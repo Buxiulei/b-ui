@@ -60,7 +60,8 @@ print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 check_root() {
     if [[ $EUID -ne 0 ]]; then
         print_error "此脚本需要 root 权限运行"
-        print_info "请使用 sudo $0 运行"
+        print_info "请使用以下命令运行:"
+        echo -e "  ${YELLOW}sudo bash <(curl -fsSL https://raw.githubusercontent.com/Buxiulei/h-ui/main/h-ui-server.sh)${NC}"
         exit 1
     fi
 }
@@ -1304,6 +1305,12 @@ quick_install() {
     echo -e "  管理密码: ${YELLOW}${ADMIN_PASSWORD}${NC}"
     echo ""
     show_client_config
+    
+    # 自动打开 h-ui 终端面板
+    echo ""
+    echo -e "${CYAN}正在打开 H-UI 终端管理面板...${NC}"
+    sleep 2
+    h-ui
 }
 
 #===============================================================================
