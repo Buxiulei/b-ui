@@ -829,16 +829,23 @@ create_hui_cli() {
     cat > /usr/local/bin/h-ui << 'HUIEOF'
 #!/bin/bash
 # H-UI 终端管理面板
-# Hysteria2 + Web 管理面板
+# Hysteria2 + Web 管理面板 完整版
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
+BLUE='\033[0;34m'
 NC='\033[0m'
 
 CONFIG_FILE="/opt/hysteria/config.yaml"
 USERS_FILE="/opt/hysteria/users.json"
+HYSTERIA_SERVICE="hysteria-server.service"
+ADMIN_SERVICE="hysteria-admin.service"
+
+print_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
+print_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
+print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
 get_domain() {
     grep -A2 "^tls:" "$CONFIG_FILE" 2>/dev/null | grep "cert:" | sed 's|.*/live/\([^/]*\)/.*|\1|' || echo "未配置"
@@ -852,29 +859,49 @@ get_admin_password() {
     grep "ADMIN_PASSWORD=" /etc/systemd/system/hysteria-admin.service 2>/dev/null | cut -d= -f3 || echo "未找到"
 }
 
-show_status() {
+show_banner() {
     clear
     echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
     echo -e "${CYAN}║                      ${YELLOW}H-UI 管理面板${CYAN}                          ║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
-    
-    local domain=$(get_domain)
-    local port=$(get_port)
-    local admin_pass=$(get_admin_password)
-    
+}
+
+show_status() {
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
     echo -e "${YELLOW}[系统状态]${NC}"
-    if systemctl is-active --quiet hysteria-server; then
+    
+    if command -v hysteria &> /dev/null; then
+        echo -e "  Hysteria2: ${YELLOW}$(hysteria version 2>/dev/null | head -n1 || echo '未知')${NC}"
+    else
+        echo -e "  Hysteria2: ${RED}未安装${NC}"
+    fi
+    
+    if systemctl is-active --quiet hysteria-server 2>/dev/null; then
         echo -e "  Hysteria 服务: ${GREEN}✓ 运行中${NC}"
     else
         echo -e "  Hysteria 服务: ${RED}✗ 未运行${NC}"
     fi
-    if systemctl is-active --quiet hysteria-admin; then
+    
+    if systemctl is-active --quiet hysteria-admin 2>/dev/null; then
         echo -e "  管理面板服务: ${GREEN}✓ 运行中${NC}"
     else
         echo -e "  管理面板服务: ${RED}✗ 未运行${NC}"
     fi
+    
+    local bbr=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    if [[ "$bbr" == "bbr" ]]; then
+        echo -e "  BBR: ${GREEN}已启用${NC}"
+    else
+        echo -e "  BBR: ${YELLOW}未启用${NC}"
+    fi
+    
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
     echo ""
+    
+    local domain=$(get_domain)
+    local port=$(get_port)
+    local admin_pass=$(get_admin_password)
     
     echo -e "${YELLOW}[配置信息]${NC}"
     echo -e "  绑定域名: ${GREEN}${domain}${NC}"
@@ -882,11 +909,32 @@ show_status() {
     echo -e "  管理面板: ${GREEN}https://${domain}${NC}"
     echo -e "  管理密码: ${GREEN}${admin_pass}${NC}"
     echo ""
+}
+
+show_menu() {
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║${NC}                      ${GREEN}H-UI 操作菜单${NC}                          ${CYAN}║${NC}"
+    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}1.${NC} 查看 API 文档                                          ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}2.${NC} 重启服务                                               ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}3.${NC} 查看日志                                               ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}4.${NC} 修改管理密码                                           ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}5.${NC} 开启 BBR                                               ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}6.${NC} ${GREEN}更新 Hysteria2${NC}                                         ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}7.${NC} ${RED}完全卸载${NC}                                               ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}0.${NC} 退出                                                   ${CYAN}║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
+}
+
+show_api_docs() {
+    local domain=$(get_domain)
+    local admin_pass=$(get_admin_password)
     
+    echo ""
     echo -e "${YELLOW}[URL 管理 API]${NC}"
     echo -e "  基础 URL: ${GREEN}https://${domain}/api/manage${NC}"
     echo ""
-    echo -e "  ${CYAN}┌─ action 参数 (必填) ─────────────────────────────────────┐${NC}"
+    echo -e "  ${CYAN}┌─ action 参数 ────────────────────────────────────────────┐${NC}"
     echo -e "  ${CYAN}│${NC}  create  - 创建新用户                                    ${CYAN}│${NC}"
     echo -e "  ${CYAN}│${NC}  delete  - 删除用户                                      ${CYAN}│${NC}"
     echo -e "  ${CYAN}│${NC}  update  - 修改用户配置                                  ${CYAN}│${NC}"
@@ -895,40 +943,29 @@ show_status() {
     echo ""
     echo -e "  ${CYAN}┌─ 参数说明 ───────────────────────────────────────────────┐${NC}"
     echo -e "  ${CYAN}│${NC}  key     - 管理密码 (必填)                               ${CYAN}│${NC}"
-    echo -e "  ${CYAN}│${NC}  user    - 用户名 (必填，除 list 外)                     ${CYAN}│${NC}"
-    echo -e "  ${CYAN}│${NC}  pass    - 密码 (可选，留空自动生成8位随机密码)          ${CYAN}│${NC}"
-    echo -e "  ${CYAN}│${NC}  days    - 有效天数，单位: 天 (0=永久有效)               ${CYAN}│${NC}"
-    echo -e "  ${CYAN}│${NC}  traffic - 总流量限制，单位: GB (0=不限)                 ${CYAN}│${NC}"
-    echo -e "  ${CYAN}│${NC}  monthly - 月流量限制，单位: GB (0=不限)                 ${CYAN}│${NC}"
+    echo -e "  ${CYAN}│${NC}  user    - 用户名 (必填)                                 ${CYAN}│${NC}"
+    echo -e "  ${CYAN}│${NC}  pass    - 密码 (可选)                                   ${CYAN}│${NC}"
+    echo -e "  ${CYAN}│${NC}  days    - 有效天数 (0=永久)                             ${CYAN}│${NC}"
+    echo -e "  ${CYAN}│${NC}  traffic - 总流量 GB (0=不限)                            ${CYAN}│${NC}"
     echo -e "  ${CYAN}└──────────────────────────────────────────────────────────┘${NC}"
     echo ""
     echo -e "  ${YELLOW}示例:${NC}"
-    echo -e "  ${GREEN}# 创建用户 (30天有效期，10GB总流量):${NC}"
-    echo -e "  https://${domain}/api/manage?key=${admin_pass}&action=create&user=test&days=30&traffic=10"
+    echo -e "  ${GREEN}创建:${NC} https://${domain}/api/manage?key=${admin_pass}&action=create&user=test&days=30&traffic=10"
+    echo -e "  ${GREEN}删除:${NC} https://${domain}/api/manage?key=${admin_pass}&action=delete&user=test"
     echo ""
-    echo -e "  ${GREEN}# 删除用户:${NC}"
-    echo -e "  https://${domain}/api/manage?key=${admin_pass}&action=delete&user=test"
-    echo ""
-    echo -e "  ${GREEN}# 修改用户配置 (续期30天，增加流量限制):${NC}"
-    echo -e "  https://${domain}/api/manage?key=${admin_pass}&action=update&user=test&days=30&traffic=20"
-    echo ""
-    echo -e "  ${GREEN}# 列出所有用户:${NC}"
-    echo -e "  https://${domain}/api/manage?key=${admin_pass}&action=list"
-    echo ""
-    echo -e "  ${YELLOW}按 p 修改密码, 按 q 退出, 按其他键刷新${NC}"
 }
 
 change_password() {
     echo ""
     read -p "请输入新密码 (至少6位): " new_pass
     if [[ ${#new_pass} -lt 6 ]]; then
-        echo -e "${RED}密码至少6位${NC}"
+        print_error "密码至少6位"
         return 1
     fi
     
     local svc="/etc/systemd/system/hysteria-admin.service"
     if [[ ! -f "$svc" ]]; then
-        echo -e "${RED}服务配置文件不存在${NC}"
+        print_error "服务配置文件不存在"
         return 1
     fi
     
@@ -936,26 +973,103 @@ change_password() {
     systemctl daemon-reload
     systemctl restart hysteria-admin
     
-    echo -e "${GREEN}密码已更新为: ${new_pass}${NC}"
-    echo -e "${YELLOW}请使用新密码登录 Web 管理面板${NC}"
+    print_success "密码已更新为: ${new_pass}"
 }
 
-main_loop() {
+enable_bbr() {
+    local cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    if [[ "$cc" == "bbr" ]]; then
+        print_success "BBR 已启用"
+        return 0
+    fi
+    
+    modprobe tcp_bbr 2>/dev/null || true
+    echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+    echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+    sysctl -p > /dev/null 2>&1
+    print_success "BBR 启用成功"
+}
+
+update_hysteria() {
+    print_info "正在更新 Hysteria2..."
+    local old_version=$(hysteria version 2>/dev/null | head -n1 || echo "未知")
+    bash <(curl -fsSL https://get.hy2.sh/)
+    local new_version=$(hysteria version 2>/dev/null | head -n1 || echo "未知")
+    print_success "更新完成！"
+    echo -e "  旧版本: ${YELLOW}${old_version}${NC}"
+    echo -e "  新版本: ${GREEN}${new_version}${NC}"
+    systemctl restart hysteria-server 2>/dev/null || true
+}
+
+uninstall_all() {
+    echo ""
+    echo -e "${RED}警告：此操作将完全卸载 H-UI 和 Hysteria2${NC}"
+    read -p "确定要继续吗? (输入 YES 确认): " confirm
+    
+    if [[ "$confirm" != "YES" ]]; then
+        print_info "已取消"
+        return
+    fi
+    
+    print_info "正在卸载..."
+    systemctl stop hysteria-server 2>/dev/null || true
+    systemctl stop hysteria-admin 2>/dev/null || true
+    systemctl disable hysteria-server 2>/dev/null || true
+    systemctl disable hysteria-admin 2>/dev/null || true
+    rm -f /etc/systemd/system/hysteria-server.service
+    rm -f /etc/systemd/system/hysteria-admin.service
+    rm -rf /etc/systemd/system/hysteria-server.service.d
+    rm -f /usr/local/bin/hysteria
+    rm -rf /opt/hysteria
+    rm -f /usr/local/bin/h-ui
+    rm -f /etc/nginx/conf.d/hysteria-admin.conf
+    systemctl daemon-reload
+    apt-get purge -y nginx nginx-common nodejs certbot 2>/dev/null || true
+    apt-get autoremove -y 2>/dev/null || true
+    
+    print_success "卸载完成！"
+    exit 0
+}
+
+main() {
+    if [[ $EUID -ne 0 ]]; then
+        print_error "请使用 sudo h-ui 运行"
+        exit 1
+    fi
+    
     while true; do
+        show_banner
         show_status
-        read -n1 -p "" key
-        case $key in
-            p|P) change_password ;;
-            q|Q) exit 0 ;;
+        show_menu
+        
+        read -p "请选择 [0-7]: " choice
+        
+        case $choice in
+            1) show_api_docs ;;
+            2) 
+                systemctl restart hysteria-server 2>/dev/null || true
+                systemctl restart hysteria-admin 2>/dev/null || true
+                print_success "服务已重启"
+                ;;
+            3) journalctl -u hysteria-server --no-pager -n 30 ;;
+            4) change_password ;;
+            5) enable_bbr ;;
+            6) update_hysteria ;;
+            7) uninstall_all ;;
+            0) echo ""; print_info "再见！"; exit 0 ;;
+            *) print_error "无效选项" ;;
         esac
+        
+        echo ""
+        read -p "按 Enter 继续..."
     done
 }
 
-main_loop
+main
 HUIEOF
     
     chmod +x /usr/local/bin/h-ui
-    print_success "h-ui 命令已创建，可在终端输入 'h-ui' 打开管理面板"
+    print_success "h-ui 命令已创建，可在终端输入 'sudo h-ui' 打开管理面板"
 }
 
 configure_nginx_proxy() {
