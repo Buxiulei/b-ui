@@ -7,7 +7,7 @@
 # 版本: 1.0.0
 #===============================================================================
 
-SCRIPT_VERSION="1.0.4"
+SCRIPT_VERSION="1.0.5"
 
 set -e
 
@@ -760,7 +760,7 @@ if(tok)init();
 http.createServer(async(req,res)=>{
 const u=new URL(req.url,`http://${req.headers.host}`),p=u.pathname;
 if(req.method==="OPTIONS"){res.writeHead(200,{"Access-Control-Allow-Origin":"*","Access-Control-Allow-Methods":"*","Access-Control-Allow-Headers":"*"});return res.end()}
-if(p==="/"||p==="/index.html"){res.writeHead(200,{"Content-Type":"text/html"});return res.end(HTML)}
+if(p==="/"||p==="/index.html"){res.writeHead(200,{"Content-Type":"text/html; charset=utf-8"});return res.end(HTML)}
 if(p.startsWith("/api/")){const r=p.slice(5);const clientIP=getClientIP(req);
 try{
 if(r==="login"&&req.method==="POST"){
