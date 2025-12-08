@@ -1,148 +1,130 @@
-# Hysteria2 一键部署工具
+# H-UI - Hysteria2 一键部署工具
 
-基于 [Hysteria2](https://v2.hysteria.network/) 的一键安装脚本，支持服务端和客户端部署。
+基于 [Hysteria2](https://v2.hysteria.network/) 的一键安装脚本，支持服务端和客户端部署，自带 Web 管理面板。
 
 ## ✨ 功能特性
 
-### 服务端
+### 服务端 (H-UI)
 - 🚀 一键安装 Hysteria2 服务器
 - 👥 多用户管理 (Web 面板)
-- 📊 流量统计 / 在线状态
+- 📊 流量统计 / 在线状态 / 月度流量
+- 📱 二维码分享 (兼容 v2rayN / Shadowrocket / Clash Meta)
+- ⏱️ 用户时长/流量限制
 - 🔐 自动 HTTPS 证书 (Let's Encrypt)
+- 🔑 管理密码可修改 (Web + 终端)
+- 🌐 URL API 管理接口
 - ⚡ BBR 优化
-- 🌐 全中文界面
+- 🖥️ h-ui 终端管理命令
 
 ### 客户端
 - 🔌 SOCKS5 / HTTP 代理
 - 🌍 TUN 全局代理模式
+- 📋 链接导入配置 (hysteria2:// 格式)
 - 🛡️ SSH 连接保护
-- 📋 路由规则 (域名/IP/关键词绕过)
-- 🔧 systemd 服务管理
+- 📋 路由规则 (域名/IP 绕过)
 
 ---
 
 ## 🖥️ 服务端安装
 
 ```bash
-# 下载脚本
-curl -fsSL https://raw.githubusercontent.com/Buxiulei/hysteria2-server/main/hysteria2-install.sh -o hy2-server.sh
-
-# 运行
-chmod +x hy2-server.sh && sudo ./hy2-server.sh
-```
-
-### 服务端菜单
-```
-1. 一键安装 (Hysteria2 + 管理面板)
-2. 查看状态
-3. 查看客户端配置
-4. 重启所有服务
-5. 查看日志
-6. 开启 BBR
-7. 开机自启动设置
-8. 一键卸载
-0. 退出
+bash <(curl -fsSL https://raw.githubusercontent.com/Buxiulei/hysteria2-server/main/hysteria2-install.sh)
 ```
 
 ### 安装完成后
-- 管理面板: `https://你的域名/`
-- 管理密码: 安装时显示
+
+- Web 管理面板: `https://你的域名/`
+- 终端管理: 输入 `h-ui`
+
+### 终端管理 (h-ui)
+
+安装后在终端输入 `h-ui` 即可查看：
+- 服务运行状态
+- 绑定域名和端口
+- 管理员密码
+- URL API 示例
+
+**快捷键：**
+- `p` - 修改管理密码
+- `q` - 退出
+- 其他键 - 刷新状态
+
+---
+
+## 🌐 URL 管理 API
+
+无需登录面板，通过 URL 直接管理用户：
+
+| 操作 | URL |
+|------|-----|
+| 创建用户 | `/api/manage?key=密码&action=create&user=用户名&days=30&traffic=10` |
+| 删除用户 | `/api/manage?key=密码&action=delete&user=用户名` |
+| 修改配置 | `/api/manage?key=密码&action=update&user=用户名&days=30` |
+| 列出用户 | `/api/manage?key=密码&action=list` |
+
+**参数说明：**
+| 参数 | 说明 |
+|------|------|
+| key | 管理密码 (必填) |
+| user | 用户名 (必填) |
+| pass | 密码 (可选，留空自动生成) |
+| days | 有效天数 (0=永久) |
+| traffic | 总流量限制 GB (0=不限) |
+| monthly | 月流量限制 GB (0=不限) |
 
 ---
 
 ## 💻 客户端安装
 
 ```bash
-# 下载脚本
-curl -fsSL https://raw.githubusercontent.com/Buxiulei/hysteria2-server/main/hysteria2-client.sh -o hy2-client.sh
-
-# 运行
-chmod +x hy2-client.sh && sudo ./hy2-client.sh
+bash <(curl -fsSL https://raw.githubusercontent.com/Buxiulei/hysteria2-server/main/hysteria2-client.sh)
 ```
 
 ### 客户端菜单
 ```
-1. 一键安装
-2. 查看状态
-3. 启动/停止
-4. 重新配置
-5. 编辑路由规则
-6. TUN 模式开关
-7. 测试代理
-8. 查看日志
-9. 卸载
-0. 退出
+1. 一键安装 (手动输入配置)
+2. 从链接导入配置          ← 支持 hysteria2:// 格式
+3. 查看状态
+4. 启动/停止
+5. 重新配置
+6. 编辑路由规则
+7. TUN 模式开关
+8. 测试代理
+9. 查看日志
+10. 卸载
 ```
 
-### 代理使用示例
+### 代理使用
 ```bash
-# SOCKS5 代理 (默认端口 1080)
+# SOCKS5 (默认 1080)
 curl --socks5 127.0.0.1:1080 https://www.google.com
 
-# HTTP 代理 (默认端口 8080)
+# HTTP (默认 8080)
 export https_proxy=http://127.0.0.1:8080
 curl https://www.google.com
 ```
 
 ---
 
-## 📋 路由规则
+## 🔓 需要开放的端口
 
-客户端支持灵活的路由规则配置，可以指定哪些流量直连不走代理：
-
-### 添加规则示例
-
-**1. IP 地址绕过**
-```
-192.168.1.0/24
-10.0.0.0/8
-```
-
-**2. 域名绕过**
-```
-*.baidu.com
-*.qq.com
-```
-
-**3. 关键词匹配**
-输入 `cn,baidu,taobao` 将自动生成：
-```
-*cn*
-*baidu*
-*taobao*
-```
-
----
-
-## 🛡️ TUN 模式
-
-TUN 模式提供全局透明代理，所有流量自动走代理：
-
-- 自动保护 SSH 连接 (服务器 IP 排除在代理外)
-- 私有网络自动绕过 (10.x.x.x, 192.168.x.x 等)
-- 需要 root 权限
+| 端口 | 协议 | 用途 |
+|------|------|------|
+| 80 | TCP | SSL 证书验证 |
+| 443 | TCP | 管理面板 (HTTPS) |
+| 10000 | **UDP** | Hysteria2 代理 |
 
 ---
 
 ## 📁 文件结构
 
-### 服务端
 ```
-脚本目录/
-├── hysteria2-install.sh    # 安装脚本
-└── data/                   # 数据目录
-    ├── config.yaml         # 服务器配置
-    ├── users.json          # 用户数据
-    └── admin/              # 管理面板
-```
+/opt/hysteria/           # 服务端数据目录
+├── config.yaml          # 服务器配置
+├── users.json           # 用户数据 (含流量统计)
+└── admin/               # 管理面板
 
-### 客户端
-```
-脚本目录/
-├── hysteria2-client.sh     # 安装脚本
-└── hysteria-client/        # 数据目录
-    ├── config.yaml         # 客户端配置
-    └── bypass-rules.txt    # 路由规则
+/usr/local/bin/h-ui      # 终端管理命令
 ```
 
 ---
@@ -151,43 +133,13 @@ TUN 模式提供全局透明代理，所有流量自动走代理：
 
 | 组件 | 要求 |
 |------|------|
-| 操作系统 | Ubuntu / Debian / CentOS |
+| 操作系统 | Ubuntu / Debian |
 | 权限 | root |
 | 服务端 | 需要域名 |
-| 客户端 | 任意 Linux |
 
 ---
 
-## 🔓 需要开放的端口
-
-在云服务商的安全组中开放以下端口：
-
-| 端口 | 协议 | 用途 |
-|------|------|------|
-| 80 | TCP | SSL 证书验证 (Let's Encrypt) |
-| 443 | TCP | 管理面板 (HTTPS) |
-| 10000 | **UDP** | Hysteria2 代理 (默认端口) |
-
-### 云平台配置指南
-
-**AWS EC2:**
-1. EC2 控制台 → Security Groups
-2. 添加入站规则: 
-   - Type: Custom TCP, Port: 80, Source: 0.0.0.0/0
-   - Type: Custom TCP, Port: 443, Source: 0.0.0.0/0
-   - Type: Custom UDP, Port: 10000, Source: 0.0.0.0/0
-
-**阿里云 ECS:**
-1. ECS 控制台 → 安全组
-2. 添加入站规则: 80/TCP, 443/TCP, 10000/UDP
-
-**腾讯云 CVM:**
-1. CVM 控制台 → 安全组
-2. 添加入站规则: 80, 443, 10000(UDP)
-
----
-
-## 📖 官方文档
+## 📖 相关链接
 
 - [Hysteria2 官网](https://v2.hysteria.network/zh/)
 - [服务端配置](https://v2.hysteria.network/zh/docs/advanced/Full-Server-Config/)
