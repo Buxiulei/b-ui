@@ -28,7 +28,7 @@
 ## 🖥️ 服务端安装
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Buxiulei/hysteria2-server/main/hysteria2-install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Buxiulei/h-ui/main/hysteria2-install.sh)
 ```
 
 ### 安装完成后
@@ -77,7 +77,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Buxiulei/hysteria2-server/ma
 ## 💻 客户端安装
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Buxiulei/hysteria2-server/main/hysteria2-client.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Buxiulei/h-ui/main/hysteria2-client.sh)
 ```
 
 ### 客户端菜单
