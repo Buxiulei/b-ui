@@ -675,7 +675,7 @@ api("/config").then(d=>cfg=d);load();setInterval(load,5000)}
 function load(){Promise.all([api("/users"),api("/online"),api("/stats")]).then(([u,o,s])=>{
 $("#st-u").innerText=u.length;$("#st-o").innerText=Object.keys(o).length;
 let tu=0,td=0;Object.values(s).forEach(v=>{tu+=v.tx||0;td+=v.rx||0});$("#st-up").innerText=sz(tu);$("#st-dl").innerText=sz(td);
-u.forEach(x=>{const uri="hysteria2://"+x.password+"@"+cfg.domain+":"+cfg.port+"/?insecure=0#"+x.username;new Image().src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data="+encodeURIComponent(uri)});
+u.forEach(x=>{const uri="hysteria2://"+encodeURIComponent(x.password)+"@"+cfg.domain+":"+cfg.port+"/?sni="+cfg.domain+"&insecure=0#"+encodeURIComponent(x.username);new Image().src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data="+encodeURIComponent(uri)});
 $("#tb").innerHTML=u.map(x=>{
 const on=o[x.username],st=s[x.username]||{};
 return '<tr><td><b>'+x.username+'</b></td><td><span class="tag '+(on?"on":"")+'">'+( on?on+" 个设备在线":"离线")+'</span></td><td class="hide-m" style="font-family:monospace;font-size:12px;color:var(--text-dim)">⬆ '+sz(st.tx)+'<br>⬇ '+sz(st.rx)+'</td><td><div class="act"><button class="ibtn" onclick="show(\''+x.username+'\',\''+x.password+'\')" title="配置">⚙</button>'+(on?'<button class="ibtn danger" onclick="kick(\''+x.username+'\')" title="强制下线">⚡</button>':'')+'<button class="ibtn danger" onclick="del(\''+x.username+'\')" title="删除">🗑</button></div></td></tr>'
@@ -683,7 +683,7 @@ return '<tr><td><b>'+x.username+'</b></td><td><span class="tag '+(on?"on":"")+'"
 function addUser(){api("/users",{method:"POST",body:JSON.stringify({username:$("#nu").value,password:$("#np").value})}).then(d=>{if(d.success){closeM();toast("用户已创建");load()}else toast("操作失败",1)})}
 function del(u){if(confirm("确定要删除用户 "+u+" 吗?"))api("/users/"+u,{method:"DELETE"}).then(()=>load())}
 function kick(u){api("/kick",{method:"POST",body:JSON.stringify([u])}).then(()=>toast("已将用户 "+u+" 强制下线"))}
-function show(u,p){const uri="hysteria2://"+p+"@"+cfg.domain+":"+cfg.port+"/?insecure=0#"+u;$("#uri").innerText=uri;$("#qrcode").innerHTML='<img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data='+encodeURIComponent(uri)+'" alt="QR Code" style="display:block">';openM("m-cfg")}
+function show(u,p){const uri="hysteria2://"+encodeURIComponent(p)+"@"+cfg.domain+":"+cfg.port+"/?sni="+cfg.domain+"&insecure=0#"+encodeURIComponent(u);$("#uri").innerText=uri;$("#qrcode").innerHTML='<img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data='+encodeURIComponent(uri)+'" alt="QR Code" style="display:block">';openM("m-cfg")}
 function copy(){navigator.clipboard.writeText($("#uri").innerText);toast("已复制到剪贴板")}
 if(tok)init();
 </script></body></html>`;
