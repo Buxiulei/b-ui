@@ -28,7 +28,11 @@
 ## 🖥️ 服务端安装
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Buxiulei/h-ui/main/h-ui-server.sh | sudo bash
+# 下载脚本
+curl -fsSL https://raw.githubusercontent.com/Buxiulei/h-ui/main/h-ui-server.sh -o h-ui-server.sh
+
+# 运行安装
+sudo bash h-ui-server.sh
 ```
 
 ### 安装完成后
@@ -77,7 +81,11 @@ curl -fsSL https://raw.githubusercontent.com/Buxiulei/h-ui/main/h-ui-server.sh |
 ## 💻 客户端安装
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Buxiulei/h-ui/main/h-ui-client.sh | sudo bash
+# 下载脚本
+curl -fsSL https://raw.githubusercontent.com/Buxiulei/h-ui/main/h-ui-client.sh -o h-ui-client.sh
+
+# 运行安装
+sudo bash h-ui-client.sh
 ```
 
 ### 客户端菜单
