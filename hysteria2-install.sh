@@ -351,8 +351,9 @@ configure_hysteria() {
     read -p "请输入伪装网站 URL [默认: https://www.bing.com/]: " MASQUERADE_URL
     MASQUERADE_URL=${MASQUERADE_URL:-"https://www.bing.com/"}
     
-    # 创建目录
-    mkdir -p /etc/hysteria
+    # 创建目录并设置权限
+    mkdir -p "$BASE_DIR"
+    chmod 755 "$BASE_DIR"
     
     # 创建用户文件
     cat > "$USERS_FILE" << EOF
@@ -391,6 +392,10 @@ masquerade:
     rewriteHost: true
 EOF
 
+    # 设置文件权限 (确保 Hysteria 服务可以读取)
+    chmod 644 "$CONFIG_FILE"
+    chmod 644 "$USERS_FILE"
+    
     print_success "配置文件已生成: $CONFIG_FILE"
     
     # 显示配置摘要
