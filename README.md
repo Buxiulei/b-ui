@@ -24,14 +24,11 @@
 ## 🖥️ 服务端安装
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Buxiulei/hysteria2-server/main/hysteria2-install.sh | sudo bash
-```
-
-或者下载后运行：
-```bash
+# 下载脚本
 curl -fsSL https://raw.githubusercontent.com/Buxiulei/hysteria2-server/main/hysteria2-install.sh -o hy2-server.sh
-chmod +x hy2-server.sh
-sudo ./hy2-server.sh
+
+# 运行
+chmod +x hy2-server.sh && sudo ./hy2-server.sh
 ```
 
 ### 服务端菜单
@@ -56,14 +53,11 @@ sudo ./hy2-server.sh
 ## 💻 客户端安装
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Buxiulei/hysteria2-server/main/hysteria2-client.sh | sudo bash
-```
-
-或者下载后运行：
-```bash
+# 下载脚本
 curl -fsSL https://raw.githubusercontent.com/Buxiulei/hysteria2-server/main/hysteria2-client.sh -o hy2-client.sh
-chmod +x hy2-client.sh
-sudo ./hy2-client.sh
+
+# 运行
+chmod +x hy2-client.sh && sudo ./hy2-client.sh
 ```
 
 ### 客户端菜单
