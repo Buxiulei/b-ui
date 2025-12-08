@@ -809,6 +809,93 @@ EOF
     fi
 }
 
+create_hui_cli() {
+    print_info "创建 h-ui 命令行工具..."
+    
+    cat > /usr/local/bin/h-ui << 'HUIEOF'
+#!/bin/bash
+# H-UI 终端管理面板
+# Hysteria2 + Web 管理面板
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+CONFIG_FILE="/opt/hysteria/config.yaml"
+USERS_FILE="/opt/hysteria/users.json"
+
+get_domain() {
+    grep -A2 "^tls:" "$CONFIG_FILE" 2>/dev/null | grep "cert:" | sed 's|.*/live/\([^/]*\)/.*|\1|' || echo "未配置"
+}
+
+get_port() {
+    grep "^listen:" "$CONFIG_FILE" 2>/dev/null | sed 's/listen: *:\?//' || echo "10000"
+}
+
+get_admin_password() {
+    grep "ADMIN_PASSWORD=" /etc/systemd/system/hysteria-admin.service 2>/dev/null | cut -d= -f3 || echo "未找到"
+}
+
+show_status() {
+    clear
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║                      ${YELLOW}H-UI 管理面板${CYAN}                          ║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    
+    local domain=$(get_domain)
+    local port=$(get_port)
+    local admin_pass=$(get_admin_password)
+    
+    echo -e "${YELLOW}[系统状态]${NC}"
+    if systemctl is-active --quiet hysteria-server; then
+        echo -e "  Hysteria 服务: ${GREEN}✓ 运行中${NC}"
+    else
+        echo -e "  Hysteria 服务: ${RED}✗ 未运行${NC}"
+    fi
+    if systemctl is-active --quiet hysteria-admin; then
+        echo -e "  管理面板服务: ${GREEN}✓ 运行中${NC}"
+    else
+        echo -e "  管理面板服务: ${RED}✗ 未运行${NC}"
+    fi
+    echo ""
+    
+    echo -e "${YELLOW}[配置信息]${NC}"
+    echo -e "  绑定域名: ${GREEN}${domain}${NC}"
+    echo -e "  Hysteria 端口: ${GREEN}${port}${NC}"
+    echo -e "  管理面板: ${GREEN}https://${domain}${NC}"
+    echo -e "  管理密码: ${GREEN}${admin_pass}${NC}"
+    echo ""
+    
+    echo -e "${YELLOW}[URL 管理 API 示例]${NC}"
+    echo -e "  ${CYAN}创建用户:${NC}"
+    echo -e "  https://${domain}/api/manage?key=${admin_pass}&action=create&user=用户名&days=30&traffic=10"
+    echo ""
+    echo -e "  ${CYAN}删除用户:${NC}"
+    echo -e "  https://${domain}/api/manage?key=${admin_pass}&action=delete&user=用户名"
+    echo ""
+    echo -e "  ${CYAN}修改配置:${NC}"
+    echo -e "  https://${domain}/api/manage?key=${admin_pass}&action=update&user=用户名&days=30&traffic=10"
+    echo ""
+    echo -e "  ${CYAN}参数说明:${NC}"
+    echo -e "    key     - 管理密码"
+    echo -e "    user    - 用户名"
+    echo -e "    pass    - 密码 (可选，留空自动生成)"
+    echo -e "    days    - 有效天数 (0=不限)"
+    echo -e "    traffic - 总流量限制 GB (0=不限)"
+    echo -e "    monthly - 月流量限制 GB (0=不限)"
+    echo ""
+}
+
+show_status
+HUIEOF
+    
+    chmod +x /usr/local/bin/h-ui
+    print_success "h-ui 命令已创建，可在终端输入 'h-ui' 打开管理面板"
+}
+
 configure_nginx_proxy() {
     print_info "配置 Nginx HTTPS 反向代理..."
     
@@ -1053,6 +1140,7 @@ quick_install() {
     
     deploy_admin_panel
     create_admin_service
+    create_hui_cli
     configure_nginx_proxy
     
     echo ""
