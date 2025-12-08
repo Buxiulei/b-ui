@@ -603,6 +603,55 @@ r.on("error",()=>s({}));r.setTimeout(3e3,()=>{r.destroy();s({})});r.end()})}
 function postStats(ep,b){return new Promise(s=>{const d=JSON.stringify(b);const r=http.request({hostname:"127.0.0.1",port:CONFIG.trafficPort,path:ep,method:"POST",headers:{"Content-Type":"application/json","Content-Length":Buffer.byteLength(d)}},
 res=>s(res.statusCode===200));r.on("error",()=>s(false));r.write(d);r.end()})}
 
+// --- Traffic Tracking ---
+function getCurrentMonth(){return new Date().toISOString().slice(0,7)}
+function updateUserTraffic(stats){const users=loadUsers();let changed=false;
+Object.entries(stats).forEach(([username,{tx,rx}])=>{const u=users.find(x=>x.username===username);if(u){
+if(!u.usage)u.usage={total:0,monthly:{}};const m=getCurrentMonth();
+u.usage.total=(u.usage.total||0)+tx+rx;u.usage.monthly[m]=(u.usage.monthly[m]||0)+tx+rx;changed=true}});
+if(changed){try{fs.writeFileSync(CONFIG.usersFile,JSON.stringify(users,null,2))}catch(e){log("ERROR","Save traffic: "+e.message)}}}
+function checkUserLimits(u){const now=Date.now(),m=getCurrentMonth();
+if(u.limits?.expiresAt&&new Date(u.limits.expiresAt).getTime()<now)return{ok:false,reason:"expired"};
+if(u.limits?.trafficLimit&&(u.usage?.total||0)>=u.limits.trafficLimit)return{ok:false,reason:"traffic_exceeded"};
+if(u.limits?.monthlyLimit&&(u.usage?.monthly?.[m]||0)>=u.limits.monthlyLimit)return{ok:false,reason:"monthly_exceeded"};
+return{ok:true}}
+function handleManage(params,res){
+const key=params.get("key"),action=params.get("action"),user=params.get("user");
+if(key!==CONFIG.adminPassword)return sendJSON(res,{error:"Invalid key"},403);
+if(!action)return sendJSON(res,{error:"Missing action"},400);
+const users=loadUsers();
+if(action==="create"){
+if(!user)return sendJSON(res,{error:"Missing user"},400);
+if(users.find(u=>u.username===user))return sendJSON(res,{error:"User exists"},400);
+const pass=params.get("pass")||crypto.randomBytes(8).toString("hex");
+const days=parseInt(params.get("days"))||0;const traffic=parseFloat(params.get("traffic"))||0;const monthly=parseFloat(params.get("monthly"))||0;
+const newUser={username:user,password:pass,createdAt:new Date().toISOString(),limits:{},usage:{total:0,monthly:{}}};
+if(days>0)newUser.limits.expiresAt=new Date(Date.now()+days*864e5).toISOString();
+if(traffic>0)newUser.limits.trafficLimit=traffic*1073741824;
+if(monthly>0)newUser.limits.monthlyLimit=monthly*1073741824;
+users.push(newUser);
+if(saveUsers(users))return sendJSON(res,{success:true,user:user,password:pass});
+return sendJSON(res,{error:"Save failed"},500)}
+if(action==="delete"){
+if(!user)return sendJSON(res,{error:"Missing user"},400);
+const idx=users.findIndex(u=>u.username===user);if(idx<0)return sendJSON(res,{error:"User not found"},404);
+users.splice(idx,1);
+if(saveUsers(users))return sendJSON(res,{success:true});
+return sendJSON(res,{error:"Save failed"},500)}
+if(action==="update"){
+if(!user)return sendJSON(res,{error:"Missing user"},400);
+const u=users.find(x=>x.username===user);if(!u)return sendJSON(res,{error:"User not found"},404);
+const days=params.get("days"),traffic=params.get("traffic"),monthly=params.get("monthly"),pass=params.get("pass");
+if(!u.limits)u.limits={};
+if(days!==null)u.limits.expiresAt=parseInt(days)>0?new Date(Date.now()+parseInt(days)*864e5).toISOString():null;
+if(traffic!==null)u.limits.trafficLimit=parseFloat(traffic)>0?parseFloat(traffic)*1073741824:null;
+if(monthly!==null)u.limits.monthlyLimit=parseFloat(monthly)>0?parseFloat(monthly)*1073741824:null;
+if(pass)u.password=pass;
+if(saveUsers(users))return sendJSON(res,{success:true});
+return sendJSON(res,{error:"Save failed"},500)}
+if(action==="list")return sendJSON(res,users.map(u=>({username:u.username,limits:u.limits,usage:u.usage})));
+return sendJSON(res,{error:"Unknown action"},400)}
+
 // --- Enhanced UI ---
 const HTML=`<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Hysteria2 管理面板</title><style>
@@ -654,11 +703,12 @@ th{color:var(--text-dim);text-transform:uppercase;font-size:12px;letter-spacing:
 <div class="stat"><div class="lbl">下载流量</div><div class="val" id="st-dl">0</div></div>
 </div>
 <div class="main-area"><div class="hdr"><h2 style="font-size:20px">用户列表</h2><button class="btn" style="width:auto;padding:10px 24px" onclick="openM('m-add')">+ 新建用户</button></div>
-<table><thead><tr><th>用户名</th><th>状态</th><th class="hide-m">流量统计</th><th>操作</th></tr></thead><tbody id="tb"></tbody></table></div>
+<table><thead><tr><th>用户名</th><th>状态</th><th class="hide-m">本月流量</th><th class="hide-m">累计流量</th><th>操作</th></tr></thead><tbody id="tb"></tbody></table></div>
 </div>
 <div id="m-add" class="modal"><div class="card"><h3>新建用户</h3><br>
 <input id="nu" placeholder="用户名"><input id="np" placeholder="密码 (留空自动生成)">
-<div style="display:flex;gap:10px"><button class="btn" style="background:rgba(255,255,255,0.1)" onclick="closeM()">取消</button><button class="btn" onclick="addUser()">创建</button></div></div></div>
+<input id="nd" type="number" placeholder="有效天数 (0=不限)" min="0"><input id="nt" type="number" placeholder="总流量限制 GB (0=不限)" min="0" step="0.1">
+<div style="display:flex;gap:10px"><button class="btn" style="background:rgba(67,20,7,0.1)" onclick="closeM()">取消</button><button class="btn" onclick="addUser()">创建</button></div></div></div>
 <div id="m-cfg" class="modal"><div class="card" style="text-align:center"><h3>连接配置</h3><p style="font-size:12px;color:var(--text-dim);margin:0 0 8px">兼容 v2rayN / Shadowrocket / Clash Meta</p><div id="qrcode" style="margin:16px auto;background:#fff;padding:16px;border-radius:12px;width:fit-content"></div><div class="code-box" id="uri" style="margin-bottom:16px"></div>
 <div style="display:flex;gap:10px"><button class="btn" onclick="copy()">复制链接</button><button class="btn" style="background:rgba(255,255,255,0.1)" onclick="closeM()">关闭</button></div></div></div>
 <div class="toast-box" id="t-box"></div>
@@ -668,19 +718,23 @@ const sz=b=>{if(!b)return"0 B";const i=Math.floor(Math.log(b)/Math.log(1024));re
 function toast(m,e){const d=document.createElement("div");d.className="toast";d.innerHTML="<span>"+(e?"⚠️":"✅")+"</span>"+m;$("#t-box").appendChild(d);setTimeout(()=>d.remove(),3000)}
 function openM(id){$("#"+id).classList.add("on")} function closeM(){document.querySelectorAll(".modal").forEach(e=>e.classList.remove("on"))}
 function api(ep,opt={}){return fetch("/api"+ep,{...opt,headers:{...opt.headers,Authorization:"Bearer "+tok}}).then(r=>{if(r.status==401)logout();return r.json()})}
-function login(){fetch("/api/login",{method:"POST",body:JSON.stringify({password:$("#lp").value})}).then(r=>r.json()).then(d=>{if(d.token){tok=d.token;localStorage.setItem("t",tok);init()}else toast("密码错误",1)})}
+function login(){const pw=$("#lp").value;fetch("/api/login",{method:"POST",body:JSON.stringify({password:pw})}).then(r=>r.json()).then(d=>{if(d.token){tok=d.token;localStorage.setItem("t",tok);localStorage.setItem("ap",pw);init()}else toast("密码错误",1)})}
 function logout(){localStorage.removeItem("t");location.reload()}
 function init(){$("#v-login").classList.remove("active");setTimeout(()=>$("#v-login").style.display="none",300);$("#v-dash").classList.add("active");
 api("/config").then(d=>cfg=d);load();setInterval(load,5000)}
 function load(){Promise.all([api("/users"),api("/online"),api("/stats")]).then(([u,o,s])=>{
 $("#st-u").innerText=u.length;$("#st-o").innerText=Object.keys(o).length;
 let tu=0,td=0;Object.values(s).forEach(v=>{tu+=v.tx||0;td+=v.rx||0});$("#st-up").innerText=sz(tu);$("#st-dl").innerText=sz(td);
+const m=new Date().toISOString().slice(0,7);
 u.forEach(x=>{const uri="hysteria2://"+encodeURIComponent(x.password)+"@"+cfg.domain+":"+cfg.port+"/?sni="+cfg.domain+"&insecure=0#"+encodeURIComponent(x.username);new Image().src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data="+encodeURIComponent(uri)});
 $("#tb").innerHTML=u.map(x=>{
-const on=o[x.username],st=s[x.username]||{};
-return '<tr><td><b>'+x.username+'</b></td><td><span class="tag '+(on?"on":"")+'">'+( on?on+" 个设备在线":"离线")+'</span></td><td class="hide-m" style="font-family:monospace;font-size:12px;color:var(--text-dim)">⬆ '+sz(st.tx)+'<br>⬇ '+sz(st.rx)+'</td><td><div class="act"><button class="ibtn" onclick="show(\''+x.username+'\',\''+x.password+'\')" title="配置">⚙</button>'+(on?'<button class="ibtn danger" onclick="kick(\''+x.username+'\')" title="强制下线">⚡</button>':'')+'<button class="ibtn danger" onclick="del(\''+x.username+'\')" title="删除">🗑</button></div></td></tr>'
+const on=o[x.username],monthly=x.usage?.monthly?.[m]||0,total=x.usage?.total||0;
+const exp=x.limits?.expiresAt?new Date(x.limits.expiresAt)<new Date():"",tlim=x.limits?.trafficLimit,over=tlim&&total>=tlim;
+const badge=exp?' <span style="color:var(--danger);font-size:10px">[已过期]</span>':(over?' <span style="color:var(--danger);font-size:10px">[超限]</span>':"");
+return '<tr><td><b>'+x.username+'</b>'+badge+'</td><td><span class="tag '+(on?"on":"")+'">'+( on?on+" 个设备在线":"离线")+'</span></td><td class="hide-m" style="font-family:monospace;font-size:12px;color:var(--text-dim)">'+sz(monthly)+'</td><td class="hide-m" style="font-family:monospace;font-size:12px;color:var(--text-dim)">'+sz(total)+(tlim?" / "+sz(tlim):"")+'</td><td><div class="act"><button class="ibtn" onclick="show(\''+x.username+'\',\''+x.password+'\')" title="配置">⚙</button>'+(on?'<button class="ibtn danger" onclick="kick(\''+x.username+'\')">⚡</button>':'')+'<button class="ibtn danger" onclick="del(\''+x.username+'\')">🗑</button></div></td></tr>'
 }).join("")})}
-function addUser(){api("/users",{method:"POST",body:JSON.stringify({username:$("#nu").value,password:$("#np").value})}).then(d=>{if(d.success){closeM();toast("用户已创建");load()}else toast("操作失败",1)})}
+function addUser(){const u=$("#nu").value,p=$("#np").value,d=$("#nd").value||0,t=$("#nt").value||0;
+fetch("/api/manage?key="+encodeURIComponent(cfg.adminPass||localStorage.getItem("ap")||"")+"&action=create&user="+encodeURIComponent(u)+(p?"&pass="+encodeURIComponent(p):"")+"&days="+d+"&traffic="+t).then(r=>r.json()).then(r=>{if(r.success){closeM();toast("用户 "+u+" 已创建，密码: "+r.password);load()}else toast(r.error||"创建失败",1)})}
 function del(u){if(confirm("确定要删除用户 "+u+" 吗?"))api("/users/"+u,{method:"DELETE"}).then(()=>load())}
 function kick(u){api("/kick",{method:"POST",body:JSON.stringify([u])}).then(()=>toast("已将用户 "+u+" 强制下线"))}
 function show(u,p){const uri="hysteria2://"+encodeURIComponent(p)+"@"+cfg.domain+":"+cfg.port+"/?sni="+cfg.domain+"&insecure=0#"+encodeURIComponent(u);$("#uri").innerText=uri;$("#qrcode").innerHTML='<img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data='+encodeURIComponent(uri)+'" alt="QR Code" style="display:block">';openM("m-cfg")}
@@ -699,6 +753,7 @@ const b=await parseBody(req);
 if(!checkRateLimit(clientIP)){recordAttempt(clientIP,false);return sendJSON(res,{error:"Too many attempts. Try again later."},429)}
 const ok=b.password===CONFIG.adminPassword;recordAttempt(clientIP,ok);
 if(ok)return sendJSON(res,{token:genToken({admin:true})});else return sendJSON(res,{error:"Auth failed"},401)}
+if(r==="manage")return handleManage(u.searchParams,res);
 const auth=verifyToken((req.headers.authorization||"").replace("Bearer ",""));if(!auth)return sendJSON(res,{error:"Unauthorized"},401);
 if(r==="users"){if(req.method==="GET")return sendJSON(res,loadUsers());
 if(req.method==="POST"){const b=await parseBody(req),users=loadUsers();if(users.find(u=>u.username===b.username))return sendJSON(res,{error:"Exists"},400);users.push({username:b.username,password:b.password||crypto.randomBytes(8).toString("hex"),createdAt:new Date()});return saveUsers(users)?sendJSON(res,{success:true}):sendJSON(res,{error:"Save failed"},500)}}
