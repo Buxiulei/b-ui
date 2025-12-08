@@ -474,20 +474,26 @@ configure_firewall() {
     print_info "配置防火墙..."
     
     if command -v firewall-cmd &> /dev/null && systemctl is-active --quiet firewalld; then
+        firewall-cmd --permanent --add-port=22/tcp  # SSH
         firewall-cmd --permanent --add-port=${port}/udp
         firewall-cmd --permanent --add-port=${port}/tcp
         firewall-cmd --permanent --add-port=80/tcp
+        firewall-cmd --permanent --add-port=443/tcp
         firewall-cmd --reload
         print_success "firewalld 规则已添加"
     elif command -v ufw &> /dev/null && ufw status | grep -q "active"; then
+        ufw allow 22/tcp  # SSH
         ufw allow ${port}/udp
         ufw allow ${port}/tcp
         ufw allow 80/tcp
+        ufw allow 443/tcp
         print_success "ufw 规则已添加"
     elif command -v iptables &> /dev/null; then
+        iptables -I INPUT -p tcp --dport 22 -j ACCEPT  # SSH
         iptables -I INPUT -p udp --dport ${port} -j ACCEPT
         iptables -I INPUT -p tcp --dport ${port} -j ACCEPT
         iptables -I INPUT -p tcp --dport 80 -j ACCEPT
+        iptables -I INPUT -p tcp --dport 443 -j ACCEPT
         print_success "iptables 规则已添加"
     else
         print_warning "未检测到防火墙，请手动开放端口"
