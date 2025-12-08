@@ -7,7 +7,7 @@
 # 版本: 1.0.0
 #===============================================================================
 
-SCRIPT_VERSION="1.0.6"
+SCRIPT_VERSION="1.0.7"
 
 set -e
 
@@ -744,7 +744,7 @@ $("#tb").innerHTML=u.map(x=>{
 const on=o[x.username],monthly=x.usage?.monthly?.[m]||0,total=x.usage?.total||0;
 const exp=x.limits?.expiresAt?new Date(x.limits.expiresAt)<new Date():"",tlim=x.limits?.trafficLimit,over=tlim&&total>=tlim;
 const badge=exp?' <span style="color:var(--danger);font-size:10px">[已过期]</span>':(over?' <span style="color:var(--danger);font-size:10px">[超限]</span>':"");
-return '<tr><td><b>'+x.username+'</b>'+badge+'</td><td><span class="tag '+(on?"on":"")+'">'+( on?on+" 个设备在线":"离线")+'</span></td><td class="hide-m" style="font-family:monospace;font-size:12px;color:var(--text-dim)">'+sz(monthly)+'</td><td class="hide-m" style="font-family:monospace;font-size:12px;color:var(--text-dim)">'+sz(total)+(tlim?" / "+sz(tlim):"")+'</td><td><div class="act"><button class="ibtn" onclick="show(\\x27'+x.username+'\\x27,\\x27'+x.password+'\\x27)" title="配置">⚙</button>'+(on?'<button class="ibtn danger" onclick="kick(\\x27'+x.username+'\\x27)">⚡</button>':'')+'<button class="ibtn danger" onclick="del(\\x27'+x.username+'\\x27)">🗑</button></div></td></tr>'
+return '<tr><td><b>'+x.username+'</b>'+badge+'</td><td><span class="tag '+(on?"on":"")+'">'+( on?on+" 个设备在线":"离线")+'</span></td><td class="hide-m" style="font-family:monospace;font-size:12px;color:var(--text-dim)">'+sz(monthly)+'</td><td class="hide-m" style="font-family:monospace;font-size:12px;color:var(--text-dim)">'+sz(total)+(tlim?" / "+sz(tlim):"")+'</td><td><div class="act"><button class="ibtn" onclick="show(\\\\x27'+x.username+'\\\\x27,\\\\x27'+x.password+'\\\\x27)" title="配置">⚙</button>'+(on?'<button class="ibtn danger" onclick="kick(\\\\x27'+x.username+'\\\\x27)">⚡</button>':'')+'<button class="ibtn danger" onclick="del(\\\\x27'+x.username+'\\\\x27)">🗑</button></div></td></tr>'
 }).join("")})}
 function addUser(){const u=$("#nu").value,p=$("#np").value,d=$("#nd").value||0,t=$("#nt").value||0;
 fetch("/api/manage?key="+encodeURIComponent(cfg.adminPass||localStorage.getItem("ap")||"")+"&action=create&user="+encodeURIComponent(u)+(p?"&pass="+encodeURIComponent(p):"")+"&days="+d+"&traffic="+t).then(r=>r.json()).then(r=>{if(r.success){closeM();toast("用户 "+u+" 已创建，密码: "+r.password);load()}else toast(r.error||"创建失败",1)})}
