@@ -332,8 +332,8 @@ configure_hysteria() {
     done
     
     # 获取端口
-    read -p "请输入监听端口 [默认: 443]: " PORT
-    PORT=${PORT:-443}
+    read -p "请输入监听端口 [默认: 10000]: " PORT
+    PORT=${PORT:-10000}
     
     # 管理面板密码
     DEFAULT_ADMIN_PASS=$(generate_password)
