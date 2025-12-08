@@ -28,7 +28,7 @@ ADMIN_SERVICE="hysteria-admin.service"
 # 全局变量
 DOMAIN=""
 EMAIL=""
-PORT="443"
+PORT="10000"
 ADMIN_PORT="8080"
 ADMIN_PASSWORD=""
 
