@@ -302,9 +302,9 @@ edit_rules() {
     echo ""
     
     echo "选择操作:"
-    echo "  1. 添加 IP/CIDR 绕过"
-    echo "  2. 添加域名绕过"
-    echo "  3. 添加正则匹配绕过"
+    echo "  1. 添加 IP 地址绕过 (如 1.2.3.4 或 10.0.0.0/8)"
+    echo "  2. 添加域名绕过 (如 baidu.com)"
+    echo "  3. 添加域名关键词匹配 (输入关键词，用逗号分隔)"
     echo "  4. 使用编辑器打开规则文件"
     echo "  5. 重置为默认规则"
     echo "  0. 返回"
@@ -313,24 +313,46 @@ edit_rules() {
     
     case $rule_choice in
         1)
-            read -p "输入 IP 或 CIDR (如 1.2.3.4 或 10.0.0.0/8): " ip_rule
+            echo ""
+            echo "IP 地址格式说明:"
+            echo "  - 单个 IP: 192.168.1.1"
+            echo "  - IP 段:   10.0.0.0/8 (表示 10.x.x.x 整个网段)"
+            echo ""
+            read -p "输入 IP 地址: " ip_rule
             if [[ -n "$ip_rule" ]]; then
                 echo "$ip_rule" >> "$RULES_FILE"
                 print_success "已添加: $ip_rule"
             fi
             ;;
         2)
-            read -p "输入域名 (如 example.com 或 *.example.com): " domain_rule
+            echo ""
+            echo "域名格式说明:"
+            echo "  - 精确域名: example.com"
+            echo "  - 通配域名: *.example.com (匹配所有子域名)"
+            echo ""
+            read -p "输入域名: " domain_rule
             if [[ -n "$domain_rule" ]]; then
                 echo "$domain_rule" >> "$RULES_FILE"
                 print_success "已添加: $domain_rule"
             fi
             ;;
         3)
-            read -p "输入正则表达式 (如 .*\.cn$): " regex_rule
-            if [[ -n "$regex_rule" ]]; then
-                echo "regexp:$regex_rule" >> "$RULES_FILE"
-                print_success "已添加: regexp:$regex_rule"
+            echo ""
+            echo "域名关键词匹配 - 包含这些关键词的域名将绕过代理"
+            echo "示例: cn,baidu,taobao,aliyun"
+            echo ""
+            read -p "输入关键词 (逗号分隔): " keywords
+            if [[ -n "$keywords" ]]; then
+                # 将逗号分隔的关键词转换为通配符域名规则
+                IFS=',' read -ra KEYWORD_ARRAY <<< "$keywords"
+                for kw in "${KEYWORD_ARRAY[@]}"; do
+                    kw=$(echo "$kw" | xargs)  # trim
+                    if [[ -n "$kw" ]]; then
+                        # 添加为通配符域名
+                        echo "*${kw}*" >> "$RULES_FILE"
+                        print_success "已添加: *${kw}* (匹配包含 '$kw' 的域名)"
+                    fi
+                done
             fi
             ;;
         4)
