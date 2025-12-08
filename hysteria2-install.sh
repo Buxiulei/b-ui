@@ -651,7 +651,7 @@ th{color:var(--text-dim);text-transform:uppercase;font-size:12px;letter-spacing:
 <div id="m-add" class="modal"><div class="card"><h3>新建用户</h3><br>
 <input id="nu" placeholder="用户名"><input id="np" placeholder="密码 (留空自动生成)">
 <div style="display:flex;gap:10px"><button class="btn" style="background:rgba(255,255,255,0.1)" onclick="closeM()">取消</button><button class="btn" onclick="addUser()">创建</button></div></div></div>
-<div id="m-cfg" class="modal"><div class="card"><h3>连接配置</h3><div class="code-box" id="uri"></div>
+<div id="m-cfg" class="modal"><div class="card" style="text-align:center"><h3>连接配置</h3><div id="qrcode" style="margin:16px auto;background:#fff;padding:16px;border-radius:12px;width:fit-content"></div><div class="code-box" id="uri" style="margin-bottom:16px"></div>
 <div style="display:flex;gap:10px"><button class="btn" onclick="copy()">复制链接</button><button class="btn" style="background:rgba(255,255,255,0.1)" onclick="closeM()">关闭</button></div></div></div>
 <div class="toast-box" id="t-box"></div>
 <script>
@@ -679,7 +679,7 @@ return \`<tr><td><b>\${x.username}</b></td>
 function addUser(){api("/users",{method:"POST",body:JSON.stringify({username:$("#nu").value,password:$("#np").value})}).then(d=>{if(d.success){closeM();toast("用户已创建");load()}else toast("操作失败",1)})}
 function del(u){if(confirm("确定要删除用户 "+u+" 吗?"))api("/users/"+u,{method:"DELETE"}).then(()=>load())}
 function kick(u){api("/kick",{method:"POST",body:JSON.stringify([u])}).then(()=>toast("已将用户 "+u+" 强制下线"))}
-function show(u,p){$("#uri").innerText="hysteria2://"+p+"@"+cfg.domain+":"+cfg.port+"/?insecure=0#"+u;openM("m-cfg")}
+function show(u,p){const uri="hysteria2://"+p+"@"+cfg.domain+":"+cfg.port+"/?insecure=0#"+u;$("#uri").innerText=uri;$("#qrcode").innerHTML='<img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data='+encodeURIComponent(uri)+'" alt="QR Code" style="display:block">';openM("m-cfg")}
 function copy(){navigator.clipboard.writeText($("#uri").innerText);toast("已复制到剪贴板")}
 if(tok)init();
 </script></body></html>`;

@@ -153,8 +153,37 @@ TUN 模式提供全局透明代理，所有流量自动走代理：
 |------|------|
 | 操作系统 | Ubuntu / Debian / CentOS |
 | 权限 | root |
-| 服务端 | 需要域名 + 80/443 端口 |
+| 服务端 | 需要域名 |
 | 客户端 | 任意 Linux |
+
+---
+
+## 🔓 需要开放的端口
+
+在云服务商的安全组中开放以下端口：
+
+| 端口 | 协议 | 用途 |
+|------|------|------|
+| 80 | TCP | SSL 证书验证 (Let's Encrypt) |
+| 443 | TCP | 管理面板 (HTTPS) |
+| 10000 | **UDP** | Hysteria2 代理 (默认端口) |
+
+### 云平台配置指南
+
+**AWS EC2:**
+1. EC2 控制台 → Security Groups
+2. 添加入站规则: 
+   - Type: Custom TCP, Port: 80, Source: 0.0.0.0/0
+   - Type: Custom TCP, Port: 443, Source: 0.0.0.0/0
+   - Type: Custom UDP, Port: 10000, Source: 0.0.0.0/0
+
+**阿里云 ECS:**
+1. ECS 控制台 → 安全组
+2. 添加入站规则: 80/TCP, 443/TCP, 10000/UDP
+
+**腾讯云 CVM:**
+1. CVM 控制台 → 安全组
+2. 添加入站规则: 80, 443, 10000(UDP)
 
 ---
 
