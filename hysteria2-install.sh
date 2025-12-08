@@ -364,18 +364,17 @@ configure_hysteria() {
 [{"username":"${FIRST_USER}","password":"${FIRST_USER_PASS}","createdAt":"$(date -Iseconds)"}]
 EOF
     
-    # 生成配置文件 (多用户模式)
+    # 生成配置文件 (使用 certbot 证书，因为 Nginx 已占用 443)
     cat > "$CONFIG_FILE" << EOF
-# Hysteria2 服务器配置 (多用户模式)
+# Hysteria2 服务器配置
 # 生成时间: $(date)
 
 listen: :${PORT}
 
-# ACME 自动证书
-acme:
-  domains:
-    - ${DOMAIN}
-  email: ${EMAIL}
+# 使用 certbot 证书 (Nginx 已占用 443 端口，无法使用 ACME)
+tls:
+  cert: /etc/letsencrypt/live/${DOMAIN}/fullchain.pem
+  key: /etc/letsencrypt/live/${DOMAIN}/privkey.pem
 
 # 多用户认证
 auth:
@@ -850,6 +849,11 @@ EOF
         
         if [[ $? -eq 0 ]]; then
             print_success "SSL 证书申请成功！"
+            
+            # 修复证书目录权限 (让 Hysteria 服务可以读取)
+            chmod 755 /etc/letsencrypt/live 2>/dev/null || true
+            chmod 755 /etc/letsencrypt/archive 2>/dev/null || true
+            chmod -R 644 /etc/letsencrypt/archive/${DOMAIN}/*.pem 2>/dev/null || true
             
             # 设置证书自动续期
             if ! crontab -l 2>/dev/null | grep -q "certbot renew"; then
