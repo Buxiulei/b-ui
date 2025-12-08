@@ -7,7 +7,7 @@
 # 版本: 1.0.0
 #===============================================================================
 
-SCRIPT_VERSION="1.0.3"
+SCRIPT_VERSION="1.0.4"
 
 set -e
 
@@ -301,10 +301,10 @@ EOF
 }
 
 #===============================================================================
-# 配置 Hysteria2 (多用户模式)
+# 收集用户配置输入
 #===============================================================================
 
-configure_hysteria() {
+collect_user_input() {
     print_info "配置 Hysteria2 服务器..."
     echo ""
     
@@ -356,6 +356,25 @@ configure_hysteria() {
     read -p "请输入伪装网站 URL [默认: https://www.bing.com/]: " MASQUERADE_URL
     MASQUERADE_URL=${MASQUERADE_URL:-"https://www.bing.com/"}
     
+    # 显示配置摘要
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}配置摘要：${NC}"
+    echo -e "  域名:       ${YELLOW}${DOMAIN}${NC}"
+    echo -e "  端口:       ${YELLOW}${PORT}${NC}"
+    echo -e "  管理密码:   ${YELLOW}${ADMIN_PASSWORD}${NC}"
+    echo -e "  首个用户:   ${YELLOW}${FIRST_USER}${NC}"
+    echo -e "  用户密码:   ${YELLOW}${FIRST_USER_PASS}${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+}
+
+#===============================================================================
+# 生成 Hysteria2 配置文件
+#===============================================================================
+
+configure_hysteria() {
+    print_info "生成 Hysteria2 配置文件..."
+    
     # 创建目录并设置权限
     mkdir -p "$BASE_DIR"
     chmod 755 "$BASE_DIR"
@@ -401,17 +420,6 @@ EOF
     chmod 644 "$USERS_FILE"
     
     print_success "配置文件已生成: $CONFIG_FILE"
-    
-    # 显示配置摘要
-    echo ""
-    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
-    echo -e "${GREEN}配置摘要：${NC}"
-    echo -e "  域名:       ${YELLOW}${DOMAIN}${NC}"
-    echo -e "  端口:       ${YELLOW}${PORT}${NC}"
-    echo -e "  管理密码:   ${YELLOW}${ADMIN_PASSWORD}${NC}"
-    echo -e "  首个用户:   ${YELLOW}${FIRST_USER}${NC}"
-    echo -e "  用户密码:   ${YELLOW}${FIRST_USER_PASS}${NC}"
-    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
 }
 
 #===============================================================================
@@ -1393,31 +1401,35 @@ quick_install() {
     # 网络环境预检
     run_network_checks
     
-    # 1. 先安装依赖和配置环境
+    # 1. 收集用户配置 (域名、端口、密码等)
+    collect_user_input
+    echo ""
+    
+    # 2. 安装 Hysteria2 和启用 BBR
     install_hysteria
     echo ""
     enable_bbr
     echo ""
     
-    # 2. 安装 Web 服务相关组件
+    # 3. 安装 Web 服务相关组件
     print_info "安装 Web 管理面板..."
     install_nodejs
     install_nginx
     install_chinese_fonts
     
-    # 3. 启动 Nginx 并开放端口 (用于 Certbot 验证)
+    # 4. 启动 Nginx 并开放端口 (用于 Certbot 验证)
     systemctl start nginx 2>/dev/null || true
     configure_firewall "$PORT" "$ADMIN_PORT"
     
-    # 4. 先申请 SSL 证书 (Hysteria 需要证书才能启动)
+    # 5. 申请 SSL 证书 (此时 DOMAIN 已设置)
     configure_nginx_proxy
     echo ""
     
-    # 5. 生成 Hysteria 配置 (此时证书已存在)
+    # 6. 生成 Hysteria 配置 (此时证书已存在)
     configure_hysteria
     echo ""
     
-    # 6. 启动 Hysteria 服务
+    # 7. 启动 Hysteria 服务
     start_hysteria
     echo ""
     
