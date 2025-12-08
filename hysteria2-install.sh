@@ -19,9 +19,8 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-# 路径配置 (自动使用脚本所在目录下的 data 文件夹)
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BASE_DIR="${SCRIPT_DIR}/data"
+# 路径配置 (使用固定目录，确保系统服务可以访问)
+BASE_DIR="/opt/hysteria"
 CONFIG_FILE="${BASE_DIR}/config.yaml"
 USERS_FILE="${BASE_DIR}/users.json"
 ADMIN_DIR="${BASE_DIR}/admin"
