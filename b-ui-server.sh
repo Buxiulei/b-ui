@@ -7,7 +7,7 @@
 # 版本: 1.0.0
 #===============================================================================
 
-SCRIPT_VERSION="1.0.8"
+SCRIPT_VERSION="1.0.9"
 
 set -e
 
@@ -727,6 +727,7 @@ th{color:var(--text-dim);text-transform:uppercase;font-size:12px;letter-spacing:
 <div class="toast-box" id="t-box"></div>
 <script>
 const $=s=>document.querySelector(s);let tok=localStorage.getItem("t"),cfg={};
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const sz=b=>{if(!b)return"0 B";const i=Math.floor(Math.log(b)/Math.log(1024));return(b/Math.pow(1024,i)).toFixed(2)+" "+["B","KB","MB","GB"][i]};
 function toast(m,e){const d=document.createElement("div");d.className="toast";d.innerHTML="<span>"+(e?"⚠️":"✅")+"</span>"+m;$("#t-box").appendChild(d);setTimeout(()=>d.remove(),3000)}
 function openM(id){$("#"+id).classList.add("on")} function closeM(){document.querySelectorAll(".modal").forEach(e=>e.classList.remove("on"))}
@@ -744,7 +745,7 @@ $("#tb").innerHTML=u.map(x=>{
 const on=o[x.username],monthly=x.usage?.monthly?.[m]||0,total=x.usage?.total||0;
 const exp=x.limits?.expiresAt?new Date(x.limits.expiresAt)<new Date():"",tlim=x.limits?.trafficLimit,over=tlim&&total>=tlim;
 const badge=exp?' <span style="color:var(--danger);font-size:10px">[已过期]</span>':(over?' <span style="color:var(--danger);font-size:10px">[超限]</span>':"");
-return '<tr><td><b>'+x.username+'</b>'+badge+'</td><td><span class="tag '+(on?"on":"")+'">'+( on?on+" 个设备在线":"离线")+'</span></td><td class="hide-m" style="font-family:monospace;font-size:12px;color:var(--text-dim)">'+sz(monthly)+'</td><td class="hide-m" style="font-family:monospace;font-size:12px;color:var(--text-dim)">'+sz(total)+(tlim?" / "+sz(tlim):"")+'</td><td><div class="act"><button class="ibtn" onclick="show(&apos;'+x.username+'&apos;,&apos;'+x.password+'&apos;)" title="配置">⚙</button>'+(on?'<button class="ibtn danger" onclick="kick(&apos;'+x.username+'&apos;)">⚡</button>':'')+'<button class="ibtn danger" onclick="del(&apos;'+x.username+'&apos;)">🗑</button></div></td></tr>'
+return '<tr><td><b>'+esc(x.username)+'</b>'+badge+'</td><td><span class="tag '+(on?"on":"")+'">'+( on?on+" 个设备在线":"离线")+'</span></td><td class="hide-m" style="font-family:monospace;font-size:12px;color:var(--text-dim)">'+sz(monthly)+'</td><td class="hide-m" style="font-family:monospace;font-size:12px;color:var(--text-dim)">'+sz(total)+(tlim?" / "+sz(tlim):"")+'</td><td><div class="act"><button class="ibtn" onclick="show(&apos;'+esc(x.username)+'&apos;,&apos;'+esc(x.password)+'&apos;)" title="配置">⚙</button>'+(on?'<button class="ibtn danger" onclick="kick(&apos;'+esc(x.username)+'&apos;)">⚡</button>':'')+'<button class="ibtn danger" onclick="del(&apos;'+esc(x.username)+'&apos;)">🗑</button></div></td></tr>'
 }).join("")})}
 function addUser(){const u=$("#nu").value,p=$("#np").value,d=$("#nd").value||0,t=$("#nt").value||0;
 fetch("/api/manage?key="+encodeURIComponent(cfg.adminPass||localStorage.getItem("ap")||"")+"&action=create&user="+encodeURIComponent(u)+(p?"&pass="+encodeURIComponent(p):"")+"&days="+d+"&traffic="+t).then(r=>r.json()).then(r=>{if(r.success){closeM();toast("用户 "+u+" 已创建，密码: "+r.password);load()}else toast(r.error||"创建失败",1)})}
