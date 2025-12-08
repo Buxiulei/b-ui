@@ -869,23 +869,37 @@ show_status() {
     echo -e "  管理密码: ${GREEN}${admin_pass}${NC}"
     echo ""
     
-    echo -e "${YELLOW}[URL 管理 API 示例]${NC}"
-    echo -e "  ${CYAN}创建用户:${NC}"
-    echo -e "  https://${domain}/api/manage?key=${admin_pass}&action=create&user=用户名&days=30&traffic=10"
+    echo -e "${YELLOW}[URL 管理 API]${NC}"
+    echo -e "  基础 URL: ${GREEN}https://${domain}/api/manage${NC}"
     echo ""
-    echo -e "  ${CYAN}删除用户:${NC}"
-    echo -e "  https://${domain}/api/manage?key=${admin_pass}&action=delete&user=用户名"
+    echo -e "  ${CYAN}┌─ action 参数 (必填) ─────────────────────────────────────┐${NC}"
+    echo -e "  ${CYAN}│${NC}  create  - 创建新用户                                    ${CYAN}│${NC}"
+    echo -e "  ${CYAN}│${NC}  delete  - 删除用户                                      ${CYAN}│${NC}"
+    echo -e "  ${CYAN}│${NC}  update  - 修改用户配置                                  ${CYAN}│${NC}"
+    echo -e "  ${CYAN}│${NC}  list    - 列出所有用户                                  ${CYAN}│${NC}"
+    echo -e "  ${CYAN}└──────────────────────────────────────────────────────────┘${NC}"
     echo ""
-    echo -e "  ${CYAN}修改配置:${NC}"
-    echo -e "  https://${domain}/api/manage?key=${admin_pass}&action=update&user=用户名&days=30&traffic=10"
+    echo -e "  ${CYAN}┌─ 参数说明 ───────────────────────────────────────────────┐${NC}"
+    echo -e "  ${CYAN}│${NC}  key     - 管理密码 (必填)                               ${CYAN}│${NC}"
+    echo -e "  ${CYAN}│${NC}  user    - 用户名 (必填，除 list 外)                     ${CYAN}│${NC}"
+    echo -e "  ${CYAN}│${NC}  pass    - 密码 (可选，留空自动生成8位随机密码)          ${CYAN}│${NC}"
+    echo -e "  ${CYAN}│${NC}  days    - 有效天数，单位: 天 (0=永久有效)               ${CYAN}│${NC}"
+    echo -e "  ${CYAN}│${NC}  traffic - 总流量限制，单位: GB (0=不限)                 ${CYAN}│${NC}"
+    echo -e "  ${CYAN}│${NC}  monthly - 月流量限制，单位: GB (0=不限)                 ${CYAN}│${NC}"
+    echo -e "  ${CYAN}└──────────────────────────────────────────────────────────┘${NC}"
     echo ""
-    echo -e "  ${CYAN}参数说明:${NC}"
-    echo -e "    key     - 管理密码"
-    echo -e "    user    - 用户名"
-    echo -e "    pass    - 密码 (可选，留空自动生成)"
-    echo -e "    days    - 有效天数 (0=不限)"
-    echo -e "    traffic - 总流量限制 GB (0=不限)"
-    echo -e "    monthly - 月流量限制 GB (0=不限)"
+    echo -e "  ${YELLOW}示例:${NC}"
+    echo -e "  ${GREEN}# 创建用户 (30天有效期，10GB总流量):${NC}"
+    echo -e "  https://${domain}/api/manage?key=${admin_pass}&action=create&user=test&days=30&traffic=10"
+    echo ""
+    echo -e "  ${GREEN}# 删除用户:${NC}"
+    echo -e "  https://${domain}/api/manage?key=${admin_pass}&action=delete&user=test"
+    echo ""
+    echo -e "  ${GREEN}# 修改用户配置 (续期30天，增加流量限制):${NC}"
+    echo -e "  https://${domain}/api/manage?key=${admin_pass}&action=update&user=test&days=30&traffic=20"
+    echo ""
+    echo -e "  ${GREEN}# 列出所有用户:${NC}"
+    echo -e "  https://${domain}/api/manage?key=${admin_pass}&action=list"
     echo ""
 }
 
@@ -1105,34 +1119,38 @@ uninstall_all() {
     rm -f /etc/nginx/conf.d/hysteria-admin.conf
     systemctl reload nginx 2>/dev/null || true
     
-    # 询问是否删除证书
-    echo ""
-    read -p "是否删除 SSL 证书? (y/N): " del_cert
-    if [[ "$del_cert" =~ ^[Yy]$ ]]; then
-        print_info "删除 SSL 证书..."
-        # 获取域名
-        local domain=$(ls /etc/letsencrypt/live/ 2>/dev/null | head -1)
-        if [[ -n "$domain" ]]; then
-            certbot delete --cert-name "$domain" --non-interactive 2>/dev/null || true
-        fi
-        rm -rf /etc/letsencrypt/live/*
-        rm -rf /etc/letsencrypt/archive/*
-        rm -rf /etc/letsencrypt/renewal/*
-    fi
-    
     # 删除 certbot 自动续期 cron
     print_info "清理定时任务..."
     crontab -l 2>/dev/null | grep -v "certbot renew" | crontab - 2>/dev/null || true
     
+    # 删除 SSL 证书
+    print_info "删除 SSL 证书..."
+    local domain=$(ls /etc/letsencrypt/live/ 2>/dev/null | head -1)
+    if [[ -n "$domain" ]]; then
+        certbot delete --cert-name "$domain" --non-interactive 2>/dev/null || true
+    fi
+    rm -rf /etc/letsencrypt/live/*
+    rm -rf /etc/letsencrypt/archive/*
+    rm -rf /etc/letsencrypt/renewal/*
+    
+    # 卸载相关软件包
+    print_info "卸载相关软件包..."
+    apt-get purge -y nginx nginx-common nginx-core 2>/dev/null || true
+    apt-get purge -y nodejs npm 2>/dev/null || true
+    apt-get purge -y certbot python3-certbot-nginx 2>/dev/null || true
+    apt-get autoremove -y 2>/dev/null || true
+    
+    # 清理残留配置
+    rm -rf /etc/nginx
+    rm -rf /var/log/nginx
+    rm -rf /var/www/html
+    
     echo ""
     echo -e "${GREEN}════════════════════════════════════════════════════════════════${NC}"
-    echo -e "${GREEN}  卸载完成！${NC}"
+    echo -e "${GREEN}  完全卸载完成！${NC}"
     echo -e "${GREEN}════════════════════════════════════════════════════════════════${NC}"
     echo ""
-    echo -e "以下组件未卸载 (如需卸载请手动操作)："
-    echo -e "  - Nginx: ${YELLOW}apt remove nginx${NC}"
-    echo -e "  - Node.js: ${YELLOW}apt remove nodejs${NC}"
-    echo -e "  - Certbot: ${YELLOW}apt remove certbot${NC}"
+    echo -e "已删除: Hysteria2, H-UI, Nginx, Node.js, Certbot, SSL 证书"
     echo ""
 }
 
@@ -1249,7 +1267,7 @@ quick_install() {
 show_menu() {
     echo ""
     echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║${NC}                      ${GREEN}操作菜单${NC}                              ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}                      ${GREEN}H-UI 操作菜单${NC}                          ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}1.${NC} 一键安装 (Hysteria2 + 管理面板)                        ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}2.${NC} 查看状态                                               ${CYAN}║${NC}"
@@ -1258,7 +1276,8 @@ show_menu() {
     echo -e "${CYAN}║${NC}  ${YELLOW}5.${NC} 查看日志                                               ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}6.${NC} 开启 BBR                                               ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}7.${NC} 开机自启动设置                                         ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}8.${NC} ${RED}一键卸载${NC}                                               ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}8.${NC} ${GREEN}更新 Hysteria2${NC}                                         ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}9.${NC} ${RED}完全卸载${NC}                                               ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}0.${NC} 退出                                                   ${CYAN}║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
 }
@@ -1273,7 +1292,7 @@ main() {
     
     while true; do
         show_menu
-        read -p "请选择 [0-8]: " choice
+        read -p "请选择 [0-9]: " choice
         
         case $choice in
             1) quick_install ;;
@@ -1312,7 +1331,17 @@ main() {
                     fi
                 fi
                 ;;
-            8) uninstall_all ;;
+            8)
+                print_info "正在更新 Hysteria2..."
+                local old_version=$(hysteria version 2>/dev/null | head -n1 || echo "未知")
+                bash <(curl -fsSL https://get.hy2.sh/)
+                local new_version=$(hysteria version 2>/dev/null | head -n1 || echo "未知")
+                print_success "更新完成！"
+                echo -e "  旧版本: ${YELLOW}${old_version}${NC}"
+                echo -e "  新版本: ${GREEN}${new_version}${NC}"
+                systemctl restart "$HYSTERIA_SERVICE" 2>/dev/null || true
+                ;;
+            9) uninstall_all ;;
             0) print_info "再见！"; exit 0 ;;
             *) print_error "无效选项" ;;
         esac
