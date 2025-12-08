@@ -661,7 +661,7 @@ th{color:var(--text-dim);text-transform:uppercase;font-size:12px;letter-spacing:
 <script>
 const $=s=>document.querySelector(s);let tok=localStorage.getItem("t"),cfg={};
 const sz=b=>{if(!b)return"0 B";const i=Math.floor(Math.log(b)/Math.log(1024));return(b/Math.pow(1024,i)).toFixed(2)+" "+["B","KB","MB","GB"][i]};
-function toast(m,e){const d=document.createElement("div");d.className="toast";d.innerHTML=`<span>${e?"⚠️":"✅"}</span>${m}`;$("#t-box").appendChild(d);setTimeout(()=>d.remove(),3000)}
+function toast(m,e){const d=document.createElement("div");d.className="toast";d.innerHTML="<span>"+(e?"⚠️":"✅")+"</span>"+m;$("#t-box").appendChild(d);setTimeout(()=>d.remove(),3000)}
 function openM(id){$("#"+id).classList.add("on")} function closeM(){document.querySelectorAll(".modal").forEach(e=>e.classList.remove("on"))}
 function api(ep,opt={}){return fetch("/api"+ep,{...opt,headers:{...opt.headers,Authorization:"Bearer "+tok}}).then(r=>{if(r.status==401)logout();return r.json()})}
 function login(){fetch("/api/login",{method:"POST",body:JSON.stringify({password:$("#lp").value})}).then(r=>r.json()).then(d=>{if(d.token){tok=d.token;localStorage.setItem("t",tok);init()}else toast("密码错误",1)})}
