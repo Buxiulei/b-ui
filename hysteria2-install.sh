@@ -324,8 +324,9 @@ configure_hysteria() {
     done
     
     # 获取邮箱
-    read -p "请输入邮箱 (用于 Let's Encrypt): " EMAIL
-    while [[ -z "$EMAIL" || ! "$EMAIL" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; do
+    read -p "请输入邮箱 (用于 Let's Encrypt) [默认: test@gmail.com]: " EMAIL
+    EMAIL=${EMAIL:-test@gmail.com}
+    while [[ ! "$EMAIL" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; do
         print_error "请输入有效的邮箱"
         read -p "请输入邮箱: " EMAIL
     done
