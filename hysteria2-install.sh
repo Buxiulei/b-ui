@@ -1048,6 +1048,94 @@ start_hysteria() {
     fi
 }
 
+uninstall_all() {
+    echo ""
+    echo -e "${RED}════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${RED}  警告：此操作将完全卸载 Hysteria2 和 H-UI 管理面板${NC}"
+    echo -e "${RED}════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "将删除以下内容："
+    echo -e "  - Hysteria2 服务和二进制文件"
+    echo -e "  - H-UI 管理面板服务和文件"
+    echo -e "  - 所有用户配置和流量数据"
+    echo -e "  - Nginx 代理配置"
+    echo -e "  - SSL 证书 (可选)"
+    echo -e "  - h-ui 命令行工具"
+    echo ""
+    read -p "确定要继续吗? (输入 YES 确认): " confirm
+    
+    if [[ "$confirm" != "YES" ]]; then
+        print_info "已取消卸载"
+        return
+    fi
+    
+    print_info "开始卸载..."
+    
+    # 停止并禁用服务
+    print_info "停止服务..."
+    systemctl stop hysteria-server 2>/dev/null || true
+    systemctl stop hysteria-admin 2>/dev/null || true
+    systemctl disable hysteria-server 2>/dev/null || true
+    systemctl disable hysteria-admin 2>/dev/null || true
+    
+    # 删除 systemd 服务文件
+    print_info "删除服务配置..."
+    rm -f /etc/systemd/system/hysteria-server.service
+    rm -f /etc/systemd/system/hysteria-admin.service
+    rm -rf /etc/systemd/system/hysteria-server.service.d
+    systemctl daemon-reload
+    
+    # 删除 Hysteria 二进制文件
+    print_info "删除 Hysteria 程序..."
+    rm -f /usr/local/bin/hysteria
+    
+    # 删除配置和数据目录
+    print_info "删除配置和数据..."
+    rm -rf /opt/hysteria
+    rm -rf /etc/hysteria
+    
+    # 删除 h-ui 命令
+    print_info "删除 h-ui 命令..."
+    rm -f /usr/local/bin/h-ui
+    
+    # 删除 Nginx 配置
+    print_info "删除 Nginx 配置..."
+    rm -f /etc/nginx/sites-enabled/hysteria-admin
+    rm -f /etc/nginx/sites-available/hysteria-admin
+    rm -f /etc/nginx/conf.d/hysteria-admin.conf
+    systemctl reload nginx 2>/dev/null || true
+    
+    # 询问是否删除证书
+    echo ""
+    read -p "是否删除 SSL 证书? (y/N): " del_cert
+    if [[ "$del_cert" =~ ^[Yy]$ ]]; then
+        print_info "删除 SSL 证书..."
+        # 获取域名
+        local domain=$(ls /etc/letsencrypt/live/ 2>/dev/null | head -1)
+        if [[ -n "$domain" ]]; then
+            certbot delete --cert-name "$domain" --non-interactive 2>/dev/null || true
+        fi
+        rm -rf /etc/letsencrypt/live/*
+        rm -rf /etc/letsencrypt/archive/*
+        rm -rf /etc/letsencrypt/renewal/*
+    fi
+    
+    # 删除 certbot 自动续期 cron
+    print_info "清理定时任务..."
+    crontab -l 2>/dev/null | grep -v "certbot renew" | crontab - 2>/dev/null || true
+    
+    echo ""
+    echo -e "${GREEN}════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}  卸载完成！${NC}"
+    echo -e "${GREEN}════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "以下组件未卸载 (如需卸载请手动操作)："
+    echo -e "  - Nginx: ${YELLOW}apt remove nginx${NC}"
+    echo -e "  - Node.js: ${YELLOW}apt remove nodejs${NC}"
+    echo -e "  - Certbot: ${YELLOW}apt remove certbot${NC}"
+    echo ""
+}
+
 show_status() {
     echo ""
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
@@ -1224,55 +1312,7 @@ main() {
                     fi
                 fi
                 ;;
-            8)
-                echo ""
-                echo -e "${RED}╔══════════════════════════════════════════════════════════════╗${NC}"
-                echo -e "${RED}║                     警告: 一键卸载                            ║${NC}"
-                echo -e "${RED}╚══════════════════════════════════════════════════════════════╝${NC}"
-                echo ""
-                echo -e "将删除以下内容:"
-                echo -e "  - Hysteria2 和管理面板服务"
-                echo -e "  - 配置文件和用户数据 (${BASE_DIR})"
-                echo -e "  - Nginx 配置"
-                echo -e "  - systemd 服务文件"
-                echo ""
-                read -p "确定要卸载吗? 输入 'YES' 确认: " confirm
-                if [[ "$confirm" == "YES" ]]; then
-                    print_info "正在卸载..."
-                    
-                    # 停止服务
-                    systemctl stop "$HYSTERIA_SERVICE" 2>/dev/null || true
-                    systemctl stop "$ADMIN_SERVICE" 2>/dev/null || true
-                    systemctl disable "$HYSTERIA_SERVICE" 2>/dev/null || true
-                    systemctl disable "$ADMIN_SERVICE" 2>/dev/null || true
-                    
-                    # 删除 systemd 服务文件
-                    rm -f "/etc/systemd/system/$ADMIN_SERVICE"
-                    rm -rf "/etc/systemd/system/hysteria-server.service.d"
-                    systemctl daemon-reload
-                    
-                    # 删除 nginx 配置
-                    rm -f /etc/nginx/conf.d/hysteria-admin.conf
-                    systemctl reload nginx 2>/dev/null || true
-                    
-                    # 删除数据目录
-                    rm -rf "$BASE_DIR"
-                    
-                    print_success "服务和配置已卸载"
-                    
-                    # 询问是否删除 Hysteria 程序
-                    read -p "是否同时删除 Hysteria2 程序? (y/n): " del_bin
-                    if [[ "$del_bin" == "y" || "$del_bin" == "Y" ]]; then
-                        bash <(curl -fsSL https://get.hy2.sh/) --remove 2>/dev/null || rm -f /usr/local/bin/hysteria
-                        print_success "Hysteria2 程序已删除"
-                    fi
-                    
-                    echo ""
-                    print_success "卸载完成！"
-                else
-                    print_info "已取消卸载"
-                fi
-                ;;
+            8) uninstall_all ;;
             0) print_info "再见！"; exit 0 ;;
             *) print_error "无效选项" ;;
         esac
