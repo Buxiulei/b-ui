@@ -70,12 +70,12 @@ check_os() {
     if [[ -f /etc/os-release ]]; then
         . /etc/os-release
         OS=$ID
-        VERSION=$VERSION_ID
+        OS_VERSION=$VERSION_ID
     else
         print_error "无法识别操作系统"
         exit 1
     fi
-    print_info "检测到操作系统: $OS $VERSION"
+    print_info "检测到操作系统: $OS $OS_VERSION"
     
     if ! command -v systemctl &> /dev/null; then
         print_error "此系统不支持 systemd，无法继续安装"
