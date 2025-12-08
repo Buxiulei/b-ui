@@ -659,7 +659,7 @@ th{color:var(--text-dim);text-transform:uppercase;font-size:12px;letter-spacing:
 <div id="m-add" class="modal"><div class="card"><h3>新建用户</h3><br>
 <input id="nu" placeholder="用户名"><input id="np" placeholder="密码 (留空自动生成)">
 <div style="display:flex;gap:10px"><button class="btn" style="background:rgba(255,255,255,0.1)" onclick="closeM()">取消</button><button class="btn" onclick="addUser()">创建</button></div></div></div>
-<div id="m-cfg" class="modal"><div class="card" style="text-align:center"><h3>连接配置</h3><div id="qrcode" style="margin:16px auto;background:#fff;padding:16px;border-radius:12px;width:fit-content"></div><div class="code-box" id="uri" style="margin-bottom:16px"></div>
+<div id="m-cfg" class="modal"><div class="card" style="text-align:center"><h3>连接配置</h3><p style="font-size:12px;color:var(--text-dim);margin:0 0 8px">兼容 v2rayN / Shadowrocket / Clash Meta</p><div id="qrcode" style="margin:16px auto;background:#fff;padding:16px;border-radius:12px;width:fit-content"></div><div class="code-box" id="uri" style="margin-bottom:16px"></div>
 <div style="display:flex;gap:10px"><button class="btn" onclick="copy()">复制链接</button><button class="btn" style="background:rgba(255,255,255,0.1)" onclick="closeM()">关闭</button></div></div></div>
 <div class="toast-box" id="t-box"></div>
 <script>
