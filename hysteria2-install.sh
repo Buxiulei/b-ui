@@ -913,9 +913,43 @@ show_status() {
     echo -e "  ${GREEN}# 列出所有用户:${NC}"
     echo -e "  https://${domain}/api/manage?key=${admin_pass}&action=list"
     echo ""
+    echo -e "  ${YELLOW}按 p 修改密码, 按 q 退出, 按其他键刷新${NC}"
 }
 
-show_status
+change_password() {
+    echo ""
+    read -p "请输入新密码 (至少6位): " new_pass
+    if [[ ${#new_pass} -lt 6 ]]; then
+        echo -e "${RED}密码至少6位${NC}"
+        return 1
+    fi
+    
+    local svc="/etc/systemd/system/hysteria-admin.service"
+    if [[ ! -f "$svc" ]]; then
+        echo -e "${RED}服务配置文件不存在${NC}"
+        return 1
+    fi
+    
+    sed -i "s/ADMIN_PASSWORD=[^ ]*/ADMIN_PASSWORD=${new_pass}/" "$svc"
+    systemctl daemon-reload
+    systemctl restart hysteria-admin
+    
+    echo -e "${GREEN}密码已更新为: ${new_pass}${NC}"
+    echo -e "${YELLOW}请使用新密码登录 Web 管理面板${NC}"
+}
+
+main_loop() {
+    while true; do
+        show_status
+        read -n1 -p "" key
+        case $key in
+            p|P) change_password ;;
+            q|Q) exit 0 ;;
+        esac
+    done
+}
+
+main_loop
 HUIEOF
     
     chmod +x /usr/local/bin/h-ui
