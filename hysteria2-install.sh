@@ -703,6 +703,10 @@ SERVEREOF
 create_admin_service() {
     print_info "创建管理面板服务..."
     
+    # 安装依赖
+    cd "$ADMIN_DIR"
+    npm install --production 2>/dev/null || true
+    
     cat > "/etc/systemd/system/$ADMIN_SERVICE" << EOF
 [Unit]
 Description=Hysteria2 Admin Panel
@@ -732,6 +736,7 @@ EOF
         print_success "管理面板服务已启动"
     else
         print_error "管理面板服务启动失败"
+        journalctl -u "$ADMIN_SERVICE" --no-pager -n 5
     fi
 }
 
@@ -775,6 +780,7 @@ EOF
     
     # 创建临时测试文件
     local test_id=$(head /dev/urandom | tr -dc 'a-z0-9' | head -c 8)
+    mkdir -p /var/www/html/.well-known/acme-challenge
     echo "test-${test_id}" > /var/www/html/.well-known/acme-challenge/test-${test_id}
     
     # 等待 nginx 加载
