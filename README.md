@@ -1,10 +1,10 @@
-# H-UI - Hysteria2 一键部署工具
+# B-UI - Hysteria2 一键部署工具
 
 基于 [Hysteria2](https://v2.hysteria.network/) 的一键安装脚本，支持服务端和客户端部署，自带 Web 管理面板。
 
 ## ✨ 功能特性
 
-### 服务端 (H-UI)
+### 服务端 (B-UI)
 - 🚀 一键安装 Hysteria2 服务器
 - 👥 多用户管理 (Web 面板)
 - 📊 流量统计 / 在线状态 / 月度流量
@@ -14,7 +14,7 @@
 - 🔑 管理密码可修改 (Web + 终端)
 - 🌐 URL API 管理接口
 - ⚡ BBR 优化
-- 🖥️ h-ui 终端管理命令
+- 🖥️ b-ui 终端管理命令
 
 ### 客户端
 - 🔌 SOCKS5 / HTTP 代理
@@ -29,20 +29,20 @@
 
 ```bash
 # 下载脚本
-curl -fsSL https://raw.githubusercontent.com/Buxiulei/h-ui/main/h-ui-server.sh -o h-ui-server.sh
+curl -fsSL https://raw.githubusercontent.com/Buxiulei/b-ui/main/b-ui-server.sh -o b-ui-server.sh
 
 # 运行安装
-sudo bash h-ui-server.sh
+sudo bash b-ui-server.sh
 ```
 
 ### 安装完成后
 
 - Web 管理面板: `https://你的域名/`
-- 终端管理: 输入 `h-ui`
+- 终端管理: 输入 `b-ui`
 
-### 终端管理 (h-ui)
+### 终端管理 (b-ui)
 
-安装后在终端输入 `h-ui` 即可查看：
+安装后在终端输入 `b-ui` 即可查看：
 - 服务运行状态
 - 绑定域名和端口
 - 管理员密码
@@ -82,10 +82,10 @@ sudo bash h-ui-server.sh
 
 ```bash
 # 下载脚本
-curl -fsSL https://raw.githubusercontent.com/Buxiulei/h-ui/main/h-ui-client.sh -o h-ui-client.sh
+curl -fsSL https://raw.githubusercontent.com/Buxiulei/b-ui/main/b-ui-client.sh -o b-ui-client.sh
 
 # 运行安装
-sudo bash h-ui-client.sh
+sudo bash b-ui-client.sh
 ```
 
 ### 客户端菜单
@@ -132,7 +132,7 @@ curl https://www.google.com
 ├── users.json           # 用户数据 (含流量统计)
 └── admin/               # 管理面板
 
-/usr/local/bin/h-ui      # 终端管理命令
+/usr/local/bin/b-ui      # 终端管理命令
 ```
 
 ---

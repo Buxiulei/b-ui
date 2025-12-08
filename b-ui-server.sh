@@ -25,7 +25,7 @@ CONFIG_FILE="${BASE_DIR}/config.yaml"
 USERS_FILE="${BASE_DIR}/users.json"
 ADMIN_DIR="${BASE_DIR}/admin"
 HYSTERIA_SERVICE="hysteria-server.service"
-ADMIN_SERVICE="hysteria-admin.service"
+ADMIN_SERVICE="b-ui-admin.service"
 
 # 全局变量
 DOMAIN=""
@@ -61,8 +61,8 @@ check_root() {
     if [[ $EUID -ne 0 ]]; then
         print_error "此脚本需要 root 权限运行"
         print_info "请使用以下命令运行:"
-        echo -e "  ${YELLOW}curl -fsSL https://raw.githubusercontent.com/Buxiulei/h-ui/main/h-ui-server.sh -o h-ui-server.sh${NC}"
-        echo -e "  ${YELLOW}sudo bash h-ui-server.sh${NC}"
+        echo -e "  ${YELLOW}curl -fsSL https://raw.githubusercontent.com/Buxiulei/b-ui/main/b-ui-server.sh -o b-ui-server.sh${NC}"
+        echo -e "  ${YELLOW}sudo bash b-ui-server.sh${NC}"
         exit 1
     fi
 }
@@ -697,7 +697,7 @@ th{color:var(--text-dim);text-transform:uppercase;font-size:12px;letter-spacing:
 <h1 style="text-align:center;margin-bottom:8px">Hysteria2</h1><p style="text-align:center;color:var(--text-dim);margin-bottom:32px">管理系统登录</p>
 <input type="password" id="lp" placeholder="请输入管理密码"><button class="btn" onclick="login()">登录</button></div></div></div>
 <div id="v-dash" class="view">
-<nav class="nav"><div class="brand"><i>⚡</i><span>H-UI</span></div><div style="display:flex;gap:8px"><button class="ibtn" onclick="openM('m-pwd')" title="修改密码">🔑</button><button class="ibtn danger" onclick="logout()" title="退出">✕</button></div></nav>
+<nav class="nav"><div class="brand"><i>⚡</i><span>B-UI</span></div><div style="display:flex;gap:8px"><button class="ibtn" onclick="openM('m-pwd')" title="修改密码">🔑</button><button class="ibtn danger" onclick="logout()" title="退出">✕</button></div></nav>
 <div class="stats">
 <div class="stat"><div class="lbl">用户总数</div><div class="val" id="st-u">0</div></div>
 <div class="stat"><div class="lbl">在线设备</div><div class="val" id="st-o" style="color:var(--success)">0</div></div>
@@ -771,7 +771,7 @@ if(r==="kick"&&req.method==="POST")return sendJSON(res,await postStats("/kick",a
 if(r==="config")return sendJSON(res,getConfig());
 if(r==="password"&&req.method==="POST"){const b=await parseBody(req);
 if(!b.newPassword||b.newPassword.length<6)return sendJSON(res,{error:"密码至少6位"},400);
-try{const svc="/etc/systemd/system/hysteria-admin.service";let c=require("fs").readFileSync(svc,"utf8");
+try{const svc="/etc/systemd/system/b-ui-admin.service";let c=require("fs").readFileSync(svc,"utf8");
 c=c.replace(/ADMIN_PASSWORD=[^\n]*/,"ADMIN_PASSWORD="+b.newPassword);
 require("fs").writeFileSync(svc,c);require("child_process").execSync("systemctl daemon-reload");
 return sendJSON(res,{success:true,message:"密码已更新，请重新登录"})}
@@ -824,11 +824,11 @@ EOF
 }
 
 create_hui_cli() {
-    print_info "创建 h-ui 命令行工具..."
+    print_info "创建 b-ui 命令行工具..."
     
-    cat > /usr/local/bin/h-ui << 'HUIEOF'
+    cat > /usr/local/bin/b-ui << 'HUIEOF'
 #!/bin/bash
-# H-UI 终端管理面板
+# B-UI 终端管理面板
 # Hysteria2 + Web 管理面板 完整版
 
 RED='\033[0;31m'
@@ -841,7 +841,7 @@ NC='\033[0m'
 CONFIG_FILE="/opt/hysteria/config.yaml"
 USERS_FILE="/opt/hysteria/users.json"
 HYSTERIA_SERVICE="hysteria-server.service"
-ADMIN_SERVICE="hysteria-admin.service"
+ADMIN_SERVICE="b-ui-admin.service"
 
 print_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
 print_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
@@ -856,13 +856,13 @@ get_port() {
 }
 
 get_admin_password() {
-    grep "ADMIN_PASSWORD=" /etc/systemd/system/hysteria-admin.service 2>/dev/null | cut -d= -f3 || echo "未找到"
+    grep "ADMIN_PASSWORD=" /etc/systemd/system/b-ui-admin.service 2>/dev/null | cut -d= -f3 || echo "未找到"
 }
 
 show_banner() {
     clear
     echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║                      ${YELLOW}H-UI 管理面板${CYAN}                          ║${NC}"
+    echo -e "${CYAN}║                      ${YELLOW}B-UI 管理面板${CYAN}                          ║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
 }
@@ -883,7 +883,7 @@ show_status() {
         echo -e "  Hysteria 服务: ${RED}✗ 未运行${NC}"
     fi
     
-    if systemctl is-active --quiet hysteria-admin 2>/dev/null; then
+    if systemctl is-active --quiet b-ui-admin 2>/dev/null; then
         echo -e "  管理面板服务: ${GREEN}✓ 运行中${NC}"
     else
         echo -e "  管理面板服务: ${RED}✗ 未运行${NC}"
@@ -913,7 +913,7 @@ show_status() {
 
 show_menu() {
     echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║${NC}                      ${GREEN}H-UI 操作菜单${NC}                          ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}                      ${GREEN}B-UI 操作菜单${NC}                          ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}1.${NC} 查看 API 文档                                          ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}2.${NC} 重启服务                                               ${CYAN}║${NC}"
@@ -963,7 +963,7 @@ change_password() {
         return 1
     fi
     
-    local svc="/etc/systemd/system/hysteria-admin.service"
+    local svc="/etc/systemd/system/b-ui-admin.service"
     if [[ ! -f "$svc" ]]; then
         print_error "服务配置文件不存在"
         return 1
@@ -971,7 +971,7 @@ change_password() {
     
     sed -i "s/ADMIN_PASSWORD=[^ ]*/ADMIN_PASSWORD=${new_pass}/" "$svc"
     systemctl daemon-reload
-    systemctl restart hysteria-admin
+    systemctl restart b-ui-admin
     
     print_success "密码已更新为: ${new_pass}"
 }
@@ -1003,7 +1003,7 @@ update_hysteria() {
 
 uninstall_all() {
     echo ""
-    echo -e "${RED}警告：此操作将完全卸载 H-UI 和 Hysteria2${NC}"
+    echo -e "${RED}警告：此操作将完全卸载 B-UI 和 Hysteria2${NC}"
     read -p "确定要继续吗? (输入 YES 确认): " confirm
     
     if [[ "$confirm" != "YES" ]]; then
@@ -1013,16 +1013,16 @@ uninstall_all() {
     
     print_info "正在卸载..."
     systemctl stop hysteria-server 2>/dev/null || true
-    systemctl stop hysteria-admin 2>/dev/null || true
+    systemctl stop b-ui-admin 2>/dev/null || true
     systemctl disable hysteria-server 2>/dev/null || true
-    systemctl disable hysteria-admin 2>/dev/null || true
+    systemctl disable b-ui-admin 2>/dev/null || true
     rm -f /etc/systemd/system/hysteria-server.service
-    rm -f /etc/systemd/system/hysteria-admin.service
+    rm -f /etc/systemd/system/b-ui-admin.service
     rm -rf /etc/systemd/system/hysteria-server.service.d
     rm -f /usr/local/bin/hysteria
     rm -rf /opt/hysteria
-    rm -f /usr/local/bin/h-ui
-    rm -f /etc/nginx/conf.d/hysteria-admin.conf
+    rm -f /usr/local/bin/b-ui
+    rm -f /etc/nginx/conf.d/b-ui-admin.conf
     systemctl daemon-reload
     apt-get purge -y nginx nginx-common nodejs certbot 2>/dev/null || true
     apt-get autoremove -y 2>/dev/null || true
@@ -1033,7 +1033,7 @@ uninstall_all() {
 
 main() {
     if [[ $EUID -ne 0 ]]; then
-        print_error "请使用 sudo h-ui 运行"
+        print_error "请使用 sudo b-ui 运行"
         exit 1
     fi
     
@@ -1048,7 +1048,7 @@ main() {
             1) show_api_docs ;;
             2) 
                 systemctl restart hysteria-server 2>/dev/null || true
-                systemctl restart hysteria-admin 2>/dev/null || true
+                systemctl restart b-ui-admin 2>/dev/null || true
                 print_success "服务已重启"
                 ;;
             3) journalctl -u hysteria-server --no-pager -n 30 ;;
@@ -1068,8 +1068,8 @@ main() {
 main
 HUIEOF
     
-    chmod +x /usr/local/bin/h-ui
-    print_success "h-ui 命令已创建，可在终端输入 'sudo h-ui' 打开管理面板"
+    chmod +x /usr/local/bin/b-ui
+    print_success "b-ui 命令已创建，可在终端输入 'sudo b-ui' 打开管理面板"
 }
 
 configure_nginx_proxy() {
@@ -1086,7 +1086,7 @@ configure_nginx_proxy() {
     fi
     
     # 先创建 HTTP 配置用于证书验证
-    cat > "/etc/nginx/conf.d/hysteria-admin.conf" << EOF
+    cat > "/etc/nginx/conf.d/b-ui-admin.conf" << EOF
 server {
     listen 80;
     server_name ${DOMAIN};
@@ -1227,16 +1227,16 @@ start_hysteria() {
 uninstall_all() {
     echo ""
     echo -e "${RED}════════════════════════════════════════════════════════════════${NC}"
-    echo -e "${RED}  警告：此操作将完全卸载 Hysteria2 和 H-UI 管理面板${NC}"
+    echo -e "${RED}  警告：此操作将完全卸载 Hysteria2 和 B-UI 管理面板${NC}"
     echo -e "${RED}════════════════════════════════════════════════════════════════${NC}"
     echo ""
     echo -e "将删除以下内容："
     echo -e "  - Hysteria2 服务和二进制文件"
-    echo -e "  - H-UI 管理面板服务和文件"
+    echo -e "  - B-UI 管理面板服务和文件"
     echo -e "  - 所有用户配置和流量数据"
     echo -e "  - Nginx 代理配置"
     echo -e "  - SSL 证书 (可选)"
-    echo -e "  - h-ui 命令行工具"
+    echo -e "  - b-ui 命令行工具"
     echo ""
     read -p "确定要继续吗? (输入 YES 确认): " confirm
     
@@ -1250,14 +1250,14 @@ uninstall_all() {
     # 停止并禁用服务
     print_info "停止服务..."
     systemctl stop hysteria-server 2>/dev/null || true
-    systemctl stop hysteria-admin 2>/dev/null || true
+    systemctl stop b-ui-admin 2>/dev/null || true
     systemctl disable hysteria-server 2>/dev/null || true
-    systemctl disable hysteria-admin 2>/dev/null || true
+    systemctl disable b-ui-admin 2>/dev/null || true
     
     # 删除 systemd 服务文件
     print_info "删除服务配置..."
     rm -f /etc/systemd/system/hysteria-server.service
-    rm -f /etc/systemd/system/hysteria-admin.service
+    rm -f /etc/systemd/system/b-ui-admin.service
     rm -rf /etc/systemd/system/hysteria-server.service.d
     systemctl daemon-reload
     
@@ -1270,15 +1270,15 @@ uninstall_all() {
     rm -rf /opt/hysteria
     rm -rf /etc/hysteria
     
-    # 删除 h-ui 命令
-    print_info "删除 h-ui 命令..."
-    rm -f /usr/local/bin/h-ui
+    # 删除 b-ui 命令
+    print_info "删除 b-ui 命令..."
+    rm -f /usr/local/bin/b-ui
     
     # 删除 Nginx 配置
     print_info "删除 Nginx 配置..."
-    rm -f /etc/nginx/sites-enabled/hysteria-admin
-    rm -f /etc/nginx/sites-available/hysteria-admin
-    rm -f /etc/nginx/conf.d/hysteria-admin.conf
+    rm -f /etc/nginx/sites-enabled/b-ui-admin
+    rm -f /etc/nginx/sites-available/b-ui-admin
+    rm -f /etc/nginx/conf.d/b-ui-admin.conf
     systemctl reload nginx 2>/dev/null || true
     
     # 删除 certbot 自动续期 cron
@@ -1312,7 +1312,7 @@ uninstall_all() {
     echo -e "${GREEN}  完全卸载完成！${NC}"
     echo -e "${GREEN}════════════════════════════════════════════════════════════════${NC}"
     echo ""
-    echo -e "已删除: Hysteria2, H-UI, Nginx, Node.js, Certbot, SSL 证书"
+    echo -e "已删除: Hysteria2, B-UI, Nginx, Node.js, Certbot, SSL 证书"
     echo ""
 }
 
@@ -1421,11 +1421,11 @@ quick_install() {
     echo ""
     show_client_config
     
-    # 自动打开 h-ui 终端面板
+    # 自动打开 b-ui 终端面板
     echo ""
-    echo -e "${CYAN}正在打开 H-UI 终端管理面板...${NC}"
+    echo -e "${CYAN}正在打开 B-UI 终端管理面板...${NC}"
     sleep 2
-    h-ui
+    b-ui
 }
 
 #===============================================================================
@@ -1435,7 +1435,7 @@ quick_install() {
 show_menu() {
     echo ""
     echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║${NC}                      ${GREEN}H-UI 操作菜单${NC}                          ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}                      ${GREEN}B-UI 操作菜单${NC}                          ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}1.${NC} 一键安装 (Hysteria2 + 管理面板)                        ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}2.${NC} 查看状态                                               ${CYAN}║${NC}"
