@@ -7,7 +7,7 @@
 # 版本: 1.0.0
 #===============================================================================
 
-SCRIPT_VERSION="1.0.1"
+SCRIPT_VERSION="1.0.2"
 
 set -e
 
@@ -876,6 +876,19 @@ EOF
 
 start_hysteria() {
     print_info "启动 Hysteria2 服务..."
+    
+    # 确保目录和文件权限正确
+    chmod 755 "$BASE_DIR" 2>/dev/null || true
+    chmod 644 "$CONFIG_FILE" 2>/dev/null || true
+    chmod 644 "$USERS_FILE" 2>/dev/null || true
+    
+    # 确保证书目录可访问 (certbot 创建的目录默认权限过严)
+    chmod 755 /etc/letsencrypt/live 2>/dev/null || true
+    chmod 755 /etc/letsencrypt/archive 2>/dev/null || true
+    if [[ -n "$DOMAIN" && -d "/etc/letsencrypt/archive/$DOMAIN" ]]; then
+        chmod 644 /etc/letsencrypt/archive/$DOMAIN/*.pem 2>/dev/null || true
+    fi
+    
     systemctl daemon-reload
     systemctl enable "$HYSTERIA_SERVICE" --now
     sleep 2
