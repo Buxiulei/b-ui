@@ -1547,10 +1547,4 @@ main() {
     done
 }
 
-#main "$@"
-
-ADMIN_DIR="."
-print_info() { echo "$1"; }
-print_success() { echo "$1"; }
-deploy_admin_panel
-
+main "$@"
