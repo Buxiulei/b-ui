@@ -657,8 +657,8 @@ th{color:var(--text-dim);text-transform:uppercase;font-size:12px;letter-spacing:
 <script>
 const $=s=>document.querySelector(s);let tok=localStorage.getItem("t"),cfg={};
 const sz=b=>{if(!b)return"0 B";const i=Math.floor(Math.log(b)/Math.log(1024));return(b/Math.pow(1024,i)).toFixed(2)+" "+["B","KB","MB","GB"][i]};
-function toast(m,e){const d=document.createElement("div");d.className="toast";d.innerHTML=\`<span>\${e?"⚠️":"✅"}</span>\${m}\`;$("#t-box").appendChild(d);setTimeout(()=>d.remove(),3000)}
-function openM(id){$(`#\${id}`).classList.add("on")} function closeM(){document.querySelectorAll(".modal").forEach(e=>e.classList.remove("on"))}
+function toast(m,e){const d=document.createElement("div");d.className="toast";d.innerHTML=`<span>${e?"⚠️":"✅"}</span>${m}`;$("#t-box").appendChild(d);setTimeout(()=>d.remove(),3000)}
+function openM(id){$("#"+id).classList.add("on")} function closeM(){document.querySelectorAll(".modal").forEach(e=>e.classList.remove("on"))}
 function api(ep,opt={}){return fetch("/api"+ep,{...opt,headers:{...opt.headers,Authorization:"Bearer "+tok}}).then(r=>{if(r.status==401)logout();return r.json()})}
 function login(){fetch("/api/login",{method:"POST",body:JSON.stringify({password:$("#lp").value})}).then(r=>r.json()).then(d=>{if(d.token){tok=d.token;localStorage.setItem("t",tok);init()}else toast("密码错误",1)})}
 function logout(){localStorage.removeItem("t");location.reload()}
@@ -679,7 +679,7 @@ return \`<tr><td><b>\${x.username}</b></td>
 function addUser(){api("/users",{method:"POST",body:JSON.stringify({username:$("#nu").value,password:$("#np").value})}).then(d=>{if(d.success){closeM();toast("用户已创建");load()}else toast("操作失败",1)})}
 function del(u){if(confirm("确定要删除用户 "+u+" 吗?"))api("/users/"+u,{method:"DELETE"}).then(()=>load())}
 function kick(u){api("/kick",{method:"POST",body:JSON.stringify([u])}).then(()=>toast("已将用户 "+u+" 强制下线"))}
-function show(u,p){$("#uri").innerText=\`hysteria2://\${p}@\${cfg.domain}:\${cfg.port}/?insecure=0#\${u}\`;openM("m-cfg")}
+function show(u,p){$("#uri").innerText="hysteria2://"+p+"@"+cfg.domain+":"+cfg.port+"/?insecure=0#"+u;openM("m-cfg")}
 function copy(){navigator.clipboard.writeText($("#uri").innerText);toast("已复制到剪贴板")}
 if(tok)init();
 </script></body></html>`;
