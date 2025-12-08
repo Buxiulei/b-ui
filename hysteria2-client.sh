@@ -100,6 +100,109 @@ install_hysteria() {
 }
 
 #===============================================================================
+# URI 解析和导入
+#===============================================================================
+
+parse_hysteria_uri() {
+    local uri="$1"
+    
+    # 验证 URI 格式
+    if [[ ! "$uri" =~ ^(hysteria2|hy2):// ]]; then
+        print_error "无效的 URI 格式，必须以 hysteria2:// 或 hy2:// 开头"
+        return 1
+    fi
+    
+    # 移除协议前缀
+    local content="${uri#*://}"
+    
+    # 提取备注名 (#后面的部分)
+    local remark=""
+    if [[ "$content" =~ \#(.+)$ ]]; then
+        remark=$(echo "${BASH_REMATCH[1]}" | sed 's/%20/ /g' | sed 's/+/ /g')
+        content="${content%%#*}"
+    fi
+    
+    # 提取密码和服务器 (password@host:port)
+    local auth_part="${content%%\?*}"
+    local password="${auth_part%%@*}"
+    local server_part="${auth_part#*@}"
+    
+    # URL 解码密码
+    password=$(echo -e "${password//%/\\x}")
+    
+    # 提取查询参数
+    local query_part=""
+    [[ "$content" =~ \?(.+) ]] && query_part="${BASH_REMATCH[1]}"
+    
+    # 解析 SNI
+    local sni=""
+    [[ "$query_part" =~ sni=([^&]+) ]] && sni="${BASH_REMATCH[1]}"
+    
+    # 解析 insecure
+    local insecure="false"
+    [[ "$query_part" =~ insecure=1 ]] && insecure="true"
+    
+    # 输出解析结果
+    echo "SERVER_ADDR=$server_part"
+    echo "AUTH_PASSWORD=$password"
+    echo "SNI=$sni"
+    echo "INSECURE=$insecure"
+    echo "REMARK=$remark"
+}
+
+import_from_uri() {
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}从链接导入配置${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "支持格式: ${YELLOW}hysteria2://password@host:port/?sni=xxx&insecure=0#备注${NC}"
+    echo ""
+    
+    read -p "请粘贴 Hysteria2 链接: " uri
+    
+    if [[ -z "$uri" ]]; then
+        print_error "链接不能为空"
+        return 1
+    fi
+    
+    # 解析 URI
+    local parsed
+    parsed=$(parse_hysteria_uri "$uri")
+    if [[ $? -ne 0 ]]; then
+        return 1
+    fi
+    
+    # 导入解析结果
+    eval "$parsed"
+    
+    echo ""
+    print_success "解析成功！"
+    echo -e "  服务器: ${GREEN}${SERVER_ADDR}${NC}"
+    echo -e "  密码: ${GREEN}${AUTH_PASSWORD}${NC}"
+    [[ -n "$SNI" ]] && echo -e "  SNI: ${GREEN}${SNI}${NC}"
+    [[ -n "$REMARK" ]] && echo -e "  备注: ${GREEN}${REMARK}${NC}"
+    echo ""
+    
+    # 继续配置本地端口
+    read -p "SOCKS5 端口 [默认 1080]: " SOCKS_PORT
+    SOCKS_PORT=${SOCKS_PORT:-1080}
+    
+    read -p "HTTP 端口 [默认 8080]: " HTTP_PORT
+    HTTP_PORT=${HTTP_PORT:-8080}
+    
+    read -p "启用 TUN 模式 (全局代理)? (y/n) [默认 n]: " enable_tun
+    TUN_ENABLED="false"
+    [[ "$enable_tun" == "y" || "$enable_tun" == "Y" ]] && TUN_ENABLED="true"
+    
+    mkdir -p "$BASE_DIR"
+    create_default_rules
+    generate_config
+    
+    print_success "配置已导入并生成"
+}
+
+#===============================================================================
 # 配置客户端
 #===============================================================================
 
@@ -572,17 +675,18 @@ uninstall() {
 show_menu() {
     echo ""
     echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║${NC}                      ${GREEN}操作菜单${NC}                              ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}                   ${GREEN}Hysteria2 客户端菜单${NC}                       ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}1.${NC} 一键安装                                               ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}2.${NC} 查看状态                                               ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}3.${NC} 启动/停止                                              ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}4.${NC} 重新配置                                               ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}5.${NC} 编辑路由规则                                           ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}6.${NC} TUN 模式开关                                           ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}7.${NC} 测试代理                                               ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}8.${NC} 查看日志                                               ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}9.${NC} ${RED}卸载${NC}                                                   ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}1.${NC} 一键安装 (手动输入配置)                                ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}2.${NC} ${GREEN}从链接导入配置${NC}                                        ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}3.${NC} 查看状态                                               ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}4.${NC} 启动/停止                                              ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}5.${NC} 重新配置                                               ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}6.${NC} 编辑路由规则                                           ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}7.${NC} TUN 模式开关                                           ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}8.${NC} 测试代理                                               ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}9.${NC} 查看日志                                               ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}10.${NC} ${RED}卸载${NC}                                                  ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}0.${NC} 退出                                                   ${CYAN}║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
 }
@@ -595,12 +699,13 @@ main() {
     
     while true; do
         show_menu
-        read -p "请选择 [0-9]: " choice
+        read -p "请选择 [0-10]: " choice
         
         case $choice in
             1) quick_install ;;
-            2) show_status ;;
-            3) 
+            2) import_from_uri && create_service && start_client ;;
+            3) show_status ;;
+            4) 
                 if systemctl is-active --quiet "$CLIENT_SERVICE" 2>/dev/null; then
                     systemctl stop "$CLIENT_SERVICE"
                     print_success "已停止"
@@ -609,12 +714,12 @@ main() {
                     print_success "已启动"
                 fi
                 ;;
-            4) configure_client && create_service && start_client ;;
-            5) edit_rules ;;
-            6) toggle_tun ;;
-            7) test_proxy ;;
-            8) journalctl -u "$CLIENT_SERVICE" --no-pager -n 30 ;;
-            9) uninstall ;;
+            5) configure_client && create_service && start_client ;;
+            6) edit_rules ;;
+            7) toggle_tun ;;
+            8) test_proxy ;;
+            9) journalctl -u "$CLIENT_SERVICE" --no-pager -n 30 ;;
+            10) uninstall ;;
             0) exit 0 ;;
             *) print_error "无效选项" ;;
         esac

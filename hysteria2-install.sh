@@ -695,7 +695,7 @@ th{color:var(--text-dim);text-transform:uppercase;font-size:12px;letter-spacing:
 <h1 style="text-align:center;margin-bottom:8px">Hysteria2</h1><p style="text-align:center;color:var(--text-dim);margin-bottom:32px">管理系统登录</p>
 <input type="password" id="lp" placeholder="请输入管理密码"><button class="btn" onclick="login()">登录</button></div></div></div>
 <div id="v-dash" class="view">
-<nav class="nav"><div class="brand"><i>⚡</i><span>Hysteria2</span></div><button class="ibtn danger" onclick="logout()" title="退出">✕</button></nav>
+<nav class="nav"><div class="brand"><i>⚡</i><span>H-UI</span></div><div style="display:flex;gap:8px"><button class="ibtn" onclick="openM('m-pwd')" title="修改密码">🔑</button><button class="ibtn danger" onclick="logout()" title="退出">✕</button></div></nav>
 <div class="stats">
 <div class="stat"><div class="lbl">用户总数</div><div class="val" id="st-u">0</div></div>
 <div class="stat"><div class="lbl">在线设备</div><div class="val" id="st-o" style="color:var(--success)">0</div></div>
@@ -711,6 +711,9 @@ th{color:var(--text-dim);text-transform:uppercase;font-size:12px;letter-spacing:
 <div style="display:flex;gap:10px"><button class="btn" style="background:rgba(67,20,7,0.1)" onclick="closeM()">取消</button><button class="btn" onclick="addUser()">创建</button></div></div></div>
 <div id="m-cfg" class="modal"><div class="card" style="text-align:center"><h3>连接配置</h3><p style="font-size:12px;color:var(--text-dim);margin:0 0 8px">兼容 v2rayN / Shadowrocket / Clash Meta</p><div id="qrcode" style="margin:16px auto;background:#fff;padding:16px;border-radius:12px;width:fit-content"></div><div class="code-box" id="uri" style="margin-bottom:16px"></div>
 <div style="display:flex;gap:10px"><button class="btn" onclick="copy()">复制链接</button><button class="btn" style="background:rgba(255,255,255,0.1)" onclick="closeM()">关闭</button></div></div></div>
+<div id="m-pwd" class="modal"><div class="card"><h3>修改管理密码</h3><br>
+<input type="password" id="newpwd" placeholder="新密码 (至少6位)">
+<div style="display:flex;gap:10px"><button class="btn" style="background:rgba(67,20,7,0.1)" onclick="closeM()">取消</button><button class="btn" onclick="changePwd()">保存</button></div></div></div>
 <div class="toast-box" id="t-box"></div>
 <script>
 const $=s=>document.querySelector(s);let tok=localStorage.getItem("t"),cfg={};
@@ -739,6 +742,8 @@ function del(u){if(confirm("确定要删除用户 "+u+" 吗?"))api("/users/"+u,{
 function kick(u){api("/kick",{method:"POST",body:JSON.stringify([u])}).then(()=>toast("已将用户 "+u+" 强制下线"))}
 function show(u,p){const uri="hysteria2://"+encodeURIComponent(p)+"@"+cfg.domain+":"+cfg.port+"/?sni="+cfg.domain+"&insecure=0#"+encodeURIComponent(u);$("#uri").innerText=uri;$("#qrcode").innerHTML='<img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data='+encodeURIComponent(uri)+'" alt="QR Code" style="display:block">';openM("m-cfg")}
 function copy(){navigator.clipboard.writeText($("#uri").innerText);toast("已复制到剪贴板")}
+function changePwd(){const np=$("#newpwd").value;if(np.length<6)return toast("密码至少6位",1);
+api("/password",{method:"POST",body:JSON.stringify({newPassword:np})}).then(r=>{if(r.success){closeM();toast("密码已更新，请重新登录");setTimeout(()=>logout(),2000)}else toast(r.error||"操作失败",1)})}
 if(tok)init();
 </script></body></html>`;
 
@@ -762,6 +767,13 @@ if(r==="stats")return sendJSON(res,await fetchStats("/traffic"));
 if(r==="online")return sendJSON(res,await fetchStats("/online"));
 if(r==="kick"&&req.method==="POST")return sendJSON(res,await postStats("/kick",await parseBody(req)));
 if(r==="config")return sendJSON(res,getConfig());
+if(r==="password"&&req.method==="POST"){const b=await parseBody(req);
+if(!b.newPassword||b.newPassword.length<6)return sendJSON(res,{error:"密码至少6位"},400);
+try{const svc="/etc/systemd/system/hysteria-admin.service";let c=require("fs").readFileSync(svc,"utf8");
+c=c.replace(/ADMIN_PASSWORD=[^\n]*/,"ADMIN_PASSWORD="+b.newPassword);
+require("fs").writeFileSync(svc,c);require("child_process").execSync("systemctl daemon-reload");
+return sendJSON(res,{success:true,message:"密码已更新，请重新登录"})}
+catch(e){return sendJSON(res,{error:e.message},500)}}
 }catch(e){return sendJSON(res,{error:e.message},500)}}
 sendJSON(res,{error:"Not found"},404)}).listen(CONFIG.port,()=>console.log("Admin Panel Running"));
 SERVEREOF
