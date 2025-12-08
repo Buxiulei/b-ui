@@ -1174,9 +1174,12 @@ EOF
             print_success "SSL 证书申请成功！"
             
             # 修复证书目录权限 (让 Hysteria 服务可以读取)
+            chmod 755 /etc/letsencrypt 2>/dev/null || true
             chmod 755 /etc/letsencrypt/live 2>/dev/null || true
+            chmod 755 /etc/letsencrypt/live/${DOMAIN} 2>/dev/null || true
             chmod 755 /etc/letsencrypt/archive 2>/dev/null || true
-            chmod -R 644 /etc/letsencrypt/archive/${DOMAIN}/*.pem 2>/dev/null || true
+            chmod 755 /etc/letsencrypt/archive/${DOMAIN} 2>/dev/null || true
+            chmod 644 /etc/letsencrypt/archive/${DOMAIN}/*.pem 2>/dev/null || true
             
             # 设置证书自动续期
             if ! crontab -l 2>/dev/null | grep -q "certbot renew"; then
@@ -1207,9 +1210,12 @@ start_hysteria() {
     chmod 644 "$USERS_FILE" 2>/dev/null || true
     
     # 确保证书目录可访问 (certbot 创建的目录默认权限过严)
+    chmod 755 /etc/letsencrypt 2>/dev/null || true
     chmod 755 /etc/letsencrypt/live 2>/dev/null || true
     chmod 755 /etc/letsencrypt/archive 2>/dev/null || true
     if [[ -n "$DOMAIN" && -d "/etc/letsencrypt/archive/$DOMAIN" ]]; then
+        chmod 755 /etc/letsencrypt/live/$DOMAIN 2>/dev/null || true
+        chmod 755 /etc/letsencrypt/archive/$DOMAIN 2>/dev/null || true
         chmod 644 /etc/letsencrypt/archive/$DOMAIN/*.pem 2>/dev/null || true
     fi
     
@@ -1387,29 +1393,38 @@ quick_install() {
     # 网络环境预检
     run_network_checks
     
+    # 1. 先安装依赖和配置环境
     install_hysteria
-    echo ""
-    configure_hysteria
     echo ""
     enable_bbr
     echo ""
-    start_hysteria
-    echo ""
     
-    # 安装管理面板
+    # 2. 安装 Web 服务相关组件
     print_info "安装 Web 管理面板..."
     install_nodejs
     install_nginx
     install_chinese_fonts
     
-    # 确保 Nginx 启动并开放 80 端口 (用于 Certbot 验证)
+    # 3. 启动 Nginx 并开放端口 (用于 Certbot 验证)
     systemctl start nginx 2>/dev/null || true
     configure_firewall "$PORT" "$ADMIN_PORT"
     
+    # 4. 先申请 SSL 证书 (Hysteria 需要证书才能启动)
+    configure_nginx_proxy
+    echo ""
+    
+    # 5. 生成 Hysteria 配置 (此时证书已存在)
+    configure_hysteria
+    echo ""
+    
+    # 6. 启动 Hysteria 服务
+    start_hysteria
+    echo ""
+    
+    # 7. 部署管理面板
     deploy_admin_panel
     create_admin_service
     create_hui_cli
-    configure_nginx_proxy
     
     echo ""
     echo -e "${GREEN}════════════════════════════════════════════════════════════════${NC}"
