@@ -573,19 +573,25 @@ const CONFIG={port:process.env.ADMIN_PORT||8080,adminPassword:process.env.ADMIN_
 jwtSecret:process.env.JWT_SECRET||crypto.randomBytes(32).toString("hex"),
 hysteriaConfig:process.env.HYSTERIA_CONFIG||"/opt/hysteria/config.yaml",usersFile:process.env.USERS_FILE||"/opt/hysteria/users.json",trafficPort:9999};
 
+// --- Security: Rate Limiting & Audit ---
+const loginAttempts={};const RATE_LIMIT={maxAttempts:5,windowMs:300000};
+function checkRateLimit(ip){const now=Date.now(),rec=loginAttempts[ip];if(!rec)return true;if(now-rec.first>RATE_LIMIT.windowMs){delete loginAttempts[ip];return true}return rec.count<RATE_LIMIT.maxAttempts}
+function recordAttempt(ip,success){const now=Date.now(),rec=loginAttempts[ip];if(!rec)loginAttempts[ip]={first:now,count:1};else rec.count++;if(success)delete loginAttempts[ip];log("AUDIT",ip+" login "+(success?"SUCCESS":"FAILED")+" (attempts: "+(loginAttempts[ip]?.count||0)+")")}
+function getClientIP(req){return req.headers["x-forwarded-for"]?.split(",")[0].trim()||req.socket.remoteAddress||"unknown"}
+
 // --- Backend Logic ---
-function log(l,m){console.log(`[${new Date().toISOString()}] [${l}] ${m}`)}
-function genToken(d){const p=Buffer.from(JSON.stringify({...d,exp:Date.now()+864e5})).toString("base64");
+function log(l,m){console.log("["+new Date().toISOString()+"] ["+l+"] "+m)}
+function genToken(d){const p=Buffer.from(JSON.stringify({...d,exp:Date.now()+864e5,iat:Date.now()})).toString("base64");
 return p+"."+crypto.createHmac("sha256",CONFIG.jwtSecret).update(p).digest("hex")}
 function verifyToken(t){try{const[p,s]=t.split(".");if(s!==crypto.createHmac("sha256",CONFIG.jwtSecret).update(p).digest("hex"))return null;
 const d=JSON.parse(Buffer.from(p,"base64").toString());return d.exp<Date.now()?null:d}catch{return null}}
 function parseBody(r){return new Promise(s=>{let b="";r.on("data",c=>b+=c);r.on("end",()=>{try{s(b?JSON.parse(b):{})}catch{s({})}})})}
-function sendJSON(r,d,s=200){r.writeHead(s,{"Content-Type":"application/json","Access-Control-Allow-Origin":"*","Access-Control-Allow-Methods":"*","Access-Control-Allow-Headers":"*"});r.end(JSON.stringify(d))}
+function sendJSON(r,d,s=200,headers={}){r.writeHead(s,{"Content-Type":"application/json","Access-Control-Allow-Origin":"*","Access-Control-Allow-Methods":"*","Access-Control-Allow-Headers":"*",...headers});r.end(JSON.stringify(d))}
 function loadUsers(){try{return fs.existsSync(CONFIG.usersFile)?JSON.parse(fs.readFileSync(CONFIG.usersFile,"utf8")):[]}catch{return[]}}
 function saveUsers(u){try{fs.writeFileSync(CONFIG.usersFile,JSON.stringify(u,null,2));updateConfig(u);return true}catch{return false}}
 function updateConfig(users){try{let c=fs.readFileSync(CONFIG.hysteriaConfig,"utf8");
 const up=users.reduce((a,u)=>{a[u.username]=u.password;return a},{});
-const auth=`auth:\n  type: userpass\n  userpass:\n${Object.entries(up).map(([u,p])=>`    ${u}: ${p}`).join("\n")}`;
+const auth="auth:\n  type: userpass\n  userpass:\n"+Object.entries(up).map(([u,p])=>"    "+u+": "+p).join("\n");
 c=c.replace(/auth:[\s\S]*?(?=\n[a-zA-Z]|$)/,auth+"\n\n");
 fs.writeFileSync(CONFIG.hysteriaConfig,c);execSync("systemctl restart hysteria-server",{stdio:"pipe"})}catch(e){log("ERROR",e.message)}}
 function getConfig(){try{const c=fs.readFileSync(CONFIG.hysteriaConfig,"utf8");
@@ -686,9 +692,13 @@ http.createServer(async(req,res)=>{
 const u=new URL(req.url,`http://${req.headers.host}`),p=u.pathname;
 if(req.method==="OPTIONS"){res.writeHead(200,{"Access-Control-Allow-Origin":"*","Access-Control-Allow-Methods":"*","Access-Control-Allow-Headers":"*"});return res.end()}
 if(p==="/"||p==="/index.html"){res.writeHead(200,{"Content-Type":"text/html"});return res.end(HTML)}
-if(p.startsWith("/api/")){const r=p.slice(5);
+if(p.startsWith("/api/")){const r=p.slice(5);const clientIP=getClientIP(req);
 try{
-if(r==="login"&&req.method==="POST"){const b=await parseBody(req);return b.password===CONFIG.adminPassword?sendJSON(res,{token:genToken({admin:true})}):sendJSON(res,{error:"Auth failed"},401)}
+if(r==="login"&&req.method==="POST"){
+const b=await parseBody(req);
+if(!checkRateLimit(clientIP)){recordAttempt(clientIP,false);return sendJSON(res,{error:"Too many attempts. Try again later."},429)}
+const ok=b.password===CONFIG.adminPassword;recordAttempt(clientIP,ok);
+if(ok)return sendJSON(res,{token:genToken({admin:true})});else return sendJSON(res,{error:"Auth failed"},401)}
 const auth=verifyToken((req.headers.authorization||"").replace("Bearer ",""));if(!auth)return sendJSON(res,{error:"Unauthorized"},401);
 if(r==="users"){if(req.method==="GET")return sendJSON(res,loadUsers());
 if(req.method==="POST"){const b=await parseBody(req),users=loadUsers();if(users.find(u=>u.username===b.username))return sendJSON(res,{error:"Exists"},400);users.push({username:b.username,password:b.password||crypto.randomBytes(8).toString("hex"),createdAt:new Date()});return saveUsers(users)?sendJSON(res,{success:true}):sendJSON(res,{error:"Save failed"},500)}}
