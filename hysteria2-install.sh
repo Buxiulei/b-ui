@@ -770,20 +770,82 @@ EOF
     mkdir -p /var/www/html
     nginx -t && systemctl reload nginx
     
-    # 申请证书
-    print_info "申请 SSL 证书..."
-    certbot --nginx -d "${DOMAIN}" --non-interactive --agree-tos -m "${EMAIL}" --redirect
+    # 检测端口 80 是否可从外部访问
+    print_info "检测端口 80 连通性..."
     
-    if [[ $? -eq 0 ]]; then
-        print_success "SSL 证书申请成功！"
+    # 创建临时测试文件
+    local test_id=$(head /dev/urandom | tr -dc 'a-z0-9' | head -c 8)
+    echo "test-${test_id}" > /var/www/html/.well-known/acme-challenge/test-${test_id}
+    
+    # 等待 nginx 加载
+    sleep 2
+    
+    # 尝试从外部访问
+    local port80_ok=false
+    local test_result=$(curl -s --max-time 10 "http://${DOMAIN}/.well-known/acme-challenge/test-${test_id}" 2>/dev/null)
+    
+    if [[ "$test_result" == "test-${test_id}" ]]; then
+        port80_ok=true
+        print_success "端口 80 可正常访问"
+    else
+        print_error "端口 80 无法从外部访问！"
+        echo ""
+        echo -e "${RED}╔══════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${RED}║            SSL 证书申请将失败 - 请先解决端口问题             ║${NC}"
+        echo -e "${RED}╚══════════════════════════════════════════════════════════════╝${NC}"
+        echo ""
+        echo -e "${YELLOW}如果您使用云服务器，请在云平台控制台开放端口 80：${NC}"
+        echo ""
+        echo -e "  ${CYAN}AWS EC2:${NC}"
+        echo -e "    1. 进入 EC2 控制台 → Security Groups"
+        echo -e "    2. 选择实例使用的安全组"
+        echo -e "    3. 添加入站规则: Type=HTTP, Port=80, Source=0.0.0.0/0"
+        echo ""
+        echo -e "  ${CYAN}阿里云 ECS:${NC}"
+        echo -e "    1. 进入 ECS 控制台 → 安全组"
+        echo -e "    2. 添加入站规则: 端口 80/80, 授权对象 0.0.0.0/0"
+        echo ""
+        echo -e "  ${CYAN}腾讯云 CVM:${NC}"
+        echo -e "    1. 进入 CVM 控制台 → 安全组"
+        echo -e "    2. 添加入站规则: 端口 80, 来源 0.0.0.0/0"
+        echo ""
         
-        # 设置证书自动续期
-        if ! crontab -l 2>/dev/null | grep -q "certbot renew"; then
-            (crontab -l 2>/dev/null; echo "0 3 * * * certbot renew --quiet") | crontab -
-            print_info "已设置证书自动续期 (每天 3:00)"
+        read -p "已开放端口 80 后，按 Enter 重试，或输入 'skip' 跳过 SSL: " retry_choice
+        
+        if [[ "$retry_choice" != "skip" ]]; then
+            # 重新测试
+            test_result=$(curl -s --max-time 10 "http://${DOMAIN}/.well-known/acme-challenge/test-${test_id}" 2>/dev/null)
+            if [[ "$test_result" == "test-${test_id}" ]]; then
+                port80_ok=true
+                print_success "端口 80 现在可以访问了！"
+            else
+                print_warning "端口仍然无法访问，跳过 SSL 证书申请"
+            fi
+        fi
+    fi
+    
+    # 清理测试文件
+    rm -f /var/www/html/.well-known/acme-challenge/test-${test_id}
+    
+    # 申请证书
+    if [[ "$port80_ok" == "true" ]]; then
+        print_info "申请 SSL 证书..."
+        certbot --nginx -d "${DOMAIN}" --non-interactive --agree-tos -m "${EMAIL}" --redirect
+        
+        if [[ $? -eq 0 ]]; then
+            print_success "SSL 证书申请成功！"
+            
+            # 设置证书自动续期
+            if ! crontab -l 2>/dev/null | grep -q "certbot renew"; then
+                (crontab -l 2>/dev/null; echo "0 3 * * * certbot renew --quiet") | crontab -
+                print_info "已设置证书自动续期 (每天 3:00)"
+            fi
+        else
+            print_warning "SSL 证书申请失败，将使用 HTTP"
         fi
     else
-        print_warning "SSL 证书申请失败，将使用 HTTP"
+        print_warning "跳过 SSL 证书申请，管理面板将使用 HTTP"
+        print_info "稍后可以手动运行 certbot 申请证书"
     fi
     
     print_success "Nginx 配置完成"
