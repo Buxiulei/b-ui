@@ -4,10 +4,10 @@
 # Hysteria2 一键安装脚本 (含 Web 管理面板)
 # 功能：安装 Hysteria2、配置多用户、Web 管理面板、BBR 优化
 # 官方文档：https://v2.hysteria.network/zh/
-# 版本: 2.2.0
+# 版本: 2.2.1
 #===============================================================================
 
-SCRIPT_VERSION="2.2.0"
+SCRIPT_VERSION="2.2.1"
 
 set -e
 
@@ -574,8 +574,14 @@ generate_reality_keys() {
     print_info "生成 Reality 密钥对..."
     
     if [[ -f "$BASE_DIR/reality-keys.json" ]]; then
-        print_info "Reality 密钥已存在，跳过生成"
-        return 0
+        # 检查现有密钥是否有效
+        local existing_priv=$(cat "$BASE_DIR/reality-keys.json" 2>/dev/null | grep '"privateKey"' | cut -d'"' -f4)
+        if [[ -n "$existing_priv" ]]; then
+            print_info "Reality 密钥已存在，跳过生成"
+            return 0
+        fi
+        # 密钥无效，重新生成
+        print_warning "发现无效密钥，重新生成..."
     fi
     
     if ! command -v xray &> /dev/null; then
@@ -583,10 +589,28 @@ generate_reality_keys() {
         return 1
     fi
     
-    local keys=$(xray x25519 2>/dev/null)
-    local privkey=$(echo "$keys" | grep "Private key:" | awk '{print $3}')
-    local pubkey=$(echo "$keys" | grep "Public key:" | awk '{print $3}')
+    # 新版 Xray x25519 输出格式: PrivateKey: xxx (无空格)
+    local keys=$(xray x25519 2>&1)
+    local privkey=$(echo "$keys" | grep -i "private" | awk -F': ' '{print $2}' | tr -d ' ')
+    
+    # 使用私钥生成公钥
+    local pubkey=""
+    if [[ -n "$privkey" ]]; then
+        pubkey=$(xray x25519 -i "$privkey" 2>&1 | grep -i "public" | awk -F': ' '{print $2}' | tr -d ' ')
+    fi
+    
+    # 如果还是获取不到，尝试旧格式
+    if [[ -z "$privkey" ]]; then
+        privkey=$(echo "$keys" | grep "Private key:" | awk '{print $3}')
+        pubkey=$(echo "$keys" | grep "Public key:" | awk '{print $3}')
+    fi
+    
     local shortid=$(openssl rand -hex 8)
+    
+    if [[ -z "$privkey" ]]; then
+        print_error "无法生成 Reality 密钥"
+        return 1
+    fi
     
     cat > "$BASE_DIR/reality-keys.json" << EOF
 {
