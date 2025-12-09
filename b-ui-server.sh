@@ -556,7 +556,7 @@ install_xray() {
     print_info "安装 Xray..."
     
     if command -v xray &> /dev/null; then
-        print_success "Xray 已安装: $(xray version 2>/dev/null | head -1 || echo '版本未知')"
+        print_success "Xray 已安装: $(xray version 2>/dev/null | head -1 | awk '{print $2}' || echo '版本未知')"
         return 0
     fi
     
@@ -1443,7 +1443,7 @@ show_status() {
     fi
     
     if command -v xray &> /dev/null; then
-        local xray_ver=$(xray version 2>/dev/null | head -n1 || echo '未知')
+        local xray_ver=$(xray version 2>/dev/null | head -n1 | awk '{print $2}' || echo '未知')
         echo -e "  Xray: ${YELLOW}${xray_ver}${NC}"
     else
         echo -e "  Xray: ${RED}未安装${NC}"
@@ -1715,9 +1715,9 @@ main() {
                 echo -e "  Hysteria2: ${YELLOW}${old_hy}${NC} -> ${GREEN}${new_hy}${NC}"
                 
                 print_info "更新 Xray..."
-                local old_xray=$(xray version 2>/dev/null | head -n1 || echo "未知")
+                local old_xray=$(xray version 2>/dev/null | head -n1 | awk '{print $2}' || echo "未知")
                 bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
-                local new_xray=$(xray version 2>/dev/null | head -n1 || echo "未知")
+                local new_xray=$(xray version 2>/dev/null | head -n1 | awk '{print $2}' || echo "未知")
                 echo -e "  Xray: ${YELLOW}${old_xray}${NC} -> ${GREEN}${new_xray}${NC}"
                 
                 systemctl restart hysteria-server 2>/dev/null || true
