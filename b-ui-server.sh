@@ -4,10 +4,10 @@
 # Hysteria2 一键安装脚本 (含 Web 管理面板)
 # 功能：安装 Hysteria2、配置多用户、Web 管理面板、BBR 优化
 # 官方文档：https://v2.hysteria.network/zh/
-# 版本: 2.2.1
+# 版本: 2.2.2
 #===============================================================================
 
-SCRIPT_VERSION="2.2.1"
+SCRIPT_VERSION="2.2.2"
 
 set -e
 
@@ -589,17 +589,14 @@ generate_reality_keys() {
         return 1
     fi
     
-    # 新版 Xray x25519 输出格式: PrivateKey: xxx (无空格)
+    # 新版 Xray x25519 输出格式:
+    # PrivateKey: xxx (服务端私钥)
+    # Password: xxx (客户端公钥 pbk)
     local keys=$(xray x25519 2>&1)
-    local privkey=$(echo "$keys" | grep -i "private" | awk -F': ' '{print $2}' | tr -d ' ')
+    local privkey=$(echo "$keys" | grep -i "^PrivateKey:" | awk -F': ' '{print $2}' | tr -d ' ')
+    local pubkey=$(echo "$keys" | grep -i "^Password:" | awk -F': ' '{print $2}' | tr -d ' ')
     
-    # 使用私钥生成公钥
-    local pubkey=""
-    if [[ -n "$privkey" ]]; then
-        pubkey=$(xray x25519 -i "$privkey" 2>&1 | grep -i "public" | awk -F': ' '{print $2}' | tr -d ' ')
-    fi
-    
-    # 如果还是获取不到，尝试旧格式
+    # 如果新格式失败，尝试旧格式
     if [[ -z "$privkey" ]]; then
         privkey=$(echo "$keys" | grep "Private key:" | awk '{print $3}')
         pubkey=$(echo "$keys" | grep "Public key:" | awk '{print $3}')
