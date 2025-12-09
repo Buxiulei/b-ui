@@ -4,10 +4,10 @@
 # Hysteria2 一键安装脚本 (含 Web 管理面板)
 # 功能：安装 Hysteria2、配置多用户、Web 管理面板、BBR 优化
 # 官方文档：https://v2.hysteria.network/zh/
-# 版本: 2.1.1
+# 版本: 2.1.2
 #===============================================================================
 
-SCRIPT_VERSION="2.1.1"
+SCRIPT_VERSION="2.1.2"
 
 set -e
 
@@ -1876,9 +1876,9 @@ show_status() {
     # 显示开机自启动状态
     echo ""
     echo -e "${YELLOW}[开机自启动]${NC}"
-    local hy_enabled=$(systemctl is-enabled "$HYSTERIA_SERVICE" 2>/dev/null || echo "未配置")
-    local xray_enabled=$(systemctl is-enabled xray 2>/dev/null || echo "未配置")
-    local admin_enabled=$(systemctl is-enabled "$ADMIN_SERVICE" 2>/dev/null || echo "未配置")
+    local hy_enabled=$(systemctl is-enabled "$HYSTERIA_SERVICE" 2>/dev/null); hy_enabled=${hy_enabled:-未配置}
+    local xray_enabled=$(systemctl is-enabled xray 2>/dev/null); xray_enabled=${xray_enabled:-未配置}
+    local admin_enabled=$(systemctl is-enabled "$ADMIN_SERVICE" 2>/dev/null); admin_enabled=${admin_enabled:-未配置}
     echo -e "  Hysteria2: ${CYAN}${hy_enabled}${NC}"
     echo -e "  Xray:      ${CYAN}${xray_enabled}${NC}"
     echo -e "  管理面板:  ${CYAN}${admin_enabled}${NC}"
