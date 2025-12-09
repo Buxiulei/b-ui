@@ -1594,14 +1594,28 @@ enable_bbr() {
 }
 
 update_hysteria() {
-    print_info "正在更新 Hysteria2..."
-    local old_version=$(hysteria version 2>/dev/null | head -n1 || echo "未知")
+    print_info "正在更新内核..."
+    echo ""
+    
+    # 更新 Hysteria2
+    print_info "更新 Hysteria2..."
+    local old_hy=$(hysteria version 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "未知")
     bash <(curl -fsSL https://get.hy2.sh/)
-    local new_version=$(hysteria version 2>/dev/null | head -n1 || echo "未知")
-    print_success "更新完成！"
-    echo -e "  旧版本: ${YELLOW}${old_version}${NC}"
-    echo -e "  新版本: ${GREEN}${new_version}${NC}"
+    local new_hy=$(hysteria version 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "未知")
+    echo -e "  Hysteria2: ${YELLOW}${old_hy}${NC} -> ${GREEN}${new_hy}${NC}"
     systemctl restart hysteria-server 2>/dev/null || true
+    
+    # 更新 Xray
+    if command -v xray &> /dev/null; then
+        print_info "更新 Xray..."
+        local old_xray=$(xray version 2>/dev/null | head -n1 | awk '{print $2}' || echo "未知")
+        bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+        local new_xray=$(xray version 2>/dev/null | head -n1 | awk '{print $2}' || echo "未知")
+        echo -e "  Xray: ${YELLOW}${old_xray}${NC} -> ${GREEN}${new_xray}${NC}"
+        systemctl restart xray 2>/dev/null || true
+    fi
+    
+    print_success "内核更新完成！"
 }
 
 uninstall_all() {

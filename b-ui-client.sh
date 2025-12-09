@@ -91,12 +91,109 @@ install_hysteria() {
     print_info "安装 Hysteria2..."
     
     if command -v hysteria &> /dev/null; then
-        print_success "已安装: $(hysteria version 2>/dev/null | head -n1)"
+        print_success "已安装: $(hysteria version 2>/dev/null | grep 'Version:' | awk '{print $2}')"
         return 0
     fi
     
     HYSTERIA_USER=root bash <(curl -fsSL https://get.hy2.sh/)
     print_success "安装完成"
+}
+
+install_xray_client() {
+    print_info "安装 Xray..."
+    
+    if command -v xray &> /dev/null; then
+        print_success "已安装: $(xray version 2>/dev/null | head -n1 | awk '{print $2}')"
+        return 0
+    fi
+    
+    bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+    print_success "Xray 安装完成"
+}
+
+generate_xray_config() {
+    local xray_config="${BASE_DIR}/xray-config.json"
+    local server_host=$(echo "$SERVER_ADDR" | cut -d':' -f1)
+    local server_port=$(echo "$SERVER_ADDR" | cut -d':' -f2)
+    
+    # SOCKS5 端口
+    read -p "SOCKS5 端口 [默认 1080]: " SOCKS_PORT
+    SOCKS_PORT=${SOCKS_PORT:-1080}
+    
+    # HTTP 端口
+    read -p "HTTP 端口 [默认 8080]: " HTTP_PORT
+    HTTP_PORT=${HTTP_PORT:-8080}
+    
+    cat > "$xray_config" << EOF
+{
+  "log": {"loglevel": "warning"},
+  "inbounds": [
+    {"tag": "socks", "port": ${SOCKS_PORT}, "listen": "127.0.0.1", "protocol": "socks", "settings": {"udp": true}},
+    {"tag": "http", "port": ${HTTP_PORT}, "listen": "127.0.0.1", "protocol": "http"}
+  ],
+  "outbounds": [
+    {
+      "tag": "proxy",
+      "protocol": "vless",
+      "settings": {
+        "vnext": [{
+          "address": "${server_host}",
+          "port": ${server_port},
+          "users": [{"id": "${UUID}", "flow": "${FLOW}", "encryption": "none"}]
+        }]
+      },
+      "streamSettings": {
+        "network": "${NETWORK}",
+        "security": "reality",
+        "realitySettings": {
+          "serverName": "${SNI}",
+          "fingerprint": "${FINGERPRINT}",
+          "publicKey": "${PUBLIC_KEY}",
+          "shortId": "${SHORT_ID}",
+          "spiderX": "/"
+        }
+      }
+    },
+    {"tag": "direct", "protocol": "freedom"},
+    {"tag": "block", "protocol": "blackhole"}
+  ],
+  "routing": {
+    "domainStrategy": "IPIfNonMatch",
+    "rules": [
+      {"type": "field", "domain": ["geosite:private"], "outboundTag": "direct"},
+      {"type": "field", "ip": ["geoip:private"], "outboundTag": "direct"},
+      {"type": "field", "domain": ["geosite:cn"], "outboundTag": "direct"},
+      {"type": "field", "ip": ["geoip:cn"], "outboundTag": "direct"}
+    ]
+  }
+}
+EOF
+    chmod 644 "$xray_config"
+    print_success "Xray 配置已生成: $xray_config"
+    
+    # 创建 Xray 客户端服务
+    cat > /etc/systemd/system/xray-client.service << EOF
+[Unit]
+Description=Xray Client
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/xray run -config ${xray_config}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable xray-client 2>/dev/null || true
+    systemctl start xray-client
+    
+    echo ""
+    print_success "Xray 客户端已启动"
+    echo -e "  SOCKS5: ${GREEN}127.0.0.1:${SOCKS_PORT}${NC}"
+    echo -e "  HTTP:   ${GREEN}127.0.0.1:${HTTP_PORT}${NC}"
 }
 
 #===============================================================================
@@ -108,7 +205,6 @@ parse_hysteria_uri() {
     
     # 验证 URI 格式
     if [[ ! "$uri" =~ ^(hysteria2|hy2):// ]]; then
-        print_error "无效的 URI 格式，必须以 hysteria2:// 或 hy2:// 开头"
         return 1
     fi
     
@@ -119,6 +215,8 @@ parse_hysteria_uri() {
     local remark=""
     if [[ "$content" =~ \#(.+)$ ]]; then
         remark=$(echo "${BASH_REMATCH[1]}" | sed 's/%20/ /g' | sed 's/+/ /g')
+        # URL 解码
+        remark=$(echo -e "${remark//%/\\x}")
         content="${content%%#*}"
     fi
     
@@ -143,10 +241,63 @@ parse_hysteria_uri() {
     [[ "$query_part" =~ insecure=1 ]] && insecure="true"
     
     # 输出解析结果
+    echo "PROTOCOL=hysteria2"
     echo "SERVER_ADDR=$server_part"
     echo "AUTH_PASSWORD=$password"
     echo "SNI=$sni"
     echo "INSECURE=$insecure"
+    echo "REMARK=$remark"
+}
+
+parse_vless_uri() {
+    local uri="$1"
+    
+    # 验证 URI 格式
+    if [[ ! "$uri" =~ ^vless:// ]]; then
+        return 1
+    fi
+    
+    # 移除协议前缀
+    local content="${uri#vless://}"
+    
+    # 提取备注名 (#后面的部分)
+    local remark=""
+    if [[ "$content" =~ \#(.+)$ ]]; then
+        remark=$(echo "${BASH_REMATCH[1]}" | sed 's/%20/ /g' | sed 's/+/ /g')
+        remark=$(echo -e "${remark//%/\\x}")
+        content="${content%%#*}"
+    fi
+    
+    # 提取 UUID 和服务器 (uuid@host:port)
+    local auth_part="${content%%\?*}"
+    local uuid="${auth_part%%@*}"
+    local server_part="${auth_part#*@}"
+    
+    # 提取查询参数
+    local query_part=""
+    [[ "$content" =~ \?(.+) ]] && query_part="${BASH_REMATCH[1]}"
+    
+    # 解析各参数
+    local security="" sni="" fp="" pbk="" sid="" flow="" type=""
+    [[ "$query_part" =~ security=([^&]+) ]] && security="${BASH_REMATCH[1]}"
+    [[ "$query_part" =~ sni=([^&]+) ]] && sni="${BASH_REMATCH[1]}"
+    [[ "$query_part" =~ fp=([^&]+) ]] && fp="${BASH_REMATCH[1]}"
+    [[ "$query_part" =~ pbk=([^&]+) ]] && pbk="${BASH_REMATCH[1]}"
+    [[ "$query_part" =~ sid=([^&]+) ]] && sid="${BASH_REMATCH[1]}"
+    [[ "$query_part" =~ flow=([^&]+) ]] && flow="${BASH_REMATCH[1]}"
+    [[ "$query_part" =~ type=([^&]+) ]] && type="${BASH_REMATCH[1]}"
+    
+    # 输出解析结果
+    echo "PROTOCOL=vless-reality"
+    echo "SERVER_ADDR=$server_part"
+    echo "UUID=$uuid"
+    echo "SECURITY=$security"
+    echo "SNI=$sni"
+    echo "FINGERPRINT=${fp:-chrome}"
+    echo "PUBLIC_KEY=$pbk"
+    echo "SHORT_ID=$sid"
+    echo "FLOW=${flow:-xtls-rprx-vision}"
+    echo "NETWORK=${type:-tcp}"
     echo "REMARK=$remark"
 }
 
@@ -156,20 +307,31 @@ import_from_uri() {
     echo -e "${GREEN}从链接导入配置${NC}"
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
     echo ""
-    echo -e "支持格式: ${YELLOW}hysteria2://password@host:port/?sni=xxx&insecure=0#备注${NC}"
+    echo -e "支持格式:"
+    echo -e "  ${YELLOW}hysteria2://password@host:port/?sni=xxx#备注${NC}"
+    echo -e "  ${YELLOW}vless://uuid@host:port/?security=reality&sni=xxx&pbk=xxx#备注${NC}"
     echo ""
     
-    read -p "请粘贴 Hysteria2 链接: " uri
+    read -p "请粘贴配置链接: " uri
     
     if [[ -z "$uri" ]]; then
         print_error "链接不能为空"
         return 1
     fi
     
-    # 解析 URI
-    local parsed
-    parsed=$(parse_hysteria_uri "$uri")
-    if [[ $? -ne 0 ]]; then
+    # 尝试解析 URI
+    local parsed=""
+    if [[ "$uri" =~ ^(hysteria2|hy2):// ]]; then
+        parsed=$(parse_hysteria_uri "$uri")
+    elif [[ "$uri" =~ ^vless:// ]]; then
+        parsed=$(parse_vless_uri "$uri")
+    else
+        print_error "不支持的链接格式"
+        return 1
+    fi
+    
+    if [[ $? -ne 0 || -z "$parsed" ]]; then
+        print_error "链接解析失败"
         return 1
     fi
     
@@ -178,26 +340,39 @@ import_from_uri() {
     
     echo ""
     print_success "解析成功！"
+    echo -e "  协议:   ${GREEN}${PROTOCOL}${NC}"
     echo -e "  服务器: ${GREEN}${SERVER_ADDR}${NC}"
-    echo -e "  密码: ${GREEN}${AUTH_PASSWORD}${NC}"
-    [[ -n "$SNI" ]] && echo -e "  SNI: ${GREEN}${SNI}${NC}"
-    [[ -n "$REMARK" ]] && echo -e "  备注: ${GREEN}${REMARK}${NC}"
+    if [[ "$PROTOCOL" == "hysteria2" ]]; then
+        echo -e "  密码:   ${GREEN}${AUTH_PASSWORD}${NC}"
+    else
+        echo -e "  UUID:   ${GREEN}${UUID}${NC}"
+        echo -e "  公钥:   ${GREEN}${PUBLIC_KEY}${NC}"
+    fi
+    [[ -n "$SNI" ]] && echo -e "  SNI:    ${GREEN}${SNI}${NC}"
+    [[ -n "$REMARK" ]] && echo -e "  备注:   ${GREEN}${REMARK}${NC}"
     echo ""
     
-    # 继续配置本地端口
-    read -p "SOCKS5 端口 [默认 1080]: " SOCKS_PORT
-    SOCKS_PORT=${SOCKS_PORT:-1080}
-    
-    read -p "HTTP 端口 [默认 8080]: " HTTP_PORT
-    HTTP_PORT=${HTTP_PORT:-8080}
-    
-    read -p "启用 TUN 模式 (全局代理)? (y/n) [默认 n]: " enable_tun
-    TUN_ENABLED="false"
-    [[ "$enable_tun" == "y" || "$enable_tun" == "Y" ]] && TUN_ENABLED="true"
-    
     mkdir -p "$BASE_DIR"
-    create_default_rules
-    generate_config
+    
+    if [[ "$PROTOCOL" == "hysteria2" ]]; then
+        # Hysteria2 配置
+        read -p "SOCKS5 端口 [默认 1080]: " SOCKS_PORT
+        SOCKS_PORT=${SOCKS_PORT:-1080}
+        
+        read -p "HTTP 端口 [默认 8080]: " HTTP_PORT
+        HTTP_PORT=${HTTP_PORT:-8080}
+        
+        read -p "启用 TUN 模式 (全局代理)? (y/n) [默认 n]: " enable_tun
+        TUN_ENABLED="false"
+        [[ "$enable_tun" == "y" || "$enable_tun" == "Y" ]] && TUN_ENABLED="true"
+        
+        create_default_rules
+        generate_config
+    else
+        # VLESS-Reality 配置 (需要 Xray)
+        install_xray_client
+        generate_xray_config
+    fi
     
     print_success "配置已导入并生成"
 }
