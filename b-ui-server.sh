@@ -4,10 +4,10 @@
 # Hysteria2 一键安装脚本 (含 Web 管理面板)
 # 功能：安装 Hysteria2、配置多用户、Web 管理面板、BBR 优化
 # 官方文档：https://v2.hysteria.network/zh/
-# 版本: 2.2.2
+# 版本: 2.2.3
 #===============================================================================
 
-SCRIPT_VERSION="2.2.2"
+SCRIPT_VERSION="2.2.3"
 
 set -e
 
@@ -1436,9 +1436,17 @@ show_status() {
     echo -e "${YELLOW}[系统状态]${NC}"
     
     if command -v hysteria &> /dev/null; then
-        echo -e "  Hysteria2: ${YELLOW}$(hysteria version 2>/dev/null | head -n1 || echo '未知')${NC}"
+        local hy_ver=$(hysteria version 2>/dev/null | head -n1 || echo '未知')
+        echo -e "  Hysteria2: ${YELLOW}${hy_ver}${NC}"
     else
         echo -e "  Hysteria2: ${RED}未安装${NC}"
+    fi
+    
+    if command -v xray &> /dev/null; then
+        local xray_ver=$(xray version 2>/dev/null | head -n1 || echo '未知')
+        echo -e "  Xray: ${YELLOW}${xray_ver}${NC}"
+    else
+        echo -e "  Xray: ${RED}未安装${NC}"
     fi
     
     if systemctl is-active --quiet hysteria-server 2>/dev/null; then
@@ -1468,6 +1476,28 @@ show_status() {
         echo -e "  BBR: ${YELLOW}未启用${NC}"
     fi
     
+    # 显示开机自启动状态
+    echo ""
+    echo -e "${YELLOW}[开机自启动]${NC}"
+    local hy_auto=$(systemctl is-enabled hysteria-server 2>/dev/null); hy_auto=${hy_auto:-未配置}
+    local xray_auto=$(systemctl is-enabled xray 2>/dev/null); xray_auto=${xray_auto:-未配置}
+    local admin_auto=$(systemctl is-enabled b-ui-admin 2>/dev/null); admin_auto=${admin_auto:-未配置}
+    if [[ "$hy_auto" == "enabled" ]]; then
+        echo -e "  Hysteria: ${GREEN}✓ 已启用${NC}"
+    else
+        echo -e "  Hysteria: ${RED}✗ 未启用${NC}"
+    fi
+    if [[ "$xray_auto" == "enabled" ]]; then
+        echo -e "  Xray: ${GREEN}✓ 已启用${NC}"
+    else
+        echo -e "  Xray: ${RED}✗ 未启用${NC}"
+    fi
+    if [[ "$admin_auto" == "enabled" ]]; then
+        echo -e "  管理面板: ${GREEN}✓ 已启用${NC}"
+    else
+        echo -e "  管理面板: ${RED}✗ 未启用${NC}"
+    fi
+    
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
     echo ""
     
@@ -1492,8 +1522,9 @@ show_menu() {
     echo -e "${CYAN}║${NC}  ${YELLOW}3.${NC} 查看日志                                               ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}4.${NC} 修改管理密码                                           ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}5.${NC} 开启 BBR                                               ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}6.${NC} ${GREEN}更新 Hysteria2${NC}                                         ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}7.${NC} ${RED}完全卸载${NC}                                               ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}6.${NC} 开机自启动开关                                         ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}7.${NC} ${GREEN}更新内核 (Hysteria2 + Xray)${NC}                            ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}8.${NC} ${RED}完全卸载${NC}                                               ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}0.${NC} 退出                                                   ${CYAN}║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
 }
@@ -1619,20 +1650,67 @@ main() {
         show_status
         show_menu
         
-        read -p "请选择 [0-7]: " choice
+        read -p "请选择 [0-8]: " choice
         
         case $choice in
             1) show_api_docs ;;
             2) 
                 systemctl restart hysteria-server 2>/dev/null || true
                 systemctl restart b-ui-admin 2>/dev/null || true
-                print_success "服务已重启"
+                systemctl restart xray 2>/dev/null || true
+                print_success "所有服务已重启"
                 ;;
-            3) journalctl -u hysteria-server --no-pager -n 30 ;;
+            3) 
+                echo ""
+                echo -e "${YELLOW}选择日志类型:${NC}"
+                echo "  1. Hysteria2"
+                echo "  2. Xray"
+                echo "  3. 管理面板"
+                read -p "请选择 [1-3]: " log_choice
+                case $log_choice in
+                    1) journalctl -u hysteria-server --no-pager -n 30 ;;
+                    2) journalctl -u xray --no-pager -n 30 ;;
+                    3) journalctl -u b-ui-admin --no-pager -n 30 ;;
+                    *) print_error "无效选项" ;;
+                esac
+                ;;
             4) change_password ;;
             5) enable_bbr ;;
-            6) update_hysteria ;;
-            7) uninstall_all ;;
+            6)
+                echo ""
+                local hy_auto=$(systemctl is-enabled hysteria-server 2>/dev/null); hy_auto=${hy_auto:-disabled}
+                if [[ "$hy_auto" == "enabled" ]]; then
+                    systemctl disable hysteria-server 2>/dev/null || true
+                    systemctl disable xray 2>/dev/null || true
+                    systemctl disable b-ui-admin 2>/dev/null || true
+                    print_success "已关闭开机自启动"
+                else
+                    systemctl enable hysteria-server 2>/dev/null || true
+                    systemctl enable xray 2>/dev/null || true
+                    systemctl enable b-ui-admin 2>/dev/null || true
+                    print_success "已开启开机自启动"
+                fi
+                ;;
+            7)
+                print_info "正在更新内核..."
+                echo ""
+                print_info "更新 Hysteria2..."
+                local old_hy=$(hysteria version 2>/dev/null | head -n1 || echo "未知")
+                bash <(curl -fsSL https://get.hy2.sh/)
+                local new_hy=$(hysteria version 2>/dev/null | head -n1 || echo "未知")
+                echo -e "  Hysteria2: ${YELLOW}${old_hy}${NC} -> ${GREEN}${new_hy}${NC}"
+                
+                print_info "更新 Xray..."
+                local old_xray=$(xray version 2>/dev/null | head -n1 || echo "未知")
+                bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+                local new_xray=$(xray version 2>/dev/null | head -n1 || echo "未知")
+                echo -e "  Xray: ${YELLOW}${old_xray}${NC} -> ${GREEN}${new_xray}${NC}"
+                
+                systemctl restart hysteria-server 2>/dev/null || true
+                systemctl restart xray 2>/dev/null || true
+                print_success "内核更新完成！"
+                ;;
+            8) uninstall_all ;;
             0) echo ""; print_info "再见！"; exit 0 ;;
             *) print_error "无效选项" ;;
         esac
