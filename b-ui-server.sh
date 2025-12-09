@@ -85,25 +85,74 @@ check_os() {
 }
 
 check_dependencies() {
-    local deps=("curl" "grep" "awk" "sed")
-    local missing=()
+    print_info "检查并安装必要的依赖..."
     
-    for dep in "${deps[@]}"; do
-        if ! command -v "$dep" &> /dev/null; then
-            missing+=("$dep")
+    # 定义需要检查的命令及其对应的包名
+    # 格式: "命令:apt包名:yum/dnf包名"
+    local deps_map=(
+        "curl:curl:curl"
+        "grep:grep:grep"
+        "awk:gawk:gawk"
+        "sed:sed:sed"
+        "dig:dnsutils:bind-utils"
+        "host:bind9-host:bind-utils"
+        "openssl:openssl:openssl"
+        "jq:jq:jq"
+        "ss:iproute2:iproute"
+        "tar:tar:tar"
+        "gzip:gzip:gzip"
+        "crontab:cron:cronie"
+    )
+    
+    local apt_pkgs=()
+    local yum_pkgs=()
+    local missing_cmds=()
+    
+    for item in "${deps_map[@]}"; do
+        IFS=':' read -r cmd apt_pkg yum_pkg <<< "$item"
+        if ! command -v "$cmd" &> /dev/null; then
+            missing_cmds+=("$cmd")
+            apt_pkgs+=("$apt_pkg")
+            yum_pkgs+=("$yum_pkg")
         fi
     done
     
-    if [[ ${#missing[@]} -gt 0 ]]; then
-        print_warning "缺少依赖: ${missing[*]}"
-        print_info "正在安装依赖..."
+    if [[ ${#missing_cmds[@]} -gt 0 ]]; then
+        print_warning "缺少以下工具: ${missing_cmds[*]}"
+        print_info "正在安装依赖包..."
+        
+        # 去重
+        apt_pkgs=($(printf '%s\n' "${apt_pkgs[@]}" | sort -u))
+        yum_pkgs=($(printf '%s\n' "${yum_pkgs[@]}" | sort -u))
+        
         if command -v apt-get &> /dev/null; then
-            apt-get update && apt-get install -y "${missing[@]}"
+            apt-get update -qq
+            apt-get install -y "${apt_pkgs[@]}"
         elif command -v yum &> /dev/null; then
-            yum install -y "${missing[@]}"
+            yum install -y "${yum_pkgs[@]}"
         elif command -v dnf &> /dev/null; then
-            dnf install -y "${missing[@]}"
+            dnf install -y "${yum_pkgs[@]}"
+        else
+            print_error "无法识别的包管理器，请手动安装: ${missing_cmds[*]}"
+            exit 1
         fi
+        
+        # 验证安装结果
+        local still_missing=()
+        for cmd in "${missing_cmds[@]}"; do
+            if ! command -v "$cmd" &> /dev/null; then
+                still_missing+=("$cmd")
+            fi
+        done
+        
+        if [[ ${#still_missing[@]} -gt 0 ]]; then
+            print_error "以下工具安装失败: ${still_missing[*]}"
+            exit 1
+        fi
+        
+        print_success "所有依赖已安装完成"
+    else
+        print_success "所有依赖检查通过"
     fi
 }
 
