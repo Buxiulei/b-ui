@@ -7,7 +7,7 @@
 # 版本: 2.0.0
 #===============================================================================
 
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="2.0.1"
 
 set -e
 
@@ -1865,6 +1865,18 @@ show_status() {
         echo -e "  BBR: ${YELLOW}未启用${NC}"
     fi
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    
+    # 显示网页看板信息
+    if [[ -f "$CONFIG_FILE" ]]; then
+        local domain=$(grep -A2 "^tls:" "$CONFIG_FILE" 2>/dev/null | grep "cert:" | sed 's|.*/live/\([^/]*\)/.*|\1|')
+        local admin_pass=$(grep "ADMIN_PASSWORD=" /etc/systemd/system/b-ui-admin.service 2>/dev/null | cut -d= -f3)
+        if [[ -n "$domain" ]]; then
+            echo ""
+            echo -e "${YELLOW}[网页管理面板]${NC}"
+            echo -e "  访问地址: ${GREEN}https://${domain}${NC}"
+            echo -e "  管理密码: ${GREEN}${admin_pass:-未设置}${NC}"
+        fi
+    fi
 }
 
 show_client_config() {
