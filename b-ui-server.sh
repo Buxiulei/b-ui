@@ -1436,7 +1436,7 @@ show_status() {
     echo -e "${YELLOW}[系统状态]${NC}"
     
     if command -v hysteria &> /dev/null; then
-        local hy_ver=$(hysteria version 2>/dev/null | head -n1 || echo '未知')
+        local hy_ver=$(hysteria version 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo '未知')
         echo -e "  Hysteria2: ${YELLOW}${hy_ver}${NC}"
     else
         echo -e "  Hysteria2: ${RED}未安装${NC}"
@@ -1709,9 +1709,9 @@ main() {
                 print_info "正在更新内核..."
                 echo ""
                 print_info "更新 Hysteria2..."
-                local old_hy=$(hysteria version 2>/dev/null | head -n1 || echo "未知")
+                local old_hy=$(hysteria version 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "未知")
                 bash <(curl -fsSL https://get.hy2.sh/)
-                local new_hy=$(hysteria version 2>/dev/null | head -n1 || echo "未知")
+                local new_hy=$(hysteria version 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "未知")
                 echo -e "  Hysteria2: ${YELLOW}${old_hy}${NC} -> ${GREEN}${new_hy}${NC}"
                 
                 print_info "更新 Xray..."
