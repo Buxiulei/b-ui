@@ -4,10 +4,10 @@
 # Hysteria2 一键安装脚本 (含 Web 管理面板)
 # 功能：安装 Hysteria2、配置多用户、Web 管理面板、BBR 优化
 # 官方文档：https://v2.hysteria.network/zh/
-# 版本: 2.1.0
+# 版本: 2.1.1
 #===============================================================================
 
-SCRIPT_VERSION="2.1.0"
+SCRIPT_VERSION="2.1.1"
 
 set -e
 
@@ -1853,6 +1853,14 @@ show_status() {
         echo -e "  Hysteria服务: ${RED}未运行${NC}"
     fi
     
+    if command -v xray &> /dev/null; then
+        if systemctl is-active --quiet xray 2>/dev/null; then
+            echo -e "  Xray服务: ${GREEN}运行中${NC}"
+        else
+            echo -e "  Xray服务: ${RED}未运行${NC}"
+        fi
+    fi
+    
     if systemctl is-active --quiet "$ADMIN_SERVICE" 2>/dev/null; then
         echo -e "  管理面板: ${GREEN}运行中${NC}"
     else
@@ -1864,6 +1872,17 @@ show_status() {
     else
         echo -e "  BBR: ${YELLOW}未启用${NC}"
     fi
+    
+    # 显示开机自启动状态
+    echo ""
+    echo -e "${YELLOW}[开机自启动]${NC}"
+    local hy_enabled=$(systemctl is-enabled "$HYSTERIA_SERVICE" 2>/dev/null || echo "未配置")
+    local xray_enabled=$(systemctl is-enabled xray 2>/dev/null || echo "未配置")
+    local admin_enabled=$(systemctl is-enabled "$ADMIN_SERVICE" 2>/dev/null || echo "未配置")
+    echo -e "  Hysteria2: ${CYAN}${hy_enabled}${NC}"
+    echo -e "  Xray:      ${CYAN}${xray_enabled}${NC}"
+    echo -e "  管理面板:  ${CYAN}${admin_enabled}${NC}"
+    
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
     
     # 显示网页看板信息
