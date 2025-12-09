@@ -4,10 +4,10 @@
 # Hysteria2 一键安装脚本 (含 Web 管理面板)
 # 功能：安装 Hysteria2、配置多用户、Web 管理面板、BBR 优化
 # 官方文档：https://v2.hysteria.network/zh/
-# 版本: 2.1.2
+# 版本: 2.2.0
 #===============================================================================
 
-SCRIPT_VERSION="2.1.2"
+SCRIPT_VERSION="2.2.0"
 
 set -e
 
@@ -610,6 +610,15 @@ configure_xray() {
     local privkey=$(cat "$BASE_DIR/reality-keys.json" | grep '"privateKey"' | cut -d'"' -f4)
     local shortid=$(cat "$BASE_DIR/reality-keys.json" | grep '"shortId"' | cut -d'"' -f4)
     
+    # 从 MASQUERADE_URL 提取域名用于 Xray Reality，默认 www.bing.com
+    local masq_domain="www.bing.com"
+    if [[ -n "$MASQUERADE_URL" ]]; then
+        masq_domain=$(echo "$MASQUERADE_URL" | sed -E 's|https?://([^/:]+).*|\1|')
+    fi
+    
+    # 保存伪装网站配置供后续修改
+    echo "{\"masqueradeUrl\": \"$MASQUERADE_URL\", \"masqueradeDomain\": \"$masq_domain\"}" > "$BASE_DIR/masquerade.json"
+    
     cat > "$BASE_DIR/xray-config.json" << EOF
 {
   "log": {"loglevel": "warning"},
@@ -630,8 +639,8 @@ configure_xray() {
         "network": "tcp",
         "security": "reality",
         "realitySettings": {
-          "dest": "www.bing.com:443",
-          "serverNames": ["www.bing.com"],
+          "dest": "${masq_domain}:443",
+          "serverNames": ["${masq_domain}"],
           "privateKey": "$privkey",
           "shortIds": ["$shortid"]
         }
@@ -644,7 +653,7 @@ configure_xray() {
 }
 EOF
     chmod 644 "$BASE_DIR/xray-config.json"
-    print_success "Xray 配置已生成"
+    print_success "Xray 配置已生成 (伪装: $masq_domain)"
 }
 
 create_xray_service() {
@@ -996,6 +1005,7 @@ const HTML=`<!DOCTYPE html>
     <nav class="nav">
         <div class="brand"><i>⚡</i><span>B-UI</span></div>
         <div style="display:flex; gap:10px">
+            <button class="ibtn" onclick="openMasq()" title="伪装网站设置">🎭</button>
             <button class="ibtn" onclick="openM('m-pwd')" title="Change Password">🔑</button>
             <button class="ibtn danger" onclick="logout()" title="Logout">✕</button>
         </div>
@@ -1090,6 +1100,19 @@ const HTML=`<!DOCTYPE html>
             <button class="btn" style="background:#F5F0E8;color:#4A0404;box-shadow:none" onclick="closeM()">取消</button>
             <button class="btn" onclick="changePwd()">Save</button>
         </div>
+</div>
+</div>
+
+<!-- Masquerade Settings Modal -->
+<div id="m-masq" class="modal">
+    <div class="modal-card">
+        <h3 style="margin-bottom:20px">伪装网站设置</h3>
+        <p style="font-size:12px;color:#666;margin-bottom:15px">此设置同时应用于 Hysteria2 和 VLESS-Reality</p>
+        <input type="text" id="masqurl" placeholder="https://www.bing.com/">
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:15px; margin-top:10px">
+            <button class="btn" style="background:#F5F0E8;color:#4A0404;box-shadow:none" onclick="closeM()">取消</button>
+            <button class="btn" onclick="saveMasq()">保存</button>
+        </div>
     </div>
 </div>
 
@@ -1169,6 +1192,14 @@ function changePwd(){
     api("/password",{method:"POST",body:JSON.stringify({newPassword:np})}).then(r=>{if(r.success){closeM();toast("Password updated, please login again");setTimeout(()=>logout(),2000)}else toast(r.error||"Failed",1)})
 }
 
+function openMasq(){
+    api("/masquerade").then(r=>{$("#masqurl").value=r.masqueradeUrl||"https://www.bing.com/";openM("m-masq")})
+}
+function saveMasq(){
+    const url=$("#masqurl").value;if(!url)return toast("请输入URL",1);
+    api("/masquerade",{method:"POST",body:JSON.stringify({url})}).then(r=>{if(r.success){closeM();toast("伪装网站已更新: "+r.domain);setTimeout(()=>location.reload(),2000)}else toast(r.error||"Failed",1)})
+}
+
 if(tok)init();
 </script>
 </body>
@@ -1244,6 +1275,23 @@ if(r==="stats")return sendJSON(res,await fetchStats("/traffic"));
 if(r==="online")return sendJSON(res,await fetchStats("/online"));
 if(r==="kick"&&req.method==="POST")return sendJSON(res,await postStats("/kick",await parseBody(req)));
 if(r==="config")return sendJSON(res,getConfig());
+if(r==="masquerade"){
+  const masqFile=CONFIG.hysteriaConfig.replace("config.yaml","masquerade.json");
+  if(req.method==="GET"){try{const m=JSON.parse(fs.readFileSync(masqFile,"utf8"));return sendJSON(res,m)}catch{return sendJSON(res,{masqueradeUrl:"https://www.bing.com/",masqueradeDomain:"www.bing.com"})}}
+  if(req.method==="POST"){const b=await parseBody(req);if(!b.url)return sendJSON(res,{error:"URL required"},400);
+    const domain=b.url.replace(/https?:\/\/([^/:]+).*/,"$1")||"www.bing.com";
+    try{fs.writeFileSync(masqFile,JSON.stringify({masqueradeUrl:b.url,masqueradeDomain:domain},null,2));
+    // Update Hysteria config
+    let hyc=fs.readFileSync(CONFIG.hysteriaConfig,"utf8");
+    hyc=hyc.replace(/masquerade:[\s\S]*?(?=\n[a-zA-Z]|$)/,`masquerade:\n  type: proxy\n  proxy:\n    url: ${b.url}\n    rewriteHost: true`);
+    fs.writeFileSync(CONFIG.hysteriaConfig,hyc);
+    // Update Xray config
+    if(fs.existsSync(CONFIG.xrayConfig)){let xc=JSON.parse(fs.readFileSync(CONFIG.xrayConfig,"utf8"));
+    const xi=xc.inbounds.find(i=>i.tag==="vless-reality");
+    if(xi&&xi.streamSettings?.realitySettings){xi.streamSettings.realitySettings.dest=domain+":443";xi.streamSettings.realitySettings.serverNames=[domain]}
+    fs.writeFileSync(CONFIG.xrayConfig,JSON.stringify(xc,null,2));execSync("systemctl restart xray 2>/dev/null||true",{stdio:"pipe"})}
+    execSync("systemctl restart hysteria-server 2>/dev/null||true",{stdio:"pipe"});
+    return sendJSON(res,{success:true,domain})}catch(e){return sendJSON(res,{error:e.message},500)}}}
 if(r==="password"&&req.method==="POST"){const b=await parseBody(req);
 if(!b.newPassword||b.newPassword.length<6)return sendJSON(res,{error:"密码至少6位"},400);
 try{const svc="/etc/systemd/system/b-ui-admin.service";let c=require("fs").readFileSync(svc,"utf8");
