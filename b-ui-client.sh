@@ -3,10 +3,10 @@
 #===============================================================================
 # Hysteria2 客户端一键安装脚本 (Ubuntu/Debian)
 # 功能：SOCKS5/HTTP 代理、TUN 模式、路由规则、SSH 保护
-# 版本: 1.0
+# 版本: 1.1.0
 #===============================================================================
 
-SCRIPT_VERSION="1.0"
+SCRIPT_VERSION="1.1.0"
 
 set -e
 
@@ -757,15 +757,33 @@ start_client() {
 show_status() {
     echo ""
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
-    echo -e "${GREEN}客户端状态${NC}"
-    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${YELLOW}[系统状态]${NC}"
     
-    if systemctl is-active --quiet "$CLIENT_SERVICE" 2>/dev/null; then
-        echo -e "  运行状态: ${GREEN}运行中${NC}"
-    else
-        echo -e "  运行状态: ${RED}未运行${NC}"
+    # 版本信息
+    if command -v hysteria &> /dev/null; then
+        local hy_ver=$(hysteria version 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "未知")
+        echo -e "  Hysteria2: ${YELLOW}${hy_ver}${NC}"
+    fi
+    if command -v xray &> /dev/null; then
+        local xray_ver=$(xray version 2>/dev/null | head -n1 | awk '{print $2}' || echo "未知")
+        echo -e "  Xray:      ${YELLOW}${xray_ver}${NC}"
     fi
     
+    # Hysteria2 服务状态
+    if systemctl is-active --quiet "$CLIENT_SERVICE" 2>/dev/null; then
+        echo -e "  Hysteria2 服务: ${GREEN}✓ 运行中${NC}"
+    else
+        echo -e "  Hysteria2 服务: ${RED}✗ 未运行${NC}"
+    fi
+    
+    # Xray 服务状态
+    if systemctl is-active --quiet xray-client 2>/dev/null; then
+        echo -e "  Xray 服务:      ${GREEN}✓ 运行中${NC}"
+    elif [[ -f /etc/systemd/system/xray-client.service ]]; then
+        echo -e "  Xray 服务:      ${RED}✗ 未运行${NC}"
+    fi
+    
+    # 配置信息
     if [[ -f "$CONFIG_FILE" ]]; then
         local server=$(grep "^server:" "$CONFIG_FILE" 2>/dev/null | awk '{print $2}')
         local socks=$(grep -A1 "^socks5:" "$CONFIG_FILE" 2>/dev/null | grep "listen:" | awk '{print $2}')
@@ -773,10 +791,40 @@ show_status() {
         local tun_status="禁用"
         grep -q "^tun:" "$CONFIG_FILE" && tun_status="启用"
         
-        echo -e "  服务器:   ${YELLOW}${server:-未配置}${NC}"
-        echo -e "  SOCKS5:   ${YELLOW}${socks:-未配置}${NC}"
-        echo -e "  HTTP:     ${YELLOW}${http:-未配置}${NC}"
-        echo -e "  TUN 模式: ${YELLOW}${tun_status}${NC}"
+        echo ""
+        echo -e "${YELLOW}[Hysteria2 配置]${NC}"
+        echo -e "  服务器:   ${GREEN}${server:-未配置}${NC}"
+        echo -e "  SOCKS5:   ${GREEN}${socks:-未配置}${NC}"
+        echo -e "  HTTP:     ${GREEN}${http:-未配置}${NC}"
+        echo -e "  TUN 模式: ${GREEN}${tun_status}${NC}"
+    fi
+    
+    # Xray 配置
+    local xray_config="${BASE_DIR}/xray-config.json"
+    if [[ -f "$xray_config" ]]; then
+        local xray_server=$(grep -o '"address": "[^"]*"' "$xray_config" 2>/dev/null | head -1 | cut -d'"' -f4)
+        local xray_port=$(grep -o '"port": [0-9]*' "$xray_config" 2>/dev/null | head -1 | awk '{print $2}')
+        echo ""
+        echo -e "${YELLOW}[VLESS-Reality 配置]${NC}"
+        echo -e "  服务器:   ${GREEN}${xray_server:-未配置}:${xray_port:-未配置}${NC}"
+    fi
+    
+    # 开机自启动状态
+    echo ""
+    echo -e "${YELLOW}[开机自启动]${NC}"
+    local hy_auto=$(systemctl is-enabled "$CLIENT_SERVICE" 2>/dev/null); hy_auto=${hy_auto:-未配置}
+    local xray_auto=$(systemctl is-enabled xray-client 2>/dev/null); xray_auto=${xray_auto:-未配置}
+    if [[ "$hy_auto" == "enabled" ]]; then
+        echo -e "  Hysteria2: ${GREEN}✓ 已启用${NC}"
+    else
+        echo -e "  Hysteria2: ${RED}✗ 未启用${NC}"
+    fi
+    if [[ -f /etc/systemd/system/xray-client.service ]]; then
+        if [[ "$xray_auto" == "enabled" ]]; then
+            echo -e "  Xray:      ${GREEN}✓ 已启用${NC}"
+        else
+            echo -e "  Xray:      ${RED}✗ 未启用${NC}"
+        fi
     fi
     
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
@@ -850,18 +898,21 @@ uninstall() {
 show_menu() {
     echo ""
     echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║${NC}                   ${GREEN}Hysteria2 客户端菜单${NC}                       ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}              ${GREEN}B-UI 客户端 操作菜单${NC}                            ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}1.${NC} 一键安装 (手动输入配置)                                ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}2.${NC} ${GREEN}从链接导入配置${NC}                                        ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}3.${NC} 查看状态                                               ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}4.${NC} 启动/停止                                              ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}5.${NC} 重新配置                                               ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}6.${NC} 编辑路由规则                                           ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}7.${NC} TUN 模式开关                                           ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}8.${NC} 测试代理                                               ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}9.${NC} 查看日志                                               ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}10.${NC} ${RED}卸载${NC}                                                  ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}1.${NC} ${GREEN}从链接导入配置${NC} (Hysteria2 / VLESS-Reality)           ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}2.${NC} 手动配置 Hysteria2                                     ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}3.${NC} 启动/停止服务                                          ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}4.${NC} 重启服务                                               ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}5.${NC} 查看日志                                               ${CYAN}║${NC}"
+    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}6.${NC} TUN 模式开关 (全局代理)                                ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}7.${NC} 编辑路由规则                                           ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}8.${NC} 测试代理连接                                           ${CYAN}║${NC}"
+    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}9.${NC} 更新内核 (Hysteria2 + Xray)                            ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}10.${NC} 开机自启动设置                                         ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}11.${NC} ${RED}卸载${NC}                                                  ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}0.${NC} 退出                                                   ${CYAN}║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
 }
@@ -869,33 +920,91 @@ show_menu() {
 main() {
     check_root
     check_os
-    print_banner
-    show_status
     
     while true; do
+        print_banner
+        show_status
         show_menu
-        read -p "请选择 [0-10]: " choice
+        read -p "请选择 [0-11]: " choice
         
         case $choice in
-            1) quick_install ;;
-            2) import_from_uri && create_service && start_client ;;
-            3) show_status ;;
-            4) 
+            1) import_from_uri ;;
+            2) quick_install ;;
+            3) 
+                # 启动/停止
                 if systemctl is-active --quiet "$CLIENT_SERVICE" 2>/dev/null; then
                     systemctl stop "$CLIENT_SERVICE"
-                    print_success "已停止"
+                    systemctl stop xray-client 2>/dev/null || true
+                    print_success "服务已停止"
                 else
-                    systemctl start "$CLIENT_SERVICE" 2>/dev/null || start_client
-                    print_success "已启动"
+                    systemctl start "$CLIENT_SERVICE" 2>/dev/null || true
+                    systemctl start xray-client 2>/dev/null || true
+                    print_success "服务已启动"
                 fi
                 ;;
-            5) configure_client && create_service && start_client ;;
-            6) edit_rules ;;
-            7) toggle_tun ;;
+            4) 
+                # 重启
+                systemctl restart "$CLIENT_SERVICE" 2>/dev/null || true
+                systemctl restart xray-client 2>/dev/null || true
+                print_success "服务已重启"
+                ;;
+            5) 
+                # 查看日志
+                echo ""
+                echo -e "${YELLOW}选择日志类型:${NC}"
+                echo "  1. Hysteria2"
+                echo "  2. Xray"
+                read -p "请选择 [1-2]: " log_choice
+                case $log_choice in
+                    1) journalctl -u "$CLIENT_SERVICE" --no-pager -n 30 ;;
+                    2) journalctl -u xray-client --no-pager -n 30 ;;
+                    *) print_error "无效选项" ;;
+                esac
+                ;;
+            6) toggle_tun ;;
+            7) edit_rules ;;
             8) test_proxy ;;
-            9) journalctl -u "$CLIENT_SERVICE" --no-pager -n 30 ;;
-            10) uninstall ;;
-            0) exit 0 ;;
+            9) 
+                # 更新内核
+                print_info "更新 Hysteria2..."
+                local old_hy=$(hysteria version 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "未知")
+                HYSTERIA_USER=root bash <(curl -fsSL https://get.hy2.sh/)
+                local new_hy=$(hysteria version 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "未知")
+                echo -e "  Hysteria2: ${YELLOW}${old_hy}${NC} -> ${GREEN}${new_hy}${NC}"
+                
+                if command -v xray &> /dev/null; then
+                    print_info "更新 Xray..."
+                    local old_xray=$(xray version 2>/dev/null | head -n1 | awk '{print $2}' || echo "未知")
+                    bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+                    local new_xray=$(xray version 2>/dev/null | head -n1 | awk '{print $2}' || echo "未知")
+                    echo -e "  Xray: ${YELLOW}${old_xray}${NC} -> ${GREEN}${new_xray}${NC}"
+                fi
+                print_success "内核更新完成"
+                ;;
+            10)
+                # 开机自启动
+                local hy_auto=$(systemctl is-enabled "$CLIENT_SERVICE" 2>/dev/null); hy_auto=${hy_auto:-disabled}
+                echo ""
+                if [[ "$hy_auto" == "enabled" ]]; then
+                    echo -e "当前状态: ${GREEN}已启用${NC}"
+                    read -p "关闭开机自启动? (y/n): " disable
+                    if [[ "$disable" == "y" ]]; then
+                        systemctl disable "$CLIENT_SERVICE" 2>/dev/null || true
+                        systemctl disable xray-client 2>/dev/null || true
+                        print_success "已关闭开机自启动"
+                    fi
+                else
+                    echo -e "当前状态: ${RED}未启用${NC}"
+                    read -p "开启开机自启动? (y/n): " enable
+                    if [[ "$enable" == "y" ]]; then
+                        systemctl enable "$CLIENT_SERVICE" 2>/dev/null || true
+                        systemctl enable xray-client 2>/dev/null || true
+                        print_success "已开启开机自启动"
+                    fi
+                fi
+                ;;
+            11) uninstall ;;
+            0) echo ""; print_info "再见！"; exit 0 ;;
             *) print_error "无效选项" ;;
         esac
         
@@ -903,5 +1012,25 @@ main() {
         read -p "按 Enter 继续..."
     done
 }
+
+#===============================================================================
+# 创建全局命令
+#===============================================================================
+
+create_global_command() {
+    print_info "创建全局命令 b-ui-client..."
+    
+    # 复制脚本到系统目录
+    cp "$0" /usr/local/bin/b-ui-client
+    chmod +x /usr/local/bin/b-ui-client
+    
+    print_success "全局命令已创建，可使用 'sudo b-ui-client' 运行"
+}
+
+# 如果是首次运行，提示创建全局命令
+if [[ ! -f /usr/local/bin/b-ui-client && "$0" != "/usr/local/bin/b-ui-client" ]]; then
+    read -p "是否创建全局命令 'b-ui-client'? (y/n): " create_cmd
+    [[ "$create_cmd" == "y" ]] && create_global_command
+fi
 
 main "$@"
