@@ -347,8 +347,8 @@ collect_user_input() {
     
     # 创建第一个用户
     DEFAULT_USER_PASS=$(generate_password)
-    read -p "请输入第一个用户名 [默认: user1]: " FIRST_USER
-    FIRST_USER=${FIRST_USER:-user1}
+    read -p "请输入第一个用户名 [默认: 低空飞行]: " FIRST_USER
+    FIRST_USER=${FIRST_USER:-低空飞行}
     read -p "请输入用户密码 [默认: $DEFAULT_USER_PASS]: " FIRST_USER_PASS
     FIRST_USER_PASS=${FIRST_USER_PASS:-$DEFAULT_USER_PASS}
     
