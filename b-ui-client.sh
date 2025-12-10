@@ -1111,74 +1111,91 @@ start_client() {
 show_status() {
     echo ""
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
-    echo -e "${YELLOW}[系统状态]${NC}"
     
     # 版本信息
+    echo -e "${YELLOW}[内核版本]${NC}"
     if command -v hysteria &> /dev/null; then
         local hy_ver=$(hysteria version 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "未知")
-        echo -e "  Hysteria2: ${YELLOW}${hy_ver}${NC}"
+        echo -e "  Hysteria2: ${GREEN}${hy_ver}${NC}"
+    else
+        echo -e "  Hysteria2: ${RED}未安装${NC}"
     fi
     if command -v xray &> /dev/null; then
         local xray_ver=$(xray version 2>/dev/null | head -n1 | awk '{print $2}' || echo "未知")
-        echo -e "  Xray:      ${YELLOW}${xray_ver}${NC}"
-    fi
-    
-    # Hysteria2 服务状态
-    if systemctl is-active --quiet "$CLIENT_SERVICE" 2>/dev/null; then
-        echo -e "  Hysteria2 服务: ${GREEN}✓ 运行中${NC}"
+        echo -e "  Xray:      ${GREEN}${xray_ver}${NC}"
     else
-        echo -e "  Hysteria2 服务: ${RED}✗ 未运行${NC}"
+        echo -e "  Xray:      ${RED}未安装${NC}"
     fi
     
-    # Xray 服务状态
+    # 服务状态
+    echo ""
+    echo -e "${YELLOW}[服务状态]${NC}"
+    if systemctl is-active --quiet "$CLIENT_SERVICE" 2>/dev/null; then
+        echo -e "  Hysteria2: ${GREEN}✓ 运行中${NC}"
+    elif command -v hysteria &> /dev/null; then
+        echo -e "  Hysteria2: ${RED}✗ 已停止${NC}"
+    else
+        echo -e "  Hysteria2: ${RED}✗ 未安装${NC}"
+    fi
+    
     if systemctl is-active --quiet xray-client 2>/dev/null; then
-        echo -e "  Xray 服务:      ${GREEN}✓ 运行中${NC}"
-    elif [[ -f /etc/systemd/system/xray-client.service ]]; then
-        echo -e "  Xray 服务:      ${RED}✗ 未运行${NC}"
+        echo -e "  Xray:      ${GREEN}✓ 运行中${NC}"
+    elif command -v xray &> /dev/null; then
+        echo -e "  Xray:      ${RED}✗ 已停止${NC}"
+    else
+        echo -e "  Xray:      ${RED}✗ 未安装${NC}"
     fi
     
-    # 配置信息
+    # TUN 模式状态
+    echo ""
+    echo -e "${YELLOW}[TUN 模式]${NC}"
+    if [[ -f "$CONFIG_FILE" ]] && grep -q "^tun:" "$CONFIG_FILE" 2>/dev/null; then
+        # 检查 TUN 接口是否存在
+        if ip link show hystun &>/dev/null 2>&1 || ifconfig hystun &>/dev/null 2>&1; then
+            echo -e "  状态: ${GREEN}✓ 已启用 (运行中)${NC}"
+        else
+            echo -e "  状态: ${YELLOW}○ 已配置 (未激活)${NC}"
+        fi
+    else
+        echo -e "  状态: ${RED}✗ 未启用${NC}"
+    fi
+    
+    # 代理端口
+    echo ""
+    echo -e "${YELLOW}[代理端口]${NC}"
     if [[ -f "$CONFIG_FILE" ]]; then
-        local server=$(grep "^server:" "$CONFIG_FILE" 2>/dev/null | awk '{print $2}')
         local socks=$(grep -A1 "^socks5:" "$CONFIG_FILE" 2>/dev/null | grep "listen:" | awk '{print $2}')
         local http=$(grep -A1 "^http:" "$CONFIG_FILE" 2>/dev/null | grep "listen:" | awk '{print $2}')
-        local tun_status="禁用"
-        grep -q "^tun:" "$CONFIG_FILE" && tun_status="启用"
-        
-        echo ""
-        echo -e "${YELLOW}[Hysteria2 配置]${NC}"
-        echo -e "  服务器:   ${GREEN}${server:-未配置}${NC}"
-        echo -e "  SOCKS5:   ${GREEN}${socks:-未配置}${NC}"
-        echo -e "  HTTP:     ${GREEN}${http:-未配置}${NC}"
-        echo -e "  TUN 模式: ${GREEN}${tun_status}${NC}"
-    fi
-    
-    # Xray 配置
-    local xray_config="${BASE_DIR}/xray-config.json"
-    if [[ -f "$xray_config" ]]; then
-        local xray_server=$(grep -o '"address": "[^"]*"' "$xray_config" 2>/dev/null | head -1 | cut -d'"' -f4)
-        local xray_port=$(grep -o '"port": [0-9]*' "$xray_config" 2>/dev/null | head -1 | awk '{print $2}')
-        echo ""
-        echo -e "${YELLOW}[VLESS-Reality 配置]${NC}"
-        echo -e "  服务器:   ${GREEN}${xray_server:-未配置}:${xray_port:-未配置}${NC}"
+        echo -e "  SOCKS5: ${GREEN}${socks:-未配置}${NC}"
+        echo -e "  HTTP:   ${GREEN}${http:-未配置}${NC}"
+    else
+        echo -e "  SOCKS5: ${RED}未配置${NC}"
+        echo -e "  HTTP:   ${RED}未配置${NC}"
     fi
     
     # 开机自启动状态
     echo ""
     echo -e "${YELLOW}[开机自启动]${NC}"
-    local hy_auto=$(systemctl is-enabled "$CLIENT_SERVICE" 2>/dev/null); hy_auto=${hy_auto:-未配置}
-    local xray_auto=$(systemctl is-enabled xray-client 2>/dev/null); xray_auto=${xray_auto:-未配置}
-    if [[ "$hy_auto" == "enabled" ]]; then
-        echo -e "  Hysteria2: ${GREEN}✓ 已启用${NC}"
+    if systemctl is-enabled "$CLIENT_SERVICE" &>/dev/null 2>&1; then
+        local hy_auto=$(systemctl is-enabled "$CLIENT_SERVICE" 2>/dev/null)
+        if [[ "$hy_auto" == "enabled" ]]; then
+            echo -e "  Hysteria2: ${GREEN}✓ 已启用${NC}"
+        else
+            echo -e "  Hysteria2: ${RED}✗ 未启用${NC}"
+        fi
     else
-        echo -e "  Hysteria2: ${RED}✗ 未启用${NC}"
+        echo -e "  Hysteria2: ${RED}✗ 未配置${NC}"
     fi
+    
     if [[ -f /etc/systemd/system/xray-client.service ]]; then
+        local xray_auto=$(systemctl is-enabled xray-client 2>/dev/null)
         if [[ "$xray_auto" == "enabled" ]]; then
             echo -e "  Xray:      ${GREEN}✓ 已启用${NC}"
         else
             echo -e "  Xray:      ${RED}✗ 未启用${NC}"
         fi
+    else
+        echo -e "  Xray:      ${RED}✗ 未配置${NC}"
     fi
     
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
