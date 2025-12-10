@@ -1432,6 +1432,7 @@ if(p==="/auth/hysteria" && req.method==="POST"){
   // auth format: username:password
   const [username, password] = authStr.split(":");
   const users = loadUsers();
+  const user = users.find(u => u.username === username && u.password === password);
   if(user){
     // Check limits
     const check = checkUserLimits(user);
