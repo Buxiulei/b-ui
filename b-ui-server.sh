@@ -823,7 +823,14 @@ function updateXrayConfig(users){try{if(!fs.existsSync(CONFIG.xrayConfig))return
 let c=JSON.parse(fs.readFileSync(CONFIG.xrayConfig,"utf8"));
 const clients=users.map(u=>({id:u.uuid,flow:"xtls-rprx-vision",email:u.username}));
 const inbound=c.inbounds.find(i=>i.tag==="vless-reality");
-if(inbound)inbound.settings.clients=clients;
+if(inbound){
+  inbound.settings.clients=clients;
+  // Collect all unique SNIs from users and add to serverNames
+  const userSnis=users.filter(u=>u.sni).map(u=>u.sni);
+  const baseSni=inbound.streamSettings?.realitySettings?.dest?.split(":")[0]||"www.bing.com";
+  const allSnis=[...new Set([baseSni,...userSnis])];
+  if(inbound.streamSettings?.realitySettings)inbound.streamSettings.realitySettings.serverNames=allSnis;
+}
 fs.writeFileSync(CONFIG.xrayConfig,JSON.stringify(c,null,2));try{const addJson={inbounds:[{tag:"vless-reality",port:10001,protocol:"vless",settings:{clients:clients,decryption:"none"}}]};fs.writeFileSync("/tmp/xray-add.json",JSON.stringify(addJson));execSync("xray api adu -s 127.0.0.1:10085 /tmp/xray-add.json",{stdio:"pipe"})}catch(e){execSync("systemctl restart xray 2>/dev/null||true",{stdio:"pipe"})}}catch(e){log("ERROR","Xray: "+e.message)}}
 function getConfig(){try{let dm,pm;
 const hc=fs.readFileSync(CONFIG.hysteriaConfig,"utf8");
@@ -862,13 +869,14 @@ if(users.find(u=>u.username===user))return sendJSON(res,{error:"User exists"},40
 const protocol=params.get("protocol")||"hysteria2";
 const pass=params.get("pass")||(protocol==="vless-reality"?crypto.randomUUID():crypto.randomBytes(8).toString("hex"));
 const days=parseInt(params.get("days"))||0;const traffic=parseFloat(params.get("traffic"))||0;const monthly=parseFloat(params.get("monthly"))||0;const speed=parseFloat(params.get("speed"))||0;
+const sni=params.get("sni")||""; // User-specific SNI for free-data domains
 const newUser={username:user,protocol,createdAt:new Date().toISOString(),limits:{},usage:{total:0,monthly:{}}};
-if(protocol==="vless-reality"){newUser.uuid=pass}else{newUser.password=pass}
+if(protocol==="vless-reality"){newUser.uuid=pass;if(sni)newUser.sni=sni}else{newUser.password=pass}
 if(days>0)newUser.limits.expiresAt=new Date(Date.now()+days*864e5).toISOString();
 if(traffic>0)newUser.limits.trafficLimit=traffic*1073741824;
 if(monthly>0)newUser.limits.monthlyLimit=monthly*1073741824;if(speed>0)newUser.limits.speedLimit=speed*1000000;
 users.push(newUser);
-if(saveUsers(users))return sendJSON(res,{success:true,user:user,password:pass});
+if(saveUsers(users))return sendJSON(res,{success:true,user:user,password:pass,sni:sni});
 return sendJSON(res,{error:"Save failed"},500)}
 if(action==="delete"){
 if(!user)return sendJSON(res,{error:"Missing user"},400);
@@ -1130,10 +1138,46 @@ const HTML=`<!DOCTYPE html>
 <div id="m-add" class="modal">
     <div class="modal-card">
         <h3 style="margin-bottom:20px; font-size:18px">新建用户</h3>
-        <select id="nproto">
+        <select id="nproto" onchange="toggleSniSelect()">
             <option value="hysteria2">Hysteria2 (推荐)</option>
             <option value="vless-reality">VLESS + Reality</option>
         </select>
+        <div id="sni-group" style="display:none">
+            <select id="nsni">
+                <optgroup label="默认">
+                    <option value="">使用全局伪装域名</option>
+                    <option value="www.bing.com">www.bing.com (默认)</option>
+                    <option value="www.microsoft.com">www.microsoft.com</option>
+                </optgroup>
+                <optgroup label="电信免流">
+                    <option value="vod3.nty.tv189.cn">天翼视讯 (vod3.nty.tv189.cn)</option>
+                    <option value="cloudgame.189.cn">天翼云游戏 (cloudgame.189.cn)</option>
+                    <option value="ltewap.tv189.com">电信爱看 (ltewap.tv189.com)</option>
+                    <option value="h5.nty.tv189.com">天翼视讯H5 (h5.nty.tv189.com)</option>
+                    <option value="open.4g.play.cn">电信爱玩 (open.4g.play.cn)</option>
+                </optgroup>
+                <optgroup label="联通免流">
+                    <option value="game.hxll.wostore.cn">沃商店游戏 (game.hxll.wostore.cn)</option>
+                    <option value="music.hxll.wostore.cn">沃商店音乐 (music.hxll.wostore.cn)</option>
+                    <option value="box.10155.com">沃音乐 (box.10155.com)</option>
+                    <option value="partner.iread.wo.com.cn">沃阅读 (partner.iread.wo.com.cn)</option>
+                    <option value="wotv.17wo.cn">联通WOTV (wotv.17wo.cn)</option>
+                </optgroup>
+                <optgroup label="移动免流">
+                    <option value="mm.10086.cn">移动商城 (mm.10086.cn)</option>
+                    <option value="www.10086.cn">移动官网 (www.10086.cn)</option>
+                    <option value="dm.toutiao.com">抖音/头条 (dm.toutiao.com)</option>
+                </optgroup>
+                <optgroup label="定向流量">
+                    <option value="short.weixin.qq.com">微信 (short.weixin.qq.com)</option>
+                    <option value="data.video.qiyi.com">爱奇艺 (data.video.qiyi.com)</option>
+                    <option value="api.mobile.youku.com">优酷 (api.mobile.youku.com)</option>
+                    <option value="dl.stream.qqmusic.com">QQ音乐 (dl.stream.qqmusic.com)</option>
+                </optgroup>
+            </select>
+            <input id="nsni-custom" placeholder="或输入自定义域名 (留空使用上面选择)" style="margin-top:8px">
+            <p style="font-size:11px;color:#888;margin:5px 0 10px">⚠️ 免流域名需要服务器支持，请确保已在伪装设置中添加</p>
+        </div>
         <input id="nu" placeholder="用户名">
         <input id="np" placeholder="密码 / UUID (自动生成)">
         <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px">
@@ -1235,8 +1279,10 @@ function load(){
 
 function addUser(){
     const u=$("#nu").value,p=$("#np").value,d=$("#nd").value||0,t=$("#nt").value||0,m=$("#nm").value||0,s=$("#ns").value||0,proto=$("#nproto").value;
-    fetch("/api/manage?key="+encodeURIComponent(cfg.adminPass||localStorage.getItem("ap")||"")+"&action=create&user="+encodeURIComponent(u)+(p?"&pass="+encodeURIComponent(p):"")+"&days="+d+"&traffic="+t+"&monthly="+m+"&speed="+s+"&protocol="+proto)
-    .then(r=>r.json()).then(r=>{if(r.success){closeM();toast("User "+u+" created");load()}else toast(r.error||"Failed",1)})
+    const customSni=$("#nsni-custom")?.value||$("#nsni")?.value||"";
+    let url="/api/manage?key="+encodeURIComponent(cfg.adminPass||localStorage.getItem("ap")||"")+"&action=create&user="+encodeURIComponent(u)+(p?"&pass="+encodeURIComponent(p):"")+"&days="+d+"&traffic="+t+"&monthly="+m+"&speed="+s+"&protocol="+proto;
+    if(customSni)url+="&sni="+encodeURIComponent(customSni);
+    fetch(url).then(r=>r.json()).then(r=>{if(r.success){closeM();toast("User "+u+" created");load()}else toast(r.error||"Failed",1)})
 }
 
 function del(u){if(confirm("Delete user "+u+"?"))api("/users/"+encodeURIComponent(u),{method:"DELETE"}).then(()=>load())}
@@ -1244,7 +1290,10 @@ function kick(u){api("/kick",{method:"POST",body:JSON.stringify([u])}).then(()=>
 
 let allUsers=[];
 function genUri(x){
-    if(x.protocol==="vless-reality") return "vless://"+x.uuid+"@"+cfg.domain+":"+cfg.xrayPort+"?encryption=none&flow=xtls-rprx-vision&security=reality&sni="+cfg.sni+"&fp=chrome&pbk="+cfg.pubKey+"&sid="+cfg.shortId+"&spx=%2F&type=tcp#"+encodeURIComponent(x.username);
+    if(x.protocol==="vless-reality"){
+        const userSni=x.sni||cfg.sni||"www.bing.com";
+        return "vless://"+x.uuid+"@"+cfg.domain+":"+cfg.xrayPort+"?encryption=none&flow=xtls-rprx-vision&security=reality&sni="+userSni+"&fp=chrome&pbk="+cfg.pubKey+"&sid="+cfg.shortId+"&spx=%2F&type=tcp#"+encodeURIComponent(x.username+(x.sni?" ["+x.sni+"]":""));
+    }
     return "hysteria2://"+encodeURIComponent(x.username)+":"+encodeURIComponent(x.password)+"@"+cfg.domain+":"+cfg.port+"/?sni="+cfg.domain+"&insecure=0#"+encodeURIComponent(x.username)
 }
 
@@ -1268,6 +1317,12 @@ function openMasq(){
 function saveMasq(){
     const url=$("#masqurl").value;if(!url)return toast("请输入URL",1);
     api("/masquerade",{method:"POST",body:JSON.stringify({url})}).then(r=>{if(r.success){closeM();toast("伪装网站已更新: "+r.domain);setTimeout(()=>location.reload(),2000)}else toast(r.error||"Failed",1)})
+}
+
+function toggleSniSelect(){
+    const proto=$("#nproto").value;
+    const sniGroup=$("#sni-group");
+    if(proto==="vless-reality"){sniGroup.style.display="block"}else{sniGroup.style.display="none"}
 }
 
 if(tok)init();
