@@ -2226,28 +2226,56 @@ main() {
 #===============================================================================
 
 SCRIPT_URL="https://raw.githubusercontent.com/Buxiulei/b-ui/main/b-ui-client.sh"
+# GitHub 镜像站点 (备用)
+SCRIPT_URL_MIRROR="https://ghproxy.com/https://raw.githubusercontent.com/Buxiulei/b-ui/main/b-ui-client.sh"
 
 create_global_command() {
     print_info "创建全局命令 bui-c..."
     
-    # 始终从 GitHub 下载最新版本 (避免管道运行时 $0 不可用的问题)
-    print_info "从 GitHub 下载脚本..."
-    if curl -fsSL "$SCRIPT_URL" -o /usr/local/bin/bui-c; then
+    local download_success=false
+    
+    # 方法1: 使用本地 SOCKS5 代理下载 (如果可用)
+    if ss -tuln 2>/dev/null | grep -q ":1080 "; then
+        print_info "使用本地代理下载..."
+        if curl --socks5 127.0.0.1:1080 -fsSL --max-time 30 "$SCRIPT_URL" -o /usr/local/bin/bui-c 2>/dev/null; then
+            download_success=true
+        fi
+    fi
+    
+    # 方法2: 使用镜像下载
+    if [[ "$download_success" == "false" ]]; then
+        print_info "尝试镜像下载..."
+        if curl -fsSL --max-time 30 "$SCRIPT_URL_MIRROR" -o /usr/local/bin/bui-c 2>/dev/null; then
+            download_success=true
+        fi
+    fi
+    
+    # 方法3: 直接下载 (带超时)
+    if [[ "$download_success" == "false" ]]; then
+        print_info "直接下载..."
+        if curl -fsSL --max-time 60 "$SCRIPT_URL" -o /usr/local/bin/bui-c 2>/dev/null; then
+            download_success=true
+        fi
+    fi
+    
+    if [[ "$download_success" == "true" ]]; then
         chmod +x /usr/local/bin/bui-c
         # 验证下载是否成功 (文件应该超过 1000 行)
         local lines=$(wc -l < /usr/local/bin/bui-c 2>/dev/null || echo "0")
         if [[ "$lines" -gt 1000 ]]; then
             print_success "全局命令已创建，可使用 'sudo bui-c' 运行"
         else
-            print_error "下载的文件不完整 (只有 $lines 行)，请检查网络连接"
+            print_error "下载的文件不完整 (只有 $lines 行)"
             rm -f /usr/local/bin/bui-c
             return 1
         fi
     else
         print_error "下载失败，请检查网络连接"
+        print_info "你可以稍后手动创建: sudo curl -o /usr/local/bin/bui-c \"$SCRIPT_URL\""
         return 1
     fi
 }
+
 
 
 # 首次运行检测 - 安装所有核心和创建全局命令
