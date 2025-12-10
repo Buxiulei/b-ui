@@ -56,6 +56,43 @@ print_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
 print_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
+# 进度动画 - 在后台运行命令时显示旋转动画
+spinner_pid=""
+start_spinner() {
+    local msg="${1:-请稍候...}"
+    (
+        chars="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+        while true; do
+            for (( i=0; i<${#chars}; i++ )); do
+                echo -ne "\r${CYAN}${chars:$i:1}${NC} $msg"
+                sleep 0.1
+            done
+        done
+    ) &
+    spinner_pid=$!
+}
+
+stop_spinner() {
+    if [[ -n "$spinner_pid" ]]; then
+        kill "$spinner_pid" 2>/dev/null
+        wait "$spinner_pid" 2>/dev/null
+        echo -ne "\r\033[K"  # 清除行
+        spinner_pid=""
+    fi
+}
+
+# 带进度动画执行命令
+run_with_spinner() {
+    local msg="$1"
+    shift
+    start_spinner "$msg"
+    "$@" > /dev/null 2>&1
+    local ret=$?
+    stop_spinner
+    return $ret
+}
+
+
 check_root() {
     if [[ $EUID -ne 0 ]]; then
         print_error "此脚本需要 root 权限"
@@ -147,8 +184,8 @@ check_dependencies() {
     
     # 更新包索引
     if [[ "$PKG_MANAGER" != "unknown" ]]; then
-        print_info "更新软件包索引..."
-        $PKG_UPDATE > /dev/null 2>&1 || true
+        run_with_spinner "更新软件包索引..." $PKG_UPDATE
+        echo -e "  ${GREEN}✓${NC} 软件包索引已更新"
     fi
     
     echo ""
@@ -403,12 +440,14 @@ install_singbox() {
     
     # 添加 sing-box 官方源
     if [[ "$PKG_MANAGER" == "apt" ]]; then
+        start_spinner "添加 sing-box 源..."
         curl -fsSL https://sing-box.app/gpg.key -o /etc/apt/keyrings/sagernet.asc 2>/dev/null || \
         curl -fsSL https://sing-box.app/gpg.key | tee /etc/apt/keyrings/sagernet.asc > /dev/null
         chmod a+r /etc/apt/keyrings/sagernet.asc
         echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/sagernet.asc] https://deb.sagernet.org/ * *" > /etc/apt/sources.list.d/sagernet.list
-        apt-get update -qq
-        apt-get install -y -qq sing-box
+        stop_spinner
+        run_with_spinner "下载 sing-box..." apt-get update -qq
+        run_with_spinner "安装 sing-box..." apt-get install -y -qq sing-box
     else
         # 其他系统使用官方安装脚本
         bash <(curl -fsSL https://sing-box.app/install.sh)
