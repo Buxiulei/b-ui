@@ -24,6 +24,10 @@ CONFIG_FILE="${BASE_DIR}/config.yaml"
 RULES_FILE="${BASE_DIR}/bypass-rules.txt"
 CLIENT_SERVICE="hysteria-client.service"
 
+# 多配置管理路径
+CONFIGS_DIR="${BASE_DIR}/configs"       # 存储所有配置
+ACTIVE_CONFIG="${BASE_DIR}/active"      # 当前激活的配置名称
+
 # 默认配置
 SOCKS_PORT="1080"
 HTTP_PORT="8080"
@@ -590,6 +594,417 @@ parse_vless_uri() {
     echo "REMARK=$remark"
 }
 
+#===============================================================================
+# 多配置管理
+#===============================================================================
+
+get_active_config() {
+    # 获取当前激活的配置名
+    if [[ -f "$ACTIVE_CONFIG" ]]; then
+        cat "$ACTIVE_CONFIG"
+    else
+        echo ""
+    fi
+}
+
+save_config_meta() {
+    # 保存配置元信息
+    local config_name="$1"
+    local protocol="$2"
+    local server="$3"
+    local uri="$4"
+    
+    local config_dir="${CONFIGS_DIR}/${config_name}"
+    mkdir -p "$config_dir"
+    
+    # 保存元信息
+    cat > "${config_dir}/meta.json" << EOF
+{
+    "name": "${config_name}",
+    "protocol": "${protocol}",
+    "server": "${server}",
+    "createdAt": "$(date -Iseconds)"
+}
+EOF
+    
+    # 保存原始 URI
+    echo "$uri" > "${config_dir}/uri.txt"
+}
+
+list_configs() {
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}已保存的配置${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    
+    if [[ ! -d "$CONFIGS_DIR" ]] || [[ -z "$(ls -A "$CONFIGS_DIR" 2>/dev/null)" ]]; then
+        print_warning "没有保存的配置"
+        return 1
+    fi
+    
+    local active=$(get_active_config)
+    local index=1
+    
+    for config_dir in "$CONFIGS_DIR"/*/; do
+        [[ ! -d "$config_dir" ]] && continue
+        local name=$(basename "$config_dir")
+        local meta_file="${config_dir}meta.json"
+        
+        local protocol="未知"
+        local server="未知"
+        if [[ -f "$meta_file" ]]; then
+            protocol=$(grep '"protocol"' "$meta_file" | cut -d'"' -f4)
+            server=$(grep '"server"' "$meta_file" | cut -d'"' -f4)
+        fi
+        
+        # 标记当前激活的配置
+        if [[ "$name" == "$active" ]]; then
+            echo -e "  ${YELLOW}${index}.${NC} ${GREEN}★ ${name}${NC} ${CYAN}[当前]${NC}"
+        else
+            echo -e "  ${YELLOW}${index}.${NC} ${name}"
+        fi
+        echo -e "     协议: ${protocol} | 服务器: ${server}"
+        echo ""
+        ((index++))
+    done
+    
+    return 0
+}
+
+switch_config() {
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}切换配置${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    
+    if ! list_configs; then
+        return 1
+    fi
+    
+    # 获取配置列表
+    local configs=()
+    for config_dir in "$CONFIGS_DIR"/*/; do
+        [[ -d "$config_dir" ]] && configs+=("$(basename "$config_dir")")
+    done
+    
+    echo ""
+    read -p "选择配置编号 (0 返回): " choice
+    
+    if [[ "$choice" == "0" ]] || [[ -z "$choice" ]]; then
+        return 0
+    fi
+    
+    if [[ ! "$choice" =~ ^[0-9]+$ ]] || [[ "$choice" -lt 1 ]] || [[ "$choice" -gt ${#configs[@]} ]]; then
+        print_error "无效选择"
+        return 1
+    fi
+    
+    local selected="${configs[$((choice-1))]}"
+    local config_dir="${CONFIGS_DIR}/${selected}"
+    
+    print_info "切换到配置: $selected"
+    
+    # 读取配置信息
+    local meta_file="${config_dir}/meta.json"
+    local protocol=$(grep '"protocol"' "$meta_file" 2>/dev/null | cut -d'"' -f4)
+    
+    # 停止所有服务
+    systemctl stop "$CLIENT_SERVICE" 2>/dev/null || true
+    systemctl stop xray-client 2>/dev/null || true
+    
+    if [[ "$protocol" == "hysteria2" ]]; then
+        # 复制 Hysteria2 配置
+        if [[ -f "${config_dir}/config.yaml" ]]; then
+            cp "${config_dir}/config.yaml" "$CONFIG_FILE"
+            create_service
+            systemctl start "$CLIENT_SERVICE"
+        else
+            print_error "配置文件不存在"
+            return 1
+        fi
+    else
+        # 复制 Xray 配置
+        if [[ -f "${config_dir}/xray-config.json" ]]; then
+            cp "${config_dir}/xray-config.json" "${BASE_DIR}/xray-config.json"
+            systemctl start xray-client
+        else
+            print_error "配置文件不存在"
+            return 1
+        fi
+    fi
+    
+    # 更新激活配置
+    echo "$selected" > "$ACTIVE_CONFIG"
+    
+    print_success "已切换到: $selected"
+}
+
+delete_config() {
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${RED}删除配置${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    
+    if ! list_configs; then
+        return 1
+    fi
+    
+    # 获取配置列表
+    local configs=()
+    for config_dir in "$CONFIGS_DIR"/*/; do
+        [[ -d "$config_dir" ]] && configs+=("$(basename "$config_dir")")
+    done
+    
+    echo ""
+    read -p "选择要删除的配置编号 (0 返回): " choice
+    
+    if [[ "$choice" == "0" ]] || [[ -z "$choice" ]]; then
+        return 0
+    fi
+    
+    if [[ ! "$choice" =~ ^[0-9]+$ ]] || [[ "$choice" -lt 1 ]] || [[ "$choice" -gt ${#configs[@]} ]]; then
+        print_error "无效选择"
+        return 1
+    fi
+    
+    local selected="${configs[$((choice-1))]}"
+    local active=$(get_active_config)
+    
+    if [[ "$selected" == "$active" ]]; then
+        print_warning "无法删除当前激活的配置，请先切换到其他配置"
+        return 1
+    fi
+    
+    read -p "确认删除 '$selected'? (y/n): " confirm
+    if [[ "$confirm" =~ ^[yY]$ ]]; then
+        rm -rf "${CONFIGS_DIR}/${selected}"
+        print_success "已删除: $selected"
+    else
+        print_info "已取消"
+    fi
+}
+
+import_batch() {
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}批量导入配置${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "支持格式:"
+    echo -e "  ${YELLOW}hysteria2://password@host:port/?sni=xxx#备注${NC}"
+    echo -e "  ${YELLOW}vless://uuid@host:port/?security=reality&sni=xxx&pbk=xxx#备注${NC}"
+    echo ""
+    echo -e "${YELLOW}请粘贴配置链接 (每行一个，输入空行结束):${NC}"
+    echo ""
+    
+    local uris=()
+    while IFS= read -r line; do
+        # 空行结束输入
+        [[ -z "$line" ]] && break
+        # 跳过注释
+        [[ "$line" =~ ^# ]] && continue
+        # 去除首尾空格
+        line=$(echo "$line" | xargs)
+        [[ -n "$line" ]] && uris+=("$line")
+    done
+    
+    if [[ ${#uris[@]} -eq 0 ]]; then
+        print_warning "没有输入任何链接"
+        return 1
+    fi
+    
+    echo ""
+    print_info "检测到 ${#uris[@]} 个链接，开始解析..."
+    echo ""
+    
+    local success_count=0
+    local fail_count=0
+    
+    for uri in "${uris[@]}"; do
+        local parsed=""
+        local protocol=""
+        
+        if [[ "$uri" =~ ^(hysteria2|hy2):// ]]; then
+            parsed=$(parse_hysteria_uri "$uri")
+            protocol="hysteria2"
+        elif [[ "$uri" =~ ^vless:// ]]; then
+            parsed=$(parse_vless_uri "$uri")
+            protocol="vless-reality"
+        else
+            echo -e "  ${RED}✗${NC} 不支持的格式: ${uri:0:50}..."
+            ((fail_count++))
+            continue
+        fi
+        
+        if [[ -z "$parsed" ]]; then
+            echo -e "  ${RED}✗${NC} 解析失败: ${uri:0:50}..."
+            ((fail_count++))
+            continue
+        fi
+        
+        # 导入解析结果
+        eval "$parsed"
+        
+        # 使用备注名或生成配置名
+        local config_name="${REMARK:-config-$(date +%s)}"
+        # 清理配置名中的特殊字符
+        config_name=$(echo "$config_name" | sed 's/[\/\\:*?"<>|]/-/g')
+        
+        # 检查是否已存在
+        if [[ -d "${CONFIGS_DIR}/${config_name}" ]]; then
+            echo -e "  ${YELLOW}○${NC} 已存在: ${config_name} (跳过)"
+            continue
+        fi
+        
+        # 保存配置元信息
+        save_config_meta "$config_name" "$protocol" "$SERVER_ADDR" "$uri"
+        
+        echo -e "  ${GREEN}✓${NC} ${config_name} (${protocol})"
+        ((success_count++))
+    done
+    
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "导入完成: ${GREEN}成功 ${success_count}${NC} / ${RED}失败 ${fail_count}${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    
+    if [[ $success_count -gt 0 ]]; then
+        echo ""
+        read -p "是否现在选择一个配置并启用? (y/n): " activate
+        if [[ "$activate" =~ ^[yY]$ ]]; then
+            activate_imported_config
+        fi
+    fi
+}
+
+activate_imported_config() {
+    # 让用户选择并完整配置一个导入的配置
+    if ! list_configs; then
+        return 1
+    fi
+    
+    # 获取配置列表
+    local configs=()
+    for config_dir in "$CONFIGS_DIR"/*/; do
+        [[ -d "$config_dir" ]] && configs+=("$(basename "$config_dir")")
+    done
+    
+    echo ""
+    read -p "选择要启用的配置编号: " choice
+    
+    if [[ ! "$choice" =~ ^[0-9]+$ ]] || [[ "$choice" -lt 1 ]] || [[ "$choice" -gt ${#configs[@]} ]]; then
+        print_error "无效选择"
+        return 1
+    fi
+    
+    local selected="${configs[$((choice-1))]}"
+    local config_dir="${CONFIGS_DIR}/${selected}"
+    local uri_file="${config_dir}/uri.txt"
+    
+    if [[ ! -f "$uri_file" ]]; then
+        print_error "无法找到原始配置链接"
+        return 1
+    fi
+    
+    local uri=$(cat "$uri_file")
+    
+    # 完整配置流程 (设置端口、TUN等)
+    _configure_and_save "$uri" "$selected" "$config_dir"
+}
+
+_configure_and_save() {
+    # 内部函数：完整配置并保存
+    local uri="$1"
+    local config_name="$2"
+    local config_dir="$3"
+    
+    # 解析 URI
+    local parsed=""
+    if [[ "$uri" =~ ^(hysteria2|hy2):// ]]; then
+        parsed=$(parse_hysteria_uri "$uri")
+    elif [[ "$uri" =~ ^vless:// ]]; then
+        parsed=$(parse_vless_uri "$uri")
+    fi
+    
+    eval "$parsed"
+    
+    mkdir -p "$BASE_DIR"
+    mkdir -p "$config_dir"
+    
+    if [[ "$PROTOCOL" == "hysteria2" ]]; then
+        # Hysteria2 配置
+        check_and_suggest_ports 1080 8080
+        
+        read -p "SOCKS5 端口 [默认 ${SUGGESTED_SOCKS_PORT}]: " SOCKS_PORT
+        SOCKS_PORT=${SOCKS_PORT:-$SUGGESTED_SOCKS_PORT}
+        
+        read -p "HTTP 端口 [默认 ${SUGGESTED_HTTP_PORT}]: " HTTP_PORT
+        HTTP_PORT=${HTTP_PORT:-$SUGGESTED_HTTP_PORT}
+        
+        read -p "启用 TUN 模式? (y/n) [默认 n]: " enable_tun
+        TUN_ENABLED="false"
+        [[ "$enable_tun" =~ ^[yY]$ ]] && TUN_ENABLED="true"
+        
+        # 带宽设置
+        echo ""
+        echo -e "${YELLOW}[带宽设置]${NC} (可选，直接回车跳过)"
+        read -p "上行带宽 (Mbps): " BANDWIDTH_UP
+        read -p "下行带宽 (Mbps): " BANDWIDTH_DOWN
+        
+        # 安装 Hysteria2
+        install_hysteria
+        
+        create_default_rules
+        generate_config
+        
+        # 复制配置到配置目录
+        cp "$CONFIG_FILE" "${config_dir}/config.yaml"
+        
+        create_service
+        systemctl start "$CLIENT_SERVICE"
+    else
+        # VLESS-Reality 配置
+        install_xray_client
+        generate_xray_config
+        
+        # 复制配置到配置目录
+        cp "${BASE_DIR}/xray-config.json" "${config_dir}/xray-config.json"
+    fi
+    
+    # 更新激活配置
+    echo "$config_name" > "$ACTIVE_CONFIG"
+    
+    print_success "配置 '$config_name' 已启用"
+}
+
+config_management() {
+    while true; do
+        echo ""
+        echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+        echo -e "${GREEN}配置管理${NC}"
+        echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+        echo ""
+        echo -e "  ${YELLOW}1.${NC} 查看所有配置"
+        echo -e "  ${YELLOW}2.${NC} 切换配置"
+        echo -e "  ${YELLOW}3.${NC} 删除配置"
+        echo -e "  ${YELLOW}0.${NC} 返回主菜单"
+        echo ""
+        read -p "请选择 [0-3]: " mgmt_choice
+        
+        case $mgmt_choice in
+            1) list_configs ;;
+            2) switch_config ;;
+            3) delete_config ;;
+            0) return ;;
+            *) print_error "无效选项" ;;
+        esac
+        
+        echo ""
+        read -p "按 Enter 继续..."
+    done
+}
+
 import_from_uri() {
     echo ""
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
@@ -641,7 +1056,26 @@ import_from_uri() {
     [[ -n "$REMARK" ]] && echo -e "  备注:   ${GREEN}${REMARK}${NC}"
     echo ""
     
+    # 生成配置名
+    local config_name="${REMARK:-config-$(date +%s)}"
+    config_name=$(echo "$config_name" | sed 's/[\/\\:*?"<>|]/-/g')
+    
+    # 如果已存在，询问是否覆盖
+    if [[ -d "${CONFIGS_DIR}/${config_name}" ]]; then
+        print_warning "配置 '$config_name' 已存在"
+        read -p "覆盖现有配置? (y/n): " overwrite
+        if [[ "$overwrite" != "y" ]]; then
+            read -p "请输入新的配置名: " config_name
+            config_name=$(echo "$config_name" | sed 's/[\/\\:*?"<>|]/-/g')
+        fi
+    fi
+    
+    local config_dir="${CONFIGS_DIR}/${config_name}"
     mkdir -p "$BASE_DIR"
+    mkdir -p "$config_dir"
+    
+    # 保存配置元信息和原始 URI
+    save_config_meta "$config_name" "$PROTOCOL" "$SERVER_ADDR" "$uri"
     
     if [[ "$PROTOCOL" == "hysteria2" ]]; then
         # Hysteria2 配置 - 检测端口占用情况
@@ -664,7 +1098,7 @@ import_from_uri() {
         
         read -p "启用 TUN 模式 (全局代理)? (y/n) [默认 n]: " enable_tun
         TUN_ENABLED="false"
-        [[ "$enable_tun" == "y" || "$enable_tun" == "Y" ]] && TUN_ENABLED="true"
+        [[ "$enable_tun" =~ ^[yY]$ ]] && TUN_ENABLED="true"
         
         # 带宽设置
         echo ""
@@ -678,13 +1112,25 @@ import_from_uri() {
         
         create_default_rules
         generate_config
+        
+        # 复制配置到配置目录
+        cp "$CONFIG_FILE" "${config_dir}/config.yaml"
+        
+        create_service
+        systemctl start "$CLIENT_SERVICE" 2>/dev/null || true
     else
         # VLESS-Reality 配置 (需要 Xray)
         install_xray_client
         generate_xray_config
+        
+        # 复制配置到配置目录
+        cp "${BASE_DIR}/xray-config.json" "${config_dir}/xray-config.json"
     fi
     
-    print_success "配置已导入并生成"
+    # 更新当前激活配置
+    echo "$config_name" > "$ACTIVE_CONFIG"
+    
+    print_success "配置 '$config_name' 已导入并生成"
 }
 
 #===============================================================================
@@ -729,7 +1175,7 @@ configure_client() {
     # TUN 模式
     read -p "启用 TUN 模式 (全局代理)? (y/n) [默认 n]: " enable_tun
     TUN_ENABLED="false"
-    [[ "$enable_tun" == "y" || "$enable_tun" == "Y" ]] && TUN_ENABLED="true"
+    [[ "$enable_tun" =~ ^[yY]$ ]] && TUN_ENABLED="true"
     
     # 带宽设置
     echo ""
@@ -1008,7 +1454,7 @@ edit_rules() {
     # 提示重新生成配置
     if [[ "$rule_choice" =~ ^[1-5]$ ]]; then
         read -p "是否重新生成配置并重启? (y/n): " regen
-        if [[ "$regen" == "y" ]]; then
+        if [[ "$regen" =~ ^[yY]$ ]]; then
             generate_config
             systemctl restart "$CLIENT_SERVICE" 2>/dev/null || true
             print_success "配置已更新并重启"
@@ -1030,7 +1476,7 @@ toggle_tun() {
     if grep -q "^tun:" "$CONFIG_FILE"; then
         echo -e "TUN 模式: ${GREEN}已启用${NC}"
         read -p "禁用 TUN 模式? (y/n): " disable
-        if [[ "$disable" == "y" ]]; then
+        if [[ "$disable" =~ ^[yY]$ ]]; then
             # 注释掉 TUN 配置
             sed -i '/^tun:/,/^[a-z]/{ /^tun:/d; /^  /d; }' "$CONFIG_FILE"
             TUN_ENABLED="false"
@@ -1040,7 +1486,7 @@ toggle_tun() {
     else
         echo -e "TUN 模式: ${YELLOW}已禁用${NC}"
         read -p "启用 TUN 模式? (y/n): " enable
-        if [[ "$enable" == "y" ]]; then
+        if [[ "$enable" =~ ^[yY]$ ]]; then
             TUN_ENABLED="true"
             
             # 配置 rp_filter (Linux TUN 必需)
@@ -1117,7 +1563,16 @@ show_status() {
     echo ""
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
     
+    # 当前配置
+    local active_config=$(get_active_config)
+    if [[ -n "$active_config" ]]; then
+        echo -e "${YELLOW}[当前配置]${NC} ${GREEN}★ ${active_config}${NC}"
+    else
+        echo -e "${YELLOW}[当前配置]${NC} ${RED}未设置${NC}"
+    fi
+    
     # 版本信息
+    echo ""
     echo -e "${YELLOW}[内核版本]${NC}"
     if command -v hysteria &> /dev/null; then
         local hy_ver=$(hysteria version 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "未知")
@@ -1257,13 +1712,14 @@ uninstall() {
     echo -e "${YELLOW}将卸载以下内容:${NC}"
     echo "  • Hysteria2 客户端服务和配置"
     echo "  • Xray 客户端服务和配置"
+    echo "  • 所有已保存的配置 (configs 目录)"
     echo "  • 路由规则和 TUN 配置"
     echo "  • 全局命令 bui-c"
     echo ""
     
     read -p "输入 'YES' 确认完全卸载: " confirm
     
-    if [[ "$confirm" != "YES" ]]; then
+    if [[ ! "$confirm" =~ ^[yY][eE][sS]$ ]]; then
         print_info "已取消卸载"
         return
     fi
@@ -1292,7 +1748,7 @@ uninstall() {
     # 3. 重载 systemd
     systemctl daemon-reload
     
-    # 4. 删除配置目录
+    # 4. 删除配置目录 (包含所有保存的配置)
     if [[ -d "$BASE_DIR" ]]; then
         rm -rf "$BASE_DIR"
         echo -e "  ${GREEN}✓${NC} 配置目录已删除 ($BASE_DIR)"
@@ -1305,14 +1761,14 @@ uninstall() {
     echo ""
     read -p "删除 Hysteria2 程序? (y/n) [默认 y]: " del_hy
     del_hy=${del_hy:-y}
-    if [[ "$del_hy" == "y" ]]; then
+    if [[ "$del_hy" =~ ^[yY]$ ]]; then
         rm -f /usr/local/bin/hysteria
         echo -e "  ${GREEN}✓${NC} Hysteria2 程序已删除"
     fi
     
     read -p "删除 Xray 程序? (y/n) [默认 y]: " del_xray
     del_xray=${del_xray:-y}
-    if [[ "$del_xray" == "y" ]]; then
+    if [[ "$del_xray" =~ ^[yY]$ ]]; then
         # Xray 可能通过官方脚本安装到不同位置
         rm -f /usr/local/bin/xray
         rm -rf /usr/local/share/xray
@@ -1320,23 +1776,27 @@ uninstall() {
         echo -e "  ${GREEN}✓${NC} Xray 程序已删除"
     fi
     
-    # 7. 删除全局命令
-    read -p "删除全局命令 bui-c? (y/n) [默认 y]: " del_cmd
-    del_cmd=${del_cmd:-y}
-    if [[ "$del_cmd" == "y" ]]; then
+    # 7. 删除全局命令 (始终删除，因为用户已确认完全卸载)
+    echo ""
+    print_info "删除全局命令..."
+    if [[ -f /usr/local/bin/bui-c ]]; then
         rm -f /usr/local/bin/bui-c
-        echo -e "  ${GREEN}✓${NC} 全局命令已删除"
+        echo -e "  ${GREEN}✓${NC} 全局命令 bui-c 已删除"
+    else
+        echo -e "  ${YELLOW}○${NC} 全局命令 bui-c 不存在"
+    fi
+    
+    # 也检查 b-ui-client 别名 (如果有)
+    if [[ -f /usr/local/bin/b-ui-client ]]; then
+        rm -f /usr/local/bin/b-ui-client
+        echo -e "  ${GREEN}✓${NC} 全局命令 b-ui-client 已删除"
     fi
     
     echo ""
     print_success "卸载完成！"
     echo ""
-    
-    # 如果删除了全局命令，提示退出
-    if [[ "$del_cmd" == "y" ]]; then
-        print_info "全局命令已删除，脚本将退出"
-        exit 0
-    fi
+    print_info "脚本将退出"
+    exit 0
 }
 
 #===============================================================================
@@ -1349,18 +1809,21 @@ show_menu() {
     echo -e "${CYAN}║${NC}              ${GREEN}B-UI 客户端 操作菜单${NC}                            ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}1.${NC} ${GREEN}从链接导入配置${NC} (Hysteria2 / VLESS-Reality)           ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}2.${NC} 手动配置 Hysteria2                                     ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}3.${NC} 启动/停止服务                                          ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}4.${NC} 重启服务                                               ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}5.${NC} 查看日志                                               ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}2.${NC} ${GREEN}批量导入配置${NC}                                         ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}3.${NC} ${GREEN}配置管理${NC} (列表/切换/删除)                             ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}4.${NC} 手动配置 Hysteria2                                     ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}6.${NC} TUN 模式开关 (全局代理)                                ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}7.${NC} 编辑路由规则                                           ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}8.${NC} 测试代理连接                                           ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}5.${NC} 启动/停止服务                                          ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}6.${NC} 重启服务                                               ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}7.${NC} 查看日志                                               ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}9.${NC} 更新内核 (Hysteria2 + Xray)                            ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}10.${NC} 开机自启动设置                                         ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}11.${NC} ${RED}卸载${NC}                                                  ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}8.${NC} TUN 模式开关 (全局代理)                                ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}9.${NC} 编辑路由规则                                           ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}10.${NC} 测试代理连接                                          ${CYAN}║${NC}"
+    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}11.${NC} 更新内核 (Hysteria2 + Xray)                           ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}12.${NC} 开机自启动设置                                        ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}13.${NC} ${RED}卸载${NC}                                                 ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}0.${NC} 退出                                                   ${CYAN}║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
 }
@@ -1374,12 +1837,14 @@ main() {
         print_banner
         show_status
         show_menu
-        read -p "请选择 [0-11]: " choice
+        read -p "请选择 [0-13]: " choice
         
         case $choice in
             1) import_from_uri ;;
-            2) quick_install ;;
-            3) 
+            2) import_batch ;;
+            3) config_management ;;
+            4) quick_install ;;
+            5) 
                 # 启动/停止
                 if systemctl is-active --quiet "$CLIENT_SERVICE" 2>/dev/null; then
                     systemctl stop "$CLIENT_SERVICE"
@@ -1391,13 +1856,13 @@ main() {
                     print_success "服务已启动"
                 fi
                 ;;
-            4) 
+            6) 
                 # 重启
                 systemctl restart "$CLIENT_SERVICE" 2>/dev/null || true
                 systemctl restart xray-client 2>/dev/null || true
                 print_success "服务已重启"
                 ;;
-            5) 
+            7) 
                 # 查看日志
                 echo ""
                 echo -e "${YELLOW}选择日志类型:${NC}"
@@ -1410,10 +1875,10 @@ main() {
                     *) print_error "无效选项" ;;
                 esac
                 ;;
-            6) toggle_tun ;;
-            7) edit_rules ;;
-            8) test_proxy ;;
-            9) 
+            8) toggle_tun ;;
+            9) edit_rules ;;
+            10) test_proxy ;;
+            11) 
                 # 更新内核
                 print_info "更新 Hysteria2..."
                 local old_hy=$(hysteria version 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "未知")
@@ -1430,14 +1895,14 @@ main() {
                 fi
                 print_success "内核更新完成"
                 ;;
-            10)
+            12)
                 # 开机自启动
                 local hy_auto=$(systemctl is-enabled "$CLIENT_SERVICE" 2>/dev/null); hy_auto=${hy_auto:-disabled}
                 echo ""
                 if [[ "$hy_auto" == "enabled" ]]; then
                     echo -e "当前状态: ${GREEN}已启用${NC}"
                     read -p "关闭开机自启动? (y/n): " disable
-                    if [[ "$disable" == "y" ]]; then
+                    if [[ "$disable" =~ ^[yY]$ ]]; then
                         systemctl disable "$CLIENT_SERVICE" 2>/dev/null || true
                         systemctl disable xray-client 2>/dev/null || true
                         print_success "已关闭开机自启动"
@@ -1445,14 +1910,14 @@ main() {
                 else
                     echo -e "当前状态: ${RED}未启用${NC}"
                     read -p "开启开机自启动? (y/n): " enable
-                    if [[ "$enable" == "y" ]]; then
+                    if [[ "$enable" =~ ^[yY]$ ]]; then
                         systemctl enable "$CLIENT_SERVICE" 2>/dev/null || true
                         systemctl enable xray-client 2>/dev/null || true
                         print_success "已开启开机自启动"
                     fi
                 fi
                 ;;
-            11) uninstall ;;
+            13) uninstall ;;
             0) echo ""; print_info "再见！"; exit 0 ;;
             *) print_error "无效选项" ;;
         esac
@@ -1493,7 +1958,7 @@ create_global_command() {
 # 如果是首次运行，提示创建全局命令
 if [[ ! -f /usr/local/bin/bui-c && "$0" != "/usr/local/bin/bui-c" ]]; then
     read -p "是否创建全局命令 'bui-c'? (y/n): " create_cmd
-    [[ "$create_cmd" == "y" ]] && create_global_command
+    [[ "$create_cmd" =~ ^[yY]$ ]] && create_global_command
 fi
 
 main "$@"
