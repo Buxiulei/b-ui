@@ -1955,15 +1955,15 @@ show_status() {
     # 开机自启动状态
     echo ""
     echo -e "${YELLOW}[开机自启动]${NC}"
-    if systemctl is-enabled "$CLIENT_SERVICE" &>/dev/null 2>&1; then
-        local hy_auto=$(systemctl is-enabled "$CLIENT_SERVICE" 2>/dev/null)
+    if [[ -f /etc/systemd/system/$CLIENT_SERVICE ]]; then
+        local hy_auto=$(systemctl is-enabled "$CLIENT_SERVICE" 2>/dev/null || echo "disabled")
         if [[ "$hy_auto" == "enabled" ]]; then
             echo -e "  Hysteria2: ${GREEN}✓ 已启用${NC}"
         else
             echo -e "  Hysteria2: ${RED}✗ 未启用${NC}"
         fi
     else
-        echo -e "  Hysteria2: ${RED}✗ 未配置${NC}"
+        echo -e "  Hysteria2: ${YELLOW}○ 未配置${NC}"
     fi
     
     if [[ -f /etc/systemd/system/xray-client.service ]]; then
