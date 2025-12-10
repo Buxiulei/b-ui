@@ -1372,13 +1372,21 @@ main() {
 # 创建全局命令
 #===============================================================================
 
+SCRIPT_URL="https://raw.githubusercontent.com/Buxiulei/b-ui/main/b-ui-client.sh"
+
 create_global_command() {
     print_info "创建全局命令 b-ui-client..."
     
-    # 复制脚本到系统目录
-    cp "$0" /usr/local/bin/b-ui-client
-    chmod +x /usr/local/bin/b-ui-client
+    # 如果是通过管道运行 (bash <(curl ...))，需要重新下载
+    if [[ ! -f "$0" || "$0" == *"/dev/fd/"* || "$0" == "bash" ]]; then
+        print_info "从 GitHub 下载脚本..."
+        curl -fsSL "$SCRIPT_URL" -o /usr/local/bin/b-ui-client
+    else
+        # 如果是本地文件，直接复制
+        cp "$0" /usr/local/bin/b-ui-client
+    fi
     
+    chmod +x /usr/local/bin/b-ui-client
     print_success "全局命令已创建，可使用 'sudo b-ui-client' 运行"
 }
 
