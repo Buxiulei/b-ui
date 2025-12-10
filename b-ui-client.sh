@@ -1377,17 +1377,23 @@ SCRIPT_URL="https://raw.githubusercontent.com/Buxiulei/b-ui/main/b-ui-client.sh"
 create_global_command() {
     print_info "创建全局命令 b-ui-client..."
     
-    # 如果是通过管道运行 (bash <(curl ...))，需要重新下载
-    if [[ ! -f "$0" || "$0" == *"/dev/fd/"* || "$0" == "bash" ]]; then
-        print_info "从 GitHub 下载脚本..."
-        curl -fsSL "$SCRIPT_URL" -o /usr/local/bin/b-ui-client
+    # 始终从 GitHub 下载最新版本 (避免管道运行时 $0 不可用的问题)
+    print_info "从 GitHub 下载脚本..."
+    if curl -fsSL "$SCRIPT_URL" -o /usr/local/bin/b-ui-client; then
+        chmod +x /usr/local/bin/b-ui-client
+        # 验证下载是否成功 (文件应该超过 1000 行)
+        local lines=$(wc -l < /usr/local/bin/b-ui-client 2>/dev/null || echo "0")
+        if [[ "$lines" -gt 1000 ]]; then
+            print_success "全局命令已创建，可使用 'sudo b-ui-client' 运行"
+        else
+            print_error "下载的文件不完整 (只有 $lines 行)，请检查网络连接"
+            rm -f /usr/local/bin/b-ui-client
+            return 1
+        fi
     else
-        # 如果是本地文件，直接复制
-        cp "$0" /usr/local/bin/b-ui-client
+        print_error "下载失败，请检查网络连接"
+        return 1
     fi
-    
-    chmod +x /usr/local/bin/b-ui-client
-    print_success "全局命令已创建，可使用 'sudo b-ui-client' 运行"
 }
 
 # 如果是首次运行，提示创建全局命令
