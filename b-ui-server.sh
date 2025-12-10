@@ -1177,7 +1177,6 @@ const HTML=`<!DOCTYPE html>
                 </optgroup>
             </select>
             <input id="nsni-custom" placeholder="或输入自定义域名 (留空使用上面选择)" style="margin-top:8px">
-            <p style="font-size:11px;color:#888;margin:5px 0 10px">⚠️ 免流域名需要服务器支持，请确保已在伪装设置中添加</p>
         </div>
         <input id="nu" placeholder="用户名">
         <input id="np" placeholder="密码 / UUID (自动生成)">
