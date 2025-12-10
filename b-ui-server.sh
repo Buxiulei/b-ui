@@ -1939,8 +1939,27 @@ EOF
     # 清理测试文件
     rm -f /var/www/html/.well-known/acme-challenge/test-${test_id}
     
-    # 申请证书
-    if [[ "$port80_ok" == "true" ]]; then
+    # 检查是否已有有效证书（避免重复申请导致 Let's Encrypt 速率限制）
+    local cert_exists=false
+    local cert_path="/etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
+    if [[ -f "$cert_path" ]]; then
+        # 检查证书是否还有效（至少还有7天有效期）
+        local expiry_date=$(openssl x509 -enddate -noout -in "$cert_path" 2>/dev/null | cut -d= -f2)
+        if [[ -n "$expiry_date" ]]; then
+            local expiry_epoch=$(date -d "$expiry_date" +%s 2>/dev/null || date -j -f "%b %d %T %Y %Z" "$expiry_date" +%s 2>/dev/null)
+            local now_epoch=$(date +%s)
+            local days_left=$(( (expiry_epoch - now_epoch) / 86400 ))
+            if [[ $days_left -gt 7 ]]; then
+                cert_exists=true
+                print_success "检测到有效的 SSL 证书（剩余 ${days_left} 天），跳过申请"
+            else
+                print_warning "证书即将过期（剩余 ${days_left} 天），尝试续期..."
+            fi
+        fi
+    fi
+    
+    # 申请证书（仅在没有有效证书时）
+    if [[ "$cert_exists" == "false" ]] && [[ "$port80_ok" == "true" ]]; then
         print_info "申请 SSL 证书..."
         certbot --nginx -d "${DOMAIN}" --non-interactive --agree-tos -m "${EMAIL}" --redirect
         
@@ -1962,6 +1981,20 @@ EOF
             fi
         else
             print_warning "SSL 证书申请失败，将使用 HTTP"
+        fi
+    elif [[ "$cert_exists" == "true" ]]; then
+        # 证书已存在，确保权限正确
+        chmod 755 /etc/letsencrypt 2>/dev/null || true
+        chmod 755 /etc/letsencrypt/live 2>/dev/null || true
+        chmod 755 /etc/letsencrypt/live/${DOMAIN} 2>/dev/null || true
+        chmod 755 /etc/letsencrypt/archive 2>/dev/null || true
+        chmod 755 /etc/letsencrypt/archive/${DOMAIN} 2>/dev/null || true
+        chmod 644 /etc/letsencrypt/archive/${DOMAIN}/*.pem 2>/dev/null || true
+        
+        # 确保自动续期已设置
+        if ! crontab -l 2>/dev/null | grep -q "certbot renew"; then
+            (crontab -l 2>/dev/null; echo "0 3 * * * certbot renew --quiet") | crontab -
+            print_info "已设置证书自动续期 (每天 3:00)"
         fi
     else
         print_warning "跳过 SSL 证书申请，管理面板将使用 HTTP"
