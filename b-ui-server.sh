@@ -1072,7 +1072,7 @@ const HTML=`<!DOCTYPE html>
     <div class="login-wrap">
         <div class="stat-card login-card">
             <h1 style="font-size:24px; margin-bottom:8px">B-UI 管理面板</h1>
-            <p style="color:var(--text-dim); font-size:14px; margin-bottom:30px">安全访问中心 · v"+VERSION+"</p>
+            <p style="color:var(--text-dim); font-size:14px; margin-bottom:30px">安全访问中心 · v${VERSION}</p>
             <input type="password" id="lp" placeholder="Enter Admin Password">
             <button class="btn" style="width:100%" onclick="login()">登 录</button>
         </div>
@@ -1082,7 +1082,7 @@ const HTML=`<!DOCTYPE html>
 <!-- Dashboard View -->
 <div id="v-dash" class="view">
     <nav class="nav">
-        <div class="brand"><i>⚡</i><span>B-UI</span><span style="font-size:11px;color:#888;margin-left:8px">v"+VERSION+"</span></div>
+        <div class="brand"><i>⚡</i><span>B-UI</span><span style="font-size:11px;color:#888;margin-left:8px">v${VERSION}</span></div>
         <div style="display:flex; gap:10px">
             <button class="ibtn" onclick="openMasq()" title="伪装网站设置">🎭</button>
             <button class="ibtn" onclick="openM('m-pwd')" title="Change Password">🔑</button>
