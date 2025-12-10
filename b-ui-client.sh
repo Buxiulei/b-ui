@@ -1244,21 +1244,93 @@ quick_install() {
 #===============================================================================
 
 uninstall() {
-    echo -e "${RED}警告: 卸载 Hysteria2 客户端${NC}"
-    read -p "输入 'YES' 确认: " confirm
+    echo ""
+    echo -e "${RED}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${RED}║                    完全卸载                                  ║${NC}"
+    echo -e "${RED}╚══════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "${YELLOW}将卸载以下内容:${NC}"
+    echo "  • Hysteria2 客户端服务和配置"
+    echo "  • Xray 客户端服务和配置"
+    echo "  • 路由规则和 TUN 配置"
+    echo "  • 全局命令 b-ui-client"
+    echo ""
     
-    if [[ "$confirm" == "YES" ]]; then
+    read -p "输入 'YES' 确认完全卸载: " confirm
+    
+    if [[ "$confirm" != "YES" ]]; then
+        print_info "已取消卸载"
+        return
+    fi
+    
+    echo ""
+    print_info "开始卸载..."
+    
+    # 1. 停止并删除 Hysteria2 服务
+    if systemctl is-active --quiet "$CLIENT_SERVICE" 2>/dev/null; then
+        print_info "停止 Hysteria2 服务..."
         systemctl stop "$CLIENT_SERVICE" 2>/dev/null || true
-        systemctl disable "$CLIENT_SERVICE" 2>/dev/null || true
-        rm -f "/etc/systemd/system/$CLIENT_SERVICE"
-        rm -f /etc/sysctl.d/99-hysteria.conf
-        systemctl daemon-reload
+    fi
+    systemctl disable "$CLIENT_SERVICE" 2>/dev/null || true
+    rm -f "/etc/systemd/system/$CLIENT_SERVICE"
+    echo -e "  ${GREEN}✓${NC} Hysteria2 服务已移除"
+    
+    # 2. 停止并删除 Xray 服务
+    if systemctl is-active --quiet xray-client 2>/dev/null; then
+        print_info "停止 Xray 服务..."
+        systemctl stop xray-client 2>/dev/null || true
+    fi
+    systemctl disable xray-client 2>/dev/null || true
+    rm -f /etc/systemd/system/xray-client.service
+    echo -e "  ${GREEN}✓${NC} Xray 服务已移除"
+    
+    # 3. 重载 systemd
+    systemctl daemon-reload
+    
+    # 4. 删除配置目录
+    if [[ -d "$BASE_DIR" ]]; then
         rm -rf "$BASE_DIR"
-        
-        read -p "删除 Hysteria2 程序? (y/n): " del_bin
-        [[ "$del_bin" == "y" ]] && rm -f /usr/local/bin/hysteria
-        
-        print_success "卸载完成"
+        echo -e "  ${GREEN}✓${NC} 配置目录已删除 ($BASE_DIR)"
+    fi
+    
+    # 5. 删除 sysctl 配置
+    rm -f /etc/sysctl.d/99-hysteria.conf 2>/dev/null || true
+    
+    # 6. 询问是否删除程序
+    echo ""
+    read -p "删除 Hysteria2 程序? (y/n) [默认 y]: " del_hy
+    del_hy=${del_hy:-y}
+    if [[ "$del_hy" == "y" ]]; then
+        rm -f /usr/local/bin/hysteria
+        echo -e "  ${GREEN}✓${NC} Hysteria2 程序已删除"
+    fi
+    
+    read -p "删除 Xray 程序? (y/n) [默认 y]: " del_xray
+    del_xray=${del_xray:-y}
+    if [[ "$del_xray" == "y" ]]; then
+        # Xray 可能通过官方脚本安装到不同位置
+        rm -f /usr/local/bin/xray
+        rm -rf /usr/local/share/xray
+        rm -rf /usr/local/etc/xray
+        echo -e "  ${GREEN}✓${NC} Xray 程序已删除"
+    fi
+    
+    # 7. 删除全局命令
+    read -p "删除全局命令 b-ui-client? (y/n) [默认 y]: " del_cmd
+    del_cmd=${del_cmd:-y}
+    if [[ "$del_cmd" == "y" ]]; then
+        rm -f /usr/local/bin/b-ui-client
+        echo -e "  ${GREEN}✓${NC} 全局命令已删除"
+    fi
+    
+    echo ""
+    print_success "卸载完成！"
+    echo ""
+    
+    # 如果删除了全局命令，提示退出
+    if [[ "$del_cmd" == "y" ]]; then
+        print_info "全局命令已删除，脚本将退出"
+        exit 0
     fi
 }
 
