@@ -1304,17 +1304,15 @@ $(echo -e "$bw_config")
     if [[ "$TUN_ENABLED" == "true" ]]; then
         cat >> "$CONFIG_FILE" << EOF
 
-# TUN 模式 (全局代理)
+# TUN 模式 (全局代理) - 仅 IPv4
 tun:
   name: "hystun"
   mtu: 1500
   timeout: 5m
   address:
     ipv4: 100.100.100.101/30
-    ipv6: 2001::ffff:ffff:ffff:fff1/126
   route:
     ipv4: [0.0.0.0/0]
-    ipv6: ["2000::/3"]
     # 排除的 IP (服务器 IP + 私有网络)
     ipv4Exclude:
       - ${server_ip}/32
@@ -1325,10 +1323,6 @@ tun:
       - 169.254.0.0/16
       - 224.0.0.0/4
       - 255.255.255.255/32
-    ipv6Exclude:
-      - "fc00::/7"
-      - "fe80::/10"
-      - "::1/128"
 
 # DNS 配置 - 解决域名解析问题
 dns:
