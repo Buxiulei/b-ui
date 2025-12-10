@@ -678,6 +678,12 @@ OUTBOUND
       "listen_port": ${SOCKS_PORT}
     },
     {
+      "type": "socks",
+      "tag": "antigravity-socks",
+      "listen": "127.0.0.1",
+      "listen_port": 54321
+    },
+    {
       "type": "http",
       "tag": "http-in",
       "listen": "127.0.0.1",
