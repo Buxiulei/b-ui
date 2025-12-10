@@ -2075,7 +2075,17 @@ uninstall() {
     rm -f /etc/systemd/system/xray-client.service
     echo -e "  ${GREEN}✓${NC} Xray 服务已移除"
     
-    # 3. 重载 systemd
+    # 3. 停止并删除 TUN 模式服务
+    if systemctl is-active --quiet bui-tun 2>/dev/null; then
+        print_info "停止 TUN 模式..."
+        systemctl stop bui-tun 2>/dev/null || true
+    fi
+    systemctl disable bui-tun 2>/dev/null || true
+    rm -f /etc/systemd/system/bui-tun.service
+    ip link delete bui-tun 2>/dev/null || true
+    echo -e "  ${GREEN}✓${NC} TUN 模式已移除"
+    
+    # 4. 重载 systemd
     systemctl daemon-reload
     
     # 4. 删除配置目录 (包含所有保存的配置)
@@ -2104,6 +2114,19 @@ uninstall() {
         rm -rf /usr/local/share/xray
         rm -rf /usr/local/etc/xray
         echo -e "  ${GREEN}✓${NC} Xray 程序已删除"
+    fi
+    
+    read -p "删除 sing-box 程序? (y/n) [默认 y]: " del_sb
+    del_sb=${del_sb:-y}
+    if [[ "$del_sb" =~ ^[yY]$ ]]; then
+        if [[ "$PKG_MANAGER" == "apt" ]]; then
+            apt-get remove -y -qq sing-box 2>/dev/null || true
+            rm -f /etc/apt/sources.list.d/sagernet.list
+            rm -f /etc/apt/keyrings/sagernet.asc
+        else
+            rm -f /usr/local/bin/sing-box /usr/bin/sing-box
+        fi
+        echo -e "  ${GREEN}✓${NC} sing-box 程序已删除"
     fi
     
     # 7. 删除全局命令 (始终删除，因为用户已确认完全卸载)
