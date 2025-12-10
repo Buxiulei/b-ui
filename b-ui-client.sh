@@ -1253,7 +1253,7 @@ uninstall() {
     echo "  • Hysteria2 客户端服务和配置"
     echo "  • Xray 客户端服务和配置"
     echo "  • 路由规则和 TUN 配置"
-    echo "  • 全局命令 b-ui-client"
+    echo "  • 全局命令 bui-c"
     echo ""
     
     read -p "输入 'YES' 确认完全卸载: " confirm
@@ -1316,10 +1316,10 @@ uninstall() {
     fi
     
     # 7. 删除全局命令
-    read -p "删除全局命令 b-ui-client? (y/n) [默认 y]: " del_cmd
+    read -p "删除全局命令 bui-c? (y/n) [默认 y]: " del_cmd
     del_cmd=${del_cmd:-y}
     if [[ "$del_cmd" == "y" ]]; then
-        rm -f /usr/local/bin/b-ui-client
+        rm -f /usr/local/bin/bui-c
         echo -e "  ${GREEN}✓${NC} 全局命令已删除"
     fi
     
@@ -1464,19 +1464,19 @@ main() {
 SCRIPT_URL="https://raw.githubusercontent.com/Buxiulei/b-ui/main/b-ui-client.sh"
 
 create_global_command() {
-    print_info "创建全局命令 b-ui-client..."
+    print_info "创建全局命令 bui-c..."
     
     # 始终从 GitHub 下载最新版本 (避免管道运行时 $0 不可用的问题)
     print_info "从 GitHub 下载脚本..."
-    if curl -fsSL "$SCRIPT_URL" -o /usr/local/bin/b-ui-client; then
-        chmod +x /usr/local/bin/b-ui-client
+    if curl -fsSL "$SCRIPT_URL" -o /usr/local/bin/bui-c; then
+        chmod +x /usr/local/bin/bui-c
         # 验证下载是否成功 (文件应该超过 1000 行)
-        local lines=$(wc -l < /usr/local/bin/b-ui-client 2>/dev/null || echo "0")
+        local lines=$(wc -l < /usr/local/bin/bui-c 2>/dev/null || echo "0")
         if [[ "$lines" -gt 1000 ]]; then
-            print_success "全局命令已创建，可使用 'sudo b-ui-client' 运行"
+            print_success "全局命令已创建，可使用 'sudo bui-c' 运行"
         else
             print_error "下载的文件不完整 (只有 $lines 行)，请检查网络连接"
-            rm -f /usr/local/bin/b-ui-client
+            rm -f /usr/local/bin/bui-c
             return 1
         fi
     else
@@ -1486,8 +1486,8 @@ create_global_command() {
 }
 
 # 如果是首次运行，提示创建全局命令
-if [[ ! -f /usr/local/bin/b-ui-client && "$0" != "/usr/local/bin/b-ui-client" ]]; then
-    read -p "是否创建全局命令 'b-ui-client'? (y/n): " create_cmd
+if [[ ! -f /usr/local/bin/bui-c && "$0" != "/usr/local/bin/bui-c" ]]; then
+    read -p "是否创建全局命令 'bui-c'? (y/n): " create_cmd
     [[ "$create_cmd" == "y" ]] && create_global_command
 fi
 
