@@ -853,6 +853,16 @@ tun:
       - "fe80::/10"
       - "::1/128"
 
+# DNS 配置 - 解决域名解析问题
+dns:
+  # 使用代理服务器解析 DNS
+  mode: tcp
+  hijack:
+    - type: override
+      addr: 8.8.8.8:53
+    - type: override
+      addr: 8.8.4.4:53
+
 # ACL 路由规则 - 保护 SSH 连接
 acl:
   inline:
