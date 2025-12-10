@@ -39,6 +39,12 @@ sudo -i
 bash <(curl -fsSL https://raw.githubusercontent.com/Buxiulei/b-ui/main/b-ui-server.sh)
 ```
 
+**国内镜像（推荐）：**
+```bash
+sudo -i
+bash <(curl -fsSL https://cdn.jsdelivr.net/gh/Buxiulei/b-ui@main/b-ui-server.sh)
+```
+
 ### 安装完成后
 
 - Web 管理面板: `https://你的域名/`
@@ -98,6 +104,12 @@ sudo -i
 
 # 一键安装
 bash <(curl -fsSL https://raw.githubusercontent.com/Buxiulei/b-ui/main/b-ui-client.sh)
+```
+
+**国内镜像（推荐）：**
+```bash
+sudo -i
+bash <(curl -fsSL https://cdn.jsdelivr.net/gh/Buxiulei/b-ui@main/b-ui-client.sh)
 ```
 
 ### 自动依赖安装
