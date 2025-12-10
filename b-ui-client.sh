@@ -2191,22 +2191,32 @@ main() {
                 ;;
             12)
                 # 开机自启动
-                local hy_auto=$(systemctl is-enabled "$CLIENT_SERVICE" 2>/dev/null); hy_auto=${hy_auto:-disabled}
                 echo ""
-                if [[ "$hy_auto" == "enabled" ]]; then
-                    echo -e "当前状态: ${GREEN}已启用${NC}"
-                    read -p "关闭开机自启动? (y/n): " disable
+                echo -e "${YELLOW}[当前自启动状态]${NC}"
+                local hy_auto=$(systemctl is-enabled "$CLIENT_SERVICE" 2>/dev/null || echo "disabled")
+                local xray_auto=$(systemctl is-enabled xray-client 2>/dev/null || echo "disabled")
+                local tun_auto=$(systemctl is-enabled bui-tun 2>/dev/null || echo "disabled")
+                
+                [[ "$hy_auto" == "enabled" ]] && echo -e "  Hysteria2: ${GREEN}✓ 已启用${NC}" || echo -e "  Hysteria2: ${RED}✗ 未启用${NC}"
+                [[ "$xray_auto" == "enabled" ]] && echo -e "  Xray:      ${GREEN}✓ 已启用${NC}" || echo -e "  Xray:      ${RED}✗ 未启用${NC}"
+                [[ "$tun_auto" == "enabled" ]] && echo -e "  TUN 模式:  ${GREEN}✓ 已启用${NC}" || echo -e "  TUN 模式:  ${RED}✗ 未启用${NC}"
+                
+                echo ""
+                if [[ "$hy_auto" == "enabled" || "$xray_auto" == "enabled" || "$tun_auto" == "enabled" ]]; then
+                    read -p "关闭所有开机自启动? (y/n): " disable
                     if [[ "$disable" =~ ^[yY]$ ]]; then
                         systemctl disable "$CLIENT_SERVICE" 2>/dev/null || true
                         systemctl disable xray-client 2>/dev/null || true
-                        print_success "已关闭开机自启动"
+                        systemctl disable bui-tun 2>/dev/null || true
+                        print_success "已关闭所有开机自启动"
                     fi
                 else
-                    echo -e "当前状态: ${RED}未启用${NC}"
-                    read -p "开启开机自启动? (y/n): " enable
+                    read -p "开启所有开机自启动? (y/n): " enable
                     if [[ "$enable" =~ ^[yY]$ ]]; then
-                        systemctl enable "$CLIENT_SERVICE" 2>/dev/null || true
-                        systemctl enable xray-client 2>/dev/null || true
+                        # 只启用已配置的服务
+                        [[ -f /etc/systemd/system/$CLIENT_SERVICE ]] && systemctl enable "$CLIENT_SERVICE" 2>/dev/null
+                        [[ -f /etc/systemd/system/xray-client.service ]] && systemctl enable xray-client 2>/dev/null
+                        [[ -f /etc/systemd/system/bui-tun.service ]] && systemctl enable bui-tun 2>/dev/null
                         print_success "已开启开机自启动"
                     fi
                 fi
