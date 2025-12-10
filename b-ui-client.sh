@@ -393,6 +393,48 @@ install_xray_client() {
     print_success "Xray 安装完成"
 }
 
+install_singbox() {
+    print_info "安装 sing-box..."
+    
+    if command -v sing-box &> /dev/null; then
+        print_success "已安装: $(sing-box version 2>/dev/null | head -n1 | awk '{print $3}')"
+        return 0
+    fi
+    
+    # 添加 sing-box 官方源
+    if [[ "$PKG_MANAGER" == "apt" ]]; then
+        curl -fsSL https://sing-box.app/gpg.key -o /etc/apt/keyrings/sagernet.asc 2>/dev/null || \
+        curl -fsSL https://sing-box.app/gpg.key | tee /etc/apt/keyrings/sagernet.asc > /dev/null
+        chmod a+r /etc/apt/keyrings/sagernet.asc
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/sagernet.asc] https://deb.sagernet.org/ * *" > /etc/apt/sources.list.d/sagernet.list
+        apt-get update -qq
+        apt-get install -y -qq sing-box
+    else
+        # 其他系统使用官方安装脚本
+        bash <(curl -fsSL https://sing-box.app/install.sh)
+    fi
+    
+    print_success "sing-box 安装完成"
+}
+
+# 一次性安装所有核心
+install_all_cores() {
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${YELLOW}[安装代理核心]${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    
+    install_hysteria
+    install_xray_client  
+    install_singbox
+    
+    echo ""
+    print_success "所有核心安装完成"
+    echo ""
+}
+
+
 generate_xray_config() {
     local xray_config="${BASE_DIR}/xray-config.json"
     local server_host=$(echo "$SERVER_ADDR" | cut -d':' -f1)
@@ -490,8 +532,213 @@ EOF
 }
 
 #===============================================================================
+# sing-box TUN 配置生成 (解决 DNS 污染问题)
+#===============================================================================
+
+generate_singbox_tun_config() {
+    local protocol="$1"  # hysteria2 或 vless-reality
+    local singbox_config="${BASE_DIR}/singbox-tun.json"
+    
+    print_info "生成 sing-box TUN 配置..."
+    
+    # 解析服务器信息
+    local server_host=$(echo "$SERVER_ADDR" | cut -d':' -f1)
+    local server_port=$(echo "$SERVER_ADDR" | cut -d':' -f2)
+    
+    # 根据协议生成不同的 outbound
+    local outbound_config=""
+    if [[ "$protocol" == "hysteria2" ]]; then
+        outbound_config=$(cat <<OUTBOUND
+    {
+      "type": "hysteria2",
+      "tag": "proxy-out",
+      "server": "${server_host}",
+      "server_port": ${server_port},
+      "password": "${AUTH_PASSWORD}",
+      "tls": {
+        "enabled": true,
+        "server_name": "${SNI:-$server_host}",
+        "insecure": ${INSECURE:-false}
+      }
+    }
+OUTBOUND
+)
+    elif [[ "$protocol" == "vless-reality" ]]; then
+        outbound_config=$(cat <<OUTBOUND
+    {
+      "type": "vless",
+      "tag": "proxy-out",
+      "server": "${server_host}",
+      "server_port": ${server_port},
+      "uuid": "${UUID}",
+      "flow": "${FLOW:-xtls-rprx-vision}",
+      "tls": {
+        "enabled": true,
+        "server_name": "${SNI}",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "${FINGERPRINT:-chrome}"
+        },
+        "reality": {
+          "enabled": true,
+          "public_key": "${PUBLIC_KEY}",
+          "short_id": "${SHORT_ID}"
+        }
+      }
+    }
+OUTBOUND
+)
+    fi
+    
+    # 生成完整 sing-box 配置
+    cat > "$singbox_config" <<EOF
+{
+  "log": {
+    "level": "info"
+  },
+  "dns": {
+    "servers": [
+      {
+        "tag": "proxy-dns",
+        "address": "https://8.8.8.8/dns-query",
+        "address_resolver": "local-dns",
+        "detour": "proxy-out"
+      },
+      {
+        "tag": "local-dns",
+        "address": "223.5.5.5",
+        "detour": "direct-out"
+      }
+    ],
+    "rules": [
+      {
+        "domain_suffix": [".cn"],
+        "server": "local-dns"
+      }
+    ],
+    "final": "proxy-dns",
+    "strategy": "ipv4_only"
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "interface_name": "bui-tun",
+      "address": ["172.19.0.1/30"],
+      "mtu": 1400,
+      "auto_route": true,
+      "strict_route": true,
+      "stack": "system",
+      "sniff": true,
+      "sniff_override_destination": true
+    },
+    {
+      "type": "socks",
+      "tag": "socks-in",
+      "listen": "127.0.0.1",
+      "listen_port": ${SOCKS_PORT}
+    },
+    {
+      "type": "http",
+      "tag": "http-in",
+      "listen": "127.0.0.1",
+      "listen_port": ${HTTP_PORT}
+    }
+  ],
+  "outbounds": [
+${outbound_config},
+    {
+      "type": "direct",
+      "tag": "direct-out"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "protocol": "dns",
+        "action": "hijack-dns"
+      },
+      {
+        "port": [22, 2222],
+        "action": "route",
+        "outbound": "direct-out"
+      },
+      {
+        "ip_is_private": true,
+        "action": "route",
+        "outbound": "direct-out"
+      }
+    ],
+    "final": "proxy-out",
+    "auto_detect_interface": true
+  }
+}
+EOF
+    chmod 644 "$singbox_config"
+    
+    # 创建 sing-box TUN 服务
+    cat > /etc/systemd/system/bui-tun.service <<EOF
+[Unit]
+Description=B-UI TUN Mode (sing-box)
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/sing-box run -c ${singbox_config}
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    
+    print_success "sing-box TUN 配置已生成: $singbox_config"
+}
+
+start_tun_mode() {
+    print_info "启动 TUN 模式..."
+    
+    # 停止可能冲突的服务
+    systemctl stop hysteria-client 2>/dev/null || true
+    systemctl stop xray-client 2>/dev/null || true
+    
+    # 删除旧的 TUN 接口
+    ip link delete hystun 2>/dev/null || true
+    ip link delete bui-tun 2>/dev/null || true
+    
+    # 设置 rp_filter (Linux TUN 需要)
+    sysctl -w net.ipv4.conf.all.rp_filter=2 >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.conf.default.rp_filter=2 >/dev/null 2>&1 || true
+    
+    # 启动 sing-box TUN
+    systemctl enable bui-tun 2>/dev/null || true
+    systemctl start bui-tun
+    
+    sleep 2
+    if systemctl is-active --quiet bui-tun; then
+        print_success "TUN 模式已启动"
+        echo -e "  接口: ${GREEN}bui-tun${NC}"
+        echo -e "  SOCKS5: ${GREEN}127.0.0.1:${SOCKS_PORT}${NC}"
+        echo -e "  HTTP:   ${GREEN}127.0.0.1:${HTTP_PORT}${NC}"
+    else
+        print_error "TUN 模式启动失败"
+        journalctl -u bui-tun --no-pager -n 10
+    fi
+}
+
+stop_tun_mode() {
+    print_info "停止 TUN 模式..."
+    systemctl stop bui-tun 2>/dev/null || true
+    ip link delete bui-tun 2>/dev/null || true
+    print_success "TUN 模式已停止"
+}
+
+#===============================================================================
 # URI 解析和导入
 #===============================================================================
+
 
 parse_hysteria_uri() {
     local uri="$1"
@@ -1314,8 +1561,6 @@ tun:
     ipv6: 2001::ffff:ffff:ffff:fff1/126
   route:
     ipv4: [0.0.0.0/0]
-    ipv6: []  # 不路由任何 IPv6 流量
-    # 排除的 IP (服务器 IP + 私有网络)
     ipv4Exclude:
       - ${server_ip}/32
       - 10.0.0.0/8
@@ -1325,6 +1570,8 @@ tun:
       - 169.254.0.0/16
       - 224.0.0.0/4
       - 255.255.255.255/32
+    ipv6Exclude:
+      - "::/0"
 
 # DNS 配置 - 解决域名解析问题
 dns:
@@ -1463,50 +1710,87 @@ edit_rules() {
 #===============================================================================
 
 toggle_tun() {
-    if [[ ! -f "$CONFIG_FILE" ]]; then
-        print_error "请先配置客户端"
-        return
-    fi
-    
     echo ""
-    if grep -q "^tun:" "$CONFIG_FILE"; then
-        echo -e "TUN 模式: ${GREEN}已启用${NC}"
-        read -p "禁用 TUN 模式? (y/n): " disable
+    
+    # 检查 sing-box TUN 服务状态
+    if systemctl is-active --quiet bui-tun 2>/dev/null; then
+        echo -e "TUN 模式: ${GREEN}✓ 运行中${NC} (sing-box)"
+        read -p "停止 TUN 模式? (y/n): " disable
         if [[ "$disable" =~ ^[yY]$ ]]; then
-            # 注释掉 TUN 配置
-            sed -i '/^tun:/,/^[a-z]/{ /^tun:/d; /^  /d; }' "$CONFIG_FILE"
-            TUN_ENABLED="false"
-            systemctl restart "$CLIENT_SERVICE" 2>/dev/null || true
-            print_success "TUN 模式已禁用"
+            stop_tun_mode
         fi
     else
-        echo -e "TUN 模式: ${YELLOW}已禁用${NC}"
-        read -p "启用 TUN 模式? (y/n): " enable
-        if [[ "$enable" =~ ^[yY]$ ]]; then
-            TUN_ENABLED="true"
+        echo -e "TUN 模式: ${RED}✗ 未启用${NC}"
+        
+        # 检查是否有可用的配置
+        local config_file=""
+        local protocol=""
+        
+        # 优先使用 sing-box 配置
+        if [[ -f "${BASE_DIR}/singbox-tun.json" ]]; then
+            echo -e "  发现已有 sing-box TUN 配置"
+            read -p "启用 TUN 模式? (y/n): " enable
+            if [[ "$enable" =~ ^[yY]$ ]]; then
+                SOCKS_PORT=$(grep -o '"listen_port": [0-9]*' "${BASE_DIR}/singbox-tun.json" | head -1 | grep -o '[0-9]*')
+                SOCKS_PORT=${SOCKS_PORT:-1080}
+                HTTP_PORT=$((SOCKS_PORT + 1))
+                start_tun_mode
+            fi
+        elif [[ -f "$CONFIG_FILE" ]]; then
+            # 从 Hysteria2 配置生成 sing-box TUN
+            echo -e "  从 Hysteria2 配置生成 TUN..."
+            protocol="hysteria2"
             
-            # 配置 rp_filter (Linux TUN 必需)
-            print_info "配置系统参数..."
-            sysctl -w net.ipv4.conf.default.rp_filter=2 > /dev/null 2>&1
-            sysctl -w net.ipv4.conf.all.rp_filter=2 > /dev/null 2>&1
-            
-            # 重新生成配置
             # 读取现有配置
-            local server=$(grep "^server:" "$CONFIG_FILE" | awk '{print $2}')
-            local auth=$(grep "^auth:" "$CONFIG_FILE" | awk '{print $2}')
+            SERVER_ADDR=$(grep "^server:" "$CONFIG_FILE" | awk '{print $2}')
+            AUTH_PASSWORD=$(grep "^auth:" "$CONFIG_FILE" | awk '{print $2}')
+            local sni=$(grep -A2 "^tls:" "$CONFIG_FILE" | grep "sni:" | awk '{print $2}')
+            SNI="${sni:-$(echo $SERVER_ADDR | cut -d':' -f1)}"
+            INSECURE=$(grep -A2 "^tls:" "$CONFIG_FILE" | grep "insecure:" | awk '{print $2}')
+            INSECURE=${INSECURE:-false}
             SOCKS_PORT=$(grep -A1 "^socks5:" "$CONFIG_FILE" | grep "listen:" | sed 's/.*://')
             HTTP_PORT=$(grep -A1 "^http:" "$CONFIG_FILE" | grep "listen:" | sed 's/.*://')
-            SERVER_ADDR="$server"
-            AUTH_PASSWORD="$auth"
+            SOCKS_PORT=${SOCKS_PORT:-1080}
+            HTTP_PORT=${HTTP_PORT:-8080}
             
-            generate_config
-            systemctl restart "$CLIENT_SERVICE" 2>/dev/null || true
-            print_success "TUN 模式已启用"
-            echo ""
-            print_warning "注意: SSH 连接已自动保护，不会断开"
+            read -p "启用 TUN 模式? (y/n): " enable
+            if [[ "$enable" =~ ^[yY]$ ]]; then
+                generate_singbox_tun_config "hysteria2"
+                start_tun_mode
+            fi
+        elif [[ -f "${BASE_DIR}/xray-config.json" ]]; then
+            # 从 Xray 配置生成 sing-box TUN
+            echo -e "  从 Xray (VLESS-Reality) 配置生成 TUN..."
+            protocol="vless-reality"
+            
+            # 读取 Xray 配置
+            local xray_config="${BASE_DIR}/xray-config.json"
+            SERVER_ADDR=$(grep -o '"address": "[^"]*"' "$xray_config" | head -1 | cut -d'"' -f4)
+            local port=$(grep -o '"port": [0-9]*' "$xray_config" | grep -v 'listen' | head -1 | grep -o '[0-9]*')
+            SERVER_ADDR="${SERVER_ADDR}:${port}"
+            UUID=$(grep -o '"id": "[^"]*"' "$xray_config" | head -1 | cut -d'"' -f4)
+            FLOW=$(grep -o '"flow": "[^"]*"' "$xray_config" | head -1 | cut -d'"' -f4)
+            SNI=$(grep -o '"serverName": "[^"]*"' "$xray_config" | head -1 | cut -d'"' -f4)
+            FINGERPRINT=$(grep -o '"fingerprint": "[^"]*"' "$xray_config" | head -1 | cut -d'"' -f4)
+            PUBLIC_KEY=$(grep -o '"publicKey": "[^"]*"' "$xray_config" | head -1 | cut -d'"' -f4)
+            SHORT_ID=$(grep -o '"shortId": "[^"]*"' "$xray_config" | head -1 | cut -d'"' -f4)
+            SOCKS_PORT=$(grep -o '"port": [0-9]*' "$xray_config" | head -1 | grep -o '[0-9]*')
+            HTTP_PORT=$(grep -o '"port": [0-9]*' "$xray_config" | tail -1 | grep -o '[0-9]*')
+            SOCKS_PORT=${SOCKS_PORT:-1080}
+            HTTP_PORT=${HTTP_PORT:-8080}
+            
+            read -p "启用 TUN 模式? (y/n): " enable
+            if [[ "$enable" =~ ^[yY]$ ]]; then
+                generate_singbox_tun_config "vless-reality"
+                start_tun_mode
+            fi
+        else
+            print_error "请先导入配置 (菜单选项 1)"
+            return
         fi
     fi
 }
+
 
 #===============================================================================
 # 服务管理
@@ -1582,6 +1866,12 @@ show_status() {
     else
         echo -e "  Xray:      ${RED}未安装${NC}"
     fi
+    if command -v sing-box &> /dev/null; then
+        local singbox_ver=$(sing-box version 2>/dev/null | head -n1 | awk '{print $3}' || echo "未知")
+        echo -e "  sing-box:  ${GREEN}${singbox_ver}${NC}"
+    else
+        echo -e "  sing-box:  ${RED}未安装${NC}"
+    fi
     
     # 服务状态
     echo ""
@@ -1591,7 +1881,7 @@ show_status() {
     elif command -v hysteria &> /dev/null; then
         echo -e "  Hysteria2: ${RED}✗ 已停止${NC}"
     else
-        echo -e "  Hysteria2: ${RED}✗ 未安装${NC}"
+        echo -e "  Hysteria2: ${YELLOW}○ 未安装${NC}"
     fi
     
     if systemctl is-active --quiet xray-client 2>/dev/null; then
@@ -1599,21 +1889,15 @@ show_status() {
     elif command -v xray &> /dev/null; then
         echo -e "  Xray:      ${RED}✗ 已停止${NC}"
     else
-        echo -e "  Xray:      ${RED}✗ 未安装${NC}"
+        echo -e "  Xray:      ${YELLOW}○ 未安装${NC}"
     fi
     
-    # TUN 模式状态
-    echo ""
-    echo -e "${YELLOW}[TUN 模式]${NC}"
-    if [[ -f "$CONFIG_FILE" ]] && grep -q "^tun:" "$CONFIG_FILE" 2>/dev/null; then
-        # 检查 TUN 接口是否存在
-        if ip link show hystun &>/dev/null 2>&1 || ifconfig hystun &>/dev/null 2>&1; then
-            echo -e "  状态: ${GREEN}✓ 已启用 (运行中)${NC}"
-        else
-            echo -e "  状态: ${YELLOW}○ 已配置 (未激活)${NC}"
-        fi
+    if systemctl is-active --quiet bui-tun 2>/dev/null; then
+        echo -e "  TUN 模式:  ${GREEN}✓ 运行中${NC} (sing-box)"
+    elif [[ -f /etc/systemd/system/bui-tun.service ]]; then
+        echo -e "  TUN 模式:  ${RED}✗ 已停止${NC}"
     else
-        echo -e "  状态: ${RED}✗ 未启用${NC}"
+        echo -e "  TUN 模式:  ${YELLOW}○ 未配置${NC}"
     fi
     
     # 代理端口
@@ -1813,11 +2097,11 @@ show_menu() {
     echo -e "${CYAN}║${NC}  ${YELLOW}6.${NC} 重启服务                                               ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}7.${NC} 查看日志                                               ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}8.${NC} TUN 模式开关 (全局代理)                                ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}8.${NC} ${GREEN}TUN 模式开关${NC} (全局透明代理 via sing-box)           ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}9.${NC} 编辑路由规则                                           ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}10.${NC} 测试代理连接                                          ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}11.${NC} 更新内核 (Hysteria2 + Xray)                           ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}11.${NC} 更新内核 (Hysteria2/Xray/sing-box)                    ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}12.${NC} 开机自启动设置                                        ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}13.${NC} ${RED}卸载${NC}                                                 ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}0.${NC} 退出                                                   ${CYAN}║${NC}"
@@ -1864,10 +2148,12 @@ main() {
                 echo -e "${YELLOW}选择日志类型:${NC}"
                 echo "  1. Hysteria2"
                 echo "  2. Xray"
-                read -p "请选择 [1-2]: " log_choice
+                echo "  3. TUN 模式 (sing-box)"
+                read -p "请选择 [1-3]: " log_choice
                 case $log_choice in
                     1) journalctl -u "$CLIENT_SERVICE" --no-pager -n 30 ;;
                     2) journalctl -u xray-client --no-pager -n 30 ;;
+                    3) journalctl -u bui-tun --no-pager -n 30 ;;
                     *) print_error "无效选项" ;;
                 esac
                 ;;
@@ -1888,6 +2174,18 @@ main() {
                     bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
                     local new_xray=$(xray version 2>/dev/null | head -n1 | awk '{print $2}' || echo "未知")
                     echo -e "  Xray: ${YELLOW}${old_xray}${NC} -> ${GREEN}${new_xray}${NC}"
+                fi
+                
+                if command -v sing-box &> /dev/null; then
+                    print_info "更新 sing-box..."
+                    local old_sb=$(sing-box version 2>/dev/null | head -n1 | awk '{print $3}' || echo "未知")
+                    if [[ "$PKG_MANAGER" == "apt" ]]; then
+                        apt-get update -qq && apt-get install -y -qq sing-box
+                    else
+                        bash <(curl -fsSL https://sing-box.app/install.sh)
+                    fi
+                    local new_sb=$(sing-box version 2>/dev/null | head -n1 | awk '{print $3}' || echo "未知")
+                    echo -e "  sing-box: ${YELLOW}${old_sb}${NC} -> ${GREEN}${new_sb}${NC}"
                 fi
                 print_success "内核更新完成"
                 ;;
@@ -1951,10 +2249,34 @@ create_global_command() {
     fi
 }
 
-# 如果是首次运行，提示创建全局命令
-if [[ ! -f /usr/local/bin/bui-c && "$0" != "/usr/local/bin/bui-c" ]]; then
-    read -p "是否创建全局命令 'bui-c'? (y/n): " create_cmd
-    [[ "$create_cmd" =~ ^[yY]$ ]] && create_global_command
-fi
 
+# 首次运行检测 - 安装所有核心和创建全局命令
+first_run_setup() {
+    local cores_installed=true
+    
+    # 检查是否需要安装核心
+    if ! command -v hysteria &> /dev/null || ! command -v xray &> /dev/null || ! command -v sing-box &> /dev/null; then
+        cores_installed=false
+    fi
+    
+    # 首次运行时安装所有核心
+    if [[ "$cores_installed" == "false" ]]; then
+        echo ""
+        print_warning "检测到首次运行，需要安装代理核心组件"
+        read -p "是否现在安装 Hysteria2/Xray/sing-box? (y/n): " install
+        if [[ "$install" =~ ^[yY]$ ]]; then
+            install_all_cores
+        fi
+    fi
+    
+    # 创建全局命令
+    if [[ ! -f /usr/local/bin/bui-c && "$0" != "/usr/local/bin/bui-c" ]]; then
+        read -p "是否创建全局命令 'bui-c'? (y/n): " create_cmd
+        [[ "$create_cmd" =~ ^[yY]$ ]] && create_global_command
+    fi
+}
+
+# 入口
+first_run_setup
 main "$@"
+
