@@ -18,9 +18,8 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-# 路径配置
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BASE_DIR="${SCRIPT_DIR}/hysteria-client"
+# 路径配置 - 使用固定路径避免管道运行时 $0 问题
+BASE_DIR="/opt/hysteria-client"
 CONFIG_FILE="${BASE_DIR}/config.yaml"
 RULES_FILE="${BASE_DIR}/bypass-rules.txt"
 CLIENT_SERVICE="hysteria-client.service"
