@@ -4,10 +4,10 @@
 # Hysteria2 一键安装脚本 (含 Web 管理面板)
 # 功能：安装 Hysteria2、配置多用户、Web 管理面板、BBR 优化
 # 官方文档：https://v2.hysteria.network/zh/
-# 版本: 2.2.3
+# 版本: 2.3.0
 #===============================================================================
 
-SCRIPT_VERSION="2.2.3"
+SCRIPT_VERSION="2.3.0"
 
 set -e
 
@@ -791,6 +791,7 @@ PKGEOF
     # 创建 server.js (内嵌完整版 - 支持 Hysteria2 + VLESS-Reality)
     cat > "$ADMIN_DIR/server.js" << 'SERVEREOF'
 const http=require("http"),fs=require("fs"),crypto=require("crypto"),{execSync,exec}=require("child_process");
+const VERSION="2.3.0";
 const CONFIG={port:process.env.ADMIN_PORT||8080,adminPassword:process.env.ADMIN_PASSWORD||"admin123",
 jwtSecret:process.env.JWT_SECRET||crypto.randomBytes(32).toString("hex"),
 hysteriaConfig:process.env.HYSTERIA_CONFIG||"/opt/hysteria/config.yaml",
@@ -1071,7 +1072,7 @@ const HTML=`<!DOCTYPE html>
     <div class="login-wrap">
         <div class="stat-card login-card">
             <h1 style="font-size:24px; margin-bottom:8px">B-UI 管理面板</h1>
-            <p style="color:var(--text-dim); font-size:14px; margin-bottom:30px">安全访问中心</p>
+            <p style="color:var(--text-dim); font-size:14px; margin-bottom:30px">安全访问中心 · v"+VERSION+"</p>
             <input type="password" id="lp" placeholder="Enter Admin Password">
             <button class="btn" style="width:100%" onclick="login()">登 录</button>
         </div>
@@ -1081,7 +1082,7 @@ const HTML=`<!DOCTYPE html>
 <!-- Dashboard View -->
 <div id="v-dash" class="view">
     <nav class="nav">
-        <div class="brand"><i>⚡</i><span>B-UI</span></div>
+        <div class="brand"><i>⚡</i><span>B-UI</span><span style="font-size:11px;color:#888;margin-left:8px">v"+VERSION+"</span></div>
         <div style="display:flex; gap:10px">
             <button class="ibtn" onclick="openMasq()" title="伪装网站设置">🎭</button>
             <button class="ibtn" onclick="openM('m-pwd')" title="Change Password">🔑</button>
