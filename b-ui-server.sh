@@ -814,25 +814,40 @@ const d=JSON.parse(Buffer.from(p,"base64").toString());return d.exp<Date.now()?n
 function parseBody(r){return new Promise(s=>{let b="";r.on("data",c=>b+=c);r.on("end",()=>{try{s(b?JSON.parse(b):{})}catch{s({})}})})}
 function sendJSON(r,d,s=200,headers={}){r.writeHead(s,{"Content-Type":"application/json","Access-Control-Allow-Origin":"*","Access-Control-Allow-Methods":"*","Access-Control-Allow-Headers":"*",...headers});r.end(JSON.stringify(d))}
 function loadUsers(){try{return fs.existsSync(CONFIG.usersFile)?JSON.parse(fs.readFileSync(CONFIG.usersFile,"utf8")):[]}catch{return[]}}
-function saveUsers(u){try{fs.writeFileSync(CONFIG.usersFile,JSON.stringify(u,null,2));updateHysteriaConfig(u.filter(x=>!x.protocol||x.protocol==="hysteria2"));updateXrayConfig(u.filter(x=>x.protocol==="vless-reality"));return true}catch{return false}}
+function saveUsers(u){try{fs.writeFileSync(CONFIG.usersFile,JSON.stringify(u,null,2));updateHysteriaConfig(u.filter(x=>!x.protocol||x.protocol==="hysteria2"));updateXrayConfig(u.filter(x=>x.protocol==="vless-reality"),u.filter(x=>x.protocol==="vless-ws-tls"));return true}catch{return false}}
 function updateHysteriaConfig(users){try{let c=fs.readFileSync(CONFIG.hysteriaConfig,"utf8");
 const up=users.reduce((a,u)=>{a[u.username]=u.password;return a},{});
 const auth="auth:\n  type: userpass\n  userpass:\n"+Object.entries(up).map(([u,p])=>"    "+u+": "+p).join("\n");
 c=c.replace(/auth:[\s\S]*?(?=\n[a-zA-Z]|$)/,auth+"\n\n");
 fs.writeFileSync(CONFIG.hysteriaConfig,c);execSync("systemctl restart hysteria-server",{stdio:"pipe"})}catch(e){log("ERROR","Hysteria: "+e.message)}}
-function updateXrayConfig(users){try{if(!fs.existsSync(CONFIG.xrayConfig))return;
+function updateXrayConfig(realityUsers,wsUsers=[]){try{if(!fs.existsSync(CONFIG.xrayConfig))return;
 let c=JSON.parse(fs.readFileSync(CONFIG.xrayConfig,"utf8"));
-const clients=users.map(u=>({id:u.uuid,flow:"xtls-rprx-vision",email:u.username}));
+// Update Reality inbound
+const realityClients=realityUsers.map(u=>({id:u.uuid,flow:"xtls-rprx-vision",email:u.username}));
 const inbound=c.inbounds.find(i=>i.tag==="vless-reality");
 if(inbound){
-  inbound.settings.clients=clients;
-  // Collect all unique SNIs from users and add to serverNames
-  const userSnis=users.filter(u=>u.sni).map(u=>u.sni);
+  inbound.settings.clients=realityClients;
+  const userSnis=realityUsers.filter(u=>u.sni).map(u=>u.sni);
   const baseSni=inbound.streamSettings?.realitySettings?.dest?.split(":")[0]||"www.bing.com";
   const allSnis=[...new Set([baseSni,...userSnis])];
   if(inbound.streamSettings?.realitySettings)inbound.streamSettings.realitySettings.serverNames=allSnis;
 }
-fs.writeFileSync(CONFIG.xrayConfig,JSON.stringify(c,null,2));try{const addJson={inbounds:[{tag:"vless-reality",port:10001,protocol:"vless",settings:{clients:clients,decryption:"none"}}]};fs.writeFileSync("/tmp/xray-add.json",JSON.stringify(addJson));execSync("xray api adu -s 127.0.0.1:10085 /tmp/xray-add.json",{stdio:"pipe"})}catch(e){execSync("systemctl restart xray 2>/dev/null||true",{stdio:"pipe"})}}catch(e){log("ERROR","Xray: "+e.message)}}
+// Update or create WS+TLS inbound
+const wsClients=wsUsers.map(u=>({id:u.uuid,email:u.username}));
+let wsInbound=c.inbounds.find(i=>i.tag==="vless-ws-tls");
+if(wsUsers.length>0){
+  if(!wsInbound){
+    // Get domain from hysteria config for TLS cert
+    const hc=fs.readFileSync(CONFIG.hysteriaConfig,"utf8");
+    const dm=hc.match(/\/live\/([^\/]+)\/fullchain/);
+    const domain=dm?dm[1]:"localhost";
+    wsInbound={tag:"vless-ws-tls",port:10002,protocol:"vless",settings:{clients:wsClients,decryption:"none"},streamSettings:{network:"ws",security:"tls",tlsSettings:{serverName:domain,certificates:[{certificateFile:"/etc/letsencrypt/live/"+domain+"/fullchain.pem",keyFile:"/etc/letsencrypt/live/"+domain+"/privkey.pem"}]},wsSettings:{path:"/ws",headers:{}}}};
+    c.inbounds.push(wsInbound);
+  }else{
+    wsInbound.settings.clients=wsClients;
+  }
+}
+fs.writeFileSync(CONFIG.xrayConfig,JSON.stringify(c,null,2));execSync("systemctl restart xray 2>/dev/null||true",{stdio:"pipe"})}catch(e){log("ERROR","Xray: "+e.message)}}
 function getConfig(){try{let dm,pm;
 const hc=fs.readFileSync(CONFIG.hysteriaConfig,"utf8");
 dm=hc.match(/\/live\/([^\/]+)\/fullchain/);pm=hc.match(/listen:\s*:(\d+)/);
@@ -868,11 +883,11 @@ if(action==="create"){
 if(!user)return sendJSON(res,{error:"Missing user"},400);
 if(users.find(u=>u.username===user))return sendJSON(res,{error:"User exists"},400);
 const protocol=params.get("protocol")||"hysteria2";
-const pass=params.get("pass")||(protocol==="vless-reality"?crypto.randomUUID():crypto.randomBytes(8).toString("hex"));
+const pass=params.get("pass")||((protocol==="vless-reality"||protocol==="vless-ws-tls")?crypto.randomUUID():crypto.randomBytes(8).toString("hex"));
 const days=parseInt(params.get("days"))||0;const traffic=parseFloat(params.get("traffic"))||0;const monthly=parseFloat(params.get("monthly"))||0;const speed=parseFloat(params.get("speed"))||0;
-const sni=params.get("sni")||""; // User-specific SNI for free-data domains
+const sni=params.get("sni")||"www.bing.com"; // User-specific SNI, default to bing
 const newUser={username:user,protocol,createdAt:new Date().toISOString(),limits:{},usage:{total:0,monthly:{}}};
-if(protocol==="vless-reality"){newUser.uuid=pass;if(sni)newUser.sni=sni}else{newUser.password=pass}
+if(protocol==="vless-reality"||protocol==="vless-ws-tls"){newUser.uuid=pass;newUser.sni=sni}else{newUser.password=pass}
 if(days>0)newUser.limits.expiresAt=new Date(Date.now()+days*864e5).toISOString();
 if(traffic>0)newUser.limits.trafficLimit=traffic*1073741824;
 if(monthly>0)newUser.limits.monthlyLimit=monthly*1073741824;if(speed>0)newUser.limits.speedLimit=speed*1000000;
@@ -1142,12 +1157,12 @@ const HTML=`<!DOCTYPE html>
         <select id="nproto" onchange="toggleSniSelect()">
             <option value="hysteria2">Hysteria2 (推荐)</option>
             <option value="vless-reality">VLESS + Reality</option>
+            <option value="vless-ws-tls">VLESS + WS + TLS (免流测试)</option>
         </select>
         <div id="sni-group" style="display:none">
             <select id="nsni">
                 <optgroup label="默认">
-                    <option value="">使用全局伪装域名</option>
-                    <option value="www.bing.com">www.bing.com (默认)</option>
+                    <option value="www.bing.com" selected>www.bing.com (默认)</option>
                     <option value="www.microsoft.com">www.microsoft.com</option>
                 </optgroup>
                 <optgroup label="电信免流">
@@ -1297,6 +1312,10 @@ function genUri(x){
         const userSni=x.sni||cfg.sni||"www.bing.com";
         return "vless://"+x.uuid+"@"+cfg.domain+":"+cfg.xrayPort+"?encryption=none&flow=xtls-rprx-vision&security=reality&sni="+userSni+"&fp=chrome&pbk="+cfg.pubKey+"&sid="+cfg.shortId+"&spx=%2F&type=tcp#"+encodeURIComponent(x.username+(x.sni?" ["+x.sni+"]":""));
     }
+    if(x.protocol==="vless-ws-tls"){
+        const hostSni=x.sni||"www.bing.com";
+        return "vless://"+x.uuid+"@"+cfg.domain+":"+(cfg.wsPort||10002)+"?encryption=none&security=tls&sni="+cfg.domain+"&type=ws&host="+hostSni+"&path=%2Fws#"+encodeURIComponent(x.username+" [WS:"+hostSni+"]");
+    }
     return "hysteria2://"+encodeURIComponent(x.username)+":"+encodeURIComponent(x.password)+"@"+cfg.domain+":"+cfg.port+"/?sni="+cfg.domain+"&insecure=0#"+encodeURIComponent(x.username)
 }
 
@@ -1325,7 +1344,7 @@ function saveMasq(){
 function toggleSniSelect(){
     const proto=$("#nproto").value;
     const sniGroup=$("#sni-group");
-    if(proto==="vless-reality"){sniGroup.style.display="block"}else{sniGroup.style.display="none"}
+    if(proto==="vless-reality"||proto==="vless-ws-tls"){sniGroup.style.display="block"}else{sniGroup.style.display="none"}
 }
 
 if(tok)init();
