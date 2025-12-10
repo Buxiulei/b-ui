@@ -673,6 +673,9 @@ import_from_uri() {
         read -p "上行带宽 (Mbps) [直接回车跳过]: " BANDWIDTH_UP
         read -p "下行带宽 (Mbps) [直接回车跳过]: " BANDWIDTH_DOWN
         
+        # 安装 Hysteria2 (如果未安装)
+        install_hysteria
+        
         create_default_rules
         generate_config
     else
@@ -734,6 +737,9 @@ configure_client() {
     print_info "提示: 设置带宽可以优化连接，但设置过高会导致性能下降"
     read -p "上行带宽 (Mbps) [直接回车跳过]: " BANDWIDTH_UP
     read -p "下行带宽 (Mbps) [直接回车跳过]: " BANDWIDTH_DOWN
+    
+    # 安装 Hysteria2 (如果未安装)
+    install_hysteria
     
     mkdir -p "$BASE_DIR"
     
