@@ -1974,7 +1974,18 @@ show_status() {
             echo -e "  Xray:      ${RED}✗ 未启用${NC}"
         fi
     else
-        echo -e "  Xray:      ${RED}✗ 未配置${NC}"
+        echo -e "  Xray:      ${YELLOW}○ 未配置${NC}"
+    fi
+    
+    if [[ -f /etc/systemd/system/bui-tun.service ]]; then
+        local tun_auto=$(systemctl is-enabled bui-tun 2>/dev/null)
+        if [[ "$tun_auto" == "enabled" ]]; then
+            echo -e "  TUN 模式:  ${GREEN}✓ 已启用${NC}"
+        else
+            echo -e "  TUN 模式:  ${RED}✗ 未启用${NC}"
+        fi
+    else
+        echo -e "  TUN 模式:  ${YELLOW}○ 未配置${NC}"
     fi
     
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
