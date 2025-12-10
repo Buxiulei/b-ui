@@ -1159,6 +1159,7 @@ const HTML=`<!DOCTYPE html>
                     <option value="open.4g.play.cn">电信爱玩 (open.4g.play.cn)</option>
                 </optgroup>
                 <optgroup label="联通免流">
+                    <option value="iservice.10010.com">联通营业厅 (iservice.10010.com) ⭐</option>
                     <option value="game.hxll.wostore.cn">沃商店游戏 (game.hxll.wostore.cn)</option>
                     <option value="music.hxll.wostore.cn">沃商店音乐 (music.hxll.wostore.cn)</option>
                     <option value="box.10155.com">沃音乐 (box.10155.com)</option>
@@ -1166,7 +1167,8 @@ const HTML=`<!DOCTYPE html>
                     <option value="wotv.17wo.cn">联通WOTV (wotv.17wo.cn)</option>
                 </optgroup>
                 <optgroup label="移动免流">
-                    <option value="mm.10086.cn">移动商城 (mm.10086.cn)</option>
+                    <option value="shop.10086.cn">移动商城 (shop.10086.cn) ⭐</option>
+                    <option value="mm.10086.cn">移动MM (mm.10086.cn)</option>
                     <option value="www.10086.cn">移动官网 (www.10086.cn)</option>
                     <option value="dm.toutiao.com">抖音/头条 (dm.toutiao.com)</option>
                 </optgroup>
