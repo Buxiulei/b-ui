@@ -29,7 +29,12 @@
 
 ## 🖥️ 服务端安装
 
+> ⚠️ **注意**: 安装脚本需要 root 权限，请先切换到 root 用户
+
 ```bash
+# 先切换到 root 用户
+sudo -i
+
 # 一键安装
 bash <(curl -fsSL https://raw.githubusercontent.com/Buxiulei/b-ui/main/b-ui-server.sh)
 ```
@@ -85,10 +90,25 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Buxiulei/b-ui/main/b-ui-serv
 
 ## 💻 客户端安装
 
+> ⚠️ **注意**: 安装脚本需要 root 权限，请先切换到 root 用户
+
 ```bash
+# 先切换到 root 用户
+sudo -i
+
 # 一键安装
 bash <(curl -fsSL https://raw.githubusercontent.com/Buxiulei/b-ui/main/b-ui-client.sh)
 ```
+
+### 自动依赖安装
+
+脚本启动时会自动检测并安装所需依赖：
+- curl, wget (下载工具)
+- dig (DNS 解析)
+- ss/netstat (端口检测)
+- iptables (TUN 模式)
+- tar, gzip (解压)
+- ca-certificates (HTTPS)
 
 ### 客户端菜单
 ```
@@ -157,9 +177,10 @@ curl https://www.google.com
 
 | 组件 | 要求 |
 |------|------|
-| 操作系统 | Ubuntu / Debian |
-| 权限 | root |
+| 操作系统 | Ubuntu / Debian / CentOS / RHEL / Fedora |
+| 权限 | root (使用 `sudo -i` 切换) |
 | 服务端 | 需要域名 |
+| 客户端 | 支持 TUN 模式需要 systemd |
 
 ---
 

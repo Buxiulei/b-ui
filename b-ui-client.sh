@@ -63,8 +63,287 @@ check_root() {
 check_os() {
     if [[ -f /etc/os-release ]]; then
         . /etc/os-release
-        print_info "操作系统: $ID"
+        OS_ID="$ID"
+        OS_VERSION="$VERSION_ID"
+        print_info "操作系统: $OS_ID $OS_VERSION"
+    else
+        OS_ID="unknown"
+        print_warning "无法识别操作系统"
     fi
+}
+
+#===============================================================================
+# 依赖检测与安装
+#===============================================================================
+
+# 检测包管理器
+detect_package_manager() {
+    if command -v apt-get &> /dev/null; then
+        PKG_MANAGER="apt"
+        PKG_UPDATE="apt-get update -qq"
+        PKG_INSTALL="apt-get install -y -qq"
+    elif command -v dnf &> /dev/null; then
+        PKG_MANAGER="dnf"
+        PKG_UPDATE="dnf check-update -q || true"
+        PKG_INSTALL="dnf install -y -q"
+    elif command -v yum &> /dev/null; then
+        PKG_MANAGER="yum"
+        PKG_UPDATE="yum check-update -q || true"
+        PKG_INSTALL="yum install -y -q"
+    elif command -v pacman &> /dev/null; then
+        PKG_MANAGER="pacman"
+        PKG_UPDATE="pacman -Sy --noconfirm"
+        PKG_INSTALL="pacman -S --noconfirm"
+    elif command -v apk &> /dev/null; then
+        PKG_MANAGER="apk"
+        PKG_UPDATE="apk update"
+        PKG_INSTALL="apk add --no-cache"
+    else
+        PKG_MANAGER="unknown"
+        print_warning "未检测到支持的包管理器"
+    fi
+}
+
+# 检查并安装单个依赖
+check_and_install_dep() {
+    local cmd="$1"
+    local pkg="$2"
+    local desc="$3"
+    
+    if command -v "$cmd" &> /dev/null; then
+        echo -e "  ${GREEN}✓${NC} $desc ($cmd)"
+        return 0
+    else
+        echo -e "  ${YELLOW}○${NC} $desc - 正在安装..."
+        if [[ "$PKG_MANAGER" != "unknown" ]]; then
+            $PKG_INSTALL "$pkg" > /dev/null 2>&1
+            if command -v "$cmd" &> /dev/null; then
+                echo -e "  ${GREEN}✓${NC} $desc - 安装成功"
+                return 0
+            else
+                echo -e "  ${RED}✗${NC} $desc - 安装失败"
+                return 1
+            fi
+        else
+            echo -e "  ${RED}✗${NC} $desc - 无法自动安装"
+            return 1
+        fi
+    fi
+}
+
+# 主依赖检测函数
+check_dependencies() {
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}检测并安装依赖${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    
+    detect_package_manager
+    print_info "包管理器: $PKG_MANAGER"
+    
+    # 更新包索引
+    if [[ "$PKG_MANAGER" != "unknown" ]]; then
+        print_info "更新软件包索引..."
+        $PKG_UPDATE > /dev/null 2>&1 || true
+    fi
+    
+    echo ""
+    echo -e "${YELLOW}[核心工具]${NC}"
+    
+    local missing_critical=0
+    
+    # curl - 下载必需
+    check_and_install_dep "curl" "curl" "curl (HTTP 下载)" || ((missing_critical++))
+    
+    # dig/nslookup - DNS 解析
+    if ! command -v dig &> /dev/null; then
+        case "$PKG_MANAGER" in
+            apt) check_and_install_dep "dig" "dnsutils" "dig (DNS 解析)" || true ;;
+            dnf|yum) check_and_install_dep "dig" "bind-utils" "dig (DNS 解析)" || true ;;
+            pacman) check_and_install_dep "dig" "bind" "dig (DNS 解析)" || true ;;
+            apk) check_and_install_dep "dig" "bind-tools" "dig (DNS 解析)" || true ;;
+            *) echo -e "  ${YELLOW}○${NC} dig (DNS 解析) - 跳过" ;;
+        esac
+    else
+        echo -e "  ${GREEN}✓${NC} dig (DNS 解析)"
+    fi
+    
+    # ss/netstat - 端口检测
+    if command -v ss &> /dev/null; then
+        echo -e "  ${GREEN}✓${NC} ss (端口检测)"
+    elif command -v netstat &> /dev/null; then
+        echo -e "  ${GREEN}✓${NC} netstat (端口检测)"
+    else
+        case "$PKG_MANAGER" in
+            apt) check_and_install_dep "ss" "iproute2" "ss (端口检测)" || true ;;
+            dnf|yum) check_and_install_dep "ss" "iproute" "ss (端口检测)" || true ;;
+            pacman) check_and_install_dep "ss" "iproute2" "ss (端口检测)" || true ;;
+            apk) check_and_install_dep "ss" "iproute2" "ss (端口检测)" || true ;;
+            *) echo -e "  ${YELLOW}○${NC} ss (端口检测) - 跳过" ;;
+        esac
+    fi
+    
+    # iptables - TUN 模式可能需要
+    if ! command -v iptables &> /dev/null; then
+        case "$PKG_MANAGER" in
+            apt) check_and_install_dep "iptables" "iptables" "iptables (防火墙)" || true ;;
+            dnf|yum) check_and_install_dep "iptables" "iptables" "iptables (防火墙)" || true ;;
+            pacman) check_and_install_dep "iptables" "iptables" "iptables (防火墙)" || true ;;
+            apk) check_and_install_dep "iptables" "iptables" "iptables (防火墙)" || true ;;
+            *) echo -e "  ${YELLOW}○${NC} iptables (防火墙) - 跳过" ;;
+        esac
+    else
+        echo -e "  ${GREEN}✓${NC} iptables (防火墙)"
+    fi
+    
+    echo ""
+    echo -e "${YELLOW}[系统工具]${NC}"
+    
+    # systemctl - 服务管理
+    if command -v systemctl &> /dev/null; then
+        echo -e "  ${GREEN}✓${NC} systemctl (服务管理)"
+    else
+        echo -e "  ${RED}✗${NC} systemctl (服务管理) - 此脚本需要 systemd"
+        ((missing_critical++))
+    fi
+    
+    # tar/gzip - 解压
+    check_and_install_dep "tar" "tar" "tar (解压)" || true
+    check_and_install_dep "gzip" "gzip" "gzip (解压)" || true
+    
+    # wget - 备用下载
+    if ! command -v wget &> /dev/null; then
+        check_and_install_dep "wget" "wget" "wget (备用下载)" || true
+    else
+        echo -e "  ${GREEN}✓${NC} wget (备用下载)"
+    fi
+    
+    # ca-certificates - HTTPS 支持
+    case "$PKG_MANAGER" in
+        apt)
+            if dpkg -l ca-certificates &> /dev/null; then
+                echo -e "  ${GREEN}✓${NC} ca-certificates (HTTPS)"
+            else
+                $PKG_INSTALL ca-certificates > /dev/null 2>&1
+                echo -e "  ${GREEN}✓${NC} ca-certificates (HTTPS) - 已安装"
+            fi
+            ;;
+        dnf|yum)
+            if rpm -q ca-certificates &> /dev/null; then
+                echo -e "  ${GREEN}✓${NC} ca-certificates (HTTPS)"
+            else
+                $PKG_INSTALL ca-certificates > /dev/null 2>&1
+                echo -e "  ${GREEN}✓${NC} ca-certificates (HTTPS) - 已安装"
+            fi
+            ;;
+        *)
+            echo -e "  ${YELLOW}○${NC} ca-certificates (HTTPS) - 跳过检测"
+            ;;
+    esac
+    
+    echo ""
+    
+    if [[ $missing_critical -gt 0 ]]; then
+        print_error "有 $missing_critical 个关键依赖缺失，无法继续"
+        exit 1
+    fi
+    
+    print_success "依赖检测完成"
+    echo ""
+}
+
+#===============================================================================
+# 端口检测工具
+#===============================================================================
+
+is_port_in_use() {
+    # 检查端口是否被占用
+    local port="$1"
+    if command -v ss &> /dev/null; then
+        # ss 输出格式: 127.0.0.1:1080 或 *:1080 或 [::]:1080
+        ss -tuln 2>/dev/null | grep -qE "[:.]${port}(\\s|$)" && return 0
+    elif command -v netstat &> /dev/null; then
+        # Linux netstat: 127.0.0.1:1080, macOS netstat: 127.0.0.1.1080
+        netstat -tuln 2>/dev/null | grep -qE "[:.](${port})\\s" && return 0
+    fi
+    # 使用 /dev/tcp 检测 (bash 内置，最后手段)
+    (echo >/dev/tcp/127.0.0.1/$port) 2>/dev/null && return 0
+    return 1
+}
+
+get_occupied_ports() {
+    # 获取当前所有已占用的端口
+    if command -v ss &> /dev/null; then
+        ss -tuln 2>/dev/null | grep -E 'LISTEN|ESTAB' | awk '{print $5}' | grep -oE '[0-9]+$' | sort -un
+    elif command -v netstat &> /dev/null; then
+        netstat -tuln 2>/dev/null | grep -i listen | awk '{print $4}' | grep -oE '[0-9]+$' | sort -un
+    fi
+}
+
+find_available_port() {
+    # 找到一个可用的端口，从指定端口开始
+    local start_port="$1"
+    local port="$start_port"
+    local max_attempts=100
+    
+    for ((i=0; i<max_attempts; i++)); do
+        if ! is_port_in_use "$port"; then
+            echo "$port"
+            return 0
+        fi
+        ((port++))
+    done
+    
+    # 如果连续100个端口都被占用，返回原始端口
+    echo "$start_port"
+    return 1
+}
+
+check_and_suggest_ports() {
+    # 检查默认端口并建议替代端口
+    local socks_default="${1:-1080}"
+    local http_default="${2:-8080}"
+    
+    echo ""
+    echo -e "${CYAN}[端口检测]${NC}"
+    
+    # 显示当前已占用的常用代理端口
+    local occupied=$(get_occupied_ports)
+    local common_ports=(1080 8080 7890 7891 10808 10809 1081 8081)
+    local occupied_common=""
+    
+    for p in "${common_ports[@]}"; do
+        if echo "$occupied" | grep -q "^${p}$"; then
+            occupied_common="${occupied_common} ${p}"
+        fi
+    done
+    
+    if [[ -n "$occupied_common" ]]; then
+        print_warning "以下常用端口已被占用:$occupied_common"
+    fi
+    
+    # 检查并建议 SOCKS5 端口
+    if is_port_in_use "$socks_default"; then
+        local new_socks=$(find_available_port "$socks_default")
+        print_warning "SOCKS5 端口 $socks_default 已被占用，建议使用: $new_socks"
+        SUGGESTED_SOCKS_PORT="$new_socks"
+    else
+        print_success "SOCKS5 端口 $socks_default 可用"
+        SUGGESTED_SOCKS_PORT="$socks_default"
+    fi
+    
+    # 检查并建议 HTTP 端口
+    if is_port_in_use "$http_default"; then
+        local new_http=$(find_available_port "$http_default")
+        print_warning "HTTP 端口 $http_default 已被占用，建议使用: $new_http"
+        SUGGESTED_HTTP_PORT="$new_http"
+    else
+        print_success "HTTP 端口 $http_default 可用"
+        SUGGESTED_HTTP_PORT="$http_default"
+    fi
+    
+    echo ""
 }
 
 get_server_ip() {
@@ -116,13 +395,24 @@ generate_xray_config() {
     local server_host=$(echo "$SERVER_ADDR" | cut -d':' -f1)
     local server_port=$(echo "$SERVER_ADDR" | cut -d':' -f2)
     
+    # 检测端口占用情况
+    check_and_suggest_ports 1080 8080
+    
     # SOCKS5 端口
-    read -p "SOCKS5 端口 [默认 1080]: " SOCKS_PORT
-    SOCKS_PORT=${SOCKS_PORT:-1080}
+    read -p "SOCKS5 端口 [默认 ${SUGGESTED_SOCKS_PORT}]: " SOCKS_PORT
+    SOCKS_PORT=${SOCKS_PORT:-$SUGGESTED_SOCKS_PORT}
+    
+    if is_port_in_use "$SOCKS_PORT"; then
+        print_warning "端口 $SOCKS_PORT 已被占用，可能会冲突！"
+    fi
     
     # HTTP 端口
-    read -p "HTTP 端口 [默认 8080]: " HTTP_PORT
-    HTTP_PORT=${HTTP_PORT:-8080}
+    read -p "HTTP 端口 [默认 ${SUGGESTED_HTTP_PORT}]: " HTTP_PORT
+    HTTP_PORT=${HTTP_PORT:-$SUGGESTED_HTTP_PORT}
+    
+    if is_port_in_use "$HTTP_PORT"; then
+        print_warning "端口 $HTTP_PORT 已被占用，可能会冲突！"
+    fi
     
     cat > "$xray_config" << EOF
 {
@@ -355,12 +645,23 @@ import_from_uri() {
     mkdir -p "$BASE_DIR"
     
     if [[ "$PROTOCOL" == "hysteria2" ]]; then
-        # Hysteria2 配置
-        read -p "SOCKS5 端口 [默认 1080]: " SOCKS_PORT
-        SOCKS_PORT=${SOCKS_PORT:-1080}
+        # Hysteria2 配置 - 检测端口占用情况
+        check_and_suggest_ports 1080 8080
         
-        read -p "HTTP 端口 [默认 8080]: " HTTP_PORT
-        HTTP_PORT=${HTTP_PORT:-8080}
+        read -p "SOCKS5 端口 [默认 ${SUGGESTED_SOCKS_PORT}]: " SOCKS_PORT
+        SOCKS_PORT=${SOCKS_PORT:-$SUGGESTED_SOCKS_PORT}
+        
+        # 验证用户输入的端口
+        if is_port_in_use "$SOCKS_PORT"; then
+            print_warning "端口 $SOCKS_PORT 已被占用，可能会冲突！"
+        fi
+        
+        read -p "HTTP 端口 [默认 ${SUGGESTED_HTTP_PORT}]: " HTTP_PORT
+        HTTP_PORT=${HTTP_PORT:-$SUGGESTED_HTTP_PORT}
+        
+        if is_port_in_use "$HTTP_PORT"; then
+            print_warning "端口 $HTTP_PORT 已被占用，可能会冲突！"
+        fi
         
         read -p "启用 TUN 模式 (全局代理)? (y/n) [默认 n]: " enable_tun
         TUN_ENABLED="false"
@@ -397,13 +698,24 @@ configure_client() {
         read -p "密码不能为空: " AUTH_PASSWORD
     done
     
+    # 检测端口占用情况
+    check_and_suggest_ports 1080 8080
+    
     # SOCKS5 端口
-    read -p "SOCKS5 端口 [默认 1080]: " SOCKS_PORT
-    SOCKS_PORT=${SOCKS_PORT:-1080}
+    read -p "SOCKS5 端口 [默认 ${SUGGESTED_SOCKS_PORT}]: " SOCKS_PORT
+    SOCKS_PORT=${SOCKS_PORT:-$SUGGESTED_SOCKS_PORT}
+    
+    if is_port_in_use "$SOCKS_PORT"; then
+        print_warning "端口 $SOCKS_PORT 已被占用，可能会冲突！"
+    fi
     
     # HTTP 端口
-    read -p "HTTP 端口 [默认 8080]: " HTTP_PORT
-    HTTP_PORT=${HTTP_PORT:-8080}
+    read -p "HTTP 端口 [默认 ${SUGGESTED_HTTP_PORT}]: " HTTP_PORT
+    HTTP_PORT=${HTTP_PORT:-$SUGGESTED_HTTP_PORT}
+    
+    if is_port_in_use "$HTTP_PORT"; then
+        print_warning "端口 $HTTP_PORT 已被占用，可能会冲突！"
+    fi
     
     # TUN 模式
     read -p "启用 TUN 模式 (全局代理)? (y/n) [默认 n]: " enable_tun
@@ -463,14 +775,8 @@ generate_config() {
     local server_ip=$(dig +short "$server_host" A 2>/dev/null | head -1)
     [[ -z "$server_ip" ]] && server_ip="$server_host"
     
-    # 获取当前 SSH 客户端 IP (需要保护)
-    local ssh_client_ip=$(echo "$SSH_CONNECTION" | awk '{print $1}')
-    
-    # 构建排除 IP 列表
-    local exclude_ips="\"${server_ip}/32\""
-    
     # 读取自定义规则
-    local acl_rules=""
+    local custom_acl_rules=""
     if [[ -f "$RULES_FILE" ]]; then
         while IFS= read -r line; do
             # 跳过注释和空行
@@ -479,16 +785,13 @@ generate_config() {
             [[ -z "$line" ]] && continue
             
             # 处理不同类型的规则
-            if [[ "$line" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ ]]; then
-                # IP/CIDR - 添加到 TUN 排除列表
-                exclude_ips="${exclude_ips}, \"${line}\""
-            elif [[ "$line" =~ ^regexp: ]]; then
+            if [[ "$line" =~ ^regexp: ]]; then
                 # 正则表达式
                 local pattern="${line#regexp:}"
-                acl_rules="${acl_rules}\n  - ${pattern} direct"
+                custom_acl_rules="${custom_acl_rules}\n    - ${pattern} direct"
             else
-                # 域名/通配符
-                acl_rules="${acl_rules}\n  - ${line} direct"
+                # 域名/通配符/IP
+                custom_acl_rules="${custom_acl_rules}\n    - ${line} direct"
             fi
         done < "$RULES_FILE"
     fi
@@ -549,17 +852,32 @@ tun:
       - "fc00::/7"
       - "fe80::/10"
       - "::1/128"
+
+# ACL 路由规则 - 保护 SSH 连接
+acl:
+  inline:
+    # SSH 端口保护 - 所有 22 端口流量绕过代理
+    - :22 direct
+    - :22/ direct
+    # 常用 SSH 备用端口
+    - :2222 direct
+    - :2222/ direct
 EOF
-    fi
-    
-    # 添加 ACL 规则 (如果有)
-    if [[ -n "$acl_rules" ]]; then
-        cat >> "$CONFIG_FILE" << EOF
+        
+        # 添加自定义 ACL 规则
+        if [[ -n "$custom_acl_rules" ]]; then
+            echo -e "$custom_acl_rules" >> "$CONFIG_FILE"
+        fi
+    else
+        # 非 TUN 模式，但如果有自定义规则，也添加 ACL
+        if [[ -n "$custom_acl_rules" ]]; then
+            cat >> "$CONFIG_FILE" << EOF
 
 # ACL 路由规则
 acl:
-  inline:$(echo -e "$acl_rules")
+  inline:$(echo -e "$custom_acl_rules")
 EOF
+        fi
     fi
 }
 
@@ -920,6 +1238,7 @@ show_menu() {
 main() {
     check_root
     check_os
+    check_dependencies
     
     while true; do
         print_banner
