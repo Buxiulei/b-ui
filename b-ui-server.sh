@@ -1151,6 +1151,7 @@ const HTML=`<!DOCTYPE html>
                     <option value="www.microsoft.com">www.microsoft.com</option>
                 </optgroup>
                 <optgroup label="电信免流">
+                    <option value="www.189.cn">电信营业厅 (www.189.cn) ⭐</option>
                     <option value="vod3.nty.tv189.cn">天翼视讯 (vod3.nty.tv189.cn)</option>
                     <option value="cloudgame.189.cn">天翼云游戏 (cloudgame.189.cn)</option>
                     <option value="ltewap.tv189.com">电信爱看 (ltewap.tv189.com)</option>
