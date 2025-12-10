@@ -667,6 +667,13 @@ import_from_uri() {
         TUN_ENABLED="false"
         [[ "$enable_tun" == "y" || "$enable_tun" == "Y" ]] && TUN_ENABLED="true"
         
+        # 带宽设置
+        echo ""
+        echo -e "${YELLOW}[带宽设置]${NC} (可选，直接回车跳过)"
+        print_info "提示: 设置带宽可以优化连接，但设置过高会导致性能下降"
+        read -p "上行带宽 (Mbps) [直接回车跳过]: " BANDWIDTH_UP
+        read -p "下行带宽 (Mbps) [直接回车跳过]: " BANDWIDTH_DOWN
+        
         create_default_rules
         generate_config
     else
@@ -721,6 +728,13 @@ configure_client() {
     read -p "启用 TUN 模式 (全局代理)? (y/n) [默认 n]: " enable_tun
     TUN_ENABLED="false"
     [[ "$enable_tun" == "y" || "$enable_tun" == "Y" ]] && TUN_ENABLED="true"
+    
+    # 带宽设置
+    echo ""
+    echo -e "${YELLOW}[带宽设置]${NC} (可选，直接回车跳过)"
+    print_info "提示: 设置带宽可以优化连接，但设置过高会导致性能下降"
+    read -p "上行带宽 (Mbps) [直接回车跳过]: " BANDWIDTH_UP
+    read -p "下行带宽 (Mbps) [直接回车跳过]: " BANDWIDTH_DOWN
     
     mkdir -p "$BASE_DIR"
     
@@ -809,11 +823,6 @@ auth: ${AUTH_PASSWORD}
 tls:
   insecure: false
 
-# 带宽设置 (可选，根据实际情况调整)
-# bandwidth:
-#   up: 50 mbps
-#   down: 100 mbps
-
 # SOCKS5 代理
 socks5:
   listen: 127.0.0.1:${SOCKS_PORT}
@@ -822,6 +831,23 @@ socks5:
 http:
   listen: 127.0.0.1:${HTTP_PORT}
 EOF
+
+    # 添加带宽设置 (如果用户设置了)
+    if [[ -n "$BANDWIDTH_UP" || -n "$BANDWIDTH_DOWN" ]]; then
+        # 在 tls 后插入带宽配置
+        local bw_config=""
+        bw_config+="\n# 带宽设置\nbandwidth:"
+        [[ -n "$BANDWIDTH_UP" ]] && bw_config+="\n  up: ${BANDWIDTH_UP} mbps"
+        [[ -n "$BANDWIDTH_DOWN" ]] && bw_config+="\n  down: ${BANDWIDTH_DOWN} mbps"
+        
+        # 使用 sed 在 tls 块后插入
+        sed -i "/^tls:/a\\$(echo -e "$bw_config")" "$CONFIG_FILE" 2>/dev/null || \
+        sed -i '' "/^tls:/a\\
+$(echo -e "$bw_config")
+" "$CONFIG_FILE"
+        
+        print_info "带宽设置: 上行 ${BANDWIDTH_UP:-未设置} Mbps, 下行 ${BANDWIDTH_DOWN:-未设置} Mbps"
+    fi
 
     # 添加 TUN 配置
     if [[ "$TUN_ENABLED" == "true" ]]; then
