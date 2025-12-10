@@ -2161,7 +2161,11 @@ show_menu() {
 main() {
     check_root
     check_os
-    check_dependencies
+    
+    # 只在首次运行时检测依赖 (核心未安装时)
+    if ! command -v hysteria &> /dev/null || ! command -v xray &> /dev/null || ! command -v sing-box &> /dev/null; then
+        check_dependencies
+    fi
     
     while true; do
         print_banner
