@@ -2226,34 +2226,41 @@ main() {
 #===============================================================================
 
 SCRIPT_URL="https://raw.githubusercontent.com/Buxiulei/b-ui/main/b-ui-client.sh"
-# GitHub 镜像站点 (备用)
-SCRIPT_URL_MIRROR="https://ghproxy.com/https://raw.githubusercontent.com/Buxiulei/b-ui/main/b-ui-client.sh"
+# 国内可访问的镜像 (首选)
+SCRIPT_URL_JSR="https://cdn.jsdelivr.net/gh/Buxiulei/b-ui@main/b-ui-client.sh"
+SCRIPT_URL_GHPROXY="https://ghproxy.com/https://raw.githubusercontent.com/Buxiulei/b-ui/main/b-ui-client.sh"
 
 create_global_command() {
     print_info "创建全局命令 bui-c..."
     
     local download_success=false
     
-    # 方法1: 使用本地 SOCKS5 代理下载 (如果可用)
-    if ss -tuln 2>/dev/null | grep -q ":1080 "; then
-        print_info "使用本地代理下载..."
+    # 方法1: 使用 jsdelivr CDN (国内可用)
+    print_info "尝试 jsdelivr CDN..."
+    if curl -fsSL --max-time 30 "$SCRIPT_URL_JSR" -o /usr/local/bin/bui-c 2>/dev/null; then
+        download_success=true
+    fi
+    
+    # 方法2: 使用 ghproxy 镜像
+    if [[ "$download_success" == "false" ]]; then
+        print_info "尝试 ghproxy 镜像..."
+        if curl -fsSL --max-time 30 "$SCRIPT_URL_GHPROXY" -o /usr/local/bin/bui-c 2>/dev/null; then
+            download_success=true
+        fi
+    fi
+    
+    # 方法3: 使用本地代理 (如果可用)
+    if [[ "$download_success" == "false" ]] && ss -tuln 2>/dev/null | grep -q ":1080 "; then
+        print_info "使用本地代理..."
         if curl --socks5 127.0.0.1:1080 -fsSL --max-time 30 "$SCRIPT_URL" -o /usr/local/bin/bui-c 2>/dev/null; then
             download_success=true
         fi
     fi
     
-    # 方法2: 使用镜像下载
+    # 方法4: 直接下载 (带超时，可能失败)
     if [[ "$download_success" == "false" ]]; then
-        print_info "尝试镜像下载..."
-        if curl -fsSL --max-time 30 "$SCRIPT_URL_MIRROR" -o /usr/local/bin/bui-c 2>/dev/null; then
-            download_success=true
-        fi
-    fi
-    
-    # 方法3: 直接下载 (带超时)
-    if [[ "$download_success" == "false" ]]; then
-        print_info "直接下载..."
-        if curl -fsSL --max-time 60 "$SCRIPT_URL" -o /usr/local/bin/bui-c 2>/dev/null; then
+        print_info "尝试直接下载..."
+        if curl -fsSL --max-time 30 "$SCRIPT_URL" -o /usr/local/bin/bui-c 2>/dev/null; then
             download_success=true
         fi
     fi
@@ -2270,11 +2277,11 @@ create_global_command() {
             return 1
         fi
     else
-        print_error "下载失败，请检查网络连接"
-        print_info "你可以稍后手动创建: sudo curl -o /usr/local/bin/bui-c \"$SCRIPT_URL\""
+        print_error "下载失败，请稍后重试或手动下载"
         return 1
     fi
 }
+
 
 
 
