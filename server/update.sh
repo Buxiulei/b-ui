@@ -236,6 +236,15 @@ update_service_paths() {
         updated=1
     fi
     
+    # 检查并更新 Hysteria 服务的 override.conf（重要！）
+    if [[ -f /etc/systemd/system/hysteria-server.service.d/override.conf ]]; then
+        if grep -q "/opt/hysteria" /etc/systemd/system/hysteria-server.service.d/override.conf 2>/dev/null; then
+            sed -i 's|/opt/hysteria|/opt/b-ui|g' /etc/systemd/system/hysteria-server.service.d/override.conf
+            print_info "  ✓ 更新 hysteria-server override.conf 路径"
+            updated=1
+        fi
+    fi
+    
     # 检查并更新管理面板服务配置
     if grep -q "/opt/hysteria" /etc/systemd/system/b-ui-admin.service 2>/dev/null; then
         sed -i 's|/opt/hysteria|/opt/b-ui|g' /etc/systemd/system/b-ui-admin.service
