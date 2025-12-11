@@ -2410,8 +2410,10 @@ test_proxy() {
     print_info "测试代理..."
     
     local port=$(grep -A1 "^socks5:" "$CONFIG_FILE" 2>/dev/null | grep "listen:" | sed 's/.*://')
+    port=${port:-1080}
     
-    if curl -s --max-time 10 --socks5 "127.0.0.1:${port:-1080}" https://www.google.com > /dev/null 2>&1; then
+    # 使用 --socks5-hostname 让代理服务端解析 DNS，避免国内 DNS 污染
+    if curl -s --max-time 15 --socks5-hostname "127.0.0.1:${port}" https://www.google.com > /dev/null 2>&1; then
         print_success "代理连接正常"
     else
         print_warning "无法访问 Google，检查配置"
