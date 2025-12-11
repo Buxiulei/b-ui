@@ -15,13 +15,22 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 # 配置
-SCRIPT_VERSION="2.4.0"
 BASE_DIR="/opt/hysteria"
 CONFIG_FILE="${BASE_DIR}/config.yaml"
 USERS_FILE="${BASE_DIR}/users.json"
 ADMIN_DIR="${BASE_DIR}/admin"
 HYSTERIA_SERVICE="hysteria-server.service"
 ADMIN_SERVICE="b-ui-admin.service"
+
+# 动态获取版本号
+get_version() {
+    if [[ -f "${BASE_DIR}/version.json" ]]; then
+        jq -r '.version' "${BASE_DIR}/version.json" 2>/dev/null || echo "2.4.0"
+    else
+        echo "2.4.0"
+    fi
+}
+SCRIPT_VERSION=$(get_version)
 
 # 打印函数
 print_info() { echo -e "${BLUE}[INFO]${NC} $1"; }

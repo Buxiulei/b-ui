@@ -3,10 +3,20 @@ const fs = require("fs");
 const crypto = require("crypto");
 const { execSync, exec } = require("child_process");
 const path = require("path");
-
-const VERSION = "2.4.0";
+// 从 version.json 读取版本号
 const BASE_DIR = process.env.BASE_DIR || "/opt/hysteria";
 const ADMIN_DIR = process.env.ADMIN_DIR || path.join(BASE_DIR, "admin");
+
+function getVersion() {
+    try {
+        const versionFile = path.join(BASE_DIR, "version.json");
+        if (fs.existsSync(versionFile)) {
+            return JSON.parse(fs.readFileSync(versionFile, "utf8")).version || "2.4.0";
+        }
+    } catch { }
+    return "2.4.0";
+}
+const VERSION = getVersion();
 
 const CONFIG = {
     port: process.env.ADMIN_PORT || 8080,
