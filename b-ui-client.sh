@@ -113,6 +113,112 @@ check_os() {
 }
 
 #===============================================================================
+# 智能下载函数 - 国内优先
+# 默认假设无法直连 GitHub/Google，优先使用国内镜像
+#===============================================================================
+
+# 国内镜像列表
+MIRROR_GHPROXY="https://ghproxy.com"
+MIRROR_GHPROXY2="https://mirror.ghproxy.com"  
+MIRROR_FASTGIT="https://hub.fastgit.xyz"
+MIRROR_JSR="https://cdn.jsdelivr.net/gh"
+
+# 智能下载文件 (优先国内镜像)
+# 用法: smart_download <url> <output_file> [description]
+smart_download() {
+    local url="$1"
+    local output="$2"
+    local desc="${3:-下载文件}"
+    local success=false
+    
+    # 检测 URL 类型
+    if [[ "$url" == *"github.com"* ]] || [[ "$url" == *"raw.githubusercontent.com"* ]]; then
+        # GitHub URL，使用镜像
+        local github_path=$(echo "$url" | sed -E 's|https://(raw\.)?github(usercontent)?\.com/||')
+        
+        # 方法1: ghproxy 镜像 (国内首选)
+        print_info "尝试 ghproxy 镜像..."
+        if curl -fsSL --max-time 60 "${MIRROR_GHPROXY}/${url}" -o "$output" 2>/dev/null; then
+            success=true
+        fi
+        
+        # 方法2: ghproxy2 镜像
+        if [[ "$success" == "false" ]]; then
+            print_info "尝试 mirror.ghproxy 镜像..."
+            if curl -fsSL --max-time 60 "${MIRROR_GHPROXY2}/${url}" -o "$output" 2>/dev/null; then
+                success=true
+            fi
+        fi
+        
+        # 方法3: jsdelivr CDN (如果是 raw 文件)
+        if [[ "$success" == "false" ]] && [[ "$url" == *"raw.githubusercontent.com"* ]]; then
+            # 转换: raw.githubusercontent.com/user/repo/branch/path -> cdn.jsdelivr.net/gh/user/repo@branch/path
+            local jsr_path=$(echo "$url" | sed -E 's|https://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/(.*)|\1/\2@\3/\4|')
+            print_info "尝试 jsdelivr CDN..."
+            if curl -fsSL --max-time 60 "${MIRROR_JSR}/${jsr_path}" -o "$output" 2>/dev/null; then
+                success=true
+            fi
+        fi
+        
+        # 方法4: 如果有本地代理，通过代理下载
+        if [[ "$success" == "false" ]] && ss -tuln 2>/dev/null | grep -q ":1080 "; then
+            print_info "通过本地代理下载..."
+            if curl --socks5 127.0.0.1:1080 -fsSL --max-time 120 "$url" -o "$output" 2>/dev/null; then
+                success=true
+            fi
+        fi
+        
+        # 方法5: 直连 (最后尝试)
+        if [[ "$success" == "false" ]]; then
+            print_info "尝试直接下载..."
+            if curl -fsSL --max-time 120 "$url" -o "$output" 2>/dev/null; then
+                success=true
+            fi
+        fi
+    else
+        # 非 GitHub URL，直接下载或使用代理
+        # 先尝试直连
+        if curl -fsSL --max-time 30 "$url" -o "$output" 2>/dev/null; then
+            success=true
+        elif ss -tuln 2>/dev/null | grep -q ":1080 "; then
+            # 通过本地代理
+            print_info "通过本地代理下载..."
+            if curl --socks5 127.0.0.1:1080 -fsSL --max-time 120 "$url" -o "$output" 2>/dev/null; then
+                success=true
+            fi
+        fi
+    fi
+    
+    if [[ "$success" == "true" ]] && [[ -f "$output" ]] && [[ -s "$output" ]]; then
+        return 0
+    else
+        rm -f "$output" 2>/dev/null
+        return 1
+    fi
+}
+
+# 执行远程脚本 (优先国内镜像)
+# 用法: smart_run_script <url> [args...]
+smart_run_script() {
+    local url="$1"
+    shift
+    local args="$@"
+    local tmp_script=$(mktemp)
+    
+    if smart_download "$url" "$tmp_script" "下载安装脚本"; then
+        chmod +x "$tmp_script"
+        bash "$tmp_script" $args
+        local ret=$?
+        rm -f "$tmp_script"
+        return $ret
+    else
+        rm -f "$tmp_script"
+        print_error "脚本下载失败: $url"
+        return 1
+    fi
+}
+
+#===============================================================================
 # 依赖检测与安装
 #===============================================================================
 
@@ -414,8 +520,25 @@ install_hysteria() {
         return 0
     fi
     
-    HYSTERIA_USER=root bash <(curl -fsSL https://get.hy2.sh/)
-    print_success "安装完成"
+    # 官方脚本 URL
+    local hy2_script="https://raw.githubusercontent.com/apernet/hysteria/master/install_server.sh"
+    local hy2_script_alt="https://get.hy2.sh/"
+    
+    # 优先使用国内镜像下载官方脚本
+    if smart_run_script "$hy2_script"; then
+        print_success "Hysteria2 安装完成"
+        return 0
+    fi
+    
+    # 备选: 直接尝试官方短链接 (可能需要代理)
+    print_info "尝试官方安装脚本..."
+    if HYSTERIA_USER=root bash <(curl -fsSL --max-time 60 "$hy2_script_alt") 2>/dev/null; then
+        print_success "Hysteria2 安装完成"
+        return 0
+    fi
+    
+    print_error "Hysteria2 安装失败，请检查网络连接"
+    return 1
 }
 
 install_xray_client() {
@@ -426,8 +549,17 @@ install_xray_client() {
         return 0
     fi
     
-    bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
-    print_success "Xray 安装完成"
+    # Xray 官方安装脚本
+    local xray_script="https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh"
+    
+    # 使用智能下载执行脚本
+    if smart_run_script "$xray_script" install; then
+        print_success "Xray 安装完成"
+        return 0
+    fi
+    
+    print_error "Xray 安装失败，请检查网络连接"
+    return 1
 }
 
 install_singbox() {
@@ -438,22 +570,74 @@ install_singbox() {
         return 0
     fi
     
-    # 添加 sing-box 官方源
+    # 方法1: 使用 apt 源 (Debian/Ubuntu)
     if [[ "$PKG_MANAGER" == "apt" ]]; then
         start_spinner "添加 sing-box 源..."
-        curl -fsSL https://sing-box.app/gpg.key -o /etc/apt/keyrings/sagernet.asc 2>/dev/null || \
-        curl -fsSL https://sing-box.app/gpg.key | tee /etc/apt/keyrings/sagernet.asc > /dev/null
-        chmod a+r /etc/apt/keyrings/sagernet.asc
-        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/sagernet.asc] https://deb.sagernet.org/ * *" > /etc/apt/sources.list.d/sagernet.list
+        
+        # 尝试下载 GPG 密钥
+        mkdir -p /etc/apt/keyrings
+        local gpg_success=false
+        
+        # 直接尝试 (sing-box.app 在国内通常可访问)
+        if curl -fsSL --max-time 30 https://sing-box.app/gpg.key -o /etc/apt/keyrings/sagernet.asc 2>/dev/null; then
+            gpg_success=true
+        fi
+        
+        # 如果直接下载失败，尝试代理
+        if [[ "$gpg_success" == "false" ]] && ss -tuln 2>/dev/null | grep -q ":1080 "; then
+            if curl --socks5 127.0.0.1:1080 -fsSL --max-time 30 https://sing-box.app/gpg.key -o /etc/apt/keyrings/sagernet.asc 2>/dev/null; then
+                gpg_success=true
+            fi
+        fi
+        
+        if [[ "$gpg_success" == "true" ]]; then
+            chmod a+r /etc/apt/keyrings/sagernet.asc
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/sagernet.asc] https://deb.sagernet.org/ * *" > /etc/apt/sources.list.d/sagernet.list
+            stop_spinner
+            run_with_spinner "更新软件源..." apt-get update -qq
+            run_with_spinner "安装 sing-box..." apt-get install -y -qq sing-box
+            print_success "sing-box 安装完成"
+            return 0
+        fi
         stop_spinner
-        run_with_spinner "下载 sing-box..." apt-get update -qq
-        run_with_spinner "安装 sing-box..." apt-get install -y -qq sing-box
-    else
-        # 其他系统使用官方安装脚本
-        bash <(curl -fsSL https://sing-box.app/install.sh)
     fi
     
-    print_success "sing-box 安装完成"
+    # 方法2: 手动下载二进制文件 (使用 GitHub releases + 镜像)
+    print_info "使用二进制安装..."
+    local arch=$(uname -m)
+    case "$arch" in
+        x86_64) arch="amd64" ;;
+        aarch64) arch="arm64" ;;
+        armv7l) arch="armv7" ;;
+    esac
+    
+    # 获取最新版本号 (使用镜像)
+    local version=""
+    local api_url="https://api.github.com/repos/SagerNet/sing-box/releases/latest"
+    
+    # 尝试获取版本号
+    version=$(curl -fsSL --max-time 15 "$api_url" 2>/dev/null | grep '"tag_name"' | sed -E 's/.*"v([^"]+)".*/\1/')
+    
+    if [[ -z "$version" ]]; then
+        # 使用默认版本
+        version="1.10.0"
+        print_warning "无法获取最新版本，使用默认版本 $version"
+    fi
+    
+    local download_url="https://github.com/SagerNet/sing-box/releases/download/v${version}/sing-box-${version}-linux-${arch}.tar.gz"
+    local tmp_file="/tmp/sing-box.tar.gz"
+    
+    if smart_download "$download_url" "$tmp_file" "sing-box"; then
+        tar -xzf "$tmp_file" -C /tmp
+        cp "/tmp/sing-box-${version}-linux-${arch}/sing-box" /usr/bin/
+        chmod +x /usr/bin/sing-box
+        rm -rf "$tmp_file" "/tmp/sing-box-${version}-linux-${arch}"
+        print_success "sing-box 安装完成"
+        return 0
+    fi
+    
+    print_error "sing-box 安装失败，请检查网络连接"
+    return 1
 }
 
 # 一次性安装所有核心
@@ -2412,60 +2596,26 @@ main() {
 #===============================================================================
 
 SCRIPT_URL="https://raw.githubusercontent.com/Buxiulei/b-ui/main/b-ui-client.sh"
-# 国内可访问的镜像 (首选)
-SCRIPT_URL_JSR="https://cdn.jsdelivr.net/gh/Buxiulei/b-ui@main/b-ui-client.sh"
-SCRIPT_URL_GHPROXY="https://ghproxy.com/https://raw.githubusercontent.com/Buxiulei/b-ui/main/b-ui-client.sh"
 
 create_global_command() {
     print_info "创建全局命令 bui-c..."
     
-    local download_success=false
-    
-    # 方法1: 使用 jsdelivr CDN (国内可用)
-    print_info "尝试 jsdelivr CDN..."
-    if curl -fsSL --max-time 30 "$SCRIPT_URL_JSR" -o /usr/local/bin/bui-c 2>/dev/null; then
-        download_success=true
-    fi
-    
-    # 方法2: 使用 ghproxy 镜像
-    if [[ "$download_success" == "false" ]]; then
-        print_info "尝试 ghproxy 镜像..."
-        if curl -fsSL --max-time 30 "$SCRIPT_URL_GHPROXY" -o /usr/local/bin/bui-c 2>/dev/null; then
-            download_success=true
-        fi
-    fi
-    
-    # 方法3: 使用本地代理 (如果可用)
-    if [[ "$download_success" == "false" ]] && ss -tuln 2>/dev/null | grep -q ":1080 "; then
-        print_info "使用本地代理..."
-        if curl --socks5 127.0.0.1:1080 -fsSL --max-time 30 "$SCRIPT_URL" -o /usr/local/bin/bui-c 2>/dev/null; then
-            download_success=true
-        fi
-    fi
-    
-    # 方法4: 直接下载 (带超时，可能失败)
-    if [[ "$download_success" == "false" ]]; then
-        print_info "尝试直接下载..."
-        if curl -fsSL --max-time 30 "$SCRIPT_URL" -o /usr/local/bin/bui-c 2>/dev/null; then
-            download_success=true
-        fi
-    fi
-    
-    if [[ "$download_success" == "true" ]]; then
+    # 使用智能下载函数 (自动尝试多个镜像)
+    if smart_download "$SCRIPT_URL" "/usr/local/bin/bui-c" "b-ui-client.sh"; then
         chmod +x /usr/local/bin/bui-c
         # 验证下载是否成功 (文件应该超过 1000 行)
         local lines=$(wc -l < /usr/local/bin/bui-c 2>/dev/null || echo "0")
         if [[ "$lines" -gt 1000 ]]; then
             print_success "全局命令已创建，可使用 'sudo bui-c' 运行"
+            return 0
         else
             print_error "下载的文件不完整 (只有 $lines 行)"
             rm -f /usr/local/bin/bui-c
-            return 1
         fi
-    else
-        print_error "下载失败，请稍后重试或手动下载"
-        return 1
     fi
+    
+    print_error "下载失败，请稍后重试或手动下载"
+    return 1
 }
 
 
