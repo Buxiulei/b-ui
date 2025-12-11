@@ -282,8 +282,15 @@ check_old_version() {
     # 先执行路径迁移
     migrate_old_path
     
-    # 检测旧版单文件安装
-    if [[ -f "/usr/local/bin/b-ui" ]]; then
+    # 优先检测模块化版本（检查 version.json）
+    if [[ -f "${BASE_DIR}/version.json" ]]; then
+        local installed_version=$(jq -r '.version' "${BASE_DIR}/version.json" 2>/dev/null || echo "0")
+        print_info "检测到已安装版本: v${installed_version}"
+        return 1  # 已是模块化版本，走更新流程
+    fi
+    
+    # 检测旧版单文件安装（只有没有 version.json 时才认为是旧版本）
+    if [[ -f "/usr/local/bin/b-ui" ]] && [[ ! -f "${BASE_DIR}/version.json" ]]; then
         local old_version=$(grep -oP 'SCRIPT_VERSION="\K[^"]+' /usr/local/bin/b-ui 2>/dev/null || echo "未知")
         print_warning "检测到旧版本 B-UI (v${old_version})"
         echo ""
@@ -307,13 +314,6 @@ check_old_version() {
         fi
         
         return 0
-    fi
-    
-    # 检测模块化版本
-    if [[ -f "${BASE_DIR}/version.json" ]]; then
-        local installed_version=$(jq -r '.version' "${BASE_DIR}/version.json" 2>/dev/null || echo "0")
-        print_info "检测到已安装版本: v${installed_version}"
-        return 1  # 已是模块化版本，走更新流程
     fi
     
     return 2  # 全新安装
