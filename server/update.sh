@@ -17,7 +17,7 @@ NC='\033[0m'
 # 配置
 GITHUB_RAW="https://raw.githubusercontent.com/Buxiulei/b-ui/main"
 GITHUB_CDN="https://cdn.jsdelivr.net/gh/Buxiulei/b-ui@main"
-BASE_DIR="/opt/hysteria"
+BASE_DIR="/opt/b-ui"
 ADMIN_DIR="${BASE_DIR}/admin"
 
 # 打印函数

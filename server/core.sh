@@ -15,7 +15,7 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 # 路径配置
-BASE_DIR="/opt/hysteria"
+BASE_DIR="/opt/b-ui"
 CONFIG_FILE="${BASE_DIR}/config.yaml"
 USERS_FILE="${BASE_DIR}/users.json"
 ADMIN_DIR="${BASE_DIR}/admin"

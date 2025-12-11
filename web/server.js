@@ -4,7 +4,7 @@ const crypto = require("crypto");
 const { execSync, exec } = require("child_process");
 const path = require("path");
 // 从 version.json 读取版本号
-const BASE_DIR = process.env.BASE_DIR || "/opt/hysteria";
+const BASE_DIR = process.env.BASE_DIR || "/opt/b-ui";
 const ADMIN_DIR = process.env.ADMIN_DIR || path.join(BASE_DIR, "admin");
 
 function getVersion() {

@@ -15,7 +15,7 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 # 配置
-BASE_DIR="/opt/hysteria"
+BASE_DIR="/opt/b-ui"
 CONFIG_FILE="${BASE_DIR}/config.yaml"
 USERS_FILE="${BASE_DIR}/users.json"
 ADMIN_DIR="${BASE_DIR}/admin"
@@ -365,7 +365,7 @@ uninstall_all() {
     rm -f /usr/local/bin/hysteria
     rm -f /usr/local/bin/xray
     rm -rf /usr/local/share/xray
-    rm -rf /opt/hysteria
+    rm -rf /opt/b-ui
     rm -f /usr/local/bin/b-ui
     
     # 删除 Nginx 配置

@@ -19,7 +19,7 @@ NC='\033[0m'
 # 配置
 GITHUB_RAW="https://raw.githubusercontent.com/Buxiulei/b-ui/main"
 GITHUB_CDN="https://cdn.jsdelivr.net/gh/Buxiulei/b-ui@main"
-BASE_DIR="/opt/hysteria"
+BASE_DIR="/opt/b-ui"
 ADMIN_DIR="${BASE_DIR}/admin"
 
 # 动态获取版本号
@@ -221,10 +221,67 @@ download_all_files() {
 }
 
 #===============================================================================
-# 检测旧版本
+# 检测旧版本并迁移
 #===============================================================================
 
+OLD_BASE_DIR="/opt/hysteria"
+
+migrate_old_path() {
+    # 检测旧路径 /opt/hysteria 是否存在数据
+    if [[ -d "$OLD_BASE_DIR" ]] && [[ ! -d "$BASE_DIR" ]]; then
+        print_warning "检测到旧安装路径 /opt/hysteria"
+        print_info "正在迁移数据到新路径 /opt/b-ui..."
+        
+        # 创建新目录
+        mkdir -p "$BASE_DIR"
+        mkdir -p "$ADMIN_DIR"
+        
+        # 迁移所有文件
+        if [[ -f "${OLD_BASE_DIR}/users.json" ]]; then
+            cp "${OLD_BASE_DIR}/users.json" "${BASE_DIR}/"
+            print_info "  ✓ 迁移 users.json"
+        fi
+        if [[ -f "${OLD_BASE_DIR}/config.yaml" ]]; then
+            cp "${OLD_BASE_DIR}/config.yaml" "${BASE_DIR}/"
+            print_info "  ✓ 迁移 config.yaml"
+        fi
+        if [[ -f "${OLD_BASE_DIR}/xray-config.json" ]]; then
+            cp "${OLD_BASE_DIR}/xray-config.json" "${BASE_DIR}/"
+            print_info "  ✓ 迁移 xray-config.json"
+        fi
+        if [[ -f "${OLD_BASE_DIR}/reality-keys.json" ]]; then
+            cp "${OLD_BASE_DIR}/reality-keys.json" "${BASE_DIR}/"
+            print_info "  ✓ 迁移 reality-keys.json"
+        fi
+        
+        print_success "数据迁移完成"
+        
+        # 更新 systemd 服务中的路径
+        update_service_paths
+    fi
+}
+
+update_service_paths() {
+    # 更新 Hysteria 服务配置
+    if [[ -f "/etc/systemd/system/hysteria-server.service" ]]; then
+        sed -i 's|/opt/hysteria|/opt/b-ui|g' /etc/systemd/system/hysteria-server.service
+        print_info "  ✓ 更新 hysteria-server.service"
+    fi
+    
+    # 更新管理面板服务配置
+    if [[ -f "/etc/systemd/system/b-ui-admin.service" ]]; then
+        sed -i 's|/opt/hysteria|/opt/b-ui|g' /etc/systemd/system/b-ui-admin.service
+        print_info "  ✓ 更新 b-ui-admin.service"
+    fi
+    
+    # 重载 systemd
+    systemctl daemon-reload
+}
+
 check_old_version() {
+    # 先执行路径迁移
+    migrate_old_path
+    
     # 检测旧版单文件安装
     if [[ -f "/usr/local/bin/b-ui" ]]; then
         local old_version=$(grep -oP 'SCRIPT_VERSION="\K[^"]+' /usr/local/bin/b-ui 2>/dev/null || echo "未知")
@@ -309,7 +366,7 @@ create_global_command() {
     cat > /usr/local/bin/b-ui << 'CLIEOF'
 #!/bin/bash
 # B-UI 全局入口
-exec /opt/hysteria/b-ui-cli.sh "$@"
+exec /opt/b-ui/b-ui-cli.sh "$@"
 CLIEOF
     
     chmod +x /usr/local/bin/b-ui
