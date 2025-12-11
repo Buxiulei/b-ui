@@ -1035,6 +1035,10 @@ const HTML=`<!DOCTYPE html>
         /* Tags */
         .tag { padding: 4px 10px; border-radius: 6px; font-size: 11px; font-weight: 600; background: rgba(255,255,255,0.1); color: var(--text-dim); }
         .tag.on { background: rgba(50, 215, 75, 0.15); color: var(--success); }
+        .proto-tag { padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: 700; margin-left: 4px; }
+        .proto-hy2 { background: rgba(255, 159, 10, 0.2); color: #ff9f0a; }
+        .proto-vless { background: rgba(50, 215, 75, 0.2); color: #32d74b; }
+        .proto-ws { background: rgba(10, 132, 255, 0.2); color: #0a84ff; }
         
         /* Forms */
         input, select {
@@ -1276,7 +1280,7 @@ function load(){
             const on=o[x.username],monthly=x.usage?.monthly?.[m]||0,total=x.usage?.total||0;
             const exp=x.limits?.expiresAt?new Date(x.limits.expiresAt)<new Date():"",tlim=x.limits?.trafficLimit,over=tlim&&total>=tlim;
             const badge=exp?' <span class="tag" style="color:var(--danger)">EXPIRED</span>':(over?' <span class="tag" style="color:var(--danger)">LIMIT</span>':"");
-            const proto=x.protocol||"hysteria2",ptag=proto==="vless-reality"?'<span class="proto-tag proto-vless">VLESS</span>':'<span class="proto-tag proto-hy2">HY2</span>';
+            const proto=x.protocol||"hysteria2",ptag=proto==="vless-reality"?'<span class="proto-tag proto-vless">VLESS</span>':(proto==="vless-ws-tls"?'<span class="proto-tag proto-ws">WS</span>':'<span class="proto-tag proto-hy2">HY2</span>');
             
             return '<tr>'+
                 '<td><div style="display:flex;align-items:center;gap:8px"><span style="font-weight:600">'+esc(x.username)+'</span>'+ptag+badge+'</div></td>'+
