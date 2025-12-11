@@ -2,7 +2,7 @@
 
 基于 [Hysteria2](https://v2.hysteria.network/) 和 [Xray](https://github.com/XTLS/Xray-core) 的一键安装脚本，支持服务端和客户端部署，自带 Web 管理面板。
 
-**当前版本**: v2.3.0
+**当前版本**: v2.4.0 (模块化版本)
 
 ## ✨ 功能特性
 
@@ -19,6 +19,7 @@
 - ⚡ BBR 优化
 - 🖥️ `b-ui` 终端管理命令
 - 📡 **免流 SNI 选择** - 支持电信/联通/移动免流域名
+- 🔄 **自动更新** - 内置版本检查，一键更新面板
 
 ### 客户端
 - 🔌 **多协议导入** - Hysteria2 + VLESS-Reality + VLESS-WS 链接
@@ -38,14 +39,27 @@
 # 先切换到 root 用户
 sudo -i
 
-# 一键安装
-bash <(curl -fsSL https://raw.githubusercontent.com/Buxiulei/b-ui/main/b-ui-server.sh)
+# 一键安装（推荐）
+bash <(curl -fsSL https://raw.githubusercontent.com/Buxiulei/b-ui/main/install.sh)
 ```
 
-**国内镜像（推荐）：**
+**国内镜像：**
 ```bash
 sudo -i
-bash <(curl -fsSL https://cdn.jsdelivr.net/gh/Buxiulei/b-ui@main/b-ui-server.sh)
+bash <(curl -fsSL https://cdn.jsdelivr.net/gh/Buxiulei/b-ui@main/install.sh)
+```
+
+### 一键更新
+
+已安装的用户可以直接运行终端管理面板更新：
+```bash
+sudo b-ui
+# 选择 7. 检查 B-UI 更新
+```
+
+或者重新运行安装命令即可自动更新：
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/Buxiulei/b-ui/main/install.sh)
 ```
 
 ### 安装完成后
@@ -59,14 +73,15 @@ bash <(curl -fsSL https://cdn.jsdelivr.net/gh/Buxiulei/b-ui@main/b-ui-server.sh)
 ╔══════════════════════════════════════════════════════════════╗
 ║                    B-UI 操作菜单                            ║
 ╠══════════════════════════════════════════════════════════════╣
-║  1. 一键安装 (Hysteria2 + Xray + 管理面板)                    ║
-║  2. 查看客户端配置                                           ║
-║  3. 重启所有服务                                             ║
-║  4. 查看日志                                                 ║
+║  1. 查看客户端配置                                           ║
+║  2. 重启所有服务                                             ║
+║  3. 查看日志                                                 ║
+║  4. 修改管理密码                                             ║
 ║  5. 开启 BBR                                                 ║
 ║  6. 开机自启动设置                                           ║
-║  7. 更新内核 (Hysteria2 + Xray)                              ║
-║  8. 完全卸载                                                 ║
+║  7. 检查 B-UI 更新              <-- 新增                     ║
+║  8. 更新内核 (Hysteria2 + Xray)                              ║
+║  9. 完全卸载                                                 ║
 ║  0. 退出                                                     ║
 ╚══════════════════════════════════════════════════════════════╝
 ```

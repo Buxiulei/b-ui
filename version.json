@@ -1,0 +1,17 @@
+{
+    "version": "2.4.0",
+    "updated": "2025-12-11",
+    "files": [
+        "install.sh",
+        "server/core.sh",
+        "server/b-ui-cli.sh",
+        "server/update.sh",
+        "web/server.js",
+        "web/index.html",
+        "web/style.css",
+        "web/app.js"
+    ],
+    "changelog": {
+        "2.4.0": "模块化重构，支持自动更新"
+    }
+}

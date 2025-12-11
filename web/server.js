@@ -1,0 +1,494 @@
+const http = require("http");
+const fs = require("fs");
+const crypto = require("crypto");
+const { execSync, exec } = require("child_process");
+const path = require("path");
+
+const VERSION = "2.4.0";
+const BASE_DIR = process.env.BASE_DIR || "/opt/hysteria";
+const ADMIN_DIR = process.env.ADMIN_DIR || path.join(BASE_DIR, "admin");
+
+const CONFIG = {
+    port: process.env.ADMIN_PORT || 8080,
+    adminPassword: process.env.ADMIN_PASSWORD || "admin123",
+    jwtSecret: process.env.JWT_SECRET || crypto.randomBytes(32).toString("hex"),
+    hysteriaConfig: process.env.HYSTERIA_CONFIG || `${BASE_DIR}/config.yaml`,
+    xrayConfig: process.env.XRAY_CONFIG || `${BASE_DIR}/xray-config.json`,
+    xrayKeysFile: process.env.XRAY_KEYS || `${BASE_DIR}/reality-keys.json`,
+    usersFile: process.env.USERS_FILE || `${BASE_DIR}/users.json`,
+    trafficPort: 9999,
+    xrayApiPort: 10085
+};
+
+// --- Security: Rate Limiting & Audit ---
+const loginAttempts = {};
+const RATE_LIMIT = { maxAttempts: 5, windowMs: 300000 };
+
+function checkRateLimit(ip) {
+    const now = Date.now(), rec = loginAttempts[ip];
+    if (!rec) return true;
+    if (now - rec.first > RATE_LIMIT.windowMs) { delete loginAttempts[ip]; return true; }
+    return rec.count < RATE_LIMIT.maxAttempts;
+}
+
+function recordAttempt(ip, success) {
+    const now = Date.now(), rec = loginAttempts[ip];
+    if (!rec) loginAttempts[ip] = { first: now, count: 1 };
+    else rec.count++;
+    if (success) delete loginAttempts[ip];
+    log("AUDIT", ip + " login " + (success ? "SUCCESS" : "FAILED") + " (attempts: " + (loginAttempts[ip]?.count || 0) + ")");
+}
+
+function getClientIP(req) {
+    return req.headers["x-forwarded-for"]?.split(",")[0].trim() || req.socket.remoteAddress || "unknown";
+}
+
+// --- Backend Logic ---
+function log(l, m) { console.log("[" + new Date().toISOString() + "] [" + l + "] " + m); }
+
+function genToken(d) {
+    const p = Buffer.from(JSON.stringify({ ...d, exp: Date.now() + 864e5, iat: Date.now() })).toString("base64");
+    return p + "." + crypto.createHmac("sha256", CONFIG.jwtSecret).update(p).digest("hex");
+}
+
+function verifyToken(t) {
+    try {
+        const [p, s] = t.split(".");
+        if (s !== crypto.createHmac("sha256", CONFIG.jwtSecret).update(p).digest("hex")) return null;
+        const d = JSON.parse(Buffer.from(p, "base64").toString());
+        return d.exp < Date.now() ? null : d;
+    } catch { return null; }
+}
+
+function parseBody(r) {
+    return new Promise(s => {
+        let b = "";
+        r.on("data", c => b += c);
+        r.on("end", () => { try { s(b ? JSON.parse(b) : {}); } catch { s({}); } });
+    });
+}
+
+function sendJSON(r, d, s = 200, headers = {}) {
+    r.writeHead(s, {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "*",
+        "Access-Control-Allow-Headers": "*",
+        ...headers
+    });
+    r.end(JSON.stringify(d));
+}
+
+function loadUsers() {
+    try {
+        return fs.existsSync(CONFIG.usersFile) ? JSON.parse(fs.readFileSync(CONFIG.usersFile, "utf8")) : [];
+    } catch { return []; }
+}
+
+function saveUsers(u) {
+    try {
+        fs.writeFileSync(CONFIG.usersFile, JSON.stringify(u, null, 2));
+        updateHysteriaConfig(u.filter(x => !x.protocol || x.protocol === "hysteria2"));
+        updateXrayConfig(u.filter(x => x.protocol === "vless-reality"), u.filter(x => x.protocol === "vless-ws-tls"));
+        return true;
+    } catch { return false; }
+}
+
+function updateHysteriaConfig(users) {
+    try {
+        let c = fs.readFileSync(CONFIG.hysteriaConfig, "utf8");
+        const up = users.reduce((a, u) => { a[u.username] = u.password; return a; }, {});
+        const auth = "auth:\n  type: userpass\n  userpass:\n" + Object.entries(up).map(([u, p]) => "    " + u + ": " + p).join("\n");
+        c = c.replace(/auth:[\s\S]*?(?=\n[a-zA-Z]|$)/, auth + "\n\n");
+        fs.writeFileSync(CONFIG.hysteriaConfig, c);
+        execSync("systemctl restart hysteria-server", { stdio: "pipe" });
+    } catch (e) { log("ERROR", "Hysteria: " + e.message); }
+}
+
+function updateXrayConfig(realityUsers, wsUsers = []) {
+    try {
+        if (!fs.existsSync(CONFIG.xrayConfig)) return;
+        let c = JSON.parse(fs.readFileSync(CONFIG.xrayConfig, "utf8"));
+
+        // Update Reality inbound
+        const realityClients = realityUsers.map(u => ({ id: u.uuid, flow: "xtls-rprx-vision", email: u.username }));
+        const inbound = c.inbounds.find(i => i.tag === "vless-reality");
+        if (inbound) {
+            inbound.settings.clients = realityClients;
+            const userSnis = realityUsers.filter(u => u.sni).map(u => u.sni);
+            const baseSni = inbound.streamSettings?.realitySettings?.dest?.split(":")[0] || "www.bing.com";
+            const allSnis = [...new Set([baseSni, ...userSnis])];
+            if (inbound.streamSettings?.realitySettings) inbound.streamSettings.realitySettings.serverNames = allSnis;
+        }
+
+        // Update WS+TLS inbound
+        const wsClients = wsUsers.map(u => ({ id: u.uuid, email: u.username }));
+        let wsInbound = c.inbounds.find(i => i.tag === "vless-ws-tls");
+        if (wsUsers.length > 0) {
+            if (!wsInbound) {
+                const hc = fs.readFileSync(CONFIG.hysteriaConfig, "utf8");
+                const dm = hc.match(/\/live\/([^\/]+)\/fullchain/);
+                const domain = dm ? dm[1] : "localhost";
+                wsInbound = {
+                    tag: "vless-ws-tls",
+                    port: 10002,
+                    protocol: "vless",
+                    settings: { clients: wsClients, decryption: "none" },
+                    streamSettings: {
+                        network: "ws",
+                        security: "tls",
+                        tlsSettings: {
+                            serverName: domain,
+                            certificates: [{
+                                certificateFile: "/etc/letsencrypt/live/" + domain + "/fullchain.pem",
+                                keyFile: "/etc/letsencrypt/live/" + domain + "/privkey.pem"
+                            }]
+                        },
+                        wsSettings: { path: "/ws", headers: {} }
+                    }
+                };
+                c.inbounds.push(wsInbound);
+            } else {
+                wsInbound.settings.clients = wsClients;
+            }
+        }
+        fs.writeFileSync(CONFIG.xrayConfig, JSON.stringify(c, null, 2));
+        execSync("systemctl restart xray 2>/dev/null||true", { stdio: "pipe" });
+    } catch (e) { log("ERROR", "Xray: " + e.message); }
+}
+
+function getConfig() {
+    try {
+        let dm, pm;
+        const hc = fs.readFileSync(CONFIG.hysteriaConfig, "utf8");
+        dm = hc.match(/\/live\/([^\/]+)\/fullchain/);
+        pm = hc.match(/listen:\s*:(\d+)/);
+        let xrayPort = 10001, pubKey = "", shortId = "", sni = "www.bing.com";
+        try {
+            const xc = JSON.parse(fs.readFileSync(CONFIG.xrayConfig, "utf8"));
+            const xi = xc.inbounds.find(i => i.tag === "vless-reality");
+            if (xi) {
+                xrayPort = xi.port;
+                const dest = xi.streamSettings?.realitySettings?.dest || "";
+                sni = dest.split(":")[0] || "www.bing.com";
+                shortId = xi.streamSettings?.realitySettings?.shortIds?.[0] || "";
+            }
+        } catch { }
+        try {
+            const k = JSON.parse(fs.readFileSync(CONFIG.xrayKeysFile, "utf8"));
+            pubKey = k.publicKey || "";
+            shortId = shortId || k.shortId || "";
+        } catch { }
+        return { domain: dm ? dm[1] : "localhost", port: pm ? pm[1] : "443", xrayPort, pubKey, shortId, sni };
+    } catch {
+        return { domain: "localhost", port: "443", xrayPort: 10001, pubKey: "", shortId: "", sni: "www.bing.com" };
+    }
+}
+
+function fetchStats(ep) {
+    return new Promise(s => {
+        const r = http.request({
+            hostname: "127.0.0.1",
+            port: CONFIG.trafficPort,
+            path: ep,
+            method: "GET"
+        }, res => {
+            let d = "";
+            res.on("data", c => d += c);
+            res.on("end", () => { try { s(JSON.parse(d)); } catch { s({}); } });
+        });
+        r.on("error", () => s({}));
+        r.setTimeout(3e3, () => { r.destroy(); s({}); });
+        r.end();
+    });
+}
+
+function postStats(ep, b) {
+    return new Promise(s => {
+        const d = JSON.stringify(b);
+        const r = http.request({
+            hostname: "127.0.0.1",
+            port: CONFIG.trafficPort,
+            path: ep,
+            method: "POST",
+            headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(d) }
+        }, res => s(res.statusCode === 200));
+        r.on("error", () => s(false));
+        r.write(d);
+        r.end();
+    });
+}
+
+// --- Traffic Tracking ---
+function getCurrentMonth() { return new Date().toISOString().slice(0, 7); }
+
+function checkUserLimits(u) {
+    const now = Date.now(), m = getCurrentMonth();
+    if (u.limits?.expiresAt && new Date(u.limits.expiresAt).getTime() < now) return { ok: false, reason: "expired" };
+    if (u.limits?.trafficLimit && (u.usage?.total || 0) >= u.limits.trafficLimit) return { ok: false, reason: "traffic_exceeded" };
+    if (u.limits?.monthlyLimit && (u.usage?.monthly?.[m] || 0) >= u.limits.monthlyLimit) return { ok: false, reason: "monthly_exceeded" };
+    return { ok: true };
+}
+
+function handleManage(params, res) {
+    const key = params.get("key"), action = params.get("action"), user = params.get("user");
+    if (key !== CONFIG.adminPassword) return sendJSON(res, { error: "Invalid key" }, 403);
+    if (!action) return sendJSON(res, { error: "Missing action" }, 400);
+    const users = loadUsers();
+
+    if (action === "create") {
+        if (!user) return sendJSON(res, { error: "Missing user" }, 400);
+        if (users.find(u => u.username === user)) return sendJSON(res, { error: "User exists" }, 400);
+        const protocol = params.get("protocol") || "hysteria2";
+        const pass = params.get("pass") || ((protocol === "vless-reality" || protocol === "vless-ws-tls") ? crypto.randomUUID() : crypto.randomBytes(8).toString("hex"));
+        const days = parseInt(params.get("days")) || 0;
+        const traffic = parseFloat(params.get("traffic")) || 0;
+        const monthly = parseFloat(params.get("monthly")) || 0;
+        const speed = parseFloat(params.get("speed")) || 0;
+        const sni = params.get("sni") || "www.bing.com";
+        const newUser = { username: user, protocol, createdAt: new Date().toISOString(), limits: {}, usage: { total: 0, monthly: {} } };
+        if (protocol === "vless-reality" || protocol === "vless-ws-tls") { newUser.uuid = pass; newUser.sni = sni; } else { newUser.password = pass; }
+        if (days > 0) newUser.limits.expiresAt = new Date(Date.now() + days * 864e5).toISOString();
+        if (traffic > 0) newUser.limits.trafficLimit = traffic * 1073741824;
+        if (monthly > 0) newUser.limits.monthlyLimit = monthly * 1073741824;
+        if (speed > 0) newUser.limits.speedLimit = speed * 1000000;
+        users.push(newUser);
+        if (saveUsers(users)) return sendJSON(res, { success: true, user: user, password: pass, sni: sni });
+        return sendJSON(res, { error: "Save failed" }, 500);
+    }
+
+    if (action === "delete") {
+        if (!user) return sendJSON(res, { error: "Missing user" }, 400);
+        const idx = users.findIndex(u => u.username === user);
+        if (idx < 0) return sendJSON(res, { error: "User not found" }, 404);
+        users.splice(idx, 1);
+        if (saveUsers(users)) return sendJSON(res, { success: true });
+        return sendJSON(res, { error: "Save failed" }, 500);
+    }
+
+    if (action === "update") {
+        if (!user) return sendJSON(res, { error: "Missing user" }, 400);
+        const u = users.find(x => x.username === user);
+        if (!u) return sendJSON(res, { error: "User not found" }, 404);
+        const days = params.get("days"), traffic = params.get("traffic"), monthly = params.get("monthly"), pass = params.get("pass");
+        if (!u.limits) u.limits = {};
+        if (days !== null) u.limits.expiresAt = parseInt(days) > 0 ? new Date(Date.now() + parseInt(days) * 864e5).toISOString() : null;
+        if (traffic !== null) u.limits.trafficLimit = parseFloat(traffic) > 0 ? parseFloat(traffic) * 1073741824 : null;
+        if (monthly !== null) u.limits.monthlyLimit = parseFloat(monthly) > 0 ? parseFloat(monthly) * 1073741824 : null;
+        if (pass) u.password = pass;
+        if (saveUsers(users)) return sendJSON(res, { success: true });
+        return sendJSON(res, { error: "Save failed" }, 500);
+    }
+
+    if (action === "list") return sendJSON(res, users.map(u => ({ username: u.username, limits: u.limits, usage: u.usage })));
+    return sendJSON(res, { error: "Unknown action" }, 400);
+}
+
+// --- Load HTML from file ---
+function loadHTML() {
+    try {
+        const htmlPath = path.join(ADMIN_DIR, "index.html");
+        let html = fs.readFileSync(htmlPath, "utf8");
+        html = html.replace(/\${VERSION}/g, VERSION);
+        return html;
+    } catch (e) {
+        log("ERROR", "Failed to load index.html: " + e.message);
+        return `<!DOCTYPE html><html><body><h1>Error loading panel</h1><p>${e.message}</p></body></html>`;
+    }
+}
+
+// --- Traffic Sync Loop ---
+let lastTraffic = {};
+setInterval(async () => {
+    try {
+        const stats = await fetchStats("/traffic");
+        let users = loadUsers();
+        let changed = false;
+        const now = new Date();
+        const m = now.toISOString().slice(0, 7);
+
+        for (const [uName, stat] of Object.entries(stats)) {
+            const u = users.find(x => x.username === uName);
+            if (!u) continue;
+
+            if (!u.usage) u.usage = { total: 0, monthly: {} };
+            if (!u.usage.monthly) u.usage.monthly = {};
+
+            const last = lastTraffic[uName] || { tx: 0, rx: 0 };
+            const deltaTx = (stat.tx < last.tx) ? stat.tx : (stat.tx - last.tx);
+            const deltaRx = (stat.rx < last.rx) ? stat.rx : (stat.rx - last.rx);
+
+            if (deltaTx > 0 || deltaRx > 0) {
+                const totalDelta = deltaTx + deltaRx;
+                u.usage.total = (u.usage.total || 0) + totalDelta;
+                u.usage.monthly[m] = (u.usage.monthly[m] || 0) + totalDelta;
+                changed = true;
+            }
+
+            lastTraffic[uName] = stat;
+        }
+
+        if (changed) {
+            try { fs.writeFileSync(CONFIG.usersFile, JSON.stringify(users, null, 2)); }
+            catch (e) { log("ERROR", "Save usage: " + e.message); }
+        }
+    } catch (e) {
+        console.error("Traffic sync failed:", e);
+    }
+}, 10000);
+
+// --- Server Startup ---
+const server = http.createServer(async (req, res) => {
+    const u = new URL(req.url, `http://${req.headers.host}`), p = u.pathname;
+
+    if (req.method === "OPTIONS") {
+        res.writeHead(200, {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "*",
+            "Access-Control-Allow-Headers": "*"
+        });
+        return res.end();
+    }
+
+    // Serve static files
+    if (p === "/" || p === "/index.html") {
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+        return res.end(loadHTML());
+    }
+
+    if (p === "/style.css") {
+        try {
+            const css = fs.readFileSync(path.join(ADMIN_DIR, "style.css"), "utf8");
+            res.writeHead(200, { "Content-Type": "text/css; charset=utf-8" });
+            return res.end(css);
+        } catch { return sendJSON(res, { error: "Not found" }, 404); }
+    }
+
+    if (p === "/app.js") {
+        try {
+            const js = fs.readFileSync(path.join(ADMIN_DIR, "app.js"), "utf8");
+            res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
+            return res.end(js);
+        } catch { return sendJSON(res, { error: "Not found" }, 404); }
+    }
+
+    // API routes
+    if (p.startsWith("/api/")) {
+        const r = p.slice(5);
+        const clientIP = getClientIP(req);
+
+        try {
+            if (r === "login" && req.method === "POST") {
+                const b = await parseBody(req);
+                if (!checkRateLimit(clientIP)) {
+                    recordAttempt(clientIP, false);
+                    return sendJSON(res, { error: "Too many attempts. Try again later." }, 429);
+                }
+                const ok = b.password === CONFIG.adminPassword;
+                recordAttempt(clientIP, ok);
+                if (ok) return sendJSON(res, { token: genToken({ admin: true }) });
+                else return sendJSON(res, { error: "Auth failed" }, 401);
+            }
+
+            if (r === "manage") return handleManage(u.searchParams, res);
+
+            const auth = verifyToken((req.headers.authorization || "").replace("Bearer ", ""));
+            if (!auth) return sendJSON(res, { error: "Unauthorized" }, 401);
+
+            if (r === "users") {
+                if (req.method === "GET") return sendJSON(res, loadUsers());
+                if (req.method === "POST") {
+                    const b = await parseBody(req), users = loadUsers();
+                    if (users.find(u => u.username === b.username)) return sendJSON(res, { error: "Exists" }, 400);
+                    users.push({
+                        username: b.username,
+                        password: b.password || crypto.randomBytes(8).toString("hex"),
+                        createdAt: new Date()
+                    });
+                    return saveUsers(users) ? sendJSON(res, { success: true }) : sendJSON(res, { error: "Save failed" }, 500);
+                }
+            }
+
+            if (r.startsWith("users/") && req.method === "DELETE") {
+                let users = loadUsers();
+                users = users.filter(u => u.username !== decodeURIComponent(r.slice(6)));
+                return saveUsers(users) ? sendJSON(res, { success: true }) : sendJSON(res, { error: "Fail" }, 500);
+            }
+
+            if (r === "stats") return sendJSON(res, await fetchStats("/traffic"));
+            if (r === "online") return sendJSON(res, await fetchStats("/online"));
+            if (r === "kick" && req.method === "POST") return sendJSON(res, await postStats("/kick", await parseBody(req)));
+            if (r === "config") return sendJSON(res, getConfig());
+
+            if (r === "masquerade") {
+                const masqFile = CONFIG.hysteriaConfig.replace("config.yaml", "masquerade.json");
+                if (req.method === "GET") {
+                    try {
+                        const m = JSON.parse(fs.readFileSync(masqFile, "utf8"));
+                        return sendJSON(res, m);
+                    } catch {
+                        return sendJSON(res, { masqueradeUrl: "https://www.bing.com/", masqueradeDomain: "www.bing.com" });
+                    }
+                }
+                if (req.method === "POST") {
+                    const b = await parseBody(req);
+                    if (!b.url) return sendJSON(res, { error: "URL required" }, 400);
+                    const domain = b.url.replace(/https?:\/\/([^/:]+).*/, "$1") || "www.bing.com";
+                    try {
+                        fs.writeFileSync(masqFile, JSON.stringify({ masqueradeUrl: b.url, masqueradeDomain: domain }, null, 2));
+                        let hyc = fs.readFileSync(CONFIG.hysteriaConfig, "utf8");
+                        hyc = hyc.replace(/masquerade:[\s\S]*?(?=\n[a-zA-Z]|$)/, `masquerade:\n  type: proxy\n  proxy:\n    url: ${b.url}\n    rewriteHost: true`);
+                        fs.writeFileSync(CONFIG.hysteriaConfig, hyc);
+                        if (fs.existsSync(CONFIG.xrayConfig)) {
+                            let xc = JSON.parse(fs.readFileSync(CONFIG.xrayConfig, "utf8"));
+                            const xi = xc.inbounds.find(i => i.tag === "vless-reality");
+                            if (xi && xi.streamSettings?.realitySettings) {
+                                xi.streamSettings.realitySettings.dest = domain + ":443";
+                                xi.streamSettings.realitySettings.serverNames = [domain];
+                            }
+                            fs.writeFileSync(CONFIG.xrayConfig, JSON.stringify(xc, null, 2));
+                            execSync("systemctl restart xray 2>/dev/null||true", { stdio: "pipe" });
+                        }
+                        execSync("systemctl restart hysteria-server 2>/dev/null||true", { stdio: "pipe" });
+                        return sendJSON(res, { success: true, domain });
+                    } catch (e) { return sendJSON(res, { error: e.message }, 500); }
+                }
+            }
+
+            if (r === "password" && req.method === "POST") {
+                const b = await parseBody(req);
+                if (!b.newPassword || b.newPassword.length < 6) return sendJSON(res, { error: "密码至少6位" }, 400);
+                try {
+                    const svc = "/etc/systemd/system/b-ui-admin.service";
+                    let c = fs.readFileSync(svc, "utf8");
+                    c = c.replace(/ADMIN_PASSWORD=[^\n]*/, "ADMIN_PASSWORD=" + b.newPassword);
+                    fs.writeFileSync(svc, c);
+                    execSync("systemctl daemon-reload");
+                    return sendJSON(res, { success: true, message: "密码已更新，请重新登录" });
+                } catch (e) { return sendJSON(res, { error: e.message }, 500); }
+            }
+        } catch (e) { return sendJSON(res, { error: e.message }, 500); }
+    }
+
+    // Hysteria2 HTTP Auth Endpoint
+    if (p === "/auth/hysteria" && req.method === "POST") {
+        const body = await parseBody(req);
+        const authStr = body.auth || "";
+        const [username, password] = authStr.split(":");
+        const users = loadUsers();
+        const user = users.find(u => u.username === username && u.password === password);
+        if (user) {
+            const check = checkUserLimits(user);
+            if (check.ok) {
+                return sendJSON(res, { ok: true, id: username });
+            } else {
+                return sendJSON(res, { ok: false, id: username });
+            }
+        }
+        return sendJSON(res, { ok: false });
+    }
+
+    sendJSON(res, { error: "Not found" }, 404);
+});
+
+server.listen(CONFIG.port, () => console.log(`B-UI Admin Panel v${VERSION} running on port ${CONFIG.port}`));
