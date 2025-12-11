@@ -1856,21 +1856,114 @@ create_service() {
     cat > "/etc/systemd/system/$CLIENT_SERVICE" << EOF
 [Unit]
 Description=Hysteria2 Client
-After=network.target
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
 
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/hysteria client --config ${CONFIG_FILE}
 Restart=always
-RestartSec=5
+RestartSec=3
 LimitNOFILE=1048576
+
+# 防止服务频繁崩溃时无限重启
+StartLimitAction=none
+
+# 网络断开时自动重连
+TimeoutStartSec=30
+TimeoutStopSec=10
+
+# 看门狗（如连接断开时自动重启）
+WatchdogSec=60
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
+    # 创建健康检查定时任务
+    create_health_check
+
     systemctl daemon-reload
-    print_success "服务已创建"
+    print_success "服务已创建（含自动重启和健康检查）"
+}
+
+# 健康检查脚本
+create_health_check() {
+    local check_script="/opt/hysteria-client/health-check.sh"
+    
+    cat > "$check_script" << 'HEALTHEOF'
+#!/bin/bash
+# Hysteria2 客户端健康检查
+# 每分钟检测服务状态，如果异常则重启
+
+SERVICE="hysteria-client.service"
+LOG_FILE="/var/log/hysteria-health.log"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
+}
+
+# 检查服务是否运行
+if ! systemctl is-active --quiet "$SERVICE"; then
+    log "服务异常，正在重启..."
+    systemctl restart "$SERVICE"
+    sleep 5
+    if systemctl is-active --quiet "$SERVICE"; then
+        log "服务重启成功"
+    else
+        log "服务重启失败！"
+    fi
+    exit 0
+fi
+
+# 检查是否能建立连接（通过 SOCKS5 代理测试）
+SOCKS_PORT=$(grep -oP 'socks5\.listen.*:\K[0-9]+' /opt/hysteria-client/config.yaml 2>/dev/null || echo "1080")
+
+if command -v curl &>/dev/null; then
+    # 尝试通过代理访问测试
+    if ! timeout 10 curl -x socks5h://127.0.0.1:${SOCKS_PORT} -s -o /dev/null -w "%{http_code}" https://www.google.com 2>/dev/null | grep -q "200\|301\|302"; then
+        log "连接测试失败，正在重启服务..."
+        systemctl restart "$SERVICE"
+        sleep 5
+        if systemctl is-active --quiet "$SERVICE"; then
+            log "服务重启成功"
+        else
+            log "服务重启失败！"
+        fi
+    fi
+fi
+HEALTHEOF
+
+    chmod +x "$check_script"
+    
+    # 创建 systemd timer
+    cat > /etc/systemd/system/hysteria-health.service << EOF
+[Unit]
+Description=Hysteria2 Health Check
+
+[Service]
+Type=oneshot
+ExecStart=$check_script
+EOF
+
+    cat > /etc/systemd/system/hysteria-health.timer << EOF
+[Unit]
+Description=Hysteria2 Health Check Timer
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable hysteria-health.timer 2>/dev/null
+    systemctl start hysteria-health.timer 2>/dev/null
 }
 
 start_client() {
