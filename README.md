@@ -2,25 +2,28 @@
 
 基于 [Hysteria2](https://v2.hysteria.network/) 和 [Xray](https://github.com/XTLS/Xray-core) 的一键安装脚本，支持服务端和客户端部署，自带 Web 管理面板。
 
+**当前版本**: v2.3.0
+
 ## ✨ 功能特性
 
 ### 服务端 (B-UI)
-- 🚀 **双协议支持** - Hysteria2 + VLESS-Reality
+- 🚀 **三协议支持** - Hysteria2 + VLESS-Reality + VLESS-WS-TLS
 - 👥 多用户管理 (Web 面板)
 - 📊 流量统计 / 在线状态 / 月度流量
 - 📱 二维码分享 (兼容 v2rayN / v2rayNG / Shadowrocket)
 - ⏱️ 用户时长/流量限制
-- 🔐 自动 HTTPS 证书 (Let's Encrypt)
+- 🔐 自动 HTTPS 证书 (Let's Encrypt，智能复用)
 - 🔑 管理密码可修改 (Web + 终端)
-- � 伪装网站配置 (双协议统一)
-- �🌐 URL API 管理接口
+- 🎭 伪装网站配置 (双协议统一)
+- 🌐 URL API 管理接口
 - ⚡ BBR 优化
 - 🖥️ `b-ui` 终端管理命令
+- 📡 **免流 SNI 选择** - 支持电信/联通/移动免流域名
 
 ### 客户端
-- 🔌 **双协议导入** - Hysteria2 + VLESS-Reality 链接
+- 🔌 **多协议导入** - Hysteria2 + VLESS-Reality + VLESS-WS 链接
 - 🌍 TUN 全局代理模式
-- ️ SSH 连接保护
+- 🛡️ SSH 连接保护
 - 📋 路由规则 (域名/IP 绕过)
 - 🔄 内核一键更新
 - 🖥️ `b-ui-client` 终端管理命令
@@ -86,8 +89,9 @@ bash <(curl -fsSL https://cdn.jsdelivr.net/gh/Buxiulei/b-ui@main/b-ui-server.sh)
 |------|------|
 | key | 管理密码 (必填) |
 | user | 用户名 (必填) |
-| protocol | 协议类型: `hysteria2` 或 `vless-reality` |
-| pass | 密码 (可选，留空自动生成) |
+| protocol | 协议类型: `hysteria2`、`vless-reality` 或 `vless-ws-tls` |
+| pass | 密码/UUID (可选，留空自动生成) |
+| sni | SNI/Host 域名 (可选，默认 www.bing.com) |
 | days | 有效天数 (0=永久) |
 | traffic | 总流量限制 GB (0=不限) |
 | monthly | 月流量限制 GB (0=不限) |
@@ -167,6 +171,7 @@ curl https://www.google.com
 | 443 | TCP | 管理面板 (HTTPS) |
 | 10000 | **UDP** | Hysteria2 代理 |
 | 10001 | TCP | VLESS-Reality 代理 |
+| 10002 | TCP | VLESS-WS-TLS 代理 (免流测试) |
 
 ---
 
