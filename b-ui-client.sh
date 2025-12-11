@@ -2732,10 +2732,21 @@ SCRIPT_URL="https://raw.githubusercontent.com/Buxiulei/b-ui/main/b-ui-client.sh"
 create_global_command() {
     print_info "创建全局命令 bui-c..."
     
-    # 使用智能下载函数 (自动尝试多个镜像)
+    # 优先从服务端下载
+    if download_from_server "b-ui-client.sh" "/usr/local/bin/bui-c"; then
+        chmod +x /usr/local/bin/bui-c
+        local lines=$(wc -l < /usr/local/bin/bui-c 2>/dev/null || echo "0")
+        if [[ "$lines" -gt 1000 ]]; then
+            print_success "全局命令已创建 (从服务端下载)"
+            return 0
+        fi
+        rm -f /usr/local/bin/bui-c
+    fi
+    
+    # 降级到镜像下载
+    print_info "服务端下载失败，尝试镜像..."
     if smart_download "$SCRIPT_URL" "/usr/local/bin/bui-c" "b-ui-client.sh"; then
         chmod +x /usr/local/bin/bui-c
-        # 验证下载是否成功 (文件应该超过 1000 行)
         local lines=$(wc -l < /usr/local/bin/bui-c 2>/dev/null || echo "0")
         if [[ "$lines" -gt 1000 ]]; then
             print_success "全局命令已创建，可使用 'sudo bui-c' 运行"
