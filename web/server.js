@@ -229,6 +229,82 @@ function postStats(ep, b) {
     });
 }
 
+// --- Xray Stats API (gRPC via CLI) ---
+let lastXrayTraffic = {};
+
+function fetchXrayUserStats() {
+    // 获取所有 VLESS 用户的流量统计
+    // Xray stats 格式: user>>>email>>>traffic>>>uplink/downlink
+    const result = {};
+    try {
+        const users = loadUsers().filter(u => u.protocol === "vless-reality" || u.protocol === "vless-ws-tls");
+        for (const u of users) {
+            const email = u.username;
+            try {
+                // 查询 uplink (上传流量)
+                const upCmd = `xray api stats --server=127.0.0.1:${CONFIG.xrayApiPort} -name "user>>>${email}>>>traffic>>>uplink" 2>/dev/null || echo "{}"`;
+                const upResult = execSync(upCmd, { encoding: "utf8", timeout: 3000 }).trim();
+                let tx = 0;
+                try {
+                    const upJson = JSON.parse(upResult);
+                    tx = upJson.stat?.value || 0;
+                } catch { }
+
+                // 查询 downlink (下载流量)
+                const downCmd = `xray api stats --server=127.0.0.1:${CONFIG.xrayApiPort} -name "user>>>${email}>>>traffic>>>downlink" 2>/dev/null || echo "{}"`;
+                const downResult = execSync(downCmd, { encoding: "utf8", timeout: 3000 }).trim();
+                let rx = 0;
+                try {
+                    const downJson = JSON.parse(downResult);
+                    rx = downJson.stat?.value || 0;
+                } catch { }
+
+                if (tx > 0 || rx > 0) {
+                    result[email] = { tx, rx };
+                }
+            } catch (e) {
+                // 忽略单个用户查询失败
+            }
+        }
+    } catch (e) {
+        log("WARN", "Xray stats query failed: " + e.message);
+    }
+    return result;
+}
+
+function fetchXrayOnline() {
+    // 通过检测流量变化判断 VLESS 用户是否在线
+    // 如果用户在过去 10 秒内有流量变化，则认为在线
+    const result = {};
+    try {
+        const currentStats = fetchXrayUserStats();
+        for (const [email, stat] of Object.entries(currentStats)) {
+            const last = lastXrayTraffic[email] || { tx: 0, rx: 0 };
+            // 如果有流量变化，认为在线
+            if (stat.tx > last.tx || stat.rx > last.rx) {
+                result[email] = 1; // 1 表示有一个连接
+            }
+            lastXrayTraffic[email] = stat;
+        }
+    } catch (e) {
+        log("WARN", "Xray online check failed: " + e.message);
+    }
+    return result;
+}
+
+// 合并 Hysteria2 和 Xray 的统计数据
+async function getMergedStats() {
+    const hy2Stats = await fetchStats("/traffic");
+    const xrayStats = fetchXrayUserStats();
+    return { ...hy2Stats, ...xrayStats };
+}
+
+async function getMergedOnline() {
+    const hy2Online = await fetchStats("/online");
+    const xrayOnline = fetchXrayOnline();
+    return { ...hy2Online, ...xrayOnline };
+}
+
 // --- Traffic Tracking ---
 function getCurrentMonth() { return new Date().toISOString().slice(0, 7); }
 
@@ -311,7 +387,8 @@ function loadHTML() {
 let lastTraffic = {};
 setInterval(async () => {
     try {
-        const stats = await fetchStats("/traffic");
+        // 合并 Hysteria2 和 Xray 的流量统计
+        const stats = await getMergedStats();
         let users = loadUsers();
         let changed = false;
         const now = new Date();
@@ -425,8 +502,8 @@ const server = http.createServer(async (req, res) => {
                 return saveUsers(users) ? sendJSON(res, { success: true }) : sendJSON(res, { error: "Fail" }, 500);
             }
 
-            if (r === "stats") return sendJSON(res, await fetchStats("/traffic"));
-            if (r === "online") return sendJSON(res, await fetchStats("/online"));
+            if (r === "stats") return sendJSON(res, await getMergedStats());
+            if (r === "online") return sendJSON(res, await getMergedOnline());
             if (r === "kick" && req.method === "POST") return sendJSON(res, await postStats("/kick", await parseBody(req)));
             if (r === "config") return sendJSON(res, getConfig());
 

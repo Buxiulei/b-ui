@@ -193,14 +193,15 @@ curl https://www.google.com
 ## 📁 文件结构
 
 ```
-/opt/hysteria/               # 服务端数据目录
+/opt/b-ui/                   # 服务端数据目录
 ├── config.yaml              # Hysteria2 配置
 ├── xray-config.json         # Xray 配置
 ├── reality-keys.json        # Reality 密钥
 ├── masquerade.json          # 伪装网站配置
 ├── users.json               # 用户数据 (含流量统计)
 └── admin/                   # 管理面板
-    └── server.js
+    ├── server.js
+    └── app.js
 
 /usr/local/bin/b-ui          # 服务端终端命令
 /usr/local/bin/b-ui-client   # 客户端终端命令

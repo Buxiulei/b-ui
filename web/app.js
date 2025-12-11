@@ -77,10 +77,27 @@ function init() {
 function load() {
     Promise.all([api("/users"), api("/online"), api("/stats")]).then(([u, o, s]) => {
         $("#st-u").innerText = u.length;
-        $("#st-o").innerText = Object.keys(o).length;
+        // 在线设备：累加所有用户的连接数
+        let totalOnline = 0;
+        Object.values(o).forEach(v => { totalOnline += (typeof v === 'number' ? v : 1); });
+        $("#st-o").innerText = totalOnline;
 
+        // 流量统计：使用用户的历史累计流量（与用户列表一致）
         let tu = 0, td = 0;
-        Object.values(s).forEach(v => { tu += v.tx || 0; td += v.rx || 0; });
+        u.forEach(x => {
+            tu += x.usage?.total || 0;
+        });
+        // 分别计算上传和下载（从实时 stats 获取比例）
+        let statsTx = 0, statsRx = 0;
+        Object.values(s).forEach(v => { statsTx += v.tx || 0; statsRx += v.rx || 0; });
+        const totalStats = statsTx + statsRx;
+        if (totalStats > 0) {
+            // 按比例分配历史流量到上传和下载
+            td = Math.round(tu * (statsRx / totalStats));
+            tu = Math.round(tu * (statsTx / totalStats));
+        } else {
+            td = 0;
+        }
         $("#st-up").innerText = sz(tu);
         $("#st-dl").innerText = sz(td);
 
