@@ -81,9 +81,12 @@ show_status() {
     echo -e "${GREEN}服务状态${NC}"
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
     
-    # Hysteria2
+    # Hysteria2 版本和状态
     if command -v hysteria &> /dev/null; then
-        echo -e "  Hysteria2: ${YELLOW}$(hysteria version 2>/dev/null | head -n1 || echo '未知')${NC}"
+        local hy_ver=$(hysteria version 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+        hy_ver=${hy_ver:-$(hysteria version 2>/dev/null | awk 'NR==1 {print $2}')}
+        hy_ver=${hy_ver:-"未知"}
+        echo -e "  Hysteria2: ${YELLOW}${hy_ver}${NC}"
     else
         echo -e "  Hysteria2: ${RED}未安装${NC}"
     fi
@@ -94,8 +97,12 @@ show_status() {
         echo -e "  Hysteria服务: ${RED}未运行${NC}"
     fi
     
-    # Xray
+    # Xray 版本和状态
     if command -v xray &> /dev/null; then
+        local xray_ver=$(xray version 2>/dev/null | grep -oE 'Xray [0-9]+\.[0-9]+\.[0-9]+' | head -1 | awk '{print $2}')
+        xray_ver=${xray_ver:-$(xray version 2>/dev/null | head -1 | awk '{print $2}')}
+        xray_ver=${xray_ver:-"未知"}
+        echo -e "  Xray: ${YELLOW}v${xray_ver}${NC}"
         if systemctl is-active --quiet xray 2>/dev/null; then
             echo -e "  Xray服务: ${GREEN}运行中${NC}"
         else
