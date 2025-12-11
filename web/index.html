@@ -82,12 +82,39 @@
             <div class="table-card" style="margin-top:20px">
                 <div class="table-header">
                     <h2>📦 客户端一键安装</h2>
-                    <button class="ibtn" onclick="copyInstallCmd()" title="复制命令">📋</button>
                 </div>
-                <p style="color:var(--text-dim);font-size:13px;margin-bottom:10px">直接从此服务端下载安装，国内可用</p>
-                <div id="install-cmd"
-                    style="background:var(--surface-dim);padding:12px;border-radius:8px;font-family:monospace;font-size:13px;word-break:break-all;color:var(--success)">
-                    正在加载...
+                <div class="install-card-content">
+                    <p style="color:var(--text-dim);font-size:13px;margin-bottom:12px">在客户端服务器上运行以下命令即可完成安装与配置（支持国内服务器）：
+                    </p>
+
+                    <div class="cmd-box">
+                        <div class="cmd-text" id="install-cmd">正在加载安装命令...</div>
+                        <button class="cmd-copy-btn" onclick="copyInstallCmd()">复制</button>
+                    </div>
+
+                    <div class="install-steps">
+                        <div class="step-item">
+                            <div class="step-num">1</div>
+                            <div class="step-content">
+                                <h4>极速下载</h4>
+                                <p>优先从本服务端内网/直连下载安装包，无需访问 GitHub。</p>
+                            </div>
+                        </div>
+                        <div class="step-item">
+                            <div class="step-num">2</div>
+                            <div class="step-content">
+                                <h4>自动配置</h4>
+                                <p>自动写入服务端地址和密钥，安装即连接。</p>
+                            </div>
+                        </div>
+                        <div class="step-item">
+                            <div class="step-num">3</div>
+                            <div class="step-content">
+                                <h4>不兼容?</h4>
+                                <p>如遇问题，脚本会自动尝试从官方镜像源下载。</p>
+                            </div>
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>
