@@ -170,14 +170,14 @@ function genUri(x) {
         return "vless://" + x.uuid + "@" + cfg.domain + ":" + cfg.xrayPort +
             "?encryption=none&flow=xtls-rprx-vision&security=reality&sni=" + userSni +
             "&fp=chrome&pbk=" + cfg.pubKey + "&sid=" + cfg.shortId + "&spx=%2F&type=tcp#" +
-            encodeURIComponent(x.username + (x.sni ? " [" + x.sni + "]" : ""));
+            encodeURIComponent(x.username);
     }
     if (x.protocol === "vless-ws-tls") {
         const hostSni = x.sni || "www.bing.com";
         return "vless://" + x.uuid + "@" + cfg.domain + ":" + (cfg.wsPort || 10002) +
             "?encryption=none&security=tls&sni=" + cfg.domain +
             "&type=ws&host=" + hostSni + "&path=%2Fws#" +
-            encodeURIComponent(x.username + " [WS:" + hostSni + "]");
+            encodeURIComponent(x.username);
     }
     return "hysteria2://" + encodeURIComponent(x.username) + ":" + encodeURIComponent(x.password) +
         "@" + cfg.domain + ":" + cfg.port + "/?sni=" + cfg.domain + "&insecure=0#" + encodeURIComponent(x.username);
