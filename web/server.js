@@ -459,6 +459,55 @@ const server = http.createServer(async (req, res) => {
         } catch { return sendJSON(res, { error: "Not found" }, 404); }
     }
 
+    // --- 客户端安装包下载 (无需认证) ---
+    const PACKAGES_DIR = path.join(path.dirname(ADMIN_DIR), "packages");
+
+    if (p === "/packages" || p === "/packages/") {
+        // 列出可用的安装包
+        try {
+            const files = fs.readdirSync(PACKAGES_DIR);
+            const packages = files.map(f => {
+                const stat = fs.statSync(path.join(PACKAGES_DIR, f));
+                return { name: f, size: stat.size, modified: stat.mtime };
+            });
+            return sendJSON(res, { packages });
+        } catch {
+            return sendJSON(res, { packages: [], message: "No packages available" });
+        }
+    }
+
+    if (p.startsWith("/packages/")) {
+        const fileName = decodeURIComponent(p.slice(10));
+        const filePath = path.join(PACKAGES_DIR, fileName);
+
+        // 安全检查：防止路径遍历
+        if (!filePath.startsWith(PACKAGES_DIR)) {
+            return sendJSON(res, { error: "Invalid path" }, 400);
+        }
+
+        try {
+            if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
+                const content = fs.readFileSync(filePath);
+                const ext = path.extname(fileName).toLowerCase();
+                let contentType = "application/octet-stream";
+                if (ext === ".sh") contentType = "text/x-shellscript";
+                else if (ext === ".json") contentType = "application/json";
+                else if (ext === ".zip") contentType = "application/zip";
+                else if (ext === ".gz" || ext === ".tar.gz") contentType = "application/gzip";
+
+                res.writeHead(200, {
+                    "Content-Type": contentType,
+                    "Content-Length": content.length,
+                    "Content-Disposition": `attachment; filename="${fileName}"`
+                });
+                return res.end(content);
+            }
+            return sendJSON(res, { error: "File not found" }, 404);
+        } catch (e) {
+            return sendJSON(res, { error: "Download failed: " + e.message }, 500);
+        }
+    }
+
     // API routes
     if (p.startsWith("/api/")) {
         const r = p.slice(5);

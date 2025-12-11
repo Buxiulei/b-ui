@@ -219,6 +219,124 @@ smart_run_script() {
 }
 
 #===============================================================================
+# 从 B-UI 服务端下载安装包
+# 优先使用服务端中转，解决国内无法直连 GitHub 的问题
+#===============================================================================
+
+# 存储服务端地址 (从导入的配置中获取)
+SERVER_ADDRESS=""
+SERVER_ADDRESS_FILE="${BASE_DIR}/server_address"
+
+# 设置服务端地址
+set_server_address() {
+    local addr="$1"
+    SERVER_ADDRESS="$addr"
+    echo "$addr" > "$SERVER_ADDRESS_FILE"
+}
+
+# 加载已保存的服务端地址
+load_server_address() {
+    if [[ -f "$SERVER_ADDRESS_FILE" ]]; then
+        SERVER_ADDRESS=$(cat "$SERVER_ADDRESS_FILE" 2>/dev/null)
+    fi
+}
+
+# 从服务端下载安装包
+# 用法: download_from_server <filename> <output_file>
+download_from_server() {
+    local filename="$1"
+    local output="$2"
+    
+    load_server_address
+    
+    if [[ -z "$SERVER_ADDRESS" ]]; then
+        return 1
+    fi
+    
+    # 构建下载 URL
+    local url="https://${SERVER_ADDRESS}/packages/${filename}"
+    
+    print_info "从服务端下载 ${filename}..."
+    if curl -fsSL --max-time 120 -k "$url" -o "$output" 2>/dev/null; then
+        if [[ -f "$output" ]] && [[ -s "$output" ]]; then
+            return 0
+        fi
+    fi
+    
+    return 1
+}
+
+# 智能安装核心 - 优先服务端，降级到镜像
+# 用法: smart_install_core <core_name>
+smart_install_core() {
+    local core_name="$1"
+    local arch=$(uname -m)
+    local arch_suffix
+    case "$arch" in
+        x86_64) arch_suffix="amd64" ;;
+        aarch64) arch_suffix="arm64" ;;
+        *) arch_suffix="amd64" ;;
+    esac
+    
+    case "$core_name" in
+        hysteria)
+            local filename="hysteria-linux-${arch_suffix}"
+            local output="/tmp/hysteria"
+            
+            # 方法1: 从服务端下载
+            if download_from_server "$filename" "$output"; then
+                chmod +x "$output"
+                mv "$output" /usr/local/bin/hysteria
+                print_success "Hysteria2 安装完成 (从服务端)"
+                return 0
+            fi
+            
+            # 方法2: 使用智能下载
+            print_info "服务端下载失败，使用镜像下载..."
+            install_hysteria
+            ;;
+            
+        xray)
+            local filename="xray-linux-${arch_suffix}.zip"
+            local output="/tmp/xray.zip"
+            
+            # 方法1: 从服务端下载
+            if download_from_server "$filename" "$output"; then
+                unzip -o "$output" -d /tmp/xray_temp >/dev/null 2>&1
+                mv /tmp/xray_temp/xray /usr/local/bin/xray
+                chmod +x /usr/local/bin/xray
+                rm -rf "$output" /tmp/xray_temp
+                print_success "Xray 安装完成 (从服务端)"
+                return 0
+            fi
+            
+            # 方法2: 使用智能下载
+            print_info "服务端下载失败，使用镜像下载..."
+            install_xray_client
+            ;;
+            
+        singbox)
+            local filename="sing-box-linux-${arch_suffix}.tar.gz"
+            local output="/tmp/sing-box.tar.gz"
+            
+            # 方法1: 从服务端下载
+            if download_from_server "$filename" "$output"; then
+                tar -xzf "$output" -C /tmp >/dev/null 2>&1
+                find /tmp -name "sing-box" -type f -exec mv {} /usr/bin/sing-box \;
+                chmod +x /usr/bin/sing-box
+                rm -rf "$output" /tmp/sing-box-*
+                print_success "sing-box 安装完成 (从服务端)"
+                return 0
+            fi
+            
+            # 方法2: 使用智能下载
+            print_info "服务端下载失败，使用镜像下载..."
+            install_singbox
+            ;;
+    esac
+}
+
+#===============================================================================
 # 依赖检测与安装
 #===============================================================================
 
@@ -648,9 +766,16 @@ install_all_cores() {
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
     echo ""
     
-    install_hysteria
-    install_xray_client  
-    install_singbox
+    # 加载服务端地址
+    load_server_address
+    if [[ -n "$SERVER_ADDRESS" ]]; then
+        print_info "检测到服务端: $SERVER_ADDRESS，优先从服务端下载安装包"
+    fi
+    
+    # 使用智能安装 (优先服务端 -> 国内镜像 -> 直连)
+    smart_install_core hysteria
+    smart_install_core xray  
+    smart_install_core singbox
     
     echo ""
     print_success "所有核心安装完成"
@@ -1105,6 +1230,13 @@ EOF
     
     # 保存原始 URI
     echo "$uri" > "${config_dir}/uri.txt"
+    
+    # 保存服务端地址 (用于从服务端下载安装包)
+    # 提取服务器域名/IP (去掉端口)
+    local server_host=$(echo "$server" | cut -d':' -f1)
+    if [[ -n "$server_host" ]]; then
+        set_server_address "$server_host"
+    fi
 }
 
 list_configs() {
