@@ -1054,9 +1054,35 @@ EOF
 start_tun_mode() {
     print_info "启动 TUN 模式..."
     
-    # 停止可能冲突的服务
-    systemctl stop hysteria-client 2>/dev/null || true
-    systemctl stop xray-client 2>/dev/null || true
+    # 检测端口冲突
+    local socks_port=${SOCKS_PORT:-1080}
+    local http_port=${HTTP_PORT:-8080}
+    
+    # 检测并停止可能冲突的服务
+    if systemctl is-active --quiet hysteria-client; then
+        print_warning "检测到 Hysteria2 客户端正在运行 (占用端口 $socks_port/$http_port)"
+        print_info "停止 Hysteria2 客户端..."
+        systemctl stop hysteria-client 2>/dev/null || true
+        sleep 1
+    fi
+    
+    if systemctl is-active --quiet xray-client; then
+        print_warning "检测到 Xray 客户端正在运行"
+        print_info "停止 Xray 客户端..."
+        systemctl stop xray-client 2>/dev/null || true
+        sleep 1
+    fi
+    
+    # 再次检查端口占用
+    if ss -tlnp | grep -q ":${socks_port} " 2>/dev/null; then
+        print_warning "端口 $socks_port 仍被占用"
+        local pid=$(ss -tlnp | grep ":${socks_port} " | grep -oP 'pid=\K\d+')
+        if [[ -n "$pid" ]]; then
+            print_info "尝试终止占用进程 PID: $pid"
+            kill -9 "$pid" 2>/dev/null || true
+            sleep 1
+        fi
+    fi
     
     # 删除旧的 TUN 接口
     ip link delete hystun 2>/dev/null || true
@@ -1067,6 +1093,7 @@ start_tun_mode() {
     sysctl -w net.ipv4.conf.default.rp_filter=2 >/dev/null 2>&1 || true
     
     # 启动 sing-box TUN
+    systemctl daemon-reload 2>/dev/null || true
     systemctl enable bui-tun 2>/dev/null || true
     systemctl start bui-tun
     
@@ -1074,8 +1101,8 @@ start_tun_mode() {
     if systemctl is-active --quiet bui-tun; then
         print_success "TUN 模式已启动"
         echo -e "  接口: ${GREEN}bui-tun${NC}"
-        echo -e "  SOCKS5: ${GREEN}127.0.0.1:${SOCKS_PORT}${NC}"
-        echo -e "  HTTP:   ${GREEN}127.0.0.1:${HTTP_PORT}${NC}"
+        echo -e "  SOCKS5: ${GREEN}127.0.0.1:${socks_port}${NC}"
+        echo -e "  HTTP:   ${GREEN}127.0.0.1:${http_port}${NC}"
     else
         print_error "TUN 模式启动失败"
         journalctl -u bui-tun --no-pager -n 10
