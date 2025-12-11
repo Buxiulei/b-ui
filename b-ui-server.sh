@@ -1608,10 +1608,10 @@ EOF
     fi
 }
 
-create_hui_cli() {
+create_bui_cli() {
     print_info "创建 b-ui 命令行工具..."
     
-    cat > /usr/local/bin/b-ui << 'HUIEOF'
+    cat > /usr/local/bin/b-ui << 'BUIEOF'
 #!/bin/bash
 # B-UI 终端管理面板
 # Hysteria2 + Web 管理面板 完整版
@@ -1956,7 +1956,7 @@ main() {
 }
 
 main
-HUIEOF
+BUIEOF
     
     chmod +x /usr/local/bin/b-ui
     print_success "b-ui 命令已创建，可在终端输入 'sudo b-ui' 打开管理面板"
@@ -2409,7 +2409,7 @@ quick_install() {
     # 9. 部署管理面板
     deploy_admin_panel
     create_admin_service
-    create_hui_cli
+    create_bui_cli
     
     # 10. 预下载客户端安装包 (可选，用于国内客户端)
     echo ""

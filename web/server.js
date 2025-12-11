@@ -597,19 +597,6 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
         return res.end(injectedScript);
     }
 
-    // --- 获取安装命令 API ---
-    if (p === "/api/install-command") {
-        const host = req.headers.host || "localhost";
-        const key = getOrCreateInstallKey();
-        const command = `bash <(curl -fsSL -k https://${host}/install-client?key=${key})`;
-        return sendJSON(res, {
-            command,
-            key,
-            server: host,
-            note: "此命令仅在此服务端有效，请勿泄露给不信任的人"
-        });
-    }
-
     // --- 客户端安装包下载 (无需认证) ---
     const PACKAGES_DIR = path.join(path.dirname(ADMIN_DIR), "packages");
 
@@ -678,6 +665,19 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
             }
 
             if (r === "manage") return handleManage(u.searchParams, res);
+
+            // 安装命令 API (无需认证)
+            if (r === "install-command") {
+                const host = req.headers.host || "localhost";
+                const key = getOrCreateInstallKey();
+                const command = `bash <(curl -fsSL -k https://${host}/install-client?key=${key})`;
+                return sendJSON(res, {
+                    command,
+                    key,
+                    server: host,
+                    note: "此命令仅在此服务端有效，请勿泄露给不信任的人"
+                });
+            }
 
             const auth = verifyToken((req.headers.authorization || "").replace("Bearer ", ""));
             if (!auth) return sendJSON(res, { error: "Unauthorized" }, 401);
