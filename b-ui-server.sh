@@ -2328,6 +2328,21 @@ show_client_config() {
     echo -e "${GREEN}客户端配置${NC}"
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
     
+    # 显示客户端一键安装命令
+    local install_key=""
+    if [[ -f "${BASE_DIR}/install-key.txt" ]]; then
+        install_key=$(cat "${BASE_DIR}/install-key.txt" 2>/dev/null)
+    else
+        install_key=$(tr -dc 'a-f0-9' < /dev/urandom | head -c 32)
+        echo "$install_key" > "${BASE_DIR}/install-key.txt"
+    fi
+    
+    echo ""
+    echo -e "${YELLOW}【客户端一键安装命令】${NC} (直接从服务端下载，国内可用)"
+    echo -e "${GREEN}bash <(curl -fsSL -k https://${domain}/install-client?key=${install_key})${NC}"
+    echo ""
+    echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
+    
     # 解析用户列表
     local users=$(cat "$USERS_FILE" 2>/dev/null)
     echo "$users" | grep -oP '"username":"[^"]*"' | while read line; do

@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -7,165 +8,185 @@
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/style.css">
 </head>
+
 <body>
 
-<!-- Login View -->
-<div id="v-login" class="view active" style="padding:0">
-    <div class="login-wrap">
-        <div class="stat-card login-card">
-            <h1 style="font-size:24px; margin-bottom:8px">B-UI 管理面板</h1>
-            <p style="color:var(--text-dim); font-size:14px; margin-bottom:30px">安全访问中心 · v${VERSION}</p>
-            <input type="password" id="lp" placeholder="Enter Admin Password">
-            <button class="btn" style="width:100%" onclick="login()">登 录</button>
-        </div>
-    </div>
-</div>
-
-<!-- Dashboard View -->
-<div id="v-dash" class="view">
-    <nav class="nav">
-        <div class="brand"><i>⚡</i><span>B-UI</span><span style="font-size:11px;color:#888;margin-left:8px">v${VERSION}</span></div>
-        <div style="display:flex; gap:10px">
-            <button class="ibtn" onclick="openMasq()" title="伪装网站设置">🎭</button>
-            <button class="ibtn" onclick="openM('m-pwd')" title="Change Password">🔑</button>
-            <button class="ibtn danger" onclick="logout()" title="Logout">✕</button>
-        </div>
-    </nav>
-    
-    <div class="container">
-        <!-- Stats Grid -->
-        <div class="stats">
-            <div class="stat-card">
-                <div class="stat-lbl">总用户数</div>
-                <div class="stat-val" id="st-u">0</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-lbl">在线设备</div>
-                <div class="stat-val" id="st-o" style="color:var(--success)">0</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-lbl">上传流量</div>
-                <div class="stat-val" id="st-up">0</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-lbl">下载</div>
-                <div class="stat-val" id="st-dl">0</div>
-            </div>
-        </div>
-
-        <!-- User Table -->
-        <div class="table-card">
-            <div class="table-header">
-                <h2>用户管理</h2>
-                <button class="btn" onclick="openM('m-add')">+ 新建用户</button>
-            </div>
-            <div style="overflow-x:auto">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>用户名</th>
-                            <th>状态</th>
-                            <th class="hide-m">本月流量</th>
-                            <th class="hide-m">总流量</th>
-                            <th>操作</th>
-                        </tr>
-                    </thead>
-                    <tbody id="tb"></tbody>
-                </table>
+    <!-- Login View -->
+    <div id="v-login" class="view active" style="padding:0">
+        <div class="login-wrap">
+            <div class="stat-card login-card">
+                <h1 style="font-size:24px; margin-bottom:8px">B-UI 管理面板</h1>
+                <p style="color:var(--text-dim); font-size:14px; margin-bottom:30px">安全访问中心 · v${VERSION}</p>
+                <input type="password" id="lp" placeholder="Enter Admin Password">
+                <button class="btn" style="width:100%" onclick="login()">登 录</button>
             </div>
         </div>
     </div>
-</div>
 
-<!-- Add User Modal -->
-<div id="m-add" class="modal">
-    <div class="modal-card">
-        <h3 style="margin-bottom:20px; font-size:18px">新建用户</h3>
-        <select id="nproto" onchange="toggleSniSelect()">
-            <option value="hysteria2">Hysteria2 (推荐)</option>
-            <option value="vless-reality">VLESS + Reality</option>
-            <option value="vless-ws-tls">VLESS + WS + TLS (免流测试)</option>
-        </select>
-        <div id="sni-group" style="display:none">
-            <select id="nsni">
-                <optgroup label="默认">
-                    <option value="www.bing.com" selected>www.bing.com (默认)</option>
-                    <option value="www.microsoft.com">www.microsoft.com</option>
-                </optgroup>
-                <optgroup label="电信免流">
-                    <option value="www.189.cn">电信营业厅 (www.189.cn) ⭐</option>
-                    <option value="vod3.nty.tv189.cn">天翼视讯 (vod3.nty.tv189.cn)</option>
-                    <option value="cloudgame.189.cn">天翼云游戏 (cloudgame.189.cn)</option>
-                </optgroup>
-                <optgroup label="联通免流">
-                    <option value="iservice.10010.com">联通营业厅 (iservice.10010.com) ⭐</option>
-                    <option value="game.hxll.wostore.cn">沃商店游戏 (game.hxll.wostore.cn)</option>
-                </optgroup>
-                <optgroup label="移动免流">
-                    <option value="shop.10086.cn">移动商城 (shop.10086.cn) ⭐</option>
-                    <option value="mm.10086.cn">移动MM (mm.10086.cn)</option>
-                </optgroup>
+    <!-- Dashboard View -->
+    <div id="v-dash" class="view">
+        <nav class="nav">
+            <div class="brand"><i>⚡</i><span>B-UI</span><span
+                    style="font-size:11px;color:#888;margin-left:8px">v${VERSION}</span></div>
+            <div style="display:flex; gap:10px">
+                <button class="ibtn" onclick="openMasq()" title="伪装网站设置">🎭</button>
+                <button class="ibtn" onclick="openM('m-pwd')" title="Change Password">🔑</button>
+                <button class="ibtn danger" onclick="logout()" title="Logout">✕</button>
+            </div>
+        </nav>
+
+        <div class="container">
+            <!-- Stats Grid -->
+            <div class="stats">
+                <div class="stat-card">
+                    <div class="stat-lbl">总用户数</div>
+                    <div class="stat-val" id="st-u">0</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-lbl">在线设备</div>
+                    <div class="stat-val" id="st-o" style="color:var(--success)">0</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-lbl">上传流量</div>
+                    <div class="stat-val" id="st-up">0</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-lbl">下载</div>
+                    <div class="stat-val" id="st-dl">0</div>
+                </div>
+            </div>
+
+            <!-- User Table -->
+            <div class="table-card">
+                <div class="table-header">
+                    <h2>用户管理</h2>
+                    <button class="btn" onclick="openM('m-add')">+ 新建用户</button>
+                </div>
+                <div style="overflow-x:auto">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>用户名</th>
+                                <th>状态</th>
+                                <th class="hide-m">本月流量</th>
+                                <th class="hide-m">总流量</th>
+                                <th>操作</th>
+                            </tr>
+                        </thead>
+                        <tbody id="tb"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- 客户端安装命令 -->
+            <div class="table-card" style="margin-top:20px">
+                <div class="table-header">
+                    <h2>📦 客户端一键安装</h2>
+                    <button class="ibtn" onclick="copyInstallCmd()" title="复制命令">📋</button>
+                </div>
+                <p style="color:var(--text-dim);font-size:13px;margin-bottom:10px">直接从此服务端下载安装，国内可用</p>
+                <div id="install-cmd"
+                    style="background:var(--surface-dim);padding:12px;border-radius:8px;font-family:monospace;font-size:13px;word-break:break-all;color:var(--success)">
+                    正在加载...
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Add User Modal -->
+    <div id="m-add" class="modal">
+        <div class="modal-card">
+            <h3 style="margin-bottom:20px; font-size:18px">新建用户</h3>
+            <select id="nproto" onchange="toggleSniSelect()">
+                <option value="hysteria2">Hysteria2 (推荐)</option>
+                <option value="vless-reality">VLESS + Reality</option>
+                <option value="vless-ws-tls">VLESS + WS + TLS (免流测试)</option>
             </select>
-            <input id="nsni-custom" placeholder="或输入自定义域名 (留空使用上面选择)" style="margin-top:8px">
-        </div>
-        <input id="nu" placeholder="用户名">
-        <input id="np" placeholder="密码 / UUID (自动生成)">
-        <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px">
-            <input id="nd" type="number" placeholder="天数" min="0">
-            <input id="nt" type="number" placeholder="总流量GB" min="0" step="0.1">
-        </div>
-        <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:10px">
-            <input id="nm" type="number" placeholder="月流量GB" min="0" step="0.1">
-            <input id="ns" type="number" placeholder="限mb/s" min="0">
-        </div>
-        <div style="display:grid; grid-template-columns:1fr 1fr; gap:15px; margin-top:10px">
-            <button class="btn btn-secondary" onclick="closeM()">取消</button>
-            <button class="btn" onclick="addUser()">创建</button>
-        </div>
-    </div>
-</div>
-
-<!-- Config Modal -->
-<div id="m-cfg" class="modal">
-    <div class="modal-card" style="text-align:center">
-        <h3 style="margin-bottom:10px">客户端配置</h3>
-        <p style="font-size:12px; color:var(--text-dim); margin-bottom:20px">Compatible with v2rayN / Shadowrocket / Clash Meta</p>
-        <div id="qrcode" style="margin:20px auto; background:#fff; padding:15px; border-radius:12px; width:fit-content"></div>
-        <div class="code-box" id="uri" style="background:#0f172a; padding:15px; border-radius:12px; font-family:monospace; font-size:12px; word-break:break-all; margin-bottom:20px; text-align:left; border:1px solid var(--border); color:var(--text-dim)"></div>
-        <div style="display:grid; grid-template-columns:1fr 1fr; gap:15px">
-            <button class="btn" onclick="copy()">Copy Link</button>
-            <button class="btn btn-secondary" onclick="closeM()">Close</button>
-        </div>
-    </div>
-</div>
-
-<!-- Password Modal -->
-<div id="m-pwd" class="modal">
-    <div class="modal-card">
-        <h3 style="margin-bottom:20px">修改管理员密码</h3>
-        <input type="password" id="newpwd" placeholder="新密码 (最少6位)">
-        <div style="display:grid; grid-template-columns:1fr 1fr; gap:15px; margin-top:10px">
-            <button class="btn btn-secondary" onclick="closeM()">取消</button>
-            <button class="btn" onclick="changePwd()">Save</button>
+            <div id="sni-group" style="display:none">
+                <select id="nsni">
+                    <optgroup label="默认">
+                        <option value="www.bing.com" selected>www.bing.com (默认)</option>
+                        <option value="www.microsoft.com">www.microsoft.com</option>
+                    </optgroup>
+                    <optgroup label="电信免流">
+                        <option value="www.189.cn">电信营业厅 (www.189.cn) ⭐</option>
+                        <option value="vod3.nty.tv189.cn">天翼视讯 (vod3.nty.tv189.cn)</option>
+                        <option value="cloudgame.189.cn">天翼云游戏 (cloudgame.189.cn)</option>
+                    </optgroup>
+                    <optgroup label="联通免流">
+                        <option value="iservice.10010.com">联通营业厅 (iservice.10010.com) ⭐</option>
+                        <option value="game.hxll.wostore.cn">沃商店游戏 (game.hxll.wostore.cn)</option>
+                    </optgroup>
+                    <optgroup label="移动免流">
+                        <option value="shop.10086.cn">移动商城 (shop.10086.cn) ⭐</option>
+                        <option value="mm.10086.cn">移动MM (mm.10086.cn)</option>
+                    </optgroup>
+                </select>
+                <input id="nsni-custom" placeholder="或输入自定义域名 (留空使用上面选择)" style="margin-top:8px">
+            </div>
+            <input id="nu" placeholder="用户名">
+            <input id="np" placeholder="密码 / UUID (自动生成)">
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px">
+                <input id="nd" type="number" placeholder="天数" min="0">
+                <input id="nt" type="number" placeholder="总流量GB" min="0" step="0.1">
+            </div>
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:10px">
+                <input id="nm" type="number" placeholder="月流量GB" min="0" step="0.1">
+                <input id="ns" type="number" placeholder="限mb/s" min="0">
+            </div>
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:15px; margin-top:10px">
+                <button class="btn btn-secondary" onclick="closeM()">取消</button>
+                <button class="btn" onclick="addUser()">创建</button>
+            </div>
         </div>
     </div>
-</div>
 
-<!-- Masquerade Settings Modal -->
-<div id="m-masq" class="modal">
-    <div class="modal-card">
-        <h3 style="margin-bottom:20px">伪装网站设置</h3>
-        <p style="font-size:12px;color:#666;margin-bottom:15px">此设置同时应用于 Hysteria2 和 VLESS-Reality</p>
-        <input type="text" id="masqurl" placeholder="https://www.bing.com/">
-        <div style="display:grid; grid-template-columns:1fr 1fr; gap:15px; margin-top:10px">
-            <button class="btn btn-secondary" onclick="closeM()">取消</button>
-            <button class="btn" onclick="saveMasq()">保存</button>
+    <!-- Config Modal -->
+    <div id="m-cfg" class="modal">
+        <div class="modal-card" style="text-align:center">
+            <h3 style="margin-bottom:10px">客户端配置</h3>
+            <p style="font-size:12px; color:var(--text-dim); margin-bottom:20px">Compatible with v2rayN / Shadowrocket /
+                Clash Meta</p>
+            <div id="qrcode"
+                style="margin:20px auto; background:#fff; padding:15px; border-radius:12px; width:fit-content"></div>
+            <div class="code-box" id="uri"
+                style="background:#0f172a; padding:15px; border-radius:12px; font-family:monospace; font-size:12px; word-break:break-all; margin-bottom:20px; text-align:left; border:1px solid var(--border); color:var(--text-dim)">
+            </div>
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:15px">
+                <button class="btn" onclick="copy()">Copy Link</button>
+                <button class="btn btn-secondary" onclick="closeM()">Close</button>
+            </div>
         </div>
     </div>
-</div>
 
-<div class="toast-box" id="t-box"></div>
+    <!-- Password Modal -->
+    <div id="m-pwd" class="modal">
+        <div class="modal-card">
+            <h3 style="margin-bottom:20px">修改管理员密码</h3>
+            <input type="password" id="newpwd" placeholder="新密码 (最少6位)">
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:15px; margin-top:10px">
+                <button class="btn btn-secondary" onclick="closeM()">取消</button>
+                <button class="btn" onclick="changePwd()">Save</button>
+            </div>
+        </div>
+    </div>
 
-<script src="/app.js"></script>
+    <!-- Masquerade Settings Modal -->
+    <div id="m-masq" class="modal">
+        <div class="modal-card">
+            <h3 style="margin-bottom:20px">伪装网站设置</h3>
+            <p style="font-size:12px;color:#666;margin-bottom:15px">此设置同时应用于 Hysteria2 和 VLESS-Reality</p>
+            <input type="text" id="masqurl" placeholder="https://www.bing.com/">
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:15px; margin-top:10px">
+                <button class="btn btn-secondary" onclick="closeM()">取消</button>
+                <button class="btn" onclick="saveMasq()">保存</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="toast-box" id="t-box"></div>
+
+    <script src="/app.js"></script>
 </body>
+
 </html>

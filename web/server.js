@@ -30,6 +30,91 @@ const CONFIG = {
     xrayApiPort: 10085
 };
 
+// --- 客户端安装 Key 管理 ---
+const INSTALL_KEY_FILE = path.join(BASE_DIR, "install-key.txt");
+
+function getOrCreateInstallKey() {
+    try {
+        if (fs.existsSync(INSTALL_KEY_FILE)) {
+            return fs.readFileSync(INSTALL_KEY_FILE, "utf8").trim();
+        }
+    } catch { }
+    // 生成新的安装 key
+    const key = crypto.randomBytes(16).toString("hex");
+    try {
+        fs.writeFileSync(INSTALL_KEY_FILE, key);
+    } catch { }
+    return key;
+}
+
+function verifyInstallKey(key) {
+    const validKey = getOrCreateInstallKey();
+    return key === validKey;
+}
+
+// 生成引导安装脚本 (当服务端没有完整脚本时使用)
+function generateBootstrapScript(serverDomain, key) {
+    return `
+# B-UI 客户端引导安装脚本
+# 从服务端下载安装包并安装
+
+set -e
+
+RED='\\033[0;31m'
+GREEN='\\033[0;32m'
+YELLOW='\\033[1;33m'
+NC='\\033[0m'
+
+echo -e "\${GREEN}B-UI 客户端安装程序\${NC}"
+echo -e "服务端: \${YELLOW}${serverDomain}\${NC}"
+echo ""
+
+# 检查 root 权限
+if [[ $EUID -ne 0 ]]; then
+    echo -e "\${RED}[ERROR]\${NC} 此脚本需要 root 权限"
+    exit 1
+fi
+
+# 创建目录
+mkdir -p /opt/hysteria-client
+echo "${serverDomain}" > /opt/hysteria-client/server_address
+
+# 下载安装包
+ARCH=$(uname -m)
+case "$ARCH" in
+    x86_64) ARCH_SUFFIX="amd64" ;;
+    aarch64) ARCH_SUFFIX="arm64" ;;
+    *) ARCH_SUFFIX="amd64" ;;
+esac
+
+echo -e "\${GREEN}[INFO]\${NC} 下载 Hysteria2..."
+curl -fsSL -k "https://${serverDomain}/packages/hysteria-linux-\${ARCH_SUFFIX}" -o /usr/local/bin/hysteria
+chmod +x /usr/local/bin/hysteria
+
+echo -e "\${GREEN}[INFO]\${NC} 下载 sing-box..."
+curl -fsSL -k "https://${serverDomain}/packages/sing-box-linux-\${ARCH_SUFFIX}.tar.gz" -o /tmp/sing-box.tar.gz
+tar -xzf /tmp/sing-box.tar.gz -C /tmp
+find /tmp -name "sing-box" -type f -exec mv {} /usr/bin/sing-box \\;
+chmod +x /usr/bin/sing-box
+rm -rf /tmp/sing-box*
+
+echo -e "\${GREEN}[INFO]\${NC} 下载 Xray..."
+curl -fsSL -k "https://${serverDomain}/packages/xray-linux-\${ARCH_SUFFIX}.zip" -o /tmp/xray.zip
+unzip -o /tmp/xray.zip -d /tmp/xray_temp >/dev/null 2>&1 || true
+mv /tmp/xray_temp/xray /usr/local/bin/xray 2>/dev/null || true
+chmod +x /usr/local/bin/xray 2>/dev/null || true
+rm -rf /tmp/xray* 
+
+echo ""
+echo -e "\${GREEN}[SUCCESS]\${NC} 核心安装完成!"
+echo -e "  Hysteria2: $(hysteria version 2>/dev/null | grep Version | awk '{print $2}' || echo '已安装')"
+echo -e "  sing-box: $(sing-box version 2>/dev/null | head -n1 | awk '{print $3}' || echo '已安装')"
+echo -e "  Xray: $(xray version 2>/dev/null | head -n1 | awk '{print $2}' || echo '已安装')"
+echo ""
+echo -e "运行 \${YELLOW}sudo bui-c\${NC} 进行配置管理"
+`;
+}
+
 // --- Security: Rate Limiting & Audit ---
 const loginAttempts = {};
 const RATE_LIMIT = { maxAttempts: 5, windowMs: 300000 };
@@ -457,6 +542,72 @@ const server = http.createServer(async (req, res) => {
             res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
             return res.end(js);
         } catch { return sendJSON(res, { error: "Not found" }, 404); }
+    }
+
+    // --- 客户端一键安装 (验证 key) ---
+    if (p === "/install-client" || p.startsWith("/install-client?")) {
+        const key = u.searchParams.get("key");
+
+        if (!key || !verifyInstallKey(key)) {
+            res.writeHead(403, { "Content-Type": "text/plain; charset=utf-8" });
+            return res.end("# Error: Invalid or missing install key\necho '安装密钥无效或缺失，请从服务端管理面板获取正确的安装命令'\nexit 1\n");
+        }
+
+        // 获取服务端域名 (从请求 Host 头获取)
+        const host = req.headers.host || "localhost";
+        const serverDomain = host.split(":")[0];
+
+        // 读取客户端脚本
+        const PACKAGES_DIR = path.join(path.dirname(ADMIN_DIR), "packages");
+        const clientScriptPath = path.join(PACKAGES_DIR, "b-ui-client.sh");
+
+        let clientScript = "";
+        try {
+            if (fs.existsSync(clientScriptPath)) {
+                clientScript = fs.readFileSync(clientScriptPath, "utf8");
+            } else {
+                // 如果本地没有脚本，返回从服务端下载的引导脚本
+                clientScript = generateBootstrapScript(serverDomain, key);
+            }
+        } catch (e) {
+            clientScript = generateBootstrapScript(serverDomain, key);
+        }
+
+        // 在脚本开头注入服务端地址
+        const injectedScript = `#!/bin/bash
+# B-UI 客户端一键安装脚本
+# 服务端: ${serverDomain}
+# 安装时间: $(date)
+
+# 预设服务端地址
+export BUI_SERVER="${serverDomain}"
+export BUI_INSTALL_KEY="${key}"
+
+# 创建配置目录并保存服务端地址
+mkdir -p /opt/hysteria-client
+echo "${serverDomain}" > /opt/hysteria-client/server_address
+
+${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
+`;
+
+        res.writeHead(200, {
+            "Content-Type": "text/x-shellscript; charset=utf-8",
+            "Content-Disposition": "inline; filename=\"b-ui-client-install.sh\""
+        });
+        return res.end(injectedScript);
+    }
+
+    // --- 获取安装命令 API ---
+    if (p === "/api/install-command") {
+        const host = req.headers.host || "localhost";
+        const key = getOrCreateInstallKey();
+        const command = `bash <(curl -fsSL -k https://${host}/install-client?key=${key})`;
+        return sendJSON(res, {
+            command,
+            key,
+            server: host,
+            note: "此命令仅在此服务端有效，请勿泄露给不信任的人"
+        });
     }
 
     // --- 客户端安装包下载 (无需认证) ---

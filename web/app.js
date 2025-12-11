@@ -63,6 +63,32 @@ function logout() {
     location.reload();
 }
 
+// 安装命令相关
+let installCmd = "";
+
+function loadInstallCommand() {
+    fetch("/api/install-command")
+        .then(r => r.json())
+        .then(d => {
+            if (d.command) {
+                installCmd = d.command;
+                const el = document.getElementById("install-cmd");
+                if (el) el.innerText = d.command;
+            }
+        })
+        .catch(() => {
+            const el = document.getElementById("install-cmd");
+            if (el) el.innerText = "无法加载安装命令";
+        });
+}
+
+function copyInstallCmd() {
+    if (!installCmd) return toast("命令未加载", 1);
+    navigator.clipboard.writeText(installCmd)
+        .then(() => toast("已复制到剪贴板"))
+        .catch(() => toast("复制失败", 1));
+}
+
 // Initialize dashboard
 function init() {
     $("#v-login").classList.remove("active");
@@ -70,6 +96,7 @@ function init() {
     $("#v-dash").classList.add("active");
     api("/config").then(d => cfg = d);
     load();
+    loadInstallCommand();
     setInterval(load, 5000);
 }
 
