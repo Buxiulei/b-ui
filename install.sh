@@ -262,20 +262,40 @@ migrate_old_path() {
 }
 
 update_service_paths() {
-    # 更新 Hysteria 服务配置
+    local updated=0
+    
+    # 检查并更新 Hysteria 服务配置
     if [[ -f "/etc/systemd/system/hysteria-server.service" ]]; then
-        sed -i 's|/opt/hysteria|/opt/b-ui|g' /etc/systemd/system/hysteria-server.service
-        print_info "  ✓ 更新 hysteria-server.service"
+        if grep -q "/opt/hysteria" /etc/systemd/system/hysteria-server.service 2>/dev/null; then
+            sed -i 's|/opt/hysteria|/opt/b-ui|g' /etc/systemd/system/hysteria-server.service
+            print_info "  ✓ 更新 hysteria-server.service 路径"
+            updated=1
+        fi
     fi
     
-    # 更新管理面板服务配置
+    # 检查并更新管理面板服务配置
     if [[ -f "/etc/systemd/system/b-ui-admin.service" ]]; then
-        sed -i 's|/opt/hysteria|/opt/b-ui|g' /etc/systemd/system/b-ui-admin.service
-        print_info "  ✓ 更新 b-ui-admin.service"
+        if grep -q "/opt/hysteria" /etc/systemd/system/b-ui-admin.service 2>/dev/null; then
+            sed -i 's|/opt/hysteria|/opt/b-ui|g' /etc/systemd/system/b-ui-admin.service
+            print_info "  ✓ 更新 b-ui-admin.service 路径"
+            updated=1
+        fi
+    fi
+    
+    # 检查并更新 Xray 服务配置
+    if [[ -f "/etc/systemd/system/xray.service" ]]; then
+        if grep -q "/opt/hysteria" /etc/systemd/system/xray.service 2>/dev/null; then
+            sed -i 's|/opt/hysteria|/opt/b-ui|g' /etc/systemd/system/xray.service
+            print_info "  ✓ 更新 xray.service 路径"
+            updated=1
+        fi
     fi
     
     # 重载 systemd
-    systemctl daemon-reload
+    if [[ $updated -eq 1 ]]; then
+        systemctl daemon-reload
+        print_success "服务配置路径已更新"
+    fi
 }
 
 check_old_version() {

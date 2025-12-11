@@ -202,9 +202,14 @@ do_update() {
     # 清理临时文件
     rm -f /tmp/b-ui-*-backup.* 2>/dev/null
     
+    # 更新服务配置路径（如果需要）
+    update_service_paths
+    
     # 重启服务
     print_info "重启服务..."
     systemctl start b-ui-admin 2>/dev/null || true
+    systemctl restart hysteria-server 2>/dev/null || true
+    systemctl restart xray 2>/dev/null || true
     
     if [[ $failed -gt 0 ]]; then
         print_warning "更新完成，但有 ${failed} 个文件更新失败"
@@ -215,6 +220,41 @@ do_update() {
     echo ""
     echo -e "  新版本: ${GREEN}v$(get_local_version)${NC}"
     echo ""
+}
+
+#===============================================================================
+# 更新服务配置路径
+#===============================================================================
+
+update_service_paths() {
+    local updated=0
+    
+    # 检查并更新 Hysteria 服务配置
+    if grep -q "/opt/hysteria" /etc/systemd/system/hysteria-server.service 2>/dev/null; then
+        sed -i 's|/opt/hysteria|/opt/b-ui|g' /etc/systemd/system/hysteria-server.service
+        print_info "  ✓ 更新 hysteria-server.service 路径"
+        updated=1
+    fi
+    
+    # 检查并更新管理面板服务配置
+    if grep -q "/opt/hysteria" /etc/systemd/system/b-ui-admin.service 2>/dev/null; then
+        sed -i 's|/opt/hysteria|/opt/b-ui|g' /etc/systemd/system/b-ui-admin.service
+        print_info "  ✓ 更新 b-ui-admin.service 路径"
+        updated=1
+    fi
+    
+    # 检查并更新 Xray 服务配置
+    if grep -q "/opt/hysteria" /etc/systemd/system/xray.service 2>/dev/null; then
+        sed -i 's|/opt/hysteria|/opt/b-ui|g' /etc/systemd/system/xray.service
+        print_info "  ✓ 更新 xray.service 路径"
+        updated=1
+    fi
+    
+    # 重载 systemd
+    if [[ $updated -eq 1 ]]; then
+        systemctl daemon-reload
+        print_success "服务配置路径已更新"
+    fi
 }
 
 #===============================================================================
