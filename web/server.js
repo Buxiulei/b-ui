@@ -650,10 +650,22 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
 
     if (p.startsWith("/packages/")) {
         const fileName = decodeURIComponent(p.slice(10));
-        const filePath = path.join(PACKAGES_DIR, fileName);
+
+        // 对于 b-ui-client.sh，优先使用根目录的版本
+        let filePath;
+        if (fileName === "b-ui-client.sh") {
+            const rootClientScript = path.join(BASE_DIR, "b-ui-client.sh");
+            if (fs.existsSync(rootClientScript)) {
+                filePath = rootClientScript;
+            } else {
+                filePath = path.join(PACKAGES_DIR, fileName);
+            }
+        } else {
+            filePath = path.join(PACKAGES_DIR, fileName);
+        }
 
         // 安全检查：防止路径遍历
-        if (!filePath.startsWith(PACKAGES_DIR)) {
+        if (!filePath.startsWith(BASE_DIR)) {
             return sendJSON(res, { error: "Invalid path" }, 400);
         }
 
