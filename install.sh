@@ -520,11 +520,28 @@ main() {
     
     # 配置定时自动更新 (每天凌晨3点)
     setup_auto_update() {
-        # 检查 crontab 是否可用
+        # 检查 crontab 是否可用，不可用则安装
         if ! command -v crontab &> /dev/null; then
-            print_warning "crontab 未安装，跳过自动更新配置"
-            print_info "如需自动更新，请手动安装 cron 后配置"
-            return
+            print_info "安装 cron..."
+            if command -v apt-get &> /dev/null; then
+                apt-get update -qq && apt-get install -y -qq cron > /dev/null 2>&1
+                systemctl enable cron 2>/dev/null || true
+                systemctl start cron 2>/dev/null || true
+            elif command -v yum &> /dev/null; then
+                yum install -y -q cronie > /dev/null 2>&1
+                systemctl enable crond 2>/dev/null || true
+                systemctl start crond 2>/dev/null || true
+            elif command -v dnf &> /dev/null; then
+                dnf install -y -q cronie > /dev/null 2>&1
+                systemctl enable crond 2>/dev/null || true
+                systemctl start crond 2>/dev/null || true
+            fi
+            
+            if ! command -v crontab &> /dev/null; then
+                print_warning "cron 安装失败，跳过自动更新配置"
+                return
+            fi
+            print_success "cron 已安装"
         fi
         
         local cron_job="0 3 * * * ${BASE_DIR}/server/update.sh auto >> /var/log/b-ui-update.log 2>&1"
