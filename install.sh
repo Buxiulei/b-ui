@@ -120,6 +120,19 @@ check_dependencies() {
         
         print_success "依赖安装完成"
     fi
+    
+    # 安装中文语言包（消除 setlocale 警告）
+    if ! locale -a 2>/dev/null | grep -qi "zh_CN"; then
+        print_info "安装中文语言包..."
+        if command -v apt-get &> /dev/null; then
+            apt-get install -y -qq locales > /dev/null 2>&1
+            sed -i '/zh_CN.UTF-8/s/^# //g' /etc/locale.gen 2>/dev/null || true
+            locale-gen zh_CN.UTF-8 > /dev/null 2>&1 || true
+        elif command -v yum &> /dev/null || command -v dnf &> /dev/null; then
+            yum install -y -q glibc-langpack-zh > /dev/null 2>&1 || \
+            dnf install -y -q glibc-langpack-zh > /dev/null 2>&1 || true
+        fi
+    fi
 }
 
 #===============================================================================
