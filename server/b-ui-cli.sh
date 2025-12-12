@@ -164,7 +164,7 @@ show_menu() {
     echo -e "${CYAN}║${NC}  ${YELLOW}6.${NC} 开机自启动设置                                           ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}7.${NC} ${GREEN}检查 B-UI 更新${NC}                                          ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}8.${NC} ${GREEN}更新内核 (Hysteria2 + Xray)${NC}                              ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}8.${NC} ${GREEN}更新内核/客户端 (Hysteria2 + Xray + Client)${NC}               ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}9.${NC} ${RED}完全卸载${NC}                                                 ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}0.${NC} 退出                                                     ${CYAN}║${NC}"
