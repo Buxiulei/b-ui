@@ -6,7 +6,7 @@
 # 版本: 1.2.0
 #===============================================================================
 
-SCRIPT_VERSION="1.3.0"
+SCRIPT_VERSION="1.4.0"
 
 # 注意: 不使用 set -e，因为它会导致 ((count++)) 等算术运算在变量为0时退出脚本
 
@@ -2015,14 +2015,26 @@ edit_rules() {
     fi
     
     echo ""
-    echo -e "${CYAN}路由绕过规则编辑${NC}"
-    echo ""
-    echo "当前规则文件: $RULES_FILE"
+    echo -e "${CYAN}路由绕过规则配置${NC}"
     echo ""
     
-    # 显示当前规则
-    echo -e "${YELLOW}当前规则:${NC}"
-    grep -v "^#" "$RULES_FILE" | grep -v "^$" || echo "  (无自定义规则)"
+    # 显示内置默认规则
+    echo -e "${YELLOW}[内置默认规则]${NC} (始终生效)"
+    echo -e "  ${GREEN}●${NC} SSH 端口: 22, 2222"
+    echo -e "  ${GREEN}●${NC} 私有 IP: 10.x.x.x, 192.168.x.x, 172.16-31.x.x"
+    echo -e "  ${GREEN}●${NC} 国内应用: 微信 腾讯 QQ 小红书 抖音 快手 B站 淘宝 支付宝 京东 百度"
+    echo ""
+    
+    # 显示自定义规则
+    echo -e "${YELLOW}[自定义规则]${NC} (文件: $RULES_FILE)"
+    local custom_rules=$(grep -v "^#" "$RULES_FILE" 2>/dev/null | grep -v "^$")
+    if [[ -n "$custom_rules" ]]; then
+        echo "$custom_rules" | while read -r rule; do
+            echo -e "  ${CYAN}+${NC} $rule"
+        done
+    else
+        echo -e "  ${YELLOW}(无自定义规则)${NC}"
+    fi
     echo ""
     
     echo "选择操作:"
