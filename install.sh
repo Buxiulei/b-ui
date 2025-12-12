@@ -224,21 +224,21 @@ download_all_files() {
     local FONT_DIR="${ADMIN_DIR}/fonts"
     local FONT_MIRROR="https://fonts.gstatic.com/s"
     
-    # 字体文件列表: 远程路径 -> 本地文件名
+    # 字体文件列表: 远程路径|本地文件名 (使用 | 分隔避免与 URL 中的 : 冲突)
     local fonts=(
-        "${FONT_MIRROR}/inter/v21/UcCO3FwrK3iLTeHuS_nVMrMxCp50SjIw2boKoduKmMEVuLyfAZ9hiJ-Ek-_EeA.woff2:inter-regular.woff2"
-        "${FONT_MIRROR}/inter/v21/UcCO3FwrK3iLTeHuS_nVMrMxCp50SjIw2boKoduKmMEVuI6fAZ9hiJ-Ek-_EeA.woff2:inter-medium.woff2"
-        "${FONT_MIRROR}/inter/v21/UcCO3FwrK3iLTeHuS_nVMrMxCp50SjIw2boKoduKmMEVuGKYAZ9hiJ-Ek-_EeA.woff2:inter-semibold.woff2"
-        "${FONT_MIRROR}/inter/v21/UcCO3FwrK3iLTeHuS_nVMrMxCp50SjIw2boKoduKmMEVuFuYAZ9hiJ-Ek-_EeA.woff2:inter-bold.woff2"
-        "${FONT_MIRROR}/jetbrainsmono/v18/tDbY2o-flEEny0FZhsfKu5WU4zr3E_BX0PnT8RD8yKxjPVmUsaaDhw.woff2:jetbrains-regular.woff2"
-        "${FONT_MIRROR}/notosanssc/v37/k3kCo84MPvpLmixcA63oeAL7Iqp5IZJF9bmaG9_FnYxNbPzS5HE.woff2:noto-sc-regular.woff2"
-        "${FONT_MIRROR}/notosanssc/v37/k3kCo84MPvpLmixcA63oeAL7Iqp5IZJF9bmaG9_FnYw1a_zS5HE.woff2:noto-sc-medium.woff2"
-        "${FONT_MIRROR}/notosanssc/v37/k3kCo84MPvpLmixcA63oeAL7Iqp5IZJF9bmaG9_FnYzbbPzS5HE.woff2:noto-sc-bold.woff2"
+        "${FONT_MIRROR}/inter/v21/UcCO3FwrK3iLTeHuS_nVMrMxCp50SjIw2boKoduKmMEVuLyfAZ9hiJ-Ek-_EeA.woff2|inter-regular.woff2"
+        "${FONT_MIRROR}/inter/v21/UcCO3FwrK3iLTeHuS_nVMrMxCp50SjIw2boKoduKmMEVuI6fAZ9hiJ-Ek-_EeA.woff2|inter-medium.woff2"
+        "${FONT_MIRROR}/inter/v21/UcCO3FwrK3iLTeHuS_nVMrMxCp50SjIw2boKoduKmMEVuGKYAZ9hiJ-Ek-_EeA.woff2|inter-semibold.woff2"
+        "${FONT_MIRROR}/inter/v21/UcCO3FwrK3iLTeHuS_nVMrMxCp50SjIw2boKoduKmMEVuFuYAZ9hiJ-Ek-_EeA.woff2|inter-bold.woff2"
+        "${FONT_MIRROR}/jetbrainsmono/v18/tDbY2o-flEEny0FZhsfKu5WU4zr3E_BX0PnT8RD8yKxjPVmUsaaDhw.woff2|jetbrains-regular.woff2"
+        "${FONT_MIRROR}/notosanssc/v37/k3kCo84MPvpLmixcA63oeAL7Iqp5IZJF9bmaG9_FnYxNbPzS5HE.woff2|noto-sc-regular.woff2"
+        "${FONT_MIRROR}/notosanssc/v37/k3kCo84MPvpLmixcA63oeAL7Iqp5IZJF9bmaG9_FnYw1a_zS5HE.woff2|noto-sc-medium.woff2"
+        "${FONT_MIRROR}/notosanssc/v37/k3kCo84MPvpLmixcA63oeAL7Iqp5IZJF9bmaG9_FnYzbbPzS5HE.woff2|noto-sc-bold.woff2"
     )
     
     local font_failed=0
     for item in "${fonts[@]}"; do
-        IFS=':' read -r url filename <<< "$item"
+        IFS='|' read -r url filename <<< "$item"
         local dest="${FONT_DIR}/${filename}"
         if [[ ! -f "$dest" ]]; then
             echo -n "  下载 ${filename}... "
@@ -246,7 +246,7 @@ download_all_files() {
                 echo -e "${GREEN}✓${NC}"
             else
                 echo -e "${YELLOW}跳过${NC}"
-                ((font_failed++))
+                ((font_failed++)) || true
             fi
         fi
     done
