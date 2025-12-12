@@ -6,7 +6,7 @@
 # 版本: 1.2.0
 #===============================================================================
 
-SCRIPT_VERSION="2.0.1"
+SCRIPT_VERSION="2.0.2"
 
 # 注意: 不使用 set -e，因为它会导致 ((count++)) 等算术运算在变量为0时退出脚本
 
@@ -866,7 +866,7 @@ install_all_cores() {
 generate_xray_config() {
     local xray_config="${BASE_DIR}/xray-config.json"
     local server_host=$(echo "$SERVER_ADDR" | cut -d':' -f1)
-    local server_port=$(echo "$SERVER_ADDR" | cut -d':' -f2)
+    local server_port=$(echo "$SERVER_ADDR" | cut -d':' -f2 | tr -cd '0-9')
     
     # 检测端口占用情况
     check_and_suggest_ports 1080 8080
@@ -970,9 +970,9 @@ generate_singbox_tun_config() {
     
     print_info "生成 sing-box TUN 配置..."
     
-    # 解析服务器信息
+    # 解析服务器信息 (移除端口号中的非数字字符，如尾部斜杠)
     local server_host=$(echo "$SERVER_ADDR" | cut -d':' -f1)
-    local server_port=$(echo "$SERVER_ADDR" | cut -d':' -f2)
+    local server_port=$(echo "$SERVER_ADDR" | cut -d':' -f2 | tr -cd '0-9')
     
     # 根据协议生成不同的 outbound
     local outbound_config=""
