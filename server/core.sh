@@ -266,6 +266,10 @@ collect_user_input() {
     read -p "请输入伪装网站 URL [默认: https://www.bing.com/]: " MASQUERADE_URL
     MASQUERADE_URL=${MASQUERADE_URL:-"https://www.bing.com/"}
     
+    # 预下载客户端核心（便于国内客户端安装）
+    read -p "是否预下载客户端核心包 (便于国内客户端安装)? [默认: y]: " PREDOWNLOAD_PACKAGES
+    PREDOWNLOAD_PACKAGES=${PREDOWNLOAD_PACKAGES:-y}
+    
     # 显示配置摘要
     echo ""
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
@@ -275,10 +279,15 @@ collect_user_input() {
     echo -e "  管理密码:   ${YELLOW}${ADMIN_PASSWORD}${NC}"
     echo -e "  首个用户:   ${YELLOW}${FIRST_USER}${NC}"
     echo -e "  用户密码:   ${YELLOW}${FIRST_USER_PASS}${NC}"
+    if [[ "$PREDOWNLOAD_PACKAGES" =~ ^[yY]$ ]]; then
+        echo -e "  预下载核心: ${YELLOW}是${NC}"
+    else
+        echo -e "  预下载核心: ${YELLOW}否${NC}"
+    fi
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
     
     # 保存配置到全局变量供其他函数使用
-    export DOMAIN EMAIL PORT ADMIN_PASSWORD FIRST_USER FIRST_USER_PASS MASQUERADE_URL
+    export DOMAIN EMAIL PORT ADMIN_PASSWORD FIRST_USER FIRST_USER_PASS MASQUERADE_URL PREDOWNLOAD_PACKAGES
 }
 
 #===============================================================================
