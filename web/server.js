@@ -560,9 +560,9 @@ const server = http.createServer(async (req, res) => {
         let clientScript = "";
 
         // 优先使用本地客户端脚本 (服务端更新后立即生效，无 CDN 延迟)
-        const PROJECT_ROOT = path.dirname(path.dirname(ADMIN_DIR)); // /opt/b-ui
-        const localClientScript = path.join(PROJECT_ROOT, "b-ui-client.sh");
-        const packagesClientScript = path.join(path.dirname(ADMIN_DIR), "packages", "b-ui-client.sh");
+        // BASE_DIR 已定义为 /opt/b-ui，直接使用
+        const localClientScript = path.join(BASE_DIR, "b-ui-client.sh");
+        const packagesClientScript = path.join(BASE_DIR, "packages", "b-ui-client.sh");
 
         if (fs.existsSync(localClientScript)) {
             // 方法1: 使用项目根目录的脚本 (推荐，与服务端同步更新)
