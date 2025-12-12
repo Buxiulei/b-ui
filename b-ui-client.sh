@@ -6,7 +6,7 @@
 # 版本: 1.2.0
 #===============================================================================
 
-SCRIPT_VERSION="2.0.2"
+SCRIPT_VERSION="2.0.3"
 
 # 注意: 不使用 set -e，因为它会导致 ((count++)) 等算术运算在变量为0时退出脚本
 
@@ -1693,6 +1693,12 @@ _configure_and_save() {
         
         create_service
         systemctl start "$CLIENT_SERVICE"
+        
+        # 如果选择了启用 TUN 模式，生成配置并启动
+        if [[ "$TUN_ENABLED" == "true" ]]; then
+            generate_singbox_tun_config "hysteria2"
+            start_tun_mode
+        fi
     else
         # VLESS-Reality 配置
         install_xray_client
@@ -1700,6 +1706,12 @@ _configure_and_save() {
         
         # 复制配置到配置目录
         cp "${BASE_DIR}/xray-config.json" "${config_dir}/xray-config.json"
+        
+        # 如果选择了启用 TUN 模式，生成配置并启动
+        if [[ "$TUN_ENABLED" == "true" ]]; then
+            generate_singbox_tun_config "vless-reality"
+            start_tun_mode
+        fi
     fi
     
     # 更新激活配置
