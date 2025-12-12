@@ -2735,15 +2735,16 @@ test_proxy() {
     
     if [[ -n "$download_size" && "$download_size" -gt 0 ]]; then
         local duration=$(awk "BEGIN {printf \"%.2f\", $end_time - $start_time}" 2>/dev/null)
-        local speed_kbps=$(awk "BEGIN {printf \"%.0f\", $download_size / $duration / 1024}" 2>/dev/null)
-        local speed_mbps=$(awk "BEGIN {printf \"%.2f\", $download_size / $duration / 1024 / 1024 * 8}" 2>/dev/null)
+        local speed_mbs=$(awk "BEGIN {printf \"%.2f\", $download_size / $duration / 1024 / 1024}" 2>/dev/null)
         
-        if [[ "${speed_mbps%.*}" -ge 10 ]]; then
-            echo -e "${GREEN}${speed_mbps} Mbps${NC} (优秀)"
-        elif [[ "${speed_mbps%.*}" -ge 5 ]]; then
-            echo -e "${YELLOW}${speed_mbps} Mbps${NC} (良好)"
+        # 评级标准：>1.25 MB/s (10Mbps) 优秀，>0.625 MB/s (5Mbps) 良好
+        local speed_int=${speed_mbs%.*}
+        if awk "BEGIN {exit !($speed_mbs >= 1.25)}" 2>/dev/null; then
+            echo -e "${GREEN}${speed_mbs} MB/s${NC} (优秀)"
+        elif awk "BEGIN {exit !($speed_mbs >= 0.625)}" 2>/dev/null; then
+            echo -e "${YELLOW}${speed_mbs} MB/s${NC} (良好)"
         else
-            echo -e "${RED}${speed_mbps} Mbps${NC} (较慢)"
+            echo -e "${RED}${speed_mbs} MB/s${NC} (较慢)"
         fi
         ((test_passed++))
     else
