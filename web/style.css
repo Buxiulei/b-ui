@@ -314,30 +314,87 @@ tr:hover td {
     border-color: rgba(180, 83, 9, 0.2);
 }
 
+/* Action Buttons */
 .ibtn {
-    width: 36px;
-    height: 36px;
-    border-radius: 10px;
-    border: none;
-    background: rgba(180, 83, 9, 0.05);
+    width: 32px;
+    height: 32px;
+    border-radius: 8px;
+    border: 1px solid transparent;
+    background: rgba(255, 255, 255, 0.4);
     color: var(--text-dim);
     cursor: pointer;
-    display: grid;
-    place-items: center;
-    transition: all 0.2s;
-    font-size: 16px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+    font-size: 15px;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.02);
 }
 
 .ibtn:hover {
-    background: rgba(180, 83, 9, 0.15);
+    transform: translateY(-2px);
+    box-shadow: 0 4px 8px rgba(120, 53, 15, 0.1);
     color: var(--text-main);
-    transform: scale(1.05);
+    background: rgba(255, 255, 255, 0.9);
+}
+
+.ibtn:active {
+    transform: translateY(0);
+}
+
+/* Button Variants */
+.ibtn.share {
+    color: #d97706;
+    background: rgba(251, 191, 36, 0.1);
+    border-color: rgba(251, 191, 36, 0.2);
+}
+
+.ibtn.share:hover {
+    background: #d97706;
+    color: white;
+    border-color: #d97706;
+    box-shadow: 0 4px 10px rgba(217, 119, 6, 0.3);
+}
+
+.ibtn.edit {
+    color: #0284c7;
+    background: rgba(56, 189, 248, 0.1);
+    border-color: rgba(56, 189, 248, 0.2);
+}
+
+.ibtn.edit:hover {
+    background: #0284c7;
+    color: white;
+    border-color: #0284c7;
+    box-shadow: 0 4px 10px rgba(2, 132, 199, 0.3);
+}
+
+.ibtn.warn {
+    color: #f59e0b;
+    background: rgba(245, 158, 11, 0.1);
+    border-color: rgba(245, 158, 11, 0.2);
+}
+
+.ibtn.warn:hover {
+    background: #f59e0b;
+    color: white;
+    border-color: #f59e0b;
+    box-shadow: 0 4px 10px rgba(245, 158, 11, 0.3);
+}
+
+.ibtn.danger {
+    color: #dc2626;
+    background: rgba(220, 38, 38, 0.1);
+    border-color: rgba(220, 38, 38, 0.2);
 }
 
 .ibtn.danger:hover {
-    background: var(--danger);
+    background: #dc2626;
     color: white;
+    border-color: #dc2626;
+    box-shadow: 0 4px 10px rgba(220, 38, 38, 0.3);
 }
+
 
 input,
 select {

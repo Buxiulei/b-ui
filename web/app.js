@@ -156,9 +156,9 @@ function load() {
                 '<td class="hide-m" style="font-family:monospace;color:var(--text-dim)">' + sz(total) + (tlim ? ' / ' + sz(tlim) : '') + '</td>' +
                 '<td>' +
                 '<div style="display:flex;gap:8px">' +
-                '<button class="ibtn" onclick="showU(\'' + esc(x.username).replace(/'/g, "\\'") + '\')" title="配置">⚙</button>' +
-                '<button class="ibtn" onclick="editUser(\'' + esc(x.username).replace(/'/g, "\\'") + '\')" title="编辑">✏️</button>' +
-                (on ? '<button class="ibtn danger" onclick="kick(\'' + esc(x.username).replace(/'/g, "\\'") + '\')" title="断开">⚡</button>' : '') +
+                '<button class="ibtn share" onclick="showU(\'' + esc(x.username).replace(/'/g, "\\'") + '\')" title="分享">🔗</button>' +
+                '<button class="ibtn edit" onclick="editUser(\'' + esc(x.username).replace(/'/g, "\\'") + '\')" title="编辑">✏️</button>' +
+                (on ? '<button class="ibtn warn" onclick="kick(\'' + esc(x.username).replace(/'/g, "\\'") + '\')" title="断开">⚡</button>' : '') +
                 '<button class="ibtn danger" onclick="del(\'' + esc(x.username).replace(/'/g, "\\'") + '\')" title="删除">🗑</button>' +
                 '</div>' +
                 '</td>' +
