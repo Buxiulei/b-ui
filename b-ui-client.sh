@@ -1704,6 +1704,11 @@ _configure_and_save() {
         install_xray_client
         generate_xray_config
         
+        # 询问是否启用 TUN 模式
+        read -p "启用 TUN 模式? (y/n) [默认 n]: " enable_tun
+        TUN_ENABLED="false"
+        [[ "$enable_tun" =~ ^[yY]$ ]] && TUN_ENABLED="true"
+        
         # 复制配置到配置目录
         cp "${BASE_DIR}/xray-config.json" "${config_dir}/xray-config.json"
         
