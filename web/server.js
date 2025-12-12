@@ -557,24 +557,69 @@ const server = http.createServer(async (req, res) => {
         const host = req.headers.host || "localhost";
         const serverDomain = host.split(":")[0];
 
-        // 读取客户端脚本
-        const PACKAGES_DIR = path.join(path.dirname(ADMIN_DIR), "packages");
-        const clientScriptPath = path.join(PACKAGES_DIR, "b-ui-client.sh");
+        // 优先从 GitHub 获取最新客户端脚本
+        const GITHUB_RAW = "https://raw.githubusercontent.com/Buxiulei/b-ui/main";
+        const GITHUB_CDN = "https://cdn.jsdelivr.net/gh/Buxiulei/b-ui@main";
 
         let clientScript = "";
-        try {
-            if (fs.existsSync(clientScriptPath)) {
-                clientScript = fs.readFileSync(clientScriptPath, "utf8");
-            } else {
-                // 如果本地没有脚本，返回从服务端下载的引导脚本
-                clientScript = generateBootstrapScript(serverDomain, key);
-            }
-        } catch (e) {
-            clientScript = generateBootstrapScript(serverDomain, key);
-        }
 
-        // 在脚本开头注入服务端地址
-        const injectedScript = `#!/bin/bash
+        // 异步获取 GitHub 脚本
+        const fetchFromGitHub = () => {
+            return new Promise((resolve) => {
+                const https = require("https");
+                // 先尝试 GitHub Raw
+                https.get(`${GITHUB_RAW}/b-ui-client.sh`, { timeout: 5000 }, (resp) => {
+                    if (resp.statusCode === 200) {
+                        let data = "";
+                        resp.on("data", chunk => data += chunk);
+                        resp.on("end", () => resolve(data));
+                    } else {
+                        // 尝试 CDN
+                        https.get(`${GITHUB_CDN}/b-ui-client.sh`, { timeout: 5000 }, (resp2) => {
+                            if (resp2.statusCode === 200) {
+                                let data = "";
+                                resp2.on("data", chunk => data += chunk);
+                                resp2.on("end", () => resolve(data));
+                            } else {
+                                resolve(null);
+                            }
+                        }).on("error", () => resolve(null));
+                    }
+                }).on("error", () => {
+                    // GitHub 失败，尝试 CDN
+                    https.get(`${GITHUB_CDN}/b-ui-client.sh`, { timeout: 5000 }, (resp) => {
+                        if (resp.statusCode === 200) {
+                            let data = "";
+                            resp.on("data", chunk => data += chunk);
+                            resp.on("end", () => resolve(data));
+                        } else {
+                            resolve(null);
+                        }
+                    }).on("error", () => resolve(null));
+                });
+            });
+        };
+
+        fetchFromGitHub().then(githubScript => {
+            if (githubScript) {
+                clientScript = githubScript;
+            } else {
+                // 回退到本地缓存或引导脚本
+                const PACKAGES_DIR = path.join(path.dirname(ADMIN_DIR), "packages");
+                const clientScriptPath = path.join(PACKAGES_DIR, "b-ui-client.sh");
+                try {
+                    if (fs.existsSync(clientScriptPath)) {
+                        clientScript = fs.readFileSync(clientScriptPath, "utf8");
+                    } else {
+                        clientScript = generateBootstrapScript(serverDomain, key);
+                    }
+                } catch (e) {
+                    clientScript = generateBootstrapScript(serverDomain, key);
+                }
+            }
+
+            // 在脚本开头注入服务端地址
+            const injectedScript = `#!/bin/bash
 # B-UI 客户端一键安装脚本
 # 服务端: ${serverDomain}
 # 安装时间: $(date)
@@ -590,11 +635,13 @@ echo "${serverDomain}" > /opt/hysteria-client/server_address
 ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
 `;
 
-        res.writeHead(200, {
-            "Content-Type": "text/x-shellscript; charset=utf-8",
-            "Content-Disposition": "inline; filename=\"b-ui-client-install.sh\""
+            res.writeHead(200, {
+                "Content-Type": "text/x-shellscript; charset=utf-8",
+                "Content-Disposition": "inline; filename=\"b-ui-client-install.sh\""
+            });
+            res.end(injectedScript);
         });
-        return res.end(injectedScript);
+        return;
     }
 
     // --- 客户端安装包下载 (无需认证) ---
