@@ -518,12 +518,26 @@ main() {
         chmod +x "${BASE_DIR}/b-ui-cli.sh"
     fi
     
+    # 配置定时自动更新 (每天凌晨3点)
+    setup_auto_update() {
+        local cron_job="0 3 * * * ${BASE_DIR}/server/update.sh auto >> /var/log/b-ui-update.log 2>&1"
+        
+        # 检查是否已存在
+        if ! crontab -l 2>/dev/null | grep -q "b-ui.*update.sh auto"; then
+            print_info "配置定时自动更新..."
+            (crontab -l 2>/dev/null; echo "$cron_job") | crontab -
+            print_success "已配置每天凌晨3点自动更新"
+        fi
+    }
+    setup_auto_update
+    
     echo ""
     echo -e "${GREEN}════════════════════════════════════════════════════════════════${NC}"
     echo -e "${GREEN}  安装完成！${NC}"
     echo -e "${GREEN}════════════════════════════════════════════════════════════════${NC}"
     echo ""
     echo -e "  终端管理: ${YELLOW}sudo b-ui${NC}"
+    echo -e "  自动更新: ${YELLOW}每天凌晨3点${NC} (日志: /var/log/b-ui-update.log)"
     echo ""
 }
 
