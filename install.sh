@@ -136,7 +136,8 @@ select_download_source() {
     # 测试 CDN
     local cdn_time=$(curl -o /dev/null -s -w '%{time_total}' --max-time 5 "${GITHUB_CDN}/version.json" 2>/dev/null || echo "999")
     
-    if (( $(echo "$cdn_time < $github_time" | bc -l 2>/dev/null || echo "0") )); then
+    # 使用 awk 比较浮点数（避免依赖 bc）
+    if awk "BEGIN {exit !($cdn_time < $github_time)}" 2>/dev/null; then
         DOWNLOAD_URL="$GITHUB_CDN"
         print_info "使用 CDN 镜像 (响应时间: ${cdn_time}s)"
     else
@@ -437,8 +438,11 @@ main() {
     
     # 检测安装状态
     local install_type
+    # 临时关闭 set -e，因为 check_old_version 用返回值表示安装类型（0/1/2）
+    set +e
     check_old_version
     install_type=$?
+    set -e
     
     case $install_type in
         0)  # 从旧版本升级
