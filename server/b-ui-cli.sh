@@ -322,6 +322,25 @@ update_kernel() {
         systemctl restart xray 2>/dev/null || true
         print_success "内核更新完成！"
     fi
+    
+    # 更新客户端安装包
+    echo ""
+    print_info "更新客户端安装包..."
+    local GITHUB_RAW="https://raw.githubusercontent.com/Buxiulei/b-ui/main"
+    local client_script="${BASE_DIR}/b-ui-client.sh"
+    
+    if curl -fsSL "${GITHUB_RAW}/b-ui-client.sh" -o "${client_script}.tmp" 2>/dev/null; then
+        local new_ver=$(grep "SCRIPT_VERSION=" "${client_script}.tmp" | head -1 | cut -d'"' -f2)
+        local old_ver=$(grep "SCRIPT_VERSION=" "${client_script}" 2>/dev/null | head -1 | cut -d'"' -f2 || echo "未知")
+        
+        mv "${client_script}.tmp" "${client_script}"
+        chmod +x "${client_script}"
+        echo -e "  客户端脚本: ${YELLOW}v${old_ver}${NC} -> ${GREEN}v${new_ver}${NC}"
+        print_success "客户端安装包更新完成！"
+    else
+        rm -f "${client_script}.tmp"
+        print_warning "客户端安装包更新失败，将使用现有版本"
+    fi
 }
 
 uninstall_all() {
