@@ -2,7 +2,7 @@
 
 基于 [Hysteria2](https://v2.hysteria.network/) 和 [Xray](https://github.com/XTLS/Xray-core) 的一键安装脚本，支持服务端和客户端部署，自带 Web 管理面板。
 
-**当前版本**: v2.4.0 (模块化版本)
+**当前版本**: v2.5.3 (模块化版本)
 
 ## ✨ 功能特性
 
@@ -39,14 +39,14 @@
 # 先切换到 root 用户
 sudo -i
 
-# 一键安装（推荐）
-bash <(curl -fsSL https://raw.githubusercontent.com/Buxiulei/b-ui/main/install.sh)
+# 一键安装（推荐，带缓存绕过）
+bash <(curl -fsSL "https://raw.githubusercontent.com/Buxiulei/b-ui/main/install.sh?$(date +%s)")
 ```
 
 **国内镜像：**
 ```bash
 sudo -i
-bash <(curl -fsSL https://cdn.jsdelivr.net/gh/Buxiulei/b-ui@main/install.sh)
+bash <(curl -fsSL "https://cdn.jsdelivr.net/gh/Buxiulei/b-ui@main/install.sh?$(date +%s)")
 ```
 
 ### 一键更新
@@ -59,7 +59,7 @@ sudo b-ui
 
 或者重新运行安装命令即可自动更新：
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Buxiulei/b-ui/main/install.sh)
+bash <(curl -fsSL "https://raw.githubusercontent.com/Buxiulei/b-ui/main/install.sh?$(date +%s)")
 ```
 
 ### 安装完成后
@@ -122,13 +122,13 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Buxiulei/b-ui/main/install.s
 sudo -i
 
 # 一键安装
-bash <(curl -fsSL https://raw.githubusercontent.com/Buxiulei/b-ui/main/b-ui-client.sh)
+bash <(curl -fsSL "https://raw.githubusercontent.com/Buxiulei/b-ui/main/b-ui-client.sh?$(date +%s)")
 ```
 
 **国内镜像（推荐）：**
 ```bash
 sudo -i
-bash <(curl -fsSL https://cdn.jsdelivr.net/gh/Buxiulei/b-ui@main/b-ui-client.sh)
+bash <(curl -fsSL "https://cdn.jsdelivr.net/gh/Buxiulei/b-ui@main/b-ui-client.sh?$(date +%s)")
 ```
 
 ### 自动依赖安装
