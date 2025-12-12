@@ -520,6 +520,13 @@ main() {
     
     # 配置定时自动更新 (每天凌晨3点)
     setup_auto_update() {
+        # 检查 crontab 是否可用
+        if ! command -v crontab &> /dev/null; then
+            print_warning "crontab 未安装，跳过自动更新配置"
+            print_info "如需自动更新，请手动安装 cron 后配置"
+            return
+        fi
+        
         local cron_job="0 3 * * * ${BASE_DIR}/server/update.sh auto >> /var/log/b-ui-update.log 2>&1"
         
         # 检查是否已存在
