@@ -2363,28 +2363,49 @@ show_status() {
     # 服务状态
     echo ""
     echo -e "${YELLOW}[服务状态]${NC}"
-    if systemctl is-active --quiet "$CLIENT_SERVICE" 2>/dev/null; then
-        echo -e "  Hysteria2: ${GREEN}✓ 运行中${NC}"
-    elif command -v hysteria &> /dev/null; then
-        echo -e "  Hysteria2: ${RED}✗ 已停止${NC}"
-    else
-        echo -e "  Hysteria2: ${YELLOW}○ 未安装${NC}"
-    fi
     
-    if systemctl is-active --quiet xray-client 2>/dev/null; then
-        echo -e "  Xray:      ${GREEN}✓ 运行中${NC}"
-    elif command -v xray &> /dev/null; then
-        echo -e "  Xray:      ${RED}✗ 已停止${NC}"
-    else
-        echo -e "  Xray:      ${YELLOW}○ 未安装${NC}"
-    fi
-    
+    # 检测 TUN 模式状态
+    local tun_running=false
+    local tun_protocol=""
     if systemctl is-active --quiet bui-tun 2>/dev/null; then
-        echo -e "  TUN 模式:  ${GREEN}✓ 运行中${NC} (sing-box)"
+        tun_running=true
+        # 从 sing-box 配置中读取协议类型
+        if [[ -f "${BASE_DIR}/singbox-tun.json" ]]; then
+            if grep -q '"type": "hysteria2"' "${BASE_DIR}/singbox-tun.json" 2>/dev/null; then
+                tun_protocol="Hysteria2"
+            elif grep -q '"type": "vless"' "${BASE_DIR}/singbox-tun.json" 2>/dev/null; then
+                tun_protocol="VLESS-Reality"
+            fi
+        fi
+    fi
+    
+    # TUN 模式优先显示
+    if $tun_running; then
+        echo -e "  TUN 模式:  ${GREEN}✓ 运行中${NC} (sing-box + ${tun_protocol:-未知协议})"
+        echo -e "  └─ 协议:   ${CYAN}${tun_protocol:-未知}${NC} (全局透明代理)"
     elif [[ -f /etc/systemd/system/bui-tun.service ]]; then
         echo -e "  TUN 模式:  ${RED}✗ 已停止${NC}"
     else
         echo -e "  TUN 模式:  ${YELLOW}○ 未配置${NC}"
+    fi
+    
+    # 独立代理服务（TUN 关闭时才显示运行状态）
+    if ! $tun_running; then
+        if systemctl is-active --quiet "$CLIENT_SERVICE" 2>/dev/null; then
+            echo -e "  Hysteria2: ${GREEN}✓ 运行中${NC}"
+        elif command -v hysteria &> /dev/null; then
+            echo -e "  Hysteria2: ${RED}✗ 已停止${NC}"
+        else
+            echo -e "  Hysteria2: ${YELLOW}○ 未安装${NC}"
+        fi
+        
+        if systemctl is-active --quiet xray-client 2>/dev/null; then
+            echo -e "  Xray:      ${GREEN}✓ 运行中${NC}"
+        elif command -v xray &> /dev/null; then
+            echo -e "  Xray:      ${RED}✗ 已停止${NC}"
+        else
+            echo -e "  Xray:      ${YELLOW}○ 未安装${NC}"
+        fi
     fi
     
     # 代理端口
