@@ -2718,11 +2718,9 @@ test_proxy() {
     else
         google_latency=$(curl -s -o /dev/null -w '%{time_total}' --max-time 10 --socks5-hostname "127.0.0.1:${socks_port}" https://www.google.com 2>/dev/null)
     fi
-    if [[ -n "$google_latency" && "$google_latency" != "0"* ]]; then
-        local latency_ms=$(echo "$google_latency * 1000" | bc 2>/dev/null | cut -d'.' -f1)
-        if [[ -z "$latency_ms" ]]; then
-            latency_ms=$(awk "BEGIN {printf \"%.0f\", $google_latency * 1000}" 2>/dev/null)
-        fi
+    # 检查是否有有效的延迟值（非空且不是纯 0）
+    if [[ -n "$google_latency" ]] && awk "BEGIN {exit !($google_latency > 0)}" 2>/dev/null; then
+        local latency_ms=$(awk "BEGIN {printf \"%.0f\", $google_latency * 1000}" 2>/dev/null)
         if [[ "$latency_ms" -lt 500 ]]; then
             echo -e "${GREEN}${latency_ms}ms${NC} (优秀)"
         elif [[ "$latency_ms" -lt 1000 ]]; then
@@ -2744,7 +2742,7 @@ test_proxy() {
     else
         yt_latency=$(curl -s -o /dev/null -w '%{time_total}' --max-time 10 --socks5-hostname "127.0.0.1:${socks_port}" https://www.youtube.com 2>/dev/null)
     fi
-    if [[ -n "$yt_latency" && "$yt_latency" != "0"* ]]; then
+    if [[ -n "$yt_latency" ]] && awk "BEGIN {exit !($yt_latency > 0)}" 2>/dev/null; then
         local yt_ms=$(awk "BEGIN {printf \"%.0f\", $yt_latency * 1000}" 2>/dev/null)
         if [[ "$yt_ms" -lt 500 ]]; then
             echo -e "${GREEN}${yt_ms}ms${NC}"
