@@ -702,6 +702,84 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                 return saveUsers(users) ? sendJSON(res, { success: true }) : sendJSON(res, { error: "Fail" }, 500);
             }
 
+            // Update user (PUT /api/users/:username)
+            if (r.startsWith("users/") && req.method === "PUT") {
+                const origUsername = decodeURIComponent(r.slice(6));
+                const b = await parseBody(req);
+                let users = loadUsers();
+                const userIndex = users.findIndex(u => u.username === origUsername);
+
+                if (userIndex < 0) {
+                    return sendJSON(res, { error: "User not found" }, 404);
+                }
+
+                const user = users[userIndex];
+
+                // 更新用户名
+                if (b.username && b.username !== origUsername) {
+                    // 检查新用户名是否已存在
+                    if (users.find(u => u.username === b.username)) {
+                        return sendJSON(res, { error: "Username already exists" }, 400);
+                    }
+                    user.username = b.username;
+                }
+
+                // 更新密码/UUID
+                if (b.password) {
+                    if (user.protocol === "vless-reality" || user.protocol === "vless-ws-tls") {
+                        user.uuid = b.password;
+                    } else {
+                        user.password = b.password;
+                    }
+                }
+
+                // 更新限制
+                if (!user.limits) user.limits = {};
+
+                // 有效期 (天数)
+                if (typeof b.days !== 'undefined') {
+                    if (b.days > 0) {
+                        user.limits.expiresAt = new Date(Date.now() + b.days * 86400000).toISOString();
+                    } else {
+                        delete user.limits.expiresAt;
+                    }
+                }
+
+                // 总流量限制 (GB)
+                if (typeof b.traffic !== 'undefined') {
+                    if (b.traffic > 0) {
+                        user.limits.trafficLimit = b.traffic * 1073741824;
+                    } else {
+                        delete user.limits.trafficLimit;
+                    }
+                }
+
+                // 月流量限制 (GB)
+                if (typeof b.monthly !== 'undefined') {
+                    if (b.monthly > 0) {
+                        user.limits.monthlyLimit = b.monthly * 1073741824;
+                    } else {
+                        delete user.limits.monthlyLimit;
+                    }
+                }
+
+                // 速度限制 (Mbps)
+                if (typeof b.speed !== 'undefined') {
+                    if (b.speed > 0) {
+                        user.limits.speedLimit = b.speed * 1000000;
+                    } else {
+                        delete user.limits.speedLimit;
+                    }
+                }
+
+                users[userIndex] = user;
+
+                if (saveUsers(users)) {
+                    return sendJSON(res, { success: true, user: user.username });
+                }
+                return sendJSON(res, { error: "Save failed" }, 500);
+            }
+
             if (r === "stats") return sendJSON(res, await getMergedStats());
             if (r === "online") return sendJSON(res, await getMergedOnline());
             if (r === "kick" && req.method === "POST") return sendJSON(res, await postStats("/kick", await parseBody(req)));

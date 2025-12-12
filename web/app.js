@@ -157,6 +157,7 @@ function load() {
                 '<td>' +
                 '<div style="display:flex;gap:8px">' +
                 '<button class="ibtn" onclick="showU(\'' + esc(x.username).replace(/'/g, "\\'") + '\')" title="Config">⚙</button>' +
+                '<button class="ibtn" onclick="editUser(\'' + esc(x.username).replace(/'/g, "\\'") + '\')" title="Edit">✏️</button>' +
                 (on ? '<button class="ibtn danger" onclick="kick(\'' + esc(x.username).replace(/'/g, "\\'") + '\')" title="Kick">⚡</button>' : '') +
                 '<button class="ibtn danger" onclick="del(\'' + esc(x.username).replace(/'/g, "\\'") + '\')" title="Delete">🗑</button>' +
                 '</div>' +
@@ -205,6 +206,77 @@ function del(u) {
 // Kick user
 function kick(u) {
     api("/kick", { method: "POST", body: JSON.stringify([u]) }).then(() => toast("User " + u + " kicked offline"));
+}
+
+// Edit user - open modal with current settings
+function editUser(uname) {
+    const x = allUsers.find(u => u.username === uname);
+    if (!x) return;
+
+    $("#edit-orig-username").value = x.username;
+    $("#edit-username").value = x.username;
+    $("#edit-password").value = "";  // 不显示密码，留空表示保持不变
+
+    // 填充限制设置
+    const limits = x.limits || {};
+
+    // 有效期转换为天数
+    if (limits.expiresAt) {
+        const expDate = new Date(limits.expiresAt);
+        const now = new Date();
+        const daysLeft = Math.max(0, Math.ceil((expDate - now) / (1000 * 60 * 60 * 24)));
+        $("#edit-days").value = daysLeft;
+    } else {
+        $("#edit-days").value = "";
+    }
+
+    // 流量转换为 GB
+    $("#edit-traffic").value = limits.trafficLimit ? (limits.trafficLimit / 1073741824).toFixed(1) : "";
+    $("#edit-monthly").value = limits.monthlyLimit ? (limits.monthlyLimit / 1073741824).toFixed(1) : "";
+    $("#edit-speed").value = limits.speedLimit ? (limits.speedLimit / 1000000) : "";
+
+    // 显示当前使用量
+    const m = new Date().toISOString().slice(0, 7);
+    const monthly = x.usage?.monthly?.[m] || 0;
+    const total = x.usage?.total || 0;
+    $("#edit-usage-info").innerHTML = "本月: " + sz(monthly) + " | 总计: " + sz(total);
+
+    openM("m-edit");
+}
+
+// Save user changes
+function saveUser() {
+    const origUsername = $("#edit-orig-username").value;
+    const newUsername = $("#edit-username").value;
+    const newPassword = $("#edit-password").value;
+    const days = $("#edit-days").value || 0;
+    const traffic = $("#edit-traffic").value || 0;
+    const monthly = $("#edit-monthly").value || 0;
+    const speed = $("#edit-speed").value || 0;
+
+    if (!newUsername) {
+        return toast("用户名不能为空", 1);
+    }
+
+    api("/users/" + encodeURIComponent(origUsername), {
+        method: "PUT",
+        body: JSON.stringify({
+            username: newUsername,
+            password: newPassword || undefined,
+            days: parseFloat(days),
+            traffic: parseFloat(traffic),
+            monthly: parseFloat(monthly),
+            speed: parseFloat(speed)
+        })
+    }).then(r => {
+        if (r.success) {
+            closeM();
+            toast("用户 " + newUsername + " 已更新");
+            load();
+        } else {
+            toast(r.error || "更新失败", 1);
+        }
+    });
 }
 
 // Generate URI
