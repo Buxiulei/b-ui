@@ -3153,8 +3153,9 @@ first_run_setup() {
     if [[ "$cores_installed" == "false" ]]; then
         echo ""
         print_warning "检测到首次运行，需要安装代理核心组件"
-        read -p "是否现在安装 Hysteria2/Xray/sing-box? (y/n): " install
-        if [[ "$install" =~ ^[yY]$ ]]; then
+        read -p "是否现在安装 Hysteria2/Xray/sing-box? [Y/n]: " install
+        # 默认为 Y，回车即安装
+        if [[ -z "$install" || "$install" =~ ^[yY]$ ]]; then
             install_all_cores
         fi
     fi
@@ -3166,9 +3167,11 @@ first_run_setup() {
             print_info "更新全局命令 bui-c..."
             create_global_command
         else
-            # 首次创建
-            read -p "是否创建全局命令 'bui-c'? (y/n): " create_cmd
-            [[ "$create_cmd" =~ ^[yY]$ ]] && create_global_command
+            # 首次创建，默认 Y
+            read -p "是否创建全局命令 'bui-c'? [Y/n]: " create_cmd
+            if [[ -z "$create_cmd" || "$create_cmd" =~ ^[yY]$ ]]; then
+                create_global_command
+            fi
         fi
     fi
 }
