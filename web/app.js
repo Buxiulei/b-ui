@@ -53,7 +53,7 @@ function login() {
                 localStorage.setItem("ap", pw);
                 init();
             } else {
-                toast("Authentication failed", 1);
+                toast("登录认证失败", 1);
             }
         });
 }
@@ -144,22 +144,22 @@ function load() {
             const exp = x.limits?.expiresAt ? new Date(x.limits.expiresAt) < new Date() : "";
             const tlim = x.limits?.trafficLimit;
             const over = tlim && total >= tlim;
-            const badge = exp ? ' <span class="tag" style="color:var(--danger)">EXPIRED</span>' : (over ? ' <span class="tag" style="color:var(--danger)">LIMIT</span>' : "");
+            const badge = exp ? ' <span class="tag" style="color:var(--danger)">已过期</span>' : (over ? ' <span class="tag" style="color:var(--danger)">流量耗尽</span>' : "");
             const proto = x.protocol || "hysteria2";
             const ptag = proto === "vless-reality" ? '<span class="proto-tag proto-vless">VLESS</span>' :
                 (proto === "vless-ws-tls" ? '<span class="proto-tag proto-ws">WS</span>' : '<span class="proto-tag proto-hy2">HY2</span>');
 
             return '<tr>' +
                 '<td><div style="display:flex;align-items:center;gap:8px"><span style="font-weight:600">' + esc(x.username) + '</span>' + ptag + badge + '</div></td>' +
-                '<td><span class="tag ' + (on ? 'on' : '') + ' ">' + (on ? on + ' Online' : 'Offline') + '</span></td>' +
+                '<td><span class="tag ' + (on ? 'on' : '') + ' ">' + (on ? on + ' 在线' : '离线') + '</span></td>' +
                 '<td class="hide-m" style="font-family:monospace;color:var(--text-dim)">' + sz(monthly) + '</td>' +
                 '<td class="hide-m" style="font-family:monospace;color:var(--text-dim)">' + sz(total) + (tlim ? ' / ' + sz(tlim) : '') + '</td>' +
                 '<td>' +
                 '<div style="display:flex;gap:8px">' +
-                '<button class="ibtn" onclick="showU(\'' + esc(x.username).replace(/'/g, "\\'") + '\')" title="Config">⚙</button>' +
-                '<button class="ibtn" onclick="editUser(\'' + esc(x.username).replace(/'/g, "\\'") + '\')" title="Edit">✏️</button>' +
-                (on ? '<button class="ibtn danger" onclick="kick(\'' + esc(x.username).replace(/'/g, "\\'") + '\')" title="Kick">⚡</button>' : '') +
-                '<button class="ibtn danger" onclick="del(\'' + esc(x.username).replace(/'/g, "\\'") + '\')" title="Delete">🗑</button>' +
+                '<button class="ibtn" onclick="showU(\'' + esc(x.username).replace(/'/g, "\\'") + '\')" title="配置">⚙</button>' +
+                '<button class="ibtn" onclick="editUser(\'' + esc(x.username).replace(/'/g, "\\'") + '\')" title="编辑">✏️</button>' +
+                (on ? '<button class="ibtn danger" onclick="kick(\'' + esc(x.username).replace(/'/g, "\\'") + '\')" title="断开">⚡</button>' : '') +
+                '<button class="ibtn danger" onclick="del(\'' + esc(x.username).replace(/'/g, "\\'") + '\')" title="删除">🗑</button>' +
                 '</div>' +
                 '</td>' +
                 '</tr>';
@@ -188,24 +188,24 @@ function addUser() {
     fetch(url).then(r => r.json()).then(r => {
         if (r.success) {
             closeM();
-            toast("User " + u + " created");
+            toast("用户 " + u + " 已创建");
             load();
         } else {
-            toast(r.error || "Failed", 1);
+            toast(r.error || "操作失败", 1);
         }
     });
 }
 
 // Delete user
 function del(u) {
-    if (confirm("Delete user " + u + "?")) {
+    if (confirm("确认删除用户 " + u + " 吗？")) {
         api("/users/" + encodeURIComponent(u), { method: "DELETE" }).then(() => load());
     }
 }
 
 // Kick user
 function kick(u) {
-    api("/kick", { method: "POST", body: JSON.stringify([u]) }).then(() => toast("User " + u + " kicked offline"));
+    api("/kick", { method: "POST", body: JSON.stringify([u]) }).then(() => toast("用户 " + u + " 已被断开"));
 }
 
 // Edit user - open modal with current settings
@@ -313,20 +313,20 @@ function showU(uname) {
 // Copy URI
 function copy() {
     navigator.clipboard.writeText($("#uri").innerText);
-    toast("Copied to clipboard");
+    toast("链接已复制到剪贴板");
 }
 
 // Change password
 function changePwd() {
     const np = $("#newpwd").value;
-    if (np.length < 6) return toast("Password min 6 chars", 1);
+    if (np.length < 6) return toast("密码至少需要6个字符", 1);
     api("/password", { method: "POST", body: JSON.stringify({ newPassword: np }) }).then(r => {
         if (r.success) {
             closeM();
-            toast("Password updated, please login again");
+            toast("密码已修改，请重新登录");
             setTimeout(() => logout(), 2000);
         } else {
-            toast(r.error || "Failed", 1);
+            toast(r.error || "操作失败", 1);
         }
     });
 }
@@ -348,7 +348,7 @@ function saveMasq() {
             toast("伪装网站已更新: " + r.domain);
             setTimeout(() => location.reload(), 2000);
         } else {
-            toast(r.error || "Failed", 1);
+            toast(r.error || "操作失败", 1);
         }
     });
 }

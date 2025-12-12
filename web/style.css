@@ -42,7 +42,7 @@
 }
 
 body {
-    font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+    font-family: 'Inter', 'PingFang SC', 'Microsoft YaHei', 'Noto Sans SC', system-ui, -apple-system, sans-serif;
     background-color: var(--bg-deep);
     background-image: var(--bg-mesh);
     background-attachment: fixed;
