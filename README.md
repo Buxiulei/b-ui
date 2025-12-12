@@ -2,7 +2,7 @@
 
 基于 [Hysteria2](https://v2.hysteria.network/) 和 [Xray](https://github.com/XTLS/Xray-core) 的一键安装脚本，支持服务端和客户端部署，自带 Web 管理面板。
 
-**当前版本**: v2.5.3 (模块化版本)
+**当前版本**: v2.7.2 (模块化版本)
 
 ## ✨ 功能特性
 
@@ -19,7 +19,7 @@
 - ⚡ BBR 优化
 - 🖥️ `b-ui` 终端管理命令
 - 📡 **免流 SNI 选择** - 支持电信/联通/移动免流域名
-- 🔄 **自动更新** - 内置版本检查，一键更新面板
+- 🔄 **自动更新** - 每小时自动检查更新，cron 定时任务
 
 ### 客户端
 - 🔌 **多协议导入** - Hysteria2 + VLESS-Reality + VLESS-WS 链接
@@ -80,7 +80,7 @@ bash <(curl -fsSL "https://raw.githubusercontent.com/Buxiulei/b-ui/main/install.
 ║  5. 开启 BBR                                                 ║
 ║  6. 开机自启动设置                                           ║
 ║  7. 检查 B-UI 更新              <-- 新增                     ║
-║  8. 更新内核 (Hysteria2 + Xray)                              ║
+║  8. 更新内核/客户端 (Hysteria2 + Xray + Client)             ║
 ║  9. 完全卸载                                                 ║
 ║  0. 退出                                                     ║
 ╚══════════════════════════════════════════════════════════════╝
@@ -141,7 +141,7 @@ bash <(curl -fsSL "https://cdn.jsdelivr.net/gh/Buxiulei/b-ui@main/b-ui-client.sh
 - tar, gzip (解压)
 - ca-certificates (HTTPS)
 
-### 客户端菜单 (v1.2.0)
+### 客户端菜单 (v2.2.0)
 ```
 ╔══════════════════════════════════════════════════════════════╗
 ║              B-UI 客户端 操作菜单                            ║
