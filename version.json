@@ -1,6 +1,6 @@
 {
-    "version": "2.4.0",
-    "updated": "2025-12-11",
+    "version": "2.5.0",
+    "updated": "2025-12-12",
     "files": [
         "install.sh",
         "server/core.sh",
@@ -12,6 +12,7 @@
         "web/app.js"
     ],
     "changelog": {
+        "2.5.0": "UI 皇家红金风格美化，全面汉化，操作按钮重设计",
         "2.4.0": "模块化重构，支持自动更新"
     }
 }
