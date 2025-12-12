@@ -126,23 +126,27 @@ check_dependencies() {
 # 网络检测与下载
 #===============================================================================
 
-# 自动选择最快的下载源
+# 全局网络环境变量
+NETWORK_ENV=""  # "global" = 国外环境, "china" = 国内环境
+FONT_CDN=""     # 字体下载源
+
+# 检测网络环境并选择下载源
 select_download_source() {
-    print_info "检测最佳下载源..."
+    print_info "检测网络环境..."
     
-    # 测试 GitHub 直连
-    local github_time=$(curl -o /dev/null -s -w '%{time_total}' --max-time 5 "${GITHUB_RAW}/version.json" 2>/dev/null || echo "999")
-    
-    # 测试 CDN
-    local cdn_time=$(curl -o /dev/null -s -w '%{time_total}' --max-time 5 "${GITHUB_CDN}/version.json" 2>/dev/null || echo "999")
-    
-    # 使用 awk 比较浮点数（避免依赖 bc）
-    if awk "BEGIN {exit !($cdn_time < $github_time)}" 2>/dev/null; then
-        DOWNLOAD_URL="$GITHUB_CDN"
-        print_info "使用 CDN 镜像 (响应时间: ${cdn_time}s)"
-    else
+    # 测试 Google 连通性 (3秒超时)
+    if curl -fsSL --max-time 3 "https://www.google.com" -o /dev/null 2>/dev/null; then
+        NETWORK_ENV="global"
+        print_success "检测到国外网络环境"
         DOWNLOAD_URL="$GITHUB_RAW"
-        print_info "使用 GitHub 直连 (响应时间: ${github_time}s)"
+        FONT_CDN="https://cdn.jsdelivr.net/fontsource/fonts"
+        print_info "使用 GitHub 直连 + Fontsource CDN"
+    else
+        NETWORK_ENV="china"
+        print_warning "检测到国内网络环境 (无法连接 Google)"
+        DOWNLOAD_URL="$GITHUB_CDN"
+        FONT_CDN="https://cdn.jsdelivr.net/fontsource/fonts"  # jsDelivr 国内也能用
+        print_info "使用 jsDelivr CDN 镜像"
     fi
 }
 
@@ -223,21 +227,22 @@ download_all_files() {
     print_info "下载字体文件..."
     local FONT_DIR="${ADMIN_DIR}/fonts"
     
-    # 字体文件列表: 远程URL|本地文件名 (使用 Fontsource CDN，稳定可靠)
+    # 字体文件列表: 相对路径|本地文件名 (使用全局 FONT_CDN 变量)
     local fonts=(
-        "https://cdn.jsdelivr.net/fontsource/fonts/inter@latest/latin-400-normal.woff2|inter-regular.woff2"
-        "https://cdn.jsdelivr.net/fontsource/fonts/inter@latest/latin-500-normal.woff2|inter-medium.woff2"
-        "https://cdn.jsdelivr.net/fontsource/fonts/inter@latest/latin-600-normal.woff2|inter-semibold.woff2"
-        "https://cdn.jsdelivr.net/fontsource/fonts/inter@latest/latin-700-normal.woff2|inter-bold.woff2"
-        "https://cdn.jsdelivr.net/fontsource/fonts/jetbrains-mono@latest/latin-400-normal.woff2|jetbrains-regular.woff2"
-        "https://cdn.jsdelivr.net/fontsource/fonts/noto-sans-sc@latest/chinese-simplified-400-normal.woff2|noto-sc-regular.woff2"
-        "https://cdn.jsdelivr.net/fontsource/fonts/noto-sans-sc@latest/chinese-simplified-500-normal.woff2|noto-sc-medium.woff2"
-        "https://cdn.jsdelivr.net/fontsource/fonts/noto-sans-sc@latest/chinese-simplified-700-normal.woff2|noto-sc-bold.woff2"
+        "inter@latest/latin-400-normal.woff2|inter-regular.woff2"
+        "inter@latest/latin-500-normal.woff2|inter-medium.woff2"
+        "inter@latest/latin-600-normal.woff2|inter-semibold.woff2"
+        "inter@latest/latin-700-normal.woff2|inter-bold.woff2"
+        "jetbrains-mono@latest/latin-400-normal.woff2|jetbrains-regular.woff2"
+        "noto-sans-sc@latest/chinese-simplified-400-normal.woff2|noto-sc-regular.woff2"
+        "noto-sans-sc@latest/chinese-simplified-500-normal.woff2|noto-sc-medium.woff2"
+        "noto-sans-sc@latest/chinese-simplified-700-normal.woff2|noto-sc-bold.woff2"
     )
     
     local font_failed=0
     for item in "${fonts[@]}"; do
-        IFS='|' read -r url filename <<< "$item"
+        IFS='|' read -r path filename <<< "$item"
+        local url="${FONT_CDN}/${path}"
         local dest="${FONT_DIR}/${filename}"
         if [[ ! -f "$dest" ]]; then
             echo -n "  下载 ${filename}... "
