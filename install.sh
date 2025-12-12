@@ -384,6 +384,14 @@ run_core_install() {
     
     # 创建全局命令
     create_global_command
+    
+    # 询问是否预下载客户端安装包
+    echo ""
+    read -p "是否预下载客户端安装包 (便于国内客户端安装)? (y/n) [默认 y]: " download_packages
+    download_packages=${download_packages:-y}
+    if [[ "$download_packages" =~ ^[yY]$ ]]; then
+        download_client_packages
+    fi
 }
 
 #===============================================================================

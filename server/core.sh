@@ -539,6 +539,96 @@ EOF
 }
 
 #===============================================================================
+# 预下载客户端安装包
+# 解决国内客户端无法直连 GitHub 的问题
+#===============================================================================
+
+PACKAGES_DIR="${BASE_DIR}/packages"
+
+download_client_packages() {
+    print_info "预下载客户端安装包..."
+    mkdir -p "$PACKAGES_DIR"
+    
+    local arch=$(uname -m)
+    local arch_suffix
+    case "$arch" in
+        x86_64) arch_suffix="amd64" ;;
+        aarch64) arch_suffix="arm64" ;;
+        *) arch_suffix="amd64" ;;
+    esac
+    
+    # 获取最新版本号
+    print_info "获取最新版本信息..."
+    
+    # Hysteria2 版本
+    local hy2_version=$(curl -fsSL --max-time 15 "https://api.github.com/repos/apernet/hysteria/releases/latest" 2>/dev/null | grep '"tag_name"' | sed -E 's/.*"app\/v([^"]+)".*/\1/')
+    [[ -z "$hy2_version" ]] && hy2_version="2.6.1"
+    
+    # Xray 版本
+    local xray_version=$(curl -fsSL --max-time 15 "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null | grep '"tag_name"' | sed -E 's/.*"v([^"]+)".*/\1/')
+    [[ -z "$xray_version" ]] && xray_version="25.1.1"
+    
+    # sing-box 版本
+    local singbox_version=$(curl -fsSL --max-time 15 "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null | grep '"tag_name"' | sed -E 's/.*"v([^"]+)".*/\1/')
+    [[ -z "$singbox_version" ]] && singbox_version="1.10.0"
+    
+    # 保存版本信息
+    cat > "$PACKAGES_DIR/versions.json" << EOF
+{
+  "hysteria2": "${hy2_version}",
+  "xray": "${xray_version}",
+  "singbox": "${singbox_version}",
+  "updated": "$(date -Iseconds)"
+}
+EOF
+    
+    # 下载 Hysteria2
+    print_info "下载 Hysteria2 v${hy2_version}..."
+    local hy2_url="https://github.com/apernet/hysteria/releases/download/app/v${hy2_version}/hysteria-linux-${arch_suffix}"
+    if curl -fsSL --max-time 120 "$hy2_url" -o "$PACKAGES_DIR/hysteria-linux-${arch_suffix}" 2>/dev/null; then
+        chmod +x "$PACKAGES_DIR/hysteria-linux-${arch_suffix}"
+        print_success "Hysteria2 下载完成"
+    else
+        print_warning "Hysteria2 下载失败，客户端将使用备用方式安装"
+    fi
+    
+    # 下载 Xray
+    print_info "下载 Xray v${xray_version}..."
+    local xray_url="https://github.com/XTLS/Xray-core/releases/download/v${xray_version}/Xray-linux-64.zip"
+    [[ "$arch_suffix" == "arm64" ]] && xray_url="https://github.com/XTLS/Xray-core/releases/download/v${xray_version}/Xray-linux-arm64-v8a.zip"
+    if curl -fsSL --max-time 120 "$xray_url" -o "$PACKAGES_DIR/xray-linux-${arch_suffix}.zip" 2>/dev/null; then
+        print_success "Xray 下载完成"
+    else
+        print_warning "Xray 下载失败，客户端将使用备用方式安装"
+    fi
+    
+    # 下载 sing-box
+    print_info "下载 sing-box v${singbox_version}..."
+    local singbox_url="https://github.com/SagerNet/sing-box/releases/download/v${singbox_version}/sing-box-${singbox_version}-linux-${arch_suffix}.tar.gz"
+    if curl -fsSL --max-time 120 "$singbox_url" -o "$PACKAGES_DIR/sing-box-linux-${arch_suffix}.tar.gz" 2>/dev/null; then
+        print_success "sing-box 下载完成"
+    else
+        print_warning "sing-box 下载失败，客户端将使用备用方式安装"
+    fi
+    
+    # 复制客户端脚本
+    print_info "准备客户端安装脚本..."
+    local client_script_url="https://raw.githubusercontent.com/Buxiulei/b-ui/main/b-ui-client.sh"
+    if curl -fsSL --max-time 60 "$client_script_url" -o "$PACKAGES_DIR/b-ui-client.sh" 2>/dev/null; then
+        chmod +x "$PACKAGES_DIR/b-ui-client.sh"
+        print_success "客户端脚本准备完成"
+    else
+        print_warning "客户端脚本下载失败"
+    fi
+    
+    # 显示下载结果
+    echo ""
+    print_info "已下载的安装包:"
+    ls -lh "$PACKAGES_DIR" 2>/dev/null | grep -v "^total"
+    echo ""
+}
+
+#===============================================================================
 # 部署 Web 面板
 #===============================================================================
 
