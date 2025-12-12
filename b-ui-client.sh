@@ -6,7 +6,7 @@
 # 版本: 1.2.0
 #===============================================================================
 
-SCRIPT_VERSION="2.1.1"
+SCRIPT_VERSION="2.2.0"
 
 # 注意: 不使用 set -e，因为它会导致 ((count++)) 等算术运算在变量为0时退出脚本
 
@@ -3142,9 +3142,28 @@ main() {
 SCRIPT_URL="https://raw.githubusercontent.com/Buxiulei/b-ui/main/b-ui-client.sh"
 
 create_global_command() {
-    print_info "创建全局命令 bui-c..."
+    print_info "创建/更新全局命令 bui-c..."
     
-    # 优先从服务端下载
+    # 获取当前脚本的实际路径
+    local current_script=""
+    
+    # 如果当前脚本可读且行数足够，直接复制
+    if [[ -r "$0" ]] && [[ "$0" != "/usr/local/bin/bui-c" ]]; then
+        local self_lines=$(wc -l < "$0" 2>/dev/null || echo "0")
+        if [[ "$self_lines" -gt 1000 ]]; then
+            current_script="$0"
+        fi
+    fi
+    
+    # 方法1: 直接复制当前脚本（最可靠）
+    if [[ -n "$current_script" ]]; then
+        cp "$current_script" /usr/local/bin/bui-c
+        chmod +x /usr/local/bin/bui-c
+        print_success "全局命令已更新 (当前版本 v${SCRIPT_VERSION})"
+        return 0
+    fi
+    
+    # 方法2: 从服务端下载
     if download_from_server "b-ui-client.sh" "/usr/local/bin/bui-c"; then
         chmod +x /usr/local/bin/bui-c
         local lines=$(wc -l < /usr/local/bin/bui-c 2>/dev/null || echo "0")
