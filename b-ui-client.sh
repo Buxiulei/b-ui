@@ -6,7 +6,7 @@
 # 版本: 1.2.0
 #===============================================================================
 
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="2.0.1"
 
 # 注意: 不使用 set -e，因为它会导致 ((count++)) 等算术运算在变量为0时退出脚本
 
@@ -57,6 +57,18 @@ print_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
 # 进度动画 - 在后台运行命令时显示旋转动画
+# JSON 字符串转义函数
+json_escape() {
+    local str="$1"
+    # 转义反斜杠、双引号、换行等特殊字符
+    str="${str//\\/\\\\}"    # 反斜杠
+    str="${str//\"/\\\"}"    # 双引号
+    str="${str//$'\n'/\\n}"  # 换行
+    str="${str//$'\r'/\\r}"  # 回车
+    str="${str//$'\t'/\\t}"  # Tab
+    echo "$str"
+}
+
 spinner_pid=""
 start_spinner() {
     local msg="${1:-请稍候...}"
@@ -964,17 +976,26 @@ generate_singbox_tun_config() {
     
     # 根据协议生成不同的 outbound
     local outbound_config=""
+    
+    # JSON 转义敏感字段
+    local safe_password=$(json_escape "${AUTH_PASSWORD}")
+    local safe_server=$(json_escape "${server_host}")
+    local safe_sni=$(json_escape "${SNI:-$server_host}")
+    local safe_uuid=$(json_escape "${UUID}")
+    local safe_pubkey=$(json_escape "${PUBLIC_KEY}")
+    local safe_shortid=$(json_escape "${SHORT_ID}")
+    
     if [[ "$protocol" == "hysteria2" ]]; then
         outbound_config=$(cat <<OUTBOUND
     {
       "type": "hysteria2",
       "tag": "proxy-out",
-      "server": "${server_host}",
+      "server": "${safe_server}",
       "server_port": ${server_port},
-      "password": "${AUTH_PASSWORD}",
+      "password": "${safe_password}",
       "tls": {
         "enabled": true,
-        "server_name": "${SNI:-$server_host}",
+        "server_name": "${safe_sni}",
         "insecure": ${INSECURE:-false}
       }
     }
@@ -985,21 +1006,21 @@ OUTBOUND
     {
       "type": "vless",
       "tag": "proxy-out",
-      "server": "${server_host}",
+      "server": "${safe_server}",
       "server_port": ${server_port},
-      "uuid": "${UUID}",
+      "uuid": "${safe_uuid}",
       "flow": "${FLOW:-xtls-rprx-vision}",
       "tls": {
         "enabled": true,
-        "server_name": "${SNI}",
+        "server_name": "${safe_sni}",
         "utls": {
           "enabled": true,
           "fingerprint": "${FINGERPRINT:-chrome}"
         },
         "reality": {
           "enabled": true,
-          "public_key": "${PUBLIC_KEY}",
-          "short_id": "${SHORT_ID}"
+          "public_key": "${safe_pubkey}",
+          "short_id": "${safe_shortid}"
         }
       }
     }
