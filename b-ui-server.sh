@@ -2413,7 +2413,8 @@ quick_install() {
     
     # 10. 预下载客户端安装包 (可选，用于国内客户端)
     echo ""
-    read -p "是否预下载客户端安装包 (便于国内客户端安装)? (y/n): " download_packages
+    read -p "是否预下载客户端安装包 (便于国内客户端安装)? (y/n) [默认 y]: " download_packages
+    download_packages=${download_packages:-y}
     if [[ "$download_packages" =~ ^[yY]$ ]]; then
         download_client_packages
     fi
