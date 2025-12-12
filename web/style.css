@@ -1,3 +1,78 @@
+/* ==========================================================================
+   Local Fonts - 本地字体定义
+   ========================================================================== */
+
+/* Inter */
+@font-face {
+    font-family: 'Inter';
+    font-style: normal;
+    font-weight: 400;
+    font-display: swap;
+    src: url('/fonts/inter-regular.woff2') format('woff2');
+}
+
+@font-face {
+    font-family: 'Inter';
+    font-style: normal;
+    font-weight: 500;
+    font-display: swap;
+    src: url('/fonts/inter-medium.woff2') format('woff2');
+}
+
+@font-face {
+    font-family: 'Inter';
+    font-style: normal;
+    font-weight: 600;
+    font-display: swap;
+    src: url('/fonts/inter-semibold.woff2') format('woff2');
+}
+
+@font-face {
+    font-family: 'Inter';
+    font-style: normal;
+    font-weight: 700;
+    font-display: swap;
+    src: url('/fonts/inter-bold.woff2') format('woff2');
+}
+
+/* JetBrains Mono */
+@font-face {
+    font-family: 'JetBrains Mono';
+    font-style: normal;
+    font-weight: 400;
+    font-display: swap;
+    src: url('/fonts/jetbrains-regular.woff2') format('woff2');
+}
+
+/* Noto Sans SC */
+@font-face {
+    font-family: 'Noto Sans SC';
+    font-style: normal;
+    font-weight: 400;
+    font-display: swap;
+    src: url('/fonts/noto-sc-regular.woff2') format('woff2');
+}
+
+@font-face {
+    font-family: 'Noto Sans SC';
+    font-style: normal;
+    font-weight: 500;
+    font-display: swap;
+    src: url('/fonts/noto-sc-medium.woff2') format('woff2');
+}
+
+@font-face {
+    font-family: 'Noto Sans SC';
+    font-style: normal;
+    font-weight: 700;
+    font-display: swap;
+    src: url('/fonts/noto-sc-bold.woff2') format('woff2');
+}
+
+/* ==========================================================================
+   CSS Variables
+   ========================================================================== */
+
 :root {
     --bg-deep: #FDFBF7;
     --bg-mesh: radial-gradient(at 0% 0%, rgba(220, 38, 38, 0.08) 0px, transparent 50%),
