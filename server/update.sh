@@ -338,7 +338,63 @@ check_and_update() {
     ensure_cli_exists
 }
 
+#===============================================================================
+# 静默自动更新 (用于 cron 定时任务)
+#===============================================================================
+
+auto_update() {
+    local LOG_FILE="/var/log/b-ui-update.log"
+    
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 开始自动检查更新..." >> "$LOG_FILE"
+    
+    local local_ver=$(get_local_version)
+    local remote_ver=$(get_remote_version)
+    
+    if [[ -z "$remote_ver" ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] 错误: 无法获取远程版本" >> "$LOG_FILE"
+        return 1
+    fi
+    
+    version_compare "$remote_ver" "$local_ver"
+    local result=$?
+    
+    if [[ $result -eq 1 ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] 发现新版本: v${local_ver} -> v${remote_ver}" >> "$LOG_FILE"
+        
+        # 执行静默更新
+        select_download_source
+        
+        # 下载新文件
+        local files=("version.json" "install.sh" "server/core.sh" "server/b-ui-cli.sh" "server/update.sh" "web/server.js" "web/index.html" "web/style.css" "web/app.js" "b-ui-client.sh")
+        
+        for file in "${files[@]}"; do
+            local local_path="${BASE_DIR}/${file}"
+            mkdir -p "$(dirname "$local_path")"
+            
+            if curl -fsSL "${DOWNLOAD_URL}/${file}" -o "$local_path" 2>/dev/null; then
+                chmod +x "$local_path" 2>/dev/null || true
+            fi
+        done
+        
+        # 重启服务
+        systemctl restart b-ui-admin 2>/dev/null || true
+        
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] 更新完成: v${remote_ver}" >> "$LOG_FILE"
+    else
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] 已是最新版本: v${local_ver}" >> "$LOG_FILE"
+    fi
+}
+
 # 如果直接运行此脚本
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-    check_and_update
+    case "${1:-}" in
+        auto)
+            # 静默自动更新模式 (用于 cron)
+            auto_update
+            ;;
+        *)
+            # 交互模式
+            check_and_update
+            ;;
+    esac
 fi
