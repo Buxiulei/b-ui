@@ -6,7 +6,7 @@
 # 版本: 1.2.0
 #===============================================================================
 
-SCRIPT_VERSION="1.4.0"
+SCRIPT_VERSION="1.5.0"
 
 # 注意: 不使用 set -e，因为它会导致 ((count++)) 等算术运算在变量为0时退出脚本
 
@@ -2851,10 +2851,17 @@ first_run_setup() {
         fi
     fi
     
-    # 创建全局命令
-    if [[ ! -f /usr/local/bin/bui-c && "$0" != "/usr/local/bin/bui-c" ]]; then
-        read -p "是否创建全局命令 'bui-c'? (y/n): " create_cmd
-        [[ "$create_cmd" =~ ^[yY]$ ]] && create_global_command
+    # 创建或更新全局命令
+    if [[ "$0" != "/usr/local/bin/bui-c" ]]; then
+        if [[ -f /usr/local/bin/bui-c ]]; then
+            # 自动更新
+            print_info "更新全局命令 bui-c..."
+            create_global_command
+        else
+            # 首次创建
+            read -p "是否创建全局命令 'bui-c'? (y/n): " create_cmd
+            [[ "$create_cmd" =~ ^[yY]$ ]] && create_global_command
+        fi
     fi
 }
 
