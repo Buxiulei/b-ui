@@ -6,7 +6,7 @@
 # 版本: 1.2.0
 #===============================================================================
 
-SCRIPT_VERSION="1.5.0"
+SCRIPT_VERSION="1.6.0"
 
 # 注意: 不使用 set -e，因为它会导致 ((count++)) 等算术运算在变量为0时退出脚本
 
@@ -92,6 +92,74 @@ run_with_spinner() {
     return $ret
 }
 
+# 远程版本检查 URL (使用 jsDelivr CDN)
+REMOTE_VERSION_URL="https://cdn.jsdelivr.net/gh/Buxiulei/b-ui@main/b-ui-client.sh"
+GITHUB_RAW_URL="https://raw.githubusercontent.com/Buxiulei/b-ui/main/b-ui-client.sh"
+
+# 全局变量存储更新状态
+UPDATE_AVAILABLE=""
+REMOTE_VERSION=""
+
+# 检查客户端更新
+check_client_update() {
+    # 尝试获取远程脚本的版本号
+    local remote_script=""
+    
+    # 先尝试 jsDelivr CDN
+    remote_script=$(curl -fsSL --max-time 5 "$REMOTE_VERSION_URL" 2>/dev/null | head -20)
+    
+    # 如果失败，尝试 GitHub Raw
+    if [[ -z "$remote_script" ]]; then
+        remote_script=$(curl -fsSL --max-time 5 "$GITHUB_RAW_URL" 2>/dev/null | head -20)
+    fi
+    
+    if [[ -n "$remote_script" ]]; then
+        REMOTE_VERSION=$(echo "$remote_script" | grep -oP 'SCRIPT_VERSION="\K[^"]+' | head -1)
+        if [[ -n "$REMOTE_VERSION" && "$REMOTE_VERSION" != "$SCRIPT_VERSION" ]]; then
+            # 版本比较
+            if [[ "$(printf '%s\n' "$REMOTE_VERSION" "$SCRIPT_VERSION" | sort -V | tail -n1)" == "$REMOTE_VERSION" ]]; then
+                UPDATE_AVAILABLE="true"
+                return 0
+            fi
+        fi
+    fi
+    
+    UPDATE_AVAILABLE=""
+    return 1
+}
+
+# 执行客户端更新
+do_client_update() {
+    print_info "正在更新客户端..."
+    
+    local temp_script="/tmp/b-ui-client-new.sh"
+    
+    # 下载新版本
+    if curl -fsSL --max-time 60 "$REMOTE_VERSION_URL" -o "$temp_script" 2>/dev/null || \
+       curl -fsSL --max-time 60 "$GITHUB_RAW_URL" -o "$temp_script" 2>/dev/null; then
+        
+        # 验证下载的脚本
+        local lines=$(wc -l < "$temp_script" 2>/dev/null || echo "0")
+        if [[ "$lines" -gt 100 ]]; then
+            # 更新 bui-c
+            cp "$temp_script" /usr/local/bin/bui-c
+            chmod +x /usr/local/bin/bui-c
+            rm -f "$temp_script"
+            
+            print_success "客户端已更新至 v${REMOTE_VERSION}"
+            echo ""
+            print_info "请重新运行 bui-c 使更新生效"
+            exit 0
+        else
+            rm -f "$temp_script"
+            print_error "下载的脚本不完整"
+            return 1
+        fi
+    else
+        print_error "下载失败"
+        return 1
+    fi
+}
 
 check_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -2659,6 +2727,13 @@ show_menu() {
     echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}11.${NC} 更新内核 (Hysteria2/Xray/sing-box)                    ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}12.${NC} 开机自启动设置                                        ${CYAN}║${NC}"
+    # 显示更新客户端选项，如果有新版本则高亮显示
+    if [[ "$UPDATE_AVAILABLE" == "true" ]]; then
+        echo -e "${CYAN}║${NC}  ${YELLOW}14.${NC} ${GREEN}⬆ 更新客户端${NC} ${RED}(有新版本 v${REMOTE_VERSION})${NC}               ${CYAN}║${NC}"
+    else
+        echo -e "${CYAN}║${NC}  ${YELLOW}14.${NC} 检查/更新客户端                                      ${CYAN}║${NC}"
+    fi
+    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}13.${NC} ${RED}卸载${NC}                                                 ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}0.${NC} 退出                                                   ${CYAN}║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
@@ -2673,11 +2748,14 @@ main() {
         check_dependencies
     fi
     
+    # 后台检查客户端更新 (静默检查，不阻塞启动)
+    check_client_update &>/dev/null &
+    
     while true; do
         print_banner
         show_status
         show_menu
-        read -p "请选择 [0-13]: " choice
+        read -p "请选择 [0-14]: " choice
         
         case $choice in
             1) import_from_uri ;;
@@ -2782,6 +2860,28 @@ main() {
                 fi
                 ;;
             13) uninstall ;;
+            14) 
+                # 更新客户端
+                echo ""
+                if [[ "$UPDATE_AVAILABLE" == "true" ]]; then
+                    echo -e "发现新版本: ${YELLOW}v${SCRIPT_VERSION}${NC} -> ${GREEN}v${REMOTE_VERSION}${NC}"
+                    read -p "是否立即更新? (y/n): " confirm
+                    if [[ "$confirm" =~ ^[yY]$ ]]; then
+                        do_client_update
+                    fi
+                else
+                    print_info "检查更新中..."
+                    if check_client_update; then
+                        echo -e "发现新版本: ${YELLOW}v${SCRIPT_VERSION}${NC} -> ${GREEN}v${REMOTE_VERSION}${NC}"
+                        read -p "是否立即更新? (y/n): " confirm
+                        if [[ "$confirm" =~ ^[yY]$ ]]; then
+                            do_client_update
+                        fi
+                    else
+                        print_success "已是最新版本 (v${SCRIPT_VERSION})"
+                    fi
+                fi
+                ;;
             0) echo ""; print_info "再见！"; exit 0 ;;
             *) print_error "无效选项" ;;
         esac
