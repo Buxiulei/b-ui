@@ -846,7 +846,8 @@ generate_xray_config() {
       {"type": "field", "domain": ["geosite:private"], "outboundTag": "direct"},
       {"type": "field", "ip": ["geoip:private"], "outboundTag": "direct"},
       {"type": "field", "domain": ["geosite:cn"], "outboundTag": "direct"},
-      {"type": "field", "ip": ["geoip:cn"], "outboundTag": "direct"}
+      {"type": "field", "ip": ["geoip:cn"], "outboundTag": "direct"},
+      {"type": "field", "domain": ["keyword:wechat", "keyword:weixin", "keyword:tencent", "keyword:qq", "keyword:xiaohongshu", "keyword:douyin", "keyword:bytedance", "keyword:toutiao", "keyword:kuaishou", "keyword:bilibili", "keyword:taobao", "keyword:alipay", "keyword:alibaba", "keyword:tmall", "keyword:jd", "keyword:baidu"], "outboundTag": "direct"}
     ]
   }
 }
@@ -1019,6 +1020,11 @@ ${outbound_config},
       },
       {
         "ip_is_private": true,
+        "action": "route",
+        "outbound": "direct-out"
+      },
+      {
+        "domain_keyword": ["wechat", "weixin", "tencent", "qq", "xiaohongshu", "douyin", "bytedance", "toutiao", "kuaishou", "bilibili", "taobao", "alipay", "alibaba", "tmall", "jd", "baidu"],
         "action": "route",
         "outbound": "direct-out"
       }
