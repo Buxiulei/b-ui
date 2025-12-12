@@ -6,7 +6,7 @@
 # 版本: 1.2.0
 #===============================================================================
 
-SCRIPT_VERSION="1.6.0"
+SCRIPT_VERSION="1.7.0"
 
 # 注意: 不使用 set -e，因为它会导致 ((count++)) 等算术运算在变量为0时退出脚本
 
@@ -2541,17 +2541,142 @@ show_status() {
 }
 
 test_proxy() {
-    print_info "测试代理..."
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${CYAN}                    代理连接测试${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
     
-    local port=$(grep -A1 "^socks5:" "$CONFIG_FILE" 2>/dev/null | grep "listen:" | sed 's/.*://')
-    port=${port:-1080}
+    local test_passed=0
+    local test_failed=0
     
-    # 使用 --socks5-hostname 让代理服务端解析 DNS，避免国内 DNS 污染
-    if curl -s --max-time 15 --socks5-hostname "127.0.0.1:${port}" https://www.google.com > /dev/null 2>&1; then
-        print_success "代理连接正常"
+    # 检测当前运行模式
+    local tun_running=false
+    local hy_running=false
+    local xray_running=false
+    local current_protocol=""
+    
+    if systemctl is-active --quiet bui-tun 2>/dev/null; then
+        tun_running=true
+        # 从配置读取协议
+        if [[ -f "${BASE_DIR}/singbox-tun.json" ]]; then
+            if grep -q '"type": "hysteria2"' "${BASE_DIR}/singbox-tun.json" 2>/dev/null; then
+                current_protocol="Hysteria2"
+            elif grep -q '"type": "vless"' "${BASE_DIR}/singbox-tun.json" 2>/dev/null; then
+                current_protocol="VLESS-Reality"
+            fi
+        fi
+        echo -e "${YELLOW}当前模式:${NC} TUN 全局透明代理 (${current_protocol:-未知协议})"
     else
-        print_warning "无法访问 Google，检查配置"
+        if systemctl is-active --quiet "$CLIENT_SERVICE" 2>/dev/null; then
+            hy_running=true
+            current_protocol="Hysteria2"
+        fi
+        if systemctl is-active --quiet xray-client 2>/dev/null; then
+            xray_running=true
+            current_protocol="VLESS-Reality"
+        fi
+        
+        if $hy_running || $xray_running; then
+            echo -e "${YELLOW}当前模式:${NC} SOCKS5/HTTP 代理 (${current_protocol})"
+        else
+            echo -e "${RED}警告:${NC} 未检测到运行中的代理服务"
+            echo ""
+            print_warning "请先启动服务 (选项 5) 或开启 TUN 模式 (选项 8)"
+            return 1
+        fi
     fi
+    echo ""
+    
+    # 测试 1: 检查代理端口
+    echo -e "${YELLOW}[测试 1]${NC} 检查代理端口..."
+    local socks_port=""
+    local http_port=""
+    
+    if $tun_running; then
+        # TUN 模式从 sing-box 配置读取端口
+        socks_port=$(grep -o '"listen_port": [0-9]*' "${BASE_DIR}/singbox-tun.json" 2>/dev/null | head -1 | grep -o '[0-9]*')
+        http_port=$(grep -o '"listen_port": [0-9]*' "${BASE_DIR}/singbox-tun.json" 2>/dev/null | tail -1 | grep -o '[0-9]*')
+    else
+        # 从 Hysteria2 或 Xray 配置读取
+        socks_port=$(grep -A1 "^socks5:" "$CONFIG_FILE" 2>/dev/null | grep "listen:" | sed 's/.*://')
+        http_port=$(grep -A1 "^http:" "$CONFIG_FILE" 2>/dev/null | grep "listen:" | sed 's/.*://')
+    fi
+    socks_port=${socks_port:-1080}
+    http_port=${http_port:-8080}
+    
+    if ss -tlnp 2>/dev/null | grep -q ":${socks_port}\b"; then
+        echo -e "  SOCKS5 (${socks_port}): ${GREEN}✓ 监听中${NC}"
+        ((test_passed++))
+    else
+        echo -e "  SOCKS5 (${socks_port}): ${RED}✗ 未监听${NC}"
+        ((test_failed++))
+    fi
+    
+    if ss -tlnp 2>/dev/null | grep -q ":${http_port}\b"; then
+        echo -e "  HTTP   (${http_port}): ${GREEN}✓ 监听中${NC}"
+        ((test_passed++))
+    else
+        echo -e "  HTTP   (${http_port}): ${YELLOW}○ 未监听${NC} (可选)"
+    fi
+    echo ""
+    
+    # 测试 2: 通过代理访问外网
+    echo -e "${YELLOW}[测试 2]${NC} 测试代理连通性..."
+    
+    if $tun_running; then
+        # TUN 模式直接测试，流量会自动走 TUN
+        echo -n "  Google (直连测试): "
+        if curl -s --max-time 10 https://www.google.com -o /dev/null 2>&1; then
+            echo -e "${GREEN}✓ 连通${NC}"
+            ((test_passed++))
+        else
+            echo -e "${RED}✗ 失败${NC}"
+            ((test_failed++))
+        fi
+    else
+        # SOCKS5 代理测试
+        echo -n "  Google (SOCKS5): "
+        if curl -s --max-time 10 --socks5-hostname "127.0.0.1:${socks_port}" https://www.google.com -o /dev/null 2>&1; then
+            echo -e "${GREEN}✓ 连通${NC}"
+            ((test_passed++))
+        else
+            echo -e "${RED}✗ 失败${NC}"
+            ((test_failed++))
+        fi
+    fi
+    
+    # 测试国内网站（验证直连规则）
+    echo -n "  百度 (直连规则): "
+    if curl -s --max-time 5 https://www.baidu.com -o /dev/null 2>&1; then
+        echo -e "${GREEN}✓ 连通${NC}"
+        ((test_passed++))
+    else
+        echo -e "${YELLOW}○ 超时${NC}"
+    fi
+    echo ""
+    
+    # 测试 3: 检查 DNS 解析
+    echo -e "${YELLOW}[测试 3]${NC} DNS 解析测试..."
+    echo -n "  解析 google.com: "
+    local google_ip=$(dig +short google.com A 2>/dev/null | head -1)
+    if [[ -n "$google_ip" ]]; then
+        echo -e "${GREEN}✓${NC} ($google_ip)"
+        ((test_passed++))
+    else
+        echo -e "${RED}✗ 解析失败${NC}"
+        ((test_failed++))
+    fi
+    echo ""
+    
+    # 汇总结果
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    if [[ $test_failed -eq 0 ]]; then
+        echo -e "${GREEN}测试结果: 全部通过 (${test_passed} 项)${NC}"
+    else
+        echo -e "${YELLOW}测试结果: 通过 ${test_passed} 项, 失败 ${test_failed} 项${NC}"
+    fi
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
 }
 
 #===============================================================================
