@@ -205,6 +205,13 @@ do_update() {
     # 更新服务配置路径（如果需要）
     update_service_paths
     
+    # 确保 CLI 命令存在
+    if [[ -f "${BASE_DIR}/b-ui-cli.sh" ]]; then
+        ln -sf "${BASE_DIR}/b-ui-cli.sh" /usr/local/bin/b-ui
+        chmod +x /usr/local/bin/b-ui
+        chmod +x "${BASE_DIR}/b-ui-cli.sh"
+    fi
+    
     # 重启服务
     print_info "重启服务..."
     systemctl start b-ui-admin 2>/dev/null || true

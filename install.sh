@@ -507,6 +507,13 @@ main() {
             ;;
     esac
     
+    # 确保 CLI 命令存在（无论哪种安装类型）
+    if [[ -f "${BASE_DIR}/b-ui-cli.sh" ]]; then
+        ln -sf "${BASE_DIR}/b-ui-cli.sh" /usr/local/bin/b-ui
+        chmod +x /usr/local/bin/b-ui
+        chmod +x "${BASE_DIR}/b-ui-cli.sh"
+    fi
+    
     echo ""
     echo -e "${GREEN}════════════════════════════════════════════════════════════════${NC}"
     echo -e "${GREEN}  安装完成！${NC}"
