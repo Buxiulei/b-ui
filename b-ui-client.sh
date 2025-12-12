@@ -6,7 +6,7 @@
 # 版本: 1.2.0
 #===============================================================================
 
-SCRIPT_VERSION="1.7.0"
+SCRIPT_VERSION="1.8.0"
 
 # 注意: 不使用 set -e，因为它会导致 ((count++)) 等算术运算在变量为0时退出脚本
 
@@ -2666,6 +2666,88 @@ test_proxy() {
     else
         echo -e "${RED}✗ 解析失败${NC}"
         ((test_failed++))
+    fi
+    echo ""
+    
+    # 测试 4: 延迟测试
+    echo -e "${YELLOW}[测试 4]${NC} 延迟测试..."
+    
+    # Google 延迟
+    echo -n "  Google 延迟: "
+    local google_latency=""
+    if $tun_running; then
+        google_latency=$(curl -s -o /dev/null -w '%{time_total}' --max-time 10 https://www.google.com 2>/dev/null)
+    else
+        google_latency=$(curl -s -o /dev/null -w '%{time_total}' --max-time 10 --socks5-hostname "127.0.0.1:${socks_port}" https://www.google.com 2>/dev/null)
+    fi
+    if [[ -n "$google_latency" && "$google_latency" != "0"* ]]; then
+        local latency_ms=$(echo "$google_latency * 1000" | bc 2>/dev/null | cut -d'.' -f1)
+        if [[ -z "$latency_ms" ]]; then
+            latency_ms=$(awk "BEGIN {printf \"%.0f\", $google_latency * 1000}" 2>/dev/null)
+        fi
+        if [[ "$latency_ms" -lt 500 ]]; then
+            echo -e "${GREEN}${latency_ms}ms${NC} (优秀)"
+        elif [[ "$latency_ms" -lt 1000 ]]; then
+            echo -e "${YELLOW}${latency_ms}ms${NC} (良好)"
+        else
+            echo -e "${RED}${latency_ms}ms${NC} (较慢)"
+        fi
+        ((test_passed++))
+    else
+        echo -e "${RED}超时${NC}"
+        ((test_failed++))
+    fi
+    
+    # YouTube 延迟 (可选)
+    echo -n "  YouTube 延迟: "
+    local yt_latency=""
+    if $tun_running; then
+        yt_latency=$(curl -s -o /dev/null -w '%{time_total}' --max-time 10 https://www.youtube.com 2>/dev/null)
+    else
+        yt_latency=$(curl -s -o /dev/null -w '%{time_total}' --max-time 10 --socks5-hostname "127.0.0.1:${socks_port}" https://www.youtube.com 2>/dev/null)
+    fi
+    if [[ -n "$yt_latency" && "$yt_latency" != "0"* ]]; then
+        local yt_ms=$(awk "BEGIN {printf \"%.0f\", $yt_latency * 1000}" 2>/dev/null)
+        if [[ "$yt_ms" -lt 500 ]]; then
+            echo -e "${GREEN}${yt_ms}ms${NC}"
+        elif [[ "$yt_ms" -lt 1000 ]]; then
+            echo -e "${YELLOW}${yt_ms}ms${NC}"
+        else
+            echo -e "${RED}${yt_ms}ms${NC}"
+        fi
+    else
+        echo -e "${YELLOW}超时${NC}"
+    fi
+    echo ""
+    
+    # 测试 5: 简单网速测试
+    echo -e "${YELLOW}[测试 5]${NC} 下载速度测试..."
+    echo -n "  Cloudflare 测速: "
+    local start_time=$(date +%s.%N)
+    local download_size=0
+    
+    if $tun_running; then
+        download_size=$(curl -s --max-time 5 -o /dev/null -w '%{size_download}' https://speed.cloudflare.com/__down?bytes=1000000 2>/dev/null)
+    else
+        download_size=$(curl -s --max-time 5 -o /dev/null -w '%{size_download}' --socks5-hostname "127.0.0.1:${socks_port}" https://speed.cloudflare.com/__down?bytes=1000000 2>/dev/null)
+    fi
+    local end_time=$(date +%s.%N)
+    
+    if [[ -n "$download_size" && "$download_size" -gt 0 ]]; then
+        local duration=$(awk "BEGIN {printf \"%.2f\", $end_time - $start_time}" 2>/dev/null)
+        local speed_kbps=$(awk "BEGIN {printf \"%.0f\", $download_size / $duration / 1024}" 2>/dev/null)
+        local speed_mbps=$(awk "BEGIN {printf \"%.2f\", $download_size / $duration / 1024 / 1024 * 8}" 2>/dev/null)
+        
+        if [[ "${speed_mbps%.*}" -ge 10 ]]; then
+            echo -e "${GREEN}${speed_mbps} Mbps${NC} (优秀)"
+        elif [[ "${speed_mbps%.*}" -ge 5 ]]; then
+            echo -e "${YELLOW}${speed_mbps} Mbps${NC} (良好)"
+        else
+            echo -e "${RED}${speed_mbps} Mbps${NC} (较慢)"
+        fi
+        ((test_passed++))
+    else
+        echo -e "${YELLOW}测速失败${NC}"
     fi
     echo ""
     
