@@ -312,6 +312,114 @@ function getConfig() {
     }
 }
 
+// 生成 sing-box 融合配置 (Hy2 优先 + VLESS 备用)
+function generateSingboxConfig(user, cfg, host) {
+    const outbounds = [];
+    const outboundTags = [];
+
+    // 1. Hysteria2 出站 (如果用户有密码)
+    if (user.password) {
+        let serverPort = cfg.port;
+        // 如果启用端口跳跃，使用端口范围格式
+        if (cfg.portHopping && cfg.portHopping.enabled) {
+            serverPort = `${cfg.portHopping.start}-${cfg.portHopping.end}`;
+        }
+
+        outbounds.push({
+            type: "hysteria2",
+            tag: "hy2-proxy",
+            server: host,
+            server_port: parseInt(cfg.port),
+            // 端口跳跃配置
+            ...(cfg.portHopping?.enabled ? {
+                hop_ports: `${cfg.portHopping.start}-${cfg.portHopping.end}`,
+                hop_interval: "30s"
+            } : {}),
+            password: `${user.username}:${user.password}`,
+            tls: {
+                enabled: true,
+                server_name: host,
+                insecure: false
+            }
+        });
+        outboundTags.push("hy2-proxy");
+    }
+
+    // 2. VLESS-Reality 出站 (如果用户有 UUID)
+    if (user.uuid && (user.protocol === "vless-reality" || !user.protocol)) {
+        outbounds.push({
+            type: "vless",
+            tag: "vless-proxy",
+            server: host,
+            server_port: cfg.xrayPort,
+            uuid: user.uuid,
+            flow: "xtls-rprx-vision",
+            tls: {
+                enabled: true,
+                server_name: user.sni || cfg.sni || "www.bing.com",
+                utls: { enabled: true, fingerprint: "chrome" },
+                reality: {
+                    enabled: true,
+                    public_key: cfg.pubKey,
+                    short_id: cfg.shortId
+                }
+            }
+        });
+        outboundTags.push("vless-proxy");
+    }
+
+    // 3. 自动选择出站 (urltest - Hy2优先)
+    if (outboundTags.length > 0) {
+        outbounds.push({
+            type: "urltest",
+            tag: "auto-select",
+            outbounds: outboundTags,
+            url: "https://www.gstatic.com/generate_204",
+            interval: "1m",
+            tolerance: 100,
+            interrupt_exist_connections: true
+        });
+    }
+
+    // 4. 直连和屏蔽
+    outbounds.push({ type: "direct", tag: "direct" });
+    outbounds.push({ type: "block", tag: "block" });
+
+    // 完整 sing-box 配置
+    return {
+        log: { level: "info", timestamp: true },
+        dns: {
+            servers: [
+                { tag: "google", address: "https://8.8.8.8/dns-query", detour: "auto-select" },
+                { tag: "local", address: "223.5.5.5", detour: "direct" }
+            ],
+            rules: [
+                { domain_suffix: [".cn", ".内"], server: "local" },
+                { query_type: ["A", "AAAA"], server: "google" }
+            ],
+            final: "google"
+        },
+        inbounds: [
+            {
+                type: "mixed",
+                tag: "mixed-in",
+                listen: "127.0.0.1",
+                listen_port: 7890
+            }
+        ],
+        outbounds,
+        route: {
+            rules: [
+                { protocol: "dns", outbound: "dns-out" },
+                { geoip: ["cn", "private"], outbound: "direct" },
+                { geosite: "cn", outbound: "direct" }
+            ],
+            final: "auto-select",
+            auto_detect_interface: true
+        }
+    };
+}
+
 function fetchStats(ep) {
     return new Promise(s => {
         const r = http.request({
@@ -757,6 +865,26 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                 });
             }
 
+            // sing-box 订阅 API (Hy2 + VLESS 融合配置)
+            if (r.startsWith("subscription/")) {
+                const username = decodeURIComponent(r.slice(13));
+                const users = loadUsers();
+                const user = users.find(u => u.username === username);
+                if (!user) return sendJSON(res, { error: "User not found" }, 404);
+
+                const cfg = getConfig();
+                const host = req.headers.host?.split(":")[0] || cfg.domain;
+
+                // 构建 sing-box 配置
+                const singboxConfig = generateSingboxConfig(user, cfg, host);
+
+                res.writeHead(200, {
+                    "Content-Type": "application/json",
+                    "Content-Disposition": `inline; filename="${username}.json"`
+                });
+                return res.end(JSON.stringify(singboxConfig, null, 2));
+            }
+
             const auth = verifyToken((req.headers.authorization || "").replace("Bearer ", ""));
             if (!auth) return sendJSON(res, { error: "Unauthorized" }, 401);
 
@@ -913,7 +1041,7 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
         } catch (e) { return sendJSON(res, { error: e.message }, 500); }
     }
 
-    // Hysteria2 HTTP Auth Endpoint
+    // Hysteria2 HTTP Auth Endpoint (支持用户级别限速)
     if (p === "/auth/hysteria" && req.method === "POST") {
         const body = await parseBody(req);
         const authStr = body.auth || "";
@@ -923,11 +1051,21 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
         if (user) {
             const check = checkUserLimits(user);
             if (check.ok) {
-                return sendJSON(res, { ok: true, id: username });
+                // 返回用户级别限速 (根据 Hysteria2 HTTP Auth 规范)
+                const response = { ok: true, id: username };
+                // 如果用户有限速设置，添加到响应中 (bps)
+                if (user.limits?.speedLimit) {
+                    response.rx = user.limits.speedLimit; // 下载限制
+                    response.tx = user.limits.speedLimit; // 上传限制
+                }
+                log("AUTH", `User ${username} authenticated with speed limit: ${user.limits?.speedLimit || 'unlimited'}`);
+                return sendJSON(res, response);
             } else {
+                log("AUTH", `User ${username} rejected: ${check.reason}`);
                 return sendJSON(res, { ok: false, id: username });
             }
         }
+        log("AUTH", `Auth failed for user: ${username}`);
         return sendJSON(res, { ok: false });
     }
 

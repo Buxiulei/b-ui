@@ -32,9 +32,14 @@ function closeM() { document.querySelectorAll(".modal").forEach(e => e.classList
 
 // API helper
 function api(ep, opt = {}) {
+    const headers = { Authorization: "Bearer " + tok, ...opt.headers };
+    // 如果有 body 且是字符串（JSON），添加 Content-Type
+    if (opt.body && typeof opt.body === 'string') {
+        headers['Content-Type'] = 'application/json';
+    }
     return fetch("/api" + ep, {
         ...opt,
-        headers: { ...opt.headers, Authorization: "Bearer " + tok }
+        headers
     }).then(r => {
         if (r.status == 401) logout();
         return r.json();
@@ -304,10 +309,14 @@ function genUri(x) {
         "@" + cfg.domain + ":" + portStr + "/?sni=" + cfg.domain + "&insecure=0#" + encodeURIComponent(x.username);
 }
 
+// 当前显示的用户名 (用于下载订阅)
+let currentShowUser = null;
+
 // Show user config
 function showU(uname) {
     const x = allUsers.find(u => u.username === uname);
     if (!x) return;
+    currentShowUser = x;
     const uri = genUri(x);
     $("#uri").innerText = uri;
     $("#qrcode").innerHTML = '<img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=' +
@@ -319,6 +328,14 @@ function showU(uname) {
 function copy() {
     navigator.clipboard.writeText($("#uri").innerText);
     toast("链接已复制到剪贴板");
+}
+
+// 下载 sing-box 融合订阅配置
+function downloadSubscription() {
+    if (!currentShowUser) return toast("请先选择用户", 1);
+    const url = "/api/subscription/" + encodeURIComponent(currentShowUser.username);
+    window.open(url, "_blank");
+    toast("正在下载 sing-box 配置...");
 }
 
 // Change password

@@ -316,14 +316,14 @@ configure_hysteria() {
     mkdir -p "$BASE_DIR"
     chmod 755 "$BASE_DIR"
     
-    # 创建用户文件
+    # 创建用户文件 (包含限速信息)
     cat > "$USERS_FILE" << EOF
-[{"username":"${FIRST_USER}","password":"${FIRST_USER_PASS}","createdAt":"$(date -Iseconds)"}]
+[{"username":"${FIRST_USER}","password":"${FIRST_USER_PASS}","createdAt":"$(date -Iseconds)","limits":{"speedLimit":100000000}}]
 EOF
     
-    # 生成配置文件（含 QUIC 流控优化）
+    # 生成配置文件（使用 HTTP 认证支持用户级别限速）
     cat > "$CONFIG_FILE" << EOF
-# Hysteria2 服务器配置
+# Hysteria2 服务器配置 (v2.9.0)
 # 生成时间: $(date)
 
 listen: :${PORT}
@@ -339,10 +339,12 @@ quic:
   initConnReceiveWindow: 67108864
   maxConnReceiveWindow: 67108864
 
+# HTTP 认证 (支持用户级别限速)
 auth:
-  type: userpass
-  userpass:
-    ${FIRST_USER}: ${FIRST_USER_PASS}
+  type: http
+  http:
+    url: http://127.0.0.1:8080/auth/hysteria
+    insecure: false
 
 trafficStats:
   listen: 127.0.0.1:9999
@@ -358,7 +360,7 @@ EOF
     chmod 644 "$CONFIG_FILE"
     chmod 644 "$USERS_FILE"
     
-    print_success "配置文件已生成: $CONFIG_FILE"
+    print_success "配置文件已生成: $CONFIG_FILE (HTTP 认证模式)"
 }
 
 #===============================================================================
