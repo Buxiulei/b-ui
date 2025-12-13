@@ -345,13 +345,13 @@ function generateSingboxConfig(user, cfg, host) {
         outboundTags.push("hy2-proxy");
     }
 
-    // 2. VLESS-Reality 出站 (如果用户有 UUID)
-    if (user.uuid && (user.protocol === "vless-reality" || !user.protocol)) {
+    // 2. VLESS-Reality 出站 (如果用户有 UUID 且服务器配置了 Xray)
+    if (user.uuid && cfg.pubKey && cfg.shortId) {
         outbounds.push({
             type: "vless",
             tag: "vless-proxy",
             server: host,
-            server_port: cfg.xrayPort,
+            server_port: cfg.xrayPort || 10001,
             uuid: user.uuid,
             flow: "xtls-rprx-vision",
             tls: {
@@ -579,20 +579,35 @@ function handleManage(params, res) {
         if (!user) return sendJSON(res, { error: "Missing user" }, 400);
         if (users.find(u => u.username === user)) return sendJSON(res, { error: "User exists" }, 400);
         const protocol = params.get("protocol") || "hysteria2";
-        const pass = params.get("pass") || ((protocol === "vless-reality" || protocol === "vless-ws-tls") ? crypto.randomUUID() : crypto.randomBytes(8).toString("hex"));
         const days = parseInt(params.get("days")) || 0;
         const traffic = parseFloat(params.get("traffic")) || 0;
         const monthly = parseFloat(params.get("monthly")) || 0;
-        const speed = parseFloat(params.get("speed")) || 0;
+        const speed = parseFloat(params.get("speed")) || 100; // 默认 100Mbps
         const sni = params.get("sni") || "www.bing.com";
-        const newUser = { username: user, protocol, createdAt: new Date().toISOString(), limits: {}, usage: { total: 0, monthly: {} } };
-        if (protocol === "vless-reality" || protocol === "vless-ws-tls") { newUser.uuid = pass; newUser.sni = sni; } else { newUser.password = pass; }
+
+        // 创建新用户，同时生成 Hy2 和 VLESS 凭据以支持融合切换
+        const hyPass = crypto.randomBytes(8).toString("hex");
+        const vlessUUID = crypto.randomUUID();
+        const passFromUrl = params.get("pass");
+
+        const newUser = {
+            username: user,
+            protocol,
+            createdAt: new Date().toISOString(),
+            limits: {},
+            usage: { total: 0, monthly: {} },
+            // 同时生成两种凭据
+            password: passFromUrl || hyPass,  // Hy2 密码
+            uuid: vlessUUID,                   // VLESS UUID
+            sni: sni
+        };
+
         if (days > 0) newUser.limits.expiresAt = new Date(Date.now() + days * 864e5).toISOString();
         if (traffic > 0) newUser.limits.trafficLimit = traffic * 1073741824;
         if (monthly > 0) newUser.limits.monthlyLimit = monthly * 1073741824;
         if (speed > 0) newUser.limits.speedLimit = speed * 1000000;
         users.push(newUser);
-        if (saveUsers(users)) return sendJSON(res, { success: true, user: user, password: pass, sni: sni });
+        if (saveUsers(users)) return sendJSON(res, { success: true, user: user, password: newUser.password, uuid: vlessUUID, sni: sni });
         return sendJSON(res, { error: "Save failed" }, 500);
     }
 
