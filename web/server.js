@@ -368,33 +368,51 @@ function generateSingboxConfig(user, cfg, host) {
         outboundTags.push("vless-proxy");
     }
 
-    // 3. 自动选择出站 (urltest - Hy2优先)
+    // 3. 自动选择出站 (urltest - 快速故障切换)
+    // interval: 10s - 每10秒检测一次连接状态
+    // tolerance: 50 - 允许50ms的延迟差异
+    // interrupt_exist_connections: true - 切换时立即中断现有连接
     if (outboundTags.length > 0) {
         outbounds.push({
             type: "urltest",
             tag: "auto-select",
             outbounds: outboundTags,
             url: "https://www.gstatic.com/generate_204",
-            interval: "1m",
-            tolerance: 100,
-            interrupt_exist_connections: true
+            interval: "10s",        // 每10秒检测一次
+            tolerance: 50,          // 50ms 容差，优先选择延迟最低的
+            idle_timeout: "30s",    // 30秒无流量后暂停检测
+            interrupt_exist_connections: true  // 切换时立即生效
         });
     }
 
     // 4. 直连和屏蔽
     outbounds.push({ type: "direct", tag: "direct" });
     outbounds.push({ type: "block", tag: "block" });
+    outbounds.push({ type: "dns", tag: "dns-out" });
 
-    // 完整 sing-box 配置
+    // 完整 sing-box 配置 (优化版 - 快速故障切换)
     return {
         log: { level: "info", timestamp: true },
+        experimental: {
+            // 启用 Clash API 用于实时切换
+            clash_api: {
+                external_controller: "127.0.0.1:9090",
+                external_ui: "",
+                secret: "",
+                default_mode: "rule"
+            },
+            cache_file: {
+                enabled: true,
+                path: "cache.db"
+            }
+        },
         dns: {
             servers: [
                 { tag: "google", address: "https://8.8.8.8/dns-query", detour: "auto-select" },
                 { tag: "local", address: "223.5.5.5", detour: "direct" }
             ],
             rules: [
-                { domain_suffix: [".cn", ".内"], server: "local" },
+                { domain_suffix: [".cn"], server: "local" },
                 { query_type: ["A", "AAAA"], server: "google" }
             ],
             final: "google"
@@ -405,6 +423,16 @@ function generateSingboxConfig(user, cfg, host) {
                 tag: "mixed-in",
                 listen: "127.0.0.1",
                 listen_port: 7890
+            },
+            {
+                type: "tun",
+                tag: "tun-in",
+                interface_name: "bui-tun",
+                inet4_address: "172.19.0.1/30",
+                auto_route: true,
+                strict_route: true,
+                stack: "system",
+                sniff: true
             }
         ],
         outbounds,
@@ -878,9 +906,11 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                 // 构建 sing-box 配置
                 const singboxConfig = generateSingboxConfig(user, cfg, host);
 
+                // 使用 ASCII 安全的文件名
+                const safeFilename = encodeURIComponent(username).replace(/%/g, "_") + ".json";
                 res.writeHead(200, {
-                    "Content-Type": "application/json",
-                    "Content-Disposition": `inline; filename="${username}.json"`
+                    "Content-Type": "application/json; charset=utf-8",
+                    "Content-Disposition": `inline; filename="${safeFilename}"`
                 });
                 return res.end(JSON.stringify(singboxConfig, null, 2));
             }
