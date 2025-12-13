@@ -6,7 +6,7 @@
 # 版本: 1.2.0
 #===============================================================================
 
-SCRIPT_VERSION="2.2.0"
+SCRIPT_VERSION="2.3.0"
 
 # 注意: 不使用 set -e，因为它会导致 ((count++)) 等算术运算在变量为0时退出脚本
 
@@ -1752,6 +1752,138 @@ config_management() {
     done
 }
 
+#===============================================================================
+# 订阅导入 (sing-box / Clash 融合配置)
+#===============================================================================
+
+import_from_subscription() {
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}从服务端导入订阅 (Hy2 + VLESS 自动切换)${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    
+    # 检查是否已配置服务端地址
+    load_server_address
+    if [[ -z "$SERVER_ADDRESS" ]]; then
+        print_warning "尚未配置服务端地址"
+        read -p "请输入服务端地址 (如 example.com:8080): " SERVER_ADDRESS
+        if [[ -z "$SERVER_ADDRESS" ]]; then
+            print_error "服务端地址不能为空"
+            return 1
+        fi
+        set_server_address "$SERVER_ADDRESS"
+    fi
+    
+    echo -e "服务端地址: ${GREEN}${SERVER_ADDRESS}${NC}"
+    echo ""
+    
+    # 询问用户名
+    read -p "请输入您的用户名: " username
+    if [[ -z "$username" ]]; then
+        print_error "用户名不能为空"
+        return 1
+    fi
+    
+    # 选择订阅格式
+    echo ""
+    echo -e "${YELLOW}选择订阅格式:${NC}"
+    echo -e "  ${YELLOW}1.${NC} sing-box (推荐 - 原生 TUN 支持)"
+    echo -e "  ${YELLOW}2.${NC} Clash (兼容更多客户端)"
+    echo ""
+    read -p "请选择 [1-2]: " sub_format
+    
+    local sub_url=""
+    local sub_file=""
+    local encoded_username=$(echo -n "$username" | jq -sRr @uri 2>/dev/null || python3 -c "import urllib.parse; print(urllib.parse.quote('$username'))" 2>/dev/null || echo "$username")
+    
+    case $sub_format in
+        1)
+            sub_url="https://${SERVER_ADDRESS}/api/subscription/${encoded_username}"
+            sub_file="${BASE_DIR}/singbox-subscription.json"
+            ;;
+        2)
+            sub_url="https://${SERVER_ADDRESS}/api/clash/${encoded_username}"
+            sub_file="${BASE_DIR}/clash-subscription.yaml"
+            ;;
+        *)
+            print_error "无效选项"
+            return 1
+            ;;
+    esac
+    
+    # 下载订阅
+    print_info "正在下载订阅配置..."
+    echo "  URL: $sub_url"
+    
+    mkdir -p "$BASE_DIR"
+    
+    if curl -fsSL --max-time 30 -k "$sub_url" -o "$sub_file" 2>/dev/null; then
+        local file_size=$(wc -c < "$sub_file" 2>/dev/null || echo "0")
+        if [[ "$file_size" -gt 100 ]]; then
+            print_success "订阅下载成功 (${file_size} 字节)"
+            echo ""
+            
+            if [[ "$sub_format" == "1" ]]; then
+                # sing-box 配置
+                print_info "配置 sing-box TUN 模式..."
+                
+                # 备份原来的配置
+                [[ -f "${BASE_DIR}/singbox-tun.json" ]] && cp "${BASE_DIR}/singbox-tun.json" "${BASE_DIR}/singbox-tun.json.bak"
+                
+                # 使用订阅配置
+                cp "$sub_file" "${BASE_DIR}/singbox-tun.json"
+                
+                echo ""
+                echo -e "${GREEN}════════════════════════════════════════════════════════════════${NC}"
+                echo -e "${GREEN}  订阅配置导入成功！${NC}"
+                echo -e "${GREEN}════════════════════════════════════════════════════════════════${NC}"
+                echo ""
+                echo -e "  配置类型: ${CYAN}sing-box (Hy2 + VLESS 自动切换)${NC}"
+                echo -e "  故障切换: ${GREEN}每 10 秒检测，断连自动切到备用协议${NC}"
+                echo ""
+                echo -e "  ${YELLOW}下一步:${NC}"
+                echo -e "    • 使用菜单选项 ${YELLOW}8${NC} 开启 TUN 模式"
+                echo -e "    • 开启后所有流量将自动走代理"
+                echo ""
+                
+                read -p "是否现在开启 TUN 模式? [Y/n]: " start_tun
+                if [[ -z "$start_tun" || "$start_tun" =~ ^[yY]$ ]]; then
+                    toggle_tun
+                fi
+            else
+                # Clash 配置
+                echo ""
+                echo -e "${GREEN}════════════════════════════════════════════════════════════════${NC}"
+                echo -e "${GREEN}  Clash 订阅下载成功！${NC}"
+                echo -e "${GREEN}════════════════════════════════════════════════════════════════${NC}"
+                echo ""
+                echo -e "  配置文件: ${CYAN}${sub_file}${NC}"
+                echo -e "  故障切换: ${GREEN}fallback 策略组，10 秒检测间隔${NC}"
+                echo ""
+                echo -e "  ${YELLOW}使用方法:${NC}"
+                echo -e "    1. 将配置文件导入到 Clash/v2rayN/Shadowrocket"
+                echo -e "    2. 选择 '自动切换' 策略组"
+                echo ""
+                echo "  配置预览:"
+                head -30 "$sub_file"
+                echo "  ..."
+            fi
+        else
+            print_error "下载的文件太小，可能是无效响应"
+            cat "$sub_file"
+            rm -f "$sub_file"
+            return 1
+        fi
+    else
+        print_error "下载订阅失败，请检查:"
+        echo "  • 服务端地址是否正确: $SERVER_ADDRESS"
+        echo "  • 用户名是否存在: $username"
+        echo "  • 网络是否畅通"
+        return 1
+    fi
+}
+
 import_from_uri() {
     echo ""
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
@@ -2960,6 +3092,7 @@ show_menu() {
     echo -e "${CYAN}║${NC}  ${YELLOW}2.${NC} ${GREEN}批量导入配置${NC}                                         ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}3.${NC} ${GREEN}配置管理${NC} (列表/切换/删除)                             ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}4.${NC} 手动配置 Hysteria2                                     ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}15.${NC} ${GREEN}📦 导入订阅${NC} (Hy2+VLESS 自动切换)                     ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}5.${NC} 启动/停止服务                                          ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}6.${NC} 重启服务                                               ${CYAN}║${NC}"
@@ -2999,7 +3132,7 @@ main() {
         print_banner
         show_status
         show_menu
-        read -p "请选择 [0-14]: " choice
+        read -p "请选择 [0-15]: " choice
         
         case $choice in
             1) import_from_uri ;;
@@ -3126,6 +3259,7 @@ main() {
                     fi
                 fi
                 ;;
+            15) import_from_subscription ;;
             0) echo ""; print_info "再见！"; exit 0 ;;
             *) print_error "无效选项" ;;
         esac
