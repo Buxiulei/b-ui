@@ -174,18 +174,21 @@
     <div id="m-cfg" class="modal">
         <div class="modal-card" style="text-align:center">
             <h3>客户端配置</h3>
-            <p style="font-size:13px; color:var(--text-dim); margin-bottom:24px">兼容 v2rayN / Shadowrocket / Clash Meta
+            <p style="font-size:13px; color:var(--text-dim); margin-bottom:24px">Hy2 + VLESS 自动故障切换
             </p>
             <div id="qrcode"
                 style="margin:0 auto 24px; background:#fff; padding:16px; border-radius:16px; width:fit-content; box-shadow: 0 10px 30px -10px rgba(0,0,0,0.1);">
             </div>
             <div class="code-box" id="uri"></div>
-            <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px">
-                <button class="btn" onclick="copy()">复制链接</button>
-                <button class="btn btn-secondary" onclick="downloadSubscription()">📦 sing-box 订阅</button>
+            <div style="display:grid; grid-template-columns:1fr; gap:12px; margin-top:16px">
+                <button class="btn" onclick="copy()">📋 复制 Hy2 链接</button>
+                <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px">
+                    <button class="btn btn-secondary" onclick="downloadSubscription()">📦 sing-box</button>
+                    <button class="btn btn-secondary" onclick="downloadClashSubscription()">🔄 Clash</button>
+                </div>
             </div>
-            <p style="font-size:12px; color:var(--text-dim); margin-top:16px">
-                sing-box 订阅包含 Hy2 + VLESS 自动切换，断连时瞬间切换备用协议
+            <p style="font-size:12px; color:var(--text-dim); margin-top:12px">
+                sing-box/Clash 订阅: Hy2 优先，10秒检测自动切换到 VLESS
             </p>
             <button class="btn btn-secondary" style="margin-top:12px; width:100%" onclick="closeM()">关闭</button>
         </div>

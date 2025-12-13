@@ -338,6 +338,14 @@ function downloadSubscription() {
     toast("正在下载 sing-box 配置...");
 }
 
+// 下载 Clash 订阅配置 (v2rayN/Shadowrocket 兼容)
+function downloadClashSubscription() {
+    if (!currentShowUser) return toast("请先选择用户", 1);
+    const url = "/api/clash/" + encodeURIComponent(currentShowUser.username);
+    window.open(url, "_blank");
+    toast("正在下载 Clash 配置 (v2rayN/Shadowrocket 兼容)...");
+}
+
 // Change password
 function changePwd() {
     const np = $("#newpwd").value;
