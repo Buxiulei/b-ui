@@ -284,8 +284,13 @@ function saveUser() {
     });
 }
 
-// Generate URI
+// Generate URI - 根据协议类型生成不同的链接
 function genUri(x) {
+    // 融合订阅用户: 返回 Clash 订阅 URL
+    if (x.protocol === "fusion") {
+        const host = location.host;
+        return "https://" + host + "/api/clash/" + encodeURIComponent(x.username);
+    }
     if (x.protocol === "vless-reality") {
         const userSni = x.sni || cfg.sni || "www.bing.com";
         return "vless://" + x.uuid + "@" + cfg.domain + ":" + cfg.xrayPort +
@@ -319,15 +324,67 @@ function showU(uname) {
     currentShowUser = x;
     const uri = genUri(x);
     $("#uri").innerText = uri;
-    $("#qrcode").innerHTML = '<img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=' +
-        encodeURIComponent(uri) + '" alt="QR Code" style="display:block;border-radius:8px">';
+
+    // 融合订阅用户显示订阅链接
+    if (x.protocol === "fusion") {
+        $("#cfg-title").innerText = "🔄 融合订阅配置";
+        $("#cfg-desc").innerHTML = "Hysteria2 + VLESS 自动故障切换<br><small>可导入 v2rayN / v2rayNG / Shadowrocket / bui-c 客户端</small>";
+
+        // 显示二维码
+        $("#qrcode").innerHTML = '<img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=' +
+            encodeURIComponent(uri) + '" alt="QR Code" style="display:block;border-radius:8px">';
+
+        // 按钮
+        $("#cfg-buttons").innerHTML = `
+            <button class="btn" onclick="copy()">📋 复制订阅链接</button>
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px">
+                <button class="btn btn-secondary" onclick="downloadSubscription()">📦 下载 sing-box</button>
+                <button class="btn btn-secondary" onclick="downloadClashSubscription()">📥 下载 Clash</button>
+            </div>
+        `;
+
+        // 提示
+        $("#cfg-hint").innerText = "📱 扫码或复制链接导入客户端，Hy2优先，10秒检测自动切换";
+    } else {
+        // 单协议用户
+        const protoName = x.protocol === "hysteria2" ? "Hysteria2" :
+            x.protocol === "vless-reality" ? "VLESS-Reality" :
+                x.protocol === "vless-ws-tls" ? "VLESS-WS" : x.protocol;
+
+        $("#cfg-title").innerText = protoName + " 配置";
+        $("#cfg-desc").innerText = "单协议客户端配置";
+
+        // 显示二维码
+        $("#qrcode").innerHTML = '<img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=' +
+            encodeURIComponent(uri) + '" alt="QR Code" style="display:block;border-radius:8px">';
+
+        // 按钮 - 根据协议类型显示
+        let btnHtml = `<button class="btn" onclick="copy()">📋 复制链接</button>`;
+
+        // 所有用户都有双协议凭据，可以显示订阅下载
+        btnHtml += `
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px">
+                <button class="btn btn-secondary" onclick="downloadSubscription()">📦 sing-box 订阅</button>
+                <button class="btn btn-secondary" onclick="downloadClashSubscription()">🔄 Clash 订阅</button>
+            </div>
+        `;
+
+        $("#cfg-buttons").innerHTML = btnHtml;
+        $("#cfg-hint").innerText = "也可下载 sing-box/Clash 订阅获得 Hy2+VLESS 自动切换功能";
+    }
+
     openM("m-cfg");
 }
 
 // Copy URI
 function copy() {
-    navigator.clipboard.writeText($("#uri").innerText);
-    toast("链接已复制到剪贴板");
+    const uri = $("#uri").innerText;
+    navigator.clipboard.writeText(uri);
+    if (currentShowUser && currentShowUser.protocol === "fusion") {
+        toast("订阅链接已复制，可粘贴到 v2rayN / Shadowrocket");
+    } else {
+        toast("链接已复制到剪贴板");
+    }
 }
 
 // 下载 sing-box 融合订阅配置
