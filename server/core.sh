@@ -266,6 +266,16 @@ collect_user_input() {
     read -p "请输入伪装网站 URL [默认: https://www.bing.com/]: " MASQUERADE_URL
     MASQUERADE_URL=${MASQUERADE_URL:-"https://www.bing.com/"}
     
+    # 端口跳跃配置
+    read -p "是否启用端口跳跃 (抗 QoS 限速)? [默认: y]: " PORT_HOPPING_ENABLED
+    PORT_HOPPING_ENABLED=${PORT_HOPPING_ENABLED:-y}
+    if [[ "$PORT_HOPPING_ENABLED" =~ ^[yY]$ ]]; then
+        read -p "端口跳跃范围起始 [默认: 20000]: " PORT_HOPPING_START
+        PORT_HOPPING_START=${PORT_HOPPING_START:-20000}
+        read -p "端口跳跃范围结束 [默认: 30000]: " PORT_HOPPING_END
+        PORT_HOPPING_END=${PORT_HOPPING_END:-30000}
+    fi
+    
     # 预下载客户端核心（便于国内客户端安装）
     read -p "是否预下载客户端核心包 (便于国内客户端安装)? [默认: y]: " PREDOWNLOAD_PACKAGES
     PREDOWNLOAD_PACKAGES=${PREDOWNLOAD_PACKAGES:-y}
@@ -276,6 +286,11 @@ collect_user_input() {
     echo -e "${GREEN}配置摘要：${NC}"
     echo -e "  域名:       ${YELLOW}${DOMAIN}${NC}"
     echo -e "  端口:       ${YELLOW}${PORT}${NC}"
+    if [[ "$PORT_HOPPING_ENABLED" =~ ^[yY]$ ]]; then
+        echo -e "  端口跳跃:   ${YELLOW}${PORT_HOPPING_START}-${PORT_HOPPING_END}${NC}"
+    else
+        echo -e "  端口跳跃:   ${YELLOW}禁用${NC}"
+    fi
     echo -e "  管理密码:   ${YELLOW}${ADMIN_PASSWORD}${NC}"
     echo -e "  首个用户:   ${YELLOW}${FIRST_USER}${NC}"
     echo -e "  用户密码:   ${YELLOW}${FIRST_USER_PASS}${NC}"
@@ -288,6 +303,7 @@ collect_user_input() {
     
     # 保存配置到全局变量供其他函数使用
     export DOMAIN EMAIL PORT ADMIN_PASSWORD FIRST_USER FIRST_USER_PASS MASQUERADE_URL PREDOWNLOAD_PACKAGES
+    export PORT_HOPPING_ENABLED PORT_HOPPING_START PORT_HOPPING_END
 }
 
 #===============================================================================
@@ -305,7 +321,7 @@ configure_hysteria() {
 [{"username":"${FIRST_USER}","password":"${FIRST_USER_PASS}","createdAt":"$(date -Iseconds)"}]
 EOF
     
-    # 生成配置文件
+    # 生成配置文件（含 QUIC 流控优化）
     cat > "$CONFIG_FILE" << EOF
 # Hysteria2 服务器配置
 # 生成时间: $(date)
@@ -315,6 +331,13 @@ listen: :${PORT}
 tls:
   cert: /etc/letsencrypt/live/${DOMAIN}/fullchain.pem
   key: /etc/letsencrypt/live/${DOMAIN}/privkey.pem
+
+# QUIC 流控优化 (提升高带宽场景性能)
+quic:
+  initStreamReceiveWindow: 26843545
+  maxStreamReceiveWindow: 26843545
+  initConnReceiveWindow: 67108864
+  maxConnReceiveWindow: 67108864
 
 auth:
   type: userpass
@@ -496,6 +519,8 @@ EOF
 
 configure_firewall() {
     local port=${PORT:-10000}
+    local start_port=${PORT_HOPPING_START:-20000}
+    local end_port=${PORT_HOPPING_END:-30000}
     
     print_info "配置防火墙..."
     
@@ -506,6 +531,11 @@ configure_firewall() {
         ufw allow 80/tcp
         ufw allow 443/tcp
         ufw allow 10001/tcp
+        # 端口跳跃范围
+        if [[ "$PORT_HOPPING_ENABLED" =~ ^[yY]$ ]]; then
+            ufw allow ${start_port}:${end_port}/udp
+            print_success "ufw 端口跳跃范围 ${start_port}:${end_port}/udp 已开放"
+        fi
         print_success "ufw 规则已添加"
     elif command -v firewall-cmd &> /dev/null && systemctl is-active --quiet firewalld; then
         firewall-cmd --permanent --add-port=22/tcp
@@ -514,6 +544,11 @@ configure_firewall() {
         firewall-cmd --permanent --add-port=80/tcp
         firewall-cmd --permanent --add-port=443/tcp
         firewall-cmd --permanent --add-port=10001/tcp
+        # 端口跳跃范围
+        if [[ "$PORT_HOPPING_ENABLED" =~ ^[yY]$ ]]; then
+            firewall-cmd --permanent --add-port=${start_port}-${end_port}/udp
+            print_success "firewalld 端口跳跃范围 ${start_port}-${end_port}/udp 已开放"
+        fi
         firewall-cmd --reload
         print_success "firewalld 规则已添加"
     fi
@@ -545,6 +580,103 @@ EOF
     else
         print_warning "BBR 配置完成，可能需要重启生效"
     fi
+}
+
+#===============================================================================
+# 端口跳跃配置 (Port Hopping)
+# 使用 iptables DNAT 将端口范围转发到 Hysteria 监听端口
+#===============================================================================
+
+PORT_HOPPING_ENABLED="n"
+PORT_HOPPING_START="20000"
+PORT_HOPPING_END="30000"
+
+configure_port_hopping() {
+    if [[ "$PORT_HOPPING_ENABLED" != "y" && "$PORT_HOPPING_ENABLED" != "Y" ]]; then
+        print_info "端口跳跃未启用，跳过配置"
+        return 0
+    fi
+    
+    local listen_port=${PORT:-10000}
+    local start_port=${PORT_HOPPING_START:-20000}
+    local end_port=${PORT_HOPPING_END:-30000}
+    
+    print_info "配置端口跳跃 (${start_port}-${end_port} -> ${listen_port})..."
+    
+    # 检测网卡名称
+    local iface=$(ip route get 8.8.8.8 2>/dev/null | grep -oP 'dev \K\S+' | head -1)
+    [[ -z "$iface" ]] && iface="eth0"
+    
+    # 清理旧规则（如果存在）
+    iptables -t nat -D PREROUTING -i "$iface" -p udp --dport ${start_port}:${end_port} -j REDIRECT --to-ports ${listen_port} 2>/dev/null || true
+    ip6tables -t nat -D PREROUTING -i "$iface" -p udp --dport ${start_port}:${end_port} -j REDIRECT --to-ports ${listen_port} 2>/dev/null || true
+    
+    # 添加 IPv4 规则
+    if iptables -t nat -A PREROUTING -i "$iface" -p udp --dport ${start_port}:${end_port} -j REDIRECT --to-ports ${listen_port}; then
+        print_success "IPv4 端口跳跃规则已添加"
+    else
+        print_warning "IPv4 端口跳跃规则添加失败"
+    fi
+    
+    # 添加 IPv6 规则
+    if ip6tables -t nat -A PREROUTING -i "$iface" -p udp --dport ${start_port}:${end_port} -j REDIRECT --to-ports ${listen_port} 2>/dev/null; then
+        print_success "IPv6 端口跳跃规则已添加"
+    else
+        print_info "IPv6 端口跳跃规则跳过（可能不支持）"
+    fi
+    
+    # 持久化 iptables 规则
+    if command -v iptables-save &> /dev/null; then
+        mkdir -p /etc/iptables
+        iptables-save > /etc/iptables/rules.v4
+        ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+        print_success "iptables 规则已持久化"
+    fi
+    
+    # 保存端口跳跃配置
+    cat > "${BASE_DIR}/port-hopping.json" << EOF
+{
+    "enabled": true,
+    "startPort": ${start_port},
+    "endPort": ${end_port},
+    "listenPort": ${listen_port},
+    "interface": "${iface}"
+}
+EOF
+    
+    print_success "端口跳跃配置完成"
+}
+
+#===============================================================================
+# 性能优化配置
+# UDP 缓冲区 + QUIC 流控 + 进程优先级
+#===============================================================================
+
+configure_performance() {
+    print_info "配置性能优化..."
+    
+    # 1. 系统 UDP 缓冲区优化
+    cat > /etc/sysctl.d/99-hysteria-perf.conf << 'EOF'
+# Hysteria2 性能优化 - UDP 缓冲区
+net.core.rmem_max=16777216
+net.core.wmem_max=16777216
+net.core.rmem_default=1048576
+net.core.wmem_default=1048576
+EOF
+    
+    sysctl --system > /dev/null 2>&1
+    print_success "UDP 缓冲区已优化 (16MB)"
+    
+    # 2. Hysteria 进程优先级优化
+    mkdir -p /etc/systemd/system/hysteria-server.service.d
+    cat > /etc/systemd/system/hysteria-server.service.d/priority.conf << 'EOF'
+[Service]
+CPUSchedulingPolicy=rr
+CPUSchedulingPriority=99
+EOF
+    
+    systemctl daemon-reload
+    print_success "进程优先级已优化 (RT priority 99)"
 }
 
 #===============================================================================

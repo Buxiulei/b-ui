@@ -3,9 +3,10 @@ const fs = require("fs");
 const crypto = require("crypto");
 const { execSync, exec } = require("child_process");
 const path = require("path");
-// 从 version.json 读取版本号
-const BASE_DIR = process.env.BASE_DIR || "/opt/b-ui";
-const ADMIN_DIR = process.env.ADMIN_DIR || path.join(BASE_DIR, "admin");
+
+// 本地开发支持：如果 /opt/b-ui 不存在，使用当前目录
+const BASE_DIR = process.env.BASE_DIR || (fs.existsSync("/opt/b-ui") ? "/opt/b-ui" : path.dirname(__dirname));
+const ADMIN_DIR = process.env.ADMIN_DIR || (fs.existsSync("/opt/b-ui") ? path.join(BASE_DIR, "admin") : __dirname);
 
 function getVersion() {
     try {
@@ -274,9 +275,40 @@ function getConfig() {
             pubKey = k.publicKey || "";
             shortId = shortId || k.shortId || "";
         } catch { }
-        return { domain: dm ? dm[1] : "localhost", port: pm ? pm[1] : "443", xrayPort, pubKey, shortId, sni };
+
+        // 读取端口跳跃配置
+        let portHopping = { enabled: false, start: 20000, end: 30000 };
+        try {
+            const phFile = path.join(BASE_DIR, "port-hopping.json");
+            if (fs.existsSync(phFile)) {
+                const ph = JSON.parse(fs.readFileSync(phFile, "utf8"));
+                portHopping = {
+                    enabled: ph.enabled || false,
+                    start: ph.startPort || 20000,
+                    end: ph.endPort || 30000
+                };
+            }
+        } catch { }
+
+        return {
+            domain: dm ? dm[1] : "localhost",
+            port: pm ? pm[1] : "443",
+            xrayPort,
+            pubKey,
+            shortId,
+            sni,
+            portHopping
+        };
     } catch {
-        return { domain: "localhost", port: "443", xrayPort: 10001, pubKey: "", shortId: "", sni: "www.bing.com" };
+        return {
+            domain: "localhost",
+            port: "443",
+            xrayPort: 10001,
+            pubKey: "",
+            shortId: "",
+            sni: "www.bing.com",
+            portHopping: { enabled: false, start: 20000, end: 30000 }
+        };
     }
 }
 

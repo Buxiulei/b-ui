@@ -174,7 +174,7 @@ function addUser() {
     const d = $("#nd").value || 0;
     const t = $("#nt").value || 0;
     const m = $("#nm").value || 0;
-    const s = $("#ns").value || 0;
+    const s = $("#ns").value || 100;  // 默认 100Mbps 上下行带宽
     const proto = $("#nproto").value;
     const customSni = $("#nsni-custom")?.value || $("#nsni")?.value || "";
 
@@ -295,8 +295,13 @@ function genUri(x) {
             "&type=ws&host=" + hostSni + "&path=%2Fws#" +
             encodeURIComponent(x.username);
     }
+    // Hysteria2: 支持端口跳跃格式
+    let portStr = cfg.port;
+    if (cfg.portHopping && cfg.portHopping.enabled) {
+        portStr = cfg.portHopping.start + "-" + cfg.portHopping.end;
+    }
     return "hysteria2://" + encodeURIComponent(x.username) + ":" + encodeURIComponent(x.password) +
-        "@" + cfg.domain + ":" + cfg.port + "/?sni=" + cfg.domain + "&insecure=0#" + encodeURIComponent(x.username);
+        "@" + cfg.domain + ":" + portStr + "/?sni=" + cfg.domain + "&insecure=0#" + encodeURIComponent(x.username);
 }
 
 // Show user config
