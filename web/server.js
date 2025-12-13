@@ -330,6 +330,8 @@ function generateSingboxConfig(user, cfg, host) {
             tag: "hy2-proxy",
             server: host,
             server_port: parseInt(cfg.port),
+            // 连接超时设置 - 2秒无法建立连接就放弃
+            connect_timeout: "2s",
             // 端口跳跃配置
             ...(cfg.portHopping?.enabled ? {
                 hop_ports: `${cfg.portHopping.start}-${cfg.portHopping.end}`,
@@ -352,6 +354,8 @@ function generateSingboxConfig(user, cfg, host) {
             tag: "vless-proxy",
             server: host,
             server_port: cfg.xrayPort || 10001,
+            // 连接超时设置 - 2秒无法建立连接就放弃
+            connect_timeout: "2s",
             uuid: user.uuid,
             flow: "xtls-rprx-vision",
             tls: {
