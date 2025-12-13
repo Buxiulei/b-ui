@@ -505,7 +505,8 @@ function generateClashConfig(user, cfg, host) {
 # 故障切换机制: Hy2 优先，断连自动切换到 VLESS
 # interval: 10 秒检测间隔
 
-mixed-port: 7890
+port: 7890
+socks-port: 7891
 allow-lan: false
 mode: rule
 log-level: info
@@ -513,13 +514,16 @@ external-controller: 127.0.0.1:9090
 
 dns:
   enable: true
+  listen: 0.0.0.0:53
   enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+    - '*.lan'
+    - localhost.ptlogin2.qq.com
   nameserver:
     - 223.5.5.5
     - 119.29.29.29
-  fallback:
-    - https://8.8.8.8/dns-query
-    - https://1.1.1.1/dns-query
+    - 114.114.114.114
 
 proxies:
 ${proxiesYaml}
@@ -541,8 +545,8 @@ ${proxyNames.map(n => `      - ${n}`).join('\n')}
       - DIRECT
 
 rules:
+  - GEOIP,LAN,DIRECT
   - GEOIP,CN,DIRECT
-  - GEOSITE,cn,DIRECT
   - MATCH,自动切换
 `;
 
