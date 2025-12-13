@@ -454,60 +454,50 @@ function generateSingboxConfig(user, cfg, host) {
 
 // 生成 Clash YAML 配置 (v2rayN/Shadowrocket 兼容，原生 fallback 支持)
 function generateClashConfig(user, cfg, host) {
-    const proxies = [];
     const proxyNames = [];
+    let proxiesYaml = "";
 
     // 1. Hysteria2 节点 (Clash Meta 支持)
     if (user.password) {
-        let portStr = cfg.port;
-        if (cfg.portHopping && cfg.portHopping.enabled) {
-            // Clash Meta 支持 ports 参数
-            portStr = cfg.port; // 主端口
-        }
-
-        const hy2Proxy = {
-            name: "Hy2-优先",
-            type: "hysteria2",
-            server: host,
-            port: parseInt(cfg.port),
-            password: `${user.username}:${user.password}`,
-            sni: host,
-            "skip-cert-verify": false
-        };
+        proxyNames.push("Hy2-优先");
+        proxiesYaml += `  - name: Hy2-优先
+    type: hysteria2
+    server: ${host}
+    port: ${cfg.port}
+    password: "${user.username}:${user.password}"
+    sni: ${host}
+    skip-cert-verify: false`;
 
         // 如果启用端口跳跃
         if (cfg.portHopping && cfg.portHopping.enabled) {
-            hy2Proxy.ports = `${cfg.portHopping.start}-${cfg.portHopping.end}`;
-            hy2Proxy["hop-interval"] = 30;
+            proxiesYaml += `
+    ports: ${cfg.portHopping.start}-${cfg.portHopping.end}
+    hop-interval: 30`;
         }
-
-        proxies.push(hy2Proxy);
-        proxyNames.push("Hy2-优先");
+        proxiesYaml += "\n";
     }
 
     // 2. VLESS-Reality 节点
     if (user.uuid && cfg.pubKey && cfg.shortId) {
-        proxies.push({
-            name: "VLESS-备用",
-            type: "vless",
-            server: host,
-            port: cfg.xrayPort || 10001,
-            uuid: user.uuid,
-            network: "tcp",
-            tls: true,
-            udp: true,
-            flow: "xtls-rprx-vision",
-            servername: user.sni || cfg.sni || "www.bing.com",
-            "reality-opts": {
-                "public-key": cfg.pubKey,
-                "short-id": cfg.shortId
-            },
-            "client-fingerprint": "chrome"
-        });
         proxyNames.push("VLESS-备用");
+        proxiesYaml += `  - name: VLESS-备用
+    type: vless
+    server: ${host}
+    port: ${cfg.xrayPort || 10001}
+    uuid: ${user.uuid}
+    network: tcp
+    tls: true
+    udp: true
+    flow: xtls-rprx-vision
+    servername: ${user.sni || cfg.sni || "www.bing.com"}
+    reality-opts:
+      public-key: ${cfg.pubKey}
+      short-id: ${cfg.shortId}
+    client-fingerprint: chrome
+`;
     }
 
-    // 构建 YAML 配置
+    // 构建完整 YAML 配置
     const config = `# Clash 配置 - B-UI 自动生成
 # 用户: ${user.username}
 # 生成时间: ${new Date().toISOString()}
@@ -532,20 +522,23 @@ dns:
     - https://1.1.1.1/dns-query
 
 proxies:
-${proxies.map(p => "  - " + JSON.stringify(p).replace(/"/g, '').replace(/,/g, ', ').replace(/{/g, '{ ').replace(/}/g, ' }')).join('\n')}
-
+${proxiesYaml}
 proxy-groups:
   # 自动故障切换: Hy2 优先，10秒检测一次可用性
   - name: 自动切换
     type: fallback
-    proxies: [${proxyNames.join(', ')}]
+    proxies:
+${proxyNames.map(n => `      - ${n}`).join('\n')}
     url: http://www.gstatic.com/generate_204
     interval: 10
     
   # 手动选择
   - name: 节点选择
     type: select
-    proxies: [自动切换, ${proxyNames.join(', ')}, DIRECT]
+    proxies:
+      - 自动切换
+${proxyNames.map(n => `      - ${n}`).join('\n')}
+      - DIRECT
 
 rules:
   - GEOIP,CN,DIRECT
