@@ -305,13 +305,13 @@ function genUri(x) {
             "&type=ws&host=" + hostSni + "&path=%2Fws#" +
             encodeURIComponent(x.username);
     }
-    // Hysteria2: 支持端口跳跃格式
-    let portStr = cfg.port;
+    // Hysteria2: v2rayN 使用 mport 参数设置端口跳跃范围
+    let portParams = "sni=" + cfg.domain + "&insecure=0";
     if (cfg.portHopping && cfg.portHopping.enabled) {
-        portStr = cfg.portHopping.start + "-" + cfg.portHopping.end;
+        portParams += "&mport=" + cfg.portHopping.start + "-" + cfg.portHopping.end;
     }
     return "hysteria2://" + encodeURIComponent(x.username) + ":" + encodeURIComponent(x.password) +
-        "@" + cfg.domain + ":" + portStr + "/?sni=" + cfg.domain + "&insecure=0#" + encodeURIComponent(x.username);
+        "@" + cfg.domain + ":" + cfg.port + "?" + portParams + "#" + encodeURIComponent(x.username);
 }
 
 // 当前显示的用户名 (用于下载订阅)

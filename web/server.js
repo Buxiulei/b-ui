@@ -1068,17 +1068,17 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
 
                 // 生成协议链接列表
                 const links = [];
-                
-                // Hysteria2 链接
+
+                // Hysteria2 链接 (v2rayN 使用 mport 参数设置端口跳跃)
                 if (user.password) {
-                    let portStr = cfg.port;
+                    let portParams = `sni=${host}&insecure=0`;
                     if (cfg.portHopping && cfg.portHopping.enabled) {
-                        portStr = cfg.portHopping.start + "-" + cfg.portHopping.end;
+                        portParams += `&mport=${cfg.portHopping.start}-${cfg.portHopping.end}`;
                     }
-                    const hy2Link = `hysteria2://${encodeURIComponent(user.username)}:${encodeURIComponent(user.password)}@${host}:${portStr}/?sni=${host}&insecure=0#${encodeURIComponent(user.username + "-Hy2")}`;
+                    const hy2Link = `hysteria2://${encodeURIComponent(user.username)}:${encodeURIComponent(user.password)}@${host}:${cfg.port}?${portParams}#${encodeURIComponent(user.username)}-Hy2`;
                     links.push(hy2Link);
                 }
-                
+
                 // VLESS-Reality 链接
                 if (user.uuid && cfg.pubKey && cfg.shortId) {
                     const userSni = user.sni || cfg.sni || "www.bing.com";
