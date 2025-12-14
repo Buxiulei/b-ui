@@ -286,10 +286,10 @@ function saveUser() {
 
 // Generate URI - 根据协议类型生成不同的链接
 function genUri(x) {
-    // 融合订阅用户: 返回 sing-box 订阅 URL (v2rayN 支持 sing-box 核心)
+    // 融合订阅用户: 返回 v2rayN 原生订阅 URL (Base64 编码的协议链接)
     if (x.protocol === "fusion") {
         const host = location.host;
-        return "https://" + host + "/api/subscription/" + encodeURIComponent(x.username);
+        return "https://" + host + "/api/sub/" + encodeURIComponent(x.username);
     }
     if (x.protocol === "vless-reality") {
         const userSni = x.sni || cfg.sni || "www.bing.com";

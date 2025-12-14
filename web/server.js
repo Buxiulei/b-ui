@@ -1056,6 +1056,47 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                 return res.end(clashConfig);
             }
 
+            // v2rayN 原生订阅 API (返回 Base64 编码的协议链接列表)
+            if (r.startsWith("sub/")) {
+                const username = decodeURIComponent(r.slice(4));
+                const users = loadUsers();
+                const user = users.find(u => u.username === username);
+                if (!user) return sendJSON(res, { error: "User not found" }, 404);
+
+                const cfg = getConfig();
+                const host = req.headers.host?.split(":")[0] || cfg.domain;
+
+                // 生成协议链接列表
+                const links = [];
+                
+                // Hysteria2 链接
+                if (user.password) {
+                    let portStr = cfg.port;
+                    if (cfg.portHopping && cfg.portHopping.enabled) {
+                        portStr = cfg.portHopping.start + "-" + cfg.portHopping.end;
+                    }
+                    const hy2Link = `hysteria2://${encodeURIComponent(user.username)}:${encodeURIComponent(user.password)}@${host}:${portStr}/?sni=${host}&insecure=0#${encodeURIComponent(user.username + "-Hy2")}`;
+                    links.push(hy2Link);
+                }
+                
+                // VLESS-Reality 链接
+                if (user.uuid && cfg.pubKey && cfg.shortId) {
+                    const userSni = user.sni || cfg.sni || "www.bing.com";
+                    const vlessLink = `vless://${user.uuid}@${host}:${cfg.xrayPort || 10001}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${userSni}&fp=chrome&pbk=${cfg.pubKey}&sid=${cfg.shortId}&spx=%2F&type=tcp#${encodeURIComponent(user.username + "-VLESS")}`;
+                    links.push(vlessLink);
+                }
+
+                // 返回 Base64 编码的链接列表
+                const content = links.join("\n");
+                const base64Content = Buffer.from(content).toString("base64");
+
+                res.writeHead(200, {
+                    "Content-Type": "text/plain; charset=utf-8",
+                    "Subscription-Userinfo": `upload=0; download=0; total=${user.limits?.trafficLimit || 0}; expire=${user.limits?.expiresAt ? new Date(user.limits.expiresAt).getTime() / 1000 : 0}`
+                });
+                return res.end(base64Content);
+            }
+
             const auth = verifyToken((req.headers.authorization || "").replace("Bearer ", ""));
             if (!auth) return sendJSON(res, { error: "Unauthorized" }, 401);
 
