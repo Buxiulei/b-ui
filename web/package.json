@@ -1,0 +1,14 @@
+{
+  "name": "b-ui-web",
+  "version": "1.0.0",
+  "description": "B-UI Web Admin Panel",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "singbox-converter": "^1.0.8",
+    "js-yaml": "^4.1.0"
+  }
+}

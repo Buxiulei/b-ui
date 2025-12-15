@@ -1,8 +1,14 @@
-const http = require("http");
-const fs = require("fs");
-const crypto = require("crypto");
-const { execSync, exec } = require("child_process");
-const path = require("path");
+import http from "http";
+import fs from "fs";
+import crypto from "crypto";
+import { execSync, exec } from "child_process";
+import path from "path";
+import { fileURLToPath } from "url";
+import { convertOutboundToLink } from "singbox-converter";
+
+// ESM 模式下获取 __dirname
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 // 本地开发支持：如果 /opt/b-ui 不存在，使用当前目录
 const BASE_DIR = process.env.BASE_DIR || (fs.existsSync("/opt/b-ui") ? "/opt/b-ui" : path.dirname(__dirname));
@@ -1066,23 +1072,49 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                 const cfg = getConfig();
                 const host = req.headers.host?.split(":")[0] || cfg.domain;
 
-                // 生成协议链接列表
+                // 生成协议链接列表 - 混合方案
                 const links = [];
 
-                // Hysteria2 链接 (v2rayN 使用 mport 参数设置端口跳跃)
+                // Hysteria2 链接 - 使用 hy2:// 协议 (v2rayN 6.30+ 支持)
+                // 保持手动生成以支持端口跳跃等自定义参数
                 if (user.password) {
+                    // 认证部分：username:password 整体作为 auth，不要单独编码冒号
+                    const auth = `${user.username}:${user.password}`;
                     let portParams = `sni=${host}&insecure=0`;
+                    // v2rayN 使用 mport 参数设置端口跳跃
                     if (cfg.portHopping && cfg.portHopping.enabled) {
                         portParams += `&mport=${cfg.portHopping.start}-${cfg.portHopping.end}`;
                     }
-                    const hy2Link = `hysteria2://${encodeURIComponent(user.username)}:${encodeURIComponent(user.password)}@${host}:${cfg.port}?${portParams}#${encodeURIComponent(user.username)}-Hy2`;
+                    // 使用 hy2:// 协议（singbox-converter 标准格式）
+                    const hy2Link = `hy2://${auth}@${host}:${cfg.port}?${portParams}#${encodeURIComponent(user.username)}-Hy2`;
                     links.push(hy2Link);
                 }
 
-                // VLESS-Reality 链接
+                // VLESS-Reality 链接 - 使用 singbox-converter 生成标准格式
                 if (user.uuid && cfg.pubKey && cfg.shortId) {
                     const userSni = user.sni || cfg.sni || "www.bing.com";
-                    const vlessLink = `vless://${user.uuid}@${host}:${cfg.xrayPort || 10001}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${userSni}&fp=chrome&pbk=${cfg.pubKey}&sid=${cfg.shortId}&spx=%2F&type=tcp#${encodeURIComponent(user.username + "-VLESS")}`;
+                    const vlessOutbound = {
+                        type: "vless",
+                        tag: `${user.username}-VLESS`,
+                        server: host,
+                        server_port: cfg.xrayPort || 10001,
+                        uuid: user.uuid,
+                        flow: "xtls-rprx-vision",
+                        tls: {
+                            enabled: true,
+                            server_name: userSni,
+                            utls: {
+                                enabled: true,
+                                fingerprint: "chrome"
+                            },
+                            reality: {
+                                enabled: true,
+                                public_key: cfg.pubKey,
+                                short_id: cfg.shortId
+                            }
+                        }
+                    };
+                    const vlessLink = convertOutboundToLink(vlessOutbound);
                     links.push(vlessLink);
                 }
 
