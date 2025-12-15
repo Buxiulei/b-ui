@@ -1088,7 +1088,7 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                         portParams += `&mport=${cfg.portHopping.start}-${cfg.portHopping.end}`;
                     }
                     // 使用 hysteria2:// 协议（v2rayN 标准格式）
-                    const hy2Link = `hysteria2://${auth}@${host}:${cfg.port}?${portParams}#${encodeURIComponent(user.username)}-Hy2`;
+                    const hy2Link = `hysteria2://${auth}@${host}:${cfg.port}?${portParams}#${encodeURIComponent(user.username + '-低空飞行')}`;
                     links.push(hy2Link);
                 }
 
@@ -1097,7 +1097,7 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                     const userSni = user.sni || cfg.sni || "www.bing.com";
                     const vlessOutbound = {
                         type: "vless",
-                        tag: `${user.username}-VLESS`,
+                        tag: `${user.username}-带壳奔跑`,
                         server: host,
                         server_port: cfg.xrayPort || 10001,
                         uuid: user.uuid,
