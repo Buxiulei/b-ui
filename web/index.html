@@ -32,6 +32,7 @@
             <div class="brand"><i>⚡</i><span>B-UI</span><span class="ver-tag">v${VERSION}</span></div>
             <div style="display:flex; gap:12px">
                 <button class="ibtn" onclick="openMasq()" title="伪装网站设置">🎭</button>
+                <button class="ibtn" onclick="openBandwidth()" title="带宽限制设置">⚡</button>
                 <button class="ibtn" onclick="openM('m-pwd')" title="修改密码">🔑</button>
                 <button class="ibtn danger" onclick="logout()" title="退出登录">✕</button>
             </div>
@@ -211,6 +212,36 @@
             <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:8px">
                 <button class="btn btn-secondary" onclick="closeM()">取消</button>
                 <button class="btn" onclick="saveMasq()">保存设置</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Bandwidth Settings Modal -->
+    <div id="m-bandwidth" class="modal">
+        <div class="modal-card">
+            <h3>⚡ 全局带宽限制</h3>
+            <div class="info-box" style="margin-bottom:20px; font-size:13px; color:var(--text-dim)">
+                设置 Hysteria2 服务的全局带宽限制，应用于所有客户端。每个客户端独立享有此带宽配额。
+            </div>
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px">
+                <div>
+                    <label style="font-size:12px;color:var(--text-dim);font-weight:600;margin-bottom:4px;display:block">上传带宽 (Mbps)</label>
+                    <input type="number" id="bandwidth-up" placeholder="例如: 100" min="0">
+                </div>
+                <div>
+                    <label style="font-size:12px;color:var(--text-dim);font-weight:600;margin-bottom:4px;display:block">下载带宽 (Mbps)</label>
+                    <input type="number" id="bandwidth-down" placeholder="例如: 100" min="0">
+                </div>
+            </div>
+            <div class="info-box" style="margin-top:12px; font-size:12px">
+                <strong>说明：</strong><br>
+                • 单位换算：100 Mbps = 12.5 MB/s<br>
+                • 设置为 0 表示无限制<br>
+                • 每个客户端独立享有此配额，不是共享总带宽
+            </div>
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:16px">
+                <button class="btn btn-secondary" onclick="closeM()">取消</button>
+                <button class="btn" onclick="saveBandwidth()">保存设置</button>
             </div>
         </div>
     </div>

@@ -440,6 +440,35 @@ function saveMasq() {
     });
 }
 
+// Bandwidth settings
+function openBandwidth() {
+    api("/bandwidth").then(r => {
+        $("#bandwidth-up").value = r.up || "";
+        $("#bandwidth-down").value = r.down || "";
+        openM("m-bandwidth");
+    });
+}
+
+function saveBandwidth() {
+    const up = $("#bandwidth-up").value || 0;
+    const down = $("#bandwidth-down").value || 0;
+
+    if (up < 0 || down < 0) return toast("带宽值不能为负数", 1);
+
+    api("/bandwidth", {
+        method: "POST",
+        body: JSON.stringify({ up: parseFloat(up), down: parseFloat(down) })
+    }).then(r => {
+        if (r.success) {
+            closeM();
+            toast("全局带宽限制已更新");
+            setTimeout(() => location.reload(), 2000);
+        } else {
+            toast(r.error || "操作失败", 1);
+        }
+    });
+}
+
 // Toggle SNI select visibility
 function toggleSniSelect() {
     const proto = $("#nproto").value;

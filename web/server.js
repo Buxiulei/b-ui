@@ -1272,6 +1272,44 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                         return sendJSON(res, { success: true, domain });
                     } catch (e) { return sendJSON(res, { error: e.message }, 500); }
                 }
+                if (r === "bandwidth") {
+                    if (req.method === "GET") {
+                        try {
+                            const hyc = fs.readFileSync(CONFIG.hysteriaConfig, "utf8");
+                            const upMatch = hyc.match(/up:\s*"?(\d+)\s*[Mm]bps"?/);
+                            const downMatch = hyc.match(/down:\s*"?(\d+)\s*[Mm]bps"?/);
+                            return sendJSON(res, {
+                                up: upMatch ? parseInt(upMatch[1]) : 0,
+                                down: downMatch ? parseInt(downMatch[1]) : 0
+                            });
+                        } catch {
+                            return sendJSON(res, { up: 0, down: 0 });
+                        }
+                    }
+                    if (req.method === "POST") {
+                        const b = await parseBody(req);
+                        const up = parseFloat(b.up) || 0;
+                        const down = parseFloat(b.down) || 0;
+
+                        try {
+                            let hyc = fs.readFileSync(CONFIG.hysteriaConfig, "utf8");
+                            const bwSection = up > 0 && down > 0
+                                ? `bandwidth:\n  up: ${up} mbps\n  down: ${down} mbps`
+                                : "# bandwidth: unlimited";
+                            hyc = hyc.replace(/bandwidth:[\s\S]*?(?=\n[a-zA-Z]|$)/, bwSection);
+                            if (!hyc.includes("bandwidth:")) {
+                                // 如果配置中没有 bandwidth 部分，添加到 listen 之后
+                                hyc = hyc.replace(/(listen:.*\n)/, `$1\n${bwSection}\n`);
+                            }
+                            fs.writeFileSync(CONFIG.hysteriaConfig, hyc);
+
+                            execSync("systemctl restart hysteria-server 2>/dev/null||true", { stdio: "pipe" });
+                            return sendJSON(res, { success: true, up, down });
+                        } catch (e) {
+                            return sendJSON(res, { error: e.message }, 500);
+                        }
+                    }
+                }
             }
 
             if (r === "password" && req.method === "POST") {
