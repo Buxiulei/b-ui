@@ -1075,18 +1075,17 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                 // 生成协议链接列表 - 混合方案
                 const links = [];
 
-                // Hysteria2 链接 - 使用 hy2:// 协议 (v2rayN 6.30+ 支持)
+                // Hysteria2 链接 - 使用 hysteria2:// 协议
                 // 保持手动生成以支持端口跳跃等自定义参数
                 if (user.password) {
-                    // 认证部分：username:password 整体作为 auth，不要单独编码冒号
                     const auth = `${user.username}:${user.password}`;
-                    let portParams = `sni=${host}&insecure=0`;
+                    let portParams = `sni=${host}&allowInsecure=0`;
                     // v2rayN 使用 mport 参数设置端口跳跃
                     if (cfg.portHopping && cfg.portHopping.enabled) {
                         portParams += `&mport=${cfg.portHopping.start}-${cfg.portHopping.end}`;
                     }
-                    // 使用 hy2:// 协议（singbox-converter 标准格式）
-                    const hy2Link = `hy2://${auth}@${host}:${cfg.port}?${portParams}#${encodeURIComponent(user.username)}-Hy2`;
+                    // 使用 hysteria2:// 协议（v2rayN 标准格式）
+                    const hy2Link = `hysteria2://${auth}@${host}:${cfg.port}?${portParams}#${encodeURIComponent(user.username)}-Hy2`;
                     links.push(hy2Link);
                 }
 
