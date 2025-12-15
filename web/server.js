@@ -1126,6 +1126,8 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
 
                 res.writeHead(200, {
                     "Content-Type": "text/plain; charset=utf-8",
+                    "profile-title": `base64:${Buffer.from(user.username).toString('base64')}`,
+                    "profile-update-interval": "24",
                     "Subscription-Userinfo": `upload=0; download=0; total=${user.limits?.trafficLimit || 0}; expire=${user.limits?.expiresAt ? new Date(user.limits.expiresAt).getTime() / 1000 : 0}`
                 });
                 return res.end(base64Content);
