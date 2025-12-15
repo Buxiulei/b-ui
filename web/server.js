@@ -1027,7 +1027,7 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                 if (!user) return sendJSON(res, { error: "User not found" }, 404);
 
                 const cfg = getConfig();
-                const host = req.headers.host?.split(":")[0] || cfg.domain;
+                const host = cfg.domain;  // 使用配置中的域名
 
                 // 构建 sing-box 配置
                 const singboxConfig = generateSingboxConfig(user, cfg, host);
@@ -1049,7 +1049,7 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                 if (!user) return sendJSON(res, { error: "User not found" }, 404);
 
                 const cfg = getConfig();
-                const host = req.headers.host?.split(":")[0] || cfg.domain;
+                const host = cfg.domain;  // 使用配置中的域名
 
                 // 生成 Clash YAML 配置
                 const clashConfig = generateClashConfig(user, cfg, host);
@@ -1070,7 +1070,7 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                 if (!user) return sendJSON(res, { error: "User not found" }, 404);
 
                 const cfg = getConfig();
-                const host = req.headers.host?.split(":")[0] || cfg.domain;
+                const host = cfg.domain;  // 使用配置中的域名
 
                 // 生成协议链接列表 - 混合方案
                 const links = [];
