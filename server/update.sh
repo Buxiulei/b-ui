@@ -205,6 +205,9 @@ do_update() {
     # 更新服务配置路径（如果需要）
     update_service_paths
     
+    # 应用 systemd 资源隔离配置（确保 Hy2/VLESS 协议隔离）
+    apply_systemd_configs
+    
     # 确保 CLI 命令存在
     if [[ -f "${BASE_DIR}/b-ui-cli.sh" ]]; then
         ln -sf "${BASE_DIR}/b-ui-cli.sh" /usr/local/bin/b-ui
@@ -270,6 +273,99 @@ update_service_paths() {
     if [[ $updated -eq 1 ]]; then
         systemctl daemon-reload
         print_success "服务配置路径已更新"
+    fi
+}
+
+#===============================================================================
+# 应用 systemd 资源隔离配置
+# 确保 Hysteria2 和 Xray 服务有正确的资源限制和隔离设置
+#===============================================================================
+
+apply_systemd_configs() {
+    print_info "应用 systemd 资源隔离配置..."
+    local updated=0
+    
+    # 获取当前配置路径
+    local config_file="${BASE_DIR}/config.yaml"
+    local xray_config="${BASE_DIR}/xray-config.json"
+    
+    # 应用 Hysteria2 服务配置
+    if [[ -d /etc/systemd/system/hysteria-server.service.d ]]; then
+        cat > /etc/systemd/system/hysteria-server.service.d/override.conf << EOF
+[Unit]
+# Hysteria2 使用 QUIC (UDP)，与 Xray (TCP) 独立运行
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/hysteria server --config ${config_file}
+
+# 资源隔离：防止 UDP 大流量影响 TCP 服务
+CPUSchedulingPolicy=other
+Nice=-5
+LimitNOFILE=1048576
+
+# 确保服务稳定运行
+Restart=always
+RestartSec=3
+EOF
+        print_info "  ✓ 更新 Hysteria2 服务配置"
+        updated=1
+    fi
+    
+    # 应用 Xray 服务配置
+    if [[ -d /etc/systemd/system/xray.service.d ]]; then
+        cat > /etc/systemd/system/xray.service.d/override.conf << EOF
+[Unit]
+# Xray 使用 TCP，与 Hysteria2 (UDP) 独立运行
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/xray run -config ${xray_config}
+
+# 资源隔离：确保 TCP 服务稳定
+CPUSchedulingPolicy=other
+Nice=-5
+LimitNOFILE=1048576
+
+# 确保服务稳定运行
+Restart=always
+RestartSec=3
+EOF
+        print_info "  ✓ 更新 Xray 服务配置"
+        updated=1
+    fi
+    
+    # 应用端口跳跃配置（如果配置文件存在）
+    if [[ -f "${BASE_DIR}/port-hopping.json" ]]; then
+        local enabled=$(jq -r '.enabled' "${BASE_DIR}/port-hopping.json" 2>/dev/null)
+        if [[ "$enabled" == "true" ]]; then
+            local start_port=$(jq -r '.startPort' "${BASE_DIR}/port-hopping.json")
+            local end_port=$(jq -r '.endPort' "${BASE_DIR}/port-hopping.json")
+            local listen_port=$(jq -r '.listenPort' "${BASE_DIR}/port-hopping.json")
+            local iface=$(jq -r '.interface' "${BASE_DIR}/port-hopping.json")
+            [[ -z "$iface" || "$iface" == "null" ]] && iface=$(ip route get 8.8.8.8 2>/dev/null | grep -oP 'dev \K\S+' | head -1)
+            [[ -z "$iface" ]] && iface="eth0"
+            
+            # 清理旧规则
+            iptables -t nat -D PREROUTING -i "$iface" -p udp --dport ${start_port}:${end_port} -j REDIRECT --to-ports ${listen_port} 2>/dev/null || true
+            
+            # 添加新规则（仅 UDP）
+            if iptables -t nat -A PREROUTING -i "$iface" -p udp --dport ${start_port}:${end_port} \
+                -m comment --comment "Hysteria2-PortHopping" \
+                -j REDIRECT --to-ports ${listen_port} 2>/dev/null; then
+                print_info "  ✓ 应用端口跳跃规则 (UDP ${start_port}-${end_port} -> ${listen_port})"
+            fi
+        fi
+    fi
+    
+    # 重载 systemd
+    if [[ $updated -eq 1 ]]; then
+        systemctl daemon-reload
+        print_success "资源隔离配置已应用"
     fi
 }
 
@@ -376,8 +472,13 @@ auto_update() {
             fi
         done
         
+        # 应用 systemd 资源隔离配置
+        apply_systemd_configs 2>/dev/null || true
+        
         # 重启服务
         systemctl restart b-ui-admin 2>/dev/null || true
+        systemctl restart hysteria-server 2>/dev/null || true
+        systemctl restart xray 2>/dev/null || true
         
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] 更新完成: v${remote_ver}" >> "$LOG_FILE"
     else

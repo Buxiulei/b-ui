@@ -1,5 +1,5 @@
 {
-    "version": "2.11.0",
+    "version": "2.11.1",
     "updated": "2025-12-16",
     "files": [
         "install.sh",
@@ -14,6 +14,7 @@
         "b-ui-client.sh"
     ],
     "changelog": {
+        "2.11.1": "更新脚本自动应用systemd资源隔离和端口跳跃配置，无需手动操作",
         "2.11.0": "协议隔离修复：端口跳跃规则只处理UDP，服务资源隔离防止Hy2/VLESS相互干扰",
         "2.10.0": "集成 singbox-converter 库，订阅链接生成标准化，ESM 模块化重构",
         "2.9.3": "客户端订阅支持：从服务端导入sing-box/Clash融合配置，一键开启TUN自动切换",
