@@ -165,6 +165,7 @@ show_menu() {
     echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}7.${NC} ${GREEN}检查 B-UI 更新${NC}                                          ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}8.${NC} ${GREEN}更新内核/客户端 (Hysteria2 + Xray + Client)${NC}               ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}10.${NC} ${YELLOW}端口跳跃设置${NC}                                            ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}9.${NC} ${RED}完全卸载${NC}                                                 ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}0.${NC} 退出                                                     ${CYAN}║${NC}"
@@ -343,6 +344,91 @@ update_kernel() {
     fi
 }
 
+configure_port_hopping_menu() {
+    echo ""
+    echo -e "${CYAN}════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${CYAN}  端口跳跃设置${NC}"
+    echo -e "${CYAN}════════════════════════════════════════════════════════════════${NC}"
+    
+    # 检查当前状态
+    local config_file="${BASE_DIR}/port-hopping.json"
+    if [[ -f "$config_file" ]]; then
+        local enabled=$(jq -r '.enabled // false' "$config_file" 2>/dev/null)
+        local start=$(jq -r '.startPort // 20000' "$config_file" 2>/dev/null)
+        local end=$(jq -r '.endPort // 30000' "$config_file" 2>/dev/null)
+        echo -e "  当前状态: ${GREEN}已启用${NC}"
+        echo -e "  端口范围: ${YELLOW}${start}-${end}${NC}"
+    else
+        echo -e "  当前状态: ${RED}未启用${NC}"
+    fi
+    
+    echo ""
+    echo -e "  ${YELLOW}1.${NC} 启用/重新配置端口跳跃"
+    echo -e "  ${YELLOW}2.${NC} 禁用端口跳跃"
+    echo -e "  ${YELLOW}0.${NC} 返回主菜单"
+    echo ""
+    read -p "请选择 [0-2]: " ph_choice
+    
+    case $ph_choice in
+        1)
+            echo ""
+            # 获取当前 Hysteria 端口
+            local hy_port=$(grep -oP '^listen:\s*:(\d+)' "${CONFIG_FILE}" 2>/dev/null | grep -oP '\d+' || echo "10000")
+            
+            read -p "起始端口 [默认: 20000]: " start_port
+            start_port=${start_port:-20000}
+            
+            read -p "结束端口 [默认: 30000]: " end_port
+            end_port=${end_port:-30000}
+            
+            # 验证端口范围
+            if [[ $start_port -ge $end_port ]]; then
+                print_error "起始端口必须小于结束端口"
+                return 1
+            fi
+            
+            print_info "配置端口跳跃 (${start_port}-${end_port} -> ${hy_port})..."
+            
+            # 设置环境变量并调用 core.sh 中的函数
+            export PORT_HOPPING_ENABLED="y"
+            export PORT_HOPPING_START="$start_port"
+            export PORT_HOPPING_END="$end_port"
+            export PORT="$hy_port"
+            
+            # source core.sh 并调用函数
+            if [[ -f "${BASE_DIR}/core.sh" ]]; then
+                source "${BASE_DIR}/core.sh"
+                configure_port_hopping
+                print_success "端口跳跃配置完成！"
+                print_info "新用户创建的链接将自动包含 mport 参数"
+            else
+                print_error "core.sh 未找到"
+            fi
+            ;;
+        2)
+            print_info "禁用端口跳跃..."
+            
+            # 清理 iptables 规则
+            local iface=$(ip route get 8.8.8.8 2>/dev/null | grep -oP 'dev \K\S+' | head -1)
+            [[ -z "$iface" ]] && iface="eth0"
+            
+            # 删除所有带 Hysteria2-PortHopping 注释的规则
+            local rule_nums=$(iptables -t nat -L PREROUTING --line-numbers -n 2>/dev/null | grep "Hysteria2-PortHopping" | awk '{print $1}' | sort -rn)
+            for num in $rule_nums; do
+                iptables -t nat -D PREROUTING $num 2>/dev/null || true
+            done
+            
+            # 删除配置文件
+            rm -f "${BASE_DIR}/port-hopping.json"
+            
+            print_success "端口跳跃已禁用"
+            ;;
+        0|*)
+            return 0
+            ;;
+    esac
+}
+
 uninstall_all() {
     echo ""
     echo -e "${RED}════════════════════════════════════════════════════════════════${NC}"
@@ -414,7 +500,7 @@ main() {
         show_status
         show_menu
         
-        read -p "请选择 [0-9]: " choice
+        read -p "请选择 [0-10]: " choice
         
         case $choice in
             1) show_client_config ;;
@@ -426,6 +512,7 @@ main() {
             7) check_bui_update ;;
             8) update_kernel ;;
             9) uninstall_all ;;
+            10) configure_port_hopping_menu ;;
             0) print_info "再见！"; exit 0 ;;
             *) print_error "无效选项" ;;
         esac
