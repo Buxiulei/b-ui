@@ -986,13 +986,21 @@ generate_singbox_tun_config() {
     local safe_shortid=$(json_escape "${SHORT_ID}")
     
     if [[ "$protocol" == "hysteria2" ]]; then
+        # 端口跳跃配置
+        local hop_config=""
+        if [[ -n "$MPORT" ]]; then
+            hop_config=",
+      \"hop_ports\": \"${MPORT}\",
+      \"hop_interval\": \"30s\""
+        fi
+        
         outbound_config=$(cat <<OUTBOUND
     {
       "type": "hysteria2",
       "tag": "proxy-out",
       "server": "${safe_server}",
       "server_port": ${server_port},
-      "password": "${safe_password}",
+      "password": "${safe_password}"${hop_config},
       "tls": {
         "enabled": true,
         "server_name": "${safe_sni}",
@@ -1256,12 +1264,17 @@ parse_hysteria_uri() {
     local insecure="false"
     [[ "$query_part" =~ insecure=1 ]] && insecure="true"
     
+    # 解析 mport (端口跳跃)
+    local mport=""
+    [[ "$query_part" =~ mport=([^&]+) ]] && mport="${BASH_REMATCH[1]}"
+    
     # 输出解析结果
     echo "PROTOCOL=hysteria2"
     echo "SERVER_ADDR=$server_part"
     echo "AUTH_PASSWORD=$password"
     echo "SNI=$sni"
     echo "INSECURE=$insecure"
+    echo "MPORT=$mport"
     echo "REMARK=$remark"
 }
 
