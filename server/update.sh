@@ -169,9 +169,11 @@ do_update() {
         "server/b-ui-cli.sh:${BASE_DIR}/b-ui-cli.sh"
         "server/update.sh:${BASE_DIR}/update.sh"
         "web/server.js:${ADMIN_DIR}/server.js"
+        "web/package.json:${ADMIN_DIR}/package.json"
         "web/index.html:${ADMIN_DIR}/index.html"
         "web/style.css:${ADMIN_DIR}/style.css"
         "web/app.js:${ADMIN_DIR}/app.js"
+        "web/logo.jpg:${ADMIN_DIR}/logo.jpg"
     )
     
     local failed=0
@@ -468,7 +470,7 @@ auto_update() {
         select_download_source
         
         # 下载新文件
-        local files=("version.json" "install.sh" "server/core.sh" "server/b-ui-cli.sh" "server/update.sh" "web/server.js" "web/index.html" "web/style.css" "web/app.js" "b-ui-client.sh")
+        local files=("version.json" "install.sh" "server/core.sh" "server/b-ui-cli.sh" "server/update.sh" "web/server.js" "web/package.json" "web/index.html" "web/style.css" "web/app.js" "web/logo.jpg" "b-ui-client.sh")
         
         for file in "${files[@]}"; do
             local local_path="${BASE_DIR}/${file}"

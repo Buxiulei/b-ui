@@ -209,9 +209,11 @@ download_all_files() {
         "server/b-ui-cli.sh:${BASE_DIR}/b-ui-cli.sh"
         "server/update.sh:${BASE_DIR}/update.sh"
         "web/server.js:${ADMIN_DIR}/server.js"
+        "web/package.json:${ADMIN_DIR}/package.json"
         "web/index.html:${ADMIN_DIR}/index.html"
         "web/style.css:${ADMIN_DIR}/style.css"
         "web/app.js:${ADMIN_DIR}/app.js"
+        "web/logo.jpg:${ADMIN_DIR}/logo.jpg"
     )
     
     local failed=0

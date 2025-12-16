@@ -1,5 +1,5 @@
 {
-    "version": "2.11.2",
+    "version": "2.12.0",
     "updated": "2025-12-16",
     "files": [
         "install.sh",
@@ -11,10 +11,11 @@
         "web/index.html",
         "web/style.css",
         "web/app.js",
+        "web/logo.jpg",
         "b-ui-client.sh"
     ],
     "changelog": {
-        "2.11.2": "更新脚本自动安装npm依赖，修复singbox-converter模块缺失问题",
+        "2.12.0": "新Logo设计、协议隔离、systemd资源隔离、npm依赖自动安装",
         "2.11.1": "更新脚本自动应用systemd资源隔离和端口跳跃配置，无需手动操作",
         "2.11.0": "协议隔离修复：端口跳跃规则只处理UDP，服务资源隔离防止Hy2/VLESS相互干扰",
         "2.10.0": "集成 singbox-converter 库，订阅链接生成标准化，ESM 模块化重构",
