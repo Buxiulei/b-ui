@@ -841,6 +841,14 @@ const server = http.createServer(async (req, res) => {
         } catch { return sendJSON(res, { error: "Not found" }, 404); }
     }
 
+    if (p === "/logo.jpg") {
+        try {
+            const logo = fs.readFileSync(path.join(ADMIN_DIR, "logo.jpg"));
+            res.writeHead(200, { "Content-Type": "image/jpeg" });
+            return res.end(logo);
+        } catch { return sendJSON(res, { error: "Not found" }, 404); }
+    }
+
     // --- 客户端一键安装 (验证 key) ---
     if (p === "/install-client" || p.startsWith("/install-client?")) {
         const key = u.searchParams.get("key");
