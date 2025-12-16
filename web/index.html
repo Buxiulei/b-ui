@@ -14,7 +14,16 @@
     <div id="v-login" class="view active" style="padding:0">
         <div class="login-wrap">
             <div class="stat-card login-card">
-                <div style="font-size:48px;margin-bottom:16px">⚡</div>
+                <div
+                    style="margin-bottom:16px; display:inline-flex; align-items:center; justify-content:center; width:64px; height:64px; background:var(--primary-gradient); border-radius:18px; box-shadow:0 8px 24px var(--primary-glow)">
+                    <svg width="40" height="40" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"
+                        style="stroke:white; stroke-width:2.5; stroke-linecap:round; stroke-linejoin:round;">
+                        <path
+                            d="M7 5C7 3.89543 7.89543 3 9 3H13.5C16.5376 3 19 5.46243 19 8.5C19 10.2526 18.1798 11.8105 16.9037 12.8028C17.7533 13.6267 18.25 14.7003 18.25 15.875C18.25 18.7065 15.9546 21 13.125 21H9C7.89543 21 7 20.1046 7 19V5Z"
+                            stroke-width="2.5" fill="none" />
+                        <path d="M7 12L14 12" stroke-width="2.5" />
+                    </svg>
+                </div>
                 <h1
                     style="font-size:28px; margin-bottom:8px; font-weight:800; background:var(--primary-gradient); -webkit-background-clip:text; -webkit-text-fill-color:transparent;">
                     B-UI 面板</h1>
@@ -29,7 +38,17 @@
     <!-- Dashboard View -->
     <div id="v-dash" class="view">
         <nav class="nav">
-            <div class="brand"><i>⚡</i><span>B-UI</span><span class="ver-tag">v${VERSION}</span></div>
+            <div class="brand">
+                <div class="logo-icon">
+                    <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                        <path
+                            d="M7 5C7 3.89543 7.89543 3 9 3H13.5C16.5376 3 19 5.46243 19 8.5C19 10.2526 18.1798 11.8105 16.9037 12.8028C17.7533 13.6267 18.25 14.7003 18.25 15.875C18.25 18.7065 15.9546 21 13.125 21H9C7.89543 21 7 20.1046 7 19V5Z"
+                            stroke-width="2.5" />
+                        <path d="M7 12L14 12" stroke-width="2.5" />
+                    </svg>
+                </div>
+                <span>B-UI</span><span class="ver-tag">v${VERSION}</span>
+            </div>
             <div style="display:flex; gap:12px">
                 <button class="ibtn" onclick="openMasq()" title="伪装网站设置">🎭</button>
                 <button class="ibtn" onclick="openBandwidth()" title="带宽限制设置">⚡</button>
@@ -225,11 +244,15 @@
             </div>
             <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px">
                 <div>
-                    <label style="font-size:12px;color:var(--text-dim);font-weight:600;margin-bottom:4px;display:block">上传带宽 (Mbps)</label>
+                    <label
+                        style="font-size:12px;color:var(--text-dim);font-weight:600;margin-bottom:4px;display:block">上传带宽
+                        (Mbps)</label>
                     <input type="number" id="bandwidth-up" placeholder="例如: 100" min="0">
                 </div>
                 <div>
-                    <label style="font-size:12px;color:var(--text-dim);font-weight:600;margin-bottom:4px;display:block">下载带宽 (Mbps)</label>
+                    <label
+                        style="font-size:12px;color:var(--text-dim);font-weight:600;margin-bottom:4px;display:block">下载带宽
+                        (Mbps)</label>
                     <input type="number" id="bandwidth-down" placeholder="例如: 100" min="0">
                 </div>
             </div>
