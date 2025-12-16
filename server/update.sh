@@ -469,14 +469,26 @@ auto_update() {
         # 执行静默更新
         select_download_source
         
-        # 下载新文件
-        local files=("version.json" "install.sh" "server/core.sh" "server/b-ui-cli.sh" "server/update.sh" "web/server.js" "web/package.json" "web/index.html" "web/style.css" "web/app.js" "web/logo.jpg" "b-ui-client.sh")
+        # 下载新文件（使用正确的路径映射）
+        declare -A file_map=(
+            ["version.json"]="${BASE_DIR}/version.json"
+            ["server/core.sh"]="${BASE_DIR}/core.sh"
+            ["server/b-ui-cli.sh"]="${BASE_DIR}/b-ui-cli.sh"
+            ["server/update.sh"]="${BASE_DIR}/update.sh"
+            ["web/server.js"]="${ADMIN_DIR}/server.js"
+            ["web/package.json"]="${ADMIN_DIR}/package.json"
+            ["web/index.html"]="${ADMIN_DIR}/index.html"
+            ["web/style.css"]="${ADMIN_DIR}/style.css"
+            ["web/app.js"]="${ADMIN_DIR}/app.js"
+            ["web/logo.jpg"]="${ADMIN_DIR}/logo.jpg"
+            ["b-ui-client.sh"]="${BASE_DIR}/b-ui-client.sh"
+        )
         
-        for file in "${files[@]}"; do
-            local local_path="${BASE_DIR}/${file}"
+        for remote in "${!file_map[@]}"; do
+            local local_path="${file_map[$remote]}"
             mkdir -p "$(dirname "$local_path")"
             
-            if curl -fsSL "${DOWNLOAD_URL}/${file}" -o "$local_path" 2>/dev/null; then
+            if curl -fsSL "${DOWNLOAD_URL}/${remote}" -o "$local_path" 2>/dev/null; then
                 chmod +x "$local_path" 2>/dev/null || true
             fi
         done
