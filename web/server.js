@@ -1247,6 +1247,87 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
             if (r === "kick" && req.method === "POST") return sendJSON(res, await postStats("/kick", await parseBody(req)));
             if (r === "config") return sendJSON(res, getConfig());
 
+            // Port Hopping settings API
+            if (r === "port-hopping") {
+                const phFile = path.join(BASE_DIR, "port-hopping.json");
+
+                if (req.method === "GET") {
+                    try {
+                        if (fs.existsSync(phFile)) {
+                            const ph = JSON.parse(fs.readFileSync(phFile, "utf8"));
+                            return sendJSON(res, {
+                                enabled: ph.enabled || false,
+                                start: ph.startPort || 20000,
+                                end: ph.endPort || 30000
+                            });
+                        }
+                        return sendJSON(res, { enabled: false, start: 20000, end: 30000 });
+                    } catch {
+                        return sendJSON(res, { enabled: false, start: 20000, end: 30000 });
+                    }
+                }
+
+                if (req.method === "POST") {
+                    const b = await parseBody(req);
+                    const enabled = !!b.enabled;
+                    const start = parseInt(b.start) || 20000;
+                    const end = parseInt(b.end) || 30000;
+
+                    if (start >= end) return sendJSON(res, { error: "起始端口必须小于结束端口" }, 400);
+
+                    try {
+                        // 获取 Hysteria 监听端口
+                        let listenPort = 10000;
+                        try {
+                            const hyc = fs.readFileSync(CONFIG.hysteriaConfig, "utf8");
+                            const pm = hyc.match(/listen:\s*:(\d+)/);
+                            if (pm) listenPort = parseInt(pm[1]);
+                        } catch { }
+
+                        // 保存配置
+                        const phConfig = {
+                            enabled,
+                            startPort: start,
+                            endPort: end,
+                            listenPort
+                        };
+                        fs.writeFileSync(phFile, JSON.stringify(phConfig, null, 2));
+
+                        // 执行 iptables 规则更新 (调用 shell 脚本)
+                        if (enabled) {
+                            // 启用端口跳跃：添加 iptables 规则
+                            const cmd = `
+                                iface=$(ip route get 8.8.8.8 2>/dev/null | grep -oP 'dev \\K\\S+' | head -1)
+                                [ -z "$iface" ] && iface="eth0"
+                                # 清理旧规则
+                                rule_nums=$(iptables -t nat -L PREROUTING --line-numbers -n 2>/dev/null | grep "Hysteria2-PortHopping" | awk '{print $1}' | sort -rn)
+                                for num in $rule_nums; do iptables -t nat -D PREROUTING $num 2>/dev/null || true; done
+                                # 添加新规则
+                                iptables -t nat -A PREROUTING -i "$iface" -p udp --dport ${start}:${end} -m comment --comment "Hysteria2-PortHopping" -j REDIRECT --to-ports ${listenPort}
+                                # 持久化
+                                mkdir -p /etc/iptables
+                                iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+                            `;
+                            execSync(cmd, { shell: "/bin/bash", stdio: "pipe" });
+                            log("INFO", `Port hopping enabled: ${start}-${end} -> ${listenPort}`);
+                        } else {
+                            // 禁用端口跳跃：删除 iptables 规则
+                            const cmd = `
+                                rule_nums=$(iptables -t nat -L PREROUTING --line-numbers -n 2>/dev/null | grep "Hysteria2-PortHopping" | awk '{print $1}' | sort -rn)
+                                for num in $rule_nums; do iptables -t nat -D PREROUTING $num 2>/dev/null || true; done
+                                iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+                            `;
+                            execSync(cmd, { shell: "/bin/bash", stdio: "pipe" });
+                            log("INFO", "Port hopping disabled");
+                        }
+
+                        return sendJSON(res, { success: true, enabled, start, end });
+                    } catch (e) {
+                        return sendJSON(res, { error: e.message }, 500);
+                    }
+                }
+            }
+
             if (r === "masquerade") {
                 const masqFile = CONFIG.hysteriaConfig.replace("config.yaml", "masquerade.json");
                 if (req.method === "GET") {

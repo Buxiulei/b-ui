@@ -469,6 +469,39 @@ function saveBandwidth() {
     });
 }
 
+// Port Hopping settings
+function openPortHopping() {
+    api("/port-hopping").then(r => {
+        $("#ph-enabled").checked = r.enabled || false;
+        $("#ph-start").value = r.start || 20000;
+        $("#ph-end").value = r.end || 30000;
+        openM("m-porthopping");
+    });
+}
+
+function savePortHopping() {
+    const enabled = $("#ph-enabled").checked;
+    const start = parseInt($("#ph-start").value) || 20000;
+    const end = parseInt($("#ph-end").value) || 30000;
+
+    if (start >= end) return toast("起始端口必须小于结束端口", 1);
+    if (start < 1024 || end > 65535) return toast("端口范围应在 1024-65535 之间", 1);
+
+    api("/port-hopping", {
+        method: "POST",
+        body: JSON.stringify({ enabled, start, end })
+    }).then(r => {
+        if (r.success) {
+            closeM();
+            toast(enabled ? "端口跳跃已启用: " + start + "-" + end : "端口跳跃已禁用");
+            // 刷新配置
+            api("/config").then(d => cfg = d);
+        } else {
+            toast(r.error || "操作失败", 1);
+        }
+    });
+}
+
 // Toggle SNI select visibility
 function toggleSniSelect() {
     const proto = $("#nproto").value;

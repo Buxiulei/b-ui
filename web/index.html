@@ -14,12 +14,11 @@
     <div id="v-login" class="view active" style="padding:0">
         <div class="login-wrap">
             <div class="stat-card login-card">
-                <img src="/logo.jpg" alt="BUI" style="width:80px; height:auto; margin-bottom:16px; border-radius:12px;">
-                <h1
-                    style="font-size:28px; margin-bottom:8px; font-weight:800; background:var(--primary-gradient); -webkit-background-clip:text; -webkit-text-fill-color:transparent;">
-                    B-UI 面板</h1>
-                <p style="color:var(--text-dim); font-size:14px; margin-bottom:40px; font-weight:500">安全访问中心 ·
-                    v${VERSION}</p>
+                <div class="login-logo-wrapper">
+                    <img src="/logo.jpg" alt="BUI" class="login-logo">
+                </div>
+                <h1 class="login-title">B-UI 面板</h1>
+                <p class="login-subtitle">安全访问中心 · v${VERSION}</p>
                 <input type="password" id="lp" placeholder="请输入管理员密码" style="text-align:center">
                 <button class="btn" style="width:100%; margin-top:8px" onclick="login()">立即登录</button>
             </div>
@@ -30,11 +29,14 @@
     <div id="v-dash" class="view">
         <nav class="nav">
             <div class="brand">
-                <img src="/logo.jpg" alt="BUI" style="height:36px; width:auto; border-radius:6px;">
+                <div class="nav-logo">
+                    <img src="/logo.jpg" alt="BUI">
+                </div>
                 <span class="ver-tag">v${VERSION}</span>
             </div>
-            <div style="display:flex; gap:12px">
+            <div class="nav-actions">
                 <button class="ibtn" onclick="openMasq()" title="伪装网站设置">🎭</button>
+                <button class="ibtn" onclick="openPortHopping()" title="端口跳跃设置">🔀</button>
                 <button class="ibtn" onclick="openBandwidth()" title="带宽限制设置">⚡</button>
                 <button class="ibtn" onclick="openM('m-pwd')" title="修改密码">🔑</button>
                 <button class="ibtn danger" onclick="logout()" title="退出登录">✕</button>
@@ -45,20 +47,32 @@
             <!-- Stats Grid -->
             <div class="stats">
                 <div class="stat-card">
-                    <div class="stat-lbl">总用户数</div>
-                    <div class="stat-val" id="st-u">0</div>
+                    <div class="stat-icon">👥</div>
+                    <div>
+                        <div class="stat-lbl">总用户数</div>
+                        <div class="stat-val" id="st-u">0</div>
+                    </div>
                 </div>
                 <div class="stat-card">
-                    <div class="stat-lbl">在线设备</div>
-                    <div class="stat-val" id="st-o" style="color:var(--success)">0</div>
+                    <div class="stat-icon">🟢</div>
+                    <div>
+                        <div class="stat-lbl">在线设备</div>
+                        <div class="stat-val" id="st-o" style="color:var(--success)">0</div>
+                    </div>
                 </div>
                 <div class="stat-card">
-                    <div class="stat-lbl">上传流量</div>
-                    <div class="stat-val" id="st-up">0</div>
+                    <div class="stat-icon">☁️</div>
+                    <div>
+                        <div class="stat-lbl">上传流量</div>
+                        <div class="stat-val" id="st-up">0</div>
+                    </div>
                 </div>
                 <div class="stat-card">
-                    <div class="stat-lbl">下载流量</div>
-                    <div class="stat-val" id="st-dl">0</div>
+                    <div class="stat-icon">📥</div>
+                    <div>
+                        <div class="stat-lbl">下载流量</div>
+                        <div class="stat-val" id="st-dl">0</div>
+                    </div>
                 </div>
             </div>
 
@@ -249,6 +263,45 @@
             <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:16px">
                 <button class="btn btn-secondary" onclick="closeM()">取消</button>
                 <button class="btn" onclick="saveBandwidth()">保存设置</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Port Hopping Settings Modal -->
+    <div id="m-porthopping" class="modal">
+        <div class="modal-card">
+            <h3>🔀 端口跳跃设置</h3>
+            <div class="info-box" style="margin-bottom:20px; font-size:13px; color:var(--text-dim)">
+                端口跳跃可以有效对抗 QoS 限速，通过在多个端口间跳跃来规避运营商的流量限制。
+            </div>
+            <div style="display:flex; align-items:center; gap:12px; margin-bottom:16px">
+                <label style="font-size:14px; font-weight:600; color:var(--text)">启用端口跳跃</label>
+                <label class="switch">
+                    <input type="checkbox" id="ph-enabled">
+                    <span class="slider"></span>
+                </label>
+            </div>
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px">
+                <div>
+                    <label
+                        style="font-size:12px;color:var(--text-dim);font-weight:600;margin-bottom:4px;display:block">起始端口</label>
+                    <input type="number" id="ph-start" placeholder="20000" min="1024" max="65535">
+                </div>
+                <div>
+                    <label
+                        style="font-size:12px;color:var(--text-dim);font-weight:600;margin-bottom:4px;display:block">结束端口</label>
+                    <input type="number" id="ph-end" placeholder="30000" min="1024" max="65535">
+                </div>
+            </div>
+            <div class="info-box" style="margin-top:12px; font-size:12px">
+                <strong>说明：</strong><br>
+                • 推荐端口范围：20000-30000<br>
+                • 需确保防火墙已开放对应 UDP 端口<br>
+                • 修改后订阅链接会自动包含 mport 参数
+            </div>
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:16px">
+                <button class="btn btn-secondary" onclick="closeM()">取消</button>
+                <button class="btn" onclick="savePortHopping()">保存设置</button>
             </div>
         </div>
     </div>
