@@ -527,9 +527,9 @@ select:focus {
 }
 
 .login-logo {
-    width: 100px;
-    height: 100px;
-    border-radius: 24px;
+    width: 180px;
+    height: auto;
+    border-radius: 16px;
     box-shadow: 0 8px 24px rgba(0, 0, 0, 0.08);
     transition: transform 0.3s var(--ease-out);
 }
