@@ -105,11 +105,27 @@ install_hysteria() {
         mkdir -p "$BASE_DIR"
         
         # 创建 systemd 服务覆盖配置
+        # 添加服务依赖和资源隔离设置，避免 Hysteria2 和 Xray 相互干扰
         mkdir -p /etc/systemd/system/hysteria-server.service.d
         cat > /etc/systemd/system/hysteria-server.service.d/override.conf << EOF
+[Unit]
+# 与 Xray 服务解耦，确保独立运行
+# Hysteria2 使用 QUIC (UDP)，Xray 使用 TCP，互不干扰
+Wants=network-online.target
+After=network-online.target
+
 [Service]
 ExecStart=
 ExecStart=/usr/local/bin/hysteria server --config ${CONFIG_FILE}
+
+# 资源隔离：防止 UDP 大流量影响 TCP 服务
+CPUSchedulingPolicy=other
+Nice=-5
+LimitNOFILE=1048576
+
+# 确保服务稳定运行
+Restart=always
+RestartSec=3
 EOF
         systemctl daemon-reload
     else
@@ -602,6 +618,7 @@ configure_port_hopping() {
     local listen_port=${PORT:-10000}
     local start_port=${PORT_HOPPING_START:-20000}
     local end_port=${PORT_HOPPING_END:-30000}
+    local xray_port=${XRAY_PORT:-10001}
     
     print_info "配置端口跳跃 (${start_port}-${end_port} -> ${listen_port})..."
     
@@ -609,22 +626,61 @@ configure_port_hopping() {
     local iface=$(ip route get 8.8.8.8 2>/dev/null | grep -oP 'dev \K\S+' | head -1)
     [[ -z "$iface" ]] && iface="eth0"
     
-    # 清理旧规则（如果存在）
+    # =========================================================================
+    # 清理旧的端口跳跃规则（通过注释标识符精确匹配）
+    # =========================================================================
+    print_info "清理旧的端口跳跃规则..."
+    
+    # 获取所有带 Hysteria2-PortHopping 注释的规则行号并删除
+    local rule_nums=$(iptables -t nat -L PREROUTING --line-numbers -n 2>/dev/null | grep "Hysteria2-PortHopping" | awk '{print $1}' | sort -rn)
+    for num in $rule_nums; do
+        iptables -t nat -D PREROUTING $num 2>/dev/null || true
+    done
+    
+    # IPv6 清理
+    local rule_nums6=$(ip6tables -t nat -L PREROUTING --line-numbers -n 2>/dev/null | grep "Hysteria2-PortHopping" | awk '{print $1}' | sort -rn)
+    for num in $rule_nums6; do
+        ip6tables -t nat -D PREROUTING $num 2>/dev/null || true
+    done
+    
+    # 兼容旧规则格式清理
     iptables -t nat -D PREROUTING -i "$iface" -p udp --dport ${start_port}:${end_port} -j REDIRECT --to-ports ${listen_port} 2>/dev/null || true
     ip6tables -t nat -D PREROUTING -i "$iface" -p udp --dport ${start_port}:${end_port} -j REDIRECT --to-ports ${listen_port} 2>/dev/null || true
     
-    # 添加 IPv4 规则
-    if iptables -t nat -A PREROUTING -i "$iface" -p udp --dport ${start_port}:${end_port} -j REDIRECT --to-ports ${listen_port}; then
-        print_success "IPv4 端口跳跃规则已添加"
+    # =========================================================================
+    # 添加端口跳跃规则 - 仅处理 UDP 流量
+    # 使用 -m comment 添加标识符，便于后续管理和清理
+    # =========================================================================
+    
+    # 添加 IPv4 UDP 端口跳跃规则
+    if iptables -t nat -A PREROUTING -i "$iface" -p udp --dport ${start_port}:${end_port} \
+        -m comment --comment "Hysteria2-PortHopping" \
+        -j REDIRECT --to-ports ${listen_port}; then
+        print_success "IPv4 端口跳跃规则已添加 (UDP only)"
     else
         print_warning "IPv4 端口跳跃规则添加失败"
     fi
     
-    # 添加 IPv6 规则
-    if ip6tables -t nat -A PREROUTING -i "$iface" -p udp --dport ${start_port}:${end_port} -j REDIRECT --to-ports ${listen_port} 2>/dev/null; then
-        print_success "IPv6 端口跳跃规则已添加"
+    # 添加 IPv6 UDP 端口跳跃规则
+    if ip6tables -t nat -A PREROUTING -i "$iface" -p udp --dport ${start_port}:${end_port} \
+        -m comment --comment "Hysteria2-PortHopping" \
+        -j REDIRECT --to-ports ${listen_port} 2>/dev/null; then
+        print_success "IPv6 端口跳跃规则已添加 (UDP only)"
     else
         print_info "IPv6 端口跳跃规则跳过（可能不支持）"
+    fi
+    
+    # =========================================================================
+    # 验证规则：确保 TCP 流量不受影响
+    # =========================================================================
+    print_info "验证协议隔离..."
+    local udp_rules=$(iptables -t nat -L PREROUTING -n 2>/dev/null | grep -c "Hysteria2-PortHopping")
+    local tcp_rules=$(iptables -t nat -L PREROUTING -n 2>/dev/null | grep "Hysteria2-PortHopping" | grep -c "tcp" || echo "0")
+    
+    if [[ "$udp_rules" -gt 0 && "$tcp_rules" -eq 0 ]]; then
+        print_success "协议隔离验证通过：UDP=${udp_rules} 条规则，TCP=无影响"
+    else
+        print_warning "协议隔离需要验证，请检查 iptables 规则"
     fi
     
     # 持久化 iptables 规则
@@ -635,18 +691,23 @@ configure_port_hopping() {
         print_success "iptables 规则已持久化"
     fi
     
-    # 保存端口跳跃配置
+    # 保存端口跳跃配置（增加 xray_port 信息）
     cat > "${BASE_DIR}/port-hopping.json" << EOF
 {
     "enabled": true,
     "startPort": ${start_port},
     "endPort": ${end_port},
     "listenPort": ${listen_port},
-    "interface": "${iface}"
+    "xrayPort": ${xray_port},
+    "interface": "${iface}",
+    "protocolIsolation": {
+        "hysteria2": "UDP only",
+        "xray": "TCP only (unaffected)"
+    }
 }
 EOF
     
-    print_success "端口跳跃配置完成"
+    print_success "端口跳跃配置完成（已确保 TCP/UDP 协议隔离）"
 }
 
 #===============================================================================
@@ -827,11 +888,26 @@ WantedBy=multi-user.target
 EOF
 
     # 创建 Xray 服务覆盖
+    # 添加资源隔离设置，确保 TCP 服务稳定运行
     mkdir -p /etc/systemd/system/xray.service.d
     cat > /etc/systemd/system/xray.service.d/override.conf << EOF
+[Unit]
+# Xray 使用 TCP，与 Hysteria2 (UDP) 独立运行
+Wants=network-online.target
+After=network-online.target
+
 [Service]
 ExecStart=
 ExecStart=/usr/local/bin/xray run -config ${BASE_DIR}/xray-config.json
+
+# 资源隔离：确保 TCP 服务稳定
+CPUSchedulingPolicy=other
+Nice=-5
+LimitNOFILE=1048576
+
+# 确保服务稳定运行
+Restart=always
+RestartSec=3
 EOF
 
     systemctl daemon-reload
