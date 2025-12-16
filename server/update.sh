@@ -208,6 +208,13 @@ do_update() {
     # 应用 systemd 资源隔离配置（确保 Hy2/VLESS 协议隔离）
     apply_systemd_configs
     
+    # 安装 Web 面板依赖
+    if [[ -f "${ADMIN_DIR}/package.json" ]]; then
+        print_info "安装 Web 面板依赖..."
+        cd "${ADMIN_DIR}" && npm install --silent 2>/dev/null && cd - > /dev/null
+        print_success "依赖安装完成"
+    fi
+    
     # 确保 CLI 命令存在
     if [[ -f "${BASE_DIR}/b-ui-cli.sh" ]]; then
         ln -sf "${BASE_DIR}/b-ui-cli.sh" /usr/local/bin/b-ui
@@ -474,6 +481,11 @@ auto_update() {
         
         # 应用 systemd 资源隔离配置
         apply_systemd_configs 2>/dev/null || true
+        
+        # 安装 Web 面板依赖
+        if [[ -f "${ADMIN_DIR}/package.json" ]]; then
+            cd "${ADMIN_DIR}" && npm install --silent 2>/dev/null && cd - > /dev/null || true
+        fi
         
         # 重启服务
         systemctl restart b-ui-admin 2>/dev/null || true
