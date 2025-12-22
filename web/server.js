@@ -192,7 +192,8 @@ function saveUsers(u) {
         fs.writeFileSync(CONFIG.usersFile, JSON.stringify(u, null, 2));
         // fusion 用户需要同时添加到两个配置
         const hy2Users = u.filter(x => !x.protocol || x.protocol === "hysteria2" || x.protocol === "fusion");
-        const vlessUsers = u.filter(x => x.protocol === "vless-reality" || x.protocol === "fusion");
+        // 所有有 uuid 的用户都添加到 Xray Reality（支持 VLESS 备用）
+        const vlessUsers = u.filter(x => x.uuid);
         updateHysteriaConfig(hy2Users);
         updateXrayConfig(vlessUsers, u.filter(x => x.protocol === "vless-ws-tls"));
         return true;
