@@ -1108,31 +1108,23 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                     links.push(hy2Link);
                 }
 
-                // VLESS-Reality 链接 - 使用 singbox-converter 生成标准格式
+                // VLESS-Reality 链接 - 手动生成 v2rayN 完整格式
                 if (user.uuid && cfg.pubKey && cfg.shortId) {
                     const userSni = user.sni || cfg.sni || "www.bing.com";
-                    const vlessOutbound = {
-                        type: "vless",
-                        tag: `${user.username}-VLESS`,
-                        server: host,
-                        server_port: cfg.xrayPort || 10001,
-                        uuid: user.uuid,
-                        flow: "xtls-rprx-vision",
-                        tls: {
-                            enabled: true,
-                            server_name: userSni,
-                            utls: {
-                                enabled: true,
-                                fingerprint: "chrome"
-                            },
-                            reality: {
-                                enabled: true,
-                                public_key: cfg.pubKey,
-                                short_id: cfg.shortId
-                            }
-                        }
-                    };
-                    const vlessLink = convertOutboundToLink(vlessOutbound);
+                    const vlessParams = [
+                        `security=reality`,
+                        `encryption=none`,
+                        `pbk=${cfg.pubKey}`,
+                        `headerType=`,
+                        `fp=chrome`,
+                        `spx=%2F`,
+                        `type=tcp`,
+                        `flow=xtls-rprx-vision`,
+                        `sni=${userSni}`,
+                        `sid=${cfg.shortId}`
+                    ].join('&');
+                    const vlessName = encodeURIComponent(`${user.username}-VLESS`);
+                    const vlessLink = `vless://${user.uuid}@${host}:${cfg.xrayPort || 10001}?${vlessParams}#${vlessName}`;
                     links.push(vlessLink);
                 }
 
