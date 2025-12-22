@@ -344,10 +344,7 @@ function showU(uname) {
         // 按钮
         $("#cfg-buttons").innerHTML = `
             <button class="btn" onclick="copy()">📋 复制订阅链接</button>
-            <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px">
-                <button class="btn btn-secondary" onclick="downloadSubscription()">📦 下载 sing-box</button>
-                <button class="btn btn-secondary" onclick="downloadClashSubscription()">📥 下载 Clash</button>
-            </div>
+            <button class="btn btn-secondary" onclick="downloadSubscription()">📦 下载 sing-box 配置</button>
         `;
 
         // 提示
@@ -368,16 +365,8 @@ function showU(uname) {
         // 按钮 - 根据协议类型显示
         let btnHtml = `<button class="btn" onclick="copy()">📋 复制链接</button>`;
 
-        // 所有用户都有双协议凭据，可以显示订阅下载
-        btnHtml += `
-            <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px">
-                <button class="btn btn-secondary" onclick="downloadSubscription()">📦 sing-box 订阅</button>
-                <button class="btn btn-secondary" onclick="downloadClashSubscription()">🔄 Clash 订阅</button>
-            </div>
-        `;
-
         $("#cfg-buttons").innerHTML = btnHtml;
-        $("#cfg-hint").innerText = "也可下载 sing-box/Clash 订阅获得 Hy2+VLESS 自动切换功能";
+        $("#cfg-hint").innerText = "扫码或复制链接导入客户端";
     }
 
     openM("m-cfg");
@@ -402,13 +391,7 @@ function downloadSubscription() {
     toast("正在下载 sing-box 配置...");
 }
 
-// 下载 Clash 订阅配置 (v2rayN/Shadowrocket 兼容)
-function downloadClashSubscription() {
-    if (!currentShowUser) return toast("请先选择用户", 1);
-    const url = "/api/clash/" + encodeURIComponent(currentShowUser.username);
-    window.open(url, "_blank");
-    toast("正在下载 Clash 配置 (v2rayN/Shadowrocket 兼容)...");
-}
+
 
 // Change password
 function changePwd() {

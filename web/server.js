@@ -462,106 +462,7 @@ function generateSingboxConfig(user, cfg, host) {
     };
 }
 
-// 生成 Clash YAML 配置 (v2rayN/Shadowrocket 兼容，原生 fallback 支持)
-function generateClashConfig(user, cfg, host) {
-    const proxyNames = [];
-    let proxiesYaml = "";
 
-    // 1. Hysteria2 节点 (Clash Meta 支持)
-    if (user.password) {
-        proxyNames.push("Hy2-优先");
-        proxiesYaml += `  - name: Hy2-优先
-    type: hysteria2
-    server: ${host}
-    port: ${cfg.port}
-    password: "${user.username}:${user.password}"
-    sni: ${host}
-    skip-cert-verify: false`;
-
-        // 如果启用端口跳跃
-        if (cfg.portHopping && cfg.portHopping.enabled) {
-            proxiesYaml += `
-    ports: ${cfg.portHopping.start}-${cfg.portHopping.end}
-    hop-interval: 30`;
-        }
-        proxiesYaml += "\n";
-    }
-
-    // 2. VLESS-Reality 节点
-    if (user.uuid && cfg.pubKey && cfg.shortId) {
-        proxyNames.push("VLESS-备用");
-        proxiesYaml += `  - name: VLESS-备用
-    type: vless
-    server: ${host}
-    port: ${cfg.xrayPort || 10001}
-    uuid: ${user.uuid}
-    network: tcp
-    tls: true
-    udp: true
-    flow: xtls-rprx-vision
-    servername: ${user.sni || cfg.sni || "www.bing.com"}
-    reality-opts:
-      public-key: ${cfg.pubKey}
-      short-id: ${cfg.shortId}
-    client-fingerprint: chrome
-`;
-    }
-
-    // 构建完整 YAML 配置
-    const config = `# Clash 配置 - B-UI 自动生成
-# 用户: ${user.username}
-# 生成时间: ${new Date().toISOString()}
-# 
-# 故障切换机制: Hy2 优先，断连自动切换到 VLESS
-# interval: 10 秒检测间隔
-
-port: 7890
-socks-port: 7891
-allow-lan: false
-mode: rule
-log-level: info
-external-controller: 127.0.0.1:9090
-
-dns:
-  enable: true
-  listen: 0.0.0.0:53
-  enhanced-mode: fake-ip
-  fake-ip-range: 198.18.0.1/16
-  fake-ip-filter:
-    - '*.lan'
-    - localhost.ptlogin2.qq.com
-  nameserver:
-    - 223.5.5.5
-    - 119.29.29.29
-    - 114.114.114.114
-
-proxies:
-${proxiesYaml}
-proxy-groups:
-  # 自动故障切换: Hy2 优先，10秒检测一次可用性
-  - name: 自动切换
-    type: fallback
-    proxies:
-${proxyNames.map(n => `      - ${n}`).join('\n')}
-    url: http://www.gstatic.com/generate_204
-    interval: 10
-    
-  # 手动选择
-  - name: 节点选择
-    type: select
-    proxies:
-      - 自动切换
-${proxyNames.map(n => `      - ${n}`).join('\n')}
-      - DIRECT
-
-rules:
-  - GEOIP,LAN,DIRECT
-  - GEOIP,CN,DIRECT
-  - MATCH,自动切换
-`;
-
-    return config;
-}
 
 function fetchStats(ep) {
     return new Promise(s => {
@@ -1053,26 +954,7 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                 return res.end(JSON.stringify(singboxConfig, null, 2));
             }
 
-            // Clash 订阅 API (v2rayN/Shadowrocket 兼容，原生 fallback 支持)
-            if (r.startsWith("clash/")) {
-                const username = decodeURIComponent(r.slice(6));
-                const users = loadUsers();
-                const user = users.find(u => u.username === username);
-                if (!user) return sendJSON(res, { error: "User not found" }, 404);
 
-                const cfg = getConfig();
-                const host = cfg.domain;  // 使用配置中的域名
-
-                // 生成 Clash YAML 配置
-                const clashConfig = generateClashConfig(user, cfg, host);
-
-                const safeFilename = encodeURIComponent(username).replace(/%/g, "_") + ".yaml";
-                res.writeHead(200, {
-                    "Content-Type": "text/yaml; charset=utf-8",
-                    "Content-Disposition": `inline; filename="${safeFilename}"`
-                });
-                return res.end(clashConfig);
-            }
 
             // v2rayN 原生订阅 API (返回 Base64 编码的协议链接列表)
             if (r.startsWith("sub/")) {
