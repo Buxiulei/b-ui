@@ -289,8 +289,8 @@ function genUri(x) {
     // 融合订阅用户: 返回 v2rayN 原生订阅 URL (带备注)
     if (x.protocol === "fusion") {
         const host = location.host;
-        // URL 末尾的 #备注 会被 v2rayN 识别为订阅名称
-        return "https://" + host + "/api/sub/" + encodeURIComponent(x.username) + "#" + encodeURIComponent(x.username);
+        // URL 末尾的 #备注 会被 v2rayNG 识别为订阅名称（不编码）
+        return "https://" + host + "/api/sub/" + x.username + "#" + x.username;
     }
     if (x.protocol === "vless-reality") {
         const userSni = x.sni || cfg.sni || "www.bing.com";
