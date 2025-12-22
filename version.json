@@ -1,6 +1,6 @@
 {
-    "version": "2.12.2",
-    "updated": "2025-12-16",
+    "version": "2.13.0",
+    "updated": "2025-12-22",
     "files": [
         "install.sh",
         "server/core.sh",
@@ -15,6 +15,7 @@
         "b-ui-client.sh"
     ],
     "changelog": {
+        "2.13.0": "v2rayN/v2rayNG 订阅链接格式修复、节点别名优化（高速版/稳定版）、移除 Clash 订阅",
         "2.12.2": "客户端支持端口跳跃 (mport) 参数解析",
         "2.12.1": "修复 Logo 加载失败问题，网页端口跳跃设置 UI",
         "2.12.0": "新Logo设计、协议隔离、systemd资源隔离、npm依赖自动安装",
