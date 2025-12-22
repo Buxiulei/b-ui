@@ -984,7 +984,7 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                     }
 
                     // 节点别名
-                    const nodeName = encodeURIComponent(user.username);
+                    const nodeName = encodeURIComponent(`${user.username}-高速版`);
 
                     // 生成 v2rayN 兼容的 Hysteria2 URI
                     const hy2Link = `hysteria2://${auth}@${host}:${cfg.port}?${queryParams}#${nodeName}`;
@@ -1006,7 +1006,7 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                         `sni=${userSni}`,
                         `sid=${cfg.shortId}`
                     ].join('&');
-                    const vlessName = encodeURIComponent(`${user.username}-VLESS`);
+                    const vlessName = encodeURIComponent(`${user.username}-稳定版`);
                     const vlessLink = `vless://${user.uuid}@${host}:${cfg.xrayPort || 10001}?${vlessParams}#${vlessName}`;
                     links.push(vlessLink);
                 }
