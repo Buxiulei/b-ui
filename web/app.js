@@ -128,7 +128,8 @@ function load() {
             td = Math.round(tu * (statsRx / totalStats));
             tu = Math.round(tu * (statsTx / totalStats));
         } else {
-            td = 0;
+            // 没有实时数据时，假设下载流量 = 上传流量（对称估算）
+            td = tu;
         }
         $("#st-up").innerText = sz(tu);
         $("#st-dl").innerText = sz(td);
