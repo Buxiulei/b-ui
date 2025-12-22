@@ -1086,28 +1086,25 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                 // 生成协议链接列表 - 混合方案
                 const links = [];
 
-                // Hysteria2 链接 - 使用 hysteria2:// 标准格式
-                // 参考: https://hysteria.network/docs/developers/URI-Scheme/
+                // Hysteria2 链接 - v2rayN 兼容格式
+                // 根据 v2rayN 导出格式反向工程
                 if (user.password) {
-                    // 用户名和密码需要 URL 编码（处理特殊字符）
-                    const encodedUser = encodeURIComponent(user.username);
-                    const encodedPass = encodeURIComponent(user.password);
-                    const auth = `${encodedUser}:${encodedPass}`;
+                    // v2rayN 格式：整个 username:password 一起编码（冒号也编码为 %3A）
+                    const auth = encodeURIComponent(`${user.username}:${user.password}`);
 
-                    // 端口处理：支持端口跳跃（使用逗号格式 port,start-end）
-                    let portPart = `${cfg.port}`;
+                    // 查询参数构建
+                    let queryParams = `sni=${host}&insecure=0&allowInsecure=0`;
+
+                    // 端口跳跃使用 mport 参数（v2rayN 格式）
                     if (cfg.portHopping && cfg.portHopping.enabled) {
-                        portPart = `${cfg.port},${cfg.portHopping.start}-${cfg.portHopping.end}`;
+                        queryParams += `&mport=${cfg.portHopping.start}-${cfg.portHopping.end}`;
                     }
 
-                    // 查询参数：使用标准 insecure 参数名（不是 allowInsecure）
-                    const queryParams = `sni=${host}&insecure=0`;
-
                     // 节点别名
-                    const nodeName = encodeURIComponent(`${user.username}-Hy2`);
+                    const nodeName = encodeURIComponent(user.username);
 
-                    // 生成标准 Hysteria2 URI
-                    const hy2Link = `hysteria2://${auth}@${host}:${portPart}?${queryParams}#${nodeName}`;
+                    // 生成 v2rayN 兼容的 Hysteria2 URI
+                    const hy2Link = `hysteria2://${auth}@${host}:${cfg.port}?${queryParams}#${nodeName}`;
                     links.push(hy2Link);
                 }
 
