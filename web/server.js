@@ -1086,17 +1086,28 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                 // 生成协议链接列表 - 混合方案
                 const links = [];
 
-                // Hysteria2 链接 - 使用 hysteria2:// 协议
-                // 保持手动生成以支持端口跳跃等自定义参数
+                // Hysteria2 链接 - 使用 hysteria2:// 标准格式
+                // 参考: https://hysteria.network/docs/developers/URI-Scheme/
                 if (user.password) {
-                    const auth = `${user.username}:${user.password}`;
-                    let portParams = `sni=${host}&allowInsecure=0`;
-                    // v2rayN 使用 mport 参数设置端口跳跃
+                    // 用户名和密码需要 URL 编码（处理特殊字符）
+                    const encodedUser = encodeURIComponent(user.username);
+                    const encodedPass = encodeURIComponent(user.password);
+                    const auth = `${encodedUser}:${encodedPass}`;
+
+                    // 端口处理：支持端口跳跃（使用逗号格式 port,start-end）
+                    let portPart = `${cfg.port}`;
                     if (cfg.portHopping && cfg.portHopping.enabled) {
-                        portParams += `&mport=${cfg.portHopping.start}-${cfg.portHopping.end}`;
+                        portPart = `${cfg.port},${cfg.portHopping.start}-${cfg.portHopping.end}`;
                     }
-                    // 使用 hysteria2:// 协议（v2rayN 标准格式）
-                    const hy2Link = `hysteria2://${auth}@${host}:${cfg.port}?${portParams}#${encodeURIComponent(user.username + '-低空飞行')}`;
+
+                    // 查询参数：使用标准 insecure 参数名（不是 allowInsecure）
+                    const queryParams = `sni=${host}&insecure=0`;
+
+                    // 节点别名
+                    const nodeName = encodeURIComponent(`${user.username}-Hy2`);
+
+                    // 生成标准 Hysteria2 URI
+                    const hy2Link = `hysteria2://${auth}@${host}:${portPart}?${queryParams}#${nodeName}`;
                     links.push(hy2Link);
                 }
 
@@ -1105,7 +1116,7 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                     const userSni = user.sni || cfg.sni || "www.bing.com";
                     const vlessOutbound = {
                         type: "vless",
-                        tag: `${user.username}-带壳奔跑`,
+                        tag: `${user.username}-VLESS`,
                         server: host,
                         server_port: cfg.xrayPort || 10001,
                         uuid: user.uuid,

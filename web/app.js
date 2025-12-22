@@ -305,13 +305,22 @@ function genUri(x) {
             "&type=ws&host=" + hostSni + "&path=%2Fws#" +
             encodeURIComponent(x.username);
     }
-    // Hysteria2: v2rayN 使用 mport 参数设置端口跳跃范围
-    let portParams = "sni=" + cfg.domain + "&insecure=0";
+    // Hysteria2: 使用标准 hysteria2:// URI 格式
+    // 参考: https://hysteria.network/docs/developers/URI-Scheme/
+    const encodedUser = encodeURIComponent(x.username);
+    const encodedPass = encodeURIComponent(x.password);
+
+    // 端口处理：支持端口跳跃（使用逗号格式 port,start-end）
+    let portPart = cfg.port;
     if (cfg.portHopping && cfg.portHopping.enabled) {
-        portParams += "&mport=" + cfg.portHopping.start + "-" + cfg.portHopping.end;
+        portPart = cfg.port + "," + cfg.portHopping.start + "-" + cfg.portHopping.end;
     }
-    return "hysteria2://" + encodeURIComponent(x.username) + ":" + encodeURIComponent(x.password) +
-        "@" + cfg.domain + ":" + cfg.port + "?" + portParams + "#" + encodeURIComponent(x.username);
+
+    // 查询参数：使用标准 insecure 参数名
+    const queryParams = "sni=" + cfg.domain + "&insecure=0";
+
+    return "hysteria2://" + encodedUser + ":" + encodedPass +
+        "@" + cfg.domain + ":" + portPart + "?" + queryParams + "#" + encodeURIComponent(x.username + "-Hy2");
 }
 
 // 当前显示的用户名 (用于下载订阅)
