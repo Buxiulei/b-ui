@@ -455,6 +455,11 @@ select:focus {
     color: #007AFF;
 }
 
+.proto-sub {
+    background: rgba(175, 82, 222, 0.12);
+    color: #AF52DE;
+}
+
 /* Modals */
 .modal {
     position: fixed;

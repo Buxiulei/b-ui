@@ -151,8 +151,10 @@ function load() {
             const over = tlim && total >= tlim;
             const badge = exp ? ' <span class="tag" style="color:var(--danger)">已过期</span>' : (over ? ' <span class="tag" style="color:var(--danger)">流量耗尽</span>' : "");
             const proto = x.protocol || "hysteria2";
-            const ptag = proto === "vless-reality" ? '<span class="proto-tag proto-vless">VLESS</span>' :
-                (proto === "vless-ws-tls" ? '<span class="proto-tag proto-ws">WS</span>' : '<span class="proto-tag proto-hy2">HY2</span>');
+            const ptag = proto === "fusion" ? '<span class="proto-tag proto-sub">订阅</span>' :
+                proto === "vless-reality" ? '<span class="proto-tag proto-vless">VLESS</span>' :
+                    proto === "vless-ws-tls" ? '<span class="proto-tag proto-ws">WS</span>' :
+                        '<span class="proto-tag proto-hy2">HY2</span>';
 
             return '<tr>' +
                 '<td><div style="display:flex;align-items:center;gap:8px"><span style="font-weight:600">' + esc(x.username) + '</span>' + ptag + badge + '</div></td>' +
