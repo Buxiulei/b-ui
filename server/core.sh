@@ -3,7 +3,7 @@
 #===============================================================================
 # B-UI 核心安装模块
 # 包含所有核心安装函数
-# 版本: 2.4.0
+# 版本: 动态读取自 version.json
 #===============================================================================
 
 # 颜色定义
@@ -849,9 +849,13 @@ deploy_admin_panel() {
         return 1
     fi
     
-    # 创建 package.json
-    cat > "$ADMIN_DIR/package.json" << 'EOF'
-{"name":"b-ui-admin","version":"2.4.0","main":"server.js","scripts":{"start":"node server.js"}}
+    # 创建 package.json (版本号从 version.json 读取)
+    local pkg_version="unknown"
+    if [[ -f "${BASE_DIR}/version.json" ]]; then
+        pkg_version=$(jq -r '.version' "${BASE_DIR}/version.json" 2>/dev/null || echo "unknown")
+    fi
+    cat > "$ADMIN_DIR/package.json" << EOF
+{"name":"b-ui-admin","version":"${pkg_version}","type":"module","main":"server.js","scripts":{"start":"node server.js"},"dependencies":{"singbox-converter":"^0.0.4"}}
 EOF
     
     print_success "Web 面板部署完成"

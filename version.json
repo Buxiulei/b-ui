@@ -1,6 +1,6 @@
 {
-    "version": "2.13.0",
-    "updated": "2025-12-22",
+    "version": "2.14.0",
+    "updated": "2025-12-24",
     "files": [
         "install.sh",
         "server/core.sh",
@@ -15,6 +15,7 @@
         "b-ui-client.sh"
     ],
     "changelog": {
+        "2.14.0": "版本号全局动态化：所有脚本现从 version.json 动态读取，彻底消除硬编码版本号",
         "2.13.0": "v2rayN/v2rayNG 订阅链接格式修复、节点别名优化（高速版/稳定版）、移除 Clash 订阅",
         "2.12.2": "客户端支持端口跳跃 (mport) 参数解析",
         "2.12.1": "修复 Logo 加载失败问题，网页端口跳跃设置 UI",

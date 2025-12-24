@@ -18,10 +18,10 @@ function getVersion() {
     try {
         const versionFile = path.join(BASE_DIR, "version.json");
         if (fs.existsSync(versionFile)) {
-            return JSON.parse(fs.readFileSync(versionFile, "utf8")).version || "2.4.0";
+            return JSON.parse(fs.readFileSync(versionFile, "utf8")).version || "unknown";
         }
     } catch { }
-    return "2.4.0";
+    return "unknown";
 }
 const VERSION = getVersion();
 

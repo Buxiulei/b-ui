@@ -3,7 +3,7 @@
 #===============================================================================
 # B-UI 安装脚本 (模块化版本)
 # 功能：下载并安装 B-UI 所有组件
-# 版本: 2.4.0
+# 版本: 动态读取自 version.json
 #===============================================================================
 
 set -e
@@ -25,10 +25,10 @@ ADMIN_DIR="${BASE_DIR}/admin"
 # 动态获取版本号
 get_version() {
     if [[ -f "${BASE_DIR}/version.json" ]]; then
-        jq -r '.version' "${BASE_DIR}/version.json" 2>/dev/null || echo "2.4.0"
+        jq -r '.version' "${BASE_DIR}/version.json" 2>/dev/null || echo "unknown"
     else
         # 尝试从远程获取
-        curl -fsSL "${GITHUB_RAW}/version.json" 2>/dev/null | jq -r '.version' 2>/dev/null || echo "2.4.0"
+        curl -fsSL "${GITHUB_RAW}/version.json" 2>/dev/null | jq -r '.version' 2>/dev/null || echo "unknown"
     fi
 }
 SCRIPT_VERSION=$(get_version)

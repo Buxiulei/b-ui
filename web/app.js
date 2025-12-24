@@ -1,6 +1,6 @@
 /**
  * B-UI Admin Panel - Frontend JavaScript
- * Version: 2.4.0
+ * Version: 动态读取自 server.js
  */
 
 const $ = s => document.querySelector(s);

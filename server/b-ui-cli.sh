@@ -3,7 +3,7 @@
 #===============================================================================
 # B-UI CLI 终端管理工具
 # 功能：服务管理、状态查看、更新检查
-# 版本: 2.4.0
+# 版本: 动态读取自 version.json
 #===============================================================================
 
 # 颜色定义
@@ -25,9 +25,9 @@ ADMIN_SERVICE="b-ui-admin.service"
 # 动态获取版本号
 get_version() {
     if [[ -f "${BASE_DIR}/version.json" ]]; then
-        jq -r '.version' "${BASE_DIR}/version.json" 2>/dev/null || echo "2.4.0"
+        jq -r '.version' "${BASE_DIR}/version.json" 2>/dev/null || echo "unknown"
     else
-        echo "2.4.0"
+        echo "unknown"
     fi
 }
 SCRIPT_VERSION=$(get_version)
