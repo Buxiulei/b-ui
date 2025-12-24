@@ -70,6 +70,7 @@ bash <(curl -fsSL "https://raw.githubusercontent.com/Buxiulei/b-ui/main/b-ui-cli
 | 10000 | UDP | Hysteria2 |
 | 10001 | TCP | VLESS-Reality |
 | 10002 | TCP | VLESS-WS-TLS |
+| 20000-30000* | UDP | 端口跳跃（可选，范围可自定义） |
 
 ### URL 管理 API
 可通过 GET 请求直接管理用户：
