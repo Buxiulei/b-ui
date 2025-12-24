@@ -987,12 +987,13 @@ generate_singbox_tun_config() {
     local safe_shortid=$(json_escape "${SHORT_ID}")
     
     if [[ "$protocol" == "hysteria2" ]]; then
-        # 端口跳跃配置 (sing-box 1.11+ 使用 server_ports 格式)
+        # 端口跳跃配置 (sing-box 1.11+ 使用 server_ports 格式，范围用冒号分隔)
         local hop_config=""
         if [[ -n "$MPORT" ]]; then
-            # server_ports 格式: "20000-30000" 或 "20000,20001,20002"
+            # 将连字符转换为冒号 (例如: 20000-30000 → 20000:30000)
+            local singbox_ports="${MPORT//-/:}"
             hop_config=",
-      \"server_ports\": \"${MPORT}\",
+      \"server_ports\": \"${singbox_ports}\",
       \"hop_interval\": \"30s\""
         fi
         
