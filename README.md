@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="web/logo.jpg" alt="B-UI Logo" width="200">
+  <img src="web/logo.jpg" alt="B-UI Logo" width="280">
 </p>
 
 # B-UI
