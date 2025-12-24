@@ -855,7 +855,7 @@ deploy_admin_panel() {
         pkg_version=$(jq -r '.version' "${BASE_DIR}/version.json" 2>/dev/null || echo "unknown")
     fi
     cat > "$ADMIN_DIR/package.json" << EOF
-{"name":"b-ui-admin","version":"${pkg_version}","type":"module","main":"server.js","scripts":{"start":"node server.js"},"dependencies":{"singbox-converter":"^0.0.4"}}
+{"name":"b-ui-admin","version":"${pkg_version}","type":"module","main":"server.js","scripts":{"start":"node server.js"},"dependencies":{"singbox-converter":"^1.0.8"}}
 EOF
     
     # 安装 npm 依赖 (多种方式尝试，确保成功)
