@@ -858,6 +858,16 @@ deploy_admin_panel() {
 {"name":"b-ui-admin","version":"${pkg_version}","type":"module","main":"server.js","scripts":{"start":"node server.js"},"dependencies":{"singbox-converter":"^0.0.4"}}
 EOF
     
+    # 安装 npm 依赖
+    print_info "安装 Web 面板依赖..."
+    if cd "$ADMIN_DIR" && npm install --silent 2>/dev/null; then
+        print_success "依赖安装完成"
+    else
+        print_warning "npm 依赖安装失败，尝试使用 --legacy-peer-deps"
+        cd "$ADMIN_DIR" && npm install --legacy-peer-deps 2>/dev/null || true
+    fi
+    cd - > /dev/null 2>&1 || true
+    
     print_success "Web 面板部署完成"
 }
 
