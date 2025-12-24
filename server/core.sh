@@ -858,15 +858,39 @@ deploy_admin_panel() {
 {"name":"b-ui-admin","version":"${pkg_version}","type":"module","main":"server.js","scripts":{"start":"node server.js"},"dependencies":{"singbox-converter":"^0.0.4"}}
 EOF
     
-    # 安装 npm 依赖
+    # 安装 npm 依赖 (多种方式尝试，确保成功)
     print_info "安装 Web 面板依赖..."
-    if cd "$ADMIN_DIR" && npm install --silent 2>/dev/null; then
+    cd "$ADMIN_DIR"
+    
+    local npm_success=false
+    
+    # 方法1: 标准安装
+    if npm install 2>&1 | tail -5; then
+        npm_success=true
+    fi
+    
+    # 方法2: 使用 --legacy-peer-deps
+    if [[ "$npm_success" == "false" ]]; then
+        print_warning "尝试 --legacy-peer-deps..."
+        if npm install --legacy-peer-deps 2>&1 | tail -5; then
+            npm_success=true
+        fi
+    fi
+    
+    # 方法3: 单独安装核心依赖
+    if [[ "$npm_success" == "false" ]] || [[ ! -d "$ADMIN_DIR/node_modules/singbox-converter" ]]; then
+        print_warning "单独安装 singbox-converter..."
+        npm install singbox-converter js-yaml 2>&1 | tail -3 || true
+    fi
+    
+    cd - > /dev/null 2>&1 || true
+    
+    # 验证安装
+    if [[ -d "$ADMIN_DIR/node_modules/singbox-converter" ]]; then
         print_success "依赖安装完成"
     else
-        print_warning "npm 依赖安装失败，尝试使用 --legacy-peer-deps"
-        cd "$ADMIN_DIR" && npm install --legacy-peer-deps 2>/dev/null || true
+        print_error "依赖安装失败，请手动运行: cd $ADMIN_DIR && npm install"
     fi
-    cd - > /dev/null 2>&1 || true
     
     print_success "Web 面板部署完成"
 }
