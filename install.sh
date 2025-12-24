@@ -130,17 +130,32 @@ check_dependencies() {
         print_success "依赖安装完成"
     fi
     
-    # 安装中文语言包（消除 setlocale 警告）
-    if ! locale -a 2>/dev/null | grep -qi "zh_CN"; then
-        print_info "安装中文语言包..."
-        if command -v apt-get &> /dev/null; then
-            apt-get install -y -qq locales > /dev/null 2>&1
-            sed -i '/zh_CN.UTF-8/s/^# //g' /etc/locale.gen 2>/dev/null || true
-            locale-gen zh_CN.UTF-8 > /dev/null 2>&1 || true
-        elif command -v yum &> /dev/null || command -v dnf &> /dev/null; then
-            yum install -y -q glibc-langpack-zh > /dev/null 2>&1 || \
-            dnf install -y -q glibc-langpack-zh > /dev/null 2>&1 || true
-        fi
+    # 安装中文语言包并配置（消除 setlocale 警告）
+    print_info "配置系统语言环境..."
+    if command -v apt-get &> /dev/null; then
+        # Debian/Ubuntu
+        apt-get install -y -qq locales > /dev/null 2>&1 || true
+        # 取消注释 zh_CN.UTF-8 和 en_US.UTF-8
+        sed -i '/^#.*zh_CN.UTF-8/s/^#//' /etc/locale.gen 2>/dev/null || true
+        sed -i '/^#.*en_US.UTF-8/s/^#//' /etc/locale.gen 2>/dev/null || true
+        # 生成 locale
+        locale-gen > /dev/null 2>&1 || true
+        # 设置默认 locale
+        update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 2>/dev/null || true
+    elif command -v yum &> /dev/null || command -v dnf &> /dev/null; then
+        # CentOS/RHEL
+        yum install -y -q glibc-langpack-en glibc-langpack-zh > /dev/null 2>&1 || \
+        dnf install -y -q glibc-langpack-en glibc-langpack-zh > /dev/null 2>&1 || true
+    fi
+    
+    # 设置当前 session 的环境变量（立即生效）
+    export LANG=en_US.UTF-8
+    export LC_ALL=en_US.UTF-8
+    
+    # 写入 /etc/environment 永久生效
+    if ! grep -q "LC_ALL" /etc/environment 2>/dev/null; then
+        echo 'LANG=en_US.UTF-8' >> /etc/environment
+        echo 'LC_ALL=en_US.UTF-8' >> /etc/environment
     fi
 }
 
