@@ -47,15 +47,10 @@ bash <(curl -fsSL "https://raw.githubusercontent.com/Buxiulei/b-ui/main/install.
 
 ## 客户端部署
 
-### 一键安装
-```bash
-sudo -i
-bash <(curl -fsSL "https://raw.githubusercontent.com/Buxiulei/b-ui/main/b-ui-client.sh?$(date +%s)")
-```
-*国内镜像*: `bash <(curl -fsSL "https://cdn.jsdelivr.net/gh/Buxiulei/b-ui@main/b-ui-client.sh?$(date +%s)")`
+> **提示**: 客户端一键安装命令需要从服务端 Web 面板获取，包含服务端地址和自动配置信息。请先完成服务端部署，然后登录 Web 管理面板查看专属安装命令。
 
 ### 使用说明
-- **启动菜单**: 输入 `b-ui-client`
+- **启动菜单**: 输入 `bui-c`
 - **代理端口**: SOCKS5 (1080) / HTTP (8080)
 - **测试连接**: `curl --socks5 127.0.0.1:1080 https://www.google.com`
 
