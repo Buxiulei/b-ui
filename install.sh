@@ -22,14 +22,23 @@ GITHUB_CDN="https://cdn.jsdelivr.net/gh/Buxiulei/b-ui@main"
 BASE_DIR="/opt/b-ui"
 ADMIN_DIR="${BASE_DIR}/admin"
 
-# 动态获取版本号
+# 动态获取版本号 (不依赖 jq，在依赖安装前也能工作)
 get_version() {
-    if [[ -f "${BASE_DIR}/version.json" ]]; then
-        jq -r '.version' "${BASE_DIR}/version.json" 2>/dev/null || echo "unknown"
-    else
-        # 尝试从远程获取
-        curl -fsSL "${GITHUB_RAW}/version.json" 2>/dev/null | jq -r '.version' 2>/dev/null || echo "unknown"
+    local ver=""
+    # 方法1: 使用 jq (如果可用)
+    if command -v jq &> /dev/null; then
+        if [[ -f "${BASE_DIR}/version.json" ]]; then
+            ver=$(jq -r '.version' "${BASE_DIR}/version.json" 2>/dev/null)
+        fi
+        if [[ -z "$ver" || "$ver" == "null" ]]; then
+            ver=$(curl -fsSL "${GITHUB_RAW}/version.json" 2>/dev/null | jq -r '.version' 2>/dev/null)
+        fi
     fi
+    # 方法2: 使用 grep (fallback，不依赖 jq)
+    if [[ -z "$ver" || "$ver" == "null" ]]; then
+        ver=$(curl -fsSL "${GITHUB_RAW}/version.json" 2>/dev/null | grep -oP '"version":\s*"\K[^"]+' | head -1)
+    fi
+    echo "${ver:-2.15.0}"
 }
 SCRIPT_VERSION=$(get_version)
 
