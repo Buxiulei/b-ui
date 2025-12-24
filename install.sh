@@ -34,9 +34,9 @@ get_version() {
             ver=$(curl -fsSL "${GITHUB_RAW}/version.json" 2>/dev/null | jq -r '.version' 2>/dev/null)
         fi
     fi
-    # 方法2: 使用 grep (fallback，不依赖 jq)
+    # 方法2: 使用 sed (fallback，不依赖 jq，兼容 macOS 和 Linux)
     if [[ -z "$ver" || "$ver" == "null" ]]; then
-        ver=$(curl -fsSL "${GITHUB_RAW}/version.json" 2>/dev/null | grep -oP '"version":\s*"\K[^"]+' | head -1)
+        ver=$(curl -fsSL "${GITHUB_RAW}/version.json" 2>/dev/null | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
     fi
     echo "${ver:-2.15.0}"
 }
