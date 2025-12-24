@@ -166,6 +166,7 @@ show_menu() {
     echo -e "${CYAN}║${NC}  ${YELLOW}7.${NC} ${GREEN}检查 B-UI 更新${NC}                                          ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}8.${NC} ${GREEN}更新内核/客户端 (Hysteria2 + Xray + Client)${NC}               ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}10.${NC} ${YELLOW}端口跳跃设置${NC}                                            ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}11.${NC} ${BLUE}VPS 质量测试${NC}                                            ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}9.${NC} ${RED}完全卸载${NC}                                                 ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}0.${NC} 退出                                                     ${CYAN}║${NC}"
@@ -485,6 +486,24 @@ uninstall_all() {
     exit 0
 }
 
+run_vps_benchmark() {
+    echo ""
+    echo -e "${CYAN}════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${CYAN}  VPS 质量测试 (goecs)${NC}"
+    echo -e "${CYAN}════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    print_info "正在下载并运行 VPS 测试脚本..."
+    echo ""
+    
+    export noninteractive=true
+    curl -L https://raw.githubusercontent.com/oneclickvirt/ecs/master/goecs.sh -o /tmp/goecs.sh && \
+    chmod +x /tmp/goecs.sh && \
+    /tmp/goecs.sh install && \
+    goecs
+    
+    rm -f /tmp/goecs.sh 2>/dev/null
+}
+
 #===============================================================================
 # 主函数
 #===============================================================================
@@ -500,7 +519,7 @@ main() {
         show_status
         show_menu
         
-        read -p "请选择 [0-10]: " choice
+        read -p "请选择 [0-11]: " choice
         
         case $choice in
             1) show_client_config ;;
@@ -513,6 +532,7 @@ main() {
             8) update_kernel ;;
             9) uninstall_all ;;
             10) configure_port_hopping_menu ;;
+            11) run_vps_benchmark ;;
             0) print_info "再见！"; exit 0 ;;
             *) print_error "无效选项" ;;
         esac
