@@ -1,5 +1,5 @@
 {
-    "version": "2.15.0",
+    "version": "2.15.1",
     "updated": "2025-12-24",
     "files": [
         "install.sh",
@@ -15,6 +15,7 @@
         "b-ui-client.sh"
     ],
     "changelog": {
+        "2.15.1": "修复 npm 依赖安装、locale 警告、版本号显示 (jq 依赖) 等问题",
         "2.15.0": "服务端添加 VPS 质量测试功能 (goecs)，README 端口列表添加端口跳跃说明",
         "2.14.0": "版本号全局动态化：所有脚本现从 version.json 动态读取，彻底消除硬编码版本号",
         "2.13.0": "v2rayN/v2rayNG 订阅链接格式修复、节点别名优化（高速版/稳定版）、移除 Clash 订阅",
