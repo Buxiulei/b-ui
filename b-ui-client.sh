@@ -1217,8 +1217,17 @@ start_tun_mode() {
 
 stop_tun_mode() {
     print_info "停止 TUN 模式..."
+    
+    # 先尝试优雅停止
     systemctl stop bui-tun 2>/dev/null || true
+    sleep 1
+    
+    # 确保 sing-box 进程完全退出
+    pkill -9 -f "sing-box.*singbox-tun" 2>/dev/null || true
+    
+    # 删除 TUN 接口
     ip link delete bui-tun 2>/dev/null || true
+    
     print_success "TUN 模式已停止"
 }
 
@@ -1455,7 +1464,16 @@ switch_config() {
     local meta_file="${config_dir}/meta.json"
     local protocol=$(grep '"protocol"' "$meta_file" 2>/dev/null | cut -d'"' -f4)
     
-    # 停止所有服务
+    # 记录 TUN 模式状态
+    local tun_was_active=false
+    if systemctl is-active --quiet bui-tun 2>/dev/null; then
+        tun_was_active=true
+        print_info "检测到 TUN 模式运行中，将在切换后自动重启..."
+    fi
+    
+    # 停止所有服务（包括 TUN）
+    systemctl stop bui-tun 2>/dev/null || true
+    pkill -9 -f "sing-box.*singbox-tun" 2>/dev/null || true
     systemctl stop "$CLIENT_SERVICE" 2>/dev/null || true
     systemctl stop xray-client 2>/dev/null || true
     
@@ -1482,6 +1500,40 @@ switch_config() {
     
     # 更新激活配置
     echo "$selected" > "$ACTIVE_CONFIG"
+    
+    # 如果之前 TUN 模式是激活的，重新生成配置并启动
+    if [[ "$tun_was_active" == "true" ]]; then
+        print_info "重新生成 TUN 配置..."
+        # 重新读取新配置参数
+        if [[ "$protocol" == "hysteria2" ]]; then
+            SERVER_ADDR=$(grep "^server:" "$CONFIG_FILE" | awk '{print $2}')
+            AUTH_PASSWORD=$(grep "^auth:" "$CONFIG_FILE" | awk '{print $2}')
+            local sni=$(grep -A2 "^tls:" "$CONFIG_FILE" | grep "sni:" | awk '{print $2}')
+            SNI="${sni:-$(echo $SERVER_ADDR | cut -d':' -f1)}"
+            INSECURE=$(grep -A2 "^tls:" "$CONFIG_FILE" | grep "insecure:" | awk '{print $2}')
+            INSECURE=${INSECURE:-false}
+            SOCKS_PORT=$(grep -A1 "^socks5:" "$CONFIG_FILE" | grep "listen:" | sed 's/.*://')
+            HTTP_PORT=$(grep -A1 "^http:" "$CONFIG_FILE" | grep "listen:" | sed 's/.*://')
+            SOCKS_PORT=${SOCKS_PORT:-1080}
+            HTTP_PORT=${HTTP_PORT:-8080}
+            generate_singbox_tun_config "hysteria2"
+        else
+            local xray_config="${BASE_DIR}/xray-config.json"
+            SERVER_ADDR=$(grep -o '"address": "[^"]*"' "$xray_config" | head -1 | cut -d'"' -f4)
+            local port=$(grep -o '"port": [0-9]*' "$xray_config" | grep -v 'listen' | head -1 | grep -o '[0-9]*')
+            SERVER_ADDR="${SERVER_ADDR}:${port}"
+            UUID=$(grep -o '"id": "[^"]*"' "$xray_config" | head -1 | cut -d'"' -f4)
+            FLOW=$(grep -o '"flow": "[^"]*"' "$xray_config" | head -1 | cut -d'"' -f4)
+            SNI=$(grep -o '"serverName": "[^"]*"' "$xray_config" | head -1 | cut -d'"' -f4)
+            FINGERPRINT=$(grep -o '"fingerprint": "[^"]*"' "$xray_config" | head -1 | cut -d'"' -f4)
+            PUBLIC_KEY=$(grep -o '"publicKey": "[^"]*"' "$xray_config" | head -1 | cut -d'"' -f4)
+            SHORT_ID=$(grep -o '"shortId": "[^"]*"' "$xray_config" | head -1 | cut -d'"' -f4)
+            SOCKS_PORT=${SOCKS_PORT:-1080}
+            HTTP_PORT=${HTTP_PORT:-8080}
+            generate_singbox_tun_config "vless-reality"
+        fi
+        start_tun_mode
+    fi
     
     print_success "已切换到: $selected"
 }

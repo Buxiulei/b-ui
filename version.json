@@ -1,6 +1,6 @@
 {
-    "version": "2.15.2",
-    "updated": "2025-12-24",
+    "version": "2.15.3",
+    "updated": "2026-01-23",
     "files": [
         "install.sh",
         "server/core.sh",
@@ -15,6 +15,7 @@
         "b-ui-client.sh"
     ],
     "changelog": {
+        "2.15.3": "修复 TUN 模式控制问题：停止更彻底 (pkill 清理残留)，切换节点时自动重新生成 TUN 配置",
         "2.15.2": "修复 sing-box TUN 端口跳跃配置格式 (server_ports + 冒号分隔符)",
         "2.15.1": "修复 npm 依赖安装、locale 警告、版本号显示 (jq 依赖) 等问题",
         "2.15.0": "服务端添加 VPS 质量测试功能 (goecs)，README 端口列表添加端口跳跃说明",
