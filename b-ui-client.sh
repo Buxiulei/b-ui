@@ -7,7 +7,7 @@
 #===============================================================================
 
 # 版本号会在安装时从 GitHub 同步更新
-SCRIPT_VERSION="2.15.3"
+SCRIPT_VERSION="2.15.4"
 
 # 注意: 不使用 set -e，因为它会导致 ((count++)) 等算术运算在变量为0时退出脚本
 
@@ -1237,15 +1237,44 @@ start_tun_mode() {
 stop_tun_mode() {
     print_info "停止 TUN 模式..."
     
-    # 先尝试优雅停止
+    # 1. 先禁用服务 (防止自动重启)
+    systemctl disable bui-tun 2>/dev/null || true
+    
+    # 2. 停止服务
     systemctl stop bui-tun 2>/dev/null || true
-    sleep 1
     
-    # 确保 sing-box 进程完全退出
+    # 3. 等待服务完全停止
+    local wait_count=0
+    while systemctl is-active --quiet bui-tun 2>/dev/null && [[ $wait_count -lt 10 ]]; do
+        sleep 0.5
+        ((wait_count++))
+    done
+    
+    # 4. 如果服务还在运行,强制停止
+    if systemctl is-active --quiet bui-tun 2>/dev/null; then
+        print_warning "服务未能正常停止,强制终止..."
+        systemctl kill -s SIGKILL bui-tun 2>/dev/null || true
+        sleep 1
+    fi
+    
+    # 5. 清理所有可能的 sing-box TUN 相关进程
     pkill -9 -f "sing-box.*singbox-tun" 2>/dev/null || true
+    pkill -9 -f "sing-box run -c /opt/hysteria-client/singbox-tun" 2>/dev/null || true
     
-    # 删除 TUN 接口
+    # 6. 删除 TUN 接口
     ip link delete bui-tun 2>/dev/null || true
+    
+    # 7. 验证停止成功
+    if systemctl is-active --quiet bui-tun 2>/dev/null; then
+        print_error "TUN 模式停止失败!"
+        return 1
+    fi
+    
+    if ip link show bui-tun 2>/dev/null; then
+        print_warning "TUN 接口残留,尝试删除..."
+        ip link set bui-tun down 2>/dev/null || true
+        ip link delete bui-tun 2>/dev/null || true
+    fi
     
     print_success "TUN 模式已停止"
 }
