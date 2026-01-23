@@ -31,16 +31,16 @@ print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 #===============================================================================
 
 select_download_source() {
+    # 优先使用 GitHub 直连，只有当 GitHub 无法访问时才回退到 CDN
     # 测试 GitHub 直连
     local github_time=$(curl -o /dev/null -s -w '%{time_total}' --max-time 5 "${GITHUB_RAW}/version.json" 2>/dev/null || echo "999")
     
-    # 测试 CDN
-    local cdn_time=$(curl -o /dev/null -s -w '%{time_total}' --max-time 5 "${GITHUB_CDN}/version.json" 2>/dev/null || echo "999")
-    
-    if (( $(echo "$cdn_time < $github_time" | bc -l 2>/dev/null || echo "0") )); then
-        DOWNLOAD_URL="$GITHUB_CDN"
-    else
+    if (( $(echo "$github_time < 5" | bc -l 2>/dev/null || echo "0") )); then
+        # GitHub 可访问，优先使用
         DOWNLOAD_URL="$GITHUB_RAW"
+    else
+        # GitHub 不可访问，回退到 CDN
+        DOWNLOAD_URL="$GITHUB_CDN"
     fi
 }
 
