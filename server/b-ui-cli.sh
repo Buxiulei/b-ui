@@ -328,10 +328,19 @@ update_kernel() {
     # 更新客户端安装包
     echo ""
     print_info "更新客户端安装包..."
-    local GITHUB_RAW="https://raw.githubusercontent.com/Buxiulei/b-ui/main"
+    
+    # 尝试智能选择下载源 (优先使用 update.sh 的智能选择结果)
+    local download_src="https://raw.githubusercontent.com/Buxiulei/b-ui/main"
+    if type select_download_source &>/dev/null; then
+        select_download_source
+        if [[ -n "$DOWNLOAD_URL" ]]; then
+            download_src="$DOWNLOAD_URL"
+        fi
+    fi
+    
     local client_script="${BASE_DIR}/b-ui-client.sh"
     
-    if curl -fsSL "${GITHUB_RAW}/b-ui-client.sh" -o "${client_script}.tmp" 2>/dev/null; then
+    if curl -fsSL "${download_src}/b-ui-client.sh" -o "${client_script}.tmp" 2>/dev/null; then
         local new_ver=$(grep "SCRIPT_VERSION=" "${client_script}.tmp" | head -1 | cut -d'"' -f2)
         local old_ver=$(grep "SCRIPT_VERSION=" "${client_script}" 2>/dev/null | head -1 | cut -d'"' -f2 || echo "未知")
         

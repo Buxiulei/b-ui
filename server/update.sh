@@ -104,6 +104,25 @@ check_update() {
     local local_ver=$(get_local_version)
     local remote_ver=$(get_remote_version)
     
+    # 智能回退：如果当前使用的是 CDN 且未发现新版本，尝试检查 GitHub 直连
+    if [[ "$DOWNLOAD_URL" == "$GITHUB_CDN" ]]; then
+        version_compare "$remote_ver" "$local_ver"
+        local result=$?
+        if [[ $result -ne 1 ]]; then
+             print_info "CDN 版本检测未发现更新，尝试检查 GitHub 源..."
+             local github_ver=$(curl -fsSL "${GITHUB_RAW}/version.json" 2>/dev/null | jq -r '.version' 2>/dev/null || echo "")
+             if [[ -n "$github_ver" ]]; then
+                 version_compare "$github_ver" "$remote_ver"
+                 if [[ $? -eq 1 ]]; then
+                     print_warning "检测到 CDN 缓存滞后 (CDN: v$remote_ver < GitHub: v$github_ver)"
+                     print_info "切换更新源为 GitHub 直连"
+                     DOWNLOAD_URL="$GITHUB_RAW"
+                     remote_ver="$github_ver"
+                 fi
+             fi
+        fi
+    fi
+    
     if [[ -z "$remote_ver" ]]; then
         print_error "无法获取远程版本信息"
         return 1
