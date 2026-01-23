@@ -7,7 +7,7 @@
 #===============================================================================
 
 # 版本号会在安装时从 GitHub 同步更新
-SCRIPT_VERSION="2.15.2"
+SCRIPT_VERSION="2.15.3"
 
 # 注意: 不使用 set -e，因为它会导致 ((count++)) 等算术运算在变量为0时退出脚本
 
@@ -108,32 +108,51 @@ run_with_spinner() {
 # 远程版本检查 URL (使用 jsDelivr CDN)
 REMOTE_VERSION_URL="https://cdn.jsdelivr.net/gh/Buxiulei/b-ui@main/b-ui-client.sh"
 GITHUB_RAW_URL="https://raw.githubusercontent.com/Buxiulei/b-ui/main/b-ui-client.sh"
+# 版本 JSON 文件 URL (推荐: 版本号统一管理)
+VERSION_JSON_URL="https://cdn.jsdelivr.net/gh/Buxiulei/b-ui@main/version.json"
+VERSION_JSON_RAW_URL="https://raw.githubusercontent.com/Buxiulei/b-ui/main/version.json"
 
 # 全局变量存储更新状态
 UPDATE_AVAILABLE=""
 REMOTE_VERSION=""
 
 # 检查客户端更新
+# 优先从 version.json 获取版本号 (统一版本管理)
 check_client_update() {
-    # 尝试获取远程脚本的版本号
-    local remote_script=""
+    local version_json=""
     
-    # 先尝试 jsDelivr CDN
-    remote_script=$(curl -fsSL --max-time 5 "$REMOTE_VERSION_URL" 2>/dev/null | head -20)
-    
-    # 如果失败，尝试 GitHub Raw
-    if [[ -z "$remote_script" ]]; then
-        remote_script=$(curl -fsSL --max-time 5 "$GITHUB_RAW_URL" 2>/dev/null | head -20)
+    # 方法1: 从 version.json 获取版本号 (推荐)
+    version_json=$(curl -fsSL --max-time 5 "$VERSION_JSON_URL" 2>/dev/null)
+    if [[ -z "$version_json" ]]; then
+        version_json=$(curl -fsSL --max-time 5 "$VERSION_JSON_RAW_URL" 2>/dev/null)
     fi
     
-    if [[ -n "$remote_script" ]]; then
-        REMOTE_VERSION=$(echo "$remote_script" | grep -oP 'SCRIPT_VERSION="\K[^"]+' | head -1)
-        if [[ -n "$REMOTE_VERSION" && "$REMOTE_VERSION" != "$SCRIPT_VERSION" ]]; then
-            # 版本比较
-            if [[ "$(printf '%s\n' "$REMOTE_VERSION" "$SCRIPT_VERSION" | sort -V | tail -n1)" == "$REMOTE_VERSION" ]]; then
-                UPDATE_AVAILABLE="true"
-                return 0
-            fi
+    if [[ -n "$version_json" ]]; then
+        # 从 JSON 提取版本号 (兼容无 jq 环境)
+        REMOTE_VERSION=$(echo "$version_json" | grep -oP '"version"\s*:\s*"\K[^"]+' | head -1)
+        if [[ -z "$REMOTE_VERSION" ]]; then
+            # 备用正则 (macOS 兼容)
+            REMOTE_VERSION=$(echo "$version_json" | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+        fi
+    fi
+    
+    # 方法2: 如果 version.json 失败，回退到从脚本文件获取
+    if [[ -z "$REMOTE_VERSION" ]]; then
+        local remote_script=""
+        remote_script=$(curl -fsSL --max-time 5 "$REMOTE_VERSION_URL" 2>/dev/null | head -20)
+        if [[ -z "$remote_script" ]]; then
+            remote_script=$(curl -fsSL --max-time 5 "$GITHUB_RAW_URL" 2>/dev/null | head -20)
+        fi
+        if [[ -n "$remote_script" ]]; then
+            REMOTE_VERSION=$(echo "$remote_script" | grep -oP 'SCRIPT_VERSION="\K[^"]+' | head -1)
+        fi
+    fi
+    
+    # 版本比较
+    if [[ -n "$REMOTE_VERSION" && "$REMOTE_VERSION" != "$SCRIPT_VERSION" ]]; then
+        if [[ "$(printf '%s\n' "$REMOTE_VERSION" "$SCRIPT_VERSION" | sort -V | tail -n1)" == "$REMOTE_VERSION" ]]; then
+            UPDATE_AVAILABLE="true"
+            return 0
         fi
     fi
     
