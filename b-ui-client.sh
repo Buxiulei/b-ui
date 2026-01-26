@@ -1630,37 +1630,38 @@ switch_config() {
     # 更新激活配置
     echo "$selected" > "$ACTIVE_CONFIG"
     
-    # 如果之前 TUN 模式是激活的，重新生成配置并启动
+    # 始终重新生成 TUN 配置文件 (不管 TUN 是否在运行，确保下次启动时使用新配置)
+    print_info "重新生成 TUN 配置..."
+    if [[ "$protocol" == "hysteria2" ]]; then
+        SERVER_ADDR=$(grep "^server:" "$CONFIG_FILE" | awk '{print $2}')
+        AUTH_PASSWORD=$(grep "^auth:" "$CONFIG_FILE" | awk '{print $2}')
+        local sni=$(grep -A2 "^tls:" "$CONFIG_FILE" | grep "sni:" | awk '{print $2}')
+        SNI="${sni:-$(echo $SERVER_ADDR | cut -d':' -f1)}"
+        INSECURE=$(grep -A2 "^tls:" "$CONFIG_FILE" | grep "insecure:" | awk '{print $2}')
+        INSECURE=${INSECURE:-false}
+        SOCKS_PORT=$(grep -A1 "^socks5:" "$CONFIG_FILE" | grep "listen:" | sed 's/.*://')
+        HTTP_PORT=$(grep -A1 "^http:" "$CONFIG_FILE" | grep "listen:" | sed 's/.*://')
+        SOCKS_PORT=${SOCKS_PORT:-1080}
+        HTTP_PORT=${HTTP_PORT:-8080}
+        generate_singbox_tun_config "hysteria2"
+    else
+        local xray_config="${BASE_DIR}/xray-config.json"
+        SERVER_ADDR=$(grep -o '"address": "[^"]*"' "$xray_config" | head -1 | cut -d'"' -f4)
+        local port=$(grep -o '"port": [0-9]*' "$xray_config" | grep -v 'listen' | head -1 | grep -o '[0-9]*')
+        SERVER_ADDR="${SERVER_ADDR}:${port}"
+        UUID=$(grep -o '"id": "[^"]*"' "$xray_config" | head -1 | cut -d'"' -f4)
+        FLOW=$(grep -o '"flow": "[^"]*"' "$xray_config" | head -1 | cut -d'"' -f4)
+        SNI=$(grep -o '"serverName": "[^"]*"' "$xray_config" | head -1 | cut -d'"' -f4)
+        FINGERPRINT=$(grep -o '"fingerprint": "[^"]*"' "$xray_config" | head -1 | cut -d'"' -f4)
+        PUBLIC_KEY=$(grep -o '"publicKey": "[^"]*"' "$xray_config" | head -1 | cut -d'"' -f4)
+        SHORT_ID=$(grep -o '"shortId": "[^"]*"' "$xray_config" | head -1 | cut -d'"' -f4)
+        SOCKS_PORT=${SOCKS_PORT:-1080}
+        HTTP_PORT=${HTTP_PORT:-8080}
+        generate_singbox_tun_config "vless-reality"
+    fi
+    
+    # 如果之前 TUN 模式是激活的，重新启动 TUN
     if [[ "$tun_was_active" == "true" ]]; then
-        print_info "重新生成 TUN 配置..."
-        # 重新读取新配置参数
-        if [[ "$protocol" == "hysteria2" ]]; then
-            SERVER_ADDR=$(grep "^server:" "$CONFIG_FILE" | awk '{print $2}')
-            AUTH_PASSWORD=$(grep "^auth:" "$CONFIG_FILE" | awk '{print $2}')
-            local sni=$(grep -A2 "^tls:" "$CONFIG_FILE" | grep "sni:" | awk '{print $2}')
-            SNI="${sni:-$(echo $SERVER_ADDR | cut -d':' -f1)}"
-            INSECURE=$(grep -A2 "^tls:" "$CONFIG_FILE" | grep "insecure:" | awk '{print $2}')
-            INSECURE=${INSECURE:-false}
-            SOCKS_PORT=$(grep -A1 "^socks5:" "$CONFIG_FILE" | grep "listen:" | sed 's/.*://')
-            HTTP_PORT=$(grep -A1 "^http:" "$CONFIG_FILE" | grep "listen:" | sed 's/.*://')
-            SOCKS_PORT=${SOCKS_PORT:-1080}
-            HTTP_PORT=${HTTP_PORT:-8080}
-            generate_singbox_tun_config "hysteria2"
-        else
-            local xray_config="${BASE_DIR}/xray-config.json"
-            SERVER_ADDR=$(grep -o '"address": "[^"]*"' "$xray_config" | head -1 | cut -d'"' -f4)
-            local port=$(grep -o '"port": [0-9]*' "$xray_config" | grep -v 'listen' | head -1 | grep -o '[0-9]*')
-            SERVER_ADDR="${SERVER_ADDR}:${port}"
-            UUID=$(grep -o '"id": "[^"]*"' "$xray_config" | head -1 | cut -d'"' -f4)
-            FLOW=$(grep -o '"flow": "[^"]*"' "$xray_config" | head -1 | cut -d'"' -f4)
-            SNI=$(grep -o '"serverName": "[^"]*"' "$xray_config" | head -1 | cut -d'"' -f4)
-            FINGERPRINT=$(grep -o '"fingerprint": "[^"]*"' "$xray_config" | head -1 | cut -d'"' -f4)
-            PUBLIC_KEY=$(grep -o '"publicKey": "[^"]*"' "$xray_config" | head -1 | cut -d'"' -f4)
-            SHORT_ID=$(grep -o '"shortId": "[^"]*"' "$xray_config" | head -1 | cut -d'"' -f4)
-            SOCKS_PORT=${SOCKS_PORT:-1080}
-            HTTP_PORT=${HTTP_PORT:-8080}
-            generate_singbox_tun_config "vless-reality"
-        fi
         start_tun_mode
     fi
     
