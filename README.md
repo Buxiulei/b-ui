@@ -6,7 +6,7 @@
 
 轻量级 Hysteria2 + Xray 一键部署工具，内置 Web 管理面板与全功能流量管理。
 
-**当前版本**: v2.15.3
+**当前版本**: v2.16.1
 
 ---
 
@@ -23,6 +23,7 @@
 ### 客户端 (Client)
 - **多模式**: 全局 TUN 代理、SSH 连接保护
 - **灵活配置**: 支持 Hysteria2 / VLESS 协议导入、路由规则自定义
+- **智能更新**: 多源并行检测（服务端/国内镜像/GitHub），自动选择最新版本
 - **工具集成**: 内核一键更新、网络连通性测试
 
 ---
@@ -54,6 +55,14 @@ bash <(curl -fsSL "https://raw.githubusercontent.com/Buxiulei/b-ui/main/install.
 - **代理端口**: SOCKS5 (1080) / HTTP (8080)
 - **测试连接**: `curl --socks5 127.0.0.1:1080 https://www.google.com`
 
+### 更新检测
+客户端更新检测采用**多源并行**策略，同时检测以下源并选择版本号最新的：
+| 源 | 说明 |
+|----|------|
+| 服务端 | 从配置的 B-UI 服务端获取（最快） |
+| 国内镜像 | ghproxy.com 代理 |
+| GitHub | 直连 GitHub Raw（实时） |
+
 ---
 
 ## API 与端口配置
@@ -81,7 +90,7 @@ bash <(curl -fsSL "https://raw.githubusercontent.com/Buxiulei/b-ui/main/install.
 
 - `/opt/b-ui/`: 核心数据目录 (配置、证书、数据库)
 - `/usr/local/bin/b-ui`: 服务端命令
-- `/usr/local/bin/b-ui-client`: 客户端命令
+- `/usr/local/bin/bui-c`: 客户端命令
 
 ---
 
