@@ -31,15 +31,12 @@ print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 #===============================================================================
 
 select_download_source() {
-    # 优先使用 GitHub 直连，只有当 GitHub 无法访问时才回退到 CDN
-    # 测试 GitHub 直连
-    local github_time=$(curl -o /dev/null -s -w '%{time_total}' --max-time 5 "${GITHUB_RAW}/version.json" 2>/dev/null || echo "999")
-    
-    if (( $(echo "$github_time < 5" | bc -l 2>/dev/null || echo "0") )); then
-        # GitHub 可访问，优先使用
+    # 优先使用 GitHub 直连 (实时性最佳，无缓存)
+    # 只有当 GitHub 完全无法访问时才回退到 CDN
+    if curl -fsSL --max-time 5 "${GITHUB_RAW}/version.json" -o /dev/null 2>/dev/null; then
         DOWNLOAD_URL="$GITHUB_RAW"
     else
-        # GitHub 不可访问，回退到 CDN
+        # GitHub 不可访问，回退到 CDN (有缓存但稳定)
         DOWNLOAD_URL="$GITHUB_CDN"
     fi
 }
@@ -104,23 +101,11 @@ check_update() {
     local local_ver=$(get_local_version)
     local remote_ver=$(get_remote_version)
     
-    # 智能回退：如果当前使用的是 CDN 且未发现新版本，尝试检查 GitHub 直连
-    if [[ "$DOWNLOAD_URL" == "$GITHUB_CDN" ]]; then
-        version_compare "$remote_ver" "$local_ver"
-        local result=$?
-        if [[ $result -ne 1 ]]; then
-             print_info "CDN 版本检测未发现更新，尝试检查 GitHub 源..."
-             local github_ver=$(curl -fsSL "${GITHUB_RAW}/version.json" 2>/dev/null | jq -r '.version' 2>/dev/null || echo "")
-             if [[ -n "$github_ver" ]]; then
-                 version_compare "$github_ver" "$remote_ver"
-                 if [[ $? -eq 1 ]]; then
-                     print_warning "检测到 CDN 缓存滞后 (CDN: v$remote_ver < GitHub: v$github_ver)"
-                     print_info "切换更新源为 GitHub 直连"
-                     DOWNLOAD_URL="$GITHUB_RAW"
-                     remote_ver="$github_ver"
-                 fi
-             fi
-        fi
+    # 显示使用的下载源
+    if [[ "$DOWNLOAD_URL" == "$GITHUB_RAW" ]]; then
+        print_info "使用 GitHub 源检测 (实时)"
+    else
+        print_info "使用 CDN 源检测 (GitHub 不可达)"
     fi
     
     if [[ -z "$remote_ver" ]]; then
