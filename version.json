@@ -1,6 +1,6 @@
 {
-    "version": "2.15.4",
-    "updated": "2026-01-23",
+    "version": "2.15.5",
+    "updated": "2026-01-26",
     "files": [
         "install.sh",
         "server/core.sh",
@@ -15,6 +15,7 @@
         "b-ui-client.sh"
     ],
     "changelog": {
+        "2.15.5": "修复 TUN 模式配置切换后 IP 不变问题：switch_config 现调用 stop_tun_mode 确保服务完全停止",
         "2.15.4": "修复 TUN 模式无法退出问题：停止时先 disable 服务防止自动重启，增加等待循环和强制终止逻辑",
         "2.15.3": "修复 TUN 模式控制问题：停止更彻底 (pkill 清理残留)，切换节点时自动重新生成 TUN 配置",
         "2.15.2": "修复 sing-box TUN 端口跳跃配置格式 (server_ports + 冒号分隔符)",

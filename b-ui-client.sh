@@ -7,7 +7,7 @@
 #===============================================================================
 
 # 版本号会在安装时从 GitHub 同步更新
-SCRIPT_VERSION="2.15.4"
+SCRIPT_VERSION="2.15.5"
 
 # 注意: 不使用 set -e，因为它会导致 ((count++)) 等算术运算在变量为0时退出脚本
 
@@ -1519,9 +1519,12 @@ switch_config() {
         print_info "检测到 TUN 模式运行中，将在切换后自动重启..."
     fi
     
-    # 停止所有服务（包括 TUN）
-    systemctl stop bui-tun 2>/dev/null || true
-    pkill -9 -f "sing-box.*singbox-tun" 2>/dev/null || true
+    # 停止 TUN 模式（调用完整清理流程，确保 disable 防止自动重启）
+    if [[ "$tun_was_active" == "true" ]]; then
+        stop_tun_mode
+    fi
+    
+    # 停止其他服务
     systemctl stop "$CLIENT_SERVICE" 2>/dev/null || true
     systemctl stop xray-client 2>/dev/null || true
     
