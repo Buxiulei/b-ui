@@ -37,7 +37,7 @@
 sudo -i
 bash <(curl -fsSL "https://raw.githubusercontent.com/Buxiulei/b-ui/main/install.sh?$(date +%s)")
 ```
-*国内镜像*: `bash <(curl -fsSL "https://cdn.jsdelivr.net/gh/Buxiulei/b-ui@main/install.sh?$(date +%s)")`
+*国内镜像*: `bash <(curl -fsSL "https://raw.githack.com/Buxiulei/b-ui/main/install.sh?$(date +%s)")`
 
 ### 管理与更新
 安装后可通过终端命令 `b-ui` 进行管理：

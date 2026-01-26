@@ -7,7 +7,7 @@
 #===============================================================================
 
 # 版本号会在安装时从 GitHub 同步更新
-SCRIPT_VERSION="2.16.1"
+SCRIPT_VERSION="2.16.2"
 
 # 注意: 不使用 set -e，因为它会导致 ((count++)) 等算术运算在变量为0时退出脚本
 
@@ -105,11 +105,11 @@ run_with_spinner() {
     return $ret
 }
 
-# 远程版本检查 URL (使用 jsDelivr CDN)
-REMOTE_VERSION_URL="https://cdn.jsdelivr.net/gh/Buxiulei/b-ui@main/b-ui-client.sh"
+# 远程版本检查 URL (使用 raw.githack.com CDN)
+REMOTE_VERSION_URL="https://raw.githack.com/Buxiulei/b-ui/main/b-ui-client.sh"
 GITHUB_RAW_URL="https://raw.githubusercontent.com/Buxiulei/b-ui/main/b-ui-client.sh"
 # 版本 JSON 文件 URL (推荐: 版本号统一管理)
-VERSION_JSON_URL="https://cdn.jsdelivr.net/gh/Buxiulei/b-ui@main/version.json"
+VERSION_JSON_URL="https://raw.githack.com/Buxiulei/b-ui/main/version.json"
 VERSION_JSON_RAW_URL="https://raw.githubusercontent.com/Buxiulei/b-ui/main/version.json"
 
 # 全局变量存储更新状态
@@ -288,7 +288,7 @@ check_os() {
 MIRROR_GHPROXY="https://ghproxy.com"
 MIRROR_GHPROXY2="https://mirror.ghproxy.com"  
 MIRROR_FASTGIT="https://hub.fastgit.xyz"
-MIRROR_JSR="https://cdn.jsdelivr.net/gh"
+MIRROR_JSR="https://raw.githack.com"
 
 # 智能下载文件 (优先国内镜像)
 # 用法: smart_download <url> <output_file> [description]
@@ -317,12 +317,12 @@ smart_download() {
             fi
         fi
         
-        # 方法3: jsdelivr CDN (如果是 raw 文件)
+        # 方法3: raw.githack.com CDN (如果是 raw 文件)
         if [[ "$success" == "false" ]] && [[ "$url" == *"raw.githubusercontent.com"* ]]; then
-            # 转换: raw.githubusercontent.com/user/repo/branch/path -> cdn.jsdelivr.net/gh/user/repo@branch/path
-            local jsr_path=$(echo "$url" | sed -E 's|https://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/(.*)|\1/\2@\3/\4|')
-            print_info "尝试 jsdelivr CDN..."
-            if curl -fsSL --max-time 60 "${MIRROR_JSR}/${jsr_path}" -o "$output" 2>/dev/null; then
+            # 转换: raw.githubusercontent.com -> raw.githack.com (路径格式相同)
+            local githack_url=$(echo "$url" | sed 's|raw\.githubusercontent\.com|raw.githack.com|')
+            print_info "尝试 raw.githack.com CDN..."
+            if curl -fsSL --max-time 60 "$githack_url" -o "$output" 2>/dev/null; then
                 success=true
             fi
         fi
