@@ -7,7 +7,7 @@
 #===============================================================================
 
 # 版本号会在安装时从 GitHub 同步更新
-SCRIPT_VERSION="2.16.0"
+SCRIPT_VERSION="2.16.1"
 
 # 注意: 不使用 set -e，因为它会导致 ((count++)) 等算术运算在变量为0时退出脚本
 
@@ -117,62 +117,84 @@ UPDATE_AVAILABLE=""
 REMOTE_VERSION=""
 
 # 检查客户端更新
-# 检测顺序: 1.服务端 → 2.国内镜像 → 3.GitHub Raw
+# 同时检测所有源，比较版本号，使用最新的那个
 check_client_update() {
-    local version_json=""
-    local source_name=""
+    local best_version=""
+    local best_source=""
+    local best_url=""
+    
+    # 从 JSON 提取版本号的辅助函数
+    _extract_version() {
+        local json="$1"
+        local ver=$(echo "$json" | grep -oP '"version"\s*:\s*"\K[^"]+' 2>/dev/null | head -1)
+        if [[ -z "$ver" ]]; then
+            ver=$(echo "$json" | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+        fi
+        echo "$ver"
+    }
+    
+    # 版本比较: 返回较新的版本
+    _newer_version() {
+        local v1="$1" v2="$2"
+        if [[ -z "$v1" ]]; then echo "$v2"; return; fi
+        if [[ -z "$v2" ]]; then echo "$v1"; return; fi
+        printf '%s\n' "$v1" "$v2" | sort -V | tail -n1
+    }
     
     # 加载服务端地址
     load_server_address
     
-    # 方法1: 优先从服务端获取 (最快，适合已配置的用户)
+    print_info "检测更新中 (多源并行)..."
+    
+    # 源1: 服务端 (如果已配置)
     if [[ -n "$SERVER_ADDRESS" ]]; then
-        version_json=$(curl -fsSL --max-time 5 "https://${SERVER_ADDRESS}/api/version" 2>/dev/null)
-        if [[ -n "$version_json" ]]; then
-            source_name="服务端"
+        local server_json=$(curl -fsSL --max-time 5 "https://${SERVER_ADDRESS}/api/version" 2>/dev/null)
+        local server_ver=$(_extract_version "$server_json")
+        if [[ -n "$server_ver" ]]; then
+            if [[ "$(_newer_version "$server_ver" "$best_version")" == "$server_ver" ]]; then
+                best_version="$server_ver"
+                best_source="服务端"
+                best_url="https://${SERVER_ADDRESS}/api/download/b-ui-client.sh"
+            fi
+            echo -e "  服务端: ${GREEN}v${server_ver}${NC}"
         fi
     fi
     
-    # 方法2: 国内镜像 (ghproxy)
-    if [[ -z "$version_json" ]]; then
-        version_json=$(curl -fsSL --max-time 5 "${MIRROR_GHPROXY}/${VERSION_JSON_RAW_URL}" 2>/dev/null)
-        if [[ -n "$version_json" ]]; then
-            source_name="国内镜像"
+    # 源2: 国内镜像 (ghproxy)
+    local mirror_json=$(curl -fsSL --max-time 5 "${MIRROR_GHPROXY}/${VERSION_JSON_RAW_URL}" 2>/dev/null)
+    local mirror_ver=$(_extract_version "$mirror_json")
+    if [[ -n "$mirror_ver" ]]; then
+        if [[ "$(_newer_version "$mirror_ver" "$best_version")" == "$mirror_ver" ]]; then
+            best_version="$mirror_ver"
+            best_source="国内镜像"
+            best_url="${MIRROR_GHPROXY}/${GITHUB_RAW_URL}"
         fi
+        echo -e "  国内镜像: ${GREEN}v${mirror_ver}${NC}"
     fi
     
-    # 方法3: GitHub Raw (实时，无缓存)
-    if [[ -z "$version_json" ]]; then
-        version_json=$(curl -fsSL --max-time 5 "$VERSION_JSON_RAW_URL" 2>/dev/null)
-        if [[ -n "$version_json" ]]; then
-            source_name="GitHub"
+    # 源3: GitHub Raw
+    local github_json=$(curl -fsSL --max-time 5 "$VERSION_JSON_RAW_URL" 2>/dev/null)
+    local github_ver=$(_extract_version "$github_json")
+    if [[ -n "$github_ver" ]]; then
+        if [[ "$(_newer_version "$github_ver" "$best_version")" == "$github_ver" ]]; then
+            best_version="$github_ver"
+            best_source="GitHub"
+            best_url="$GITHUB_RAW_URL"
         fi
+        echo -e "  GitHub: ${GREEN}v${github_ver}${NC}"
     fi
     
-    # 方法4: jsDelivr CDN (最后回退)
-    if [[ -z "$version_json" ]]; then
-        version_json=$(curl -fsSL --max-time 5 "$VERSION_JSON_URL" 2>/dev/null)
-        if [[ -n "$version_json" ]]; then
-            source_name="CDN"
-        fi
-    fi
-    
-    if [[ -n "$version_json" ]]; then
-        # 从 JSON 提取版本号 (兼容无 jq 环境)
-        REMOTE_VERSION=$(echo "$version_json" | grep -oP '"version"\s*:\s*"\K[^"]+' | head -1)
-        if [[ -z "$REMOTE_VERSION" ]]; then
-            # 备用正则 (macOS 兼容)
-            REMOTE_VERSION=$(echo "$version_json" | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
-        fi
-    fi
-    
-    # 保存检测源供 do_client_update 使用
-    UPDATE_SOURCE="$source_name"
+    # 保存最佳版本和源供 do_client_update 使用
+    REMOTE_VERSION="$best_version"
+    UPDATE_SOURCE="$best_source"
+    UPDATE_URL="$best_url"
     
     # 版本比较
     if [[ -n "$REMOTE_VERSION" && "$REMOTE_VERSION" != "$SCRIPT_VERSION" ]]; then
         if [[ "$(printf '%s\n' "$REMOTE_VERSION" "$SCRIPT_VERSION" | sort -V | tail -n1)" == "$REMOTE_VERSION" ]]; then
             UPDATE_AVAILABLE="true"
+            echo ""
+            echo -e "  ${CYAN}最新版本: v${REMOTE_VERSION} (来自 ${UPDATE_SOURCE})${NC}"
             return 0
         fi
     fi
@@ -182,7 +204,7 @@ check_client_update() {
 }
 
 # 执行客户端更新
-# 下载顺序: 1.服务端 → 2.国内镜像 → 3.GitHub Raw
+# 优先使用 check_client_update 检测到的最佳源
 do_client_update() {
     print_info "正在更新客户端..."
     
@@ -192,22 +214,20 @@ do_client_update() {
     # 加载服务端地址
     load_server_address
     
-    # 构建下载源列表 (按优先级)
+    # 构建下载源列表
     local sources=()
     
-    # 1. 服务端 (如果已配置)
+    # 优先使用检测到的最佳源
+    if [[ -n "$UPDATE_URL" ]]; then
+        sources+=("${UPDATE_URL}|${UPDATE_SOURCE}(最佳)")
+    fi
+    
+    # 备选源
     if [[ -n "$SERVER_ADDRESS" ]]; then
         sources+=("https://${SERVER_ADDRESS}/api/download/b-ui-client.sh|服务端")
     fi
-    
-    # 2. 国内镜像
     sources+=("${MIRROR_GHPROXY}/${GITHUB_RAW_URL}|国内镜像")
-    sources+=("${MIRROR_GHPROXY2}/${GITHUB_RAW_URL}|国内镜像2")
-    
-    # 3. GitHub Raw
     sources+=("${GITHUB_RAW_URL}|GitHub")
-    
-    # 4. jsDelivr CDN
     sources+=("${REMOTE_VERSION_URL}|CDN")
     
     # 依次尝试下载
