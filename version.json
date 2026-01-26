@@ -1,5 +1,5 @@
 {
-    "version": "2.15.7",
+    "version": "2.15.8",
     "updated": "2026-01-26",
     "files": [
         "install.sh",
@@ -15,6 +15,7 @@
         "b-ui-client.sh"
     ],
     "changelog": {
+        "2.15.8": "更新检测优化：默认使用 GitHub Raw (无缓存)；新增选项 16 (国内镜像更新)",
         "2.15.7": "修复切换配置时 TUN 配置文件不更新问题：始终重新生成配置确保下次启动使用新节点",
         "2.15.6": "TUN 模式启动和配置切换后自动检测公网 IP、归属地、运营商及 Google/YouTube/GitHub 连通性",
         "2.15.5": "修复 TUN 模式配置切换后 IP 不变问题：switch_config 现调用 stop_tun_mode 确保服务完全停止",
