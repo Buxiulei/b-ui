@@ -7,7 +7,7 @@
 #===============================================================================
 
 # 版本号会在安装时从 GitHub 同步更新
-SCRIPT_VERSION="2.15.8"
+SCRIPT_VERSION="2.16.0"
 
 # 注意: 不使用 set -e，因为它会导致 ((count++)) 等算术运算在变量为0时退出脚本
 
@@ -117,16 +117,44 @@ UPDATE_AVAILABLE=""
 REMOTE_VERSION=""
 
 # 检查客户端更新
-# 优先从 version.json 获取版本号 (统一版本管理)
-# 默认使用 GitHub Raw (实时性最佳,适合国外服务器)
+# 检测顺序: 1.服务端 → 2.国内镜像 → 3.GitHub Raw
 check_client_update() {
     local version_json=""
+    local source_name=""
     
-    # 方法1: 优先 GitHub Raw (实时,无缓存)
-    version_json=$(curl -fsSL --max-time 5 "$VERSION_JSON_RAW_URL" 2>/dev/null)
+    # 加载服务端地址
+    load_server_address
+    
+    # 方法1: 优先从服务端获取 (最快，适合已配置的用户)
+    if [[ -n "$SERVER_ADDRESS" ]]; then
+        version_json=$(curl -fsSL --max-time 5 "https://${SERVER_ADDRESS}/api/version" 2>/dev/null)
+        if [[ -n "$version_json" ]]; then
+            source_name="服务端"
+        fi
+    fi
+    
+    # 方法2: 国内镜像 (ghproxy)
     if [[ -z "$version_json" ]]; then
-        # 方法2: 回退 jsDelivr CDN (有缓存但稳定)
+        version_json=$(curl -fsSL --max-time 5 "${MIRROR_GHPROXY}/${VERSION_JSON_RAW_URL}" 2>/dev/null)
+        if [[ -n "$version_json" ]]; then
+            source_name="国内镜像"
+        fi
+    fi
+    
+    # 方法3: GitHub Raw (实时，无缓存)
+    if [[ -z "$version_json" ]]; then
+        version_json=$(curl -fsSL --max-time 5 "$VERSION_JSON_RAW_URL" 2>/dev/null)
+        if [[ -n "$version_json" ]]; then
+            source_name="GitHub"
+        fi
+    fi
+    
+    # 方法4: jsDelivr CDN (最后回退)
+    if [[ -z "$version_json" ]]; then
         version_json=$(curl -fsSL --max-time 5 "$VERSION_JSON_URL" 2>/dev/null)
+        if [[ -n "$version_json" ]]; then
+            source_name="CDN"
+        fi
     fi
     
     if [[ -n "$version_json" ]]; then
@@ -138,18 +166,8 @@ check_client_update() {
         fi
     fi
     
-    # 方法3: 如果 version.json 失败，回退到从脚本文件获取
-    if [[ -z "$REMOTE_VERSION" ]]; then
-        local remote_script=""
-        # 优先 GitHub Raw
-        remote_script=$(curl -fsSL --max-time 5 "$GITHUB_RAW_URL" 2>/dev/null | head -20)
-        if [[ -z "$remote_script" ]]; then
-            remote_script=$(curl -fsSL --max-time 5 "$REMOTE_VERSION_URL" 2>/dev/null | head -20)
-        fi
-        if [[ -n "$remote_script" ]]; then
-            REMOTE_VERSION=$(echo "$remote_script" | grep -oP 'SCRIPT_VERSION="\K[^"]+' | head -1)
-        fi
-    fi
+    # 保存检测源供 do_client_update 使用
+    UPDATE_SOURCE="$source_name"
     
     # 版本比较
     if [[ -n "$REMOTE_VERSION" && "$REMOTE_VERSION" != "$SCRIPT_VERSION" ]]; then
@@ -163,103 +181,44 @@ check_client_update() {
     return 1
 }
 
-# 执行客户端更新 (优先 GitHub Raw)
+# 执行客户端更新
+# 下载顺序: 1.服务端 → 2.国内镜像 → 3.GitHub Raw
 do_client_update() {
-    print_info "正在更新客户端 (GitHub 源)..."
-    
-    local temp_script="/tmp/b-ui-client-new.sh"
-    
-    # 下载新版本 (优先 GitHub Raw)
-    if curl -fsSL --max-time 60 "$GITHUB_RAW_URL" -o "$temp_script" 2>/dev/null || \
-       curl -fsSL --max-time 60 "$REMOTE_VERSION_URL" -o "$temp_script" 2>/dev/null; then
-        
-        # 验证下载的脚本
-        local lines=$(wc -l < "$temp_script" 2>/dev/null || echo "0")
-        if [[ "$lines" -gt 100 ]]; then
-            # 更新 bui-c
-            cp "$temp_script" /usr/local/bin/bui-c
-            chmod +x /usr/local/bin/bui-c
-            rm -f "$temp_script"
-            
-            print_success "客户端已更新至 v${REMOTE_VERSION}"
-            echo ""
-            print_info "请重新运行 bui-c 使更新生效"
-            exit 0
-        else
-            rm -f "$temp_script"
-            print_error "下载的脚本不完整"
-            return 1
-        fi
-    else
-        print_error "下载失败"
-        return 1
-    fi
-}
-
-#===============================================================================
-# 国内镜像更新 (专门用于国内服务器或无法直连 GitHub 的环境)
-#===============================================================================
-
-# 检查客户端更新 (国内镜像源)
-check_client_update_cn() {
-    print_info "使用国内镜像检测更新..."
-    local version_json=""
-    
-    # 国内镜像源列表 (按优先级)
-    local mirrors=(
-        "${MIRROR_GHPROXY}/https://raw.githubusercontent.com/Buxiulei/b-ui/main/version.json"
-        "${MIRROR_GHPROXY2}/https://raw.githubusercontent.com/Buxiulei/b-ui/main/version.json"
-        "$VERSION_JSON_URL"  # jsDelivr CDN
-    )
-    
-    for mirror in "${mirrors[@]}"; do
-        version_json=$(curl -fsSL --max-time 10 "$mirror" 2>/dev/null)
-        if [[ -n "$version_json" ]]; then
-            print_info "成功从镜像获取版本信息"
-            break
-        fi
-    done
-    
-    if [[ -n "$version_json" ]]; then
-        REMOTE_VERSION=$(echo "$version_json" | grep -oP '"version"\s*:\s*"\K[^"]+' | head -1)
-        if [[ -z "$REMOTE_VERSION" ]]; then
-            REMOTE_VERSION=$(echo "$version_json" | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
-        fi
-    fi
-    
-    # 版本比较
-    if [[ -n "$REMOTE_VERSION" && "$REMOTE_VERSION" != "$SCRIPT_VERSION" ]]; then
-        if [[ "$(printf '%s\n' "$REMOTE_VERSION" "$SCRIPT_VERSION" | sort -V | tail -n1)" == "$REMOTE_VERSION" ]]; then
-            UPDATE_AVAILABLE="true"
-            return 0
-        fi
-    fi
-    
-    UPDATE_AVAILABLE=""
-    return 1
-}
-
-# 执行客户端更新 (国内镜像源)
-do_client_update_cn() {
-    print_info "正在更新客户端 (国内镜像源)..."
+    print_info "正在更新客户端..."
     
     local temp_script="/tmp/b-ui-client-new.sh"
     local download_success=false
     
-    # 国内镜像源列表
-    local mirrors=(
-        "${MIRROR_GHPROXY}/https://raw.githubusercontent.com/Buxiulei/b-ui/main/b-ui-client.sh"
-        "${MIRROR_GHPROXY2}/https://raw.githubusercontent.com/Buxiulei/b-ui/main/b-ui-client.sh"
-        "$REMOTE_VERSION_URL"  # jsDelivr CDN
-    )
+    # 加载服务端地址
+    load_server_address
     
-    for mirror in "${mirrors[@]}"; do
-        print_info "尝试: ${mirror:0:50}..."
-        if curl -fsSL --max-time 60 "$mirror" -o "$temp_script" 2>/dev/null; then
+    # 构建下载源列表 (按优先级)
+    local sources=()
+    
+    # 1. 服务端 (如果已配置)
+    if [[ -n "$SERVER_ADDRESS" ]]; then
+        sources+=("https://${SERVER_ADDRESS}/api/download/b-ui-client.sh|服务端")
+    fi
+    
+    # 2. 国内镜像
+    sources+=("${MIRROR_GHPROXY}/${GITHUB_RAW_URL}|国内镜像")
+    sources+=("${MIRROR_GHPROXY2}/${GITHUB_RAW_URL}|国内镜像2")
+    
+    # 3. GitHub Raw
+    sources+=("${GITHUB_RAW_URL}|GitHub")
+    
+    # 4. jsDelivr CDN
+    sources+=("${REMOTE_VERSION_URL}|CDN")
+    
+    # 依次尝试下载
+    for item in "${sources[@]}"; do
+        IFS='|' read -r url name <<< "$item"
+        print_info "尝试: ${name}..."
+        if curl -fsSL --max-time 60 "$url" -o "$temp_script" 2>/dev/null; then
             local lines=$(wc -l < "$temp_script" 2>/dev/null || echo "0")
             if [[ "$lines" -gt 100 ]]; then
                 download_success=true
-                print_success "下载成功"
+                print_success "从 ${name} 下载成功"
                 break
             fi
         fi
@@ -276,7 +235,7 @@ do_client_update_cn() {
         exit 0
     else
         rm -f "$temp_script"
-        print_error "所有镜像下载失败"
+        print_error "所有下载源均失败"
         return 1
     fi
 }
@@ -3409,7 +3368,6 @@ show_menu() {
     else
         echo -e "${CYAN}║${NC}  ${YELLOW}14.${NC} 检查/更新客户端                                      ${CYAN}║${NC}"
     fi
-    echo -e "${CYAN}║${NC}  ${YELLOW}16.${NC} 检查/更新客户端 (国内镜像)                            ${CYAN}║${NC}"
     echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}13.${NC} ${RED}卸载${NC}                                                 ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}  ${YELLOW}0.${NC} 退出                                                   ${CYAN}║${NC}"
@@ -3560,20 +3518,6 @@ main() {
                 fi
                 ;;
             15) import_from_subscription ;;
-            16) 
-                # 国内镜像更新
-                echo ""
-                print_info "使用国内镜像检测更新..."
-                if check_client_update_cn; then
-                    echo -e "发现新版本: ${YELLOW}v${SCRIPT_VERSION}${NC} -> ${GREEN}v${REMOTE_VERSION}${NC}"
-                    read -p "是否立即更新? (y/n): " confirm
-                    if [[ "$confirm" =~ ^[yY]$ ]]; then
-                        do_client_update_cn
-                    fi
-                else
-                    print_success "已是最新版本 (v${SCRIPT_VERSION})"
-                fi
-                ;;
             0) echo ""; print_info "再见！"; exit 0 ;;
             *) print_error "无效选项" ;;
         esac
