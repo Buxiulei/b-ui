@@ -7,7 +7,7 @@
 #===============================================================================
 
 # 版本号会在安装时从 GitHub 同步更新
-SCRIPT_VERSION="2.15.5"
+SCRIPT_VERSION="2.15.6"
 
 # 注意: 不使用 set -e，因为它会导致 ((count++)) 等算术运算在变量为0时退出脚本
 
@@ -1176,6 +1176,82 @@ EOF
     print_success "sing-box TUN 配置已生成: $singbox_config"
 }
 
+# 检测公网 IP 和连通性
+check_public_ip() {
+    local mode="${1:-TUN}"  # 模式标识: TUN 或 切换配置
+    echo ""
+    echo -e "${CYAN}[网络检测]${NC}"
+    
+    # IP 检测 API 列表（按优先级）
+    local ip_apis=(
+        "https://api.ipify.org"
+        "https://ip.sb"
+        "https://icanhazip.com"
+        "https://ifconfig.me"
+        "https://ipinfo.io/ip"
+    )
+    
+    local public_ip=""
+    local api_used=""
+    
+    # 尝试获取公网 IP
+    for api in "${ip_apis[@]}"; do
+        public_ip=$(curl -s --max-time 5 "$api" 2>/dev/null | tr -d '\n')
+        if [[ -n "$public_ip" ]] && [[ "$public_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            api_used="$api"
+            break
+        fi
+        public_ip=""
+    done
+    
+    if [[ -n "$public_ip" ]]; then
+        echo -e "  ${GREEN}✓${NC} 公网 IP: ${GREEN}${public_ip}${NC}"
+        
+        # 尝试获取 IP 归属地
+        local ip_info=$(curl -s --max-time 3 "https://ipinfo.io/${public_ip}/json" 2>/dev/null)
+        if [[ -n "$ip_info" ]]; then
+            local country=$(echo "$ip_info" | grep -o '"country": "[^"]*"' | cut -d'"' -f4)
+            local city=$(echo "$ip_info" | grep -o '"city": "[^"]*"' | cut -d'"' -f4)
+            local org=$(echo "$ip_info" | grep -o '"org": "[^"]*"' | cut -d'"' -f4)
+            if [[ -n "$country" ]]; then
+                echo -e "  ${GREEN}✓${NC} 归属地: ${YELLOW}${city:-Unknown}, ${country}${NC}"
+            fi
+            if [[ -n "$org" ]]; then
+                echo -e "  ${GREEN}✓${NC} 运营商: ${YELLOW}${org}${NC}"
+            fi
+        fi
+    else
+        echo -e "  ${RED}✗${NC} 无法获取公网 IP (网络可能不通)"
+    fi
+    
+    # 连通性测试
+    echo ""
+    echo -e "${CYAN}[连通性测试]${NC}"
+    
+    # 测试 Google
+    if curl -s --max-time 5 -o /dev/null -w '' "https://www.google.com" 2>/dev/null; then
+        echo -e "  ${GREEN}✓${NC} Google: 可访问"
+    else
+        echo -e "  ${RED}✗${NC} Google: 不可访问"
+    fi
+    
+    # 测试 YouTube
+    if curl -s --max-time 5 -o /dev/null -w '' "https://www.youtube.com" 2>/dev/null; then
+        echo -e "  ${GREEN}✓${NC} YouTube: 可访问"
+    else
+        echo -e "  ${RED}✗${NC} YouTube: 不可访问"
+    fi
+    
+    # 测试 GitHub
+    if curl -s --max-time 5 -o /dev/null -w '' "https://github.com" 2>/dev/null; then
+        echo -e "  ${GREEN}✓${NC} GitHub: 可访问"
+    else
+        echo -e "  ${RED}✗${NC} GitHub: 不可访问"
+    fi
+    
+    echo ""
+}
+
 start_tun_mode() {
     print_info "启动 TUN 模式..."
     
@@ -1228,6 +1304,8 @@ start_tun_mode() {
         echo -e "  接口: ${GREEN}bui-tun${NC}"
         echo -e "  SOCKS5: ${GREEN}127.0.0.1:${socks_port}${NC}"
         echo -e "  HTTP:   ${GREEN}127.0.0.1:${http_port}${NC}"
+        # 自动检测公网 IP 和连通性
+        check_public_ip "TUN"
     else
         print_error "TUN 模式启动失败"
         journalctl -u bui-tun --no-pager -n 10
@@ -1587,6 +1665,19 @@ switch_config() {
     fi
     
     print_success "已切换到: $selected"
+    
+    # 如果 TUN 模式未激活，也检测一下当前网络状态（通过代理）
+    if [[ "$tun_was_active" != "true" ]]; then
+        # 使用本地代理检测 IP
+        echo ""
+        echo -e "${CYAN}[代理网络检测]${NC}"
+        local proxy_ip=$(curl -s --max-time 5 --socks5 127.0.0.1:${SOCKS_PORT:-1080} "https://api.ipify.org" 2>/dev/null)
+        if [[ -n "$proxy_ip" ]] && [[ "$proxy_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo -e "  ${GREEN}✓${NC} 代理 IP: ${GREEN}${proxy_ip}${NC}"
+        else
+            echo -e "  ${YELLOW}○${NC} 代理未就绪或无法获取 IP"
+        fi
+    fi
 }
 
 delete_config() {
