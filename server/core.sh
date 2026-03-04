@@ -533,6 +533,61 @@ EOF
 }
 
 #===============================================================================
+# 配置定时任务 (证书续期 + b-ui 自动更新 + 证书健康检查)
+#===============================================================================
+
+configure_cron_tasks() {
+    print_info "配置定时任务..."
+    
+    # 清除旧的 b-ui 相关 cron 任务
+    crontab -l 2>/dev/null | grep -v "certbot renew" | grep -v "b-ui" | grep -v "cert-check" | crontab - 2>/dev/null || true
+    
+    # 创建证书健康检查脚本
+    cat > "${BASE_DIR}/cert-check.sh" << 'CERTEOF'
+#!/bin/bash
+# B-UI 证书健康检查与自动修复
+LOG="/var/log/b-ui-cert-check.log"
+DOMAIN=$(grep -A3 "^tls:" /opt/b-ui/config.yaml 2>/dev/null | grep "cert:" | sed 's|.*/live/\([^/]*\)/.*|\1|')
+CERT="/etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
+
+[ -z "$DOMAIN" ] && exit 0
+[ ! -f "$CERT" ] && echo "[$(date)] ERROR: 证书不存在: $CERT" >> "$LOG" && exit 1
+
+# 检查是否在 7 天内过期
+if ! openssl x509 -checkend 604800 -noout -in "$CERT" 2>/dev/null; then
+    EXPIRY=$(openssl x509 -enddate -noout -in "$CERT" | cut -d= -f2)
+    echo "[$(date)] WARNING: 证书即将过期 ($EXPIRY)，尝试续期..." >> "$LOG"
+    certbot renew --force-renewal --deploy-hook "systemctl restart hysteria-server && systemctl reload nginx 2>/dev/null || true" >> "$LOG" 2>&1
+    if [ $? -eq 0 ]; then
+        echo "[$(date)] SUCCESS: 证书续期成功" >> "$LOG"
+    else
+        echo "[$(date)] CRITICAL: 证书续期失败！" >> "$LOG"
+    fi
+else
+    echo "[$(date)] OK: 证书有效 ($DOMAIN)" >> "$LOG"
+fi
+
+# 保留最近 200 行日志
+tail -200 "$LOG" > "${LOG}.tmp" && mv "${LOG}.tmp" "$LOG" 2>/dev/null
+CERTEOF
+    chmod +x "${BASE_DIR}/cert-check.sh"
+    
+    # 添加所有 cron 任务
+    (
+        crontab -l 2>/dev/null
+        echo '# === B-UI 定时任务 ==='
+        echo '0 3 * * * certbot renew --quiet --deploy-hook "systemctl restart hysteria-server && systemctl reload nginx 2>/dev/null || true"'
+        echo '0 */6 * * * /opt/b-ui/update.sh auto >> /var/log/b-ui-update.log 2>&1'
+        echo '0 */12 * * * /opt/b-ui/cert-check.sh'
+    ) | crontab -
+    
+    print_success "定时任务已配置:"
+    echo -e "  ${CYAN}• 证书续期:     每天 03:00 (续期后自动重启服务)${NC}"
+    echo -e "  ${CYAN}• B-UI 自动更新: 每 6 小时检查并静默更新${NC}"
+    echo -e "  ${CYAN}• 证书健康检查:  每 12 小时 (≤7天过期自动续期)${NC}"
+}
+
+#===============================================================================
 # 配置防火墙
 #===============================================================================
 
