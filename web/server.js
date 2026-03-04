@@ -462,6 +462,119 @@ function generateSingboxConfig(user, cfg, host) {
     };
 }
 
+// 生成 Clash Meta (mihomo) YAML 配置 (Clash Verge Rev 兼容)
+function generateClashConfig(user, cfg, host) {
+    const proxies = [];
+    const proxyNames = [];
+
+    // 1. Hysteria2 节点
+    if (user.password) {
+        const hy2Name = `${user.username}-高速版`;
+        let hy2Yaml = `  - name: "${hy2Name}"
+    type: hysteria2
+    server: ${host}
+    port: ${cfg.port}`;
+
+        // 端口跳跃
+        if (cfg.portHopping && cfg.portHopping.enabled) {
+            hy2Yaml += `\n    ports: "${cfg.portHopping.start}-${cfg.portHopping.end}"
+    hop-interval: 30`;
+        }
+
+        hy2Yaml += `\n    password: "${user.username}:${user.password}"
+    sni: ${host}
+    skip-cert-verify: false
+    alpn:
+      - h3`;
+
+        proxies.push(hy2Yaml);
+        proxyNames.push(hy2Name);
+    }
+
+    // 2. VLESS-Reality 节点
+    if (user.uuid && cfg.pubKey && cfg.shortId) {
+        const vlessName = `${user.username}-稳定版`;
+        const userSni = user.sni || cfg.sni || "www.bing.com";
+
+        const vlessYaml = `  - name: "${vlessName}"
+    type: vless
+    server: ${host}
+    port: ${cfg.xrayPort || 10001}
+    uuid: ${user.uuid}
+    flow: xtls-rprx-vision
+    tls: true
+    udp: true
+    servername: ${userSni}
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: ${cfg.pubKey}
+      short-id: ${cfg.shortId}
+    network: tcp`;
+
+        proxies.push(vlessYaml);
+        proxyNames.push(vlessName);
+    }
+
+    // 代理名称列表 (YAML 格式)
+    const nameList = proxyNames.map(n => `      - "${n}"`).join("\n");
+
+    // 完整 Clash Meta 配置
+    const yaml = `# B-UI Clash Meta 订阅配置
+# 用户: ${user.username}
+# 生成时间: ${new Date().toISOString()}
+
+mixed-port: 7890
+allow-lan: false
+mode: rule
+log-level: info
+unified-delay: true
+find-process-mode: strict
+geodata-mode: true
+tcp-concurrent: true
+
+dns:
+  enable: true
+  listen: 0.0.0.0:1053
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  nameserver:
+    - https://dns.alidns.com/dns-query
+    - https://doh.pub/dns-query
+  fallback:
+    - https://8.8.8.8/dns-query
+    - https://1.1.1.1/dns-query
+  fallback-filter:
+    geoip: true
+    geoip-code: CN
+
+proxies:
+${proxies.join("\n")}
+
+proxy-groups:
+  - name: "自动选择"
+    type: url-test
+    proxies:
+${nameList}
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 50
+
+  - name: "PROXY"
+    type: select
+    proxies:
+      - "自动选择"
+${nameList}
+
+rules:
+  - GEOIP,private,DIRECT,no-resolve
+  - GEOSITE,cn,DIRECT
+  - GEOIP,cn,DIRECT,no-resolve
+  - MATCH,PROXY
+`;
+
+    return yaml;
+}
+
 
 
 function fetchStats(ep) {
@@ -1022,6 +1135,28 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                     "Subscription-Userinfo": `upload=0; download=0; total=${user.limits?.trafficLimit || 0}; expire=${user.limits?.expiresAt ? new Date(user.limits.expiresAt).getTime() / 1000 : 0}`
                 });
                 return res.end(base64Content);
+            }
+
+            // Clash Meta (mihomo) 订阅 API - Clash Verge Rev 兼容
+            if (r.startsWith("clash/")) {
+                const username = decodeURIComponent(r.slice(6));
+                const users = loadUsers();
+                const user = users.find(u => u.username === username);
+                if (!user) return sendJSON(res, { error: "User not found" }, 404);
+
+                const cfg = getConfig();
+                const host = cfg.domain;
+
+                const clashYaml = generateClashConfig(user, cfg, host);
+
+                res.writeHead(200, {
+                    "Content-Type": "text/yaml; charset=utf-8",
+                    "Content-Disposition": `inline; filename="${user.username}.yaml"`,
+                    "profile-title": `base64:${Buffer.from(user.username).toString('base64')}`,
+                    "profile-update-interval": "24",
+                    "Subscription-Userinfo": `upload=0; download=0; total=${user.limits?.trafficLimit || 0}; expire=${user.limits?.expiresAt ? new Date(user.limits.expiresAt).getTime() / 1000 : 0}`
+                });
+                return res.end(clashYaml);
             }
 
             const auth = verifyToken((req.headers.authorization || "").replace("Bearer ", ""));

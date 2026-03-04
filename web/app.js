@@ -344,14 +344,14 @@ function showU(uname) {
         $("#qrcode").innerHTML = '<img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=' +
             encodeURIComponent(uri) + '" alt="QR Code" style="display:block;border-radius:8px">';
 
-        // 按钮
         $("#cfg-buttons").innerHTML = `
             <button class="btn" onclick="copy()">📋 复制订阅链接</button>
+            <button class="btn btn-secondary" onclick="copyClash()">📎 复制 Clash 订阅</button>
             <button class="btn btn-secondary" onclick="downloadSubscription()">📦 下载 sing-box 配置</button>
         `;
 
         // 提示
-        $("#cfg-hint").innerText = "📱 扫码或复制链接导入客户端，Hy2优先，10秒检测自动切换";
+        $("#cfg-hint").innerText = "📱 扫码或复制链接导入客户端，支持 v2rayN / Shadowrocket / Clash Verge Rev";
     } else {
         // 单协议用户
         const protoName = x.protocol === "hysteria2" ? "Hysteria2" :
@@ -392,6 +392,15 @@ function downloadSubscription() {
     const url = "/api/subscription/" + encodeURIComponent(currentShowUser.username);
     window.open(url, "_blank");
     toast("正在下载 sing-box 配置...");
+}
+
+// 复制 Clash Verge Rev 订阅链接
+function copyClash() {
+    if (!currentShowUser) return toast("请先选择用户", 1);
+    const clashUrl = "https://" + location.host + "/api/clash/" + encodeURIComponent(currentShowUser.username);
+    navigator.clipboard.writeText(clashUrl)
+        .then(() => toast("Clash 订阅链接已复制，可导入 Clash Verge Rev"))
+        .catch(() => toast("复制失败", 1));
 }
 
 
