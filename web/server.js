@@ -473,7 +473,7 @@ function generateClashConfig(user, cfg, host) {
         let hy2Yaml = `  - name: "${hy2Name}"
     type: hysteria2
     server: ${host}
-    port: ${cfg.port}`;
+    port: ${parseInt(cfg.port)}`;
 
         // 端口跳跃
         if (cfg.portHopping && cfg.portHopping.enabled) {
@@ -518,34 +518,11 @@ function generateClashConfig(user, cfg, host) {
     // 代理名称列表 (YAML 格式)
     const nameList = proxyNames.map(n => `      - "${n}"`).join("\n");
 
-    // 完整 Clash Meta 配置
+    // Clash Meta 订阅配置 (仅包含 proxies/proxy-groups/rules)
+    // 全局设置由 Clash Verge Rev 自身管理
     const yaml = `# B-UI Clash Meta 订阅配置
 # 用户: ${user.username}
 # 生成时间: ${new Date().toISOString()}
-
-mixed-port: 7890
-allow-lan: false
-mode: rule
-log-level: info
-unified-delay: true
-find-process-mode: strict
-geodata-mode: true
-tcp-concurrent: true
-
-dns:
-  enable: true
-  listen: 0.0.0.0:1053
-  enhanced-mode: fake-ip
-  fake-ip-range: 198.18.0.1/16
-  nameserver:
-    - https://dns.alidns.com/dns-query
-    - https://doh.pub/dns-query
-  fallback:
-    - https://8.8.8.8/dns-query
-    - https://1.1.1.1/dns-query
-  fallback-filter:
-    geoip: true
-    geoip-code: CN
 
 proxies:
 ${proxies.join("\n")}
