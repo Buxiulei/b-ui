@@ -1151,7 +1151,7 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
 
                 res.writeHead(200, {
                     "Content-Type": "text/yaml; charset=utf-8",
-                    "Content-Disposition": `inline; filename="${user.username}.yaml"`,
+                    "Content-Disposition": `inline; filename*=UTF-8''${encodeURIComponent(user.username)}.yaml`,
                     "profile-title": `base64:${Buffer.from(user.username).toString('base64')}`,
                     "profile-update-interval": "24",
                     "Subscription-Userinfo": `upload=0; download=0; total=${user.limits?.trafficLimit || 0}; expire=${user.limits?.expiresAt ? new Date(user.limits.expiresAt).getTime() / 1000 : 0}`
