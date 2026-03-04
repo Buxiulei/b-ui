@@ -532,6 +532,7 @@ listen: :${PORT}
 
 # 使用 certbot 证书 (Nginx 已占用 443 端口，无法使用 ACME)
 tls:
+  sniGuard: disable
   cert: /etc/letsencrypt/live/${DOMAIN}/fullchain.pem
   key: /etc/letsencrypt/live/${DOMAIN}/privkey.pem
 
@@ -1719,6 +1720,36 @@ show_status() {
         echo -e "  管理面板: ${RED}✗ 未启用${NC}"
     fi
     
+    # 显示证书状态
+    echo ""
+    echo -e "${YELLOW}[证书状态]${NC}"
+    local cert_domain=$(get_domain)
+    local cert_path="/etc/letsencrypt/live/${cert_domain}/fullchain.pem"
+    if [[ -f "$cert_path" ]]; then
+        local expiry_date=$(openssl x509 -enddate -noout -in "$cert_path" 2>/dev/null | cut -d= -f2)
+        if [[ -n "$expiry_date" ]]; then
+            local expiry_epoch=$(date -d "$expiry_date" +%s 2>/dev/null)
+            local now_epoch=$(date +%s)
+            local days_left=$(( (expiry_epoch - now_epoch) / 86400 ))
+            local formatted_expiry=$(date -d "$expiry_date" '+%Y-%m-%d %H:%M' 2>/dev/null)
+            echo -e "  域名: ${GREEN}${cert_domain}${NC}"
+            echo -e "  过期时间: ${CYAN}${formatted_expiry}${NC}"
+            if [[ $days_left -le 0 ]]; then
+                echo -e "  剩余天数: ${RED}已过期！请立即续期${NC}"
+            elif [[ $days_left -le 7 ]]; then
+                echo -e "  剩余天数: ${RED}${days_left} 天 ⚠ 即将过期${NC}"
+            elif [[ $days_left -le 30 ]]; then
+                echo -e "  剩余天数: ${YELLOW}${days_left} 天${NC}"
+            else
+                echo -e "  剩余天数: ${GREEN}${days_left} 天 ✓${NC}"
+            fi
+        else
+            echo -e "  ${RED}无法读取证书信息${NC}"
+        fi
+    else
+        echo -e "  ${RED}证书文件不存在: ${cert_path}${NC}"
+    fi
+    
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
     echo ""
     
@@ -2091,10 +2122,10 @@ EOF
             chmod 644 /etc/letsencrypt/archive/${DOMAIN}/*.pem 2>/dev/null || true
             
             # 设置证书自动续期
-            if ! crontab -l 2>/dev/null | grep -q "certbot renew"; then
-                (crontab -l 2>/dev/null; echo "0 3 * * * certbot renew --quiet") | crontab -
-                print_info "已设置证书自动续期 (每天 3:00)"
-            fi
+            # 移除旧的不带 deploy-hook 的 cron 任务
+            crontab -l 2>/dev/null | grep -v "certbot renew" | crontab - 2>/dev/null || true
+            (crontab -l 2>/dev/null; echo '0 3 * * * certbot renew --quiet --deploy-hook "systemctl restart hysteria-server && systemctl reload nginx 2>/dev/null || true"') | crontab -
+            print_info "已设置证书自动续期 (每天 3:00, 续期后自动重启服务)"
         else
             print_warning "SSL 证书申请失败，将使用 HTTP"
         fi
@@ -2108,10 +2139,10 @@ EOF
         chmod 644 /etc/letsencrypt/archive/${DOMAIN}/*.pem 2>/dev/null || true
         
         # 确保自动续期已设置
-        if ! crontab -l 2>/dev/null | grep -q "certbot renew"; then
-            (crontab -l 2>/dev/null; echo "0 3 * * * certbot renew --quiet") | crontab -
-            print_info "已设置证书自动续期 (每天 3:00)"
-        fi
+        # 移除旧的不带 deploy-hook 的 cron 任务
+        crontab -l 2>/dev/null | grep -v "certbot renew" | crontab - 2>/dev/null || true
+        (crontab -l 2>/dev/null; echo '0 3 * * * certbot renew --quiet --deploy-hook "systemctl restart hysteria-server && systemctl reload nginx 2>/dev/null || true"') | crontab -
+        print_info "已设置证书自动续期 (每天 3:00, 续期后自动重启服务)"
     else
         print_warning "跳过 SSL 证书申请，管理面板将使用 HTTP"
         print_info "稍后可以手动运行 certbot 申请证书"
@@ -2297,6 +2328,40 @@ show_status() {
     echo -e "  Hysteria2: ${CYAN}${hy_enabled}${NC}"
     echo -e "  Xray:      ${CYAN}${xray_enabled}${NC}"
     echo -e "  管理面板:  ${CYAN}${admin_enabled}${NC}"
+    
+    # 显示证书状态
+    echo ""
+    echo -e "${YELLOW}[证书状态]${NC}"
+    if [[ -f "$CONFIG_FILE" ]]; then
+        local cert_domain=$(grep -A2 "^tls:" "$CONFIG_FILE" 2>/dev/null | grep "cert:" | sed 's|.*/live/\([^/]*\)/.*|\1|')
+        local cert_path="/etc/letsencrypt/live/${cert_domain}/fullchain.pem"
+        if [[ -n "$cert_domain" ]] && [[ -f "$cert_path" ]]; then
+            local expiry_date=$(openssl x509 -enddate -noout -in "$cert_path" 2>/dev/null | cut -d= -f2)
+            if [[ -n "$expiry_date" ]]; then
+                local expiry_epoch=$(date -d "$expiry_date" +%s 2>/dev/null)
+                local now_epoch=$(date +%s)
+                local days_left=$(( (expiry_epoch - now_epoch) / 86400 ))
+                local formatted_expiry=$(date -d "$expiry_date" '+%Y-%m-%d %H:%M' 2>/dev/null)
+                echo -e "  域名: ${GREEN}${cert_domain}${NC}"
+                echo -e "  过期时间: ${CYAN}${formatted_expiry}${NC}"
+                if [[ $days_left -le 0 ]]; then
+                    echo -e "  剩余天数: ${RED}已过期！请立即续期${NC}"
+                elif [[ $days_left -le 7 ]]; then
+                    echo -e "  剩余天数: ${RED}${days_left} 天 ⚠ 即将过期${NC}"
+                elif [[ $days_left -le 30 ]]; then
+                    echo -e "  剩余天数: ${YELLOW}${days_left} 天${NC}"
+                else
+                    echo -e "  剩余天数: ${GREEN}${days_left} 天 ✓${NC}"
+                fi
+            else
+                echo -e "  ${RED}无法读取证书信息${NC}"
+            fi
+        else
+            echo -e "  ${RED}证书文件不存在${NC}"
+        fi
+    else
+        echo -e "  ${YELLOW}未配置${NC}"
+    fi
     
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
     

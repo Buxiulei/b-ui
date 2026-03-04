@@ -345,6 +345,7 @@ EOF
 listen: :${PORT}
 
 tls:
+  sniGuard: disable
   cert: /etc/letsencrypt/live/${DOMAIN}/fullchain.pem
   key: /etc/letsencrypt/live/${DOMAIN}/privkey.pem
 
