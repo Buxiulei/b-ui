@@ -1,5 +1,5 @@
 {
-    "version": "2.16.4",
+    "version": "2.16.5",
     "updated": "2026-03-04",
     "files": [
         "install.sh",
@@ -15,6 +15,7 @@
         "b-ui-client.sh"
     ],
     "changelog": {
+        "2.16.5": "Clash Verge Rev 订阅支持 + 定时任务自动配置：/api/clash/:user 返回 Clash Meta YAML（含 DNS fake-ip）；安装/更新时自动检查修复 cron 定时任务",
         "2.16.4": "新增 Clash Verge Rev 订阅支持：/api/clash/:user 端点返回 Clash Meta YAML 配置，前端添加复制 Clash 订阅按钮",
         "2.16.3": "TLS 兼容性修复：默认关闭 sniGuard 兼容 sing-box 1.13+ uTLS；certbot 续期添加 deploy-hook 自动重启服务；CLI 面板显示证书状态和剩余天数",
         "2.16.2": "CDN 优化：将 jsdelivr CDN 替换为 raw.githack.com，分钟级更新延迟，解决缓存延迟问题",
