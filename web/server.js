@@ -518,11 +518,40 @@ function generateClashConfig(user, cfg, host) {
     // 代理名称列表 (YAML 格式)
     const nameList = proxyNames.map(n => `      - "${n}"`).join("\n");
 
-    // Clash Meta 订阅配置 (仅包含 proxies/proxy-groups/rules)
-    // 全局设置由 Clash Verge Rev 自身管理
+    // Clash Meta 订阅配置
+    // 包含 DNS (fake-ip) + proxies + proxy-groups + rules
+    // 不包含 mixed-port (由 Clash Verge Rev 自身管理)
     const yaml = `# B-UI Clash Meta 订阅配置
 # 用户: ${user.username}
 # 生成时间: ${new Date().toISOString()}
+
+mode: rule
+log-level: warning
+unified-delay: true
+tcp-concurrent: true
+find-process-mode: strict
+global-client-fingerprint: chrome
+
+dns:
+  enable: true
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+    - "*.lan"
+    - "*.local"
+    - "*.localhost"
+  default-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+  nameserver:
+    - https://dns.alidns.com/dns-query
+    - https://doh.pub/dns-query
+  fallback:
+    - https://8.8.8.8/dns-query
+    - https://1.1.1.1/dns-query
+  fallback-filter:
+    geoip: true
+    geoip-code: CN
 
 proxies:
 ${proxies.join("\n")}
