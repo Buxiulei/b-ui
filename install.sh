@@ -557,7 +557,7 @@ main() {
         chmod +x "${BASE_DIR}/b-ui-cli.sh"
     fi
     
-    # 配置定时自动更新 (每天凌晨3点)
+    # 配置定时任务 (自动更新 + 证书检查)
     setup_auto_update() {
         # 检查 crontab 是否可用，不可用则安装
         if ! command -v crontab &> /dev/null; then
@@ -577,20 +577,29 @@ main() {
             fi
             
             if ! command -v crontab &> /dev/null; then
-                print_warning "cron 安装失败，跳过自动更新配置"
+                print_warning "cron 安装失败，跳过定时任务配置"
                 return
             fi
             print_success "cron 已安装"
         fi
         
-        local cron_job="0 * * * * ${BASE_DIR}/server/update.sh auto >> /var/log/b-ui-update.log 2>&1"
+        print_info "配置定时任务..."
         
-        # 检查是否已存在
-        if ! crontab -l 2>/dev/null | grep -q "b-ui.*update.sh auto"; then
-            print_info "配置定时自动更新..."
-            (crontab -l 2>/dev/null; echo "$cron_job") | crontab -
-            print_success "已配置每小时自动检查更新"
-        fi
+        # 清理旧的/错误路径的 cron 条目
+        local current_cron
+        current_cron=$(crontab -l 2>/dev/null || echo "")
+        local new_cron
+        new_cron=$(echo "$current_cron" | grep -v "b-ui.*update.sh" | grep -v "b-ui.*cert-check" || echo "")
+        
+        # 添加标记注释和定时任务
+        new_cron="${new_cron}
+# === B-UI 定时任务 ===
+0 */6 * * * ${BASE_DIR}/update.sh auto >> /var/log/b-ui-update.log 2>&1
+0 */12 * * * ${BASE_DIR}/cert-check.sh >> /var/log/b-ui-cert-check.log 2>&1"
+        
+        # 去除空行并写入
+        echo "$new_cron" | sed '/^$/d' | crontab -
+        print_success "定时任务已配置: 每6小时检查更新, 每12小时检查证书"
     }
     setup_auto_update
     

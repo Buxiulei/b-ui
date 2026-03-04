@@ -235,6 +235,9 @@ do_update() {
     systemctl restart hysteria-server 2>/dev/null || true
     systemctl restart xray 2>/dev/null || true
     
+    # 确保定时任务配置正确
+    ensure_cron_jobs
+    
     if [[ $failed -gt 0 ]]; then
         print_warning "更新完成，但有 ${failed} 个文件更新失败"
     else
@@ -430,6 +433,49 @@ ensure_cli_exists() {
 }
 
 #===============================================================================
+# 确保定时任务配置正确
+#===============================================================================
+
+ensure_cron_jobs() {
+    # 检查 crontab 是否可用
+    if ! command -v crontab &> /dev/null; then
+        return
+    fi
+    
+    local needs_fix=0
+    local current_cron
+    current_cron=$(crontab -l 2>/dev/null || echo "")
+    
+    # 检查是否存在正确路径的定时任务
+    if ! echo "$current_cron" | grep -q "${BASE_DIR}/update.sh auto"; then
+        needs_fix=1
+    fi
+    if ! echo "$current_cron" | grep -q "${BASE_DIR}/cert-check.sh"; then
+        needs_fix=1
+    fi
+    # 检查是否存在错误路径
+    if echo "$current_cron" | grep -q "server/update.sh"; then
+        needs_fix=1
+    fi
+    
+    if [[ $needs_fix -eq 1 ]]; then
+        print_info "修复定时任务配置..."
+        # 移除所有 b-ui 相关的旧条目
+        local new_cron
+        new_cron=$(echo "$current_cron" | grep -v "b-ui.*update.sh" | grep -v "b-ui.*cert-check" | grep -v "B-UI 定时" || echo "")
+        
+        # 添加正确的定时任务
+        new_cron="${new_cron}
+# === B-UI 定时任务 ===
+0 */6 * * * ${BASE_DIR}/update.sh auto >> /var/log/b-ui-update.log 2>&1
+0 */12 * * * ${BASE_DIR}/cert-check.sh >> /var/log/b-ui-cert-check.log 2>&1"
+        
+        echo "$new_cron" | sed '/^$/d' | crontab -
+        print_success "定时任务已修复: 每6小时检查更新, 每12小时检查证书"
+    fi
+}
+
+#===============================================================================
 # 检查并自动更新入口
 #===============================================================================
 
@@ -512,6 +558,9 @@ auto_update() {
         systemctl restart xray 2>/dev/null || true
         
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] 更新完成: v${remote_ver}" >> "$LOG_FILE"
+        
+        # 确保定时任务配置正确
+        ensure_cron_jobs 2>/dev/null || true
     else
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] 已是最新版本: v${local_ver}" >> "$LOG_FILE"
     fi
