@@ -2644,21 +2644,10 @@ toggle_tun() {
     else
         echo -e "TUN 模式: ${RED}✗ 未启用${NC}"
         
-        # 检查是否有可用的配置
-        local config_file=""
+        # 始终从当前激活配置重新生成 TUN 配置 (防止切换配置后使用旧的 singbox-tun.json)
         local protocol=""
         
-        # 优先使用 sing-box 配置
-        if [[ -f "${BASE_DIR}/singbox-tun.json" ]]; then
-            echo -e "  发现已有 sing-box TUN 配置"
-            read -p "启用 TUN 模式? (y/n): " enable
-            if [[ "$enable" =~ ^[yY]$ ]]; then
-                SOCKS_PORT=$(grep -o '"listen_port": [0-9]*' "${BASE_DIR}/singbox-tun.json" | head -1 | grep -o '[0-9]*')
-                SOCKS_PORT=${SOCKS_PORT:-1080}
-                HTTP_PORT=$((SOCKS_PORT + 1))
-                start_tun_mode
-            fi
-        elif [[ -f "$CONFIG_FILE" ]]; then
+        if [[ -f "$CONFIG_FILE" ]]; then
             # 从 Hysteria2 配置生成 sing-box TUN
             echo -e "  从 Hysteria2 配置生成 TUN..."
             protocol="hysteria2"
