@@ -1135,34 +1135,26 @@ OUTBOUND
     fi
     
     # 生成完整 sing-box 配置
+    # 按 sing-box 官方文档生成配置
+    # 参考: https://sing-box.sagernet.org/manual/proxy/client/
     cat > "$singbox_config" <<EOF
 {
-  "log": {
-    "level": "info"
-  },
+  "log": { "level": "info" },
   "dns": {
     "servers": [
       {
-        "type": "https",
         "tag": "proxy-dns",
-        "server": "8.8.8.8",
-        "detour": "proxy-out"
+        "type": "tls",
+        "server": "8.8.8.8"
       },
       {
-        "type": "udp",
         "tag": "local-dns",
+        "type": "udp",
         "server": "223.5.5.5"
-      },
-      {
-        "type": "local",
-        "tag": "system-dns"
       }
     ],
     "rules": [
-      {
-        "domain_suffix": [".cn"],
-        "server": "local-dns"
-      }
+      { "domain_suffix": [".cn"], "server": "local-dns" }
     ],
     "final": "proxy-dns",
     "strategy": "ipv4_only"
@@ -1170,27 +1162,15 @@ OUTBOUND
   "inbounds": [
     {
       "type": "tun",
-      "tag": "tun-in",
-      "interface_name": "bui-tun",
       "address": ["172.19.0.1/30"],
-      "mtu": 1400,
       "auto_route": true,
-      "strict_route": true,
-      "stack": "mixed",
-      "sniff": true,
-      "sniff_override_destination": true
+      "strict_route": true
     },
     {
       "type": "socks",
       "tag": "socks-in",
       "listen": "127.0.0.1",
       "listen_port": ${SOCKS_PORT}
-    },
-    {
-      "type": "socks",
-      "tag": "antigravity-socks",
-      "listen": "127.0.0.1",
-      "listen_port": 54321
     },
     {
       "type": "http",
@@ -1208,23 +1188,12 @@ ${outbound_config},
   ],
   "route": {
     "rules": [
-      {
-        "protocol": "dns",
-        "action": "hijack-dns"
-      },
-      {
-        "port": [22, 2222],
-        "action": "route",
-        "outbound": "direct-out"
-      },
-      {
-        "ip_is_private": true,
-        "action": "route",
-        "outbound": "direct-out"
-      },
+      { "action": "sniff" },
+      { "protocol": "dns", "action": "hijack-dns" },
+      { "port": [22, 2222], "outbound": "direct-out" },
+      { "ip_is_private": true, "outbound": "direct-out" },
       {
         "domain_keyword": ["wechat", "weixin", "tencent", "qq", "xiaohongshu", "douyin", "bytedance", "toutiao", "kuaishou", "bilibili", "taobao", "alipay", "alibaba", "tmall", "jd", "baidu"],
-        "action": "route",
         "outbound": "direct-out"
       }
     ],
