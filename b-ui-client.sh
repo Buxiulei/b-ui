@@ -7,7 +7,7 @@
 #===============================================================================
 
 # 版本号会在安装时从 GitHub 同步更新
-SCRIPT_VERSION="3.1.0"
+SCRIPT_VERSION="3.1.1"
 
 # 注意: 不使用 set -e，因为它会导致 ((count++)) 等算术运算在变量为0时退出脚本
 
@@ -1091,6 +1091,7 @@ generate_singbox_tun_config() {
       "server": "${safe_server}",
       "server_port": ${server_port},
       "password": "${safe_password}"${hop_config},
+      "domain_resolver": "local-dns",
       "tls": {
         "enabled": true,
         "server_name": "${safe_sni}",
@@ -1108,6 +1109,7 @@ OUTBOUND
       "server_port": ${server_port},
       "uuid": "${safe_uuid}",
       "flow": "${FLOW:-xtls-rprx-vision}",
+      "domain_resolver": "local-dns",
       "tls": {
         "enabled": true,
         "server_name": "${safe_sni}",
@@ -1218,7 +1220,8 @@ ${outbound_config},
       }
     ],
     "final": "proxy-out",
-    "auto_detect_interface": true
+    "auto_detect_interface": true,
+    "default_domain_resolver": "local-dns"
   }
 }
 EOF
