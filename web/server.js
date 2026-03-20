@@ -1261,7 +1261,7 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
             if (r === "install-command") {
                 const host = req.headers.host || "localhost";
                 const key = getOrCreateInstallKey();
-                const command = `bash <(curl -fsSL -k https://${host}/install-client?key=${key})`;
+                const command = `bash <(curl -fsSL -k 'https://${host}/install-client?key=${key}')`;
                 return sendJSON(res, {
                     command,
                     key,
