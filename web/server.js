@@ -633,8 +633,10 @@ function fetchXrayUserStats() {
         for (const u of users) {
             const email = u.username;
             try {
+                // 用户名安全处理：过滤非法字符防止命令注入
+                const safeEmail = email.replace(/[^a-zA-Z0-9._@-]/g, "");
                 // 查询 uplink (上传流量)
-                const upCmd = `xray api stats --server=127.0.0.1:${CONFIG.xrayApiPort} -name "user>>>${email}>>>traffic>>>uplink" 2>/dev/null || echo "{}"`;
+                const upCmd = `xray api stats --server=127.0.0.1:${CONFIG.xrayApiPort} -name "user>>>${safeEmail}>>>traffic>>>uplink" 2>/dev/null || echo "{}"`;
                 const upResult = execSync(upCmd, { encoding: "utf8", timeout: 3000 }).trim();
                 let tx = 0;
                 try {
@@ -643,7 +645,7 @@ function fetchXrayUserStats() {
                 } catch { }
 
                 // 查询 downlink (下载流量)
-                const downCmd = `xray api stats --server=127.0.0.1:${CONFIG.xrayApiPort} -name "user>>>${email}>>>traffic>>>downlink" 2>/dev/null || echo "{}"`;
+                const downCmd = `xray api stats --server=127.0.0.1:${CONFIG.xrayApiPort} -name "user>>>${safeEmail}>>>traffic>>>downlink" 2>/dev/null || echo "{}"`;
                 const downResult = execSync(downCmd, { encoding: "utf8", timeout: 3000 }).trim();
                 let rx = 0;
                 try {
@@ -1126,6 +1128,11 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
     if (p.startsWith("/packages/")) {
         const fileName = decodeURIComponent(p.slice(10));
 
+        // 安全检查：禁止路径遍历字符
+        if (fileName.includes("..") || fileName.includes("/") || fileName.includes("\\")) {
+            return sendJSON(res, { error: "Invalid filename" }, 400);
+        }
+
         // 对于 b-ui-client.sh，优先使用根目录的版本
         let filePath;
         if (fileName === "b-ui-client.sh") {
@@ -1139,8 +1146,9 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
             filePath = path.join(PACKAGES_DIR, fileName);
         }
 
-        // 安全检查：防止路径遍历
-        if (!filePath.startsWith(BASE_DIR)) {
+        // 安全检查：确保路径在 BASE_DIR 内
+        const resolvedPath = path.resolve(filePath);
+        if (!resolvedPath.startsWith(path.resolve(BASE_DIR))) {
             return sendJSON(res, { error: "Invalid path" }, 400);
         }
 
