@@ -1144,8 +1144,9 @@ OUTBOUND
     "servers": [
       {
         "tag": "proxy-dns",
-        "type": "tls",
-        "server": "8.8.8.8"
+        "type": "udp",
+        "server": "8.8.8.8",
+        "detour": "proxy-out"
       },
       {
         "tag": "local-dns",
