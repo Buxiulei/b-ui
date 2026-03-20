@@ -7,7 +7,7 @@
 #===============================================================================
 
 # 版本号会在安装时从 GitHub 同步更新
-SCRIPT_VERSION="2.16.2"
+SCRIPT_VERSION="3.0.0"
 
 # 注意: 不使用 set -e，因为它会导致 ((count++)) 等算术运算在变量为0时退出脚本
 
@@ -1429,6 +1429,29 @@ stop_tun_mode() {
 #===============================================================================
 
 
+# 安全导入 URI 解析结果（替代 eval，防止命令注入）
+safe_import_parsed() {
+    local parsed="$1"
+    # 白名单验证：只允许已知的变量名
+    local allowed_vars="PROTOCOL SERVER_ADDR AUTH_PASSWORD SNI INSECURE MPORT REMARK UUID SECURITY FINGERPRINT PUBLIC_KEY SHORT_ID FLOW NETWORK"
+    
+    while IFS='=' read -r key value; do
+        [[ -z "$key" || "$key" =~ ^# ]] && continue
+        # 检查变量名是否在白名单中
+        local allowed=false
+        for var in $allowed_vars; do
+            if [[ "$key" == "$var" ]]; then
+                allowed=true
+                break
+            fi
+        done
+        if [[ "$allowed" == "true" ]]; then
+            # 使用 printf %q 确保值被正确转义
+            printf -v "$key" '%s' "$value"
+        fi
+    done <<< "$parsed"
+}
+
 parse_hysteria_uri() {
     local uri="$1"
     
@@ -1852,7 +1875,7 @@ import_batch() {
         fi
         
         # 导入解析结果
-        eval "$parsed"
+        safe_import_parsed "$parsed"
         
         # 使用备注名或生成配置名
         local config_name="${REMARK:-config-$(date +%s)}"
@@ -1935,7 +1958,7 @@ _configure_and_save() {
         parsed=$(parse_vless_uri "$uri")
     fi
     
-    eval "$parsed"
+    safe_import_parsed "$parsed"
     
     mkdir -p "$BASE_DIR"
     mkdir -p "$config_dir"
@@ -2197,7 +2220,7 @@ import_from_uri() {
     fi
     
     # 导入解析结果
-    eval "$parsed"
+    safe_import_parsed "$parsed"
     
     echo ""
     print_success "解析成功！"
@@ -3347,90 +3370,172 @@ uninstall() {
 }
 
 #===============================================================================
-# 主菜单
+# 统一导入节点（自动识别：链接 / 批量 / 订阅）
 #===============================================================================
 
-show_menu() {
+import_node() {
     echo ""
-    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║${NC}              ${GREEN}B-UI 客户端 操作菜单${NC}                            ${CYAN}║${NC}"
-    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}1.${NC} ${GREEN}从链接导入配置${NC} (Hysteria2 / VLESS-Reality)           ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}2.${NC} ${GREEN}批量导入配置${NC}                                         ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}3.${NC} ${GREEN}配置管理${NC} (列表/切换/删除)                             ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}4.${NC} 手动配置 Hysteria2                                     ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}15.${NC} ${GREEN}📦 导入订阅${NC} (Hy2+VLESS 自动切换)                     ${CYAN}║${NC}"
-    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}5.${NC} 启动/停止服务                                          ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}6.${NC} 重启服务                                               ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}7.${NC} 查看日志                                               ${CYAN}║${NC}"
-    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}8.${NC} ${GREEN}TUN 模式开关${NC} (全局透明代理 via sing-box)           ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}9.${NC} 编辑路由规则                                           ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}10.${NC} 测试代理连接                                          ${CYAN}║${NC}"
-    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}11.${NC} 更新内核 (Hysteria2/Xray/sing-box)                    ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}12.${NC} 开机自启动设置                                        ${CYAN}║${NC}"
-    # 显示更新客户端选项，如果有新版本则高亮显示
-    if [[ "$UPDATE_AVAILABLE" == "true" ]]; then
-        echo -e "${CYAN}║${NC}  ${YELLOW}14.${NC} ${GREEN}⬆ 更新客户端${NC} ${RED}(有新版本 v${REMOTE_VERSION})${NC}               ${CYAN}║${NC}"
-    else
-        echo -e "${CYAN}║${NC}  ${YELLOW}14.${NC} 检查/更新客户端                                      ${CYAN}║${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}📥 导入节点${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "支持以下输入（自动识别）:"
+    echo -e "  ${YELLOW}• 协议链接${NC}  hysteria2://... 或 vless://..."
+    echo -e "  ${YELLOW}• 订阅地址${NC}  https://... (自动识别)"
+    echo -e "  ${YELLOW}• 批量粘贴${NC}  每行一个链接，空行结束"
+    echo -e "  ${YELLOW}• 输入 m${NC}    手动配置 Hysteria2"
+    echo ""
+    echo -e "${YELLOW}请粘贴链接 (空行结束):${NC}"
+    echo ""
+    
+    local lines=()
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && break
+        line=$(echo "$line" | xargs)
+        [[ -n "$line" ]] && lines+=("$line")
+    done
+    
+    if [[ ${#lines[@]} -eq 0 ]]; then
+        print_warning "没有输入任何内容"
+        return 1
     fi
-    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}13.${NC} ${RED}卸载${NC}                                                 ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}0.${NC} 退出                                                   ${CYAN}║${NC}"
-    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
+    
+    local first="${lines[0]}"
+    
+    # 手动配置快捷键
+    if [[ ${#lines[@]} -eq 1 && ( "$first" == "m" || "$first" == "M" ) ]]; then
+        quick_install
+        return $?
+    fi
+    
+    # 自动识别订阅地址 (https:// 开头)
+    if [[ ${#lines[@]} -eq 1 && "$first" =~ ^https?:// ]]; then
+        print_info "检测到订阅地址，进入订阅导入..."
+        import_from_subscription "$first"
+        return $?
+    fi
+    
+    # 收集所有有效 URI
+    local uris=()
+    for line in "${lines[@]}"; do
+        [[ "$line" =~ ^# ]] && continue
+        if [[ "$line" =~ ^(hysteria2|hy2|vless):// ]]; then
+            uris+=("$line")
+        elif [[ "$line" =~ ^https?:// ]]; then
+            # 多行粘贴中的订阅地址，提示用户
+            echo -e "  ${YELLOW}⚠${NC} 跳过订阅地址 (请单独粘贴): ${line:0:60}..."
+        else
+            echo -e "  ${YELLOW}⚠${NC} 跳过不支持的格式: ${line:0:60}..."
+        fi
+    done
+    
+    if [[ ${#uris[@]} -eq 0 ]]; then
+        print_error "没有识别到有效链接"
+        return 1
+    fi
+    
+    echo ""
+    print_info "识别到 ${#uris[@]} 个链接，开始导入..."
+    echo ""
+    
+    # 复用 import_batch 的核心逻辑：只保存元信息
+    local success_count=0
+    local fail_count=0
+    
+    for uri in "${uris[@]}"; do
+        local parsed=""
+        local protocol=""
+        
+        if [[ "$uri" =~ ^(hysteria2|hy2):// ]]; then
+            parsed=$(parse_hysteria_uri "$uri")
+            protocol="hysteria2"
+        elif [[ "$uri" =~ ^vless:// ]]; then
+            parsed=$(parse_vless_uri "$uri")
+            protocol="vless-reality"
+        fi
+        
+        if [[ -z "$parsed" ]]; then
+            echo -e "  ${RED}✗${NC} 解析失败: ${uri:0:50}..."
+            ((fail_count++))
+            continue
+        fi
+        
+        safe_import_parsed "$parsed"
+        
+        local config_name="${REMARK:-${protocol}-$(date +%s)}"
+        config_name=$(echo "$config_name" | sed 's/[\/\\:*?"<>|]/-/g')
+        
+        # 已存在则跳过
+        if [[ -d "${CONFIGS_DIR}/${config_name}" ]]; then
+            echo -e "  ${YELLOW}○${NC} 已存在: ${config_name} (跳过)"
+            continue
+        fi
+        
+        # 保存配置元信息和原始 URI
+        save_config_meta "$config_name" "$protocol" "$SERVER_ADDR" "$uri"
+        
+        echo -e "  ${GREEN}✓${NC} ${config_name} (${protocol})"
+        ((success_count++))
+    done
+    
+    echo ""
+    echo -e "导入完成: ${GREEN}${success_count} 成功${NC}  ${RED}${fail_count} 失败${NC}"
+    
+    if [[ $success_count -gt 0 ]]; then
+        echo ""
+        read -p "是否现在选择一个配置并启用? (y/n): " activate
+        if [[ "$activate" =~ ^[yY]$ ]]; then
+            activate_imported_config
+        fi
+    fi
 }
 
-main() {
-    check_root
-    check_os
-    
-    # 只在首次运行时检测依赖 (核心未安装时)
-    if ! command -v hysteria &> /dev/null || ! command -v xray &> /dev/null || ! command -v sing-box &> /dev/null; then
-        check_dependencies
-    fi
-    
-    # 后台检查客户端更新 (静默检查，不阻塞启动)
-    check_client_update &>/dev/null &
-    
+#===============================================================================
+# 子菜单：服务控制
+#===============================================================================
+
+service_control_menu() {
     while true; do
-        print_banner
-        show_status
-        show_menu
-        read -p "请选择 [0-15]: " choice
+        local hy_status xray_status tun_status
+        systemctl is-active --quiet "$CLIENT_SERVICE" 2>/dev/null && hy_status="${GREEN}运行中${NC}" || hy_status="${RED}已停止${NC}"
+        systemctl is-active --quiet xray-client 2>/dev/null && xray_status="${GREEN}运行中${NC}" || xray_status="${RED}已停止${NC}"
+        systemctl is-active --quiet bui-tun 2>/dev/null && tun_status="${GREEN}运行中${NC}" || tun_status="${YELLOW}未启用${NC}"
         
-        case $choice in
-            1) import_from_uri ;;
-            2) import_batch ;;
-            3) config_management ;;
-            4) quick_install ;;
-            5) 
-                # 启动/停止
-                if systemctl is-active --quiet "$CLIENT_SERVICE" 2>/dev/null; then
-                    systemctl stop "$CLIENT_SERVICE"
-                    systemctl stop xray-client 2>/dev/null || true
-                    print_success "服务已停止"
-                else
-                    systemctl start "$CLIENT_SERVICE" 2>/dev/null || true
-                    systemctl start xray-client 2>/dev/null || true
-                    print_success "服务已启动"
-                fi
+        echo ""
+        echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${CYAN}║${NC}  ${GREEN}▶ 服务控制${NC}                                                ${CYAN}║${NC}"
+        echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
+        echo -e "${CYAN}║${NC}  Hysteria2: ${hy_status}   Xray: ${xray_status}   TUN: ${tun_status}    ${CYAN}║${NC}"
+        echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
+        echo -e "${CYAN}║${NC}  ${YELLOW}1.${NC} 启动所有服务                                          ${CYAN}║${NC}"
+        echo -e "${CYAN}║${NC}  ${YELLOW}2.${NC} 停止所有服务                                          ${CYAN}║${NC}"
+        echo -e "${CYAN}║${NC}  ${YELLOW}3.${NC} 重启所有服务                                          ${CYAN}║${NC}"
+        echo -e "${CYAN}║${NC}  ${YELLOW}4.${NC} 查看日志                                              ${CYAN}║${NC}"
+        echo -e "${CYAN}║${NC}  ${YELLOW}0.${NC} 返回主菜单                                            ${CYAN}║${NC}"
+        echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
+        read -p "请选择 [0-4]: " sub
+        case $sub in
+            1)
+                systemctl start "$CLIENT_SERVICE" 2>/dev/null || true
+                systemctl start xray-client 2>/dev/null || true
+                print_success "服务已启动"
                 ;;
-            6) 
-                # 重启
+            2)
+                systemctl stop "$CLIENT_SERVICE" 2>/dev/null || true
+                systemctl stop xray-client 2>/dev/null || true
+                print_success "服务已停止"
+                ;;
+            3)
                 systemctl restart "$CLIENT_SERVICE" 2>/dev/null || true
                 systemctl restart xray-client 2>/dev/null || true
                 print_success "服务已重启"
                 ;;
-            7) 
-                # 查看日志
+            4)
                 echo ""
-                echo -e "${YELLOW}选择日志类型:${NC}"
+                echo -e "${YELLOW}选择日志:${NC}"
                 echo "  1. Hysteria2"
                 echo "  2. Xray"
-                echo "  3. TUN 模式 (sing-box)"
+                echo "  3. TUN (sing-box)"
                 read -p "请选择 [1-3]: " log_choice
                 case $log_choice in
                     1) journalctl -u "$CLIENT_SERVICE" --no-pager -n 30 ;;
@@ -3439,40 +3544,161 @@ main() {
                     *) print_error "无效选项" ;;
                 esac
                 ;;
-            8) toggle_tun ;;
-            9) edit_rules ;;
-            10) test_proxy ;;
-            11) 
-                # 更新内核
+            0) return ;;
+            *) print_error "无效选项" ;;
+        esac
+        echo ""
+        read -p "按 Enter 继续..."
+    done
+}
+
+#===============================================================================
+# 统一更新（合并内核更新 + 客户端更新）
+#===============================================================================
+
+update_all() {
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}⬆ 组件版本检查${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    
+    local has_update=false
+    
+    echo -e "${CYAN}[客户端]${NC}"
+    if [[ "$UPDATE_AVAILABLE" == "true" ]]; then
+        echo -e "  本地: ${YELLOW}v${SCRIPT_VERSION}${NC}  最新: ${GREEN}v${REMOTE_VERSION}${NC}  ${RED}⬆ 可更新${NC}"
+        has_update=true
+    else
+        print_info "检查更新中..."
+        if check_client_update; then
+            echo -e "  本地: ${YELLOW}v${SCRIPT_VERSION}${NC}  最新: ${GREEN}v${REMOTE_VERSION}${NC}  ${RED}⬆ 可更新${NC}"
+            has_update=true
+        else
+            echo -e "  版本: ${GREEN}v${SCRIPT_VERSION}${NC}  ✓ 最新"
+        fi
+    fi
+    
+    load_server_address
+    local server_versions=""
+    if [[ -n "$SERVER_ADDRESS" ]]; then
+        server_versions=$(curl -fsSL --max-time 5 -k "https://${SERVER_ADDRESS}/api/kernel-versions" 2>/dev/null || echo "")
+    fi
+    
+    _jval() { echo "$1" | grep -oP "\"$2\"\s*:\s*\"\K[^\"]+" 2>/dev/null | head -1; }
+    _newer() { printf '%s\n' "$1" "$2" | sort -V | tail -n1; }
+    
+    local sv_hy=$(_jval "$server_versions" "hysteria2")
+    local sv_xray=$(_jval "$server_versions" "xray")
+    local sv_sb=$(_jval "$server_versions" "singbox")
+    
+    if command -v hysteria &> /dev/null; then
+        local local_hy=$(hysteria version 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/^v//' || echo "")
+        local gh_hy=$(curl -fsSL --max-time 10 "https://api.github.com/repos/apernet/hysteria/releases/latest" 2>/dev/null \
+            | grep '"tag_name"' | sed -E 's/.*"tag_name":\s*"app\/v?([^"]+)".*/\1/')
+        [[ -z "$gh_hy" ]] && gh_hy=$(curl -fsSL --max-time 10 "https://api.github.com/repos/apernet/hysteria/releases/latest" 2>/dev/null \
+            | grep '"tag_name"' | sed -E 's/.*"v?([0-9][^"]+)".*/\1/')
+        local best_hy=$(_newer "${sv_hy:-0}" "${gh_hy:-0}")
+        [[ "$best_hy" == "0" ]] && best_hy=""
+        echo ""
+        echo -e "${CYAN}[Hysteria2]${NC}"
+        if [[ -n "$local_hy" && -n "$best_hy" ]]; then
+            if [[ "$local_hy" == "$best_hy" ]]; then
+                echo -e "  版本: ${GREEN}v${local_hy}${NC}  ✓ 最新"
+            else
+                echo -e "  本地: ${YELLOW}v${local_hy}${NC}  最新: ${GREEN}v${best_hy}${NC}  ${RED}⬆ 可更新${NC}"
+                has_update=true
+            fi
+        fi
+    fi
+    
+    if command -v xray &> /dev/null; then
+        local local_xray=$(xray version 2>/dev/null | head -n1 | awk '{print $2}' | sed 's/^v//' || echo "")
+        local gh_xray=$(curl -fsSL --max-time 10 "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null \
+            | grep '"tag_name"' | sed -E 's/.*"v?([0-9][^"]+)".*/\1/')
+        local best_xray=$(_newer "${sv_xray:-0}" "${gh_xray:-0}")
+        [[ "$best_xray" == "0" ]] && best_xray=""
+        echo ""
+        echo -e "${CYAN}[Xray]${NC}"
+        if [[ -n "$local_xray" && -n "$best_xray" ]]; then
+            if [[ "$local_xray" == "$best_xray" ]]; then
+                echo -e "  版本: ${GREEN}v${local_xray}${NC}  ✓ 最新"
+            else
+                echo -e "  本地: ${YELLOW}v${local_xray}${NC}  最新: ${GREEN}v${best_xray}${NC}  ${RED}⬆ 可更新${NC}"
+                has_update=true
+            fi
+        fi
+    fi
+    
+    if command -v sing-box &> /dev/null; then
+        local local_sb=$(sing-box version 2>/dev/null | head -n1 | awk '{print $3}' | sed 's/^v//' || echo "")
+        local gh_sb=$(curl -fsSL --max-time 10 "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null \
+            | grep '"tag_name"' | sed -E 's/.*"v?([0-9][^"]+)".*/\1/')
+        local best_sb=$(_newer "${sv_sb:-0}" "${gh_sb:-0}")
+        [[ "$best_sb" == "0" ]] && best_sb=""
+        echo ""
+        echo -e "${CYAN}[sing-box]${NC}"
+        if [[ -n "$local_sb" && -n "$best_sb" ]]; then
+            if [[ "$local_sb" == "$best_sb" ]]; then
+                echo -e "  版本: ${GREEN}v${local_sb}${NC}  ✓ 最新"
+            else
+                echo -e "  本地: ${YELLOW}v${local_sb}${NC}  最新: ${GREEN}v${best_sb}${NC}  ${RED}⬆ 可更新${NC}"
+                has_update=true
+            fi
+        fi
+    fi
+    
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    
+    if [[ "$has_update" == "true" ]]; then
+        read -p "发现可更新项，是否立即全部更新? (y/n): " confirm
+        if [[ "$confirm" =~ ^[yY]$ ]]; then
+            if [[ "$UPDATE_AVAILABLE" == "true" ]]; then
+                print_info "更新客户端脚本..."
+                do_client_update
+            fi
+            if [[ -n "${best_hy:-}" && -n "${local_hy:-}" && "$local_hy" != "$best_hy" ]]; then
                 print_info "更新 Hysteria2..."
-                local old_hy=$(hysteria version 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "未知")
                 HYSTERIA_USER=root bash <(curl -fsSL https://get.hy2.sh/)
-                local new_hy=$(hysteria version 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "未知")
-                echo -e "  Hysteria2: ${YELLOW}${old_hy}${NC} -> ${GREEN}${new_hy}${NC}"
-                
-                if command -v xray &> /dev/null; then
-                    print_info "更新 Xray..."
-                    local old_xray=$(xray version 2>/dev/null | head -n1 | awk '{print $2}' || echo "未知")
-                    bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
-                    local new_xray=$(xray version 2>/dev/null | head -n1 | awk '{print $2}' || echo "未知")
-                    echo -e "  Xray: ${YELLOW}${old_xray}${NC} -> ${GREEN}${new_xray}${NC}"
+            fi
+            if [[ -n "${best_xray:-}" && -n "${local_xray:-}" && "$local_xray" != "$best_xray" ]]; then
+                print_info "更新 Xray..."
+                bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+            fi
+            if [[ -n "${best_sb:-}" && -n "${local_sb:-}" && "$local_sb" != "$best_sb" ]]; then
+                print_info "更新 sing-box..."
+                if [[ "${PKG_MANAGER:-}" == "apt" ]]; then
+                    apt-get update -qq && apt-get install -y -qq sing-box
+                else
+                    bash <(curl -fsSL https://sing-box.app/install.sh)
                 fi
-                
-                if command -v sing-box &> /dev/null; then
-                    print_info "更新 sing-box..."
-                    local old_sb=$(sing-box version 2>/dev/null | head -n1 | awk '{print $3}' || echo "未知")
-                    if [[ "$PKG_MANAGER" == "apt" ]]; then
-                        apt-get update -qq && apt-get install -y -qq sing-box
-                    else
-                        bash <(curl -fsSL https://sing-box.app/install.sh)
-                    fi
-                    local new_sb=$(sing-box version 2>/dev/null | head -n1 | awk '{print $3}' || echo "未知")
-                    echo -e "  sing-box: ${YELLOW}${old_sb}${NC} -> ${GREEN}${new_sb}${NC}"
-                fi
-                print_success "内核更新完成"
-                ;;
-            12)
-                # 开机自启动
+            fi
+            echo ""
+            print_success "更新完成！"
+        fi
+    else
+        print_success "所有组件均为最新版本"
+    fi
+}
+
+#===============================================================================
+# 子菜单：高级设置
+#===============================================================================
+
+advanced_settings_menu() {
+    while true; do
+        echo ""
+        echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${CYAN}║${NC}              ${GREEN}⚙ 高级设置${NC}                                     ${CYAN}║${NC}"
+        echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
+        echo -e "${CYAN}║${NC}  ${YELLOW}1.${NC} 开机自启动管理                                        ${CYAN}║${NC}"
+        echo -e "${CYAN}║${NC}  ${YELLOW}2.${NC} 编辑路由规则                                          ${CYAN}║${NC}"
+        echo -e "${CYAN}║${NC}  ${YELLOW}0.${NC} 返回主菜单                                            ${CYAN}║${NC}"
+        echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
+        read -p "请选择 [0-2]: " sub
+        case $sub in
+            1)
                 echo ""
                 echo -e "${YELLOW}[当前自启动状态]${NC}"
                 local hy_auto=$(systemctl is-enabled "$CLIENT_SERVICE" 2>/dev/null || echo "disabled")
@@ -3495,7 +3721,6 @@ main() {
                 else
                     read -p "开启所有开机自启动? (y/n): " enable
                     if [[ "$enable" =~ ^[yY]$ ]]; then
-                        # 只启用已配置的服务
                         [[ -f /etc/systemd/system/$CLIENT_SERVICE ]] && systemctl enable "$CLIENT_SERVICE" 2>/dev/null
                         [[ -f /etc/systemd/system/xray-client.service ]] && systemctl enable xray-client 2>/dev/null
                         [[ -f /etc/systemd/system/bui-tun.service ]] && systemctl enable bui-tun 2>/dev/null
@@ -3503,30 +3728,68 @@ main() {
                     fi
                 fi
                 ;;
-            13) uninstall ;;
-            14) 
-                # 更新客户端
-                echo ""
-                if [[ "$UPDATE_AVAILABLE" == "true" ]]; then
-                    echo -e "发现新版本: ${YELLOW}v${SCRIPT_VERSION}${NC} -> ${GREEN}v${REMOTE_VERSION}${NC}"
-                    read -p "是否立即更新? (y/n): " confirm
-                    if [[ "$confirm" =~ ^[yY]$ ]]; then
-                        do_client_update
-                    fi
-                else
-                    print_info "检查更新中..."
-                    if check_client_update; then
-                        echo -e "发现新版本: ${YELLOW}v${SCRIPT_VERSION}${NC} -> ${GREEN}v${REMOTE_VERSION}${NC}"
-                        read -p "是否立即更新? (y/n): " confirm
-                        if [[ "$confirm" =~ ^[yY]$ ]]; then
-                            do_client_update
-                        fi
-                    else
-                        print_success "已是最新版本 (v${SCRIPT_VERSION})"
-                    fi
-                fi
-                ;;
-            15) import_from_subscription ;;
+            2) edit_rules ;;
+            0) return ;;
+            *) print_error "无效选项" ;;
+        esac
+        echo ""
+        read -p "按 Enter 继续..."
+    done
+}
+
+#===============================================================================
+# 主菜单（精简版 — 8 项）
+#===============================================================================
+
+show_menu() {
+    echo ""
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║${NC}              ${GREEN}B-UI 客户端 操作菜单${NC}                            ${CYAN}║${NC}"
+    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}1.${NC} ${GREEN}📥 导入节点${NC} (直接粘贴链接即可)                       ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}2.${NC} ${GREEN}📋 节点管理${NC} (列表/切换/删除)                         ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}3.${NC} ${GREEN}▶ 服务控制${NC} (启动/停止/重启/日志)                     ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}4.${NC} ${GREEN}🌐 TUN 全局代理${NC} (开启/关闭)                         ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}5.${NC} 🔍 连接测试                                            ${CYAN}║${NC}"
+    if [[ "$UPDATE_AVAILABLE" == "true" ]]; then
+        echo -e "${CYAN}║${NC}  ${YELLOW}6.${NC} ${GREEN}⬆ 一键更新${NC} ${RED}(有新版本!)${NC}                              ${CYAN}║${NC}"
+    else
+        echo -e "${CYAN}║${NC}  ${YELLOW}6.${NC} ⬆ 一键更新 (内核+客户端)                              ${CYAN}║${NC}"
+    fi
+    echo -e "${CYAN}║${NC}  ${YELLOW}7.${NC} ⚙ 高级设置 (自启动/路由规则)                           ${CYAN}║${NC}"
+    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}8.${NC} ${RED}🗑 卸载${NC}                                                ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${YELLOW}0.${NC} 退出                                                   ${CYAN}║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
+}
+
+main() {
+    check_root
+    check_os
+    
+    # 只在首次运行时检测依赖 (核心未安装时)
+    if ! command -v hysteria &> /dev/null || ! command -v xray &> /dev/null || ! command -v sing-box &> /dev/null; then
+        check_dependencies
+    fi
+    
+    # 后台检查客户端更新 (静默检查，不阻塞启动)
+    check_client_update &>/dev/null &
+    
+    while true; do
+        print_banner
+        show_status
+        show_menu
+        read -p "请选择 [0-8]: " choice
+        
+        case $choice in
+            1) import_node ;;
+            2) config_management ;;
+            3) service_control_menu ;;
+            4) toggle_tun ;;
+            5) test_proxy ;;
+            6) update_all ;;
+            7) advanced_settings_menu ;;
+            8) uninstall ;;
             0) echo ""; print_info "再见！"; exit 0 ;;
             *) print_error "无效选项" ;;
         esac
@@ -3535,6 +3798,8 @@ main() {
         read -p "按 Enter 继续..."
     done
 }
+
+
 
 #===============================================================================
 # 创建全局命令
@@ -3594,7 +3859,118 @@ create_global_command() {
 }
 
 
+#===============================================================================
+# 客户端静默自动更新 (支持 `bui-c auto` 调用)
+# 包含：客户端脚本更新 + 内核更新
+#===============================================================================
 
+auto_update_all() {
+    local LOG_FILE="/var/log/bui-c-auto-update.log"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 开始自动检查更新..." >> "$LOG_FILE"
+    
+    load_server_address
+    
+    # 1. 检查客户端脚本更新
+    check_client_update > /dev/null 2>&1
+    if [[ "$UPDATE_AVAILABLE" == "true" ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] 客户端: v${SCRIPT_VERSION} -> v${REMOTE_VERSION}, 更新中..." >> "$LOG_FILE"
+        do_client_update >> "$LOG_FILE" 2>&1 || true
+    else
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] 客户端已是最新: v${SCRIPT_VERSION}" >> "$LOG_FILE"
+    fi
+    
+    # 2. 检查内核更新 (服务端优先)
+    local server_versions=""
+    if [[ -n "$SERVER_ADDRESS" ]]; then
+        server_versions=$(curl -fsSL --max-time 5 -k "https://${SERVER_ADDRESS}/api/kernel-versions" 2>/dev/null || echo "")
+    fi
+    
+    # 辅助函数
+    _jval() { echo "$1" | grep -oP "\"$2\"\\s*:\\s*\"\\K[^\"]+" 2>/dev/null | head -1; }
+    _newer() { printf '%s\n' "$1" "$2" | sort -V | tail -n1; }
+    _is_newer() {
+        local lv="$1" rv="$2"
+        [[ -z "$rv" || "$lv" == "$rv" ]] && return 1
+        [[ "$(_newer "$lv" "$rv")" == "$rv" ]] && return 0
+        return 1
+    }
+    
+    local sv_hy=$(_jval "$server_versions" "hysteria2")
+    local sv_xray=$(_jval "$server_versions" "xray")
+    local sv_sb=$(_jval "$server_versions" "singbox")
+    
+    # Hysteria2
+    local local_hy=$(hysteria version 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/^v//' || echo "")
+    local gh_hy=$(curl -fsSL --max-time 10 "https://api.github.com/repos/apernet/hysteria/releases/latest" 2>/dev/null \
+        | grep '"tag_name"' | sed -E 's/.*"tag_name":\s*"app\/v?([^"]+)".*/\1/')
+    [[ -z "$gh_hy" ]] && gh_hy=$(curl -fsSL --max-time 10 "https://api.github.com/repos/apernet/hysteria/releases/latest" 2>/dev/null \
+        | grep '"tag_name"' | sed -E 's/.*"v?([0-9][^"]+)".*/\1/')
+    local best_hy=$(_newer "${sv_hy:-0}" "${gh_hy:-0}")
+    [[ "$best_hy" == "0" ]] && best_hy=""
+    if [[ -n "$local_hy" && -n "$best_hy" ]] && _is_newer "$local_hy" "$best_hy"; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Hysteria2: v${local_hy} -> v${best_hy}, 更新中..." >> "$LOG_FILE"
+        HYSTERIA_USER=root bash <(curl -fsSL https://get.hy2.sh/) >> "$LOG_FILE" 2>&1 || true
+        systemctl restart "$CLIENT_SERVICE" 2>/dev/null || true
+    fi
+    
+    # Xray
+    if command -v xray &> /dev/null; then
+        local local_xray=$(xray version 2>/dev/null | head -n1 | awk '{print $2}' | sed 's/^v//' || echo "")
+        local gh_xray=$(curl -fsSL --max-time 10 "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null \
+            | grep '"tag_name"' | sed -E 's/.*"v?([0-9][^"]+)".*/\1/')
+        local best_xray=$(_newer "${sv_xray:-0}" "${gh_xray:-0}")
+        [[ "$best_xray" == "0" ]] && best_xray=""
+        if [[ -n "$local_xray" && -n "$best_xray" ]] && _is_newer "$local_xray" "$best_xray"; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Xray: v${local_xray} -> v${best_xray}, 更新中..." >> "$LOG_FILE"
+            bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install >> "$LOG_FILE" 2>&1 || true
+            systemctl restart xray-client 2>/dev/null || true
+        fi
+    fi
+    
+    # sing-box
+    if command -v sing-box &> /dev/null; then
+        local local_sb=$(sing-box version 2>/dev/null | head -n1 | awk '{print $3}' | sed 's/^v//' || echo "")
+        local gh_sb=$(curl -fsSL --max-time 10 "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null \
+            | grep '"tag_name"' | sed -E 's/.*"v?([0-9][^"]+)".*/\1/')
+        local best_sb=$(_newer "${sv_sb:-0}" "${gh_sb:-0}")
+        [[ "$best_sb" == "0" ]] && best_sb=""
+        if [[ -n "$local_sb" && -n "$best_sb" ]] && _is_newer "$local_sb" "$best_sb"; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] sing-box: v${local_sb} -> v${best_sb}, 更新中..." >> "$LOG_FILE"
+            if command -v apt-get &> /dev/null; then
+                apt-get update -qq && apt-get install -y -qq sing-box >> "$LOG_FILE" 2>&1 || true
+            else
+                bash <(curl -fsSL https://sing-box.app/install.sh) >> "$LOG_FILE" 2>&1 || true
+            fi
+        fi
+    fi
+    
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 自动检查完成" >> "$LOG_FILE"
+}
+
+#===============================================================================
+# 确保客户端定时任务
+#===============================================================================
+
+ensure_client_cron() {
+    if ! command -v crontab &> /dev/null; then
+        return
+    fi
+    
+    local current_cron
+    current_cron=$(crontab -l 2>/dev/null || echo "")
+    
+    if ! echo "$current_cron" | grep -q "bui-c auto"; then
+        # 移除旧的 bui-c 相关条目
+        local new_cron
+        new_cron=$(echo "$current_cron" | grep -v "bui-c" | grep -v "BUI-C 定时" || echo "")
+        
+        new_cron="${new_cron}
+# === BUI-C 定时任务 ===
+0 */6 * * * /usr/local/bin/bui-c auto >> /var/log/bui-c-auto-update.log 2>&1"
+        
+        echo "$new_cron" | sed '/^$/d' | crontab -
+    fi
+}
 
 # 首次运行检测 - 安装所有核心和创建全局命令
 first_run_setup() {
@@ -3630,9 +4006,20 @@ first_run_setup() {
             fi
         fi
     fi
+    
+    # 确保定时任务存在
+    ensure_client_cron
 }
 
 # 入口
-first_run_setup
-main "$@"
-
+case "${1:-}" in
+    auto)
+        # 静默自动更新模式 (用于 cron)
+        auto_update_all
+        ;;
+    *)
+        # 交互模式
+        first_run_setup
+        main "$@"
+        ;;
+esac

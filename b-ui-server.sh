@@ -7,7 +7,7 @@
 # 版本: 2.3.0
 #===============================================================================
 
-SCRIPT_VERSION="2.3.0"
+SCRIPT_VERSION="3.0.0"
 
 set -e
 
@@ -523,7 +523,7 @@ configure_hysteria() {
 [{"username":"${FIRST_USER}","password":"${FIRST_USER_PASS}","createdAt":"$(date -Iseconds)"}]
 EOF
     
-    # 生成配置文件 (使用 certbot 证书，因为 Nginx 已占用 443)
+    # 生成配置文件 — 使用 HTTP 认证模式（与 core.sh 保持一致）
     cat > "$CONFIG_FILE" << EOF
 # Hysteria2 服务器配置
 # 生成时间: $(date)
@@ -536,11 +536,12 @@ tls:
   cert: /etc/letsencrypt/live/${DOMAIN}/fullchain.pem
   key: /etc/letsencrypt/live/${DOMAIN}/privkey.pem
 
-# 多用户认证
+# HTTP 认证 (由管理面板 server.js 处理)
 auth:
-  type: userpass
-  userpass:
-    ${FIRST_USER}: ${FIRST_USER_PASS}
+  type: http
+  http:
+    url: http://127.0.0.1:${ADMIN_PORT}/auth/hysteria
+    insecure: true
 
 # 流量统计 API
 trafficStats:
@@ -868,703 +869,58 @@ install_chinese_fonts() {
 # Web 管理面板部署
 #===============================================================================
 
+GITHUB_RAW="https://raw.githubusercontent.com/Buxiulei/b-ui/main"
+GITHUB_CDN="https://cdn.jsdelivr.net/gh/Buxiulei/b-ui@main"
+
+# 从 GitHub 下载文件（带 CDN 回退）
+download_from_github() {
+    local path="$1"  # 相对路径，如 web/server.js
+    local dest="$2"  # 目标路径
+    
+    if curl -fsSL --max-time 30 "${GITHUB_RAW}/${path}" -o "$dest" 2>/dev/null; then
+        return 0
+    fi
+    
+    if curl -fsSL --max-time 30 "${GITHUB_CDN}/${path}" -o "$dest" 2>/dev/null; then
+        return 0
+    fi
+    
+    print_error "下载失败: ${path}"
+    return 1
+}
+
 deploy_admin_panel() {
-    print_info "部署 Web 管理面板 (Redesigned UI)..."
+    print_info "部署 Web 管理面板..."
     
     mkdir -p "$ADMIN_DIR"
     
     # 创建 package.json
     cat > "$ADMIN_DIR/package.json" << 'PKGEOF'
-{"name":"hysteria2-admin","version":"2.0.0","main":"server.js","scripts":{"start":"node server.js"}}
+{"name":"b-ui-admin","version":"2.0.0","main":"server.js","scripts":{"start":"node server.js"}}
 PKGEOF
 
-    # 创建 server.js (内嵌)
-    # 创建 server.js (内嵌完整版 - 支持 Hysteria2 + VLESS-Reality)
-    cat > "$ADMIN_DIR/server.js" << 'SERVEREOF'
-const http=require("http"),fs=require("fs"),crypto=require("crypto"),{execSync,exec}=require("child_process");
-const VERSION="2.3.0";
-const CONFIG={port:process.env.ADMIN_PORT||8080,adminPassword:process.env.ADMIN_PASSWORD||"admin123",
-jwtSecret:process.env.JWT_SECRET||crypto.randomBytes(32).toString("hex"),
-hysteriaConfig:process.env.HYSTERIA_CONFIG||"/opt/hysteria/config.yaml",
-xrayConfig:process.env.XRAY_CONFIG||"/opt/hysteria/xray-config.json",
-xrayKeysFile:process.env.XRAY_KEYS||"/opt/hysteria/reality-keys.json",
-usersFile:process.env.USERS_FILE||"/opt/hysteria/users.json",trafficPort:9999,xrayApiPort:10085};
-
-// --- Security: Rate Limiting & Audit ---
-const loginAttempts={};const RATE_LIMIT={maxAttempts:5,windowMs:300000};
-function checkRateLimit(ip){const now=Date.now(),rec=loginAttempts[ip];if(!rec)return true;if(now-rec.first>RATE_LIMIT.windowMs){delete loginAttempts[ip];return true}return rec.count<RATE_LIMIT.maxAttempts}
-function recordAttempt(ip,success){const now=Date.now(),rec=loginAttempts[ip];if(!rec)loginAttempts[ip]={first:now,count:1};else rec.count++;if(success)delete loginAttempts[ip];log("AUDIT",ip+" login "+(success?"SUCCESS":"FAILED")+" (attempts: "+(loginAttempts[ip]?.count||0)+")")}
-function getClientIP(req){return req.headers["x-forwarded-for"]?.split(",")[0].trim()||req.socket.remoteAddress||"unknown"}
-
-// --- Backend Logic ---
-function log(l,m){console.log("["+new Date().toISOString()+"] ["+l+"] "+m)}
-function genToken(d){const p=Buffer.from(JSON.stringify({...d,exp:Date.now()+864e5,iat:Date.now()})).toString("base64");
-return p+"."+crypto.createHmac("sha256",CONFIG.jwtSecret).update(p).digest("hex")}
-function verifyToken(t){try{const[p,s]=t.split(".");if(s!==crypto.createHmac("sha256",CONFIG.jwtSecret).update(p).digest("hex"))return null;
-const d=JSON.parse(Buffer.from(p,"base64").toString());return d.exp<Date.now()?null:d}catch{return null}}
-function parseBody(r){return new Promise(s=>{let b="";r.on("data",c=>b+=c);r.on("end",()=>{try{s(b?JSON.parse(b):{})}catch{s({})}})})}
-function sendJSON(r,d,s=200,headers={}){r.writeHead(s,{"Content-Type":"application/json","Access-Control-Allow-Origin":"*","Access-Control-Allow-Methods":"*","Access-Control-Allow-Headers":"*",...headers});r.end(JSON.stringify(d))}
-function loadUsers(){try{return fs.existsSync(CONFIG.usersFile)?JSON.parse(fs.readFileSync(CONFIG.usersFile,"utf8")):[]}catch{return[]}}
-function saveUsers(u){try{fs.writeFileSync(CONFIG.usersFile,JSON.stringify(u,null,2));updateHysteriaConfig(u.filter(x=>!x.protocol||x.protocol==="hysteria2"));updateXrayConfig(u.filter(x=>x.protocol==="vless-reality"),u.filter(x=>x.protocol==="vless-ws-tls"));return true}catch{return false}}
-function updateHysteriaConfig(users){try{let c=fs.readFileSync(CONFIG.hysteriaConfig,"utf8");
-const up=users.reduce((a,u)=>{a[u.username]=u.password;return a},{});
-const auth="auth:\n  type: userpass\n  userpass:\n"+Object.entries(up).map(([u,p])=>"    "+u+": "+p).join("\n");
-c=c.replace(/auth:[\s\S]*?(?=\n[a-zA-Z]|$)/,auth+"\n\n");
-fs.writeFileSync(CONFIG.hysteriaConfig,c);execSync("systemctl restart hysteria-server",{stdio:"pipe"})}catch(e){log("ERROR","Hysteria: "+e.message)}}
-function updateXrayConfig(realityUsers,wsUsers=[]){try{if(!fs.existsSync(CONFIG.xrayConfig))return;
-let c=JSON.parse(fs.readFileSync(CONFIG.xrayConfig,"utf8"));
-// Update Reality inbound
-const realityClients=realityUsers.map(u=>({id:u.uuid,flow:"xtls-rprx-vision",email:u.username}));
-const inbound=c.inbounds.find(i=>i.tag==="vless-reality");
-if(inbound){
-  inbound.settings.clients=realityClients;
-  const userSnis=realityUsers.filter(u=>u.sni).map(u=>u.sni);
-  const baseSni=inbound.streamSettings?.realitySettings?.dest?.split(":")[0]||"www.bing.com";
-  const allSnis=[...new Set([baseSni,...userSnis])];
-  if(inbound.streamSettings?.realitySettings)inbound.streamSettings.realitySettings.serverNames=allSnis;
-}
-// Update or create WS+TLS inbound
-const wsClients=wsUsers.map(u=>({id:u.uuid,email:u.username}));
-let wsInbound=c.inbounds.find(i=>i.tag==="vless-ws-tls");
-if(wsUsers.length>0){
-  if(!wsInbound){
-    // Get domain from hysteria config for TLS cert
-    const hc=fs.readFileSync(CONFIG.hysteriaConfig,"utf8");
-    const dm=hc.match(/\/live\/([^\/]+)\/fullchain/);
-    const domain=dm?dm[1]:"localhost";
-    wsInbound={tag:"vless-ws-tls",port:10002,protocol:"vless",settings:{clients:wsClients,decryption:"none"},streamSettings:{network:"ws",security:"tls",tlsSettings:{serverName:domain,certificates:[{certificateFile:"/etc/letsencrypt/live/"+domain+"/fullchain.pem",keyFile:"/etc/letsencrypt/live/"+domain+"/privkey.pem"}]},wsSettings:{path:"/ws",headers:{}}}};
-    c.inbounds.push(wsInbound);
-  }else{
-    wsInbound.settings.clients=wsClients;
-  }
-}
-fs.writeFileSync(CONFIG.xrayConfig,JSON.stringify(c,null,2));execSync("systemctl restart xray 2>/dev/null||true",{stdio:"pipe"})}catch(e){log("ERROR","Xray: "+e.message)}}
-function getConfig(){try{let dm,pm;
-const hc=fs.readFileSync(CONFIG.hysteriaConfig,"utf8");
-dm=hc.match(/\/live\/([^\/]+)\/fullchain/);pm=hc.match(/listen:\s*:(\d+)/);
-let xrayPort=10001,pubKey="",shortId="",sni="www.bing.com";
-try{const xc=JSON.parse(fs.readFileSync(CONFIG.xrayConfig,"utf8"));const xi=xc.inbounds.find(i=>i.tag==="vless-reality");if(xi){xrayPort=xi.port;
-const dest=xi.streamSettings?.realitySettings?.dest||"";sni=dest.split(":")[0]||"www.bing.com";shortId=xi.streamSettings?.realitySettings?.shortIds?.[0]||""}}catch{}
-try{const k=JSON.parse(fs.readFileSync(CONFIG.xrayKeysFile,"utf8"));pubKey=k.publicKey||"";shortId=shortId||k.shortId||""}catch{}
-return{domain:dm?dm[1]:"localhost",port:pm?pm[1]:"443",xrayPort,pubKey,shortId,sni}}catch{return{domain:"localhost",port:"443",xrayPort:10001,pubKey:"",shortId:"",sni:"www.bing.com"}}}
-function fetchStats(ep){return new Promise(s=>{const r=http.request({hostname:"127.0.0.1",port:CONFIG.trafficPort,path:ep,method:"GET"},
-res=>{let d="";res.on("data",c=>d+=c);res.on("end",()=>{try{s(JSON.parse(d))}catch{s({})}})});
-r.on("error",()=>s({}));r.setTimeout(3e3,()=>{r.destroy();s({})});r.end()})}
-function postStats(ep,b){return new Promise(s=>{const d=JSON.stringify(b);const r=http.request({hostname:"127.0.0.1",port:CONFIG.trafficPort,path:ep,method:"POST",headers:{"Content-Type":"application/json","Content-Length":Buffer.byteLength(d)}},
-res=>s(res.statusCode===200));r.on("error",()=>s(false));r.write(d);r.end()})}
-
-// --- Traffic Tracking ---
-function getCurrentMonth(){return new Date().toISOString().slice(0,7)}
-function updateUserTraffic(stats){const users=loadUsers();let changed=false;
-Object.entries(stats).forEach(([username,{tx,rx}])=>{const u=users.find(x=>x.username===username);if(u){
-if(!u.usage)u.usage={total:0,monthly:{}};const m=getCurrentMonth();
-u.usage.total=(u.usage.total||0)+tx+rx;u.usage.monthly[m]=(u.usage.monthly[m]||0)+tx+rx;changed=true}});
-if(changed){try{fs.writeFileSync(CONFIG.usersFile,JSON.stringify(users,null,2))}catch(e){log("ERROR","Save traffic: "+e.message)}}}
-function checkUserLimits(u){const now=Date.now(),m=getCurrentMonth();
-if(u.limits?.expiresAt&&new Date(u.limits.expiresAt).getTime()<now)return{ok:false,reason:"expired"};
-if(u.limits?.trafficLimit&&(u.usage?.total||0)>=u.limits.trafficLimit)return{ok:false,reason:"traffic_exceeded"};
-if(u.limits?.monthlyLimit&&(u.usage?.monthly?.[m]||0)>=u.limits.monthlyLimit)return{ok:false,reason:"monthly_exceeded"};
-return{ok:true}}
-function handleManage(params,res){
-const key=params.get("key"),action=params.get("action"),user=params.get("user");
-if(key!==CONFIG.adminPassword)return sendJSON(res,{error:"Invalid key"},403);
-if(!action)return sendJSON(res,{error:"Missing action"},400);
-const users=loadUsers();
-if(action==="create"){
-if(!user)return sendJSON(res,{error:"Missing user"},400);
-if(users.find(u=>u.username===user))return sendJSON(res,{error:"User exists"},400);
-const protocol=params.get("protocol")||"hysteria2";
-const pass=params.get("pass")||((protocol==="vless-reality"||protocol==="vless-ws-tls")?crypto.randomUUID():crypto.randomBytes(8).toString("hex"));
-const days=parseInt(params.get("days"))||0;const traffic=parseFloat(params.get("traffic"))||0;const monthly=parseFloat(params.get("monthly"))||0;const speed=parseFloat(params.get("speed"))||0;
-const sni=params.get("sni")||"www.bing.com"; // User-specific SNI, default to bing
-const newUser={username:user,protocol,createdAt:new Date().toISOString(),limits:{},usage:{total:0,monthly:{}}};
-if(protocol==="vless-reality"||protocol==="vless-ws-tls"){newUser.uuid=pass;newUser.sni=sni}else{newUser.password=pass}
-if(days>0)newUser.limits.expiresAt=new Date(Date.now()+days*864e5).toISOString();
-if(traffic>0)newUser.limits.trafficLimit=traffic*1073741824;
-if(monthly>0)newUser.limits.monthlyLimit=monthly*1073741824;if(speed>0)newUser.limits.speedLimit=speed*1000000;
-users.push(newUser);
-if(saveUsers(users))return sendJSON(res,{success:true,user:user,password:pass,sni:sni});
-return sendJSON(res,{error:"Save failed"},500)}
-if(action==="delete"){
-if(!user)return sendJSON(res,{error:"Missing user"},400);
-const idx=users.findIndex(u=>u.username===user);if(idx<0)return sendJSON(res,{error:"User not found"},404);
-users.splice(idx,1);
-if(saveUsers(users))return sendJSON(res,{success:true});
-return sendJSON(res,{error:"Save failed"},500)}
-if(action==="update"){
-if(!user)return sendJSON(res,{error:"Missing user"},400);
-const u=users.find(x=>x.username===user);if(!u)return sendJSON(res,{error:"User not found"},404);
-const days=params.get("days"),traffic=params.get("traffic"),monthly=params.get("monthly"),pass=params.get("pass");
-if(!u.limits)u.limits={};
-if(days!==null)u.limits.expiresAt=parseInt(days)>0?new Date(Date.now()+parseInt(days)*864e5).toISOString():null;
-if(traffic!==null)u.limits.trafficLimit=parseFloat(traffic)>0?parseFloat(traffic)*1073741824:null;
-if(monthly!==null)u.limits.monthlyLimit=parseFloat(monthly)>0?parseFloat(monthly)*1073741824:null;
-if(pass)u.password=pass;
-if(saveUsers(users))return sendJSON(res,{success:true});
-return sendJSON(res,{error:"Save failed"},500)}
-if(action==="list")return sendJSON(res,users.map(u=>({username:u.username,limits:u.limits,usage:u.usage})));
-return sendJSON(res,{error:"Unknown action"},400)}
-
-// --- Enhanced UI ---
-const HTML=`<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>B-UI 管理面板</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <style>
-        :root {
-            --primary: #B22222;
-            --primary-gradient: linear-gradient(135deg, #8B0000, #B22222, #D4AF37);
-            --bg: #FBF7F0;
-            --card-bg: rgba(255, 252, 245, 0.7);
-            --header-bg: rgba(255, 252, 245, 0.8);
-            --text: #4A0404;
-            --text-dim: #8B4513;
-            --border: rgba(139, 0, 0, 0.12);
-            --success: #2E8B57;
-            --danger: #C41E3A;
-            --warning: #ff9f0a;
-            --radius: 20px;
-        }
-        * { margin: 0; padding: 0; box-sizing: border-box; outline: none; -webkit-tap-highlight-color: transparent; }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", sans-serif;
-            background: var(--bg);
-            color: var(--text);
-            min-height: 100vh;
-            overflow-x: hidden;
-            background-image:
-                radial-gradient(circle at 15% 15%, rgba(255, 107, 107, 0.15) 0%, transparent 45%),
-                radial-gradient(circle at 85% 15%, rgba(255, 142, 83, 0.15) 0%, transparent 45%),
-                radial-gradient(circle at 85% 85%, rgba(157, 78, 221, 0.12) 0%, transparent 45%),
-                radial-gradient(circle at 15% 85%, rgba(255, 107, 107, 0.12) 0%, transparent 45%);
-            background-attachment: fixed;
-        }
-        .view { display: none; padding-top: 90px; padding-bottom: 40px; }
-        .view.active { display: block; animation: fadeIn 0.5s cubic-bezier(0.16, 1, 0.3, 1); }
-        @keyframes fadeIn { from { opacity: 0; transform: scale(0.98); } to { opacity: 1; transform: scale(1); } }
-
-        /* Navigation - Apple Style Glass */
-        .nav {
-            position: fixed; top: 0; left: 0; right: 0; height: 60px;
-            background: rgba(28, 28, 30, 0.7);
-            backdrop-filter: blur(20px) saturate(180%);
-            -webkit-backdrop-filter: blur(20px) saturate(180%);
-            border-bottom: 1px solid var(--border);
-            display: flex; justify-content: space-between; align-items: center;
-            padding: 0 24px; z-index: 100;
-        }
-        .brand { 
-            font-size: 19px; font-weight: 600; display: flex; align-items: center; gap: 10px; 
-            background: linear-gradient(135deg, #fff, #cecece); -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-        }
-        .brand i { 
-            width: 28px; height: 28px; 
-            background: var(--primary-gradient); 
-            border-radius: 8px; display: grid; place-items: center; 
-            font-style: normal; font-size: 14px; color: white; -webkit-text-fill-color: white; 
-            box-shadow: 0 4px 12px rgba(255, 107, 107, 0.3);
-        }
-
-        /* Dashboard */
-        .container { max-width: 1000px; margin: 0 auto; padding: 0 20px; }
-        
-        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-bottom: 24px; }
-        .stat-card {
-            background: var(--card-bg);
-            backdrop-filter: blur(25px) saturate(180%);
-            -webkit-backdrop-filter: blur(25px) saturate(180%);
-            border: 1px solid var(--border); border-radius: var(--radius);
-            padding: 20px; transition: transform 0.2s cubic-bezier(0.34, 1.56, 0.64, 1);
-        }
-        .stat-card:hover { transform: scale(1.02); }
-        .stat-val { font-size: 32px; font-weight: 700; margin-top: 8px; letter-spacing: -0.5px; }
-        .stat-lbl { font-size: 13px; color: var(--text-dim); font-weight: 500; }
-
-        /* Table Card */
-        .table-card {
-            background: var(--card-bg);
-            backdrop-filter: blur(25px) saturate(180%);
-            -webkit-backdrop-filter: blur(25px) saturate(180%);
-            border: 1px solid var(--border); border-radius: var(--radius);
-            overflow: hidden;
-        }
-        .table-header {
-            padding: 20px 24px; display: flex; justify-content: space-between; align-items: center;
-            border-bottom: 1px solid var(--border); background: rgba(255,255,255,0.02);
-        }
-        .table-header h2 { font-size: 17px; font-weight: 600; }
-        
-        /* Buttons */
-        .btn {
-            background: var(--primary-gradient);
-            color: white; border: none; padding: 10px 20px; border-radius: 99px;
-            font-weight: 600; font-size: 13px; cursor: pointer; transition: .2s;
-            box-shadow: 0 4px 12px rgba(255, 107, 107, 0.25);
-        }
-        .btn:hover { transform: scale(1.02); box-shadow: 0 6px 16px rgba(255, 107, 107, 0.35); }
-        
-        /* Icon Button */
-        .ibtn {
-            width: 32px; height: 32px; border-radius: 50%; border: none;
-            background: rgba(255,255,255,0.1); color: var(--text);
-            cursor: pointer; display: grid; place-items: center; transition: .2s; font-size: 14px;
-        }
-        .ibtn:hover { background: rgba(255,255,255,0.2); }
-        .ibtn.danger { color: var(--danger); background: rgba(255, 69, 58, 0.1); }
-        .ibtn.danger:hover { background: rgba(255, 69, 58, 0.2); }
-        
-        table { width: 100%; border-collapse: collapse; }
-        th, td { padding: 18px 24px; text-align: left; border-bottom: 1px solid var(--border); }
-        th { color: var(--text-dim); font-size: 12px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.5px; }
-        td { font-size: 14px; font-weight: 400; }
-        tr:last-child td { border-bottom: none; }
-        tr:hover td { background: rgba(255,255,255,0.03); }
-
-        /* Tags */
-        .tag { padding: 4px 10px; border-radius: 6px; font-size: 11px; font-weight: 600; background: rgba(255,255,255,0.1); color: var(--text-dim); }
-        .tag.on { background: rgba(50, 215, 75, 0.15); color: var(--success); }
-        .proto-tag { padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: 700; margin-left: 4px; }
-        .proto-hy2 { background: rgba(255, 159, 10, 0.2); color: #ff9f0a; }
-        .proto-vless { background: rgba(50, 215, 75, 0.2); color: #32d74b; }
-        .proto-ws { background: rgba(10, 132, 255, 0.2); color: #0a84ff; }
-        
-        /* Forms */
-        input, select {
-            width: 100%; background: rgba(0,0,0,0.2); border: 1px solid var(--border);
-            padding: 12px 16px; border-radius: 12px; color: var(--text); margin-bottom: 16px;
-            font-size: 15px; transition: .2s;
-        }
-        input:focus, select:focus { border-color: var(--primary); background: rgba(0,0,0,0.3); }
-
-        /* Modal */
-        .modal {
-            position: fixed; inset: 0; background: rgba(139,0,0,0.08); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
-            z-index: 200; display: none; align-items: center; justify-content: center; opacity: 0; transition: .3s;
-        }
-        .modal.on { display: flex; opacity: 1; }
-        .modal-card {
-            background: #FFFCF5; border: 1px solid var(--border); border-radius: 24px;
-            width: 90%; max-width: 380px; padding: 32px;
-            box-shadow: 0 40px 80px -20px rgba(0,0,0,0.6);
-            transform: scale(0.95); transition: .3s cubic-bezier(0.16, 1, 0.3, 1);
-        }
-        .modal.on .modal-card { transform: scale(1); }
-        
-        /* Login */
-        .login-wrap { display: flex; justify-content: center; align-items: center; min-height: 100vh; }
-        .login-card { width: 100%; max-width: 360px; text-align: center; border-radius: 28px; padding: 40px 30px; }
-
-        /* Toast */
-        .toast-box { position: fixed; top: 20px; left: 50%; transform: translateX(-50%); display: flex; flex-direction: column; gap: 10px; z-index: 300; }
-        .toast {
-            background: #FFFCF5; backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
-            color: var(--text); border: 1px solid var(--border);
-            padding: 12px 24px; border-radius: 99px; display: flex; align-items: center; gap: 10px; font-size: 14px; font-weight: 500;
-            box-shadow: 0 10px 30px -10px rgba(0,0,0,0.3); animation: toastIn 0.3s cubic-bezier(0.16, 1, 0.3, 1);
-        }
-        @keyframes toastIn { from { opacity: 0; transform: translateY(-20px); } to { opacity: 1; transform: translateY(0); } }
-
-        @media (max-width: 768px) {
-            .stats { grid-template-columns: 1fr; }
-            .hide-m { display: none; }
-            .container { padding: 0 16px; }
-            td, th { padding: 16px; }
-        }
-    </style>
-</head>
-<body>
-
-<!-- Login View -->
-<div id="v-login" class="view active" style="padding:0">
-    <div class="login-wrap">
-        <div class="stat-card login-card">
-            <h1 style="font-size:24px; margin-bottom:8px">B-UI 管理面板</h1>
-            <p style="color:var(--text-dim); font-size:14px; margin-bottom:30px">安全访问中心 · v${VERSION}</p>
-            <input type="password" id="lp" placeholder="Enter Admin Password">
-            <button class="btn" style="width:100%" onclick="login()">登 录</button>
-        </div>
-    </div>
-</div>
-
-<!-- Dashboard View -->
-<div id="v-dash" class="view">
-    <nav class="nav">
-        <div class="brand"><i>⚡</i><span>B-UI</span><span style="font-size:11px;color:#888;margin-left:8px">v${VERSION}</span></div>
-        <div style="display:flex; gap:10px">
-            <button class="ibtn" onclick="openMasq()" title="伪装网站设置">🎭</button>
-            <button class="ibtn" onclick="openM('m-pwd')" title="Change Password">🔑</button>
-            <button class="ibtn danger" onclick="logout()" title="Logout">✕</button>
-        </div>
-    </nav>
+    # 从 GitHub 下载管理面板文件（不再内嵌）
+    print_info "下载管理面板 server.js..."
+    if ! download_from_github "web/server.js" "$ADMIN_DIR/server.js"; then
+        print_error "server.js 下载失败，安装无法继续"
+        exit 1
+    fi
     
-    <div class="container">
-        <!-- Stats Grid -->
-        <div class="stats">
-            <div class="stat-card">
-                <div class="stat-lbl">总用户数</div>
-                <div class="stat-val" id="st-u">0</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-lbl">在线设备</div>
-                <div class="stat-val" id="st-o" style="color:var(--success)">0</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-lbl">上传流量</div>
-                <div class="stat-val" id="st-up">0</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-lbl">下载</div>
-                <div class="stat-val" id="st-dl">0</div>
-            </div>
-        </div>
-
-        <!-- User Table -->
-        <div class="table-card">
-            <div class="table-header">
-                <h2>用户管理</h2>
-                <button class="btn" onclick="openM('m-add')">+ 新建用户</button>
-            </div>
-            <div style="overflow-x:auto">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>用户名</th>
-                            <th>状态</th>
-                            <th class="hide-m">本月流量</th>
-                            <th class="hide-m">总流量</th>
-                            <th>操作</th>
-                        </tr>
-                    </thead>
-                    <tbody id="tb"></tbody>
-                </table>
-            </div>
-        </div>
-    </div>
-</div>
-
-<!-- Add User Modal -->
-<div id="m-add" class="modal">
-    <div class="modal-card">
-        <h3 style="margin-bottom:20px; font-size:18px">新建用户</h3>
-        <select id="nproto" onchange="toggleSniSelect()">
-            <option value="hysteria2">Hysteria2 (推荐)</option>
-            <option value="vless-reality">VLESS + Reality</option>
-            <option value="vless-ws-tls">VLESS + WS + TLS (免流测试)</option>
-        </select>
-        <div id="sni-group" style="display:none">
-            <select id="nsni">
-                <optgroup label="默认">
-                    <option value="www.bing.com" selected>www.bing.com (默认)</option>
-                    <option value="www.microsoft.com">www.microsoft.com</option>
-                </optgroup>
-                <optgroup label="电信免流">
-                    <option value="www.189.cn">电信营业厅 (www.189.cn) ⭐</option>
-                    <option value="vod3.nty.tv189.cn">天翼视讯 (vod3.nty.tv189.cn)</option>
-                    <option value="cloudgame.189.cn">天翼云游戏 (cloudgame.189.cn)</option>
-                    <option value="ltewap.tv189.com">电信爱看 (ltewap.tv189.com)</option>
-                    <option value="h5.nty.tv189.com">天翼视讯H5 (h5.nty.tv189.com)</option>
-                    <option value="open.4g.play.cn">电信爱玩 (open.4g.play.cn)</option>
-                </optgroup>
-                <optgroup label="联通免流">
-                    <option value="iservice.10010.com">联通营业厅 (iservice.10010.com) ⭐</option>
-                    <option value="game.hxll.wostore.cn">沃商店游戏 (game.hxll.wostore.cn)</option>
-                    <option value="music.hxll.wostore.cn">沃商店音乐 (music.hxll.wostore.cn)</option>
-                    <option value="box.10155.com">沃音乐 (box.10155.com)</option>
-                    <option value="partner.iread.wo.com.cn">沃阅读 (partner.iread.wo.com.cn)</option>
-                    <option value="wotv.17wo.cn">联通WOTV (wotv.17wo.cn)</option>
-                </optgroup>
-                <optgroup label="移动免流">
-                    <option value="shop.10086.cn">移动商城 (shop.10086.cn) ⭐</option>
-                    <option value="mm.10086.cn">移动MM (mm.10086.cn)</option>
-                    <option value="www.10086.cn">移动官网 (www.10086.cn)</option>
-                    <option value="dm.toutiao.com">抖音/头条 (dm.toutiao.com)</option>
-                </optgroup>
-                <optgroup label="定向流量">
-                    <option value="short.weixin.qq.com">微信 (short.weixin.qq.com)</option>
-                    <option value="data.video.qiyi.com">爱奇艺 (data.video.qiyi.com)</option>
-                    <option value="api.mobile.youku.com">优酷 (api.mobile.youku.com)</option>
-                    <option value="dl.stream.qqmusic.com">QQ音乐 (dl.stream.qqmusic.com)</option>
-                </optgroup>
-            </select>
-            <input id="nsni-custom" placeholder="或输入自定义域名 (留空使用上面选择)" style="margin-top:8px">
-        </div>
-        <input id="nu" placeholder="用户名">
-        <input id="np" placeholder="密码 / UUID (自动生成)">
-        <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px">
-            <input id="nd" type="number" placeholder="天数" min="0">
-            <input id="nt" type="number" placeholder="总流量GB" min="0" step="0.1"></div><div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:10px"><input id="nm" type="number" placeholder="月流量GB" min="0" step="0.1"><input id="ns" type="number" placeholder="限mb/s" min="0">
-        </div>
-        <div style="display:grid; grid-template-columns:1fr 1fr; gap:15px; margin-top:10px">
-            <button class="btn" style="background:#F5F0E8;color:#4A0404;box-shadow:none" onclick="closeM()">取消</button>
-            <button class="btn" onclick="addUser()">创建</button>
-        </div>
-    </div>
-</div>
-
-<!-- Config Modal -->
-<div id="m-cfg" class="modal">
-    <div class="modal-card" style="text-align:center">
-        <h3 style="margin-bottom:10px">客户端配置</h3>
-        <p style="font-size:12px; color:var(--text-dim); margin-bottom:20px">Compatible with v2rayN / Shadowrocket / Clash Meta</p>
-        <div id="qrcode" style="margin:20px auto; background:#fff; padding:15px; border-radius:12px; width:fit-content"></div>
-        <div class="code-box" id="uri" style="background:#0f172a; padding:15px; border-radius:12px; font-family:monospace; font-size:12px; word-break:break-all; margin-bottom:20px; text-align:left; border:1px solid var(--border); color:var(--text-dim)"></div>
-        <div style="display:grid; grid-template-columns:1fr 1fr; gap:15px">
-            <button class="btn" onclick="copy()">Copy Link</button>
-            <button class="btn" style="background:#F5F0E8;color:#4A0404;box-shadow:none" onclick="closeM()">Close</button>
-        </div>
-    </div>
-</div>
-
-<!-- Password Modal -->
-<div id="m-pwd" class="modal">
-    <div class="modal-card">
-        <h3 style="margin-bottom:20px">修改管理员密码</h3>
-        <input type="password" id="newpwd" placeholder="新密码 (最少6位)">
-        <div style="display:grid; grid-template-columns:1fr 1fr; gap:15px; margin-top:10px">
-            <button class="btn" style="background:#F5F0E8;color:#4A0404;box-shadow:none" onclick="closeM()">取消</button>
-            <button class="btn" onclick="changePwd()">Save</button>
-        </div>
-</div>
-</div>
-
-<!-- Masquerade Settings Modal -->
-<div id="m-masq" class="modal">
-    <div class="modal-card">
-        <h3 style="margin-bottom:20px">伪装网站设置</h3>
-        <p style="font-size:12px;color:#666;margin-bottom:15px">此设置同时应用于 Hysteria2 和 VLESS-Reality</p>
-        <input type="text" id="masqurl" placeholder="https://www.bing.com/">
-        <div style="display:grid; grid-template-columns:1fr 1fr; gap:15px; margin-top:10px">
-            <button class="btn" style="background:#F5F0E8;color:#4A0404;box-shadow:none" onclick="closeM()">取消</button>
-            <button class="btn" onclick="saveMasq()">保存</button>
-        </div>
-    </div>
-</div>
-
-<div class="toast-box" id="t-box"></div>
-
-<script>
-const $=s=>document.querySelector(s);let tok=localStorage.getItem("t"),cfg={};
-const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const sz=b=>{if(!b)return"0 B";const i=Math.floor(Math.log(b)/Math.log(1024));return(b/Math.pow(1024,i)).toFixed(2)+" "+["B","KB","MB","GB"][i]};
-
-function toast(m,e){const d=document.createElement("div");d.className="toast";d.innerHTML="<span style='font-size:18px'>"+(e?"⚠️":"✅")+"</span><div>"+m+"</div>";$("#t-box").appendChild(d);setTimeout(()=>d.remove(),3000)}
-function openM(id){$("#"+id).classList.add("on")}
-function closeM(){document.querySelectorAll(".modal").forEach(e=>e.classList.remove("on"))}
-
-function api(ep,opt={}){return fetch("/api"+ep,{...opt,headers:{...opt.headers,Authorization:"Bearer "+tok}}).then(r=>{if(r.status==401)logout();return r.json()})}
-function login(){const pw=$("#lp").value;fetch("/api/login",{method:"POST",body:JSON.stringify({password:pw})}).then(r=>r.json()).then(d=>{if(d.token){tok=d.token;localStorage.setItem("t",tok);localStorage.setItem("ap",pw);init()}else toast("Authentication failed",1)})}
-function logout(){localStorage.removeItem("t");location.reload()}
-
-function init(){$("#v-login").classList.remove("active");setTimeout(()=>$("#v-login").style.display="none",300);$("#v-dash").classList.add("active");api("/config").then(d=>cfg=d);load();setInterval(load,5000)}
-
-function load(){
-    Promise.all([api("/users"),api("/online"),api("/stats")]).then(([u,o,s])=>{
-        $("#st-u").innerText=u.length;$("#st-o").innerText=Object.keys(o).length;
-        let tu=0,td=0;Object.values(s).forEach(v=>{tu+=v.tx||0;td+=v.rx||0});
-        $("#st-up").innerText=sz(tu);$("#st-dl").innerText=sz(td);
-        const m=new Date().toISOString().slice(0,7);
-        allUsers=u;u.forEach(x=>{const uri=genUri(x);new Image().src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data="+encodeURIComponent(uri)});
-        $("#tb").innerHTML=u.map(x=>{
-            const on=o[x.username],monthly=x.usage?.monthly?.[m]||0,total=x.usage?.total||0;
-            const exp=x.limits?.expiresAt?new Date(x.limits.expiresAt)<new Date():"",tlim=x.limits?.trafficLimit,over=tlim&&total>=tlim;
-            const badge=exp?' <span class="tag" style="color:var(--danger)">EXPIRED</span>':(over?' <span class="tag" style="color:var(--danger)">LIMIT</span>':"");
-            const proto=x.protocol||"hysteria2",ptag=proto==="vless-reality"?'<span class="proto-tag proto-vless">VLESS</span>':(proto==="vless-ws-tls"?'<span class="proto-tag proto-ws">WS</span>':'<span class="proto-tag proto-hy2">HY2</span>');
-            
-            return '<tr>'+
-                '<td><div style="display:flex;align-items:center;gap:8px"><span style="font-weight:600">'+esc(x.username)+'</span>'+ptag+badge+'</div></td>'+
-                '<td><span class="tag '+(on?'on':'')+' ">'+(on?on+' Online':'Offline')+'</span></td>'+
-                '<td class="hide-m" style="font-family:monospace;color:var(--text-dim)">'+sz(monthly)+'</td>'+
-                '<td class="hide-m" style="font-family:monospace;color:var(--text-dim)">'+sz(total)+(tlim?' / '+sz(tlim):'')+'</td>'+
-                '<td>'+
-                    '<div style="display:flex;gap:8px">'+
-                        '<button class="ibtn" onclick="showU(&apos;'+esc(x.username)+'&apos;)" title="Config">⚙</button>'+
-                        (on?'<button class="ibtn danger" onclick="kick(&apos;'+esc(x.username)+'&apos;)" title="Kick">⚡</button>':'')+
-                        '<button class="ibtn danger" onclick="del(&apos;'+esc(x.username)+'&apos;)" title="Delete">🗑</button>'+
-                    '</div>'+
-                '</td>'+
-            '</tr>'
-        }).join("")
-    })
-}
-
-function addUser(){
-    const u=$("#nu").value,p=$("#np").value,d=$("#nd").value||0,t=$("#nt").value||0,m=$("#nm").value||0,s=$("#ns").value||0,proto=$("#nproto").value;
-    const customSni=$("#nsni-custom")?.value||$("#nsni")?.value||"";
-    let url="/api/manage?key="+encodeURIComponent(cfg.adminPass||localStorage.getItem("ap")||"")+"&action=create&user="+encodeURIComponent(u)+(p?"&pass="+encodeURIComponent(p):"")+"&days="+d+"&traffic="+t+"&monthly="+m+"&speed="+s+"&protocol="+proto;
-    if(customSni)url+="&sni="+encodeURIComponent(customSni);
-    fetch(url).then(r=>r.json()).then(r=>{if(r.success){closeM();toast("User "+u+" created");load()}else toast(r.error||"Failed",1)})
-}
-
-function del(u){if(confirm("Delete user "+u+"?"))api("/users/"+encodeURIComponent(u),{method:"DELETE"}).then(()=>load())}
-function kick(u){api("/kick",{method:"POST",body:JSON.stringify([u])}).then(()=>toast("User "+u+" kicked offline"))}
-
-let allUsers=[];
-function genUri(x){
-    if(x.protocol==="vless-reality"){
-        const userSni=x.sni||cfg.sni||"www.bing.com";
-        return "vless://"+x.uuid+"@"+cfg.domain+":"+cfg.xrayPort+"?encryption=none&flow=xtls-rprx-vision&security=reality&sni="+userSni+"&fp=chrome&pbk="+cfg.pubKey+"&sid="+cfg.shortId+"&spx=%2F&type=tcp#"+encodeURIComponent(x.username+(x.sni?" ["+x.sni+"]":""));
-    }
-    if(x.protocol==="vless-ws-tls"){
-        const hostSni=x.sni||"www.bing.com";
-        return "vless://"+x.uuid+"@"+cfg.domain+":"+(cfg.wsPort||10002)+"?encryption=none&security=tls&sni="+cfg.domain+"&type=ws&host="+hostSni+"&path=%2Fws#"+encodeURIComponent(x.username+" [WS:"+hostSni+"]");
-    }
-    return "hysteria2://"+encodeURIComponent(x.username)+":"+encodeURIComponent(x.password)+"@"+cfg.domain+":"+cfg.port+"/?sni="+cfg.domain+"&insecure=0#"+encodeURIComponent(x.username)
-}
-
-function showU(uname){
-    const x=allUsers.find(u=>u.username===uname);if(!x)return;
-    const uri=genUri(x);
-    $("#uri").innerText=uri;
-    $("#qrcode").innerHTML='<img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data='+encodeURIComponent(uri)+'" alt="QR Code" style="display:block;border-radius:8px">';
-    openM("m-cfg")
-}
-
-function copy(){navigator.clipboard.writeText($("#uri").innerText);toast("Copied to clipboard")}
-function changePwd(){
-    const np=$("#newpwd").value;if(np.length<6)return toast("Password min 6 chars",1);
-    api("/password",{method:"POST",body:JSON.stringify({newPassword:np})}).then(r=>{if(r.success){closeM();toast("Password updated, please login again");setTimeout(()=>logout(),2000)}else toast(r.error||"Failed",1)})
-}
-
-function openMasq(){
-    api("/masquerade").then(r=>{$("#masqurl").value=r.masqueradeUrl||"https://www.bing.com/";openM("m-masq")})
-}
-function saveMasq(){
-    const url=$("#masqurl").value;if(!url)return toast("请输入URL",1);
-    api("/masquerade",{method:"POST",body:JSON.stringify({url})}).then(r=>{if(r.success){closeM();toast("伪装网站已更新: "+r.domain);setTimeout(()=>location.reload(),2000)}else toast(r.error||"Failed",1)})
-}
-
-function toggleSniSelect(){
-    const proto=$("#nproto").value;
-    const sniGroup=$("#sni-group");
-    if(proto==="vless-reality"||proto==="vless-ws-tls"){sniGroup.style.display="block"}else{sniGroup.style.display="none"}
-}
-
-if(tok)init();
-</script>
-</body>
-</html>`;
-
-// --- Traffic Sync Loop ---
-let lastTraffic = {};
-setInterval(async () => {
-    try {
-        const stats = await fetchStats("/traffic"); // { user: { tx: 123, rx: 456 } }
-        // TODO: Merge Xray stats here if needed
-        
-        let users = loadUsers();
-        let changed = false;
-        const now = new Date();
-        const m = now.toISOString().slice(0, 7);
-
-        for (const [uName, stat] of Object.entries(stats)) {
-            const u = users.find(x => x.username === uName);
-            if (!u) continue;
-
-            if (!u.usage) u.usage = { total: 0, monthly: {} };
-            if (!u.usage.monthly) u.usage.monthly = {};
-
-            // Calculate delta
-            const last = lastTraffic[uName] || { tx: 0, rx: 0 };
-            // If current stat is less than last, service restarted -> delta is current
-            const deltaTx = (stat.tx < last.tx) ? stat.tx : (stat.tx - last.tx);
-            const deltaRx = (stat.rx < last.rx) ? stat.rx : (stat.rx - last.rx);
-
-            if (deltaTx > 0 || deltaRx > 0) {
-                const totalDelta = deltaTx + deltaRx;
-                u.usage.total = (u.usage.total || 0) + totalDelta;
-                u.usage.monthly[m] = (u.usage.monthly[m] || 0) + totalDelta;
-                changed = true;
-            }
-            
-            // Check limits
-            if (u.limits && u.limits.trafficLimit && u.usage.total >= u.limits.trafficLimit) {
-                 // Logic to kick/disable user could go here
-            }
-
-            lastTraffic[uName] = stat;
-        }
-
-        if (changed) { try { fs.writeFileSync(CONFIG.usersFile, JSON.stringify(users, null, 2)); } catch (e) { log("ERROR", "Save usage: " + e.message); } }
-    } catch (e) {
-        console.error("Traffic sync failed:", e);
-    }
-}, 10000); // Sync every 10s
-
-// --- Server Startup ---
-const server = http.createServer(async(req,res)=>{
-    const u=new URL(req.url,`http://${req.headers.host}`),p=u.pathname;
-    if(req.method==="OPTIONS"){res.writeHead(200,{"Access-Control-Allow-Origin":"*","Access-Control-Allow-Methods":"*","Access-Control-Allow-Headers":"*"});return res.end()}
-    if(p==="/"||p==="/index.html"){res.writeHead(200,{"Content-Type":"text/html; charset=utf-8"});return res.end(HTML)}
+    # 下载前端文件
+    print_info "下载前端文件..."
+    download_from_github "web/index.html" "$ADMIN_DIR/index.html" || true
+    download_from_github "web/style.css" "$ADMIN_DIR/style.css" || true
+    download_from_github "web/app.js" "$ADMIN_DIR/app.js" || true
     
-    // ... (rest of the server logic)
-
-if(p.startsWith("/api/")){const r=p.slice(5);const clientIP=getClientIP(req);
-try{
-if(r==="login"&&req.method==="POST"){
-const b=await parseBody(req);
-if(!checkRateLimit(clientIP)){recordAttempt(clientIP,false);return sendJSON(res,{error:"Too many attempts. Try again later."},429)}
-const ok=b.password===CONFIG.adminPassword;recordAttempt(clientIP,ok);
-if(ok)return sendJSON(res,{token:genToken({admin:true})});else return sendJSON(res,{error:"Auth failed"},401)}
-if(r==="manage")return handleManage(u.searchParams,res);
-const auth=verifyToken((req.headers.authorization||"").replace("Bearer ",""));if(!auth)return sendJSON(res,{error:"Unauthorized"},401);
-if(r==="users"){if(req.method==="GET")return sendJSON(res,loadUsers());
-if(req.method==="POST"){const b=await parseBody(req),users=loadUsers();if(users.find(u=>u.username===b.username))return sendJSON(res,{error:"Exists"},400);users.push({username:b.username,password:b.password||crypto.randomBytes(8).toString("hex"),createdAt:new Date()});return saveUsers(users)?sendJSON(res,{success:true}):sendJSON(res,{error:"Save failed"},500)}}
-if(r.startsWith("users/")&&req.method==="DELETE"){let users=loadUsers();users=users.filter(u=>u.username!==decodeURIComponent(r.slice(6)));return saveUsers(users)?sendJSON(res,{success:true}):sendJSON(res,{error:"Fail"},500)}
-if(r==="stats")return sendJSON(res,await fetchStats("/traffic"));
-if(r==="online")return sendJSON(res,await fetchStats("/online"));
-if(r==="kick"&&req.method==="POST")return sendJSON(res,await postStats("/kick",await parseBody(req)));
-if(r==="config")return sendJSON(res,getConfig());
-if(r==="masquerade"){
-  const masqFile=CONFIG.hysteriaConfig.replace("config.yaml","masquerade.json");
-  if(req.method==="GET"){try{const m=JSON.parse(fs.readFileSync(masqFile,"utf8"));return sendJSON(res,m)}catch{return sendJSON(res,{masqueradeUrl:"https://www.bing.com/",masqueradeDomain:"www.bing.com"})}}
-  if(req.method==="POST"){const b=await parseBody(req);if(!b.url)return sendJSON(res,{error:"URL required"},400);
-    const domain=b.url.replace(/https?:\/\/([^/:]+).*/,"$1")||"www.bing.com";
-    try{fs.writeFileSync(masqFile,JSON.stringify({masqueradeUrl:b.url,masqueradeDomain:domain},null,2));
-    // Update Hysteria config
-    let hyc=fs.readFileSync(CONFIG.hysteriaConfig,"utf8");
-    hyc=hyc.replace(/masquerade:[\s\S]*?(?=\n[a-zA-Z]|$)/,`masquerade:\n  type: proxy\n  proxy:\n    url: ${b.url}\n    rewriteHost: true`);
-    fs.writeFileSync(CONFIG.hysteriaConfig,hyc);
-    // Update Xray config
-    if(fs.existsSync(CONFIG.xrayConfig)){let xc=JSON.parse(fs.readFileSync(CONFIG.xrayConfig,"utf8"));
-    const xi=xc.inbounds.find(i=>i.tag==="vless-reality");
-    if(xi&&xi.streamSettings?.realitySettings){xi.streamSettings.realitySettings.dest=domain+":443";xi.streamSettings.realitySettings.serverNames=[domain]}
-    fs.writeFileSync(CONFIG.xrayConfig,JSON.stringify(xc,null,2));execSync("systemctl restart xray 2>/dev/null||true",{stdio:"pipe"})}
-    execSync("systemctl restart hysteria-server 2>/dev/null||true",{stdio:"pipe"});
-    return sendJSON(res,{success:true,domain})}catch(e){return sendJSON(res,{error:e.message},500)}}}
-if(r==="password"&&req.method==="POST"){const b=await parseBody(req);
-if(!b.newPassword||b.newPassword.length<6)return sendJSON(res,{error:"密码至少6位"},400);
-try{const svc="/etc/systemd/system/b-ui-admin.service";let c=require("fs").readFileSync(svc,"utf8");
-c=c.replace(/ADMIN_PASSWORD=[^\n]*/,"ADMIN_PASSWORD="+b.newPassword);
-require("fs").writeFileSync(svc,c);require("child_process").execSync("systemctl daemon-reload");
-return sendJSON(res,{success:true,message:"密码已更新，请重新登录"})}
-catch(e){return sendJSON(res,{error:e.message},500)}}
-}catch(e){return sendJSON(res,{error:e.message},500)}}
-// Hysteria2 HTTP Auth Endpoint
-if(p==="/auth/hysteria" && req.method==="POST"){
-  const body = await parseBody(req);
-  const authStr = body.auth || "";
-  // auth format: username:password
-  const [username, password] = authStr.split(":");
-  const users = loadUsers();
-  const user = users.find(u => u.username === username && u.password === password);
-  if(user){
-    // Check limits
-    const check = checkUserLimits(user);
-    if(check.ok){
-      return sendJSON(res, {ok: true, id: username});
-    } else {
-      return sendJSON(res, {ok: false, id: username});
-    }
-  }
-  return sendJSON(res, {ok: false});
-}
-sendJSON(res,{error:"Not found"},404)}).listen(CONFIG.port,()=>console.log("Admin Panel Running"));
-
-SERVEREOF
-
+    # 下载版本信息
+    download_from_github "version.json" "${BASE_DIR}/version.json" || true
+    
+    # 下载服务端管理工具
+    print_info "下载服务端管理工具..."
+    download_from_github "server/core.sh" "${BASE_DIR}/core.sh" || true
+    download_from_github "server/update.sh" "${BASE_DIR}/update.sh" || true
+    download_from_github "server/b-ui-cli.sh" "${BASE_DIR}/b-ui-cli.sh" || true
+    chmod +x "${BASE_DIR}/update.sh" "${BASE_DIR}/b-ui-cli.sh" 2>/dev/null || true
 
     print_success "管理面板文件已部署"
 }
@@ -1612,381 +968,26 @@ EOF
 create_bui_cli() {
     print_info "创建 b-ui 命令行工具..."
     
+    # 创建轻量入口脚本，实际逻辑由 b-ui-cli.sh 提供
     cat > /usr/local/bin/b-ui << 'BUIEOF'
 #!/bin/bash
-# B-UI 终端管理面板
-# Hysteria2 + Web 管理面板 完整版
+# B-UI 终端管理面板 - 入口脚本
+# 实际逻辑由 /opt/hysteria/b-ui-cli.sh 提供
+BASE_DIR="/opt/hysteria"
+CLI_SCRIPT="${BASE_DIR}/b-ui-cli.sh"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-BLUE='\033[0;34m'
-NC='\033[0m'
+if [[ $EUID -ne 0 ]]; then
+    echo -e "\033[0;31m[ERROR]\033[0m 请使用 sudo b-ui 运行"
+    exit 1
+fi
 
-CONFIG_FILE="/opt/hysteria/config.yaml"
-USERS_FILE="/opt/hysteria/users.json"
-HYSTERIA_SERVICE="hysteria-server.service"
-ADMIN_SERVICE="b-ui-admin.service"
-
-print_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
-print_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
-print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
-
-get_domain() {
-    grep -A2 "^tls:" "$CONFIG_FILE" 2>/dev/null | grep "cert:" | sed 's|.*/live/\([^/]*\)/.*|\1|' || echo "未配置"
-}
-
-get_port() {
-    grep "^listen:" "$CONFIG_FILE" 2>/dev/null | sed 's/listen: *:\?//' || echo "10000"
-}
-
-get_admin_password() {
-    grep "ADMIN_PASSWORD=" /etc/systemd/system/b-ui-admin.service 2>/dev/null | cut -d= -f3 || echo "未找到"
-}
-
-show_banner() {
-    clear
-    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║                      ${YELLOW}B-UI 管理面板${CYAN}                          ║${NC}"
-    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
-    echo ""
-}
-
-show_status() {
-    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
-    echo -e "${YELLOW}[系统状态]${NC}"
-    
-    if command -v hysteria &> /dev/null; then
-        local hy_ver=$(hysteria version 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo '未知')
-        echo -e "  Hysteria2: ${YELLOW}${hy_ver}${NC}"
-    else
-        echo -e "  Hysteria2: ${RED}未安装${NC}"
-    fi
-    
-    if command -v xray &> /dev/null; then
-        local xray_ver=$(xray version 2>/dev/null | head -n1 | awk '{print $2}' || echo '未知')
-        echo -e "  Xray: ${YELLOW}${xray_ver}${NC}"
-    else
-        echo -e "  Xray: ${RED}未安装${NC}"
-    fi
-    
-    if systemctl is-active --quiet hysteria-server 2>/dev/null; then
-        echo -e "  Hysteria 服务: ${GREEN}✓ 运行中${NC}"
-    else
-        echo -e "  Hysteria 服务: ${RED}✗ 未运行${NC}"
-    fi
-    
-    if systemctl is-active --quiet b-ui-admin 2>/dev/null; then
-        echo -e "  管理面板服务: ${GREEN}✓ 运行中${NC}"
-    else
-        echo -e "  管理面板服务: ${RED}✗ 未运行${NC}"
-    fi
-    
-    if command -v xray &> /dev/null; then
-        if systemctl is-active --quiet xray 2>/dev/null; then
-            echo -e "  Xray 服务: ${GREEN}✓ 运行中${NC}"
-        else
-            echo -e "  Xray 服务: ${RED}✗ 未运行${NC}"
-        fi
-    fi
-    
-    local bbr=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-    if [[ "$bbr" == "bbr" ]]; then
-        echo -e "  BBR: ${GREEN}已启用${NC}"
-    else
-        echo -e "  BBR: ${YELLOW}未启用${NC}"
-    fi
-    
-    # 显示开机自启动状态
-    echo ""
-    echo -e "${YELLOW}[开机自启动]${NC}"
-    local hy_auto=$(systemctl is-enabled hysteria-server 2>/dev/null); hy_auto=${hy_auto:-未配置}
-    local xray_auto=$(systemctl is-enabled xray 2>/dev/null); xray_auto=${xray_auto:-未配置}
-    local admin_auto=$(systemctl is-enabled b-ui-admin 2>/dev/null); admin_auto=${admin_auto:-未配置}
-    if [[ "$hy_auto" == "enabled" ]]; then
-        echo -e "  Hysteria: ${GREEN}✓ 已启用${NC}"
-    else
-        echo -e "  Hysteria: ${RED}✗ 未启用${NC}"
-    fi
-    if [[ "$xray_auto" == "enabled" ]]; then
-        echo -e "  Xray: ${GREEN}✓ 已启用${NC}"
-    else
-        echo -e "  Xray: ${RED}✗ 未启用${NC}"
-    fi
-    if [[ "$admin_auto" == "enabled" ]]; then
-        echo -e "  管理面板: ${GREEN}✓ 已启用${NC}"
-    else
-        echo -e "  管理面板: ${RED}✗ 未启用${NC}"
-    fi
-    
-    # 显示证书状态
-    echo ""
-    echo -e "${YELLOW}[证书状态]${NC}"
-    local cert_domain=$(get_domain)
-    local cert_path="/etc/letsencrypt/live/${cert_domain}/fullchain.pem"
-    if [[ -f "$cert_path" ]]; then
-        local expiry_date=$(openssl x509 -enddate -noout -in "$cert_path" 2>/dev/null | cut -d= -f2)
-        if [[ -n "$expiry_date" ]]; then
-            local expiry_epoch=$(date -d "$expiry_date" +%s 2>/dev/null)
-            local now_epoch=$(date +%s)
-            local days_left=$(( (expiry_epoch - now_epoch) / 86400 ))
-            local formatted_expiry=$(date -d "$expiry_date" '+%Y-%m-%d %H:%M' 2>/dev/null)
-            echo -e "  域名: ${GREEN}${cert_domain}${NC}"
-            echo -e "  过期时间: ${CYAN}${formatted_expiry}${NC}"
-            if [[ $days_left -le 0 ]]; then
-                echo -e "  剩余天数: ${RED}已过期！请立即续期${NC}"
-            elif [[ $days_left -le 7 ]]; then
-                echo -e "  剩余天数: ${RED}${days_left} 天 ⚠ 即将过期${NC}"
-            elif [[ $days_left -le 30 ]]; then
-                echo -e "  剩余天数: ${YELLOW}${days_left} 天${NC}"
-            else
-                echo -e "  剩余天数: ${GREEN}${days_left} 天 ✓${NC}"
-            fi
-        else
-            echo -e "  ${RED}无法读取证书信息${NC}"
-        fi
-    else
-        echo -e "  ${RED}证书文件不存在: ${cert_path}${NC}"
-    fi
-    
-    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
-    echo ""
-    
-    local domain=$(get_domain)
-    local port=$(get_port)
-    local admin_pass=$(get_admin_password)
-    
-    echo -e "${YELLOW}[配置信息]${NC}"
-    echo -e "  绑定域名: ${GREEN}${domain}${NC}"
-    echo -e "  Hysteria 端口: ${GREEN}${port}${NC}"
-    echo -e "  管理面板: ${GREEN}https://${domain}${NC}"
-    echo -e "  管理密码: ${GREEN}${admin_pass}${NC}"
-    echo ""
-}
-
-show_menu() {
-    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║${NC}                      ${GREEN}B-UI 操作菜单${NC}                          ${CYAN}║${NC}"
-    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}1.${NC} 查看 API 文档                                          ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}2.${NC} 重启服务                                               ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}3.${NC} 查看日志                                               ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}4.${NC} 修改管理密码                                           ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}5.${NC} 开启 BBR                                               ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}6.${NC} 开机自启动开关                                         ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}7.${NC} ${GREEN}更新内核 (Hysteria2 + Xray)${NC}                            ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}8.${NC} ${RED}完全卸载${NC}                                               ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}0.${NC} 退出                                                   ${CYAN}║${NC}"
-    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
-}
-
-show_api_docs() {
-    local domain=$(get_domain)
-    local admin_pass=$(get_admin_password)
-    
-    echo ""
-    echo -e "${YELLOW}[URL 管理 API]${NC}"
-    echo -e "  基础 URL: ${GREEN}https://${domain}/api/manage${NC}"
-    echo ""
-    echo -e "  ${CYAN}┌─ action 参数 ────────────────────────────────────────────┐${NC}"
-    echo -e "  ${CYAN}│${NC}  create  - 创建新用户                                    ${CYAN}│${NC}"
-    echo -e "  ${CYAN}│${NC}  delete  - 删除用户                                      ${CYAN}│${NC}"
-    echo -e "  ${CYAN}│${NC}  update  - 修改用户配置                                  ${CYAN}│${NC}"
-    echo -e "  ${CYAN}│${NC}  list    - 列出所有用户                                  ${CYAN}│${NC}"
-    echo -e "  ${CYAN}└──────────────────────────────────────────────────────────┘${NC}"
-    echo ""
-    echo -e "  ${CYAN}┌─ 参数说明 ───────────────────────────────────────────────┐${NC}"
-    echo -e "  ${CYAN}│${NC}  key     - 管理密码 (必填)                               ${CYAN}│${NC}"
-    echo -e "  ${CYAN}│${NC}  user    - 用户名 (必填)                                 ${CYAN}│${NC}"
-    echo -e "  ${CYAN}│${NC}  pass    - 密码 (可选)                                   ${CYAN}│${NC}"
-    echo -e "  ${CYAN}│${NC}  days    - 有效天数 (0=永久)                             ${CYAN}│${NC}"
-    echo -e "  ${CYAN}│${NC}  traffic - 总流量 GB (0=不限)                            ${CYAN}│${NC}"
-    echo -e "  ${CYAN}└──────────────────────────────────────────────────────────┘${NC}"
-    echo ""
-    echo -e "  ${YELLOW}示例:${NC}"
-    echo -e "  ${GREEN}创建:${NC} https://${domain}/api/manage?key=${admin_pass}&action=create&user=test&days=30&traffic=10"
-    echo -e "  ${GREEN}删除:${NC} https://${domain}/api/manage?key=${admin_pass}&action=delete&user=test"
-    echo ""
-}
-
-change_password() {
-    echo ""
-    read -p "请输入新密码 (至少6位): " new_pass
-    if [[ ${#new_pass} -lt 6 ]]; then
-        print_error "密码至少6位"
-        return 1
-    fi
-    
-    local svc="/etc/systemd/system/b-ui-admin.service"
-    if [[ ! -f "$svc" ]]; then
-        print_error "服务配置文件不存在"
-        return 1
-    fi
-    
-    sed -i "s/ADMIN_PASSWORD=[^ ]*/ADMIN_PASSWORD=${new_pass}/" "$svc"
-    systemctl daemon-reload
-    systemctl restart b-ui-admin
-    
-    print_success "密码已更新为: ${new_pass}"
-}
-
-enable_bbr() {
-    local cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-    if [[ "$cc" == "bbr" ]]; then
-        print_success "BBR 已启用"
-        return 0
-    fi
-    
-    modprobe tcp_bbr 2>/dev/null || true
-    echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
-    echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-    sysctl -p > /dev/null 2>&1
-    print_success "BBR 启用成功"
-}
-
-update_hysteria() {
-    print_info "正在更新内核..."
-    echo ""
-    
-    # 更新 Hysteria2
-    print_info "更新 Hysteria2..."
-    local old_hy=$(hysteria version 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "未知")
-    bash <(curl -fsSL https://get.hy2.sh/)
-    local new_hy=$(hysteria version 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "未知")
-    echo -e "  Hysteria2: ${YELLOW}${old_hy}${NC} -> ${GREEN}${new_hy}${NC}"
-    systemctl restart hysteria-server 2>/dev/null || true
-    
-    # 更新 Xray
-    if command -v xray &> /dev/null; then
-        print_info "更新 Xray..."
-        local old_xray=$(xray version 2>/dev/null | head -n1 | awk '{print $2}' || echo "未知")
-        bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
-        local new_xray=$(xray version 2>/dev/null | head -n1 | awk '{print $2}' || echo "未知")
-        echo -e "  Xray: ${YELLOW}${old_xray}${NC} -> ${GREEN}${new_xray}${NC}"
-        systemctl restart xray 2>/dev/null || true
-    fi
-    
-    print_success "内核更新完成！"
-}
-
-uninstall_all() {
-    echo ""
-    echo -e "${RED}警告：此操作将完全卸载 B-UI 和 Hysteria2${NC}"
-    read -p "确定要继续吗? (输入 YES 确认): " confirm
-    
-    if [[ "$confirm" != "YES" ]]; then
-        print_info "已取消"
-        return
-    fi
-    
-    print_info "正在卸载..."
-    systemctl stop hysteria-server 2>/dev/null || true
-    systemctl stop b-ui-admin 2>/dev/null || true
-    systemctl stop xray 2>/dev/null || true
-    systemctl disable hysteria-server 2>/dev/null || true
-    systemctl disable b-ui-admin 2>/dev/null || true
-    systemctl disable xray 2>/dev/null || true
-    rm -f /etc/systemd/system/hysteria-server.service
-    rm -f /etc/systemd/system/b-ui-admin.service
-    rm -rf /etc/systemd/system/hysteria-server.service.d
-    rm -rf /etc/systemd/system/xray.service.d
-    rm -f /usr/local/bin/hysteria
-    rm -f /usr/local/bin/xray
-    rm -rf /usr/local/share/xray
-    rm -rf /opt/hysteria
-    rm -f /usr/local/bin/b-ui
-    rm -f /etc/nginx/conf.d/b-ui-admin.conf
-    systemctl daemon-reload
-    apt-get purge -y nginx nginx-common nodejs certbot 2>/dev/null || true
-    apt-get autoremove -y 2>/dev/null || true
-    
-    print_success "卸载完成！"
-    exit 0
-}
-
-main() {
-    if [[ $EUID -ne 0 ]]; then
-        print_error "请使用 sudo b-ui 运行"
-        exit 1
-    fi
-    
-    while true; do
-        show_banner
-        show_status
-        show_menu
-        
-        read -p "请选择 [0-8]: " choice
-        
-        case $choice in
-            1) show_api_docs ;;
-            2) 
-                systemctl restart hysteria-server 2>/dev/null || true
-                systemctl restart b-ui-admin 2>/dev/null || true
-                systemctl restart xray 2>/dev/null || true
-                print_success "所有服务已重启"
-                ;;
-            3) 
-                echo ""
-                echo -e "${YELLOW}选择日志类型:${NC}"
-                echo "  1. Hysteria2"
-                echo "  2. Xray"
-                echo "  3. 管理面板"
-                read -p "请选择 [1-3]: " log_choice
-                case $log_choice in
-                    1) journalctl -u hysteria-server --no-pager -n 30 ;;
-                    2) journalctl -u xray --no-pager -n 30 ;;
-                    3) journalctl -u b-ui-admin --no-pager -n 30 ;;
-                    *) print_error "无效选项" ;;
-                esac
-                ;;
-            4) change_password ;;
-            5) enable_bbr ;;
-            6)
-                echo ""
-                local hy_auto=$(systemctl is-enabled hysteria-server 2>/dev/null); hy_auto=${hy_auto:-disabled}
-                if [[ "$hy_auto" == "enabled" ]]; then
-                    systemctl disable hysteria-server 2>/dev/null || true
-                    systemctl disable xray 2>/dev/null || true
-                    systemctl disable b-ui-admin 2>/dev/null || true
-                    print_success "已关闭开机自启动"
-                else
-                    systemctl enable hysteria-server 2>/dev/null || true
-                    systemctl enable xray 2>/dev/null || true
-                    systemctl enable b-ui-admin 2>/dev/null || true
-                    print_success "已开启开机自启动"
-                fi
-                ;;
-            7)
-                print_info "正在更新内核..."
-                echo ""
-                print_info "更新 Hysteria2..."
-                local old_hy=$(hysteria version 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "未知")
-                bash <(curl -fsSL https://get.hy2.sh/)
-                local new_hy=$(hysteria version 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "未知")
-                echo -e "  Hysteria2: ${YELLOW}${old_hy}${NC} -> ${GREEN}${new_hy}${NC}"
-                
-                print_info "更新 Xray..."
-                local old_xray=$(xray version 2>/dev/null | head -n1 | awk '{print $2}' || echo "未知")
-                bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
-                local new_xray=$(xray version 2>/dev/null | head -n1 | awk '{print $2}' || echo "未知")
-                echo -e "  Xray: ${YELLOW}${old_xray}${NC} -> ${GREEN}${new_xray}${NC}"
-                
-                systemctl restart hysteria-server 2>/dev/null || true
-                systemctl restart xray 2>/dev/null || true
-                print_success "内核更新完成！"
-                ;;
-            8) uninstall_all ;;
-            0) echo ""; print_info "再见！"; exit 0 ;;
-            *) print_error "无效选项" ;;
-        esac
-        
-        echo ""
-        read -p "按 Enter 继续..."
-    done
-}
-
-main
+if [[ -f "$CLI_SCRIPT" ]]; then
+    source "$CLI_SCRIPT"
+else
+    echo -e "\033[0;31m[ERROR]\033[0m CLI 工具未找到: $CLI_SCRIPT"
+    echo -e "\033[0;34m[INFO]\033[0m 尝试重新下载..."
+    curl -fsSL "https://raw.githubusercontent.com/Buxiulei/b-ui/main/server/b-ui-cli.sh" -o "$CLI_SCRIPT" && chmod +x "$CLI_SCRIPT" && source "$CLI_SCRIPT"
+fi
 BUIEOF
     
     chmod +x /usr/local/bin/b-ui
@@ -2184,104 +1185,11 @@ start_hysteria() {
     fi
 }
 
-uninstall_all() {
-    echo ""
-    echo -e "${RED}════════════════════════════════════════════════════════════════${NC}"
-    echo -e "${RED}  警告：此操作将完全卸载 Hysteria2 和 B-UI 管理面板${NC}"
-    echo -e "${RED}════════════════════════════════════════════════════════════════${NC}"
-    echo ""
-    echo -e "将删除以下内容："
-    echo -e "  - Hysteria2 服务和二进制文件"
-    echo -e "  - B-UI 管理面板服务和文件"
-    echo -e "  - 所有用户配置和流量数据"
-    echo -e "  - Nginx 代理配置"
-    echo -e "  - SSL 证书 (可选)"
-    echo -e "  - b-ui 命令行工具"
-    echo ""
-    read -p "确定要继续吗? (输入 YES 确认): " confirm
-    
-    if [[ "$confirm" != "YES" ]]; then
-        print_info "已取消卸载"
-        return
-    fi
-    
-    print_info "开始卸载..."
-    
-    # 停止并禁用服务
-    print_info "停止服务..."
-    systemctl stop hysteria-server 2>/dev/null || true
-    systemctl stop b-ui-admin 2>/dev/null || true
-    systemctl stop xray 2>/dev/null || true
-    systemctl disable hysteria-server 2>/dev/null || true
-    systemctl disable b-ui-admin 2>/dev/null || true
-    systemctl disable xray 2>/dev/null || true
-    
-    # 删除 systemd 服务文件
-    print_info "删除服务配置..."
-    rm -f /etc/systemd/system/hysteria-server.service
-    rm -f /etc/systemd/system/b-ui-admin.service
-    rm -rf /etc/systemd/system/hysteria-server.service.d
-    rm -rf /etc/systemd/system/xray.service.d
-    systemctl daemon-reload
-    
-    # 删除 Hysteria 和 Xray 二进制文件
-    print_info "删除程序文件..."
-    rm -f /usr/local/bin/hysteria
-    rm -f /usr/local/bin/xray
-    rm -rf /usr/local/share/xray
-    
-    # 删除配置和数据目录
-    print_info "删除配置和数据..."
-    rm -rf /opt/hysteria
-    rm -rf /etc/hysteria
-    
-    # 删除 b-ui 命令
-    print_info "删除 b-ui 命令..."
-    rm -f /usr/local/bin/b-ui
-    
-    # 删除 Nginx 配置
-    print_info "删除 Nginx 配置..."
-    rm -f /etc/nginx/sites-enabled/b-ui-admin
-    rm -f /etc/nginx/sites-available/b-ui-admin
-    rm -f /etc/nginx/conf.d/b-ui-admin.conf
-    systemctl reload nginx 2>/dev/null || true
-    
-    # 删除 certbot 自动续期 cron
-    print_info "清理定时任务..."
-    crontab -l 2>/dev/null | grep -v "certbot renew" | crontab - 2>/dev/null || true
-    
-    # 删除 SSL 证书
-    print_info "删除 SSL 证书..."
-    local domain=$(ls /etc/letsencrypt/live/ 2>/dev/null | head -1)
-    if [[ -n "$domain" ]]; then
-        certbot delete --cert-name "$domain" --non-interactive 2>/dev/null || true
-    fi
-    rm -rf /etc/letsencrypt/live/*
-    rm -rf /etc/letsencrypt/archive/*
-    rm -rf /etc/letsencrypt/renewal/*
-    
-    # 卸载相关软件包
-    print_info "卸载相关软件包..."
-    apt-get purge -y nginx nginx-common nginx-core 2>/dev/null || true
-    apt-get purge -y nodejs npm 2>/dev/null || true
-    apt-get purge -y certbot python3-certbot-nginx 2>/dev/null || true
-    apt-get autoremove -y 2>/dev/null || true
-    
-    # 清理残留配置
-    rm -rf /etc/nginx
-    rm -rf /var/log/nginx
-    rm -rf /var/www/html
-    
-    echo ""
-    echo -e "${GREEN}════════════════════════════════════════════════════════════════${NC}"
-    echo -e "${GREEN}  完全卸载完成！${NC}"
-    echo -e "${GREEN}════════════════════════════════════════════════════════════════${NC}"
-    echo ""
-    echo -e "已删除: Hysteria2, B-UI, Nginx, Node.js, Certbot, SSL 证书"
-    echo ""
-}
+#===============================================================================
+# 简化状态显示（仅安装完成后使用，完整功能由 b-ui CLI 提供）
+#===============================================================================
 
-show_status() {
+show_install_status() {
     echo ""
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
     echo -e "${GREEN}服务状态${NC}"
@@ -2313,116 +1221,11 @@ show_status() {
         echo -e "  管理面板: ${YELLOW}未安装${NC}"
     fi
     
-    if check_bbr_status; then
-        echo -e "  BBR: ${GREEN}已启用${NC}"
-    else
-        echo -e "  BBR: ${YELLOW}未启用${NC}"
-    fi
-    
-    # 显示开机自启动状态
-    echo ""
-    echo -e "${YELLOW}[开机自启动]${NC}"
-    local hy_enabled=$(systemctl is-enabled "$HYSTERIA_SERVICE" 2>/dev/null); hy_enabled=${hy_enabled:-未配置}
-    local xray_enabled=$(systemctl is-enabled xray 2>/dev/null); xray_enabled=${xray_enabled:-未配置}
-    local admin_enabled=$(systemctl is-enabled "$ADMIN_SERVICE" 2>/dev/null); admin_enabled=${admin_enabled:-未配置}
-    echo -e "  Hysteria2: ${CYAN}${hy_enabled}${NC}"
-    echo -e "  Xray:      ${CYAN}${xray_enabled}${NC}"
-    echo -e "  管理面板:  ${CYAN}${admin_enabled}${NC}"
-    
-    # 显示证书状态
-    echo ""
-    echo -e "${YELLOW}[证书状态]${NC}"
-    if [[ -f "$CONFIG_FILE" ]]; then
-        local cert_domain=$(grep -A2 "^tls:" "$CONFIG_FILE" 2>/dev/null | grep "cert:" | sed 's|.*/live/\([^/]*\)/.*|\1|')
-        local cert_path="/etc/letsencrypt/live/${cert_domain}/fullchain.pem"
-        if [[ -n "$cert_domain" ]] && [[ -f "$cert_path" ]]; then
-            local expiry_date=$(openssl x509 -enddate -noout -in "$cert_path" 2>/dev/null | cut -d= -f2)
-            if [[ -n "$expiry_date" ]]; then
-                local expiry_epoch=$(date -d "$expiry_date" +%s 2>/dev/null)
-                local now_epoch=$(date +%s)
-                local days_left=$(( (expiry_epoch - now_epoch) / 86400 ))
-                local formatted_expiry=$(date -d "$expiry_date" '+%Y-%m-%d %H:%M' 2>/dev/null)
-                echo -e "  域名: ${GREEN}${cert_domain}${NC}"
-                echo -e "  过期时间: ${CYAN}${formatted_expiry}${NC}"
-                if [[ $days_left -le 0 ]]; then
-                    echo -e "  剩余天数: ${RED}已过期！请立即续期${NC}"
-                elif [[ $days_left -le 7 ]]; then
-                    echo -e "  剩余天数: ${RED}${days_left} 天 ⚠ 即将过期${NC}"
-                elif [[ $days_left -le 30 ]]; then
-                    echo -e "  剩余天数: ${YELLOW}${days_left} 天${NC}"
-                else
-                    echo -e "  剩余天数: ${GREEN}${days_left} 天 ✓${NC}"
-                fi
-            else
-                echo -e "  ${RED}无法读取证书信息${NC}"
-            fi
-        else
-            echo -e "  ${RED}证书文件不存在${NC}"
-        fi
-    else
-        echo -e "  ${YELLOW}未配置${NC}"
-    fi
-    
-    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
-    
-    # 显示网页看板信息
-    if [[ -f "$CONFIG_FILE" ]]; then
-        local domain=$(grep -A2 "^tls:" "$CONFIG_FILE" 2>/dev/null | grep "cert:" | sed 's|.*/live/\([^/]*\)/.*|\1|')
-        local admin_pass=$(grep "ADMIN_PASSWORD=" /etc/systemd/system/b-ui-admin.service 2>/dev/null | cut -d= -f3)
-        if [[ -n "$domain" ]]; then
-            echo ""
-            echo -e "${YELLOW}[网页管理面板]${NC}"
-            echo -e "  访问地址: ${GREEN}https://${domain}${NC}"
-            echo -e "  管理密码: ${GREEN}${admin_pass:-未设置}${NC}"
-        fi
-    fi
-}
-
-show_client_config() {
-    if [[ ! -f "$USERS_FILE" ]]; then
-        print_error "未找到用户配置"
-        return
-    fi
-    
-    local domain=$(grep -A1 "domains:" "$CONFIG_FILE" 2>/dev/null | tail -1 | sed 's/.*- //' | tr -d ' ')
-    local port=$(grep "listen:" "$CONFIG_FILE" 2>/dev/null | head -1 | sed 's/.*://' | tr -d ' ')
-    port=${port:-443}
-    
-    echo ""
-    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
-    echo -e "${GREEN}客户端配置${NC}"
-    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
-    
-    # 显示客户端一键安装命令
-    local install_key=""
-    if [[ -f "${BASE_DIR}/install-key.txt" ]]; then
-        install_key=$(cat "${BASE_DIR}/install-key.txt" 2>/dev/null)
-    else
-        install_key=$(tr -dc 'a-f0-9' < /dev/urandom | head -c 32)
-        echo "$install_key" > "${BASE_DIR}/install-key.txt"
-    fi
-    
-    echo ""
-    echo -e "${YELLOW}【客户端一键安装命令】${NC} (直接从服务端下载，国内可用)"
-    echo -e "${GREEN}bash <(curl -fsSL -k https://${domain}/install-client?key=${install_key})${NC}"
-    echo ""
-    echo -e "${CYAN}───────────────────────────────────────────────────────────────${NC}"
-    
-    # 解析用户列表
-    local users=$(cat "$USERS_FILE" 2>/dev/null)
-    echo "$users" | grep -oP '"username":"[^"]*"' | while read line; do
-        local uname=$(echo "$line" | cut -d'"' -f4)
-        local upass=$(echo "$users" | grep -oP "\"username\":\"$uname\",\"password\":\"[^\"]*\"" | grep -oP 'password":"[^"]*' | cut -d'"' -f3)
-        echo -e "  用户: ${YELLOW}$uname${NC}"
-        echo -e "  URI:  ${GREEN}hysteria2://${upass}@${domain}:${port}/?insecure=0#${uname}${NC}"
-        echo ""
-    done
-    
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
 }
 
 #===============================================================================
-# 一键安装
+# 一键安装编排
 #===============================================================================
 
 quick_install() {
@@ -2492,34 +1295,11 @@ quick_install() {
     echo -e "  管理面板: ${YELLOW}https://${DOMAIN}${NC}"
     echo -e "  管理密码: ${YELLOW}${ADMIN_PASSWORD}${NC}"
     echo ""
-    show_client_config
     
-    # 自动打开 b-ui 终端面板
-    echo ""
+    # 安装后自动打开 CLI 管理面板
     echo -e "${CYAN}正在打开 B-UI 终端管理面板...${NC}"
     sleep 2
     b-ui
-}
-
-#===============================================================================
-# 主菜单
-#===============================================================================
-
-show_menu() {
-    echo ""
-    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║${NC}                    ${GREEN}B-UI 操作菜单${NC}                            ${CYAN}║${NC}"
-    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}1.${NC} 一键安装 (Hysteria2 + Xray + 管理面板)                    ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}2.${NC} 查看客户端配置                                           ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}3.${NC} 重启所有服务                                             ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}4.${NC} 查看日志                                                 ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}5.${NC} 开启 BBR                                                 ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}6.${NC} 开机自启动设置                                           ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}7.${NC} ${GREEN}更新内核 (Hysteria2 + Xray)${NC}                              ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}8.${NC} ${RED}完全卸载${NC}                                                 ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}0.${NC} 退出                                                     ${CYAN}║${NC}"
-    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
 }
 
 main() {
@@ -2528,98 +1308,25 @@ main() {
     check_dependencies
     
     print_banner
-    show_status
     
-    while true; do
-        show_menu
-        read -p "请选择 [0-9]: " choice
-        
-        case $choice in
-            1) quick_install ;;
-            2) show_client_config ;;
-            3) 
-                systemctl restart "$HYSTERIA_SERVICE" 2>/dev/null || true
-                systemctl restart "$ADMIN_SERVICE" 2>/dev/null || true
-                systemctl restart xray 2>/dev/null || true
-                print_success "所有服务已重启 (Hysteria2 + Xray + 管理面板)"
-                ;;
-            4) 
-                echo ""
-                echo -e "${CYAN}查看日志 (选择服务)${NC}"
-                echo "  1. Hysteria2"
-                echo "  2. Xray"
-                echo "  3. 管理面板"
-                read -p "请选择 [1-3]: " log_choice
-                case $log_choice in
-                    1) journalctl -u "$HYSTERIA_SERVICE" --no-pager -n 30 ;;
-                    2) journalctl -u xray --no-pager -n 30 ;;
-                    3) journalctl -u "$ADMIN_SERVICE" --no-pager -n 30 ;;
-                    *) print_error "无效选项" ;;
-                esac
-                ;;
-            5) enable_bbr ;;
-            6) 
-                echo ""
-                echo -e "${CYAN}开机自启动设置${NC}"
-                echo ""
-                
-                # 检查当前状态
-                local hy_enabled=$(systemctl is-enabled "$HYSTERIA_SERVICE" 2>/dev/null || echo "disabled")
-                local admin_enabled=$(systemctl is-enabled "$ADMIN_SERVICE" 2>/dev/null || echo "disabled")
-                local xray_enabled=$(systemctl is-enabled xray 2>/dev/null || echo "disabled")
-                
-                echo -e "  Hysteria2 服务: ${YELLOW}${hy_enabled}${NC}"
-                echo -e "  Xray 服务:      ${YELLOW}${xray_enabled}${NC}"
-                echo -e "  管理面板服务:   ${YELLOW}${admin_enabled}${NC}"
-                echo ""
-                
-                read -p "切换自启动状态? (y/n): " toggle
-                if [[ "$toggle" == "y" || "$toggle" == "Y" ]]; then
-                    if [[ "$hy_enabled" == "enabled" ]]; then
-                        systemctl disable "$HYSTERIA_SERVICE" 2>/dev/null
-                        systemctl disable "$ADMIN_SERVICE" 2>/dev/null
-                        systemctl disable xray 2>/dev/null
-                        print_success "已禁用开机自启动"
-                    else
-                        systemctl enable "$HYSTERIA_SERVICE" 2>/dev/null
-                        systemctl enable "$ADMIN_SERVICE" 2>/dev/null
-                        systemctl enable xray 2>/dev/null
-                        print_success "已启用开机自启动"
-                    fi
-                fi
-                ;;
-            7)
-                print_info "正在更新内核..."
-                echo ""
-                
-                # 更新 Hysteria2
-                print_info "更新 Hysteria2..."
-                local old_hy=$(hysteria version 2>/dev/null | head -n1 || echo "未知")
-                bash <(curl -fsSL https://get.hy2.sh/)
-                local new_hy=$(hysteria version 2>/dev/null | head -n1 || echo "未知")
-                echo -e "  Hysteria2: ${YELLOW}${old_hy}${NC} -> ${GREEN}${new_hy}${NC}"
-                
-                # 更新 Xray
-                print_info "更新 Xray..."
-                local old_xray=$(xray version 2>/dev/null | head -n1 || echo "未知")
-                bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
-                local new_xray=$(xray version 2>/dev/null | head -n1 || echo "未知")
-                echo -e "  Xray: ${YELLOW}${old_xray}${NC} -> ${GREEN}${new_xray}${NC}"
-                
-                # 重启服务
-                systemctl restart "$HYSTERIA_SERVICE" 2>/dev/null || true
-                systemctl restart xray 2>/dev/null || true
-                print_success "内核更新完成！"
-                ;;
-            8) uninstall_all ;;
-            0) print_info "再见！"; exit 0 ;;
-            *) print_error "无效选项" ;;
-        esac
-        
+    # 检查是否已安装
+    if systemctl is-active --quiet "$HYSTERIA_SERVICE" 2>/dev/null; then
+        show_install_status
         echo ""
-        read -p "按 Enter 继续..."
-    done
+        echo -e "${GREEN}B-UI 已安装，正在打开管理面板...${NC}"
+        echo -e "${CYAN}提示：后续管理请直接使用 'sudo b-ui' 命令${NC}"
+        echo ""
+        sleep 1
+        # 委托给已安装的 CLI 工具
+        if [[ -x /usr/local/bin/b-ui ]]; then
+            exec /usr/local/bin/b-ui
+        else
+            print_warning "CLI 工具未找到，请重新安装"
+        fi
+    fi
+    
+    # 未安装，执行一键安装
+    quick_install
 }
 
 main "$@"
-# Force cache refresh

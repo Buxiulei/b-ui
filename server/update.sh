@@ -387,34 +387,161 @@ EOF
 }
 
 #===============================================================================
-# 更新内核（Hysteria2 和 Xray）
+# 更新内核（Hysteria2、Xray、sing-box）— 带版本检查
 #===============================================================================
 
+# 辅助: 版本号比较，相等返回 0，$1 更新返回 1
+_is_newer() {
+    local local_v="$1" remote_v="$2"
+    [[ -z "$remote_v" ]] && return 1
+    [[ "$local_v" == "$remote_v" ]] && return 1
+    [[ "$(printf '%s\n' "$local_v" "$remote_v" | sort -V | tail -n1)" == "$remote_v" ]] && return 0
+    return 1
+}
+
 update_kernel() {
-    print_info "正在更新内核..."
+    print_info "检查内核版本..."
     echo ""
-    
-    # 更新 Hysteria2
-    print_info "更新 Hysteria2..."
-    local old_hy=$(hysteria version 2>/dev/null | head -n1 || echo "未知")
-    bash <(curl -fsSL https://get.hy2.sh/)
-    local new_hy=$(hysteria version 2>/dev/null | head -n1 || echo "未知")
-    echo -e "  Hysteria2: ${YELLOW}${old_hy}${NC} -> ${GREEN}${new_hy}${NC}"
-    
-    # 更新 Xray
-    if command -v xray &> /dev/null; then
-        print_info "更新 Xray..."
-        local old_xray=$(xray version 2>/dev/null | head -n1 || echo "未知")
-        bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
-        local new_xray=$(xray version 2>/dev/null | head -n1 || echo "未知")
-        echo -e "  Xray: ${YELLOW}${old_xray}${NC} -> ${GREEN}${new_xray}${NC}"
+    local has_update=false
+
+    # --- Hysteria2 ---
+    local local_hy=$(hysteria version 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/^v//' || echo "")
+    local remote_hy=$(curl -fsSL --max-time 10 "https://api.github.com/repos/apernet/hysteria/releases/latest" 2>/dev/null \
+        | grep '"tag_name"' | sed -E 's/.*"tag_name":\s*"app\/v?([^"]+)".*/\1/')
+    [[ -z "$remote_hy" ]] && remote_hy=$(curl -fsSL --max-time 10 "https://api.github.com/repos/apernet/hysteria/releases/latest" 2>/dev/null \
+        | grep '"tag_name"' | sed -E 's/.*"v?([0-9][^"]+)".*/\1/')
+
+    echo -e "${CYAN}[Hysteria2]${NC}"
+    if [[ -n "$local_hy" && -n "$remote_hy" ]]; then
+        echo -e "  本地: ${YELLOW}v${local_hy}${NC}  远程: ${GREEN}v${remote_hy}${NC}"
+        if _is_newer "$local_hy" "$remote_hy"; then
+            print_info "发现新版本，正在更新..."
+            bash <(curl -fsSL https://get.hy2.sh/)
+            has_update=true
+        else
+            print_success "已是最新版本"
+        fi
+    elif [[ -z "$local_hy" ]]; then
+        print_warning "未安装，跳过"
+    else
+        print_warning "无法获取远程版本，跳过"
     fi
-    
+
+    # --- Xray ---
+    if command -v xray &> /dev/null; then
+        local local_xray=$(xray version 2>/dev/null | head -n1 | awk '{print $2}' | sed 's/^v//' || echo "")
+        local remote_xray=$(curl -fsSL --max-time 10 "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null \
+            | grep '"tag_name"' | sed -E 's/.*"v?([0-9][^"]+)".*/\1/')
+        echo ""
+        echo -e "${CYAN}[Xray]${NC}"
+        if [[ -n "$local_xray" && -n "$remote_xray" ]]; then
+            echo -e "  本地: ${YELLOW}v${local_xray}${NC}  远程: ${GREEN}v${remote_xray}${NC}"
+            if _is_newer "$local_xray" "$remote_xray"; then
+                print_info "发现新版本，正在更新..."
+                bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+                has_update=true
+            else
+                print_success "已是最新版本"
+            fi
+        else
+            print_warning "无法获取版本信息，跳过"
+        fi
+    fi
+
+    # --- sing-box ---
+    if command -v sing-box &> /dev/null; then
+        local local_sb=$(sing-box version 2>/dev/null | head -n1 | awk '{print $3}' | sed 's/^v//' || echo "")
+        local remote_sb=$(curl -fsSL --max-time 10 "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null \
+            | grep '"tag_name"' | sed -E 's/.*"v?([0-9][^"]+)".*/\1/')
+        echo ""
+        echo -e "${CYAN}[sing-box]${NC}"
+        if [[ -n "$local_sb" && -n "$remote_sb" ]]; then
+            echo -e "  本地: ${YELLOW}v${local_sb}${NC}  远程: ${GREEN}v${remote_sb}${NC}"
+            if _is_newer "$local_sb" "$remote_sb"; then
+                print_info "发现新版本，正在更新..."
+                if command -v apt-get &> /dev/null; then
+                    apt-get update -qq && apt-get install -y -qq sing-box
+                else
+                    bash <(curl -fsSL https://sing-box.app/install.sh)
+                fi
+                has_update=true
+            else
+                print_success "已是最新版本"
+            fi
+        else
+            print_warning "无法获取版本信息，跳过"
+        fi
+    fi
+
     # 重启服务
-    systemctl restart hysteria-server 2>/dev/null || true
-    systemctl restart xray 2>/dev/null || true
-    
-    print_success "内核更新完成！"
+    if [[ "$has_update" == "true" ]]; then
+        echo ""
+        systemctl restart hysteria-server 2>/dev/null || true
+        systemctl restart xray 2>/dev/null || true
+        print_success "内核更新完成，服务已重启"
+    else
+        echo ""
+        print_success "所有内核均为最新版本"
+    fi
+}
+
+#===============================================================================
+# 静默内核更新 (用于 cron 定时任务)
+#===============================================================================
+
+auto_update_kernel() {
+    local LOG_FILE="/var/log/b-ui-kernel-update.log"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 开始检查内核更新..." >> "$LOG_FILE"
+
+    local updated=false
+
+    # Hysteria2
+    local local_hy=$(hysteria version 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/^v//' || echo "")
+    local remote_hy=$(curl -fsSL --max-time 10 "https://api.github.com/repos/apernet/hysteria/releases/latest" 2>/dev/null \
+        | grep '"tag_name"' | sed -E 's/.*"tag_name":\s*"app\/v?([^"]+)".*/\1/')
+    [[ -z "$remote_hy" ]] && remote_hy=$(curl -fsSL --max-time 10 "https://api.github.com/repos/apernet/hysteria/releases/latest" 2>/dev/null \
+        | grep '"tag_name"' | sed -E 's/.*"v?([0-9][^"]+)".*/\1/')
+    if [[ -n "$local_hy" && -n "$remote_hy" ]] && _is_newer "$local_hy" "$remote_hy"; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Hysteria2: v${local_hy} -> v${remote_hy}, 更新中..." >> "$LOG_FILE"
+        bash <(curl -fsSL https://get.hy2.sh/) >> "$LOG_FILE" 2>&1 || true
+        systemctl restart hysteria-server 2>/dev/null || true
+        updated=true
+    fi
+
+    # Xray
+    if command -v xray &> /dev/null; then
+        local local_xray=$(xray version 2>/dev/null | head -n1 | awk '{print $2}' | sed 's/^v//' || echo "")
+        local remote_xray=$(curl -fsSL --max-time 10 "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null \
+            | grep '"tag_name"' | sed -E 's/.*"v?([0-9][^"]+)".*/\1/')
+        if [[ -n "$local_xray" && -n "$remote_xray" ]] && _is_newer "$local_xray" "$remote_xray"; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Xray: v${local_xray} -> v${remote_xray}, 更新中..." >> "$LOG_FILE"
+            bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install >> "$LOG_FILE" 2>&1 || true
+            systemctl restart xray 2>/dev/null || true
+            updated=true
+        fi
+    fi
+
+    # sing-box
+    if command -v sing-box &> /dev/null; then
+        local local_sb=$(sing-box version 2>/dev/null | head -n1 | awk '{print $3}' | sed 's/^v//' || echo "")
+        local remote_sb=$(curl -fsSL --max-time 10 "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null \
+            | grep '"tag_name"' | sed -E 's/.*"v?([0-9][^"]+)".*/\1/')
+        if [[ -n "$local_sb" && -n "$remote_sb" ]] && _is_newer "$local_sb" "$remote_sb"; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] sing-box: v${local_sb} -> v${remote_sb}, 更新中..." >> "$LOG_FILE"
+            if command -v apt-get &> /dev/null; then
+                apt-get update -qq && apt-get install -y -qq sing-box >> "$LOG_FILE" 2>&1 || true
+            else
+                bash <(curl -fsSL https://sing-box.app/install.sh) >> "$LOG_FILE" 2>&1 || true
+            fi
+            updated=true
+        fi
+    fi
+
+    if [[ "$updated" == "true" ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] 内核更新完成" >> "$LOG_FILE"
+    else
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] 所有内核已是最新" >> "$LOG_FILE"
+    fi
 }
 
 #===============================================================================
@@ -453,6 +580,9 @@ ensure_cron_jobs() {
     if ! echo "$current_cron" | grep -q "${BASE_DIR}/cert-check.sh"; then
         needs_fix=1
     fi
+    if ! echo "$current_cron" | grep -q "${BASE_DIR}/update.sh kernel"; then
+        needs_fix=1
+    fi
     # 检查是否存在错误路径
     if echo "$current_cron" | grep -q "server/update.sh"; then
         needs_fix=1
@@ -468,10 +598,11 @@ ensure_cron_jobs() {
         new_cron="${new_cron}
 # === B-UI 定时任务 ===
 0 */6 * * * ${BASE_DIR}/update.sh auto >> /var/log/b-ui-update.log 2>&1
+30 */12 * * * ${BASE_DIR}/update.sh kernel >> /var/log/b-ui-kernel-update.log 2>&1
 0 */12 * * * ${BASE_DIR}/cert-check.sh >> /var/log/b-ui-cert-check.log 2>&1"
         
         echo "$new_cron" | sed '/^$/d' | crontab -
-        print_success "定时任务已修复: 每6小时检查更新, 每12小时检查证书"
+        print_success "定时任务已修复: 每6小时检查B-UI更新, 每12小时检查内核更新和证书"
     fi
 }
 
@@ -564,6 +695,9 @@ auto_update() {
     else
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] 已是最新版本: v${local_ver}" >> "$LOG_FILE"
     fi
+
+    # B-UI 更新检查后，顺带检查内核更新
+    auto_update_kernel
 }
 
 # 如果直接运行此脚本
@@ -572,6 +706,10 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         auto)
             # 静默自动更新模式 (用于 cron)
             auto_update
+            ;;
+        kernel)
+            # 静默内核更新模式 (用于 cron)
+            auto_update_kernel
             ;;
         *)
             # 交互模式
