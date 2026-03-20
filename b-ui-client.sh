@@ -1176,7 +1176,7 @@ OUTBOUND
       "mtu": 1400,
       "auto_route": true,
       "strict_route": true,
-      "stack": "system",
+      "stack": "mixed",
       "sniff": true,
       "sniff_override_destination": true
     },
