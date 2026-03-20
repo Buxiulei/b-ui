@@ -7,7 +7,7 @@
 #===============================================================================
 
 # 版本号会在安装时从 GitHub 同步更新
-SCRIPT_VERSION="3.1.1"
+SCRIPT_VERSION="3.1.2"
 
 # 注意: 不使用 set -e，因为它会导致 ((count++)) 等算术运算在变量为0时退出脚本
 
@@ -165,7 +165,8 @@ check_client_update() {
     local mirror_json=$(curl -fsSL --max-time 5 "${MIRROR_GHPROXY}/${VERSION_JSON_RAW_URL}" 2>/dev/null)
     local mirror_ver=$(_extract_version "$mirror_json")
     if [[ -n "$mirror_ver" ]]; then
-        if [[ "$(_newer_version "$mirror_ver" "$best_version")" == "$mirror_ver" ]]; then
+        # 仅当严格更新时才覆盖（服务端版本相同时不替换）
+        if [[ "$(_newer_version "$mirror_ver" "$best_version")" == "$mirror_ver" && "$mirror_ver" != "$best_version" ]]; then
             best_version="$mirror_ver"
             best_source="国内镜像"
             best_url="${MIRROR_GHPROXY}/${GITHUB_RAW_URL}"
@@ -177,7 +178,8 @@ check_client_update() {
     local github_json=$(curl -fsSL --max-time 5 "$VERSION_JSON_RAW_URL" 2>/dev/null)
     local github_ver=$(_extract_version "$github_json")
     if [[ -n "$github_ver" ]]; then
-        if [[ "$(_newer_version "$github_ver" "$best_version")" == "$github_ver" ]]; then
+        # 仅当严格更新时才覆盖（服务端/镜像版本相同时不替换）
+        if [[ "$(_newer_version "$github_ver" "$best_version")" == "$github_ver" && "$github_ver" != "$best_version" ]]; then
             best_version="$github_ver"
             best_source="GitHub"
             best_url="$GITHUB_RAW_URL"
@@ -215,18 +217,20 @@ do_client_update() {
     # 加载服务端地址
     load_server_address
     
-    # 构建下载源列表
+    # 构建下载源列表 (服务端永远排第一，确保国内可达)
     local sources=()
     
-    # 优先使用检测到的最佳源
-    if [[ -n "$UPDATE_URL" ]]; then
-        sources+=("${UPDATE_URL}|${UPDATE_SOURCE}(最佳)")
+    # 服务端优先 (国内可达，速度最快)
+    if [[ -n "$SERVER_ADDRESS" ]]; then
+        sources+=("https://${SERVER_ADDRESS}/packages/b-ui-client.sh|服务端")
+    fi
+    
+    # 检测到的最佳源 (如果不是服务端，作为第二选择)
+    if [[ -n "$UPDATE_URL" && "$UPDATE_SOURCE" != "服务端" ]]; then
+        sources+=("${UPDATE_URL}|${UPDATE_SOURCE}")
     fi
     
     # 备选源
-    if [[ -n "$SERVER_ADDRESS" ]]; then
-        sources+=("https://${SERVER_ADDRESS}/api/download/b-ui-client.sh|服务端")
-    fi
     sources+=("${MIRROR_GHPROXY}/${GITHUB_RAW_URL}|国内镜像")
     sources+=("${GITHUB_RAW_URL}|GitHub")
     sources+=("${REMOTE_VERSION_URL}|CDN")

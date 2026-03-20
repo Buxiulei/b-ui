@@ -1194,6 +1194,19 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
             }
 
             if (r === "manage") return handleManage(u.searchParams, res);
+            // 客户端版本查询 API (无需认证, 供客户端检查更新)
+            if (r === "version") {
+                try {
+                    const versionFile = path.join(BASE_DIR, "version.json");
+                    if (fs.existsSync(versionFile)) {
+                        const data = JSON.parse(fs.readFileSync(versionFile, "utf8"));
+                        return sendJSON(res, data);
+                    }
+                    return sendJSON(res, { version: CONFIG.scriptVersion || "0.0.0" });
+                } catch (e) {
+                    return sendJSON(res, { version: "0.0.0" });
+                }
+            }
 
             // 内核版本查询 API (无需认证, 供客户端检查更新)
             if (r === "kernel-versions") {
