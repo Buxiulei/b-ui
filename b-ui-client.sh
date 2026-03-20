@@ -1608,6 +1608,13 @@ EOF
     # 保存原始 URI
     echo "$uri" > "${config_dir}/uri.txt"
     
+    # 将当前配置文件拷贝到 profile 目录（供 switch_config 使用）
+    if [[ "$protocol" == "hysteria2" ]] && [[ -f "$CONFIG_FILE" ]]; then
+        cp "$CONFIG_FILE" "${config_dir}/config.yaml"
+    elif [[ -f "${BASE_DIR}/xray-config.json" ]]; then
+        cp "${BASE_DIR}/xray-config.json" "${config_dir}/xray-config.json"
+    fi
+    
     # 保存服务端地址 (用于从服务端下载安装包)
     # 提取服务器域名/IP (去掉端口)
     local server_host=$(echo "$server" | cut -d':' -f1)
