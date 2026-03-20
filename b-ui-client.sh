@@ -7,7 +7,7 @@
 #===============================================================================
 
 # 版本号会在安装时从 GitHub 同步更新
-SCRIPT_VERSION="3.0.2"
+SCRIPT_VERSION="3.0.3"
 
 # 注意: 不使用 set -e，因为它会导致 ((count++)) 等算术运算在变量为0时退出脚本
 
@@ -3587,7 +3587,11 @@ update_all() {
         server_versions=$(curl -fsSL --max-time 5 -k "https://${SERVER_ADDRESS}/api/kernel-versions" 2>/dev/null || echo "")
     fi
     
-    _jval() { echo "$1" | grep -oP "\"$2\"\s*:\s*\"\K[^\"]+" 2>/dev/null | head -1; }
+    # 从 JSON 字符串提取字段值（兼容无 grep -P 的系统）
+    _jval() { echo "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -1; }
+    # 版本号格式校验：只接受 X.Y.Z 格式（过滤 HTML/CSS 垃圾）
+    _is_ver() { [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; }
+    # 取两个版本号中较新的
     _newer() { printf '%s\n' "$1" "$2" | sort -V | tail -n1; }
     
     local sv_hy=$(_jval "$server_versions" "hysteria2")
@@ -3600,6 +3604,8 @@ update_all() {
             | grep '"tag_name"' | sed -E 's/.*"tag_name":\s*"app\/v?([^"]+)".*/\1/')
         [[ -z "$gh_hy" ]] && gh_hy=$(curl -fsSL --max-time 10 "https://api.github.com/repos/apernet/hysteria/releases/latest" 2>/dev/null \
             | grep '"tag_name"' | sed -E 's/.*"v?([0-9][^"]+)".*/\1/')
+        _is_ver "$gh_hy" || gh_hy=""
+        _is_ver "$sv_hy" || sv_hy=""
         local best_hy=$(_newer "${sv_hy:-0}" "${gh_hy:-0}")
         [[ "$best_hy" == "0" ]] && best_hy=""
         echo ""
@@ -3618,6 +3624,8 @@ update_all() {
         local local_xray=$(xray version 2>/dev/null | head -n1 | awk '{print $2}' | sed 's/^v//' || echo "")
         local gh_xray=$(curl -fsSL --max-time 10 "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null \
             | grep '"tag_name"' | sed -E 's/.*"v?([0-9][^"]+)".*/\1/')
+        _is_ver "$gh_xray" || gh_xray=""
+        _is_ver "$sv_xray" || sv_xray=""
         local best_xray=$(_newer "${sv_xray:-0}" "${gh_xray:-0}")
         [[ "$best_xray" == "0" ]] && best_xray=""
         echo ""
@@ -3636,6 +3644,8 @@ update_all() {
         local local_sb=$(sing-box version 2>/dev/null | head -n1 | awk '{print $3}' | sed 's/^v//' || echo "")
         local gh_sb=$(curl -fsSL --max-time 10 "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null \
             | grep '"tag_name"' | sed -E 's/.*"v?([0-9][^"]+)".*/\1/')
+        _is_ver "$gh_sb" || gh_sb=""
+        _is_ver "$sv_sb" || sv_sb=""
         local best_sb=$(_newer "${sv_sb:-0}" "${gh_sb:-0}")
         [[ "$best_sb" == "0" ]] && best_sb=""
         echo ""
