@@ -7,7 +7,7 @@
 #===============================================================================
 
 # 版本号会在安装时从 GitHub 同步更新
-SCRIPT_VERSION="3.0.1"
+SCRIPT_VERSION="3.0.2"
 
 # 注意: 不使用 set -e，因为它会导致 ((count++)) 等算术运算在变量为0时退出脚本
 
@@ -1135,14 +1135,15 @@ OUTBOUND
   "dns": {
     "servers": [
       {
+        "type": "https",
         "tag": "proxy-dns",
-        "address": "https://8.8.8.8/dns-query",
-        "address_resolver": "local-dns",
+        "server": "8.8.8.8",
         "detour": "proxy-out"
       },
       {
+        "type": "udp",
         "tag": "local-dns",
-        "address": "223.5.5.5",
+        "server": "223.5.5.5",
         "detour": "direct-out"
       }
     ],
