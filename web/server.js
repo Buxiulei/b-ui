@@ -1653,6 +1653,8 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                     c = c.replace(/ADMIN_PASSWORD=[^\n]*/, "ADMIN_PASSWORD=" + b.newPassword);
                     fs.writeFileSync(svc, c);
                     execSync("systemctl daemon-reload");
+                    // 同时更新内存中的密码，立即生效（无需重启服务）
+                    CONFIG.adminPassword = b.newPassword;
                     return sendJSON(res, { success: true, message: "密码已更新，请重新登录" });
                 } catch (e) { return sendJSON(res, { error: e.message }, 500); }
             }

@@ -536,8 +536,9 @@ ${DOMAIN} {
 }
 CADDYEOF
 
-    # 创建日志目录
+    # 创建日志目录 (Caddy 以 caddy 用户运行)
     mkdir -p /var/log/caddy
+    chown -R caddy:caddy /var/log/caddy
     
     # 验证配置
     if caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile 2>/dev/null; then
