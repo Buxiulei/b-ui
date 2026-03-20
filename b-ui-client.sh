@@ -2506,67 +2506,19 @@ $(echo -e "$bw_config")
         print_info "带宽设置: 上行 ${BANDWIDTH_UP:-未设置} Mbps, 下行 ${BANDWIDTH_DOWN:-未设置} Mbps"
     fi
 
-    # 添加 TUN 配置
-    if [[ "$TUN_ENABLED" == "true" ]]; then
+    # TUN 模式：Hysteria2 只提供 SOCKS/HTTP 代理, sing-box 管全局路由
+    # 非 TUN 模式：不需要额外配置
+    # 两种模式都不再向 Hysteria2 config 添加 TUN/DNS/ACL 段
+    # （sing-box 有自己的 DNS 和路由规则）
+    
+    # 仅当有自定义绕过规则且非 TUN 模式时，添加 ACL
+    if [[ "$TUN_ENABLED" != "true" ]] && [[ -n "$custom_acl_rules" ]]; then
         cat >> "$CONFIG_FILE" << EOF
-
-# TUN 模式 (全局代理) - 仅路由 IPv4 流量
-tun:
-  name: "hystun"
-  mtu: 1500
-  timeout: 5m
-  address:
-    ipv4: 100.100.100.101/30
-    ipv6: 2001::ffff:ffff:ffff:fff1/126
-  route:
-    ipv4: [0.0.0.0/0]
-    ipv4Exclude:
-$([ -n "$server_ip" ] && echo "      - ${server_ip}/32")
-      - 10.0.0.0/8
-      - 172.16.0.0/12
-      - 192.168.0.0/16
-      - 127.0.0.0/8
-      - 169.254.0.0/16
-      - 224.0.0.0/4
-      - 255.255.255.255/32
-    ipv6Exclude:
-      - "::/0"
-
-# DNS 配置 - 解决域名解析问题
-dns:
-  # 使用代理服务器解析 DNS
-  mode: tcp
-  hijack:
-    - type: override
-      addr: 8.8.8.8:53
-    - type: override
-      addr: 8.8.4.4:53
-
-# ACL 路由规则 - 保护 SSH 连接
-acl:
-  inline:
-    # SSH 端口保护 - 所有 22 端口流量绕过代理
-    - :22 direct
-    - :22/ direct
-    # 常用 SSH 备用端口
-    - :2222 direct
-    - :2222/ direct
-EOF
-        
-        # 添加自定义 ACL 规则
-        if [[ -n "$custom_acl_rules" ]]; then
-            echo -e "$custom_acl_rules" >> "$CONFIG_FILE"
-        fi
-    else
-        # 非 TUN 模式，但如果有自定义规则，也添加 ACL
-        if [[ -n "$custom_acl_rules" ]]; then
-            cat >> "$CONFIG_FILE" << EOF
 
 # ACL 路由规则
 acl:
   inline:$(echo -e "$custom_acl_rules")
 EOF
-        fi
     fi
 }
 
