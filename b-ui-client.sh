@@ -2438,8 +2438,13 @@ EOF
 generate_config() {
     # 获取服务器 IP 用于 TUN 排除
     local server_host=$(echo "$SERVER_ADDR" | cut -d':' -f1)
-    local server_ip=$(dig +short "$server_host" A 2>/dev/null | head -1)
-    [[ -z "$server_ip" ]] && server_ip="$server_host"
+    local server_ip=$(dig +short "$server_host" A 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+    # fallback: getent 解析
+    [[ -z "$server_ip" ]] && server_ip=$(getent ahostsv4 "$server_host" 2>/dev/null | awk '{print $1; exit}')
+    # 最终验证：必须是合法 IP 格式
+    if [[ ! "$server_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        server_ip=""
+    fi
     
     # 读取自定义规则
     local custom_acl_rules=""
@@ -2516,7 +2521,7 @@ tun:
   route:
     ipv4: [0.0.0.0/0]
     ipv4Exclude:
-      - ${server_ip}/32
+$([ -n "$server_ip" ] && echo "      - ${server_ip}/32")
       - 10.0.0.0/8
       - 172.16.0.0/12
       - 192.168.0.0/16
