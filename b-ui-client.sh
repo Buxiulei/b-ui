@@ -1160,10 +1160,6 @@ OUTBOUND
       {
         "domain_suffix": [".cn"],
         "server": "local-dns"
-      },
-      {
-        "outbound": "any",
-        "server": "local-dns"
       }
     ],
     "final": "proxy-dns",
