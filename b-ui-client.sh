@@ -1227,6 +1227,36 @@ EOF
     print_success "sing-box TUN 配置已生成: $singbox_config"
 }
 
+# 系统代理环境变量管理
+# 让 curl/git/wget/apt 等命令自动走代理，无需 TUN 全局劫持
+setup_system_proxy() {
+    local socks_port="${1:-1080}"
+    local http_port="${2:-8080}"
+    
+    cat > /etc/profile.d/proxy.sh << EOF
+# B-UI 自动代理配置 (bui-c 管理，请勿手动修改)
+export http_proxy="http://127.0.0.1:${http_port}"
+export https_proxy="http://127.0.0.1:${http_port}"
+export all_proxy="socks5://127.0.0.1:${socks_port}"
+export HTTP_PROXY="http://127.0.0.1:${http_port}"
+export HTTPS_PROXY="http://127.0.0.1:${http_port}"
+export ALL_PROXY="socks5://127.0.0.1:${socks_port}"
+export no_proxy="localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.cn"
+export NO_PROXY="localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.cn"
+EOF
+    chmod 644 /etc/profile.d/proxy.sh
+    # 立即在当前 shell 生效
+    source /etc/profile.d/proxy.sh 2>/dev/null || true
+    print_success "系统代理已配置 (SOCKS5:${socks_port} HTTP:${http_port})"
+    echo -e "  ${DIM}新终端自动生效 | 当前终端: source /etc/profile.d/proxy.sh${NC}"
+}
+
+remove_system_proxy() {
+    rm -f /etc/profile.d/proxy.sh
+    # 清除当前 shell 变量
+    unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY no_proxy NO_PROXY 2>/dev/null || true
+}
+
 # 检测公网 IP 和连通性
 check_public_ip() {
     local mode="${1:-TUN}"  # 模式标识: TUN 或 切换配置
@@ -1426,6 +1456,9 @@ stop_tun_mode() {
         sleep 1
         if systemctl is-active --quiet "$CLIENT_SERVICE"; then
             print_success "Hysteria2 客户端已恢复"
+            local p_socks=$(grep -A1 '^socks5:' "$CONFIG_FILE" 2>/dev/null | grep 'listen:' | sed 's/.*://')
+            local p_http=$(grep -A1 '^http:' "$CONFIG_FILE" 2>/dev/null | grep 'listen:' | sed 's/.*://')
+            setup_system_proxy "${p_socks:-1080}" "${p_http:-8080}"
         fi
     elif [[ -f /etc/systemd/system/xray-client.service ]]; then
         print_info "恢复 Xray 客户端..."
@@ -2027,6 +2060,9 @@ _configure_and_save() {
         
         create_service
         systemctl start "$CLIENT_SERVICE"
+        
+        # 配置系统代理（让 curl/git/apt 自动走代理）
+        setup_system_proxy "$SOCKS_PORT" "$HTTP_PORT"
         
         # 如果选择了启用 TUN 模式，生成配置并启动
         if [[ "$TUN_ENABLED" == "true" ]]; then
@@ -3578,12 +3614,16 @@ service_control_menu() {
             1)
                 if [[ "$hy_status" == "running" ]]; then
                     systemctl stop "$CLIENT_SERVICE" 2>/dev/null || true
+                    remove_system_proxy
                     print_success "Hysteria2 已停止"
                 else
                     if [[ -f "/etc/systemd/system/$CLIENT_SERVICE" ]]; then
                         systemctl start "$CLIENT_SERVICE" 2>/dev/null || true
                         sleep 1
                         if systemctl is-active --quiet "$CLIENT_SERVICE"; then
+                            local p_socks=$(grep -A1 '^socks5:' "$CONFIG_FILE" 2>/dev/null | grep 'listen:' | sed 's/.*://')
+                            local p_http=$(grep -A1 '^http:' "$CONFIG_FILE" 2>/dev/null | grep 'listen:' | sed 's/.*://')
+                            setup_system_proxy "${p_socks:-1080}" "${p_http:-8080}"
                             print_success "Hysteria2 已启动"
                         else
                             print_error "Hysteria2 启动失败"
