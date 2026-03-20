@@ -167,24 +167,44 @@ install_nodejs() {
 # 安装 Nginx
 #===============================================================================
 
-install_nginx() {
-    print_info "检查 Nginx..."
+install_caddy() {
+    print_info "检查 Caddy..."
     
-    if command -v nginx &> /dev/null; then
-        print_success "Nginx 已安装"
+    if command -v caddy &> /dev/null; then
+        print_success "Caddy 已安装: $(caddy version 2>/dev/null | head -1)"
         return 0
     fi
     
-    print_info "安装 Nginx..."
+    print_info "安装 Caddy..."
     if command -v apt-get &> /dev/null; then
-        apt-get update && apt-get install -y nginx
+        # Debian/Ubuntu: 使用官方 APT 仓库
+        apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl 2>/dev/null || true
+        curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg 2>/dev/null
+        curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list > /dev/null
+        apt-get update -qq && apt-get install -y caddy
     elif command -v yum &> /dev/null; then
-        yum install -y nginx
+        # CentOS/RHEL: 使用官方 YUM 仓库
+        yum install -y yum-plugin-copr 2>/dev/null || true
+        yum copr enable -y @caddy/caddy 2>/dev/null || true
+        yum install -y caddy
     elif command -v dnf &> /dev/null; then
-        dnf install -y nginx
+        dnf install -y 'dnf-command(copr)' 2>/dev/null || true
+        dnf copr enable -y @caddy/caddy 2>/dev/null || true
+        dnf install -y caddy
     fi
-    systemctl enable nginx
-    print_success "Nginx 安装完成"
+    
+    if ! command -v caddy &> /dev/null; then
+        print_error "Caddy 安装失败"
+        return 1
+    fi
+    
+    systemctl enable caddy
+    print_success "Caddy 安装完成"
+}
+
+# 兼容旧调用
+install_nginx() {
+    install_caddy
 }
 
 #===============================================================================
@@ -489,47 +509,51 @@ EOF
 # 配置 Nginx
 #===============================================================================
 
-configure_nginx_proxy() {
-    print_info "配置 Nginx HTTPS 反向代理..."
+configure_caddy_proxy() {
+    print_info "配置 Caddy HTTPS 反向代理..."
     
-    # 安装 certbot
-    if command -v apt-get &> /dev/null; then
-        apt-get install -y certbot python3-certbot-nginx
-    elif command -v yum &> /dev/null; then
-        yum install -y certbot python3-certbot-nginx
-    elif command -v dnf &> /dev/null; then
-        dnf install -y certbot python3-certbot-nginx
+    # 如果有旧的 nginx 配置，停用 nginx 释放 80/443 端口
+    if command -v nginx &> /dev/null; then
+        systemctl stop nginx 2>/dev/null || true
+        systemctl disable nginx 2>/dev/null || true
+        print_info "已停用 Nginx (Caddy 接管 80/443)"
     fi
     
-    # 创建 HTTP 配置
-    cat > "/etc/nginx/conf.d/b-ui-admin.conf" << EOF
-server {
-    listen 80;
-    server_name ${DOMAIN};
-    
-    location /.well-known/acme-challenge/ {
-        root /var/www/html;
-    }
-    
-    location / {
-        proxy_pass http://127.0.0.1:${ADMIN_PORT};
-        proxy_http_version 1.1;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
+    # 生成 Caddyfile (自动 HTTPS + 反向代理)
+    cat > /etc/caddy/Caddyfile << CADDYEOF
+# B-UI Web 管理面板 - 由 Caddy 自动管理 HTTPS 证书
+${DOMAIN} {
+    # 反代到 Node.js 管理面板
+    reverse_proxy 127.0.0.1:${ADMIN_PORT}
+
+    # 日志
+    log {
+        output file /var/log/caddy/b-ui-access.log {
+            roll_size 10mb
+            roll_keep 5
+        }
     }
 }
-EOF
+CADDYEOF
+
+    # 创建日志目录
+    mkdir -p /var/log/caddy
     
-    mkdir -p /var/www/html
-    nginx -t && systemctl reload nginx
+    # 验证配置
+    if caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile 2>/dev/null; then
+        print_success "Caddy 配置验证通过"
+    else
+        print_warning "Caddy 配置验证失败，请检查域名配置"
+    fi
     
-    # 申请 SSL 证书
-    print_info "申请 SSL 证书..."
-    certbot --nginx -d "${DOMAIN}" --non-interactive --agree-tos -m "${EMAIL}" --redirect || {
-        print_warning "SSL 证书申请失败，请稍后手动配置"
-    }
-    
-    print_success "Nginx 配置完成"
+    # 重启 Caddy (自动申请 SSL 证书)
+    systemctl restart caddy
+    print_success "Caddy 反向代理已配置 (自动 HTTPS: ${DOMAIN})"
+}
+
+# 兼容旧调用
+configure_nginx_proxy() {
+    configure_caddy_proxy
 }
 
 #===============================================================================
@@ -542,29 +566,23 @@ configure_cron_tasks() {
     # 清除旧的 b-ui 相关 cron 任务
     crontab -l 2>/dev/null | grep -v "certbot renew" | grep -v "b-ui" | grep -v "cert-check" | crontab - 2>/dev/null || true
     
-    # 创建证书健康检查脚本
+    # 创建 Caddy 健康检查脚本 (Caddy 自动续期证书，只需检查服务状态)
     cat > "${BASE_DIR}/cert-check.sh" << 'CERTEOF'
 #!/bin/bash
-# B-UI 证书健康检查与自动修复
+# B-UI Caddy 健康检查 (Caddy 自动管理 HTTPS 证书)
 LOG="/var/log/b-ui-cert-check.log"
-DOMAIN=$(grep -A3 "^tls:" /opt/b-ui/config.yaml 2>/dev/null | grep "cert:" | sed 's|.*/live/\([^/]*\)/.*|\1|')
-CERT="/etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
 
-[ -z "$DOMAIN" ] && exit 0
-[ ! -f "$CERT" ] && echo "[$(date)] ERROR: 证书不存在: $CERT" >> "$LOG" && exit 1
-
-# 检查是否在 7 天内过期
-if ! openssl x509 -checkend 604800 -noout -in "$CERT" 2>/dev/null; then
-    EXPIRY=$(openssl x509 -enddate -noout -in "$CERT" | cut -d= -f2)
-    echo "[$(date)] WARNING: 证书即将过期 ($EXPIRY)，尝试续期..." >> "$LOG"
-    certbot renew --force-renewal --deploy-hook "systemctl restart hysteria-server && systemctl reload nginx 2>/dev/null || true" >> "$LOG" 2>&1
-    if [ $? -eq 0 ]; then
-        echo "[$(date)] SUCCESS: 证书续期成功" >> "$LOG"
-    else
-        echo "[$(date)] CRITICAL: 证书续期失败！" >> "$LOG"
-    fi
+# 检查 Caddy 服务状态
+if systemctl is-active --quiet caddy 2>/dev/null; then
+    echo "[$(date)] OK: Caddy 运行正常" >> "$LOG"
 else
-    echo "[$(date)] OK: 证书有效 ($DOMAIN)" >> "$LOG"
+    echo "[$(date)] WARNING: Caddy 未运行，尝试重启..." >> "$LOG"
+    systemctl restart caddy >> "$LOG" 2>&1
+    if systemctl is-active --quiet caddy 2>/dev/null; then
+        echo "[$(date)] SUCCESS: Caddy 重启成功" >> "$LOG"
+    else
+        echo "[$(date)] CRITICAL: Caddy 重启失败！" >> "$LOG"
+    fi
 fi
 
 # 保留最近 200 行日志
@@ -572,19 +590,17 @@ tail -200 "$LOG" > "${LOG}.tmp" && mv "${LOG}.tmp" "$LOG" 2>/dev/null
 CERTEOF
     chmod +x "${BASE_DIR}/cert-check.sh"
     
-    # 添加所有 cron 任务
+    # 添加 cron 任务 (不再需要 certbot，Caddy 自动续期)
     (
         crontab -l 2>/dev/null
         echo '# === B-UI 定时任务 ==='
-        echo '0 3 * * * certbot renew --quiet --deploy-hook "systemctl restart hysteria-server && systemctl reload nginx 2>/dev/null || true"'
         echo '0 */6 * * * /opt/b-ui/update.sh auto >> /var/log/b-ui-update.log 2>&1'
         echo '0 */12 * * * /opt/b-ui/cert-check.sh'
     ) | crontab -
     
     print_success "定时任务已配置:"
-    echo -e "  ${CYAN}• 证书续期:     每天 03:00 (续期后自动重启服务)${NC}"
     echo -e "  ${CYAN}• B-UI 自动更新: 每 6 小时检查并静默更新${NC}"
-    echo -e "  ${CYAN}• 证书健康检查:  每 12 小时 (≤7天过期自动续期)${NC}"
+    echo -e "  ${CYAN}• Caddy 健康检查: 每 12 小时 (证书由 Caddy 自动管理)${NC}"
 }
 
 #===============================================================================
