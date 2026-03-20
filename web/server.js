@@ -1213,28 +1213,35 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                 return sendJSON(res, versions);
             }
 
-            // 内核下载信息 API (供客户端优先从服务端下载内核)
+            // 内核下载信息 API (供客户端优先从服务端下载内核, 无需认证)
             if (r === "kernel-downloads") {
-                const cached = loadCachedVersions();
-                const result = {};
-                for (const [name, info] of Object.entries(cached)) {
-                    result[name] = {
-                        version: info.version,
-                        syncedAt: info.syncedAt,
-                        files: {}
-                    };
-                    // 根据内核类型列出可下载的文件
-                    for (const arch of ["amd64", "arm64"]) {
-                        let filename;
-                        if (name === "hysteria2") filename = `hysteria-linux-${arch}`;
-                        else if (name === "xray") filename = `xray-linux-${arch}.zip`;
-                        else if (name === "singbox") filename = `sing-box-linux-${arch}.tar.gz`;
-                        if (filename && fs.existsSync(path.join(PACKAGES_DIR_SYNC, filename))) {
-                            result[name].files[arch] = `/packages/${filename}`;
+                try {
+                    const cached = loadCachedVersions();
+                    const result = {};
+                    const kernelNames = ["hysteria2", "xray", "singbox"];
+                    for (const name of kernelNames) {
+                        const info = cached[name];
+                        if (!info) continue;
+                        // 兼容旧版平面格式 ("hysteria2": "2.7.1") 和新版嵌套格式
+                        const version = typeof info === "string" ? info : info.version;
+                        const syncedAt = typeof info === "object" ? info.syncedAt : cached.updated;
+                        if (!version) continue;
+                        result[name] = { version, syncedAt, files: {} };
+                        for (const arch of ["amd64", "arm64"]) {
+                            let filename;
+                            if (name === "hysteria2") filename = `hysteria-linux-${arch}`;
+                            else if (name === "xray") filename = `xray-linux-${arch}.zip`;
+                            else if (name === "singbox") filename = `sing-box-linux-${arch}.tar.gz`;
+                            if (filename && fs.existsSync(path.join(PACKAGES_DIR_SYNC, filename))) {
+                                result[name].files[arch] = `/packages/${filename}`;
+                            }
                         }
                     }
-                };
-                return sendJSON(res, result);
+                    return sendJSON(res, result);
+                } catch (e) {
+                    log("ERROR", "kernel-downloads API error: " + e.message);
+                    return sendJSON(res, {});
+                }
             }
 
             // 安装命令 API (无需认证)
