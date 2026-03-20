@@ -3,6 +3,7 @@ import fs from "fs";
 import crypto from "crypto";
 import { execSync, exec } from "child_process";
 import path from "path";
+import https from "https";
 import { fileURLToPath } from "url";
 import { convertOutboundToLink } from "singbox-converter";
 
@@ -789,6 +790,151 @@ function loadHTML() {
     }
 }
 
+// --- 内核同步：从 GitHub 下载最新内核缓存到 packages 目录 ---
+const PACKAGES_DIR_SYNC = path.join(path.dirname(ADMIN_DIR), "packages");
+const KERNEL_VERSIONS_FILE = path.join(PACKAGES_DIR_SYNC, "versions.json");
+
+// HTTPS GET 辅助函数（支持重定向）
+function fetchUrl(url, opts = {}) {
+    return new Promise((resolve, reject) => {
+        const maxRedirects = opts.maxRedirects || 5;
+        const doRequest = (reqUrl, redirectCount) => {
+            if (redirectCount > maxRedirects) return reject(new Error("Too many redirects"));
+            https.get(reqUrl, {
+                headers: { "User-Agent": "B-UI-Server/" + VERSION },
+                timeout: opts.timeout || 30000
+            }, (res) => {
+                if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+                    return doRequest(res.headers.location, redirectCount + 1);
+                }
+                if (res.statusCode !== 200) {
+                    res.resume();
+                    return reject(new Error(`HTTP ${res.statusCode}`));
+                }
+                if (opts.file) {
+                    const ws = fs.createWriteStream(opts.file);
+                    res.pipe(ws);
+                    ws.on("finish", () => { ws.close(); resolve(opts.file); });
+                    ws.on("error", reject);
+                } else {
+                    let data = "";
+                    res.on("data", c => data += c);
+                    res.on("end", () => resolve(data));
+                }
+            }).on("error", reject).on("timeout", function() { this.destroy(); reject(new Error("Timeout")); });
+        };
+        doRequest(url, 0);
+    });
+}
+
+// 获取 GitHub 最新 Release 信息
+async function getGitHubLatest(repo) {
+    const data = await fetchUrl(`https://api.github.com/repos/${repo}/releases/latest`, { timeout: 15000 });
+    return JSON.parse(data);
+}
+
+// 读取已缓存的版本信息
+function loadCachedVersions() {
+    try {
+        if (fs.existsSync(KERNEL_VERSIONS_FILE)) {
+            return JSON.parse(fs.readFileSync(KERNEL_VERSIONS_FILE, "utf8"));
+        }
+    } catch { }
+    return {};
+}
+
+function saveCachedVersions(versions) {
+    try {
+        fs.mkdirSync(PACKAGES_DIR_SYNC, { recursive: true });
+        fs.writeFileSync(KERNEL_VERSIONS_FILE, JSON.stringify(versions, null, 2));
+    } catch (e) { log("ERROR", "保存版本缓存失败: " + e.message); }
+}
+
+// 同步单个内核
+async function syncOneKernel(name, repo, getAssets, cached) {
+    try {
+        const release = await getGitHubLatest(repo);
+        const version = (release.tag_name || "").replace(/^v/, "").replace(/^app\/v?/, "");
+        if (!version || !/^\d+\.\d+/.test(version)) return;
+
+        // 版本未变则跳过
+        if (cached[name]?.version === version) {
+            log("INFO", `[内核同步] ${name} v${version} 已是最新`);
+            return;
+        }
+
+        log("INFO", `[内核同步] ${name} 发现新版本 v${version}，开始下载...`);
+        const assets = getAssets(release, version);
+
+        for (const { url, filename } of assets) {
+            const filePath = path.join(PACKAGES_DIR_SYNC, filename);
+            try {
+                await fetchUrl(url, { file: filePath, timeout: 120000 });
+                // 对非压缩的可执行文件设置权限
+                if (!filename.endsWith(".zip") && !filename.endsWith(".tar.gz") && !filename.endsWith(".gz")) {
+                    fs.chmodSync(filePath, 0o755);
+                }
+                log("INFO", `[内核同步] ✓ ${filename}`);
+            } catch (e) {
+                log("WARN", `[内核同步] ✗ ${filename}: ${e.message}`);
+            }
+        }
+
+        cached[name] = { version, syncedAt: new Date().toISOString() };
+        saveCachedVersions(cached);
+        log("INFO", `[内核同步] ${name} v${version} 同步完成`);
+    } catch (e) {
+        log("WARN", `[内核同步] ${name} 同步失败: ${e.message}`);
+    }
+}
+
+// 主同步函数
+async function syncKernels() {
+    log("INFO", "[内核同步] 开始同步内核...");
+    fs.mkdirSync(PACKAGES_DIR_SYNC, { recursive: true });
+    const cached = loadCachedVersions();
+
+    // Hysteria2
+    await syncOneKernel("hysteria2", "apernet/hysteria", (release, ver) => {
+        return ["amd64", "arm64"].map(arch => {
+            const asset = release.assets?.find(a => a.name === `hysteria-linux-${arch}`) || {};
+            return {
+                url: asset.browser_download_url || `https://github.com/apernet/hysteria/releases/download/app/v${ver}/hysteria-linux-${arch}`,
+                filename: `hysteria-linux-${arch}`
+            };
+        });
+    }, cached);
+
+    // Xray
+    await syncOneKernel("xray", "XTLS/Xray-core", (release, ver) => {
+        return ["64", "arm64-v8a"].map(arch => {
+            const suffix = arch === "64" ? "amd64" : "arm64";
+            const asset = release.assets?.find(a => a.name === `Xray-linux-${arch}.zip`) || {};
+            return {
+                url: asset.browser_download_url || `https://github.com/XTLS/Xray-core/releases/download/v${ver}/Xray-linux-${arch}.zip`,
+                filename: `xray-linux-${suffix}.zip`
+            };
+        });
+    }, cached);
+
+    // sing-box
+    await syncOneKernel("singbox", "SagerNet/sing-box", (release, ver) => {
+        return ["amd64", "arm64"].map(arch => {
+            const asset = release.assets?.find(a => a.name === `sing-box-${ver}-linux-${arch}.tar.gz`) || {};
+            return {
+                url: asset.browser_download_url || `https://github.com/SagerNet/sing-box/releases/download/v${ver}/sing-box-${ver}-linux-${arch}.tar.gz`,
+                filename: `sing-box-linux-${arch}.tar.gz`
+            };
+        });
+    }, cached);
+
+    log("INFO", "[内核同步] 同步完成");
+}
+
+// 启动时执行一次，之后每 6 小时同步
+setTimeout(() => syncKernels().catch(e => log("ERROR", "内核同步异常: " + e.message)), 10000);
+setInterval(() => syncKernels().catch(e => log("ERROR", "内核同步异常: " + e.message)), 6 * 60 * 60 * 1000);
+
 // --- Traffic Sync Loop ---
 let lastTraffic = {};
 setInterval(async () => {
@@ -1057,6 +1203,30 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                     if (sbVer) versions.singbox = sbVer;
                 } catch { }
                 return sendJSON(res, versions);
+            }
+
+            // 内核下载信息 API (供客户端优先从服务端下载内核)
+            if (r === "kernel-downloads") {
+                const cached = loadCachedVersions();
+                const result = {};
+                for (const [name, info] of Object.entries(cached)) {
+                    result[name] = {
+                        version: info.version,
+                        syncedAt: info.syncedAt,
+                        files: {}
+                    };
+                    // 根据内核类型列出可下载的文件
+                    for (const arch of ["amd64", "arm64"]) {
+                        let filename;
+                        if (name === "hysteria2") filename = `hysteria-linux-${arch}`;
+                        else if (name === "xray") filename = `xray-linux-${arch}.zip`;
+                        else if (name === "singbox") filename = `sing-box-linux-${arch}.tar.gz`;
+                        if (filename && fs.existsSync(path.join(PACKAGES_DIR_SYNC, filename))) {
+                            result[name].files[arch] = `/packages/${filename}`;
+                        }
+                    }
+                };
+                return sendJSON(res, result);
             }
 
             // 安装命令 API (无需认证)

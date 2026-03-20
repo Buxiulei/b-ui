@@ -7,7 +7,7 @@
 #===============================================================================
 
 # 版本号会在安装时从 GitHub 同步更新
-SCRIPT_VERSION="3.0.3"
+SCRIPT_VERSION="3.1.0"
 
 # 注意: 不使用 set -e，因为它会导致 ((count++)) 等算术运算在变量为0时退出脚本
 
@@ -3670,20 +3670,88 @@ update_all() {
                 print_info "更新客户端脚本..."
                 do_client_update
             fi
+            # 检测当前架构
+            local ARCH=$(uname -m)
+            local ARCH_SUFFIX="amd64"
+            [[ "$ARCH" == "aarch64" ]] && ARCH_SUFFIX="arm64"
+            
             if [[ -n "${best_hy:-}" && -n "${local_hy:-}" && "$local_hy" != "$best_hy" ]]; then
                 print_info "更新 Hysteria2..."
-                HYSTERIA_USER=root bash <(curl -fsSL https://get.hy2.sh/)
+                local hy_ok=false
+                if [[ -n "$SERVER_ADDRESS" ]]; then
+                    print_info "尝试从服务端下载..."
+                    if curl -fsSL --max-time 60 -k "https://${SERVER_ADDRESS}/packages/hysteria-linux-${ARCH_SUFFIX}" -o /tmp/hysteria-new 2>/dev/null; then
+                        chmod +x /tmp/hysteria-new
+                        # 验证二进制可执行
+                        if /tmp/hysteria-new version &>/dev/null; then
+                            mv /tmp/hysteria-new /usr/local/bin/hysteria
+                            print_success "从服务端更新成功"
+                            hy_ok=true
+                        else
+                            rm -f /tmp/hysteria-new
+                            print_warning "服务端文件校验失败，尝试官方源..."
+                        fi
+                    else
+                        print_warning "服务端下载失败，尝试官方源..."
+                    fi
+                fi
+                if [[ "$hy_ok" == "false" ]]; then
+                    HYSTERIA_USER=root bash <(curl -fsSL https://get.hy2.sh/) 2>/dev/null || print_error "Hysteria2 更新失败"
+                fi
             fi
             if [[ -n "${best_xray:-}" && -n "${local_xray:-}" && "$local_xray" != "$best_xray" ]]; then
                 print_info "更新 Xray..."
-                bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+                local xray_ok=false
+                if [[ -n "$SERVER_ADDRESS" ]]; then
+                    print_info "尝试从服务端下载..."
+                    if curl -fsSL --max-time 60 -k "https://${SERVER_ADDRESS}/packages/xray-linux-${ARCH_SUFFIX}.zip" -o /tmp/xray-new.zip 2>/dev/null; then
+                        rm -rf /tmp/xray_temp && mkdir -p /tmp/xray_temp
+                        if unzip -o /tmp/xray-new.zip -d /tmp/xray_temp &>/dev/null && [[ -f /tmp/xray_temp/xray ]]; then
+                            mv /tmp/xray_temp/xray /usr/local/bin/xray
+                            chmod +x /usr/local/bin/xray
+                            print_success "从服务端更新成功"
+                            xray_ok=true
+                        else
+                            print_warning "服务端文件解压失败，尝试官方源..."
+                        fi
+                        rm -rf /tmp/xray-new.zip /tmp/xray_temp
+                    else
+                        print_warning "服务端下载失败，尝试官方源..."
+                    fi
+                fi
+                if [[ "$xray_ok" == "false" ]]; then
+                    bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install 2>/dev/null || print_error "Xray 更新失败"
+                fi
             fi
             if [[ -n "${best_sb:-}" && -n "${local_sb:-}" && "$local_sb" != "$best_sb" ]]; then
                 print_info "更新 sing-box..."
-                if [[ "${PKG_MANAGER:-}" == "apt" ]]; then
-                    apt-get update -qq && apt-get install -y -qq sing-box
-                else
-                    bash <(curl -fsSL https://sing-box.app/install.sh)
+                local sb_ok=false
+                if [[ -n "$SERVER_ADDRESS" ]]; then
+                    print_info "尝试从服务端下载..."
+                    if curl -fsSL --max-time 60 -k "https://${SERVER_ADDRESS}/packages/sing-box-linux-${ARCH_SUFFIX}.tar.gz" -o /tmp/sing-box-new.tar.gz 2>/dev/null; then
+                        rm -rf /tmp/sing-box_temp && mkdir -p /tmp/sing-box_temp
+                        if tar -xzf /tmp/sing-box-new.tar.gz -C /tmp/sing-box_temp 2>/dev/null; then
+                            local sb_bin=$(find /tmp/sing-box_temp -name "sing-box" -type f | head -1)
+                            if [[ -n "$sb_bin" ]]; then
+                                mv "$sb_bin" /usr/bin/sing-box
+                                chmod +x /usr/bin/sing-box
+                                print_success "从服务端更新成功"
+                                sb_ok=true
+                            fi
+                        else
+                            print_warning "服务端文件解压失败，尝试官方源..."
+                        fi
+                        rm -rf /tmp/sing-box-new.tar.gz /tmp/sing-box_temp
+                    else
+                        print_warning "服务端下载失败，尝试官方源..."
+                    fi
+                fi
+                if [[ "$sb_ok" == "false" ]]; then
+                    if [[ "${PKG_MANAGER:-}" == "apt" ]]; then
+                        apt-get update -qq && apt-get install -y -qq sing-box 2>/dev/null || print_error "sing-box 更新失败"
+                    else
+                        bash <(curl -fsSL https://sing-box.app/install.sh) 2>/dev/null || print_error "sing-box 更新失败"
+                    fi
                 fi
             fi
             echo ""
