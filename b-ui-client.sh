@@ -1344,6 +1344,20 @@ start_tun_mode() {
     sysctl -w net.ipv4.conf.all.rp_filter=2 >/dev/null 2>&1 || true
     sysctl -w net.ipv4.conf.default.rp_filter=2 >/dev/null 2>&1 || true
     
+    # 开启 IP 转发 (TUN 必需)
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+    
+    # 防火墙适配：UFW 与 sing-box TUN strict_route 不兼容
+    # TUN 模式下 sing-box 接管全局路由，UFW 的 FORWARD DROP 会阻断 TCP 流量
+    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "active"; then
+        print_warning "检测到 UFW 防火墙 (与 TUN 冲突)"
+        print_info "暂停 UFW (TUN 停止后自动恢复)..."
+        ufw disable >/dev/null 2>&1 || true
+        # 标记 UFW 需要在 TUN 停止时恢复
+        echo "ufw_was_active=true" > /opt/hysteria-client/.ufw_state
+        print_success "UFW 已暂停"
+    fi
+    
     # 启动 sing-box TUN
     systemctl daemon-reload 2>/dev/null || true
     systemctl enable bui-tun 2>/dev/null || true
@@ -1420,6 +1434,17 @@ stop_tun_mode() {
         if systemctl is-active --quiet xray-client; then
             print_success "Xray 客户端已恢复"
         fi
+    fi
+    
+    # 9. 恢复 UFW 防火墙（如果被 TUN 暂停过）
+    if [[ -f /opt/hysteria-client/.ufw_state ]]; then
+        source /opt/hysteria-client/.ufw_state
+        if [[ "$ufw_was_active" == "true" ]]; then
+            print_info "恢复 UFW 防火墙..."
+            ufw --force enable >/dev/null 2>&1 || true
+            print_success "UFW 已恢复"
+        fi
+        rm -f /opt/hysteria-client/.ufw_state
     fi
     
     print_success "TUN 模式已停止"
