@@ -410,6 +410,8 @@ set_server_address() {
 load_server_address() {
     if [[ -f "$SERVER_ADDRESS_FILE" ]]; then
         SERVER_ADDRESS=$(cat "$SERVER_ADDRESS_FILE" 2>/dev/null)
+        # 去掉端口号 (Web 面板通过 HTTPS 443，不是 Hysteria2 端口)
+        SERVER_ADDRESS="${SERVER_ADDRESS%%:*}"
     fi
 }
 
