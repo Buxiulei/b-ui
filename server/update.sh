@@ -194,6 +194,12 @@ do_update() {
         fi
     done
     
+    # 同步到 packages 分发目录（供客户端下载）
+    if [[ -d "${BASE_DIR}/packages" ]]; then
+        cp -f "${BASE_DIR}/version.json" "${BASE_DIR}/packages/version.json" 2>/dev/null || true
+        cp -f "${BASE_DIR}/b-ui-client.sh" "${BASE_DIR}/packages/b-ui-client.sh" 2>/dev/null || true
+    fi
+    
     # 设置权限
     chmod +x "${BASE_DIR}/core.sh" 2>/dev/null
     chmod +x "${BASE_DIR}/b-ui-cli.sh" 2>/dev/null
@@ -674,6 +680,13 @@ auto_update() {
                 chmod +x "$local_path" 2>/dev/null || true
             fi
         done
+        
+        # 同步到 packages 分发目录（供客户端下载）
+        if [[ -d "${BASE_DIR}/packages" ]]; then
+            cp -f "${BASE_DIR}/version.json" "${BASE_DIR}/packages/version.json" 2>/dev/null || true
+            cp -f "${BASE_DIR}/b-ui-client.sh" "${BASE_DIR}/packages/b-ui-client.sh" 2>/dev/null || true
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] packages 目录已同步" >> "$LOG_FILE"
+        fi
         
         # 应用 systemd 资源隔离配置
         apply_systemd_configs 2>/dev/null || true
