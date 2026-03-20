@@ -3163,6 +3163,27 @@ test_proxy() {
     else
         echo -e "${YELLOW}超时${NC}"
     fi
+    
+    # GitHub 延迟
+    echo -n "  GitHub 延迟: "
+    local gh_latency=""
+    if $tun_running; then
+        gh_latency=$(curl -s -o /dev/null -w '%{time_total}' --max-time 10 https://github.com 2>/dev/null)
+    else
+        gh_latency=$(curl -s -o /dev/null -w '%{time_total}' --max-time 10 --socks5-hostname "127.0.0.1:${socks_port}" https://github.com 2>/dev/null)
+    fi
+    if [[ -n "$gh_latency" ]] && awk "BEGIN {exit !($gh_latency > 0)}" 2>/dev/null; then
+        local gh_ms=$(awk "BEGIN {printf \"%.0f\", $gh_latency * 1000}" 2>/dev/null)
+        if [[ "$gh_ms" -lt 500 ]]; then
+            echo -e "${GREEN}${gh_ms}ms${NC}"
+        elif [[ "$gh_ms" -lt 1000 ]]; then
+            echo -e "${YELLOW}${gh_ms}ms${NC}"
+        else
+            echo -e "${RED}${gh_ms}ms${NC}"
+        fi
+    else
+        echo -e "${YELLOW}超时${NC}"
+    fi
     echo ""
     
     # 测试 5: 简单网速测试
