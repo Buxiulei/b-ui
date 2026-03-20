@@ -1145,13 +1145,20 @@ OUTBOUND
       {
         "type": "udp",
         "tag": "local-dns",
-        "server": "223.5.5.5",
-        "detour": "direct-out"
+        "server": "223.5.5.5"
+      },
+      {
+        "type": "local",
+        "tag": "system-dns"
       }
     ],
     "rules": [
       {
         "domain_suffix": [".cn"],
+        "server": "local-dns"
+      },
+      {
+        "outbound": "any",
         "server": "local-dns"
       }
     ],
