@@ -7,7 +7,7 @@
 #===============================================================================
 
 # 版本号会在安装时从 GitHub 同步更新
-SCRIPT_VERSION="3.1.2"
+SCRIPT_VERSION="3.2.0"
 
 # 注意: 不使用 set -e，因为它会导致 ((count++)) 等算术运算在变量为0时退出脚本
 
@@ -1405,6 +1405,23 @@ stop_tun_mode() {
         ip link delete bui-tun 2>/dev/null || true
     fi
     
+    # 8. 恢复 Hysteria2/Xray 客户端服务（TUN 停止后用户仍需代理）
+    if [[ -f "/etc/systemd/system/$CLIENT_SERVICE" ]]; then
+        print_info "恢复 Hysteria2 客户端..."
+        systemctl start "$CLIENT_SERVICE" 2>/dev/null || true
+        sleep 1
+        if systemctl is-active --quiet "$CLIENT_SERVICE"; then
+            print_success "Hysteria2 客户端已恢复"
+        fi
+    elif [[ -f /etc/systemd/system/xray-client.service ]]; then
+        print_info "恢复 Xray 客户端..."
+        systemctl start xray-client 2>/dev/null || true
+        sleep 1
+        if systemctl is-active --quiet xray-client; then
+            print_success "Xray 客户端已恢复"
+        fi
+    fi
+    
     print_success "TUN 模式已停止"
 }
 
@@ -2712,9 +2729,6 @@ StartLimitAction=none
 TimeoutStartSec=30
 TimeoutStopSec=10
 
-# 看门狗（如连接断开时自动重启）
-WatchdogSec=60
-
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -3221,6 +3235,19 @@ uninstall() {
     
     echo ""
     print_info "开始卸载..."
+    
+    # 0. 强制停止所有相关进程（防止残留）
+    print_info "停止所有代理进程..."
+    systemctl stop bui-tun 2>/dev/null || true
+    systemctl stop "$CLIENT_SERVICE" 2>/dev/null || true
+    systemctl stop xray-client 2>/dev/null || true
+    pkill -9 sing-box 2>/dev/null || true
+    pkill -9 hysteria 2>/dev/null || true
+    pkill -9 xray 2>/dev/null || true
+    ip link delete bui-tun 2>/dev/null || true
+    ip link delete hystun 2>/dev/null || true
+    sleep 1
+    echo -e "  ${GREEN}✓${NC} 所有代理进程已停止"
     
     # 1. 停止并删除 Hysteria2 服务
     if systemctl is-active --quiet "$CLIENT_SERVICE" 2>/dev/null; then
