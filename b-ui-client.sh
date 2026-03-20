@@ -3518,40 +3518,106 @@ import_node() {
 service_control_menu() {
     while true; do
         local hy_status xray_status tun_status
-        systemctl is-active --quiet "$CLIENT_SERVICE" 2>/dev/null && hy_status="${GREEN}运行中${NC}" || hy_status="${RED}已停止${NC}"
-        systemctl is-active --quiet xray-client 2>/dev/null && xray_status="${GREEN}运行中${NC}" || xray_status="${RED}已停止${NC}"
-        systemctl is-active --quiet bui-tun 2>/dev/null && tun_status="${GREEN}运行中${NC}" || tun_status="${YELLOW}未启用${NC}"
+        local hy_label xray_label tun_label
+        
+        if systemctl is-active --quiet "$CLIENT_SERVICE" 2>/dev/null; then
+            hy_status="running"
+            local hy_ports=$(ss -tlnp 2>/dev/null | grep hysteria | grep -oP ':\K\d+' | sort -u | tr '\n' '/' | sed 's/\/$//')
+            hy_label="${GREEN}运行中${NC} (${hy_ports:-?})"
+        else
+            hy_status="stopped"
+            hy_label="${RED}已停止${NC}"
+        fi
+        
+        if systemctl is-active --quiet xray-client 2>/dev/null; then
+            xray_status="running"
+            xray_label="${GREEN}运行中${NC}"
+        elif [[ -f /etc/systemd/system/xray-client.service ]]; then
+            xray_status="stopped"
+            xray_label="${RED}已停止${NC}"
+        else
+            xray_status="none"
+            xray_label="${DIM}未配置${NC}"
+        fi
+        
+        if systemctl is-active --quiet bui-tun 2>/dev/null; then
+            tun_label="${GREEN}运行中${NC}"
+        elif [[ -f /etc/systemd/system/bui-tun.service ]]; then
+            tun_label="${YELLOW}已停止${NC}"
+        else
+            tun_label="${DIM}未配置${NC}"
+        fi
         
         echo ""
         echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
         echo -e "${CYAN}║${NC}  ${GREEN}▶ 服务控制${NC}                                                ${CYAN}║${NC}"
         echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
-        echo -e "${CYAN}║${NC}  Hysteria2: ${hy_status}   Xray: ${xray_status}   TUN: ${tun_status}    ${CYAN}║${NC}"
+        echo -e "${CYAN}║${NC}  Hysteria2: $hy_label"
+        echo -e "${CYAN}║${NC}  Xray:      $xray_label"
+        echo -e "${CYAN}║${NC}  TUN 模式:  $tun_label  ${DIM}(主菜单选 4 控制)${NC}"
         echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
-        echo -e "${CYAN}║${NC}  ${YELLOW}1.${NC} 启动所有服务                                          ${CYAN}║${NC}"
-        echo -e "${CYAN}║${NC}  ${YELLOW}2.${NC} 停止所有服务                                          ${CYAN}║${NC}"
-        echo -e "${CYAN}║${NC}  ${YELLOW}3.${NC} 重启所有服务                                          ${CYAN}║${NC}"
-        echo -e "${CYAN}║${NC}  ${YELLOW}4.${NC} 查看日志                                              ${CYAN}║${NC}"
-        echo -e "${CYAN}║${NC}  ${YELLOW}0.${NC} 返回主菜单                                            ${CYAN}║${NC}"
+        
+        if [[ "$hy_status" == "running" ]]; then
+            echo -e "${CYAN}║${NC}  ${YELLOW}1.${NC} ⏹  停止 Hysteria2"
+            echo -e "${CYAN}║${NC}  ${YELLOW}2.${NC} 🔄 重启 Hysteria2"
+        else
+            echo -e "${CYAN}║${NC}  ${YELLOW}1.${NC} ▶  启动 Hysteria2"
+        fi
+        
+        if [[ "$xray_status" == "running" ]]; then
+            echo -e "${CYAN}║${NC}  ${YELLOW}3.${NC} ⏹  停止 Xray"
+        elif [[ "$xray_status" == "stopped" ]]; then
+            echo -e "${CYAN}║${NC}  ${YELLOW}3.${NC} ▶  启动 Xray"
+        fi
+        
+        echo -e "${CYAN}║${NC}  ${YELLOW}5.${NC} 📋 查看日志"
+        echo -e "${CYAN}║${NC}  ${YELLOW}0.${NC} 返回主菜单"
         echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
-        read -p "请选择 [0-4]: " sub
+        read -p "请选择 [0-5]: " sub
         case $sub in
             1)
-                systemctl start "$CLIENT_SERVICE" 2>/dev/null || true
-                systemctl start xray-client 2>/dev/null || true
-                print_success "服务已启动"
+                if [[ "$hy_status" == "running" ]]; then
+                    systemctl stop "$CLIENT_SERVICE" 2>/dev/null || true
+                    print_success "Hysteria2 已停止"
+                else
+                    if [[ -f "/etc/systemd/system/$CLIENT_SERVICE" ]]; then
+                        systemctl start "$CLIENT_SERVICE" 2>/dev/null || true
+                        sleep 1
+                        if systemctl is-active --quiet "$CLIENT_SERVICE"; then
+                            print_success "Hysteria2 已启动"
+                        else
+                            print_error "Hysteria2 启动失败"
+                            journalctl -u "$CLIENT_SERVICE" --no-pager -n 5
+                        fi
+                    else
+                        print_error "请先导入节点 (主菜单选 1)"
+                    fi
+                fi
                 ;;
             2)
-                systemctl stop "$CLIENT_SERVICE" 2>/dev/null || true
-                systemctl stop xray-client 2>/dev/null || true
-                print_success "服务已停止"
+                if [[ "$hy_status" == "running" ]]; then
+                    systemctl restart "$CLIENT_SERVICE" 2>/dev/null || true
+                    sleep 1
+                    print_success "Hysteria2 已重启"
+                fi
                 ;;
             3)
-                systemctl restart "$CLIENT_SERVICE" 2>/dev/null || true
-                systemctl restart xray-client 2>/dev/null || true
-                print_success "服务已重启"
+                if [[ "$xray_status" == "none" ]]; then
+                    print_warning "Xray 未配置"
+                elif [[ "$xray_status" == "running" ]]; then
+                    systemctl stop xray-client 2>/dev/null || true
+                    print_success "Xray 已停止"
+                else
+                    systemctl start xray-client 2>/dev/null || true
+                    sleep 1
+                    if systemctl is-active --quiet xray-client; then
+                        print_success "Xray 已启动"
+                    else
+                        print_error "Xray 启动失败"
+                    fi
+                fi
                 ;;
-            4)
+            5)
                 echo ""
                 echo -e "${YELLOW}选择日志:${NC}"
                 echo "  1. Hysteria2"
