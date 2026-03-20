@@ -1,7 +1,7 @@
 #!/bin/bash
 
 #===============================================================================
-# Hysteria2 客户端一键安装脚本 (Ubuntu/Debian)
+# B-UI 多协议客户端 (Hysteria2 / VLESS-Reality / TUN)
 # 功能：SOCKS5/HTTP 代理、TUN 模式、路由规则、SSH 保护
 # 版本: 动态读取自 GitHub
 #===============================================================================
@@ -18,6 +18,7 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
+DIM='\033[2m'
 
 # 路径配置 - 使用固定路径避免管道运行时 $0 问题
 BASE_DIR="/opt/hysteria-client"
@@ -40,16 +41,16 @@ TUN_ENABLED="false"
 
 print_banner() {
     clear
-    echo -e "${CYAN}"
-    echo "╔══════════════════════════════════════════════════════════════╗"
-    echo "║                                                              ║"
-    echo "║          Hysteria2 客户端 - 增强版                           ║"
-    echo "║                                                              ║"
-    echo "║     支持：SOCKS5 / HTTP / TUN / 路由规则 / SSH保护           ║"
-    echo "║                                                              ║"
-    echo -e "║     版本: ${YELLOW}${SCRIPT_VERSION}${CYAN}                                               ║"
-    echo "╚══════════════════════════════════════════════════════════════╝"
-    echo -e "${NC}"
+    echo ""
+    echo -e "${CYAN}┌──────────────────────────────────────────┐${NC}"
+    echo -e "${CYAN}│${NC}                                          ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}       ${GREEN}B-UI 多协议客户端${NC}                 ${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}                                          ${CYAN}│${NC}"
+    echo -e "${CYAN}├──────────────────────────────────────────┘${NC}"
+    echo -e "${CYAN}│${NC}  Hysteria2 / VLESS-Reality / TUN"
+    echo -e "${CYAN}│${NC}  ${DIM}版本: ${NC}${YELLOW}${SCRIPT_VERSION}${NC}"
+    echo -e "${CYAN}└──────────────────────────────────────────${NC}"
+    echo ""
 }
 
 print_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
@@ -3743,24 +3744,26 @@ advanced_settings_menu() {
 
 show_menu() {
     echo ""
-    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║${NC}              ${GREEN}B-UI 客户端 操作菜单${NC}                            ${CYAN}║${NC}"
-    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}1.${NC} ${GREEN}📥 导入节点${NC} (直接粘贴链接即可)                       ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}2.${NC} ${GREEN}📋 节点管理${NC} (列表/切换/删除)                         ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}3.${NC} ${GREEN}▶ 服务控制${NC} (启动/停止/重启/日志)                     ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}4.${NC} ${GREEN}🌐 TUN 全局代理${NC} (开启/关闭)                         ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}5.${NC} 🔍 连接测试                                            ${CYAN}║${NC}"
+    echo -e "${CYAN}┌──────────────────────────────────────────┐${NC}"
+    echo -e "${CYAN}│${NC}       ${GREEN}B-UI 客户端  操作菜单${NC}             ${CYAN}│${NC}"
+    echo -e "${CYAN}├──────────────────────────────────────────┘${NC}"
+    echo -e "${CYAN}│${NC}"
+    echo -e "${CYAN}│${NC}  ${YELLOW}1.${NC} 📥  导入节点  ${DIM}(粘贴链接自动识别)${NC}"
+    echo -e "${CYAN}│${NC}  ${YELLOW}2.${NC} 📋  节点管理  ${DIM}(列表/切换/删除)${NC}"
+    echo -e "${CYAN}│${NC}  ${YELLOW}3.${NC} ▶   服务控制  ${DIM}(启动/停止/重启/日志)${NC}"
+    echo -e "${CYAN}│${NC}  ${YELLOW}4.${NC} 🌐  TUN 代理  ${DIM}(全局模式 开/关)${NC}"
+    echo -e "${CYAN}│${NC}  ${YELLOW}5.${NC} 🔍  连接测试"
     if [[ "$UPDATE_AVAILABLE" == "true" ]]; then
-        echo -e "${CYAN}║${NC}  ${YELLOW}6.${NC} ${GREEN}⬆ 一键更新${NC} ${RED}(有新版本!)${NC}                              ${CYAN}║${NC}"
+        echo -e "${CYAN}│${NC}  ${YELLOW}6.${NC} ⬆   一键更新  ${RED}★ 有新版本${NC}"
     else
-        echo -e "${CYAN}║${NC}  ${YELLOW}6.${NC} ⬆ 一键更新 (内核+客户端)                              ${CYAN}║${NC}"
+        echo -e "${CYAN}│${NC}  ${YELLOW}6.${NC} ⬆   一键更新  ${DIM}(内核+客户端)${NC}"
     fi
-    echo -e "${CYAN}║${NC}  ${YELLOW}7.${NC} ⚙ 高级设置 (自启动/路由规则)                           ${CYAN}║${NC}"
-    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}8.${NC} ${RED}🗑 卸载${NC}                                                ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}0.${NC} 退出                                                   ${CYAN}║${NC}"
-    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
+    echo -e "${CYAN}│${NC}  ${YELLOW}7.${NC} ⚙   高级设置  ${DIM}(自启动/路由规则)${NC}"
+    echo -e "${CYAN}│${NC}"
+    echo -e "${CYAN}├──────────────────────────────────────────${NC}"
+    echo -e "${CYAN}│${NC}  ${YELLOW}8.${NC} ${RED}🗑  卸载${NC}"
+    echo -e "${CYAN}│${NC}  ${YELLOW}0.${NC} 退出"
+    echo -e "${CYAN}└──────────────────────────────────────────${NC}"
 }
 
 main() {
