@@ -438,6 +438,38 @@ check_old_version() {
 run_core_install() {
     print_info "运行核心安装流程..."
     
+    # ====== 安装前清理：停止旧服务、释放端口 ======
+    print_info "清理旧服务和端口占用..."
+    
+    # 停止所有 B-UI 相关服务
+    for svc in hysteria-server b-ui-admin caddy xray nginx b-ui-cert-sync.timer b-ui-cert-sync; do
+        systemctl stop "$svc" 2>/dev/null || true
+        systemctl disable "$svc" 2>/dev/null || true
+    done
+    
+    # 停止可能占用 80/443 的进程
+    if command -v fuser &>/dev/null; then
+        fuser -k 80/tcp 2>/dev/null || true
+        fuser -k 443/tcp 2>/dev/null || true
+    fi
+    
+    # 清理旧的 systemd 服务文件 (重装时重新生成)
+    rm -f /etc/systemd/system/hysteria-server.service 2>/dev/null
+    rm -f /etc/systemd/system/b-ui-admin.service 2>/dev/null
+    rm -f /etc/systemd/system/b-ui-cert-sync.service 2>/dev/null
+    rm -f /etc/systemd/system/b-ui-cert-sync.timer 2>/dev/null
+    rm -rf /etc/systemd/system/hysteria-server.service.d 2>/dev/null
+    rm -rf /etc/systemd/system/xray.service.d 2>/dev/null
+    systemctl daemon-reload 2>/dev/null
+    
+    # 清理旧的 cron 任务
+    crontab -l 2>/dev/null | grep -v "b-ui" | grep -v "cert-check" | grep -v "cert-sync" | crontab - 2>/dev/null || true
+    
+    # 清理环境代理变量 (防止 curl 走死代理)
+    unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY 2>/dev/null || true
+    
+    print_success "旧服务已清理，端口已释放"
+    
     # 加载核心模块
     source "${BASE_DIR}/core.sh"
     
