@@ -19,6 +19,7 @@ BASE_DIR="/opt/b-ui"
 CONFIG_FILE="${BASE_DIR}/config.yaml"
 USERS_FILE="${BASE_DIR}/users.json"
 ADMIN_DIR="${BASE_DIR}/admin"
+CERTS_DIR="${BASE_DIR}/certs"
 HYSTERIA_SERVICE="hysteria-server.service"
 ADMIN_SERVICE="b-ui-admin.service"
 
@@ -350,6 +351,7 @@ configure_hysteria() {
     print_info "生成 Hysteria2 配置文件..."
     
     mkdir -p "$BASE_DIR"
+    mkdir -p "$CERTS_DIR"
     chmod 755 "$BASE_DIR"
     
     # 创建用户文件 (包含限速信息)
@@ -366,8 +368,8 @@ listen: :${PORT}
 
 tls:
   sniGuard: disable
-  cert: /etc/letsencrypt/live/${DOMAIN}/fullchain.pem
-  key: /etc/letsencrypt/live/${DOMAIN}/privkey.pem
+  cert: ${CERTS_DIR}/fullchain.pem
+  key: ${CERTS_DIR}/privkey.pem
 
 # QUIC 流控优化 (提升高带宽场景性能)
 quic:
@@ -519,6 +521,10 @@ configure_caddy_proxy() {
         print_info "已停用 Nginx (Caddy 接管 80/443)"
     fi
     
+    # 创建共享证书目录
+    mkdir -p "$CERTS_DIR"
+    chmod 755 "$CERTS_DIR"
+    
     # 生成 Caddyfile (自动 HTTPS + 反向代理)
     cat > /etc/caddy/Caddyfile << CADDYEOF
 # B-UI Web 管理面板 - 由 Caddy 自动管理 HTTPS 证书
@@ -550,11 +556,163 @@ CADDYEOF
     # 重启 Caddy (自动申请 SSL 证书)
     systemctl restart caddy
     print_success "Caddy 反向代理已配置 (自动 HTTPS: ${DOMAIN})"
+    
+    # 创建证书同步脚本和服务
+    setup_cert_sync
 }
 
 # 兼容旧调用
 configure_nginx_proxy() {
     configure_caddy_proxy
+}
+
+#===============================================================================
+# Caddy 证书同步到 Hysteria2
+# Caddy 自动管理证书，同步到 /opt/b-ui/certs/ 供 Hysteria2 使用
+#===============================================================================
+
+setup_cert_sync() {
+    print_info "配置证书同步机制..."
+    
+    local sync_script="${BASE_DIR}/cert-sync.sh"
+    local caddy_data_dir="/var/lib/caddy/.local/share/caddy"
+    
+    # 创建证书同步脚本
+    cat > "$sync_script" << 'SYNCEOF'
+#!/bin/bash
+# Caddy 证书同步脚本
+# 从 Caddy 数据目录复制证书到共享目录供 Hysteria2 使用
+
+CERTS_DIR="/opt/b-ui/certs"
+CADDY_DATA="/var/lib/caddy/.local/share/caddy"
+DOMAIN_FILE="/opt/b-ui/certs/.domain"
+LOG_FILE="/var/log/b-ui-cert-sync.log"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
+}
+
+# 读取域名
+if [[ ! -f "$DOMAIN_FILE" ]]; then
+    log "ERROR: 域名配置文件不存在: $DOMAIN_FILE"
+    exit 1
+fi
+DOMAIN=$(cat "$DOMAIN_FILE")
+
+# Caddy 证书存储路径 (ACME 目录结构)
+CERT_SOURCE="${CADDY_DATA}/certificates/acme-v02.api.letsencrypt.org-directory/${DOMAIN}"
+
+# 备用路径: Caddy 有时使用 acme.zerossl.com
+if [[ ! -d "$CERT_SOURCE" ]]; then
+    CERT_SOURCE=$(find "$CADDY_DATA/certificates" -type d -name "$DOMAIN" 2>/dev/null | head -1)
+fi
+
+if [[ -z "$CERT_SOURCE" ]] || [[ ! -d "$CERT_SOURCE" ]]; then
+    log "WARNING: 未找到 Caddy 证书目录 (域名: $DOMAIN)"
+    exit 1
+fi
+
+# 查找证书和密钥文件
+CERT_FILE="${CERT_SOURCE}/${DOMAIN}.crt"
+KEY_FILE="${CERT_SOURCE}/${DOMAIN}.key"
+
+if [[ ! -f "$CERT_FILE" ]] || [[ ! -f "$KEY_FILE" ]]; then
+    log "WARNING: 证书文件不完整 (cert: $CERT_FILE, key: $KEY_FILE)"
+    exit 1
+fi
+
+# 比较文件是否有变化
+mkdir -p "$CERTS_DIR"
+if [[ -f "${CERTS_DIR}/fullchain.pem" ]] && cmp -s "$CERT_FILE" "${CERTS_DIR}/fullchain.pem"; then
+    # 证书未变化，无需同步
+    exit 0
+fi
+
+# 同步证书
+cp "$CERT_FILE" "${CERTS_DIR}/fullchain.pem"
+cp "$KEY_FILE" "${CERTS_DIR}/privkey.pem"
+chmod 644 "${CERTS_DIR}/fullchain.pem"
+chmod 600 "${CERTS_DIR}/privkey.pem"
+
+log "SUCCESS: 证书已同步 (${DOMAIN})"
+
+# Reload Hysteria2 (如果正在运行)
+if systemctl is-active --quiet hysteria-server 2>/dev/null; then
+    systemctl reload hysteria-server 2>/dev/null || systemctl restart hysteria-server 2>/dev/null
+    log "Hysteria2 已重载"
+fi
+
+# 保留最近 200 行日志
+tail -200 "$LOG_FILE" > "${LOG_FILE}.tmp" && mv "${LOG_FILE}.tmp" "$LOG_FILE" 2>/dev/null
+SYNCEOF
+
+    chmod +x "$sync_script"
+    
+    # 保存域名到文件供同步脚本使用
+    echo "$DOMAIN" > "${CERTS_DIR}/.domain"
+    
+    # 创建 systemd 定时同步服务
+    cat > /etc/systemd/system/b-ui-cert-sync.service << EOF
+[Unit]
+Description=B-UI Certificate Sync (Caddy -> Hysteria2)
+After=caddy.service
+
+[Service]
+Type=oneshot
+ExecStart=${sync_script}
+EOF
+
+    cat > /etc/systemd/system/b-ui-cert-sync.timer << EOF
+[Unit]
+Description=B-UI Certificate Sync Timer
+
+[Timer]
+# 首次启动后 30 秒执行 (等待 Caddy 申请证书)
+OnBootSec=30s
+# 之后每 6 小时检查一次证书更新
+OnUnitActiveSec=6h
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable b-ui-cert-sync.timer 2>/dev/null
+    systemctl start b-ui-cert-sync.timer 2>/dev/null
+    
+    print_success "证书同步机制已配置"
+}
+
+# 等待 Caddy 证书就绪并同步
+wait_and_sync_certs() {
+    print_info "等待 Caddy 申请 SSL 证书..."
+    
+    local max_wait=60
+    local waited=0
+    local caddy_data="/var/lib/caddy/.local/share/caddy"
+    
+    while [[ $waited -lt $max_wait ]]; do
+        # 查找域名证书目录
+        local cert_dir=$(find "$caddy_data/certificates" -type d -name "$DOMAIN" 2>/dev/null | head -1)
+        if [[ -n "$cert_dir" ]] && [[ -f "${cert_dir}/${DOMAIN}.crt" ]]; then
+            print_success "Caddy 证书已就绪"
+            # 执行同步
+            bash "${BASE_DIR}/cert-sync.sh" 2>/dev/null
+            if [[ -f "${CERTS_DIR}/fullchain.pem" ]]; then
+                print_success "证书已同步到 ${CERTS_DIR}/"
+                return 0
+            fi
+        fi
+        sleep 2
+        ((waited+=2))
+        echo -ne "\r  等待中... ${waited}/${max_wait}s"
+    done
+    
+    echo ""
+    print_warning "证书等待超时 (${max_wait}s)，Caddy 可能仍在申请中"
+    print_info "Hysteria2 将在证书就绪后通过定时任务自动同步"
+    return 1
 }
 
 #===============================================================================
@@ -567,22 +725,46 @@ configure_cron_tasks() {
     # 清除旧的 b-ui 相关 cron 任务
     crontab -l 2>/dev/null | grep -v "certbot renew" | grep -v "b-ui" | grep -v "cert-check" | crontab - 2>/dev/null || true
     
-    # 创建 Caddy 健康检查脚本 (Caddy 自动续期证书，只需检查服务状态)
+    # 创建 Caddy + 证书健康检查脚本
     cat > "${BASE_DIR}/cert-check.sh" << 'CERTEOF'
 #!/bin/bash
-# B-UI Caddy 健康检查 (Caddy 自动管理 HTTPS 证书)
+# B-UI 健康检查 (Caddy 服务 + 证书同步)
 LOG="/var/log/b-ui-cert-check.log"
 
-# 检查 Caddy 服务状态
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG"
+}
+
+# 1. 检查 Caddy 服务状态
 if systemctl is-active --quiet caddy 2>/dev/null; then
-    echo "[$(date)] OK: Caddy 运行正常" >> "$LOG"
+    log "OK: Caddy 运行正常"
 else
-    echo "[$(date)] WARNING: Caddy 未运行，尝试重启..." >> "$LOG"
+    log "WARNING: Caddy 未运行，尝试重启..."
     systemctl restart caddy >> "$LOG" 2>&1
     if systemctl is-active --quiet caddy 2>/dev/null; then
-        echo "[$(date)] SUCCESS: Caddy 重启成功" >> "$LOG"
+        log "SUCCESS: Caddy 重启成功"
     else
-        echo "[$(date)] CRITICAL: Caddy 重启失败！" >> "$LOG"
+        log "CRITICAL: Caddy 重启失败！"
+    fi
+fi
+
+# 2. 同步证书 (从 Caddy 到 Hysteria2)
+if [[ -x "/opt/b-ui/cert-sync.sh" ]]; then
+    /opt/b-ui/cert-sync.sh
+fi
+
+# 3. 检查 Hysteria2 服务状态
+if ! systemctl is-active --quiet hysteria-server 2>/dev/null; then
+    # 检查证书是否存在，如果存在则尝试启动
+    if [[ -f "/opt/b-ui/certs/fullchain.pem" ]]; then
+        log "WARNING: Hysteria2 未运行但证书存在，尝试启动..."
+        systemctl start hysteria-server 2>/dev/null
+        sleep 2
+        if systemctl is-active --quiet hysteria-server 2>/dev/null; then
+            log "SUCCESS: Hysteria2 启动成功"
+        else
+            log "ERROR: Hysteria2 启动失败"
+        fi
     fi
 fi
 
@@ -591,7 +773,7 @@ tail -200 "$LOG" > "${LOG}.tmp" && mv "${LOG}.tmp" "$LOG" 2>/dev/null
 CERTEOF
     chmod +x "${BASE_DIR}/cert-check.sh"
     
-    # 添加 cron 任务 (不再需要 certbot，Caddy 自动续期)
+    # 添加 cron 任务
     (
         crontab -l 2>/dev/null
         echo '# === B-UI 定时任务 ==='
@@ -601,7 +783,7 @@ CERTEOF
     
     print_success "定时任务已配置:"
     echo -e "  ${CYAN}• B-UI 自动更新: 每 6 小时检查并静默更新${NC}"
-    echo -e "  ${CYAN}• Caddy 健康检查: 每 12 小时 (证书由 Caddy 自动管理)${NC}"
+    echo -e "  ${CYAN}• 健康检查: 每 12 小时 (Caddy + 证书同步 + Hysteria2)${NC}"
 }
 
 #===============================================================================
@@ -1033,31 +1215,51 @@ start_all_services() {
     print_info "启动所有服务..."
     
     # 确保证书目录权限
-    chmod 755 /etc/letsencrypt 2>/dev/null || true
-    chmod 755 /etc/letsencrypt/live 2>/dev/null || true
-    chmod 755 /etc/letsencrypt/archive 2>/dev/null || true
+    mkdir -p "$CERTS_DIR"
+    chmod 755 "$CERTS_DIR"
     
-    systemctl enable hysteria-server --now
-    systemctl enable b-ui-admin --now
-    systemctl enable xray --now
-    
-    sleep 2
-    
-    if systemctl is-active --quiet hysteria-server; then
-        print_success "Hysteria2 服务已启动"
+    # 1. 先启动 Caddy (需要它申请 SSL 证书)
+    systemctl enable caddy --now 2>/dev/null
+    sleep 1
+    if systemctl is-active --quiet caddy; then
+        print_success "Caddy 已启动"
     else
-        print_warning "Hysteria2 服务启动失败"
+        print_warning "Caddy 启动失败，请检查 80/443 端口"
     fi
     
+    # 2. 等待 Caddy 证书就绪并同步到共享目录
+    wait_and_sync_certs
+    
+    # 3. 启动管理面板 (不依赖证书)
+    systemctl enable b-ui-admin --now
     if systemctl is-active --quiet b-ui-admin; then
         print_success "管理面板已启动"
     else
         print_warning "管理面板启动失败"
     fi
     
+    # 4. 启动 Xray (不依赖证书)
+    systemctl enable xray --now
     if systemctl is-active --quiet xray; then
         print_success "Xray 服务已启动"
     else
         print_warning "Xray 服务启动失败"
+    fi
+    
+    # 5. 最后启动 Hysteria2 (依赖证书)
+    if [[ -f "${CERTS_DIR}/fullchain.pem" ]]; then
+        systemctl enable hysteria-server --now
+        sleep 2
+        if systemctl is-active --quiet hysteria-server; then
+            print_success "Hysteria2 服务已启动"
+        else
+            print_warning "Hysteria2 服务启动失败"
+            journalctl -u hysteria-server --no-pager -n 5 2>/dev/null
+        fi
+    else
+        # 证书尚未就绪，启用服务但不立即启动
+        systemctl enable hysteria-server 2>/dev/null
+        print_warning "Hysteria2: 证书尚未就绪，已设置开机自启"
+        print_info "证书同步后 Hysteria2 将通过健康检查自动启动"
     fi
 }
