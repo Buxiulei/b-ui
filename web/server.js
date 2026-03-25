@@ -1106,13 +1106,27 @@ const server = http.createServer(async (req, res) => {
 # 服务端: ${serverDomain}
 # 安装时间: $(date)
 
-# 预设服务端地址
+# ====== 安装前环境准备 ======
+
+# 1. 清理代理环境变量 (防止后续 curl/wget 走死代理)
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY no_proxy NO_PROXY 2>/dev/null || true
+export http_proxy="" https_proxy="" HTTP_PROXY="" HTTPS_PROXY=""
+
+# 2. 停止旧的客户端服务 (避免端口冲突)
+for svc in hysteria-client xray-client sing-box-tun sing-box-client; do
+    systemctl stop "\$svc" 2>/dev/null || true
+    systemctl disable "\$svc" 2>/dev/null || true
+done
+
+# 3. 预设服务端地址
 export BUI_SERVER="${serverDomain}"
 export BUI_INSTALL_KEY="${key}"
 
-# 创建配置目录并保存服务端地址
+# 4. 创建配置目录并保存服务端地址
 mkdir -p /opt/hysteria-client
 echo "${serverDomain}" > /opt/hysteria-client/server_address
+
+# ====== 加载客户端脚本 ======
 
 ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
 `;
