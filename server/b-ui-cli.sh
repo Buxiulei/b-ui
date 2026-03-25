@@ -469,16 +469,14 @@ uninstall_all() {
     print_info "开始卸载..."
     
     # 停止服务
-    systemctl stop hysteria-server 2>/dev/null || true
-    systemctl stop b-ui-admin 2>/dev/null || true
-    systemctl stop xray 2>/dev/null || true
-    systemctl disable hysteria-server 2>/dev/null || true
-    systemctl disable b-ui-admin 2>/dev/null || true
-    systemctl disable xray 2>/dev/null || true
+    systemctl stop hysteria-server caddy b-ui-admin xray b-ui-cert-sync.timer 2>/dev/null || true
+    systemctl disable hysteria-server caddy b-ui-admin xray b-ui-cert-sync.timer b-ui-cert-sync 2>/dev/null || true
     
     # 删除服务文件
     rm -f /etc/systemd/system/hysteria-server.service
     rm -f /etc/systemd/system/b-ui-admin.service
+    rm -f /etc/systemd/system/b-ui-cert-sync.service
+    rm -f /etc/systemd/system/b-ui-cert-sync.timer
     rm -rf /etc/systemd/system/hysteria-server.service.d
     rm -rf /etc/systemd/system/xray.service.d
     systemctl daemon-reload
@@ -490,9 +488,15 @@ uninstall_all() {
     rm -rf /opt/b-ui
     rm -f /usr/local/bin/b-ui
     
-    # 删除 Nginx 配置
-    rm -f /etc/nginx/conf.d/b-ui-admin.conf
+    # 清理 Caddy 配置 (保留 Caddy 程序供其他用途)
+    rm -f /etc/caddy/Caddyfile 2>/dev/null
+    
+    # 清理旧版 Nginx 配置 (如果存在)
+    rm -f /etc/nginx/conf.d/b-ui-admin.conf 2>/dev/null
     systemctl reload nginx 2>/dev/null || true
+    
+    # 清理 cron 任务
+    crontab -l 2>/dev/null | grep -vE "b-ui|cert-check|cert-sync" | crontab - 2>/dev/null || true
     
     echo ""
     echo -e "${GREEN}════════════════════════════════════════════════════════════════${NC}"

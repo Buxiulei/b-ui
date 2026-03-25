@@ -432,28 +432,57 @@ check_old_version() {
 }
 
 #===============================================================================
-# 安装核心组件
+# 安装前环境准备 (覆盖所有安装场景)
+# 场景1: 全新安装 — 干净 VPS，无需清理
+# 场景2: 旧版升级 — Nginx+Certbot → Caddy，需停 nginx/certbot
+# 场景3: 同版重装 — 已有 Caddy+证书，需停服务但保留 Caddy 证书
+# 场景4: 代理污染 — 系统有 http_proxy 等变量导致 curl 走死代理
+# 场景5: 端口冲突 — 80/443 被 Apache/其他进程占用
 #===============================================================================
 
-run_core_install() {
-    print_info "运行核心安装流程..."
+prepare_install_env() {
+    print_info "安装前环境检查与清理..."
     
-    # ====== 安装前清理：停止旧服务、释放端口 ======
-    print_info "清理旧服务和端口占用..."
+    # ---- 1. 清理代理环境变量 (场景4) ----
+    # 防止 curl/wget 走已死的本地代理
+    unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY no_proxy NO_PROXY 2>/dev/null || true
+    export http_proxy="" https_proxy="" HTTP_PROXY="" HTTPS_PROXY=""
     
-    # 停止所有 B-UI 相关服务
-    for svc in hysteria-server b-ui-admin caddy xray nginx b-ui-cert-sync.timer b-ui-cert-sync; do
-        systemctl stop "$svc" 2>/dev/null || true
+    # ---- 2. 备份用户数据 (场景2/3: 重装时保留) ----
+    if [[ -f "${BASE_DIR}/users.json" ]]; then
+        cp -f "${BASE_DIR}/users.json" /tmp/b-ui-users-backup.json 2>/dev/null
+        print_info "已备份用户数据"
+    fi
+    if [[ -f "${BASE_DIR}/config.yaml" ]]; then
+        cp -f "${BASE_DIR}/config.yaml" /tmp/b-ui-config-backup.yaml 2>/dev/null
+    fi
+    
+    # ---- 3. 停止所有可能冲突的服务 ----
+    local all_services=(
+        hysteria-server b-ui-admin caddy xray nginx apache2 httpd
+        b-ui-cert-sync.timer b-ui-cert-sync
+        certbot.timer certbot-renew.timer
+    )
+    for svc in "${all_services[@]}"; do
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            systemctl stop "$svc" 2>/dev/null || true
+            print_info "  已停止: $svc"
+        fi
         systemctl disable "$svc" 2>/dev/null || true
     done
     
-    # 停止可能占用 80/443 的进程
-    if command -v fuser &>/dev/null; then
-        fuser -k 80/tcp 2>/dev/null || true
-        fuser -k 443/tcp 2>/dev/null || true
-    fi
+    # ---- 4. 强制释放 80/443 端口 (场景5) ----
+    for port in 80 443; do
+        local pid=$(lsof -ti :$port 2>/dev/null | head -5)
+        if [[ -n "$pid" ]]; then
+            print_info "  释放端口 $port (PID: $pid)"
+            kill $pid 2>/dev/null || true
+            sleep 0.5
+            kill -9 $pid 2>/dev/null || true
+        fi
+    done
     
-    # 清理旧的 systemd 服务文件 (重装时重新生成)
+    # ---- 5. 清理旧的 systemd 服务文件 (重装时重新生成) ----
     rm -f /etc/systemd/system/hysteria-server.service 2>/dev/null
     rm -f /etc/systemd/system/b-ui-admin.service 2>/dev/null
     rm -f /etc/systemd/system/b-ui-cert-sync.service 2>/dev/null
@@ -462,13 +491,36 @@ run_core_install() {
     rm -rf /etc/systemd/system/xray.service.d 2>/dev/null
     systemctl daemon-reload 2>/dev/null
     
-    # 清理旧的 cron 任务
-    crontab -l 2>/dev/null | grep -v "b-ui" | grep -v "cert-check" | grep -v "cert-sync" | crontab - 2>/dev/null || true
+    # ---- 6. 清理旧的 cron 任务 ----
+    if crontab -l 2>/dev/null | grep -qE "b-ui|cert-check|cert-sync|certbot"; then
+        crontab -l 2>/dev/null | grep -vE "b-ui|cert-check|cert-sync|certbot renew" | crontab - 2>/dev/null || true
+        print_info "  已清理旧 cron 任务"
+    fi
     
-    # 清理环境代理变量 (防止 curl 走死代理)
-    unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY 2>/dev/null || true
+    # ---- 7. 清理旧版 Nginx 配置 (场景2: 从 Nginx 迁移到 Caddy) ----
+    if [[ -f /etc/nginx/conf.d/b-ui-admin.conf ]]; then
+        rm -f /etc/nginx/conf.d/b-ui-admin.conf 2>/dev/null
+        print_info "  已清理旧 Nginx 配置"
+    fi
     
-    print_success "旧服务已清理，端口已释放"
+    # ---- 8. 检查 Caddy 已有证书 (场景3: 重装时保留有效证书) ----
+    local caddy_data="/var/lib/caddy/.local/share/caddy"
+    if [[ -d "$caddy_data/certificates" ]]; then
+        print_info "  检测到 Caddy 已有证书数据，重装后将自动复用"
+    fi
+    
+    print_success "环境准备完成"
+}
+
+#===============================================================================
+# 安装核心组件
+#===============================================================================
+
+run_core_install() {
+    print_info "运行核心安装流程..."
+    
+    # ====== 安装前环境准备：覆盖全新/重装/旧版升级所有场景 ======
+    prepare_install_env
     
     # 加载核心模块
     source "${BASE_DIR}/core.sh"
