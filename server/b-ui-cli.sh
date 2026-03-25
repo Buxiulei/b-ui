@@ -66,8 +66,15 @@ check_bbr_status() {
 }
 
 get_domain() {
-    if [[ -f "$CONFIG_FILE" ]]; then
-        grep -A2 "^tls:" "$CONFIG_FILE" 2>/dev/null | grep "cert:" | sed 's|.*/live/\([^/]*\)/.*|\1|'
+    # 优先从证书同步保存的域名文件读取
+    if [[ -f "${BASE_DIR}/certs/.domain" ]]; then
+        cat "${BASE_DIR}/certs/.domain"
+        return
+    fi
+    # 备选：从 Caddyfile 第一个站点块解析域名
+    if [[ -f /etc/caddy/Caddyfile ]]; then
+        grep -oP '^[a-zA-Z0-9][-a-zA-Z0-9.]*\.[a-zA-Z]{2,}' /etc/caddy/Caddyfile 2>/dev/null | head -1
+        return
     fi
 }
 
