@@ -6,22 +6,24 @@
 
 轻量级 Hysteria2 + Xray 多协议代理一键部署工具，内置 Web 管理面板与全功能流量管理。
 
-**当前版本**: v3.1.0
+**当前版本**: v3.2.2
 
 ---
 
 ## 最新更新
 
-### v3.1.0 — 内核代理下载
-- 🌐 **服务端内核缓存**：自动从 GitHub 同步 Hysteria2/Xray/sing-box 最新二进制（每 6h）
-- 📥 **客户端服务端优先下载**：内核更新时优先从服务端拉取，解决国内无法直连 GitHub
-- 🔄 **自动 Fallback**：服务端不可达时自动切换到 GitHub 官方源
+### v3.2.2 — Caddy 证书共享修复
+- 🔐 **证书自动同步**：Caddy 申请的 SSL 证书自动同步到 Hysteria2，修复服务端启动失败
+- ⏱ **启动顺序优化**：Caddy → 证书同步 → Hysteria2，确保证书就绪后再启动
+- 🩺 **健康检查增强**：定时检查 Caddy 状态 + 证书同步 + Hysteria2 自动恢复
 
-### v3.0.x — 架构重构
-- 🎯 客户端菜单 15 → 8 项，统一导入节点入口
-- ▶ 服务控制/一键更新/高级设置子菜单
-- 🔒 消除 `eval` 注入漏洞，sing-box 1.13 DNS 兼容
-- 📦 服务端瘦身 49%
+### v3.2.x — 客户端增强
+- 🛡 UFW 防火墙兼容（TUN 启动前暂停/停止后恢复）
+- 🌐 系统代理自动配置（不开 TUN 也能访问 GitHub）
+- ▶ 服务控制菜单重构（按服务独立启停+显示端口号）
+
+### v3.1.0 — 内核代理下载
+- 🌐 服务端自动从 GitHub 同步最新内核（每 6h），客户端优先从服务端拉取
 
 ---
 
@@ -32,7 +34,7 @@
 - **用户管理**: Web 面板可视化管理，支持多用户、流量统计、在线状态监控
 - **访问控制**: 用户时长限制、总流量/月度流量限制、用户级别限速
 - **内核代理**: 自动缓存 GitHub 最新内核二进制，供客户端国内环境下载
-- **自动维护**: HTTPS 证书 (Let's Encrypt)、自动更新、BBR 优化
+- **自动维护**: Caddy 自动 HTTPS 证书、证书同步、自动更新、BBR 优化
 - **便捷分享**: 二维码 (v2rayN/Shadowrocket)、sing-box/Clash 订阅
 
 ### 客户端 (Client)
@@ -99,7 +101,7 @@ bash <(curl -fsSL "https://raw.githubusercontent.com/Buxiulei/b-ui/main/install.
 ### 端口列表
 | 端口 | 协议 | 用途 |
 |------|------|------|
-| 80/443 | TCP | Web 面板 / 证书申请 |
+| 80/443 | TCP | Caddy (Web 面板 HTTPS + 证书申请) |
 | 10000 | UDP | Hysteria2 |
 | 10001 | TCP | VLESS-Reality |
 | 10002 | TCP | VLESS-WS-TLS |
@@ -119,7 +121,8 @@ bash <(curl -fsSL "https://raw.githubusercontent.com/Buxiulei/b-ui/main/install.
 
 ## 文件结构
 
-- `/opt/b-ui/`: 核心数据目录 (配置、证书、数据库)
+- `/opt/b-ui/`: 核心数据目录 (配置、用户数据)
+- `/opt/b-ui/certs/`: SSL 证书 (Caddy 自动同步)
 - `/opt/b-ui/packages/`: 内核二进制缓存 (自动同步)
 - `/usr/local/bin/b-ui`: 服务端命令
 - `/usr/local/bin/bui-c`: 客户端命令
