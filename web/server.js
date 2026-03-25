@@ -268,8 +268,24 @@ function getConfig() {
     try {
         let dm, pm;
         const hc = fs.readFileSync(CONFIG.hysteriaConfig, "utf8");
-        dm = hc.match(/\/live\/([^\/]+)\/fullchain/);
         pm = hc.match(/listen:\s*:(\d+)/);
+        
+        // 域名提取: 优先 certs/.domain → Caddyfile → 旧证书路径
+        const domainFile = path.join(BASE_DIR, "certs", ".domain");
+        if (fs.existsSync(domainFile)) {
+            dm = fs.readFileSync(domainFile, "utf8").trim();
+        }
+        if (!dm) {
+            try {
+                const caddyfile = fs.readFileSync("/etc/caddy/Caddyfile", "utf8");
+                const m = caddyfile.match(/^([a-zA-Z0-9][-a-zA-Z0-9.]*\.[a-zA-Z]{2,})/m);
+                if (m) dm = m[1];
+            } catch { }
+        }
+        if (!dm) {
+            const certMatch = hc.match(/\/live\/([^\/]+)\/fullchain/);
+            if (certMatch) dm = certMatch[1];
+        }
         let xrayPort = 10001, pubKey = "", shortId = "", sni = "www.bing.com";
         try {
             const xc = JSON.parse(fs.readFileSync(CONFIG.xrayConfig, "utf8"));
@@ -302,7 +318,7 @@ function getConfig() {
         } catch { }
 
         return {
-            domain: dm ? dm[1] : "localhost",
+            domain: dm || "localhost",
             port: pm ? pm[1] : "443",
             xrayPort,
             pubKey,
