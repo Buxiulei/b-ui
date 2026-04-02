@@ -562,6 +562,11 @@ OVEOF
         print_warning "Caddy 配置验证失败，请检查域名配置"
     fi
 
+    # caddy validate 以 root 运行会创建 owner=root 的日志文件，
+    # 导致后续 caddy 用户启动时 permission denied，必须清理
+    rm -f /var/log/caddy/b-ui-access.log 2>/dev/null
+    chown -R caddy:caddy /var/log/caddy
+
     # 重启 Caddy (自动申请 SSL 证书)
     systemctl restart caddy
     print_success "Caddy 反向代理已配置 (自动 HTTPS: ${DOMAIN})"
