@@ -1,6 +1,6 @@
 {
-    "version": "3.2.3",
-    "updated": "2026-03-25",
+    "version": "3.2.4",
+    "updated": "2026-04-02",
     "files": [
         "install.sh",
         "server/core.sh",
@@ -15,6 +15,7 @@
         "b-ui-client.sh"
     ],
     "changelog": {
+        "3.2.4": "安装加固：修复 Caddy 日志目录权限导致启动失败；修复 npm install 错误码被管道吞掉；补全 js-yaml 依赖；安装后自动检测 SSH 公钥并关闭密码登录",
         "3.2.3": "全场景安装加固：安装前自动清理旧服务/端口/代理变量；CLI 域名显示修复；server.js 域名解析适配 Caddy；客户端安装命令防代理污染（--noproxy）；CLI 卸载适配 Caddy；安装注入脚本头加固（清代理+停旧服务）",
         "3.2.2": "修复 Caddy 证书共享：Hysteria2 服务端启动失败（证书路径不匹配）；新增 cert-sync.sh 自动从 Caddy 同步证书到 /opt/b-ui/certs/；启动顺序优化（Caddy→证书同步→Hysteria2）；健康检查增加证书同步和 Hysteria2 自动恢复",
         "3.2.1": "UFW 防火墙兼容（TUN 启动前暂停/停止后恢复）；系统代理自动配置（hy2 启停时管理 http_proxy/https_proxy，不开 TUN 也能访问 GitHub）；服务控制菜单重构（按服务独立启停+显示端口号）；连接测试添加 GitHub",

@@ -1110,7 +1110,7 @@ deploy_admin_panel() {
         pkg_version=$(jq -r '.version' "${BASE_DIR}/version.json" 2>/dev/null || echo "unknown")
     fi
     cat > "$ADMIN_DIR/package.json" << EOF
-{"name":"b-ui-admin","version":"${pkg_version}","type":"module","main":"server.js","scripts":{"start":"node server.js"},"dependencies":{"singbox-converter":"^1.0.8"}}
+{"name":"b-ui-admin","version":"${pkg_version}","type":"module","main":"server.js","scripts":{"start":"node server.js"},"dependencies":{"singbox-converter":"^1.0.8","js-yaml":"^4.1.0"}}
 EOF
     
     # 安装 npm 依赖 (多种方式尝试，确保成功)
@@ -1118,24 +1118,24 @@ EOF
     cd "$ADMIN_DIR"
     
     local npm_success=false
-    
+
     # 方法1: 标准安装
-    if npm install 2>&1 | tail -5; then
+    if npm install 2>&1; then
         npm_success=true
     fi
-    
+
     # 方法2: 使用 --legacy-peer-deps
     if [[ "$npm_success" == "false" ]]; then
         print_warning "尝试 --legacy-peer-deps..."
-        if npm install --legacy-peer-deps 2>&1 | tail -5; then
+        if npm install --legacy-peer-deps 2>&1; then
             npm_success=true
         fi
     fi
-    
+
     # 方法3: 单独安装核心依赖
     if [[ "$npm_success" == "false" ]] || [[ ! -d "$ADMIN_DIR/node_modules/singbox-converter" ]]; then
         print_warning "单独安装 singbox-converter..."
-        npm install singbox-converter js-yaml 2>&1 | tail -3 || true
+        npm install singbox-converter js-yaml 2>&1 || true
     fi
     
     cd - > /dev/null 2>&1 || true
@@ -1219,12 +1219,17 @@ start_all_services() {
     chmod 755 "$CERTS_DIR"
     
     # 1. 先启动 Caddy (需要它申请 SSL 证书)
+    # 确保 Caddy 日志目录权限正确 (Caddy 以 caddy 用户运行)
+    mkdir -p /var/log/caddy
+    chown -R caddy:caddy /var/log/caddy
+    chmod 755 /var/log/caddy
     systemctl enable caddy --now 2>/dev/null
     sleep 1
     if systemctl is-active --quiet caddy; then
         print_success "Caddy 已启动"
     else
         print_warning "Caddy 启动失败，请检查 80/443 端口"
+        print_info "查看详情: journalctl -xeu caddy.service"
     fi
     
     # 2. 等待 Caddy 证书就绪并同步到共享目录
@@ -1261,5 +1266,47 @@ start_all_services() {
         systemctl enable hysteria-server 2>/dev/null
         print_warning "Hysteria2: 证书尚未就绪，已设置开机自启"
         print_info "证书同步后 Hysteria2 将通过健康检查自动启动"
+    fi
+}
+
+#===============================================================================
+# SSH 安全加固
+# 检测 root 用户是否已配置 SSH 公钥，如果有则关闭密码登录
+#===============================================================================
+
+harden_ssh() {
+    local auth_keys="/root/.ssh/authorized_keys"
+
+    # 检查是否有已配置的 SSH 公钥
+    if [[ ! -f "$auth_keys" ]] || [[ ! -s "$auth_keys" ]]; then
+        print_info "未检测到 SSH 公钥，保留密码登录"
+        return
+    fi
+
+    local key_count=$(grep -c '^ssh-' "$auth_keys" 2>/dev/null || echo "0")
+    if [[ "$key_count" -eq 0 ]]; then
+        print_info "未检测到有效 SSH 公钥，保留密码登录"
+        return
+    fi
+
+    print_info "检测到 ${key_count} 个 SSH 公钥，正在加固 SSH 安全..."
+
+    local sshd_config="/etc/ssh/sshd_config"
+
+    # 备份原始配置
+    if [[ ! -f "${sshd_config}.bak" ]]; then
+        cp "$sshd_config" "${sshd_config}.bak"
+    fi
+
+    # 关闭 root 密码登录，仅允许公钥
+    sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' "$sshd_config"
+    sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' "$sshd_config"
+    sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' "$sshd_config"
+
+    # 重启 sshd
+    if systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null; then
+        print_success "SSH 已加固: 仅允许公钥登录，密码登录已关闭"
+    else
+        print_warning "SSH 重启失败，请手动检查 sshd 配置"
     fi
 }

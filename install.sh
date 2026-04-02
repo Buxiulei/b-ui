@@ -550,7 +550,10 @@ run_core_install() {
     
     # 创建全局命令
     create_global_command
-    
+
+    # SSH 安全加固 (检测到公钥时自动关闭密码登录)
+    harden_ssh
+
     # 根据用户配置决定是否预下载客户端安装包
     if [[ "$PREDOWNLOAD_PACKAGES" =~ ^[yY]$ ]]; then
         download_client_packages

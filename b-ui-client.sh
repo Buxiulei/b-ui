@@ -1196,6 +1196,14 @@ ${outbound_config},
       {
         "domain_keyword": ["wechat", "weixin", "tencent", "qq", "xiaohongshu", "douyin", "bytedance", "toutiao", "kuaishou", "bilibili", "taobao", "alipay", "alibaba", "tmall", "jd", "baidu"],
         "outbound": "direct-out"
+      },
+      {
+        "domain_keyword": ["github", "google", "googleapis", "googlevideo", "gstatic", "gmail", "gemini", "generativelanguage", "anthropic", "openai", "chatgpt", "antigravity", "cloudcode", "visualstudio", "vscode"],
+        "outbound": "proxy-out"
+      },
+      {
+        "domain_suffix": [".github.com", ".github.io", ".githubusercontent.com", ".githubassets.com", ".google.com", ".google.com.hk", ".google.co.jp", ".goog", ".youtube.com", ".ytimg.com", ".googlesyndication.com", ".googleusercontent.com", ".ggpht.com", ".gemini.google.com", ".antigravity.google", ".antigravity-unleash.goog", ".run.app", ".visualstudio.com", ".vscode-cdn.net", ".aka.ms"],
+        "outbound": "proxy-out"
       }
     ],
     "final": "proxy-out",

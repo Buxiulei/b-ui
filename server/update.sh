@@ -224,7 +224,7 @@ do_update() {
     # 安装 Web 面板依赖
     if [[ -f "${ADMIN_DIR}/package.json" ]]; then
         print_info "安装 Web 面板依赖..."
-        cd "${ADMIN_DIR}" && npm install --silent 2>/dev/null && cd - > /dev/null
+        cd "${ADMIN_DIR}" && npm install 2>&1 && cd - > /dev/null
         print_success "依赖安装完成"
     fi
     
@@ -693,7 +693,7 @@ auto_update() {
         
         # 安装 Web 面板依赖
         if [[ -f "${ADMIN_DIR}/package.json" ]]; then
-            cd "${ADMIN_DIR}" && npm install --silent 2>/dev/null && cd - > /dev/null || true
+            cd "${ADMIN_DIR}" && npm install 2>&1 && cd - > /dev/null || true
         fi
         
         # 重启服务
