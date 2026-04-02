@@ -411,7 +411,8 @@ generate_reality_keys() {
     
     if [[ -f "$BASE_DIR/reality-keys.json" ]]; then
         local existing_priv=$(cat "$BASE_DIR/reality-keys.json" 2>/dev/null | grep '"privateKey"' | cut -d'"' -f4)
-        if [[ -n "$existing_priv" ]]; then
+        local existing_pub=$(cat "$BASE_DIR/reality-keys.json" 2>/dev/null | grep '"publicKey"' | cut -d'"' -f4)
+        if [[ -n "$existing_priv" && -n "$existing_pub" ]]; then
             print_info "Reality 密钥已存在，跳过生成"
             return 0
         fi
@@ -423,9 +424,14 @@ generate_reality_keys() {
     fi
     
     local keys=$(xray x25519 2>&1)
+    # xray x25519 输出格式：
+    #   PrivateKey: xxx
+    #   Password (PublicKey): xxx    (Xray 26.x+)
+    #   PublicKey: xxx               (旧版)
+    #   Public key: xxx              (更旧版)
     local privkey=$(echo "$keys" | grep -i "^PrivateKey:" | awk -F': ' '{print $2}' | tr -d ' ')
-    local pubkey=$(echo "$keys" | grep -i "^Password:" | awk -F': ' '{print $2}' | tr -d ' ')
-    
+    local pubkey=$(echo "$keys" | grep -i "PublicKey" | awk -F': ' '{print $2}' | tr -d ' ')
+
     # 尝试旧格式
     if [[ -z "$privkey" ]]; then
         privkey=$(echo "$keys" | grep "Private key:" | awk '{print $3}')
