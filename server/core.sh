@@ -545,14 +545,23 @@ CADDYEOF
     # 创建日志目录 (Caddy 以 caddy 用户运行)
     mkdir -p /var/log/caddy
     chown -R caddy:caddy /var/log/caddy
-    
+
+    # 添加 systemd override: Caddy 官方 service 使用 ProtectSystem=full
+    # 导致 /var/log 只读，必须显式放行日志目录写入
+    mkdir -p /etc/systemd/system/caddy.service.d
+    cat > /etc/systemd/system/caddy.service.d/override.conf << 'OVEOF'
+[Service]
+ReadWritePaths=/var/log/caddy
+OVEOF
+    systemctl daemon-reload
+
     # 验证配置
     if caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile 2>/dev/null; then
         print_success "Caddy 配置验证通过"
     else
         print_warning "Caddy 配置验证失败，请检查域名配置"
     fi
-    
+
     # 重启 Caddy (自动申请 SSL 证书)
     systemctl restart caddy
     print_success "Caddy 反向代理已配置 (自动 HTTPS: ${DOMAIN})"
@@ -1219,10 +1228,6 @@ start_all_services() {
     chmod 755 "$CERTS_DIR"
     
     # 1. 先启动 Caddy (需要它申请 SSL 证书)
-    # 确保 Caddy 日志目录权限正确 (Caddy 以 caddy 用户运行)
-    mkdir -p /var/log/caddy
-    chown -R caddy:caddy /var/log/caddy
-    chmod 755 /var/log/caddy
     systemctl enable caddy --now 2>/dev/null
     sleep 1
     if systemctl is-active --quiet caddy; then
