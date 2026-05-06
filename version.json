@@ -1,6 +1,6 @@
 {
-    "version": "3.2.5",
-    "updated": "2026-04-02",
+    "version": "3.2.6",
+    "updated": "2026-05-06",
     "files": [
         "install.sh",
         "server/core.sh",
@@ -15,6 +15,7 @@
         "b-ui-client.sh"
     ],
     "changelog": {
+        "3.2.6": "Hysteria 内存治理：systemd override 增加 GOMEMLIMIT=400MiB + MemoryHigh/Max 500M/700M 防止 Go runtime 长跑后 RSS 不归还；小内存机器（≤2G）自动降低 vm.swappiness=10；老用户跑 update 自动迁移并重启 hysteria 生效",
         "3.2.5": "修复 Reality publicKey 解析失败导致 VLESS 稳定版订阅缺失；兼容 Xray 26.x 新输出格式；重装时检查 publicKey 非空才跳过密钥生成",
         "3.2.4": "安装加固：修复 Caddy 日志目录权限导致启动失败；修复 npm install 错误码被管道吞掉；补全 js-yaml 依赖；安装后自动检测 SSH 公钥并关闭密码登录",
         "3.2.3": "全场景安装加固：安装前自动清理旧服务/端口/代理变量；CLI 域名显示修复；server.js 域名解析适配 Caddy；客户端安装命令防代理污染（--noproxy）；CLI 卸载适配 Caddy；安装注入脚本头加固（清代理+停旧服务）",

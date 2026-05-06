@@ -124,11 +124,36 @@ CPUSchedulingPolicy=other
 Nice=-5
 LimitNOFILE=1048576
 
+# 内存回收：让 Go runtime 主动归还内存给 OS（Go 1.19+）
+# 不设此变量时 hysteria 长跑后 RSS 会缓慢爬升至历史峰值不释放
+Environment=GOMEMLIMIT=400MiB
+
+# cgroup 兜底：超过 500M 开始 throttle，700M 硬上限触发 OOM-restart
+# 适配 1G 小内存机器；2G+ 机器可手动放宽到 800M/1G
+MemoryHigh=500M
+MemoryMax=700M
+
 # 确保服务稳定运行
 Restart=always
 RestartSec=3
 EOF
         systemctl daemon-reload
+
+        # 小内存机器（≤2G）自动降低 swappiness，避免 hysteria 工作集被换出导致卡顿
+        local mem_mb
+        mem_mb=$(awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo)
+        if [[ $mem_mb -le 2048 ]]; then
+            print_info "检测到物理内存 ${mem_mb}MB ≤ 2G，应用 swappiness 优化"
+            cat > /etc/sysctl.d/99-b-ui-memory.conf <<'SYSCTL_EOF'
+# b-ui 内存策略：小内存机器（≤2G）降低 swap 倾向
+# 配合 hysteria-server.service 的 GOMEMLIMIT/MemoryHigh/MemoryMax 一起生效
+vm.swappiness = 10
+SYSCTL_EOF
+            sysctl -p /etc/sysctl.d/99-b-ui-memory.conf >/dev/null 2>&1 && \
+                print_success "swappiness 已设为 10"
+        else
+            print_info "物理内存 ${mem_mb}MB > 2G，保持系统默认 swappiness"
+        fi
     else
         print_error "Hysteria2 安装失败"
         exit 1
