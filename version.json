@@ -1,5 +1,5 @@
 {
-    "version": "3.2.6",
+    "version": "3.2.7",
     "updated": "2026-05-06",
     "files": [
         "install.sh",
@@ -15,6 +15,7 @@
         "b-ui-client.sh"
     ],
     "changelog": {
+        "3.2.7": "修复 Hysteria 内存膨胀根因：移除 config.yaml 中过大的 QUIC 接收窗口配置（旧版 64MiB/conn × 多客户端 = 每会话 ~80MB），改用 hysteria 默认值（8MiB stream / 20MiB conn，200ms RTT 下单连接吞吐仍达 670Mbps）；老用户跑 update 自动备份并迁移 config.yaml；实测 5 客户端场景 RSS 从 400MB 降至 185MB",
         "3.2.6": "Hysteria 内存治理：systemd override 增加 GOMEMLIMIT=400MiB + MemoryHigh/Max 500M/700M 防止 Go runtime 长跑后 RSS 不归还；小内存机器（≤2G）自动降低 vm.swappiness=10；老用户跑 update 自动迁移并重启 hysteria 生效",
         "3.2.5": "修复 Reality publicKey 解析失败导致 VLESS 稳定版订阅缺失；兼容 Xray 26.x 新输出格式；重装时检查 publicKey 非空才跳过密钥生成",
         "3.2.4": "安装加固：修复 Caddy 日志目录权限导致启动失败；修复 npm install 错误码被管道吞掉；补全 js-yaml 依赖；安装后自动检测 SSH 公钥并关闭密码登录",

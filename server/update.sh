@@ -307,11 +307,24 @@ update_service_paths() {
 apply_systemd_configs() {
     print_info "应用 systemd 资源隔离配置..."
     local updated=0
-    
+
     # 获取当前配置路径
     local config_file="${BASE_DIR}/config.yaml"
     local xray_config="${BASE_DIR}/xray-config.json"
-    
+
+    # 迁移 config.yaml：移除过大的 QUIC 接收窗口配置（旧版默认 64 MiB/conn 在小内存机器上每会话占用 ~80MB）
+    local hysteria_config_changed=0
+    if [[ -f "$config_file" ]] && grep -q '^# QUIC 流控优化\|^quic:' "$config_file"; then
+        cp "$config_file" "${config_file}.bak.$(date +%Y%m%d-%H%M%S)"
+        sed -i '/^# QUIC 流控优化/,/^  maxConnReceiveWindow:/d' "$config_file"
+        # 兼容只有 quic: 段没有注释的情况
+        sed -i '/^quic:$/,/^  maxConnReceiveWindow:/d' "$config_file"
+        if ! grep -q '^quic:' "$config_file"; then
+            print_info "  ✓ 移除 config.yaml 中过大的 QUIC 窗口配置（已备份）"
+            hysteria_config_changed=1
+        fi
+    fi
+
     # 应用 Hysteria2 服务配置
     local hysteria_mem_changed=0
     if [[ -d /etc/systemd/system/hysteria-server.service.d ]]; then
@@ -417,11 +430,16 @@ EOF
     # 重载 systemd
     if [[ $updated -eq 1 ]]; then
         systemctl daemon-reload
-        # cgroup 内存限制和 GOMEMLIMIT 必须 restart 才生效（reload 不会重读 [Service]）
-        if [[ $hysteria_mem_changed -eq 1 ]] && systemctl is-active --quiet hysteria-server; then
-            print_info "  ↻ 重启 hysteria-server 应用内存优化（客户端会自动重连）"
-            systemctl restart hysteria-server
-        fi
+    fi
+
+    # cgroup 内存限制、GOMEMLIMIT、config.yaml 任一变化都需要 restart hysteria 才生效
+    if { [[ $hysteria_mem_changed -eq 1 ]] || [[ $hysteria_config_changed -eq 1 ]]; } && \
+       systemctl is-active --quiet hysteria-server; then
+        print_info "  ↻ 重启 hysteria-server 应用内存优化（客户端会自动重连）"
+        systemctl restart hysteria-server
+    fi
+
+    if [[ $updated -eq 1 ]]; then
         print_success "资源隔离配置已应用"
     fi
 }
