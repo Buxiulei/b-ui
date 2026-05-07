@@ -1,5 +1,5 @@
 {
-    "version": "3.3.9",
+    "version": "3.3.10",
     "updated": "2026-05-07",
     "files": [
         "install.sh",
@@ -16,6 +16,7 @@
         "b-ui-client.sh"
     ],
     "changelog": {
+        "3.3.10": "修复 sing-box 中继 hairpin 回环问题：apply_xray 和 apply_hysteria 在写入路由规则时自动检测服务器公网 IP，并将其加入直连例外；解决用户在 b-ui VPN（TUN 模式）下 SSH 到服务器自身超时的问题",
         "3.3.9": "install.sh 集成 sing-box 初始化：一键安装完成后自动调用 residential-helper.sh setup，下载 sing-box 并配置 Xray/Hysteria2 永久指向 sing-box 出站中继，新装服务器无需手动操作",
         "3.3.8": "sing-box 升级为永久出站中继：无论住宅代理是否开启，Xray 和 Hysteria2 始终将所有流量转发给 sing-box（配置写死，不随开关变化）；开启住宅代理只需更新 sing-box 路由规则并重启 sing-box，无需重启 Xray/Hysteria2，切换更快无断流；新增 setup 子命令用于已有服务器的一次性初始化；disable 改为写直连配置而非停止 sing-box",
         "3.3.7": "住宅 IP 架构升级：sing-box 作为统一出站路由层，Xray 和 Hysteria2 的所有非私有 IP 流量均转发给 sing-box（不再各自做域名匹配），sing-box 内部统一处理路由规则和 DNS 路由（域名关键词匹配的 DNS 也走住宅 IP），解决 TUN 模式下 DNS 绕过分流问题；set-domains 只需重启 sing-box 即生效，无需重建 Xray/Hysteria2 配置",

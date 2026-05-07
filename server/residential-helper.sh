@@ -260,9 +260,27 @@ stop_relay_service() {
 }
 
 # ---------------------------------------------------------------------------
+# 获取服务器公网 IP（缓存到 _SERVER_IP，供 apply_xray/apply_hysteria 使用）
+# ---------------------------------------------------------------------------
+get_server_ip() {
+    [[ -n "${_SERVER_IP:-}" ]] && return 0
+    _SERVER_IP=$(curl -sS --max-time 5 https://api.ipify.org 2>/dev/null || \
+                 curl -sS --max-time 5 https://ifconfig.me 2>/dev/null || true)
+}
+
+# ---------------------------------------------------------------------------
 # Xray 配置：永久指向 sing-box（一次写入，不随住宅代理开关变化）
 # ---------------------------------------------------------------------------
 apply_xray() {
+    get_server_ip
+
+    local ip_direct_json
+    if [[ -n "${_SERVER_IP:-}" ]]; then
+        ip_direct_json=$(jq -n --arg ip "${_SERVER_IP}" '["geoip:private", ($ip + "/32")]')
+    else
+        ip_direct_json='["geoip:private"]'
+    fi
+
     local outbounds
     outbounds=$(jq -n \
         --argjson relay_port "$SINGBOX_RELAY_PORT" \
@@ -272,11 +290,12 @@ apply_xray() {
           {"tag":"direct","protocol":"freedom"}]')
 
     local rules
-    rules='[
-      {"type":"field","inboundTag":["api"],"outboundTag":"api"},
-      {"type":"field","ip":["geoip:private"],"outboundTag":"direct"},
-      {"type":"field","outboundTag":"relay","network":"tcp,udp"}
-    ]'
+    rules=$(jq -n --argjson ip_direct "$ip_direct_json" \
+        '[
+          {"type":"field","inboundTag":["api"],"outboundTag":"api"},
+          {"type":"field","ip":$ip_direct,"outboundTag":"direct"},
+          {"type":"field","outboundTag":"relay","network":"tcp,udp"}
+        ]')
 
     local backup="${XRAY_CONFIG}.bak.$(date +%Y%m%d%H%M%S)"
     cp "${XRAY_CONFIG}" "$backup"
@@ -302,6 +321,8 @@ apply_hysteria() {
     local backup="${config}.bak.$(date +%Y%m%d%H%M%S)"
     cp "$config" "$backup"
 
+    get_server_ip
+
     block_file=$(mktemp)
     {
         printf 'outbounds:\n'
@@ -318,6 +339,7 @@ apply_hysteria() {
         printf '    - direct(172.16.0.0/12)\n'
         printf '    - direct(192.168.0.0/16)\n'
         printf '    - direct(169.254.0.0/16)\n'
+        [[ -n "${_SERVER_IP:-}" ]] && printf '    - direct(%s)\n' "${_SERVER_IP}"
         printf '    - relay(all)\n'
     } > "$block_file"
 
