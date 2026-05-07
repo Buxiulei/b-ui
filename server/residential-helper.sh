@@ -186,9 +186,7 @@ write_singbox_config_residential() {
             "type": "socks",
             "tag": "socks-in",
             "listen": "127.0.0.1",
-            "listen_port": $relay_port,
-            "sniff": true,
-            "sniff_override_destination": true
+            "listen_port": $relay_port
           }],
           "outbounds": [
             {
@@ -204,6 +202,7 @@ write_singbox_config_residential() {
           ],
           "route": {
             "rules": [
+              {"action": "sniff"},
               {
                 "ip_cidr": ($private + (if $server_ip != "" then [($server_ip + "/32")] else [] end)),
                 "outbound": "direct"
@@ -240,9 +239,7 @@ write_singbox_config_direct() {
             "type": "socks",
             "tag": "socks-in",
             "listen": "127.0.0.1",
-            "listen_port": $relay_port,
-            "sniff": true,
-            "sniff_override_destination": true
+            "listen_port": $relay_port
           }],
           "outbounds": [{"type": "direct", "tag": "direct"}],
           "route": {
