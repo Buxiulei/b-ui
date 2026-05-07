@@ -4432,7 +4432,11 @@ main() {
     # 过滤掉 flags，只保留非 flag 参数
     local args=()
     for arg in "$@"; do
-        [[ "$arg" == -* ]] || args+=("$arg")
+        case "$arg" in
+            -h|--help) dispatch_subcommand --help; exit 0 ;;
+            -*) : ;;
+            *) args+=("$arg") ;;
+        esac
     done
 
     # 有子命令 → 非交互路径
