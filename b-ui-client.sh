@@ -4366,24 +4366,83 @@ show_menu() {
     echo -e "${CYAN}└──────────────────────────────────────────${NC}"
 }
 
+dispatch_subcommand() {
+    local cmd="$1"; shift
+    case "$cmd" in
+        switch)  cmd_switch "$@" ;;
+        tun)     cmd_tun "$@" ;;
+        import)  cmd_import "$@" ;;
+        start)   cmd_start "$@" ;;
+        stop)    cmd_stop "$@" ;;
+        restart) cmd_restart "$@" ;;
+        status)  cmd_status "$@"; exit 0 ;;
+        list)    cmd_list "$@"; exit 0 ;;
+        -h|--help|help)
+            cat <<'HELP'
+用法: bui-c [subcommand] [options]
+
+  无参数          进入 TUI 交互菜单
+
+子命令:
+  switch <名称>        切换到指定节点
+  tun on|off|status   TUN 模式控制
+  import <uri>        导入节点（加 --activate 立即激活）
+  start               启动当前节点服务
+  stop                停止所有客户端服务
+  restart             重启当前节点（重新生成配置）
+  status              查看当前状态（--json 输出机器可读格式）
+  list                列出所有节点（--json 输出机器可读格式）
+
+通用 flags:
+  -y, --yes           跳过所有确认提示
+  --json              输出 JSON 格式
+  -q, --quiet         只输出结果，不输出过程信息
+HELP
+            exit 0
+            ;;
+        *)
+            tui_error "未知命令: $cmd。运行 'bui-c --help' 查看帮助。"
+            exit 2
+            ;;
+    esac
+}
+
 main() {
     check_root
     check_os
-    
+
+    # 提取全局 flags（-y, --json, --quiet）
+    parse_global_flags "$@"
+    # 过滤掉 flags，只保留非 flag 参数
+    local args=()
+    for arg in "$@"; do
+        [[ "$arg" == -* ]] || args+=("$arg")
+    done
+
+    # 有子命令 → 非交互路径
+    if [[ ${#args[@]} -gt 0 ]]; then
+        dispatch_subcommand "${args[@]}"
+        exit $?
+    fi
+
+    # 无参数 → TUI 交互模式
+    tui_main_loop
+}
+
+tui_main_loop() {
     # 只在首次运行时检测依赖 (核心未安装时)
     if ! command -v hysteria &> /dev/null || ! command -v xray &> /dev/null || ! command -v sing-box &> /dev/null; then
         check_dependencies
     fi
-    
+
     # 后台检查客户端更新 (静默检查，不阻塞启动)
     check_client_update &>/dev/null &
-    
+
     while true; do
         print_banner
         show_status
         show_menu
         read -p "请选择 [0-8]: " choice
-        
         case $choice in
             1) import_node ;;
             2) config_management ;;
@@ -4393,10 +4452,9 @@ main() {
             6) update_all ;;
             7) advanced_settings_menu ;;
             8) uninstall ;;
-            0) echo ""; print_info "再见！"; exit 0 ;;
+            0) echo ""; tui_info "再见！"; exit 0 ;;
             *) print_error "无效选项" ;;
         esac
-        
         echo ""
         read -p "按 Enter 继续..."
     done
