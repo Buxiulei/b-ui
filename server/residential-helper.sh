@@ -230,7 +230,7 @@ write_singbox_config_direct() {
           "log": {"level": "error"},
           "dns": {
             "servers": [
-              {"tag": "dns_direct", "type": "udp", "server": "1.1.1.1", "detour": "direct"}
+              {"tag": "dns_direct", "type": "udp", "server": "1.1.1.1"}
             ],
             "final": "dns_direct",
             "strategy": "prefer_ipv4"
