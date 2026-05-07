@@ -13,10 +13,10 @@ B-UI 当前部署的 Hysteria2 + Xray 代理直接使用 VPS 自身的机房 IP 
 **用户场景**: 用户从代理商处购买静态住宅 IP（包月不限流量套餐），获得 `socks5://user:pass@host:port` 形式的凭据，希望通过一键安装 / CLI / Web 看板任一入口配置后立即生效。
 
 **非目标**:
-- 不做选择性分流（geosite-based）。本期默认且仅支持"全量出站走住宅"。
 - 不做多 SOCKS5 池负载均衡或自动切换。一次只用一个上游。
 - 不做 HTTP/HTTPS 上游代理。仅 SOCKS5。
 - 不做 Per-user 路由（用户 A 走住宅、用户 B 走直出）。所有 inbound 用户共享出站策略。
+- 不做自定义 geosite 域名列表的 UI 编辑。分流站点列表内置在 helper 脚本中，改动需更新脚本。
 
 ---
 
@@ -26,7 +26,7 @@ B-UI 当前部署的 Hysteria2 + Xray 代理直接使用 VPS 自身的机房 IP 
 |---|---|---|
 | 上游代理协议 | SOCKS5 (账密模式) | 云 VPS 的公网 IP 可能因重建/迁移变化，IP 白名单认证脆弱；账密认证一套凭据多机通用 |
 | 凭据存储格式 | 标准 URI `socks5://user:pass@host:port` | RFC 3986 形式，Xray/Hysteria2/curl/sing-box 全部原生识别。安装器另接受三种厂商 CSV 格式但内部统一归一化为 URI |
-| 分流策略 | 全量出站走住宅，仅内网 CIDR 走直出 | 用户购买的是包月不限流量套餐，无成本顾虑；最简实现；以后如需分流再加 |
+| 分流策略 | 选择性：Netflix / OpenAI / Google / Claude 走住宅，其余直出 | 速度最快（大部分流量不走额外跳）；住宅带宽消耗小；这几个站点恰好是最需要住宅 IP 的场景 |
 | 校验策略 | 强制连通性 + 出口 IP 校验，失败拒绝保存 | 防止错误凭据写入后服务重启全挂 |
 | 配置入口 | 一键安装、CLI 主菜单、Web 看板（三处） | 一键安装和 CLI 为主，Web 看板补充 |
 
@@ -82,15 +82,32 @@ B-UI 当前部署的 Hysteria2 + Xray 代理直接使用 VPS 自身的机房 IP 
 ]
 ```
 
-`routing.rules` 替换为（保留原有 api 规则不动，追加两条）：
+`routing.rules` 替换为（保留原有 api 规则，插入分流规则，其余默认直出）：
 
 ```json
 [
   { "type": "field", "inboundTag": ["api"], "outboundTag": "api" },
   { "type": "field", "ip": ["geoip:private"], "outboundTag": "direct" },
-  { "type": "field", "outboundTag": "residential", "network": "tcp,udp" }
+  {
+    "type": "field",
+    "domain": [
+      "geosite:netflix",
+      "geosite:openai",
+      "geosite:google",
+      "domain:anthropic.com",
+      "domain:claude.ai"
+    ],
+    "outboundTag": "residential"
+  },
+  { "type": "field", "outboundTag": "direct", "network": "tcp,udp" }
 ]
 ```
+
+规则顺序说明：Xray 按规则从上往下匹配，第一条命中即止。最后一条 `network: tcp,udp` 是兜底直出规则，未匹配到住宅域名的流量全部走 VPS 直出。
+
+`geosite:openai` 在 v2fly domain-list-community 中覆盖 `openai.com`、`chatgpt.com`、`oaistatic.com` 等 OpenAI 旗下域名。
+`geosite:google` 覆盖 `google.com`、`*.google.com`（含 `gemini.google.com`）、`googleapis.com`、`youtube.com` 等。
+Anthropic/Claude 不在标准 geosite 中，需显式列出。
 
 禁用时还原为现有原始形式（单 `freedom` 出站 + 仅 api 路由规则）。
 
@@ -129,16 +146,37 @@ outbounds:
     type: direct
 acl:
   inline:
+    # 内网直出（安全垫，必须排在最前）
     - direct(127.0.0.0/8)
     - direct(10.0.0.0/8)
     - direct(172.16.0.0/12)
     - direct(192.168.0.0/16)
     - direct(169.254.0.0/16)
-    - direct(::1/128)
-    - direct(fc00::/7)
-    - direct(fe80::/10)
-    - residential(all)
+    # Netflix
+    - residential(*.netflix.com)
+    - residential(netflix.com)
+    - residential(*.nflxvideo.net)
+    - residential(*.nflxso.net)
+    # OpenAI / ChatGPT
+    - residential(*.openai.com)
+    - residential(openai.com)
+    - residential(*.chatgpt.com)
+    - residential(chatgpt.com)
+    # Google / Gemini
+    - residential(*.google.com)
+    - residential(google.com)
+    - residential(*.googleapis.com)
+    - residential(*.gstatic.com)
+    # Anthropic / Claude
+    - residential(*.anthropic.com)
+    - residential(anthropic.com)
+    - residential(*.claude.ai)
+    - residential(claude.ai)
+    # 其余全部直出
+    - direct(all)
 ```
+
+Hysteria2 的 ACL 不依赖 geosite.dat，使用内置域名通配符匹配，安装时无需下载额外数据文件。`*.example.com` 匹配任意层级子域名，`example.com` 匹配根域名，两者需同时列出。
 
 禁用时清空两锚点之间内容（保留锚点本身作为下次启用的 sed 替换目标）。
 
@@ -315,24 +353,26 @@ acl:
 
 ## 性能影响（用户须知）
 
-加住宅 IP 后链路变成 `客户端 → VPS → 住宅代理 → 目标站`，多一跳。
+选择性分流后，只有住宅规则命中的流量（Netflix / OpenAI / Google / Claude）走额外一跳，其余（YouTube 下载、普通网页、大文件）全部直出 VPS 跑满速。实测住宅流量占比通常 < 20%。
 
-| 场景 | 额外延迟 | 速度损失 |
+住宅规则匹配的流量链路：`客户端 → VPS → 住宅代理 → 目标站`。
+
+| 场景 | 命中住宅规则时额外延迟 | 其余流量 |
 |---|---|---|
-| VPS 与住宅代理同区域（如同在美西） | +10~30ms | <10% |
-| VPS 香港/日本，住宅在美国 | +120~180ms | 30~50% |
-| VPS 美西，住宅在美东 | +60~80ms | 15~25% |
+| VPS 与住宅代理同区域（如同在美西） | +10~30ms | 无影响，直出 |
+| VPS 香港/日本，住宅在美国 | +120~180ms | 无影响，直出 |
+| VPS 美西，住宅在美东 | +60~80ms | 无影响，直出 |
 
 **建议**：VPS 选址尽量贴近住宅代理 POP；Hysteria2 (QUIC + BBR) 对额外延迟容忍度优于 VLESS-Reality (TCP)。
 
-这部分不会写进 README 主文，但会在一键安装的询问交互文案中带一行简短提示，并在 b-ui 看板的住宅 IP 卡片下方放一个折叠的 "?" 帮助说明。
+这部分会在 b-ui 看板的住宅 IP 卡片下方放一个简短说明文案，一键安装询问时也带一行提示。
 
 ---
 
 ## 已知限制与未来扩展
 
-- **本期不做**：分流模式（geosite 选择性）、多 SOCKS5 上游池、Per-user 路由、HTTP/HTTPS 上游代理、自动测速选最佳 POP。
-- **未来如需分流**：Xray 的 `routing.rules` 和 Hysteria 的 `acl.inline` 都已经预留路由层结构，加分流模式只需扩展规则数组，不动其它部分。helper 脚本可以加一个 `mode` 字段（`full` / `selective`）切换生成逻辑。
+- **本期不做**：自定义 geosite 域名列表的 UI、多 SOCKS5 上游池、Per-user 路由、HTTP/HTTPS 上游代理、自动测速选最佳 POP。
+- **未来扩展站点列表**：Xray 端只需在 `domain[]` 数组加 geosite 标签；Hysteria2 端在 ACL inline 规则中追加域名行。两处改动均在 `residential-helper.sh` 同一函数中，不影响其它组件。
 
 ---
 
@@ -340,10 +380,12 @@ acl:
 
 实施完成后，应满足以下所有：
 
-1. 一键安装时回答 Y 并粘贴有效凭据 → 安装结束后 Netflix/ipinfo.io 看到的是住宅 IP。
+1. 一键安装时回答 Y 并粘贴有效凭据 → 安装结束后访问 `netflix.com` 看到的出口 IP 是住宅 IP。
 2. 一键安装时粘贴**错误**凭据 → 校验失败提示，安装继续完成，住宅 IP 未启用。
-3. 通过 CLI 菜单启用 → 服务自动 reload，新流量立即走住宅。
-4. 通过 b-ui 看板启用 → API 返回成功 + 出口 IP，刷新页面状态正确显示。
-5. CLI 禁用住宅 IP → Xray/Hysteria 配置恢复为安装时的默认（仅 freedom 出站）。
-6. 通过 `bash -n server/residential-helper.sh` 等语法检查。
-7. 升级 v3.3.0 后再升级到下一个 patch 版本，已启用的住宅 IP 配置依然生效（idempotent 验证）。
+3. 启用住宅 IP 后访问 `baidu.com`（不在分流列表）→ 出口 IP 仍为 VPS 机房 IP（直出）。
+4. 启用住宅 IP 后访问 `openai.com` / `claude.ai` / `netflix.com` / `gemini.google.com` → 出口 IP 为住宅 IP。
+5. 通过 CLI 菜单启用 → 服务自动 reload，新流量立即按分流规则生效。
+6. 通过 b-ui 看板启用 → API 返回成功 + 出口 IP，刷新页面状态正确显示。
+7. CLI 禁用住宅 IP → Xray/Hysteria 配置恢复为安装时的默认（仅 freedom 出站，所有流量直出）。
+8. 通过 `bash -n server/residential-helper.sh` 等语法检查。
+9. 升级 v3.3.0 后再升级到下一个 patch 版本，已启用的住宅 IP 分流规则依然生效（idempotent 验证）。
