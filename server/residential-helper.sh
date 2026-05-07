@@ -102,7 +102,7 @@ apply_xray() {
 
     get_domains
     local domain_json
-    domain_json=$(printf '%s\n' "${DOMAINS[@]}" | jq -R . | jq -s 'map("domain:" + .)')
+    domain_json=$(printf '%s\n' "${DOMAINS[@]}" | jq -R . | jq -s 'map("keyword:" + .)')
 
     local outbounds
     outbounds=$(jq -n \
@@ -172,8 +172,7 @@ apply_hysteria() {
         printf '    - direct(192.168.0.0/16)\n'
         printf '    - direct(169.254.0.0/16)\n'
         for d in "${DOMAINS[@]}"; do
-            printf '    - residential(*.%s)\n' "$d"
-            printf '    - residential(%s)\n' "$d"
+            printf '    - residential(*%s*)\n' "$d"
         done
         printf '    - direct(all)\n'
     } > "$block_file"
