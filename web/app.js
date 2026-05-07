@@ -629,8 +629,8 @@ function resiToggleEye() {
 
 function resiCopyUrl(btn) {
     const input = $("#resi-url");
-    const text  = input.value.trim() || input.placeholder;
-    if (!text || text === "socks5://user:pass@host:port") return;
+    const text  = input.value.trim();
+    if (!text) return;
     navigator.clipboard.writeText(text).then(() => {
         btn.classList.add("flash");
         setTimeout(() => btn.classList.remove("flash"), 1400);
