@@ -26,7 +26,6 @@ DEFAULT_DOMAINS=("openai" "chatgpt" "google" "googleapis" "gstatic" "anthropic" 
 
 # ---------------------------------------------------------------------------
 # 读取分流域名列表 → 导出 DOMAINS 数组
-# 优先从 residential-proxy.json 读取，否则使用默认列表
 # ---------------------------------------------------------------------------
 get_domains() {
     if [[ -f "${RESIDENTIAL_CONFIG}" ]]; then
@@ -99,12 +98,12 @@ verify() {
 }
 
 # ---------------------------------------------------------------------------
-# 下载 sing-box 二进制（用作本地 SOCKS5 中继，正确实现 UDP ASSOCIATE）
+# 下载 sing-box 二进制
 # ---------------------------------------------------------------------------
 ensure_singbox() {
     [[ -x "${SINGBOX_BIN}" ]] && return 0
 
-    info "下载 sing-box 用于本地 SOCKS5 中继..."
+    info "下载 sing-box 用于本地统一出站路由..."
     local arch
     arch=$(uname -m)
     local arch_str
@@ -131,44 +130,79 @@ ensure_singbox() {
 }
 
 # ---------------------------------------------------------------------------
-# 生成 sing-box 中继配置（SOCKS5 入站 → 住宅代理出站）
+# 生成 sing-box 统一路由配置
+#
+# 架构说明：Xray 和 Hysteria2 把所有非私有 IP 流量交给 sing-box，
+# sing-box 统一做域名路由（含 DNS），匹配关键词的走住宅 IP，其余直连。
+# 好处：DNS 查询也走住宅 IP，避免 TUN 模式下 DNS 泄露或绕过分流。
 # ---------------------------------------------------------------------------
 write_singbox_config() {
     local host="$1" port="$2" user="$3" pass="$4"
+
+    get_domains
+    local kw_json
+    kw_json=$(printf '%s\n' "${DOMAINS[@]}" | jq -R . | jq -s '.')
+
     jq -n \
-        --arg  host       "$host" \
-        --argjson port    "$port" \
-        --arg  user       "$user" \
-        --arg  pass       "$pass" \
+        --arg  host      "$host" \
+        --argjson port   "$port" \
+        --arg  user      "$user" \
+        --arg  pass      "$pass" \
         --argjson relay_port "$SINGBOX_RELAY_PORT" \
+        --argjson kw     "$kw_json" \
         '{
           "log": {"level": "error"},
+          "dns": {
+            "servers": [
+              {"tag": "dns_resi",   "address": "udp://8.8.8.8", "detour": "residential"},
+              {"tag": "dns_direct", "address": "udp://1.1.1.1",  "detour": "direct"}
+            ],
+            "rules": [{"domain_keyword": $kw, "server": "dns_resi"}],
+            "final": "dns_direct",
+            "strategy": "prefer_ipv4"
+          },
           "inbounds": [{
             "type": "socks",
             "tag": "socks-in",
             "listen": "127.0.0.1",
-            "listen_port": $relay_port
+            "listen_port": $relay_port,
+            "sniff": true,
+            "sniff_override_destination": true
           }],
-          "outbounds": [{
-            "type": "socks",
-            "tag": "residential",
-            "server": $host,
-            "server_port": $port,
-            "username": $user,
-            "password": $pass,
-            "version": "5"
-          }]
+          "outbounds": [
+            {
+              "type": "socks",
+              "tag": "residential",
+              "server": $host,
+              "server_port": $port,
+              "username": $user,
+              "password": $pass,
+              "version": "5"
+            },
+            {"type": "direct", "tag": "direct"}
+          ],
+          "route": {
+            "rules": [
+              {
+                "ip_cidr": ["127.0.0.0/8","10.0.0.0/8","172.16.0.0/12",
+                            "192.168.0.0/16","169.254.0.0/16"],
+                "outbound": "direct"
+              },
+              {"domain_keyword": $kw, "outbound": "residential"}
+            ],
+            "final": "direct"
+          }
         }' > "${SINGBOX_CONFIG}"
     chmod 600 "${SINGBOX_CONFIG}"
 }
 
 # ---------------------------------------------------------------------------
-# 启动 / 停止 sing-box 中继 systemd 服务
+# 启动 / 停止 / 重载 sing-box 中继服务
 # ---------------------------------------------------------------------------
 start_relay_service() {
     cat > /etc/systemd/system/${RELAY_SERVICE}.service <<EOF
 [Unit]
-Description=B-UI Residential SOCKS5 Relay (sing-box)
+Description=B-UI Unified Outbound Relay (sing-box)
 After=network.target
 
 [Service]
@@ -186,6 +220,10 @@ EOF
     systemctl enable --now "${RELAY_SERVICE}" 2>/dev/null || true
 }
 
+reload_relay_service() {
+    systemctl restart "${RELAY_SERVICE}" 2>/dev/null || true
+}
+
 stop_relay_service() {
     systemctl stop "${RELAY_SERVICE}" 2>/dev/null || true
     systemctl disable "${RELAY_SERVICE}" 2>/dev/null || true
@@ -194,30 +232,24 @@ stop_relay_service() {
 }
 
 # ---------------------------------------------------------------------------
-# Xray 配置写入（出站指向本地 sing-box 中继）
+# Xray 配置写入
+# 所有非私有 IP 流量 → sing-box（sing-box 内部做域名分流）
 # ---------------------------------------------------------------------------
 apply_xray() {
-    get_domains
-    local domain_json
-    domain_json=$(printf '%s\n' "${DOMAINS[@]}" | jq -R . | jq -s 'map("keyword:" + .)')
-
     local outbounds
     outbounds=$(jq -n \
         --argjson relay_port "$SINGBOX_RELAY_PORT" \
-        '[{"tag":"residential","protocol":"socks","settings":{"servers":[{
+        '[{"tag":"relay","protocol":"socks","settings":{"servers":[{
             "address":"127.0.0.1","port":$relay_port
           }]}},
           {"tag":"direct","protocol":"freedom"}]')
 
     local rules
-    rules=$(jq -n \
-        --argjson domains "$domain_json" \
-        '[
-          {"type":"field","inboundTag":["api"],"outboundTag":"api"},
-          {"type":"field","ip":["geoip:private"],"outboundTag":"direct"},
-          {"type":"field","domain":$domains,"outboundTag":"residential"},
-          {"type":"field","outboundTag":"direct","network":"tcp,udp"}
-        ]')
+    rules='[
+      {"type":"field","inboundTag":["api"],"outboundTag":"api"},
+      {"type":"field","ip":["geoip:private"],"outboundTag":"direct"},
+      {"type":"field","outboundTag":"relay","network":"tcp,udp"}
+    ]'
 
     local backup="${XRAY_CONFIG}.bak.$(date +%Y%m%d%H%M%S)"
     cp "${XRAY_CONFIG}" "$backup"
@@ -229,7 +261,8 @@ apply_xray() {
 }
 
 # ---------------------------------------------------------------------------
-# Hysteria2 配置写入（出站指向本地 sing-box 中继）
+# Hysteria2 配置写入
+# 所有非私有 IP 流量 → sing-box（sing-box 内部做域名分流）
 # ---------------------------------------------------------------------------
 apply_hysteria() {
     local config="${HYSTERIA_CONFIG}"
@@ -243,12 +276,10 @@ apply_hysteria() {
     local backup="${config}.bak.$(date +%Y%m%d%H%M%S)"
     cp "$config" "$backup"
 
-    get_domains
-
     block_file=$(mktemp)
     {
         printf 'outbounds:\n'
-        printf '  - name: residential\n'
+        printf '  - name: relay\n'
         printf '    type: socks5\n'
         printf '    socks5:\n'
         printf '      addr: "127.0.0.1:%s"\n' "$SINGBOX_RELAY_PORT"
@@ -261,10 +292,7 @@ apply_hysteria() {
         printf '    - direct(172.16.0.0/12)\n'
         printf '    - direct(192.168.0.0/16)\n'
         printf '    - direct(169.254.0.0/16)\n'
-        for d in "${DOMAINS[@]}"; do
-            printf '    - residential(*%s*)\n' "$d"
-        done
-        printf '    - direct(all)\n'
+        printf '    - relay(all)\n'
     } > "$block_file"
 
     tmp=$(mktemp)
@@ -278,7 +306,7 @@ apply_hysteria() {
 }
 
 # ---------------------------------------------------------------------------
-# 清除配置 (还原 Xray/Hysteria 到默认)
+# 清除配置 (还原 Xray/Hysteria 到默认直连)
 # ---------------------------------------------------------------------------
 clear_xray() {
     local backup="${XRAY_CONFIG}.bak.$(date +%Y%m%d%H%M%S)"
@@ -394,7 +422,7 @@ case "$cmd" in
     set-domains)
         [[ -z "${2:-}" ]] && { err "用法: $0 set-domains <json_array>"; exit 1; }
         echo "$2" | jq 'if type == "array" then . else error("not an array") end' >/dev/null 2>&1 \
-            || { err "参数必须是 JSON 数组，如 [\"openai.com\",\"google.com\"]"; exit 1; }
+            || { err "参数必须是 JSON 数组，如 [\"openai\",\"google\"]"; exit 1; }
 
         if [[ -f "${RESIDENTIAL_CONFIG}" ]]; then
             jq --argjson domains "$2" '.domains = $domains' \
@@ -412,10 +440,9 @@ case "$cmd" in
             RESI_PORT=$(jq -r '.port'     "${RESIDENTIAL_CONFIG}")
             RESI_USER=$(jq -r '.username' "${RESIDENTIAL_CONFIG}")
             RESI_PASS=$(jq -r '.password' "${RESIDENTIAL_CONFIG}")
+            # 只需更新 sing-box 配置并重启，Xray/Hysteria2 路由不变（都指向 sing-box）
             write_singbox_config "$RESI_HOST" "$RESI_PORT" "$RESI_USER" "$RESI_PASS"
-            apply_xray
-            apply_hysteria
-            reload_services
+            reload_relay_service
         fi
         ;;
 

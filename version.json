@@ -1,5 +1,5 @@
 {
-    "version": "3.3.6",
+    "version": "3.3.7",
     "updated": "2026-05-07",
     "files": [
         "install.sh",
@@ -16,6 +16,7 @@
         "b-ui-client.sh"
     ],
     "changelog": {
+        "3.3.7": "住宅 IP 架构升级：sing-box 作为统一出站路由层，Xray 和 Hysteria2 的所有非私有 IP 流量均转发给 sing-box（不再各自做域名匹配），sing-box 内部统一处理路由规则和 DNS 路由（域名关键词匹配的 DNS 也走住宅 IP），解决 TUN 模式下 DNS 绕过分流问题；set-domains 只需重启 sing-box 即生效，无需重建 Xray/Hysteria2 配置",
         "3.3.6": "update.sh 完善：新增 -y/--yes 静默更新参数（跳过确认提示）；do_update 和 auto_update 文件列表补充 residential-helper.sh；更新完成后自动调用 residential-helper.sh reapply 重建 sing-box 中继；apply_systemd_configs 补充 udpPorts:all 迁移步骤（防止恢复备份后丢失）",
         "3.3.5": "住宅 IP 出站改用本地 sing-box 中继（127.0.0.1:2080）：sing-box 正确实现 RFC 1928 UDP ASSOCIATE，解决 Hysteria2 原生 socks5 outbound UDP 不稳定问题；恢复 udpPorts:all 嗅探支持；去掉 TCP-only 限制，UDP/QUIC 流量（如 DNS-over-UDP、HTTP/3）同样走住宅 IP；新增 b-ui-relay systemd 服务随系统自启",
         "3.3.4": "临时修复：限制住宅 IP 出站为 TCP only，禁用 udpPorts sniff，规避 Hysteria2 socks5 UDP ASSOCIATE bug（已被 3.3.5 完整方案替代）",
