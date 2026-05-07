@@ -649,6 +649,7 @@ install_tui_tools() {
 
     local arch
     local fzf_arch
+    local tarball
     case "$(uname -m)" in
         x86_64)  arch="x86_64" ; fzf_arch="amd64" ;;
         aarch64) arch="arm64"  ; fzf_arch="arm64" ;;
@@ -660,13 +661,15 @@ install_tui_tools() {
     if ! command -v gum &>/dev/null; then
         local gum_ver
         gum_ver=$(curl -sI "https://github.com/charmbracelet/gum/releases/latest" \
-            | grep -i "^location:" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+')
+            | grep -i "^location:" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)
         if [[ -z "$gum_ver" ]]; then
             print_warning "无法获取 gum 版本，跳过"
         else
             local gum_url="https://github.com/charmbracelet/gum/releases/download/${gum_ver}/gum_${gum_ver#v}_Linux_${arch}.tar.gz"
-            local tmp=$(mktemp -d)
-            if curl -fsSL "$gum_url" | tar -xz -C "$tmp" 2>/dev/null; then
+            local tmp
+            tmp=$(mktemp -d) || { print_warning "无法创建临时目录，跳过"; return 0; }
+            tarball="$tmp/download.tar.gz"
+            if curl -fsSL "$gum_url" -o "$tarball" && tar -xz -C "$tmp" -f "$tarball" 2>/dev/null; then
                 install -m 755 "$tmp/gum" /usr/local/bin/gum
                 print_success "gum ${gum_ver} 已安装"
             else
@@ -682,13 +685,15 @@ install_tui_tools() {
     if ! command -v fzf &>/dev/null; then
         local fzf_ver
         fzf_ver=$(curl -sI "https://github.com/junegunn/fzf/releases/latest" \
-            | grep -i "^location:" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+')
+            | grep -i "^location:" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)
         if [[ -z "$fzf_ver" ]]; then
             print_warning "无法获取 fzf 版本，跳过"
         else
             local fzf_url="https://github.com/junegunn/fzf/releases/download/${fzf_ver}/fzf-${fzf_ver#v}-linux_${fzf_arch}.tar.gz"
-            local tmp=$(mktemp -d)
-            if curl -fsSL "$fzf_url" | tar -xz -C "$tmp" 2>/dev/null; then
+            local tmp
+            tmp=$(mktemp -d) || { print_warning "无法创建临时目录，跳过"; return 0; }
+            tarball="$tmp/download.tar.gz"
+            if curl -fsSL "$fzf_url" -o "$tarball" && tar -xz -C "$tmp" -f "$tarball" 2>/dev/null; then
                 install -m 755 "$tmp/fzf" /usr/local/bin/fzf
                 print_success "fzf ${fzf_ver} 已安装"
             else
