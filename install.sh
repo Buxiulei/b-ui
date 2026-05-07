@@ -556,6 +556,14 @@ run_core_install() {
     # SSH 安全加固 (检测到公钥时自动关闭密码登录)
     harden_ssh
 
+    # 初始化 sing-box 永久出站中继（下载二进制、配置 Xray/Hysteria2 永久走 sing-box）
+    if [[ -f "${BASE_DIR}/residential-helper.sh" ]]; then
+        print_info "初始化 sing-box 出站中继..."
+        bash "${BASE_DIR}/residential-helper.sh" setup 2>/dev/null && \
+            print_success "sing-box 出站中继已就绪" || \
+            print_warning "sing-box 初始化失败，可稍后手动运行: bash /opt/b-ui/residential-helper.sh setup"
+    fi
+
     # 根据用户配置决定是否预下载客户端安装包
     if [[ "$PREDOWNLOAD_PACKAGES" =~ ^[yY]$ ]]; then
         download_client_packages
