@@ -124,7 +124,7 @@ sing-box 中继 (127.0.0.1:2080)
     └─ 其余 → 直出 VPS
 ```
 
-- 默认分流关键词：`openai chatgpt google googleapis gstatic anthropic claude ping0`
+- 默认分流关键词：`openai chatgpt google googleapis gstatic anthropic claude ping0 grok tiktok`
 - 配置文件：`/opt/b-ui/residential-proxy.json`（chmod 600）
 - 控制脚本：`/opt/b-ui/residential-helper.sh {setup|enable|disable|status|reapply|set-domains}`
 - 入口：一键安装向导 / `b-ui` CLI 菜单 / Web 看板🏠
