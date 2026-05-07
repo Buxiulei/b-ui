@@ -13,12 +13,16 @@ BASE_DIR="${BASE_DIR:-/opt/b-ui}"
 RESIDENTIAL_CONFIG="${BASE_DIR}/residential-proxy.json"
 XRAY_CONFIG="${BASE_DIR}/xray-config.json"
 HYSTERIA_CONFIG="${BASE_DIR}/config.yaml"
+SINGBOX_BIN="${BASE_DIR}/sing-box"
+SINGBOX_CONFIG="${BASE_DIR}/singbox-relay.json"
+SINGBOX_RELAY_PORT=2080
+RELAY_SERVICE="b-ui-relay"
 
 RED='\033[0;31m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 err()  { echo -e "${RED}ERROR: $*${NC}" >&2; }
 info() { echo -e "${BLUE}$*${NC}" >&2; }
 
-DEFAULT_DOMAINS=("openai" "chatgpt" "google" "googleapis" "gstatic" "anthropic" "claude" "ping0" "ip.sb")
+DEFAULT_DOMAINS=("openai" "chatgpt" "google" "googleapis" "gstatic" "anthropic" "claude" "ping0")
 
 # ---------------------------------------------------------------------------
 # 读取分流域名列表 → 导出 DOMAINS 数组
@@ -95,24 +99,113 @@ verify() {
 }
 
 # ---------------------------------------------------------------------------
-# Xray 配置写入 (jq 原子替换，域名动态生成)
+# 下载 sing-box 二进制（用作本地 SOCKS5 中继，正确实现 UDP ASSOCIATE）
+# ---------------------------------------------------------------------------
+ensure_singbox() {
+    [[ -x "${SINGBOX_BIN}" ]] && return 0
+
+    info "下载 sing-box 用于本地 SOCKS5 中继..."
+    local arch
+    arch=$(uname -m)
+    local arch_str
+    case "$arch" in
+        x86_64)  arch_str="linux-amd64" ;;
+        aarch64) arch_str="linux-arm64" ;;
+        armv7l)  arch_str="linux-armv7" ;;
+        *) err "不支持的架构: $arch"; return 1 ;;
+    esac
+
+    local ver
+    ver=$(curl -sS --max-time 15 \
+        https://api.github.com/repos/SagerNet/sing-box/releases/latest \
+        | grep '"tag_name"' | cut -d'"' -f4)
+    [[ -z "$ver" ]] && { err "无法获取 sing-box 最新版本"; return 1; }
+
+    local tarname="sing-box-${ver#v}-${arch_str}.tar.gz"
+    local url="https://github.com/SagerNet/sing-box/releases/download/${ver}/${tarname}"
+    curl -sS -L --max-time 120 "$url" \
+        | tar -xz -C "${BASE_DIR}" --wildcards "*/sing-box" --strip-components=1
+    chmod +x "${SINGBOX_BIN}"
+    [[ -x "${SINGBOX_BIN}" ]] || { err "sing-box 下载失败"; return 1; }
+    info "sing-box ${ver} 就绪"
+}
+
+# ---------------------------------------------------------------------------
+# 生成 sing-box 中继配置（SOCKS5 入站 → 住宅代理出站）
+# ---------------------------------------------------------------------------
+write_singbox_config() {
+    local host="$1" port="$2" user="$3" pass="$4"
+    jq -n \
+        --arg  host       "$host" \
+        --argjson port    "$port" \
+        --arg  user       "$user" \
+        --arg  pass       "$pass" \
+        --argjson relay_port "$SINGBOX_RELAY_PORT" \
+        '{
+          "log": {"level": "error"},
+          "inbounds": [{
+            "type": "socks",
+            "tag": "socks-in",
+            "listen": "127.0.0.1",
+            "listen_port": $relay_port
+          }],
+          "outbounds": [{
+            "type": "socks",
+            "tag": "residential",
+            "server": $host,
+            "server_port": $port,
+            "username": $user,
+            "password": $pass,
+            "version": "5"
+          }]
+        }' > "${SINGBOX_CONFIG}"
+    chmod 600 "${SINGBOX_CONFIG}"
+}
+
+# ---------------------------------------------------------------------------
+# 启动 / 停止 sing-box 中继 systemd 服务
+# ---------------------------------------------------------------------------
+start_relay_service() {
+    cat > /etc/systemd/system/${RELAY_SERVICE}.service <<EOF
+[Unit]
+Description=B-UI Residential SOCKS5 Relay (sing-box)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=${SINGBOX_BIN} run -c ${SINGBOX_CONFIG}
+Restart=always
+RestartSec=3
+StandardOutput=null
+StandardError=null
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now "${RELAY_SERVICE}" 2>/dev/null || true
+}
+
+stop_relay_service() {
+    systemctl stop "${RELAY_SERVICE}" 2>/dev/null || true
+    systemctl disable "${RELAY_SERVICE}" 2>/dev/null || true
+    rm -f /etc/systemd/system/${RELAY_SERVICE}.service
+    systemctl daemon-reload 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# Xray 配置写入（出站指向本地 sing-box 中继）
 # ---------------------------------------------------------------------------
 apply_xray() {
-    local host="$1" port="$2" user="$3" pass="$4"
-
     get_domains
     local domain_json
     domain_json=$(printf '%s\n' "${DOMAINS[@]}" | jq -R . | jq -s 'map("keyword:" + .)')
 
     local outbounds
     outbounds=$(jq -n \
-        --arg  host "$host" \
-        --argjson port "$port" \
-        --arg  user "$user" \
-        --arg  pass "$pass" \
+        --argjson relay_port "$SINGBOX_RELAY_PORT" \
         '[{"tag":"residential","protocol":"socks","settings":{"servers":[{
-            "address":$host,"port":$port,
-            "users":[{"user":$user,"pass":$pass,"level":0}]
+            "address":"127.0.0.1","port":$relay_port
           }]}},
           {"tag":"direct","protocol":"freedom"}]')
 
@@ -122,7 +215,7 @@ apply_xray() {
         '[
           {"type":"field","inboundTag":["api"],"outboundTag":"api"},
           {"type":"field","ip":["geoip:private"],"outboundTag":"direct"},
-          {"type":"field","domain":$domains,"outboundTag":"residential","network":"tcp"},
+          {"type":"field","domain":$domains,"outboundTag":"residential"},
           {"type":"field","outboundTag":"direct","network":"tcp,udp"}
         ]')
 
@@ -136,10 +229,9 @@ apply_xray() {
 }
 
 # ---------------------------------------------------------------------------
-# Hysteria2 配置写入 (awk 锚点注入，域名动态生成)
+# Hysteria2 配置写入（出站指向本地 sing-box 中继）
 # ---------------------------------------------------------------------------
 apply_hysteria() {
-    local host="$1" port="$2" user="$3" pass="$4"
     local config="${HYSTERIA_CONFIG}"
     local block_file tmp
     trap 'rm -f "${block_file:-}" "${tmp:-}"' RETURN
@@ -159,9 +251,7 @@ apply_hysteria() {
         printf '  - name: residential\n'
         printf '    type: socks5\n'
         printf '    socks5:\n'
-        printf '      addr: "%s:%s"\n' "$host" "$port"
-        printf '      username: "%s"\n' "$user"
-        printf '      password: "%s"\n' "$pass"
+        printf '      addr: "127.0.0.1:%s"\n' "$SINGBOX_RELAY_PORT"
         printf '  - name: direct\n'
         printf '    type: direct\n'
         printf 'acl:\n'
@@ -172,7 +262,7 @@ apply_hysteria() {
         printf '    - direct(192.168.0.0/16)\n'
         printf '    - direct(169.254.0.0/16)\n'
         for d in "${DOMAINS[@]}"; do
-            printf '    - residential(*%s*, tcp)\n' "$d"
+            printf '    - residential(*%s*)\n' "$d"
         done
         printf '    - direct(all)\n'
     } > "$block_file"
@@ -254,8 +344,11 @@ case "$cmd" in
         [[ -z "${2:-}" ]] && { err "用法: $0 enable <socks5_url>"; exit 1; }
         parse_url "$2"
         verify "$RESI_HOST" "$RESI_PORT" "$RESI_USER" "$RESI_PASS"
-        apply_xray "$RESI_HOST" "$RESI_PORT" "$RESI_USER" "$RESI_PASS"
-        apply_hysteria "$RESI_HOST" "$RESI_PORT" "$RESI_USER" "$RESI_PASS"
+        ensure_singbox
+        write_singbox_config "$RESI_HOST" "$RESI_PORT" "$RESI_USER" "$RESI_PASS"
+        start_relay_service
+        apply_xray
+        apply_hysteria
         save_config true
         reload_services
         echo "$RESI_EXIT_IP"
@@ -264,6 +357,7 @@ case "$cmd" in
 
     disable)
         RESI_HOST="" RESI_PORT=0 RESI_USER="" RESI_PASS="" RESI_EXIT_IP="" RESI_ISP_INFO=""
+        stop_relay_service
         clear_xray
         clear_hysteria
         if [[ -f "${RESIDENTIAL_CONFIG}" ]]; then
@@ -289,8 +383,11 @@ case "$cmd" in
         RESI_PORT=$(jq -r '.port'     "${RESIDENTIAL_CONFIG}")
         RESI_USER=$(jq -r '.username' "${RESIDENTIAL_CONFIG}")
         RESI_PASS=$(jq -r '.password' "${RESIDENTIAL_CONFIG}")
-        apply_xray "$RESI_HOST" "$RESI_PORT" "$RESI_USER" "$RESI_PASS"
-        apply_hysteria "$RESI_HOST" "$RESI_PORT" "$RESI_USER" "$RESI_PASS"
+        ensure_singbox
+        write_singbox_config "$RESI_HOST" "$RESI_PORT" "$RESI_USER" "$RESI_PASS"
+        start_relay_service
+        apply_xray
+        apply_hysteria
         reload_services
         ;;
 
@@ -315,8 +412,9 @@ case "$cmd" in
             RESI_PORT=$(jq -r '.port'     "${RESIDENTIAL_CONFIG}")
             RESI_USER=$(jq -r '.username' "${RESIDENTIAL_CONFIG}")
             RESI_PASS=$(jq -r '.password' "${RESIDENTIAL_CONFIG}")
-            apply_xray "$RESI_HOST" "$RESI_PORT" "$RESI_USER" "$RESI_PASS"
-            apply_hysteria "$RESI_HOST" "$RESI_PORT" "$RESI_USER" "$RESI_PASS"
+            write_singbox_config "$RESI_HOST" "$RESI_PORT" "$RESI_USER" "$RESI_PASS"
+            apply_xray
+            apply_hysteria
             reload_services
         fi
         ;;
