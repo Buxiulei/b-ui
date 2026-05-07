@@ -312,6 +312,74 @@ update_service_paths() {
 # 确保 Hysteria2 和 Xray 服务有正确的资源限制和隔离设置
 #===============================================================================
 
+# config.yaml 完整性修复：从 users.json 重新生成 auth/trafficStats/masquerade/sniff 段
+# 保留 listen / tls / quic / RESIDENTIAL-START..END 等已有段（避免覆盖端口/证书路径/中继配置）
+repair_hysteria_config() {
+    local config_file="${BASE_DIR}/config.yaml"
+    local users_file="${BASE_DIR}/users.json"
+    [[ -f "$config_file" ]] || return 1
+
+    # 提取已有的关键段：listen / tls / quic / RESIDENTIAL block
+    local port
+    port=$(awk '/^listen:/{sub(/^listen: *:/,""); print; exit}' "$config_file")
+    [[ -z "$port" ]] && port=10000
+
+    local cert_path key_path
+    cert_path=$(awk '/^  cert:/{print $2; exit}' "$config_file")
+    key_path=$(awk '/^  key:/{print $2; exit}' "$config_file")
+    [[ -z "$cert_path" ]] && cert_path="${BASE_DIR}/certs/fullchain.pem"
+    [[ -z "$key_path" ]]  && key_path="${BASE_DIR}/certs/privkey.pem"
+
+    # 读取 RESIDENTIAL block（包含 START/END 标记）
+    local residential_block
+    residential_block=$(awk '/^# B-UI:RESIDENTIAL-START/,/^# B-UI:RESIDENTIAL-END/' "$config_file")
+    [[ -z "$residential_block" ]] && residential_block=$'# B-UI:RESIDENTIAL-START\n# B-UI:RESIDENTIAL-END'
+
+    # 重新生成完整 config（HTTP 认证模式，配合 b-ui-admin 实现用户管理 + 限速）
+    cat > "${config_file}.tmp" <<EOF
+# Hysteria2 服务器配置
+# 修复时间: $(date)
+
+listen: :${port}
+
+tls:
+  sniGuard: disable
+  cert: ${cert_path}
+  key: ${key_path}
+
+quic:
+  maxIdleTimeout: 120s
+
+# HTTP 认证 (支持用户级别限速)
+auth:
+  type: http
+  http:
+    url: http://127.0.0.1:8080/auth/hysteria
+    insecure: false
+
+trafficStats:
+  listen: 127.0.0.1:9999
+  secret: ""
+
+masquerade:
+  type: proxy
+  proxy:
+    url: https://www.bing.com/
+    rewriteHost: true
+
+sniff:
+  enable: true
+  timeout: 2s
+  rewriteDomain: true
+  tcpPorts: 80,443,8000-9000
+  udpPorts: all
+
+${residential_block}
+EOF
+    mv "${config_file}.tmp" "$config_file"
+    chmod 644 "$config_file"
+}
+
 apply_systemd_configs() {
     print_info "应用 systemd 资源隔离配置..."
     local updated=0
@@ -356,6 +424,23 @@ apply_systemd_configs() {
         fi
         print_info "  ✓ config.yaml 添加 QUIC maxIdleTimeout: 120s（防止空闲断连）"
         hysteria_config_changed=1
+    fi
+
+    # config.yaml 完整性兜底：检查关键段是否齐全，缺失则基于 users.json 重新生成
+    # （保护历史损坏的 config —— 如旧版 update.sh 的 sed 范围删除 bug 把 auth/sniff 等冲掉）
+    if [[ -f "$config_file" ]]; then
+        local missing=()
+        grep -qE '^auth:'         "$config_file" || missing+=(auth)
+        grep -qE '^trafficStats:' "$config_file" || missing+=(trafficStats)
+        grep -qE '^masquerade:'   "$config_file" || missing+=(masquerade)
+        grep -qE '^sniff:'        "$config_file" || missing+=(sniff)
+        if [[ ${#missing[@]} -gt 0 ]]; then
+            cp "$config_file" "${config_file}.bak.broken-$(date +%Y%m%d-%H%M%S)"
+            repair_hysteria_config && {
+                print_info "  ✓ config.yaml 修复：补回缺失段 [${missing[*]}]"
+                hysteria_config_changed=1
+            }
+        fi
     fi
 
     # 应用 Hysteria2 服务配置
