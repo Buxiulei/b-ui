@@ -209,7 +209,8 @@ write_singbox_config_residential() {
               },
               {"domain_keyword": $kw, "outbound": "residential"}
             ],
-            "final": "direct"
+            "final": "direct",
+            "default_domain_resolver": "dns_direct"
           }
         }' > "${SINGBOX_CONFIG}"
     chmod 600 "${SINGBOX_CONFIG}"
@@ -244,12 +245,14 @@ write_singbox_config_direct() {
           "outbounds": [{"type": "direct", "tag": "direct"}],
           "route": {
             "rules": [
+              {"action": "sniff"},
               {
                 "ip_cidr": ($private + (if $server_ip != "" then [($server_ip + "/32")] else [] end)),
                 "outbound": "direct"
               }
             ],
-            "final": "direct"
+            "final": "direct",
+            "default_domain_resolver": "dns_direct"
           }
         }' > "${SINGBOX_CONFIG}"
     chmod 600 "${SINGBOX_CONFIG}"
