@@ -2132,17 +2132,29 @@ cmd_import() {
         exit 1
     fi
 
-    safe_import_parsed "$parsed"
+    # 从 parsed 输出中提取 remark（不污染全局变量）
+    local remark
+    remark=$(echo "$parsed" | grep '^REMARK=' | cut -d= -f2-)
+    local server_addr
+    server_addr=$(echo "$parsed" | grep '^SERVER_ADDR=' | cut -d= -f2-)
 
-    local config_name="${REMARK:-${protocol}-$(date +%s)}"
-    config_name=$(echo "$config_name" | sed 's/[\/\\:*?"<>|]/-/g')
+    # 生成配置名称（sanitize: 只保留字母数字连字符下划线点）
+    local config_name="${remark:-${protocol}-$(date +%s)}"
+    config_name=$(echo "$config_name" | tr -s ' ' '-' | sed 's/[^a-zA-Z0-9._-]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//')
+    [[ -z "$config_name" ]] && config_name="${protocol}-$(date +%s)"
 
     if [[ -d "${CONFIGS_DIR}/${config_name}" ]]; then
         tui_info "节点 '$config_name' 已存在，跳过"
         exit 0
     fi
 
-    save_config_meta "$config_name" "$protocol" "$SERVER_ADDR" "$uri" 1080 8080
+    # 现在才应用到全局变量
+    safe_import_parsed "$parsed"
+
+    if ! save_config_meta "$config_name" "$protocol" "${server_addr:-$SERVER_ADDR}" "$uri" 1080 8080; then
+        tui_error "保存配置失败"
+        exit 1
+    fi
     tui_success "已导入: $config_name ($protocol)"
 
     if [[ "$activate" == "true" ]]; then
@@ -2163,6 +2175,10 @@ cmd_start() {
     fi
     local protocol
     protocol=$(grep '"protocol"' "${CONFIGS_DIR}/${active}/meta.json" 2>/dev/null | cut -d'"' -f4)
+    if [[ -z "$protocol" ]]; then
+        tui_error "无法读取节点协议信息，尝试 bui-c switch <名称> 重新激活"
+        exit 1
+    fi
     if [[ "$protocol" == "hysteria2" ]]; then
         tui_info "启动 Hysteria2..."; systemctl start "$CLIENT_SERVICE"
     else
