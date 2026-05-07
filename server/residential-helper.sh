@@ -4,7 +4,7 @@
 # 架构：sing-box 作为永久本地出站中继 (127.0.0.1:2080)
 #   开启住宅代理 → sing-box 按域名关键词分流，匹配域名走住宅 SOCKS5，其余直连
 #   关闭住宅代理 → sing-box 全部直连，开销可忽略（loopback 转发）
-#   Xray / Hysteria2 永远指向 sing-box，配置不随住宅代理开关变化
+#   Xray / Hysteria2 永远指向 sing-box，路由和 DNS 由 sing-box 统一负责
 #
 # Usage:
 #   residential-helper.sh setup                → 初始化：配置 Xray/Hy2 永久走 sing-box（只需跑一次）
@@ -24,6 +24,9 @@ SINGBOX_BIN="${BASE_DIR}/sing-box"
 SINGBOX_CONFIG="${BASE_DIR}/singbox-relay.json"
 SINGBOX_RELAY_PORT=2080
 RELAY_SERVICE="b-ui-relay"
+
+# sing-box 直连规则中的私有/保留 CIDR（两个配置函数共用）
+PRIVATE_CIDRS='["127.0.0.0/8","10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","169.254.0.0/16"]'
 
 RED='\033[0;31m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 err()  { echo -e "${RED}ERROR: $*${NC}" >&2; }
@@ -83,9 +86,11 @@ verify() {
     local host="$1" port="$2" user="$3" pass="$4"
 
     info "获取 VPS 公网 IP..."
-    local vps_ip
-    vps_ip=$(curl -sS --max-time 5 https://api.ipify.org 2>/dev/null) \
+    # 顺便填充 _SERVER_IP 缓存，避免后续 get_server_ip 重复请求
+    _SERVER_IP=$(curl -sS --max-time 5 https://api.ipify.org 2>/dev/null) \
         || { err "无法获取 VPS 公网 IP，请检查网络连接"; return 1; }
+    _SERVER_IP_FETCHED=1
+    local vps_ip="$_SERVER_IP"
 
     info "通过 SOCKS5 测试出口..."
     local exit_ip
@@ -136,6 +141,16 @@ ensure_singbox() {
 }
 
 # ---------------------------------------------------------------------------
+# 获取服务器公网 IP（缓存到 _SERVER_IP，供 sing-box 配置使用）
+# ---------------------------------------------------------------------------
+get_server_ip() {
+    [[ "${_SERVER_IP_FETCHED:-}" == "1" ]] && return 0
+    _SERVER_IP=$(curl -sS --max-time 5 https://api.ipify.org 2>/dev/null || \
+                 curl -sS --max-time 5 https://ifconfig.me 2>/dev/null || true)
+    _SERVER_IP_FETCHED=1
+}
+
+# ---------------------------------------------------------------------------
 # sing-box 配置：住宅代理模式（按域名关键词分流 + DNS 路由）
 # sing-box 统一负责所有路由和 DNS 决策
 # ---------------------------------------------------------------------------
@@ -155,6 +170,7 @@ write_singbox_config_residential() {
         --argjson relay_port "$SINGBOX_RELAY_PORT" \
         --argjson kw      "$kw_json" \
         --arg  server_ip  "${_SERVER_IP:-}" \
+        --argjson private  "$PRIVATE_CIDRS" \
         '{
           "log": {"level": "error"},
           "dns": {
@@ -189,9 +205,7 @@ write_singbox_config_residential() {
           "route": {
             "rules": [
               {
-                "ip_cidr": (["127.0.0.0/8","10.0.0.0/8","172.16.0.0/12",
-                             "192.168.0.0/16","169.254.0.0/16"] +
-                            (if $server_ip != "" then [($server_ip + "/32")] else [] end)),
+                "ip_cidr": ($private + (if $server_ip != "" then [($server_ip + "/32")] else [] end)),
                 "outbound": "direct"
               },
               {"domain_keyword": $kw, "outbound": "residential"}
@@ -208,14 +222,11 @@ write_singbox_config_residential() {
 # ---------------------------------------------------------------------------
 write_singbox_config_direct() {
     get_server_ip
-    local ip_direct_json
-    ip_direct_json=$(jq -n --arg ip "${_SERVER_IP:-}" \
-        '["127.0.0.0/8","10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","169.254.0.0/16"] +
-         (if $ip != "" then [($ip + "/32")] else [] end)')
 
     jq -n \
-        --argjson relay_port  "$SINGBOX_RELAY_PORT" \
-        --argjson ip_direct   "$ip_direct_json" \
+        --argjson relay_port "$SINGBOX_RELAY_PORT" \
+        --arg  server_ip  "${_SERVER_IP:-}" \
+        --argjson private  "$PRIVATE_CIDRS" \
         '{
           "log": {"level": "error"},
           "dns": {
@@ -236,7 +247,10 @@ write_singbox_config_direct() {
           "outbounds": [{"type": "direct", "tag": "direct"}],
           "route": {
             "rules": [
-              {"ip_cidr": $ip_direct, "outbound": "direct"}
+              {
+                "ip_cidr": ($private + (if $server_ip != "" then [($server_ip + "/32")] else [] end)),
+                "outbound": "direct"
+              }
             ],
             "final": "direct"
           }
@@ -281,15 +295,6 @@ stop_relay_service() {
     systemctl disable "${RELAY_SERVICE}" 2>/dev/null || true
     rm -f /etc/systemd/system/${RELAY_SERVICE}.service
     systemctl daemon-reload 2>/dev/null || true
-}
-
-# ---------------------------------------------------------------------------
-# 获取服务器公网 IP（缓存到 _SERVER_IP，供 sing-box 配置使用）
-# ---------------------------------------------------------------------------
-get_server_ip() {
-    [[ -n "${_SERVER_IP:-}" ]] && return 0
-    _SERVER_IP=$(curl -sS --max-time 5 https://api.ipify.org 2>/dev/null || \
-                 curl -sS --max-time 5 https://ifconfig.me 2>/dev/null || true)
 }
 
 # ---------------------------------------------------------------------------
@@ -385,27 +390,35 @@ save_config() {
     chmod 600 "${RESIDENTIAL_CONFIG}"
 }
 
+# 从 residential-proxy.json 加载凭据到 RESI_* 变量
+load_credentials_from_config() {
+    RESI_HOST=$(jq -r '.host'     "${RESIDENTIAL_CONFIG}")
+    RESI_PORT=$(jq -r '.port'     "${RESIDENTIAL_CONFIG}")
+    RESI_USER=$(jq -r '.username' "${RESIDENTIAL_CONFIG}")
+    RESI_PASS=$(jq -r '.password' "${RESIDENTIAL_CONFIG}")
+}
+
+# 根据当前 residential-proxy.json 状态写入对应的 sing-box 配置
+write_singbox_config_from_state() {
+    if [[ -f "${RESIDENTIAL_CONFIG}" ]] && \
+       [[ "$(jq -r '.enabled' "${RESIDENTIAL_CONFIG}" 2>/dev/null)" == "true" ]]; then
+        load_credentials_from_config
+        write_singbox_config_residential "$RESI_HOST" "$RESI_PORT" "$RESI_USER" "$RESI_PASS"
+        info "sing-box 配置：住宅代理模式"
+    else
+        write_singbox_config_direct
+        info "sing-box 配置：直连模式"
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # 主入口
 # ---------------------------------------------------------------------------
 cmd="${1:-}"
 case "$cmd" in
     setup)
-        # 初始化：下载 sing-box，配置 Xray/Hysteria2 永久走 sing-box
-        # 根据当前 residential-proxy.json 状态写入对应的 sing-box 配置
         ensure_singbox
-        if [[ -f "${RESIDENTIAL_CONFIG}" ]] && \
-           [[ "$(jq -r '.enabled' "${RESIDENTIAL_CONFIG}" 2>/dev/null)" == "true" ]]; then
-            RESI_HOST=$(jq -r '.host'     "${RESIDENTIAL_CONFIG}")
-            RESI_PORT=$(jq -r '.port'     "${RESIDENTIAL_CONFIG}")
-            RESI_USER=$(jq -r '.username' "${RESIDENTIAL_CONFIG}")
-            RESI_PASS=$(jq -r '.password' "${RESIDENTIAL_CONFIG}")
-            write_singbox_config_residential "$RESI_HOST" "$RESI_PORT" "$RESI_USER" "$RESI_PASS"
-            info "sing-box 配置：住宅代理模式"
-        else
-            write_singbox_config_direct
-            info "sing-box 配置：直连模式"
-        fi
+        write_singbox_config_from_state
         start_relay_service
         apply_xray
         apply_hysteria
@@ -447,18 +460,8 @@ case "$cmd" in
         ;;
 
     reapply)
-        # update.sh 更新后调用：确保 sing-box 运行，Xray/Hysteria2 配置正确
         ensure_singbox
-        if [[ -f "${RESIDENTIAL_CONFIG}" ]] && \
-           [[ "$(jq -r '.enabled' "${RESIDENTIAL_CONFIG}" 2>/dev/null)" == "true" ]]; then
-            RESI_HOST=$(jq -r '.host'     "${RESIDENTIAL_CONFIG}")
-            RESI_PORT=$(jq -r '.port'     "${RESIDENTIAL_CONFIG}")
-            RESI_USER=$(jq -r '.username' "${RESIDENTIAL_CONFIG}")
-            RESI_PASS=$(jq -r '.password' "${RESIDENTIAL_CONFIG}")
-            write_singbox_config_residential "$RESI_HOST" "$RESI_PORT" "$RESI_USER" "$RESI_PASS"
-        else
-            write_singbox_config_direct
-        fi
+        write_singbox_config_from_state
         start_relay_service
         apply_xray
         apply_hysteria
@@ -482,10 +485,7 @@ case "$cmd" in
 
         local_enabled=$(jq -r '.enabled // false' "${RESIDENTIAL_CONFIG}" 2>/dev/null || echo "false")
         if [[ "$local_enabled" == "true" ]]; then
-            RESI_HOST=$(jq -r '.host'     "${RESIDENTIAL_CONFIG}")
-            RESI_PORT=$(jq -r '.port'     "${RESIDENTIAL_CONFIG}")
-            RESI_USER=$(jq -r '.username' "${RESIDENTIAL_CONFIG}")
-            RESI_PASS=$(jq -r '.password' "${RESIDENTIAL_CONFIG}")
+            load_credentials_from_config
             write_singbox_config_residential "$RESI_HOST" "$RESI_PORT" "$RESI_USER" "$RESI_PASS"
             reload_relay_service
         fi
