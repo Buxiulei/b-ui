@@ -1605,7 +1605,7 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
 
             if (r === "residential") {
                 const helperPath = CONFIG.residentialHelper;
-                const DEFAULT_DOMAINS = ["openai.com","chatgpt.com","google.com","googleapis.com","gstatic.com","anthropic.com","claude.ai"];
+                const DEFAULT_DOMAINS = ["openai.com","chatgpt.com","google.com","googleapis.com","gstatic.com","anthropic.com","claude.ai","ping0.cc","ip.sb"];
 
                 if (req.method === "GET") {
                     try {
