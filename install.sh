@@ -579,6 +579,39 @@ CLIEOF
 }
 
 #===============================================================================
+# 住宅 IP 交互配置（全新安装时询问）
+#===============================================================================
+
+configure_residential_interactive() {
+    echo ""
+    print_info "========================================================"
+    print_info "可选：配置住宅 IP 出站"
+    print_info "启用后 OpenAI / Google / Claude 流量将走住宅 IP，其余直出"
+    print_info "========================================================"
+    read -rp "$(echo -e "${YELLOW}是否配置住宅 IP？(y/N): ${NC}")" ans
+    [[ "${ans,,}" != "y" ]] && return 0
+
+    read -rp "$(echo -e "${YELLOW}请粘贴凭据 (socks5://user:pass@host:port): ${NC}")" resi_url
+    [[ -z "$resi_url" ]] && { print_warning "已跳过住宅 IP 配置"; return 0; }
+
+    print_info "正在校验连通性..."
+    local output exit_code
+    output=$("${BASE_DIR}/residential-helper.sh" enable "$resi_url" 2>&1) && exit_code=0 || exit_code=$?
+
+    if [[ $exit_code -eq 0 ]]; then
+        local exit_ip isp_info
+        exit_ip=$(echo "$output" | head -1)
+        isp_info=$(echo "$output" | sed -n '2p')
+        print_success "住宅 IP 已启用，出口 IP: ${exit_ip}"
+        [[ -n "$isp_info" ]] && print_info "ISP: ${isp_info}"
+    else
+        print_error "住宅 IP 校验失败（配置未保存）："
+        echo "$output" | grep "ERROR:" | sed 's/.*ERROR: //' >&2
+        print_warning "可稍后通过 'sudo b-ui' 菜单或 Web 看板重新配置"
+    fi
+}
+
+#===============================================================================
 # 恢复备份数据
 #===============================================================================
 
@@ -635,6 +668,7 @@ main() {
             print_info "开始全新安装..."
             download_all_files
             run_core_install
+            configure_residential_interactive
             ;;
     esac
     
