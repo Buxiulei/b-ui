@@ -13,9 +13,9 @@ RESIDENTIAL_CONFIG="${BASE_DIR}/residential-proxy.json"
 XRAY_CONFIG="${BASE_DIR}/xray-config.json"
 HYSTERIA_CONFIG="${BASE_DIR}/config.yaml"
 
-RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
+RED='\033[0;31m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 err()  { echo -e "${RED}ERROR: $*${NC}" >&2; }
-info() { echo -e "${YELLOW}$*${NC}" >&2; }
+info() { echo -e "${BLUE}$*${NC}" >&2; }
 
 # ---------------------------------------------------------------------------
 # URL 解析 → 导出 RESI_HOST RESI_PORT RESI_USER RESI_PASS
@@ -115,6 +115,8 @@ apply_xray() {
 apply_hysteria() {
     local host="$1" port="$2" user="$3" pass="$4"
     local config="${HYSTERIA_CONFIG}"
+    local block_file tmp
+    trap 'rm -f "${block_file:-}" "${tmp:-}"' RETURN
 
     if ! grep -q "# B-UI:RESIDENTIAL-START" "$config"; then
         printf '\n# B-UI:RESIDENTIAL-START\n# B-UI:RESIDENTIAL-END\n' >> "$config"
@@ -123,16 +125,15 @@ apply_hysteria() {
     local backup="${config}.bak.$(date +%Y%m%d%H%M%S)"
     cp "$config" "$backup"
 
-    local block_file
     block_file=$(mktemp)
     cat > "$block_file" << EOYAML
 outbounds:
   - name: residential
     type: socks5
     socks5:
-      addr: ${host}:${port}
-      username: ${user}
-      password: ${pass}
+      addr: "${host}:${port}"
+      username: "${user}"
+      password: "${pass}"
   - name: direct
     type: direct
 acl:
@@ -157,7 +158,6 @@ acl:
     - direct(all)
 EOYAML
 
-    local tmp
     tmp=$(mktemp)
     awk -v blockfile="$block_file" '
         /# B-UI:RESIDENTIAL-START/ { print; while((getline ln < blockfile) > 0) print ln; close(blockfile); skip=1; next }
@@ -165,9 +165,7 @@ EOYAML
         !skip { print }
     ' "$config" > "$tmp" \
     && mv "$tmp" "$config" \
-    || { cp "$backup" "$config"; rm -f "$block_file" "$tmp"; err "Hysteria2 配置写入失败"; return 1; }
-
-    rm -f "$block_file"
+    || { cp "$backup" "$config"; err "Hysteria2 配置写入失败"; return 1; }
 }
 
 # ---------------------------------------------------------------------------
