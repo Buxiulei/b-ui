@@ -200,6 +200,10 @@ tui_menu() {
         local choice
         read -p "选择 (1-$((i-1))): " choice
         local opts=("$@")
+        if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#opts[@]} )); then
+            tui_error "无效选择"
+            return 1
+        fi
         echo "${opts[$((choice-1))]}"
     fi
 }
@@ -215,6 +219,9 @@ tui_filter() {
     else
         local lines=()
         while IFS= read -r line; do lines+=("$line"); done
+        if [[ ${#lines[@]} -eq 0 ]]; then
+            return 1
+        fi
         local i=1
         for line in "${lines[@]}"; do
             echo "  $i. $line"
@@ -222,6 +229,10 @@ tui_filter() {
         done
         local choice
         read -p "选择 (1-$((i-1))): " choice
+        if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#lines[@]} )); then
+            tui_error "无效选择"
+            return 1
+        fi
         echo "${lines[$((choice-1))]}"
     fi
 }
