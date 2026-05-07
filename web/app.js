@@ -13,8 +13,9 @@ const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;'
 // Format bytes
 const sz = b => {
     if (!b) return "0 B";
-    const i = Math.floor(Math.log(b) / Math.log(1024));
-    return (b / Math.pow(1024, i)).toFixed(2) + " " + ["B", "KB", "MB", "GB"][i];
+    const units = ["B", "KB", "MB", "GB", "TB", "PB"];
+    const i = Math.min(Math.floor(Math.log(b) / Math.log(1024)), units.length - 1);
+    return (b / Math.pow(1024, i)).toFixed(2) + " " + units[i];
 };
 
 // Toast notification
