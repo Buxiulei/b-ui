@@ -321,13 +321,19 @@ apply_systemd_configs() {
     local xray_config="${BASE_DIR}/xray-config.json"
 
     # 迁移 config.yaml：移除过大的 QUIC 接收窗口配置（旧版默认 64 MiB/conn 在小内存机器上每会话占用 ~80MB）
+    # 关键：只有当 maxConnReceiveWindow 真的存在时才执行 sed 范围删除，
+    # 否则 sed 找不到结束锚点会一路删到 EOF，把 auth/masquerade/sniff 等全冲掉（v3.4.3 复盘）。
     local hysteria_config_changed=0
-    if [[ -f "$config_file" ]] && grep -q '^# QUIC 流控优化\|^quic:' "$config_file"; then
+    if [[ -f "$config_file" ]] && grep -q '^  maxConnReceiveWindow:' "$config_file"; then
         cp "$config_file" "${config_file}.bak.$(date +%Y%m%d-%H%M%S)"
-        sed -i '/^# QUIC 流控优化/,/^  maxConnReceiveWindow:/d' "$config_file"
-        # 兼容只有 quic: 段没有注释的情况
-        sed -i '/^quic:$/,/^  maxConnReceiveWindow:/d' "$config_file"
-        if ! grep -q '^quic:' "$config_file"; then
+        # 优先按注释锚定（更精确，连同注释一起删除）
+        if grep -q '^# QUIC 流控优化' "$config_file"; then
+            sed -i '/^# QUIC 流控优化/,/^  maxConnReceiveWindow:/d' "$config_file"
+        else
+            # 没有注释，只能按 quic: 锚定（仅当 maxConnReceiveWindow 还在时才安全）
+            sed -i '/^quic:$/,/^  maxConnReceiveWindow:/d' "$config_file"
+        fi
+        if ! grep -q '^  maxConnReceiveWindow:' "$config_file"; then
             print_info "  ✓ 移除 config.yaml 中过大的 QUIC 窗口配置（已备份）"
             hysteria_config_changed=1
         fi
