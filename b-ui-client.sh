@@ -3439,6 +3439,44 @@ show_status() {
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
 }
 
+show_status_bar() {
+    local active; active=$(get_active_config)
+    local protocol="" socks_port=1080 http_port=8080
+
+    if [[ -n "$active" ]] && [[ -f "${CONFIGS_DIR}/${active}/meta.json" ]]; then
+        local meta="${CONFIGS_DIR}/${active}/meta.json"
+        protocol=$(grep '"protocol"' "$meta" | cut -d'"' -f4)
+        socks_port=$(grep '"socks_port"' "$meta" | grep -o '[0-9]*' | head -1)
+        http_port=$(grep '"http_port"'  "$meta" | grep -o '[0-9]*' | head -1)
+    fi
+    socks_port="${socks_port:-1080}"
+    http_port="${http_port:-8080}"
+
+    local svc_icon="🔴" tun_icon="🔴" tun_label="关闭"
+    systemctl is-active --quiet "$CLIENT_SERVICE" 2>/dev/null && svc_icon="🟢"
+    systemctl is-active --quiet xray-client 2>/dev/null && svc_icon="🟢"
+    if systemctl is-active --quiet bui-tun 2>/dev/null; then
+        tun_icon="🟢"; tun_label="运行中"
+    fi
+
+    if [[ "$TUI_AVAILABLE" == "true" ]]; then
+        gum style \
+            --border rounded --border-foreground 39 \
+            --padding "0 2" --margin "1 0" \
+            "$(gum style --bold 'B-UI Client')" \
+            "" \
+            "节点   ${svc_icon}  $(gum style --foreground 46 "${active:-(未设置)}")  $(gum style --faint "${protocol}")" \
+            "代理       SOCKS5 :${socks_port}  HTTP :${http_port}" \
+            "TUN    ${tun_icon}  ${tun_label}"
+    else
+        echo ""
+        echo -e "  节点: ${svc_icon} ${active:-(未设置)} (${protocol})"
+        echo -e "  代理: SOCKS5 :${socks_port}  HTTP :${http_port}"
+        echo -e "  TUN:  ${tun_icon} ${tun_label}"
+        echo ""
+    fi
+}
+
 test_proxy() {
     echo ""
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
@@ -4454,35 +4492,72 @@ main() {
 }
 
 tui_main_loop() {
-    # 只在首次运行时检测依赖 (核心未安装时)
-    if ! command -v hysteria &> /dev/null || ! command -v xray &> /dev/null || ! command -v sing-box &> /dev/null; then
-        check_dependencies
-    fi
-
-    # 后台检查客户端更新 (静默检查，不阻塞启动)
     check_client_update &>/dev/null &
 
     while true; do
+        clear
         print_banner
-        show_status
-        show_menu
-        read -p "请选择 [0-8]: " choice
-        case $choice in
-            1) import_node ;;
-            2) config_management ;;
-            3) service_control_menu ;;
-            4) toggle_tun ;;
-            5) test_proxy ;;
-            6) update_all ;;
-            7) advanced_settings_menu ;;
-            8) uninstall ;;
-            0) echo ""; tui_info "再见！"; exit 0 ;;
-            *) print_error "无效选项" ;;
+
+        show_status_bar
+
+        # 动态 TUN 标签
+        local tun_opt="开启 TUN"
+        systemctl is-active --quiet bui-tun 2>/dev/null && tun_opt="停止 TUN"
+
+        local choice
+        if [[ "$TUI_AVAILABLE" == "true" ]]; then
+            choice=$(gum choose \
+                "切换节点" \
+                "$tun_opt" \
+                "──────────" \
+                "导入节点" \
+                "服务控制" \
+                "高级设置" \
+                "──────────" \
+                "一键更新" \
+                "卸载" \
+                "退出" \
+                2>/dev/null) || choice="退出"
+        else
+            show_menu
+            read -p "请选择 [0-8]: " choice
+            case $choice in
+                1) choice="切换节点" ;;
+                2) choice="$tun_opt" ;;
+                3) choice="导入节点" ;;
+                4) choice="服务控制" ;;
+                5) choice="高级设置" ;;
+                6) choice="一键更新" ;;
+                7) choice="卸载" ;;
+                0) choice="退出" ;;
+                *) choice="__invalid__" ;;
+            esac
+        fi
+
+        case "$choice" in
+            "切换节点")                  tui_switch_node ;;
+            "开启 TUN"|"停止 TUN")       tui_toggle_tun ;;
+            "导入节点")                  tui_import_node ;;
+            "服务控制")                  tui_service_control ;;
+            "高级设置")                  advanced_settings_menu ;;
+            "一键更新")                  update_all ;;
+            "卸载")                      uninstall ;;
+            "退出")                      echo ""; tui_info "再见！"; exit 0 ;;
+            "──────────")               continue ;;
+            "__invalid__")              print_error "无效选项" ;;
         esac
-        echo ""
-        read -p "按 Enter 继续..."
+
+        if [[ "$TUI_AVAILABLE" != "true" ]]; then
+            echo ""
+            read -p "按 Enter 继续..."
+        fi
     done
 }
+
+tui_switch_node()     { switch_config; }
+tui_toggle_tun()      { toggle_tun; }
+tui_import_node()     { import_node; }
+tui_service_control() { service_control_menu; }
 
 
 
