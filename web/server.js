@@ -1,7 +1,7 @@
 import http from "http";
 import fs from "fs";
 import crypto from "crypto";
-import { execSync, exec } from "child_process";
+import { execSync, exec, spawnSync } from "child_process";
 import path from "path";
 import https from "https";
 import { fileURLToPath } from "url";
@@ -33,6 +33,8 @@ const CONFIG = {
     hysteriaConfig: process.env.HYSTERIA_CONFIG || `${BASE_DIR}/config.yaml`,
     xrayConfig: process.env.XRAY_CONFIG || `${BASE_DIR}/xray-config.json`,
     xrayKeysFile: process.env.XRAY_KEYS || `${BASE_DIR}/reality-keys.json`,
+    residentialConfig: process.env.RESIDENTIAL_CONFIG || `${BASE_DIR}/residential-proxy.json`,
+    residentialHelper: `${BASE_DIR}/residential-helper.sh`,
     usersFile: process.env.USERS_FILE || `${BASE_DIR}/users.json`,
     trafficPort: 9999,
     xrayApiPort: 10085
@@ -1601,6 +1603,61 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                 }
             }
 
+            if (r === "residential") {
+                const helperPath = CONFIG.residentialHelper;
+
+                if (req.method === "GET") {
+                    try {
+                        const raw = fs.existsSync(CONFIG.residentialConfig)
+                            ? JSON.parse(fs.readFileSync(CONFIG.residentialConfig, "utf8"))
+                            : { enabled: false };
+                        const display = { ...raw };
+                        if (display.password) display.password = display.password.slice(0, 2) + "***";
+                        if (display.username && display.host) {
+                            display.displayUrl = `socks5://${display.username.slice(0, 2)}***@${display.host}:${display.port}`;
+                        }
+                        return sendJSON(res, display);
+                    } catch {
+                        return sendJSON(res, { enabled: false });
+                    }
+                }
+
+                if (req.method === "POST") {
+                    const b = await parseBody(req);
+                    if (!b.url) return sendJSON(res, { error: "url 字段必填" }, 400);
+                    try {
+                        const result = spawnSync(helperPath, ["enable", b.url], {
+                            env: { ...process.env, BASE_DIR },
+                            encoding: "utf8",
+                            timeout: 30000,
+                        });
+                        if (result.status !== 0) {
+                            const errMsg = (result.stderr || "").replace(/\x1b\[[0-9;]*m/g, "").trim();
+                            return sendJSON(res, { error: errMsg || "住宅 IP 启用失败" }, 400);
+                        }
+                        const lines = result.stdout.trim().split("\n");
+                        return sendJSON(res, { success: true, exitIp: lines[0] || "", ispInfo: lines[1] || "" });
+                    } catch (e) {
+                        return sendJSON(res, { error: e.message }, 500);
+                    }
+                }
+
+                if (req.method === "DELETE") {
+                    try {
+                        const result = spawnSync(helperPath, ["disable"], {
+                            env: { ...process.env, BASE_DIR },
+                            encoding: "utf8",
+                            timeout: 15000,
+                        });
+                        if (result.status !== 0) {
+                            return sendJSON(res, { error: (result.stderr || "禁用失败").trim() }, 500);
+                        }
+                        return sendJSON(res, { success: true });
+                    } catch (e) {
+                        return sendJSON(res, { error: e.message }, 500);
+                    }
+                }
+            }
             if (r === "masquerade") {
                 const masqFile = CONFIG.hysteriaConfig.replace("config.yaml", "masquerade.json");
                 if (req.method === "GET") {
