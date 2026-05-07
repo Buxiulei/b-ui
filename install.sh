@@ -553,6 +553,9 @@ run_core_install() {
     # 创建全局命令
     create_global_command
 
+    # 安装 TUI 工具
+    install_tui_tools
+
     # SSH 安全加固 (检测到公钥时自动关闭密码登录)
     harden_ssh
 
@@ -634,6 +637,66 @@ restore_backup() {
         cp "/tmp/b-ui-config-backup.yaml" "${BASE_DIR}/config.yaml"
         rm -f "/tmp/b-ui-config-backup.yaml"
         print_success "已恢复 Hysteria 配置"
+    fi
+}
+
+#===============================================================================
+# 安装 TUI 工具 (gum + fzf)
+#===============================================================================
+
+install_tui_tools() {
+    print_info "安装 TUI 工具 (gum + fzf)..."
+
+    local arch
+    case "$(uname -m)" in
+        x86_64)  arch="x86_64" ; fzf_arch="amd64" ;;
+        aarch64) arch="arm64"  ; fzf_arch="arm64" ;;
+        armv7l)  arch="armv7"  ; fzf_arch="armhf" ;;
+        *)       print_warning "不支持的架构，跳过 TUI 工具安装"; return 0 ;;
+    esac
+
+    # --- gum ---
+    if ! command -v gum &>/dev/null; then
+        local gum_ver
+        gum_ver=$(curl -sI "https://github.com/charmbracelet/gum/releases/latest" \
+            | grep -i "^location:" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+')
+        if [[ -z "$gum_ver" ]]; then
+            print_warning "无法获取 gum 版本，跳过"
+        else
+            local gum_url="https://github.com/charmbracelet/gum/releases/download/${gum_ver}/gum_${gum_ver#v}_Linux_${arch}.tar.gz"
+            local tmp=$(mktemp -d)
+            if curl -fsSL "$gum_url" | tar -xz -C "$tmp" 2>/dev/null; then
+                install -m 755 "$tmp/gum" /usr/local/bin/gum
+                print_success "gum ${gum_ver} 已安装"
+            else
+                print_warning "gum 下载失败，TUI 功能将降级为传统模式"
+            fi
+            rm -rf "$tmp"
+        fi
+    else
+        print_info "gum 已存在，跳过"
+    fi
+
+    # --- fzf ---
+    if ! command -v fzf &>/dev/null; then
+        local fzf_ver
+        fzf_ver=$(curl -sI "https://github.com/junegunn/fzf/releases/latest" \
+            | grep -i "^location:" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+')
+        if [[ -z "$fzf_ver" ]]; then
+            print_warning "无法获取 fzf 版本，跳过"
+        else
+            local fzf_url="https://github.com/junegunn/fzf/releases/download/${fzf_ver}/fzf-${fzf_ver#v}-linux_${fzf_arch}.tar.gz"
+            local tmp=$(mktemp -d)
+            if curl -fsSL "$fzf_url" | tar -xz -C "$tmp" 2>/dev/null; then
+                install -m 755 "$tmp/fzf" /usr/local/bin/fzf
+                print_success "fzf ${fzf_ver} 已安装"
+            else
+                print_warning "fzf 下载失败，节点选择将降级为数字菜单"
+            fi
+            rm -rf "$tmp"
+        fi
+    else
+        print_info "fzf 已存在，跳过"
     fi
 }
 
