@@ -6,31 +6,33 @@
 
 轻量级 Hysteria2 + Xray 多协议代理一键部署工具，内置 Web 管理面板与全功能流量管理。
 
-**当前版本**: v3.2.5
+**当前版本**: v3.4.1
 
 ---
 
 ## 最新更新
 
-### v3.2.4 — 安装加固 + SSH 安全
-- 🔧 **修复 Caddy 启动失败**：`caddy validate` 以 root 创建日志文件导致权限冲突，安装时自动清理
-- 📦 **修复 npm 依赖安装**：管道吞错误码导致依赖缺失静默失败，补全 `js-yaml` 依赖
-- 🔒 **SSH 安全加固**：安装后自动检测 SSH 公钥，有公钥则关闭 root 密码登录
+### v3.4.1 — sing-box 1.13 兼容性
+- 🔧 **DNS server 新格式**：迁移到 `type: udp + server` 字段（旧 `address: udp://` 已移除）
+- 🔧 **inbound sniff 移除**：改为 route rule action `{action: sniff}`
+- 🔧 **route.default_domain_resolver**：sing-box 1.12+ 必需字段
+- 🔧 **修复 b-ui-relay 启动失败**：彻底解决 sing-box 1.13 启动报错
 
-### v3.2.3 — 全场景安装加固
-- 🧹 安装前自动清理旧服务/端口/代理变量
-- 🛡 客户端安装命令防代理污染（`--noproxy`）
-- 🔧 CLI 域名显示修复、卸载适配 Caddy
+### v3.4.0 — 架构重构：sing-box 统一控制平面
+- 🌐 **路由集中**：所有路由决策和 DNS 解析由 sing-box 统一负责
+- 🚀 **简化转发链**：Xray/Hysteria2 全部流量直接转 sing-box，不再各自维护路由规则
+- 🛡 **解决 hairpin 回环**：自动检测服务器公网 IP，加入直连例外，修复 TUN 模式下 SSH 到服务器自身超时
 
-### v3.2.2 — Caddy 证书共享修复
-- 🔐 **证书自动同步**：Caddy 申请的 SSL 证书自动同步到 Hysteria2，修复服务端启动失败
-- ⏱ **启动顺序优化**：Caddy → 证书同步 → Hysteria2，确保证书就绪后再启动
-- 🩺 **健康检查增强**：定时检查 Caddy 状态 + 证书同步 + Hysteria2 自动恢复
+### v3.3.x — 住宅 IP 出站功能
+- 🏠 **住宅 SOCKS5 中继**：OpenAI/Google/Claude/ping0 等指定域名走住宅代理，其余直出 VPS
+- ⚡ **sing-box 永久中继**：127.0.0.1:2080 常驻服务，切换住宅代理无需重启 Xray/Hysteria2
+- 🎛 **三入口配置**：一键安装向导 / CLI 菜单 / Web 看板
+- ✅ **硬失败校验**：开启前验证凭据，出口 IP ≠ VPS 才放行
 
-### v3.2.x — 客户端增强
-- 🛡 UFW 防火墙兼容（TUN 启动前暂停/停止后恢复）
-- 🌐 系统代理自动配置（不开 TUN 也能访问 GitHub）
-- ▶ 服务控制菜单重构（按服务独立启停+显示端口号）
+### v3.2.x — 安装与稳定性加固
+- 🔐 Caddy 证书自动同步给 Hysteria2，修复启动失败
+- 🔒 SSH 安全加固：检测公钥后自动关闭密码登录
+- 🛡 UFW 兼容、系统代理自动配置、服务控制菜单重构
 
 ### v3.1.0 — 内核代理下载
 - 🌐 服务端自动从 GitHub 同步最新内核（每 6h），客户端优先从服务端拉取
@@ -43,6 +45,7 @@
 - **多协议支持**: Hysteria2 / VLESS-Reality / VLESS-WS-TLS
 - **用户管理**: Web 面板可视化管理，支持多用户、流量统计、在线状态监控
 - **访问控制**: 用户时长限制、总流量/月度流量限制、用户级别限速
+- **住宅 IP 出站**: sing-box 中继架构，指定域名（OpenAI/Google/Claude/ping0 等）走住宅 SOCKS5，其余直出 VPS
 - **内核代理**: 自动缓存 GitHub 最新内核二进制，供客户端国内环境下载
 - **自动维护**: Caddy 自动 HTTPS 证书、证书同步、自动更新、BBR 优化
 - **便捷分享**: 二维码 (v2rayN/Shadowrocket)、sing-box/Clash 订阅
@@ -106,6 +109,28 @@ bash <(curl -fsSL "https://raw.githubusercontent.com/Buxiulei/b-ui/main/install.
 
 ---
 
+## 住宅 IP 出站架构
+
+```
+客户端 VPN 流量
+    │
+    ▼
+Xray / Hysteria2  (无路由逻辑，全部转发)
+    │
+    ▼
+sing-box 中继 (127.0.0.1:2080)
+    ├─ 私有 IP / 服务器自身 IP → 直出 VPS
+    ├─ 关键词域名 (openai/chatgpt/google/anthropic/claude/...) → 住宅 SOCKS5
+    └─ 其余 → 直出 VPS
+```
+
+- 默认分流关键词：`openai chatgpt google googleapis gstatic anthropic claude ping0`
+- 配置文件：`/opt/b-ui/residential-proxy.json`（chmod 600）
+- 控制脚本：`/opt/b-ui/residential-helper.sh {setup|enable|disable|status|reapply|set-domains}`
+- 入口：一键安装向导 / `b-ui` CLI 菜单 / Web 看板🏠
+
+---
+
 ## API 与端口配置
 
 ### 端口列表
@@ -134,6 +159,10 @@ bash <(curl -fsSL "https://raw.githubusercontent.com/Buxiulei/b-ui/main/install.
 - `/opt/b-ui/`: 核心数据目录 (配置、用户数据)
 - `/opt/b-ui/certs/`: SSL 证书 (Caddy 自动同步)
 - `/opt/b-ui/packages/`: 内核二进制缓存 (自动同步)
+- `/opt/b-ui/sing-box`: 出站中继内核 (住宅 IP 分流)
+- `/opt/b-ui/singbox-relay.json`: sing-box 中继配置
+- `/opt/b-ui/residential-proxy.json`: 住宅代理凭据 (chmod 600)
+- `/opt/b-ui/residential-helper.sh`: 住宅代理控制脚本
 - `/usr/local/bin/b-ui`: 服务端命令
 - `/usr/local/bin/bui-c`: 客户端命令
 

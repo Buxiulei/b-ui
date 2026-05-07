@@ -1,5 +1,5 @@
 {
-    "version": "3.4.0",
+    "version": "3.4.1",
     "updated": "2026-05-07",
     "files": [
         "install.sh",
@@ -16,6 +16,7 @@
         "b-ui-client.sh"
     ],
     "changelog": {
+        "3.4.1": "sing-box 1.13 兼容性修复：DNS server 旧格式 address: udp:// 迁移为 type: udp + server: 字段；inbound 的 sniff/sniff_override_destination 字段移除，改为 route rule action {action: sniff}；移除 DNS server 的 detour: direct（sing-box 1.13 不允许指向空 direct outbound）；route 增加 default_domain_resolver: dns_direct（1.12+ 必需）；解决 b-ui-relay 服务在 sing-box 1.13 上无法启动的问题",
         "3.4.0": "架构重构：sing-box 统一负责所有路由决策和 DNS 解析；Xray 和 Hysteria2 不再含任何路由逻辑（全部流量转给 sing-box）；sing-box 直连模式新增 DNS 配置（1.1.1.1）和私有 IP + 服务器自身 IP 直连规则；住宅模式 route.rules 补充服务器自身 IP 直连，彻底解决 TUN 模式下 SSH 到服务器自身的 hairpin 问题",
         "3.3.10": "修复 sing-box 中继 hairpin 回环问题：apply_xray 和 apply_hysteria 在写入路由规则时自动检测服务器公网 IP，并将其加入直连例外；解决用户在 b-ui VPN（TUN 模式）下 SSH 到服务器自身超时的问题",
         "3.3.9": "install.sh 集成 sing-box 初始化：一键安装完成后自动调用 residential-helper.sh setup，下载 sing-box 并配置 Xray/Hysteria2 永久指向 sing-box 出站中继，新装服务器无需手动操作",
