@@ -4554,7 +4554,61 @@ tui_main_loop() {
     done
 }
 
-tui_switch_node()     { switch_config; }
+tui_switch_node() {
+    if [[ ! -d "$CONFIGS_DIR" ]] || [[ -z "$(ls -A "$CONFIGS_DIR" 2>/dev/null)" ]]; then
+        tui_error "没有已保存的节点，请先导入"
+        sleep 1
+        return 0
+    fi
+
+    local active; active=$(get_active_config)
+
+    # 构建显示列表
+    local lines=()
+    for config_dir in "$CONFIGS_DIR"/*/; do
+        [[ ! -d "$config_dir" ]] && continue
+        local name; name=$(basename "$config_dir")
+        local meta="${config_dir}meta.json"
+        local protocol; protocol=$(grep '"protocol"' "$meta" 2>/dev/null | cut -d'"' -f4)
+        local server; server=$(grep '"server"' "$meta" 2>/dev/null | cut -d'"' -f4)
+        local marker=""
+        [[ "$name" == "$active" ]] && marker="  ★ 当前"
+        lines+=("$(printf '%-28s  %-16s  %s%s' "$name" "$protocol" "$server" "$marker")")
+    done
+
+    local selected
+    if [[ "$TUI_AVAILABLE" == "true" ]]; then
+        selected=$(printf '%s\n' "${lines[@]}" \
+            | fzf --prompt "切换节点 > " \
+                  --mouse \
+                  --height 50% \
+                  --border rounded \
+                  --layout reverse \
+                  --info inline \
+                  --header "↑↓ 选择   Enter 确认   Esc 取消" \
+                  2>/dev/null) || return 0
+        # 提取节点名（第一列）
+        selected=$(echo "$selected" | awk '{print $1}')
+    else
+        local configs=()
+        for config_dir in "$CONFIGS_DIR"/*/; do
+            [[ -d "$config_dir" ]] && configs+=("$(basename "$config_dir")")
+        done
+        list_configs
+        echo ""
+        read -p "选择配置编号 (0 返回): " choice
+        [[ "$choice" == "0" ]] || [[ -z "$choice" ]] && return 0
+        if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#configs[@]} )); then
+            print_error "无效选择"; return 1
+        fi
+        selected="${configs[$((choice-1))]}"
+    fi
+
+    [[ -z "$selected" ]] && return 0
+    [[ "$selected" == "$active" ]] && { tui_info "已是当前节点"; sleep 1; return 0; }
+
+    _switch_to_profile "$selected"
+}
 tui_toggle_tun()      { toggle_tun; }
 tui_import_node()     { import_node; }
 tui_service_control() { service_control_menu; }
