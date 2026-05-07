@@ -2056,6 +2056,55 @@ cmd_list() {
     fi
 }
 
+cmd_switch() {
+    local name="$1"
+    if [[ -z "$name" ]]; then
+        echo "用法: bui-c switch <节点名>" >&2
+        exit 2
+    fi
+    if [[ ! -d "${CONFIGS_DIR}/${name}" ]]; then
+        tui_error "节点 '$name' 不存在。用 'bui-c list' 查看可用节点。"
+        exit 3
+    fi
+    _switch_to_profile "$name"
+    local rc=$?
+    exit $rc
+}
+
+cmd_tun() {
+    local action="${1:-status}"
+    case "$action" in
+        on|start|enable)
+            if systemctl is-active --quiet bui-tun 2>/dev/null; then
+                tui_info "TUN 已在运行中"
+                exit 0
+            fi
+            tui_info "启动 TUN 模式..."; start_tun_mode
+            exit $?
+            ;;
+        off|stop|disable)
+            if ! systemctl is-active --quiet bui-tun 2>/dev/null; then
+                tui_info "TUN 未在运行"
+                exit 0
+            fi
+            tui_info "停止 TUN 模式..."; stop_tun_mode
+            exit $?
+            ;;
+        status)
+            if systemctl is-active --quiet bui-tun 2>/dev/null; then
+                echo "running"
+            else
+                echo "stopped"
+            fi
+            exit 0
+            ;;
+        *)
+            echo "用法: bui-c tun <on|off|status>" >&2
+            exit 2
+            ;;
+    esac
+}
+
 switch_config() {
     echo ""
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
