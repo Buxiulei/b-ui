@@ -752,7 +752,12 @@ auto_update() {
         systemctl restart b-ui-admin 2>/dev/null || true
         systemctl restart hysteria-server 2>/dev/null || true
         systemctl restart xray 2>/dev/null || true
-        
+
+        # 重新应用住宅 IP 配置（如已启用，防止升级重写 outbound 配置丢失）
+        if [[ -f "${BASE_DIR}/residential-helper.sh" ]]; then
+            "${BASE_DIR}/residential-helper.sh" reapply 2>/dev/null || true
+        fi
+
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] 更新完成: v${remote_ver}" >> "$LOG_FILE"
         
         # 确保定时任务配置正确
