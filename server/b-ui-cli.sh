@@ -873,7 +873,7 @@ main() {
                 "更多设置 →" \
                 "卸载" \
                 "退出" \
-                2>/dev/null) || choice="退出"
+                ) || choice="退出"
         else
             show_menu
             read -p "请选择 [0-12]: " num

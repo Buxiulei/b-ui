@@ -4517,7 +4517,7 @@ tui_main_loop() {
                 "一键更新" \
                 "卸载" \
                 "退出" \
-                2>/dev/null) || choice="退出"
+                ) || choice="退出"
         else
             show_menu
             read -p "请选择 [0-8]: " choice
