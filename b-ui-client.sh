@@ -1880,16 +1880,15 @@ _switch_to_profile() {
     if [[ -z "$stored_http" ]] && [[ -f "${config_dir}/config.yaml" ]]; then
         stored_http=$(grep -A1 '^http:' "${config_dir}/config.yaml" | grep 'listen:' | sed 's/.*://')
     fi
-    SOCKS_PORT="${stored_socks:-1080}"
-    HTTP_PORT="${stored_http:-8080}"
-
     # 记录 TUN 状态
     local tun_was_active=false
     systemctl is-active --quiet bui-tun 2>/dev/null && tun_was_active=true
     [[ "$tun_was_active" == "true" ]] && tui_info "检测到 TUN 运行中，切换后自动重启..."
 
     # 停止 TUN
-    [[ "$tun_was_active" == "true" ]] && tui_spin "停止 TUN 模式..." stop_tun_mode
+    if [[ "$tun_was_active" == "true" ]]; then
+        tui_info "停止 TUN 模式..."; stop_tun_mode
+    fi
 
     # 停止客户端服务
     tui_spin "停止当前服务..." bash -c "
@@ -1913,14 +1912,12 @@ _switch_to_profile() {
 
     # 生成配置并启动
     if [[ "$protocol" == "hysteria2" ]]; then
-        tui_spin "生成 Hysteria2 配置..." generate_config
+        tui_info "生成 Hysteria2 配置..."; generate_config
         cp "$CONFIG_FILE" "${config_dir}/config.yaml"
-        tui_spin "启动 Hysteria2 服务..." bash -c "
-            create_service
-            systemctl start '$CLIENT_SERVICE'
-        "
+        tui_info "创建 Hysteria2 服务配置..."; create_service
+        tui_spin "启动 Hysteria2 服务..." systemctl start "$CLIENT_SERVICE"
     else
-        tui_spin "生成 Xray 配置..." _write_xray_json
+        tui_info "生成 Xray 配置..."; _write_xray_json
         if [[ ! -f /etc/systemd/system/xray-client.service ]]; then
             local xray_cfg="${BASE_DIR}/xray-config.json"
             printf '%s\n' \
@@ -1949,9 +1946,11 @@ _switch_to_profile() {
     # 重新生成 TUN 配置
     local tun_protocol="${protocol:-hysteria2}"
     [[ "$tun_protocol" != "hysteria2" ]] && tun_protocol="vless-reality"
-    tui_spin "重新生成 TUN 配置..." generate_singbox_tun_config "$tun_protocol"
+    tui_info "重新生成 TUN 配置..."; generate_singbox_tun_config "$tun_protocol"
 
-    [[ "$tun_was_active" == "true" ]] && tui_spin "重启 TUN 模式..." start_tun_mode
+    if [[ "$tun_was_active" == "true" ]]; then
+        tui_info "重启 TUN 模式..."; start_tun_mode
+    fi
 
     tui_success "已切换到: $selected"
 
@@ -1965,6 +1964,96 @@ _switch_to_profile() {
     fi
 
     return 0
+}
+
+#===============================================================================
+# 非交互子命令
+#===============================================================================
+
+cmd_status() {
+    local active
+    active=$(get_active_config)
+    local protocol="" socks_port=1080 http_port=8080
+
+    if [[ -n "$active" ]] && [[ -f "${CONFIGS_DIR}/${active}/meta.json" ]]; then
+        local meta="${CONFIGS_DIR}/${active}/meta.json"
+        protocol=$(grep '"protocol"' "$meta" | cut -d'"' -f4)
+        socks_port=$(grep '"socks_port"' "$meta" | grep -o '[0-9]*' | head -1)
+        http_port=$(grep '"http_port"'  "$meta" | grep -o '[0-9]*' | head -1)
+    fi
+    socks_port="${socks_port:-1080}"
+    http_port="${http_port:-8080}"
+
+    local svc_status="stopped"
+    systemctl is-active --quiet "$CLIENT_SERVICE" 2>/dev/null && svc_status="running"
+    if [[ "$svc_status" == "stopped" ]]; then
+        systemctl is-active --quiet xray-client 2>/dev/null && svc_status="running"
+    fi
+
+    local tun_status="stopped"
+    systemctl is-active --quiet bui-tun 2>/dev/null && tun_status="running"
+
+    if [[ "$OPT_JSON" == "true" ]]; then
+        printf '{\n'
+        printf '  "active_node": "%s",\n' "${active:-}"
+        printf '  "protocol": "%s",\n' "${protocol:-}"
+        printf '  "service": "%s",\n' "$svc_status"
+        printf '  "socks_port": %s,\n' "$socks_port"
+        printf '  "http_port": %s,\n' "$http_port"
+        printf '  "tun": "%s"\n' "$tun_status"
+        printf '}\n'
+    else
+        echo "节点:    ${active:-(未设置)}"
+        echo "协议:    ${protocol:-(未知)}"
+        echo "服务:    $svc_status"
+        echo "SOCKS5:  127.0.0.1:$socks_port"
+        echo "HTTP:    127.0.0.1:$http_port"
+        echo "TUN:     $tun_status"
+    fi
+}
+
+cmd_list() {
+    if [[ ! -d "$CONFIGS_DIR" ]] || [[ -z "$(ls -A "$CONFIGS_DIR" 2>/dev/null)" ]]; then
+        if [[ "$OPT_JSON" == "true" ]]; then
+            echo "[]"
+        else
+            echo "没有已保存的节点"
+        fi
+        return 0
+    fi
+
+    local active
+    active=$(get_active_config)
+
+    if [[ "$OPT_JSON" == "true" ]]; then
+        printf '[\n'
+        local first=true
+        for config_dir in "$CONFIGS_DIR"/*/; do
+            [[ ! -d "$config_dir" ]] && continue
+            local name; name=$(basename "$config_dir")
+            local meta="${config_dir}meta.json"
+            local protocol; protocol=$(grep '"protocol"' "$meta" 2>/dev/null | cut -d'"' -f4)
+            local server; server=$(grep '"server"' "$meta" 2>/dev/null | cut -d'"' -f4)
+            local is_active="false"
+            [[ "$name" == "$active" ]] && is_active="true"
+            [[ "$first" == "false" ]] && printf ',\n'
+            printf '  {"name": "%s", "protocol": "%s", "server": "%s", "active": %s}' \
+                "$name" "$protocol" "$server" "$is_active"
+            first=false
+        done
+        printf '\n]\n'
+    else
+        for config_dir in "$CONFIGS_DIR"/*/; do
+            [[ ! -d "$config_dir" ]] && continue
+            local name; name=$(basename "$config_dir")
+            local meta="${config_dir}meta.json"
+            local protocol; protocol=$(grep '"protocol"' "$meta" 2>/dev/null | cut -d'"' -f4)
+            local server; server=$(grep '"server"' "$meta" 2>/dev/null | cut -d'"' -f4)
+            local marker=""
+            [[ "$name" == "$active" ]] && marker=" ★"
+            printf "%-30s  %-16s  %s%s\n" "$name" "$protocol" "$server" "$marker"
+        done
+    fi
 }
 
 switch_config() {
