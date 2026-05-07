@@ -39,6 +39,91 @@ print_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
 #===============================================================================
+# TUI 工具检测 & Helpers
+#===============================================================================
+
+TUI_AVAILABLE=false
+command -v gum &>/dev/null && command -v fzf &>/dev/null && TUI_AVAILABLE=true
+
+OPT_YES=false
+OPT_JSON=false
+OPT_QUIET=false
+
+parse_global_flags() {
+    for arg in "$@"; do
+        case "$arg" in
+            -y|--yes)    OPT_YES=true ;;
+            --json)      OPT_JSON=true ;;
+            --quiet|-q)  OPT_QUIET=true ;;
+        esac
+    done
+}
+
+tui_info() {
+    [[ "$OPT_QUIET" == "true" ]] && return 0
+    [[ "$TUI_AVAILABLE" == "true" ]] \
+        && gum style --foreground 39 "  $*" \
+        || echo -e "  ${CYAN}$*${NC}"
+}
+
+tui_success() {
+    [[ "$OPT_QUIET" == "true" ]] && return 0
+    [[ "$TUI_AVAILABLE" == "true" ]] \
+        && gum style --foreground 46 "✓ $*" \
+        || echo -e "  ${GREEN}✓ $*${NC}"
+}
+
+tui_error() {
+    [[ "$TUI_AVAILABLE" == "true" ]] \
+        && gum style --foreground 196 "✗ $*" >&2 \
+        || echo -e "  ${RED}✗ $*${NC}" >&2
+}
+
+tui_spin() {
+    local title="$1"; shift
+    if [[ "$TUI_AVAILABLE" == "true" ]]; then
+        gum spin --spinner dot --title "$title" -- "$@"
+    else
+        tui_info "$title"
+        "$@"
+    fi
+}
+
+tui_confirm() {
+    local prompt="$1"
+    if [[ "$OPT_YES" == "true" ]]; then return 0; fi
+    if [[ "$TUI_AVAILABLE" == "true" ]]; then
+        gum confirm "$prompt"
+    else
+        local ans
+        read -p "${prompt} (y/n): " ans
+        [[ "$ans" =~ ^[yY]$ ]]
+    fi
+}
+
+tui_menu() {
+    local header="$1"; shift
+    if [[ "$TUI_AVAILABLE" == "true" ]]; then
+        gum choose --header "$header" "$@"
+    else
+        local i=1
+        echo "$header"
+        for opt in "$@"; do
+            echo "  $i. $opt"
+            ((i++))
+        done
+        local choice
+        read -p "选择 (1-$((i-1))): " choice
+        local opts=("$@")
+        if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#opts[@]} )); then
+            tui_error "无效选择"
+            return 1
+        fi
+        echo "${opts[$((choice-1))]}"
+    fi
+}
+
+#===============================================================================
 # Banner
 #===============================================================================
 
@@ -151,6 +236,30 @@ show_status() {
         echo -e "${YELLOW}[网页管理面板]${NC}"
         echo -e "  访问地址: ${GREEN}https://${domain}${NC}"
         echo -e "  管理密码: ${GREEN}${admin_pass:-未设置}${NC}"
+    fi
+}
+
+show_status_bar_server() {
+    local hy2_icon="🔴" xray_icon="🔴" admin_icon="🔴" caddy_icon="🔴"
+    systemctl is-active --quiet hysteria-server 2>/dev/null && hy2_icon="🟢"
+    systemctl is-active --quiet xray 2>/dev/null            && xray_icon="🟢"
+    systemctl is-active --quiet b-ui-admin 2>/dev/null      && admin_icon="🟢"
+    systemctl is-active --quiet caddy 2>/dev/null           && caddy_icon="🟢"
+    local bbr_status="✗"
+    sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr && bbr_status="✓"
+
+    if [[ "$TUI_AVAILABLE" == "true" ]]; then
+        gum style \
+            --border rounded --border-foreground 39 \
+            --padding "0 2" --margin "1 0" \
+            "$(gum style --bold 'B-UI Server')" "" \
+            "Hysteria2   ${hy2_icon}  运行状态" \
+            "Xray        ${xray_icon}  运行状态" \
+            "Admin 面板  ${admin_icon}  :8080" \
+            "Caddy       ${caddy_icon}  运行状态" \
+            "BBR         ${bbr_status}"
+    else
+        echo -e "  Hysteria2: ${hy2_icon}  Xray: ${xray_icon}  Admin: ${admin_icon}  Caddy: ${caddy_icon}  BBR: ${bbr_status}"
     fi
 }
 
@@ -607,41 +716,223 @@ configure_residential_menu() {
 }
 
 #===============================================================================
+# 非交互子命令（服务端）
+#===============================================================================
+
+cmd_server_status() {
+    local hy2 xray admin caddy bbr
+    hy2=$(systemctl is-active hysteria-server 2>/dev/null || echo "inactive")
+    xray=$(systemctl is-active xray 2>/dev/null || echo "inactive")
+    admin=$(systemctl is-active b-ui-admin 2>/dev/null || echo "inactive")
+    caddy=$(systemctl is-active caddy 2>/dev/null || echo "inactive")
+    bbr="false"
+    sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr && bbr="true"
+
+    if [[ "$OPT_JSON" == "true" ]]; then
+        printf '{\n'
+        printf '  "hysteria2": "%s",\n' "$hy2"
+        printf '  "xray": "%s",\n' "$xray"
+        printf '  "admin": "%s",\n' "$admin"
+        printf '  "caddy": "%s",\n' "$caddy"
+        printf '  "bbr": %s\n' "$bbr"
+        printf '}\n'
+    else
+        echo "Hysteria2:  $hy2"
+        echo "Xray:       $xray"
+        echo "Admin:      $admin"
+        echo "Caddy:      $caddy"
+        echo "BBR:        $bbr"
+    fi
+}
+
+cmd_server_restart() {
+    tui_info "重启所有服务..."
+    systemctl restart hysteria-server 2>/dev/null || true
+    systemctl restart xray 2>/dev/null || true
+    systemctl restart b-ui-admin 2>/dev/null || true
+    systemctl restart caddy 2>/dev/null || true
+    tui_success "所有服务已重启"
+    exit 0
+}
+
+cmd_server_logs() {
+    local svc="${1:-hysteria2}"
+    case "$svc" in
+        hysteria2) journalctl -u hysteria-server --no-pager -n 100 ;;
+        xray)      journalctl -u xray --no-pager -n 100 ;;
+        admin)     journalctl -u b-ui-admin --no-pager -n 100 ;;
+        caddy)     journalctl -u caddy --no-pager -n 100 ;;
+        *)
+            echo "用法: b-ui logs <hysteria2|xray|admin|caddy>" >&2
+            exit 2
+            ;;
+    esac
+    exit 0
+}
+
+cmd_server_residential() {
+    local action="$1"; shift
+    case "$action" in
+        enable)
+            local url="$1"
+            [[ -z "$url" ]] && { echo "用法: b-ui residential enable <url>" >&2; exit 2; }
+            bash /opt/b-ui/residential-helper.sh enable "$url"
+            ;;
+        disable)
+            bash /opt/b-ui/residential-helper.sh disable
+            ;;
+        status)
+            bash /opt/b-ui/residential-helper.sh status
+            ;;
+        *)
+            echo "用法: b-ui residential <enable <url>|disable|status>" >&2
+            exit 2
+            ;;
+    esac
+    exit 0
+}
+
+dispatch_subcommand_server() {
+    local cmd="$1"; shift
+    case "$cmd" in
+        status)      cmd_server_status "$@"; exit 0 ;;
+        restart)     cmd_server_restart "$@" ;;
+        logs)        cmd_server_logs "$@" ;;
+        residential) cmd_server_residential "$@" ;;
+        update)      check_bui_update; exit 0 ;;
+        -h|--help|help)
+            cat <<'HELP'
+用法: b-ui [subcommand] [options]
+
+  无参数         进入 TUI 交互菜单
+
+子命令:
+  status                查看服务状态（--json）
+  restart               重启所有服务
+  logs <service>        查看日志（hysteria2/xray/admin/caddy）
+  update                检查并更新
+  residential enable <url>   启用住宅 IP 出口
+  residential disable        禁用住宅 IP 出口
+  residential status         查看住宅 IP 状态
+
+通用 flags:
+  -y, --yes    跳过确认
+  --json       JSON 输出
+HELP
+            exit 0
+            ;;
+        *)
+            echo "未知命令: $cmd。运行 'b-ui --help' 查看帮助。" >&2
+            exit 2
+            ;;
+    esac
+}
+
+#===============================================================================
 # 主函数
 #===============================================================================
 
 main() {
     if [[ $EUID -ne 0 ]]; then
-        print_error "请使用 sudo b-ui 运行"
+        echo "请使用 sudo b-ui 运行" >&2
         exit 1
     fi
-    
-    while true; do
-        print_banner
-        show_status
-        show_menu
-        
-        read -p "请选择 [0-12]: " choice
-        
-        case $choice in
-            1) show_client_config ;;
-            2) restart_services ;;
-            3) view_logs ;;
-            4) change_password ;;
-            5) enable_bbr ;;
-            6) toggle_autostart ;;
-            7) check_bui_update ;;
-            8) update_kernel ;;
-            9) uninstall_all ;;
-            10) configure_port_hopping_menu ;;
-            11) run_vps_benchmark ;;
-            12) configure_residential_menu ;;
-            0) print_info "再见！"; exit 0 ;;
-            *) print_error "无效选项" ;;
+
+    parse_global_flags "$@"
+    local args=()
+    for arg in "$@"; do
+        case "$arg" in
+            -h|--help) dispatch_subcommand_server --help; exit 0 ;;
+            -*) : ;;
+            *) args+=("$arg") ;;
         esac
-        
-        echo ""
-        read -p "按 Enter 继续..."
+    done
+
+    if [[ ${#args[@]} -gt 0 ]]; then
+        dispatch_subcommand_server "${args[@]}"
+        exit $?
+    fi
+
+    # TUI 主循环
+    while true; do
+        clear
+        print_banner
+        show_status_bar_server
+
+        local choice
+        if [[ "$TUI_AVAILABLE" == "true" ]]; then
+            choice=$(gum choose \
+                "重启所有服务" \
+                "查看日志 →" \
+                "查看客户端配置" \
+                "──────────" \
+                "更新" \
+                "端口跳跃设置" \
+                "住宅 IP 出口 →" \
+                "──────────" \
+                "更多设置 →" \
+                "卸载" \
+                "退出" \
+                2>/dev/null) || choice="退出"
+        else
+            show_menu
+            read -p "请选择 [0-12]: " num
+            case $num in
+                1)  choice="查看客户端配置" ;;
+                2)  choice="重启所有服务" ;;
+                3)  choice="查看日志 →" ;;
+                7)  choice="更新" ;;
+                9)  choice="卸载" ;;
+                10) choice="端口跳跃设置" ;;
+                12) choice="住宅 IP 出口 →" ;;
+                0)  choice="退出" ;;
+                *)  choice="更多设置 →" ;;
+            esac
+        fi
+
+        case "$choice" in
+            "重启所有服务")
+                tui_info "重启所有服务..."
+                systemctl restart hysteria-server 2>/dev/null || true
+                systemctl restart xray 2>/dev/null || true
+                systemctl restart b-ui-admin 2>/dev/null || true
+                systemctl restart caddy 2>/dev/null || true
+                tui_success "所有服务已重启"
+                ;;
+            "查看日志 →")
+                local svc
+                svc=$(tui_menu "查看哪个服务的日志？" "Hysteria2" "Xray" "Admin 面板" "Caddy" "返回")
+                case "$svc" in
+                    "Hysteria2")  journalctl -u hysteria-server --no-pager -n 100 | less ;;
+                    "Xray")       journalctl -u xray --no-pager -n 100 | less ;;
+                    "Admin 面板") journalctl -u b-ui-admin --no-pager -n 100 | less ;;
+                    "Caddy")      journalctl -u caddy --no-pager -n 100 | less ;;
+                esac
+                ;;
+            "查看客户端配置") show_client_config ;;
+            "更新")            check_bui_update ;;
+            "端口跳跃设置")    configure_port_hopping_menu ;;
+            "住宅 IP 出口 →")  configure_residential_menu ;;
+            "更多设置 →")
+                local sub
+                sub=$(tui_menu "更多设置" "修改管理密码" "BBR 设置" "自启动管理" "VPS 测速" "返回")
+                case "$sub" in
+                    "修改管理密码") change_password ;;
+                    "BBR 设置")     enable_bbr ;;
+                    "自启动管理")   toggle_autostart ;;
+                    "VPS 测速")     run_vps_benchmark ;;
+                esac
+                ;;
+            "卸载")            uninstall_all ;;
+            "退出")            tui_info "再见！"; exit 0 ;;
+            "──────────")     continue ;;
+            "__invalid__")    print_error "无效选项" ;;
+        esac
+
+        if [[ "$TUI_AVAILABLE" != "true" ]]; then
+            echo ""
+            read -p "按 Enter 继续..."
+        fi
     done
 }
 
