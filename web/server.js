@@ -26,6 +26,14 @@ function getVersion() {
 }
 const VERSION = getVersion();
 
+// 分发 b-ui-client.sh 时把脚本中的 SCRIPT_VERSION 替换成 version.json 里的版本，
+// 防止仓库 b-ui-client.sh 滞后于 version.json 时客户端下载到旧版本号。
+function injectClientVersion(scriptContent) {
+    const v = getVersion();
+    if (!v || v === "unknown") return scriptContent;
+    return scriptContent.replace(/^SCRIPT_VERSION=".*"/m, `SCRIPT_VERSION="${v}"`);
+}
+
 const CONFIG = {
     port: process.env.ADMIN_PORT || 8080,
     adminPassword: process.env.ADMIN_PASSWORD || "admin123",
@@ -1061,11 +1069,11 @@ const server = http.createServer(async (req, res) => {
 
         if (fs.existsSync(localClientScript)) {
             // 方法1: 使用项目根目录的脚本 (推荐，与服务端同步更新)
-            clientScript = fs.readFileSync(localClientScript, "utf8");
+            clientScript = injectClientVersion(fs.readFileSync(localClientScript, "utf8"));
             console.log(`[install-client] 使用本地脚本: ${localClientScript}`);
         } else if (fs.existsSync(packagesClientScript)) {
             // 方法2: 使用 packages 目录的脚本
-            clientScript = fs.readFileSync(packagesClientScript, "utf8");
+            clientScript = injectClientVersion(fs.readFileSync(packagesClientScript, "utf8"));
             console.log(`[install-client] 使用 packages 脚本: ${packagesClientScript}`);
         } else {
             // 方法3: 从 GitHub 获取 (备用)
@@ -1087,7 +1095,7 @@ const server = http.createServer(async (req, res) => {
 
             fetchPromise.then(githubScript => {
                 if (githubScript) {
-                    clientScript = githubScript;
+                    clientScript = injectClientVersion(githubScript);
                 } else {
                     clientScript = generateBootstrapScript(serverDomain, key);
                 }
@@ -1186,13 +1194,17 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
 
         try {
             if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
-                const content = fs.readFileSync(filePath);
+                let content = fs.readFileSync(filePath);
                 const ext = path.extname(fileName).toLowerCase();
                 let contentType = "application/octet-stream";
                 if (ext === ".sh") contentType = "text/x-shellscript";
                 else if (ext === ".json") contentType = "application/json";
                 else if (ext === ".zip") contentType = "application/zip";
                 else if (ext === ".gz" || ext === ".tar.gz") contentType = "application/gzip";
+
+                if (fileName === "b-ui-client.sh") {
+                    content = Buffer.from(injectClientVersion(content.toString("utf8")), "utf8");
+                }
 
                 res.writeHead(200, {
                     "Content-Type": contentType,

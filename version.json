@@ -1,5 +1,5 @@
 {
-    "version": "3.4.2",
+    "version": "3.4.3",
     "updated": "2026-05-07",
     "files": [
         "install.sh",
@@ -16,6 +16,7 @@
         "b-ui-client.sh"
     ],
     "changelog": {
+        "3.4.3": "修复客户端 b-ui-client.sh 版本号硬编码长期滞后于 version.json（停留在 3.2.1）：bump SCRIPT_VERSION 至当前；web/server.js 在 /install-client 和 /packages/b-ui-client.sh 分发时从 version.json 动态注入 SCRIPT_VERSION，彻底杜绝以后漏改",
         "3.4.2": "默认住宅分流关键词新增 grok（x.ai 旗下 AI）、tiktok（TikTok 视频）",
         "3.4.1": "sing-box 1.13 兼容性修复：DNS server 旧格式 address: udp:// 迁移为 type: udp + server: 字段；inbound 的 sniff/sniff_override_destination 字段移除，改为 route rule action {action: sniff}；移除 DNS server 的 detour: direct（sing-box 1.13 不允许指向空 direct outbound）；route 增加 default_domain_resolver: dns_direct（1.12+ 必需）；解决 b-ui-relay 服务在 sing-box 1.13 上无法启动的问题",
         "3.4.0": "架构重构：sing-box 统一负责所有路由决策和 DNS 解析；Xray 和 Hysteria2 不再含任何路由逻辑（全部流量转给 sing-box）；sing-box 直连模式新增 DNS 配置（1.1.1.1）和私有 IP + 服务器自身 IP 直连规则；住宅模式 route.rules 补充服务器自身 IP 直连，彻底解决 TUN 模式下 SSH 到服务器自身的 hairpin 问题",
