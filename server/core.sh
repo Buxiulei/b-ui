@@ -399,6 +399,8 @@ tls:
 # QUIC 接收窗口使用 hysteria 默认值（8 MiB stream / 20 MiB conn）
 # 旧版本写死 64 MiB conn 窗口在 1G 小机器上会导致每会话占用 ~80MB 内存
 # 默认值在 200ms RTT 下单连接吞吐约 670 Mbps，对绝大多数 VPS 已够用
+quic:
+  maxIdleTimeout: 120s
 
 # HTTP 认证 (支持用户级别限速)
 auth:

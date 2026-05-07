@@ -325,6 +325,18 @@ apply_systemd_configs() {
         fi
     fi
 
+    # 迁移 config.yaml：添加 QUIC maxIdleTimeout（默认 30s 过短，空闲断连后客户端需约 1 分钟恢复）
+    if [[ -f "$config_file" ]] && ! grep -q 'maxIdleTimeout' "$config_file"; then
+        if grep -q '^quic:' "$config_file"; then
+            sed -i '/^quic:/a\  maxIdleTimeout: 120s' "$config_file"
+        else
+            awk '/^listen:/{print; print ""; print "quic:"; print "  maxIdleTimeout: 120s"; next}1' \
+                "$config_file" > "${config_file}.tmp" && mv "${config_file}.tmp" "$config_file"
+        fi
+        print_info "  ✓ config.yaml 添加 QUIC maxIdleTimeout: 120s（防止空闲断连）"
+        hysteria_config_changed=1
+    fi
+
     # 应用 Hysteria2 服务配置
     local hysteria_mem_changed=0
     if [[ -d /etc/systemd/system/hysteria-server.service.d ]]; then

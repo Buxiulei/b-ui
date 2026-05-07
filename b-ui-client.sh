@@ -2536,6 +2536,10 @@ auth: ${AUTH_PASSWORD}
 tls:
   insecure: false
 
+# 保活：防止 QUIC 空闲超时静默断连
+quic:
+  keepAlivePeriod: 10s
+
 # SOCKS5 代理
 socks5:
   listen: 127.0.0.1:${SOCKS_PORT}
