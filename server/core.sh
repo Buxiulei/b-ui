@@ -416,6 +416,9 @@ masquerade:
   proxy:
     url: ${MASQUERADE_URL}
     rewriteHost: true
+
+# B-UI:RESIDENTIAL-START
+# B-UI:RESIDENTIAL-END
 EOF
 
     chmod 644 "$CONFIG_FILE"
