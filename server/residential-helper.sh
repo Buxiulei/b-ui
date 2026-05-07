@@ -122,7 +122,7 @@ apply_xray() {
         '[
           {"type":"field","inboundTag":["api"],"outboundTag":"api"},
           {"type":"field","ip":["geoip:private"],"outboundTag":"direct"},
-          {"type":"field","domain":$domains,"outboundTag":"residential"},
+          {"type":"field","domain":$domains,"outboundTag":"residential","network":"tcp"},
           {"type":"field","outboundTag":"direct","network":"tcp,udp"}
         ]')
 
@@ -172,7 +172,7 @@ apply_hysteria() {
         printf '    - direct(192.168.0.0/16)\n'
         printf '    - direct(169.254.0.0/16)\n'
         for d in "${DOMAINS[@]}"; do
-            printf '    - residential(*%s*)\n' "$d"
+            printf '    - residential(*%s*, tcp)\n' "$d"
         done
         printf '    - direct(all)\n'
     } > "$block_file"

@@ -1,5 +1,5 @@
 {
-    "version": "3.3.3",
+    "version": "3.3.4",
     "updated": "2026-05-07",
     "files": [
         "install.sh",
@@ -16,6 +16,7 @@
         "b-ui-client.sh"
     ],
     "changelog": {
+        "3.3.4": "修复住宅 IP 出站稳定性：Xray 分流规则限制为 TCP only（network:tcp），Hysteria2 ACL 规则限制为 tcp（residential(*kw*, tcp)），去除 sniff udpPorts:all 避免 UDP 嗅探触发 SOCKS5 UDP ASSOCIATE 导致连接不稳定",
         "3.3.3": "住宅 IP 弹窗 UI 重设计：加载骨架屏、绿色脉冲状态点、可点击 IP 徽章一键复制、URL 显示/隐藏切换及复制按钮、分流域名面板折叠箭头动画及数量徽章、错误提示图标化；默认分流关键词去后缀改为纯关键词匹配（openai/chatgpt/google/googleapis/gstatic/anthropic/claude/ping0/ip.sb）",
         "3.3.2": "Hysteria2 ACL 域名匹配确认支持 *keyword* 跨点通配（源码 deepMatchRune 验证）；Xray 用 keyword: 前缀，输入 ping0 同时匹配 ping0.cc/ping0.net/ping0.io 等所有含该关键词的域名",
         "3.3.1": "住宅 IP 分流改为关键词匹配：Xray 用 keyword: 前缀，Hysteria2 用 *keyword* 通配，输入 ping0 自动匹配 ping0.cc/ping0.net 等所有含该字段的域名",
