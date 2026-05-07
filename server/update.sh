@@ -811,6 +811,7 @@ install_tui_tools() {
     print_info "安装 TUI 工具 (gum + fzf)..."
 
     local arch
+    local fzf_arch
     case "$(uname -m)" in
         x86_64)  arch="x86_64" ; fzf_arch="amd64" ;;
         aarch64) arch="arm64"  ; fzf_arch="arm64" ;;
@@ -880,12 +881,11 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             ;;
         *)
             # 交互模式
+            # 补装缺失的 TUI 工具
+            if ! command -v gum &>/dev/null || ! command -v fzf &>/dev/null; then
+                install_tui_tools
+            fi
             check_and_update
             ;;
     esac
-
-    # 补装缺失的 TUI 工具
-    if ! command -v gum &>/dev/null || ! command -v fzf &>/dev/null; then
-        install_tui_tools
-    fi
 fi

@@ -648,6 +648,7 @@ install_tui_tools() {
     print_info "安装 TUI 工具 (gum + fzf)..."
 
     local arch
+    local fzf_arch
     case "$(uname -m)" in
         x86_64)  arch="x86_64" ; fzf_arch="amd64" ;;
         aarch64) arch="arm64"  ; fzf_arch="arm64" ;;
