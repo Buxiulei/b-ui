@@ -4609,9 +4609,179 @@ tui_switch_node() {
 
     _switch_to_profile "$selected"
 }
-tui_toggle_tun()      { toggle_tun; }
-tui_import_node()     { import_node; }
-tui_service_control() { service_control_menu; }
+tui_toggle_tun() {
+    if systemctl is-active --quiet bui-tun 2>/dev/null; then
+        if tui_confirm "停止 TUN 模式？"; then
+            tui_info "停止 TUN..."; stop_tun_mode
+            tui_success "TUN 已停止"
+        fi
+    else
+        local active; active=$(get_active_config)
+        if [[ -z "$active" ]]; then
+            tui_error "没有激活的节点，无法启动 TUN"
+            sleep 1
+            return 0
+        fi
+        if tui_confirm "启动 TUN 全局代理模式？"; then
+            local protocol
+            protocol=$(grep '"protocol"' "${CONFIGS_DIR}/${active}/meta.json" 2>/dev/null | cut -d'"' -f4)
+            tui_info "生成 TUN 配置..."; generate_singbox_tun_config "${protocol:-hysteria2}"
+            tui_info "启动 TUN..."; start_tun_mode
+            tui_success "TUN 已启动"
+        fi
+    fi
+    sleep 1
+}
+
+tui_import_node() {
+    echo ""
+    local raw_input
+    if [[ "$TUI_AVAILABLE" == "true" ]]; then
+        echo "支持: hysteria2://  vless://  https://订阅地址"
+        echo ""
+        raw_input=$(gum write \
+            --placeholder "粘贴链接，每行一个（Ctrl+D 或 Esc 完成）..." \
+            --char-limit 0 --width 70 --height 8) || return 0
+    else
+        echo "请粘贴链接（每行一个，空行结束）："
+        local lines_input=()
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && break
+            lines_input+=("$line")
+        done
+        raw_input=$(printf '%s\n' "${lines_input[@]}")
+    fi
+
+    [[ -z "$raw_input" ]] && return 0
+
+    local uris=()
+    while IFS= read -r line; do
+        line=$(echo "$line" | xargs 2>/dev/null || echo "$line")
+        [[ -z "$line" || "$line" =~ ^# ]] && continue
+        uris+=("$line")
+    done <<< "$raw_input"
+
+    [[ ${#uris[@]} -eq 0 ]] && { tui_error "未识别到有效链接"; sleep 1; return 0; }
+
+    local success=0 fail=0
+    local imported_names=()
+
+    for uri in "${uris[@]}"; do
+        local parsed="" protocol=""
+        if [[ "$uri" =~ ^(hysteria2|hy2):// ]]; then
+            parsed=$(parse_hysteria_uri "$uri"); protocol="hysteria2"
+        elif [[ "$uri" =~ ^vless:// ]]; then
+            parsed=$(parse_vless_uri "$uri"); protocol="vless-reality"
+        elif [[ "$uri" =~ ^https?:// ]]; then
+            tui_info "订阅地址请通过导入节点菜单的订阅功能导入"
+            ((fail++)); continue
+        else
+            tui_error "不支持: ${uri:0:50}"; ((fail++)); continue
+        fi
+
+        [[ -z "$parsed" ]] && { tui_error "解析失败: ${uri:0:50}"; ((fail++)); continue; }
+
+        local remark server_addr
+        remark=$(echo "$parsed" | grep '^REMARK=' | cut -d= -f2-)
+        server_addr=$(echo "$parsed" | grep '^SERVER_ADDR=' | cut -d= -f2-)
+
+        local config_name="${remark:-${protocol}-$(date +%s)}"
+        config_name=$(echo "$config_name" | tr -s ' ' '-' | sed 's/[^a-zA-Z0-9._-]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//')
+        [[ -z "$config_name" ]] && config_name="${protocol}-$(date +%s)"
+
+        if [[ -d "${CONFIGS_DIR}/${config_name}" ]]; then
+            tui_info "已存在: $config_name（跳过）"; continue
+        fi
+
+        safe_import_parsed "$parsed"
+
+        if ! save_config_meta "$config_name" "$protocol" "${server_addr:-$SERVER_ADDR}" "$uri" 1080 8080; then
+            tui_error "保存失败: $config_name"; ((fail++)); continue
+        fi
+        tui_success "已导入: $config_name ($protocol)"
+        imported_names+=("$config_name")
+        ((success++))
+    done
+
+    echo ""
+    tui_info "导入完成: 成功 ${success}  失败 ${fail}"
+
+    if [[ ${#imported_names[@]} -gt 0 ]]; then
+        echo ""
+        if tui_confirm "立即激活其中一个节点？"; then
+            tui_switch_node
+        fi
+    fi
+}
+
+tui_service_control() {
+    while true; do
+        clear
+        echo ""
+        echo -e "${CYAN}═══ 服务控制 ═══════════════════════════════${NC}"
+        echo ""
+
+        local hy2_status="🔴 停止" xray_status="🔴 停止" tun_status="🔴 停止"
+        systemctl is-active --quiet "$CLIENT_SERVICE" 2>/dev/null && hy2_status="🟢 运行中"
+        systemctl is-active --quiet xray-client 2>/dev/null       && xray_status="🟢 运行中"
+        systemctl is-active --quiet bui-tun 2>/dev/null            && tun_status="🟢 运行中"
+
+        echo -e "  Hysteria2  $hy2_status"
+        echo -e "  Xray       $xray_status"
+        echo -e "  TUN        $tun_status"
+        echo ""
+
+        local opts=()
+        if systemctl is-active --quiet "$CLIENT_SERVICE" 2>/dev/null; then
+            opts+=("停止 Hysteria2" "重启 Hysteria2")
+        else
+            opts+=("启动 Hysteria2")
+        fi
+        if systemctl is-active --quiet xray-client 2>/dev/null; then
+            opts+=("停止 Xray")
+        else
+            opts+=("启动 Xray")
+        fi
+        opts+=("查看日志" "返回")
+
+        local choice
+        choice=$(tui_menu "操作" "${opts[@]}") || choice="返回"
+
+        case "$choice" in
+            "启动 Hysteria2")
+                tui_info "启动..."; systemctl start "$CLIENT_SERVICE"
+                tui_success "Hysteria2 已启动"
+                ;;
+            "停止 Hysteria2")
+                tui_info "停止..."; systemctl stop "$CLIENT_SERVICE"
+                tui_success "Hysteria2 已停止"
+                ;;
+            "重启 Hysteria2")
+                tui_info "重启..."; systemctl restart "$CLIENT_SERVICE"
+                tui_success "Hysteria2 已重启"
+                ;;
+            "启动 Xray")
+                tui_info "启动..."; systemctl start xray-client
+                tui_success "Xray 已启动"
+                ;;
+            "停止 Xray")
+                tui_info "停止..."; systemctl stop xray-client
+                tui_success "Xray 已停止"
+                ;;
+            "查看日志")
+                local svc_choice
+                svc_choice=$(tui_menu "查看哪个日志？" "Hysteria2" "Xray" "TUN" "返回")
+                case "$svc_choice" in
+                    "Hysteria2") journalctl -u "$CLIENT_SERVICE" --no-pager -n 50 | less ;;
+                    "Xray")      journalctl -u xray-client --no-pager -n 50 | less ;;
+                    "TUN")       journalctl -u bui-tun --no-pager -n 50 | less ;;
+                esac
+                ;;
+            "返回"|"") return 0 ;;
+        esac
+        sleep 1
+    done
+}
 
 
 
