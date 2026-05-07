@@ -230,10 +230,22 @@
                 加载中...
             </div>
             <input type="password" id="resi-url" placeholder="socks5://user:pass@host:port"
-                   style="font-family:monospace; margin-bottom:8px">
-            <div style="font-size:12px; color:var(--text-dim); margin-bottom:16px">
+                   style="font-family:monospace; margin-bottom:4px">
+            <div style="font-size:12px; color:var(--text-dim); margin-bottom:14px">
                 支持格式: socks5://user:pass@host:port 或 host:port:user:pass
             </div>
+            <details id="resi-domains-details" style="margin-bottom:14px">
+                <summary style="cursor:pointer; font-size:13px; color:var(--text-dim); user-select:none; padding:4px 0; list-style:none">
+                    ▸ 分流域名设置
+                </summary>
+                <div style="margin-top:8px">
+                    <textarea id="resi-domains" rows="7"
+                        style="font-family:monospace; font-size:12px; resize:vertical; margin-bottom:4px"
+                        placeholder="每行一个域名&#10;openai.com&#10;google.com&#10;anthropic.com"></textarea>
+                    <div style="font-size:11px; color:var(--text-dim)">每行一个根域名（如 openai.com），自动匹配该域名及所有子域名</div>
+                    <button class="btn btn-secondary" onclick="saveDomainsOnly()" style="margin-top:8px; padding:4px 12px; font-size:12px">仅更新分流域名</button>
+                </div>
+            </details>
             <div id="resi-error" style="display:none; color:var(--red,#e74c3c); font-size:13px; margin-bottom:12px"></div>
             <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px">
                 <button class="btn btn-secondary" onclick="closeM()">取消</button>

@@ -1605,6 +1605,7 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
 
             if (r === "residential") {
                 const helperPath = CONFIG.residentialHelper;
+                const DEFAULT_DOMAINS = ["openai.com","chatgpt.com","google.com","googleapis.com","gstatic.com","anthropic.com","claude.ai"];
 
                 if (req.method === "GET") {
                     try {
@@ -1612,19 +1613,49 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                             ? JSON.parse(fs.readFileSync(CONFIG.residentialConfig, "utf8"))
                             : { enabled: false };
                         const display = { ...raw };
+                        if (!display.domains || !display.domains.length) display.domains = DEFAULT_DOMAINS;
                         if (display.password) display.password = display.password.slice(0, 2) + "***";
                         if (display.username && display.host) {
                             display.displayUrl = `socks5://${display.username.slice(0, 2)}***@${display.host}:${display.port}`;
                         }
                         return sendJSON(res, display);
                     } catch {
-                        return sendJSON(res, { enabled: false });
+                        return sendJSON(res, { enabled: false, domains: DEFAULT_DOMAINS });
                     }
                 }
 
                 if (req.method === "POST") {
                     const b = await parseBody(req);
+
+                    // domains-only update (already enabled, just change routing)
+                    if (!b.url && b.domains) {
+                        try {
+                            const result = spawnSync(helperPath, ["set-domains", JSON.stringify(b.domains)], {
+                                env: { ...process.env, BASE_DIR },
+                                encoding: "utf8",
+                                timeout: 15000,
+                            });
+                            if (result.status !== 0) {
+                                const errMsg = (result.stderr || "").replace(/\x1b\[[0-9;]*m/g, "").trim();
+                                return sendJSON(res, { error: errMsg || "分流域名更新失败" }, 400);
+                            }
+                            return sendJSON(res, { success: true });
+                        } catch (e) {
+                            return sendJSON(res, { error: e.message }, 500);
+                        }
+                    }
+
                     if (!b.url) return sendJSON(res, { error: "url 字段必填" }, 400);
+
+                    // set domains first if provided, then enable
+                    if (b.domains) {
+                        spawnSync(helperPath, ["set-domains", JSON.stringify(b.domains)], {
+                            env: { ...process.env, BASE_DIR },
+                            encoding: "utf8",
+                            timeout: 10000,
+                        });
+                    }
+
                     try {
                         const result = spawnSync(helperPath, ["enable", b.url], {
                             env: { ...process.env, BASE_DIR },

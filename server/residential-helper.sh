@@ -1,10 +1,11 @@
 #!/bin/bash
 # residential-helper.sh — 住宅 IP SOCKS5 出站代理助手
 # Usage:
-#   residential-helper.sh enable <url>   → prints exit_ip (line1) isp_info (line2)
-#   residential-helper.sh disable        → removes residential config
-#   residential-helper.sh status         → prints residential-proxy.json
-#   residential-helper.sh reapply        → re-applies existing enabled config (used by update.sh)
+#   residential-helper.sh enable <url>          → prints exit_ip (line1) isp_info (line2)
+#   residential-helper.sh disable               → removes residential config
+#   residential-helper.sh status                → prints residential-proxy.json
+#   residential-helper.sh reapply               → re-applies existing enabled config (used by update.sh)
+#   residential-helper.sh set-domains <json>    → update domain list and reapply if enabled
 
 set -euo pipefail
 
@@ -16,6 +17,24 @@ HYSTERIA_CONFIG="${BASE_DIR}/config.yaml"
 RED='\033[0;31m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 err()  { echo -e "${RED}ERROR: $*${NC}" >&2; }
 info() { echo -e "${BLUE}$*${NC}" >&2; }
+
+DEFAULT_DOMAINS=("openai.com" "chatgpt.com" "google.com" "googleapis.com" "gstatic.com" "anthropic.com" "claude.ai")
+
+# ---------------------------------------------------------------------------
+# 读取分流域名列表 → 导出 DOMAINS 数组
+# 优先从 residential-proxy.json 读取，否则使用默认列表
+# ---------------------------------------------------------------------------
+get_domains() {
+    if [[ -f "${RESIDENTIAL_CONFIG}" ]]; then
+        local d
+        d=$(jq '.domains // empty' "${RESIDENTIAL_CONFIG}" 2>/dev/null || echo "")
+        if [[ -n "$d" && "$d" != "null" && "$d" != "[]" ]]; then
+            mapfile -t DOMAINS < <(jq -r '.[]' <<< "$d")
+            return
+        fi
+    fi
+    DOMAINS=("${DEFAULT_DOMAINS[@]}")
+}
 
 # ---------------------------------------------------------------------------
 # URL 解析 → 导出 RESI_HOST RESI_PORT RESI_USER RESI_PASS
@@ -76,10 +95,14 @@ verify() {
 }
 
 # ---------------------------------------------------------------------------
-# Xray 配置写入 (jq 原子替换)
+# Xray 配置写入 (jq 原子替换，域名动态生成)
 # ---------------------------------------------------------------------------
 apply_xray() {
     local host="$1" port="$2" user="$3" pass="$4"
+
+    get_domains
+    local domain_json
+    domain_json=$(printf '%s\n' "${DOMAINS[@]}" | jq -R . | jq -s 'map("domain:" + .)')
 
     local outbounds
     outbounds=$(jq -n \
@@ -93,12 +116,15 @@ apply_xray() {
           }]}},
           {"tag":"direct","protocol":"freedom"}]')
 
-    local rules='[
-      {"type":"field","inboundTag":["api"],"outboundTag":"api"},
-      {"type":"field","ip":["geoip:private"],"outboundTag":"direct"},
-      {"type":"field","domain":["geosite:openai","geosite:google","domain:anthropic.com","domain:claude.ai"],"outboundTag":"residential"},
-      {"type":"field","outboundTag":"direct","network":"tcp,udp"}
-    ]'
+    local rules
+    rules=$(jq -n \
+        --argjson domains "$domain_json" \
+        '[
+          {"type":"field","inboundTag":["api"],"outboundTag":"api"},
+          {"type":"field","ip":["geoip:private"],"outboundTag":"direct"},
+          {"type":"field","domain":$domains,"outboundTag":"residential"},
+          {"type":"field","outboundTag":"direct","network":"tcp,udp"}
+        ]')
 
     local backup="${XRAY_CONFIG}.bak.$(date +%Y%m%d%H%M%S)"
     cp "${XRAY_CONFIG}" "$backup"
@@ -110,7 +136,7 @@ apply_xray() {
 }
 
 # ---------------------------------------------------------------------------
-# Hysteria2 配置写入 (awk 锚点注入)
+# Hysteria2 配置写入 (awk 锚点注入，域名动态生成)
 # ---------------------------------------------------------------------------
 apply_hysteria() {
     local host="$1" port="$2" user="$3" pass="$4"
@@ -125,38 +151,32 @@ apply_hysteria() {
     local backup="${config}.bak.$(date +%Y%m%d%H%M%S)"
     cp "$config" "$backup"
 
+    get_domains
+
     block_file=$(mktemp)
-    cat > "$block_file" << EOYAML
-outbounds:
-  - name: residential
-    type: socks5
-    socks5:
-      addr: "${host}:${port}"
-      username: "${user}"
-      password: "${pass}"
-  - name: direct
-    type: direct
-acl:
-  inline:
-    - direct(127.0.0.0/8)
-    - direct(10.0.0.0/8)
-    - direct(172.16.0.0/12)
-    - direct(192.168.0.0/16)
-    - direct(169.254.0.0/16)
-    - residential(*.openai.com)
-    - residential(openai.com)
-    - residential(*.chatgpt.com)
-    - residential(chatgpt.com)
-    - residential(*.google.com)
-    - residential(google.com)
-    - residential(*.googleapis.com)
-    - residential(*.gstatic.com)
-    - residential(*.anthropic.com)
-    - residential(anthropic.com)
-    - residential(*.claude.ai)
-    - residential(claude.ai)
-    - direct(all)
-EOYAML
+    {
+        printf 'outbounds:\n'
+        printf '  - name: residential\n'
+        printf '    type: socks5\n'
+        printf '    socks5:\n'
+        printf '      addr: "%s:%s"\n' "$host" "$port"
+        printf '      username: "%s"\n' "$user"
+        printf '      password: "%s"\n' "$pass"
+        printf '  - name: direct\n'
+        printf '    type: direct\n'
+        printf 'acl:\n'
+        printf '  inline:\n'
+        printf '    - direct(127.0.0.0/8)\n'
+        printf '    - direct(10.0.0.0/8)\n'
+        printf '    - direct(172.16.0.0/12)\n'
+        printf '    - direct(192.168.0.0/16)\n'
+        printf '    - direct(169.254.0.0/16)\n'
+        for d in "${DOMAINS[@]}"; do
+            printf '    - residential(*.%s)\n' "$d"
+            printf '    - residential(%s)\n' "$d"
+        done
+        printf '    - direct(all)\n'
+    } > "$block_file"
 
     tmp=$(mktemp)
     awk -v blockfile="$block_file" '
@@ -206,8 +226,12 @@ reload_services() {
 
 save_config() {
     local enabled="$1"
+    local existing_domains
+    existing_domains=$(jq '.domains // null' "${RESIDENTIAL_CONFIG}" 2>/dev/null || echo "null")
+
     jq -n \
         --argjson enabled "$enabled" \
+        --argjson domains  "${existing_domains}" \
         --arg  host      "${RESI_HOST:-}" \
         --argjson port   "${RESI_PORT:-0}" \
         --arg  username  "${RESI_USER:-}" \
@@ -215,7 +239,7 @@ save_config() {
         --arg  lastVerifiedIp      "${RESI_EXIT_IP:-}" \
         --arg  lastVerifiedIspInfo "${RESI_ISP_INFO:-}" \
         --arg  lastVerifiedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-        '{enabled:$enabled,host:$host,port:$port,username:$username,
+        '{enabled:$enabled,domains:$domains,host:$host,port:$port,username:$username,
           password:$password,lastVerifiedIp:$lastVerifiedIp,
           lastVerifiedIspInfo:$lastVerifiedIspInfo,lastVerifiedAt:$lastVerifiedAt}' \
         > "${RESIDENTIAL_CONFIG}"
@@ -271,8 +295,35 @@ case "$cmd" in
         reload_services
         ;;
 
+    set-domains)
+        [[ -z "${2:-}" ]] && { err "用法: $0 set-domains <json_array>"; exit 1; }
+        echo "$2" | jq 'if type == "array" then . else error("not an array") end' >/dev/null 2>&1 \
+            || { err "参数必须是 JSON 数组，如 [\"openai.com\",\"google.com\"]"; exit 1; }
+
+        if [[ -f "${RESIDENTIAL_CONFIG}" ]]; then
+            jq --argjson domains "$2" '.domains = $domains' \
+               "${RESIDENTIAL_CONFIG}" > "${RESIDENTIAL_CONFIG}.tmp" \
+            && mv "${RESIDENTIAL_CONFIG}.tmp" "${RESIDENTIAL_CONFIG}"
+        else
+            jq -n --argjson domains "$2" '{enabled:false,domains:$domains}' \
+               > "${RESIDENTIAL_CONFIG}"
+            chmod 600 "${RESIDENTIAL_CONFIG}"
+        fi
+
+        local_enabled=$(jq -r '.enabled // false' "${RESIDENTIAL_CONFIG}" 2>/dev/null || echo "false")
+        if [[ "$local_enabled" == "true" ]]; then
+            RESI_HOST=$(jq -r '.host'     "${RESIDENTIAL_CONFIG}")
+            RESI_PORT=$(jq -r '.port'     "${RESIDENTIAL_CONFIG}")
+            RESI_USER=$(jq -r '.username' "${RESIDENTIAL_CONFIG}")
+            RESI_PASS=$(jq -r '.password' "${RESIDENTIAL_CONFIG}")
+            apply_xray "$RESI_HOST" "$RESI_PORT" "$RESI_USER" "$RESI_PASS"
+            apply_hysteria "$RESI_HOST" "$RESI_PORT" "$RESI_USER" "$RESI_PASS"
+            reload_services
+        fi
+        ;;
+
     *)
-        echo "Usage: $0 {enable <url>|disable|status|reapply}" >&2
+        echo "Usage: $0 {enable <url>|disable|status|reapply|set-domains <json>}" >&2
         exit 1
         ;;
 esac
