@@ -1849,6 +1849,124 @@ list_configs() {
     return 0
 }
 
+_switch_to_profile() {
+    local selected="$1"
+    local config_dir="${CONFIGS_DIR}/${selected}"
+    local meta_file="${config_dir}/meta.json"
+    local uri_file="${config_dir}/uri.txt"
+
+    if [[ ! -d "$config_dir" ]]; then
+        tui_error "节点 '$selected' 不存在"
+        return 3
+    fi
+
+    if [[ ! -f "$uri_file" ]]; then
+        tui_error "配置损坏：缺少 uri.txt"
+        return 1
+    fi
+
+    local protocol
+    protocol=$(grep '"protocol"' "$meta_file" 2>/dev/null | cut -d'"' -f4)
+    local uri
+    uri=$(cat "$uri_file")
+
+    # 读取端口（三级回退：meta.json → config.yaml → 默认值）
+    local stored_socks stored_http
+    stored_socks=$(grep '"socks_port"' "$meta_file" 2>/dev/null | grep -o '[0-9]*' | head -1)
+    stored_http=$(grep '"http_port"'  "$meta_file" 2>/dev/null | grep -o '[0-9]*' | head -1)
+    if [[ -z "$stored_socks" ]] && [[ -f "${config_dir}/config.yaml" ]]; then
+        stored_socks=$(grep -A1 '^socks5:' "${config_dir}/config.yaml" | grep 'listen:' | sed 's/.*://')
+    fi
+    if [[ -z "$stored_http" ]] && [[ -f "${config_dir}/config.yaml" ]]; then
+        stored_http=$(grep -A1 '^http:' "${config_dir}/config.yaml" | grep 'listen:' | sed 's/.*://')
+    fi
+    SOCKS_PORT="${stored_socks:-1080}"
+    HTTP_PORT="${stored_http:-8080}"
+
+    # 记录 TUN 状态
+    local tun_was_active=false
+    systemctl is-active --quiet bui-tun 2>/dev/null && tun_was_active=true
+    [[ "$tun_was_active" == "true" ]] && tui_info "检测到 TUN 运行中，切换后自动重启..."
+
+    # 停止 TUN
+    [[ "$tun_was_active" == "true" ]] && tui_spin "停止 TUN 模式..." stop_tun_mode
+
+    # 停止客户端服务
+    tui_spin "停止当前服务..." bash -c "
+        systemctl stop '$CLIENT_SERVICE' 2>/dev/null || true
+        systemctl stop xray-client 2>/dev/null || true
+    "
+
+    # 解析 URI
+    local parsed=""
+    if [[ "$uri" =~ ^(hysteria2|hy2):// ]]; then
+        parsed=$(parse_hysteria_uri "$uri")
+    elif [[ "$uri" =~ ^vless:// ]]; then
+        parsed=$(parse_vless_uri "$uri")
+    else
+        tui_error "不支持的 URI 格式"
+        return 1
+    fi
+    safe_import_parsed "$parsed"
+    SOCKS_PORT="${stored_socks:-1080}"
+    HTTP_PORT="${stored_http:-8080}"
+
+    # 生成配置并启动
+    if [[ "$protocol" == "hysteria2" ]]; then
+        tui_spin "生成 Hysteria2 配置..." generate_config
+        cp "$CONFIG_FILE" "${config_dir}/config.yaml"
+        tui_spin "启动 Hysteria2 服务..." bash -c "
+            create_service
+            systemctl start '$CLIENT_SERVICE'
+        "
+    else
+        tui_spin "生成 Xray 配置..." _write_xray_json
+        if [[ ! -f /etc/systemd/system/xray-client.service ]]; then
+            local xray_cfg="${BASE_DIR}/xray-config.json"
+            printf '%s\n' \
+                '[Unit]' \
+                'Description=Xray Client' \
+                'After=network.target' \
+                '' \
+                '[Service]' \
+                'Type=simple' \
+                "ExecStart=/usr/local/bin/xray run -config ${xray_cfg}" \
+                'Restart=always' \
+                'RestartSec=5' \
+                '' \
+                '[Install]' \
+                'WantedBy=multi-user.target' \
+                > /etc/systemd/system/xray-client.service
+            systemctl daemon-reload
+            systemctl enable xray-client 2>/dev/null || true
+        fi
+        cp "${BASE_DIR}/xray-config.json" "${config_dir}/xray-config.json"
+        tui_spin "启动 Xray 服务..." systemctl start xray-client
+    fi
+
+    echo "$selected" > "$ACTIVE_CONFIG"
+
+    # 重新生成 TUN 配置
+    local tun_protocol="${protocol:-hysteria2}"
+    [[ "$tun_protocol" != "hysteria2" ]] && tun_protocol="vless-reality"
+    tui_spin "重新生成 TUN 配置..." generate_singbox_tun_config "$tun_protocol"
+
+    [[ "$tun_was_active" == "true" ]] && tui_spin "重启 TUN 模式..." start_tun_mode
+
+    tui_success "已切换到: $selected"
+
+    if [[ "$tun_was_active" != "true" ]] && [[ "$OPT_JSON" != "true" ]]; then
+        local proxy_ip
+        proxy_ip=$(curl -s --max-time 5 --socks5 "127.0.0.1:${SOCKS_PORT}" \
+            "https://api.ipify.org" 2>/dev/null)
+        if [[ -n "$proxy_ip" ]] && [[ "$proxy_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            tui_success "代理 IP: ${proxy_ip}"
+        fi
+    fi
+
+    return 0
+}
+
 switch_config() {
     echo ""
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
@@ -1877,123 +1995,7 @@ switch_config() {
     fi
 
     local selected="${configs[$((choice-1))]}"
-    local config_dir="${CONFIGS_DIR}/${selected}"
-    local meta_file="${config_dir}/meta.json"
-    local uri_file="${config_dir}/uri.txt"
-
-    print_info "切换到配置: $selected"
-
-    # uri.txt 是重新生成配置的依据，必须存在
-    if [[ ! -f "$uri_file" ]]; then
-        print_error "配置损坏：缺少原始链接文件 (uri.txt)"
-        return 1
-    fi
-
-    local protocol=$(grep '"protocol"' "$meta_file" 2>/dev/null | cut -d'"' -f4)
-    local uri=$(cat "$uri_file")
-
-    # 从 meta.json 读取端口，回退到配置文件解析，最终用默认值
-    local stored_socks=$(grep '"socks_port"' "$meta_file" 2>/dev/null | grep -o '[0-9]*' | head -1)
-    local stored_http=$(grep '"http_port"'  "$meta_file" 2>/dev/null | grep -o '[0-9]*' | head -1)
-    if [[ -z "$stored_socks" ]] && [[ -f "${config_dir}/config.yaml" ]]; then
-        stored_socks=$(grep -A1 '^socks5:' "${config_dir}/config.yaml" | grep 'listen:' | sed 's/.*://')
-    fi
-    if [[ -z "$stored_http" ]] && [[ -f "${config_dir}/config.yaml" ]]; then
-        stored_http=$(grep -A1 '^http:' "${config_dir}/config.yaml" | grep 'listen:' | sed 's/.*://')
-    fi
-    if [[ -z "$stored_socks" ]] && [[ -f "${config_dir}/xray-config.json" ]]; then
-        stored_socks=$(grep -o '"port": [0-9]*' "${config_dir}/xray-config.json" | head -1 | grep -o '[0-9]*')
-    fi
-    SOCKS_PORT="${stored_socks:-1080}"
-    HTTP_PORT="${stored_http:-8080}"
-
-    # 记录 TUN 状态
-    local tun_was_active=false
-    if systemctl is-active --quiet bui-tun 2>/dev/null; then
-        tun_was_active=true
-        print_info "检测到 TUN 模式运行中，将在切换后自动重启..."
-    fi
-
-    # 停止 TUN（完整清理）
-    [[ "$tun_was_active" == "true" ]] && stop_tun_mode
-
-    # 停止当前客户端服务
-    systemctl stop "$CLIENT_SERVICE" 2>/dev/null || true
-    systemctl stop xray-client 2>/dev/null || true
-
-    # 解析 URI → 设置全局变量 (PROTOCOL, SERVER_ADDR, AUTH_PASSWORD, UUID 等)
-    local parsed=""
-    if [[ "$uri" =~ ^(hysteria2|hy2):// ]]; then
-        parsed=$(parse_hysteria_uri "$uri")
-    elif [[ "$uri" =~ ^vless:// ]]; then
-        parsed=$(parse_vless_uri "$uri")
-    else
-        print_error "配置中包含不支持的 URI 格式"
-        return 1
-    fi
-    safe_import_parsed "$parsed"
-    # safe_import_parsed 不覆盖 SOCKS_PORT/HTTP_PORT，重新赋值确保正确
-    SOCKS_PORT="${stored_socks:-1080}"
-    HTTP_PORT="${stored_http:-8080}"
-
-    # 重新生成配置并启动对应服务
-    if [[ "$protocol" == "hysteria2" ]]; then
-        generate_config
-        cp "$CONFIG_FILE" "${config_dir}/config.yaml"
-        create_service
-        systemctl start "$CLIENT_SERVICE"
-    else
-        _write_xray_json
-        # 确保 xray-client 服务文件存在
-        if [[ ! -f /etc/systemd/system/xray-client.service ]]; then
-            local xray_config="${BASE_DIR}/xray-config.json"
-            cat > /etc/systemd/system/xray-client.service << EOF
-[Unit]
-Description=Xray Client
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/xray run -config ${xray_config}
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-            systemctl daemon-reload
-            systemctl enable xray-client 2>/dev/null || true
-        fi
-        cp "${BASE_DIR}/xray-config.json" "${config_dir}/xray-config.json"
-        systemctl start xray-client
-    fi
-
-    # 更新激活配置
-    echo "$selected" > "$ACTIVE_CONFIG"
-
-    # 重新生成 TUN 配置（保证下次启动或立即重启时使用新节点）
-    print_info "重新生成 TUN 配置..."
-    if [[ "$protocol" == "hysteria2" ]]; then
-        generate_singbox_tun_config "hysteria2"
-    else
-        generate_singbox_tun_config "vless-reality"
-    fi
-
-    # 如果 TUN 之前在运行，重新启动
-    [[ "$tun_was_active" == "true" ]] && start_tun_mode
-
-    print_success "已切换到: $selected"
-
-    if [[ "$tun_was_active" != "true" ]]; then
-        echo ""
-        echo -e "${CYAN}[代理网络检测]${NC}"
-        local proxy_ip=$(curl -s --max-time 5 --socks5 127.0.0.1:${SOCKS_PORT} "https://api.ipify.org" 2>/dev/null)
-        if [[ -n "$proxy_ip" ]] && [[ "$proxy_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo -e "  ${GREEN}✓${NC} 代理 IP: ${GREEN}${proxy_ip}${NC}"
-        else
-            echo -e "  ${YELLOW}○${NC} 代理未就绪或无法获取 IP"
-        fi
-    fi
+    _switch_to_profile "$selected"
 }
 
 delete_config() {
