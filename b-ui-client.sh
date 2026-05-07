@@ -117,6 +117,132 @@ VERSION_JSON_RAW_URL="https://raw.githubusercontent.com/Buxiulei/b-ui/main/versi
 UPDATE_AVAILABLE=""
 REMOTE_VERSION=""
 
+#===============================================================================
+# TUI 工具检测 & Helpers
+#===============================================================================
+
+TUI_AVAILABLE=false
+command -v gum &>/dev/null && command -v fzf &>/dev/null && TUI_AVAILABLE=true
+
+# 全局 flags（由 parse_global_flags 设置）
+OPT_YES=false
+OPT_JSON=false
+OPT_QUIET=false
+
+parse_global_flags() {
+    for arg in "$@"; do
+        case "$arg" in
+            -y|--yes)    OPT_YES=true ;;
+            --json)      OPT_JSON=true ;;
+            --quiet|-q)  OPT_QUIET=true ;;
+        esac
+    done
+}
+
+# 输出（受 --quiet 控制）
+tui_info() {
+    [[ "$OPT_QUIET" == "true" ]] && return 0
+    [[ "$TUI_AVAILABLE" == "true" ]] \
+        && gum style --foreground 39 "  $*" \
+        || echo -e "  ${CYAN}$*${NC}"
+}
+
+tui_success() {
+    [[ "$OPT_QUIET" == "true" ]] && return 0
+    [[ "$TUI_AVAILABLE" == "true" ]] \
+        && gum style --foreground 46 "✓ $*" \
+        || echo -e "  ${GREEN}✓ $*${NC}"
+}
+
+tui_error() {
+    [[ "$TUI_AVAILABLE" == "true" ]] \
+        && gum style --foreground 196 "✗ $*" >&2 \
+        || echo -e "  ${RED}✗ $*${NC}" >&2
+}
+
+# gum spin 封装：tui_spin "标题" cmd args...
+tui_spin() {
+    local title="$1"; shift
+    if [[ "$TUI_AVAILABLE" == "true" ]]; then
+        gum spin --spinner dot --title "$title" -- "$@"
+    else
+        tui_info "$title"
+        "$@"
+    fi
+}
+
+# gum confirm 封装：-y flag 时直接返回 0
+tui_confirm() {
+    local prompt="$1"
+    if [[ "$OPT_YES" == "true" ]]; then return 0; fi
+    if [[ "$TUI_AVAILABLE" == "true" ]]; then
+        gum confirm "$prompt"
+    else
+        local ans
+        read -p "${prompt} (y/n): " ans
+        [[ "$ans" =~ ^[yY]$ ]]
+    fi
+}
+
+# gum choose 封装（箭头键菜单）：首个参数为 header，其余为选项
+# 返回：用户选中的字符串（echoed）
+tui_menu() {
+    local header="$1"; shift
+    if [[ "$TUI_AVAILABLE" == "true" ]]; then
+        gum choose --header "$header" "$@"
+    else
+        local i=1
+        echo "$header"
+        for opt in "$@"; do
+            echo "  $i. $opt"
+            ((i++))
+        done
+        local choice
+        read -p "选择 (1-$((i-1))): " choice
+        local opts=("$@")
+        echo "${opts[$((choice-1))]}"
+    fi
+}
+
+# fzf 节点选择封装
+# 用法：printf '%s\n' "${lines[@]}" | tui_filter "提示"
+# 返回：选中行
+tui_filter() {
+    local prompt="${1:-搜索...}"
+    if [[ "$TUI_AVAILABLE" == "true" ]]; then
+        fzf --prompt "$prompt " --mouse --height 50% --border rounded \
+            --info inline --layout reverse
+    else
+        local lines=()
+        while IFS= read -r line; do lines+=("$line"); done
+        local i=1
+        for line in "${lines[@]}"; do
+            echo "  $i. $line"
+            ((i++))
+        done
+        local choice
+        read -p "选择 (1-$((i-1))): " choice
+        echo "${lines[$((choice-1))]}"
+    fi
+}
+
+# gum write 封装（多行输入）
+tui_write() {
+    local placeholder="${1:-请输入...}"
+    if [[ "$TUI_AVAILABLE" == "true" ]]; then
+        gum write --placeholder "$placeholder" --char-limit 0 \
+            --width 70 --height 8
+    else
+        echo "请粘贴内容，输入空行结束："
+        local lines=()
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && break
+            lines+=("$line")
+        done
+        printf '%s\n' "${lines[@]}"
+    fi
+}
+
 # 检查客户端更新
 # 同时检测所有源，比较版本号，使用最新的那个
 check_client_update() {
@@ -957,30 +1083,11 @@ install_all_cores() {
 }
 
 
-generate_xray_config() {
+_write_xray_json() {
     local xray_config="${BASE_DIR}/xray-config.json"
     local server_host=$(echo "$SERVER_ADDR" | cut -d':' -f1)
     local server_port=$(echo "$SERVER_ADDR" | cut -d':' -f2 | tr -cd '0-9')
-    
-    # 检测端口占用情况
-    check_and_suggest_ports 1080 8080
-    
-    # SOCKS5 端口
-    read -p "SOCKS5 端口 [默认 ${SUGGESTED_SOCKS_PORT}]: " SOCKS_PORT
-    SOCKS_PORT=${SOCKS_PORT:-$SUGGESTED_SOCKS_PORT}
-    
-    if is_port_in_use "$SOCKS_PORT"; then
-        print_warning "端口 $SOCKS_PORT 已被占用，可能会冲突！"
-    fi
-    
-    # HTTP 端口
-    read -p "HTTP 端口 [默认 ${SUGGESTED_HTTP_PORT}]: " HTTP_PORT
-    HTTP_PORT=${HTTP_PORT:-$SUGGESTED_HTTP_PORT}
-    
-    if is_port_in_use "$HTTP_PORT"; then
-        print_warning "端口 $HTTP_PORT 已被占用，可能会冲突！"
-    fi
-    
+
     cat > "$xray_config" << EOF
 {
   "log": {"loglevel": "warning"},
@@ -1028,7 +1135,29 @@ generate_xray_config() {
 EOF
     chmod 644 "$xray_config"
     print_success "Xray 配置已生成: $xray_config"
-    
+}
+
+generate_xray_config() {
+    # 检测端口占用情况
+    check_and_suggest_ports 1080 8080
+
+    read -p "SOCKS5 端口 [默认 ${SUGGESTED_SOCKS_PORT}]: " SOCKS_PORT
+    SOCKS_PORT=${SOCKS_PORT:-$SUGGESTED_SOCKS_PORT}
+
+    if is_port_in_use "$SOCKS_PORT"; then
+        print_warning "端口 $SOCKS_PORT 已被占用，可能会冲突！"
+    fi
+
+    read -p "HTTP 端口 [默认 ${SUGGESTED_HTTP_PORT}]: " HTTP_PORT
+    HTTP_PORT=${HTTP_PORT:-$SUGGESTED_HTTP_PORT}
+
+    if is_port_in_use "$HTTP_PORT"; then
+        print_warning "端口 $HTTP_PORT 已被占用，可能会冲突！"
+    fi
+
+    _write_xray_json
+
+    local xray_config="${BASE_DIR}/xray-config.json"
     # 创建 Xray 客户端服务
     cat > /etc/systemd/system/xray-client.service << EOF
 [Unit]
@@ -1047,7 +1176,7 @@ EOF
     systemctl daemon-reload
     systemctl enable xray-client 2>/dev/null || true
     systemctl start xray-client
-    
+
     echo ""
     print_success "Xray 客户端已启动"
     echo -e "  SOCKS5: ${GREEN}127.0.0.1:${SOCKS_PORT}${NC}"
@@ -1639,37 +1768,29 @@ get_active_config() {
 }
 
 save_config_meta() {
-    # 保存配置元信息
     local config_name="$1"
     local protocol="$2"
     local server="$3"
     local uri="$4"
-    
+    local socks_port="${5:-1080}"
+    local http_port="${6:-8080}"
+
     local config_dir="${CONFIGS_DIR}/${config_name}"
     mkdir -p "$config_dir"
-    
-    # 保存元信息
+
     cat > "${config_dir}/meta.json" << EOF
 {
     "name": "${config_name}",
     "protocol": "${protocol}",
     "server": "${server}",
+    "socks_port": ${socks_port},
+    "http_port": ${http_port},
     "createdAt": "$(date -Iseconds)"
 }
 EOF
-    
-    # 保存原始 URI
+
     echo "$uri" > "${config_dir}/uri.txt"
-    
-    # 将当前配置文件拷贝到 profile 目录（供 switch_config 使用）
-    if [[ "$protocol" == "hysteria2" ]] && [[ -f "$CONFIG_FILE" ]]; then
-        cp "$CONFIG_FILE" "${config_dir}/config.yaml"
-    elif [[ -f "${BASE_DIR}/xray-config.json" ]]; then
-        cp "${BASE_DIR}/xray-config.json" "${config_dir}/xray-config.json"
-    fi
-    
-    # 保存服务端地址 (用于从服务端下载安装包)
-    # 提取服务器域名/IP (去掉端口)
+
     local server_host=$(echo "$server" | cut -d':' -f1)
     if [[ -n "$server_host" ]]; then
         set_server_address "$server_host"
@@ -1722,121 +1843,140 @@ switch_config() {
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
     echo -e "${GREEN}切换配置${NC}"
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
-    
+
     if ! list_configs; then
         return 1
     fi
-    
-    # 获取配置列表
+
     local configs=()
     for config_dir in "$CONFIGS_DIR"/*/; do
         [[ -d "$config_dir" ]] && configs+=("$(basename "$config_dir")")
     done
-    
+
     echo ""
     read -p "选择配置编号 (0 返回): " choice
-    
+
     if [[ "$choice" == "0" ]] || [[ -z "$choice" ]]; then
         return 0
     fi
-    
+
     if [[ ! "$choice" =~ ^[0-9]+$ ]] || [[ "$choice" -lt 1 ]] || [[ "$choice" -gt ${#configs[@]} ]]; then
         print_error "无效选择"
         return 1
     fi
-    
+
     local selected="${configs[$((choice-1))]}"
     local config_dir="${CONFIGS_DIR}/${selected}"
-    
-    print_info "切换到配置: $selected"
-    
-    # 读取配置信息
     local meta_file="${config_dir}/meta.json"
+    local uri_file="${config_dir}/uri.txt"
+
+    print_info "切换到配置: $selected"
+
+    # uri.txt 是重新生成配置的依据，必须存在
+    if [[ ! -f "$uri_file" ]]; then
+        print_error "配置损坏：缺少原始链接文件 (uri.txt)"
+        return 1
+    fi
+
     local protocol=$(grep '"protocol"' "$meta_file" 2>/dev/null | cut -d'"' -f4)
-    
-    # 记录 TUN 模式状态
+    local uri=$(cat "$uri_file")
+
+    # 从 meta.json 读取端口，回退到配置文件解析，最终用默认值
+    local stored_socks=$(grep '"socks_port"' "$meta_file" 2>/dev/null | grep -o '[0-9]*' | head -1)
+    local stored_http=$(grep '"http_port"'  "$meta_file" 2>/dev/null | grep -o '[0-9]*' | head -1)
+    if [[ -z "$stored_socks" ]] && [[ -f "${config_dir}/config.yaml" ]]; then
+        stored_socks=$(grep -A1 '^socks5:' "${config_dir}/config.yaml" | grep 'listen:' | sed 's/.*://')
+    fi
+    if [[ -z "$stored_http" ]] && [[ -f "${config_dir}/config.yaml" ]]; then
+        stored_http=$(grep -A1 '^http:' "${config_dir}/config.yaml" | grep 'listen:' | sed 's/.*://')
+    fi
+    if [[ -z "$stored_socks" ]] && [[ -f "${config_dir}/xray-config.json" ]]; then
+        stored_socks=$(grep -o '"port": [0-9]*' "${config_dir}/xray-config.json" | head -1 | grep -o '[0-9]*')
+    fi
+    SOCKS_PORT="${stored_socks:-1080}"
+    HTTP_PORT="${stored_http:-8080}"
+
+    # 记录 TUN 状态
     local tun_was_active=false
     if systemctl is-active --quiet bui-tun 2>/dev/null; then
         tun_was_active=true
         print_info "检测到 TUN 模式运行中，将在切换后自动重启..."
     fi
-    
-    # 停止 TUN 模式（调用完整清理流程，确保 disable 防止自动重启）
-    if [[ "$tun_was_active" == "true" ]]; then
-        stop_tun_mode
-    fi
-    
-    # 停止其他服务
+
+    # 停止 TUN（完整清理）
+    [[ "$tun_was_active" == "true" ]] && stop_tun_mode
+
+    # 停止当前客户端服务
     systemctl stop "$CLIENT_SERVICE" 2>/dev/null || true
     systemctl stop xray-client 2>/dev/null || true
-    
-    if [[ "$protocol" == "hysteria2" ]]; then
-        # 复制 Hysteria2 配置
-        if [[ -f "${config_dir}/config.yaml" ]]; then
-            cp "${config_dir}/config.yaml" "$CONFIG_FILE"
-            create_service
-            systemctl start "$CLIENT_SERVICE"
-        else
-            print_error "配置文件不存在"
-            return 1
-        fi
+
+    # 解析 URI → 设置全局变量 (PROTOCOL, SERVER_ADDR, AUTH_PASSWORD, UUID 等)
+    local parsed=""
+    if [[ "$uri" =~ ^(hysteria2|hy2):// ]]; then
+        parsed=$(parse_hysteria_uri "$uri")
+    elif [[ "$uri" =~ ^vless:// ]]; then
+        parsed=$(parse_vless_uri "$uri")
     else
-        # 复制 Xray 配置
-        if [[ -f "${config_dir}/xray-config.json" ]]; then
-            cp "${config_dir}/xray-config.json" "${BASE_DIR}/xray-config.json"
-            systemctl start xray-client
-        else
-            print_error "配置文件不存在"
-            return 1
-        fi
+        print_error "配置中包含不支持的 URI 格式"
+        return 1
     fi
-    
+    safe_import_parsed "$parsed"
+    # safe_import_parsed 不覆盖 SOCKS_PORT/HTTP_PORT，重新赋值确保正确
+    SOCKS_PORT="${stored_socks:-1080}"
+    HTTP_PORT="${stored_http:-8080}"
+
+    # 重新生成配置并启动对应服务
+    if [[ "$protocol" == "hysteria2" ]]; then
+        generate_config
+        cp "$CONFIG_FILE" "${config_dir}/config.yaml"
+        create_service
+        systemctl start "$CLIENT_SERVICE"
+    else
+        _write_xray_json
+        # 确保 xray-client 服务文件存在
+        if [[ ! -f /etc/systemd/system/xray-client.service ]]; then
+            local xray_config="${BASE_DIR}/xray-config.json"
+            cat > /etc/systemd/system/xray-client.service << EOF
+[Unit]
+Description=Xray Client
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/xray run -config ${xray_config}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+            systemctl daemon-reload
+            systemctl enable xray-client 2>/dev/null || true
+        fi
+        cp "${BASE_DIR}/xray-config.json" "${config_dir}/xray-config.json"
+        systemctl start xray-client
+    fi
+
     # 更新激活配置
     echo "$selected" > "$ACTIVE_CONFIG"
-    
-    # 始终重新生成 TUN 配置文件 (不管 TUN 是否在运行，确保下次启动时使用新配置)
+
+    # 重新生成 TUN 配置（保证下次启动或立即重启时使用新节点）
     print_info "重新生成 TUN 配置..."
     if [[ "$protocol" == "hysteria2" ]]; then
-        SERVER_ADDR=$(grep "^server:" "$CONFIG_FILE" | awk '{print $2}')
-        AUTH_PASSWORD=$(grep "^auth:" "$CONFIG_FILE" | awk '{print $2}')
-        local sni=$(grep -A2 "^tls:" "$CONFIG_FILE" | grep "sni:" | awk '{print $2}')
-        SNI="${sni:-$(echo $SERVER_ADDR | cut -d':' -f1)}"
-        INSECURE=$(grep -A2 "^tls:" "$CONFIG_FILE" | grep "insecure:" | awk '{print $2}')
-        INSECURE=${INSECURE:-false}
-        SOCKS_PORT=$(grep -A1 "^socks5:" "$CONFIG_FILE" | grep "listen:" | sed 's/.*://')
-        HTTP_PORT=$(grep -A1 "^http:" "$CONFIG_FILE" | grep "listen:" | sed 's/.*://')
-        SOCKS_PORT=${SOCKS_PORT:-1080}
-        HTTP_PORT=${HTTP_PORT:-8080}
         generate_singbox_tun_config "hysteria2"
     else
-        local xray_config="${BASE_DIR}/xray-config.json"
-        SERVER_ADDR=$(grep -o '"address": "[^"]*"' "$xray_config" | head -1 | cut -d'"' -f4)
-        local port=$(grep -o '"port": [0-9]*' "$xray_config" | grep -v 'listen' | head -1 | grep -o '[0-9]*')
-        SERVER_ADDR="${SERVER_ADDR}:${port}"
-        UUID=$(grep -o '"id": "[^"]*"' "$xray_config" | head -1 | cut -d'"' -f4)
-        FLOW=$(grep -o '"flow": "[^"]*"' "$xray_config" | head -1 | cut -d'"' -f4)
-        SNI=$(grep -o '"serverName": "[^"]*"' "$xray_config" | head -1 | cut -d'"' -f4)
-        FINGERPRINT=$(grep -o '"fingerprint": "[^"]*"' "$xray_config" | head -1 | cut -d'"' -f4)
-        PUBLIC_KEY=$(grep -o '"publicKey": "[^"]*"' "$xray_config" | head -1 | cut -d'"' -f4)
-        SHORT_ID=$(grep -o '"shortId": "[^"]*"' "$xray_config" | head -1 | cut -d'"' -f4)
-        SOCKS_PORT=${SOCKS_PORT:-1080}
-        HTTP_PORT=${HTTP_PORT:-8080}
         generate_singbox_tun_config "vless-reality"
     fi
-    
-    # 如果之前 TUN 模式是激活的，重新启动 TUN
-    if [[ "$tun_was_active" == "true" ]]; then
-        start_tun_mode
-    fi
-    
+
+    # 如果 TUN 之前在运行，重新启动
+    [[ "$tun_was_active" == "true" ]] && start_tun_mode
+
     print_success "已切换到: $selected"
-    
-    # 如果 TUN 模式未激活，也检测一下当前网络状态（通过代理）
+
     if [[ "$tun_was_active" != "true" ]]; then
-        # 使用本地代理检测 IP
         echo ""
         echo -e "${CYAN}[代理网络检测]${NC}"
-        local proxy_ip=$(curl -s --max-time 5 --socks5 127.0.0.1:${SOCKS_PORT:-1080} "https://api.ipify.org" 2>/dev/null)
+        local proxy_ip=$(curl -s --max-time 5 --socks5 127.0.0.1:${SOCKS_PORT} "https://api.ipify.org" 2>/dev/null)
         if [[ -n "$proxy_ip" ]] && [[ "$proxy_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo -e "  ${GREEN}✓${NC} 代理 IP: ${GREEN}${proxy_ip}${NC}"
         else
@@ -1962,13 +2102,13 @@ import_batch() {
             continue
         fi
         
-        # 保存配置元信息
-        save_config_meta "$config_name" "$protocol" "$SERVER_ADDR" "$uri"
-        
+        # 保存配置元信息（批量导入使用默认端口，激活时可调整）
+        save_config_meta "$config_name" "$protocol" "$SERVER_ADDR" "$uri" 1080 8080
+
         echo -e "  ${GREEN}✓${NC} ${config_name} (${protocol})"
         ((success_count++))
     done
-    
+
     echo ""
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
     echo -e "导入完成: ${GREEN}成功 ${success_count}${NC} / ${RED}失败 ${fail_count}${NC}"
@@ -2097,9 +2237,12 @@ _configure_and_save() {
         fi
     fi
     
+    # 更新 meta.json 中的端口信息（端口在上面两个分支中已确定）
+    save_config_meta "$config_name" "$PROTOCOL" "$SERVER_ADDR" "$uri" "${SOCKS_PORT:-1080}" "${HTTP_PORT:-8080}"
+
     # 更新激活配置
     echo "$config_name" > "$ACTIVE_CONFIG"
-    
+
     print_success "配置 '$config_name' 已启用"
 }
 
@@ -2330,63 +2473,62 @@ import_from_uri() {
     local config_dir="${CONFIGS_DIR}/${config_name}"
     mkdir -p "$BASE_DIR"
     mkdir -p "$config_dir"
-    
-    # 保存配置元信息和原始 URI
-    save_config_meta "$config_name" "$PROTOCOL" "$SERVER_ADDR" "$uri"
-    
+
     if [[ "$PROTOCOL" == "hysteria2" ]]; then
         # Hysteria2 配置 - 检测端口占用情况
         check_and_suggest_ports 1080 8080
-        
+
         read -p "SOCKS5 端口 [默认 ${SUGGESTED_SOCKS_PORT}]: " SOCKS_PORT
         SOCKS_PORT=${SOCKS_PORT:-$SUGGESTED_SOCKS_PORT}
-        
-        # 验证用户输入的端口
+
         if is_port_in_use "$SOCKS_PORT"; then
             print_warning "端口 $SOCKS_PORT 已被占用，可能会冲突！"
         fi
-        
+
         read -p "HTTP 端口 [默认 ${SUGGESTED_HTTP_PORT}]: " HTTP_PORT
         HTTP_PORT=${HTTP_PORT:-$SUGGESTED_HTTP_PORT}
-        
+
         if is_port_in_use "$HTTP_PORT"; then
             print_warning "端口 $HTTP_PORT 已被占用，可能会冲突！"
         fi
-        
+
         read -p "启用 TUN 模式 (全局代理)? (y/n) [默认 n]: " enable_tun
         TUN_ENABLED="false"
         [[ "$enable_tun" =~ ^[yY]$ ]] && TUN_ENABLED="true"
-        
+
         # 带宽设置
         echo ""
         echo -e "${YELLOW}[带宽设置]${NC} (可选，直接回车跳过)"
         print_info "提示: 设置带宽可以优化连接，但设置过高会导致性能下降"
         read -p "上行带宽 (Mbps) [直接回车跳过]: " BANDWIDTH_UP
         read -p "下行带宽 (Mbps) [直接回车跳过]: " BANDWIDTH_DOWN
-        
+
         # 安装 Hysteria2 (如果未安装)
         install_hysteria
-        
+
         create_default_rules
         generate_config
-        
+
         # 复制配置到配置目录
         cp "$CONFIG_FILE" "${config_dir}/config.yaml"
-        
+
         create_service
         systemctl start "$CLIENT_SERVICE" 2>/dev/null || true
     else
-        # VLESS-Reality 配置 (需要 Xray)
+        # VLESS-Reality 配置 (需要 Xray，generate_xray_config 内部会设置 SOCKS_PORT/HTTP_PORT)
         install_xray_client
         generate_xray_config
-        
+
         # 复制配置到配置目录
         cp "${BASE_DIR}/xray-config.json" "${config_dir}/xray-config.json"
     fi
-    
+
+    # 保存配置元信息（端口已在上面两个分支中确定）
+    save_config_meta "$config_name" "$PROTOCOL" "$SERVER_ADDR" "$uri" "${SOCKS_PORT:-1080}" "${HTTP_PORT:-8080}"
+
     # 更新当前激活配置
     echo "$config_name" > "$ACTIVE_CONFIG"
-    
+
     print_success "配置 '$config_name' 已导入并生成"
 }
 
@@ -3540,13 +3682,13 @@ import_node() {
             continue
         fi
         
-        # 保存配置元信息和原始 URI
-        save_config_meta "$config_name" "$protocol" "$SERVER_ADDR" "$uri"
-        
+        # 保存配置元信息和原始 URI（批量导入使用默认端口，激活时可调整）
+        save_config_meta "$config_name" "$protocol" "$SERVER_ADDR" "$uri" 1080 8080
+
         echo -e "  ${GREEN}✓${NC} ${config_name} (${protocol})"
         ((success_count++))
     done
-    
+
     echo ""
     echo -e "导入完成: ${GREEN}${success_count} 成功${NC}  ${RED}${fail_count} 失败${NC}"
     
