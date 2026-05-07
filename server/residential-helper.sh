@@ -137,21 +137,24 @@ ensure_singbox() {
 
 # ---------------------------------------------------------------------------
 # sing-box 配置：住宅代理模式（按域名关键词分流 + DNS 路由）
+# sing-box 统一负责所有路由和 DNS 决策
 # ---------------------------------------------------------------------------
 write_singbox_config_residential() {
     local host="$1" port="$2" user="$3" pass="$4"
 
+    get_server_ip
     get_domains
     local kw_json
     kw_json=$(printf '%s\n' "${DOMAINS[@]}" | jq -R . | jq -s '.')
 
     jq -n \
-        --arg  host      "$host" \
-        --argjson port   "$port" \
-        --arg  user      "$user" \
-        --arg  pass      "$pass" \
+        --arg  host       "$host" \
+        --argjson port    "$port" \
+        --arg  user       "$user" \
+        --arg  pass       "$pass" \
         --argjson relay_port "$SINGBOX_RELAY_PORT" \
-        --argjson kw     "$kw_json" \
+        --argjson kw      "$kw_json" \
+        --arg  server_ip  "${_SERVER_IP:-}" \
         '{
           "log": {"level": "error"},
           "dns": {
@@ -186,8 +189,9 @@ write_singbox_config_residential() {
           "route": {
             "rules": [
               {
-                "ip_cidr": ["127.0.0.0/8","10.0.0.0/8","172.16.0.0/12",
-                            "192.168.0.0/16","169.254.0.0/16"],
+                "ip_cidr": (["127.0.0.0/8","10.0.0.0/8","172.16.0.0/12",
+                             "192.168.0.0/16","169.254.0.0/16"] +
+                            (if $server_ip != "" then [($server_ip + "/32")] else [] end)),
                 "outbound": "direct"
               },
               {"domain_keyword": $kw, "outbound": "residential"}
@@ -200,12 +204,27 @@ write_singbox_config_residential() {
 
 # ---------------------------------------------------------------------------
 # sing-box 配置：直连模式（全部直连，无住宅代理）
+# sing-box 统一负责所有路由和 DNS 决策
 # ---------------------------------------------------------------------------
 write_singbox_config_direct() {
+    get_server_ip
+    local ip_direct_json
+    ip_direct_json=$(jq -n --arg ip "${_SERVER_IP:-}" \
+        '["127.0.0.0/8","10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","169.254.0.0/16"] +
+         (if $ip != "" then [($ip + "/32")] else [] end)')
+
     jq -n \
-        --argjson relay_port "$SINGBOX_RELAY_PORT" \
+        --argjson relay_port  "$SINGBOX_RELAY_PORT" \
+        --argjson ip_direct   "$ip_direct_json" \
         '{
           "log": {"level": "error"},
+          "dns": {
+            "servers": [
+              {"tag": "dns_direct", "address": "udp://1.1.1.1", "detour": "direct"}
+            ],
+            "final": "dns_direct",
+            "strategy": "prefer_ipv4"
+          },
           "inbounds": [{
             "type": "socks",
             "tag": "socks-in",
@@ -215,7 +234,12 @@ write_singbox_config_direct() {
             "sniff_override_destination": true
           }],
           "outbounds": [{"type": "direct", "tag": "direct"}],
-          "route": {"final": "direct"}
+          "route": {
+            "rules": [
+              {"ip_cidr": $ip_direct, "outbound": "direct"}
+            ],
+            "final": "direct"
+          }
         }' > "${SINGBOX_CONFIG}"
     chmod 600 "${SINGBOX_CONFIG}"
 }
@@ -260,7 +284,7 @@ stop_relay_service() {
 }
 
 # ---------------------------------------------------------------------------
-# 获取服务器公网 IP（缓存到 _SERVER_IP，供 apply_xray/apply_hysteria 使用）
+# 获取服务器公网 IP（缓存到 _SERVER_IP，供 sing-box 配置使用）
 # ---------------------------------------------------------------------------
 get_server_ip() {
     [[ -n "${_SERVER_IP:-}" ]] && return 0
@@ -269,18 +293,9 @@ get_server_ip() {
 }
 
 # ---------------------------------------------------------------------------
-# Xray 配置：永久指向 sing-box（一次写入，不随住宅代理开关变化）
+# Xray 配置：永久指向 sing-box，路由和 DNS 由 sing-box 统一负责
 # ---------------------------------------------------------------------------
 apply_xray() {
-    get_server_ip
-
-    local ip_direct_json
-    if [[ -n "${_SERVER_IP:-}" ]]; then
-        ip_direct_json=$(jq -n --arg ip "${_SERVER_IP}" '["geoip:private", ($ip + "/32")]')
-    else
-        ip_direct_json='["geoip:private"]'
-    fi
-
     local outbounds
     outbounds=$(jq -n \
         --argjson relay_port "$SINGBOX_RELAY_PORT" \
@@ -290,12 +305,10 @@ apply_xray() {
           {"tag":"direct","protocol":"freedom"}]')
 
     local rules
-    rules=$(jq -n --argjson ip_direct "$ip_direct_json" \
-        '[
-          {"type":"field","inboundTag":["api"],"outboundTag":"api"},
-          {"type":"field","ip":$ip_direct,"outboundTag":"direct"},
-          {"type":"field","outboundTag":"relay","network":"tcp,udp"}
-        ]')
+    rules='[
+      {"type":"field","inboundTag":["api"],"outboundTag":"api"},
+      {"type":"field","outboundTag":"relay","network":"tcp,udp"}
+    ]'
 
     local backup="${XRAY_CONFIG}.bak.$(date +%Y%m%d%H%M%S)"
     cp "${XRAY_CONFIG}" "$backup"
@@ -321,8 +334,6 @@ apply_hysteria() {
     local backup="${config}.bak.$(date +%Y%m%d%H%M%S)"
     cp "$config" "$backup"
 
-    get_server_ip
-
     block_file=$(mktemp)
     {
         printf 'outbounds:\n'
@@ -334,12 +345,6 @@ apply_hysteria() {
         printf '    type: direct\n'
         printf 'acl:\n'
         printf '  inline:\n'
-        printf '    - direct(127.0.0.0/8)\n'
-        printf '    - direct(10.0.0.0/8)\n'
-        printf '    - direct(172.16.0.0/12)\n'
-        printf '    - direct(192.168.0.0/16)\n'
-        printf '    - direct(169.254.0.0/16)\n'
-        [[ -n "${_SERVER_IP:-}" ]] && printf '    - direct(%s)\n' "${_SERVER_IP}"
         printf '    - relay(all)\n'
     } > "$block_file"
 
