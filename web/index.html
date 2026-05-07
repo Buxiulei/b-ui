@@ -242,35 +242,53 @@
     <!-- Residential IP Modal -->
     <div id="m-resi" class="modal">
         <div class="modal-card">
-            <h3><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="vertical-align:-3px;margin-right:6px"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>住宅 IP 出站</h3>
-            <div class="info-box" style="margin-bottom:16px; font-size:13px; color:var(--text-dim)">
-                OpenAI / Google / Claude 流量走住宅 IP，其余流量直出 VPS。
+            <div class="resi-header">
+                <div class="resi-header-icon">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
+                </div>
+                <h3>住宅 IP 出站</h3>
             </div>
-            <div id="resi-status" style="margin-bottom:16px; font-size:13px; padding:10px; border-radius:8px; background:var(--bg-card)">
-                加载中...
+            <div class="resi-desc">OpenAI / Google / Claude 流量走住宅 IP，其余流量直出 VPS。</div>
+            <div id="resi-status" class="resi-status-card">
+                <div class="resi-shimmer-line" style="width:55%"></div>
             </div>
-            <input type="password" id="resi-url" placeholder="socks5://user:pass@host:port"
-                   style="font-family:monospace; margin-bottom:4px">
-            <div style="font-size:12px; color:var(--text-dim); margin-bottom:14px">
-                支持格式: socks5://user:pass@host:port 或 host:port:user:pass
+            <div class="resi-input-wrap">
+                <input type="password" id="resi-url" class="resi-url-input"
+                       placeholder="socks5://user:pass@host:port" autocomplete="new-password">
+                <div class="resi-input-actions">
+                    <button class="resi-icon-btn" id="resi-eye-btn" type="button"
+                            onclick="resiToggleEye()" title="显示/隐藏">
+                        <svg id="resi-eye-open" xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+                        <svg id="resi-eye-closed" xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="display:none"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
+                    </button>
+                    <button class="resi-icon-btn" id="resi-copy-btn" type="button"
+                            onclick="resiCopyUrl(this)" title="复制">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                    </button>
+                </div>
             </div>
-            <details id="resi-domains-details" style="margin-bottom:14px">
-                <summary style="cursor:pointer; font-size:13px; color:var(--text-dim); user-select:none; padding:4px 0; list-style:none">
-                    ▸ 分流域名设置
+            <div class="resi-field-hint">支持格式: socks5://user:pass@host:port 或 host:port:user:pass</div>
+            <div id="resi-error" class="resi-error-box" style="display:none">
+                <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+                <span id="resi-error-text"></span>
+            </div>
+            <details id="resi-domains-details" class="resi-domains-details">
+                <summary class="resi-domains-summary">
+                    <svg class="resi-chevron" xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+                    <span>分流域名设置</span>
+                    <span id="resi-domains-count" class="resi-count-badge"></span>
                 </summary>
-                <div style="margin-top:8px">
-                    <textarea id="resi-domains" rows="7"
-                        style="font-family:monospace; font-size:12px; resize:vertical; margin-bottom:4px"
+                <div class="resi-domains-body">
+                    <textarea id="resi-domains" rows="6" class="resi-domains-ta"
                         placeholder="每行一个域名&#10;openai.com&#10;google.com&#10;anthropic.com"></textarea>
-                    <div style="font-size:11px; color:var(--text-dim)">每行一个根域名（如 openai.com），自动匹配该域名及所有子域名</div>
-                    <button class="btn btn-secondary" onclick="saveDomainsOnly()" style="margin-top:8px; padding:4px 12px; font-size:12px">仅更新分流域名</button>
+                    <div class="resi-domains-hint">每行一个根域名（如 openai.com），自动匹配该域名及所有子域名</div>
+                    <button class="btn btn-secondary resi-update-btn" onclick="saveDomainsOnly()">仅更新分流域名</button>
                 </div>
             </details>
-            <div id="resi-error" style="display:none; color:var(--red,#e74c3c); font-size:13px; margin-bottom:12px"></div>
-            <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px">
+            <div class="resi-actions">
                 <button class="btn btn-secondary" onclick="closeM()">取消</button>
-                <button class="btn btn-secondary" id="resi-disable-btn" onclick="disableResi()">禁用</button>
-                <button class="btn" onclick="saveResi()">保存启用</button>
+                <button class="btn resi-btn-disable" id="resi-disable-btn" onclick="disableResi()">禁用</button>
+                <button class="btn resi-btn-save" onclick="saveResi()">保存启用</button>
             </div>
         </div>
     </div>

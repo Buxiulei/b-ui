@@ -523,44 +523,118 @@ if (tok) init();
 
 // ─── 住宅 IP 出站 ─────────────────────────────────────────────────────────────
 
+function _resiErr(msg) {
+    const txt = $("#resi-error-text");
+    if (txt) txt.textContent = msg;
+    $("#resi-error").style.display = "flex";
+}
+function _resiClearErr() { $("#resi-error").style.display = "none"; }
+
 function openResi() {
     const statusEl  = $("#resi-status");
     const urlEl     = $("#resi-url");
-    const errEl     = $("#resi-error");
     const disBtn    = $("#resi-disable-btn");
     const domainsEl = $("#resi-domains");
-    statusEl.textContent = "加载中...";
+    const countEl   = $("#resi-domains-count");
+
+    // Reset to shimmer loading state
+    statusEl.className = "resi-status-card";
+    statusEl.textContent = "";
+    const shimmer = document.createElement("div");
+    shimmer.className = "resi-shimmer-line";
+    shimmer.style.width = "55%";
+    statusEl.appendChild(shimmer);
+
     urlEl.value = "";
-    errEl.style.display = "none";
+    urlEl.type = "password";
+    const eyeOpen   = $("#resi-eye-open");
+    const eyeClosed = $("#resi-eye-closed");
+    if (eyeOpen)   eyeOpen.style.display   = "";
+    if (eyeClosed) eyeClosed.style.display = "none";
+    _resiClearErr();
     $("#resi-domains-details").removeAttribute("open");
     openM("m-resi");
+
     api("/residential").then(r => {
         statusEl.textContent = "";
+        const row = document.createElement("div");
+        row.className = "resi-status-row";
+        const dot = document.createElement("span");
+        dot.className = "resi-dot " + (r.enabled ? "active" : "inactive");
+        const label = document.createElement("span");
+        label.className = "resi-status-label " + (r.enabled ? "active" : "inactive");
+        label.textContent = r.enabled ? "已启用" : "未启用";
+        row.append(dot, label);
+
         if (r.enabled) {
-            const dot = document.createElement("span");
-            dot.style.color = "var(--green,#2ecc71)";
-            dot.textContent = "● 已启用";
-            const sep = document.createTextNode("　出口 IP: ");
-            const ipEl = document.createElement("b");
-            ipEl.textContent = r.lastVerifiedIp || "-";
-            const br = document.createElement("br");
-            const ispEl = document.createElement("span");
-            ispEl.style.cssText = "font-size:12px;color:var(--text-dim)";
-            ispEl.textContent = r.lastVerifiedIspInfo || "";
-            statusEl.append(dot, sep, ipEl, br, ispEl);
+            statusEl.className = "resi-status-card resi-status-enabled";
+            const ip = r.lastVerifiedIp || "-";
+            const pill = document.createElement("span");
+            pill.className = "resi-ip-pill";
+            pill.title = "点击复制 IP";
+            pill.textContent = ip;
+            pill.onclick = () => {
+                navigator.clipboard.writeText(ip).then(() => {
+                    pill.classList.add("copied");
+                    setTimeout(() => pill.classList.remove("copied"), 1400);
+                }).catch(() => {});
+            };
+            row.appendChild(pill);
+            statusEl.appendChild(row);
+            if (r.lastVerifiedIspInfo) {
+                const isp = document.createElement("div");
+                isp.className = "resi-isp";
+                isp.textContent = r.lastVerifiedIspInfo;
+                statusEl.appendChild(isp);
+            }
             urlEl.placeholder = r.displayUrl || "socks5://user:pass@host:port";
             disBtn.style.display = "";
         } else {
-            const dot = document.createElement("span");
-            dot.style.color = "var(--text-dim)";
-            dot.textContent = "● 未启用";
-            statusEl.append(dot);
+            statusEl.className = "resi-status-card";
+            statusEl.appendChild(row);
             disBtn.style.display = "none";
         }
-        if (r.domains && r.domains.length) domainsEl.value = r.domains.join("\n");
+
+        if (r.domains && r.domains.length) {
+            domainsEl.value = r.domains.join("\n");
+            if (countEl) countEl.textContent = r.domains.length;
+        } else {
+            domainsEl.value = "";
+            if (countEl) countEl.textContent = "";
+        }
     }).catch(() => {
-        statusEl.textContent = "状态获取失败";
+        statusEl.className = "resi-status-card";
+        statusEl.textContent = "";
+        const errMsg = document.createElement("span");
+        errMsg.style.cssText = "color:var(--danger);font-size:13px";
+        errMsg.textContent = "状态获取失败";
+        statusEl.appendChild(errMsg);
     });
+}
+
+function resiToggleEye() {
+    const input     = $("#resi-url");
+    const eyeOpen   = $("#resi-eye-open");
+    const eyeClosed = $("#resi-eye-closed");
+    if (input.type === "password") {
+        input.type = "text";
+        if (eyeOpen)   eyeOpen.style.display   = "none";
+        if (eyeClosed) eyeClosed.style.display = "";
+    } else {
+        input.type = "password";
+        if (eyeOpen)   eyeOpen.style.display   = "";
+        if (eyeClosed) eyeClosed.style.display = "none";
+    }
+}
+
+function resiCopyUrl(btn) {
+    const input = $("#resi-url");
+    const text  = input.value.trim() || input.placeholder;
+    if (!text || text === "socks5://user:pass@host:port") return;
+    navigator.clipboard.writeText(text).then(() => {
+        btn.classList.add("flash");
+        setTimeout(() => btn.classList.remove("flash"), 1400);
+    }).catch(() => {});
 }
 
 function _parseDomains() {
@@ -570,10 +644,9 @@ function _parseDomains() {
 }
 
 function saveResi() {
-    const url   = $("#resi-url").value.trim();
-    const errEl = $("#resi-error");
-    errEl.style.display = "none";
-    if (!url) { errEl.textContent = "请填写凭据 URL"; errEl.style.display = ""; return; }
+    const url = $("#resi-url").value.trim();
+    _resiClearErr();
+    if (!url) { _resiErr("请填写凭据 URL"); return; }
     const body = { url };
     const domains = _parseDomains();
     if (domains) body.domains = domains;
@@ -582,37 +655,31 @@ function saveResi() {
             closeM();
             toast("住宅 IP 已启用，出口 IP: " + (r.exitIp || ""));
         } else {
-            errEl.textContent = r.error || "保存失败";
-            errEl.style.display = "";
+            _resiErr(r.error || "保存失败");
         }
     }).catch(e => {
-        errEl.textContent = e.message || "请求失败";
-        errEl.style.display = "";
+        _resiErr(e.message || "请求失败");
     });
 }
 
 function saveDomainsOnly() {
-    const errEl   = $("#resi-error");
     const domains = _parseDomains();
-    errEl.style.display = "none";
-    if (!domains || !domains.length) { errEl.textContent = "域名列表不能为空"; errEl.style.display = ""; return; }
+    _resiClearErr();
+    if (!domains || !domains.length) { _resiErr("域名列表不能为空"); return; }
     api("/residential", { method: "POST", body: JSON.stringify({ domains }) }).then(r => {
         if (r.success) toast("分流域名已更新");
-        else { errEl.textContent = r.error || "更新失败"; errEl.style.display = ""; }
+        else _resiErr(r.error || "更新失败");
     }).catch(e => {
-        errEl.textContent = e.message || "请求失败";
-        errEl.style.display = "";
+        _resiErr(e.message || "请求失败");
     });
 }
 
 function disableResi() {
-    const errEl = $("#resi-error");
-    errEl.style.display = "none";
+    _resiClearErr();
     api("/residential", { method: "DELETE" }).then(r => {
         if (r.success) { closeM(); toast("住宅 IP 已禁用"); }
-        else { errEl.textContent = r.error || "禁用失败"; errEl.style.display = ""; }
+        else _resiErr(r.error || "禁用失败");
     }).catch(e => {
-        errEl.textContent = e.message || "请求失败";
-        errEl.style.display = "";
+        _resiErr(e.message || "请求失败");
     });
 }
