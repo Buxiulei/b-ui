@@ -669,8 +669,13 @@ install_tui_tools() {
             local tmp
             tmp=$(mktemp -d) || { print_warning "无法创建临时目录，跳过"; return 0; }
             tarball="$tmp/download.tar.gz"
-            if curl -fsSL "$gum_url" -o "$tarball" && tar -xz -C "$tmp" -f "$tarball" 2>/dev/null; then
-                install -m 755 "$tmp/gum" /usr/local/bin/gum
+            local gum_bin=""
+            if curl -fsSL "$gum_url" -o "$tarball" 2>/dev/null && \
+               tar -xz -C "$tmp" -f "$tarball" 2>/dev/null; then
+                gum_bin=$(find "$tmp" -name "gum" -type f 2>/dev/null | head -1)
+            fi
+            if [[ -n "$gum_bin" ]]; then
+                install -m 755 "$gum_bin" /usr/local/bin/gum
                 print_success "gum ${gum_ver} 已安装"
             else
                 print_warning "gum 下载失败，TUI 功能将降级为传统模式"
@@ -693,8 +698,13 @@ install_tui_tools() {
             local tmp
             tmp=$(mktemp -d) || { print_warning "无法创建临时目录，跳过"; return 0; }
             tarball="$tmp/download.tar.gz"
-            if curl -fsSL "$fzf_url" -o "$tarball" && tar -xz -C "$tmp" -f "$tarball" 2>/dev/null; then
-                install -m 755 "$tmp/fzf" /usr/local/bin/fzf
+            local fzf_bin=""
+            if curl -fsSL "$fzf_url" -o "$tarball" 2>/dev/null && \
+               tar -xz -C "$tmp" -f "$tarball" 2>/dev/null; then
+                fzf_bin=$(find "$tmp" -name "fzf" -type f 2>/dev/null | head -1)
+            fi
+            if [[ -n "$fzf_bin" ]]; then
+                install -m 755 "$fzf_bin" /usr/local/bin/fzf
                 print_success "fzf ${fzf_ver} 已安装"
             else
                 print_warning "fzf 下载失败，节点选择将降级为数字菜单"
