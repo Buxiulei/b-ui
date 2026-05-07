@@ -1787,7 +1787,7 @@ save_config_meta() {
     local http_port="${6:-8080}"
 
     local config_dir="${CONFIGS_DIR}/${config_name}"
-    mkdir -p "$config_dir"
+    mkdir -p "$config_dir" || return 1
 
     cat > "${config_dir}/meta.json" << EOF
 {
@@ -1799,13 +1799,17 @@ save_config_meta() {
     "createdAt": "$(date -Iseconds)"
 }
 EOF
+    [[ $? -eq 0 ]] || return 1
 
-    echo "$uri" > "${config_dir}/uri.txt"
+    echo "$uri" > "${config_dir}/uri.txt" || return 1
 
-    local server_host=$(echo "$server" | cut -d':' -f1)
+    local server_host
+    server_host=$(echo "$server" | cut -d':' -f1)
     if [[ -n "$server_host" ]]; then
-        set_server_address "$server_host"
+        set_server_address "$server_host" 2>/dev/null || true
     fi
+
+    return 0
 }
 
 list_configs() {
