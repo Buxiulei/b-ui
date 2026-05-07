@@ -419,6 +419,13 @@ masquerade:
     url: ${MASQUERADE_URL}
     rewriteHost: true
 
+sniff:
+  enable: true
+  timeout: 2s
+  rewriteDomain: false
+  tcpPorts: 80,443,8000-9000
+  udpPorts: all
+
 # B-UI:RESIDENTIAL-START
 # B-UI:RESIDENTIAL-END
 EOF
