@@ -176,7 +176,7 @@ write_singbox_config_residential() {
           "dns": {
             "servers": [
               {"tag": "dns_resi",   "type": "udp", "server": "8.8.8.8", "detour": "residential"},
-              {"tag": "dns_direct", "type": "udp", "server": "1.1.1.1", "detour": "direct"}
+              {"tag": "dns_direct", "type": "udp", "server": "1.1.1.1"}
             ],
             "rules": [{"domain_keyword": $kw, "server": "dns_resi"}],
             "final": "dns_direct",
