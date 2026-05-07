@@ -18,7 +18,7 @@ RED='\033[0;31m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 err()  { echo -e "${RED}ERROR: $*${NC}" >&2; }
 info() { echo -e "${BLUE}$*${NC}" >&2; }
 
-DEFAULT_DOMAINS=("openai.com" "chatgpt.com" "google.com" "googleapis.com" "gstatic.com" "anthropic.com" "claude.ai" "ping0.cc" "ip.sb")
+DEFAULT_DOMAINS=("openai" "chatgpt" "google" "googleapis" "gstatic" "anthropic" "claude" "ping0" "ip.sb")
 
 # ---------------------------------------------------------------------------
 # 读取分流域名列表 → 导出 DOMAINS 数组
