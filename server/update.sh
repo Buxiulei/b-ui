@@ -172,6 +172,7 @@ do_update() {
         "server/core.sh:${BASE_DIR}/core.sh"
         "server/b-ui-cli.sh:${BASE_DIR}/b-ui-cli.sh"
         "server/update.sh:${BASE_DIR}/update.sh"
+        "server/residential-helper.sh:${BASE_DIR}/residential-helper.sh"
         "b-ui-client.sh:${BASE_DIR}/b-ui-client.sh"
         "web/server.js:${ADMIN_DIR}/server.js"
         "web/package.json:${ADMIN_DIR}/package.json"
@@ -204,6 +205,7 @@ do_update() {
     chmod +x "${BASE_DIR}/core.sh" 2>/dev/null
     chmod +x "${BASE_DIR}/b-ui-cli.sh" 2>/dev/null
     chmod +x "${BASE_DIR}/update.sh" 2>/dev/null
+    chmod +x "${BASE_DIR}/residential-helper.sh" 2>/dev/null
     
     # 恢复配置
     print_info "恢复配置..."
@@ -240,7 +242,13 @@ do_update() {
     systemctl start b-ui-admin 2>/dev/null || true
     systemctl restart hysteria-server 2>/dev/null || true
     systemctl restart xray 2>/dev/null || true
-    
+
+    # 重新应用住宅 IP 配置（包含下载 sing-box、启动中继、更新 xray/hy2 出站）
+    if [[ -f "${BASE_DIR}/residential-helper.sh" ]]; then
+        print_info "重新应用住宅 IP 配置..."
+        "${BASE_DIR}/residential-helper.sh" reapply 2>/dev/null || true
+    fi
+
     # 确保定时任务配置正确
     ensure_cron_jobs
     
@@ -323,6 +331,13 @@ apply_systemd_configs() {
             print_info "  ✓ 移除 config.yaml 中过大的 QUIC 窗口配置（已备份）"
             hysteria_config_changed=1
         fi
+    fi
+
+    # 迁移 config.yaml：确保 udpPorts: all 存在（供住宅 IP UDP 域名分流）
+    if [[ -f "$config_file" ]] && grep -q 'tcpPorts:' "$config_file" && ! grep -q 'udpPorts:' "$config_file"; then
+        sed -i '/tcpPorts:.*80,443/a\  udpPorts: all' "$config_file"
+        print_info "  ✓ config.yaml 添加 udpPorts: all（供住宅 IP UDP 域名分流）"
+        hysteria_config_changed=1
     fi
 
     # 迁移 config.yaml：添加 QUIC maxIdleTimeout（默认 30s 过短，空闲断连后客户端需约 1 分钟恢复）
@@ -681,16 +696,21 @@ ensure_cron_jobs() {
 #===============================================================================
 
 check_and_update() {
+    local yes_flag="${1:-}"
     if check_update; then
         echo ""
-        read -p "是否立即更新? (y/n): " confirm
-        if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+        if [[ "$yes_flag" == "-y" || "$yes_flag" == "--yes" ]]; then
             do_update
         else
-            print_info "已跳过更新"
+            read -p "是否立即更新? (y/n): " confirm
+            if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+                do_update
+            else
+                print_info "已跳过更新"
+            fi
         fi
     fi
-    
+
     # 无论是否更新，都确保 CLI 命令存在
     ensure_cli_exists
 }
@@ -727,6 +747,7 @@ auto_update() {
             ["server/core.sh"]="${BASE_DIR}/core.sh"
             ["server/b-ui-cli.sh"]="${BASE_DIR}/b-ui-cli.sh"
             ["server/update.sh"]="${BASE_DIR}/update.sh"
+            ["server/residential-helper.sh"]="${BASE_DIR}/residential-helper.sh"
             ["web/server.js"]="${ADMIN_DIR}/server.js"
             ["web/package.json"]="${ADMIN_DIR}/package.json"
             ["web/index.html"]="${ADMIN_DIR}/index.html"
@@ -792,6 +813,10 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         kernel)
             # 静默内核更新模式 (用于 cron)
             auto_update_kernel
+            ;;
+        -y|--yes)
+            # 静默交互更新模式（跳过确认提示）
+            check_and_update "-y"
             ;;
         *)
             # 交互模式

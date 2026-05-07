@@ -1,5 +1,5 @@
 {
-    "version": "3.3.5",
+    "version": "3.3.6",
     "updated": "2026-05-07",
     "files": [
         "install.sh",
@@ -16,6 +16,7 @@
         "b-ui-client.sh"
     ],
     "changelog": {
+        "3.3.6": "update.sh 完善：新增 -y/--yes 静默更新参数（跳过确认提示）；do_update 和 auto_update 文件列表补充 residential-helper.sh；更新完成后自动调用 residential-helper.sh reapply 重建 sing-box 中继；apply_systemd_configs 补充 udpPorts:all 迁移步骤（防止恢复备份后丢失）",
         "3.3.5": "住宅 IP 出站改用本地 sing-box 中继（127.0.0.1:2080）：sing-box 正确实现 RFC 1928 UDP ASSOCIATE，解决 Hysteria2 原生 socks5 outbound UDP 不稳定问题；恢复 udpPorts:all 嗅探支持；去掉 TCP-only 限制，UDP/QUIC 流量（如 DNS-over-UDP、HTTP/3）同样走住宅 IP；新增 b-ui-relay systemd 服务随系统自启",
         "3.3.4": "临时修复：限制住宅 IP 出站为 TCP only，禁用 udpPorts sniff，规避 Hysteria2 socks5 UDP ASSOCIATE bug（已被 3.3.5 完整方案替代）",
         "3.3.3": "住宅 IP 弹窗 UI 重设计：加载骨架屏、绿色脉冲状态点、可点击 IP 徽章一键复制、URL 显示/隐藏切换及复制按钮、分流域名面板折叠箭头动画及数量徽章、错误提示图标化；默认分流关键词去后缀改为纯关键词匹配（openai/chatgpt/google/googleapis/gstatic/anthropic/claude/ping0/ip.sb）",
