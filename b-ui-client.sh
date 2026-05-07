@@ -4582,7 +4582,7 @@ tui_switch_node() {
             | fzf --prompt "切换节点 > " \
                   --mouse \
                   --height 50% \
-                  --border rounded \
+                  --border=rounded \
                   --layout reverse \
                   --info inline \
                   --header "↑↓ 选择   Enter 确认   Esc 取消" \
@@ -4594,7 +4594,13 @@ tui_switch_node() {
         for config_dir in "$CONFIGS_DIR"/*/; do
             [[ -d "$config_dir" ]] && configs+=("$(basename "$config_dir")")
         done
-        list_configs
+        local i=1
+        for c in "${configs[@]}"; do
+            local marker=""
+            [[ "$c" == "$active" ]] && marker=" ★"
+            echo "  $i. ${c}${marker}"
+            ((i++))
+        done
         echo ""
         read -p "选择配置编号 (0 返回): " choice
         [[ "$choice" == "0" ]] || [[ -z "$choice" ]] && return 0
