@@ -2105,6 +2105,97 @@ cmd_tun() {
     esac
 }
 
+cmd_import() {
+    local uri="$1"
+    local activate=false
+    [[ "$2" == "--activate" ]] && activate=true
+
+    if [[ -z "$uri" ]]; then
+        echo "用法: bui-c import <uri> [--activate]" >&2
+        exit 2
+    fi
+
+    local parsed="" protocol=""
+    if [[ "$uri" =~ ^(hysteria2|hy2):// ]]; then
+        parsed=$(parse_hysteria_uri "$uri")
+        protocol="hysteria2"
+    elif [[ "$uri" =~ ^vless:// ]]; then
+        parsed=$(parse_vless_uri "$uri")
+        protocol="vless-reality"
+    else
+        tui_error "不支持的 URI 格式（仅支持 hysteria2:// 和 vless://）"
+        exit 2
+    fi
+
+    if [[ -z "$parsed" ]]; then
+        tui_error "URI 解析失败"
+        exit 1
+    fi
+
+    safe_import_parsed "$parsed"
+
+    local config_name="${REMARK:-${protocol}-$(date +%s)}"
+    config_name=$(echo "$config_name" | sed 's/[\/\\:*?"<>|]/-/g')
+
+    if [[ -d "${CONFIGS_DIR}/${config_name}" ]]; then
+        tui_info "节点 '$config_name' 已存在，跳过"
+        exit 0
+    fi
+
+    save_config_meta "$config_name" "$protocol" "$SERVER_ADDR" "$uri" 1080 8080
+    tui_success "已导入: $config_name ($protocol)"
+
+    if [[ "$activate" == "true" ]]; then
+        OPT_YES=true
+        _switch_to_profile "$config_name"
+        exit $?
+    fi
+
+    exit 0
+}
+
+cmd_start() {
+    local active
+    active=$(get_active_config)
+    if [[ -z "$active" ]]; then
+        tui_error "没有激活的节点，请先 bui-c switch <名称>"
+        exit 1
+    fi
+    local protocol
+    protocol=$(grep '"protocol"' "${CONFIGS_DIR}/${active}/meta.json" 2>/dev/null | cut -d'"' -f4)
+    if [[ "$protocol" == "hysteria2" ]]; then
+        tui_info "启动 Hysteria2..."; systemctl start "$CLIENT_SERVICE"
+    else
+        tui_info "启动 Xray..."; systemctl start xray-client
+    fi
+    tui_success "服务已启动"
+    exit 0
+}
+
+cmd_stop() {
+    tui_info "停止客户端服务..."
+    systemctl stop "$CLIENT_SERVICE" 2>/dev/null || true
+    systemctl stop xray-client 2>/dev/null || true
+    systemctl stop bui-tun 2>/dev/null || true
+    tui_success "服务已停止"
+    exit 0
+}
+
+cmd_restart() {
+    local active
+    active=$(get_active_config)
+    if [[ -z "$active" ]]; then
+        tui_error "没有激活的节点"
+        exit 1
+    fi
+    tui_info "停止客户端服务..."
+    systemctl stop "$CLIENT_SERVICE" 2>/dev/null || true
+    systemctl stop xray-client 2>/dev/null || true
+    systemctl stop bui-tun 2>/dev/null || true
+    _switch_to_profile "$active"
+    exit $?
+}
+
 switch_config() {
     echo ""
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
