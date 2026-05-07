@@ -262,6 +262,7 @@ download_all_files() {
     chmod +x "${BASE_DIR}/core.sh"
     chmod +x "${BASE_DIR}/b-ui-cli.sh"
     chmod +x "${BASE_DIR}/update.sh"
+    chmod +x "${BASE_DIR}/residential-helper.sh"
     
     # 下载字体文件（本地化）- 使用 Fontsource CDN
     print_info "下载字体文件..."
