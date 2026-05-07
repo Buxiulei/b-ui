@@ -422,7 +422,7 @@ masquerade:
 sniff:
   enable: true
   timeout: 2s
-  rewriteDomain: false
+  rewriteDomain: true
   tcpPorts: 80,443,8000-9000
   udpPorts: all
 
