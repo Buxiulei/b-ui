@@ -175,8 +175,8 @@ write_singbox_config_residential() {
           "log": {"level": "error"},
           "dns": {
             "servers": [
-              {"tag": "dns_resi",   "address": "udp://8.8.8.8", "detour": "residential"},
-              {"tag": "dns_direct", "address": "udp://1.1.1.1",  "detour": "direct"}
+              {"tag": "dns_resi",   "type": "udp", "server": "8.8.8.8", "detour": "residential"},
+              {"tag": "dns_direct", "type": "udp", "server": "1.1.1.1", "detour": "direct"}
             ],
             "rules": [{"domain_keyword": $kw, "server": "dns_resi"}],
             "final": "dns_direct",
@@ -231,7 +231,7 @@ write_singbox_config_direct() {
           "log": {"level": "error"},
           "dns": {
             "servers": [
-              {"tag": "dns_direct", "address": "udp://1.1.1.1", "detour": "direct"}
+              {"tag": "dns_direct", "type": "udp", "server": "1.1.1.1", "detour": "direct"}
             ],
             "final": "dns_direct",
             "strategy": "prefer_ipv4"
