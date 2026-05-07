@@ -125,6 +125,58 @@ REMOTE_VERSION=""
 TUI_AVAILABLE=false
 command -v gum &>/dev/null && command -v fzf &>/dev/null && TUI_AVAILABLE=true
 
+# 自动安装 gum + fzf（仅在 root 且当前缺失时执行，失败不致命）
+ensure_tui_tools() {
+    [[ "$TUI_AVAILABLE" == "true" ]] && return 0
+    [[ $EUID -ne 0 ]] && return 0
+
+    local arch fzf_arch
+    case "$(uname -m)" in
+        x86_64)  arch="x86_64" ; fzf_arch="amd64" ;;
+        aarch64) arch="arm64"  ; fzf_arch="arm64" ;;
+        armv7l)  arch="armv7"  ; fzf_arch="armhf" ;;
+        *) return 0 ;;
+    esac
+
+    print_info "安装 TUI 工具（gum + fzf）以启用交互式菜单..."
+
+    if ! command -v gum &>/dev/null; then
+        local ver
+        ver=$(curl -sI "https://github.com/charmbracelet/gum/releases/latest" \
+            | grep -i "^location:" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+        if [[ -n "$ver" ]]; then
+            local url="https://github.com/charmbracelet/gum/releases/download/${ver}/gum_${ver#v}_Linux_${arch}.tar.gz"
+            local tmp; tmp=$(mktemp -d 2>/dev/null) || tmp=""
+            local bin=""
+            if [[ -n "$tmp" ]] && curl -fsSL "$url" -o "$tmp/d.tar.gz" 2>/dev/null \
+               && tar -xz -C "$tmp" -f "$tmp/d.tar.gz" 2>/dev/null; then
+                bin=$(find "$tmp" -name gum -type f 2>/dev/null | head -1)
+            fi
+            [[ -n "$bin" ]] && install -m 755 "$bin" /usr/local/bin/gum && print_success "gum ${ver} 已安装"
+            [[ -n "$tmp" ]] && rm -rf "$tmp"
+        fi
+    fi
+
+    if ! command -v fzf &>/dev/null; then
+        local ver
+        ver=$(curl -sI "https://github.com/junegunn/fzf/releases/latest" \
+            | grep -i "^location:" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+        if [[ -n "$ver" ]]; then
+            local url="https://github.com/junegunn/fzf/releases/download/${ver}/fzf-${ver#v}-linux_${fzf_arch}.tar.gz"
+            local tmp; tmp=$(mktemp -d 2>/dev/null) || tmp=""
+            local bin=""
+            if [[ -n "$tmp" ]] && curl -fsSL "$url" -o "$tmp/d.tar.gz" 2>/dev/null \
+               && tar -xz -C "$tmp" -f "$tmp/d.tar.gz" 2>/dev/null; then
+                bin=$(find "$tmp" -name fzf -type f 2>/dev/null | head -1)
+            fi
+            [[ -n "$bin" ]] && install -m 755 "$bin" /usr/local/bin/fzf && print_success "fzf ${ver} 已安装"
+            [[ -n "$tmp" ]] && rm -rf "$tmp"
+        fi
+    fi
+
+    command -v gum &>/dev/null && command -v fzf &>/dev/null && TUI_AVAILABLE=true
+}
+
 # 全局 flags（由 parse_global_flags 设置）
 OPT_YES=false
 OPT_JSON=false
@@ -4489,6 +4541,7 @@ main() {
     fi
 
     # 无参数 → TUI 交互模式
+    ensure_tui_tools
     tui_main_loop
 }
 

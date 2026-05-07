@@ -1,5 +1,5 @@
 {
-    "version": "3.4.4",
+    "version": "3.4.5",
     "updated": "2026-05-07",
     "files": [
         "install.sh",
@@ -16,6 +16,7 @@
         "b-ui-client.sh"
     ],
     "changelog": {
+        "3.4.5": "客户端 b-ui-client.sh 新增 ensure_tui_tools：进入交互菜单前自动检测 gum/fzf 缺失则下载安装（root 时），用 find 定位解压后的二进制兼容不同 tarball 结构；非 root 或安装失败仍正常降级到旧菜单",
         "3.4.4": "紧急修复 update.sh 损坏 config.yaml 的严重 bug：apply_systemd_configs 的 QUIC 迁移逻辑用 sed 范围删除 `/^quic:$/,/^  maxConnReceiveWindow:/d`，但 3.2.7 已经迁移过的机器上 maxConnReceiveWindow 早已删除，sed 找不到结束锚点会一路删到 EOF，把 auth/trafficStats/masquerade/sniff/residential outbounds 全部冲掉，导致 hysteria-server 启动失败 'auth.type: empty auth type' 进入 restart loop。修复：迁移逻辑前置检查 maxConnReceiveWindow 是否真实存在，已迁移机器跳过 sed",
         "3.4.3": "修复客户端 b-ui-client.sh 版本号硬编码长期滞后于 version.json（停留在 3.2.1）：bump SCRIPT_VERSION 至当前；web/server.js 在 /install-client 和 /packages/b-ui-client.sh 分发时从 version.json 动态注入 SCRIPT_VERSION，彻底杜绝以后漏改",
         "3.4.2": "默认住宅分流关键词新增 grok（x.ai 旗下 AI）、tiktok（TikTok 视频）",
