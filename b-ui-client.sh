@@ -1534,9 +1534,83 @@ check_public_ip() {
     echo ""
 }
 
+# 确保 TUN 配置文件存在且字段填充完整、跟当前 active 节点一致
+# 任一不满足就基于 active 节点重新生成
+# 返回 0=已就绪/重生成功，非 0=没有 active 节点或节点 URI 损坏
+ensure_tun_config_ready() {
+    local active
+    active=$(get_active_config)
+    if [[ -z "$active" ]]; then
+        print_error "没有激活的节点，请先 'bui-c switch <name>' 或在菜单切换节点"
+        return 1
+    fi
+
+    local config_dir="${CONFIGS_DIR}/${active}"
+    local tun_cfg="${BASE_DIR}/singbox-tun.json"
+    local meta_file="${config_dir}/meta.json"
+    local uri_file="${config_dir}/uri.txt"
+
+    [[ -f "$uri_file" && -f "$meta_file" ]] || {
+        print_error "节点配置损坏（缺 uri.txt 或 meta.json）：${active}"
+        return 1
+    }
+
+    # 当前 active 节点的 server host
+    local active_server
+    active_server=$(grep '"server"' "$meta_file" | cut -d'"' -f4 | cut -d':' -f1)
+
+    local needs_regen=false
+    if [[ ! -f "$tun_cfg" ]]; then
+        needs_regen=true
+    else
+        # 关键字段非空检测
+        local cfg_server cfg_port
+        cfg_server=$(grep -m1 -oE '"server"[[:space:]]*:[[:space:]]*"[^"]*"' "$tun_cfg" | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
+        cfg_port=$(grep -m1 -oE '"server_port"[[:space:]]*:[[:space:]]*[0-9]*' "$tun_cfg" | head -1 | grep -oE '[0-9]+$')
+        if [[ -z "$cfg_server" || -z "$cfg_port" ]]; then
+            needs_regen=true
+        elif [[ -n "$active_server" && "$cfg_server" != "$active_server" ]]; then
+            # 切换过节点但 TUN 配置还指向旧节点
+            needs_regen=true
+        fi
+    fi
+
+    [[ "$needs_regen" == "false" ]] && return 0
+
+    print_info "TUN 配置缺失或过期，基于节点 '${active}' 重新生成..."
+
+    # 解析 URI 并加载变量到当前 shell
+    local uri protocol parsed
+    uri=$(cat "$uri_file")
+    protocol=$(grep '"protocol"' "$meta_file" | cut -d'"' -f4)
+    [[ -z "$protocol" ]] && protocol="hysteria2"
+
+    if [[ "$uri" =~ ^(hysteria2|hy2):// ]]; then
+        parsed=$(parse_hysteria_uri "$uri")
+    elif [[ "$uri" =~ ^vless:// ]]; then
+        parsed=$(parse_vless_uri "$uri")
+        protocol="vless-reality"
+    else
+        print_error "节点 URI 格式不支持"
+        return 1
+    fi
+    [[ -z "$parsed" ]] && { print_error "节点 URI 解析失败"; return 1; }
+
+    safe_import_parsed "$parsed"
+    SOCKS_PORT=$(grep '"socks_port"' "$meta_file" | grep -o '[0-9]*' | head -1)
+    HTTP_PORT=$(grep '"http_port"'   "$meta_file" | grep -o '[0-9]*' | head -1)
+    SOCKS_PORT="${SOCKS_PORT:-1080}"
+    HTTP_PORT="${HTTP_PORT:-8080}"
+
+    generate_singbox_tun_config "$protocol"
+}
+
 start_tun_mode() {
     print_info "启动 TUN 模式..."
-    
+
+    # 兜底：确保 TUN 配置文件就绪（任何入口路径都能被正确启动）
+    ensure_tun_config_ready || return 1
+
     # 检测端口冲突
     local socks_port=${SOCKS_PORT:-1080}
     local http_port=${HTTP_PORT:-8080}
@@ -4676,18 +4750,13 @@ tui_toggle_tun() {
             tui_success "TUN 已停止"
         fi
     else
-        local active; active=$(get_active_config)
-        if [[ -z "$active" ]]; then
-            tui_error "没有激活的节点，无法启动 TUN"
-            sleep 1
-            return 0
-        fi
         if tui_confirm "启动 TUN 全局代理模式？"; then
-            local protocol
-            protocol=$(grep '"protocol"' "${CONFIGS_DIR}/${active}/meta.json" 2>/dev/null | cut -d'"' -f4)
-            tui_info "生成 TUN 配置..."; generate_singbox_tun_config "${protocol:-hysteria2}"
-            tui_info "启动 TUN..."; start_tun_mode
-            tui_success "TUN 已启动"
+            tui_info "启动 TUN..."
+            if start_tun_mode; then
+                tui_success "TUN 已启动"
+            else
+                tui_error "TUN 启动失败，查看上方提示"
+            fi
         fi
     fi
     sleep 1

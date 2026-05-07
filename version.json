@@ -1,5 +1,5 @@
 {
-    "version": "3.4.6",
+    "version": "3.4.7",
     "updated": "2026-05-07",
     "files": [
         "install.sh",
@@ -16,6 +16,7 @@
         "b-ui-client.sh"
     ],
     "changelog": {
+        "3.4.7": "客户端 TUN 模式鲁棒性：新增 ensure_tun_config_ready 函数在 start_tun_mode 入口兜底，自动检测 singbox-tun.json 缺失/字段为空/server 与当前 active 节点不一致三种情况，自动从节点 uri.txt + meta.json 重新加载变量并生成 TUN 配置；不再需要先 switch 才能 tun on；tui_toggle_tun 简化为直接调 start_tun_mode（去除重复的 protocol 检测和配置生成逻辑）",
         "3.4.6": "update.sh 增加 config.yaml 完整性兜底：apply_systemd_configs 末尾检查 auth/trafficStats/masquerade/sniff 任一缺失则备份后调用新增的 repair_hysteria_config 函数重新生成（保留 listen/tls/quic/RESIDENTIAL 段，HTTP 认证模式）；防止历史损坏的 config（如旧版 sed 范围删除 bug 受害者）在升级时永远无法自动恢复",
         "3.4.5": "客户端 b-ui-client.sh 新增 ensure_tui_tools：进入交互菜单前自动检测 gum/fzf 缺失则下载安装（root 时），用 find 定位解压后的二进制兼容不同 tarball 结构；非 root 或安装失败仍正常降级到旧菜单",
         "3.4.4": "紧急修复 update.sh 损坏 config.yaml 的严重 bug：apply_systemd_configs 的 QUIC 迁移逻辑用 sed 范围删除 `/^quic:$/,/^  maxConnReceiveWindow:/d`，但 3.2.7 已经迁移过的机器上 maxConnReceiveWindow 早已删除，sed 找不到结束锚点会一路删到 EOF，把 auth/trafficStats/masquerade/sniff/residential outbounds 全部冲掉，导致 hysteria-server 启动失败 'auth.type: empty auth type' 进入 restart loop。修复：迁移逻辑前置检查 maxConnReceiveWindow 是否真实存在，已迁移机器跳过 sed",
