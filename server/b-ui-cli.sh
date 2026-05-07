@@ -776,13 +776,13 @@ cmd_server_residential() {
         enable)
             local url="$1"
             [[ -z "$url" ]] && { echo "用法: b-ui residential enable <url>" >&2; exit 2; }
-            bash /opt/b-ui/residential-helper.sh enable "$url"
+            bash "${BASE_DIR}/residential-helper.sh" enable "$url"
             ;;
         disable)
-            bash /opt/b-ui/residential-helper.sh disable
+            bash "${BASE_DIR}/residential-helper.sh" disable
             ;;
         status)
-            bash /opt/b-ui/residential-helper.sh status
+            bash "${BASE_DIR}/residential-helper.sh" status
             ;;
         *)
             echo "用法: b-ui residential <enable <url>|disable|status>" >&2
@@ -796,8 +796,8 @@ dispatch_subcommand_server() {
     local cmd="$1"; shift
     case "$cmd" in
         status)      cmd_server_status "$@"; exit 0 ;;
-        restart)     cmd_server_restart "$@" ;;
-        logs)        cmd_server_logs "$@" ;;
+        restart)     cmd_server_restart "$@"; exit $? ;;
+        logs)        cmd_server_logs "$@"; exit $? ;;
         residential) cmd_server_residential "$@" ;;
         update)      check_bui_update; exit 0 ;;
         -h|--help|help)
