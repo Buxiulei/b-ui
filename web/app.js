@@ -517,3 +517,73 @@ function toggleSniSelect() {
 
 // Auto-init if token exists
 if (tok) init();
+
+// ─── 住宅 IP 出站 ─────────────────────────────────────────────────────────────
+
+function openResi() {
+    const statusEl = $("#resi-status");
+    const urlEl    = $("#resi-url");
+    const errEl    = $("#resi-error");
+    const disBtn   = $("#resi-disable-btn");
+    statusEl.textContent = "加载中...";
+    urlEl.value = "";
+    errEl.style.display = "none";
+    openM("m-resi");
+    api("/residential").then(r => {
+        statusEl.textContent = "";
+        if (r.enabled) {
+            const dot = document.createElement("span");
+            dot.style.color = "var(--green,#2ecc71)";
+            dot.textContent = "● 已启用";
+            const sep = document.createTextNode("　出口 IP: ");
+            const ipEl = document.createElement("b");
+            ipEl.textContent = r.lastVerifiedIp || "-";
+            const br = document.createElement("br");
+            const ispEl = document.createElement("span");
+            ispEl.style.cssText = "font-size:12px;color:var(--text-dim)";
+            ispEl.textContent = r.lastVerifiedIspInfo || "";
+            statusEl.append(dot, sep, ipEl, br, ispEl);
+            urlEl.placeholder = r.displayUrl || "socks5://user:pass@host:port";
+            disBtn.style.display = "";
+        } else {
+            const dot = document.createElement("span");
+            dot.style.color = "var(--text-dim)";
+            dot.textContent = "● 未启用";
+            statusEl.append(dot);
+            disBtn.style.display = "none";
+        }
+    }).catch(() => {
+        statusEl.textContent = "状态获取失败";
+    });
+}
+
+function saveResi() {
+    const url    = $("#resi-url").value.trim();
+    const errEl  = $("#resi-error");
+    errEl.style.display = "none";
+    if (!url) { errEl.textContent = "请填写凭据"; errEl.style.display = ""; return; }
+    api("/residential", { method: "POST", body: JSON.stringify({ url }) }).then(r => {
+        if (r.success) {
+            closeM();
+            toast("住宅 IP 已启用，出口 IP: " + (r.exitIp || ""));
+        } else {
+            errEl.textContent = r.error || "保存失败";
+            errEl.style.display = "";
+        }
+    }).catch(e => {
+        errEl.textContent = e.message || "请求失败";
+        errEl.style.display = "";
+    });
+}
+
+function disableResi() {
+    const errEl = $("#resi-error");
+    errEl.style.display = "none";
+    api("/residential", { method: "DELETE" }).then(r => {
+        if (r.success) { closeM(); toast("住宅 IP 已禁用"); }
+        else { errEl.textContent = r.error || "禁用失败"; errEl.style.display = ""; }
+    }).catch(e => {
+        errEl.textContent = e.message || "请求失败";
+        errEl.style.display = "";
+    });
+}

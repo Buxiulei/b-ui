@@ -36,6 +36,7 @@
             </div>
             <div class="nav-actions">
                 <button class="ibtn" onclick="openMasq()" title="伪装网站设置">🎭</button>
+                <button class="ibtn" onclick="openResi()" title="住宅 IP 出站">🏠</button>
                 <button class="ibtn" onclick="openPortHopping()" title="端口跳跃设置">🔀</button>
                 <button class="ibtn" onclick="openBandwidth()" title="带宽限制设置">⚡</button>
                 <button class="ibtn" onclick="openM('m-pwd')" title="修改密码">🔑</button>
@@ -214,6 +215,30 @@
             <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:8px">
                 <button class="btn btn-secondary" onclick="closeM()">取消</button>
                 <button class="btn" onclick="changePwd()">保存修改</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Residential IP Modal -->
+    <div id="m-resi" class="modal">
+        <div class="modal-card">
+            <h3>🏠 住宅 IP 出站</h3>
+            <div class="info-box" style="margin-bottom:16px; font-size:13px; color:var(--text-dim)">
+                OpenAI / Google / Claude 流量走住宅 IP，其余流量直出 VPS。
+            </div>
+            <div id="resi-status" style="margin-bottom:16px; font-size:13px; padding:10px; border-radius:8px; background:var(--bg-card)">
+                加载中...
+            </div>
+            <input type="password" id="resi-url" placeholder="socks5://user:pass@host:port"
+                   style="font-family:monospace; margin-bottom:8px">
+            <div style="font-size:12px; color:var(--text-dim); margin-bottom:16px">
+                支持格式: socks5://user:pass@host:port 或 host:port:user:pass
+            </div>
+            <div id="resi-error" style="display:none; color:var(--red,#e74c3c); font-size:13px; margin-bottom:12px"></div>
+            <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px">
+                <button class="btn btn-secondary" onclick="closeM()">取消</button>
+                <button class="btn btn-secondary" id="resi-disable-btn" onclick="disableResi()">禁用</button>
+                <button class="btn" onclick="saveResi()">保存启用</button>
             </div>
         </div>
     </div>
