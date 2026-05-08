@@ -6,11 +6,22 @@
 
 轻量级 Hysteria2 + Xray 多协议代理一键部署工具，内置 Web 管理面板与全功能流量管理。
 
-**当前版本**: v3.4.1
+**当前版本**: v3.4.10
 
 ---
 
 ## 最新更新
+
+### v3.4.10 — UI 简化 + 自愈强化
+- 🎯 **CLI 菜单回到数字直选**：实测下来 gum 箭头选择体验比直接敲数字慢，重新设计两栏紧凑布局，纯 bash + ANSI 渲染零依赖
+- 🔒 **入向 SSH 在 TUN 模式下保活**：路由规则补 `source_port [22, 2222] → direct`，sshd 回包不再被 strict_route 塞进隧道
+- 🔧 **配置文件原子写入**：客户端 `singbox-tun.json` 和服务端下载流程都改为 `.tmp` + 校验 + `mv`，半截下载/中断不会破坏现有配置
+- ⚡ **TUN 路由模板自动同步**：客户端脚本升级后下次 TUN 重启自动应用新规则（`TUN_SCHEMA_VERSION` sidecar 比对），新增 `bui-c reload-tun` 子命令立即应用
+
+### v3.4.x — 维护期修复（v3.4.2 ~ v3.4.9）
+- 🐛 **紧急修复 update.sh 截断 config.yaml 的严重 bug**：旧版 sed 范围删除找不到结束锚点会一路删到 EOF，把 auth/sniff/masquerade 全冲掉（v3.4.4）
+- 🛡 **update.sh 新增 config.yaml 完整性兜底**：检查关键段缺失则自动 `repair_hysteria_config` 重建（v3.4.6）
+- 🔄 **客户端 TUN 配置自愈**：`ensure_tun_config_ready` 检测配置缺失/字段空/指向旧节点时自动重新生成（v3.4.7）
 
 ### v3.4.1 — sing-box 1.13 兼容性
 - 🔧 **DNS server 新格式**：迁移到 `type: udp + server` 字段（旧 `address: udp://` 已移除）
@@ -87,16 +98,22 @@ bash <(curl -fsSL "https://raw.githubusercontent.com/Buxiulei/b-ui/main/install.
 
 ### 客户端菜单一览
 
+v3.4.10 起为数字两栏布局（纯 bash + ANSI 渲染，零依赖）：
+
 ```
-1. 📥 导入节点      (粘贴链接即可，自动识别)
-2. 📋 节点管理      (列表/切换/删除)
-3. ▶  服务控制      (启动/停止/重启/日志)
-4. 🌐 TUN 全局代理  (开启/关闭)
-5. 🔍 连接测试
-6. ⬆  一键更新      (服务端优先 → GitHub fallback)
-7. ⚙  高级设置      (自启动/路由规则)
-8. 🗑  卸载
+  ━━━━━  B-UI 客户端  · v3.4.10  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  节点: ● bwg-tizi  Hysteria2  •  SOCKS5 :1080  HTTP :8080  •  TUN: ● running
+
+     [1] 切换节点        [2] 停止 TUN
+     [3] 导入节点        [4] 服务控制
+     [5] 高级设置        [6] 一键更新
+     [7] 卸载            [0] 退出
+
+  ▸ 选择 [0-7]:
 ```
+
+直接键入数字 + 回车即可触发对应操作；服务端 `b-ui` 看板同样为两栏数字布局，覆盖 12 项功能。
 
 ### 内核更新策略
 
