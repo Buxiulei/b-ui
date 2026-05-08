@@ -1,5 +1,5 @@
 {
-    "version": "3.4.13",
+    "version": "3.4.14",
     "updated": "2026-05-08",
     "files": [
         "install.sh",
@@ -16,6 +16,7 @@
         "b-ui-client.sh"
     ],
     "changelog": {
+        "3.4.14": "客户端 test_proxy 新增'测试 6: 出口 IP 类型检测 (ping0.cc)'：抓 ping0.cc 主页 HTML 解析 `<span class=\"label ...\">家庭宽带 IP / IDC机房 IP</span>` 字段；TUN 模式直连，SOCKS 模式经 socks5 走代理；同时显示出口 IP（从 <title> 解析）；用于验证开了住宅代理后流量是不是真的从住宅 IP 出去——之前需要手动浏览器打开 ping0.cc 看，现在 bui-c 一个连接测试就跑完所有检查",
         "3.4.13": "修复客户端 do_client_update 检测/下载脱节的严重 bug：v3.4.12 之前 check_client_update 检测到 best 源（如 GitHub 的 v3.4.12）后，do_client_update 仍然把'服务端'放在下载源列表第一位——导致服务端 cron 还没跑（版本落后）时，下载到的是服务端的旧版（v3.4.11），但日志却显示'已升级至 v3.4.12'（用的是 REMOTE_VERSION 检测值），用户重启 bui-c 才发现版本对不上。修复：(1) 下载源排序改成'检测到 best 版本的源（UPDATE_URL）优先'，服务端降为 fallback；(2) 下载完比对脚本里实际的 SCRIPT_VERSION 和 REMOTE_VERSION，不一致就丢弃换下一源；(3) 完成消息显示真实下载到的版本号，不再误报",
         "3.4.12": "客户端 check_client_update 改为真正的 3 源并行查询：v3.4.11 之前注释写'多源并行'但实际是串行 curl，每源 5s 超时最坏情况 15s 才能拿到所有版本号；TUN 模式下走 hy2 隧道到 GitHub/ghproxy 经常 5s 内回不来，结果只有'服务端'源能稳赢——服务端 cron 没及时升级时客户端就拿不到 GitHub 上的最新版（baiyi 的现实问题）。改用 bash 子 shell 后台并行 + 临时文件收集结果 + wait 等齐，每源 10s 超时，所有源同时跑，慢源不再阻塞快源；最大版本号取胜逻辑保留（服务端优先，任一源返回严格更新版就切换 best_url）；超时未返回的源在 UI 显示 '(超时)' 提示用户网络不通畅",
         "3.4.11": "客户端菜单 UX 修复（用户实测反馈）：(1) 状态栏从单行紧凑（节点/协议/SOCKS/HTTP/TUN 横排）改成 3 行缩进竖排（节点/代理/TUN 三行各占一行），节点名 visual 宽度 > 26 列时截断 + 加 …，节点名前缀已含协议时不再重复显示协议；TUN 状态用中文'运行中/关闭'代替英文'running/stopped'；(2) 主菜单加回 [5] 连接测试（之前 v3.4.10 重排时漏掉 test_proxy），重排为 4 行 2 列（[1][2]/[3][4]/[5][6]/[7][8]）+ 单独一行 [0] 退出；(3) tui_main_loop 去掉无条件的 'read -p 按 Enter 继续...'——子菜单循环（service_control / advanced_settings_menu）自己有 0=返回早 return，没必要再被外层强制按一下 Enter；只有 test_proxy 这种一次性 action 在末尾自己 pause；(4) advanced_settings_menu 替换老的 ╔═╗ 盒子菜单为 menu_title_bar + menu_row 的 C 风格",

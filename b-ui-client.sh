@@ -8,7 +8,7 @@
 
 # 版本号占位符，分发时由 web/server.js 从 version.json 动态注入
 # 直接从 GitHub clone 时该值可能滞后于实际仓库版本
-SCRIPT_VERSION="3.4.13"
+SCRIPT_VERSION="3.4.14"
 
 # 注意: 不使用 set -e，因为它会导致 ((count++)) 等算术运算在变量为0时退出脚本
 
@@ -3996,7 +3996,39 @@ test_proxy() {
         echo -e "${YELLOW}测速失败${NC}"
     fi
     echo ""
-    
+
+    # 测试 6: 出口 IP 类型检测（ping0.cc）
+    # 抓 ping0.cc 主页 HTML 里的 <span class="label ...">家庭宽带 IP / IDC机房 IP</span>
+    # 用于验证开了住宅代理后流量是否真的从住宅 IP 出去
+    echo -e "${YELLOW}[测试 6]${NC} 出口 IP 类型检测 (ping0.cc)..."
+    local ping0_html
+    if $tun_running; then
+        ping0_html=$(curl -sL --max-time 12 -A 'Mozilla/5.0' 'https://ping0.cc/' 2>/dev/null)
+    else
+        ping0_html=$(curl -sL --max-time 12 -A 'Mozilla/5.0' --socks5-hostname "127.0.0.1:${socks_port}" 'https://ping0.cc/' 2>/dev/null)
+    fi
+
+    if [[ -z "$ping0_html" ]]; then
+        echo -e "  ${YELLOW}访问 ping0.cc 失败（超时/被拦截/页面结构变了）${NC}"
+        ((test_failed++))
+    else
+        # title 是 "<IP>-高精度IP地址归属地..." 格式
+        local exit_ip
+        exit_ip=$(echo "$ping0_html" | sed -n 's|.*<title>\([0-9.]*\)-.*|\1|p' | head -1)
+        echo -e "  出口 IP: ${YELLOW}${exit_ip:-未知}${NC}"
+        if echo "$ping0_html" | grep -q '家庭宽带[[:space:]]*IP'; then
+            echo -e "  ${GREEN}✓ 家庭宽带 IP（住宅）${NC}"
+            ((test_passed++))
+        elif echo "$ping0_html" | grep -q 'IDC机房[[:space:]]*IP'; then
+            echo -e "  ${YELLOW}○ IDC 机房 IP（数据中心）${NC}"
+            ((test_passed++))
+        else
+            echo -e "  ${YELLOW}○ 类型未识别（ping0 可能改版）${NC}"
+            ((test_passed++))
+        fi
+    fi
+    echo ""
+
     # 汇总结果
     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
     if [[ $test_failed -eq 0 ]]; then
