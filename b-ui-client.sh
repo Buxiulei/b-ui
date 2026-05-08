@@ -1385,6 +1385,7 @@ ${outbound_config},
       { "action": "sniff" },
       { "protocol": "dns", "action": "hijack-dns" },
       { "port": [22, 2222], "outbound": "direct-out" },
+      { "source_port": [22, 2222], "outbound": "direct-out" },
       { "ip_is_private": true, "outbound": "direct-out" },
       {
         "domain_keyword": ["wechat", "weixin", "tencent", "qq", "xiaohongshu", "douyin", "bytedance", "toutiao", "kuaishou", "bilibili", "taobao", "alipay", "alibaba", "tmall", "jd", "baidu"],
