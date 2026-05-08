@@ -8,7 +8,7 @@
 
 # 版本号占位符，分发时由 web/server.js 从 version.json 动态注入
 # 直接从 GitHub clone 时该值可能滞后于实际仓库版本
-SCRIPT_VERSION="3.4.12"
+SCRIPT_VERSION="3.4.13"
 
 # 注意: 不使用 set -e，因为它会导致 ((count++)) 等算术运算在变量为0时退出脚本
 
@@ -424,51 +424,69 @@ check_client_update() {
 }
 
 # 执行客户端更新
-# 优先使用 check_client_update 检测到的最佳源
+# 优先使用 check_client_update 检测到的最佳源（带最新版本的那个），
+# 并验证下载脚本的 SCRIPT_VERSION 与 REMOTE_VERSION 一致——避免出现
+# "检测到 GitHub 上 v3.4.12 但从服务端下载到 v3.4.11，脚本却显示已升级至 3.4.12" 这种脱节。
 do_client_update() {
     print_info "正在更新客户端..."
-    
+
     local temp_script="/tmp/b-ui-client-new.sh"
     local download_success=false
-    
-    # 加载服务端地址
+
     load_server_address
-    
-    # 构建下载源列表 (服务端永远排第一，确保国内可达)
+
+    # 构建下载源列表
+    # 顺序：检测到 REMOTE_VERSION 那个源（best）放第一，其他作为 fallback
+    # 之前是"服务端永远第一"——会出现服务端版本落后于 GitHub 时拿不到最新
     local sources=()
-    
-    # 服务端优先 (国内可达，速度最快)
-    if [[ -n "$SERVER_ADDRESS" ]]; then
-        sources+=("https://${SERVER_ADDRESS}/packages/b-ui-client.sh|服务端")
+
+    # 1) 最佳源（带 REMOTE_VERSION 的那个）
+    if [[ -n "$UPDATE_URL" ]]; then
+        sources+=("${UPDATE_URL}|${UPDATE_SOURCE:-best}")
     fi
-    
-    # 检测到的最佳源 (如果不是服务端，作为第二选择)
-    if [[ -n "$UPDATE_URL" && "$UPDATE_SOURCE" != "服务端" ]]; then
-        sources+=("${UPDATE_URL}|${UPDATE_SOURCE}")
+
+    # 2) 服务端（如果还没在 #1 里）
+    if [[ -n "$SERVER_ADDRESS" ]] && [[ "$UPDATE_SOURCE" != "服务端" ]]; then
+        sources+=("https://${SERVER_ADDRESS}/packages/b-ui-client.sh|服务端 (fallback)")
     fi
-    
-    # 备选源
-    sources+=("${MIRROR_GHPROXY}/${GITHUB_RAW_URL}|国内镜像")
-    sources+=("${GITHUB_RAW_URL}|GitHub")
+
+    # 3-5) 其他备选源
+    [[ "$UPDATE_SOURCE" != "国内镜像" ]] && sources+=("${MIRROR_GHPROXY}/${GITHUB_RAW_URL}|国内镜像")
+    [[ "$UPDATE_SOURCE" != "GitHub" ]]   && sources+=("${GITHUB_RAW_URL}|GitHub")
     sources+=("${REMOTE_VERSION_URL}|CDN")
-    
-    # 依次尝试下载
-    # 完整性校验：行数 > 100 + shebang 起头 + bash -n 语法通过
-    # 任一失败就丢弃 .tmp 切到下一个源，避免半截脚本覆盖能跑的 /usr/local/bin/bui-c
+
+    # 依次尝试下载 + 完整性校验 + 版本号一致性校验
+    # 任一失败就丢弃 .tmp 切到下一个源，避免半截或过期脚本覆盖能跑的 /usr/local/bin/bui-c
     for item in "${sources[@]}"; do
         IFS='|' read -r url name <<< "$item"
         print_info "尝试: ${name}..."
-        if curl -fsSL --max-time 60 "$url" -o "$temp_script" 2>/dev/null; then
-            local lines=$(wc -l < "$temp_script" 2>/dev/null || echo "0")
-            if [[ "$lines" -gt 100 ]] && head -1 "$temp_script" 2>/dev/null | grep -q '^#!' && bash -n "$temp_script" 2>/dev/null; then
-                download_success=true
-                print_success "从 ${name} 下载成功"
-                break
-            else
-                print_warning "${name} 下载内容校验失败（行数/shebang/语法），尝试下一源"
-                rm -f "$temp_script"
-            fi
+        if ! curl -fsSL --max-time 60 "$url" -o "$temp_script" 2>/dev/null; then
+            print_warning "${name} 下载失败，尝试下一源"
+            continue
         fi
+
+        # 完整性校验：行数 > 100 + shebang + bash -n 语法
+        local lines
+        lines=$(wc -l < "$temp_script" 2>/dev/null || echo "0")
+        if ! [[ "$lines" -gt 100 ]] || ! head -1 "$temp_script" 2>/dev/null | grep -q '^#!' || ! bash -n "$temp_script" 2>/dev/null; then
+            print_warning "${name} 下载内容校验失败（行数/shebang/语法），尝试下一源"
+            rm -f "$temp_script"
+            continue
+        fi
+
+        # 版本号一致性：下载脚本里的 SCRIPT_VERSION 必须等于 REMOTE_VERSION
+        # 不一致说明该源还没同步到最新版（典型场景：服务端 cron 没跑，本地 version.json 落后）
+        local got_ver
+        got_ver=$(grep -m1 -oE '^SCRIPT_VERSION="[^"]+"' "$temp_script" | cut -d'"' -f2)
+        if [[ -n "$REMOTE_VERSION" ]] && [[ -n "$got_ver" ]] && [[ "$got_ver" != "$REMOTE_VERSION" ]]; then
+            print_warning "${name} 返回 v${got_ver}，期望 v${REMOTE_VERSION}（源未及时同步），尝试下一源"
+            rm -f "$temp_script"
+            continue
+        fi
+
+        download_success=true
+        print_success "从 ${name} 下载成功 (v${got_ver:-未知})"
+        break
     done
 
     if [[ "$download_success" == "true" ]]; then
