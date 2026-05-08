@@ -8,7 +8,7 @@
 
 # 版本号占位符，分发时由 web/server.js 从 version.json 动态注入
 # 直接从 GitHub clone 时该值可能滞后于实际仓库版本
-SCRIPT_VERSION="3.4.10"
+SCRIPT_VERSION="3.4.11"
 
 # 注意: 不使用 set -e，因为它会导致 ((count++)) 等算术运算在变量为0时退出脚本
 
@@ -3692,18 +3692,39 @@ show_status_bar() {
     socks_port="${socks_port:-1080}"
     http_port="${http_port:-8080}"
 
-    local svc_dot="${RED}●${NC}" tun_dot="${RED}●${NC}" tun_label="stopped"
-    if systemctl is-active --quiet "$CLIENT_SERVICE" 2>/dev/null \
-        || systemctl is-active --quiet xray-client 2>/dev/null \
-        || systemctl is-active --quiet bui-tun 2>/dev/null; then
-        svc_dot="${GREEN}●${NC}"
-    fi
-    if systemctl is-active --quiet bui-tun 2>/dev/null; then
-        tun_dot="${GREEN}●${NC}"; tun_label="running"
+    # 节点名截断：超过 26 视觉列保留 25 列 + …，避免长 timestamp 后缀挤爆状态条
+    local node_display="${active:-(未设置)}"
+    local node_w; node_w=$(_visual_width "$node_display")
+    if (( node_w > 26 )); then
+        # 简化截断：bash 字符切片是按 char 不是按 visual width，对纯 ASCII 节点名够用
+        # 节点名一般是 hysteria2-XXXX 或自定义短名，基本都是 ASCII，直接 char 截断
+        node_display="${node_display:0:25}…"
     fi
 
-    # 紧凑单行状态：节点 / 协议 / SOCKS / HTTP / TUN
-    echo -e "  节点: ${svc_dot} ${active:-${DIM}(未设置)${NC}}  ${DIM}${protocol}${NC}  ${DIM}•${NC}  SOCKS5 :${socks_port}  HTTP :${http_port}  ${DIM}•${NC}  TUN: ${tun_dot} ${tun_label}"
+    # 服务运行状态点
+    local svc_running=false
+    systemctl is-active --quiet "$CLIENT_SERVICE" 2>/dev/null && svc_running=true
+    systemctl is-active --quiet xray-client       2>/dev/null && svc_running=true
+    systemctl is-active --quiet bui-tun           2>/dev/null && svc_running=true
+    local svc_dot="${RED}●${NC}" svc_label="${DIM}已停止${NC}"
+    [[ "$svc_running" == "true" ]] && svc_dot="${GREEN}●${NC}" && svc_label="运行中"
+
+    local tun_dot="${RED}○${NC}" tun_label="${DIM}关闭${NC}"
+    if systemctl is-active --quiet bui-tun 2>/dev/null; then
+        tun_dot="${GREEN}●${NC}"; tun_label="运行中"
+    fi
+
+    # 协议显示：如果节点名前缀已经包含协议（如 hysteria2-...），不再重复
+    local proto_display="$protocol"
+    if [[ -n "$protocol" ]] && [[ "$node_display" == ${protocol}* ]]; then
+        proto_display=""
+    fi
+    [[ -n "$proto_display" ]] && proto_display="  ${DIM}${proto_display}${NC}"
+
+    # 三行缩进竖排：节点 / 代理 / TUN
+    echo -e "   ${DIM}节点${NC}   ${svc_dot}  ${node_display}${proto_display}"
+    echo -e "   ${DIM}代理${NC}      SOCKS5 :${socks_port}   HTTP :${http_port}"
+    echo -e "   ${DIM}TUN ${NC}   ${tun_dot}  ${tun_label}"
 }
 
 test_proxy() {
@@ -4591,15 +4612,16 @@ update_all() {
 
 advanced_settings_menu() {
     while true; do
-        echo ""
-        echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
-        echo -e "${CYAN}║${NC}              ${GREEN}⚙ 高级设置${NC}                                     ${CYAN}║${NC}"
-        echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
-        echo -e "${CYAN}║${NC}  ${YELLOW}1.${NC} 开机自启动管理                                        ${CYAN}║${NC}"
-        echo -e "${CYAN}║${NC}  ${YELLOW}2.${NC} 编辑路由规则                                          ${CYAN}║${NC}"
-        echo -e "${CYAN}║${NC}  ${YELLOW}0.${NC} 返回主菜单                                            ${CYAN}║${NC}"
-        echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
-        read -p "请选择 [0-2]: " sub
+        clear
+        menu_title_bar "高级设置" "${SCRIPT_VERSION}"
+        menu_row "1" "开机自启动管理"
+        menu_row "2" "编辑路由规则"
+        echo -e "     ${DIM}─────────${NC}"
+        menu_row "0" "返回主菜单"
+        echo
+        local sub
+        menu_prompt_show "选择 [0-2]"
+        read -r sub
         case $sub in
             1)
                 echo ""
@@ -4641,12 +4663,12 @@ advanced_settings_menu() {
 }
 
 #===============================================================================
-# 主菜单（精简版 — 8 项）
+# 主菜单（9 项 + 退出）
 #===============================================================================
 
 show_menu() {
     # C 风格两栏紧凑型菜单：每行两个选项，数字直选
-    # 标题条（含版本）+ 状态行（节点/TUN）+ 选项 grid + 输入提示
+    # 标题条（含版本）+ 状态行（节点/代理/TUN 三行）+ 选项 grid + 输入提示
     menu_title_bar "B-UI 客户端" "${SCRIPT_VERSION}"
     show_status_bar
     echo
@@ -4661,8 +4683,10 @@ show_menu() {
 
     menu_row "1" "切换节点" "2" "$tun_label"
     menu_row "3" "导入节点" "4" "服务控制"
-    menu_row "5" "高级设置" "6" "$update_label"
-    menu_row "7" "卸载"     "0" "退出"
+    menu_row "5" "连接测试" "6" "高级设置"
+    menu_row "7" "$update_label" "8" "卸载"
+    echo -e "     ${DIM}─────────${NC}"
+    menu_row "0" "退出"
     echo
 }
 
@@ -4742,23 +4766,23 @@ tui_main_loop() {
         show_menu
 
         local choice
-        menu_prompt_show "选择 [0-7]"
+        menu_prompt_show "选择 [0-8]"
         read -r choice
 
+        # 不在主循环里强制 read -p "按 Enter"——子菜单循环（service_control / advanced_settings）
+        # 自己有 0=返回；一次性 action 各自决定要不要暂停（test_proxy / update_all 在末尾自己 pause）
         case "$choice" in
             1) tui_switch_node ;;
             2) tui_toggle_tun ;;
             3) tui_import_node ;;
             4) tui_service_control ;;
-            5) advanced_settings_menu ;;
-            6) update_all ;;
-            7) uninstall ;;
+            5) test_proxy; echo; read -p "  按 Enter 返回主菜单..." ;;
+            6) advanced_settings_menu ;;
+            7) update_all ;;
+            8) uninstall ;;
             0) echo; print_info "再见！"; exit 0 ;;
-            *) print_error "无效选项: ${choice:-（空）}" ;;
+            *) print_error "无效选项: ${choice:-（空）}"; sleep 1 ;;
         esac
-
-        echo
-        read -p "  按 Enter 继续..."
     done
 }
 
