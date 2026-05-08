@@ -13,6 +13,8 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
+DIM='\033[2m'
+BOLD='\033[1m'
 
 # 配置
 BASE_DIR="/opt/b-ui"
@@ -39,11 +41,56 @@ print_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
 #===============================================================================
+# 数字菜单渲染（C 风格两栏紧凑型，纯 bash + ANSI）
+#===============================================================================
+
+_visual_width() {
+    local s="$1" w=0 i ch
+    for ((i=0; i<${#s}; i++)); do
+        ch="${s:$i:1}"
+        if [[ "$ch" =~ [^[:ascii:]] ]]; then ((w+=2)); else ((w++)); fi
+    done
+    echo "$w"
+}
+
+_pad_to_width() {
+    local s="$1" target="$2"
+    local cur; cur=$(_visual_width "$s")
+    local need=$((target - cur))
+    [[ $need -lt 0 ]] && need=0
+    printf "%s%${need}s" "$s" ""
+}
+
+# menu_row "1" "label1" "2" "label2"  → 两栏一行，中间留 14 列对齐
+menu_row() {
+    local n1="$1" l1="$2" n2="$3" l2="$4"
+    local left; left=$(_pad_to_width "$l1" 18)
+    if [[ -n "$n2" ]]; then
+        echo -e "     ${YELLOW}[${n1}]${NC} ${left}  ${YELLOW}[${n2}]${NC} ${l2}"
+    else
+        echo -e "     ${YELLOW}[${n1}]${NC} ${l1}"
+    fi
+}
+
+menu_title_bar() {
+    local title="$1" version="$2"
+    echo
+    echo -e "  ${CYAN}━━━━━${NC}  ${BOLD}${title}${NC}  ${DIM}·${NC} ${YELLOW}v${version}${NC}  ${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo
+}
+
+menu_prompt_show() {
+    local prompt="${1:-选择}"
+    echo -ne "  ${GREEN}▸${NC} ${prompt}: "
+}
+
+#===============================================================================
 # TUI 工具检测 & Helpers
 #===============================================================================
 
+# TUI 路径已废弃：v3.4.10 起菜单全部走纯 bash 数字菜单（用户实测箭头选择体验差）
+# 旧分支保留但 TUI_AVAILABLE 永远为 false
 TUI_AVAILABLE=false
-command -v gum &>/dev/null && command -v fzf &>/dev/null && TUI_AVAILABLE=true
 
 OPT_YES=false
 OPT_JSON=false
@@ -268,26 +315,28 @@ show_status_bar_server() {
 #===============================================================================
 
 show_menu() {
-    echo ""
-    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║${NC}                    ${GREEN}B-UI 操作菜单${NC}                            ${CYAN}║${NC}"
-    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}1.${NC} 查看客户端配置                                           ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}2.${NC} 重启所有服务                                             ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}3.${NC} 查看日志                                                 ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}4.${NC} 修改管理密码                                             ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}5.${NC} 开启 BBR                                                 ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}6.${NC} 开机自启动设置                                           ${CYAN}║${NC}"
-    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}7.${NC} ${GREEN}检查 B-UI 更新${NC}                                          ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}8.${NC} ${GREEN}更新内核/客户端 (Hysteria2 + Xray + Client)${NC}               ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}10.${NC} ${YELLOW}端口跳跃设置${NC}                                            ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}11.${NC} ${BLUE}VPS 质量测试${NC}                                            ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}12.${NC} ${YELLOW}配置住宅 IP 出站${NC}                                        ${CYAN}║${NC}"
-    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}9.${NC} ${RED}完全卸载${NC}                                                 ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${YELLOW}0.${NC} 退出                                                     ${CYAN}║${NC}"
-    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
+    # C 风格两栏紧凑型（纯 bash + ANSI 渲染，零依赖）
+    menu_title_bar "B-UI 终端管理面板" "${SCRIPT_VERSION}"
+
+    # 紧凑状态行（4 个服务 + BBR 一行展示）
+    local hy_dot="${RED}●${NC}" xr_dot="${RED}●${NC}" admin_dot="${RED}●${NC}" caddy_dot="${RED}●${NC}" bbr_label="${DIM}off${NC}"
+    systemctl is-active --quiet "$HYSTERIA_SERVICE" 2>/dev/null && hy_dot="${GREEN}●${NC}"
+    systemctl is-active --quiet xray                2>/dev/null && xr_dot="${GREEN}●${NC}"
+    systemctl is-active --quiet "$ADMIN_SERVICE"    2>/dev/null && admin_dot="${GREEN}●${NC}"
+    systemctl is-active --quiet caddy               2>/dev/null && caddy_dot="${GREEN}●${NC}"
+    [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == "bbr" ]] && bbr_label="${GREEN}on${NC}"
+    echo -e "  Hysteria2 ${hy_dot}  Xray ${xr_dot}  Admin ${admin_dot}  Caddy ${caddy_dot}  ${DIM}•${NC}  BBR ${bbr_label}"
+    echo
+
+    menu_row "1"  "查看客户端配置"  "2"  "重启所有服务"
+    menu_row "3"  "查看日志"        "4"  "修改管理密码"
+    menu_row "5"  "开启 BBR"        "6"  "开机自启动"
+    menu_row "7"  "检查更新"        "8"  "更新内核/客户端"
+    menu_row "10" "端口跳跃设置"    "11" "VPS 质量测试"
+    menu_row "12" "住宅 IP 出站"
+    echo -e "     ${DIM}─────────${NC}"
+    menu_row "9"  "${RED}完全卸载${NC}"   "0"  "退出"
+    echo
 }
 
 #===============================================================================
@@ -853,42 +902,32 @@ main() {
         exit $?
     fi
 
-    # TUI 主循环
+    # 主循环（v3.4.10 起：纯数字菜单，所有 12 项直接映射）
     while true; do
         clear
-        print_banner
-        show_status_bar_server
+        show_menu
+
+        local num
+        menu_prompt_show "选择 [0-12]"
+        read -r num
 
         local choice
-        if [[ "$TUI_AVAILABLE" == "true" ]]; then
-            choice=$(gum choose \
-                "重启所有服务" \
-                "查看日志 →" \
-                "查看客户端配置" \
-                "──────────" \
-                "更新" \
-                "端口跳跃设置" \
-                "住宅 IP 出口 →" \
-                "──────────" \
-                "更多设置 →" \
-                "卸载" \
-                "退出" \
-                ) || choice="退出"
-        else
-            show_menu
-            read -p "请选择 [0-12]: " num
-            case $num in
-                1)  choice="查看客户端配置" ;;
-                2)  choice="重启所有服务" ;;
-                3)  choice="查看日志 →" ;;
-                7)  choice="更新" ;;
-                9)  choice="卸载" ;;
-                10) choice="端口跳跃设置" ;;
-                12) choice="住宅 IP 出口 →" ;;
-                0)  choice="退出" ;;
-                *)  choice="更多设置 →" ;;
-            esac
-        fi
+        case $num in
+            1)  choice="查看客户端配置" ;;
+            2)  choice="重启所有服务" ;;
+            3)  choice="查看日志 →" ;;
+            4)  choice="修改管理密码" ;;
+            5)  choice="BBR 设置" ;;
+            6)  choice="自启动管理" ;;
+            7)  choice="更新" ;;
+            8)  choice="更新内核客户端" ;;
+            9)  choice="卸载" ;;
+            10) choice="端口跳跃设置" ;;
+            11) choice="VPS 测速" ;;
+            12) choice="住宅 IP 出口 →" ;;
+            0)  choice="退出" ;;
+            *)  choice="__invalid__" ;;
+        esac
 
         case "$choice" in
             "重启所有服务")
@@ -910,29 +949,21 @@ main() {
                 esac
                 ;;
             "查看客户端配置") show_client_config ;;
+            "修改管理密码")   change_password ;;
+            "BBR 设置")       enable_bbr ;;
+            "自启动管理")     toggle_autostart ;;
             "更新")            check_bui_update ;;
+            "更新内核客户端")  update_kernel ;;
+            "VPS 测速")       run_vps_benchmark ;;
             "端口跳跃设置")    configure_port_hopping_menu ;;
             "住宅 IP 出口 →")  configure_residential_menu ;;
-            "更多设置 →")
-                local sub
-                sub=$(tui_menu "更多设置" "修改管理密码" "BBR 设置" "自启动管理" "VPS 测速" "返回")
-                case "$sub" in
-                    "修改管理密码") change_password ;;
-                    "BBR 设置")     enable_bbr ;;
-                    "自启动管理")   toggle_autostart ;;
-                    "VPS 测速")     run_vps_benchmark ;;
-                esac
-                ;;
             "卸载")            uninstall_all ;;
-            "退出")            tui_info "再见！"; exit 0 ;;
-            "──────────")     continue ;;
-            "__invalid__")    print_error "无效选项" ;;
+            "退出")            print_info "再见！"; exit 0 ;;
+            "__invalid__")    print_error "无效选项: ${num:-（空）}" ;;
         esac
 
-        if [[ "$TUI_AVAILABLE" != "true" ]]; then
-            echo ""
-            read -p "按 Enter 继续..."
-        fi
+        echo
+        read -p "  按 Enter 继续..."
     done
 }
 

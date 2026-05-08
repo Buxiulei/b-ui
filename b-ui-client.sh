@@ -20,6 +20,7 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 DIM='\033[2m'
+BOLD='\033[1m'
 
 # 路径配置 - 使用固定路径避免管道运行时 $0 问题
 BASE_DIR="/opt/hysteria-client"
@@ -58,6 +59,62 @@ print_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
 print_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
 print_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
 print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+
+#===============================================================================
+# 数字菜单渲染（C 风格两栏紧凑型）
+# 设计目标：纯 bash + ANSI，零依赖；中英文混排正确对齐
+#===============================================================================
+
+# 估算字符串的视觉列宽（ASCII = 1，非 ASCII 假定为 2 列宽——CJK 全角字符）
+_visual_width() {
+    local s="$1" w=0 i ch
+    for ((i=0; i<${#s}; i++)); do
+        ch="${s:$i:1}"
+        if [[ "$ch" =~ [^[:ascii:]] ]]; then
+            ((w+=2))
+        else
+            ((w++))
+        fi
+    done
+    echo "$w"
+}
+
+# 把字符串右补空格到目标视觉列宽（用于两栏对齐）
+_pad_to_width() {
+    local s="$1" target="$2"
+    local cur; cur=$(_visual_width "$s")
+    local need=$((target - cur))
+    [[ $need -lt 0 ]] && need=0
+    printf "%s%${need}s" "$s" ""
+}
+
+# 渲染两栏菜单的一行：menu_row "1" "切换节点" "2" "停止 TUN"
+# 第二个参数允许为空，那一栏不显示（用于奇数项最后一行）
+menu_row() {
+    local n1="$1" l1="$2" n2="$3" l2="$4"
+    local left_width=14   # 左栏 label 视觉列宽（足以容纳 4 个 CJK 字符 + 余量）
+    local left
+    left=$(_pad_to_width "$l1" "$left_width")
+    if [[ -n "$n2" ]]; then
+        echo -e "     ${YELLOW}[${n1}]${NC} ${left}  ${YELLOW}[${n2}]${NC} ${l2}"
+    else
+        echo -e "     ${YELLOW}[${n1}]${NC} ${l1}"
+    fi
+}
+
+# 顶部标题分隔条
+menu_title_bar() {
+    local title="$1" version="$2"
+    echo
+    echo -e "  ${CYAN}━━━━━${NC}  ${BOLD}${title}${NC}  ${DIM}·${NC} ${YELLOW}v${version}${NC}  ${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo
+}
+
+# 输入提示（统一风格）
+menu_prompt_show() {
+    local prompt="${1:-选择}"
+    echo -ne "  ${GREEN}▸${NC} ${prompt}: "
+}
 
 # 进度动画 - 在后台运行命令时显示旋转动画
 # JSON 字符串转义函数
@@ -122,60 +179,9 @@ REMOTE_VERSION=""
 # TUI 工具检测 & Helpers
 #===============================================================================
 
+# TUI 路径已废弃：v3.4.10 起菜单全部走纯 bash 数字菜单（用户实测箭头选择体验差）
+# TUI_AVAILABLE 保留为常量 false 兼容旧代码里的 if 分支，但永远不会变 true
 TUI_AVAILABLE=false
-command -v gum &>/dev/null && command -v fzf &>/dev/null && TUI_AVAILABLE=true
-
-# 自动安装 gum + fzf（仅在 root 且当前缺失时执行，失败不致命）
-ensure_tui_tools() {
-    [[ "$TUI_AVAILABLE" == "true" ]] && return 0
-    [[ $EUID -ne 0 ]] && return 0
-
-    local arch fzf_arch
-    case "$(uname -m)" in
-        x86_64)  arch="x86_64" ; fzf_arch="amd64" ;;
-        aarch64) arch="arm64"  ; fzf_arch="arm64" ;;
-        armv7l)  arch="armv7"  ; fzf_arch="armhf" ;;
-        *) return 0 ;;
-    esac
-
-    print_info "安装 TUI 工具（gum + fzf）以启用交互式菜单..."
-
-    if ! command -v gum &>/dev/null; then
-        local ver
-        ver=$(curl -sI "https://github.com/charmbracelet/gum/releases/latest" \
-            | grep -i "^location:" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-        if [[ -n "$ver" ]]; then
-            local url="https://github.com/charmbracelet/gum/releases/download/${ver}/gum_${ver#v}_Linux_${arch}.tar.gz"
-            local tmp; tmp=$(mktemp -d 2>/dev/null) || tmp=""
-            local bin=""
-            if [[ -n "$tmp" ]] && curl -fsSL "$url" -o "$tmp/d.tar.gz" 2>/dev/null \
-               && tar -xz -C "$tmp" -f "$tmp/d.tar.gz" 2>/dev/null; then
-                bin=$(find "$tmp" -name gum -type f 2>/dev/null | head -1)
-            fi
-            [[ -n "$bin" ]] && install -m 755 "$bin" /usr/local/bin/gum && print_success "gum ${ver} 已安装"
-            [[ -n "$tmp" ]] && rm -rf "$tmp"
-        fi
-    fi
-
-    if ! command -v fzf &>/dev/null; then
-        local ver
-        ver=$(curl -sI "https://github.com/junegunn/fzf/releases/latest" \
-            | grep -i "^location:" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-        if [[ -n "$ver" ]]; then
-            local url="https://github.com/junegunn/fzf/releases/download/${ver}/fzf-${ver#v}-linux_${fzf_arch}.tar.gz"
-            local tmp; tmp=$(mktemp -d 2>/dev/null) || tmp=""
-            local bin=""
-            if [[ -n "$tmp" ]] && curl -fsSL "$url" -o "$tmp/d.tar.gz" 2>/dev/null \
-               && tar -xz -C "$tmp" -f "$tmp/d.tar.gz" 2>/dev/null; then
-                bin=$(find "$tmp" -name fzf -type f 2>/dev/null | head -1)
-            fi
-            [[ -n "$bin" ]] && install -m 755 "$bin" /usr/local/bin/fzf && print_success "fzf ${ver} 已安装"
-            [[ -n "$tmp" ]] && rm -rf "$tmp"
-        fi
-    fi
-
-    command -v gum &>/dev/null && command -v fzf &>/dev/null && TUI_AVAILABLE=true
-}
 
 # 全局 flags（由 parse_global_flags 设置）
 OPT_YES=false
@@ -3686,29 +3692,18 @@ show_status_bar() {
     socks_port="${socks_port:-1080}"
     http_port="${http_port:-8080}"
 
-    local svc_icon="🔴" tun_icon="🔴" tun_label="关闭"
-    systemctl is-active --quiet "$CLIENT_SERVICE" 2>/dev/null && svc_icon="🟢"
-    systemctl is-active --quiet xray-client 2>/dev/null && svc_icon="🟢"
+    local svc_dot="${RED}●${NC}" tun_dot="${RED}●${NC}" tun_label="stopped"
+    if systemctl is-active --quiet "$CLIENT_SERVICE" 2>/dev/null \
+        || systemctl is-active --quiet xray-client 2>/dev/null \
+        || systemctl is-active --quiet bui-tun 2>/dev/null; then
+        svc_dot="${GREEN}●${NC}"
+    fi
     if systemctl is-active --quiet bui-tun 2>/dev/null; then
-        tun_icon="🟢"; tun_label="运行中"
+        tun_dot="${GREEN}●${NC}"; tun_label="running"
     fi
 
-    if [[ "$TUI_AVAILABLE" == "true" ]]; then
-        gum style \
-            --border rounded --border-foreground 39 \
-            --padding "0 2" --margin "1 0" \
-            "$(gum style --bold 'B-UI Client')" \
-            "" \
-            "节点   ${svc_icon}  $(gum style --foreground 46 "${active:-(未设置)}")  $(gum style --faint "${protocol}")" \
-            "代理       SOCKS5 :${socks_port}  HTTP :${http_port}" \
-            "TUN    ${tun_icon}  ${tun_label}"
-    else
-        echo ""
-        echo -e "  节点: ${svc_icon} ${active:-(未设置)} (${protocol})"
-        echo -e "  代理: SOCKS5 :${socks_port}  HTTP :${http_port}"
-        echo -e "  TUN:  ${tun_icon} ${tun_label}"
-        echo ""
-    fi
+    # 紧凑单行状态：节点 / 协议 / SOCKS / HTTP / TUN
+    echo -e "  节点: ${svc_dot} ${active:-${DIM}(未设置)${NC}}  ${DIM}${protocol}${NC}  ${DIM}•${NC}  SOCKS5 :${socks_port}  HTTP :${http_port}  ${DIM}•${NC}  TUN: ${tun_dot} ${tun_label}"
 }
 
 test_proxy() {
@@ -4091,7 +4086,22 @@ uninstall() {
         echo -e "  ${GREEN}✓${NC} sing-box 程序已删除"
     fi
     
-    # 7. 删除全局命令 (始终删除，因为用户已确认完全卸载)
+    # 7. 清理 v3.4.5-3.4.9 期间自动安装的 TUI 工具（v3.4.10 起不再使用）
+    # 默认删除，但保留 y/n 提示，避免误删用户自己装的版本
+    if [[ -f /usr/local/bin/gum ]] || [[ -f /usr/local/bin/fzf ]]; then
+        echo ""
+        print_info "清理 TUI 工具（v3.4.5-3.4.9 期间为箭头菜单自动安装）..."
+        read -p "删除 /usr/local/bin/gum 和 /usr/local/bin/fzf? (y/n) [默认 y]: " del_tui
+        del_tui=${del_tui:-y}
+        if [[ "$del_tui" =~ ^[yY]$ ]]; then
+            [[ -f /usr/local/bin/gum ]] && rm -f /usr/local/bin/gum && echo -e "  ${GREEN}✓${NC} gum 已删除"
+            [[ -f /usr/local/bin/fzf ]] && rm -f /usr/local/bin/fzf && echo -e "  ${GREEN}✓${NC} fzf 已删除"
+        else
+            echo -e "  ${YELLOW}○${NC} 跳过 gum/fzf 清理"
+        fi
+    fi
+
+    # 8. 删除全局命令 (始终删除，因为用户已确认完全卸载)
     echo ""
     print_info "删除全局命令..."
     if [[ -f /usr/local/bin/bui-c ]]; then
@@ -4635,27 +4645,25 @@ advanced_settings_menu() {
 #===============================================================================
 
 show_menu() {
-    echo ""
-    echo -e "${CYAN}┌──────────────────────────────────────────┐${NC}"
-    echo -e "${CYAN}│${NC}       ${GREEN}B-UI 客户端  操作菜单${NC}             ${CYAN}│${NC}"
-    echo -e "${CYAN}├──────────────────────────────────────────┘${NC}"
-    echo -e "${CYAN}│${NC}"
-    echo -e "${CYAN}│${NC}  ${YELLOW}1.${NC} 📥  导入节点  ${DIM}(粘贴链接自动识别)${NC}"
-    echo -e "${CYAN}│${NC}  ${YELLOW}2.${NC} 📋  节点管理  ${DIM}(列表/切换/删除)${NC}"
-    echo -e "${CYAN}│${NC}  ${YELLOW}3.${NC} ▶   服务控制  ${DIM}(启动/停止/重启/日志)${NC}"
-    echo -e "${CYAN}│${NC}  ${YELLOW}4.${NC} 🌐  TUN 代理  ${DIM}(全局模式 开/关)${NC}"
-    echo -e "${CYAN}│${NC}  ${YELLOW}5.${NC} 🔍  连接测试"
-    if [[ "$UPDATE_AVAILABLE" == "true" ]]; then
-        echo -e "${CYAN}│${NC}  ${YELLOW}6.${NC} ⬆   一键更新  ${RED}★ 有新版本${NC}"
-    else
-        echo -e "${CYAN}│${NC}  ${YELLOW}6.${NC} ⬆   一键更新  ${DIM}(内核+客户端)${NC}"
-    fi
-    echo -e "${CYAN}│${NC}  ${YELLOW}7.${NC} ⚙   高级设置  ${DIM}(自启动/路由规则)${NC}"
-    echo -e "${CYAN}│${NC}"
-    echo -e "${CYAN}├──────────────────────────────────────────${NC}"
-    echo -e "${CYAN}│${NC}  ${YELLOW}8.${NC} ${RED}🗑  卸载${NC}"
-    echo -e "${CYAN}│${NC}  ${YELLOW}0.${NC} 退出"
-    echo -e "${CYAN}└──────────────────────────────────────────${NC}"
+    # C 风格两栏紧凑型菜单：每行两个选项，数字直选
+    # 标题条（含版本）+ 状态行（节点/TUN）+ 选项 grid + 输入提示
+    menu_title_bar "B-UI 客户端" "${SCRIPT_VERSION}"
+    show_status_bar
+    echo
+
+    # 动态 TUN 标签
+    local tun_label="开启 TUN"
+    systemctl is-active --quiet bui-tun 2>/dev/null && tun_label="停止 TUN"
+
+    # 一键更新带"有新版"标记
+    local update_label="一键更新"
+    [[ "$UPDATE_AVAILABLE" == "true" ]] && update_label="一键更新 ${RED}★${NC}"
+
+    menu_row "1" "切换节点" "2" "$tun_label"
+    menu_row "3" "导入节点" "4" "服务控制"
+    menu_row "5" "高级设置" "6" "$update_label"
+    menu_row "7" "卸载"     "0" "退出"
+    echo
 }
 
 dispatch_subcommand() {
@@ -4722,8 +4730,7 @@ main() {
         exit $?
     fi
 
-    # 无参数 → TUI 交互模式
-    ensure_tui_tools
+    # 无参数 → 交互菜单（纯数字）
     tui_main_loop
 }
 
@@ -4732,61 +4739,26 @@ tui_main_loop() {
 
     while true; do
         clear
-        print_banner
-
-        show_status_bar
-
-        # 动态 TUN 标签
-        local tun_opt="开启 TUN"
-        systemctl is-active --quiet bui-tun 2>/dev/null && tun_opt="停止 TUN"
+        show_menu
 
         local choice
-        if [[ "$TUI_AVAILABLE" == "true" ]]; then
-            choice=$(gum choose \
-                "切换节点" \
-                "$tun_opt" \
-                "──────────" \
-                "导入节点" \
-                "服务控制" \
-                "高级设置" \
-                "──────────" \
-                "一键更新" \
-                "卸载" \
-                "退出" \
-                ) || choice="退出"
-        else
-            show_menu
-            read -p "请选择 [0-8]: " choice
-            case $choice in
-                1) choice="切换节点" ;;
-                2) choice="$tun_opt" ;;
-                3) choice="导入节点" ;;
-                4) choice="服务控制" ;;
-                5) choice="高级设置" ;;
-                6) choice="一键更新" ;;
-                7) choice="卸载" ;;
-                0) choice="退出" ;;
-                *) choice="__invalid__" ;;
-            esac
-        fi
+        menu_prompt_show "选择 [0-7]"
+        read -r choice
 
         case "$choice" in
-            "切换节点")                  tui_switch_node ;;
-            "开启 TUN"|"停止 TUN")       tui_toggle_tun ;;
-            "导入节点")                  tui_import_node ;;
-            "服务控制")                  tui_service_control ;;
-            "高级设置")                  advanced_settings_menu ;;
-            "一键更新")                  update_all ;;
-            "卸载")                      uninstall ;;
-            "退出")                      echo ""; tui_info "再见！"; exit 0 ;;
-            "──────────")               continue ;;
-            "__invalid__")              print_error "无效选项" ;;
+            1) tui_switch_node ;;
+            2) tui_toggle_tun ;;
+            3) tui_import_node ;;
+            4) tui_service_control ;;
+            5) advanced_settings_menu ;;
+            6) update_all ;;
+            7) uninstall ;;
+            0) echo; print_info "再见！"; exit 0 ;;
+            *) print_error "无效选项: ${choice:-（空）}" ;;
         esac
 
-        if [[ "$TUI_AVAILABLE" != "true" ]]; then
-            echo ""
-            read -p "按 Enter 继续..."
-        fi
+        echo
+        read -p "  按 Enter 继续..."
     done
 }
 
