@@ -8,7 +8,7 @@
 
 # 版本号占位符，分发时由 web/server.js 从 version.json 动态注入
 # 直接从 GitHub clone 时该值可能滞后于实际仓库版本
-SCRIPT_VERSION="3.4.14"
+SCRIPT_VERSION="3.4.15"
 
 # 注意: 不使用 set -e，因为它会导致 ((count++)) 等算术运算在变量为0时退出脚本
 
@@ -391,7 +391,10 @@ check_client_update() {
     if [[ -n "$server_ver" ]]; then
         best_version="$server_ver"
         best_source="服务端"
-        best_url="https://${SERVER_ADDRESS}/api/download/b-ui-client.sh"
+        # 注意：是 /packages/b-ui-client.sh 不是 /api/download/...
+        # 历史 bug：曾经写过 /api/download/ 但 server.js 从未实现该路由
+        # 走 /packages/ 才能命中 web/server.js:1168 的处理器（含 SCRIPT_VERSION 注入）
+        best_url="https://${SERVER_ADDRESS}/packages/b-ui-client.sh"
     fi
     if [[ -n "$mirror_ver" ]] && [[ "$(_newer_version "$mirror_ver" "$best_version")" == "$mirror_ver" ]] && [[ "$mirror_ver" != "$best_version" ]]; then
         best_version="$mirror_ver"
