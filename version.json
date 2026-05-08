@@ -1,5 +1,5 @@
 {
-    "version": "3.4.11",
+    "version": "3.4.12",
     "updated": "2026-05-08",
     "files": [
         "install.sh",
@@ -16,6 +16,7 @@
         "b-ui-client.sh"
     ],
     "changelog": {
+        "3.4.12": "客户端 check_client_update 改为真正的 3 源并行查询：v3.4.11 之前注释写'多源并行'但实际是串行 curl，每源 5s 超时最坏情况 15s 才能拿到所有版本号；TUN 模式下走 hy2 隧道到 GitHub/ghproxy 经常 5s 内回不来，结果只有'服务端'源能稳赢——服务端 cron 没及时升级时客户端就拿不到 GitHub 上的最新版（baiyi 的现实问题）。改用 bash 子 shell 后台并行 + 临时文件收集结果 + wait 等齐，每源 10s 超时，所有源同时跑，慢源不再阻塞快源；最大版本号取胜逻辑保留（服务端优先，任一源返回严格更新版就切换 best_url）；超时未返回的源在 UI 显示 '(超时)' 提示用户网络不通畅",
         "3.4.11": "客户端菜单 UX 修复（用户实测反馈）：(1) 状态栏从单行紧凑（节点/协议/SOCKS/HTTP/TUN 横排）改成 3 行缩进竖排（节点/代理/TUN 三行各占一行），节点名 visual 宽度 > 26 列时截断 + 加 …，节点名前缀已含协议时不再重复显示协议；TUN 状态用中文'运行中/关闭'代替英文'running/stopped'；(2) 主菜单加回 [5] 连接测试（之前 v3.4.10 重排时漏掉 test_proxy），重排为 4 行 2 列（[1][2]/[3][4]/[5][6]/[7][8]）+ 单独一行 [0] 退出；(3) tui_main_loop 去掉无条件的 'read -p 按 Enter 继续...'——子菜单循环（service_control / advanced_settings_menu）自己有 0=返回早 return，没必要再被外层强制按一下 Enter；只有 test_proxy 这种一次性 action 在末尾自己 pause；(4) advanced_settings_menu 替换老的 ╔═╗ 盒子菜单为 menu_title_bar + menu_row 的 C 风格",
         "3.4.10": "CLI 菜单回退到数字直选 + 视觉重设计：(1) 用户实测 v3.4.5 引入的 gum 箭头菜单体验比直接敲数字慢（数字靠肌肉记忆，箭头每次都得读光标位置），全部回退到纯 bash 数字菜单；(2) 设计 C 风格两栏紧凑布局：顶部 ━━━━━ 分隔条带版本，中间一行紧凑状态（节点/服务/协议/端口/TUN dot），下方 [N] label 两栏排列，4 行装下 8 个选项；(3) 新增 menu_row + menu_title_bar + menu_prompt_show + _visual_width + _pad_to_width 辅助函数，CJK 全角字符按 2 列宽计算实现混排对齐，零依赖纯 ANSI；(4) 客户端 b-ui-client.sh 删除 v3.4.5 的 ensure_tui_tools 自动安装函数（不再下载 gum/fzf），TUI_AVAILABLE 永久锁为 false；(5) 服务端 b-ui-cli.sh 主循环原本数字 fallback 把 4/5/6/8/11 都丢进 '更多设置 →' 子菜单，改成 12 项全部直接数字映射（修改密码=4、BBR=5、自启动=6、更新内核=8、VPS 测速=11）；(6) 客户端卸载流程新增可选清理 /usr/local/bin/{gum,fzf}（默认 y，避免误删用户自己装的版本）",
         "3.4.9": "配置完整性 + TUN 路由模板自动同步：(1) 客户端 generate_singbox_tun_config 改为原子写入 —— 写到 .tmp.$$ → jq/python3 校验 JSON → sing-box check → mv 替换，避免 cat heredoc 中途被打断把 singbox-tun.json 截断成无效配置；(2) 新增 TUN_SCHEMA_VERSION 常量（v3.4.9 = '2'）+ singbox-tun.json.schema sidecar 文件，ensure_tun_config_ready 比对版本不一致就重新生成，让客户端脚本升级后路由/DNS 模板变更自动同步（之前 v3.4.8 加的 source_port 规则要靠用户手动重启 TUN 才生效）；(3) 新增 bui-c reload-tun 子命令，do_client_update 写入新版后会自动 fork 触发让 TUN 立即应用新模板；(4) do_client_update 下载阶段补强校验（行数 + shebang + bash -n 语法），cp 改 mv 原子替换 /usr/local/bin/bui-c，防止半截脚本覆盖能跑的版本；(5) 服务端 update.sh 新增 download_and_validate 辅助函数：下载到 .tmp → 按扩展名分类校验（.json 用 jq，.sh 检 shebang+bash -n，.yaml 至少有顶层 key）→ mv 替换，do_update 和 auto_update 全部走这条路，下载/校验失败就保留现有文件不覆盖",
