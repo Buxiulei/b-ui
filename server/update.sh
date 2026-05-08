@@ -42,6 +42,52 @@ select_download_source() {
 }
 
 #===============================================================================
+# 下载并校验完整性后原子替换
+# 用法: download_and_validate <url> <local_path>
+# 校验失败/下载失败时丢弃 .tmp，不覆盖现有文件（避免半截下载把能跑的配置冲掉）
+# 按扩展名做相应校验：.json 用 jq，.sh 检 shebang+bash -n，.yaml 至少有顶层 key
+#===============================================================================
+
+download_and_validate() {
+    local url="$1" local_path="$2"
+    local tmp="${local_path}.dl.$$"
+
+    if ! curl -fsSL --max-time 60 "$url" -o "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        return 1
+    fi
+
+    # 大小合理性：空文件直接拒绝
+    if [[ ! -s "$tmp" ]]; then
+        rm -f "$tmp"
+        return 1
+    fi
+
+    # 按扩展名校验语法/结构
+    local ext="${local_path##*.}"
+    case "$ext" in
+        json)
+            if command -v jq &>/dev/null; then
+                jq empty "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+            fi
+            ;;
+        sh)
+            head -1 "$tmp" | grep -q '^#!' || { rm -f "$tmp"; return 1; }
+            bash -n "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+            ;;
+        yaml|yml)
+            # YAML 没有轻量校验器，至少要有一个顶层 key（行首字母+冒号）
+            grep -qE '^[a-zA-Z_][a-zA-Z0-9_-]*:' "$tmp" || { rm -f "$tmp"; return 1; }
+            ;;
+        # html/css/jpg 等二进制/纯文本：仅大小校验，已通过
+    esac
+
+    # 同盘 mv 是原子的；目标目录已被 mkdir -p 创建好
+    mv -f "$tmp" "$local_path"
+    return 0
+}
+
+#===============================================================================
 # 获取版本信息
 #===============================================================================
 
@@ -187,7 +233,7 @@ do_update() {
         IFS=':' read -r remote local <<< "$item"
         mkdir -p "$(dirname "$local")"
         echo -n "  更新 ${remote}... "
-        if curl -fsSL "${DOWNLOAD_URL}/${remote}" -o "${local}" 2>/dev/null; then
+        if download_and_validate "${DOWNLOAD_URL}/${remote}" "${local}"; then
             echo -e "${GREEN}✓${NC}"
         else
             echo -e "${RED}✗${NC}"
@@ -848,14 +894,21 @@ auto_update() {
             ["b-ui-client.sh"]="${BASE_DIR}/b-ui-client.sh"
         )
         
+        local auto_failed=0
         for remote in "${!file_map[@]}"; do
             local local_path="${file_map[$remote]}"
             mkdir -p "$(dirname "$local_path")"
-            
-            if curl -fsSL "${DOWNLOAD_URL}/${remote}" -o "$local_path" 2>/dev/null; then
+
+            if download_and_validate "${DOWNLOAD_URL}/${remote}" "$local_path"; then
                 chmod +x "$local_path" 2>/dev/null || true
+            else
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] 文件下载/校验失败: ${remote}" >> "$LOG_FILE"
+                ((auto_failed++))
             fi
         done
+        if [[ $auto_failed -gt 0 ]]; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] 警告: 共 ${auto_failed} 个文件未通过校验，未覆盖现有版本" >> "$LOG_FILE"
+        fi
         
         # 同步到 packages 分发目录（供客户端下载）
         if [[ -d "${BASE_DIR}/packages" ]]; then

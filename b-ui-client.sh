@@ -426,25 +426,49 @@ do_client_update() {
     sources+=("${REMOTE_VERSION_URL}|CDN")
     
     # 依次尝试下载
+    # 完整性校验：行数 > 100 + shebang 起头 + bash -n 语法通过
+    # 任一失败就丢弃 .tmp 切到下一个源，避免半截脚本覆盖能跑的 /usr/local/bin/bui-c
     for item in "${sources[@]}"; do
         IFS='|' read -r url name <<< "$item"
         print_info "尝试: ${name}..."
         if curl -fsSL --max-time 60 "$url" -o "$temp_script" 2>/dev/null; then
             local lines=$(wc -l < "$temp_script" 2>/dev/null || echo "0")
-            if [[ "$lines" -gt 100 ]]; then
+            if [[ "$lines" -gt 100 ]] && head -1 "$temp_script" 2>/dev/null | grep -q '^#!' && bash -n "$temp_script" 2>/dev/null; then
                 download_success=true
                 print_success "从 ${name} 下载成功"
                 break
+            else
+                print_warning "${name} 下载内容校验失败（行数/shebang/语法），尝试下一源"
+                rm -f "$temp_script"
             fi
         fi
     done
-    
+
     if [[ "$download_success" == "true" ]]; then
-        cp "$temp_script" /usr/local/bin/bui-c
-        chmod +x /usr/local/bin/bui-c
+        # 原子替换 /usr/local/bin/bui-c：先拷到目标目录的 .tmp（同盘 mv 才原子），再 mv
+        # 防止 cp 中途被打断（信号/磁盘满）让全局命令变成空文件或半截脚本
+        local target="/usr/local/bin/bui-c"
+        local target_tmp="${target}.tmp.$$"
+        if ! cp "$temp_script" "$target_tmp"; then
+            rm -f "$temp_script" "$target_tmp"
+            print_error "脚本拷贝失败"
+            return 1
+        fi
+        chmod +x "$target_tmp"
+        mv -f "$target_tmp" "$target"
         rm -f "$temp_script"
-        
+
         print_success "客户端已更新至 v${REMOTE_VERSION}"
+
+        # 自动同步 TUN 路由模板：如果 TUN 在跑，fork 新版 bui-c reload-tun
+        # （新进程跑新代码，调用新 generate_singbox_tun_config 重新生成配置）
+        # 必须 fork 而不是 exec/source，因为当前进程脚本副本是旧的
+        if systemctl is-active --quiet bui-tun 2>/dev/null; then
+            print_info "检测到 TUN 运行中，应用新路由模板..."
+            "$target" reload-tun </dev/null >/dev/null 2>&1 &
+            disown 2>/dev/null || true
+        fi
+
         echo ""
         print_info "请重新运行 bui-c 使更新生效"
         exit 0
@@ -1251,6 +1275,14 @@ EOF
 # sing-box TUN 配置生成 (解决 DNS 污染问题)
 #===============================================================================
 
+# 路由模板版本（schema version）：每次修改 generate_singbox_tun_config 里的
+# 路由/DNS 规则模板时必须 bump。ensure_tun_config_ready 用 sidecar 比对，
+# 不一致就重新生成 singbox-tun.json，让客户端脚本升级后自动同步路由模板。
+# 历史:
+#   1 = v3.4.7 及以前
+#   2 = v3.4.8 入向 SSH 修复（新增 source_port [22, 2222] → direct）
+readonly TUN_SCHEMA_VERSION="2"
+
 generate_singbox_tun_config() {
     local protocol="$1"  # hysteria2 或 vless-reality
     local singbox_config="${BASE_DIR}/singbox-tun.json"
@@ -1330,7 +1362,10 @@ OUTBOUND
     # 生成完整 sing-box 配置
     # 按 sing-box 官方文档生成配置
     # 参考: https://sing-box.sagernet.org/manual/proxy/client/
-    cat > "$singbox_config" <<EOF
+    # 写到 .tmp 校验通过后再原子替换，避免 cat heredoc 中途被打断（信号/磁盘满）
+    # 把现有 singbox-tun.json 截断成无效配置导致 sing-box 启不起来
+    local tmp_config="${singbox_config}.tmp.$$"
+    cat > "$tmp_config" <<EOF
 {
   "log": { "level": "info" },
   "dns": {
@@ -1406,8 +1441,40 @@ ${outbound_config},
   }
 }
 EOF
+
+    # 配置完整性校验（按可用性降级，jq → python3 → 末尾字符兜底）
+    # 失败时丢弃 .tmp、保留旧配置，避免半截配置覆盖能跑的版本
+    local validate_ok=true
+    if command -v jq &>/dev/null; then
+        jq empty "$tmp_config" 2>/dev/null || validate_ok=false
+    elif command -v python3 &>/dev/null; then
+        python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$tmp_config" 2>/dev/null || validate_ok=false
+    else
+        local last_char
+        last_char=$(tr -d '[:space:]' < "$tmp_config" | tail -c 1)
+        [[ "$last_char" == "}" ]] || validate_ok=false
+    fi
+    if [[ "$validate_ok" != "true" ]]; then
+        rm -f "$tmp_config"
+        print_error "TUN 配置 JSON 校验失败，已丢弃临时文件，保留现有配置"
+        return 1
+    fi
+
+    # sing-box 自检（best-effort，安装了就跑；不影响 .tmp 已通过 JSON 校验）
+    if command -v sing-box &>/dev/null; then
+        if ! sing-box check -c "$tmp_config" 2>/dev/null; then
+            rm -f "$tmp_config"
+            print_error "sing-box check 校验失败，已丢弃临时文件，保留现有配置"
+            return 1
+        fi
+    fi
+
+    # 原子替换 + 写入 schema sidecar
+    # mv -f 在同一文件系统上是原子的；schema 文件供 ensure_tun_config_ready 比对
+    mv -f "$tmp_config" "$singbox_config"
     chmod 644 "$singbox_config"
-    
+    echo "$TUN_SCHEMA_VERSION" > "${singbox_config}.schema"
+
     # 创建 sing-box TUN 服务
     cat > /etc/systemd/system/bui-tun.service <<EOF
 [Unit]
@@ -1572,6 +1639,17 @@ ensure_tun_config_ready() {
             needs_regen=true
         elif [[ -n "$active_server" && "$cfg_server" != "$active_server" ]]; then
             # 切换过节点但 TUN 配置还指向旧节点
+            needs_regen=true
+        fi
+    fi
+
+    # 路由模板版本（schema）检测：脚本升级后 generate_singbox_tun_config 模板可能变了
+    # （例如 v3.4.8 新增 source_port 规则），靠 sidecar 文件强制重新生成
+    if [[ "$needs_regen" == "false" ]]; then
+        local cfg_schema=""
+        [[ -f "${tun_cfg}.schema" ]] && cfg_schema=$(tr -d '[:space:]' < "${tun_cfg}.schema" 2>/dev/null)
+        if [[ "$cfg_schema" != "$TUN_SCHEMA_VERSION" ]]; then
+            print_info "TUN 路由模板已升级（schema ${cfg_schema:-未知} → ${TUN_SCHEMA_VERSION}），重新生成..."
             needs_regen=true
         fi
     fi
@@ -2235,6 +2313,34 @@ cmd_tun() {
             exit 2
             ;;
     esac
+}
+
+# 重新生成 TUN 配置并重启（用于客户端脚本升级后让新路由模板立即生效）
+# do_client_update 在写入新版 /usr/local/bin/bui-c 后会 fork 这个子命令——
+# 必须用 NEW 进程跑，因为当前进程加载的还是旧脚本（旧 generate_singbox_tun_config）
+cmd_reload_tun() {
+    if ! systemctl is-active --quiet bui-tun 2>/dev/null; then
+        tui_info "TUN 未在运行，跳过 reload"
+        exit 0
+    fi
+
+    tui_info "检查 TUN 配置（schema=${TUN_SCHEMA_VERSION}）..."
+    if ! ensure_tun_config_ready; then
+        tui_error "TUN 配置生成失败，bui-tun 保持原状"
+        exit 1
+    fi
+
+    tui_info "重启 bui-tun 应用新模板..."
+    systemctl restart bui-tun || { tui_error "bui-tun 重启失败"; exit 1; }
+
+    sleep 2
+    if systemctl is-active --quiet bui-tun; then
+        tui_success "TUN 已应用新路由模板"
+        exit 0
+    else
+        tui_error "bui-tun 启动失败，请查看 journalctl -u bui-tun"
+        exit 1
+    fi
 }
 
 cmd_import() {
@@ -4557,6 +4663,7 @@ dispatch_subcommand() {
     case "$cmd" in
         switch)  cmd_switch "$@" ;;
         tun)     cmd_tun "$@" ;;
+        reload-tun) cmd_reload_tun "$@" ;;
         import)  cmd_import "$@" ;;
         start)   cmd_start "$@" ;;
         stop)    cmd_stop "$@" ;;
