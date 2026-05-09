@@ -2233,10 +2233,21 @@ _switch_to_profile() {
         tui_info "停止 TUN 模式..."; stop_tun_mode
     fi
 
-    # 停止客户端服务
+    # 停止客户端服务（同步等到端口释放，避免 systemctl stop 异步导致后续 start 端口冲突）
     tui_spin "停止当前服务..." bash -c "
         systemctl stop '$CLIENT_SERVICE' 2>/dev/null || true
         systemctl stop xray-client 2>/dev/null || true
+        # 等端口真释放最多 5s（systemctl stop 是异步信号，进程可能还没退出）
+        for i in 1 2 3 4 5; do
+            if ! ss -tlnp 2>/dev/null | grep -qE ':(1080|8080)\s'; then break; fi
+            sleep 1
+        done
+        # 兜底：仍占用就强制 kill
+        if ss -tlnp 2>/dev/null | grep -qE ':(1080|8080)\s'; then
+            pkill -9 -f 'hysteria client' 2>/dev/null || true
+            pkill -9 -f 'xray run' 2>/dev/null || true
+            sleep 1
+        fi
     "
 
     # 解析 URI
@@ -2258,7 +2269,13 @@ _switch_to_profile() {
         tui_info "生成 Hysteria2 配置..."; generate_config
         cp "$CONFIG_FILE" "${config_dir}/config.yaml"
         tui_info "创建 Hysteria2 服务配置..."; create_service
-        tui_spin "启动 Hysteria2 服务..." systemctl start "$CLIENT_SERVICE"
+        # v3.4.31: TUN 模式下不启动 hysteria-client (sing-box 已占 1080/8080 端口冲突)
+        # 切换流程末尾的 start_tun_mode 会按新 active 重新拉起 sing-box，不需要 hysteria-client
+        if [[ "$tun_was_active" == "true" ]]; then
+            tui_info "TUN 模式：跳过启动 Hysteria2 客户端（避免和 sing-box 抢 1080/8080）"
+        else
+            tui_spin "启动 Hysteria2 服务..." systemctl start "$CLIENT_SERVICE"
+        fi
     else
         tui_info "生成 Xray 配置..."; _write_xray_json
         if [[ ! -f /etc/systemd/system/xray-client.service ]]; then
