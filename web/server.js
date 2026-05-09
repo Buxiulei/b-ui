@@ -1780,51 +1780,52 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                     return sendJSON(res, baseResp);
                 }
 
-                // v3.4.21 关键修复：和 CLI cmd_residential_health 同款——用 ping0.cc/geo
-                // (1) ping0.cc 域名命中 sing-box 分流关键词 'ping0' → 自然路由到住宅 outbound
-                // (2) /geo endpoint 返回纯文本（4 行：IP/国家/ASN/ISP），无 captcha
-                // (3) 这才是测"真实业务路径"——用户实际访问 Claude 等敏感服务也走同款路由
-                // 之前 ipinfo.io 不命中 keyword 走 direct 出 VPS，测出来是 VPS IT7 IP，误以为住宅没生效
+                // v3.4.22 关键改进：用 ip-api.com 的 hosting 字段（权威判断）替代 ASN 关键词正则
+                // ip-api.com 的 hosting=true/false 综合多个数据库 + IP 行为分析，比单纯按 ASN 名称推断准确得多
+                //   - hosting:false + proxy:false + mobile:false → 家庭宽带 IP（真 residential）
+                //   - hosting:true → IDC机房 IP
+                //   - mobile:true → 移动网络 IP
+                //   - proxy:true → 代理/匿名 IP
+                // 通过 sing-box socks5 中继访问（127.0.0.1:2080），ip-api.com 不在分流关键词列表，
+                // 但本 endpoint 测的就是"住宅链路是否通"——所以**直接拨住宅 socks5**绕开路由
+                // 用 ping0.cc/geo 同时拿一份做对照（ping0 命中 keyword 走住宅，是双重验证）
+                const socksProxy = (raw.username && raw.password)
+                    ? `socks5://${encodeURIComponent(raw.username)}:${encodeURIComponent(raw.password)}@${raw.host}:${raw.port}`
+                    : `socks5://${raw.host}:${raw.port}`;
                 execFile("curl", [
-                    "--socks5-hostname", "127.0.0.1:2080",
-                    "-m", "10",
+                    "--proxy", socksProxy,
+                    "-m", "8",
                     "-sS",
-                    "https://ping0.cc/geo"
-                ], { timeout: 11000, maxBuffer: 1 * 1024 * 1024 }, (err, stdout) => {
+                    "http://ip-api.com/json/?fields=status,country,city,isp,org,as,mobile,proxy,hosting,query"
+                ], { timeout: 9000, maxBuffer: 1 * 1024 * 1024 }, (err, stdout) => {
                     if (err || !stdout) {
                         return sendJSON(res, baseResp);
                     }
                     try {
-                        // ping0.cc/geo 返回 4 行纯文本:
-                        //   line 1: 出口 IP
-                        //   line 2: 国家 省 市
-                        //   line 3: AS号
-                        //   line 4: ISP 名
-                        const lines = String(stdout).trim().split(/\r?\n/).map(s => s.trim()).filter(Boolean);
-                        const ip = lines[0] || null;
-                        const location = lines[1] || "";
-                        const asn = lines[2] || "";
-                        const ispName = lines[3] || "";
-                        const fullIsp = [asn, ispName].filter(Boolean).join(" ");
+                        const data = JSON.parse(String(stdout));
+                        if (data.status !== "success") {
+                            return sendJSON(res, baseResp);
+                        }
+                        const ip = data.query || null;
+                        const isp = data.isp || data.org || "";
+                        const asn = data.as || "";
+                        const country = data.country || "";
+                        const city = data.city || "";
 
-                        // 类型推断：基于 ISP 名 + ASN
-                        const idcKeywords = /\b(amazon|aws|google\s*cloud|microsoft|azure|digitalocean|linode|vultr|akamai|cloudflare|fastly|hetzner|ovh|leaseweb|scaleway|choopa|hivelocity|latitude|psychz|equinix|hosting|datacenter|data\s*center|colo|colocation|cogent|level\s*3|hurricane\s*electric|he\.net|psinet|tata|telia|ntt|bandwagonhost|cn2|alibaba|tencent|huawei|sharktech|atlantic|quadranet|m247|contabo|gcore|dedipath|frantech|buyvm|fdcservers|nfoservers|zenlayer|noezone|i3d|delimiter|incero|reliablesite|servermania|softlayer|gtt\s+communications|it7\s*networks|godaddy|krypt|i-2000|tier1net)\b/i;
-                        const residentialKeywords = /\b(comcast|verizon|at\s*&\s*t|att\s+services|spectrum|charter|cox|optimum|frontier|centurylink|telekom|deutsche\s+telekom|vodafone|orange|free\s+sas|sfr|bouygues|sky\s+broadband|virgin\s+media|bt\s+group|talktalk|china\s+telecom|china\s+unicom|china\s+mobile|broadband|fttp|fttx|cable|dsl|residential)\b/i;
-                        // 中文关键词补充（ping0 显示中文 ISP 名）
-                        const cnIdc = /(机房|数据中心|主机|云|服务器|数据)/;
-                        const cnResi = /(电信|联通|移动|宽带|家庭|住宅|铁通|长城|联合)/;
+                        // 权威类型判断：ip-api 的 hosting / proxy / mobile boolean
+                        let egressType = "家庭宽带 IP"; // 默认假设住宅（true residential）
+                        if (data.hosting === true) egressType = "IDC机房 IP";
+                        else if (data.proxy === true) egressType = "代理 IP";
+                        else if (data.mobile === true) egressType = "移动网络 IP";
 
-                        let egressType = "unknown";
-                        if (residentialKeywords.test(fullIsp) || cnResi.test(fullIsp)) egressType = "家庭宽带 IP";
-                        else if (idcKeywords.test(fullIsp) || cnIdc.test(fullIsp)) egressType = "IDC机房 IP";
-
-                        const isp = fullIsp + (location ? ` (${location})` : '');
+                        const ispLabel = [asn, isp].filter(Boolean).join(" — ") +
+                                         (country ? ` (${city ? city + ', ' : ''}${country})` : '');
 
                         return sendJSON(res, {
                             ...baseResp,
                             current_egress_ip_test: ip,
                             egress_ip_type: egressType,
-                            via_proxy_isp: isp.trim() || null,
+                            via_proxy_isp: ispLabel.trim() || null,
                         });
                     } catch {
                         return sendJSON(res, baseResp);
