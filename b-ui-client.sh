@@ -1370,6 +1370,8 @@ generate_singbox_tun_config() {
       "server": "${safe_server}",
       "server_port": ${server_port},
       "password": "${safe_password}"${hop_config},
+      "keep_alive_period": "10s",
+      "idle_timeout": "60s",
       "domain_resolver": "local-dns",
       "tls": {
         "enabled": true,

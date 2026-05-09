@@ -394,7 +394,12 @@ tls:
   key: ${key_path}
 
 quic:
-  maxIdleTimeout: 120s
+  # maxIdleTimeout 默认 30s，源码硬上限 120s；60s 在抖动链路下兼顾稳定与连接回收速度
+  maxIdleTimeout: 60s
+
+# 强制走服务端拥塞控制（BBR/Reno），忽略客户端 Brutal 宣告
+# 多用户共享 VPS 必开：防一个客户端宣告 1Gbps Brutal 抢光带宽
+ignoreClientBandwidth: true
 
 # HTTP 认证 (支持用户级别限速)
 auth:
@@ -463,12 +468,31 @@ apply_systemd_configs() {
     # 迁移 config.yaml：添加 QUIC maxIdleTimeout（默认 30s 过短，空闲断连后客户端需约 1 分钟恢复）
     if [[ -f "$config_file" ]] && ! grep -q 'maxIdleTimeout' "$config_file"; then
         if grep -q '^quic:' "$config_file"; then
-            sed -i '/^quic:/a\  maxIdleTimeout: 120s' "$config_file"
+            sed -i '/^quic:/a\  maxIdleTimeout: 60s' "$config_file"
         else
-            awk '/^listen:/{print; print ""; print "quic:"; print "  maxIdleTimeout: 120s"; next}1' \
+            awk '/^listen:/{print; print ""; print "quic:"; print "  maxIdleTimeout: 60s"; next}1' \
                 "$config_file" > "${config_file}.tmp" && mv "${config_file}.tmp" "$config_file"
         fi
-        print_info "  ✓ config.yaml 添加 QUIC maxIdleTimeout: 120s（防止空闲断连）"
+        print_info "  ✓ config.yaml 添加 QUIC maxIdleTimeout: 60s（防止空闲断连）"
+        hysteria_config_changed=1
+    fi
+
+    # 迁移 config.yaml：旧值 120s 调整为 60s（源码硬上限 120s，60s 兼顾稳定与连接回收）
+    if [[ -f "$config_file" ]] && grep -qE '^\s*maxIdleTimeout:\s*120s' "$config_file"; then
+        sed -i 's/^\(\s*maxIdleTimeout:\s*\)120s\s*$/\160s/' "$config_file"
+        print_info "  ✓ config.yaml: maxIdleTimeout 120s → 60s"
+        hysteria_config_changed=1
+    fi
+
+    # 迁移 config.yaml：添加 ignoreClientBandwidth（多用户共享 VPS 防 Brutal 抢带宽）
+    if [[ -f "$config_file" ]] && ! grep -q '^ignoreClientBandwidth:' "$config_file"; then
+        if [[ -n "$(tail -c 1 "$config_file")" ]]; then echo "" >> "$config_file"; fi
+        cat >> "$config_file" <<'EOF'
+
+# 强制走服务端拥塞控制，忽略 Brutal 宣告，防多用户带宽抢占
+ignoreClientBandwidth: true
+EOF
+        print_info "  ✓ config.yaml 加 ignoreClientBandwidth: true"
         hysteria_config_changed=1
     fi
 
@@ -605,6 +629,99 @@ EOF
         fi
     fi
     
+    # 重新部署 cert-sync.sh + service：修复 race condition（exit 1 → exit 0 + 60s 轮询 + ExecStartPre 等 caddy）
+    # 仅当老服务器已有 cert-sync 部署时才覆盖（新装由 core.sh 的 setup_cert_sync 处理）
+    if [[ -f /opt/b-ui/cert-sync.sh ]] || [[ -f /etc/systemd/system/b-ui-cert-sync.service ]]; then
+        cat > /opt/b-ui/cert-sync.sh << 'SYNCEOF'
+#!/bin/bash
+# Caddy 证书同步脚本
+# 从 Caddy 数据目录复制证书到共享目录供 Hysteria2 使用
+
+CERTS_DIR="/opt/b-ui/certs"
+CADDY_DATA="/var/lib/caddy/.local/share/caddy"
+DOMAIN_FILE="/opt/b-ui/certs/.domain"
+LOG_FILE="/var/log/b-ui-cert-sync.log"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
+}
+
+# 读取域名
+if [[ ! -f "$DOMAIN_FILE" ]]; then
+    log "ERROR: 域名配置文件不存在: $DOMAIN_FILE"
+    exit 1
+fi
+DOMAIN=$(cat "$DOMAIN_FILE")
+
+# 轮询 60s 等 Caddy ACME 流程完成（OnBootSec=30s 触发时 Caddy 可能还在签发）
+# 找不到/不完整时 exit 0 而不是 exit 1，避免 systemd 误报失败；下次 timer 会再触发
+CERT_SOURCE=""
+for i in $(seq 1 30); do
+    CERT_SOURCE="${CADDY_DATA}/certificates/acme-v02.api.letsencrypt.org-directory/${DOMAIN}"
+    [[ -d "$CERT_SOURCE" ]] || CERT_SOURCE=$(find "$CADDY_DATA/certificates" -type d -name "$DOMAIN" 2>/dev/null | head -1)
+    if [[ -n "$CERT_SOURCE" && -d "$CERT_SOURCE" \
+          && -f "${CERT_SOURCE}/${DOMAIN}.crt" \
+          && -f "${CERT_SOURCE}/${DOMAIN}.key" ]]; then
+        break
+    fi
+    CERT_SOURCE=""
+    sleep 2
+done
+if [[ -z "$CERT_SOURCE" ]]; then
+    log "INFO: Caddy 证书暂未就绪 (域名: $DOMAIN)，等待下次 timer/cron 触发"
+    exit 0
+fi
+
+# 证书和密钥文件路径
+CERT_FILE="${CERT_SOURCE}/${DOMAIN}.crt"
+KEY_FILE="${CERT_SOURCE}/${DOMAIN}.key"
+
+# 比较文件是否有变化
+mkdir -p "$CERTS_DIR"
+if [[ -f "${CERTS_DIR}/fullchain.pem" ]] && cmp -s "$CERT_FILE" "${CERTS_DIR}/fullchain.pem"; then
+    # 证书未变化，无需同步
+    exit 0
+fi
+
+# 同步证书
+cp "$CERT_FILE" "${CERTS_DIR}/fullchain.pem"
+cp "$KEY_FILE" "${CERTS_DIR}/privkey.pem"
+chmod 644 "${CERTS_DIR}/fullchain.pem"
+chmod 600 "${CERTS_DIR}/privkey.pem"
+
+log "SUCCESS: 证书已同步 (${DOMAIN})"
+
+# Reload Hysteria2 (如果正在运行)
+if systemctl is-active --quiet hysteria-server 2>/dev/null; then
+    systemctl reload hysteria-server 2>/dev/null || systemctl restart hysteria-server 2>/dev/null
+    log "Hysteria2 已重载"
+fi
+
+# 保留最近 200 行日志
+tail -200 "$LOG_FILE" > "${LOG_FILE}.tmp" && mv "${LOG_FILE}.tmp" "$LOG_FILE" 2>/dev/null
+SYNCEOF
+        chmod +x /opt/b-ui/cert-sync.sh
+
+        cat > /etc/systemd/system/b-ui-cert-sync.service << 'EOF'
+[Unit]
+Description=B-UI Certificate Sync (Caddy -> Hysteria2)
+After=caddy.service
+
+[Service]
+Type=oneshot
+# 等 Caddy 完全就绪：进程 active + 证书目录已生成（最多 30s）
+ExecStartPre=/bin/bash -c 'until systemctl is-active --quiet caddy; do sleep 1; done; sleep 3'
+ExecStart=/opt/b-ui/cert-sync.sh
+EOF
+        updated=1
+        print_info "  ✓ cert-sync 修复 race condition (exit 0 + ExecStartPre 等 caddy)"
+    fi
+
+    # install-key.txt 权限收紧到 0600（幂等）
+    if [[ -f /opt/b-ui/install-key.txt ]]; then
+        chmod 600 /opt/b-ui/install-key.txt
+    fi
+
     # 重载 systemd
     if [[ $updated -eq 1 ]]; then
         systemctl daemon-reload

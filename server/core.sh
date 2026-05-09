@@ -400,7 +400,12 @@ tls:
 # 旧版本写死 64 MiB conn 窗口在 1G 小机器上会导致每会话占用 ~80MB 内存
 # 默认值在 200ms RTT 下单连接吞吐约 670 Mbps，对绝大多数 VPS 已够用
 quic:
-  maxIdleTimeout: 120s
+  # maxIdleTimeout 默认 30s，源码硬上限 120s；60s 在抖动链路下兼顾稳定与连接回收速度
+  maxIdleTimeout: 60s
+
+# 强制走服务端拥塞控制（BBR/Reno），忽略客户端 Brutal 宣告
+# 多用户共享 VPS 必开：防一个客户端宣告 1Gbps Brutal 抢光带宽
+ignoreClientBandwidth: true
 
 # HTTP 认证 (支持用户级别限速)
 auth:
@@ -653,27 +658,28 @@ if [[ ! -f "$DOMAIN_FILE" ]]; then
 fi
 DOMAIN=$(cat "$DOMAIN_FILE")
 
-# Caddy 证书存储路径 (ACME 目录结构)
-CERT_SOURCE="${CADDY_DATA}/certificates/acme-v02.api.letsencrypt.org-directory/${DOMAIN}"
-
-# 备用路径: Caddy 有时使用 acme.zerossl.com
-if [[ ! -d "$CERT_SOURCE" ]]; then
-    CERT_SOURCE=$(find "$CADDY_DATA/certificates" -type d -name "$DOMAIN" 2>/dev/null | head -1)
+# 轮询 60s 等 Caddy ACME 流程完成（OnBootSec=30s 触发时 Caddy 可能还在签发）
+# 找不到/不完整时 exit 0 而不是 exit 1，避免 systemd 误报失败；下次 timer 会再触发
+CERT_SOURCE=""
+for i in $(seq 1 30); do
+    CERT_SOURCE="${CADDY_DATA}/certificates/acme-v02.api.letsencrypt.org-directory/${DOMAIN}"
+    [[ -d "$CERT_SOURCE" ]] || CERT_SOURCE=$(find "$CADDY_DATA/certificates" -type d -name "$DOMAIN" 2>/dev/null | head -1)
+    if [[ -n "$CERT_SOURCE" && -d "$CERT_SOURCE" \
+          && -f "${CERT_SOURCE}/${DOMAIN}.crt" \
+          && -f "${CERT_SOURCE}/${DOMAIN}.key" ]]; then
+        break
+    fi
+    CERT_SOURCE=""
+    sleep 2
+done
+if [[ -z "$CERT_SOURCE" ]]; then
+    log "INFO: Caddy 证书暂未就绪 (域名: $DOMAIN)，等待下次 timer/cron 触发"
+    exit 0
 fi
 
-if [[ -z "$CERT_SOURCE" ]] || [[ ! -d "$CERT_SOURCE" ]]; then
-    log "WARNING: 未找到 Caddy 证书目录 (域名: $DOMAIN)"
-    exit 1
-fi
-
-# 查找证书和密钥文件
+# 证书和密钥文件路径
 CERT_FILE="${CERT_SOURCE}/${DOMAIN}.crt"
 KEY_FILE="${CERT_SOURCE}/${DOMAIN}.key"
-
-if [[ ! -f "$CERT_FILE" ]] || [[ ! -f "$KEY_FILE" ]]; then
-    log "WARNING: 证书文件不完整 (cert: $CERT_FILE, key: $KEY_FILE)"
-    exit 1
-fi
 
 # 比较文件是否有变化
 mkdir -p "$CERTS_DIR"
@@ -713,6 +719,8 @@ After=caddy.service
 
 [Service]
 Type=oneshot
+# 等 Caddy 完全就绪：进程 active + 证书目录已生成（最多 30s）
+ExecStartPre=/bin/bash -c 'until systemctl is-active --quiet caddy; do sleep 1; done; sleep 3'
 ExecStart=${sync_script}
 EOF
 
