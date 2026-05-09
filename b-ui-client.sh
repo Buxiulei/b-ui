@@ -2034,6 +2034,35 @@ get_active_config() {
     fi
 }
 
+#===============================================================================
+# v3.4.25: 节点显示名 helper (alias 优先 → 老节点从 uri.txt 兜底解析 → 目录名 fallback)
+# 在 save_config_meta / list_configs / show_status_bar / tui_switch_node 复用
+#===============================================================================
+_extract_alias_from_uri() {
+    local uri="$1"
+    [[ "$uri" != *"#"* ]] && return
+    local frag="${uri#*#}"
+    if command -v python3 &>/dev/null; then
+        python3 -c "import sys,urllib.parse; print(urllib.parse.unquote(sys.argv[1]))" "$frag" 2>/dev/null
+    else
+        printf '%b' "${frag//%/\\x}"
+    fi
+}
+
+_get_node_display_name() {
+    local config_name="$1"
+    [[ -z "$config_name" ]] && { echo "(未设置)"; return; }
+    local meta="${CONFIGS_DIR}/${config_name}/meta.json"
+    local uri_file="${CONFIGS_DIR}/${config_name}/uri.txt"
+    local alias=""
+
+    [[ -f "$meta" ]] && alias=$(grep '"alias"' "$meta" 2>/dev/null | cut -d'"' -f4)
+    if [[ -z "$alias" ]] && [[ -f "$uri_file" ]]; then
+        alias=$(_extract_alias_from_uri "$(cat "$uri_file" 2>/dev/null)")
+    fi
+    if [[ -n "$alias" ]]; then echo "$alias"; else echo "$config_name"; fi
+}
+
 save_config_meta() {
     local config_name="$1"
     local protocol="$2"
@@ -2045,19 +2074,13 @@ save_config_meta() {
     local config_dir="${CONFIGS_DIR}/${config_name}"
     mkdir -p "$config_dir" || return 1
 
-    # v3.4.24: 从 URI 的 #fragment 解析中文备注名（hy2://...#服务器专用 / vless://...#xxx）
-    # URL decode 后写入 meta.json 的 alias 字段，list_configs 优先显示
-    local alias=""
-    if [[ "$uri" == *"#"* ]]; then
-        local frag="${uri#*#}"
-        # URL decode（python3 兜底，没 python3 用 printf '%b' 简单解 %xx）
-        if command -v python3 &>/dev/null; then
-            alias=$(python3 -c "import sys,urllib.parse; print(urllib.parse.unquote(sys.argv[1]))" "$frag" 2>/dev/null)
-        else
-            alias=$(printf '%b' "${frag//%/\\x}")
-        fi
-        # JSON-escape：双引号、反斜杠、控制字符
-        alias=$(printf '%s' "$alias" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read())[1:-1])" 2>/dev/null || printf '%s' "$alias" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    # v3.4.24+: 从 URI 的 #fragment 解析中文备注名
+    local alias
+    alias=$(_extract_alias_from_uri "$uri")
+    # JSON-escape：双引号、反斜杠
+    if [[ -n "$alias" ]]; then
+        alias=$(printf '%s' "$alias" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read())[1:-1])" 2>/dev/null \
+                || printf '%s' "$alias" | sed 's/\\/\\\\/g; s/"/\\"/g')
     fi
 
     cat > "${config_dir}/meta.json" << EOF
@@ -3772,13 +3795,17 @@ show_status_bar() {
     socks_port="${socks_port:-1080}"
     http_port="${http_port:-8080}"
 
-    # 节点名截断：超过 26 视觉列保留 25 列 + …，避免长 timestamp 后缀挤爆状态条
-    local node_display="${active:-(未设置)}"
+    # v3.4.25: alias 优先显示，长名截断（节点中文备注名优于 timestamp 目录名）
+    local node_display
+    node_display=$(_get_node_display_name "${active:-}")
     local node_w; node_w=$(_visual_width "$node_display")
     if (( node_w > 26 )); then
-        # 简化截断：bash 字符切片是按 char 不是按 visual width，对纯 ASCII 节点名够用
-        # 节点名一般是 hysteria2-XXXX 或自定义短名，基本都是 ASCII，直接 char 截断
-        node_display="${node_display:0:25}…"
+        # 简化截断：bash 字符切片按 char，CJK 在终端按 2 列宽显示，截 13 个字符 ≈ 26 列
+        if (( ${#node_display} > 13 )); then
+            node_display="${node_display:0:13}…"
+        else
+            node_display="${node_display:0:25}…"
+        fi
     fi
 
     # 服务运行状态点
@@ -4907,7 +4934,7 @@ tui_switch_node() {
 
     local active; active=$(get_active_config)
 
-    # 构建显示列表
+    # v3.4.25: 构建显示列表（alias 优先，目录名做副标题）
     local lines=()
     for config_dir in "$CONFIGS_DIR"/*/; do
         [[ ! -d "$config_dir" ]] && continue
@@ -4915,9 +4942,17 @@ tui_switch_node() {
         local meta="${config_dir}meta.json"
         local protocol; protocol=$(grep '"protocol"' "$meta" 2>/dev/null | cut -d'"' -f4)
         local server; server=$(grep '"server"' "$meta" 2>/dev/null | cut -d'"' -f4)
+        local display; display=$(_get_node_display_name "$name")
         local marker=""
         [[ "$name" == "$active" ]] && marker="  ★ 当前"
-        lines+=("$(printf '%-28s  %-16s  %s%s' "$name" "$protocol" "$server" "$marker")")
+        # alias 不等于 name 时显示 'alias (name)'，相等就只显示 name 一次
+        local title
+        if [[ "$display" != "$name" ]]; then
+            title="$display ($name)"
+        else
+            title="$name"
+        fi
+        lines+=("$(printf '%-40s  %-12s  %s%s' "$title" "$protocol" "$server" "$marker")")
     done
 
     local selected
@@ -4942,7 +4977,13 @@ tui_switch_node() {
         for c in "${configs[@]}"; do
             local marker=""
             [[ "$c" == "$active" ]] && marker=" ★"
-            echo "  $i. ${c}${marker}"
+            # v3.4.25: alias 优先显示，目录名置灰做副标题
+            local disp; disp=$(_get_node_display_name "$c")
+            if [[ "$disp" != "$c" ]]; then
+                echo -e "  $i. ${disp}${marker}  ${DIM}($c)${NC}"
+            else
+                echo "  $i. ${c}${marker}"
+            fi
             ((i++))
         done
         echo ""
