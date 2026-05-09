@@ -1,5 +1,5 @@
 {
-    "version": "3.4.34",
+    "version": "3.4.35",
     "updated": "2026-05-09",
     "files": [
         "install.sh",
@@ -16,6 +16,7 @@
         "b-ui-client.sh"
     ],
     "changelog": {
+        "3.4.35": "test_proxy 测试 6 出口 IP 类型检测换数据源（同 v3.4.22 server 端）：之前用 ping0.cc 主页 HTML 抓 '家庭宽带 IP / IDC机房 IP' label，但 ping0 加了 Cloudflare Turnstile 验证码（页面只有 ~1.3KB captcha 不返回真内容），永远显示'类型未识别（ping0 可能改版）'。改用 ip-api.com/json 返回 hosting/proxy/mobile boolean 权威判断（同 v3.4.22 服务端 /api/residential/health 同款方案）：hosting=true → IDC，proxy=true → 代理，mobile=true → 移动，否则 → 家庭宽带；同时显示 ASN ISP 名（更详细）。客户端测试 6 现在可靠返回真实出口类型。",
         "3.4.34": "b-ui-client.sh 入口加 BASH_SOURCE 守卫（让脚本可 source 不触发 main）。第三轮 smoke test 发现：用 `source /usr/local/bin/bui-c` 调用单个函数（如 test_proxy / show_status_bar）做诊断时，脚本末尾的 case 入口无条件跑 first_run_setup + main → 触发 update 流程 / 主菜单循环，让 source 调用 hang 住或污染目标函数。修复：用 `[[ \"${BASH_SOURCE[0]}\" == \"${0}\" ]]` 守卫（标准 bash 做法），脚本被 source 时仅加载函数定义不触发 main，被直接执行时正常跑。这样未来调试可以 `bash -c '. /usr/local/bin/bui-c; test_proxy'` 单独调任意函数做单元测试。",
         "3.4.33": "import 节点 dedup 修复（第二轮 smoke test 发现）：cmd_import 和 tui_import_node 都用 sanitize 后的 config_name 做 -d 检测，但中文 remark（如 '服务器专用'）经 sanitize（保留 [a-zA-Z0-9._-]）→ 全删 → fallback 到 ${protocol}-$(date +%s) 时间戳，**每次时间戳都不同**所以 dedup 永远不命中，重复 URI 反复创建新节点目录。修复：抽出 `_find_config_by_uri` helper 遍历 configs/*/uri.txt 按内容比对（cmp 等价），cmd_import 和 tui_import_node 在 sanitize 之前先用 helper 检查 URI 是否已导入过——命中就跳过。这才是用户实际期望的去重语义（同款 hy2:// URL 应去重，不管 remark 是不是 sanitize 友好）。",
         "3.4.32": "bui-c 全功能 smoke test 后修 4 个 bug：(1) **status --json / list --json 输出污染**：check_os 在 main 第 2 行打 'INFO 操作系统' 进 stdout，但 parse_global_flags 在第 4 行才设 OPT_JSON——JSON 解析失败。修复：先解析 flags，再 check_os；check_os 收到 status/list 子命令名时静默；OPT_JSON/OPT_QUIET 任一为 true 时也静默。(2) **switch <当前节点> 重跑切换流程**：cmd_switch 没检测就调 _switch_to_profile，导致 stop/start TUN 浪费时间。修复：cmd_switch 开头比对 active，相同直接 exit 0 提示'已是当前节点'。(3) **bui-c stop 后服务变 failed 不是 inactive**：之前 hysteria-client fail 累积。修复：stop 后加 systemctl reset-failed 清理状态。(4) **bui-c start 在 TUN 模式下错误启动 hysteria-client**：导致端口冲突 + bui-tun 没起来。修复：检测 bui-tun.service unit 存在且 enabled → 调 start_tun_mode 恢复 TUN，否则按协议启动 hysteria-client/xray-client。",

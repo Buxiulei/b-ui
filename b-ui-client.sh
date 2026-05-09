@@ -4149,35 +4149,39 @@ test_proxy() {
     fi
     echo ""
 
-    # 测试 6: 出口 IP 类型检测（ping0.cc）
-    # 抓 ping0.cc 主页 HTML 里的 <span class="label ...">家庭宽带 IP / IDC机房 IP</span>
-    # 用于验证开了住宅代理后流量是否真的从住宅 IP 出去
-    echo -e "${YELLOW}[测试 6]${NC} 出口 IP 类型检测 (ping0.cc)..."
-    local ping0_html
+    # 测试 6: 出口 IP 类型检测（v3.4.34 改用 ip-api.com 替代 ping0.cc）
+    # ping0.cc 加 Cloudflare Turnstile 验证码后主页 HTML 解析永远拿不到内容
+    # ip-api.com 返回 hosting/proxy/mobile boolean 字段权威判断
+    echo -e "${YELLOW}[测试 6]${NC} 出口 IP 类型检测 (ip-api.com)..."
+    local ip_json
     if $tun_running; then
-        ping0_html=$(curl -sL --max-time 12 -A 'Mozilla/5.0' 'https://ping0.cc/' 2>/dev/null)
+        ip_json=$(curl -sL --max-time 8 'http://ip-api.com/json/?fields=status,country,city,isp,org,as,mobile,proxy,hosting,query' 2>/dev/null)
     else
-        ping0_html=$(curl -sL --max-time 12 -A 'Mozilla/5.0' --socks5-hostname "127.0.0.1:${socks_port}" 'https://ping0.cc/' 2>/dev/null)
+        ip_json=$(curl -sL --max-time 8 --socks5-hostname "127.0.0.1:${socks_port}" 'http://ip-api.com/json/?fields=status,country,city,isp,org,as,mobile,proxy,hosting,query' 2>/dev/null)
     fi
 
-    if [[ -z "$ping0_html" ]]; then
-        echo -e "  ${YELLOW}访问 ping0.cc 失败（超时/被拦截/页面结构变了）${NC}"
+    if [[ -z "$ip_json" ]] || ! echo "$ip_json" | grep -q '"status":"success"'; then
+        echo -e "  ${YELLOW}访问 ip-api.com 失败（超时/网络不通）${NC}"
         ((test_failed++))
     else
-        # title 是 "<IP>-高精度IP地址归属地..." 格式
-        local exit_ip
-        exit_ip=$(echo "$ping0_html" | sed -n 's|.*<title>\([0-9.]*\)-.*|\1|p' | head -1)
+        local exit_ip isp_label hosting proxy mobile
+        exit_ip=$(echo "$ip_json" | sed -n 's|.*"query":"\([^"]*\)".*|\1|p')
+        isp_label=$(echo "$ip_json" | sed -n 's|.*"as":"\([^"]*\)".*|\1|p')
+        hosting=$(echo "$ip_json" | grep -o '"hosting":[a-z]*' | cut -d: -f2)
+        proxy=$(echo "$ip_json" | grep -o '"proxy":[a-z]*' | cut -d: -f2)
+        mobile=$(echo "$ip_json" | grep -o '"mobile":[a-z]*' | cut -d: -f2)
         echo -e "  出口 IP: ${YELLOW}${exit_ip:-未知}${NC}"
-        if echo "$ping0_html" | grep -q '家庭宽带[[:space:]]*IP'; then
-            echo -e "  ${GREEN}✓ 家庭宽带 IP（住宅）${NC}"
-            ((test_passed++))
-        elif echo "$ping0_html" | grep -q 'IDC机房[[:space:]]*IP'; then
+        echo -e "  ISP:    ${YELLOW}${isp_label:-未知}${NC}"
+        if [[ "$hosting" == "true" ]]; then
             echo -e "  ${YELLOW}○ IDC 机房 IP（数据中心）${NC}"
-            ((test_passed++))
+        elif [[ "$proxy" == "true" ]]; then
+            echo -e "  ${YELLOW}○ 代理/匿名 IP${NC}"
+        elif [[ "$mobile" == "true" ]]; then
+            echo -e "  ${GREEN}✓ 移动网络 IP${NC}"
         else
-            echo -e "  ${YELLOW}○ 类型未识别（ping0 可能改版）${NC}"
-            ((test_passed++))
+            echo -e "  ${GREEN}✓ 家庭宽带 IP（住宅）${NC}"
         fi
+        ((test_passed++))
     fi
     echo ""
 
