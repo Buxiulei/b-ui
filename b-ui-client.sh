@@ -2086,6 +2086,22 @@ _get_node_display_name() {
     if [[ -n "$alias" ]]; then echo "$alias"; else echo "$config_name"; fi
 }
 
+# v3.4.33: 按 URI 内容 dedup（避免中文 remark sanitize 后 fallback 到时间戳每次不同导致重复导入）
+# 返回找到的 config_name 或空字符串
+_find_config_by_uri() {
+    local uri="$1"
+    [[ -z "$uri" ]] && return
+    [[ ! -d "$CONFIGS_DIR" ]] && return
+    local d
+    for d in "$CONFIGS_DIR"/*/; do
+        [[ -d "$d" ]] || continue
+        if [[ -f "${d}uri.txt" ]] && [[ "$(cat "${d}uri.txt" 2>/dev/null)" == "$uri" ]]; then
+            basename "$d"
+            return
+        fi
+    done
+}
+
 save_config_meta() {
     local config_name="$1"
     local protocol="$2"
@@ -2528,6 +2544,14 @@ cmd_import() {
     if [[ -z "$parsed" ]]; then
         tui_error "URI 解析失败"
         exit 1
+    fi
+
+    # v3.4.33: URI 内容 dedup（中文 remark sanitize 后变 timestamp 每次不同，老逻辑永远 dedup 不到）
+    local existing
+    existing=$(_find_config_by_uri "$uri")
+    if [[ -n "$existing" ]]; then
+        tui_info "节点已存在（相同 URI）: $existing，跳过"
+        exit 0
     fi
 
     # 从 parsed 输出中提取 remark（不污染全局变量）
@@ -5126,6 +5150,13 @@ tui_import_node() {
         fi
 
         [[ -z "$parsed" ]] && { tui_error "解析失败: ${uri:0:50}"; ((fail++)); continue; }
+
+        # v3.4.33: URI 内容 dedup（同款 cmd_import 修复）
+        local existing_dup
+        existing_dup=$(_find_config_by_uri "$uri")
+        if [[ -n "$existing_dup" ]]; then
+            tui_info "已存在: $existing_dup（相同 URI，跳过）"; continue
+        fi
 
         local remark server_addr
         remark=$(echo "$parsed" | grep '^REMARK=' | cut -d= -f2-)
