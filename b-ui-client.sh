@@ -1511,10 +1511,16 @@ EOF
     fi
 
     # sing-box 自检（best-effort，安装了就跑；不影响 .tmp 已通过 JSON 校验）
+    # v3.4.28: 把 sing-box check 的 stderr 显示出来，方便诊断字段不识别 / 版本不对等问题
     if command -v sing-box &>/dev/null; then
-        if ! sing-box check -c "$tmp_config" 2>/dev/null; then
-            rm -f "$tmp_config"
-            print_error "sing-box check 校验失败，已丢弃临时文件，保留现有配置"
+        local check_err
+        check_err=$(sing-box check -c "$tmp_config" 2>&1)
+        if [[ $? -ne 0 ]]; then
+            print_error "sing-box check 校验失败:"
+            printf '%s\n' "$check_err" | sed 's/^/    /' >&2
+            print_warning "保留临时文件用于诊断: ${tmp_config}"
+            print_warning "现有 singbox-tun.json 配置不变"
+            # 注：临时文件保留供用户自查，下次成功生成时会被覆盖
             return 1
         fi
     fi
