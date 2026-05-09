@@ -1425,3 +1425,148 @@ textarea.resi-domains-ta:focus { border-color: rgba(0,0,0,.15); }
     box-shadow: 0 4px 12px var(--primary-glow);
 }
 .resi-btn-save:hover { box-shadow: 0 6px 16px var(--primary-glow); }
+
+/* ─── 系统状态卡片 (住宅 IP 健康 + hy2 watchdog) ─────────────────────────── */
+.sysstat-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    gap: 20px;
+}
+.sysstat-card .table-header {
+    padding: 18px 24px;
+}
+.sysstat-card .table-header h2 {
+    font-size: 16px;
+}
+.sysstat-refresh {
+    padding: 6px 14px !important;
+    font-size: 12px !important;
+}
+.sysstat-body {
+    padding: 18px 24px 22px;
+    display: flex;
+    flex-direction: column;
+    gap: 11px;
+    min-height: 120px;
+}
+.sysstat-row {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    flex-wrap: wrap;
+    margin-bottom: 4px;
+}
+.sysstat-label {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-main);
+}
+.sysstat-label-dim {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-dim);
+}
+.sysstat-kv {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    font-size: 13px;
+    line-height: 1.5;
+}
+.sysstat-k {
+    color: var(--text-dim);
+    font-weight: 500;
+    flex-shrink: 0;
+}
+.sysstat-v {
+    color: var(--text-main);
+    font-weight: 500;
+    text-align: right;
+    word-break: break-word;
+}
+.sysstat-tag {
+    display: inline-block;
+    padding: 2px 9px;
+    border-radius: 999px;
+    font-size: 11.5px;
+    font-weight: 600;
+    background: rgba(0, 0, 0, 0.05);
+    color: var(--text-dim);
+}
+.sysstat-tag.good {
+    background: var(--success-bg);
+    color: var(--success);
+}
+.sysstat-tag.warn {
+    background: var(--warning-bg);
+    color: var(--warning);
+}
+.sysstat-tag.bad {
+    background: var(--danger-bg);
+    color: var(--danger);
+}
+.resi-dot.warn {
+    background: var(--warning);
+    animation: resiPulse 2s infinite;
+}
+.sysstat-err {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 14px;
+    background: var(--danger-bg);
+    border-radius: 12px;
+    color: var(--danger);
+    font-size: 13px;
+    font-weight: 500;
+}
+.sysstat-err-ico {
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    background: var(--danger);
+    color: #fff;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 700;
+    flex-shrink: 0;
+    font-size: 13px;
+}
+.sysstat-retry-btn {
+    margin-left: auto;
+    padding: 5px 12px !important;
+    font-size: 12px !important;
+}
+.sysstat-logs {
+    margin-top: 4px;
+    border: 1px solid var(--glass-border);
+    border-radius: 12px;
+    overflow: hidden;
+}
+.sysstat-logs > summary {
+    list-style: none;
+    cursor: pointer;
+    padding: 9px 14px;
+    font-size: 12.5px;
+    color: var(--text-dim);
+    background: rgba(0, 0, 0, 0.025);
+    transition: background 0.18s;
+    user-select: none;
+}
+.sysstat-logs > summary::-webkit-details-marker { display: none; }
+.sysstat-logs > summary:hover { background: rgba(0, 0, 0, 0.04); color: var(--text-main); }
+.sysstat-logs > pre {
+    margin: 0;
+    padding: 12px 14px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11.5px;
+    color: var(--text-main);
+    background: #fafafa;
+    line-height: 1.55;
+    white-space: pre-wrap;
+    word-break: break-all;
+    max-height: 180px;
+    overflow-y: auto;
+}

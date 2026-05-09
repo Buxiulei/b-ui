@@ -80,7 +80,24 @@ verify_domain_dns() {
 
 check_bbr_status() {
     local cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-    [[ "$cc" == "bbr" ]]
+    # 兼容 bbr / bbr3 / bbrv3 / bbr_v3
+    [[ "$cc" == "bbr" || "$cc" == "bbr3" || "$cc" == "bbrv3" || "$cc" == "bbr_v3" ]]
+}
+
+# 检测系统支持的最佳 BBR 拥塞算法（BBRv3 优先）
+# 输出：bbr3 / bbrv3 / bbr_v3 / bbr / 空字符串（不支持）
+detect_best_bbr_algo() {
+    local available
+    available=$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || echo "")
+    # 按优先级匹配（BBRv3 > BBR）
+    for algo in bbr3 bbrv3 bbr_v3 bbr; do
+        if [[ " $available " == *" $algo "* ]]; then
+            echo "$algo"
+            return 0
+        fi
+    done
+    echo ""
+    return 1
 }
 
 #===============================================================================
@@ -507,7 +524,14 @@ generate_reality_keys() {
 }
 EOF
     chmod 600 "$BASE_DIR/reality-keys.json"
-    print_success "Reality 密钥已生成"
+
+    # 备份到外部目录（防 b-ui 重装时丢密钥导致客户端订阅 reality verification failed）
+    mkdir -p /root/.b-ui-backup /var/backups/b-ui 2>/dev/null
+    cp "$BASE_DIR/reality-keys.json" /root/.b-ui-backup/reality-keys.json 2>/dev/null || true
+    cp "$BASE_DIR/reality-keys.json" /var/backups/b-ui/reality-keys.json 2>/dev/null || true
+    chmod 600 /root/.b-ui-backup/reality-keys.json /var/backups/b-ui/reality-keys.json 2>/dev/null || true
+
+    print_success "Reality 密钥已生成（已备份到 /root/.b-ui-backup/ 和 /var/backups/b-ui/）"
 }
 
 configure_xray() {
@@ -993,25 +1017,41 @@ configure_firewall() {
 
 enable_bbr() {
     print_info "配置 BBR 优化..."
-    
-    if check_bbr_status; then
-        print_success "BBR 已启用"
+
+    # 检测系统支持的最佳 BBR 算法（BBRv3 优先）
+    local algo
+    algo=$(detect_best_bbr_algo)
+
+    # 如果当前已经是 bbr 系且系统支持的"最佳"也是同一个，直接 OK
+    local current_cc
+    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    if [[ -n "$current_cc" && "$current_cc" == "$algo" ]]; then
+        print_success "BBR 已启用（${current_cc}）"
         return 0
     fi
-    
+
+    # 模块自动加载（部分内核 bbr3 内置无独立模块）
     modprobe tcp_bbr 2>/dev/null || true
-    
-    cat > /etc/sysctl.d/99-hysteria-bbr.conf << EOF
+
+    # 没探测到任何 bbr 算法 → 退回常规 bbr 写入（让 sysctl 在加载模块后生效）
+    if [[ -z "$algo" ]]; then
+        algo="bbr"
+        print_warning "未检测到 BBR 算法（/proc/.../tcp_available_congestion_control），仍写入 bbr 兜底"
+    fi
+
+    cat > /etc/sysctl.d/99-hysteria-bbr.conf <<EOF
 net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
+net.ipv4.tcp_congestion_control=${algo}
 EOF
-    
+
     sysctl --system > /dev/null 2>&1
-    
+
     if check_bbr_status; then
-        print_success "BBR 启用成功"
+        local now_cc
+        now_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+        print_success "BBR 启用成功（${now_cc}）"
     else
-        print_warning "BBR 配置完成，可能需要重启生效"
+        print_warning "BBR 配置完成（${algo}），可能需要重启生效"
     fi
 }
 
@@ -1118,6 +1158,33 @@ EOF
     
     systemctl daemon-reload
     print_success "进程优先级已优化 (RT priority 99)"
+
+    # 3. 网络栈调优（v3.4.19，与 99-hysteria-perf.conf 分离）
+    # 关键点：减少跨境抖动 / GFW PMTU 黑洞 / 僵尸 TCP 卡死感
+    cat > /etc/sysctl.d/99-b-ui-network.conf <<'EOF'
+# B-UI 网络栈调优 v3.4.19
+# 减少 stuck 卡死感（影响用户感受的"断连"）
+net.ipv4.tcp_retries2=8
+net.ipv4.tcp_mtu_probing=1
+net.ipv4.tcp_keepalive_time=600
+net.ipv4.tcp_keepalive_intvl=30
+net.ipv4.tcp_keepalive_probes=3
+net.ipv4.tcp_no_metrics_save=1
+net.ipv4.tcp_slow_start_after_idle=0
+net.ipv4.tcp_notsent_lowat=131072
+# TCP 缓冲池上调到 16 MiB 配 BDP（200ms RTT × 100Mbps = 2.5MB BDP）
+net.ipv4.tcp_rmem=4096 262144 16777216
+net.ipv4.tcp_wmem=4096 65536 16777216
+# UDP 全局内存上限提升（多用户 hy2 突发场景兜底）
+net.ipv4.udp_mem=262144 524288 1048576
+# 临时端口范围扩大（多用户 + Xray 出向连接复用）
+net.ipv4.ip_local_port_range=10000 65535
+# 队列层
+net.core.netdev_max_backlog=5000
+net.ipv4.tcp_max_syn_backlog=8192
+EOF
+    sysctl --system > /dev/null 2>&1
+    print_success "网络栈调优已应用 (99-b-ui-network.conf)"
 }
 
 #===============================================================================
@@ -1459,4 +1526,64 @@ EOF
 
     # 顺带打印 apt-daily-upgrade 提示（C5）
     print_info "如需启用系统自动安全更新，运行: b-ui harden-system"
+}
+
+#===============================================================================
+# 系统卫生：timesyncd / fail2ban / journald 限额（v3.4.19 Cluster G）
+#===============================================================================
+
+configure_system_hygiene() {
+    print_info "配置系统卫生（时钟同步 / 暴力扫防护 / 日志限额）..."
+
+    # G1. 时钟同步：systemd-timesyncd（缺失时安装）
+    # 时钟错乱会导致 TLS/ACME 失败、客户端订阅时间戳异常
+    if ! systemctl is-active --quiet systemd-timesyncd 2>/dev/null && \
+       ! systemctl is-active --quiet chrony 2>/dev/null && \
+       ! systemctl is-active --quiet ntp 2>/dev/null; then
+        if command -v apt-get &>/dev/null; then
+            apt-get install -y systemd-timesyncd 2>/dev/null || true
+        fi
+        systemctl enable --now systemd-timesyncd 2>/dev/null || true
+        if systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
+            print_success "  ✓ 启用 systemd-timesyncd（时钟同步影响 TLS/ACME）"
+        else
+            print_warning "  systemd-timesyncd 启用失败，请检查时间同步"
+        fi
+    else
+        print_info "  时钟同步已就绪（timesyncd/chrony/ntp 至少一项在跑）"
+    fi
+
+    # G2. fail2ban 自动安装（SSH 暴力扫日志噪音）
+    if ! command -v fail2ban-client &>/dev/null && command -v apt-get &>/dev/null; then
+        apt-get install -y fail2ban 2>/dev/null || true
+    fi
+    if command -v fail2ban-client &>/dev/null; then
+        mkdir -p /etc/fail2ban/jail.d
+        if [[ ! -f /etc/fail2ban/jail.d/b-ui-sshd.local ]]; then
+            cat > /etc/fail2ban/jail.d/b-ui-sshd.local <<'EOF'
+[sshd]
+enabled = true
+port = ssh
+maxretry = 5
+bantime = 1h
+findtime = 10m
+EOF
+        fi
+        systemctl enable --now fail2ban 2>/dev/null || true
+        if systemctl is-active --quiet fail2ban 2>/dev/null; then
+            print_success "  ✓ fail2ban 已启用（SSH 暴力扫自动封禁 1h）"
+        fi
+    fi
+
+    # G3. journald 限额（避免日志膨胀填满磁盘）
+    mkdir -p /etc/systemd/journald.conf.d
+    cat > /etc/systemd/journald.conf.d/99-b-ui.conf <<'EOF'
+[Journal]
+SystemMaxUse=500M
+SystemKeepFree=1G
+MaxRetentionSec=14day
+Compress=yes
+EOF
+    systemctl restart systemd-journald 2>/dev/null || true
+    print_success "  ✓ journald 限额已应用 (500M/14day)"
 }

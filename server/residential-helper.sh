@@ -7,12 +7,14 @@
 #   Xray / Hysteria2 永远指向 sing-box，路由和 DNS 由 sing-box 统一负责
 #
 # Usage:
-#   residential-helper.sh setup                → 初始化：配置 Xray/Hy2 永久走 sing-box（只需跑一次）
-#   residential-helper.sh enable <url>         → 开启住宅代理，更新 sing-box 路由规则
-#   residential-helper.sh disable              → 关闭住宅代理，sing-box 改为全直连
-#   residential-helper.sh status               → 输出 residential-proxy.json
-#   residential-helper.sh reapply             → 重新应用当前配置（update.sh 调用）
-#   residential-helper.sh set-domains <json>   → 更新分流域名，重载 sing-box
+#   residential-helper.sh setup                  → 初始化：配置 Xray/Hy2 永久走 sing-box（只需跑一次）
+#   residential-helper.sh enable <url>           → 开启住宅代理（单 URL，覆盖现有）
+#   residential-helper.sh enable --add <url>     → 新增一个住宅 URL（v3.4.19 多 URL）
+#   residential-helper.sh enable --remove <url>  → 移除一个住宅 URL（v3.4.19 多 URL）
+#   residential-helper.sh disable                → 关闭住宅代理，sing-box 改为全直连
+#   residential-helper.sh status                 → 输出 residential-proxy.json
+#   residential-helper.sh reapply                → 重新应用当前配置（update.sh 调用）
+#   residential-helper.sh set-domains <json>     → 更新分流域名，重载 sing-box
 
 set -euo pipefail
 
@@ -174,22 +176,54 @@ get_server_ip() {
 # ---------------------------------------------------------------------------
 # sing-box 配置：住宅代理模式（按域名关键词分流 + DNS 路由）
 # sing-box 统一负责所有路由和 DNS 决策
+#
+# v3.4.19 起支持两种配置形态：
+#   单 URL（旧）：write_singbox_config_residential <host> <port> <user> <pass>
+#   多 URL（新）：write_singbox_config_residential_multi <urls_json>
+#                urls_json 为 [{"host":"","port":N,"username":"","password":"","name":""},...]
 # ---------------------------------------------------------------------------
 write_singbox_config_residential() {
     local host="$1" port="$2" user="$3" pass="$4"
+    # 包装成 1-元素 urls 数组复用 multi 实现
+    local urls_json
+    urls_json=$(jq -n \
+        --arg  host "$host" \
+        --argjson port "$port" \
+        --arg  user "$user" \
+        --arg  pass "$pass" \
+        '[{host:$host, port:$port, username:$user, password:$pass, name:"primary"}]')
+    write_singbox_config_residential_multi "$urls_json"
+}
+
+write_singbox_config_residential_multi() {
+    local urls_json="$1"
 
     get_server_ip
     get_domains
     local kw_json
     kw_json=$(printf '%s\n' "${DOMAINS[@]}" | jq -R . | jq -s '.')
 
-    # 路由命中 tag "residential"（urltest），实际拨号 outbound 为 "residential-direct"。
-    # urltest 探测 URL 必须不命中任何分流 keyword，否则探测流量本身会被路由回 residential 形成自循环。
+    # 多 URL outbound：每个 URL 一个 socks outbound，tag 为 residential-N
+    # tag 名称用递增 N 避免 special 字符与重复
+    local outbounds_resi outbound_tags
+    outbounds_resi=$(echo "$urls_json" | jq '
+      to_entries | map({
+        type: "socks",
+        tag: ("residential-" + ((.key + 1) | tostring)),
+        server: .value.host,
+        server_port: (.value.port | tonumber),
+        username: .value.username,
+        password: .value.password,
+        version: "5"
+      })')
+    outbound_tags=$(echo "$urls_json" | jq '
+      to_entries | map("residential-" + ((.key + 1) | tostring))')
+
+    # 路由命中 tag "residential"（urltest），urltest 包含所有 residential-N。
+    # urltest 探测 URL 必须不命中任何分流 keyword，否则探测流量被路由回 residential 形成自循环。
     jq -n \
-        --arg  host       "$host" \
-        --argjson port    "$port" \
-        --arg  user       "$user" \
-        --arg  pass       "$pass" \
+        --argjson outbounds_resi "$outbounds_resi" \
+        --argjson outbound_tags  "$outbound_tags" \
         --argjson relay_port "$SINGBOX_RELAY_PORT" \
         --argjson kw      "$kw_json" \
         --arg  server_ip  "${_SERVER_IP:-}" \
@@ -211,27 +245,19 @@ write_singbox_config_residential() {
             "listen": "127.0.0.1",
             "listen_port": $relay_port
           }],
-          "outbounds": [
-            {
-              "type": "socks",
-              "tag": "residential-direct",
-              "server": $host,
-              "server_port": $port,
-              "username": $user,
-              "password": $pass,
-              "version": "5"
-            },
-            {
-              "type": "urltest",
-              "tag": "residential",
-              "outbounds": ["residential-direct"],
-              "url": "https://cp.cloudflare.com/generate_204",
-              "interval": "3m",
-              "tolerance": 50,
-              "idle_timeout": "30m"
-            },
-            {"type": "direct", "tag": "direct"}
-          ],
+          "outbounds": (
+            $outbounds_resi
+            + [{
+                "type": "urltest",
+                "tag": "residential",
+                "outbounds": $outbound_tags,
+                "url": "https://cp.cloudflare.com/generate_204",
+                "interval": "3m",
+                "tolerance": 50,
+                "idle_timeout": "30m"
+              },
+              {"type": "direct", "tag": "direct"}]
+          ),
           "route": {
             "rules": [
               {"action": "sniff"},
@@ -404,12 +430,14 @@ reload_services() {
 
 save_config() {
     local enabled="$1"
-    local existing_domains
+    local existing_domains existing_urls
     existing_domains=$(jq '.domains // null' "${RESIDENTIAL_CONFIG}" 2>/dev/null || echo "null")
+    existing_urls=$(jq '.urls // []'    "${RESIDENTIAL_CONFIG}" 2>/dev/null || echo "[]")
 
     jq -n \
-        --argjson enabled "$enabled" \
+        --argjson enabled  "$enabled" \
         --argjson domains  "${existing_domains}" \
+        --argjson urls     "${existing_urls}" \
         --arg  host      "${RESI_HOST:-}" \
         --argjson port   "${RESI_PORT:-0}" \
         --arg  username  "${RESI_USER:-}" \
@@ -417,7 +445,7 @@ save_config() {
         --arg  lastVerifiedIp      "${RESI_EXIT_IP:-}" \
         --arg  lastVerifiedIspInfo "${RESI_ISP_INFO:-}" \
         --arg  lastVerifiedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-        '{enabled:$enabled,domains:$domains,host:$host,port:$port,username:$username,
+        '{enabled:$enabled,domains:$domains,urls:$urls,host:$host,port:$port,username:$username,
           password:$password,lastVerifiedIp:$lastVerifiedIp,
           lastVerifiedIspInfo:$lastVerifiedIspInfo,lastVerifiedAt:$lastVerifiedAt}' \
         > "${RESIDENTIAL_CONFIG}"
@@ -432,17 +460,80 @@ load_credentials_from_config() {
     RESI_PASS=$(jq -r '.password' "${RESIDENTIAL_CONFIG}")
 }
 
+# v3.4.19 Cluster F: 获取住宅 URL 列表的 JSON 数组
+# 优先使用新 schema 的 urls 字段；为空则降级用旧的 host/port/username/password
+build_urls_json_from_config() {
+    local urls_count
+    urls_count=$(jq '.urls // [] | length' "${RESIDENTIAL_CONFIG}" 2>/dev/null || echo 0)
+    if [[ "$urls_count" -gt 0 ]]; then
+        jq '.urls' "${RESIDENTIAL_CONFIG}"
+        return 0
+    fi
+    # 兼容旧 schema：把 host/port/username/password 包装成单元素 urls
+    local h p u pw
+    h=$(jq -r '.host // ""'     "${RESIDENTIAL_CONFIG}")
+    p=$(jq -r '.port // 0'      "${RESIDENTIAL_CONFIG}")
+    u=$(jq -r '.username // ""' "${RESIDENTIAL_CONFIG}")
+    pw=$(jq -r '.password // ""' "${RESIDENTIAL_CONFIG}")
+    if [[ -z "$h" || "$p" == "0" ]]; then
+        echo "[]"
+        return 0
+    fi
+    jq -n --arg h "$h" --argjson p "$p" --arg u "$u" --arg pw "$pw" \
+        '[{host:$h, port:$p, username:$u, password:$pw, name:"primary"}]'
+}
+
 # 根据当前 residential-proxy.json 状态写入对应的 sing-box 配置
 write_singbox_config_from_state() {
     if [[ -f "${RESIDENTIAL_CONFIG}" ]] && \
        [[ "$(jq -r '.enabled' "${RESIDENTIAL_CONFIG}" 2>/dev/null)" == "true" ]]; then
-        load_credentials_from_config
-        write_singbox_config_residential "$RESI_HOST" "$RESI_PORT" "$RESI_USER" "$RESI_PASS"
-        info "sing-box 配置：住宅代理模式"
+        local urls_json
+        urls_json=$(build_urls_json_from_config)
+        local cnt
+        cnt=$(echo "$urls_json" | jq 'length')
+        if [[ "$cnt" -gt 0 ]]; then
+            write_singbox_config_residential_multi "$urls_json"
+            info "sing-box 配置：住宅代理模式（${cnt} 个 URL）"
+        else
+            write_singbox_config_direct
+            info "sing-box 配置：直连模式（urls 为空）"
+        fi
     else
         write_singbox_config_direct
         info "sing-box 配置：直连模式"
     fi
+}
+
+# v3.4.19 Cluster F: 添加 URL 到 urls 数组（去重 host:port）
+add_url_to_config() {
+    local host="$1" port="$2" user="$3" pass="$4"
+
+    # 确保 RESIDENTIAL_CONFIG 存在
+    if [[ ! -f "${RESIDENTIAL_CONFIG}" ]]; then
+        echo '{"enabled":false,"urls":[]}' > "${RESIDENTIAL_CONFIG}"
+        chmod 600 "${RESIDENTIAL_CONFIG}"
+    fi
+
+    # 计算下一个 name（递增 N，N 从 1 开始）
+    local next_n
+    next_n=$(jq '(.urls // []) | length + 1' "${RESIDENTIAL_CONFIG}")
+
+    jq --arg h "$host" --argjson p "$port" --arg u "$user" --arg pw "$pass" --arg n "url-${next_n}" \
+        '.urls = ((.urls // []) | map(select(.host != $h or .port != $p)) + [{host:$h, port:$p, username:$u, password:$pw, name:$n}])' \
+        "${RESIDENTIAL_CONFIG}" > "${RESIDENTIAL_CONFIG}.tmp" \
+    && mv "${RESIDENTIAL_CONFIG}.tmp" "${RESIDENTIAL_CONFIG}"
+    chmod 600 "${RESIDENTIAL_CONFIG}"
+}
+
+# v3.4.19 Cluster F: 从 urls 数组移除（按 host:port 匹配）
+remove_url_from_config() {
+    local host="$1" port="$2"
+    [[ -f "${RESIDENTIAL_CONFIG}" ]] || return 0
+    jq --arg h "$host" --argjson p "$port" \
+        '.urls = ((.urls // []) | map(select(.host != $h or .port != $p)))' \
+        "${RESIDENTIAL_CONFIG}" > "${RESIDENTIAL_CONFIG}.tmp" \
+    && mv "${RESIDENTIAL_CONFIG}.tmp" "${RESIDENTIAL_CONFIG}"
+    chmod 600 "${RESIDENTIAL_CONFIG}"
 }
 
 # ---------------------------------------------------------------------------
@@ -461,12 +552,56 @@ case "$cmd" in
         ;;
 
     enable)
+        # v3.4.19 Cluster F: 多 URL 子操作（--add / --remove）
+        if [[ "${2:-}" == "--add" ]]; then
+            [[ -z "${3:-}" ]] && { err "用法: $0 enable --add <socks5_url>"; exit 1; }
+            parse_url "$3"
+            verify "$RESI_HOST" "$RESI_PORT" "$RESI_USER" "$RESI_PASS"
+            ensure_singbox
+            add_url_to_config "$RESI_HOST" "$RESI_PORT" "$RESI_USER" "$RESI_PASS"
+            # 写 enable=true（保留旧 host/port 字段供向后兼容）
+            save_config true
+            write_singbox_config_from_state
+            reload_relay_service
+            local total
+            total=$(jq '(.urls // []) | length' "${RESIDENTIAL_CONFIG}")
+            info "已新增 URL（共 ${total} 个住宅出口）"
+            echo "$RESI_EXIT_IP"
+            echo "${RESI_ISP_INFO:-}"
+            exit 0
+        elif [[ "${2:-}" == "--remove" ]]; then
+            [[ -z "${3:-}" ]] && { err "用法: $0 enable --remove <socks5_url>"; exit 1; }
+            parse_url "$3"
+            ensure_singbox
+            remove_url_from_config "$RESI_HOST" "$RESI_PORT"
+            local total
+            total=$(jq '(.urls // []) | length' "${RESIDENTIAL_CONFIG}" 2>/dev/null || echo 0)
+            if [[ "$total" -eq 0 ]]; then
+                # urls 空 → 直连模式
+                jq '.enabled = false' "${RESIDENTIAL_CONFIG}" > "${RESIDENTIAL_CONFIG}.tmp" \
+                  && mv "${RESIDENTIAL_CONFIG}.tmp" "${RESIDENTIAL_CONFIG}"
+                write_singbox_config_direct
+                info "最后一个 URL 已移除，住宅代理已禁用"
+            else
+                write_singbox_config_from_state
+                info "已移除 URL（剩余 ${total} 个住宅出口）"
+            fi
+            reload_relay_service
+            exit 0
+        fi
+
+        # 单 URL 模式（旧行为，覆盖现有 host/port/...）
         [[ -z "${2:-}" ]] && { err "用法: $0 enable <socks5_url>"; exit 1; }
         parse_url "$2"
         verify "$RESI_HOST" "$RESI_PORT" "$RESI_USER" "$RESI_PASS"
         ensure_singbox
         write_singbox_config_residential "$RESI_HOST" "$RESI_PORT" "$RESI_USER" "$RESI_PASS"
         reload_relay_service
+        # 单 URL 模式：清空 urls 数组（保持 schema 干净）
+        if [[ -f "${RESIDENTIAL_CONFIG}" ]]; then
+            jq '.urls = []' "${RESIDENTIAL_CONFIG}" > "${RESIDENTIAL_CONFIG}.tmp" 2>/dev/null \
+              && mv "${RESIDENTIAL_CONFIG}.tmp" "${RESIDENTIAL_CONFIG}" || true
+        fi
         save_config true
         echo "$RESI_EXIT_IP"
         echo "${RESI_ISP_INFO:-}"
@@ -478,7 +613,9 @@ case "$cmd" in
         reload_relay_service
         RESI_HOST="" RESI_PORT=0 RESI_USER="" RESI_PASS="" RESI_EXIT_IP="" RESI_ISP_INFO=""
         if [[ -f "${RESIDENTIAL_CONFIG}" ]]; then
+            # v3.4.19: 同时清空 urls
             jq '.enabled = false | .host = "" | .username = "" | .password = "" |
+                .urls = [] |
                 .lastVerifiedIp = "" | .lastVerifiedIspInfo = ""' \
                 "${RESIDENTIAL_CONFIG}" > "${RESIDENTIAL_CONFIG}.tmp" \
                 && mv "${RESIDENTIAL_CONFIG}.tmp" "${RESIDENTIAL_CONFIG}"

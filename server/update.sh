@@ -782,6 +782,112 @@ SYSCTL_EOF
             print_success "  ✓ 应用 UDP 缓冲区优化 (16MB)"
     fi
 
+    # v3.4.19 D1: 网络栈调优（缺失时写入；老用户补丁）
+    if [[ ! -f /etc/sysctl.d/99-b-ui-network.conf ]]; then
+        cat > /etc/sysctl.d/99-b-ui-network.conf <<'SYSCTL_EOF'
+# B-UI 网络栈调优 v3.4.19
+net.ipv4.tcp_retries2=8
+net.ipv4.tcp_mtu_probing=1
+net.ipv4.tcp_keepalive_time=600
+net.ipv4.tcp_keepalive_intvl=30
+net.ipv4.tcp_keepalive_probes=3
+net.ipv4.tcp_no_metrics_save=1
+net.ipv4.tcp_slow_start_after_idle=0
+net.ipv4.tcp_notsent_lowat=131072
+net.ipv4.tcp_rmem=4096 262144 16777216
+net.ipv4.tcp_wmem=4096 65536 16777216
+net.ipv4.udp_mem=262144 524288 1048576
+net.ipv4.ip_local_port_range=10000 65535
+net.core.netdev_max_backlog=5000
+net.ipv4.tcp_max_syn_backlog=8192
+SYSCTL_EOF
+        sysctl -p /etc/sysctl.d/99-b-ui-network.conf >/dev/null 2>&1 && \
+            print_success "  ✓ 应用网络栈调优 (99-b-ui-network.conf)"
+    fi
+
+    # v3.4.19 D2: BBRv3 自动升级
+    # 已开 bbr 但系统支持更优的 bbr3/bbrv3/bbr_v3 → 升级
+    if [[ -f /etc/sysctl.d/99-hysteria-bbr.conf ]]; then
+        local current_algo available_algos best_algo=""
+        current_algo=$(grep -oE 'tcp_congestion_control=\S+' /etc/sysctl.d/99-hysteria-bbr.conf 2>/dev/null | cut -d= -f2)
+        available_algos=$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || echo "")
+        for algo in bbr3 bbrv3 bbr_v3; do
+            if [[ " $available_algos " == *" $algo "* ]]; then
+                best_algo="$algo"
+                break
+            fi
+        done
+        if [[ -n "$best_algo" && "$current_algo" != "$best_algo" ]]; then
+            cat > /etc/sysctl.d/99-hysteria-bbr.conf <<EOF
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=${best_algo}
+EOF
+            sysctl --system >/dev/null 2>&1
+            print_success "  ✓ BBR 升级：${current_algo:-bbr} → ${best_algo}"
+        fi
+    fi
+
+    # v3.4.19 I: reality-keys.json 备份（防 b-ui 重装丢密钥）
+    if [[ -f /opt/b-ui/reality-keys.json ]]; then
+        mkdir -p /root/.b-ui-backup /var/backups/b-ui 2>/dev/null
+        # 仅在差异时同步
+        if ! cmp -s /opt/b-ui/reality-keys.json /root/.b-ui-backup/reality-keys.json 2>/dev/null; then
+            cp /opt/b-ui/reality-keys.json /root/.b-ui-backup/reality-keys.json 2>/dev/null && \
+                chmod 600 /root/.b-ui-backup/reality-keys.json 2>/dev/null
+        fi
+        if ! cmp -s /opt/b-ui/reality-keys.json /var/backups/b-ui/reality-keys.json 2>/dev/null; then
+            cp /opt/b-ui/reality-keys.json /var/backups/b-ui/reality-keys.json 2>/dev/null && \
+                chmod 600 /var/backups/b-ui/reality-keys.json 2>/dev/null
+        fi
+    fi
+
+    # v3.4.19 G1: 时钟同步（缺失时安装 systemd-timesyncd）
+    if ! systemctl is-active --quiet systemd-timesyncd 2>/dev/null && \
+       ! systemctl is-active --quiet chrony 2>/dev/null && \
+       ! systemctl is-active --quiet ntp 2>/dev/null; then
+        if command -v apt-get &>/dev/null; then
+            apt-get install -y systemd-timesyncd 2>/dev/null || true
+            systemctl enable --now systemd-timesyncd 2>/dev/null || true
+            if systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
+                print_info "  ✓ 启用 systemd-timesyncd（时钟同步影响 TLS/ACME）"
+            fi
+        fi
+    fi
+
+    # v3.4.19 G2: fail2ban（SSH 暴力扫日志噪音）
+    if ! command -v fail2ban-client &>/dev/null && command -v apt-get &>/dev/null; then
+        apt-get install -y fail2ban 2>/dev/null || true
+    fi
+    if command -v fail2ban-client &>/dev/null && [[ ! -f /etc/fail2ban/jail.d/b-ui-sshd.local ]]; then
+        mkdir -p /etc/fail2ban/jail.d
+        cat > /etc/fail2ban/jail.d/b-ui-sshd.local <<'EOF'
+[sshd]
+enabled = true
+port = ssh
+maxretry = 5
+bantime = 1h
+findtime = 10m
+EOF
+        systemctl enable --now fail2ban 2>/dev/null || true
+        if systemctl is-active --quiet fail2ban 2>/dev/null; then
+            print_info "  ✓ fail2ban 已启用（SSH 暴力扫自动封禁 1h）"
+        fi
+    fi
+
+    # v3.4.19 G3: journald 限额
+    if [[ ! -f /etc/systemd/journald.conf.d/99-b-ui.conf ]]; then
+        mkdir -p /etc/systemd/journald.conf.d
+        cat > /etc/systemd/journald.conf.d/99-b-ui.conf <<'EOF'
+[Journal]
+SystemMaxUse=500M
+SystemKeepFree=1G
+MaxRetentionSec=14day
+Compress=yes
+EOF
+        systemctl restart systemd-journald 2>/dev/null || true
+        print_info "  ✓ journald 限额已应用 (500M/14day)"
+    fi
+
     # 应用 Xray 服务配置
     # 重命名 override.conf → 99-b-ui-override.conf 确保字典序最大，覆盖发行版/upstream drop-in
     if [[ -d /etc/systemd/system/xray.service.d ]]; then

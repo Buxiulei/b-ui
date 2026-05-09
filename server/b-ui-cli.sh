@@ -873,6 +873,86 @@ cmd_server_logs() {
     exit 0
 }
 
+# v3.4.19 Cluster E: hysteria2 obfs salamander 一键开关
+# 不默认开启；GFW 高峰期 UDP QoS 应急工具
+# 启用后 masquerade 反探测会失效；客户端订阅链接需要重新生成
+cmd_obfs() {
+    local action="${1:-status}"
+    local config_file="${BASE_DIR:-/opt/b-ui}/config.yaml"
+    if [[ ! -f "$config_file" ]]; then
+        print_error "config.yaml 不存在: $config_file"; exit 1
+    fi
+
+    case "$action" in
+        on|enable)
+            if grep -qE '^obfs:' "$config_file" 2>/dev/null; then
+                print_warning "obfs 已启用"
+                grep -A 3 '^obfs:' "$config_file"
+                exit 0
+            fi
+            local pwd
+            pwd=$(openssl rand -base64 24 | tr -d '\n=' | tr '+/' '-_')
+            # 备份
+            cp "$config_file" "${config_file}.bak.obfs.$(date +%Y%m%d-%H%M%S)"
+            # 在文件顶部插入 obfs 段（新行而非 sed 拼接，更安全）
+            local tmp
+            tmp=$(mktemp)
+            {
+                printf '# v3.4.19 obfs salamander（GFW 高峰期应急）\n'
+                printf '# 启用后 masquerade 反探测会失效\n'
+                printf 'obfs:\n'
+                printf '  type: salamander\n'
+                printf '  salamander:\n'
+                printf '    password: %s\n' "$pwd"
+                cat "$config_file"
+            } > "$tmp" && mv "$tmp" "$config_file"
+            chmod 600 "$config_file"
+            systemctl restart hysteria-server 2>/dev/null || true
+            print_success "obfs 已启用，密码已写入 config.yaml"
+            print_warning "重要：客户端订阅链接需要重新生成，所有客户端要重新导入"
+            echo "  在 web 面板 / b-ui CLI 重发订阅"
+            ;;
+        off|disable)
+            if ! grep -qE '^obfs:' "$config_file" 2>/dev/null; then
+                print_info "obfs 未启用，无需关闭"
+                exit 0
+            fi
+            cp "$config_file" "${config_file}.bak.obfs.$(date +%Y%m%d-%H%M%S)"
+            # awk 删除整个 obfs 段（共 4 行：obfs:/type:/salamander:/password:）
+            # 同时清理我们插入时附带的 2 行 v3.4.19 注释
+            # 注：每次 next 后 skip 不再处理本行；用"先消费当前行 → 再设置 skip 表示再吃 N 行"的语义
+            local tmp
+            tmp=$(mktemp)
+            awk '
+                BEGIN { skip = 0 }
+                # 注释行 #1：当前行直接丢弃，再吃 1 行（注释 #2）
+                /^# v3\.4\.19 obfs salamander/ { skip = 1; next }
+                # obfs: 起始行：当前行直接丢弃，再吃 3 行（type/salamander/password）
+                /^obfs:[[:space:]]*$/ { skip = 3; next }
+                skip > 0 { skip--; next }
+                { print }
+            ' "$config_file" > "$tmp" && mv "$tmp" "$config_file"
+            chmod 600 "$config_file"
+            systemctl restart hysteria-server 2>/dev/null || true
+            print_success "obfs 已禁用，masquerade 反探测恢复"
+            print_warning "客户端订阅链接需要重新生成（移除 obfs 参数）"
+            ;;
+        status|"")
+            if grep -qE '^obfs:' "$config_file" 2>/dev/null; then
+                echo "obfs: ENABLED"
+                grep -A 3 '^obfs:' "$config_file"
+            else
+                echo "obfs: DISABLED"
+            fi
+            ;;
+        *)
+            echo "用法: b-ui obfs <on|off|status>" >&2
+            exit 2
+            ;;
+    esac
+    exit 0
+}
+
 cmd_server_residential() {
     local action="$1"; shift
     case "$action" in
@@ -880,6 +960,20 @@ cmd_server_residential() {
             local url="$1"
             [[ -z "$url" ]] && { echo "用法: b-ui residential enable <url>" >&2; exit 2; }
             bash "${BASE_DIR}/residential-helper.sh" enable "$url"
+            ;;
+        # v3.4.19 Cluster F: 多 URL 支持
+        add)
+            local url="$1"
+            [[ -z "$url" ]] && { echo "用法: b-ui residential add <url>" >&2; exit 2; }
+            bash "${BASE_DIR}/residential-helper.sh" enable --add "$url"
+            ;;
+        remove|rm)
+            local url="$1"
+            [[ -z "$url" ]] && { echo "用法: b-ui residential remove <url>" >&2; exit 2; }
+            bash "${BASE_DIR}/residential-helper.sh" enable --remove "$url"
+            ;;
+        list|ls)
+            bash "${BASE_DIR}/residential-helper.sh" status
             ;;
         disable)
             bash "${BASE_DIR}/residential-helper.sh" disable
@@ -891,11 +985,54 @@ cmd_server_residential() {
             cmd_residential_health
             ;;
         *)
-            echo "用法: b-ui residential <enable <url>|disable|status|health>" >&2
+            echo "用法: b-ui residential <enable <url>|add <url>|remove <url>|list|disable|status|health>" >&2
             exit 2
             ;;
     esac
     exit 0
+}
+
+# v3.4.19 Cluster I: export/import reality-keys + users + install-key
+cmd_export_keys() {
+    local out="${1:-/root/b-ui-keys-export.tar.gz}"
+    local files=()
+    [[ -f /opt/b-ui/reality-keys.json ]] && files+=(reality-keys.json)
+    [[ -f /opt/b-ui/users.json ]]        && files+=(users.json)
+    [[ -f /opt/b-ui/install-key.txt ]]   && files+=(install-key.txt)
+    if [[ ${#files[@]} -eq 0 ]]; then
+        print_error "未找到任何待导出文件 (/opt/b-ui/{reality-keys.json,users.json,install-key.txt})"
+        exit 1
+    fi
+    tar -C /opt/b-ui -czf "$out" "${files[@]}" || { print_error "tar 失败"; exit 1; }
+    chmod 600 "$out"
+    print_success "已导出到 $out (chmod 600)"
+    echo "  包含: ${files[*]}"
+    echo "  恢复: b-ui import-keys $out"
+}
+
+cmd_import_keys() {
+    local in_file="$1"
+    if [[ -z "$in_file" || ! -f "$in_file" ]]; then
+        print_error "用法: b-ui import-keys <tarball>"
+        exit 2
+    fi
+    print_info "从 $in_file 恢复..."
+    mkdir -p /opt/b-ui
+    if ! tar -C /opt/b-ui -xzf "$in_file"; then
+        print_error "tar 解压失败"
+        exit 1
+    fi
+    chmod 600 /opt/b-ui/reality-keys.json /opt/b-ui/users.json /opt/b-ui/install-key.txt 2>/dev/null || true
+    # 同步到外部备份位置
+    mkdir -p /root/.b-ui-backup /var/backups/b-ui 2>/dev/null
+    [[ -f /opt/b-ui/reality-keys.json ]] && {
+        cp /opt/b-ui/reality-keys.json /root/.b-ui-backup/reality-keys.json 2>/dev/null
+        cp /opt/b-ui/reality-keys.json /var/backups/b-ui/reality-keys.json 2>/dev/null
+        chmod 600 /root/.b-ui-backup/reality-keys.json /var/backups/b-ui/reality-keys.json 2>/dev/null
+    }
+    systemctl restart xray 2>/dev/null || true
+    systemctl restart b-ui-admin 2>/dev/null || true
+    print_success "恢复完成（已重启 xray + b-ui-admin）"
 }
 
 # 通过 sing-box 中继 (127.0.0.1:2080) 实测当前敏感域名出口 IP / ISP，
@@ -1050,6 +1187,9 @@ dispatch_subcommand_server() {
         restart)       cmd_server_restart "$@"; exit $? ;;
         logs)          cmd_server_logs "$@"; exit $? ;;
         residential)   cmd_server_residential "$@" ;;
+        obfs)          cmd_obfs "$@" ;;
+        export-keys)   cmd_export_keys "$@"; exit 0 ;;
+        import-keys)   cmd_import_keys "$@"; exit 0 ;;
         update)        check_bui_update; exit 0 ;;
         harden-ssh)    cmd_harden_ssh ;;
         harden-system) cmd_harden_system ;;
@@ -1064,10 +1204,16 @@ dispatch_subcommand_server() {
   restart               重启所有服务
   logs <service>        查看日志（hysteria2/xray/admin/caddy）
   update                检查并更新
-  residential enable <url>   启用住宅 IP 出口
+  residential enable <url>   启用住宅 IP 出口（单 URL）
+  residential add <url>      新增住宅 SOCKS5 URL（多住宅）
+  residential remove <url>   移除指定 URL
+  residential list           查看所有 URL（同 status）
   residential disable        禁用住宅 IP 出口
   residential status         查看住宅 IP 状态
   residential health         住宅出口健康检查（实测当前 IP / ISP）
+  obfs <on|off|status>       hysteria2 obfs salamander 一键开关（GFW 高峰期应急）
+  export-keys [path]         导出 reality-keys + users + install-key 到 tarball
+  import-keys <path>         从 tarball 恢复（覆盖现有，重启 xray/admin）
   harden-ssh                 SSH 加固（写 99-b-ui-hardening.conf，需要 pubkey）
   harden-system              重置 unattended-upgrades 自动安全更新
 

@@ -1,7 +1,7 @@
 import http from "http";
 import fs from "fs";
 import crypto from "crypto";
-import { execSync, exec, spawn, spawnSync } from "child_process";
+import { execSync, exec, spawn, spawnSync, execFile } from "child_process";
 import path from "path";
 import https from "https";
 import { fileURLToPath } from "url";
@@ -329,6 +329,23 @@ function getConfig() {
             }
         } catch { }
 
+        // v3.4.19 Cluster E: 检测 obfs salamander
+        // 从 config.yaml 解析 obfs 段（YAML 顶层 obfs:type:salamander 块）
+        let obfs = { enabled: false, type: "", password: "" };
+        try {
+            const obfsBlock = hc.match(/^obfs:\s*\n((?:[ \t].*\n?)+)/m);
+            if (obfsBlock) {
+                const block = obfsBlock[1];
+                const typeMatch = block.match(/^\s+type:\s*(\S+)/m);
+                const pwdMatch = block.match(/^\s+password:\s*(\S+)/m);
+                if (typeMatch) {
+                    obfs.type = typeMatch[1].trim();
+                    obfs.enabled = true;
+                }
+                if (pwdMatch) obfs.password = pwdMatch[1].trim();
+            }
+        } catch { }
+
         return {
             domain: dm || "localhost",
             port: pm ? pm[1] : "443",
@@ -336,7 +353,8 @@ function getConfig() {
             pubKey,
             shortId,
             sni,
-            portHopping
+            portHopping,
+            obfs
         };
     } catch {
         return {
@@ -346,7 +364,8 @@ function getConfig() {
             pubKey: "",
             shortId: "",
             sni: "www.bing.com",
-            portHopping: { enabled: false, start: 20000, end: 30000 }
+            portHopping: { enabled: false, start: 20000, end: 30000 },
+            obfs: { enabled: false, type: "", password: "" }
         };
     }
 }
@@ -375,6 +394,10 @@ function generateSingboxConfig(user, cfg, host) {
             ...(cfg.portHopping?.enabled ? {
                 hop_ports: `${cfg.portHopping.start}-${cfg.portHopping.end}`,
                 hop_interval: "30s"
+            } : {}),
+            // v3.4.19 Cluster E: obfs salamander（GFW 高峰期应急）
+            ...(cfg.obfs?.enabled && cfg.obfs.type === "salamander" && cfg.obfs.password ? {
+                obfs: { type: "salamander", password: cfg.obfs.password }
             } : {}),
             password: `${user.username}:${user.password}`,
             tls: {
@@ -1367,6 +1390,11 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                         queryParams += `&mport=${cfg.portHopping.start}-${cfg.portHopping.end}`;
                     }
 
+                    // v3.4.19 Cluster E: obfs salamander（GFW 高峰期应急）
+                    if (cfg.obfs && cfg.obfs.enabled && cfg.obfs.type === "salamander" && cfg.obfs.password) {
+                        queryParams += `&obfs=salamander&obfs-password=${encodeURIComponent(cfg.obfs.password)}`;
+                    }
+
                     // 节点别名
                     const nodeName = encodeURIComponent(`${user.username}-高速版`);
 
@@ -1703,6 +1731,141 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                     }
                 }
             }
+
+            // 住宅 IP 健康检查 - 返回当前出口 IP / ISP / IP 类型
+            // 不暴露 socks5 凭据；通过本地 socks5 出口实测 ping0.cc
+            if (r === "residential/health" && req.method === "GET") {
+                const DEFAULT_DOMAINS = ["openai","chatgpt","google","googleapis","gstatic","anthropic","claude","ping0","ip.sb"];
+                let raw = { enabled: false };
+                try {
+                    if (fs.existsSync(CONFIG.residentialConfig)) {
+                        raw = JSON.parse(fs.readFileSync(CONFIG.residentialConfig, "utf8"));
+                    }
+                } catch { }
+
+                const domainsList = (raw.domains && raw.domains.length) ? raw.domains : DEFAULT_DOMAINS;
+                const safeUrls = [];
+                if (raw.enabled && raw.host) {
+                    safeUrls.push({
+                        host: raw.host,
+                        port: raw.port || null,
+                        last_verified_at: raw.lastVerifiedAt || raw.last_verified_at || null,
+                        last_verified_ip: raw.lastVerifiedIp || raw.last_verified_ip || null,
+                        last_verified_isp: raw.lastVerifiedIspInfo || raw.last_verified_isp || null,
+                    });
+                }
+
+                const baseResp = {
+                    enabled: !!raw.enabled,
+                    urls: safeUrls,
+                    domains_count: domainsList.length,
+                    current_egress_ip_test: null,
+                    egress_ip_type: "unknown",
+                    via_proxy_isp: null,
+                };
+
+                if (!raw.enabled) {
+                    return sendJSON(res, baseResp);
+                }
+
+                // 实时通过本地 socks5 (127.0.0.1:2080) 抓取 ping0.cc 解析 IP 类型 / ISP
+                execFile("curl", [
+                    "--socks5", "127.0.0.1:2080",
+                    "-m", "5",
+                    "-sS",
+                    "-A", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+                    "https://ping0.cc/"
+                ], { timeout: 6000, maxBuffer: 4 * 1024 * 1024 }, (err, stdout) => {
+                    if (err || !stdout) {
+                        return sendJSON(res, baseResp);
+                    }
+                    try {
+                        const html = String(stdout);
+                        // 抓取 ping0.cc 页面中 IP / ISP / 类型 标签 (formatted as <span class="label">...</span><span class="content">...</span>)
+                        const ipMatch = html.match(/Your IP[\s\S]{0,400}?<span[^>]*class="content"[^>]*>([\s\S]*?)<\/span>/i)
+                            || html.match(/IP\s*地址[\s\S]{0,400}?<span[^>]*class="content"[^>]*>([\s\S]*?)<\/span>/i);
+                        const ispMatch = html.match(/ASN[\s\S]{0,400}?<span[^>]*class="content"[^>]*>([\s\S]*?)<\/span>/i)
+                            || html.match(/ISP[\s\S]{0,400}?<span[^>]*class="content"[^>]*>([\s\S]*?)<\/span>/i)
+                            || html.match(/运营商[\s\S]{0,400}?<span[^>]*class="content"[^>]*>([\s\S]*?)<\/span>/i);
+                        const typeMatch = html.match(/IP\s*类型[\s\S]{0,400}?<span[^>]*class="content"[^>]*>([\s\S]*?)<\/span>/i)
+                            || html.match(/Type[\s\S]{0,400}?<span[^>]*class="content"[^>]*>([\s\S]*?)<\/span>/i);
+
+                        const stripTags = s => String(s || "").replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim();
+
+                        const ip = stripTags(ipMatch && ipMatch[1]);
+                        const isp = stripTags(ispMatch && ispMatch[1]);
+                        const ipTypeRaw = stripTags(typeMatch && typeMatch[1]);
+
+                        let egressType = "unknown";
+                        if (ipTypeRaw) {
+                            if (/家庭|住宅|宽带|broadband|residential/i.test(ipTypeRaw)) egressType = "家庭宽带 IP";
+                            else if (/IDC|机房|数据中心|datacenter|data\s*center|company|hosting/i.test(ipTypeRaw)) egressType = "IDC机房 IP";
+                            else egressType = ipTypeRaw;
+                        }
+
+                        return sendJSON(res, {
+                            ...baseResp,
+                            current_egress_ip_test: ip || null,
+                            egress_ip_type: egressType,
+                            via_proxy_isp: isp || null,
+                        });
+                    } catch {
+                        return sendJSON(res, baseResp);
+                    }
+                });
+                return;
+            }
+
+            // hy2 watchdog 状态 - 用于 Web 面板系统状态卡片
+            if (r === "hy2/watchdog/status" && req.method === "GET") {
+                let watchdogActive = false;
+                let nextRunAt = null;
+                let lastRunAt = null;
+                let failCount = 0;
+                let logRecentLines = [];
+
+                try {
+                    const out = execSync("systemctl list-timers hy2-watchdog.timer --all --no-pager 2>/dev/null || true", { encoding: "utf8", timeout: 5000 });
+                    const lines = out.split("\n").filter(l => l.includes("hy2-watchdog"));
+                    if (lines.length) {
+                        // NEXT          LEFT       LAST          PASSED       UNIT  ACTIVATES
+                        const cols = lines[0].trim().split(/\s{2,}/);
+                        if (cols.length >= 4) {
+                            nextRunAt = cols[0] && cols[0] !== "-" ? cols[0] : null;
+                            lastRunAt = cols[2] && cols[2] !== "-" ? cols[2] : null;
+                        }
+                        watchdogActive = true;
+                    }
+                } catch { }
+
+                if (!watchdogActive) {
+                    try {
+                        const isActive = execSync("systemctl is-active hy2-watchdog.timer 2>/dev/null || true", { encoding: "utf8", timeout: 3000 }).trim();
+                        if (isActive === "active") watchdogActive = true;
+                    } catch { }
+                }
+
+                try {
+                    const fc = fs.readFileSync("/tmp/hy2-watchdog-fail-count", "utf8").trim();
+                    failCount = parseInt(fc, 10) || 0;
+                } catch { }
+
+                try {
+                    if (fs.existsSync("/var/log/b-ui-hy2-watchdog.log")) {
+                        const tail = execSync("tail -n 5 /var/log/b-ui-hy2-watchdog.log 2>/dev/null || true", { encoding: "utf8", timeout: 3000 });
+                        logRecentLines = tail.split("\n").filter(Boolean).slice(-5);
+                    }
+                } catch { }
+
+                return sendJSON(res, {
+                    watchdog_active: watchdogActive,
+                    next_run_at: nextRunAt,
+                    last_run_at: lastRunAt,
+                    fail_count: failCount,
+                    log_recent_lines: logRecentLines,
+                });
+            }
+
             if (r === "masquerade") {
                 const masqFile = CONFIG.hysteriaConfig.replace("config.yaml", "masquerade.json");
                 if (req.method === "GET") {

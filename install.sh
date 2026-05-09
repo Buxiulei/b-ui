@@ -301,7 +301,24 @@ download_all_files() {
     else
         print_success "字体文件下载完成"
     fi
-    
+
+    # v3.4.19 Cluster I: 检测外部 reality-keys.json 备份（重装恢复）
+    # 防止 b-ui 重装/换系统后 reality-keys.json 丢失，导致客户端订阅 reality verification failed
+    if [[ ! -f "${BASE_DIR}/reality-keys.json" ]]; then
+        local backup_path
+        for backup_path in /root/.b-ui-backup/reality-keys.json \
+                           /var/backups/b-ui/reality-keys.json \
+                           /etc/b-ui-backup/reality-keys.json; do
+            if [[ -f "$backup_path" ]]; then
+                print_info "检测到 reality-keys.json 备份: $backup_path"
+                print_info "复用旧密钥（避免客户端订阅失效）"
+                cp "$backup_path" "${BASE_DIR}/reality-keys.json"
+                chmod 600 "${BASE_DIR}/reality-keys.json"
+                break
+            fi
+        done
+    fi
+
     print_success "所有文件下载完成"
 }
 
@@ -558,6 +575,11 @@ run_core_install() {
 
     # SSH 安全加固 (检测到公钥时自动关闭密码登录)
     harden_ssh
+
+    # 系统卫生：时钟同步 / fail2ban / journald 限额（v3.4.19 Cluster G）
+    if declare -F configure_system_hygiene &>/dev/null; then
+        configure_system_hygiene
+    fi
 
     # 初始化 sing-box 永久出站中继（下载二进制、配置 Xray/Hysteria2 永久走 sing-box）
     if [[ -f "${BASE_DIR}/residential-helper.sh" ]]; then

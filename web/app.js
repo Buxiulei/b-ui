@@ -105,6 +105,7 @@ function init() {
     api("/config").then(d => cfg = d);
     load();
     loadInstallCommand();
+    initSysStatusOnce();
     setInterval(load, 5000);
 }
 
@@ -682,4 +683,186 @@ function disableResi() {
     }).catch(e => {
         _resiErr(e.message || "请求失败");
     });
+}
+
+// ─── 系统状态卡片：住宅 IP 健康 + hy2 watchdog ───────────────────────────────
+
+function _sysFmt(v) {
+    return (v === null || v === undefined || v === "") ? "—" : String(v);
+}
+
+function _sysClear(el) {
+    while (el.firstChild) el.removeChild(el.firstChild);
+}
+
+function _sysShimmer(el) {
+    _sysClear(el);
+    const a = document.createElement("div");
+    a.className = "resi-shimmer-line";
+    a.style.cssText = "width:60%;margin-bottom:10px";
+    const b = document.createElement("div");
+    b.className = "resi-shimmer-line";
+    b.style.width = "40%";
+    el.appendChild(a);
+    el.appendChild(b);
+}
+
+function _sysErr(el, msg, retryFn) {
+    _sysClear(el);
+    const wrap = document.createElement("div");
+    wrap.className = "sysstat-err";
+    const ico = document.createElement("span");
+    ico.className = "sysstat-err-ico";
+    ico.textContent = "!";
+    const text = document.createElement("span");
+    text.textContent = msg;
+    const btn = document.createElement("button");
+    btn.className = "btn btn-secondary sysstat-retry-btn";
+    btn.textContent = "重试";
+    btn.onclick = retryFn;
+    wrap.append(ico, text, btn);
+    el.appendChild(wrap);
+}
+
+function _sysKv(label, valueNode) {
+    const row = document.createElement("div");
+    row.className = "sysstat-kv";
+    const k = document.createElement("span");
+    k.className = "sysstat-k";
+    k.textContent = label;
+    const v = document.createElement("span");
+    v.className = "sysstat-v";
+    if (typeof valueNode === "string") v.textContent = valueNode;
+    else v.appendChild(valueNode);
+    row.append(k, v);
+    return row;
+}
+
+function _sysTag(text, kind) {
+    const t = document.createElement("span");
+    t.className = "sysstat-tag" + (kind ? (" " + kind) : "");
+    t.textContent = text;
+    return t;
+}
+
+function loadResiHealth() {
+    const body = document.getElementById("sys-resi-body");
+    const btn  = document.getElementById("resi-health-refresh");
+    if (!body) return;
+    _sysShimmer(body);
+    if (btn) { btn.disabled = true; btn.textContent = "检查中…"; }
+
+    api("/residential/health").then(r => {
+        if (btn) { btn.disabled = false; btn.textContent = "检查"; }
+        if (!r || r.error) {
+            _sysErr(body, "读取失败", loadResiHealth);
+            return;
+        }
+        _sysClear(body);
+
+        if (!r.enabled) {
+            const row = document.createElement("div");
+            row.className = "sysstat-row";
+            const dot = document.createElement("span");
+            dot.className = "resi-dot inactive";
+            const lbl = document.createElement("span");
+            lbl.className = "sysstat-label-dim";
+            lbl.textContent = "住宅未启用";
+            row.append(dot, lbl);
+            body.appendChild(row);
+            body.appendChild(_sysKv("分流关键词", _sysFmt(r.domains_count) + " 个"));
+            return;
+        }
+
+        const ip   = r.current_egress_ip_test;
+        const isp  = r.via_proxy_isp;
+        const type = r.egress_ip_type || "unknown";
+
+        let dotClass = "active";
+        let stateText = "正常";
+        if (!ip) { dotClass = "warn"; stateText = "待测"; }
+        else if (type && /IDC|机房/i.test(type)) { dotClass = "warn"; stateText = "非住宅"; }
+        else if (type === "unknown") { dotClass = "warn"; stateText = "类型未知"; }
+
+        const row = document.createElement("div");
+        row.className = "sysstat-row";
+        const dot = document.createElement("span");
+        dot.className = "resi-dot " + dotClass;
+        const lbl = document.createElement("span");
+        lbl.className = "sysstat-label";
+        lbl.textContent = stateText;
+        row.append(dot, lbl);
+        if (ip) {
+            const pill = document.createElement("span");
+            pill.className = "resi-ip-pill";
+            pill.title = "出口 IP";
+            pill.textContent = ip;
+            row.appendChild(pill);
+        }
+        body.appendChild(row);
+
+        body.appendChild(_sysKv("ISP", _sysFmt(isp)));
+        const typeKind = dotClass === "active" ? "good" : (dotClass === "warn" ? "warn" : "");
+        body.appendChild(_sysKv("IP 类型", _sysTag(_sysFmt(type), typeKind)));
+        body.appendChild(_sysKv("分流关键词", _sysFmt(r.domains_count) + " 个"));
+    }).catch(() => {
+        if (btn) { btn.disabled = false; btn.textContent = "检查"; }
+        _sysErr(body, "读取失败", loadResiHealth);
+    });
+}
+
+function loadWatchdogStatus() {
+    const body = document.getElementById("sys-wd-body");
+    const btn  = document.getElementById("wd-refresh");
+    if (!body) return;
+    _sysShimmer(body);
+    if (btn) { btn.disabled = true; btn.textContent = "刷新中…"; }
+
+    api("/hy2/watchdog/status").then(r => {
+        if (btn) { btn.disabled = false; btn.textContent = "刷新"; }
+        if (!r || r.error) {
+            _sysErr(body, "读取失败", loadWatchdogStatus);
+            return;
+        }
+        _sysClear(body);
+
+        const active = !!r.watchdog_active;
+        const failCount = r.fail_count || 0;
+        const logs = Array.isArray(r.log_recent_lines) ? r.log_recent_lines : [];
+
+        const row = document.createElement("div");
+        row.className = "sysstat-row";
+        const dot = document.createElement("span");
+        dot.className = "resi-dot " + (active ? "active" : "inactive");
+        const lbl = document.createElement("span");
+        lbl.className = "sysstat-label";
+        lbl.textContent = active ? "运行中" : "未启用";
+        row.append(dot, lbl);
+        body.appendChild(row);
+
+        body.appendChild(_sysKv("下次检查", _sysFmt(r.next_run_at)));
+        body.appendChild(_sysKv("上次检查", _sysFmt(r.last_run_at)));
+        body.appendChild(_sysKv("失败计数",
+            failCount > 0 ? _sysTag(failCount + " 次", "bad") : _sysTag("0", "good")));
+
+        if (logs.length) {
+            const det = document.createElement("details");
+            det.className = "sysstat-logs";
+            const sum = document.createElement("summary");
+            sum.textContent = "最近日志（" + logs.length + " 行）";
+            const pre = document.createElement("pre");
+            pre.textContent = logs.join("\n");
+            det.append(sum, pre);
+            body.appendChild(det);
+        }
+    }).catch(() => {
+        if (btn) { btn.disabled = false; btn.textContent = "刷新"; }
+        _sysErr(body, "读取失败", loadWatchdogStatus);
+    });
+}
+
+// 在 dashboard 初始化后自动加载一次
+function initSysStatusOnce() {
+    if (document.getElementById("sys-resi-body")) loadResiHealth();
+    if (document.getElementById("sys-wd-body"))   loadWatchdogStatus();
 }
