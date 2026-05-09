@@ -423,7 +423,8 @@ sniff:
   timeout: 2s
   rewriteDomain: true
   tcpPorts: 80,443,8000-9000
-  udpPorts: all
+  # UDP 嗅探仅限 443 (QUIC/HTTP3) 和 53 (DoH/DoQ)
+  udpPorts: 443,53
 
 ${residential_block}
 EOF
@@ -431,9 +432,178 @@ EOF
     chmod 644 "$config_file"
 }
 
+# residential-proxy.json 关键词迁移（v3.4.17 → v3.4.18）
+# 老默认 10 个含 "google" "googleapis" "gstatic"（粗匹配 → 全站误伤 + urltest 自循环）
+# 新默认精化为 AI/敏感站点 24 个
+migrate_residential_keywords() {
+    local cfg="${BASE_DIR}/residential-proxy.json"
+    [[ -f "$cfg" ]] || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+
+    # 旧默认列表（v3.4.17 及之前，保序）
+    local legacy_default
+    legacy_default=$(jq -nc '["openai","chatgpt","google","googleapis","gstatic","anthropic","claude","ping0","grok","tiktok"]')
+
+    # 新默认列表（必须与 residential-helper.sh DEFAULT_DOMAINS 完全一致）
+    local new_default
+    new_default=$(jq -nc '[
+        "openai","chatgpt","oai","oaistatic",
+        "anthropic","claude",
+        "aistudio","generativelanguage","gemini.google","makersuite",
+        "grok","githubcopilot","cursor","perplexity",
+        "mistral","cohere","huggingface","replicate","together","groq",
+        "statsig","featuregates",
+        "ping0","ip.sb",
+        "tiktok"
+    ]')
+
+    local current
+    current=$(jq -c '.domains // null' "$cfg" 2>/dev/null || echo "null")
+
+    # 已经是新默认 → 无需任何动作（防止重复打印）
+    if [[ "$current" == "$new_default" ]]; then
+        return 0
+    fi
+
+    # 自动迁移条件：用户从未自定义
+    #   1) domains == null（老服务器初始化时就这样）
+    #   2) domains 精确等于老默认 10 个（保序对比）
+    local should_auto_replace=0
+    if [[ "$current" == "null" ]] || [[ "$current" == "$legacy_default" ]]; then
+        should_auto_replace=1
+    fi
+
+    if [[ "$should_auto_replace" == "1" ]]; then
+        local tmp="${cfg}.tmp.$$"
+        if jq --argjson nd "$new_default" '.domains = $nd' "$cfg" > "$tmp" 2>/dev/null; then
+            mv "$tmp" "$cfg"
+            chmod 600 "$cfg"
+            print_info "  ✓ 住宅代理分流关键词已升级为 v3.4.18 默认（24 个 AI / 敏感站点关键词）"
+        else
+            rm -f "$tmp"
+        fi
+        return 0
+    fi
+
+    # 用户已自定义 —— 不覆盖（这是用户数据），仅在含老粗关键词时打印提示
+    local has_stale
+    has_stale=$(jq -r '
+        (.domains // []) as $d |
+        if (($d | index("google"))      != null) or
+           (($d | index("googleapis")) != null) or
+           (($d | index("gstatic"))    != null)
+        then "yes" else "" end
+    ' "$cfg" 2>/dev/null)
+    if [[ "$has_stale" == "yes" ]]; then
+        print_warning "  住宅代理含 google/googleapis/gstatic 关键词（v3.4.18 已弃用）"
+        print_warning "    原因：会让整个 google 全站走住宅 + 触发 sing-box urltest 探测自循环"
+        print_warning "    建议：在 b-ui 菜单的「住宅 IP 出口」中重新应用默认关键词"
+        print_warning "    （当前为用户自定义列表，已保留不动）"
+    fi
+}
+
+#===============================================================================
+# v3.4.18 安全加固迁移（C1: admin.env / C2: SSH 99-conf）
+# - 老用户从 unit Environment= 迁移到 /opt/b-ui/admin.env (chmod 600) + bind 127.0.0.1
+# - 升级时检测 pubkey，若有则写 /etc/ssh/sshd_config.d/99-b-ui-hardening.conf
+#===============================================================================
+migrate_admin_env() {
+    # 仅当 admin.env 不存在且 unit 文件存在时迁移
+    [[ -f /opt/b-ui/admin.env ]] && return 0
+    [[ -f /etc/systemd/system/b-ui-admin.service ]] || return 0
+
+    local OLD_PWD OLD_PORT
+    OLD_PWD=$(grep '^Environment=ADMIN_PASSWORD=' /etc/systemd/system/b-ui-admin.service 2>/dev/null \
+              | sed 's/^Environment=ADMIN_PASSWORD=//')
+    OLD_PORT=$(grep '^Environment=ADMIN_PORT=' /etc/systemd/system/b-ui-admin.service 2>/dev/null \
+              | sed 's/^Environment=ADMIN_PORT=//')
+    # 兜底默认值
+    [[ -z "$OLD_PORT" ]] && OLD_PORT=8080
+    [[ -z "$OLD_PWD" ]]  && OLD_PWD=admin123
+
+    cat > /opt/b-ui/admin.env <<EOF
+ADMIN_PORT=${OLD_PORT}
+ADMIN_BIND=127.0.0.1
+ADMIN_PASSWORD=${OLD_PWD}
+HYSTERIA_CONFIG=/opt/b-ui/config.yaml
+USERS_FILE=/opt/b-ui/users.json
+XRAY_CONFIG=/opt/b-ui/xray-config.json
+XRAY_KEYS=/opt/b-ui/reality-keys.json
+EOF
+    chmod 600 /opt/b-ui/admin.env
+
+    # 重写 unit：去掉 Environment=ADMIN_*/HYSTERIA_/USERS_/XRAY_，加 EnvironmentFile=
+    sed -i '/^Environment=ADMIN_/d' /etc/systemd/system/b-ui-admin.service
+    sed -i '/^Environment=HYSTERIA_CONFIG/d' /etc/systemd/system/b-ui-admin.service
+    sed -i '/^Environment=USERS_FILE/d' /etc/systemd/system/b-ui-admin.service
+    sed -i '/^Environment=XRAY_CONFIG/d' /etc/systemd/system/b-ui-admin.service
+    sed -i '/^Environment=XRAY_KEYS/d' /etc/systemd/system/b-ui-admin.service
+    if ! grep -q '^EnvironmentFile' /etc/systemd/system/b-ui-admin.service; then
+        sed -i '/^\[Service\]/a EnvironmentFile=-/opt/b-ui/admin.env' /etc/systemd/system/b-ui-admin.service
+    fi
+    systemctl daemon-reload
+    systemctl restart b-ui-admin 2>/dev/null || true
+    print_info "  ✓ b-ui-admin: 密码迁移到 /opt/b-ui/admin.env (chmod 600)，bind 收紧到 127.0.0.1"
+}
+
+migrate_ssh_hardening() {
+    # 已加固 → 跳过
+    [[ -f /etc/ssh/sshd_config.d/99-b-ui-hardening.conf ]] && return 0
+    # 用户明确不加固（首装时无 pubkey）→ 跳过
+    [[ -f /opt/b-ui/.ssh-not-hardened ]] && return 0
+
+    local pubkey_count=0
+    if [[ -f /root/.ssh/authorized_keys ]] && [[ -s /root/.ssh/authorized_keys ]]; then
+        pubkey_count=$(grep -cE '^[^#]*\s*(ssh-(rsa|ed25519|dss)|ecdsa-sha2-)' \
+                       /root/.ssh/authorized_keys 2>/dev/null || echo 0)
+    fi
+    pubkey_count=${pubkey_count//[^0-9]/}
+    [[ -z "$pubkey_count" ]] && pubkey_count=0
+
+    if [[ $pubkey_count -lt 1 ]]; then
+        # 没有 pubkey，不加固，但留一个提示文件防止下次重复检测
+        return 0
+    fi
+
+    mkdir -p /etc/ssh/sshd_config.d
+    cat > /etc/ssh/sshd_config.d/99-b-ui-hardening.conf <<'EOF'
+# B-UI SSH 加固（覆盖 50-cloud-init.conf）
+PasswordAuthentication no
+PermitRootLogin prohibit-password
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+EOF
+    chmod 644 /etc/ssh/sshd_config.d/99-b-ui-hardening.conf
+
+    if sshd -t 2>/dev/null; then
+        systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null || \
+            systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null
+        print_info "  ✓ SSH 加固已启用（密码登录禁用，pubkey 数量: ${pubkey_count}）"
+    else
+        rm -f /etc/ssh/sshd_config.d/99-b-ui-hardening.conf
+        print_warning "  sshd -t 校验失败，已回滚 SSH 加固"
+    fi
+}
+
+migrate_relay_log() {
+    # C3: 老 b-ui-relay unit 含 StandardOutput=null/StandardError=null → 让 reapply 重写
+    if [[ -f /etc/systemd/system/b-ui-relay.service ]] && \
+       grep -qE '^Standard(Output|Error)=null' /etc/systemd/system/b-ui-relay.service; then
+        if [[ -f "${BASE_DIR}/residential-helper.sh" ]]; then
+            bash "${BASE_DIR}/residential-helper.sh" reapply 2>/dev/null || true
+            print_info "  ✓ b-ui-relay: 日志改走 journal（清理 StandardOutput=null）"
+        fi
+    fi
+}
+
 apply_systemd_configs() {
     print_info "应用 systemd 资源隔离配置..."
     local updated=0
+
+    # v3.4.18 安全加固迁移（先于 systemd 配置，因为 b-ui-admin 会被 reapply 重启）
+    migrate_admin_env
+    migrate_ssh_hardening
+    migrate_relay_log
 
     # 获取当前配置路径
     local config_file="${BASE_DIR}/config.yaml"
@@ -458,11 +628,34 @@ apply_systemd_configs() {
         fi
     fi
 
-    # 迁移 config.yaml：确保 udpPorts: all 存在（供住宅 IP UDP 域名分流）
+    # 迁移 config.yaml：确保 udpPorts 存在；旧值 'all' 收窄为 '443,53'
+    # 'all' 在游戏/视频会议等高频小包场景下嗅探会浪费 CPU 且容易误判
     if [[ -f "$config_file" ]] && grep -q 'tcpPorts:' "$config_file" && ! grep -q 'udpPorts:' "$config_file"; then
-        sed -i '/tcpPorts:.*80,443/a\  udpPorts: all' "$config_file"
-        print_info "  ✓ config.yaml 添加 udpPorts: all（供住宅 IP UDP 域名分流）"
+        sed -i '/tcpPorts:.*80,443/a\  udpPorts: 443,53' "$config_file"
+        print_info "  ✓ config.yaml 添加 udpPorts: 443,53"
         hysteria_config_changed=1
+    elif [[ -f "$config_file" ]] && grep -qE '^\s*udpPorts:\s*all\s*$' "$config_file"; then
+        sed -i 's/^\(\s*udpPorts:\s*\)all\s*$/\1443,53/' "$config_file"
+        print_info "  ✓ config.yaml: udpPorts all → 443,53（收窄嗅探范围）"
+        hysteria_config_changed=1
+    fi
+
+    # 迁移 config.yaml：单端口 listen → 多端口 listen（端口跳跃，hysteria 2.9+ 内置语法）
+    # 老服务器若 port-hopping.json 标记 enabled，把 listen: :10000 升级为 listen: :10000,20000-30000
+    if [[ -f "$config_file" ]] && [[ -f "${BASE_DIR}/port-hopping.json" ]]; then
+        local ph_enabled ph_listen ph_start ph_end
+        ph_enabled=$(jq -r '.enabled // false' "${BASE_DIR}/port-hopping.json" 2>/dev/null)
+        if [[ "$ph_enabled" == "true" ]]; then
+            ph_listen=$(jq -r '.listenPort // 10000' "${BASE_DIR}/port-hopping.json" 2>/dev/null)
+            ph_start=$(jq -r '.startPort // 20000' "${BASE_DIR}/port-hopping.json" 2>/dev/null)
+            ph_end=$(jq -r '.endPort // 30000' "${BASE_DIR}/port-hopping.json" 2>/dev/null)
+            # 仅当 listen 是单端口（无逗号）时才升级
+            if grep -qE "^listen:\s*:[0-9]+\s*\$" "$config_file"; then
+                sed -i "s|^listen:\s*:[0-9]*\s*\$|listen: :${ph_listen},${ph_start}-${ph_end}|" "$config_file"
+                print_info "  ✓ config.yaml: listen 升级为多端口 :${ph_listen},${ph_start}-${ph_end}（hysteria 内置端口跳跃）"
+                hysteria_config_changed=1
+            fi
+        fi
     fi
 
     # 迁移 config.yaml：添加 QUIC maxIdleTimeout（默认 30s 过短，空闲断连后客户端需约 1 分钟恢复）
@@ -516,8 +709,12 @@ EOF
     # 应用 Hysteria2 服务配置
     local hysteria_mem_changed=0
     if [[ -d /etc/systemd/system/hysteria-server.service.d ]]; then
-        # 检测旧配置是否缺少内存优化（用于决定是否需要 restart）
+        # 检测旧配置是否缺少内存优化或日志级别（用于决定是否需要 restart）
         if ! grep -q 'GOMEMLIMIT' /etc/systemd/system/hysteria-server.service.d/override.conf 2>/dev/null; then
+            hysteria_mem_changed=1
+        fi
+        # HYSTERIA_LOG_LEVEL 是环境变量，必须 restart 才生效
+        if ! grep -q 'HYSTERIA_LOG_LEVEL' /etc/systemd/system/hysteria-server.service.d/override.conf 2>/dev/null; then
             hysteria_mem_changed=1
         fi
         cat > /etc/systemd/system/hysteria-server.service.d/override.conf << EOF
@@ -538,6 +735,10 @@ LimitNOFILE=1048576
 # 内存回收：让 Go runtime 主动归还内存给 OS（Go 1.19+）
 # 不设此变量时 hysteria 长跑后 RSS 会缓慢爬升至历史峰值不释放
 Environment=GOMEMLIMIT=400MiB
+
+# 日志级别：默认 info 在大流量下每秒数十条 disconnect 信息，污染 journal 且 IO 开销大
+# warn 仅保留异常和错误，能显著降低 SSD 写入与日志噪音
+Environment=HYSTERIA_LOG_LEVEL=warn
 
 # cgroup 兜底：超过 500M 开始 throttle，700M 硬上限触发 OOM-restart
 # 适配 1G 小内存机器；2G+ 机器可手动放宽到 800M/1G
@@ -582,8 +783,14 @@ SYSCTL_EOF
     fi
 
     # 应用 Xray 服务配置
+    # 重命名 override.conf → 99-b-ui-override.conf 确保字典序最大，覆盖发行版/upstream drop-in
     if [[ -d /etc/systemd/system/xray.service.d ]]; then
-        cat > /etc/systemd/system/xray.service.d/override.conf << EOF
+        # 老用户迁移：清理旧文件名
+        if [[ -f /etc/systemd/system/xray.service.d/override.conf ]]; then
+            rm -f /etc/systemd/system/xray.service.d/override.conf
+            print_info "  ✓ xray drop-in 重命名为 99-b-ui-override.conf（确保字典序最大）"
+        fi
+        cat > /etc/systemd/system/xray.service.d/99-b-ui-override.conf << EOF
 [Unit]
 # Xray 使用 TCP，与 Hysteria2 (UDP) 独立运行
 Wants=network-online.target
@@ -606,29 +813,126 @@ EOF
         updated=1
     fi
     
-    # 应用端口跳跃配置（如果配置文件存在）
+    # 端口跳跃迁移：hysteria 2.9+ 内置 listen 多端口语法接管 iptables REDIRECT
+    # 1) 清理 b-ui 历史遗留的 iptables Hysteria2-PortHopping 规则（让 hysteria 接管）
+    # 2) UFW/firewalld 放行端口范围
     if [[ -f "${BASE_DIR}/port-hopping.json" ]]; then
-        local enabled=$(jq -r '.enabled' "${BASE_DIR}/port-hopping.json" 2>/dev/null)
+        local enabled
+        enabled=$(jq -r '.enabled // false' "${BASE_DIR}/port-hopping.json" 2>/dev/null)
         if [[ "$enabled" == "true" ]]; then
-            local start_port=$(jq -r '.startPort' "${BASE_DIR}/port-hopping.json")
-            local end_port=$(jq -r '.endPort' "${BASE_DIR}/port-hopping.json")
-            local listen_port=$(jq -r '.listenPort' "${BASE_DIR}/port-hopping.json")
-            local iface=$(jq -r '.interface' "${BASE_DIR}/port-hopping.json")
-            [[ -z "$iface" || "$iface" == "null" ]] && iface=$(ip route get 8.8.8.8 2>/dev/null | grep -oP 'dev \K\S+' | head -1)
-            [[ -z "$iface" ]] && iface="eth0"
-            
-            # 清理旧规则
-            iptables -t nat -D PREROUTING -i "$iface" -p udp --dport ${start_port}:${end_port} -j REDIRECT --to-ports ${listen_port} 2>/dev/null || true
-            
-            # 添加新规则（仅 UDP）
-            if iptables -t nat -A PREROUTING -i "$iface" -p udp --dport ${start_port}:${end_port} \
-                -m comment --comment "Hysteria2-PortHopping" \
-                -j REDIRECT --to-ports ${listen_port} 2>/dev/null; then
-                print_info "  ✓ 应用端口跳跃规则 (UDP ${start_port}-${end_port} -> ${listen_port})"
+            local start_port end_port
+            start_port=$(jq -r '.startPort // 20000' "${BASE_DIR}/port-hopping.json")
+            end_port=$(jq -r '.endPort // 30000' "${BASE_DIR}/port-hopping.json")
+
+            # 安全清理 iptables 旧规则（保留其它规则，仅删 Hysteria2-PortHopping 注释）
+            if command -v iptables-save &>/dev/null && \
+               iptables -t nat -L PREROUTING -n 2>/dev/null | grep -q "Hysteria2-PortHopping"; then
+                iptables-save 2>/dev/null | grep -v "Hysteria2-PortHopping" | iptables-restore 2>/dev/null || true
+                if command -v ip6tables-save &>/dev/null; then
+                    ip6tables-save 2>/dev/null | grep -v "Hysteria2-PortHopping" | ip6tables-restore 2>/dev/null || true
+                fi
+                if [[ -d /etc/iptables ]]; then
+                    iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+                    ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+                fi
+                print_info "  ✓ 清理旧 iptables Hysteria2-PortHopping 规则（hysteria 内置已接管）"
+            fi
+
+            # UFW 放行
+            if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "active"; then
+                if ! ufw status 2>/dev/null | grep -qE "${start_port}:${end_port}/udp"; then
+                    ufw allow ${start_port}:${end_port}/udp comment "Hysteria2 端口跳跃" 2>/dev/null || true
+                    print_info "  ✓ UFW 放行 udp ${start_port}:${end_port}"
+                fi
+            fi
+
+            # firewalld 放行
+            if command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
+                firewall-cmd --permanent --add-port=${start_port}-${end_port}/udp 2>/dev/null || true
+                firewall-cmd --reload 2>/dev/null || true
             fi
         fi
     fi
-    
+
+    # Hysteria2 watchdog 迁移：老服务器没有 hy2-watchdog.timer 则部署
+    if [[ ! -f /etc/systemd/system/hy2-watchdog.timer ]]; then
+        local watchdog_script="${BASE_DIR}/hy2-watchdog.sh"
+        local listen_port_w
+        listen_port_w=$(awk '/^listen:/{ sub(/^listen: *:/,""); split($0,a,","); print a[1]; exit }' "$config_file" 2>/dev/null)
+        [[ -z "$listen_port_w" ]] && listen_port_w=10000
+
+        cat > "$watchdog_script" << WDOGEOF
+#!/bin/bash
+# Hysteria2 半死自愈：进程在但端口失活时强制重启
+LISTEN_PORT="\${HY2_PORT:-${listen_port_w}}"
+FAIL_FILE=/tmp/hy2-watchdog-fail-count
+LOG=/var/log/b-ui-hy2-watchdog.log
+
+log() { echo "[\$(date '+%Y-%m-%d %H:%M:%S')] \$1" >> "\$LOG"; }
+
+if ! systemctl is-active --quiet hysteria-server; then
+    log "INFO: hysteria-server 未运行，跳过（systemd 会自动拉起）"
+    rm -f "\$FAIL_FILE"
+    exit 0
+fi
+
+if ! ss -lun "( sport = :\${LISTEN_PORT} )" 2>/dev/null | grep -q ":\${LISTEN_PORT}"; then
+    fail=\$((\$(cat "\$FAIL_FILE" 2>/dev/null || echo 0) + 1))
+    echo "\$fail" > "\$FAIL_FILE"
+    log "WARN: UDP :\${LISTEN_PORT} 监听失活，失败计数 \${fail}/3"
+    if [[ \$fail -ge 3 ]]; then
+        log "ACTION: 连续 3 次失败，重启 hysteria-server"
+        systemctl restart hysteria-server
+        rm -f "\$FAIL_FILE"
+    fi
+    tail -200 "\$LOG" > "\${LOG}.tmp" 2>/dev/null && mv "\${LOG}.tmp" "\$LOG" 2>/dev/null
+    exit 0
+fi
+
+rm -f "\$FAIL_FILE"
+exit 0
+WDOGEOF
+        chmod 755 "$watchdog_script"
+
+        cat > /etc/systemd/system/hy2-watchdog.service << EOF
+[Unit]
+Description=Hysteria2 Watchdog (semi-dead self-heal)
+After=hysteria-server.service
+
+[Service]
+Type=oneshot
+ExecStart=${watchdog_script}
+EOF
+
+        cat > /etc/systemd/system/hy2-watchdog.timer << 'EOF'
+[Unit]
+Description=Hysteria2 Watchdog Timer
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+        systemctl daemon-reload
+        systemctl enable hy2-watchdog.timer 2>/dev/null
+        systemctl start hy2-watchdog.timer 2>/dev/null
+        print_info "  ✓ 部署 Hysteria2 watchdog（每 5 min 检测，连续 3 次失败重启）"
+        updated=1
+    fi
+
+    # 迁移 residential-proxy.json 关键词（v3.4.18）
+    # 老默认 10 个含 google/googleapis/gstatic（全站误伤 + urltest 自循环风险）
+    # 新默认 24 个 AI/敏感站点精准 keyword
+    # 策略：
+    #   - 用户从未自定义（domains == null 或精确等于老默认）→ 自动迁移到新默认
+    #   - 用户已自定义 → 保留原样，仅打印提示让用户决定（这是用户数据，不强制覆盖）
+    migrate_residential_keywords
+
     # 重新部署 cert-sync.sh + service：修复 race condition（exit 1 → exit 0 + 60s 轮询 + ExecStartPre 等 caddy）
     # 仅当老服务器已有 cert-sync 部署时才覆盖（新装由 core.sh 的 setup_cert_sync 处理）
     if [[ -f /opt/b-ui/cert-sync.sh ]] || [[ -f /etc/systemd/system/b-ui-cert-sync.service ]]; then

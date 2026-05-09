@@ -211,6 +211,11 @@ get_domain() {
 }
 
 get_admin_password() {
+    # 优先读 admin.env（v3.4.18+），回退到老 unit Environment=
+    if [[ -f "${BASE_DIR}/admin.env" ]]; then
+        grep '^ADMIN_PASSWORD=' "${BASE_DIR}/admin.env" 2>/dev/null | head -1 | cut -d= -f2-
+        return
+    fi
     grep "ADMIN_PASSWORD=" /etc/systemd/system/b-ui-admin.service 2>/dev/null | cut -d= -f3
 }
 
@@ -398,17 +403,56 @@ change_password() {
         print_error "密码至少6位"
         return 1
     fi
-    
-    local svc="/etc/systemd/system/b-ui-admin.service"
-    if [[ ! -f "$svc" ]]; then
-        print_error "服务配置文件不存在"
-        return 1
+
+    # v3.4.18+：写 /opt/b-ui/admin.env (chmod 600)
+    # 注意：EnvironmentFile reload 不重读，必须 restart
+    local env_file="${BASE_DIR}/admin.env"
+
+    if [[ ! -f "$env_file" ]]; then
+        # 兜底：admin.env 不存在 → 触发一次迁移（让 update.sh 的逻辑跑一次）
+        # 这里保险起见：直接生成最小可用 env 文件
+        local OLD_PORT=8080
+        if [[ -f /etc/systemd/system/b-ui-admin.service ]]; then
+            local p
+            p=$(grep '^Environment=ADMIN_PORT=' /etc/systemd/system/b-ui-admin.service 2>/dev/null | sed 's/^Environment=ADMIN_PORT=//')
+            [[ -n "$p" ]] && OLD_PORT=$p
+        fi
+        cat > "$env_file" <<EOF
+ADMIN_PORT=${OLD_PORT}
+ADMIN_BIND=127.0.0.1
+ADMIN_PASSWORD=${new_pass}
+HYSTERIA_CONFIG=${BASE_DIR}/config.yaml
+USERS_FILE=${BASE_DIR}/users.json
+XRAY_CONFIG=${BASE_DIR}/xray-config.json
+XRAY_KEYS=${BASE_DIR}/reality-keys.json
+EOF
+        chmod 600 "$env_file"
+        # 同步重写 unit 去掉 Environment=ADMIN_PASSWORD/ADMIN_PORT
+        if [[ -f /etc/systemd/system/b-ui-admin.service ]]; then
+            sed -i '/^Environment=ADMIN_/d' /etc/systemd/system/b-ui-admin.service
+            grep -q '^EnvironmentFile' /etc/systemd/system/b-ui-admin.service || \
+                sed -i '/^\[Service\]/a EnvironmentFile=-'"${env_file}" /etc/systemd/system/b-ui-admin.service
+            systemctl daemon-reload
+        fi
+    else
+        # 已有 env 文件：替换 ADMIN_PASSWORD 行（找不到则 append）
+        if grep -q '^ADMIN_PASSWORD=' "$env_file"; then
+            # 用 awk 安全替换（避免密码含 sed 元字符）
+            awk -v pwd="$new_pass" '
+                BEGIN { replaced=0 }
+                /^ADMIN_PASSWORD=/ { print "ADMIN_PASSWORD=" pwd; replaced=1; next }
+                { print }
+                END { if (!replaced) print "ADMIN_PASSWORD=" pwd }
+            ' "$env_file" > "${env_file}.tmp" && mv "${env_file}.tmp" "$env_file"
+        else
+            echo "ADMIN_PASSWORD=${new_pass}" >> "$env_file"
+        fi
+        chmod 600 "$env_file"
     fi
-    
-    sed -i "s/ADMIN_PASSWORD=[^ ]*/ADMIN_PASSWORD=${new_pass}/" "$svc"
-    systemctl daemon-reload
+
+    # EnvironmentFile reload 不重读，必须 restart
     systemctl restart b-ui-admin
-    
+
     print_success "密码已更新为: ${new_pass}"
 }
 
@@ -649,7 +693,13 @@ uninstall_all() {
     
     # 清理 Caddy 配置 (保留 Caddy 程序供其他用途)
     rm -f /etc/caddy/Caddyfile 2>/dev/null
-    
+
+    # 清理 SSH 加固 drop-in（不动 /etc/ssh/sshd_config.bak）
+    if [[ -f /etc/ssh/sshd_config.d/99-b-ui-hardening.conf ]]; then
+        rm -f /etc/ssh/sshd_config.d/99-b-ui-hardening.conf
+        systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null || true
+    fi
+
     # 清理旧版 Nginx 配置 (如果存在)
     rm -f /etc/nginx/conf.d/b-ui-admin.conf 2>/dev/null
     systemctl reload nginx 2>/dev/null || true
@@ -714,6 +764,7 @@ configure_residential_menu() {
         echo -e "  ${YELLOW}1.${NC} 启用 / 修改凭据"
         echo -e "  ${YELLOW}2.${NC} 禁用住宅 IP"
         echo -e "  ${YELLOW}3.${NC} 重新校验连通性"
+        echo -e "  ${YELLOW}4.${NC} 住宅出口健康检查（实测当前 IP / ISP）"
         echo -e "  ${YELLOW}0.${NC} 返回主菜单"
         echo ""
         read -rp "请选择: " sub
@@ -757,6 +808,9 @@ configure_residential_menu() {
                 else
                     print_error "校验失败: $(echo "$out" | grep "ERROR:" | sed 's/.*ERROR: //')"
                 fi
+                ;;
+            4)
+                cmd_residential_health
                 ;;
             0) return ;;
             *) print_error "无效选项" ;;
@@ -833,22 +887,172 @@ cmd_server_residential() {
         status)
             bash "${BASE_DIR}/residential-helper.sh" status
             ;;
+        health)
+            cmd_residential_health
+            ;;
         *)
-            echo "用法: b-ui residential <enable <url>|disable|status>" >&2
+            echo "用法: b-ui residential <enable <url>|disable|status|health>" >&2
             exit 2
             ;;
     esac
     exit 0
 }
 
+# 通过 sing-box 中继 (127.0.0.1:2080) 实测当前敏感域名出口 IP / ISP，
+# 直观验证流量是否真的从住宅出去。
+cmd_residential_health() {
+    local config_file="${BASE_DIR}/residential-proxy.json"
+    local relay="127.0.0.1:2080"
+
+    echo -e "${CYAN}════════════ 住宅 IP 健康检查 ════════════${NC}"
+
+    if [[ ! -f "$config_file" ]]; then
+        print_warning "未找到 residential-proxy.json，未配置住宅代理"
+        return 0
+    fi
+
+    local enabled host port verified_ip verified_isp verified_at
+    enabled=$(jq -r '.enabled // false' "$config_file" 2>/dev/null)
+    host=$(jq -r '.host // ""' "$config_file" 2>/dev/null)
+    port=$(jq -r '.port // ""' "$config_file" 2>/dev/null)
+    verified_ip=$(jq -r '.lastVerifiedIp // ""' "$config_file" 2>/dev/null)
+    verified_isp=$(jq -r '.lastVerifiedIspInfo // ""' "$config_file" 2>/dev/null)
+    verified_at=$(jq -r '.lastVerifiedAt // ""' "$config_file" 2>/dev/null)
+
+    if [[ "$enabled" == "true" ]]; then
+        echo -e "  状态:        ${GREEN}已启用 ✓${NC}"
+        [[ -n "$host" && -n "$port" ]] && echo "  上游 SOCKS5: ${host}:${port}"
+        [[ -n "$verified_ip" ]]  && echo "  上次校验 IP: ${verified_ip}"
+        [[ -n "$verified_isp" ]] && echo "  ISP:         ${verified_isp}"
+        [[ -n "$verified_at" ]]  && echo "  校验时间:    ${verified_at}"
+    else
+        echo -e "  状态:        ${RED}未启用${NC}"
+        return 0
+    fi
+
+    echo
+    echo "  分流关键词:"
+    jq -r '.domains // [] | .[]' "$config_file" 2>/dev/null \
+        | awk '{printf "    - %s\n", $0}' || echo "    (使用默认列表)"
+
+    if ! systemctl is-active --quiet b-ui-relay 2>/dev/null; then
+        echo
+        print_warning "b-ui-relay 服务未运行，无法实测"
+        return 0
+    fi
+
+    echo
+    echo "  实测出口（通过 sing-box 中继 ${relay}）..."
+
+    # ipify 不在 keyword 列表 → 此请求应直连，体现 VPS 自身 IP（用作对照基线）
+    local vps_ip
+    vps_ip=$(curl -sS --max-time 8 --socks5-hostname "${relay}" \
+        https://api.ipify.org 2>/dev/null || true)
+    [[ -n "$vps_ip" ]] && echo -e "    [直连基线] VPS IP: ${YELLOW}${vps_ip}${NC}"
+
+    # 走 anthropic（命中 keyword）→ 必须从住宅出去
+    local resi_ip resi_org
+    resi_ip=$(curl -sS --max-time 10 --socks5-hostname "${relay}" \
+        https://ipinfo.io/json 2>/dev/null \
+        | jq -r '.ip // ""' 2>/dev/null || true)
+
+    # 注意：ipinfo.io 不命中关键词；通过命中关键词的域名做一次 DNS resolve 触发 dns_resi
+    # 这里直接打 ping0.cc（命中 ping0 keyword）拿到当前敏感域出口
+    local ping0_out
+    ping0_out=$(curl -sS --max-time 12 --socks5-hostname "${relay}" \
+        "https://ping0.cc/geo" 2>/dev/null | head -c 500 || true)
+    if [[ -n "$ping0_out" ]]; then
+        echo -e "    [住宅出口] ping0.cc geo: ${GREEN}${ping0_out}${NC}"
+    else
+        print_warning "    ping0.cc 未返回，住宅链路可能不通"
+    fi
+
+    if [[ -n "$resi_ip" ]]; then
+        echo "    [对照]     ipinfo.io 看到的 IP: ${resi_ip}（直连/未命中 keyword）"
+    fi
+}
+
+# SSH 加固子命令 — 检测 root pubkey，写 99-b-ui-hardening.conf 覆盖 cloud-init
+# 与 core.sh 的 harden_ssh 同款逻辑（避免 source core.sh 引入意外副作用）
+cmd_harden_ssh() {
+    if [[ $EUID -ne 0 ]]; then
+        echo "需要 root 权限" >&2; exit 1
+    fi
+    local auth_keys="/root/.ssh/authorized_keys"
+    local pubkey_count=0
+    if [[ -f "$auth_keys" ]] && [[ -s "$auth_keys" ]]; then
+        pubkey_count=$(grep -cE '^[^#]*\s*(ssh-(rsa|ed25519|dss)|ecdsa-sha2-)' "$auth_keys" 2>/dev/null || echo 0)
+    fi
+    pubkey_count=${pubkey_count//[^0-9]/}
+    [[ -z "$pubkey_count" ]] && pubkey_count=0
+
+    if [[ $pubkey_count -lt 1 ]]; then
+        print_error "未检测到 SSH 公钥（/root/.ssh/authorized_keys）"
+        print_warning "请先添加公钥再运行: b-ui harden-ssh"
+        print_info "添加方法（在客户端机器执行）: ssh-copy-id root@<server>"
+        exit 1
+    fi
+
+    mkdir -p /etc/ssh/sshd_config.d
+    cat > /etc/ssh/sshd_config.d/99-b-ui-hardening.conf <<'EOF'
+# B-UI SSH 加固（覆盖 50-cloud-init.conf）
+PasswordAuthentication no
+PermitRootLogin prohibit-password
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+EOF
+    chmod 644 /etc/ssh/sshd_config.d/99-b-ui-hardening.conf
+
+    if sshd -t 2>/dev/null; then
+        systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null || \
+            systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null
+        print_success "  ✓ SSH 加固已启用（密码登录禁用，pubkey: ${pubkey_count}）"
+        rm -f /opt/b-ui/.ssh-not-hardened
+    else
+        rm -f /etc/ssh/sshd_config.d/99-b-ui-hardening.conf
+        print_error "sshd -t 校验失败，已回滚"
+        exit 1
+    fi
+    exit 0
+}
+
+# 系统加固子命令 — 重置 unattended-upgrades，启用 apt-daily 自动安全更新
+cmd_harden_system() {
+    if [[ $EUID -ne 0 ]]; then
+        echo "需要 root 权限" >&2; exit 1
+    fi
+    if ! command -v apt-get >/dev/null 2>&1; then
+        print_error "未检测到 apt-get（仅支持 Debian/Ubuntu）"
+        exit 1
+    fi
+    print_info "安装 unattended-upgrades..."
+    apt-get update -qq 2>&1 | tail -3
+    apt-get install -y unattended-upgrades 2>&1 | tail -3
+
+    print_info "重置 apt-daily timer 状态戳..."
+    rm -f /var/lib/systemd/timers/stamp-apt-daily*.timer
+    systemctl restart apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+
+    print_info "重置 unattended-upgrades 配置..."
+    echo "unattended-upgrades unattended-upgrades/enable_auto_updates boolean true" \
+        | debconf-set-selections 2>/dev/null || true
+    DEBIAN_FRONTEND=noninteractive dpkg-reconfigure -plow unattended-upgrades 2>&1 | tail -3
+
+    print_success "  ✓ unattended-upgrades 已重置"
+    print_info "查看状态: systemctl status apt-daily.timer apt-daily-upgrade.timer"
+    exit 0
+}
+
 dispatch_subcommand_server() {
     local cmd="$1"; shift
     case "$cmd" in
-        status)      cmd_server_status "$@"; exit 0 ;;
-        restart)     cmd_server_restart "$@"; exit $? ;;
-        logs)        cmd_server_logs "$@"; exit $? ;;
-        residential) cmd_server_residential "$@" ;;
-        update)      check_bui_update; exit 0 ;;
+        status)        cmd_server_status "$@"; exit 0 ;;
+        restart)       cmd_server_restart "$@"; exit $? ;;
+        logs)          cmd_server_logs "$@"; exit $? ;;
+        residential)   cmd_server_residential "$@" ;;
+        update)        check_bui_update; exit 0 ;;
+        harden-ssh)    cmd_harden_ssh ;;
+        harden-system) cmd_harden_system ;;
         -h|--help|help)
             cat <<'HELP'
 用法: b-ui [subcommand] [options]
@@ -863,6 +1067,9 @@ dispatch_subcommand_server() {
   residential enable <url>   启用住宅 IP 出口
   residential disable        禁用住宅 IP 出口
   residential status         查看住宅 IP 状态
+  residential health         住宅出口健康检查（实测当前 IP / ISP）
+  harden-ssh                 SSH 加固（写 99-b-ui-hardening.conf，需要 pubkey）
+  harden-system              重置 unattended-upgrades 自动安全更新
 
 通用 flags:
   -y, --yes    跳过确认

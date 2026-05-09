@@ -1,7 +1,7 @@
 import http from "http";
 import fs from "fs";
 import crypto from "crypto";
-import { execSync, exec, spawnSync } from "child_process";
+import { execSync, exec, spawn, spawnSync } from "child_process";
 import path from "path";
 import https from "https";
 import { fileURLToPath } from "url";
@@ -36,6 +36,7 @@ function injectClientVersion(scriptContent) {
 
 const CONFIG = {
     port: process.env.ADMIN_PORT || 8080,
+    bind: process.env.ADMIN_BIND || "127.0.0.1",
     adminPassword: process.env.ADMIN_PASSWORD || "admin123",
     jwtSecret: process.env.JWT_SECRET || crypto.randomBytes(32).toString("hex"),
     hysteriaConfig: process.env.HYSTERIA_CONFIG || `${BASE_DIR}/config.yaml`,
@@ -44,6 +45,7 @@ const CONFIG = {
     residentialConfig: process.env.RESIDENTIAL_CONFIG || `${BASE_DIR}/residential-proxy.json`,
     residentialHelper: `${BASE_DIR}/residential-helper.sh`,
     usersFile: process.env.USERS_FILE || `${BASE_DIR}/users.json`,
+    adminEnvFile: process.env.ADMIN_ENV_FILE || `${BASE_DIR}/admin.env`,
     trafficPort: 9999,
     xrayApiPort: 10085
 };
@@ -1778,13 +1780,43 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                 const b = await parseBody(req);
                 if (!b.newPassword || b.newPassword.length < 6) return sendJSON(res, { error: "密码至少6位" }, 400);
                 try {
-                    const svc = "/etc/systemd/system/b-ui-admin.service";
-                    let c = fs.readFileSync(svc, "utf8");
-                    c = c.replace(/ADMIN_PASSWORD=[^\n]*/, "ADMIN_PASSWORD=" + b.newPassword);
-                    fs.writeFileSync(svc, c);
-                    execSync("systemctl daemon-reload");
-                    // 同时更新内存中的密码，立即生效（无需重启服务）
-                    CONFIG.adminPassword = b.newPassword;
+                    // 新方案：写 admin.env (chmod 600) 而非 unit Environment=
+                    // 注意：systemd EnvironmentFile reload 不会重读，必须 restart
+                    const envFile = CONFIG.adminEnvFile;
+                    const newPwd = b.newPassword;
+                    let envContent = "";
+                    if (fs.existsSync(envFile)) {
+                        envContent = fs.readFileSync(envFile, "utf8");
+                    }
+                    const lines = envContent.split("\n");
+                    let replaced = false;
+                    for (let i = 0; i < lines.length; i++) {
+                        if (/^ADMIN_PASSWORD=/.test(lines[i])) {
+                            lines[i] = "ADMIN_PASSWORD=" + newPwd;
+                            replaced = true;
+                            break;
+                        }
+                    }
+                    if (!replaced) {
+                        // 移除尾部空行后追加
+                        while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+                        lines.push("ADMIN_PASSWORD=" + newPwd);
+                        lines.push("");
+                    }
+                    fs.writeFileSync(envFile, lines.join("\n"));
+                    try { fs.chmodSync(envFile, 0o600); } catch { }
+                    // 同时更新内存中的密码，立即生效（避免重启窗口期）
+                    CONFIG.adminPassword = newPwd;
+                    // 异步重启 b-ui-admin 让 systemd 重新读取 EnvironmentFile
+                    // 不能 reload —— EnvironmentFile 的 reload 不会重读
+                    // 用 spawn + detached + unref 避免 self-restart 时阻塞当前响应
+                    try {
+                        const child = spawn("systemctl", ["restart", "b-ui-admin"], {
+                            detached: true,
+                            stdio: "ignore"
+                        });
+                        child.unref();
+                    } catch { }
                     return sendJSON(res, { success: true, message: "密码已更新，请重新登录" });
                 } catch (e) { return sendJSON(res, { error: e.message }, 500); }
             }
@@ -1822,4 +1854,4 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
     sendJSON(res, { error: "Not found" }, 404);
 });
 
-server.listen(CONFIG.port, () => console.log(`B-UI Admin Panel v${VERSION} running on port ${CONFIG.port}`));
+server.listen(CONFIG.port, CONFIG.bind, () => console.log(`B-UI Admin Panel v${VERSION} running on ${CONFIG.bind}:${CONFIG.port}`));

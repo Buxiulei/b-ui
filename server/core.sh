@@ -128,6 +128,10 @@ LimitNOFILE=1048576
 # 不设此变量时 hysteria 长跑后 RSS 会缓慢爬升至历史峰值不释放
 Environment=GOMEMLIMIT=400MiB
 
+# 日志级别：默认 info 在大流量下每秒数十条 disconnect 信息，污染 journal 且 IO 开销大
+# warn 仅保留异常和错误，能显著降低 SSD 写入与日志噪音
+Environment=HYSTERIA_LOG_LEVEL=warn
+
 # cgroup 兜底：超过 500M 开始 throttle，700M 硬上限触发 OOM-restart
 # 适配 1G 小内存机器；2G+ 机器可手动放宽到 800M/1G
 MemoryHigh=500M
@@ -384,12 +388,21 @@ configure_hysteria() {
 [{"username":"${FIRST_USER}","password":"${FIRST_USER_PASS}","createdAt":"$(date -Iseconds)","limits":{"speedLimit":100000000}}]
 EOF
     
+    # 决定 listen 字段：启用端口跳跃时使用 hysteria 2.9+ 内置多端口语法
+    # （比 iptables REDIRECT 干净：hysteria 自管 nftables，shutdown 自动清理）
+    local listen_value=":${PORT}"
+    if [[ "$PORT_HOPPING_ENABLED" =~ ^[yY]$ ]]; then
+        listen_value=":${PORT},${PORT_HOPPING_START:-20000}-${PORT_HOPPING_END:-30000}"
+    fi
+
     # 生成配置文件（使用 HTTP 认证支持用户级别限速）
     cat > "$CONFIG_FILE" << EOF
 # Hysteria2 服务器配置 (v2.9.0)
 # 生成时间: $(date)
 
-listen: :${PORT}
+# 端口跳跃：hysteria 2.9+ 内置多端口绑定，降低 ISP 对单 UDP 端口的 QoS 命中率
+# 单端口流量明显，多端口可让 ISP 难以定向限速；hysteria 自动管理 nftables/iptables
+listen: ${listen_value}
 
 tls:
   sniGuard: disable
@@ -429,7 +442,9 @@ sniff:
   timeout: 2s
   rewriteDomain: true
   tcpPorts: 80,443,8000-9000
-  udpPorts: all
+  # UDP 嗅探仅限 443 (QUIC/HTTP3) 和 53 (DoH/DoQ)；'all' 会让 hysteria 嗅探所有 UDP 端口
+  # 在游戏/视频会议等高频小包场景下可能误中，徒增 CPU 与误判
+  udpPorts: 443,53
 
 # B-UI:RESIDENTIAL-START
 # B-UI:RESIDENTIAL-END
@@ -742,8 +757,91 @@ EOF
     systemctl daemon-reload
     systemctl enable b-ui-cert-sync.timer 2>/dev/null
     systemctl start b-ui-cert-sync.timer 2>/dev/null
-    
+
     print_success "证书同步机制已配置"
+}
+
+#===============================================================================
+# Hysteria2 半死自愈 watchdog
+# 进程在但 UDP 监听失活时强制重启（每 5 min 检测，连续 3 次失败触发）
+#===============================================================================
+
+setup_hy2_watchdog() {
+    print_info "配置 Hysteria2 watchdog（半死自愈）..."
+
+    local watchdog_script="${BASE_DIR}/hy2-watchdog.sh"
+    local listen_port=${PORT:-10000}
+
+    # 写入 watchdog 脚本
+    cat > "$watchdog_script" << WDOGEOF
+#!/bin/bash
+# Hysteria2 半死自愈：进程在但端口失活时强制重启
+# 每 5 min 触发一次；连续 3 次（15min）失败 → systemctl restart hysteria-server
+LISTEN_PORT="\${HY2_PORT:-${listen_port}}"
+FAIL_FILE=/tmp/hy2-watchdog-fail-count
+LOG=/var/log/b-ui-hy2-watchdog.log
+
+log() { echo "[\$(date '+%Y-%m-%d %H:%M:%S')] \$1" >> "\$LOG"; }
+
+# 1. 进程必须存在；不存在交给 systemd Restart=always 处理
+if ! systemctl is-active --quiet hysteria-server; then
+    log "INFO: hysteria-server 未运行，跳过（systemd 会自动拉起）"
+    rm -f "\$FAIL_FILE"
+    exit 0
+fi
+
+# 2. UDP 端口必须仍在监听（侧面证明 socket 存活）
+if ! ss -lun "( sport = :\${LISTEN_PORT} )" 2>/dev/null | grep -q ":\${LISTEN_PORT}"; then
+    fail=\$((\$(cat "\$FAIL_FILE" 2>/dev/null || echo 0) + 1))
+    echo "\$fail" > "\$FAIL_FILE"
+    log "WARN: UDP :\${LISTEN_PORT} 监听失活，失败计数 \${fail}/3"
+    if [[ \$fail -ge 3 ]]; then
+        log "ACTION: 连续 3 次失败，重启 hysteria-server"
+        systemctl restart hysteria-server
+        rm -f "\$FAIL_FILE"
+    fi
+    # 保留最近 200 行日志
+    tail -200 "\$LOG" > "\${LOG}.tmp" 2>/dev/null && mv "\${LOG}.tmp" "\$LOG" 2>/dev/null
+    exit 0
+fi
+
+# 监听正常，重置失败计数
+rm -f "\$FAIL_FILE"
+exit 0
+WDOGEOF
+    chmod 755 "$watchdog_script"
+
+    # systemd service（oneshot）
+    cat > /etc/systemd/system/hy2-watchdog.service << EOF
+[Unit]
+Description=Hysteria2 Watchdog (semi-dead self-heal)
+After=hysteria-server.service
+
+[Service]
+Type=oneshot
+ExecStart=${watchdog_script}
+EOF
+
+    # systemd timer（每 5 min）
+    cat > /etc/systemd/system/hy2-watchdog.timer << 'EOF'
+[Unit]
+Description=Hysteria2 Watchdog Timer
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable hy2-watchdog.timer 2>/dev/null
+    systemctl start hy2-watchdog.timer 2>/dev/null
+
+    print_success "Hysteria2 watchdog 已启用（每 5min 检测，连续 3 次失败重启）"
 }
 
 # 等待 Caddy 证书就绪并同步
@@ -922,7 +1020,7 @@ EOF
 # 使用 iptables DNAT 将端口范围转发到 Hysteria 监听端口
 #===============================================================================
 
-PORT_HOPPING_ENABLED="n"
+PORT_HOPPING_ENABLED="y"
 PORT_HOPPING_START="20000"
 PORT_HOPPING_END="30000"
 
@@ -931,84 +1029,49 @@ configure_port_hopping() {
         print_info "端口跳跃未启用，跳过配置"
         return 0
     fi
-    
+
     local listen_port=${PORT:-10000}
     local start_port=${PORT_HOPPING_START:-20000}
     local end_port=${PORT_HOPPING_END:-30000}
     local xray_port=${XRAY_PORT:-10001}
-    
-    print_info "配置端口跳跃 (${start_port}-${end_port} -> ${listen_port})..."
-    
-    # 检测网卡名称
+
+    print_info "配置端口跳跃 (${start_port}-${end_port}) ..."
+
+    # hysteria 2.9+ 使用 config.yaml 内置 listen 多端口语法（如 :10000,20000-30000）
+    # hysteria 自动管理 nftables/iptables，shutdown 时自动清理；不再需要手动写 REDIRECT
+    # 这里只负责放行防火墙端口范围 + 保存状态
+
+    # 清理 b-ui 历史遗留的 iptables REDIRECT 规则（如果有），让 hysteria 接管
+    if command -v iptables &>/dev/null && iptables -t nat -L PREROUTING -n 2>/dev/null | grep -q "Hysteria2-PortHopping"; then
+        print_info "清理旧的 iptables REDIRECT 规则（hysteria 内置已接管）"
+        # 安全清理：保留其他规则，只删带 Hysteria2-PortHopping 注释的
+        iptables-save 2>/dev/null | grep -v "Hysteria2-PortHopping" | iptables-restore 2>/dev/null || true
+        if command -v ip6tables-save &>/dev/null; then
+            ip6tables-save 2>/dev/null | grep -v "Hysteria2-PortHopping" | ip6tables-restore 2>/dev/null || true
+        fi
+        # 持久化清理后的 iptables 规则
+        if [[ -d /etc/iptables ]]; then
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+            ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+        fi
+    fi
+
+    # 放行 UFW（如果启用）
+    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "active"; then
+        ufw allow ${start_port}:${end_port}/udp comment "Hysteria2 端口跳跃" 2>/dev/null || true
+        print_success "  ✓ UFW 已放行 udp ${start_port}:${end_port} 端口跳跃范围"
+    fi
+
+    # 放行 firewalld（如果启用）
+    if command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
+        firewall-cmd --permanent --add-port=${start_port}-${end_port}/udp 2>/dev/null || true
+        firewall-cmd --reload 2>/dev/null || true
+        print_success "  ✓ firewalld 已放行 udp ${start_port}-${end_port}"
+    fi
+
+    # 保存端口跳跃状态（供 web/server.js 生成 mport 链接、update.sh 迁移用）
     local iface=$(ip route get 8.8.8.8 2>/dev/null | grep -oP 'dev \K\S+' | head -1)
     [[ -z "$iface" ]] && iface="eth0"
-    
-    # =========================================================================
-    # 清理旧的端口跳跃规则（通过注释标识符精确匹配）
-    # =========================================================================
-    print_info "清理旧的端口跳跃规则..."
-    
-    # 获取所有带 Hysteria2-PortHopping 注释的规则行号并删除
-    local rule_nums=$(iptables -t nat -L PREROUTING --line-numbers -n 2>/dev/null | grep "Hysteria2-PortHopping" | awk '{print $1}' | sort -rn)
-    for num in $rule_nums; do
-        iptables -t nat -D PREROUTING $num 2>/dev/null || true
-    done
-    
-    # IPv6 清理
-    local rule_nums6=$(ip6tables -t nat -L PREROUTING --line-numbers -n 2>/dev/null | grep "Hysteria2-PortHopping" | awk '{print $1}' | sort -rn)
-    for num in $rule_nums6; do
-        ip6tables -t nat -D PREROUTING $num 2>/dev/null || true
-    done
-    
-    # 兼容旧规则格式清理
-    iptables -t nat -D PREROUTING -i "$iface" -p udp --dport ${start_port}:${end_port} -j REDIRECT --to-ports ${listen_port} 2>/dev/null || true
-    ip6tables -t nat -D PREROUTING -i "$iface" -p udp --dport ${start_port}:${end_port} -j REDIRECT --to-ports ${listen_port} 2>/dev/null || true
-    
-    # =========================================================================
-    # 添加端口跳跃规则 - 仅处理 UDP 流量
-    # 使用 -m comment 添加标识符，便于后续管理和清理
-    # =========================================================================
-    
-    # 添加 IPv4 UDP 端口跳跃规则
-    if iptables -t nat -A PREROUTING -i "$iface" -p udp --dport ${start_port}:${end_port} \
-        -m comment --comment "Hysteria2-PortHopping" \
-        -j REDIRECT --to-ports ${listen_port}; then
-        print_success "IPv4 端口跳跃规则已添加 (UDP only)"
-    else
-        print_warning "IPv4 端口跳跃规则添加失败"
-    fi
-    
-    # 添加 IPv6 UDP 端口跳跃规则
-    if ip6tables -t nat -A PREROUTING -i "$iface" -p udp --dport ${start_port}:${end_port} \
-        -m comment --comment "Hysteria2-PortHopping" \
-        -j REDIRECT --to-ports ${listen_port} 2>/dev/null; then
-        print_success "IPv6 端口跳跃规则已添加 (UDP only)"
-    else
-        print_info "IPv6 端口跳跃规则跳过（可能不支持）"
-    fi
-    
-    # =========================================================================
-    # 验证规则：确保 TCP 流量不受影响
-    # =========================================================================
-    print_info "验证协议隔离..."
-    local udp_rules=$(iptables -t nat -L PREROUTING -n 2>/dev/null | grep -c "Hysteria2-PortHopping")
-    local tcp_rules=$(iptables -t nat -L PREROUTING -n 2>/dev/null | grep "Hysteria2-PortHopping" | grep -c "tcp" || echo "0")
-    
-    if [[ "$udp_rules" -gt 0 && "$tcp_rules" -eq 0 ]]; then
-        print_success "协议隔离验证通过：UDP=${udp_rules} 条规则，TCP=无影响"
-    else
-        print_warning "协议隔离需要验证，请检查 iptables 规则"
-    fi
-    
-    # 持久化 iptables 规则
-    if command -v iptables-save &> /dev/null; then
-        mkdir -p /etc/iptables
-        iptables-save > /etc/iptables/rules.v4
-        ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
-        print_success "iptables 规则已持久化"
-    fi
-    
-    # 保存端口跳跃配置（增加 xray_port 信息）
     cat > "${BASE_DIR}/port-hopping.json" << EOF
 {
     "enabled": true,
@@ -1017,14 +1080,12 @@ configure_port_hopping() {
     "listenPort": ${listen_port},
     "xrayPort": ${xray_port},
     "interface": "${iface}",
-    "protocolIsolation": {
-        "hysteria2": "UDP only",
-        "xray": "TCP only (unaffected)"
-    }
+    "implementation": "hysteria-builtin-listen",
+    "note": "hysteria 2.9+ 内置 listen 多端口语法，已不再使用 iptables REDIRECT"
 }
 EOF
-    
-    print_success "端口跳跃配置完成（已确保 TCP/UDP 协议隔离）"
+
+    print_success "端口跳跃配置完成（hysteria 内置 listen 多端口）"
 }
 
 #===============================================================================
@@ -1218,8 +1279,21 @@ EOF
 
 create_services() {
     print_info "创建系统服务..."
-    
-    # 创建管理面板服务
+
+    # 写入 admin.env (chmod 600) — 把密码/敏感配置移出 unit 文件（unit 全局可读）
+    # bind 默认 127.0.0.1，强制 Caddy 反代，禁止 8080 直访
+    cat > "${BASE_DIR}/admin.env" <<EOF
+ADMIN_PORT=${ADMIN_PORT:-8080}
+ADMIN_BIND=127.0.0.1
+ADMIN_PASSWORD=${ADMIN_PASSWORD}
+HYSTERIA_CONFIG=${CONFIG_FILE}
+USERS_FILE=${USERS_FILE}
+XRAY_CONFIG=${BASE_DIR}/xray-config.json
+XRAY_KEYS=${BASE_DIR}/reality-keys.json
+EOF
+    chmod 600 "${BASE_DIR}/admin.env"
+
+    # 创建管理面板服务（使用 EnvironmentFile 取代 Environment=）
     cat > /etc/systemd/system/b-ui-admin.service << EOF
 [Unit]
 Description=B-UI Admin Panel
@@ -1227,12 +1301,7 @@ After=network.target
 
 [Service]
 Type=simple
-Environment=ADMIN_PORT=${ADMIN_PORT}
-Environment=ADMIN_PASSWORD=${ADMIN_PASSWORD}
-Environment=HYSTERIA_CONFIG=${CONFIG_FILE}
-Environment=USERS_FILE=${USERS_FILE}
-Environment=XRAY_CONFIG=${BASE_DIR}/xray-config.json
-Environment=XRAY_KEYS=${BASE_DIR}/reality-keys.json
+EnvironmentFile=-${BASE_DIR}/admin.env
 WorkingDirectory=${ADMIN_DIR}
 ExecStart=/usr/bin/node server.js
 Restart=always
@@ -1243,9 +1312,11 @@ WantedBy=multi-user.target
 EOF
 
     # 创建 Xray 服务覆盖
-    # 添加资源隔离设置，确保 TCP 服务稳定运行
+    # 重命名为 99-b-ui-override.conf 确保字典序最大，覆盖发行版/upstream drop-in
     mkdir -p /etc/systemd/system/xray.service.d
-    cat > /etc/systemd/system/xray.service.d/override.conf << EOF
+    # 清理可能残留的旧文件名
+    rm -f /etc/systemd/system/xray.service.d/override.conf
+    cat > /etc/systemd/system/xray.service.d/99-b-ui-override.conf << EOF
 [Unit]
 # Xray 使用 TCP，与 Hysteria2 (UDP) 独立运行
 Wants=network-online.target
@@ -1325,6 +1396,12 @@ start_all_services() {
         print_warning "Hysteria2: 证书尚未就绪，已设置开机自启"
         print_info "证书同步后 Hysteria2 将通过健康检查自动启动"
     fi
+
+    # 6. 端口跳跃防火墙放行 + 状态持久化（hysteria 内置 listen 多端口接管 iptables）
+    configure_port_hopping
+
+    # 7. 启用 Hysteria2 watchdog（半死自愈，5 min 检测）
+    setup_hy2_watchdog
 }
 
 #===============================================================================
@@ -1335,36 +1412,51 @@ start_all_services() {
 harden_ssh() {
     local auth_keys="/root/.ssh/authorized_keys"
 
-    # 检查是否有已配置的 SSH 公钥
-    if [[ ! -f "$auth_keys" ]] || [[ ! -s "$auth_keys" ]]; then
-        print_info "未检测到 SSH 公钥，保留密码登录"
-        return
+    # pubkey 检测：必须有非注释的 ssh-(rsa|ed25519|dss) 或 ecdsa-sha2- 行
+    local pubkey_count=0
+    if [[ -f "$auth_keys" ]] && [[ -s "$auth_keys" ]]; then
+        pubkey_count=$(grep -cE '^[^#]*\s*(ssh-(rsa|ed25519|dss)|ecdsa-sha2-)' "$auth_keys" 2>/dev/null || echo 0)
+    fi
+    # grep -c 在某些环境下可能返回多行，强制成单数
+    pubkey_count=${pubkey_count//[^0-9]/}
+    [[ -z "$pubkey_count" ]] && pubkey_count=0
+
+    if [[ $pubkey_count -lt 1 ]]; then
+        print_warning "未检测到 SSH 公钥（/root/.ssh/authorized_keys），跳过 SSH 加固"
+        print_warning "如需启用密码登录禁用，请先添加公钥后运行: b-ui harden-ssh"
+        mkdir -p /opt/b-ui
+        touch /opt/b-ui/.ssh-not-hardened
+        # 顺带打印 apt-daily-upgrade 提示（C5）
+        print_info "如需启用系统自动安全更新，运行: b-ui harden-system"
+        return 0
     fi
 
-    local key_count=$(grep -c '^ssh-' "$auth_keys" 2>/dev/null || echo "0")
-    if [[ "$key_count" -eq 0 ]]; then
-        print_info "未检测到有效 SSH 公钥，保留密码登录"
-        return
-    fi
+    print_info "检测到 ${pubkey_count} 个 SSH 公钥，写入 99-b-ui-hardening.conf 覆盖 cloud-init 默认..."
 
-    print_info "检测到 ${key_count} 个 SSH 公钥，正在加固 SSH 安全..."
+    # 确保 sshd_config.d 存在并 Include（绝大多数发行版默认已 Include /etc/ssh/sshd_config.d/*.conf）
+    mkdir -p /etc/ssh/sshd_config.d
 
-    local sshd_config="/etc/ssh/sshd_config"
+    # 写 99-... 后缀确保字典序最大，覆盖 50-cloud-init.conf
+    cat > /etc/ssh/sshd_config.d/99-b-ui-hardening.conf <<'EOF'
+# B-UI SSH 加固（覆盖 50-cloud-init.conf）
+PasswordAuthentication no
+PermitRootLogin prohibit-password
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+EOF
+    chmod 644 /etc/ssh/sshd_config.d/99-b-ui-hardening.conf
 
-    # 备份原始配置
-    if [[ ! -f "${sshd_config}.bak" ]]; then
-        cp "$sshd_config" "${sshd_config}.bak"
-    fi
-
-    # 关闭 root 密码登录，仅允许公钥
-    sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' "$sshd_config"
-    sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' "$sshd_config"
-    sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' "$sshd_config"
-
-    # 重启 sshd
-    if systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null; then
-        print_success "SSH 已加固: 仅允许公钥登录，密码登录已关闭"
+    # 校验 sshd 配置
+    if sshd -t 2>/dev/null; then
+        systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null || \
+            systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null
+        print_success "  ✓ SSH 加固已启用（密码登录已禁用，pubkey 数量: ${pubkey_count}）"
+        rm -f /opt/b-ui/.ssh-not-hardened
     else
-        print_warning "SSH 重启失败，请手动检查 sshd 配置"
+        rm -f /etc/ssh/sshd_config.d/99-b-ui-hardening.conf
+        print_error "sshd 配置校验失败 (sshd -t)，已回滚"
     fi
+
+    # 顺带打印 apt-daily-upgrade 提示（C5）
+    print_info "如需启用系统自动安全更新，运行: b-ui harden-system"
 }

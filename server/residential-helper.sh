@@ -32,7 +32,28 @@ RED='\033[0;31m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 err()  { echo -e "${RED}ERROR: $*${NC}" >&2; }
 info() { echo -e "${BLUE}$*${NC}" >&2; }
 
-DEFAULT_DOMAINS=("openai" "chatgpt" "google" "googleapis" "gstatic" "anthropic" "claude" "ping0" "grok" "tiktok")
+# 默认分流关键词（v3.4.18 起）
+# 设计原则：
+#   1) 只针对 AI / 强风控站点，不大面积匹配 google/gstatic（避全站误伤 + 避 urltest 自循环）
+#   2) statsig/featuregates 是 OpenAI/Anthropic 共用的 telemetry / feature flag 域名，必须随主站走
+#   3) ping0 / ip.sb 用于用户验证流量是否真的从住宅出去
+# 注意：旧默认含 "google" "googleapis" "gstatic"，已被精化移除（迁移见 update.sh）
+DEFAULT_DOMAINS=(
+    "openai" "chatgpt" "oai" "oaistatic"
+    "anthropic" "claude"
+    "aistudio" "generativelanguage" "gemini.google" "makersuite"
+    "grok" "githubcopilot" "cursor" "perplexity"
+    "mistral" "cohere" "huggingface" "replicate" "together" "groq"
+    "statsig" "featuregates"
+    "ping0" "ip.sb"
+    "tiktok"
+)
+
+# 旧默认列表（v3.4.17 及之前）—— 用于 update.sh 判断"用户从未自定义"
+LEGACY_DEFAULT_DOMAINS_V3_4_17=(
+    "openai" "chatgpt" "google" "googleapis" "gstatic"
+    "anthropic" "claude" "ping0" "grok" "tiktok"
+)
 
 # ---------------------------------------------------------------------------
 # 读取分流域名列表 → 导出 DOMAINS 数组
@@ -162,6 +183,8 @@ write_singbox_config_residential() {
     local kw_json
     kw_json=$(printf '%s\n' "${DOMAINS[@]}" | jq -R . | jq -s '.')
 
+    # 路由命中 tag "residential"（urltest），实际拨号 outbound 为 "residential-direct"。
+    # urltest 探测 URL 必须不命中任何分流 keyword，否则探测流量本身会被路由回 residential 形成自循环。
     jq -n \
         --arg  host       "$host" \
         --argjson port    "$port" \
@@ -178,7 +201,7 @@ write_singbox_config_residential() {
               {"tag": "dns_resi",   "type": "udp", "server": "8.8.8.8", "detour": "residential"},
               {"tag": "dns_direct", "type": "udp", "server": "1.1.1.1"}
             ],
-            "rules": [{"domain_keyword": $kw, "server": "dns_resi"}],
+            "rules": [{"domain_keyword": $kw, "action": "route", "server": "dns_resi"}],
             "final": "dns_direct",
             "strategy": "prefer_ipv4"
           },
@@ -191,12 +214,21 @@ write_singbox_config_residential() {
           "outbounds": [
             {
               "type": "socks",
-              "tag": "residential",
+              "tag": "residential-direct",
               "server": $host,
               "server_port": $port,
               "username": $user,
               "password": $pass,
               "version": "5"
+            },
+            {
+              "type": "urltest",
+              "tag": "residential",
+              "outbounds": ["residential-direct"],
+              "url": "https://cp.cloudflare.com/generate_204",
+              "interval": "3m",
+              "tolerance": 50,
+              "idle_timeout": "30m"
             },
             {"type": "direct", "tag": "direct"}
           ],
@@ -262,6 +294,8 @@ write_singbox_config_direct() {
 # sing-box 服务管理
 # ---------------------------------------------------------------------------
 start_relay_service() {
+    # 日志策略：systemd 默认走 journal（不再 redirect 到 null，便于排查）
+    # 加速率限防日志风暴：10s 窗口内最多 200 条
     cat > /etc/systemd/system/${RELAY_SERVICE}.service <<EOF
 [Unit]
 Description=B-UI Outbound Relay (sing-box)
@@ -272,8 +306,8 @@ Type=simple
 ExecStart=${SINGBOX_BIN} run -c ${SINGBOX_CONFIG}
 Restart=always
 RestartSec=3
-StandardOutput=null
-StandardError=null
+LogRateLimitIntervalSec=10s
+LogRateLimitBurst=200
 
 [Install]
 WantedBy=multi-user.target
