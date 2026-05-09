@@ -1,5 +1,5 @@
 {
-    "version": "3.4.28",
+    "version": "3.4.29",
     "updated": "2026-05-09",
     "files": [
         "install.sh",
@@ -16,6 +16,7 @@
         "b-ui-client.sh"
     ],
     "changelog": {
+        "3.4.29": "客户端 b-ui-client.sh 4 处裸 clear 全部加 `2>/dev/null || true` 容错（baiyi PC 客户端 SSH 调试时屏幕被 'unknown: I need something more specific' 刷屏）。Root cause: bui-c 主循环 / 子菜单循环反复调 `clear`，但 SSH non-TTY 或 TERM=unknown 时 clear 找不到 terminfo 会报错，bash 不捕获 stderr 就一直刷屏。同款问题之前 v3.4.20 修过 install.sh 的 print_banner，这次把 b-ui-client.sh 的 4 处也包上：line 45 (banner) / line 4778 (tui_main_loop) / line 4927 (tui_switch_node fzf 分支) / line 5128 (tui_service_control)。改后用 `ssh baiyi 'bui-c'` 这种 non-TTY 方式调试也不会刷屏。",
         "3.4.28": "诊断改进：把 sing-box check 校验错误打印出来（之前被 2>/dev/null 吞了）。用户实测 TUN 启动失败报 'sing-box check 校验失败，已丢弃临时文件'，但具体哪一行字段不识别完全看不到，无法诊断。修复：改成 `sing-box check 2>&1` 捕获 stderr，失败时缩进显示完整错误（包含 line:col + 字段名），同时保留 tmp_config 文件不删（之前 rm -f 丢弃，无法事后排查）让用户能 cat 看实际生成的 JSON 内容。下次失败时屏幕上就能直接看到诸如 'inbound[0].type: unknown' / 'outbound[0].keep_alive_period: not a string' 等具体错误。",
         "3.4.27": "TUN 启动失败修复（5月临时 用户实测：导入新节点后仍报 '没有激活的节点'）。Root cause: _switch_to_profile 在 line 2263 末尾才写 ACTIVE_CONFIG，但中间任何 step (generate_config / create_service / systemctl start) 异常都会让流程半途中止，ACTIVE_CONFIG 永远写不上。修复：(1) **提早写 ACTIVE_CONFIG 到函数开头**——通过 uri.txt / 节点目录存在校验后立刻 echo 写入，让后续步骤即使部分失败 active 也保持一致；末尾原来的写入注释保留作为防御。(2) **ensure_tun_config_ready 加自愈逻辑**：active 缺失但 configs 目录非空时，自动用 ls -t 选最新节点（mtime 排序）设为 active，覆盖 _switch_to_profile 异常退出 / 用户手动删 active 文件 等 corner case。诊断证据：用户客户端 `/opt/hysteria-client/active` 文件不存在，但 `/opt/hysteria-client/configs/hysteria2-1778329470/` 节点目录及 meta.json/uri.txt 都完整——典型 _switch_to_profile 半途退出现象。",
         "3.4.26": "去掉 3 处子菜单循环里冗余的 'read -p 按 Enter 继续...'（v3.4.11 漏改，user 实测反馈）：v3.4.11 改了 tui_main_loop 主循环但漏了 3 个子菜单循环——配置管理（line 2877，list/switch/delete）、服务控制（line 4536）、高级设置子菜单（line 4800），它们每个 case 跑完都强制 read 一次让用户按 Enter，而这些子菜单又**不 clear** 屏幕——echo 输出仍然可见，强制 pause 没意义反而多一次按键。修复：3 处 read 全部删除，case 末尾改成 `*) print_error '无效选项'; sleep 1 ;;` 让无效输入有 1s 提示再回循环。保留 tui_main_loop 中 test_proxy 后的 'Enter 返回主菜单'（test_proxy 输出大量结果，不 pause 会被主菜单清屏覆盖）。从此用户按 0 返回任何子菜单都立即生效，不再需要多按一次 Enter。",

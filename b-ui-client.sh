@@ -42,7 +42,7 @@ TUN_ENABLED="false"
 #===============================================================================
 
 print_banner() {
-    clear
+    clear 2>/dev/null || true   # v3.4.29: TERM=unknown (SSH non-TTY) 时 clear 会刷错，吞掉
     echo ""
     echo -e "${CYAN}┌──────────────────────────────────────────┐${NC}"
     echo -e "${CYAN}│${NC}                                          ${CYAN}│${NC}"
@@ -4775,7 +4775,7 @@ update_all() {
 
 advanced_settings_menu() {
     while true; do
-        clear
+        clear 2>/dev/null || true   # v3.4.29: TERM=unknown (SSH non-TTY) 时 clear 会刷错，吞掉
         menu_title_bar "高级设置" "${SCRIPT_VERSION}"
         menu_row "1" "开机自启动管理"
         menu_row "2" "编辑路由规则"
@@ -4924,7 +4924,7 @@ tui_main_loop() {
     check_client_update &>/dev/null &
 
     while true; do
-        clear
+        clear 2>/dev/null || true   # v3.4.29: TERM=unknown (SSH non-TTY) 时 clear 会刷错，吞掉
         show_menu
 
         local choice
@@ -5125,7 +5125,7 @@ tui_import_node() {
 
 tui_service_control() {
     while true; do
-        clear
+        clear 2>/dev/null || true   # v3.4.29: TERM=unknown (SSH non-TTY) 时 clear 会刷错，吞掉
         echo ""
         echo -e "${CYAN}═══ 服务控制 ═══════════════════════════════${NC}"
         echo ""
