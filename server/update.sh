@@ -542,7 +542,21 @@ SYSCTL_EOF
                 print_info "  ✓ 应用 swappiness=10 (检测到 ${mem_mb}MB ≤ 2G)"
         fi
     fi
-    
+
+    # UDP 缓冲区优化（老用户补丁）：与 core.sh 新装模板保持一致
+    # 缺失时会导致 Hysteria2 QUIC 掉包、客户端报 "no recent network activity"
+    if [[ ! -f /etc/sysctl.d/99-hysteria-perf.conf ]]; then
+        cat > /etc/sysctl.d/99-hysteria-perf.conf <<'SYSCTL_EOF'
+# Hysteria2 性能优化 - UDP 缓冲区
+net.core.rmem_max=16777216
+net.core.wmem_max=16777216
+net.core.rmem_default=1048576
+net.core.wmem_default=1048576
+SYSCTL_EOF
+        sysctl -p /etc/sysctl.d/99-hysteria-perf.conf >/dev/null 2>&1 && \
+            print_success "  ✓ 应用 UDP 缓冲区优化 (16MB)"
+    fi
+
     # 应用 Xray 服务配置
     if [[ -d /etc/systemd/system/xray.service.d ]]; then
         cat > /etc/systemd/system/xray.service.d/override.conf << EOF

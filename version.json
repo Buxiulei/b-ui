@@ -1,6 +1,6 @@
 {
-    "version": "3.4.15",
-    "updated": "2026-05-08",
+    "version": "3.4.16",
+    "updated": "2026-05-09",
     "files": [
         "install.sh",
         "server/core.sh",
@@ -16,6 +16,7 @@
         "b-ui-client.sh"
     ],
     "changelog": {
+        "3.4.16": "update.sh 自动补 UDP 缓冲区调优（hysteria 客户端 'no recent network activity' 疑难杂症修复）：bwg-temp 等老服务器实测 sysctl 仍是 Linux 默认 net.core.rmem_max=212992（208KB），core.sh:1031 的 configure_performance 只在新装路径写 /etc/sysctl.d/99-hysteria-perf.conf，老机器从来没补过。结果 QUIC 突发流量打满 208KB 内核缓冲 → 丢 UDP 包 → quic-go 重传卡住 → maxIdleTimeout(120s) 触发后整条 hysteria2 隧道失活，客户端 sing-box 日志刷 'open connection to 1.1.1.1:443 using outbound/hysteria2[proxy]: timeout: no recent network activity' 和 'dns: exchange failed ... context deadline exceeded'（连 1.1.1.1/Cloudflare 这种全球可达目标都连不上，证明是隧道层失活而不是被墙）。update.sh 的 apply_systemd_configs 末尾新增幂等补丁段：if 不存在则按 core.sh 同款模板写入（rmem_max/wmem_max=16MiB，rmem_default/wmem_default=1MiB）+ sysctl -p 立即生效，老服务器跑一次 b-ui update 自动修复，无需手动 sysctl。bwg-temp 现场验证：sysctl 修复前 rmem_max=212992、修复后=16777216；重启 hysteria-server 启动日志彻底干净（之前会刷 'failed to sufficiently increase receive buffer size' 警告），客户端立即重连且 tx 立刻回 12.5MB/s",
         "3.4.15": "修复客户端 check_client_update 里服务端下载 URL 的历史遗留 bug：best_url 写的是 https://server/api/download/b-ui-client.sh，但 web/server.js 根本没有 /api/download 这个路由（grep 全文 0 命中），实际客户端分发端点是 /packages/b-ui-client.sh（含 SCRIPT_VERSION 注入）。现象：当服务端是 best 源时，do_client_update 第一次 curl 直接 404，fallback 到 ghproxy（最近经常返回 HTML 错误页校验失败）再 fallback 到 GitHub 才成功——多走两步弯路。修正成 /packages/ 后，服务端源命中即可一步完成下载",
         "3.4.14": "客户端 test_proxy 新增'测试 6: 出口 IP 类型检测 (ping0.cc)'：抓 ping0.cc 主页 HTML 解析 `<span class=\"label ...\">家庭宽带 IP / IDC机房 IP</span>` 字段；TUN 模式直连，SOCKS 模式经 socks5 走代理；同时显示出口 IP（从 <title> 解析）；用于验证开了住宅代理后流量是不是真的从住宅 IP 出去——之前需要手动浏览器打开 ping0.cc 看，现在 bui-c 一个连接测试就跑完所有检查",
         "3.4.13": "修复客户端 do_client_update 检测/下载脱节的严重 bug：v3.4.12 之前 check_client_update 检测到 best 源（如 GitHub 的 v3.4.12）后，do_client_update 仍然把'服务端'放在下载源列表第一位——导致服务端 cron 还没跑（版本落后）时，下载到的是服务端的旧版（v3.4.11），但日志却显示'已升级至 v3.4.12'（用的是 REMOTE_VERSION 检测值），用户重启 bui-c 才发现版本对不上。修复：(1) 下载源排序改成'检测到 best 版本的源（UPDATE_URL）优先'，服务端降为 fallback；(2) 下载完比对脚本里实际的 SCRIPT_VERSION 和 REMOTE_VERSION，不一致就丢弃换下一源；(3) 完成消息显示真实下载到的版本号，不再误报",
