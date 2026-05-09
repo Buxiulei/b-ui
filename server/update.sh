@@ -283,11 +283,20 @@ do_update() {
         chmod +x "${BASE_DIR}/b-ui-cli.sh"
     fi
     
-    # 重启服务
-    print_info "重启服务..."
+    # v3.4.23: 智能重启——只在必要时重启 hysteria/xray，避免每次升级都让所有客户端断流
+    # apply_systemd_configs 已经处理了 config 变更触发的 restart（line 1142+ 的 hysteria_config_changed 逻辑）
+    # 这里只在服务挂了 / 没运行时启动；运行中的服务**保持现状**避免无谓的瞬断
+    print_info "确保服务运行..."
     systemctl start b-ui-admin 2>/dev/null || true
-    systemctl restart hysteria-server 2>/dev/null || true
-    systemctl restart xray 2>/dev/null || true
+    if ! systemctl is-active --quiet hysteria-server 2>/dev/null; then
+        systemctl start hysteria-server 2>/dev/null || true
+        print_info "  ↑ hysteria-server 之前未运行，已启动"
+    else
+        print_info "  ✓ hysteria-server 运行中（不必要重启，避免客户端瞬断）"
+    fi
+    if ! systemctl is-active --quiet xray 2>/dev/null; then
+        systemctl start xray 2>/dev/null || true
+    fi
 
     # 重新应用住宅 IP 配置（包含下载 sing-box、启动中继、更新 xray/hy2 出站）
     if [[ -f "${BASE_DIR}/residential-helper.sh" ]]; then
