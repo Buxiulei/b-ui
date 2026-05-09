@@ -158,13 +158,13 @@ tui_menu() {
         gum choose --header "$header" "$@"
     else
         local i=1
-        echo "$header"
+        echo "$header" >&2
         for opt in "$@"; do
-            echo "  $i. $opt"
+            echo "  $i. $opt" >&2
             ((i++))
         done
         local choice
-        read -p "选择 (1-$((i-1))): " choice
+        read -p "选择 (1-$((i-1))): " choice >&2
         local opts=("$@")
         if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#opts[@]} )); then
             tui_error "无效选择"
@@ -479,23 +479,27 @@ toggle_autostart() {
     local hy_enabled=$(systemctl is-enabled "$HYSTERIA_SERVICE" 2>/dev/null || echo "disabled")
     local xray_enabled=$(systemctl is-enabled xray 2>/dev/null || echo "disabled")
     local admin_enabled=$(systemctl is-enabled "$ADMIN_SERVICE" 2>/dev/null || echo "disabled")
-    
+    local caddy_enabled=$(systemctl is-enabled caddy 2>/dev/null || echo "disabled")
+
     echo -e "  Hysteria2 服务: ${YELLOW}${hy_enabled}${NC}"
     echo -e "  Xray 服务:      ${YELLOW}${xray_enabled}${NC}"
     echo -e "  管理面板服务:   ${YELLOW}${admin_enabled}${NC}"
+    echo -e "  Caddy 服务:     ${YELLOW}${caddy_enabled}${NC}"
     echo ""
-    
+
     read -p "切换自启动状态? (y/n): " toggle
     if [[ "$toggle" == "y" || "$toggle" == "Y" ]]; then
         if [[ "$hy_enabled" == "enabled" ]]; then
             systemctl disable "$HYSTERIA_SERVICE" 2>/dev/null
             systemctl disable "$ADMIN_SERVICE" 2>/dev/null
             systemctl disable xray 2>/dev/null
+            systemctl disable caddy 2>/dev/null
             print_success "已禁用开机自启动"
         else
             systemctl enable "$HYSTERIA_SERVICE" 2>/dev/null
             systemctl enable "$ADMIN_SERVICE" 2>/dev/null
             systemctl enable xray 2>/dev/null
+            systemctl enable caddy 2>/dev/null
             print_success "已启用开机自启动"
         fi
     fi
@@ -725,16 +729,22 @@ run_vps_benchmark() {
     echo -e "${CYAN}  VPS 质量测试 (goecs)${NC}"
     echo -e "${CYAN}════════════════════════════════════════════════════════════════${NC}"
     echo ""
+    local confirm
+    read -p "VPS 质量测试会下载 goecs 脚本并跑 10+ 分钟，确认继续？(y/N): " confirm
+    [[ ! "$confirm" =~ ^[yY]$ ]] && { echo "已取消"; return 0; }
+    echo ""
     print_info "正在下载并运行 VPS 测试脚本..."
     echo ""
-    
+
     export noninteractive=true
     curl -L https://raw.githubusercontent.com/oneclickvirt/ecs/master/goecs.sh -o /tmp/goecs.sh && \
     chmod +x /tmp/goecs.sh && \
     /tmp/goecs.sh install && \
     goecs
-    
+
     rm -f /tmp/goecs.sh 2>/dev/null
+    echo ""
+    read -p "  按 Enter 继续..."
 }
 
 #===============================================================================
@@ -828,10 +838,10 @@ configure_residential_menu() {
 
 cmd_server_status() {
     local hy2 xray admin caddy bbr
-    hy2=$(systemctl is-active hysteria-server 2>/dev/null || echo "inactive")
-    xray=$(systemctl is-active xray 2>/dev/null || echo "inactive")
-    admin=$(systemctl is-active b-ui-admin 2>/dev/null || echo "inactive")
-    caddy=$(systemctl is-active caddy 2>/dev/null || echo "inactive")
+    hy2=$(systemctl is-active hysteria-server 2>/dev/null);   [[ -z "$hy2" ]]   && hy2=inactive
+    xray=$(systemctl is-active xray 2>/dev/null);              [[ -z "$xray" ]]  && xray=inactive
+    admin=$(systemctl is-active b-ui-admin 2>/dev/null);       [[ -z "$admin" ]] && admin=inactive
+    caddy=$(systemctl is-active caddy 2>/dev/null);            [[ -z "$caddy" ]] && caddy=inactive
     bbr="false"
     sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr && bbr="true"
 
@@ -1316,11 +1326,8 @@ main() {
             "住宅 IP 出口 →")  configure_residential_menu ;;
             "卸载")            uninstall_all ;;
             "退出")            print_info "再见！"; exit 0 ;;
-            "__invalid__")    print_error "无效选项: ${num:-（空）}" ;;
+            "__invalid__")    print_error "无效选项: ${num:-（空）}"; echo; read -p "  按 Enter 继续..." ;;
         esac
-
-        echo
-        read -p "  按 Enter 继续..."
     done
 }
 

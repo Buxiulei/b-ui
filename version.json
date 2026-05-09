@@ -1,6 +1,6 @@
 {
-    "version": "3.4.35",
-    "updated": "2026-05-09",
+    "version": "3.4.36",
+    "updated": "2026-05-10",
     "files": [
         "install.sh",
         "server/core.sh",
@@ -16,6 +16,7 @@
         "b-ui-client.sh"
     ],
     "changelog": {
+        "3.4.36": "Web + b-ui CLI 全量测试（6 个并行 QA agent）后修 11 个 bug。Web 安全 (server.js): (1) POST /api/users 增加严格白名单输入验证：username 必须非空、长度 1-64、仅允许 Unicode 字母数字+中文+下划线连字符点；password 必须非空、长度 1-256；之前空 username/null username/空 body/空 password/XSS payload/SQL 注入字符/300 字符超长名 全部被接受，导致 hy2 config.yaml 出现 ': x' 让 hy2 启动崩。(2) PUT /api/users 同款验证 + URL 段过滤防 path traversal。(3) 损坏 JSON body 错误信息从 Exists 改为'请求格式错误'。(4) 空 body 返 400。CLI (b-ui-cli.sh): (5) cmd_server_status 双行 + JSON 不合法（systemctl is-active failed 加 echo inactive 双行被捕获），改用空判断后赋值。(6) 主菜单删除冗余 read 'Enter 继续'。(7) 菜单 [11] VPS 测试加 y/N 确认。(8) 菜单 [6] 自启动加 Caddy。(9) tui_menu fallback 提示走 stderr。residential-helper.sh: (10) line 566/577 'local can only be used in a function' 删除 2 处 local 关键字。core.sh: (11) harden_ssh 加幂等 diff 检测，仅内容真改动才写 + reload sshd。",
         "3.4.35": "test_proxy 测试 6 出口 IP 类型检测换数据源（同 v3.4.22 server 端）：之前用 ping0.cc 主页 HTML 抓 '家庭宽带 IP / IDC机房 IP' label，但 ping0 加了 Cloudflare Turnstile 验证码（页面只有 ~1.3KB captcha 不返回真内容），永远显示'类型未识别（ping0 可能改版）'。改用 ip-api.com/json 返回 hosting/proxy/mobile boolean 权威判断（同 v3.4.22 服务端 /api/residential/health 同款方案）：hosting=true → IDC，proxy=true → 代理，mobile=true → 移动，否则 → 家庭宽带；同时显示 ASN ISP 名（更详细）。客户端测试 6 现在可靠返回真实出口类型。",
         "3.4.34": "b-ui-client.sh 入口加 BASH_SOURCE 守卫（让脚本可 source 不触发 main）。第三轮 smoke test 发现：用 `source /usr/local/bin/bui-c` 调用单个函数（如 test_proxy / show_status_bar）做诊断时，脚本末尾的 case 入口无条件跑 first_run_setup + main → 触发 update 流程 / 主菜单循环，让 source 调用 hang 住或污染目标函数。修复：用 `[[ \"${BASH_SOURCE[0]}\" == \"${0}\" ]]` 守卫（标准 bash 做法），脚本被 source 时仅加载函数定义不触发 main，被直接执行时正常跑。这样未来调试可以 `bash -c '. /usr/local/bin/bui-c; test_proxy'` 单独调任意函数做单元测试。",
         "3.4.33": "import 节点 dedup 修复（第二轮 smoke test 发现）：cmd_import 和 tui_import_node 都用 sanitize 后的 config_name 做 -d 检测，但中文 remark（如 '服务器专用'）经 sanitize（保留 [a-zA-Z0-9._-]）→ 全删 → fallback 到 ${protocol}-$(date +%s) 时间戳，**每次时间戳都不同**所以 dedup 永远不命中，重复 URI 反复创建新节点目录。修复：抽出 `_find_config_by_uri` helper 遍历 configs/*/uri.txt 按内容比对（cmp 等价），cmd_import 和 tui_import_node 在 sanitize 之前先用 helper 检查 URI 是否已导入过——命中就跳过。这才是用户实际期望的去重语义（同款 hy2:// URL 应去重，不管 remark 是不是 sanitize 友好）。",

@@ -563,7 +563,6 @@ case "$cmd" in
             save_config true
             write_singbox_config_from_state
             reload_relay_service
-            local total
             total=$(jq '(.urls // []) | length' "${RESIDENTIAL_CONFIG}")
             info "已新增 URL（共 ${total} 个住宅出口）"
             echo "$RESI_EXIT_IP"
@@ -574,7 +573,6 @@ case "$cmd" in
             parse_url "$3"
             ensure_singbox
             remove_url_from_config "$RESI_HOST" "$RESI_PORT"
-            local total
             total=$(jq '(.urls // []) | length' "${RESIDENTIAL_CONFIG}" 2>/dev/null || echo 0)
             if [[ "$total" -eq 0 ]]; then
                 # urls 空 → 直连模式

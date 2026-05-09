@@ -179,8 +179,25 @@ function parseBody(r) {
     return new Promise(s => {
         let b = "";
         r.on("data", c => b += c);
-        r.on("end", () => { try { s(b ? JSON.parse(b) : {}); } catch { s({}); } });
+        r.on("end", () => {
+            if (!b) return s({ __empty: true });
+            try { s(JSON.parse(b)); } catch { s({ __invalidJson: true }); }
+        });
     });
+}
+
+// 验证 username 白名单（用于 POST 创建和 PUT 路径）
+function validateUsername(name) {
+    if (typeof name !== "string" || name.length === 0) return "username 不能为空";
+    if (name.length > 64) return "username 长度不能超过 64 字符";
+    if (!/^[\p{L}\p{N}_\-.]+$/u.test(name)) return "username 仅允许字母/数字/中文/下划线/连字符/点";
+    return null;
+}
+
+function validatePassword(pwd) {
+    if (typeof pwd !== "string" || pwd.length === 0) return "password 不能为空";
+    if (pwd.length > 256) return "password 长度不能超过 256 字符";
+    return null;
 }
 
 function sendJSON(r, d, s = 200, headers = {}) {
@@ -1464,11 +1481,22 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
             if (r === "users") {
                 if (req.method === "GET") return sendJSON(res, loadUsers());
                 if (req.method === "POST") {
-                    const b = await parseBody(req), users = loadUsers();
-                    if (users.find(u => u.username === b.username)) return sendJSON(res, { error: "Exists" }, 400);
+                    const b = await parseBody(req);
+                    if (b && b.__empty) return sendJSON(res, { error: "缺少请求体" }, 400);
+                    if (b && b.__invalidJson) return sendJSON(res, { error: "请求格式错误（JSON 解析失败）" }, 400);
+                    if (!b || typeof b !== "object" || Array.isArray(b)) {
+                        return sendJSON(res, { error: "请求格式错误（需要 JSON 对象）" }, 400);
+                    }
+                    const unameErr = validateUsername(b.username);
+                    if (unameErr) return sendJSON(res, { error: unameErr }, 400);
+                    const pwdErr = validatePassword(b.password);
+                    if (pwdErr) return sendJSON(res, { error: pwdErr }, 400);
+
+                    const users = loadUsers();
+                    if (users.find(u => u.username === b.username)) return sendJSON(res, { error: "用户名已存在" }, 400);
                     users.push({
                         username: b.username,
-                        password: b.password || crypto.randomBytes(8).toString("hex"),
+                        password: b.password,
                         createdAt: new Date()
                     });
                     return saveUsers(users) ? sendJSON(res, { success: true }) : sendJSON(res, { error: "Save failed" }, 500);
@@ -1484,7 +1512,17 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
             // Update user (PUT /api/users/:username)
             if (r.startsWith("users/") && req.method === "PUT") {
                 const origUsername = decodeURIComponent(r.slice(6));
+                // path traversal / 非法字符校验
+                const pathErr = validateUsername(origUsername);
+                if (pathErr) return sendJSON(res, { error: "URL 中的 " + pathErr }, 400);
+
                 const b = await parseBody(req);
+                if (b && b.__empty) return sendJSON(res, { error: "缺少请求体" }, 400);
+                if (b && b.__invalidJson) return sendJSON(res, { error: "请求格式错误（JSON 解析失败）" }, 400);
+                if (!b || typeof b !== "object" || Array.isArray(b)) {
+                    return sendJSON(res, { error: "请求格式错误（需要 JSON 对象）" }, 400);
+                }
+
                 let users = loadUsers();
                 const userIndex = users.findIndex(u => u.username === origUsername);
 
@@ -1496,6 +1534,8 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
 
                 // 更新用户名
                 if (b.username && b.username !== origUsername) {
+                    const newUnameErr = validateUsername(b.username);
+                    if (newUnameErr) return sendJSON(res, { error: newUnameErr }, 400);
                     // 检查新用户名是否已存在
                     if (users.find(u => u.username === b.username)) {
                         return sendJSON(res, { error: "Username already exists" }, 400);
@@ -1504,7 +1544,9 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                 }
 
                 // 更新密码/UUID
-                if (b.password) {
+                if (typeof b.password !== "undefined") {
+                    const pwdErr = validatePassword(b.password);
+                    if (pwdErr) return sendJSON(res, { error: pwdErr }, 400);
                     if (user.protocol === "vless-reality" || user.protocol === "vless-ws-tls") {
                         user.uuid = b.password;
                     } else {

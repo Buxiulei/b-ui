@@ -1498,20 +1498,34 @@ harden_ssh() {
         return 0
     fi
 
-    print_info "检测到 ${pubkey_count} 个 SSH 公钥，写入 99-b-ui-hardening.conf 覆盖 cloud-init 默认..."
-
     # 确保 sshd_config.d 存在并 Include（绝大多数发行版默认已 Include /etc/ssh/sshd_config.d/*.conf）
     mkdir -p /etc/ssh/sshd_config.d
 
-    # 写 99-... 后缀确保字典序最大，覆盖 50-cloud-init.conf
-    cat > /etc/ssh/sshd_config.d/99-b-ui-hardening.conf <<'EOF'
+    local target_conf=/etc/ssh/sshd_config.d/99-b-ui-hardening.conf
+    local new_content
+    new_content=$(cat <<'EOF'
 # B-UI SSH 加固（覆盖 50-cloud-init.conf）
 PasswordAuthentication no
 PermitRootLogin prohibit-password
 KbdInteractiveAuthentication no
 ChallengeResponseAuthentication no
 EOF
-    chmod 644 /etc/ssh/sshd_config.d/99-b-ui-hardening.conf
+)
+
+    # 幂等：内容相同则跳过写入（避免 mtime 改变和无谓的 sshd reload）
+    if [[ -f "$target_conf" ]] && [[ "$(cat "$target_conf")" == "$new_content" ]]; then
+        print_info "  ✓ SSH 加固已是最新（幂等跳过，pubkey 数量: ${pubkey_count}）"
+        rm -f /opt/b-ui/.ssh-not-hardened
+        # 顺带打印 apt-daily-upgrade 提示（C5）
+        print_info "如需启用系统自动安全更新，运行: b-ui harden-system"
+        return 0
+    fi
+
+    print_info "检测到 ${pubkey_count} 个 SSH 公钥，写入 99-b-ui-hardening.conf 覆盖 cloud-init 默认..."
+
+    # 写 99-... 后缀确保字典序最大，覆盖 50-cloud-init.conf
+    echo "$new_content" > "$target_conf"
+    chmod 644 "$target_conf"
 
     # 校验 sshd 配置
     if sshd -t 2>/dev/null; then
@@ -1520,7 +1534,7 @@ EOF
         print_success "  ✓ SSH 加固已启用（密码登录已禁用，pubkey 数量: ${pubkey_count}）"
         rm -f /opt/b-ui/.ssh-not-hardened
     else
-        rm -f /etc/ssh/sshd_config.d/99-b-ui-hardening.conf
+        rm -f "$target_conf"
         print_error "sshd 配置校验失败 (sshd -t)，已回滚"
     fi
 
