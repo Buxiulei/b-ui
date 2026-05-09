@@ -1780,35 +1780,45 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                     return sendJSON(res, baseResp);
                 }
 
-                // v3.4.20: ping0.cc 已加 Cloudflare Turnstile 验证码无法解析
-                // 改用 ipinfo.io/json（稳定 JSON API，通过本地 socks5 走住宅出去）
-                // IP 类型从 org 字段关键词推断（最佳替代——ipinfo 不直接给类型字段）
+                // v3.4.21 关键修复：和 CLI cmd_residential_health 同款——用 ping0.cc/geo
+                // (1) ping0.cc 域名命中 sing-box 分流关键词 'ping0' → 自然路由到住宅 outbound
+                // (2) /geo endpoint 返回纯文本（4 行：IP/国家/ASN/ISP），无 captcha
+                // (3) 这才是测"真实业务路径"——用户实际访问 Claude 等敏感服务也走同款路由
+                // 之前 ipinfo.io 不命中 keyword 走 direct 出 VPS，测出来是 VPS IT7 IP，误以为住宅没生效
                 execFile("curl", [
-                    "--socks5", "127.0.0.1:2080",
-                    "-m", "5",
+                    "--socks5-hostname", "127.0.0.1:2080",
+                    "-m", "10",
                     "-sS",
-                    "https://ipinfo.io/json"
-                ], { timeout: 6000, maxBuffer: 1 * 1024 * 1024 }, (err, stdout) => {
+                    "https://ping0.cc/geo"
+                ], { timeout: 11000, maxBuffer: 1 * 1024 * 1024 }, (err, stdout) => {
                     if (err || !stdout) {
                         return sendJSON(res, baseResp);
                     }
                     try {
-                        const data = JSON.parse(String(stdout));
-                        const ip = data.ip || null;
-                        const org = data.org || ""; // e.g. "AS3257 GTT Communications Inc."
-                        const country = data.country || "";
-                        const city = data.city || "";
+                        // ping0.cc/geo 返回 4 行纯文本:
+                        //   line 1: 出口 IP
+                        //   line 2: 国家 省 市
+                        //   line 3: AS号
+                        //   line 4: ISP 名
+                        const lines = String(stdout).trim().split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+                        const ip = lines[0] || null;
+                        const location = lines[1] || "";
+                        const asn = lines[2] || "";
+                        const ispName = lines[3] || "";
+                        const fullIsp = [asn, ispName].filter(Boolean).join(" ");
 
-                        // org 关键词推断 IP 类型（IDC vs 家庭宽带）
-                        // IDC/cloud/hosting 关键词覆盖主流数据中心 ISP
-                        const idcKeywords = /\b(amazon|aws|google|microsoft|azure|digitalocean|linode|vultr|akamai|cloudflare|fastly|hetzner|ovh|leaseweb|scaleway|hosting|datacenter|data\s*center|colo|server|gtt|cogent|level\s*3|hurricane\s*electric|he\.net|psinet|telia|ntt|bandwagonhost|cn2|alibaba|tencent|huawei|sharktech|atlantic|quadranet|choopa)\b/i;
-                        const residentialKeywords = /\b(comcast|verizon|att|spectrum|charter|cox|optimum|frontier|centurylink|telekom|vodafone|orange|free|sfr|bouygues|sky|virgin|bt|talktalk|chinaTelecom|chinaUnicom|chinaMobile|broadband|fttp|fttx|cable|dsl|fiber|residential)\b/i;
+                        // 类型推断：基于 ISP 名 + ASN
+                        const idcKeywords = /\b(amazon|aws|google\s*cloud|microsoft|azure|digitalocean|linode|vultr|akamai|cloudflare|fastly|hetzner|ovh|leaseweb|scaleway|choopa|hivelocity|latitude|psychz|equinix|hosting|datacenter|data\s*center|colo|colocation|cogent|level\s*3|hurricane\s*electric|he\.net|psinet|tata|telia|ntt|bandwagonhost|cn2|alibaba|tencent|huawei|sharktech|atlantic|quadranet|m247|contabo|gcore|dedipath|frantech|buyvm|fdcservers|nfoservers|zenlayer|noezone|i3d|delimiter|incero|reliablesite|servermania|softlayer|gtt\s+communications|it7\s*networks|godaddy|krypt|i-2000|tier1net)\b/i;
+                        const residentialKeywords = /\b(comcast|verizon|at\s*&\s*t|att\s+services|spectrum|charter|cox|optimum|frontier|centurylink|telekom|deutsche\s+telekom|vodafone|orange|free\s+sas|sfr|bouygues|sky\s+broadband|virgin\s+media|bt\s+group|talktalk|china\s+telecom|china\s+unicom|china\s+mobile|broadband|fttp|fttx|cable|dsl|residential)\b/i;
+                        // 中文关键词补充（ping0 显示中文 ISP 名）
+                        const cnIdc = /(机房|数据中心|主机|云|服务器|数据)/;
+                        const cnResi = /(电信|联通|移动|宽带|家庭|住宅|铁通|长城|联合)/;
 
                         let egressType = "unknown";
-                        if (residentialKeywords.test(org)) egressType = "家庭宽带 IP";
-                        else if (idcKeywords.test(org)) egressType = "IDC机房 IP";
+                        if (residentialKeywords.test(fullIsp) || cnResi.test(fullIsp)) egressType = "家庭宽带 IP";
+                        else if (idcKeywords.test(fullIsp) || cnIdc.test(fullIsp)) egressType = "IDC机房 IP";
 
-                        const isp = org + (country ? ` (${city ? city + ', ' : ''}${country})` : '');
+                        const isp = fullIsp + (location ? ` (${location})` : '');
 
                         return sendJSON(res, {
                             ...baseResp,
