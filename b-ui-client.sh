@@ -1658,6 +1658,21 @@ check_public_ip() {
 ensure_tun_config_ready() {
     local active
     active=$(get_active_config)
+
+    # v3.4.27 自愈：active 缺失但 configs 目录非空 → 自动选最新节点设为 active
+    # 防御 _switch_to_profile 异常退出 / 用户手动删 active 文件 等 corner case
+    if [[ -z "$active" ]] && [[ -d "$CONFIGS_DIR" ]]; then
+        local newest
+        newest=$(ls -t "$CONFIGS_DIR" 2>/dev/null | head -1)
+        if [[ -n "$newest" ]] && [[ -d "${CONFIGS_DIR}/${newest}" ]] && \
+           [[ -f "${CONFIGS_DIR}/${newest}/uri.txt" ]] && \
+           [[ -f "${CONFIGS_DIR}/${newest}/meta.json" ]]; then
+            print_warning "ACTIVE_CONFIG 缺失，自愈选用最新节点: ${newest}"
+            echo "$newest" > "$ACTIVE_CONFIG"
+            active="$newest"
+        fi
+    fi
+
     if [[ -z "$active" ]]; then
         print_error "没有激活的节点，请先 'bui-c switch <name>' 或在菜单切换节点"
         return 1
@@ -2184,6 +2199,11 @@ _switch_to_profile() {
         return 1
     fi
 
+    # v3.4.27: 提早写 ACTIVE_CONFIG（之前在 line 2263 太晚，generate_config /
+    # systemctl start 任一异常都会让 active 写不上，导致 ensure_tun_config_ready
+    # 报"没有激活的节点"。先写 active，让后续步骤即使部分失败也保持 active 一致）
+    echo "$selected" > "$ACTIVE_CONFIG"
+
     local protocol
     protocol=$(grep '"protocol"' "$meta_file" 2>/dev/null | cut -d'"' -f4)
     local uri
@@ -2260,7 +2280,7 @@ _switch_to_profile() {
         tui_spin "启动 Xray 服务..." systemctl start xray-client
     fi
 
-    echo "$selected" > "$ACTIVE_CONFIG"
+    # v3.4.27: ACTIVE_CONFIG 已在函数开头写过（提早写避免 generate_config 异常时 active 没设）
 
     # 重新生成 TUN 配置
     local tun_protocol="${protocol:-hysteria2}"
