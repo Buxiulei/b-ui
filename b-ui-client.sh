@@ -2045,9 +2045,25 @@ save_config_meta() {
     local config_dir="${CONFIGS_DIR}/${config_name}"
     mkdir -p "$config_dir" || return 1
 
+    # v3.4.24: 从 URI 的 #fragment 解析中文备注名（hy2://...#服务器专用 / vless://...#xxx）
+    # URL decode 后写入 meta.json 的 alias 字段，list_configs 优先显示
+    local alias=""
+    if [[ "$uri" == *"#"* ]]; then
+        local frag="${uri#*#}"
+        # URL decode（python3 兜底，没 python3 用 printf '%b' 简单解 %xx）
+        if command -v python3 &>/dev/null; then
+            alias=$(python3 -c "import sys,urllib.parse; print(urllib.parse.unquote(sys.argv[1]))" "$frag" 2>/dev/null)
+        else
+            alias=$(printf '%b' "${frag//%/\\x}")
+        fi
+        # JSON-escape：双引号、反斜杠、控制字符
+        alias=$(printf '%s' "$alias" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read())[1:-1])" 2>/dev/null || printf '%s' "$alias" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    fi
+
     cat > "${config_dir}/meta.json" << EOF
 {
     "name": "${config_name}",
+    "alias": "${alias}",
     "protocol": "${protocol}",
     "server": "${server}",
     "socks_port": ${socks_port},
@@ -2087,19 +2103,39 @@ list_configs() {
         [[ ! -d "$config_dir" ]] && continue
         local name=$(basename "$config_dir")
         local meta_file="${config_dir}meta.json"
-        
+
         local protocol="未知"
         local server="未知"
+        local alias=""
         if [[ -f "$meta_file" ]]; then
             protocol=$(grep '"protocol"' "$meta_file" | cut -d'"' -f4)
             server=$(grep '"server"' "$meta_file" | cut -d'"' -f4)
+            # v3.4.24: alias 字段优先显示（从 URI 的 #fragment 解析的中文备注名）
+            alias=$(grep '"alias"' "$meta_file" | cut -d'"' -f4)
         fi
-        
+        # alias 老节点 meta 没有 → 兜底从 uri.txt 现场解析
+        if [[ -z "$alias" ]] && [[ -f "${config_dir}uri.txt" ]]; then
+            local uri_content
+            uri_content=$(cat "${config_dir}uri.txt" 2>/dev/null)
+            if [[ "$uri_content" == *"#"* ]]; then
+                local frag="${uri_content#*#}"
+                if command -v python3 &>/dev/null; then
+                    alias=$(python3 -c "import sys,urllib.parse; print(urllib.parse.unquote(sys.argv[1]))" "$frag" 2>/dev/null)
+                else
+                    alias=$(printf '%b' "${frag//%/\\x}")
+                fi
+            fi
+        fi
+
+        # 显示文本：alias 优先，没有再用目录名
+        local display_name="$name"
+        [[ -n "$alias" ]] && display_name="${alias}  ${DIM:-}(${name})${NC:-}"
+
         # 标记当前激活的配置
         if [[ "$name" == "$active" ]]; then
-            echo -e "  ${YELLOW}${index}.${NC} ${GREEN}★ ${name}${NC} ${CYAN}[当前]${NC}"
+            echo -e "  ${YELLOW}${index}.${NC} ${GREEN}★ ${display_name}${NC} ${CYAN}[当前]${NC}"
         else
-            echo -e "  ${YELLOW}${index}.${NC} ${name}"
+            echo -e "  ${YELLOW}${index}.${NC} ${display_name}"
         fi
         echo -e "     协议: ${protocol} | 服务器: ${server}"
         echo ""
