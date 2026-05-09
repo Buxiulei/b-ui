@@ -5472,15 +5472,18 @@ first_run_setup() {
     ensure_client_cron
 }
 
-# 入口
-case "${1:-}" in
-    auto)
-        # 静默自动更新模式 (用于 cron)
-        auto_update_all
-        ;;
-    *)
-        # 交互模式
-        first_run_setup
-        main "$@"
-        ;;
-esac
+# 入口（v3.4.34: 加 BASH_SOURCE 守卫——脚本被 source 时只加载函数，不触发 main 主流程
+# 让外部脚本可以 `. /usr/local/bin/bui-c` 后调用单个函数（test_proxy / show_status_bar 等）做诊断）
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    case "${1:-}" in
+        auto)
+            # 静默自动更新模式 (用于 cron)
+            auto_update_all
+            ;;
+        *)
+            # 交互模式
+            first_run_setup
+            main "$@"
+            ;;
+    esac
+fi
