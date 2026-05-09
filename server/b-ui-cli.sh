@@ -1145,14 +1145,23 @@ cmd_harden_ssh() {
     fi
 
     mkdir -p /etc/ssh/sshd_config.d
-    cat > /etc/ssh/sshd_config.d/99-b-ui-hardening.conf <<'EOF'
+    local target_conf=/etc/ssh/sshd_config.d/99-b-ui-hardening.conf
+    local new_content
+    new_content=$(cat <<'EOF'
 # B-UI SSH 加固（覆盖 50-cloud-init.conf）
 PasswordAuthentication no
 PermitRootLogin prohibit-password
 KbdInteractiveAuthentication no
 ChallengeResponseAuthentication no
 EOF
-    chmod 644 /etc/ssh/sshd_config.d/99-b-ui-hardening.conf
+)
+    # v3.4.37: 幂等——内容相同就跳过写入和 reload，避免 mtime 改变
+    if [[ -f "$target_conf" ]] && [[ "$(cat "$target_conf")" == "$new_content" ]]; then
+        print_info "  ✓ SSH 加固已是最新（幂等跳过，pubkey 数量: ${pubkey_count}）"
+        return 0
+    fi
+    echo "$new_content" > "$target_conf"
+    chmod 644 "$target_conf"
 
     if sshd -t 2>/dev/null; then
         systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null || \
