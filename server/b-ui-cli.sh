@@ -45,10 +45,14 @@ print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 #===============================================================================
 
 _visual_width() {
-    local s="$1" w=0 i ch
+    # CJK 全角字符按 2 列宽计算；纯 bash，无外部依赖
+    # 注：[:ascii:] 是 GNU glibc 扩展，Ubuntu 26+ / 严格 POSIX 实现不认（v3.4.19 实测踩雷）
+    # 改用 printf %d "'X" 取首字节 ord，>=128 即 UTF-8 多字节字符（CJK/全角）
+    local s="$1" w=0 i ch ord
     for ((i=0; i<${#s}; i++)); do
         ch="${s:$i:1}"
-        if [[ "$ch" =~ [^[:ascii:]] ]]; then ((w+=2)); else ((w++)); fi
+        printf -v ord '%d' "'$ch" 2>/dev/null || ord=0
+        if (( ord >= 128 )); then ((w+=2)); else ((w++)); fi
     done
     echo "$w"
 }

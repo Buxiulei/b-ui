@@ -576,6 +576,13 @@ run_core_install() {
     # SSH 安全加固 (检测到公钥时自动关闭密码登录)
     harden_ssh
 
+    # 网络栈调优：UDP buffer + 13 项 TCP/UDP sysctl + BBRv3 自动检测（v3.4.20 修复 pre-existing bug）
+    # 之前 install.sh 只调用 configure_system_hygiene，没调 configure_performance
+    # 导致新装机器的 sysctl 调优要等 cron 6h 后 update.sh 才生效
+    if declare -F configure_performance &>/dev/null; then
+        configure_performance
+    fi
+
     # 系统卫生：时钟同步 / fail2ban / journald 限额（v3.4.19 Cluster G）
     if declare -F configure_system_hygiene &>/dev/null; then
         configure_system_hygiene

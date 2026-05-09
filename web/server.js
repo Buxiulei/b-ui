@@ -1735,7 +1735,6 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
             // 住宅 IP 健康检查 - 返回当前出口 IP / ISP / IP 类型
             // 不暴露 socks5 凭据；通过本地 socks5 出口实测 ping0.cc
             if (r === "residential/health" && req.method === "GET") {
-                const DEFAULT_DOMAINS = ["openai","chatgpt","google","googleapis","gstatic","anthropic","claude","ping0","ip.sb"];
                 let raw = { enabled: false };
                 try {
                     if (fs.existsSync(CONFIG.residentialConfig)) {
@@ -1743,7 +1742,20 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                     }
                 } catch { }
 
-                const domainsList = (raw.domains && raw.domains.length) ? raw.domains : DEFAULT_DOMAINS;
+                // 优先读 sing-box 实际生效配置（source of truth）；fallback 用 residential-proxy.json
+                let domainsList = [];
+                try {
+                    const sb = JSON.parse(fs.readFileSync("/opt/b-ui/singbox-relay.json", "utf8"));
+                    const rules = sb?.route?.rules || [];
+                    for (const rl of rules) {
+                        if (Array.isArray(rl.domain_keyword) && rl.domain_keyword.length > domainsList.length) {
+                            domainsList = rl.domain_keyword;
+                        }
+                    }
+                } catch { }
+                if (!domainsList.length && raw.domains && raw.domains.length) {
+                    domainsList = raw.domains;
+                }
                 const safeUrls = [];
                 if (raw.enabled && raw.host) {
                     safeUrls.push({
@@ -1768,46 +1780,41 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                     return sendJSON(res, baseResp);
                 }
 
-                // 实时通过本地 socks5 (127.0.0.1:2080) 抓取 ping0.cc 解析 IP 类型 / ISP
+                // v3.4.20: ping0.cc 已加 Cloudflare Turnstile 验证码无法解析
+                // 改用 ipinfo.io/json（稳定 JSON API，通过本地 socks5 走住宅出去）
+                // IP 类型从 org 字段关键词推断（最佳替代——ipinfo 不直接给类型字段）
                 execFile("curl", [
                     "--socks5", "127.0.0.1:2080",
                     "-m", "5",
                     "-sS",
-                    "-A", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
-                    "https://ping0.cc/"
-                ], { timeout: 6000, maxBuffer: 4 * 1024 * 1024 }, (err, stdout) => {
+                    "https://ipinfo.io/json"
+                ], { timeout: 6000, maxBuffer: 1 * 1024 * 1024 }, (err, stdout) => {
                     if (err || !stdout) {
                         return sendJSON(res, baseResp);
                     }
                     try {
-                        const html = String(stdout);
-                        // 抓取 ping0.cc 页面中 IP / ISP / 类型 标签 (formatted as <span class="label">...</span><span class="content">...</span>)
-                        const ipMatch = html.match(/Your IP[\s\S]{0,400}?<span[^>]*class="content"[^>]*>([\s\S]*?)<\/span>/i)
-                            || html.match(/IP\s*地址[\s\S]{0,400}?<span[^>]*class="content"[^>]*>([\s\S]*?)<\/span>/i);
-                        const ispMatch = html.match(/ASN[\s\S]{0,400}?<span[^>]*class="content"[^>]*>([\s\S]*?)<\/span>/i)
-                            || html.match(/ISP[\s\S]{0,400}?<span[^>]*class="content"[^>]*>([\s\S]*?)<\/span>/i)
-                            || html.match(/运营商[\s\S]{0,400}?<span[^>]*class="content"[^>]*>([\s\S]*?)<\/span>/i);
-                        const typeMatch = html.match(/IP\s*类型[\s\S]{0,400}?<span[^>]*class="content"[^>]*>([\s\S]*?)<\/span>/i)
-                            || html.match(/Type[\s\S]{0,400}?<span[^>]*class="content"[^>]*>([\s\S]*?)<\/span>/i);
+                        const data = JSON.parse(String(stdout));
+                        const ip = data.ip || null;
+                        const org = data.org || ""; // e.g. "AS3257 GTT Communications Inc."
+                        const country = data.country || "";
+                        const city = data.city || "";
 
-                        const stripTags = s => String(s || "").replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim();
-
-                        const ip = stripTags(ipMatch && ipMatch[1]);
-                        const isp = stripTags(ispMatch && ispMatch[1]);
-                        const ipTypeRaw = stripTags(typeMatch && typeMatch[1]);
+                        // org 关键词推断 IP 类型（IDC vs 家庭宽带）
+                        // IDC/cloud/hosting 关键词覆盖主流数据中心 ISP
+                        const idcKeywords = /\b(amazon|aws|google|microsoft|azure|digitalocean|linode|vultr|akamai|cloudflare|fastly|hetzner|ovh|leaseweb|scaleway|hosting|datacenter|data\s*center|colo|server|gtt|cogent|level\s*3|hurricane\s*electric|he\.net|psinet|telia|ntt|bandwagonhost|cn2|alibaba|tencent|huawei|sharktech|atlantic|quadranet|choopa)\b/i;
+                        const residentialKeywords = /\b(comcast|verizon|att|spectrum|charter|cox|optimum|frontier|centurylink|telekom|vodafone|orange|free|sfr|bouygues|sky|virgin|bt|talktalk|chinaTelecom|chinaUnicom|chinaMobile|broadband|fttp|fttx|cable|dsl|fiber|residential)\b/i;
 
                         let egressType = "unknown";
-                        if (ipTypeRaw) {
-                            if (/家庭|住宅|宽带|broadband|residential/i.test(ipTypeRaw)) egressType = "家庭宽带 IP";
-                            else if (/IDC|机房|数据中心|datacenter|data\s*center|company|hosting/i.test(ipTypeRaw)) egressType = "IDC机房 IP";
-                            else egressType = ipTypeRaw;
-                        }
+                        if (residentialKeywords.test(org)) egressType = "家庭宽带 IP";
+                        else if (idcKeywords.test(org)) egressType = "IDC机房 IP";
+
+                        const isp = org + (country ? ` (${city ? city + ', ' : ''}${country})` : '');
 
                         return sendJSON(res, {
                             ...baseResp,
-                            current_egress_ip_test: ip || null,
+                            current_egress_ip_test: ip,
                             egress_ip_type: egressType,
-                            via_proxy_isp: isp || null,
+                            via_proxy_isp: isp.trim() || null,
                         });
                     } catch {
                         return sendJSON(res, baseResp);
