@@ -5439,8 +5439,14 @@ ensure_client_cron() {
 
 # 首次运行检测 - 安装所有核心和创建全局命令
 first_run_setup() {
+    # v3.4.38: 首次安装时创建必要的目录结构（configs 用于节点目录、certs 等）
+    # 之前 first_run_setup 没建 configs 目录，全新安装后用户即使从备份/订阅恢复节点
+    # 也会因 cp 目标目录不存在失败；CONFIGS_DIR 这个目录应该全程都存在
+    mkdir -p "$BASE_DIR" "$CONFIGS_DIR" 2>/dev/null
+    chmod 755 "$BASE_DIR" "$CONFIGS_DIR" 2>/dev/null
+
     local cores_installed=true
-    
+
     # 检查是否需要安装核心
     if ! command -v hysteria &> /dev/null || ! command -v xray &> /dev/null || ! command -v sing-box &> /dev/null; then
         cores_installed=false
