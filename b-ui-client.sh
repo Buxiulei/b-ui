@@ -539,10 +539,14 @@ check_os() {
         . /etc/os-release
         OS_ID="$ID"
         OS_VERSION="$VERSION_ID"
-        print_info "操作系统: $OS_ID $OS_VERSION"
+        # v3.4.32: --json / -q / status / list 子命令时不打印（避免污染机器可读输出）
+        if [[ "$OPT_JSON" != "true" ]] && [[ "$OPT_QUIET" != "true" ]] && \
+           [[ "$1" != "status" ]] && [[ "$1" != "list" ]]; then
+            print_info "操作系统: $OS_ID $OS_VERSION"
+        fi
     else
         OS_ID="unknown"
-        print_warning "无法识别操作系统"
+        [[ "$OPT_JSON" != "true" ]] && [[ "$OPT_QUIET" != "true" ]] && print_warning "无法识别操作系统"
     fi
 }
 
@@ -2426,6 +2430,12 @@ cmd_switch() {
         tui_error "节点 '$name' 不存在。用 'bui-c list' 查看可用节点。"
         exit 3
     fi
+    # v3.4.32: 已是当前节点 → 直接 return 0，不重跑 _switch_to_profile（避免无谓的 stop+start TUN）
+    local active; active=$(get_active_config)
+    if [[ "$name" == "$active" ]]; then
+        tui_info "已是当前节点: $name"
+        exit 0
+    fi
     _switch_to_profile "$name"
     local rc=$?
     exit $rc
@@ -2561,6 +2571,14 @@ cmd_start() {
         tui_error "没有激活的节点，请先 bui-c switch <名称>"
         exit 1
     fi
+    # v3.4.32: 智能判断启动什么——TUN 有 unit 文件且最近被启用过 → 优先恢复 TUN
+    # 否则按协议启动 hysteria-client/xray-client（直连模式）
+    if [[ -f /etc/systemd/system/bui-tun.service ]] && \
+       systemctl is-enabled bui-tun &>/dev/null; then
+        tui_info "TUN 模式（之前已启用）→ 启动 bui-tun..."
+        start_tun_mode
+        exit $?
+    fi
     local protocol
     protocol=$(grep '"protocol"' "${CONFIGS_DIR}/${active}/meta.json" 2>/dev/null | cut -d'"' -f4)
     if [[ -z "$protocol" ]]; then
@@ -2581,6 +2599,8 @@ cmd_stop() {
     systemctl stop "$CLIENT_SERVICE" 2>/dev/null || true
     systemctl stop xray-client 2>/dev/null || true
     systemctl stop bui-tun 2>/dev/null || true
+    # v3.4.32: 清理 failed 状态（之前 hysteria-client fail 累积让 systemctl is-active 显示 failed）
+    systemctl reset-failed "$CLIENT_SERVICE" xray-client bui-tun 2>/dev/null || true
     tui_success "服务已停止"
     exit 0
 }
@@ -4911,9 +4931,8 @@ HELP
 
 main() {
     check_root
-    check_os
 
-    # 提取全局 flags（-y, --json, --quiet）
+    # v3.4.32: 先解析 flags（OPT_JSON / OPT_QUIET），再 check_os 才能正确抑制输出
     parse_global_flags "$@"
     # 过滤掉 flags，只保留非 flag 参数
     local args=()
@@ -4924,6 +4943,9 @@ main() {
             *) args+=("$arg") ;;
         esac
     done
+
+    # 把第一个子命令名传给 check_os 让它在 status/list 时静默
+    check_os "${args[0]:-}"
 
     # 有子命令 → 非交互路径
     if [[ ${#args[@]} -gt 0 ]]; then

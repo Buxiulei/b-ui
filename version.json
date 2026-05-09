@@ -1,5 +1,5 @@
 {
-    "version": "3.4.31",
+    "version": "3.4.32",
     "updated": "2026-05-09",
     "files": [
         "install.sh",
@@ -16,6 +16,7 @@
         "b-ui-client.sh"
     ],
     "changelog": {
+        "3.4.32": "bui-c 全功能 smoke test 后修 4 个 bug：(1) **status --json / list --json 输出污染**：check_os 在 main 第 2 行打 'INFO 操作系统' 进 stdout，但 parse_global_flags 在第 4 行才设 OPT_JSON——JSON 解析失败。修复：先解析 flags，再 check_os；check_os 收到 status/list 子命令名时静默；OPT_JSON/OPT_QUIET 任一为 true 时也静默。(2) **switch <当前节点> 重跑切换流程**：cmd_switch 没检测就调 _switch_to_profile，导致 stop/start TUN 浪费时间。修复：cmd_switch 开头比对 active，相同直接 exit 0 提示'已是当前节点'。(3) **bui-c stop 后服务变 failed 不是 inactive**：之前 hysteria-client fail 累积。修复：stop 后加 systemctl reset-failed 清理状态。(4) **bui-c start 在 TUN 模式下错误启动 hysteria-client**：导致端口冲突 + bui-tun 没起来。修复：检测 bui-tun.service unit 存在且 enabled → 调 start_tun_mode 恢复 TUN，否则按协议启动 hysteria-client/xray-client。",
         "3.4.31": "切换节点流程修两个 bug（baiyi PC 客户端实测发现）：(1) **_switch_to_profile 在 TUN 模式下无条件启动 hysteria-client，跟 sing-box 抢 1080/8080 端口冲突**：journal 报 `FATAL failed to run HTTP proxy server: bind: address already in use`，systemd Restart=always 让 hysteria-client 反复 fail 重启刷屏。修复：检测 tun_was_active=true 时**跳过启动 hysteria-client**——切换流程末尾的 start_tun_mode 会按新 active 节点重新拉起 sing-box，根本不需要 hysteria-client。(2) **systemctl stop 是异步的，stop 后立即 start 端口可能还没释放**：加 5 次循环 `ss -tlnp` 检测 1080/8080 真释放才进入 start，超时则 `pkill -9 -f 'hysteria client'/'xray run'` 兜底强杀。这样 user 反复切换不再撞端口冲突。",
         "3.4.30": "删掉 sing-box hysteria2 outbound 的 keep_alive_period / idle_timeout 字段（v3.4.17 加错了，1.13.x 不认）。Root cause：v3.4.17 基于研究说 'sing-box 1.13.0-alpha.13 起统一 HTTP/2 + QUIC 参数到 outbound block' 而显式加这俩字段，但实测 sing-box **1.13.11**（baiyi 客户端版本）直接拒绝：`outbounds[0].keep_alive_period: json: unknown field`。sing-quic 内部默认 keep_alive=10s/idle=30s 仍然生效（无需显式写），而且这两个字段在未来 sing-box 1.14+ 才真正稳定暴露。删掉这两行让 sing-box 1.13.x 用内置默认即可。bug 触发链：v3.4.17 → 客户端 sing-box 升级到 1.13.11 → outbound JSON 含 unknown field → sing-box check 拒绝 → singbox-tun.json 永远生成不出来 → TUN 启动失败。诊断证据：v3.4.28 改进让 sing-box check 错误打印出来，v3.4.30 看到精确错误后修。",
         "3.4.29": "客户端 b-ui-client.sh 4 处裸 clear 全部加 `2>/dev/null || true` 容错（baiyi PC 客户端 SSH 调试时屏幕被 'unknown: I need something more specific' 刷屏）。Root cause: bui-c 主循环 / 子菜单循环反复调 `clear`，但 SSH non-TTY 或 TERM=unknown 时 clear 找不到 terminfo 会报错，bash 不捕获 stderr 就一直刷屏。同款问题之前 v3.4.20 修过 install.sh 的 print_banner，这次把 b-ui-client.sh 的 4 处也包上：line 45 (banner) / line 4778 (tui_main_loop) / line 4927 (tui_switch_node fzf 分支) / line 5128 (tui_service_control)。改后用 `ssh baiyi 'bui-c'` 这种 non-TTY 方式调试也不会刷屏。",
