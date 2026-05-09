@@ -2870,11 +2870,10 @@ config_management() {
             2) switch_config ;;
             3) delete_config ;;
             0) return ;;
-            *) print_error "无效选项" ;;
+            *) print_error "无效选项"; sleep 1 ;;
         esac
-        
-        echo ""
-        read -p "按 Enter 继续..."
+        # v3.4.26: 不再强制 read 'Enter 继续' — 子菜单不 clear，输出仍可见，
+        # 直接进入下一轮循环让用户立刻能选下一项
     done
 }
 
@@ -4530,10 +4529,9 @@ service_control_menu() {
                 esac
                 ;;
             0) return ;;
-            *) print_error "无效选项" ;;
+            *) print_error "无效选项"; sleep 1 ;;
         esac
-        echo ""
-        read -p "按 Enter 继续..."
+        # v3.4.26: 去掉冗余 'Enter 继续'——子菜单不 clear，下一轮循环菜单会重打但输出仍可见
     done
 }
 
@@ -4794,10 +4792,9 @@ advanced_settings_menu() {
                 ;;
             2) edit_rules ;;
             0) return ;;
-            *) print_error "无效选项" ;;
+            *) print_error "无效选项"; sleep 1 ;;
         esac
-        echo ""
-        read -p "按 Enter 继续..."
+        # v3.4.26: 去掉冗余 'Enter 继续'
     done
 }
 
