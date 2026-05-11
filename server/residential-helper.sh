@@ -38,7 +38,7 @@ info() { echo -e "${BLUE}$*${NC}" >&2; }
 # 设计原则：
 #   1) 只针对 AI / 强风控站点，不大面积匹配 google/gstatic（避全站误伤 + 避 urltest 自循环）
 #   2) statsig/featuregates 是 OpenAI/Anthropic 共用的 telemetry / feature flag 域名，必须随主站走
-#   3) ping0 / ip.sb 用于用户验证流量是否真的从住宅出去
+#   3) ping0 / ip.sb / ip-api 用于用户验证流量是否真的从住宅出去
 # 注意：旧默认含 "google" "googleapis" "gstatic"，已被精化移除（迁移见 update.sh）
 DEFAULT_DOMAINS=(
     "openai" "chatgpt" "oai" "oaistatic"
@@ -47,7 +47,7 @@ DEFAULT_DOMAINS=(
     "grok" "githubcopilot" "cursor" "perplexity"
     "mistral" "cohere" "huggingface" "replicate" "together" "groq"
     "statsig" "featuregates"
-    "ping0" "ip.sb"
+    "ping0" "ip.sb" "ip-api"
     "tiktok"
 )
 
