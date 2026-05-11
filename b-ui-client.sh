@@ -4035,9 +4035,11 @@ test_proxy() {
     echo ""
     
     # 测试 3: 检查 DNS 解析
+    # 注意: dig +short 在网络/DNS 故障时会把 ";; communications error..." 写到 stdout,
+    # 必须用 IPv4 正则过滤, 不然空值检查会把错误消息当成"解析成功"
     echo -e "${YELLOW}[测试 3]${NC} DNS 解析测试..."
     echo -n "  解析 google.com: "
-    local google_ip=$(dig +short google.com A 2>/dev/null | head -1)
+    local google_ip=$(dig +short google.com A 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
     if [[ -n "$google_ip" ]]; then
         echo -e "${GREEN}✓${NC} ($google_ip)"
         ((test_passed++))
