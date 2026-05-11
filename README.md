@@ -6,11 +6,16 @@
 
 轻量级 Hysteria2 + Xray 多协议代理一键部署工具，内置 Web 管理面板与全功能流量管理。
 
-**当前版本**: v3.4.10
+**当前版本**: v3.4.40
 
 ---
 
 ## 最新更新
+
+### v3.4.40 — DNS UDP→DoH 修 sing-box UDP relay 死锁
+- 🩺 **故障**：原 `proxy-dns` 走 UDP/8.8.8.8 over Hysteria2 隧道，sing-box 重启或 UDP relay 抖动时整体死锁。TCP 流量正常但所有 DNS 被 `hijack-dns` 规则转给挂死的 proxy-dns，浏览器/Claude Code/curl 走代理时"全面断联"
+- 🔧 **修复**：`proxy-dns` 改成 DoH/HTTPS `1.1.1.1` via proxy-out，DNS 走 TCP 隧道跟 API 流量同通路。**只要代理 TCP 能用，DNS 就一定能用**，彻底绕开 UDP relay 故障域
+- 📜 **v3.4.11 ~ v3.4.39 共 30 个版本**详见 `version.json` changelog：紧急 hotfix（cmd_harden_ssh / first_run_setup / cgroup 限额）、Web 安全验证（POST/PUT users 白名单）、bui-c smoke test、住宅 IP ip-api 分流、test_proxy DNS 假阳性等
 
 ### v3.4.10 — UI 简化 + 自愈强化
 - 🎯 **CLI 菜单回到数字直选**：实测下来 gum 箭头选择体验比直接敲数字慢，重新设计两栏紧凑布局，纯 bash + ANSI 渲染零依赖
