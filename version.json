@@ -1,5 +1,5 @@
 {
-    "version": "3.4.39",
+    "version": "3.4.40",
     "updated": "2026-05-11",
     "files": [
         "install.sh",
@@ -16,6 +16,7 @@
         "b-ui-client.sh"
     ],
     "changelog": {
+        "3.4.40": "fix(client): singbox-tun.json proxy-dns 从 UDP/8.8.8.8 改成 DoH/HTTPS 1.1.1.1 via proxy-out。baiyi 实测发现：原配置把所有系统 DNS 请求 hijack-dns 后转给 8.8.8.8 over UDP 走 Hy2 隧道，**Hy2 的 UDP relay 在 sing-box 重启或 UDP 抖动时会整体死锁**（TCP 流量正常但 UDP DNS 全部 context deadline exceeded 30s+），症状：浏览器/Claude Code/curl 走代理时整个'全面断联'，dig 系统 DNS 也卡（因为被 sing-box hijack 到挂死的 proxy-dns）。改 DoH 让 DNS 走 HTTPS over TCP 隧道，跟 API 流量同通路，**只要代理 TCP 能用 DNS 就能用**，彻底绕开 UDP relay 故障域。baiyi 实测：改前 dig api.anthropic.com / github.com / google.com 全部超时；改后三个域名全部解出 + sing-box 日志 'exchanged A ... 156ms'。同时之前观测到的 SSE 长连接 33% 失败率大概率也是 DNS 间歇性卡死导致请求开始就超时，并非 SSE 链路本身问题。",
         "3.4.39": "baiyi 客户端 bui-c 测试链路两个 fix：(1) **测试 3 DNS 解析假阳性 ✓**：b-ui-client.sh:4040 用 `dig +short google.com A 2>/dev/null | head -1` 解析，但 dig +short 在网络/DNS 故障时会把 ';; communications error...' 写到 **stdout**（不是 stderr，2>/dev/null 拦不住），head -1 把这行错误消息当成解析结果，非空检查误报 ✓，输出变成矛盾的 '✓ (;; communications error to 127.0.0.53#53: timed out)'。baiyi 服务器上 systemd-resolved stub 127.0.0.53 真挂了暴露此 bug。修复：对齐同文件 :3328 已有 dig 调用的 `grep -E '^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$'` IPv4 正则过滤，真失败时正确显示 ✗ 解析失败。(2) **测试 6 看不到住宅 IP**：bui-c 测试 6 用 `ip-api.com/json` 检测出口 IP 类型（hosting/proxy/mobile 字段），但 'ip-api' 不在 sing-box 默认 domain_keyword 分流列表里，流量走 `final: direct` 从服务端 IDC IP 出去，用户看到的永远是机房 IP（如 138.128.195.22 / AS25820 IT7），误以为住宅代理没生效。修复：residential-helper.sh DEFAULT_DOMAINS 和 web/server.js Web 后端 DEFAULT_DOMAINS 同步加 'ip-api' 关键词。注意：已部署实例 residential-proxy.json 已持久化 domains 数组，update.sh 不会自动迁移自定义列表，需手动跑 `residential-helper.sh set-domains <new_json>` 追加 ip-api 让 sing-box 重载。baiyi 实测：测试 6 现在正确返回 38.248.199.239 / AS214483 FiberPower LLC / ✓ 家庭宽带 IP（住宅）。",
         "3.4.38": "卸载 + 一键重装实测（baiyi 客户端）发现的 install bug：first_run_setup 没建 CONFIGS_DIR 目录。Root cause: install-client.sh 全新安装跑 first_run_setup → 装核心 → 进 main 循环，但 CONFIGS_DIR=/opt/hysteria-client/configs 这个用于存节点目录的路径要等到 save_config_meta 第一次导入节点时才被 mkdir -p 创建。结果用户从备份/订阅恢复节点（cp -r 旧 configs/* 新 configs/）会因目标 configs 目录不存在而失败。修复：first_run_setup 顶部加 mkdir -p $BASE_DIR $CONFIGS_DIR + chmod 755 让全程目录存在。卸载流程已实测确认彻底干净（/opt/hysteria-client + bui-c + 3 个 systemd unit 全删除，hysteria/sing-box/xray 二进制可选保留），一键安装从 bwg.baiyibaiyi.cn/install-client?key=xxx 拉取部署 v3.4.37 流程跑通（先 curl 到 file 再 bash 跑，process substitution 在 SSH+sudo 下不工作但 install-key 鉴权 + main 启动都正常）。",
         "3.4.37": "v3.4.36 hotfix：cmd_harden_ssh 幂等检测漏改（v3.4.36 final 重测发现）。Root cause: cmd_harden_ssh 在 b-ui-cli.sh 是独立实现没走 core.sh 的 harden_ssh，agent 修 core.sh 的幂等逻辑对 b-ui harden-ssh 命令无效，每次 b-ui harden-ssh 仍重写 99-b-ui-hardening.conf 改 mtime。本次在 cmd_harden_ssh 里加同款幂等检测：把 heredoc 内容存进 new_content 变量，与现有 target_conf 内容比对，相同就 print_info '幂等跳过' 直接 return 0，不再 reload sshd。final 重测 11/11 PASS。",

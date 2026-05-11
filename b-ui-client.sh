@@ -1424,8 +1424,8 @@ OUTBOUND
     "servers": [
       {
         "tag": "proxy-dns",
-        "type": "udp",
-        "server": "8.8.8.8",
+        "type": "https",
+        "server": "1.1.1.1",
         "detour": "proxy-out"
       },
       {
