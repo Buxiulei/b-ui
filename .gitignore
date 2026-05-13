@@ -1,0 +1,13 @@
+# Claude Code 工具产物
+.claude/
+
+# Playwright MCP 产物
+.playwright-mcp/
+
+# 本地 packages 目录（部署时生成，不入仓）
+packages/
+
+# 本地编辑器/系统
+.DS_Store
+*.swp
+*.swo
