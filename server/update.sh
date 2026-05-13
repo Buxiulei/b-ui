@@ -191,6 +191,42 @@ check_update() {
 }
 
 #===============================================================================
+# 清理孤儿 CLI 进程
+#===============================================================================
+# 只杀 PPID==1（systemd 收养）且 cmdline 匹配 b-ui CLI 的进程组。
+# 主动跳过当前 update.sh 所在的 PGID（update.sh 是被 b-ui-cli.sh source 调用的，
+# $$ 即为 b-ui-cli.sh 自身），避免把自己 / 用户当前菜单 session 一起干掉。
+cleanup_orphan_cli_processes() {
+    local self_pgid victims=()
+    self_pgid=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')
+    [[ -z "$self_pgid" ]] && return 0
+
+    while read -r pid ppid pgid rest; do
+        [[ -z "$pid" || "$pid" == "$$" ]] && continue
+        [[ "$ppid" != "1" ]] && continue
+        [[ "$pgid" == "$self_pgid" ]] && continue
+        case "$rest" in
+            *b-ui-cli.sh*|*"/usr/local/bin/b-ui "*|*"/usr/local/bin/b-ui") victims+=("$pgid") ;;
+        esac
+    done < <(ps -eo pid=,ppid=,pgid=,args=)
+
+    [[ ${#victims[@]} -eq 0 ]] && return 0
+
+    local unique_pgids
+    unique_pgids=$(printf '%s\n' "${victims[@]}" | sort -u)
+    print_warning "发现孤儿 b-ui CLI 进程组: $(echo "$unique_pgids" | tr '\n' ' ')— 清理中"
+
+    local pgid
+    for pgid in $unique_pgids; do
+        kill -TERM -- "-$pgid" 2>/dev/null || true
+    done
+    sleep 2
+    for pgid in $unique_pgids; do
+        kill -KILL -- "-$pgid" 2>/dev/null || true
+    done
+}
+
+#===============================================================================
 # 执行更新
 #===============================================================================
 
@@ -209,6 +245,11 @@ do_update() {
     # 停止服务
     print_info "停止服务..."
     systemctl stop b-ui-admin 2>/dev/null || true
+
+    # 清理孤儿 b-ui CLI 进程（PPID==1，不动当前调用链）
+    # 老 b-ui-cli.sh 实例若被 update.sh 重写文件，会 hold deleted inode 持续跑；
+    # 配合一条没匹配的 grep|head 管道就能死锁卡 CPU 数天 → hysteria keepalive 超时
+    cleanup_orphan_cli_processes
     
     # 下载新文件
     print_info "下载更新文件..."

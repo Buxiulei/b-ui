@@ -6,16 +6,17 @@
 
 轻量级 Hysteria2 + Xray 多协议代理一键部署工具，内置 Web 管理面板与全功能流量管理。
 
-**当前版本**: v3.4.40
+**当前版本**: v3.4.41
 
 ---
 
 ## 最新更新
 
-### v3.4.40 — DNS UDP→DoH 修 sing-box UDP relay 死锁
-- 🩺 **故障**：原 `proxy-dns` 走 UDP/8.8.8.8 over Hysteria2 隧道，sing-box 重启或 UDP relay 抖动时整体死锁。TCP 流量正常但所有 DNS 被 `hijack-dns` 规则转给挂死的 proxy-dns，浏览器/Claude Code/curl 走代理时"全面断联"
-- 🔧 **修复**：`proxy-dns` 改成 DoH/HTTPS `1.1.1.1` via proxy-out，DNS 走 TCP 隧道跟 API 流量同通路。**只要代理 TCP 能用，DNS 就一定能用**，彻底绕开 UDP relay 故障域
-- 📜 **v3.4.11 ~ v3.4.39 共 30 个版本**详见 `version.json` changelog：紧急 hotfix（cmd_harden_ssh / first_run_setup / cgroup 限额）、Web 安全验证（POST/PUT users 白名单）、bui-c smoke test、住宅 IP ip-api 分流、test_proxy DNS 假阳性等
+### v3.4.41 — 防止孤儿 b-ui CLI 进程把 hy2 keepalive 吃垮
+- 🩺 **故障**：bwg-tizi 实例排查到一条遗留管道 `bash -x b-ui-cli.sh </dev/null | grep -B2 'unknown' | head -20` —— SSH 断开后被 init 收养，grep 从未匹配 'unknown'、head 永远等不到 20 行，bash -x 持续吐 trace 死锁。3 天 15 小时累积把 1 vCPU VPS 拖到 sys 50% / idle 14%，hysteria QUIC 来不及发 keepalive，客户端 sing-box 看到 `outbound/hysteria2[proxy]: timeout: no recent network activity`
+- 🔧 **update.sh `cleanup_orphan_cli_processes`**：停服阶段按 PGID SIGTERM→KILL 清掉 PPID==1 且 cmdline 含 b-ui CLI 的孤儿；主动跳过当前 update.sh 所在 PGID（防自杀）和其他活跃 sudo b-ui session
+- 🔧 **b-ui-cli.sh TTY 守卫**：交互菜单 `while true` 前加 `[[ -t 0 ]]` 检查，无 TTY 直接 exit 1 不进死循环 read；`b-ui <子命令>` 非交互入口不受影响（cron 正常）
+- 📜 **v3.4.11 ~ v3.4.40 共 31 个版本**详见 `version.json` changelog：DNS UDP→DoH (v3.4.40)、紧急 hotfix（cmd_harden_ssh / first_run_setup / cgroup 限额）、Web 安全验证（POST/PUT users 白名单）、bui-c smoke test、住宅 IP ip-api 分流、test_proxy DNS 假阳性等
 
 ### v3.4.10 — UI 简化 + 自愈强化
 - 🎯 **CLI 菜单回到数字直选**：实测下来 gum 箭头选择体验比直接敲数字慢，重新设计两栏紧凑布局，纯 bash + ANSI 渲染零依赖

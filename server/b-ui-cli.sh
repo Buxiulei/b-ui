@@ -1278,6 +1278,13 @@ main() {
         exit $?
     fi
 
+    # 交互菜单要求 stdin 是 TTY；防止 'bash -x b-ui-cli.sh </dev/null | grep ... | head'
+    # 这类无 stdin 调用导致菜单 read 卡死、bash -x 持续吐 trace 把 1 vCPU VPS 拖到 keepalive 超时
+    if [[ ! -t 0 ]]; then
+        echo "b-ui: 交互菜单需要 TTY；非交互调用请用 'sudo b-ui <子命令>'（例：sudo b-ui server status）" >&2
+        exit 1
+    fi
+
     # 主循环（v3.4.10 起：纯数字菜单，所有 12 项直接映射）
     while true; do
         clear
