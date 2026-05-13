@@ -1338,7 +1338,9 @@ EOF
 #       等海外 CDN 域名 → 客户端直连 23.62.46.219(Akamai) 5s timeout，30min 47 个无效 ERROR
 #   4 = v3.4.43 排除 cloudflared 进程（QUIC tunnel 走 Cloudflare:7844 UDP 被 sing-box sniff
 #       误判为 DNS → hijack-dns 试解析失败，30 min 50 个 "bad rdata"/"buffer size too small" 噪音）
-readonly TUN_SCHEMA_VERSION="4"
+#   5 = v3.4.44 加 UDP :7844 端口兜底（process_name 在 /proc race 时偶尔 miss，
+#       baiyi 实测 10 个噪音 ERROR 来自同一个 cloudflared session 漏网；端口规则不依赖 /proc）
+readonly TUN_SCHEMA_VERSION="5"
 
 generate_singbox_tun_config() {
     local protocol="$1"  # hysteria2 或 vless-reality
@@ -1475,6 +1477,7 @@ ${outbound_config},
   "route": {
     "rules": [
       { "process_name": ["cloudflared"], "outbound": "direct-out" },
+      { "network": "udp", "port": [7844], "outbound": "direct-out" },
       { "action": "sniff" },
       { "protocol": "dns", "action": "hijack-dns" },
       { "port": [22, 2222], "outbound": "direct-out" },

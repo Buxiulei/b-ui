@@ -6,11 +6,16 @@
 
 轻量级 Hysteria2 + Xray 多协议代理一键部署工具，内置 Web 管理面板与全功能流量管理。
 
-**当前版本**: v3.4.43
+**当前版本**: v3.4.44
 
 ---
 
 ## 最新更新
+
+### v3.4.44 — UDP :7844 兜底 process_name race
+- 🩺 v3.4.43 部署后 baiyi 仍偶发一批 DNS unpack ERROR（同 session id 17 秒内 10 个），cloudflared rule 没生效
+- 🔍 sing-box `process_name` 依赖 /proc 反查，UDP socket race 时查不到 → 整 session miss 规则
+- 🔧 加 `{ network: udp, port: [7844], outbound: direct-out }` 兜底，端口规则不查 /proc 永不 race；TUN_SCHEMA_VERSION 4→5
 
 ### v3.4.43 — 排除 cloudflared 被 sniff 误判为 DNS
 - 🩺 baiyi 在 v3.4.42 修复后仍每 30s 一批 `router: process DNS packet: bad rdata / buffer size too small`
