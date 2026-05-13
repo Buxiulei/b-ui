@@ -6,11 +6,17 @@
 
 轻量级 Hysteria2 + Xray 多协议代理一键部署工具，内置 Web 管理面板与全功能流量管理。
 
-**当前版本**: v3.4.42
+**当前版本**: v3.4.43
 
 ---
 
 ## 最新更新
+
+### v3.4.43 — 排除 cloudflared 被 sniff 误判为 DNS
+- 🩺 baiyi 在 v3.4.42 修复后仍每 30s 一批 `router: process DNS packet: bad rdata / buffer size too small`
+- 🔍 tcpdump tun0 抓到 `172.19.0.1 > 198.41.192.107:7844 UDP 41 bytes` —— cloudflared 的 QUIC tunnel 包被 sing-box `sniff` 协议嗅探**误判为 DNS** → `hijack-dns` 解析失败 → 噪音 ERROR
+- 🔧 修复：`route.rules` 第一条加 `{ process_name: ["cloudflared"], outbound: "direct-out" }`，cloudflared 完全跳过 sniff；TUN_SCHEMA_VERSION 3→4 自动重建
+- 💡 副产品：cloudflared 隧道不再双层封装，直走本机网络少一跳
 
 ### v3.4.42 — 客户端路由 keyword 子串误判 + 服务端 hy2 nft 孤儿规则
 - 🩺 **故障 A**：baiyi 30min 内 47 个 `direct-out: dial 23.62.46.219:443: i/o timeout`。`domain_keyword: [tencent, qq, alibaba, baidu, ...]` 子串匹配误中 `*-akamai-cdn` / `qqmusic-akamai-edge` 等海外 CDN 域名 → 强制本地直连 Akamai 5s 超时

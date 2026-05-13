@@ -1336,7 +1336,9 @@ EOF
 #   3 = v3.4.42 直连规则 domain_keyword→domain_suffix 精确匹配 + akamai/fastly CDN 强制走代理
 #       baiyi 实测：旧 keyword "tencent/qq/alibaba/baidu" 子串误中 *-akamai-cdn / qqmusic-akamai
 #       等海外 CDN 域名 → 客户端直连 23.62.46.219(Akamai) 5s timeout，30min 47 个无效 ERROR
-readonly TUN_SCHEMA_VERSION="3"
+#   4 = v3.4.43 排除 cloudflared 进程（QUIC tunnel 走 Cloudflare:7844 UDP 被 sing-box sniff
+#       误判为 DNS → hijack-dns 试解析失败，30 min 50 个 "bad rdata"/"buffer size too small" 噪音）
+readonly TUN_SCHEMA_VERSION="4"
 
 generate_singbox_tun_config() {
     local protocol="$1"  # hysteria2 或 vless-reality
@@ -1472,6 +1474,7 @@ ${outbound_config},
   ],
   "route": {
     "rules": [
+      { "process_name": ["cloudflared"], "outbound": "direct-out" },
       { "action": "sniff" },
       { "protocol": "dns", "action": "hijack-dns" },
       { "port": [22, 2222], "outbound": "direct-out" },
