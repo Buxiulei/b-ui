@@ -1333,7 +1333,10 @@ EOF
 # 历史:
 #   1 = v3.4.7 及以前
 #   2 = v3.4.8 入向 SSH 修复（新增 source_port [22, 2222] → direct）
-readonly TUN_SCHEMA_VERSION="2"
+#   3 = v3.4.42 直连规则 domain_keyword→domain_suffix 精确匹配 + akamai/fastly CDN 强制走代理
+#       baiyi 实测：旧 keyword "tencent/qq/alibaba/baidu" 子串误中 *-akamai-cdn / qqmusic-akamai
+#       等海外 CDN 域名 → 客户端直连 23.62.46.219(Akamai) 5s timeout，30min 47 个无效 ERROR
+readonly TUN_SCHEMA_VERSION="3"
 
 generate_singbox_tun_config() {
     local protocol="$1"  # hysteria2 或 vless-reality
@@ -1435,7 +1438,7 @@ OUTBOUND
       }
     ],
     "rules": [
-      { "domain_suffix": [".cn"], "server": "local-dns" }
+      { "domain_suffix": [".qq.com", ".wechat.com", ".tencent.com", ".myqcloud.com", ".xiaohongshu.com", ".douyin.com", ".bytedance.com", ".toutiao.com", ".kuaishou.com", ".bilibili.com", ".taobao.com", ".alibaba.com", ".alipay.com", ".aliyuncs.com", ".tmall.com", ".jd.com", ".baidu.com", ".cn"], "server": "local-dns" }
     ],
     "final": "proxy-dns",
     "strategy": "ipv4_only"
@@ -1475,8 +1478,12 @@ ${outbound_config},
       { "source_port": [22, 2222], "outbound": "direct-out" },
       { "ip_is_private": true, "outbound": "direct-out" },
       {
-        "domain_keyword": ["wechat", "weixin", "tencent", "qq", "xiaohongshu", "douyin", "bytedance", "toutiao", "kuaishou", "bilibili", "taobao", "alipay", "alibaba", "tmall", "jd", "baidu"],
+        "domain_suffix": [".qq.com", ".qpic.cn", ".qlogo.cn", ".wechat.com", ".weixin.qq.com", ".wx.qq.com", ".tencent.com", ".tencent-cloud.net", ".myqcloud.com", ".gtimg.com", ".xiaohongshu.com", ".xhscdn.com", ".douyin.com", ".douyincdn.com", ".amemv.com", ".bytedance.com", ".bytecdntp.com", ".toutiao.com", ".iesdouyin.com", ".kuaishou.com", ".ksapisrv.com", ".bilibili.com", ".bilivideo.com", ".hdslb.com", ".taobao.com", ".tbcdn.cn", ".alicdn.com", ".aliyuncs.com", ".alipay.com", ".alipayobjects.com", ".alibaba.com", ".alibabacloud.com", ".tmall.com", ".tmall.hk", ".jd.com", ".360buyimg.com", ".jdcdn.com", ".baidu.com", ".bdstatic.com", ".bdimg.com", ".cn"],
         "outbound": "direct-out"
+      },
+      {
+        "domain_keyword": ["akamai", "akamaized", "akamaihd", "edgekey", "edgesuite", "fastly", "cloudfront"],
+        "outbound": "proxy-out"
       },
       {
         "domain_keyword": ["github", "google", "googleapis", "googlevideo", "gstatic", "gmail", "gemini", "generativelanguage", "anthropic", "openai", "chatgpt", "antigravity", "cloudcode", "visualstudio", "vscode"],

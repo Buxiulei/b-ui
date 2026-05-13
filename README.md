@@ -6,11 +6,17 @@
 
 轻量级 Hysteria2 + Xray 多协议代理一键部署工具，内置 Web 管理面板与全功能流量管理。
 
-**当前版本**: v3.4.41
+**当前版本**: v3.4.42
 
 ---
 
 ## 最新更新
+
+### v3.4.42 — 客户端路由 keyword 子串误判 + 服务端 hy2 nft 孤儿规则
+- 🩺 **故障 A**：baiyi 30min 内 47 个 `direct-out: dial 23.62.46.219:443: i/o timeout`。`domain_keyword: [tencent, qq, alibaba, baidu, ...]` 子串匹配误中 `*-akamai-cdn` / `qqmusic-akamai-edge` 等海外 CDN 域名 → 强制本地直连 Akamai 5s 超时
+- 🔧 **修复 A**：`TUN_SCHEMA_VERSION` 2→3 触发自动重建；`domain_keyword` 改为 `domain_suffix` 精确列表（40+ 项根域 + `.cn`）；加 akamai/fastly/cloudfront keyword 强制走代理兜底；DNS rules 同步国内 suffix → local-dns
+- 🩺 **故障 B**：bwg-tizi `nft list ruleset` 看到 `hysteria_e6fe45cb` ip6 表同 chain **重复 2 条** redirect 规则。hy2 SIGKILL 跳过 closer chain → 规则残留 → systemd 重启 add 规则到旧 chain
+- 🔧 **修复 B**：override.conf 加 `ExecStartPre=-/opt/b-ui/hy2-nft-cleanup.sh` 启动前清扫所有 `hysteria_*` 表；加 `TimeoutStopSec=15`；update.sh 加缺失检测自动重写
 
 ### v3.4.41 — 防止孤儿 b-ui CLI 进程把 hy2 keepalive 吃垮
 - 🩺 **故障**：bwg-tizi 实例排查到一条遗留管道 `bash -x b-ui-cli.sh </dev/null | grep -B2 'unknown' | head -20` —— SSH 断开后被 init 收养，grep 从未匹配 'unknown'、head 永远等不到 20 行，bash -x 持续吐 trace 死锁。3 天 15 小时累积把 1 vCPU VPS 拖到 sys 50% / idle 14%，hysteria QUIC 来不及发 keepalive，客户端 sing-box 看到 `outbound/hysteria2[proxy]: timeout: no recent network activity`

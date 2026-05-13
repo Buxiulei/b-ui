@@ -767,6 +767,10 @@ EOF
         if ! grep -q 'HYSTERIA_LOG_LEVEL' /etc/systemd/system/hysteria-server.service.d/override.conf 2>/dev/null; then
             hysteria_mem_changed=1
         fi
+        # v3.4.42: ExecStartPre nft 清理 / TimeoutStopSec，缺失则触发 restart
+        if ! grep -q 'hy2-nft-cleanup.sh' /etc/systemd/system/hysteria-server.service.d/override.conf 2>/dev/null; then
+            hysteria_mem_changed=1
+        fi
         cat > /etc/systemd/system/hysteria-server.service.d/override.conf << EOF
 [Unit]
 # Hysteria2 使用 QUIC (UDP)，与 Xray (TCP) 独立运行
@@ -795,10 +799,30 @@ Environment=HYSTERIA_LOG_LEVEL=warn
 MemoryHigh=500M
 MemoryMax=700M
 
+# 启动前清理孤儿 nft 规则（SIGKILL/OOM 后 closer chain 没跑完留下的 hysteria_* 表）
+# 否则下次 hy2 启动 nft add rule 会追加到同 chain 内造成重复
+ExecStartPre=-/opt/b-ui/hy2-nft-cleanup.sh
+
+# 给 hy2 充足时间走完 closer chain 删 nft 表（正常 <1s）
+TimeoutStopSec=15
+
 # 确保服务稳定运行
 Restart=always
 RestartSec=3
 EOF
+
+        # 写入 / 更新 nft 清理 helper（幂等）
+        cat > /opt/b-ui/hy2-nft-cleanup.sh <<'CLEANUP_EOF'
+#!/bin/sh
+# 删除所有 hysteria_* nft 表（family + name 配对遍历）
+# 用于 hy2 ExecStartPre：清理 SIGKILL/OOM 残留的孤儿规则
+nft list tables 2>/dev/null | awk '/^table .* hysteria_/{print $2,$3}' | while read fam name; do
+    nft delete table "$fam" "$name" 2>/dev/null || true
+done
+exit 0
+CLEANUP_EOF
+        chmod 755 /opt/b-ui/hy2-nft-cleanup.sh
+
         print_info "  ✓ 更新 Hysteria2 服务配置"
         updated=1
     fi

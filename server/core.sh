@@ -154,10 +154,31 @@ Environment=HYSTERIA_LOG_LEVEL=warn
 MemoryHigh=500M
 MemoryMax=700M
 
+# 启动前清理孤儿 nft 规则（SIGKILL/OOM 后 closer chain 没跑完留下的 hysteria_* 表）
+# 否则下次 hy2 启动 nft add rule 会追加到同 chain 内造成重复
+ExecStartPre=-/opt/b-ui/hy2-nft-cleanup.sh
+
+# 给 hy2 充足时间走完 closer chain 删 nft 表（正常 <1s）
+TimeoutStopSec=15
+
 # 确保服务稳定运行
 Restart=always
 RestartSec=3
 EOF
+
+        # 写入 nft 清理 helper（幂等，被 ExecStartPre 调用）
+        cat > /opt/b-ui/hy2-nft-cleanup.sh <<'CLEANUP_EOF'
+#!/bin/sh
+# 删除所有 hysteria_* nft 表（family + name 配对遍历）
+# 用于 hy2 ExecStartPre：清理 SIGKILL/OOM 残留的孤儿规则
+# 退出码恒为 0（- 前缀已让 systemd 忽略错误，但稳妥起见还是 || true）
+nft list tables 2>/dev/null | awk '/^table .* hysteria_/{print $2,$3}' | while read fam name; do
+    nft delete table "$fam" "$name" 2>/dev/null || true
+done
+exit 0
+CLEANUP_EOF
+        chmod 755 /opt/b-ui/hy2-nft-cleanup.sh
+
         systemctl daemon-reload
 
         # 小内存机器（≤2G）自动降低 swappiness，避免 hysteria 工作集被换出导致卡顿
