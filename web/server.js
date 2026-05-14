@@ -1436,8 +1436,10 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                 if (!user) return sendJSON(res, { error: "User not found" }, 404);
 
                 const cfg = getConfig();
-                // v3.5.0: 用 IP literal 不用域名 — 防客户端 bootstrap DNS 投毒
+                // v3.5.8: host 优先用域名 (cfg.domain)；域名缺失才 fallback IP。
+                // 客户端 (b-ui-client.sh / singbox-tun.json) 已用 DoH + predefined-rule 防 GFW DNS 投毒
                 const serverIp = getServerIP();
+                const serverHost = (cfg.domain && cfg.domain !== "localhost") ? cfg.domain : serverIp;
                 const userSni = user.sni || cfg.sni || "www.bing.com";
                 const links = [];
 
@@ -1457,7 +1459,7 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                         `sid=${cfg.shortId}`
                     ].join('&');
                     const name = encodeURIComponent(`${user.username}-${label}`);
-                    return `vless://${user.uuid}@${serverIp}:${port}?${vlessParams}#${name}`;
+                    return `vless://${user.uuid}@${serverHost}:${port}?${vlessParams}#${name}`;
                 };
 
                 // v3.5.5/3.5.6: per-user 住宅开关 + protocol 决定节点数
@@ -1493,12 +1495,12 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                     if (!user.password) return null;
                     // v3.5.0: 分段 encode（防止 : 被编码导致客户端无法拆分 user/pass）
                     const auth = `${encodeURIComponent(user.username)}:${encodeURIComponent(user.password)}`;
-                    let qp = `sni=${cfg.domain || serverIp}&insecure=0&mport=${hopRange}`;
+                    let qp = `sni=${serverHost}&insecure=0&mport=${hopRange}`;
                     if (includeObfs && cfg.obfs && cfg.obfs.enabled && cfg.obfs.type === "salamander" && cfg.obfs.password) {
                         qp += `&obfs=salamander&obfs-password=${encodeURIComponent(cfg.obfs.password)}`;
                     }
                     const name = encodeURIComponent(`${user.username}-${label}`);
-                    return `hysteria2://${auth}@${serverIp}:${port}?${qp}#${name}`;
+                    return `hysteria2://${auth}@${serverHost}:${port}?${qp}#${name}`;
                 };
 
                 // ② HY2 URL (按 proto + residential 决定端口)
