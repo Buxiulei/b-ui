@@ -1420,7 +1420,7 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
 
 
 
-            // v2rayN 原生订阅 API (返回 Base64 编码的协议链接列表)
+            // v2rayN 原生订阅 API — v3.5.0 输出 4 个节点 (Reality直连/Reality住宅/HY2直连/HY2住宅)
             if (r.startsWith("sub/")) {
                 const username = decodeURIComponent(r.slice(4));
                 const users = loadUsers();
@@ -1428,41 +1428,14 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                 if (!user) return sendJSON(res, { error: "User not found" }, 404);
 
                 const cfg = getConfig();
-                const host = cfg.domain;  // 使用配置中的域名
-
-                // 生成协议链接列表 - 混合方案
+                // v3.5.0: 用 IP literal 不用域名 — 防客户端 bootstrap DNS 投毒
+                const serverIp = getServerIP();
+                const userSni = user.sni || cfg.sni || "www.bing.com";
                 const links = [];
 
-                // Hysteria2 链接 - v2rayN 兼容格式
-                // 根据 v2rayN 导出格式反向工程
-                if (user.password) {
-                    // v2rayN 格式：整个 username:password 一起编码（冒号也编码为 %3A）
-                    const auth = encodeURIComponent(`${user.username}:${user.password}`);
-
-                    // 查询参数构建
-                    let queryParams = `sni=${host}&insecure=0&allowInsecure=0`;
-
-                    // 端口跳跃使用 mport 参数（v2rayN 格式）
-                    if (cfg.portHopping && cfg.portHopping.enabled) {
-                        queryParams += `&mport=${cfg.portHopping.start}-${cfg.portHopping.end}`;
-                    }
-
-                    // v3.4.19 Cluster E: obfs salamander（GFW 高峰期应急）
-                    if (cfg.obfs && cfg.obfs.enabled && cfg.obfs.type === "salamander" && cfg.obfs.password) {
-                        queryParams += `&obfs=salamander&obfs-password=${encodeURIComponent(cfg.obfs.password)}`;
-                    }
-
-                    // 节点别名
-                    const nodeName = encodeURIComponent(`${user.username}-高速版`);
-
-                    // 生成 v2rayN 兼容的 Hysteria2 URI
-                    const hy2Link = `hysteria2://${auth}@${host}:${cfg.port}?${queryParams}#${nodeName}`;
-                    links.push(hy2Link);
-                }
-
-                // VLESS-Reality 链接 - 手动生成 v2rayN 完整格式
-                if (user.uuid && cfg.pubKey && cfg.shortId) {
-                    const userSni = user.sni || cfg.sni || "www.bing.com";
+                // Reality 公共参数生成器（直连和住宅版只差端口 + fragment）
+                const buildVlessUrl = (port, label) => {
+                    if (!user.uuid || !cfg.pubKey || !cfg.shortId) return null;
                     const vlessParams = [
                         `security=reality`,
                         `encryption=none`,
@@ -1475,14 +1448,39 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                         `sni=${userSni}`,
                         `sid=${cfg.shortId}`
                     ].join('&');
-                    const vlessName = encodeURIComponent(`${user.username}-稳定版`);
-                    const vlessLink = `vless://${user.uuid}@${host}:${cfg.xrayPort || 10001}?${vlessParams}#${vlessName}`;
-                    links.push(vlessLink);
-                }
+                    const name = encodeURIComponent(`${user.username}-${label}`);
+                    return `vless://${user.uuid}@${serverIp}:${port}?${vlessParams}#${name}`;
+                };
 
-                // 返回 Base64 编码的链接列表
-                const content = links.join("\n");
-                const base64Content = Buffer.from(content).toString("base64");
+                // ① Reality 直连 (vless-direct :10001)
+                const r1 = buildVlessUrl(10001, "Reality直连");
+                if (r1) links.push(r1);
+
+                // ② Reality 住宅 (vless-residential :10002)
+                const r2 = buildVlessUrl(10002, "Reality住宅");
+                if (r2) links.push(r2);
+
+                // HY2 公共参数生成器
+                const buildHy2Url = (port, hopRange, label, includeObfs) => {
+                    if (!user.password) return null;
+                    const auth = encodeURIComponent(`${user.username}:${user.password}`);
+                    let qp = `sni=${cfg.domain || serverIp}&insecure=0&mport=${hopRange}`;
+                    if (includeObfs && cfg.obfs && cfg.obfs.enabled && cfg.obfs.type === "salamander" && cfg.obfs.password) {
+                        qp += `&obfs=salamander&obfs-password=${encodeURIComponent(cfg.obfs.password)}`;
+                    }
+                    const name = encodeURIComponent(`${user.username}-${label}`);
+                    return `hysteria2://${auth}@${serverIp}:${port}?${qp}#${name}`;
+                };
+
+                // ③ HY2 直连 (:10000 + 20000-30000 hop)
+                const h1 = buildHy2Url(cfg.port || 10000, "20000-30000", "HY2直连", true);
+                if (h1) links.push(h1);
+
+                // ④ HY2 住宅 (:40000 + 41000-50000 hop)
+                const h2 = buildHy2Url(40000, "41000-50000", "HY2住宅", false);
+                if (h2) links.push(h2);
+
+                const base64Content = Buffer.from(links.join("\n")).toString("base64");
 
                 res.writeHead(200, {
                     "Content-Type": "text/plain; charset=utf-8",
@@ -1738,6 +1736,17 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                             : { enabled: false };
                         const display = { ...raw };
                         if (!display.domains || !display.domains.length) display.domains = DEFAULT_DOMAINS;
+                        // v3.5.0: 保证 global 字段始终在响应里
+                        if (typeof display.global === "undefined") display.global = false;
+                        // v3.5.0: 保证 urls 数组始终在响应里（多 URL CRUD 支持）
+                        if (!Array.isArray(display.urls)) {
+                            display.urls = display.host
+                                ? [{ host: display.host, port: display.port, username: display.username, name: "primary" }]
+                                : [];
+                        } else {
+                            // 不暴露明文密码
+                            display.urls = display.urls.map(u => ({ host: u.host, port: u.port, username: u.username, name: u.name }));
+                        }
                         if (display.password) display.password = display.password.slice(0, 2) + "***";
                         if (display.username && display.host) {
                             display.displayUrl = `socks5://${display.username.slice(0, 2)}***@${display.host}:${display.port}`;
@@ -1811,6 +1820,80 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                     } catch (e) {
                         return sendJSON(res, { error: e.message }, 500);
                     }
+                }
+            }
+
+            // v3.5.0: POST /api/residential/global — 切换全局/分流模式
+            if (r === "residential/global" && req.method === "POST") {
+                const b = await parseBody(req);
+                if (!b || typeof b.global !== "boolean") {
+                    return sendJSON(res, { error: "body 需要 { global: true|false }" }, 400);
+                }
+                try {
+                    const result = spawnSync(CONFIG.residentialHelper, ["global", b.global ? "on" : "off"], {
+                        env: { ...process.env, BASE_DIR },
+                        encoding: "utf8",
+                        timeout: 15000,
+                    });
+                    if (result.status !== 0) {
+                        const errMsg = (result.stderr || "").replace(/\x1b\[[0-9;]*m/g, "").trim();
+                        return sendJSON(res, { error: errMsg || "global toggle 失败" }, 500);
+                    }
+                    return sendJSON(res, { success: true, global: b.global });
+                } catch (e) {
+                    return sendJSON(res, { error: e.message }, 500);
+                }
+            }
+
+            // v3.5.0: POST /api/residential/urls — 追加一个住宅 socks5 URL
+            if (r === "residential/urls" && req.method === "POST") {
+                const b = await parseBody(req);
+                if (!b || typeof b.url !== "string" || !b.url.startsWith("socks5://")) {
+                    return sendJSON(res, { error: "url 必须是 socks5:// 开头" }, 400);
+                }
+                try {
+                    const result = spawnSync(CONFIG.residentialHelper, ["enable", "--add", b.url], {
+                        env: { ...process.env, BASE_DIR },
+                        encoding: "utf8",
+                        timeout: 30000,
+                    });
+                    if (result.status !== 0) {
+                        const errMsg = (result.stderr || "").replace(/\x1b\[[0-9;]*m/g, "").trim();
+                        return sendJSON(res, { error: errMsg || "添加 URL 失败" }, 400);
+                    }
+                    const lines = (result.stdout || "").trim().split("\n");
+                    return sendJSON(res, { success: true, exitIp: lines[0] || "", ispInfo: lines[1] || "" });
+                } catch (e) {
+                    return sendJSON(res, { error: e.message }, 500);
+                }
+            }
+
+            // v3.5.0: DELETE /api/residential/urls/:host:port — 移除指定 URL
+            if (r.startsWith("residential/urls/") && req.method === "DELETE") {
+                const target = decodeURIComponent(r.slice("residential/urls/".length));
+                // target 格式: "host:port"
+                try {
+                    let rConfig = { urls: [] };
+                    if (fs.existsSync(CONFIG.residentialConfig)) {
+                        rConfig = JSON.parse(fs.readFileSync(CONFIG.residentialConfig, "utf8"));
+                    }
+                    if (!Array.isArray(rConfig.urls)) rConfig.urls = [];
+                    const match = rConfig.urls.find(u => `${u.host}:${u.port}` === target);
+                    if (!match) return sendJSON(res, { error: "未找到匹配 URL" }, 404);
+                    // helper 期望 socks5:// 格式（不需要凭据匹配，按 host:port 即可）
+                    const url = `socks5://${match.username}:${match.password}@${match.host}:${match.port}`;
+                    const result = spawnSync(CONFIG.residentialHelper, ["enable", "--remove", url], {
+                        env: { ...process.env, BASE_DIR },
+                        encoding: "utf8",
+                        timeout: 15000,
+                    });
+                    if (result.status !== 0) {
+                        const errMsg = (result.stderr || "").replace(/\x1b\[[0-9;]*m/g, "").trim();
+                        return sendJSON(res, { error: errMsg || "移除 URL 失败" }, 500);
+                    }
+                    return sendJSON(res, { success: true });
+                } catch (e) {
+                    return sendJSON(res, { error: e.message }, 500);
                 }
             }
 
