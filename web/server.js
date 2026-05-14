@@ -1829,6 +1829,31 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                 }
             }
 
+            // v3.5.3: POST /api/residential/enable — 总开关启用（池非空时调 helper reapply 设 enabled=true）
+            if (r === "residential/enable" && req.method === "POST") {
+                try {
+                    let rConfig = { enabled: false, urls: [] };
+                    if (fs.existsSync(CONFIG.residentialConfig)) {
+                        rConfig = JSON.parse(fs.readFileSync(CONFIG.residentialConfig, "utf8"));
+                    }
+                    if (!Array.isArray(rConfig.urls) || rConfig.urls.length === 0) {
+                        return sendJSON(res, { error: "代理节点池为空，请先添加至少 1 个住宅 URL" }, 400);
+                    }
+                    rConfig.enabled = true;
+                    fs.writeFileSync(CONFIG.residentialConfig, JSON.stringify(rConfig, null, 2));
+                    const result = spawnSync(CONFIG.residentialHelper, ["reapply"], {
+                        env: { ...process.env, BASE_DIR },
+                        encoding: "utf8",
+                        timeout: 15000,
+                    });
+                    if (result.status !== 0) {
+                        const errMsg = (result.stderr || "").replace(/\x1b\[[0-9;]*m/g, "").trim();
+                        return sendJSON(res, { error: errMsg || "reapply 失败" }, 500);
+                    }
+                    return sendJSON(res, { success: true });
+                } catch (e) { return sendJSON(res, { error: e.message }, 500); }
+            }
+
             // v3.5.0: POST /api/residential/global — 切换全局/分流模式
             if (r === "residential/global" && req.method === "POST") {
                 const b = await parseBody(req);

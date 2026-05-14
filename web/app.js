@@ -632,6 +632,23 @@ function _resiReload() {
     }).catch(() => {});
 }
 
+// v3.5.3: 住宅代理总开关（启用/禁用）
+function toggleResidentialEnabled(checked) {
+    _resiClearErr();
+    if (checked) {
+        // 启用：检查 urls 池非空，触发 helper reapply（设 enabled=true）
+        api("/residential/enable", { method: "POST" }).then(r => {
+            if (r.success) { toast("住宅代理已启用"); openResi(); }
+            else { _resiErr(r.error || "启用失败 — 请先在池里添加至少 1 个 URL"); openResi(); }
+        }).catch(e => { _resiErr(e.message || "请求失败"); openResi(); });
+    } else {
+        api("/residential", { method: "DELETE" }).then(r => {
+            if (r.success) { toast("住宅代理已禁用，fallback 直连"); openResi(); }
+            else { _resiErr(r.error || "禁用失败"); openResi(); }
+        }).catch(e => { _resiErr(e.message || "请求失败"); openResi(); });
+    }
+}
+
 function openResi() {
     const statusEl  = $("#resi-status");
     const disBtn    = $("#resi-disable-btn");
@@ -661,7 +678,19 @@ function openResi() {
         const label = document.createElement("span");
         label.className = "resi-status-label " + (r.enabled ? "active" : "inactive");
         label.textContent = r.enabled ? "已启用" : "未启用";
-        row.append(dot, label);
+        // v3.5.3: 总开关 toggle — 点亮启用住宅，禁用时回 disable
+        const masterTog = document.createElement("label");
+        masterTog.className = "switch";
+        masterTog.style.cssText = "margin-left:auto";
+        masterTog.title = r.enabled ? "点击禁用" : "点击启用（需池中有至少 1 个 URL）";
+        const masterInp = document.createElement("input");
+        masterInp.type = "checkbox";
+        masterInp.checked = !!r.enabled;
+        masterInp.onchange = () => toggleResidentialEnabled(masterInp.checked);
+        const masterSlider = document.createElement("span");
+        masterSlider.className = "slider";
+        masterTog.append(masterInp, masterSlider);
+        row.append(dot, label, masterTog);
 
         if (r.enabled) {
             statusEl.className = "resi-status-card resi-status-enabled";
