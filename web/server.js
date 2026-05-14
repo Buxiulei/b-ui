@@ -46,9 +46,30 @@ const CONFIG = {
     residentialHelper: `${BASE_DIR}/residential-helper.sh`,
     usersFile: process.env.USERS_FILE || `${BASE_DIR}/users.json`,
     adminEnvFile: process.env.ADMIN_ENV_FILE || `${BASE_DIR}/admin.env`,
+    hysteriaResidentialConfig: process.env.HYSTERIA_RESIDENTIAL_CONFIG || `${BASE_DIR}/config-residential.yaml`,
     trafficPort: 9999,
+    trafficPortResidential: 9998,
     xrayApiPort: 10085
 };
+
+// v3.5.0: 获取服务器 IP — 订阅 URL 用 IP literal 防客户端 DNS 投毒
+// 优先 SERVER_IP env → /opt/b-ui/server_ip.txt → ip route 探测出口 IP → 127.0.0.1 兜底
+function getServerIP() {
+    if (process.env.SERVER_IP) return process.env.SERVER_IP.trim();
+    try {
+        const ipFile = path.join(BASE_DIR, "server_ip.txt");
+        if (fs.existsSync(ipFile)) {
+            const ip = fs.readFileSync(ipFile, "utf8").trim();
+            if (ip) return ip;
+        }
+    } catch { }
+    try {
+        const out = require("child_process").spawnSync("ip", ["route", "get", "8.8.8.8"], { encoding: "utf8", timeout: 3000 });
+        const m = (out.stdout || "").match(/src\s+([0-9.]+)/);
+        if (m) return m[1];
+    } catch { }
+    return "127.0.0.1";
+}
 
 // --- 客户端安装 Key 管理 ---
 const INSTALL_KEY_FILE = path.join(BASE_DIR, "install-key.txt");
@@ -225,9 +246,24 @@ function saveUsers(u) {
         // 所有有 uuid 的用户都添加到 Xray Reality（支持 VLESS 备用）
         const vlessUsers = u.filter(x => x.uuid);
         updateHysteriaConfig(hy2Users);
+        // v3.5.0: 同步 hy2-residential 实例（直连/住宅版共用密码）
+        updateHysteriaResidentialConfig(hy2Users);
         updateXrayConfig(vlessUsers, u.filter(x => x.protocol === "vless-ws-tls"));
         return true;
     } catch { return false; }
+}
+
+// v3.5.0: 写 config-residential.yaml 的 auth.userpass 段并 reload hysteria-residential service
+function updateHysteriaResidentialConfig(users) {
+    try {
+        if (!fs.existsSync(CONFIG.hysteriaResidentialConfig)) return; // v3.4 老服务器没装第二实例，跳过
+        let c = fs.readFileSync(CONFIG.hysteriaResidentialConfig, "utf8");
+        const up = users.reduce((a, u) => { a[u.username] = u.password; return a; }, {});
+        const auth = "auth:\n  type: userpass\n  userpass:\n" + Object.entries(up).map(([u, p]) => "    " + u + ": " + p).join("\n");
+        c = c.replace(/auth:[\s\S]*?(?=\n[a-zA-Z]|$)/, auth + "\n\n");
+        fs.writeFileSync(CONFIG.hysteriaResidentialConfig, c);
+        execSync("systemctl reload-or-restart hysteria-residential 2>/dev/null || true", { stdio: "pipe" });
+    } catch (e) { log("ERROR", "HysteriaResidential: " + e.message); }
 }
 
 function updateHysteriaConfig(users) {
@@ -246,15 +282,19 @@ function updateXrayConfig(realityUsers, wsUsers = []) {
         if (!fs.existsSync(CONFIG.xrayConfig)) return;
         let c = JSON.parse(fs.readFileSync(CONFIG.xrayConfig, "utf8"));
 
-        // Update Reality inbound
+        // v3.5.0: 双 Reality inbound — vless-direct + vless-residential 共用 clients/SNI
+        // 兼容 v3.4 老 tag "vless-reality" — 若存在则当作 vless-direct 处理
         const realityClients = realityUsers.map(u => ({ id: u.uuid, flow: "xtls-rprx-vision", email: u.username }));
-        const inbound = c.inbounds.find(i => i.tag === "vless-reality");
-        if (inbound) {
-            inbound.settings.clients = realityClients;
-            const userSnis = realityUsers.filter(u => u.sni).map(u => u.sni);
-            const baseSni = inbound.streamSettings?.realitySettings?.dest?.split(":")[0] || "www.bing.com";
-            const allSnis = [...new Set([baseSni, ...userSnis])];
-            if (inbound.streamSettings?.realitySettings) inbound.streamSettings.realitySettings.serverNames = allSnis;
+        const userSnis = realityUsers.filter(u => u.sni).map(u => u.sni);
+
+        for (const inboundTag of ["vless-direct", "vless-residential", "vless-reality"]) {
+            const inbound = c.inbounds.find(i => i.tag === inboundTag);
+            if (inbound) {
+                inbound.settings.clients = realityClients;
+                const baseSni = inbound.streamSettings?.realitySettings?.dest?.split(":")[0] || "www.bing.com";
+                const allSnis = [...new Set([baseSni, ...userSnis])];
+                if (inbound.streamSettings?.realitySettings) inbound.streamSettings.realitySettings.serverNames = allSnis;
+            }
         }
 
         // Update WS+TLS inbound
