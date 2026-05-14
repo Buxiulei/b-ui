@@ -6,11 +6,19 @@
 
 轻量级 Hysteria2 + Xray 多协议代理一键部署工具，内置 Web 管理面板与全功能流量管理。
 
-**当前版本**: v3.4.44
+**当前版本**: v3.5.0
 
 ---
 
 ## 最新更新
+
+### v3.5.0 — 双实例架构 + 4 订阅 URL + 多住宅 URL 池 + Global 模式
+- 🏗 **架构重构**：xray 双 inbound (vless-direct :10001 / vless-residential :10002)；hysteria 双实例 (direct :10000+20000-30000 / residential :40000+41000-50000)；direct 路径完全绕开 sing-box 中转
+- 🛜 **4 订阅 URL**：每用户输出 `-Reality直连 / -Reality住宅 / -HY2直连 / -HY2住宅`，订阅 host 用 IP literal 防 client DNS 投毒
+- 🏠 **多住宅 URL urltest 池**：30s ping 自动选最优住宅；池空 fallback 直连
+- 🌐 **Global toggle**：OFF 域名分流（默认）/ ON 全走住宅
+- 🛡 **多层 DoH 防投毒**：hy2 resolver / xray dns / client predefined / 静态 /etc/resolv.conf + chattr +i
+- 🔄 **老服务器自动迁移**：update.sh 5 幂等块（hy2-residential unit + config-residential.yaml + xray jq 转换 + DoH + 防火墙），老订阅 URL 继续有效
 
 ### v3.4.44 — UDP :7844 兜底 process_name race
 - 🩺 v3.4.43 部署后 baiyi 仍偶发一批 DNS unpack ERROR（同 session id 17 秒内 10 个），cloudflared rule 没生效
