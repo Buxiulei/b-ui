@@ -1702,6 +1702,15 @@ check_and_update() {
                 print_info "已跳过更新"
             fi
         fi
+    else
+        # v3.5.10: 版本相同也跑一次 apply_systemd_configs，让 .fix 块的 guard 自检 + 自愈
+        # 历史 bug：新 .fix 块加到 update.sh 后，bash 已加载老函数到 RAM，本次 do_update 调用
+        # 仍跑老函数定义；新 .fix 块要等"下次 update"才生效。但"下次"只有有新版本时才会触发，
+        # 没新版本就永远卡住——所以让"无更新"路径也跑一次 apply_systemd_configs (所有 .fix 块
+        # 都有 guard，无残留即 no-op)，把"打不死"的迁移块改成"打得死"。
+        echo ""
+        print_info "幂等自愈检查（无残留时为 no-op）..."
+        apply_systemd_configs
     fi
 
     # 无论是否更新，都确保 CLI 命令存在
@@ -1792,11 +1801,13 @@ auto_update() {
         fi
 
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] 更新完成: v${remote_ver}" >> "$LOG_FILE"
-        
+
         # 确保定时任务配置正确
         ensure_cron_jobs 2>/dev/null || true
     else
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] 已是最新版本: v${local_ver}" >> "$LOG_FILE"
+        # v3.5.10: 无更新也跑一次 apply_systemd_configs 做幂等自愈（详见 check_and_update 注释）
+        apply_systemd_configs 2>/dev/null >> "$LOG_FILE" || true
     fi
 
     # B-UI 更新检查后，顺带检查内核更新
