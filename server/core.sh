@@ -177,7 +177,9 @@ MemoryMax=700M
 
 # 启动前清理孤儿 nft 规则（SIGKILL/OOM 后 closer chain 没跑完留下的 hysteria_* 表）
 # 否则下次 hy2 启动 nft add rule 会追加到同 chain 内造成重复
-ExecStartPre=-/opt/b-ui/hy2-nft-cleanup.sh
+# v3.5.1: ExecStartPre 共用 cleanup 会误删另一实例 nft 端口跳跃表（bug confirmed bwg-tizi/temp）
+# 改为不主动清理孤儿规则，由 hy2 自己 SIGTERM 时的 closer chain 删自己的 nft 表
+# SIGKILL 留孤儿是边缘 case，发生时手工 nft delete
 
 # 给 hy2 充足时间走完 closer chain 删 nft 表（正常 <1s）
 TimeoutStopSec=15
@@ -212,7 +214,9 @@ Environment=GOMEMLIMIT=200MiB
 Environment=HYSTERIA_LOG_LEVEL=warn
 MemoryHigh=300M
 MemoryMax=500M
-ExecStartPre=-/opt/b-ui/hy2-nft-cleanup.sh
+# v3.5.1: ExecStartPre 共用 cleanup 会误删另一实例 nft 端口跳跃表（bug confirmed bwg-tizi/temp）
+# 改为不主动清理孤儿规则，由 hy2 自己 SIGTERM 时的 closer chain 删自己的 nft 表
+# SIGKILL 留孤儿是边缘 case，发生时手工 nft delete
 TimeoutStopSec=15
 Restart=always
 RestartSec=3

@@ -768,9 +768,16 @@ EOF
             hysteria_mem_changed=1
         fi
         # v3.4.42: ExecStartPre nft 清理 / TimeoutStopSec，缺失则触发 restart
-        if ! grep -q 'hy2-nft-cleanup.sh' /etc/systemd/system/hysteria-server.service.d/override.conf 2>/dev/null; then
+        # v3.5.1: 检测老 ExecStartPre 引用残留（hy2-nft-cleanup.sh 在 v3.5.0 被 unit drop-in 临时清空，
+        # 但 update.sh 重写 override.conf 时会把它写回，导致 bug 复发）。新 override 已不含该行，
+        # 检测残留时若发现就重写 + 移除老 drop-in。
+        if grep -q 'hy2-nft-cleanup.sh' /etc/systemd/system/hysteria-server.service.d/override.conf 2>/dev/null; then
             hysteria_mem_changed=1
         fi
+        # 同步清掉 v3.5.0 临时 hotfix drop-in
+        rm -f /etc/systemd/system/hysteria-server.service.d/99-no-cross-cleanup.conf
+        rm -f /etc/systemd/system/hysteria-residential.service.d/99-no-cross-cleanup.conf
+        rmdir /etc/systemd/system/hysteria-residential.service.d 2>/dev/null || true
         cat > /etc/systemd/system/hysteria-server.service.d/override.conf << EOF
 [Unit]
 # Hysteria2 使用 QUIC (UDP)，与 Xray (TCP) 独立运行
@@ -801,7 +808,7 @@ MemoryMax=700M
 
 # 启动前清理孤儿 nft 规则（SIGKILL/OOM 后 closer chain 没跑完留下的 hysteria_* 表）
 # 否则下次 hy2 启动 nft add rule 会追加到同 chain 内造成重复
-ExecStartPre=-/opt/b-ui/hy2-nft-cleanup.sh
+# v3.5.1: 不再 ExecStartPre 清理 nft（共用脚本互删另一实例的端口跳跃表）
 
 # 给 hy2 充足时间走完 closer chain 删 nft 表（正常 <1s）
 TimeoutStopSec=15
@@ -1238,7 +1245,7 @@ Environment=GOMEMLIMIT=200MiB
 Environment=HYSTERIA_LOG_LEVEL=warn
 MemoryHigh=300M
 MemoryMax=500M
-ExecStartPre=-/opt/b-ui/hy2-nft-cleanup.sh
+# v3.5.1: 不再 ExecStartPre 清理 nft（共用脚本互删另一实例的端口跳跃表）
 TimeoutStopSec=15
 Restart=always
 RestartSec=3
