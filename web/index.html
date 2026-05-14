@@ -230,12 +230,12 @@
                 <input id="nm" type="number" placeholder="月流量(GB)" min="0" step="0.1">
                 <input id="ns" type="number" placeholder="限速(Mbps) 默认100" min="0">
             </div>
-            <!-- v3.5.5: 住宅代理订阅开关 -->
-            <label style="display:flex; align-items:center; gap:10px; margin-top:12px; padding:10px 14px; background:rgba(0,0,0,.03); border-radius:10px; cursor:pointer">
+            <!-- v3.5.5/3.5.6: 住宅代理开关 (语义随 protocol 变) -->
+            <label id="nresi-wrap" style="display:flex; align-items:center; gap:10px; margin-top:12px; padding:10px 14px; background:rgba(0,0,0,.03); border-radius:10px; cursor:pointer">
                 <input type="checkbox" id="nresi" checked style="cursor:pointer">
                 <span style="display:flex; flex-direction:column; gap:2px">
-                    <span style="font-size:13px; font-weight:600">订阅包含住宅节点</span>
-                    <span style="font-size:11px; color:var(--text-dim)">勾选 → 4 节点 (直连+住宅 ×2)；不勾 → 仅 2 节点 (直连 ×2)</span>
+                    <span id="nresi-title" style="font-size:13px; font-weight:600">订阅包含住宅节点</span>
+                    <span id="nresi-hint" style="font-size:11px; color:var(--text-dim)">勾选 → 4 节点 (直连+住宅 ×2)；不勾 → 仅 2 节点 (直连 ×2)</span>
                 </span>
             </label>
             <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:16px">

@@ -1,5 +1,5 @@
 {
-    "version": "3.5.5",
+    "version": "3.5.6",
     "updated": "2026-05-14",
     "files": [
         "install.sh",
@@ -16,6 +16,7 @@
         "b-ui-client.sh"
     ],
     "changelog": {
+        "3.5.6": "feat: 单协议用户也支持住宅版选择。v3.5.5 仅 fusion 类型用 residential 字段；单协议 'hysteria2' / 'vless-reality' 类型的住宅 toggle 不起作用。**v3.5.6**: 订阅生成逻辑按 user.protocol + user.residential 组合：(1) fusion: 4 URL (直连+住宅) 或 2 URL (仅直连)；(2) hysteria2 单协议: 1 URL，residential=true → :40000 住宅，false → :10000 直连；(3) vless-reality 单协议: 1 URL，residential=true → :10002 住宅，false → :10001 直连。前端 toggleSniSelect() 同步改 checkbox 文案，proto=hysteria2 显示「使用住宅版 (HY2)」，proto=reality 显示「使用住宅版 (Reality)」，proto=ws-tls 隐藏复选框。",
         "3.5.5": "feat: per-user 住宅代理订阅开关。新建用户表单加复选框「订阅包含住宅节点」(默认勾选)。勾选 → 订阅返 4 节点 (Reality直连/Reality住宅/HY2直连/HY2住宅)；不勾 → 仅 2 节点 (直连版)。users.json 新增 user.residential 布尔字段。/api/sub/:user 读该字段决定输出。**老用户向后兼容**：缺失字段默认 true，行为不变。适用场景：给团队不同人发不同订阅，部分人不需要住宅代理（节省住宅 IP metering 流量 + 简化客户端节点列表）。",
         "3.5.4": "tune: sing-box urltest probe interval 30s → 10s。住宅池切换更灵敏，挂节点恢复时间从最长 30s 降到 10s。代价是每 10s 对每个住宅 URL 探测一次 https://www.gstatic.com/generate_204（小流量），N 个 URL 每分钟 6N 次探测请求。",
         "3.5.3": "fix(ui): 住宅 IP 出站面板缺『启用』开关。v3.5.0 设计把启用动作隐藏到『+ 添加 URL』后端 helper enable --add，但 UI 上『未启用』标签是只读的，用户看不到怎么明确启用。修复：在状态行加 iOS toggle 开关作为主启用控制（点亮 → POST /api/residential/enable 触发 helper reapply 设 enabled=true；点灭 → DELETE /api/residential 走 disable）。新 API POST /api/residential/enable 检查池非空才允许启用。",

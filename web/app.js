@@ -519,6 +519,26 @@ function toggleSniSelect() {
     } else {
         sniGroup.style.display = "none";
     }
+    // v3.5.6: 住宅 checkbox 语义随 protocol 变
+    const wrap = $("#nresi-wrap");
+    const title = $("#nresi-title");
+    const hint = $("#nresi-hint");
+    if (!wrap || !title || !hint) return;
+    if (proto === "fusion") {
+        wrap.style.display = "flex";
+        title.textContent = "订阅包含住宅节点";
+        hint.textContent = "勾选 → 4 节点 (直连+住宅 ×2)；不勾 → 仅 2 节点 (直连 ×2)";
+    } else if (proto === "hysteria2") {
+        wrap.style.display = "flex";
+        title.textContent = "使用住宅版 (HY2)";
+        hint.textContent = "勾选 → 节点指 :40000 hy2-residential 经住宅 IP；不勾 → :10000 直连";
+    } else if (proto === "vless-reality") {
+        wrap.style.display = "flex";
+        title.textContent = "使用住宅版 (Reality)";
+        hint.textContent = "勾选 → 节点指 :10002 vless-residential 经住宅 IP；不勾 → :10001 直连";
+    } else {
+        wrap.style.display = "none";  // ws-tls 无住宅版
+    }
 }
 
 // Auto-init if token exists

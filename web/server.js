@@ -1460,17 +1460,32 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                     return `vless://${user.uuid}@${serverIp}:${port}?${vlessParams}#${name}`;
                 };
 
-                // v3.5.5: per-user 住宅开关（默认 true 向后兼容）
+                // v3.5.5/3.5.6: per-user 住宅开关 + protocol 决定节点数
+                // - fusion: 默认 4 URL，residential=false 时仅 2 URL (-直连)
+                // - hysteria2 / vless-reality: 单节点 URL，residential 决定直连版 vs 住宅版
+                // - vless-ws-tls: 单独走 ws-tls inbound（不在此 4-URL 框架内）
                 const includeResi = user.residential !== false;
+                const proto = user.protocol || "fusion";
 
-                // ① Reality 直连 (vless-direct :10001)
-                const r1 = buildVlessUrl(10001, "Reality直连");
-                if (r1) links.push(r1);
-
-                // ② Reality 住宅 (vless-residential :10002) — 仅 user.residential 启用时输出
-                if (includeResi) {
-                    const r2 = buildVlessUrl(10002, "Reality住宅");
-                    if (r2) links.push(r2);
+                // ① Reality URL (按 proto + residential 决定端口)
+                if (proto === "fusion" || proto === "vless-reality") {
+                    // fusion: 直连版必给
+                    if (proto === "fusion") {
+                        const r1 = buildVlessUrl(10001, "Reality直连");
+                        if (r1) links.push(r1);
+                    }
+                    // vless-reality 单协议: 按 residential 选端口
+                    if (proto === "vless-reality") {
+                        const port = includeResi ? 10002 : 10001;
+                        const label = includeResi ? "Reality住宅" : "Reality直连";
+                        const u = buildVlessUrl(port, label);
+                        if (u) links.push(u);
+                    }
+                    // fusion: 住宅版可选
+                    if (proto === "fusion" && includeResi) {
+                        const r2 = buildVlessUrl(10002, "Reality住宅");
+                        if (r2) links.push(r2);
+                    }
                 }
 
                 // HY2 公共参数生成器
@@ -1486,14 +1501,25 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                     return `hysteria2://${auth}@${serverIp}:${port}?${qp}#${name}`;
                 };
 
-                // ③ HY2 直连 (:10000 + 20000-30000 hop)
-                const h1 = buildHy2Url(cfg.port || 10000, "20000-30000", "HY2直连", true);
-                if (h1) links.push(h1);
-
-                // ④ HY2 住宅 (:40000 + 41000-50000 hop) — 仅 user.residential 启用时输出
-                if (includeResi) {
-                    const h2 = buildHy2Url(40000, "41000-50000", "HY2住宅", false);
-                    if (h2) links.push(h2);
+                // ② HY2 URL (按 proto + residential 决定端口)
+                if (proto === "fusion" || proto === "hysteria2") {
+                    if (proto === "fusion") {
+                        const h1 = buildHy2Url(cfg.port || 10000, "20000-30000", "HY2直连", true);
+                        if (h1) links.push(h1);
+                    }
+                    if (proto === "hysteria2") {
+                        if (includeResi) {
+                            const u = buildHy2Url(40000, "41000-50000", "HY2住宅", false);
+                            if (u) links.push(u);
+                        } else {
+                            const u = buildHy2Url(cfg.port || 10000, "20000-30000", "HY2直连", true);
+                            if (u) links.push(u);
+                        }
+                    }
+                    if (proto === "fusion" && includeResi) {
+                        const h2 = buildHy2Url(40000, "41000-50000", "HY2住宅", false);
+                        if (h2) links.push(h2);
+                    }
                 }
 
                 const base64Content = Buffer.from(links.join("\n")).toString("base64");
