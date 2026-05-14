@@ -1358,7 +1358,9 @@ EOF
               (.inboundTag // []) as $t |
               ($t | index("vless-reality")) == null and
               ($t | index("vless-direct")) == null and
-              ($t | index("vless-residential")) == null
+              ($t | index("vless-residential")) == null and
+              # v3.5.9: 过滤 v3.4 全局无条件 relay 规则 (无 inboundTag 限定，会覆盖 vless-direct → direct)
+              (.outboundTag != "relay" or ($t | length) > 0)
             )] + [
               {"type": "field", "inboundTag": ["vless-direct"], "outboundTag": "direct"},
               {"type": "field", "inboundTag": ["vless-residential"], "outboundTag": "relay"}
@@ -1369,6 +1371,26 @@ EOF
              cp "$_xray_bak" "${BASE_DIR}/xray-config.json" 2>/dev/null || true; }
         systemctl restart xray 2>/dev/null || true
         print_info "  ✓ xray-config.json: 双 inbound + dns + relay outbound + routing"
+        updated=1
+    fi
+
+    # B.fix (v3.5.9): xray routing 残留 v3.4 全局无条件 relay 规则
+    # 老 v3.5 升级路径的 B 块 select 没过滤 inboundTag 为空的规则 →
+    # {"outboundTag":"relay","network":"tcp,udp"} 被保留 → 永远命中，覆盖 vless-direct → direct →
+    # Reality 直连 节点流量被强制走 b-ui-relay → 出口拿到住宅 IP（应为机房 IP）
+    if [[ -f "${BASE_DIR}/xray-config.json" ]] && \
+       jq -e '.routing.rules[] | select(.outboundTag == "relay" and ((.inboundTag // []) | length == 0))' \
+           "${BASE_DIR}/xray-config.json" &>/dev/null; then
+        print_info "v3.5.9 fix: 清除 xray routing 残留无条件 relay 规则 (v3.4 → v3.5 升级遗留)"
+        cp "${BASE_DIR}/xray-config.json" "${BASE_DIR}/xray-config.json.bak.v359.$(date +%s)"
+        jq '.routing.rules = [.routing.rules[] | select(
+                .outboundTag != "relay" or ((.inboundTag // []) | length > 0)
+            )]' \
+            "${BASE_DIR}/xray-config.json" > "${BASE_DIR}/xray-config.json.tmp"
+        mv "${BASE_DIR}/xray-config.json.tmp" "${BASE_DIR}/xray-config.json"
+        chmod 644 "${BASE_DIR}/xray-config.json"
+        systemctl restart xray
+        print_info "  ✓ routing 已清理，xray 重启完成"
         updated=1
     fi
 
