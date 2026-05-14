@@ -409,13 +409,14 @@ update_service_paths() {
 #===============================================================================
 
 # config.yaml 完整性修复：从 users.json 重新生成 auth/trafficStats/masquerade/sniff 段
-# 保留 listen / tls / quic / RESIDENTIAL-START..END 等已有段（避免覆盖端口/证书路径/中继配置）
+# 保留 listen / tls / quic 已有段（避免覆盖端口/证书路径）
+# v3.5+: hy2-direct (config.yaml) 永远内置直连，不写 outbounds/acl/RESIDENTIAL block
 repair_hysteria_config() {
     local config_file="${BASE_DIR}/config.yaml"
     local users_file="${BASE_DIR}/users.json"
     [[ -f "$config_file" ]] || return 1
 
-    # 提取已有的关键段：listen / tls / quic / RESIDENTIAL block
+    # 提取已有的关键段：listen / tls
     local port
     port=$(awk '/^listen:/{sub(/^listen: *:/,""); print; exit}' "$config_file")
     [[ -z "$port" ]] && port=10000
@@ -426,14 +427,10 @@ repair_hysteria_config() {
     [[ -z "$cert_path" ]] && cert_path="${BASE_DIR}/certs/fullchain.pem"
     [[ -z "$key_path" ]]  && key_path="${BASE_DIR}/certs/privkey.pem"
 
-    # 读取 RESIDENTIAL block（包含 START/END 标记）
-    local residential_block
-    residential_block=$(awk '/^# B-UI:RESIDENTIAL-START/,/^# B-UI:RESIDENTIAL-END/' "$config_file")
-    [[ -z "$residential_block" ]] && residential_block=$'# B-UI:RESIDENTIAL-START\n# B-UI:RESIDENTIAL-END'
-
     # 重新生成完整 config（HTTP 认证模式，配合 b-ui-admin 实现用户管理 + 限速）
     cat > "${config_file}.tmp" <<EOF
-# Hysteria2 服务器配置
+# Hysteria2 服务器配置 — Direct 实例 (v3.5+)
+# hy2-direct 内置直连，绕开 b-ui-relay；住宅路径走 config-residential.yaml
 # 修复时间: $(date)
 
 listen: :${port}
@@ -476,7 +473,15 @@ sniff:
   # UDP 嗅探仅限 443 (QUIC/HTTP3) 和 53 (DoH/DoQ)
   udpPorts: 443,53
 
-${residential_block}
+# 强制走服务端拥塞控制（BBR/Reno），忽略客户端 Brutal 宣告
+ignoreClientBandwidth: true
+
+# DoH 防 GFW DNS 投毒（hy2 sniff 出 host 后用 DoH 重解析）
+resolver:
+  type: https
+  https:
+    addr: "1.1.1.1:443"
+    sni: cloudflare-dns.com
 EOF
     mv "${config_file}.tmp" "$config_file"
     chmod 644 "$config_file"
@@ -1318,6 +1323,23 @@ EOF
         systemctl daemon-reload
         systemctl restart hysteria-residential
         print_info "  ✓ ExecStartPre 已移除，hy2-residential 重启完成"
+        updated=1
+    fi
+
+    # A.fix2 (v3.5.7): 清理 config.yaml (hy2-direct) 残留 RESIDENTIAL marker block
+    # v3.4 时代 residential-helper apply_hysteria 在 config.yaml 插 socks5:2080 + relay(all) acl，
+    # v3.5 升级路径 repair_hysteria_config 又把这块保留下来 → hy2-direct 实际走 b-ui-relay → 全局住宅模式下「直连」节点也变住宅出口
+    # v3.5.7: hy2-direct 永远内置直连，主动剥离所有 RESIDENTIAL marker block
+    if [[ -f "${BASE_DIR}/config.yaml" ]] && \
+       grep -q '# B-UI:RESIDENTIAL-START' "${BASE_DIR}/config.yaml"; then
+        print_info "v3.5.7 fix: 清理 config.yaml 残留 RESIDENTIAL marker block (hy2-direct 应内置直连)"
+        cp "${BASE_DIR}/config.yaml" "${BASE_DIR}/config.yaml.bak.v357.$(date +%s)"
+        awk '/# B-UI:RESIDENTIAL-START/{flag=1;next} /# B-UI:RESIDENTIAL-END/{flag=0;next} !flag' \
+            "${BASE_DIR}/config.yaml" > "${BASE_DIR}/config.yaml.v357.tmp"
+        mv "${BASE_DIR}/config.yaml.v357.tmp" "${BASE_DIR}/config.yaml"
+        chmod 644 "${BASE_DIR}/config.yaml"
+        systemctl restart hysteria-server 2>/dev/null || true
+        print_info "  ✓ config.yaml 已剥离 outbounds/acl，hysteria-server 重启完成"
         updated=1
     fi
 
