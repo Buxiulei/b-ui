@@ -1570,3 +1570,40 @@ textarea.resi-domains-ta:focus { border-color: rgba(0,0,0,.15); }
     max-height: 180px;
     overflow-y: auto;
 }
+/* v3.5.0: 住宅 IP 出口新 UI */
+.resi-global-row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 14px; border-radius: 10px;
+    background: rgba(0,0,0,.03); margin-bottom: 14px;
+}
+.resi-global-label { display: flex; flex-direction: column; gap: 2px; }
+.resi-global-title { font-size: 13px; font-weight: 600; }
+.resi-global-hint { font-size: 11px; color: var(--text-dim); }
+.resi-urls-section {
+    border: 1px solid rgba(0,0,0,.07); border-radius: 10px;
+    margin-bottom: 14px; overflow: hidden;
+}
+.resi-urls-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 9px 12px; background: rgba(0,0,0,.025);
+    border-bottom: 1px solid rgba(0,0,0,.05);
+}
+.resi-urls-title { font-size: 12px; font-weight: 600; color: var(--text-dim); text-transform: uppercase; letter-spacing: .04em; }
+.resi-add-btn { padding: 4px 10px !important; font-size: 12px !important; }
+.resi-urls-table { max-height: 180px; overflow-y: auto; }
+.resi-urls-empty { padding: 14px 12px; font-size: 12.5px; color: var(--text-light); text-align: center; }
+.resi-url-row {
+    display: flex; align-items: center; padding: 8px 12px;
+    border-bottom: 1px solid rgba(0,0,0,.04); gap: 8px;
+}
+.resi-url-row:last-child { border-bottom: none; }
+.resi-url-info { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; }
+.resi-url-name { font-size: 13px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.resi-url-addr { font-size: 11px; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.resi-del-btn { color: var(--danger); cursor: pointer; padding: 2px 6px; }
+.resi-add-url-wrap {
+    padding: 10px 12px; border-top: 1px solid rgba(0,0,0,.05);
+    background: rgba(0,0,0,.015);
+}
+.resi-new-url-input { margin-bottom: 8px !important; width: 100%; }
+.resi-add-url-actions { display: flex; gap: 8px; justify-content: flex-end; margin-bottom: 4px; }

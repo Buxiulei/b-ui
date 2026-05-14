@@ -1201,6 +1201,184 @@ EOF
         print_info "  ✓ cert-sync 修复 race condition (exit 0 + ExecStartPre 等 caddy)"
     fi
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # v3.5 迁移块（幂等，每块独立 guard，老 v3.4.x 自动补齐新架构）
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # A. hysteria-residential systemd unit + config-residential.yaml
+    if [[ -f "${BASE_DIR}/config.yaml" ]] && \
+       [[ ! -f /etc/systemd/system/hysteria-residential.service ]]; then
+        print_info "v3.5 迁移: 安装 hysteria-residential 实例 (:40000+41000-50000)"
+        local _cert _key _masq
+        _cert=$(grep -E '^\s+cert:\s' "${BASE_DIR}/config.yaml" | awk '{print $2}' | head -1)
+        _key=$(grep -E '^\s+key:\s' "${BASE_DIR}/config.yaml" | awk '{print $2}' | head -1)
+        _masq=$(grep -A2 'type: proxy' "${BASE_DIR}/config.yaml" | grep 'url:' | awk '{print $2}' | head -1)
+        [[ -z "$_cert" ]] && _cert="/opt/b-ui/certs/fullchain.pem"
+        [[ -z "$_key"  ]] && _key="/opt/b-ui/certs/privkey.pem"
+        [[ -z "$_masq" ]] && _masq="https://www.bing.com/"
+
+        cat > /etc/systemd/system/hysteria-residential.service <<'RESI_UNIT_EOF'
+[Unit]
+Description=Hysteria Server (Residential) Service
+Documentation=https://v2.hysteria.network/
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hysteria server --config /opt/b-ui/config-residential.yaml
+WorkingDirectory=/etc/hysteria
+User=root
+Group=root
+LimitNPROC=512
+LimitNOFILE=1048576
+CPUSchedulingPolicy=other
+Nice=-5
+Environment=GOMEMLIMIT=200MiB
+Environment=HYSTERIA_LOG_LEVEL=warn
+MemoryHigh=300M
+MemoryMax=500M
+ExecStartPre=-/opt/b-ui/hy2-nft-cleanup.sh
+TimeoutStopSec=15
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+RESI_UNIT_EOF
+
+        cat > "${BASE_DIR}/config-residential.yaml" <<EOF
+# Hysteria2 服务器配置 — Residential 实例 (v3.5 迁移)
+# 生成时间: $(date)
+listen: :40000,41000-50000
+tls:
+  sniGuard: disable
+  cert: ${_cert}
+  key: ${_key}
+quic:
+  maxIdleTimeout: 60s
+ignoreClientBandwidth: true
+resolver:
+  type: https
+  https:
+    addr: "1.1.1.1:443"
+    sni: cloudflare-dns.com
+auth:
+  type: http
+  http:
+    url: http://127.0.0.1:8080/auth/hysteria
+    insecure: false
+trafficStats:
+  listen: 127.0.0.1:9998
+  secret: ""
+masquerade:
+  type: proxy
+  proxy:
+    url: ${_masq}
+    rewriteHost: true
+sniff:
+  enable: true
+  timeout: 2s
+  rewriteDomain: true
+  tcpPorts: 80,443,8000-9000
+  udpPorts: 443,53
+outbounds:
+  - name: relay
+    type: socks5
+    socks5:
+      addr: "127.0.0.1:2080"
+  - name: direct
+    type: direct
+acl:
+  inline:
+    - relay(all)
+EOF
+        chmod 644 "${BASE_DIR}/config-residential.yaml"
+        systemctl daemon-reload
+        systemctl enable hysteria-residential 2>/dev/null || true
+        systemctl start hysteria-residential 2>/dev/null || \
+            print_warning "  hy2-residential 启动失败，请检查: journalctl -u hysteria-residential"
+        print_info "  ✓ hysteria-residential unit + config-residential.yaml 已部署"
+        updated=1
+    fi
+
+    # B. xray 双 inbound 迁移
+    if [[ -f "${BASE_DIR}/xray-config.json" ]] && \
+       ! jq -e '.inbounds[] | select(.tag == "vless-residential")' "${BASE_DIR}/xray-config.json" &>/dev/null; then
+        print_info "v3.5 迁移: 升级 xray 到双 inbound (vless-direct + vless-residential)"
+        local _xray_bak="${BASE_DIR}/xray-config.json.bak.$(date +%s)"
+        cp "${BASE_DIR}/xray-config.json" "$_xray_bak"
+        jq '
+          .inbounds = (.inbounds | map(if .tag == "vless-reality" then .tag = "vless-direct" else . end))
+          | .inbounds += [(.inbounds[] | select(.tag == "vless-direct") | .tag = "vless-residential" | .port = 10002)]
+          | .dns = (.dns // {"servers": ["https+local://1.1.1.1/dns-query", "8.8.8.8"], "queryStrategy": "UseIPv4"})
+          | .outbounds = ([.outbounds[] | select(.tag != "relay")] + [{"tag": "relay", "protocol": "socks", "settings": {"servers": [{"address": "127.0.0.1", "port": 2080}]}}])
+          | .routing.rules = ([.routing.rules[]? | select(
+              (.inboundTag // []) as $t |
+              ($t | index("vless-reality")) == null and
+              ($t | index("vless-direct")) == null and
+              ($t | index("vless-residential")) == null
+            )] + [
+              {"type": "field", "inboundTag": ["vless-direct"], "outboundTag": "direct"},
+              {"type": "field", "inboundTag": ["vless-residential"], "outboundTag": "relay"}
+            ])
+        ' "${BASE_DIR}/xray-config.json" > "${BASE_DIR}/xray-config.json.tmp" \
+        && mv "${BASE_DIR}/xray-config.json.tmp" "${BASE_DIR}/xray-config.json" \
+        || { print_warning "  xray jq 转换失败，已还原备份"
+             cp "$_xray_bak" "${BASE_DIR}/xray-config.json" 2>/dev/null || true; }
+        systemctl restart xray 2>/dev/null || true
+        print_info "  ✓ xray-config.json: 双 inbound + dns + relay outbound + routing"
+        updated=1
+    fi
+
+    # C. config.yaml 加 DoH resolver
+    if [[ -f "${BASE_DIR}/config.yaml" ]] && ! grep -q '^resolver:' "${BASE_DIR}/config.yaml"; then
+        print_info "v3.5 迁移: config.yaml 加 DoH resolver"
+        awk '/^ignoreClientBandwidth:/{
+            print; print ""
+            print "resolver:"
+            print "  type: https"
+            print "  https:"
+            print "    addr: \"1.1.1.1:443\""
+            print "    sni: cloudflare-dns.com"
+            next
+        }1' "${BASE_DIR}/config.yaml" > "${BASE_DIR}/config.yaml.tmp" \
+        && mv "${BASE_DIR}/config.yaml.tmp" "${BASE_DIR}/config.yaml"
+        hysteria_config_changed=1
+        print_info "  ✓ config.yaml 加 resolver DoH 块"
+    fi
+
+    # D. 静态 /etc/resolv.conf
+    if [[ -L /etc/resolv.conf ]] || grep -q '127.0.0.53' /etc/resolv.conf 2>/dev/null; then
+        print_info "v3.5 迁移: 切静态 /etc/resolv.conf + 关 systemd-resolved"
+        systemctl disable --now systemd-resolved 2>/dev/null || true
+        chattr -i /etc/resolv.conf 2>/dev/null || true
+        rm -f /etc/resolv.conf
+        cat > /etc/resolv.conf <<'RESOLV_EOF'
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+nameserver 9.9.9.9
+options edns0 timeout:2 attempts:2 single-request
+RESOLV_EOF
+        chattr +i /etc/resolv.conf 2>/dev/null || true
+        print_info "  ✓ /etc/resolv.conf 静态化"
+    fi
+
+    # E. 防火墙放行 v3.5 新端口
+    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "active"; then
+        ufw status 2>/dev/null | grep -q "10002/tcp" || ufw allow 10002/tcp 2>/dev/null || true
+        ufw status 2>/dev/null | grep -q "40000/udp" || ufw allow 40000/udp 2>/dev/null || true
+        ufw status 2>/dev/null | grep -qE "41000:50000/udp" || ufw allow 41000:50000/udp 2>/dev/null || true
+        print_info "  ✓ UFW 放行 v3.5 新端口"
+    fi
+    if command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
+        firewall-cmd --permanent --add-port=10002/tcp 2>/dev/null || true
+        firewall-cmd --permanent --add-port=40000/udp 2>/dev/null || true
+        firewall-cmd --permanent --add-port=41000-50000/udp 2>/dev/null || true
+        firewall-cmd --reload 2>/dev/null || true
+        print_info "  ✓ firewalld 放行 v3.5 新端口"
+    fi
+
     # install-key.txt 权限收紧到 0600（幂等）
     if [[ -f /opt/b-ui/install-key.txt ]]; then
         chmod 600 /opt/b-ui/install-key.txt
