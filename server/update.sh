@@ -1313,7 +1313,12 @@ EOF
           | .inbounds += [(.inbounds[] | select(.tag == "vless-direct") | .tag = "vless-residential" | .port = 10002)]
           | .dns = (.dns // {"servers": ["https+local://1.1.1.1/dns-query", "8.8.8.8"], "queryStrategy": "UseIPv4"})
           | .outbounds = ([.outbounds[] | select(.tag != "relay")] + [{"tag": "relay", "protocol": "socks", "settings": {"servers": [{"address": "127.0.0.1", "port": 2080}]}}])
-          | .routing.rules = ([.routing.rules[]? | select(.inboundTag and (.inboundTag | tojson | contains("vless") | not))] + [
+          | .routing.rules = ([.routing.rules[]? | select(
+              (.inboundTag // []) as $t |
+              ($t | index("vless-reality")) == null and
+              ($t | index("vless-direct")) == null and
+              ($t | index("vless-residential")) == null
+            )] + [
               {"type": "field", "inboundTag": ["vless-direct"], "outboundTag": "direct"},
               {"type": "field", "inboundTag": ["vless-residential"], "outboundTag": "relay"}
             ])

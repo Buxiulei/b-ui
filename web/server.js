@@ -64,7 +64,7 @@ function getServerIP() {
         }
     } catch { }
     try {
-        const out = require("child_process").spawnSync("ip", ["route", "get", "8.8.8.8"], { encoding: "utf8", timeout: 3000 });
+        const out = spawnSync("ip", ["route", "get", "8.8.8.8"], { encoding: "utf8", timeout: 3000 });
         const m = (out.stdout || "").match(/src\s+([0-9.]+)/);
         if (m) return m[1];
     } catch { }
@@ -298,8 +298,13 @@ function updateXrayConfig(realityUsers, wsUsers = []) {
         }
 
         // Update WS+TLS inbound
+        // v3.5.0: 端口从 10002 改到 10003（10002 被 vless-residential 占用）
         const wsClients = wsUsers.map(u => ({ id: u.uuid, email: u.username }));
         let wsInbound = c.inbounds.find(i => i.tag === "vless-ws-tls");
+        // 老配置若有 vless-ws-tls 在 :10002 且 vless-residential 也在 :10002，强制把 ws-tls 改到 :10003
+        if (wsInbound && wsInbound.port === 10002 && c.inbounds.some(i => i.tag === "vless-residential" && i.port === 10002)) {
+            wsInbound.port = 10003;
+        }
         if (wsUsers.length > 0) {
             if (!wsInbound) {
                 const hc = fs.readFileSync(CONFIG.hysteriaConfig, "utf8");
@@ -307,7 +312,7 @@ function updateXrayConfig(realityUsers, wsUsers = []) {
                 const domain = dm ? dm[1] : "localhost";
                 wsInbound = {
                     tag: "vless-ws-tls",
-                    port: 10002,
+                    port: 10003,
                     protocol: "vless",
                     settings: { clients: wsClients, decryption: "none" },
                     streamSettings: {
@@ -358,7 +363,7 @@ function getConfig() {
         let xrayPort = 10001, pubKey = "", shortId = "", sni = "www.bing.com";
         try {
             const xc = JSON.parse(fs.readFileSync(CONFIG.xrayConfig, "utf8"));
-            const xi = xc.inbounds.find(i => i.tag === "vless-reality");
+            const xi = xc.inbounds.find(i => i.tag === "vless-direct" || i.tag === "vless-reality");
             if (xi) {
                 xrayPort = xi.port;
                 const dest = xi.streamSettings?.realitySettings?.dest || "";
@@ -1463,7 +1468,8 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                 // HY2 公共参数生成器
                 const buildHy2Url = (port, hopRange, label, includeObfs) => {
                     if (!user.password) return null;
-                    const auth = encodeURIComponent(`${user.username}:${user.password}`);
+                    // v3.5.0: 分段 encode（防止 : 被编码导致客户端无法拆分 user/pass）
+                    const auth = `${encodeURIComponent(user.username)}:${encodeURIComponent(user.password)}`;
                     let qp = `sni=${cfg.domain || serverIp}&insecure=0&mport=${hopRange}`;
                     if (includeObfs && cfg.obfs && cfg.obfs.enabled && cfg.obfs.type === "salamander" && cfg.obfs.password) {
                         qp += `&obfs=salamander&obfs-password=${encodeURIComponent(cfg.obfs.password)}`;
@@ -2070,7 +2076,7 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                         fs.writeFileSync(CONFIG.hysteriaConfig, hyc);
                         if (fs.existsSync(CONFIG.xrayConfig)) {
                             let xc = JSON.parse(fs.readFileSync(CONFIG.xrayConfig, "utf8"));
-                            const xi = xc.inbounds.find(i => i.tag === "vless-reality");
+                            const xi = xc.inbounds.find(i => i.tag === "vless-direct" || i.tag === "vless-reality");
                             if (xi && xi.streamSettings?.realitySettings) {
                                 xi.streamSettings.realitySettings.dest = domain + ":443";
                                 xi.streamSettings.realitySettings.serverNames = [domain];
