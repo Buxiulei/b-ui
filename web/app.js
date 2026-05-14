@@ -189,11 +189,13 @@ function addUser() {
     const s = $("#ns").value || 100;  // 默认 100Mbps 上下行带宽
     const proto = $("#nproto").value;
     const customSni = $("#nsni-custom")?.value || $("#nsni")?.value || "";
+    const residential = $("#nresi")?.checked !== false; // 默认 true
 
     let url = "/api/manage?key=" + encodeURIComponent(cfg.adminPass || localStorage.getItem("ap") || "") +
         "&action=create&user=" + encodeURIComponent(u) +
         (p ? "&pass=" + encodeURIComponent(p) : "") +
-        "&days=" + d + "&traffic=" + t + "&monthly=" + m + "&speed=" + s + "&protocol=" + proto;
+        "&days=" + d + "&traffic=" + t + "&monthly=" + m + "&speed=" + s + "&protocol=" + proto +
+        "&residential=" + (residential ? "true" : "false");
 
     if (customSni) url += "&sni=" + encodeURIComponent(customSni);
 

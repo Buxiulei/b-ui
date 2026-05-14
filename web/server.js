@@ -838,6 +838,8 @@ function handleManage(params, res) {
         const monthly = parseFloat(params.get("monthly")) || 0;
         const speed = parseFloat(params.get("speed")) || 100; // 默认 100Mbps
         const sni = params.get("sni") || "www.bing.com";
+        // v3.5.5: per-user 住宅代理订阅开关（默认 true 兼容现有用户）
+        const residential = params.get("residential") !== "false";
 
         // 创建新用户，同时生成 Hy2 和 VLESS 凭据以支持融合切换
         const hyPass = crypto.randomBytes(8).toString("hex");
@@ -853,7 +855,8 @@ function handleManage(params, res) {
             // 同时生成两种凭据
             password: passFromUrl || hyPass,  // Hy2 密码
             uuid: vlessUUID,                   // VLESS UUID
-            sni: sni
+            sni: sni,
+            residential: residential  // v3.5.5: 订阅是否包含 -住宅 后缀节点
         };
 
         if (days > 0) newUser.limits.expiresAt = new Date(Date.now() + days * 864e5).toISOString();
@@ -1457,13 +1460,18 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                     return `vless://${user.uuid}@${serverIp}:${port}?${vlessParams}#${name}`;
                 };
 
+                // v3.5.5: per-user 住宅开关（默认 true 向后兼容）
+                const includeResi = user.residential !== false;
+
                 // ① Reality 直连 (vless-direct :10001)
                 const r1 = buildVlessUrl(10001, "Reality直连");
                 if (r1) links.push(r1);
 
-                // ② Reality 住宅 (vless-residential :10002)
-                const r2 = buildVlessUrl(10002, "Reality住宅");
-                if (r2) links.push(r2);
+                // ② Reality 住宅 (vless-residential :10002) — 仅 user.residential 启用时输出
+                if (includeResi) {
+                    const r2 = buildVlessUrl(10002, "Reality住宅");
+                    if (r2) links.push(r2);
+                }
 
                 // HY2 公共参数生成器
                 const buildHy2Url = (port, hopRange, label, includeObfs) => {
@@ -1482,9 +1490,11 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                 const h1 = buildHy2Url(cfg.port || 10000, "20000-30000", "HY2直连", true);
                 if (h1) links.push(h1);
 
-                // ④ HY2 住宅 (:40000 + 41000-50000 hop)
-                const h2 = buildHy2Url(40000, "41000-50000", "HY2住宅", false);
-                if (h2) links.push(h2);
+                // ④ HY2 住宅 (:40000 + 41000-50000 hop) — 仅 user.residential 启用时输出
+                if (includeResi) {
+                    const h2 = buildHy2Url(40000, "41000-50000", "HY2住宅", false);
+                    if (h2) links.push(h2);
+                }
 
                 const base64Content = Buffer.from(links.join("\n")).toString("base64");
 
