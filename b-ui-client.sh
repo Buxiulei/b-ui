@@ -1340,7 +1340,9 @@ EOF
 #       误判为 DNS → hijack-dns 试解析失败，30 min 50 个 "bad rdata"/"buffer size too small" 噪音）
 #   5 = v3.4.44 加 UDP :7844 端口兜底（process_name 在 /proc race 时偶尔 miss，
 #       baiyi 实测 10 个噪音 ERROR 来自同一个 cloudflared session 漏网；端口规则不依赖 /proc）
-readonly TUN_SCHEMA_VERSION="5"
+#   6 = v3.5.0 DNS 加固 — generate config 时一次性预解析 server_host 到 IP，
+#       注入 dns.rules predefined 规则，运行时完全不查 DNS → 防 GFW bootstrap 投毒
+readonly TUN_SCHEMA_VERSION="6"
 
 generate_singbox_tun_config() {
     local protocol="$1"  # hysteria2 或 vless-reality
@@ -1351,6 +1353,22 @@ generate_singbox_tun_config() {
     # 解析服务器信息 (移除端口号中的非数字字符，如尾部斜杠)
     local server_host=$(echo "$SERVER_ADDR" | cut -d':' -f1)
     local server_port=$(echo "$SERVER_ADDR" | cut -d':' -f2 | tr -cd '0-9')
+
+    # v3.5: 预解析 server_host 到 IP，写入 dns.rules predefined 规则
+    # 防止 GFW 投毒 server_host 域名导致客户端无法连上 server（bootstrap 投毒漏洞）
+    local server_predefined_rule=""
+    if [[ ! "$server_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        local server_ip_resolved
+        server_ip_resolved=$(dig +short "$server_host" A 2>/dev/null \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+        [[ -z "$server_ip_resolved" ]] && \
+            server_ip_resolved=$(getent ahostsv4 "$server_host" 2>/dev/null \
+                | awk '{print $1; exit}')
+        if [[ "$server_ip_resolved" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            server_predefined_rule=",
+      { \"domain\": [\"${server_host}\"], \"action\": \"predefined\", \"answer\": [\"${server_host}. IN A ${server_ip_resolved}\"] }"
+        fi
+    fi
     
     # 根据协议生成不同的 outbound
     local outbound_config=""
@@ -1442,7 +1460,7 @@ OUTBOUND
       }
     ],
     "rules": [
-      { "domain_suffix": [".qq.com", ".wechat.com", ".tencent.com", ".myqcloud.com", ".xiaohongshu.com", ".douyin.com", ".bytedance.com", ".toutiao.com", ".kuaishou.com", ".bilibili.com", ".taobao.com", ".alibaba.com", ".alipay.com", ".aliyuncs.com", ".tmall.com", ".jd.com", ".baidu.com", ".cn"], "server": "local-dns" }
+      { "domain_suffix": [".qq.com", ".wechat.com", ".tencent.com", ".myqcloud.com", ".xiaohongshu.com", ".douyin.com", ".bytedance.com", ".toutiao.com", ".kuaishou.com", ".bilibili.com", ".taobao.com", ".alibaba.com", ".alipay.com", ".aliyuncs.com", ".tmall.com", ".jd.com", ".baidu.com", ".cn"], "server": "local-dns" }${server_predefined_rule}
     ],
     "final": "proxy-dns",
     "strategy": "ipv4_only"

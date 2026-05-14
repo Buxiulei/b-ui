@@ -105,27 +105,48 @@ detect_best_bbr_algo() {
 #===============================================================================
 
 install_hysteria() {
-    print_info "正在安装 Hysteria2..."
-    
+    print_info "正在安装 Hysteria2（双实例：direct + residential）..."
+
     if command -v hysteria &> /dev/null; then
         print_warning "Hysteria2 已安装，版本: $(hysteria version 2>/dev/null | head -n1)"
         read -p "是否重新安装/升级？(y/n): " reinstall
         if [[ "$reinstall" != "y" && "$reinstall" != "Y" ]]; then
-            return
+            : # 二进制不重装，但仍要生成 systemd unit（首次升级到 v3.5 必经路径）
+        else
+            HYSTERIA_USER=root bash <(curl -fsSL https://get.hy2.sh/)
         fi
+    else
+        HYSTERIA_USER=root bash <(curl -fsSL https://get.hy2.sh/)
     fi
-    
-    HYSTERIA_USER=root bash <(curl -fsSL https://get.hy2.sh/)
-    
-    if command -v hysteria &> /dev/null; then
-        print_success "Hysteria2 安装成功！"
-        
-        mkdir -p "$BASE_DIR"
-        
-        # 创建 systemd 服务覆盖配置
-        # 添加服务依赖和资源隔离设置，避免 Hysteria2 和 Xray 相互干扰
-        mkdir -p /etc/systemd/system/hysteria-server.service.d
-        cat > /etc/systemd/system/hysteria-server.service.d/override.conf << EOF
+
+    if ! command -v hysteria &> /dev/null; then
+        print_error "Hysteria2 安装失败"
+        exit 1
+    fi
+    print_success "Hysteria2 二进制就绪"
+
+    mkdir -p "$BASE_DIR"
+
+    # ────────────────────────────────────────────────────────────────────
+    # 写 nft 清理 helper（两个 unit 共享）
+    # ────────────────────────────────────────────────────────────────────
+    cat > /opt/b-ui/hy2-nft-cleanup.sh <<'CLEANUP_EOF'
+#!/bin/sh
+# 删除所有 hysteria_* nft 表（family + name 配对遍历）
+# 用于 hy2 ExecStartPre：清理 SIGKILL/OOM 残留的孤儿规则
+nft list tables 2>/dev/null | awk '/^table .* hysteria_/{print $2,$3}' | while read fam name; do
+    nft delete table "$fam" "$name" 2>/dev/null || true
+done
+exit 0
+CLEANUP_EOF
+    chmod 755 /opt/b-ui/hy2-nft-cleanup.sh
+
+    # ────────────────────────────────────────────────────────────────────
+    # 实例 1: hysteria-server.service (direct) — 监听 :10000+20000-30000
+    # 保留旧 unit 名兼容老订阅 URL（vless@host:10000 仍指向 direct）
+    # ────────────────────────────────────────────────────────────────────
+    mkdir -p /etc/systemd/system/hysteria-server.service.d
+    cat > /etc/systemd/system/hysteria-server.service.d/override.conf << EOF
 [Unit]
 # 与 Xray 服务解耦，确保独立运行
 # Hysteria2 使用 QUIC (UDP)，Xray 使用 TCP，互不干扰
@@ -166,39 +187,56 @@ Restart=always
 RestartSec=3
 EOF
 
-        # 写入 nft 清理 helper（幂等，被 ExecStartPre 调用）
-        cat > /opt/b-ui/hy2-nft-cleanup.sh <<'CLEANUP_EOF'
-#!/bin/sh
-# 删除所有 hysteria_* nft 表（family + name 配对遍历）
-# 用于 hy2 ExecStartPre：清理 SIGKILL/OOM 残留的孤儿规则
-# 退出码恒为 0（- 前缀已让 systemd 忽略错误，但稳妥起见还是 || true）
-nft list tables 2>/dev/null | awk '/^table .* hysteria_/{print $2,$3}' | while read fam name; do
-    nft delete table "$fam" "$name" 2>/dev/null || true
-done
-exit 0
-CLEANUP_EOF
-        chmod 755 /opt/b-ui/hy2-nft-cleanup.sh
+    # ────────────────────────────────────────────────────────────────────
+    # 实例 2: hysteria-residential.service — 监听 :40000+41000-50000
+    # 出战指向 socks5 127.0.0.1:2080 (b-ui-relay sing-box 自动选住宅 URL)
+    # ────────────────────────────────────────────────────────────────────
+    cat > /etc/systemd/system/hysteria-residential.service <<'UNIT_EOF'
+[Unit]
+Description=Hysteria Server (Residential) Service
+Documentation=https://v2.hysteria.network/
+After=network.target network-online.target
+Wants=network-online.target
 
-        systemctl daemon-reload
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hysteria server --config /opt/b-ui/config-residential.yaml
+WorkingDirectory=/etc/hysteria
+User=root
+Group=root
+LimitNPROC=512
+LimitNOFILE=1048576
+CPUSchedulingPolicy=other
+Nice=-5
+Environment=GOMEMLIMIT=200MiB
+Environment=HYSTERIA_LOG_LEVEL=warn
+MemoryHigh=300M
+MemoryMax=500M
+ExecStartPre=-/opt/b-ui/hy2-nft-cleanup.sh
+TimeoutStopSec=15
+Restart=always
+RestartSec=3
 
-        # 小内存机器（≤2G）自动降低 swappiness，避免 hysteria 工作集被换出导致卡顿
-        local mem_mb
-        mem_mb=$(awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo)
-        if [[ $mem_mb -le 2048 ]]; then
-            print_info "检测到物理内存 ${mem_mb}MB ≤ 2G，应用 swappiness 优化"
-            cat > /etc/sysctl.d/99-b-ui-memory.conf <<'SYSCTL_EOF'
+[Install]
+WantedBy=multi-user.target
+UNIT_EOF
+
+    systemctl daemon-reload
+
+    # 小内存机器（≤2G）自动降低 swappiness，避免 hysteria 工作集被换出导致卡顿
+    local mem_mb
+    mem_mb=$(awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo)
+    if [[ $mem_mb -le 2048 ]]; then
+        print_info "检测到物理内存 ${mem_mb}MB ≤ 2G，应用 swappiness 优化"
+        cat > /etc/sysctl.d/99-b-ui-memory.conf <<'SYSCTL_EOF'
 # b-ui 内存策略：小内存机器（≤2G）降低 swap 倾向
-# 配合 hysteria-server.service 的 GOMEMLIMIT/MemoryHigh/MemoryMax 一起生效
+# 配合 hysteria 两个实例的 GOMEMLIMIT/MemoryHigh/MemoryMax 一起生效
 vm.swappiness = 10
 SYSCTL_EOF
-            sysctl -p /etc/sysctl.d/99-b-ui-memory.conf >/dev/null 2>&1 && \
-                print_success "swappiness 已设为 10"
-        else
-            print_info "物理内存 ${mem_mb}MB > 2G，保持系统默认 swappiness"
-        fi
+        sysctl -p /etc/sysctl.d/99-b-ui-memory.conf >/dev/null 2>&1 && \
+            print_success "swappiness 已设为 10"
     else
-        print_error "Hysteria2 安装失败"
-        exit 1
+        print_info "物理内存 ${mem_mb}MB > 2G，保持系统默认 swappiness"
     fi
 }
 
@@ -427,38 +465,39 @@ configure_hysteria() {
 EOF
     
     # 决定 listen 字段：启用端口跳跃时使用 hysteria 2.9+ 内置多端口语法
-    # （比 iptables REDIRECT 干净：hysteria 自管 nftables，shutdown 自动清理）
-    local listen_value=":${PORT}"
+    local direct_listen=":${PORT}"
     if [[ "$PORT_HOPPING_ENABLED" =~ ^[yY]$ ]]; then
-        listen_value=":${PORT},${PORT_HOPPING_START:-20000}-${PORT_HOPPING_END:-30000}"
+        direct_listen=":${PORT},${PORT_HOPPING_START:-20000}-${PORT_HOPPING_END:-30000}"
     fi
+    local resi_listen=":40000,41000-50000"
+    local resi_traffic_port="9998"
 
-    # 生成配置文件（使用 HTTP 认证支持用户级别限速）
+    # ────────────────────────────────────────────────────────────────────
+    # 配置 1：config.yaml — hysteria-direct (无 outbounds 块，hy2 内置 direct)
+    # ────────────────────────────────────────────────────────────────────
     cat > "$CONFIG_FILE" << EOF
-# Hysteria2 服务器配置 (v2.9.0)
+# Hysteria2 服务器配置 — Direct 实例 (v3.5)
 # 生成时间: $(date)
 
-# 端口跳跃：hysteria 2.9+ 内置多端口绑定，降低 ISP 对单 UDP 端口的 QoS 命中率
-# 单端口流量明显，多端口可让 ISP 难以定向限速；hysteria 自动管理 nftables/iptables
-listen: ${listen_value}
+listen: ${direct_listen}
 
 tls:
   sniGuard: disable
   cert: ${CERTS_DIR}/fullchain.pem
   key: ${CERTS_DIR}/privkey.pem
 
-# QUIC 接收窗口使用 hysteria 默认值（8 MiB stream / 20 MiB conn）
-# 旧版本写死 64 MiB conn 窗口在 1G 小机器上会导致每会话占用 ~80MB 内存
-# 默认值在 200ms RTT 下单连接吞吐约 670 Mbps，对绝大多数 VPS 已够用
 quic:
-  # maxIdleTimeout 默认 30s，源码硬上限 120s；60s 在抖动链路下兼顾稳定与连接回收速度
   maxIdleTimeout: 60s
 
-# 强制走服务端拥塞控制（BBR/Reno），忽略客户端 Brutal 宣告
-# 多用户共享 VPS 必开：防一个客户端宣告 1Gbps Brutal 抢光带宽
 ignoreClientBandwidth: true
 
-# HTTP 认证 (支持用户级别限速)
+# DoH 防 DNS 投毒（hy2 v2.x 原生支持）
+resolver:
+  type: https
+  https:
+    addr: "1.1.1.1:443"
+    sni: cloudflare-dns.com
+
 auth:
   type: http
   http:
@@ -480,18 +519,75 @@ sniff:
   timeout: 2s
   rewriteDomain: true
   tcpPorts: 80,443,8000-9000
-  # UDP 嗅探仅限 443 (QUIC/HTTP3) 和 53 (DoH/DoQ)；'all' 会让 hysteria 嗅探所有 UDP 端口
-  # 在游戏/视频会议等高频小包场景下可能误中，徒增 CPU 与误判
   udpPorts: 443,53
-
-# B-UI:RESIDENTIAL-START
-# B-UI:RESIDENTIAL-END
 EOF
 
-    chmod 644 "$CONFIG_FILE"
-    chmod 644 "$USERS_FILE"
-    
-    print_success "配置文件已生成: $CONFIG_FILE (HTTP 认证模式)"
+    # ────────────────────────────────────────────────────────────────────
+    # 配置 2：config-residential.yaml — hysteria-residential
+    # 流量出战指向 127.0.0.1:2080 (b-ui-relay sing-box 决定 direct or 住宅池)
+    # ────────────────────────────────────────────────────────────────────
+    cat > "${BASE_DIR}/config-residential.yaml" << EOF
+# Hysteria2 服务器配置 — Residential 实例 (v3.5)
+# 出战 SOCKS5 → b-ui-relay sing-box → direct 或 住宅 URL urltest 池
+# 生成时间: $(date)
+
+listen: ${resi_listen}
+
+tls:
+  sniGuard: disable
+  cert: ${CERTS_DIR}/fullchain.pem
+  key: ${CERTS_DIR}/privkey.pem
+
+quic:
+  maxIdleTimeout: 60s
+
+ignoreClientBandwidth: true
+
+resolver:
+  type: https
+  https:
+    addr: "1.1.1.1:443"
+    sni: cloudflare-dns.com
+
+auth:
+  type: http
+  http:
+    url: http://127.0.0.1:8080/auth/hysteria
+    insecure: false
+
+trafficStats:
+  listen: 127.0.0.1:${resi_traffic_port}
+  secret: ""
+
+masquerade:
+  type: proxy
+  proxy:
+    url: ${MASQUERADE_URL}
+    rewriteHost: true
+
+sniff:
+  enable: true
+  timeout: 2s
+  rewriteDomain: true
+  tcpPorts: 80,443,8000-9000
+  udpPorts: 443,53
+
+outbounds:
+  - name: relay
+    type: socks5
+    socks5:
+      addr: "127.0.0.1:2080"
+  - name: direct
+    type: direct
+
+acl:
+  inline:
+    - relay(all)
+EOF
+
+    chmod 644 "$CONFIG_FILE" "${BASE_DIR}/config-residential.yaml" "$USERS_FILE"
+
+    print_success "Hysteria 双配置已生成: config.yaml (direct) + config-residential.yaml (resi)"
 }
 
 #===============================================================================
@@ -584,11 +680,35 @@ configure_xray() {
     "levels": {"0": {"statsUserUplink": true, "statsUserDownlink": true}},
     "system": {"statsInboundUplink": true, "statsInboundDownlink": true}
   },
+  "dns": {
+    "servers": [
+      "https+local://1.1.1.1/dns-query",
+      "8.8.8.8"
+    ],
+    "queryStrategy": "UseIPv4"
+  },
   "inbounds": [
     {"tag": "api", "port": 10085, "listen": "127.0.0.1", "protocol": "dokodemo-door", "settings": {"address": "127.0.0.1"}},
     {
-      "tag": "vless-reality",
+      "tag": "vless-direct",
       "port": 10001,
+      "protocol": "vless",
+      "settings": {"clients": [], "decryption": "none"},
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "dest": "${masq_domain}:443",
+          "serverNames": ["${masq_domain}"],
+          "privateKey": "$privkey",
+          "shortIds": ["$shortid"]
+        }
+      },
+      "sniffing": {"enabled": true, "destOverride": ["http", "tls"]}
+    },
+    {
+      "tag": "vless-residential",
+      "port": 10002,
       "protocol": "vless",
       "settings": {"clients": [], "decryption": "none"},
       "streamSettings": {
@@ -604,12 +724,21 @@ configure_xray() {
       "sniffing": {"enabled": true, "destOverride": ["http", "tls"]}
     }
   ],
-  "outbounds": [{"protocol": "freedom", "tag": "direct"}],
-  "routing": {"rules": [{"type": "field", "inboundTag": ["api"], "outboundTag": "api"}]}
+  "outbounds": [
+    {"tag": "direct", "protocol": "freedom"},
+    {"tag": "relay", "protocol": "socks", "settings": {"servers": [{"address": "127.0.0.1", "port": 2080}]}}
+  ],
+  "routing": {
+    "rules": [
+      {"type": "field", "inboundTag": ["api"], "outboundTag": "api"},
+      {"type": "field", "inboundTag": ["vless-direct"], "outboundTag": "direct"},
+      {"type": "field", "inboundTag": ["vless-residential"], "outboundTag": "relay"}
+    ]
+  }
 }
 EOF
     chmod 644 "$BASE_DIR/xray-config.json"
-    print_success "Xray 配置已生成"
+    print_success "Xray 配置已生成（双 inbound：vless-direct + vless-residential）"
 }
 
 #===============================================================================
@@ -999,37 +1128,84 @@ configure_firewall() {
     local port=${PORT:-10000}
     local start_port=${PORT_HOPPING_START:-20000}
     local end_port=${PORT_HOPPING_END:-30000}
-    
+    # v3.5: 住宅 hy2 实例端口
+    local resi_port=40000
+    local resi_hop_start=41000
+    local resi_hop_end=50000
+    # v3.5: xray 双 inbound 端口
+    local xray_direct=10001
+    local xray_resi=10002
+
     print_info "配置防火墙..."
-    
+
     if command -v ufw &> /dev/null && ufw status | grep -q "active"; then
         ufw allow 22/tcp
         ufw allow ${port}/udp
         ufw allow ${port}/tcp
         ufw allow 80/tcp
         ufw allow 443/tcp
-        ufw allow 10001/tcp
-        # 端口跳跃范围
+        ufw allow ${xray_direct}/tcp
+        ufw allow ${xray_resi}/tcp                  # v3.5 vless-residential
+        ufw allow ${resi_port}/udp                  # v3.5 hy2-residential
         if [[ "$PORT_HOPPING_ENABLED" =~ ^[yY]$ ]]; then
             ufw allow ${start_port}:${end_port}/udp
             print_success "ufw 端口跳跃范围 ${start_port}:${end_port}/udp 已开放"
         fi
-        print_success "ufw 规则已添加"
+        ufw allow ${resi_hop_start}:${resi_hop_end}/udp   # v3.5 hy2-residential hop
+        print_success "ufw 规则已添加（含 v3.5 住宅实例端口 ${resi_port}+${resi_hop_start}-${resi_hop_end}）"
     elif command -v firewall-cmd &> /dev/null && systemctl is-active --quiet firewalld; then
         firewall-cmd --permanent --add-port=22/tcp
         firewall-cmd --permanent --add-port=${port}/udp
         firewall-cmd --permanent --add-port=${port}/tcp
         firewall-cmd --permanent --add-port=80/tcp
         firewall-cmd --permanent --add-port=443/tcp
-        firewall-cmd --permanent --add-port=10001/tcp
-        # 端口跳跃范围
+        firewall-cmd --permanent --add-port=${xray_direct}/tcp
+        firewall-cmd --permanent --add-port=${xray_resi}/tcp
+        firewall-cmd --permanent --add-port=${resi_port}/udp
         if [[ "$PORT_HOPPING_ENABLED" =~ ^[yY]$ ]]; then
             firewall-cmd --permanent --add-port=${start_port}-${end_port}/udp
             print_success "firewalld 端口跳跃范围 ${start_port}-${end_port}/udp 已开放"
         fi
+        firewall-cmd --permanent --add-port=${resi_hop_start}-${resi_hop_end}/udp
         firewall-cmd --reload
-        print_success "firewalld 规则已添加"
+        print_success "firewalld 规则已添加（含 v3.5 住宅实例端口）"
     fi
+}
+
+#===============================================================================
+# v3.5: 静态 DNS — 锁 /etc/resolv.conf 防 systemd-resolved 改 + 防 GFW 投毒兜底
+#===============================================================================
+
+setup_static_dns() {
+    print_info "配置静态 DNS（绕 systemd-resolved，DoH 防投毒在 hy2/xray 自己的 resolver）..."
+
+    # 关停 systemd-resolved（实测会挂 + 它管的 /etc/resolv.conf 是 stub 127.0.0.53）
+    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        systemctl disable --now systemd-resolved 2>/dev/null || true
+        print_info "  ✓ 已停 systemd-resolved"
+    fi
+
+    # 若 /etc/resolv.conf 是 systemd-resolved 的 symlink，删了重写
+    if [[ -L /etc/resolv.conf ]]; then
+        rm -f /etc/resolv.conf
+    fi
+
+    # 解锁老的 immutable 标志（如果之前锁过）
+    chattr -i /etc/resolv.conf 2>/dev/null || true
+
+    cat > /etc/resolv.conf <<'RESOLV_EOF'
+# B-UI v3.5: 静态 DNS（防 systemd-resolved 挂死 + 防 GFW UDP 投毒兜底）
+# hy2/xray/sing-box 自己用 DoH 解析，这里给 cron/apt/curl 等次要进程用
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+nameserver 9.9.9.9
+options edns0 timeout:2 attempts:2 single-request
+RESOLV_EOF
+
+    # immutable 锁住，防止任何进程修改（NetworkManager / dhclient 都拦下）
+    chattr +i /etc/resolv.conf 2>/dev/null && \
+        print_success "  ✓ /etc/resolv.conf 写入并 chattr +i 锁定（1.1.1.1 + 8.8.8.8 + 9.9.9.9）" || \
+        print_warning "  ⚠ chattr +i 失败（文件系统可能不支持），DNS 仍配置但未锁定"
 }
 
 #===============================================================================
