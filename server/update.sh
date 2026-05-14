@@ -1309,6 +1309,18 @@ EOF
         updated=1
     fi
 
+    # A.fix (v3.5.2): 老 hysteria-residential.service 含 ExecStartPre nft cleanup 行（互删另一实例 nft 表）
+    # A 块文件存在 guard 让旧 unit 不被重写，这里专门 sed 修补 + 重启
+    if [[ -f /etc/systemd/system/hysteria-residential.service ]] && \
+       grep -q "ExecStartPre=-/opt/b-ui/hy2-nft-cleanup.sh" /etc/systemd/system/hysteria-residential.service; then
+        print_info "v3.5.2 fix: 删除 hysteria-residential.service ExecStartPre nft cleanup 行"
+        sed -i '/^ExecStartPre=-\/opt\/b-ui\/hy2-nft-cleanup\.sh/d' /etc/systemd/system/hysteria-residential.service
+        systemctl daemon-reload
+        systemctl restart hysteria-residential
+        print_info "  ✓ ExecStartPre 已移除，hy2-residential 重启完成"
+        updated=1
+    fi
+
     # B. xray 双 inbound 迁移
     if [[ -f "${BASE_DIR}/xray-config.json" ]] && \
        ! jq -e '.inbounds[] | select(.tag == "vless-residential")' "${BASE_DIR}/xray-config.json" &>/dev/null; then
