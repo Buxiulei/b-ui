@@ -275,26 +275,38 @@
                 </div>
                 <h3>住宅 IP 出站</h3>
             </div>
-            <div class="resi-desc">OpenAI / Google / Claude 流量走住宅 IP，其余流量直出 VPS。</div>
+            <div class="resi-desc">v3.5: 多 URL urltest 池 + 全局/分流切换。住宅 URL 池非空时 -住宅 节点走池子，否则 fallback 直连。</div>
             <div id="resi-status" class="resi-status-card">
                 <div class="resi-shimmer-line" style="width:55%"></div>
             </div>
-            <div class="resi-input-wrap">
-                <input type="password" id="resi-url" class="resi-url-input"
-                       placeholder="socks5://user:pass@host:port" autocomplete="new-password">
-                <div class="resi-input-actions">
-                    <button class="resi-icon-btn" id="resi-eye-btn" type="button"
-                            onclick="resiToggleEye()" title="显示/隐藏">
-                        <svg id="resi-eye-open" xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
-                        <svg id="resi-eye-closed" xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="display:none"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
-                    </button>
-                    <button class="resi-icon-btn" id="resi-copy-btn" type="button"
-                            onclick="resiCopyUrl(this)" title="复制">
-                        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-                    </button>
+            <!-- v3.5.0: 全局模式开关 -->
+            <div class="resi-global-row">
+                <div class="resi-global-label">
+                    <span class="resi-global-title">全局模式</span>
+                    <span class="resi-global-hint" id="resi-global-hint">域名分流</span>
+                </div>
+                <label class="switch">
+                    <input type="checkbox" id="resi-global-toggle" onchange="toggleResidentialGlobal(this.checked)">
+                    <span class="slider"></span>
+                </label>
+            </div>
+            <!-- v3.5.0: 多 URL 列表 + 添加 -->
+            <div class="resi-urls-section">
+                <div class="resi-urls-header">
+                    <span class="resi-urls-title">代理节点池</span>
+                    <button class="btn btn-secondary resi-add-btn" type="button" onclick="openAddResiUrl()">+ 添加 URL</button>
+                </div>
+                <div id="resi-urls-table" class="resi-urls-table"></div>
+                <div id="resi-add-url-wrap" class="resi-add-url-wrap" style="display:none">
+                    <input type="text" id="resi-new-url" class="resi-new-url-input"
+                           placeholder="socks5://user:pass@host:port" autocomplete="off">
+                    <div class="resi-add-url-actions">
+                        <button class="btn btn-secondary resi-update-btn" type="button" onclick="cancelAddResiUrl()">取消</button>
+                        <button class="btn resi-btn-save resi-update-btn" type="button" onclick="addResidentialUrl()">确认添加</button>
+                    </div>
+                    <div class="resi-field-hint">格式: socks5://user:pass@host:port 或 host:port:user:pass</div>
                 </div>
             </div>
-            <div class="resi-field-hint">支持格式: socks5://user:pass@host:port 或 host:port:user:pass</div>
             <div id="resi-error" class="resi-error-box" style="display:none">
                 <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
                 <span id="resi-error-text"></span>
@@ -312,10 +324,9 @@
                     <button class="btn btn-secondary resi-update-btn" onclick="saveDomainsOnly()">仅更新分流域名</button>
                 </div>
             </details>
-            <div class="resi-actions">
-                <button class="btn btn-secondary" onclick="closeM()">取消</button>
-                <button class="btn resi-btn-disable" id="resi-disable-btn" onclick="disableResi()">禁用</button>
-                <button class="btn resi-btn-save" onclick="saveResi()">保存启用</button>
+            <div class="resi-actions" style="grid-template-columns:1fr 1fr">
+                <button class="btn btn-secondary" onclick="closeM()">关闭</button>
+                <button class="btn resi-btn-disable" id="resi-disable-btn" onclick="disableResi()">全部禁用</button>
             </div>
         </div>
     </div>

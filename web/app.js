@@ -531,14 +531,113 @@ function _resiErr(msg) {
 }
 function _resiClearErr() { $("#resi-error").style.display = "none"; }
 
+// v3.5.0: 渲染住宅 URL 池表格
+function renderResidentialUrls(urls) {
+    const table = $("#resi-urls-table");
+    if (!table) return;
+    table.replaceChildren();
+    if (!urls || !urls.length) {
+        const empty = document.createElement("div");
+        empty.className = "resi-urls-empty";
+        empty.textContent = "暂无代理节点，点击「+ 添加 URL」添加";
+        table.appendChild(empty);
+        return;
+    }
+    urls.forEach(u => {
+        const row = document.createElement("div");
+        row.className = "resi-url-row";
+        const info = document.createElement("div");
+        info.className = "resi-url-info";
+        const name = document.createElement("span");
+        name.className = "resi-url-name";
+        name.textContent = u.name || u.host;
+        const addr = document.createElement("span");
+        addr.className = "resi-url-addr";
+        addr.textContent = u.host + ":" + u.port + (u.username ? " (" + u.username + ")" : "");
+        info.append(name, addr);
+        const delBtn = document.createElement("button");
+        delBtn.className = "resi-icon-btn resi-del-btn";
+        delBtn.title = "删除";
+        delBtn.type = "button";
+        delBtn.textContent = "✕";
+        const hostPort = encodeURIComponent(u.host + ":" + u.port);
+        delBtn.onclick = () => removeResidentialUrl(hostPort);
+        row.append(info, delBtn);
+        table.appendChild(row);
+    });
+}
+
+function openAddResiUrl() {
+    _resiClearErr();
+    const wrap = $("#resi-add-url-wrap");
+    if (wrap) wrap.style.display = "";
+    const inp = $("#resi-new-url");
+    if (inp) { inp.value = ""; inp.focus(); }
+}
+
+function cancelAddResiUrl() {
+    const wrap = $("#resi-add-url-wrap");
+    if (wrap) wrap.style.display = "none";
+    const inp = $("#resi-new-url");
+    if (inp) inp.value = "";
+    _resiClearErr();
+}
+
+function addResidentialUrl() {
+    const inp = $("#resi-new-url");
+    const url = inp ? inp.value.trim() : "";
+    _resiClearErr();
+    if (!url) { _resiErr("请填写代理 URL"); return; }
+    api("/residential/urls", { method: "POST", body: JSON.stringify({ url }) }).then(r => {
+        if (r.success) { cancelAddResiUrl(); toast("节点已添加"); _resiReload(); }
+        else _resiErr(r.error || "添加失败");
+    }).catch(e => _resiErr(e.message || "请求失败"));
+}
+
+function removeResidentialUrl(hostPort) {
+    _resiClearErr();
+    api("/residential/urls/" + hostPort, { method: "DELETE" }).then(r => {
+        if (r.success) { toast("节点已移除"); _resiReload(); }
+        else _resiErr(r.error || "移除失败");
+    }).catch(e => _resiErr(e.message || "请求失败"));
+}
+
+function toggleResidentialGlobal(checked) {
+    api("/residential/global", { method: "POST", body: JSON.stringify({ global: checked }) }).then(r => {
+        if (r.success) {
+            const hint = $("#resi-global-hint");
+            if (hint) hint.textContent = checked ? "全走住宅" : "域名分流";
+            toast(checked ? "已切换为全局模式" : "已切换为域名分流");
+        } else {
+            _resiErr(r.error || "切换失败");
+            const tog = $("#resi-global-toggle");
+            if (tog) tog.checked = !checked;
+        }
+    }).catch(e => {
+        _resiErr(e.message || "请求失败");
+        const tog = $("#resi-global-toggle");
+        if (tog) tog.checked = !checked;
+    });
+}
+
+function _resiReload() {
+    api("/residential").then(r => {
+        renderResidentialUrls(r.urls || []);
+        const disBtn = $("#resi-disable-btn");
+        const tog = $("#resi-global-toggle");
+        const hint = $("#resi-global-hint");
+        if (disBtn) disBtn.style.display = (r.enabled ? "" : "none");
+        if (tog) tog.checked = !!r.global;
+        if (hint) hint.textContent = r.global ? "全走住宅" : "域名分流";
+    }).catch(() => {});
+}
+
 function openResi() {
     const statusEl  = $("#resi-status");
-    const urlEl     = $("#resi-url");
     const disBtn    = $("#resi-disable-btn");
     const domainsEl = $("#resi-domains");
     const countEl   = $("#resi-domains-count");
 
-    // Reset to shimmer loading state
     statusEl.className = "resi-status-card";
     statusEl.textContent = "";
     const shimmer = document.createElement("div");
@@ -546,12 +645,9 @@ function openResi() {
     shimmer.style.width = "55%";
     statusEl.appendChild(shimmer);
 
-    urlEl.value = "";
-    urlEl.type = "password";
-    const eyeOpen   = $("#resi-eye-open");
-    const eyeClosed = $("#resi-eye-closed");
-    if (eyeOpen)   eyeOpen.style.display   = "";
-    if (eyeClosed) eyeClosed.style.display = "none";
+    const table = $("#resi-urls-table");
+    if (table) table.replaceChildren();
+    cancelAddResiUrl();
     _resiClearErr();
     $("#resi-domains-details").removeAttribute("open");
     openM("m-resi");
@@ -588,19 +684,24 @@ function openResi() {
                 isp.textContent = r.lastVerifiedIspInfo;
                 statusEl.appendChild(isp);
             }
-            urlEl.placeholder = r.displayUrl || "socks5://user:pass@host:port";
-            disBtn.style.display = "";
+            if (disBtn) disBtn.style.display = "";
         } else {
             statusEl.className = "resi-status-card";
             statusEl.appendChild(row);
-            disBtn.style.display = "none";
+            if (disBtn) disBtn.style.display = "none";
         }
 
+        renderResidentialUrls(r.urls || []);
+        const tog = $("#resi-global-toggle");
+        const hint = $("#resi-global-hint");
+        if (tog) tog.checked = !!r.global;
+        if (hint) hint.textContent = r.global ? "全走住宅" : "域名分流";
+
         if (r.domains && r.domains.length) {
-            domainsEl.value = r.domains.join("\n");
+            if (domainsEl) domainsEl.value = r.domains.join("\n");
             if (countEl) countEl.textContent = r.domains.length;
         } else {
-            domainsEl.value = "";
+            if (domainsEl) domainsEl.value = "";
             if (countEl) countEl.textContent = "";
         }
     }).catch(() => {
@@ -613,54 +714,10 @@ function openResi() {
     });
 }
 
-function resiToggleEye() {
-    const input     = $("#resi-url");
-    const eyeOpen   = $("#resi-eye-open");
-    const eyeClosed = $("#resi-eye-closed");
-    if (input.type === "password") {
-        input.type = "text";
-        if (eyeOpen)   eyeOpen.style.display   = "none";
-        if (eyeClosed) eyeClosed.style.display = "";
-    } else {
-        input.type = "password";
-        if (eyeOpen)   eyeOpen.style.display   = "";
-        if (eyeClosed) eyeClosed.style.display = "none";
-    }
-}
-
-function resiCopyUrl(btn) {
-    const input = $("#resi-url");
-    const text  = input.value.trim();
-    if (!text) return;
-    navigator.clipboard.writeText(text).then(() => {
-        btn.classList.add("flash");
-        setTimeout(() => btn.classList.remove("flash"), 1400);
-    }).catch(() => {});
-}
-
 function _parseDomains() {
     const raw = $("#resi-domains").value.trim();
     if (!raw) return null;
     return raw.split("\n").map(d => d.trim()).filter(Boolean);
-}
-
-function saveResi() {
-    const url = $("#resi-url").value.trim();
-    _resiClearErr();
-    if (!url) { _resiErr("请填写凭据 URL"); return; }
-    const body = { url };
-    const domains = _parseDomains();
-    if (domains) body.domains = domains;
-    api("/residential", { method: "POST", body: JSON.stringify(body) }).then(r => {
-        if (r.success) {
-            closeM();
-            toast("住宅 IP 已启用，出口 IP: " + (r.exitIp || ""));
-        } else {
-            _resiErr(r.error || "保存失败");
-        }
-    }).catch(e => {
-        _resiErr(e.message || "请求失败");
-    });
 }
 
 function saveDomainsOnly() {
