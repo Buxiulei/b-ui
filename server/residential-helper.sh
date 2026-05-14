@@ -226,7 +226,7 @@ write_singbox_config_residential_multi() {
                 "tag": "resi-pool",
                 "outbounds": $outbound_tags,
                 "url": "https://www.gstatic.com/generate_204",
-                "interval": "30s",
+                "interval": "10s",
                 "tolerance": 50
               },
               {"type": "direct", "tag": "direct"}]

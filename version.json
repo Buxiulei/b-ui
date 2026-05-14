@@ -1,5 +1,5 @@
 {
-    "version": "3.5.3",
+    "version": "3.5.4",
     "updated": "2026-05-14",
     "files": [
         "install.sh",
@@ -16,6 +16,7 @@
         "b-ui-client.sh"
     ],
     "changelog": {
+        "3.5.4": "tune: sing-box urltest probe interval 30s → 10s。住宅池切换更灵敏，挂节点恢复时间从最长 30s 降到 10s。代价是每 10s 对每个住宅 URL 探测一次 https://www.gstatic.com/generate_204（小流量），N 个 URL 每分钟 6N 次探测请求。",
         "3.5.3": "fix(ui): 住宅 IP 出站面板缺『启用』开关。v3.5.0 设计把启用动作隐藏到『+ 添加 URL』后端 helper enable --add，但 UI 上『未启用』标签是只读的，用户看不到怎么明确启用。修复：在状态行加 iOS toggle 开关作为主启用控制（点亮 → POST /api/residential/enable 触发 helper reapply 设 enabled=true；点灭 → DELETE /api/residential 走 disable）。新 API POST /api/residential/enable 检查池非空才允许启用。",
         "3.5.2": "fix(server): v3.5.1 漏改 hysteria-residential.service 主 unit 文件（A 块 guard '文件不存在才装' 跳过 update）。bwg-tizi/bwg-temp 部署 v3.5.1 后 hy2-residential nft 端口跳跃表 (`hysteria_76f34edc`) 仍然消失，因为旧 unit 文件中 `ExecStartPre=-/opt/b-ui/hy2-nft-cleanup.sh` 还在。**v3.5.2**：update.sh 加 A.fix 块独立检测 hysteria-residential.service 是否含 nft cleanup ExecStartPre，含则 sed 删除该行 + daemon-reload + restart hy2-residential，使老 deploy 自动 patch。手动 fix 已在 bwg-tizi/bwg-temp 应用，本提交确保未来 update.sh 跑也能自愈。",
         "3.5.1": "fix(server): 删除 hy2 unit 的 ExecStartPre nft cleanup —— 两实例共用脚本互删 nft 端口跳跃表，导致 HY2住宅 (UDP :40000+:41000-50000) 端口跳跃失效。bwg-tizi/bwg-temp 上 v3.5.0 部署后用户实测 v2rayN 测速 HY2住宅 节点显示 '跳过测试' (UDP 不通)，root cause: hy2-nft-cleanup.sh 用 `nft list tables | grep hysteria_` 删**所有** hysteria_* 表，hy2-direct 启动时清掉 hy2-residential 的 nft 规则（反之亦然）。修复：core.sh + update.sh 两边 hy2 unit override.conf 移除 ExecStartPre=-/opt/b-ui/hy2-nft-cleanup.sh 行，依赖 hy2 SIGTERM closer chain 清理自己的 nft 表（SIGKILL 残留是边缘 case）。update.sh 加检测：若现有 override.conf 含 hy2-nft-cleanup.sh 引用就强制重写，并清掉 v3.5.0 期间的 99-no-cross-cleanup.conf drop-in。",
