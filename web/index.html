@@ -78,7 +78,7 @@
                     </div>
                 </div>
                 <div class="stat-card">
-                    <div class="stat-icon" style="color:#5856D6">
+                    <div class="stat-icon" style="color:var(--gold-700)">
                         <svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="16 16 12 12 8 16"/><line x1="12" y1="12" x2="12" y2="21"/><path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"/></svg>
                     </div>
                     <div>
@@ -87,7 +87,7 @@
                     </div>
                 </div>
                 <div class="stat-card">
-                    <div class="stat-icon" style="color:#007AFF">
+                    <div class="stat-icon" style="color:var(--accent)">
                         <svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="8 17 12 21 16 17"/><line x1="12" y1="12" x2="12" y2="21"/><path d="M20.88 18.09A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.29"/></svg>
                     </div>
                     <div>
@@ -231,7 +231,7 @@
                 <input id="ns" type="number" placeholder="限速(Mbps) 默认100" min="0">
             </div>
             <!-- v3.5.5/3.5.6: 住宅代理开关 (语义随 protocol 变) -->
-            <label id="nresi-wrap" style="display:flex; align-items:center; gap:10px; margin-top:12px; padding:10px 14px; background:rgba(0,0,0,.03); border-radius:10px; cursor:pointer">
+            <label id="nresi-wrap" style="display:flex; align-items:center; gap:10px; margin-top:12px; padding:12px 14px; background:var(--ivory-200); border:1px solid var(--hairline); border-radius:12px; cursor:pointer">
                 <input type="checkbox" id="nresi" checked style="cursor:pointer">
                 <span style="display:flex; flex-direction:column; gap:2px">
                     <span id="nresi-title" style="font-size:13px; font-weight:600">订阅包含住宅节点</span>
@@ -251,7 +251,7 @@
             <h3 id="cfg-title">客户端配置</h3>
             <p id="cfg-desc" style="font-size:13px; color:var(--text-dim); margin-bottom:24px"></p>
             <div id="qrcode"
-                style="margin:0 auto 24px; background:#fff; padding:16px; border-radius:16px; width:fit-content; box-shadow: 0 10px 30px -10px rgba(0,0,0,0.1);">
+                style="margin:0 auto 24px; background:#fff; padding:16px; border-radius:18px; width:fit-content; box-shadow: 0 12px 28px -12px rgba(101,78,32,0.18), 0 2px 6px rgba(101,78,32,0.06); border:1px solid var(--hairline);">
             </div>
             <div class="code-box" id="uri" style="word-break:break-all"></div>
             <div id="cfg-buttons" style="display:grid; gap:12px; margin-top:16px">
