@@ -403,11 +403,13 @@ add_url_to_config() {
         echo '{"enabled":false,"global":false,"urls":[]}' > "${RESIDENTIAL_CONFIG}"
         chmod 600 "${RESIDENTIAL_CONFIG}"
     fi
-    local next_n
-    next_n=$(jq '(.urls // []) | length + 1' "${RESIDENTIAL_CONFIG}")
-
-    jq --arg h "$host" --argjson p "$port" --arg u "$user" --arg pw "$pass" --arg n "url-${next_n}" \
-        '.urls = ((.urls // []) | map(select(.host != $h or .port != $p)) + [{host:$h, port:$p, username:$u, password:$pw, name:$n}])' \
+    # name 按最终数组位置稠密重排（url-1..url-N），避免 length+1 在去重/移除后产生重名
+    jq --arg h "$host" --argjson p "$port" --arg u "$user" --arg pw "$pass" \
+        '.urls = ((.urls // [])
+                  | map(select(.host != $h or .port != $p))
+                  + [{host:$h, port:$p, username:$u, password:$pw}]
+                  | to_entries
+                  | map(.value + {name: ("url-" + ((.key + 1) | tostring))}))' \
         "${RESIDENTIAL_CONFIG}" > "${RESIDENTIAL_CONFIG}.tmp" \
     && mv "${RESIDENTIAL_CONFIG}.tmp" "${RESIDENTIAL_CONFIG}"
     chmod 600 "${RESIDENTIAL_CONFIG}"
@@ -416,8 +418,12 @@ add_url_to_config() {
 remove_url_from_config() {
     local host="$1" port="$2"
     [[ -f "${RESIDENTIAL_CONFIG}" ]] || return 0
+    # 移除后同样稠密重排 name，保持 url-1..url-N 连续无空洞
     jq --arg h "$host" --argjson p "$port" \
-        '.urls = ((.urls // []) | map(select(.host != $h or .port != $p)))' \
+        '.urls = ((.urls // [])
+                  | map(select(.host != $h or .port != $p))
+                  | to_entries
+                  | map(.value + {name: ("url-" + ((.key + 1) | tostring))}))' \
         "${RESIDENTIAL_CONFIG}" > "${RESIDENTIAL_CONFIG}.tmp" \
     && mv "${RESIDENTIAL_CONFIG}.tmp" "${RESIDENTIAL_CONFIG}"
     chmod 600 "${RESIDENTIAL_CONFIG}"

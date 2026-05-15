@@ -432,111 +432,173 @@ function getConfig() {
     }
 }
 
-// 生成 sing-box 融合配置 (Hy2 优先 + VLESS 备用)
-function generateSingboxConfig(user, cfg, host) {
-    const outbounds = [];
-    const outboundTags = [];
-
-    // 1. Hysteria2 出站 (如果用户有密码)
-    if (user.password) {
-        let serverPort = cfg.port;
-        // 如果启用端口跳跃，使用端口范围格式
-        if (cfg.portHopping && cfg.portHopping.enabled) {
-            serverPort = `${cfg.portHopping.start}-${cfg.portHopping.end}`;
+// 读取服务端住宅代理状态（enabled / global / domains）
+// urls 为空或 enabled=false 时视为未启用（与 residential-helper.sh 行为一致：空池回落直连）
+function getResidentialConfig() {
+    try {
+        if (fs.existsSync(CONFIG.residentialConfig)) {
+            const r = JSON.parse(fs.readFileSync(CONFIG.residentialConfig, "utf8"));
+            const urls = Array.isArray(r.urls) ? r.urls : [];
+            return {
+                enabled: r.enabled === true && urls.length > 0,
+                global: r.global === true,
+                domains: Array.isArray(r.domains) ? r.domains : []
+            };
         }
+    } catch { }
+    return { enabled: false, global: false, domains: [] };
+}
 
-        outbounds.push({
-            type: "hysteria2",
-            tag: "hy2-proxy",
-            server: host,
-            server_port: parseInt(cfg.port),
-            // 连接超时设置 - 2秒无法建立连接就放弃
-            connect_timeout: "2s",
-            // 端口跳跃配置
-            ...(cfg.portHopping?.enabled ? {
-                hop_ports: `${cfg.portHopping.start}-${cfg.portHopping.end}`,
-                hop_interval: "30s"
-            } : {}),
-            // v3.4.19 Cluster E: obfs salamander（GFW 高峰期应急）
-            ...(cfg.obfs?.enabled && cfg.obfs.type === "salamander" && cfg.obfs.password ? {
-                obfs: { type: "salamander", password: cfg.obfs.password }
-            } : {}),
-            password: `${user.username}:${user.password}`,
-            tls: {
-                enabled: true,
-                server_name: host,
-                insecure: false
+// 生成 sing-box 融合配置 — v3.5.11: 补住宅出口 (10002 Reality / 40000 HY2) + 住宅域名分流
+// 节点集合与 /api/sub/ 对齐：fusion=直连+住宅，单协议按 residential 决定直连版/住宅版
+function generateSingboxConfig(user, cfg, host) {
+    const resi = getResidentialConfig();
+    const proto = user.protocol || "fusion";
+    const includeResi = user.residential !== false && resi.enabled;
+    const userSni = user.sni || cfg.sni || "www.bing.com";
+
+    const hasVless = user.uuid && cfg.pubKey && cfg.shortId;
+    const hasHy2 = !!user.password;
+
+    // 出站构造器（直连/住宅只差端口与 hop 范围）
+    const mkHy2 = (tag, port, hopStart, hopEnd, useObfs) => ({
+        type: "hysteria2",
+        tag,
+        server: host,
+        server_port: parseInt(port),
+        connect_timeout: "2s",
+        ...(hopStart ? { hop_ports: `${hopStart}-${hopEnd}`, hop_interval: "30s" } : {}),
+        ...(useObfs && cfg.obfs?.enabled && cfg.obfs.type === "salamander" && cfg.obfs.password
+            ? { obfs: { type: "salamander", password: cfg.obfs.password } } : {}),
+        password: `${user.username}:${user.password}`,
+        tls: { enabled: true, server_name: host, insecure: false }
+    });
+    const mkVless = (tag, port) => ({
+        type: "vless",
+        tag,
+        server: host,
+        server_port: parseInt(port),
+        connect_timeout: "2s",
+        uuid: user.uuid,
+        flow: "xtls-rprx-vision",
+        tls: {
+            enabled: true,
+            server_name: userSni,
+            utls: { enabled: true, fingerprint: "chrome" },
+            reality: { enabled: true, public_key: cfg.pubKey, short_id: cfg.shortId }
+        }
+    });
+
+    const hy2DirectPort = parseInt(cfg.port) || 10000;
+    const hy2DirectHop = cfg.portHopping?.enabled
+        ? [cfg.portHopping.start, cfg.portHopping.end] : [null, null];
+    const vlessDirectPort = cfg.xrayPort || 10001;
+
+    const outbounds = [];
+    const directTags = [];
+    const resiTags = [];
+
+    // 节点集合，严格对齐 web/server.js /api/sub/ 的 proto/residential 逻辑
+    if (proto === "fusion" || proto === "vless-reality") {
+        if (hasVless && proto === "fusion") {
+            outbounds.push(mkVless("vless-direct", vlessDirectPort));
+            directTags.push("vless-direct");
+        }
+        if (hasVless && proto === "vless-reality") {
+            if (includeResi) {
+                outbounds.push(mkVless("vless-residential", 10002));
+                resiTags.push("vless-residential");
+            } else {
+                outbounds.push(mkVless("vless-direct", vlessDirectPort));
+                directTags.push("vless-direct");
             }
-        });
-        outboundTags.push("hy2-proxy");
+        }
+        if (hasVless && proto === "fusion" && includeResi) {
+            outbounds.push(mkVless("vless-residential", 10002));
+            resiTags.push("vless-residential");
+        }
     }
-
-    // 2. VLESS-Reality 出站 (如果用户有 UUID 且服务器配置了 Xray)
-    if (user.uuid && cfg.pubKey && cfg.shortId) {
-        outbounds.push({
-            type: "vless",
-            tag: "vless-proxy",
-            server: host,
-            server_port: cfg.xrayPort || 10001,
-            // 连接超时设置 - 2秒无法建立连接就放弃
-            connect_timeout: "2s",
-            uuid: user.uuid,
-            flow: "xtls-rprx-vision",
-            tls: {
-                enabled: true,
-                server_name: user.sni || cfg.sni || "www.bing.com",
-                utls: { enabled: true, fingerprint: "chrome" },
-                reality: {
-                    enabled: true,
-                    public_key: cfg.pubKey,
-                    short_id: cfg.shortId
-                }
+    if (proto === "fusion" || proto === "hysteria2") {
+        if (hasHy2 && proto === "fusion") {
+            outbounds.push(mkHy2("hy2-direct", hy2DirectPort, hy2DirectHop[0], hy2DirectHop[1], true));
+            directTags.push("hy2-direct");
+        }
+        if (hasHy2 && proto === "hysteria2") {
+            if (includeResi) {
+                outbounds.push(mkHy2("hy2-residential", 40000, 41000, 50000, false));
+                resiTags.push("hy2-residential");
+            } else {
+                outbounds.push(mkHy2("hy2-direct", hy2DirectPort, hy2DirectHop[0], hy2DirectHop[1], true));
+                directTags.push("hy2-direct");
             }
-        });
-        outboundTags.push("vless-proxy");
+        }
+        if (hasHy2 && proto === "fusion" && includeResi) {
+            outbounds.push(mkHy2("hy2-residential", 40000, 41000, 50000, false));
+            resiTags.push("hy2-residential");
+        }
     }
 
-    // 3. 自动选择出站 (urltest - 快速故障切换)
-    // interval: 10s - 每10秒检测一次连接状态
-    // tolerance: 50 - 允许50ms的延迟差异
-    // interrupt_exist_connections: true - 切换时立即中断现有连接
-    if (outboundTags.length > 0) {
-        outbounds.push({
-            type: "urltest",
-            tag: "auto-select",
-            outbounds: outboundTags,
-            url: "https://www.gstatic.com/generate_204",
-            interval: "10s",        // 每10秒检测一次
-            tolerance: 50,          // 50ms 容差，优先选择延迟最低的
-            idle_timeout: "30s",    // 30秒无流量后暂停检测
-            interrupt_exist_connections: true  // 切换时立即生效
-        });
+    const urltest = (tag, tags) => ({
+        type: "urltest",
+        tag,
+        outbounds: tags,
+        url: "https://www.gstatic.com/generate_204",
+        interval: "10s",
+        tolerance: 50,
+        idle_timeout: "30s",
+        interrupt_exist_connections: true
+    });
+
+    // 路由分流：仅当同时有直连池和住宅池（fusion+住宅）才做 global/域名分流；
+    // 否则单池直接 final，行为与旧版一致
+    const hasSplit = directTags.length > 0 && resiTags.length > 0;
+    let primaryTag;
+    const routeRules = [
+        { protocol: "dns", outbound: "dns-out" },
+        { geoip: ["cn", "private"], outbound: "direct" },
+        { geosite: "cn", outbound: "direct" }
+    ];
+    let routeFinal;
+
+    if (hasSplit) {
+        outbounds.push(urltest("direct-pool", directTags));
+        outbounds.push(urltest("residential-pool", resiTags));
+        primaryTag = "direct-pool";
+        if (resi.global) {
+            // 全局住宅：cn/私网直连，其余全部走住宅
+            routeFinal = "residential-pool";
+        } else {
+            // 域名分流：住宅关键词走住宅池，其余走直连池
+            if (resi.domains.length > 0) {
+                routeRules.push({ domain_keyword: resi.domains, outbound: "residential-pool" });
+            }
+            routeFinal = "direct-pool";
+        }
+    } else {
+        const onlyTags = directTags.length > 0 ? directTags : resiTags;
+        outbounds.push(urltest("proxy", onlyTags));
+        primaryTag = "proxy";
+        routeFinal = "proxy";
     }
 
-    // 4. 直连和屏蔽
     outbounds.push({ type: "direct", tag: "direct" });
     outbounds.push({ type: "block", tag: "block" });
     outbounds.push({ type: "dns", tag: "dns-out" });
 
-    // 完整 sing-box 配置 (优化版 - 快速故障切换)
     return {
         log: { level: "info", timestamp: true },
         experimental: {
-            // 启用 Clash API 用于实时切换
             clash_api: {
                 external_controller: "127.0.0.1:9090",
                 external_ui: "",
                 secret: "",
                 default_mode: "rule"
             },
-            cache_file: {
-                enabled: true,
-                path: "cache.db"
-            }
+            cache_file: { enabled: true, path: "cache.db" }
         },
         dns: {
             servers: [
-                { tag: "google", address: "https://8.8.8.8/dns-query", detour: "auto-select" },
+                { tag: "google", address: "https://8.8.8.8/dns-query", detour: primaryTag },
                 { tag: "local", address: "223.5.5.5", detour: "direct" }
             ],
             rules: [
@@ -546,12 +608,7 @@ function generateSingboxConfig(user, cfg, host) {
             final: "google"
         },
         inbounds: [
-            {
-                type: "mixed",
-                tag: "mixed-in",
-                listen: "127.0.0.1",
-                listen_port: 7890
-            },
+            { type: "mixed", tag: "mixed-in", listen: "127.0.0.1", listen_port: 7890 },
             {
                 type: "tun",
                 tag: "tun-in",
@@ -565,55 +622,46 @@ function generateSingboxConfig(user, cfg, host) {
         ],
         outbounds,
         route: {
-            rules: [
-                { protocol: "dns", outbound: "dns-out" },
-                { geoip: ["cn", "private"], outbound: "direct" },
-                { geosite: "cn", outbound: "direct" }
-            ],
-            final: "auto-select",
+            rules: routeRules,
+            final: routeFinal,
             auto_detect_interface: true
         }
     };
 }
 
 // 生成 Clash Meta (mihomo) YAML 配置 (Clash Verge Rev 兼容)
+// v3.5.11: 补住宅出口 (10002 Reality / 40000 HY2) + 住宅域名分流，节点集合对齐 /api/sub/
 function generateClashConfig(user, cfg, host) {
-    const proxies = [];
-    const proxyNames = [];
+    const resi = getResidentialConfig();
+    const proto = user.protocol || "fusion";
+    const includeResi = user.residential !== false && resi.enabled;
+    const userSni = user.sni || cfg.sni || "www.bing.com";
+    const hasVless = user.uuid && cfg.pubKey && cfg.shortId;
+    const hasHy2 = !!user.password;
 
-    // 1. Hysteria2 节点
-    if (user.password) {
-        const hy2Name = `${user.username}-高速版`;
-        let hy2Yaml = `  - name: "${hy2Name}"
+    const proxies = [];
+    const directNames = [];
+    const resiNames = [];
+
+    const mkHy2 = (name, port, hopStart, hopEnd) => {
+        let y = `  - name: "${name}"
     type: hysteria2
     server: ${host}
-    port: ${parseInt(cfg.port)}`;
-
-        // 端口跳跃
-        if (cfg.portHopping && cfg.portHopping.enabled) {
-            hy2Yaml += `\n    ports: "${cfg.portHopping.start}-${cfg.portHopping.end}"
+    port: ${parseInt(port)}`;
+        if (hopStart) y += `\n    ports: "${hopStart}-${hopEnd}"
     hop-interval: 30`;
-        }
-
-        hy2Yaml += `\n    password: "${user.username}:${user.password}"
+        y += `\n    password: "${user.username}:${user.password}"
     sni: ${host}
     skip-cert-verify: false
     alpn:
       - h3`;
-
-        proxies.push(hy2Yaml);
-        proxyNames.push(hy2Name);
-    }
-
-    // 2. VLESS-Reality 节点
-    if (user.uuid && cfg.pubKey && cfg.shortId) {
-        const vlessName = `${user.username}-稳定版`;
-        const userSni = user.sni || cfg.sni || "www.bing.com";
-
-        const vlessYaml = `  - name: "${vlessName}"
+        proxies.push(y);
+    };
+    const mkVless = (name, port) => {
+        proxies.push(`  - name: "${name}"
     type: vless
     server: ${host}
-    port: ${cfg.xrayPort || 10001}
+    port: ${parseInt(port)}
     uuid: ${user.uuid}
     flow: xtls-rprx-vision
     tls: true
@@ -623,14 +671,82 @@ function generateClashConfig(user, cfg, host) {
     reality-opts:
       public-key: ${cfg.pubKey}
       short-id: ${cfg.shortId}
-    network: tcp`;
+    network: tcp`);
+    };
 
-        proxies.push(vlessYaml);
-        proxyNames.push(vlessName);
+    const hy2DirectPort = parseInt(cfg.port) || 10000;
+    const hy2Hop = cfg.portHopping?.enabled ? [cfg.portHopping.start, cfg.portHopping.end] : [null, null];
+    const vlessDirectPort = cfg.xrayPort || 10001;
+    const U = user.username;
+
+    // 节点集合，严格对齐 /api/sub/ 的 proto/residential 逻辑
+    if (proto === "fusion" || proto === "vless-reality") {
+        if (hasVless && proto === "fusion") {
+            mkVless(`${U}-Reality直连`, vlessDirectPort); directNames.push(`${U}-Reality直连`);
+        }
+        if (hasVless && proto === "vless-reality") {
+            if (includeResi) { mkVless(`${U}-Reality住宅`, 10002); resiNames.push(`${U}-Reality住宅`); }
+            else { mkVless(`${U}-Reality直连`, vlessDirectPort); directNames.push(`${U}-Reality直连`); }
+        }
+        if (hasVless && proto === "fusion" && includeResi) {
+            mkVless(`${U}-Reality住宅`, 10002); resiNames.push(`${U}-Reality住宅`);
+        }
+    }
+    if (proto === "fusion" || proto === "hysteria2") {
+        if (hasHy2 && proto === "fusion") {
+            mkHy2(`${U}-HY2直连`, hy2DirectPort, hy2Hop[0], hy2Hop[1]); directNames.push(`${U}-HY2直连`);
+        }
+        if (hasHy2 && proto === "hysteria2") {
+            if (includeResi) { mkHy2(`${U}-HY2住宅`, 40000, 41000, 50000); resiNames.push(`${U}-HY2住宅`); }
+            else { mkHy2(`${U}-HY2直连`, hy2DirectPort, hy2Hop[0], hy2Hop[1]); directNames.push(`${U}-HY2直连`); }
+        }
+        if (hasHy2 && proto === "fusion" && includeResi) {
+            mkHy2(`${U}-HY2住宅`, 40000, 41000, 50000); resiNames.push(`${U}-HY2住宅`);
+        }
     }
 
-    // 代理名称列表 (YAML 格式)
-    const nameList = proxyNames.map(n => `      - "${n}"`).join("\n");
+    const hasSplit = directNames.length > 0 && resiNames.length > 0;
+    const yamlNames = ns => ns.map(n => `      - "${n}"`).join("\n");
+
+    // proxy-groups：有直连池建"直连自动"，有住宅池建"住宅自动"，PROXY 汇总
+    const groups = [];
+    if (directNames.length > 0) {
+        groups.push(`  - name: "直连自动"
+    type: url-test
+    proxies:
+${yamlNames(directNames)}
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 50`);
+    }
+    if (resiNames.length > 0) {
+        groups.push(`  - name: "住宅自动"
+    type: url-test
+    proxies:
+${yamlNames(resiNames)}
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 50`);
+    }
+    const selectMembers = [];
+    if (directNames.length > 0) selectMembers.push("直连自动");
+    if (resiNames.length > 0) selectMembers.push("住宅自动");
+    const allNames = [...directNames, ...resiNames];
+    groups.push(`  - name: "PROXY"
+    type: select
+    proxies:
+${yamlNames([...selectMembers, ...allNames])}`);
+
+    // rules：cn/私网直连；分流时住宅域名走住宅自动；MATCH 目标按 global/单池决定
+    let matchTarget;
+    if (hasSplit) matchTarget = resi.global ? "住宅自动" : "直连自动";
+    else matchTarget = directNames.length > 0 ? "直连自动" : "住宅自动";
+
+    const resiRules = (hasSplit && !resi.global && resi.domains.length > 0)
+        ? resi.domains.map(kw => `  - DOMAIN-KEYWORD,${kw},住宅自动`).join("\n") + "\n"
+        : "";
+
+    const proxyGroupsBlock = groups.join("\n\n");
 
     // Clash Meta 订阅配置
     // 包含 DNS (fake-ip) + proxies + proxy-groups + rules
@@ -674,25 +790,13 @@ proxies:
 ${proxies.join("\n")}
 
 proxy-groups:
-  - name: "自动选择"
-    type: url-test
-    proxies:
-${nameList}
-    url: https://www.gstatic.com/generate_204
-    interval: 300
-    tolerance: 50
-
-  - name: "PROXY"
-    type: select
-    proxies:
-      - "自动选择"
-${nameList}
+${proxyGroupsBlock}
 
 rules:
   - GEOIP,private,DIRECT,no-resolve
   - GEOSITE,cn,DIRECT
   - GEOIP,cn,DIRECT,no-resolve
-  - MATCH,PROXY
+${resiRules}  - MATCH,${matchTarget}
 `;
 
     return yaml;
