@@ -6,11 +6,28 @@
 
 轻量级 Hysteria2 + Xray 多协议代理一键部署工具，内置 Web 管理面板与全功能流量管理。
 
-**当前版本**: v3.5.0
+**当前版本**: v3.5.13
 
 ---
 
 ## 最新更新
+
+### v3.5.13 — 伪装设置 Reality 四方分裂修复
+- 🩺 **故障**：改伪装站后客户端 VLESS Reality 报 `received real certificate (potential MITM)`，延迟测试 -1 / OperationCancelled（服务端日志却显示 Reality 仍在成功代理真实流量）
+- 🔍 **根因**：伪装值在 4 处不一致——`masquerade.json` / xray `vless-direct` / xray `vless-residential` / 订阅下发
+- 🔧 **Bug A**：`server.js` 伪装 handler 用 `.find()` 只改第一个 reality inbound，v3.5 双 inbound 架构下 `vless-residential` 永远停在旧伪装域名 → 改 `.filter()` 遍历全部 reality inbound
+- 🔧 **Bug B**：三个订阅生成器 `user.sni || cfg.sni` 优先级反了，`user.sni` 是建用户时固化的旧拷贝、改伪装从不回写 → 翻转为 `cfg.sni || user.sni`，sni 以服务端实时 xray 配置为唯一可信源
+- ✅ 本地沙箱 + bwg-temp 端到端实测：四节点全通（Reality 180/167ms、HY2 隧道 200/204），改伪装即时对所有用户订阅生效
+- ⚠️ 改伪装后该机用户需重拉一次订阅（Reality sni 变更；HY2 sni=证书域不受影响）
+
+### v3.5.12 — Web 面板苹果设计风格重做
+- 🎨 **完全重写 `style.css`**：语义化 token 体系，淡金色主调 + 勃艮第辅助 + 米白画布；修掉旧文件两套设计系统混用导致的未定义变量 bug（dashboard nav 被渲染成深色等）
+- 🪟 **iOS 17 玻璃材质**：半透明本体 + blur(24-40px) saturate(200%) + 顶缘 specular 高光 + 底缘暗边 + 双层投影；nav / 卡片 / modal / login / toast 全量应用，modal 由实色改为可透出背景的玻璃 sheet
+- ✨ **苹果 spring 动画**：modal/toast 入场 overshoot 回弹、按钮 enter 慢 exit 快、iOS 开关拨杆按压拉长；`prefers-reduced-motion` 全局兜底
+- 📱 桌面 / 移动 / modal Playwright 实测通过；纯前端改动，不涉及服务端逻辑
+
+### v3.5.1 ~ v3.5.11 — 共 11 个版本
+- 📜 详见 `version.json` changelog：sing-box / Clash 订阅生成器补住宅出口 + 住宅域名分流 (v3.5.11)、update.sh 幂等自愈「打得死」迁移块 (v3.5.10)、xray routing 残留 v3.4 无条件 relay 规则修复 (v3.5.9)、订阅 host 切回域名 cfg.domain (v3.5.8)、hy2-direct config.yaml 残留 outbounds 修复 (v3.5.7)、单协议用户住宅版支持 (v3.5.6) 等
 
 ### v3.5.0 — 双实例架构 + 4 订阅 URL + 多住宅 URL 池 + Global 模式
 - 🏗 **架构重构**：xray 双 inbound (vless-direct :10001 / vless-residential :10002)；hysteria 双实例 (direct :10000+20000-30000 / residential :40000+41000-50000)；direct 路径完全绕开 sing-box 中转
