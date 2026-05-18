@@ -455,7 +455,10 @@ function generateSingboxConfig(user, cfg, host) {
     const resi = getResidentialConfig();
     const proto = user.protocol || "fusion";
     const includeResi = user.residential !== false && resi.enabled;
-    const userSni = user.sni || cfg.sni || "www.bing.com";
+    // v3.5.13 Bug B fix: cfg.sni（服务端 xray 实时 reality serverNames）优先于 user.sni。
+    // user.sni 是建用户时固化的旧拷贝；reality serverNames 本就是服务端全局，per-user sni
+    // 是伪需求。旧的 user.sni 优先导致改伪装后订阅永远发旧域名 → SNI 不匹配 → Reality 坏。
+    const userSni = cfg.sni || user.sni || "www.bing.com";
 
     const hasVless = user.uuid && cfg.pubKey && cfg.shortId;
     const hasHy2 = !!user.password;
@@ -635,7 +638,10 @@ function generateClashConfig(user, cfg, host) {
     const resi = getResidentialConfig();
     const proto = user.protocol || "fusion";
     const includeResi = user.residential !== false && resi.enabled;
-    const userSni = user.sni || cfg.sni || "www.bing.com";
+    // v3.5.13 Bug B fix: cfg.sni（服务端 xray 实时 reality serverNames）优先于 user.sni。
+    // user.sni 是建用户时固化的旧拷贝；reality serverNames 本就是服务端全局，per-user sni
+    // 是伪需求。旧的 user.sni 优先导致改伪装后订阅永远发旧域名 → SNI 不匹配 → Reality 坏。
+    const userSni = cfg.sni || user.sni || "www.bing.com";
     const hasVless = user.uuid && cfg.pubKey && cfg.shortId;
     const hasHy2 = !!user.password;
 
@@ -1544,7 +1550,10 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                 // 客户端 (b-ui-client.sh / singbox-tun.json) 已用 DoH + predefined-rule 防 GFW DNS 投毒
                 const serverIp = getServerIP();
                 const serverHost = (cfg.domain && cfg.domain !== "localhost") ? cfg.domain : serverIp;
-                const userSni = user.sni || cfg.sni || "www.bing.com";
+                // v3.5.13 Bug B fix: cfg.sni（服务端 xray 实时 reality serverNames）优先于 user.sni。
+                // user.sni 是建用户时固化的旧拷贝；reality serverNames 本就是服务端全局，per-user
+                // sni 是伪需求。旧的 user.sni 优先导致改伪装后订阅永远发旧域名 → SNI 不匹配 → 坏。
+                const userSni = cfg.sni || user.sni || "www.bing.com";
                 const links = [];
 
                 // Reality 公共参数生成器（直连和住宅版只差端口 + fragment）
@@ -2243,8 +2252,11 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                         fs.writeFileSync(CONFIG.hysteriaConfig, hyc);
                         if (fs.existsSync(CONFIG.xrayConfig)) {
                             let xc = JSON.parse(fs.readFileSync(CONFIG.xrayConfig, "utf8"));
-                            const xi = xc.inbounds.find(i => i.tag === "vless-direct" || i.tag === "vless-reality");
-                            if (xi && xi.streamSettings?.realitySettings) {
+                            // v3.5.13 Bug A fix: 遍历所有 reality inbound（vless-direct:10001 +
+                            // vless-residential:10002）。旧代码 .find() 只改第一个，v3.5 双 inbound
+                            // 架构下 vless-residential 永远停在旧伪装域名，导致四方分裂。
+                            const reInbounds = xc.inbounds.filter(i => i.streamSettings?.realitySettings);
+                            for (const xi of reInbounds) {
                                 xi.streamSettings.realitySettings.dest = domain + ":443";
                                 xi.streamSettings.realitySettings.serverNames = [domain];
                             }
