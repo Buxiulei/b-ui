@@ -1767,7 +1767,11 @@ start_all_services() {
     fi
 
     # 4. 启动 Xray (不依赖证书)
-    systemctl enable xray --now || true
+    # 官方 Xray 安装脚本会用默认配置 /usr/local/etc/xray/config.json 自启 xray；
+    # `enable --now` 不会重启已在跑的服务 → b-ui override(指向 /opt/b-ui/xray-config.json)不生效
+    # → VLESS :10001/:10002 不监听(全新安装实测踩坑)。必须显式 restart 让 override 配置加载。
+    systemctl enable xray 2>/dev/null || true
+    systemctl restart xray 2>/dev/null || true
     if systemctl is-active --quiet xray; then
         print_success "Xray 服务已启动"
     else
