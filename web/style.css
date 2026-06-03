@@ -611,6 +611,49 @@ input[type="number"] {
     font-variant-numeric: tabular-nums;
 }
 
+/* 原生复选框（非 .switch 开关）——修复被全局 input 规则吞成大圆角框、无勾选反馈的 bug */
+input[type="checkbox"]:not(.switch input) {
+    width: 20px;
+    height: 20px;
+    min-width: 20px;
+    flex: 0 0 auto;
+    margin: 0;
+    padding: 0;
+    border-radius: 6px;
+    border: 1.5px solid var(--border);
+    background: var(--surface);
+    cursor: pointer;
+    position: relative;
+    vertical-align: middle;
+    transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+input[type="checkbox"]:not(.switch input):hover {
+    border-color: var(--primary);
+}
+
+input[type="checkbox"]:not(.switch input):checked {
+    background: var(--primary);
+    border-color: var(--primary);
+}
+
+input[type="checkbox"]:not(.switch input):checked::after {
+    content: "";
+    position: absolute;
+    left: 6px;
+    top: 2px;
+    width: 5px;
+    height: 9px;
+    border: solid #FFFFFF;
+    border-width: 0 2px 2px 0;
+    transform: rotate(45deg);
+}
+
+input[type="checkbox"]:not(.switch input):focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 4px var(--primary-glow);
+}
+
 select {
     background-image:
         linear-gradient(45deg, transparent 50%, var(--text-dim) 50%),

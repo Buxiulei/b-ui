@@ -128,18 +128,57 @@ install_hysteria() {
     mkdir -p "$BASE_DIR"
 
     # ────────────────────────────────────────────────────────────────────
-    # 写 nft 清理 helper（两个 unit 共享）
+    # 写"按实例"端口跳跃孤儿链清理 helper（ExecStartPre 用）
+    # hysteria 内置端口跳跃用的是 iptables/ip6tables 的 HYSTERIA-PR-<hash> NAT 链
+    # （不是 nft 的 hysteria_* 表——旧 hy2-nft-cleanup.sh 清错了对象且 nft 常未安装）。
+    # SIGKILL/OOM 后该链残留，下次启动 `ip6tables -N` 报 "Chain already exists" → FATAL 崩溃循环。
+    # 关键：只清"REDIRECT 到本实例 base 端口"的链，绝不碰另一实例
+    #       （v3.5.1 共享 cleanup 跨实例误删 regression 的正确修法）。
+    # 用法：hy2-portjump-cleanup.sh <base_port>
     # ────────────────────────────────────────────────────────────────────
-    cat > /opt/b-ui/hy2-nft-cleanup.sh <<'CLEANUP_EOF'
+    cat > /opt/b-ui/hy2-portjump-cleanup.sh <<'CLEANUP_EOF'
 #!/bin/sh
-# 删除所有 hysteria_* nft 表（family + name 配对遍历）
-# 用于 hy2 ExecStartPre：清理 SIGKILL/OOM 残留的孤儿规则
-nft list tables 2>/dev/null | awk '/^table .* hysteria_/{print $2,$3}' | while read fam name; do
-    nft delete table "$fam" "$name" 2>/dev/null || true
+# 删除"只属于本实例"的孤儿端口跳跃 NAT 规则（按 REDIRECT 目标端口区分实例，绝不碰另一实例）。
+# 同时覆盖两种后端：iptables(HYSTERIA-PR-<hash> 链) 与 nft(hysteria_<hash> 表)——hysteria 探测到
+# nft 就用 nft、否则 iptables；本脚本两种都清，不强制切换后端以免扰动在跑的机器。
+# 正常 SIGTERM 退出时 hysteria 已自清，本脚本为 no-op；仅在 SIGKILL/OOM 残留时清理。
+# 参数可为 base 端口数字，或 hysteria 配置文件路径（从 listen: :PORT,... 提取，支持自定义直连端口）。
+arg="$1"
+[ -z "$arg" ] && exit 0
+case "$arg" in
+    *[!0-9]*) base=$(awk '/^listen:/{ sub(/^listen: *:/,""); split($0,a,","); print a[1]; exit }' "$arg" 2>/dev/null) ;;
+    *)        base="$arg" ;;
+esac
+[ -z "$base" ] && exit 0
+
+# 后端 A: iptables / ip6tables —— 删 REDIRECT 到本 base 端口的 HYSTERIA-PR 链
+for ipt in iptables ip6tables; do
+    command -v "$ipt" >/dev/null 2>&1 || continue
+    chains=$("$ipt" -t nat -S 2>/dev/null | \
+        sed -n "s/^-A \\(HYSTERIA-PR-[A-Za-z0-9]*\\) .*--to-ports ${base}\$/\\1/p" | sort -u)
+    [ -z "$chains" ] && continue
+    for ch in $chains; do
+        "$ipt" -t nat -S 2>/dev/null | grep -- "-j ${ch}\$" | while read -r line; do
+            rule=$(printf '%s' "$line" | sed 's/^-A /-D /')
+            # shellcheck disable=SC2086
+            "$ipt" -t nat $rule 2>/dev/null || true
+        done
+        "$ipt" -t nat -F "$ch" 2>/dev/null || true
+        "$ipt" -t nat -X "$ch" 2>/dev/null || true
+    done
 done
+
+# 后端 B: nft —— 删 REDIRECT 到本 base 端口的 hysteria_<hash> 表（仅本实例，按 redirect 目标端口判定）
+if command -v nft >/dev/null 2>&1; then
+    nft list tables 2>/dev/null | awk '$3 ~ /^hysteria_/{print $2, $3}' | while read -r fam tbl; do
+        if nft list table "$fam" "$tbl" 2>/dev/null | grep -qE "redirect to :${base}([^0-9]|\$)"; then
+            nft delete table "$fam" "$tbl" 2>/dev/null || true
+        fi
+    done
+fi
 exit 0
 CLEANUP_EOF
-    chmod 755 /opt/b-ui/hy2-nft-cleanup.sh
+    chmod 755 /opt/b-ui/hy2-portjump-cleanup.sh
 
     # ────────────────────────────────────────────────────────────────────
     # 实例 1: hysteria-server.service (direct) — 监听 :10000+20000-30000
@@ -175,13 +214,13 @@ Environment=HYSTERIA_LOG_LEVEL=warn
 MemoryHigh=500M
 MemoryMax=700M
 
-# 启动前清理孤儿 nft 规则（SIGKILL/OOM 后 closer chain 没跑完留下的 hysteria_* 表）
-# 否则下次 hy2 启动 nft add rule 会追加到同 chain 内造成重复
-# v3.5.1: ExecStartPre 共用 cleanup 会误删另一实例 nft 端口跳跃表（bug confirmed bwg-tizi/temp）
-# 改为不主动清理孤儿规则，由 hy2 自己 SIGTERM 时的 closer chain 删自己的 nft 表
-# SIGKILL 留孤儿是边缘 case，发生时手工 nft delete
+# 启动前清理"仅本实例"的孤儿端口跳跃 NAT 链（base 端口从 config.yaml 的 listen 提取，支持自定义端口）
+# SIGKILL/OOM 后 hysteria 没走完 closer chain 会残留 HYSTERIA-PR-<hash> 链，
+# 下次启动 ip6tables -N 报 "Chain already exists" → FATAL 崩溃循环（v3.5.13 实测踩坑）。
+# 按 --to-ports <base> 精确清理，绝不碰住宅实例（:40000）的链。`-` 前缀使清理失败不致命。
+ExecStartPre=-/opt/b-ui/hy2-portjump-cleanup.sh ${CONFIG_FILE}
 
-# 给 hy2 充足时间走完 closer chain 删 nft 表（正常 <1s）
+# 给 hy2 充足时间走完 closer chain 删自己的 NAT 链（正常 <1s）
 TimeoutStopSec=15
 
 # 确保服务稳定运行
@@ -214,9 +253,9 @@ Environment=GOMEMLIMIT=200MiB
 Environment=HYSTERIA_LOG_LEVEL=warn
 MemoryHigh=300M
 MemoryMax=500M
-# v3.5.1: ExecStartPre 共用 cleanup 会误删另一实例 nft 端口跳跃表（bug confirmed bwg-tizi/temp）
-# 改为不主动清理孤儿规则，由 hy2 自己 SIGTERM 时的 closer chain 删自己的 nft 表
-# SIGKILL 留孤儿是边缘 case，发生时手工 nft delete
+# 启动前清理"仅本实例"的孤儿端口跳跃 NAT 链（base=40000，按 --to-ports 区分实例）
+# 绝不碰直连实例（:10000）的链。`-` 前缀使清理失败不致命。详见 hy2-portjump-cleanup.sh
+ExecStartPre=-/opt/b-ui/hy2-portjump-cleanup.sh 40000
 TimeoutStopSec=15
 Restart=always
 RestartSec=3
@@ -889,11 +928,14 @@ chmod 600 "${CERTS_DIR}/privkey.pem"
 
 log "SUCCESS: 证书已同步 (${DOMAIN})"
 
-# Reload Hysteria2 (如果正在运行)
-if systemctl is-active --quiet hysteria-server 2>/dev/null; then
-    systemctl reload hysteria-server 2>/dev/null || systemctl restart hysteria-server 2>/dev/null
-    log "Hysteria2 已重载"
-fi
+# 证书变了 → 重启所有在跑的 hysteria 实例
+# hysteria 仅在启动时读证书、无热重载（CanReload=no，reload 是空操作），必须 restart；
+# 两个实例（direct + residential）共用同一份 /opt/b-ui/certs，都要重启，否则住宅节点续期后用旧证书 → 过期即挂。
+for u in hysteria-server hysteria-residential; do
+    if systemctl is-active --quiet "$u" 2>/dev/null; then
+        systemctl restart "$u" 2>/dev/null && log "$u 已重启以加载新证书"
+    fi
+done
 
 # 保留最近 200 行日志
 tail -200 "$LOG_FILE" > "${LOG_FILE}.tmp" && mv "${LOG_FILE}.tmp" "$LOG_FILE" 2>/dev/null
@@ -950,41 +992,43 @@ setup_hy2_watchdog() {
     local watchdog_script="${BASE_DIR}/hy2-watchdog.sh"
     local listen_port=${PORT:-10000}
 
-    # 写入 watchdog 脚本
+    # 写入 watchdog 脚本（覆盖 direct + residential 两实例，各自独立失败计数）
     cat > "$watchdog_script" << WDOGEOF
 #!/bin/bash
-# Hysteria2 半死自愈：进程在但端口失活时强制重启
-# 每 5 min 触发一次；连续 3 次（15min）失败 → systemctl restart hysteria-server
-LISTEN_PORT="\${HY2_PORT:-${listen_port}}"
-FAIL_FILE=/tmp/hy2-watchdog-fail-count
+# Hysteria2 半死自愈：进程在但 UDP 端口失活时强制重启（direct + residential 双实例）
+# 每 5 min 触发；某实例连续 3 次（15min）UDP 监听失活 → systemctl restart 该实例
 LOG=/var/log/b-ui-hy2-watchdog.log
-
 log() { echo "[\$(date '+%Y-%m-%d %H:%M:%S')] \$1" >> "\$LOG"; }
 
-# 1. 进程必须存在；不存在交给 systemd Restart=always 处理
-if ! systemctl is-active --quiet hysteria-server; then
-    log "INFO: hysteria-server 未运行，跳过（systemd 会自动拉起）"
-    rm -f "\$FAIL_FILE"
-    exit 0
-fi
-
-# 2. UDP 端口必须仍在监听（侧面证明 socket 存活）
-if ! ss -lun "( sport = :\${LISTEN_PORT} )" 2>/dev/null | grep -q ":\${LISTEN_PORT}"; then
-    fail=\$((\$(cat "\$FAIL_FILE" 2>/dev/null || echo 0) + 1))
-    echo "\$fail" > "\$FAIL_FILE"
-    log "WARN: UDP :\${LISTEN_PORT} 监听失活，失败计数 \${fail}/3"
-    if [[ \$fail -ge 3 ]]; then
-        log "ACTION: 连续 3 次失败，重启 hysteria-server"
-        systemctl restart hysteria-server
-        rm -f "\$FAIL_FILE"
+# check_instance <service> <udp_port>
+check_instance() {
+    svc="\$1"; port="\$2"
+    fail_file="/tmp/hy2-watchdog-fail-\${svc}"
+    # 1. 进程不在 → 交给 systemd Restart=always，并重置计数
+    if ! systemctl is-active --quiet "\$svc"; then
+        rm -f "\$fail_file"; return 0
     fi
-    # 保留最近 200 行日志
-    tail -200 "\$LOG" > "\${LOG}.tmp" 2>/dev/null && mv "\${LOG}.tmp" "\$LOG" 2>/dev/null
-    exit 0
-fi
+    # 2. UDP 端口失活 → 累计失败，连续 3 次重启本实例
+    if ! ss -lun "( sport = :\${port} )" 2>/dev/null | grep -q ":\${port}"; then
+        fail=\$(( \$(cat "\$fail_file" 2>/dev/null || echo 0) + 1 ))
+        echo "\$fail" > "\$fail_file"
+        log "WARN: \${svc} UDP :\${port} 监听失活，失败计数 \${fail}/3"
+        if [ "\$fail" -ge 3 ]; then
+            log "ACTION: \${svc} 连续 3 次失败，重启"
+            systemctl restart "\$svc"
+            rm -f "\$fail_file"
+        fi
+        return 0
+    fi
+    # 监听正常，重置失败计数
+    rm -f "\$fail_file"
+}
 
-# 监听正常，重置失败计数
-rm -f "\$FAIL_FILE"
+check_instance hysteria-server ${listen_port}
+systemctl list-unit-files hysteria-residential.service >/dev/null 2>&1 && check_instance hysteria-residential 40000
+
+# 保留最近 200 行日志
+tail -200 "\$LOG" > "\${LOG}.tmp" 2>/dev/null && mv "\${LOG}.tmp" "\$LOG" 2>/dev/null
 exit 0
 WDOGEOF
     chmod 755 "$watchdog_script"
@@ -1091,19 +1135,21 @@ if [[ -x "/opt/b-ui/cert-sync.sh" ]]; then
     /opt/b-ui/cert-sync.sh
 fi
 
-# 3. 检查 Hysteria2 服务状态
-if ! systemctl is-active --quiet hysteria-server 2>/dev/null; then
-    # 检查证书是否存在，如果存在则尝试启动
-    if [[ -f "/opt/b-ui/certs/fullchain.pem" ]]; then
-        log "WARNING: Hysteria2 未运行但证书存在，尝试启动..."
-        systemctl start hysteria-server 2>/dev/null
-        sleep 2
-        if systemctl is-active --quiet hysteria-server 2>/dev/null; then
-            log "SUCCESS: Hysteria2 启动成功"
-        else
-            log "ERROR: Hysteria2 启动失败"
+# 3. 检查 Hysteria2 两实例（direct + residential），证书已就绪但未运行则拉起
+if [[ -f "/opt/b-ui/certs/fullchain.pem" ]]; then
+    for u in hysteria-server hysteria-residential; do
+        systemctl list-unit-files "${u}.service" >/dev/null 2>&1 || continue
+        if ! systemctl is-active --quiet "$u" 2>/dev/null; then
+            log "WARNING: $u 未运行但证书存在，尝试启动..."
+            systemctl start "$u" 2>/dev/null
+            sleep 2
+            if systemctl is-active --quiet "$u" 2>/dev/null; then
+                log "SUCCESS: $u 启动成功"
+            else
+                log "ERROR: $u 启动失败"
+            fi
         fi
-    fi
+    done
 fi
 
 # 保留最近 200 行日志
@@ -1116,7 +1162,8 @@ CERTEOF
         crontab -l 2>/dev/null
         echo '# === B-UI 定时任务 ==='
         echo '0 */6 * * * /opt/b-ui/update.sh auto >> /var/log/b-ui-update.log 2>&1'
-        echo '0 */12 * * * /opt/b-ui/cert-check.sh'
+        echo '30 */12 * * * /opt/b-ui/update.sh kernel >> /var/log/b-ui-kernel-update.log 2>&1'
+        echo '0 */12 * * * /opt/b-ui/cert-check.sh >> /var/log/b-ui-cert-check.log 2>&1'
     ) | crontab -
     
     print_success "定时任务已配置:"
@@ -1380,12 +1427,44 @@ net.ipv4.tcp_wmem=4096 65536 16777216
 net.ipv4.udp_mem=262144 524288 1048576
 # 临时端口范围扩大（多用户 + Xray 出向连接复用）
 net.ipv4.ip_local_port_range=10000 65535
+# 关键：把所有代理监听端口 + 端口跳跃段从临时端口池里排除，
+# 否则出向连接（Xray freedom / 住宅 relay / ACME / apt）可能抢占跳跃段端口
+# （20000-30000 / 41000-50000）→ 间歇性 "address already in use" UDP 出向失败，极难排查。
+net.ipv4.ip_local_reserved_ports=10000-10002,20000-30000,40000,41000-50000
 # 队列层
 net.core.netdev_max_backlog=5000
 net.ipv4.tcp_max_syn_backlog=8192
 EOF
     sysctl --system > /dev/null 2>&1
     print_success "网络栈调优已应用 (99-b-ui-network.conf)"
+
+    # 4. conntrack 容量：默认 8192 是多用户真正的并发天花板
+    # hy2 端口跳跃让每个客户端横跨多个 UDP 5-tuple，每条 + 其 DNAT 回包都占一条 conntrack；
+    # 表满时内核 "table full, dropping packet" 会对所有用户（含 TCP Reality/SSH）静默丢新连接。
+    local mem_mb
+    mem_mb=$(awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo)
+    local ct_max=131072
+    if   [[ $mem_mb -gt 4096 ]]; then ct_max=524288
+    elif [[ $mem_mb -gt 2048 ]]; then ct_max=262144
+    fi
+    cat > /etc/sysctl.d/99-b-ui-conntrack.conf <<EOF
+# B-UI conntrack 容量（多用户 hy2 端口跳跃 + xray + 住宅 relay 共享一张表）
+net.netfilter.nf_conntrack_max=${ct_max}
+# UDP 流（hy2 QUIC + 端口跳跃）回收更快，避免短命 5-tuple 堆积撑爆表
+net.netfilter.nf_conntrack_udp_timeout=20
+net.netfilter.nf_conntrack_udp_timeout_stream=60
+EOF
+    # 哈希桶大小须在模块加载时设定（重启后生效）；并确保开机先加载模块，sysctl.d 才能写入 max
+    echo "options nf_conntrack hashsize=$((ct_max / 4))" > /etc/modprobe.d/b-ui-nf_conntrack.conf
+    echo "nf_conntrack" > /etc/modules-load.d/b-ui-conntrack.conf
+    modprobe nf_conntrack 2>/dev/null || true
+    sysctl --system > /dev/null 2>&1
+    print_success "conntrack 容量已上调 (nf_conntrack_max=${ct_max}, 物理内存 ${mem_mb}MB)"
+
+    # 5. BBR 拥塞控制（enable_bbr 此前是 dead code，BBR 仅靠发行版镜像运气；显式启用兜底）
+    if declare -F enable_bbr >/dev/null; then
+        enable_bbr
+    fi
 }
 
 #===============================================================================
@@ -1575,6 +1654,11 @@ ExecStart=/usr/bin/node server.js
 Restart=always
 RestartSec=3
 
+# 内存兜底：面板不在数据通道上，但 Node 累计流量统计/跑 singbox-converter 可能涨 RSS；
+# 在小内存机器上限制它，避免它把内核 OOM-killer 引到 hysteria/xray 头上（那会触发孤儿链崩溃循环）。
+MemoryHigh=150M
+MemoryMax=200M
+
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -1630,39 +1714,43 @@ start_all_services() {
     fi
     
     # 2. 等待 Caddy 证书就绪并同步到共享目录
-    wait_and_sync_certs
-    
+    # `|| true`：超时返回 1 时不能让 set -e 中断后续安装（v3.5.13 botched-install 根因）
+    wait_and_sync_certs || true
+
     # 3. 启动管理面板 (不依赖证书)
-    systemctl enable b-ui-admin --now
+    # 所有 enable --now 都加 `|| true`：服务起不来只告警，绝不让 set -e 中断整个安装
+    systemctl enable b-ui-admin --now || true
     if systemctl is-active --quiet b-ui-admin; then
         print_success "管理面板已启动"
     else
         print_warning "管理面板启动失败"
     fi
-    
+
     # 4. 启动 Xray (不依赖证书)
-    systemctl enable xray --now
+    systemctl enable xray --now || true
     if systemctl is-active --quiet xray; then
         print_success "Xray 服务已启动"
     else
         print_warning "Xray 服务启动失败"
     fi
-    
-    # 5. 最后启动 Hysteria2 (依赖证书)
+
+    # 5. 最后启动 Hysteria2 direct + residential (依赖证书，两实例共用同一份 LE 证书)
     if [[ -f "${CERTS_DIR}/fullchain.pem" ]]; then
-        systemctl enable hysteria-server --now
-        sleep 2
-        if systemctl is-active --quiet hysteria-server; then
-            print_success "Hysteria2 服务已启动"
-        else
-            print_warning "Hysteria2 服务启动失败"
-            journalctl -u hysteria-server --no-pager -n 5 2>/dev/null
-        fi
+        for u in hysteria-server hysteria-residential; do
+            systemctl enable "$u" --now || true
+            sleep 1
+            if systemctl is-active --quiet "$u"; then
+                print_success "${u} 已启动"
+            else
+                print_warning "${u} 启动失败"
+                journalctl -u "$u" --no-pager -n 5 2>/dev/null || true
+            fi
+        done
     else
-        # 证书尚未就绪，启用服务但不立即启动
-        systemctl enable hysteria-server 2>/dev/null
-        print_warning "Hysteria2: 证书尚未就绪，已设置开机自启"
-        print_info "证书同步后 Hysteria2 将通过健康检查自动启动"
+        # 证书尚未就绪：两实例都设开机自启但不立即启动（cert-sync / cert-check.sh 就绪后拉起）
+        systemctl enable hysteria-server hysteria-residential 2>/dev/null || true
+        print_warning "Hysteria2: 证书尚未就绪，direct + residential 已设置开机自启"
+        print_info "证书同步后将通过健康检查自动启动"
     fi
 
     # 6. 端口跳跃防火墙放行 + 状态持久化（hysteria 内置 listen 多端口接管 iptables）

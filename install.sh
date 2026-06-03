@@ -822,23 +822,25 @@ main() {
             print_success "cron 已安装"
         fi
         
-        print_info "配置定时任务..."
-        
-        # 清理旧的/错误路径的 cron 条目
-        local current_cron
-        current_cron=$(crontab -l 2>/dev/null || echo "")
-        local new_cron
-        new_cron=$(echo "$current_cron" | grep -v "b-ui.*update.sh" | grep -v "b-ui.*cert-check" || echo "")
-        
-        # 添加标记注释和定时任务
-        new_cron="${new_cron}
-# === B-UI 定时任务 ===
-0 */6 * * * ${BASE_DIR}/update.sh auto >> /var/log/b-ui-update.log 2>&1
-0 */12 * * * ${BASE_DIR}/cert-check.sh >> /var/log/b-ui-cert-check.log 2>&1"
-        
-        # 去除空行并写入
-        echo "$new_cron" | sed '/^$/d' | crontab -
-        print_success "定时任务已配置: 每6小时检查更新, 每12小时检查证书"
+        # 委托给 core.sh 的 configure_cron_tasks：它会真正生成 cert-check.sh 健康检查脚本
+        # 并写入三条 cron（更新 + 内核更新 + 证书/服务健康检查）。
+        # install_type==1（已装机重跑）只 source 了 update.sh、没 source core.sh，
+        # 否则会走 fallback 把已有的 cert-check / kernel cron 删掉（净回归）。先补 source 保证函数可用。
+        [[ -f "${BASE_DIR}/core.sh" ]] && source "${BASE_DIR}/core.sh" 2>/dev/null || true
+        if declare -F configure_cron_tasks >/dev/null; then
+            configure_cron_tasks
+        elif declare -F ensure_cron_jobs >/dev/null; then
+            ensure_cron_jobs
+        else
+            print_warning "cron 配置函数不可用，回退为内联写入全部三条 cron"
+            ( crontab -l 2>/dev/null | grep -v "b-ui.*update.sh" | grep -v "b-ui.*cert-check" | grep -v "B-UI 定时"
+              echo "# === B-UI 定时任务 ==="
+              echo "0 */6 * * * ${BASE_DIR}/update.sh auto >> /var/log/b-ui-update.log 2>&1"
+              echo "30 */12 * * * ${BASE_DIR}/update.sh kernel >> /var/log/b-ui-kernel-update.log 2>&1"
+              echo "0 */12 * * * ${BASE_DIR}/cert-check.sh >> /var/log/b-ui-cert-check.log 2>&1"
+            ) | sed '/^$/d' | crontab -
+            print_success "定时任务已配置（内联兜底，三条）"
+        fi
     }
     setup_auto_update
     
