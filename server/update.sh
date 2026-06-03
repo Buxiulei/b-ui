@@ -1012,6 +1012,24 @@ EOF
         rm -f "$_upf"
     fi
 
+    # v3.5.17 D7: 补下被 index.html 引用但缺失的 web 静态文件（自愈）
+    # 新增静态文件(如 qrcode.min.js)有 chicken-and-egg：老 update.sh 的 file_map 没有它，
+    # 同版本不会重下 → 文件永远缺。这里每次 apply 都补下 index 引用却不存在的资源。
+    if [[ -f "${ADMIN_DIR}/index.html" ]]; then
+        local _asset _src
+        select_download_source 2>/dev/null || true
+        for _asset in qrcode.min.js; do
+            if grep -q "$_asset" "${ADMIN_DIR}/index.html" && [[ ! -s "${ADMIN_DIR}/${_asset}" ]]; then
+                _src="${DOWNLOAD_URL:-$GITHUB_RAW}/web/${_asset}"
+                if download_and_validate "$_src" "${ADMIN_DIR}/${_asset}"; then
+                    print_success "  ✓ 补下缺失的 web 资源 ${_asset}"
+                    systemctl restart b-ui-admin 2>/dev/null || true
+                    updated=1
+                fi
+            fi
+        done
+    fi
+
     # v3.4.19 D2: BBRv3 自动升级
     # 已开 bbr 但系统支持更优的 bbr3/bbrv3/bbr_v3 → 升级
     if [[ -f /etc/sysctl.d/99-hysteria-bbr.conf ]]; then
