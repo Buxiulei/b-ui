@@ -976,6 +976,33 @@ EOF
         updated=1
     fi
 
+    # v3.5.15 D6: hy2 auth http→userpass（高并发硬化）
+    # http auth 每条连接回调 b-ui-admin /auth/hysteria，几十客户端共享订阅 + 重连风暴时
+    # 单线程面板成 SPOF；userpass 本地鉴权无依赖。v3.4→v3.5 迁移机的 residential 实例
+    # 常卡在 http（加 unit 后没经过面板存用户）。读 users.json 就地转 userpass，幂等。
+    if [[ -f "${BASE_DIR}/users.json" ]] && command -v jq >/dev/null 2>&1; then
+        local _upf; _upf=$(mktemp)
+        jq -r '.[] | "    \(.username): \(.password)"' "${BASE_DIR}/users.json" 2>/dev/null > "$_upf"
+        if [[ -s "$_upf" ]]; then
+            local _pair _cfg _svc
+            for _pair in "config.yaml:hysteria-server" "config-residential.yaml:hysteria-residential"; do
+                _cfg="${BASE_DIR}/${_pair%%:*}"; _svc="${_pair##*:}"
+                [[ -f "$_cfg" ]] || continue
+                grep -q '^  type: http' "$_cfg" || continue
+                awk -v upfile="$_upf" '
+                    /^auth:/ {print "auth:"; print "  type: userpass"; print "  userpass:"; while ((getline line < upfile) > 0) print line; close(upfile); skip=1; next}
+                    skip && /^[a-zA-Z]/ {skip=0}
+                    !skip {print}
+                ' "$_cfg" > "${_cfg}.tmp" && mv "${_cfg}.tmp" "$_cfg"
+                chmod 644 "$_cfg"
+                systemctl is-active --quiet "$_svc" 2>/dev/null && systemctl restart "$_svc" 2>/dev/null || true
+                print_success "  ✓ ${_svc} auth http→userpass（本地鉴权，高并发更稳）"
+                updated=1
+            done
+        fi
+        rm -f "$_upf"
+    fi
+
     # v3.4.19 D2: BBRv3 自动升级
     # 已开 bbr 但系统支持更优的 bbr3/bbrv3/bbr_v3 → 升级
     if [[ -f /etc/sysctl.d/99-hysteria-bbr.conf ]]; then

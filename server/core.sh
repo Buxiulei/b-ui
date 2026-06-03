@@ -630,7 +630,38 @@ EOF
 
     chmod 644 "$CONFIG_FILE" "${BASE_DIR}/config-residential.yaml" "$USERS_FILE"
 
+    # v3.5.15: 安装即把两个 hy2 实例的 auth 从 http 转成本地 userpass
+    # http auth 每条连接都回调 b-ui-admin /auth/hysteria，几十客户端共享一条订阅、
+    # 重连风暴时单线程面板成 SPOF；userpass 本地鉴权无依赖，高并发更稳。
+    # （这是 b-ui 既有设计：原本等首次面板存用户才切，这里提前到安装期。）
+    apply_hy2_userpass_auth
+
     print_success "Hysteria 双配置已生成: config.yaml (direct) + config-residential.yaml (resi)"
+}
+
+# 把 hy2 两实例的 auth 块从 http 改成本地 userpass（读 users.json）。幂等：已是 userpass 则跳过。
+# 安装期服务未起→仅改文件；update 期服务在跑→改完 restart。
+apply_hy2_userpass_auth() {
+    local uf="${USERS_FILE:-${BASE_DIR}/users.json}"
+    [[ -f "$uf" ]] || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+    local tmp_up; tmp_up=$(mktemp)
+    jq -r '.[] | "    \(.username): \(.password)"' "$uf" 2>/dev/null > "$tmp_up"
+    [[ -s "$tmp_up" ]] || { rm -f "$tmp_up"; return 0; }
+    local pair cfg svc
+    for pair in "config.yaml:hysteria-server" "config-residential.yaml:hysteria-residential"; do
+        cfg="${BASE_DIR}/${pair%%:*}"; svc="${pair##*:}"
+        [[ -f "$cfg" ]] || continue
+        grep -q '^  type: http' "$cfg" || continue   # 已是 userpass 就跳过
+        awk -v upfile="$tmp_up" '
+            /^auth:/ {print "auth:"; print "  type: userpass"; print "  userpass:"; while ((getline line < upfile) > 0) print line; close(upfile); skip=1; next}
+            skip && /^[a-zA-Z]/ {skip=0}
+            !skip {print}
+        ' "$cfg" > "${cfg}.tmp" && mv "${cfg}.tmp" "$cfg"
+        chmod 644 "$cfg"
+        systemctl is-active --quiet "$svc" 2>/dev/null && systemctl restart "$svc" 2>/dev/null || true
+    done
+    rm -f "$tmp_up"
 }
 
 #===============================================================================
