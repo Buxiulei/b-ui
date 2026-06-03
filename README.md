@@ -6,11 +6,21 @@
 
 轻量级 Hysteria2 + Xray 多协议代理一键部署工具，内置 Web 管理面板与全功能流量管理。
 
-**当前版本**: v3.5.13
+**当前版本**: v3.5.18
 
 ---
 
 ## 最新更新
+
+### v3.5.14 ~ v3.5.18 — 安装健壮性 + 多用户/高并发硬化 + 隐私收口
+- 🧯 **端口跳跃孤儿链崩溃循环根治** (v3.5.14/16)：SIGKILL/OOM 残留 `HYSTERIA-PR` 链 / `hysteria_*` nft 表 → 下次启动 `Chain already exists` FATAL 崩溃循环。新增 `hy2-portjump-cleanup.sh` 作为两实例 `ExecStartPre`，按 base 端口 + 跳跃端口段**双重定位**（连"建了空链、还没加 redirect"的残留也清），只清本实例、兼容 iptables/nft 两后端
+- 🔁 **重启存活 + 双实例自愈** (v3.5.14)：补 `enable hysteria-residential`（此前重启后住宅 HY2 不恢复）；watchdog / cert-sync / cert-check 全覆盖 direct + residential
+- 🚦 **多用户容量** (v3.5.14)：`nf_conntrack_max` 8192→按内存 131072+ + hashsize 开机预载；保留所有代理/跳跃端口避免临时端口抢占；`enable_bbr` 接入；`b-ui-admin` 加 `MemoryMax` 防 OOM 误杀代理进程
+- 🛠 **安装中断根治** (v3.5.14)：`install.sh` 的 `set -e` + 未保护的 `systemctl enable --now` 遇 Caddy ACME 超时会中途夭折（漏装 watchdog/cron/住宅 enable 等）→ 全部加 `|| true`；`configure_cron_tasks` 统一三条 cron（更新/内核/证书健康检查），消除引用不存在脚本的 dead code
+- ⚡ **高并发硬化** (v3.5.15)：hy2 两实例 auth 从 `http`（每条连接回调面板、重连风暴下成 SPOF）迁到本地 `userpass`，同一订阅几十客户端并发更稳
+- 🔒 **二维码本地生成** (v3.5.17)：内置 `qrcode.min.js` 浏览器本地出码，不再把节点链接（含域名/uuid/密码）发给境外 `api.qrserver.com`（隐私 + 国内可用性）；面板复制链接 sni/端口对齐订阅
+- 🩹 **新增静态文件投递自愈** (v3.5.18)：`apply_systemd_configs` 扫 `index.html` 引用却本地缺失的 web 资源自动从 GitHub 补下，消除新增前端文件的投递盲区
+- 📜 各版本详细根因与验证见 `version.json` changelog
 
 ### v3.5.13 — 伪装设置 Reality 四方分裂修复
 - 🩺 **故障**：改伪装站后客户端 VLESS Reality 报 `received real certificate (potential MITM)`，延迟测试 -1 / OperationCancelled（服务端日志却显示 Reality 仍在成功代理真实流量）
