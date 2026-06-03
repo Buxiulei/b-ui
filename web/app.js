@@ -141,11 +141,7 @@ function load() {
         const m = new Date().toISOString().slice(0, 7);
         allUsers = u;
 
-        // Preload QR codes
-        u.forEach(x => {
-            const uri = genUri(x);
-            new Image().src = "https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=" + encodeURIComponent(uri);
-        });
+        // 二维码现在本地生成（见 renderQR），无需预取外部图片
 
         $("#tb").innerHTML = u.map(x => {
             const on = o[x.username];
@@ -302,7 +298,11 @@ function genUri(x) {
         return "https://" + host + "/api/sub/" + x.username + "#" + x.username;
     }
     if (x.protocol === "vless-reality") {
-        const userSni = x.sni || cfg.sni || "www.bing.com";
+        // sni 以服务端实时 reality 配置(cfg.sni)为准，user.sni 是建用户时的旧拷贝。
+        // 改伪装后只动 xray-config、不回写老用户 sni；若优先 user.sni 会下发旧 sni →
+        // 与服务端 serverNames 不匹配 → REALITY received real certificate → 连不上。
+        // (与 server.js v3.5.13 订阅修复保持一致，避免"复制链接"路径重蹈覆辙)
+        const userSni = cfg.sni || x.sni || "www.bing.com";
         return "vless://" + x.uuid + "@" + cfg.domain + ":" + cfg.xrayPort +
             "?encryption=none&flow=xtls-rprx-vision&security=reality&sni=" + userSni +
             "&fp=chrome&pbk=" + cfg.pubKey + "&sid=" + cfg.shortId + "&spx=%2F&type=tcp#" +
@@ -310,7 +310,8 @@ function genUri(x) {
     }
     if (x.protocol === "vless-ws-tls") {
         const hostSni = x.sni || "www.bing.com";
-        return "vless://" + x.uuid + "@" + cfg.domain + ":" + (cfg.wsPort || 10002) +
+        // :10003 — vless-ws-tls 端口(v3.5.0 起 :10002 被 vless-residential 占用)
+        return "vless://" + x.uuid + "@" + cfg.domain + ":" + (cfg.wsPort || 10003) +
             "?encryption=none&security=tls&sni=" + cfg.domain +
             "&type=ws&host=" + hostSni + "&path=%2Fws#" +
             encodeURIComponent(x.username);
@@ -333,6 +334,18 @@ function genUri(x) {
 // 当前显示的用户名 (用于下载订阅)
 let currentShowUser = null;
 
+// 本地生成二维码（vendored /qrcode.min.js）。替代以前把节点链接(含域名/uuid/密码)
+// 发给境外 api.qrserver.com 渲染——既泄露凭据给第三方，国内还常刷不出码。
+function renderQR(uri) {
+    const el = $("#qrcode");
+    if (!el) return;
+    el.innerHTML = "";
+    if (typeof QRCode === "undefined") { el.innerText = "二维码库未加载"; return; }
+    new QRCode(el, { text: uri, width: 200, height: 200, correctLevel: QRCode.CorrectLevel.M });
+    const img = el.querySelector("canvas, img");
+    if (img) { img.style.display = "block"; img.style.borderRadius = "8px"; }
+}
+
 // Show user config
 function showU(uname) {
     const x = allUsers.find(u => u.username === uname);
@@ -346,9 +359,8 @@ function showU(uname) {
         $("#cfg-title").innerText = "融合订阅配置";
         $("#cfg-desc").innerHTML = "Hysteria2 + VLESS 自动故障切换<br><small>可导入 v2rayN / v2rayNG / Shadowrocket / bui-c 客户端</small>";
 
-        // 显示二维码
-        $("#qrcode").innerHTML = '<img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=' +
-            encodeURIComponent(uri) + '" alt="QR Code" style="display:block;border-radius:8px">';
+        // 显示二维码（本地生成，节点链接不外发）
+        renderQR(uri);
 
         $("#cfg-buttons").innerHTML = `
             <button class="btn" onclick="copy()"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;margin-right:5px"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>复制订阅链接</button>
@@ -367,9 +379,8 @@ function showU(uname) {
         $("#cfg-title").innerText = protoName + " 配置";
         $("#cfg-desc").innerText = "单协议客户端配置";
 
-        // 显示二维码
-        $("#qrcode").innerHTML = '<img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=' +
-            encodeURIComponent(uri) + '" alt="QR Code" style="display:block;border-radius:8px">';
+        // 显示二维码（本地生成，节点链接不外发）
+        renderQR(uri);
 
         // 按钮 - 根据协议类型显示
         let btnHtml = `<button class="btn" onclick="copy()"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;margin-right:5px"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>复制链接</button>`;

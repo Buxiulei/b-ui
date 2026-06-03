@@ -1239,6 +1239,14 @@ const server = http.createServer(async (req, res) => {
         } catch { return sendJSON(res, { error: "Not found" }, 404); }
     }
 
+    if (p === "/qrcode.min.js") {
+        try {
+            const js = fs.readFileSync(path.join(ADMIN_DIR, "qrcode.min.js"), "utf8");
+            res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
+            return res.end(js);
+        } catch { return sendJSON(res, { error: "Not found" }, 404); }
+    }
+
     if (p === "/logo.jpg") {
         try {
             const logo = fs.readFileSync(path.join(ADMIN_DIR, "logo.jpg"));

@@ -266,6 +266,7 @@ do_update() {
         "web/index.html:${ADMIN_DIR}/index.html"
         "web/style.css:${ADMIN_DIR}/style.css"
         "web/app.js:${ADMIN_DIR}/app.js"
+        "web/qrcode.min.js:${ADMIN_DIR}/qrcode.min.js"
         "web/logo.jpg:${ADMIN_DIR}/logo.jpg"
     )
     
@@ -1894,6 +1895,7 @@ auto_update() {
             ["web/index.html"]="${ADMIN_DIR}/index.html"
             ["web/style.css"]="${ADMIN_DIR}/style.css"
             ["web/app.js"]="${ADMIN_DIR}/app.js"
+            ["web/qrcode.min.js"]="${ADMIN_DIR}/qrcode.min.js"
             ["web/logo.jpg"]="${ADMIN_DIR}/logo.jpg"
             ["b-ui-client.sh"]="${BASE_DIR}/b-ui-client.sh"
         )

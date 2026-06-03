@@ -238,6 +238,7 @@ download_all_files() {
         "web/index.html:${ADMIN_DIR}/index.html"
         "web/style.css:${ADMIN_DIR}/style.css"
         "web/app.js:${ADMIN_DIR}/app.js"
+        "web/qrcode.min.js:${ADMIN_DIR}/qrcode.min.js"
         "web/logo.jpg:${ADMIN_DIR}/logo.jpg"
     )
     
