@@ -454,7 +454,9 @@ function getResidentialConfig() {
 function generateSingboxConfig(user, cfg, host) {
     const resi = getResidentialConfig();
     const proto = user.protocol || "fusion";
-    const includeResi = user.residential !== false && resi.enabled;
+    // 与链接列表生成器(genUri 路径)对齐：只看 user.residential，不再额外要求 resi.enabled。
+    // 住宅未配池时 relay fail-open 直连，住宅节点仍可用；两个生成器保持一致的 4 节点拓扑。
+    const includeResi = user.residential !== false;
     // v3.5.13 Bug B fix: cfg.sni（服务端 xray 实时 reality serverNames）优先于 user.sni。
     // user.sni 是建用户时固化的旧拷贝；reality serverNames 本就是服务端全局，per-user sni
     // 是伪需求。旧的 user.sni 优先导致改伪装后订阅永远发旧域名 → SNI 不匹配 → Reality 坏。
@@ -637,7 +639,9 @@ function generateSingboxConfig(user, cfg, host) {
 function generateClashConfig(user, cfg, host) {
     const resi = getResidentialConfig();
     const proto = user.protocol || "fusion";
-    const includeResi = user.residential !== false && resi.enabled;
+    // 与链接列表生成器(genUri 路径)对齐：只看 user.residential，不再额外要求 resi.enabled。
+    // 住宅未配池时 relay fail-open 直连，住宅节点仍可用；两个生成器保持一致的 4 节点拓扑。
+    const includeResi = user.residential !== false;
     // v3.5.13 Bug B fix: cfg.sni（服务端 xray 实时 reality serverNames）优先于 user.sni。
     // user.sni 是建用户时固化的旧拷贝；reality serverNames 本就是服务端全局，per-user sni
     // 是伪需求。旧的 user.sni 优先导致改伪装后订阅永远发旧域名 → SNI 不匹配 → Reality 坏。
@@ -1288,7 +1292,9 @@ const server = http.createServer(async (req, res) => {
             console.log("[install-client] 本地脚本不存在，尝试从 GitHub 获取...");
             const GITHUB_RAW = "https://raw.githubusercontent.com/Buxiulei/b-ui/main";
 
-            const https = require("https");
+            // 注意：server.js 是 ESM（package.json type:module），不能用 require()——
+            // 之前这里 `const https = require("https")` 会抛 ReferenceError 把整个面板进程打挂
+            // （全新安装本地无 b-ui-client.sh 必走此分支 → 登录/订阅全 502）。https 已在文件顶部 import。
             const fetchPromise = new Promise((resolve) => {
                 https.get(`${GITHUB_RAW}/b-ui-client.sh`, { timeout: 10000 }, (resp) => {
                     if (resp.statusCode === 200) {

@@ -459,7 +459,13 @@ collect_user_input() {
     # 伪装网站
     read -p "请输入伪装网站 URL [默认: https://www.bing.com/]: " MASQUERADE_URL
     MASQUERADE_URL=${MASQUERADE_URL:-"https://www.bing.com/"}
-    
+
+    # 首个用户的 VLESS uuid + sni（与面板建用户一致 → 首个用户也拥有全部 4 节点；
+    # 此前只写 hy2 字段、无 uuid，导致全新装后 VLESS-Reality 两节点没有客户端 → 2/4 节点失效）
+    FIRST_USER_UUID=$(generate_uuid)
+    FIRST_USER_SNI=$(echo "$MASQUERADE_URL" | sed -E 's|https?://([^/:]+).*|\1|')
+    [[ -z "$FIRST_USER_SNI" ]] && FIRST_USER_SNI="www.bing.com"
+
     # 端口跳跃配置
     read -p "是否启用端口跳跃 (抗 QoS 限速)? [默认: y]: " PORT_HOPPING_ENABLED
     PORT_HOPPING_ENABLED=${PORT_HOPPING_ENABLED:-y}
@@ -498,6 +504,7 @@ collect_user_input() {
     # 保存配置到全局变量供其他函数使用
     export DOMAIN EMAIL PORT ADMIN_PASSWORD FIRST_USER FIRST_USER_PASS MASQUERADE_URL PREDOWNLOAD_PACKAGES
     export PORT_HOPPING_ENABLED PORT_HOPPING_START PORT_HOPPING_END
+    export FIRST_USER_UUID FIRST_USER_SNI
 }
 
 #===============================================================================
@@ -513,7 +520,7 @@ configure_hysteria() {
     
     # 创建用户文件 (包含限速信息)
     cat > "$USERS_FILE" << EOF
-[{"username":"${FIRST_USER}","password":"${FIRST_USER_PASS}","createdAt":"$(date -Iseconds)","limits":{"speedLimit":100000000}}]
+[{"username":"${FIRST_USER}","password":"${FIRST_USER_PASS}","uuid":"${FIRST_USER_UUID}","sni":"${FIRST_USER_SNI}","protocol":"fusion","residential":true,"createdAt":"$(date -Iseconds)","limits":{"speedLimit":100000000}}]
 EOF
     
     # 决定 listen 字段：启用端口跳跃时使用 hysteria 2.9+ 内置多端口语法
@@ -776,7 +783,7 @@ configure_xray() {
       "tag": "vless-direct",
       "port": 10001,
       "protocol": "vless",
-      "settings": {"clients": [], "decryption": "none"},
+      "settings": {"clients": [{"id": "${FIRST_USER_UUID}", "flow": "xtls-rprx-vision", "email": "${FIRST_USER}"}], "decryption": "none"},
       "streamSettings": {
         "network": "tcp",
         "security": "reality",
@@ -793,7 +800,7 @@ configure_xray() {
       "tag": "vless-residential",
       "port": 10002,
       "protocol": "vless",
-      "settings": {"clients": [], "decryption": "none"},
+      "settings": {"clients": [{"id": "${FIRST_USER_UUID}", "flow": "xtls-rprx-vision", "email": "${FIRST_USER}"}], "decryption": "none"},
       "streamSettings": {
         "network": "tcp",
         "security": "reality",
@@ -1145,7 +1152,8 @@ configure_cron_tasks() {
     print_info "配置定时任务..."
     
     # 清除旧的 b-ui 相关 cron 任务
-    crontab -l 2>/dev/null | grep -v "certbot renew" | grep -v "b-ui" | grep -v "cert-check" | crontab - 2>/dev/null || true
+    # 注意带上 "B-UI 定时" 头注释（grep -v "b-ui" 区分大小写，漏掉大写头注释会每次重复追加）
+    crontab -l 2>/dev/null | grep -v "certbot renew" | grep -v "b-ui" | grep -v "cert-check" | grep -v "B-UI 定时" | crontab - 2>/dev/null || true
     
     # 创建 Caddy + 证书健康检查脚本
     cat > "${BASE_DIR}/cert-check.sh" << 'CERTEOF'
@@ -1580,14 +1588,22 @@ EOF
         print_warning "sing-box 下载失败，客户端将使用备用方式安装"
     fi
     
-    # 复制客户端脚本
+    # 复制客户端脚本 —— 必须落到 ${BASE_DIR}/b-ui-client.sh（server.js 一键安装首先读这里；
+    # 缺失会 fallback 到 GitHub 拉取分支）。install.sh 已无条件下载到 BASE_DIR，这里再确保 + 同步到 packages。
     print_info "准备客户端安装脚本..."
-    local client_script_url="https://raw.githubusercontent.com/Buxiulei/b-ui/main/b-ui-client.sh"
-    if curl -fsSL --max-time 60 "$client_script_url" -o "$PACKAGES_DIR/b-ui-client.sh" 2>/dev/null; then
-        chmod +x "$PACKAGES_DIR/b-ui-client.sh"
+    local cs_dst="${BASE_DIR}/b-ui-client.sh"
+    if [[ ! -s "$cs_dst" ]]; then
+        if curl -fsSL --max-time 60 "https://raw.githubusercontent.com/Buxiulei/b-ui/main/b-ui-client.sh" -o "$cs_dst" 2>/dev/null \
+           || curl -fsSL --max-time 60 "https://raw.githack.com/Buxiulei/b-ui/main/b-ui-client.sh" -o "$cs_dst" 2>/dev/null; then
+            :
+        fi
+    fi
+    if [[ -s "$cs_dst" ]]; then
+        chmod +x "$cs_dst"
+        cp -f "$cs_dst" "$PACKAGES_DIR/b-ui-client.sh" 2>/dev/null && chmod +x "$PACKAGES_DIR/b-ui-client.sh" 2>/dev/null
         print_success "客户端脚本准备完成"
     else
-        print_warning "客户端脚本下载失败"
+        print_error "客户端脚本下载失败 —— 客户端一键安装将不可用，请检查网络后重跑或手动放置 ${cs_dst}"
     fi
     
     # 显示下载结果
@@ -1834,10 +1850,14 @@ harden_ssh() {
     # 确保 sshd_config.d 存在并 Include（绝大多数发行版默认已 Include /etc/ssh/sshd_config.d/*.conf）
     mkdir -p /etc/ssh/sshd_config.d
 
-    local target_conf=/etc/ssh/sshd_config.d/99-b-ui-hardening.conf
+    # OpenSSH sshd_config.d 是"首个匹配生效" + 按字典序读取：要盖过 cloud-init 的
+    # 50-cloud-init.conf(PasswordAuthentication yes)，本文件必须排在它前面 → 用 00- 前缀。
+    # 老版本用 99-（排最后）反被 50-cloud-init 抢先生效，加固形同虚设（全新装实测踩坑）。
+    rm -f /etc/ssh/sshd_config.d/99-b-ui-hardening.conf 2>/dev/null
+    local target_conf=/etc/ssh/sshd_config.d/00-b-ui-hardening.conf
     local new_content
     new_content=$(cat <<'EOF'
-# B-UI SSH 加固（覆盖 50-cloud-init.conf）
+# B-UI SSH 加固（00- 前缀确保先于 50-cloud-init.conf 生效）
 PasswordAuthentication no
 PermitRootLogin prohibit-password
 KbdInteractiveAuthentication no
@@ -1854,9 +1874,9 @@ EOF
         return 0
     fi
 
-    print_info "检测到 ${pubkey_count} 个 SSH 公钥，写入 99-b-ui-hardening.conf 覆盖 cloud-init 默认..."
+    print_info "检测到 ${pubkey_count} 个 SSH 公钥，写入 00-b-ui-hardening.conf 覆盖 cloud-init 默认..."
 
-    # 写 99-... 后缀确保字典序最大，覆盖 50-cloud-init.conf
+    # 00- 前缀确保字典序最先被读取（OpenSSH 首个匹配生效），盖过 50-cloud-init.conf
     echo "$new_content" > "$target_conf"
     chmod 644 "$target_conf"
 

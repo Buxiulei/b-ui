@@ -702,9 +702,9 @@ uninstall_all() {
     # 清理 Caddy 配置 (保留 Caddy 程序供其他用途)
     rm -f /etc/caddy/Caddyfile 2>/dev/null
 
-    # 清理 SSH 加固 drop-in（不动 /etc/ssh/sshd_config.bak）
-    if [[ -f /etc/ssh/sshd_config.d/99-b-ui-hardening.conf ]]; then
-        rm -f /etc/ssh/sshd_config.d/99-b-ui-hardening.conf
+    # 清理 SSH 加固 drop-in（00- 新名 + 99- 老名，不动 /etc/ssh/sshd_config.bak）
+    if [[ -f /etc/ssh/sshd_config.d/00-b-ui-hardening.conf || -f /etc/ssh/sshd_config.d/99-b-ui-hardening.conf ]]; then
+        rm -f /etc/ssh/sshd_config.d/00-b-ui-hardening.conf /etc/ssh/sshd_config.d/99-b-ui-hardening.conf
         systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null || true
     fi
 
@@ -1145,10 +1145,12 @@ cmd_harden_ssh() {
     fi
 
     mkdir -p /etc/ssh/sshd_config.d
-    local target_conf=/etc/ssh/sshd_config.d/99-b-ui-hardening.conf
+    # 00- 前缀确保先于 50-cloud-init.conf 生效（OpenSSH 首个匹配生效）；清掉老 99- 残留
+    rm -f /etc/ssh/sshd_config.d/99-b-ui-hardening.conf
+    local target_conf=/etc/ssh/sshd_config.d/00-b-ui-hardening.conf
     local new_content
     new_content=$(cat <<'EOF'
-# B-UI SSH 加固（覆盖 50-cloud-init.conf）
+# B-UI SSH 加固（00- 前缀确保先于 50-cloud-init.conf 生效）
 PasswordAuthentication no
 PermitRootLogin prohibit-password
 KbdInteractiveAuthentication no
@@ -1169,7 +1171,7 @@ EOF
         print_success "  ✓ SSH 加固已启用（密码登录禁用，pubkey: ${pubkey_count}）"
         rm -f /opt/b-ui/.ssh-not-hardened
     else
-        rm -f /etc/ssh/sshd_config.d/99-b-ui-hardening.conf
+        rm -f /etc/ssh/sshd_config.d/00-b-ui-hardening.conf
         print_error "sshd -t 校验失败，已回滚"
         exit 1
     fi
@@ -1237,7 +1239,7 @@ dispatch_subcommand_server() {
   obfs <on|off|status>       hysteria2 obfs salamander 一键开关（GFW 高峰期应急）
   export-keys [path]         导出 reality-keys + users + install-key 到 tarball
   import-keys <path>         从 tarball 恢复（覆盖现有，重启 xray/admin）
-  harden-ssh                 SSH 加固（写 99-b-ui-hardening.conf，需要 pubkey）
+  harden-ssh                 SSH 加固（写 00-b-ui-hardening.conf，需要 pubkey）
   harden-system              重置 unattended-upgrades 自动安全更新
 
 通用 flags:

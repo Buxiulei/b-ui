@@ -233,6 +233,7 @@ download_all_files() {
         "server/b-ui-cli.sh:${BASE_DIR}/b-ui-cli.sh"
         "server/update.sh:${BASE_DIR}/update.sh"
         "server/residential-helper.sh:${BASE_DIR}/residential-helper.sh"
+        "b-ui-client.sh:${BASE_DIR}/b-ui-client.sh"
         "web/server.js:${ADMIN_DIR}/server.js"
         "web/package.json:${ADMIN_DIR}/package.json"
         "web/index.html:${ADMIN_DIR}/index.html"

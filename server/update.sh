@@ -603,8 +603,15 @@ EOF
 }
 
 migrate_ssh_hardening() {
-    # 已加固 → 跳过
-    [[ -f /etc/ssh/sshd_config.d/99-b-ui-hardening.conf ]] && return 0
+    # 迁移老 99-b-ui-hardening.conf → 00-（OpenSSH 首个匹配生效，99 排在 50-cloud-init.conf
+    # 之后反被其 PasswordAuthentication yes 抢先 → 密码登录其实没关。00- 排最前才真正生效）。
+    if [[ -f /etc/ssh/sshd_config.d/99-b-ui-hardening.conf ]] && [[ ! -f /etc/ssh/sshd_config.d/00-b-ui-hardening.conf ]]; then
+        mv -f /etc/ssh/sshd_config.d/99-b-ui-hardening.conf /etc/ssh/sshd_config.d/00-b-ui-hardening.conf
+        sshd -t 2>/dev/null && { systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null || true; }
+        print_info "  ✓ SSH 加固 drop-in 迁移 99→00（修复被 cloud-init 抢先、密码登录未真正关闭）"
+    fi
+    # 已加固（00- 存在）→ 跳过
+    [[ -f /etc/ssh/sshd_config.d/00-b-ui-hardening.conf ]] && return 0
     # 用户明确不加固（首装时无 pubkey）→ 跳过
     [[ -f /opt/b-ui/.ssh-not-hardened ]] && return 0
 
@@ -622,21 +629,22 @@ migrate_ssh_hardening() {
     fi
 
     mkdir -p /etc/ssh/sshd_config.d
-    cat > /etc/ssh/sshd_config.d/99-b-ui-hardening.conf <<'EOF'
-# B-UI SSH 加固（覆盖 50-cloud-init.conf）
+    rm -f /etc/ssh/sshd_config.d/99-b-ui-hardening.conf
+    cat > /etc/ssh/sshd_config.d/00-b-ui-hardening.conf <<'EOF'
+# B-UI SSH 加固（00- 前缀确保先于 50-cloud-init.conf 生效）
 PasswordAuthentication no
 PermitRootLogin prohibit-password
 KbdInteractiveAuthentication no
 ChallengeResponseAuthentication no
 EOF
-    chmod 644 /etc/ssh/sshd_config.d/99-b-ui-hardening.conf
+    chmod 644 /etc/ssh/sshd_config.d/00-b-ui-hardening.conf
 
     if sshd -t 2>/dev/null; then
         systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null || \
             systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null
         print_info "  ✓ SSH 加固已启用（密码登录禁用，pubkey 数量: ${pubkey_count}）"
     else
-        rm -f /etc/ssh/sshd_config.d/99-b-ui-hardening.conf
+        rm -f /etc/ssh/sshd_config.d/00-b-ui-hardening.conf
         print_warning "  sshd -t 校验失败，已回滚 SSH 加固"
     fi
 }
