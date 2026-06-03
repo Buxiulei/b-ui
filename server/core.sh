@@ -138,30 +138,39 @@ install_hysteria() {
     # ────────────────────────────────────────────────────────────────────
     cat > /opt/b-ui/hy2-portjump-cleanup.sh <<'CLEANUP_EOF'
 #!/bin/sh
-# 删除"只属于本实例"的孤儿端口跳跃 NAT 规则（按 REDIRECT 目标端口区分实例，绝不碰另一实例）。
-# 同时覆盖两种后端：iptables(HYSTERIA-PR-<hash> 链) 与 nft(hysteria_<hash> 表)——hysteria 探测到
-# nft 就用 nft、否则 iptables；本脚本两种都清，不强制切换后端以免扰动在跑的机器。
-# 正常 SIGTERM 退出时 hysteria 已自清，本脚本为 no-op；仅在 SIGKILL/OOM 残留时清理。
-# 参数可为 base 端口数字，或 hysteria 配置文件路径（从 listen: :PORT,... 提取，支持自定义直连端口）。
+# 删除"只属于本实例"的孤儿端口跳跃 NAT 规则。按本实例 base 端口(REDIRECT 目标) + 跳跃端口段
+# (--dport range) 双重定位：既清"有 redirect 规则的完整孤儿"，也清"crash 在 -N 之后、加 redirect
+# 之前残留的空链(0 内部规则但有 dport 跳转)"——后者是 v3.5.15 实测的崩溃循环元凶。range 按实例唯一
+# (直连 20000-30000 / 住宅 41000-50000)，绝不跨实例误删。同时覆盖 iptables 与 nft 后端，不强制切换。
+# 正常 SIGTERM 退出 hysteria 已自清，本脚本为 no-op；仅 SIGKILL/OOM 残留时清理。
+# 参数：hysteria 配置文件路径(从 listen: :BASE,RANGE 提取)，或纯 base 端口数字(无 range 只清完整孤儿)。
 arg="$1"
 [ -z "$arg" ] && exit 0
 case "$arg" in
-    *[!0-9]*) base=$(awk '/^listen:/{ sub(/^listen: *:/,""); split($0,a,","); print a[1]; exit }' "$arg" 2>/dev/null) ;;
-    *)        base="$arg" ;;
+    *[!0-9]*)
+        base=$(awk '/^listen:/{ sub(/^listen: *:/,""); split($0,a,","); print a[1]; exit }' "$arg" 2>/dev/null)
+        range=$(awk '/^listen:/{ sub(/^listen: *:/,""); split($0,a,","); print a[2]; exit }' "$arg" 2>/dev/null)
+        ;;
+    *)  base="$arg"; range="" ;;
 esac
 [ -z "$base" ] && exit 0
+rangec=$(printf '%s' "$range" | tr '-' ':')
 
-# 后端 A: iptables / ip6tables —— 删 REDIRECT 到本 base 端口的 HYSTERIA-PR 链
+# 后端 A: iptables / ip6tables —— 收集本实例链名(redirect 到 base 的完整链 + dport range 跳转引用的链含空链)
 for ipt in iptables ip6tables; do
     command -v "$ipt" >/dev/null 2>&1 || continue
-    chains=$("$ipt" -t nat -S 2>/dev/null | \
-        sed -n "s/^-A \\(HYSTERIA-PR-[A-Za-z0-9]*\\) .*--to-ports ${base}\$/\\1/p" | sort -u)
+    S=$("$ipt" -t nat -S 2>/dev/null)
+    chains=$(printf '%s\n' "$S" | sed -n "s/^-A \\(HYSTERIA-PR-[A-Za-z0-9]*\\) .*--to-ports ${base}\$/\\1/p")
+    if [ -n "$rangec" ]; then
+        chains="${chains}
+$(printf '%s\n' "$S" | sed -n "s/^-A .* --dport ${rangec} -j \\(HYSTERIA-PR-[A-Za-z0-9]*\\)\$/\\1/p")"
+    fi
+    chains=$(printf '%s\n' "$chains" | sort -u | grep -v '^$')
     [ -z "$chains" ] && continue
     for ch in $chains; do
-        "$ipt" -t nat -S 2>/dev/null | grep -- "-j ${ch}\$" | while read -r line; do
-            rule=$(printf '%s' "$line" | sed 's/^-A /-D /')
+        printf '%s\n' "$S" | grep -- "-j ${ch}\$" | while read -r line; do
             # shellcheck disable=SC2086
-            "$ipt" -t nat $rule 2>/dev/null || true
+            "$ipt" -t nat $(printf '%s' "$line" | sed 's/^-A /-D /') 2>/dev/null || true
         done
         "$ipt" -t nat -F "$ch" 2>/dev/null || true
         "$ipt" -t nat -X "$ch" 2>/dev/null || true
@@ -253,9 +262,9 @@ Environment=GOMEMLIMIT=200MiB
 Environment=HYSTERIA_LOG_LEVEL=warn
 MemoryHigh=300M
 MemoryMax=500M
-# 启动前清理"仅本实例"的孤儿端口跳跃 NAT 链（base=40000，按 --to-ports 区分实例）
+# 启动前清理"仅本实例"的孤儿端口跳跃 NAT 链（从 config-residential.yaml 提取 base=40000+range）
 # 绝不碰直连实例（:10000）的链。`-` 前缀使清理失败不致命。详见 hy2-portjump-cleanup.sh
-ExecStartPre=-/opt/b-ui/hy2-portjump-cleanup.sh 40000
+ExecStartPre=-/opt/b-ui/hy2-portjump-cleanup.sh /opt/b-ui/config-residential.yaml
 TimeoutStopSec=15
 Restart=always
 RestartSec=3

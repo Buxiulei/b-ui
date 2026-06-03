@@ -829,28 +829,36 @@ EOF
         # 精确清理的版本（见 core.sh 同名脚本），并删掉误导的旧脚本。
         cat > /opt/b-ui/hy2-portjump-cleanup.sh <<'CLEANUP_EOF'
 #!/bin/sh
-# 删除"只属于本实例"的孤儿端口跳跃 NAT 规则（按 REDIRECT 目标端口区分实例，绝不碰另一实例）。
-# 同时覆盖两种后端：iptables(HYSTERIA-PR-<hash> 链) 与 nft(hysteria_<hash> 表)，不强制切换后端。
-# 正常 SIGTERM 退出时 hysteria 已自清，本脚本为 no-op；仅在 SIGKILL/OOM 残留时清理。
-# 参数可为 base 端口数字，或 hysteria 配置文件路径（从 listen: :PORT,... 提取，支持自定义直连端口）。
+# 删除"只属于本实例"的孤儿端口跳跃 NAT 规则。按 base 端口(REDIRECT 目标) + 跳跃端口段(--dport range)
+# 双重定位：既清"有 redirect 规则的完整孤儿"，也清"crash 在 -N 后、加 redirect 前残留的空链(0 内部
+# 规则但有 dport 跳转)"——v3.5.15 实测崩溃循环元凶。range 按实例唯一，绝不跨实例误删。覆盖 iptables+nft。
+# 参数：hysteria 配置文件路径(从 listen: :BASE,RANGE 提取)，或纯 base 端口数字(无 range 只清完整孤儿)。
 arg="$1"
 [ -z "$arg" ] && exit 0
 case "$arg" in
-    *[!0-9]*) base=$(awk '/^listen:/{ sub(/^listen: *:/,""); split($0,a,","); print a[1]; exit }' "$arg" 2>/dev/null) ;;
-    *)        base="$arg" ;;
+    *[!0-9]*)
+        base=$(awk '/^listen:/{ sub(/^listen: *:/,""); split($0,a,","); print a[1]; exit }' "$arg" 2>/dev/null)
+        range=$(awk '/^listen:/{ sub(/^listen: *:/,""); split($0,a,","); print a[2]; exit }' "$arg" 2>/dev/null)
+        ;;
+    *)  base="$arg"; range="" ;;
 esac
 [ -z "$base" ] && exit 0
+rangec=$(printf '%s' "$range" | tr '-' ':')
 # 后端 A: iptables / ip6tables
 for ipt in iptables ip6tables; do
     command -v "$ipt" >/dev/null 2>&1 || continue
-    chains=$("$ipt" -t nat -S 2>/dev/null | \
-        sed -n "s/^-A \\(HYSTERIA-PR-[A-Za-z0-9]*\\) .*--to-ports ${base}\$/\\1/p" | sort -u)
+    S=$("$ipt" -t nat -S 2>/dev/null)
+    chains=$(printf '%s\n' "$S" | sed -n "s/^-A \\(HYSTERIA-PR-[A-Za-z0-9]*\\) .*--to-ports ${base}\$/\\1/p")
+    if [ -n "$rangec" ]; then
+        chains="${chains}
+$(printf '%s\n' "$S" | sed -n "s/^-A .* --dport ${rangec} -j \\(HYSTERIA-PR-[A-Za-z0-9]*\\)\$/\\1/p")"
+    fi
+    chains=$(printf '%s\n' "$chains" | sort -u | grep -v '^$')
     [ -z "$chains" ] && continue
     for ch in $chains; do
-        "$ipt" -t nat -S 2>/dev/null | grep -- "-j ${ch}\$" | while read -r line; do
-            rule=$(printf '%s' "$line" | sed 's/^-A /-D /')
+        printf '%s\n' "$S" | grep -- "-j ${ch}\$" | while read -r line; do
             # shellcheck disable=SC2086
-            "$ipt" -t nat $rule 2>/dev/null || true
+            "$ipt" -t nat $(printf '%s' "$line" | sed 's/^-A /-D /') 2>/dev/null || true
         done
         "$ipt" -t nat -F "$ch" 2>/dev/null || true
         "$ipt" -t nat -X "$ch" 2>/dev/null || true
@@ -1365,8 +1373,8 @@ Environment=GOMEMLIMIT=200MiB
 Environment=HYSTERIA_LOG_LEVEL=warn
 MemoryHigh=300M
 MemoryMax=500M
-# 启动前清理"仅本实例"的孤儿端口跳跃 NAT 链（base=40000，绝不碰直连实例 :10000）
-ExecStartPre=-/opt/b-ui/hy2-portjump-cleanup.sh 40000
+# 启动前清理"仅本实例"的孤儿端口跳跃 NAT 链（从 config-residential.yaml 提取 base=40000+range）
+ExecStartPre=-/opt/b-ui/hy2-portjump-cleanup.sh /opt/b-ui/config-residential.yaml
 TimeoutStopSec=15
 Restart=always
 RestartSec=3
@@ -1437,12 +1445,11 @@ EOF
     #      老机器重启后住宅 HY2 节点不恢复
     if [[ -f /etc/systemd/system/hysteria-residential.service ]]; then
         local _resi_changed=0
-        if grep -q "hy2-nft-cleanup.sh" /etc/systemd/system/hysteria-residential.service; then
-            sed -i '/^ExecStartPre=-\/opt\/b-ui\/hy2-nft-cleanup\.sh/d' /etc/systemd/system/hysteria-residential.service
-            _resi_changed=1
-        fi
-        if ! grep -q "hy2-portjump-cleanup.sh 40000" /etc/systemd/system/hysteria-residential.service; then
-            sed -i '/^ExecStart=\/usr\/local\/bin\/hysteria/a ExecStartPre=-/opt/b-ui/hy2-portjump-cleanup.sh 40000' /etc/systemd/system/hysteria-residential.service
+        # 期望的 ExecStartPre（config 路径，脚本从中提取 base+range，能清空链孤儿）。
+        # 若当前不是这一行（老 nft 脚本 / 旧 40000 数字参数 / 缺失），统一删旧再注入。
+        if ! grep -qF 'ExecStartPre=-/opt/b-ui/hy2-portjump-cleanup.sh /opt/b-ui/config-residential.yaml' /etc/systemd/system/hysteria-residential.service; then
+            sed -i '/ExecStartPre=-\/opt\/b-ui\/hy2-.*cleanup\.sh/d' /etc/systemd/system/hysteria-residential.service
+            sed -i '/^ExecStart=\/usr\/local\/bin\/hysteria/a ExecStartPre=-/opt/b-ui/hy2-portjump-cleanup.sh /opt/b-ui/config-residential.yaml' /etc/systemd/system/hysteria-residential.service
             _resi_changed=1
         fi
         if [[ $_resi_changed -eq 1 ]]; then
