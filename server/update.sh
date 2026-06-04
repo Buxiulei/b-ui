@@ -1046,8 +1046,14 @@ EOF
         local _nmem
         _nmem=$(jq -r '[.outbounds[]|select(.type=="socks")]|length' /opt/b-ui/singbox-relay.json 2>/dev/null || echo 0)
         if [[ "${_nmem:-0}" -ge 2 ]]; then
+            # 自愈下载 resi-health.sh（新增文件 chicken-and-egg：老 update.sh 的 file_map 没有它，
+            # 同版本不会重下 → 这里缺失则直接补下，确保 timer 能建起来）
+            if [[ ! -s /opt/b-ui/resi-health.sh ]]; then
+                select_download_source 2>/dev/null || true
+                download_and_validate "${DOWNLOAD_URL:-$GITHUB_RAW}/server/resi-health.sh" /opt/b-ui/resi-health.sh 2>/dev/null || true
+            fi
             [[ -f /opt/b-ui/resi-health.sh ]] && chmod +x /opt/b-ui/resi-health.sh
-            if [[ -f /opt/b-ui/resi-health.sh ]] && [[ ! -f /etc/systemd/system/b-ui-resi-health.timer ]]; then
+            if [[ -s /opt/b-ui/resi-health.sh ]] && [[ ! -f /etc/systemd/system/b-ui-resi-health.timer ]]; then
                 cat > /etc/systemd/system/b-ui-resi-health.service <<'EOF'
 [Unit]
 Description=B-UI Residential Line Health Monitor
