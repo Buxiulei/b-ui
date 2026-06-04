@@ -664,11 +664,10 @@ uninstall_all() {
     echo -e "${RED}════════════════════════════════════════════════════════════════${NC}"
     echo ""
     echo -e "将删除以下内容："
-    echo -e "  - Hysteria2 服务和二进制文件"
-    echo -e "  - B-UI 管理面板服务和文件"
-    echo -e "  - 所有用户配置和流量数据"
-    echo -e "  - Nginx 代理配置"
-    echo -e "  - b-ui 命令行工具"
+    echo -e "  - Hysteria2 直连/住宅双实例 + Xray + 出站中继 服务和二进制"
+    echo -e "  - B-UI 管理面板、watchdog、证书同步、所有 systemd unit/drop-in"
+    echo -e "  - 所有用户配置和流量数据 + b-ui 命令行工具"
+    echo -e "  - b-ui 写入的 sysctl/内核模块、端口跳跃 NAT 规则、SSH 加固、cron、Caddy 配置"
     echo ""
     read -p "确定要继续吗? (输入 YES 确认): " confirm
     
@@ -679,28 +678,56 @@ uninstall_all() {
     
     print_info "开始卸载..."
     
-    # 停止服务
-    systemctl stop hysteria-server caddy b-ui-admin xray b-ui-cert-sync.timer 2>/dev/null || true
-    systemctl disable hysteria-server caddy b-ui-admin xray b-ui-cert-sync.timer b-ui-cert-sync 2>/dev/null || true
-    
-    # 删除服务文件
-    rm -f /etc/systemd/system/hysteria-server.service
-    rm -f /etc/systemd/system/b-ui-admin.service
-    rm -f /etc/systemd/system/b-ui-cert-sync.service
-    rm -f /etc/systemd/system/b-ui-cert-sync.timer
-    rm -rf /etc/systemd/system/hysteria-server.service.d
+    # 停止 + 禁用所有 b-ui 服务（含 v3.5 住宅实例 / watchdog / cert-sync / 出站中继）
+    for s in hysteria-server hysteria-residential xray b-ui-admin caddy \
+             b-ui-cert-sync.timer b-ui-cert-sync.service hy2-watchdog.timer hy2-watchdog.service b-ui-relay; do
+        systemctl stop "$s" 2>/dev/null || true
+        systemctl disable "$s" 2>/dev/null || true
+    done
+    pkill -9 sing-box 2>/dev/null || true
+    pkill -9 hysteria 2>/dev/null || true
+
+    # 删除 systemd unit + drop-in（含住宅实例 / watchdog / 中继 / admin 内存 drop-in）
+    rm -f /etc/systemd/system/hysteria-server.service /etc/systemd/system/hysteria-residential.service
+    rm -rf /etc/systemd/system/hysteria-server.service.d /etc/systemd/system/hysteria-residential.service.d
+    rm -f /etc/systemd/system/b-ui-admin.service; rm -rf /etc/systemd/system/b-ui-admin.service.d
     rm -rf /etc/systemd/system/xray.service.d
+    rm -f /etc/systemd/system/b-ui-cert-sync.service /etc/systemd/system/b-ui-cert-sync.timer
+    rm -f /etc/systemd/system/hy2-watchdog.service /etc/systemd/system/hy2-watchdog.timer
+    rm -f /etc/systemd/system/b-ui-relay.service
     systemctl daemon-reload
-    
+
     # 删除程序文件
-    rm -f /usr/local/bin/hysteria
-    rm -f /usr/local/bin/xray
-    rm -rf /usr/local/share/xray
-    rm -rf /opt/b-ui
-    rm -f /usr/local/bin/b-ui
-    
+    rm -f /usr/local/bin/hysteria /usr/local/bin/xray /usr/local/bin/b-ui
+    rm -rf /usr/local/share/xray /opt/b-ui /etc/hysteria
+
+    # 清理 b-ui 写入的 sysctl / 内核模块配置
+    rm -f /etc/sysctl.d/99-b-ui-network.conf /etc/sysctl.d/99-b-ui-memory.conf \
+          /etc/sysctl.d/99-b-ui-conntrack.conf /etc/sysctl.d/99-hysteria-perf.conf \
+          /etc/sysctl.d/99-hysteria-bbr.conf
+    rm -f /etc/modprobe.d/b-ui-nf_conntrack.conf /etc/modules-load.d/b-ui-conntrack.conf
+    sysctl --system >/dev/null 2>&1 || true
+
+    # 清理 hysteria 端口跳跃 NAT 规则（iptables HYSTERIA-PR 链 + nft hysteria_ 表）
+    for ipt in iptables ip6tables; do
+        command -v "$ipt" >/dev/null 2>&1 || continue
+        for ch in $("$ipt" -t nat -S 2>/dev/null | sed -n 's/^-N \(HYSTERIA-PR-[A-Za-z0-9]*\)$/\1/p'); do
+            "$ipt" -t nat -S 2>/dev/null | grep -- "-j ${ch}\$" | while read -r l; do
+                # shellcheck disable=SC2086
+                "$ipt" -t nat $(printf '%s' "$l" | sed 's/^-A /-D /') 2>/dev/null || true
+            done
+            "$ipt" -t nat -F "$ch" 2>/dev/null || true
+            "$ipt" -t nat -X "$ch" 2>/dev/null || true
+        done
+    done
+    if command -v nft >/dev/null 2>&1; then
+        nft list tables 2>/dev/null | awk '$3 ~ /^hysteria_/{print $2, $3}' | while read -r f t; do
+            nft delete table "$f" "$t" 2>/dev/null || true
+        done
+    fi
+
     # 清理 Caddy 配置 (保留 Caddy 程序供其他用途)
-    rm -f /etc/caddy/Caddyfile 2>/dev/null
+    rm -f /etc/caddy/Caddyfile 2>/dev/null || true
 
     # 清理 SSH 加固 drop-in（00- 新名 + 99- 老名，不动 /etc/ssh/sshd_config.bak）
     if [[ -f /etc/ssh/sshd_config.d/00-b-ui-hardening.conf || -f /etc/ssh/sshd_config.d/99-b-ui-hardening.conf ]]; then
@@ -711,9 +738,9 @@ uninstall_all() {
     # 清理旧版 Nginx 配置 (如果存在)
     rm -f /etc/nginx/conf.d/b-ui-admin.conf 2>/dev/null
     systemctl reload nginx 2>/dev/null || true
-    
-    # 清理 cron 任务
-    crontab -l 2>/dev/null | grep -vE "b-ui|cert-check|cert-sync" | crontab - 2>/dev/null || true
+
+    # 清理 cron 任务（含大写"B-UI 定时"头注释 + 内核更新行）
+    crontab -l 2>/dev/null | grep -vE "b-ui|cert-check|cert-sync|B-UI 定时" | crontab - 2>/dev/null || true
     
     echo ""
     echo -e "${GREEN}════════════════════════════════════════════════════════════════${NC}"
