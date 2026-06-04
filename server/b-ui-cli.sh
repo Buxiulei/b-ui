@@ -680,7 +680,8 @@ uninstall_all() {
     
     # 停止 + 禁用所有 b-ui 服务（含 v3.5 住宅实例 / watchdog / cert-sync / 出站中继）
     for s in hysteria-server hysteria-residential xray b-ui-admin caddy \
-             b-ui-cert-sync.timer b-ui-cert-sync.service hy2-watchdog.timer hy2-watchdog.service b-ui-relay; do
+             b-ui-cert-sync.timer b-ui-cert-sync.service hy2-watchdog.timer hy2-watchdog.service \
+             b-ui-resi-health.timer b-ui-resi-health.service b-ui-relay; do
         systemctl stop "$s" 2>/dev/null || true
         systemctl disable "$s" 2>/dev/null || true
     done
@@ -694,6 +695,7 @@ uninstall_all() {
     rm -rf /etc/systemd/system/xray.service.d
     rm -f /etc/systemd/system/b-ui-cert-sync.service /etc/systemd/system/b-ui-cert-sync.timer
     rm -f /etc/systemd/system/hy2-watchdog.service /etc/systemd/system/hy2-watchdog.timer
+    rm -f /etc/systemd/system/b-ui-resi-health.service /etc/systemd/system/b-ui-resi-health.timer
     rm -f /etc/systemd/system/b-ui-relay.service
     systemctl daemon-reload
 

@@ -260,6 +260,7 @@ do_update() {
         "server/b-ui-cli.sh:${BASE_DIR}/b-ui-cli.sh"
         "server/update.sh:${BASE_DIR}/update.sh"
         "server/residential-helper.sh:${BASE_DIR}/residential-helper.sh"
+        "server/resi-health.sh:${BASE_DIR}/resi-health.sh"
         "b-ui-client.sh:${BASE_DIR}/b-ui-client.sh"
         "web/server.js:${ADMIN_DIR}/server.js"
         "web/package.json:${ADMIN_DIR}/package.json"
@@ -1036,6 +1037,49 @@ EOF
                 fi
             fi
         done
+    fi
+
+    # v3.5.22 D8: 住宅线路可靠性监测 timer（reliability-aware failover）
+    # relay 有 ≥2 条住宅上游(socks 出站)时确保 b-ui-resi-health.timer 启用——它定期真实探测每条
+    # 住宅线路，质量差的自动从 urltest 池剔除(流量转到好线路)、恢复后加回。<2 条则清理该 timer。
+    if [[ -f /opt/b-ui/singbox-relay.json ]] && command -v jq >/dev/null 2>&1; then
+        local _nmem
+        _nmem=$(jq -r '[.outbounds[]|select(.type=="socks")]|length' /opt/b-ui/singbox-relay.json 2>/dev/null || echo 0)
+        if [[ "${_nmem:-0}" -ge 2 ]]; then
+            [[ -f /opt/b-ui/resi-health.sh ]] && chmod +x /opt/b-ui/resi-health.sh
+            if [[ -f /opt/b-ui/resi-health.sh ]] && [[ ! -f /etc/systemd/system/b-ui-resi-health.timer ]]; then
+                cat > /etc/systemd/system/b-ui-resi-health.service <<'EOF'
+[Unit]
+Description=B-UI Residential Line Health Monitor
+After=b-ui-relay.service
+[Service]
+Type=oneshot
+ExecStart=/opt/b-ui/resi-health.sh
+EOF
+                cat > /etc/systemd/system/b-ui-resi-health.timer <<'EOF'
+[Unit]
+Description=B-UI Residential Health Timer
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+AccuracySec=20s
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOF
+                systemctl daemon-reload
+                systemctl enable --now b-ui-resi-health.timer 2>/dev/null || true
+                print_success "  ✓ 住宅线路可靠性监测已启用（每2min 探测，质量差自动切到好线路）"
+                updated=1
+            fi
+        else
+            # 单条/未启用住宅 → 无可切换，清理监测 timer
+            if [[ -f /etc/systemd/system/b-ui-resi-health.timer ]]; then
+                systemctl disable --now b-ui-resi-health.timer 2>/dev/null || true
+                rm -f /etc/systemd/system/b-ui-resi-health.timer /etc/systemd/system/b-ui-resi-health.service
+                systemctl daemon-reload
+            fi
+        fi
     fi
 
     # v3.4.19 D2: BBRv3 自动升级
@@ -1916,6 +1960,7 @@ auto_update() {
             ["server/b-ui-cli.sh"]="${BASE_DIR}/b-ui-cli.sh"
             ["server/update.sh"]="${BASE_DIR}/update.sh"
             ["server/residential-helper.sh"]="${BASE_DIR}/residential-helper.sh"
+            ["server/resi-health.sh"]="${BASE_DIR}/resi-health.sh"
             ["web/server.js"]="${ADMIN_DIR}/server.js"
             ["web/package.json"]="${ADMIN_DIR}/package.json"
             ["web/index.html"]="${ADMIN_DIR}/index.html"
