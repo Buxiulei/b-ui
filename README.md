@@ -124,6 +124,7 @@
 - **多模式**: 全局 TUN 代理 (Hysteria2 + VLESS-Reality)、SSH 连接保护
 - **服务端优先更新**: 内核从服务端下载，解决 GitHub 不可达问题
 - **服务控制**: 实时状态显示，一键启停/重启/查看日志
+- 🪟 **v2rayN TUN + IPv6**：服务端无 IPv6 出口时的推荐设置见 [docs/v2rayn-tun-ipv6.md](docs/v2rayn-tun-ipv6.md)
 
 ---
 
