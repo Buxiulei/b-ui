@@ -39,7 +39,7 @@ acquire_relay_lock() {
     flock -w 30 9 || { err "获取 relay 锁超时(30s)，可能有另一个 residential-helper/resi-health 在运行"; exit 1; }
 }
 
-PRIVATE_CIDRS='["127.0.0.0/8","10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","169.254.0.0/16"]'
+PRIVATE_CIDRS='["127.0.0.0/8","10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","169.254.0.0/16","::1/128","fc00::/7","fe80::/10"]'
 
 RED='\033[0;31m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 err()  { echo -e "${RED}ERROR: $*${NC}" >&2; }
@@ -240,7 +240,7 @@ write_singbox_config_residential_multi() {
                       else [{"domain_keyword": $kw, "server": "dns_resi"}]
                       end),
             "final": (if $is_global then "dns_resi" else "dns_direct" end),
-            "strategy": "prefer_ipv4"
+            "strategy": "ipv4_only"
           },
           "inbounds": [{
             "type": "socks",
@@ -293,7 +293,7 @@ write_singbox_config_direct() {
               {"tag": "dns_direct", "type": "udp", "server": "1.1.1.1"}
             ],
             "final": "dns_direct",
-            "strategy": "prefer_ipv4"
+            "strategy": "ipv4_only"
           },
           "inbounds": [{
             "type": "socks",

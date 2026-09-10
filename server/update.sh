@@ -412,7 +412,9 @@ update_service_paths() {
 
 # config.yaml 完整性修复：从 users.json 重新生成 auth/trafficStats/masquerade/sniff 段
 # 保留 listen / tls / quic 已有段（避免覆盖端口/证书路径）
-# v3.5+: hy2-direct (config.yaml) 永远内置直连，不写 outbounds/acl/RESIDENTIAL block
+# v3.5+: hy2-direct (config.yaml) 永远直连，不写 acl/RESIDENTIAL block
+# v3.6.0: 唯一允许的 outbounds 是 direct(mode 4)——VPS 无 IPv6 出口，必须显式只拨 IPv4；
+#         修复出来的 config 自带这块，D9 迁移即为幂等空操作
 repair_hysteria_config() {
     local config_file="${BASE_DIR}/config.yaml"
     local users_file="${BASE_DIR}/users.json"
@@ -484,6 +486,13 @@ resolver:
   https:
     addr: "1.1.1.1:443"
     sni: cloudflare-dns.com
+
+# v3.6.0: 出站只走 IPv4（VPS 无 IPv6 出口）
+outbounds:
+  - name: direct
+    type: direct
+    direct:
+      mode: 4
 EOF
     mv "${config_file}.tmp" "$config_file"
     chmod 644 "$config_file"
@@ -657,6 +666,63 @@ migrate_relay_log() {
         if [[ -f "${BASE_DIR}/residential-helper.sh" ]]; then
             bash "${BASE_DIR}/residential-helper.sh" reapply 2>/dev/null || true
             print_info "  ✓ b-ui-relay: 日志改走 journal（清理 StandardOutput=null）"
+        fi
+    fi
+}
+
+# v3.6.0 D9: 服务端出站 IPv4-only（VPS 无 IPv6 出口，v6 目标拨号必失败）
+#   config.yaml             缺 outbounds → 追加 direct(mode 4)
+#   config-residential.yaml direct 出站缺 mode → 补 direct.mode: 4
+#   xray-config.json        direct freedom 缺 domainStrategy → ForceIPv4
+# 幂等：每项只在缺失时改；改前备份 .bak.v360.<ts>；只重启文件真被改的那个服务
+migrate_ipv4_only_egress() {
+    local ts; ts=$(date +%s)
+    local cfg="${BASE_DIR}/config.yaml" rcfg="${BASE_DIR}/config-residential.yaml" xcfg="${BASE_DIR}/xray-config.json"
+
+    if [[ -f "$cfg" ]] && ! grep -qE '^outbounds:' "$cfg"; then
+        cp "$cfg" "${cfg}.bak.v360.${ts}"
+        printf '\n# v3.6.0: 出站只走 IPv4（VPS 无 IPv6 出口）\noutbounds:\n  - name: direct\n    type: direct\n    direct:\n      mode: 4\n' >> "$cfg"
+        systemctl restart hysteria-server 2>/dev/null || true
+        print_success "  ✓ D9 config.yaml 出站 IPv4-only (direct mode 4)"
+        updated=1
+    fi
+
+    if [[ -f "$rcfg" ]] && grep -qE '^[[:space:]]+- name: direct$' "$rcfg" && ! grep -qE '^[[:space:]]+mode: 4$' "$rcfg"; then
+        cp "$rcfg" "${rcfg}.bak.v360.${ts}"
+        # 只在 "- name: direct" 条目里补 direct.mode（relay 条目不能碰）
+        # 缩进照抄 type 行：写死空格数遇到别的缩进风格会把 mode 挂错层级 → YAML 直接坏掉
+        awk '
+          /^[[:space:]]+- name: direct$/ { in_direct=1 }
+          in_direct && /^[[:space:]]+type: direct$/ {
+              match($0, /^[[:space:]]+/); ind = substr($0, 1, RLENGTH)
+              print; print ind "direct:"; print ind "  mode: 4"; in_direct=0; next
+          }
+          { print }' "$rcfg" > "${rcfg}.tmp" && mv "${rcfg}.tmp" "$rcfg" && chmod 644 "$rcfg"
+        if grep -qE '^[[:space:]]+mode: 4$' "$rcfg"; then
+            systemctl restart hysteria-residential 2>/dev/null || true
+            print_success "  ✓ D9 config-residential.yaml direct 出站 IPv4-only"
+            updated=1
+        else
+            # 没插进去（配置形态不认识）→ 还原，不重启，也不反复重试
+            cp "${rcfg}.bak.v360.${ts}" "$rcfg"
+            print_warning "  D9 config-residential.yaml direct 出站形态不认识，已还原"
+        fi
+    fi
+
+    # 只在「direct 是 freedom 且缺 ForceIPv4」时才动手：下面的 jq map 只改 freedom，
+    # 若按 domainStrategy 单独判定，遇到非 freedom 的 direct 会每次 update 都备份+重启却改不动
+    if [[ -f "$xcfg" ]] && command -v jq >/dev/null 2>&1 && \
+       jq -e '.outbounds[]?|select(.tag=="direct" and .protocol=="freedom" and (.settings.domainStrategy // "") != "ForceIPv4")' \
+          "$xcfg" >/dev/null 2>&1; then
+        cp "$xcfg" "${xcfg}.bak.v360.${ts}"
+        if jq '.outbounds |= map(if .tag=="direct" and .protocol=="freedom" then .settings = ((.settings // {}) + {domainStrategy:"ForceIPv4"}) else . end)' \
+              "$xcfg" > "${xcfg}.tmp" 2>/dev/null && [[ -s "${xcfg}.tmp" ]]; then
+            mv "${xcfg}.tmp" "$xcfg" && chmod 644 "$xcfg"
+            systemctl restart xray 2>/dev/null || true
+            print_success "  ✓ D9 xray direct 出站 ForceIPv4"
+            updated=1
+        else
+            rm -f "${xcfg}.tmp"; print_warning "  D9 xray-config.json jq 改写失败，保留原文件"
         fi
     fi
 }
@@ -1092,6 +1158,9 @@ EOF
             fi
         fi
     fi
+
+    # v3.6.0 D9: 服务端出站 IPv4-only（hy2 direct mode 4 / xray ForceIPv4）
+    migrate_ipv4_only_egress
 
     # v3.4.19 D2: BBRv3 自动升级
     # 已开 bbr 但系统支持更优的 bbr3/bbrv3/bbr_v3 → 升级

@@ -532,7 +532,7 @@ EOF
     local resi_traffic_port="9998"
 
     # ────────────────────────────────────────────────────────────────────
-    # 配置 1：config.yaml — hysteria-direct (无 outbounds 块，hy2 内置 direct)
+    # 配置 1：config.yaml — hysteria-direct (outbounds: direct mode 4，IPv4-only)
     # ────────────────────────────────────────────────────────────────────
     cat > "$CONFIG_FILE" << EOF
 # Hysteria2 服务器配置 — Direct 实例 (v3.5)
@@ -579,6 +579,13 @@ sniff:
   rewriteDomain: true
   tcpPorts: 80,443,8000-9000
   udpPorts: 443,53
+
+# v3.6.0: 出站只走 IPv4（VPS 无 IPv6 出口；mode 4 = 只拨 IPv4，解析不到 A 记录即失败）
+outbounds:
+  - name: direct
+    type: direct
+    direct:
+      mode: 4
 EOF
 
     # ────────────────────────────────────────────────────────────────────
@@ -638,6 +645,8 @@ outbounds:
       addr: "127.0.0.1:2080"
   - name: direct
     type: direct
+    direct:
+      mode: 4
 
 acl:
   inline:
@@ -815,7 +824,7 @@ configure_xray() {
     }
   ],
   "outbounds": [
-    {"tag": "direct", "protocol": "freedom"},
+    {"tag": "direct", "protocol": "freedom", "settings": {"domainStrategy": "ForceIPv4"}},
     {"tag": "relay", "protocol": "socks", "settings": {"servers": [{"address": "127.0.0.1", "port": 2080}]}}
   ],
   "routing": {
