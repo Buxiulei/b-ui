@@ -1382,7 +1382,10 @@ generate_singbox_tun_config() {
         [[ -z "$server_ip_resolved" ]] && \
             server_ip_resolved=$(getent ahostsv4 "$server_host" 2>/dev/null \
                 | awk '{print $1; exit}')
-        if [[ "$server_ip_resolved" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        # v3.6.0: 只接受公网 IPv4，与服务端 resolveHostV4() 的过滤一致。
+        # 私网/环回结果（split-horizon DNS、/etc/hosts 条目、劫持型热点）既不能拨号也不该写进 predefined
+        if [[ "$server_ip_resolved" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] \
+            && [[ ! "$server_ip_resolved" =~ ^(127\.|10\.|192\.168\.|169\.254\.|0\.|172\.(1[6-9]|2[0-9]|3[01])\.) ]]; then
             server_predefined_rule=",
       { \"domain\": [\"${server_host}\"], \"action\": \"predefined\", \"answer\": [\"${server_host}. IN A ${server_ip_resolved}\"] }"
         else
