@@ -740,7 +740,7 @@ function generateClashConfig(user, cfg, host) {
     const directNames = [];
     const resiNames = [];
 
-    const mkHy2 = (name, port, hopStart, hopEnd) => {
+    const mkHy2 = (name, port, hopStart, hopEnd, useObfs) => {
         let y = `  - name: "${name}"
     type: hysteria2
     server: ${host}
@@ -752,6 +752,12 @@ function generateClashConfig(user, cfg, host) {
     skip-cert-verify: false
     alpn:
       - h3`;
+        // v3.6.0: salamander obfs 只有直连节点带（cmd_obfs on 只改 config.yaml，住宅实例没有）；
+        // 与 generateSingboxConfig 的 useObfs 同一套判定。密码用 JSON.stringify 加引号，防 YAML 特殊字符
+        if (useObfs && cfg.obfs?.enabled && cfg.obfs.type === "salamander" && cfg.obfs.password) {
+            y += `\n    obfs: salamander
+    obfs-password: ${JSON.stringify(cfg.obfs.password)}`;
+        }
         proxies.push(y);
     };
     const mkVless = (name, port) => {
@@ -791,14 +797,14 @@ function generateClashConfig(user, cfg, host) {
     }
     if (proto === "fusion" || proto === "hysteria2") {
         if (hasHy2 && proto === "fusion") {
-            mkHy2(`${U}-HY2直连`, hy2DirectPort, hy2Hop[0], hy2Hop[1]); directNames.push(`${U}-HY2直连`);
+            mkHy2(`${U}-HY2直连`, hy2DirectPort, hy2Hop[0], hy2Hop[1], true); directNames.push(`${U}-HY2直连`);
         }
         if (hasHy2 && proto === "hysteria2") {
-            if (includeResi) { mkHy2(`${U}-HY2住宅`, 40000, 41000, 50000); resiNames.push(`${U}-HY2住宅`); }
-            else { mkHy2(`${U}-HY2直连`, hy2DirectPort, hy2Hop[0], hy2Hop[1]); directNames.push(`${U}-HY2直连`); }
+            if (includeResi) { mkHy2(`${U}-HY2住宅`, 40000, 41000, 50000, false); resiNames.push(`${U}-HY2住宅`); }
+            else { mkHy2(`${U}-HY2直连`, hy2DirectPort, hy2Hop[0], hy2Hop[1], true); directNames.push(`${U}-HY2直连`); }
         }
         if (hasHy2 && proto === "fusion" && includeResi) {
-            mkHy2(`${U}-HY2住宅`, 40000, 41000, 50000); resiNames.push(`${U}-HY2住宅`);
+            mkHy2(`${U}-HY2住宅`, 40000, 41000, 50000, false); resiNames.push(`${U}-HY2住宅`);
         }
     }
 

@@ -1419,13 +1419,20 @@ generate_singbox_tun_config() {
       \"hop_interval\": \"30s\""
         fi
         
+        # v3.6.0: salamander obfs（服务端开了 obfs 后不带这段就静默连不上）
+        local obfs_config=""
+        if [[ "${OBFS_TYPE:-}" == "salamander" && -n "${OBFS_PASSWORD:-}" ]]; then
+            obfs_config=",
+      \"obfs\": { \"type\": \"salamander\", \"password\": \"$(json_escape "$OBFS_PASSWORD")\" }"
+        fi
+        
         outbound_config=$(cat <<OUTBOUND
     {
       "type": "hysteria2",
       "tag": "proxy-out",
       "server": "${safe_server}",
       "server_port": ${server_port},
-      "password": "${safe_password}"${hop_config},
+      "password": "${safe_password}"${hop_config}${obfs_config},
       "domain_resolver": "local-dns",
       "tls": {
         "enabled": true,
@@ -1986,7 +1993,7 @@ stop_tun_mode() {
 safe_import_parsed() {
     local parsed="$1"
     # 白名单验证：只允许已知的变量名
-    local allowed_vars="PROTOCOL SERVER_ADDR AUTH_PASSWORD SNI INSECURE MPORT REMARK UUID SECURITY FINGERPRINT PUBLIC_KEY SHORT_ID FLOW NETWORK"
+    local allowed_vars="PROTOCOL SERVER_ADDR AUTH_PASSWORD SNI INSECURE MPORT OBFS_TYPE OBFS_PASSWORD REMARK UUID SECURITY FINGERPRINT PUBLIC_KEY SHORT_ID FLOW NETWORK"
     
     while IFS='=' read -r key value; do
         [[ -z "$key" || "$key" =~ ^# ]] && continue
@@ -2049,6 +2056,12 @@ parse_hysteria_uri() {
     local mport=""
     [[ "$query_part" =~ mport=([^&]+) ]] && mport="${BASH_REMATCH[1]}"
     
+    # v3.6.0: obfs salamander（服务端 b-ui obfs on 后订阅链接带 obfs 参数）
+    # obfs=([^&]+) 不会误匹配 obfs-password=（"obfs" 后面是 "-" 不是 "="）
+    local obfs_type="" obfs_password=""
+    [[ "$query_part" =~ obfs=([^&]+) ]] && obfs_type="${BASH_REMATCH[1]}"
+    [[ "$query_part" =~ obfs-password=([^&]+) ]] && obfs_password=$(echo -e "${BASH_REMATCH[1]//%/\\x}")
+    
     # 输出解析结果
     echo "PROTOCOL=hysteria2"
     echo "SERVER_ADDR=$server_part"
@@ -2056,6 +2069,8 @@ parse_hysteria_uri() {
     echo "SNI=$sni"
     echo "INSECURE=$insecure"
     echo "MPORT=$mport"
+    echo "OBFS_TYPE=$obfs_type"
+    echo "OBFS_PASSWORD=$obfs_password"
     echo "REMARK=$remark"
 }
 
@@ -3431,6 +3446,20 @@ generate_config() {
         done < "$RULES_FILE"
     fi
     
+    # v3.6.0: salamander obfs（服务端 b-ui obfs on 后必须带，否则握手被服务端丢弃）
+    # 密码用双引号包住并转义 \ 与 "，防 YAML 特殊字符（#、: 等）破坏配置
+    local obfs_block=""
+    if [[ "${OBFS_TYPE:-}" == "salamander" && -n "${OBFS_PASSWORD:-}" ]]; then
+        local obfs_pwd_yaml
+        obfs_pwd_yaml=$(printf '%s' "$OBFS_PASSWORD" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+        obfs_block="
+obfs:
+  type: salamander
+  salamander:
+    password: \"${obfs_pwd_yaml}\"
+"
+    fi
+    
     # 生成配置文件
     cat > "$CONFIG_FILE" << EOF
 # Hysteria2 客户端配置
@@ -3443,7 +3472,7 @@ auth: ${AUTH_PASSWORD}
 
 tls:
   insecure: false
-
+${obfs_block}
 # 保活：防止 QUIC 空闲超时静默断连
 quic:
   keepAlivePeriod: 10s

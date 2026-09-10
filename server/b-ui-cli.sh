@@ -952,7 +952,7 @@ cmd_obfs() {
             chmod 600 "$config_file"
             systemctl restart hysteria-server 2>/dev/null || true
             print_success "obfs 已启用，密码已写入 config.yaml"
-            print_warning "重要：客户端订阅链接需要重新生成，所有客户端要重新导入"
+            print_warning "重要：客户端订阅链接需要重新生成，所有客户端要重新导入（新增 obfs 参数）"
             echo "  在 web 面板 / b-ui CLI 重发订阅"
             ;;
         off|disable)
