@@ -226,7 +226,7 @@ MemoryMax=700M
 # 启动前清理"仅本实例"的孤儿端口跳跃 NAT 链（base 端口从 config.yaml 的 listen 提取，支持自定义端口）
 # SIGKILL/OOM 后 hysteria 没走完 closer chain 会残留 HYSTERIA-PR-<hash> 链，
 # 下次启动 ip6tables -N 报 "Chain already exists" → FATAL 崩溃循环（v3.5.13 实测踩坑）。
-# 按 --to-ports <base> 精确清理，绝不碰住宅实例（:40000）的链。`-` 前缀使清理失败不致命。
+# 按 --to-ports <base> 精确清理，绝不碰住宅实例（:40000）的链。\`-\` 前缀使清理失败不致命。
 ExecStartPre=-/opt/b-ui/hy2-portjump-cleanup.sh ${CONFIG_FILE}
 
 # 给 hy2 充足时间走完 closer chain 删自己的 NAT 链（正常 <1s）

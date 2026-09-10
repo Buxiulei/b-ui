@@ -1636,7 +1636,8 @@ EOF
         fi
         if [[ $_resi_changed -eq 1 ]]; then
             systemctl daemon-reload
-            systemctl restart hysteria-residential 2>/dev/null || true
+            # 与 D9 一致：只重启"本来就在跑"的实例，别把人为停掉的住宅实例拽起来崩循环
+            systemctl is-active --quiet hysteria-residential 2>/dev/null && systemctl restart hysteria-residential 2>/dev/null || true
             print_info "  ✓ hysteria-residential ExecStartPre 已更新为按实例端口跳跃清理"
             updated=1
         fi
