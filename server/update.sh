@@ -2016,11 +2016,16 @@ auto_update() {
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] 警告: 共 ${auto_failed} 个文件未通过校验，未覆盖现有版本" >> "$LOG_FILE"
         fi
 
-        local changed_files=() web_changed=0
+        local changed_files=() web_changed=0 have_md5=1
+        # v3.6.0: 无 md5sum 算不出变更集，退化为「全部视为变更」（宁可多重启一次面板，也不能让面板更新不生效）
+        if ! command -v md5sum >/dev/null 2>&1; then
+            have_md5=0
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] 警告: 缺少 md5sum，无法判定变更集，按全部变更处理" >> "$LOG_FILE"
+        fi
         for remote in "${!file_map[@]}"; do
             local lp="${file_map[$remote]}" after
             after=$( [[ -f "$lp" ]] && md5sum "$lp" 2>/dev/null | cut -d' ' -f1 || echo "" )
-            if [[ "$after" != "${before_md5[$remote]}" ]]; then
+            if [[ $have_md5 -eq 0 || "$after" != "${before_md5[$remote]}" ]]; then
                 changed_files+=("$remote"); [[ "$remote" == web/* ]] && web_changed=1
             fi
         done
