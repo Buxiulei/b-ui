@@ -1673,53 +1673,159 @@ remove_system_proxy() {
     unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY no_proxy NO_PROXY 2>/dev/null || true
 }
 
+#===============================================================================
+# v3.6.0: 双栈出口检测（「连接测试」测试 6 与 TUN 启动后的自检共用）
+# IPv4: my.ippure.com 公开接口给 isResidential/fraudScore（该站自述测试阶段可能变动，
+#       失败就回退 v3.4.34 起一直在用的 ip-api）；ippure 只有 IPv4，没有 AAAA
+# IPv6: 先取出口地址（api6.ipify.org → ipv6.icanhazip.com），再用 ip-api 按地址查
+#       归属与类型——ip-api 免费层没有 IPv6 传输，但支持按 IPv6 地址查询
+#===============================================================================
+
+# 取 JSON 顶层字段（字符串/布尔/数字通用）：有 jq 用 jq，否则退回 sed
+_jf() {
+    local json="$1" key="$2"
+    if command -v jq &>/dev/null; then
+        printf '%s' "$json" | jq -r --arg k "$key" '.[$k] | if . == null then empty else . end' 2>/dev/null
+    else
+        printf '%s' "$json" | sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"\{0,1\}\([^\",}]*\)\"\{0,1\}.*/\1/p" | head -1
+    fi
+}
+
+# ip-api 的 hosting/proxy/mobile 布尔 → 中文类型（措辞沿用 test_proxy）
+_ipapi_type() {
+    local json="$1"
+    if [[ "$(_jf "$json" hosting)" == "true" ]]; then
+        echo "IDC 机房 IP（数据中心）"
+    elif [[ "$(_jf "$json" proxy)" == "true" ]]; then
+        echo "代理 IP"
+    elif [[ "$(_jf "$json" mobile)" == "true" ]]; then
+        echo "移动网络 IP"
+    else
+        echo "家庭宽带 IP（住宅）"
+    fi
+}
+
+# probe_egress <4|6> [socks_port]
+# 输出 key=value 行：ip country region city org type score source（拿不到就为空）
+probe_egress() {
+    local fam="$1" sp="${2:-}"
+    local proxy=()
+    [[ -n "$sp" ]] && proxy=(--socks5-hostname "127.0.0.1:${sp}")
+    local ip="" country="" region="" city="" org="" type="" score="" source="" j=""
+
+    if [[ "$fam" == "4" ]]; then
+        j=$(curl -4 -sL --max-time 8 "${proxy[@]}" https://my.ippure.com/v1/info 2>/dev/null)
+        if [[ "$j" == *'"ip"'* && "$j" == *'"isResidential"'* ]]; then
+            ip=$(_jf "$j" ip)
+            country=$(_jf "$j" country)
+            region=$(_jf "$j" region)
+            city=$(_jf "$j" city)
+            org=$(_jf "$j" asOrganization)
+            score=$(_jf "$j" fraudScore)
+            source="ippure"
+            if [[ "$(_jf "$j" isResidential)" == "true" ]]; then
+                type="家庭宽带 IP（住宅）"
+            else
+                type="IDC 机房 IP（数据中心）"
+            fi
+        else
+            j=$(curl -4 -sL --max-time 8 "${proxy[@]}" 'http://ip-api.com/json/?fields=status,country,regionName,city,isp,org,as,mobile,proxy,hosting,query' 2>/dev/null)
+            if [[ "$(_jf "$j" status)" == "success" ]]; then
+                ip=$(_jf "$j" query)
+                country=$(_jf "$j" country)
+                region=$(_jf "$j" regionName)
+                city=$(_jf "$j" city)
+                org=$(_jf "$j" isp)
+                type=$(_ipapi_type "$j")
+                source="ip-api"
+            fi
+        fi
+    else
+        ip=$(curl -6 -sS --max-time 6 "${proxy[@]}" https://api6.ipify.org 2>/dev/null | tr -d '[:space:]')
+        [[ "$ip" == *:* ]] || ip=$(curl -6 -sS --max-time 6 "${proxy[@]}" https://ipv6.icanhazip.com 2>/dev/null | tr -d '[:space:]')
+        [[ "$ip" == *:* ]] || ip=""
+        if [[ -n "$ip" ]]; then
+            j=$(curl -4 -sL --max-time 8 "http://ip-api.com/json/${ip}?fields=status,country,regionName,city,isp,org,as,mobile,proxy,hosting" 2>/dev/null)
+            if [[ "$(_jf "$j" status)" == "success" ]]; then
+                country=$(_jf "$j" country)
+                region=$(_jf "$j" regionName)
+                city=$(_jf "$j" city)
+                org=$(_jf "$j" isp)
+                type=$(_ipapi_type "$j")
+                source="ip-api"
+            fi
+        fi
+    fi
+
+    printf 'ip=%s\ncountry=%s\nregion=%s\ncity=%s\norg=%s\ntype=%s\nscore=%s\nsource=%s\n' \
+        "$ip" "$country" "$region" "$city" "$org" "$type" "$score" "$source"
+}
+
+# print_egress_rows <tun_running:true|false> [socks_port]
+# 打印 IPv4 / IPv6 两行出口信息；IPv4 拿不到就返回非 0（供调用方计入失败项）
+print_egress_rows() {
+    local tun="${1:-false}" sp="${2:-}"
+    local ip country region city org type score source k v geo
+
+    ip=""; country=""; region=""; city=""; org=""; type=""; score=""; source=""
+    while IFS='=' read -r k v; do
+        case "$k" in
+            ip) ip="$v" ;; country) country="$v" ;; region) region="$v" ;; city) city="$v" ;;
+            org) org="$v" ;; type) type="$v" ;; score) score="$v" ;; source) source="$v" ;;
+        esac
+    done <<< "$(probe_egress 4 "$sp")"
+
+    local v4_ok=false
+    if [[ -n "$ip" ]]; then
+        v4_ok=true
+        geo="${country}${city:+·${city}}"
+        echo -e "  ${GREEN}✓${NC} IPv4 出口: ${YELLOW}${ip}${NC}  ${geo:-归属未知}  ${org:-运营商未知}"
+        if [[ "$type" == *住宅* ]]; then
+            echo -e "      ${GREEN}✓ ${type}${NC}${score:+ 风险分 ${score}}  ${DIM}(${source})${NC}"
+        else
+            echo -e "      ${YELLOW}○ ${type:-类型未知}${NC}${score:+ 风险分 ${score}}  ${DIM}(${source})${NC}"
+        fi
+    else
+        echo -e "  ${RED}✗${NC} IPv4 出口: 获取失败（ippure.com 与 ip-api.com 都不可达）"
+    fi
+
+    ip=""; country=""; region=""; city=""; org=""; type=""; score=""; source=""
+    while IFS='=' read -r k v; do
+        case "$k" in
+            ip) ip="$v" ;; country) country="$v" ;; region) region="$v" ;; city) city="$v" ;;
+            org) org="$v" ;; type) type="$v" ;; score) score="$v" ;; source) source="$v" ;;
+        esac
+    done <<< "$(probe_egress 6 "$sp")"
+
+    geo="${country}${city:+·${city}}"
+    if [[ "$tun" == "true" ]]; then
+        if [[ -z "$ip" ]]; then
+            # TUN 接管 ::/0 + ip_version 6 reject，服务端无 v6 出口，这里拿不到才是对的
+            echo -e "  ${GREEN}✓${NC} IPv6 出口: 已被隧道拦截（无泄漏）"
+        else
+            echo -e "  ${RED}⚠${NC} IPv6 出口: ${YELLOW}${ip}${NC}  ${geo:-归属未知}  ${RED}IPv6 泄漏（未进隧道）${NC}"
+        fi
+    else
+        if [[ -n "$ip" ]]; then
+            echo -e "  ${YELLOW}○${NC} IPv6 出口: ${YELLOW}${ip}${NC}  ${geo:-归属未知}"
+            echo -e "      ${DIM}SOCKS 模式下未走代理的流量使用本机 IPv6${NC}"
+        else
+            echo -e "  ${DIM}○ IPv6 出口: 本机无 IPv6${NC}"
+        fi
+    fi
+
+    $v4_ok
+}
+
 # 检测公网 IP 和连通性
 check_public_ip() {
     local mode="${1:-TUN}"  # 模式标识: TUN 或 切换配置
     echo ""
     echo -e "${CYAN}[网络检测]${NC}"
     
-    # IP 检测 API 列表（按优先级）
-    local ip_apis=(
-        "https://api.ipify.org"
-        "https://ip.sb"
-        "https://icanhazip.com"
-        "https://ifconfig.me"
-        "https://ipinfo.io/ip"
-    )
-    
-    local public_ip=""
-    local api_used=""
-    
-    # 尝试获取公网 IP
-    for api in "${ip_apis[@]}"; do
-        public_ip=$(curl -s --max-time 5 "$api" 2>/dev/null | tr -d '\n')
-        if [[ -n "$public_ip" ]] && [[ "$public_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            api_used="$api"
-            break
-        fi
-        public_ip=""
-    done
-    
-    if [[ -n "$public_ip" ]]; then
-        echo -e "  ${GREEN}✓${NC} 公网 IP: ${GREEN}${public_ip}${NC}"
-        
-        # 尝试获取 IP 归属地
-        local ip_info=$(curl -s --max-time 3 "https://ipinfo.io/${public_ip}/json" 2>/dev/null)
-        if [[ -n "$ip_info" ]]; then
-            local country=$(echo "$ip_info" | grep -o '"country": "[^"]*"' | cut -d'"' -f4)
-            local city=$(echo "$ip_info" | grep -o '"city": "[^"]*"' | cut -d'"' -f4)
-            local org=$(echo "$ip_info" | grep -o '"org": "[^"]*"' | cut -d'"' -f4)
-            if [[ -n "$country" ]]; then
-                echo -e "  ${GREEN}✓${NC} 归属地: ${YELLOW}${city:-Unknown}, ${country}${NC}"
-            fi
-            if [[ -n "$org" ]]; then
-                echo -e "  ${GREEN}✓${NC} 运营商: ${YELLOW}${org}${NC}"
-            fi
-        fi
-    else
-        echo -e "  ${RED}✗${NC} 无法获取公网 IP (网络可能不通)"
-    fi
+    # v3.6.0: 出口 IP/归属/机房判定统一走 print_egress_rows（IPv4 + IPv6 双栈）
+    # 这里只在 TUN 启动后调用，所以按 TUN 模式渲染（IPv6 拿不到 = 无泄漏）
+    print_egress_rows true
     
     # 连通性测试
     echo ""
@@ -4268,39 +4374,19 @@ test_proxy() {
     fi
     echo ""
 
-    # 测试 6: 出口 IP 类型检测（v3.4.34 改用 ip-api.com 替代 ping0.cc）
-    # ping0.cc 加 Cloudflare Turnstile 验证码后主页 HTML 解析永远拿不到内容
-    # ip-api.com 返回 hosting/proxy/mobile boolean 字段权威判断
-    echo -e "${YELLOW}[测试 6]${NC} 出口 IP 类型检测 (ip-api.com)..."
-    local ip_json
+    # 测试 6: 出口 IP 检测（v3.6.0 改成双栈：IPv4 走 ippure.com 判住宅/机房、回退 ip-api；
+    # IPv6 取出口地址顺带查泄漏。ping0.cc/ip-api 的历史见 v3.4.34）
+    echo -e "${YELLOW}[测试 6]${NC} 出口 IP 检测 (IPv4 ippure.com / IPv6)..."
+    local egress_ok=false
     if $tun_running; then
-        ip_json=$(curl -sL --max-time 8 'http://ip-api.com/json/?fields=status,country,city,isp,org,as,mobile,proxy,hosting,query' 2>/dev/null)
+        print_egress_rows true && egress_ok=true
     else
-        ip_json=$(curl -sL --max-time 8 --socks5-hostname "127.0.0.1:${socks_port}" 'http://ip-api.com/json/?fields=status,country,city,isp,org,as,mobile,proxy,hosting,query' 2>/dev/null)
+        print_egress_rows false "$socks_port" && egress_ok=true
     fi
-
-    if [[ -z "$ip_json" ]] || ! echo "$ip_json" | grep -q '"status":"success"'; then
-        echo -e "  ${YELLOW}访问 ip-api.com 失败（超时/网络不通）${NC}"
-        ((test_failed++))
-    else
-        local exit_ip isp_label hosting proxy mobile
-        exit_ip=$(echo "$ip_json" | sed -n 's|.*"query":"\([^"]*\)".*|\1|p')
-        isp_label=$(echo "$ip_json" | sed -n 's|.*"as":"\([^"]*\)".*|\1|p')
-        hosting=$(echo "$ip_json" | grep -o '"hosting":[a-z]*' | cut -d: -f2)
-        proxy=$(echo "$ip_json" | grep -o '"proxy":[a-z]*' | cut -d: -f2)
-        mobile=$(echo "$ip_json" | grep -o '"mobile":[a-z]*' | cut -d: -f2)
-        echo -e "  出口 IP: ${YELLOW}${exit_ip:-未知}${NC}"
-        echo -e "  ISP:    ${YELLOW}${isp_label:-未知}${NC}"
-        if [[ "$hosting" == "true" ]]; then
-            echo -e "  ${YELLOW}○ IDC 机房 IP（数据中心）${NC}"
-        elif [[ "$proxy" == "true" ]]; then
-            echo -e "  ${YELLOW}○ 代理/匿名 IP${NC}"
-        elif [[ "$mobile" == "true" ]]; then
-            echo -e "  ${GREEN}✓ 移动网络 IP${NC}"
-        else
-            echo -e "  ${GREEN}✓ 家庭宽带 IP（住宅）${NC}"
-        fi
+    if $egress_ok; then
         ((test_passed++))
+    else
+        ((test_failed++))
     fi
     echo ""
 
