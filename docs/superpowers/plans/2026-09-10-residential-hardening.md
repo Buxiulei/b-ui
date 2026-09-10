@@ -619,3 +619,219 @@ bash $S/resi-tests/test_probe_rate.sh && bash $S/resi-tests/test_udp_rules.sh &&
 git add server/residential-helper.sh server/resi-health.sh server/update.sh web/server.js
 git commit -m "fix(residential): 三层探测降频(中继 3m/500ms, 订阅 60s 不打断连接, 巡检 2 次+timer 抖动)"
 ```
+
+
+---
+
+### Task 6: R6 selector + Clash API 热切换
+
+**Files:**
+- Modify: `server/residential-helper.sh`（`write_singbox_config_residential_multi`：`resi-pool` 改 selector、加 `experimental`；常量 `SINGBOX_RELAY_API="127.0.0.1:9091"`）
+- Modify: `server/resi-health.sh`（决策段重写）
+- Test: `scratchpad/resi-tests/test_selector_switch.sh`
+
+**Interfaces:**
+- Produces: relay `experimental.clash_api.external_controller` = `127.0.0.1:9091`；`resi-pool` selector；状态文件键 `_last_switch`；环境变量 `RESI_HEALTH_SWITCH_MIN_INTERVAL`（默认 60）、`RESI_HEALTH_API`（默认 `127.0.0.1:9091`，测试可指到 stub）。
+
+- [ ] **Step 1: 写测试（预期失败）**
+
+```bash
+#!/bin/bash
+set -u
+S=/tmp/claude-1000/-home-roots-b-ui/71917ef4-b1f0-4466-927f-5df467756568/scratchpad
+REPO=/home/roots/b-ui; fail=0; T=$(mktemp -d); mkdir -p "$T/bin"
+printf '#!/bin/bash\nexit 0\n' > "$T/bin/systemctl"; chmod +x "$T/bin/systemctl"
+printf '#!/bin/bash\necho sing-box version 1.13.19\n' > "$T/sing-box"; chmod +x "$T/sing-box"
+export PATH="$T/bin:$PATH"
+# A. 配置形状
+echo '{"enabled":true,"global":false,"domains":null,"urls":[{"host":"h1","port":1080,"username":"u","password":"p","name":"url-1"},{"host":"h2","port":1080,"username":"u","password":"p","name":"url-2"}]}' > "$T/residential-proxy.json"
+BASE_DIR="$T" bash "$REPO/server/residential-helper.sh" reapply >/dev/null 2>&1
+jq -e '.outbounds[]|select(.tag=="resi-pool")|.type=="selector" and .outbounds==["resi-1","resi-2"] and .default=="resi-1" and .interrupt_exist_connections==false' "$T/singbox-relay.json" >/dev/null || { echo "FAIL A selector"; fail=1; }
+jq -e '.experimental.clash_api.external_controller=="127.0.0.1:9091" and .experimental.cache_file.enabled==true and (.experimental.cache_file.path|endswith("relay-cache.db"))' "$T/singbox-relay.json" >/dev/null || { echo "FAIL A experimental"; fail=1; }
+for bin in /usr/bin/sing-box "$S/singbox-bins/v1.14.0/sing-box" "$S/singbox-bins/v1.15.0-alpha.2/sing-box"; do
+  out=$("$bin" check -c "$T/singbox-relay.json" 2>&1) && ! grep -qi deprecated <<<"$out" || { echo "FAIL A check $bin: $out"; fail=1; }
+done
+# B. 巡检决策：curl stub 同时扮演探测目标与 Clash API
+cat > "$T/bin/curl" <<'STUB'
+#!/bin/bash
+# 记录 PUT；探测结果由 PROBE_FAIL 环境变量(逗号分隔的 host)决定；GET /proxies 返回 NOW
+args="$*"
+if [[ "$args" == *"/proxies/resi-pool"* ]]; then
+  if [[ "$args" == *"PUT"* || "$args" == *"-X PUT"* ]]; then echo "$args" >> "$STUB_DIR/put.log"; exit 0; fi
+  echo "{\"type\":\"Selector\",\"now\":\"${NOW}\",\"all\":[\"resi-1\",\"resi-2\"]}"; exit 0
+fi
+# 探测：从 stdin 配置里读 proxy 行取 host
+cfg=$(cat); host=$(sed -n 's#.*socks5h://\([^:]*\):.*#\1#p' <<<"$cfg")
+[[ ",${PROBE_FAIL:-}," == *",$host,"* ]] && exit 7
+exit 0
+STUB
+chmod +x "$T/bin/curl"; export STUB_DIR="$T"
+run_health() { RESI_HEALTH_BASE_DIR="$T" RESI_HEALTH_LOG="$T/h.log" RESI_HEALTH_TRIES=1 RESI_HEALTH_OK_NEED=1 RESI_HEALTH_TIMEOUT=1 RESI_HEALTH_API=127.0.0.1:9091 bash "$REPO/server/resi-health.sh"; }
+cp "$T/singbox-relay.json" "$T/relay.orig"
+# B1. 当前 resi-1 健康 → 不切
+echo '{}' > "$T/.resi-health-state.json"; : > "$T/put.log"
+NOW=resi-1 PROBE_FAIL= run_health
+[[ -s "$T/put.log" ]] && { echo "FAIL B1 健康却切换: $(cat $T/put.log)"; fail=1; }
+# B2. resi-1 连续 2 轮失败 → 切到 resi-2（第 1 轮不切，第 2 轮切）
+echo '{}' > "$T/.resi-health-state.json"; : > "$T/put.log"
+NOW=resi-1 PROBE_FAIL=h1 run_health; [[ -s "$T/put.log" ]] && { echo "FAIL B2 第 1 轮不该切(迟滞)"; fail=1; }
+NOW=resi-1 PROBE_FAIL=h1 run_health; grep -q 'resi-2' "$T/put.log" || { echo "FAIL B2 第 2 轮未切到 resi-2: $(cat $T/h.log)"; fail=1; }
+# B3. 限速：紧接着再跑一轮（resi-2 也坏了）→ 60s 内不再切
+: > "$T/put.log"; NOW=resi-2 PROBE_FAIL=h1,h2 run_health; NOW=resi-2 PROBE_FAIL=h1,h2 run_health
+[[ -s "$T/put.log" ]] && { echo "FAIL B3 全坏/限速内不该切: $(cat $T/put.log)"; fail=1; }
+grep -q 'WARN' "$T/h.log" || { echo "FAIL B3 全坏应 WARN"; fail=1; }
+# B4. relay 文件从未被改写、无重启
+cmp -s "$T/relay.orig" "$T/singbox-relay.json" || { echo "FAIL B4 relay 文件被改写"; fail=1; }
+# B5. API 不可达(旧配置) → 退出 0 且记日志
+cat > "$T/bin/curl" <<'STUB'
+#!/bin/bash
+[[ "$*" == *"/proxies/"* ]] && exit 7; cat >/dev/null; exit 0
+STUB
+chmod +x "$T/bin/curl"; : > "$T/h.log"; NOW= run_health; rc=$?
+[[ $rc == 0 ]] && grep -qi 'clash api\|API' "$T/h.log" || { echo "FAIL B5 API 不可达处理 rc=$rc"; fail=1; }
+rm -rf "$T"; [[ $fail == 0 ]] && echo "PASS selector switch" || exit 1
+```
+
+stub 的参数匹配按实现里 curl 的实际调用形态调整（PUT 用 `-X PUT`；探测用 `-K -` 读 stdin）。
+
+- [ ] **Step 2: 运行确认失败** → Expected: A（仍是 urltest/无 experimental）、B2（无 PUT）FAIL。
+
+- [ ] **Step 3: 实现**
+
+`residential-helper.sh`：常量区加 `SINGBOX_RELAY_API="127.0.0.1:9091"`；multi 写函数 jq 传 `--arg api "$SINGBOX_RELAY_API" --arg cache "${BASE_DIR}/relay-cache.db" --arg first "$(jq -r '.[0]' <<<"$outbound_tags")"`，把 urltest 对象换成：
+
+```json
+{"type": "selector", "tag": "resi-pool", "outbounds": $outbound_tags, "default": $first, "interrupt_exist_connections": false}
+```
+
+并在顶层加：
+
+```json
+"experimental": {"clash_api": {"external_controller": $api}, "cache_file": {"enabled": true, "path": $cache, "store_selected": true}}
+```
+
+注释：`# v3.6.0 R6: selector + Clash API 热切换——巡检按健康度粘住，切换不重启；urltest 按延迟择优会在会话内换出口 IP`。
+
+`resi-health.sh`：头部注释重写（描述新机制）；新增 `API="${RESI_HEALTH_API:-127.0.0.1:9091}"`、`SWITCH_MIN="${RESI_HEALTH_SWITCH_MIN_INTERVAL:-60}"`；删除 `RESTART_COOLDOWN`、`LOCK`。把从 `des='[]'` 到 `flock -u 9` 的整段替换为：
+
+```bash
+# v3.6.0 R6: 不再改写 relay 配置、不再重启。通过 Clash API 读当前选择，只有当前线路不健康时才切到健康线路（粘住）
+nowtags=$(jq -c '[.outbounds[]|select(.type=="socks").tag]|unique' "$RELAY" 2>/dev/null || echo '[]')
+was='[]'; [ "${#alltags[@]}" -gt 0 ] && was=$(printf '%s\n' "${alltags[@]}" | sort -u | jq -R . | jq -cs .)
+if [ "$nowtags" != "$was" ]; then log "住宅池成员在探测期间发生变化 ${was} → ${nowtags}，本轮不切换"; exit 0; fi
+sel=$(curl -s --max-time 2 "http://${API}/proxies/resi-pool" 2>/dev/null | jq -r '.now // empty' 2>/dev/null)
+if [ -z "$sel" ]; then log "relay 未启用 Clash API（旧配置或未运行），跳过切换；升级后 reapply 会启用"; exit 0; fi
+# healthy 集 = 迟滞后 active 的成员（desired 已按 alltags 顺序）
+if [ "${#healthy[@]}" -eq 0 ]; then log "WARN 全部线路探测不达标，保持当前 ${sel}"; exit 0; fi
+for h in "${healthy[@]}"; do [ "$h" = "$sel" ] && { [ "$DRY_RUN" = "1" ] && log "当前 ${sel} 健康，保持"; exit 0; }; done
+target="${healthy[0]}"
+now=$(date +%s); last=$(jq -r '._last_switch // 0' "$STATE" 2>/dev/null); last=${last:-0}; [ "$last" -gt "$now" ] && last=0
+if [ $((now - last)) -lt "$SWITCH_MIN" ]; then log "当前 ${sel} 不健康，需切到 ${target}，但切换限速中（剩余 $((SWITCH_MIN - now + last))s）"; exit 0; fi
+if [ "$DRY_RUN" != "1" ]; then
+    if curl -s --max-time 3 -X PUT -H 'Content-Type: application/json' -d "{\"name\":\"${target}\"}" "http://${API}/proxies/resi-pool" >/dev/null 2>&1; then
+        jq --argjson t "$now" '._last_switch=$t' "$STATE" > "${STATE}.tmp" 2>/dev/null && mv "${STATE}.tmp" "$STATE"
+        log "切换住宅出口 ${sel} → ${target}（${sel} 连续探测不达标）"
+    else
+        log "WARN 切换到 ${target} 失败（Clash API PUT 出错）"
+    fi
+fi
+```
+
+其中 `healthy` 数组即原来的 `desired`（重命名或直接用）；"全坏则保留全部"的旧逻辑删除（改为不切换）。探测循环里对 `active` 的迟滞与状态写入不变。删除 `exec 9>"$LOCK"`/`flock` 相关行。日志轮转保留。
+
+- [ ] **Step 4: 验证并提交**
+
+```bash
+bash -n server/residential-helper.sh server/resi-health.sh && bash $S/resi-tests/test_selector_switch.sh && bash $S/resi-tests/test_udp_rules.sh && bash $S/resi-tests/test_domains.sh && bash $S/resi-tests/test_creds.sh
+# test_lock_cooldown.sh 与 test_probe_rate.sh 中依赖"改写文件+重启+冷却"的用例 C/D/E/F 已随 R6 失效：把它们改成断言"不改写 relay 文件、不调用 systemctl restart"，A/B（锁与原子写）保留。
+git add server/residential-helper.sh server/resi-health.sh
+git commit -m "feat(residential): 中继改 selector + Clash API 热切换,巡检按健康度粘住不再重启"
+```
+
+---
+
+### Task 7: R7 体检端点以中继为真源 + R9 HTTPS 数据源 + 面板成员表
+
+**Files:**
+- Modify: `web/server.js`（`residential/health` 处理器重写）
+- Modify: `web/app.js`（`loadResiHealth()`）
+- Test: `scratchpad/resi-tests/test_health_endpoint.sh`
+
+**Interfaces:**
+- Produces: `GET /api/residential/health` 新响应（spec R7）；内部函数 `probeEgress({host,port,username,password}) → Promise<{ip,type,isp,country,city}|null>`。
+
+- [ ] **Step 1: 先核对数据源字段**
+
+在沙箱直接请求（不经代理）：`curl -s https://api.ipapi.is/ | jq .` 与 `curl -s https://ipinfo.io/json | jq .`，把真实字段名记进报告；若 ipapi.is 不可用或字段不同，按实际调整映射（spec R9 允许）。
+
+- [ ] **Step 2: 写测试（预期失败）**
+
+```bash
+#!/bin/bash
+set -u
+S=/tmp/claude-1000/-home-roots-b-ui/71917ef4-b1f0-4466-927f-5df467756568/scratchpad
+REPO=/home/roots/b-ui; fail=0; T=$(mktemp -d); mkdir -p "$T/bin"
+# curl stub：按 URL 返回；Clash API GET → now=resi-2；ipapi.is → 按 stdin 里的 host 决定类型
+cat > "$T/bin/curl" <<'STUB'
+#!/bin/bash
+args="$*"
+if [[ "$args" == *"/proxies/resi-pool"* ]]; then echo '{"now":"resi-2"}'; exit 0; fi
+cfg=$(cat 2>/dev/null); host=$(sed -n 's#.*socks5h://\([^:]*\):.*#\1#p' <<<"$cfg")
+if [[ "$args" == *"api.ipapi.is"* ]]; then
+  case "$host" in h1) echo '{"ip":"1.1.1.1","is_datacenter":true,"is_proxy":false,"is_vpn":false,"is_mobile":false,"company":{"name":"DC Inc","type":"hosting"},"location":{"country":"US","city":"X"}}';;
+                  h2) echo '{"ip":"2.2.2.2","is_datacenter":false,"is_proxy":false,"is_vpn":false,"is_mobile":false,"company":{"name":"Home ISP","type":"isp"},"location":{"country":"JP","city":"Y"}}';;
+                  *) exit 7;; esac; exit 0
+fi
+exit 7
+STUB
+chmod +x "$T/bin/curl"; export PATH="$T/bin:$PATH"
+W="$S/resi-tests/w_health"; rm -rf "$W"; bash "$S/resi-tests/final-c/run_server.sh" "$W"   # 复制 ipv6-tests/run_server.sh 改 REPO=/home/roots/b-ui-wt/final-c、端口 18085，并在 BASE_DIR 写入 singbox-relay.json(两个 socks 出站 h1/h2 + selector) 与 .resi-health-state.json({"resi-1":{"active":false,"failstreak":3,"okstreak":0},"resi-2":{"active":true,"failstreak":0,"okstreak":4}})
+TOKEN=$(curl -s -X POST http://127.0.0.1:18085/api/login -H 'Content-Type: application/json' -d '{"password":"test123"}' | jq -r .token)
+# 注意：上面这条 curl 也会被 stub 拦截——把 stub 放到 server 进程的 PATH 而不是测试壳的 PATH：改为在 run_server.sh 里 export PATH 后再 exec node，测试壳用 /usr/bin/curl 全路径
+r=$(/usr/bin/curl -s http://127.0.0.1:18085/api/residential/health -H "Authorization: Bearer $TOKEN")
+jq -e '.mode=="selector" and .selected=="resi-2" and (.members|length)==2' <<<"$r" >/dev/null || { echo "FAIL 结构: $r"; fail=1; }
+jq -e '.members[]|select(.tag=="resi-1")|.active==false and .egress.type=="IDC机房 IP" and .egress.ip=="1.1.1.1"' <<<"$r" >/dev/null || { echo "FAIL resi-1"; fail=1; }
+jq -e '.members[]|select(.tag=="resi-2")|.active==true and .egress.type=="家庭宽带 IP"' <<<"$r" >/dev/null || { echo "FAIL resi-2"; fail=1; }
+jq -e '.current_egress_ip_test=="2.2.2.2" and .egress_ip_type=="家庭宽带 IP"' <<<"$r" >/dev/null || { echo "FAIL 顶层派生自 selected"; fail=1; }
+grep -q '"password"' <<<"$r" && { echo "FAIL 泄露密码"; fail=1; }
+grep -q 'ip-api.com' "$REPO/web/server.js" && { echo "FAIL 仍用 http ip-api"; fail=1; }
+kill "$(cat "$W/pid")" 2>/dev/null; rm -rf "$T"
+[[ $fail == 0 ]] && echo "PASS health endpoint" || exit 1
+```
+
+（`REPO` 与 worktree 路径按实际泳道设置。）
+
+- [ ] **Step 3: 实现**
+
+`web/server.js`：
+- 新增 `probeEgress(member)`：构造 `-K -` 配置（复用现有转义与校验），`execFile("curl", ["-K","-","-m","8","-sS","https://api.ipapi.is/"])`；解析失败或非 JSON → 再试 `https://ipinfo.io/json`（type `unknown`，isp 取 `org`）；两者都失败 → resolve(null)。类型映射见 spec R9。
+- 处理器：读 relay 文件成员（socks 出站，最多 8 个）、状态文件、`http.get("http://127.0.0.1:9091/proxies/resi-pool", 1s)` 取 `now`；`mode` 由 relay 里 `resi-pool` 的 type 决定（selector/urltest/none）；`Promise.all(members.map(probeEgress))`；组装响应（成员不含 password）；顶层旧字段由 selected（否则 members[0]）派生；`enabled=false` 或无成员时返回 baseResp 形状（含 `members: []`）。
+- 删除 ip-api 与 ping0 相关代码与注释。
+
+`web/app.js` `loadResiHealth()`：在现有渲染后追加成员表：每行 `tag`、`host:port`、`_sysTag(active ? "健康" : "已剔除", …)`、`egress.ip`、`egress.type`；当前选择的行加 `selected` 样式（`web/style.css` 若无对应类则加一条最小样式）。
+
+- [ ] **Step 4: 验证并提交**
+
+```bash
+node --check web/server.js && node --check web/app.js && bash $S/resi-tests/test_health_endpoint.sh && bash $S/resi-tests/test_creds_server.sh
+git add web/server.js web/app.js web/style.css
+git commit -m "feat(residential): 体检端点以中继成员为真源并暴露巡检状态,数据源改 HTTPS(ipapi.is/ipinfo)"
+```
+
+---
+
+### Task 8: R8 供应商粘性参数指南 + 面板提示
+
+**Files:**
+- Create: `docs/residential-proxy-guide.md`
+- Modify: `web/index.html`（住宅弹窗 URL 输入区提示 + 链接）、`server/residential-helper.sh`（`verify()` 失败文案）、`README.md`（一行链接）
+
+- [ ] **Step 1: 写文档**（内容见 spec R8；参数格式逐字引用调研报告 §1.1 表；标注"以供应商当前文档为准"）
+- [ ] **Step 2: 面板提示**：`index.html` 住宅弹窗的 URL 输入区下加 `<div class="resi-hint">建议在用户名里加供应商的粘性/失效参数（如 Bright Data -session-xxx-const），否则出口 IP 会静默轮换；见 <a href="https://github.com/Buxiulei/b-ui/blob/main/docs/residential-proxy-guide.md" target="_blank">住宅代理指南</a></div>`（样式沿用 `resi-global-hint`）。`verify()` 的 `err "连接住宅代理失败 (${host}:${port})"` 后追加一行 `err "若供应商限制目标端口（如 Bright Data 住宅仅开放 8080/8443 等），请改用其 HTTP 代理端口或联系供应商"`。README 客户端段下加一行链接。
+- [ ] **Step 3: 验证并提交**
+
+```bash
+test -s docs/residential-proxy-guide.md && grep -q 'residential-proxy-guide' web/index.html README.md && bash -n server/residential-helper.sh
+git add docs/residential-proxy-guide.md web/index.html server/residential-helper.sh README.md
+git commit -m "docs(residential): 供应商粘性参数指南 + 面板提示 + verify 端口白名单提示"
+```

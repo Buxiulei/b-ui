@@ -96,6 +96,57 @@ proxy-user = "USER:PASS"
 - 巡检（`resi-health.sh`）：默认 `TRIES=2`、`OK_NEED=1`（一轮内任一成功即健康，迟滞仍是 2 轮）；`update.sh` 的 `b-ui-resi-health.timer` 加 `RandomizedDelaySec=30s`（新装与既有 timer 文件都要有：D8 块生成的 unit 文本加此行，并对已存在但缺该行的 timer 做一次幂等补丁 + `daemon-reload`）。
 - 验收：生成的中继配置三版 `sing-box check` 通过；订阅 JSON 的 urltest 字段断言；resi-health 用 stub 跑一轮，日志/状态符合新默认；timer 文本含 `RandomizedDelaySec`。
 
+
+### R6 selector + Clash API 热切换（替代"改配置 + 重启 + 冷却"）
+
+来源：住宅最佳实践调研 P0-3。sing-box 重启/reload 会重置实例上所有连接（官方 issue #3731 closed as not planned）；urltest 按延迟择优 + 50ms 容忍会在会话内换出口 IP，对 AI 登录账号是高危动作。行业做法是"按健康度粘住"。
+
+- 中继配置（`write_singbox_config_residential_multi`）：
+  - `resi-pool` 由 `urltest` 改为 `{"type":"selector","tag":"resi-pool","outbounds":[resi-1..N],"default":"resi-1","interrupt_exist_connections":false}`。
+  - 新增 `"experimental": {"clash_api": {"external_controller": "127.0.0.1:9091"}, "cache_file": {"enabled": true, "path": "<BASE_DIR>/relay-cache.db", "store_selected": true}}`（选择结果跨重启保留；仅回环监听，不设 secret；`SINGBOX_RELAY_API="127.0.0.1:9091"` 作为脚本常量）。
+  - 直连模式写函数不加 selector/clash_api（无可选）。
+- `resi-health.sh` 决策段重写：
+  - 探测循环与迟滞状态（`active/failstreak/okstreak`）保持。
+  - 不再改写 `singbox-relay.json`、不再 `systemctl restart`、删除重启冷却逻辑（`_last_restart` 不再写）。
+  - 取当前选择：`GET http://127.0.0.1:9091/proxies/resi-pool` 的 `.now`；取不到（旧配置无 API / relay 未起）→ 记一行日志并 `exit 0`（`update.sh` 每次升级都 `reapply`，配置会自动换成 selector）。
+  - 决策：健康集 = 迟滞后 `active=true` 的成员。当前选择在健康集内 → 不动（粘住）。否则切到健康集中按 `alltags` 顺序的第一个：`PUT /proxies/resi-pool` body `{"name":"resi-N"}`。健康集为空 → 不切、WARN。
+  - 切换限速：状态文件 `_last_switch`（epoch），两次切换间隔 ≥ `RESI_HEALTH_SWITCH_MIN_INTERVAL`（默认 60s）。
+  - 探测期间成员集变化的复核保留（比较 relay 的 socks tag 集），不再需要 `flock`（不写 relay 文件）；`acquire_relay_lock` 仅 helper 使用。
+  - 单成员（<2）仍直接退出。
+- `residential-helper.sh`：`enable --add/--remove` 等改成员集的操作仍需重写配置并 `restart`（出站列表变化无法热加载）；这是管理员显式操作，可接受。
+- 已知取舍：selector 不再自动按延迟择优，只在当前线路探测失败时切换；这是刻意的。
+
+### R7 体检端点以中继为真源 + 暴露巡检状态
+
+来源：调研 P0-5。现状 `/api/residential/health` 只拨 `residential-proxy.json` 顶层 `host`（= 最后一次 `--add` 的那条，可能已不在池里）。
+
+- 读 `singbox-relay.json` 的 socks 出站（tag/server/server_port/username/password）作为成员列表；读 `.resi-health-state.json` 取每成员 `active/failstreak/okstreak`；`GET 127.0.0.1:9091/proxies/resi-pool` 取 `now`（1s 超时，失败为 null）。
+- 对每个成员（最多 8 个）并行做出口探测（复用 R3 的 `-K -` 凭据方式，改用 R9 的 HTTPS 源），单个 8s 超时。
+- 响应：
+  ```json
+  { "enabled": true, "domains_count": 31, "mode": "selector|urltest|none", "selected": "resi-2",
+    "members": [ { "tag": "resi-1", "host": "…", "port": 1080, "active": true, "failstreak": 0, "okstreak": 5,
+                   "egress": { "ip": "…", "type": "家庭宽带 IP", "isp": "…", "country": "…" } } ],
+    "current_egress_ip_test": "…", "egress_ip_type": "…", "via_proxy_isp": "…", "urls": [ … ] }
+  ```
+  顶层旧字段由"当前选择的成员"（无则第一个）派生，保持面板旧渲染可用。密码不出现在响应里。
+- `web/app.js` `loadResiHealth()`：状态行用当前选择成员的出口类型定色，下方列出成员表（tag、host:port、健康/剔除、出口 IP、类型）；旧的 ISP/IP 类型/分流关键词行保留。
+
+### R8 供应商粘性参数引导 + 文档
+
+来源：调研 P0-4。各厂商默认"出口不可用就静默换 IP"，只有在**用户名参数**里加锁定/失效参数才会显式报错，我们的健康探测语义才成立；参数不含冒号，`parse_url` 无需改。
+
+- 新文档 `docs/residential-proxy-guide.md`：供应商用户名参数表（Bright Data `-session-<id>` + `-const`，SOCKS5 端口 22228 / HTTP 44445，住宅 SOCKS5 只开放 8080/8443 等目标端口且只允许 HTTPS 目标；Oxylabs `sessid-<id>` + `sesstime-<min>` + `sessid_oneip`；Decodo `session-<id>-sessionduration-<min>`；IPRoyal `_session-<8位>_lifetime-<t>_killswitch-1`；SOAX `sessionid-<id>-sessionlength-<s>`）、为什么 AI 登录必须粘住、"不限量"实为每 IP 配额、转售条款风险、UDP/QUIC 处理（R4）、探测频率（R5）、体检读数含义（R7）。
+- 面板：住宅弹窗 URL 输入区加一行提示（"建议在用户名里加供应商的粘性/失效参数，见文档"）并链接到该文档；`residential-helper.sh verify()` 失败文案补一句"若供应商限制目标端口（如 Bright Data 住宅仅开放 8080/8443 等）请改用其 HTTP 代理端口"。
+
+### R9 体检数据源改 HTTPS
+
+来源：调研 P0-6。`http://ip-api.com` 免费端点无 HTTPS、禁商用、45 次/分；明文 HTTP 经住宅腿可被篡改。
+
+- 主源：`https://api.ipapi.is/`（免费、无 key、HTTPS；返回 `ip`、`is_datacenter`、`is_proxy`、`is_vpn`、`is_mobile`、`company.name/type`、`location.country/city`——实施时用真实请求核对字段名后再映射）。类型映射：`is_datacenter` → IDC机房 IP；`is_proxy||is_vpn` → 代理 IP；`is_mobile` → 移动网络 IP；否则 家庭宽带 IP。
+- 备源：`https://ipinfo.io/json`（`ip/org/country/city`），类型记 unknown、ISP 取 `org`。
+- 两者都经成员的 SOCKS5（socks5h）拨出；主源失败自动用备源。
+
 ## 3. 文件改动清单
 
 | 文件 | 改动 |
@@ -114,6 +165,16 @@ proxy-user = "USER:PASS"
 | `server/update.sh` | D8 timer 文本加 `RandomizedDelaySec=30s`；既有 timer 缺该行则补（幂等） |
 | `web/server.js` | `generateSingboxConfig` `urltest()`：`interval "60s"`、`interrupt_exist_connections false`、`tolerance 100` |
 
+## 3c. R6–R9 文件改动
+
+| 文件 | 改动 |
+|---|---|
+| `server/residential-helper.sh` | multi 写函数：selector + experimental(clash_api/cache_file)；`verify()` 失败文案 |
+| `server/resi-health.sh` | 决策段：Clash API GET/PUT、粘住、切换限速；删除重写/重启/冷却 |
+| `web/server.js` | `/api/residential/health` 重写为成员列表 + 状态 + 选择 + HTTPS 探测（主/备源） |
+| `web/app.js`、`web/index.html` | 健康卡成员表；住宅弹窗提示与文档链接 |
+| `docs/residential-proxy-guide.md` | 新增 |
+
 ## 4. 提交拆分
 
 1. `fix(residential): 订阅域名回退与服务端中继一致`（R1）
@@ -121,6 +182,9 @@ proxy-user = "USER:PASS"
 3. `fix(residential): SOCKS5 凭据不再出现在 curl 命令行`（R3）
 4. `fix(residential): 中继显式处理 UDP(53 直连/443 拒绝/其余直连)`（R4）
 5. `fix(residential): 三层探测降频(中继 3m/500ms, 订阅 60s 不打断连接, 巡检 2 次+抖动)`（R5）
+6. `feat(residential): 中继改 selector + Clash API 热切换,巡检按健康度粘住不再重启`（R6）
+7. `feat(residential): 体检端点以中继成员为真源并暴露巡检状态,数据源改 HTTPS`（R7+R9）
+8. `docs(residential): 供应商粘性参数指南 + 面板提示`（R8）
 
 每个提交独立可回滚，均不 bump 版本；版本随 IPv6 提交之后的 `bump: v3.6.0` 一起。
 
