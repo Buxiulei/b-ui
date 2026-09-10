@@ -1804,7 +1804,9 @@ auto_update_kernel() {
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] Hysteria2: v${local_hy} -> v${remote_hy}, 更新中..." >> "$LOG_FILE"
         bash <(curl -fsSL https://get.hy2.sh/) >> "$LOG_FILE" 2>&1 || true
         local new_hy; new_hy=$(hysteria version 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/^v//' || echo "")
-        if [[ -n "$new_hy" && "$new_hy" != "$local_hy" ]]; then
+        if [[ -z "$new_hy" ]]; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Hysteria2 安装后无法读取版本，跳过重启" >> "$LOG_FILE"
+        elif [[ "$new_hy" != "$local_hy" ]]; then
             systemctl restart hysteria-server 2>/dev/null || true
             systemctl is-active --quiet hysteria-residential 2>/dev/null && systemctl restart hysteria-residential 2>/dev/null || true
             updated=true
@@ -1822,7 +1824,9 @@ auto_update_kernel() {
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] Xray: v${local_xray} -> v${remote_xray}, 更新中..." >> "$LOG_FILE"
             bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install >> "$LOG_FILE" 2>&1 || true
             local new_xray; new_xray=$(xray version 2>/dev/null | head -n1 | awk '{print $2}' | sed 's/^v//' || echo "")
-            if [[ -n "$new_xray" && "$new_xray" != "$local_xray" ]]; then
+            if [[ -z "$new_xray" ]]; then
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] Xray 安装后无法读取版本，跳过重启" >> "$LOG_FILE"
+            elif [[ "$new_xray" != "$local_xray" ]]; then
                 systemctl restart xray 2>/dev/null || true
                 updated=true
             else
@@ -2026,7 +2030,9 @@ auto_update() {
             local lp="${file_map[$remote]}" after
             after=$( [[ -f "$lp" ]] && md5sum "$lp" 2>/dev/null | cut -d' ' -f1 || echo "" )
             if [[ $have_md5 -eq 0 || "$after" != "${before_md5[$remote]}" ]]; then
-                changed_files+=("$remote"); [[ "$remote" == web/* ]] && web_changed=1
+                changed_files+=("$remote")
+                # v3.6.0: version.json 也算面板文件——server.js 启动时缓存 VERSION 并写进 HTML，不重启会一直显示旧版本
+                [[ "$remote" == web/* || "$remote" == version.json ]] && web_changed=1
             fi
         done
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] 变更文件: ${changed_files[*]:-无}" >> "$LOG_FILE"
@@ -2050,7 +2056,7 @@ auto_update() {
         # 与各迁移块按需重启，版本升级本身不再无条件踢掉所有在线用户
         if [[ $web_changed -eq 1 ]]; then
             systemctl restart b-ui-admin 2>/dev/null || true
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] 重启: b-ui-admin（web 文件变更）" >> "$LOG_FILE"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] 重启: b-ui-admin（面板文件/版本号变更）" >> "$LOG_FILE"
         else
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] 无需重启服务" >> "$LOG_FILE"
         fi
