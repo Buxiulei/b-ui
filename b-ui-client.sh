@@ -1944,6 +1944,9 @@ ensure_tun_config_ready() {
                 needs_regen=true
             fi
         fi
+        # v3.6.0: 侧车只记节点名，同名覆盖导入（重写 uri.txt、节点名不变）它认不出来，
+        # 会带着旧密码/旧端口走快速路径。uri.txt 比生成的配置新就一定重新生成
+        [[ "$uri_file" -nt "$tun_cfg" ]] && needs_regen=true
     fi
 
     # 路由模板版本（schema）检测：脚本升级后 generate_singbox_tun_config 模板可能变了
@@ -2023,6 +2026,17 @@ start_tun_mode() {
         fi
     fi
     
+    # v3.6.0: 开机竞态——两个客户端和 bui-tun 都 enable 时，systemd 启动会因两者互斥
+    # 随机丢掉其中一个 job，TUN 用户可能开机进了 SOCKS 模式（且没写 proxy.sh）。
+    # TUN 期间把两个客户端 disable（bui-tun 保持 enable），停 TUN 恢复时再 enable 回去
+    systemctl disable "$CLIENT_SERVICE" 2>/dev/null || true
+    systemctl disable xray-client.service 2>/dev/null || true
+
+    # v3.6.0: 巡检 timer 每分钟跑一次，若正好落在 start bui-tun 之后的几十毫秒里，
+    # 它的 restart hysteria-client 会因互斥关系变成停掉 bui-tun，切换就报"启动失败"。
+    # TUN 期间先停掉 timer（TUN 模式下巡检脚本本来也只是早退），停 TUN 恢复时再拉起
+    systemctl stop hysteria-health.timer 2>/dev/null || true
+
     # 删除旧的 TUN 接口
     ip link delete hystun 2>/dev/null || true
     ip link delete bui-tun 2>/dev/null || true
@@ -2131,6 +2145,8 @@ stop_tun_mode() {
     if $restore; then
         if [[ -f "/etc/systemd/system/$CLIENT_SERVICE" ]]; then
             print_info "恢复 Hysteria2 客户端..."
+            # v3.6.0: start_tun_mode 把它 disable 了，恢复时要一并 enable 回来（开机自启）
+            systemctl enable "$CLIENT_SERVICE" 2>/dev/null || true
             systemctl start "$CLIENT_SERVICE" 2>/dev/null || true
             sleep 1
             if systemctl is-active --quiet "$CLIENT_SERVICE"; then
@@ -2141,12 +2157,15 @@ stop_tun_mode() {
             fi
         elif [[ -f /etc/systemd/system/xray-client.service ]]; then
             print_info "恢复 Xray 客户端..."
+            systemctl enable xray-client.service 2>/dev/null || true
             systemctl start xray-client 2>/dev/null || true
             sleep 1
             if systemctl is-active --quiet xray-client; then
                 print_success "Xray 客户端已恢复"
             fi
         fi
+        # v3.6.0: 恢复 TUN 期间停掉的巡检 timer（timer 单元本身一直存在、一直 enable）
+        systemctl start hysteria-health.timer 2>/dev/null || true
     fi
     
     # 9. 恢复 UFW 防火墙（如果被 TUN 暂停过）
@@ -2592,7 +2611,10 @@ _switch_to_profile() {
     tui_info "重新生成 TUN 配置..."; generate_singbox_tun_config "$tun_protocol"
 
     if [[ "$tun_was_active" == "true" ]]; then
-        tui_info "重启 TUN 模式..."; start_tun_mode
+        # v3.6.0: TUN 拉不起来就别报"已切换"——此时 hysteria-client 也没启（TUN 分支跳过了），
+        # 用户是彻底没代理的状态，必须让调用方看到失败
+        tui_info "重启 TUN 模式..."
+        start_tun_mode || { tui_error "TUN 启动失败，见上方日志"; return 1; }
     fi
 
     tui_success "已切换到: $selected"
@@ -3800,8 +3822,14 @@ edit_rules() {
         read -p "是否重新生成配置并重启? (y/n): " regen
         if [[ "$regen" =~ ^[yY]$ ]]; then
             generate_config
-            systemctl restart "$CLIENT_SERVICE" 2>/dev/null || true
-            print_success "配置已更新并重启"
+            # v3.6.0: TUN 模式下 hysteria-client 本该停着（sing-box 有自己的路由规则），
+            # 无条件 restart 会因单元互斥顶掉 bui-tun
+            if systemctl is-active --quiet "$CLIENT_SERVICE"; then
+                systemctl restart "$CLIENT_SERVICE" 2>/dev/null || true
+                print_success "配置已更新并重启"
+            else
+                print_success "配置已更新（Hysteria2 客户端未在运行，未重启）"
+            fi
         fi
     fi
 }
@@ -5609,7 +5637,10 @@ auto_update_all() {
     if [[ -n "$local_hy" && -n "$best_hy" ]] && _is_newer "$local_hy" "$best_hy"; then
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] Hysteria2: v${local_hy} -> v${best_hy}, 更新中..." >> "$LOG_FILE"
         HYSTERIA_USER=root bash <(curl -fsSL https://get.hy2.sh/) >> "$LOG_FILE" 2>&1 || true
-        systemctl restart "$CLIENT_SERVICE" 2>/dev/null || true
+        # v3.6.0: 只重启本来就在跑的那个。TUN 模式下 hysteria-client 本该停着，
+        # 无条件 restart 会因单元互斥变成"显式停掉 bui-tun"（Restart=always 不管这种停止），
+        # 用户直接断网且 proxy.sh 也没了
+        systemctl is-active --quiet "$CLIENT_SERVICE" && systemctl restart "$CLIENT_SERVICE" 2>/dev/null || true
     fi
     
     # Xray
@@ -5621,7 +5652,8 @@ auto_update_all() {
         if [[ -n "$local_xray" && -n "$best_xray" ]] && _is_newer "$local_xray" "$best_xray"; then
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] Xray: v${local_xray} -> v${best_xray}, 更新中..." >> "$LOG_FILE"
             bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install >> "$LOG_FILE" 2>&1 || true
-            systemctl restart xray-client 2>/dev/null || true
+            # v3.6.0: 同上，TUN 模式下别把 bui-tun 顶掉
+            systemctl is-active --quiet xray-client && systemctl restart xray-client 2>/dev/null || true
         fi
     fi
     
@@ -5635,8 +5667,15 @@ auto_update_all() {
             # 安装源固定为 GitHub tarball，所以按上限内的 gh_sb 装（服务端可能缓存了超上限版本）
             if [[ -n "$gh_sb" ]] && _is_newer "$local_sb" "$gh_sb"; then
                 echo "[$(date '+%Y-%m-%d %H:%M:%S')] sing-box: v${local_sb} -> v${gh_sb}, 更新中..." >> "$LOG_FILE"
-                install_singbox "$gh_sb" >> "$LOG_FILE" 2>&1 \
-                    || echo "[$(date '+%Y-%m-%d %H:%M:%S')] sing-box 安装失败，保留 v${local_sb}" >> "$LOG_FILE"
+                if install_singbox "$gh_sb" >> "$LOG_FILE" 2>&1; then
+                    # v3.6.0: 新内核要重启才生效；TUN 在跑就重启 bui-tun，不在跑什么都不做
+                    if systemctl is-active --quiet bui-tun; then
+                        echo "[$(date '+%Y-%m-%d %H:%M:%S')] 重启 bui-tun 以应用新 sing-box..." >> "$LOG_FILE"
+                        systemctl restart bui-tun 2>/dev/null || true
+                    fi
+                else
+                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] sing-box 安装失败，保留 v${local_sb}" >> "$LOG_FILE"
+                fi
             else
                 echo "[$(date '+%Y-%m-%d %H:%M:%S')] sing-box 无 ${SINGBOX_MAX_MINOR}.x 以内的可用新版本，跳过" >> "$LOG_FILE"
             fi
