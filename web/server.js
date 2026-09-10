@@ -1161,10 +1161,16 @@ function pickLatestTag(repo, releases) {
     const tags = (Array.isArray(releases) ? releases : []).filter(r => r && !r.draft).map(r => r.tag_name);
     if (repo === "SagerNet/sing-box") {
         const stable = tags.filter(t => /^v\d+\.\d+\.\d+$/.test(t));
-        const inCap = stable.find(t => t.startsWith(`v${SINGBOX_MAX_MINOR}.`));
         const latest = stable[0];
-        if (latest && inCap && !latest.startsWith(`v${SINGBOX_MAX_MINOR}.`)) return inCap;
-        return latest || null;
+        if (!latest) return null;
+        // minor 要按数值比（"1.9" 字符串上大于 "1.14"）；latest 不高于上限就直接用
+        const [lMaj, lMin] = latest.replace(/^v/, "").split(".").map(Number);
+        const [cMaj, cMin] = SINGBOX_MAX_MINOR.split(".").map(Number);
+        if (lMaj < cMaj || (lMaj === cMaj && lMin <= cMin)) return latest;
+        const inCap = stable.find(t => t.startsWith(`v${SINGBOX_MAX_MINOR}.`));
+        if (inCap) return inCap;
+        log("WARN", `[内核同步] sing-box 最新 ${latest} 超过上限 ${SINGBOX_MAX_MINOR}.x 且未找到上限内版本，跳过同步`);
+        return null;
     }
     if (repo === "XTLS/Xray-core") return tags.find(t => /^v\d/.test(t)) || null;
     return tags.find(t => !/-(alpha|beta|rc)/.test(t)) || null;
@@ -1174,10 +1180,12 @@ function pickLatestTag(repo, releases) {
 async function getGitHubLatest(repo) {
     // Xray / sing-box 走 releases 列表 + pickLatestTag；hysteria 的 tag 形如 app/v2.12.2，沿用 latest
     if (repo === "XTLS/Xray-core" || repo === "SagerNet/sing-box") {
-        const list = JSON.parse(await fetchUrl(`https://api.github.com/repos/${repo}/releases?per_page=30`, { timeout: 15000 }));
+        const list = JSON.parse(await fetchUrl(`https://api.github.com/repos/${repo}/releases?per_page=100`, { timeout: 15000 }));
         const tag = pickLatestTag(repo, list);
-        const picked = Array.isArray(list) ? list.find(r => r && r.tag_name === tag) : null;
-        if (picked) return picked;
+        // 列表里没有可用 tag（sing-box 超上限且无上限内版本）→ 视为无更新；
+        // 回退 /releases/latest 会把超上限的版本拉回来，正是本次要堵的口子
+        if (!tag) return null;
+        return list.find(r => r && r.tag_name === tag);
     }
     const data = await fetchUrl(`https://api.github.com/repos/${repo}/releases/latest`, { timeout: 15000 });
     return JSON.parse(data);
@@ -1204,6 +1212,7 @@ function saveCachedVersions(versions) {
 async function syncOneKernel(name, repo, getAssets, cached) {
     try {
         const release = await getGitHubLatest(repo);
+        if (!release) { log("INFO", `[内核同步] ${name} 无符合条件的版本，跳过`); return; }
         const version = (release.tag_name || "").replace(/^v/, "").replace(/^app\/v?/, "");
         if (!version || !/^\d+\.\d+/.test(version)) return;
 

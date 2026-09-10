@@ -1800,7 +1800,7 @@ SINGBOX_MAX_MINOR="1.14"
 
 gh_latest_tag() {
     local repo="$1" re="${2:-.}"
-    curl -fsSL --max-time 15 "https://api.github.com/repos/${repo}/releases?per_page=30" 2>/dev/null \
+    curl -fsSL --max-time 15 "https://api.github.com/repos/${repo}/releases?per_page=100" 2>/dev/null \
         | grep -oE '"tag_name":[[:space:]]*"[^"]+"' | sed -E 's/.*"([^"]+)"$/\1/' | grep -E "$re" | head -1 || true
 }
 
@@ -1812,12 +1812,41 @@ singbox_latest_version() {
         && [[ "$(printf '%s\n%s\n' "$SINGBOX_MAX_MINOR" "$minor" | sort -V | head -1)" == "$SINGBOX_MAX_MINOR" ]]; then
         capped=$(gh_latest_tag SagerNet/sing-box "^v${SINGBOX_MAX_MINOR//./\\.}\.[0-9]+$" | sed 's/^v//')
         if [[ -n "$capped" ]]; then echo "$capped"; return 0; fi
-        print_warning "sing-box 最新 ${latest} 超过上限 ${SINGBOX_MAX_MINOR}.x 且找不到上限内版本，回退使用最新版" >&2
+        print_warning "sing-box 最新 ${latest} 超过上限 ${SINGBOX_MAX_MINOR}.x 且未找到上限内版本，跳过自动更新" >&2
+        echo ""
+        return 0
     fi
     echo "$latest"
 }
 
 xray_latest_version() { gh_latest_tag XTLS/Xray-core '^v[0-9]' | sed 's/^v//'; }
+
+# v3.6.0: 按指定版本从 GitHub release tarball 安装 sing-box。
+# apt / 官方脚本只会装最新版，会绕过 SINGBOX_MAX_MINOR 上限（1.15 起 1.14 的弃用项变致命）。
+install_singbox_version() {
+    local ver="$1" dst arch tmp
+    dst="${SINGBOX_INSTALL_PATH:-$(command -v sing-box 2>/dev/null || echo /usr/local/bin/sing-box)}"
+    case "$(uname -m)" in
+        x86_64)  arch=amd64 ;;
+        aarch64) arch=arm64 ;;
+        armv7l)  arch=armv7 ;;
+        *) print_warning "未知架构 $(uname -m)，跳过 sing-box 安装"; return 1 ;;
+    esac
+    tmp=$(mktemp -d)
+    if curl -fsSL --max-time 120 -o "$tmp/sb.tgz" \
+        "https://github.com/SagerNet/sing-box/releases/download/v${ver}/sing-box-${ver}-linux-${arch}.tar.gz" \
+        && tar xzf "$tmp/sb.tgz" -C "$tmp" && [[ -x "$tmp/sing-box-${ver}-linux-${arch}/sing-box" ]]; then
+        # 先装到同目录 .new 再 mv：sing-box 正在跑时直接覆盖会 ETXTBSY
+        if install -m 755 "$tmp/sing-box-${ver}-linux-${arch}/sing-box" "${dst}.new" && mv -f "${dst}.new" "$dst"; then
+            rm -rf "$tmp"
+            return 0
+        fi
+        rm -f "${dst}.new"
+    fi
+    rm -rf "$tmp"
+    print_warning "sing-box ${ver} tarball 安装失败，保留现有版本"
+    return 1
+}
 
 
 update_kernel() {
@@ -1878,12 +1907,9 @@ update_kernel() {
             echo -e "  本地: ${YELLOW}v${local_sb}${NC}  远程: ${GREEN}v${remote_sb}${NC}"
             if _is_newer "$local_sb" "$remote_sb"; then
                 print_info "发现新版本，正在更新..."
-                if command -v apt-get &> /dev/null; then
-                    apt-get update -qq && apt-get install -y -qq sing-box
-                else
-                    bash <(curl -fsSL https://sing-box.app/install.sh)
+                if install_singbox_version "$remote_sb"; then
+                    has_update=true
                 fi
-                has_update=true
             else
                 print_success "已是最新版本"
             fi
@@ -1960,12 +1986,11 @@ auto_update_kernel() {
         local remote_sb=$(singbox_latest_version)
         if [[ -n "$local_sb" && -n "$remote_sb" ]] && _is_newer "$local_sb" "$remote_sb"; then
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] sing-box: v${local_sb} -> v${remote_sb}, 更新中..." >> "$LOG_FILE"
-            if command -v apt-get &> /dev/null; then
-                apt-get update -qq && apt-get install -y -qq sing-box >> "$LOG_FILE" 2>&1 || true
+            if install_singbox_version "$remote_sb" >> "$LOG_FILE" 2>&1; then
+                updated=true
             else
-                bash <(curl -fsSL https://sing-box.app/install.sh) >> "$LOG_FILE" 2>&1 || true
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] sing-box 安装失败，保留 v${local_sb}" >> "$LOG_FILE"
             fi
-            updated=true
         fi
     fi
 

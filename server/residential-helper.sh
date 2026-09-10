@@ -153,7 +153,7 @@ SINGBOX_MAX_MINOR="1.14"
 
 gh_latest_tag() {
     local repo="$1" re="${2:-.}"
-    curl -fsSL --max-time 15 "https://api.github.com/repos/${repo}/releases?per_page=30" 2>/dev/null \
+    curl -fsSL --max-time 15 "https://api.github.com/repos/${repo}/releases?per_page=100" 2>/dev/null \
         | grep -oE '"tag_name":[[:space:]]*"[^"]+"' | sed -E 's/.*"([^"]+)"$/\1/' | grep -E "$re" | head -1 || true
 }
 
@@ -165,7 +165,9 @@ singbox_latest_version() {
         && [[ "$(printf '%s\n%s\n' "$SINGBOX_MAX_MINOR" "$minor" | sort -V | head -1)" == "$SINGBOX_MAX_MINOR" ]]; then
         capped=$(gh_latest_tag SagerNet/sing-box "^v${SINGBOX_MAX_MINOR//./\\.}\.[0-9]+$" | sed 's/^v//')
         if [[ -n "$capped" ]]; then echo "$capped"; return 0; fi
-        info "sing-box 最新 ${latest} 超过上限 ${SINGBOX_MAX_MINOR}.x 且找不到上限内版本，回退使用最新版"
+        info "sing-box 最新 ${latest} 超过上限 ${SINGBOX_MAX_MINOR}.x 且未找到上限内版本，跳过自动更新"
+        echo ""
+        return 0
     fi
     echo "$latest"
 }

@@ -1127,7 +1127,7 @@ SINGBOX_MAX_MINOR="1.14"
 
 gh_latest_tag() {
     local repo="$1" re="${2:-.}"
-    curl -fsSL --max-time 15 "https://api.github.com/repos/${repo}/releases?per_page=30" 2>/dev/null \
+    curl -fsSL --max-time 15 "https://api.github.com/repos/${repo}/releases?per_page=100" 2>/dev/null \
         | grep -oE '"tag_name":[[:space:]]*"[^"]+"' | sed -E 's/.*"([^"]+)"$/\1/' | grep -E "$re" | head -1 || true
 }
 
@@ -1139,7 +1139,9 @@ singbox_latest_version() {
         && [[ "$(printf '%s\n%s\n' "$SINGBOX_MAX_MINOR" "$minor" | sort -V | head -1)" == "$SINGBOX_MAX_MINOR" ]]; then
         capped=$(gh_latest_tag SagerNet/sing-box "^v${SINGBOX_MAX_MINOR//./\\.}\.[0-9]+$" | sed 's/^v//')
         if [[ -n "$capped" ]]; then echo "$capped"; return 0; fi
-        print_warning "sing-box 最新 ${latest} 超过上限 ${SINGBOX_MAX_MINOR}.x 且找不到上限内版本，回退使用最新版" >&2
+        print_warning "sing-box 最新 ${latest} 超过上限 ${SINGBOX_MAX_MINOR}.x 且未找到上限内版本，跳过自动更新" >&2
+        echo ""
+        return 0
     fi
     echo "$latest"
 }
@@ -1147,46 +1149,16 @@ singbox_latest_version() {
 xray_latest_version() { gh_latest_tag XTLS/Xray-core '^v[0-9]' | sed 's/^v//'; }
 
 install_singbox() {
+    # v3.6.0: 可传入版本号（内核更新按 SINGBOX_MAX_MINOR 上限指定版本）；不传则查上限内最新版。
+    # apt 源 / 官方脚本只会装最新版（绕过上限，1.15 起 1.14 的弃用项变致命），已移除。
+    local version="${1:-}"
     print_info "安装 sing-box..."
-    
-    if command -v sing-box &> /dev/null; then
+
+    if [[ -z "$version" ]] && command -v sing-box &> /dev/null; then
         print_success "已安装: $(sing-box version 2>/dev/null | head -n1 | awk '{print $3}')"
         return 0
     fi
-    
-    # 方法1: 使用 apt 源 (Debian/Ubuntu)
-    if [[ "$PKG_MANAGER" == "apt" ]]; then
-        start_spinner "添加 sing-box 源..."
-        
-        # 尝试下载 GPG 密钥
-        mkdir -p /etc/apt/keyrings
-        local gpg_success=false
-        
-        # 直接尝试 (sing-box.app 在国内通常可访问)
-        if curl -fsSL --max-time 30 https://sing-box.app/gpg.key -o /etc/apt/keyrings/sagernet.asc 2>/dev/null; then
-            gpg_success=true
-        fi
-        
-        # 如果直接下载失败，尝试代理
-        if [[ "$gpg_success" == "false" ]] && ss -tuln 2>/dev/null | grep -q ":1080 "; then
-            if curl --socks5 127.0.0.1:1080 -fsSL --max-time 30 https://sing-box.app/gpg.key -o /etc/apt/keyrings/sagernet.asc 2>/dev/null; then
-                gpg_success=true
-            fi
-        fi
-        
-        if [[ "$gpg_success" == "true" ]]; then
-            chmod a+r /etc/apt/keyrings/sagernet.asc
-            echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/sagernet.asc] https://deb.sagernet.org/ * *" > /etc/apt/sources.list.d/sagernet.list
-            stop_spinner
-            run_with_spinner "更新软件源..." apt-get update -qq
-            run_with_spinner "安装 sing-box..." apt-get install -y -qq sing-box
-            print_success "sing-box 安装完成"
-            return 0
-        fi
-        stop_spinner
-    fi
-    
-    # 方法2: 手动下载二进制文件 (使用 GitHub releases + 镜像)
+
     print_info "使用二进制安装..."
     local arch=$(uname -m)
     case "$arch" in
@@ -1194,29 +1166,28 @@ install_singbox() {
         aarch64) arch="arm64" ;;
         armv7l) arch="armv7" ;;
     esac
-    
-    # 获取最新版本号 (使用镜像)
-    local version=""
-    version=$(singbox_latest_version)
-    
+
+    [[ -z "$version" ]] && version=$(singbox_latest_version)
     if [[ -z "$version" ]]; then
         # 使用默认版本
         version="1.10.0"
         print_warning "无法获取最新版本，使用默认版本 $version"
     fi
-    
+
     local download_url="https://github.com/SagerNet/sing-box/releases/download/v${version}/sing-box-${version}-linux-${arch}.tar.gz"
     local tmp_file="/tmp/sing-box.tar.gz"
-    
+
     if smart_download "$download_url" "$tmp_file" "sing-box"; then
         tar -xzf "$tmp_file" -C /tmp
-        cp "/tmp/sing-box-${version}-linux-${arch}/sing-box" /usr/bin/
-        chmod +x /usr/bin/sing-box
+        # 先写 .new 再 mv：sing-box 正在跑时直接覆盖会 ETXTBSY
+        cp "/tmp/sing-box-${version}-linux-${arch}/sing-box" /usr/bin/sing-box.new
+        chmod +x /usr/bin/sing-box.new
+        mv -f /usr/bin/sing-box.new /usr/bin/sing-box
         rm -rf "$tmp_file" "/tmp/sing-box-${version}-linux-${arch}"
-        print_success "sing-box 安装完成"
+        print_success "sing-box 安装完成 (v${version})"
         return 0
     fi
-    
+
     print_error "sing-box 安装失败，请检查网络连接"
     return 1
 }
@@ -4946,10 +4917,10 @@ update_all() {
                     fi
                 fi
                 if [[ "$sb_ok" == "false" ]]; then
-                    if [[ "${PKG_MANAGER:-}" == "apt" ]]; then
-                        apt-get update -qq && apt-get install -y -qq sing-box 2>/dev/null || print_error "sing-box 更新失败"
+                    if [[ -n "${gh_sb:-}" ]]; then
+                        install_singbox "$gh_sb" || print_error "sing-box 更新失败"
                     else
-                        bash <(curl -fsSL https://sing-box.app/install.sh) 2>/dev/null || print_error "sing-box 更新失败"
+                        print_warning "未找到 ${SINGBOX_MAX_MINOR}.x 以内的 sing-box 版本，跳过更新"
                     fi
                 fi
             fi
@@ -5527,11 +5498,13 @@ auto_update_all() {
         local best_sb=$(_newer "${sv_sb:-0}" "${gh_sb:-0}")
         [[ "$best_sb" == "0" ]] && best_sb=""
         if [[ -n "$local_sb" && -n "$best_sb" ]] && _is_newer "$local_sb" "$best_sb"; then
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] sing-box: v${local_sb} -> v${best_sb}, 更新中..." >> "$LOG_FILE"
-            if command -v apt-get &> /dev/null; then
-                apt-get update -qq && apt-get install -y -qq sing-box >> "$LOG_FILE" 2>&1 || true
+            # 安装源固定为 GitHub tarball，所以按上限内的 gh_sb 装（服务端可能缓存了超上限版本）
+            if [[ -n "$gh_sb" ]] && _is_newer "$local_sb" "$gh_sb"; then
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] sing-box: v${local_sb} -> v${gh_sb}, 更新中..." >> "$LOG_FILE"
+                install_singbox "$gh_sb" >> "$LOG_FILE" 2>&1 \
+                    || echo "[$(date '+%Y-%m-%d %H:%M:%S')] sing-box 安装失败，保留 v${local_sb}" >> "$LOG_FILE"
             else
-                bash <(curl -fsSL https://sing-box.app/install.sh) >> "$LOG_FILE" 2>&1 || true
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] sing-box 无 ${SINGBOX_MAX_MINOR}.x 以内的可用新版本，跳过" >> "$LOG_FILE"
             fi
         fi
     fi
