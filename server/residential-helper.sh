@@ -47,8 +47,15 @@ RED='\033[0;31m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 err()  { echo -e "${RED}ERROR: $*${NC}" >&2; }
 info() { echo -e "${BLUE}$*${NC}" >&2; }
 
-# v3.6.0: 文件摘要（文件不存在 → 空串，与任何真实摘要都不相等 → 视为有变化）
-file_digest() { [[ -f "$1" ]] && md5sum "$1" 2>/dev/null | awk '{print $1}' || echo ""; }
+# v3.6.0: 文件摘要。文件不存在 → 空串（与任何真实摘要都不相等 → 视为有变化）；
+# md5sum 不可用时每次返回不同的 token，让"拿不到摘要"退化成"当作有变化"——
+# 宁可多重启一次，也不能因为两边都是空串而把真的配置变化判成"没变"。
+file_digest() {
+    [[ -f "$1" ]] || { echo ""; return 0; }
+    local d
+    d=$(md5sum "$1" 2>/dev/null | awk '{print $1}') || d=""
+    [[ -n "$d" ]] && echo "$d" || echo "nodigest-$$-${RANDOM}"
+}
 
 # v3.6.0 R3: curl 配置文件双引号内需转义 \ 与 "
 curl_cfg_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
@@ -212,6 +219,13 @@ get_server_ip() {
     [[ "${_SERVER_IP_FETCHED:-}" == "1" ]] && return 0
     _SERVER_IP=$(curl -sS --max-time 5 https://api.ipify.org 2>/dev/null || \
                  curl -sS --max-time 5 https://ifconfig.me 2>/dev/null || true)
+    # v3.6.0: 两个探测都失败时，沿用中继配置里已有的那个 /32（本机公网 IP 直连例外）。
+    # 否则一次网络抖动就让 ip_cidr 少一项 → 摘要变化 → 白重启一次，恢复时再重启一次。
+    # 探测成功一律以探测结果为准（换 IP 的机器要跟上）。
+    if [[ -z "$_SERVER_IP" && -f "${SINGBOX_CONFIG}" ]]; then
+        _SERVER_IP=$(jq -r '[.route.rules[]?|select(.ip_cidr)|.ip_cidr[]|select(endswith("/32"))][0] // "" | sub("/32$";"")' \
+                     "${SINGBOX_CONFIG}" 2>/dev/null || true)
+    fi
     _SERVER_IP_FETCHED=1
 }
 
