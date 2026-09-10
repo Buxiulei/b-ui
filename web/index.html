@@ -313,6 +313,8 @@
                         <button class="btn resi-btn-save resi-update-btn" type="button" onclick="addResidentialUrl()">确认添加</button>
                     </div>
                     <div class="resi-field-hint">格式: socks5://user:pass@host:port 或 host:port:user:pass</div>
+                    <!-- v3.6.0 R8: 供应商默认"出口不可用就静默换 IP"，不加粘性/失效参数健康探测语义就失真 -->
+                    <div class="resi-hint resi-global-hint">建议在用户名里加供应商的粘性/失效参数（如 Bright Data <code>-session-xxx-const</code>），否则出口 IP 会静默轮换；见 <a href="https://github.com/Buxiulei/b-ui/blob/main/docs/residential-proxy-guide.md" target="_blank" rel="noopener">住宅代理指南</a></div>
                 </div>
             </div>
             <div id="resi-error" class="resi-error-box" style="display:none">

@@ -204,6 +204,7 @@ sing-box 中继 (127.0.0.1:2080)
 - 配置文件：`/opt/b-ui/residential-proxy.json`（chmod 600）
 - 控制脚本：`/opt/b-ui/residential-helper.sh {setup|enable|disable|status|reapply|set-domains}`
 - 入口：一键安装向导 / `b-ui` CLI 菜单 / Web 看板🏠
+- 选购与配置：[docs/residential-proxy-guide.md](docs/residential-proxy-guide.md) —— 供应商粘性参数（不加就静默换 IP）、目标端口白名单、"不限量"与转售条款、池子来源风险披露、体检读数判读
 
 ---
 

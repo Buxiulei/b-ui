@@ -136,7 +136,11 @@ verify() {
     local exit_ip
     exit_ip=$(curl_socks_cfg "$host" "$port" "$user" "$pass" \
         | curl -sS --max-time 10 -K - https://api.ipify.org 2>/dev/null) \
-        || { err "连接住宅代理失败 (${host}:${port})"; return 1; }
+        || { err "连接住宅代理失败 (${host}:${port})"
+             # v3.6.0 R8: Bright Data 等住宅线路只放开固定目标端口(8080/8443/5678/1962/2000/4443/...)且只允许
+             # HTTPS 目标，443 不在名单里——探测必然失败，但报错看起来像"凭据错了"
+             err "若供应商限制目标端口（如 Bright Data 住宅仅开放 8080/8443 等），请改用其 HTTP 代理端口或联系供应商；详见 docs/residential-proxy-guide.md"
+             return 1; }
 
     [[ "$exit_ip" == "$vps_ip" ]] \
         && { err "出口 IP 与 VPS 相同 (${vps_ip})，代理未生效"; return 1; }
