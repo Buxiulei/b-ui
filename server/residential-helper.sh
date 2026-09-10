@@ -30,6 +30,7 @@ SINGBOX_CONFIG="${BASE_DIR}/singbox-relay.json"
 SINGBOX_RELAY_PORT=2080
 SINGBOX_RELAY_API="127.0.0.1:9091"
 RELAY_SERVICE="b-ui-relay"
+RELAY_UNIT="${RELAY_UNIT_FILE:-/etc/systemd/system/${RELAY_SERVICE}.service}"
 RELAY_LOCK="${BASE_DIR}/.relay.lock"
 
 # v3.6.0 R2: 写路径互斥（与 resi-health.sh 共用同一把锁）；持锁到进程退出
@@ -365,7 +366,7 @@ write_singbox_config_direct() {
 }
 
 start_relay_service() {
-    cat > /etc/systemd/system/${RELAY_SERVICE}.service <<EOF
+    cat > "${RELAY_UNIT}" <<EOF
 [Unit]
 Description=B-UI Outbound Relay (sing-box)
 After=network.target
@@ -396,7 +397,7 @@ reload_relay_service() {
 stop_relay_service() {
     systemctl stop "${RELAY_SERVICE}" 2>/dev/null || true
     systemctl disable "${RELAY_SERVICE}" 2>/dev/null || true
-    rm -f /etc/systemd/system/${RELAY_SERVICE}.service
+    rm -f "${RELAY_UNIT}"
     systemctl daemon-reload 2>/dev/null || true
 }
 
@@ -616,7 +617,13 @@ case "$cmd" in
     reapply)
         ensure_singbox
         write_singbox_config_from_state
+        # start_relay_service 会重写 unit（升级迁移依赖它），但 enable --now 不会重启"已在跑"的实例。
+        # v3.6.0 R6: 新配置(selector + clash_api)必须真正加载——否则升级后巡检永远拿不到 Clash API，
+        # 热切换形同虚设。已在跑的实例显式 restart 一次（升级本来就会重启 hy2/xray，一次性代价）。
+        relay_was_active=0
+        systemctl is-active --quiet "${RELAY_SERVICE}" 2>/dev/null && relay_was_active=1
         start_relay_service
+        [[ "$relay_was_active" == "1" ]] && systemctl restart "${RELAY_SERVICE}" 2>/dev/null
         ;;
 
     set-domains)
