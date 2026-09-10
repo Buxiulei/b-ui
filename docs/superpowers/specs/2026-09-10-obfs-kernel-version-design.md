@@ -67,3 +67,13 @@
 1. `bash -n` 全部脚本；`node --check web/server.js`。
 2. obfs：本地起 server.js，`config.yaml` 含 obfs 块 → `/api/clash/<fusion 用户>` 的 HY2直连 节点含 `obfs: salamander` 与 `obfs-password`，HY2住宅 不含；无 obfs 块时两者都不含。`parse_hysteria_uri` 对含 `obfs=salamander&obfs-password=p%40ss` 的 URI 输出 `OBFS_TYPE=salamander`、`OBFS_PASSWORD=p@ss`；生成的 Hysteria2 YAML 与 sing-box TUN 配置含对应 obfs（sing-box 三版 `check` 通过）；无 obfs 的 URI 不含。`b-ui obfs on` 输出含"重新"提示。
 3. 版本：PATH 前置 `curl` stub 返回固定 JSON（Xray 列表首项 `v26.9.9` prerelease；sing-box latest `v1.15.0`、列表含 `v1.15.0`、`v1.14.3`、`v1.14.0`、`v1.15.0-alpha.2`），各文件的探测函数得到 Xray `26.9.9`、sing-box `1.14.3`；把上限改成 `1.15` 时得到 `1.15.0`；Hysteria 仍走 latest。
+
+
+## 5. 追加：sing-box 上限约束安装通道（Task D，审查发现）
+
+审查发现 `SINGBOX_MAX_MINOR` 只决定"要不要更新"，安装动作仍是 `apt-get install -y sing-box` / `sing-box.app/install.sh`（`update.sh` `update_kernel`/`auto_update_kernel`，`b-ui-client.sh` `update_all`/`auto_update_all`），装到的是仓库最新版（将是 1.15.x），上限形同虚设。另外上限内在 30 条 releases 窗口里找不到 1.14.x 时回退到最新，几个月后 1.14.x 会被 alpha/beta 挤出窗口。
+
+决策：
+- `gh_latest_tag` 的 `per_page` 提到 100；`singbox_latest_version` 在上限内找不到版本时**返回空**（调用方视为"无更新"），并打警告；`web/server.js` `pickLatestTag` 同样返回 null 并 `log("WARN")`。
+- sing-box 的安装动作改为按版本下载 GitHub release tarball（`https://github.com/SagerNet/sing-box/releases/download/v<ver>/sing-box-<ver>-linux-<arch>.tar.gz`，arch 映射 amd64/arm64/armv7），解包到现有二进制路径，失败保留旧二进制；四处调用点统一走各自文件内的按版本安装函数（客户端复用现有 `install_singbox <ver>`；服务端 `update.sh` 新增 `install_singbox_version`，逻辑同 `residential-helper.sh ensure_singbox` 的 tarball 分支）。
+- Hysteria2/Xray 安装通道不变。

@@ -337,3 +337,95 @@ bash -n server/update.sh server/core.sh && bash $S/kernel-tests/test_update_hygi
 git add server/update.sh server/core.sh
 git commit -m "fix(update): D6 守卫锚定 type: http\$ 不再每次自愈都重启 hysteria; D9 resi 已有 direct: 子块时跳过; 恢复路径不累积备份"
 ```
+
+---
+
+### Task D: sing-box 上限约束安装通道 + 上限内无版本则跳过
+
+**Files:**
+- Modify: `server/update.sh`（`gh_latest_tag` per_page、`singbox_latest_version` 回退语义、`update_kernel()` 与 `auto_update_kernel()` 的 sing-box 安装分支、新增 `install_singbox_version()`）
+- Modify: `b-ui-client.sh`（同上四项；安装复用现有 `install_singbox <ver>`）
+- Modify: `server/core.sh`、`server/residential-helper.sh`（仅 `gh_latest_tag` per_page 与 `singbox_latest_version` 回退语义）
+- Modify: `web/server.js`（`pickLatestTag` sing-box 无上限内版本 → null + WARN 日志，`getGitHubLatest` 对 null 不再回退 latest；`per_page=100`）
+- Test: `scratchpad/kernel-tests/test_singbox_cap_install.sh`
+
+- [ ] **Step 1: 写测试（预期失败）**
+
+```bash
+#!/bin/bash
+set -u
+REPO=/home/roots/b-ui; fail=0; T=$(mktemp -d); mkdir -p "$T/bin" "$T/usr"
+# curl stub：releases 列表按 per_page 区分；tarball 下载把 fake.tgz 复制到 -o 目标
+cat > "$T/bin/curl" <<'STUB'
+#!/bin/bash
+url="${@: -1}"; out=""; prev=""
+for a in "$@"; do [[ "$prev" == "-o" ]] && out="$a"; prev="$a"; done
+case "$url" in
+  *sing-box/releases\?per_page=100*) echo '[{"tag_name":"v1.15.0"},{"tag_name":"v1.15.0-alpha.2"},{"tag_name":"v1.14.3"},{"tag_name":"v1.14.0"}]';;
+  *sing-box/releases\?per_page=30*) echo 'WRONG-PER-PAGE';;
+  *Xray-core/releases*) echo '[{"tag_name":"v26.9.9"}]';;
+  *hysteria/releases/latest*) echo '{"tag_name":"app/v2.9.1"}';;
+  *sing-box/releases/download/v1.14.3/sing-box-1.14.3-linux-amd64.tar.gz) echo "$url" >> "$STUB_DIR/dl.log"; [[ -n "$out" ]] && cp "$STUB_DIR/fake.tgz" "$out";;
+  *) exit 22;;
+esac
+STUB
+chmod +x "$T/bin/curl"; export STUB_DIR="$T"; export PATH="$T/bin:$PATH"
+printf '#!/bin/bash\necho "$@" >> "%s/sc.log"; exit 0\n' "$T" > "$T/bin/systemctl"; chmod +x "$T/bin/systemctl"
+printf '#!/bin/bash\necho "$@" >> "%s/apt.log"; exit 0\n' "$T" > "$T/bin/apt-get"; chmod +x "$T/bin/apt-get"
+mkdir -p "$T/pkg/sing-box-1.14.3-linux-amd64"; printf '#!/bin/bash\necho "sing-box version 1.14.3"\n' > "$T/pkg/sing-box-1.14.3-linux-amd64/sing-box"; chmod +x "$T/pkg/sing-box-1.14.3-linux-amd64/sing-box"; tar czf "$T/fake.tgz" -C "$T/pkg" .
+extract() { sed -n "/^$2() {/,/^}/p" "$1"; }
+# A. 四个 bash 文件的 singbox_latest_version：上限 1.14 → 1.14.3；上限 1.12(窗口内无) → 空
+for f in server/update.sh b-ui-client.sh server/core.sh server/residential-helper.sh; do
+  { grep -E '^(RED|GREEN|YELLOW|BLUE|NC)=' "$REPO/$f" | head -5; grep -E '^SINGBOX_MAX_MINOR=' "$REPO/$f"; for fn in print_info print_warning print_success info err gh_latest_tag singbox_latest_version; do extract "$REPO/$f" "$fn"; done; } > "$T/lib.sh"
+  v=$(bash -c "source '$T/lib.sh' 2>/dev/null; singbox_latest_version 2>/dev/null"); [[ "$v" == "1.14.3" ]] || { echo "FAIL $f cap → '$v'"; fail=1; }
+  v=$(bash -c "source '$T/lib.sh' 2>/dev/null; SINGBOX_MAX_MINOR=1.12 singbox_latest_version 2>/dev/null"); [[ -z "$v" ]] || { echo "FAIL $f 上限内无版本应返回空，得到 '$v'"; fail=1; }
+done
+# B. update.sh auto_update_kernel 的 sing-box 分支走 tarball 而非 apt
+{ grep -E '^(RED|GREEN|YELLOW|BLUE|NC)=' "$REPO/server/update.sh" | head -5; grep -E '^SINGBOX_MAX_MINOR=' "$REPO/server/update.sh"; echo "BASE_DIR='$T'; SINGBOX_INSTALL_PATH='$T/usr/sing-box'"
+  for fn in print_info print_warning print_success _is_newer gh_latest_tag singbox_latest_version xray_latest_version install_singbox_version auto_update_kernel; do extract "$REPO/server/update.sh" "$fn"; done
+  echo 'hysteria(){ echo "Version: v2.9.1"; }; xray(){ echo "Xray 26.9.9"; }; sing-box(){ echo "sing-box version 1.13.11"; }; command(){ if [[ "$2" == sing-box || "$2" == xray ]]; then return 0; fi; builtin command "$@"; }; uname(){ echo x86_64; }'
+} > "$T/k.sh"
+sed -i 's#local LOG_FILE="/var/log/b-ui-kernel-update.log"#local LOG_FILE="'"$T"'/k.log"#' "$T/k.sh"
+: > "$T/apt.log"; : > "$T/dl.log"; ( source "$T/k.sh"; auto_update_kernel ) >/dev/null 2>&1
+grep -q 'sing-box' "$T/apt.log" && { echo "FAIL B 仍用 apt 安装 sing-box"; fail=1; }
+grep -q 'v1.14.3/sing-box-1.14.3-linux-amd64' "$T/dl.log" || { echo "FAIL B 未按上限版本下载 tarball: $(cat $T/dl.log 2>/dev/null)"; fail=1; }
+[[ -x "$T/usr/sing-box" ]] && "$T/usr/sing-box" version | grep -q 1.14.3 || { echo "FAIL B 二进制未安装到位"; fail=1; }
+# C. server.js 同步
+grep -q 'per_page=100' "$REPO/web/server.js" && grep -q 'SINGBOX_MAX_MINOR' "$REPO/web/server.js" || { echo "FAIL C server.js 未同步"; fail=1; }
+rm -rf "$T"; [[ $fail == 0 ]] && echo "PASS singbox cap install" || exit 1
+```
+
+`auto_update_kernel` 的 hysteria/xray 分支在壳里被函数桩短路（版本相同不更新）。`install_singbox_version` 需支持 `SINGBOX_INSTALL_PATH` 覆盖（默认取 `$(command -v sing-box)`，缺省 `/usr/local/bin/sing-box`）。
+
+- [ ] **Step 2: 运行确认失败** → Expected: A 第二项（上限内无版本仍返回最新）、B（apt 被调用 / 无 tarball）FAIL。
+
+- [ ] **Step 3: 实现**
+
+- 四个 bash 文件：`per_page=30` → `per_page=100`；`singbox_latest_version` 找不到上限内版本的分支改为 `print_warning "sing-box 最新 ${latest} 超过上限 ${SINGBOX_MAX_MINOR}.x 且未找到上限内版本，跳过自动更新" >&2; echo ""; return 0`（helper 用 `info`）。
+- `server/update.sh` 新增：
+  ```bash
+  # v3.6.0: 按指定版本从 GitHub release tarball 安装 sing-box（apt/官方脚本只会装最新版，会绕过 SINGBOX_MAX_MINOR）
+  install_singbox_version() {
+      local ver="$1" dst arch tmp
+      dst="${SINGBOX_INSTALL_PATH:-$(command -v sing-box 2>/dev/null || echo /usr/local/bin/sing-box)}"
+      case "$(uname -m)" in x86_64) arch=amd64;; aarch64) arch=arm64;; armv7l) arch=armv7;; *) print_warning "未知架构 $(uname -m)，跳过 sing-box 安装"; return 1;; esac
+      tmp=$(mktemp -d)
+      if curl -fsSL --max-time 120 -o "$tmp/sb.tgz" "https://github.com/SagerNet/sing-box/releases/download/v${ver}/sing-box-${ver}-linux-${arch}.tar.gz" \
+         && tar xzf "$tmp/sb.tgz" -C "$tmp" && [[ -x "$tmp/sing-box-${ver}-linux-${arch}/sing-box" ]]; then
+          install -m 755 "$tmp/sing-box-${ver}-linux-${arch}/sing-box" "$dst" && { rm -rf "$tmp"; return 0; }
+      fi
+      rm -rf "$tmp"; print_warning "sing-box ${ver} tarball 安装失败，保留现有版本"; return 1
+  }
+  ```
+  `update_kernel()`/`auto_update_kernel()` 的 sing-box 分支：`remote_sb=$(singbox_latest_version)`；非空且 `_is_newer` → `install_singbox_version "$remote_sb"` 成功才 `updated=true`；删除 apt/官方脚本分支。
+- `b-ui-client.sh`：`update_all`/`auto_update_all` 的 sing-box 分支同理，调用现有 `install_singbox "$gh_sb"`（确认其接受版本参数并走 tarball；若内部再查 latest，改为优先用传入版本）。
+- `web/server.js`：`pickLatestTag` sing-box 分支无上限内版本 → `log("WARN", …)` 并返回 null；`getGitHubLatest` 对 null 不再回退 `/releases/latest`（视为无更新）；`per_page=30` → 100。
+
+- [ ] **Step 4: 验证并提交**
+
+```bash
+bash -n server/update.sh b-ui-client.sh server/core.sh server/residential-helper.sh && node --check web/server.js
+bash $S/kernel-tests/test_singbox_cap_install.sh && bash $S/kernel-tests/test_version_probe.sh && bash $S/restart-tests/test_auto_update.sh
+git add server/update.sh b-ui-client.sh server/core.sh server/residential-helper.sh web/server.js
+git commit -m "fix(kernel): sing-box 上限约束安装通道(按版本 tarball 安装,不再 apt 装最新) + 上限内无版本则跳过更新"
+```
