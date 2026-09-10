@@ -2772,11 +2772,12 @@ cmd_tun() {
             exit $?
             ;;
         off|stop|disable)
-            # v3.6.0: 显式关闭时，只要 bui-tun 还活着/还 enable/unit 还在，就走完整收尾
-            # （停 TUN + 恢复客户端与巡检 timer），让上次启动失败的机器能回到 SOCKS
+            # v3.6.0: 活着或还 enable（上次启动失败的半途状态）都走完整收尾
+            # （停 TUN + 恢复客户端与巡检 timer），让机器能回到 SOCKS。
+            # 只判这两项：unit 文件在正常 SOCKS 模式下也一直存在，若把它算进来，
+            # 一次多余的 bui-c tun off 会去重启本来在跑的客户端并重写 proxy.sh
             if ! systemctl is-active --quiet bui-tun 2>/dev/null \
-               && ! systemctl is-enabled --quiet bui-tun 2>/dev/null \
-               && [[ ! -f /etc/systemd/system/bui-tun.service ]]; then
+               && ! systemctl is-enabled --quiet bui-tun 2>/dev/null; then
                 tui_info "TUN 未在运行"
                 exit 0
             fi
