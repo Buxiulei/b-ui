@@ -12,7 +12,8 @@
 
 ## Global Constraints
 
-- 目标 sing-box 版本区间：1.12.0 到 1.14.0（`packages/versions.json` 分发 1.13.11；v2rayN 7.25 锁 ≤1.14）。生成的每份 sing-box 配置都必须在 **1.13.19 与 1.14.0** 两个二进制上 `sing-box check` 退出 0 且 stderr 无 `deprecated`。
+- 目标 sing-box 版本区间：1.12.0 到 1.14.0（`packages/versions.json` 分发 1.13.11；v2rayN 7.25 锁 ≤1.14）。生成的每份 sing-box 配置都必须在 **1.13.19、1.14.0、1.15.0-alpha.2** 三个二进制上 `sing-box check` 退出 0 且无 `deprecated` 输出（1.15 把 1.14 的弃用项变成致命错误，提前挡住）。
+- 不使用 remote rule_set / `download_detour` / `http_client`（1.13 与 1.15 无法同时兼容）；cn 直连用域名后缀列表。
 - TUN 地址固定 `["172.19.0.1/30", "fdfe:dcba:9876::1/126"]`；DNS `strategy` 固定 `ipv4_only`；IPv6 reject 规则固定 `{"ip_version": 6, "action": "reject"}` 且位于 `ip_is_private` 之后、所有域名规则之前。
 - Xray freedom 用 `settings.domainStrategy: "ForceIPv4"`；Hysteria2 用 `direct: {mode: 4}`。
 - 遵守 CLAUDE.md「Surgical Changes」：节点集合/urltest 逻辑不动；不删无关死代码（`singbox-converter` 死 import 留着，提交信息里提一句）。
@@ -35,7 +36,9 @@
 
 ```bash
 S=/tmp/claude-1000/-home-roots-b-ui/71917ef4-b1f0-4466-927f-5df467756568/scratchpad/ipv6-tests; mkdir -p "$S/bin" && cd "$S/bin"
+# 调研代理已在 scratchpad 下载过 1.14.0 与 1.15.0-alpha.2（find $S/.. -name 'sing-box*' -type f -perm -u+x），有则直接复制为 sing-box-1.14.0 / sing-box-1.15.0-alpha.2，否则下载：
 curl -fsSL -o sb.tgz https://github.com/SagerNet/sing-box/releases/download/v1.14.0/sing-box-1.14.0-linux-amd64.tar.gz && tar xzf sb.tgz && mv sing-box-1.14.0-linux-amd64/sing-box ./sing-box-1.14.0 && ./sing-box-1.14.0 version
+curl -fsSL -o sb15.tgz https://github.com/SagerNet/sing-box/releases/download/v1.15.0-alpha.2/sing-box-1.15.0-alpha.2-linux-amd64.tar.gz && tar xzf sb15.tgz && mv sing-box-1.15.0-alpha.2-linux-amd64/sing-box ./sing-box-1.15.0-alpha.2 && ./sing-box-1.15.0-alpha.2 version
 XV=$(curl -fsSL https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
 curl -fsSL -o xray.zip "https://github.com/XTLS/Xray-core/releases/download/${XV}/Xray-linux-64.zip" && unzip -o -q xray.zip xray && ./xray version | head -1
 ```
@@ -51,7 +54,7 @@ cat > "$S/check_singbox.sh" <<'EOF'
 set -u
 S=/tmp/claude-1000/-home-roots-b-ui/71917ef4-b1f0-4466-927f-5df467756568/scratchpad/ipv6-tests
 cfg="$1"; rc=0
-for bin in /usr/bin/sing-box "$S/bin/sing-box-1.14.0"; do
+for bin in /usr/bin/sing-box "$S/bin/sing-box-1.14.0" "$S/bin/sing-box-1.15.0-alpha.2"; do
     [[ -x "$bin" ]] || { echo "SKIP $bin (缺失)"; continue; }
     out=$("$bin" check -c "$cfg" 2>&1); r=$?
     if [[ $r -ne 0 ]] || grep -qi 'deprecated' <<<"$out"; then
@@ -138,7 +141,8 @@ for combo in "hop:on resi:list" "hop:off resi:null" "hop:on resi:global"; do
     jq -e '(.route.rules|map(.ip_is_private==true)|index(true)) < (.route.rules|map(.ip_version==6)|index(true))' "$W/$u.json" >/dev/null || { echo "FAIL $combo $u 规则顺序"; fail=1; }
     jq -e '.route.default_domain_resolver=="local"' "$W/$u.json" >/dev/null || { echo "FAIL $combo $u resolver"; fail=1; }
     jq -e '[.outbounds[]|select(.type=="block" or .type=="dns")]|length==0' "$W/$u.json" >/dev/null || { echo "FAIL $combo $u 特殊出站残留"; fail=1; }
-    jq -e '[.. | objects | select(has("inet4_address") or has("geoip") or has("geosite") or has("hop_ports"))]|length==0' "$W/$u.json" >/dev/null || { echo "FAIL $combo $u 旧字段残留"; fail=1; }
+    jq -e '[.. | objects | select(has("inet4_address") or has("geoip") or has("geosite") or has("hop_ports") or has("rule_set") or has("download_detour") or has("http_client"))]|length==0' "$W/$u.json" >/dev/null || { echo "FAIL $combo $u 旧字段/规则集残留"; fail=1; }
+    jq -e '[.route.rules[]|select(.domain_suffix and .outbound=="direct")]|length==1' "$W/$u.json" >/dev/null || { echo "FAIL $combo $u cn 直连后缀规则"; fail=1; }
   done
   # alice fusion: 4 节点 + 两个 urltest 池；hop:on 时 hy2-direct 有 server_ports
   jq -e '[.outbounds[]|select(.type=="hysteria2" or .type=="vless")]|length==4' "$W/alice.json" >/dev/null || { echo "FAIL $combo alice 节点数"; fail=1; }
@@ -173,11 +177,10 @@ Expected: `check_singbox.sh` 对现有输出 FAIL（legacy 字段），结构断
         { ip_version: 6, action: "reject" }
     ];
     // …hasSplit 分支里原来的 routeRules.push({ domain_keyword: resi.domains, outbound: "residential-pool" }) 位置不变…
-    routeRules.push({ rule_set: ["geosite-cn", "geoip-cn"], outbound: "direct" });
+    routeRules.push({ domain_suffix: CN_DIRECT_SUFFIXES, outbound: "direct" });
 
     outbounds.push({ type: "direct", tag: "direct" });
 
-    const ruleSet = (tag, url) => ({ tag, type: "remote", format: "binary", url, download_detour: primaryTag });
     return {
         log: { level: "info", timestamp: true },
         experimental: {
@@ -191,8 +194,7 @@ Expected: `check_singbox.sh` 对现有输出 FAIL（legacy 字段），结构断
             ],
             rules: [
                 ...predefined,
-                { rule_set: ["geosite-cn"], server: "local" },
-                { domain_suffix: [".cn"], server: "local" }
+                { domain_suffix: CN_DIRECT_SUFFIXES, server: "local" }
             ],
             final: "remote",
             strategy: "ipv4_only"
@@ -204,10 +206,6 @@ Expected: `check_singbox.sh` 对现有输出 FAIL（legacy 字段），结构断
         ],
         outbounds,
         route: {
-            rule_set: [
-                ruleSet("geosite-cn", "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs"),
-                ruleSet("geoip-cn", "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs")
-            ],
             rules: routeRules,
             final: routeFinal,
             auto_detect_interface: true,
@@ -216,7 +214,9 @@ Expected: `check_singbox.sh` 对现有输出 FAIL（legacy 字段），结构断
     };
 ```
 
-注意 `routeRules.push(domain_keyword…)` 必须在 `rule_set cn 直连` 之前（住宅关键字优先级高于 cn 直连，与旧版 geoip 在前的顺序不同——旧版 cn 规则在住宅规则前，但 cn 域名不会命中 AI 关键字，两种顺序等价；新顺序让关键字命中更早短路）。把函数顶部注释更新为 `v3.6.0: sing-box 1.12-1.14 语法 + IPv6 接管(ipv4_only + v6 reject)`。删除 `outbounds.push({ type: "block"…})`、`{ type: "dns"…}` 两行。
+在 `web/server.js` 顶部（`CONFIG` 之后）加常量 `CN_DIRECT_SUFFIXES`，内容逐字复制 `b-ui-client.sh` 约 1508 行 route 规则里的 `domain_suffix` 数组（`.qq.com` … `.cn`，约 40 项），注释 `// v3.6.0: 国内域名直连后缀，与 b-ui-client.sh TUN 模板同源；不用 remote rule_set（1.13/1.15 字段不兼容）`。
+
+注意 `routeRules.push(domain_keyword…)` 必须在 `domain_suffix cn 直连` 之前（住宅关键字优先级高于 cn 直连，与旧版 geoip 在前的顺序不同——旧版 cn 规则在住宅规则前，但 cn 域名不会命中 AI 关键字，两种顺序等价；新顺序让关键字命中更早短路）。把函数顶部注释更新为 `v3.6.0: sing-box 1.12-1.14 语法 + IPv6 接管(ipv4_only + v6 reject)`。删除 `outbounds.push({ type: "block"…})`、`{ type: "dns"…}` 两行。
 
 - [ ] **Step 4: 运行测试，确认通过**
 
@@ -313,14 +313,21 @@ Expected: `host_ipv6_enabled` 不存在 → gen 失败；或生成但 v6 地址/
 # 且 disable_ipv6=1 的主机给 TUN 配 v6 地址会失败）。BUI_FORCE_IPV6=0|1 可强制（排障/测试）。
 host_ipv6_enabled() {
     case "${BUI_FORCE_IPV6:-}" in 1) return 0 ;; 0) return 1 ;; esac
+    # 1. 内核 IPv6 栈存在（ipv6.disable=1 启动参数会让它消失）
     [[ -f /proc/net/if_inet6 ]] || return 1
-    [[ "$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)" == "0" ]] || return 1
-    [[ "$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null)" == "0" ]] || return 1
-    return 0
+    # 2. sysctl 未禁用：all 管现有接口，default 决定新建的 TUN 接口能否配 v6 地址
+    [[ "$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)" == "1" ]] && return 1
+    [[ "$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null)" == "1" ]] && return 1
+    # 3. 有 v6 默认路由
+    local dev
+    dev=$(ip -6 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="dev"){print $(i+1); exit}}')
+    [[ -n "$dev" ]] || return 1
+    # 4. 该接口有 2000::/3 全球单播地址（排除只有 ULA 的 Docker 网桥等）
+    ip -6 addr show dev "$dev" scope global 2>/dev/null | grep -qE 'inet6 [23]'
 }
 ```
 
-（若 `singtun-v6-disabled` 调研给出更稳的判定，以 spec §3.2 更新为准。）
+依据 spec §3.2：sing-tun 加 v6 地址失败即整个 TUN 起不来，所以四条全满足才加。
 
 函数内、`cat > "$tmp_config" <<EOF` 之前加：
 

@@ -45,10 +45,10 @@
 | 裸 IPv6 目标处理 | 路由规则 `{"ip_version": 6, "action": "reject"}` | sing-box 1.13 起嗅探域名不再替换连接目标（`sniff` action 无 `override_destination`，源码 `route/route.go` 的 `OverrideDestination` 无任何配置路径可置位），服务器收到的必然是 IPv6 字面量而无法处理；reject 默认方法对 TCP 回 RST、UDP 回 ICMP 端口不可达，应用能立刻回退 IPv4。 |
 | 客户端 DNS 策略 | 保持/设为 `ipv4_only` | sing-box 对 AAAA 返回 NOERROR 空答案（`dns/client.go` 本地短路），应用拿不到 v6 地址。`prefer_ipv4` 在只有 AAAA 时仍会返回 v6。 |
 | TUN 地址 | `["172.19.0.1/30", "fdfe:dcba:9876::1/126"]` | sing-box 官方手册示例；有 v6 地址后 `auto_route` 才会把 `::/0` 装进 TUN 路由表。 |
-| 客户端主机 IPv6 被禁用时 | 仅 IPv4 地址（保持现状） | 无 IPv6 则无泄漏；避免给 TUN 加 v6 地址在 `disable_ipv6=1` 主机上失败。检测规则见 §3.2。 |
+| 客户端主机无真实 IPv6 时 | 仅 IPv4 地址（保持现状） | 无 IPv6 则无泄漏。sing-tun 对 TUN 加 v6 地址失败是致命的（`tun_linux.go` `configure()` 任何非 EEXIST 错误直接放弃整个 TUN；sing-box#1966 Docker 实例 `permission denied`），所以只有确认主机有 v6 默认路由和 2000::/3 全球地址才加。检测规则见 §3.2。 |
 | Xray freedom | `settings.domainStrategy: "ForceIPv4"` | `UseIPv4` 在解析不到 A 时静默回退 AsIs；`ForceIPv4` 直接失败。Xray 26.9.9 起该字段自动迁移到 `sockopt.domainStrategy` 并记警告，新旧版本都能用。 |
 | Hysteria2 | 显式 `outbounds: - name: direct, type: direct, direct: {mode: 4}` | 官方文档：`mode: 4` = 只拨 IPv4，无 IPv4 地址则失败。用户自定义 `direct` 出站会覆盖内置 direct。 |
-| `geoip/geosite` 替代 | `route.rule_set` remote（SagerNet 官方 `.srs`），`download_detour` 指向主代理池 | 旧字段 1.12 已移除；rule_set 是官方替代且保持"cn 直连"语义不变。 |
+| `geoip/geosite` 替代 | 与客户端模板同款的国内域名 `domain_suffix` 直连列表（`b-ui-client.sh:1508`），不用 remote rule_set | 旧字段 1.12 已移除；remote rule_set 的 `download_detour` 在 1.14 弃用、1.15 起致命，而 1.13 不认新的 `http_client` 字段，无法同时兼容 1.13 到 1.15；域名列表零网络依赖，客户端模板已长期如此。代价：失去 geoip-cn 的按 IP 直连。 |
 | `stack` | 不指定 | sing-box 默认（有 gVisor 时 `mixed`，否则 `system`）跨平台最稳；v2rayN wiki 推荐 mixed。 |
 | 版本号 | 3.6.0 | 行为变更（IPv6 接管 + 服务端出站策略），非 patch。 |
 
@@ -73,8 +73,7 @@
     "rules": [
       // 仅当 host 是域名且 getServerIP() 返回公网 IPv4（非 127.0.0.1 兜底）时输出，防 GFW 投毒服务器域名
       { "domain": ["<host>"], "action": "predefined", "answer": ["<host>. IN A <serverIp>"] },
-      { "rule_set": ["geosite-cn"], "server": "local" },
-      { "domain_suffix": [".cn"], "server": "local" }
+      { "domain_suffix": [/* CN_DIRECT_SUFFIXES，同 b-ui-client.sh:1508，含 ".cn" */], "server": "local" }
     ],
     "final": "remote",
     "strategy": "ipv4_only"
@@ -87,14 +86,6 @@
   ],
   "outbounds": [ /* 节点 + urltest 池 + */ { "type": "direct", "tag": "direct" } ],
   "route": {
-    "rule_set": [
-      { "tag": "geosite-cn", "type": "remote", "format": "binary",
-        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs",
-        "download_detour": "<primaryTag>" },
-      { "tag": "geoip-cn", "type": "remote", "format": "binary",
-        "url": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs",
-        "download_detour": "<primaryTag>" }
-    ],
     "rules": [
       { "action": "sniff" },
       { "protocol": "dns", "action": "hijack-dns" },
@@ -102,7 +93,7 @@
       { "ip_version": 6, "action": "reject" },
       // hasSplit && !global && resi.domains.length>0 时：
       { "domain_keyword": [/* resi.domains */], "outbound": "residential-pool" },
-      { "rule_set": ["geosite-cn", "geoip-cn"], "outbound": "direct" }
+      { "domain_suffix": [/* CN_DIRECT_SUFFIXES */], "outbound": "direct" }
     ],
     "final": "<routeFinal>",
     "auto_detect_interface": true,
@@ -111,7 +102,7 @@
 }
 ```
 
-删除：`block`、`dns` 特殊出站；`{protocol:"dns", outbound:"dns-out"}`、`geoip`、`geosite` 规则；`inet4_address`、`sniff`、`stack`；`{query_type:["A","AAAA"]}` DNS 规则；`{tag:"local", detour:"direct"}` 的 `detour`（direct 是默认）。
+删除：`block`、`dns` 特殊出站；`{protocol:"dns", outbound:"dns-out"}`、`geoip`、`geosite` 规则；`inet4_address`、`sniff`、`stack`；`{query_type:["A","AAAA"]}` DNS 规则；`{tag:"local", detour:"direct"}` 的 `detour`（direct 是默认）；`mkHy2` 的 `hop_ports` 改为 `server_ports: ["start:end"]`（sing-box 字段名）。`CN_DIRECT_SUFFIXES` 定义为 `web/server.js` 顶部常量，内容复制 `b-ui-client.sh:1508` 的 `domain_suffix` 数组。不引入 remote rule_set（见 §2）。
 
 规则顺序说明：`ip_is_private` 在 `ip_version: 6` 之前，保证 `::1`、ULA、link-local 仍直连；`ip_version: 6` 在所有域名规则之前，保证任何 IPv6 字面量（含嗅探到域名的）都被 reject 而不是送到服务器。
 
@@ -123,7 +114,12 @@
 2. TUN inbound `address`：
    - 主机 IPv6 可用 → `["172.19.0.1/30", "fdfe:dcba:9876::1/126"]`
    - 否则 → `["172.19.0.1/30"]`（现状）
-   - "IPv6 可用"判定（新增函数 `host_ipv6_enabled()`，返回 0 表示可用）：`/proc/net/if_inet6` 存在，且 `sysctl -n net.ipv6.conf.all.disable_ipv6` 与 `net.ipv6.conf.default.disable_ipv6` 都为 `0`。判定细节以 §7 调研结论为准，实施时若调研给出更稳的规则以调研为准。
+   - "IPv6 可用"判定（新增函数 `host_ipv6_enabled()`，返回 0 表示可用；`BUI_FORCE_IPV6=0|1` 强制覆盖）四条全满足才算可用：
+     1. `/proc/net/if_inet6` 存在（内核 IPv6 栈未被 `ipv6.disable=1` 关掉）；
+     2. `sysctl -n net.ipv6.conf.all.disable_ipv6` 与 `net.ipv6.conf.default.disable_ipv6` 都不是 `1`（`default` 决定新建的 TUN 接口是否允许配 v6 地址）；
+     3. `ip -6 route show default` 有默认路由（取其 `dev`）；
+     4. 该设备上有 `scope global` 且属于 2000::/3 的地址（`inet6 [23]` 开头），排除只有 ULA（如 Docker 网桥）的情况。
+     依据：sing-tun v0.8.9 `tun_linux.go:138-146` 加地址失败即整个 TUN 创建失败（非 EEXIST 错误直接返回），无任何 disable_ipv6 容错；无真实 v6 出口的主机加 v6 地址还会造成 AAAA 黑洞（sing-box#1616）。
 3. `route.rules`：在 `{ "ip_is_private": true, "outbound": "direct-out" }` 之后、国内域名直连规则之前，插入 `{ "ip_version": 6, "action": "reject" }`。无论是否加了 v6 地址都插入（IPv4-only 时该规则永不命中，无副作用）。
 4. `dns.strategy` 保持 `ipv4_only`。其余规则、DNS、出站、校验与原子写逻辑不动。
 5. `import_from_subscription()`：sing-box 分支在 `cp "$sub_file" singbox-tun.json` 之前，若 `host_ipv6_enabled` 为假且 `jq` 可用，用 `jq` 从 `.inbounds[] | select(.type=="tun") | .address` 中剔除含 `:` 的条目后再落盘；`jq` 不可用则原样落盘并 `print_warning` 提示。
@@ -201,9 +197,9 @@
 
 | 场景 | 处理 |
 |---|---|
-| 客户端主机 IPv6 禁用 | 不加 v6 地址，行为与 v3.5 相同 |
+| 客户端主机无真实 IPv6（四条判定任一不满足） | 不加 v6 地址，行为与 v3.5 相同；`BUI_FORCE_IPV6=0` 可强制关闭作为排障逃生口 |
+| rule_set 网络依赖 | 无（改用域名后缀列表） |
 | 服务端订阅 JSON 被旧版 sing-box（<1.12）加载 | 不支持；`packages/versions.json` 分发的是 1.13.11，客户端安装流程优先服务端缓存 |
-| rule_set 首次下载失败 | sing-box 照常启动并重试，cn 直连规则暂不生效，其余规则正常 |
 | `update.sh` D9 任一步失败 | 保留备份，跳过该步，打印 warning，不阻塞其余升级 |
 | Xray 26.9.9+ 对 `settings.domainStrategy` 打弃用警告 | 接受，自动迁移不影响行为；后续版本再切 `targetStrategy` |
 | 回滚 | `git revert` 对应提交；已升级的服务器：删 `config.yaml` 的 `outbounds` 块、去掉 `mode: 4`、jq 删 `domainStrategy`，重启三服务；客户端：`TUN_SCHEMA_VERSION` 回退即重生成 |
@@ -232,6 +228,29 @@
 - v2rayN：7.24.9 稳定版（2026-08-29）；7.25.x 预发布锁 sing-box ≤1.14；默认模板 `strategy: prefer_ipv4`、`strict_route: false`、带 v6 地址；wiki 明示 UseIPv4 在 sing-box 内核映射 `prefer_ipv4`。
 - sing-box 1.14/1.15 弃用清单与本项目三处生成器的对照：见 §8（调研回填）。
 
-## 8. sing-box 1.14 / 1.15 弃用对照
+## 8. sing-box 1.14 / 1.15 弃用对照（2026-09-10 实测）
 
-（待 `singbox-deprecation` 调研回填。）
+来源：sing-box v1.14.0 `experimental/deprecated/constants.go`（与 v1.15.0-alpha.2 逐字节相同，1.15 alpha 没有新增弃用）；用真实 1.14.0 与 1.15.0-alpha.2 二进制对三处生成器输出跑 `sing-box check`。
+
+机制：每条弃用有 `Impending()` 判断（计划移除版本减当前小版本 ≤ 1 即"临近"）。临近时不是 WARN 而是 ERROR + `log.Fatal` 退出，除非设 `ENABLE_DEPRECATED_<NAME>=true`。因此 1.14.0 新弃用的 8 项在 1.14.x 只是 WARN，**到 1.15.x 全部变致命**。
+
+| 1.14.0 新弃用（1.16.0 移除） | 我们是否使用 | 处理 |
+|---|---|---|
+| remote rule_set 的 `download_detour` | 原方案曾计划使用 | 已改为域名后缀列表，不用 remote rule_set |
+| remote rule_set 隐式默认 HTTP client | 同上 | 同上 |
+| TLS 内联 ACME | 否 | 无 |
+| DNS rule action 的 `strategy` | 否 | 无 |
+| DNS rule 的 `rule_set_ip_cidr_accept_empty` | 否 | 无 |
+| DNS rule 地址过滤字段（`ip_cidr`/`ip_is_private` 未配 `match_response`） | 否（我们的 `ip_is_private`/`ip_cidr` 都在 route 规则里，不受影响） | 无 |
+| `dns.independent_cache` | 否 | 无 |
+| `cache_file.store_rdrc` | 否 | 无 |
+
+1.12 弃用、1.14 已致命：缺 `route.default_domain_resolver`/`domain_resolver`（有 ≥2 个 DNS server 时）；DNS rule 的 `outbound` 项；旧 `domain_strategy` 拨号字段。新生成器必须设 `route.default_domain_resolver`（§3.1 已含）。
+
+实测结论：`b-ui-client.sh` 与 `residential-helper.sh` 的输出在 1.14.0、1.15.0-alpha.2 上 `sing-box check` 均退出 0 无输出；`web/server.js` 现有输出在两者上都 FATAL（逐步修复路径：DNS 格式 → `dns` 出站 → inbound `sniff` → 缺 domain_resolver，每一步都独立致命）。
+
+注意：`download_detour`、DNS rule 内 `ip_cidr`、DNS rule action `strategy` 三项在 `sing-box check` 阶段不报警（在 DNS 路由 Start 时才评估），所以"check 通过"对这三项不是充分证据；本设计不使用它们。
+
+中继 `"log": {"level": "error"}` 会吞掉 WARN 级弃用提示；`ensure_singbox()` 永远拉 GitHub latest，一旦 1.15 发布，任何弃用项会直接让中继起不来。这两点记入待办（本次不改）。
+
+用户报告"1.14 有功能要下线"的提示，最可能来自：(1) 某台机器磁盘上未按新生成器重生成的旧配置（中继无 schema 版本门控）；(2) 手工对 `/api/subscription` 输出跑过 sing-box。排查：在服务器上 `sing-box check -c /opt/b-ui/singbox-relay.json`，客户端 `sing-box check -c /opt/hysteria-client/singbox-tun.json`，看输出原文。
