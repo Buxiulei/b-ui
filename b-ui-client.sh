@@ -1310,6 +1310,8 @@ generate_xray_config() {
 [Unit]
 Description=Xray Client
 After=network.target
+# v3.6.0: 与 TUN 模式互斥（两者抢同一组 SOCKS/HTTP 端口）
+Conflicts=bui-tun.service
 
 [Service]
 Type=simple
@@ -1613,6 +1615,8 @@ EOF
     mv -f "$tmp_config" "$singbox_config"
     chmod 644 "$singbox_config"
     echo "$TUN_SCHEMA_VERSION" > "${singbox_config}.schema"
+    # v3.6.0: 侧车记录本次生成用的 active 节点名，供 ensure_tun_config_ready 判定是否过期
+    get_active_config > "${singbox_config}.node" 2>/dev/null || true
 
     # 创建 sing-box TUN 服务
     cat > /etc/systemd/system/bui-tun.service <<EOF
@@ -1620,12 +1624,16 @@ EOF
 Description=B-UI TUN Mode (sing-box)
 After=network.target
 Wants=network.target
+# v3.6.0: 与 SOCKS 模式的两个客户端互斥（抢同一组 SOCKS/HTTP 端口）
+Conflicts=hysteria-client.service xray-client.service
 
 [Service]
 Type=simple
 ExecStart=/usr/bin/sing-box run -c ${singbox_config}
 Restart=always
 RestartSec=3
+# v3.6.0: sing-box 关停慢时别让 systemctl stop 一直阻塞切换流程
+TimeoutStopSec=10
 
 [Install]
 WantedBy=multi-user.target
@@ -1777,10 +1785,6 @@ ensure_tun_config_ready() {
         return 1
     }
 
-    # 当前 active 节点的 server host
-    local active_server
-    active_server=$(grep '"server"' "$meta_file" | cut -d'"' -f4 | cut -d':' -f1)
-
     local needs_regen=false
     if [[ ! -f "$tun_cfg" ]]; then
         needs_regen=true
@@ -1791,9 +1795,17 @@ ensure_tun_config_ready() {
         cfg_port=$(grep -m1 -oE '"server_port"[[:space:]]*:[[:space:]]*[0-9]*' "$tun_cfg" | head -1 | grep -oE '[0-9]+$')
         if [[ -z "$cfg_server" || -z "$cfg_port" ]]; then
             needs_regen=true
-        elif [[ -n "$active_server" && "$cfg_server" != "$active_server" ]]; then
-            # 切换过节点但 TUN 配置还指向旧节点
-            needs_regen=true
+        else
+            # v3.6.0: 用 .node 侧车判断"配置是否还指向当前节点"。
+            # 原先拿 $tun_cfg 里第一个 "server" 跟节点 host 比，命中的是 dns.servers[0]
+            # (1.1.1.1)，永远不相等 → 每次 start_tun_mode 都白重生成一遍（含一次同步 dig）；
+            # v3.6.0 引导按 IP 拨号后出站 server 也可能是 IP，按 host 比更加不成立
+            local cfg_node=""
+            [[ -f "${tun_cfg}.node" ]] && cfg_node=$(tr -d '[:space:]' < "${tun_cfg}.node" 2>/dev/null)
+            if [[ "$cfg_node" != "$active" ]]; then
+                # 切换过节点，或配置是没写侧车的老版本生成的
+                needs_regen=true
+            fi
         fi
     fi
 
@@ -1901,21 +1913,42 @@ start_tun_mode() {
     systemctl enable bui-tun 2>/dev/null || true
     systemctl start bui-tun
     
-    sleep 2
-    if systemctl is-active --quiet bui-tun; then
-        print_success "TUN 模式已启动"
-        echo -e "  接口: ${GREEN}bui-tun${NC}"
-        echo -e "  SOCKS5: ${GREEN}127.0.0.1:${socks_port}${NC}"
-        echo -e "  HTTP:   ${GREEN}127.0.0.1:${http_port}${NC}"
-        # 自动检测公网 IP 和连通性
-        check_public_ip "TUN"
-    else
-        print_error "TUN 模式启动失败"
-        journalctl -u bui-tun --no-pager -n 10
+    # v3.6.0: 轮询就绪（最多 5s）。固定 sleep 2 在慢机器/大路由表上会误判启动失败，
+    # 切换节点时表现为"时灵时不灵"。Type=simple 的 is-active 在 exec 后立刻为真，
+    # 所以必须连 bui-tun 接口一起等——只等 is-active 会在接口还没建出来时误判成功
+    local i tun_ok=false
+    for i in $(seq 1 10); do
+        sleep 0.5
+        if systemctl is-active --quiet bui-tun && ip link show bui-tun &>/dev/null; then
+            tun_ok=true; break
+        fi
+    done
+    if ! $tun_ok; then
+        if systemctl is-active --quiet bui-tun; then
+            print_error "bui-tun 已启动但 TUN 接口 bui-tun 未就绪"
+        else
+            print_error "TUN 模式启动失败"
+        fi
+        journalctl -u bui-tun -n 20 --no-pager 2>/dev/null | tail -20
+        print_warning "若日志显示 IPv6 地址配置失败，可 BUI_FORCE_IPV6=0 后重试"
+        return 1
     fi
+
+    print_success "TUN 模式已启动"
+    echo -e "  接口: ${GREEN}bui-tun${NC}"
+    echo -e "  SOCKS5: ${GREEN}127.0.0.1:${socks_port}${NC}"
+    echo -e "  HTTP:   ${GREEN}127.0.0.1:${http_port}${NC}"
+    # 自动检测公网 IP 和连通性
+    check_public_ip "TUN"
 }
 
 stop_tun_mode() {
+    # v3.6.0: --no-restore 跳过收尾的"恢复 hysteria-client + 写系统代理"。
+    # 切换节点时 _switch_to_profile 紧接着又会把它停掉，那次启停纯属浪费，
+    # 且写进 /etc/profile.d/proxy.sh 的还是旧节点的端口
+    local restore=true
+    [[ "${1:-}" == "--no-restore" ]] && restore=false
+
     print_info "停止 TUN 模式..."
     
     # 1. 先禁用服务 (防止自动重启)
@@ -1958,22 +1991,24 @@ stop_tun_mode() {
     fi
     
     # 8. 恢复 Hysteria2/Xray 客户端服务（TUN 停止后用户仍需代理）
-    if [[ -f "/etc/systemd/system/$CLIENT_SERVICE" ]]; then
-        print_info "恢复 Hysteria2 客户端..."
-        systemctl start "$CLIENT_SERVICE" 2>/dev/null || true
-        sleep 1
-        if systemctl is-active --quiet "$CLIENT_SERVICE"; then
-            print_success "Hysteria2 客户端已恢复"
-            local p_socks=$(grep -A1 '^socks5:' "$CONFIG_FILE" 2>/dev/null | grep 'listen:' | sed 's/.*://')
-            local p_http=$(grep -A1 '^http:' "$CONFIG_FILE" 2>/dev/null | grep 'listen:' | sed 's/.*://')
-            setup_system_proxy "${p_socks:-1080}" "${p_http:-8080}"
-        fi
-    elif [[ -f /etc/systemd/system/xray-client.service ]]; then
-        print_info "恢复 Xray 客户端..."
-        systemctl start xray-client 2>/dev/null || true
-        sleep 1
-        if systemctl is-active --quiet xray-client; then
-            print_success "Xray 客户端已恢复"
+    if $restore; then
+        if [[ -f "/etc/systemd/system/$CLIENT_SERVICE" ]]; then
+            print_info "恢复 Hysteria2 客户端..."
+            systemctl start "$CLIENT_SERVICE" 2>/dev/null || true
+            sleep 1
+            if systemctl is-active --quiet "$CLIENT_SERVICE"; then
+                print_success "Hysteria2 客户端已恢复"
+                local p_socks=$(grep -A1 '^socks5:' "$CONFIG_FILE" 2>/dev/null | grep 'listen:' | sed 's/.*://')
+                local p_http=$(grep -A1 '^http:' "$CONFIG_FILE" 2>/dev/null | grep 'listen:' | sed 's/.*://')
+                setup_system_proxy "${p_socks:-1080}" "${p_http:-8080}"
+            fi
+        elif [[ -f /etc/systemd/system/xray-client.service ]]; then
+            print_info "恢复 Xray 客户端..."
+            systemctl start xray-client 2>/dev/null || true
+            sleep 1
+            if systemctl is-active --quiet xray-client; then
+                print_success "Xray 客户端已恢复"
+            fi
         fi
     fi
     
@@ -2339,7 +2374,7 @@ _switch_to_profile() {
 
     # 停止 TUN
     if [[ "$tun_was_active" == "true" ]]; then
-        tui_info "停止 TUN 模式..."; stop_tun_mode
+        tui_info "停止 TUN 模式..."; stop_tun_mode --no-restore
     fi
 
     # 停止客户端服务（同步等到端口释放，避免 systemctl stop 异步导致后续 start 端口冲突）
@@ -2393,6 +2428,8 @@ _switch_to_profile() {
                 '[Unit]' \
                 'Description=Xray Client' \
                 'After=network.target' \
+                '# v3.6.0: 与 TUN 模式互斥（两者抢同一组 SOCKS/HTTP 端口）' \
+                'Conflicts=bui-tun.service' \
                 '' \
                 '[Service]' \
                 'Type=simple' \
@@ -3648,61 +3685,19 @@ toggle_tun() {
         fi
     else
         echo -e "TUN 模式: ${RED}✗ 未启用${NC}"
-        
-        # 始终从当前激活配置重新生成 TUN 配置 (防止切换配置后使用旧的 singbox-tun.json)
-        local protocol=""
-        
-        if [[ -f "$CONFIG_FILE" ]]; then
-            # 从 Hysteria2 配置生成 sing-box TUN
-            echo -e "  从 Hysteria2 配置生成 TUN..."
-            protocol="hysteria2"
-            
-            # 读取现有配置
-            SERVER_ADDR=$(grep "^server:" "$CONFIG_FILE" | awk '{print $2}')
-            AUTH_PASSWORD=$(grep "^auth:" "$CONFIG_FILE" | awk '{print $2}')
-            local sni=$(grep -A2 "^tls:" "$CONFIG_FILE" | grep "sni:" | awk '{print $2}')
-            SNI="${sni:-$(echo $SERVER_ADDR | cut -d':' -f1)}"
-            INSECURE=$(grep -A2 "^tls:" "$CONFIG_FILE" | grep "insecure:" | awk '{print $2}')
-            INSECURE=${INSECURE:-false}
-            SOCKS_PORT=$(grep -A1 "^socks5:" "$CONFIG_FILE" | grep "listen:" | sed 's/.*://')
-            HTTP_PORT=$(grep -A1 "^http:" "$CONFIG_FILE" | grep "listen:" | sed 's/.*://')
-            SOCKS_PORT=${SOCKS_PORT:-1080}
-            HTTP_PORT=${HTTP_PORT:-8080}
-            
-            read -p "启用 TUN 模式? (y/n): " enable
-            if [[ "$enable" =~ ^[yY]$ ]]; then
-                generate_singbox_tun_config "hysteria2"
-                start_tun_mode
-            fi
-        elif [[ -f "${BASE_DIR}/xray-config.json" ]]; then
-            # 从 Xray 配置生成 sing-box TUN
-            echo -e "  从 Xray (VLESS-Reality) 配置生成 TUN..."
-            protocol="vless-reality"
-            
-            # 读取 Xray 配置
-            local xray_config="${BASE_DIR}/xray-config.json"
-            SERVER_ADDR=$(grep -o '"address": "[^"]*"' "$xray_config" | head -1 | cut -d'"' -f4)
-            local port=$(grep -o '"port": [0-9]*' "$xray_config" | grep -v 'listen' | head -1 | grep -o '[0-9]*')
-            SERVER_ADDR="${SERVER_ADDR}:${port}"
-            UUID=$(grep -o '"id": "[^"]*"' "$xray_config" | head -1 | cut -d'"' -f4)
-            FLOW=$(grep -o '"flow": "[^"]*"' "$xray_config" | head -1 | cut -d'"' -f4)
-            SNI=$(grep -o '"serverName": "[^"]*"' "$xray_config" | head -1 | cut -d'"' -f4)
-            FINGERPRINT=$(grep -o '"fingerprint": "[^"]*"' "$xray_config" | head -1 | cut -d'"' -f4)
-            PUBLIC_KEY=$(grep -o '"publicKey": "[^"]*"' "$xray_config" | head -1 | cut -d'"' -f4)
-            SHORT_ID=$(grep -o '"shortId": "[^"]*"' "$xray_config" | head -1 | cut -d'"' -f4)
-            SOCKS_PORT=$(grep -o '"port": [0-9]*' "$xray_config" | head -1 | grep -o '[0-9]*')
-            HTTP_PORT=$(grep -o '"port": [0-9]*' "$xray_config" | tail -1 | grep -o '[0-9]*')
-            SOCKS_PORT=${SOCKS_PORT:-1080}
-            HTTP_PORT=${HTTP_PORT:-8080}
-            
-            read -p "启用 TUN 模式? (y/n): " enable
-            if [[ "$enable" =~ ^[yY]$ ]]; then
-                generate_singbox_tun_config "vless-reality"
-                start_tun_mode
-            fi
-        else
+
+        if [[ ! -f "$CONFIG_FILE" ]] && [[ ! -f "${BASE_DIR}/xray-config.json" ]]; then
             print_error "请先导入配置 (菜单选项 1)"
             return
+        fi
+
+        read -p "启用 TUN 模式? (y/n): " enable
+        if [[ "$enable" =~ ^[yY]$ ]]; then
+            # v3.6.0: 原先从 config.yaml / xray-config.json grep 参数自行拼 TUN 配置，
+            # 会丢掉 obfs、端口跳跃等只存在于节点 URI 里的参数。改为删掉 .node 侧车，
+            # 让 start_tun_mode → ensure_tun_config_ready 从 active 节点的 uri.txt 重解析
+            rm -f "${BASE_DIR}/singbox-tun.json.node"
+            start_tun_mode
         fi
     fi
 }
@@ -3729,6 +3724,8 @@ create_service() {
 Description=Hysteria2 Client
 After=network-online.target
 Wants=network-online.target
+# v3.6.0: 与 TUN 模式互斥（两者抢同一组 SOCKS/HTTP 端口）
+Conflicts=bui-tun.service
 StartLimitIntervalSec=300
 StartLimitBurst=10
 
@@ -3772,6 +3769,13 @@ LOG_FILE="/var/log/hysteria-health.log"
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
 }
+
+# v3.6.0: TUN 模式由 bui-tun 接管 SOCKS/HTTP 端口，hysteria-client 本该停着。
+# 巡检把它拉起来会和 sing-box 抢 1080/8080（切换节点后"时灵时不灵"的首因）
+if systemctl is-active --quiet bui-tun 2>/dev/null; then
+    log "TUN 模式，跳过 hysteria-client 巡检"
+    exit 0
+fi
 
 # 检查服务是否运行
 if ! systemctl is-active --quiet "$SERVICE"; then
