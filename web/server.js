@@ -619,15 +619,16 @@ function generateSingboxConfig(user, cfg, host) {
         }
     }
 
+    // v3.6.0 R5: sing-box 默认 3m；10s 会让每个住宅 IP 每分钟被打 6 次，且 50ms 容忍导致会话内换 IP
     const urltest = (tag, tags) => ({
         type: "urltest",
         tag,
         outbounds: tags,
         url: "https://www.gstatic.com/generate_204",
-        interval: "10s",
-        tolerance: 50,
+        interval: "60s",
+        tolerance: 100,
         idle_timeout: "30s",
-        interrupt_exist_connections: true
+        interrupt_exist_connections: false
     });
 
     // 路由分流：仅当同时有直连池和住宅池（fusion+住宅）才做 global/域名分流；

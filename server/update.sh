@@ -727,6 +727,15 @@ migrate_ipv4_only_egress() {
     fi
 }
 
+# v3.6.0 R5: 既有 timer 补随机抖动（幂等）
+patch_resi_health_timer() {
+    local f="${RESI_HEALTH_TIMER_FILE:-/etc/systemd/system/b-ui-resi-health.timer}"
+    [[ -f "$f" ]] || return 0
+    grep -q '^RandomizedDelaySec=' "$f" && return 0
+    sed -i '/^AccuracySec=/a RandomizedDelaySec=30s' "$f" && systemctl daemon-reload 2>/dev/null || true
+    print_success "  ✓ b-ui-resi-health.timer 加随机抖动 30s"
+}
+
 apply_systemd_configs() {
     print_info "应用 systemd 资源隔离配置..."
     local updated=0
@@ -1140,6 +1149,7 @@ Description=B-UI Residential Health Timer
 OnBootSec=2min
 OnUnitActiveSec=2min
 AccuracySec=20s
+RandomizedDelaySec=30s
 Persistent=true
 [Install]
 WantedBy=timers.target
@@ -1149,6 +1159,8 @@ EOF
                 print_success "  ✓ 住宅线路可靠性监测已启用（每2min 探测，质量差自动切到好线路）"
                 updated=1
             fi
+            # v3.6.0 R5: 上面 heredoc 只在 timer 缺失时写；已存在的老 timer 在此补随机抖动
+            patch_resi_health_timer
         else
             # 单条/未启用住宅 → 无可切换，清理监测 timer
             if [[ -f /etc/systemd/system/b-ui-resi-health.timer ]]; then

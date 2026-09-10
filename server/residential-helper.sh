@@ -221,6 +221,7 @@ write_singbox_config_residential_multi() {
 
     # global=true:  final → resi-pool（全部走住宅），无域名分流规则
     # global=false: final → direct，domain_keyword 命中时走 resi-pool
+    # v3.6.0 R5: sing-box 默认 3m；10s 会让每个住宅 IP 每分钟被打 6 次，且 50ms 容忍导致会话内换 IP
     # v3.6.0 R4: 住宅 SOCKS5 基本不支持 UDP ASSOCIATE —— DNS 直连、QUIC 拒绝(浏览器回退 TCP 走住宅)、其余 UDP 直连
     jq -n \
         --argjson outbounds_resi "$outbounds_resi" \
@@ -256,8 +257,9 @@ write_singbox_config_residential_multi() {
                 "tag": "resi-pool",
                 "outbounds": $outbound_tags,
                 "url": "https://www.gstatic.com/generate_204",
-                "interval": "10s",
-                "tolerance": 50
+                "interval": "3m",
+                "tolerance": 500,
+                "idle_timeout": "30m"
               },
               {"type": "direct", "tag": "direct"}]
           ),
