@@ -524,6 +524,21 @@ function getResidentialConfig() {
     return { enabled: false, global: false, domains: [] };
 }
 
+// v3.6.0 R10: helper 的 stderr 里混着 info() 的进度行（"获取 VPS 公网 IP..."/"通过 SOCKS5 测试出口..."），
+// 面板错误框只该显示真正的错误：去 ANSI 色码 → 只留 ERROR: 开头的行并剥掉前缀 → 一行都没有时退回完整 stderr。
+function helperErrText(result, fallback) {
+    const clean = String((result && result.stderr) || "").replace(/\x1b\[[0-9;]*m/g, "").trim();
+    const errs = clean.split("\n").map(l => l.trim())
+        .filter(l => l.startsWith("ERROR:"))
+        .map(l => l.replace(/^ERROR:\s*/, ""));
+    return (errs.length ? errs.join("\n") : clean) || fallback;
+}
+
+// 添加住宅上游要真连上游（auto 最坏两轮 10s 探测 + 取 IP/ISP），而 helper 还要先抢 relay 锁
+// （flock -w 30）—— 锁竞争下 45s 不够，给到 60s；超时单独回 RESI_ADD_TIMEOUT_MSG，不把进度行当错误
+const RESI_ADD_TIMEOUT_MS = 60000;
+const RESI_ADD_TIMEOUT_MSG = `校验超时（${Math.round(RESI_ADD_TIMEOUT_MS / 1000)} 秒），上游没有响应`;
+
 // v3.6.0 R6: 中继 Clash API（只监听回环，与 residential-helper.sh 的 SINGBOX_RELAY_API 同值）
 const RELAY_CLASH_API = "127.0.0.1:9091";
 
@@ -2189,8 +2204,7 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                                 timeout: 15000,
                             });
                             if (result.status !== 0) {
-                                const errMsg = (result.stderr || "").replace(/\x1b\[[0-9;]*m/g, "").trim();
-                                return sendJSON(res, { error: errMsg || "分流域名更新失败" }, 400);
+                                return sendJSON(res, { error: helperErrText(result, "分流域名更新失败") }, 400);
                             }
                             return sendJSON(res, { success: true });
                         } catch (e) {
@@ -2211,16 +2225,19 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
 
                     try {
                         // v3.6.0 R10: 与 /urls 一致 —— 原文经 stdin 交 helper（凭据不进 argv），
-                        // 超时给到 45s（auto 最坏两轮探测 ~25s + 取 IP/ISP），stdout 第三行是探测到的类型
+                        // stdout 第三行是探测到的类型
                         const result = spawnSync(helperPath, ["enable", "-"], {
                             env: { ...process.env, BASE_DIR },
                             input: String(b.url).trim() + "\n",
                             encoding: "utf8",
-                            timeout: 45000,
+                            timeout: RESI_ADD_TIMEOUT_MS,
                         });
+                        // 超时时 status 是 null、stderr 里只有进度行 —— 必须在 status 判断之前拦掉
+                        if (result.error && result.error.code === "ETIMEDOUT") {
+                            return sendJSON(res, { error: RESI_ADD_TIMEOUT_MSG }, 400);
+                        }
                         if (result.status !== 0) {
-                            const errMsg = (result.stderr || "").replace(/\x1b\[[0-9;]*m/g, "").trim();
-                            return sendJSON(res, { error: errMsg || "住宅 IP 启用失败" }, 400);
+                            return sendJSON(res, { error: helperErrText(result, "住宅 IP 启用失败") }, 400);
                         }
                         const lines = (result.stdout || "").trim().split("\n");
                         return sendJSON(res, {
@@ -2242,7 +2259,7 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                             timeout: 15000,
                         });
                         if (result.status !== 0) {
-                            return sendJSON(res, { error: (result.stderr || "禁用失败").trim() }, 500);
+                            return sendJSON(res, { error: helperErrText(result, "禁用失败") }, 500);
                         }
                         return sendJSON(res, { success: true });
                     } catch (e) {
@@ -2269,8 +2286,7 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                         timeout: 15000,
                     });
                     if (result.status !== 0) {
-                        const errMsg = (result.stderr || "").replace(/\x1b\[[0-9;]*m/g, "").trim();
-                        return sendJSON(res, { error: errMsg || "reapply 失败" }, 500);
+                        return sendJSON(res, { error: helperErrText(result, "reapply 失败") }, 500);
                     }
                     return sendJSON(res, { success: true });
                 } catch (e) { return sendJSON(res, { error: e.message }, 500); }
@@ -2289,8 +2305,7 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                         timeout: 15000,
                     });
                     if (result.status !== 0) {
-                        const errMsg = (result.stderr || "").replace(/\x1b\[[0-9;]*m/g, "").trim();
-                        return sendJSON(res, { error: errMsg || "global toggle 失败" }, 500);
+                        return sendJSON(res, { error: helperErrText(result, "global toggle 失败") }, 500);
                     }
                     return sendJSON(res, { success: true, global: b.global });
                 } catch (e) {
@@ -2301,7 +2316,7 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
             // v3.5.0: POST /api/residential/urls — 追加一个住宅上游
             // v3.6.0 R10: 接受供应商给的任意一行（socks5:// / http:// / host:port:user:pass / user:pass@host:port），
             //   解析与类型探测都交 helper；凭据经 stdin（--add -）传入，不进 argv（ps 看不到）；
-            //   两轮探测最坏 ~25s 再加取 IP/ISP，超时给到 45s。helper stdout 第三行是探测到的类型。
+            //   helper stdout 第三行是探测到的类型。超时见 RESI_ADD_TIMEOUT_MS。
             if (r === "residential/urls" && req.method === "POST") {
                 const b = await parseBody(req);
                 const rawUrl = (b && typeof b.url === "string") ? b.url.trim() : "";
@@ -2313,11 +2328,14 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                         env: { ...process.env, BASE_DIR },
                         input: rawUrl + "\n",
                         encoding: "utf8",
-                        timeout: 45000,
+                        timeout: RESI_ADD_TIMEOUT_MS,
                     });
+                    // 超时时 status 是 null、stderr 里只有进度行 —— 必须在 status 判断之前拦掉
+                    if (result.error && result.error.code === "ETIMEDOUT") {
+                        return sendJSON(res, { error: RESI_ADD_TIMEOUT_MSG }, 400);
+                    }
                     if (result.status !== 0) {
-                        const errMsg = (result.stderr || "").replace(/\x1b\[[0-9;]*m/g, "").trim();
-                        return sendJSON(res, { error: errMsg || "添加 URL 失败" }, 400);
+                        return sendJSON(res, { error: helperErrText(result, "添加 URL 失败") }, 400);
                     }
                     const lines = (result.stdout || "").trim().split("\n");
                     return sendJSON(res, {
@@ -2352,8 +2370,7 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                         timeout: 15000,
                     });
                     if (result.status !== 0) {
-                        const errMsg = (result.stderr || "").replace(/\x1b\[[0-9;]*m/g, "").trim();
-                        return sendJSON(res, { error: errMsg || "移除 URL 失败" }, 500);
+                        return sendJSON(res, { error: helperErrText(result, "移除 URL 失败") }, 500);
                     }
                     return sendJSON(res, { success: true });
                 } catch (e) {
