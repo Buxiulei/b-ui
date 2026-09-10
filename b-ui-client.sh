@@ -1775,14 +1775,16 @@ probe_egress() {
         # TUN 模式下直连就是经 TUN，拿不到才说明 v6 被隧道拦住了
         local v6api
         for v6api in https://api6.ipify.org https://ipv6.icanhazip.com; do
-            ip=$(curl -6 -fsS --max-time 5 "$v6api" 2>/dev/null | tr -d '[:space:]')
+            # --noproxy '*'：root shell 会 source /etc/profile.d/proxy.sh，curl 认 ALL_PROXY，
+            # 不显式关掉的话 SOCKS 模式下这个"直连"探测会经隧道出去、误报"本机无 IPv6"
+            ip=$(curl -6 -fsS --noproxy '*' --max-time 5 "$v6api" 2>/dev/null | tr -d '[:space:]')
             # 严格校验：错误页 / JSON 报错 / IPv4 都可能带 ':'，只认十六进制与冒号且 ≤39 字符
             [[ "$ip" =~ ^[0-9A-Fa-f:]+$ && "$ip" == *:* && ${#ip} -le 39 ]] && break
             ip=""
         done
         if [[ -n "$ip" ]]; then
             # ip-api 免费层没有 IPv6 传输，但支持按 IPv6 地址查询（走 IPv4、直连）
-            j=$(curl -4 -fsS --max-time 6 "http://ip-api.com/json/${ip}?fields=status,country,regionName,city,isp,org,as,mobile,proxy,hosting" 2>/dev/null)
+            j=$(curl -4 -fsS --noproxy '*' --max-time 6 "http://ip-api.com/json/${ip}?fields=status,country,regionName,city,isp,org,as,mobile,proxy,hosting" 2>/dev/null)
             if [[ "$(_jf "$j" status)" == "success" ]]; then
                 country=$(_jf "$j" country)
                 region=$(_jf "$j" regionName)
@@ -2093,6 +2095,11 @@ start_tun_mode() {
         # v3.6.0: TUN 没起来就把巡检 timer 放回去，让它一分钟内把 hysteria-client 拉起来，
         # 否则用户落在"TUN 没起 + 客户端也停着"的彻底无代理状态（两个客户端不在这里 enable）
         systemctl start hysteria-health.timer 2>/dev/null || true
+        # 同时把 bui-tun 收干净：否则它带着 enable + Restart=always 留在原地，
+        # 下次开机会一边反复重启失败、一边（因为两个 SOCKS 单元被 disable）没有任何代理
+        systemctl disable bui-tun 2>/dev/null || true
+        systemctl stop bui-tun 2>/dev/null || true
+        systemctl reset-failed bui-tun 2>/dev/null || true
         return 1
     fi
 
@@ -2765,7 +2772,11 @@ cmd_tun() {
             exit $?
             ;;
         off|stop|disable)
-            if ! systemctl is-active --quiet bui-tun 2>/dev/null; then
+            # v3.6.0: 显式关闭时，只要 bui-tun 还活着/还 enable/unit 还在，就走完整收尾
+            # （停 TUN + 恢复客户端与巡检 timer），让上次启动失败的机器能回到 SOCKS
+            if ! systemctl is-active --quiet bui-tun 2>/dev/null \
+               && ! systemctl is-enabled --quiet bui-tun 2>/dev/null \
+               && [[ ! -f /etc/systemd/system/bui-tun.service ]]; then
                 tui_info "TUN 未在运行"
                 exit 0
             fi
@@ -3852,9 +3863,14 @@ edit_rules() {
 toggle_tun() {
     echo ""
     
-    # 检查 sing-box TUN 服务状态
-    if systemctl is-active --quiet bui-tun 2>/dev/null; then
-        echo -e "TUN 模式: ${GREEN}✓ 运行中${NC} (sing-box)"
+    # 检查 sing-box TUN 服务状态。除了"正在运行"，还要认"开机自启但没在跑"——启动失败或
+    # 被外部中断后可能留下这种半途状态，只看 is-active 用户就既进不去 TUN 也回不到 SOCKS
+    if systemctl is-active --quiet bui-tun 2>/dev/null || systemctl is-enabled --quiet bui-tun 2>/dev/null; then
+        if systemctl is-active --quiet bui-tun 2>/dev/null; then
+            echo -e "TUN 模式: ${GREEN}✓ 运行中${NC} (sing-box)"
+        else
+            echo -e "TUN 模式: ${YELLOW}○ 未运行但仍开机自启${NC}（上次启动失败？建议关闭以恢复 SOCKS）"
+        fi
         read -p "停止 TUN 模式? (y/n): " disable
         if [[ "$disable" =~ ^[yY]$ ]]; then
             stop_tun_mode
@@ -5362,7 +5378,8 @@ tui_switch_node() {
     _switch_to_profile "$selected"
 }
 tui_toggle_tun() {
-    if systemctl is-active --quiet bui-tun 2>/dev/null; then
+    # v3.6.0: enable 但没在跑（上次启动失败）也要能走关闭流程回到 SOCKS
+    if systemctl is-active --quiet bui-tun 2>/dev/null || systemctl is-enabled --quiet bui-tun 2>/dev/null; then
         if tui_confirm "停止 TUN 模式？"; then
             tui_info "停止 TUN..."; stop_tun_mode
             tui_success "TUN 已停止"
