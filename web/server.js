@@ -2210,17 +2210,25 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                     }
 
                     try {
-                        const result = spawnSync(helperPath, ["enable", b.url], {
+                        // v3.6.0 R10: 与 /urls 一致 —— 原文经 stdin 交 helper（凭据不进 argv），
+                        // 超时给到 45s（auto 最坏两轮探测 ~25s + 取 IP/ISP），stdout 第三行是探测到的类型
+                        const result = spawnSync(helperPath, ["enable", "-"], {
                             env: { ...process.env, BASE_DIR },
+                            input: String(b.url).trim() + "\n",
                             encoding: "utf8",
-                            timeout: 30000,
+                            timeout: 45000,
                         });
                         if (result.status !== 0) {
                             const errMsg = (result.stderr || "").replace(/\x1b\[[0-9;]*m/g, "").trim();
                             return sendJSON(res, { error: errMsg || "住宅 IP 启用失败" }, 400);
                         }
-                        const lines = result.stdout.trim().split("\n");
-                        return sendJSON(res, { success: true, exitIp: lines[0] || "", ispInfo: lines[1] || "" });
+                        const lines = (result.stdout || "").trim().split("\n");
+                        return sendJSON(res, {
+                            success: true,
+                            exitIp: lines[0] || "",
+                            ispInfo: lines[1] || "",
+                            type: (lines[2] || "socks5").trim(),
+                        });
                     } catch (e) {
                         return sendJSON(res, { error: e.message }, 500);
                     }
@@ -2335,8 +2343,9 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                     if (!Array.isArray(rConfig.urls)) rConfig.urls = [];
                     const match = rConfig.urls.find(u => `${u.host}:${u.port}` === target);
                     if (!match) return sendJSON(res, { error: "未找到匹配 URL" }, 404);
-                    // helper 期望 socks5:// 格式（不需要凭据匹配，按 host:port 即可）
-                    const url = `socks5://${match.username}:${match.password}@${match.host}:${match.port}`;
+                    // helper 只按 host:port 匹配，不校验凭据 —— 用占位凭据拼 URL，
+                    // v3.6.0 R10: 真凭据不再进 argv（ps 能看到 spawn 的命令行）
+                    const url = `socks5://x:x@${match.host}:${match.port}`;
                     const result = spawnSync(CONFIG.residentialHelper, ["enable", "--remove", url], {
                         env: { ...process.env, BASE_DIR },
                         encoding: "utf8",

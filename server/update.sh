@@ -1139,11 +1139,13 @@ EOF
     fi
 
     # v3.5.22 D8: 住宅线路可靠性监测 timer（reliability-aware failover）
-    # relay 有 ≥2 条住宅上游(socks 出站)时确保 b-ui-resi-health.timer 启用——它定期真实探测每条
+    # v3.6.0 R10: 住宅上游可以是 socks(SOCKS5) 或 http(HTTP) 出站，两者都要计入成员数——
+    #             只数 socks 会把纯 HTTP 池判成 <2 条，进而把 timer 删掉、巡检彻底停摆
+    # relay 有 ≥2 条住宅上游(socks/http 出站)时确保 b-ui-resi-health.timer 启用——它定期真实探测每条
     # 住宅线路，质量差的自动从 urltest 池剔除(流量转到好线路)、恢复后加回。<2 条则清理该 timer。
     if [[ -f /opt/b-ui/singbox-relay.json ]] && command -v jq >/dev/null 2>&1; then
         local _nmem
-        _nmem=$(jq -r '[.outbounds[]|select(.type=="socks")]|length' /opt/b-ui/singbox-relay.json 2>/dev/null || echo 0)
+        _nmem=$(jq -r '[.outbounds[]|select(.type=="socks" or .type=="http")]|length' /opt/b-ui/singbox-relay.json 2>/dev/null || echo 0)
         if [[ "${_nmem:-0}" -ge 2 ]]; then
             # 自愈下载 resi-health.sh（新增文件 chicken-and-egg：老 update.sh 的 file_map 没有它，
             # 同版本不会重下 → 这里缺失则直接补下，确保 timer 能建起来）

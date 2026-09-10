@@ -580,9 +580,11 @@ function parseResiInput(text) {
         s = s.slice(1, -1).trim();
     }
     const EG = "示例：socks5://user:pass@host:port 或 host:port:user:pass";
-    let scheme = "auto";
-    if (/^socks5:\/\//i.test(s)) { scheme = "socks5"; s = s.slice("socks5://".length); }
-    else if (/^http:\/\//i.test(s)) { scheme = "http"; s = s.slice("http://".length); }
+    let scheme = "auto", schemeGiven = false;
+    // socks5h:// 是 socks5:// 的别名（供应商文档普遍这么写）；大小写不敏感
+    if (/^socks5h:\/\//i.test(s)) { scheme = "socks5"; s = s.slice("socks5h://".length); schemeGiven = true; }
+    else if (/^socks5:\/\//i.test(s)) { scheme = "socks5"; s = s.slice("socks5://".length); schemeGiven = true; }
+    else if (/^http:\/\//i.test(s)) { scheme = "http"; s = s.slice("http://".length); schemeGiven = true; }
     const other = s.match(/^([A-Za-z][A-Za-z0-9+.-]*):\/\//);
     if (other) return { error: "不支持的协议 " + other[1] + "://，只支持 socks5:// 与 http://" };
 
@@ -592,7 +594,15 @@ function parseResiInput(text) {
     const csvLike = parts.length >= 4 && parts[0].indexOf("@") < 0 && /^[0-9]+$/.test(parts[1]);
     let host, port, username, password;
 
-    if (at >= 0 && /^[^:@/]+:[0-9]+$/.test(tail)) {
+    const atOk = at >= 0 && /^[^:@/]+:[0-9]+$/.test(tail);
+    // 与 helper parse_url 同优先级：没写 scheme → CSV 优先（密码含 @ 的整行粘贴），写了 → @ 形态优先
+    if (csvLike && (!schemeGiven || !atOk)) {
+        // host:port:user:pass（供应商 IP 列表的整行，密码可含 : 与 @）
+        host = parts[0];
+        port = parts[1];
+        username = parts[2];
+        password = parts.slice(3).join(":");
+    } else if (atOk) {
         // user:pass@host:port（以最后一个 @ 切分，密码可含 @）
         const userpass = s.slice(0, at);
         const ci = userpass.indexOf(":");
@@ -602,12 +612,6 @@ function parseResiInput(text) {
         const li = tail.lastIndexOf(":");
         host = tail.slice(0, li);
         port = tail.slice(li + 1);
-    } else if (csvLike) {
-        // host:port:user:pass（供应商 IP 列表 CSV 的整行，密码可含 : 与 @）
-        host = parts[0];
-        port = parts[1];
-        username = parts[2];
-        password = parts.slice(3).join(":");
     } else if (at >= 0) {
         if (tail.indexOf(":") < 0) return { error: "缺少端口，格式应为 user:pass@host:port" };
         const li = tail.lastIndexOf(":");

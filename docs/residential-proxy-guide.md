@@ -125,8 +125,13 @@ udp/443 → reject    （QUIC 显式拒绝，浏览器自动回退 TCP/HTTP2，�
 ```
 
 所以开启"全局模式"时 DNS 与 QUIC 不会被塞进住宅 SOCKS5 里挂死。域名解析交给上游
-（`socks5h` 语义：目标域名原样传给供应商解析）——这也是 Bright Data 的硬要求，
-它明确**拒绝**用显式 IP 或本地解析发起的 SOCKS5 请求。
+（`socks5h` 语义：目标域名原样传给供应商解析），HTTP 上游则是 `CONNECT 域名:端口`。
+
+**中继自己在热路径上不做 DNS 解析**（2026-09-10 用 sing-box 1.14 实测：把中继的两个 DNS 服务器
+都换成本机假 DNS 再经中继请求 AI 域名，上游收到的是 `CONNECT chatgpt.com:443`，两个假 DNS
+一次都没被查）。所以配置里 `dns_resi`（`detour: resi-pool`）在纯 HTTP 上游池下也不会被查到——
+HTTP 出站扛不了 UDP，但它压根不在请求路径上；路由需要解析时走的是
+`route.default_domain_resolver`（`dns_direct`，直连）。
 
 ---
 
@@ -207,16 +212,32 @@ udp/443 → reject    （QUIC 显式拒绝，浏览器自动回退 TCP/HTTP2，�
 把 HTTP CONNECT 打到 22228 同样不通。**B-UI 添加时会自动识别**：不带协议前缀的输入先试 SOCKS5、
 失败再试 HTTP，识别结果记进 `residential-proxy.json` 的 `type` 字段，中继按类型出站
 （`socks` / `http`），面板节点池那一行会显示 `SOCKS5` 或 `HTTP` 徽标。
-想跳过探测就自己写前缀：`socks5://…` 或 `http://…`。
+想跳过探测就自己写前缀：`socks5://…`、`socks5h://…`（同义）或 `http://…`。
+
+**Bright Data 推荐用 HTTP 端口（44445）当上游**。2026-09-10 在生产机上用真实 ISP zone 凭据实测，
+同一套凭据两个端口的差别是：
+
+| 目标 | SOCKS5 · 22228 | HTTP · 44445 |
+|---|---|---|
+| HTTPS + 域名（如 `https://api.ipify.org`） | 通 | 通 |
+| HTTPS + 显式 IP | 通 | 通 |
+| **明文 HTTP（80 端口，如 `http://neverssl.com/`）** | **不通（无响应）** | 通 |
+
+两个端口的出口 IP 是同一个，所以选 HTTP 端口没有任何损失，还多拿到明文 HTTP 目标的能力
+（AI 站点全是 HTTPS，但客户端里总有零星明文回落、探测与 OCSP 之类的请求）。
+操作上不用记这些：把供应商 IP 列表里的 `host:44445:user:pass` **整行粘进面板**，
+自动探测会识别成 `http` 类型。
 
 供应商后台导出的 **IP 列表 CSV 每行就是 `host:port:username:password`**，可以整行粘贴，不用手工改写。
 
 ### 9.2 目标必须是域名，不要在本地解析成 IP
 
-Bright Data 的 SOCKS5 **只接受域名目标**（`socks5h` 语义，由出口节点远端解析），显式 IP 会被拒；
-走 HTTP 代理时 IP 目标会改由"超级代理"直接发出，**出口就不再是你的住宅/ISP IP 了**。
-B-UI 中继把目标域名原样交给上游（不本地解析），所以客户端侧请保持 TUN / 域名嗅探开启，
-不要在本地把域名解析成 IP 再连。想让解析确定发生在出口节点，可在用户名加 `-dns-remote`。
+Bright Data 文档要求 SOCKS5 用 `socks5h` 语义（把域名交给出口节点远端解析）。
+2026-09-10 实测：**HTTPS 打显式 IP 其实是通的**，所以"显式 IP 一定被拒"这句话不成立；
+但按文档，走 HTTP 代理时 IP 目标会改由"超级代理"直接发出，**出口就不再是你的住宅/ISP IP**——
+这才是"尽量交域名"的真实理由（出口归属，不是能不能连）。
+B-UI 中继把目标域名原样交给上游（不本地解析，实测见第 6 节），所以客户端侧请保持 TUN / 域名嗅探
+开启，不要在本地把域名解析成 IP 再连。想让解析确定发生在出口节点，可在用户名加 `-dns-remote`。
 
 ### 9.3 超级代理绕过（superproxy bypass）：出口显示成机房 IP 不一定是配置错了
 

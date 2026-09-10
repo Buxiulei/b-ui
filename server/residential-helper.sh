@@ -16,7 +16,7 @@
 #
 # Usage:
 #   residential-helper.sh setup                  → 初始化：启动 b-ui-relay sing-box 服务
-#   residential-helper.sh enable <url>           → 开启住宅代理（单 URL，覆盖现有）
+#   residential-helper.sh enable <url>|-         → 开启住宅代理（单 URL，覆盖现有；- 从 stdin 读一行）
 #   residential-helper.sh enable --add <url>     → 新增一个住宅 URL（多 URL 模式）
 #   residential-helper.sh enable --add -         → 同上，URL 从 stdin 读一行（凭据不进 argv）
 #   residential-helper.sh enable --remove <url>  → 移除一个住宅 URL（按 host:port 匹配，与协议无关）
@@ -107,7 +107,7 @@ get_domains() {
 # v3.6.0 R10: 四种格式 → RESI_HOST/PORT/USER/PASS + RESI_TYPE(socks5|http|auto)
 # 供应商邮件与 IP 列表 CSV 常带首尾空白和成对引号，先剥掉
 parse_url() {
-    local raw="$1" url s
+    local raw="$1" url s scheme_given at_ok csv_ok userpass hostport
     url="${raw#"${raw%%[![:space:]]*}"}"; url="${url%"${url##*[![:space:]]}"}"
     case "$url" in
         \"*\") url="${url:1:${#url}-2}" ;;
@@ -117,9 +117,12 @@ parse_url() {
 
     RESI_TYPE="auto"
     s="$url"
-    case "$url" in
-        socks5://*) RESI_TYPE="socks5"; s="${url#socks5://}" ;;
-        http://*)   RESI_TYPE="http";   s="${url#http://}"   ;;
+    scheme_given=0
+    # 大小写不敏感；socks5h:// 是 socks5:// 的别名（供应商文档普遍写 socks5h）
+    case "${url,,}" in
+        socks5h://*) RESI_TYPE="socks5"; s="${url:10}"; scheme_given=1 ;;
+        socks5://*)  RESI_TYPE="socks5"; s="${url:9}";  scheme_given=1 ;;
+        http://*)    RESI_TYPE="http";   s="${url:7}";  scheme_given=1 ;;
     esac
     # https:// / socks4:// 等一律拒绝，别把 scheme 当成用户名静默解析
     if [[ "$s" =~ ^[A-Za-z][A-Za-z0-9+.-]*:// ]]; then
@@ -127,21 +130,28 @@ parse_url() {
         return 1
     fi
 
-    # user:pass@host:port 以**最后一个** @ 切分（密码可含 @），且 @ 之后必须形如 host:port；
-    # 否则按 host:port:user:pass 解析（CSV 形态的密码同样可以含 @）
-    if [[ "$s" == *"@"* && "${s##*@}" =~ ^[^:@/]+:[0-9]+$ ]]; then
-        local userpass="${s%@*}"
-        local hostport="${s##*@}"
+    # 两种形态的密码都可以含 : 与 @，只靠字符判不出来，所以按"有没有写 scheme"定优先级：
+    #   没写 scheme → 供应商 IP 列表整行（host:port:user:pass）优先，其密码含 @ 很常见
+    #                （h:1084:u:p@x:5 若按 @ 形态解析会把 host 当用户名）
+    #   写了 scheme → 按 URL 语义，先试 user:pass@host:port（以最后一个 @ 切分）
+    at_ok=0; csv_ok=0
+    if [[ "$s" == *"@"* && "${s##*@}" =~ ^[^:@/]+:[0-9]+$ ]]; then at_ok=1; fi
+    if [[ "$s" =~ ^[^:@]+:[0-9]+:[^:]+:.+$ ]]; then csv_ok=1; fi
+
+    if [[ "$csv_ok" == 1 && ( "$scheme_given" == 0 || "$at_ok" == 0 ) ]]; then
+        [[ "$s" =~ ^([^:@]+):([0-9]+):([^:]+):(.+)$ ]]
+        RESI_HOST="${BASH_REMATCH[1]}"
+        RESI_PORT="${BASH_REMATCH[2]}"
+        RESI_USER="${BASH_REMATCH[3]}"
+        RESI_PASS="${BASH_REMATCH[4]}"
+    elif [[ "$at_ok" == 1 ]]; then
+        userpass="${s%@*}"
+        hostport="${s##*@}"
         [[ "$userpass" == *:* ]] || { err "凭据缺少密码，应为 user:pass@host:port"; return 1; }
         RESI_USER="${userpass%%:*}"
         RESI_PASS="${userpass#*:}"
         RESI_HOST="${hostport%%:*}"
         RESI_PORT="${hostport##*:}"
-    elif [[ "$s" =~ ^([^:@]+):([0-9]+):([^:]+):(.+)$ ]]; then
-        RESI_HOST="${BASH_REMATCH[1]}"
-        RESI_PORT="${BASH_REMATCH[2]}"
-        RESI_USER="${BASH_REMATCH[3]}"
-        RESI_PASS="${BASH_REMATCH[4]}"
     else
         err "无法解析凭据格式。支持: socks5://user:pass@host:port、http://user:pass@host:port、host:port:user:pass、user:pass@host:port"
         return 1
@@ -151,6 +161,10 @@ parse_url() {
         || { err "解析结果包含空字段"; return 1; }
     [[ "$RESI_PORT" =~ ^[0-9]+$ ]] \
         || { err "端口必须是数字，实际: ${RESI_PORT}"; return 1; }
+    # v3.6.0 R10: 端口范围在这里收口——否则 99999 要等到 verify 才以"两种协议都连不上"暴露
+    if [[ "${#RESI_PORT}" -gt 5 ]] || [[ "$RESI_PORT" -lt 1 ]] || [[ "$RESI_PORT" -gt 65535 ]]; then
+        err "端口超出范围 1-65535，实际: ${RESI_PORT}"; return 1
+    fi
 }
 
 # v3.6.0 R10: want = socks5|http|auto。auto 先 SOCKS5 再 HTTP（Bright Data 22228=SOCKS5、
@@ -340,6 +354,9 @@ write_singbox_config_residential_multi() {
         --arg  cache      "${BASE_DIR}/relay-cache.db" \
         '{
           "log": {"level": "error"},
+          # v3.6.0 R10: dns_resi 的 detour 是住宅池，http 上游扛不了 UDP —— 但实测(sing-box 1.14)
+          # 中继热路径根本不查 DNS（域名原样交上游，路由要解析时走 default_domain_resolver=dns_direct），
+          # 纯 HTTP 池下 dns_resi 一次也不会被查，所以这里不按池类型分叉（见 docs 第 6 节）
           "dns": {
             "servers": [
               {"tag": "dns_resi",   "type": "udp", "server": "8.8.8.8", "detour": "resi-pool"},
@@ -649,8 +666,14 @@ case "$cmd" in
             exit 0
         fi
 
-        [[ -z "${2:-}" ]] && { err "用法: $0 enable <url>"; exit 1; }
-        parse_url "$2"
+        [[ -z "${2:-}" ]] && { err "用法: $0 enable <url>|-（- 表示从 stdin 读一行）"; exit 1; }
+        enable_url="$2"
+        # v3.6.0 R10: 与 --add - 一致，"-" 从 stdin 读一行，凭据不进 argv（面板走这条路）
+        if [[ "$enable_url" == "-" ]]; then
+            IFS= read -r enable_url || true
+            [[ -z "$enable_url" ]] && { err "stdin 未读到代理 URL"; exit 1; }
+        fi
+        parse_url "$enable_url"
         verify "$RESI_HOST" "$RESI_PORT" "$RESI_USER" "$RESI_PASS" "$RESI_TYPE"
         ensure_singbox
         write_singbox_config_residential "$RESI_HOST" "$RESI_PORT" "$RESI_USER" "$RESI_PASS" "$RESI_TYPE"
