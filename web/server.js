@@ -256,7 +256,11 @@ function saveUsers(u) {
 // v3.6.0: 非阻塞重启（范式同 b-ui-admin 自重启）；失败只记日志，不拖垮 API 响应
 function restartServiceAsync(unit) {
     try {
-        spawn("systemctl", ["restart", unit], { detached: true, stdio: "ignore" }).unref();
+        const child = spawn("systemctl", ["restart", unit], { detached: true, stdio: "ignore" });
+        // spawn 失败（如无 systemctl）走异步 error 事件，try/catch 抓不到；
+        // 无监听时 unhandled 'error' 会直接终止进程，必须挂上
+        child.on("error", e => log("ERROR", `restart ${unit}: ${e.message}`));
+        child.unref();
     } catch (e) { log("ERROR", `restart ${unit}: ${e.message}`); }
 }
 
@@ -2408,6 +2412,7 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                             detached: true,
                             stdio: "ignore"
                         });
+                        child.on("error", e => log("ERROR", `restart b-ui-admin: ${e.message}`));
                         child.unref();
                     } catch { }
                     return sendJSON(res, { success: true, message: "密码已更新，请重新登录" });
