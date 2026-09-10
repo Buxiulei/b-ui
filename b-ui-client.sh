@@ -1688,21 +1688,29 @@ _jf() {
         printf '%s' "$json" | jq -r --arg k "$key" '.[$k] | if . == null then empty else . end' 2>/dev/null
         return
     fi
-    # 无 jq 时的 sed 版。两点讲究：
-    # 1) 先把"嵌套对象/数组的值"换成 null，只认顶层字段——接口改版把字段挪进 data.* 时
-    #    要和 jq 一样判空回退，而不是被内层的同名字段骗过去
-    # 2) 带引号的值先按字符串整体取（值里可以有逗号、转义引号），取不到再按裸值取
-    #    （数字/布尔/null）；原来的 [^",}]* 会把 "Washington, D.C." 截成 "Washington"
+    # 无 jq 时的 sed 版（客户端从不装 jq，精简镜像走的就是这条路）。四点讲究：
+    # 1) 先把"某个键的对象/数组值"整体换成 null，循环替换到不再变化（多层嵌套要逐层剥），
+    #    这样只认顶层字段——接口改版把字段挪进 data.* 时要和 jq 一样判空回退。替换必须
+    #    锚在键的收尾引号上，否则字符串值里的 "Foo:[bar]" 会被当成嵌套值吃掉
+    # 2) 带引号的值先按字符串整体取（值里可以有逗号、转义引号），并还原常见转义
+    #    （\uXXXX 与 \n/\t 不处理，本接口用不到）；原来的 [^",}]* 会把
+    #    "Washington, D.C." 截成 "Washington"
+    # 3) 裸值（数字/布尔/null）不吃空格，`"isResidential" : true ,` 这种排版不会带出尾随空格
+    # 4) JSON null 归一成空串，跟 jq 的 empty 对齐——否则 "ip":null 会骗过调用方的判空回退
     local flat v
     flat=$(printf '%s' "$json" | tr -d '\n' \
-        | sed -e 's/:[[:space:]]*{[^{}]*}/:null/g' -e 's/:[[:space:]]*\[[^][]*\]/:null/g')
+        | sed -e ':a' \
+              -e 's/"\([[:space:]]*:[[:space:]]*\){[^{}]*}/"\1null/g' \
+              -e 's/"\([[:space:]]*:[[:space:]]*\)\[[^][]*\]/"\1null/g' \
+              -e 'ta')
     v=$(printf '%s' "$flat" | sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"\(\([^\"\\]\|\\\\.\)*\)\".*/\1/p")
     if [[ -n "$v" ]]; then
-        # 常见转义还原，跟 jq -r 的输出对齐（\uXXXX 不处理，本接口用不到）
         printf '%s\n' "$v" | sed -e 's/\\"/"/g' -e 's|\\/|/|g' -e 's/\\\\/\\/g'
         return
     fi
-    printf '%s\n' "$(printf '%s' "$flat" | sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\([^\",}]*\).*/\1/p")"
+    v=$(printf '%s' "$flat" | sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\([^\",}[:space:]]*\).*/\1/p")
+    [[ "$v" == null ]] && v=""
+    printf '%s\n' "$v"
 }
 
 # ip-api 的 hosting/proxy/mobile 布尔 → 中文类型（措辞沿用 test_proxy）
