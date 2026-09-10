@@ -391,6 +391,11 @@ function getConfig() {
             }
         } catch { }
 
+        // v3.6.0: hysteria 实际监听 (listen: :PORT[,START-END]) 是端口跳跃的真源；
+        // 有区间即启用且用该区间；无区间沿用 port-hopping.json（老式 iptables 路径兜底）
+        const lm = hc.match(/^listen:\s*:?(\d+)(?:,(\d+)-(\d+))?\s*$/m);
+        if (lm && lm[2]) portHopping = { enabled: true, start: parseInt(lm[2]), end: parseInt(lm[3]) };
+
         // v3.4.19 Cluster E: 检测 obfs salamander
         // 从 config.yaml 解析 obfs 段（YAML 顶层 obfs:type:salamander 块）
         let obfs = { enabled: false, type: "", password: "" };
@@ -1637,7 +1642,9 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                     if (!user.password) return null;
                     // v3.5.0: 分段 encode（防止 : 被编码导致客户端无法拆分 user/pass）
                     const auth = `${encodeURIComponent(user.username)}:${encodeURIComponent(user.password)}`;
-                    let qp = `sni=${serverHost}&insecure=0&mport=${hopRange}`;
+                    // v3.6.0: mport 只在实际启用端口跳跃时输出（写死 20000-30000 曾让未开跳跃/自定义区间的服务器必现连不上）
+                    let qp = `sni=${serverHost}&insecure=0`;
+                    if (hopRange) qp += `&mport=${hopRange}`;
                     if (includeObfs && cfg.obfs && cfg.obfs.enabled && cfg.obfs.type === "salamander" && cfg.obfs.password) {
                         qp += `&obfs=salamander&obfs-password=${encodeURIComponent(cfg.obfs.password)}`;
                     }
@@ -1645,10 +1652,12 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                     return `hysteria2://${auth}@${serverHost}:${port}?${qp}#${name}`;
                 };
 
+                const directHop = cfg.portHopping?.enabled ? `${cfg.portHopping.start}-${cfg.portHopping.end}` : null;
+
                 // ② HY2 URL (按 proto + residential 决定端口)
                 if (proto === "fusion" || proto === "hysteria2") {
                     if (proto === "fusion") {
-                        const h1 = buildHy2Url(cfg.port || 10000, "20000-30000", "HY2直连", true);
+                        const h1 = buildHy2Url(cfg.port || 10000, directHop, "HY2直连", true);
                         if (h1) links.push(h1);
                     }
                     if (proto === "hysteria2") {
@@ -1656,7 +1665,7 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                             const u = buildHy2Url(40000, "41000-50000", "HY2住宅", false);
                             if (u) links.push(u);
                         } else {
-                            const u = buildHy2Url(cfg.port || 10000, "20000-30000", "HY2直连", true);
+                            const u = buildHy2Url(cfg.port || 10000, directHop, "HY2直连", true);
                             if (u) links.push(u);
                         }
                     }
