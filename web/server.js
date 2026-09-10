@@ -627,7 +627,8 @@ function generateSingboxConfig(user, cfg, host) {
         url: "https://www.gstatic.com/generate_204",
         interval: "60s",
         tolerance: 100,
-        idle_timeout: "30s",
+        // idle_timeout 必须 >= interval，否则 sing-box 启动即 FATAL（check 查不出来）
+        idle_timeout: "30m",
         interrupt_exist_connections: false
     });
 
