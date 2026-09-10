@@ -1375,8 +1375,8 @@ generate_singbox_tun_config() {
     # v3.5: 预解析 server_host 到 IP，写入 dns.rules predefined 规则
     # 防止 GFW 投毒 server_host 域名导致客户端无法连上 server（bootstrap 投毒漏洞）
     local server_predefined_rule=""
+    local server_ip_resolved=""
     if [[ ! "$server_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        local server_ip_resolved
         server_ip_resolved=$(dig +short "$server_host" A 2>/dev/null \
             | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
         [[ -z "$server_ip_resolved" ]] && \
@@ -1385,6 +1385,8 @@ generate_singbox_tun_config() {
         if [[ "$server_ip_resolved" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             server_predefined_rule=",
       { \"domain\": [\"${server_host}\"], \"action\": \"predefined\", \"answer\": [\"${server_host}. IN A ${server_ip_resolved}\"] }"
+        else
+            server_ip_resolved=""
         fi
     fi
     
@@ -1393,7 +1395,11 @@ generate_singbox_tun_config() {
     
     # JSON 转义敏感字段
     local safe_password=$(json_escape "${AUTH_PASSWORD}")
-    local safe_server=$(json_escape "${server_host}")
+    # v3.6.0: 解析成功则按 IP 连接、SNI 用域名——出站的 domain_resolver 不经过 dns.rules，
+    # 上面那条 predefined 防投毒规则保护不到出站自身对 server_host 的解析
+    local dial_host="$server_host"
+    [[ -n "$server_ip_resolved" ]] && dial_host="$server_ip_resolved"
+    local safe_server=$(json_escape "${dial_host}")
     local safe_sni=$(json_escape "${SNI:-$server_host}")
     local safe_uuid=$(json_escape "${UUID}")
     local safe_pubkey=$(json_escape "${PUBLIC_KEY}")
