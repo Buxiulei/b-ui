@@ -9,11 +9,17 @@
 #   global=OFF → 池有效时按 domain_keyword 分流（AI 域名走住宅，其余直连）
 #   Xray / Hysteria2 配置由 core.sh 一次写定，此脚本不再重写它们
 #
+# v3.6.0 R10: 上游支持 SOCKS5 与 HTTP 两种协议。URL 可以是
+#   socks5://user:pass@host:port / http://user:pass@host:port（显式类型）
+#   host:port:user:pass / user:pass@host:port（自动探测：先 SOCKS5，失败再 HTTP）
+# 探测结果记进 residential-proxy.json 的 type 字段（缺省=socks5），中继按 type 出 socks/http 出站。
+#
 # Usage:
 #   residential-helper.sh setup                  → 初始化：启动 b-ui-relay sing-box 服务
 #   residential-helper.sh enable <url>           → 开启住宅代理（单 URL，覆盖现有）
 #   residential-helper.sh enable --add <url>     → 新增一个住宅 URL（多 URL 模式）
-#   residential-helper.sh enable --remove <url>  → 移除一个住宅 URL
+#   residential-helper.sh enable --add -         → 同上，URL 从 stdin 读一行（凭据不进 argv）
+#   residential-helper.sh enable --remove <url>  → 移除一个住宅 URL（按 host:port 匹配，与协议无关）
 #   residential-helper.sh disable                → 关闭住宅代理，sing-box 改为空池直连
 #   residential-helper.sh status                 → 输出 residential-proxy.json
 #   residential-helper.sh domains                → 输出生效分流域名关键字 (JSON 数组)
@@ -60,9 +66,10 @@ file_digest() {
 # v3.6.0 R3: curl 配置文件双引号内需转义 \ 与 "
 curl_cfg_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
 # 生成 curl -K - 的配置：proxy 行 + 可选 proxy-user 行（凭据不出现在 argv 里）
-curl_socks_cfg() {
-    local host="$1" port="$2" user="$3" pass="$4"
-    printf 'proxy = "socks5h://%s:%s"\n' "$(curl_cfg_escape "$host")" "$(curl_cfg_escape "$port")"
+# v3.6.0 R10: scheme 由调用方给（socks5h / http），内部常量，不来自用户输入
+curl_proxy_cfg() {
+    local scheme="$1" host="$2" port="$3" user="$4" pass="$5"
+    printf 'proxy = "%s://%s:%s"\n' "$scheme" "$(curl_cfg_escape "$host")" "$(curl_cfg_escape "$port")"
     [ -n "$user" ] && printf 'proxy-user = "%s:%s"\n' "$(curl_cfg_escape "$user")" "$(curl_cfg_escape "$pass")"
     return 0
 }
@@ -97,24 +104,46 @@ get_domains() {
     DOMAINS=("${DEFAULT_DOMAINS[@]}")
 }
 
+# v3.6.0 R10: 四种格式 → RESI_HOST/PORT/USER/PASS + RESI_TYPE(socks5|http|auto)
+# 供应商邮件与 IP 列表 CSV 常带首尾空白和成对引号，先剥掉
 parse_url() {
-    local url="$1"
-    local s="${url#socks5://}"
+    local raw="$1" url s
+    url="${raw#"${raw%%[![:space:]]*}"}"; url="${url%"${url##*[![:space:]]}"}"
+    case "$url" in
+        \"*\") url="${url:1:${#url}-2}" ;;
+        \'*\') url="${url:1:${#url}-2}" ;;
+    esac
+    url="${url#"${url%%[![:space:]]*}"}"; url="${url%"${url##*[![:space:]]}"}"
 
-    if [[ "$s" == *"@"* ]]; then
-        local userpass="${s%%@*}"
+    RESI_TYPE="auto"
+    s="$url"
+    case "$url" in
+        socks5://*) RESI_TYPE="socks5"; s="${url#socks5://}" ;;
+        http://*)   RESI_TYPE="http";   s="${url#http://}"   ;;
+    esac
+    # https:// / socks4:// 等一律拒绝，别把 scheme 当成用户名静默解析
+    if [[ "$s" =~ ^[A-Za-z][A-Za-z0-9+.-]*:// ]]; then
+        err "不支持的代理协议 ${s%%://*}:// —— 只支持 socks5:// 与 http://"
+        return 1
+    fi
+
+    # user:pass@host:port 以**最后一个** @ 切分（密码可含 @），且 @ 之后必须形如 host:port；
+    # 否则按 host:port:user:pass 解析（CSV 形态的密码同样可以含 @）
+    if [[ "$s" == *"@"* && "${s##*@}" =~ ^[^:@/]+:[0-9]+$ ]]; then
+        local userpass="${s%@*}"
         local hostport="${s##*@}"
+        [[ "$userpass" == *:* ]] || { err "凭据缺少密码，应为 user:pass@host:port"; return 1; }
         RESI_USER="${userpass%%:*}"
         RESI_PASS="${userpass#*:}"
         RESI_HOST="${hostport%%:*}"
         RESI_PORT="${hostport##*:}"
-    elif [[ "$url" =~ ^([^:@]+):([0-9]+):([^:]+):(.+)$ ]]; then
+    elif [[ "$s" =~ ^([^:@]+):([0-9]+):([^:]+):(.+)$ ]]; then
         RESI_HOST="${BASH_REMATCH[1]}"
         RESI_PORT="${BASH_REMATCH[2]}"
         RESI_USER="${BASH_REMATCH[3]}"
         RESI_PASS="${BASH_REMATCH[4]}"
     else
-        err "无法解析凭据格式。支持: socks5://user:pass@host:port 或 host:port:user:pass"
+        err "无法解析凭据格式。支持: socks5://user:pass@host:port、http://user:pass@host:port、host:port:user:pass、user:pass@host:port"
         return 1
     fi
 
@@ -124,8 +153,10 @@ parse_url() {
         || { err "端口必须是数字，实际: ${RESI_PORT}"; return 1; }
 }
 
+# v3.6.0 R10: want = socks5|http|auto。auto 先 SOCKS5 再 HTTP（Bright Data 22228=SOCKS5、
+# 44445=HTTP，同一套凭据两种都可用），成功后 RESI_TYPE 是实际可用类型
 verify() {
-    local host="$1" port="$2" user="$3" pass="$4"
+    local host="$1" port="$2" user="$3" pass="$4" want="${5:-auto}"
 
     # v3.6.0 R3: 换行无法安全写进 curl 配置文件（会注入额外指令），视为非法
     case "${user}${pass}" in
@@ -143,15 +174,36 @@ verify() {
     _SERVER_IP_FETCHED=1
     local vps_ip="$_SERVER_IP"
 
-    info "通过 SOCKS5 测试出口..."
-    local exit_ip
-    exit_ip=$(curl_socks_cfg "$host" "$port" "$user" "$pass" \
-        | curl -sS --max-time 10 -K - https://api.ipify.org 2>/dev/null) \
-        || { err "连接住宅代理失败 (${host}:${port})"
-             # v3.6.0 R8: Bright Data 等住宅线路只放开固定目标端口(8080/8443/5678/1962/2000/4443/...)且只允许
-             # HTTPS 目标，443 不在名单里——探测必然失败，但报错看起来像"凭据错了"
-             err "若供应商限制目标端口（如 Bright Data 住宅仅开放 8080/8443 等），请改用其 HTTP 代理端口或联系供应商；详见 docs/residential-proxy-guide.md"
-             return 1; }
+    local candidates
+    case "$want" in
+        socks5) candidates="socks5" ;;
+        http)   candidates="http"   ;;
+        *)      candidates="socks5 http" ;;
+    esac
+
+    local t scheme exit_ip=""
+    for t in $candidates; do
+        if [[ "$t" == "http" ]]; then scheme="http"; else scheme="socks5h"; fi
+        info "通过 ${t^^} 测试出口..."
+        if exit_ip=$(curl_proxy_cfg "$scheme" "$host" "$port" "$user" "$pass" \
+                     | curl -sS --max-time 10 -K - https://api.ipify.org 2>/dev/null); then
+            RESI_TYPE="$t"
+            break
+        fi
+        exit_ip=""
+    done
+
+    if [[ -z "$exit_ip" ]]; then
+        if [[ "$want" == "auto" ]]; then
+            err "SOCKS5 与 HTTP 两种协议都连不上 (${host}:${port}) —— 请核对凭据与端口（供应商的 SOCKS5 与 HTTP 端口通常不同）"
+        else
+            err "连接住宅代理失败 (${want^^} ${host}:${port})"
+        fi
+        # v3.6.0 R8: Bright Data 等住宅线路只放开固定目标端口(8080/8443/5678/1962/2000/4443/...)且只允许
+        # HTTPS 目标，443 不在名单里——探测必然失败，但报错看起来像"凭据错了"
+        err "若供应商限制目标端口（如 Bright Data 住宅仅开放 8080/8443 等），请改用其 HTTP 代理端口或联系供应商；详见 docs/residential-proxy-guide.md"
+        return 1
+    fi
 
     [[ "$exit_ip" == "$vps_ip" ]] \
         && { err "出口 IP 与 VPS 相同 (${vps_ip})，代理未生效"; return 1; }
@@ -230,12 +282,12 @@ get_server_ip() {
 }
 
 write_singbox_config_residential() {
-    local host="$1" port="$2" user="$3" pass="$4"
+    local host="$1" port="$2" user="$3" pass="$4" type="${5:-socks5}"
     local urls_json
     urls_json=$(jq -n \
         --arg  host "$host" --argjson port "$port" \
-        --arg  user "$user" --arg pass "$pass" \
-        '[{host:$host, port:$port, username:$user, password:$pass, name:"primary"}]')
+        --arg  user "$user" --arg pass "$pass" --arg type "$type" \
+        '[{host:$host, port:$port, username:$user, password:$pass, name:"primary", type:$type}]')
     write_singbox_config_residential_multi "$urls_json"
 }
 
@@ -253,17 +305,21 @@ write_singbox_config_residential_multi() {
         is_global=$(jq -r '.global // false' "${RESIDENTIAL_CONFIG}" 2>/dev/null || echo "false")
     fi
 
+    # v3.6.0 R10: 按条目 type 出站 —— http 上游是 sing-box 的 http 出站（无 version 字段、TCP only，
+    # 与 R4 的 UDP 规则一致，无需改路由）；缺 type 的老条目一律当 socks5
     local outbounds_resi outbound_tags
     outbounds_resi=$(echo "$urls_json" | jq '
-      to_entries | map({
-        type: "socks",
-        tag: ("resi-" + ((.key + 1) | tostring)),
-        server: .value.host,
-        server_port: (.value.port | tonumber),
-        username: .value.username,
-        password: .value.password,
-        version: "5"
-      })')
+      to_entries | map(
+        ((.value.type // "socks5") as $t
+         | {tag: ("resi-" + ((.key + 1) | tostring)),
+            server: .value.host,
+            server_port: (.value.port | tonumber),
+            username: .value.username,
+            password: .value.password} as $base
+         | if $t == "http"
+           then {type: "http"} + $base
+           else {type: "socks"} + $base + {version: "5"}
+           end))')
     outbound_tags=$(echo "$urls_json" | jq '
       to_entries | map("resi-" + ((.key + 1) | tostring))')
 
@@ -434,11 +490,12 @@ save_config() {
         --argjson port   "${RESI_PORT:-0}" \
         --arg  username  "${RESI_USER:-}" \
         --arg  password  "${RESI_PASS:-}" \
+        --arg  type      "${RESI_TYPE:-socks5}" \
         --arg  lastVerifiedIp      "${RESI_EXIT_IP:-}" \
         --arg  lastVerifiedIspInfo "${RESI_ISP_INFO:-}" \
         --arg  lastVerifiedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         '{enabled:$enabled,global:$global,domains:$domains,urls:$urls,host:$host,port:$port,
-          username:$username,password:$password,lastVerifiedIp:$lastVerifiedIp,
+          username:$username,password:$password,type:$type,lastVerifiedIp:$lastVerifiedIp,
           lastVerifiedIspInfo:$lastVerifiedIspInfo,lastVerifiedAt:$lastVerifiedAt}' \
         > "${RESIDENTIAL_CONFIG}.tmp" \
     && chmod 600 "${RESIDENTIAL_CONFIG}.tmp" \
@@ -460,17 +517,18 @@ build_urls_json_from_config() {
         jq '.urls' "${RESIDENTIAL_CONFIG}"
         return 0
     fi
-    local h p u pw
+    local h p u pw t
     h=$(jq -r '.host // ""'     "${RESIDENTIAL_CONFIG}")
     p=$(jq -r '.port // 0'      "${RESIDENTIAL_CONFIG}")
     u=$(jq -r '.username // ""' "${RESIDENTIAL_CONFIG}")
     pw=$(jq -r '.password // ""' "${RESIDENTIAL_CONFIG}")
+    t=$(jq -r '.type // "socks5"' "${RESIDENTIAL_CONFIG}")
     if [[ -z "$h" || "$p" == "0" ]]; then
         echo "[]"
         return 0
     fi
-    jq -n --arg h "$h" --argjson p "$p" --arg u "$u" --arg pw "$pw" \
-        '[{host:$h, port:$p, username:$u, password:$pw, name:"primary"}]'
+    jq -n --arg h "$h" --argjson p "$p" --arg u "$u" --arg pw "$pw" --arg t "$t" \
+        '[{host:$h, port:$p, username:$u, password:$pw, name:"primary", type:$t}]'
 }
 
 write_singbox_config_from_state() {
@@ -496,7 +554,7 @@ write_singbox_config_from_state() {
 }
 
 add_url_to_config() {
-    local host="$1" port="$2" user="$3" pass="$4"
+    local host="$1" port="$2" user="$3" pass="$4" type="${5:-socks5}"
     if [[ ! -f "${RESIDENTIAL_CONFIG}" ]]; then
         echo '{"enabled":false,"global":false,"urls":[]}' > "${RESIDENTIAL_CONFIG}.tmp" \
         && chmod 600 "${RESIDENTIAL_CONFIG}.tmp" \
@@ -504,10 +562,10 @@ add_url_to_config() {
         chmod 600 "${RESIDENTIAL_CONFIG}"
     fi
     # name 按最终数组位置稠密重排（url-1..url-N），避免 length+1 在去重/移除后产生重名
-    jq --arg h "$host" --argjson p "$port" --arg u "$user" --arg pw "$pass" \
+    jq --arg h "$host" --argjson p "$port" --arg u "$user" --arg pw "$pass" --arg t "$type" \
         '.urls = ((.urls // [])
                   | map(select(.host != $h or .port != $p))
-                  + [{host:$h, port:$p, username:$u, password:$pw}]
+                  + [{host:$h, port:$p, username:$u, password:$pw, type:$t}]
                   | to_entries
                   | map(.value + {name: ("url-" + ((.key + 1) | tostring))}))' \
         "${RESIDENTIAL_CONFIG}" > "${RESIDENTIAL_CONFIG}.tmp" \
@@ -551,21 +609,28 @@ case "$cmd" in
 
     enable)
         if [[ "${2:-}" == "--add" ]]; then
-            [[ -z "${3:-}" ]] && { err "用法: $0 enable --add <socks5_url>"; exit 1; }
-            parse_url "$3"
-            verify "$RESI_HOST" "$RESI_PORT" "$RESI_USER" "$RESI_PASS"
+            add_url="${3:-}"
+            [[ -z "$add_url" ]] && { err "用法: $0 enable --add <url>|-（- 表示从 stdin 读一行）"; exit 1; }
+            # v3.6.0 R10: "-" → 从 stdin 读一行，凭据不进 argv（面板走这条路，ps 看不到）
+            if [[ "$add_url" == "-" ]]; then
+                IFS= read -r add_url || true
+                [[ -z "$add_url" ]] && { err "stdin 未读到代理 URL"; exit 1; }
+            fi
+            parse_url "$add_url"
+            verify "$RESI_HOST" "$RESI_PORT" "$RESI_USER" "$RESI_PASS" "$RESI_TYPE"
             ensure_singbox
-            add_url_to_config "$RESI_HOST" "$RESI_PORT" "$RESI_USER" "$RESI_PASS"
+            add_url_to_config "$RESI_HOST" "$RESI_PORT" "$RESI_USER" "$RESI_PASS" "$RESI_TYPE"
             save_config true
             write_singbox_config_from_state
             reload_relay_service
             total=$(jq '(.urls // []) | length' "${RESIDENTIAL_CONFIG}")
-            info "已新增 URL（共 ${total} 个住宅出口）"
+            info "已新增 URL（共 ${total} 个住宅出口，本条 ${RESI_TYPE}）"
             echo "$RESI_EXIT_IP"
             echo "${RESI_ISP_INFO:-}"
+            echo "$RESI_TYPE"
             exit 0
         elif [[ "${2:-}" == "--remove" ]]; then
-            [[ -z "${3:-}" ]] && { err "用法: $0 enable --remove <socks5_url>"; exit 1; }
+            [[ -z "${3:-}" ]] && { err "用法: $0 enable --remove <url>"; exit 1; }
             parse_url "$3"
             ensure_singbox
             remove_url_from_config "$RESI_HOST" "$RESI_PORT"
@@ -584,11 +649,11 @@ case "$cmd" in
             exit 0
         fi
 
-        [[ -z "${2:-}" ]] && { err "用法: $0 enable <socks5_url>"; exit 1; }
+        [[ -z "${2:-}" ]] && { err "用法: $0 enable <url>"; exit 1; }
         parse_url "$2"
-        verify "$RESI_HOST" "$RESI_PORT" "$RESI_USER" "$RESI_PASS"
+        verify "$RESI_HOST" "$RESI_PORT" "$RESI_USER" "$RESI_PASS" "$RESI_TYPE"
         ensure_singbox
-        write_singbox_config_residential "$RESI_HOST" "$RESI_PORT" "$RESI_USER" "$RESI_PASS"
+        write_singbox_config_residential "$RESI_HOST" "$RESI_PORT" "$RESI_USER" "$RESI_PASS" "$RESI_TYPE"
         reload_relay_service
         if [[ -f "${RESIDENTIAL_CONFIG}" ]]; then
             jq '.urls = []' "${RESIDENTIAL_CONFIG}" > "${RESIDENTIAL_CONFIG}.tmp" 2>/dev/null \
@@ -598,6 +663,7 @@ case "$cmd" in
         save_config true
         echo "$RESI_EXIT_IP"
         echo "${RESI_ISP_INFO:-}"
+        echo "$RESI_TYPE"
         ;;
 
     disable)
@@ -618,7 +684,10 @@ case "$cmd" in
 
     status)
         if [[ -f "${RESIDENTIAL_CONFIG}" ]]; then
-            cat "${RESIDENTIAL_CONFIG}"
+            # v3.6.0 R10: 老条目缺 type → 输出时补 socks5（读侧缺省），文件本身不动
+            status_out=$(jq 'if (.urls|type)=="array" then .urls |= map(.type = (.type // "socks5")) else . end' \
+                            "${RESIDENTIAL_CONFIG}" 2>/dev/null) \
+                && printf '%s\n' "$status_out" || cat "${RESIDENTIAL_CONFIG}"
         else
             echo '{"enabled":false,"global":false}'
         fi

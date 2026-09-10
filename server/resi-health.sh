@@ -6,8 +6,10 @@
 # 全部线路都不健康 → 不切，只 WARN（降级总比乱切好）。两次切换间隔有下限（默认 60s）。
 # 由 b-ui-resi-health.timer 每 ~2 分钟触发。
 #
-# 关键：池成员(tag + socks 凭据)直接读自 relay 自身的 socks 出站——relay 是 selector 成员 tag 的
+# 关键：池成员(tag + 凭据)直接读自 relay 自身的住宅出站——relay 是 selector 成员 tag 的
 # 唯一真源（住宅 tag 是 resi-1/resi-2，不是 residential-proxy.json 里的 url-1/url-2，别搞混）。
+# v3.6.0 R10: 住宅出站可以是 socks（SOCKS5 上游）或 http（HTTP 上游），探测按出站类型选
+# curl 的 proxy scheme（socks5h:// / http://）。
 set -u
 BASE="${RESI_HEALTH_BASE_DIR:-/opt/b-ui}"
 RELAY="$BASE/singbox-relay.json"
@@ -32,9 +34,10 @@ trap rotate_log EXIT
 # v3.6.0 R3: curl 配置文件双引号内需转义 \ 与 "
 curl_cfg_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
 # 生成 curl -K - 的配置：proxy 行 + 可选 proxy-user 行（凭据不出现在 argv 里）
-curl_socks_cfg() {
-    local host="$1" port="$2" user="$3" pass="$4"
-    printf 'proxy = "socks5h://%s:%s"\n' "$(curl_cfg_escape "$host")" "$(curl_cfg_escape "$port")"
+# v3.6.0 R10: scheme 由出站类型决定（socks→socks5h、http→http），内部常量，不来自用户输入
+curl_proxy_cfg() {
+    local scheme="$1" host="$2" port="$3" user="$4" pass="$5"
+    printf 'proxy = "%s://%s:%s"\n' "$scheme" "$(curl_cfg_escape "$host")" "$(curl_cfg_escape "$port")"
     [ -n "$user" ] && printf 'proxy-user = "%s:%s"\n' "$(curl_cfg_escape "$user")" "$(curl_cfg_escape "$pass")"
     return 0
 }
@@ -43,8 +46,8 @@ command -v jq >/dev/null 2>&1 || exit 0
 command -v curl >/dev/null 2>&1 || exit 0
 [ -f "$RELAY" ] || exit 0
 
-# 住宅上游 = relay 的 socks 出站；<2 条无可切换，退出
-nmem=$(jq -r '[.outbounds[]|select(.type=="socks")]|length' "$RELAY" 2>/dev/null || echo 0)
+# 住宅上游 = relay 的 socks / http 出站；<2 条无可切换，退出
+nmem=$(jq -r '[.outbounds[]|select(.type=="socks" or .type=="http")]|length' "$RELAY" 2>/dev/null || echo 0)
 [ "${nmem:-0}" -ge 2 ] || exit 0
 
 [ -f "$STATE" ] || echo '{}' > "$STATE"
@@ -54,6 +57,8 @@ while IFS= read -r m; do
     tag=$(echo "$m" | jq -r .tag)
     host=$(echo "$m" | jq -r '.server'); port=$(echo "$m" | jq -r '.server_port')
     user=$(echo "$m" | jq -r '.username // ""'); pass=$(echo "$m" | jq -r '.password // ""')
+    otype=$(echo "$m" | jq -r '.type // "socks"')
+    if [ "$otype" = "http" ]; then scheme="http"; else scheme="socks5h"; fi
     [ -z "$tag" ] && continue
     alltags+=("$tag")
 
@@ -71,7 +76,7 @@ while IFS= read -r m; do
     fi
     ok=0
     for _ in $(seq 1 "$TRIES"); do
-        curl_socks_cfg "$host" "$port" "$user" "$pass" \
+        curl_proxy_cfg "$scheme" "$host" "$port" "$user" "$pass" \
             | curl -s -o /dev/null --max-time "$TIMEOUT" -K - "$PROBE_URL" 2>/dev/null && ok=$((ok+1))
     done
 
@@ -90,7 +95,7 @@ while IFS= read -r m; do
     fi
     [ "$DRY_RUN" = "1" ] && log "probe ${tag} ${host}:${port}: ${ok}/${TRIES} ok → active=${active}"
     [ "$active" = "true" ] && healthy+=("$tag")
-done < <(jq -c '.outbounds[]|select(.type=="socks")|{tag,server,server_port,username,password}' "$RELAY")
+done < <(jq -c '.outbounds[]|select(.type=="socks" or .type=="http")|{tag,type,server,server_port,username,password}' "$RELAY")
 
 # v3.6.0 R6: 不再改写 relay 配置、不再重启 b-ui-relay（重启会掐断所有用户的现有连接）。
 # 只经 Clash API 读 selector 当前选择：当前线路健康就粘住；不健康才切到一条健康线路
@@ -100,7 +105,7 @@ was='[]'
 
 # alltags 是探测开始时的成员快照。探测期间管理员增删了住宅 URL（或 relay 正被改写）→ 本轮不切：
 # 那时 selector 的成员已随 relay 重写而变，探测结论与切换目标都可能已经过期，下一轮重新评估。
-nowtags=$(jq -c '[.outbounds[]|select(.type=="socks").tag]|unique' "$RELAY" 2>/dev/null || echo '[]')
+nowtags=$(jq -c '[.outbounds[]|select(.type=="socks" or .type=="http").tag]|unique' "$RELAY" 2>/dev/null || echo '[]')
 [ -n "$nowtags" ] || nowtags='[]'
 if [ "$nowtags" != "$was" ]; then
     log "住宅池成员在本轮探测期间发生变化 ${was} → ${nowtags}，本轮不切换"
