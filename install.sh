@@ -99,6 +99,7 @@ check_dependencies() {
         "jq:jq:jq"
         "dig:dnsutils:bind-utils"
         "openssl:openssl:openssl"
+        "flock:util-linux:util-linux"
     )
     
     local apt_pkgs=()
@@ -127,6 +128,14 @@ check_dependencies() {
             dnf install -y "${yum_pkgs[@]}"
         fi
         
+        # v3.6.0: 安装命令不看退出码（apt 锁/源限速/包 hold 都会静默失败），逐个复查
+        local still_missing=()
+        for cmd in "${missing_cmds[@]}"; do command -v "$cmd" &>/dev/null || still_missing+=("$cmd"); done
+        if [[ ${#still_missing[@]} -gt 0 ]]; then
+            print_error "依赖安装失败: ${still_missing[*]}（缺 jq 会让 hy2 认证卡在 http 回调面板，缺 flock 会让住宅巡检失效）"
+            print_error "请手动安装后重新运行安装脚本"
+            exit 1
+        fi
         print_success "依赖安装完成"
     fi
     

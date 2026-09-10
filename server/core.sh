@@ -660,7 +660,7 @@ EOF
 apply_hy2_userpass_auth() {
     local uf="${USERS_FILE:-${BASE_DIR}/users.json}"
     [[ -f "$uf" ]] || return 0
-    command -v jq >/dev/null 2>&1 || return 0
+    command -v jq >/dev/null 2>&1 || { print_warning "缺少 jq，hy2 认证仍走 http 回调面板（高并发时面板成单点），请安装 jq 后重跑更新"; return 0; }
     local tmp_up; tmp_up=$(mktemp)
     jq -r '.[] | "    \(.username): \(.password)"' "$uf" 2>/dev/null > "$tmp_up"
     [[ -s "$tmp_up" ]] || { rm -f "$tmp_up"; return 0; }

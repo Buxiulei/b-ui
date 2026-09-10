@@ -998,27 +998,32 @@ EOF
     # http auth 每条连接回调 b-ui-admin /auth/hysteria，几十客户端共享订阅 + 重连风暴时
     # 单线程面板成 SPOF；userpass 本地鉴权无依赖。v3.4→v3.5 迁移机的 residential 实例
     # 常卡在 http（加 unit 后没经过面板存用户）。读 users.json 就地转 userpass，幂等。
-    if [[ -f "${BASE_DIR}/users.json" ]] && command -v jq >/dev/null 2>&1; then
-        local _upf; _upf=$(mktemp)
-        jq -r '.[] | "    \(.username): \(.password)"' "${BASE_DIR}/users.json" 2>/dev/null > "$_upf"
-        if [[ -s "$_upf" ]]; then
-            local _pair _cfg _svc
-            for _pair in "config.yaml:hysteria-server" "config-residential.yaml:hysteria-residential"; do
-                _cfg="${BASE_DIR}/${_pair%%:*}"; _svc="${_pair##*:}"
-                [[ -f "$_cfg" ]] || continue
-                grep -q '^  type: http' "$_cfg" || continue
-                awk -v upfile="$_upf" '
-                    /^auth:/ {print "auth:"; print "  type: userpass"; print "  userpass:"; while ((getline line < upfile) > 0) print line; close(upfile); skip=1; next}
-                    skip && /^[a-zA-Z]/ {skip=0}
-                    !skip {print}
-                ' "$_cfg" > "${_cfg}.tmp" && mv "${_cfg}.tmp" "$_cfg"
-                chmod 644 "$_cfg"
-                systemctl is-active --quiet "$_svc" 2>/dev/null && systemctl restart "$_svc" 2>/dev/null || true
-                print_success "  ✓ ${_svc} auth http→userpass（本地鉴权，高并发更稳）"
-                updated=1
-            done
+    if [[ -f "${BASE_DIR}/users.json" ]]; then
+        # v3.6.0: 缺 jq 时不再静默跳过，明确告警（否则认证一直卡在 http 回调面板）
+        if ! command -v jq >/dev/null 2>&1; then
+            print_warning "  缺少 jq，跳过 hy2 userpass 迁移（认证仍走 http）"
+        else
+            local _upf; _upf=$(mktemp)
+            jq -r '.[] | "    \(.username): \(.password)"' "${BASE_DIR}/users.json" 2>/dev/null > "$_upf"
+            if [[ -s "$_upf" ]]; then
+                local _pair _cfg _svc
+                for _pair in "config.yaml:hysteria-server" "config-residential.yaml:hysteria-residential"; do
+                    _cfg="${BASE_DIR}/${_pair%%:*}"; _svc="${_pair##*:}"
+                    [[ -f "$_cfg" ]] || continue
+                    grep -q '^  type: http' "$_cfg" || continue
+                    awk -v upfile="$_upf" '
+                        /^auth:/ {print "auth:"; print "  type: userpass"; print "  userpass:"; while ((getline line < upfile) > 0) print line; close(upfile); skip=1; next}
+                        skip && /^[a-zA-Z]/ {skip=0}
+                        !skip {print}
+                    ' "$_cfg" > "${_cfg}.tmp" && mv "${_cfg}.tmp" "$_cfg"
+                    chmod 644 "$_cfg"
+                    systemctl is-active --quiet "$_svc" 2>/dev/null && systemctl restart "$_svc" 2>/dev/null || true
+                    print_success "  ✓ ${_svc} auth http→userpass（本地鉴权，高并发更稳）"
+                    updated=1
+                done
+            fi
+            rm -f "$_upf"
         fi
-        rm -f "$_upf"
     fi
 
     # v3.5.17 D7: 补下被 index.html 引用但缺失的 web 静态文件（自愈）
