@@ -153,6 +153,16 @@
 - `PRIVATE_CIDRS` 追加 `"::1/128"`, `"fc00::/7"`, `"fe80::/10"`。
 - `update.sh:347` 已在每次升级调用 `reapply`，中继配置自动重生成，无需额外迁移。
 
+### 3.6 引导连接按 IP（防服务器域名投毒真正生效）
+
+审查时读 sing-box v1.12/v1.13 源码（`dns/router.go` `Lookup()`）确认：出站的 `domain_resolver` / `route.default_domain_resolver` 指定了 DNS server 时，解析直接走该 transport，**不经过 `dns.rules`**，因此 `predefined` 规则只对隧道内应用查询生效，保护不到出站自身对服务器域名的解析。客户端模板 v3.5 加的"防 bootstrap 投毒"规则同样无效。
+
+处理：两侧生成器都改为"生成时解析、按 IP 连接、SNI 用域名"，解析失败回退域名（现状）。`predefined` 规则保留（仍服务应用查询）。
+
+- `web/server.js`：新增 `resolveHostV4(host)`：`host` 为域名时 `execFileSync("getent", ["ahostsv4", host])` 取第一个公网 IPv4（排除 127/10/172.16-31/192.168/169.254/0.0.0.0），进程内缓存 300 秒；失败则用 `getServerIP()`（须为公网 IPv4），再失败返回 null。`generateSingboxConfig()` 中 `mkHy2`/`mkVless` 的 `server` 用解析结果（为 null 时仍用 `host`）；`tls.server_name` 不变（hy2 为 `host`，vless 为 `userSni`）。`predefined` 规则的 answer 也用同一解析结果。
+- `b-ui-client.sh` `generate_singbox_tun_config()`：已有的 `dig +short A` / `getent ahostsv4` 解析结果（`server_ip`）非空时，出站 `server` 用该 IP，`tls.server_name` 保持 `${SNI:-$server_host}`（域名）；为空时保持域名。`domain_resolver` 行保留。
+- 风险：服务器换 IP 后旧配置失效；客户端每次开 TUN/切换节点都会重生成配置，服务端订阅每次请求都重新解析（有 300 秒缓存），风险可接受。NAT 型 VPS（`ip route get` 得到内网 IP）由"优先用域名 A 记录、`getServerIP()` 只做公网 IPv4 兜底"规避。
+
 ### 3.4 文档
 
 #### `docs/v2rayn-tun-ipv6.md`（中文）
@@ -214,6 +224,7 @@
 6. `update.sh` D9 在一份 v3.5.23 风格的样例 `config.yaml` / `config-residential.yaml` / `xray-config.json` 上执行两次：第一次产生预期改动，第二次无改动（幂等）。
 7. `docs/v2rayn-tun-ipv6.md` 存在，README 有链接。
 8. `version.json` 版本 3.6.0，changelog 有 3.6.0 条目。
+10. 引导按 IP：服务端订阅（getent 可解析或 `SERVER_IP` 公网时）出站 `server` 为 IPv4 字面量且 `tls.server_name` 为域名；客户端模板在 dig 可解析时同样；解析失败时两者回退域名（`sing-box check` 全部通过）。
 9. 用户线上验收（不在本任务内）：Linux 客户端开 TUN 后 test-ipv6.com 无 IPv6；v2rayN 按文档设置后同样。
 
 ## 7. 事实依据（2026-09-10 调研）

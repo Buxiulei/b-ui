@@ -607,6 +607,135 @@ git commit -m "docs: v2rayN TUN 模式 IPv6 设置指南(服务端仅 IPv4 出�
 
 ---
 
+### Task 6: 引导连接按 IP（服务端订阅 + 客户端模板）
+
+**Files:**
+- Modify: `web/server.js`（`generateSingboxConfig()`：`mkHy2`/`mkVless` 的 `server`、predefined answer；新增 `resolveHostV4()`）
+- Modify: `b-ui-client.sh`（`generate_singbox_tun_config()`：`safe_server` 的取值）
+- Test: `scratchpad/ipv6-tests/test_bootstrap_ip.sh`（服务端）、`scratchpad/ipv6-client-tests/test_bootstrap_ip.sh`（客户端）
+
+**Interfaces:**
+- Produces: `resolveHostV4(host): string|null`（server.js 内部，300s 缓存）。
+- Consumes: Task 1 的生成器骨架、Task 2 的 `gen_client_tun.sh`。
+
+- [ ] **Step 1（服务端）: 写测试（预期失败）**
+
+```bash
+#!/bin/bash
+set -u
+S=/tmp/claude-1000/-home-roots-b-ui/71917ef4-b1f0-4466-927f-5df467756568/scratchpad/ipv6-tests
+fail=0; T=$(mktemp -d); mkdir -p "$T/bin"
+# A. getent 可解析（stub 返回公网 IP）→ server 为该 IP，server_name 仍为域名，predefined answer 用该 IP
+printf '#!/bin/bash\n[[ "$1" == ahostsv4 ]] && echo "93.184.216.34 STREAM $2"\n' > "$T/bin/getent"; chmod +x "$T/bin/getent"
+W="$S/w_boot_a"; rm -rf "$W"; PATH="$T/bin:$PATH" bash "$S/run_server.sh" "$W" hop:on resi:list
+curl -s http://127.0.0.1:18081/api/subscription/alice > "$W/alice.json"
+jq -e '[.outbounds[]|select(.type=="hysteria2" or .type=="vless")|.server]|all(.=="93.184.216.34")' "$W/alice.json" >/dev/null || { echo "FAIL A server 未按 IP"; fail=1; }
+jq -e '.outbounds[]|select(.tag=="hy2-direct")|.tls.server_name=="proxy.example.com"' "$W/alice.json" >/dev/null || { echo "FAIL A hy2 server_name"; fail=1; }
+jq -e '.dns.rules[]|select(.action=="predefined")|.answer[0]|test("93.184.216.34")' "$W/alice.json" >/dev/null || { echo "FAIL A predefined"; fail=1; }
+"$S/check_singbox.sh" "$W/alice.json" || fail=1
+kill "$(cat "$W/pid")" 2>/dev/null
+# B. getent 失败 → 回退 SERVER_IP(203.0.113.10)
+printf '#!/bin/bash\nexit 2\n' > "$T/bin/getent"
+W="$S/w_boot_b"; rm -rf "$W"; PATH="$T/bin:$PATH" bash "$S/run_server.sh" "$W" hop:on resi:list
+curl -s http://127.0.0.1:18081/api/subscription/alice > "$W/alice.json"
+jq -e '[.outbounds[]|select(.type=="hysteria2" or .type=="vless")|.server]|all(.=="203.0.113.10")' "$W/alice.json" >/dev/null || { echo "FAIL B 未回退 SERVER_IP"; fail=1; }
+kill "$(cat "$W/pid")" 2>/dev/null
+# C. getent 失败且 SERVER_IP=127.0.0.1(兜底值) → 保持域名
+W="$S/w_boot_c"; rm -rf "$W"; PATH="$T/bin:$PATH" SERVER_IP=127.0.0.1 bash "$S/run_server.sh" "$W" hop:on resi:list
+curl -s http://127.0.0.1:18081/api/subscription/alice > "$W/alice.json"
+jq -e '[.outbounds[]|select(.type=="hysteria2" or .type=="vless")|.server]|all(.=="proxy.example.com")' "$W/alice.json" >/dev/null || { echo "FAIL C 应保持域名"; fail=1; }
+jq -e '[.dns.rules[]|select(.action=="predefined")]|length==0' "$W/alice.json" >/dev/null || { echo "FAIL C 不应有 predefined"; fail=1; }
+kill "$(cat "$W/pid")" 2>/dev/null; rm -rf "$T"
+[[ $fail == 0 ]] && echo "PASS bootstrap ip (server)" || exit 1
+```
+
+`run_server.sh` 若不透传 `SERVER_IP` 覆盖，改成 `SERVER_IP="${SERVER_IP:-203.0.113.10}"`。
+
+- [ ] **Step 2（服务端）: 实现**
+
+在 `getServerIP()` 之后加：
+
+```js
+// v3.6.0: 生成时把服务器域名解析成公网 IPv4，订阅里按 IP 连接、SNI 用域名——
+// sing-box 出站的 domain_resolver 不经过 dns.rules，predefined 防投毒规则保护不到出站自身的解析
+const _hostV4Cache = new Map();
+function isPublicV4(ip) {
+    return /^\d{1,3}(\.\d{1,3}){3}$/.test(ip) &&
+        !/^(127\.|10\.|192\.168\.|169\.254\.|0\.|172\.(1[6-9]|2\d|3[01])\.)/.test(ip);
+}
+function resolveHostV4(host) {
+    if (!host || /^\d{1,3}(\.\d{1,3}){3}$/.test(host)) return null;
+    const hit = _hostV4Cache.get(host);
+    if (hit && Date.now() - hit.ts < 300000) return hit.ip;
+    let ip = null;
+    try {
+        const out = execFileSync("getent", ["ahostsv4", host], { encoding: "utf8", timeout: 3000 });
+        ip = (out.split("\n").map(l => l.trim().split(/\s+/)[0]).find(isPublicV4)) || null;
+    } catch { }
+    if (!ip) { const s = getServerIP(); if (isPublicV4(s)) ip = s; }
+    _hostV4Cache.set(host, { ip, ts: Date.now() });
+    return ip;
+}
+```
+
+`execFileSync` 需从 `child_process` 引入（顶部 import 已有 `execFile`，补 `execFileSync`）。`generateSingboxConfig()` 里：`const dialIp = resolveHostV4(host); const dialHost = dialIp || host;`，`mkHy2`/`mkVless` 的 `server: host` → `server: dialHost`，`tls.server_name` 不动；`predefined` 条件改为 `hostIsDomain && dialIp`，answer 用 `dialIp`（去掉原来对 `getServerIP()` 的直接依赖）。
+
+- [ ] **Step 3（服务端）: 验证并提交**
+
+```bash
+node --check web/server.js && bash $S/test_bootstrap_ip.sh && bash $S/test_subscription.sh
+git add web/server.js
+git commit -m "feat(sub): sing-box 订阅出站按解析出的公网 IPv4 连接、SNI 用域名(防投毒真正生效)"
+```
+
+- [ ] **Step 4（客户端）: 写测试（预期失败）**
+
+`scratchpad/ipv6-client-tests/test_bootstrap_ip.sh`：
+
+```bash
+#!/bin/bash
+set -u
+S=/tmp/claude-1000/-home-roots-b-ui/71917ef4-b1f0-4466-927f-5df467756568/scratchpad/ipv6-client-tests
+fail=0; T=$(mktemp -d); mkdir -p "$T/bin"
+printf '#!/bin/bash\necho 93.184.216.34\n' > "$T/bin/dig"; chmod +x "$T/bin/dig"
+for proto in hysteria2 vless-reality; do
+  out="$S/boot_${proto}.json"
+  PATH="$T/bin:$PATH" bash "$S/gen_client_tun.sh" "$proto" "$out" 1 || { echo "FAIL gen $proto"; fail=1; continue; }
+  jq -e '.outbounds[]|select(.tag=="proxy-out")|.server=="93.184.216.34"' "$out" >/dev/null || { echo "FAIL $proto server 未按 IP"; fail=1; }
+  jq -e '.outbounds[]|select(.tag=="proxy-out")|.tls.server_name=="proxy.example.com"' "$out" >/dev/null || { echo "FAIL $proto server_name"; fail=1; }
+  "$S/check_singbox.sh" "$out" || fail=1
+done
+# dig 失败 → 保持域名
+printf '#!/bin/bash\nexit 1\n' > "$T/bin/dig"; printf '#!/bin/bash\nexit 2\n' > "$T/bin/getent"; chmod +x "$T/bin/getent"
+out="$S/boot_fallback.json"; PATH="$T/bin:$PATH" bash "$S/gen_client_tun.sh" hysteria2 "$out" 1
+jq -e '.outbounds[]|select(.tag=="proxy-out")|.server=="proxy.example.com"' "$out" >/dev/null || { echo "FAIL fallback"; fail=1; }
+rm -rf "$T"
+[[ $fail == 0 ]] && echo "PASS bootstrap ip (client)" || exit 1
+```
+
+- [ ] **Step 5（客户端）: 实现**
+
+`generate_singbox_tun_config()` 中，`server_predefined_rule` 计算段已得到 `server_ip`（dig/getent）。在 `local safe_server=$(json_escape "${server_host}")` 处改为：
+
+```bash
+    # v3.6.0: 解析成功则按 IP 连接、SNI 用域名（出站 domain_resolver 不经过 dns.rules，predefined 保护不到自身解析）
+    local dial_host="$server_host"
+    [[ -n "${server_ip:-}" ]] && dial_host="$server_ip"
+    local safe_server=$(json_escape "${dial_host}")
+```
+
+`safe_sni` 保持 `${SNI:-$server_host}`。`server_ip` 变量若在 `if` 分支内声明为 local，需提到函数作用域可见处（保持 dig/getent 逻辑不变）。
+
+- [ ] **Step 6（客户端）: 验证并提交**
+
+```bash
+bash -n b-ui-client.sh && bash $S/test_bootstrap_ip.sh && bash $S/test_client_tun.sh
+git add b-ui-client.sh
+git commit -m "feat(ipv6): 客户端 TUN 出站按解析出的 IP 连接、SNI 用域名(防 bootstrap 投毒真正生效)"
+```
+
+---
+
 ### Task 5: 版本 bump v3.6.0 + changelog + 全量回归
 
 **Files:**
@@ -630,7 +759,7 @@ node --check web/server.js
 node -e 'JSON.parse(require("fs").readFileSync("version.json","utf8"))'
 grep -c '"3.6.0"' version.json
 S=/tmp/claude-1000/-home-roots-b-ui/71917ef4-b1f0-4466-927f-5df467756568/scratchpad
-bash $S/ipv6-tests/test_subscription.sh && bash $S/ipv6-tests/test_client_tun.sh && bash $S/ipv6-tests/test_server_egress.sh
+bash $S/ipv6-tests/test_subscription.sh && bash $S/ipv6-tests/test_bootstrap_ip.sh && bash $S/ipv6-tests/test_server_egress.sh && bash $S/ipv6-client-tests/test_client_tun.sh && bash $S/ipv6-client-tests/test_bootstrap_ip.sh
 bash $S/resi-tests/test_domains.sh && bash $S/resi-tests/test_lock_cooldown.sh && bash $S/resi-tests/test_creds.sh
 bash $S/restart-tests/test_mport.sh && bash $S/restart-tests/test_restart_gate.sh && bash $S/restart-tests/test_auto_update.sh && bash $S/restart-tests/test_deps.sh
 git status --short   # 只应有 version.json
