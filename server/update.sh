@@ -498,21 +498,24 @@ EOF
     chmod 644 "$config_file"
 }
 
-# residential-proxy.json 关键词迁移（v3.4.17 → v3.4.18）
-# 老默认 10 个含 "google" "googleapis" "gstatic"（粗匹配 → 全站误伤 + urltest 自循环）
-# 新默认精化为 AI/敏感站点 24 个
+# residential-proxy.json 关键词迁移
+# v3.4.17 老默认 10 个含 "google" "googleapis" "gstatic"（粗匹配 → 全站误伤 + urltest 自循环）；
+# v3.4.18 的迁移把当时的 25 个关键词**固化**写进配置。
+# v3.6.0 R1 起 domains == null 就是"跟随 helper 实时默认"（residential-helper.sh DEFAULT_DOMAINS
+# 是唯一默认表，helper 的 domains 子命令输出它，web/server.js 订阅生成器也从这里取），
+# 固化的旧表反而会盖掉新默认。所以本块不再写任何硬编码列表：
+#   - domains == null                    → 不动（已经跟随 helper 默认）
+#   - domains 精确等于老默认 10 / 25 个   → 置 null（这两份都是老迁移写的，管理员不会手打出来）
+#   - 其它（管理员自定义）                → 原样保留，仅在含老粗关键词时提示
 migrate_residential_keywords() {
     local cfg="${BASE_DIR}/residential-proxy.json"
     [[ -f "$cfg" ]] || return 0
     command -v jq >/dev/null 2>&1 || return 0
 
-    # 旧默认列表（v3.4.17 及之前，保序）
-    local legacy_default
-    legacy_default=$(jq -nc '["openai","chatgpt","google","googleapis","gstatic","anthropic","claude","ping0","grok","tiktok"]')
-
-    # 新默认列表（必须与 residential-helper.sh DEFAULT_DOMAINS 完全一致）
-    local new_default
-    new_default=$(jq -nc '[
+    # 两份历史默认列表（保序，只用于比对，绝不作为写入源）
+    local legacy_v3_4_17 legacy_v3_4_18
+    legacy_v3_4_17=$(jq -nc '["openai","chatgpt","google","googleapis","gstatic","anthropic","claude","ping0","grok","tiktok"]')
+    legacy_v3_4_18=$(jq -nc '[
         "openai","chatgpt","oai","oaistatic",
         "anthropic","claude",
         "aistudio","generativelanguage","gemini.google","makersuite",
@@ -526,25 +529,21 @@ migrate_residential_keywords() {
     local current
     current=$(jq -c '.domains // null' "$cfg" 2>/dev/null || echo "null")
 
-    # 已经是新默认 → 无需任何动作（防止重复打印）
-    if [[ "$current" == "$new_default" ]]; then
-        return 0
-    fi
+    # 已经跟随 helper 默认 → 无需任何动作（防止重复打印）
+    [[ "$current" == "null" ]] && return 0
 
-    # 自动迁移条件：用户从未自定义
-    #   1) domains == null（老服务器初始化时就这样）
-    #   2) domains 精确等于老默认 10 个（保序对比）
-    local should_auto_replace=0
-    if [[ "$current" == "null" ]] || [[ "$current" == "$legacy_default" ]]; then
-        should_auto_replace=1
-    fi
-
-    if [[ "$should_auto_replace" == "1" ]]; then
+    if [[ "$current" == "$legacy_v3_4_17" ]] || [[ "$current" == "$legacy_v3_4_18" ]]; then
         local tmp="${cfg}.tmp.$$"
-        if jq --argjson nd "$new_default" '.domains = $nd' "$cfg" > "$tmp" 2>/dev/null; then
+        if jq '.domains = null' "$cfg" > "$tmp" 2>/dev/null; then
             mv "$tmp" "$cfg"
             chmod 600 "$cfg"
-            print_info "  ✓ 住宅代理分流关键词已升级为 v3.4.18 默认（24 个 AI / 敏感站点关键词）"
+            print_info "  ✓ 住宅关键字表回到跟随 helper 默认（domains = null）"
+            # 关键字变了 → singbox-relay.json 的 domain_keyword 规则要按新默认重生成。
+            # "已是最新版本"路径之后不会再调 reapply，这里补一次；
+            # reapply 只在中继配置/unit 真变化时才重启 relay，稳态不掐连接。
+            if [[ -f "${BASE_DIR}/residential-helper.sh" ]]; then
+                bash "${BASE_DIR}/residential-helper.sh" reapply 2>/dev/null || true
+            fi
         else
             rm -f "$tmp"
         fi
@@ -682,7 +681,9 @@ migrate_ipv4_only_egress() {
     if [[ -f "$cfg" ]] && ! grep -qE '^outbounds:' "$cfg"; then
         cp "$cfg" "${cfg}.bak.v360.${ts}"
         printf '\n# v3.6.0: 出站只走 IPv4（VPS 无 IPv6 出口）\noutbounds:\n  - name: direct\n    type: direct\n    direct:\n      mode: 4\n' >> "$cfg"
-        systemctl restart hysteria-server 2>/dev/null || true
+        # 只重启"本来就在跑"的实例：证书未就绪时 hy2 是被人为停掉的，
+        # 这里 start 它只会撞上 Restart=always 崩溃循环（配置照样已迁移）
+        systemctl is-active --quiet hysteria-server 2>/dev/null && systemctl restart hysteria-server 2>/dev/null || true
         print_success "  ✓ D9 config.yaml 出站 IPv4-only (direct mode 4)"
         updated=1
     fi
@@ -710,7 +711,7 @@ migrate_ipv4_only_egress() {
           }
           { print }' "$rcfg" > "${rcfg}.tmp" && mv "${rcfg}.tmp" "$rcfg" && chmod 644 "$rcfg"
         if grep -qE '^[[:space:]]+mode: 4$' "$rcfg"; then
-            systemctl restart hysteria-residential 2>/dev/null || true
+            systemctl is-active --quiet hysteria-residential 2>/dev/null && systemctl restart hysteria-residential 2>/dev/null || true
             print_success "  ✓ D9 config-residential.yaml direct 出站 IPv4-only"
             updated=1
         else
@@ -724,14 +725,17 @@ migrate_ipv4_only_egress() {
 
     # 只在「direct 是 freedom 且缺 ForceIPv4」时才动手：下面的 jq map 只改 freedom，
     # 若按 domainStrategy 单独判定，遇到非 freedom 的 direct 会每次 update 都备份+重启却改不动
-    if [[ -f "$xcfg" ]] && command -v jq >/dev/null 2>&1 && \
+    # v3.6.0: 缺 jq 时不再静默跳过，明确告警（否则 xray 直连出站一直会去拨必失败的 IPv6）
+    if [[ -f "$xcfg" ]] && ! command -v jq >/dev/null 2>&1; then
+        print_warning "  D9: 缺少 jq，跳过 xray ForceIPv4 迁移"
+    elif [[ -f "$xcfg" ]] && \
        jq -e '.outbounds[]?|select(.tag=="direct" and .protocol=="freedom" and (.settings.domainStrategy // "") != "ForceIPv4")' \
           "$xcfg" >/dev/null 2>&1; then
         cp "$xcfg" "${xcfg}.bak.v360.${ts}"
         if jq '.outbounds |= map(if .tag=="direct" and .protocol=="freedom" then .settings = ((.settings // {}) + {domainStrategy:"ForceIPv4"}) else . end)' \
               "$xcfg" > "${xcfg}.tmp" 2>/dev/null && [[ -s "${xcfg}.tmp" ]]; then
             mv "${xcfg}.tmp" "$xcfg" && chmod 644 "$xcfg"
-            systemctl restart xray 2>/dev/null || true
+            systemctl is-active --quiet xray 2>/dev/null && systemctl restart xray 2>/dev/null || true
             print_success "  ✓ D9 xray direct 出站 ForceIPv4"
             updated=1
         else
@@ -910,7 +914,7 @@ MemoryMax=700M
 # 启动前清理"仅本实例"的孤儿端口跳跃 NAT 链（base 端口从 config.yaml listen 提取，支持自定义端口）
 # hysteria 内置端口跳跃用 iptables/ip6tables 的 HYSTERIA-PR-<hash> 链；SIGKILL/OOM 残留时，
 # 下次启动 ip6tables -N 报 "Chain already exists" → FATAL 崩溃循环（v3.5.13 实测踩坑）。
-# 只清 --to-ports <base> 的链，绝不碰住宅实例（:40000）。`-` 前缀使清理失败不致命。
+# 只清 --to-ports <base> 的链，绝不碰住宅实例（:40000）。\`-\` 前缀使清理失败不致命。
 ExecStartPre=-/opt/b-ui/hy2-portjump-cleanup.sh ${config_file}
 
 # 给 hy2 充足时间走完 closer chain 删自己的 NAT 链（正常 <1s）
@@ -1416,11 +1420,11 @@ EOF
         updated=1
     fi
 
-    # 迁移 residential-proxy.json 关键词（v3.4.18）
+    # 迁移 residential-proxy.json 关键词
     # 老默认 10 个含 google/googleapis/gstatic（全站误伤 + urltest 自循环风险）
-    # 新默认 24 个 AI/敏感站点精准 keyword
-    # 策略：
-    #   - 用户从未自定义（domains == null 或精确等于老默认）→ 自动迁移到新默认
+    # 策略（v3.6.0 R1：null 即跟随 helper 实时默认，本块不写任何硬编码列表）：
+    #   - domains == null → 不动
+    #   - domains 精确等于历史默认 10 / 25 个 → 置 null，回到跟随 helper 默认
     #   - 用户已自定义 → 保留原样，仅打印提示让用户决定（这是用户数据，不强制覆盖）
     migrate_residential_keywords
 

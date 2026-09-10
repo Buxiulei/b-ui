@@ -33,12 +33,12 @@ RELAY_SERVICE="b-ui-relay"
 RELAY_UNIT="${RELAY_UNIT_FILE:-/etc/systemd/system/${RELAY_SERVICE}.service}"
 RELAY_LOCK="${BASE_DIR}/.relay.lock"
 
-# v3.6.0 R2: 写路径互斥（与 resi-health.sh 共用同一把锁）；持锁到进程退出
+# v3.6.0 R2: 写路径互斥（同一把锁只在并发的 residential-helper 之间抢）；持锁到进程退出
 acquire_relay_lock() {
     command -v flock >/dev/null 2>&1 || { err "缺少 flock (util-linux)，无法安全写入住宅配置"; exit 1; }
     exec 9>"${RELAY_LOCK}"
     chmod 600 "${RELAY_LOCK}" 2>/dev/null || true
-    flock -w 30 9 || { err "获取 relay 锁超时(30s)，可能有另一个 residential-helper/resi-health 在运行"; exit 1; }
+    flock -w 30 9 || { err "获取 relay 锁超时(30s)，可能有另一个 residential-helper 在运行"; exit 1; }
 }
 
 PRIVATE_CIDRS='["127.0.0.0/8","10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","169.254.0.0/16","::1/128","fc00::/7","fe80::/10"]'
@@ -46,6 +46,9 @@ PRIVATE_CIDRS='["127.0.0.0/8","10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","169
 RED='\033[0;31m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 err()  { echo -e "${RED}ERROR: $*${NC}" >&2; }
 info() { echo -e "${BLUE}$*${NC}" >&2; }
+
+# v3.6.0: 文件摘要（文件不存在 → 空串，与任何真实摘要都不相等 → 视为有变化）
+file_digest() { [[ -f "$1" ]] && md5sum "$1" 2>/dev/null | awk '{print $1}' || echo ""; }
 
 # v3.6.0 R3: curl 配置文件双引号内需转义 \ 与 "
 curl_cfg_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
@@ -616,15 +619,24 @@ case "$cmd" in
 
     reapply)
         ensure_singbox
-        write_singbox_config_from_state
         # start_relay_service 会重写 unit（升级迁移依赖它），但 enable --now 不会重启"已在跑"的实例。
         # v3.6.0 R6: 新配置(selector + clash_api)必须真正加载——否则升级后巡检永远拿不到 Clash API，
-        # 热切换形同虚设。已在跑的实例显式 restart 一次（升级本来就会重启 hy2/xray，一次性代价）。
+        # 热切换形同虚设；但无条件 restart 会让每次版本升级都掐断全部住宅连接。
+        # 所以取"改前/改后"摘要，只有中继配置或 unit 真的变了才重启已在跑的实例（稳态 = 零重启）。
         relay_was_active=0
         systemctl is-active --quiet "${RELAY_SERVICE}" 2>/dev/null && relay_was_active=1
+        relay_cfg_before=$(file_digest "${SINGBOX_CONFIG}")
+        relay_unit_before=$(file_digest "${RELAY_UNIT}")
+        write_singbox_config_from_state
         start_relay_service
         if [ "$relay_was_active" = "1" ]; then
-            systemctl restart "${RELAY_SERVICE}" 2>/dev/null || true
+            if [ "$(file_digest "${SINGBOX_CONFIG}")" != "$relay_cfg_before" ] || \
+               [ "$(file_digest "${RELAY_UNIT}")" != "$relay_unit_before" ]; then
+                systemctl restart "${RELAY_SERVICE}" 2>/dev/null || true
+                info "b-ui-relay 配置/unit 有变化，已重启"
+            else
+                info "b-ui-relay 配置与 unit 无变化，保持运行（不掐断住宅连接）"
+            fi
         fi
         ;;
 
