@@ -510,10 +510,14 @@ function getResidentialConfig() {
         if (fs.existsSync(CONFIG.residentialConfig)) {
             const r = JSON.parse(fs.readFileSync(CONFIG.residentialConfig, "utf8"));
             const urls = Array.isArray(r.urls) ? r.urls : [];
+            const enabled = r.enabled === true && urls.length > 0;
             return {
-                enabled: r.enabled === true && urls.length > 0,
+                enabled,
                 global: r.global === true,
-                domains: (Array.isArray(r.domains) && r.domains.length > 0) ? r.domains : getEffectiveResidentialDomains()
+                // 未启用（关闭或空池）时不给关键字：中继此时 fail-open 直连，
+                // 订阅再发分流规则只是把流量导向一个直连池，纯噪声（保持 main 的行为）
+                domains: !enabled ? []
+                    : (Array.isArray(r.domains) && r.domains.length > 0) ? r.domains : getEffectiveResidentialDomains()
             };
         }
     } catch { }

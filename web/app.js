@@ -297,16 +297,22 @@ function genUri(x) {
         // URL 末尾的 #备注 会被 v2rayNG 识别为订阅名称（不编码）
         return "https://" + host + "/api/sub/" + x.username + "#" + x.username;
     }
+    // v3.6.0: 单协议用户按 residential 选直连版/住宅版端口与备注，
+    // 判定与 server.js /api/sub 的 includeResi 完全一致（未设 residential 视为开）
+    const includeResi = x.residential !== false;
     if (x.protocol === "vless-reality") {
         // sni 以服务端实时 reality 配置(cfg.sni)为准，user.sni 是建用户时的旧拷贝。
         // 改伪装后只动 xray-config、不回写老用户 sni；若优先 user.sni 会下发旧 sni →
         // 与服务端 serverNames 不匹配 → REALITY received real certificate → 连不上。
         // (与 server.js v3.5.13 订阅修复保持一致，避免"复制链接"路径重蹈覆辙)
         const userSni = cfg.sni || x.sni || "www.bing.com";
-        return "vless://" + x.uuid + "@" + cfg.domain + ":" + cfg.xrayPort +
-            "?encryption=none&flow=xtls-rprx-vision&security=reality&sni=" + userSni +
-            "&fp=chrome&pbk=" + cfg.pubKey + "&sid=" + cfg.shortId + "&spx=%2F&type=tcp#" +
-            encodeURIComponent(x.username);
+        // 参数顺序与 /api/sub 的 buildVlessUrl 逐字节一致，方便与订阅比对
+        const vlessParams = "security=reality&encryption=none&pbk=" + cfg.pubKey +
+            "&headerType=&fp=chrome&spx=%2F&type=tcp&flow=xtls-rprx-vision&sni=" + userSni +
+            "&sid=" + cfg.shortId;
+        return "vless://" + x.uuid + "@" + cfg.domain + ":" +
+            (includeResi ? 10002 : (cfg.xrayPort || 10001)) + "?" + vlessParams + "#" +
+            encodeURIComponent(x.username + "-" + (includeResi ? "Reality住宅" : "Reality直连"));
     }
     if (x.protocol === "vless-ws-tls") {
         const hostSni = x.sni || "www.bing.com";
@@ -317,18 +323,26 @@ function genUri(x) {
             encodeURIComponent(x.username);
     }
     // Hysteria2: v2rayN 兼容格式
-    // v2rayN 格式：整个 username:password 一起编码（冒号也编码为 %3A）
-    const auth = encodeURIComponent(x.username + ":" + x.password);
+    // 分段 encode（与 /api/sub 一致：整串编码会把 : 变成 %3A，客户端拆不出 user/pass）
+    const auth = encodeURIComponent(x.username) + ":" + encodeURIComponent(x.password);
 
-    // 查询参数构建
-    let queryParams = "sni=" + cfg.domain + "&insecure=0&allowInsecure=0";
+    // 住宅版固定 :40000 + 41000-50000 内建跳跃；直连版用真实 listen 端口与跳跃区间
+    const port = includeResi ? 40000 : (cfg.port || 10000);
+    const hopRange = includeResi
+        ? "41000-50000"
+        : (cfg.portHopping && cfg.portHopping.enabled ? cfg.portHopping.start + "-" + cfg.portHopping.end : null);
 
+    // 查询参数构建（顺序与 /api/sub 的 buildHy2Url 一致）
+    let queryParams = "sni=" + cfg.domain + "&insecure=0";
     // 端口跳跃使用 mport 参数（v2rayN 格式）
-    if (cfg.portHopping && cfg.portHopping.enabled) {
-        queryParams += "&mport=" + cfg.portHopping.start + "-" + cfg.portHopping.end;
+    if (hopRange) queryParams += "&mport=" + hopRange;
+    // salamander obfs 只有直连实例有（cmd_obfs on 只改 config.yaml，hysteria-residential 没有）
+    if (!includeResi && cfg.obfs && cfg.obfs.enabled && cfg.obfs.type === "salamander" && cfg.obfs.password) {
+        queryParams += "&obfs=salamander&obfs-password=" + encodeURIComponent(cfg.obfs.password);
     }
 
-    return "hysteria2://" + auth + "@" + cfg.domain + ":" + cfg.port + "?" + queryParams + "#" + encodeURIComponent(x.username);
+    return "hysteria2://" + auth + "@" + cfg.domain + ":" + port + "?" + queryParams + "#" +
+        encodeURIComponent(x.username + "-" + (includeResi ? "HY2住宅" : "HY2直连"));
 }
 
 // 当前显示的用户名 (用于下载订阅)
