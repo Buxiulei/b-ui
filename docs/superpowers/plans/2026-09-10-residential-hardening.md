@@ -489,3 +489,133 @@ kill "$(cat $W/pid)"
 git add server/residential-helper.sh server/resi-health.sh web/server.js
 git commit -m "fix(residential): SOCKS5 凭据改经 stdin 传给 curl,不再出现在命令行"
 ```
+
+
+---
+
+### Task 4: R4 中继显式处理 UDP
+
+**Files:**
+- Modify: `server/residential-helper.sh`（`write_singbox_config_residential_multi` 与 `write_singbox_config_direct` 的 `route.rules`）
+- Test: `scratchpad/resi-tests/test_udp_rules.sh`
+
+- [ ] **Step 1: 写测试（预期失败）**
+
+```bash
+#!/bin/bash
+set -u
+S=/tmp/claude-1000/-home-roots-b-ui/71917ef4-b1f0-4466-927f-5df467756568/scratchpad
+REPO=/home/roots/b-ui; fail=0; T=$(mktemp -d); mkdir -p "$T/bin"
+printf '#!/bin/bash\nexit 0\n' > "$T/bin/systemctl"; chmod +x "$T/bin/systemctl"; export PATH="$T/bin:$PATH"
+printf '#!/bin/bash\necho sing-box version 1.13.19\n' > "$T/sing-box"; chmod +x "$T/sing-box"
+check_rules() { # $1 文件
+  jq -e '(.route.rules|map(select(.network=="udp"))) as $u
+     | ($u|length)==3
+     and $u[0]=={"network":"udp","port":53,"outbound":"direct"}
+     and $u[1]=={"network":"udp","port":443,"action":"reject"}
+     and $u[2]=={"network":"udp","outbound":"direct"}' "$1" >/dev/null || { echo "FAIL $1 udp 规则"; fail=1; }
+  # 顺序：sniff 之后、第一条 ip_cidr 之前
+  jq -e '(.route.rules|map(has("network"))|index(true)) > (.route.rules|map(.action=="sniff")|index(true))
+     and (.route.rules|map(has("network"))|index(true)) < (.route.rules|map(has("ip_cidr"))|index(true))' "$1" >/dev/null || { echo "FAIL $1 顺序"; fail=1; }
+}
+for mode in multi direct; do
+  if [[ $mode == multi ]]; then echo '{"enabled":true,"global":true,"domains":null,"urls":[{"host":"1.2.3.4","port":1080,"username":"u","password":"p","name":"url-1"},{"host":"1.2.3.5","port":1080,"username":"u","password":"p","name":"url-2"}]}' > "$T/residential-proxy.json"
+  else echo '{"enabled":false,"global":false,"urls":[]}' > "$T/residential-proxy.json"; fi
+  BASE_DIR="$T" bash "$REPO/server/residential-helper.sh" reapply >/dev/null 2>&1
+  check_rules "$T/singbox-relay.json"
+  for bin in /usr/bin/sing-box "$S/singbox-bins/v1.14.0/sing-box" "$S/singbox-bins/v1.15.0-alpha.2/sing-box"; do
+    out=$("$bin" check -c "$T/singbox-relay.json" 2>&1) && ! grep -qi deprecated <<<"$out" || { echo "FAIL $mode check $bin: $out"; fail=1; }
+  done
+done
+rm -rf "$T"; [[ $fail == 0 ]] && echo "PASS udp rules" || exit 1
+```
+
+- [ ] **Step 2: 运行确认失败** → Run: `bash $S/resi-tests/test_udp_rules.sh` → Expected: udp 规则 FAIL。
+
+- [ ] **Step 3: 实现**
+
+两个写函数的 jq 模板里，`[{"action": "sniff"}, {"ip_cidr": …}]` 之间插入：
+
+```json
+{"network": "udp", "port": 53, "outbound": "direct"},
+{"network": "udp", "port": 443, "action": "reject"},
+{"network": "udp", "outbound": "direct"}
+```
+
+并在模板上方加注释：`# v3.6.0 R4: 住宅 SOCKS5 基本不支持 UDP ASSOCIATE —— DNS 直连、QUIC 拒绝(浏览器回退 TCP 走住宅)、其余 UDP 直连`。
+
+- [ ] **Step 4: 验证并提交**
+
+```bash
+bash -n server/residential-helper.sh && bash $S/resi-tests/test_udp_rules.sh && bash $S/resi-tests/test_domains.sh && bash $S/resi-tests/test_lock_cooldown.sh
+git add server/residential-helper.sh
+git commit -m "fix(residential): 中继显式处理 UDP(53 直连/443 拒绝/其余直连),global 模式下 DNS/QUIC 不再塞进住宅 SOCKS5"
+```
+
+---
+
+### Task 5: R5 三层探测降频
+
+**Files:**
+- Modify: `server/residential-helper.sh`（urltest 字段）、`server/resi-health.sh`（默认值）、`server/update.sh`（D8 timer 文本 + 既有 timer 幂等补丁）、`web/server.js`（`generateSingboxConfig` 的 `urltest()`）
+- Test: `scratchpad/resi-tests/test_probe_rate.sh`
+
+- [ ] **Step 1: 写测试（预期失败）**
+
+```bash
+#!/bin/bash
+set -u
+S=/tmp/claude-1000/-home-roots-b-ui/71917ef4-b1f0-4466-927f-5df467756568/scratchpad
+REPO=/home/roots/b-ui; fail=0; T=$(mktemp -d); mkdir -p "$T/bin"
+printf '#!/bin/bash\nexit 0\n' > "$T/bin/systemctl"; chmod +x "$T/bin/systemctl"; export PATH="$T/bin:$PATH"
+printf '#!/bin/bash\necho sing-box version 1.13.19\n' > "$T/sing-box"; chmod +x "$T/sing-box"
+echo '{"enabled":true,"global":false,"domains":null,"urls":[{"host":"1.2.3.4","port":1080,"username":"u","password":"p","name":"url-1"},{"host":"1.2.3.5","port":1080,"username":"u","password":"p","name":"url-2"}]}' > "$T/residential-proxy.json"
+BASE_DIR="$T" bash "$REPO/server/residential-helper.sh" reapply >/dev/null 2>&1
+jq -e '.outbounds[]|select(.tag=="resi-pool")|.interval=="3m" and .tolerance==500 and .idle_timeout=="30m"' "$T/singbox-relay.json" >/dev/null || { echo "FAIL relay urltest"; fail=1; }
+# 订阅
+W="$S/resi-tests/w_rate"; rm -rf "$W"; bash "$S/ipv6-tests/run_server.sh" "$W" hop:on resi:list
+curl -s http://127.0.0.1:18081/api/subscription/alice > "$W/a.json"
+jq -e '[.outbounds[]|select(.type=="urltest")]|all(.interval=="60s" and .interrupt_exist_connections==false and .tolerance==100)' "$W/a.json" >/dev/null || { echo "FAIL 订阅 urltest"; fail=1; }
+kill "$(cat "$W/pid")" 2>/dev/null
+# 巡检默认值
+grep -qE '^TRIES="\$\{RESI_HEALTH_TRIES:-2\}"' "$REPO/server/resi-health.sh" && grep -qE '^OK_NEED="\$\{RESI_HEALTH_OK_NEED:-1\}"' "$REPO/server/resi-health.sh" || { echo "FAIL health 默认值"; fail=1; }
+# timer 文本（新装）与既有 timer 补丁
+grep -q 'RandomizedDelaySec=30s' "$REPO/server/update.sh" || { echo "FAIL timer 文本"; fail=1; }
+mkdir -p "$T/sysd"; printf '[Unit]\nDescription=B-UI Residential Health Timer\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=2min\nAccuracySec=20s\nPersistent=true\n[Install]\nWantedBy=timers.target\n' > "$T/sysd/b-ui-resi-health.timer"
+extract() { sed -n "/^$1() {/,/^}/p" "$REPO/server/update.sh"; }
+{ grep -E '^(RED|GREEN|YELLOW|BLUE|NC)=' "$REPO/server/update.sh" | head -5; for f in print_info print_success print_warning patch_resi_health_timer; do extract "$f"; done; } > "$T/u.sh"
+( source "$T/u.sh"; RESI_HEALTH_TIMER_FILE="$T/sysd/b-ui-resi-health.timer" patch_resi_health_timer ) >/dev/null 2>&1
+grep -q 'RandomizedDelaySec=30s' "$T/sysd/b-ui-resi-health.timer" || { echo "FAIL 既有 timer 未补"; fail=1; }
+cp "$T/sysd/b-ui-resi-health.timer" "$T/t1"; ( source "$T/u.sh"; RESI_HEALTH_TIMER_FILE="$T/sysd/b-ui-resi-health.timer" patch_resi_health_timer ) >/dev/null 2>&1
+cmp -s "$T/t1" "$T/sysd/b-ui-resi-health.timer" || { echo "FAIL timer 补丁不幂等"; fail=1; }
+rm -rf "$T"; [[ $fail == 0 ]] && echo "PASS probe rate" || exit 1
+```
+
+- [ ] **Step 2: 运行确认失败** → Run: `bash $S/resi-tests/test_probe_rate.sh` → Expected: 四类断言 FAIL。
+
+- [ ] **Step 3: 实现**
+
+- `residential-helper.sh` urltest：`"interval": "3m", "tolerance": 500, "idle_timeout": "30m"`，注释 `# v3.6.0 R5: sing-box 默认 3m；10s 会让每个住宅 IP 每分钟被打 6 次，且 50ms 容忍导致会话内换 IP`。
+- `resi-health.sh`：`TRIES` 默认 2、`OK_NEED` 默认 1；头部注释同步。
+- `update.sh`：D8 块的 timer heredoc 在 `AccuracySec=20s` 后加 `RandomizedDelaySec=30s`；新增函数
+  ```bash
+  # v3.6.0 R5: 既有 timer 补随机抖动（幂等）
+  patch_resi_health_timer() {
+      local f="${RESI_HEALTH_TIMER_FILE:-/etc/systemd/system/b-ui-resi-health.timer}"
+      [[ -f "$f" ]] || return 0
+      grep -q '^RandomizedDelaySec=' "$f" && return 0
+      sed -i '/^AccuracySec=/a RandomizedDelaySec=30s' "$f" && systemctl daemon-reload 2>/dev/null || true
+      print_success "  ✓ b-ui-resi-health.timer 加随机抖动 30s"
+  }
+  ```
+  在 D8 块末尾（timer 存在分支）调用。
+- `web/server.js` `urltest()`：`interval: "60s"`, `tolerance: 100`, `interrupt_exist_connections: false`（注释同上）。
+
+- [ ] **Step 4: 验证并提交**
+
+```bash
+bash -n server/residential-helper.sh server/resi-health.sh server/update.sh && node --check web/server.js
+bash $S/resi-tests/test_probe_rate.sh && bash $S/resi-tests/test_udp_rules.sh && bash $S/resi-tests/test_lock_cooldown.sh && bash $S/ipv6-tests/test_subscription.sh
+git add server/residential-helper.sh server/resi-health.sh server/update.sh web/server.js
+git commit -m "fix(residential): 三层探测降频(中继 3m/500ms, 订阅 60s 不打断连接, 巡检 2 次+timer 抖动)"
+```

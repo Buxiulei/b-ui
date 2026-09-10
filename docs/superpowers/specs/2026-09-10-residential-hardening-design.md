@@ -75,6 +75,27 @@ proxy-user = "USER:PASS"
 - `web/server.js` `residential/health`：`execFile("curl", ["-K", "-", "-m", "8", "-sS", "<url>"], …)` 得到 `ChildProcess`，向 `child.stdin` 写入上述两行后 `end()`；转义函数 `curlCfgEscape(s)`。回调逻辑不变。
 - 验证：`ps -o args` 在探测期间不含密码；行为与改前一致（用一个本地 socks5 stub 或对比 `curl` dry-run 输出）。
 
+### R4 中继显式处理 UDP（住宅 SOCKS5 基本不支持 UDP ASSOCIATE）
+
+来源：住宅最佳实践调研 P0-1。现状：中继 route 无任何 `network: udp` 规则；`global=true` 时 `final: resi-pool`，客户端的 QUIC(443/udp) 与 DNS(53/udp) 全被塞进住宅 SOCKS5；RFC1928 允许服务器不支持 UDP ASSOCIATE，主流住宅供应商未文档化 UDP 能力。
+
+- `residential-helper.sh` 两个 `write_singbox_config_*` 的 `route.rules` 在 `sniff` 之后、私网规则之前插入（顺序固定）：
+  1. `{"network": "udp", "port": 53, "outbound": "direct"}` — DNS 走 VPS 直连；
+  2. `{"network": "udp", "port": 443, "action": "reject"}` — QUIC 立即拒绝，浏览器回退 TCP，TCP 仍按后续规则走住宅；
+  3. `{"network": "udp", "outbound": "direct"}` — 其余 UDP（游戏/STUN 等）直连 fail-open。
+- 直连模式（空池）也加同样三条（行为一致，便于测试）。
+- 不改 Hysteria2 ACL 与 Xray 配置：hy2 住宅实例的 socks5 出站与 xray relay 出站的 UDP 都进中继，由中继统一裁决。
+- 已知取舍：global 模式下非 QUIC 的 UDP 会用 VPS IP 出去（与 TCP 的住宅身份不一致）；对 AI 服务无影响（只用 TCP/QUIC）。
+
+### R5 三层探测降频
+
+来源：住宅最佳实践调研 P0-2。现状：中继 urltest `interval: 10s` / `tolerance: 50`；客户端 sing-box 订阅 urltest `interval: 10s` 且 `interrupt_exist_connections: true`；巡检每 2 分钟 × 3 次 curl。sing-box 官方默认 `3m / 50 / idle 30m`；Bright Data 按每 IP 请求速率限流（429）。
+
+- 中继（`residential-helper.sh` urltest）：`interval: "3m"`，`tolerance: 500`（毫秒；避免延迟抖动引起出口漂移），`idle_timeout: "30m"`（显式写出，默认值）。
+- 客户端 sing-box 订阅（`web/server.js` `generateSingboxConfig` 的 `urltest()`）：`interval: "60s"`，`interrupt_exist_connections: false`，`tolerance: 100`。Clash 订阅已是 300s，不动。
+- 巡检（`resi-health.sh`）：默认 `TRIES=2`、`OK_NEED=1`（一轮内任一成功即健康，迟滞仍是 2 轮）；`update.sh` 的 `b-ui-resi-health.timer` 加 `RandomizedDelaySec=30s`（新装与既有 timer 文件都要有：D8 块生成的 unit 文本加此行，并对已存在但缺该行的 timer 做一次幂等补丁 + `daemon-reload`）。
+- 验收：生成的中继配置三版 `sing-box check` 通过；订阅 JSON 的 urltest 字段断言；resi-health 用 stub 跑一轮，日志/状态符合新默认；timer 文本含 `RandomizedDelaySec`。
+
 ## 3. 文件改动清单
 
 | 文件 | 改动 |
@@ -84,11 +105,22 @@ proxy-user = "USER:PASS"
 | `web/server.js` | `getEffectiveResidentialDomains()`；`getResidentialConfig()` 回退；删内联 `DEFAULT_DOMAINS`；`residential/health` 的 curl 改 stdin 配置 |
 | `version.json` | changelog 3.6.0 里三条（随 IPv6 提交一起 bump） |
 
+## 3b. R4/R5 文件改动
+
+| 文件 | 改动 |
+|---|---|
+| `server/residential-helper.sh` | 两个写函数：route.rules 插入三条 UDP 规则；urltest `interval 3m` / `tolerance 500` / `idle_timeout 30m` |
+| `server/resi-health.sh` | `TRIES` 默认 2、`OK_NEED` 默认 1 |
+| `server/update.sh` | D8 timer 文本加 `RandomizedDelaySec=30s`；既有 timer 缺该行则补（幂等） |
+| `web/server.js` | `generateSingboxConfig` `urltest()`：`interval "60s"`、`interrupt_exist_connections false`、`tolerance 100` |
+
 ## 4. 提交拆分
 
 1. `fix(residential): 订阅域名回退与服务端中继一致`（R1）
 2. `fix(residential): singbox-relay.json 加锁 + 原子写 + 巡检重启冷却`（R2）
 3. `fix(residential): SOCKS5 凭据不再出现在 curl 命令行`（R3）
+4. `fix(residential): 中继显式处理 UDP(53 直连/443 拒绝/其余直连)`（R4）
+5. `fix(residential): 三层探测降频(中继 3m/500ms, 订阅 60s 不打断连接, 巡检 2 次+抖动)`（R5）
 
 每个提交独立可回滚，均不 bump 版本；版本随 IPv6 提交之后的 `bump: v3.6.0` 一起。
 
