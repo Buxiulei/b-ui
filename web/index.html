@@ -302,17 +302,20 @@
             <div class="resi-urls-section">
                 <div class="resi-urls-header">
                     <span class="resi-urls-title">代理节点池</span>
-                    <button class="btn btn-secondary resi-add-btn" type="button" onclick="openAddResiUrl()">+ 添加 URL</button>
+                    <button class="btn btn-secondary resi-add-btn" type="button" onclick="openAddResiUrl()">+ 添加代理</button>
                 </div>
                 <div id="resi-urls-table" class="resi-urls-table"></div>
                 <div id="resi-add-url-wrap" class="resi-add-url-wrap" style="display:none">
+                    <!-- v3.6.0 R10: 一个粘贴框 + 实时解析预览；类型由服务端探测（socks5:// / http:// 可显式指定） -->
                     <input type="text" id="resi-new-url" class="resi-new-url-input"
-                           placeholder="socks5://user:pass@host:port" autocomplete="off">
+                           placeholder="粘贴供应商给的代理：socks5://user:pass@host:port、http://…、host:port:user:pass"
+                           autocomplete="off" oninput="onResiInputChange()">
+                    <div id="resi-preview" class="resi-preview" style="display:none"></div>
                     <div class="resi-add-url-actions">
                         <button class="btn btn-secondary resi-update-btn" type="button" onclick="cancelAddResiUrl()">取消</button>
-                        <button class="btn resi-btn-save resi-update-btn" type="button" onclick="addResidentialUrl()">确认添加</button>
+                        <button id="resi-add-confirm" class="btn resi-btn-save resi-update-btn" type="button" onclick="addResidentialUrl()">校验并添加</button>
                     </div>
-                    <div class="resi-field-hint">格式: socks5://user:pass@host:port 或 host:port:user:pass</div>
+                    <div class="resi-field-hint">四种格式都认：<code>socks5://user:pass@host:port</code>、<code>http://user:pass@host:port</code>、<code>host:port:user:pass</code>、<code>user:pass@host:port</code>；不写协议时自动探测 SOCKS5 / HTTP（如 Bright Data 的 22228 是 SOCKS5、44445 是 HTTP）</div>
                     <!-- v3.6.0 R8: 供应商默认"出口不可用就静默换 IP"，不加粘性/失效参数健康探测语义就失真 -->
                     <div class="resi-hint resi-global-hint">建议在用户名里加供应商的粘性/失效参数（如 Bright Data <code>-session-xxx-const</code>），否则出口 IP 会静默轮换；见 <a href="https://github.com/Buxiulei/b-ui/blob/main/docs/residential-proxy-guide.md" target="_blank" rel="noopener">住宅代理指南</a></div>
                 </div>

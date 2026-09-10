@@ -1434,6 +1434,104 @@ textarea.resi-domains-ta:focus {
 
 .resi-new-url-input { margin-bottom: 8px !important; width: 100%; }
 
+/* v3.6.0 R10: 添加框的实时解析预览 / 类型徽标 / 校验进行态 */
+.resi-preview {
+    border: 1px solid var(--hairline);
+    border-radius: 10px;
+    background: var(--ivory-50);
+    padding: 8px 11px;
+    margin-bottom: 9px;
+}
+
+.resi-preview-bad {
+    border-color: rgba(139, 26, 43, 0.16);
+    background: var(--danger-bg);
+}
+
+.resi-preview-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 2px 0;
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+.resi-preview-key {
+    flex: 0 0 46px;
+    color: var(--text-dim);
+}
+
+.resi-preview-val {
+    color: var(--text-main);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.resi-preview-mono { font-family: 'JetBrains Mono', monospace; }
+
+.resi-preview-err {
+    font-size: 12px;
+    color: var(--danger);
+    line-height: 1.5;
+}
+
+.resi-pw-toggle {
+    margin-left: auto;
+    flex-shrink: 0;
+    border: none;
+    background: transparent;
+    color: var(--primary);
+    font-size: 11.5px;
+    cursor: pointer;
+    padding: 0 2px;
+}
+
+.resi-pw-toggle:hover { text-decoration: underline; }
+
+.resi-url-nameline {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+}
+
+/* flex 子项默认 min-width:auto，不给 0 的话 .resi-url-name 的省略号不生效 */
+.resi-url-nameline .resi-url-name { min-width: 0; }
+
+.resi-type-badge {
+    flex-shrink: 0;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    padding: 1px 5px;
+    border-radius: 5px;
+    border: 1px solid var(--hairline);
+    color: var(--text-dim);
+    background: var(--ivory-200);
+}
+
+.resi-type-http {
+    color: var(--gold-700);
+    border-color: rgba(184, 150, 77, 0.30);
+    background: var(--primary-soft);
+}
+
+.resi-url-ip {
+    font-size: 11px;
+    color: var(--text-light);
+    font-family: 'JetBrains Mono', monospace;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.resi-btn-busy {
+    opacity: 0.72;
+    cursor: progress;
+}
+
 .resi-add-url-actions {
     display: flex;
     gap: 8px;

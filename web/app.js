@@ -571,6 +571,69 @@ if (tok) init();
 
 // ─── 住宅 IP 出站 ─────────────────────────────────────────────────────────────
 
+// v3.6.0 R10: 与 residential-helper.sh parse_url 同规则的纯解析（无 DOM，可单测）
+// 返回 {host, port, username, password, scheme} 或 {error}
+function parseResiInput(text) {
+    let s = String(text == null ? "" : text).trim();
+    if (!s) return { error: "请粘贴供应商给的代理" };
+    if (s.length > 1 && ((s[0] === '"' && s.endsWith('"')) || (s[0] === "'" && s.endsWith("'")))) {
+        s = s.slice(1, -1).trim();
+    }
+    const EG = "示例：socks5://user:pass@host:port 或 host:port:user:pass";
+    let scheme = "auto";
+    if (/^socks5:\/\//i.test(s)) { scheme = "socks5"; s = s.slice("socks5://".length); }
+    else if (/^http:\/\//i.test(s)) { scheme = "http"; s = s.slice("http://".length); }
+    const other = s.match(/^([A-Za-z][A-Za-z0-9+.-]*):\/\//);
+    if (other) return { error: "不支持的协议 " + other[1] + "://，只支持 socks5:// 与 http://" };
+
+    const at = s.lastIndexOf("@");
+    const tail = at >= 0 ? s.slice(at + 1) : "";
+    const parts = s.split(":");
+    const csvLike = parts.length >= 4 && parts[0].indexOf("@") < 0 && /^[0-9]+$/.test(parts[1]);
+    let host, port, username, password;
+
+    if (at >= 0 && /^[^:@/]+:[0-9]+$/.test(tail)) {
+        // user:pass@host:port（以最后一个 @ 切分，密码可含 @）
+        const userpass = s.slice(0, at);
+        const ci = userpass.indexOf(":");
+        if (ci < 0) return { error: "缺少密码，格式应为 user:pass@host:port" };
+        username = userpass.slice(0, ci);
+        password = userpass.slice(ci + 1);
+        const li = tail.lastIndexOf(":");
+        host = tail.slice(0, li);
+        port = tail.slice(li + 1);
+    } else if (csvLike) {
+        // host:port:user:pass（供应商 IP 列表 CSV 的整行，密码可含 : 与 @）
+        host = parts[0];
+        port = parts[1];
+        username = parts[2];
+        password = parts.slice(3).join(":");
+    } else if (at >= 0) {
+        if (tail.indexOf(":") < 0) return { error: "缺少端口，格式应为 user:pass@host:port" };
+        const li = tail.lastIndexOf(":");
+        if (!/^[0-9]+$/.test(tail.slice(li + 1))) return { error: "端口不是数字：" + tail.slice(li + 1) };
+        return { error: "认不出格式，" + EG };
+    } else {
+        if (parts.length < 2) return { error: "认不出格式，" + EG };
+        if (!/^[0-9]+$/.test(parts[1])) return { error: "端口不是数字：" + parts[1] };
+        return { error: "缺少用户名或密码，格式应为 host:port:user:pass" };
+    }
+
+    if (!host) return { error: "缺少主机，" + EG };
+    if (!port) return { error: "缺少端口，" + EG };
+    if (!/^[0-9]+$/.test(port)) return { error: "端口不是数字：" + port };
+    const pn = parseInt(port, 10);
+    if (pn < 1 || pn > 65535) return { error: "端口超出范围（1-65535）：" + port };
+    if (!username) return { error: "缺少用户名" };
+    if (!password) return { error: "缺少密码" };
+    return { host, port, username, password, scheme };
+}
+
+// 上游类型文案：socks5 / http 是已确定的类型，auto 表示交给服务端探测
+function _resiTypeLabel(t) {
+    return t === "http" ? "HTTP" : t === "socks5" ? "SOCKS5" : "自动探测（SOCKS5 / HTTP）";
+}
+
 function _resiErr(msg) {
     const txt = $("#resi-error-text");
     if (txt) txt.textContent = msg;
@@ -586,7 +649,7 @@ function renderResidentialUrls(urls) {
     if (!urls || !urls.length) {
         const empty = document.createElement("div");
         empty.className = "resi-urls-empty";
-        empty.textContent = "暂无代理节点，点击「+ 添加 URL」添加";
+        empty.textContent = "暂无代理节点，点击「+ 添加代理」添加";
         table.appendChild(empty);
         return;
     }
@@ -595,13 +658,29 @@ function renderResidentialUrls(urls) {
         row.className = "resi-url-row";
         const info = document.createElement("div");
         info.className = "resi-url-info";
+        const nameLine = document.createElement("div");
+        nameLine.className = "resi-url-nameline";
         const name = document.createElement("span");
         name.className = "resi-url-name";
         name.textContent = u.name || u.host;
+        // v3.6.0 R10: 上游类型徽标（老条目无 type → SOCKS5）
+        const type = u.type === "http" ? "http" : "socks5";
+        const badge = document.createElement("span");
+        badge.className = "resi-type-badge resi-type-" + type;
+        badge.textContent = type === "http" ? "HTTP" : "SOCKS5";
+        badge.title = type === "http" ? "上游是 HTTP 代理" : "上游是 SOCKS5 代理";
+        nameLine.append(name, badge);
         const addr = document.createElement("span");
         addr.className = "resi-url-addr";
         addr.textContent = u.host + ":" + u.port + (u.username ? " (" + u.username + ")" : "");
-        info.append(name, addr);
+        info.append(nameLine, addr);
+        if (u.lastVerifiedIp) {
+            const ip = document.createElement("span");
+            ip.className = "resi-url-ip";
+            ip.title = "上次校验的出口 IP";
+            ip.textContent = "出口 " + u.lastVerifiedIp;
+            info.appendChild(ip);
+        }
         const delBtn = document.createElement("button");
         delBtn.className = "resi-icon-btn resi-del-btn";
         delBtn.title = "删除";
@@ -614,12 +693,16 @@ function renderResidentialUrls(urls) {
     });
 }
 
+let _resiPwShown = false;   // 预览区"显示/隐藏密码"状态
+
 function openAddResiUrl() {
     _resiClearErr();
     const wrap = $("#resi-add-url-wrap");
     if (wrap) wrap.style.display = "";
     const inp = $("#resi-new-url");
     if (inp) { inp.value = ""; inp.focus(); }
+    _resiPwShown = false;
+    onResiInputChange();
 }
 
 function cancelAddResiUrl() {
@@ -627,18 +710,84 @@ function cancelAddResiUrl() {
     if (wrap) wrap.style.display = "none";
     const inp = $("#resi-new-url");
     if (inp) inp.value = "";
+    _resiPwShown = false;
+    onResiInputChange();
     _resiClearErr();
+}
+
+// v3.6.0 R10: 输入即解析预览（主机/端口/用户名/密码打码/类型），解析失败给具体原因
+function onResiInputChange() {
+    const inp = $("#resi-new-url");
+    const box = $("#resi-preview");
+    if (!box) return;
+    box.replaceChildren();
+    const raw = inp ? inp.value : "";
+    if (!raw.trim()) { box.style.display = "none"; box.className = "resi-preview"; return; }
+    box.style.display = "";
+    const p = parseResiInput(raw);
+    if (p.error) {
+        box.className = "resi-preview resi-preview-bad";
+        const e = document.createElement("div");
+        e.className = "resi-preview-err";
+        e.textContent = p.error;
+        box.appendChild(e);
+        return;
+    }
+    box.className = "resi-preview";
+    const row = (k, v, mono) => {
+        const line = document.createElement("div");
+        line.className = "resi-preview-row";
+        const key = document.createElement("span");
+        key.className = "resi-preview-key";
+        key.textContent = k;
+        const val = document.createElement("span");
+        val.className = "resi-preview-val" + (mono ? " resi-preview-mono" : "");
+        val.textContent = v;
+        line.append(key, val);
+        box.appendChild(line);
+        return line;
+    };
+    row("主机", p.host, true);
+    row("端口", p.port, true);
+    row("用户名", p.username, true);
+    const pwLine = row("密码", _resiPwShown ? p.password : "•".repeat(Math.min(p.password.length, 12)), true);
+    const tog = document.createElement("button");
+    tog.type = "button";
+    tog.className = "resi-pw-toggle";
+    tog.textContent = _resiPwShown ? "隐藏" : "显示";
+    tog.onclick = () => { _resiPwShown = !_resiPwShown; onResiInputChange(); };
+    pwLine.appendChild(tog);
+    row("类型", _resiTypeLabel(p.scheme), false);
 }
 
 function addResidentialUrl() {
     const inp = $("#resi-new-url");
-    const url = inp ? inp.value.trim() : "";
+    const url = inp ? String(inp.value).trim() : "";
     _resiClearErr();
-    if (!url) { _resiErr("请填写代理 URL"); return; }
-    api("/residential/urls", { method: "POST", body: JSON.stringify({ url }) }).then(r => {
-        if (r.success) { cancelAddResiUrl(); toast("节点已添加"); _resiReload(); }
-        else _resiErr(r.error || "添加失败");
-    }).catch(e => _resiErr(e.message || "请求失败"));
+    // 明显解析不出来的先在前端拦掉（错误文案与 helper 同口径），别白等一次上游探测
+    const parsed = parseResiInput(url);
+    if (parsed.error) { _resiErr(parsed.error); return; }
+    // v3.6.0 R10: 服务端要连上游真拨（auto 最坏两轮 ~25s），按钮进行态给用户预期
+    const btn = $("#resi-add-confirm");
+    const restore = () => {
+        if (!btn) return;
+        btn.disabled = false;
+        btn.textContent = "校验并添加";
+        btn.classList.remove("resi-btn-busy");
+    };
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = "正在连接上游校验，最长约 30 秒…";
+        btn.classList.add("resi-btn-busy");
+    }
+    return api("/residential/urls", { method: "POST", body: JSON.stringify({ url }) }).then(r => {
+        restore();
+        if (r.success) {
+            cancelAddResiUrl();
+            toast("节点已添加（" + _resiTypeLabel(r.type || "socks5") + "）");
+            _resiReload();
+        } else _resiErr(r.error || "添加失败");
+    }).catch(e => { restore(); _resiErr(e.message || "请求失败"); });
 }
 
 function removeResidentialUrl(hostPort) {

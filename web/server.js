@@ -530,8 +530,9 @@ const RELAY_CLASH_API = "127.0.0.1:9091";
 // v3.6.0 R3: curl 配置文件双引号内需转义 \ 与 "（凭据经 stdin 传入，不出现在 argv 里）
 const curlCfgEscape = (s) => String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 
-// 经某条住宅 SOCKS5 取一个 JSON 接口；host/port 非法或凭据含换行 → null（不发请求）
-function curlJsonViaSocks(member, url, timeoutSec) {
+// 经某条住宅上游取一个 JSON 接口；host/port 非法或凭据含换行 → null（不发请求）
+// v3.6.0 R10: member.type=="http" → proxy 行写 http://，否则 socks5h://（远端解析）
+function curlJsonViaProxy(member, url, timeoutSec) {
     return new Promise((resolve) => {
         const user = member.username || "";
         const pass = member.password || "";
@@ -539,7 +540,8 @@ function curlJsonViaSocks(member, url, timeoutSec) {
         if (!/^[A-Za-z0-9.\-\[\]:]+$/.test(String(member.host)) || !/^\d{1,5}$/.test(String(member.port))) {
             return resolve(null);
         }
-        let cfg = `proxy = "socks5h://${curlCfgEscape(member.host)}:${curlCfgEscape(member.port)}"\n`;
+        const scheme = member.type === "http" ? "http" : "socks5h";
+        let cfg = `proxy = "${scheme}://${curlCfgEscape(member.host)}:${curlCfgEscape(member.port)}"\n`;
         if (user && pass) cfg += `proxy-user = "${curlCfgEscape(user)}:${curlCfgEscape(pass)}"\n`;
         const child = execFile("curl", ["-K", "-", "-m", String(timeoutSec), "-sS", url],
             { timeout: (timeoutSec + 1) * 1000, maxBuffer: 1024 * 1024 },
@@ -552,7 +554,7 @@ function curlJsonViaSocks(member, url, timeoutSec) {
     });
 }
 
-// v3.6.0 R9: 出口画像三源，全 HTTPS、全无 key、全经该成员的 socks5h 拨出。
+// v3.6.0 R9: 出口画像三源，全 HTTPS、全无 key、全经该成员的上游拨出（socks5h:// 或 http://）。
 // 主源 my.ippure.com/v1/info —— isResidential 直接给住宅判定，fraudScore 给风险分（实测 2026-09-10：
 //   {ip, asn, asOrganization, country, countryCode, region, city, timezone, fraudScore, isResidential, …}）。
 // 备源 api.ipquery.io —— risk.is_datacenter/is_vpn/is_proxy/is_mobile 走原映射；注意裸 `/` 返回纯文本 IP，
@@ -599,12 +601,12 @@ function ipqueryEgress(d) {
 
 // 单条住宅出口探测：主源失败/非 JSON 就往下一源退，全失败 → null
 async function probeEgress(member) {
-    const a = await curlJsonViaSocks(member, "https://my.ippure.com/v1/info", 8);
+    const a = await curlJsonViaProxy(member, "https://my.ippure.com/v1/info", 8);
     if (a && a.ip && typeof a.isResidential === "boolean") return ippureEgress(a);
-    const b = await curlJsonViaSocks(member, "https://api.ipquery.io/?format=json", 8);
+    const b = await curlJsonViaProxy(member, "https://api.ipquery.io/?format=json", 8);
     if (b && b.ip) return ipqueryEgress(b);
     if (a && a.ip) return ippureEgress(a);   // 主源只剩归属字段时至少保住 IP/ISP，类型记 unknown
-    const c = await curlJsonViaSocks(member, "https://ipinfo.io/json", 8);
+    const c = await curlJsonViaProxy(member, "https://ipinfo.io/json", 8);
     if (c && c.ip) {
         return { ip: c.ip, type: "unknown", isp: c.org || null, country: c.country || null, city: c.city || null };
     }
@@ -2147,17 +2149,27 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                         // v3.5.0: 保证 global 字段始终在响应里
                         if (typeof display.global === "undefined") display.global = false;
                         // v3.5.0: 保证 urls 数组始终在响应里（多 URL CRUD 支持）
+                        // v3.6.0 R10: 行里带上游类型（缺省 socks5）与上次校验出口 IP，显示 URL 按类型拼；密码不外泄
+                        const resiRow = (u, name) => {
+                            const type = u.type === "http" ? "http" : "socks5";
+                            return {
+                                host: u.host,
+                                port: u.port,
+                                username: u.username,
+                                name: name || u.name,
+                                type,
+                                lastVerifiedIp: u.lastVerifiedIp || "",
+                                displayUrl: `${type}://${String(u.username || "").slice(0, 2)}***@${u.host}:${u.port}`,
+                            };
+                        };
                         if (!Array.isArray(display.urls)) {
-                            display.urls = display.host
-                                ? [{ host: display.host, port: display.port, username: display.username, name: "primary" }]
-                                : [];
+                            display.urls = display.host ? [resiRow(display, "primary")] : [];
                         } else {
-                            // 不暴露明文密码
-                            display.urls = display.urls.map(u => ({ host: u.host, port: u.port, username: u.username, name: u.name }));
+                            display.urls = display.urls.map(u => resiRow(u));
                         }
                         if (display.password) display.password = display.password.slice(0, 2) + "***";
                         if (display.username && display.host) {
-                            display.displayUrl = `socks5://${display.username.slice(0, 2)}***@${display.host}:${display.port}`;
+                            display.displayUrl = resiRow(display).displayUrl;
                         }
                         return sendJSON(res, display);
                     } catch {
@@ -2278,24 +2290,34 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                 }
             }
 
-            // v3.5.0: POST /api/residential/urls — 追加一个住宅 socks5 URL
+            // v3.5.0: POST /api/residential/urls — 追加一个住宅上游
+            // v3.6.0 R10: 接受供应商给的任意一行（socks5:// / http:// / host:port:user:pass / user:pass@host:port），
+            //   解析与类型探测都交 helper；凭据经 stdin（--add -）传入，不进 argv（ps 看不到）；
+            //   两轮探测最坏 ~25s 再加取 IP/ISP，超时给到 45s。helper stdout 第三行是探测到的类型。
             if (r === "residential/urls" && req.method === "POST") {
                 const b = await parseBody(req);
-                if (!b || typeof b.url !== "string" || !b.url.startsWith("socks5://")) {
-                    return sendJSON(res, { error: "url 必须是 socks5:// 开头" }, 400);
+                const rawUrl = (b && typeof b.url === "string") ? b.url.trim() : "";
+                if (!rawUrl) {
+                    return sendJSON(res, { error: "请粘贴供应商给的代理，如 socks5://user:pass@host:port 或 host:port:user:pass" }, 400);
                 }
                 try {
-                    const result = spawnSync(CONFIG.residentialHelper, ["enable", "--add", b.url], {
+                    const result = spawnSync(CONFIG.residentialHelper, ["enable", "--add", "-"], {
                         env: { ...process.env, BASE_DIR },
+                        input: rawUrl + "\n",
                         encoding: "utf8",
-                        timeout: 30000,
+                        timeout: 45000,
                     });
                     if (result.status !== 0) {
                         const errMsg = (result.stderr || "").replace(/\x1b\[[0-9;]*m/g, "").trim();
                         return sendJSON(res, { error: errMsg || "添加 URL 失败" }, 400);
                     }
                     const lines = (result.stdout || "").trim().split("\n");
-                    return sendJSON(res, { success: true, exitIp: lines[0] || "", ispInfo: lines[1] || "" });
+                    return sendJSON(res, {
+                        success: true,
+                        exitIp: lines[0] || "",
+                        ispInfo: lines[1] || "",
+                        type: (lines[2] || "socks5").trim(),
+                    });
                 } catch (e) {
                     return sendJSON(res, { error: e.message }, 500);
                 }
@@ -2362,11 +2384,13 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                 } catch { }
 
                 const relayOutbounds = Array.isArray(relay?.outbounds) ? relay.outbounds : [];
+                // v3.6.0 R10: 住宅成员 = socks 与 http 出站（与 resi-health.sh 同源）
                 const members = relayOutbounds
-                    .filter(o => o && o.type === "socks" && o.tag)
+                    .filter(o => o && (o.type === "socks" || o.type === "http") && o.tag)
                     .slice(0, 8)
                     .map(o => ({
                         tag: o.tag,
+                        type: o.type === "http" ? "http" : "socks5",
                         host: o.server,
                         port: o.server_port,
                         username: o.username || "",
@@ -2411,6 +2435,7 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                         const st = healthState[m.tag] || {};
                         return {
                             tag: m.tag,
+                            type: m.type,
                             host: m.host,
                             port: m.port,
                             active: st.active !== false,

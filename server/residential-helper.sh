@@ -554,7 +554,7 @@ write_singbox_config_from_state() {
 }
 
 add_url_to_config() {
-    local host="$1" port="$2" user="$3" pass="$4" type="${5:-socks5}"
+    local host="$1" port="$2" user="$3" pass="$4" type="${5:-socks5}" ip="${6:-}"
     if [[ ! -f "${RESIDENTIAL_CONFIG}" ]]; then
         echo '{"enabled":false,"global":false,"urls":[]}' > "${RESIDENTIAL_CONFIG}.tmp" \
         && chmod 600 "${RESIDENTIAL_CONFIG}.tmp" \
@@ -562,10 +562,10 @@ add_url_to_config() {
         chmod 600 "${RESIDENTIAL_CONFIG}"
     fi
     # name 按最终数组位置稠密重排（url-1..url-N），避免 length+1 在去重/移除后产生重名
-    jq --arg h "$host" --argjson p "$port" --arg u "$user" --arg pw "$pass" --arg t "$type" \
+    jq --arg h "$host" --argjson p "$port" --arg u "$user" --arg pw "$pass" --arg t "$type" --arg ip "$ip" \
         '.urls = ((.urls // [])
                   | map(select(.host != $h or .port != $p))
-                  + [{host:$h, port:$p, username:$u, password:$pw, type:$t}]
+                  + [{host:$h, port:$p, username:$u, password:$pw, type:$t, lastVerifiedIp:$ip}]
                   | to_entries
                   | map(.value + {name: ("url-" + ((.key + 1) | tostring))}))' \
         "${RESIDENTIAL_CONFIG}" > "${RESIDENTIAL_CONFIG}.tmp" \
@@ -619,7 +619,7 @@ case "$cmd" in
             parse_url "$add_url"
             verify "$RESI_HOST" "$RESI_PORT" "$RESI_USER" "$RESI_PASS" "$RESI_TYPE"
             ensure_singbox
-            add_url_to_config "$RESI_HOST" "$RESI_PORT" "$RESI_USER" "$RESI_PASS" "$RESI_TYPE"
+            add_url_to_config "$RESI_HOST" "$RESI_PORT" "$RESI_USER" "$RESI_PASS" "$RESI_TYPE" "${RESI_EXIT_IP:-}"
             save_config true
             write_singbox_config_from_state
             reload_relay_service
