@@ -2167,7 +2167,11 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                 // v3.6.0 R3: 凭据经 stdin 配置文件传给 curl，不出现在进程参数里（ps / /proc/<pid>/cmdline 可见）
                 const curlCfgEscape = (s) => String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
                 // 换行会在配置里注入额外的 curl 指令，一律拒绝
-                if (/[\r\n]/.test(`${raw.host}${raw.port}${raw.username || ""}${raw.password || ""}`)) {
+                if (/[\r\n]/.test(`${raw.username || ""}${raw.password || ""}`)) {
+                    return sendJSON(res, baseResp);
+                }
+                // host/port 直接进 proxy 行，走白名单（含 IPv6 字面量的 [] 与 :）
+                if (!/^[A-Za-z0-9.\-\[\]:]+$/.test(String(raw.host)) || !/^\d{1,5}$/.test(String(raw.port))) {
                     return sendJSON(res, baseResp);
                 }
                 let curlCfg = `proxy = "socks5h://${curlCfgEscape(raw.host)}:${curlCfgEscape(raw.port)}"\n`;

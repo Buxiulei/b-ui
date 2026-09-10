@@ -52,15 +52,17 @@ while IFS= read -r m; do
     [ -z "$tag" ] && continue
     alltags+=("$tag")
 
-    # v3.6.0 R3: 换行无法安全写进 curl 配置文件（会注入额外指令）；跳过本条探测并保留其当前
-    # 池成员身份，免得一条坏记录既剪掉池成员又白搭一次重启
-    case "${host}${port}${user}${pass}" in
-        *$'\n'*|*$'\r'*)
-            log "WARN ${tag} 参数含换行符，跳过探测（保留当前状态）"
-            [ "$(jq -r --arg n "$tag" '.[$n].active // true' "$STATE")" = "false" ] || desired+=("$tag")
-            continue
-            ;;
-    esac
+    # v3.6.0 R3: 换行会在 curl 配置里注入额外指令；host/port 直接进 proxy 行，必须严格校验。
+    # 不合规的一律跳过探测并保留其当前池成员身份，免得一条坏记录既剪掉池成员又白搭一次重启
+    skip=""
+    case "${user}${pass}" in *$'\n'*|*$'\r'*) skip="凭据含换行符" ;; esac
+    case "$host" in ""|*$'\n'*|*$'\r'*|*'"'*|*'\'*) skip="host/port 非法" ;; esac
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] || skip="host/port 非法"
+    if [ -n "$skip" ]; then
+        log "WARN ${tag} ${skip}，跳过探测（保留当前状态）"
+        [ "$(jq -r --arg n "$tag" '.[$n].active // true' "$STATE")" = "false" ] || desired+=("$tag")
+        continue
+    fi
     ok=0
     for _ in $(seq 1 "$TRIES"); do
         curl_socks_cfg "$host" "$port" "$user" "$pass" \

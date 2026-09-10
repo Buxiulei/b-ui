@@ -116,9 +116,14 @@ verify() {
     local host="$1" port="$2" user="$3" pass="$4"
 
     # v3.6.0 R3: 换行无法安全写进 curl 配置文件（会注入额外指令），视为非法
-    case "${host}${port}${user}${pass}" in
-        *$'\n'*|*$'\r'*) err "住宅代理参数含换行符，非法"; return 1 ;;
+    case "${user}${pass}" in
+        *$'\n'*|*$'\r'*) err "凭据含换行符，非法"; return 1 ;;
     esac
+    # host/port 直接进 proxy 行（凭据靠 curl_cfg_escape 转义即可，host 不给这个余地）
+    case "$host" in
+        ""|*$'\n'*|*$'\r'*|*'"'*|*'\'*) err "host/port 非法"; return 1 ;;
+    esac
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] || { err "host/port 非法"; return 1; }
 
     info "获取 VPS 公网 IP..."
     _SERVER_IP=$(curl -sS --max-time 5 https://api.ipify.org 2>/dev/null) \
