@@ -67,7 +67,7 @@
 
 新增小节：
 - **HTTP 与 SOCKS5 端口**：同一套凭据两种协议都可用；Bright Data HTTP/HTTPS 用 44445（旧 22225/33335），SOCKS5 固定 22228。B-UI 添加时自动识别；手动指定用 `http://` / `socks5://` 前缀。
-- **目标必须是域名**：Bright Data 的 SOCKS5 只接受域名目标（`socks5h` 语义、远端解析），显式 IP 会被拒；HTTP 代理下 IP 目标会改由"超级代理"直接发出（出口不再是你的住宅/ISP IP）。B-UI 中继把目标域名原样交给上游，客户端侧请保持 TUN/嗅探开启，不要在本地把域名解析成 IP 再连。可在用户名加 `-dns-remote` 让解析发生在出口节点。
+- **目标尽量用域名**：Bright Data 文档称 SOCKS5 只接受域名目标（`socks5h` 语义、远端解析）；2026-09-10 在 bwg-rick 实测：经 SOCKS5 22228，HTTPS 域名与 HTTPS 显式 IP 目标都能通，**明文 HTTP（80）目标不通**；经 HTTP 44445 三种都通、出口 IP 相同。HTTP 代理下 IP 目标会改由"超级代理"直接发出（出口不再是你的住宅/ISP IP）。因此对 Bright Data 上游 B-UI 推荐 HTTP 端口。B-UI 中继把目标域名原样交给上游，客户端侧请保持 TUN/嗅探开启，不要在本地把域名解析成 IP 再连。可在用户名加 `-dns-remote` 让解析发生在出口节点。
 - **超级代理绕过（superproxy bypass）**：google/bing/youtube 等搜索引擎与第三方 IP 检测站可能被绕过，出口显示为 Bright Data 机房 IP 而非 peer；这不是配置错误。要"宁可失败也不绕过"可在用户名加 `-route_err-block`。B-UI 体检卡显示的 ippure/ipquery 结果以实际经上游请求为准（实测 ippure 未被绕过）。
 - **Residential（非 ISP）zone 的 HTTPS 限制**：未完成 KYC 时 Residential/Mobile 网络的 HTTPS 会做证书拦截（需装 Bright Data 证书），B-UI 端到端 TLS 不会装第三方 CA → 会出现证书错误；建议用 ISP / Datacenter zone，或完成 KYC。
 - **粘性与会话**：`-session-<id>` 同 ID 同 IP，空闲 7 分钟释放；`-const` 绑定 peer 不可用时报 502；专属池用 `-ip-x.x.x.x` 钉死（本 spec 主理人当前 zone 只有一个 IP）；`glob_` 前缀忽略来源 IP。
