@@ -1152,8 +1152,33 @@ function fetchUrl(url, opts = {}) {
     });
 }
 
+// v3.6.0: sing-box 1.15 起 1.14 的弃用项变致命，自动同步的版本卡在这个 minor
+const SINGBOX_MAX_MINOR = "1.14";
+
+// v3.6.0: Xray 的 tag 全部标 prerelease，/releases/latest 永远返回 v26.3.27（2026-03），
+// 所以从 releases 列表（按创建时间倒序）取首个匹配 tag；sing-box 再按 SINGBOX_MAX_MINOR 卡上限
+function pickLatestTag(repo, releases) {
+    const tags = (Array.isArray(releases) ? releases : []).filter(r => r && !r.draft).map(r => r.tag_name);
+    if (repo === "SagerNet/sing-box") {
+        const stable = tags.filter(t => /^v\d+\.\d+\.\d+$/.test(t));
+        const inCap = stable.find(t => t.startsWith(`v${SINGBOX_MAX_MINOR}.`));
+        const latest = stable[0];
+        if (latest && inCap && !latest.startsWith(`v${SINGBOX_MAX_MINOR}.`)) return inCap;
+        return latest || null;
+    }
+    if (repo === "XTLS/Xray-core") return tags.find(t => /^v\d/.test(t)) || null;
+    return tags.find(t => !/-(alpha|beta|rc)/.test(t)) || null;
+}
+
 // 获取 GitHub 最新 Release 信息
 async function getGitHubLatest(repo) {
+    // Xray / sing-box 走 releases 列表 + pickLatestTag；hysteria 的 tag 形如 app/v2.12.2，沿用 latest
+    if (repo === "XTLS/Xray-core" || repo === "SagerNet/sing-box") {
+        const list = JSON.parse(await fetchUrl(`https://api.github.com/repos/${repo}/releases?per_page=30`, { timeout: 15000 }));
+        const tag = pickLatestTag(repo, list);
+        const picked = Array.isArray(list) ? list.find(r => r && r.tag_name === tag) : null;
+        if (picked) return picked;
+    }
     const data = await fetchUrl(`https://api.github.com/repos/${repo}/releases/latest`, { timeout: 15000 });
     return JSON.parse(data);
 }

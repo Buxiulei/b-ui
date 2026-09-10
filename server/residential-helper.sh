@@ -146,6 +146,30 @@ verify() {
         2>/dev/null || echo "")
 }
 
+# v3.6.0: sing-box 版本探测。1.15 起 1.14 的弃用项变致命（会拒绝启动），所以自动下载的版本
+# 卡在 SINGBOX_MAX_MINOR.x；tag 从 releases 列表（按创建时间倒序）取首个匹配，不用
+# /releases/latest（拿不到上限内的老版本）
+SINGBOX_MAX_MINOR="1.14"
+
+gh_latest_tag() {
+    local repo="$1" re="${2:-.}"
+    curl -fsSL --max-time 15 "https://api.github.com/repos/${repo}/releases?per_page=30" 2>/dev/null \
+        | grep -oE '"tag_name":[[:space:]]*"[^"]+"' | sed -E 's/.*"([^"]+)"$/\1/' | grep -E "$re" | head -1 || true
+}
+
+singbox_latest_version() {
+    local latest minor capped
+    latest=$(gh_latest_tag SagerNet/sing-box '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed 's/^v//')
+    minor=$(echo "$latest" | cut -d. -f1-2)
+    if [[ -n "$latest" && "$minor" != "$SINGBOX_MAX_MINOR" ]] \
+        && [[ "$(printf '%s\n%s\n' "$SINGBOX_MAX_MINOR" "$minor" | sort -V | head -1)" == "$SINGBOX_MAX_MINOR" ]]; then
+        capped=$(gh_latest_tag SagerNet/sing-box "^v${SINGBOX_MAX_MINOR//./\\.}\.[0-9]+$" | sed 's/^v//')
+        if [[ -n "$capped" ]]; then echo "$capped"; return 0; fi
+        info "sing-box 最新 ${latest} 超过上限 ${SINGBOX_MAX_MINOR}.x 且找不到上限内版本，回退使用最新版"
+    fi
+    echo "$latest"
+}
+
 ensure_singbox() {
     [[ -x "${SINGBOX_BIN}" ]] && return 0
     info "下载 sing-box..."
@@ -160,10 +184,9 @@ ensure_singbox() {
     esac
 
     local ver
-    ver=$(curl -sS --max-time 15 \
-        https://api.github.com/repos/SagerNet/sing-box/releases/latest \
-        | grep '"tag_name"' | cut -d'"' -f4)
+    ver=$(singbox_latest_version)
     [[ -z "$ver" ]] && { err "无法获取 sing-box 最新版本"; return 1; }
+    ver="v${ver}"
 
     local tarname="sing-box-${ver#v}-${arch_str}.tar.gz"
     curl -sS -L --max-time 120 \

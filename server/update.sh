@@ -1778,6 +1778,32 @@ _is_newer() {
     [[ "$(printf '%s\n' "$local_v" "$remote_v" | sort -V | tail -n1)" == "$remote_v" ]] && return 0
     return 1
 }
+# v3.6.0: 内核版本探测。Xray 的 tag 全部标 prerelease，/releases/latest 永远返回 v26.3.27（2026-03），
+# 所以从 releases 列表（按创建时间倒序）取第一个匹配 tag；sing-box 1.15 起 1.14 的弃用项变致命，
+# 自动升级上限卡在 SINGBOX_MAX_MINOR
+SINGBOX_MAX_MINOR="1.14"
+
+gh_latest_tag() {
+    local repo="$1" re="${2:-.}"
+    curl -fsSL --max-time 15 "https://api.github.com/repos/${repo}/releases?per_page=30" 2>/dev/null \
+        | grep -oE '"tag_name":[[:space:]]*"[^"]+"' | sed -E 's/.*"([^"]+)"$/\1/' | grep -E "$re" | head -1 || true
+}
+
+singbox_latest_version() {
+    local latest minor capped
+    latest=$(gh_latest_tag SagerNet/sing-box '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed 's/^v//')
+    minor=$(echo "$latest" | cut -d. -f1-2)
+    if [[ -n "$latest" && "$minor" != "$SINGBOX_MAX_MINOR" ]] \
+        && [[ "$(printf '%s\n%s\n' "$SINGBOX_MAX_MINOR" "$minor" | sort -V | head -1)" == "$SINGBOX_MAX_MINOR" ]]; then
+        capped=$(gh_latest_tag SagerNet/sing-box "^v${SINGBOX_MAX_MINOR//./\\.}\.[0-9]+$" | sed 's/^v//')
+        if [[ -n "$capped" ]]; then echo "$capped"; return 0; fi
+        print_warning "sing-box 最新 ${latest} 超过上限 ${SINGBOX_MAX_MINOR}.x 且找不到上限内版本，回退使用最新版" >&2
+    fi
+    echo "$latest"
+}
+
+xray_latest_version() { gh_latest_tag XTLS/Xray-core '^v[0-9]' | sed 's/^v//'; }
+
 
 update_kernel() {
     print_info "检查内核版本..."
@@ -1810,8 +1836,7 @@ update_kernel() {
     # --- Xray ---
     if command -v xray &> /dev/null; then
         local local_xray=$(xray version 2>/dev/null | head -n1 | awk '{print $2}' | sed 's/^v//' || echo "")
-        local remote_xray=$(curl -fsSL --max-time 10 "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null \
-            | grep '"tag_name"' | sed -E 's/.*"v?([0-9][^"]+)".*/\1/')
+        local remote_xray=$(xray_latest_version)
         echo ""
         echo -e "${CYAN}[Xray]${NC}"
         if [[ -n "$local_xray" && -n "$remote_xray" ]]; then
@@ -1831,8 +1856,7 @@ update_kernel() {
     # --- sing-box ---
     if command -v sing-box &> /dev/null; then
         local local_sb=$(sing-box version 2>/dev/null | head -n1 | awk '{print $3}' | sed 's/^v//' || echo "")
-        local remote_sb=$(curl -fsSL --max-time 10 "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null \
-            | grep '"tag_name"' | sed -E 's/.*"v?([0-9][^"]+)".*/\1/')
+        local remote_sb=$(singbox_latest_version)
         echo ""
         echo -e "${CYAN}[sing-box]${NC}"
         if [[ -n "$local_sb" && -n "$remote_sb" ]]; then
@@ -1899,8 +1923,7 @@ auto_update_kernel() {
     # Xray
     if command -v xray &> /dev/null; then
         local local_xray=$(xray version 2>/dev/null | head -n1 | awk '{print $2}' | sed 's/^v//' || echo "")
-        local remote_xray=$(curl -fsSL --max-time 10 "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null \
-            | grep '"tag_name"' | sed -E 's/.*"v?([0-9][^"]+)".*/\1/')
+        local remote_xray=$(xray_latest_version)
         if [[ -n "$local_xray" && -n "$remote_xray" ]] && _is_newer "$local_xray" "$remote_xray"; then
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] Xray: v${local_xray} -> v${remote_xray}, 更新中..." >> "$LOG_FILE"
             bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install >> "$LOG_FILE" 2>&1 || true
@@ -1919,8 +1942,7 @@ auto_update_kernel() {
     # sing-box
     if command -v sing-box &> /dev/null; then
         local local_sb=$(sing-box version 2>/dev/null | head -n1 | awk '{print $3}' | sed 's/^v//' || echo "")
-        local remote_sb=$(curl -fsSL --max-time 10 "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null \
-            | grep '"tag_name"' | sed -E 's/.*"v?([0-9][^"]+)".*/\1/')
+        local remote_sb=$(singbox_latest_version)
         if [[ -n "$local_sb" && -n "$remote_sb" ]] && _is_newer "$local_sb" "$remote_sb"; then
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] sing-box: v${local_sb} -> v${remote_sb}, 更新中..." >> "$LOG_FILE"
             if command -v apt-get &> /dev/null; then

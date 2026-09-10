@@ -1120,6 +1120,32 @@ install_xray_client() {
     return 1
 }
 
+# v3.6.0: 内核版本探测。Xray 的 tag 全部标 prerelease，/releases/latest 永远返回 v26.3.27（2026-03），
+# 所以从 releases 列表（按创建时间倒序）取第一个匹配 tag；sing-box 1.15 起 1.14 的弃用项变致命，
+# 自动升级上限卡在 SINGBOX_MAX_MINOR
+SINGBOX_MAX_MINOR="1.14"
+
+gh_latest_tag() {
+    local repo="$1" re="${2:-.}"
+    curl -fsSL --max-time 15 "https://api.github.com/repos/${repo}/releases?per_page=30" 2>/dev/null \
+        | grep -oE '"tag_name":[[:space:]]*"[^"]+"' | sed -E 's/.*"([^"]+)"$/\1/' | grep -E "$re" | head -1 || true
+}
+
+singbox_latest_version() {
+    local latest minor capped
+    latest=$(gh_latest_tag SagerNet/sing-box '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed 's/^v//')
+    minor=$(echo "$latest" | cut -d. -f1-2)
+    if [[ -n "$latest" && "$minor" != "$SINGBOX_MAX_MINOR" ]] \
+        && [[ "$(printf '%s\n%s\n' "$SINGBOX_MAX_MINOR" "$minor" | sort -V | head -1)" == "$SINGBOX_MAX_MINOR" ]]; then
+        capped=$(gh_latest_tag SagerNet/sing-box "^v${SINGBOX_MAX_MINOR//./\\.}\.[0-9]+$" | sed 's/^v//')
+        if [[ -n "$capped" ]]; then echo "$capped"; return 0; fi
+        print_warning "sing-box 最新 ${latest} 超过上限 ${SINGBOX_MAX_MINOR}.x 且找不到上限内版本，回退使用最新版" >&2
+    fi
+    echo "$latest"
+}
+
+xray_latest_version() { gh_latest_tag XTLS/Xray-core '^v[0-9]' | sed 's/^v//'; }
+
 install_singbox() {
     print_info "安装 sing-box..."
     
@@ -1171,10 +1197,7 @@ install_singbox() {
     
     # 获取最新版本号 (使用镜像)
     local version=""
-    local api_url="https://api.github.com/repos/SagerNet/sing-box/releases/latest"
-    
-    # 尝试获取版本号
-    version=$(curl -fsSL --max-time 15 "$api_url" 2>/dev/null | grep '"tag_name"' | sed -E 's/.*"v([^"]+)".*/\1/')
+    version=$(singbox_latest_version)
     
     if [[ -z "$version" ]]; then
         # 使用默认版本
@@ -4800,8 +4823,7 @@ update_all() {
     
     if command -v xray &> /dev/null; then
         local local_xray=$(xray version 2>/dev/null | head -n1 | awk '{print $2}' | sed 's/^v//' || echo "")
-        local gh_xray=$(curl -fsSL --max-time 10 "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null \
-            | grep '"tag_name"' | sed -E 's/.*"v?([0-9][^"]+)".*/\1/')
+        local gh_xray=$(xray_latest_version)
         _is_ver "$gh_xray" || gh_xray=""
         _is_ver "$sv_xray" || sv_xray=""
         local best_xray=$(_newer "${sv_xray:-0}" "${gh_xray:-0}")
@@ -4820,8 +4842,7 @@ update_all() {
     
     if command -v sing-box &> /dev/null; then
         local local_sb=$(sing-box version 2>/dev/null | head -n1 | awk '{print $3}' | sed 's/^v//' || echo "")
-        local gh_sb=$(curl -fsSL --max-time 10 "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null \
-            | grep '"tag_name"' | sed -E 's/.*"v?([0-9][^"]+)".*/\1/')
+        local gh_sb=$(singbox_latest_version)
         _is_ver "$gh_sb" || gh_sb=""
         _is_ver "$sv_sb" || sv_sb=""
         local best_sb=$(_newer "${sv_sb:-0}" "${gh_sb:-0}")
@@ -5489,8 +5510,7 @@ auto_update_all() {
     # Xray
     if command -v xray &> /dev/null; then
         local local_xray=$(xray version 2>/dev/null | head -n1 | awk '{print $2}' | sed 's/^v//' || echo "")
-        local gh_xray=$(curl -fsSL --max-time 10 "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null \
-            | grep '"tag_name"' | sed -E 's/.*"v?([0-9][^"]+)".*/\1/')
+        local gh_xray=$(xray_latest_version)
         local best_xray=$(_newer "${sv_xray:-0}" "${gh_xray:-0}")
         [[ "$best_xray" == "0" ]] && best_xray=""
         if [[ -n "$local_xray" && -n "$best_xray" ]] && _is_newer "$local_xray" "$best_xray"; then
@@ -5503,8 +5523,7 @@ auto_update_all() {
     # sing-box
     if command -v sing-box &> /dev/null; then
         local local_sb=$(sing-box version 2>/dev/null | head -n1 | awk '{print $3}' | sed 's/^v//' || echo "")
-        local gh_sb=$(curl -fsSL --max-time 10 "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null \
-            | grep '"tag_name"' | sed -E 's/.*"v?([0-9][^"]+)".*/\1/')
+        local gh_sb=$(singbox_latest_version)
         local best_sb=$(_newer "${sv_sb:-0}" "${gh_sb:-0}")
         [[ "$best_sb" == "0" ]] && best_sb=""
         if [[ -n "$local_sb" && -n "$best_sb" ]] && _is_newer "$local_sb" "$best_sb"; then

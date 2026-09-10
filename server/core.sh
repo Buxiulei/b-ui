@@ -1531,6 +1531,32 @@ EOF
 
 PACKAGES_DIR="${BASE_DIR}/packages"
 
+# v3.6.0: 内核版本探测。Xray 的 tag 全部标 prerelease，/releases/latest 永远返回 v26.3.27（2026-03），
+# 所以从 releases 列表（按创建时间倒序）取第一个匹配 tag；sing-box 1.15 起 1.14 的弃用项变致命，
+# 自动升级上限卡在 SINGBOX_MAX_MINOR
+SINGBOX_MAX_MINOR="1.14"
+
+gh_latest_tag() {
+    local repo="$1" re="${2:-.}"
+    curl -fsSL --max-time 15 "https://api.github.com/repos/${repo}/releases?per_page=30" 2>/dev/null \
+        | grep -oE '"tag_name":[[:space:]]*"[^"]+"' | sed -E 's/.*"([^"]+)"$/\1/' | grep -E "$re" | head -1 || true
+}
+
+singbox_latest_version() {
+    local latest minor capped
+    latest=$(gh_latest_tag SagerNet/sing-box '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed 's/^v//')
+    minor=$(echo "$latest" | cut -d. -f1-2)
+    if [[ -n "$latest" && "$minor" != "$SINGBOX_MAX_MINOR" ]] \
+        && [[ "$(printf '%s\n%s\n' "$SINGBOX_MAX_MINOR" "$minor" | sort -V | head -1)" == "$SINGBOX_MAX_MINOR" ]]; then
+        capped=$(gh_latest_tag SagerNet/sing-box "^v${SINGBOX_MAX_MINOR//./\\.}\.[0-9]+$" | sed 's/^v//')
+        if [[ -n "$capped" ]]; then echo "$capped"; return 0; fi
+        print_warning "sing-box 最新 ${latest} 超过上限 ${SINGBOX_MAX_MINOR}.x 且找不到上限内版本，回退使用最新版" >&2
+    fi
+    echo "$latest"
+}
+
+xray_latest_version() { gh_latest_tag XTLS/Xray-core '^v[0-9]' | sed 's/^v//'; }
+
 download_client_packages() {
     print_info "预下载客户端安装包..."
     mkdir -p "$PACKAGES_DIR"
@@ -1551,11 +1577,11 @@ download_client_packages() {
     [[ -z "$hy2_version" ]] && hy2_version="2.6.1"
     
     # Xray 版本
-    local xray_version=$(curl -fsSL --max-time 15 "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null | grep '"tag_name"' | sed -E 's/.*"v([^"]+)".*/\1/')
+    local xray_version=$(xray_latest_version)
     [[ -z "$xray_version" ]] && xray_version="25.1.1"
     
     # sing-box 版本
-    local singbox_version=$(curl -fsSL --max-time 15 "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null | grep '"tag_name"' | sed -E 's/.*"v([^"]+)".*/\1/')
+    local singbox_version=$(singbox_latest_version)
     [[ -z "$singbox_version" ]] && singbox_version="1.10.0"
     
     # 保存版本信息
