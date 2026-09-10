@@ -29,6 +29,14 @@ SINGBOX_BIN="${BASE_DIR}/sing-box"
 SINGBOX_CONFIG="${BASE_DIR}/singbox-relay.json"
 SINGBOX_RELAY_PORT=2080
 RELAY_SERVICE="b-ui-relay"
+RELAY_LOCK="${BASE_DIR}/.relay.lock"
+
+# v3.6.0 R2: 写路径互斥（与 resi-health.sh 共用同一把锁）；持锁到进程退出
+acquire_relay_lock() {
+    exec 9>"${RELAY_LOCK}"
+    chmod 600 "${RELAY_LOCK}" 2>/dev/null || true
+    flock -w 30 9 || { err "获取 relay 锁超时(30s)，可能有另一个 residential-helper/resi-health 在运行"; exit 1; }
+}
 
 PRIVATE_CIDRS='["127.0.0.0/8","10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","169.254.0.0/16"]'
 
@@ -345,7 +353,9 @@ save_config() {
         '{enabled:$enabled,global:$global,domains:$domains,urls:$urls,host:$host,port:$port,
           username:$username,password:$password,lastVerifiedIp:$lastVerifiedIp,
           lastVerifiedIspInfo:$lastVerifiedIspInfo,lastVerifiedAt:$lastVerifiedAt}' \
-        > "${RESIDENTIAL_CONFIG}"
+        > "${RESIDENTIAL_CONFIG}.tmp" \
+    && chmod 600 "${RESIDENTIAL_CONFIG}.tmp" \
+    && mv "${RESIDENTIAL_CONFIG}.tmp" "${RESIDENTIAL_CONFIG}"
     chmod 600 "${RESIDENTIAL_CONFIG}"
 }
 
@@ -401,7 +411,9 @@ write_singbox_config_from_state() {
 add_url_to_config() {
     local host="$1" port="$2" user="$3" pass="$4"
     if [[ ! -f "${RESIDENTIAL_CONFIG}" ]]; then
-        echo '{"enabled":false,"global":false,"urls":[]}' > "${RESIDENTIAL_CONFIG}"
+        echo '{"enabled":false,"global":false,"urls":[]}' > "${RESIDENTIAL_CONFIG}.tmp" \
+        && chmod 600 "${RESIDENTIAL_CONFIG}.tmp" \
+        && mv "${RESIDENTIAL_CONFIG}.tmp" "${RESIDENTIAL_CONFIG}"
         chmod 600 "${RESIDENTIAL_CONFIG}"
     fi
     # name 按最终数组位置稠密重排（url-1..url-N），避免 length+1 在去重/移除后产生重名
@@ -434,6 +446,12 @@ remove_url_from_config() {
 # 主入口
 # ---------------------------------------------------------------------------
 cmd="${1:-}"
+
+# v3.6.0 R2: 写路径统一加锁（status/domains 只读，不加锁）
+case "$cmd" in
+    setup|enable|disable|reapply|set-domains|global) acquire_relay_lock ;;
+esac
+
 case "$cmd" in
     setup)
         ensure_singbox
@@ -466,6 +484,7 @@ case "$cmd" in
             if [[ "$total" -eq 0 ]]; then
                 jq '.enabled = false' "${RESIDENTIAL_CONFIG}" > "${RESIDENTIAL_CONFIG}.tmp" \
                   && mv "${RESIDENTIAL_CONFIG}.tmp" "${RESIDENTIAL_CONFIG}"
+                chmod 600 "${RESIDENTIAL_CONFIG}"
                 write_singbox_config_direct
                 info "最后一个 URL 已移除，住宅代理已禁用"
             else
@@ -485,6 +504,7 @@ case "$cmd" in
         if [[ -f "${RESIDENTIAL_CONFIG}" ]]; then
             jq '.urls = []' "${RESIDENTIAL_CONFIG}" > "${RESIDENTIAL_CONFIG}.tmp" 2>/dev/null \
               && mv "${RESIDENTIAL_CONFIG}.tmp" "${RESIDENTIAL_CONFIG}" || true
+            chmod 600 "${RESIDENTIAL_CONFIG}"
         fi
         save_config true
         echo "$RESI_EXIT_IP"
@@ -502,6 +522,7 @@ case "$cmd" in
                 .lastVerifiedIp = "" | .lastVerifiedIspInfo = ""' \
                 "${RESIDENTIAL_CONFIG}" > "${RESIDENTIAL_CONFIG}.tmp" \
                 && mv "${RESIDENTIAL_CONFIG}.tmp" "${RESIDENTIAL_CONFIG}"
+            chmod 600 "${RESIDENTIAL_CONFIG}"
         fi
         info "住宅代理已关闭，b-ui-relay 继续运行（直连模式）"
         ;;
@@ -536,9 +557,12 @@ case "$cmd" in
             jq --argjson domains "$2" '.domains = $domains' \
                "${RESIDENTIAL_CONFIG}" > "${RESIDENTIAL_CONFIG}.tmp" \
             && mv "${RESIDENTIAL_CONFIG}.tmp" "${RESIDENTIAL_CONFIG}"
+            chmod 600 "${RESIDENTIAL_CONFIG}"
         else
             jq -n --argjson domains "$2" '{enabled:false,global:false,domains:$domains}' \
-               > "${RESIDENTIAL_CONFIG}"
+               > "${RESIDENTIAL_CONFIG}.tmp" \
+            && chmod 600 "${RESIDENTIAL_CONFIG}.tmp" \
+            && mv "${RESIDENTIAL_CONFIG}.tmp" "${RESIDENTIAL_CONFIG}"
             chmod 600 "${RESIDENTIAL_CONFIG}"
         fi
 
@@ -562,9 +586,12 @@ case "$cmd" in
             jq --argjson g "$new_global" '.global = $g' \
                "${RESIDENTIAL_CONFIG}" > "${RESIDENTIAL_CONFIG}.tmp" \
             && mv "${RESIDENTIAL_CONFIG}.tmp" "${RESIDENTIAL_CONFIG}"
+            chmod 600 "${RESIDENTIAL_CONFIG}"
         else
             jq -n --argjson g "$new_global" '{"enabled":false,"global":$g}' \
-               > "${RESIDENTIAL_CONFIG}"
+               > "${RESIDENTIAL_CONFIG}.tmp" \
+            && chmod 600 "${RESIDENTIAL_CONFIG}.tmp" \
+            && mv "${RESIDENTIAL_CONFIG}.tmp" "${RESIDENTIAL_CONFIG}"
             chmod 600 "${RESIDENTIAL_CONFIG}"
         fi
 

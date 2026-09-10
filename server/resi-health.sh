@@ -3,14 +3,17 @@
 # 对每条住宅 SOCKS5 上游做真实连通探测，按成功率打分；让 sing-box relay 的 urltest 只在"健康"
 # 线路里选——某条质量变差自动从池中剔除（流量转到好的那条），恢复后自动加回。带迟滞防抖，
 # 绝不清空池子（至少留 1 条），仅在池子真发生变化时才 reload relay（平时零打扰）。
-# 由 b-ui-resi-health.timer 每 ~2 分钟触发。
+# 由 b-ui-resi-health.timer 每 ~2 分钟触发。重启有冷却（默认 10 分钟，RESI_HEALTH_RESTART_COOLDOWN 可调）。
 #
 # 关键：池成员(tag + socks 凭据)直接读自 relay 自身的 socks 出站——relay 是 urltest 池 tag 的
 # 唯一真源（住宅 tag 是 resi-1/resi-2，不是 residential-proxy.json 里的 url-1/url-2，别搞混）。
 set -u
-RELAY=/opt/b-ui/singbox-relay.json
-STATE=/opt/b-ui/.resi-health-state.json
-LOG=/var/log/b-ui-resi-health.log
+BASE="${RESI_HEALTH_BASE_DIR:-/opt/b-ui}"
+RELAY="$BASE/singbox-relay.json"
+STATE="$BASE/.resi-health-state.json"
+LOCK="$BASE/.relay.lock"
+LOG="${RESI_HEALTH_LOG:-/var/log/b-ui-resi-health.log}"
+RESTART_COOLDOWN="${RESI_HEALTH_RESTART_COOLDOWN:-600}"
 PROBE_URL="${RESI_HEALTH_PROBE_URL:-https://www.gstatic.com/generate_204}"
 TRIES="${RESI_HEALTH_TRIES:-3}"
 OK_NEED="${RESI_HEALTH_OK_NEED:-2}"
@@ -67,16 +70,27 @@ done < <(jq -c '.outbounds[]|select(.type=="socks")|{tag,server,server_port,user
 if [ "${#desired[@]}" -eq 0 ]; then desired=("${alltags[@]}"); log "WARN 全部线路探测不达标，保留全部避免断流"; fi
 
 des=$(printf '%s\n' "${desired[@]}" | sort -u | jq -R . | jq -cs .)
+# v3.6.0 R2: 只在读-改-写-重启这一段持锁（探测循环不持锁），持锁后重读当前池，避免用陈旧快照覆盖管理员刚做的修改
+exec 9>"$LOCK"
+if ! flock -w 30 9; then log "WARN 获取 relay 锁超时，本轮跳过"; exit 0; fi
 cur=$(jq -c '[.outbounds[]|select(.type=="urltest" and .tag=="resi-pool").outbounds[]]|sort' "$RELAY" 2>/dev/null)
 if [ "$des" != "$cur" ]; then
-    log "住宅池变化: ${cur} → ${des}"
-    if [ "$DRY_RUN" != "1" ]; then
-        jq --argjson d "$des" '.outbounds |= map(if (.type=="urltest" and .tag=="resi-pool") then (.outbounds=$d) else . end)' \
-           "$RELAY" > "${RELAY}.tmp" 2>/dev/null && mv "${RELAY}.tmp" "$RELAY" \
-           && systemctl restart b-ui-relay 2>/dev/null \
-           && log "已更新 singbox-relay.json + 重启 b-ui-relay（住宅池=$(IFS=,; echo "${desired[*]}")）"
+    now=$(date +%s)
+    last=$(jq -r '._last_restart // 0' "$STATE" 2>/dev/null); last=${last:-0}
+    if [ $((now - last)) -lt "$RESTART_COOLDOWN" ]; then
+        log "住宅池需变更 ${cur} → ${des}，重启冷却中（剩余 $((RESTART_COOLDOWN - now + last))s），延后"
+    else
+        log "住宅池变化: ${cur} → ${des}"
+        if [ "$DRY_RUN" != "1" ]; then
+            jq --argjson d "$des" '.outbounds |= map(if (.type=="urltest" and .tag=="resi-pool") then (.outbounds=$d) else . end)' \
+               "$RELAY" > "${RELAY}.tmp" 2>/dev/null && mv "${RELAY}.tmp" "$RELAY" \
+               && systemctl restart b-ui-relay 2>/dev/null \
+               && jq --argjson t "$now" '._last_restart=$t' "$STATE" > "${STATE}.tmp" 2>/dev/null && mv "${STATE}.tmp" "$STATE" \
+               && log "已更新 singbox-relay.json + 重启 b-ui-relay（住宅池=$(IFS=,; echo "${desired[*]}")）"
+        fi
     fi
 fi
+flock -u 9
 
 [ "$DRY_RUN" != "1" ] && { tail -300 "$LOG" > "${LOG}.tmp" 2>/dev/null && mv "${LOG}.tmp" "$LOG" 2>/dev/null; }
 exit 0
