@@ -677,7 +677,9 @@ apply_hy2_userpass_auth() {
     for pair in "config.yaml:hysteria-server" "config-residential.yaml:hysteria-residential"; do
         cfg="${BASE_DIR}/${pair%%:*}"; svc="${pair##*:}"
         [[ -f "$cfg" ]] || continue
-        grep -q '^  type: http' "$cfg" || continue   # 已是 userpass 就跳过
+        # v3.6.0: 锚 $ —— '^  type: http' 也匹配 resolver 段的 type: https，会把已是
+        # userpass 的配置又重写一遍并重启实例
+        grep -qE '^  type: http$' "$cfg" || continue   # 已是 userpass 就跳过
         awk -v upfile="$tmp_up" '
             /^auth:/ {print "auth:"; print "  type: userpass"; print "  userpass:"; while ((getline line < upfile) > 0) print line; close(upfile); skip=1; next}
             skip && /^[a-zA-Z]/ {skip=0}

@@ -687,7 +687,18 @@ migrate_ipv4_only_egress() {
         updated=1
     fi
 
+    local resi_needs_mode4=""
     if [[ -f "$rcfg" ]] && grep -qE '^[[:space:]]+- name: direct$' "$rcfg" && ! grep -qE '^[[:space:]]+mode: 4$' "$rcfg"; then
+        # v3.6.0: 手改过的配置已有 direct: 子块（例如 mode: 64）→ 下面的 awk 会插进第二个
+        # direct: 键，hysteria 拒绝整份配置。这种只提示，交人工处理
+        if grep -qE '^[[:space:]]+direct:$' "$rcfg"; then
+            print_warning "  D9 config-residential.yaml 的 direct 出站已有 direct: 子块（不是 mode: 4），跳过自动迁移；请手动加 mode: 4 后重启 hysteria-residential"
+        else
+            resi_needs_mode4=1
+        fi
+    fi
+
+    if [[ -n "$resi_needs_mode4" ]]; then
         cp "$rcfg" "${rcfg}.bak.v360.${ts}"
         # 只在 "- name: direct" 条目里补 direct.mode（relay 条目不能碰）
         # 缩进照抄 type 行：写死空格数遇到别的缩进风格会把 mode 挂错层级 → YAML 直接坏掉
@@ -705,6 +716,8 @@ migrate_ipv4_only_egress() {
         else
             # 没插进去（配置形态不认识）→ 还原，不重启，也不反复重试
             cp "${rcfg}.bak.v360.${ts}" "$rcfg"
+            # v3.6.0: 还原后备份和原文件一模一样，留着只会每个自愈周期攒一个
+            rm -f "${rcfg}.bak.v360.${ts}"
             print_warning "  D9 config-residential.yaml direct 出站形态不认识，已还原"
         fi
     fi
@@ -1085,7 +1098,9 @@ EOF
                 for _pair in "config.yaml:hysteria-server" "config-residential.yaml:hysteria-residential"; do
                     _cfg="${BASE_DIR}/${_pair%%:*}"; _svc="${_pair##*:}"
                     [[ -f "$_cfg" ]] || continue
-                    grep -q '^  type: http' "$_cfg" || continue
+                    # v3.6.0: 必须锚 $ —— '^  type: http' 也匹配 resolver 段的 type: https
+                    # （每份 hy2 配置都有），于是每次自愈都重写 auth 块 + 重启两个实例
+                    grep -qE '^  type: http$' "$_cfg" || continue
                     awk -v upfile="$_upf" '
                         /^auth:/ {print "auth:"; print "  type: userpass"; print "  userpass:"; while ((getline line < upfile) > 0) print line; close(upfile); skip=1; next}
                         skip && /^[a-zA-Z]/ {skip=0}
