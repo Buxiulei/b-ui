@@ -924,6 +924,48 @@ function loadResiHealth() {
         const typeKind = dotClass === "active" ? "good" : (dotClass === "warn" ? "warn" : "");
         body.appendChild(_sysKv("IP 类型", _sysTag(_sysFmt(type), typeKind)));
         body.appendChild(_sysKv("分流关键词", _sysFmt(r.domains_count) + " 个"));
+
+        // v3.6.0 R7: 中继成员表 —— 真源是 singbox-relay.json 的 socks 出站（与巡检同源），
+        // 高亮行是 selector 当前选中的出口；巡检列是 .resi-health-state.json 的迟滞判定
+        const members = Array.isArray(r.members) ? r.members : [];
+        if (members.length) {
+            const tbl = document.createElement("div");
+            tbl.className = "resi-members";
+            const head = document.createElement("div");
+            head.className = "resi-member resi-member-head";
+            ["线路", "上游", "巡检", "出口 IP", "类型"].forEach(t => {
+                const c = document.createElement("span");
+                c.textContent = t;
+                head.appendChild(c);
+            });
+            tbl.appendChild(head);
+            members.forEach(m => {
+                const selected = !!r.selected && m.tag === r.selected;
+                const row = document.createElement("div");
+                row.className = "resi-member" + (selected ? " selected" : "");
+                if (selected) row.title = "当前选中的出口";
+                const eg = m.egress || {};
+                const cTag = document.createElement("span");
+                cTag.textContent = m.tag || "-";
+                const cUp = document.createElement("span");
+                cUp.textContent = (m.host || "-") + (m.port ? ":" + m.port : "");
+                cUp.title = cUp.textContent;
+                const cState = document.createElement("span");
+                const chip = _sysTag(m.active ? "健康" : "已剔除", m.active ? "good" : "bad");
+                chip.title = m.active
+                    ? "连续健康 " + (m.okstreak || 0) + " 轮"
+                    : "连续不达标 " + (m.failstreak || 0) + " 轮，已从可选线路里剔除";
+                cState.appendChild(chip);
+                const cIp = document.createElement("span");
+                cIp.textContent = eg.ip || "—";
+                const cType = document.createElement("span");
+                cType.textContent = eg.type || "unknown";
+                cType.title = eg.isp || "";
+                row.append(cTag, cUp, cState, cIp, cType);
+                tbl.appendChild(row);
+            });
+            body.appendChild(tbl);
+        }
     }).catch(() => {
         if (btn) { btn.disabled = false; btn.textContent = "检查"; }
         _sysErr(body, "读取失败", loadResiHealth);

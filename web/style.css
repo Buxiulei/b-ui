@@ -1156,6 +1156,23 @@ select {
 .resi-ip-pill:hover  { background: rgba(47, 158, 93, 0.22); }
 .resi-ip-pill.copied { background: rgba(47, 158, 93, 0.32); }
 
+/* v3.6.0 R7: 住宅健康卡的中继成员表 */
+.resi-members { margin-top: 10px; border-top: 1px solid var(--hairline); }
+
+.resi-member {
+    display: grid;
+    grid-template-columns: 52px minmax(0, 1fr) 58px minmax(0, 1fr) minmax(0, 76px);
+    gap: 8px;
+    align-items: center;
+    padding: 6px 4px;
+    font-size: 11px;
+    border-bottom: 1px solid var(--hairline);
+}
+
+.resi-member > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.resi-member-head { color: var(--text-dim); font-size: 10px; letter-spacing: 0.04em; }
+.resi-member.selected { background: var(--ivory-200); border-radius: 6px; font-weight: 600; }
+
 .resi-isp {
     margin-top: 5px;
     font-size: 11px;

@@ -520,6 +520,83 @@ function getResidentialConfig() {
     return { enabled: false, global: false, domains: [] };
 }
 
+// v3.6.0 R6: 中继 Clash API（只监听回环，与 residential-helper.sh 的 SINGBOX_RELAY_API 同值）
+const RELAY_CLASH_API = "127.0.0.1:9091";
+
+// v3.6.0 R3: curl 配置文件双引号内需转义 \ 与 "（凭据经 stdin 传入，不出现在 argv 里）
+const curlCfgEscape = (s) => String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+
+// 经某条住宅 SOCKS5 取一个 JSON 接口；host/port 非法或凭据含换行 → null（不发请求）
+function curlJsonViaSocks(member, url, timeoutSec) {
+    return new Promise((resolve) => {
+        const user = member.username || "";
+        const pass = member.password || "";
+        if (/[\r\n]/.test(`${user}${pass}`)) return resolve(null);
+        if (!/^[A-Za-z0-9.\-\[\]:]+$/.test(String(member.host)) || !/^\d{1,5}$/.test(String(member.port))) {
+            return resolve(null);
+        }
+        let cfg = `proxy = "socks5h://${curlCfgEscape(member.host)}:${curlCfgEscape(member.port)}"\n`;
+        if (user && pass) cfg += `proxy-user = "${curlCfgEscape(user)}:${curlCfgEscape(pass)}"\n`;
+        const child = execFile("curl", ["-K", "-", "-m", String(timeoutSec), "-sS", url],
+            { timeout: (timeoutSec + 1) * 1000, maxBuffer: 1024 * 1024 },
+            (err, stdout) => {
+                if (err || !stdout) return resolve(null);
+                try { resolve(JSON.parse(String(stdout))); } catch { resolve(null); }
+            });
+        child.stdin.on("error", () => { });
+        child.stdin.end(cfg);
+    });
+}
+
+// v3.6.0 R9: api.ipapi.is 响应 → 出口画像。2026-09-01 起匿名层（无 API key）只回 11 个字段，
+// is_datacenter/is_proxy/is_vpn/is_tor/is_mobile 已移到 key 后面（见 https://ipapi.is/free-tier.html），
+// 且 company/asn 从对象变成字符串——两种形状都要吃下，一个检测布尔都没有时类型只报 unknown 不瞎猜。
+function ipapiEgress(d) {
+    const flags = ["is_datacenter", "is_proxy", "is_vpn", "is_tor", "is_mobile"];
+    let type = "unknown";
+    if (flags.some(k => typeof d[k] === "boolean")) {
+        if (d.is_datacenter === true) type = "IDC机房 IP";
+        else if (d.is_proxy === true || d.is_vpn === true || d.is_tor === true) type = "代理 IP";
+        else if (d.is_mobile === true) type = "移动网络 IP";
+        else type = "家庭宽带 IP";
+    }
+    const company = typeof d.company === "string" ? d.company : (d.company?.name || "");
+    const asn = typeof d.asn === "string" ? d.asn
+        : (d.asn ? [d.asn.asn ? `AS${d.asn.asn}` : "", d.asn.org || ""].filter(Boolean).join(" ") : "");
+    const loc = d.location || {};
+    return {
+        ip: d.ip || null,
+        type,
+        isp: [asn, company].filter(Boolean).join(" — ") || null,
+        country: d.country || loc.country || null,
+        city: d.city || loc.city || null,
+    };
+}
+
+// 单条住宅出口探测：主源 HTTPS api.ipapi.is，失败/非 JSON 回退 https://ipinfo.io/json（类型 unknown）
+async function probeEgress(member) {
+    const a = await curlJsonViaSocks(member, "https://api.ipapi.is/", 8);
+    if (a && a.ip) return ipapiEgress(a);
+    const b = await curlJsonViaSocks(member, "https://ipinfo.io/json", 8);
+    if (b && b.ip) {
+        return { ip: b.ip, type: "unknown", isp: b.org || null, country: b.country || null, city: b.city || null };
+    }
+    return null;
+}
+
+// selector 当前选中的成员；relay 未运行或是旧配置（无 clash_api）→ null
+function getRelaySelected() {
+    return new Promise((resolve) => {
+        const req = http.get(`http://${RELAY_CLASH_API}/proxies/resi-pool`, { timeout: 1000 }, (resp) => {
+            let body = "";
+            resp.on("data", (c) => { body += c; if (body.length > 65536) req.destroy(); });
+            resp.on("end", () => { try { resolve(JSON.parse(body).now || null); } catch { resolve(null); } });
+        });
+        req.on("timeout", () => req.destroy());
+        req.on("error", () => resolve(null));
+    });
+}
+
 // 生成 sing-box 融合配置 — v3.6.0: sing-box 1.12-1.14 语法 + IPv6 接管(ipv4_only + v6 reject)
 // v3.5.11: 补住宅出口 (10002 Reality / 40000 HY2) + 住宅域名分流
 // 节点集合与 /api/sub/ 对齐：fusion=直连+住宅，单协议按 residential 决定直连版/住宅版
@@ -2223,8 +2300,10 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                 }
             }
 
-            // 住宅 IP 健康检查 - 返回当前出口 IP / ISP / IP 类型
-            // 不暴露 socks5 凭据；通过本地 socks5 出口实测 ping0.cc
+            // 住宅 IP 健康检查 — v3.6.0 R7: 成员真源是中继的 socks 出站（与 resi-health.sh 同源，
+            // 不再只拨 residential-proxy.json 顶层 host —— 那是"最后一次 --add 的那条"，可能已不在池里）；
+            // 附巡检状态(active/failstreak/okstreak)与 selector 当前选择，每成员并行做一次 HTTPS 出口探测。
+            // 顶层旧字段由当前选择的成员派生，面板旧渲染继续可用；密码不出现在响应里。
             if (r === "residential/health" && req.method === "GET") {
                 let raw = { enabled: false };
                 try {
@@ -2233,20 +2312,39 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                     }
                 } catch { }
 
-                // 优先读 sing-box 实际生效配置（source of truth）；fallback 用 residential-proxy.json
+                // sing-box 实际生效配置是真源（成员 / 池类型 / 分流关键词）
+                let relay = null;
+                try { relay = JSON.parse(fs.readFileSync(`${BASE_DIR}/singbox-relay.json`, "utf8")); } catch { }
+
                 let domainsList = [];
-                try {
-                    const sb = JSON.parse(fs.readFileSync("/opt/b-ui/singbox-relay.json", "utf8"));
-                    const rules = sb?.route?.rules || [];
-                    for (const rl of rules) {
-                        if (Array.isArray(rl.domain_keyword) && rl.domain_keyword.length > domainsList.length) {
-                            domainsList = rl.domain_keyword;
-                        }
+                for (const rl of (relay?.route?.rules || [])) {
+                    if (Array.isArray(rl.domain_keyword) && rl.domain_keyword.length > domainsList.length) {
+                        domainsList = rl.domain_keyword;
                     }
-                } catch { }
+                }
                 if (!domainsList.length && raw.domains && raw.domains.length) {
                     domainsList = raw.domains;
                 }
+
+                let healthState = {};
+                try {
+                    healthState = JSON.parse(fs.readFileSync(`${BASE_DIR}/.resi-health-state.json`, "utf8"));
+                } catch { }
+
+                const relayOutbounds = Array.isArray(relay?.outbounds) ? relay.outbounds : [];
+                const members = relayOutbounds
+                    .filter(o => o && o.type === "socks" && o.tag)
+                    .slice(0, 8)
+                    .map(o => ({
+                        tag: o.tag,
+                        host: o.server,
+                        port: o.server_port,
+                        username: o.username || "",
+                        password: o.password || "",
+                    }));
+                const pool = relayOutbounds.find(o => o && o.tag === "resi-pool");
+                const mode = (pool && (pool.type === "selector" || pool.type === "urltest")) ? pool.type : "none";
+
                 const safeUrls = [];
                 if (raw.enabled && raw.host) {
                     safeUrls.push({
@@ -2262,79 +2360,47 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                     enabled: !!raw.enabled,
                     urls: safeUrls,
                     domains_count: domainsList.length,
+                    mode,
+                    selected: null,
+                    members: [],
                     current_egress_ip_test: null,
                     egress_ip_type: "unknown",
                     via_proxy_isp: null,
                 };
 
-                if (!raw.enabled) {
+                if (!raw.enabled || !members.length) {
                     return sendJSON(res, baseResp);
                 }
 
-                // v3.4.22 关键改进：用 ip-api.com 的 hosting 字段（权威判断）替代 ASN 关键词正则
-                // ip-api.com 的 hosting=true/false 综合多个数据库 + IP 行为分析，比单纯按 ASN 名称推断准确得多
-                //   - hosting:false + proxy:false + mobile:false → 家庭宽带 IP（真 residential）
-                //   - hosting:true → IDC机房 IP
-                //   - mobile:true → 移动网络 IP
-                //   - proxy:true → 代理/匿名 IP
-                // 通过 sing-box socks5 中继访问（127.0.0.1:2080），ip-api.com 不在分流关键词列表，
-                // 但本 endpoint 测的就是"住宅链路是否通"——所以**直接拨住宅 socks5**绕开路由
-                // 用 ping0.cc/geo 同时拿一份做对照（ping0 命中 keyword 走住宅，是双重验证）
-                // v3.6.0 R3: 凭据经 stdin 配置文件传给 curl，不出现在进程参数里（ps / /proc/<pid>/cmdline 可见）
-                const curlCfgEscape = (s) => String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-                // 换行会在配置里注入额外的 curl 指令，一律拒绝
-                if (/[\r\n]/.test(`${raw.username || ""}${raw.password || ""}`)) {
-                    return sendJSON(res, baseResp);
-                }
-                // host/port 直接进 proxy 行，走白名单（含 IPv6 字面量的 [] 与 :）
-                if (!/^[A-Za-z0-9.\-\[\]:]+$/.test(String(raw.host)) || !/^\d{1,5}$/.test(String(raw.port))) {
-                    return sendJSON(res, baseResp);
-                }
-                let curlCfg = `proxy = "socks5h://${curlCfgEscape(raw.host)}:${curlCfgEscape(raw.port)}"\n`;
-                if (raw.username && raw.password) {
-                    curlCfg += `proxy-user = "${curlCfgEscape(raw.username)}:${curlCfgEscape(raw.password)}"\n`;
-                }
-                const child = execFile("curl", [
-                    "-K", "-",
-                    "-m", "8",
-                    "-sS",
-                    "http://ip-api.com/json/?fields=status,country,city,isp,org,as,mobile,proxy,hosting,query"
-                ], { timeout: 9000, maxBuffer: 1 * 1024 * 1024 }, (err, stdout) => {
-                    if (err || !stdout) {
-                        return sendJSON(res, baseResp);
-                    }
-                    try {
-                        const data = JSON.parse(String(stdout));
-                        if (data.status !== "success") {
-                            return sendJSON(res, baseResp);
-                        }
-                        const ip = data.query || null;
-                        const isp = data.isp || data.org || "";
-                        const asn = data.as || "";
-                        const country = data.country || "";
-                        const city = data.city || "";
-
-                        // 权威类型判断：ip-api 的 hosting / proxy / mobile boolean
-                        let egressType = "家庭宽带 IP"; // 默认假设住宅（true residential）
-                        if (data.hosting === true) egressType = "IDC机房 IP";
-                        else if (data.proxy === true) egressType = "代理 IP";
-                        else if (data.mobile === true) egressType = "移动网络 IP";
-
-                        const ispLabel = [asn, isp].filter(Boolean).join(" — ") +
-                                         (country ? ` (${city ? city + ', ' : ''}${country})` : '');
-
-                        return sendJSON(res, {
-                            ...baseResp,
-                            current_egress_ip_test: ip,
-                            egress_ip_type: egressType,
-                            via_proxy_isp: ispLabel.trim() || null,
-                        });
-                    } catch {
-                        return sendJSON(res, baseResp);
-                    }
-                });
-                child.stdin.on("error", () => { });
-                child.stdin.end(curlCfg);
+                (async () => {
+                    const [selected, egressList] = await Promise.all([
+                        getRelaySelected(),
+                        Promise.all(members.map(m => probeEgress(m))),
+                    ]);
+                    const rows = members.map((m, i) => {
+                        const st = healthState[m.tag] || {};
+                        return {
+                            tag: m.tag,
+                            host: m.host,
+                            port: m.port,
+                            active: st.active !== false,
+                            failstreak: st.failstreak || 0,
+                            okstreak: st.okstreak || 0,
+                            egress: egressList[i],
+                        };
+                    });
+                    const cur = rows.find(x => x.tag === selected) || rows[0];
+                    const eg = (cur && cur.egress) || null;
+                    const place = eg && eg.country ? ` (${eg.city ? eg.city + ", " : ""}${eg.country})` : "";
+                    return sendJSON(res, {
+                        ...baseResp,
+                        selected: selected || null,
+                        members: rows,
+                        current_egress_ip_test: (eg && eg.ip) || null,
+                        egress_ip_type: (eg && eg.type) || "unknown",
+                        via_proxy_isp: (((eg && eg.isp) || "") + place).trim() || null,
+                    });
+                })().catch(() => sendJSON(res, baseResp));
                 return;
             }
 
