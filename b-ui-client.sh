@@ -1686,9 +1686,23 @@ _jf() {
     local json="$1" key="$2"
     if command -v jq &>/dev/null; then
         printf '%s' "$json" | jq -r --arg k "$key" '.[$k] | if . == null then empty else . end' 2>/dev/null
-    else
-        printf '%s' "$json" | sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"\{0,1\}\([^\",}]*\)\"\{0,1\}.*/\1/p" | head -1
+        return
     fi
+    # 无 jq 时的 sed 版。两点讲究：
+    # 1) 先把"嵌套对象/数组的值"换成 null，只认顶层字段——接口改版把字段挪进 data.* 时
+    #    要和 jq 一样判空回退，而不是被内层的同名字段骗过去
+    # 2) 带引号的值先按字符串整体取（值里可以有逗号、转义引号），取不到再按裸值取
+    #    （数字/布尔/null）；原来的 [^",}]* 会把 "Washington, D.C." 截成 "Washington"
+    local flat v
+    flat=$(printf '%s' "$json" | tr -d '\n' \
+        | sed -e 's/:[[:space:]]*{[^{}]*}/:null/g' -e 's/:[[:space:]]*\[[^][]*\]/:null/g')
+    v=$(printf '%s' "$flat" | sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"\(\([^\"\\]\|\\\\.\)*\)\".*/\1/p")
+    if [[ -n "$v" ]]; then
+        # 常见转义还原，跟 jq -r 的输出对齐（\uXXXX 不处理，本接口用不到）
+        printf '%s\n' "$v" | sed -e 's/\\"/"/g' -e 's|\\/|/|g' -e 's/\\\\/\\/g'
+        return
+    fi
+    printf '%s\n' "$(printf '%s' "$flat" | sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\([^\",}]*\).*/\1/p")"
 }
 
 # ip-api 的 hosting/proxy/mobile 布尔 → 中文类型（措辞沿用 test_proxy）
@@ -1707,29 +1721,36 @@ _ipapi_type() {
 
 # probe_egress <4|6> [socks_port]
 # 输出 key=value 行：ip country region city org type score source（拿不到就为空）
+# 超时预算（最坏 30s）：ippure 8 + ip-api 6 + ipify 5 + icanhazip 5 + v6 归属 6
 probe_egress() {
     local fam="$1" sp="${2:-}"
-    local proxy=()
-    [[ -n "$sp" ]] && proxy=(--socks5-hostname "127.0.0.1:${sp}")
     local ip="" country="" region="" city="" org="" type="" score="" source="" j=""
 
     if [[ "$fam" == "4" ]]; then
+        # IPv4 才走代理：TUN 模式不传 sp（隧道已接管），SOCKS 模式经本机 SOCKS 出去
+        local proxy=()
+        [[ -n "$sp" ]] && proxy=(--socks5-hostname "127.0.0.1:${sp}")
         j=$(curl -4 -sL --max-time 8 "${proxy[@]}" https://my.ippure.com/v1/info 2>/dev/null)
-        if [[ "$j" == *'"ip"'* && "$j" == *'"isResidential"'* ]]; then
-            ip=$(_jf "$j" ip)
+        # 先解析再判空：原文里有没有字段名不作数（502 页面 / 改版把字段挪进 data.* /
+        # 值为空串或 null 时都必须回退），ip 与 isResidential 缺一就走 ip-api
+        ip=$(_jf "$j" ip)
+        local resi
+        resi=$(_jf "$j" isResidential)
+        if [[ -n "$ip" && -n "$resi" ]]; then
             country=$(_jf "$j" country)
             region=$(_jf "$j" region)
             city=$(_jf "$j" city)
             org=$(_jf "$j" asOrganization)
             score=$(_jf "$j" fraudScore)
             source="ippure"
-            if [[ "$(_jf "$j" isResidential)" == "true" ]]; then
+            if [[ "$resi" == "true" ]]; then
                 type="家庭宽带 IP（住宅）"
             else
                 type="IDC 机房 IP（数据中心）"
             fi
         else
-            j=$(curl -4 -sL --max-time 8 "${proxy[@]}" 'http://ip-api.com/json/?fields=status,country,regionName,city,isp,org,as,mobile,proxy,hosting,query' 2>/dev/null)
+            ip=""
+            j=$(curl -4 -sL --max-time 6 "${proxy[@]}" 'http://ip-api.com/json/?fields=status,country,regionName,city,isp,org,as,mobile,proxy,hosting,query' 2>/dev/null)
             if [[ "$(_jf "$j" status)" == "success" ]]; then
                 ip=$(_jf "$j" query)
                 country=$(_jf "$j" country)
@@ -1741,11 +1762,19 @@ probe_egress() {
             fi
         fi
     else
-        ip=$(curl -6 -sS --max-time 6 "${proxy[@]}" https://api6.ipify.org 2>/dev/null | tr -d '[:space:]')
-        [[ "$ip" == *:* ]] || ip=$(curl -6 -sS --max-time 6 "${proxy[@]}" https://ipv6.icanhazip.com 2>/dev/null | tr -d '[:space:]')
-        [[ "$ip" == *:* ]] || ip=""
+        # IPv6 一律直连、忽略 $sp：curl -6 连不上 IPv4 字面量的本机 SOCKS（握手前就 exit 7），
+        # 而且服务端本就没有 v6 出口——SOCKS 模式下有意义的只是"本机 IPv6"，
+        # TUN 模式下直连就是经 TUN，拿不到才说明 v6 被隧道拦住了
+        local v6api
+        for v6api in https://api6.ipify.org https://ipv6.icanhazip.com; do
+            ip=$(curl -6 -fsS --max-time 5 "$v6api" 2>/dev/null | tr -d '[:space:]')
+            # 严格校验：错误页 / JSON 报错 / IPv4 都可能带 ':'，只认十六进制与冒号且 ≤39 字符
+            [[ "$ip" =~ ^[0-9A-Fa-f:]+$ && "$ip" == *:* && ${#ip} -le 39 ]] && break
+            ip=""
+        done
         if [[ -n "$ip" ]]; then
-            j=$(curl -4 -sL --max-time 8 "http://ip-api.com/json/${ip}?fields=status,country,regionName,city,isp,org,as,mobile,proxy,hosting" 2>/dev/null)
+            # ip-api 免费层没有 IPv6 传输，但支持按 IPv6 地址查询（走 IPv4、直连）
+            j=$(curl -4 -fsS --max-time 6 "http://ip-api.com/json/${ip}?fields=status,country,regionName,city,isp,org,as,mobile,proxy,hosting" 2>/dev/null)
             if [[ "$(_jf "$j" status)" == "success" ]]; then
                 country=$(_jf "$j" country)
                 region=$(_jf "$j" regionName)
@@ -1762,10 +1791,11 @@ probe_egress() {
 }
 
 # print_egress_rows <tun_running:true|false> [socks_port]
-# 打印 IPv4 / IPv6 两行出口信息；IPv4 拿不到就返回非 0（供调用方计入失败项）
+# 打印 IPv4 / IPv6 两行出口信息。返回非 0（调用方计入失败项）的两种情况：
+# IPv4 两个源都拿不到；TUN 模式下探到了 IPv6 地址（说明 v6 没进隧道 = 泄漏）
 print_egress_rows() {
     local tun="${1:-false}" sp="${2:-}"
-    local ip country region city org type score source k v geo
+    local ip country region city org type score source k v geo rc=0
 
     ip=""; country=""; region=""; city=""; org=""; type=""; score=""; source=""
     while IFS='=' read -r k v; do
@@ -1775,9 +1805,7 @@ print_egress_rows() {
         esac
     done <<< "$(probe_egress 4 "$sp")"
 
-    local v4_ok=false
     if [[ -n "$ip" ]]; then
-        v4_ok=true
         geo="${country}${city:+·${city}}"
         echo -e "  ${GREEN}✓${NC} IPv4 出口: ${YELLOW}${ip}${NC}  ${geo:-归属未知}  ${org:-运营商未知}"
         if [[ "$type" == *住宅* ]]; then
@@ -1787,6 +1815,7 @@ print_egress_rows() {
         fi
     else
         echo -e "  ${RED}✗${NC} IPv4 出口: 获取失败（ippure.com 与 ip-api.com 都不可达）"
+        rc=1
     fi
 
     ip=""; country=""; region=""; city=""; org=""; type=""; score=""; source=""
@@ -1795,7 +1824,7 @@ print_egress_rows() {
             ip) ip="$v" ;; country) country="$v" ;; region) region="$v" ;; city) city="$v" ;;
             org) org="$v" ;; type) type="$v" ;; score) score="$v" ;; source) source="$v" ;;
         esac
-    done <<< "$(probe_egress 6 "$sp")"
+    done <<< "$(probe_egress 6)"   # v6 一律直连，不传 socks 端口
 
     geo="${country}${city:+·${city}}"
     if [[ "$tun" == "true" ]]; then
@@ -1804,6 +1833,8 @@ print_egress_rows() {
             echo -e "  ${GREEN}✓${NC} IPv6 出口: 已被隧道拦截（无泄漏）"
         else
             echo -e "  ${RED}⚠${NC} IPv6 出口: ${YELLOW}${ip}${NC}  ${geo:-归属未知}  ${RED}IPv6 泄漏（未进隧道）${NC}"
+            # 泄漏是真失败，要让测试 6 计入失败项，而不是只画一行 ⚠
+            rc=1
         fi
     else
         if [[ -n "$ip" ]]; then
@@ -1814,7 +1845,7 @@ print_egress_rows() {
         fi
     fi
 
-    $v4_ok
+    return $rc
 }
 
 # 检测公网 IP 和连通性
