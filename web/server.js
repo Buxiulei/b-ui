@@ -52,6 +52,19 @@ const CONFIG = {
     xrayApiPort: 10085
 };
 
+// v3.6.0: 国内域名直连后缀，与 b-ui-client.sh TUN 模板同源；不用 remote rule_set（1.13/1.15 字段不兼容）
+const CN_DIRECT_SUFFIXES = [
+    ".qq.com", ".qpic.cn", ".qlogo.cn", ".wechat.com", ".weixin.qq.com", ".wx.qq.com",
+    ".tencent.com", ".tencent-cloud.net", ".myqcloud.com", ".gtimg.com",
+    ".xiaohongshu.com", ".xhscdn.com", ".douyin.com", ".douyincdn.com", ".amemv.com",
+    ".bytedance.com", ".bytecdntp.com", ".toutiao.com", ".iesdouyin.com",
+    ".kuaishou.com", ".ksapisrv.com", ".bilibili.com", ".bilivideo.com", ".hdslb.com",
+    ".taobao.com", ".tbcdn.cn", ".alicdn.com", ".aliyuncs.com", ".alipay.com",
+    ".alipayobjects.com", ".alibaba.com", ".alibabacloud.com", ".tmall.com", ".tmall.hk",
+    ".jd.com", ".360buyimg.com", ".jdcdn.com", ".baidu.com", ".bdstatic.com",
+    ".bdimg.com", ".cn"
+];
+
 // v3.5.0: 获取服务器 IP — 订阅 URL 用 IP literal 防客户端 DNS 投毒
 // 优先 SERVER_IP env → /opt/b-ui/server_ip.txt → ip route 探测出口 IP → 127.0.0.1 兜底
 function getServerIP() {
@@ -485,7 +498,8 @@ function getResidentialConfig() {
     return { enabled: false, global: false, domains: [] };
 }
 
-// 生成 sing-box 融合配置 — v3.5.11: 补住宅出口 (10002 Reality / 40000 HY2) + 住宅域名分流
+// 生成 sing-box 融合配置 — v3.6.0: sing-box 1.12-1.14 语法 + IPv6 接管(ipv4_only + v6 reject)
+// v3.5.11: 补住宅出口 (10002 Reality / 40000 HY2) + 住宅域名分流
 // 节点集合与 /api/sub/ 对齐：fusion=直连+住宅，单协议按 residential 决定直连版/住宅版
 function generateSingboxConfig(user, cfg, host) {
     const resi = getResidentialConfig();
@@ -508,7 +522,7 @@ function generateSingboxConfig(user, cfg, host) {
         server: host,
         server_port: parseInt(port),
         connect_timeout: "2s",
-        ...(hopStart ? { hop_ports: `${hopStart}-${hopEnd}`, hop_interval: "30s" } : {}),
+        ...(hopStart ? { server_ports: [`${hopStart}:${hopEnd}`], hop_interval: "30s" } : {}),
         ...(useObfs && cfg.obfs?.enabled && cfg.obfs.type === "salamander" && cfg.obfs.password
             ? { obfs: { type: "salamander", password: cfg.obfs.password } } : {}),
         password: `${user.username}:${user.password}`,
@@ -594,10 +608,12 @@ function generateSingboxConfig(user, cfg, host) {
     // 否则单池直接 final，行为与旧版一致
     const hasSplit = directTags.length > 0 && resiTags.length > 0;
     let primaryTag;
+    // 顺序：sniff → DNS 劫持 → 私网直连 → IPv6 reject（服务端无 v6 出口，RST 让应用回退 v4）→ 住宅关键字 → cn 直连
     const routeRules = [
-        { protocol: "dns", outbound: "dns-out" },
-        { geoip: ["cn", "private"], outbound: "direct" },
-        { geosite: "cn", outbound: "direct" }
+        { action: "sniff" },
+        { protocol: "dns", action: "hijack-dns" },
+        { ip_is_private: true, outbound: "direct" },
+        { ip_version: 6, action: "reject" }
     ];
     let routeFinal;
 
@@ -622,9 +638,16 @@ function generateSingboxConfig(user, cfg, host) {
         routeFinal = "proxy";
     }
 
+    // 住宅关键字规则（上面 hasSplit 分支里 push）优先级高于 cn 直连
+    routeRules.push({ domain_suffix: CN_DIRECT_SUFFIXES, outbound: "direct" });
+
     outbounds.push({ type: "direct", tag: "direct" });
-    outbounds.push({ type: "block", tag: "block" });
-    outbounds.push({ type: "dns", tag: "dns-out" });
+
+    // 服务器域名预解析：防 GFW 投毒 bootstrap（与 b-ui-client.sh 同款 predefined 规则）
+    const serverIp = getServerIP();
+    const hostIsDomain = !/^\d+\.\d+\.\d+\.\d+$/.test(host);
+    const predefined = (hostIsDomain && /^\d+\.\d+\.\d+\.\d+$/.test(serverIp) && serverIp !== "127.0.0.1")
+        ? [{ domain: [host], action: "predefined", answer: [`${host}. IN A ${serverIp}`] }] : [];
 
     return {
         log: { level: "info", timestamp: true },
@@ -639,14 +662,15 @@ function generateSingboxConfig(user, cfg, host) {
         },
         dns: {
             servers: [
-                { tag: "google", address: "https://8.8.8.8/dns-query", detour: primaryTag },
-                { tag: "local", address: "223.5.5.5", detour: "direct" }
+                { tag: "remote", type: "https", server: "8.8.8.8", detour: primaryTag },
+                { tag: "local", type: "udp", server: "223.5.5.5" }
             ],
             rules: [
-                { domain_suffix: [".cn"], server: "local" },
-                { query_type: ["A", "AAAA"], server: "google" }
+                ...predefined,
+                { domain_suffix: CN_DIRECT_SUFFIXES, server: "local" }
             ],
-            final: "google"
+            final: "remote",
+            strategy: "ipv4_only"
         },
         inbounds: [
             { type: "mixed", tag: "mixed-in", listen: "127.0.0.1", listen_port: 7890 },
@@ -654,18 +678,17 @@ function generateSingboxConfig(user, cfg, host) {
                 type: "tun",
                 tag: "tun-in",
                 interface_name: "bui-tun",
-                inet4_address: "172.19.0.1/30",
+                address: ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
                 auto_route: true,
-                strict_route: true,
-                stack: "system",
-                sniff: true
+                strict_route: true
             }
         ],
         outbounds,
         route: {
             rules: routeRules,
             final: routeFinal,
-            auto_detect_interface: true
+            auto_detect_interface: true,
+            default_domain_resolver: "local"
         }
     };
 }
