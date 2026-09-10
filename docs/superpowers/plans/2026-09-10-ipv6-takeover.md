@@ -751,6 +751,8 @@ git commit -m "feat(ipv6): 客户端 TUN 出站按解析出的 IP 连接、SNI �
 - 订阅/客户端：开 salamander obfs 后 Clash 订阅与 Linux 客户端补齐 obfs 字段（此前静默连不上）。
 - 内核更新：Xray 版本探测改用 releases 列表（`/releases/latest` 因 prerelease 标记卡在 v26.3.27）；sing-box 自动升级上限 1.14。
 - update.sh：D6 守卫锚定 `type: http$`（此前每次自愈都误重启两个 hysteria 实例）；D9 边角修正。
+- 客户端：TUN 模式切换节点稳定性（巡检 TUN 感知、systemd Conflicts/TimeoutStopSec、侧车判定、启动轮询、切换不重启 hysteria-client）；连接测试与 TUN 自检显示 IPv4/IPv6 出口 IP、归属地与机房判定（ippure.com，回退 ip-api）。
+- 住宅追加：中继改 selector + Clash API 热切换（巡检按健康度粘住不再重启）；体检端点以中继成员为真源并暴露巡检状态，数据源改 HTTPS；供应商粘性参数指南与面板提示。
 - 重启硬化（体检 P0）：v2rayN 订阅 HY2直连 `mport` 按 `config.yaml` 实际监听输出；用户变更只在配置真变化时非阻塞重启对应服务；自更新按变更文件门控重启 + cron 抖动 + 内核更新按版本变化重启；安装期依赖复查（含 flock）、缺 jq 时 userpass 迁移给出警告。
 - 备注：`singbox-converter` 为未使用依赖（本次未删）。
 
@@ -768,6 +770,8 @@ bash $S/resi-tests/test_domains.sh && bash $S/resi-tests/test_lock_cooldown.sh &
 bash $S/restart-tests/test_mport.sh && bash $S/restart-tests/test_restart_gate.sh && bash $S/restart-tests/test_auto_update.sh && bash $S/restart-tests/test_deps.sh
 bash $S/resi-tests/test_udp_rules.sh && bash $S/resi-tests/test_probe_rate.sh
 bash $S/obfs-tests/test_obfs_clash.sh && bash $S/obfs-tests/test_obfs_client.sh && bash $S/kernel-tests/test_version_probe.sh && bash $S/kernel-tests/test_update_hygiene.sh
+bash $S/resi-tests/test_selector_switch.sh && bash $S/resi-tests/test_health_endpoint.sh
+bash $S/client-tests/test_switch_stability.sh && bash $S/client-tests/test_probe_egress.sh
 git status --short   # 只应有 version.json
 ```
 
