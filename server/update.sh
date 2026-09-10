@@ -1798,8 +1798,14 @@ auto_update_kernel() {
     if [[ -n "$local_hy" && -n "$remote_hy" ]] && _is_newer "$local_hy" "$remote_hy"; then
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] Hysteria2: v${local_hy} -> v${remote_hy}, 更新中..." >> "$LOG_FILE"
         bash <(curl -fsSL https://get.hy2.sh/) >> "$LOG_FILE" 2>&1 || true
-        systemctl restart hysteria-server 2>/dev/null || true
-        updated=true
+        local new_hy; new_hy=$(hysteria version 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/^v//' || echo "")
+        if [[ -n "$new_hy" && "$new_hy" != "$local_hy" ]]; then
+            systemctl restart hysteria-server 2>/dev/null || true
+            systemctl is-active --quiet hysteria-residential 2>/dev/null && systemctl restart hysteria-residential 2>/dev/null || true
+            updated=true
+        else
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Hysteria2 安装未生效（仍为 v${local_hy}），跳过重启" >> "$LOG_FILE"
+        fi
     fi
 
     # Xray
@@ -1810,8 +1816,13 @@ auto_update_kernel() {
         if [[ -n "$local_xray" && -n "$remote_xray" ]] && _is_newer "$local_xray" "$remote_xray"; then
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] Xray: v${local_xray} -> v${remote_xray}, 更新中..." >> "$LOG_FILE"
             bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install >> "$LOG_FILE" 2>&1 || true
-            systemctl restart xray 2>/dev/null || true
-            updated=true
+            local new_xray; new_xray=$(xray version 2>/dev/null | head -n1 | awk '{print $2}' | sed 's/^v//' || echo "")
+            if [[ -n "$new_xray" && "$new_xray" != "$local_xray" ]]; then
+                systemctl restart xray 2>/dev/null || true
+                updated=true
+            else
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] Xray 安装未生效（仍为 v${local_xray}），跳过重启" >> "$LOG_FILE"
+            fi
         fi
     fi
 
@@ -1977,6 +1988,13 @@ auto_update() {
             ["b-ui-client.sh"]="${BASE_DIR}/b-ui-client.sh"
         )
         
+        # v3.6.0 P0-3: 记录下载前哈希，只重启真正受影响的服务
+        declare -A before_md5=()
+        for remote in "${!file_map[@]}"; do
+            local lp="${file_map[$remote]}"
+            before_md5["$remote"]=$( [[ -f "$lp" ]] && md5sum "$lp" 2>/dev/null | cut -d' ' -f1 || echo "" )
+        done
+
         local auto_failed=0
         for remote in "${!file_map[@]}"; do
             local local_path="${file_map[$remote]}"
@@ -1992,6 +2010,16 @@ auto_update() {
         if [[ $auto_failed -gt 0 ]]; then
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] 警告: 共 ${auto_failed} 个文件未通过校验，未覆盖现有版本" >> "$LOG_FILE"
         fi
+
+        local changed_files=() web_changed=0
+        for remote in "${!file_map[@]}"; do
+            local lp="${file_map[$remote]}" after
+            after=$( [[ -f "$lp" ]] && md5sum "$lp" 2>/dev/null | cut -d' ' -f1 || echo "" )
+            if [[ "$after" != "${before_md5[$remote]}" ]]; then
+                changed_files+=("$remote"); [[ "$remote" == web/* ]] && web_changed=1
+            fi
+        done
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] 变更文件: ${changed_files[*]:-无}" >> "$LOG_FILE"
         
         # 同步到 packages 分发目录（供客户端下载）
         if [[ -d "${BASE_DIR}/packages" ]]; then
@@ -2008,11 +2036,14 @@ auto_update() {
             cd "${ADMIN_DIR}" && npm install 2>&1 && cd - > /dev/null || true
         fi
         
-        # 重启服务（含住宅实例，否则版本升级后 config-residential 变更不生效）
-        systemctl restart b-ui-admin 2>/dev/null || true
-        systemctl restart hysteria-server 2>/dev/null || true
-        systemctl is-active --quiet hysteria-residential 2>/dev/null && systemctl restart hysteria-residential 2>/dev/null || true
-        systemctl restart xray 2>/dev/null || true
+        # v3.6.0 P0-3: 只有面板文件变了才重启 b-ui-admin；hysteria/xray 的运行配置由 apply_systemd_configs
+        # 与各迁移块按需重启，版本升级本身不再无条件踢掉所有在线用户
+        if [[ $web_changed -eq 1 ]]; then
+            systemctl restart b-ui-admin 2>/dev/null || true
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] 重启: b-ui-admin（web 文件变更）" >> "$LOG_FILE"
+        else
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] 无需重启服务" >> "$LOG_FILE"
+        fi
 
         # 重新应用住宅 IP 配置（如已启用，防止升级重写 outbound 配置丢失）
         if [[ -f "${BASE_DIR}/residential-helper.sh" ]]; then
@@ -2104,10 +2135,14 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     case "${1:-}" in
         auto)
             # 静默自动更新模式 (用于 cron)
+            # v3.6.0: cron 触发时随机延迟 0-15 分钟，避免机队整点齐步重启；交互/手动执行不延迟
+            [[ -t 0 || -n "${B_UI_NO_JITTER:-}" ]] || sleep $((RANDOM % 900))
             auto_update
             ;;
         kernel)
             # 静默内核更新模式 (用于 cron)
+            # v3.6.0: cron 触发时随机延迟 0-15 分钟，避免机队整点齐步重启；交互/手动执行不延迟
+            [[ -t 0 || -n "${B_UI_NO_JITTER:-}" ]] || sleep $((RANDOM % 900))
             auto_update_kernel
             ;;
         -y|--yes)
