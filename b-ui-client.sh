@@ -2090,6 +2090,9 @@ start_tun_mode() {
         fi
         journalctl -u bui-tun -n 20 --no-pager 2>/dev/null | tail -20
         print_warning "若日志显示 IPv6 地址配置失败，可 BUI_FORCE_IPV6=0 后重试"
+        # v3.6.0: TUN 没起来就把巡检 timer 放回去，让它一分钟内把 hysteria-client 拉起来，
+        # 否则用户落在"TUN 没起 + 客户端也停着"的彻底无代理状态（两个客户端不在这里 enable）
+        systemctl start hysteria-health.timer 2>/dev/null || true
         return 1
     fi
 
