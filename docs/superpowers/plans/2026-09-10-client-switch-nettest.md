@@ -105,7 +105,7 @@ rm -rf "$T"; [[ $fail == 0 ]] && echo "PASS switch stability" || exit 1
 
 函数抽取范围与依赖按实际报错补齐（`start_tun_mode` 内的 `ufw`/`sysctl`/`ip link` 等外部命令都用 stub）。若 `create_health_check`/unit 写入路径硬编码，允许在函数里引入 `HEALTH_SCRIPT="${HEALTH_SCRIPT:-/opt/hysteria-client/health-check.sh}"` 与 `SYSTEMD_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"` 两个可覆盖变量（默认值不变）。
 
-- [ ] **Step 2: 运行确认失败** → Expected: A（TUN 活动时仍 restart）、B（缺 Conflicts/TimeoutStopSec）、C1（侧车一致仍重生成）、D1（轮询）、E（无 `--no-restore`）FAIL。
+- [ ] **Step 2: 运行确认失败** → Expected: A（TUN 活动时仍 restart）、B（缺 Conflicts/TimeoutStopSec）、C1（侧车一致仍重生成）、D1（轮询）、E（无 `--no-restore`）、F（toggle_tun 丢 obfs）FAIL。
 
 - [ ] **Step 3: 实现**（按 spec §2.1 六条；要点）
 
@@ -128,6 +128,7 @@ rm -rf "$T"; [[ $fail == 0 ]] && echo "PASS switch stability" || exit 1
   fi
   ```
   随后原有的 `ip link show bui-tun` 检查保留（若无则加）。
+- `toggle_tun`（~3655-3692）开启分支：删掉从 `config.yaml` grep 变量并直接 `generate_singbox_tun_config` 的代码，改为 `rm -f "${BASE_DIR}/singbox-tun.json.node"; start_tun_mode`。测试 F：uri.txt 含 `obfs=salamander&obfs-password=x`、stub 的 `generate_singbox_tun_config` 把 `OBFS_TYPE` 写进 gen.log，调用 `toggle_tun` 开启分支后 gen.log 含 `OBFS_TYPE=salamander`。
 - `stop_tun_mode`：`local restore=true; [[ "${1:-}" == "--no-restore" ]] && restore=false`；末尾"重启 hysteria-client + setup_system_proxy"段包在 `if $restore; then … fi`。`_switch_to_profile` 里的调用改 `stop_tun_mode --no-restore`。
 
 - [ ] **Step 4: 验证并提交**
@@ -135,7 +136,7 @@ rm -rf "$T"; [[ $fail == 0 ]] && echo "PASS switch stability" || exit 1
 ```bash
 bash -n b-ui-client.sh && bash $S/client-tests/test_switch_stability.sh && bash $S/ipv6-client-tests/test_client_tun.sh && bash $S/ipv6-client-tests/test_bootstrap_ip.sh
 git add b-ui-client.sh
-git commit -m "fix(client): TUN 模式切换节点稳定性(巡检 TUN 感知/Conflicts+TimeoutStopSec/侧车判定不再重复生成/启动轮询/切换不重启 hysteria-client)"
+git commit -m "fix(client): TUN 模式切换节点稳定性(巡检 TUN 感知/Conflicts+TimeoutStopSec/侧车判定不再重复生成/启动轮询/切换不重启 hysteria-client/toggle_tun 走 uri.txt 重解析)"
 ```
 
 ---

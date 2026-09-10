@@ -33,6 +33,7 @@
 4. **`start_tun_mode` 就绪判定**：`systemctl start bui-tun` 后轮询 `is-active`（最多 10 × 0.5s），成功后再确认 `ip link show bui-tun` 存在；失败时打印 `journalctl -u bui-tun -n 20 --no-pager` 尾部与提示 `BUI_FORCE_IPV6=0` 逃生口（v6 地址配不上时）。
 5. **`stop_tun_mode` 增加 `--no-restore` 参数**：`_switch_to_profile` 调用时传入，跳过"重启 hysteria-client + 写 proxy.sh"的收尾；菜单手动关闭 TUN 仍恢复。
 6. 不改：`Restart=always`、路由规则、`hysteria-health.timer` 的存在（SOCKS 模式仍需要它）。
+7. 旧 `toggle_tun`（高级设置里的开关）现在从客户端 `config.yaml` grep server/auth/tls 拼参数直接调用 `generate_singbox_tun_config`，会丢掉 obfs/MPORT（审查发现）：开启分支改为删除 `${BASE_DIR}/singbox-tun.json.node` 侧车后调用 `start_tun_mode`（走 `ensure_tun_config_ready` 从 `uri.txt` 重解析），不再自行拼参数。
 
 ### 2.2 网络测试双栈出口（Task 2）
 
