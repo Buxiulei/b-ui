@@ -259,3 +259,81 @@ bash $S/kernel-tests/test_version_probe.sh
 git add server/core.sh server/update.sh b-ui-client.sh server/residential-helper.sh web/server.js
 git commit -m "fix(kernel): Xray 版本探测改用 releases 列表(不再卡在 v26.3.27) + sing-box 自动升级上限 1.14"
 ```
+
+
+---
+
+### Task C: update.sh 迁移块卫生（审查发现的既有重启风暴源 + D9 边角）
+
+**Files:**
+- Modify: `server/update.sh`（D6 块守卫；D9 `migrate_ipv4_only_egress()` 的 resi 守卫与恢复路径）；若 `server/core.sh apply_hy2_userpass_auth()` 有同型守卫则同改
+- Test: `scratchpad/kernel-tests/test_update_hygiene.sh`
+
+背景：IPv6 T3 审查发现 D6 的守卫 `grep -q '^  type: http' "$_cfg"` 也匹配 resolver 段的 `  type: https`（每份 hy2 配置都有），所以**每次** `apply_systemd_configs`（安装、升级、每 6 小时自愈）都重写 auth 块并重启两个 hysteria 实例——与 P0-3 同类的无谓重启源。另两条 D9 边角：resi direct 出站若已有 `direct:` 子块（手改）会被插入重复键导致 hysteria 拒绝配置；恢复路径每周期留一个新备份。
+
+- [ ] **Step 1: 写测试（预期失败）**
+
+```bash
+#!/bin/bash
+set -u
+REPO=/home/roots/b-ui; fail=0; T=$(mktemp -d); mkdir -p "$T/bin"
+cat > "$T/bin/systemctl" <<'STUB'
+#!/bin/bash
+echo "$@" >> "${STUB_LOG}"; exit 0
+STUB
+chmod +x "$T/bin/systemctl"; export STUB_LOG="$T/sc.log"; export PATH="$T/bin:$PATH"
+extract() { sed -n "/^$1() {/,/^}/p" "$REPO/server/update.sh"; }
+# A. D6 守卫：userpass 已就位 + resolver type: https → 不应重写、不应重启
+mkdir -p "$T/base"; cat > "$T/base/config.yaml" <<'CFG'
+listen: :10000
+resolver:
+  type: https
+  https:
+    addr: "1.1.1.1:443"
+auth:
+  type: userpass
+  userpass:
+    a: p
+
+trafficStats:
+  listen: 127.0.0.1:9999
+CFG
+echo '[{"username":"a","password":"p"}]' > "$T/base/users.json"
+# 把 D6 块单独抽出包成函数（边界以文件里的 '# v3.5.15 D6' 与下一个 D 标记为准）
+awk '/# v3.5.15 D6/{f=1} /# v3.5.17 D7/{f=0} f' "$REPO/server/update.sh" > "$T/d6.txt"
+{ grep -E '^(RED|GREEN|YELLOW|BLUE|NC)=' "$REPO/server/update.sh" | head -5; echo "BASE_DIR='$T/base'"; for f in print_info print_success print_warning; do extract "$f"; done; echo 'run_d6(){ local updated=0'; cat "$T/d6.txt"; echo '; echo "updated=$updated"; }'; } > "$T/d6.sh"
+: > "$STUB_LOG"; cp "$T/base/config.yaml" "$T/c0"
+out=$(bash -c "source '$T/d6.sh'; run_d6" 2>&1)
+cmp -s "$T/c0" "$T/base/config.yaml" || { echo "FAIL A D6 重写了已是 userpass 的配置"; fail=1; }
+grep -q restart "$STUB_LOG" && { echo "FAIL A D6 无谓重启: $(cat $STUB_LOG)"; fail=1; }
+# A2. 真正的 http auth 仍会迁移
+printf 'listen: :10000\nresolver:\n  type: https\nauth:\n  type: http\n  http:\n    url: http://127.0.0.1:8080/auth/hysteria\n\ntrafficStats:\n  listen: 127.0.0.1:9999\n' > "$T/base/config.yaml"
+: > "$STUB_LOG"; out=$(bash -c "source '$T/d6.sh'; run_d6" 2>&1)
+grep -q 'type: userpass' "$T/base/config.yaml" && grep -q 'restart hysteria-server' "$STUB_LOG" || { echo "FAIL A2 http→userpass 未迁移: $out"; fail=1; }
+# B. D9 resi 守卫：已有 direct: 子块(mode: 64) → 不插重复键
+mkdir -p "$T/up"; printf 'listen: :40000\noutbounds:\n  - name: relay\n    type: socks5\n    socks5:\n      addr: "127.0.0.1:2080"\n  - name: direct\n    type: direct\n    direct:\n      mode: 64\n\nacl:\n  inline:\n    - relay(all)\n' > "$T/up/config-residential.yaml"
+{ grep -E '^(RED|GREEN|YELLOW|BLUE|NC)=' "$REPO/server/update.sh" | head -5; echo "BASE_DIR='$T/up'"; for f in print_info print_success print_warning migrate_ipv4_only_egress; do extract "$f"; done; } > "$T/d9.sh"
+( source "$T/d9.sh"; migrate_ipv4_only_egress ) >/dev/null 2>&1
+[[ "$(grep -c '^    direct:$' "$T/up/config-residential.yaml")" == "1" ]] || { echo "FAIL B 重复 direct: 键"; fail=1; }
+# C. 恢复路径不累积备份：构造无法识别的 resi 格式（direct 出站缺 type 行），跑两次
+printf 'listen: :40000\noutbounds:\n  - name: relay\n    type: socks5\n  - name: direct\n\nacl:\n  inline:\n    - relay(all)\n' > "$T/up/config-residential.yaml"; rm -f "$T"/up/*.bak.v360.*
+( source "$T/d9.sh"; migrate_ipv4_only_egress ) >/dev/null 2>&1; ( source "$T/d9.sh"; migrate_ipv4_only_egress ) >/dev/null 2>&1
+n=$(ls "$T"/up/config-residential.yaml.bak.v360.* 2>/dev/null | wc -l); [[ "$n" -le 1 ]] || { echo "FAIL C 恢复路径累积备份: $n"; fail=1; }
+rm -rf "$T"; [[ $fail == 0 ]] && echo "PASS update hygiene" || exit 1
+```
+
+- [ ] **Step 2: 运行确认失败** → Expected: A（重写+重启）、B（重复键）FAIL。
+
+- [ ] **Step 3: 实现**
+
+- D6：`grep -q '^  type: http' "$_cfg"` → `grep -qE '^  type: http$' "$_cfg"`（`core.sh apply_hy2_userpass_auth()` 有同型守卫则同改）。
+- D9 resi 守卫：`! grep -qE '^\s+mode: 4$'` 之外再要求 `! grep -qE '^\s+direct:$' "$rcfg"`（已有 `direct:` 子块的手改配置跳过并 `print_warning` 提示手动加 `mode: 4`）。
+- D9 恢复路径：恢复原文件时 `rm -f` 本轮刚创建的备份。
+
+- [ ] **Step 4: 验证并提交**
+
+```bash
+bash -n server/update.sh server/core.sh && bash $S/kernel-tests/test_update_hygiene.sh && bash $S/restart-tests/test_auto_update.sh && bash $S/ipv6-tests/test_server_egress.sh
+git add server/update.sh server/core.sh
+git commit -m "fix(update): D6 守卫锚定 type: http\$ 不再每次自愈都重启 hysteria; D9 resi 已有 direct: 子块时跳过; 恢复路径不累积备份"
+```
