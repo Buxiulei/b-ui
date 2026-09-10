@@ -1174,19 +1174,26 @@ install_singbox() {
         print_warning "无法获取最新版本，使用默认版本 $version"
     fi
 
+    # v3.6.0: 之前经 apt 装过 sing-box 的客户端，去掉 sagernet 源并 hold，
+    # 否则 apt upgrade 会把超过上限的版本盖回 dpkg 管的 /usr/bin/sing-box
+    local apt_sources_dir="${APT_SOURCES_DIR:-/etc/apt/sources.list.d}"
+    local apt_keyrings_dir="${APT_KEYRINGS_DIR:-/etc/apt/keyrings}"
+    rm -f "${apt_sources_dir}/sagernet.list" "${apt_keyrings_dir}/sagernet.asc" 2>/dev/null
+    command -v apt-mark >/dev/null 2>&1 && apt-mark hold sing-box >/dev/null 2>&1 || true
+
     local download_url="https://github.com/SagerNet/sing-box/releases/download/v${version}/sing-box-${version}-linux-${arch}.tar.gz"
     local tmp_file="/tmp/sing-box.tar.gz"
     local tmp_dir="/tmp/sing-box-${version}-linux-${arch}"
 
     # 镜像对不存在的文件常回 200 + HTML 错误页（smart_download 只验非空），所以下载后先 tar -tzf
-    # 验一遍；解包/落地整条链路串成一个条件，任一步失败都不能报成功
+    # 验一遍；解包/落地整条链路串成一个条件，任一步失败都不能报成功。
+    # 先写 .new 再 mv：sing-box 正在跑时直接覆盖会 ETXTBSY
     if smart_download "$download_url" "$tmp_file" "sing-box" \
         && tar -tzf "$tmp_file" >/dev/null 2>&1 \
         && tar -xzf "$tmp_file" -C /tmp \
         && cp "${tmp_dir}/sing-box" /usr/bin/sing-box.new \
         && chmod +x /usr/bin/sing-box.new \
         && mv -f /usr/bin/sing-box.new /usr/bin/sing-box; then
-        # 先写 .new 再 mv：sing-box 正在跑时直接覆盖会 ETXTBSY
         rm -rf "$tmp_file" "$tmp_dir"
         print_success "sing-box 安装完成 (v${version})"
         return 0
