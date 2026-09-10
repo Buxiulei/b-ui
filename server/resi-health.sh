@@ -58,14 +58,15 @@ while IFS= read -r m; do
     alltags+=("$tag")
 
     # v3.6.0 R3: 换行会在 curl 配置里注入额外指令；host/port 直接进 proxy 行，必须严格校验。
-    # 不合规的一律跳过探测并保留其当前池成员身份，免得一条坏记录既剪掉池成员又白搭一次重启
+    # v3.6.0 R6: 不合规的一律跳过探测，且**不计入健康集** —— 它从未被探测过，不能当切换目标。
+    # （旧规则"保留其池成员身份"是 urltest 时代为了省一次重启，selector 时代切换没有重启代价。
+    #   它仍然进 alltags：成员集复核要靠完整成员集，否则每轮都误判"成员发生变化"。）
     skip=""
     case "${user}${pass}" in *$'\n'*|*$'\r'*) skip="凭据含换行符" ;; esac
     case "$host" in ""|*$'\n'*|*$'\r'*|*'"'*|*'\'*) skip="host/port 非法" ;; esac
     [[ "$port" =~ ^[0-9]{1,5}$ ]] || skip="host/port 非法"
     if [ -n "$skip" ]; then
-        log "WARN ${tag} ${skip}，跳过探测（保留当前状态）"
-        [ "$(jq -r --arg n "$tag" '.[$n].active // true' "$STATE")" = "false" ] || healthy+=("$tag")
+        log "WARN ${tag} ${skip}，跳过探测（不计入健康集）"
         continue
     fi
     ok=0

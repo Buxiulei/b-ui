@@ -614,6 +614,9 @@ function getRelaySelected() {
             let body = "";
             resp.on("data", (c) => { body += c; if (body.length > 65536) req.destroy(); });
             resp.on("end", () => { try { resolve(JSON.parse(body).now || null); } catch { resolve(null); } });
+            // 只发头就不再结束 body、或超 64KB 被我们自己 destroy —— 两种情况都不 emit error
+            // （destroy() 无参不触发 error），没有这一行 promise 永不 settle，体检端点整个挂死
+            resp.on("close", () => resolve(null));
         });
         req.on("timeout", () => req.destroy());
         req.on("error", () => resolve(null));
