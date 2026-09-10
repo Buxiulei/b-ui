@@ -253,34 +253,44 @@ function saveUsers(u) {
     } catch { return false; }
 }
 
-// v3.5.0: 写 config-residential.yaml 的 auth.userpass 段并 reload hysteria-residential service
+// v3.6.0: 非阻塞重启（范式同 b-ui-admin 自重启）；失败只记日志，不拖垮 API 响应
+function restartServiceAsync(unit) {
+    try {
+        spawn("systemctl", ["restart", unit], { detached: true, stdio: "ignore" }).unref();
+    } catch (e) { log("ERROR", `restart ${unit}: ${e.message}`); }
+}
+
+// v3.5.0: 写 config-residential.yaml 的 auth.userpass 段并重启 hysteria-residential service
 function updateHysteriaResidentialConfig(users) {
     try {
         if (!fs.existsSync(CONFIG.hysteriaResidentialConfig)) return; // v3.4 老服务器没装第二实例，跳过
-        let c = fs.readFileSync(CONFIG.hysteriaResidentialConfig, "utf8");
+        const c = fs.readFileSync(CONFIG.hysteriaResidentialConfig, "utf8");
         const up = users.reduce((a, u) => { a[u.username] = u.password; return a; }, {});
         const auth = "auth:\n  type: userpass\n  userpass:\n" + Object.entries(up).map(([u, p]) => "    " + u + ": " + p).join("\n");
-        c = c.replace(/auth:[\s\S]*?(?=\n[a-zA-Z]|$)/, auth + "\n\n");
-        fs.writeFileSync(CONFIG.hysteriaResidentialConfig, c);
-        execSync("systemctl reload-or-restart hysteria-residential 2>/dev/null || true", { stdio: "pipe" });
+        const next = c.replace(/auth:[\s\S]*?(?=\n[a-zA-Z]|$)/, auth + "\n\n");
+        if (next === c) return; // v3.6.0: 内容未变不写不重启（改限额/到期日不再踢掉所有在线用户）
+        fs.writeFileSync(CONFIG.hysteriaResidentialConfig, next);
+        restartServiceAsync("hysteria-residential");
     } catch (e) { log("ERROR", "HysteriaResidential: " + e.message); }
 }
 
 function updateHysteriaConfig(users) {
     try {
-        let c = fs.readFileSync(CONFIG.hysteriaConfig, "utf8");
+        const c = fs.readFileSync(CONFIG.hysteriaConfig, "utf8");
         const up = users.reduce((a, u) => { a[u.username] = u.password; return a; }, {});
         const auth = "auth:\n  type: userpass\n  userpass:\n" + Object.entries(up).map(([u, p]) => "    " + u + ": " + p).join("\n");
-        c = c.replace(/auth:[\s\S]*?(?=\n[a-zA-Z]|$)/, auth + "\n\n");
-        fs.writeFileSync(CONFIG.hysteriaConfig, c);
-        execSync("systemctl restart hysteria-server", { stdio: "pipe" });
+        const next = c.replace(/auth:[\s\S]*?(?=\n[a-zA-Z]|$)/, auth + "\n\n");
+        if (next === c) return; // v3.6.0: 内容未变不写不重启
+        fs.writeFileSync(CONFIG.hysteriaConfig, next);
+        restartServiceAsync("hysteria-server");
     } catch (e) { log("ERROR", "Hysteria: " + e.message); }
 }
 
 function updateXrayConfig(realityUsers, wsUsers = []) {
     try {
         if (!fs.existsSync(CONFIG.xrayConfig)) return;
-        let c = JSON.parse(fs.readFileSync(CONFIG.xrayConfig, "utf8"));
+        const raw = fs.readFileSync(CONFIG.xrayConfig, "utf8");
+        let c = JSON.parse(raw);
 
         // v3.5.0: 双 Reality inbound — vless-direct + vless-residential 共用 clients/SNI
         // 兼容 v3.4 老 tag "vless-reality" — 若存在则当作 vless-direct 处理
@@ -333,8 +343,10 @@ function updateXrayConfig(realityUsers, wsUsers = []) {
                 wsInbound.settings.clients = wsClients;
             }
         }
-        fs.writeFileSync(CONFIG.xrayConfig, JSON.stringify(c, null, 2));
-        execSync("systemctl restart xray 2>/dev/null||true", { stdio: "pipe" });
+        const next = JSON.stringify(c, null, 2);
+        if (next === raw) return; // v3.6.0: 内容未变不写不重启
+        fs.writeFileSync(CONFIG.xrayConfig, next);
+        restartServiceAsync("xray");
     } catch (e) { log("ERROR", "Xray: " + e.message); }
 }
 
