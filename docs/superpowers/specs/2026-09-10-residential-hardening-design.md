@@ -103,7 +103,7 @@ proxy-user = "USER:PASS"
 
 - 中继配置（`write_singbox_config_residential_multi`）：
   - `resi-pool` 由 `urltest` 改为 `{"type":"selector","tag":"resi-pool","outbounds":[resi-1..N],"default":"resi-1","interrupt_exist_connections":false}`。
-  - 新增 `"experimental": {"clash_api": {"external_controller": "127.0.0.1:9091"}, "cache_file": {"enabled": true, "path": "<BASE_DIR>/relay-cache.db", "store_selected": true}}`（选择结果跨重启保留；仅回环监听，不设 secret；`SINGBOX_RELAY_API="127.0.0.1:9091"` 作为脚本常量）。
+  - 新增 `"experimental": {"clash_api": {"external_controller": "127.0.0.1:9091"}, "cache_file": {"enabled": true, "path": "<BASE_DIR>/relay-cache.db"}}`（selector 的选择默认写入 cache_file、跨重启保留——注意 `store_selected` 不是合法字段，三版 sing-box `check` 会 FATAL；仅回环监听，不设 secret；`SINGBOX_RELAY_API="127.0.0.1:9091"` 作为脚本常量）。
   - 直连模式写函数不加 selector/clash_api（无可选）。
 - `resi-health.sh` 决策段重写：
   - 探测循环与迟滞状态（`active/failstreak/okstreak`）保持。
@@ -141,12 +141,12 @@ proxy-user = "USER:PASS"
 
 ### R9 体检数据源改 HTTPS
 
-来源：调研 P0-6。`http://ip-api.com` 免费端点无 HTTPS、禁商用、45 次/分；明文 HTTP 经住宅腿可被篡改。
+来源：调研 P0-6。`http://ip-api.com` 免费端点无 HTTPS、禁商用、45 次/分；明文 HTTP 经住宅腿可被篡改。实施时发现 `api.ipapi.is` 免费层自 2026-09-01 起不再返回 `is_datacenter` 等分类字段，弃用。
 
-- 主源：`https://api.ipapi.is/`（免费、无 key、HTTPS；返回 `ip`、`is_datacenter`、`is_proxy`、`is_vpn`、`is_mobile`、`company.name/type`、`location.country/city`——实施时用真实请求核对字段名后再映射）。类型映射：`is_datacenter` → IDC机房 IP；`is_proxy||is_vpn` → 代理 IP；`is_mobile` → 移动网络 IP；否则 家庭宽带 IP。
-- 备源：`https://ipinfo.io/json`（`ip/org/country/city`），类型记 unknown、ISP 取 `org`。
-- 两者都经成员的 SOCKS5（socks5h）拨出；主源失败自动用备源。
-
+- 主源：`https://my.ippure.com/v1/info`（公开、无 key、仅 IPv4——住宅 SOCKS5 本就是 IPv4；字段 `ip / asOrganization / country / region / city / fraudScore / isResidential`）。类型映射：`isResidential:true` → 家庭宽带 IP；false → IDC机房 IP；ISP 标签附 `风险分 N`。与客户端「连接测试」同源，判定口径一致。
+- 备源：`https://api.ipquery.io/`（免费、无 key；`risk.is_datacenter/is_vpn/is_proxy/is_mobile`）：`is_datacenter` → IDC机房 IP；`is_vpn||is_proxy` → 代理 IP；`is_mobile` → 移动网络 IP；否则 家庭宽带 IP。
+- 兜底：`https://ipinfo.io/json`（`ip/org/country/city`），类型记 unknown、ISP 取 `org`。
+- 三者都经成员的 SOCKS5（socks5h，`-K -` 凭据）拨出，按顺序失败即降级。
 ## 3. 文件改动清单
 
 | 文件 | 改动 |
