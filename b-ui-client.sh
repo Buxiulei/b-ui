@@ -1176,19 +1176,25 @@ install_singbox() {
 
     local download_url="https://github.com/SagerNet/sing-box/releases/download/v${version}/sing-box-${version}-linux-${arch}.tar.gz"
     local tmp_file="/tmp/sing-box.tar.gz"
+    local tmp_dir="/tmp/sing-box-${version}-linux-${arch}"
 
-    if smart_download "$download_url" "$tmp_file" "sing-box"; then
-        tar -xzf "$tmp_file" -C /tmp
+    # 镜像对不存在的文件常回 200 + HTML 错误页（smart_download 只验非空），所以下载后先 tar -tzf
+    # 验一遍；解包/落地整条链路串成一个条件，任一步失败都不能报成功
+    if smart_download "$download_url" "$tmp_file" "sing-box" \
+        && tar -tzf "$tmp_file" >/dev/null 2>&1 \
+        && tar -xzf "$tmp_file" -C /tmp \
+        && cp "${tmp_dir}/sing-box" /usr/bin/sing-box.new \
+        && chmod +x /usr/bin/sing-box.new \
+        && mv -f /usr/bin/sing-box.new /usr/bin/sing-box; then
         # 先写 .new 再 mv：sing-box 正在跑时直接覆盖会 ETXTBSY
-        cp "/tmp/sing-box-${version}-linux-${arch}/sing-box" /usr/bin/sing-box.new
-        chmod +x /usr/bin/sing-box.new
-        mv -f /usr/bin/sing-box.new /usr/bin/sing-box
-        rm -rf "$tmp_file" "/tmp/sing-box-${version}-linux-${arch}"
+        rm -rf "$tmp_file" "$tmp_dir"
         print_success "sing-box 安装完成 (v${version})"
         return 0
     fi
 
-    print_error "sing-box 安装失败，请检查网络连接"
+    rm -rf "$tmp_file" "$tmp_dir"
+    rm -f /usr/bin/sing-box.new
+    print_error "sing-box ${version} 安装失败，保留现有版本"
     return 1
 }
 
