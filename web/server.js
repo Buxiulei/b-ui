@@ -548,38 +548,61 @@ function curlJsonViaSocks(member, url, timeoutSec) {
     });
 }
 
-// v3.6.0 R9: api.ipapi.is 响应 → 出口画像。2026-09-01 起匿名层（无 API key）只回 11 个字段，
-// is_datacenter/is_proxy/is_vpn/is_tor/is_mobile 已移到 key 后面（见 https://ipapi.is/free-tier.html），
-// 且 company/asn 从对象变成字符串——两种形状都要吃下，一个检测布尔都没有时类型只报 unknown 不瞎猜。
-function ipapiEgress(d) {
-    const flags = ["is_datacenter", "is_proxy", "is_vpn", "is_tor", "is_mobile"];
+// v3.6.0 R9: 出口画像三源，全 HTTPS、全无 key、全经该成员的 socks5h 拨出。
+// 主源 my.ippure.com/v1/info —— isResidential 直接给住宅判定，fraudScore 给风险分（实测 2026-09-10：
+//   {ip, asn, asOrganization, country, countryCode, region, city, timezone, fraudScore, isResidential, …}）。
+// 备源 api.ipquery.io —— risk.is_datacenter/is_vpn/is_proxy/is_mobile 走原映射；注意裸 `/` 返回纯文本 IP，
+//   要 `?format=json` 才是 JSON（实测）。兜底 ipinfo.io/json 只有归属，类型记 unknown。
+// 不再用 api.ipapi.is：2026-09-01 起它把 is_datacenter/is_vpn/is_proxy/is_tor 移到 API key 之后，
+// 匿名层只回归属与地理字段，分类能力已经没了（https://ipapi.is/free-tier.html）。
+function ippureEgress(d) {
+    const type = d.isResidential === true ? "家庭宽带 IP"
+        : d.isResidential === false ? "IDC机房 IP"
+            : "unknown";
+    const asn = (typeof d.asn === "number" || typeof d.asn === "string") ? `AS${d.asn}` : "";
+    let isp = [asn, typeof d.asOrganization === "string" ? d.asOrganization : ""].filter(Boolean).join(" ");
+    if (typeof d.fraudScore === "number") {
+        isp = [isp, `风险分 ${d.fraudScore}`].filter(Boolean).join(" — ");
+    }
+    return {
+        ip: d.ip || null,
+        type,
+        isp: isp || null,
+        country: d.country || null,
+        city: d.city || null,
+    };
+}
+
+function ipqueryEgress(d) {
+    const risk = d.risk || {};
     let type = "unknown";
-    if (flags.some(k => typeof d[k] === "boolean")) {
-        if (d.is_datacenter === true) type = "IDC机房 IP";
-        else if (d.is_proxy === true || d.is_vpn === true || d.is_tor === true) type = "代理 IP";
-        else if (d.is_mobile === true) type = "移动网络 IP";
+    if (["is_datacenter", "is_proxy", "is_vpn", "is_tor", "is_mobile"].some(k => typeof risk[k] === "boolean")) {
+        if (risk.is_datacenter === true) type = "IDC机房 IP";
+        else if (risk.is_proxy === true || risk.is_vpn === true || risk.is_tor === true) type = "代理 IP";
+        else if (risk.is_mobile === true) type = "移动网络 IP";
         else type = "家庭宽带 IP";
     }
-    const company = typeof d.company === "string" ? d.company : (d.company?.name || "");
-    const asn = typeof d.asn === "string" ? d.asn
-        : (d.asn ? [d.asn.asn ? `AS${d.asn.asn}` : "", d.asn.org || ""].filter(Boolean).join(" ") : "");
+    const isp = d.isp || {};
     const loc = d.location || {};
     return {
         ip: d.ip || null,
         type,
-        isp: [asn, company].filter(Boolean).join(" — ") || null,
-        country: d.country || loc.country || null,
-        city: d.city || loc.city || null,
+        isp: [isp.asn || "", isp.org || isp.isp || ""].filter(Boolean).join(" ") || null,
+        country: loc.country || null,
+        city: loc.city || null,
     };
 }
 
-// 单条住宅出口探测：主源 HTTPS api.ipapi.is，失败/非 JSON 回退 https://ipinfo.io/json（类型 unknown）
+// 单条住宅出口探测：主源失败/非 JSON 就往下一源退，全失败 → null
 async function probeEgress(member) {
-    const a = await curlJsonViaSocks(member, "https://api.ipapi.is/", 8);
-    if (a && a.ip) return ipapiEgress(a);
-    const b = await curlJsonViaSocks(member, "https://ipinfo.io/json", 8);
-    if (b && b.ip) {
-        return { ip: b.ip, type: "unknown", isp: b.org || null, country: b.country || null, city: b.city || null };
+    const a = await curlJsonViaSocks(member, "https://my.ippure.com/v1/info", 8);
+    if (a && a.ip && typeof a.isResidential === "boolean") return ippureEgress(a);
+    const b = await curlJsonViaSocks(member, "https://api.ipquery.io/?format=json", 8);
+    if (b && b.ip) return ipqueryEgress(b);
+    if (a && a.ip) return ippureEgress(a);   // 主源只剩归属字段时至少保住 IP/ISP，类型记 unknown
+    const c = await curlJsonViaSocks(member, "https://ipinfo.io/json", 8);
+    if (c && c.ip) {
+        return { ip: c.ip, type: "unknown", isp: c.org || null, country: c.country || null, city: c.city || null };
     }
     return null;
 }

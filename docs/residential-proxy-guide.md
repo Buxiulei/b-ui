@@ -157,14 +157,25 @@ udp/443 → reject    （QUIC 显式拒绝，浏览器自动回退 TCP/HTTP2，�
 | 出口 IP | 该线路刚才实测的出口 IP（每次点"检查"都经这条线路真拨一次） |
 | 类型 | 出口 IP 的画像：`家庭宽带 IP` / `IDC机房 IP` / `移动网络 IP` / `代理 IP` / `unknown` |
 
-数据源是 HTTPS 的 `https://api.ipapi.is/`，失败时回退 `https://ipinfo.io/json`（v3.6.0 起不再用
-明文 `http://ip-api.com`：明文经住宅腿可被篡改，且其免费端点禁商用）。
+数据源三层，全部 HTTPS、全部无需 API key、全部经该成员的 SOCKS5 拨出（v3.6.0 起不再用明文
+`http://ip-api.com`：明文经住宅腿可被篡改，且其免费端点禁商用）：
 
-**关于 `unknown`**：ipapi.is 自 2026-09-01 起把 `is_datacenter` / `is_vpn` / `is_proxy` /
-`is_tor` 等检测布尔移到了 API key 之后，匿名调用只返回归属与地理字段
-（[官方说明](https://ipapi.is/free-tier.html)）。因此**不带 key 时类型一律显示 `unknown`**——
-这是"没有判据"，不是"判定为可疑"；出口 IP、ISP、国家/城市仍然准确。
-想要类型判定，就给数据源配一个 key（或换一家带检测字段的免费源）。
+| 顺序 | 数据源 | 提供什么 |
+|---|---|---|
+| 主源 | `https://my.ippure.com/v1/info` | `isResidential`（→ 家庭宽带 / IDC机房）、`fraudScore`（面板 ISP 一列里的"风险分 N"）、ASN 与归属、国家城市 |
+| 备源 | `https://api.ipquery.io/?format=json` | `risk.is_datacenter / is_vpn / is_proxy / is_mobile` → 同样的类型映射；ASN 与归属 |
+| 兜底 | `https://ipinfo.io/json` | 只有 IP / `org` / 国家城市，类型记 `unknown` |
+
+主源失败、返回非 JSON、或**返回了 IP 但没有分类字段**时自动往下一层退（最后一种情况仍保留主源
+拿到的 IP 与归属）。三层都不通 → 该行出口 IP 显示 `—`，说明这条线路当下拨不出去。
+
+**关于 `风险分`**：来自主源的 `fraudScore`（0–100，越高越可疑），是"这个 IP 的历史滥用画像"，
+不是"你这次请求被判定的结果"。数值高不必然封号，但配合 `IDC机房 IP` 一起出现时应该换线路。
+
+**关于 `unknown`**：只会在"走到兜底源"时出现，意思是**没有判据**，不是"判定为可疑"；
+此时出口 IP、ISP、国家/城市仍然准确。（历史注记：v3.6.0 开发期间曾用 `api.ipapi.is` 作主源，
+但它自 2026-09-01 起把 `is_datacenter`/`is_vpn`/`is_proxy`/`is_tor` 移到了 API key 之后，
+匿名调用不再返回任何分类字段，因此改用上表三源。）
 
 判读建议：
 
