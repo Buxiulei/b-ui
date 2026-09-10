@@ -69,14 +69,32 @@ done < <(jq -c '.outbounds[]|select(.type=="socks")|{tag,server,server_port,user
 # 绝不清空：全坏则保留全部（降级总比断流好）
 if [ "${#desired[@]}" -eq 0 ]; then desired=("${alltags[@]}"); log "WARN 全部线路探测不达标，保留全部避免断流"; fi
 
-des=$(printf '%s\n' "${desired[@]}" | sort -u | jq -R . | jq -cs .)
+# v3.6.0 R2: 成员集一律排序去重；空数组必须得到 [] 而不是 [""]（printf 无参会吐一个空行）
+des='[]'
+[ "${#desired[@]}" -gt 0 ] && des=$(printf '%s\n' "${desired[@]}" | sort -u | jq -R . | jq -cs .)
+was='[]'
+[ "${#alltags[@]}" -gt 0 ] && was=$(printf '%s\n' "${alltags[@]}" | sort -u | jq -R . | jq -cs .)
+
 # v3.6.0 R2: 只在读-改-写-重启这一段持锁（探测循环不持锁），持锁后重读当前池，避免用陈旧快照覆盖管理员刚做的修改
 exec 9>"$LOCK"
 if ! flock -w 30 9; then log "WARN 获取 relay 锁超时，本轮跳过"; exit 0; fi
+
+# alltags/desired 是探测开始时的成员快照。持锁后复核成员集：探测期间管理员增删了住宅 URL、
+# 或 relay 正被改写（读到不足 2 条），本轮一律弃写——否则会拿陈旧成员集覆盖掉管理员
+# 刚做的修改，还白搭一个重启冷却窗口。
+nowtags=$(jq -c '[.outbounds[]|select(.type=="socks").tag]|unique' "$RELAY" 2>/dev/null || echo '[]')
+[ -n "$nowtags" ] || nowtags='[]'
+nowcnt=$(jq -r 'length' <<<"$nowtags" 2>/dev/null || echo 0)
+if [ "${nowcnt:-0}" -lt 2 ] || [ "$nowtags" != "$was" ]; then
+    log "住宅池成员在本轮探测期间发生变化 ${was} → ${nowtags}，本轮不改池、不重启"
+    exit 0
+fi
+
 cur=$(jq -c '[.outbounds[]|select(.type=="urltest" and .tag=="resi-pool").outbounds[]]|sort' "$RELAY" 2>/dev/null)
 if [ "$des" != "$cur" ]; then
     now=$(date +%s)
     last=$(jq -r '._last_restart // 0' "$STATE" 2>/dev/null); last=${last:-0}
+    [ "$last" -gt "$now" ] && last=0   # 时钟回跳（NTP 校时/手工改表）不致于把冷却锁死
     if [ $((now - last)) -lt "$RESTART_COOLDOWN" ]; then
         log "住宅池需变更 ${cur} → ${des}，重启冷却中（剩余 $((RESTART_COOLDOWN - now + last))s），延后"
     else
