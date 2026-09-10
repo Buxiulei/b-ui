@@ -16,6 +16,7 @@
 #   residential-helper.sh enable --remove <url>  → 移除一个住宅 URL
 #   residential-helper.sh disable                → 关闭住宅代理，sing-box 改为空池直连
 #   residential-helper.sh status                 → 输出 residential-proxy.json
+#   residential-helper.sh domains                → 输出生效分流域名关键字 (JSON 数组)
 #   residential-helper.sh reapply                → 重新应用当前配置（update.sh 调用）
 #   residential-helper.sh set-domains <json>     → 更新分流域名，重载 sing-box
 #   residential-helper.sh global on|off          → 切换全局/分流模式，重载 sing-box
@@ -513,6 +514,13 @@ case "$cmd" in
         fi
         ;;
 
+    domains)
+        # v3.6.0 R1: 输出生效域名关键字（自定义优先，否则 DEFAULT_DOMAINS）
+        # server.js 订阅生成器与面板显示都从这里取，默认列表只此一处
+        get_domains
+        printf '%s\n' "${DOMAINS[@]}" | jq -R . | jq -sc 'unique'
+        ;;
+
     reapply)
         ensure_singbox
         write_singbox_config_from_state
@@ -566,7 +574,7 @@ case "$cmd" in
         ;;
 
     *)
-        echo "Usage: $0 {setup|enable <url>|disable|status|reapply|set-domains <json>|global on|off}" >&2
+        echo "Usage: $0 {setup|enable <url>|disable|status|domains|reapply|set-domains <json>|global on|off}" >&2
         exit 1
         ;;
 esac

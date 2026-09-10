@@ -432,6 +432,21 @@ function getConfig() {
     }
 }
 
+// v3.6.0 R1: 生效域名关键字以 residential-helper.sh 为唯一真源（含默认回退）
+function getEffectiveResidentialDomains() {
+    try {
+        if (!fs.existsSync(CONFIG.residentialHelper)) return [];
+        const r = spawnSync(CONFIG.residentialHelper, ["domains"], {
+            env: { ...process.env, BASE_DIR },
+            encoding: "utf8",
+            timeout: 3000,
+        });
+        if (r.status !== 0 || !r.stdout) return [];
+        const arr = JSON.parse(r.stdout.trim());
+        return Array.isArray(arr) ? arr.filter(x => typeof x === "string" && x) : [];
+    } catch { return []; }
+}
+
 // 读取服务端住宅代理状态（enabled / global / domains）
 // urls 为空或 enabled=false 时视为未启用（与 residential-helper.sh 行为一致：空池回落直连）
 function getResidentialConfig() {
@@ -442,7 +457,7 @@ function getResidentialConfig() {
             return {
                 enabled: r.enabled === true && urls.length > 0,
                 global: r.global === true,
-                domains: Array.isArray(r.domains) ? r.domains : []
+                domains: (Array.isArray(r.domains) && r.domains.length > 0) ? r.domains : getEffectiveResidentialDomains()
             };
         }
     } catch { }
@@ -1898,7 +1913,6 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
 
             if (r === "residential") {
                 const helperPath = CONFIG.residentialHelper;
-                const DEFAULT_DOMAINS = ["openai","chatgpt","google","googleapis","gstatic","anthropic","claude","ping0","ip.sb","ip-api"];
 
                 if (req.method === "GET") {
                     try {
@@ -1906,7 +1920,7 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                             ? JSON.parse(fs.readFileSync(CONFIG.residentialConfig, "utf8"))
                             : { enabled: false };
                         const display = { ...raw };
-                        if (!display.domains || !display.domains.length) display.domains = DEFAULT_DOMAINS;
+                        if (!display.domains || !display.domains.length) display.domains = getEffectiveResidentialDomains();
                         // v3.5.0: 保证 global 字段始终在响应里
                         if (typeof display.global === "undefined") display.global = false;
                         // v3.5.0: 保证 urls 数组始终在响应里（多 URL CRUD 支持）
@@ -1924,7 +1938,7 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                         }
                         return sendJSON(res, display);
                     } catch {
-                        return sendJSON(res, { enabled: false, domains: DEFAULT_DOMAINS });
+                        return sendJSON(res, { enabled: false, domains: getEffectiveResidentialDomains() });
                     }
                 }
 
