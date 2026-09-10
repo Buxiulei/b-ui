@@ -33,6 +33,10 @@
 4. **`start_tun_mode` 就绪判定**：`systemctl start bui-tun` 后轮询 `is-active`（最多 10 × 0.5s），成功后再确认 `ip link show bui-tun` 存在；失败时打印 `journalctl -u bui-tun -n 20 --no-pager` 尾部与提示 `BUI_FORCE_IPV6=0` 逃生口（v6 地址配不上时）。
 5. **`stop_tun_mode` 增加 `--no-restore` 参数**：`_switch_to_profile` 调用时传入，跳过"重启 hysteria-client + 写 proxy.sh"的收尾；菜单手动关闭 TUN 仍恢复。
 6. 不改：`Restart=always`、路由规则、`hysteria-health.timer` 的存在（SOCKS 模式仍需要它）。
+8. （审查追加）`Conflicts=` 的连带：任何"无条件 `systemctl restart hysteria-client/xray-client`"在 TUN 模式下都会变成停掉 bui-tun（systemd 显式 stop，`Restart=always` 不会拉回），用户静默失去代理。因此 `auto_update_all`（cron 内核更新后的重启）与规则编辑器只重启**正在运行**的单元；sing-box 内核更新后若 bui-tun 在跑则重启 bui-tun 让新内核生效。
+9. （审查追加）开机互斥：三个 unit 同时 `enable` 时 systemd 会随机丢弃一个冲突的启动任务。`start_tun_mode` 停掉并 `disable` hysteria-client / xray-client（bui-tun 保持 enable）；`stop_tun_mode` 恢复路径重新 `enable` 它重启的那个单元。
+10. （审查追加）巡检与切换的竞态：`start_tun_mode` 在启动 bui-tun 前 `systemctl stop hysteria-health.timer`（TUN 模式下巡检脚本本就只会提前退出）；`stop_tun_mode` 恢复路径再 `start` 它。timer 仍保持 enable。
+11. （审查追加）`ensure_tun_config_ready` 追加判定：`uri.txt` 比生成的配置新（同名覆盖导入）→ 重生成。`_switch_to_profile` 必须检查 `start_tun_mode` 的返回值，失败时报错并返回非零，不再打印"已切换到"。
 7. 旧 `toggle_tun`（高级设置里的开关）现在从客户端 `config.yaml` grep server/auth/tls 拼参数直接调用 `generate_singbox_tun_config`，会丢掉 obfs/MPORT（审查发现）：开启分支改为删除 `${BASE_DIR}/singbox-tun.json.node` 侧车后调用 `start_tun_mode`（走 `ensure_tun_config_ready` 从 `uri.txt` 重解析），不再自行拼参数。
 
 ### 2.2 网络测试双栈出口（Task 2）
