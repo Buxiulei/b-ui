@@ -623,7 +623,9 @@ case "$cmd" in
         relay_was_active=0
         systemctl is-active --quiet "${RELAY_SERVICE}" 2>/dev/null && relay_was_active=1
         start_relay_service
-        [[ "$relay_was_active" == "1" ]] && systemctl restart "${RELAY_SERVICE}" 2>/dev/null
+        if [ "$relay_was_active" = "1" ]; then
+            systemctl restart "${RELAY_SERVICE}" 2>/dev/null || true
+        fi
         ;;
 
     set-domains)
