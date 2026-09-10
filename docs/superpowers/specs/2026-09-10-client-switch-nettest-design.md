@@ -39,7 +39,8 @@
 
 新增函数 `probe_egress(family, socks_port_or_empty)`（family=4|6），输出 `key=value` 行：`ip / country / region / city / org / type / score / source`：
 - IPv4：`curl -4 -sL --max-time 8 [--socks5-hostname 127.0.0.1:PORT] https://my.ippure.com/v1/info`；解析（无 jq 依赖，沿用文件里 grep/sed 风格；有 jq 优先用 jq）`ip`、`country`、`region`、`city`、`asOrganization`、`fraudScore`、`isResidential`；`type`：`isResidential=true` → `家庭宽带 IP（住宅）`，否则 `IDC 机房 IP（数据中心）`；`source=ippure`。失败或字段缺失 → 回退 `http://ip-api.com/json/?fields=status,country,regionName,city,isp,org,as,mobile,proxy,hosting,query`（`hosting→IDC 机房 IP`、`proxy→代理 IP`、`mobile→移动网络 IP`、否则 家庭宽带 IP；`source=ip-api`）。
-- IPv6：`curl -6 -sS --max-time 6 [--socks5-hostname …] https://api6.ipify.org`（失败再试 `https://ipv6.icanhazip.com`）。拿到地址后归属与类型用 `curl -4 … "http://ip-api.com/json/<ip6>?fields=status,country,regionName,city,isp,org,as,mobile,proxy,hosting"`（IPv4 传输、按地址查）；`source=ip-api`。拿不到地址 → `ip=`（空）。
+- IPv6：**一律直连、不带 socks 参数**（审查发现 `curl -6` 无法连接 IPv4 字面量的本地 SOCKS 代理；而且服务端本就无 IPv6 出口，SOCKS 模式下有意义的只是"本机 IPv6"，TUN 模式下直连即经 TUN 被拦截）：`curl -6 -fsS --max-time 5 https://api6.ipify.org`（失败再试 `https://ipv6.icanhazip.com`，同样 5s）。返回值必须通过严格校验（仅 `[0-9A-Fa-f:]`、含 `:`、≤39 字符），否则视为失败、尝试下一源。拿到地址后归属与类型用 `curl -4 -fsS --max-time 6 "http://ip-api.com/json/<ip6>?fields=status,country,regionName,city,isp,org,as,mobile,proxy,hosting"`（IPv4 传输、按地址查、直连）；`source=ip-api`。拿不到地址 → `ip=`（空）。
+- IPv4 的 ippure 判定必须**先解析再判空**：`ip` 与 `isResidential` 任一解析为空才回退 ip-api（不能只看原文里有没有字段名）；ip-api 回退 `--max-time 6`。
 - 渲染（`test_proxy` 测试 6 与 `check_public_ip` 共用一个 `print_egress_rows` 函数）：
   - IPv4 行：`IPv4 出口: 1.2.3.4  美国·洛杉矶  Cluster Logic  [IDC 机房 IP] 风险分 12  (ippure)`
   - IPv6 行：
@@ -48,7 +49,9 @@
     - SOCKS 模式拿到 v6：`IPv6 出口: 2001:…  归属…  （SOCKS 模式下未走代理的流量使用本机 IPv6）`
     - SOCKS 模式拿不到：`IPv6 出口: 本机无 IPv6`
 - `test_proxy` 测试 6 的标题改为「出口 IP 检测 (IPv4 ippure.com / IPv6)」，原 ip-api 逻辑并入回退分支；`check_public_ip` 改为调用同一函数（TUN 分支、无 socks 参数）。
-- 超时：每个探测 ≤ 8s，整体测试 6 ≤ 30s。
+- 超时：ippure 8s + ip-api 6s + ipify 5s + icanhazip 5s + v6 归属 6s = 最坏 30s；每个探测 ≤ 8s。
+- 返回值：TUN 模式下探到 IPv6 地址（泄漏）时 `print_egress_rows` 返回 1，让测试 6 计为失败而不是只画一行 ⚠。
+- 输出排版以文件既有 `✓/✗/○` 风格为准（IPv4 两行、无 `[type]` 方括号），上文示例文案为内容要求而非逐字节格式。
 - 不做：WebRTC/DNS 泄漏检测（ippure 的出口检测页是浏览器专属签名 API，不可脚本化）。
 
 ## 3. 验收
