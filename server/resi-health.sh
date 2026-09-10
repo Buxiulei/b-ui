@@ -24,6 +24,16 @@ DRY_RUN="${RESI_HEALTH_DRY_RUN:-0}"
 
 log(){ echo "[$(date '+%F %T')] $1" >> "$LOG" 2>/dev/null; [ "$DRY_RUN" = "1" ] && echo "$1"; }
 
+# v3.6.0 R3: curl 配置文件双引号内需转义 \ 与 "
+curl_cfg_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+# 生成 curl -K - 的配置：proxy 行 + 可选 proxy-user 行（凭据不出现在 argv 里）
+curl_socks_cfg() {
+    local host="$1" port="$2" user="$3" pass="$4"
+    printf 'proxy = "socks5h://%s:%s"\n' "$(curl_cfg_escape "$host")" "$(curl_cfg_escape "$port")"
+    [ -n "$user" ] && printf 'proxy-user = "%s:%s"\n' "$(curl_cfg_escape "$user")" "$(curl_cfg_escape "$pass")"
+    return 0
+}
+
 command -v jq >/dev/null 2>&1 || exit 0
 command -v curl >/dev/null 2>&1 || exit 0
 [ -f "$RELAY" ] || exit 0
@@ -42,11 +52,19 @@ while IFS= read -r m; do
     [ -z "$tag" ] && continue
     alltags+=("$tag")
 
-    creds=""; [ -n "$user" ] && creds="${user}:${pass}@"
+    # v3.6.0 R3: 换行无法安全写进 curl 配置文件（会注入额外指令）；跳过本条探测并保留其当前
+    # 池成员身份，免得一条坏记录既剪掉池成员又白搭一次重启
+    case "${host}${port}${user}${pass}" in
+        *$'\n'*|*$'\r'*)
+            log "WARN ${tag} 参数含换行符，跳过探测（保留当前状态）"
+            [ "$(jq -r --arg n "$tag" '.[$n].active // true' "$STATE")" = "false" ] || desired+=("$tag")
+            continue
+            ;;
+    esac
     ok=0
     for _ in $(seq 1 "$TRIES"); do
-        curl -s -o /dev/null --max-time "$TIMEOUT" \
-            --socks5-hostname "${creds}${host}:${port}" "$PROBE_URL" 2>/dev/null && ok=$((ok+1))
+        curl_socks_cfg "$host" "$port" "$user" "$pass" \
+            | curl -s -o /dev/null --max-time "$TIMEOUT" -K - "$PROBE_URL" 2>/dev/null && ok=$((ok+1))
     done
 
     active=$(jq -r --arg n "$tag" '.[$n].active // true' "$STATE")

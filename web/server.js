@@ -2164,11 +2164,18 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                 // 通过 sing-box socks5 中继访问（127.0.0.1:2080），ip-api.com 不在分流关键词列表，
                 // 但本 endpoint 测的就是"住宅链路是否通"——所以**直接拨住宅 socks5**绕开路由
                 // 用 ping0.cc/geo 同时拿一份做对照（ping0 命中 keyword 走住宅，是双重验证）
-                const socksProxy = (raw.username && raw.password)
-                    ? `socks5://${encodeURIComponent(raw.username)}:${encodeURIComponent(raw.password)}@${raw.host}:${raw.port}`
-                    : `socks5://${raw.host}:${raw.port}`;
-                execFile("curl", [
-                    "--proxy", socksProxy,
+                // v3.6.0 R3: 凭据经 stdin 配置文件传给 curl，不出现在进程参数里（ps / /proc/<pid>/cmdline 可见）
+                const curlCfgEscape = (s) => String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+                // 换行会在配置里注入额外的 curl 指令，一律拒绝
+                if (/[\r\n]/.test(`${raw.host}${raw.port}${raw.username || ""}${raw.password || ""}`)) {
+                    return sendJSON(res, baseResp);
+                }
+                let curlCfg = `proxy = "socks5h://${curlCfgEscape(raw.host)}:${curlCfgEscape(raw.port)}"\n`;
+                if (raw.username && raw.password) {
+                    curlCfg += `proxy-user = "${curlCfgEscape(raw.username)}:${curlCfgEscape(raw.password)}"\n`;
+                }
+                const child = execFile("curl", [
+                    "-K", "-",
                     "-m", "8",
                     "-sS",
                     "http://ip-api.com/json/?fields=status,country,city,isp,org,as,mobile,proxy,hosting,query"
@@ -2206,6 +2213,8 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                         return sendJSON(res, baseResp);
                     }
                 });
+                child.stdin.on("error", () => { });
+                child.stdin.end(curlCfg);
                 return;
             }
 

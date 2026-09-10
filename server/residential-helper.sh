@@ -45,6 +45,16 @@ RED='\033[0;31m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 err()  { echo -e "${RED}ERROR: $*${NC}" >&2; }
 info() { echo -e "${BLUE}$*${NC}" >&2; }
 
+# v3.6.0 R3: curl 配置文件双引号内需转义 \ 与 "
+curl_cfg_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+# 生成 curl -K - 的配置：proxy 行 + 可选 proxy-user 行（凭据不出现在 argv 里）
+curl_socks_cfg() {
+    local host="$1" port="$2" user="$3" pass="$4"
+    printf 'proxy = "socks5h://%s:%s"\n' "$(curl_cfg_escape "$host")" "$(curl_cfg_escape "$port")"
+    [ -n "$user" ] && printf 'proxy-user = "%s:%s"\n' "$(curl_cfg_escape "$user")" "$(curl_cfg_escape "$pass")"
+    return 0
+}
+
 DEFAULT_DOMAINS=(
     "openai" "chatgpt" "oai" "oaistatic"
     "anthropic" "claude"
@@ -105,6 +115,11 @@ parse_url() {
 verify() {
     local host="$1" port="$2" user="$3" pass="$4"
 
+    # v3.6.0 R3: 换行无法安全写进 curl 配置文件（会注入额外指令），视为非法
+    case "${host}${port}${user}${pass}" in
+        *$'\n'*|*$'\r'*) err "住宅代理参数含换行符，非法"; return 1 ;;
+    esac
+
     info "获取 VPS 公网 IP..."
     _SERVER_IP=$(curl -sS --max-time 5 https://api.ipify.org 2>/dev/null) \
         || { err "无法获取 VPS 公网 IP"; return 1; }
@@ -113,9 +128,8 @@ verify() {
 
     info "通过 SOCKS5 测试出口..."
     local exit_ip
-    exit_ip=$(curl -sS --max-time 10 \
-        --socks5-hostname "${user}:${pass}@${host}:${port}" \
-        https://api.ipify.org 2>/dev/null) \
+    exit_ip=$(curl_socks_cfg "$host" "$port" "$user" "$pass" \
+        | curl -sS --max-time 10 -K - https://api.ipify.org 2>/dev/null) \
         || { err "连接住宅代理失败 (${host}:${port})"; return 1; }
 
     [[ "$exit_ip" == "$vps_ip" ]] \
