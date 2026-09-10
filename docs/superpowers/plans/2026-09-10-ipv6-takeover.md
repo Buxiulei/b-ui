@@ -746,7 +746,11 @@ git commit -m "feat(ipv6): 客户端 TUN 出站按解析出的 IP 连接、SNI �
 `"version": "3.6.0"`，`"updated": "2026-09-10"`，`changelog` 最前面加 `"3.6.0"` 条目，格式照 `3.5.23` 条目（先读一遍它的字段形状），内容要点：
 
 - IPv6 接管：客户端 TUN 加 v6 地址 + `ip_version 6` reject（schema v7）；`/api/subscription` sing-box 配置升级到 1.12-1.14 语法（去掉 inet4_address/legacy DNS/geoip/geosite/block/dns/hop_ports）并内置 `ipv4_only` + v6 reject + cn 域名后缀直连（不用 remote rule_set）；服务端出站 IPv4-only（hy2 direct mode 4、xray ForceIPv4、中继 ipv4_only + v6 私网 CIDR），update.sh D9 幂等迁移；v2rayN 文档。
-- 住宅：订阅域名回退与中继一致（`residential-helper.sh domains`）；relay 配置 flock + 原子写 + 巡检重启冷却 10 分钟；SOCKS5 凭据不再出现在 curl 命令行。
+- IPv6 附加：sing-box 订阅与客户端 TUN 出站改为按解析出的公网 IPv4 连接、SNI 用域名（防服务器域名投毒真正生效；`domain_resolver` 不经过 dns.rules）。
+- 住宅：订阅域名回退与中继一致（`residential-helper.sh domains`）；relay 配置 flock + 原子写 + 巡检重启冷却 10 分钟 + 池成员锁后复核；SOCKS5 凭据不再出现在 curl 命令行（host/port 校验）；中继显式处理 UDP（53 直连 / 443 拒绝 / 其余直连）；三层探测降频（中继 3m/500ms、订阅 60s 不打断连接且 idle 30m、巡检 2 次 + timer 抖动）。
+- 订阅/客户端：开 salamander obfs 后 Clash 订阅与 Linux 客户端补齐 obfs 字段（此前静默连不上）。
+- 内核更新：Xray 版本探测改用 releases 列表（`/releases/latest` 因 prerelease 标记卡在 v26.3.27）；sing-box 自动升级上限 1.14。
+- update.sh：D6 守卫锚定 `type: http$`（此前每次自愈都误重启两个 hysteria 实例）；D9 边角修正。
 - 重启硬化（体检 P0）：v2rayN 订阅 HY2直连 `mport` 按 `config.yaml` 实际监听输出；用户变更只在配置真变化时非阻塞重启对应服务；自更新按变更文件门控重启 + cron 抖动 + 内核更新按版本变化重启；安装期依赖复查（含 flock）、缺 jq 时 userpass 迁移给出警告。
 - 备注：`singbox-converter` 为未使用依赖（本次未删）。
 
@@ -762,6 +766,8 @@ S=/tmp/claude-1000/-home-roots-b-ui/71917ef4-b1f0-4466-927f-5df467756568/scratch
 bash $S/ipv6-tests/test_subscription.sh && bash $S/ipv6-tests/test_bootstrap_ip.sh && bash $S/ipv6-tests/test_server_egress.sh && bash $S/ipv6-client-tests/test_client_tun.sh && bash $S/ipv6-client-tests/test_bootstrap_ip.sh
 bash $S/resi-tests/test_domains.sh && bash $S/resi-tests/test_lock_cooldown.sh && bash $S/resi-tests/test_creds.sh
 bash $S/restart-tests/test_mport.sh && bash $S/restart-tests/test_restart_gate.sh && bash $S/restart-tests/test_auto_update.sh && bash $S/restart-tests/test_deps.sh
+bash $S/resi-tests/test_udp_rules.sh && bash $S/resi-tests/test_probe_rate.sh
+bash $S/obfs-tests/test_obfs_clash.sh && bash $S/obfs-tests/test_obfs_client.sh && bash $S/kernel-tests/test_version_probe.sh && bash $S/kernel-tests/test_update_hygiene.sh
 git status --short   # 只应有 version.json
 ```
 
@@ -771,6 +777,6 @@ Expected: 全部 PASS。
 
 ```bash
 git add version.json
-git commit -m "bump: v3.6.0 IPv6 接管 + sing-box 订阅 1.14 适配 + 服务端出站 IPv4-only + 住宅硬化 + 重启硬化"
+git commit -m "bump: v3.6.0 IPv6 接管 + sing-box 订阅 1.14 适配 + 服务端出站 IPv4-only + 住宅硬化 + 重启硬化 + obfs/内核探测修正"
 git log --oneline -8
 ```
