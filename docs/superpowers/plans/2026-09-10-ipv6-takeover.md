@@ -227,7 +227,7 @@ Expected: 三组合 × 两用户全部 `OK [1.13.19]`、`OK [1.14.0]`，`PASS su
 
 ```bash
 git add web/server.js
-git commit -m "fix(sub): sing-box 订阅生成器升级 1.12-1.14 语法并内置 IPv6 接管(ipv4_only + v6 reject + rule_set)"
+git commit -m "fix(sub): sing-box 订阅生成器升级 1.12-1.14 语法并内置 IPv6 接管(ipv4_only + v6 reject + cn 后缀直连)"
 ```
 
 ---
@@ -616,7 +616,7 @@ git commit -m "docs: v2rayN TUN 模式 IPv6 设置指南(服务端仅 IPv4 出�
 
 `"version": "3.6.0"`，`"updated": "2026-09-10"`，`changelog` 最前面加 `"3.6.0"` 条目，格式照 `3.5.23` 条目（先读一遍它的字段形状），内容要点：
 
-- IPv6 接管：客户端 TUN 加 v6 地址 + `ip_version 6` reject（schema v7）；`/api/subscription` sing-box 配置升级到 1.12-1.14 语法（去掉 inet4_address/legacy DNS/geoip/geosite/block/dns/hop_ports）并内置 `ipv4_only` + v6 reject + rule_set；服务端出站 IPv4-only（hy2 direct mode 4、xray ForceIPv4、中继 ipv4_only + v6 私网 CIDR），update.sh D9 幂等迁移；v2rayN 文档。
+- IPv6 接管：客户端 TUN 加 v6 地址 + `ip_version 6` reject（schema v7）；`/api/subscription` sing-box 配置升级到 1.12-1.14 语法（去掉 inet4_address/legacy DNS/geoip/geosite/block/dns/hop_ports）并内置 `ipv4_only` + v6 reject + cn 域名后缀直连（不用 remote rule_set）；服务端出站 IPv4-only（hy2 direct mode 4、xray ForceIPv4、中继 ipv4_only + v6 私网 CIDR），update.sh D9 幂等迁移；v2rayN 文档。
 - 住宅：订阅域名回退与中继一致（`residential-helper.sh domains`）；relay 配置 flock + 原子写 + 巡检重启冷却 10 分钟；SOCKS5 凭据不再出现在 curl 命令行。
 - 备注：`singbox-converter` 为未使用依赖（本次未删）。
 
