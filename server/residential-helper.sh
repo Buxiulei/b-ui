@@ -3,7 +3,7 @@
 #
 # 架构：sing-box 作为永久本地出站中继 (127.0.0.1:2080)
 #   b-ui-relay (sing-box) 永远运行，singbox-relay.json 决定路由行为
-#   住宅 URL 池非空 → urltest resi-pool → 选最优住宅出口
+#   住宅 URL 池非空 → selector resi-pool → 粘住当前出口，由 resi-health.sh 经 Clash API 热切换
 #   住宅 URL 池空   → 全部直连（hy2-resi / vless-residential fallback 直连）
 #   global=ON  → 池有效时 final 强制走 resi-pool（全流量住宅）
 #   global=OFF → 池有效时按 domain_keyword 分流（AI 域名走住宅，其余直连）
@@ -28,6 +28,7 @@ RESIDENTIAL_CONFIG="${BASE_DIR}/residential-proxy.json"
 SINGBOX_BIN="${BASE_DIR}/sing-box"
 SINGBOX_CONFIG="${BASE_DIR}/singbox-relay.json"
 SINGBOX_RELAY_PORT=2080
+SINGBOX_RELAY_API="127.0.0.1:9091"
 RELAY_SERVICE="b-ui-relay"
 RELAY_LOCK="${BASE_DIR}/.relay.lock"
 
@@ -246,8 +247,9 @@ write_singbox_config_residential_multi() {
 
     # global=true:  final → resi-pool（全部走住宅），无域名分流规则
     # global=false: final → direct，domain_keyword 命中时走 resi-pool
-    # v3.6.0 R5: sing-box 默认 3m；10s 会让每个住宅 IP 每分钟被打 6 次，且 50ms 容忍导致会话内换 IP
     # v3.6.0 R4: 住宅 SOCKS5 基本不支持 UDP ASSOCIATE —— DNS 直连、QUIC 拒绝(浏览器回退 TCP 走住宅)、其余 UDP 直连
+    # v3.6.0 R6: selector + Clash API 热切换——巡检按健康度粘住，切换不重启；
+    #            urltest 按延迟择优会在会话内换出口 IP（住宅抖动大，AI 登录场景高危）
     jq -n \
         --argjson outbounds_resi "$outbounds_resi" \
         --argjson outbound_tags  "$outbound_tags" \
@@ -256,6 +258,8 @@ write_singbox_config_residential_multi() {
         --arg  server_ip  "${_SERVER_IP:-}" \
         --argjson private  "$PRIVATE_CIDRS" \
         --argjson is_global "$is_global" \
+        --arg  api        "$SINGBOX_RELAY_API" \
+        --arg  cache      "${BASE_DIR}/relay-cache.db" \
         '{
           "log": {"level": "error"},
           "dns": {
@@ -278,16 +282,18 @@ write_singbox_config_residential_multi() {
           "outbounds": (
             $outbounds_resi
             + [{
-                "type": "urltest",
+                "type": "selector",
                 "tag": "resi-pool",
                 "outbounds": $outbound_tags,
-                "url": "https://www.gstatic.com/generate_204",
-                "interval": "3m",
-                "tolerance": 500,
-                "idle_timeout": "30m"
+                "default": $outbound_tags[0],
+                "interrupt_exist_connections": false
               },
               {"type": "direct", "tag": "direct"}]
           ),
+          "experimental": {
+            "clash_api": {"external_controller": $api},
+            "cache_file": {"enabled": true, "path": $cache}
+          },
           "route": {
             "rules": (
               [{"action": "sniff"},

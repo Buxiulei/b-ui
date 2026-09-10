@@ -1,19 +1,20 @@
 #!/bin/bash
 # B-UI 住宅线路可靠性监测（reliability-aware failover）
-# 对每条住宅 SOCKS5 上游做真实连通探测，按成功率打分；让 sing-box relay 的 urltest 只在"健康"
-# 线路里选——某条质量变差自动从池中剔除（流量转到好的那条），恢复后自动加回。带迟滞防抖，
-# 绝不清空池子（至少留 1 条），仅在池子真发生变化时才 reload relay（平时零打扰）。
-# 由 b-ui-resi-health.timer 每 ~2 分钟触发。重启有冷却（默认 10 分钟，RESI_HEALTH_RESTART_COOLDOWN 可调）。
+# 对每条住宅 SOCKS5 上游做真实连通探测，按成功率打分（带迟滞防抖）；relay 的 resi-pool 是
+# selector，本脚本只在"当前选中的线路不健康"时经 Clash API 把它切到一条健康线路——健康就粘住，
+# 既不改写 singbox-relay.json 也不重启 b-ui-relay（重启会掐断所有用户的现有连接）。
+# 全部线路都不健康 → 不切，只 WARN（降级总比乱切好）。两次切换间隔有下限（默认 60s）。
+# 由 b-ui-resi-health.timer 每 ~2 分钟触发。
 #
-# 关键：池成员(tag + socks 凭据)直接读自 relay 自身的 socks 出站——relay 是 urltest 池 tag 的
+# 关键：池成员(tag + socks 凭据)直接读自 relay 自身的 socks 出站——relay 是 selector 成员 tag 的
 # 唯一真源（住宅 tag 是 resi-1/resi-2，不是 residential-proxy.json 里的 url-1/url-2，别搞混）。
 set -u
 BASE="${RESI_HEALTH_BASE_DIR:-/opt/b-ui}"
 RELAY="$BASE/singbox-relay.json"
 STATE="$BASE/.resi-health-state.json"
-LOCK="$BASE/.relay.lock"
 LOG="${RESI_HEALTH_LOG:-/var/log/b-ui-resi-health.log}"
-RESTART_COOLDOWN="${RESI_HEALTH_RESTART_COOLDOWN:-600}"
+API="${RESI_HEALTH_API:-127.0.0.1:9091}"
+SWITCH_MIN="${RESI_HEALTH_SWITCH_MIN_INTERVAL:-60}"
 PROBE_URL="${RESI_HEALTH_PROBE_URL:-https://www.gstatic.com/generate_204}"
 # v3.6.0 R5: 一轮 2 次探测、任一成功即健康（迟滞仍是 2 轮），住宅按每 IP 请求速率限流
 TRIES="${RESI_HEALTH_TRIES:-2}"
@@ -24,6 +25,9 @@ OK_TO_READD="${RESI_HEALTH_OK_TO_READD:-2}"
 DRY_RUN="${RESI_HEALTH_DRY_RUN:-0}"
 
 log(){ echo "[$(date '+%F %T')] $1" >> "$LOG" 2>/dev/null; [ "$DRY_RUN" = "1" ] && echo "$1"; }
+# v3.6.0 R6: 决策段现在多处提前 exit（粘住/限速/API 不可达），日志轮转挂 EXIT 才不会漏
+rotate_log(){ [ "$DRY_RUN" != "1" ] && { tail -300 "$LOG" > "${LOG}.tmp" 2>/dev/null && mv "${LOG}.tmp" "$LOG" 2>/dev/null; }; return 0; }
+trap rotate_log EXIT
 
 # v3.6.0 R3: curl 配置文件双引号内需转义 \ 与 "
 curl_cfg_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
@@ -45,7 +49,7 @@ nmem=$(jq -r '[.outbounds[]|select(.type=="socks")]|length' "$RELAY" 2>/dev/null
 
 [ -f "$STATE" ] || echo '{}' > "$STATE"
 
-desired=(); alltags=()
+healthy=(); alltags=()
 while IFS= read -r m; do
     tag=$(echo "$m" | jq -r .tag)
     host=$(echo "$m" | jq -r '.server'); port=$(echo "$m" | jq -r '.server_port')
@@ -61,7 +65,7 @@ while IFS= read -r m; do
     [[ "$port" =~ ^[0-9]{1,5}$ ]] || skip="host/port 非法"
     if [ -n "$skip" ]; then
         log "WARN ${tag} ${skip}，跳过探测（保留当前状态）"
-        [ "$(jq -r --arg n "$tag" '.[$n].active // true' "$STATE")" = "false" ] || desired+=("$tag")
+        [ "$(jq -r --arg n "$tag" '.[$n].active // true' "$STATE")" = "false" ] || healthy+=("$tag")
         continue
     fi
     ok=0
@@ -84,52 +88,53 @@ while IFS= read -r m; do
            '.[$n]={active:$a,failstreak:$f,okstreak:$o}' "$STATE" > "${STATE}.tmp" 2>/dev/null && mv "${STATE}.tmp" "$STATE"
     fi
     [ "$DRY_RUN" = "1" ] && log "probe ${tag} ${host}:${port}: ${ok}/${TRIES} ok → active=${active}"
-    [ "$active" = "true" ] && desired+=("$tag")
+    [ "$active" = "true" ] && healthy+=("$tag")
 done < <(jq -c '.outbounds[]|select(.type=="socks")|{tag,server,server_port,username,password}' "$RELAY")
 
-# 绝不清空：全坏则保留全部（降级总比断流好）
-if [ "${#desired[@]}" -eq 0 ]; then desired=("${alltags[@]}"); log "WARN 全部线路探测不达标，保留全部避免断流"; fi
-
-# v3.6.0 R2: 成员集一律排序去重；空数组必须得到 [] 而不是 [""]（printf 无参会吐一个空行）
-des='[]'
-[ "${#desired[@]}" -gt 0 ] && des=$(printf '%s\n' "${desired[@]}" | sort -u | jq -R . | jq -cs .)
+# v3.6.0 R6: 不再改写 relay 配置、不再重启 b-ui-relay（重启会掐断所有用户的现有连接）。
+# 只经 Clash API 读 selector 当前选择：当前线路健康就粘住；不健康才切到一条健康线路
+# （按 relay 里的成员顺序取第一条）。全部不健康 → 不切，只 WARN。
 was='[]'
 [ "${#alltags[@]}" -gt 0 ] && was=$(printf '%s\n' "${alltags[@]}" | sort -u | jq -R . | jq -cs .)
 
-# v3.6.0 R2: 只在读-改-写-重启这一段持锁（探测循环不持锁），持锁后重读当前池，避免用陈旧快照覆盖管理员刚做的修改
-exec 9>"$LOCK"
-if ! flock -w 30 9; then log "WARN 获取 relay 锁超时，本轮跳过"; exit 0; fi
-
-# alltags/desired 是探测开始时的成员快照。持锁后复核成员集：探测期间管理员增删了住宅 URL、
-# 或 relay 正被改写（读到不足 2 条），本轮一律弃写——否则会拿陈旧成员集覆盖掉管理员
-# 刚做的修改，还白搭一个重启冷却窗口。
+# alltags 是探测开始时的成员快照。探测期间管理员增删了住宅 URL（或 relay 正被改写）→ 本轮不切：
+# 那时 selector 的成员已随 relay 重写而变，探测结论与切换目标都可能已经过期，下一轮重新评估。
 nowtags=$(jq -c '[.outbounds[]|select(.type=="socks").tag]|unique' "$RELAY" 2>/dev/null || echo '[]')
 [ -n "$nowtags" ] || nowtags='[]'
-nowcnt=$(jq -r 'length' <<<"$nowtags" 2>/dev/null || echo 0)
-if [ "${nowcnt:-0}" -lt 2 ] || [ "$nowtags" != "$was" ]; then
-    log "住宅池成员在本轮探测期间发生变化 ${was} → ${nowtags}，本轮不改池、不重启"
+if [ "$nowtags" != "$was" ]; then
+    log "住宅池成员在本轮探测期间发生变化 ${was} → ${nowtags}，本轮不切换"
     exit 0
 fi
 
-cur=$(jq -c '[.outbounds[]|select(.type=="urltest" and .tag=="resi-pool").outbounds[]]|sort' "$RELAY" 2>/dev/null)
-if [ "$des" != "$cur" ]; then
-    now=$(date +%s)
-    last=$(jq -r '._last_restart // 0' "$STATE" 2>/dev/null); last=${last:-0}
-    [ "$last" -gt "$now" ] && last=0   # 时钟回跳（NTP 校时/手工改表）不致于把冷却锁死
-    if [ $((now - last)) -lt "$RESTART_COOLDOWN" ]; then
-        log "住宅池需变更 ${cur} → ${des}，重启冷却中（剩余 $((RESTART_COOLDOWN - now + last))s），延后"
-    else
-        log "住宅池变化: ${cur} → ${des}"
-        if [ "$DRY_RUN" != "1" ]; then
-            jq --argjson d "$des" '.outbounds |= map(if (.type=="urltest" and .tag=="resi-pool") then (.outbounds=$d) else . end)' \
-               "$RELAY" > "${RELAY}.tmp" 2>/dev/null && mv "${RELAY}.tmp" "$RELAY" \
-               && systemctl restart b-ui-relay 2>/dev/null \
-               && jq --argjson t "$now" '._last_restart=$t' "$STATE" > "${STATE}.tmp" 2>/dev/null && mv "${STATE}.tmp" "$STATE" \
-               && log "已更新 singbox-relay.json + 重启 b-ui-relay（住宅池=$(IFS=,; echo "${desired[*]}")）"
-        fi
-    fi
+sel=$(curl -s --max-time 2 "http://${API}/proxies/resi-pool" 2>/dev/null | jq -r '.now // empty' 2>/dev/null)
+if [ -z "$sel" ]; then
+    log "relay 未启用 Clash API（旧配置或未运行），跳过切换；升级后 reapply 会启用"
+    exit 0
 fi
-flock -u 9
 
-[ "$DRY_RUN" != "1" ] && { tail -300 "$LOG" > "${LOG}.tmp" 2>/dev/null && mv "${LOG}.tmp" "$LOG" 2>/dev/null; }
+if [ "${#healthy[@]}" -eq 0 ]; then
+    log "WARN 全部线路探测不达标，保持当前 ${sel}（降级总比乱切好）"
+    exit 0
+fi
+for h in "${healthy[@]}"; do
+    [ "$h" = "$sel" ] && { [ "$DRY_RUN" = "1" ] && log "当前 ${sel} 健康，保持"; exit 0; }
+done
+
+target="${healthy[0]}"
+now=$(date +%s)
+last=$(jq -r '._last_switch // 0' "$STATE" 2>/dev/null); last=${last:-0}
+[ "$last" -gt "$now" ] && last=0   # 时钟回跳（NTP 校时/手工改表）不致于把限速锁死
+if [ $((now - last)) -lt "$SWITCH_MIN" ]; then
+    log "当前 ${sel} 不健康，需切到 ${target}，但切换限速中（剩余 $((SWITCH_MIN - now + last))s）"
+    exit 0
+fi
+if [ "$DRY_RUN" = "1" ]; then
+    log "当前 ${sel} 不健康，将切到 ${target}"
+elif curl -sf --max-time 3 -X PUT -H 'Content-Type: application/json' \
+          -d "{\"name\":\"${target}\"}" "http://${API}/proxies/resi-pool" >/dev/null 2>&1; then
+    jq --argjson t "$now" '._last_switch=$t' "$STATE" > "${STATE}.tmp" 2>/dev/null && mv "${STATE}.tmp" "$STATE"
+    log "切换住宅出口 ${sel} → ${target}（${sel} 连续探测不达标）"
+else
+    log "WARN 切换到 ${target} 失败（Clash API PUT 出错）"
+fi
 exit 0
