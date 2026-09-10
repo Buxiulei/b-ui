@@ -618,6 +618,7 @@ git commit -m "docs: v2rayN TUN 模式 IPv6 设置指南(服务端仅 IPv4 出�
 
 - IPv6 接管：客户端 TUN 加 v6 地址 + `ip_version 6` reject（schema v7）；`/api/subscription` sing-box 配置升级到 1.12-1.14 语法（去掉 inet4_address/legacy DNS/geoip/geosite/block/dns/hop_ports）并内置 `ipv4_only` + v6 reject + cn 域名后缀直连（不用 remote rule_set）；服务端出站 IPv4-only（hy2 direct mode 4、xray ForceIPv4、中继 ipv4_only + v6 私网 CIDR），update.sh D9 幂等迁移；v2rayN 文档。
 - 住宅：订阅域名回退与中继一致（`residential-helper.sh domains`）；relay 配置 flock + 原子写 + 巡检重启冷却 10 分钟；SOCKS5 凭据不再出现在 curl 命令行。
+- 重启硬化（体检 P0）：v2rayN 订阅 HY2直连 `mport` 按 `config.yaml` 实际监听输出；用户变更只在配置真变化时非阻塞重启对应服务；自更新按变更文件门控重启 + cron 抖动 + 内核更新按版本变化重启；安装期依赖复查（含 flock）、缺 jq 时 userpass 迁移给出警告。
 - 备注：`singbox-converter` 为未使用依赖（本次未删）。
 
 - [ ] **Step 2: 全量回归**
@@ -631,6 +632,7 @@ grep -c '"3.6.0"' version.json
 S=/tmp/claude-1000/-home-roots-b-ui/71917ef4-b1f0-4466-927f-5df467756568/scratchpad
 bash $S/ipv6-tests/test_subscription.sh && bash $S/ipv6-tests/test_client_tun.sh && bash $S/ipv6-tests/test_server_egress.sh
 bash $S/resi-tests/test_domains.sh && bash $S/resi-tests/test_lock_cooldown.sh && bash $S/resi-tests/test_creds.sh
+bash $S/restart-tests/test_mport.sh && bash $S/restart-tests/test_restart_gate.sh && bash $S/restart-tests/test_auto_update.sh && bash $S/restart-tests/test_deps.sh
 git status --short   # 只应有 version.json
 ```
 
@@ -640,6 +642,6 @@ Expected: 全部 PASS。
 
 ```bash
 git add version.json
-git commit -m "bump: v3.6.0 IPv6 接管 + sing-box 订阅生成器 1.14 适配 + 服务端出站 IPv4-only + 住宅硬化"
+git commit -m "bump: v3.6.0 IPv6 接管 + sing-box 订阅 1.14 适配 + 服务端出站 IPv4-only + 住宅硬化 + 重启硬化"
 git log --oneline -8
 ```
