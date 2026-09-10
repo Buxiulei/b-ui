@@ -1342,7 +1342,25 @@ EOF
 #       baiyi 实测 10 个噪音 ERROR 来自同一个 cloudflared session 漏网；端口规则不依赖 /proc）
 #   6 = v3.5.0 DNS 加固 — generate config 时一次性预解析 server_host 到 IP，
 #       注入 dns.rules predefined 规则，运行时完全不查 DNS → 防 GFW bootstrap 投毒
-readonly TUN_SCHEMA_VERSION="6"
+#   7 = v3.6.0 TUN 加 IPv6 地址接管 ::/0 + ip_version 6 reject，服务端无 v6 出口
+readonly TUN_SCHEMA_VERSION="7"
+
+# v3.6.0: 主机 IPv6 是否可用。可用 → TUN 加 v6 地址接管 ::/0；不可用 → 保持 IPv4-only（无 v6 则无泄漏，
+# 且 disable_ipv6=1 的主机给 TUN 配 v6 地址会失败）。BUI_FORCE_IPV6=0|1 可强制（排障/测试）。
+host_ipv6_enabled() {
+    case "${BUI_FORCE_IPV6:-}" in 1) return 0 ;; 0) return 1 ;; esac
+    # 1. 内核 IPv6 栈存在（ipv6.disable=1 启动参数会让它消失）
+    [[ -f /proc/net/if_inet6 ]] || return 1
+    # 2. sysctl 未禁用：all 管现有接口，default 决定新建的 TUN 接口能否配 v6 地址
+    [[ "$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)" == "1" ]] && return 1
+    [[ "$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null)" == "1" ]] && return 1
+    # 3. 有 v6 默认路由
+    local dev
+    dev=$(ip -6 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="dev"){print $(i+1); exit}}')
+    [[ -n "$dev" ]] || return 1
+    # 4. 该接口有 2000::/3 全球单播地址（排除只有 ULA 的 Docker 网桥等）
+    ip -6 addr show dev "$dev" scope global 2>/dev/null | grep -qE 'inet6 [23]'
+}
 
 generate_singbox_tun_config() {
     local protocol="$1"  # hysteria2 或 vless-reality
@@ -1436,6 +1454,14 @@ OUTBOUND
 )
     fi
     
+    # v3.6.0: 主机有真实 IPv6 才给 TUN 加 v6 地址（加了 auto_route 才会把 ::/0 装进 TUN 路由表）；
+    # sing-tun 加 v6 地址失败会导致整个 TUN 创建失败，所以宁缺勿滥
+    local tun_address='["172.19.0.1/30"]'
+    if host_ipv6_enabled; then
+        tun_address='["172.19.0.1/30", "fdfe:dcba:9876::1/126"]'
+        print_info "主机 IPv6 可用：TUN 同时接管 IPv6（服务端 IPv4 出站，裸 v6 目标就地 reject）"
+    fi
+
     # 生成完整 sing-box 配置
     # 按 sing-box 官方文档生成配置
     # 参考: https://sing-box.sagernet.org/manual/proxy/client/
@@ -1468,7 +1494,7 @@ OUTBOUND
   "inbounds": [
     {
       "type": "tun",
-      "address": ["172.19.0.1/30"],
+      "address": ${tun_address},
       "auto_route": true,
       "strict_route": true
     },
@@ -1501,6 +1527,7 @@ ${outbound_config},
       { "port": [22, 2222], "outbound": "direct-out" },
       { "source_port": [22, 2222], "outbound": "direct-out" },
       { "ip_is_private": true, "outbound": "direct-out" },
+      { "ip_version": 6, "action": "reject" },
       {
         "domain_suffix": [".qq.com", ".qpic.cn", ".qlogo.cn", ".wechat.com", ".weixin.qq.com", ".wx.qq.com", ".tencent.com", ".tencent-cloud.net", ".myqcloud.com", ".gtimg.com", ".xiaohongshu.com", ".xhscdn.com", ".douyin.com", ".douyincdn.com", ".amemv.com", ".bytedance.com", ".bytecdntp.com", ".toutiao.com", ".iesdouyin.com", ".kuaishou.com", ".ksapisrv.com", ".bilibili.com", ".bilivideo.com", ".hdslb.com", ".taobao.com", ".tbcdn.cn", ".alicdn.com", ".aliyuncs.com", ".alipay.com", ".alipayobjects.com", ".alibaba.com", ".alibabacloud.com", ".tmall.com", ".tmall.hk", ".jd.com", ".360buyimg.com", ".jdcdn.com", ".baidu.com", ".bdstatic.com", ".bdimg.com", ".cn"],
         "outbound": "direct-out"
@@ -3073,7 +3100,17 @@ import_from_subscription() {
                 [[ -f "${BASE_DIR}/singbox-tun.json" ]] && cp "${BASE_DIR}/singbox-tun.json" "${BASE_DIR}/singbox-tun.json.bak"
                 
                 # 使用订阅配置
-                cp "$sub_file" "${BASE_DIR}/singbox-tun.json"
+                # v3.6.0: 服务端订阅默认带 IPv6 TUN 地址；本机 IPv6 不可用时剔除，避免 sing-box 起不来
+                if ! host_ipv6_enabled && command -v jq >/dev/null 2>&1; then
+                    jq '(.inbounds[] | select(.type=="tun") | .address) |= map(select(contains(":") | not))' \
+                        "$sub_file" > "${BASE_DIR}/singbox-tun.json.tmp" && mv "${BASE_DIR}/singbox-tun.json.tmp" "${BASE_DIR}/singbox-tun.json" \
+                        || cp "$sub_file" "${BASE_DIR}/singbox-tun.json"
+                elif ! host_ipv6_enabled; then
+                    print_warning "本机 IPv6 不可用且缺 jq，订阅里的 IPv6 TUN 地址未剔除；若 TUN 起不来请安装 jq 后重导"
+                    cp "$sub_file" "${BASE_DIR}/singbox-tun.json"
+                else
+                    cp "$sub_file" "${BASE_DIR}/singbox-tun.json"
+                fi
                 
                 echo ""
                 echo -e "${GREEN}════════════════════════════════════════════════════════════════${NC}"
