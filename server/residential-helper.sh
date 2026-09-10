@@ -221,6 +221,7 @@ write_singbox_config_residential_multi() {
 
     # global=true:  final → resi-pool（全部走住宅），无域名分流规则
     # global=false: final → direct，domain_keyword 命中时走 resi-pool
+    # v3.6.0 R4: 住宅 SOCKS5 基本不支持 UDP ASSOCIATE —— DNS 直连、QUIC 拒绝(浏览器回退 TCP 走住宅)、其余 UDP 直连
     jq -n \
         --argjson outbounds_resi "$outbounds_resi" \
         --argjson outbound_tags  "$outbound_tags" \
@@ -263,6 +264,9 @@ write_singbox_config_residential_multi() {
           "route": {
             "rules": (
               [{"action": "sniff"},
+               {"network": "udp", "port": 53, "outbound": "direct"},
+               {"network": "udp", "port": 443, "action": "reject"},
+               {"network": "udp", "outbound": "direct"},
                {"ip_cidr": ($private + (if $server_ip != "" then [($server_ip + "/32")] else [] end)),
                 "outbound": "direct"}]
               + (if $is_global then []
@@ -282,6 +286,7 @@ write_singbox_config_residential_multi() {
 write_singbox_config_direct() {
     get_server_ip
 
+    # v3.6.0 R4: 住宅 SOCKS5 基本不支持 UDP ASSOCIATE —— DNS 直连、QUIC 拒绝(浏览器回退 TCP 走住宅)、其余 UDP 直连
     jq -n \
         --argjson relay_port "$SINGBOX_RELAY_PORT" \
         --arg  server_ip  "${_SERVER_IP:-}" \
@@ -305,6 +310,9 @@ write_singbox_config_direct() {
           "route": {
             "rules": [
               {"action": "sniff"},
+              {"network": "udp", "port": 53, "outbound": "direct"},
+              {"network": "udp", "port": 443, "action": "reject"},
+              {"network": "udp", "outbound": "direct"},
               {
                 "ip_cidr": ($private + (if $server_ip != "" then [($server_ip + "/32")] else [] end)),
                 "outbound": "direct"
