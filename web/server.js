@@ -1,7 +1,7 @@
 import http from "http";
 import fs from "fs";
 import crypto from "crypto";
-import { execSync, exec, spawn, spawnSync, execFile } from "child_process";
+import { execSync, exec, spawn, spawnSync, execFile, execFileSync } from "child_process";
 import path from "path";
 import https from "https";
 import { fileURLToPath } from "url";
@@ -82,6 +82,28 @@ function getServerIP() {
         if (m) return m[1];
     } catch { }
     return "127.0.0.1";
+}
+
+// v3.6.0: 生成时把服务器域名解析成公网 IPv4，订阅里按 IP 连接、SNI 用域名——
+// sing-box 出站的 domain_resolver 不经过 dns.rules，predefined 防投毒规则保护不到出站自身的解析
+const _hostV4Cache = new Map();
+const V4_RE = /^\d{1,3}(\.\d{1,3}){3}$/;
+function isPublicV4(ip) {
+    return V4_RE.test(ip) &&
+        !/^(127\.|10\.|192\.168\.|169\.254\.|0\.|172\.(1[6-9]|2\d|3[01])\.)/.test(ip);
+}
+function resolveHostV4(host) {
+    if (!host || V4_RE.test(host)) return null;
+    const hit = _hostV4Cache.get(host);
+    if (hit && Date.now() - hit.ts < 300000) return hit.ip;
+    let ip = null;
+    try {
+        const out = execFileSync("getent", ["ahostsv4", host], { encoding: "utf8", timeout: 3000 });
+        ip = out.split("\n").map(l => l.trim().split(/\s+/)[0]).find(isPublicV4) || null;
+    } catch { }
+    if (!ip) { const s = getServerIP(); if (isPublicV4(s)) ip = s; }
+    _hostV4Cache.set(host, { ip, ts: Date.now() });
+    return ip;
 }
 
 // --- 客户端安装 Key 管理 ---
@@ -515,11 +537,15 @@ function generateSingboxConfig(user, cfg, host) {
     const hasVless = user.uuid && cfg.pubKey && cfg.shortId;
     const hasHy2 = !!user.password;
 
+    // v3.6.0: 出站按解析出的公网 IPv4 连接，TLS SNI 仍用域名；解析不到则保持域名（旧行为）
+    const dialIp = resolveHostV4(host);
+    const dialHost = dialIp || host;
+
     // 出站构造器（直连/住宅只差端口与 hop 范围）
     const mkHy2 = (tag, port, hopStart, hopEnd, useObfs) => ({
         type: "hysteria2",
         tag,
-        server: host,
+        server: dialHost,
         server_port: parseInt(port),
         connect_timeout: "2s",
         ...(hopStart ? { server_ports: [`${hopStart}:${hopEnd}`], hop_interval: "30s" } : {}),
@@ -531,7 +557,7 @@ function generateSingboxConfig(user, cfg, host) {
     const mkVless = (tag, port) => ({
         type: "vless",
         tag,
-        server: host,
+        server: dialHost,
         server_port: parseInt(port),
         connect_timeout: "2s",
         uuid: user.uuid,
@@ -644,10 +670,10 @@ function generateSingboxConfig(user, cfg, host) {
     outbounds.push({ type: "direct", tag: "direct" });
 
     // 服务器域名预解析：防 GFW 投毒 bootstrap（与 b-ui-client.sh 同款 predefined 规则）
-    const serverIp = getServerIP();
-    const hostIsDomain = !/^\d+\.\d+\.\d+\.\d+$/.test(host);
-    const predefined = (hostIsDomain && /^\d+\.\d+\.\d+\.\d+$/.test(serverIp) && serverIp !== "127.0.0.1")
-        ? [{ domain: [host], action: "predefined", answer: [`${host}. IN A ${serverIp}`] }] : [];
+    // 只服务隧道内的应用查询；出站自身已按 dialIp 直连，两者用同一个 IP
+    const hostIsDomain = !V4_RE.test(host);
+    const predefined = (hostIsDomain && dialIp)
+        ? [{ domain: [host], action: "predefined", answer: [`${host}. IN A ${dialIp}`] }] : [];
 
     return {
         log: { level: "info", timestamp: true },
