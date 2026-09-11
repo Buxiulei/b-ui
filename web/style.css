@@ -1277,6 +1277,12 @@ textarea.resi-domains-ta {
     flex-wrap: wrap;
 }
 
+/* 按钮下方那一行说明：贴着按钮会挤，给点上边距；它是本区最后一个元素，下边距收掉 */
+.resi-domains-actions + .resi-domains-hint {
+    margin-top: 9px;
+    margin-bottom: 0;
+}
+
 textarea.resi-domains-ta:focus {
     border-color: var(--primary);
     box-shadow: 0 0 0 3px var(--primary-glow);

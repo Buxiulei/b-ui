@@ -333,13 +333,13 @@
                 <div class="resi-domains-body">
                     <textarea id="resi-domains" rows="6" class="resi-domains-ta"
                         placeholder="每行一个关键词&#10;openai&#10;google&#10;anthropic"></textarea>
-                    <div class="resi-domains-hint">每行一个关键词（如 openai），自动匹配所有含该词的域名（openai.com / openai.net 等）。
-                        <!-- v3.6.2 R12: 保存 = 固化成自定义表；恢复默认 = 写 domains=null，后续版本扩充自动跟上 -->
-                        保存后这台服务器就用自定义表，版本更新扩充的默认关键字不会自动生效；点「恢复默认」可以回到跟随默认。</div>
+                    <div class="resi-domains-hint">每行一个关键词（如 openai），自动匹配所有含该词的域名（openai.com / openai.net 等）</div>
+                    <!-- v3.6.2 R12: 恢复默认 = 写 domains=null（跟随版本内置默认表）；仅更新 = 固化成自定义表 -->
                     <div class="resi-domains-actions">
-                        <button class="btn btn-secondary resi-update-btn" onclick="resetResidentialDomains()">恢复默认</button>
+                        <button class="btn btn-secondary resi-update-btn" onclick="resetResidentialDomains()">恢复默认（跟随最新默认表）</button>
                         <button class="btn btn-secondary resi-update-btn" onclick="saveDomainsOnly()">仅更新分流域名</button>
                     </div>
+                    <div class="resi-domains-hint">跟随默认时，升级会自动获得新增的关键字；改过文本框即变为自定义</div>
                 </div>
             </details>
             <div class="resi-actions" style="grid-template-columns:1fr 1fr">
