@@ -17,6 +17,22 @@ fn xray_config_has_two_reality_inbounds_and_passes_xray_test() {
     );
     let clients = inb[1]["settings"]["clients"].as_array().unwrap();
     assert_eq!(clients.len(), 3, "bob 是 hysteria2-only，不进 xray");
+    // spec §3.3：clients[].email 必须是 user_id（gRPC AddUser/RemoveUser/QueryStats 的唯一键）
+    let emails: Vec<String> = clients
+        .iter()
+        .map(|c| c["email"].as_str().unwrap().to_string())
+        .collect();
+    let ids: Vec<String> = s
+        .users
+        .iter()
+        .filter(|u| {
+            u.entitlements
+                .protocols
+                .contains(&bui_schema::model::Protocol::Reality)
+        })
+        .map(|u| u.user_id.to_string())
+        .collect();
+    assert_eq!(emails, ids, "clients[].email 必须是 user_id");
     assert_eq!(
         inb[1]["settings"]["clients"], inb[2]["settings"]["clients"],
         "两个 inbound 必须共用同一份 clients"

@@ -88,7 +88,8 @@ fn clients(users: &[User]) -> Vec<Value> {
             json!({
                 "id": u.credentials.vless_uuid,
                 "flow": "xtls-rprx-vision",
-                "email": u.username,
+                // spec §3.3：email 是 gRPC 侧唯一键（AddUser/RemoveUser/QueryStats 都用它），与 state 的 user_id 一一对应
+                "email": u.user_id.to_string(),
             })
         })
         .collect()
