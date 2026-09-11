@@ -1,0 +1,86 @@
+# B-UI Clash Meta 订阅配置
+# 用户: dave
+# 生成时间: 2026-09-11T14:39:13.908Z
+
+mode: rule
+log-level: warning
+unified-delay: true
+tcp-concurrent: true
+find-process-mode: strict
+global-client-fingerprint: chrome
+
+dns:
+  enable: true
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+    - "*.lan"
+    - "*.local"
+    - "*.localhost"
+    - "example.com"
+  default-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+  nameserver:
+    - https://dns.alidns.com/dns-query
+    - https://doh.pub/dns-query
+  nameserver-policy:
+    "example.com": "223.5.5.5"
+  fallback:
+    - https://8.8.8.8/dns-query
+    - https://1.1.1.1/dns-query
+  fallback-filter:
+    geoip: true
+    geoip-code: CN
+
+proxies:
+  - name: "dave-Reality直连"
+    type: vless
+    server: example.com
+    port: 10001
+    uuid: 44444444-4444-4444-8444-444444444444
+    flow: xtls-rprx-vision
+    tls: true
+    udp: true
+    servername: www.bing.com
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: xpkTHqtLnYuBcHoV5_MgPY0MEjbMCHjkyKruMhDfbjY
+      short-id: 0123456789abcdef
+    network: tcp
+  - name: "dave-HY2直连"
+    type: hysteria2
+    server: example.com
+    port: 10000
+    ports: "20000-30000"
+    hop-interval: 30
+    password: "dave:pw-dave-04"
+    sni: example.com
+    skip-cert-verify: false
+    alpn:
+      - h3
+    obfs: salamander
+    obfs-password: "obfs-pw-test"
+
+proxy-groups:
+  - name: "直连自动"
+    type: url-test
+    proxies:
+      - "dave-Reality直连"
+      - "dave-HY2直连"
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 50
+
+  - name: "PROXY"
+    type: select
+    proxies:
+      - "直连自动"
+      - "dave-Reality直连"
+      - "dave-HY2直连"
+
+rules:
+  - GEOIP,private,DIRECT,no-resolve
+  - GEOSITE,cn,DIRECT
+  - GEOIP,cn,DIRECT,no-resolve
+  - MATCH,直连自动

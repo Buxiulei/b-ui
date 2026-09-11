@@ -1,0 +1,188 @@
+# B-UI Clash Meta 订阅配置
+# 用户: alice
+# 生成时间: 2026-09-11T14:39:13.361Z
+
+mode: rule
+log-level: warning
+unified-delay: true
+tcp-concurrent: true
+find-process-mode: strict
+global-client-fingerprint: chrome
+
+dns:
+  enable: true
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+    - "*.lan"
+    - "*.local"
+    - "*.localhost"
+    - "example.com"
+  default-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+  nameserver:
+    - https://dns.alidns.com/dns-query
+    - https://doh.pub/dns-query
+  nameserver-policy:
+    "example.com": "223.5.5.5"
+  fallback:
+    - https://8.8.8.8/dns-query
+    - https://1.1.1.1/dns-query
+  fallback-filter:
+    geoip: true
+    geoip-code: CN
+
+proxies:
+  - name: "alice-Reality直连"
+    type: vless
+    server: example.com
+    port: 10001
+    uuid: 11111111-1111-4111-8111-111111111111
+    flow: xtls-rprx-vision
+    tls: true
+    udp: true
+    servername: www.bing.com
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: xpkTHqtLnYuBcHoV5_MgPY0MEjbMCHjkyKruMhDfbjY
+      short-id: 0123456789abcdef
+    network: tcp
+  - name: "alice-Reality住宅"
+    type: vless
+    server: example.com
+    port: 10002
+    uuid: 11111111-1111-4111-8111-111111111111
+    flow: xtls-rprx-vision
+    tls: true
+    udp: true
+    servername: www.bing.com
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: xpkTHqtLnYuBcHoV5_MgPY0MEjbMCHjkyKruMhDfbjY
+      short-id: 0123456789abcdef
+    network: tcp
+  - name: "alice-HY2直连"
+    type: hysteria2
+    server: example.com
+    port: 10000
+    ports: "20000-30000"
+    hop-interval: 30
+    password: "alice:pw-alice-01"
+    sni: example.com
+    skip-cert-verify: false
+    alpn:
+      - h3
+  - name: "alice-HY2住宅"
+    type: hysteria2
+    server: example.com
+    port: 40000
+    ports: "41000-50000"
+    hop-interval: 30
+    password: "alice:pw-alice-01"
+    sni: example.com
+    skip-cert-verify: false
+    alpn:
+      - h3
+
+proxy-groups:
+  - name: "直连自动"
+    type: url-test
+    proxies:
+      - "alice-Reality直连"
+      - "alice-HY2直连"
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 50
+
+  - name: "住宅自动"
+    type: url-test
+    proxies:
+      - "alice-Reality住宅"
+      - "alice-HY2住宅"
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 50
+
+  - name: "PROXY"
+    type: select
+    proxies:
+      - "直连自动"
+      - "住宅自动"
+      - "alice-Reality直连"
+      - "alice-HY2直连"
+      - "alice-Reality住宅"
+      - "alice-HY2住宅"
+
+rules:
+  - GEOIP,private,DIRECT,no-resolve
+  - GEOSITE,cn,DIRECT
+  - GEOIP,cn,DIRECT,no-resolve
+  - DOMAIN-KEYWORD,accounts.google,住宅自动
+  - DOMAIN-KEYWORD,ai.google.dev,住宅自动
+  - DOMAIN-KEYWORD,aistudio,住宅自动
+  - DOMAIN-KEYWORD,anthropic,住宅自动
+  - DOMAIN-KEYWORD,antigravity,住宅自动
+  - DOMAIN-KEYWORD,api.123169,住宅自动
+  - DOMAIN-KEYWORD,api.x.ai,住宅自动
+  - DOMAIN-KEYWORD,apis.google,住宅自动
+  - DOMAIN-KEYWORD,browserleaks,住宅自动
+  - DOMAIN-KEYWORD,cf.999831,住宅自动
+  - DOMAIN-KEYWORD,chatgpt,住宅自动
+  - DOMAIN-KEYWORD,claude,住宅自动
+  - DOMAIN-KEYWORD,clients6.google,住宅自动
+  - DOMAIN-KEYWORD,cloudcode,住宅自动
+  - DOMAIN-KEYWORD,cohere,住宅自动
+  - DOMAIN-KEYWORD,cursor,住宅自动
+  - DOMAIN-KEYWORD,deepmind,住宅自动
+  - DOMAIN-KEYWORD,featuregates,住宅自动
+  - DOMAIN-KEYWORD,gemini.google,住宅自动
+  - DOMAIN-KEYWORD,generativelanguage,住宅自动
+  - DOMAIN-KEYWORD,githubcopilot,住宅自动
+  - DOMAIN-KEYWORD,googleapis,住宅自动
+  - DOMAIN-KEYWORD,googleusercontent,住宅自动
+  - DOMAIN-KEYWORD,grok,住宅自动
+  - DOMAIN-KEYWORD,groq,住宅自动
+  - DOMAIN-KEYWORD,gstatic,住宅自动
+  - DOMAIN-KEYWORD,huggingface,住宅自动
+  - DOMAIN-KEYWORD,idx.google,住宅自动
+  - DOMAIN-KEYWORD,ip-api,住宅自动
+  - DOMAIN-KEYWORD,ip.sb,住宅自动
+  - DOMAIN-KEYWORD,ip.skk.moe,住宅自动
+  - DOMAIN-KEYWORD,ip2location,住宅自动
+  - DOMAIN-KEYWORD,ipapi,住宅自动
+  - DOMAIN-KEYWORD,ipdata,住宅自动
+  - DOMAIN-KEYWORD,ipinfo,住宅自动
+  - DOMAIN-KEYWORD,ipip.net,住宅自动
+  - DOMAIN-KEYWORD,ipleak,住宅自动
+  - DOMAIN-KEYWORD,iplocation,住宅自动
+  - DOMAIN-KEYWORD,ippure,住宅自动
+  - DOMAIN-KEYWORD,ipqualityscore,住宅自动
+  - DOMAIN-KEYWORD,ipquery,住宅自动
+  - DOMAIN-KEYWORD,ipregistry,住宅自动
+  - DOMAIN-KEYWORD,jules.google,住宅自动
+  - DOMAIN-KEYWORD,labs.google,住宅自动
+  - DOMAIN-KEYWORD,makersuite,住宅自动
+  - DOMAIN-KEYWORD,mistral,住宅自动
+  - DOMAIN-KEYWORD,myaccount.google,住宅自动
+  - DOMAIN-KEYWORD,notebooklm,住宅自动
+  - DOMAIN-KEYWORD,oaistatic,住宅自动
+  - DOMAIN-KEYWORD,oaiusercontent,住宅自动
+  - DOMAIN-KEYWORD,ogs.google,住宅自动
+  - DOMAIN-KEYWORD,one.google,住宅自动
+  - DOMAIN-KEYWORD,openai,住宅自动
+  - DOMAIN-KEYWORD,pay.google,住宅自动
+  - DOMAIN-KEYWORD,payments.google,住宅自动
+  - DOMAIN-KEYWORD,perplexity,住宅自动
+  - DOMAIN-KEYWORD,ping.pe,住宅自动
+  - DOMAIN-KEYWORD,ping0,住宅自动
+  - DOMAIN-KEYWORD,replicate,住宅自动
+  - DOMAIN-KEYWORD,scamalytics,住宅自动
+  - DOMAIN-KEYWORD,sora.com,住宅自动
+  - DOMAIN-KEYWORD,statsig,住宅自动
+  - DOMAIN-KEYWORD,tiktok,住宅自动
+  - DOMAIN-KEYWORD,together,住宅自动
+  - DOMAIN-KEYWORD,wallet.google,住宅自动
+  - DOMAIN-KEYWORD,whatismyipaddress,住宅自动
+  - DOMAIN-KEYWORD,whoer,住宅自动
+  - MATCH,直连自动

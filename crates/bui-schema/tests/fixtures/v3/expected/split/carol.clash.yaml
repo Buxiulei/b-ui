@@ -1,0 +1,71 @@
+# B-UI Clash Meta 订阅配置
+# 用户: carol
+# 生成时间: 2026-09-11T14:39:13.446Z
+
+mode: rule
+log-level: warning
+unified-delay: true
+tcp-concurrent: true
+find-process-mode: strict
+global-client-fingerprint: chrome
+
+dns:
+  enable: true
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+    - "*.lan"
+    - "*.local"
+    - "*.localhost"
+    - "example.com"
+  default-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+  nameserver:
+    - https://dns.alidns.com/dns-query
+    - https://doh.pub/dns-query
+  nameserver-policy:
+    "example.com": "223.5.5.5"
+  fallback:
+    - https://8.8.8.8/dns-query
+    - https://1.1.1.1/dns-query
+  fallback-filter:
+    geoip: true
+    geoip-code: CN
+
+proxies:
+  - name: "carol-Reality住宅"
+    type: vless
+    server: example.com
+    port: 10002
+    uuid: 33333333-3333-4333-8333-333333333333
+    flow: xtls-rprx-vision
+    tls: true
+    udp: true
+    servername: www.bing.com
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: xpkTHqtLnYuBcHoV5_MgPY0MEjbMCHjkyKruMhDfbjY
+      short-id: 0123456789abcdef
+    network: tcp
+
+proxy-groups:
+  - name: "住宅自动"
+    type: url-test
+    proxies:
+      - "carol-Reality住宅"
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 50
+
+  - name: "PROXY"
+    type: select
+    proxies:
+      - "住宅自动"
+      - "carol-Reality住宅"
+
+rules:
+  - GEOIP,private,DIRECT,no-resolve
+  - GEOSITE,cn,DIRECT
+  - GEOIP,cn,DIRECT,no-resolve
+  - MATCH,住宅自动
