@@ -215,26 +215,46 @@ verify() {
     _SERVER_IP_FETCHED=1
     local vps_ip="$_SERVER_IP"
 
-    local candidates
+    local candidates rounds=1
     case "$want" in
         socks5) candidates="socks5" ;;
         http)   candidates="http"   ;;
-        *)      candidates="socks5 http" ;;
+        # v3.6.2 R12: auto 整轮重试一次。实测有效的 44445 也会偶发报"两种协议都连不上"，
+        # 同一行立刻重试就成——瞬时抽风不该让用户以为凭据写错了。每种协议各有自己的
+        # --max-time，慢的那个不会吃掉另一个的预算。
+        *)      candidates="socks5 http"; rounds=2 ;;
     esac
 
-    local t scheme exit_ip=""
-    for t in $candidates; do
-        if [[ "$t" == "http" ]]; then scheme="http"; else scheme="socks5h"; fi
-        info "通过 ${t^^} 测试出口..."
-        if exit_ip=$(curl_proxy_cfg "$scheme" "$host" "$port" "$user" "$pass" \
-                     | curl -sS --max-time 10 -K - https://api.ipify.org 2>/dev/null); then
-            RESI_TYPE="$t"
-            break
-        fi
-        exit_ip=""
+    local probe_timeout=10
+    local t scheme exit_ip="" rc=0 timed_out=0 round
+    for round in $(seq 1 "$rounds"); do
+        timed_out=0    # 只看最后一轮的失败性质：超时 vs 连不上，两种事故的处置不一样
+        for t in $candidates; do
+            if [[ "$t" == "http" ]]; then scheme="http"; else scheme="socks5h"; fi
+            if [[ "$rounds" -gt 1 ]] && [[ "$round" -gt 1 ]]; then
+                info "通过 ${t^^} 重试出口..."
+            else
+                info "通过 ${t^^} 测试出口..."
+            fi
+            exit_ip=$(curl_proxy_cfg "$scheme" "$host" "$port" "$user" "$pass" \
+                      | curl -sS --max-time "$probe_timeout" -K - https://api.ipify.org 2>/dev/null) \
+                && rc=0 || rc=$?
+            if [[ "$rc" -eq 0 ]]; then
+                RESI_TYPE="$t"
+                break 2
+            fi
+            [[ "$rc" -eq 28 ]] && timed_out=1   # curl 28 = 超时
+            exit_ip=""
+        done
     done
 
     if [[ -z "$exit_ip" ]]; then
+        # 超时和"连不上/被拒"是两码事：端口白名单那条提示只对后者有意义，
+        # 对超时给它只会把人引到错的方向（而且超时多半重试就好）
+        if [[ "$timed_out" == "1" ]]; then
+            err "校验超时（上游未在 ${probe_timeout} 秒内响应），请重试"
+            return 1
+        fi
         if [[ "$want" == "auto" ]]; then
             err "SOCKS5 与 HTTP 两种协议都连不上 (${host}:${port}) —— 请核对凭据与端口（供应商的 SOCKS5 与 HTTP 端口通常不同）"
         else
