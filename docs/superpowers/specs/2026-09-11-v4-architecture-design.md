@@ -122,14 +122,14 @@ Cargo workspace：
 
 ### 3.2 Hysteria2 鉴权：`auth.type: command`
 
-`config.yaml`：`auth: { type: command, command: /opt/b-ui/bin/bui auth-hook }`。内核每次建连以参数调用钩子（参数形态由 Sonnet 调研确认，见 §10），钩子读 `/opt/b-ui/auth-snapshot.json`（600，守护进程在用户变更时原子重写；内容 = 用户名 → HY2 密码、到期时间、是否超限），常量时间比对，放行则 stdout 输出 `user_id`，退出 0。不放行：到期、超限、禁用、不存在。
+`config.yaml`：`auth: { type: command, command: /opt/b-ui/bin/bui auth-hook }`。内核对**每条新 QUIC 连接调用一次** `bui auth-hook <addr> <auth> <tx>`（无环境变量、stdin 为空；`auth` 是客户端 `hysteria2://user:pass@` 里的 `user:pass` 原串，钩子按第一个 `:` 拆分用户名与密码；调研 H1–H7）。钩子读 `/opt/b-ui/auth-snapshot.json`（600，守护进程在用户变更时原子重写；内容 = 用户名 → HY2 密码、`user_id`、到期时间、是否超限），常量时间比对，放行则 stdout 打印 `user_id` 并退出 0——**该字符串就是 `/traffic`、`/online`、`/kick` 的键**。不放行：到期、超限、禁用、不存在、快照读取失败或超时（fail-closed）。内核对钩子**不设超时、不限流**（H8/H9）：钩子自设 ≤ 2 秒硬超时；`auth-hook` 子命令走极简路径（不初始化 tokio/tracing/不加载 state，只读快照一个小文件）；stderr 不会进 `hysteria-server` 的 journal（H5），诊断日志由钩子自写 `/opt/b-ui/auth-hook.log`（按大小轮转，只记用户名与结果，不记密码）。
 - 效果：增删用户、到期、超限在建连时生效，内核不重启；无面板 SPOF。
-- 代价：每次建连 fork 一个静态二进制（毫秒级）。M5 压测 200 建连/秒 p99 < 20ms；不达标的退路是改回 `userpass` + 内容比对重启（v3.6.0 行为），此退路必须在 M3 就以配置开关实现好。
+- 代价：每次建连 fork 一个静态二进制（毫秒级）。M5 压测 200 建连/秒 p99 < 20ms，同时记录 PID/fd 峰值；不达标的退路是改回 `userpass` + 内容比对重启（v3.6.0 行为；Hysteria2 无 SIGHUP/热加载，用户表变更只能重启，H14），此退路必须在 M3 就以配置开关实现好。
 - 密码以明文存 state 与快照（v3 的 `config.yaml` 本来就是明文，订阅也需要明文）；文件 600，日志脱敏。
 
 ### 3.3 Xray 用户与统计走 gRPC
 
-tonic 客户端，proto 从 Xray-core 仓库按 pinned 版本 vendor 进仓。`HandlerService.AlterInbound`（AddUser / RemoveUser，对两个 inbound 各一次）；`StatsService.QueryStats(pattern="user>>>", reset=true)` 一次拉全量增量。`xray-config.json` 里的 `clients` 列表同步维护，只为重启后持久化；它的变化不触发重启。
+tonic 客户端，proto 从 Xray-core `v26.3.27` vendor 进仓（以仓库根为 include path，共 10 个文件：`app/proxyman/command/command.proto`、`app/stats/command/command.proto`、`common/protocol/user.proto`、`common/serial/typed_message.proto`、`core/config.proto`、`proxy/vless/account.proto`、`app/proxyman/config.proto`、`transport/internet/config.proto`、`common/net/address.proto`、`common/net/port.proto`；标准 proto3，无 well-known types）。增删用户：`HandlerService.AlterInbound{tag, operation}`，`operation` 是两层 `TypedMessage`——外层 `type="xray.app.proxyman.command.AddUserOperation"` 包 `User{level:0, email:<user_id>, account}`，`account` 的 `type="xray.proxy.vless.Account"` 包 `Account{id:<uuid>, flow:"xtls-rprx-vision"}`；删除用 `RemoveUserOperation{email}`；对两个 inbound 各一次。**`email` 是 gRPC 侧唯一键**（stats 计数器名也用它），因此 `xray-config.json` 的 `clients[].email` 与 state 的 `user_id` 一一对应且非空。统计：`StatsService.QueryStats(pattern="user>>>", reset=true)` 一次拉全量（`pattern` 是子串匹配；`reset` 对每个计数器原子交换清零，不丢不重，但不同计数器不是同一时刻快照，累加语义正确，X6/X7）。`RemoveUser` **只阻止新握手，已建立的 REALITY 连接会活到客户端自己断开**（Xray #5844 未合并，X10）——v4 接受该窗口，不做进程重启硬切，面板说明写明「超限/到期用户的既有连接可能延续到其断开」。`xray-config.json` 里的 `clients` 列表同步维护，只为重启后持久化；它的变化不触发重启；REALITY 参数在 transport 层，增删用户无额外动作（X11）。CLI 退路：`xray api rmu -tag=<tag> <email>`；`xray api adu` 需要完整 inbound JSON 片段。
 
 ### 3.4 证书、系统状态、watchdog
 
@@ -167,10 +167,10 @@ tonic 客户端，proto 从 Xray-core 仓库按 pinned 版本 vendor 进仓。`H
 
 ### 4.2 流量采样与限额
 
-- 守护进程内 10 秒任务：hysteria 直连 `GET /traffic?clear=1`（9999）+ 住宅（9998）增量相加；Xray `QueryStats(reset=true)`；累加到内存中的 `usage`，最多每 30 秒合并落盘一次。
-- 在线：hysteria 两个 `/online` 的并集 ∪ 最近 30 秒有 Xray 增量的用户。
+- 守护进程内 10 秒任务：hysteria 直连 `GET /traffic?clear=1`（9999）+ 住宅（9998）增量相加（`clear` 在同一把锁内序列化并清零，原子，H10；trafficStats 若设 `secret`，请求头 `Authorization: <secret>`，无 `Bearer` 前缀，H13）；Xray `QueryStats(reset=true)`；累加到内存中的 `usage`，最多每 30 秒合并落盘一次。
+- 在线：hysteria 两个 `/online` 的并集（值是该用户当前 QUIC 连接数，`>0` 即在线，H11）∪ 最近 30 秒有 Xray 增量的用户。
 - 月度重置：服务器本地时间每月 1 日 00:00，`month_key` 变化时清零 `monthly_bytes`。
-- 执行：到期 / 超限 / 禁用 → 快照标记拒绝 + 对两个 hysteria `POST /kick` + Xray `RemoveUser`；恢复条件满足时反向操作。限额判断每次采样后执行。
+- 执行：到期 / 超限 / 禁用 → 快照标记拒绝（主保障：新连接一律被钩子拒绝）+ 对两个 hysteria `POST /kick`（请求体 `["<user_id>"]`；kick 只是标记，要等该用户下次有流量才断连，空闲连接可能长期不断，被踢后客户端会重连并再次过钩子，H12）+ Xray `RemoveUser`（只阻新握手，见 §3.3）；恢复条件满足时反向操作（快照放行 + Xray `AddUser`）。限额判断每次采样后执行。
 - `/api/stats`、`/api/online` 读同一份缓存；面板开着不增加采样。
 
 ### 4.3 面板 API
@@ -218,7 +218,7 @@ tonic 客户端，proto 从 Xray-core 仓库按 pinned 版本 vendor 进仓。`H
 
 ### 5.3 健康与切换
 
-每 2 分钟一轮，成员并行：每成员对 `https://www.gstatic.com/generate_204` 探测 2 次，任一成功即本轮健康；连续 2 轮不达标 → 标记不健康，连续 2 轮达标 → 恢复。当前选中成员健康 → 不动；不健康 → 切到健康成员里 `priority` 最小者（同优先级按近 24h 成功率）；两次切换间隔 ≥ 60 秒；全部不健康 → 保持并告警；成员集在本轮内变化 → 本轮不切。切换通过 Clash API `PUT /proxies/resi-pool`。relay 任何重启后立即重放 `selected_upstream_id`。
+每 2 分钟一轮，成员并行：每成员对 `https://www.gstatic.com/generate_204` 探测 2 次，任一成功即本轮健康；连续 2 轮不达标 → 标记不健康，连续 2 轮达标 → 恢复。当前选中成员健康 → 不动；不健康 → 切到健康成员里 `priority` 最小者（同优先级按近 24h 成功率）；两次切换间隔 ≥ 60 秒；全部不健康 → 保持并告警；成员集在本轮内变化 → 本轮不切。切换通过 Clash API `PUT /proxies/resi-pool`（与配置切换走同一条 `SelectOutbound` 路径，S4）。**`resi-pool` 选择器的 `interrupt_exist_connections` 固定为 `false`**，否则每次健康切换都会掐断全部住宅连接。relay 任何重启后立即重放 `selected_upstream_id`。
 
 ### 5.4 黑名单（R13 落地）
 
@@ -226,12 +226,12 @@ tonic 客户端，proto 从 Xray-core 仓库按 pinned 版本 vendor 进仓。`H
 - **确认**：经该上游探测为**硬拒**（HTTP 上游：CONNECT 状态码 4xx/5xx；SOCKS5 上游：回复码 ≠ 0）**且**直连同目标 TCP 可达，间隔 ≥ 10 分钟连续 2 次 → 生成 `domain_suffix` 规则，值就是被拒的完整主机名（如 `gateway.icloud.com`，它同时覆盖其子域），**不**泛化到注册域名，进入 `auto`。端口类拒绝不进黑名单，由上游的 `ports_allowed` 表达。
 - **生效**：pins 与手动「立即应用」→ 立刻重渲染 relay 并重启；`auto` 新增 → 每日 04:00（服务器本地时间）批量；relay 重启是唯一掐连接的动作。
 - **复核**：每条 `auto` 每日复探一次，连续 3 次不再被拒（`passes ≥ 3`）→ 移除。
-- **渲染**：relay `route.rules` 顺序：① 黑名单 `domain_suffix/domain → direct`；② `ports_allowed` 非空时 `port_range` 取反 → direct；③ `udp/443 → reject`、`udp/53 → direct`、其余 udp → direct；④ split 模式下 `domain_keyword → resi-pool`；`final` = global 时 `resi-pool`，split 时 `direct`。DNS 规则镜像：黑名单域名走 `dns_direct`。池空或 `enabled=false` → 全部 direct（fail-open）。
+- **渲染**：relay `route.rules` 顺序：① 黑名单 `domain_suffix/domain → direct`；② `ports_allowed` 非空时 `port_range` 取反 → direct（写法 `{"port_range":["1:79","81:442","444:65535"],"outbound":"direct"}`；`port_range` 必含冒号，单端口用 `port` 数组，S3）；③ `udp/443 → reject`、`udp/53 → direct`、其余 udp → direct；④ split 模式下 `domain_keyword → resi-pool`；`final` = global 时 `resi-pool`，split 时 `direct`。DNS 规则镜像：黑名单域名走 `dns_direct`。池空或 `enabled=false` → 全部 direct（fail-open）。
 - **局限**（写进面板说明）：返回 200 拦截页的软封锁识别不了，靠 pin。
 
 ### 5.5 多组预留
 
-以上全部按 `group_id` 作用域实现；v4 只有 `default`。扩展路径（不实现）：Reality 住宅按用户路由到组的 socks 出站，relay 用 `auth_user` 分组；HY2 住宅每组一个 `hysteria-residential@<group>` 实例与端口。
+以上全部按 `group_id` 作用域实现；v4 只有 `default`。扩展路径（不实现）：Reality 住宅按用户路由到组的 socks 出站，relay 的 `mixed`/`socks` inbound 配 `users[]`、规则用 `auth_user`（不是 `user`，后者匹配进程属主，S1/S2）分组；HY2 住宅每组一个 `hysteria-residential@<group>` 实例与端口。
 
 ---
 
@@ -239,7 +239,7 @@ tonic 客户端，proto 从 Xray-core 仓库按 pinned 版本 vendor 进仓。`H
 
 - 静态二进制（x86_64 / aarch64），`/opt/bui-c/{bin/sing-box, profiles.json, config.json}`，单元 `bui-c.service`（`sing-box run -c /opt/bui-c/config.json`，`Restart=always`）与 `bui-c.timer`（每分钟 `bui-c check`）。
 - 引擎只有 sing-box（≤ 1.14）；Hysteria2 与 VLESS-REALITY 均为 sing-box 出站（uTLS chrome）。
-- 模式：`socks`（`mixed` inbound 127.0.0.1:1080 与 127.0.0.1:8080）/ `tun`（`tun` inbound，`interface_name: bui-tun`，`stack: mixed`，`auto_route`，IPv6 接管与裸 v6 拒绝按 `2026-09-10-ipv6-takeover-design.md`，CN 域名直连 DNS，`sniff` + `hijack-dns`，cloudflared QUIC 例外，住宅节点的分流关键字）。切模式 = 重渲染 + 重启单元。
+- 模式：`socks`（`mixed` inbound 127.0.0.1:1080 与 127.0.0.1:8080）/ `tun`（`tun` inbound，`interface_name: bui-tun`，`stack: mixed`，`auto_route`，IPv6 接管与裸 v6 拒绝按 `2026-09-10-ipv6-takeover-design.md`，CN 域名直连 DNS，`sniff` + `hijack-dns`，cloudflared QUIC 例外，住宅节点的分流关键字）。切模式 = 重渲染 + 重启单元。DNS 用 typed server，**凡需经代理解析的 server 必须显式 `detour`**（typed server 不设 `detour` 时是空 direct dialer，不是默认出站，S5）；生成器禁止出现 `rule_set`、`download_detour`、legacy 字符串式 DNS server、`inet4_address/inet6_address`（S8/S9）。
 - 节点来源：`/api/nodes/<user>`（首选，schema 同源）；`/api/sub` base64；粘贴 `hysteria2://`、`vless://`。多 profile，`switch` 切换。
 - `check`：经本地 inbound 请求 gstatic 204；TUN 下核对接口与默认路由；失败退避重启（1/2/4 分钟）。
 - `update`：来源顺序 面板 `/packages/` → GitHub Releases → 镜像；每日 timer 自动，可关。服务端内核缓存继续维护 sing-box 与 `bui-c` 的 Linux 二进制。
@@ -264,7 +264,7 @@ tonic 客户端，proto 从 Xray-core 仓库按 pinned 版本 vendor 进仓。`H
 |---|---|---|
 | 单元 | 四种粘贴格式解析；权益 → 节点集合；限额判断；月度重置；黑名单确认状态机；健康迟滞状态机；对账 diff 计算 | `cargo test` |
 | Golden | 以 bwg-rick **迁移前**抓取并脱敏的 v3 样本（M1 第一项任务就是抓样本）（users.json、config、三种订阅输出）为 fixture，v4 渲染必须逐项相等 | `cargo test`，M1 验收的机器化版本 |
-| 集成 | 渲染出的 hysteria / xray / relay / 客户端配置过真实内核校验 | CI |
+| 集成 | 渲染出的 hysteria / xray / relay / 客户端配置过真实内核校验；`sing-box check` 对未知字段（含嵌套层）严格报错（S10），是生成器的可靠门槛，1.13.19 与 1.14.x 都跑 | CI |
 | 端到端 | §9 里程碑验收 | bwg-rick / baiyi |
 
 ---
@@ -285,13 +285,15 @@ tonic 客户端，proto 从 Xray-core 仓库按 pinned 版本 vendor 进仓。`H
 
 ---
 
-## 10. 实施前必须由 Sonnet 确认的三项
+## 10. 实施前三项未知（已裁决）
 
-| 项 | 需要确认 | 影响 |
-|---|---|---|
-| Hysteria2 `auth.type: command` | 参数/环境变量的精确形态、stdout 约定、超时、并发行为、失败时内核日志 | §3.2 钩子实现；不满足则启用 `userpass` 退路 |
-| sing-box `auth_user` 路由与 `port_range` 取反写法 | 1.12–1.14 三个版本一致可用 | §5.4 渲染、§5.5 预留 |
-| Xray gRPC proto 与 `QueryStats(reset)` 行为 | pinned 版本的 proto 文件、`reset=true` 是否原子 | §3.3、§4.2 |
+调研与裁决见 `docs/superpowers/research/2026-09-11-v4-unknowns.md`（2026-09-11，两路 Sonnet + Fable 对账）；结论已并入 §3.2、§3.3、§4.2、§5.3、§5.4、§5.5、§6、§8。
+
+| 项 | 裁决 |
+|---|---|
+| Hysteria2 `auth.type: command` | 可用：`<addr> <auth> <tx>`，stdout id，exit 0；无超时/无限流/无热加载 → 钩子自设超时 + 极简路径 + 自写日志；`userpass` 退路开关 M3 实现 |
+| sing-box `auth_user` / `port_range` 取反 | 1.12–1.14 三版一致可用；`sing-box check` 严格校验可作生成器门槛；`resi-pool` 必须 `interrupt_exist_connections: false` |
+| Xray gRPC proto 与 `QueryStats(reset)` | 可用：10 个 proto vendor；`reset` 单计数器原子；`RemoveUser` 不断既有连接是上游缺口，§4.2 已明写接受该窗口 |
 
 ---
 
