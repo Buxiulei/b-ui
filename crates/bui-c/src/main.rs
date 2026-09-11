@@ -1,3 +1,3 @@
 fn main() {
-    println!("bui-c v4 placeholder");
+    println!("bui-c {}", bui_c::VERSION);
 }
