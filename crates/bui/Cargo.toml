@@ -7,3 +7,51 @@ license.workspace = true
 
 [dependencies]
 bui-schema = { path = "../bui-schema" }
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+uuid.workspace = true
+sha2.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "time",
+    "net",
+    "signal",
+    "io-util",
+    "process",
+] }
+axum = "0.8"
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["trace"] }
+hyper = { version = "1", features = ["client", "server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+http-body-util = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-journald = "0.3"
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "json",
+    "blocking",
+] }
+inotify = { version = "0.11", features = ["stream"] }
+nix = { version = "0.29", features = ["socket", "user", "hostname", "fs"] }
+argon2.workspace = true
+jsonwebtoken = "9"
+rand.workspace = true
+time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
+futures-util = "0.3"
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+tempfile.workspace = true
+# Task 11/15 用 `#[tokio::test(start_paused = true)]` 推进时钟，它需要 tokio 的 `test-util` feature。
+# cargo 在 test 构建时把 dev-dependencies 的 feature 与 [dependencies] 的并集生效，生产构建不带这一项；
+# 少了这一行，`start_paused = true` 直接报 `no method named start_paused`，Task 11/15 的测试编译不过。
+tokio = { version = "1", features = ["test-util"] }

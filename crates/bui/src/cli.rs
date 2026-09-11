@@ -1,0 +1,304 @@
+//! CLI 定义。子命令与选项名**逐字照总纲 C5**，P5 的脚本按 C5 调用，不得自造参数名。
+use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+
+/// b-ui v4 单二进制控制器（守护进程 + CLI）。
+#[derive(Debug, Parser)]
+#[command(
+    name = "bui",
+    about = "b-ui v4 期望态控制器",
+    subcommand_required = false,
+    arg_required_else_help = false,
+    // 总纲 C5：`bui --version` 只打印版本号，所以关掉 clap 自带的 --version（它会打印 "bui 4.0.0"）
+    disable_version_flag = true
+)]
+pub struct Cli {
+    /// 日志级别（覆盖 RUST_LOG），例如 info / debug
+    #[arg(long, global = true)]
+    pub log: Option<String>,
+    /// 打印版本号后退出（只打印 `4.0.0`，不带程序名）
+    #[arg(long, short = 'V')]
+    pub version: bool,
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+/// 全部子命令（形状是 C5 的字面约定）。
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum Command {
+    /// 首次安装：交互收集参数 → 写 state.json → 对账
+    Install {
+        /// 面板域名
+        #[arg(long)]
+        domain: Option<String>,
+        /// Hysteria2 直连端口（默认 10000）
+        #[arg(long)]
+        port: Option<u16>,
+        /// 从 stdin 读管理员密码（凭据不进 argv）
+        #[arg(long)]
+        admin_password_stdin: bool,
+        /// 从 v3 安装目录导入（不带值时用 /opt/b-ui）
+        #[arg(long, value_name = "DIR", num_args = 0..=1, default_missing_value = "/opt/b-ui")]
+        import_v3: Option<PathBuf>,
+        /// 非交互安装：一个问题都不问（总纲 C5）
+        #[arg(long)]
+        non_interactive: bool,
+        /// 非交互安装的答案文件（JSON；形状见 Task 16 的 `Answers` / `load_answers`）
+        #[arg(long, value_name = "FILE", requires = "non_interactive")]
+        answers: Option<PathBuf>,
+        /// 非交互：缺失项用默认值（`--non-interactive` 的简写别名，两者都接受）
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// 升级 bui 与内核二进制
+    Upgrade {
+        /// 回滚到上一版二进制与最近一份 state 备份
+        #[arg(long)]
+        rollback: bool,
+        /// 升级到指定版本（manifest 取 `releases/download/v<x.y.z>/manifest.json`）
+        #[arg(long, value_name = "X.Y.Z")]
+        version: Option<String>,
+        /// 覆盖 manifest 地址：http(s) URL、`file://…` 或本地路径（总纲 C4，M5 演练用）
+        #[arg(long, value_name = "URL|FILE")]
+        manifest_url: Option<String>,
+    },
+    /// 运行守护进程（systemd 用）
+    Serve,
+    /// 手动对账一次
+    Reconcile {
+        /// 连非受管的漂移项一起清理
+        #[arg(long)]
+        force: bool,
+        /// 只打印将要做的改动，不落盘
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// 打印状态与体检
+    Status {
+        /// 输出 `/api/health` 的 JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// 只从 v3 生成 state.json（不对账、不卸载 v3）
+    ImportV3 {
+        /// v3 安装目录
+        #[arg(long, default_value = "/opt/b-ui")]
+        dir: PathBuf,
+        /// 输出路径（默认写 <base>/state.json）
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Hysteria2 auth.command 钩子（逻辑由 P2 实现）
+    AuthHook {
+        /// hysteria 传进来的位置参数，原样收集
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// 数字菜单（sudo b-ui 的符号链接目标）
+    Menu,
+    /// 只做 SSH 硬化
+    HardenSsh,
+}
+
+/// `/usr/local/bin/b-ui` 这个符号链接裸跑时进菜单（spec §1、§2.4）。
+///
+/// 以 `bui` 名字裸跑则返回 `None`，由 `main` 打印 help。
+pub fn default_command(argv0: &str) -> Option<Command> {
+    let name = std::path::Path::new(argv0)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    (name == "b-ui").then_some(Command::Menu)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn parses_install_with_bare_import_flag() {
+        let cli = Cli::try_parse_from(["bui", "install", "--domain", "example.com", "--import-v3"])
+            .unwrap();
+        assert_eq!(
+            cli.command,
+            Some(Command::Install {
+                domain: Some("example.com".into()),
+                port: None,
+                admin_password_stdin: false,
+                import_v3: Some(PathBuf::from("/opt/b-ui")),
+                non_interactive: false,
+                answers: None,
+                yes: false,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_non_interactive_install_with_an_answers_file() {
+        // 总纲 C5 的 `bui install [--non-interactive --answers <file>]`：P5 的 v3-cutover.sh 只准用这一条
+        let cli = Cli::try_parse_from([
+            "bui",
+            "install",
+            "--non-interactive",
+            "--answers",
+            "/root/answers.json",
+            "--admin-password-stdin",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.command,
+            Some(Command::Install {
+                domain: None,
+                port: None,
+                admin_password_stdin: true,
+                import_v3: None,
+                non_interactive: true,
+                answers: Some(PathBuf::from("/root/answers.json")),
+                yes: false,
+            })
+        );
+    }
+
+    #[test]
+    fn an_answers_file_without_non_interactive_is_rejected() {
+        assert!(
+            Cli::try_parse_from(["bui", "install", "--answers", "/root/answers.json"]).is_err()
+        );
+    }
+
+    #[test]
+    fn parses_install_with_import_dir_and_password_stdin() {
+        let cli = Cli::try_parse_from([
+            "bui",
+            "install",
+            "--domain",
+            "example.com",
+            "--port",
+            "10000",
+            "--admin-password-stdin",
+            "--import-v3",
+            "/tmp/old",
+            "-y",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.command,
+            Some(Command::Install {
+                domain: Some("example.com".into()),
+                port: Some(10000),
+                admin_password_stdin: true,
+                import_v3: Some(PathBuf::from("/tmp/old")),
+                non_interactive: false,
+                answers: None,
+                yes: true,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_password_on_argv() {
+        // 凭据不进 argv：没有 --admin-password 这个选项
+        assert!(Cli::try_parse_from(["bui", "install", "--admin-password", "x"]).is_err());
+    }
+
+    #[test]
+    fn parses_upgrade_flags_per_c5_and_reconcile_flags() {
+        assert_eq!(
+            Cli::try_parse_from(["bui", "upgrade", "--rollback"])
+                .unwrap()
+                .command,
+            Some(Command::Upgrade {
+                rollback: true,
+                version: None,
+                manifest_url: None
+            })
+        );
+        assert_eq!(
+            Cli::try_parse_from(["bui", "upgrade", "--version", "4.0.1"])
+                .unwrap()
+                .command,
+            Some(Command::Upgrade {
+                rollback: false,
+                version: Some("4.0.1".into()),
+                manifest_url: None
+            })
+        );
+        assert_eq!(
+            Cli::try_parse_from([
+                "bui",
+                "upgrade",
+                "--manifest-url",
+                "http://127.0.0.1:8000/manifest.json"
+            ])
+            .unwrap()
+            .command,
+            Some(Command::Upgrade {
+                rollback: false,
+                version: None,
+                manifest_url: Some("http://127.0.0.1:8000/manifest.json".into()),
+            })
+        );
+        assert!(
+            Cli::try_parse_from(["bui", "upgrade", "--channel", "beta"]).is_err(),
+            "--channel 已废弃"
+        );
+        assert_eq!(
+            Cli::try_parse_from(["bui", "reconcile", "--force", "--dry-run"])
+                .unwrap()
+                .command,
+            Some(Command::Reconcile {
+                force: true,
+                dry_run: true
+            })
+        );
+        assert_eq!(
+            Cli::try_parse_from(["bui", "import-v3"]).unwrap().command,
+            Some(Command::ImportV3 {
+                dir: PathBuf::from("/opt/b-ui"),
+                out: None
+            })
+        );
+    }
+
+    #[test]
+    fn auth_hook_collects_trailing_args() {
+        let cli = Cli::try_parse_from(["bui", "auth-hook", "alice", "pw"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Some(Command::AuthHook {
+                args: vec!["alice".into(), "pw".into()]
+            })
+        );
+    }
+
+    #[test]
+    fn bare_invocation_parses_and_leaves_the_command_empty() {
+        // spec §2.4：`sudo b-ui` 无参也要能跑（进菜单），所以子命令不是必填
+        assert_eq!(Cli::try_parse_from(["b-ui"]).unwrap().command, None);
+        assert_eq!(Cli::try_parse_from(["bui"]).unwrap().command, None);
+    }
+
+    #[test]
+    fn version_is_our_own_flag_so_it_can_print_just_the_number() {
+        // 总纲 C5：`bui --version` 只打印 `4.0.0`。clap 自带的 version 会打印 `bui 4.0.0`，
+        // 所以 `#[command(...)]` 里 `disable_version_flag = true`，改由 main 自己处理这个 bool。
+        let cli = Cli::try_parse_from(["bui", "--version"]).unwrap();
+        assert!(cli.version);
+        assert_eq!(cli.command, None);
+        assert!(!Cli::try_parse_from(["bui", "status"]).unwrap().version);
+    }
+
+    #[test]
+    fn the_b_ui_alias_defaults_to_the_menu() {
+        assert_eq!(default_command("/usr/local/bin/b-ui"), Some(Command::Menu));
+        assert_eq!(default_command("b-ui"), Some(Command::Menu));
+        assert_eq!(
+            default_command("/opt/b-ui/bin/bui"),
+            None,
+            "以 bui 名字裸跑打印 help"
+        );
+        assert_eq!(default_command(""), None);
+    }
+}
