@@ -187,7 +187,7 @@ tonic 客户端，proto 从 Xray-core `v26.3.27` vendor 进仓（以仓库根为
 
 ### 4.4 订阅
 
-三种订阅与 v3 逐项等价（节点集、端口、UUID、密码、标签、`mport=`、obfs 参数、住宅分流规则），由 `bui-schema` 从同一节点列表渲染；sing-box JSON 保持 1.12–1.14 兼容子集（typed DNS、TUN `address` 数组、rule action、无 `rule_set`）。CI 用 v3 抓取的脱敏样本做 golden 比对（§8）。
+三种订阅与 v3 逐项等价（节点集、端口、UUID、密码、标签、`mport=`、obfs 参数、住宅分流规则），由 `bui-schema` 从同一节点列表渲染；唯一有意的差异：v3 对「单协议 + 住宅」用户只发住宅版节点，v4 按权益（`direct=true`）多发一个直连版——等价口径是「v3 有的节点逐项相等」（P0 golden 测试的 `v3_nodes_only` 过滤）；sing-box JSON 保持 1.12–1.14 兼容子集（typed DNS、TUN `address` 数组、rule action、无 `rule_set`）。CI 用 v3 抓取的脱敏样本做 golden 比对（§8）。
 
 ---
 
@@ -226,7 +226,7 @@ tonic 客户端，proto 从 Xray-core `v26.3.27` vendor 进仓（以仓库根为
 - **确认**：经该上游探测为**硬拒**（HTTP 上游：CONNECT 状态码 4xx/5xx；SOCKS5 上游：回复码 ≠ 0）**且**直连同目标 TCP 可达，间隔 ≥ 10 分钟连续 2 次 → 生成 `domain_suffix` 规则，值就是被拒的完整主机名（如 `gateway.icloud.com`，它同时覆盖其子域），**不**泛化到注册域名，进入 `auto`。端口类拒绝不进黑名单，由上游的 `ports_allowed` 表达。
 - **生效**：pins 与手动「立即应用」→ 立刻重渲染 relay 并重启；`auto` 新增 → 每日 04:00（服务器本地时间）批量；relay 重启是唯一掐连接的动作。
 - **复核**：每条 `auto` 每日复探一次，连续 3 次不再被拒（`passes ≥ 3`）→ 移除。
-- **渲染**：relay `route.rules` 顺序：① 黑名单 `domain_suffix/domain → direct`；② `ports_allowed` 非空时 `port_range` 取反 → direct（写法 `{"port_range":["1:79","81:442","444:65535"],"outbound":"direct"}`；`port_range` 必含冒号，单端口用 `port` 数组，S3）；③ `udp/443 → reject`、`udp/53 → direct`、其余 udp → direct；④ split 模式下 `domain_keyword → resi-pool`；`final` = global 时 `resi-pool`，split 时 `direct`。DNS 规则镜像：黑名单域名走 `dns_direct`。池空或 `enabled=false` → 全部 direct（fail-open）。
+- **渲染**：relay `route.rules` 顺序：① 黑名单 `domain_suffix/domain → direct`；② `ports_allowed` 非空时 `port_range` 取反 → direct（写法 `{"port_range":["1:79","81:442","444:65535"],"outbound":"direct"}`；`port_range` 必含冒号，单端口用 `port` 数组，S3）；③ `udp/443 → reject`、`udp/53 → direct`、其余 udp → direct；③′ 私网网段与本机公网 IP `ip_cidr → direct`（沿用 v3 PRIVATE_CIDRS）；④ split 模式下 `domain_keyword → resi-pool`；`final` = global 时 `resi-pool`，split 时 `direct`。DNS 规则镜像：黑名单域名走 `dns_direct`。池空或 `enabled=false` → 全部 direct（fail-open）。
 - **局限**（写进面板说明）：返回 200 拦截页的软封锁识别不了，靠 pin。
 
 ### 5.5 多组预留
@@ -237,7 +237,7 @@ tonic 客户端，proto 从 Xray-core `v26.3.27` vendor 进仓（以仓库根为
 
 ## 6. Linux 客户端 `bui-c`（§⑤）
 
-- 静态二进制（x86_64 / aarch64），`/opt/bui-c/{bin/sing-box, profiles.json, config.json}`，单元 `bui-c.service`（`sing-box run -c /opt/bui-c/config.json`，`Restart=always`）与 `bui-c.timer`（每分钟 `bui-c check`）。
+- 静态二进制（x86_64 / aarch64），`/opt/bui-c/{bin/sing-box, profiles.json, config.json}`，三个单元：`bui-c.service`（`sing-box run -c /opt/bui-c/config.json`，`Restart=always`，唯一数据面进程）、`bui-c-check.service`（`Type=oneshot`，`ExecStart=bui-c check`）、`bui-c.timer`（每分钟触发 `bui-c-check.service`；timer 不能直接指向 sing-box 单元，否则每分钟重新激活引擎）。
 - 引擎只有 sing-box（≤ 1.14）；Hysteria2 与 VLESS-REALITY 均为 sing-box 出站（uTLS chrome）。
 - 模式：`socks`（`mixed` inbound 127.0.0.1:1080 与 127.0.0.1:8080）/ `tun`（`tun` inbound，`interface_name: bui-tun`，`stack: mixed`，`auto_route`，IPv6 接管与裸 v6 拒绝按 `2026-09-10-ipv6-takeover-design.md`，CN 域名直连 DNS，`sniff` + `hijack-dns`，cloudflared QUIC 例外，住宅节点的分流关键字）。切模式 = 重渲染 + 重启单元。DNS 用 typed server，**凡需经代理解析的 server 必须显式 `detour`**（typed server 不设 `detour` 时是空 direct dialer，不是默认出站，S5）；生成器禁止出现 `rule_set`、`download_detour`、legacy 字符串式 DNS server、`inet4_address/inet6_address`（S8/S9）。
 - 节点来源：`/api/nodes/<user>`（首选，schema 同源）；`/api/sub` base64；粘贴 `hysteria2://`、`vless://`。多 profile，`switch` 切换。
@@ -254,7 +254,7 @@ tonic 客户端，proto 从 Xray-core `v26.3.27` vendor 进仓（以仓库根为
 - `install.sh`（路径不变）≈ 100 行：架构识别 → 多源下载 `bui` → sha256 → `bui install [--import-v3]`。
 - `bui install`：交互（域名、管理员密码、端口、可选住宅 URL）→ state → `reconcile()`。幂等：第二次运行零变更。
 - `bui upgrade`：下载 `manifest.json` 指定版本的 `bui` → 原子替换 → `systemctl restart b-ui` → `reconcile()`（内核随 manifest 升级）。守护进程每日带抖动自检；面板 / CLI 手动；`--rollback` 恢复上一版二进制 + 最近一份 state 备份。
-- 发布：GitHub Actions：`cargo test` → 渲染结果用真实内核校验（sing-box 1.12 / 1.13 / 1.14 `check`、`xray run -test`）→ musl 静态构建 → Release 附 `manifest.json`（`bui`、内核目标版本、sha256）。`CHANGELOG.md` 记录；首版 `v4.0.0`。
+- 发布：GitHub Actions：`cargo test` → 渲染结果用真实内核校验（sing-box 1.12 / 1.13 / 1.14 `check`、`xray run -test`）→ musl 静态构建 → Release 附 `manifest.json`（形状见总纲 C4：`version`、`kernels` 版本表、`artifacts` 以 `<name>-linux-<arch>` 为键的裸二进制 URL + sha256；上游内核的 tar.gz/zip 由 Actions 解包后重新上传）。`CHANGELOG.md` 记录；首版 `v4.0.0`。
 
 ---
 
