@@ -1,0 +1,60 @@
+# Hysteria2 服务器配置 — Residential 实例 (v3.5)
+# 出战 SOCKS5 → b-ui-relay sing-box → direct 或 住宅 URL urltest 池
+# 生成时间: Fri May  1 00:00:00 UTC 2026
+
+listen: :40000,41000-50000
+
+tls:
+  sniGuard: disable
+  cert: /opt/b-ui/certs/fullchain.pem
+  key: /opt/b-ui/certs/privkey.pem
+
+quic:
+  maxIdleTimeout: 60s
+
+ignoreClientBandwidth: true
+
+resolver:
+  type: https
+  https:
+    addr: "1.1.1.1:443"
+    sni: cloudflare-dns.com
+
+auth:
+  type: userpass
+  userpass:
+    alice: pw-alice-01
+    bob: pw-bob-02
+    carol: pw-carol-03
+    dave: pw-dave-04
+
+trafficStats:
+  listen: 127.0.0.1:9998
+  secret: ""
+
+masquerade:
+  type: proxy
+  proxy:
+    url: https://www.bing.com
+    rewriteHost: true
+
+sniff:
+  enable: true
+  timeout: 2s
+  rewriteDomain: true
+  tcpPorts: 80,443,8000-9000
+  udpPorts: 443,53
+
+outbounds:
+  - name: relay
+    type: socks5
+    socks5:
+      addr: "127.0.0.1:2080"
+  - name: direct
+    type: direct
+    direct:
+      mode: 4
+
+acl:
+  inline:
+    - relay(all)

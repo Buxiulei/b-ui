@@ -18,6 +18,8 @@ url = "2"
 sha2 = "0.10"
 hex = "0.4"
 thiserror = "2"
+argon2 = "0.5"
+rand = "0.8"
 pretty_assertions = "1"
 tempfile = "3"
 
