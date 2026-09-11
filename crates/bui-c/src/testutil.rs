@@ -2,6 +2,7 @@
 //!
 //! 不加 `#[cfg(test)]`——同一套样例给 `src/**` 的单元测试与未来的集成测试共用。
 
+use crate::profiles::{Mode, Profile, Profiles, Source};
 use bui_schema::nodes::{Node, NodeKind, Transport};
 use bui_schema::render::SplitRules;
 
@@ -66,4 +67,28 @@ pub fn split_keywords() -> SplitRules {
         global: false,
         keywords: vec!["openai.com".into(), "anthropic.com".into()],
     }
+}
+
+fn one(mode: Mode) -> Profiles {
+    let mut p = Profiles::new_default();
+    p.mode = mode;
+    p.profiles.push(Profile {
+        name: "alice-hy2-direct".into(),
+        node: hy2_direct_node(),
+        split: split_global(),
+        source: Source::ApiNodes,
+        imported_at: "2026-09-11T00:00:00Z".into(),
+    });
+    p.active = Some("alice-hy2-direct".into());
+    p
+}
+
+/// 一个 hy2 直连节点，`mode = Socks`，active 已设。
+pub fn profiles_socks() -> Profiles {
+    one(Mode::Socks)
+}
+
+/// 同 [`profiles_socks`]，但 `mode = Tun`。
+pub fn profiles_tun() -> Profiles {
+    one(Mode::Tun)
 }
