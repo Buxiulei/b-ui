@@ -6,6 +6,7 @@ pub mod error;
 pub mod fake;
 pub mod net;
 pub mod paths;
+pub mod profiles;
 pub mod sys;
 pub mod testutil;
 
