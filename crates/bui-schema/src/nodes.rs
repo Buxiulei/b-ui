@@ -1,10 +1,12 @@
 //! 权益 → 节点集合：把一个用户的 [`Entitlements`](crate::model::Entitlements) 展开成他订阅里该出现的节点。
 
 use crate::model::{NodeParams, Protocol, Residential, User};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// 四条通路之一。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum NodeKind {
     RealityDirect,
     RealityResidential,
@@ -13,7 +15,8 @@ pub enum NodeKind {
 }
 
 /// 节点的协议参数。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum Transport {
     Hysteria2 {
         username: String,
@@ -34,7 +37,7 @@ pub enum Transport {
 }
 
 /// 订阅里的一个节点。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Node {
     pub kind: NodeKind,
     pub label: String,
@@ -281,5 +284,122 @@ mod tests {
             Transport::Hysteria2 { obfs_password, .. } => assert_eq!(obfs_password, &None),
             _ => panic!(),
         }
+    }
+}
+
+#[cfg(test)]
+mod serde_tests {
+    use super::*;
+
+    fn hy2() -> Node {
+        Node {
+            kind: NodeKind::Hy2Direct,
+            label: "HY2直连".into(),
+            host: "panel.example.com".into(),
+            port: 10000,
+            hop: Some((20000, 30000)),
+            transport: Transport::Hysteria2 {
+                username: "alice".into(),
+                password: "pw".into(),
+                sni: "panel.example.com".into(),
+                obfs_password: None,
+            },
+        }
+    }
+
+    #[test]
+    fn node_wire_format_is_snake_case_and_internally_tagged() {
+        let v = serde_json::to_value(hy2()).unwrap();
+        assert_eq!(v["kind"], "hy2_direct");
+        assert_eq!(v["hop"], serde_json::json!([20000, 30000]));
+        assert_eq!(v["transport"]["type"], "hysteria2");
+        assert_eq!(v["transport"]["username"], "alice");
+        assert!(v["transport"]["obfs_password"].is_null());
+    }
+
+    #[test]
+    fn node_round_trips() {
+        let n = hy2();
+        let back: Node = serde_json::from_str(&serde_json::to_string(&n).unwrap()).unwrap();
+        assert_eq!(n, back);
+    }
+
+    #[test]
+    fn reality_node_round_trips() {
+        let n = Node {
+            kind: NodeKind::RealityResidential,
+            label: "Reality住宅".into(),
+            host: "panel.example.com".into(),
+            port: 10002,
+            hop: None,
+            transport: Transport::Reality {
+                uuid: Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap(),
+                public_key: "PUB".into(),
+                short_id: "0123456789abcdef".into(),
+                server_name: "www.bing.com".into(),
+                fingerprint: "chrome".into(),
+                flow: "xtls-rprx-vision".into(),
+            },
+        };
+        let v = serde_json::to_value(&n).unwrap();
+        assert_eq!(v["kind"], "reality_residential");
+        assert_eq!(v["transport"]["type"], "reality");
+        assert_eq!(
+            v["transport"]["uuid"],
+            "11111111-1111-4111-8111-111111111111"
+        );
+        assert!(v["hop"].is_null());
+        let back: Node = serde_json::from_value(v).unwrap();
+        assert_eq!(n, back);
+    }
+
+    #[test]
+    fn split_rules_round_trips() {
+        let s = crate::render::SplitRules {
+            enabled: true,
+            global: false,
+            keywords: vec!["openai".into()],
+        };
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"enabled": true, "global": false, "keywords": ["openai"]})
+        );
+        let back: crate::render::SplitRules = serde_json::from_value(v).unwrap();
+        assert_eq!(s, back);
+    }
+
+    #[test]
+    fn node_uri_label_is_the_whole_decoded_fragment() {
+        // 守门测试：node_uri 的 label 必须是解码后的完整 fragment（含 "alice-" 前缀）。
+        // P4 的 import-v3 用 `label.split_once('-')` 推导用户名；一旦有人改成「先剥前缀」，
+        // 用户名就是空串，profile 名会从 alice-hy2-direct 退化成 hy2-direct，P4 T9 三个断言全红。
+        // （`kind` 的判定规则由 node_uri.rs 自己的测试覆盖，这里不重复断言。）
+        let n = crate::parse::node_uri(
+            "hysteria2://alice:hy2-pw@panel.example.com:10000/?sni=panel.example.com&mport=20000-30000#alice-HY2%E7%9B%B4%E8%BF%9E",
+        )
+        .unwrap();
+        assert_eq!(n.label, "alice-HY2直连");
+        assert_eq!(n.host, "panel.example.com");
+        assert_eq!(n.port, 10000);
+        assert_eq!(n.hop, Some((20000, 30000)));
+    }
+
+    #[test]
+    fn client_opts_is_importable_from_render_client() {
+        // 守门测试：ClientOpts / ClientMode 现在定义在 render/client.rs，P4 的 engine.rs 按
+        // 这条路径导入。谁把定义搬去 render/mod.rs 而不留 re-export，这里先编译不过。
+        let o = crate::render::client::ClientOpts {
+            mode: crate::render::client::ClientMode::Mixed,
+            socks_port: 1080,
+            http_port: 8080,
+            host_has_ipv6: false,
+            split: crate::render::SplitRules {
+                enabled: false,
+                global: false,
+                keywords: vec![],
+            },
+        };
+        assert_eq!((o.socks_port, o.http_port), (1080, 8080));
     }
 }

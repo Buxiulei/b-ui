@@ -7,9 +7,10 @@ pub mod xray;
 
 use crate::keywords::DEFAULT_KEYWORDS;
 use crate::model::ResidentialGroup;
+use serde::{Deserialize, Serialize};
 
 /// 订阅与客户端配置里的住宅分流规则（与 relay 同源）。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SplitRules {
     /// 住宅池有效（enabled 且非空）
     pub enabled: bool,
