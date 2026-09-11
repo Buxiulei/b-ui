@@ -101,3 +101,26 @@
 3. Rust 只覆盖控制面、住宅 agent、Linux 客户端；协议握手全部交给成熟二进制。
 4. 住宅上游 = 静态 ISP IP，selector 热切换，fail-open，黑名单硬拒绝自动/软拦截人工。
 5. 验收含 48–72h soak（Xray 26.3.27）、Hysteria2 vs REALITY 连接成功率对照、供应商 §8 试测。
+
+---
+
+## D. 追加：Decodo Dedicated ISP 在 bwg-rick 的实测（2026-09-11，measured）
+
+按 §8 验证计划执行，10 个已购 IP 分类 + 直连与经 relay 两条路径的目标可达性：
+
+| 项 | 结果 |
+|---|---|
+| IP 质量 | 10 个 IP 中 4 个美国 ISP（2 Comcast，ippure fraud 1–3、residential；2 Verizon Business），其余 6 个为 AU/CA/HK 机房或 Lumen「Private Customer」段，fraud 83–91 |
+| Google 搜索 / Gemini | 200，无 sorry/验证码（Bright Data policy_20110 的问题消失） |
+| OpenAI / Anthropic API | 可达（401 / authentication_error，不是地区封锁） |
+| Stripe checkout / TikTok / Apple、Google 商店首页 / accounts.google.com | 可达 |
+| SOCKS5 UDP ASSOCIATE | 通（与 HTTP 同端口） |
+| 端口 | **只放行 80/443**；5228 / 5223 / 993 / 22 / 8080 / 853 全部 CONNECT 403 |
+| 443 上被封的主机 | pay.google.com、www.paypal.com、api.stripe.com、gateway.icloud.com、itunes/ess.apple.com、x.com / api.x.com |
+| 拒绝方式 | 硬拒：CONNECT 返回 `403 Forbidden`。直连 curl 8.18 退出码 **7**（不是旧 spec 假设的 56），`%{http_connect}` 为 403；经 sing-box relay 时 curl 得 35 / 52 / 97，relay 日志 `unexpected status: 403 Forbidden` |
+
+对 v4 的修正：
+1. R13 黑名单的硬拒判定改用 `%{http_connect}`（HTTP 上游）/ SOCKS 回复码，退出码集合加入 7。
+2. 「谷歌支付域名走住宅」在 Decodo 上不可行（pay.google.com 403），支付类目必须直连。
+3. 供应商切换后 global 模式的拒绝目标集合与 Bright Data 高度重合（Apple 服务、推送端口、x.com、IMAP），黑名单是与供应商无关的必需模块。
+4. 采购时必须按国家/ASN 选 IP（Decodo 支持 `-country-` / `-asn-` 与自助换 IP），随机分配会拿到机房段。
