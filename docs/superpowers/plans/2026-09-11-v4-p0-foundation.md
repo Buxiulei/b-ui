@@ -134,7 +134,7 @@ pub mod paths;
 pub mod render;
 pub mod v3;
 ```
-先给每个模块建空文件（`pub mod` 需要文件存在）：`keywords.rs`、`model.rs`、`nodes.rs`、`parse/mod.rs`、`paths.rs`、`render/mod.rs`、`v3.rs`，内容只有 `//! placeholder filled by later tasks`。
+先给每个模块建桩文件（`pub mod` 需要文件存在；后续任务只填自己的文件，避免并行冲突）：`keywords.rs`（内容 `pub const DEFAULT_KEYWORDS: &[&str] = &[];`）、`model.rs`、`nodes.rs`、`paths.rs`、`v3.rs`、`parse/mod.rs`（内含 `pub mod upstream; pub mod node_uri;`）、`parse/upstream.rs`、`parse/node_uri.rs`、`render/mod.rs`（内含 `pub mod client; pub mod hysteria; pub mod relay; pub mod subscription; pub mod xray;`）、`render/client.rs`、`render/hysteria.rs`、`render/relay.rs`、`render/subscription.rs`、`render/xray.rs`；其余桩文件内容只有 `//! placeholder filled by later tasks`。
 `crates/bui/Cargo.toml` 与 `crates/bui-c/Cargo.toml`：`[package] name = "bui"`（另一个 `"bui-c"`），`version = "4.0.0"`，`edition.workspace = true`，`[dependencies] bui-schema = { path = "../bui-schema" }`；`src/main.rs`：`fn main() { println!("bui v4 placeholder"); }`（bui-c 同理）。
 `.gitignore` 追加 `target/`。
 
@@ -155,7 +155,7 @@ git commit -m "feat(workspace): v4 Cargo workspace 脚手架（bui-schema / bui 
 ### Task 2: 期望态模型（C1 契约）
 
 **Files:**
-- Create: `crates/bui-schema/src/model.rs`, `crates/bui-schema/src/paths.rs`
+- Create: `crates/bui-schema/src/model.rs`, `crates/bui-schema/src/paths.rs`, `crates/bui-schema/src/render/mod.rs`（`SplitRules`，供 Task 6/9/10 共用）
 - Test: `crates/bui-schema/src/model.rs`（单元测试模块）
 
 **Interfaces:**
@@ -475,6 +475,36 @@ pub enum CatalogKind { ResidentialIp, Plan }
 ```
 注意 `Rule` 的 serde 表示：`{"kind":"port","value":5228}` —— `#[serde(tag="kind", content="value")]` 恰好产生这个形状。
 
+`crates/bui-schema/src/render/mod.rs`（本任务一并写，渲染器子模块文件由 Task 1 建的空桩占位）：
+```rust
+pub mod client;
+pub mod hysteria;
+pub mod relay;
+pub mod subscription;
+pub mod xray;
+
+use crate::keywords::DEFAULT_KEYWORDS;
+use crate::model::ResidentialGroup;
+
+/// 订阅与客户端配置里的住宅分流规则（与 relay 同源）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SplitRules {
+    /// 住宅池有效（enabled 且非空）
+    pub enabled: bool,
+    /// global 模式：全部走住宅
+    pub global: bool,
+    /// 分流关键字（跟随默认表或自定义）
+    pub keywords: Vec<String>,
+}
+impl SplitRules {
+    pub fn from_group(g: &ResidentialGroup) -> Self {
+        let keywords = match &g.keywords { Some(k) if !k.is_empty() => k.clone(), _ => DEFAULT_KEYWORDS.iter().map(|s| s.to_string()).collect() };
+        Self { enabled: g.pool_active(), global: matches!(g.mode, crate::model::ResiMode::Global), keywords }
+    }
+}
+```
+（Task 12 之前 `DEFAULT_KEYWORDS` 先以空切片桩存在：Task 1 的 `keywords.rs` 写 `pub const DEFAULT_KEYWORDS: &[&str] = &[];`）
+
 - [ ] **Step 4: 测试通过**
 
 Run: `cargo test -p bui-schema model::` — Expected: 2 passed。
@@ -496,7 +526,7 @@ git commit -m "feat(schema): v4 期望态模型（State/User/Entitlements/Reside
 
 **Interfaces:**
 - Consumes: `model::*`
-- Produces: `pub fn import(dir: &Path) -> Result<State, ImportError>`；`pub enum ImportError { Io(std::io::Error), Json(serde_json::Error), Missing(&'static str), Invalid(String) }`（`thiserror`）。
+- Produces: `pub struct ImportReport { pub state: State, pub warnings: Vec<String> }`；`pub fn import(dir: &Path) -> Result<ImportReport, ImportError>`；`pub enum ImportError { Io(std::io::Error), Json(serde_json::Error), Missing(&'static str), Invalid(String) }`（`thiserror`）。
 
 - [ ] **Step 1: 写合成 v3 fixture（与 Task 5 共用）**
 
@@ -526,7 +556,7 @@ fn fixture() -> &'static Path { Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/
 
 #[test]
 fn imports_node_params() {
-    let s = bui_schema::v3::import(fixture()).unwrap();
+    let s = bui_schema::v3::import(fixture()).unwrap().state;
     assert_eq!(s.schema_version, SCHEMA_VERSION);
     assert_eq!(s.node.domain, "example.com");
     assert_eq!(s.node.ports.hy2, 10000);
@@ -540,7 +570,7 @@ fn imports_node_params() {
 
 #[test]
 fn maps_users_and_limits() {
-    let s = bui_schema::v3::import(fixture()).unwrap();
+    let s = bui_schema::v3::import(fixture()).unwrap().state;
     let alice = s.users.iter().find(|u| u.username == "alice").unwrap();
     assert_eq!(alice.entitlements.protocols, vec![Protocol::Hysteria2, Protocol::Reality]);
     assert!(alice.entitlements.direct);
@@ -562,7 +592,7 @@ fn maps_users_and_limits() {
 
 #[test]
 fn maps_residential_pool() {
-    let s = bui_schema::v3::import(fixture()).unwrap();
+    let s = bui_schema::v3::import(fixture()).unwrap().state;
     let g = s.residential.default_group().unwrap();
     assert!(g.enabled);
     assert_eq!(g.mode, ResiMode::Global);
@@ -576,7 +606,9 @@ fn maps_residential_pool() {
 
 #[test]
 fn admin_password_is_hashed_not_stored() {
-    let s = bui_schema::v3::import(fixture()).unwrap();
+    let r = bui_schema::v3::import(fixture()).unwrap();
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    let s = r.state;
     assert!(s.admin.password_hash.starts_with("$argon2id$"));
     assert_ne!(s.admin.jwt_secret, "");
 }
@@ -598,7 +630,7 @@ fn admin_password_is_hashed_not_stored() {
 - 住宅：`enabled`、`global` → `ResiMode::Global` 否则 `Split`；`domains` null 或空数组 → `keywords: None`，非空 → `Some`；`urls[]` → `Upstream{ id: new_v4, name, kind: type=="http"?Http:Socks5（缺省 socks5）, host, port, username, password, priority: 100, verified: lastVerifiedIp.map(...) }`；`selected_upstream_id` = 第一个上游。
 - `admin.env` 的 `ADMIN_PASSWORD` → argon2id 哈希（`Argon2::default().hash_password(pw, &SaltString::generate(&mut OsRng))`）；`jwt_secret` = 32 字节随机 hex。
 - `versions` 留空由 P1 填；`catalog` 空。
-- 缺文件：`users.json`/`config.yaml`/`reality-keys.json`/`xray-config.json`/`certs/.domain` 任一缺失 → `Missing`；`residential-proxy.json`、`admin.env`、`config-residential.yaml` 可缺（分别默认：空组、随机管理员密码并在返回值旁打印警告——用 `ImportReport { state, warnings: Vec<String> }` 返回，测试断言 `warnings` 为空）。
+- 缺文件：`users.json`/`config.yaml`/`reality-keys.json`/`xray-config.json`/`certs/.domain` 任一缺失 → `Missing`；`residential-proxy.json`、`admin.env`、`config-residential.yaml` 可缺（分别默认：空组、随机管理员密码，并把一条说明追加进 `ImportReport.warnings`；fixture 齐全时 `warnings` 为空）。
 
 - [ ] **Step 5: 测试通过** — `cargo test -p bui-schema --test v3_import`，Expected：4 passed。
 
@@ -727,7 +759,7 @@ pub fn nodes_for(user: &User, node: &NodeParams, resi: &Residential) -> Vec<Node
 ### Task 5: 用 v3 生成 golden fixtures
 
 **Files:**
-- Create: `scripts/gen-v3-fixtures.sh`, `crates/bui-schema/tests/fixtures/v3/expected/**`
+- Create: `scripts/gen-v3-fixtures.sh`, `crates/bui-schema/tests/fixtures/v3/expected/**`, `crates/bui-schema/tests/common/mod.rs`（Task 6 里给出的内容原样在本任务落地，供 Task 6–10 共用）
 - Test: 无（产物供 Task 6 使用）
 
 **Interfaces:**
@@ -795,17 +827,14 @@ git commit -m "test(schema): 用 v3 server.js 生成订阅 golden 样本（globa
 ### Task 6: 订阅渲染器（三种）+ golden 比对
 
 **Files:**
-- Create: `crates/bui-schema/src/render/mod.rs`, `crates/bui-schema/src/render/subscription.rs`, `crates/bui-schema/tests/common/mod.rs`, `crates/bui-schema/tests/golden_subscription.rs`
-- Modify: `crates/bui-schema/src/lib.rs`（已 `pub mod render`）
+- Create: `crates/bui-schema/src/render/subscription.rs`, `crates/bui-schema/tests/golden_subscription.rs`
+- 依赖：`render/mod.rs`（`SplitRules`，Task 2）、`tests/common/mod.rs`（Task 5）
 
 **Interfaces:**
 - Consumes: `nodes::{Node, nodes_for}`, `model::*`, `keywords::DEFAULT_KEYWORDS`（Task 12）
 - Produces:
 ```rust
-// render/mod.rs
-pub struct SplitRules { pub enabled: bool /* 住宅池有效 */, pub global: bool, pub keywords: Vec<String> }
-impl SplitRules { pub fn from_group(g: &ResidentialGroup) -> Self }   // keywords: g.keywords 或 DEFAULT_KEYWORDS；enabled = g.pool_active()
-// render/subscription.rs
+// render/subscription.rs（SplitRules 见 Task 2 的 render/mod.rs）
 pub fn uri_list(nodes: &[Node], username: &str) -> String         // base64(lines.join("\n"))，行格式与 v3 一致
 pub fn singbox(nodes: &[Node], username: &str, split: &SplitRules) -> serde_json::Value
 pub fn clash(nodes: &[Node], username: &str, split: &SplitRules) -> String
@@ -899,7 +928,7 @@ fn clash_matches_v3() {
 
 **Files:**
 - Create: `crates/bui-schema/src/render/hysteria.rs`
-- Test: `crates/bui-schema/tests/kernel_check.rs`（本任务新建，后续任务追加）
+- Test: `crates/bui-schema/tests/kernel_hysteria.rs`（每个渲染器任务各自一个测试文件，避免并行冲突；文件头 `mod common;`）
 
 **Interfaces:**
 - Produces: `pub fn direct_yaml(node: &NodeParams, paths: &Paths) -> String`、`pub fn residential_yaml(node: &NodeParams, paths: &Paths) -> String`。用 `serde_yaml` 从 `serde_json::json!` 构造的 Value 序列化（字段顺序按 v3 模板）。
@@ -957,7 +986,7 @@ fn hysteria_residential_shape() {
 
 **Files:**
 - Create: `crates/bui-schema/src/render/xray.rs`
-- Test: 追加到 `tests/kernel_check.rs`
+- Test: `crates/bui-schema/tests/kernel_xray.rs`（文件头 `mod common;`）
 
 **Interfaces:**
 - Produces: `pub fn config(node: &NodeParams, users: &[User], paths: &Paths) -> serde_json::Value`；`pub fn structural_hash(cfg: &serde_json::Value) -> String`（去掉每个 inbound 的 `settings.clients` 后 `serde_json::to_vec` 的 sha256 hex）。
@@ -1001,7 +1030,7 @@ fn structural_hash_ignores_clients() {
 
 **Files:**
 - Create: `crates/bui-schema/src/render/relay.rs`
-- Test: 追加到 `tests/kernel_check.rs`
+- Test: `crates/bui-schema/tests/kernel_relay.rs`（文件头 `mod common;`；`check_singbox` 辅助函数放进 `tests/common/mod.rs` 若尚无则本任务加）
 
 **Interfaces:**
 - Consumes: `model::{ResidentialGroup, Upstream, Rule}`, `keywords`
@@ -1066,7 +1095,7 @@ fn relay_fail_open_when_pool_empty() {
 
 **Files:**
 - Create: `crates/bui-schema/src/render/client.rs`
-- Test: 追加到 `tests/kernel_check.rs`
+- Test: `crates/bui-schema/tests/kernel_client.rs`（文件头 `mod common;`，`check_singbox` 与 Task 9 相同实现，若 common 里已有则复用）
 
 **Interfaces:**
 - Produces: `pub struct ClientOpts { pub mode: ClientMode /* Tun | Mixed */, pub socks_port: u16 /*1080*/, pub http_port: u16 /*8080*/, pub host_has_ipv6: bool, pub split: SplitRules }`；`pub fn tun_config(node: &Node, opts: &ClientOpts) -> Value`；`pub fn mixed_config(node: &Node, opts: &ClientOpts) -> Value`。
