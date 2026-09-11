@@ -2160,7 +2160,11 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                             ? JSON.parse(fs.readFileSync(CONFIG.residentialConfig, "utf8"))
                             : { enabled: false };
                         const display = { ...raw };
-                        if (!display.domains || !display.domains.length) display.domains = getEffectiveResidentialDomains();
+                        // v3.6.2 R12: domains 为 null/空 = 跟随 helper 默认表。面板要能区分"跟随默认"与
+                        // "自定义"，否则用户一保存就把当时的默认表固化成自定义，再也跟不上版本扩充。
+                        const followDefault = !Array.isArray(raw.domains) || raw.domains.length === 0;
+                        display.domainsFollowDefault = followDefault;
+                        if (followDefault) display.domains = getEffectiveResidentialDomains();
                         // v3.5.0: 保证 global 字段始终在响应里
                         if (typeof display.global === "undefined") display.global = false;
                         // v3.5.0: 保证 urls 数组始终在响应里（多 URL CRUD 支持）
@@ -2188,12 +2192,36 @@ ${clientScript.replace(/^#!\/bin\/bash\s*\n?/, "")}
                         }
                         return sendJSON(res, display);
                     } catch {
-                        return sendJSON(res, { enabled: false, domains: getEffectiveResidentialDomains() });
+                        return sendJSON(res, { enabled: false, domains: getEffectiveResidentialDomains(), domainsFollowDefault: true });
                     }
                 }
 
                 if (req.method === "POST") {
                     const b = await parseBody(req);
+
+                    // v3.6.2 R12: {reset:true}（或 domains:null）→ 回到跟随默认表，写 .domains = null
+                    const wantReset = !b.url
+                        && (b.reset === true
+                            || (Object.prototype.hasOwnProperty.call(b, "domains") && b.domains === null));
+                    if (wantReset) {
+                        try {
+                            const result = spawnSync(helperPath, ["set-domains", "null"], {
+                                env: { ...process.env, BASE_DIR },
+                                encoding: "utf8",
+                                timeout: 15000,
+                            });
+                            if (result.status !== 0) {
+                                return sendJSON(res, { error: helperErrText(result, "恢复默认分流域名失败") }, 400);
+                            }
+                            return sendJSON(res, {
+                                success: true,
+                                domainsFollowDefault: true,
+                                domains: getEffectiveResidentialDomains(),
+                            });
+                        } catch (e) {
+                            return sendJSON(res, { error: e.message }, 500);
+                        }
+                    }
 
                     // domains-only update (already enabled, just change routing)
                     if (!b.url && b.domains) {

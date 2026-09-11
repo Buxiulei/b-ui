@@ -1271,6 +1271,12 @@ textarea.resi-domains-ta {
     margin-bottom: 8px;
 }
 
+.resi-domains-actions {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
 textarea.resi-domains-ta:focus {
     border-color: var(--primary);
     box-shadow: 0 0 0 3px var(--primary-glow);

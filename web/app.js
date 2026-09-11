@@ -929,13 +929,7 @@ function openResi() {
         if (tog) tog.checked = !!r.global;
         if (hint) hint.textContent = r.global ? "全走住宅" : "域名分流";
 
-        if (r.domains && r.domains.length) {
-            if (domainsEl) domainsEl.value = r.domains.join("\n");
-            if (countEl) countEl.textContent = r.domains.length;
-        } else {
-            if (domainsEl) domainsEl.value = "";
-            if (countEl) countEl.textContent = "";
-        }
+        _resiRenderDomains(r);
     }).catch(() => {
         statusEl.className = "resi-status-card";
         statusEl.textContent = "";
@@ -944,6 +938,35 @@ function openResi() {
         errMsg.textContent = "状态获取失败";
         statusEl.appendChild(errMsg);
     });
+}
+
+// v3.6.2 R12: 分流域名区的渲染 —— 标签要把"跟随默认"与"自定义"摆明。
+// domains 为 null/空时服务端回的是生效默认表（domainsFollowDefault=true），编辑框照样填上，
+// 用户可以看着它改；但只要没点保存，这台服务器仍然跟随默认，版本扩充会自动生效。
+function _resiRenderDomains(r) {
+    const domainsEl = $("#resi-domains");
+    const countEl = $("#resi-domains-count");
+    const list = (r && Array.isArray(r.domains)) ? r.domains : [];
+    if (domainsEl) domainsEl.value = list.length ? list.join("\n") : "";
+    if (countEl) {
+        countEl.textContent = list.length
+            ? ((r.domainsFollowDefault === false ? "自定义" : "跟随默认") + "（" + list.length + " 条）")
+            : "";
+        countEl.title = r && r.domainsFollowDefault === false
+            ? "这台服务器用的是自定义关键字表，后续版本扩充默认表不会自动生效；点「恢复默认」可以回到跟随默认"
+            : "跟随版本内置的默认表，升级后自动跟着扩充";
+    }
+}
+
+// 回到"跟随默认"：写 domains = null，而不是把当时的默认表固化成自定义
+function resetResidentialDomains() {
+    _resiClearErr();
+    api("/residential", { method: "POST", body: JSON.stringify({ reset: true }) }).then(r => {
+        if (r.success) {
+            toast("已恢复默认分流域名（今后跟随版本更新）");
+            _resiRenderDomains({ domains: r.domains || [], domainsFollowDefault: true });
+        } else _resiErr(r.error || "恢复默认失败");
+    }).catch(e => _resiErr(e.message || "请求失败"));
 }
 
 function _parseDomains() {

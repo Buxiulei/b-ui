@@ -25,6 +25,7 @@
 #   residential-helper.sh domains                → 输出生效分流域名关键字 (JSON 数组)
 #   residential-helper.sh reapply                → 重新应用当前配置（update.sh 调用）
 #   residential-helper.sh set-domains <json>     → 更新分流域名，重载 sing-box
+#   residential-helper.sh set-domains null       → 回到跟随默认表（.domains = null；空数组同义）
 #   residential-helper.sh global on|off          → 切换全局/分流模式，重载 sing-box
 
 set -euo pipefail
@@ -771,17 +772,22 @@ case "$cmd" in
         ;;
 
     set-domains)
-        [[ -z "${2:-}" ]] && { err "用法: $0 set-domains <json_array>"; exit 1; }
-        echo "$2" | jq 'if type == "array" then . else error("not an array") end' >/dev/null 2>&1 \
-            || { err "参数必须是 JSON 数组"; exit 1; }
+        [[ -z "${2:-}" ]] && { err "用法: $0 set-domains <json_array>|null"; exit 1; }
+        # v3.6.2 R12: null（以及空数组）= 回到"跟随 DEFAULT_DOMAINS"，写 .domains = null。
+        # 面板「恢复默认」走这条：把当时的默认表固化成显式数组，会让这台服务器永远算"自定义"，
+        # 之后版本扩充默认表它再也跟不上（tizi 线上就是这么卡在老的 31 条）。
+        set_dom_json=$(echo "$2" | jq -c 'if . == null then null
+                                          elif type == "array" then (if length == 0 then null else . end)
+                                          else error("not an array") end' 2>/dev/null) \
+            || { err "参数必须是 JSON 数组或 null"; exit 1; }
 
         if [[ -f "${RESIDENTIAL_CONFIG}" ]]; then
-            jq --argjson domains "$2" '.domains = $domains' \
+            jq --argjson domains "$set_dom_json" '.domains = $domains' \
                "${RESIDENTIAL_CONFIG}" > "${RESIDENTIAL_CONFIG}.tmp" \
             && chmod 600 "${RESIDENTIAL_CONFIG}.tmp" \
             && mv "${RESIDENTIAL_CONFIG}.tmp" "${RESIDENTIAL_CONFIG}"
         else
-            jq -n --argjson domains "$2" '{enabled:false,global:false,domains:$domains}' \
+            jq -n --argjson domains "$set_dom_json" '{enabled:false,global:false,domains:$domains}' \
                > "${RESIDENTIAL_CONFIG}.tmp" \
             && chmod 600 "${RESIDENTIAL_CONFIG}.tmp" \
             && mv "${RESIDENTIAL_CONFIG}.tmp" "${RESIDENTIAL_CONFIG}"
