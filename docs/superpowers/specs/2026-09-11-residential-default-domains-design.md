@@ -8,7 +8,7 @@
 
 | 结论 | 域名 |
 |---|---|
-| 放行（出口 168.158.161.12） | openai.com 全家（api/auth/auth0/platform/cdn/help/pay）、chatgpt.com（ab/sora/operator）、sora.com、cdn.oaistatic.com、files.oaiusercontent.com；anthropic.com 全家、claude.ai、claude.com、claudeusercontent.com；gemini.google.com、aistudio.google.com、notebooklm.google.com、jules.google.com、labs.google、antigravity.google、idx.google.com、ai.google.dev、deepmind.google、makersuite.google.com、bard.google.com、clients6.google.com（alkalimakersuite-pa/waa-pa/signaler-pa/payments-pa）、accounts/myaccount/apis/ogs/play.google.com、pay/payments/wallet/one.google.com、*.googleapis.com（generativelanguage/cloudcode-pa/oauth2/firebase/aiplatform/fonts）、gstatic、googleusercontent；grok.com、x.ai、api.x.ai、copilot.microsoft.com、github.com、api.githubcopilot.com、cursor.com、api2.cursor.sh、perplexity.ai、mistral.ai、huggingface.co、replicate.com、api.together.xyz、groq.com、statsig.com、featuregates.org；ippure.com、my.ippure.com、ipquery.io、ipinfo.io、ip-api.com、ping0.cc、ip.sb、browserleaks.com、whoer.net、ipleak.net、scamalytics.com、ipqualityscore.com、ip2location.com、iplocation.net、whatismyipaddress.com、ipdata.co、ipapi.co、ipregistry.co、ip.skk.moe、ping.pe |
+| 放行（出口 168.158.161.12） | api.123169.xyz、myip.ipip.net、cf.999831.xyz（ippure.com 网页后端）；openai.com 全家（api/auth/auth0/platform/cdn/help/pay）、chatgpt.com（ab/sora/operator）、sora.com、cdn.oaistatic.com、files.oaiusercontent.com；anthropic.com 全家、claude.ai、claude.com、claudeusercontent.com；gemini.google.com、aistudio.google.com、notebooklm.google.com、jules.google.com、labs.google、antigravity.google、idx.google.com、ai.google.dev、deepmind.google、makersuite.google.com、bard.google.com、clients6.google.com（alkalimakersuite-pa/waa-pa/signaler-pa/payments-pa）、accounts/myaccount/apis/ogs/play.google.com、pay/payments/wallet/one.google.com、*.googleapis.com（generativelanguage/cloudcode-pa/oauth2/firebase/aiplatform/fonts）、gstatic、googleusercontent；grok.com、x.ai、api.x.ai、copilot.microsoft.com、github.com、api.githubcopilot.com、cursor.com、api2.cursor.sh、perplexity.ai、mistral.ai、huggingface.co、replicate.com、api.together.xyz、groq.com、statsig.com、featuregates.org；ippure.com、my.ippure.com、ipquery.io、ipinfo.io、ip-api.com、ping0.cc、ip.sb、browserleaks.com、whoer.net、ipleak.net、scamalytics.com、ipqualityscore.com、ip2location.com、iplocation.net、whatismyipaddress.com、ipdata.co、ipapi.co、ipregistry.co、ip.skk.moe、ping.pe |
 | **Bright Data 拒绝** | www.google.com（policy_20110，搜索）；checkout/js/api/m.stripe.com、www.paypal.com（policy_20050，支付处理商）；tiktok.com（policy_20050） |
 | 无法解析（apex 无记录，非拒绝） | oaiusercontent.com、statsig.anthropic.com |
 
@@ -36,6 +36,8 @@ pay.google payments.google wallet.google one.google
 grok api.x.ai githubcopilot cursor perplexity mistral cohere huggingface replicate together groq statsig featuregates
 # 住宅 IP 检测站
 ippure ipquery ipinfo ip-api ping0 ip.sb browserleaks whoer ipleak scamalytics ipqualityscore ip2location iplocation whatismyipaddress ipdata ipapi ipregistry ip.skk.moe ping.pe
+# ippure.com 网页的后端域（2026-09-11 抓包：签名 API 在 api.123169.xyz，辅助 myip.ipip.net / cf.999831.xyz；经 Bright Data 放行）
+123169 ipip.net 999831
 # 既有
 tiktok
 ```
