@@ -1352,7 +1352,10 @@ EOF
 #   6 = v3.5.0 DNS 加固 — generate config 时一次性预解析 server_host 到 IP，
 #       注入 dns.rules predefined 规则，运行时完全不查 DNS → 防 GFW bootstrap 投毒
 #   7 = v3.6.0 TUN 加 IPv6 地址接管 ::/0 + ip_version 6 reject，服务端无 v6 出口
-readonly TUN_SCHEMA_VERSION="7"
+#   8 = v3.6.3 TUN inbound 补回 interface_name=bui-tun。2026-03-20 重构时把它当"非必要字段"删了，
+#       sing-box 于是自动起名 tun0；v3.6.0 起 start_tun_mode 的就绪轮询按 `ip link show bui-tun` 等接口，
+#       5s 内永远等不到 → 每次开 TUN 都报"已启动但 TUN 接口 bui-tun 未就绪"并被回滚（TUN 其实已在转发）
+readonly TUN_SCHEMA_VERSION="8"
 
 # v3.6.0: 主机 IPv6 是否可用。可用 → TUN 加 v6 地址接管 ::/0；不可用 → 保持 IPv4-only（无 v6 则无泄漏，
 # 且 disable_ipv6=1 的主机给 TUN 配 v6 地址会失败）。BUI_FORCE_IPV6=0|1 可强制（排障/测试）。
@@ -1519,6 +1522,7 @@ OUTBOUND
   "inbounds": [
     {
       "type": "tun",
+      "interface_name": "bui-tun",
       "address": ${tun_address},
       "auto_route": true,
       "strict_route": true
@@ -2087,6 +2091,11 @@ start_tun_mode() {
     if ! $tun_ok; then
         if systemctl is-active --quiet bui-tun; then
             print_error "bui-tun 已启动但 TUN 接口 bui-tun 未就绪"
+            # v3.6.3: 列出机器上实际存在的 tun 设备。v3.6.0-3.6.2 就是因为模板没写 interface_name、
+            # sing-box 自动起名 tun0 而这里永远等 bui-tun，静默失败了三个版本——以后名字再不一致直接看得见
+            local tuns
+            tuns=$(ip tuntap show 2>/dev/null | awk -F: '{print $1}' | paste -sd' ' -)
+            [[ -n "$tuns" ]] && print_warning "当前存在的 tun 设备: ${tuns}（期望 bui-tun；不一致说明 singbox-tun.json 的 interface_name 与脚本不同步）"
         else
             print_error "TUN 模式启动失败"
         fi
