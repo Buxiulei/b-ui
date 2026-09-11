@@ -3,7 +3,11 @@
 //! 渲染全部来自 `bui_schema::render::client`；本 crate 只组装 `ClientOpts`、
 //! 校验后落盘、管三个 systemd 单元、探测自愈、下载校验与菜单交互。
 pub mod error;
+pub mod fake;
+pub mod net;
 pub mod paths;
+pub mod sys;
+pub mod testutil;
 
 pub use error::{Error, Result};
 
