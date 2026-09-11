@@ -286,17 +286,18 @@ B-UI 是端到端 TLS、**不会**装第三方 CA，所以这种 zone 上会直�
 | Google 账号 | `accounts.google` `myaccount.google` `apis.google` `ogs.google` |
 | Google 支付 | `pay.google` `payments.google` `wallet.google` `one.google` |
 | 其它 AI | `grok` `api.x.ai` `githubcopilot` `cursor` `perplexity` `mistral` `cohere` `huggingface` `replicate` `together` `groq` `statsig` `featuregates` |
-| 住宅 IP 检测站 | `ippure` `ipquery` `ipinfo` `ip-api` `ping0` `ip.sb` `browserleaks` `whoer` `ipleak` `scamalytics` `ipqualityscore` `ip2location` `iplocation` `whatismyipaddress` `ipdata` `ipapi` `ipregistry` `ip.skk.moe` `ping.pe` `123169` `ipip.net` `999831` |
+| 住宅 IP 检测站 | `ippure` `ipquery` `ipinfo` `ip-api` `ping0` `ip.sb` `browserleaks` `whoer` `ipleak` `scamalytics` `ipqualityscore` `ip2location` `iplocation` `whatismyipaddress` `ipdata` `ipapi` `ipregistry` `ip.skk.moe` `ping.pe` `api.123169` `ipip.net` `cf.999831` |
 | 既有（非 AI） | `tiktok` |
 
 关键字是 **子串** 匹配（sing-box `domain_keyword` / Clash `DOMAIN-KEYWORD`），所以表里刻意
 不写裸 `google`（否则会把下面第一类也送进住宅腿）、不写裸 `x.ai`（会误伤大量域名）、
 不写裸 `oai`（过宽，改用 `oaistatic` + `oaiusercontent`）。
 检测站进表的理由：面板体检和你自己开网页查 IP，都必须经住宅腿出去才看得到真实出口画像。
-最后三个（`123169` / `ipip.net` / `999831`）是 **ippure.com 页面自己的后端域**——2026-09-11
+最后三个（`api.123169` / `ipip.net` / `cf.999831`）是 **ippure.com 页面自己的后端域**——2026-09-11
 抓包发现它的检测走签名 API `api.123169.xyz`，另外用到 `myip.ipip.net` 与 `cf.999831.xyz`，
 这些都不含 `ippure` 字样，不进表的话在住宅节点上打开那个页面看到的仍是 VPS 的 IP。
-三个域都经 Bright Data 实测放行。
+三个域都经 Bright Data 实测放行。带前缀写（而不是裸 `123169` / `999831`）是为了别让任何
+含这串数字的域名都被卷进住宅腿。
 
 ### Bright Data 拒绝的三类（2026-09-11 逐域实测）
 

@@ -103,8 +103,9 @@ DEFAULT_DOMAINS=(
     "ippure" "ipquery" "ipinfo" "ip-api" "ping0" "ip.sb" "browserleaks" "whoer" "ipleak"
     "scamalytics" "ipqualityscore" "ip2location" "iplocation" "whatismyipaddress"
     "ipdata" "ipapi" "ipregistry" "ip.skk.moe" "ping.pe"
-    # ippure.com 网页的后端域（签名 API 在 api.123169.xyz）
-    "123169" "ipip.net" "999831"
+    # ippure.com 网页的后端域（签名 API 在 api.123169.xyz，辅助 cf.999831.xyz / myip.ipip.net）
+    # 数字串写成 api.123169 / cf.999831 而不是裸数字：裸数字会命中任何含这串数字的域名
+    "api.123169" "ipip.net" "cf.999831"
     # 既有（非 AI）
     "tiktok"
 )
