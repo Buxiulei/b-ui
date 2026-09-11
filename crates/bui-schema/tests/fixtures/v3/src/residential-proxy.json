@@ -1,0 +1,1 @@
+{"enabled":true,"global":true,"domains":null,"urls":[{"host":"isp.example.net","port":10007,"username":"u1","password":"p1","type":"http","name":"url-1","lastVerifiedIp":"198.51.100.7"},{"host":"socks.example.net","port":1080,"username":"u2","password":"p2","type":"socks5","name":"url-2","lastVerifiedIp":"198.51.100.8"}]}
