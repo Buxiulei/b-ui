@@ -1,0 +1,484 @@
+[
+ {
+  "id": "data-C1",
+  "subsystem": "data",
+  "claim": "configure_firewall() at server/core.sh:1237-1283 is defined but has zero callers anywhere in install.sh, server/core.sh, or server/update.sh (repo-wide grep for the literal string 'configure_firewall' outside its own definition and the unrelated legacy b-ui-server.sh finds nothing).",
+  "high_impact": true,
+  "counter_claim": "ctrl-C7 claims core.sh:1252-1270 opens the v3.5 residential ports at install time — directly contradicting this claim (those lines are inside configure_firewall)."
+ },
+ {
+  "id": "data-C2",
+  "subsystem": "data",
+  "claim": "setup_static_dns() at server/core.sh:1289-1319 is defined but never called from install.sh/core.sh/update.sh; the same static-DNS behavior (disable systemd-resolved, rewrite /etc/resolv.conf, chattr +i) is separately re-implemented as migration block D inside server/update.sh:1738-1751, which is the code path that actually executes.",
+  "high_impact": true,
+  "counter_claim": "ctrl-C6 claims core.sh:1286-1317 already writes static resolv.conf at install time, making update.sh block D unreachable — directly contradicting this claim."
+ },
+ {
+  "id": "data-C3",
+  "subsystem": "data",
+  "claim": "install_chinese_fonts() at server/core.sh:394-410 is defined but has no callers anywhere in the repo (repo-wide grep for 'install_chinese_fonts' returns only its own definition line).",
+  "high_impact": true
+ },
+ {
+  "id": "data-C4",
+  "subsystem": "data",
+  "claim": "install.sh:562 and install.sh:571 call install_nginx()/configure_nginx_proxy() (server/core.sh:364/914), which are one-line delegates to install_caddy()/configure_caddy_proxy() (server/core.sh:328/849); install_caddy and configure_caddy_proxy are never called by their real names anywhere in install.sh or core.sh.",
+  "high_impact": false
+ },
+ {
+  "id": "data-C5",
+  "subsystem": "data",
+  "claim": "web/server.js:334-339 assigns the same uuid/email pair to both the vless-direct and vless-residential Xray inbound tags when building xray-config.json, meaning the direct/residential choice for a given account is encoded purely by which of ports :10001/:10002 the client dials, not by any server-side per-connection routing rule.",
+  "high_impact": false
+ },
+ {
+  "id": "data-C6",
+  "subsystem": "data",
+  "claim": "hysteria-residential's outbound in server/core.sh:641-653 is an unconditional `acl: inline: [relay(all)]` pointing at socks5 127.0.0.1:2080, and Xray's vless-residential inbound is unconditionally routed to outboundTag 'relay' -> socks 127.0.0.1:2080 in server/core.sh:830-836, so residential-labeled traffic always transits the b-ui-relay sing-box process even when residential-helper.sh's write_singbox_config_direct() (server/residential-helper.sh:462-504) configures that relay to do nothing but forward everything to 'direct'.",
+  "high_impact": false
+ },
+ {
+  "id": "ctrl-C1",
+  "subsystem": "ctrl",
+  "claim": "server/update.sh:1093-1121 (D6 hy2 http→userpass migration) duplicates the exact awk rewrite script already present at server/core.sh:669-692 (apply_hy2_userpass_auth), which core.sh now calls at install time per its own comment at core.sh:660-661.",
+  "high_impact": false
+ },
+ {
+  "id": "ctrl-C2",
+  "subsystem": "ctrl",
+  "claim": "server/update.sh:672-745 (migrate_ipv4_only_egress, D9) is a no-op on any host installed by the current core.sh, since core.sh:588, core.sh:649 and core.sh:829 already emit IPv4-only egress (direct mode:4, ForceIPv4) at install time.",
+  "high_impact": false
+ },
+ {
+  "id": "ctrl-C3",
+  "subsystem": "ctrl",
+  "claim": "server/update.sh:1527-1623 (block A, hysteria-residential unit + config-residential.yaml install) can never fire on the current fleet because core.sh:244 already creates hysteria-residential.service at every fresh install, and both production servers (bwg-tizi, bwg-rick) are already on the v3.5+ dual-instance topology.",
+  "high_impact": true
+ },
+ {
+  "id": "ctrl-C4",
+  "subsystem": "ctrl",
+  "claim": "server/update.sh:1670-1699 (block B, xray dual-inbound migration) is unreachable on any host installed by current core.sh, since core.sh:811 already emits the vless-residential inbound tag that this block's guard checks for.",
+  "high_impact": false
+ },
+ {
+  "id": "ctrl-C5",
+  "subsystem": "ctrl",
+  "claim": "server/update.sh:1721-1736 (block C, add DoH resolver) is unreachable on current-core.sh-installed hosts because core.sh:554 and core.sh:612 already write the `resolver:` block into both config.yaml and config-residential.yaml at generation time.",
+  "high_impact": false
+ },
+ {
+  "id": "ctrl-C6",
+  "subsystem": "ctrl",
+  "claim": "server/update.sh:1738-1752 (block D, static /etc/resolv.conf) is unreachable on current-core.sh-installed hosts because core.sh:1286-1317 already writes and chattr +i locks a static resolv.conf at install time.",
+  "high_impact": true,
+  "counter_claim": "data-C2 claims setup_static_dns() (core.sh:1289-1319) is NEVER called on the install path, i.e. the update.sh block D IS the live path — directly contradicting this claim."
+ },
+ {
+  "id": "ctrl-C7",
+  "subsystem": "ctrl",
+  "claim": "server/update.sh:1754-1767 (block E, v3.5 firewall ports) is unreachable on current-core.sh-installed hosts because core.sh:1252-1270 already opens the same v3.5 residential ports (10002/tcp, 40000/udp range) at install time, each explicitly commented '// v3.5'.",
+  "high_impact": true,
+  "counter_claim": "data-C1 claims configure_firewall() (core.sh:1237-1283, which contains lines 1252-1270) has ZERO callers, so nothing at install time opens those ports — directly contradicting this claim."
+ },
+ {
+  "id": "ctrl-C8",
+  "subsystem": "ctrl",
+  "claim": "server/update.sh:1015-1037 (D1, 99-b-ui-network.conf sysctl) writes a file already produced verbatim by server/core.sh:1471-1498 at fresh install, making D1 a no-op for any host installed since core.sh gained this block.",
+  "high_impact": false
+ },
+ {
+  "id": "ctrl-C9",
+  "subsystem": "ctrl",
+  "claim": "server/update.sh:1050-1070 (D4, conntrack sysctl) writes a file already produced by server/core.sh:1500-1521 (nf_conntrack_max tiering logic) at fresh install.",
+  "high_impact": false
+ },
+ {
+  "id": "ctrl-C10",
+  "subsystem": "ctrl",
+  "claim": "server/update.sh:1072-1087 (D5, b-ui-admin memory drop-in) writes a drop-in already produced by server/core.sh around line 1755 (MemoryMax=200M) at fresh install.",
+  "high_impact": false
+ },
+ {
+  "id": "ctrl-C11",
+  "subsystem": "ctrl",
+  "claim": "server/update.sh:575-612 (migrate_admin_env) is unreachable on current-core.sh-installed hosts because core.sh:1727-1736 already writes /opt/b-ui/admin.env with EnvironmentFile wiring at install time.",
+  "high_impact": false
+ },
+ {
+  "id": "ctrl-C12",
+  "subsystem": "ctrl",
+  "claim": "server/update.sh:1435-1521 (cert-sync.sh race-condition rewrite, 87 lines) writes content that is byte-for-byte functionally identical to server/core.sh:930-994's setup_cert_sync heredoc (differing only in one comment line), and only overwrites an existing deployment, so it is a pure no-op on any host installed by the current core.sh.",
+  "high_impact": false
+ },
+ {
+  "id": "ctrl-C13",
+  "subsystem": "ctrl",
+  "claim": "server/update.sh:932-978 (hy2-portjump-cleanup.sh heredoc written inside apply_systemd_configs) and server/core.sh:139-186 (the same heredoc written at install) are two independently-maintained copies of the same cleanup script that have already drifted in their comments, evidencing real duplication maintenance cost.",
+  "high_impact": false
+ },
+ {
+  "id": "ctrl-C14",
+  "subsystem": "ctrl",
+  "claim": "The SSH-hardening logic is implemented three separate times with near-identical bodies: server/core.sh:1867-1935 (harden_ssh, install-time), server/update.sh:614-659 (migrate_ssh_hardening, every apply cycle), and server/b-ui-cli.sh:1157-1208 (cmd_harden_ssh, manual `sudo b-ui harden-ssh` subcommand).",
+  "high_impact": false
+ },
+ {
+  "id": "ctrl-C15",
+  "subsystem": "ctrl",
+  "claim": "install.sh:378-422 (update_service_paths) and server/update.sh:368-406 (update_service_paths) are two verbatim copies of the same /opt/hysteria→/opt/b-ui unit-file path migration function.",
+  "high_impact": false
+ },
+ {
+  "id": "ctrl-C16",
+  "subsystem": "ctrl",
+  "claim": "install.sh's install_type==0 branch (install.sh:784-790, fed by check_old_version at install.sh:424-463 and migrate_old_path at install.sh:343-376) is unreachable on any host that has ever completed a modular b-ui install, since that detection requires /usr/local/bin/b-ui to exist while ${BASE_DIR}/version.json is absent, a state CLAUDE.md's own description of the disconnected legacy b-ui-server.sh product confirms cannot arise from any install.sh-driven upgrade path.",
+  "high_impact": true
+ },
+ {
+  "id": "ctrl-C17",
+  "subsystem": "ctrl",
+  "claim": "install_tui_tools() is defined identically in both install.sh:688-758 and server/update.sh:2237-2297, but update.sh's copy is only reachable via update.sh's own direct-execution dispatch block at server/update.sh:2299-2326 (guarded by `[[ \"${BASH_SOURCE[0]}\" == \"${0}\" ]]`), which no sourcing caller (b-ui-cli.sh:511/520, install.sh:793) or cron invocation (`update.sh auto`/`update.sh kernel`) ever exercises.",
+  "high_impact": false
+ },
+ {
+  "id": "ctrl-C18",
+  "subsystem": "ctrl",
+  "claim": "server/update.sh:2200-2203 runs `npm install` unconditionally on every 6-hour auto_update() cron cycle regardless of whether web/package.json actually changed, even though the same function already computes a `web_changed` flag (server/update.sh:2173-2188) that correctly gates the b-ui-admin restart three lines later but is not used to gate this npm install.",
+  "high_impact": false
+ },
+ {
+  "id": "ctrl-C19",
+  "subsystem": "ctrl",
+  "claim": "server/b-ui-cli.sh:518-556 defines an inline fallback implementation of kernel-update logic that only executes if ${BASE_DIR}/update.sh is missing, a condition that cannot occur on any real install since update.sh is unconditionally part of every file set installed by both install.sh (install.sh:243) and update.sh's own do_update (server/update.sh:261) and auto_update (server/update.sh:2137).",
+  "high_impact": false
+ },
+ {
+  "id": "client-C1",
+  "subsystem": "client",
+  "claim": "b-ui-client.sh:44-57 print_banner() is defined but has zero call sites anywhere in the 5810-line file.",
+  "high_impact": false
+ },
+ {
+  "id": "client-C2",
+  "subsystem": "client",
+  "claim": "b-ui-client.sh:300-319 tui_write() is defined but has zero call sites anywhere in the file.",
+  "high_impact": false
+ },
+ {
+  "id": "client-C3",
+  "subsystem": "client",
+  "claim": "b-ui-client.sh:812-963 check_and_install_dep()+check_dependencies() are defined but check_dependencies() has zero callers, and check_and_install_dep()'s only 12 call sites (lines 861-921) are all inside check_dependencies()'s own dead body, making both functions unreachable from main()/tui_main_loop()/dispatch_subcommand().",
+  "high_impact": true
+ },
+ {
+  "id": "client-C4",
+  "subsystem": "client",
+  "claim": "b-ui-client.sh:1053-1072 get_server_ip() and get_current_ssh_ip() are defined but have zero call sites in b-ui-client.sh (distinct same-named functions do exist and are used server-side in server/core.sh:52 and server/residential-helper.sh:332, but those are separate files).",
+  "high_impact": false
+ },
+ {
+  "id": "client-C5",
+  "subsystem": "client",
+  "claim": "b-ui-client.sh:2456-3285 and 3040-3423 and 3555-3615 and 4503-4528 and 4680-4931 (list_configs, switch_config, delete_config, import_batch, activate_imported_config, _configure_and_save, config_management, import_from_subscription, import_from_uri, configure_client, quick_install, import_node, service_control_menu — 13 functions, ~1190 lines combined) form a closed call graph that is never entered from main(), tui_main_loop(), dispatch_subcommand(), or any other function reachable from those three entry points; the live TUI/CLI paths (tui_switch_node:5315, tui_import_node:5410, tui_service_control:5498, cmd_switch:2751, cmd_list:2707, cmd_import:2839, _switch_to_profile:2517) independently reimplement equivalent functionality instead of calling into this cluster.",
+  "high_impact": true
+ },
+ {
+  "id": "client-C6",
+  "subsystem": "client",
+  "claim": "docs/superpowers/plans/2026-05-07-cli-redesign.md lines 1078-1079 specify the original design intent as `tui_import_node() { import_node; }` and `tui_service_control() { service_control_menu; }` (thin delegating wrappers), but the shipped b-ui-client.sh implements tui_import_node (5410-5497) and tui_service_control (5498-5574) as full independent reimplementations that never call import_node or service_control_menu.",
+  "high_impact": false
+ },
+ {
+  "id": "client-C7",
+  "subsystem": "client",
+  "claim": "b-ui-client.sh's live subscription-import entry point, tui_import_node (~line 5443), rejects https:// input with a message telling the user to use the import-menu's subscription feature, but that referenced feature (import_from_subscription/config_management) is unreachable dead code, and the CLI path cmd_import (2839-2907) also rejects any URI that isn't ^(hysteria2|hy2):// or ^vless://, so subscription-URL import is not reachable through any live code path in this file.",
+  "high_impact": true
+ },
+ {
+  "id": "client-C8",
+  "subsystem": "client",
+  "claim": "generate_xray_config() (b-ui-client.sh:1287-1333), which sets up the VLESS-REALITY SOCKS-mode systemd unit, never calls create_health_check(), while create_service() (3912-3959), used only for the Hysteria2 SOCKS-mode path, does call it — so VLESS-node users get no hysteria-health.timer auto-restart watchdog while Hysteria2-node users do.",
+  "high_impact": false
+ },
+ {
+  "id": "client-C9",
+  "subsystem": "client",
+  "claim": "The 'stop hysteria-client + xray-client + bui-tun' three-service-stop sequence is independently hand-written (not via a shared helper function) at at least 6 locations in b-ui-client.sh: inside start_tun_mode (~2015-2028), _switch_to_profile (~2563-2567), cmd_stop (2938-2948)/switch_config-equivalent, uninstall (~4555-4590), tui_service_control (~5537-5549), and auto_update_all (~5681-5712); no function named stop_all_client_services or equivalent exists in the file.",
+  "high_impact": false
+ },
+ {
+  "id": "resi-C1",
+  "subsystem": "resi",
+  "claim": "server/residential-helper.sh:113-116 defines LEGACY_DEFAULT_DOMAINS_V3_4_17 as a bash array that is never read anywhere else in the repo (grep for the identifier across the whole tree returns only its own definition plus two docs that call it out as known dead code), so it is DEAD code.",
+  "high_impact": false
+ },
+ {
+  "id": "resi-C2",
+  "subsystem": "resi",
+  "claim": "server/update.sh:510-568 (migrate_residential_keywords, block A-ish, pre-D-numbering) only fires for installs whose residential-proxy.json .domains array exactly equals the hardcoded v3.4.17 (10-entry) or v3.4.18 (25-entry) lists baked in at server/update.sh:517-527; since v4 is a clean reinstall on both production servers per the owner's decision, this ~60-line migration function together with its two embedded legacy lists is LEGACY-ONLY and deletable wholesale.",
+  "high_impact": false
+ },
+ {
+  "id": "resi-C3",
+  "subsystem": "resi",
+  "claim": "server/update.sh:1653-1668 (A.fix2, v3.5.7) only repairs config.yaml files that still contain a '# B-UI:RESIDENTIAL-START' marker block left by the pre-v3.5 residential-helper architecture (single hysteria instance with outbounds/acl injected into config.yaml); the current v3.5+ topology (core.sh, two separate Hysteria2 instances) never writes that marker, so this block is LEGACY-ONLY for installs older than v3.5.7 and deletable on a v4 clean reinstall.",
+  "high_impact": false
+ },
+ {
+  "id": "resi-C4",
+  "subsystem": "resi",
+  "claim": "The b-ui-resi-health.timer/service systemd units are created ONLY inside server/update.sh's migration block D8 (server/update.sh:1141-1193, originally v3.5.22), never inside server/core.sh; since install.sh's fresh-install path (run_core_install, install.sh:550-609) sources only core.sh and not update.sh, a brand-new install that is given >=2 residential upstream URLs at setup time will run without the b-ui-resi-health.timer (and thus without automatic unhealthy-upstream failover) until the update.sh cron job first runs (up to 6 hours later per the '0 */6 * * *' cron line in core.sh), which is an architectural placement bug (health-timer bootstrap logic living only in a migration block) rather than genuinely redundant code.",
+  "high_impact": false
+ },
+ {
+  "id": "resi-C5",
+  "subsystem": "resi",
+  "claim": "The exact same curl proxy-config-escaping and proxy-config-building logic (curl_cfg_escape + curl_proxy_cfg, building a curl `-K -` stdin config so SOCKS5/HTTP credentials never appear in argv/ps) is implemented three separate times: server/residential-helper.sh:67-76, server/resi-health.sh:34-43 (near-byte-identical copy of the same two functions, differing only in a comment), and again reimplemented in JavaScript in web/server.js:544-568 (curlCfgEscape + inline cfg string building inside curlJsonViaProxy) — a REDUNDANT triplication of a security-relevant helper that any future credential-handling fix (e.g. the R3 hardening) must be applied to in all three places to stay correct.",
+  "high_impact": false
+ },
+ {
+  "id": "resi-C6",
+  "subsystem": "resi",
+  "claim": "web/server.js implements a third, independent proxy-egress probing mechanism (probeEgress/curlJsonViaProxy at web/server.js:618-629, invoked from the GET /api/residential/health handler at web/server.js:2413 onward) distinct from server/residential-helper.sh's verify() (one-shot IP check on add, residential-helper.sh:200-277) and server/resi-health.sh's periodic reachability probe (resi-health.sh:56-98) — three separately coded 'ask this proxy for its egress' implementations, though they differ enough in purpose (add-time verification vs periodic failover scoring vs on-demand ISP/residential classification for the panel) that this is best read as three purposes sharing one un-shared curl-cfg primitive rather than three redundant implementations of the same feature.",
+  "high_impact": false
+ },
+ {
+  "id": "resi-C7",
+  "subsystem": "resi",
+  "claim": "Both of the owner's production servers (bwg-tizi and bwg-rick, per the user's own MEMORY.md notes bwg-tizi-global-residential.md and bwg-rick-config.md) run residential egress in global=true mode, and the owner's explicit v4 capability list names only 'residential egress in global mode' as a capability to keep; the non-global domain-keyword split-routing mode is nonetheless implemented redundantly in four separate places that must all be kept in sync in spirit (though they share one true keyword source): server/residential-helper.sh's write_singbox_config_residential_multi (domain_keyword DNS/route rules, residential-helper.sh:405-454), web/server.js's sing-box subscription generator (domain_keyword rule at web/server.js:781-782), web/server.js's Clash/mihomo subscription generator (DOMAIN-KEYWORD rules at web/server.js:972-973), and web/app.js's panel UI for toggling global vs editing the domain list (web/app.js:809-992) — a real simplification candidate if the product only needs to support global mode going forward, though this is a product-scope decision, not a proven bug.",
+  "high_impact": false
+ },
+ {
+  "id": "resi-C8",
+  "subsystem": "resi",
+  "claim": "The interactive `sudo b-ui` numbered menu path for residential config (configure_residential_menu, server/b-ui-cli.sh:783 onward, reached via the '住宅 IP 出口 →' menu item at server/b-ui-cli.sh:1373) exposes only single-URL enable/modify (calling `residential-helper.sh enable <url>`, i.e. overwrite mode which clears urls[] per residential-helper.sh:729-733), while the full multi-URL add/remove/list functionality (calling `residential-helper.sh enable --add/--remove`) exists only in the flag-style CLI subcommand dispatcher cmd_server_residential (server/b-ui-cli.sh:999-1030, reached via `b-ui residential add/remove/list`, server/b-ui-cli.sh:1243) and in the web panel (web/app.js:790-802 calling POST/DELETE /api/residential/urls) — neither of which is reachable from the interactive numbered menu the owner's own memory says is the preferred UX, nor documented in README.md (grep for 'residential add'/'residential enable' in README.md and docs/*.md returns no hits), making the CLI subcommand path effectively undiscoverable/redundant with the panel's better-integrated multi-URL UI.",
+  "high_impact": false
+ },
+ {
+  "id": "hist-C1",
+  "subsystem": "hist",
+  "claim": "b-ui-server.sh (repo root, 1332 lines) has received zero commits since 523b18c \"feat(v3.0.0): 架构大版本重构\" on 2026-03-20, confirmed by `git log --oneline -- b-ui-server.sh` and an identical `git show 523b18c:b-ui-server.sh | wc -l` vs current `wc -l` (both 1332).",
+  "high_impact": false
+ },
+ {
+  "id": "hist-C2",
+  "subsystem": "hist",
+  "claim": "b-ui-client.sh:183-184 and server/b-ui-cli.sh:96-97 hardcode `TUI_AVAILABLE=false` with a comment stating it will never become true, making every gum/fzf branch in both files (tui_info/success/error/spin/confirm/menu/filter/write, ~20+8 call sites) permanently unreachable dead code.",
+  "high_impact": true
+ },
+ {
+  "id": "hist-C3",
+  "subsystem": "hist",
+  "claim": "The gum/fzf TUI feature was introduced on 2026-05-07 (commits 4391cc2, 596335b, 72558e3, fcdf1c7, 37016f1, 5972df9) and reverted the next day, 2026-05-08, by commit c76ba3a \"refactor(ui): replace gum arrow menus with numeric two-column layout\".",
+  "high_impact": false
+ },
+ {
+  "id": "hist-C4",
+  "subsystem": "hist",
+  "claim": "docs/superpowers/specs/2026-05-07-residential-ip-design.md:16-21 explicitly rules out multi-upstream load balancing/auto-switch and HTTP-proxy upstreams as non-goals, both of which shipped later (multi-URL urltest pool in v3.5.0/v3.5.22, HTTP-upstream auto-detection in v3.6.0 R10), and the spec was never updated to reflect this.",
+  "high_impact": false
+ },
+ {
+  "id": "hist-C7",
+  "subsystem": "hist",
+  "claim": "README.md:9 states \"当前版本: v3.5.18\" while version.json:2 states \"version\": \"3.6.3\", and README.md:213-220's port table lists :10002 as VLESS-WS-TLS while server/core.sh:811-812 assigns :10002 to the \"vless-residential\" inbound (ws-tls moved to :10003 per web/server.js:353's comment, dated v3.5.17).",
+  "high_impact": false
+ },
+ {
+  "id": "eff-C1",
+  "subsystem": "eff",
+  "claim": "web/server.js:1071-1111 fetchXrayUserStats() spawns two synchronous execSync child processes (one for uplink, one for downlink) per Xray/VLESS user in a sequential loop, blocking Node's single event loop for the duration.",
+  "high_impact": false
+ },
+ {
+  "id": "eff-C2",
+  "subsystem": "eff",
+  "claim": "web/server.js:1134-1138 getMergedStats() and web/server.js:1140-1144 getMergedOnline() each independently call fetchXrayUserStats() (directly, and via fetchXrayOnline() respectively) with no shared cache between them, so the identical O(N) subprocess-spawn work runs twice whenever both are invoked together.",
+  "high_impact": false
+ },
+ {
+  "id": "eff-C3",
+  "subsystem": "eff",
+  "claim": "web/app.js:109 `setInterval(load, 5000)` together with web/app.js:114 `Promise.all([api(\"/users\"), api(\"/online\"), api(\"/stats\")])` means the admin dashboard, whenever open, triggers both /api/stats and /api/online every 5 seconds, each independently re-running the full per-user Xray stats query.",
+  "high_impact": false
+ },
+ {
+  "id": "eff-C4",
+  "subsystem": "eff",
+  "claim": "web/server.js:1423 a separate `setInterval(..., 10000)` background loop also calls getMergedStats() every 10 seconds regardless of whether the dashboard is open, adding a third independent trigger of the same O(N) execSync work.",
+  "high_impact": false
+ },
+ {
+  "id": "eff-C5",
+  "subsystem": "eff",
+  "claim": "server/residential-helper.sh:507-522 the b-ui-relay.service systemd unit sets no LimitNOFILE, MemoryHigh, MemoryMax, or Nice, unlike hysteria-server (server/core.sh:197-238), hysteria-residential (server/core.sh:244-274), and xray (server/core.sh:1766-1784), which all explicitly set LimitNOFILE=1048576 plus memory limits.",
+  "high_impact": true,
+  "counter_claim": "prod-state reader reports \"ulimits (1048576 open files) match\" on both hosts; check whether that observation covered the sing-box relay PID (cat /proc/<pid>/limits) or only hysteria/xray."
+ },
+ {
+  "id": "eff-C7",
+  "subsystem": "eff",
+  "claim": "web/server.js:302-326 updateHysteriaResidentialConfig() and updateHysteriaConfig() rewrite the entire userpass auth block and call restartServiceAsync on hysteria-residential/hysteria-server respectively whenever the serialized userpass content differs from what's on disk (guarded by `if (next === c) return;` at lines 310 and 322), meaning any username/password change restarts the whole hysteria instance rather than hot-updating just the affected user.",
+  "high_impact": false
+ },
+ {
+  "id": "prod-C1",
+  "subsystem": "prod",
+  "claim": "hysteria-server@.service and xray@.service are systemd template units present identically on both bwg-rick and bwg-tizi (/etc/systemd/system/) that are never active and are never referenced by any .sh file in the repo (verified by repo-wide grep for 'hysteria-server@' and 'xray@'), i.e. they are upstream-installer byproducts, not b-ui code.",
+  "high_impact": false
+ },
+ {
+  "id": "prod-C2",
+  "subsystem": "prod",
+  "claim": "On bwg-tizi, crontab runs `/opt/b-ui/cert-check.sh` every 12 hours (server/update.sh:2044-2066 writes this line unconditionally) but the file /opt/b-ui/cert-check.sh does not exist on disk, confirmed by direct execution returning 'not found' — this cron job has been failing silently since some point after the 2026-05-09 install, because core.sh:1170-1225 (which is the only place that writes cert-check.sh's content) only runs at install/reinstall time and version.json's file_map (confirmed on-device) does not list cert-check.sh for redelivery on update.",
+  "high_impact": false
+ },
+ {
+  "id": "prod-C3",
+  "subsystem": "prod",
+  "claim": "server/update.sh:1353-1360 only regenerates /opt/b-ui/hy2-watchdog.sh's content when /etc/systemd/system/hy2-watchdog.timer is absent, not on any content/version check, so a host that already has the timer (both bwg-rick and bwg-tizi do) never receives further fixes to the heredoc body — live evidence: bwg-tizi's copy (1280 bytes, mtime 2026-05-09) differs from bwg-rick's (1484 bytes, mtime 2026-06-03) despite both running the same current core.sh/update.sh version 3.6.3.",
+  "high_impact": false
+ },
+ {
+  "id": "prod-C4",
+  "subsystem": "prod",
+  "claim": "server/update.sh contains 11 distinct call sites that write a `.bak.<tag>.<timestamp>` copy of a config file during migration, and only one line (update.sh:721) ever deletes a .bak file it created (a rollback-specific delete, not a general retention policy) — live evidence: bwg-tizi's /opt/b-ui/ holds 26 distinct dated .bak files for config.yaml and xray-config.json alone, spanning 2026-05-09 through 2026-09-11, none pruned.",
+  "high_impact": false
+ },
+ {
+  "id": "prod-C5",
+  "subsystem": "prod",
+  "claim": "residential-proxy.json.bak.null.*, .bak.rmdc.*, .bak.pre-null.*, .namebak.*, and residential-helper.sh.bak.ippure.* found live on bwg-tizi are not produced by any code currently in server/residential-helper.sh (grep for 'bak', 'BACKUP', 'backup' in that file returns zero hits), indicating they are residue of manual/ad-hoc edits made directly on the production host rather than through the shipped scripts.",
+  "high_impact": false
+ },
+ {
+  "id": "prod-C6",
+  "subsystem": "prod",
+  "claim": "/etc/systemd/system/hysteria-residential.service.d/99-debug.conf exists only on bwg-tizi (absent on bwg-rick and absent from the repo), sets `--log-level debug`, and directly correlates with bwg-tizi's hysteria-residential unit producing 72,425 journal lines in 24h versus bwg-rick's 3,789 lines for the same unit — roughly 19x the log volume from one leftover manual override.",
+  "high_impact": false
+ },
+ {
+  "id": "prod-C7",
+  "subsystem": "prod",
+  "claim": "bwg-tizi's disk usage (7.5G/19G, 43%) is roughly 3.5x bwg-rick's (2.1G/19G, 13%) despite both running the identical current version and topology, consistent with the accumulated unpruned .bak files, stray duplicate web/ files, and elevated debug-level journal retention documented above.",
+  "high_impact": false
+ },
+ {
+  "id": "web-C1",
+  "subsystem": "web",
+  "claim": "web/server.js:8 imports convertOutboundToLink from singbox-converter and no other line in the repository (outside node_modules) references that symbol; js-yaml is never imported by web/server.js.",
+  "high_impact": false,
+  "also_raised_as": [
+   "hist-C6"
+  ]
+ },
+ {
+  "id": "web-C2",
+  "subsystem": "web",
+  "claim": "web/server.js:2683-2708 (/auth/hysteria) and web/server.js:1149-1155 (checkUserLimits) are unreachable on any install where jq is present, because server/core.sh:664 calls apply_hy2_userpass_auth at install and server/update.sh:1090-1120 converts `auth: type: http` to userpass on every update; consequently limits.expiresAt/trafficLimit/monthlyLimit/speedLimit are enforced nowhere (grep in server/ and b-ui-client.sh hits only core.sh:523).",
+  "high_impact": true,
+  "also_raised_as": [
+   "hist-C5"
+  ]
+ },
+ {
+  "id": "web-C3",
+  "subsystem": "web",
+  "claim": "web/server.js:51 CONFIG.trafficPortResidential (9998) has no reader; fetchStats/postStats (1034-1066) always use CONFIG.trafficPort 9999, so hysteria-residential traffic, online status and kick are never observed by the panel.",
+  "high_impact": false,
+  "also_raised_as": [
+   "eff-C6"
+  ]
+ },
+ {
+  "id": "web-C4",
+  "subsystem": "web",
+  "claim": "web/server.js:1076 filters xray stats to protocol vless-reality|vless-ws-tls, so users with protocol fusion (the first/default option in web/index.html:196 and the seed user in core.sh:523) never get Reality traffic counted.",
+  "high_impact": false
+ },
+ {
+  "id": "web-C5",
+  "subsystem": "web",
+  "claim": "web/server.js:1422 initialises lastTraffic as {} and the loop at 1437-1438 computes delta = stat.tx - 0 on the first tick after a b-ui-admin restart while hysteria's /traffic endpoint is cumulative (no clear=1 anywhere in server.js), so cumulative traffic is re-added to users.json on every panel restart.",
+  "high_impact": true
+ },
+ {
+  "id": "web-C6",
+  "subsystem": "web",
+  "claim": "web/app.js:190 sends the admin password as the `key` query parameter of GET /api/manage, sourced from localStorage 'ap' set at app.js:60, because web/server.js never returns an adminPass field (grep adminPass in server.js is empty); Caddy access logging at server/core.sh:869-874 records that URI.",
+  "high_impact": false
+ },
+ {
+  "id": "web-C7",
+  "subsystem": "web",
+  "claim": "handleManage actions delete/update/list (web/server.js:1198-1225) and POST /api/users (web/server.js:1958-1975) have no callers in web/app.js, web/index.html, b-ui-client.sh or server/*.sh.",
+  "high_impact": false
+ },
+ {
+  "id": "web-C8",
+  "subsystem": "web",
+  "claim": "GET /api/install-command (web/server.js:1770-1780) is placed before the Bearer check at 1953 and returns the install key, and /packages/b-ui-client.sh (1636-1691) serves the client script with no key, so verifyInstallKey (126-129) provides no access control.",
+  "high_impact": false
+ },
+ {
+  "id": "web-C9",
+  "subsystem": "web",
+  "claim": "generateBootstrapScript (web/server.js:132-192) is reachable only when both /opt/b-ui/b-ui-client.sh and /opt/b-ui/packages/b-ui-client.sh are missing and raw.githubusercontent.com is unreachable; install.sh:246 and server/core.sh:1630-1642 always create the first file.",
+  "high_impact": false
+ },
+ {
+  "id": "web-C10",
+  "subsystem": "web",
+  "claim": "web/server.js:1592 stops/disables systemd units sing-box-tun and sing-box-client which b-ui-client.sh never creates (its units are hysteria-client.service at line 29, xray-client.service at 1309 and bui-tun.service at 1626).",
+  "high_impact": false
+ },
+ {
+  "id": "web-C11",
+  "subsystem": "web",
+  "claim": "GET /api/kernel-downloads (web/server.js:1739-1767) has no caller: b-ui-client.sh uses /api/kernel-versions (4958, 5650) and fixed /packages/<file> URLs (5052, 5076, 5100).",
+  "high_impact": false
+ },
+ {
+  "id": "web-C12",
+  "subsystem": "web",
+  "claim": "web/server.js:2544 reads /tmp/hy2-watchdog-fail-count, but the watchdog script written by server/core.sh:1064 and server/update.sh:1368 writes /tmp/hy2-watchdog-fail-${svc}; the panel's fail_count is therefore always 0.",
+  "high_impact": false
+ },
+ {
+  "id": "web-C13",
+  "subsystem": "web",
+  "claim": "POST /api/port-hopping (web/server.js:2098-2152) writes port-hopping.json and iptables REDIRECT rules but never edits the `listen:` line that getConfig (446-448) treats as the source of truth since v3.6.0, and server/core.sh:1388-1400 deletes those same iptables rules as obsolete.",
+  "high_impact": false
+ },
+ {
+  "id": "web-C14",
+  "subsystem": "web",
+  "claim": "syncKernels (web/server.js:1242-1419) duplicates the GitHub release polling done by server/core.sh:1566-1651 at install and by `update.sh kernel` (server/update.sh:1944-2065, cron every 12h), with a different sing-box version cap.",
+  "high_impact": false
+ },
+ {
+  "id": "web-C15",
+  "subsystem": "web",
+  "claim": "The proto×residential node-selection tree is implemented four times: web/server.js:706-760, 909-934, 1850-1907 and web/app.js:293-350, with ports 10002/40000/41000-50000 hard-coded in each, and /api/sub (1857) hard-codes 10001 while the other three use cfg.xrayPort.",
+  "high_impact": false
+ },
+ {
+  "id": "web-C16",
+  "subsystem": "web",
+  "claim": "web/server.js:359-372 builds the vless-ws-tls inbound with certificate paths under /etc/letsencrypt/live/<domain>/ whereas server/core.sh:541 stores certificates under ${BASE_DIR}/certs, and no subscription generator emits a ws-tls node (server.js:1846).",
+  "high_impact": false
+ },
+ {
+  "id": "web-C17",
+  "subsystem": "web",
+  "claim": "JWT_SECRET is absent from admin.env written by server/core.sh:1727-1735, so web/server.js:40 generates a new secret per process and every b-ui-admin restart invalidates all sessions.",
+  "high_impact": false
+ },
+ {
+  "id": "web-C18",
+  "subsystem": "web",
+  "claim": "web/server.js:492-506 spawns residential-helper.sh (`domains`) synchronously on every /api/subscription and /api/clash request whenever residential-proxy.json is enabled with an empty domains list (the default follow-default state, see 2170-2172).",
+  "high_impact": false
+ }
+]
