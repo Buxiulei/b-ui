@@ -161,10 +161,15 @@ parse_url() {
         || { err "解析结果包含空字段"; return 1; }
     [[ "$RESI_PORT" =~ ^[0-9]+$ ]] \
         || { err "端口必须是数字，实际: ${RESI_PORT}"; return 1; }
-    # v3.6.0 R10: 端口范围在这里收口——否则 99999 要等到 verify 才以"两种协议都连不上"暴露
-    if [[ "${#RESI_PORT}" -gt 5 ]] || [[ "$RESI_PORT" -lt 1 ]] || [[ "$RESI_PORT" -gt 65535 ]]; then
-        err "端口超出范围 1-65535，实际: ${RESI_PORT}"; return 1
-    fi
+    # v3.6.0 R10: 端口范围在这里收口——否则 99999 要等到 verify 才以"两种协议都连不上"暴露。
+    # 位数先按**原串**判（065535 这种"补零后合法"的怪输入一律拒），再归一成十进制：
+    # 08080 → 8080 —— 不归一的话 bash 会把前导 0 当八进制（`[[ 08080 -lt 1 ]]` 直接报
+    # "value too great for base"），jq --argjson 收到 08080 在 1.5/1.6 上也会拒。
+    [[ "${#RESI_PORT}" -le 5 ]] \
+        || { err "端口超出范围 1-65535，实际: ${RESI_PORT}"; return 1; }
+    RESI_PORT=$((10#$RESI_PORT))
+    [[ "$RESI_PORT" -ge 1 && "$RESI_PORT" -le 65535 ]] \
+        || { err "端口超出范围 1-65535，实际: ${RESI_PORT}"; return 1; }
 }
 
 # v3.6.0 R10: want = socks5|http|auto。auto 先 SOCKS5 再 HTTP（Bright Data 22228=SOCKS5、

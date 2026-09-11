@@ -208,14 +208,14 @@ HTTP 出站扛不了 UDP，但它压根不在请求路径上；路由需要解�
 | HTTP / HTTPS | **44445** | 旧文档里的 22225 / 33335 是同一个入口的历史端口 |
 | SOCKS5 | **22228** | 固定端口，不随 zone 变 |
 
-把 SOCKS5 打到 44445 会收到 `invalid version in initial SOCKS5 response`（那是个 HTTP 端口），
-把 HTTP CONNECT 打到 22228 同样不通。**B-UI 添加时会自动识别**：不带协议前缀的输入先试 SOCKS5、
+把 SOCKS5 打到 44445 会收到 `invalid version in initial SOCKS5 response`（那是个 HTTP 端口，实测）。
+**B-UI 添加时会自动识别**：不带协议前缀的输入先试 SOCKS5、
 失败再试 HTTP，识别结果记进 `residential-proxy.json` 的 `type` 字段，中继按类型出站
 （`socks` / `http`），面板节点池那一行会显示 `SOCKS5` 或 `HTTP` 徽标。
 想跳过探测就自己写前缀：`socks5://…`、`socks5h://…`（同义）或 `http://…`。
 
-**Bright Data 推荐用 HTTP 端口（44445）当上游**。2026-09-10 在生产机上用真实 ISP zone 凭据实测，
-同一套凭据两个端口的差别是：
+**对 Bright Data 上游，B-UI 推荐用 HTTP 端口 44445。** 这是 2026-09-10 在生产机上用真实 ISP zone
+凭据实测后本项目给的建议（不是供应商的说法）；同一套凭据两个端口的差别是：
 
 | 目标 | SOCKS5 · 22228 | HTTP · 44445 |
 |---|---|---|

@@ -592,7 +592,7 @@ function parseResiInput(text) {
     const tail = at >= 0 ? s.slice(at + 1) : "";
     const parts = s.split(":");
     const csvLike = parts.length >= 4 && parts[0].indexOf("@") < 0 && /^[0-9]+$/.test(parts[1]);
-    let host, port, username, password;
+    let host, port, username, password;   // port 末尾会归一成十进制字符串
 
     const atOk = at >= 0 && /^[^:@/]+:[0-9]+$/.test(tail);
     // 与 helper parse_url 同优先级：没写 scheme → CSV 优先（密码含 @ 的整行粘贴），写了 → @ 形态优先
@@ -626,8 +626,11 @@ function parseResiInput(text) {
     if (!host) return { error: "缺少主机，" + EG };
     if (!port) return { error: "缺少端口，" + EG };
     if (!/^[0-9]+$/.test(port)) return { error: "端口不是数字：" + port };
+    // 与 helper parse_url 同口径：位数先按原串判（065535 这种补零后合法的也拒），再归一成十进制
+    if (port.length > 5) return { error: "端口超出范围（1-65535）：" + port };
     const pn = parseInt(port, 10);
     if (pn < 1 || pn > 65535) return { error: "端口超出范围（1-65535）：" + port };
+    port = String(pn);   // 08080 → 8080，预览显示的就是 helper 会落库的值
     if (!username) return { error: "缺少用户名" };
     if (!password) return { error: "缺少密码" };
     return { host, port, username, password, scheme };
@@ -781,7 +784,7 @@ function addResidentialUrl() {
     };
     if (btn) {
         btn.disabled = true;
-        btn.textContent = "正在连接上游校验，最长约 30 秒…";
+        btn.textContent = "正在连接上游校验，通常 30 秒内（最长 60 秒）…";
         btn.classList.add("resi-btn-busy");
     }
     return api("/residential/urls", { method: "POST", body: JSON.stringify({ url }) }).then(r => {
