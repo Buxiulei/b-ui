@@ -1,0 +1,68 @@
+# B-UI Clash Meta 订阅配置
+# 用户: bob
+# 生成时间: 2026-09-11T14:39:13.406Z
+
+mode: rule
+log-level: warning
+unified-delay: true
+tcp-concurrent: true
+find-process-mode: strict
+global-client-fingerprint: chrome
+
+dns:
+  enable: true
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+    - "*.lan"
+    - "*.local"
+    - "*.localhost"
+    - "example.com"
+  default-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+  nameserver:
+    - https://dns.alidns.com/dns-query
+    - https://doh.pub/dns-query
+  nameserver-policy:
+    "example.com": "223.5.5.5"
+  fallback:
+    - https://8.8.8.8/dns-query
+    - https://1.1.1.1/dns-query
+  fallback-filter:
+    geoip: true
+    geoip-code: CN
+
+proxies:
+  - name: "bob-HY2住宅"
+    type: hysteria2
+    server: example.com
+    port: 40000
+    ports: "41000-50000"
+    hop-interval: 30
+    password: "bob:pw-bob-02"
+    sni: example.com
+    skip-cert-verify: false
+    alpn:
+      - h3
+
+proxy-groups:
+  - name: "住宅自动"
+    type: url-test
+    proxies:
+      - "bob-HY2住宅"
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 50
+
+  - name: "PROXY"
+    type: select
+    proxies:
+      - "住宅自动"
+      - "bob-HY2住宅"
+
+rules:
+  - GEOIP,private,DIRECT,no-resolve
+  - GEOSITE,cn,DIRECT
+  - GEOIP,cn,DIRECT,no-resolve
+  - MATCH,住宅自动
