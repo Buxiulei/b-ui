@@ -85,3 +85,45 @@ fn admin_password_is_hashed_not_stored() {
     assert!(s.admin.password_hash.starts_with("$argon2id$"));
     assert_ne!(s.admin.jwt_secret, "");
 }
+
+/// v3 面板允许小数 GB 限额（`web/index.html` 的 `step="0.1"`，`web/server.js` 落盘
+/// `parseFloat(x) * 1073741824`），users.json 里会出现浮点字节数；导入必须取整，
+/// 不能让一个用户的一个字段把整份导入打挂。
+#[test]
+fn fractional_byte_limits_are_rounded() {
+    let tmp = tempfile::tempdir().unwrap();
+    copy_tree(fixture(), tmp.path());
+    std::fs::write(
+        tmp.path().join("users.json"),
+        r#"[
+ {"username":"erin","password":"pw-erin-05","uuid":"55555555-5555-4555-8555-555555555555","protocol":"fusion","residential":true,"createdAt":"2026-05-05T00:00:00.000Z","limits":{"trafficLimit":107374182.4,"monthlyLimit":536870912.0},"usage":{"total":1024.7,"monthly":{"2026-09":2048.5}}}
+]"#,
+    )
+    .unwrap();
+
+    let s = bui_schema::v3::import(tmp.path()).unwrap().state;
+    let erin = s.users.iter().find(|u| u.username == "erin").unwrap();
+    assert_eq!(
+        erin.entitlements.traffic_limit.total_bytes,
+        Some(107_374_182)
+    );
+    assert_eq!(
+        erin.entitlements.traffic_limit.monthly_bytes,
+        Some(536_870_912)
+    );
+    assert_eq!(erin.usage.total_bytes, 1025);
+    assert_eq!(erin.usage.monthly_bytes, 2049);
+}
+
+fn copy_tree(from: &Path, to: &Path) {
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let dst = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            std::fs::create_dir_all(&dst).unwrap();
+            copy_tree(&entry.path(), &dst);
+        } else {
+            std::fs::copy(entry.path(), &dst).unwrap();
+        }
+    }
+}

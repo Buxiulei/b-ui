@@ -1,6 +1,9 @@
 //! v3 状态导入：把 `/opt/b-ui` 下 v3 的散装配置读成一份 [`State`]（spec §2.3、§4.1）。
 //!
 //! 只读不写：`import` 不碰 v3 文件，也不做卸载动作（卸载在 P1 的 `bui import-v3`）。
+//!
+//! v3 的 `server_ip.txt` 只有 `web/server.js` 读、没人写，真实安装上基本不存在，
+//! 因此 `public_ip` 常常为空并附一条 warning，需要 P1 装机阶段现场探测后回填。
 use crate::model::*;
 use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::{PasswordHasher, SaltString};
@@ -66,7 +69,14 @@ pub fn import(dir: &Path) -> Result<ImportReport, ImportError> {
     // hy2 住宅：配置可缺（老安装还没有住宅实例），缺则用 v3 固定值
     let (hy2_resi, hy2_resi_hop) = match read_optional(dir, "config-residential.yaml")? {
         Some(yaml) => match parse_listen(&yaml) {
-            Some((port, hop)) => (port, hop.unwrap_or(DEFAULT_RESI_HOP)),
+            Some((port, Some(hop))) => (port, hop),
+            Some((port, None)) => {
+                warnings.push(format!(
+                    "config-residential.yaml 的 listen 行没有端口跳跃区间，按 v3 默认值 {}-{} 导入",
+                    DEFAULT_RESI_HOP.0, DEFAULT_RESI_HOP.1
+                ));
+                (port, DEFAULT_RESI_HOP)
+            }
             None => {
                 return Err(ImportError::Invalid(
                     "config-residential.yaml 里没有可解析的 listen: 行".into(),
@@ -110,13 +120,22 @@ pub fn import(dir: &Path) -> Result<ImportReport, ImportError> {
             let v3_resi: V3Residential = serde_json::from_str(&raw)?;
             residential_from_v3(v3_resi)
         }
-        None => Residential::default(),
+        None => {
+            warnings.push(
+                "缺少 residential-proxy.json，住宅上游池按空池导入（住宅出口需要重新配置）".into(),
+            );
+            Residential::default()
+        }
     };
 
     // 订阅用 IP literal 连接，v3 把公网 IP 记在 server_ip.txt；缺则留空由装机阶段现场探测
-    let public_ip = read_optional(dir, "server_ip.txt")?
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
+    let public_ip = match read_optional(dir, "server_ip.txt")? {
+        Some(text) => text.trim().to_string(),
+        None => {
+            warnings.push("缺少 server_ip.txt，公网 IP 留空，需在装机阶段现场探测后回填".into());
+            String::new()
+        }
+    };
 
     let users = v3_users
         .into_iter()
@@ -162,8 +181,10 @@ pub fn import(dir: &Path) -> Result<ImportReport, ImportError> {
 #[derive(Debug, Deserialize)]
 struct V3User {
     username: String,
-    password: String,
-    uuid: String,
+    #[serde(default)]
+    password: Option<String>,
+    #[serde(default)]
+    uuid: Option<String>,
     #[serde(default)]
     protocol: Option<String>,
     #[serde(default)]
@@ -181,17 +202,17 @@ struct V3User {
 struct V3Limits {
     #[serde(default)]
     expires_at: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_bytes_opt")]
     traffic_limit: Option<u64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_bytes_opt")]
     monthly_limit: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct V3Usage {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_bytes")]
     total: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_bytes_map")]
     monthly: BTreeMap<String, u64>,
 }
 
@@ -250,8 +271,20 @@ fn user_from_v3(u: V3User) -> Result<User, ImportError> {
             )))
         }
     };
-    let vless_uuid = Uuid::parse_str(&u.uuid)
+    let uuid_str = u.uuid.filter(|s| !s.is_empty()).ok_or_else(|| {
+        ImportError::Invalid(format!(
+            "用户 {} 缺少 uuid，请先在 v3 面板重建该用户后再导入",
+            u.username
+        ))
+    })?;
+    let vless_uuid = Uuid::parse_str(&uuid_str)
         .map_err(|e| ImportError::Invalid(format!("用户 {} 的 uuid 非法: {}", u.username, e)))?;
+    let hy2_password = u.password.filter(|s| !s.is_empty()).ok_or_else(|| {
+        ImportError::Invalid(format!(
+            "用户 {} 缺少 password，请先在 v3 面板重设该用户密码后再导入",
+            u.username
+        ))
+    })?;
     // v3 的 residential 缺省视为开通（web/server.js 用 `!== false` 判定）
     let residential = (u.residential != Some(false)).then(|| ResidentialEntitlement {
         group_id: DEFAULT_GROUP.to_string(),
@@ -272,7 +305,7 @@ fn user_from_v3(u: V3User) -> Result<User, ImportError> {
         created_at: u.created_at.unwrap_or_else(|| EPOCH.to_string()),
         disabled: false,
         credentials: Credentials {
-            hy2_password: u.password,
+            hy2_password,
             vless_uuid,
         },
         entitlements: Entitlements {
@@ -317,13 +350,17 @@ fn residential_from_v3(r: V3Residential) -> Residential {
             provider: None,
             region: None,
             ports_allowed: None,
-            verified: u.last_verified_ip.map(|ip| Verified {
-                ip,
-                asn: None,
-                org: None,
-                country: None,
-                at: EPOCH.to_string(),
-            }),
+            // v3 helper 在出口 IP 未知时写空串（server.js 语义是 `|| null`）
+            verified: u
+                .last_verified_ip
+                .filter(|ip| !ip.is_empty())
+                .map(|ip| Verified {
+                    ip,
+                    asn: None,
+                    org: None,
+                    country: None,
+                    at: EPOCH.to_string(),
+                }),
         })
         .collect();
 
@@ -424,20 +461,27 @@ fn parse_listen(yaml: &str) -> Option<(u16, Option<(u16, u16)>)> {
             Some(r) => r.trim(),
             None => continue,
         };
-        let rest = rest.strip_prefix(':').unwrap_or(rest);
-        let (port_str, hop) = match rest.split_once(',') {
-            Some((p, h)) => {
-                let (start, end) = h.split_once('-')?;
-                (
-                    p,
-                    Some((start.trim().parse().ok()?, end.trim().parse().ok()?)),
-                )
-            }
-            None => (rest, None),
-        };
-        return Some((port_str.trim().parse().ok()?, hop));
+        if let Some(parsed) = parse_listen_value(rest) {
+            return Some(parsed);
+        }
     }
     None
+}
+
+/// 解析 `listen:` 后面的 `:PORT[,START-END]`；解析不了返回 None（调用方继续找下一行）。
+fn parse_listen_value(value: &str) -> Option<(u16, Option<(u16, u16)>)> {
+    let rest = value.strip_prefix(':').unwrap_or(value);
+    let (port_str, hop) = match rest.split_once(',') {
+        Some((p, h)) => {
+            let (start, end) = h.split_once('-')?;
+            (
+                p,
+                Some((start.trim().parse().ok()?, end.trim().parse().ok()?)),
+            )
+        }
+        None => (rest, None),
+    };
+    Some((port_str.trim().parse().ok()?, hop))
 }
 
 /// 解析 `config.yaml` 顶层 `obfs:` 块（语义同 `web/server.js`：有 `type` 即算启用）。
@@ -452,8 +496,8 @@ fn parse_obfs(yaml: &str) -> Obfs {
         if !in_block {
             continue;
         }
-        // 块结束：回到顶层的非空行
-        if !line.starts_with(' ') && !line.starts_with('\t') && !line.trim().is_empty() {
+        // 块结束：不以缩进开头的行（空行也算结束，同 server.js 的 `((?:[ \t].*\n?)+)`）
+        if !line.starts_with(' ') && !line.starts_with('\t') {
             break;
         }
         let trimmed = line.trim();
@@ -474,6 +518,43 @@ fn parse_env(text: &str) -> BTreeMap<String, String> {
         .filter(|l| !l.trim_start().starts_with('#'))
         .filter_map(|l| l.split_once('='))
         .map(|(k, v)| (k.trim().to_string(), v.trim().trim_matches('"').to_string()))
+        .collect()
+}
+
+// ── 字节数反序列化（容忍 v3 的浮点值）────────────────────────────────
+
+// v3 面板的限额输入是小数 GB（`web/index.html` 的 `step="0.1"`），
+// `web/server.js` 用 `parseFloat(x) * 1073741824` 落盘，于是 users.json 里
+// 会出现 `107374182.4` 这样的浮点字节数；v4 的 State 只存整数字节，
+// 这里统一四舍五入，避免一个用户的一个字段让整份导入失败。
+
+fn number_to_bytes<E: serde::de::Error>(n: &serde_json::Number) -> Result<u64, E> {
+    if let Some(u) = n.as_u64() {
+        return Ok(u);
+    }
+    match n.as_f64() {
+        // 负数与 NaN 一律按 0（v3 面板不会产生，但落盘手改过的文件可能有）
+        Some(f) => Ok(f.round().max(0.0) as u64),
+        None => Err(E::custom(format!("字节数 {} 无法转成整数", n))),
+    }
+}
+
+fn de_bytes<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+    let n = serde_json::Number::deserialize(d)?;
+    number_to_bytes(&n)
+}
+
+fn de_bytes_opt<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    match Option::<serde_json::Number>::deserialize(d)? {
+        Some(n) => number_to_bytes(&n).map(Some),
+        None => Ok(None),
+    }
+}
+
+fn de_bytes_map<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BTreeMap<String, u64>, D::Error> {
+    BTreeMap::<String, serde_json::Number>::deserialize(d)?
+        .into_iter()
+        .map(|(k, n)| number_to_bytes(&n).map(|v| (k, v)))
         .collect()
 }
 
