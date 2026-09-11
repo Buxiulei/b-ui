@@ -36,8 +36,8 @@ pay.google payments.google wallet.google one.google
 grok api.x.ai githubcopilot cursor perplexity mistral cohere huggingface replicate together groq statsig featuregates
 # 住宅 IP 检测站
 ippure ipquery ipinfo ip-api ping0 ip.sb browserleaks whoer ipleak scamalytics ipqualityscore ip2location iplocation whatismyipaddress ipdata ipapi ipregistry ip.skk.moe ping.pe
-# ippure.com 网页的后端域（2026-09-11 抓包：签名 API 在 api.123169.xyz，辅助 myip.ipip.net / cf.999831.xyz；经 Bright Data 放行）
-123169 ipip.net 999831
+# ippure.com 网页的后端域（2026-09-11 抓包：签名 API api.123169.xyz、辅助 myip.ipip.net / cf.999831.xyz；带前缀避免裸数字子串误伤；经 Bright Data 放行）
+api.123169 ipip.net cf.999831
 # 既有
 tiktok
 ```
