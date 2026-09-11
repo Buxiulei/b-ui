@@ -74,17 +74,36 @@ curl_proxy_cfg() {
     return 0
 }
 
+# v3.6.1 R11: 默认分流关键字表（唯一真源；domains == null 的服务器实时跟随这里）。
+# 2026-09-11 经 Bright Data ISP zone HTTP 44445 逐域实测：
+#   放行 → OpenAI / Anthropic / Gemini 全家 + 谷歌账号与支付 + 主流住宅 IP 检测站（下表）
+#   被拒 → www.google.com（policy_20110 搜索）、Stripe / PayPal（policy_20050 支付处理商）、
+#          tiktok（policy_20050，但非 AI、既有用户依赖，保留在表里，住宅用户可在面板删掉）
+# 关键字是 sing-box domain_keyword / Clash DOMAIN-KEYWORD 的**子串**语义，所以：
+#   不写裸 google（会把被拒的 www.google.com 也送进住宅腿），改按子域枚举；
+#   不写裸 x.ai（子串会误伤大量域名），用 api.x.ai；
+#   不写裸 oai（过宽），用 oaistatic + oaiusercontent。
+# 支付处理商故意不进表：进表反而让 ChatGPT Plus / Claude Pro 的付款页打不开（详见 docs 第 10 节）。
 DEFAULT_DOMAINS=(
-    "openai" "chatgpt" "oai" "oaistatic"
+    # OpenAI
+    "openai" "chatgpt" "oaistatic" "oaiusercontent" "sora.com"
+    # Anthropic
     "anthropic" "claude"
-    "aistudio" "generativelanguage" "makersuite"
-    "grok" "githubcopilot" "cursor" "perplexity"
-    "mistral" "cohere" "huggingface" "replicate" "together" "groq"
-    "statsig" "featuregates"
-    "ping0" "ip.sb" "ip-api"
+    # Google AI + 账号 + 支付（不含裸 google）
+    "gemini.google" "aistudio" "generativelanguage" "makersuite" "notebooklm" "jules.google"
+    "labs.google" "antigravity" "idx.google" "ai.google.dev" "deepmind" "cloudcode"
+    "googleapis" "gstatic" "googleusercontent" "clients6.google"
+    "accounts.google" "myaccount.google" "apis.google" "ogs.google"
+    "pay.google" "payments.google" "wallet.google" "one.google"
+    # 其它 AI
+    "grok" "api.x.ai" "githubcopilot" "cursor" "perplexity" "mistral" "cohere"
+    "huggingface" "replicate" "together" "groq" "statsig" "featuregates"
+    # 住宅 IP 检测站（面板体检与用户自查都得经住宅腿才准）
+    "ippure" "ipquery" "ipinfo" "ip-api" "ping0" "ip.sb" "browserleaks" "whoer" "ipleak"
+    "scamalytics" "ipqualityscore" "ip2location" "iplocation" "whatismyipaddress"
+    "ipdata" "ipapi" "ipregistry" "ip.skk.moe" "ping.pe"
+    # 既有（非 AI）
     "tiktok"
-    "cloudcode" "antigravity"
-    "gstatic" "ggpht" "googleapis" "googleusercontent"
 )
 
 LEGACY_DEFAULT_DOMAINS_V3_4_17=(

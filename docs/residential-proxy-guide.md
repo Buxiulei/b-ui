@@ -268,3 +268,50 @@ B-UI 是端到端 TLS、**不会**装第三方 CA，所以这种 zone 上会直�
 
 面板添加失败且报"两种协议都连不上"时，先看这条：住宅 zone 上 443 探测**必然**失败，
 和凭据对不对无关。
+
+---
+
+## 10. 默认分流表：哪些域名走住宅，哪三类故意不走
+
+默认表只有一处真源：`server/residential-helper.sh` 的 `DEFAULT_DOMAINS`（`residential-proxy.json`
+里 `domains` 为 `null` 的服务器实时跟随它，升级即生效；面板上改过关键字的服务器需要点一次
+「恢复默认」才会跟上）。v3.6.1 起共 **64 条**，按组：
+
+| 组 | 关键字 |
+|---|---|
+| OpenAI | `openai` `chatgpt` `oaistatic` `oaiusercontent` `sora.com` |
+| Anthropic | `anthropic` `claude` |
+| Google AI | `gemini.google` `aistudio` `generativelanguage` `makersuite` `notebooklm` `jules.google` `labs.google` `antigravity` `idx.google` `ai.google.dev` `deepmind` `cloudcode` |
+| Google 基础设施 | `googleapis` `gstatic` `googleusercontent` `clients6.google` |
+| Google 账号 | `accounts.google` `myaccount.google` `apis.google` `ogs.google` |
+| Google 支付 | `pay.google` `payments.google` `wallet.google` `one.google` |
+| 其它 AI | `grok` `api.x.ai` `githubcopilot` `cursor` `perplexity` `mistral` `cohere` `huggingface` `replicate` `together` `groq` `statsig` `featuregates` |
+| 住宅 IP 检测站 | `ippure` `ipquery` `ipinfo` `ip-api` `ping0` `ip.sb` `browserleaks` `whoer` `ipleak` `scamalytics` `ipqualityscore` `ip2location` `iplocation` `whatismyipaddress` `ipdata` `ipapi` `ipregistry` `ip.skk.moe` `ping.pe` |
+| 既有（非 AI） | `tiktok` |
+
+关键字是 **子串** 匹配（sing-box `domain_keyword` / Clash `DOMAIN-KEYWORD`），所以表里刻意
+不写裸 `google`（否则会把下面第一类也送进住宅腿）、不写裸 `x.ai`（会误伤大量域名）、
+不写裸 `oai`（过宽，改用 `oaistatic` + `oaiusercontent`）。
+检测站进表的理由：面板体检和你自己开网页查 IP，都必须经住宅腿出去才看得到真实出口画像。
+
+### Bright Data 拒绝的三类（2026-09-11 逐域实测）
+
+经 Bright Data ISP zone 逐域探测，下面三类会被**供应商**按策略拒绝，不是 B-UI 配错：
+
+| 类别 | 域名 | 供应商返回 |
+|---|---|---|
+| 搜索引擎 | `www.google.com` | `policy_20110` |
+| 支付处理商 | `checkout/js/api/m.stripe.com`、`www.paypal.com` | `policy_20050` |
+| 短视频 | `tiktok.com` | `policy_20050` |
+
+因此：
+
+- **搜索**：默认表按子域枚举谷歌，裸 `google` 不进表，`www.google.com` 继续从 VPS 直出。
+- **支付处理商**：Stripe / PayPal **故意不进表**。进表等于把 ChatGPT Plus / Claude Pro 的付款页
+  送进一条会被拒的线路，付款直接打不开；让它们从 VPS 直出反而是对的。
+  谷歌自家的支付域（`pay/payments/wallet/one.google`、`payments-pa.clients6.google`）实测放行，所以进表。
+- **TikTok**：保留在默认表（非 AI，但既有用户依赖）。**用 Bright Data 的话它会被拒**——
+  在面板「分流域名设置」里删掉 `tiktok` 即可，删掉后它走 VPS 直出。
+
+同理，如果你的供应商拒绝表里的其它域名，面板改关键字就行，不用等版本更新；改过之后这台
+服务器就不再跟随默认表，后续默认表扩充要自己点「恢复默认」再补上自定义项。
