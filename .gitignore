@@ -11,3 +11,6 @@ packages/
 .DS_Store
 *.swp
 *.swo
+
+# Rust 构建产物
+target/

@@ -1,0 +1,9 @@
+[package]
+name = "bui"
+version = "4.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+bui-schema = { path = "../bui-schema" }
