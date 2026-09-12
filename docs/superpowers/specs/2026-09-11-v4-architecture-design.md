@@ -254,6 +254,24 @@ tonic 客户端，proto 从 Xray-core `v26.3.27` vendor 进仓（以仓库根为
 
 ---
 
+### 5.6 IP 池与槽位（2026-09-13 主理人裁决：不按用户绑定，用 IP 池；用户数 > IP 数）
+
+**语义**：池内每个上游 IP 是一个**槽位**（slot，键为上游 uuid）。用户按槽位分配，**多个用户共用一个 IP**；同一用户稳定走同一个 IP（粘性）。所有 IP 同时在用，不再「一主两备」。
+
+**槽位资源**（持久化在 `state.residential.slots[]`，增删上游时分配/释放，取最小空闲序号 i）：
+- 中继入口：sing-box 每槽一个 socks 入站 `127.0.0.1:(2080+i)`；路由 `inbound = slot-i ⇒ selector slot-i-pool`，成员顺序 = [本槽 IP, 其余 IP…]。巡检按槽驱动 selector：本槽 IP 健康且 Google 通 ⇒ 用本槽；否则临时借用排名最高的其他健康 IP，本槽恢复（连续 3 轮）后切回。UDP、测速、黑名单、`ports_allowed` 按上游不变。
+- HY2 住宅：每槽一个 Hysteria 实例 `hysteria-residential-<i>.service`（配置 `config-residential-<i>.yaml`），监听 `:(40000+i)`，跳跃区间把 41000–50000 按槽数等分连续切片；出站 socks5 `127.0.0.1:(2080+i)`；鉴权钩子、流量采样、看门狗同原实例。槽 0 保持今天的 40000 与 `hysteria-residential.service` 名字兼容。
+- REALITY 住宅：入站 `:10002` 不变；Xray 路由规则按用户 email 分到 `relay-slot-<i>` 出站（socks `127.0.0.1:(2080+i)`），未分配的用户走槽 0。
+- 防火墙：放行 `40000..40000+N-1/udp` 与 `41000–50000/udp`。
+
+**分配规则**（`user.residential.slot_id: Option<Uuid>`）：
+1. 新建用户：分到**用户数最少**的槽，平手取序号最小（确定性）。
+2. 删除上游（IP 更换）：该槽用户按规则 1 逐个重新分配；新增上游不自动搬动既有用户（避免抖动），只承接之后的新用户与 `rebalance`。
+3. `bui residential rebalance`（与面板按钮）：把用户在各槽均匀重排（按创建时间稳定排序，尽量少动）；`bui residential assign <user> <slot|upstream>` 手动指定。
+4. 升级迁移：已有用户按创建时间顺序轮流落槽（如 5 人 3 IP ⇒ 2/2/1）；非槽 0 的用户住宅 HY2 端口会变，需刷新一次订阅（主理人已接受）。
+
+**订阅**：住宅 HY2 节点用该用户槽位的端口与跳跃区间；REALITY 住宅节点不变；直连节点不变。**展示**：`bui residential status/health` 与面板按槽列出 IP、当前实际出口（本槽/借用自 X）、用户数与用户名、指标；用户列表显示其槽位/IP。**不做**：连接级轮询多 IP（风控）。
+
 ## 6. Linux 客户端 `bui-c`（§⑤）
 
 - 静态二进制（x86_64 / aarch64），`/opt/bui-c/{bin/sing-box, profiles.json, config.json}`，三个单元：`bui-c.service`（`sing-box run -c /opt/bui-c/config.json`，`Restart=always`，唯一数据面进程）、`bui-c-check.service`（`Type=oneshot`，`ExecStart=bui-c check`）、`bui-c.timer`（每分钟触发 `bui-c-check.service`；timer 不能直接指向 sing-box 单元，否则每分钟重新激活引擎）。
