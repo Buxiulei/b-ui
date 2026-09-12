@@ -217,7 +217,7 @@ loopback 一跳的实测量级是微秒级（调研报告 §1.9），**不是延
 | 模板单元 hysteria-server@/xray@ | 存在、从未激活 | 同 |
 | relay 配置 | selector | selector（**直到 2026-09-11 06:56 UTC 才换上**） |
 | sshd | :22 | 非标准高位端口，直连被掐，需 `-J bwg-rick` |
-| 无关负载 | cron 每分钟 `nbdpsy-keepalive.sh`（其它项目） | — |
+| 无关负载 | cron 每分钟一个其它项目的 keepalive 脚本 | — |
 
 结论：两台机数据面一致且健康；差异全部来自「增量迁移随机器寿命退化」——bwg-tizi 的每一处漂移（watchdog 版本、debug drop-in、残留文件、cron 指向不存在的脚本）都是 update.sh 只补不收的结果。这直接支持已定的「v4 两台机重装」。
 
