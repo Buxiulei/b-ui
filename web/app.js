@@ -58,7 +58,6 @@ function login() {
             if (d.token) {
                 tok = d.token;
                 localStorage.setItem("t", tok);
-                localStorage.setItem("ap", pw);
                 init();
             } else {
                 toast("登录认证失败", 1);
@@ -187,15 +186,22 @@ function addUser() {
     const customSni = $("#nsni-custom")?.value || $("#nsni")?.value || "";
     const residential = $("#nresi")?.checked !== false; // 默认 true
 
-    let url = "/api/manage?key=" + encodeURIComponent(cfg.adminPass || localStorage.getItem("ap") || "") +
-        "&action=create&user=" + encodeURIComponent(u) +
-        (p ? "&pass=" + encodeURIComponent(p) : "") +
-        "&days=" + d + "&traffic=" + t + "&monthly=" + m + "&speed=" + s + "&protocol=" + proto +
-        "&residential=" + (residential ? "true" : "false");
-
-    if (customSni) url += "&sni=" + encodeURIComponent(customSni);
-
-    fetch(url).then(r => r.json()).then(r => {
+    // v4：创建用户改为 JWT 保护的 POST /api/users（spec §4.3 改动 1）。
+    // sni 与 speed 服务端会接受但忽略（v4 的 SNI 全局唯一、内核不支持按用户限速）。
+    api("/users", {
+        method: "POST",
+        body: JSON.stringify({
+            username: u,
+            password: p || undefined,
+            days: parseFloat(d),
+            traffic: parseFloat(t),
+            monthly: parseFloat(m),
+            protocol: proto,
+            residential: residential,
+            sni: customSni || undefined,
+            speed: parseFloat(s)
+        })
+    }).then(r => {
         if (r.success) {
             closeM();
             toast("用户 " + u + " 已创建");
