@@ -659,6 +659,47 @@ mod tests {
     }
 
     #[test]
+    fn second_pass_is_clean_even_when_the_kernel_clamps_a_multi_value_sysctl() {
+        // bwg-rick 真机 M1 step2 的两种成因都在这里兜住：多值键读回制表符（FakeHost 默认行为）
+        // 与内核钳制（`sysctl_clamp`）—— 两轮之后 changed 必须为空。
+        let host = ready_host();
+        host.with(|i| {
+            i.sysctl_clamp
+                .insert("net.ipv4.udp_mem".into(), "8192\t524288\t1048576".into());
+        });
+        let state = crate::testutil::sample_state();
+        let paths = bui_schema::paths::Paths::default_server();
+        let reg = modules(None);
+        let (first, keys) = reconcile_once(
+            input(
+                &state,
+                &reg.modules,
+                &paths,
+                &BTreeMap::new(),
+                &NoopInstaller,
+            ),
+            host.as_ref(),
+        )
+        .unwrap();
+        assert!(first.changed.iter().any(|c| c == "net.ipv4.tcp_rmem"));
+        assert!(
+            first.notes.iter().any(|n| n.contains("net.ipv4.udp_mem")),
+            "被钳制的键要留一条提示：{:?}",
+            first.notes
+        );
+        let (second, _) = reconcile_once(
+            input(&state, &reg.modules, &paths, &keys, &NoopInstaller),
+            host.as_ref(),
+        )
+        .unwrap();
+        assert!(
+            second.is_clean(),
+            "多值键的制表符与内核钳制都不该让二次对账有改动：{:?}",
+            second.changed
+        );
+    }
+
+    #[test]
     fn a_hand_edited_config_is_rewritten_and_only_its_unit_restarts() {
         let host = ready_host();
         let state = crate::testutil::sample_state();

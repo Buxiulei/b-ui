@@ -245,7 +245,33 @@ pub fn apply(input: ApplyInput<'_>, host: &dyn Host) -> ApplyOutcome {
             continue;
         };
         match host.sysctl_set(key, value) {
-            Ok(()) => out.changed.push(key.clone()),
+            Ok(()) => {
+                out.changed.push(key.clone());
+                // 立刻读回：内核可能钳制或重排多值键（如把 `tcp_rmem` 的最小值抬到一个页）。
+                // 不把读回值记成已生效值的话，下一轮 diff 又报一条 changed，「二次对账零变更」
+                // 永远不成立（bwg-rick 真机 M1 step2）。
+                if let Ok(Some(actual)) = host.sysctl_get(key) {
+                    if !super::sysctl_tokens_eq(&actual, value) {
+                        tracing::warn!(
+                            key = %key,
+                            want = %value,
+                            got = %actual,
+                            "sysctl 值被内核钳制/重排，以读回值为准"
+                        );
+                        out.notes.push(format!(
+                            "sysctl {key} 写入 {value}，内核实际生效 {}（已按实际值记账）",
+                            actual
+                                .split_ascii_whitespace()
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        ));
+                        out.keys.insert(
+                            format!("sysctl:{key}"),
+                            super::sysctl_clamped_record(value, &actual),
+                        );
+                    }
+                }
+            }
             Err(e) => out.errors.push(format!("sysctl {key}={value} 失败：{e}")),
         }
     }
@@ -887,6 +913,53 @@ mod tests {
                 "nf_conntrack".to_string(),
                 "net.netfilter.nf_conntrack_max".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn a_clamped_sysctl_is_recorded_as_effective_with_one_note() {
+        // 内核把写入值钳制/重排了（这里用假机器的 `sysctl_clamp` 模拟）：apply 立刻读回、
+        // 把「写入值 → 读回值」记进 keys 并留一条提示，下一轮 diff 才不会再报 changed。
+        let h = FakeHost::new();
+        h.with(|i| {
+            i.sysctl_clamp
+                .insert("net.ipv4.udp_mem".into(), "8192\t524288\t1048576".into());
+        });
+        let plan = Plan {
+            changes: vec![
+                Change::SetSysctl {
+                    key: "net.ipv4.udp_mem".into(),
+                    value: "262144 524288 1048576".into(),
+                },
+                Change::SetSysctl {
+                    key: "net.ipv4.tcp_rmem".into(),
+                    value: "4096 262144 16777216".into(),
+                },
+            ],
+            keys: Default::default(),
+            unchanged: 0,
+        };
+        let out = run(plan, &h, &NoopInstaller);
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(
+            out.keys.get("sysctl:net.ipv4.udp_mem").map(String::as_str),
+            Some(super::super::sysctl_clamped_record(
+                "262144 524288 1048576",
+                "8192\t524288\t1048576"
+            ))
+            .as_deref()
+        );
+        assert!(
+            !out.keys.contains_key("sysctl:net.ipv4.tcp_rmem"),
+            "没被钳制的键不记账（读回值与写入值只差制表符）：{:?}",
+            out.keys
+        );
+        assert_eq!(out.notes.len(), 1, "{:?}", out.notes);
+        assert!(
+            out.notes[0].contains("net.ipv4.udp_mem")
+                && out.notes[0].contains("8192 524288 1048576"),
+            "{:?}",
+            out.notes
         );
     }
 
