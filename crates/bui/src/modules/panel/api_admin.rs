@@ -141,6 +141,7 @@ async fn create_user(State(app): State<AppState>, body: Bytes) -> Response {
     };
     let mut dup = false;
     let to_push = user.clone();
+    let uid = to_push.user_id;
     if let Err(e) = app
         .store
         .update(|s| {
@@ -149,6 +150,8 @@ async fn create_user(State(app): State<AppState>, body: Bytes) -> Response {
                 return;
             }
             s.users.push(to_push);
+            // spec §5.6 规则 1：新建用户分到用户数最少的槽，与 push 同一次写盘
+            crate::modules::residential::slots::assign_new_user(s, uid);
         })
         .await
     {

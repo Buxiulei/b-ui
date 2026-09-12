@@ -30,6 +30,16 @@ pub struct ResiRuntime {
     /// 不按 priority / Google 排序把它切走（R2 ①）。它变不健康时由巡检清空并自动切换；
     /// `POST /api/residential/select {"auto":true}` 也能主动解锁
     pub manual_selected_id: Option<Uuid>,
+    /// 每个槽位的运行时状态，键 = 槽序号的十进制串（spec §5.6）
+    pub slots: BTreeMap<String, SlotRuntime>,
+    /// 渲染出的 Xray 槽路由与 xray 进程里正在跑的那一份**可能**已经不一致（D7）。
+    /// 由用户增删 / 改分槽 / `rebalance` / 删上游后的重分配置位，由
+    /// `slots::converge_xray`（T4）收敛成功（gRPC 增删，或退回一次重启）后清掉。
+    pub xray_slot_rules_dirty: bool,
+    /// 最近一次**成功收敛**时那份槽路由的 `slot_rules_hash`（D7 第 2–4 步）。
+    /// `converge_xray` 拿它做快速判等：脏了但哈希没变 ⇒ 清脏、不动 xray。
+    /// 真正的差分真源是 `ListRule()` 读回来的那张表，不是这个字段。
+    pub xray_slot_rules_hash: Option<String>,
     pub last_switch_at: Option<String>,
     /// `state.selected_upstream_id` 与 `selected_upstream_id` 已漂移，等下一个 04:00 窗口写回
     pub selected_pending_persist: bool,
@@ -64,6 +74,26 @@ pub struct ResiRuntime {
     /// 候选一换就归零 —— 三条上游轮流各赢一轮不该凑成 3 轮
     pub improve_candidate_id: Option<Uuid>,
     pub improve_rounds: u32,
+}
+
+/// 一个槽位的运行时状态（spec §5.6「巡检按槽驱动 selector」）。
+/// 键是**槽序号的十进制串**（与 `health` 用 uuid 串同风格：`runtime.json` 的 map 键只能是串）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SlotRuntime {
+    /// 该槽的 selector 当前指向哪条上游（`None` = 还没驱动过 / 刚被清零）。
+    /// 与本槽自己的 IP 不同 ⇒ 正在**借用**别人的出口。
+    ///
+    /// 两处会把它清成 `None`：relay 重启（`health::replay_loop`，T5）、解除 pin
+    /// （`slots::pin_slot(.., None)`，T5）。清零的语义都是「下一轮 `drive_slots`
+    /// 无条件按本槽优先重 PUT 一次」，而不是「正在借用」——所以解除 pin 不会被防抖
+    /// 卡住 3 轮。
+    pub current_upstream_id: Option<Uuid>,
+    /// 管理员把这一槽**钉**在某条上游上（`POST /api/residential/slots/pin`）：
+    /// 驱动器不再按「本槽优先 / 借用」把它挪走。
+    pub pinned_upstream_id: Option<Uuid>,
+    /// 借用期间「本槽自己已经连续健康了几轮」，攒满 `SLOT_BACK_ROUNDS` 才切回。
+    pub back_rounds: u32,
 }
 
 /// 单个上游的健康状态。**容器级** `#[serde(default)]`：缺字段时走 [`HealthState::default`]，

@@ -144,10 +144,20 @@ fn default_true() -> bool {
     true
 }
 
-/// 住宅权益：指向某个住宅分组。
+/// 住宅权益：指向某个住宅分组，以及该用户粘住的 IP 槽位。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ResidentialEntitlement {
     pub group_id: String,
+    /// 该用户粘住的槽位键 = 上游 uuid（spec §5.6「槽，键为上游 uuid」）。
+    /// `None` = 还没分配（升级迁移前的老用户、或池为空），出口走兜底槽。
+    /// **不存槽序号**：序号会在删上游时被回收复用，存序号等于把用户绑到「第 i 个位置」
+    /// 而不是「那个 IP」，换一条上游进来就悄悄换了人家的出口。
+    ///
+    /// `skip_serializing_if`（D10）：没分过槽就一个字节都不进 `state.json` —— 与同文件
+    /// 三个 `speedtest_*` 同风格，也让 `tests::state_round_trips` 的 `to_value(&s) == SAMPLE`
+    /// 继续成立。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot_id: Option<Uuid>,
 }
 
 /// 流量上限（`None` = 不限）。
@@ -228,6 +238,15 @@ pub enum OrderStatus {
 pub struct Residential {
     #[serde(default)]
     pub groups: BTreeMap<String, ResidentialGroup>,
+    /// IP 池的槽位表（spec §5.6）。**跨版本可缺**：旧 `state.json` 没有这个字段时
+    /// default 成空表，由 `bui` 启动时的一次迁移补齐（`migrate_on_start`）。
+    ///
+    /// `skip_serializing_if`（D10）：空表不落盘 —— 既让 `tests::state_round_trips`
+    /// 的 `to_value(&s) == SAMPLE` 继续成立（`SAMPLE` 里没有这个字段，**不许改它**），
+    /// 也让单槽 / 空池的机器升级后 `state.json` 一个字节都不变，`Store::update_as`
+    /// 的零变更比对不会空写一次盘。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slots: Vec<Slot>,
     /// 巡检测速的用量与周期覆盖（`None` = 用代码里的默认 4MB / 1MB / 60 分钟）。
     /// **`skip_serializing_if`**：不设就一个字节都不进 `state.json` —— 这三项是给
     /// 「流量吃紧想调小」的运维留的旋钮，不该让每台机器的 state 都多三个 null。
@@ -245,6 +264,7 @@ impl Default for Residential {
         groups.insert(DEFAULT_GROUP.to_string(), ResidentialGroup::default());
         Self {
             groups,
+            slots: Vec::new(),
             speedtest_down_bytes: None,
             speedtest_up_bytes: None,
             speedtest_interval_mins: None,
@@ -333,6 +353,15 @@ pub struct Upstream {
 
 fn default_priority() -> u32 {
     100
+}
+
+/// 一个 IP 槽位（spec §5.6）：池内每个上游 IP 占一个槽，多个用户共用一个槽。
+/// `index` 决定该槽的全部端口（见 [`crate::slots`]），在增删上游时分配 / 释放，
+/// 取 `0..MAX_SLOTS` 里的最小空闲值。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Slot {
+    pub index: u16,
+    pub upstream_id: Uuid,
 }
 
 /// 上游协议类型。
@@ -526,5 +555,54 @@ mod tests {
         assert!(s.residential.groups.contains_key("default"));
         assert_eq!(s.residential.groups["default"].mode, ResiMode::Split);
         assert!(s.system.static_dns);
+    }
+
+    #[test]
+    fn slots_and_user_slot_id_round_trip() {
+        let s: State = serde_json::from_str(SAMPLE).expect("parse");
+        // 旧 state 没有 slots / slot_id：必须 default 出来而不是解析失败
+        assert!(s.residential.slots.is_empty());
+        assert_eq!(
+            s.users[0]
+                .entitlements
+                .residential
+                .as_ref()
+                .unwrap()
+                .slot_id,
+            None
+        );
+        // D10：空槽位 / 未分配一个字节都不进 `state.json`。既有的
+        // `state_round_trips` 断言 `to_value(&s) == SAMPLE`，多出 `"slots": []`
+        // 或 `"slot_id": null` 就会红 —— 这两条是那条测试的前哨。
+        let plain = serde_json::to_value(&s).unwrap();
+        assert!(plain["residential"].get("slots").is_none());
+        assert!(plain["users"][0]["entitlements"]["residential"]
+            .get("slot_id")
+            .is_none());
+
+        let up = s.residential.groups["default"].upstreams[0].id;
+        let mut s2 = s.clone();
+        s2.residential.slots = vec![Slot {
+            index: 0,
+            upstream_id: up,
+        }];
+        s2.users[0]
+            .entitlements
+            .residential
+            .as_mut()
+            .unwrap()
+            .slot_id = Some(up);
+        let json = serde_json::to_value(&s2).unwrap();
+        assert_eq!(json["residential"]["slots"][0]["index"], 0);
+        assert_eq!(
+            json["residential"]["slots"][0]["upstream_id"],
+            up.to_string()
+        );
+        assert_eq!(
+            json["users"][0]["entitlements"]["residential"]["slot_id"],
+            up.to_string()
+        );
+        let back: State = serde_json::from_value(json).unwrap();
+        assert_eq!(back, s2);
     }
 }

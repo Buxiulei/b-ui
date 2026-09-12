@@ -190,6 +190,8 @@ pub fn new_user(req: &CreateRequest, now: OffsetDateTime) -> Result<User, String
             direct: true,
             residential: residential.then(|| ResidentialEntitlement {
                 group_id: DEFAULT_GROUP.to_string(),
+                // 分槽在 `create_user` 的那一次 `store.update` 里做（spec §5.6 规则 1）
+                slot_id: None,
             }),
             expires_at: expires_from_days(req.days, now),
             traffic_limit: TrafficLimit {

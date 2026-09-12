@@ -27,6 +27,13 @@
 //! - [`nodes::nodes_for`]：按用户权限展开该用户可见的节点集合，返回
 //!   [`Node`](nodes::Node)（[`NodeKind`](nodes::NodeKind) / [`Transport`](nodes::Transport)）。
 //!
+//! ## IP 池与槽位 —— [`slots`]
+//!
+//! - [`slots::SlotRes`]：一个槽位的全部端口（relay 入站 / HY2 监听 / trafficStats / 跳跃区间），
+//!   由 [`slots::resources_of`] 从 [`Ports`](model::Ports) 与槽序号纯函数算出。
+//! - [`slots::sync_slots`] / [`slots::least_loaded`] / [`slots::assign`] /
+//!   [`slots::migrate_unassigned`] / [`slots::rebalance`]：spec §5.6 的分配规则，纯函数。
+//!
 //! ## 解析器 —— [`parse`]
 //!
 //! - [`parse::upstream_url`]：把住宅上游的四种粘贴写法归一成 [`UpstreamInput`](parse::UpstreamInput)。
@@ -85,6 +92,7 @@ pub mod nodes;
 pub mod parse;
 pub mod paths;
 pub mod render;
+pub mod slots;
 pub mod v3;
 
 pub use model::State;

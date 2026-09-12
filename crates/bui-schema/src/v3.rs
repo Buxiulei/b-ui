@@ -288,6 +288,8 @@ fn user_from_v3(u: V3User) -> Result<User, ImportError> {
     // v3 的 residential 缺省视为开通（web/server.js 用 `!== false` 判定）
     let residential = (u.residential != Some(false)).then(|| ResidentialEntitlement {
         group_id: DEFAULT_GROUP.to_string(),
+        // 导入时还没有槽位表，由守护进程启动时的迁移补齐（spec §5.6 规则 4）
+        slot_id: None,
     });
     // 取字典序最大的月份键，即导入时最近的一个月
     let (month_key, monthly_bytes) = u
