@@ -223,3 +223,71 @@ fn disabled_pool_emits_no_keyword_rules() {
     let yaml = subscription::clash(&nodes, "alice", &split);
     assert!(!yaml.contains("DOMAIN-KEYWORD"));
 }
+
+/// 多槽时三种订阅里的 HY2 住宅端口/跳跃区间都跟着用户的槽位走，
+/// 其余节点与 golden 逐字相同。
+#[test]
+fn multi_slot_moves_only_the_residential_hy2_endpoint() {
+    let mut s = common::state("global");
+    // fixture 自带 2 条上游，补到 3 条并按创建时间轮流落槽
+    let g = s.residential.groups.get_mut("default").unwrap();
+    let mut third = g.upstreams[0].clone();
+    third.id = uuid::Uuid::from_u128(0xdead);
+    third.host = "isp3.example.net".into();
+    g.upstreams.push(third);
+    bui_schema::slots::sync_slots(&mut s.residential);
+    bui_schema::slots::migrate_unassigned(&mut s);
+    assert_eq!(bui_schema::slots::slot_span(&s.residential), 3);
+
+    let split = split_of(&s);
+    for u in USERS {
+        let Some(user) = s.users.iter().find(|x| x.username == u) else {
+            continue;
+        };
+        let idx = bui_schema::slots::index_of_user(user, &s.residential);
+        let res = bui_schema::slots::resources_of(&s.node.ports, &s.residential, idx);
+        let nodes = nodes_of(&s, u);
+        let Some(resi) = nodes
+            .iter()
+            .find(|n| n.kind == bui_schema::nodes::NodeKind::Hy2Residential)
+        else {
+            continue; // 没有住宅权益的用户
+        };
+        assert_eq!(resi.port, res.hy2_port, "user={u}");
+        assert_eq!(resi.hop, Some(res.hop), "user={u}");
+
+        // URI 列表里出现的就是这一槽的端口与 mport
+        let text = String::from_utf8(
+            base64::engine::general_purpose::STANDARD
+                .decode(subscription::uri_list(&nodes, u).trim())
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            text.contains(&format!(":{}?", res.hy2_port)),
+            "user={u} 的 URI 里没有槽位端口 {}：\n{text}",
+            res.hy2_port
+        );
+        assert!(
+            text.contains(&format!("mport={}-{}", res.hop.0, res.hop.1)),
+            "user={u}"
+        );
+
+        // sing-box / clash 同源，且必须仍然过 check
+        let sb = subscription::singbox(&nodes, &split, &s.node.public_ip);
+        let out = sb["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["tag"] == "hy2-residential")
+            .unwrap()
+            .clone();
+        assert_eq!(out["server_port"], res.hy2_port, "user={u}");
+        common::check_singbox_all(&sb);
+        let yaml = subscription::clash(&nodes, u, &split);
+        assert!(
+            yaml.contains(&format!("port: {}", res.hy2_port)),
+            "user={u} 的 clash YAML 里没有槽位端口"
+        );
+    }
+}

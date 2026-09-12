@@ -159,6 +159,13 @@ function load() {
             return '<tr>' +
                 '<td><div style="display:flex;align-items:center;gap:8px"><span style="font-weight:600">' + esc(x.username) + '</span>' + ptag + badge + '</div></td>' +
                 '<td><span class="tag ' + (on ? 'on' : '') + ' ">' + (on ? on + ' 在线' : '离线') + '</span></td>' +
+                // v4 P3（spec §5.6）：这个用户走哪个住宅 IP。没有住宅权益就打「—」。
+                '<td class="hide-m" style="font-family:monospace;color:var(--text-dim)">' +
+                (x.slot == null ? '—' :
+                    '<span title="' + esc('HY2 住宅 :' + x.slotPort +
+                        (Array.isArray(x.slotHop) ? ' + ' + x.slotHop[0] + '-' + x.slotHop[1] : '')) + '">#' +
+                    x.slot + (x.slotIp ? ' ' + esc(x.slotIp) : '') + '</span>') +
+                '</td>' +
                 '<td class="hide-m" style="font-family:monospace;color:var(--text-dim)">' + sz(monthly) + '</td>' +
                 '<td class="hide-m" style="font-family:monospace;color:var(--text-dim)">' + sz(total) + (tlim ? ' / ' + sz(tlim) : '') + '</td>' +
                 '<td>' +
@@ -332,10 +339,12 @@ function genUri(x) {
     // 分段 encode（与 /api/sub 一致：整串编码会把 : 变成 %3A，客户端拆不出 user/pass）
     const auth = encodeURIComponent(x.username) + ":" + encodeURIComponent(x.password);
 
-    // 住宅版固定 :40000 + 41000-50000 内建跳跃；直连版用真实 listen 端口与跳跃区间
-    const port = includeResi ? 40000 : (cfg.port || 10000);
+    // 住宅版端口与跳跃区间由后端按用户槽位下发（spec §5.6）；
+    // 老后端没有这两个字段时退回 v3 的单槽值，链接与那时的订阅一致。
+    const port = includeResi ? (x.slotPort || 40000) : (cfg.port || 10000);
+    const resiHop = Array.isArray(x.slotHop) ? x.slotHop[0] + "-" + x.slotHop[1] : "41000-50000";
     const hopRange = includeResi
-        ? "41000-50000"
+        ? resiHop
         : (cfg.portHopping && cfg.portHopping.enabled ? cfg.portHopping.start + "-" + cfg.portHopping.end : null);
 
     // 查询参数构建（顺序与 /api/sub 的 buildHy2Url 一致）
