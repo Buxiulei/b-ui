@@ -272,6 +272,21 @@ tonic 客户端，proto 从 Xray-core `v26.3.27` vendor 进仓（以仓库根为
 
 **订阅**：住宅 HY2 节点用该用户槽位的端口与跳跃区间；REALITY 住宅节点不变；直连节点不变。**展示**：`bui residential status/health` 与面板按槽列出 IP、当前实际出口（本槽/借用自 X）、用户数与用户名、指标；用户列表显示其槽位/IP。**不做**：连接级轮询多 IP（风控）。
 
+### 5.7 日志哨兵与预案（2026-09-13 主理人要求：监听后台日志，出错立即处置）
+
+**哨兵**：守护进程内一个任务 `journal follow` 四个单元（b-ui-relay / hysteria-server / hysteria-residential-* / xray，caddy 只看证书类错误），按签名表匹配并触发动作；每类签名带去抖窗口（同签名 60s 内只触发一次）与冷却（同动作 10 分钟内不重复）。所有触发都写 `runtime.incidents[]`（时间、单元、签名、动作、结果），面板「事件」卡与 `bui status` 显示最近 20 条，`bui incidents` 可查全量。
+
+| 签名（示例） | 动作 |
+|---|---|
+| relay：到某上游 `connection refused / timeout / socks5 auth failed / 407` 连续 ≥3 条（60s 内） | 立刻对该上游做一次带外巡检（不等 2 分钟周期）；失败即按 §5.6 让该槽借用健康 IP，并在面板与 `bui status` 亮告警「IP X 不可达，槽 i 已临时切到 Y」 |
+| relay：某上游对目标 `403 serp domain` / sorry 页 | 标记该上游 google_ok=false，触发该槽借用 |
+| hysteria：`auth command failed / timeout` | 对钩子做一次自检（回环鉴权），失败则重启 b-ui 并告警 |
+| hysteria/xray：`bind: address already in use` / 单元崩溃循环 | 交给现有看门狗（退避重启），哨兵只记事件 |
+| xray：gRPC `Unavailable` 连续 | 用户同步安全网立即重试一轮 |
+| caddy：`obtaining certificate ... failed` | 告警（不自动动作） |
+
+**预案边界**：哨兵只做「探测 → 切换/重试/告警」，不改 state 里的池成员；替换 IP 仍由管理员在面板/CLI 执行，替换后 §5.6 的重分配自动完成。告警渠道：面板 + `bui status`；外部通知（Telegram/Webhook）作为可选项留接口，本期不做。
+
 ## 6. Linux 客户端 `bui-c`（§⑤）
 
 - 静态二进制（x86_64 / aarch64），`/opt/bui-c/{bin/sing-box, profiles.json, config.json}`，三个单元：`bui-c.service`（`sing-box run -c /opt/bui-c/config.json`，`Restart=always`，唯一数据面进程）、`bui-c-check.service`（`Type=oneshot`，`ExecStart=bui-c check`）、`bui-c.timer`（每分钟触发 `bui-c-check.service`；timer 不能直接指向 sing-box 单元，否则每分钟重新激活引擎）。
