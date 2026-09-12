@@ -24,12 +24,21 @@ use bui_schema::model::State;
 /// 覆盖 v4 的期望值（对账只 `sysctl -w` 当前值，看不出下次开机会被翻回去）。它的文件名不带
 /// `b-ui` 前缀，`stray_conf` 那类漂移也扫不到，只能在这里显式删。
 ///
+/// `/etc/systemd/system/xray.service.d/10-donot_touch_single_conf.conf` 是**官方 Xray 安装器**
+/// （`install-release.sh`）写的 drop-in，内容是 `ExecStart=`（清空）+
+/// `ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json`。drop-in 的优先级
+/// 高于单元文件本体，所以它留在机器上就等于 v4 单元里那条 `ExecStart={bin}/xray run -config
+/// {base}/xray-config.json` 形同虚设：2026-09-12 bwg-rick 的 v3→v4 首切现场，xray 显示 active 却跑着
+/// v3 的二进制和 v3 的配置，10001/10002 一个端口都没监听，而单元文件本身对账起来毫无差异。
+/// 它不带 `b-ui` 前缀、也不是受管 artifact，漂移扫描扫不到，只能在这里显式删。
+///
 /// 反过来，`99-b-ui-memory.conf` **不在**这份名单里：那是 system 模块在 ≤2G 机器上接管的同名
 /// 文件，放进来会让两个模块每轮互斗（system 写、units 删），对账永不收敛。
-pub const LEGACY_FILES: [&str; 9] = [
+pub const LEGACY_FILES: [&str; 10] = [
     "/etc/systemd/system/hysteria-server.service.d/override.conf",
     "/etc/systemd/system/hysteria-server.service.d/priority.conf",
     "/etc/systemd/system/xray.service.d/99-b-ui-override.conf",
+    "/etc/systemd/system/xray.service.d/10-donot_touch_single_conf.conf",
     "/etc/systemd/system/caddy.service.d/override.conf",
     "/etc/sysctl.d/99-hysteria-perf.conf",
     "/etc/sysctl.d/99-hysteria-bbr.conf",
@@ -261,10 +270,16 @@ WantedBy=multi-user.target
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reconcile::apply::{apply, ApplyInput, ApplyOutcome, BinaryInstaller};
+    use crate::reconcile::diff::{plan, PlanInput};
     use crate::reconcile::{Artifact, Facts, Module, RenderCtx};
+    use crate::sys::fake::FakeHost;
+    use crate::sys::Host;
     use crate::testutil::sample_state;
     use bui_schema::paths::Paths;
     use pretty_assertions::assert_eq;
+    use std::collections::BTreeMap;
+    use std::path::Path;
 
     fn ctx() -> RenderCtx {
         RenderCtx {
@@ -534,5 +549,107 @@ mod tests {
         let a = UnitsModule.render(&sample_state(), &ctx());
         let b = UnitsModule.render(&sample_state(), &ctx());
         assert_eq!(a, b);
+    }
+
+    struct NoopInstaller;
+    impl BinaryInstaller for NoopInstaller {
+        fn install(&self, _n: &str, _v: &str, _s: &str, _u: &str, _d: &Path) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// 只跑 units 模块的 render → plan → apply（本模块的遗留清理要真的落到机器上才算数）。
+    fn reconcile_units(h: &FakeHost) -> ApplyOutcome {
+        let ctx = ctx();
+        let arts = UnitsModule.render(&sample_state(), &ctx);
+        let p = plan(
+            PlanInput {
+                artifacts: &arts,
+                paths: &ctx.paths,
+                keys: &BTreeMap::new(),
+                installed_versions: &BTreeMap::new(),
+            },
+            h,
+        )
+        .unwrap();
+        apply(
+            ApplyInput {
+                plan: p,
+                paths: &ctx.paths,
+                facts: &ctx.facts,
+                installer: &NoopInstaller,
+                dry_run: false,
+            },
+            h,
+        )
+    }
+
+    const XRAY_DROPIN_DIR: &str = "/etc/systemd/system/xray.service.d";
+    const OFFICIAL_XRAY_DROPIN: &str =
+        "/etc/systemd/system/xray.service.d/10-donot_touch_single_conf.conf";
+
+    /// 官方 Xray 安装器（`install-release.sh`）写的
+    /// `10-donot_touch_single_conf.conf` 内容是 `ExecStart=`（清空）+
+    /// `ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json`。
+    /// drop-in 的优先级高于单元文件本体，所以留着它 = v4 写的完整单元的 ExecStart 被整条替换成
+    /// **旧二进制 + 旧配置**（2026-09-12 bwg-rick 首切实录：xray 跑 v3 二进制、10001/10002 一个都没监听，
+    /// 而 `systemctl status` 显示 active，健康检查看不出来）。清掉文件后空掉的 `.service.d/`
+    /// 也一并删：留着它下次 `bui reconcile` 的漂移扫描要报、官方脚本再跑一次又能悄悄塞回来。
+    #[test]
+    fn official_xray_installer_dropin_is_cleaned_up_with_its_empty_dir() {
+        let h = FakeHost::new();
+        h.with(|i| {
+            i.dirs.insert(XRAY_DROPIN_DIR.into());
+            i.files.insert(
+                OFFICIAL_XRAY_DROPIN.into(),
+                (
+                    b"[Service]\nExecStart=\nExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json\n".to_vec(),
+                    0o644,
+                ),
+            );
+        });
+        let out = reconcile_units(&h);
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert!(
+            h.text(OFFICIAL_XRAY_DROPIN).is_none(),
+            "官方 drop-in 必须被清掉，否则 v4 的 ExecStart 形同虚设"
+        );
+        assert!(
+            !h.is_dir(Path::new(XRAY_DROPIN_DIR)).unwrap(),
+            "清空后的 .service.d 目录要一并删掉"
+        );
+        assert!(out
+            .changed
+            .iter()
+            .any(|c| c == OFFICIAL_XRAY_DROPIN || c == XRAY_DROPIN_DIR));
+    }
+
+    /// 只删**空**目录：同一个 `.service.d/` 里还有别人的 drop-in（运维手写的
+    /// `ExecStartPost=`、云厂商 agent 塞的限速片段）时，目录必须留着，否则连带删掉别人的文件。
+    #[test]
+    fn a_dropin_dir_with_other_files_left_in_it_is_kept() {
+        let h = FakeHost::new();
+        h.with(|i| {
+            i.files.insert(
+                OFFICIAL_XRAY_DROPIN.into(),
+                (b"ExecStart=\n".to_vec(), 0o644),
+            );
+            i.files.insert(
+                format!("{XRAY_DROPIN_DIR}/50-operator.conf").into(),
+                (b"[Service]\nExecStartPost=/bin/true\n".to_vec(), 0o644),
+            );
+        });
+        reconcile_units(&h);
+        assert!(h.text(OFFICIAL_XRAY_DROPIN).is_none());
+        assert_eq!(
+            h.text(&format!("{XRAY_DROPIN_DIR}/50-operator.conf"))
+                .as_deref(),
+            Some("[Service]\nExecStartPost=/bin/true\n"),
+            "别人的 drop-in 不许动"
+        );
+        assert!(
+            h.is_dir(Path::new(XRAY_DROPIN_DIR)).unwrap(),
+            "非空目录不动"
+        );
     }
 }
