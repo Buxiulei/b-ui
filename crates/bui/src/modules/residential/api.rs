@@ -737,7 +737,9 @@ async fn domains_body(app: &AppState) -> serde_json::Value {
 async fn get_status(State(app): State<AppState>) -> ApiResult {
     // 纯读 state + runtime，不需要 Deps ⇒ 不写那个提取器
     let s = app.store.read().await;
-    let r = state::read(&app.runtime).await;
+    // 顺手把 R1 之前的遗留告警与已删上游的孤儿告警清掉（只在有变化时写盘）：
+    // 面板一刷新就干净，不必等下一轮巡检
+    let r = state::purge_stale_alerts(&app.runtime, &state::group_of(&s)).await;
     Ok(Json(status_of(&s, &r)).into_response())
 }
 
@@ -881,7 +883,7 @@ async fn post_restore_default(
 async fn get_health(State(app): State<AppState>) -> ApiResult {
     // **只读**：不碰 Prober / Clash，不推进迟滞，不切换（裁决 D6/D10）
     let g = state::group_of(&*app.store.read().await);
-    let r = state::read(&app.runtime).await;
+    let r = state::purge_stale_alerts(&app.runtime, &g).await;
     let split = SplitRules::from_group(&g);
     let now = app.host.now();
     // active tag 现算：runtime 存 uuid（§C）

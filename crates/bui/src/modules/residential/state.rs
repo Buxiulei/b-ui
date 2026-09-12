@@ -209,6 +209,41 @@ pub fn visible_alerts(g: &ResidentialGroup, r: &ResiRuntime) -> Vec<String> {
     out
 }
 
+/// R1 之前的上游级告警是按**位置名**拼成字符串写进 [`ResiRuntime::alerts`] 的
+/// （`上游 url-3 凭据失效（407）`）。这些条目既不以 uuid 为键、也不会被「探通一次即清」
+/// 认领，会在 status / 面板上永久刷屏：2026-09-12 bwg-rick 升级到含 R1 的 v4 后，池里
+/// 三条 Decodo 连续成功 109 次、体检全通，`bui residential status` 仍挂着 5 条旧告警。
+/// R1 之后的代码只把上游级告警写进 [`ResiRuntime::upstream_alerts`]，所以这条判据纯粹
+/// 是一次性的迁移过滤，不会误伤新写入的全局告警（它们都不是这个形状）。
+fn is_legacy_upstream_alert(msg: &str) -> bool {
+    msg.starts_with("上游 ") && msg.contains("凭据失效")
+}
+
+/// 丢掉所有**不以池内现存 uuid 为键**的上游级告警：R1 之前的纯字符串条目，以及键是
+/// uuid 但该 uuid 已不在池里的条目。全局告警（全员不达标、切换失败、journalctl 缺失）
+/// 留着。返回是否真的改了，调用方据此决定要不要写盘。
+fn retain_live_alerts(g: &ResidentialGroup, r: &mut ResiRuntime) -> bool {
+    let before = (r.alerts.len(), r.upstream_alerts.len());
+    r.alerts.retain(|a| !is_legacy_upstream_alert(a));
+    let live: std::collections::BTreeSet<Uuid> = g.upstreams.iter().map(|u| u.id).collect();
+    r.upstream_alerts.retain(|id, _| live.contains(id));
+    before != (r.alerts.len(), r.upstream_alerts.len())
+}
+
+/// 加载 runtime（status / health 每次读）与每轮巡检时清一次遗留/孤儿告警，并把结果写回
+/// runtime —— **只在真有变化时写**：本方法每 2 分钟一轮、每次看板刷新都会被调，
+/// 而每次 `update` 都是 tmp + fsync + rename。
+pub async fn purge_stale_alerts(runtime: &Runtime, g: &ResidentialGroup) -> ResiRuntime {
+    let mut r = read(runtime).await;
+    if !retain_live_alerts(g, &mut r) {
+        return r;
+    }
+    update(runtime, |r| {
+        retain_live_alerts(g, r);
+    })
+    .await
+}
+
 /// 读当前住宅分组（不存在时给 `Default`，等价于「池未启用」→ relay fail-open 直连）
 pub fn group_of(s: &State) -> ResidentialGroup {
     s.residential
@@ -523,6 +558,63 @@ mod tests {
         let r = update(&runtime, |r| clear_upstream_alert(r, live)).await;
         assert!(!r.upstream_alerts.contains_key(&live));
         assert_eq!(visible_alerts(&g, &r).len(), 1, "全局告警不受影响");
+    }
+
+    #[tokio::test]
+    async fn loading_drops_legacy_and_orphan_upstream_alerts() {
+        // 真机形态（2026-09-12 bwg-rick 升级到含 R1 的 v4 后）：池里三条 Decodo 连续成功
+        // 109 次、体检全通，`bui residential status` 仍挂着 R1 之前按位置名写进 alerts 的
+        // 旧告警，以及删掉的上游留在 upstream_alerts 里的孤儿条目。
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("runtime.json");
+        let runtime = Runtime::load(&p);
+        let s = crate::modules::residential::sample_state_with_pool();
+        let g = group_of(&s);
+        let live = g.upstreams[0].id;
+        let gone = Uuid::from_u128(0xdead);
+        update(&runtime, |r| {
+            push_alert(r, "上游 url-3 凭据失效（407）");
+            push_alert(
+                r,
+                "上游 url-6 凭据失效（407 / SOCKS5 认证被拒），请更新凭据",
+            );
+            set_upstream_alert(r, gone, "上游 old.example.net:10007 凭据失效（407）");
+            set_upstream_alert(r, live, "上游 isp.example.net:10007 凭据失效（407）");
+        })
+        .await;
+
+        let r = purge_stale_alerts(&runtime, &g).await;
+        assert_eq!(
+            visible_alerts(&g, &r),
+            vec!["上游 isp.example.net:10007 凭据失效（407）".to_string()],
+            "只留按池内现存 uuid 存的那一条"
+        );
+        assert!(r.alerts.is_empty(), "旧格式的纯字符串上游告警一条不留");
+        assert_eq!(r.upstream_alerts.len(), 1);
+        // 清理结果必须落盘：不然下次加载又是 5 条
+        assert_eq!(read(&Runtime::load(&p)).await, r, "清理结果写回 runtime");
+    }
+
+    #[tokio::test]
+    async fn purging_keeps_global_alerts_and_does_not_write_when_nothing_changed() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("runtime.json");
+        let g = group_of(&crate::modules::residential::sample_state_with_pool());
+
+        // 干净的 runtime：一次写盘都不该有（本方法每轮巡检、每次 status 都会被调）
+        let runtime = Runtime::load(&p);
+        purge_stale_alerts(&runtime, &g).await;
+        assert!(!p.exists(), "无变化不写盘");
+
+        // 全局告警（全员不达标、切换失败、journalctl 缺失）不是上游级告警，不许被清掉
+        update(&runtime, |r| {
+            push_alert(r, "机器上没有 journalctl，黑名单候选只能靠每日探针集");
+            push_alert(r, "全部住宅上游探测不达标，出口已降级但未切换");
+            push_alert(r, "切换住宅出口到 resi-2 失败：connection refused");
+        })
+        .await;
+        let r = purge_stale_alerts(&runtime, &g).await;
+        assert_eq!(r.alerts.len(), 3, "全局告警不受影响：{:?}", r.alerts);
     }
 
     #[test]
