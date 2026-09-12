@@ -23,6 +23,11 @@ pub fn manifest_file(p: &Paths) -> PathBuf {
     p.base_dir.join("manifest.json")
 }
 
+/// 升级前的 manifest 缓存快照；`bui upgrade --rollback` 靠它把内核版本表一并回退。
+pub fn manifest_prev_file(p: &Paths) -> PathBuf {
+    p.base_dir.join("manifest.prev.json")
+}
+
 /// state 的历史备份目录（保留 10 份）。
 pub fn backups_dir(p: &Paths) -> PathBuf {
     p.base_dir.join("state.backups")
@@ -88,6 +93,10 @@ mod tests {
         assert_eq!(state_file(&p), PathBuf::from("/opt/b-ui/state.json"));
         assert_eq!(runtime_file(&p), PathBuf::from("/opt/b-ui/runtime.json"));
         assert_eq!(manifest_file(&p), PathBuf::from("/opt/b-ui/manifest.json"));
+        assert_eq!(
+            manifest_prev_file(&p),
+            PathBuf::from("/opt/b-ui/manifest.prev.json")
+        );
         assert_eq!(backups_dir(&p), PathBuf::from("/opt/b-ui/state.backups"));
         assert_eq!(verify_dir(&p), PathBuf::from("/opt/b-ui/.verify"));
         assert_eq!(v3_backup_dir(&p), PathBuf::from("/opt/b-ui/v3-backup"));

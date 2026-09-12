@@ -114,7 +114,73 @@ pub fn apply_self(
     Ok(())
 }
 
-/// `bin/bui.prev` → `bin/bui`，并把最近一份 state 备份恢复成 `state.json`，最后重启 `b-ui`。
+/// `bin/<kernel>.prev`：内核二进制的上一版快照（`bin/bui.prev` 由 [`apply_self`] 写）。
+fn kernel_prev(bin_dir: &Path, name: &str) -> PathBuf {
+    bin_dir.join(format!("{name}.prev"))
+}
+
+/// 升级前的快照：`manifest.json` → `manifest.prev.json`，四个内核 → 各自 `.prev`。
+///
+/// 由 [`prepare`] 在**算出计划、确认真有东西要换之后、写新 manifest 缓存与替换内核之前**调：
+/// 早了快照里存的就是新版，无替换时动它会把上一版快照冲掉。缺的文件（全新装机、某个内核还没
+/// 装）一概跳过；已有的 `.prev` 直接覆盖——回滚只回一步，不留上上一版。
+///
+/// 裁决（2026-09-11 v4-master「P1：bui upgrade --rollback 范围」）：`--rollback` 要能连内核
+/// 一起回退，而内核版本是 manifest 缓存说了算，所以两样必须一起快照、一起恢复。
+pub fn snapshot_prev(host: &dyn Host, paths: &Paths) -> anyhow::Result<()> {
+    if let Some(bytes) = host.read_file(&crate::paths::manifest_file(paths))? {
+        host.write_file(&crate::paths::manifest_prev_file(paths), &bytes, 0o644)?;
+    }
+    for name in crate::kernels::KERNELS {
+        if let Some(bytes) = host.read_file(&paths.bin_dir.join(name))? {
+            host.write_file(&kernel_prev(&paths.bin_dir, name), &bytes, 0o755)?;
+        }
+    }
+    Ok(())
+}
+
+/// 「要不要换 + 换之前先留快照」一步到位：先算计划，**只在真有东西要换时**才快照并写新的
+/// manifest 缓存。
+///
+/// 顺序是裁决的要求，不是风格问题：
+/// - `plan_upgrade` 会 bail（`min_upgrade_from`），bail 之后一个字都不该落盘，否则留下一份
+///   「新版 manifest 缓存 + 旧内核」的不可用状态；
+/// - 已是最新（菜单里的「检查升级」那一下）时也绝不能碰 `.prev`，否则升级过一次后再跑一次
+///   就把五个 `.prev` 与 `manifest.prev.json` 全覆盖成**当前**版，而 `bin/bui.prev` 仍是上一版
+///   （它只由 [`apply_self`] 写）⇒ `--rollback` 只退 bui 不退内核，正是裁决要消灭的混合态。
+pub fn prepare(
+    host: &dyn Host,
+    paths: &Paths,
+    m: &Manifest,
+    current_bui: &str,
+    arch: &str,
+) -> anyhow::Result<(UpgradePlan, Asset)> {
+    let installed = crate::kernels::installed_versions(host, &paths.bin_dir);
+    let plan = plan_upgrade(m, current_bui, &installed, arch)?;
+    let asset = m.bui_asset(arch)?.clone();
+    if plan.self_to.is_some() || !plan.kernels.is_empty() {
+        // 换任何东西之前先留一份回滚快照（manifest 缓存 + 四个内核）：`--rollback` 靠它
+        snapshot_prev(host, paths)?;
+        // 缓存给对账用：内核版本随 manifest 落地
+        let bytes = serde_json::to_vec_pretty(m)?;
+        host.write_file(&crate::paths::manifest_file(paths), &bytes, 0o644)?;
+    }
+    Ok((plan, asset))
+}
+
+/// `bin/bui.prev` → `bin/bui`、四个内核 ← 各自 `.prev`、`manifest.json` ←
+/// `manifest.prev.json`、`state.json` ← 最近一份备份，最后重启 `b-ui`（重启后守护进程自己
+/// 对账）。
+///
+/// 恢复后的 manifest 与恢复后的内核二进制是同一版，对账时 Binary 的比对（实际探测版本 vs
+/// manifest 记的版本）必然相等 ⇒ 零变更、不下载。正因为零变更，对账不会替我们重启内核单元，
+/// 所以每恢复一个内核就自己 restart 它的单元（`hysteria` 两个）。缺 `.prev` 的内核只记一条
+/// note 跳过、不碰它的单元；连 `manifest.prev.json` 都没有时**删掉**当前缓存，否则对账会照新版
+/// manifest 把内核又拉上去。
+///
+/// 边界（记在这里以免误判）：`.prev` 只有显式 `bui upgrade` 会留。守护进程每日自检
+/// （`serve.rs` 的 `selfcheck_loop`：拉 manifest → 写缓存 → 对账）换内核不经本模块、不写 `.prev`，
+/// 所以 `--rollback` 能退到的是「最近一次显式 `bui upgrade` 之前」，不是「任意一次换内核之前」。
 pub fn rollback(host: &dyn Host, paths: &Paths) -> anyhow::Result<Vec<String>> {
     let prev = paths.bin_dir.join("bui.prev");
     let bytes = host
@@ -122,6 +188,43 @@ pub fn rollback(host: &dyn Host, paths: &Paths) -> anyhow::Result<Vec<String>> {
         .ok_or_else(|| anyhow::anyhow!("没有 {}，无法回滚二进制", prev.display()))?;
     host.write_file(&paths.bin_dir.join("bui"), &bytes, 0o755)?;
     let mut done = vec![format!("已恢复上一版 bui（{}）", prev.display())];
+    for name in crate::kernels::KERNELS {
+        let prev = kernel_prev(&paths.bin_dir, name);
+        match host.read_file(&prev)? {
+            Some(bytes) => {
+                host.write_file(&paths.bin_dir.join(name), &bytes, 0o755)?;
+                done.push(format!("已恢复上一版 {name}（{}）", prev.display()));
+                // 盘上换回旧字节 ≠ 回滚生效：单元还在内存里跑新版二进制，而恢复后的 manifest
+                // 与盘上版本一致 ⇒ 对账零变更 ⇒ apply 第 7 步（只在 InstallBinary 成功时才收单元）
+                // 不会替我们重启。所以这里自己重启；跳过的内核不碰它的单元。
+                for unit in crate::reconcile::apply::units_for_binary(name) {
+                    let _ = host.systemd("restart", &unit.name);
+                    done.push(format!("已重启 {}", unit.name));
+                }
+            }
+            None => done.push(format!("没有 {}，{name} 保持现状", prev.display())),
+        }
+    }
+    let manifest = crate::paths::manifest_file(paths);
+    let manifest_prev = crate::paths::manifest_prev_file(paths);
+    match host.read_file(&manifest_prev)? {
+        Some(bytes) => {
+            host.write_file(&manifest, &bytes, 0o644)?;
+            done.push(format!(
+                "已恢复上一版 manifest（{}）",
+                manifest_prev.display()
+            ));
+        }
+        None if host.read_file(&manifest)?.is_some() => {
+            host.remove_file(&manifest)?;
+            done.push(format!(
+                "没有 {}，已删掉 {}（免得对账又按新版装内核）",
+                manifest_prev.display(),
+                manifest.display()
+            ));
+        }
+        None => {}
+    }
     // 备份名是 `state-<stamp>-<nnn>.json`（零填充，Task 2）⇒ 字典序 == 时间序，而 `list_dir`
     // 的契约就是「直接子项、按路径名升序」⇒ 最后一项就是最近一份。目录不存在时它给空表。
     if let Some(newest) = host.list_dir(&crate::paths::backups_dir(paths))?.pop() {
@@ -186,14 +289,9 @@ pub async fn run_with(
                 m.version
             );
         }
-        let bytes = serde_json::to_vec_pretty(&m)?;
-        // 缓存给对账用：内核版本随 manifest 落地
-        h.write_file(&crate::paths::manifest_file(&p), &bytes, 0o644)?;
-        let installed = crate::kernels::installed_versions(h.as_ref(), &p.bin_dir);
         let arch = h.arch()?;
-        let plan = plan_upgrade(&m, env!("CARGO_PKG_VERSION"), &installed, &arch)?;
-        let asset = m.bui_asset(&arch)?.clone();
-        Ok((plan, asset))
+        // 计划先算、快照与新缓存只在真要换东西时才写（见 `prepare` 的说明）
+        prepare(h.as_ref(), &p, &m, env!("CARGO_PKG_VERSION"), &arch)
     })
     .await??;
     println!("{}", format_plan(&plan));
@@ -242,7 +340,7 @@ pub fn format_plan(p: &UpgradePlan) -> String {
 mod tests {
     use super::*;
     use crate::kernels::{Asset, Manifest};
-    use crate::sys::{fake::FakeHost, Host};
+    use crate::sys::{fake::FakeHost, CmdOut, Host};
     use pretty_assertions::assert_eq;
     use std::collections::BTreeMap;
     use std::sync::Mutex;
@@ -457,6 +555,353 @@ mod tests {
         let h = FakeHost::new();
         let err = rollback(&h, &paths).unwrap_err().to_string();
         assert!(err.contains("bui.prev"), "{err}");
+    }
+
+    /// 升级演练用的 manifest 缓存（总纲 C4 形状；只放 amd64 资产）。
+    fn manifest_json(bui: &str, kernels: [&str; 4]) -> String {
+        let [hy, xray, sb, caddy] = kernels;
+        format!(
+            r#"{{"version":"{bui}",
+  "kernels":{{"hysteria":"{hy}","xray":"{xray}","sing_box":"{sb}","caddy":"{caddy}"}},
+  "artifacts":{{
+    "bui-linux-amd64":      {{"url":"https://x/bui","sha256":"00"}},
+    "hysteria-linux-amd64": {{"url":"https://x/hy","sha256":"01"}},
+    "xray-linux-amd64":     {{"url":"https://x/xray","sha256":"02"}},
+    "sing-box-linux-amd64": {{"url":"https://x/sb","sha256":"03"}},
+    "caddy-linux-amd64":    {{"url":"https://x/caddy","sha256":"04"}}
+  }}}}"#
+        )
+    }
+
+    const OLD_KERNELS: [&str; 4] = ["2.12.2", "26.3.27", "1.13.19", "2.10.2"];
+    const NEW_KERNELS: [&str; 4] = ["2.13.0", "26.4.0", "1.14.2", "2.11.0"];
+    /// 升级前盘上的五个二进制（内容当版本指纹用，回滚后逐字节比对）
+    const OLD_BINS: [(&str, &str); 5] = [
+        ("bui", "BUI-4.0.0"),
+        ("hysteria", "HY-2.12.2"),
+        ("xray", "XRAY-26.3.27"),
+        ("sing-box", "SB-1.13.19"),
+        ("caddy", "CADDY-2.10.2"),
+    ];
+    const NEW_BINS: [(&str, &str); 4] = [
+        ("hysteria", "HY-2.13.0"),
+        ("xray", "XRAY-26.4.0"),
+        ("sing-box", "SB-1.14.2"),
+        ("caddy", "CADDY-2.11.0"),
+    ];
+
+    fn scratch(d: &tempfile::TempDir) -> Paths {
+        Paths {
+            base_dir: d.path().into(),
+            certs_dir: d.path().join("certs"),
+            bin_dir: d.path().join("bin"),
+        }
+    }
+
+    /// 升级前的机器：manifest 缓存 + `bin/` 下五个二进制 + 四个内核的 `version` 输出。
+    fn pre_upgrade(paths: &Paths) -> (FakeHost, String) {
+        let h = FakeHost::new();
+        let manifest = manifest_json("4.0.0", OLD_KERNELS);
+        h.write_file(
+            &crate::paths::manifest_file(paths),
+            manifest.as_bytes(),
+            0o644,
+        )
+        .unwrap();
+        for (name, body) in OLD_BINS {
+            h.write_file(&paths.bin_dir.join(name), body.as_bytes(), 0o755)
+                .unwrap();
+        }
+        script_versions(&h, paths, OLD_KERNELS);
+        h.clear_ops();
+        (h, manifest)
+    }
+
+    /// FakeHost 的 `run` 只按命令行前缀匹配，与盘上的字节无关；插到脚本表**最前面**即代表
+    /// 「`bin/<kernel>` 现在是这一版」，让 `installed_versions` 跟着升级/回滚走。
+    fn script_versions(h: &FakeHost, paths: &Paths, versions: [&str; 4]) {
+        let banner = |name: &str, v: &str| match name {
+            "hysteria" => format!("Version:\tv{v}\n"),
+            "xray" => format!("Xray {v} (Xray) a (go1 linux/amd64)\n"),
+            "sing-box" => format!("sing-box version {v}\n"),
+            _ => format!("v{v} h1:x\n"),
+        };
+        h.with(|i| {
+            for (name, v) in crate::kernels::KERNELS.iter().zip(versions) {
+                let line = format!("{} version", paths.bin_dir.join(name).display());
+                i.scripted
+                    .insert(0, (line, CmdOut::success(&banner(name, v))));
+            }
+        });
+    }
+
+    fn text(h: &FakeHost, path: &std::path::Path) -> Option<String> {
+        h.text(path.to_str().unwrap())
+    }
+
+    /// 只挑落盘类的 op（`installed_versions` 的探测 `run` 不算写）。
+    fn writes(h: &FakeHost) -> Vec<String> {
+        h.ops()
+            .into_iter()
+            .filter(|o| o.starts_with("write:") || o.starts_with("remove:"))
+            .collect()
+    }
+
+    #[test]
+    fn snapshot_prev_copies_the_manifest_cache_and_all_four_kernels() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = scratch(&d);
+        let (h, manifest) = pre_upgrade(&paths);
+        // 上上一版的 .prev 必须被覆盖（回滚只回一步）
+        h.write_file(&paths.bin_dir.join("xray.prev"), b"XRAY-ANCIENT", 0o755)
+            .unwrap();
+        snapshot_prev(&h, &paths).unwrap();
+        let prev_manifest = crate::paths::manifest_prev_file(&paths);
+        assert_eq!(text(&h, &prev_manifest).as_deref(), Some(manifest.as_str()));
+        assert_eq!(h.mode(prev_manifest.to_str().unwrap()), Some(0o644));
+        for name in crate::kernels::KERNELS {
+            let body = OLD_BINS.iter().find(|(n, _)| *n == name).unwrap().1;
+            let prev = paths.bin_dir.join(format!("{name}.prev"));
+            assert_eq!(text(&h, &prev).as_deref(), Some(body), "{name}");
+            assert_eq!(h.mode(prev.to_str().unwrap()), Some(0o755), "{name}");
+        }
+        assert!(
+            text(&h, &paths.bin_dir.join("bui.prev")).is_none(),
+            "bui 自己的 .prev 由 apply_self 在校验过 sha256 之后写，快照不碰"
+        );
+    }
+
+    #[test]
+    fn snapshot_prev_skips_what_is_not_installed_yet() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = scratch(&d);
+        let h = FakeHost::new();
+        snapshot_prev(&h, &paths).unwrap();
+        assert!(h.ops().is_empty(), "全新装机没有可快照的东西，一个字都不写");
+    }
+
+    /// 已是最新时 `prepare` 一个字都不能写：否则升过一次后再跑一次 `bui upgrade`
+    /// （菜单里的「检查升级」）会把五个 `.prev` 与 `manifest.prev.json` 全覆盖成当前版，
+    /// `--rollback` 就变成「只退 bui、内核原地不动」的混合态。
+    #[test]
+    fn prepare_writes_nothing_when_there_is_nothing_to_upgrade() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = scratch(&d);
+        let (h, old_manifest) = pre_upgrade(&paths);
+        let m: Manifest = serde_json::from_str(&manifest_json("4.0.0", OLD_KERNELS)).unwrap();
+        let (plan, _) = prepare(&h, &paths, &m, "4.0.0", "x86_64").unwrap();
+        assert!(
+            plan.self_to.is_none() && plan.kernels.is_empty(),
+            "{plan:?}"
+        );
+        assert_eq!(writes(&h), Vec::<String>::new(), "无需升级就一个字都不写");
+        assert_eq!(
+            text(&h, &crate::paths::manifest_file(&paths)).as_deref(),
+            Some(old_manifest.as_str()),
+            "连 manifest 缓存都不该重写"
+        );
+        assert!(text(&h, &crate::paths::manifest_prev_file(&paths)).is_none());
+
+        // min_upgrade_from 直接 bail 的那次同样不许留下任何东西（尤其不许留新版缓存）
+        let mut blocked: Manifest =
+            serde_json::from_str(&manifest_json("4.2.0", NEW_KERNELS)).unwrap();
+        blocked.min_upgrade_from = Some("4.1.0".into());
+        assert!(prepare(&h, &paths, &blocked, "4.0.0", "x86_64").is_err());
+        assert_eq!(writes(&h), Vec::<String>::new(), "bail 之后一个字都不写");
+    }
+
+    #[test]
+    fn prepare_snapshots_prev_before_writing_the_new_manifest_cache() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = scratch(&d);
+        let (h, old_manifest) = pre_upgrade(&paths);
+        let m: Manifest = serde_json::from_str(&manifest_json("4.0.1", NEW_KERNELS)).unwrap();
+        let (plan, _) = prepare(&h, &paths, &m, "4.0.0", "x86_64").unwrap();
+        assert_eq!(plan.self_to.as_deref(), Some("4.0.1"));
+
+        let ops = h.ops();
+        let pos = |p: &std::path::Path| {
+            let needle = format!("write:{}:", p.display());
+            ops.iter()
+                .position(|o| o.starts_with(&needle))
+                .unwrap_or_else(|| panic!("{} 没写：{ops:?}", p.display()))
+        };
+        let cache = pos(&crate::paths::manifest_file(&paths));
+        assert!(
+            pos(&crate::paths::manifest_prev_file(&paths)) < cache,
+            "manifest 快照必须早于新缓存：{ops:?}"
+        );
+        for name in crate::kernels::KERNELS {
+            assert!(
+                pos(&kernel_prev(&paths.bin_dir, name)) < cache,
+                "{name}.prev 必须早于新 manifest 缓存：{ops:?}"
+            );
+        }
+        assert_eq!(
+            text(&h, &crate::paths::manifest_prev_file(&paths)).as_deref(),
+            Some(old_manifest.as_str())
+        );
+        let cached: Manifest =
+            serde_json::from_str(&text(&h, &crate::paths::manifest_file(&paths)).unwrap()).unwrap();
+        assert_eq!(cached.version, "4.0.1", "新缓存照 manifest 落地");
+    }
+
+    #[test]
+    fn rollback_restores_the_four_kernels_and_the_manifest_cache_byte_for_byte() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = scratch(&d);
+        let (h, old_manifest) = pre_upgrade(&paths);
+
+        // ---- 升一次：快照 → 换 manifest 缓存 → 换四个内核 → 换 bui 自己（apply_self 写 bui.prev）
+        snapshot_prev(&h, &paths).unwrap();
+        h.write_file(
+            &crate::paths::manifest_file(&paths),
+            manifest_json("4.0.1", NEW_KERNELS).as_bytes(),
+            0o644,
+        )
+        .unwrap();
+        for (name, body) in NEW_BINS {
+            h.write_file(&paths.bin_dir.join(name), body.as_bytes(), 0o755)
+                .unwrap();
+        }
+        script_versions(&h, &paths, NEW_KERNELS);
+        let payload = b"BUI-4.0.1".to_vec();
+        let asset = Asset {
+            url: "https://x/bui".into(),
+            sha256: crate::kernels::sha256_hex(&payload),
+        };
+        let f = F(Mutex::new(vec![("https://x/bui".to_string(), payload)]));
+        apply_self(&h, &f, &asset, &paths.bin_dir).unwrap();
+
+        // 五个 .prev + manifest.prev.json 都在，且内容 == 升级前
+        for (name, body) in OLD_BINS {
+            assert_eq!(
+                text(&h, &paths.bin_dir.join(format!("{name}.prev"))).as_deref(),
+                Some(body),
+                "{name}.prev"
+            );
+        }
+        assert_eq!(
+            text(&h, &crate::paths::manifest_prev_file(&paths)).as_deref(),
+            Some(old_manifest.as_str())
+        );
+
+        // ---- 回滚
+        h.clear_ops();
+        let done = rollback(&h, &paths).unwrap();
+        script_versions(&h, &paths, OLD_KERNELS); // 盘上换回旧二进制 ⇒ 版本探测给旧版
+        for (name, body) in OLD_BINS {
+            let bin = paths.bin_dir.join(name);
+            assert_eq!(
+                text(&h, &bin).as_deref(),
+                Some(body),
+                "{name} 要逐字节回到升级前"
+            );
+            assert_eq!(h.mode(bin.to_str().unwrap()), Some(0o755), "{name}");
+        }
+        assert_eq!(
+            text(&h, &crate::paths::manifest_file(&paths)).as_deref(),
+            Some(old_manifest.as_str()),
+            "manifest 缓存也要回到升级前，否则对账又把内核拉成新版"
+        );
+        assert!(h.ops().contains(&"systemd:restart:b-ui".to_string()));
+        // 光把字节写回盘上不算回滚：五个内核单元还在内存里跑新版二进制，而恢复后的
+        // manifest 与盘上版本一致 ⇒ 对账零变更 ⇒ apply 第 7 步不会替我们重启任何一个。
+        for unit in [
+            "hysteria-server",
+            "hysteria-residential",
+            "xray",
+            "b-ui-relay",
+            "caddy",
+        ] {
+            assert!(
+                h.ops().contains(&format!("systemd:restart:{unit}")),
+                "{unit} 必须随内核回滚一起重启：{:?}",
+                h.ops()
+            );
+        }
+        assert!(
+            done.iter().any(|l| l.contains("manifest.prev.json")),
+            "{done:?}"
+        );
+
+        // 漂移为空：manifest.prev.json 与 bin/*.prev 都不该被报成陌生文件
+        assert_eq!(
+            crate::reconcile::drift::scan(&h, &[], &paths),
+            vec![],
+            "回滚留下的快照文件不算漂移"
+        );
+
+        // 对账零变更（也就不会下载）：Binary 的版本以恢复后的实际探测为准，与恢复的 manifest 一致
+        let m: Manifest = serde_json::from_str(&old_manifest).unwrap();
+        let arts: Vec<crate::reconcile::Artifact> = crate::kernels::KERNELS
+            .iter()
+            .map(|name| {
+                let (version, asset) = m.kernel_asset(name, "x86_64").unwrap();
+                crate::reconcile::Artifact::Binary {
+                    name: name.to_string(),
+                    version: version.to_string(),
+                    sha256: asset.sha256.clone(),
+                    url: asset.url.clone(),
+                }
+            })
+            .collect();
+        let installed = crate::kernels::installed_versions(&h, &paths.bin_dir);
+        let plan = crate::reconcile::diff::plan(
+            crate::reconcile::diff::PlanInput {
+                artifacts: &arts,
+                paths: &paths,
+                keys: &BTreeMap::new(),
+                installed_versions: &installed,
+            },
+            &h,
+        )
+        .unwrap();
+        assert_eq!(plan.changes, vec![], "回滚后对账不许再装一遍内核");
+        assert_eq!(plan.unchanged, 4);
+    }
+
+    #[test]
+    fn rollback_without_kernel_prev_files_only_notes_it() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = scratch(&d);
+        // 只升过 bui 自己、没升过内核的机器：只有 bin/bui.prev
+        let h = FakeHost::new();
+        h.write_file(&paths.bin_dir.join("bui.prev"), b"OLDBUI", 0o755)
+            .unwrap();
+        h.write_file(&paths.bin_dir.join("bui"), b"NEWBUI", 0o755)
+            .unwrap();
+        h.write_file(
+            &crate::paths::manifest_file(&paths),
+            manifest_json("4.0.1", NEW_KERNELS).as_bytes(),
+            0o644,
+        )
+        .unwrap();
+        let done = rollback(&h, &paths).unwrap();
+        assert_eq!(
+            text(&h, &paths.bin_dir.join("bui")).as_deref(),
+            Some("OLDBUI")
+        );
+        for name in crate::kernels::KERNELS {
+            assert!(
+                done.iter().any(|l| l.contains(&format!("{name}.prev"))),
+                "缺 {name}.prev 只记一条 note：{done:?}"
+            );
+        }
+        assert!(
+            text(&h, &crate::paths::manifest_file(&paths)).is_none(),
+            "没有上一版 manifest 就删掉当前缓存，免得对账按新版把内核又拉上去"
+        );
+        let restarts: Vec<String> = h
+            .ops()
+            .into_iter()
+            .filter(|o| o.starts_with("systemd:restart:"))
+            .collect();
+        assert_eq!(
+            restarts,
+            vec!["systemd:restart:b-ui".to_string()],
+            "没恢复内核就不该重启内核服务"
+        );
     }
 
     #[test]

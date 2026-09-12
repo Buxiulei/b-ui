@@ -561,8 +561,8 @@ fn verify_candidate(
     }
 }
 
-/// 换了内核二进制要重启哪些单元。
-fn units_for_binary(name: &str) -> Vec<Unit> {
+/// 换了内核二进制要重启哪些单元。`bui upgrade --rollback` 把内核换回上一版后也用它。
+pub(crate) fn units_for_binary(name: &str) -> Vec<Unit> {
     match name {
         "hysteria" => vec![
             Unit::restart("hysteria-server"),
