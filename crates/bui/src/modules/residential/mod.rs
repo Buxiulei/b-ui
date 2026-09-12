@@ -8,8 +8,9 @@
 // 这一行在 Task 12 收口（CLI + 菜单 + /api/health 都接上）时删除。
 #![allow(dead_code)]
 
-use crate::reconcile::{Artifact, Module, RenderCtx};
+use crate::reconcile::{Artifact, DaemonCtx, Module, RenderCtx};
 use bui_schema::model::{State, DEFAULT_GROUP};
+use bui_schema::paths::Paths;
 use std::sync::Arc;
 
 pub mod api;
@@ -87,11 +88,33 @@ pub const EXIT_IP_URL: &str = "https://api.ipify.org";
 /// [`EXIT_IP_URL`] 的主机名（同 [`HEALTH_PROBE_HOST`]，给 `confirm_auth_failure` 用）
 pub const EXIT_IP_HOST: &str = "api.ipify.org";
 
-pub struct ResidentialModule;
+pub struct ResidentialModule {
+    prober: Arc<dyn proxy::Prober>,
+    clash: Arc<dyn clash::Clash>,
+    paths: Paths,
+}
 
 impl ResidentialModule {
+    /// 生产构造：`ReqwestProber` + `HttpClash` + `Paths::default_server()`
     pub fn new() -> Self {
-        Self
+        Self::with(
+            Arc::new(proxy::ReqwestProber::new()),
+            Arc::new(clash::HttpClash::new()),
+            Paths::default_server(),
+        )
+    }
+
+    /// 测试与 M2 演练用：注入 fake
+    pub fn with(
+        prober: Arc<dyn proxy::Prober>,
+        clash: Arc<dyn clash::Clash>,
+        paths: Paths,
+    ) -> Self {
+        Self {
+            prober,
+            clash,
+            paths,
+        }
     }
 }
 
@@ -111,6 +134,28 @@ impl Module for ResidentialModule {
     /// 顺序。改住宅状态请走 `state::update_group`。
     fn render(&self, _s: &State, _ctx: &RenderCtx) -> Vec<Artifact> {
         Vec::new()
+    }
+
+    fn routes(&self) -> axum::Router<crate::api::AppState> {
+        api::routes(self.prober.clone(), self.clash.clone(), self.paths.clone())
+    }
+
+    fn spawn(&self, ctx: DaemonCtx) -> Vec<tokio::task::JoinHandle<()>> {
+        let (p, c) = (self.prober.clone(), self.clash.clone());
+        // **先 subscribe 再 spawn**：broadcast 丢弃「发送时还没有订阅者」的事件，
+        // 若让 replay_loop 自己 subscribe，紧随 spawn 的第一次对账重启就可能漏掉。
+        let rx = ctx.bus.subscribe();
+        vec![
+            // spec §5.3：每 2 分钟一轮巡检 + 切换
+            tokio::spawn(health::health_loop(ctx.clone(), p.clone(), c.clone())),
+            // spec §5.3 最后一句：relay 任何重启后立即重放 runtime.selected_upstream_id
+            tokio::spawn(health::replay_loop(ctx.clone(), c, rx)),
+            // spec §5.4 (a)：跟随 relay 日志学候选（契约决策 §E：游标增量，不用 -f），
+            // 同一轮里紧接着做一次确认 ⇒ ≥10 分钟就能进 pending（裁决「黑名单确认节奏」）
+            tokio::spawn(blacklist::journal_loop(ctx.clone(), p.clone())),
+            // spec §5.4：每日 04:00 批量生效 + 每日探针/端口集 + 复核移除（不做确认）
+            tokio::spawn(blacklist::daily_loop(ctx, p)),
+        ]
     }
 }
 
@@ -334,5 +379,82 @@ mod tests {
         })
         .await;
         assert_eq!(out, vec![Some(10), None, Some(30)]);
+    }
+
+    #[tokio::test]
+    async fn the_module_exposes_routes_and_four_background_tasks() {
+        use crate::api::EventBus;
+        use crate::modules::residential::clash::FakeClash;
+        use crate::modules::residential::proxy::FakeProber;
+        use crate::state::runtime::Runtime;
+        use crate::state::store::Store;
+        use crate::sys::fake::FakeHost;
+        let d = tempfile::tempdir().unwrap();
+        let host = std::sync::Arc::new(FakeHost::new());
+        let ctx = crate::reconcile::DaemonCtx {
+            store: Store::create(d.path().join("state.json"), sample_state())
+                .await
+                .unwrap(),
+            runtime: Runtime::load(d.path().join("runtime.json")),
+            bus: EventBus::new(),
+            host,
+            paths: Paths::default_server(),
+        };
+        let m = ResidentialModule::with(
+            std::sync::Arc::new(FakeProber::new()),
+            std::sync::Arc::new(FakeClash::new(Some("resi-1"))),
+            Paths::default_server(),
+        );
+        let handles = m.spawn(ctx);
+        assert_eq!(handles.len(), 4, "巡检 / 重放 / 日志学习 / 每日批量");
+        for h in handles {
+            h.abort();
+        }
+        // routes() 能被 P1 的 router 形状接住（类型对齐即编译通过）
+        let _router: axum::Router<crate::api::AppState> = m.routes();
+    }
+
+    #[tokio::test]
+    async fn a_state_change_reaches_the_relay_render_through_p1() {
+        // 端到端：P3 改 state → P1 的 core_files 渲染出的 relay 配置随之变化。
+        // 这条锁住契约决策 §B：P3 不渲染，但它的改动必须真的落到 relay 配置里。
+        use crate::modules::core_files::CoreFilesModule;
+        use crate::modules::residential::state as rstate;
+        use crate::reconcile::Artifact;
+        // 用带池的夹具：空池时 relay 渲染的是 fail-open 直连形态，加 pin 也看不出差别
+        let mut s = sample_state_with_pool();
+        let render = |s: &State| -> String {
+            CoreFilesModule::new(None)
+                .render(s, &ctx())
+                .into_iter()
+                .find_map(|a| match a {
+                    Artifact::File { path, content, .. }
+                        if path.ends_with("singbox-relay.json") =>
+                    {
+                        Some(String::from_utf8(content).unwrap())
+                    }
+                    _ => None,
+                })
+                .expect("core_files 必须渲染 singbox-relay.json")
+        };
+        let before = render(&s);
+        assert!(!before.contains("www.paypal.com"));
+        // 等价于 blacklist::add_pin 对 state 的那一步
+        let g = s.residential.groups.get_mut(GROUP_DEFAULT).unwrap();
+        g.blacklist.pins.push(bui_schema::model::Pin {
+            rule: bui_schema::model::Rule::DomainSuffix("www.paypal.com".into()),
+            note: String::new(),
+            created_at: "2026-09-12T00:00:00Z".into(),
+        });
+        let after = render(&s);
+        assert!(
+            after.contains("www.paypal.com"),
+            "pin 必须出现在 relay 的 domain_suffix → direct 规则里"
+        );
+        assert_ne!(
+            before, after,
+            "内容变了 ⇒ P1 的 diff 会写盘并重启 b-ui-relay"
+        );
+        assert_eq!(rstate::group_of(&s).blacklist.pins.len(), 2);
     }
 }
