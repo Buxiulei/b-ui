@@ -32,6 +32,9 @@ pub struct FakeInner {
     pub scripted: Vec<(String, CmdOut)>,
     /// 令某单元的 systemd 动作失败（测回滚）
     pub fail_units: BTreeSet<String>,
+    /// 令某单元**永远不 active**：`systemctl start/restart` 照样退 0，单元却起不来
+    /// （203/EXEC、start-limit-hit 的真实形态）。裸名与全名两种键各查一次。
+    pub never_active: BTreeSet<String>,
     pub listening: BTreeMap<Proto, BTreeSet<u16>>,
     pub mem_mb: u64,
     pub arch: String,
@@ -59,6 +62,7 @@ impl Default for FakeInner {
             modules: BTreeSet::new(),
             scripted: Vec::new(),
             fail_units: BTreeSet::new(),
+            never_active: BTreeSet::new(),
             listening: BTreeMap::new(),
             mem_mb: 2048,
             arch: "x86_64".into(),
@@ -259,7 +263,9 @@ impl Host for FakeHost {
         // 语义跟真实 systemd 对齐：`disable` 不停服务，`stop` 不改 enable 状态。
         match verb {
             "start" | "restart" | "reload-or-restart" => {
-                i.units_active.insert(full);
+                if !(i.never_active.contains(&full) || i.never_active.contains(&bare)) {
+                    i.units_active.insert(full);
+                }
             }
             "stop" => {
                 i.units_active.remove(&full);
@@ -405,6 +411,21 @@ mod tests {
         assert!(h.run("sshd", &["-t"]).unwrap().ok());
         assert!(!h.systemd("restart", "b-ui-relay").unwrap().ok());
         assert!(h.systemd("restart", "xray").unwrap().ok());
+    }
+
+    #[test]
+    fn never_active_units_stay_down_even_though_restart_returns_zero() {
+        let h = FakeHost::new();
+        h.with(|i| {
+            i.never_active.insert("caddy".into());
+        });
+        assert!(
+            h.systemd("restart", "caddy").unwrap().ok(),
+            "退出码照样是 0"
+        );
+        assert!(!h.unit_is_active("caddy").unwrap(), "单元其实没起来");
+        assert!(h.systemd("restart", "xray").unwrap().ok());
+        assert!(h.unit_is_active("xray").unwrap());
     }
 
     #[test]

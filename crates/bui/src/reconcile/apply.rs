@@ -4,11 +4,13 @@
 //! 三条不变量：
 //! 1. **校验再写盘**：`verify` 为 `Some` 时先把候选内容写进 `.verify/` 跑内核校验，失败不写目标文件（spec §2.2）。
 //! 2. **重启失败回滚**：重启失败就把该单元相关文件恢复成上一版内容再启一次，仍失败才记 `errors`。
+//!    「起来了没有」一律以 `is-active` 为准而不是 `systemctl restart` 的退出码，且每次 restart
+//!    之前先 `reset-failed` 清 start-limit（见 [`activate`]）。
 //! 3. **绝不同步重启 `b-ui` 自己**：apply 跑在守护进程自己的进程里，只置
 //!    [`ApplyOutcome::self_restart_required`]，由调用方在报告落盘之后处理（第 12 步）。
 
 use super::diff::{Change, Plan};
-use super::{Facts, PortSpec, Unit, UnitAction, Verify};
+use super::{Facts, PortSpec, Unit, UnitAction, Verify, MANAGED_UNITS};
 use crate::sys::Host;
 use bui_schema::paths::Paths;
 use std::collections::{BTreeMap, BTreeSet};
@@ -358,6 +360,8 @@ pub fn apply(input: ApplyInput<'_>, host: &dyn Host) -> ApplyOutcome {
 
     // ---- 第 11 步：删除项
     let mut need_daemon_reload2 = false;
+    // 本轮删过文件的受管单元 drop-in 目录（删完若空则连目录一起清掉，见循环之后）
+    let mut dropin_dirs: BTreeSet<PathBuf> = BTreeSet::new();
     for c in &changes {
         let Change::RemoveFile { path } = c else {
             continue;
@@ -372,8 +376,28 @@ pub fn apply(input: ApplyInput<'_>, host: &dyn Host) -> ApplyOutcome {
                 if path.starts_with("/etc/systemd/system") {
                     need_daemon_reload2 = true;
                 }
+                if let Some(dir) = path.parent().filter(|d| is_managed_dropin_dir(d)) {
+                    dropin_dirs.insert(dir.to_path_buf());
+                }
             }
             Err(e) => out.errors.push(format!("{} 删除失败：{e}", path.display())),
+        }
+    }
+    // 受管单元的 `<unit>.service.d/` 被清空了就把目录一并删掉（**只删空目录**）：
+    // 留一个空 drop-in 目录在那儿，官方安装器或云厂商 agent 下次再往里塞一个片段就又能悄悄
+    // 覆盖 ExecStart，而单元文件本体对账起来毫无差异（2026-09-12 bwg-rick 首切的 xray 就是这样）。
+    // 目录里还有别人的 drop-in 时一定要留着，否则连带删掉运维手写的片段。
+    for dir in dropin_dirs {
+        if host.is_dir(&dir).unwrap_or(false)
+            && host.list_dir(&dir).map(|v| v.is_empty()).unwrap_or(false)
+        {
+            match host.remove_dir_all(&dir) {
+                Ok(()) => {
+                    out.changed.push(dir.display().to_string());
+                    need_daemon_reload2 = true;
+                }
+                Err(e) => out.errors.push(format!("{} 删除失败：{e}", dir.display())),
+            }
         }
     }
     if need_daemon_reload2 {
@@ -393,7 +417,7 @@ pub fn apply(input: ApplyInput<'_>, host: &dyn Host) -> ApplyOutcome {
             UnitAction::Restart => "restart",
             UnitAction::Reload => "reload",
         };
-        if host.systemd(verb, &unit.name).is_ok_and(|o| o.ok()) {
+        if activate(host, &unit) {
             record_restarted(&mut out, &unit.name);
             continue;
         }
@@ -410,20 +434,97 @@ pub fn apply(input: ApplyInput<'_>, host: &dyn Host) -> ApplyOutcome {
         if restored_a_unit_file {
             let _ = host.systemd_daemon_reload();
         }
-        if host.systemd(verb, &unit.name).is_ok_and(|o| o.ok()) {
+        if activate(host, &unit) {
             record_restarted(&mut out, &unit.name);
             out.notes.push(format!(
                 "{} {verb} 失败，已回滚上一版配置并重启成功",
                 unit.name
             ));
         } else {
+            // 上一版配置也起不来：这一轮对账必须是**失败**（errors 非空 → `/api/health` degraded、
+            // `bui status` 显示 degraded 原因），并且把原因抄进去——2026-09-12 bwg-rick 首切时
+            // 这里只报「已回滚上一版配置并重启成功」，真相是 start-limit-hit、caddy 处于 failed，
+            // NBDpsy 的生产站点断了几分钟没人看出来。
             out.errors.push(format!(
-                "{} {verb} 失败，已回滚上一版配置但仍未起来",
-                unit.name
+                "回滚后 {} 仍未运行：{}",
+                unit.name,
+                failure_detail(host, &unit)
             ));
         }
     }
     out
+}
+
+/// `/etc/systemd/system/<受管单元>.service.d` → true。只认这一层：别人的单元
+/// （发行版的 `ssh.service.d`、云厂商 agent 的目录）不是我们的地盘，空了也不许删。
+fn is_managed_dropin_dir(dir: &Path) -> bool {
+    dir.parent() == Some(Path::new("/etc/systemd/system"))
+        && dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .and_then(|n| n.strip_suffix(".service.d"))
+            .is_some_and(|unit| MANAGED_UNITS.contains(&unit))
+}
+
+/// 让一个单元「现在真的在跑」：restart 走 `reset-failed` → `restart` → `is-active` 三步。
+///
+/// - **先 reset-failed**：连着几次 203/EXEC 之后 systemd 记住了 start-limit，后面的 `restart`
+///   一律被拒（`start request repeated too quickly`）。不清这个计数器，回滚了也起不来，
+///   正常路径同样会被上一轮的失败挡住——所以两条路径都先清。
+/// - **以 is-active 为准**：`systemctl restart` 的退出码不可靠（退 0 而单元随即 failed 是常态），
+///   只有 `is-active` 能回答「现在到底活着没有」。
+///
+/// `reload` 这一支只看退出码：reload 不改变激活态，而对一个没在跑的单元 `systemctl reload`
+/// 本来就退非 0，退出码已经是可靠信号（多跑一次 reset-failed 反而会清掉运维要看的失败记录）。
+fn activate(host: &dyn Host, unit: &Unit) -> bool {
+    match unit.action {
+        UnitAction::Reload => host.systemd("reload", &unit.name).is_ok_and(|o| o.ok()),
+        UnitAction::Restart => {
+            let _ = host.systemd("reset-failed", &unit.name);
+            host.systemd("restart", &unit.name).is_ok_and(|o| o.ok())
+                && host.unit_is_active(&unit.name).unwrap_or(false)
+        }
+    }
+}
+
+/// 单元没起来时给运维一行能直接抓的线索：优先 journal 最后一行，拿不到就退回
+/// `ActiveState/SubState/Result` 三个属性。relay 的日志里可能带住宅上游的凭据，所以过一遍脱敏；
+/// 长行截断，免得一条报错把 `/api/health` 的 JSON 撑爆。
+fn failure_detail(host: &dyn Host, unit: &Unit) -> String {
+    let full = unit.service();
+    if host.which("journalctl") {
+        if let Ok(o) = host.run(
+            "journalctl",
+            &["-u", &full, "-n", "1", "--no-pager", "-o", "cat"],
+        ) {
+            if let Some(line) = o.stdout.lines().rev().find(|l| !l.trim().is_empty()) {
+                return trim_detail(&crate::redact::url_credentials(line.trim()));
+            }
+        }
+    }
+    let props: Vec<String> = ["ActiveState", "SubState", "Result"]
+        .iter()
+        .filter_map(|p| {
+            host.unit_property(&unit.name, p)
+                .ok()
+                .flatten()
+                .filter(|v| !v.trim().is_empty())
+                .map(|v| format!("{p}={}", v.trim()))
+        })
+        .collect();
+    if props.is_empty() {
+        "journalctl 与 systemctl show 都没有输出，请人工看 `systemctl status`".to_string()
+    } else {
+        props.join(" ")
+    }
+}
+
+/// 报错里的细节最多 240 字符。
+fn trim_detail(s: &str) -> String {
+    if s.chars().count() <= 240 {
+        return s.to_string();
+    }
+    format!("{}…", s.chars().take(240).collect::<String>())
 }
 
 fn record_restarted(out: &mut ApplyOutcome, name: &str) {
@@ -657,6 +758,8 @@ mod tests {
                 "write:/opt/b-ui/config.yaml:600",
                 "write:/etc/systemd/system/b-ui.service:644",
                 "daemon-reload",
+                // restart 之前一定先 reset-failed：上一轮留下的 start-limit 会让这次直接被拒
+                "systemd:reset-failed:hysteria-server",
                 "systemd:restart:hysteria-server",
             ],
             "b-ui 不在同步重启序列里（第 12 步）：在守护进程里第一条就会把自己杀掉"
@@ -824,13 +927,114 @@ mod tests {
             h.ops(),
             vec![
                 "write:/opt/b-ui/config.yaml:600",
+                "systemd:reset-failed:hysteria-server",
                 "systemd:restart:hysteria-server",
                 "write:/opt/b-ui/config.yaml:600",
+                "systemd:reset-failed:hysteria-server",
                 "systemd:restart:hysteria-server",
             ]
         );
         assert_eq!(out.errors.len(), 1);
-        assert!(out.errors[0].contains("hysteria-server"));
+        assert!(
+            out.errors[0].contains("回滚后 hysteria-server 仍未运行"),
+            "{}",
+            out.errors[0]
+        );
+    }
+
+    /// 2026-09-12 bwg-rick 首切实录：caddy 单元 203/EXEC 之后报告写「已回滚上一版配置并重启成功」，
+    /// 真相是 start-limit-hit、单元处于 failed，NBDpsy 生产站点断了几分钟没人看出来。
+    /// 判据只能是 `is-active`：`systemctl restart` 的退出码退 0 不代表单元活着。
+    #[test]
+    fn a_restart_that_returns_zero_but_leaves_the_unit_dead_is_reported_as_still_down() {
+        let h = FakeHost::new();
+        h.with(|i| {
+            // restart 退 0，单元却永远起不来（203/EXEC、start-limit-hit 都是这个形态）
+            i.never_active.insert("caddy".into());
+            i.which.insert("journalctl".into());
+            i.scripted.push((
+                "journalctl -u caddy.service".into(),
+                CmdOut::success("caddy.service: Start request repeated too quickly.\n"),
+            ));
+            i.files
+                .insert("/opt/b-ui/Caddyfile".into(), (b"old\n".to_vec(), 0o644));
+        });
+        let plan = Plan {
+            changes: vec![Change::WriteFile {
+                path: "/opt/b-ui/Caddyfile".into(),
+                content: b"new\n".to_vec(),
+                mode: 0o644,
+                verify: None,
+                restart: Some(Unit::restart("caddy")),
+            }],
+            keys: Default::default(),
+            unchanged: 0,
+        };
+        let out = run(plan, &h, &NoopInstaller);
+        assert_eq!(
+            h.ops(),
+            vec![
+                "write:/opt/b-ui/Caddyfile:644",
+                "systemd:reset-failed:caddy",
+                "systemd:restart:caddy",
+                "write:/opt/b-ui/Caddyfile:644",
+                "systemd:reset-failed:caddy",
+                "systemd:restart:caddy",
+                "run:journalctl -u caddy.service -n 1 --no-pager -o cat",
+            ],
+            "reset-failed 必须排在每次 restart 之前（start-limit 是常态坑）"
+        );
+        assert_eq!(
+            h.text("/opt/b-ui/Caddyfile").as_deref(),
+            Some("old\n"),
+            "回滚到上一版内容"
+        );
+        assert!(out.restarted.is_empty(), "没起来就不算重启成功");
+        assert!(
+            !out.notes.iter().any(|n| n.contains("重启成功")),
+            "不许再报「回滚上一版配置并重启成功」：{:?}",
+            out.notes
+        );
+        assert_eq!(out.errors.len(), 1, "{:?}", out.errors);
+        assert!(
+            out.errors[0].contains("回滚后 caddy 仍未运行")
+                && out.errors[0].contains("Start request repeated too quickly"),
+            "{}",
+            out.errors[0]
+        );
+    }
+
+    /// 拿不到 journal（机器上没有 journalctl / 输出为空）时退回单元属性，而不是给一句空原因。
+    #[test]
+    fn without_journalctl_the_failure_reason_falls_back_to_unit_properties() {
+        let h = FakeHost::new();
+        h.with(|i| {
+            i.never_active.insert("xray".into());
+            i.unit_props.insert(
+                ("xray.service".into(), "ActiveState".into()),
+                "failed".into(),
+            );
+            i.unit_props
+                .insert(("xray.service".into(), "Result".into()), "exit-code".into());
+        });
+        let plan = Plan {
+            changes: vec![Change::WriteUnit {
+                path: "/etc/systemd/system/xray.service".into(),
+                content: "[Service]\n".into(),
+                unit: Unit::restart("xray"),
+            }],
+            keys: Default::default(),
+            unchanged: 0,
+        };
+        let out = run(plan, &h, &NoopInstaller);
+        assert_eq!(out.errors.len(), 1, "{:?}", out.errors);
+        assert!(
+            out.errors[0].contains("回滚后 xray 仍未运行")
+                && out.errors[0].contains("ActiveState=failed")
+                && out.errors[0].contains("Result=exit-code"),
+            "{}",
+            out.errors[0]
+        );
     }
 
     #[test]
@@ -935,6 +1139,7 @@ mod tests {
                 "write:/etc/systemd/system/xray.service:644",
                 "daemon-reload",
                 "systemd:enable:xray",
+                "systemd:reset-failed:xray",
                 "systemd:restart:xray",
             ],
             "本轮要 restart 的单元不再额外 start（首装时会变成 start 后紧跟 restart 的双启动）"
