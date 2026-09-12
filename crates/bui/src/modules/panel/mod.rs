@@ -205,6 +205,9 @@ impl Shared {
 
 pub struct PanelModule {
     shared: Arc<Shared>,
+    /// 包缓存任务（`packages::cache_loop`）用的下载器。生产是 [`crate::kernels::HttpFetcher`]，
+    /// 测试用 [`PanelModule::with_fetcher`] 注入内存 fake，于是 `spawn` 出来的任务不可能出网。
+    fetcher: Arc<dyn crate::kernels::Fetcher>,
 }
 
 impl PanelModule {
@@ -216,7 +219,17 @@ impl PanelModule {
     }
 
     pub fn with_shared(shared: Arc<Shared>) -> Self {
-        Self { shared }
+        Self {
+            shared,
+            fetcher: Arc::new(crate::kernels::HttpFetcher::new()),
+        }
+    }
+
+    /// 换掉包缓存用的 `Fetcher`（只有测试需要；生产走 [`PanelModule::new`] 的 `HttpFetcher`）。
+    #[cfg(test)]
+    pub fn with_fetcher(mut self, fetcher: Arc<dyn crate::kernels::Fetcher>) -> Self {
+        self.fetcher = fetcher;
+        self
     }
 
     pub fn shared(&self) -> Arc<Shared> {
@@ -257,12 +270,14 @@ impl Module for PanelModule {
     /// 三个后台任务，顺序固定：①10 秒采样 ②用户同步反应器（事件驱动 + 60 秒）③每日包缓存。
     fn spawn(&self, ctx: DaemonCtx) -> Vec<tokio::task::JoinHandle<()>> {
         self.shared.set_paths(&ctx.paths);
-        let fetcher: Arc<dyn crate::kernels::Fetcher> =
-            Arc::new(crate::kernels::HttpFetcher::new());
         vec![
             tokio::spawn(traffic::sampling_loop(ctx.clone(), self.shared.clone())),
             tokio::spawn(users::sync_loop(ctx.clone(), self.shared.clone())),
-            tokio::spawn(packages::cache_loop(ctx, self.shared.clone(), fetcher)),
+            tokio::spawn(packages::cache_loop(
+                ctx,
+                self.shared.clone(),
+                self.fetcher.clone(),
+            )),
         ]
     }
 }
@@ -486,6 +501,24 @@ mod tests {
         }
     }
 
+    /// 只记 URL、一律失败的 `Fetcher`：注入它之后，`spawn` 出来的包缓存任务
+    /// **不可能**碰到 `HttpFetcher`（铁律：测试不出网）。
+    #[derive(Default)]
+    struct FakeFetcher(std::sync::Mutex<Vec<String>>);
+
+    impl FakeFetcher {
+        fn urls(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl crate::kernels::Fetcher for FakeFetcher {
+        fn get_bytes(&self, url: &str) -> anyhow::Result<Vec<u8>> {
+            self.0.lock().unwrap().push(url.to_string());
+            anyhow::bail!("fake fetcher 不出网")
+        }
+    }
+
     #[tokio::test]
     async fn spawn_starts_three_tasks_and_hands_the_paths_to_shared() {
         let h = testsupport::harness().await;
@@ -493,7 +526,31 @@ mod tests {
             Box::new(super::fakes::FakeXray::new()),
             Box::new(super::fakes::FakeHy2::new()),
         );
-        let m = PanelModule::with_shared(std::sync::Arc::new(s));
+        // 播一份 manifest 缓存，让包缓存任务真的走到取二进制那一步（否则它直接跳过本轮，
+        // 「注入生效」就没被证明过）
+        let fetcher = std::sync::Arc::new(FakeFetcher::default());
+        let mut artifacts = serde_json::Map::new();
+        let mut want: Vec<String> = Vec::new();
+        for name in packages::CLIENT_BINARIES {
+            for arch in packages::CLIENT_ARCHES {
+                let url = format!("https://fake.invalid/{name}-linux-{arch}");
+                artifacts.insert(
+                    format!("{name}-linux-{arch}"),
+                    serde_json::json!({"url": url, "sha256": "00"}),
+                );
+                want.push(url);
+            }
+        }
+        let manifest =
+            serde_json::json!({"version": "4.0.0", "kernels": {}, "artifacts": artifacts});
+        h.host.with(|i| {
+            i.files.insert(
+                crate::paths::manifest_file(&h.paths),
+                (serde_json::to_vec(&manifest).unwrap(), 0o600),
+            );
+        });
+        let m = PanelModule::with_shared(std::sync::Arc::new(s))
+            .with_fetcher(fetcher.clone() as Arc<dyn crate::kernels::Fetcher>);
         let ctx = crate::reconcile::DaemonCtx {
             store: h.store.clone(),
             runtime: h.runtime.clone(),
@@ -505,7 +562,15 @@ mod tests {
         assert_eq!(handles.len(), 3, "采样 / 用户同步 / 包缓存");
         assert_eq!(m.shared().paths().base_dir, h.paths.base_dir);
         // 让第一轮跑完再收摊，确认三个任务都没有立刻 panic
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        for _ in 0..200 {
+            if fetcher.urls().len() == want.len() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let mut got = fetcher.urls();
+        got.sort();
+        assert_eq!(got, want, "包缓存任务取的是注入进来的 Fetcher");
         for hd in &handles {
             assert!(!hd.is_finished(), "后台任务不该自己结束");
         }

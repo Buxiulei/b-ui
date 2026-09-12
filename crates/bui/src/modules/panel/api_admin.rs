@@ -294,7 +294,9 @@ async fn set_password(State(app): State<AppState>, body: Bytes) -> Response {
     };
     // 决策 D11：轮换 JWT 密钥，让旧 token 立即失效（v3 靠重启进程达到同样效果）
     let secret = hex::encode(rand::random::<[u8; 32]>());
-    tracing::info!(password = %crate::redact::secret(pw), "管理员密码已更新并轮换 JWT 密钥");
+    // 日志里关于密码一个字都不留（连长度也不留：`redact::secret` 会漏出字符数），
+    // 只记「这件事发生过」。
+    tracing::info!("管理员密码已更新并轮换 JWT 密钥");
     if let Err(e) = app
         .store
         .update(|s| {
@@ -718,6 +720,61 @@ mod tests {
             "newpass123"
         ));
         assert_ne!(st.admin.jwt_secret, before, "决策 D11：旧 token 立即失效");
+    }
+
+    /// 终审收尾：换密码时**日志与回包都不许出现密码的任何信息，连长度都不许**
+    /// （`redact::secret` 会漏出字符数）；只留「管理员密码已更新」这件事本身可审计。
+    ///
+    /// 为什么锁源码而不是拿测试订阅器抓日志：tracing 的回调点 `Interest` 是**全局**缓存，
+    /// 并行跑的别的测试先命中同一个 `info!`（当时没有任何订阅器）就会把它缓存成
+    /// 「永不感兴趣」，本线程后装的订阅器再也收不到 —— 实测在整套 panel 测试里必然 flaky。
+    #[test]
+    fn set_password_logs_nothing_about_the_password() {
+        let src = include_str!("api_admin.rs");
+        let after = src
+            .split_once("async fn set_password(")
+            .expect("set_password 还在吧？")
+            .1;
+        let body = after
+            .split_once("\nasync fn ")
+            .map(|(b, _)| b)
+            .unwrap_or(after);
+        let logs: Vec<&str> = body.lines().filter(|l| l.contains("tracing::")).collect();
+        assert_eq!(logs.len(), 1, "set_password 只该有那一条日志：{logs:?}");
+        assert!(
+            logs[0].contains("管理员密码已更新"),
+            "换密码这件事仍要留痕：{logs:?}"
+        );
+        // `pw` / `redact::secret(pw)` / 任何字符数都不许进这一行
+        for leak in ["pw", "secret", "redact", "count()", "len()"] {
+            assert!(
+                !logs[0].contains(leak),
+                "这条日志里不许出现 {leak:?}（长度也算信息）：{}",
+                logs[0]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn changing_the_admin_password_answers_without_echoing_it() {
+        const PW: &str = "hunter2-correct-horse";
+        let h = harness().await;
+        let (r, t) = app(&h).await;
+        let (s, v) = send(
+            &r,
+            "POST",
+            "/api/password",
+            Some(&t),
+            Some(serde_json::json!({"newPassword": PW})),
+        )
+        .await;
+        assert_eq!(s, axum::http::StatusCode::OK);
+        let body = v.to_string();
+        let len = PW.chars().count().to_string();
+        assert!(
+            !body.contains(PW) && !body.contains(len.as_str()) && !body.contains("***"),
+            "回包不许带密码的任何信息（含长度）：{body}"
+        );
     }
 
     #[tokio::test]
