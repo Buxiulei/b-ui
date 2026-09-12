@@ -10,6 +10,14 @@
 //!
 //! manifest 地址只在 [`resolve_manifest_url`] / [`manifest_url`] 决定一次（总纲 C4「manifest
 //! 来源与覆盖」）：`--manifest-url` > `--version`（套模板）> `$BUI_MANIFEST_URL` > 内置 latest。
+//! 「什么都没指定」这一支还有一步回退：GitHub 的 `releases/latest` 不解析预发布，所以 rc 阶段
+//! `latest/download/manifest.json` 必然 404 —— [`fetch_manifest_with`] 在**本机自己就是预发布**
+//! 时改跟 releases 列表里最新的 `v*-rcN`（裁决记录「发布：预发布与首推（2026-09-12）」）。
+//! 「本机是预发布」只认 **tag**（[`on_prerelease_channel`]）：编译进二进制的发布 tag
+//! （[`BUILD_TAG`]）或 manifest 缓存里记的 [`Manifest::tag`]。**版本号不是信号**——
+//! `scripts/release/check-version.sh` 强制 workspace version 是纯 semver，`release.yml` 的
+//! verify 又先把 `-rcN` 从 tag 上剥掉再校验，所以 `v4.0.0-rc1` 构建出来的二进制
+//! `CARGO_PKG_VERSION` 与 manifest 的 `version` 都是 `4.0.0`，永远不含 `-rc`。
 
 use crate::reconcile::apply::BinaryInstaller;
 use crate::sys::Host;
@@ -33,12 +41,33 @@ pub const MANIFEST_URL_TEMPLATE: &str =
 /// 环境变量覆盖（总纲 C4「manifest 来源与覆盖」明写由 P1 实现）。
 pub const MANIFEST_URL_ENV: &str = "BUI_MANIFEST_URL";
 
+/// 发布时**编译进**二进制的真实 tag：`release.yml` 的 build 作业经 `BUI_BUILD_TAG` 传入
+/// （`needs.verify.outputs.tag`，预发布是 `v4.0.0-rc1`；cross 走容器，靠
+/// `CROSS_BUILD_ENV_PASSTHROUGH` 透传，build 作业有一步断言它真编进去了）。
+/// 本地 `cargo build` 没有这个变量 → `None`，于是本地构建永远不在预发布通道上
+/// （cargo 不跟踪 `option_env!` 的变量：本地改了它要 `touch` 本文件或 `cargo clean` 才会
+/// 重编；CI 每次都是全新的 `target/`，不受影响）。
+///
+/// 这是「本机是预发布」**唯一**可靠的运行期信号：见模块头，版本号里永远不会有 `-rc`。
+pub const BUILD_TAG: Option<&str> = option_env!("BUI_BUILD_TAG");
+
+/// GitHub 的 releases 列表（**无凭据**，只取最近 10 条）：`releases/latest` 不解析预发布，
+/// 预发布通道靠它找最新的 rc tag。仓库与 [`MANIFEST_URL`] 必须是同一个。
+pub const RELEASES_API_URL: &str =
+    "https://api.github.com/repos/Buxiulei/b-ui/releases?per_page=10";
+
 /// 总纲 C4 的形状：`version` 是 bui 自己的版本，`kernels` 是版本表（键 = state `versions` 的
 /// 字段名，下划线），`artifacts` 的键固定 `<name>-linux-<amd64|arm64>`（name = 二进制名，
 /// 连字符）。未知字段一律忽略（serde 默认），P5 往 manifest 里加字段不会打死 P1。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
     pub version: String,
+    /// 发布这份 manifest 的 Release tag（`gen-manifest.sh --tag` 写入，预发布是
+    /// `v4.0.0-rc1`）。C4 要求 `version` 是纯 semver，所以 rc 只能从这里看出来：装机/升级
+    /// 把 manifest 落盘成缓存后，它就是「本机在预发布通道上」的信号（[`on_prerelease_channel`]）。
+    /// 老 manifest 没有这个字段 → `None`（等于「不知道，按正式版算」）。
+    #[serde(default)]
+    pub tag: Option<String>,
     #[serde(default)]
     pub kernels: BTreeMap<String, String>,
     #[serde(default)]
@@ -53,6 +82,18 @@ pub struct Manifest {
 pub struct Asset {
     pub url: String,
     pub sha256: String,
+}
+
+/// 一次 404（或 `releases/latest` 还没有这个资产）。预发布回退必须把「没这个文件」与
+/// 「网络断了 / JSON 坏了」分开，所以 404 单独成型，判断靠 `anyhow` 的 downcast
+/// （[`is_not_found`]），不靠匹配错误串。
+#[derive(Debug, thiserror::Error)]
+#[error("下载 {0} 失败：HTTP 404")]
+pub struct NotFound(pub String);
+
+/// 错误链里有没有 [`NotFound`]。
+pub fn is_not_found(err: &anyhow::Error) -> bool {
+    err.chain().any(|c| c.is::<NotFound>())
 }
 
 /// **同步** trait：实现会阻塞线程，所以每个调用点都必须在 `tokio::task::spawn_blocking` 里
@@ -118,6 +159,10 @@ impl Fetcher for HttpFetcher {
             anyhow::Error::new(e)
                 .context(format!("下载 {} 失败", crate::redact::url_credentials(url)))
         })?;
+        // 404 单独成型：预发布通道回退要认出它（见 [`fetch_manifest_with`]）
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(NotFound(crate::redact::url_credentials(url)).into());
+        }
         if !resp.status().is_success() {
             anyhow::bail!(
                 "下载 {} 失败：HTTP {}",
@@ -175,9 +220,54 @@ pub fn artifact_key(name: &str, arch: &str) -> anyhow::Result<String> {
     Ok(format!("{name}-linux-{}", asset_arch(arch)?))
 }
 
-/// `MANIFEST_URL_TEMPLATE` 代入版本号。
+/// 指定 **tag** 的 manifest：预发布回退拿到的是 tag（`v4.0.0-rc1`），不是纯版本号。
+/// [`MANIFEST_URL_TEMPLATE`] 里的 `v{version}` 就是 tag 那一段。
+pub fn manifest_url_for_tag(tag: &str) -> String {
+    MANIFEST_URL_TEMPLATE.replace("v{version}", tag)
+}
+
+/// `MANIFEST_URL_TEMPLATE` 代入版本号（tag = `v<version>`）。
 pub fn manifest_url_for_version(version: &str) -> String {
-    MANIFEST_URL_TEMPLATE.replace("{version}", version.trim_start_matches('v'))
+    manifest_url_for_tag(&format!("v{}", version.trim_start_matches('v')))
+}
+
+/// tag 是不是 `^v\d+\.\d+\.\d+-rc\d+$`（整串锚定；不引 regex crate，手写）。
+pub fn is_rc_tag(tag: &str) -> bool {
+    fn digits(s: &str) -> bool {
+        !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+    }
+    let Some((core, rc)) = tag.strip_prefix('v').and_then(|r| r.split_once("-rc")) else {
+        return false;
+    };
+    let mut seg = core.split('.');
+    let three = [seg.next(), seg.next(), seg.next()];
+    seg.next().is_none() && three.iter().all(|s| s.is_some_and(digits)) && digits(rc)
+}
+
+/// 本机是不是在预发布通道上：编译进来的发布 tag 是 rc，或 manifest 缓存里记的 tag 是 rc。
+/// 两个入参都只接受 **tag**（`v<x.y.z>[-rcN]`），不接受版本号——版本号认不出 rc（见模块头）。
+pub fn on_prerelease_channel(build_tag: Option<&str>, cached_tag: Option<&str>) -> bool {
+    build_tag.is_some_and(is_rc_tag) || cached_tag.is_some_and(is_rc_tag)
+}
+
+/// GitHub releases 列表里的一条（只取用得上的两个字段，其余忽略）。
+#[derive(Debug, Deserialize)]
+struct GhRelease {
+    tag_name: String,
+    #[serde(default)]
+    prerelease: bool,
+}
+
+/// releases 列表里最新的预发布 rc tag：列表按创建时间倒序，取第一个 `prerelease=true`
+/// 且 tag 形如 `v<x.y.z>-rcN` 的。没有就 `None`（调用方把原来的 404 上抛）。
+pub fn latest_rc_tag(fetcher: &dyn Fetcher) -> anyhow::Result<Option<String>> {
+    let bytes = fetcher.get_bytes(RELEASES_API_URL)?;
+    let list: Vec<GhRelease> =
+        serde_json::from_slice(&bytes).context("解析 GitHub releases 列表失败")?;
+    Ok(list
+        .into_iter()
+        .find(|r| r.prerelease && is_rc_tag(&r.tag_name))
+        .map(|r| r.tag_name))
 }
 
 /// **唯一**一处决定 manifest 地址（纯函数，便于测试）：
@@ -199,6 +289,76 @@ pub fn resolve_manifest_url(
 pub fn manifest_url(cli_override: Option<&str>, version: Option<&str>) -> String {
     let env = std::env::var(MANIFEST_URL_ENV).ok();
     resolve_manifest_url(cli_override, version, env.as_deref())
+}
+
+/// C4 那三个覆盖是否**都没给**（空串按没给算，与 [`resolve_manifest_url`] 同一口径）。
+/// 预发布回退只在这种「跟着 latest 走」的情况下才允许发生。
+fn nothing_specified(cli_override: Option<&str>, version: Option<&str>, env: Option<&str>) -> bool {
+    [cli_override, version, env]
+        .iter()
+        .all(|o| !o.is_some_and(|s| !s.is_empty()))
+}
+
+/// 按 C4 的顺序算地址并把 manifest 拉回来，返回 **(实际用的 url, manifest)**。
+///
+/// 比 [`resolve_manifest_url`] 多的只有一件事：**未指定版本**（没有 `--manifest-url`、没有
+/// `--version`、没有 `$BUI_MANIFEST_URL`，也就是跟着 `latest` 走）时若拿到 404，且本机自己
+/// 就在预发布通道上，就改跟 GitHub releases 列表里最新的 `v<x.y.z>-rcN`
+/// （裁决记录「发布：预发布与首推（2026-09-12）」：rc1 发布时仓库里还没有正式版，
+/// `releases/latest/download/manifest.json` 必然 404）。
+///
+/// 两条边界：
+/// - **指定了地址或版本就只认那一个**，404 原样上抛——不许把人从指定源拽回预发布通道。
+///   判据是「三个覆盖都没给」（[`nothing_specified`]），不是「算出来的 url 恰好等于
+///   [`MANIFEST_URL`]」：后者会让把 `$BUI_MANIFEST_URL` 设成内置 latest 同一串的人也被回退；
+/// - **正式版不回退**（只跟 latest），否则一次 rc 就能把所有正式版机器拽上预发布轨道。
+///
+/// 「本机是预发布」的信号见 [`on_prerelease_channel`]：`build_tag` 传 [`BUILD_TAG`]，
+/// `cached_tag` 传 manifest 缓存里的 [`Manifest::tag`]。
+pub fn fetch_manifest_with(
+    fetcher: &dyn Fetcher,
+    cli_override: Option<&str>,
+    version: Option<&str>,
+    env: Option<&str>,
+    build_tag: Option<&str>,
+    cached_tag: Option<&str>,
+) -> anyhow::Result<(String, Manifest)> {
+    let url = resolve_manifest_url(cli_override, version, env);
+    match Manifest::from_url(fetcher, &url) {
+        Ok(m) => Ok((url, m)),
+        Err(e) if nothing_specified(cli_override, version, env) && is_not_found(&e) => {
+            if !on_prerelease_channel(build_tag, cached_tag) {
+                return Err(e);
+            }
+            let Some(tag) = latest_rc_tag(fetcher)? else {
+                return Err(e);
+            };
+            let rc_url = manifest_url_for_tag(&tag);
+            tracing::info!(tag = %tag, "latest 里没有 manifest（GitHub 不把预发布算 latest），改跟预发布通道");
+            let m = Manifest::from_url(fetcher, &rc_url)?;
+            Ok((rc_url, m))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// 读进程环境与编译期 tag 后调 [`fetch_manifest_with`]；`cached_tag` 传 manifest 缓存
+/// （`<base>/manifest.json`）里记的 [`Manifest::tag`]，没有缓存或老 manifest 就传 `None`。
+pub fn fetch_manifest(
+    fetcher: &dyn Fetcher,
+    cli_override: Option<&str>,
+    version: Option<&str>,
+    cached_tag: Option<&str>,
+) -> anyhow::Result<(String, Manifest)> {
+    let env = std::env::var(MANIFEST_URL_ENV).ok();
+    fetch_manifest_with(
+        fetcher,
+        cli_override,
+        version,
+        env.as_deref(),
+        BUILD_TAG,
+        cached_tag,
+    )
 }
 
 /// 从内核的 `version` 输出里反解版本号（每个内核的格式都不一样，注释里是本机实测的第一行）。
@@ -369,17 +529,38 @@ mod tests {
 
     struct FakeFetcher {
         files: Mutex<Vec<(String, Vec<u8>)>>,
+        seen: Mutex<Vec<String>>,
+    }
+
+    impl FakeFetcher {
+        fn new(files: Vec<(&str, &str)>) -> Self {
+            Self {
+                files: Mutex::new(
+                    files
+                        .into_iter()
+                        .map(|(u, b)| (u.to_string(), b.as_bytes().to_vec()))
+                        .collect(),
+                ),
+                seen: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn seen(&self) -> Vec<String> {
+            self.seen.lock().unwrap().clone()
+        }
     }
 
     impl Fetcher for FakeFetcher {
         fn get_bytes(&self, url: &str) -> anyhow::Result<Vec<u8>> {
+            self.seen.lock().unwrap().push(url.to_string());
             self.files
                 .lock()
                 .unwrap()
                 .iter()
                 .find(|(u, _)| u == url)
                 .map(|(_, b)| b.clone())
-                .ok_or_else(|| anyhow::anyhow!("404 {url}"))
+                // 真 HttpFetcher 的 404 是 `NotFound`，预发布回退靠它判断：假的必须一致
+                .ok_or_else(|| NotFound(url.to_string()).into())
         }
     }
 
@@ -401,6 +582,7 @@ mod tests {
         let json = MANIFEST_JSON.replace("PLACE_SUM", &sha256_hex(payload));
         let m: Manifest = serde_json::from_str(&json).unwrap();
         let f = FakeFetcher {
+            seen: Mutex::new(Vec::new()),
             files: Mutex::new(vec![
                 ("https://x/manifest.json".into(), json.into_bytes()),
                 ("https://x/hysteria".into(), payload.to_vec()),
@@ -474,6 +656,11 @@ mod tests {
             manifest_url_for_version("4.0.1"),
             resolve_manifest_url(None, Some("4.0.1"), None)
         );
+        assert_eq!(
+            manifest_url_for_tag("v4.0.0-rc1"),
+            "https://github.com/Buxiulei/b-ui/releases/download/v4.0.0-rc1/manifest.json",
+            "预发布回退拿到的是 tag，不是纯版本号"
+        );
     }
 
     #[test]
@@ -494,9 +681,173 @@ mod tests {
         let m = Manifest::from_url(&f, p.to_str().unwrap()).unwrap();
         assert_eq!(m.version, "4.0.1");
         assert_eq!(m.min_upgrade_from, None, "可选字段缺失不报错");
+        assert_eq!(m.tag, None, "老 manifest 没有 tag：按「不知道」算");
         assert!(f
             .get_bytes(&d.path().join("nope.json").display().to_string())
             .is_err());
+    }
+
+    /// 预发布通道回退用的 fixture（裁决记录「发布：预发布与首推（2026-09-12）」）。
+    /// **这是 rc 机器的真实形状**：C4 要求 `version` 是纯 semver，`check-version.sh` 与
+    /// `release.yml` 的 verify 也一起把 `-rcN` 从版本号上剥掉，所以 rc 只写在 `tag` 上。
+    const RC_MANIFEST: &str =
+        r#"{"version":"4.0.0","tag":"v4.0.0-rc2","kernels":{},"artifacts":{}}"#;
+    const PLAIN_MANIFEST: &str =
+        r#"{"version":"4.0.0","tag":"v4.0.0","kernels":{},"artifacts":{}}"#;
+    /// GitHub 的 releases 列表按创建时间倒序。第 1 条是 rc 形状但 `prerelease=false`
+    /// （必须跳过），第 2 条是 prerelease 但 tag 不匹配（必须跳过）。
+    const RELEASES_JSON: &str = r#"[
+      {"tag_name": "v4.0.1-rc1", "prerelease": false},
+      {"tag_name": "nightly",    "prerelease": true},
+      {"tag_name": "v4.0.0-rc2", "prerelease": true},
+      {"tag_name": "v4.0.0-rc1", "prerelease": true},
+      {"tag_name": "v3.9.9",     "prerelease": false}
+    ]"#;
+
+    #[test]
+    fn rc_tag_matching_is_anchored() {
+        assert!(is_rc_tag("v4.0.0-rc1"));
+        assert!(is_rc_tag("v10.2.30-rc12"));
+        assert!(!is_rc_tag("v4.0.0"), "正式版不是 rc");
+        assert!(!is_rc_tag("4.0.0-rc1"), "少 v 前缀");
+        assert!(!is_rc_tag("v4.0-rc1"), "少一段");
+        assert!(!is_rc_tag("v4.0.0-rc"), "rc 后面必须有数字");
+        assert!(!is_rc_tag("v4.0.0-rc1x"), "整串锚定：后面不许有尾巴");
+        assert!(!is_rc_tag("v4.0.0-rc1-rc2"), "整串锚定：不许接第二个 rc");
+    }
+
+    #[test]
+    fn the_prerelease_signal_is_the_tag_never_the_version() {
+        // 版本号不可能带 -rc：`check-version.sh` 只放纯 semver 过，`release.yml` 的 verify
+        // 又把 `-rcN` 从 tag 上剥掉才校验。谁要是把这条当信号，rc 机器就永远回退不了。
+        assert!(
+            !env!("CARGO_PKG_VERSION").contains("-rc"),
+            "workspace version 必须是纯 semver（check-version.sh 强制），所以它不能当预发布信号"
+        );
+        // 信号一：编译进二进制的发布 tag（rc1 装机后没有任何缓存，只能靠它）
+        assert!(on_prerelease_channel(Some("v4.0.0-rc1"), None));
+        // 信号二：manifest 缓存里记的 tag（二进制没带 tag 时的兜底）
+        assert!(on_prerelease_channel(None, Some("v4.0.0-rc1")));
+        // 正式版的两种形状与「什么都不知道」都不算预发布
+        assert!(!on_prerelease_channel(Some("v4.0.0"), Some("v4.0.0")));
+        assert!(!on_prerelease_channel(None, None));
+        // 版本号（没有 v 前缀）即便真带了 -rc 也不是 tag，不认
+        assert!(!on_prerelease_channel(Some("4.0.0-rc1"), Some("4.0.0-rc1")));
+    }
+
+    #[test]
+    fn unspecified_version_follows_latest_when_it_exists() {
+        let f = FakeFetcher::new(vec![(MANIFEST_URL, RC_MANIFEST)]);
+        let (url, m) = fetch_manifest_with(&f, None, None, None, Some("v4.0.0-rc1"), None).unwrap();
+        assert_eq!(url, MANIFEST_URL);
+        assert_eq!(m.version, "4.0.0");
+        assert_eq!(
+            f.seen(),
+            vec![MANIFEST_URL],
+            "latest 拿到了就不该再问 GitHub 的 releases 列表"
+        );
+        // 正式版机器同样只跟 latest（转正之后 rc 机器走的就是这一支）
+        let g = FakeFetcher::new(vec![(MANIFEST_URL, PLAIN_MANIFEST)]);
+        let (url, m) = fetch_manifest_with(&g, None, None, None, Some("v4.0.0"), None).unwrap();
+        assert_eq!(url, MANIFEST_URL);
+        assert_eq!(m.tag.as_deref(), Some("v4.0.0"));
+    }
+
+    #[test]
+    fn a_prerelease_build_falls_back_to_the_newest_rc_when_latest_is_404() {
+        // GitHub 的 releases/latest 不解析预发布：rc1 发布时 latest/download/… 必然 404
+        let rc_url = manifest_url_for_tag("v4.0.0-rc2");
+        let f = FakeFetcher::new(vec![
+            (RELEASES_API_URL, RELEASES_JSON),
+            (&rc_url, RC_MANIFEST),
+        ]);
+        // 信号一：二进制是 rc1 构建的（一台刚用一行命令装好的 rc1 机器：没有 manifest 缓存）
+        let (url, m) = fetch_manifest_with(&f, None, None, None, Some("v4.0.0-rc1"), None).unwrap();
+        assert_eq!(url, rc_url, "取列表里第一个 prerelease=true 且 tag 匹配的");
+        assert_eq!(m.version, "4.0.0");
+        assert_eq!(
+            m.tag.as_deref(),
+            Some("v4.0.0-rc2"),
+            "缓存下来就是下一轮的信号"
+        );
+        assert_eq!(
+            f.seen(),
+            vec![
+                MANIFEST_URL.to_string(),
+                RELEASES_API_URL.to_string(),
+                rc_url.clone()
+            ],
+            "顺序必须是 latest → releases 列表 → rc 的 manifest"
+        );
+        // 信号二：二进制没带 tag（本地构建 / 手搓），但 manifest 缓存里记的 tag 是 rc
+        let (url, _) = fetch_manifest_with(&f, None, None, None, None, Some("v4.0.0-rc1")).unwrap();
+        assert_eq!(url, rc_url);
+        // 指定了地址或版本就只认那一个，404 原样上抛（不许把人从指定源拽回预发布通道）
+        let e = fetch_manifest_with(
+            &f,
+            None,
+            None,
+            Some("https://x/nope.json"),
+            Some("v4.0.0-rc1"),
+            None,
+        )
+        .unwrap_err();
+        assert!(is_not_found(&e), "{e:#}");
+        let e = fetch_manifest_with(&f, None, Some("4.9.9"), None, Some("v4.0.0-rc1"), None)
+            .unwrap_err();
+        assert!(is_not_found(&e), "{e:#}");
+        let e = fetch_manifest_with(
+            &f,
+            Some("/tmp/nope.json"),
+            None,
+            None,
+            Some("v4.0.0-rc1"),
+            None,
+        )
+        .unwrap_err();
+        assert!(is_not_found(&e), "{e:#}");
+    }
+
+    #[test]
+    fn a_formal_build_never_falls_back_to_a_prerelease() {
+        let rc_url = manifest_url_for_tag("v4.0.0-rc2");
+        let files = || {
+            vec![
+                (RELEASES_API_URL.to_string(), RELEASES_JSON.to_string()),
+                (rc_url.clone(), RC_MANIFEST.to_string()),
+            ]
+        };
+        let fake = |v: Vec<(String, String)>| {
+            FakeFetcher::new(v.iter().map(|(u, b)| (u.as_str(), b.as_str())).collect())
+        };
+        // 正式版二进制 + 正式版缓存
+        let f = fake(files());
+        let e =
+            fetch_manifest_with(&f, None, None, None, Some("v4.0.0"), Some("v4.0.0")).unwrap_err();
+        assert!(is_not_found(&e), "404 原样上抛：{e:#}");
+        assert_eq!(
+            f.seen(),
+            vec![MANIFEST_URL],
+            "正式版只跟 latest：连 releases 列表都不许问，否则一次 rc 能把正式版机器拽走"
+        );
+        // 什么都不知道（本地构建、没缓存）也按正式版算
+        let f = fake(files());
+        let e = fetch_manifest_with(&f, None, None, None, None, None).unwrap_err();
+        assert!(is_not_found(&e), "{e:#}");
+        assert_eq!(f.seen(), vec![MANIFEST_URL]);
+        // 把 $BUI_MANIFEST_URL 设成与内置 latest 逐字相同的串也算「指定了」：只认那一个
+        let f = fake(files());
+        let e = fetch_manifest_with(&f, None, None, Some(MANIFEST_URL), Some("v4.0.0-rc1"), None)
+            .unwrap_err();
+        assert!(is_not_found(&e), "{e:#}");
+        assert_eq!(f.seen(), vec![MANIFEST_URL], "指定了就只认那一个");
+        // 预发布通道但列表里没有 rc：仍然只是把 404 上抛
+        let g = FakeFetcher::new(vec![(
+            RELEASES_API_URL,
+            r#"[{"tag_name":"v4.0.0","prerelease":false}]"#,
+        )]);
+        let e = fetch_manifest_with(&g, None, None, None, Some("v4.0.0-rc1"), None).unwrap_err();
+        assert!(is_not_found(&e), "{e:#}");
     }
 
     #[test]

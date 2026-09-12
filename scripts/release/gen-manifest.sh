@@ -9,6 +9,7 @@ LC_ALL=C
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 VERSION=""
+TAG=""
 DIST=""
 LOCK="$HERE/kernels.lock"
 RELEASED=""
@@ -19,13 +20,14 @@ ARTIFACT_NAMES="bui bui-c hysteria xray sing-box caddy"
 ARCHES="amd64 arm64"
 
 usage() {
-    printf '用法：%s --version <x.y.z> --dist <dir> [--lock <kernels.lock>] [--base-url <prefix>] [--released <ISO8601Z>]\n' "$0" >&2
+    printf '用法：%s --version <x.y.z> [--tag <tag>] --dist <dir> [--lock <kernels.lock>] [--base-url <prefix>] [--released <ISO8601Z>]\n' "$0" >&2
     exit 2
 }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --version) VERSION="${2:-}"; shift 2 ;;
+        --tag) TAG="${2:-}"; shift 2 ;;
         --dist) DIST="${2:-}"; shift 2 ;;
         --lock) LOCK="${2:-}"; shift 2 ;;
         --base-url) BASE_URL="${2:-}"; shift 2 ;;
@@ -36,7 +38,13 @@ done
 [[ -n "$VERSION" && -n "$DIST" ]] || usage
 [[ -f "$LOCK" ]] || { printf '找不到 lock：%s\n' "$LOCK" >&2; exit 2; }
 [[ -z "$RELEASED" ]] && RELEASED=$(date -u +%FT%TZ)
-[[ -z "$BASE_URL" ]] && BASE_URL="https://github.com/$REPO/releases/download/v$VERSION/"
+# 预发布的 tag 是 v<x.y.z>-rcN（裁决记录「发布：预发布与首推（2026-09-12）」），而 C4 要求
+# manifest.version 是纯 semver，所以 tag 与 version 分开传；默认 tag = v<version>。
+# 资产 URL 与 changelog_url 都跟 tag 走（rc 的资产挂在 rc 那个 Release 下），tag 本身也写进
+# manifest：装机/升级把 manifest 落盘成缓存后，它是「本机在预发布通道上」的信号之一
+# （crates/bui/src/kernels/mod.rs 的 on_prerelease_channel；version 是纯 semver，认不出 rc）。
+[[ -z "$TAG" ]] && TAG="v$VERSION"
+[[ -z "$BASE_URL" ]] && BASE_URL="https://github.com/$REPO/releases/download/$TAG/"
 [[ "$BASE_URL" == */ ]] || BASE_URL="$BASE_URL/"
 
 lock_version() {
@@ -73,8 +81,9 @@ require_artifacts
 SB_VER=$(lock_version sing-box)
 jq -n \
     --arg version "$VERSION" \
+    --arg tag "$TAG" \
     --arg released "$RELEASED" \
-    --arg changelog "https://github.com/$REPO/releases/tag/v$VERSION" \
+    --arg changelog "https://github.com/$REPO/releases/tag/$TAG" \
     --arg hysteria "$(lock_version hysteria)" \
     --arg xray "$(lock_version xray)" \
     --arg singbox "$SB_VER" \
@@ -82,6 +91,7 @@ jq -n \
     --argjson artifacts "$(artifacts_json)" \
     '{
         version: $version,
+        tag: $tag,
         released: $released,
         changelog_url: $changelog,
         min_upgrade_from: "4.0.0",

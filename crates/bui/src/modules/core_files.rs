@@ -233,6 +233,7 @@ mod tests {
                 ("caddy-linux-amd64".to_string(), asset("https://x/caddy")),
             ]),
             min_upgrade_from: None,
+            tag: None,
         }
     }
 

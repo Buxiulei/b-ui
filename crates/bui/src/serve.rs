@@ -261,20 +261,41 @@ pub async fn debounce_loop(bus: EventBus, tx: tokio::sync::mpsc::Sender<bool>) {
 /// → 刷新共享 manifest 句柄 → 记录可升级版本 → 请求一次对账（内核随 manifest 升级）。
 ///
 /// 只刷内核、**不自动换 bui 自己**：`bui upgrade` 仍由面板 / CLI 手动触发。
+///
+/// `url_override` = `$BUI_MANIFEST_URL`（守护进程没有命令行开关）。没覆盖就跟 `latest`，
+/// 404 时按预发布通道回退——与 `bui upgrade` 用的是 [`crate::kernels::fetch_manifest_with`]
+/// 这同一套解析。
 pub async fn selfcheck_loop(
     ctx: DaemonCtx,
     manifest: Arc<RwLock<Option<Manifest>>>,
     fetcher: Arc<dyn Fetcher>,
-    url: String,
+    url_override: Option<String>,
 ) {
     let node_id = ctx.store.read().await.node.id;
     // 按节点 id 定死的抖动，避免所有机器同一秒打 GitHub（spec §7）
     tokio::time::sleep(std::time::Duration::from_secs(jitter_secs(node_id))).await;
     loop {
         let f = fetcher.clone();
-        let u = url.clone();
-        match tokio::task::spawn_blocking(move || Manifest::from_url(f.as_ref(), &u)).await {
-            Ok(Ok(m)) => {
+        let u = url_override.clone();
+        // 缓存 manifest 里记的 tag 是「本机是否在预发布通道」的信号之一（版本号是纯
+        // semver，认不出 rc：见 kernels 模块头）
+        let cached = manifest
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().and_then(|m| m.tag.clone()));
+        match tokio::task::spawn_blocking(move || {
+            crate::kernels::fetch_manifest_with(
+                f.as_ref(),
+                None,
+                None,
+                u.as_deref(),
+                crate::kernels::BUILD_TAG,
+                cached.as_deref(),
+            )
+        })
+        .await
+        {
+            Ok(Ok((_url, m))) => {
                 // 写缓存：下次启动直接用，拉不到网也能装内核
                 let path = crate::paths::manifest_file(&ctx.paths);
                 match serde_json::to_vec_pretty(&m) {
@@ -298,6 +319,12 @@ pub async fn selfcheck_loop(
                 }
                 // 内核版本随 manifest 走：请求一次对账（不 force）
                 ctx.bus.send(Event::ReconcileRequested { force: false });
+            }
+            // rc 阶段（或正式版还没发）latest 就是 404，而且没有可回退的预发布通道：
+            // 这是预期状态，只记一行 info，不用 warn/error 每天刷一条（裁决记录
+            // 「发布：预发布与首推（2026-09-12）」）
+            Ok(Err(e)) if crate::kernels::is_not_found(&e) => {
+                tracing::info!(error = %e, "每日自检：还没有可用的 manifest，跳过本轮")
             }
             Ok(Err(e)) => tracing::warn!(error = %e, "每日自检拉取 manifest 失败"),
             Err(e) => tracing::warn!(error = %e, "每日自检任务 panic"),
@@ -443,8 +470,9 @@ pub async fn run(paths: Paths, host: Arc<dyn Host>) -> anyhow::Result<()> {
         ctx.clone(),
         reg.manifest.clone(),
         fetcher.clone(),
-        // 总纲 C4：`$BUI_MANIFEST_URL` 可覆盖（M1 时内置 URL 必然 404，演练/装机都靠它）
-        crate::kernels::manifest_url(None, None),
+        // 总纲 C4：`$BUI_MANIFEST_URL` 可覆盖（M1 时内置 URL 必然 404，演练/装机都靠它）；
+        // 没覆盖就跟 latest，404 时按预发布通道回退（见 `selfcheck_loop`）
+        std::env::var(crate::kernels::MANIFEST_URL_ENV).ok(),
     )));
     let sock = PathBuf::from(crate::paths::SOCKET_PATH);
     let admin_bind = format!("127.0.0.1:{}", ctx.store.read().await.node.ports.admin);
@@ -550,7 +578,7 @@ mod tests {
                 .iter()
                 .find(|(u, _)| u == url)
                 .map(|(_, b)| b.clone())
-                .ok_or_else(|| anyhow::anyhow!("404 {url}"))
+                .ok_or_else(|| crate::kernels::NotFound(url.to_string()).into())
         }
     }
 
@@ -913,6 +941,7 @@ mod tests {
                 },
             )]),
             min_upgrade_from: None,
+            tag: None,
         };
         let state = crate::testutil::sample_state();
         let paths = bui_schema::paths::Paths::default_server();
@@ -1012,7 +1041,7 @@ mod tests {
             ctx.clone(),
             handle.clone(),
             fetcher,
-            "https://x/manifest.json".to_string(),
+            Some("https://x/manifest.json".to_string()),
         ));
         // 抖动窗口内什么都不该发生
         tokio::time::sleep(std::time::Duration::from_secs(
@@ -1042,6 +1071,66 @@ mod tests {
             events.recv().await.unwrap(),
             Event::ReconcileRequested { force: false }
         );
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn selfcheck_follows_the_prerelease_channel_when_latest_is_404() {
+        // 裁决记录「发布：预发布与首推（2026-09-12）」：rc 阶段 releases/latest 必然 404，
+        // 每日自检必须走 kernels 里那同一套回退，而不是每天 warn 一条「拉取失败」。
+        let host = Arc::new(FakeHost::new());
+        let d = tempfile::tempdir().unwrap();
+        let ctx = ctx_for(host.clone(), &d).await;
+        let jitter = jitter_secs(ctx.store.read().await.node.id);
+        let rc_url = crate::kernels::manifest_url_for_tag("v4.0.0-rc2");
+        let rc_manifest = serde_json::json!({
+            "version": "4.0.2",
+            "kernels": { "sing_box": "1.14.2" },
+            "artifacts": { "sing-box-linux-amd64": { "url": "https://x/sb", "sha256": "00" } }
+        })
+        .to_string();
+        let fetcher: Arc<dyn Fetcher> = Arc::new(FakeFetcher(Mutex::new(vec![
+            (
+                crate::kernels::RELEASES_API_URL.into(),
+                br#"[{"tag_name":"v4.0.0-rc2","prerelease":true}]"#.to_vec(),
+            ),
+            (rc_url, rc_manifest.into_bytes()),
+        ])));
+        // 「本机在预发布通道」的信号：manifest 缓存里记的 tag 是 rc（version 是纯 semver，
+        // 这正是一台 rc1 机器落盘的缓存形状）
+        let handle = Arc::new(std::sync::RwLock::new(Some(Manifest {
+            version: "4.0.0".into(),
+            tag: Some("v4.0.0-rc1".into()),
+            ..Default::default()
+        })));
+        let task = tokio::spawn(selfcheck_loop(ctx.clone(), handle.clone(), fetcher, None));
+        tokio::time::sleep(std::time::Duration::from_secs(jitter + 3)).await;
+        assert_eq!(
+            handle.read().unwrap().as_ref().map(|m| m.version.clone()),
+            Some("4.0.2".to_string()),
+            "latest 404 之后应当跟上预发布通道里最新的 rc"
+        );
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn selfcheck_survives_a_404_with_nothing_to_fall_back_to() {
+        // 正式版 + latest 还没发布：只记一行 info，不写缓存、不请求对账、更不会退出循环
+        let host = Arc::new(FakeHost::new());
+        let d = tempfile::tempdir().unwrap();
+        let ctx = ctx_for(host.clone(), &d).await;
+        let jitter = jitter_secs(ctx.store.read().await.node.id);
+        let fetcher: Arc<dyn Fetcher> = Arc::new(FakeFetcher(Mutex::new(vec![])));
+        let handle = Arc::new(std::sync::RwLock::new(None));
+        let task = tokio::spawn(selfcheck_loop(ctx.clone(), handle.clone(), fetcher, None));
+        tokio::time::sleep(std::time::Duration::from_secs(jitter + 3)).await;
+        assert!(handle.read().unwrap().is_none());
+        assert!(
+            host.text(d.path().join("manifest.json").to_str().unwrap())
+                .is_none(),
+            "拉不到就不该写缓存"
+        );
+        assert!(!task.is_finished(), "404 不许让自检循环退出");
         task.abort();
     }
 
@@ -1114,6 +1203,7 @@ mod tests {
             kernels: BTreeMap::new(),
             artifacts: BTreeMap::new(),
             min_upgrade_from: None,
+            tag: None,
         });
         // 句柄与 core-files 模块里的是同一个锁：写进去以后 render 会看到
         let state = crate::testutil::sample_state();
