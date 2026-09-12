@@ -1,1 +1,762 @@
-//! placeholder filled by Task 7
+//! 上游池的增删改（spec §5.1）：四种粘贴格式、类型自动探测、出口画像写回 `verified`，
+//! 以及总开关 / 分流模式 / 分流关键字 / 优先级。
+//!
+//! 写 state 一律经 [`super::state::update_group`]（契约决策 §B）：本模块**不渲染**
+//! `singbox-relay.json`，改完 state 由 P1 的对账器重渲染并重启 `b-ui-relay`。
+
+use super::proxy::{ProbeError, Prober};
+use super::{check, proxy, state, EXIT_IP_HOST, EXIT_IP_URL, MAX_UPSTREAMS};
+use crate::reconcile::DaemonCtx;
+use crate::util::fmt_rfc3339;
+use bui_schema::model::{ResiMode, Upstream, UpstreamKind};
+use bui_schema::parse::{upstream_url, ParseError, UpstreamInput};
+use serde::Serialize;
+use std::sync::Arc;
+use uuid::Uuid;
+
+/// 一次「加上游」的结果（面板与 CLI 直接回显）。**不含凭据**。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AddOutcome {
+    pub id: Uuid,
+    pub name: String,
+    pub kind: UpstreamKind,
+    pub exit_ip: Option<String>,
+    pub isp: Option<String>,
+    pub class_label: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum UpstreamError {
+    #[error("{0}")]
+    Parse(#[from] ParseError),
+    #[error("SOCKS5 与 HTTP 两种协议都连不上 ({host}:{port}) —— 请核对凭据与端口（供应商的 SOCKS5 与 HTTP 端口通常不同）")]
+    Unverifiable { host: String, port: u16 },
+    #[error("上游凭据失效（407 / SOCKS5 认证被拒）")]
+    AuthFailed,
+    #[error("出口 IP 与本机相同（{0}），代理未生效")]
+    NotProxied(String),
+    #[error("代理节点池已满（上限 {MAX_UPSTREAMS} 个）")]
+    PoolFull,
+    #[error("未找到匹配的上游")]
+    NotFound,
+    #[error("代理节点池为空，请先添加至少 1 个住宅上游")]
+    PoolEmpty,
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
+/// 上游定位：面板用 `host:port`（v3 的 `DELETE /api/residential/urls/<host:port>`），
+/// 规范端点与 CLI 用 id
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpstreamSel {
+    Id(Uuid),
+    HostPort { host: String, port: u16 },
+}
+
+impl UpstreamSel {
+    pub fn parse_host_port(s: &str) -> Option<Self> {
+        let (host, port) = s.rsplit_once(':')?;
+        if host.is_empty() {
+            return None;
+        }
+        Some(Self::HostPort {
+            host: host.to_string(),
+            port: port.parse().ok()?,
+        })
+    }
+}
+
+/// `url-1..url-N` 稠密重排（v3 `add_url_to_config` 的 `to_entries|map(name:…)`）。
+/// 名字**必须**跟着下标重排，否则删掉中间一条后 `url-3` 与 `resi-2` 对不上，面板表与
+/// relay 成员就错位了。
+pub fn renumber(ups: &mut [Upstream]) {
+    for (i, u) in ups.iter_mut().enumerate() {
+        u.name = format!("url-{}", i + 1);
+    }
+}
+
+/// 类型自动探测：`socks5` → `http`，**整轮重试一次**（v3.6.2 R12：实测有效的端口也会偶发
+/// 抽风，同一行立刻重试就成）。`kind` 已指定时只试那一种、不重试。
+/// 全都失败、且 `get` 没能识别出凭据失效时，再对每个候选类型用
+/// [`proxy::confirm_auth_failure`] 补判一次 [`EXIT_IP_HOST`]`:443`——`get` 在 https
+/// 目标上判不出 407（见 T3 `confirm_auth_failure` 的注释），不补判的话真机上凭据写错
+/// 只会得到 `Unverifiable`（「协议都连不上」）这条误导性文案，运维会去改端口而不是换凭据。
+pub fn detect_kind(
+    p: &dyn Prober,
+    probe: &Upstream,
+    want: Option<UpstreamKind>,
+) -> Result<(UpstreamKind, String), UpstreamError> {
+    // v3.6.2 R12：auto 整轮重试一次（实测有效的端口也会偶发抽风，
+    // 同一行立刻重试就成，不该让用户以为凭据写错了）
+    let (candidates, rounds): (Vec<UpstreamKind>, usize) = match want {
+        Some(k) => (vec![k], 1),
+        None => (vec![UpstreamKind::Socks5, UpstreamKind::Http], 2),
+    };
+    let mut auth_failed = false;
+    for _round in 0..rounds {
+        for kind in &candidates {
+            let mut probe = probe.clone();
+            probe.kind = *kind;
+            match p.get(&probe, EXIT_IP_URL) {
+                Ok(hp) => {
+                    let ip = hp.body.trim().to_string();
+                    if !ip.is_empty() {
+                        return Ok((*kind, ip));
+                    }
+                }
+                Err(ProbeError::AuthFailed) => auth_failed = true,
+                Err(_) => {}
+            }
+        }
+    }
+    if !auth_failed {
+        // `get` 分不出「凭据失效」与「连不上」：https 目标经 HTTP 上游走 CONNECT 隧道，
+        // 407 发生在隧道建立阶段，reqwest 只给一个 Err（T3 `confirm_auth_failure` 的注释）。
+        // 逐个候选类型补判一次，否则真机上凭据写错报的是 Unverifiable（「端口/协议不对」），
+        // 把运维引到错误的排查方向。
+        for kind in &candidates {
+            let mut probe = probe.clone();
+            probe.kind = *kind;
+            if proxy::confirm_auth_failure(p, &probe, EXIT_IP_HOST) {
+                auth_failed = true;
+                break;
+            }
+        }
+    }
+    if auth_failed {
+        return Err(UpstreamError::AuthFailed);
+    }
+    Err(UpstreamError::Unverifiable {
+        host: probe.host.clone(),
+        port: probe.port,
+    })
+}
+
+/// 加一条上游：解析 → 类型探测 → 出口画像 → 写 state。**凭据只进 state**，
+/// 日志与错误信息里一律脱敏。同 `host:port` 是**覆盖**语义（v3 同），所以覆盖时
+/// 不占新名额、池满也允许，并且**沿用既有条目的 `id`**（绝不换新 uuid）：`id` 是
+/// 全模块的运行时主键（契约决策 §C），换掉它会让 `runtime.selected_upstream_id`、
+/// `runtime.health[id]`、`runtime.checks[id]` 与 `state.blacklist.auto[].upstream_id`
+/// 里的旧 uuid 一起悬空。
+///
+/// 只做出口画像、**不做端口集**：面板的添加请求预算是 60 秒（v3 `RESI_ADD_TIMEOUT_MS`），
+/// 类型探测最坏 2 轮 × 2 协议 × 10 秒 = 40 秒，再加端口集就超了。端口集由调用方
+/// （T10 的 handler）返回后异步起一次 `check::run_and_store` 补。
+pub async fn add(
+    ctx: &DaemonCtx,
+    p: Arc<dyn Prober>,
+    raw: &str,
+) -> Result<AddOutcome, UpstreamError> {
+    let input: UpstreamInput = upstream_url(raw)?;
+    let s = ctx.store.read().await;
+    let g = state::group_of(&s);
+    // 同 host:port 是**覆盖**既有条目（下面 update_group 里先 retain 再 push），不占新名额：
+    // 池满时改一条已有上游的凭据/类型不该被 400 拒
+    let existing_id = g
+        .upstreams
+        .iter()
+        .find(|u| u.host == input.host && u.port == input.port)
+        .map(|u| u.id);
+    if existing_id.is_none() && g.upstreams.len() >= MAX_UPSTREAMS {
+        return Err(UpstreamError::PoolFull);
+    }
+    let vps_ip = s.node.public_ip.clone();
+    drop(s);
+
+    // **覆盖时沿用既有 id**：id 是全模块的运行时主键（契约决策 §C）。换新 uuid 会让
+    // runtime.selected_upstream_id / runtime.health[id] / runtime.checks[id] 与
+    // state.blacklist.auto[].upstream_id 里的旧 uuid 全部悬空：旧 auto 条目不再被渲染、
+    // 永远不进复核、remove_auto 也删不到，replay_loop 因 tag_of 为 None 跳过重放。
+    let id = existing_id.unwrap_or_else(Uuid::new_v4);
+    let mut up = Upstream {
+        id,
+        name: String::new(), // renumber 里填
+        kind: input.kind.unwrap_or(UpstreamKind::Socks5),
+        host: input.host,
+        port: input.port,
+        username: input.username,
+        password: input.password,
+        priority: 100,
+        provider: None,
+        region: None,
+        ports_allowed: None,
+        verified: None,
+    };
+
+    let (kind, exit_ip) = {
+        let (pp, probe, want) = (p.clone(), up.clone(), input.kind);
+        tokio::task::spawn_blocking(move || detect_kind(pp.as_ref(), &probe, want))
+            .await
+            .map_err(|e| UpstreamError::Other(anyhow::anyhow!(e)))??
+    };
+    if exit_ip == vps_ip {
+        // v3 verify 的那条判据：出口与本机相同说明流量根本没经代理
+        return Err(UpstreamError::NotProxied(vps_ip));
+    }
+    up.kind = kind;
+
+    // 出口画像（三源交叉）；失败不阻塞添加，verified 留空由后续体检补
+    let now = ctx.host.now();
+    let (class, exit, sources, _notes) = {
+        let (pp, u2) = (p.clone(), up.clone());
+        tokio::task::spawn_blocking(move || check::probe_exit(pp.as_ref(), &u2))
+            .await
+            .map_err(|e| UpstreamError::Other(anyhow::anyhow!(e)))?
+    };
+    let at = fmt_rfc3339(now);
+    up.verified = check::to_verified(&exit, &at);
+    up.region = exit.country.clone();
+    tracing::info!(
+        upstream = %proxy::proxy_url(&up),
+        kind = ?kind, class = ?class, sources = ?sources, "新增住宅上游"
+    );
+
+    let isp = exit
+        .asn
+        .map(|a| format!("AS{a}"))
+        .into_iter()
+        .chain(exit.org.clone())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let up2 = up.clone();
+    state::update_group(&ctx.store, &ctx.bus, move |g| {
+        // 同 host:port 视为同一上游，覆盖（v3 add_url_to_config 的 map(select(…)) 同语义）
+        g.upstreams
+            .retain(|u| !(u.host == up2.host && u.port == up2.port));
+        g.upstreams.push(up2);
+        renumber(&mut g.upstreams);
+        g.enabled = true;
+        if g.selected_upstream_id.is_none() {
+            g.selected_upstream_id = g.upstreams.first().map(|u| u.id);
+        }
+    })
+    .await?;
+    let added = state::group_of(&*ctx.store.read().await)
+        .upstreams
+        .iter()
+        .find(|u| u.id == id)
+        .cloned()
+        .ok_or(UpstreamError::NotFound)?;
+    Ok(AddOutcome {
+        id: added.id,
+        name: added.name,
+        kind,
+        exit_ip: Some(exit_ip),
+        isp: (!isp.is_empty()).then_some(isp),
+        class_label: class.label().to_string(),
+    })
+}
+
+/// 删一条上游；删掉最后一条时顺带 `enabled = false`（v3 `enable --remove` 同语义）
+pub async fn remove(ctx: &DaemonCtx, sel: &UpstreamSel) -> Result<(), UpstreamError> {
+    let g = state::group_of(&*ctx.store.read().await);
+    let target = g
+        .upstreams
+        .iter()
+        .find(|u| match sel {
+            UpstreamSel::Id(id) => u.id == *id,
+            UpstreamSel::HostPort { host, port } => u.host == *host && u.port == *port,
+        })
+        .cloned()
+        .ok_or(UpstreamError::NotFound)?;
+    let id = target.id;
+    state::update_group(&ctx.store, &ctx.bus, move |g| {
+        g.upstreams.retain(|u| u.id != id);
+        renumber(&mut g.upstreams);
+        // 该上游的 auto 条目一起删：留着没人复核，还会被 render/relay 的
+        // `upstream_id == selected` 过滤悄悄忽略
+        g.blacklist.auto.retain(|e| e.upstream_id != id);
+        if g.selected_upstream_id == Some(id) {
+            g.selected_upstream_id = g.upstreams.first().map(|u| u.id);
+        }
+        if g.upstreams.is_empty() {
+            g.enabled = false; // relay 回落 fail-open 直连（v3 `enable --remove` 同语义）
+            g.selected_upstream_id = None;
+        }
+    })
+    .await?;
+    state::update(&ctx.runtime, |r| {
+        r.checks.remove(&id.to_string());
+        r.candidates.retain(|_, c| c.upstream_id != id);
+        r.pending.retain(|e| e.upstream_id != id);
+        // 运行时主键是 uuid（契约决策 §C）：健康 streak 与「当前生效」都得跟着清，
+        // 否则 replay_loop 会去重放一条已经不存在的上游，24h 成功率也会留着僵尸样本
+        r.health.remove(&id.to_string());
+        if r.selected_upstream_id == Some(id) {
+            r.selected_upstream_id = None;
+            r.selected_pending_persist = false;
+        }
+    })
+    .await;
+    Ok(())
+}
+
+/// 总开关。开启要求池非空（v3 `POST /api/residential/enable` 的 400 分支）
+pub async fn set_enabled(ctx: &DaemonCtx, on: bool) -> Result<(), UpstreamError> {
+    if on
+        && state::group_of(&*ctx.store.read().await)
+            .upstreams
+            .is_empty()
+    {
+        return Err(UpstreamError::PoolEmpty);
+    }
+    state::update_group(&ctx.store, &ctx.bus, |g| g.enabled = on).await?;
+    Ok(())
+}
+
+/// global / split（v3 `POST /api/residential/global`）
+pub async fn set_mode(ctx: &DaemonCtx, global: bool) -> Result<(), UpstreamError> {
+    let mode = if global {
+        ResiMode::Global
+    } else {
+        ResiMode::Split
+    };
+    state::update_group(&ctx.store, &ctx.bus, |g| g.mode = mode).await?;
+    Ok(())
+}
+
+/// 分流关键字：`None` = 回到跟随默认表（v3 的 `set-domains null`，R12 的语义）
+pub async fn set_keywords(ctx: &DaemonCtx, kw: Option<Vec<String>>) -> Result<(), UpstreamError> {
+    // None / 空列表 = 回到跟随 DEFAULT_KEYWORDS（R12：不把当时的默认表固化成自定义，
+    // 否则后续版本扩充默认表这台机器永远跟不上）
+    let cleaned = kw.and_then(|list| {
+        let mut v: Vec<String> = list
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let mut seen = std::collections::BTreeSet::new();
+        v.retain(|s| seen.insert(s.clone()));
+        (!v.is_empty()).then_some(v)
+    });
+    state::update_group(&ctx.store, &ctx.bus, |g| g.keywords = cleaned).await?;
+    Ok(())
+}
+
+/// 调优先级（切换目标的第一排序键）
+pub async fn set_priority(ctx: &DaemonCtx, id: Uuid, priority: u32) -> Result<(), UpstreamError> {
+    let g = state::group_of(&*ctx.store.read().await);
+    if !g.upstreams.iter().any(|u| u.id == id) {
+        return Err(UpstreamError::NotFound);
+    }
+    state::update_group(&ctx.store, &ctx.bus, |g| {
+        if let Some(u) = g.upstreams.iter_mut().find(|u| u.id == id) {
+            u.priority = priority;
+        }
+    })
+    .await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::EventBus;
+    use crate::modules::residential::proxy::{FakeProber, HttpProbe};
+    use crate::modules::residential::state as rstate;
+    use crate::state::runtime::Runtime;
+    use crate::state::store::Store;
+    use crate::sys::fake::FakeHost;
+    use crate::testutil::sample_state;
+    use pretty_assertions::assert_eq;
+
+    async fn ctx(d: &tempfile::TempDir) -> DaemonCtx {
+        let mut s = sample_state();
+        s.node.public_ip = "203.0.113.10".into();
+        // 从空池起步，便于断言添加路径
+        let g = s
+            .residential
+            .groups
+            .get_mut(super::super::GROUP_DEFAULT)
+            .expect("sample_state 带 default 分组");
+        g.upstreams.clear();
+        g.selected_upstream_id = None;
+        DaemonCtx {
+            store: Store::create(d.path().join("state.json"), s).await.unwrap(),
+            runtime: Runtime::load(d.path().join("runtime.json")),
+            bus: EventBus::new(),
+            host: std::sync::Arc::new(FakeHost::new()),
+            paths: bui_schema::paths::Paths::default_server(),
+        }
+    }
+
+    fn prober_ok(exit: &str) -> std::sync::Arc<FakeProber> {
+        let p = std::sync::Arc::new(FakeProber::new());
+        let exit = exit.to_string();
+        p.with(|i| {
+            i.gets.insert(
+                EXIT_IP_URL.into(),
+                Ok(HttpProbe {
+                    status: 200,
+                    body: exit.clone(),
+                }),
+            );
+            i.gets.insert(
+                crate::modules::residential::check::EXIT_SOURCES[0].1.into(),
+                Ok(HttpProbe {
+                    status: 200,
+                    body: serde_json::json!({"ip": exit, "asn": 33667, "asOrganization": "Comcast",
+                                             "country": "US", "isResidential": true})
+                    .to_string(),
+                }),
+            );
+        });
+        p
+    }
+
+    #[tokio::test]
+    async fn add_accepts_all_four_paste_formats_and_records_verified() {
+        let d = tempfile::tempdir().unwrap();
+        let c = ctx(&d).await;
+        let p = prober_ok("198.51.100.7");
+        for raw in [
+            "socks5://user1:pw1@isp1.example.net:1080",
+            "http://user1:pw1@isp2.example.net:10007",
+            "isp3.example.net:1084:user1:pw1",
+            "user1:pw1@isp4.example.net:1080",
+        ] {
+            add(&c, p.clone(), raw).await.unwrap();
+        }
+        let g = rstate::group_of(&*c.store.read().await);
+        assert_eq!(g.upstreams.len(), 4);
+        assert_eq!(
+            g.upstreams[0].kind,
+            UpstreamKind::Socks5,
+            "scheme 指定了就不探测"
+        );
+        assert_eq!(g.upstreams[1].kind, UpstreamKind::Http);
+        assert_eq!(g.upstreams[2].host, "isp3.example.net");
+        assert_eq!(g.upstreams[2].password, "pw1");
+        assert_eq!(
+            g.upstreams
+                .iter()
+                .map(|u| u.name.clone())
+                .collect::<Vec<_>>(),
+            vec!["url-1", "url-2", "url-3", "url-4"]
+        );
+        let v = g.upstreams[0].verified.clone().unwrap();
+        assert_eq!(
+            (v.ip.as_str(), v.asn, v.org.as_deref()),
+            ("198.51.100.7", Some(33667), Some("Comcast"))
+        );
+        assert!(g.enabled, "第一条添加成功即启用（v3 save_config true）");
+        assert_eq!(
+            g.selected_upstream_id,
+            Some(g.upstreams[0].id),
+            "首条成为落点"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_detection_falls_back_to_http_and_retries_the_whole_round_once() {
+        let d = tempfile::tempdir().unwrap();
+        let c = ctx(&d).await;
+        // 没写 scheme → auto：先 SOCKS5 再 HTTP，整轮重试一次
+        let p = std::sync::Arc::new(FakeProber::new());
+        p.with(|i| {
+            // FakeProber 按 URL 查表、不区分上游类型，所以用调用流水断言顺序与次数
+            i.gets
+                .insert(EXIT_IP_URL.into(), Err("connection refused".into()));
+        });
+        let e = add(&c, p.clone(), "user1:pw1@isp.example.net:1080")
+            .await
+            .unwrap_err();
+        assert!(matches!(e, UpstreamError::Unverifiable { .. }), "实际 {e}");
+        assert_eq!(
+            p.calls().iter().filter(|c| c.starts_with("get:")).count(),
+            4,
+            "socks5 / http 各两轮：整轮重试一次（v3.6.2 R12）"
+        );
+        assert!(
+            rstate::group_of(&*c.store.read().await)
+                .upstreams
+                .is_empty(),
+            "失败不写 state"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_rejects_a_407_and_an_exit_ip_equal_to_the_vps() {
+        let d = tempfile::tempdir().unwrap();
+        let c = ctx(&d).await;
+        let p = std::sync::Arc::new(FakeProber::new());
+        p.with(|i| {
+            i.gets
+                .insert(EXIT_IP_URL.into(), Err("__auth_failed__".into()));
+        });
+        assert!(matches!(
+            add(&c, p, "http://user1:pw1@isp.example.net:10007").await,
+            Err(UpstreamError::AuthFailed)
+        ));
+        // 出口 IP == 本机公网 IP ⇒ 代理没生效（v3 verify 的那条判据）
+        let p2 = prober_ok("203.0.113.10");
+        assert!(matches!(
+            add(&c, p2, "http://user1:pw1@isp.example.net:10007").await,
+            Err(UpstreamError::NotProxied(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn add_rejects_bad_pastes_with_the_parse_message_and_enforces_the_pool_cap() {
+        let d = tempfile::tempdir().unwrap();
+        let c = ctx(&d).await;
+        let p = prober_ok("198.51.100.7");
+        assert!(matches!(
+            add(&c, p.clone(), "https://u:p@h:1").await,
+            Err(UpstreamError::Parse(_))
+        ));
+        assert!(matches!(
+            add(&c, p.clone(), "socks5://u@h:1").await,
+            Err(UpstreamError::Parse(_))
+        ));
+        for i in 0..MAX_UPSTREAMS {
+            add(
+                &c,
+                p.clone(),
+                &format!("http://user1:pw1@isp{i}.example.net:10007"),
+            )
+            .await
+            .unwrap();
+        }
+        assert!(matches!(
+            add(&c, p.clone(), "http://user1:pw1@overflow.example.net:10007").await,
+            Err(UpstreamError::PoolFull)
+        ));
+        // 池满时「更新一条已有上游」不该被 400 拒：同 host:port 是覆盖，不占新名额
+        add(&c, p, "socks5://user1:pw1@isp0.example.net:10007")
+            .await
+            .unwrap();
+        let g = rstate::group_of(&*c.store.read().await);
+        assert_eq!(g.upstreams.len(), MAX_UPSTREAMS, "覆盖不增长");
+        assert_eq!(
+            g.upstreams
+                .iter()
+                .find(|u| u.host == "isp0.example.net")
+                .unwrap()
+                .kind,
+            UpstreamKind::Socks5,
+            "覆盖后 kind 跟着新粘贴的那一行走"
+        );
+    }
+
+    #[tokio::test]
+    async fn overwriting_the_same_host_port_keeps_the_id_so_runtime_and_blacklist_keys_survive() {
+        // 覆盖必须沿用既有 id（契约决策 §C：id 是运行时主键）。换新 uuid 的话，
+        // 下面这四处引用会一起悬空：state.selected_upstream_id / blacklist.auto[].upstream_id
+        // / runtime.selected_upstream_id / runtime.health[id]。
+        let d = tempfile::tempdir().unwrap();
+        let c = ctx(&d).await;
+        let p = prober_ok("198.51.100.7");
+        let first = add(&c, p.clone(), "http://user1:pw1@isp1.example.net:10007")
+            .await
+            .unwrap();
+        rstate::update_group(&c.store, &c.bus, |g| {
+            g.blacklist.auto.push(bui_schema::model::AutoEntry {
+                upstream_id: first.id,
+                rule: bui_schema::model::Rule::DomainSuffix("gateway.icloud.com".into()),
+                hits: 9,
+                confirmed_at: "2026-09-12T00:00:00Z".into(),
+                last_verified_at: "2026-09-12T00:00:00Z".into(),
+                passes: 0,
+            });
+        })
+        .await
+        .unwrap();
+        rstate::update(&c.runtime, |r| {
+            r.selected_upstream_id = Some(first.id);
+            r.health
+                .insert(first.id.to_string(), rstate::HealthState::default());
+        })
+        .await;
+
+        // 同 host:port、换协议与凭据重新粘贴一次
+        let again = add(&c, p, "socks5://user2:pw2@isp1.example.net:10007")
+            .await
+            .unwrap();
+        assert_eq!(again.id, first.id, "覆盖沿用既有 id，不换 uuid");
+        let g = rstate::group_of(&*c.store.read().await);
+        assert_eq!(g.upstreams.len(), 1, "覆盖不增长");
+        assert_eq!(g.upstreams[0].id, first.id);
+        assert_eq!(
+            g.upstreams[0].kind,
+            UpstreamKind::Socks5,
+            "类型跟着新粘贴的那一行走"
+        );
+        assert_eq!(g.upstreams[0].password, "pw2", "凭据也跟着走");
+        assert_eq!(g.upstreams[0].name, "url-1");
+        assert_eq!(
+            g.selected_upstream_id,
+            Some(first.id),
+            "state 落点没被改成悬空 uuid"
+        );
+        assert_eq!(
+            g.blacklist
+                .auto
+                .iter()
+                .map(|a| a.upstream_id)
+                .collect::<Vec<_>>(),
+            vec![first.id],
+            "该上游学到的 auto 条目仍挂在同一个 id 上（换 uuid 会让它永远不进复核、也删不到）"
+        );
+        let r = rstate::read(&c.runtime).await;
+        assert_eq!(
+            r.selected_upstream_id,
+            Some(first.id),
+            "replay_loop 还能重放到它"
+        );
+        assert!(
+            r.health.contains_key(&first.id.to_string()),
+            "健康 streak 与 24h 成功率不清零"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_by_host_port_renumbers_and_disables_when_the_pool_empties() {
+        let d = tempfile::tempdir().unwrap();
+        let c = ctx(&d).await;
+        let p = prober_ok("198.51.100.7");
+        for i in 1..=3 {
+            add(
+                &c,
+                p.clone(),
+                &format!("http://user1:pw1@isp{i}.example.net:10007"),
+            )
+            .await
+            .unwrap();
+        }
+        remove(
+            &c,
+            &UpstreamSel::parse_host_port("isp2.example.net:10007").unwrap(),
+        )
+        .await
+        .unwrap();
+        let g = rstate::group_of(&*c.store.read().await);
+        assert_eq!(
+            g.upstreams
+                .iter()
+                .map(|u| (u.host.clone(), u.name.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("isp1.example.net".to_string(), "url-1".to_string()),
+                ("isp3.example.net".to_string(), "url-2".to_string()),
+            ],
+            "名字跟着下标稠密重排，否则 url-N 与 resi-N 会错位"
+        );
+        assert!(matches!(
+            remove(
+                &c,
+                &UpstreamSel::parse_host_port("nope.example.net:1").unwrap()
+            )
+            .await,
+            Err(UpstreamError::NotFound)
+        ));
+        for host in ["isp1.example.net", "isp3.example.net"] {
+            remove(
+                &c,
+                &UpstreamSel::parse_host_port(&format!("{host}:10007")).unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+        let g = rstate::group_of(&*c.store.read().await);
+        assert!(g.upstreams.is_empty());
+        assert!(
+            !g.enabled,
+            "最后一条被移除即关总开关（relay 回落 fail-open 直连）"
+        );
+        assert_eq!(g.selected_upstream_id, None);
+    }
+
+    #[tokio::test]
+    async fn remove_also_drops_that_upstreams_auto_blacklist_and_runtime_traces() {
+        let d = tempfile::tempdir().unwrap();
+        let c = ctx(&d).await;
+        let p = prober_ok("198.51.100.7");
+        let a = add(&c, p.clone(), "http://user1:pw1@isp1.example.net:10007")
+            .await
+            .unwrap();
+        add(&c, p, "http://user1:pw1@isp2.example.net:10007")
+            .await
+            .unwrap();
+        rstate::update_group(&c.store, &c.bus, |g| {
+            g.blacklist.auto.push(bui_schema::model::AutoEntry {
+                upstream_id: a.id,
+                rule: bui_schema::model::Rule::DomainSuffix("gateway.icloud.com".into()),
+                hits: 9,
+                confirmed_at: "2026-09-12T00:00:00Z".into(),
+                last_verified_at: "2026-09-12T00:00:00Z".into(),
+                passes: 0,
+            });
+        })
+        .await
+        .unwrap();
+        rstate::update(&c.runtime, |r| {
+            r.checks
+                .insert(a.id.to_string(), serde_json::json!({"x": 1}));
+            // 运行时主键是 uuid（契约决策 §C），这两处也必须跟着清
+            r.health
+                .insert(a.id.to_string(), rstate::HealthState::default());
+            r.selected_upstream_id = Some(a.id);
+            r.selected_pending_persist = true;
+        })
+        .await;
+        remove(&c, &UpstreamSel::Id(a.id)).await.unwrap();
+        let g = rstate::group_of(&*c.store.read().await);
+        assert!(
+            g.blacklist.auto.is_empty(),
+            "该上游的 auto 条目一起删（不然永远没人复核它）"
+        );
+        let r = rstate::read(&c.runtime).await;
+        assert!(!r.checks.contains_key(&a.id.to_string()));
+        assert!(
+            !r.health.contains_key(&a.id.to_string()),
+            "健康 streak 跟着 uuid 一起清"
+        );
+        assert_eq!(
+            r.selected_upstream_id, None,
+            "别让 replay_loop 去重放一条已删的上游"
+        );
+        assert!(!r.selected_pending_persist);
+    }
+
+    #[tokio::test]
+    async fn toggles_follow_the_v3_semantics() {
+        let d = tempfile::tempdir().unwrap();
+        let c = ctx(&d).await;
+        // 空池不许开总开关（v3 的 400 分支）
+        assert!(matches!(
+            set_enabled(&c, true).await,
+            Err(UpstreamError::PoolEmpty)
+        ));
+        let p = prober_ok("198.51.100.7");
+        let a = add(&c, p, "http://user1:pw1@isp1.example.net:10007")
+            .await
+            .unwrap();
+        set_mode(&c, true).await.unwrap();
+        assert_eq!(
+            rstate::group_of(&*c.store.read().await).mode,
+            ResiMode::Global
+        );
+        set_keywords(
+            &c,
+            Some(vec!["openai.com".into(), " ".into(), "openai.com".into()]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rstate::group_of(&*c.store.read().await).keywords,
+            Some(vec!["openai.com".to_string()]),
+            "去空白、去重"
+        );
+        // None = 回到跟随默认表（R12：不把当时的默认表固化成自定义）
+        set_keywords(&c, None).await.unwrap();
+        assert_eq!(rstate::group_of(&*c.store.read().await).keywords, None);
+        set_priority(&c, a.id, 5).await.unwrap();
+        assert_eq!(
+            rstate::group_of(&*c.store.read().await).upstreams[0].priority,
+            5
+        );
+        set_enabled(&c, false).await.unwrap();
+        assert!(!rstate::group_of(&*c.store.read().await).enabled);
+    }
+}
