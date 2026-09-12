@@ -7,6 +7,28 @@ use crate::paths::Paths;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+/// 住宅槽路由规则的 `ruleTag` 前缀：gRPC 侧按它认「这条规则是槽位模块的」。
+/// 改它等于把线上已经装载的旧规则变成认不出来的孤儿（收敛会把它们当多余项删掉，
+/// 一轮之内自愈，但别没事乱改）。
+pub const USER_RULE_PREFIX: &str = "resi-u-";
+/// 兜底规则的 `ruleTag`：永远排在表尾，兜住「一条规则都没有的 email」。
+pub const FALLBACK_RULE_TAG: &str = "resi-fallback";
+
+/// 用户 `user_id`（= xray 侧的 email）对应的规则 tag。
+pub fn user_rule_tag(user_id: uuid::Uuid) -> String {
+    format!("{USER_RULE_PREFIX}{user_id}")
+}
+
+/// 一条住宅槽路由规则 —— **渲染（写 `xray-config.json`）与 gRPC 增删共用同一个形状**，
+/// 两边不可能各算一份（D7）。`emails` 为空 = 兜底规则（不带 `user`，匹配该 inbound 的全部流量）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotRule {
+    pub rule_tag: String,
+    pub inbound_tag: String,
+    pub emails: Vec<String>,
+    pub outbound_tag: String,
+}
+
 /// API inbound 的本地端口（v3 固定值）。
 const API_PORT: u16 = 10085;
 /// 住宅出口指向的本地 sing-box relay。
@@ -114,4 +136,27 @@ fn vless_inbound(tag: &str, port: u16, node: &NodeParams, clients: &[Value]) -> 
         },
         "sniffing": {"enabled": true, "destOverride": ["http", "tls"]}
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+    use uuid::Uuid;
+
+    #[test]
+    fn rule_tags_are_stable_and_prefixed() {
+        let id = Uuid::from_u128(0xaa);
+        assert_eq!(
+            user_rule_tag(id),
+            format!("resi-u-{id}"),
+            "gRPC 侧按前缀认「这条规则是我们的」，改前缀等于把旧规则变成孤儿"
+        );
+        assert!(user_rule_tag(id).starts_with(USER_RULE_PREFIX));
+        assert_eq!(FALLBACK_RULE_TAG, "resi-fallback");
+        assert!(
+            !FALLBACK_RULE_TAG.starts_with(USER_RULE_PREFIX),
+            "兜底 tag 不能被当成某个用户的规则（收敛时会把它当多余项删掉）"
+        );
+    }
 }

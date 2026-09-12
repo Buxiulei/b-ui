@@ -26,6 +26,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "proto/transport/internet/config.proto",
                 "proto/common/net/address.proto",
                 "proto/common/net/port.proto",
+                "proto/app/router/command/command.proto",
+                "proto/app/router/config.proto",
+                "proto/common/net/network.proto",
             ],
             &["proto"],
         )?;

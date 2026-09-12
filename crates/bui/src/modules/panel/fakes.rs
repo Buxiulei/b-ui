@@ -17,6 +17,8 @@ pub struct FakeXrayInner {
     /// 真实 xray 在「email 已存在」与「email 不存在」时都报错，而这两种错误 Task 6
     /// 按成功处理——错误串不可配就没法给那条容错写正向测试。
     pub error_text: BTreeMap<String, String>,
+    /// 进程里「正在跑」的规则表，按表序：`(ruleTag, outboundTag)`
+    pub rules: Vec<(String, String)>,
 }
 
 #[derive(Clone, Default)]
@@ -38,6 +40,10 @@ impl FakeXray {
 
     pub fn clear_calls(&self) {
         self.0.lock().unwrap().calls.clear();
+    }
+
+    pub fn rules(&self) -> Vec<(String, String)> {
+        self.0.lock().unwrap().rules.clone()
     }
 }
 
@@ -80,6 +86,44 @@ impl XrayApi for FakeXray {
             anyhow::bail!("fake QueryStats 失败");
         }
         Ok(std::mem::take(&mut i.deltas))
+    }
+
+    async fn add_rule(&self, rule: &bui_schema::render::xray::SlotRule) -> anyhow::Result<()> {
+        let key = format!("add-rule:{}:{}", rule.rule_tag, rule.outbound_tag);
+        let mut i = self.0.lock().unwrap();
+        i.calls.push(key.clone());
+        if i.fail_on.contains(&key) || i.fail_on.contains("add-rule") {
+            anyhow::bail!("fake AddRule 失败：{key}");
+        }
+        // 真实内核：重名 ruleTag ⇒ 整条请求报错（D7 事实①）
+        if i.rules.iter().any(|(t, _)| *t == rule.rule_tag) {
+            anyhow::bail!("duplicate ruleTag {}", rule.rule_tag);
+        }
+        // 真实内核：shouldAppend=true ⇒ 落在表尾（D7 事实③）
+        i.rules
+            .push((rule.rule_tag.clone(), rule.outbound_tag.clone()));
+        Ok(())
+    }
+
+    async fn remove_rule(&self, rule_tag: &str) -> anyhow::Result<()> {
+        let key = format!("remove-rule:{rule_tag}");
+        let mut i = self.0.lock().unwrap();
+        i.calls.push(key.clone());
+        if i.fail_on.contains(&key) || i.fail_on.contains("remove-rule") {
+            anyhow::bail!("fake RemoveRule 失败：{key}");
+        }
+        // 真实内核：tag 不存在也算成功（D7 事实②）
+        i.rules.retain(|(t, _)| t != rule_tag);
+        Ok(())
+    }
+
+    async fn list_rules(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let mut i = self.0.lock().unwrap();
+        i.calls.push("list-rules".into());
+        if i.fail_on.contains("list-rules") {
+            anyhow::bail!("fake ListRule 失败");
+        }
+        Ok(i.rules.clone())
     }
 }
 
@@ -174,6 +218,48 @@ mod tests {
                 format!("remove:vless-residential:{uid}"),
                 "query".to_string(),
                 "query".to_string(),
+            ]
+        );
+    }
+
+    /// fake 的规则表必须与真实内核同语义（D7 的三条事实），否则 T4 的收敛测试是在测假东西。
+    /// 真身由 `panel::xray::tests::routing_rules_round_trip_against_a_real_xray` 打在真 xray 上。
+    #[tokio::test]
+    async fn fake_xray_mirrors_the_three_routing_rule_facts() {
+        use bui_schema::render::xray::SlotRule;
+        let rule = |tag: &str, out: &str| SlotRule {
+            rule_tag: tag.to_string(),
+            inbound_tag: "vless-residential".into(),
+            emails: vec![],
+            outbound_tag: out.to_string(),
+        };
+        let x = FakeXray::new();
+        x.add_rule(&rule("resi-fallback", "relay-slot-0"))
+            .await
+            .unwrap();
+        x.add_rule(&rule("resi-u-a", "relay-slot-1")).await.unwrap();
+        // 事实③：追加即表尾
+        assert_eq!(
+            x.rules(),
+            vec![
+                ("resi-fallback".to_string(), "relay-slot-0".to_string()),
+                ("resi-u-a".to_string(), "relay-slot-1".to_string()),
+            ]
+        );
+        // 事实①：重名 ruleTag 报错
+        assert!(x.add_rule(&rule("resi-u-a", "relay-slot-2")).await.is_err());
+        // 事实②：删不存在的 tag 也算成功
+        x.remove_rule("resi-u-nobody").await.unwrap();
+        // 删+追加把兜底挪回表尾
+        x.remove_rule("resi-fallback").await.unwrap();
+        x.add_rule(&rule("resi-fallback", "relay-slot-0"))
+            .await
+            .unwrap();
+        assert_eq!(
+            x.list_rules().await.unwrap(),
+            vec![
+                ("resi-u-a".to_string(), "relay-slot-1".to_string()),
+                ("resi-fallback".to_string(), "relay-slot-0".to_string()),
             ]
         );
     }
