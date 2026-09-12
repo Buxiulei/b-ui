@@ -56,7 +56,32 @@ fn main() -> Result<()> {
 
 async fn dispatch(command: Command) -> Result<()> {
     match command {
-        Command::Install { .. } => not_yet("install"),
+        Command::Install {
+            domain,
+            port,
+            admin_password_stdin,
+            import_v3,
+            non_interactive,
+            answers,
+            yes,
+        } => {
+            commands::install::run(
+                commands::install::InstallOpts {
+                    domain,
+                    port,
+                    admin_password_stdin,
+                    import_v3,
+                    non_interactive,
+                    answers,
+                    yes,
+                    // socket 路径由调用方传入，install 自己不读常量（单元测试因此不碰真实 socket）
+                    socket: PathBuf::from(paths::SOCKET_PATH),
+                },
+                bui_schema::paths::Paths::default_server(),
+                std::sync::Arc::new(sys::real::RealHost::new()),
+            )
+            .await
+        }
         Command::Upgrade { .. } => not_yet("upgrade"),
         Command::Serve => {
             serve::run(
@@ -76,7 +101,15 @@ async fn dispatch(command: Command) -> Result<()> {
             .await
         }
         Command::Status { .. } => not_yet("status"),
-        Command::ImportV3 { .. } => not_yet("import-v3"),
+        Command::ImportV3 { dir, out } => {
+            commands::import_v3::run(
+                dir,
+                out,
+                bui_schema::paths::Paths::default_server(),
+                std::sync::Arc::new(sys::real::RealHost::new()),
+            )
+            .await
+        }
         Command::AuthHook { .. } => unreachable!("auth-hook 已在 main 里提前返回"),
         Command::Menu => not_yet("menu"),
         Command::HardenSsh => {
