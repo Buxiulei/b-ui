@@ -170,7 +170,7 @@ impl Module for CoreFilesModule {
                 });
             }
         }
-        let xray = bui_schema::render::xray::config(&s.node, &s.users, p);
+        let xray = bui_schema::render::xray::config(&s.node, &s.users, &s.residential, p);
         let hash = bui_schema::render::xray::structural_hash(&xray);
         out.push(
             Artifact::file(
@@ -395,7 +395,12 @@ mod tests {
     fn xray_file_uses_the_structural_hash_as_its_restart_key() {
         let s = sample_state();
         let arts = CoreFilesModule::new(None).render(&s, &ctx());
-        let cfg = bui_schema::render::xray::config(&s.node, &s.users, &Paths::default_server());
+        let cfg = bui_schema::render::xray::config(
+            &s.node,
+            &s.users,
+            &s.residential,
+            &Paths::default_server(),
+        );
         let hash = bui_schema::render::xray::structural_hash(&cfg);
         match find_file(&arts, "/opt/b-ui/xray-config.json") {
             Artifact::File {

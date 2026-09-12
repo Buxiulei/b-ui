@@ -38,11 +38,15 @@ pub const SELFCHECK_INTERVAL_SECS: u64 = 86400;
 pub struct Registry {
     pub modules: Vec<Arc<dyn Module>>,
     pub manifest: Arc<RwLock<Option<Manifest>>>,
+    /// 对账末尾收敛 Xray 槽路由要用它的 `XrayApi`（D7）
+    pub panel: Arc<crate::modules::panel::Shared>,
 }
 
 pub fn modules(manifest: Option<Manifest>) -> Registry {
     let core = CoreFilesModule::new(manifest);
     let handle = core.manifest_handle();
+    let panel = crate::modules::panel::PanelModule::new();
+    let shared = panel.shared();
     Registry {
         modules: vec![
             Arc::new(core),
@@ -52,10 +56,11 @@ pub fn modules(manifest: Option<Manifest>) -> Registry {
             Arc::new(CertsModule),
             Arc::new(WatchdogModule),
             // P2：面板 API + 采样 + auth 快照 + Xray gRPC
-            Arc::new(crate::modules::panel::PanelModule::new()),
+            Arc::new(panel),
             Arc::new(crate::modules::residential::ResidentialModule::new()),
         ],
         manifest: handle,
+        panel: shared,
     }
 }
 
@@ -405,6 +410,7 @@ pub async fn run(paths: Paths, host: Arc<dyn Host>) -> anyhow::Result<()> {
     };
     let reg = modules(cached);
     let mods = reg.modules.clone();
+    let panel = reg.panel.clone();
     let fetcher: Arc<dyn Fetcher> = Arc::new(HttpFetcher::new());
     let ctx = DaemonCtx {
         store: store.clone(),
@@ -428,8 +434,14 @@ pub async fn run(paths: Paths, host: Arc<dyn Host>) -> anyhow::Result<()> {
     let app = crate::api::router(app_state, &mods);
     // spec §5.6 规则 4：旧 state 没有 slots 字段时补齐，既有住宅用户按创建时间轮流落槽。
     // 幂等，所以每次启动无条件跑一次；失败只告警（对账仍能按单槽视图渲染，行为退回 v3）。
-    if let Err(e) = crate::modules::residential::slots::migrate_on_start(&ctx.store, &bus).await {
-        tracing::warn!(error = %e, "住宅槽位迁移失败，本次启动按单槽渲染");
+    match crate::modules::residential::slots::migrate_on_start(&ctx.store, &bus).await {
+        // spec §5.6 + D7：迁移动过分槽 ⇒ 槽规则要跟着收敛，这里只置脏，
+        // 收口交给紧接着那一轮对账末尾的 converge_xray
+        Ok(n) if n > 0 => {
+            crate::modules::residential::slots::mark_xray_rules_dirty(&runtime).await;
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "住宅槽位迁移失败，本次启动按单槽渲染"),
     }
     // 启动时先对账一次，再拉起后台任务
     match reconcile_from_ctx(&ctx, &mods, fetcher.clone(), false, false).await {
@@ -444,6 +456,10 @@ pub async fn run(paths: Paths, host: Arc<dyn Host>) -> anyhow::Result<()> {
         }
         Err(e) => tracing::error!(error = %e, "启动对账失败"),
     }
+    // spec §5.6 + D7：对账刚把新的 xray-config.json 落盘，这时收敛住宅槽路由 ——
+    // 走 RoutingService gRPC 增删受影响用户的规则，**不重启 xray**；只有 gRPC 失败且
+    // 文件已落地才退回一次重启。干净时是零成本 no-op，所以无条件调。
+    crate::modules::residential::slots::converge_xray(&ctx, panel.xray()).await;
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     for m in &mods {
         tasks.extend(m.spawn(ctx.clone()));
@@ -456,12 +472,15 @@ pub async fn run(paths: Paths, host: Arc<dyn Host>) -> anyhow::Result<()> {
     tasks.push(tokio::spawn(debounce_loop(bus.clone(), tx.clone())));
     {
         let (ctx2, mods2, f2) = (ctx.clone(), mods.clone(), fetcher.clone());
+        let panel2 = panel.clone();
         tasks.push(tokio::spawn(async move {
             while let Some(force) = rx.recv().await {
                 match reconcile_from_ctx(&ctx2, &mods2, f2.clone(), force, false).await {
                     Ok(r) => finish_self_restart(&ctx2, &r, true).await,
                     Err(e) => tracing::error!(error = %e, "对账失败"),
                 }
+                // spec §5.6 + D7：同上，对账落盘之后收敛住宅槽路由（gRPC 增删，不重启）
+                crate::modules::residential::slots::converge_xray(&ctx2, panel2.xray()).await;
             }
         }));
     }

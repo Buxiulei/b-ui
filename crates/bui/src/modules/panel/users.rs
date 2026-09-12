@@ -486,6 +486,10 @@ pub async fn sync_users(ctx: &DaemonCtx, shared: &Shared, blocked: &BTreeSet<Uui
         let known: BTreeSet<Uuid> = state.users.iter().map(|u| u.user_id).collect();
         applied.xray_removed.retain(|id| known.contains(id));
     }
+    // 用户集合变了 ⇒ Xray 的槽规则表要跟着增删（D7），置脏交给对账末尾收敛
+    if !out.added.is_empty() || !out.removed.is_empty() {
+        crate::modules::residential::slots::mark_xray_rules_dirty(&ctx.runtime).await;
+    }
     out
 }
 
