@@ -8,6 +8,7 @@ pub mod fake;
 pub mod net;
 pub mod paths;
 pub mod profiles;
+pub mod source;
 pub mod sys;
 pub mod testutil;
 pub mod units;
