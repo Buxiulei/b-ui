@@ -11,6 +11,7 @@ pub mod profiles;
 pub mod sys;
 pub mod testutil;
 pub mod units;
+pub mod update;
 
 pub use error::{Error, Result};
 
