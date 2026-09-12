@@ -4,10 +4,6 @@
 //! `crate::modules::core_files`（P1 Task 10）从 `state.residential.groups["default"]`
 //! 渲染；P3 只改 `state`，由 P1 的对账器完成重渲染、`sing-box check` 与 relay 重启。
 
-// bin crate 里 `pub` 不消除 dead_code，而 T2–T9 的 pub fn 要到 T11/T12 才接上调用方；
-// 这一行在 Task 12 收口（CLI + 菜单 + /api/health 都接上）时删除。
-#![allow(dead_code)]
-
 use crate::reconcile::{Artifact, DaemonCtx, Module, RenderCtx};
 use bui_schema::model::{State, DEFAULT_GROUP};
 use bui_schema::paths::Paths;

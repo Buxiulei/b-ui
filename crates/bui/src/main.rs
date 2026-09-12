@@ -140,6 +140,9 @@ async fn dispatch(command: Command) -> Result<()> {
             .await
         }
         Command::AuthHook { .. } => unreachable!("auth-hook 已在 main 里提前返回"),
+        Command::Residential { cmd } => {
+            modules::residential::cli::run(cmd, PathBuf::from(paths::SOCKET_PATH)).await
+        }
         Command::Menu => {
             commands::menu::run(
                 bui_schema::paths::Paths::default_server(),
