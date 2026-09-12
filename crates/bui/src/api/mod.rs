@@ -12,7 +12,8 @@ pub use state::{AppState, Event, EventBus};
 use crate::reconcile::Module;
 use std::sync::Arc;
 
-/// 基础 Router：公开 `/api/login`，其余全部走 `require_admin`；再 merge 各模块的 `routes()`。
+/// 基础 Router：公开 `/api/login` 与各模块的 `public_routes()`，其余全部走 `require_admin`；
+/// 再 merge 各模块的 `routes()`。
 ///
 /// 模块路由挂在 `protected` 上，所以 P2/P3 的端点天然带鉴权，不必自己加中间件。
 pub fn router(state: AppState, modules: &[Arc<dyn Module>]) -> axum::Router {
@@ -26,8 +27,13 @@ pub fn router(state: AppState, modules: &[Arc<dyn Module>]) -> axum::Router {
     let protected = modules
         .iter()
         .fold(protected, |acc, m| acc.merge(m.routes()));
+    // 裁决 D1：公开路由必须落在 require_admin 外面
+    let public = modules
+        .iter()
+        .fold(axum::Router::new(), |acc, m| acc.merge(m.public_routes()));
     axum::Router::new()
         .route("/api/login", axum::routing::post(auth::login))
+        .merge(public)
         .merge(protected.layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_admin,
@@ -336,6 +342,87 @@ mod tests {
         assert_eq!(
             call("hysteria-server", "chown").await.status(),
             StatusCode::BAD_REQUEST
+        );
+    }
+
+    /// 一个只为「公开路由不过鉴权、受保护路由仍要 Bearer」而存在的模块（裁决 D1 的回归锁）
+    struct ProbeModule;
+    impl Module for ProbeModule {
+        fn name(&self) -> &'static str {
+            "probe"
+        }
+        fn render(
+            &self,
+            _s: &bui_schema::model::State,
+            _c: &crate::reconcile::RenderCtx,
+        ) -> Vec<crate::reconcile::Artifact> {
+            Vec::new()
+        }
+        fn routes(&self) -> axum::Router<AppState> {
+            axum::Router::new().route("/probe/admin", axum::routing::get(|| async { "admin" }))
+        }
+        fn public_routes(&self) -> axum::Router<AppState> {
+            axum::Router::new().route("/probe/open", axum::routing::get(|| async { "open" }))
+        }
+    }
+
+    /// 与 `app_with_runtime()` 同一套 AppState，只是把模块挂进 `router()`
+    async fn app_with_modules(modules: Vec<Arc<dyn Module>>) -> (axum::Router, tempfile::TempDir) {
+        let d = tempfile::tempdir().unwrap();
+        let mut state = crate::testutil::sample_state();
+        state.admin.password_hash = crate::api::auth::hash_password("test123").unwrap();
+        let store = Store::create(d.path().join("state.json"), state)
+            .await
+            .unwrap();
+        let host = Arc::new(FakeHost::new());
+        let app_state = AppState {
+            store,
+            bus: EventBus::new(),
+            runtime: Runtime::load(d.path().join("runtime.json")),
+            host: host.clone(),
+            started_at: host.now(),
+            version: "4.0.0",
+            login: crate::api::auth::LoginLimiter::default(),
+        };
+        (router(app_state, &modules), d)
+    }
+
+    async fn get_status(app: &axum::Router, uri: &str, token: Option<&str>) -> StatusCode {
+        let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        let req = match token {
+            Some(t) => with_token(req, t),
+            None => req,
+        };
+        app.clone().oneshot(req).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn public_module_routes_skip_require_admin() {
+        let (app, _d) = app_with_modules(vec![Arc::new(ProbeModule)]).await;
+        assert_eq!(
+            get_status(&app, "/probe/open", None).await,
+            StatusCode::OK,
+            "public_routes() 必须落在 require_admin 外面（裁决 D1）：订阅 / 嵌入前端 / /packages/* 靠它"
+        );
+    }
+
+    #[tokio::test]
+    async fn protected_module_routes_still_require_a_bearer_token() {
+        let (app, _d) = app_with_modules(vec![Arc::new(ProbeModule)]).await;
+        assert_eq!(
+            get_status(&app, "/probe/admin", None).await,
+            StatusCode::UNAUTHORIZED,
+            "模块的 routes() 仍然整棵套在 require_admin 里"
+        );
+        let token = login(&app).await;
+        assert_eq!(
+            get_status(&app, "/probe/admin", Some(&token)).await,
+            StatusCode::OK
+        );
+        // 公开通道不许顺手把 P1 自己的受保护端点漏出去
+        assert_eq!(
+            get_status(&app, "/api/health", None).await,
+            StatusCode::UNAUTHORIZED
         );
     }
 }
