@@ -21,6 +21,10 @@ pub const INTERVAL_SECS: u64 = 60;
 pub const FAIL_THRESHOLD: u32 = 2;
 /// 退避 1/2/4 分钟（spec §3.4），第四次及以后停在 4 分钟。
 pub const BACKOFF_MINUTES: [i64; 3] = [1, 2, 4];
+/// 每轮跑完把「这一轮的时刻 / 下一轮的时刻」记到 `runtime.extra` 的这个键下
+/// （`RuntimeData::extra` 是 flatten 的扩展位，不必为两个字段改 `runtime.rs`）。
+/// 面板 `GET /api/hy2/watchdog/status` 原样透出这两个字段。
+pub const RUN_KEY: &str = "watchdog_run";
 
 /// 一个探测目标：单元名 + 协议 + 监听端口。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,13 +121,21 @@ pub fn decide(
     Decision::Restart
 }
 
+/// 一轮跑完的时间戳：`last_run_at` = 这一轮的时刻，`next_run_at` = 再加一个间隔。
+pub fn run_stamp(now: OffsetDateTime) -> serde_json::Value {
+    serde_json::json!({
+        "last_run_at": fmt_rfc3339(now),
+        "next_run_at": fmt_rfc3339(now + time::Duration::seconds(INTERVAL_SECS as i64)),
+    })
+}
+
 /// 跑一轮：读单元状态与监听端口（都经 `Host`，时钟也取 `host.now()`），按裁决重启，落 `runtime.json`。
 pub async fn check_once(ctx: &DaemonCtx) -> anyhow::Result<Vec<(String, Decision)>> {
     let state = ctx.store.read().await;
     let targets = targets(&state);
     let mut records = ctx.runtime.read().await.watchdog;
     let host = ctx.host.clone();
-    let (decisions, records) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+    let (decisions, records, now) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let now = host.now();
         let udp = host.listening_ports(Proto::Udp).unwrap_or_default();
         let tcp = host.listening_ports(Proto::Tcp).unwrap_or_default();
@@ -142,10 +154,15 @@ pub async fn check_once(ctx: &DaemonCtx) -> anyhow::Result<Vec<(String, Decision
             }
             out.push((t.unit.clone(), d));
         }
-        Ok((out, records))
+        Ok((out, records, now))
     })
     .await??;
-    ctx.runtime.update(|r| r.watchdog = records).await;
+    ctx.runtime
+        .update(|r| {
+            r.watchdog = records;
+            r.extra.insert(RUN_KEY.into(), run_stamp(now));
+        })
+        .await;
     Ok(decisions)
 }
 
@@ -336,5 +353,30 @@ mod tests {
         let rt = c.runtime.read().await;
         assert_eq!(rt.watchdog["hysteria-server"].restarts, 1);
         assert_eq!(rt.watchdog["xray"].fails, 0);
+    }
+
+    #[tokio::test]
+    async fn each_round_stamps_last_run_at_and_next_run_at() {
+        let host = Arc::new(FakeHost::new());
+        let (c, _d) = ctx(host.clone()).await;
+        assert!(
+            !c.runtime.read().await.extra.contains_key(RUN_KEY),
+            "没跑过一轮时没有时间戳（接口那头就是 null）"
+        );
+
+        check_once(&c).await.unwrap();
+        let stamp = c.runtime.read().await.extra[RUN_KEY].clone();
+        assert_eq!(stamp["last_run_at"], "2026-09-11T00:00:00Z");
+        assert_eq!(
+            stamp["next_run_at"], "2026-09-11T00:01:00Z",
+            "next = last + INTERVAL_SECS"
+        );
+
+        // 时钟推进一轮：两个字段跟着走
+        host.advance(INTERVAL_SECS as i64);
+        check_once(&c).await.unwrap();
+        let stamp = c.runtime.read().await.extra[RUN_KEY].clone();
+        assert_eq!(stamp["last_run_at"], "2026-09-11T00:01:00Z");
+        assert_eq!(stamp["next_run_at"], "2026-09-11T00:02:00Z");
     }
 }

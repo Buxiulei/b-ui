@@ -6,7 +6,6 @@
 use super::users;
 use super::{Shared, HY2_STATS_PORT_DIRECT, HY2_STATS_PORT_RESI};
 use crate::api::{AppState, Event};
-use crate::state::runtime::WatchdogRecord;
 use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -16,7 +15,6 @@ use bui_schema::model::State as BuiState;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::json;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 fn ok_json<T: Serialize>(v: T) -> Response {
@@ -83,10 +81,19 @@ pub fn host_of(url: &str) -> String {
     rest.split(['/', ':']).next().unwrap_or("").to_string()
 }
 
-/// `runtime.watchdog` → v3 `/api/hy2/watchdog/status` 的形状（兼容 shim，见契约表 #21）
-pub fn watchdog_payload(w: &BTreeMap<String, WatchdogRecord>) -> serde_json::Value {
+/// `runtime` → v3 `/api/hy2/watchdog/status` 的形状（兼容 shim，见契约表 #21）。
+///
+/// `last_run_at` / `next_run_at` 原样取 watchdog 每轮写进 `runtime.extra[RUN_KEY]` 的时间戳
+/// （上一轮的时刻 + 一个间隔），没跑过一轮时两者都是 `null`。
+pub fn watchdog_payload(rt: &crate::state::runtime::RuntimeData) -> serde_json::Value {
+    let w = &rt.watchdog;
     let fail_count: u32 = w.values().map(|r| r.fails).sum();
-    let last_run_at = w.values().filter_map(|r| r.last_restart_at.clone()).max();
+    let run = rt.extra.get(crate::modules::watchdog::RUN_KEY);
+    let stamp = |k: &str| {
+        run.and_then(|v| v.get(k))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    };
     let mut lines: Vec<String> = w
         .iter()
         .filter_map(|(unit, r)| {
@@ -104,8 +111,8 @@ pub fn watchdog_payload(w: &BTreeMap<String, WatchdogRecord>) -> serde_json::Val
     json!({
         // v4 的 watchdog 是守护进程内的常驻任务，没有 timer；只要面板答得出这一问，它就在跑
         "watchdog_active": true,
-        "next_run_at": serde_json::Value::Null,
-        "last_run_at": last_run_at,
+        "next_run_at": stamp("next_run_at"),
+        "last_run_at": stamp("last_run_at"),
         "fail_count": fail_count,
         "log_recent_lines": lines,
     })
@@ -397,7 +404,7 @@ async fn set_port_hopping(State(app): State<AppState>, body: Bytes) -> Response 
 }
 
 async fn watchdog_status(State(app): State<AppState>) -> Response {
-    ok_json(watchdog_payload(&app.runtime.read().await.watchdog))
+    ok_json(watchdog_payload(&app.runtime.read().await))
 }
 
 /// 裁决 D2：`/api/health` 不加用户段，摘要由这条管理员端点透出（写入侧是 T7 的 `write_health_summary`）
@@ -938,13 +945,22 @@ mod tests {
                         backoff_until: None,
                     },
                 );
+                rt.extra.insert(
+                    crate::modules::watchdog::RUN_KEY.into(),
+                    crate::modules::watchdog::run_stamp(
+                        time::macros::datetime!(2026-09-11 00:02:00 UTC),
+                    ),
+                );
             })
             .await;
         let (s, v) = send(&r, "GET", "/api/hy2/watchdog/status", Some(&t), None).await;
         assert_eq!(s, axum::http::StatusCode::OK);
         assert_eq!(v["watchdog_active"], true);
-        assert_eq!(v["next_run_at"], serde_json::Value::Null);
-        assert_eq!(v["last_run_at"], "2026-09-11T00:00:00Z");
+        assert_eq!(v["last_run_at"], "2026-09-11T00:02:00Z");
+        assert_eq!(
+            v["next_run_at"], "2026-09-11T00:03:00Z",
+            "next_run_at = 上一轮 + 一个间隔，不再是 null"
+        );
         assert_eq!(v["fail_count"], 2);
         let lines = v["log_recent_lines"].as_array().unwrap();
         assert_eq!(lines.len(), 1);
@@ -952,6 +968,16 @@ mod tests {
             lines[0].as_str().unwrap().contains("hysteria-server"),
             "{lines:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn the_watchdog_shim_reports_null_before_the_first_round() {
+        let h = harness().await;
+        let (r, t) = app(&h).await;
+        let (s, v) = send(&r, "GET", "/api/hy2/watchdog/status", Some(&t), None).await;
+        assert_eq!(s, axum::http::StatusCode::OK);
+        assert_eq!(v["last_run_at"], serde_json::Value::Null);
+        assert_eq!(v["next_run_at"], serde_json::Value::Null);
     }
 
     #[tokio::test]
