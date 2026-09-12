@@ -52,9 +52,9 @@ fn main() -> Result<()> {
         return Ok(());
     };
     if let Command::AuthHook { args } = &command {
-        let _ = args;
-        // P2 的交付物；P1 在这里就返回，连 runtime 与日志都不初始化
-        anyhow::bail!("auth-hook 由 P2 实现");
+        // spec §3.2：不建 tokio runtime、不初始化 tracing、不加载 state。
+        // 退出码即判定结果（0 = 放行），放行时 stdout 已打印 user_id。
+        std::process::exit(modules::panel::auth_hook::run(args));
     }
     logging::init(args.log.as_deref());
     let rt = tokio::runtime::Builder::new_multi_thread()
