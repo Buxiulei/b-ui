@@ -5,7 +5,7 @@
 //! 用）与并发版 [`run`] 都调它，避免两条路径给出不同的分类。
 
 use super::proxy::{ConnectVerdict, HttpProbe, ProbeError, Prober};
-use super::{state, AI_HOSTS, BASE_PORTS, PAY_HOSTS, PROBE_PORTS};
+use super::{port_probe_host, state, AI_HOSTS, BASE_PORTS, PAY_HOSTS, PROBE_PORTS};
 use crate::reconcile::DaemonCtx;
 use crate::util::fmt_rfc3339;
 use bui_schema::model::{Upstream, Verified};
@@ -311,7 +311,8 @@ pub fn probe_exit(
 }
 
 /// 搜索页 GET 结果 → 是否被判机器人（正文含 `/sorry/` 或状态码 429）；
-/// `None` = 没探到结论（别把网络抖动显示成「被判机器人」）
+/// `None` = 没探到结论（别把网络抖动显示成「被判机器人」）。
+/// **唯一**一份 sorry 判定：[`run`] 用它读 `fanout` 里 [`GOOGLE_SEARCH_URL`] 那一项。
 pub fn sorry_of(r: Option<&Result<HttpProbe, ProbeError>>) -> Option<bool> {
     match r {
         // 正文含 /sorry/ 或状态码 429 都算「被判机器人」（v3 同判据）
@@ -319,11 +320,6 @@ pub fn sorry_of(r: Option<&Result<HttpProbe, ProbeError>>) -> Option<bool> {
         // 探不到就不下结论：把抖动显示成「被判机器人」会误导运维换上游
         _ => None,
     }
-}
-
-/// `/sorry/` 检测（同步版；[`run`] 里用 [`sorry_of`] 读 `fanout` 的那一项）
-pub fn google_sorry(p: &dyn Prober, up: &Upstream) -> Option<bool> {
-    sorry_of(Some(&p.get(up, GOOGLE_SEARCH_URL)))
 }
 
 /// [`ExitInfo`] → `Verified`（写回 `state` 的那个结构；`ip` 为 `None` 时返回 `None`）
@@ -382,7 +378,9 @@ pub async fn run(p: Arc<dyn Prober>, up: &Upstream, now: OffsetDateTime) -> Chec
         }
     }
 
-    // ④ 固定端口集：目标主机固定用 www.google.com，只看隧道能不能开（端口策略与目标无关）
+    // ④ 固定端口集：每个端口打 `super::port_probe_host` 给的目标——基准 80/443 打中性主机
+    // `www.gstatic.com`（用搜索域名会被 Bright Data 整域硬拒，基准端口全判不通 ⇒
+    // 白名单学不出来），固定端口集打各自真在该端口监听的主机
     let plist: Vec<u16> = BASE_PORTS
         .iter()
         .chain(PROBE_PORTS.iter())
@@ -390,7 +388,7 @@ pub async fn run(p: Arc<dyn Prober>, up: &Upstream, now: OffsetDateTime) -> Chec
         .collect();
     let (pp, u2) = (p.clone(), up.clone());
     let pv = super::fanout(plist.clone(), move |port| {
-        pp.connect(&u2, "www.google.com", port)
+        pp.connect(&u2, port_probe_host(port), port)
     })
     .await;
     let mut ports = BTreeMap::new();
@@ -466,14 +464,16 @@ pub async fn run_and_store(
     })
     .await;
     let report = run(p, &up, now).await;
-    // 体检学到的两项写回 state（会触发一次对账；ports_allowed 变了 relay 规则就得改，本来就要重启）
-    let (allowed, verified) = (
-        report.ports_allowed.clone(),
-        to_verified(&report.exit, &report.at),
-    );
+    // 体检学到的两项写回 state（会触发一次对账；ports_allowed 变了 relay 规则就得改，本来就要重启）。
+    // **写回口径与每日轮次完全同一份**：都走 `blacklist::port_learn`——`Learned` 才写
+    // （含「全通 ⇒ None = 不限」这种真结论），`Keep` 一个字节都不动。手动体检以前是
+    // 「只要没 407 就写 report.ports_allowed」，一次端口探测抖动（unreachable）就能把
+    // 已学到的 `[80, 443]` 覆盖成 `None`，端口策略静默失效。
+    let learn = super::blacklist::port_learn(&report.ports, report.auth_failed);
+    let verified = to_verified(&report.exit, &report.at);
     state::update_group(&ctx.store, &ctx.bus, |g| {
         if let Some(u) = g.upstreams.iter_mut().find(|u| u.id == id) {
-            if !report.auth_failed {
+            if let super::blacklist::PortLearn::Learned(allowed) = learn {
                 u.ports_allowed = allowed;
             }
             if let Some(v) = verified {
@@ -713,9 +713,10 @@ mod tests {
                 "www.paypal.com:443".into(),
                 ConnectVerdict::Refused { code: 403 },
             );
+            // 固定端口集打各自的真实主机（基准 80/443 打中性主机、缺省 Open）
             for port in PROBE_PORTS {
                 i.connects.insert(
-                    format!("www.google.com:{port}"),
+                    format!("{}:{port}", port_probe_host(port)),
                     ConnectVerdict::Refused { code: 403 },
                 );
             }
@@ -805,31 +806,24 @@ mod tests {
     }
 
     #[test]
-    fn google_sorry_reads_the_search_page_and_stays_none_when_unknown() {
-        let p = FakeProber::new();
-        p.with(|i| {
-            i.gets.insert(
-                GOOGLE_SEARCH_URL.into(),
-                Ok(HttpProbe {
-                    status: 429,
-                    body: "<title>https://www.google.com/sorry/index".into(),
-                }),
-            );
-        });
-        assert_eq!(google_sorry(&p, &up()), Some(true));
-        let p2 = FakeProber::new();
-        p2.with(|i| {
-            i.gets.insert(
-                GOOGLE_SEARCH_URL.into(),
-                Ok(HttpProbe {
-                    status: 200,
-                    body: "<html>results".into(),
-                }),
-            );
-        });
-        assert_eq!(google_sorry(&p2, &up()), Some(false));
+    fn sorry_of_reads_the_search_page_and_stays_none_when_unknown() {
+        // `run` 的第 ② 步就是把 fanout 里 GOOGLE_SEARCH_URL 那一项喂给它（唯一一份判定）
         assert_eq!(
-            google_sorry(&FakeProber::new(), &up()),
+            sorry_of(Some(&Ok(HttpProbe {
+                status: 429,
+                body: "<title>https://www.google.com/sorry/index".into(),
+            }))),
+            Some(true)
+        );
+        assert_eq!(
+            sorry_of(Some(&Ok(HttpProbe {
+                status: 200,
+                body: "<html>results".into(),
+            }))),
+            Some(false)
+        );
+        assert_eq!(
+            sorry_of(Some(&Err(ProbeError::Unreachable("no route".into())))),
             None,
             "探不到就不下结论"
         );
@@ -841,8 +835,10 @@ mod tests {
         let p = std::sync::Arc::new(FakeProber::new());
         p.with(|i| {
             for port in PROBE_PORTS.iter().chain(BASE_PORTS.iter()) {
-                i.connects
-                    .insert(format!("www.google.com:{port}"), ConnectVerdict::AuthFailed);
+                i.connects.insert(
+                    format!("{}:{port}", port_probe_host(*port)),
+                    ConnectVerdict::AuthFailed,
+                );
             }
         });
         let r = run(p, &up(), t0()).await;
@@ -878,5 +874,159 @@ mod tests {
         assert_eq!(r.google_sorry, Some(true));
         assert_eq!(r.class, ExitClass::Unknown, "挑战页记未知，不是失败");
         assert_eq!(r.sources["ippure"], "cloudflare_challenge");
+    }
+
+    /// 调研 §D 的 Bright Data 形态：搜索域名**整域**硬拒（policy_20110，端口无关），
+    /// 非白名单端口 403，白名单端口（80/443）放行
+    struct SearchDomainBlocked;
+    impl Prober for SearchDomainBlocked {
+        fn connect(&self, _u: &Upstream, h: &str, port: u16) -> ConnectVerdict {
+            if h == "www.google.com" {
+                return ConnectVerdict::Refused { code: 403 };
+            }
+            if BASE_PORTS.contains(&port) {
+                ConnectVerdict::Open
+            } else {
+                ConnectVerdict::Refused { code: 403 }
+            }
+        }
+        fn get(&self, _u: &Upstream, _url: &str) -> Result<HttpProbe, ProbeError> {
+            Err(ProbeError::Unreachable("no route".into()))
+        }
+        fn udp_associate(&self, _u: &Upstream) -> Result<bool, ProbeError> {
+            Ok(false)
+        }
+        fn direct_tcp(&self, _h: &str, _p: u16) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn a_403_on_the_search_domain_no_longer_kills_the_port_whitelist() {
+        // 端口集的基准端口打中性主机 www.gstatic.com，所以「整域拒搜索域名」的上游
+        // 照样能学出 [80, 443]
+        let r = run(std::sync::Arc::new(SearchDomainBlocked), &up(), t0()).await;
+        assert_eq!(r.ports[&80], "open");
+        assert_eq!(r.ports[&443], "open");
+        assert_eq!(r.ports[&5228], "refused:403");
+        assert_eq!(
+            r.ports_allowed,
+            Some(vec![80, 443]),
+            "基准主机被 403 的上游不该把 ports_allowed 判成 None"
+        );
+        // 反证（回归前的行为）：若基准端口仍打 www.google.com，80/443 会跟着被判 403，
+        // derive_ports_allowed 的「连基准端口都不通就别学」分支直接返回 None
+        let all_refused: BTreeMap<u16, String> = BASE_PORTS
+            .iter()
+            .chain(PROBE_PORTS.iter())
+            .map(|p| (*p, "refused:403".to_string()))
+            .collect();
+        assert_eq!(derive_ports_allowed(&all_refused, false), None);
+    }
+
+    async fn store_ctx(d: &tempfile::TempDir, allowed: Option<Vec<u16>>) -> DaemonCtx {
+        use crate::api::EventBus;
+        use crate::state::runtime::Runtime;
+        use crate::state::store::Store;
+        use crate::sys::fake::FakeHost;
+        let mut s = crate::testutil::sample_state();
+        let g = s
+            .residential
+            .groups
+            .entry(super::super::GROUP_DEFAULT.to_string())
+            .or_default();
+        g.enabled = true;
+        g.upstreams = vec![Upstream {
+            ports_allowed: allowed,
+            ..up()
+        }];
+        DaemonCtx {
+            store: Store::create(d.path().join("state.json"), s).await.unwrap(),
+            runtime: Runtime::load(d.path().join("runtime.json")),
+            bus: EventBus::new(),
+            host: std::sync::Arc::new(FakeHost::new()),
+            paths: bui_schema::paths::Paths::default_server(),
+        }
+    }
+
+    async fn stored_ports(ctx: &DaemonCtx) -> Option<Vec<u16>> {
+        state::group_of(&*ctx.store.read().await).upstreams[0]
+            .ports_allowed
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn one_flaky_port_probe_never_overwrites_the_learned_whitelist() {
+        // 写回口径与每日轮次同一份（blacklist::port_learn）：本轮有 unreachable ⇒ Keep
+        let d = tempfile::tempdir().unwrap();
+        let ctx = store_ctx(&d, Some(vec![80, 443])).await;
+        let p = std::sync::Arc::new(FakeProber::new());
+        p.with(|i| {
+            i.connects.insert(
+                format!("{}:993", port_probe_host(993)),
+                ConnectVerdict::Unreachable {
+                    detail: "timeout".into(),
+                },
+            );
+        });
+        let r = run_and_store(&ctx, p, up().id).await.unwrap();
+        assert_eq!(r.ports_allowed, None, "本轮抖动 ⇒ 这一轮什么也没学到");
+        assert_eq!(
+            stored_ports(&ctx).await,
+            Some(vec![80, 443]),
+            "一次抖动不能把已学到的白名单覆盖成 None"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_clean_manual_check_writes_the_whitelist_back() {
+        let d = tempfile::tempdir().unwrap();
+        let ctx = store_ctx(&d, None).await;
+        // 干净一轮：固定端口集全 403、基准端口通 ⇒ 学成 [80, 443]
+        let p = std::sync::Arc::new(FakeProber::new());
+        p.with(|i| {
+            for port in PROBE_PORTS {
+                i.connects.insert(
+                    format!("{}:{port}", port_probe_host(port)),
+                    ConnectVerdict::Refused { code: 403 },
+                );
+            }
+        });
+        let r = run_and_store(&ctx, p, up().id).await.unwrap();
+        assert_eq!(r.ports_allowed, Some(vec![80, 443]));
+        assert_eq!(stored_ports(&ctx).await, Some(vec![80, 443]));
+        // 下一轮全通 ⇒ 「不限」是**真结论**，照 PortLearn::Learned(None) 写回（清掉白名单），
+        // 否则供应商放开端口策略后这条上游永远只走 80/443
+        let r2 = run_and_store(&ctx, std::sync::Arc::new(FakeProber::new()), up().id)
+            .await
+            .unwrap();
+        assert_eq!(r2.ports_allowed, None);
+        assert_eq!(stored_ports(&ctx).await, None, "全通 ⇒ 不限");
+    }
+
+    #[tokio::test]
+    async fn a_407_round_leaves_the_stored_whitelist_untouched() {
+        let d = tempfile::tempdir().unwrap();
+        let ctx = store_ctx(&d, Some(vec![80, 443])).await;
+        let p = std::sync::Arc::new(FakeProber::new());
+        p.with(|i| {
+            for port in BASE_PORTS.iter().chain(PROBE_PORTS.iter()) {
+                i.connects.insert(
+                    format!("{}:{port}", port_probe_host(*port)),
+                    ConnectVerdict::AuthFailed,
+                );
+            }
+        });
+        let r = run_and_store(&ctx, p, up().id).await.unwrap();
+        assert!(r.auth_failed);
+        assert_eq!(stored_ports(&ctx).await, Some(vec![80, 443]));
+        let rt = state::read(&ctx.runtime).await;
+        assert!(
+            rt.alerts.iter().any(|a| a.contains("凭据失效")),
+            "{:?}",
+            rt.alerts
+        );
+        assert!(rt.checking.is_none());
+        assert!(rt.checks.contains_key(&up().id.to_string()));
     }
 }

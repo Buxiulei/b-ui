@@ -7,9 +7,9 @@
 
 use super::proxy::{ConnectVerdict, Prober};
 use super::{
-    check, clash, journal, state, BASE_PORTS, CANDIDATE_THRESHOLD, CONFIRM_MIN_GAP_SECS,
-    CONFIRM_NEEDED, DAILY_HOUR, DAILY_TICK_SECS, JOURNAL_POLL_SECS, PROBE_PORTS,
-    REVIEW_PASSES_TO_REMOVE,
+    check, clash, journal, port_probe_host, state, BASE_PORTS, CANDIDATE_THRESHOLD,
+    CONFIRM_MIN_GAP_SECS, CONFIRM_NEEDED, DAILY_HOUR, DAILY_TICK_SECS, JOURNAL_POLL_SECS,
+    PROBE_PORTS, REVIEW_PASSES_TO_REMOVE,
 };
 use crate::reconcile::DaemonCtx;
 use crate::util::parse_rfc3339;
@@ -313,9 +313,11 @@ pub async fn probe_ports_daily(p: Arc<dyn Prober>, ups: &[Upstream]) -> Vec<(Uui
         .flat_map(|u| plist.iter().map(move |port| (u.clone(), *port)))
         .collect();
     let pp = p.clone();
-    // 目标主机固定 www.google.com：端口策略与目标无关，只看隧道能不能开（与 T6 同判据）
+    // 目标主机由 `port_probe_host` 给（与 T6 体检第 ④ 步同一份表）：基准 80/443 打中性
+    // 主机 www.gstatic.com——用搜索域名会被 Bright Data 整域硬拒，基准端口全判不通，
+    // `port_learn` 于是永远学不出白名单；固定端口集打各自真在该端口监听的主机
     let probed = super::fanout(jobs.clone(), move |(up, port)| {
-        pp.connect(&up, "www.google.com", port)
+        pp.connect(&up, port_probe_host(port), port)
     })
     .await;
     let mut per_up: BTreeMap<Uuid, (BTreeMap<u16, String>, bool)> = BTreeMap::new();
@@ -340,46 +342,52 @@ pub async fn probe_ports_daily(p: Arc<dyn Prober>, ups: &[Upstream]) -> Vec<(Uui
         .collect()
 }
 
-/// `pending` → `state.blacklist.auto`（同一条重复出现时只累加 hits），返回写入条数
-async fn flush_pending(
-    ctx: &DaemonCtx,
-    extra: impl FnOnce(&mut bui_schema::model::ResidentialGroup),
-) -> anyhow::Result<usize> {
+/// `pending` → `g.blacklist.auto`（同一条重复出现时只累加 hits）。**纯函数**，
+/// [`flush_pending`] 与 [`daily_round`] 那一次 `update_group` 共用同一份合并逻辑。
+fn merge_pending(
+    g: &mut bui_schema::model::ResidentialGroup,
+    pending: &[state::PendingEntry],
+    at: &str,
+) {
+    for e in pending {
+        // 规则值就是被拒的完整主机名；domain_suffix 已覆盖其子域，不泛化到注册域名
+        let rule = Rule::DomainSuffix(e.host.clone());
+        match g
+            .blacklist
+            .auto
+            .iter_mut()
+            .find(|a| a.upstream_id == e.upstream_id && a.rule == rule)
+        {
+            Some(a) => {
+                a.hits += e.hits;
+                a.last_verified_at = at.to_string();
+                a.passes = 0;
+            }
+            None => g.blacklist.auto.push(AutoEntry {
+                upstream_id: e.upstream_id,
+                rule,
+                hits: e.hits,
+                confirmed_at: at.to_string(),
+                last_verified_at: at.to_string(),
+                passes: 0,
+            }),
+        }
+    }
+}
+
+/// `pending` → `state.blacklist.auto`，返回写入条数。
+/// **`pending` 为空时直接返回**：不写 state、不发 `StateChanged`——面板「立即应用」
+/// 连点两下（或 pending 早就空了）不该白走一次「重渲染 relay 配置 + 重启 b-ui-relay」的
+/// 对账（spec §5.4：relay 重启是唯一掐连接的动作）。
+async fn flush_pending(ctx: &DaemonCtx) -> anyhow::Result<usize> {
     let pending = state::read(&ctx.runtime).await.pending;
     if pending.is_empty() {
-        // 仍要执行 extra（复核移除 / 落点写回也走这条路径）
-        state::update_group(&ctx.store, &ctx.bus, extra).await?;
         return Ok(0);
     }
     let at = crate::util::fmt_rfc3339(ctx.host.now());
     let n = pending.len();
-    let items = pending.clone();
     state::update_group(&ctx.store, &ctx.bus, move |g| {
-        for e in items {
-            // 规则值就是被拒的完整主机名；domain_suffix 已覆盖其子域，不泛化到注册域名
-            let rule = Rule::DomainSuffix(e.host.clone());
-            match g
-                .blacklist
-                .auto
-                .iter_mut()
-                .find(|a| a.upstream_id == e.upstream_id && a.rule == rule)
-            {
-                Some(a) => {
-                    a.hits += e.hits;
-                    a.last_verified_at = at.clone();
-                    a.passes = 0;
-                }
-                None => g.blacklist.auto.push(AutoEntry {
-                    upstream_id: e.upstream_id,
-                    rule,
-                    hits: e.hits,
-                    confirmed_at: at.clone(),
-                    last_verified_at: at.clone(),
-                    passes: 0,
-                }),
-            }
-        }
-        extra(g);
+        merge_pending(g, &pending, &at);
     })
     .await?;
     state::update(&ctx.runtime, |r| r.pending.clear()).await;
@@ -388,7 +396,7 @@ async fn flush_pending(
 
 /// 管理员「立即应用」：把 `runtime.pending` 全部写进 `state.blacklist.auto`（立刻重启 relay）
 pub async fn apply_now(ctx: &DaemonCtx) -> anyhow::Result<usize> {
-    flush_pending(ctx, |_| {}).await
+    flush_pending(ctx).await
 }
 
 /// 每日窗口（服务器本地 04:00）：learn → 探针集（只探 `port_allowed` 为真的上游）→
@@ -489,7 +497,12 @@ pub async fn daily_round(ctx: &DaemonCtx, p: Arc<dyn Prober>) -> anyhow::Result<
         .then_some(r.selected_upstream_id)
         .flatten()
         .filter(|id| g.upstreams.iter().any(|u| u.id == *id));
-    rep.applied = flush_pending(ctx, |g| {
+    // 待生效条目在**这一次**写盘里合并（不经 flush_pending：复核移除、端口白名单与落点
+    // 写回都得和它同一次 update_group，否则一轮 04:00 会重启 relay 两次）
+    let pending = r.pending.clone();
+    rep.applied = pending.len();
+    state::update_group(&ctx.store, &ctx.bus, |g| {
+        merge_pending(g, &pending, &at);
         for (a, verdict) in reviewed.into_iter().flatten() {
             let Some(cur) = g
                 .blacklist
@@ -533,8 +546,12 @@ pub async fn daily_round(ctx: &DaemonCtx, p: Arc<dyn Prober>) -> anyhow::Result<
     rep.removed = removed;
     rep.persisted_selection = persist_id.is_some();
     let done_at = at.clone();
+    let flushed = rep.applied > 0;
     state::update(&ctx.runtime, move |r| {
         r.last_daily_at = Some(done_at);
+        if flushed {
+            r.pending.clear();
+        }
         if persist_id.is_some() {
             r.selected_pending_persist = false;
         }
@@ -1302,5 +1319,64 @@ mod tests {
             .blacklist
             .auto
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_daily_port_probe_uses_a_neutral_base_host_and_the_real_host_per_port() {
+        // Bright Data 对 www.google.com 整域 403：基准端口若打它，`port_learn` 永远
+        // 只会得到 Keep（一条白名单都学不出来）。基准端口必须打中性主机。
+        let up = Upstream {
+            id: Uuid::from_u128(1),
+            name: "url-1".into(),
+            kind: UpstreamKind::Http,
+            host: "isp1.example.net".into(),
+            port: 10007,
+            username: "user1".into(),
+            password: "pw1".into(),
+            priority: 10,
+            provider: None,
+            region: None,
+            ports_allowed: None,
+            verified: None,
+        };
+        let p = rejector(
+            &[
+                // 搜索域名整域被拒（端口无关）
+                "www.google.com:80",
+                "www.google.com:443",
+                // 端口策略：白名单外的端口全拒（打的是各自的真实主机）
+                "mtalk.google.com:5228",
+                "courier.push.apple.com:5223",
+                "imap.gmail.com:993",
+                "github.com:22",
+                "dns.google:853",
+                "www.gstatic.com:8080",
+            ],
+            &[],
+        );
+        assert_eq!(
+            probe_ports_daily(p, std::slice::from_ref(&up)).await,
+            vec![(up.id, PortLearn::Learned(Some(vec![80, 443])))]
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_now_with_nothing_pending_writes_nothing_and_restarts_nothing() {
+        // pending 空 ⇒ flush_pending 直接返回：不写 state、不发 StateChanged。
+        // 否则面板「立即应用」连点两下就白重启一次 b-ui-relay（唯一掐连接的动作）
+        let d = tempfile::tempdir().unwrap();
+        let (c, _host) = ctx(&d).await;
+        let before = serde_json::to_string(&*c.store.read().await).unwrap();
+        let mut rx = c.bus.subscribe();
+        assert_eq!(apply_now(&c).await.unwrap(), 0);
+        assert!(
+            rx.try_recv().is_err(),
+            "空 pending 不该触发对账（重渲染 relay + 重启）"
+        );
+        assert_eq!(
+            serde_json::to_string(&*c.store.read().await).unwrap(),
+            before,
+            "state 一个字节都不该动"
+        );
     }
 }
