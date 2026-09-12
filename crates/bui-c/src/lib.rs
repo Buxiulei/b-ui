@@ -13,6 +13,8 @@ pub mod profiles;
 pub mod source;
 pub mod sys;
 pub mod testutil;
+pub mod ufw;
+pub mod uninstall;
 pub mod units;
 pub mod update;
 
