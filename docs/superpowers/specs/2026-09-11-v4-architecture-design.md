@@ -139,7 +139,7 @@ tonic 客户端，proto 从 Xray-core `v26.3.27` vendor 进仓（以仓库根为
 - 防火墙：装了 ufw/firewalld → 开 22/`PORT`/80/443/10001/10002/40000 + 两个跳跃段；否则体检提示。
 - SSH 硬化：一份实现（禁密码登录，仅当存在公钥；`sshd -t` 失败则不写并记录），装机与 `b-ui harden-ssh` 同一函数。
 - systemd 单元全部带 `LimitNOFILE=1048576`；两个 hysteria 与 relay、xray 带 `MemoryHigh/MemoryMax`（relay 与 xray 是 v3 缺的）；`Nice=-5`；`b-ui.service` 自身 `MemoryMax=200M`、`Restart=always`。
-- watchdog：守护进程每 60 秒检查四个内核进程存活 + 监听端口存在（读 `/proc/net/{udp,tcp}`），连续 2 次失败 `systemctl restart`，退避 1/2/4 分钟，体检显示最近重启记录。`/tmp/hy2-watchdog-*` 文件与 timer 删除。
+- watchdog：守护进程每 60 秒检查四个内核（单元 active + 监听端口存在，读 `/proc/net/{udp,tcp}`）：进程不 active 交给 systemd `Restart=always` 自愈，watchdog 不插手；只对「active 但端口不在听/探测失败」连续 2 次的情况执行 `systemctl restart`（退避 1/2/4 分钟），体检显示最近重启记录。`/tmp/hy2-watchdog-*` 文件与 timer 删除。
 - 日志：`tracing` → journald；默认 INFO；凭据、密钥、密码一律脱敏。
 
 ---
@@ -180,6 +180,8 @@ tonic 客户端，proto 从 Xray-core `v26.3.27` vendor 进仓（以仓库根为
 2. 删除 `/auth/hysteria`、`/api/kernel-downloads`、install-key（`/api/install-command` 返回不带 key 的命令；`/packages/*` 直接可下）。
 3. `/api/health` 增加漂移列表、watchdog 记录、上游体检结果。
 4. 新增 `/api/residential/check`（体检）、`/api/residential/select`（手动切上游）、`/api/residential/blacklist`（GET）、`/api/residential/blacklist/pins`（POST/DELETE）、`/api/residential/blacklist/apply`（立即应用）。
+
+`POST /api/reconcile` 的 `dry_run` 仅 CLI 本地路径（`bui reconcile --dry-run`）支持，HTTP 端点忽略该字段：请求一律排队真跑一轮对账，返回 200 + 最近一份 `ReconcileReport` 或 202 `{"queued":true}`。
 
 无鉴权（按用户名，沿用 v3）：`/api/sub/<user>`、`/api/subscription/<user>`、`/api/clash/<user>`、**新增** `/api/nodes/<user>`（节点 schema JSON，供 `bui-c` 渲染）。
 
