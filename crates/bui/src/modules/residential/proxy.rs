@@ -411,14 +411,6 @@ impl FakeProber {
             .calls
             .clone()
     }
-
-    pub fn clear_calls(&self) {
-        self.inner
-            .lock()
-            .expect("FakeProber 锁被毒化")
-            .calls
-            .clear();
-    }
 }
 
 #[cfg(test)]

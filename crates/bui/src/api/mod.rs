@@ -234,7 +234,13 @@ mod tests {
         assert!(h.watchdog.is_empty());
         assert_eq!(h.reconcile, None);
         assert_eq!(h.upgrade_available, None);
-        assert_eq!(h.residential, None, "P3 才填");
+        let resi = h
+            .residential
+            .clone()
+            .expect("P3 起 /api/health 一定带住宅摘要");
+        assert_eq!(resi["enabled"], false, "夹具是空池");
+        assert!(resi.get("alerts").is_some());
+        assert!(resi.get("blacklist").is_some());
     }
 
     #[tokio::test]

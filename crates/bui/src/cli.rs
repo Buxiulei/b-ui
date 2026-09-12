@@ -94,6 +94,11 @@ pub enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// 住宅出口（上游池 / 体检 / 切换 / 黑名单）
+    Residential {
+        #[command(subcommand)]
+        cmd: crate::modules::residential::cli::ResidentialCmd,
+    },
     /// 数字菜单（sudo b-ui 的符号链接目标）
     Menu,
     /// 只做 SSH 硬化

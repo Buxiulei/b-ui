@@ -32,7 +32,7 @@ pub struct HealthResponse {
     pub watchdog: BTreeMap<String, WatchdogRecord>,
     /// 每日自检发现的新版本（spec §7）
     pub upgrade_available: Option<String>,
-    /// P3 填
+    /// 住宅摘要（P3 `modules::residential::state::health_summary`）
     pub residential: Option<serde_json::Value>,
 }
 
@@ -79,6 +79,10 @@ pub async fn get(State(app): State<AppState>) -> Json<HealthResponse> {
         drift: rt.drift.clone(),
         watchdog: rt.watchdog.clone(),
         upgrade_available: rt.upgrade_available.clone(),
-        residential: None,
+        // spec §4.3 第 ③ 条：/api/health 带上住宅体检摘要（`state` 与 `rt` 是上面已读出的两个局部变量）
+        residential: Some(crate::modules::residential::state::health_summary(
+            &crate::modules::residential::state::group_of(&state),
+            &crate::modules::residential::state::from_runtime(&rt),
+        )),
     })
 }

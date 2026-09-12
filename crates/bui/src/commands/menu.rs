@@ -6,7 +6,8 @@
 //!
 //! 守护进程没跑时（首装、或 `b-ui.service` 挂了）仍保留六项：状态 / 对账 / 对账并清理漂移 /
 //! 升级 / SSH 硬化 / 退出——对账两项退化为进程内跑（与 `serve::reconcile_cli` 同一条路径），
-//! `harden-ssh` 放行的理由见 Task 7。只有「重启数据面」与「查看日志」标「(需守护进程)」。
+//! `harden-ssh` 放行的理由见 Task 7。只有「重启数据面」「查看日志」与「住宅出口」（P3）
+//! 标「(需守护进程)」。
 
 use crate::sys::Host;
 use anyhow::Result;
@@ -42,6 +43,8 @@ pub enum MenuAction {
     Logs,
     Upgrade,
     HardenSsh,
+    /// 住宅出口子菜单（P3；整项需守护进程）
+    Residential,
     Quit,
 }
 
@@ -81,6 +84,11 @@ pub fn items() -> Vec<MenuItem> {
             key: "7",
             title: "SSH 硬化",
             action: MenuAction::HardenSsh,
+        },
+        MenuItem {
+            key: "8",
+            title: "住宅出口（池 / 体检 / 黑名单）",
+            action: MenuAction::Residential,
         },
         MenuItem {
             key: "0",
@@ -132,7 +140,10 @@ fn display_width(s: &str) -> usize {
 /// 后缀**紧跟标题、不带空格**：两列排版下一行放两项，标注若写在行尾就分不清是左项还是右项的。
 pub fn render_with(items: &[MenuItem], daemon_up: bool) -> String {
     let cell = |i: &MenuItem| -> String {
-        let needs = matches!(i.action, MenuAction::Service(_) | MenuAction::Logs);
+        let needs = matches!(
+            i.action,
+            MenuAction::Service(_) | MenuAction::Logs | MenuAction::Residential
+        );
         let suffix = if !daemon_up && needs {
             "(需守护进程)"
         } else {
@@ -253,6 +264,15 @@ async fn dispatch(
         MenuAction::HardenSsh => {
             crate::commands::harden_ssh::run(paths.clone(), host.clone()).await
         }
+        MenuAction::Residential => {
+            // 与 4/5 同处理：整项标「(需守护进程)」，socket 不可用时拒绝进入
+            if !daemon_up {
+                anyhow::bail!(
+                    "守护进程未运行，住宅出口全部经 API 操作；请先 `systemctl start b-ui`"
+                );
+            }
+            crate::modules::residential::cli::menu(socket.clone()).await
+        }
         MenuAction::Quit => Ok(()),
     }
 }
@@ -266,7 +286,7 @@ mod tests {
     fn menu_keys_are_stable_and_unique() {
         let items = items();
         let keys: Vec<&str> = items.iter().map(|i| i.key).collect();
-        assert_eq!(keys, vec!["1", "2", "3", "4", "5", "6", "7", "0"]);
+        assert_eq!(keys, vec!["1", "2", "3", "4", "5", "6", "7", "8", "0"]);
         let mut sorted = keys.clone();
         sorted.sort_unstable();
         sorted.dedup();
@@ -308,7 +328,10 @@ mod tests {
         assert_eq!(up, render(&items), "render 就是 render_with(.., true)");
         assert!(!up.contains("需守护进程"));
         for i in &items {
-            let needs_daemon = matches!(i.action, MenuAction::Service(_) | MenuAction::Logs);
+            let needs_daemon = matches!(
+                i.action,
+                MenuAction::Service(_) | MenuAction::Logs | MenuAction::Residential
+            );
             let line = down.lines().find(|l| l.contains(i.title)).unwrap();
             // 标注**紧跟标题**（`标题(需守护进程)`），不是行尾：两列排版下一行有两项，
             // 断言「这一行里有没有标注」会把同行邻居的标注算到自己头上（4/5 同行时 3 必假阳）
