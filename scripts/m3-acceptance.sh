@@ -48,9 +48,34 @@ TOL_PCT=5
 DL_TIMEOUT=600
 HEAD_TIMEOUT=20
 
-# 判据 ① 看这三个内核单元；判据 ④ 重启的是守护进程
+# 判据 ① 看这些内核单元：直连 + 每个住宅实例 + xray；判据 ④ 重启的是守护进程。
+# 这里先给 v3 的单实例名字兜底，真机分支（run_checks）开头再按槽位展开 ——
+# **不在这里就调 $BUI**：`--self-test` 也会走到顶层赋值，那一下会去碰真实系统。
 KERNEL_UNITS="hysteria-server hysteria-residential xray"
 DAEMON_UNIT="b-ui"
+
+# 槽位由 bui 自己报，脚本不重算（spec §5.6）。读不到（住宅未启用 / bui 没跑）时打印空。
+resi_units() {
+  "${BUI:-$BASE/bin/bui}" residential slots --json 2>/dev/null |
+    python3 -c 'import json, sys
+try:
+    rows = (json.load(sys.stdin) or {}).get("slots") or []
+except Exception:
+    rows = []
+for r in rows:
+    i = r["index"]
+    print("hysteria-residential" if i == 0 else "hysteria-residential-%d" % i)' 2>/dev/null
+}
+
+# 判据 ① 要看**每个**住宅实例的 NRestarts/MainPID，漏一个就等于没验「加用户不重启」。
+# 读不到槽位时退回 v3 的单实例名字。
+load_kernel_units() {
+  KERNEL_UNITS="hysteria-server xray $(resi_units)"
+  case " $KERNEL_UNITS " in
+    *" hysteria-residential "*) : ;;
+    *) KERNEL_UNITS="hysteria-server hysteria-residential xray" ;;
+  esac
+}
 
 # 到期用 `days` 设的最短正 TTL（见 check_expiry 的说明）
 EXPIRE_TTL=2
@@ -556,7 +581,9 @@ usage_dev() {
   }'
 }
 
-# $1=实测增量 $2=已知流量 $3=容差% → 问题描述（空串 = 在容差内）
+# $1=实测增量 $2=已知流量 $3=容差% → 问题描述（空串 = 在容差内）。
+# 多实例时流量可能落在任意一个住宅实例上，`bui` 的采样已覆盖全部 `trafficStats` 端口
+# （`traffic::stats_ports`），所以这一项**不需要**按槽分别核对。
 judge_usage() {
   local dev
   dev=$(usage_dev "$1" "$2")
@@ -864,6 +891,7 @@ check_cleanup() {
 run_checks() {
   local pw
   [ "$(id -u)" = "0" ] || printf 'WARN  不是 root：systemctl 与 %s 下的文件可能读不到\n' "$BASE"
+  load_kernel_units
   load_node_params
   API="http://127.0.0.1:$ADMIN_PORT"
   PW_SRC=${ADMIN_PW_FILE:-$BASE/v3-backup/admin.env}
@@ -1274,6 +1302,20 @@ st_units_and_judges() {
   if [[ "$out" == *变小* ]]; then ok "自测：重启后变小判失败"; else no "自测：计数丢了没被判失败" "$out"; fi
   out=$(judge_restart_total "" 1)
   if [[ "$out" == *读不到* ]]; then ok "自测：读不到 usage.total 判失败"; else no "自测：空值被当成通过" "$out"; fi
+
+  # 槽位读不到时 KERNEL_UNITS 必须退回单住宅实例名（不然判据 ① 会漏掉住宅那台）
+  out=$(
+    KERNEL_UNITS="hysteria-server xray"
+    case " $KERNEL_UNITS " in
+      *" hysteria-residential "*) printf 'kept' ;;
+      *) printf 'fallback' ;;
+    esac
+  )
+  if [ "$out" = "fallback" ]; then
+    ok "自测：读不到槽位时退回单住宅实例名"
+  else
+    no "自测：兜底分支没生效" "$out"
+  fi
 }
 
 st_login_and_crud() {

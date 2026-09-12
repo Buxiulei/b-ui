@@ -127,10 +127,13 @@ pub fn reconcile_once(
     // 没有防火墙的机器仍然满足 M1 的「二次对账零变更」（第三轮审查 C1）。
     if input.state.system.firewall != "off" && !ctx.facts.ufw_active && !ctx.facts.firewalld_active
     {
-        let specs: Vec<String> = crate::modules::system::firewall_ports(&input.state.node.ports)
-            .iter()
-            .map(|p| p.ufw())
-            .collect();
+        let specs: Vec<String> = crate::modules::system::firewall_ports(
+            &input.state.node.ports,
+            bui_schema::slots::slot_span(&input.state.residential),
+        )
+        .iter()
+        .map(|p| p.ufw())
+        .collect();
         notes.push(format!(
             "未检测到 ufw/firewalld，请在云厂商安全组放行：{}",
             specs.join(", ")

@@ -67,6 +67,10 @@ pub enum ResidentialCmd {
         #[arg(long)]
         auto: bool,
     },
+    /// 把住宅用户在各槽间均匀重排（按创建时间稳定排序）
+    Rebalance,
+    /// 把某个用户钉到某一槽（`<槽序号>`、`<uuid>`、`resi-N` / `url-N` 或 `<host:port>`）
+    Assign { user: String, target: String },
     /// 黑名单（查看 / 钉住 / 立即应用）
     Blacklist {
         #[command(subcommand)]
@@ -175,6 +179,12 @@ pub fn to_request(
             };
             ("POST", "/api/residential/slots/pin".into(), Some(body))
         }
+        C::Rebalance => ("POST", "/api/residential/rebalance".into(), None),
+        C::Assign { user, target } => (
+            "POST",
+            "/api/residential/assign".into(),
+            Some(serde_json::json!({"user": user, "target": target})),
+        ),
         C::Blacklist { cmd } => return blacklist_request(cmd),
     })
 }
@@ -656,6 +666,18 @@ pub async fn run(cmd: ResidentialCmd, socket: PathBuf) -> anyhow::Result<()> {
                 "已钉住"
             }
         ),
+        ResidentialCmd::Rebalance => println!(
+            "已重排 {} 个用户{}",
+            v.get("moved").and_then(|m| m.as_u64()).unwrap_or(0),
+            if v.get("xray_rules_pending") == Some(&serde_json::json!(true)) {
+                "，约 1 秒后槽路由生效（不重启 xray）"
+            } else {
+                ""
+            }
+        ),
+        ResidentialCmd::Assign { user, target } => {
+            println!("已把用户 {user} 分到 {target}，约 1 秒后槽路由生效（不重启 xray）")
+        }
         // 供脚本消费：只打印生效关键字数组（等价于 v3 `residential-helper.sh domains`）
         ResidentialCmd::Domains => println!(
             "{}",
@@ -666,7 +688,7 @@ pub async fn run(cmd: ResidentialCmd, socket: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 住宅子菜单的 10 项（两列渲染沿用 P1 的 [`crate::commands::menu::render_with`]）。
+/// 住宅子菜单的 12 项（两列渲染沿用 P1 的 [`crate::commands::menu::render_with`]）。
 pub fn menu_items() -> Vec<MenuItem> {
     vec![
         MenuItem {
@@ -713,6 +735,16 @@ pub fn menu_items() -> Vec<MenuItem> {
         MenuItem {
             key: "9",
             title: "钉住某一槽的出口 IP",
+            action: MenuAction::Residential,
+        },
+        MenuItem {
+            key: "10",
+            title: "按槽重排用户",
+            action: MenuAction::Residential,
+        },
+        MenuItem {
+            key: "11",
+            title: "指定用户的槽位",
             action: MenuAction::Residential,
         },
         MenuItem {
@@ -821,6 +853,20 @@ pub async fn menu(socket: PathBuf) -> anyhow::Result<()> {
                         auto: false,
                     }
                 }
+            }
+            "10" => ResidentialCmd::Rebalance,
+            "11" => {
+                let user = prompt("用户名: ")?;
+                if user.is_empty() {
+                    println!("未输入，已取消");
+                    continue;
+                }
+                let target = prompt("槽序号或上游（<槽序号>、<uuid>、resi-N 或 <host:port>）: ")?;
+                if target.is_empty() {
+                    println!("未输入，已取消");
+                    continue;
+                }
+                ResidentialCmd::Assign { user, target }
             }
             "0" => return Ok(()),
             other => {
@@ -1168,9 +1214,27 @@ mod tests {
     }
 
     #[test]
-    fn the_menu_lists_ten_items_and_the_p1_menu_gains_one() {
+    fn rebalance_and_assign_map_to_their_endpoints() {
+        assert_eq!(
+            to_request(&ResidentialCmd::Rebalance).unwrap(),
+            ("POST", "/api/residential/rebalance".to_string(), None)
+        );
+        let (m, p, b) = to_request(&ResidentialCmd::Assign {
+            user: "alice".into(),
+            target: "resi-2".into(),
+        })
+        .unwrap();
+        assert_eq!((m, p.as_str()), ("POST", "/api/residential/assign"));
+        assert_eq!(
+            b.unwrap(),
+            serde_json::json!({"user": "alice", "target": "resi-2"})
+        );
+    }
+
+    #[test]
+    fn the_menu_lists_twelve_items_and_the_p1_menu_gains_one() {
         let items = menu_items();
-        assert_eq!(items.len(), 10);
+        assert_eq!(items.len(), 12);
         assert_eq!(items.last().unwrap().action, MenuAction::Quit);
         assert!(items.iter().any(|i| i.title.contains("黑名单")));
         // 两处「钉住」的文案必须能区分开：一个钉域名，一个钉槽位的出口 IP（spec §5.6）

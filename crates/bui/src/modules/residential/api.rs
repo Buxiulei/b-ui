@@ -438,6 +438,14 @@ pub struct PinSlotRequest {
     pub auto: bool,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct AssignRequest {
+    /// 用户名（面板与 CLI 都按用户名说话）
+    pub user: String,
+    /// 槽序号（`"0"`）或上游定位串（`<uuid>` / `resi-N` / `url-N` / `<host:port>`）
+    pub target: String,
+}
+
 /// v3 `members[].egress`：`type` 是中文串（`web/app.js:1095` 用 `/IDC|机房/i` 判色）
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Egress {
@@ -581,6 +589,8 @@ pub fn routes_with(
         // ── 槽位（spec §5.6）──
         .route("/api/residential/slots", get(get_slots))
         .route("/api/residential/slots/pin", post(post_pin_slot))
+        .route("/api/residential/rebalance", post(post_rebalance))
+        .route("/api/residential/assign", post(post_assign))
         // ── v3 路径别名（契约决策 §A；前端零改动，P5 删兼容层时一并删掉本段）──
         .route(
             "/api/residential",
@@ -962,6 +972,64 @@ async fn post_pin_slot(
         .await
         .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
     Ok(Json(serde_json::json!({ "success": true })).into_response())
+}
+
+/// `POST /api/residential/rebalance`（spec §5.6 规则 3）：把住宅用户在各槽间均匀重排。
+async fn post_rebalance(State(app): State<AppState>, Extension(d): Extension<Deps>) -> ApiResult {
+    let ctx = ctx_of(&app, &d.paths);
+    let moved = crate::modules::residential::slots::rebalance_users(&ctx)
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // `xray_rules_pending` 提醒前端：槽路由要等下一轮对账（≈1 秒）走 gRPC 收口才生效（D7），
+    // 那一下不重启 xray、不掐连接
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "moved": moved,
+        "xray_rules_pending": moved > 0
+    }))
+    .into_response())
+}
+
+/// `POST /api/residential/assign`（spec §5.6 规则 3）：把某个用户钉到某一槽。
+async fn post_assign(
+    State(app): State<AppState>,
+    Extension(d): Extension<Deps>,
+    Json(req): Json<AssignRequest>,
+) -> ApiResult {
+    let s = app.store.read().await;
+    let user_id = s
+        .users
+        .iter()
+        .find(|u| u.username == req.user)
+        .map(|u| u.user_id)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("没有用户 {}", req.user)))?;
+    let g = state::group_of(&s);
+    // `target` 先按纯槽序号解释（面板传的是 SlotRow.index），再按上游定位串解析
+    let slot_id = match req.target.parse::<u16>() {
+        Ok(i) => s
+            .residential
+            .slots
+            .iter()
+            .find(|x| x.index == i)
+            .map(|x| x.upstream_id)
+            .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("没有槽 {i}")))?,
+        Err(_) => upstream::resolve_upstream(&g, &req.target).map_err(map_upstream_err)?,
+    };
+    drop(s);
+    let ctx = ctx_of(&app, &d.paths);
+    if !crate::modules::residential::slots::assign_user(&ctx, user_id, slot_id)
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "该用户没有住宅权益，无法分配槽位",
+        ));
+    }
+    // **不在这里调 converge_xray**：守护进程里只许对账 consumer 那一处调它（D7）。
+    // `assign_user` 已经发了 `StateChanged("residential")`，约 1 秒后对账末尾那次调用
+    // 会走 gRPC 把这个用户的规则改掉，xray 不重启。
+    Ok(Json(serde_json::json!({ "success": true, "xray_rules_pending": true })).into_response())
 }
 
 async fn post_add(
@@ -2520,6 +2588,81 @@ mod tests {
         assert_eq!(code, StatusCode::OK);
         let (_, v) = call(&h.app, "GET", "/api/residential/slots", None).await;
         assert_eq!(v["slots"][0]["pinned"], false);
+    }
+
+    // ── T7：`rebalance` / `assign` ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn post_rebalance_moves_users_and_reports_the_count() {
+        let d = tempfile::tempdir().unwrap();
+        let h = harness(&d).await;
+        grow_pool(&h, 2).await;
+        // alice 在槽 0；rebalance 后（1 人 2 槽）她仍在槽 0 ⇒ 改动数 0
+        let (code, v) = call(&h.app, "POST", "/api/residential/rebalance", None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v["moved"], 0);
+        // 把她挪到槽 1，再 rebalance ⇒ 回到槽 0，改动数 1
+        let slot1 = bui_schema::slots::sorted(&h.ctx.store.read().await.residential)[1].upstream_id;
+        let uid = h.ctx.store.read().await.users[0].user_id;
+        crate::modules::residential::slots::assign_user(&h.ctx, uid, slot1)
+            .await
+            .unwrap();
+        let (_, v) = call(&h.app, "POST", "/api/residential/rebalance", None).await;
+        assert_eq!(v["moved"], 1);
+        let (_, v) = call(&h.app, "GET", "/api/residential/slots", None).await;
+        assert_eq!(v["slots"][0]["user_count"], 1);
+    }
+
+    #[tokio::test]
+    async fn post_assign_pins_one_user_to_one_slot() {
+        let d = tempfile::tempdir().unwrap();
+        let h = harness(&d).await;
+        grow_pool(&h, 2).await;
+        let (code, _) = call(
+            &h.app,
+            "POST",
+            "/api/residential/assign",
+            Some(serde_json::json!({"user": "alice", "target": "resi-2"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        let (_, v) = call(&h.app, "GET", "/api/residential/slots", None).await;
+        assert_eq!(v["slots"][1]["users"], serde_json::json!(["alice"]));
+        // 槽序号写法也认
+        let (code, _) = call(
+            &h.app,
+            "POST",
+            "/api/residential/assign",
+            Some(serde_json::json!({"user": "alice", "target": "0"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        let (_, v) = call(&h.app, "GET", "/api/residential/slots", None).await;
+        assert_eq!(v["slots"][0]["users"], serde_json::json!(["alice"]));
+    }
+
+    #[tokio::test]
+    async fn post_assign_rejects_an_unknown_user_or_target() {
+        let d = tempfile::tempdir().unwrap();
+        let h = harness(&d).await;
+        grow_pool(&h, 2).await;
+        for (body, want) in [
+            (
+                serde_json::json!({"user": "nobody", "target": "resi-1"}),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                serde_json::json!({"user": "alice", "target": "resi-9"}),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                serde_json::json!({"user": "alice"}),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+        ] {
+            let (code, v) = call(&h.app, "POST", "/api/residential/assign", Some(body)).await;
+            assert_eq!(code, want, "{v}");
+        }
     }
 
     #[tokio::test]
