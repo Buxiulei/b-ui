@@ -355,6 +355,11 @@ pub trait Module: Send + Sync {
     fn routes(&self) -> axum::Router<crate::api::AppState> {
         axum::Router::new()
     }
+    /// 无鉴权路由：订阅、`/api/nodes`、嵌入前端、`/packages/*`、用户域桩。
+    /// `api::router()` 把它合并在 `require_admin` **外面**（裁决 D1）。
+    fn public_routes(&self) -> axum::Router<crate::api::AppState> {
+        axum::Router::new()
+    }
     /// 该模块的后台任务（默认没有）。
     fn spawn(&self, _ctx: DaemonCtx) -> Vec<tokio::task::JoinHandle<()>> {
         Vec::new()
