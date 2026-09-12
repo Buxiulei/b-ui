@@ -26,6 +26,8 @@ pub struct FakeInner {
     /// 键是 `(单元**全名**, 属性名)`，如 `("hysteria-server.service", "NRestarts")`
     pub unit_props: BTreeMap<(String, String), String>,
     pub sysctl: BTreeMap<String, String>,
+    /// 「这个键被内核钳制/重排」：`sysctl_set` 之后读回的就是这里的值，不是写入值
+    pub sysctl_clamp: BTreeMap<String, String>,
     pub which: BTreeSet<String>,
     pub modules: BTreeSet<String>,
     /// 前缀匹配的脚本化命令结果："xray run -test" → CmdOut
@@ -55,6 +57,7 @@ impl Default for FakeInner {
             units_exist: BTreeSet::new(),
             unit_props: BTreeMap::new(),
             sysctl: BTreeMap::new(),
+            sysctl_clamp: BTreeMap::new(),
             which: BTreeSet::new(),
             modules: BTreeSet::new(),
             scripted: Vec::new(),
@@ -302,7 +305,18 @@ impl Host for FakeHost {
 
     fn sysctl_set(&self, key: &str, value: &str) -> Result<()> {
         let mut i = self.lock();
-        i.sysctl.insert(key.to_string(), value.to_string());
+        // 真机语义：`sysctl -w` 写进去的是空格分隔，但 `/proc` 里多值键存的是**制表符**分隔，
+        // 下一轮 `sysctl -n` 原样读回制表符（`4096\t262144\t16777216`）。假机器照抄这条，
+        // 否则「二次对账零变更」在测试里恒绿、在真机上恒红（bwg-rick M1 step2）。
+        let stored = match i.sysctl_clamp.get(key) {
+            // 内核钳制/重排：写什么都读回这个值
+            Some(clamped) => clamped.clone(),
+            None => value
+                .split_ascii_whitespace()
+                .collect::<Vec<_>>()
+                .join("\t"),
+        };
+        i.sysctl.insert(key.to_string(), stored);
         i.ops.push(format!("sysctl:{key}={value}"));
         Ok(())
     }
@@ -380,6 +394,29 @@ mod tests {
                 "systemd:restart:hysteria-server",
                 "sysctl:net.ipv4.tcp_retries2=8"
             ]
+        );
+    }
+
+    #[test]
+    fn multi_value_sysctl_reads_back_tab_separated_and_clamps_win() {
+        // 真机行为：`sysctl -w net.ipv4.tcp_rmem="4096 262144 16777216"` 之后
+        // `sysctl -n net.ipv4.tcp_rmem` 输出的是制表符分隔；被内核钳制的键读回的还不是写入值。
+        let h = FakeHost::new();
+        h.sysctl_set("net.ipv4.tcp_rmem", "4096 262144 16777216")
+            .unwrap();
+        assert_eq!(
+            h.sysctl_get("net.ipv4.tcp_rmem").unwrap().as_deref(),
+            Some("4096\t262144\t16777216")
+        );
+        h.with(|i| {
+            i.sysctl_clamp
+                .insert("net.ipv4.udp_mem".into(), "8192\t524288\t1048576".into());
+        });
+        h.sysctl_set("net.ipv4.udp_mem", "262144 524288 1048576")
+            .unwrap();
+        assert_eq!(
+            h.sysctl_get("net.ipv4.udp_mem").unwrap().as_deref(),
+            Some("8192\t524288\t1048576")
         );
     }
 

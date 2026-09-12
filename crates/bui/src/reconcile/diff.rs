@@ -161,13 +161,23 @@ pub fn plan(input: PlanInput<'_>, host: &dyn Host) -> Result<Plan> {
                 }
             }
             Artifact::Sysctl { key, value } => {
-                if host.sysctl_get(key)?.as_deref() != Some(value.as_str()) {
+                // 比较按空白切分的 token 序列（`/proc` 的多值键是制表符分隔），切分后仍不等时
+                // 再看 apply 留下的钳制记账（内核把写入值改过，读回值才是已生效值）。
+                let current = host.sysctl_get(key)?;
+                let settled = current.as_deref().is_some_and(|cur| {
+                    super::sysctl_tokens_eq(cur, value)
+                        || input
+                            .keys
+                            .get(&art.id())
+                            .is_some_and(|rec| super::sysctl_clamp_settled(rec, value, cur))
+                });
+                if settled {
+                    out.unchanged += 1;
+                } else {
                     out.changes.push(Change::SetSysctl {
                         key: key.clone(),
                         value: value.clone(),
                     });
-                } else {
-                    out.unchanged += 1;
                 }
             }
             Artifact::Modprobe { module } => {
@@ -470,6 +480,100 @@ mod tests {
             ]
         );
         assert_eq!(p.unchanged, 3, "tcp_retries2 / xray 版本 / 不存在的 Absent");
+    }
+
+    #[test]
+    fn multi_value_sysctl_is_compared_token_wise_not_byte_wise() {
+        // bwg-rick 真机 M1 step2：`/proc` 里多值键是**制表符**分隔，而 conf 与 `sysctl -w`
+        // 用空格 —— 逐字节比会让 tcp_rmem / tcp_wmem / udp_mem / ip_local_port_range
+        // 这四个键每轮都进 `changed`，「二次对账零变更」恒 FAIL。
+        let h = FakeHost::new();
+        h.with(|i| {
+            i.sysctl
+                .insert("net.ipv4.tcp_rmem".into(), "4096\t262144\t16777216".into());
+            i.sysctl
+                .insert("net.ipv4.ip_local_port_range".into(), "10000\t65535".into());
+            // 单值键不受影响，但顺手覆盖「前后空白」这一种
+            i.sysctl
+                .insert("net.ipv4.tcp_retries2".into(), " 8 ".into());
+        });
+        let paths = Paths::default_server();
+        let (keys, versions) = (BTreeMap::new(), BTreeMap::new());
+        let arts = vec![
+            Artifact::Sysctl {
+                key: "net.ipv4.tcp_rmem".into(),
+                value: "4096 262144 16777216".into(),
+            },
+            Artifact::Sysctl {
+                key: "net.ipv4.ip_local_port_range".into(),
+                value: "10000 65535".into(),
+            },
+            Artifact::Sysctl {
+                key: "net.ipv4.tcp_retries2".into(),
+                value: "8".into(),
+            },
+        ];
+        let p = plan(input(&arts, &paths, &keys, &versions), &h).unwrap();
+        assert_eq!(p.changes, vec![], "制表符/空格之差不是改动");
+        assert_eq!(p.unchanged, 3);
+        // token 序列真的不同（值变了 / 少一个 token）才算改动
+        let arts = vec![
+            Artifact::Sysctl {
+                key: "net.ipv4.tcp_rmem".into(),
+                value: "4096 524288 16777216".into(),
+            },
+            Artifact::Sysctl {
+                key: "net.ipv4.ip_local_port_range".into(),
+                value: "10000".into(),
+            },
+        ];
+        let p = plan(input(&arts, &paths, &keys, &versions), &h).unwrap();
+        assert_eq!(p.changes.len(), 2, "{:?}", p.changes);
+    }
+
+    #[test]
+    fn a_kernel_clamped_sysctl_settles_after_one_apply() {
+        // 切分后仍不等 = 内核钳制/重排。apply 记下「写了什么 → 实际生效什么」之后，
+        // 下一轮就把读回值当已生效值，不再每轮报 changed。
+        let h = FakeHost::new();
+        h.with(|i| {
+            i.sysctl
+                .insert("net.ipv4.udp_mem".into(), "8192\t524288\t1048576".into());
+        });
+        let paths = Paths::default_server();
+        let versions = BTreeMap::new();
+        let want = "262144 524288 1048576";
+        let arts = vec![Artifact::Sysctl {
+            key: "net.ipv4.udp_mem".into(),
+            value: want.into(),
+        }];
+        // 没有记账 → 照旧写一次
+        let keys = BTreeMap::new();
+        let p = plan(input(&arts, &paths, &keys, &versions), &h).unwrap();
+        assert_eq!(p.changes.len(), 1);
+        // 记账之后 → 零变更
+        let mut keys = BTreeMap::new();
+        keys.insert(
+            "sysctl:net.ipv4.udp_mem".to_string(),
+            super::super::sysctl_clamped_record(want, "8192\t524288\t1048576"),
+        );
+        let p = plan(input(&arts, &paths, &keys, &versions), &h).unwrap();
+        assert!(p.changes.is_empty(), "{:?}", p.changes);
+        assert_eq!(p.unchanged, 1);
+        // 期望值改了 → 记账失效，重新写
+        let other = vec![Artifact::Sysctl {
+            key: "net.ipv4.udp_mem".into(),
+            value: "262144 524288 2097152".into(),
+        }];
+        let p = plan(input(&other, &paths, &keys, &versions), &h).unwrap();
+        assert_eq!(p.changes.len(), 1, "期望值变了必须重新写");
+        // 读回值被人手改了 → 记账失效，重新写
+        h.with(|i| {
+            i.sysctl
+                .insert("net.ipv4.udp_mem".into(), "1024\t1024\t1024".into());
+        });
+        let p = plan(input(&arts, &paths, &keys, &versions), &h).unwrap();
+        assert_eq!(p.changes.len(), 1, "读回值不再是记账里的已生效值");
     }
 
     #[test]

@@ -90,6 +90,41 @@ pub enum Verify {
     Sshd,
 }
 
+/// sysctl 的值一律**按 ASCII 空白切分成 token 序列**再比：多值键在 `/proc` 里是**制表符**
+/// 分隔（`sysctl -n net.ipv4.tcp_rmem` → `4096\t262144\t16777216`），而我们的 conf 与
+/// `sysctl -w` 用空格。逐字节比会让 `net.ipv4.tcp_rmem` / `tcp_wmem` / `udp_mem` /
+/// `ip_local_port_range` 这四个多值键每轮都进 `changed`（bwg-rick 真机 M1 step2 的
+/// 「二次对账零变更」FAIL；单值键不复现）。
+pub fn sysctl_tokens_eq(a: &str, b: &str) -> bool {
+    a.split_ascii_whitespace().eq(b.split_ascii_whitespace())
+}
+
+/// 记账分隔符：sysctl 的值只有数字、字母、`,`、`-`、`.`，不会出现 `=>`。
+const SYSCTL_CLAMP_SEP: &str = " => ";
+
+/// 「写入值 → 内核实际生效值」的记账，存进 `runtime.restart_keys["sysctl:<key>"]`。
+/// 切分后仍不等（内核钳制或重排，例如把 `tcp_rmem` 的最小值抬到一个页）时由 apply 写下，
+/// 下一轮 [`diff::plan`] 拿它认账：读回值就是已生效值，不再每轮报 changed。
+pub fn sysctl_clamped_record(want: &str, got: &str) -> String {
+    format!(
+        "{}{SYSCTL_CLAMP_SEP}{}",
+        norm_sysctl(want),
+        norm_sysctl(got)
+    )
+}
+
+/// 记账是否仍然成立：期望值没变、且当前读回值就是记账里的已生效值
+/// （期望值改了或值被人手改了都要重新写）。
+pub fn sysctl_clamp_settled(record: &str, want: &str, current: &str) -> bool {
+    record
+        .split_once(SYSCTL_CLAMP_SEP)
+        .is_some_and(|(w, g)| sysctl_tokens_eq(w, want) && sysctl_tokens_eq(g, current))
+}
+
+fn norm_sysctl(v: &str) -> String {
+    v.split_ascii_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// 一条要放行的端口（单端口 = `from == to`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortSpec {
