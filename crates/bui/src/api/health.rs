@@ -40,9 +40,11 @@ pub async fn get(State(app): State<AppState>) -> Json<HealthResponse> {
     let state = app.store.read().await;
     let rt = app.runtime.read().await;
     let host = app.host.clone();
-    // 三次 systemctl × 六个单元都是阻塞调用，必须离开 async 线程（总纲裁决：Host 同步 + spawn_blocking）
+    // 受管单元 = 六个固定 + 槽 1.. 的住宅实例（按期望态枚举）
+    let units = crate::reconcile::managed_units(&state);
+    // 三次 systemctl × 每个单元都是阻塞调用，必须离开 async 线程（总纲裁决：Host 同步 + spawn_blocking）
     let services = tokio::task::spawn_blocking(move || {
-        crate::reconcile::MANAGED_UNITS
+        units
             .iter()
             .map(|u| ServiceStatus {
                 unit: u.to_string(),

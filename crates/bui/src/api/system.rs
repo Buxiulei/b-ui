@@ -33,12 +33,13 @@ pub async fn reconcile(State(app): State<AppState>, Json(req): Json<ReconcileReq
     }
 }
 
-/// `POST /api/services/{unit}/{action}`；`unit` 只接受 `MANAGED_UNITS` 里的六个名字，其余 400。
+/// `POST /api/services/{unit}/{action}`；`unit` 只接受 `reconcile::is_managed_unit` 认的名字
+/// （六个固定 + `hysteria-residential-<1..7>`），其余 400。
 pub async fn service_action(
     State(app): State<AppState>,
     Path((unit, action)): Path<(String, String)>,
 ) -> Response {
-    if !crate::reconcile::MANAGED_UNITS.contains(&unit.as_str()) {
+    if !crate::reconcile::is_managed_unit(unit.as_str()) {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": format!("不受管的单元：{unit}")})),

@@ -20,6 +20,16 @@ pub const RELAY_LISTEN_PORT: u16 = 2080;
 /// 本地 relay 的 Clash API（巡检热切换上游用，不重启进程）。
 pub const RELAY_CLASH_API: &str = "127.0.0.1:9091";
 
+/// 槽 `index` 的住宅配置路径：槽 0 是 v3 的 `config-residential.yaml`（兼容面），
+/// 其余是 `config-residential-<i>.yaml`。
+pub fn resi_config_path(p: &Paths, index: u16) -> std::path::PathBuf {
+    if index == 0 {
+        p.base_dir.join("config-residential.yaml")
+    } else {
+        p.base_dir.join(format!("config-residential-{index}.yaml"))
+    }
+}
+
 /// 四个内核二进制 + 它们的五份配置（唯一来源是 bui-schema 的渲染器）+ 站点目录占位文件。
 /// manifest 放共享锁里：守护进程每日自检拉到新 manifest 后直接写这个锁，
 /// 下一轮对账就按新版本装内核，不需要重启进程（spec §7）。
@@ -139,13 +149,27 @@ impl Module for CoreFilesModule {
             )
             .restart(Unit::restart("hysteria-server")),
         );
-        out.push(
-            Artifact::file(
-                p.base_dir.join("config-residential.yaml"),
-                bui_schema::render::hysteria::residential_yaml(&s.node, p),
-            )
-            .restart(Unit::restart("hysteria-residential")),
-        );
+        // 每槽一个住宅实例的配置（spec §5.6）；改了哪一槽只重启那一槽的单元
+        let live = bui_schema::slots::indices(&s.residential);
+        for i in live.iter().copied() {
+            let res = bui_schema::slots::resources_of(&s.node.ports, &s.residential, i);
+            out.push(
+                Artifact::file(
+                    resi_config_path(p, i),
+                    bui_schema::render::hysteria::residential_slot_yaml(&s.node, p, &res),
+                )
+                .restart(Unit::restart(&crate::reconcile::resi_unit(i))),
+            );
+        }
+        // 池缩小之后留下的配置文件要删掉：留着不会被加载，但会被漂移扫描
+        // 报成「受管目录里的陌生文件」，体检永久 degraded
+        for i in 1..crate::reconcile::MAX_RESI_SLOTS {
+            if !live.contains(&i) {
+                out.push(Artifact::Absent {
+                    path: resi_config_path(p, i),
+                });
+            }
+        }
         let xray = bui_schema::render::xray::config(&s.node, &s.users, p);
         let hash = bui_schema::render::xray::structural_hash(&xray);
         out.push(
@@ -305,7 +329,17 @@ mod tests {
     fn without_a_manifest_only_the_files_are_rendered() {
         let arts = CoreFilesModule::new(None).render(&sample_state(), &ctx());
         assert!(!arts.iter().any(|a| matches!(a, Artifact::Binary { .. })));
-        assert_eq!(arts.len(), 6);
+        // 六份配置文件 + 空槽位（1..MAX）的配置清理项
+        assert_eq!(
+            arts.iter()
+                .filter(|a| matches!(a, Artifact::File { .. }))
+                .count(),
+            6
+        );
+        assert_eq!(
+            arts.len(),
+            6 + usize::from(crate::reconcile::MAX_RESI_SLOTS - 1)
+        );
     }
 
     #[test]
@@ -585,5 +619,95 @@ mod tests {
             "caddy validate 失败：{}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    /// 造一份 n 槽的期望态（上游 uuid = index+1，与 T1 的夹具同规则）。
+    fn state_with_slots(n: u16) -> bui_schema::model::State {
+        let mut s = sample_state();
+        let g = s
+            .residential
+            .groups
+            .get_mut(bui_schema::model::DEFAULT_GROUP)
+            .unwrap();
+        g.enabled = true;
+        g.upstreams = (0..n)
+            .map(|i| bui_schema::model::Upstream {
+                id: uuid::Uuid::from_u128(u128::from(i) + 1),
+                name: format!("url-{}", i + 1),
+                kind: bui_schema::model::UpstreamKind::Socks5,
+                host: format!("isp{}.example.net", i + 1),
+                port: 10007,
+                username: "user1".into(),
+                password: "pw1".into(),
+                priority: 100,
+                provider: None,
+                region: None,
+                ports_allowed: None,
+                verified: None,
+            })
+            .collect();
+        g.selected_upstream_id = g.upstreams.first().map(|u| u.id);
+        s.residential.slots = (0..n)
+            .map(|i| bui_schema::model::Slot {
+                index: i,
+                upstream_id: uuid::Uuid::from_u128(u128::from(i) + 1),
+            })
+            .collect();
+        s
+    }
+
+    #[test]
+    fn a_single_slot_renders_exactly_one_residential_config_named_like_v3() {
+        let arts = CoreFilesModule::new(None).render(&sample_state(), &ctx());
+        let files: Vec<String> = arts
+            .iter()
+            .filter_map(|a| match a {
+                Artifact::File { path, .. } => Some(path.display().to_string()),
+                _ => None,
+            })
+            .collect();
+        assert!(files.contains(&"/opt/b-ui/config-residential.yaml".to_string()));
+        assert!(!files.iter().any(|f| f.contains("config-residential-")));
+        // 空槽位的清理项覆盖 1..MAX
+        for i in 1..crate::reconcile::MAX_RESI_SLOTS {
+            assert!(
+                arts.iter().any(|a| matches!(a, Artifact::Absent { path }
+                    if path.to_str() == Some(&format!("/opt/b-ui/config-residential-{i}.yaml")))),
+                "槽 {i} 的配置没有清理项"
+            );
+        }
+    }
+
+    #[test]
+    fn three_slots_render_three_residential_configs_with_their_own_restart_targets() {
+        let s = state_with_slots(3);
+        let arts = CoreFilesModule::new(None).render(&s, &ctx());
+        let p = Paths::default_server();
+        for i in 0..3u16 {
+            let want = bui_schema::render::hysteria::residential_slot_yaml(
+                &s.node,
+                &p,
+                &bui_schema::slots::resources_of(&s.node.ports, &s.residential, i),
+            );
+            let path = crate::modules::core_files::resi_config_path(&p, i);
+            match find_file(&arts, path.to_str().unwrap()) {
+                Artifact::File {
+                    content, restart, ..
+                } => {
+                    assert_eq!(String::from_utf8(content).unwrap(), want, "槽 {i} 内容");
+                    assert_eq!(
+                        restart,
+                        Some(Unit::restart(&crate::reconcile::resi_unit(i))),
+                        "槽 {i} 只重启自己那个实例"
+                    );
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        // 只剩 3..MAX 需要清理
+        assert!(arts.iter().any(|a| matches!(a, Artifact::Absent { path }
+            if path.to_str() == Some("/opt/b-ui/config-residential-3.yaml"))));
+        assert!(!arts.iter().any(|a| matches!(a, Artifact::Absent { path }
+            if path.to_str() == Some("/opt/b-ui/config-residential-2.yaml"))));
     }
 }

@@ -63,8 +63,14 @@ pub fn scan(host: &dyn Host, artifacts: &[Artifact], paths: &Paths) -> Vec<Drift
     let mut out = Vec::new();
     let managed_paths = artifact_paths(artifacts);
 
-    // 1) 受管单元下的陌生 drop-in
-    for unit in MANAGED_UNITS {
+    // 1) 受管单元下的陌生 drop-in。**按「所有可能的槽」枚举而不是按期望态**：
+    // 某个槽此刻不存在，它留下的 drop-in 照样是我们该报出来的东西。
+    let units: Vec<String> = MANAGED_UNITS
+        .iter()
+        .map(|u| u.to_string())
+        .chain((1..super::MAX_RESI_SLOTS).map(super::resi_unit))
+        .collect();
+    for unit in &units {
         let dir = PathBuf::from(SYSTEMD_DIR).join(format!("{unit}.service.d"));
         for entry in host.list_dir(&dir).unwrap_or_default() {
             if managed_paths.contains(&entry) {

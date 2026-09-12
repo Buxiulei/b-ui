@@ -62,13 +62,14 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let mut state = crate::testutil::sample_state();
         state.admin.password_hash = crate::api::auth::hash_password("test123").unwrap();
+        let units = crate::reconcile::managed_units(&state);
         let store = Store::create(d.path().join("state.json"), state)
             .await
             .unwrap();
         let runtime = Runtime::load(d.path().join("runtime.json"));
         let host = Arc::new(FakeHost::new());
         host.with(|i| {
-            for u in crate::reconcile::MANAGED_UNITS {
+            for u in &units {
                 i.units_active.insert(format!("{u}.service"));
                 i.units_enabled.insert(format!("{u}.service"));
             }

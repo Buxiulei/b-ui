@@ -117,11 +117,12 @@ mod tests {
         let sock = dir.join("b-ui.sock");
         let mut state = crate::testutil::sample_state();
         state.admin.password_hash = hash_password("test123").unwrap();
+        let units = crate::reconcile::managed_units(&state);
         let store = Store::create(dir.join("state.json"), state).await.unwrap();
         let runtime = Runtime::load(dir.join("runtime.json"));
         let host = Arc::new(FakeHost::new());
         host.with(|i| {
-            for u in crate::reconcile::MANAGED_UNITS {
+            for u in &units {
                 i.units_active.insert(format!("{u}.service"));
                 i.units_enabled.insert(format!("{u}.service"));
             }

@@ -38,7 +38,9 @@ use uuid::Uuid;
 pub const MODULE_NAME: &str = "panel";
 /// 两个 hysteria 的 trafficStats 监听端口（由 `bui_schema::render::hysteria` 写死）。
 pub const HY2_STATS_PORT_DIRECT: u16 = 9999;
-pub const HY2_STATS_PORT_RESI: u16 = 9998;
+/// 住宅实例的 `trafficStats` 端口基准（槽 i = `9998 - i`，见 `bui_schema::slots`）。
+/// 单槽时就是今天的 9998。
+pub const HY2_STATS_PORT_RESI: u16 = bui_schema::slots::HY2_STATS_RESI_BASE;
 /// `bui_schema::render::hysteria` 渲染的 `trafficStats.secret` 是空串 ⇒ 不发 Authorization 头。
 /// 若将来改成非空，`hy2::Hy2Client` 按调研 H13 发 `Authorization: <secret>`（**无** `Bearer ` 前缀）。
 pub const HY2_STATS_SECRET: &str = "";

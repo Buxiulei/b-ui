@@ -56,18 +56,36 @@ impl Module for UnitsModule {
         "units"
     }
 
-    fn render(&self, _s: &State, ctx: &RenderCtx) -> Vec<Artifact> {
+    fn render(&self, s: &State, ctx: &RenderCtx) -> Vec<Artifact> {
         let mut out = Vec::new();
 
         // 六个单元文件。`name` 一律 `Unit::restart`，caddy 也不例外：单元文件本身变了必须
         // `systemctl restart`，`reload` 不会让新的 ExecStart / Environment / MemoryMax 生效。
         // （`Unit::reload` 只用在两个 `Artifact::File` 上：`<base>/Caddyfile` 与
         // `/etc/ssh/sshd_config.d/00-b-ui-hardening.conf`。）
+        // `hysteria-residential` 是槽 0，正文由 `resi_unit_text` 出（与槽 1.. 同一模板）；
+        // 它必须留在 MANAGED_UNITS 的原位，`renders_exactly_six_units_and_no_timers`
+        // 按这个顺序断言。
         for name in MANAGED_UNITS {
+            let content = if name == "hysteria-residential" {
+                resi_unit_text(0, ctx)
+            } else {
+                unit_text(name, ctx)
+            };
             out.push(Artifact::Unit {
                 name: Unit::restart(name),
                 dropin: None,
-                content: unit_text(name, ctx),
+                content,
+            });
+        }
+        // 槽 1.. 的住宅实例（槽 0 已在上面那轮里）
+        let live = bui_schema::slots::indices(&s.residential);
+        for i in live.iter().copied().filter(|i| *i != 0) {
+            let name = crate::reconcile::resi_unit(i);
+            out.push(Artifact::Unit {
+                name: Unit::restart(&name),
+                dropin: None,
+                content: resi_unit_text(i, ctx),
             });
         }
 
@@ -103,6 +121,28 @@ impl Module for UnitsModule {
                 active: true,
             });
         }
+        for i in live.iter().copied().filter(|i| *i != 0) {
+            out.push(Artifact::UnitState {
+                name: crate::reconcile::resi_unit(i),
+                enabled: true,
+                active: true,
+            });
+        }
+        // 池缩小之后多出来的实例：先停用再删单元文件（与 LEGACY_UNITS 同一套手法）
+        for i in 1..crate::reconcile::MAX_RESI_SLOTS {
+            if live.contains(&i) {
+                continue;
+            }
+            let name = crate::reconcile::resi_unit(i);
+            out.push(Artifact::UnitState {
+                name: name.clone(),
+                enabled: false,
+                active: false,
+            });
+            out.push(Artifact::Absent {
+                path: format!("/etc/systemd/system/{name}.service").into(),
+            });
+        }
 
         // v3 遗留单元：先全部停用，再删单元文件。
         for legacy in LEGACY_UNITS {
@@ -126,7 +166,8 @@ impl Module for UnitsModule {
     }
 }
 
-/// 渲染一个受管单元的完整正文。`name` 必须是 [`MANAGED_UNITS`] 里的一个。
+/// 渲染一个受管单元的完整正文。`name` 必须是 [`MANAGED_UNITS`] 里的一个，
+/// **`hysteria-residential` 除外**——住宅实例（含槽 0）一律走 [`resi_unit_text`]。
 pub fn unit_text(name: &str, ctx: &RenderCtx) -> String {
     let bin = ctx.paths.bin_dir.display();
     let base = ctx.paths.base_dir.display();
@@ -174,35 +215,6 @@ Environment=GOMEMLIMIT=400MiB
 Environment=HYSTERIA_LOG_LEVEL=warn
 MemoryHigh=500M
 MemoryMax=700M
-
-[Install]
-WantedBy=multi-user.target
-"
-        ),
-        "hysteria-residential" => format!(
-            "[Unit]
-Description=Hysteria Server (Residential)
-Documentation=https://v2.hysteria.network/
-After=network-online.target b-ui-relay.service
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStartPre=-{bin}/bui hy2-prestart {base}/config-residential.yaml
-ExecStart={bin}/hysteria server --config {base}/config-residential.yaml
-User=root
-Group=root
-Restart=always
-RestartSec=3
-TimeoutStopSec=15
-LimitNOFILE=1048576
-LimitNPROC=512
-CPUSchedulingPolicy=other
-Nice=-5
-Environment=GOMEMLIMIT=200MiB
-Environment=HYSTERIA_LOG_LEVEL=warn
-MemoryHigh=300M
-MemoryMax=500M
 
 [Install]
 WantedBy=multi-user.target
@@ -284,6 +296,53 @@ WantedBy=multi-user.target
         }
         other => unreachable!("unit_text 只认受管单元，收到 {other}"),
     }
+}
+
+/// 槽 `index` 的住宅 hysteria 单元正文。与直连实例的差别只有 `--config` 指向的文件
+/// 与 Description；资源限制沿用 v3 的住宅档（`GOMEMLIMIT=200MiB` / `MemoryHigh=300M` /
+/// `MemoryMax=500M` / `LimitNPROC=512`）。
+///
+/// **每槽独立的资源上限而不是共享一份**：一条上游抖起来只该影响它自己那个实例。
+/// `ExecStartPre` 同样按槽传**自己**那份配置——端口跳跃的 nat 链按实例的
+/// base 端口 + 跳跃区间定位，跨实例清理正是 v3.5.1 翻车的写法。
+pub fn resi_unit_text(index: u16, ctx: &RenderCtx) -> String {
+    let bin = ctx.paths.bin_dir.display();
+    let cfg = crate::modules::core_files::resi_config_path(&ctx.paths, index);
+    let cfg = cfg.display();
+    let slot = if index == 0 {
+        String::new()
+    } else {
+        format!(" slot {index}")
+    };
+    format!(
+        "[Unit]
+Description=Hysteria Server (Residential{slot})
+Documentation=https://v2.hysteria.network/
+After=network-online.target b-ui-relay.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=-{bin}/bui hy2-prestart {cfg}
+ExecStart={bin}/hysteria server --config {cfg}
+User=root
+Group=root
+Restart=always
+RestartSec=3
+TimeoutStopSec=15
+LimitNOFILE=1048576
+LimitNPROC=512
+CPUSchedulingPolicy=other
+Nice=-5
+Environment=GOMEMLIMIT=200MiB
+Environment=HYSTERIA_LOG_LEVEL=warn
+MemoryHigh=300M
+MemoryMax=500M
+
+[Install]
+WantedBy=multi-user.target
+"
+    )
 }
 
 #[cfg(test)]
@@ -748,5 +807,76 @@ mod tests {
             h.is_dir(Path::new(XRAY_DROPIN_DIR)).unwrap(),
             "非空目录不动"
         );
+    }
+
+    #[test]
+    fn a_single_slot_renders_the_v3_named_residential_unit_only() {
+        let arts = UnitsModule.render(&sample_state(), &ctx());
+        let names: Vec<String> = arts
+            .iter()
+            .filter_map(|a| match a {
+                Artifact::Unit { name, .. } => Some(name.name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            names,
+            MANAGED_UNITS
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        );
+        // 1..MAX 的实例：停用 + 删单元文件
+        for i in 1..crate::reconcile::MAX_RESI_SLOTS {
+            let u = crate::reconcile::resi_unit(i);
+            assert!(arts.iter().any(
+                |a| matches!(a, Artifact::UnitState { name, enabled: false, active: false } if *name == u)
+            ));
+            assert!(arts.iter().any(|a| matches!(a, Artifact::Absent { path }
+                if path.to_str() == Some(&format!("/etc/systemd/system/{u}.service")))));
+        }
+    }
+
+    #[test]
+    fn three_slots_render_three_residential_units_each_with_its_own_config() {
+        let mut s = sample_state();
+        s.residential.slots = (0..3)
+            .map(|i| bui_schema::model::Slot {
+                index: i,
+                upstream_id: uuid::Uuid::from_u128(u128::from(i) + 1),
+            })
+            .collect();
+        let arts = UnitsModule.render(&s, &ctx());
+        for i in 0..3u16 {
+            let name = crate::reconcile::resi_unit(i);
+            let t = unit_of(&arts, &name);
+            let cfg = if i == 0 {
+                "/opt/b-ui/config-residential.yaml".to_string()
+            } else {
+                format!("/opt/b-ui/config-residential-{i}.yaml")
+            };
+            assert!(
+                t.contains(&format!(
+                    "ExecStart=/opt/b-ui/bin/hysteria server --config {cfg}"
+                )),
+                "{name} 的 ExecStart 不对：\n{t}"
+            );
+            assert!(t.contains("Environment=GOMEMLIMIT=200MiB"));
+            assert!(t.contains("LimitNOFILE=1048576"));
+            assert!(t.contains("Nice=-5"));
+            assert!(t.contains("After=network-online.target b-ui-relay.service"));
+            assert!(arts.iter().any(
+                |a| matches!(a, Artifact::UnitState { name: n, enabled: true, active: true } if *n == name)
+            ));
+        }
+        // 3..MAX 才是清理项
+        assert!(arts.iter().any(
+            |a| matches!(a, Artifact::UnitState { name, enabled: false, active: false }
+            if name == "hysteria-residential-3")
+        ));
+        assert!(!arts.iter().any(
+            |a| matches!(a, Artifact::UnitState { name, enabled: false, active: false }
+            if name == "hysteria-residential-2")
+        ));
     }
 }
