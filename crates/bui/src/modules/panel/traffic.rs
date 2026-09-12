@@ -8,7 +8,7 @@
 //! - `/api/stats`、`/api/online` 读同一份缓存，面板开着不增加采样。
 
 use super::users::{self, month_key};
-use super::{Shared, TxRx, HY2_STATS_PORT_DIRECT, HY2_STATS_PORT_RESI};
+use super::{Shared, TxRx, HY2_STATS_PORT_DIRECT};
 use crate::reconcile::DaemonCtx;
 use bui_schema::model::State;
 use std::collections::{BTreeMap, BTreeSet};
@@ -34,12 +34,28 @@ pub struct Sample {
     pub errors: Vec<String>,
 }
 
-/// 打两个 hysteria 的 `/traffic?clear=1` 与 `/online`，再打一次 `QueryStats(reset=true)`。
-/// 单个来源失败只记 error，不影响其余来源（spec §4.2；审计 web-C3：住宅 9998 也要读）。
-pub async fn sample_once(shared: &Shared) -> Sample {
+/// 每个住宅实例的 `trafficStats` 端口，按槽序号升序（单槽 = `[9998]`）。
+pub fn resi_stats_ports(s: &State) -> Vec<u16> {
+    bui_schema::slots::indices(&s.residential)
+        .into_iter()
+        .map(|i| bui_schema::slots::resources_of(&s.node.ports, &s.residential, i).stats_port)
+        .collect()
+}
+
+/// 要采样 / kick 的全部 hysteria trafficStats 端口：直连实例 + 每个住宅实例。
+/// **住宅实例一个都不能漏**：漏一个就是那部分流量不计费（审计 web-C3 的 v3 老账）。
+pub fn stats_ports(s: &State) -> Vec<u16> {
+    let mut v = vec![HY2_STATS_PORT_DIRECT];
+    v.extend(resi_stats_ports(s));
+    v
+}
+
+/// 打每个 hysteria 实例的 `/traffic?clear=1` 与 `/online`，再打一次 `QueryStats(reset=true)`。
+/// 单个来源失败只记 error，不影响其余来源（spec §4.2；审计 web-C3：住宅那几个口也要读）。
+pub async fn sample_once(shared: &Shared, ports: &[u16]) -> Sample {
     let mut s = Sample::default();
-    // 顺序固定（9999 → 9998 → online 9999 → online 9998 → Xray），测试按这个顺序断言 calls()
-    for port in [HY2_STATS_PORT_DIRECT, HY2_STATS_PORT_RESI] {
+    // 顺序固定（traffic 按 ports 升序 → online 同序 → Xray），测试按这个顺序断言 calls()
+    for port in ports.iter().copied() {
         match shared.hy2().traffic_clear(port).await {
             Ok(m) => {
                 for (id, d) in m {
@@ -51,7 +67,7 @@ pub async fn sample_once(shared: &Shared) -> Sample {
                 .push(format!("hysteria :{port} /traffic 失败：{e}")),
         }
     }
-    for port in [HY2_STATS_PORT_DIRECT, HY2_STATS_PORT_RESI] {
+    for port in ports.iter().copied() {
         match shared.hy2().online(port).await {
             Ok(m) => {
                 for (id, n) in m {
@@ -134,7 +150,9 @@ pub fn apply_sample(
 /// （`SampleCache` 与 `Applied` 同样要下一轮重建，两者都是幂等的）。
 pub async fn tick(ctx: &DaemonCtx, shared: &Shared) -> anyhow::Result<()> {
     let now = ctx.host.now();
-    let sample = sample_once(shared).await;
+    // 采样与 kick 的端口集按槽位表来：住宅实例漏一个就是那部分流量不计费
+    let ports = stats_ports(ctx.store.read().await.as_ref());
+    let sample = sample_once(shared, &ports).await;
     let deltas = to_uuid_map(&sample.deltas);
 
     // ① 内存累加
@@ -187,7 +205,7 @@ pub async fn tick(ctx: &DaemonCtx, shared: &Shared) -> anyhow::Result<()> {
     let out = users::sync_now(ctx, shared).await;
     if !out.newly_blocked.is_empty() {
         let ids: Vec<String> = out.newly_blocked.iter().map(Uuid::to_string).collect();
-        for port in [HY2_STATS_PORT_DIRECT, HY2_STATS_PORT_RESI] {
+        for port in ports.iter().copied() {
             if let Err(e) = shared.hy2().kick(port, &ids).await {
                 tracing::warn!(port, error = %e, "kick 失败；快照拒绝仍然生效");
             }
@@ -376,7 +394,14 @@ mod tests {
         h.xray.with(|i| {
             i.deltas.insert(id.clone(), TxRx { tx: 0, rx: 100 });
         });
-        let s = sample_once(&h.shared).await;
+        let s = sample_once(
+            &h.shared,
+            &[
+                HY2_STATS_PORT_DIRECT,
+                crate::modules::panel::HY2_STATS_PORT_RESI,
+            ],
+        )
+        .await;
         assert_eq!(s.deltas[&id], TxRx { tx: 11, rx: 102 }, "三个来源相加");
         assert_eq!(s.online[&id], 3, "两个 /online 的值相加");
         assert!(s.xray_ids.contains(&id));
@@ -404,7 +429,14 @@ mod tests {
         h.xray.with(|i| {
             i.fail_on.insert("query".into());
         });
-        let s = sample_once(&h.shared).await;
+        let s = sample_once(
+            &h.shared,
+            &[
+                HY2_STATS_PORT_DIRECT,
+                crate::modules::panel::HY2_STATS_PORT_RESI,
+            ],
+        )
+        .await;
         assert_eq!(s.deltas[&id], TxRx { tx: 7, rx: 0 });
         assert_eq!(
             s.errors.len(),
@@ -634,5 +666,20 @@ mod tests {
                 .any(|e| e.as_str().unwrap().contains("9998")),
             "采样错误要能在 `/api/users/health` 里看见：{v}"
         );
+    }
+
+    #[test]
+    fn stats_ports_follow_the_slot_table() {
+        let mut s = crate::testutil::sample_state();
+        assert_eq!(stats_ports(&s), vec![9999, 9998], "单槽 = 今天的两个端口");
+        s.residential.slots = (0..3)
+            .map(|i| bui_schema::model::Slot {
+                index: i,
+                upstream_id: uuid::Uuid::from_u128(u128::from(i) + 1),
+            })
+            .collect();
+        assert_eq!(stats_ports(&s), vec![9999, 9998, 9997, 9996]);
+        assert_eq!(resi_stats_ports(&s), vec![9998, 9997, 9996]);
+        assert!(!stats_ports(&s).contains(&9995), "只枚举真实存在的槽");
     }
 }

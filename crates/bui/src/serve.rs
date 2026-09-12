@@ -602,8 +602,8 @@ mod tests {
     /// 有意不 start/restart `b-ui`（不许在对账中途杀掉自己）。真机上守护进程正在跑，
     /// `unit_is_active("b-ui")` 为真、diff 不出这一条；假机器上不播种就永远差这一条，
     /// 于是「二次对账零变更」恒 FAIL。
-    fn mark_units_up(i: &mut crate::sys::fake::FakeInner) {
-        for u in crate::reconcile::MANAGED_UNITS {
+    fn mark_units_up(i: &mut crate::sys::fake::FakeInner, s: &State) {
+        for u in crate::reconcile::managed_units(s) {
             i.units_active.insert(format!("{u}.service"));
             i.units_enabled.insert(format!("{u}.service"));
         }
@@ -616,7 +616,7 @@ mod tests {
     fn ready_host() -> Arc<FakeHost> {
         let h = Arc::new(FakeHost::new());
         h.with(|i| {
-            mark_units_up(i);
+            mark_units_up(i, &crate::testutil::sample_state());
             i.files.insert(
                 "/root/.ssh/authorized_keys".into(),
                 (b"ssh-ed25519 AAAA me\n".to_vec(), 0o600),
@@ -855,7 +855,7 @@ mod tests {
         // 绝不能落进 `changed`。
         let host = Arc::new(FakeHost::new()); // 没有 ufw、没有 firewalld
         host.with(|i| {
-            mark_units_up(i);
+            mark_units_up(i, &crate::testutil::sample_state());
             i.files.insert(
                 "/root/.ssh/authorized_keys".into(),
                 (b"ssh-ed25519 AAAA me\n".to_vec(), 0o600),

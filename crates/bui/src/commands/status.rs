@@ -118,16 +118,26 @@ async fn fetch_over_socket(socket: &std::path::Path) -> Option<HealthResponse> {
 
 /// 守护进程没跑时的本地版本：单元状态现场问 systemd，其余读 `runtime.json` / `state.json`。
 async fn local_health(paths: &Paths, host: Arc<dyn Host>) -> Result<HealthResponse> {
-    let node = match Store::open(crate::paths::state_file(paths)).await {
-        Ok(store) => store.read().await.node.name.clone(),
-        Err(_) => host.hostname().unwrap_or_default(),
+    // 读不到期望态就只报那六个固定单元（槽 1.. 的住宅实例无从得知）
+    let (node, units) = match Store::open(crate::paths::state_file(paths)).await {
+        Ok(store) => {
+            let s = store.read().await;
+            (s.node.name.clone(), crate::reconcile::managed_units(&s))
+        }
+        Err(_) => (
+            host.hostname().unwrap_or_default(),
+            crate::reconcile::MANAGED_UNITS
+                .iter()
+                .map(|u| u.to_string())
+                .collect(),
+        ),
     };
     let rt = Runtime::load(crate::paths::runtime_file(paths))
         .read()
         .await;
     let h = host.clone();
     let services = tokio::task::spawn_blocking(move || {
-        crate::reconcile::MANAGED_UNITS
+        units
             .iter()
             .map(|u| ServiceStatus {
                 unit: u.to_string(),

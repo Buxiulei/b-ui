@@ -4,6 +4,7 @@
 //! `masquerade.proxy.url` 由 REALITY 伪装域推导；`obfs` 段只在启用时输出。
 use crate::model::NodeParams;
 use crate::paths::Paths;
+use crate::slots::{self, SlotRes};
 use serde_yaml::{Mapping, Value};
 
 /// 直连实例 `config.yaml`。
@@ -21,18 +22,24 @@ pub fn direct_yaml(node: &NodeParams, paths: &Paths) -> String {
     to_yaml(doc)
 }
 
-/// 住宅实例 `config-residential.yaml`：出站 socks5 → 本地 relay，`acl: relay(all)`。
-pub fn residential_yaml(node: &NodeParams, paths: &Paths) -> String {
-    let (start, end) = node.ports.hy2_resi_hop;
-    let listen = format!(":{},{}-{}", node.ports.hy2_resi, start, end);
-    let mut doc = common_doc(node, paths, &listen, 9998);
+/// 住宅实例 `config-residential[-<i>].yaml`：出站 socks5 → 本槽的 relay 入站，`acl: relay(all)`。
+///
+/// 每个槽一个实例（spec §5.6）：监听 `:{hy2_port},{hop.0}-{hop.1}`，出站
+/// `127.0.0.1:{relay_port}`，`trafficStats` 监听 `127.0.0.1:{stats_port}`。
+/// 端口全部来自 [`SlotRes`]，本函数不自己算任何端口。
+pub fn residential_slot_yaml(node: &NodeParams, paths: &Paths, res: &SlotRes) -> String {
+    let listen = format!(":{},{}-{}", res.hy2_port, res.hop.0, res.hop.1);
+    let mut doc = common_doc(node, paths, &listen, res.stats_port);
 
     let mut relay = Mapping::new();
     relay.insert(key("name"), str_val("relay"));
     relay.insert(key("type"), str_val("socks5"));
     relay.insert(
         key("socks5"),
-        map(vec![("addr", str_val("127.0.0.1:2080"))]),
+        map(vec![(
+            "addr",
+            str_val(&format!("127.0.0.1:{}", res.relay_port)),
+        )]),
     );
     doc.insert(
         key("outbounds"),
@@ -50,6 +57,12 @@ pub fn residential_yaml(node: &NodeParams, paths: &Paths) -> String {
     );
     // 住宅实例不带 obfs：v3 的订阅只给直连节点 obfs 参数，两边必须一致。
     to_yaml(doc)
+}
+
+/// 单槽（槽 0）的住宅配置。保留这个签名给 golden 与 `import-v3`：
+/// 池空 / 只有一条上游时，输出与 v3 单实例逐字节相同。
+pub fn residential_yaml(node: &NodeParams, paths: &Paths) -> String {
+    residential_slot_yaml(node, paths, &slots::resources(&node.ports, 0, 1))
 }
 
 /// 两个实例共有的字段（顺序按 v3 模板）。
@@ -167,4 +180,71 @@ fn map(pairs: Vec<(&str, Value)>) -> Value {
 
 fn to_yaml(doc: Mapping) -> String {
     serde_yaml::to_string(&Value::Mapping(doc)).expect("hysteria 配置序列化不会失败")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::slots;
+
+    fn node() -> NodeParams {
+        serde_json::from_str(
+            r#"{"id":"8d5a1a1e-3b2c-4d1e-9f00-000000000001","name":"node-a","domain":"example.com","public_ip":"203.0.113.10",
+            "ports":{"hy2":10000,"hy2_hop":[20000,30000],"hy2_resi":40000,"hy2_resi_hop":[41000,50000],
+                     "reality_direct":10001,"reality_resi":10002,"admin":8080},
+            "reality":{"private_key":"a","public_key":"b","short_ids":["0123456789abcdef"],"dest":"www.bing.com:443","server_names":["www.bing.com"]},
+            "obfs":{"enabled":false,"password":""}}"#,
+        )
+        .unwrap()
+    }
+
+    /// 槽 0 单槽的输出必须与今天的 `residential_yaml` **逐字节相同**：
+    /// golden、M1 验收与 `import-v3` 都按它写死。
+    #[test]
+    fn slot_zero_of_a_single_slot_pool_is_byte_identical_to_the_old_output() {
+        let (n, p) = (node(), Paths::default_server());
+        let one = slots::resources(&n.ports, 0, 1);
+        assert_eq!(
+            residential_slot_yaml(&n, &p, &one),
+            residential_yaml(&n, &p)
+        );
+        let text = residential_yaml(&n, &p);
+        // serde_yaml 对 `:40000,…` 这种以冒号开头的标量不加引号，原样输出
+        assert!(
+            text.lines().any(|l| l == "listen: :40000,41000-50000"),
+            "{text}"
+        );
+        assert!(text.contains("127.0.0.1:9998"));
+        assert!(text.contains("127.0.0.1:2080"));
+    }
+
+    #[test]
+    fn each_slot_gets_its_own_listen_relay_and_stats_port() {
+        let (n, p) = (node(), Paths::default_server());
+        let texts: Vec<String> = (0..3)
+            .map(|i| residential_slot_yaml(&n, &p, &slots::resources(&n.ports, i, 3)))
+            .collect();
+        let listen = |t: &str| -> String {
+            t.lines()
+                .find(|l| l.starts_with("listen:"))
+                .unwrap()
+                .to_string()
+        };
+        assert!(listen(&texts[0]).contains(":40000,41000-43999"));
+        assert!(listen(&texts[1]).contains(":40001,44000-46999"));
+        assert!(listen(&texts[2]).contains(":40002,47000-50000"));
+        assert!(
+            texts[1].contains("127.0.0.1:2081"),
+            "出站指向本槽的 relay 入站"
+        );
+        assert!(texts[1].contains("127.0.0.1:9997"), "trafficStats 按槽递减");
+        assert!(texts[2].contains("127.0.0.1:2082"));
+        assert!(texts[2].contains("127.0.0.1:9996"));
+        // 住宅实例一律不带 obfs（v3 语义：订阅只给直连节点 obfs 参数）
+        for t in &texts {
+            assert!(!t.contains("salamander"));
+            assert!(t.contains("relay(all)"));
+            assert!(t.contains("/opt/b-ui/bin/bui-auth-hook"));
+        }
+    }
 }

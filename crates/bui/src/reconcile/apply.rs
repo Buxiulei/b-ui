@@ -10,7 +10,7 @@
 //!    [`ApplyOutcome::self_restart_required`]，由调用方在报告落盘之后处理（第 12 步）。
 
 use super::diff::{Change, Plan};
-use super::{Facts, PortSpec, Unit, UnitAction, Verify, MANAGED_UNITS};
+use super::{Facts, PortSpec, Unit, UnitAction, Verify};
 use crate::sys::Host;
 use bui_schema::paths::Paths;
 use std::collections::{BTreeMap, BTreeSet};
@@ -489,7 +489,7 @@ fn is_managed_dropin_dir(dir: &Path) -> bool {
             .file_name()
             .and_then(|s| s.to_str())
             .and_then(|n| n.strip_suffix(".service.d"))
-            .is_some_and(|unit| MANAGED_UNITS.contains(&unit))
+            .is_some_and(super::is_managed_unit)
 }
 
 /// 让一个单元「现在真的在跑」：restart 走 `reset-failed` → `restart` → `is-active` 三步。

@@ -33,6 +33,53 @@ pub const LEGACY_UNITS: [&str; 9] = [
     "xray@.service",
 ];
 
+/// 住宅槽位上限（= `bui_schema::slots::MAX_SLOTS`）：受管单元、配置文件与清理项都按它枚举。
+pub const MAX_RESI_SLOTS: u16 = bui_schema::slots::MAX_SLOTS;
+
+/// 槽 `index` 的住宅 hysteria 单元名。**槽 0 保持 v3 的名字**（spec §5.6「槽 0 保持今天的
+/// 40000 与 `hysteria-residential.service` 名字兼容」）：M1 验收、`watchdog::targets`、
+/// 面板与运维脚本都按它写死。
+pub fn resi_unit(index: u16) -> String {
+    if index == 0 {
+        "hysteria-residential".to_string()
+    } else {
+        format!("hysteria-residential-{index}")
+    }
+}
+
+/// 这个名字是不是 v4 的受管单元。**词法判定**（不读期望态）：六个固定名字，
+/// 外加 `hysteria-residential-<1..MAX_RESI_SLOTS-1>`。
+///
+/// 给「我能不能动这个单元 / 这个 drop-in 目录是不是我的地盘」这类判断用
+/// （`apply::is_managed_dropin_dir`、`POST /api/services/{unit}/{action}` 的白名单、
+/// 漂移扫描）。这些调用点手上没有期望态，也不该因为某个槽此刻不存在就把它的残留
+/// 当成别人的东西不敢清。
+pub fn is_managed_unit(name: &str) -> bool {
+    if MANAGED_UNITS.contains(&name) {
+        return true;
+    }
+    match name.strip_prefix("hysteria-residential-") {
+        // 只认十进制规范写法：`-01` 不是我们会生成的名字，放过去等于允许伪造
+        Some(n) if !n.is_empty() && !n.starts_with('0') => n
+            .parse::<u16>()
+            .is_ok_and(|i| (1..MAX_RESI_SLOTS).contains(&i)),
+        _ => false,
+    }
+}
+
+/// 按期望态枚举**此刻**该跑的受管单元：六个固定名字 + 槽 1.. 的住宅实例
+/// （槽 0 就是 [`MANAGED_UNITS`] 里的 `hysteria-residential`）。
+/// 体检的 services 表、`/api/services` 枚举、`bui status`、自检、假机器播种都用它。
+pub fn managed_units(s: &State) -> Vec<String> {
+    let mut v: Vec<String> = MANAGED_UNITS.iter().map(|x| x.to_string()).collect();
+    for i in bui_schema::slots::indices(&s.residential) {
+        if i != 0 {
+            v.push(resi_unit(i));
+        }
+    }
+    v
+}
+
 use crate::state::runtime::Runtime;
 use crate::state::store::Store;
 use crate::sys::{Host, Proto};
@@ -491,5 +538,59 @@ mod tests {
         assert!(LEGACY_UNITS.contains(&"hysteria-server@.service"));
         assert!(LEGACY_UNITS.contains(&"xray@.service"));
         assert!(LEGACY_UNITS.contains(&"b-ui-admin.service"));
+    }
+
+    #[test]
+    fn resi_unit_keeps_slot_zero_on_the_v3_name() {
+        assert_eq!(resi_unit(0), "hysteria-residential");
+        assert_eq!(resi_unit(1), "hysteria-residential-1");
+        assert_eq!(resi_unit(7), "hysteria-residential-7");
+    }
+
+    #[test]
+    fn is_managed_unit_accepts_the_six_plus_every_possible_slot() {
+        for m in MANAGED_UNITS {
+            assert!(is_managed_unit(m), "{m}");
+        }
+        for i in 1..MAX_RESI_SLOTS {
+            assert!(is_managed_unit(&resi_unit(i)));
+        }
+        assert!(!is_managed_unit("hysteria-residential-8"), "超出槽位上限");
+        assert!(!is_managed_unit("hysteria-residential-x"));
+        assert!(
+            !is_managed_unit("hysteria-residential-01"),
+            "只认十进制规范写法"
+        );
+        assert!(!is_managed_unit("ssh"));
+        for l in LEGACY_UNITS {
+            assert!(!is_managed_unit(
+                l.trim_end_matches(".service").trim_end_matches(".timer")
+            ));
+        }
+    }
+
+    #[test]
+    fn managed_units_follows_the_slot_table() {
+        let mut s = crate::testutil::sample_state();
+        assert_eq!(
+            managed_units(&s),
+            MANAGED_UNITS
+                .iter()
+                .map(|x| x.to_string())
+                .collect::<Vec<_>>(),
+            "单槽（含空池）时就是今天那六个"
+        );
+        s.residential.slots = (0..3)
+            .map(|i| bui_schema::model::Slot {
+                index: i,
+                upstream_id: uuid::Uuid::from_u128(u128::from(i) + 1),
+            })
+            .collect();
+        let u = managed_units(&s);
+        assert_eq!(u.len(), 8);
+        assert!(u.contains(&"hysteria-residential".to_string()));
+        assert!(u.contains(&"hysteria-residential-1".to_string()));
+        assert!(u.contains(&"hysteria-residential-2".to_string()));
+        assert!(u.iter().all(|n| is_managed_unit(n)));
     }
 }

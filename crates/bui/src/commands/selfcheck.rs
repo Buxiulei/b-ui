@@ -16,7 +16,6 @@
 //! ——否则一行命令装完必然退 2，与「一行命令完成新服务器的所有安装」直接冲突。
 //! 同一段等待顺带消掉 `finish_self_restart` 刚 restart 过 `b-ui` 时 admin 口的竞态。
 
-use crate::reconcile::MANAGED_UNITS;
 use crate::state::runtime::DriftItem;
 use crate::sys::{Host, Proto};
 use bui_schema::model::State;
@@ -160,7 +159,7 @@ fn wait_ready(
     let mut waited = Duration::ZERO;
     loop {
         let cert = cert_present(host, paths);
-        let units = MANAGED_UNITS
+        let units = crate::reconcile::managed_units(state)
             .iter()
             .all(|u| host.unit_is_active(u).unwrap_or(false));
         let ports = {
@@ -320,7 +319,8 @@ pub fn run_with_clock(
     // 先等：全新装机的证书、刚被 restart 的 b-ui 的 admin 口，都要几十秒才到位。
     let cert_ready = wait_ready(host, paths, state, wait, sleep);
     let mut rows = Vec::new();
-    for unit in MANAGED_UNITS {
+    for unit in crate::reconcile::managed_units(state) {
+        let unit = unit.as_str();
         let active = host.unit_is_active(unit).unwrap_or(false);
         rows.push(if active {
             pass(format!("单元 {unit}"), "running")
@@ -493,7 +493,7 @@ mod tests {
         h.with(|i| {
             i.files
                 .insert(p.certs_dir.join("fullchain.pem"), (b"CERT".to_vec(), 0o644));
-            for u in MANAGED_UNITS {
+            for u in crate::reconcile::managed_units(state) {
                 i.units_active.insert(format!("{u}.service"));
             }
             for k in crate::kernels::KERNELS {
@@ -525,7 +525,10 @@ mod tests {
         let rows = no_wait(&h, &p, &state, &[]);
         assert_eq!(failures(&rows), 0, "{}", table(&rows));
         // 六单元 + 三校验器 + 端口 + 漂移 + HY2 回环
-        assert_eq!(rows.len(), MANAGED_UNITS.len() + 6);
+        assert_eq!(
+            rows.len(),
+            crate::reconcile::managed_units(&state).len() + 6
+        );
         let t = table(&rows);
         for want in [
             "单元 b-ui",

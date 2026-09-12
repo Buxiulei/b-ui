@@ -143,31 +143,33 @@ impl Module for WatchdogModule {
     }
 }
 
-/// 四个内核 + 各自的监听端口：relay 与 xray 是 TCP，两个 hysteria 是 UDP。
-/// 端口取自期望态（`state.node.ports`），relay 的入站端口是常量。
+/// 四类内核 + 每个住宅实例，各自的监听端口：relay 与 xray 是 TCP，hysteria 是 UDP。
+/// 端口取自期望态（`state.node.ports` + 槽位表），relay 的入站端口是基准常量。
 pub fn targets(state: &State) -> Vec<Target> {
-    vec![
-        Target {
-            unit: "hysteria-server".into(),
+    let mut v = vec![Target {
+        unit: "hysteria-server".into(),
+        proto: Proto::Udp,
+        port: state.node.ports.hy2,
+    }];
+    for i in bui_schema::slots::indices(&state.residential) {
+        v.push(Target {
+            unit: crate::reconcile::resi_unit(i),
             proto: Proto::Udp,
-            port: state.node.ports.hy2,
-        },
-        Target {
-            unit: "hysteria-residential".into(),
-            proto: Proto::Udp,
-            port: state.node.ports.hy2_resi,
-        },
-        Target {
-            unit: "xray".into(),
-            proto: Proto::Tcp,
-            port: state.node.ports.reality_direct,
-        },
-        Target {
-            unit: "b-ui-relay".into(),
-            proto: Proto::Tcp,
-            port: crate::modules::core_files::RELAY_LISTEN_PORT,
-        },
-    ]
+            port: bui_schema::slots::resources_of(&state.node.ports, &state.residential, i)
+                .hy2_port,
+        });
+    }
+    v.push(Target {
+        unit: "xray".into(),
+        proto: Proto::Tcp,
+        port: state.node.ports.reality_direct,
+    });
+    v.push(Target {
+        unit: "b-ui-relay".into(),
+        proto: Proto::Tcp,
+        port: crate::modules::core_files::RELAY_LISTEN_PORT,
+    });
+    v
 }
 
 /// 纯状态机：返回裁决并就地更新记录（不碰机器、不落盘，便于单测）。
@@ -674,5 +676,40 @@ mod tests {
         let stamp = c.runtime.read().await.extra[RUN_KEY].clone();
         assert_eq!(stamp["last_run_at"], "2026-09-11T00:01:00Z");
         assert_eq!(stamp["next_run_at"], "2026-09-11T00:02:00Z");
+    }
+
+    #[test]
+    fn targets_cover_every_residential_slot_instance() {
+        let mut s = crate::testutil::sample_state();
+        assert_eq!(
+            targets(&s)
+                .iter()
+                .map(|t| (t.unit.clone(), t.port))
+                .collect::<Vec<_>>(),
+            vec![
+                ("hysteria-server".to_string(), 10000),
+                ("hysteria-residential".to_string(), 40000),
+                ("xray".to_string(), 10001),
+                ("b-ui-relay".to_string(), 2080),
+            ]
+        );
+        s.residential.slots = (0..3)
+            .map(|i| bui_schema::model::Slot {
+                index: i,
+                upstream_id: uuid::Uuid::from_u128(u128::from(i) + 1),
+            })
+            .collect();
+        let t = targets(&s);
+        assert_eq!(t.len(), 6);
+        assert!(t
+            .iter()
+            .any(|x| x.unit == "hysteria-residential-1" && x.port == 40001));
+        assert!(t
+            .iter()
+            .any(|x| x.unit == "hysteria-residential-2" && x.port == 40002));
+        assert!(t.iter().all(|x| match x.unit.as_str() {
+            "xray" | "b-ui-relay" => x.proto == Proto::Tcp,
+            _ => x.proto == Proto::Udp,
+        }));
     }
 }

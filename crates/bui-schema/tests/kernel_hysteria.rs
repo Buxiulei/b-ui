@@ -102,3 +102,36 @@ fn hysteria_auth_command_is_a_single_executable_path_without_arguments() {
         );
     }
 }
+
+/// 三个住宅实例的配置都得是合法 YAML、`listen` 行互不重叠 —— hysteria 没有
+/// `check` 子命令（spec §2.2），所以这一层只能靠 schema 测试兜底。
+#[test]
+fn three_residential_slot_configs_parse_and_do_not_overlap() {
+    let s = common::state("global");
+    let p = bui_schema::paths::Paths::default_server();
+    let mut seen: Vec<(u16, u16)> = vec![];
+    for i in 0..3u16 {
+        let r = bui_schema::slots::resources(&s.node.ports, i, 3);
+        let text = bui_schema::render::hysteria::residential_slot_yaml(&s.node, &p, &r);
+        let v: serde_yaml::Value = serde_yaml::from_str(&text).expect("合法 YAML");
+        assert_eq!(
+            v["listen"].as_str().unwrap(),
+            format!(":{},{}-{}", r.hy2_port, r.hop.0, r.hop.1)
+        );
+        assert_eq!(
+            v["outbounds"][0]["socks5"]["addr"].as_str().unwrap(),
+            format!("127.0.0.1:{}", r.relay_port)
+        );
+        assert_eq!(
+            v["trafficStats"]["listen"].as_str().unwrap(),
+            format!("127.0.0.1:{}", r.stats_port)
+        );
+        for (lo, hi) in &seen {
+            assert!(
+                r.hop.1 < *lo || r.hop.0 > *hi,
+                "槽 {i} 的跳跃区间与已有区间重叠"
+            );
+        }
+        seen.push(r.hop);
+    }
+}
