@@ -364,25 +364,88 @@ fn fetch_and_install_kernels(
     Some(manifest)
 }
 
-/// 问一个问题；回车即接受默认值。
-fn ask(prompt: &str, default: &str) -> String {
-    use std::io::Write;
-    if default.is_empty() {
-        print!("{prompt}: ");
-    } else {
-        print!("{prompt} [{default}]: ");
+/// 面板域名的环境变量（与 `install.sh` 的 `BUI_DOMAIN` 同名同义：一行命令里不想把域名写进
+/// argv 时用它）。
+pub const DOMAIN_ENV: &str = "BUI_DOMAIN";
+
+/// 装完自检有 FAIL 时的错误：[`run`] 据它退 **2**（裁决「任一 FAIL 退出码 2 但不回滚」）。
+/// 用独立类型而不是一句错误串，`run` 才能把它和别的失败区分开——别的失败退 1。
+#[derive(Debug)]
+pub struct SelfCheckFailed(pub usize);
+
+impl std::fmt::Display for SelfCheckFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "装完自检有 {} 项未通过（配置已落盘，未回滚）", self.0)
     }
+}
+
+impl std::error::Error for SelfCheckFailed {}
+
+/// 面板域名的来源与优先级（**唯一必填项**，2026-09-12 裁决「安装：一行命令与零手工配置」）：
+/// `--domain` > `$BUI_DOMAIN` > `--answers` 文件 > `/dev/tty` 只问这一问 > 报错退出。
+///
+/// `ask` 返回 `None` = 问不到（`--yes` / `--non-interactive`，或既不是终端又没有 `/dev/tty`）：
+/// 此时**报错退出，不装一半**。其余问题（节点名、公网 IP、伪装目标、端口）一概不问。
+pub fn pick_domain(
+    cli: Option<&str>,
+    env: Option<&str>,
+    from_file: &str,
+    ask: impl FnOnce() -> Option<String>,
+) -> anyhow::Result<String> {
+    for candidate in [cli.unwrap_or_default(), env.unwrap_or_default(), from_file] {
+        let candidate = candidate.trim();
+        if !candidate.is_empty() {
+            return Ok(candidate.to_string());
+        }
+    }
+    if let Some(answer) = ask() {
+        let answer = answer.trim().to_string();
+        if !answer.is_empty() {
+            return Ok(answer);
+        }
+    }
+    anyhow::bail!(
+        "缺少面板域名（唯一必填项）：请 `bui install --domain <面板域名>`，或设 {DOMAIN_ENV}=<面板域名>，\
+         或在 --answers 文件里给 domain；什么都没改，可直接重跑"
+    )
+}
+
+/// 只问「面板域名」这一问；回答空串视为没答。
+///
+/// `curl … | bash` 时 stdin 是管道：`install.sh` 已经把 `/dev/tty` 接了进来（那时 stdin 就是
+/// 终端），没接上则这里自己开一次 `/dev/tty`——两条路都不通返回 `None`。
+fn ask_domain() -> Option<String> {
+    use std::io::{BufRead, Write};
+    // 先确定「有没有地方可读」，再打提示：反了的话无终端时会先留下一行悬空的提问
+    // 才报「缺少面板域名」（2026-09-12 审查 nit）。
+    let mut reader: Box<dyn BufRead> = if std::io::stdin().is_terminal() {
+        Box::new(std::io::BufReader::new(std::io::stdin()))
+    } else {
+        Box::new(std::io::BufReader::new(
+            std::fs::File::open("/dev/tty").ok()?,
+        ))
+    };
+    print!("面板域名（唯一必填，例如 panel.example.com）: ");
     let _ = std::io::stdout().flush();
-    let mut buf = String::new();
-    if std::io::stdin().read_line(&mut buf).is_err() {
-        return default.to_string();
+    let mut line = String::new();
+    reader.read_line(&mut line).ok()?;
+    let v = line.trim().to_string();
+    (!v.is_empty()).then_some(v)
+}
+
+/// 装机最后一屏（spec §7 第 10 步）：面板地址、一次性管理员密码（只有全新装机才有）、
+/// 三种订阅地址的形状、两个入口。
+pub fn summary(state: &State, password_notice: Option<&str>) -> String {
+    let d = &state.node.domain;
+    let mut out = vec![format!("面板        https://{d}/")];
+    if let Some(line) = password_notice {
+        out.push(format!("管理员      {line}"));
     }
-    let v = buf.trim();
-    if v.is_empty() {
-        default.to_string()
-    } else {
-        v.to_string()
-    }
+    out.push(format!(
+        "订阅        https://{d}/api/sub/<用户名>（v2rayN）· /api/subscription/<用户名>（sing-box）· /api/clash/<用户名>（mihomo）"
+    ));
+    out.push("后续        `b-ui` 进菜单 / `bui status` 看体检 / `bui reconcile` 手动对账".into());
+    out.join("\n")
 }
 
 /// 已装机时的 `Answers`：事实全部复用 `state.json`，密码留空。
@@ -430,19 +493,21 @@ async fn collect_answers(
         Some(f) => load_answers(f, defaults)?,
         None => defaults,
     };
-    if !opts.quiet() && std::io::stdin().is_terminal() {
-        answers.domain = ask("面板域名", &answers.domain);
-        answers.node_name = ask("节点名", &answers.node_name);
-        answers.public_ip = ask("公网 IP", &answers.public_ip);
-        answers.masquerade = ask("REALITY 伪装目标", &answers.masquerade);
-        answers.ports.hy2 = ask("Hysteria2 直连端口", &answers.ports.hy2.to_string())
-            .parse()
-            .unwrap_or(answers.ports.hy2);
-    }
-    // 命令行优先于答案文件与交互
-    if let Some(d) = &opts.domain {
-        answers.domain = d.clone();
-    }
+    // 域名是唯一必填项，也是唯一还会问的一问；节点名 / 公网 IP / 伪装目标 / 端口全用探测值与
+    // 默认值（`--answers` 文件仍可逐项覆盖），于是「一行命令完成新服务器的所有安装」成立。
+    let env_domain = std::env::var(DOMAIN_ENV).ok();
+    answers.domain = if opts.import_v3.is_some() {
+        // v3 导入：域名沿用 v3 的 Caddyfile（`run_with` 的导入分支整份用 `report.state`），
+        // 所以这里既不要求也不追问；命令行/环境变量给了就以它为准。
+        opts.domain.clone().or(env_domain).unwrap_or(answers.domain)
+    } else {
+        pick_domain(
+            opts.domain.as_deref(),
+            env_domain.as_deref(),
+            &answers.domain,
+            || (!opts.quiet()).then(ask_domain).flatten(),
+        )?
+    };
     if let Some(p) = opts.port {
         answers.ports.hy2 = p;
     }
@@ -468,6 +533,18 @@ async fn collect_answers(
     Ok((answers, notice))
 }
 
+/// 最后一屏的摘要文本：`state.json` 已落盘就给，否则 `None`（那时什么都还没装成）。
+///
+/// 判据是「`state.json` 在不在」而**不是**「`run_with` 成功或只是自检 FAIL」：`Store::create`
+/// 之后还有写 `auth-snapshot.json`、IPC 对账、`reconcile_from_ctx`、「对账有失败项」一串失败点，
+/// 而全新服务器上证书签发或校验器失败非常常见。一次性管理员密码只有这一屏机会（`state.json`
+/// 里只存 argon2 hash，面板 `/api/password` 又要先登录），漏打就只剩「删 state.json 整机重装」
+/// ——REALITY 密钥等全部重生成——这一条路。
+async fn final_summary(state_path: &Path, notice: Option<&str>) -> Option<String> {
+    let store = Store::open(state_path).await.ok()?;
+    Some(summary(store.read().await.as_ref(), notice))
+}
+
 /// 面向真实终端的入口：读已装机的期望态 → 收集 `Answers` → 交给 [`run_with`]。
 pub async fn run(opts: InstallOpts, paths: Paths, host: Arc<dyn Host>) -> anyhow::Result<()> {
     // 判据与 `run_with` 的 `fresh` 完全同一条（`state.json` 在不在），两边不会分叉
@@ -478,11 +555,8 @@ pub async fn run(opts: InstallOpts, paths: Paths, host: Arc<dyn Host>) -> anyhow
         None
     };
     let (answers, notice) = collect_answers(&opts, installed.as_deref(), host.clone()).await?;
-    if let Some(line) = notice {
-        println!("{line}");
-    }
     let manifest_url = crate::kernels::manifest_url(None, None);
-    run_with(
+    let outcome = run_with(
         opts,
         answers,
         manifest_url,
@@ -490,7 +564,24 @@ pub async fn run(opts: InstallOpts, paths: Paths, host: Arc<dyn Host>) -> anyhow
         host,
         Arc::new(HttpFetcher::new()),
     )
-    .await
+    .await;
+    // 摘要压在最后一屏（一次性管理员密码只在这里出现这一次）：自检有 FAIL 也要给出面板地址，
+    // 不然运维连去哪儿看都不知道。
+    let failed = match &outcome {
+        Err(e) => e.downcast_ref::<SelfCheckFailed>().map(|f| f.0),
+        Ok(()) => None,
+    };
+    if let Some(text) = final_summary(&state_path, notice.as_deref()).await {
+        println!("{text}");
+    }
+    if let Some(n) = failed {
+        // 裁决「任一 FAIL 退出码 2 但不回滚」：配置已落盘、v3 已卸掉，回滚只会更糟。
+        eprintln!(
+            "自检有 {n} 项未通过（未回滚）：按上表逐项处理后 `bui reconcile`、`bui status` 复检"
+        );
+        std::process::exit(2);
+    }
+    outcome
 }
 
 /// spec §7 的十步。`manifest_url` 由调用方算好（[`crate::kernels::manifest_url`]），
@@ -502,6 +593,31 @@ pub async fn run_with(
     paths: Paths,
     host: Arc<dyn Host>,
     fetcher: Arc<dyn Fetcher>,
+) -> anyhow::Result<()> {
+    run_with_wait(
+        opts,
+        answers,
+        manifest_url,
+        paths,
+        host,
+        fetcher,
+        crate::commands::selfcheck::Wait::default(),
+    )
+    .await
+}
+
+/// [`run_with`] 外加「自检前等多久」（见 [`crate::commands::selfcheck::Wait`]）。
+/// 全新装机要等首张证书，所以默认 120s；**故意坏掉的**那几个测试传 `Wait::NONE`，
+/// 否则每条都要真睡满两分钟。
+#[allow(clippy::too_many_arguments)]
+pub async fn run_with_wait(
+    opts: InstallOpts,
+    answers: Answers,
+    manifest_url: String,
+    paths: Paths,
+    host: Arc<dyn Host>,
+    fetcher: Arc<dyn Fetcher>,
+    wait: crate::commands::selfcheck::Wait,
 ) -> anyhow::Result<()> {
     let state_path = crate::paths::state_file(&paths);
     let fresh = !state_path.exists();
@@ -526,6 +642,33 @@ pub async fn run_with(
     // 报错退出后 v3 一字不动、`state.json` 也还没落盘（下次修好 manifest 重跑即可）。
     // 只管全新装机与导入：活机器上重跑 install 只对账，内核该由 `bui upgrade` 补。
     if fresh {
+        // 4.2：环境探测 + 打一张「环境」表（主理人 2026-09-12「安装我需要能自动检测环境」）。
+        // 顺手修 SELinux 标签与时钟；唯一会中止的是**关键端口被非本栈进程占着**——此时一个
+        // 破坏性动作都还没做，腾了端口重跑即可。v3 迁移例外：那些端口正被要替换掉的 v3 占着。
+        let env = {
+            let (h, p) = (host.clone(), paths.clone());
+            let (ports, domain, ip) = (
+                answers.ports.clone(),
+                answers.domain.clone(),
+                answers.public_ip.clone(),
+            );
+            let skip_ports = opts.import_v3.is_some();
+            tokio::task::spawn_blocking(move || {
+                crate::sys::env_probe::probe(
+                    h.as_ref(),
+                    &domain,
+                    &ip,
+                    &ports,
+                    &p.bin_dir,
+                    skip_ports,
+                )
+            })
+            .await?
+        };
+        println!("{}", crate::sys::env_probe::table(&env, &answers.ports));
+        if let Some(msg) = env.blocking() {
+            anyhow::bail!(msg);
+        }
         let missing = {
             // 探测走 spawn_blocking：`installed_versions` 会 run 四次 `<bin>/<kernel> version`
             let (h, p) = (host.clone(), paths.clone());
@@ -640,15 +783,23 @@ pub async fn run_with(
     {
         println!("{line}");
     }
-    // 10
-    let state = ctx.store.read().await;
-    println!(
-        "面板: https://{}/    用户: 见 `b-ui` 菜单",
-        state.node.domain
-    );
-    println!("后续: `b-ui` 进菜单 / `bui status` 看体检 / `bui reconcile` 手动对账");
+    // 10：装完自检（PASS/FAIL 表）。判据照 `scripts/m1-acceptance.sh`，外加一条 HY2 回环鉴权。
+    // 摘要（面板地址 / 一次性密码 / 订阅形状）由 [`run`] 在这之后打，是最后一屏。
+    let rows = {
+        let state = ctx.store.read().await.clone();
+        let (h, p, drift) = (host.clone(), paths.clone(), report.drift.clone());
+        tokio::task::spawn_blocking(move || {
+            crate::commands::selfcheck::run(h.as_ref(), &p, &state, &drift, wait)
+        })
+        .await?
+    };
+    println!("{}", crate::commands::selfcheck::table(&rows));
     if !report.errors.is_empty() || !report.verify_failures.is_empty() {
         anyhow::bail!("对账有失败项，见上面的输出");
+    }
+    let failed = crate::commands::selfcheck::failures(&rows);
+    if failed > 0 {
+        return Err(anyhow::Error::new(SelfCheckFailed(failed)));
     }
     Ok(())
 }
@@ -839,7 +990,11 @@ mod tests {
         }
     }
 
-    /// 装机用的假机器：公钥在位；`bin/` 下的 xray 被脚本化（脚本键按 tempdir 拼）
+    /// 装机用的假机器：公钥在位；`bin/` 下的 xray 被脚本化（脚本键按 tempdir 拼）。
+    ///
+    /// 环境探测与装完自检也要有得可探，否则每个 install 测试都会被「systemd 缺失」
+    /// 「关键端口没在监听」染红：`systemctl` 在 PATH 上、`/etc/os-release` 认得出发行版、
+    /// 域名解析到 `answers()` 的公网 IP、六单元起来后该听的端口都在听、HY2 回环探测回 200。
     fn host_for_install(paths: &bui_schema::paths::Paths) -> Arc<FakeHost> {
         let bin = |n: &str| paths.bin_dir.join(n).display().to_string();
         let h = Arc::new(FakeHost::new());
@@ -848,6 +1003,31 @@ mod tests {
                 "/root/.ssh/authorized_keys".into(),
                 (b"ssh-ed25519 AAAA me\n".to_vec(), 0o600),
             );
+            i.which.insert("systemctl".into());
+            i.files.insert(
+                "/etc/os-release".into(),
+                (b"ID=debian\nVERSION_ID=\"12\"\n".to_vec(), 0o644),
+            );
+            i.scripted.push((
+                "getent ahosts example.com".into(),
+                CmdOut::success("203.0.113.10 STREAM example.com\n"),
+            ));
+            i.listening.insert(
+                crate::sys::Proto::Tcp,
+                std::collections::BTreeSet::from([443, 10001, 10002, 8080]),
+            );
+            i.listening.insert(
+                crate::sys::Proto::Udp,
+                std::collections::BTreeSet::from([10000, 40000]),
+            );
+            // 证书已同步（两个 hysteria 的 tls.cert）；缺它时自检等一等再判 SKIP，
+            // 见 a_fresh_install_without_a_certificate_yet_still_exits_zero
+            i.files.insert(
+                paths.certs_dir.join("fullchain.pem"),
+                (b"CERT".to_vec(), 0o644),
+            );
+            // 自检的 HY2 回环探测脚本（有用户时才跑）
+            i.scripted.push(("sh ".into(), CmdOut::success("200\n")));
             i.scripted
                 .push((format!("{} x25519", bin("xray")), CmdOut::success(X25519)));
             i.scripted.push((
@@ -905,13 +1085,14 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let paths = scratch(&d);
         let host = host_for_install(&paths);
-        run_with(
+        run_with_wait(
             opts(&d),
             answers(),
             murl(),
             paths.clone(),
             host.clone(),
             fetcher_with_manifest(),
+            crate::commands::selfcheck::Wait::NONE,
         )
         .await
         .unwrap();
@@ -954,13 +1135,14 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let paths = scratch(&d);
         let host = host_for_install(&paths);
-        run_with(
+        run_with_wait(
             opts(&d),
             answers(),
             murl(),
             paths.clone(),
             host.clone(),
             fetcher_with_manifest(),
+            crate::commands::selfcheck::Wait::NONE,
         )
         .await
         .unwrap();
@@ -1063,13 +1245,14 @@ mod tests {
         let paths = scratch(&d);
         let host = Arc::new(FakeHost::new()); // 没有 bin/xray，PATH 上也没有 xray
         let empty: Arc<dyn Fetcher> = Arc::new(FakeFetcher(Mutex::new(vec![])));
-        let err = run_with(
+        let err = run_with_wait(
             opts(&d),
             answers(),
             murl(),
             paths.clone(),
             host.clone(),
             empty,
+            crate::commands::selfcheck::Wait::NONE,
         )
         .await
         .unwrap_err()
@@ -1089,24 +1272,26 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let paths = scratch(&d);
         let host = host_for_install(&paths);
-        run_with(
+        run_with_wait(
             opts(&d),
             answers(),
             murl(),
             paths.clone(),
             host.clone(),
             fetcher_with_manifest(),
+            crate::commands::selfcheck::Wait::NONE,
         )
         .await
         .unwrap();
         host.clear_ops();
-        run_with(
+        run_with_wait(
             opts(&d),
             answers(),
             murl(),
             paths.clone(),
             host.clone(),
             fetcher_with_manifest(),
+            crate::commands::selfcheck::Wait::NONE,
         )
         .await
         .unwrap();
@@ -1160,7 +1345,7 @@ mod tests {
         let empty: Arc<dyn Fetcher> = Arc::new(FakeFetcher(Mutex::new(vec![])));
         let mut o = opts(&d);
         o.import_v3 = Some(src.to_path_buf());
-        let err = run_with(
+        let err = run_with_wait(
             o,
             answers(),
             // 带 userinfo：错误信息里的 manifest 地址必须经 redact
@@ -1168,6 +1353,7 @@ mod tests {
             paths.clone(),
             host.clone(),
             empty,
+            crate::commands::selfcheck::Wait::NONE,
         )
         .await
         .unwrap_err();
@@ -1220,13 +1406,14 @@ mod tests {
                 .insert(paths.bin_dir.join("xray"), (b"ELF".to_vec(), 0o755));
         });
         let empty: Arc<dyn Fetcher> = Arc::new(FakeFetcher(Mutex::new(vec![])));
-        let err = run_with(
+        let err = run_with_wait(
             opts(&d),
             answers(),
             murl(),
             paths.clone(),
             host.clone(),
             empty,
+            crate::commands::selfcheck::Wait::NONE,
         )
         .await
         .unwrap_err()
@@ -1278,7 +1465,7 @@ mod tests {
         assert_eq!(notice, None, "导入路径不许打印随机管理员密码");
         assert!(a.admin_password.is_empty(), "导入路径不许生成密码");
         // 端到端：state 里的哈希就是 v3 admin.env 的密码
-        run_with(
+        run_with_wait(
             {
                 let mut o = opts(&d);
                 o.import_v3 = Some(src.to_path_buf());
@@ -1292,6 +1479,7 @@ mod tests {
             paths.clone(),
             host.clone(),
             fetcher_with_manifest(),
+            crate::commands::selfcheck::Wait::NONE,
         )
         .await
         .unwrap();
@@ -1340,13 +1528,14 @@ mod tests {
         });
         let mut o = opts(&d);
         o.import_v3 = Some(src.to_path_buf());
-        let err = run_with(
+        let err = run_with_wait(
             o,
             answers(),
             murl(),
             paths.clone(),
             host.clone(),
             fetcher_with_manifest(),
+            crate::commands::selfcheck::Wait::NONE,
         )
         .await
         .unwrap_err();
@@ -1473,13 +1662,14 @@ mod tests {
         });
         let mut o = opts(&d);
         o.import_v3 = Some(src.to_path_buf());
-        run_with(
+        run_with_wait(
             o,
             answers(),
             murl(),
             paths.clone(),
             host.clone(),
             fetcher_with_manifest(),
+            crate::commands::selfcheck::Wait::NONE,
         )
         .await
         .unwrap();
@@ -1576,5 +1766,260 @@ mod tests {
             "import-v3 之后不能留下任何漂移"
         );
         assert_eq!(state.users.len(), 4, "四个 v3 用户都要导入");
+    }
+
+    /// 2026-09-12 裁决：面板域名是**唯一必填**，来源优先级 `--domain` > `$BUI_DOMAIN` >
+    /// `--answers` 文件 > `/dev/tty` 只问这一问 > 报错退出（绝不装一半）。
+    #[test]
+    fn the_domain_is_the_only_required_answer_and_has_a_strict_priority() {
+        let never = || -> Option<String> { panic!("已有来源时不该再问") };
+        assert_eq!(
+            pick_domain(
+                Some("cli.example.com"),
+                Some("env.example.com"),
+                "file.example.com",
+                never
+            )
+            .unwrap(),
+            "cli.example.com"
+        );
+        assert_eq!(
+            pick_domain(None, Some("env.example.com"), "file.example.com", never).unwrap(),
+            "env.example.com"
+        );
+        assert_eq!(
+            pick_domain(None, None, "file.example.com", never).unwrap(),
+            "file.example.com"
+        );
+        assert_eq!(
+            pick_domain(None, None, "", || Some(" tty.example.com \n".into())).unwrap(),
+            "tty.example.com",
+            "问来的答案要去掉首尾空白与换行"
+        );
+        // 空串 / 纯空白都不算来源，继续往下找
+        assert_eq!(
+            pick_domain(Some("   "), Some(""), "", || Some("tty.example.com".into())).unwrap(),
+            "tty.example.com"
+        );
+        // 问不到（`--yes` / 无 tty）→ 报错，并给出三条出路
+        let err = pick_domain(None, None, "", || None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--domain"), "{err}");
+        assert!(err.contains(DOMAIN_ENV), "{err}");
+        assert!(err.contains("--answers"), "{err}");
+        // 直接回车（空答）也算没答，不许拿空域名装下去
+        assert!(pick_domain(None, None, "", || Some("\n".into())).is_err());
+    }
+
+    /// `--yes` / `--non-interactive` 语义不变：一个问题都不问，所以没有域名就报错而不是挂住。
+    #[tokio::test]
+    async fn a_quiet_install_without_a_domain_fails_instead_of_prompting() {
+        if std::env::var_os(DOMAIN_ENV).is_some() {
+            eprintln!("skipped: 开发机上设了 {DOMAIN_ENV}");
+            return;
+        }
+        let d = tempfile::tempdir().unwrap();
+        let paths = scratch(&d);
+        let host = host_for_install(&paths);
+        let mut o = opts(&d);
+        o.domain = None; // opts() 里 yes = true
+        let err = collect_answers(&o, None, host.clone())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("缺少面板域名"), "{err}");
+    }
+
+    /// 域名之外一个都不问：节点名、公网 IP、伪装目标、端口全用探测值与默认值。
+    #[tokio::test]
+    async fn nothing_but_the_domain_is_ever_asked() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = scratch(&d);
+        let host = host_for_install(&paths);
+        let mut o = opts(&d);
+        (o.yes, o.non_interactive) = (false, false); // 交互模式，但域名已由 --domain 给出
+        let (a, _) = collect_answers(&o, None, host.clone()).await.unwrap();
+        assert_eq!(a.domain, "example.com");
+        assert_eq!(a.node_name, "node-a", "节点名用 hostname，不问");
+        assert_eq!(a.public_ip, "203.0.113.10", "公网 IP 用探测值，不问");
+        assert_eq!(a.masquerade, "www.bing.com:443", "伪装目标用默认值，不问");
+        assert_eq!(a.ports.hy2, 10000, "端口用默认值，不问");
+    }
+
+    /// 关键端口被非本栈进程占着 ⇒ 中止，不写单元、不落 `state.json`（腾了端口重跑即可）。
+    #[tokio::test]
+    async fn a_foreign_process_on_a_key_port_aborts_the_install() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = scratch(&d);
+        let host = host_for_install(&paths);
+        host.with(|i| {
+            i.scripted.insert(
+                0,
+                (
+                    "ss -lntupH".into(),
+                    CmdOut::success(
+                        "tcp LISTEN 0 511 0.0.0.0:443 0.0.0.0:* users:((\"nginx\",pid=7,fd=6))\n",
+                    ),
+                ),
+            );
+        });
+        let err = run_with_wait(
+            opts(&d),
+            answers(),
+            murl(),
+            paths.clone(),
+            host.clone(),
+            fetcher_with_manifest(),
+            crate::commands::selfcheck::Wait::NONE,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("443/tcp 被 nginx 占用"), "{err}");
+        assert!(
+            !crate::paths::state_file(&paths).exists(),
+            "state.json 不许落盘"
+        );
+        assert!(
+            host.text("/etc/systemd/system/b-ui.service").is_none(),
+            "一个单元都不该写"
+        );
+    }
+
+    /// 自检有 FAIL ⇒ 返回 [`SelfCheckFailed`]（`run` 据它退 2），但**不回滚**：
+    /// 配置照旧落盘，运维按表逐项修比回到中间态强。
+    #[tokio::test]
+    async fn a_failed_selfcheck_is_reported_without_rolling_back() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = scratch(&d);
+        let host = host_for_install(&paths);
+        // HY2 的两个 UDP 端口没在监听 → 自检的「关键端口」那一项 FAIL
+        host.with(|i| {
+            i.listening
+                .insert(crate::sys::Proto::Udp, Default::default());
+        });
+        let err = run_with_wait(
+            opts(&d),
+            answers(),
+            murl(),
+            paths.clone(),
+            host.clone(),
+            fetcher_with_manifest(),
+            crate::commands::selfcheck::Wait::NONE,
+        )
+        .await
+        .unwrap_err();
+        let marked = err
+            .downcast_ref::<SelfCheckFailed>()
+            .expect("要能被 run 识别成「自检不过」（退 2）");
+        assert_eq!(marked.0, 1, "只有关键端口那一项没过");
+        assert!(
+            crate::paths::state_file(&paths).exists(),
+            "不回滚：state.json 留在原处"
+        );
+        assert!(
+            host.text(&d.path().join("config.yaml").display().to_string())
+                .is_some(),
+            "不回滚：配置留在原处"
+        );
+    }
+
+    /// 全新服务器上装完那一刻证书常常还没签下来（Caddy 的 ACME 还在跑、守护进程的证书同步
+    /// 还没复制过来）：两个 hysteria 起不来、HY2 的 UDP 口没在听。这**不是**装坏了，
+    /// 自检得判 SKIP，`bui install` 必须退 0 —— 否则「一行命令完成新服务器的所有安装」不成立。
+    #[tokio::test]
+    async fn a_fresh_install_without_a_certificate_yet_still_exits_zero() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = scratch(&d);
+        let host = host_for_install(&paths);
+        host.with(|i| {
+            i.files.remove(&paths.certs_dir.join("fullchain.pem"));
+            i.units_active.remove("hysteria-server.service");
+            i.units_active.remove("hysteria-residential.service");
+            i.listening
+                .insert(crate::sys::Proto::Udp, Default::default());
+        });
+        // Wait::NONE：真跑会先等 120s，这里只要证明「等不到也不 FAIL」
+        run_with_wait(
+            opts(&d),
+            answers(),
+            murl(),
+            paths.clone(),
+            host.clone(),
+            fetcher_with_manifest(),
+            crate::commands::selfcheck::Wait::NONE,
+        )
+        .await
+        .expect("证书未到不该让装机退 2");
+    }
+
+    /// 一次性管理员密码只有装机最后一屏这一次机会：`Store::create` 之后的失败（这里用
+    /// 「对账有失败项」，全新服务器上证书签发/校验器失败非常常见）也必须把它打出来。
+    /// 漏打就只剩「删 state.json 整机重装」一条路——重跑 install 会走「已安装」分支，没有密码行。
+    #[tokio::test]
+    async fn the_one_time_password_survives_a_failure_after_the_state_landed() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = scratch(&d);
+        let host = host_for_install(&paths);
+        // caddy 的 systemd 动作失败 → 对账进 report.errors → `run_with` 以「对账有失败项」退出
+        host.with(|i| {
+            i.fail_units.insert("caddy".into());
+        });
+        let err = run_with_wait(
+            opts(&d),
+            answers(),
+            murl(),
+            paths.clone(),
+            host.clone(),
+            fetcher_with_manifest(),
+            crate::commands::selfcheck::Wait::NONE,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.downcast_ref::<SelfCheckFailed>().is_none(),
+            "这条路径不是「自检 FAIL」，正是旧判据漏掉的那一类：{err}"
+        );
+        let state_path = crate::paths::state_file(&paths);
+        assert!(
+            state_path.exists(),
+            "state.json 已落盘（密码的 hash 在里面）"
+        );
+        let line = "已生成随机管理员密码：hunter2（只显示这一次，请立刻存好）";
+        let text = final_summary(&state_path, Some(line))
+            .await
+            .expect("state.json 在就该有摘要");
+        assert!(text.contains("hunter2"), "装到一半失败也要打出密码：{text}");
+        assert!(text.contains("https://example.com/"), "{text}");
+        // state.json 还没落盘（如端口被占、缺内核）时没有摘要可打：那时密码一次都没用上
+        let empty = tempfile::tempdir().unwrap();
+        assert!(
+            final_summary(&crate::paths::state_file(&scratch(&empty)), Some(line))
+                .await
+                .is_none(),
+            "state.json 不在就不该打摘要"
+        );
+    }
+
+    #[test]
+    fn the_summary_gives_the_panel_the_one_time_password_and_the_subscription_shapes() {
+        let state = crate::testutil::sample_state();
+        let s = summary(
+            &state,
+            Some("已生成随机管理员密码：hunter2（只显示这一次，请立刻存好）"),
+        );
+        assert!(s.contains("https://example.com/"), "{s}");
+        assert!(s.contains("hunter2"), "一次性密码只在摘要里出现这一次：{s}");
+        for shape in [
+            "/api/sub/<用户名>",
+            "/api/subscription/<用户名>",
+            "/api/clash/<用户名>",
+        ] {
+            assert!(s.contains(shape), "订阅形状缺 {shape}：{s}");
+        }
+        assert!(s.contains("`b-ui`") && s.contains("bui status"), "{s}");
+        // 已装机重跑（没有一次性密码）时不出现「管理员」那一行
+        assert!(!summary(&state, None).contains("管理员"));
     }
 }

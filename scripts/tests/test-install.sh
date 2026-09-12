@@ -146,8 +146,11 @@ assert_eq "$(printf -- '--non-interactive\n--answers\n/root/bui-answers.json')" 
 assert_eq "$(printf -- '--port\n20000')" "$(install_args "$WORK/fresh" --port 20000)" "其它参数原样透传"
 
 # ---- 规模守门：引导脚本保持精简（spec §7 ≈100 行）----
+# 上限从 130 提到 150：2026-09-12 第三轮审查的 blocking 要求 /dev/tty 交接前先判「域名已定」
+# （含 --answers 文件里的 domain）与「stdin 是不是正给 --admin-password-stdin 送密码」，
+# 那三档判定（answers_domain / domain_pinned / tty_source）值 15 行。守门仍在，只是挪了一格。
 code_lines=$(grep -cvE '^[[:space:]]*(#|$)' "$ROOT/install.sh")
-assert_eq "1" "$([[ "$code_lines" -le 130 ]] && echo 1 || echo 0)" "install.sh 有效代码 ≤ 130 行（实测 $code_lines）"
+assert_eq "1" "$([[ "$code_lines" -le 150 ]] && echo 1 || echo 0)" "install.sh 有效代码 ≤ 150 行（实测 $code_lines）"
 assert_not_contains "apt-get" "$(cat "$ROOT/install.sh")" "引导脚本不装任何系统包（依赖由 bui install 负责）"
 assert_contains "BUI_MANIFEST_URL" "$(cat "$ROOT/install.sh")" "支持 BUI_MANIFEST_URL（C5，M5 演练与离线源都用它）"
 assert_not_contains "no-import-v3" "$(cat "$ROOT/install.sh")" "不自造 C5 之外的 bui 参数名（C5 只有 --import-v3）"
