@@ -1,5 +1,6 @@
 //! 四个内核二进制 + 它们的五份配置（`config.yaml` / `config-residential.yaml` /
-//! `xray-config.json` / `singbox-relay.json` / `Caddyfile`）。
+//! `xray-config.json` / `singbox-relay.json` / `Caddyfile`），外加外部站点目录的占位
+//! `caddy/sites/README.txt`（2026-09-13 裁决：目录由对账器建，里面的 `*.caddy` 归用户管）。
 //!
 //! 除 Caddyfile 之外的每份配置都**原样**落 `bui-schema` 的渲染结果（总纲 C1）：P1 绝不自己
 //! 拼内核配置，订阅与配置的一致性由 P0 的 golden 测试兜底。
@@ -19,7 +20,7 @@ pub const RELAY_LISTEN_PORT: u16 = 2080;
 /// 本地 relay 的 Clash API（巡检热切换上游用，不重启进程）。
 pub const RELAY_CLASH_API: &str = "127.0.0.1:9091";
 
-/// 四个内核二进制 + 它们的五份配置（唯一来源是 bui-schema 的渲染器）。
+/// 四个内核二进制 + 它们的五份配置（唯一来源是 bui-schema 的渲染器）+ 站点目录占位文件。
 /// manifest 放共享锁里：守护进程每日自检拉到新 manifest 后直接写这个锁，
 /// 下一轮对账就按新版本装内核，不需要重启进程（spec §7）。
 pub struct CoreFilesModule {
@@ -52,8 +53,43 @@ pub fn relay_opts(state: &State, paths: &Paths) -> RelayOpts {
     }
 }
 
+/// 站点目录的占位说明：写它顺带把目录建出来（`write_file` 会建父目录），
+/// 后缀不是 `.caddy` 所以不会被 import 进配置。
+pub const SITES_README: &str = "\
+# 外部站点通道（B-UI v4）
+#
+# 这个目录里的 *.caddy 文件会被 <base>/Caddyfile 末尾的 import 行整体引入，
+# 内容**完全归你管**：bui 只负责把这个目录建出来，从不改写、覆盖或删除里面的文件，
+# 漂移扫描也不会报告它们。
+#
+# 一个文件可以放任意多个顶层站点块，写法与 /etc/caddy/Caddyfile 里一样，例如：
+#
+#   blog.example.com {
+#       root * /srv/blog
+#       file_server
+#   }
+#
+# 注意：
+# - 不要在这里写 Caddy 的全局选项块（开头那个没有站点地址的 `{ ... }`）——
+#   被 import 的文件里不允许出现它，caddy validate 会直接报错；
+# - 改完用 `bui reconcile` 或 `systemctl reload caddy` 生效；语法错会让整份配置
+#   校验失败（对账会把它报成 verify_failures，旧配置保持不变）。
+";
+
+/// 外部站点通道的 import 通配：`<base>/caddy/sites/*.caddy`（路径经 [`crate::paths`] 派生）。
+pub fn sites_glob(paths: &Paths) -> String {
+    crate::paths::caddy_sites(paths)
+        .join("*.caddy")
+        .display()
+        .to_string()
+}
+
 /// Caddyfile：只反代面板端口，日志进 stderr（journald 收），不再写 `/var/log/caddy`。
-pub fn caddyfile_text(domain: &str, admin_port: u16) -> String {
+///
+/// `sites_glob` 是外部站点通道的 import 通配（2026-09-13 裁决），由 [`crate::paths`] 派生传进来，
+/// **必须排在面板站点块之后**：写进块里就变成站点内指令了。glob 一个文件都没匹配到时
+/// caddy 不报错（2.10 实测），所以目录空着也照样 `Valid configuration`。
+pub fn caddyfile_text(domain: &str, admin_port: u16, sites_glob: &str) -> String {
     format!(
         "\
 # B-UI v4 —— 由 bui 对账器生成，手改会被覆盖
@@ -64,6 +100,9 @@ pub fn caddyfile_text(domain: &str, admin_port: u16) -> String {
 \t\tformat console
 \t}}
 }}
+
+# 外部站点：{sites_glob} 里的文件归用户管，bui 不覆盖也不删除
+import {sites_glob}
 "
     )
 }
@@ -128,10 +167,13 @@ impl Module for CoreFilesModule {
             .verify(Verify::SingBox)
             .restart(Unit::restart("b-ui-relay")),
         );
+        // 外部站点通道（2026-09-13 裁决）：占位 README 只为把目录建出来（写文件会建父目录），
+        // 排在 Caddyfile 之前，这样首装当轮 caddy validate 时目录已经在了。
+        out.push(Artifact::file(crate::paths::caddy_sites_readme(p), SITES_README).mode(0o644));
         out.push(
             Artifact::file(
                 crate::paths::caddyfile(p),
-                caddyfile_text(&s.node.domain, s.node.ports.admin),
+                caddyfile_text(&s.node.domain, s.node.ports.admin, &sites_glob(p)),
             )
             .mode(0o644)
             .verify(Verify::Caddy)
@@ -202,7 +244,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_four_binaries_then_five_files() {
+    fn renders_four_binaries_then_six_files() {
         let arts = CoreFilesModule::new(Some(manifest())).render(&sample_state(), &ctx());
         let bins: Vec<(String, String, String)> = arts
             .iter()
@@ -252,6 +294,7 @@ mod tests {
                 "/opt/b-ui/config-residential.yaml",
                 "/opt/b-ui/xray-config.json",
                 "/opt/b-ui/singbox-relay.json",
+                "/opt/b-ui/caddy/sites/README.txt",
                 "/opt/b-ui/Caddyfile",
             ]
         );
@@ -261,7 +304,7 @@ mod tests {
     fn without_a_manifest_only_the_files_are_rendered() {
         let arts = CoreFilesModule::new(None).render(&sample_state(), &ctx());
         assert!(!arts.iter().any(|a| matches!(a, Artifact::Binary { .. })));
-        assert_eq!(arts.len(), 5);
+        assert_eq!(arts.len(), 6);
     }
 
     #[test]
@@ -415,8 +458,52 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert_eq!(
-            caddyfile_text("example.com", 8080),
-            caddyfile_text("example.com", 8080)
+            caddyfile_text("example.com", 8080, "/opt/b-ui/caddy/sites/*.caddy"),
+            caddyfile_text("example.com", 8080, "/opt/b-ui/caddy/sites/*.caddy")
+        );
+    }
+
+    /// 2026-09-13 裁决「P1：Caddy 外部站点通道」：面板块之后追加 import 行，
+    /// 目录由对账器建出来（`README.txt` 占位），目录里的 `*.caddy` 归用户管。
+    #[test]
+    fn caddyfile_imports_the_external_sites_dir_after_the_panel_block() {
+        let arts = CoreFilesModule::new(None).render(&sample_state(), &ctx());
+        let text = match find_file(&arts, "/opt/b-ui/Caddyfile") {
+            Artifact::File { content, .. } => String::from_utf8(content).unwrap(),
+            other => panic!("{other:?}"),
+        };
+        let import = "import /opt/b-ui/caddy/sites/*.caddy";
+        let at = text
+            .find(import)
+            .unwrap_or_else(|| panic!("Caddyfile 缺 import 行：\n{text}"));
+        assert!(
+            at > text.rfind('}').expect("面板块的右花括号"),
+            "import 必须在面板站点块**之后**（块内的 import 会被当成站点内指令）：\n{text}"
+        );
+        // 目录得有人建：渲染一个占位 README（0644、不是 *.caddy 所以不会被 import 进去）
+        match find_file(&arts, "/opt/b-ui/caddy/sites/README.txt") {
+            Artifact::File {
+                mode,
+                restart,
+                verify,
+                content,
+                ..
+            } => {
+                assert_eq!(mode, 0o644);
+                assert_eq!(restart, None, "占位文件变了不该 reload caddy");
+                assert_eq!(verify, None);
+                assert!(String::from_utf8(content).unwrap().contains(".caddy"));
+            }
+            other => panic!("{other:?}"),
+        }
+        // 用户的站点文件永远不是 artifact（不会被覆盖），也不会被 Absent 删掉
+        assert!(
+            !arts.iter().any(|a| match a {
+                Artifact::File { path, .. } | Artifact::Absent { path } =>
+                    path.to_str().is_some_and(|p| p.ends_with(".caddy")),
+                _ => false,
+            }),
+            "bui 不许把任何 *.caddy 纳入受管"
         );
     }
 
@@ -463,8 +550,21 @@ mod tests {
             return;
         };
         let d = tempfile::tempdir().unwrap();
+        // 连外部站点通道一起过：sites/ 里放一个真实的外部站点块（裁决 P1）
+        let p = Paths {
+            base_dir: d.path().into(),
+            certs_dir: d.path().join("certs"),
+            bin_dir: d.path().join("bin"),
+        };
+        std::fs::create_dir_all(crate::paths::caddy_sites(&p)).unwrap();
+        std::fs::write(crate::paths::caddy_sites_readme(&p), SITES_README).unwrap();
+        std::fs::write(
+            crate::paths::caddy_sites(&p).join("blog.caddy"),
+            "blog.example.com {\n\trespond \"hi\"\n}\n",
+        )
+        .unwrap();
         let f = d.path().join("Caddyfile");
-        std::fs::write(&f, caddyfile_text("example.com", 8080)).unwrap();
+        std::fs::write(&f, caddyfile_text("example.com", 8080, &sites_glob(&p))).unwrap();
         // caddy validate 会 provision tls 模块，可能往 ~/.local/share/caddy 建目录；
         // 把两个 XDG 目录指到 tempdir，保持测试封闭（不碰开发机的家目录）
         let out = std::process::Command::new(caddy)

@@ -48,6 +48,93 @@ print("; ".join(p))
 PY
 }
 
+# 一份 *.caddy 里的顶层站点地址（每行一个 host，已去重）。
+# 注释（含带 } 的注释）与引号里的花括号都不计数，逻辑与 bui 的 split_caddy_blocks 一致。
+site_hosts() {
+  python3 - "$1" <<'PY'
+import sys
+
+text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+
+
+def code(line):
+    """剥掉注释：# 只有在行首或前面是空白、且不在引号里时才起注释作用"""
+    quote = None
+    i = 0
+    while i < len(line):
+        c = line[i]
+        if quote:
+            if c == "\\":
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+        elif c in "\"`":
+            quote = c
+        elif c == "#" and (i == 0 or line[i - 1].isspace()):
+            return line[:i]
+        i += 1
+    return line
+
+
+hosts, header, depth, opened = [], "", 0, False
+for line in text.splitlines(True):
+    for ch in code(line):
+        if ch == "{":
+            depth += 1
+            opened = True
+            if depth == 1:
+                continue
+        elif ch == "}":
+            depth = max(depth - 1, 0)
+            if depth == 0:
+                continue
+        if depth == 0:
+            header += ch
+    if opened and depth == 0:
+        for tok in header.replace(",", " ").split():
+            if tok == "import":
+                break  # 顶层 import 指令，不是站点地址
+            tok = tok.split("://")[-1].split("/")[0]
+            if not tok or tok.startswith("(") or tok.startswith(":") or "*" in tok:
+                continue  # 片段定义 / 只写端口 / 通配域名：curl 不了
+            host, _, port = tok.rpartition(":")
+            tok = host if host and port.isdigit() else tok
+            if tok and tok not in hosts:
+                hosts.append(tok)
+        header, opened = "", False
+print("\n".join(hosts))
+PY
+}
+
+# 打本机 443 要一次 TLS + HTTP；状态码非 000 就算通（自测模式下被替换成 fake）
+probe_site_code() {
+  curl -sk --resolve "$1:443:127.0.0.1" --max-time 10 -o /dev/null -w '%{http_code}' "https://$1/" 2>/dev/null
+}
+
+# step 5（2026-09-13 裁决「Caddy 外部站点通道」）：import-v3 搬过来的外部站点
+# 在 v4 的 bundled caddy 上仍然能握手。状态码非 000 即通（403/404 也算：证明 caddy 在应答）。
+check_external_sites() {
+  local f=$1 hosts h code
+  if [ ! -f "$f" ]; then
+    skip "step5 外部站点通道（$f 不存在，这台机器没有从 v3 导入的站点）"
+    return
+  fi
+  hosts=$(site_hosts "$f")
+  if [ -z "$hosts" ]; then
+    no "step5 外部站点通道：$f 里解析不出站点地址" "$(head -n 5 "$f")"
+    return
+  fi
+  for h in $hosts; do
+    code=$(probe_site_code "$h")
+    if [ -n "$code" ] && [ "$code" != "000" ]; then
+      ok "step5 外部站点 $h 可握手（HTTP $code）"
+    else
+      no "step5 外部站点 $h 无响应" "curl -sk --resolve $h:443:127.0.0.1 https://$h/ → ${code:-空}"
+    fi
+  done
+}
+
 # 对账报告 JSON → 问题描述（空串 = 零变更零错误）
 check_report_clean() {
   python3 - "$1" <<'PY'
@@ -139,6 +226,9 @@ PY
   else
     no "step4 socket 异常" "$(ls -l /run/b-ui.sock 2>&1)"
   fi
+
+  # step 5：从 v3 导过来的外部站点仍然可达
+  check_external_sites "${SITES_FILE:-$BASE/caddy/sites/imported-from-v3.caddy}"
 }
 
 self_test() {
@@ -160,6 +250,56 @@ self_test() {
   if [ -z "$out" ]; then ok "自测：零变更报告判通过"; else no "自测：零变更报告被误判" "$out"; fi
   out=$(check_report_clean '{"changed":["/opt/b-ui/config.yaml"],"restarted":["hysteria-server"],"errors":[],"verify_failures":[],"drift":[],"notes":[]}')
   if [[ "$out" == *config.yaml* ]]; then ok "自测：有变更的报告被判失败"; else no "自测：漏判变更" "$out"; fi
+  self_test_external_sites
+}
+
+# step 5 的自测：真 curl 换成 fake，只验「站点地址解析 + 状态码判定」
+self_test_external_sites() {
+  local d f out
+  d=$(mktemp -d) || { no "自测：建不出临时目录"; return; }
+  f="$d/imported-from-v3.caddy"
+  cat > "$f" <<'EOF'
+# 由 bui import-v3 原样导出
+blog.example.com {
+    root * /srv/blog  # 这个注释里有个 } 别被当成收尾
+    tls /etc/caddy/certs/blog.crt /etc/caddy/certs/blog.key
+}
+
+https://shop.example.com:443, www.shop.example.com {
+    reverse_proxy 127.0.0.1:3000
+}
+EOF
+  out=$(site_hosts "$f")
+  if [ "$out" = "blog.example.com
+shop.example.com
+www.shop.example.com" ]; then
+    ok "自测：外部站点地址解析（含行内注释、scheme、端口、多地址）"
+  else
+    no "自测：站点地址解析不对" "$out"
+  fi
+  # shellcheck disable=SC2317  # 在 $( ) 子 shell 里覆盖真 curl，下面那次调用会用到
+  out=$(
+    probe_site_code() { echo 200; }
+    check_external_sites "$f"
+  )
+  if [ "$(printf '%s\n' "$out" | grep -c '^PASS')" = "3" ] && [[ "$out" == *"HTTP 200"* ]]; then
+    ok "自测：三个站点都应答 → 三条 PASS（带状态码）"
+  else
+    no "自测：站点可达却没判通过" "$out"
+  fi
+  # shellcheck disable=SC2317
+  out=$(
+    probe_site_code() { echo 000; }
+    check_external_sites "$f"
+  )
+  if [ "$(printf '%s\n' "$out" | grep -c '^FAIL')" = "3" ]; then
+    ok "自测：状态码 000 判失败"
+  else
+    no "自测：000 没被判失败" "$out"
+  fi
+  out=$(check_external_sites "$d/not-there.caddy")
+  if [[ "$out" == SKIP* ]]; then ok "自测：没有导入文件 → SKIP"; else no "自测：缺文件该 SKIP" "$out"; fi
+  rm -rf "$d"
 }
 
 main() {

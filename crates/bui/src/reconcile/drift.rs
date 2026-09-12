@@ -405,6 +405,57 @@ mod tests {
         );
     }
 
+    /// 2026-09-13 裁决「P1：Caddy 外部站点通道」：`<base>/caddy/sites/` 里的文件归用户管，
+    /// 既不是 artifact 也永远不算漂移（报了就是每 10 分钟一条永久 degraded）。
+    #[test]
+    fn user_site_files_under_caddy_sites_are_never_drift() {
+        let h = FakeHost::new();
+        h.with(|i| {
+            i.files
+                .insert("/opt/b-ui/config.yaml".into(), (b"a".to_vec(), 0o600));
+            i.files.insert(
+                "/opt/b-ui/Caddyfile".into(),
+                (b"example.com {}\n".to_vec(), 0o644),
+            );
+            i.files
+                .insert("/etc/resolv.conf".into(), (b"b".to_vec(), 0o644));
+            i.immutable.insert("/etc/resolv.conf".into());
+            i.files.insert(
+                "/etc/systemd/system/xray.service".into(),
+                (b"x".to_vec(), 0o644),
+            );
+            // 用户自己丢进来的站点块 + import-v3 导出的那份 + 对账器的占位 README
+            i.files.insert(
+                "/opt/b-ui/caddy/sites/my-blog.caddy".into(),
+                (
+                    b"blog.example.com {\n\troot * /srv/blog\n}\n".to_vec(),
+                    0o644,
+                ),
+            );
+            i.files.insert(
+                "/opt/b-ui/caddy/sites/imported-from-v3.caddy".into(),
+                (b"shop.example.com {\n}\n".to_vec(), 0o644),
+            );
+            i.files.insert(
+                "/opt/b-ui/caddy/sites/README.txt".into(),
+                (b"put your *.caddy here".to_vec(), 0o644),
+            );
+            i.scripted.push((
+                "crontab -l".into(),
+                CmdOut::failure(1, "no crontab for root"),
+            ));
+        });
+        assert!(
+            BASE_WHITELIST.contains(&"caddy"),
+            "caddy/ 在白名单里，sites/ 才连带不被扫"
+        );
+        assert_eq!(
+            scan(&h, &managed(), &Paths::default_server()),
+            vec![],
+            "用户的站点文件不许被报成漂移"
+        );
+    }
+
     #[test]
     fn a_b_ui_prefixed_backup_under_etc_is_reported_as_stray_conf() {
         // spec §2.2「受管目录里的陌生文件」：四个 /etc 目录只看 b-ui 前缀的文件名

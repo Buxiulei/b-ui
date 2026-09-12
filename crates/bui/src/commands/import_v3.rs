@@ -3,6 +3,11 @@
 //! 卸载的顺序是硬要求（2026-09-12 裁决）：先把发行版 Caddy 的 ACME 账号与证书搬进 v4 的数据
 //! 目录，再停它；整个 `uninstall_v3` 又必须排在**对账之前**（v3 的 `b-ui-admin` 还占着 `:8080`
 //! 时，对账 start 的 `b-ui.service` 首启 bind 失败会进 `Restart=always` 循环）。
+//!
+//! 2026-09-13 裁决又在最前面加了一步：把 `/etc/caddy/Caddyfile` 里**除 b-ui 面板块以外**的
+//! 顶层站点块原样搬进 `<base>/caddy/sites/imported-from-v3.caddy`，并对渲染出的新 Caddyfile
+//! 跑一次 `caddy validate`。这一步过不了就整体中止（发行版 caddy 照旧在跑、`/etc/caddy`
+//! 一个字节没动），生产机上那些托管着别人站点的 Caddy 才不会因为升级 v4 而集体掉线。
 
 use crate::sys::Host;
 use bui_schema::paths::Paths;
@@ -83,6 +88,283 @@ pub const V3_LEFTOVER_PREFIXES: [&str; 6] = [
 
 /// 发行版 Caddy（v3 用的那个）的数据目录：ACME 账号与已签证书都在它下面。
 pub const V3_CADDY_DATA: &str = "/var/lib/caddy/.local/share/caddy";
+
+/// 发行版 Caddy 的主配置（v3 `server/core.sh:864` 写它）。**只读**：导入全程不改、不删它。
+pub const V3_CADDYFILE: &str = "/etc/caddy/Caddyfile";
+
+/// 导出文件开头加的说明（之后是一字节未改的外部站点块）。
+pub const SITES_EXPORT_HEADER: &str = "\
+# 由 bui import-v3 从 /etc/caddy/Caddyfile 原样导出（除 b-ui 面板站点块以外的全部顶层块）。
+# 证书等绝对路径一个字节都没改；/etc/caddy 下的原文件也没删。
+# 这个文件归你管：bui 不会再改写、覆盖或删除它。
+";
+
+/// 一份 Caddyfile 里的一个顶层段落。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaddyBlock {
+    /// 站点地址：`{` 之前的代码文本（剥掉注释、首尾空白），全局选项块是空串。
+    pub header: String,
+    /// 块内代码（剥掉注释），只用来判定；写文件用的是 [`CaddyBlock::text`]。
+    pub body: String,
+    /// 这一段的**原样字节**：前导注释 / 空行 + 站点块本身 + 行尾换行。
+    /// 所有段落的 `text` 顺序拼起来 == 原文。
+    pub text: String,
+    /// 这一段里出现过配对的花括号块体（末尾纯注释 / 空行的尾巴没有）。
+    pub braced: bool,
+}
+
+impl CaddyBlock {
+    /// 要不要搬家：有块体的、或者没块体但有站点地址的（宁可多搬，绝不丢别人的站点）。
+    fn is_site(&self) -> bool {
+        self.braced || !self.header.is_empty()
+    }
+
+    /// 全局选项块：有块体但没有站点地址。
+    fn is_global_options(&self) -> bool {
+        self.braced && self.header.is_empty()
+    }
+
+    /// 站点地址列表（`a.com, b.com` / 空白分隔都认）。
+    fn addresses(&self) -> Vec<&str> {
+        self.header
+            .split([',', ' ', '\t', '\n'])
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+}
+
+/// 剥掉一行里的注释：`#` 只有在行首或前面是空白、且不在引号里时才起注释作用（Caddyfile 语义）。
+fn code_part(line: &str) -> &str {
+    let b = line.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        match quote {
+            Some(q) => {
+                if c == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => {
+                if c == b'"' || c == b'`' {
+                    quote = Some(c);
+                } else if c == b'#' && (i == 0 || b[i - 1].is_ascii_whitespace()) {
+                    return &line[..i];
+                }
+            }
+        }
+        i += 1;
+    }
+    line
+}
+
+/// 把一份 Caddyfile 切成顶层段落（2026-09-13 裁决的 import 通道要按块搬家）。
+///
+/// 规则：段落是**连续**的——前一段结束的下一行就是后一段的开始，所以前导注释与空行归后面那个块，
+/// 拼回来一定等于原文（这就是「字节不改」的实现方式）。花括号只在剥掉注释与引号之后才计数，
+/// 段落只在**行尾**且深度回到 0 时收尾（一行写多个块时宁可整行留在一段里，也不切断任何人的站点）。
+pub fn split_caddy_blocks(text: &str) -> Vec<CaddyBlock> {
+    let mut out = Vec::new();
+    let (mut chunk, mut header, mut body) = (String::new(), String::new(), String::new());
+    let mut depth = 0usize;
+    let mut opened = false;
+    for line in text.split_inclusive('\n') {
+        chunk.push_str(line);
+        for ch in code_part(line).chars() {
+            match ch {
+                '{' => {
+                    depth += 1;
+                    opened = true;
+                    if depth == 1 {
+                        continue; // 最外层的花括号本身不进 header / body
+                    }
+                }
+                '}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+            if depth == 0 {
+                header.push(ch);
+            } else {
+                body.push(ch);
+            }
+        }
+        if opened && depth == 0 {
+            out.push(CaddyBlock {
+                header: header.trim().to_string(),
+                body: std::mem::take(&mut body),
+                text: std::mem::take(&mut chunk),
+                braced: true,
+            });
+            header.clear();
+            opened = false;
+        }
+    }
+    // 尾巴：文件末尾的注释 / 空行，或没闭合的残句（原样保留，不丢字节）
+    if !chunk.is_empty() {
+        out.push(CaddyBlock {
+            header: header.trim().to_string(),
+            body,
+            text: chunk,
+            braced: false,
+        });
+    }
+    out
+}
+
+/// 是不是 b-ui 的面板站点块？判定口径（2026-09-13 裁决）：
+/// **站点地址里有一个等于 `domain`**（`https://` 前缀与 `:443` 之类的端口后缀忽略）
+/// **且块内有一条 `reverse_proxy … :<admin_port>`**。两条都满足才算，避免把运营自己反代
+/// 别的服务的同域块误吞。
+pub fn is_bui_panel_block(block: &CaddyBlock, domain: &str, admin_port: u16) -> bool {
+    let addr_hit = block.addresses().into_iter().any(|a| {
+        let a = a
+            .trim_start_matches("https://")
+            .trim_start_matches("http://");
+        a == domain || a.rsplit_once(':').map(|(h, _)| h) == Some(domain)
+    });
+    if !addr_hit {
+        return false;
+    }
+    let port = format!(":{admin_port}");
+    block.body.lines().any(|l| {
+        let mut w = l.split_whitespace();
+        w.next() == Some("reverse_proxy") && w.any(|t| t.ends_with(&port))
+    })
+}
+
+/// [`external_caddy_sites`] 的结果。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SitesExport {
+    /// 要写进 `<base>/caddy/sites/imported-from-v3.caddy` 的内容
+    /// （[`SITES_EXPORT_HEADER`] + 原样的外部块）；没有外部站点时是空串。
+    pub text: String,
+    /// 导出的站点地址行（日志用）。
+    pub addresses: Vec<String>,
+    /// 丢掉了全局选项块：被 import 的文件里不允许出现它，照搬会让 `caddy validate` 直接报错。
+    pub dropped_global: bool,
+}
+
+/// 从一份 Caddyfile 文本里取出**除 b-ui 面板块以外**的所有顶层站点块，原样拼接。
+pub fn external_caddy_sites(text: &str, domain: &str, admin_port: u16) -> SitesExport {
+    let mut out = SitesExport::default();
+    let mut kept = String::new();
+    for b in split_caddy_blocks(text) {
+        if !b.is_site() {
+            continue; // 纯注释 / 空行的尾巴
+        }
+        if b.is_global_options() {
+            out.dropped_global = true;
+            continue;
+        }
+        if is_bui_panel_block(&b, domain, admin_port) {
+            continue;
+        }
+        kept.push_str(&b.text);
+        out.addresses.push(b.header.clone());
+    }
+    // 首尾的空行是块之间的分隔，不是谁的内容：只在拼好的整体两端修掉
+    let kept = kept.trim_matches('\n');
+    if !kept.is_empty() {
+        out.text = format!("{SITES_EXPORT_HEADER}{kept}\n");
+    }
+    out
+}
+
+/// 外部站点通道的迁移（2026-09-13 裁决），**必须在停发行版 caddy 之前**跑：
+/// 读 `/etc/caddy/Caddyfile` → 把非 b-ui 的顶层块原样写进 `<base>/caddy/sites/imported-from-v3.caddy`
+/// （0644）→ 对**渲染出的新 Caddyfile**（带 import 行）跑 `caddy validate`。
+///
+/// validate 失败 → `Err`：调用方中止 import，发行版 caddy 照旧在跑，`/etc/caddy` 一个字节没动。
+/// bundled caddy 还没装（离线装机）→ 只记一行「跳过」，不因此卡住 import（与
+/// `reconcile::apply` 里「校验器不存在就跳过」同一口径）。
+pub fn migrate_external_caddy_sites(
+    host: &dyn Host,
+    paths: &Paths,
+    domain: &str,
+    admin_port: u16,
+) -> anyhow::Result<Vec<String>> {
+    let Ok(Some(raw)) = host.read_file(Path::new(V3_CADDYFILE)) else {
+        return Ok(Vec::new()); // 没装过发行版 caddy
+    };
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let export = external_caddy_sites(&text, domain, admin_port);
+    let mut done = Vec::new();
+    if export.dropped_global {
+        done.push(format!(
+            "提示：{V3_CADDYFILE} 的全局选项块没有导出（被 import 的文件里不允许出现它），需要的话请自己并进 {}",
+            crate::paths::caddyfile(paths).display()
+        ));
+    }
+    if export.text.is_empty() {
+        done.push(format!(
+            "{V3_CADDYFILE} 里只有 b-ui 面板块，没有外部站点要迁移"
+        ));
+    } else {
+        let dest = crate::paths::caddy_sites_imported(paths);
+        host.write_file(&dest, export.text.as_bytes(), 0o644)?;
+        done.push(format!(
+            "已把 {} 个外部站点块原样导出到 {}：{}",
+            export.addresses.len(),
+            dest.display(),
+            export.addresses.join(" / ")
+        ));
+    }
+    // 停发行版 caddy 之前的闸门：新 Caddyfile（含 import 行）必须先过 caddy validate
+    match validate_rendered_caddyfile(host, paths, domain, admin_port)? {
+        Some(note) => done.push(note),
+        None => done.push("新 Caddyfile（含外部站点 import）已过 caddy validate".into()),
+    }
+    Ok(done)
+}
+
+/// 用 bundled caddy 校验渲染出的新 Caddyfile。`Ok(None)` = 校验通过，
+/// `Ok(Some(note))` = 没有可用的 caddy 二进制、跳过校验，`Err` = 校验失败（中止 import）。
+fn validate_rendered_caddyfile(
+    host: &dyn Host,
+    paths: &Paths,
+    domain: &str,
+    admin_port: u16,
+) -> anyhow::Result<Option<String>> {
+    let bin = paths.bin_dir.join("caddy");
+    if host.read_file(&bin).ok().flatten().is_none() {
+        return Ok(Some(format!(
+            "没有 {}，已跳过新 Caddyfile 的 caddy validate",
+            bin.display()
+        )));
+    }
+    let candidate = crate::paths::verify_dir(paths).join("Caddyfile");
+    let text = crate::modules::core_files::caddyfile_text(
+        domain,
+        admin_port,
+        &crate::modules::core_files::sites_glob(paths),
+    );
+    host.write_file(&candidate, text.as_bytes(), 0o600)?;
+    let cand = candidate.display().to_string();
+    let out = host.run(
+        &bin.display().to_string(),
+        &["validate", "--config", &cand, "--adapter", "caddyfile"],
+    );
+    let _ = host.remove_file(&candidate);
+    match out {
+        Ok(o) if o.ok() => Ok(None),
+        Ok(o) => anyhow::bail!(
+            "新 Caddyfile 过不了 caddy validate，已中止导入（发行版 caddy 仍在运行，{V3_CADDYFILE} 未改动）：{}",
+            if o.stderr.is_empty() { o.stdout } else { o.stderr }.trim()
+        ),
+        Err(e) => anyhow::bail!("跑 caddy validate 失败，已中止导入：{e}"),
+    }
+}
 
 /// 只删 b-ui 自己写的 cron 行。
 pub fn filter_cron(text: &str) -> String {
@@ -240,13 +522,26 @@ pub fn flush_v3_portjump_rules(host: &dyn Host) -> Vec<String> {
     done
 }
 
-/// 顺序：[`migrate_caddy_data`] → 停 v3 单元 → 删 v3 shell/Node 文件 → 归档 v3 状态文件 →
+/// 顺序：[`migrate_external_caddy_sites`]（外部站点块 + caddy validate 闸门）→
+/// [`migrate_caddy_data`] → 停 v3 单元 → 删 v3 shell/Node 文件 → 归档 v3 状态文件 →
 /// [`sweep_v3_leftovers`]（`*.bak.*` 归档、`*.tmp` 删） → 删 v3 `admin/` → 删
 /// `/tmp/hy2-watchdog-*` → 清 cron 行 → [`flush_v3_portjump_rules`]；保留 `certs/` 与 `packages/`。
-pub fn uninstall_v3(host: &dyn Host, paths: &Paths) -> Vec<String> {
-    // 第一步（2026-09-12 裁决）：先把发行版 Caddy 的 ACME 账号与证书搬进 v4 的数据目录，
+///
+/// 返回 `Err` 只有一种情况：第一步的 `caddy validate` 没过。那时**什么破坏性动作都还没做**
+/// （发行版 caddy 还在跑、v3 单元一个没停），调用方按「中止 import」处理。
+pub fn uninstall_v3(
+    host: &dyn Host,
+    paths: &Paths,
+    domain: &str,
+    admin_port: u16,
+) -> anyhow::Result<Vec<String>> {
+    // 第一步（2026-09-13 裁决）：把 /etc/caddy/Caddyfile 里非 b-ui 的站点块搬进外部站点目录，
+    // 并对渲染出的新 Caddyfile 跑 caddy validate。必须排在停发行版 caddy **之前**，
+    // 失败就整体中止（下面一行都不执行）。
+    let mut done = migrate_external_caddy_sites(host, paths, domain, admin_port)?;
+    // 第二步（2026-09-12 裁决）：先把发行版 Caddy 的 ACME 账号与证书搬进 v4 的数据目录，
     // 再停它；顺序颠倒就会重新签发。必须排在所有删除动作之前。
-    let mut done = migrate_caddy_data(host, paths);
+    done.extend(migrate_caddy_data(host, paths));
     let mut touched_units = false;
     for u in V3_UNITS {
         let unit_file = PathBuf::from("/etc/systemd/system").join(u);
@@ -316,7 +611,7 @@ pub fn uninstall_v3(host: &dyn Host, paths: &Paths) -> Vec<String> {
     // 必须最后做：紧接着 install 第 9 步的对账会重写两个 hysteria 单元并重启，
     // hysteria 2.12 启动时自建它需要的链。
     done.extend(flush_v3_portjump_rules(host));
-    done
+    Ok(done)
 }
 
 /// `bui import-v3`：**只**从 v3 目录生成 `state.json`，不卸载 v3、不对账
@@ -413,6 +708,288 @@ mod tests {
         assert!(!out.contains("/opt/b-ui/update.sh"));
         assert!(out.contains("backup-my-blog.sh"), "别人的 cron 行必须留着");
         assert!(out.contains("# m h dom mon dow command"));
+    }
+
+    /// bwg-rick 实况：v3 的面板块（`core.sh:864` 那份）+ 运营手工加的两个外部站点块，
+    /// 带前导注释、行内注释、带 `}` 的注释、`/etc/caddy/certs` 的绝对路径。
+    const V3_CADDYFILE_TEXT: &str = "\
+# B-UI Web 管理面板 - 由 Caddy 自动管理 HTTPS 证书
+example.com {
+    # 反代到 Node.js 管理面板
+    reverse_proxy 127.0.0.1:8080
+
+    # 日志
+    log {
+        output file /var/log/caddy/b-ui-access.log {
+            roll_size 10mb
+            roll_keep 5
+        }
+    }
+}
+
+# 我的博客（手工加的，别动）
+blog.example.com {
+    root * /srv/blog
+    file_server
+    tls /etc/caddy/certs/blog.crt /etc/caddy/certs/blog.key
+}
+
+shop.example.com, www.shop.example.com {
+    reverse_proxy 127.0.0.1:3000  # 这个注释里有个 } 别被当成收尾
+}
+";
+
+    /// 上面那份里除 b-ui 面板块之外的部分，**逐字节**就是这些（前导注释也算块的一部分）
+    const EXTERNAL_BLOCKS: &str = "\
+# 我的博客（手工加的，别动）
+blog.example.com {
+    root * /srv/blog
+    file_server
+    tls /etc/caddy/certs/blog.crt /etc/caddy/certs/blog.key
+}
+
+shop.example.com, www.shop.example.com {
+    reverse_proxy 127.0.0.1:3000  # 这个注释里有个 } 别被当成收尾
+}
+";
+
+    #[test]
+    fn splits_top_level_blocks_and_keeps_them_byte_exact() {
+        let blocks = split_caddy_blocks(V3_CADDYFILE_TEXT);
+        let headers: Vec<&str> = blocks.iter().map(|b| b.header.as_str()).collect();
+        assert_eq!(
+            headers,
+            vec![
+                "example.com",
+                "blog.example.com",
+                "shop.example.com, www.shop.example.com"
+            ]
+        );
+        // 拼回来必须与原文一字不差（注释、空行、缩进全在）
+        assert_eq!(
+            blocks.iter().map(|b| b.text.as_str()).collect::<String>(),
+            V3_CADDYFILE_TEXT
+        );
+        assert!(
+            is_bui_panel_block(&blocks[0], "example.com", 8080),
+            "面板块要认出来"
+        );
+        for b in &blocks[1..] {
+            assert!(!is_bui_panel_block(b, "example.com", 8080), "{b:?}");
+        }
+        // 域名对但反代端口不是面板端口（运营自己反代的别的服务）→ 不是面板块
+        assert!(!is_bui_panel_block(&blocks[0], "example.com", 9090));
+        assert!(!is_bui_panel_block(&blocks[0], "other.example.com", 8080));
+    }
+
+    #[test]
+    fn exports_every_block_but_the_panel_one() {
+        let e = external_caddy_sites(V3_CADDYFILE_TEXT, "example.com", 8080);
+        assert!(e.text.starts_with(SITES_EXPORT_HEADER));
+        assert_eq!(
+            &e.text[SITES_EXPORT_HEADER.len()..],
+            EXTERNAL_BLOCKS,
+            "外部站点块必须逐字节原样（含注释与绝对路径）"
+        );
+        assert!(
+            !e.text.contains("127.0.0.1:8080"),
+            "b-ui 面板块不许被导出（会和 v4 的 Caddyfile 撞同一个站点地址）"
+        );
+        assert!(
+            e.text.contains("/etc/caddy/certs/blog.crt"),
+            "绝对路径不许改"
+        );
+        assert_eq!(
+            e.addresses,
+            vec![
+                "blog.example.com".to_string(),
+                "shop.example.com, www.shop.example.com".to_string()
+            ]
+        );
+        assert!(!e.dropped_global);
+    }
+
+    #[test]
+    fn a_caddyfile_with_only_the_panel_block_exports_nothing() {
+        let only_panel = "example.com {\n\treverse_proxy 127.0.0.1:8080\n}\n";
+        let e = external_caddy_sites(only_panel, "example.com", 8080);
+        assert_eq!(e.text, "");
+        assert!(e.addresses.is_empty());
+    }
+
+    #[test]
+    fn the_global_options_block_is_dropped_with_a_warning() {
+        // 被 import 的文件里不允许出现全局选项块，照搬过去 caddy validate 直接报错
+        let text = "\
+{
+\temail me@example.com
+}
+
+example.com {
+\treverse_proxy 127.0.0.1:8080
+}
+
+blog.example.com {
+\tfile_server
+}
+";
+        let e = external_caddy_sites(text, "example.com", 8080);
+        assert!(e.dropped_global, "全局选项块要被丢掉并告知");
+        assert!(!e.text.contains("email me@example.com"));
+        assert!(e.text.contains("blog.example.com {"));
+        assert_eq!(e.addresses, vec!["blog.example.com".to_string()]);
+    }
+
+    #[test]
+    fn external_sites_are_exported_and_validated_before_the_distro_caddy_is_stopped() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = scratch(&d);
+        let h = FakeHost::new();
+        h.with(|i| {
+            i.files.insert(
+                V3_CADDYFILE.into(),
+                (V3_CADDYFILE_TEXT.as_bytes().to_vec(), 0o644),
+            );
+            // bundled caddy 已装好（install 第 3/4 步先装内核，第 7 步才卸 v3）
+            i.files
+                .insert(paths.bin_dir.join("caddy"), (b"ELF".to_vec(), 0o755));
+            i.files.insert(
+                format!("{V3_CADDY_DATA}/certificates/x/example.com.crt").into(),
+                (b"CERT".to_vec(), 0o600),
+            );
+            i.scripted.push((
+                "crontab -l".into(),
+                CmdOut::failure(1, "no crontab for root"),
+            ));
+        });
+        let done = uninstall_v3(&h, &paths, "example.com", 8080).unwrap();
+        let sites = crate::paths::caddy_sites_imported(&paths);
+        let got = h.text(sites.to_str().unwrap()).expect("要写出导出文件");
+        assert_eq!(&got[SITES_EXPORT_HEADER.len()..], EXTERNAL_BLOCKS);
+        assert_eq!(h.mode(sites.to_str().unwrap()), Some(0o644));
+        assert_eq!(
+            h.text(V3_CADDYFILE).as_deref(),
+            Some(V3_CADDYFILE_TEXT),
+            "/etc/caddy 只读，一个字节都不许动"
+        );
+        let ops = h.ops();
+        let validate = ops
+            .iter()
+            .position(|o| o.contains("caddy validate --config"))
+            .expect("停 caddy 之前要对新 Caddyfile 跑 validate");
+        let stop = ops
+            .iter()
+            .position(|o| o == "systemd:stop:caddy")
+            .expect("要停发行版 caddy");
+        let write = ops
+            .iter()
+            .position(|o| o.starts_with(&format!("write:{}", sites.display())))
+            .expect("要写导出文件");
+        assert!(write < validate && validate < stop, "{ops:?}");
+        // validate 用的是渲染出的新 Caddyfile（带 import 行），不是 /etc/caddy 那份
+        assert!(
+            ops[validate].contains(
+                crate::paths::verify_dir(&paths)
+                    .join("Caddyfile")
+                    .to_str()
+                    .unwrap()
+            ),
+            "{:?}",
+            ops[validate]
+        );
+        assert!(done.iter().any(|l| l.contains("blog.example.com")));
+    }
+
+    #[test]
+    fn a_failing_validate_aborts_the_import_and_leaves_the_distro_caddy_running() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = scratch(&d);
+        let h = FakeHost::new();
+        h.with(|i| {
+            i.files.insert(
+                V3_CADDYFILE.into(),
+                (V3_CADDYFILE_TEXT.as_bytes().to_vec(), 0o644),
+            );
+            i.files
+                .insert(paths.bin_dir.join("caddy"), (b"ELF".to_vec(), 0o755));
+            i.files.insert(
+                format!("{V3_CADDY_DATA}/certificates/x/example.com.crt").into(),
+                (b"CERT".to_vec(), 0o600),
+            );
+            for u in V3_UNITS {
+                i.files.insert(
+                    format!("/etc/systemd/system/{u}").into(),
+                    (b"x".to_vec(), 0o644),
+                );
+                i.units_active.insert(u.to_string());
+            }
+            i.scripted.push((
+                format!("{} validate", paths.bin_dir.join("caddy").display()),
+                CmdOut::failure(
+                    1,
+                    "Caddyfile:9 - Error during parsing: unrecognized directive",
+                ),
+            ));
+            i.scripted.push((
+                "crontab -l".into(),
+                CmdOut::failure(1, "no crontab for root"),
+            ));
+        });
+        let err = uninstall_v3(&h, &paths, "example.com", 8080).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("unrecognized directive"), "{msg}");
+        let ops = h.ops();
+        assert!(
+            !ops.iter().any(|o| o == "systemd:stop:caddy"),
+            "validate 失败必须保留发行版 caddy 在跑：{ops:?}"
+        );
+        let verify_prefix = format!("remove:{}", crate::paths::verify_dir(&paths).display());
+        assert!(
+            !ops.iter().any(|o| o.starts_with("systemd:disable:")
+                || (o.starts_with("remove:") && !o.starts_with(&verify_prefix))),
+            "还没开始卸 v3（只允许清掉 .verify/ 里的校验候选）：{ops:?}"
+        );
+        assert!(h.text(V3_CADDYFILE).is_some(), "/etc/caddy 不删");
+        assert!(
+            h.text(&format!("{V3_CADDY_DATA}/certificates/x/example.com.crt"))
+                .is_some(),
+            "发行版 caddy 的证书原地不动"
+        );
+    }
+
+    #[test]
+    fn a_machine_without_the_distro_caddyfile_skips_the_whole_channel() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = scratch(&d);
+        let h = FakeHost::new();
+        h.with(|i| {
+            i.scripted.push((
+                "crontab -l".into(),
+                CmdOut::failure(1, "no crontab for root"),
+            ));
+        });
+        assert_eq!(
+            migrate_external_caddy_sites(&h, &paths, "example.com", 8080).unwrap(),
+            Vec::<String>::new()
+        );
+        assert!(!h.ops().iter().any(|o| o.contains("validate")));
+    }
+
+    #[test]
+    fn a_caddyfile_without_the_bundled_caddy_binary_only_notes_the_skip() {
+        // 离线装机 / 内核还没下载：validate 不了就只记一行提示，不能因此卡住 import
+        let d = tempfile::tempdir().unwrap();
+        let paths = scratch(&d);
+        let h = FakeHost::new();
+        h.with(|i| {
+            i.files.insert(
+                V3_CADDYFILE.into(),
+                (V3_CADDYFILE_TEXT.as_bytes().to_vec(), 0o644),
+            );
+        });
+        let done = migrate_external_caddy_sites(&h, &paths, "example.com", 8080).unwrap();
+        assert!(done.iter().any(|l| l.contains("跳过")), "{done:?}");
+        assert!(!h.ops().iter().any(|o| o.contains("validate")));
     }
 
     #[test]
@@ -548,7 +1125,7 @@ mod tests {
             i.scripted
                 .push(("crontab -l".into(), CmdOut::success(CRONTAB)));
         });
-        let done = uninstall_v3(&h, &paths);
+        let done = uninstall_v3(&h, &paths, "example.com", 8080).unwrap();
         for u in V3_UNITS {
             assert!(
                 h.ops().contains(&format!("systemd:disable:{u}")),
@@ -699,7 +1276,7 @@ mod tests {
                 CmdOut::failure(1, "no crontab for root"),
             ));
         });
-        let done = uninstall_v3(&h, &paths);
+        let done = uninstall_v3(&h, &paths, "example.com", 8080).unwrap();
         let dest = crate::paths::caddy_data(&paths);
         let key = dest.join(
             "certificates/acme-v02.api.letsencrypt.org-directory/example.com/example.com.key",
@@ -768,7 +1345,7 @@ mod tests {
                 CmdOut::failure(1, "no crontab for root"),
             ))
         });
-        let done = uninstall_v3(&h, &scratch(&d));
+        let done = uninstall_v3(&h, &scratch(&d), "example.com", 8080).unwrap();
         assert_eq!(done, Vec::<String>::new());
         assert!(!h
             .ops()
