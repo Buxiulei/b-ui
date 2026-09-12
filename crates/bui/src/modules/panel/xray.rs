@@ -9,7 +9,10 @@
 
 // 生成代码归 prost/tonic 管，clippy 的意见对它没有意义；不挂这个 allow，
 // `cargo clippy --all-targets -- -D warnings` 大概率直接失败。
-#[allow(clippy::all)]
+// 生成代码里有十来个本项目用不到的消息（`xray.core::Config`、`common.net::PortRange`…），
+// 它们是被用到的那几个 proto `import` 进来的，删不掉也没法「补调用方」⇒ 这条 allow 只盖
+// 生成代码，不盖手写代码（Task 13 已删掉整个 panel 子树的 allow(dead_code)）。
+#[allow(clippy::all, dead_code)]
 pub mod pb {
     // prost 生成的嵌套模块树；不要改成平铺的 `include_proto!`，跨包引用会解析失败。
     include!(concat!(env!("OUT_DIR"), "/xray.rs"));

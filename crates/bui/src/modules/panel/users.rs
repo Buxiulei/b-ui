@@ -666,6 +666,36 @@ mod tests {
         );
     }
 
+    /// 决策 D13：v3 前端仍会传 `sni` 与 `speed`，两者**接受但忽略**——反序列化必须收下
+    /// （不能因为多出字段就 400），而 `new_user` / `apply_update` 一个字都不看它们。
+    #[test]
+    fn sni_and_speed_are_accepted_and_then_ignored() {
+        let req: CreateRequest =
+            serde_json::from_str(r#"{"username":"bob","sni":"ignored.example.com","speed":100}"#)
+                .unwrap();
+        assert_eq!(req.sni.as_deref(), Some("ignored.example.com"));
+        assert_eq!(req.speed, Some(100.0));
+        let plain = new_user(
+            &CreateRequest {
+                username: "bob".into(),
+                ..Default::default()
+            },
+            t0(),
+        )
+        .unwrap();
+        let ignored = new_user(&req, t0()).unwrap();
+        assert_eq!(
+            ignored.entitlements, plain.entitlements,
+            "sni / speed 不许影响任何权益"
+        );
+
+        let upd: UpdateRequest = serde_json::from_str(r#"{"speed":50}"#).unwrap();
+        assert_eq!(upd.speed, Some(50.0));
+        let mut u = ignored.clone();
+        apply_update(&mut u, &upd, t0()).unwrap();
+        assert_eq!(u, ignored, "只传 speed 时用户一个字段都不该变");
+    }
+
     #[test]
     fn new_user_converts_days_and_gigabytes_like_v3() {
         let req = CreateRequest {
