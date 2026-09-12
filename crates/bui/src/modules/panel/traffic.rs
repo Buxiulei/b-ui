@@ -126,7 +126,8 @@ pub fn apply_sample(
 /// 一个完整周期：采样 → 累加到内存 → 到点落盘 → 限额执行（含 `/kick`）→ 刷新缓存。
 ///
 /// 落盘节奏：`pending` 累加每一轮的增量，距上次落盘 ≥ [`FLUSH_INTERVAL_SECS`] 时在一次
-/// `store.update` 里全部并进 `usage` 并清空。限额判定用 `usage + pending`
+/// `store.update` 里全部并进 `usage`；**只有 `update` 成功才算清空**，失败就把取走的增量
+/// 合并回 `pending`，下一轮重试。限额判定用 `usage + pending`
 /// （`users::is_blocked` 的 `extra` 参数），所以「还没落盘」不会让超限用户多跑 30 秒。
 ///
 /// 已知降级：`pending` 只在内存里，`systemctl restart b-ui` / SIGTERM 最多丢 30 秒的计数
@@ -163,12 +164,23 @@ pub async fn tick(ctx: &DaemonCtx, shared: &Shared) -> anyhow::Result<()> {
         }
     };
     if due {
-        let pending = std::mem::take(&mut *shared.pending().await);
-        ctx.store
+        let taken = std::mem::take(&mut *shared.pending().await);
+        if let Err(e) = ctx
+            .store
             .update(|s| {
-                apply_sample(s, &pending, now);
+                apply_sample(s, &taken, now);
             })
-            .await?;
+            .await
+        {
+            // 落盘失败（磁盘满、备份目录写不动…）不能把本轮取走的增量丢掉：按用户键累加回
+            // `pending`，下轮再试。`last_flush_at` 也没被推进（下面那一段在 `?` 之后），
+            // 所以下一轮仍然判「到点该落盘了」。
+            let mut pending = shared.pending().await;
+            for (id, d) in &taken {
+                pending.entry(*id).or_default().add(*d);
+            }
+            return Err(e);
+        }
     }
 
     // ④ 限额执行与恢复（快照拒绝 + Xray 增删 + kick）
@@ -443,6 +455,65 @@ mod tests {
             TxRx { tx: 6, rx: 5 },
             "缓存是累计值"
         );
+    }
+
+    /// 终审收尾：落盘失败不许把本轮取走的增量丢掉。
+    ///
+    /// 制造失败的办法：把 `state.backups` 变成一个**普通文件** ⇒ `Store::update` 写盘前的
+    /// 「备份上一版」那步 `create_dir_all` 必然失败（与 uid 无关，root 下也一样失败）。
+    #[tokio::test]
+    async fn a_failed_flush_keeps_the_delta_and_the_next_round_lands_the_sum() {
+        let h = harness().await;
+        let ctx = ctx_of(&h);
+        let id = h.store.read().await.users[0].user_id;
+        h.hy2.with(|i| {
+            i.traffic.insert(
+                9999,
+                BTreeMap::from([(id.to_string(), TxRx { tx: 5, rx: 0 })]),
+            );
+        });
+        // 第一轮只进内存，同时把 `last_flush_at` 设成当轮时间
+        tick(&ctx, &h.shared).await.unwrap();
+
+        let blocker = crate::paths::backups_dir(&h.paths);
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        h.hy2.with(|i| {
+            i.traffic.insert(
+                9999,
+                BTreeMap::from([(id.to_string(), TxRx { tx: 2, rx: 0 })]),
+            );
+        });
+        h.host.advance(31);
+        assert!(
+            tick(&ctx, &h.shared).await.is_err(),
+            "落盘失败要报上去（sampling_loop 记 warn 后继续）"
+        );
+        assert_eq!(
+            h.shared.pending().await[&id],
+            TxRx { tx: 7, rx: 0 },
+            "取走的增量必须合并回 pending：5 + 2"
+        );
+        assert_eq!(
+            h.store.read().await.users[0].usage.total_bytes,
+            0,
+            "失败的那一轮一个字节都没落盘"
+        );
+
+        std::fs::remove_file(&blocker).unwrap();
+        h.hy2.with(|i| {
+            i.traffic.insert(
+                9999,
+                BTreeMap::from([(id.to_string(), TxRx { tx: 1, rx: 0 })]),
+            );
+        });
+        h.host.advance(1);
+        tick(&ctx, &h.shared).await.unwrap();
+        assert_eq!(
+            h.store.read().await.users[0].usage.total_bytes,
+            8,
+            "5 + 2 + 1：重试那轮把三轮的增量一次落全"
+        );
+        assert!(h.shared.pending().await.is_empty());
     }
 
     #[tokio::test]

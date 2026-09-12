@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 交付 v4 的面板与用户域：`bui auth-hook`（Hysteria2 `auth.type: command` 钩子，极简路径 + ≤2 秒硬超时 + fail-closed + 自写日志）与 `auth-snapshot.json` 的原子重写；Xray gRPC（tonic + vendored 10 个 proto）的 AddUser / RemoveUser / QueryStats；用户 CRUD（不重启内核）；10 秒流量采样、内存累加、≤30 秒落盘、在线并集、月度重置、到期/超限/禁用的执行与恢复；管理员 API（契约沿用 v3，四处改动）；三种订阅 + 新增 `/api/nodes/<user>`；用户域 `/api/me/*` 的 501 桩；`rust-embed` 嵌入的旧前端（只改创建用户那一处）；客户端包缓存与 `/packages/*`；用户与流量摘要经 `GET /api/stats`（v3 既有契约）与新增的 `GET /api/users/health` 透出（**不改** `/api/health`，裁决 D2）。
+**Goal:** 交付 v4 的面板与用户域：`bui auth-hook`（Hysteria2 `auth.type: command` 钩子，极简路径 + ≤2 秒硬超时 + fail-closed + 自写日志）与 `auth-snapshot.json` 的原子重写；Xray gRPC（tonic + vendored 10 个 proto）的 AddUser / RemoveUser / QueryStats；用户 CRUD（不重启内核）；10 秒流量采样、内存累加、≤30 秒落盘、在线并集、月度重置、到期/超限/禁用的执行与恢复；管理员 API（契约沿用 v3，四处改动）；三种订阅 + 新增 `/api/nodes/<user>`；用户域 `/api/me/*` 的 501 桩；`rust-embed` 嵌入的旧前端（`app.js` 只改两处：`login()` 删 localStorage `ap`、`addUser()` 改 POST）；客户端包缓存与 `/packages/*`；用户与流量摘要经 `GET /api/stats`（v3 既有契约）与新增的 `GET /api/users/health` 透出（**不改** `/api/health`，裁决 D2）。
 
 **Architecture:** 全部代码落在 `crates/bui/src/modules/panel/` 一棵子树里，对外只是 P1 `reconcile::Module` 的**一个**实现 `PanelModule`：`render()` 返回空（xray 的 `clients` 由 P1 Task 10 的 `core_files` 从 `state.users` 渲染，`auth-snapshot.json` 不是 artifact，见「渲染边界」一节）、`routes()` 给出管理员端点、`public_routes()` 给出无鉴权端点（订阅 / 节点 / 前端 / `/packages` / `/api/me`）、`spawn()` 起两个后台任务（10 秒采样 + 用户同步反应器）。写机器的动作一律经 P1 的 `Host` / `crate::state::store::write_atomic`，网络一律经注入的 `XrayApi` / `Hy2Api` trait，于是全部逻辑都能在单元测试里用 `FakeHost` + 内存 fake 验证，不碰真实系统、不联网。用户变更走「改 state → 发 `Event::StateChanged("users")` → ①P1 的对账把新 `clients` 写进 `xray-config.json`（结构哈希不变 ⇒ 不重启 xray）②P2 的同步反应器重写快照并对两个 inbound 做 gRPC 差分」，因此加删用户既不重启内核也不掉线。
 
@@ -23,7 +23,7 @@
 - **测试位置约定**：`bui` 是 bin-only crate，P2 的全部测试都是 crate 内单元测试（`#[cfg(test)] mod tests`），共享的测试支架放 `modules/panel/testsupport.rs`（`#[cfg(test)]`）。不建 `crates/bui/tests/` 目录。
 - **不碰真实系统、不出网的铁律**：单元测试只允许接触 `tempfile` 给的临时目录；`systemctl` / `sysctl` 走 `FakeHost`；gRPC 走 `FakeXray`；hysteria 的 HTTP API 走 `FakeHy2`；HTTP 端点优先用 `tower::ServiceExt::oneshot` 直接打 Router。口径是「**不出网、只允许进程内回环**」，不是「一律不许监听端口」——Task 5 第 1 步的假 hysteria 是进程内 `127.0.0.1:0`（内核分配随机端口）的 `tokio::net::TcpListener`，Task 4 与 Task 5 各有一条连 `127.0.0.1:1`（必然连不上）的报错/超时测试，Task 1 的 `the_clients_report_errors_instead_of_pretending_and_only_dial_a_dead_port` 同样只拨 `127.0.0.1:1`，这几处合法，**不得以本约束为由删掉**。反过来也是铁律：**任何测试都不许拨 `127.0.0.1:10085` / `:9999` / `:9998`**——`QueryStats(reset=true)` 会把线上 Xray 计数器清零，`/traffic?clear=1` 会把 hysteria 的流量账取走。真实内核联调留给 M1 / M3 里程碑验收（bwg-rick）。
 - **总纲 C2 的裁决口径只许改 P1 两处**：`serve.rs` 的 `modules()` 追加一行（**T13** 做，与三个方法的接线同一个 commit；同时把那条六模块断言改成子集断言，见 D14）、`modules/mod.rs` 追加一行 `pub mod panel;`（T1）。总纲「裁决记录」（2026-09-12）另外批准了两处：`reconcile/mod.rs` 的 `Module` trait 追加带默认实现的 `public_routes()` 与 `api/mod.rs` 的 `router()` 在 `require_admin` 外合并它（**裁决 D1**，裁决原文「这是 P2 唯一可改的 P1 文件对，改动限于这两处」，由**独立的 Task 0** 落地）、`main.rs` 的 `Command::AuthHook` 那一支（D3，P1 Task 1 已在代码注释里预授权）。`api/health.rs` **一个字都不改**（裁决 D2 不批准）：用户与流量摘要走 `GET /api/stats`（v3 既有契约）与新增的 `GET /api/users/health`（T8）。详见「P1 边界」一节。
-- v3 的 `server/`、`web/server.js`、`b-ui-client.sh` 在 P2 期间**只读**（移植参照），不修改、不删除（P5 最后一个任务才删）。唯一例外是 `web/app.js` 的创建用户那一处（spec §4.3 改动 1，Task 11）。
+- v3 的 `server/`、`web/server.js`、`b-ui-client.sh` 在 P2 期间**只读**（移植参照），不修改、不删除（P5 最后一个任务才删）。唯一例外是 `web/app.js` 的两处（`login()` 删 localStorage `ap`、`addUser()` 改 POST；spec §4.3 改动 1，Task 11）。
 - 前端 `web/{index.html,style.css,logo.jpg,qrcode.min.js}` 一个字都不改：**因此 `/api/users`、`/api/config`、`/api/stats`、`/api/online`、`/api/hy2/watchdog/status` 必须按 v3 的字段名与形状回包**（见「v3 端点逐个契约」表）。
 
 ---
@@ -71,7 +71,7 @@ crates/bui/src/modules/panel/api_public.rs     /api/sub /api/subscription /api/c
 crates/bui/src/modules/panel/api_me.rs         /api/me/* 的 501 桩（T10）
 crates/bui/src/modules/panel/assets.rs         rust-embed 前端 5 文件 + 引导脚本（T11）
 crates/bui/src/modules/panel/packages.rs       客户端包缓存 + /packages/*（T12）
-web/app.js                                     只改 addUser() 那一处（T11）
+web/app.js                                     两处：login() 删 localStorage `ap`、addUser() 改 POST（T11）
 ```
 
 **T1 一次建齐 `modules/panel/` 下的全部桩文件**（照 P1 Task 1 的做法）：`panel/mod.rs` 把 `pub mod` 行一次写全，其余文件内容只有一行 `//! placeholder filled by Task N`。这样后续任务只填自己的文件，并行合并零冲突，任何单个任务合并后 workspace 都能编译。
@@ -236,7 +236,7 @@ bui_schema::render::subscription::{uri_list(&[Node], username: &str) -> String,
 | 13 | `PUT /api/users/<user>` | `web/app.js:271-281` | `web/server.js:1977-2066` | `{"username","password"?,"days","traffic","monthly","speed"}`（days = 天数、traffic/monthly = GB、speed = Mbps） → `{"success":true,"user"}` | **保留，语义不变**（`speed` 忽略，决策 D13）（T8） |
 | 14 | `GET /api/stats` | `web/app.js:114` | `web/server.js:2068` | → `{"<用户名>":{"tx":n,"rx":n}}`（hysteria `/traffic` 与 `xray api stats` 合并） | **保留形状**，改为进程内共享缓存（审计 eff-C1~C4、web-C3/C4：住宅 9998 也读、fusion 用户也计）（T7/T8） |
 | 15 | `GET /api/online` | `web/app.js:114` | `web/server.js:2069` | → `{"<用户名>":n}`（n = 连接数） | **保留形状**：两个 `/online` 并集 ∪ 30 秒内有 Xray 增量的用户（T7/T8） |
-| 16 | `POST /api/kick` | `web/app.js:218` | `web/server.js:2070` | `["<用户名>"]` → `true`（v3 直接把布尔透传） | **保留**，改回 JSON：`{"success":bool}`；内部把用户名映射成 `user_id` 再 POST 到两个 hysteria 的 `/kick`（体 `["<user_id>"]`，H12）（T8） |
+| 16 | `POST /api/kick` | `web/app.js:218` | `web/server.js:2070` | `["<用户名>"]` → `true`（v3 直接把布尔透传） | **保留**，改回 JSON：`{"success":bool,"kicked":n}`（`n` = 认得出的用户名个数，认不出的静默跳过）；内部把用户名映射成 `user_id` 再 POST 到两个 hysteria 的 `/kick`（体 `["<user_id>"]`，H12）（T8） |
 | 17 | `GET /api/config` | `web/app.js:105`、`531` | `web/server.js:392-489`（`getConfig`）、`2071` | → `{"domain","port"(字符串),"xrayPort","pubKey","shortId","sni","portHopping":{"enabled","start","end"},"obfs":{"enabled","type","password"}}` | **保留，形状不变**，数据源从「解析 config.yaml / xray-config.json」改成读 `state`（T8） |
 | 18 | `GET /api/port-hopping` | `web/app.js:507` | `web/server.js:2074-2092` | → `{"enabled","start","end"}` | **保留**，真源改为 `state.node.ports.hy2_hop`（T8） |
 | 19 | `POST /api/port-hopping` | `web/app.js:523` | `web/server.js:2093-2152` | `{"enabled","start","end"}` → `{"success":true,"enabled","start","end"}`；**v3 写的是 iptables REDIRECT**（审计 web-C13） | **重写**：改 `state.node.ports.hy2_hop` + `Event::StateChanged("ports")`，由对账重写 `config.yaml` 的 `listen:` 行并重启 `hysteria-server`；**不产生任何 iptables 规则**（spec §3.1）（T8） |
@@ -7068,7 +7068,7 @@ git commit -m "feat(panel): PanelModule 接线（管理员/公开路由 + 三个
 | §3.2 快照在用户变更、限额变化时原子重写；形状照总纲 C5 | Task 2（`Snapshot` / `write_if_changed`）+ Task 6（`sync_users` 第 ① 步）+ Task 7（每轮 `tick` 调 `sync_now`） |
 | §3.2 `userpass` 退路开关「M3 就实现好」 | **不在 P2，且目前无任务承接**：它要改 `bui_schema::render::hysteria`（把 `auth.type` 从 `command` 切回 `userpass` 并写用户表）+ P1 的重启映射，属 P0/P1 范围。总纲把 M3 归 P2，**不指派就是 M3 验收缺项** ⇒ 见「待裁决与需落字」第 1 条 |
 | §3.3 tonic + vendored 10 个 proto；AddUser/RemoveUser 两层 TypedMessage；`email = user_id`；`QueryStats(pattern="user>>>", reset=true)`；CLI 退路 `xray api rmu` | Task 4（proto / `add_user_request` / `remove_user_request` / `deltas_from_stats` / `rmu_args`）+ Task 6（差分与退路调用点） |
-| §3.3 `RemoveUser` 不断既有连接（接受该窗口，调研 X10） | 计划「渲染边界」一节的 D6 + Task 6 的无条件 RemoveUser 与 `NRestarts` 重放；**面板说明文案不在前端**（前端只改一处是硬约束），归 M3 验收清单 ⇒ 见「待裁决与需落字」第 2 条 |
+| §3.3 `RemoveUser` 不断既有连接（接受该窗口，调研 X10） | 计划「渲染边界」一节的 D6 + Task 6 的无条件 RemoveUser 与 `NRestarts` 重放；**面板说明文案不在前端**（前端只改 `app.js` 那两处是硬约束），归 M3 验收清单 ⇒ 见「待裁决与需落字」第 2 条 |
 | §4.1 用户 CRUD：state 变更 → 快照重写 + gRPC 增删，用户变更不重启内核 | Task 8（handler 改 state + 发事件）+ Task 6（反应器）；不重启由 P1 Task 10 的 `structural_hash` 保证 |
 | §4.1 v3 `protocol` ↔ 权益映射、`nodes_for` 是唯一节点来源 | Task 6（`protocol_label` / `protocols_from_label`）+ Task 9（四个端点都调 `nodes_for`） |
 | §4.1 订单与 SKU 只定义结构不实现 | P0 已定义 `Order` / `CatalogItem`；Task 10 的 `/api/me/orders*` 是 501 桩 |
@@ -7129,7 +7129,7 @@ git commit -m "feat(panel): PanelModule 接线（管理员/公开路由 + 三个
 | # | 事项 | spec 依据 | 本计划的处置 | 需要的裁决 |
 |---|---|---|---|---|
 | 1 | `auth.type` 从 `command` 切回 `userpass` 的**配置开关** | §3.2、§11 明写「`userpass` 退路必须在 M3 就以配置开关实现好」 | **无任务承接**：要改 `bui_schema::render::hysteria`（写用户表）与 P1 的重启映射，都在 P2 的改动许可之外 | **指派**给 P0 + P1（各一个新任务），并给出 M3 前的完成时点。不指派 ⇒ M3 验收缺这一项，请在裁决记录里写明「M3 接受缺此项」 |
-| 2 | 面板说明「超限/到期用户的既有连接可能延续到其断开」 | §3.3（成因见调研 X10：xray 的 `RemoveUser` 不断已建连接，hysteria 侧同理） | 因「前端一个字都不改，只动 `web/app.js` 的 `addUser()`」是硬约束，本计划把这句话推到 `docs/superpowers/checks/` 的 M3 清单，**前端里不会出现** | **确认接受**「说明只在文档、不在界面」。若要求上界面，请批准 P2 多改一处 `web/index.html`（T11 加一条 DOM 断言测试） |
+| 2 | 面板说明「超限/到期用户的既有连接可能延续到其断开」 | §3.3（成因见调研 X10：xray 的 `RemoveUser` 不断已建连接，hysteria 侧同理） | 因「前端界面一个字都不改，只动 `web/app.js` 的那两处」是硬约束，本计划把这句话推到 `docs/superpowers/checks/` 的 M3 清单，**前端里不会出现** | **确认接受**「说明只在文档、不在界面」。若要求上界面，请批准 P2 多改一处 `web/index.html`（T11 加一条 DOM 断言测试） |
 | 3 | 月度重置的时区 | §4.2 写「服务器本地时间每月 1 日 00:00」 | 决策 D7：用 `host.now()`（`now_utc`）算 `month_key` ⇒ 按 **UTC 月初**重置 | **落字**：两台机时区就是 UTC、零差异，接受 UTC 口径；或指定东八区（改 `users::month_key` 一处 + 三条测试） |
 | 4 | `xray-config.json` 只写当前有效用户 | §4.2「超限/到期 → Xray RemoveUser」的长期正解 | 决策 D6 的长期修法两条（P0 加派生字段 / P1 Task 10 过滤）都超出 P2 许可。P2 这一版靠「无条件 RemoveUser + `NRestarts` 重放 + 60 秒安全网」兜住运行期，**xray 重启到下一轮同步之间仍有一个窗口** | **裁决**走 (a) 还是 (b)，指派到 P0 或 P1；或明确「接受这个重启窗口，不做长期修法」 |
 | 5 | spec 未明写的行为变更（五条） | — | D5：`POST /api/bandwidth` → 501（GET 恒 `{"up":0,"down":0}`）；D8：客户端 `client_sing_box` 与 `sing_box` 版本不一致只 `warn!` 并仍缓存；D11：改管理员密码同时轮换 `jwt_secret`（旧 token 立刻失效）；D13：`sni` / `speed` 接受但忽略，`/api/users` 投影里不再有 `limits.speedLimit`；D9 / D10：删 `/api/version`、`/api/kernel-versions`、`GET /packages` 目录列表 | 五条都是合理处置，但**都不是 spec 写过的**，请在裁决记录里逐条落字。D9 / D10 另带一条运维前提：**服务端切 v4 前先给客户端装 `bui-c`**（旧 v3 `b-ui-client.sh` 会调这些端点，见「P1 边界」一节末尾），写进 M1 / M4 清单 |
