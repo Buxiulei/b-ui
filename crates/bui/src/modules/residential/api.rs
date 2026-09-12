@@ -145,6 +145,8 @@ pub struct StatusResponse {
     /// 上一行对应的成员 tag，由 `clash::tag_of` 现算（面板显示用，不做主键）
     pub active_tag: Option<String>,
     pub selected_pending_persist: bool,
+    /// UDP 走不走住宅出口（全 socks5 池才走，见 [`ResidentialGroup::udp_via_pool`]）
+    pub udp_via_residential: bool,
     pub checking: Option<state::Checking>,
     pub blacklist: BlacklistCounts,
     pub upstreams: Vec<UpstreamRow>,
@@ -221,6 +223,8 @@ pub struct HealthResponse {
     pub egress_ip_type: String,
     pub via_proxy_isp: Option<String>,
     // v4 追加
+    /// 同 [`StatusResponse::udp_via_residential`]
+    pub udp_via_residential: bool,
     pub alerts: Vec<String>,
     pub last_daily_at: Option<String>,
     pub notes: Vec<String>,
@@ -593,6 +597,7 @@ pub fn status_of(s: &SchemaState, r: &state::ResiRuntime) -> StatusResponse {
         // tag 现算：runtime 存的是 uuid，池增删后同一个 resi-N 可能已指向别人（§C）
         active_tag: r.selected_upstream_id.and_then(|id| clash::tag_of(&g, id)),
         selected_pending_persist: r.selected_pending_persist,
+        udp_via_residential: g.udp_via_pool(),
         checking: r.checking.clone(),
         blacklist: BlacklistCounts {
             pins: g.blacklist.pins.len(),
@@ -895,6 +900,7 @@ async fn get_health(State(app): State<AppState>) -> ApiResult {
         current_egress_ip_test: None,
         egress_ip_type: "unknown".into(),
         via_proxy_isp: None,
+        udp_via_residential: g.udp_via_pool(),
         alerts: state::visible_alerts(&g, &r),
         last_daily_at: r.last_daily_at.clone(),
         notes: health_notes(),
@@ -1441,6 +1447,39 @@ mod tests {
         h.host.advance(61);
         let (st3, _) = call(&h.app, "POST", "/api/residential/health/check", None).await;
         assert_eq!(st3, StatusCode::OK);
+    }
+
+    /// UDP 能不能经住宅出口要在 status / health 上看得见：夹具是 http 上游 ⇒ 否；
+    /// 全池换成 socks5 ⇒ 是（relay 渲染同一判据）。
+    #[tokio::test]
+    async fn status_and_health_report_whether_udp_goes_through_the_pool() {
+        let d = tempfile::tempdir().unwrap();
+        let h = harness(&d).await;
+        let (_, v) = call(&h.app, "GET", "/api/residential/status", None).await;
+        assert_eq!(v["udp_via_residential"], false, "池内有 http 上游 ⇒ 否");
+        let (_, v) = call(&h.app, "GET", "/api/residential/health", None).await;
+        assert_eq!(v["udp_via_residential"], false);
+
+        rstate::update_group(&h.ctx.store, &h.ctx.bus, |g| {
+            for u in &mut g.upstreams {
+                u.kind = bui_schema::model::UpstreamKind::Socks5;
+            }
+        })
+        .await
+        .unwrap();
+        let (_, v) = call(&h.app, "GET", "/api/residential/status", None).await;
+        assert_eq!(v["udp_via_residential"], true, "全 socks5 池 ⇒ 是");
+        let (_, v) = call(&h.app, "GET", "/api/residential/health", None).await;
+        assert_eq!(v["udp_via_residential"], true);
+
+        // 池关掉时 UDP 根本不经住宅
+        rstate::update_group(&h.ctx.store, &h.ctx.bus, |g| g.enabled = false)
+            .await
+            .unwrap();
+        let (_, v) = call(&h.app, "GET", "/api/residential/status", None).await;
+        assert_eq!(v["udp_via_residential"], false);
+        let (_, v) = call(&h.app, "GET", "/api/residential/health", None).await;
+        assert_eq!(v["udp_via_residential"], false);
     }
 
     #[tokio::test]

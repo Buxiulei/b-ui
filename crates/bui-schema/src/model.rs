@@ -267,6 +267,21 @@ impl ResidentialGroup {
     pub fn pool_active(&self) -> bool {
         self.enabled && !self.upstreams.is_empty()
     }
+
+    /// UDP 能不能经住宅出口：池有效且**每一条**上游都是 socks5。
+    ///
+    /// socks5 上游的 UDP ASSOCIATE 可用（2026-09-12 实测 Decodo Dedicated ISP：
+    /// YouTube / Google / Cloudflare 的 HTTP/3 握手全通，STUN 看到的源 IP 是住宅出口；
+    /// 唯一约束是一次关联只服务第一个目标地址，而 sing-box 的 socks 出站每个 packet
+    /// conn 一次关联，QUIC 单目标无影响）。http 出站在 sing-box 里没有 UDP 能力，
+    /// selector 选到它会直接报错，所以池里只要混进一条 http 就整池不走 UDP。
+    pub fn udp_via_pool(&self) -> bool {
+        self.pool_active()
+            && self
+                .upstreams
+                .iter()
+                .all(|u| matches!(u.kind, UpstreamKind::Socks5))
+    }
 }
 
 /// 住宅分流模式。

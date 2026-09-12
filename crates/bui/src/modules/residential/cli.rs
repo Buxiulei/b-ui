@@ -227,6 +227,18 @@ fn pct(v: &serde_json::Value, k: &str) -> i64 {
 }
 
 /// `status` 的人类可读渲染。**只读**传入的 JSON 字段，绝不打印 `password`（服务端也不回它）。
+/// status / health 共用的一行：sing-box 的 http 出站没有 UDP 能力，池里混一条就整池不走 UDP。
+fn udp_line(v: &serde_json::Value) -> String {
+    format!(
+        "UDP 经住宅：{}（池内含 http 上游时为否）",
+        if as_bool(v, "udp_via_residential") {
+            "是"
+        } else {
+            "否"
+        }
+    )
+}
+
 pub fn format_status(v: &serde_json::Value) -> String {
     let mut out = vec![format!(
         "总开关：{}",
@@ -258,6 +270,7 @@ pub fn format_status(v: &serde_json::Value) -> String {
         as_str(v, "active_tag"),
         as_str(v, "active_upstream_id")
     ));
+    out.push(udp_line(v));
     if as_bool(v, "selected_pending_persist") {
         out.push("  自动切换后的落点尚未持久化，将在每日 04:00 写回".to_string());
     }
@@ -314,6 +327,7 @@ pub fn format_health(v: &serde_json::Value) -> String {
         selected,
     )];
     out.push(format!("分流关键字 {} 条", as_u64(v, "domains_count")));
+    out.push(udp_line(v));
     out.push(format!(
         "当前出口 IP：{}（{}）",
         v.get("current_egress_ip_test")
@@ -911,6 +925,25 @@ mod tests {
             out.contains("软封锁"),
             "局限说明要出现在 CLI 输出里（spec §5.4）"
         );
+    }
+
+    /// status / health 都要有一行「UDP 经住宅」，运维一眼看出池里混了 http 上游的代价。
+    #[test]
+    fn the_formatters_spell_out_whether_udp_goes_through_the_pool() {
+        let line = |yes: bool| {
+            format!(
+                "UDP 经住宅：{}（池内含 http 上游时为否）",
+                if yes { "是" } else { "否" }
+            )
+        };
+        let s = format_status(&serde_json::json!({"udp_via_residential": true}));
+        assert!(s.contains(&line(true)), "{s}");
+        let s = format_status(&serde_json::json!({"udp_via_residential": false}));
+        assert!(s.contains(&line(false)), "{s}");
+        let hh = format_health(&serde_json::json!({"udp_via_residential": true}));
+        assert!(hh.contains(&line(true)), "{hh}");
+        let hh = format_health(&serde_json::json!({"udp_via_residential": false}));
+        assert!(hh.contains(&line(false)), "{hh}");
     }
 
     #[test]
