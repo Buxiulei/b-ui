@@ -3,12 +3,9 @@
 //!
 //! 对 P1 只暴露一个 [`PanelModule`]（`reconcile::Module` 的实现）。
 //!
-//! ⚠️ 本子树整体带一条 `allow(dead_code)`：Task 1 只交付「契约面」——`Shared` 的各把锁、
-//! [`Applied`] / [`SampleCache`] 的字段、`XRAY_INBOUND_TAGS` 等常量、`testsupport` 的几个
-//! 挂载 helper，调用方都在 Task 2…Task 13。P1 的 crate 级 allow 只作用于 `not(test)`
-//! 构建（见 `main.rs` 文首），而本子树的绝大多数消费方是单元测试，所以那条盖不住这里。
-//! **Task 13 收口时整条删掉**：届时每一项都该有真实调用方，删不掉就说明有真正的死代码。
-#![allow(dead_code)]
+//! Task 1 留的子树级 `#![allow(dead_code)]` 已在 Task 13 收口时删掉：契约面的每一项
+//! （`Shared` 的各把锁、[`Applied`] / [`SampleCache`] 的字段、常量、`testsupport` 的挂载
+//! helper）都有了真实调用方。以后这里再出 dead_code 告警就是真正的死代码，直接删符号。
 
 pub mod api_admin;
 pub mod api_me;
@@ -247,18 +244,26 @@ impl Module for PanelModule {
     }
 
     fn routes(&self) -> axum::Router<AppState> {
-        // Task 13 接线
-        axum::Router::new()
+        api_admin::routes(self.shared.clone())
     }
 
     fn public_routes(&self) -> axum::Router<AppState> {
-        // Task 13 接线
-        axum::Router::new()
+        api_public::public_routes(self.shared.clone())
+            .merge(api_me::public_routes(self.shared.clone()))
+            .merge(assets::public_routes(self.shared.clone()))
+            .merge(packages::public_routes(self.shared.clone()))
     }
 
-    fn spawn(&self, _ctx: DaemonCtx) -> Vec<tokio::task::JoinHandle<()>> {
-        // Task 13 接线
-        Vec::new()
+    /// 三个后台任务，顺序固定：①10 秒采样 ②用户同步反应器（事件驱动 + 60 秒）③每日包缓存。
+    fn spawn(&self, ctx: DaemonCtx) -> Vec<tokio::task::JoinHandle<()>> {
+        self.shared.set_paths(&ctx.paths);
+        let fetcher: Arc<dyn crate::kernels::Fetcher> =
+            Arc::new(crate::kernels::HttpFetcher::new());
+        vec![
+            tokio::spawn(traffic::sampling_loop(ctx.clone(), self.shared.clone())),
+            tokio::spawn(users::sync_loop(ctx.clone(), self.shared.clone())),
+            tokio::spawn(packages::cache_loop(ctx, self.shared.clone(), fetcher)),
+        ]
     }
 }
 
@@ -332,6 +337,8 @@ mod tests {
         assert_eq!(arts, Vec::new());
         // render 顺带把 paths 交给 Shared（handler 要用 <base>/packages）
         assert_eq!(h.shared.paths().base_dir, h.paths.base_dir);
+        // 铁律锁：整套支架只活在 tempfile 的临时目录里，`Harness::dir` 就是它的存活守卫
+        assert_eq!(h.paths.base_dir.as_path(), h.dir.path());
     }
 
     #[tokio::test]
@@ -413,5 +420,156 @@ mod tests {
         let dead_xray = super::xray::XrayClient::with_addr("127.0.0.1:1");
         assert!(XrayApi::query_user_deltas(&dead_xray).await.is_err());
         assert!(Hy2Api::online(&k, 1).await.is_err(), "端口 1 上没人听");
+    }
+
+    #[tokio::test]
+    async fn routes_cover_every_admin_endpoint_and_nothing_public() {
+        let h = testsupport::harness().await;
+        let router =
+            testsupport::mount(&h.app, PanelModule::with_shared(h.shared.clone()).routes());
+        // 受保护路由在这里是裸挂的（没套 require_admin），只验「路由存在」
+        for (m, p) in [
+            ("GET", "/api/users"),
+            ("GET", "/api/stats"),
+            ("GET", "/api/online"),
+            ("GET", "/api/config"),
+            ("GET", "/api/masquerade"),
+            ("GET", "/api/bandwidth"),
+            ("GET", "/api/port-hopping"),
+            ("GET", "/api/hy2/watchdog/status"),
+            ("GET", "/api/users/health"),
+        ] {
+            let (s, _) = testsupport::send(&router, m, p, None, None).await;
+            assert_ne!(s, axum::http::StatusCode::NOT_FOUND, "{m} {p} 没挂上");
+        }
+        // 公开端点不该出现在 routes() 里
+        for p in [
+            "/api/sub/alice",
+            "/api/nodes/alice",
+            "/",
+            "/packages/manifest.json",
+            "/api/me",
+        ] {
+            let (s, _) = testsupport::send(&router, "GET", p, None, None).await;
+            assert_eq!(
+                s,
+                axum::http::StatusCode::NOT_FOUND,
+                "{p} 应该在 public_routes 里"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn public_routes_cover_subscriptions_front_end_packages_and_the_user_domain() {
+        let h = testsupport::harness().await;
+        let router = testsupport::mount(
+            &h.app,
+            PanelModule::with_shared(h.shared.clone()).public_routes(),
+        );
+        for p in [
+            "/",
+            "/index.html",
+            "/app.js",
+            "/style.css",
+            "/qrcode.min.js",
+            "/logo.jpg",
+            "/api/sub/alice",
+            "/api/subscription/alice",
+            "/api/clash/alice",
+            "/api/nodes/alice",
+            "/api/install-command",
+            "/api/me",
+            "/api/me/billing",
+        ] {
+            let (s, _) = testsupport::send(&router, "GET", p, None, None).await;
+            assert_ne!(s, axum::http::StatusCode::NOT_FOUND, "{p} 没挂上");
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_starts_three_tasks_and_hands_the_paths_to_shared() {
+        let h = testsupport::harness().await;
+        let s = Shared::new(
+            Box::new(super::fakes::FakeXray::new()),
+            Box::new(super::fakes::FakeHy2::new()),
+        );
+        let m = PanelModule::with_shared(std::sync::Arc::new(s));
+        let ctx = crate::reconcile::DaemonCtx {
+            store: h.store.clone(),
+            runtime: h.runtime.clone(),
+            bus: h.app.bus.clone(),
+            host: h.host.clone(),
+            paths: h.paths.clone(),
+        };
+        let handles = m.spawn(ctx);
+        assert_eq!(handles.len(), 3, "采样 / 用户同步 / 包缓存");
+        assert_eq!(m.shared().paths().base_dir, h.paths.base_dir);
+        // 让第一轮跑完再收摊，确认三个任务都没有立刻 panic
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        for hd in &handles {
+            assert!(!hd.is_finished(), "后台任务不该自己结束");
+        }
+        for hd in handles {
+            hd.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn the_panel_module_is_registered_in_serve_modules() {
+        let reg = crate::serve::modules(None);
+        assert!(
+            reg.modules.iter().any(|m| m.name() == MODULE_NAME),
+            "serve::modules() 里没有 panel：{:?}",
+            reg.modules.iter().map(|m| m.name()).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_user_health_endpoint_reports_the_summary_after_one_sampling_tick() {
+        let h = testsupport::harness().await;
+        let ctx = crate::reconcile::DaemonCtx {
+            store: h.store.clone(),
+            runtime: h.runtime.clone(),
+            bus: h.app.bus.clone(),
+            host: h.host.clone(),
+            paths: h.paths.clone(),
+        };
+        traffic::tick(&ctx, &h.shared).await.unwrap();
+        traffic::write_health_summary(&ctx, &h.shared).await;
+        // 裁决 D2：摘要从 T8 的 `GET /api/users/health` 读，`/api/health` 不加用户段
+        let router = h.router();
+        let tok = testsupport::token(&h).await;
+        let (s, users) =
+            testsupport::send(&router, "GET", "/api/users/health", Some(&tok), None).await;
+        assert_eq!(s, axum::http::StatusCode::OK);
+        assert_eq!(users["total"], 1);
+        assert_eq!(users["blocked"], 0);
+        assert_eq!(users["month_key"], "2026-09");
+        // 回归锁：P1 的 `HealthResponse` 一个字都没改，`/api/health` 里不该出现用户段
+        let out = crate::api::health::get(axum::extract::State(h.app.clone())).await;
+        let raw = serde_json::to_value(&out.0).unwrap();
+        assert!(
+            raw.get("users").is_none(),
+            "裁决 D2 不批准给 /api/health 加用户段：{raw}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_full_router_serves_the_panel_login_and_a_subscription() {
+        let h = testsupport::harness().await;
+        let router = h.router();
+        // 前端无鉴权
+        let (s_index, _) = testsupport::text(&router, "/").await;
+        assert_eq!(s_index, axum::http::StatusCode::OK);
+        // 订阅无鉴权
+        let (s_sub, _) = testsupport::text(&router, "/api/sub/alice").await;
+        assert_eq!(s_sub, axum::http::StatusCode::OK);
+        // 管理员端点要 token
+        let (s_401, _) = testsupport::send(&router, "GET", "/api/users", None, None).await;
+        assert_eq!(s_401, axum::http::StatusCode::UNAUTHORIZED);
+        let tok = testsupport::token(&h).await;
+        let (s_ok, v) = testsupport::send(&router, "GET", "/api/users", Some(&tok), None).await;
+        assert_eq!(s_ok, axum::http::StatusCode::OK);
+        assert_eq!(v[0]["username"], "alice");
     }
 }

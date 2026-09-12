@@ -51,7 +51,8 @@ pub fn modules(manifest: Option<Manifest>) -> Registry {
             Arc::new(SshModule),
             Arc::new(CertsModule),
             Arc::new(WatchdogModule),
-            // P2 在此追加 UsersModule（面板 API + 采样 + auth 快照）
+            // P2：面板 API + 采样 + auth 快照 + Xray gRPC
+            Arc::new(crate::modules::panel::PanelModule::new()),
             Arc::new(crate::modules::residential::ResidentialModule::new()),
         ],
         manifest: handle,
@@ -1028,6 +1029,7 @@ mod tests {
             "ssh",
             "certs",
             "watchdog",
+            "panel",
             "residential",
         ] {
             assert!(

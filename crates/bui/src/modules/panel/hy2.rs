@@ -271,6 +271,8 @@ mod tests {
     async fn online_and_kick_use_the_documented_shapes_and_a_bare_secret_header() {
         let (port, mut rx) = fake_hysteria(r#"{"u-1":3}"#).await;
         let c = Hy2Client::new().with_secret("s3cr3t");
+        assert_eq!(c.secret(), "s3cr3t", "with_secret 必须真的换掉默认空串");
+        assert_eq!(Hy2Client::new().secret(), super::super::HY2_STATS_SECRET);
         assert_eq!(c.online(port).await.unwrap()["u-1"], 3);
         let req = rx.recv().await.unwrap();
         assert!(req.starts_with("GET /online HTTP/1.1"), "{req}");
