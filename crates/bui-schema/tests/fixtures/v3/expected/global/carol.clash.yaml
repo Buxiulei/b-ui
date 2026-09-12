@@ -9,8 +9,22 @@ tcp-concurrent: true
 find-process-mode: strict
 global-client-fingerprint: chrome
 
+ipv6: true
+
+# 以下 tun/ipv6/IP-CIDR6 三处为 v4 在 v3 输出之上新增（2026-09-12 裁决），其余与 v3 一字不差
+tun:
+  stack: mixed
+  auto-route: true
+  strict-route: true
+  auto-detect-interface: true
+  inet6-address:
+    - fdfe:dcba:9876::1/126
+  dns-hijack:
+    - any:53
+
 dns:
   enable: true
+  ipv6: false
   enhanced-mode: fake-ip
   fake-ip-range: 198.18.0.1/16
   fake-ip-filter:
@@ -68,4 +82,7 @@ rules:
   - GEOIP,private,DIRECT,no-resolve
   - GEOSITE,cn,DIRECT
   - GEOIP,cn,DIRECT,no-resolve
+  - IP-CIDR6,fc00::/7,DIRECT,no-resolve
+  - IP-CIDR6,fe80::/10,DIRECT,no-resolve
+  - IP-CIDR6,::/0,REJECT,no-resolve
   - MATCH,住宅自动

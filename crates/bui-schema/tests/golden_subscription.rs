@@ -74,6 +74,109 @@ fn clash_matches_v3() {
     }
 }
 
+/// Clash 订阅的 IPv6 接管字段——v3 没有，v4 在 v3 golden 之上**新增**（2026-09-12 裁决）。
+///
+/// 字段名与语法以 mihomo 文档为准：`tun.stack` / `auto-route` / `strict-route` /
+/// `auto-detect-interface` / `inet6-address` / `dns-hijack`（wiki.metacubex.one/config/inbound/tun/）、
+/// 顶层与 `dns` 下的 `ipv6`（/config/general/、/config/dns/）、`IP-CIDR6` 与 `no-resolve`
+/// （/config/rules/）。目标客户端是 v2rayN 7.x 内置 mihomo 与 Clash Verge。
+///
+/// 语义对应 sing-box 订阅（`docs/superpowers/specs/2026-09-10-ipv6-takeover-design.md` §2/§3.1）：
+/// `ip_is_private ⇒ direct` ↔ `IP-CIDR6,fc00::/7|fe80::/10,DIRECT`，
+/// `ip_version 6 ⇒ reject` ↔ `IP-CIDR6,::/0,REJECT`；TUN v6 地址与 sing-box 侧同源。
+/// `tun.enable` 故意不下发：TUN 开关归客户端（v2rayN / Clash Verge）自己管。
+///
+/// 顶层 `ipv6` 必须为 `true`：mihomo `config/config.go parseIPV6()` 在
+/// `!rawCfg.IPv6` 时把 `Tun.Inet6Address` 置 nil，`ipv6: false` 会让下面的
+/// `inet6-address` 失效、`auto-route` 不装 `::/0`，裸 v6 进不了隧道。AAAA 由
+/// `dns.ipv6: false` 关闭（`hub/executor updateDNS()`：`ipv6 = dns.ipv6 && general.ipv6`）。
+#[test]
+fn clash_declares_ipv6_takeover() {
+    for mode in MODES {
+        let s = common::state(mode);
+        let split = split_of(&s);
+        for u in USERS {
+            let nodes = nodes_of(&s, u);
+            let doc: serde_yaml::Value =
+                serde_yaml::from_str(&subscription::clash(&nodes, u, &split)).unwrap();
+            let ctx = format!("mode={mode} user={u}");
+
+            assert_eq!(doc["ipv6"], serde_yaml::Value::Bool(true), "{ctx}");
+            assert_eq!(doc["dns"]["ipv6"], serde_yaml::Value::Bool(false), "{ctx}");
+
+            let tun = doc["tun"].as_mapping().expect("tun 段");
+            // enable 归客户端自己开关，订阅不写
+            assert!(
+                !tun.contains_key(serde_yaml::Value::from("enable")),
+                "{ctx}"
+            );
+            // inet4-address 是 mihomo 忽略的死配置（RawTun 里已注释掉，parseTun 由
+            // dns.fake-ip-range 推 /30），不写
+            assert!(
+                !tun.contains_key(serde_yaml::Value::from("inet4-address")),
+                "{ctx}"
+            );
+            assert_eq!(
+                doc["tun"]["stack"],
+                serde_yaml::Value::from("mixed"),
+                "{ctx}"
+            );
+            for k in ["auto-route", "strict-route", "auto-detect-interface"] {
+                assert_eq!(
+                    doc["tun"][k],
+                    serde_yaml::Value::Bool(true),
+                    "{ctx} key={k}"
+                );
+            }
+            assert_eq!(
+                doc["tun"]["inet6-address"]
+                    .as_sequence()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                vec!["fdfe:dcba:9876::1/126"],
+                "{ctx}"
+            );
+            assert_eq!(
+                doc["tun"]["dns-hijack"]
+                    .as_sequence()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                vec!["any:53"],
+                "{ctx}"
+            );
+
+            // 三条 IPv6 规则紧贴最终 MATCH 之前、既有直连/分流规则之后
+            let rules: Vec<&str> = doc["rules"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
+            let tail = &rules[rules.len() - 4..];
+            assert_eq!(
+                tail[..3],
+                [
+                    "IP-CIDR6,fc00::/7,DIRECT,no-resolve",
+                    "IP-CIDR6,fe80::/10,DIRECT,no-resolve",
+                    "IP-CIDR6,::/0,REJECT,no-resolve",
+                ],
+                "{ctx}"
+            );
+            assert!(tail[3].starts_with("MATCH,"), "{ctx} tail={tail:?}");
+            assert!(
+                rules[..rules.len() - 4]
+                    .iter()
+                    .all(|r| !r.starts_with("IP-CIDR6") && !r.starts_with("MATCH")),
+                "{ctx}"
+            );
+        }
+    }
+}
+
 /// golden 里每一行 URI 都能被 `parse::node_uri` 解回同一个节点（label 带 `{user}-` 前缀）。
 #[test]
 fn uri_list_round_trips_through_node_uri_parser() {

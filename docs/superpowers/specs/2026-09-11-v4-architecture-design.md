@@ -189,7 +189,7 @@ tonic 客户端，proto 从 Xray-core `v26.3.27` vendor 进仓（以仓库根为
 
 ### 4.4 订阅
 
-三种订阅与 v3 逐项等价（节点集、端口、UUID、密码、标签、`mport=`、obfs 参数、住宅分流规则），由 `bui-schema` 从同一节点列表渲染；唯一有意的差异：v3 对「单协议 + 住宅」用户只发住宅版节点，v4 按权益（`direct=true`）多发一个直连版——等价口径是「v3 有的节点逐项相等」（P0 golden 测试的 `v3_nodes_only` 过滤）；sing-box JSON 保持 1.12–1.14 兼容子集（typed DNS、TUN `address` 数组、rule action、无 `rule_set`）。CI 用 v3 抓取的脱敏样本做 golden 比对（§8）。
+三种订阅与 v3 逐项等价（节点集、端口、UUID、密码、标签、`mport=`、obfs 参数、住宅分流规则），由 `bui-schema` 从同一节点列表渲染；唯一有意的差异：v3 对「单协议 + 住宅」用户只发住宅版节点，v4 按权益（`direct=true`）多发一个直连版——等价口径是「v3 有的节点逐项相等」（P0 golden 测试的 `v3_nodes_only` 过滤）；sing-box JSON 保持 1.12–1.14 兼容子集（typed DNS、TUN `address` 数组、rule action、无 `rule_set`）；Clash/mihomo YAML 另有一处有意新增（2026-09-12 裁决）：`ipv6: true` + `dns.ipv6: false` + `tun` 接管参数（`stack: mixed`、`auto-route`/`strict-route`/`auto-detect-interface`、`inet6-address`、`dns-hijack`，不下发 `enable`）+ 三条 `IP-CIDR6` 规则（ULA/link-local 直连、其余 `::/0` REJECT），与 sing-box 侧的 IPv6 接管同构。CI 用 v3 抓取的脱敏样本做 golden 比对（§8）。
 
 ---
 

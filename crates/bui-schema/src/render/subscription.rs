@@ -422,6 +422,25 @@ fn clash_proxy(node: &Node, name: &str) -> Yaml {
     }
 }
 
+/// mihomo 的 TUN 接管参数。**不下发 `enable`**：TUN 开关归客户端（v2rayN / Clash Verge）自己管。
+///
+/// v6 地址与 sing-box 订阅的 TUN `address` 同源（spec 2026-09-10-ipv6-takeover-design §3.1），
+/// 有 v6 地址 `auto-route` 才会把 `::/0` 装进 TUN 路由表，裸 v6 才进得了隧道被下面的
+/// `IP-CIDR6,::/0,REJECT` 打回、让应用回退 v4。
+///
+/// 不写 `inet4-address`：mihomo `config/config.go` 的 `RawTun` 里该字段是注释掉的，
+/// `parseTun()` 固定用 `dns.fake-ip-range` 取 /30（本配置即 `198.18.0.1/30`），写了也被忽略。
+fn clash_tun() -> Yaml {
+    ymap(vec![
+        ("stack", y("mixed")),
+        ("auto-route", y(true)),
+        ("strict-route", y(true)),
+        ("auto-detect-interface", y(true)),
+        ("inet6-address", y(["fdfe:dcba:9876::1/126"])),
+        ("dns-hijack", y(["any:53"])),
+    ])
+}
+
 fn clash_group(name: &str, members: &[String]) -> Yaml {
     ymap(vec![
         ("name", y(name)),
@@ -437,6 +456,10 @@ fn clash_group(name: &str, members: &[String]) -> Yaml {
 ///
 /// 不含 `mixed-port`（由客户端自身管理）。v3 的首部注释带生成时间，这里去掉：
 /// 期望态渲染必须可重复，带时间戳会让每次比对都判"变了"。
+///
+/// v4 在 v3 输出之上新增 IPv6 接管（2026-09-12 裁决，golden 同步补齐）：顶层 `ipv6: true`、
+/// `dns.ipv6: false`、`tun` 接管参数、三条 `IP-CIDR6` 规则，与 sing-box 订阅同构，
+/// 依据 spec 2026-09-10-ipv6-takeover-design。其余字段与 v3 逐项相同。
 pub fn clash(nodes: &[Node], username: &str, split: &SplitRules) -> String {
     let host = nodes.first().map(|n| n.host.as_str()).unwrap_or("");
 
@@ -497,10 +520,19 @@ pub fn clash(nodes: &[Node], username: &str, split: &SplitRules) -> String {
                 .map(|k| format!("DOMAIN-KEYWORD,{k},住宅自动")),
         );
     }
+    // IPv6 接管，对应 sing-box 订阅的 `ip_is_private ⇒ direct` 与 `ip_version 6 ⇒ reject`：
+    // mihomo 没有 `ip_version` 匹配器，用 IP-CIDR6 等价表达（`no-resolve` 防触发 DNS 解析）。
+    // 顺序：ULA / link-local 先直连，剩下的 v6 一律 REJECT。
+    rules.push("IP-CIDR6,fc00::/7,DIRECT,no-resolve".to_string());
+    rules.push("IP-CIDR6,fe80::/10,DIRECT,no-resolve".to_string());
+    rules.push("IP-CIDR6,::/0,REJECT,no-resolve".to_string());
     rules.push(format!("MATCH,{match_target}"));
 
     let dns = ymap(vec![
         ("enable", y(true)),
+        // AAAA 全关：mihomo `hub/executor updateDNS()` 取 `dns.ipv6 && general.ipv6`，
+        // 这里关 dns 侧即可，顶层 `ipv6` 必须留 true（见 doc 顶部与 clash_tun）。
+        ("ipv6", y(false)),
         ("enhanced-mode", y("fake-ip")),
         ("fake-ip-range", y("198.18.0.1/16")),
         (
@@ -532,6 +564,11 @@ pub fn clash(nodes: &[Node], username: &str, split: &SplitRules) -> String {
         ("tcp-concurrent", y(true)),
         ("find-process-mode", y("strict")),
         ("global-client-fingerprint", y("chrome")),
+        // 必须 true：mihomo `config/config.go parseIPV6()` 在 `!rawCfg.IPv6` 时把
+        // `Tun.Inet6Address` 置 nil，`ipv6: false` 会让 `tun.inet6-address` 失效、
+        // `auto-route` 不装 `::/0`，裸 v6 从物理网卡漏出去。AAAA 由 `dns.ipv6: false` 关。
+        ("ipv6", y(true)),
+        ("tun", clash_tun()),
         ("dns", dns),
         ("proxies", Yaml::Sequence(proxies)),
         ("proxy-groups", Yaml::Sequence(groups)),
