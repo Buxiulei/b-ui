@@ -1,0 +1,24 @@
+# musl 目标出**非 PIE** 的纯静态二进制。
+#
+# 为什么：Rust 的 *-unknown-linux-musl 默认出 static-pie，进程每次启动都要由自带的 rcrt1
+# 先把整个镜像的 R_*_RELATIVE 重定位跑一遍。`bui` 是 11.8 MB 的单体二进制，而 Hysteria2 的
+# `auth.type: command` 每条新 QUIC 连接 exec 它一次（spec §9 M5：200 建连/秒、p99 < 20ms）。
+# 2026-09-13 bwg-rick（2 vCPU Intel Sierra Forest）实测每次调用有 ≈15ms 的**固定**开销，
+# 50/s 与 200/s 的 p50 基本相同 —— 不是 CPU 饱和，就是启动开销。关掉 PIE 让内核按固定
+# 地址直接映射，省掉那一遍自重定位（本机 strace -c：execve 从 196µs 降到 ~90µs）。
+#
+# 代价：主镜像不再有 ASLR（静态二进制本来就没有 PIC 的 GOT/PLT 间接层可打；堆、栈、mmap
+# 仍然随机化）。这是为 M5 的建连延迟换的，写在这里以免以后有人当成手滑删掉。
+#
+# 作用面：`cargo build --target x86_64-unknown-linux-musl`（release.yml 的原生 amd64 构建）
+# 与 `cross build --target aarch64-unknown-linux-musl`（cross 把仓库挂进容器再跑 cargo，
+# 读的是这一份 config）。两个目标都只产 `bui` 与 `bui-c`，所以 bui-c 同样受益。
+# 注意：环境里的 RUSTFLAGS 会**整体覆盖**这里的 rustflags。ci.yml 确实设了
+# `RUSTFLAGS: -D warnings`，但它只跑 fmt / clippy / test（宿主 gnu 目标），一个 musl
+# 目标都不构建，所以覆盖不到发布产物；release.yml 的 env 里没有 RUSTFLAGS，别往里加。
+
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-C", "relocation-model=static", "-C", "target-feature=+crt-static"]
+
+[target.aarch64-unknown-linux-musl]
+rustflags = ["-C", "relocation-model=static", "-C", "target-feature=+crt-static"]
