@@ -6,6 +6,7 @@ pub mod check;
 pub mod engine;
 pub mod error;
 pub mod fake;
+pub mod import_v3;
 pub mod net;
 pub mod paths;
 pub mod profiles;
