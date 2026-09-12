@@ -220,7 +220,24 @@ tonic 客户端，proto 从 Xray-core `v26.3.27` vendor 进仓（以仓库根为
 
 ### 5.3 健康与切换
 
-每 2 分钟一轮，成员并行：每成员对 `https://www.gstatic.com/generate_204` 探测 2 次，任一成功即本轮健康；连续 2 轮不达标 → 标记不健康，连续 2 轮达标 → 恢复。当前选中成员健康 → 不动；不健康 → 切到健康成员里 `priority` 最小者（同优先级按近 24h 成功率）；两次切换间隔 ≥ 60 秒；全部不健康 → 保持并告警；成员集在本轮内变化 → 本轮不切。切换通过 Clash API `PUT /proxies/resi-pool`（与配置切换走同一条 `SelectOutbound` 路径，S4）。**`resi-pool` 选择器的 `interrupt_exist_connections` 固定为 `false`**，否则每次健康切换都会掐断全部住宅连接。relay 任何重启后立即重放 `selected_upstream_id`。
+每 2 分钟一轮，成员并行：每成员探测 2 次（第 1 次打 `https://www.google.com/generate_204`、**带浏览器 UA 并计时**，第 2 次打 `https://www.gstatic.com/generate_204`），任一成功即本轮健康；连续 2 轮不达标 → 标记不健康，连续 2 轮达标 → 恢复。当前选中成员健康 → 不动（但见下段的「更优候选」）；不健康 → 切到健康成员里的最优者；两次切换间隔 ≥ 60 秒；全部不健康 → 保持并告警；成员集在本轮内变化 → 本轮不切。切换通过 Clash API `PUT /proxies/resi-pool`（与配置切换走同一条 `SelectOutbound` 路径，S4）。**`resi-pool` 选择器的 `interrupt_exist_connections` 固定为 `false`**，否则每次健康切换都会掐断全部住宅连接。relay 任何重启后立即重放 `selected_upstream_id`。
+
+**指标、周期与流量成本**（主理人 2026-09-12：「巡检除了连通健康度，还要给出延迟、上下行速度等具体信息；目的是选择最健康、最低延迟、速度最快的住宅代理」，以及「巡检也要测 UDP」）。每轮每成员额外记三类样本，各保留最近 30 个（环形），报 p50 / p95：
+
+| 指标 | 怎么测 | 周期 | 说明 |
+|---|---|---|---|
+| TCP 延迟 | 到上游网关 `host:port` 的 TCP 建连耗时 | 每轮（2 分钟） | 不经隧道、不发请求，量「到这条上游有多远」 |
+| HTTP 延迟 | 经上游 GET `https://www.google.com/generate_204`（浏览器 UA，超时 8 秒）的完整往返 | 每轮 | **与本轮第 1 次连通性探测复用同一次请求**，所以健康成员每轮的 HTTP 请求数没有增加 |
+| UDP | 经 socks5 上游 UDP ASSOCIATE（**每次新建关联**：实测 Decodo 一次关联只服务第一个目标地址）向 `stun.l.google.com:19302` 发 STUN Binding Request（RFC 5389，magic cookie `0x2112A442`、20 字节头 + 12 字节随机 transaction id），超时 5 秒 | 每轮 | 收到 Binding Response 即 `udp_ok`，并从 XOR-MAPPED-ADDRESS 解出 **UDP 出口 IP**（与 TCP 出口 IP 可能不同）；记 UDP 往返耗时，与 TCP / HTTP 分开报。http 上游 `udp_ok` 恒为 false 并标注「HTTP 上游无 UDP」（协议里没有 UDP ASSOCIATE） |
+| 上下行速度 | 经上游下载 `https://speed.cloudflare.com/__down?bytes=4194304`（4 MB）+ 上传 1 MB 随机字节到 `https://speed.cloudflare.com/__up`，算 Mbps | **每 60 分钟**（游标 `runtime.last_speedtest_at`，与巡检同一个 tick，不另起调度器）；手动体检（`bui residential check` / `POST /api/residential/check`）**附带一次全量测速** | 保留最近 6 次，报中位数。**测速失败不影响健康判定**，只记 note。大小与周期是常量，可由 `state.residential.speedtest_down_bytes` / `speedtest_up_bytes` / `speedtest_interval_mins` 覆盖（0 与荒唐的大小一律回退 / 夹到 64 MB） |
+
+流量成本：延迟与 UDP 探测都是 204 / 32 字节量级，可忽略；测速是全部开销。每条上游每小时 5 MB ⇒ **每条约 3.6 GB/月，三条约 11 GB/月**。嫌多就把 `speedtest_interval_mins` 调大或把字节数调小。
+
+**选路与防抖**。候选 = 健康成员；排序键依次为 ① Google 可用 ② `priority` 升序 ③ UDP 可用 ④ 延迟 p50 升序 ⑤ 下行中位数降序 ⑥ 近 24h 成功率降序 ⑦ 池内下标（稳定）。①（主理人口径里写成「候选 = 健康且 google_ok」）落成**第一排序键**而不是硬过滤：全池都还没探到 Google 结论（首轮、或 Google 整域不可达）时硬过滤会让候选集为空、整池选不出出口，fail-open 比 fail-closed 安全；只要有一条 Google 通，它与过滤等价。④⑤ 的「没测过」一律排在「有数据」之后（延迟按 `u64::MAX`、速度按 0）——否则一条刚加进来、什么都没测的上游会拿到全池最低延迟直接抢走出口。手动锁定（R2 ①）仍压过全部排序键。
+
+当前出口**不健康**时按上段立即切（既有规则）。当前出口健康但**它自己的 Google 被封**时也立即切、不吃下面的防抖（规则 6d，新增）——前提是池里还有别的健康成员 Google 通，否则切到自己身上只会白掐一次住宅连接，此时只记一条说明。手动锁定的出口不因 Google 被封而挪走（R2 ①）。当前出口**健康**时新增一条「更优候选」路径，并且必须防抖：只有最佳候选与当前出口不同、且**连续 3 轮**满足「延迟 p50 低 ≥ 20% **或** 下行中位数快 ≥ 30%」才切；候选一换轮数就从 1 数起（三条上游轮流各赢一轮不该凑成 3 轮），切换成功后归零，并同吃 ≥ 60 秒的切换限速。轮数与候选记在 `runtime.improve_rounds` / `improve_candidate_id`。
+
+`bui residential health` / `status`、`GET /api/residential/health` / `status` 的每个成员都带上延迟 p50/p95、下行/上行 Mbps、最近测速时间、UDP（通/不通 + 出口 IP + p50），响应级带上防抖进度（`switch_improve_rounds`/`switch_improve_needed`/`switch_improve_candidate`）与 `last_speedtest_at`，并输出一行「当前选中 resi-N 的原因」（手动锁定 / 唯一健康 / Google / 优先级 / UDP / 延迟最低 / 下行最快）。面板的体检卡读这些字段，只在中继成员表里加「延迟 / 速度 / UDP」三列。
 
 ### 5.4 黑名单（R13 落地）
 

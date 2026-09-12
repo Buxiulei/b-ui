@@ -228,13 +228,27 @@ pub enum OrderStatus {
 pub struct Residential {
     #[serde(default)]
     pub groups: BTreeMap<String, ResidentialGroup>,
+    /// 巡检测速的用量与周期覆盖（`None` = 用代码里的默认 4MB / 1MB / 60 分钟）。
+    /// **`skip_serializing_if`**：不设就一个字节都不进 `state.json` —— 这三项是给
+    /// 「流量吃紧想调小」的运维留的旋钮，不该让每台机器的 state 都多三个 null。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speedtest_down_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speedtest_up_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speedtest_interval_mins: Option<i64>,
 }
 
 impl Default for Residential {
     fn default() -> Self {
         let mut groups = BTreeMap::new();
         groups.insert(DEFAULT_GROUP.to_string(), ResidentialGroup::default());
-        Self { groups }
+        Self {
+            groups,
+            speedtest_down_bytes: None,
+            speedtest_up_bytes: None,
+            speedtest_interval_mins: None,
+        }
     }
 }
 

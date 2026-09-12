@@ -72,6 +72,23 @@ pub struct CheckReport {
     /// 端口 → `ConnectVerdict::label()`
     pub ports: BTreeMap<u16, String>,
     pub udp_associate: Option<bool>,
+    /// STUN 探测解出的 **UDP 出口 IP**（与 [`ExitInfo::ip`] 的 TCP 出口可能不是同一个）。
+    /// `udp_associate` 只说「关联建不建得起来」，这一项才说明 UDP 真能收发包
+    #[serde(default)]
+    pub udp_exit_ip: Option<String>,
+    /// UDP 不通的原因（`HTTP 上游无 UDP` / STUN 无回复…）
+    #[serde(default)]
+    pub udp_note: Option<String>,
+    /// 本次体检**附带的全量测速**（Mbps；`None` = 没测到）。主理人 2026-09-12：
+    /// 手动体检要带一次测速，别让人等下一个整点
+    #[serde(default)]
+    pub down_mbps: Option<f64>,
+    #[serde(default)]
+    pub up_mbps: Option<f64>,
+    /// 测速失败的原因。**测速失败不影响任何判定**，所以它有自己的字段，不混进
+    /// `notes`（那里是「这份报告为什么不可信」）
+    #[serde(default)]
+    pub speed_note: Option<String>,
     /// 学到的端口白名单（`None` = 不限或学不到）
     pub ports_allowed: Option<Vec<u16>>,
     /// 本轮遇到 407 / SOCKS5 认证被拒 —— 结果不可信，不写 `ports_allowed`
@@ -341,7 +358,15 @@ pub fn to_verified(e: &ExitInfo, at: &str) -> Option<Verified> {
 /// 一次完整体检：三源出口 + Google sorry + AI + 支付 + 端口集 + UDP ASSOCIATE。
 /// **全部**探测经 [`super::fanout`] 并发跑（上限 4），整个函数是 `async`（因为 `fanout` 是），
 /// 每个探测项自身在 `spawn_blocking` 里。
-pub async fn run(p: Arc<dyn Prober>, up: &Upstream, now: OffsetDateTime) -> CheckReport {
+/// `speed` = 本次测速的 (下载字节数, 上传字节数)，由调用方从
+/// [`super::health::speedtest_cfg`] 取（常量默认 + `state.residential` 可覆盖）：
+/// 运维把用量调小是为了省住宅流量，手动体检不该绕过这个旋钮。
+pub async fn run(
+    p: Arc<dyn Prober>,
+    up: &Upstream,
+    now: OffsetDateTime,
+    speed: (u64, u64),
+) -> CheckReport {
     let mut notes = Vec::new();
     let mut auth_failed = false;
 
@@ -437,6 +462,20 @@ pub async fn run(p: Arc<dyn Prober>, up: &Upstream, now: OffsetDateTime) -> Chec
         _ => None,
     };
 
+    // ⑤b STUN Binding（主理人 2026-09-12）：UDP 真能不能收发包 + UDP 出口 IP。
+    // 与 ④ 的 `udp_associate` 分开：那一项只说关联建不建得起来，中间设备吞 UDP 时
+    // 它照样是 true。判据与巡检同一份（`Prober::stun_binding`）
+    let (pp, u2) = (p.clone(), up.clone());
+    let stun = tokio::task::spawn_blocking(move || pp.stun_binding(&u2))
+        .await
+        .unwrap_or_default();
+
+    // ⑥ 全量测速（下载 + 上传）。**失败只记 note**，不碰 `auth_failed`、不影响任何判定
+    let (pp, u2, (down_bytes, up_bytes)) = (p.clone(), up.clone(), speed);
+    let speed = tokio::task::spawn_blocking(move || pp.speedtest(&u2, down_bytes, up_bytes))
+        .await
+        .unwrap_or_default();
+
     if auth_failed {
         notes.push("本轮出现 407 / SOCKS5 认证被拒：上游凭据可能已失效，端口白名单不予采信".into());
     }
@@ -454,6 +493,11 @@ pub async fn run(p: Arc<dyn Prober>, up: &Upstream, now: OffsetDateTime) -> Chec
         payments,
         ports,
         udp_associate,
+        udp_exit_ip: stun.exit_ip,
+        udp_note: stun.note,
+        down_mbps: speed.down_mbps,
+        up_mbps: speed.up_mbps,
+        speed_note: speed.note,
         ports_allowed,
         auth_failed,
         notes,
@@ -475,6 +519,7 @@ pub async fn run_and_store(
         .find(|u| u.id == id)
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("上游不存在"))?;
+    let (down_bytes, up_bytes, _) = super::health::speedtest_cfg(&s);
     drop(s);
     let now = ctx.host.now();
     state::update(&ctx.runtime, |r| {
@@ -484,7 +529,7 @@ pub async fn run_and_store(
         });
     })
     .await;
-    let report = run(p, &up, now).await;
+    let report = run(p, &up, now, (down_bytes, up_bytes)).await;
     // 体检学到的两项写回 state（会触发一次对账；ports_allowed 变了 relay 规则就得改，本来就要重启）。
     // **写回口径与每日轮次完全同一份**：都走 `blacklist::port_learn`——`Learned` 才写
     // （含「全通 ⇒ None = 不限」这种真结论），`Keep` 一个字节都不动。手动体检以前是
@@ -504,9 +549,15 @@ pub async fn run_and_store(
     })
     .await?;
     let json = serde_json::to_value(&report).unwrap_or(serde_json::Value::Null);
+    // 体检带的这次测速要进 `runtime.health`：`health` / `status` / CLI 的速度列都读那里，
+    // 只写进 `checks[]` 的话面板上还是「未测速」
+    let (down, up_speed, speed_note) =
+        (report.down_mbps, report.up_mbps, report.speed_note.clone());
     state::update(&ctx.runtime, |r| {
         r.checks.insert(id.to_string(), json);
         r.checking = None;
+        let h = r.health.entry(id.to_string()).or_default();
+        state::record_speed(h, down, up_speed, speed_note, now);
         // 告警以 uuid 为键、文案用 host:port：`url-N` 是位置名，删掉一条上游后会被新
         // 条目复用，新上游就顶着上一个账号的 407 告警（2026-09-12 bwg-rick 的真机事故）
         if report.auth_failed {
@@ -558,6 +609,14 @@ mod tests {
             status: 200,
             body: body.to_string(),
         })
+    }
+
+    /// 默认测速用量（`run_and_store` 从 `speedtest_cfg` 取同一对值）
+    fn budget() -> (u64, u64) {
+        (
+            crate::modules::residential::SPEEDTEST_DOWN_BYTES,
+            crate::modules::residential::SPEEDTEST_UP_BYTES,
+        )
     }
 
     #[test]
@@ -752,7 +811,7 @@ mod tests {
             }
             i.udp = true;
         });
-        let r = run(p, &up(), t0()).await;
+        let r = run(p, &up(), t0(), budget()).await;
         assert_eq!(r.class, ExitClass::Residential);
         assert_eq!(r.class_label, "家庭宽带 IP");
         assert_eq!(r.exit.ip.as_deref(), Some("198.51.100.7"));
@@ -871,7 +930,7 @@ mod tests {
                 body: "403 Forbidden serp domain".into(),
             }))
         });
-        let r = run(p.clone(), &up(), t0()).await;
+        let r = run(p.clone(), &up(), t0(), budget()).await;
         assert_eq!(r.google_ok, Some(false));
         assert!(
             p.calls().iter().any(|c| c == "google"),
@@ -885,12 +944,17 @@ mod tests {
                 body: "<html>weather results".into(),
             }))
         });
-        assert_eq!(run(p2, &up(), t0()).await.google_ok, Some(true));
+        assert_eq!(run(p2, &up(), t0(), budget()).await.google_ok, Some(true));
         // 探不到就是未知（缺省的 FakeProber 不给 google）
         assert_eq!(
-            run(std::sync::Arc::new(FakeProber::new()), &up(), t0())
-                .await
-                .google_ok,
+            run(
+                std::sync::Arc::new(FakeProber::new()),
+                &up(),
+                t0(),
+                budget()
+            )
+            .await
+            .google_ok,
             None
         );
     }
@@ -899,7 +963,7 @@ mod tests {
     async fn a_google_probe_that_fails_auth_marks_the_round_untrustworthy() {
         let p = std::sync::Arc::new(FakeProber::new());
         p.with(|i| i.google = Some(Err("__auth_failed__".into())));
-        let r = run(p, &up(), t0()).await;
+        let r = run(p, &up(), t0(), budget()).await;
         assert!(r.auth_failed, "407 出现在哪一项都算整轮不可信");
         assert_eq!(r.google_ok, None);
         assert_eq!(r.ports_allowed, None);
@@ -916,7 +980,7 @@ mod tests {
                 );
             }
         });
-        let r = run(p, &up(), t0()).await;
+        let r = run(p, &up(), t0(), budget()).await;
         assert!(r.auth_failed, "调研 §D 的 407 场景");
         assert_eq!(r.ports_allowed, None, "凭据失效时绝不写端口白名单");
         assert!(
@@ -945,7 +1009,7 @@ mod tests {
                 }),
             );
         });
-        let r = run(p, &up(), t0()).await;
+        let r = run(p, &up(), t0(), budget()).await;
         assert_eq!(r.google_sorry, Some(true));
         assert_eq!(r.class, ExitClass::Unknown, "挑战页记未知，不是失败");
         assert_eq!(r.sources["ippure"], "cloudflare_challenge");
@@ -984,7 +1048,13 @@ mod tests {
     async fn a_403_on_the_search_domain_no_longer_kills_the_port_whitelist() {
         // 端口集的基准端口打中性主机 www.gstatic.com，所以「整域拒搜索域名」的上游
         // 照样能学出 [80, 443]
-        let r = run(std::sync::Arc::new(SearchDomainBlocked), &up(), t0()).await;
+        let r = run(
+            std::sync::Arc::new(SearchDomainBlocked),
+            &up(),
+            t0(),
+            budget(),
+        )
+        .await;
         assert_eq!(r.ports[&80], "open");
         assert_eq!(r.ports[&443], "open");
         assert_eq!(r.ports[&5228], "refused:403");
@@ -1081,6 +1151,53 @@ mod tests {
             .unwrap();
         assert_eq!(r2.ports_allowed, None);
         assert_eq!(stored_ports(&ctx).await, None, "全通 ⇒ 不限");
+    }
+
+    #[tokio::test]
+    async fn a_manual_check_carries_a_full_speedtest_and_the_udp_exit_ip() {
+        // 主理人 2026-09-12：「手动体检（check / POST /api/residential/check）附带一次全量测速」
+        let d = tempfile::tempdir().unwrap();
+        let ctx = store_ctx(&d, None).await;
+        let p = std::sync::Arc::new(FakeProber::new());
+        p.with(|i| {
+            i.speed = crate::modules::residential::proxy::SpeedSample {
+                down_mbps: Some(88.5),
+                up_mbps: Some(12.25),
+                note: None,
+            };
+            i.stun = crate::modules::residential::proxy::UdpProbe {
+                ok: true,
+                exit_ip: Some("198.51.100.9".into()),
+                ms: Some(42),
+                note: None,
+            };
+        });
+        let r = run_and_store(&ctx, p, up().id).await.unwrap();
+        assert_eq!(r.down_mbps, Some(88.5));
+        assert_eq!(r.up_mbps, Some(12.25));
+        // 体检的样本要能被巡检的视图读到（面板与 CLI 都读 runtime.health）
+        let rt = state::read(&ctx.runtime).await;
+        let h = &rt.health[&up().id.to_string()];
+        assert_eq!(h.down_mbps, vec![88.5]);
+        assert_eq!(h.up_mbps, vec![12.25]);
+        assert!(h.speed_at.is_some());
+        // 体检用的是 `up()`（http 类型）⇒ STUN 表不作数，恒「HTTP 上游无 UDP」
+        assert_eq!(r.udp_exit_ip, None);
+        assert_eq!(r.udp_note.as_deref(), Some("HTTP 上游无 UDP"));
+    }
+
+    #[tokio::test]
+    async fn a_speedtest_failure_in_a_check_only_records_a_note() {
+        let d = tempfile::tempdir().unwrap();
+        let ctx = store_ctx(&d, None).await;
+        // FakeProber 缺省的 speed 是「没测到」：体检照样成功，只是没有速度
+        let r = run_and_store(&ctx, std::sync::Arc::new(FakeProber::new()), up().id)
+            .await
+            .unwrap();
+        assert_eq!(r.down_mbps, None);
+        assert!(!r.auth_failed, "测速没测到不等于凭据失效");
+        let rt = state::read(&ctx.runtime).await;
+        assert!(rt.health[&up().id.to_string()].down_mbps.is_empty());
     }
 
     #[tokio::test]

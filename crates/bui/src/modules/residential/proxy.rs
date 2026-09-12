@@ -42,6 +42,106 @@ pub struct HttpProbe {
     pub body: String,
 }
 
+/// 一次「经 socks5 上游 UDP ASSOCIATE → STUN Binding」的结果。
+/// **`ok` 为真才说明 UDP 真的能用**：能建关联但收不到 Binding Response 的上游（中间
+/// 设备吞 UDP）一样不可用，所以判据是「收到回复」，不是「关联建立」。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UdpProbe {
+    /// 收到了 Binding Response
+    pub ok: bool,
+    /// XOR-MAPPED-ADDRESS 解出的 **UDP 出口 IP**（与 TCP 出口 IP 可能不同，要能对照）
+    pub exit_ip: Option<String>,
+    /// 往返耗时（毫秒）；`None` = 没测到（与 TCP / HTTP 延迟分开存）
+    pub ms: Option<u64>,
+    /// 不通的原因（`HTTP 上游无 UDP` / 超时 / 认证被拒…），面板直接显示
+    pub note: Option<String>,
+}
+
+/// 一次测速的结果（Mbps）。失败**不影响健康判定**，只记 `note`（主理人口径）
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SpeedSample {
+    pub down_mbps: Option<f64>,
+    pub up_mbps: Option<f64>,
+    pub note: Option<String>,
+}
+
+/// 传输速率（Mbps）。`bytes == 0`（一个字节都没传）或 `ms == 0`（时钟粒度不够，
+/// 算出来是无穷大）一律不当成速度。
+pub fn mbps(bytes: u64, ms: u64) -> Option<f64> {
+    if bytes == 0 || ms == 0 {
+        return None;
+    }
+    Some(bytes as f64 * 8.0 / (ms as f64 / 1000.0) / 1_000_000.0)
+}
+
+/// RFC 5389 §6：20 字节头（type=0x0001 Binding Request、length=0、magic cookie、
+/// 12 字节 transaction id），没有属性。
+pub fn stun_binding_request(tid: &[u8; 12]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(20);
+    v.extend_from_slice(&0x0001u16.to_be_bytes());
+    v.extend_from_slice(&0x0000u16.to_be_bytes());
+    v.extend_from_slice(&super::STUN_MAGIC_COOKIE.to_be_bytes());
+    v.extend_from_slice(tid);
+    v
+}
+
+/// Binding Response → XOR-MAPPED-ADDRESS 里的 IPv4（RFC 5389 §15.2：地址与端口都跟
+/// magic cookie 异或过）。**transaction id 不匹配一律不信**：UDP 没有连接语义，
+/// 收到的可能是上一次关联的迟到回包。只解 IPv4（住宅出口没有 IPv6，spec §0）。
+pub fn parse_stun_xor_mapped(buf: &[u8], tid: &[u8; 12]) -> Option<String> {
+    if buf.len() < 20 {
+        return None;
+    }
+    // 0x0101 = Binding Response（0x0111 是 Error Response，不算成功）
+    if buf[0] != 0x01 || buf[1] != 0x01 {
+        return None;
+    }
+    let cookie = super::STUN_MAGIC_COOKIE.to_be_bytes();
+    if buf[4..8] != cookie || buf[8..20] != *tid {
+        return None;
+    }
+    let mut i = 20;
+    while i + 4 <= buf.len() {
+        let kind = u16::from_be_bytes([buf[i], buf[i + 1]]);
+        let len = u16::from_be_bytes([buf[i + 2], buf[i + 3]]) as usize;
+        let val = buf.get(i + 4..i + 4 + len)?;
+        // 0x0020 = XOR-MAPPED-ADDRESS：RSV(1) family(1) x-port(2) x-address(4)
+        if kind == 0x0020 && len >= 8 && val[1] == 0x01 {
+            let ip: Vec<String> = (0..4)
+                .map(|k| (val[4 + k] ^ cookie[k]).to_string())
+                .collect();
+            return Some(ip.join("."));
+        }
+        // 属性按 4 字节对齐填充
+        i += 4 + len.next_multiple_of(4);
+    }
+    None
+}
+
+/// RFC1928 §7 的 UDP 请求头：`RSV(2) FRAG(1) ATYP(1) DST.ADDR DST.PORT`。
+/// **ATYP=03（域名）**：目标域名原样交上游解析（socks5h 口径，v3.6.0 R10 的结论）
+pub fn socks5_udp_header(host: &str, port: u16) -> Vec<u8> {
+    let mut v = vec![0x00, 0x00, 0x00, 0x03, host.len() as u8];
+    v.extend_from_slice(host.as_bytes());
+    v.extend_from_slice(&port.to_be_bytes());
+    v
+}
+
+/// 剥掉回包的 RFC1928 UDP 头，拿到载荷。头长随 ATYP 变；`FRAG ≠ 0` 的分片包不支持
+/// （RFC1928 允许实现直接丢），返回 `None`。
+pub fn strip_socks5_udp_header(buf: &[u8]) -> Option<&[u8]> {
+    if buf.len() < 4 || buf[2] != 0x00 {
+        return None;
+    }
+    let addr_len = match buf[3] {
+        0x01 => 4,
+        0x04 => 16,
+        0x03 => 1 + *buf.get(4)? as usize,
+        _ => return None,
+    };
+    buf.get(4 + addr_len + 2..)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ProbeError {
     #[error("上游凭据失效（CONNECT 407 / SOCKS5 认证被拒）")]
@@ -66,6 +166,41 @@ pub trait Prober: Send + Sync + 'static {
     fn udp_associate(&self, up: &Upstream) -> Result<bool, ProbeError>;
     /// **不经上游**的直连 TCP 对照（黑名单确认的第二条件：直连同目标可达）
     fn direct_tcp(&self, host: &str, port: u16) -> bool;
+    /// 到上游网关 `host:port` 的 **TCP 建连耗时**（毫秒）；`None` = 连不上 / 没测。
+    /// 这一项不经隧道、不发任何请求，量的是「到这条上游有多远」。
+    ///
+    /// 以下四个**指标**方法都有缺省实现（「没测到」），只有真正量数据的 Prober
+    /// 才需要覆盖：它们不参与健康/黑名单判定，缺数据时选路只是少一个排序依据，
+    /// 而按判定方法的口径强制每个测试替身都实现一遍纯属噪声。
+    fn gateway_tcp_ms(&self, _up: &Upstream) -> Option<u64> {
+        None
+    }
+    /// 经上游发一次**浏览器 UA** 的 GET 并**计时**，返回 `(完整往返耗时 ms, 结果)`。
+    /// `ms` 为 `None` = 请求没成功（失败的耗时只是超时值，记进样本会污染 p50）
+    fn timed_get(&self, up: &Upstream, url: &str) -> (Option<u64>, Result<HttpProbe, ProbeError>) {
+        (None, self.get(up, url))
+    }
+    /// 经 socks5 上游 UDP ASSOCIATE 向 [`super::STUN_HOST`] 发一个 STUN Binding Request。
+    /// HTTP 上游恒不通并标注（协议里没有 UDP ASSOCIATE），见 [`http_no_udp`]
+    fn stun_binding(&self, up: &Upstream) -> UdpProbe {
+        http_no_udp(up).unwrap_or_default()
+    }
+    /// 经上游下载 `down_bytes` / 上传 `up_bytes`，算 Mbps。失败只记 `note`
+    fn speedtest(&self, _up: &Upstream, _down_bytes: u64, _up_bytes: u64) -> SpeedSample {
+        SpeedSample::default()
+    }
+}
+
+/// 「HTTP 上游没有 UDP」这句话的**唯一**一份：HTTP 代理协议里没有 UDP ASSOCIATE，
+/// sing-box 的 http 出站也没有 UDP 能力（同 `ResidentialGroup::udp_via_pool`）。
+/// 真实与假 Prober 都调它，免得同一句文案有两份、面板上两种写法。
+pub const HTTP_NO_UDP_NOTE: &str = "HTTP 上游无 UDP";
+
+pub fn http_no_udp(up: &Upstream) -> Option<UdpProbe> {
+    (up.kind == UpstreamKind::Http).then(|| UdpProbe {
+        note: Some(HTTP_NO_UDP_NOTE.into()),
+        ..Default::default()
+    })
 }
 
 /// 目标主机名合法性（`\r\n` / 引号 / 空格 / 空串一律拒，绝不让它进请求行）
@@ -262,6 +397,58 @@ impl ReqwestProber {
             .map_err(|e| ProbeError::Unreachable(e.to_string()))
     }
 
+    /// RFC1928 §7 的 UDP ASSOCIATE：返回 (控制连接, 中继地址)。
+    /// **控制连接必须留在调用方手里活着**：RFC1928 规定关联的生命周期就是这条 TCP
+    /// 连接的生命周期，提前 drop 它上游会立刻丢弃关联，后面发的 UDP 包全被丢。
+    fn socks5_associate(
+        &self,
+        up: &Upstream,
+    ) -> std::io::Result<(std::net::TcpStream, std::net::SocketAddr)> {
+        use std::io::{Read, Write};
+        let mut s = self.dial(up)?;
+        match socks5_handshake(&mut s, up)? {
+            ConnectVerdict::Open => {}
+            other => return Err(std::io::Error::other(other.label())),
+        }
+        s.write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])?;
+        s.flush()?;
+        let mut head = [0u8; 4];
+        s.read_exact(&mut head)?;
+        if head[1] != 0x00 {
+            return Err(std::io::Error::other(format!(
+                "UDP ASSOCIATE 被拒（REP=0x{:02x}）",
+                head[1]
+            )));
+        }
+        // BND.ADDR / BND.PORT 就是要往哪里发 UDP，必须完整读出来（`socks5_request`
+        // 只读前 4 字节，拿不到中继地址）
+        let mut addr = match head[3] {
+            0x01 => vec![0u8; 4],
+            0x04 => vec![0u8; 16],
+            0x03 => {
+                let mut l = [0u8; 1];
+                s.read_exact(&mut l)?;
+                vec![0u8; l[0] as usize]
+            }
+            t => {
+                return Err(std::io::Error::other(format!(
+                    "UDP ASSOCIATE 回了未知 ATYP 0x{t:02x}"
+                )))
+            }
+        };
+        s.read_exact(&mut addr)?;
+        let mut port = [0u8; 2];
+        s.read_exact(&mut port)?;
+        // 很多实现（Decodo 在内）回 BND.ADDR = 0.0.0.0，意思是「就发到你连着的这台」
+        let ip = match (head[3], addr.as_slice()) {
+            (0x01, [a, b, c, d]) if [*a, *b, *c, *d] != [0, 0, 0, 0] => {
+                std::net::IpAddr::from([*a, *b, *c, *d])
+            }
+            _ => s.peer_addr()?.ip(),
+        };
+        Ok((s, std::net::SocketAddr::new(ip, u16::from_be_bytes(port))))
+    }
+
     /// RFC1928 §4：CMD=03（UDP ASSOCIATE），绑定地址 0.0.0.0:0
     fn socks5_udp(&self, up: &Upstream) -> Result<bool, ProbeError> {
         let mut s = self
@@ -428,6 +615,132 @@ impl Prober for ReqwestProber {
             .into_iter()
             .any(|a| std::net::TcpStream::connect_timeout(&a, self.timeout).is_ok())
     }
+
+    fn gateway_tcp_ms(&self, up: &Upstream) -> Option<u64> {
+        let t = std::time::Instant::now();
+        // `dial` 里含 DNS 解析：到上游网关的实际开销本来就包含它，不单独扣
+        self.dial(up).ok().map(|_| elapsed_ms(t))
+    }
+
+    fn timed_get(&self, up: &Upstream, url: &str) -> (Option<u64>, Result<HttpProbe, ProbeError>) {
+        let client = match self.proxied_client(
+            up,
+            std::time::Duration::from_secs(super::LATENCY_PROBE_TIMEOUT_SECS),
+        ) {
+            Ok(c) => c,
+            Err(e) => return (None, Err(e)),
+        };
+        let t = std::time::Instant::now();
+        let r = client
+            .get(url)
+            // 浏览器 UA：脚本 UA 会被 Google 当机器人加塞挑战，那测的不是上游的延迟
+            .header(reqwest::header::USER_AGENT, super::GOOGLE_PROBE_UA)
+            .send()
+            .map_err(|e| send_error(url, e))
+            .and_then(http_probe_of);
+        // 失败的耗时只是超时值，记进样本会把 p50 拉成 8000ms
+        let ms = r.is_ok().then(|| elapsed_ms(t));
+        (ms, r)
+    }
+
+    fn stun_binding(&self, up: &Upstream) -> UdpProbe {
+        // 「HTTP 上游没有 UDP」的文案与判据只有 [`http_no_udp`] 这一份
+        if let Some(v) = http_no_udp(up) {
+            return v;
+        }
+        let fail = |note: String| UdpProbe {
+            note: Some(note),
+            ..Default::default()
+        };
+        // 每次探测新建关联：实测 Decodo 的一次 UDP ASSOCIATE 只服务第一个目标地址
+        let (_ctrl, relay) = match self.socks5_associate(up) {
+            Ok(x) => x,
+            Err(e) => return fail(format!("UDP ASSOCIATE 失败：{e}")),
+        };
+        let sock = match std::net::UdpSocket::bind("0.0.0.0:0") {
+            Ok(s) => s,
+            Err(e) => return fail(format!("本地 UDP 套接字创建失败：{e}")),
+        };
+        let timeout = std::time::Duration::from_secs(super::STUN_TIMEOUT_SECS);
+        if let Err(e) = sock.set_read_timeout(Some(timeout)) {
+            return fail(format!("本地 UDP 套接字超时设置失败：{e}"));
+        }
+        let tid: [u8; 12] = rand::random();
+        let mut pkt = socks5_udp_header(super::STUN_HOST, super::STUN_PORT);
+        pkt.extend_from_slice(&stun_binding_request(&tid));
+        let t = std::time::Instant::now();
+        if let Err(e) = sock.send_to(&pkt, relay) {
+            return fail(format!("STUN 请求发不出去：{e}"));
+        }
+        let mut buf = [0u8; 1500];
+        let n = match sock.recv_from(&mut buf) {
+            Ok((n, _)) => n,
+            Err(e) => {
+                return fail(format!(
+                    "STUN 无回复（{}s 内）：{e}",
+                    super::STUN_TIMEOUT_SECS
+                ))
+            }
+        };
+        let ms = elapsed_ms(t);
+        match strip_socks5_udp_header(&buf[..n]).and_then(|p| parse_stun_xor_mapped(p, &tid)) {
+            Some(ip) => UdpProbe {
+                ok: true,
+                exit_ip: Some(ip),
+                ms: Some(ms),
+                note: None,
+            },
+            // 收到字节但不是本次请求的 Binding Response ⇒ 不算通（可能是迟到的旧回包）
+            None => fail("收到 UDP 回包但不是本次的 STUN Binding Response".into()),
+        }
+    }
+
+    fn speedtest(&self, up: &Upstream, down_bytes: u64, up_bytes: u64) -> SpeedSample {
+        let client = match self.proxied_client(
+            up,
+            std::time::Duration::from_secs(super::SPEEDTEST_TIMEOUT_SECS),
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                return SpeedSample {
+                    note: Some(e.to_string()),
+                    ..Default::default()
+                }
+            }
+        };
+        let mut notes: Vec<String> = Vec::new();
+        let url = format!("{}{}", super::SPEEDTEST_DOWN_URL, down_bytes);
+        let t = std::time::Instant::now();
+        // 用**实收字节数**算，不用请求的字节数：服务端截断时不能虚报速度
+        let down = match client.get(&url).send().and_then(|r| r.bytes()) {
+            Ok(b) => mbps(b.len() as u64, elapsed_ms(t)),
+            Err(e) => {
+                notes.push(format!("下载测速失败：{e}"));
+                None
+            }
+        };
+        // 随机字节：全零正文会被链路上的压缩吃掉，测出来是压缩比不是带宽
+        let mut body = vec![0u8; up_bytes as usize];
+        rand::Rng::fill(&mut rand::thread_rng(), &mut body[..]);
+        let t = std::time::Instant::now();
+        let up_mbps = match client.post(super::SPEEDTEST_UP_URL).body(body).send() {
+            Ok(_) => mbps(up_bytes, elapsed_ms(t)),
+            Err(e) => {
+                notes.push(format!("上传测速失败：{e}"));
+                None
+            }
+        };
+        SpeedSample {
+            down_mbps: down,
+            up_mbps,
+            note: (!notes.is_empty()).then(|| notes.join("；")),
+        }
+    }
+}
+
+/// `Instant` → 毫秒（`u128` 截到 `u64`：测速上限 60 秒，永远溢不出）
+fn elapsed_ms(t: std::time::Instant) -> u64 {
+    t.elapsed().as_millis() as u64
 }
 
 #[cfg(test)]
@@ -450,6 +763,14 @@ pub struct FakeProberInner {
     pub udp: bool,
     /// 直连可达的 `"<host>:<port>"`；不在集合里即不可达
     pub direct: std::collections::BTreeSet<String>,
+    /// [`Prober::gateway_tcp_ms`] 的返回，缺省 `None`（= 连不上，「未知」不许变成好成绩）
+    pub tcp_ms: Option<u64>,
+    /// [`Prober::timed_get`] 的耗时；结果本身仍查 `gets`（同一份 URL 表）
+    pub http_ms: Option<u64>,
+    /// [`Prober::stun_binding`] 的返回，缺省 `UdpProbe::default()`（不通、没耗时）
+    pub stun: UdpProbe,
+    /// [`Prober::speedtest`] 的返回，缺省 `SpeedSample::default()`（没测到）
+    pub speed: SpeedSample,
     pub calls: Vec<String>,
 }
 
@@ -482,6 +803,19 @@ impl Default for FakeProber {
     }
 }
 
+/// `gets` / `google` 表里的一格 → [`Prober`] 的返回。**错误哨兵约定**（跨任务契约）：
+/// `Err("__auth_failed__")` ⇒ [`ProbeError::AuthFailed`]，其余字符串 ⇒ `Unreachable`。
+/// `get` / `google_search` / `timed_get` 共用这一份，免得哨兵约定有三份。
+#[cfg(test)]
+fn fake_result(v: Option<&Result<HttpProbe, String>>) -> Result<HttpProbe, ProbeError> {
+    match v {
+        Some(Ok(hp)) => Ok(hp.clone()),
+        Some(Err(e)) if e == "__auth_failed__" => Err(ProbeError::AuthFailed),
+        Some(Err(e)) => Err(ProbeError::Unreachable(e.clone())),
+        None => Err(ProbeError::Unreachable("no route".into())),
+    }
+}
+
 #[cfg(test)]
 impl Prober for FakeProber {
     fn connect(&self, _up: &Upstream, host: &str, port: u16) -> ConnectVerdict {
@@ -496,24 +830,13 @@ impl Prober for FakeProber {
     fn get(&self, _up: &Upstream, url: &str) -> Result<HttpProbe, ProbeError> {
         let mut i = self.inner.lock().expect("FakeProber 锁被毒化");
         i.calls.push(format!("get:{url}"));
-        match i.gets.get(url) {
-            Some(Ok(hp)) => Ok(hp.clone()),
-            // 哨兵：让测试能构造「上游凭据失效」这一条路径（T7 的 407 用例）
-            Some(Err(e)) if e == "__auth_failed__" => Err(ProbeError::AuthFailed),
-            Some(Err(e)) => Err(ProbeError::Unreachable(e.clone())),
-            None => Err(ProbeError::Unreachable("no route".into())),
-        }
+        fake_result(i.gets.get(url))
     }
 
     fn google_search(&self, _up: &Upstream) -> Result<HttpProbe, ProbeError> {
         let mut i = self.inner.lock().expect("FakeProber 锁被毒化");
         i.calls.push("google".into());
-        match i.google.as_ref() {
-            Some(Ok(hp)) => Ok(hp.clone()),
-            Some(Err(e)) if e == "__auth_failed__" => Err(ProbeError::AuthFailed),
-            Some(Err(e)) => Err(ProbeError::Unreachable(e.clone())),
-            None => Err(ProbeError::Unreachable("no route".into())),
-        }
+        fake_result(i.google.as_ref())
     }
 
     fn udp_associate(&self, _up: &Upstream) -> Result<bool, ProbeError> {
@@ -526,6 +849,36 @@ impl Prober for FakeProber {
         let mut i = self.inner.lock().expect("FakeProber 锁被毒化");
         i.calls.push(format!("direct:{host}:{port}"));
         i.direct.contains(&format!("{host}:{port}"))
+    }
+
+    fn gateway_tcp_ms(&self, _up: &Upstream) -> Option<u64> {
+        let mut i = self.inner.lock().expect("FakeProber 锁被毒化");
+        i.calls.push("tcp".into());
+        i.tcp_ms
+    }
+
+    fn timed_get(&self, _up: &Upstream, url: &str) -> (Option<u64>, Result<HttpProbe, ProbeError>) {
+        let mut i = self.inner.lock().expect("FakeProber 锁被毒化");
+        // 只记一条 `timed:`：真实实现就是**一次**请求，记两条会让按 calls() 数请求数的
+        // 测试把它当成两次
+        i.calls.push(format!("timed:{url}"));
+        // 结果查同一份 `gets` 表（真实实现也是一次普通 GET，只是带 UA 并计时）；
+        // 失败时不给耗时，与 `ReqwestProber::timed_get` 同口径
+        let r = fake_result(i.gets.get(url));
+        (r.is_ok().then_some(i.http_ms).flatten(), r)
+    }
+
+    fn stun_binding(&self, up: &Upstream) -> UdpProbe {
+        let mut i = self.inner.lock().expect("FakeProber 锁被毒化");
+        i.calls.push("stun".into());
+        // 「HTTP 上游没有 UDP」是协议事实，不是可编程的假数据（真实 Prober 同一份判据）
+        http_no_udp(up).unwrap_or_else(|| i.stun.clone())
+    }
+
+    fn speedtest(&self, _up: &Upstream, _down: u64, _up_bytes: u64) -> SpeedSample {
+        let mut i = self.inner.lock().expect("FakeProber 锁被毒化");
+        i.calls.push("speed".into());
+        i.speed.clone()
     }
 }
 
@@ -793,6 +1146,157 @@ mod tests {
             Err(ProbeError::AuthFailed)
         ));
         assert_eq!(p.calls(), vec!["google", "google", "google"]);
+    }
+
+    /// 一条 Binding Response：20 字节头 + 一条 XOR-MAPPED-ADDRESS 属性（RFC 5389 §15.2）
+    fn stun_response_fixture(tid: &[u8; 12], ip: [u8; 4], port: u16) -> Vec<u8> {
+        let cookie = super::super::STUN_MAGIC_COOKIE.to_be_bytes();
+        let mut v = vec![0x01, 0x01, 0x00, 0x0c];
+        v.extend_from_slice(&cookie);
+        v.extend_from_slice(tid);
+        v.extend_from_slice(&[0x00, 0x20, 0x00, 0x08, 0x00, 0x01]);
+        v.extend_from_slice(&(port ^ (super::super::STUN_MAGIC_COOKIE >> 16) as u16).to_be_bytes());
+        for (i, b) in ip.iter().enumerate() {
+            v.push(b ^ cookie[i]);
+        }
+        v
+    }
+
+    #[test]
+    fn a_stun_binding_request_has_the_rfc5389_header_and_the_transaction_id() {
+        let tid = [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let req = stun_binding_request(&tid);
+        assert_eq!(req.len(), 20, "20 字节头，没有属性");
+        assert_eq!(&req[..2], &[0x00, 0x01], "Binding Request 的 type");
+        assert_eq!(&req[2..4], &[0x00, 0x00], "没有属性 ⇒ length = 0");
+        assert_eq!(
+            &req[4..8],
+            &super::super::STUN_MAGIC_COOKIE.to_be_bytes(),
+            "magic cookie 0x2112A442"
+        );
+        assert_eq!(&req[8..20], &tid, "12 字节 transaction id 原样带上");
+    }
+
+    #[test]
+    fn the_xor_mapped_address_is_unxored_back_to_the_udp_exit_ip() {
+        // RFC 5389 §15.2：XOR-MAPPED-ADDRESS 的地址与端口都跟 magic cookie 异或过
+        let tid = [7u8; 12];
+        let resp = stun_response_fixture(&tid, [198, 51, 100, 7], 54321);
+        assert_eq!(
+            parse_stun_xor_mapped(&resp, &tid).as_deref(),
+            Some("198.51.100.7"),
+            "解回真实 UDP 出口 IP"
+        );
+        // transaction id 不匹配 ⇒ 不是这次请求的回复，一律不信（UDP 没有连接语义）
+        assert_eq!(parse_stun_xor_mapped(&resp, &[9u8; 12]), None);
+        // Binding Error Response（0x0111）不是成功回复
+        let mut bad = resp.clone();
+        bad[1] = 0x11;
+        assert_eq!(parse_stun_xor_mapped(&bad, &tid), None);
+        // 截断的包不许 panic
+        assert_eq!(parse_stun_xor_mapped(&resp[..12], &tid), None);
+        assert_eq!(parse_stun_xor_mapped(&[], &tid), None);
+    }
+
+    #[test]
+    fn the_socks5_udp_header_carries_the_domain_so_the_upstream_resolves_it() {
+        // RFC1928 §7：RSV(2) FRAG(1) ATYP(1) DST.ADDR DST.PORT，然后才是载荷。
+        // ATYP=03（域名）= 目标域名原样交上游解析（socks5h 口径，v3.6.0 R10 的结论）
+        let h = socks5_udp_header("stun.l.google.com", 19302);
+        assert_eq!(&h[..4], &[0x00, 0x00, 0x00, 0x03]);
+        assert_eq!(h[4] as usize, "stun.l.google.com".len());
+        assert_eq!(&h[5..22], b"stun.l.google.com");
+        assert_eq!(&h[22..24], &19302u16.to_be_bytes());
+        // 回包的头长随 ATYP 变，载荷要按 ATYP 剥
+        let mut pkt = vec![0x00, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x04, 0x38];
+        pkt.extend_from_slice(b"payload");
+        assert_eq!(strip_socks5_udp_header(&pkt), Some(&b"payload"[..]));
+        let mut dom = vec![0x00, 0x00, 0x00, 0x03, 3, b'a', b'b', b'c', 0x04, 0x38];
+        dom.extend_from_slice(b"xy");
+        assert_eq!(strip_socks5_udp_header(&dom), Some(&b"xy"[..]));
+        // FRAG ≠ 0 = 分片包，RFC1928 允许实现直接丢
+        assert_eq!(
+            strip_socks5_udp_header(&[0, 0, 1, 1, 0, 0, 0, 0, 0, 0]),
+            None
+        );
+        assert_eq!(strip_socks5_udp_header(&[0, 0, 0, 1]), None, "截断不 panic");
+        assert_eq!(strip_socks5_udp_header(&[]), None);
+    }
+
+    #[test]
+    fn mbps_is_bytes_times_eight_over_seconds_and_refuses_a_zero_duration() {
+        // 4 MB / 4 秒 = 8.388608 Mbps
+        assert_eq!(mbps(4 * 1024 * 1024, 4_000), Some(8.388608));
+        assert_eq!(mbps(1024 * 1024, 1_000), Some(8.388608));
+        // 0 字节 / 0 毫秒都不是速度（除零与「一个字节都没传」都要挡掉）
+        assert_eq!(mbps(0, 1_000), None);
+        assert_eq!(mbps(1024, 0), None);
+    }
+
+    #[test]
+    fn the_fake_prober_returns_programmable_latency_udp_and_speed_samples() {
+        let p = FakeProber::new();
+        let u = up(UpstreamKind::Socks5);
+        // 缺省：没测到延迟、UDP 不通、没测速 —— 「未知」不能凭空变成好成绩
+        assert_eq!(p.gateway_tcp_ms(&u), None);
+        assert_eq!(p.stun_binding(&u), UdpProbe::default());
+        assert_eq!(p.speedtest(&u, 1, 1), SpeedSample::default());
+        let (ms, r) = p.timed_get(&u, super::super::LATENCY_PROBE_URL);
+        assert_eq!(ms, None);
+        assert!(matches!(r, Err(ProbeError::Unreachable(_))));
+
+        p.with(|i| {
+            i.tcp_ms = Some(31);
+            i.http_ms = Some(97);
+            i.gets.insert(
+                super::super::LATENCY_PROBE_URL.into(),
+                Ok(HttpProbe {
+                    status: 204,
+                    body: String::new(),
+                }),
+            );
+            i.stun = UdpProbe {
+                ok: true,
+                exit_ip: Some("198.51.100.7".into()),
+                ms: Some(42),
+                note: None,
+            };
+            i.speed = SpeedSample {
+                down_mbps: Some(88.5),
+                up_mbps: Some(12.25),
+                note: None,
+            };
+        });
+        assert_eq!(p.gateway_tcp_ms(&u), Some(31));
+        let (ms, r) = p.timed_get(&u, super::super::LATENCY_PROBE_URL);
+        assert_eq!(ms, Some(97));
+        assert_eq!(r.unwrap().status, 204);
+        assert_eq!(p.stun_binding(&u).exit_ip.as_deref(), Some("198.51.100.7"));
+        assert_eq!(p.speedtest(&u, 1, 1).down_mbps, Some(88.5));
+        assert_eq!(
+            p.calls(),
+            vec![
+                "tcp",
+                "stun",
+                "speed",
+                "timed:https://www.google.com/generate_204",
+                "tcp",
+                "timed:https://www.google.com/generate_204",
+                "stun",
+                "speed",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_http_upstream_never_claims_udp() {
+        // sing-box 的 http 出站没有 UDP 能力，协议层也没有 UDP ASSOCIATE：恒不通、要标注
+        let p = ReqwestProber::with_timeout(1);
+        let v = p.stun_binding(&up(UpstreamKind::Http));
+        assert!(!v.ok);
+        assert_eq!(v.ms, None);
+        assert_eq!(v.exit_ip, None);
+        assert_eq!(v.note.as_deref(), Some("HTTP 上游无 UDP"));
     }
 
     #[test]

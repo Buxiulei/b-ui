@@ -378,7 +378,11 @@ fn residential_from_v3(r: V3Residential) -> Residential {
     };
     let mut groups = BTreeMap::new();
     groups.insert(DEFAULT_GROUP.to_string(), group);
-    Residential { groups }
+    Residential {
+        groups,
+        // v3 没有测速旋钮，导入后走代码里的默认（4MB / 1MB / 60 分钟）
+        ..Residential::default()
+    }
 }
 
 fn reality_from_xray(

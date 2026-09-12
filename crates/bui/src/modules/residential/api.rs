@@ -152,6 +152,14 @@ pub struct StatusResponse {
     pub upstreams: Vec<UpstreamRow>,
     pub notes: Vec<String>,
     pub alerts: Vec<String>,
+    /// 一行「当前这条出口为什么是它」（[`health::selection_reason`]，主理人 2026-09-12）。
+    /// 与 [`HealthResponse::selected_reason`] 同一个函数
+    pub selected_reason: Option<String>,
+    /// 「更优候选」防抖进度与上次全量测速时间，与 [`HealthResponse`] 的同名字段同源
+    pub switch_improve_rounds: u32,
+    pub switch_improve_needed: u32,
+    pub switch_improve_candidate: Option<String>,
+    pub last_speedtest_at: Option<String>,
 }
 
 /// v3 的 `urls[]` 行（`web/app.js:665-699 renderResidentialUrls` 逐字段读）
@@ -199,6 +207,9 @@ pub struct UpstreamRow {
     pub blacklist_count: usize,
     /// 最近一次体检报告（`check::CheckReport` 的 JSON）
     pub check: Option<serde_json::Value>,
+    /// 与 [`MemberRow::metrics`] 同源同函数（[`metrics_of`]）
+    #[serde(flatten)]
+    pub metrics: Metrics,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -228,6 +239,16 @@ pub struct HealthResponse {
     pub alerts: Vec<String>,
     pub last_daily_at: Option<String>,
     pub notes: Vec<String>,
+    /// 一行「当前选中 resi-N 的原因」（主理人 2026-09-12）
+    pub selected_reason: Option<String>,
+    /// 「更优候选」防抖的进度：已连续满足 `switch_improve_rounds` 轮，
+    /// 攒到 `switch_improve_needed` 轮才切
+    pub switch_improve_rounds: u32,
+    pub switch_improve_needed: u32,
+    /// 上一行那个候选的 tag（`None` = 本轮没有更优候选）
+    pub switch_improve_candidate: Option<String>,
+    /// 上一次全量测速的时间（面板据此知道速度数字有多新）
+    pub last_speedtest_at: Option<String>,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -266,6 +287,54 @@ pub struct MemberRow {
     pub google_ok: Option<bool>,
     pub google_at: Option<String>,
     pub upstream_id: Uuid,
+    /// 延迟 / 速度 / UDP 指标（主理人 2026-09-12）。与 [`UpstreamRow`] 的同名字段
+    /// **同源同函数**（[`metrics_of`]），面板两处显示的必须是同一个数
+    #[serde(flatten)]
+    pub metrics: Metrics,
+}
+
+/// 一个成员的延迟 / 速度 / UDP 指标。`status` 的 [`UpstreamRow`] 与 `health` 的
+/// [`MemberRow`] 都 flatten 它 —— 同一份数字不许有两套算法。
+/// 每一项都是 `Option`：**「没测过」必须与「0」区分开**，否则面板会把一条什么都没测
+/// 的上游显示成延迟最低、也会让运维以为它最快。
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+pub struct Metrics {
+    /// 经上游的完整 HTTP 往返延迟（毫秒），选路用的就是 p50
+    pub latency_p50_ms: Option<u64>,
+    pub latency_p95_ms: Option<u64>,
+    /// 到上游网关的 TCP 建连耗时（毫秒）
+    pub tcp_p50_ms: Option<u64>,
+    pub tcp_p95_ms: Option<u64>,
+    /// 最近若干次测速的中位数（Mbps）与测速时间
+    pub down_mbps: Option<f64>,
+    pub up_mbps: Option<f64>,
+    pub speed_at: Option<String>,
+    pub speed_note: Option<String>,
+    /// 经该上游 SOCKS5 UDP ASSOCIATE + STUN 的结论、UDP 出口 IP 与往返 p50
+    pub udp_ok: Option<bool>,
+    pub udp_exit_ip: Option<String>,
+    pub udp_p50_ms: Option<u64>,
+    pub udp_note: Option<String>,
+    pub udp_at: Option<String>,
+}
+
+/// `runtime.health[<id>]` → [`Metrics`]。**唯一**一份投影
+pub fn metrics_of(h: &state::HealthState) -> Metrics {
+    Metrics {
+        latency_p50_ms: state::percentile(&h.http_ms, 50.0),
+        latency_p95_ms: state::percentile(&h.http_ms, 95.0),
+        tcp_p50_ms: state::percentile(&h.tcp_ms, 50.0),
+        tcp_p95_ms: state::percentile(&h.tcp_ms, 95.0),
+        down_mbps: state::median(&h.down_mbps),
+        up_mbps: state::median(&h.up_mbps),
+        speed_at: h.speed_at.clone(),
+        speed_note: h.speed_note.clone(),
+        udp_ok: h.udp_ok,
+        udp_exit_ip: h.udp_exit_ip.clone(),
+        udp_p50_ms: state::percentile(&h.udp_ms, 50.0),
+        udp_note: h.udp_note.clone(),
+        udp_at: h.udp_at.clone(),
+    }
 }
 
 /// v3 `members[].egress`：`type` 是中文串（`web/app.js:1095` 用 `/IDC|机房/i` 判色）
@@ -567,6 +636,11 @@ pub fn status_of(s: &SchemaState, r: &state::ResiRuntime) -> StatusResponse {
                 .and_then(|h| h.google_at.clone()),
             blacklist_count: auto_count(&g, u.id),
             check: r.checks.get(&u.id.to_string()).cloned(),
+            metrics: r
+                .health
+                .get(&u.id.to_string())
+                .map(metrics_of)
+                .unwrap_or_default(),
         })
         .collect();
     let v = selected.and_then(|u| u.verified.clone());
@@ -608,6 +682,14 @@ pub fn status_of(s: &SchemaState, r: &state::ResiRuntime) -> StatusResponse {
         upstreams,
         notes: notes(),
         alerts: state::visible_alerts(&g, r),
+        // 真源是 `runtime.selected_upstream_id`（§C），所以理由也按它算
+        selected_reason: r
+            .selected_upstream_id
+            .map(|id| health::selection_reason(&g, r, id)),
+        switch_improve_rounds: r.improve_rounds,
+        switch_improve_needed: crate::modules::residential::SWITCH_IMPROVE_ROUNDS,
+        switch_improve_candidate: r.improve_candidate_id.and_then(|id| clash::tag_of(&g, id)),
+        last_speedtest_at: r.last_speedtest_at.clone(),
     }
 }
 
@@ -906,6 +988,14 @@ async fn get_health(State(app): State<AppState>) -> ApiResult {
         alerts: state::visible_alerts(&g, &r),
         last_daily_at: r.last_daily_at.clone(),
         notes: health_notes(),
+        // 理由按 runtime 记的真源算（§C）；tag 现算
+        selected_reason: r
+            .selected_upstream_id
+            .map(|id| health::selection_reason(&g, &r, id)),
+        switch_improve_rounds: r.improve_rounds,
+        switch_improve_needed: crate::modules::residential::SWITCH_IMPROVE_ROUNDS,
+        switch_improve_candidate: r.improve_candidate_id.and_then(|id| clash::tag_of(&g, id)),
+        last_speedtest_at: r.last_speedtest_at.clone(),
     };
     if !g.pool_active() {
         return Ok(Json(resp).into_response());
@@ -933,6 +1023,8 @@ async fn get_health(State(app): State<AppState>) -> ApiResult {
             google_ok: h.google_ok,
             google_at: h.google_at.clone(),
             upstream_id: u.id,
+            // 与 status_of 的 UpstreamRow 同一个函数：面板两处是同一个数
+            metrics: metrics_of(&h),
         });
         resp.urls.push(HealthUrlRow {
             host: u.host.clone(),
@@ -1424,6 +1516,121 @@ mod tests {
             "status 与 health 的同名字段必须永远相等（同一个 auto_count）"
         );
         assert!(v["members"][0]["priority"].is_number());
+    }
+
+    #[tokio::test]
+    async fn health_and_status_expose_latency_speed_udp_and_why_this_exit_is_selected() {
+        // 主理人 2026-09-12：巡检要给出延迟 p50/p95、上下行 Mbps、最近测速时间、
+        // 是否满足切换条件，并说清「当前选中 resi-N 的原因」
+        let d = tempfile::tempdir().unwrap();
+        let h = harness(&d).await;
+        let id = rstate::group_of(&*h.ctx.store.read().await).upstreams[0].id;
+        rstate::update(&h.ctx.runtime, |r| {
+            let x = r.health.entry(id.to_string()).or_default();
+            for ms in [80u64, 100, 300] {
+                rstate::record_latency(x, Some(ms), Some(ms / 3), Some(ms / 2));
+            }
+            rstate::record_speed(
+                x,
+                Some(88.5),
+                Some(12.25),
+                None,
+                time::macros::datetime!(2026-09-12 00:00:00 UTC),
+            );
+            rstate::record_udp(
+                x,
+                &crate::modules::residential::proxy::UdpProbe {
+                    ok: true,
+                    exit_ip: Some("198.51.100.9".into()),
+                    ms: Some(40),
+                    note: None,
+                },
+                time::macros::datetime!(2026-09-12 00:00:00 UTC),
+            );
+            r.improve_rounds = 2;
+            r.improve_candidate_id = Some(id);
+        })
+        .await;
+        let (_, v) = call(&h.app, "GET", "/api/residential/health", None).await;
+        let m = &v["members"][0];
+        assert_eq!(m["latency_p50_ms"], 100, "80/100/300 的 p50");
+        assert_eq!(m["latency_p95_ms"], 300);
+        assert_eq!(m["tcp_p50_ms"], 33);
+        assert_eq!(m["down_mbps"], 88.5);
+        assert_eq!(m["up_mbps"], 12.25);
+        assert_eq!(m["speed_at"], "2026-09-12T00:00:00Z");
+        assert_eq!(m["udp_ok"], true);
+        assert_eq!(m["udp_exit_ip"], "198.51.100.9");
+        // udp_ms 样本是 [40, 50, 150, 40]（三轮 record_latency + 一次 record_udp）⇒ p50 = 40
+        assert_eq!(m["udp_p50_ms"], 40, "UDP 耗时来自 STUN 往返，单独一列");
+        // 防抖进度：面板要能看出「还差几轮才会切」
+        assert_eq!(v["switch_improve_rounds"], 2);
+        assert_eq!(
+            v["switch_improve_needed"],
+            crate::modules::residential::SWITCH_IMPROVE_ROUNDS
+        );
+        assert!(
+            v["selected_reason"].as_str().unwrap().contains("唯一"),
+            "夹具只有一条上游：{v}"
+        );
+        // status 的同名字段读同一处 runtime.health，必须一字不差
+        let (_, sv) = call(&h.app, "GET", "/api/residential/status", None).await;
+        let u = &sv["upstreams"][0];
+        for k in [
+            "latency_p50_ms",
+            "latency_p95_ms",
+            "down_mbps",
+            "up_mbps",
+            "udp_ok",
+            "udp_exit_ip",
+        ] {
+            assert_eq!(u[k], m[k], "status 与 health 的 {k} 必须相等");
+        }
+        assert_eq!(sv["selected_reason"], v["selected_reason"]);
+        // 防抖进度与上次测速时间在 status 上也要有（口径：health / status / API 都给）
+        assert_eq!(sv["switch_improve_rounds"], v["switch_improve_rounds"]);
+        assert_eq!(sv["switch_improve_needed"], v["switch_improve_needed"]);
+        assert_eq!(sv["last_speedtest_at"], v["last_speedtest_at"]);
+        // CLI 的渲染吃同一份 JSON：延迟 / 速度 / UDP / 选路原因都要出现在人读的那几行里
+        let text = crate::modules::residential::cli::format_health(&v);
+        assert!(text.contains("延迟 p50 100"), "{text}");
+        assert!(text.contains("p95 300"), "{text}");
+        assert!(text.contains("88.5"), "{text}");
+        assert!(text.contains("UDP 通"), "{text}");
+        assert!(text.contains("198.51.100.9"), "{text}");
+        assert!(text.contains("选路原因"), "{text}");
+        assert!(text.contains("2/3"), "防抖进度也要看得到：{text}");
+        let stext = crate::modules::residential::cli::format_status(&sv);
+        assert!(stext.contains("选路原因"), "{stext}");
+        assert!(stext.contains("2/3"), "{stext}");
+        assert!(stext.contains("88.5"), "{stext}");
+    }
+
+    #[tokio::test]
+    async fn an_unmeasured_member_renders_as_unknown_not_as_zero() {
+        // 「没测过」与「0 毫秒 / 0 Mbps」必须区分开：前者不该在面板上显示成最优
+        let d = tempfile::tempdir().unwrap();
+        let h = harness(&d).await;
+        let (_, v) = call(&h.app, "GET", "/api/residential/health", None).await;
+        let m = &v["members"][0];
+        for k in [
+            "latency_p50_ms",
+            "latency_p95_ms",
+            "tcp_p50_ms",
+            "udp_p50_ms",
+            "down_mbps",
+            "up_mbps",
+            "speed_at",
+            "udp_ok",
+            "udp_exit_ip",
+        ] {
+            assert_eq!(m[k], serde_json::Value::Null, "{k} 没测过就该是 null");
+        }
+        let text = crate::modules::residential::cli::format_health(&v);
+        assert!(text.contains("延迟 p50 - / p95 - ms"), "{text}");
+        assert!(text.contains("↓- / ↑- Mbps"), "{text}");
+        assert!(text.contains("UDP 未知"), "{text}");
+        assert!(text.contains("没有明显更优的候选"), "{text}");
     }
 
     #[tokio::test]

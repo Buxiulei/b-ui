@@ -226,6 +226,80 @@ fn pct(v: &serde_json::Value, k: &str) -> i64 {
     (v.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0) * 100.0).round() as i64
 }
 
+/// 一个数字字段的人读形态；**没测过打 `-`**，绝不打 0 —— 面板与终端上「未知」和
+/// 「0 毫秒 / 0 Mbps」是两回事（后者会被误读成最优）
+fn num(v: &serde_json::Value, k: &str) -> String {
+    match v.get(k) {
+        Some(serde_json::Value::Number(n)) => match n.as_u64() {
+            Some(u) => u.to_string(),
+            // 速度是浮点，一位小数就够看
+            None => format!("{:.1}", n.as_f64().unwrap_or_default()),
+        },
+        _ => "-".into(),
+    }
+}
+
+/// 延迟一段：`延迟 p50 100 / p95 300 ms（TCP p50 33 ms）`
+fn latency_text(v: &serde_json::Value) -> String {
+    format!(
+        "延迟 p50 {} / p95 {} ms（TCP p50 {} ms）",
+        num(v, "latency_p50_ms"),
+        num(v, "latency_p95_ms"),
+        num(v, "tcp_p50_ms"),
+    )
+}
+
+/// 速度一段：`↓88.5 / ↑12.3 Mbps（测于 …）`
+fn speed_text(v: &serde_json::Value) -> String {
+    format!(
+        "↓{} / ↑{} Mbps（测于 {}）",
+        num(v, "down_mbps"),
+        num(v, "up_mbps"),
+        as_str(v, "speed_at"),
+    )
+}
+
+/// UDP 一段：`UDP 通（198.51.100.9，p50 50 ms）` / `UDP 不通（HTTP 上游无 UDP）`
+fn udp_text(v: &serde_json::Value) -> String {
+    match v.get("udp_ok").and_then(|x| x.as_bool()) {
+        Some(true) => format!(
+            "UDP 通（{}，p50 {} ms）",
+            as_str(v, "udp_exit_ip"),
+            num(v, "udp_p50_ms")
+        ),
+        Some(false) => format!("UDP 不通（{}）", as_str(v, "udp_note")),
+        None => "UDP 未知".into(),
+    }
+}
+
+/// 选路那几行：`选路原因` + 「更优候选」防抖进度 + 上次全量测速时间。
+/// **status / health 共用**（两处的字段同源，渲染也不许有两份）。
+fn selection_lines(v: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(why) = v.get("selected_reason").and_then(|x| x.as_str()) {
+        out.push(format!("选路原因：{why}"));
+    }
+    // 防抖进度：面板与终端都要看得出「还差几轮才会切」
+    let (rounds, needed) = (
+        as_u64(v, "switch_improve_rounds"),
+        as_u64(v, "switch_improve_needed"),
+    );
+    if needed > 0 {
+        out.push(
+            match v.get("switch_improve_candidate").and_then(|x| x.as_str()) {
+                Some(tag) => {
+                    format!(
+                        "切换条件：{tag} 已连续 {rounds}/{needed} 轮延迟 / 速度更优（攒满才切）"
+                    )
+                }
+                None => format!("切换条件：当前没有明显更优的候选（0/{needed} 轮）"),
+            },
+        );
+        out.push(format!("上次全量测速：{}", as_str(v, "last_speedtest_at")));
+    }
+    out
+}
+
 /// `status` 的人类可读渲染。**只读**传入的 JSON 字段，绝不打印 `password`（服务端也不回它）。
 /// status / health 共用的一行：sing-box 的 http 出站没有 UDP 能力，池里混一条就整池不走 UDP。
 fn udp_line(v: &serde_json::Value) -> String {
@@ -270,6 +344,7 @@ pub fn format_status(v: &serde_json::Value) -> String {
         as_str(v, "active_tag"),
         as_str(v, "active_upstream_id")
     ));
+    out.extend(selection_lines(v));
     out.push(udp_line(v));
     if as_bool(v, "selected_pending_persist") {
         out.push("  自动切换后的落点尚未持久化，将在每日 04:00 写回".to_string());
@@ -294,6 +369,13 @@ pub fn format_status(v: &serde_json::Value) -> String {
             as_u64(u, "priority"),
             google_label(&row),
             as_str(u, "displayUrl"),
+        ));
+        // 延迟 / 速度 / UDP 另起一行：上一行已经满了，挤在一起没人读得下去
+        out.push(format!(
+            "      {} {} {}",
+            latency_text(&row),
+            speed_text(&row),
+            udp_text(&row)
         ));
     }
     let b = v.get("blacklist").cloned().unwrap_or(serde_json::json!({}));
@@ -327,6 +409,7 @@ pub fn format_health(v: &serde_json::Value) -> String {
         selected,
     )];
     out.push(format!("分流关键字 {} 条", as_u64(v, "domains_count")));
+    out.extend(selection_lines(v));
     out.push(udp_line(v));
     out.push(format!(
         "当前出口 IP：{}（{}）",
@@ -359,6 +442,13 @@ pub fn format_health(v: &serde_json::Value) -> String {
             as_str(&e, "type"),
             as_str(&e, "isp"),
             as_u64(m, "blacklist_count"),
+        ));
+        // 指标另起一行：主理人要的「延迟、上下行速度、UDP」三项，挤进上一行读不了
+        out.push(format!(
+            "    {} {} {}",
+            latency_text(m),
+            speed_text(m),
+            udp_text(m)
         ));
     }
     for n in as_arr(v, "notes") {
