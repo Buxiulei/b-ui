@@ -7,6 +7,7 @@ pub mod engine;
 pub mod error;
 pub mod fake;
 pub mod import_v3;
+pub mod menu;
 pub mod net;
 pub mod paths;
 pub mod profiles;
