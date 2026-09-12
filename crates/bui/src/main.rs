@@ -63,7 +63,13 @@ async fn dispatch(command: Command) -> Result<()> {
         Command::ImportV3 { .. } => not_yet("import-v3"),
         Command::AuthHook { .. } => unreachable!("auth-hook 已在 main 里提前返回"),
         Command::Menu => not_yet("menu"),
-        Command::HardenSsh => not_yet("harden-ssh"),
+        Command::HardenSsh => {
+            commands::harden_ssh::run(
+                bui_schema::paths::Paths::default_server(),
+                std::sync::Arc::new(sys::real::RealHost::new()),
+            )
+            .await
+        }
     }
 }
 
