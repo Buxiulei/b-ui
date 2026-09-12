@@ -165,6 +165,10 @@ pub async fn check_round(
 ) -> anyhow::Result<RoundOutcome> {
     let mut out = RoundOutcome::default();
     let g = state::group_of(&*ctx.store.read().await);
+    // R1 之前按位置名写进 alerts 的上游告警、以及已被删出池的 uuid 留下的孤儿告警：
+    // 每轮清一次（只在有变化时写盘）。放在 pool_active 之前 —— 池被清空时
+    // 那些条目同样该消失。
+    state::purge_stale_alerts(&ctx.runtime, &g).await;
     if !g.pool_active() {
         out.notes
             .push("住宅池未启用或为空，跳过巡检（relay 已 fail-open 直连）".into());
@@ -794,6 +798,40 @@ mod tests {
             "成功一轮即清：{:?}",
             r.upstream_alerts
         );
+    }
+
+    #[tokio::test]
+    async fn a_round_purges_legacy_and_orphan_alerts_and_clears_the_live_ones_on_success() {
+        // 真机（bwg-rick 升级到含 R1 的 v4 后）：三条 Decodo 连续成功 109 次、体检全通，
+        // status 仍挂着 5 条 R1 之前按位置名写进 alerts 的旧告警。一轮巡检就该清干净。
+        let d = tempfile::tempdir().unwrap();
+        let (c, _host) = ctx(&d, &[10, 20]).await;
+        let clash = Arc::new(FakeClash::new(Some("resi-1")));
+        let live = Uuid::from_u128(1);
+        let gone = Uuid::from_u128(0xdead);
+        rstate::update(&c.runtime, |r| {
+            rstate::push_alert(r, "上游 url-3 凭据失效（407）");
+            rstate::push_alert(
+                r,
+                "上游 url-6 凭据失效（407 / SOCKS5 认证被拒），请更新凭据",
+            );
+            rstate::set_upstream_alert(r, gone, "上游 old.example.net:10007 凭据失效（407）");
+            rstate::set_upstream_alert(r, live, "上游 isp1.example.net:10007 凭据失效（407）");
+        })
+        .await;
+
+        check_once(&c, by_host(&[], &[]), clash.clone())
+            .await
+            .unwrap();
+        let g = rstate::group_of(&*c.store.read().await);
+        let r = rstate::read(&c.runtime).await;
+        assert!(
+            r.alerts.is_empty() && r.upstream_alerts.is_empty(),
+            "遗留/孤儿告警清掉，探通的那条也消警：{:?} / {:?}",
+            r.alerts,
+            r.upstream_alerts
+        );
+        assert!(rstate::visible_alerts(&g, &r).is_empty());
     }
 
     #[tokio::test]
