@@ -263,8 +263,8 @@ pub async fn debounce_loop(bus: EventBus, tx: tokio::sync::mpsc::Sender<bool>) {
 /// 只刷内核、**不自动换 bui 自己**：`bui upgrade` 仍由面板 / CLI 手动触发。
 ///
 /// `url_override` = `$BUI_MANIFEST_URL`（守护进程没有命令行开关）。没覆盖就跟 `latest`，
-/// 404 时按预发布通道回退——与 `bui upgrade` 用的是 [`crate::kernels::fetch_manifest_with`]
-/// 这同一套解析。
+/// 404 时无条件回退到 releases 列表里最新的预发布——与 `bui upgrade` 用的是
+/// [`crate::kernels::fetch_manifest_with`] 这同一套解析；两边都拿不到就只 info 一行。
 pub async fn selfcheck_loop(
     ctx: DaemonCtx,
     manifest: Arc<RwLock<Option<Manifest>>>,
@@ -277,21 +277,8 @@ pub async fn selfcheck_loop(
     loop {
         let f = fetcher.clone();
         let u = url_override.clone();
-        // 缓存 manifest 里记的 tag 是「本机是否在预发布通道」的信号之一（版本号是纯
-        // semver，认不出 rc：见 kernels 模块头）
-        let cached = manifest
-            .read()
-            .ok()
-            .and_then(|g| g.as_ref().and_then(|m| m.tag.clone()));
         match tokio::task::spawn_blocking(move || {
-            crate::kernels::fetch_manifest_with(
-                f.as_ref(),
-                None,
-                None,
-                u.as_deref(),
-                crate::kernels::BUILD_TAG,
-                cached.as_deref(),
-            )
+            crate::kernels::fetch_manifest_with(f.as_ref(), None, None, u.as_deref())
         })
         .await
         {
@@ -1147,8 +1134,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn selfcheck_follows_the_prerelease_channel_when_latest_is_404() {
-        // 裁决记录「发布：预发布与首推（2026-09-12）」：rc 阶段 releases/latest 必然 404，
-        // 每日自检必须走 kernels 里那同一套回退，而不是每天 warn 一条「拉取失败」。
+        // 裁决记录「发布：预发布与首推（2026-09-12）」：仓库里只有预发布时 releases/latest
+        // 必然 404，每日自检必须走 kernels 里那同一套**无条件**回退（本机没有任何缓存、
+        // 版本号是纯 semver，认不出 rc），而不是每天 warn 一条「拉取失败」。
         let host = Arc::new(FakeHost::new());
         let d = tempfile::tempdir().unwrap();
         let ctx = ctx_for(host.clone(), &d).await;
@@ -1167,13 +1155,8 @@ mod tests {
             ),
             (rc_url, rc_manifest.into_bytes()),
         ])));
-        // 「本机在预发布通道」的信号：manifest 缓存里记的 tag 是 rc（version 是纯 semver，
-        // 这正是一台 rc1 机器落盘的缓存形状）
-        let handle = Arc::new(std::sync::RwLock::new(Some(Manifest {
-            version: "4.0.0".into(),
-            tag: Some("v4.0.0-rc1".into()),
-            ..Default::default()
-        })));
+        // bwg-rick 的真机形状：跑着 4.0.0（纯 semver），还没有任何 manifest 缓存
+        let handle = Arc::new(std::sync::RwLock::new(None));
         let task = tokio::spawn(selfcheck_loop(ctx.clone(), handle.clone(), fetcher, None));
         tokio::time::sleep(std::time::Duration::from_secs(jitter + 3)).await;
         assert_eq!(
@@ -1186,7 +1169,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn selfcheck_survives_a_404_with_nothing_to_fall_back_to() {
-        // 正式版 + latest 还没发布：只记一行 info，不写缓存、不请求对账、更不会退出循环
+        // latest 404 且 releases 列表也拉不到（什么都没发 / 断网）：只记一行 info，
+        // 不写缓存、不请求对账、更不会退出循环
         let host = Arc::new(FakeHost::new());
         let d = tempfile::tempdir().unwrap();
         let ctx = ctx_for(host.clone(), &d).await;
