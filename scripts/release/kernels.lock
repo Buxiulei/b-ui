@@ -1,0 +1,12 @@
+# 由 scripts/release/pin-kernels.sh --write 生成，勿手工编辑（生成时间 2026-09-12T08:35:47Z）
+# kernel role version arch sha256 url
+sing-box target 1.14.0 amd64 2375de6999f4f56ab46b4fc5ddf26a6aba1d3e61a0f4e7ddec2f4690457d5f63 https://github.com/SagerNet/sing-box/releases/download/v1.14.0/sing-box-1.14.0-linux-amd64.tar.gz
+sing-box target 1.14.0 arm64 04d9b40bc98dc55b6f509ce3292145c65478f65866bea64826ebb2f382385088 https://github.com/SagerNet/sing-box/releases/download/v1.14.0/sing-box-1.14.0-linux-arm64.tar.gz
+xray target 26.3.27 amd64 23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-linux-64.zip
+xray target 26.3.27 arm64 4d30283ae614e3057f730f67cd088a42be6fdf91f8639d82cb69e48cde80413c https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-linux-arm64-v8a.zip
+hysteria target 2.12.2 amd64 6493dfffd55b5883f64c76c63880ecc32988f0c568c9ca9014907877b4d55f94 https://github.com/apernet/hysteria/releases/download/app/v2.12.2/hysteria-linux-amd64
+hysteria target 2.12.2 arm64 ebfacc1ec3a0edfd742cd68ce17f292a6092e606b9d11f99b035c1d888f3d709 https://github.com/apernet/hysteria/releases/download/app/v2.12.2/hysteria-linux-arm64
+caddy target 2.11.4 amd64 527fbf917c39189a1e3b31d34fa955601680b2d5c8055d2a87b8b9588dec7bb9 https://github.com/caddyserver/caddy/releases/download/v2.11.4/caddy_2.11.4_linux_amd64.tar.gz
+caddy target 2.11.4 arm64 52d42ae12b3462097e9868da6dfed3c9648ae12edd3b3638102312af84cb6904 https://github.com/caddyserver/caddy/releases/download/v2.11.4/caddy_2.11.4_linux_arm64.tar.gz
+sing-box check 1.12.25 amd64 a1ec76e2b6b139eb747a1b1ebee7d14b8d4be5a833596cad8070a31ef960301f https://github.com/SagerNet/sing-box/releases/download/v1.12.25/sing-box-1.12.25-linux-amd64.tar.gz
+sing-box check 1.13.21 amd64 24f9ef8e7234e13e71e74c3598a4164c5fe07b7b67ccc6e96cf68b54789f72cd https://github.com/SagerNet/sing-box/releases/download/v1.13.21/sing-box-1.13.21-linux-amd64.tar.gz
