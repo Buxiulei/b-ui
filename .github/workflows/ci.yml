@@ -1,0 +1,126 @@
+name: CI
+
+on:
+  push:
+    branches: [v4]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: 缓存 cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-lint-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      - name: rustfmt / clippy 组件
+        run: rustup component add rustfmt clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: 安装 shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends shellcheck
+      - name: 收集脚本清单
+        id: scripts
+        run: |
+          set -euo pipefail
+          # 不用 'scripts/**/*.sh' 这种 pathspec：git 的 ** 要求中间至少一层目录，
+          # 直接放在 scripts/ 下的脚本会被漏掉（本机在 server/**/*.sh 上实测过漏匹配）。
+          {
+            printf 'files<<EOF\n'
+            git ls-files -- install.sh scripts | grep -E '\.sh$'
+            printf 'EOF\n'
+          } >> "$GITHUB_OUTPUT"
+      - name: bash -n
+        run: |
+          while IFS= read -r f; do
+            [[ -n "$f" ]] || continue
+            bash -n "$f"
+          done <<< '${{ steps.scripts.outputs.files }}'
+      - name: shellcheck -S error
+        run: |
+          while IFS= read -r f; do
+            [[ -n "$f" ]] || continue
+            shellcheck -S error "$f"
+          done <<< '${{ steps.scripts.outputs.files }}'
+      - name: 解包工具（脚本测试要 zip/unzip）
+        run: sudo apt-get install -y --no-install-recommends zip unzip
+      - name: shell 脚本测试
+        run: bash scripts/tests/run-all.sh
+      - name: 版本号三处一致
+        run: bash scripts/release/check-version.sh
+      - name: 内核 lock 没有漂移出轨道
+        run: bash scripts/release/pin-kernels.sh --check
+
+  test:
+    name: test (${{ matrix.singbox }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        singbox: ["1.12", "1.13", "1.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: 缓存 cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-test-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      - name: 准备内核
+        uses: ./.github/actions/setup-kernels
+        with:
+          dir: ${{ runner.temp }}/kernels-amd64
+          role: all
+          arch: amd64
+      - name: 把本矩阵的 sing-box 放到 PATH 首位
+        run: |
+          set -euo pipefail
+          BIN="$RUNNER_TEMP/pathbin"
+          mkdir -p "$BIN"
+          SB="$RUNNER_TEMP/kernels-amd64/singbox/${{ matrix.singbox }}/sing-box"
+          if [[ ! -x "$SB" ]]; then
+            SB="$RUNNER_TEMP/kernels-amd64/bin/sing-box"   # target minor（1.14）不在 check 目录里
+          fi
+          ln -sf "$SB" "$BIN/sing-box"
+          ln -sf "$RUNNER_TEMP/kernels-amd64/bin/xray" "$BIN/xray"
+          ln -sf "$RUNNER_TEMP/kernels-amd64/bin/hysteria" "$BIN/hysteria"
+          echo "$BIN" >> "$GITHUB_PATH"
+          # caddy 的 validate 用例（core_files.rs）不查 PATH，只认三个绝对路径，
+          # 而 ubuntu-24.04 镜像不预装 caddy：软链进 /usr/local/bin 才能真跑校验。
+          sudo ln -sf "$RUNNER_TEMP/kernels-amd64/bin/caddy" /usr/local/bin/caddy
+          caddy version | head -1
+      - name: 确认版本就是矩阵要求的
+        run: |
+          set -euo pipefail
+          got=$(sing-box version | awk '/^sing-box version/ {print $3; exit}')
+          echo "sing-box = $got"
+          case "$got" in ${{ matrix.singbox }}.*) ;; *) echo "版本不符：期望 ${{ matrix.singbox }}.x"; exit 1 ;; esac
+      - name: cargo test（渲染结果过真实内核）
+        run: |
+          set -euo pipefail
+          cargo test --workspace -- --nocapture 2>&1 | tee "$RUNNER_TEMP/test.log"
+          # 只判「内核校验漏跑」这一种 skip：sing-box / xray / hysteria 没在 PATH 上，
+          # 或 caddy 不在三个绝对路径上。测试里另有两种设计内的 skip（缺 P0 的 v3
+          # fixture、P5 删掉 server/core.sh 后的 v3 sysctl 对照），不能算漏跑判红。
+          if grep -Eq 'skipped: ((sing-box|xray|hysteria) not found|本机没有 caddy 二进制)' "$RUNNER_TEMP/test.log"; then
+            echo "内核校验被跳过，说明没找到内核二进制：CI 不接受 skip"
+            grep -E 'skipped: ' "$RUNNER_TEMP/test.log"
+            exit 1
+          fi
