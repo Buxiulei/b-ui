@@ -1161,7 +1161,8 @@ select {
 
 .resi-member {
     display: grid;
-    grid-template-columns: 52px minmax(0, 1fr) 58px minmax(0, 1fr) minmax(0, 76px);
+    /* v4 P3 追加「延迟 / 速度 / UDP」三列（数字都短，给固定窄列） */
+    grid-template-columns: 52px minmax(0, 1fr) 58px 52px 48px 32px minmax(0, 1fr) minmax(0, 76px);
     gap: 8px;
     align-items: center;
     padding: 6px 4px;

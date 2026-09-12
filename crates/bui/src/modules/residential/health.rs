@@ -9,7 +9,7 @@
 
 use super::{
     clash, proxy, state, HEALTH_INTERVAL_SECS, HEALTH_PROBE_HOST, HEALTH_PROBE_URL, HEALTH_TRIES,
-    SWITCH_MIN_INTERVAL_SECS,
+    SWITCH_IMPROVE_ROUNDS, SWITCH_LATENCY_GAIN, SWITCH_MIN_INTERVAL_SECS, SWITCH_SPEED_GAIN,
 };
 use crate::api::Event;
 use crate::reconcile::DaemonCtx;
@@ -41,46 +41,70 @@ pub struct RoundOutcome {
 /// 一个成员一轮探测的结果。`auth_failed` 单独带出来，是因为凭据失效要**单独告警**
 /// （管理员必须换凭据，不是等它自愈），而 `check_once` 是 async、不能为了补判一次
 /// 就再同步调一次 `Prober`（`reqwest::blocking` 在 async 上下文会 panic）。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MemberProbe {
     pub ok: bool,
     pub auth_failed: bool,
     /// 经该上游还能不能正常用 Google 搜索（`None` = 本轮没探到结论）。
     /// 主理人硬要求「住宅上游不封 Google」，所以它参与选路（R2 ②）
     pub google_ok: Option<bool>,
+    /// 本轮**经上游的完整 HTTP 往返**耗时（毫秒）；`None` = 没测到。
+    /// 与连通性判定复用同一次请求（[`probe_reachable`] 的 try #1）
+    pub http_ms: Option<u64>,
+    /// 本轮**到上游网关**的 TCP 建连耗时（毫秒）
+    pub tcp_ms: Option<u64>,
+    /// 本轮的 UDP 探测（socks5 走 STUN，http 恒不通 + 标注「HTTP 上游无 UDP」）
+    pub udp: proxy::UdpProbe,
 }
 
-/// 单成员一轮探测：可达性（[`HEALTH_PROBE_URL`]）+ Google 可达性各一轮。
+/// 单成员一轮探测：可达性（含延迟样本）+ Google 可达性 + UDP 各一轮。
 pub fn probe_member(p: &dyn Prober, up: &Upstream) -> MemberProbe {
+    // 到网关的 TCP 建连耗时：不经隧道、不发请求。它只是**指标**，连不上也照样往下探
+    let tcp_ms = p.gateway_tcp_ms(up);
     let mut probe = probe_reachable(p, up);
+    probe.tcp_ms = tcp_ms;
     // R2 ②：每轮额外经该上游打一次真实 Google 搜索。凭据失效时不打——每条连接都会
     // 被拒，探不出任何关于 Google 的结论，只会白等 GOOGLE_PROBE_TIMEOUT_SECS。
+    // UDP 同理（SOCKS5 认证会被直接拒）
     if !probe.auth_failed {
         probe.google_ok = proxy::google_ok_of(&p.google_search(up));
+        probe.udp = p.stun_binding(up);
     }
     probe
 }
 
-/// 可达性那一半：对 [`HEALTH_PROBE_URL`] 最多 [`HEALTH_TRIES`] 次，任一成功即本轮健康。
+/// 可达性那一半：最多 [`HEALTH_TRIES`] 次，任一成功即本轮健康。
+/// **第 1 次打 [`super::LATENCY_PROBE_URL`] 并计时**——延迟样本与连通性判定复用同一次
+/// 请求，所以加了指标之后健康成员每轮的 HTTP 请求数没变（主理人口径「避免多发」）；
+/// 第 2 次打 [`HEALTH_PROBE_URL`]，两个互不相干的目标反而比连打同一个更能分辨
+/// 「上游挂了」与「这个站点挂了」。
 /// **407 / SOCKS5 认证被拒一律算不健康**（调研 §D：凭据失效的上游会把每条连接都拒掉，
 /// 它「可达」但不可用），并且立刻停止重试。
 fn probe_reachable(p: &dyn Prober, up: &Upstream) -> MemberProbe {
-    for _ in 0..HEALTH_TRIES {
-        match p.get(up, HEALTH_PROBE_URL) {
+    let mut http_ms = None;
+    for i in 0..HEALTH_TRIES {
+        let r = if i == 0 {
+            let (ms, r) = p.timed_get(up, super::LATENCY_PROBE_URL);
+            http_ms = ms;
+            r
+        } else {
+            p.get(up, HEALTH_PROBE_URL)
+        };
+        match r {
             // generate_204 正常回 204；任何 2xx/3xx 都说明隧道通了
             Ok(hp) if hp.status < 400 => {
                 return MemberProbe {
                     ok: true,
-                    auth_failed: false,
-                    google_ok: None,
+                    http_ms,
+                    ..Default::default()
                 }
             }
             // 调研 §D：407 的上游「可达」但每条连接都被拒 —— 一律不健康，且不必再试
             Err(ProbeError::AuthFailed) => {
                 return MemberProbe {
-                    ok: false,
                     auth_failed: true,
-                    google_ok: None,
+                    http_ms,
+                    ..Default::default()
                 }
             }
             _ => {}
@@ -92,9 +116,9 @@ fn probe_reachable(p: &dyn Prober, up: &Upstream) -> MemberProbe {
     // 只会报「上游挂了」，spec §5.2 要求的「凭据失效」告警永远不出现。
     let auth_failed = proxy::confirm_auth_failure(p, up, HEALTH_PROBE_HOST);
     MemberProbe {
-        ok: false,
         auth_failed,
-        google_ok: None,
+        http_ms,
+        ..Default::default()
     }
 }
 
@@ -103,8 +127,29 @@ pub fn ids_of(g: &ResidentialGroup) -> Vec<Uuid> {
     g.upstreams.iter().map(|u| u.id).collect()
 }
 
-/// 切换目标。排序键依次是：**「Google 通」优先**（R2 ②，封 Google 的上游对主理人等于
-/// 不可用）→ `priority` 最小 → 近 24h 成功率降序 → 池内下标升序（稳定）。
+/// [`pick_target`] 的排序键，按元组的字典序比较：`(Google 不通, priority, UDP 不通,
+/// 延迟 p50, -下行×1000, -近 24h 成功率×1e6, 池内下标, uuid)`。
+/// 布尔项用 `0 = 好`，降序项取负 —— f64 不能直接排序，也不想引 `total_cmp` 的歧义。
+type SortKey = (u8, u32, u8, u64, i64, i64, usize, Uuid);
+
+/// 切换目标。排序键依次是：
+/// ① **「Google 通」优先**（R2 ②，封 Google 的上游对主理人等于不可用）。
+///    主理人 2026-09-12 的口径写的是「候选 = 健康且 google_ok」，这里落成**第一排序键**
+///    而不是硬过滤：全池都探不到 Google 结论（首轮、或 Google 整域不可达）时硬过滤会让
+///    候选集为空、整池选不出出口，fail-open 比 fail-closed 安全。有一条 Google 通时，
+///    它与过滤等价。
+/// ② `priority` 最小（管理员显式给的偏好，压过下面的实测指标）
+/// ③ **「UDP 通」优先**（主理人 2026-09-12 追加：http 上游没有 UDP，socks5 上游也可能被中
+///    间设备吞 UDP，QUIC / HTTP3 全靠它）
+/// ④ 延迟 p50 最低 → ⑤ 下行中位数最快
+///    （主理人 2026-09-12：「选最健康、最低延迟、速度最快的」）
+/// ⑥ 近 24h 成功率降序 → ⑦ 池内下标升序（稳定）。
+///
+/// ④⑤ 的「未知」一律排在「有数据」之后（延迟按 `u64::MAX`、速度按 0）：没测过不等于
+/// 0 毫秒，否则一条刚加进来、什么都没测的上游会拿到全池最低延迟、直接抢走出口。
+/// ⑥ 留在 ⑤ 之后：主理人给的键到 ⑤ 为止，但两条上游连延迟与速度都齐平时，
+/// 近 24h 成功率仍是比池内下标更有意义的判据。
+///
 /// 管理员手动锁定的上游（`r.manual_selected_id`）只要还在池里且健康就**直接返回**，
 /// 不吃任何排序键（R2 ①）。进出都是 **uuid**（契约决策 §C：运行时主键不用位置键 tag）
 pub fn pick_target(
@@ -120,20 +165,28 @@ pub fn pick_target(
             return Some(m);
         }
     }
-    let mut cands: Vec<(u8, u32, i64, usize, Uuid)> = healthy
+    let mut cands: Vec<SortKey> = healthy
         .iter()
         .filter_map(|id| {
             // 不在当前池里的 uuid 直接忽略（删上游与巡检并发时会出现）
             let idx = g.upstreams.iter().position(|u| u.id == *id)?;
             let h = r.health.get(&id.to_string());
             let rate = h.map(|h| state::success_rate_24h(h, now)).unwrap_or(0.0);
-            // 「未知」与「封了」一起排在「通」之后：没探到结论不该凭空赢过探过的成员
+            // 「未知」与「封了 / 不通」一起排在「通」之后：没探到结论不该凭空赢过探过的
             let google_rank = u8::from(h.and_then(|h| h.google_ok) != Some(true));
-            // 成功率降序 = 放大后取负（f64 不能直接排序，也不想引 total_cmp 的歧义）；
-            // 第四项 idx 让前面全同时按池内下标稳定排序
+            let udp_rank = u8::from(h.and_then(|h| h.udp_ok) != Some(true));
+            // 延迟升序，未知排最后；速度与成功率降序 = 放大后取负
+            // （f64 不能直接排序，也不想引 total_cmp 的歧义）
+            let latency = h.and_then(state::latency_p50).unwrap_or(u64::MAX);
+            let down = h
+                .and_then(|h| state::median(&h.down_mbps))
+                .unwrap_or_default();
             Some((
                 google_rank,
                 g.upstreams[idx].priority,
+                udp_rank,
+                latency,
+                -((down * 1_000.0) as i64),
                 -((rate * 1_000_000.0) as i64),
                 idx,
                 *id,
@@ -141,7 +194,101 @@ pub fn pick_target(
         })
         .collect();
     cands.sort();
-    cands.into_iter().next().map(|(_, _, _, _, id)| id)
+    cands.into_iter().next().map(|c| c.7)
+}
+
+/// 「候选比当前出口**明显**更优」（主理人 2026-09-12 的防抖判据）：延迟 p50 低
+/// ≥ [`SWITCH_LATENCY_GAIN`]，**或**下行中位数快 ≥ [`SWITCH_SPEED_GAIN`]。
+/// 任一侧没数据就不算更优 —— 未知不许赢，否则一条没测过的上游能靠「无数据」抢出口。
+pub fn is_improvement(r: &ResiRuntime, cand: Uuid, cur: Uuid) -> bool {
+    let h = |id: Uuid| r.health.get(&id.to_string());
+    let faster = match (
+        h(cand).and_then(state::latency_p50),
+        h(cur).and_then(state::latency_p50),
+    ) {
+        (Some(a), Some(b)) if b > 0 => (b as f64 - a as f64) / b as f64 >= SWITCH_LATENCY_GAIN,
+        _ => false,
+    };
+    let fatter = match (
+        h(cand).and_then(|x| state::median(&x.down_mbps)),
+        h(cur).and_then(|x| state::median(&x.down_mbps)),
+    ) {
+        (Some(a), Some(b)) if b > 0.0 => (a - b) / b >= SWITCH_SPEED_GAIN,
+        _ => false,
+    };
+    faster || fatter
+}
+
+/// 一行「当前选中 resi-N 的原因」（主理人 2026-09-12）：按 [`pick_target`] 的排序键
+/// 从前往后找第一条**真正起作用**的理由，说人话。纯函数，`health` / `status` / CLI 共用。
+pub fn selection_reason(g: &ResidentialGroup, r: &ResiRuntime, id: Uuid) -> String {
+    let Some(up) = g.upstreams.iter().find(|u| u.id == id) else {
+        return "当前出口已不在池里（成员集刚变过）".into();
+    };
+    if r.manual_selected_id == Some(id) {
+        return "手动锁定（巡检不会按优先级 / 延迟 / 速度把它切走）".into();
+    }
+    let h = |u: &Upstream| r.health.get(&u.id.to_string()).cloned().unwrap_or_default();
+    let healthy: Vec<&Upstream> = g.upstreams.iter().filter(|u| h(u).active).collect();
+    if healthy.len() <= 1 {
+        return "唯一健康的成员".into();
+    }
+    let me = h(up);
+    let others = || healthy.iter().filter(|u| u.id != id);
+    // 排序键 ①：只在「别人确实不行」时才说得上是理由
+    if me.google_ok == Some(true) && others().all(|u| h(u).google_ok != Some(true)) {
+        return "其余健康成员的 Google 不可用（Google 可用是第一排序键）".into();
+    }
+    // 排序键 ②
+    if others().all(|u| u.priority > up.priority) {
+        return format!("优先级最优（{}）", up.priority);
+    }
+    // 排序键 ③④⑤ 都是同优先级内部的比较（priority 压过实测指标）
+    let peers: Vec<&Upstream> = healthy
+        .iter()
+        .copied()
+        .filter(|u| u.priority == up.priority && u.id != id)
+        .collect();
+    if me.udp_ok == Some(true) && peers.iter().all(|u| h(u).udp_ok != Some(true)) {
+        return "同优先级里只有它的 UDP 通".into();
+    }
+    if let Some(ms) = state::latency_p50(&me) {
+        if peers
+            .iter()
+            .all(|u| state::latency_p50(&h(u)).is_none_or(|x| x > ms))
+        {
+            return format!("同优先级里延迟最低（p50 {ms} ms）");
+        }
+    }
+    if let Some(v) = state::median(&me.down_mbps) {
+        if peers
+            .iter()
+            .all(|u| state::median(&h(u).down_mbps).is_none_or(|x| x < v))
+        {
+            return format!("同优先级里下行最快（{v:.1} Mbps）");
+        }
+    }
+    "按 Google / 优先级 / UDP / 延迟 / 速度排序后的首位".into()
+}
+
+/// 测速的用量与周期：常量为默认，`state.residential` 的三个可选字段可覆盖。
+/// 0 与荒唐的大小一律回退 / 夹住 —— 打错一个 0 不该把上游流量打爆，也不该把测速关死。
+pub fn speedtest_cfg(s: &bui_schema::model::State) -> (u64, u64, i64) {
+    let bytes = |v: Option<u64>, dflt: u64| match v {
+        Some(x) if x > 0 => x.min(super::SPEEDTEST_MAX_BYTES),
+        _ => dflt,
+    };
+    (
+        bytes(
+            s.residential.speedtest_down_bytes,
+            super::SPEEDTEST_DOWN_BYTES,
+        ),
+        bytes(s.residential.speedtest_up_bytes, super::SPEEDTEST_UP_BYTES),
+        match s.residential.speedtest_interval_mins {
+            Some(m) if m > 0 => m,
+            _ => super::SPEEDTEST_INTERVAL_MINS,
+        },
+    )
 }
 
 /// 一轮完整巡检（spec §5.3 的全部规则）：自己取「本轮开始时的成员集快照」再转调 [`check_round`]
@@ -186,18 +333,18 @@ pub async fn check_round(
     // 话，删掉一条上游后位置名会被新条目复用，新上游就顶着上一个账号的 407 告警
     let mut auth_alerts: Vec<(Uuid, String)> = Vec::new();
     let mut probed: Vec<(Uuid, bool)> = Vec::new();
-    // 本轮探到的 Google 结论（`None` = 没探到，写回时不动上次的结论）
-    let mut googles: Vec<(Uuid, Option<bool>)> = Vec::new();
+    // 本轮每个成员的完整探测结果（Google 判定、延迟样本、UDP），写回时按 uuid 落账
+    let mut metrics: Vec<(Uuid, MemberProbe)> = Vec::new();
     for (i, up) in ups.iter().enumerate() {
-        let probe = results.get(i).copied().flatten();
-        let ok = probe.map(|x| x.ok).unwrap_or(false);
+        let probe = results.get(i).cloned().flatten();
+        let ok = probe.as_ref().map(|x| x.ok).unwrap_or(false);
         if probe.is_none() {
             out.notes
                 .push(format!("{} 的探测任务异常结束，本轮按不达标处理", up.name));
         }
         // 凭据失效要单独告警：不是网络抖动，管理员必须换凭据（探测结果里直接带出来，
         // 不再为了补判而在 async 上下文里同步调一次 Prober）
-        if probe.map(|x| x.auth_failed).unwrap_or(false) {
+        if probe.as_ref().map(|x| x.auth_failed).unwrap_or(false) {
             auth_alerts.push((
                 up.id,
                 format!(
@@ -208,14 +355,17 @@ pub async fn check_round(
         }
         out.probed.push((tags[i].clone(), ok));
         probed.push((up.id, ok));
-        googles.push((up.id, probe.and_then(|x| x.google_ok)));
+        // 任务异常结束的成员只记「本轮不达标」（上面的 `probed`），指标一个都不落账：
+        // 缺省的 `MemberProbe` 会把 UDP 记成「不通」，那是「没探」不是「不通」
+        if let Some(pr) = probe {
+            metrics.push((up.id, pr));
+        }
     }
 
-    // 规则 3：迟滞 + 24h 样本 + Google 判定。**一轮只写一次 runtime**：每次 update 都是
-    // tmp + fsync + rename，按成员各写一次等于一轮 N 次落盘。凭据失效告警的写入与
-    // 「成功即清」也并进这一次写（下面各分支不再重复落它）。
+    // 规则 3：迟滞 + 24h 样本 + Google 判定 + 延迟 / UDP 样本。**一轮只写一次 runtime**：
+    // 每次 update 都是 tmp + fsync + rename，按成员各写一次等于一轮 N 次落盘。
+    // 凭据失效告警的写入与「成功即清」也并进这一次写（下面各分支不再重复落它）。
     let samples = probed.clone();
-    let verdicts = googles.clone();
     let rt = state::update(&ctx.runtime, move |r| {
         for (id, ok) in samples {
             let h = r.health.entry(id.to_string()).or_default();
@@ -229,12 +379,33 @@ pub async fn check_round(
         for (id, msg) in auth_alerts {
             state::set_upstream_alert(r, id, msg);
         }
-        for (id, google) in verdicts {
+        for (id, m) in metrics {
             let h = r.health.entry(id.to_string()).or_default();
-            state::record_google(h, google, now);
+            state::record_google(h, m.google_ok, now);
+            state::record_latency(h, m.http_ms, m.tcp_ms, None);
+            // 凭据失效那一轮没探 UDP（`probe_member` 跳过了），别把「没探」记成「不通」
+            if !m.auth_failed {
+                state::record_udp(h, &m.udp, now);
+            }
         }
     })
     .await;
+
+    // 每小时一轮**全量测速**（主理人 2026-09-12）：与巡检同一个 tick，不另起调度器；
+    // 到点与否看 runtime 的游标，所以守护进程重启既不会漏测也不会连着测两次。
+    // 放在健康判定之后：测速失败只记 note，一个字节都不影响上面那份判定。
+    let (down_bytes, up_bytes, interval) = speedtest_cfg(&ctx.store.read().await.clone());
+    let due = match rt.last_speedtest_at.as_deref().and_then(parse_rfc3339) {
+        // 时钟回跳（NTP 校时）不该把测速永久锁死
+        Some(t) => {
+            let mins = (now - t).whole_minutes();
+            mins >= interval || mins < 0
+        }
+        None => true,
+    };
+    if due {
+        run_speedtest(ctx, p.clone(), &ups, down_bytes, up_bytes, now).await;
+    }
     let healthy: Vec<Uuid> = probed
         .iter()
         .map(|(id, _)| *id)
@@ -279,53 +450,100 @@ pub async fn check_round(
     // 这两条来路都不发 Event::RelayRestarted（§C 末段），所以在这里重放。
     // **方向只能是 runtime → Clash**：反过来把 now 写进 runtime 会让一次重启静默
     // 撤销管理员的手动切换与上一轮的自动避障。
+    //
+    // 规则 6b：runtime 没有选择（守护进程首次启动、从没切过）或它已被删出池 ——
+    // 此时才拿 Clash 的 now 初始化 runtime，并粘在它上面。
     let ids = ids_of(&g);
     let want = rt.selected_upstream_id.filter(|id| ids.contains(id));
-    if let Some(want) = want {
-        if healthy.contains(&want) {
-            let mut alerts: Vec<String> = Vec::new();
-            if Some(want) != sel_id {
-                // tag 现算（位置键，不做主键）；want 来自当前池，tag_of 必有值
-                let tag = clash::tag_of(&g, want).expect("want 取自当前池");
-                let (cc, t2) = (c.clone(), tag.clone());
-                match tokio::task::spawn_blocking(move || cc.select(&t2)).await? {
-                    Ok(()) => {
-                        tracing::info!(from = %sel_tag, to = %tag, "relay 重启后重放住宅出口选择");
-                        out.notes.push(format!(
-                            "relay 的当前选择 {sel_tag} 与运行时记录的 {tag} 不一致（relay 刚重启过），已重放运行时的选择"
-                        ));
-                        // 重放不是切换：不写 last_switch_at、不吃 60s 限速
-                        out.replayed_to = Some(tag);
-                    }
-                    Err(e) => {
-                        alerts.push(format!("重放住宅出口选择到 {tag} 失败：{e}"));
-                        out.notes.push(format!("重放到 {tag} 失败：{e}"));
-                    }
+    // 「当前该生效的出口」：6a 的 runtime 记录（真源）优先，6b 的 Clash now 兜底
+    let current = match want {
+        Some(w) => healthy.contains(&w).then_some(w),
+        None => sel_id.filter(|s| healthy.contains(s)),
+    };
+    // 规则 6d（主理人 2026-09-12：「当前不健康 / Google 封立即切」）：不健康由上面的
+    // `healthy` 挡掉，Google 被封的当前出口在这里放掉「它就是当前出口」这个结论，直接
+    // 落到规则 8 的立即切换（不吃 6c 的防抖轮数）。两个前提：手动锁定的那条不挪
+    // （R2 ①），且池里确实还有别的健康成员 Google 通 —— 否则全池都封 Google 时
+    // 每轮都会「切」到自己身上，白掐一次住宅连接。
+    let google_ok = |id: Uuid| rt.health.get(&id.to_string()).and_then(|h| h.google_ok);
+    let current = match current {
+        Some(cur) if google_ok(cur) == Some(false) && rt.manual_selected_id != Some(cur) => {
+            // tag 现算；cur 取自当前池，tag_of 必有值
+            let tag = clash::tag_of(&g, cur).unwrap_or_else(|| sel_tag.clone());
+            if healthy
+                .iter()
+                .any(|id| *id != cur && google_ok(*id) == Some(true))
+            {
+                out.notes
+                    .push(format!("当前 {tag} 的 Google 已被封，立即切换（不吃防抖）"));
+                None
+            } else {
+                out.notes.push(format!(
+                    "当前 {tag} 的 Google 已被封，但池里没有别的 Google 可用的健康成员，本轮不切"
+                ));
+                Some(cur)
+            }
+        }
+        other => other,
+    };
+    if let Some(cur) = current {
+        // 规则 6c（主理人 2026-09-12）：当前出口健康时也要看有没有**明显**更优的候选。
+        // 先算判定，好把防抖计数与下面的选择落账并成同一次写盘
+        let d = improve_decision(&g, &rt, &healthy, cur, now);
+        let mut alerts: Vec<String> = Vec::new();
+        if want == Some(cur) && Some(cur) != sel_id {
+            // tag 现算（位置键，不做主键）；cur 来自当前池，tag_of 必有值
+            let tag = clash::tag_of(&g, cur).expect("cur 取自当前池");
+            let (cc, t2) = (c.clone(), tag.clone());
+            match tokio::task::spawn_blocking(move || cc.select(&t2)).await? {
+                Ok(()) => {
+                    tracing::info!(from = %sel_tag, to = %tag, "relay 重启后重放住宅出口选择");
+                    out.notes.push(format!(
+                        "relay 的当前选择 {sel_tag} 与运行时记录的 {tag} 不一致（relay 刚重启过），已重放运行时的选择"
+                    ));
+                    // 重放不是切换：不写 last_switch_at、不吃 60s 限速
+                    out.replayed_to = Some(tag);
+                }
+                Err(e) => {
+                    alerts.push(format!("重放住宅出口选择到 {tag} 失败：{e}"));
+                    out.notes.push(format!("重放到 {tag} 失败：{e}"));
                 }
             }
-            let pending = Some(want) != g.selected_upstream_id;
-            state::update(&ctx.runtime, move |r| {
-                r.selected_upstream_id = Some(want);
-                r.selected_pending_persist = pending;
-                for a in alerts.drain(..) {
-                    state::push_alert(r, a);
-                }
-            })
-            .await;
-            return Ok(out);
         }
-    } else if let Some(sel_id) = sel_id {
-        // 规则 6b：runtime 没有选择（守护进程首次启动、从没切过）或它已被删出池 ——
-        // 此时才拿 Clash 的 now 初始化 runtime，并粘在它上面
-        if healthy.contains(&sel_id) {
-            let pending = Some(sel_id) != g.selected_upstream_id;
-            state::update(&ctx.runtime, move |r| {
-                r.selected_upstream_id = Some(sel_id);
-                r.selected_pending_persist = pending;
-            })
-            .await;
-            return Ok(out);
+        let pending = Some(cur) != g.selected_upstream_id;
+        let (cand, rounds) = (d.cand, d.rounds);
+        state::update(&ctx.runtime, move |r| {
+            r.selected_upstream_id = Some(cur);
+            r.selected_pending_persist = pending;
+            r.improve_candidate_id = cand;
+            r.improve_rounds = rounds;
+            for a in alerts.drain(..) {
+                state::push_alert(r, a);
+            }
+        })
+        .await;
+        if let Some(target_id) = d.go {
+            // tag 现算；target_id 来自 pick_target，必在当前池里
+            let tag = clash::tag_of(&g, target_id).expect("target 取自当前池");
+            // 这是一次真切换，同吃规则 9 的 60 秒限速
+            if let Some(rest) = switch_cooldown(&rt, now) {
+                out.notes
+                    .push(format!("{tag} 明显更优，但切换限速中（剩余 {rest}s）"));
+            } else if switch_to(ctx, c, &g, target_id, &tag, now, None, &mut out).await? {
+                tracing::info!(from = %sel_tag, to = %tag, rounds, "住宅出口按延迟 / 速度切换");
+                out.notes.push(format!(
+                    "{tag} 连续 {} 轮延迟 / 速度明显更优，已切换",
+                    rounds.max(1)
+                ));
+            }
+        } else if let Some(c) = d.cand {
+            if let Some(tag) = clash::tag_of(&g, c) {
+                out.notes.push(format!(
+                    "{tag} 延迟 / 速度更优，已连续 {rounds}/{SWITCH_IMPROVE_ROUNDS} 轮，未到防抖门槛，本轮不切"
+                ));
+            }
         }
+        return Ok(out);
     }
 
     // 规则 7：全不健康 → 保持并告警
@@ -353,18 +571,9 @@ pub async fn check_round(
     };
 
     // 规则 9：≥ 60 秒
-    let since = rt
-        .last_switch_at
-        .as_deref()
-        .and_then(parse_rfc3339)
-        .map(|t| (now - t).whole_seconds())
-        // 时钟回跳（NTP 校时）不该把限速锁死
-        .map(|s| if s < 0 { i64::MAX } else { s })
-        .unwrap_or(i64::MAX);
-    if since < SWITCH_MIN_INTERVAL_SECS {
+    if let Some(rest) = switch_cooldown(&rt, now) {
         out.notes.push(format!(
-            "当前 {sel_tag} 不健康，需切到 {target_tag}，但切换限速中（剩余 {}s）",
-            SWITCH_MIN_INTERVAL_SECS - since
+            "当前 {sel_tag} 需切到 {target_tag}，但切换限速中（剩余 {rest}s）"
         ));
         return Ok(out);
     }
@@ -374,7 +583,105 @@ pub async fn check_round(
     // 解除锁定，别锁着一条坏上游不放（R2 ①）。切到的**就是**锁定目标时（规则 6a 的
     // runtime 选择另有其人、已不健康）这一轮正是在把锁定目标放回去，锁必须留着。
     let manual_dropped = rt.manual_selected_id.filter(|m| *m != target_id);
-    let (cc, t2) = (c.clone(), target_tag.clone());
+    if switch_to(
+        ctx,
+        c,
+        &g,
+        target_id,
+        &target_tag,
+        now,
+        manual_dropped,
+        &mut out,
+    )
+    .await?
+    {
+        tracing::info!(from = %sel_tag, to = %target_tag, "住宅出口切换");
+        if let Some(m) = manual_dropped {
+            tracing::info!(manual = %m, to = %target_tag, "手动锁定的出口已不健康，自动切换并解除锁定");
+            out.notes.push(format!(
+                "手动锁定的出口已不健康，已自动切到 {target_tag} 并解除手动锁定"
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// 一轮「更优候选」的判定结果
+struct Improve {
+    /// 本轮的更优候选（`None` = 没有，计数要归零）
+    cand: Option<Uuid>,
+    /// 连续满足改善阈值的轮数
+    rounds: u32,
+    /// 本轮就该切到它（防抖攒满，或手动锁定压过防抖）
+    go: Option<Uuid>,
+}
+
+/// 纯判定：本轮有没有明显更优的候选、攒到第几轮、该不该切。
+/// **候选一换就从 1 数起**——三条上游轮流各赢一轮，不该凑成「连续 3 轮」。
+fn improve_decision(
+    g: &ResidentialGroup,
+    r: &ResiRuntime,
+    healthy: &[Uuid],
+    cur: Uuid,
+    now: OffsetDateTime,
+) -> Improve {
+    let none = Improve {
+        cand: None,
+        rounds: 0,
+        go: None,
+    };
+    // 目标本来就是当前出口 ⇒ 没有候选。手动锁定时 `pick_target` 直接返回锁定目标，
+    // 所以「锁定的那条不会被更快的候选抢走」自动成立（R2 ① 的优先级不变）；反过来
+    // 锁定目标还不是当前出口时也**不**给它开后门立即切 —— 那会改掉 R2 ① 的既有语义
+    // （当前出口健康就不动，等它不健康时由规则 8 把锁定目标放回去）
+    let Some(cand) = pick_target(g, r, healthy, now).filter(|t| *t != cur) else {
+        return none;
+    };
+    if !is_improvement(r, cand, cur) {
+        return none;
+    }
+    let rounds = if r.improve_candidate_id == Some(cand) {
+        r.improve_rounds + 1
+    } else {
+        1
+    };
+    Improve {
+        cand: Some(cand),
+        rounds,
+        go: (rounds >= SWITCH_IMPROVE_ROUNDS).then_some(cand),
+    }
+}
+
+/// 距上次切换还差多少秒才够 [`SWITCH_MIN_INTERVAL_SECS`]（`None` = 不限速）。
+/// 规则 9 与规则 6c 的「更优候选」共用：两者都是真切换，都会掐住宅连接。
+fn switch_cooldown(r: &ResiRuntime, now: OffsetDateTime) -> Option<i64> {
+    let since = r
+        .last_switch_at
+        .as_deref()
+        .and_then(parse_rfc3339)
+        .map(|t| (now - t).whole_seconds())
+        // 时钟回跳（NTP 校时）不该把限速锁死
+        .map(|s| if s < 0 { i64::MAX } else { s })
+        .unwrap_or(i64::MAX);
+    (since < SWITCH_MIN_INTERVAL_SECS).then_some(SWITCH_MIN_INTERVAL_SECS - since)
+}
+
+/// 共用的「切换落账」：Clash PUT 成功 → 写 runtime（当前出口 / 限速游标 / 解除已失效的
+/// 手动锁定 / 归零防抖计数）并返回 `true`；失败 → 记全局告警、**不改 runtime** 并返回
+/// `false`（别把没生效的选择记成生效，下一轮重新评估）。
+/// 规则 10/11 与规则 6c 两条切换路径共用它，免得落账口径有两份。
+#[allow(clippy::too_many_arguments)]
+async fn switch_to(
+    ctx: &DaemonCtx,
+    c: Arc<dyn Clash>,
+    g: &ResidentialGroup,
+    target_id: Uuid,
+    target_tag: &str,
+    now: OffsetDateTime,
+    manual_dropped: Option<Uuid>,
+    out: &mut RoundOutcome,
+) -> anyhow::Result<bool> {
+    let (cc, t2) = (c, target_tag.to_string());
     match tokio::task::spawn_blocking(move || cc.select(&t2)).await? {
         Ok(()) => {
             let pending = Some(target_id) != g.selected_upstream_id;
@@ -385,24 +692,55 @@ pub async fn check_round(
                 if manual_dropped.is_some() {
                     r.manual_selected_id = None;
                 }
+                // 切完归零：下一次「更优」要重新攒满 SWITCH_IMPROVE_ROUNDS 轮
+                r.improve_candidate_id = None;
+                r.improve_rounds = 0;
             })
             .await;
-            tracing::info!(from = %sel_tag, to = %target_tag, "住宅出口切换");
-            if let Some(m) = manual_dropped {
-                tracing::info!(manual = %m, to = %target_tag, "手动锁定的出口已不健康，自动切换并解除锁定");
-                out.notes.push(format!(
-                    "手动锁定的出口已不健康，已自动切到 {target_tag} 并解除手动锁定"
-                ));
-            }
-            out.switched_to = Some(target_tag);
+            out.switched_to = Some(target_tag.to_string());
+            Ok(true)
         }
         Err(e) => {
-            // 切换失败不改 runtime：下一轮重新评估（别把没生效的选择记成生效）
             persist_alerts(ctx, &[format!("切换住宅出口到 {target_tag} 失败：{e}")]).await;
             out.notes.push(format!("切换到 {target_tag} 失败：{e}"));
+            Ok(false)
         }
     }
-    Ok(out)
+}
+
+/// 一轮全量测速：并发跑完（上限 [`super::PROBE_CONCURRENCY`]）后**一次**写盘。
+/// 失败只写 `note`，既不入样本也不碰健康位（主理人口径）。
+async fn run_speedtest(
+    ctx: &DaemonCtx,
+    p: Arc<dyn Prober>,
+    ups: &[Upstream],
+    down: u64,
+    up: u64,
+    now: OffsetDateTime,
+) {
+    let pp = p.clone();
+    let results = super::fanout(ups.to_vec(), move |u| pp.speedtest(&u, down, up)).await;
+    let samples: Vec<(Uuid, proxy::SpeedSample)> = ups
+        .iter()
+        .zip(results)
+        .map(|(u, r)| {
+            (
+                u.id,
+                r.unwrap_or_else(|| proxy::SpeedSample {
+                    note: Some("测速任务异常结束".into()),
+                    ..Default::default()
+                }),
+            )
+        })
+        .collect();
+    state::update(&ctx.runtime, move |r| {
+        for (id, s) in samples {
+            let h = r.health.entry(id.to_string()).or_default();
+            state::record_speed(h, s.down_mbps, s.up_mbps, s.note, now);
+        }
+        r.last_speedtest_at = Some(fmt_rfc3339(now));
+    })
+    .await;
 }
 
 async fn persist_alerts(ctx: &DaemonCtx, alerts: &[String]) {
@@ -550,11 +888,18 @@ mod tests {
     /// `FakeProber` 按 URL 查表，本任务要按**上游**区分好坏，所以用一个按 host 分派的 prober。
     /// `connect` 也按上游分派：`probe_member` 全失败后会用它做 CONNECT 补判，
     /// `auth_failed` 集合里的上游必须在补判里也回 `AuthFailed`（真机上 407 只有这条路能认出来）
+    #[derive(Default)]
     struct ByHost {
         bad: std::collections::BTreeSet<String>,
         auth_failed: std::collections::BTreeSet<String>,
         /// 经这些上游打 Google 搜索回 403（调研 §D 的 Bright Data 形态）
         google_blocked: std::collections::BTreeSet<String>,
+        /// host → (HTTP 往返 ms, TCP 建连 ms)；不在表里 = 没测到
+        latency: std::collections::BTreeMap<String, (u64, u64)>,
+        /// host → (下行 Mbps, 上行 Mbps)
+        speed: std::collections::BTreeMap<String, (f64, f64)>,
+        /// host → UDP 探测结果（http 上游由 `proxy::http_no_udp` 兜底，不看这张表）
+        udp: std::collections::BTreeMap<String, proxy::UdpProbe>,
     }
     impl Prober for ByHost {
         fn connect(
@@ -601,6 +946,41 @@ mod tests {
         fn direct_tcp(&self, _h: &str, _p: u16) -> bool {
             true
         }
+        fn gateway_tcp_ms(&self, up: &Upstream) -> Option<u64> {
+            self.latency.get(&up.host).map(|(_, tcp)| *tcp)
+        }
+        fn timed_get(
+            &self,
+            up: &Upstream,
+            url: &str,
+        ) -> (Option<u64>, Result<HttpProbe, ProbeError>) {
+            let r = self.get(up, url);
+            // 失败不给耗时（超时值不是延迟），与真实 Prober 同口径
+            let ms = r
+                .is_ok()
+                .then(|| self.latency.get(&up.host).map(|(http, _)| *http))
+                .flatten();
+            (ms, r)
+        }
+        fn stun_binding(&self, up: &Upstream) -> proxy::UdpProbe {
+            // 「HTTP 上游没有 UDP」是协议事实，测试替身也不许伪造成通
+            proxy::http_no_udp(up)
+                .or_else(|| self.udp.get(&up.host).cloned())
+                .unwrap_or_default()
+        }
+        fn speedtest(&self, up: &Upstream, _d: u64, _u: u64) -> proxy::SpeedSample {
+            match self.speed.get(&up.host) {
+                Some((d, u)) => proxy::SpeedSample {
+                    down_mbps: Some(*d),
+                    up_mbps: Some(*u),
+                    note: None,
+                },
+                None => proxy::SpeedSample {
+                    note: Some("测速目标不可达".into()),
+                    ..Default::default()
+                },
+            }
+        }
     }
     fn by_host(bad: &[&str], auth_failed: &[&str]) -> Arc<dyn Prober> {
         by_host_with_google(bad, auth_failed, &[])
@@ -614,7 +994,18 @@ mod tests {
             bad: bad.iter().map(|s| s.to_string()).collect(),
             auth_failed: auth_failed.iter().map(|s| s.to_string()).collect(),
             google_blocked: google_blocked.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
         })
+    }
+    /// 按 `isp{i}.example.net` 编好延迟与速度的 prober：`metrics[i] = (http_ms, tcp_ms, down, up)`
+    fn by_host_with_metrics(metrics: &[(u64, u64, f64, f64)]) -> Arc<dyn Prober> {
+        let mut p = ByHost::default();
+        for (i, (http, tcp, d, u)) in metrics.iter().enumerate() {
+            let host = format!("isp{}.example.net", i + 1);
+            p.latency.insert(host.clone(), (*http, *tcp));
+            p.speed.insert(host, (*d, *u));
+        }
+        Arc::new(p)
     }
 
     #[tokio::test]
@@ -1163,6 +1554,513 @@ mod tests {
         assert_eq!(pick_target(&g, &r, &[], now), None);
         // 不在当前池里的 uuid 直接忽略（删上游与巡检并发时会出现）
         assert_eq!(pick_target(&g, &r, &[Uuid::from_u128(99)], now), None);
+    }
+
+    #[tokio::test]
+    async fn a_round_records_latency_and_runs_the_first_speedtest() {
+        // 主理人 2026-09-12：「巡检除了连通健康度，还要给出延迟、上下行速度」
+        let d = tempfile::tempdir().unwrap();
+        let (c, _h) = ctx(&d, &[10, 20]).await;
+        let clash = Arc::new(FakeClash::new(Some("resi-1")));
+        let p = by_host_with_metrics(&[(90, 30, 50.0, 10.0), (120, 40, 20.0, 5.0)]);
+        check_once(&c, p, clash.clone()).await.unwrap();
+        let r = rstate::read(&c.runtime).await;
+        let h1 = &r.health[&Uuid::from_u128(1).to_string()];
+        assert_eq!(h1.http_ms, vec![90], "经上游的完整往返耗时");
+        assert_eq!(h1.tcp_ms, vec![30], "到上游网关的 TCP 建连耗时，单独存");
+        assert_eq!(rstate::latency_p50(h1), Some(90));
+        // 第一轮（`last_speedtest_at` 还是 None）必须测一次速，否则面板上永远是「未测」
+        assert_eq!(h1.down_mbps, vec![50.0]);
+        assert_eq!(h1.up_mbps, vec![10.0]);
+        assert!(h1.speed_at.is_some());
+        assert!(r.last_speedtest_at.is_some(), "测速游标要落账");
+        let h2 = &r.health[&Uuid::from_u128(2).to_string()];
+        assert_eq!(h2.http_ms, vec![120], "每个成员各自记");
+        assert_eq!(h2.down_mbps, vec![20.0]);
+    }
+
+    #[tokio::test]
+    async fn the_speedtest_runs_once_an_hour_not_once_a_round() {
+        // 每 2 分钟测一次 4MB 就是 每月 86GB，只能每小时一次（spec §5.3 的流量账）
+        let d = tempfile::tempdir().unwrap();
+        let (c, host) = ctx(&d, &[10]).await;
+        let clash = Arc::new(FakeClash::new(Some("resi-1")));
+        let p = by_host_with_metrics(&[(90, 30, 50.0, 10.0)]);
+        check_once(&c, p.clone(), clash.clone()).await.unwrap();
+        let key = Uuid::from_u128(1).to_string();
+        assert_eq!(
+            rstate::read(&c.runtime).await.health[&key].down_mbps.len(),
+            1
+        );
+        host.advance(120); // 下一轮巡检
+        check_once(&c, p.clone(), clash.clone()).await.unwrap();
+        let r = rstate::read(&c.runtime).await;
+        assert_eq!(r.health[&key].down_mbps.len(), 1, "2 分钟后不重复测速");
+        assert_eq!(r.health[&key].http_ms.len(), 2, "延迟仍是每轮都记");
+        host.advance(60 * 60); // 满一小时
+        check_once(&c, p, clash).await.unwrap();
+        assert_eq!(
+            rstate::read(&c.runtime).await.health[&key].down_mbps.len(),
+            2,
+            "满 60 分钟再测一次"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_speedtest_only_leaves_a_note_and_never_touches_health() {
+        let d = tempfile::tempdir().unwrap();
+        let (c, _h) = ctx(&d, &[10]).await;
+        let clash = Arc::new(FakeClash::new(Some("resi-1")));
+        // `by_host` 没编 speed 表 ⇒ 测速回 note，但连通性与 Google 都是通的
+        let out = check_once(&c, by_host(&[], &[]), clash).await.unwrap();
+        assert_eq!(out.healthy, vec!["resi-1"], "测速失败不影响健康判定");
+        let h = &rstate::read(&c.runtime).await.health[&Uuid::from_u128(1).to_string()];
+        assert!(h.active);
+        assert!(h.down_mbps.is_empty());
+        assert_eq!(h.speed_note.as_deref(), Some("测速目标不可达"));
+    }
+
+    #[tokio::test]
+    async fn a_socks5_member_records_the_udp_exit_ip_while_an_http_member_is_marked_no_udp() {
+        // 主理人 2026-09-12 追加：「巡检也要测 UDP」。http 上游恒不通 + 标注
+        let d = tempfile::tempdir().unwrap();
+        let (c, _h) = ctx(&d, &[10, 20]).await;
+        // resi-1 换成 socks5（ctx() 建的是 http），resi-2 保持 http 做对照
+        rstate::update_group(&c.store, &c.bus, |g| {
+            g.upstreams[0].kind = UpstreamKind::Socks5;
+        })
+        .await
+        .unwrap();
+        let mut byh = ByHost::default();
+        byh.udp.insert(
+            "isp1.example.net".into(),
+            proxy::UdpProbe {
+                ok: true,
+                exit_ip: Some("198.51.100.7".into()),
+                ms: Some(42),
+                note: None,
+            },
+        );
+        let clash = Arc::new(FakeClash::new(Some("resi-1")));
+        check_once(&c, Arc::new(byh), clash).await.unwrap();
+        let r = rstate::read(&c.runtime).await;
+        let h1 = &r.health[&Uuid::from_u128(1).to_string()];
+        assert_eq!(h1.udp_ok, Some(true));
+        assert_eq!(h1.udp_exit_ip.as_deref(), Some("198.51.100.7"));
+        assert_eq!(h1.udp_ms, vec![42], "UDP 耗时与 TCP/HTTP 分开报");
+        assert!(h1.udp_at.is_some());
+        let h2 = &r.health[&Uuid::from_u128(2).to_string()];
+        assert_eq!(h2.udp_ok, Some(false));
+        assert_eq!(h2.udp_note.as_deref(), Some("HTTP 上游无 UDP"));
+        assert!(h2.udp_ms.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_udp_timeout_is_recorded_as_not_ok_with_the_reason() {
+        let d = tempfile::tempdir().unwrap();
+        let (c, _h) = ctx(&d, &[10]).await;
+        rstate::update_group(&c.store, &c.bus, |g| {
+            g.upstreams[0].kind = UpstreamKind::Socks5;
+        })
+        .await
+        .unwrap();
+        let mut byh = ByHost::default();
+        byh.udp.insert(
+            "isp1.example.net".into(),
+            proxy::UdpProbe {
+                ok: false,
+                exit_ip: None,
+                ms: None,
+                note: Some("STUN 无回复（5s 内）：timed out".into()),
+            },
+        );
+        let clash = Arc::new(FakeClash::new(Some("resi-1")));
+        let out = check_once(&c, Arc::new(byh), clash).await.unwrap();
+        assert_eq!(out.healthy, vec!["resi-1"], "UDP 不通不影响 TCP 健康判定");
+        let h = &rstate::read(&c.runtime).await.health[&Uuid::from_u128(1).to_string()];
+        assert_eq!(h.udp_ok, Some(false));
+        assert!(h.udp_note.as_deref().unwrap().contains("无回复"));
+        assert!(h.udp_ms.is_empty(), "超时的 5 秒不是延迟");
+    }
+
+    #[test]
+    fn pick_target_orders_by_latency_then_download_speed() {
+        // 主理人 2026-09-12：「选择最健康、最低延迟、速度最快的住宅代理」
+        let mut g = rstate::group_of(&crate::modules::residential::sample_state_with_pool());
+        g.upstreams = vec![upstream(1, 10), upstream(2, 10), upstream(3, 10)];
+        let now = time::macros::datetime!(2026-09-12 00:00:00 UTC);
+        let healthy = vec![Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3)];
+        // 同优先级：u2 延迟最低 ⇒ 它赢
+        let mut r = ResiRuntime::default();
+        for (i, ms) in [(1u128, 200u64), (2, 80), (3, 150)] {
+            let h = r.health.entry(Uuid::from_u128(i).to_string()).or_default();
+            rstate::record_latency(h, Some(ms), None, None);
+        }
+        assert_eq!(pick_target(&g, &r, &healthy, now), Some(Uuid::from_u128(2)));
+        // 延迟齐平后比下行：u3 最快
+        for (i, ms) in [(1u128, 80u64), (3, 80)] {
+            let h = r.health.entry(Uuid::from_u128(i).to_string()).or_default();
+            h.http_ms = vec![ms];
+        }
+        for (i, d) in [(1u128, 10.0), (2, 20.0), (3, 90.0)] {
+            let h = r.health.entry(Uuid::from_u128(i).to_string()).or_default();
+            rstate::record_speed(h, Some(d), Some(d / 2.0), None, now);
+        }
+        assert_eq!(
+            pick_target(&g, &r, &healthy, now),
+            Some(Uuid::from_u128(3)),
+            "延迟相同 ⇒ 下行最快的赢"
+        );
+        // priority 仍压过延迟与速度（它是更靠前的排序键）
+        g.upstreams[0].priority = 1;
+        assert_eq!(pick_target(&g, &r, &healthy, now), Some(Uuid::from_u128(1)));
+        // 没测过延迟的成员不许凭空赢过测过的（未知 ≠ 0 毫秒）
+        g.upstreams[0].priority = 10;
+        let mut unknown = ResiRuntime::default();
+        let h = unknown
+            .health
+            .entry(Uuid::from_u128(2).to_string())
+            .or_default();
+        rstate::record_latency(h, Some(500), None, None);
+        assert_eq!(
+            pick_target(&g, &unknown, &healthy, now),
+            Some(Uuid::from_u128(2)),
+            "只有 u2 有延迟数据 ⇒ 选它，不选「未知」"
+        );
+    }
+
+    #[test]
+    fn pick_target_puts_a_working_udp_upstream_ahead_of_one_without() {
+        // 排序键：Google → priority → UDP → 延迟 → 下行（主理人 2026-09-12 的口径）。
+        // 所以 UDP 只在**同优先级**里说话，跨优先级由管理员给的 priority 说话
+        let mut g = rstate::group_of(&crate::modules::residential::sample_state_with_pool());
+        g.upstreams = vec![upstream(1, 5), upstream(2, 20)];
+        let now = time::macros::datetime!(2026-09-12 00:00:00 UTC);
+        let healthy = vec![Uuid::from_u128(1), Uuid::from_u128(2)];
+        let mk = |udp: [Option<bool>; 2], google: [Option<bool>; 2]| {
+            let mut r = ResiRuntime::default();
+            for i in 0..2 {
+                let h = r
+                    .health
+                    .entry(Uuid::from_u128(i as u128 + 1).to_string())
+                    .or_default();
+                h.udp_ok = udp[i];
+                rstate::record_google(h, google[i], now);
+            }
+            r
+        };
+        // 同优先级：u1 的 UDP 不通 ⇒ 让给 UDP 通的 u2
+        g.upstreams[1].priority = 5;
+        assert_eq!(
+            pick_target(
+                &g,
+                &mk([Some(false), Some(true)], [Some(true), Some(true)]),
+                &healthy,
+                now
+            ),
+            Some(Uuid::from_u128(2)),
+            "同优先级里 UDP 通的优先"
+        );
+        // 两条都通 ⇒ 回到池内下标（都同优先级、都没测过延迟与速度）
+        assert_eq!(
+            pick_target(
+                &g,
+                &mk([Some(true), Some(true)], [Some(true), Some(true)]),
+                &healthy,
+                now
+            ),
+            Some(Uuid::from_u128(1))
+        );
+        // priority 压过 UDP：管理员把 u1 排在前面，它 UDP 不通也照样是它
+        g.upstreams[1].priority = 20;
+        assert_eq!(
+            pick_target(
+                &g,
+                &mk([Some(false), Some(true)], [Some(true), Some(true)]),
+                &healthy,
+                now
+            ),
+            Some(Uuid::from_u128(1)),
+            "priority 是比 UDP 更靠前的排序键"
+        );
+        // Google 仍压过一切（priority 也压不过它）：u2 的 priority 更好、UDP 也通，
+        // 但 Google 被封 ⇒ 选 Google 通的 u1
+        g.upstreams[0].priority = 20;
+        g.upstreams[1].priority = 5;
+        assert_eq!(
+            pick_target(
+                &g,
+                &mk([Some(false), Some(true)], [Some(true), Some(false)]),
+                &healthy,
+                now
+            ),
+            Some(Uuid::from_u128(1)),
+            "Google 可用是第一排序键"
+        );
+    }
+
+    #[test]
+    fn the_improvement_threshold_is_twenty_percent_latency_or_thirty_percent_download() {
+        let mut r = ResiRuntime::default();
+        let (cand, cur) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let set = |r: &mut ResiRuntime, id: Uuid, ms: u64, down: f64| {
+            let h = r.health.entry(id.to_string()).or_default();
+            h.http_ms = vec![ms];
+            h.down_mbps = vec![down];
+        };
+        // 两项都没数据 ⇒ 不算更优（未知不许赢）
+        assert!(!is_improvement(&r, cand, cur));
+        set(&mut r, cur, 100, 10.0);
+        set(&mut r, cand, 81, 10.9);
+        assert!(!is_improvement(&r, cand, cur), "19% / 9% 都不够");
+        set(&mut r, cand, 80, 10.0);
+        assert!(is_improvement(&r, cand, cur), "延迟正好低 20%");
+        set(&mut r, cand, 100, 13.0);
+        assert!(is_improvement(&r, cand, cur), "下行正好快 30%");
+        set(&mut r, cand, 200, 5.0);
+        assert!(!is_improvement(&r, cand, cur), "更差当然不算更优");
+    }
+
+    #[tokio::test]
+    async fn a_better_candidate_only_wins_after_three_consecutive_rounds() {
+        // 防抖（主理人 2026-09-12）：当前出口**健康**时也可以按延迟/速度切，但两条
+        // 上游的延迟会互相交替领先，不防抖就会每 2 分钟掐一次住宅连接
+        let d = tempfile::tempdir().unwrap();
+        let (c, host) = ctx(&d, &[10, 10]).await;
+        let clash = Arc::new(FakeClash::new(Some("resi-1")));
+        // resi-2 延迟只有 resi-1 的一半 ⇒ 每轮都满足「低 ≥20%」
+        let p = by_host_with_metrics(&[(200, 50, 10.0, 5.0), (80, 20, 12.0, 6.0)]);
+        for round in 1..=2 {
+            let out = check_once(&c, p.clone(), clash.clone()).await.unwrap();
+            assert_eq!(out.switched_to, None, "第 {round} 轮还在防抖里");
+            assert!(
+                out.notes.iter().any(|n| n.contains(&format!("{round}/3"))),
+                "要说清攒到第几轮了：{:?}",
+                out.notes
+            );
+            assert_eq!(
+                rstate::read(&c.runtime).await.improve_rounds,
+                round,
+                "轮数记在 runtime 里"
+            );
+            host.advance(120);
+        }
+        let out = check_once(&c, p, clash.clone()).await.unwrap();
+        assert_eq!(
+            out.switched_to.as_deref(),
+            Some("resi-2"),
+            "连续 3 轮更优 ⇒ 切"
+        );
+        assert_eq!(clash.calls().last().unwrap(), "put:resi-2");
+        let r = rstate::read(&c.runtime).await;
+        assert_eq!(r.selected_upstream_id, Some(Uuid::from_u128(2)));
+        assert_eq!(r.improve_rounds, 0, "切完归零，下一次要重新攒");
+        assert!(r.last_switch_at.is_some(), "这是一次真切换，吃 60s 限速");
+    }
+
+    #[tokio::test]
+    async fn a_candidate_that_stops_being_better_resets_the_streak() {
+        let d = tempfile::tempdir().unwrap();
+        let (c, host) = ctx(&d, &[10, 10]).await;
+        let clash = Arc::new(FakeClash::new(Some("resi-1")));
+        let fast = by_host_with_metrics(&[(200, 50, 10.0, 5.0), (80, 20, 12.0, 6.0)]);
+        check_once(&c, fast.clone(), clash.clone()).await.unwrap();
+        assert_eq!(rstate::read(&c.runtime).await.improve_rounds, 1);
+        host.advance(120);
+        // 这一轮两条延迟拉平 ⇒ 不再更优，计数归零
+        let even = by_host_with_metrics(&[(90, 30, 10.0, 5.0), (90, 30, 10.0, 5.0)]);
+        let out = check_once(&c, even, clash.clone()).await.unwrap();
+        assert_eq!(out.switched_to, None);
+        let r = rstate::read(&c.runtime).await;
+        assert_eq!(r.improve_rounds, 0, "断了就归零");
+        assert_eq!(r.improve_candidate_id, None);
+        host.advance(120);
+        // 再更优也得从 1 数起（不是接着 2）
+        let out = check_once(&c, fast, clash).await.unwrap();
+        assert_eq!(out.switched_to, None);
+        assert_eq!(rstate::read(&c.runtime).await.improve_rounds, 1);
+    }
+
+    #[tokio::test]
+    async fn a_manually_locked_upstream_is_not_stolen_by_a_faster_candidate() {
+        // R2 ① 的优先级不变：手动锁定的出口再慢也不许被延迟/速度抢走
+        let d = tempfile::tempdir().unwrap();
+        let (c, host) = ctx(&d, &[10, 10]).await;
+        let clash = Arc::new(FakeClash::new(Some("resi-1")));
+        select_manual(&c, clash.clone(), Uuid::from_u128(1))
+            .await
+            .unwrap();
+        let p = by_host_with_metrics(&[(200, 50, 10.0, 5.0), (80, 20, 99.0, 9.0)]);
+        for _ in 0..4 {
+            host.advance(120);
+            let out = check_once(&c, p.clone(), clash.clone()).await.unwrap();
+            assert_eq!(out.switched_to, None, "手动锁定压过延迟/速度");
+        }
+        assert_eq!(clash.selected().as_deref(), Some("resi-1"));
+        assert_eq!(rstate::read(&c.runtime).await.improve_rounds, 0);
+    }
+
+    #[tokio::test]
+    async fn an_unhealthy_current_exit_switches_immediately_without_the_debounce() {
+        // 「当前出口不健康或 Google 封时立即切，沿用既有规则」：防抖只管「更优」这条新路径
+        let d = tempfile::tempdir().unwrap();
+        let (c, host) = ctx(&d, &[10, 10]).await;
+        let clash = Arc::new(FakeClash::new(Some("resi-1")));
+        let mut byh = ByHost {
+            bad: ["isp1.example.net".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+        // resi-2 延迟更差：不是「更优候选」，但当前出口坏了照样要切
+        byh.latency.insert("isp2.example.net".into(), (900, 300));
+        let p: Arc<dyn Prober> = Arc::new(byh);
+        check_once(&c, p.clone(), clash.clone()).await.unwrap();
+        host.advance(120);
+        let out = check_once(&c, p, clash).await.unwrap();
+        assert_eq!(
+            out.switched_to.as_deref(),
+            Some("resi-2"),
+            "当前不健康 ⇒ 不吃防抖，立刻切"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_google_blocked_current_exit_switches_immediately_without_the_debounce() {
+        // 主理人 2026-09-12：「当前不健康 / Google 封立即切」。resi-1 连通性没问题、
+        // 延迟也更好（不是「更优候选」那条路径），但它封 Google ⇒ 本轮就得让位
+        let d = tempfile::tempdir().unwrap();
+        let (c, _h) = ctx(&d, &[10, 10]).await;
+        let clash = Arc::new(FakeClash::new(Some("resi-1")));
+        let out = check_once(
+            &c,
+            by_host_with_google(&[], &[], &["isp1.example.net"]),
+            clash.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            out.switched_to.as_deref(),
+            Some("resi-2"),
+            "Google 被封 ⇒ 不吃防抖，立刻切：{:?}",
+            out.notes
+        );
+        assert_eq!(rstate::read(&c.runtime).await.improve_rounds, 0);
+    }
+
+    #[tokio::test]
+    async fn a_pool_where_every_member_blocks_google_keeps_the_current_exit() {
+        // 全池都封 Google 时切不出更好的，切到自己身上只会白掐一次住宅连接
+        let d = tempfile::tempdir().unwrap();
+        let (c, _h) = ctx(&d, &[10, 10]).await;
+        let clash = Arc::new(FakeClash::new(Some("resi-1")));
+        let p = by_host_with_google(&[], &[], &["isp1.example.net", "isp2.example.net"]);
+        let out = check_once(&c, p, clash.clone()).await.unwrap();
+        assert_eq!(out.switched_to, None);
+        assert_eq!(clash.selected().as_deref(), Some("resi-1"));
+        assert!(
+            out.notes.iter().any(|n| n.contains("没有别的 Google 可用")),
+            "{:?}",
+            out.notes
+        );
+    }
+
+    #[tokio::test]
+    async fn a_manual_lock_keeps_a_google_blocked_exit() {
+        // R2 ①：手动锁定压过一切，包括「Google 封立即切」
+        let d = tempfile::tempdir().unwrap();
+        let (c, host) = ctx(&d, &[10, 10]).await;
+        let clash = Arc::new(FakeClash::new(Some("resi-1")));
+        select_manual(&c, clash.clone(), Uuid::from_u128(1))
+            .await
+            .unwrap();
+        host.advance(120);
+        let out = check_once(
+            &c,
+            by_host_with_google(&[], &[], &["isp1.example.net"]),
+            clash.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.switched_to, None, "锁定的出口不因 Google 被封而挪走");
+        assert_eq!(clash.selected().as_deref(), Some("resi-1"));
+    }
+
+    #[test]
+    fn the_selection_reason_names_why_this_exit_is_the_one_in_use() {
+        // 主理人 2026-09-12：「输出一行『当前选中 resi-N 的原因』」
+        let mut g = rstate::group_of(&crate::modules::residential::sample_state_with_pool());
+        g.upstreams = vec![upstream(1, 5), upstream(2, 20)];
+        let now = time::macros::datetime!(2026-09-12 00:00:00 UTC);
+        let (u1, u2) = (Uuid::from_u128(1), Uuid::from_u128(2));
+
+        // 只有一个成员 ⇒ 唯一健康
+        let mut one = g.clone();
+        one.upstreams.truncate(1);
+        assert!(selection_reason(&one, &ResiRuntime::default(), u1).contains("唯一"));
+        // 手动锁定压过一切
+        let locked = ResiRuntime {
+            manual_selected_id: Some(u2),
+            ..Default::default()
+        };
+        assert!(selection_reason(&g, &locked, u2).contains("手动锁定"));
+        // 优先级最优
+        assert!(selection_reason(&g, &ResiRuntime::default(), u1).contains("优先级"));
+        // 同优先级 ⇒ 说延迟
+        g.upstreams[1].priority = 5;
+        let mut r = ResiRuntime::default();
+        for (id, ms) in [(u1, 80u64), (u2, 200)] {
+            let h = r.health.entry(id.to_string()).or_default();
+            rstate::record_latency(h, Some(ms), None, None);
+        }
+        let why = selection_reason(&g, &r, u1);
+        assert!(why.contains("延迟") && why.contains("80"), "{why}");
+        // 延迟齐平 ⇒ 说下行
+        r.health.get_mut(&u2.to_string()).unwrap().http_ms = vec![80];
+        for (id, d) in [(u1, 90.0), (u2, 10.0)] {
+            let h = r.health.entry(id.to_string()).or_default();
+            rstate::record_speed(h, Some(d), Some(1.0), None, now);
+        }
+        assert!(selection_reason(&g, &r, u1).contains("下行"));
+        // Google 被封的那条在场 ⇒ 先说 Google
+        let mut blocked = r.clone();
+        rstate::record_google(
+            blocked.health.get_mut(&u2.to_string()).unwrap(),
+            Some(false),
+            now,
+        );
+        rstate::record_google(
+            blocked.health.get_mut(&u1.to_string()).unwrap(),
+            Some(true),
+            now,
+        );
+        assert!(selection_reason(&g, &blocked, u1).contains("Google"));
+        // 已被删出池的 uuid 不许 panic
+        assert!(selection_reason(&g, &r, Uuid::from_u128(99)).contains("不在池里"));
+    }
+
+    #[test]
+    fn the_speedtest_budget_comes_from_constants_and_can_be_overridden_by_state() {
+        let mut s = crate::modules::residential::sample_state_with_pool();
+        assert_eq!(
+            speedtest_cfg(&s),
+            (
+                crate::modules::residential::SPEEDTEST_DOWN_BYTES,
+                crate::modules::residential::SPEEDTEST_UP_BYTES,
+                crate::modules::residential::SPEEDTEST_INTERVAL_MINS
+            ),
+            "默认 4MB / 1MB / 60min"
+        );
+        s.residential.speedtest_down_bytes = Some(1024);
+        s.residential.speedtest_up_bytes = Some(512);
+        s.residential.speedtest_interval_mins = Some(180);
+        assert_eq!(speedtest_cfg(&s), (1024, 512, 180));
+        // 0 与荒唐的大小不采信（打错一个 0 不该把上游流量打爆 / 把测速关死）
+        s.residential.speedtest_down_bytes = Some(0);
+        s.residential.speedtest_up_bytes = Some(1 << 40);
+        s.residential.speedtest_interval_mins = Some(0);
+        let (d, u, m) = speedtest_cfg(&s);
+        assert_eq!(d, crate::modules::residential::SPEEDTEST_DOWN_BYTES);
+        assert_eq!(u, crate::modules::residential::SPEEDTEST_MAX_BYTES);
+        assert_eq!(m, crate::modules::residential::SPEEDTEST_INTERVAL_MINS);
     }
 
     #[tokio::test]

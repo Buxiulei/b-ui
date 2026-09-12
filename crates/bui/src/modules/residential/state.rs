@@ -1,7 +1,7 @@
 //! 住宅模块的运行时数据（`runtime.json` 的 `extra["residential"]`）与状态读写助手。
 use super::{
-    FAIL_TO_UNHEALTHY, GROUP_DEFAULT, OK_TO_HEALTHY, RATE_SAMPLES_MAX, RATE_WINDOW_SECS,
-    RUNTIME_KEY,
+    FAIL_TO_UNHEALTHY, GROUP_DEFAULT, LATENCY_SAMPLES_MAX, OK_TO_HEALTHY, RATE_SAMPLES_MAX,
+    RATE_WINDOW_SECS, RUNTIME_KEY, SPEEDTEST_SAMPLES_MAX,
 };
 use crate::api::{Event, EventBus};
 use crate::state::runtime::{Runtime, RuntimeData};
@@ -56,6 +56,14 @@ pub struct ResiRuntime {
     /// 成功一次即清。输出侧一律经 [`visible_alerts`]，池里没有的 uuid 不显示。
     pub upstream_alerts: BTreeMap<Uuid, String>,
     pub last_daily_at: Option<String>,
+    /// 上一次**全量测速**的时间（每小时一轮的判据，主理人 2026-09-12）。
+    /// 放 runtime 而不是另起一个后台任务：巡检本来就每 2 分钟醒一次，到点顺手跑一轮，
+    /// 少一个调度器、也不会与巡检抢同一批上游
+    pub last_speedtest_at: Option<String>,
+    /// 「更优候选」防抖：当前正在攒轮数的候选与已连续满足的轮数。
+    /// 候选一换就归零 —— 三条上游轮流各赢一轮不该凑成 3 轮
+    pub improve_candidate_id: Option<Uuid>,
+    pub improve_rounds: u32,
 }
 
 /// 单个上游的健康状态。**容器级** `#[serde(default)]`：缺字段时走 [`HealthState::default`]，
@@ -72,6 +80,26 @@ pub struct HealthState {
     pub google_ok: Option<bool>,
     /// 上一行那个结论是什么时候的（面板显示用）
     pub google_at: Option<String>,
+    /// **到上游网关**的 TCP 建连耗时样本（毫秒，环形，上限 [`LATENCY_SAMPLES_MAX`]）
+    pub tcp_ms: Vec<u64>,
+    /// **经上游的完整 HTTP 往返**耗时样本（毫秒，环形）。选路用的就是这一项的 p50
+    pub http_ms: Vec<u64>,
+    /// 经上游 SOCKS5 UDP ASSOCIATE 的 **STUN 往返**耗时样本（毫秒，环形）。
+    /// 与上面两项分开：UDP 走的是另一条路径，混进 TCP 样本就看不出是谁慢
+    pub udp_ms: Vec<u64>,
+    /// 最近一次**探到结论**的 UDP 可用性（`None` = 还没探过）。参与选路（排在 `priority` 之前）
+    pub udp_ok: Option<bool>,
+    /// STUN 的 XOR-MAPPED-ADDRESS：**UDP 出口 IP**（与 TCP 出口 IP 可能不是同一个）
+    pub udp_exit_ip: Option<String>,
+    /// UDP 不通的原因（`HTTP 上游无 UDP` / 超时…）
+    pub udp_note: Option<String>,
+    pub udp_at: Option<String>,
+    /// 最近 [`SPEEDTEST_SAMPLES_MAX`] 次测速（Mbps，环形），报中位数
+    pub down_mbps: Vec<f64>,
+    pub up_mbps: Vec<f64>,
+    pub speed_at: Option<String>,
+    /// 测速失败的原因。**测速失败不影响健康判定**（主理人口径），只留这一条说明
+    pub speed_note: Option<String>,
 }
 
 impl Default for HealthState {
@@ -85,6 +113,18 @@ impl Default for HealthState {
             // Google 可达性没有「默认通」：没探过就是未知，别让它凭空赢过探过的成员
             google_ok: None,
             google_at: None,
+            // 延迟 / 速度 / UDP 同理：没测过就是空，不是 0（0 毫秒会赢过所有人）
+            tcp_ms: Vec::new(),
+            http_ms: Vec::new(),
+            udp_ms: Vec::new(),
+            udp_ok: None,
+            udp_exit_ip: None,
+            udp_note: None,
+            udp_at: None,
+            down_mbps: Vec::new(),
+            up_mbps: Vec::new(),
+            speed_at: None,
+            speed_note: None,
         }
     }
 }
@@ -330,6 +370,93 @@ pub fn record_google(h: &mut HealthState, ok: Option<bool>, now: OffsetDateTime)
     }
 }
 
+/// 环形推入：超过 `cap` 就从头丢（`runtime.json` 不会无限长）。
+/// `Vec` 而不是 `VecDeque`：它要 serde 成 JSON 数组，面板也直接画这串数
+fn push_ring<T>(v: &mut Vec<T>, x: T, cap: usize) {
+    v.push(x);
+    if v.len() > cap {
+        let drop = v.len() - cap;
+        v.drain(..drop);
+    }
+}
+
+/// 记一轮的延迟样本（毫秒）。`None` 的那一项**不入样本** —— 没测到不等于 0 毫秒，
+/// 写成 0 会让一条连不上的上游拿到全池最低延迟。
+pub fn record_latency(h: &mut HealthState, http: Option<u64>, tcp: Option<u64>, udp: Option<u64>) {
+    for (samples, ms) in [
+        (&mut h.http_ms, http),
+        (&mut h.tcp_ms, tcp),
+        (&mut h.udp_ms, udp),
+    ] {
+        if let Some(ms) = ms {
+            push_ring(samples, ms, LATENCY_SAMPLES_MAX);
+        }
+    }
+}
+
+/// 第 `p` 百分位（毫秒，`p` 取 0–100）。空样本 `None`（未知不是 0）。
+/// 最近邻插值：排序后取第 `ceil(p/100 * n)` 个（1-based），30 个样本时 p50 = 第 15、
+/// p95 = 第 29。样本只有 30 个，线性插值的精度没有意义，只会让口径难解释。
+pub fn percentile(samples: &[u64], p: f64) -> Option<u64> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut s = samples.to_vec();
+    s.sort_unstable();
+    let rank = ((p / 100.0) * s.len() as f64).ceil().max(1.0) as usize;
+    s.get(rank.min(s.len()) - 1).copied()
+}
+
+/// 选路用的「延迟」：**经上游的完整 HTTP 往返** p50（用户体感），还没攒到 HTTP
+/// 样本时退回到 TCP 建连耗时 —— 否则刚加进来的成员永远没有延迟依据、排序全靠 idx。
+pub fn latency_p50(h: &HealthState) -> Option<u64> {
+    percentile(&h.http_ms, 50.0).or_else(|| percentile(&h.tcp_ms, 50.0))
+}
+
+/// 测速样本的中位数（Mbps）。空 `None`；取中位数而不是平均数：一次撞上上游限速的
+/// 慢样本不该把结论拉走
+pub fn median(samples: &[f64]) -> Option<f64> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut s = samples.to_vec();
+    // f64 没有 Ord；样本是速率，不会有 NaN（`mbps` 已挡掉除零）
+    s.sort_by(f64::total_cmp);
+    Some(s[(s.len() - 1) / 2])
+}
+
+/// 记一次测速。失败（`None`）**不写样本、不碰健康位**，只留 `note`（主理人口径：
+/// 「测速失败不影响健康判定，只记 note」）；成功一次就把上次的 note 清掉。
+pub fn record_speed(
+    h: &mut HealthState,
+    down: Option<f64>,
+    up: Option<f64>,
+    note: Option<String>,
+    now: OffsetDateTime,
+) {
+    if let Some(d) = down {
+        push_ring(&mut h.down_mbps, d, SPEEDTEST_SAMPLES_MAX);
+    }
+    if let Some(u) = up {
+        push_ring(&mut h.up_mbps, u, SPEEDTEST_SAMPLES_MAX);
+    }
+    h.speed_note = note;
+    h.speed_at = Some(fmt_rfc3339(now));
+}
+
+/// 记一次 UDP 探测（STUN）。这一项每轮都有确定结论（http 上游也有：恒不通 + 标注），
+/// 所以与 [`record_google`] 不同，不做「没结论就保留上次」——直接覆盖。
+/// 耗时只在通的时候入样本（超时的 5 秒不是延迟）。
+pub fn record_udp(h: &mut HealthState, v: &super::proxy::UdpProbe, now: OffsetDateTime) {
+    h.udp_ok = Some(v.ok);
+    h.udp_exit_ip = v.exit_ip.clone();
+    h.udp_note = v.note.clone();
+    h.udp_at = Some(fmt_rfc3339(now));
+    if v.ok {
+        record_latency(h, None, None, v.ms);
+    }
+}
+
 /// 近 24h 成功率；无样本返回 0.0（「没数据」不该赢过「有数据且全成功」）
 pub fn success_rate_24h(h: &HealthState, now: OffsetDateTime) -> f64 {
     let cutoff = now - time::Duration::seconds(RATE_WINDOW_SECS);
@@ -463,6 +590,163 @@ mod tests {
         record_google(&mut h, Some(false), t0() + time::Duration::hours(2));
         assert_eq!(h.google_ok, Some(false));
         assert_eq!(h.google_at.as_deref(), Some("2026-09-12T02:00:00Z"));
+    }
+
+    #[test]
+    fn latency_samples_are_a_ring_of_thirty_and_report_p50_p95() {
+        let mut h = HealthState::default();
+        assert_eq!(percentile(&h.http_ms, 50.0), None, "没样本就是未知");
+        // 1..=30 毫秒：p50 = 第 15 个（1-based ceil(0.5*30)），p95 = 第 29 个
+        for i in 1..=30u64 {
+            record_latency(&mut h, Some(i), None, None);
+        }
+        assert_eq!(h.http_ms.len(), 30);
+        assert_eq!(percentile(&h.http_ms, 50.0), Some(15));
+        assert_eq!(percentile(&h.http_ms, 95.0), Some(29));
+        // 第 31 个把最老的 1 挤出去（环形，runtime.json 不会无限长）
+        record_latency(&mut h, Some(999), None, None);
+        assert_eq!(h.http_ms.len(), LATENCY_SAMPLES_MAX);
+        assert_eq!(h.http_ms[0], 2, "最老的样本被挤掉");
+        assert_eq!(h.http_ms[29], 999);
+        // 单样本：p50 与 p95 都是它自己
+        let mut one = HealthState::default();
+        record_latency(&mut one, None, Some(7), Some(8));
+        assert_eq!(percentile(&one.tcp_ms, 50.0), Some(7));
+        assert_eq!(percentile(&one.tcp_ms, 95.0), Some(7));
+        assert_eq!(percentile(&one.udp_ms, 50.0), Some(8));
+        assert!(one.http_ms.is_empty(), "None 不入样本（没测到 ≠ 0 毫秒）");
+        // 三种延迟分开存（TCP / HTTP / UDP 量的是不同的东西）
+        assert_eq!(one.tcp_ms, vec![7]);
+        assert_eq!(one.udp_ms, vec![8]);
+    }
+
+    #[test]
+    fn latency_for_routing_prefers_the_http_round_trip_and_falls_back_to_tcp() {
+        // 选路用的「延迟」是**经上游的完整往返**：它才是用户体感。只有还没攒到
+        // HTTP 样本时才退回 TCP 建连耗时（否则新成员永远没有延迟依据）
+        let mut h = HealthState::default();
+        assert_eq!(latency_p50(&h), None);
+        record_latency(&mut h, None, Some(20), None);
+        assert_eq!(latency_p50(&h), Some(20), "只有 TCP 样本 ⇒ 用 TCP");
+        record_latency(&mut h, Some(120), Some(20), None);
+        assert_eq!(latency_p50(&h), Some(120), "有 HTTP 样本就用 HTTP");
+    }
+
+    #[test]
+    fn speed_samples_keep_six_rounds_and_report_the_median() {
+        let mut h = HealthState::default();
+        assert_eq!(median(&h.down_mbps), None);
+        let now = t0();
+        for (i, v) in [10.0, 30.0, 20.0].iter().enumerate() {
+            record_speed(
+                &mut h,
+                Some(*v),
+                Some(v / 2.0),
+                None,
+                now + time::Duration::hours(i as i64),
+            );
+        }
+        assert_eq!(median(&h.down_mbps), Some(20.0), "10/20/30 的中位数");
+        assert_eq!(median(&h.up_mbps), Some(10.0));
+        assert_eq!(h.speed_at.as_deref(), Some("2026-09-12T02:00:00Z"));
+        for i in 0..10 {
+            record_speed(
+                &mut h,
+                Some(1.0),
+                Some(1.0),
+                None,
+                now + time::Duration::hours(10 + i),
+            );
+        }
+        assert_eq!(h.down_mbps.len(), SPEEDTEST_SAMPLES_MAX, "只留最近 6 次");
+        // 测速失败只记 note，**不影响健康判定**、也不把样本写成 0
+        record_speed(
+            &mut h,
+            None,
+            None,
+            Some("下载测速失败：timeout".into()),
+            now,
+        );
+        assert_eq!(h.down_mbps.len(), SPEEDTEST_SAMPLES_MAX);
+        assert_eq!(median(&h.down_mbps), Some(1.0));
+        assert_eq!(h.speed_note.as_deref(), Some("下载测速失败：timeout"));
+        assert!(h.active, "测速失败不碰健康位");
+        // 成功一次就把上次的 note 清掉
+        record_speed(&mut h, Some(2.0), Some(2.0), None, now);
+        assert_eq!(h.speed_note, None);
+    }
+
+    #[test]
+    fn a_udp_verdict_records_the_exit_ip_and_only_a_probed_round_overwrites_it() {
+        let mut h = HealthState::default();
+        assert_eq!(h.udp_ok, None, "没探过就是未知");
+        record_udp(
+            &mut h,
+            &crate::modules::residential::proxy::UdpProbe {
+                ok: true,
+                exit_ip: Some("198.51.100.7".into()),
+                ms: Some(42),
+                note: None,
+            },
+            t0(),
+        );
+        assert_eq!(h.udp_ok, Some(true));
+        assert_eq!(h.udp_exit_ip.as_deref(), Some("198.51.100.7"));
+        assert_eq!(h.udp_at.as_deref(), Some("2026-09-12T00:00:00Z"));
+        assert_eq!(h.udp_ms, vec![42], "UDP 耗时与 TCP/HTTP 分开存");
+        // http 上游：恒不通 + 标注，且不留下上一次的出口 IP
+        record_udp(
+            &mut h,
+            &crate::modules::residential::proxy::UdpProbe {
+                ok: false,
+                exit_ip: None,
+                ms: None,
+                note: Some("HTTP 上游无 UDP".into()),
+            },
+            t0() + time::Duration::hours(1),
+        );
+        assert_eq!(h.udp_ok, Some(false));
+        assert_eq!(h.udp_exit_ip, None);
+        assert_eq!(h.udp_note.as_deref(), Some("HTTP 上游无 UDP"));
+        assert_eq!(h.udp_ms, vec![42], "失败不入耗时样本");
+    }
+
+    #[tokio::test]
+    async fn the_metric_fields_round_trip_and_an_old_runtime_json_still_loads() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("runtime.json");
+        // R1 之前的 runtime.json 没有这些字段：容器级 #[serde(default)] 必须让它照样读回
+        std::fs::write(
+            &p,
+            br#"{"residential":{"health":{"u1":{"active":true,"okstreak":3}}}}"#,
+        )
+        .unwrap();
+        let runtime = Runtime::load(&p);
+        let r = read(&runtime).await;
+        assert_eq!(r.health["u1"].okstreak, 3);
+        assert!(r.health["u1"].http_ms.is_empty());
+        assert_eq!(r.health["u1"].udp_ok, None);
+        assert_eq!(r.last_speedtest_at, None);
+        assert_eq!(r.improve_rounds, 0);
+        let id = Uuid::from_u128(9);
+        update(&runtime, |r| {
+            let h = r.health.entry("u1".into()).or_default();
+            record_latency(h, Some(90), Some(30), Some(40));
+            record_speed(h, Some(88.5), Some(12.0), None, t0());
+            r.last_speedtest_at = Some(fmt_rfc3339(t0()));
+            r.improve_candidate_id = Some(id);
+            r.improve_rounds = 2;
+        })
+        .await;
+        let back = read(&Runtime::load(&p)).await;
+        assert_eq!(back.health["u1"].http_ms, vec![90]);
+        assert_eq!(back.health["u1"].down_mbps, vec![88.5]);
+        assert_eq!(
+            back.last_speedtest_at.as_deref(),
+            Some("2026-09-12T00:00:00Z")
+        );
+        assert_eq!(back.improve_candidate_id, Some(id));
+        assert_eq!(back.improve_rounds, 2);
     }
 
     #[tokio::test]

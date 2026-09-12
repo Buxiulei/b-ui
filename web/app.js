@@ -1123,6 +1123,15 @@ function loadResiHealth() {
         const typeKind = dotClass === "active" ? "good" : (dotClass === "warn" ? "warn" : "");
         body.appendChild(_sysKv("IP 类型", _sysTag(_sysFmt(type), typeKind)));
         body.appendChild(_sysKv("分流关键词", _sysFmt(r.domains_count) + " 个"));
+        // v4 P3: 选路原因与「更优候选」防抖进度（后端 selection_reason / switch_improve_*）
+        if (r.selected_reason) body.appendChild(_sysKv("选路原因", r.selected_reason));
+        if (r.switch_improve_needed) {
+            const need = r.switch_improve_needed;
+            const done = r.switch_improve_rounds || 0;
+            body.appendChild(_sysKv("切换条件", r.switch_improve_candidate
+                ? r.switch_improve_candidate + " 已连续 " + done + "/" + need + " 轮更优"
+                : "无更优候选（0/" + need + " 轮）"));
+        }
 
         // v3.6.0 R7: 中继成员表 —— 真源是 singbox-relay.json 的 socks 出站（与巡检同源），
         // 高亮行是 selector 当前选中的出口；巡检列是 .resi-health-state.json 的迟滞判定
@@ -1132,7 +1141,7 @@ function loadResiHealth() {
             tbl.className = "resi-members";
             const head = document.createElement("div");
             head.className = "resi-member resi-member-head";
-            ["线路", "上游", "巡检", "出口 IP", "类型"].forEach(t => {
+            ["线路", "上游", "巡检", "延迟", "速度", "UDP", "出口 IP", "类型"].forEach(t => {
                 const c = document.createElement("span");
                 c.textContent = t;
                 head.appendChild(c);
@@ -1155,12 +1164,28 @@ function loadResiHealth() {
                     ? "连续健康 " + (m.okstreak || 0) + " 轮"
                     : "连续不达标 " + (m.failstreak || 0) + " 轮，已从可选线路里剔除";
                 cState.appendChild(chip);
+                // v4 P3: 延迟 / 速度 / UDP 三列。**没测过一律打「—」**，绝不打 0：
+                // 「未知」与「0 毫秒 / 0 Mbps」在面板上是两回事（后者会被读成最优）
+                const cLat = document.createElement("span");
+                cLat.textContent = m.latency_p50_ms == null ? "—" : m.latency_p50_ms + "ms";
+                cLat.title = "p50 " + _sysFmt(m.latency_p50_ms) + " / p95 "
+                    + _sysFmt(m.latency_p95_ms) + " ms（到网关 TCP p50 "
+                    + _sysFmt(m.tcp_p50_ms) + " ms）";
+                const cSpd = document.createElement("span");
+                cSpd.textContent = m.down_mbps == null ? "—" : ("↓" + m.down_mbps.toFixed(1));
+                cSpd.title = "下行 " + _sysFmt(m.down_mbps) + " / 上行 " + _sysFmt(m.up_mbps)
+                    + " Mbps，测于 " + _sysFmt(m.speed_at) + (m.speed_note ? "（" + m.speed_note + "）" : "");
+                const cUdp = document.createElement("span");
+                cUdp.textContent = m.udp_ok == null ? "—" : (m.udp_ok ? "通" : "不通");
+                cUdp.title = m.udp_ok
+                    ? "UDP 出口 " + _sysFmt(m.udp_exit_ip) + "，p50 " + _sysFmt(m.udp_p50_ms) + " ms"
+                    : (m.udp_note || "还没探过 UDP");
                 const cIp = document.createElement("span");
                 cIp.textContent = eg.ip || "—";
                 const cType = document.createElement("span");
                 cType.textContent = eg.type || "unknown";
                 cType.title = eg.isp || "";
-                row.append(cTag, cUp, cState, cIp, cType);
+                row.append(cTag, cUp, cState, cLat, cSpd, cUdp, cIp, cType);
                 tbl.appendChild(row);
             });
             body.appendChild(tbl);

@@ -57,6 +57,49 @@ pub const GOOGLE_PROBE_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) App
      (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 /// Google 探测的硬超时：比 [`PROBE_TIMEOUT_SECS`] 短，一轮巡检多这一次请求不能拖垮整轮
 pub const GOOGLE_PROBE_TIMEOUT_SECS: u64 = 8;
+/// 每轮延迟样本的 HTTP 目标（主理人 2026-09-12：「巡检要给出延迟」）。204 空响应，
+/// 正文 0 字节 —— 每 2 分钟每成员一次，用带正文的目标等于白烧住宅流量。
+/// **这一次请求同时充当本轮的第一次连通性探测**（`probe_reachable` 的 try #1），
+/// 所以健康成员每轮的 HTTP 请求数与加这一项之前一样是 2 次（本项 + Google 搜索）
+pub const LATENCY_PROBE_URL: &str = "https://www.google.com/generate_204";
+/// 延迟探测的超时：与 [`GOOGLE_PROBE_TIMEOUT_SECS`] 同值（主理人口径 `--max-time 8`）
+pub const LATENCY_PROBE_TIMEOUT_SECS: u64 = 8;
+/// 每成员保留的延迟样本数（环形），p50/p95 从这些样本算。30 × 2 分钟 = 近 1 小时
+pub const LATENCY_SAMPLES_MAX: usize = 30;
+
+/// 每小时测速（主理人 2026-09-12：「要给出上下行速度，目的是选最快的住宅代理」）。
+/// Cloudflare 的 speedtest 端点：`__down?bytes=N` 回 N 字节，`__up` 收任意 POST 正文
+pub const SPEEDTEST_DOWN_URL: &str = "https://speed.cloudflare.com/__down?bytes=";
+pub const SPEEDTEST_UP_URL: &str = "https://speed.cloudflare.com/__up";
+/// 下载 4 MB / 上传 1 MB / 每 60 分钟一轮（可由 `state.residential` 的同名可选字段覆盖）。
+/// 三条上游按此口径约 11 GB/月，见 spec §5.3
+pub const SPEEDTEST_DOWN_BYTES: u64 = 4 * 1024 * 1024;
+pub const SPEEDTEST_UP_BYTES: u64 = 1024 * 1024;
+pub const SPEEDTEST_INTERVAL_MINS: i64 = 60;
+/// 每成员保留的测速次数（环形），报中位数
+pub const SPEEDTEST_SAMPLES_MAX: usize = 6;
+/// 测速的硬超时：4 MB 在慢上游上会超过 [`PROBE_TIMEOUT_SECS`]，不能用探测的超时
+pub const SPEEDTEST_TIMEOUT_SECS: u64 = 60;
+/// 单次测速用量的上限：覆盖字段是人手填的，多打一个 0 就是几十 GB 住宅流量。
+/// 上传还要在内存里备齐这么多随机字节，不夹住等于给自己留一个 OOM
+pub const SPEEDTEST_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// UDP 探测（主理人 2026-09-12：「巡检也要测 UDP」）：经 socks5 上游做 UDP ASSOCIATE，
+/// 向 Google 的公共 STUN 发一个 Binding Request，回包里的 XOR-MAPPED-ADDRESS 就是
+/// 「UDP 出口 IP」。**每次探测新建关联**：实测 Decodo 的一次 UDP ASSOCIATE 只服务
+/// 第一个目标地址（同 `ResidentialGroup::udp_via_pool` 的注释）
+pub const STUN_HOST: &str = "stun.l.google.com";
+pub const STUN_PORT: u16 = 19302;
+pub const STUN_TIMEOUT_SECS: u64 = 5;
+/// RFC 5389 §6 的 magic cookie
+pub const STUN_MAGIC_COOKIE: u32 = 0x2112_A442;
+
+/// 「更优候选」防抖（主理人 2026-09-12）：当前出口**健康**时，只有连续
+/// [`SWITCH_IMPROVE_ROUNDS`] 轮满足「延迟 p50 低 ≥ [`SWITCH_LATENCY_GAIN`] 或
+/// 下行快 ≥ [`SWITCH_SPEED_GAIN`]」才切。当前出口不健康 / Google 封仍立即切（既有规则）
+pub const SWITCH_IMPROVE_ROUNDS: u32 = 3;
+pub const SWITCH_LATENCY_GAIN: f64 = 0.20;
+pub const SWITCH_SPEED_GAIN: f64 = 0.30;
 /// 迟滞：连续 2 轮不达标 → 不健康；连续 2 轮达标 → 恢复（spec §5.3）
 pub const FAIL_TO_UNHEALTHY: u32 = 2;
 pub const OK_TO_HEALTHY: u32 = 2;
