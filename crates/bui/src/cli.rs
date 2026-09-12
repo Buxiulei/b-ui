@@ -98,6 +98,13 @@ pub enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Hysteria2 启动前清理**本实例**残留的端口跳跃 nat 链（两个 hysteria 单元的
+    /// `ExecStartPre=-`，也被 watchdog 的自愈分支复用）。永远退 0。
+    Hy2Prestart {
+        /// 该实例的配置路径（`/opt/b-ui/config.yaml` 或 `config-residential.yaml`），
+        /// 从它的 `listen:` 行取本实例的 base 端口与跳跃区间
+        config: PathBuf,
+    },
     /// 住宅出口（上游池 / 体检 / 切换 / 黑名单）
     Residential {
         #[command(subcommand)]
@@ -300,6 +307,24 @@ mod tests {
                 dir: PathBuf::from("/opt/b-ui"),
                 out: None
             })
+        );
+    }
+
+    /// 单元里写的是 `ExecStartPre=-/opt/b-ui/bin/bui hy2-prestart /opt/b-ui/config.yaml`：
+    /// 子命令名与位置参数的形状必须和 `modules::units` 渲染的那一行逐字对得上。
+    #[test]
+    fn parses_hy2_prestart_with_the_config_path() {
+        assert_eq!(
+            Cli::try_parse_from(["bui", "hy2-prestart", "/opt/b-ui/config-residential.yaml"])
+                .unwrap()
+                .command,
+            Some(Command::Hy2Prestart {
+                config: PathBuf::from("/opt/b-ui/config-residential.yaml")
+            })
+        );
+        assert!(
+            Cli::try_parse_from(["bui", "hy2-prestart"]).is_err(),
+            "配置路径是必填：不给就不知道清哪个实例的链"
         );
     }
 

@@ -90,6 +90,57 @@ pub struct Runtime(Arc<Inner>);
 struct Inner {
     path: PathBuf,
     data: RwLock<RuntimeData>,
+    /// 落盘串行化锁：见 [`Runtime::update`]。
+    write: tokio::sync::Mutex<()>,
+}
+
+/// 临时文件名的进程内序号，配合 pid 保证每次落盘的临时文件互不相同（见 [`persist`]）。
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 落盘一份快照：**独占**临时文件 + fsync + 0600 + rename，错误带上具体路径与 errno。
+///
+/// 事故（2026-09-12 bwg-rick，M5 回滚演练）：守护进程日志里有「runtime.json 落盘失败（忽略）」
+/// 而看不出原因。根因是临时文件名固定：`state::store::write_atomic` 取
+/// `path.with_extension("json.tmp")`，于是**同一个** `runtime.json.tmp` 被多个写者共用——
+/// 守护进程里的 watchdog（每 60 秒）、对账循环、住宅巡检各自 `update()`，而 `update()` 在
+/// 拿到快照后就放开了数据锁再去写盘；同一台机器上 `bui reconcile` / `bui status` 这些 CLI 进程
+/// 也写同一个文件。两个写者交错时后者的 `create` 会截断前者的临时文件，先完成的那个 `rename`
+/// 把它搬走，另一个的 `set_permissions`/`rename` 就 ENOENT —— 正是那句被吞掉的告警。
+///
+/// 修法两条：① 临时文件名带 pid + 进程内序号，谁也不踩谁；② 失败时把临时文件清掉，
+/// 不在 `<base>` 里留下漂移扫描要报的垃圾（`.tmp` 后缀虽在 `TRANSIENT_SUFFIXES` 里，
+/// 但留着毫无用处）。同进程内的写者顺序另由 [`Runtime::update`] 的 `write` 锁保证。
+fn persist(path: &PathBuf, bytes: &[u8]) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("{} 没有父目录", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("创建目录 {} 失败", parent.display()))?;
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("runtime.json");
+    let tmp = parent.join(format!(".{name}.{}.{seq}.tmp", std::process::id()));
+    let r = (|| -> anyhow::Result<()> {
+        let mut f = std::fs::File::create(&tmp)
+            .with_context(|| format!("创建临时文件 {} 失败", tmp.display()))?;
+        f.write_all(bytes)
+            .with_context(|| format!("写入 {} 失败", tmp.display()))?;
+        f.sync_all()
+            .with_context(|| format!("fsync {} 失败", tmp.display()))?;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("chmod 600 {} 失败", tmp.display()))?;
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("rename {} → {} 失败", tmp.display(), path.display()))
+    })();
+    if r.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    r
 }
 
 impl Runtime {
@@ -105,6 +156,7 @@ impl Runtime {
         Self(Arc::new(Inner {
             path,
             data: RwLock::new(data),
+            write: tokio::sync::Mutex::new(()),
         }))
     }
 
@@ -113,11 +165,16 @@ impl Runtime {
     }
 
     /// 落盘是 best-effort：runtime.json 丢了能从零重建（spec §2.1）。
-    /// 走 `store::write_atomic`（tmp + 0600 + rename）并放进 `spawn_blocking`——本方法在守护进程的
-    /// 每一轮对账、watchdog 的每 60 秒都会被调，直接 `std::fs::write` 会阻塞 runtime 线程，而
+    /// 走 [`persist`]（独占 tmp + fsync + 0600 + rename）并放进 `spawn_blocking`——本方法在守护
+    /// 进程的每一轮对账、watchdog 的每 60 秒都会被调，直接 `std::fs::write` 会阻塞 runtime 线程，而
     /// 「先 write 再 chmod」在这两次系统调用之间会把 `runtime.json` 暴露成 0644（里面有 `restart_keys`
     /// 与上一轮报告）。Global Constraints 要求它恒为 0600。
+    ///
+    /// `write` 锁在**整个读-改-写盘**期间持有（不是只在改内存那一段）：守护进程里有三四个任务
+    /// 并发 `update()`，放开锁再写盘会让两次落盘交错，落在文件里的可能是**较旧**那份快照。
+    /// 锁的粒度是「一次 update」，写盘本身在 `spawn_blocking` 里，不占 async 工作线程。
     pub async fn update(&self, f: impl FnOnce(&mut RuntimeData)) -> RuntimeData {
+        let _write = self.0.write.lock().await;
         let mut guard = self.0.data.write().await;
         f(&mut guard);
         let snapshot = guard.clone();
@@ -125,12 +182,15 @@ impl Runtime {
         match serde_json::to_vec_pretty(&snapshot) {
             Ok(bytes) => {
                 let path = self.0.path.clone();
-                let joined = tokio::task::spawn_blocking(move || {
-                    crate::state::store::write_atomic(&path, &bytes)
-                })
-                .await;
+                let joined = tokio::task::spawn_blocking(move || persist(&path, &bytes)).await;
                 match joined {
-                    Ok(Err(e)) => tracing::warn!(error = %e, "runtime.json 落盘失败（忽略）"),
+                    // `{e:#}` 带上 anyhow 的整条 context 链（哪一步、哪个路径、errno）；
+                    // 原来只有 `%e`，真机上就只剩一句「落盘失败（忽略）」查不下去
+                    Ok(Err(e)) => tracing::warn!(
+                        path = %self.0.path.display(),
+                        error = format!("{e:#}"),
+                        "runtime.json 落盘失败（忽略）"
+                    ),
                     Err(e) => tracing::warn!(error = %e, "runtime.json 落盘任务 panic（忽略）"),
                     Ok(Ok(())) => {}
                 }
@@ -202,6 +262,65 @@ mod tests {
         assert_eq!(back["resi_streak"], serde_json::json!({"u1": 3}));
         assert_eq!(back["upgrade_available"], "4.0.1");
         assert_eq!(back["cert_sha256"], "abc");
+    }
+
+    /// 事故排查（2026-09-12 bwg-rick「runtime.json 落盘失败（忽略）」）：并发 `update()`
+    /// 一次都不许失败，最终文件必须是完整 JSON 且恒为 0600，`<base>` 里不留临时文件。
+    ///
+    /// 旧实现的临时文件名固定（`runtime.json.tmp`），并发写者互相截断 / rename 走对方的
+    /// 临时文件 → ENOENT。这条测试跑的是「10 个任务同时 update」，旧实现下必留下失败痕迹
+    /// （文件残缺或 `.tmp` 遗留）。
+    #[tokio::test]
+    async fn concurrent_updates_all_land_without_leaving_temp_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("runtime.json");
+        let rt = Runtime::load(&p);
+        let mut tasks = Vec::new();
+        for i in 0..10u32 {
+            let rt = rt.clone();
+            tasks.push(tokio::spawn(async move {
+                rt.update(|r| {
+                    r.restart_keys.insert(format!("k{i}"), i.to_string());
+                })
+                .await
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        // 最终快照 = 内存态，且文件能解析回来（不是被截断的半份）
+        let back = Runtime::load(&p).read().await;
+        assert_eq!(back, rt.read().await);
+        assert_eq!(back.restart_keys.len(), 10);
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(d.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .filter(|n| n != "runtime.json")
+            .collect();
+        assert!(leftovers.is_empty(), "临时文件没清掉：{leftovers:?}");
+    }
+
+    /// 目录不存在也要能写（`persist` 自己 `create_dir_all`），失败时理由必须点名具体路径与步骤
+    /// ——原来整条 context 链被 `%e` 吞成一句「落盘失败（忽略）」。
+    #[tokio::test]
+    async fn persist_creates_the_directory_and_reports_why_it_failed() {
+        let d = tempfile::tempdir().unwrap();
+        let nested = d.path().join("a/b/runtime.json");
+        persist(&nested, b"{}").unwrap();
+        assert_eq!(std::fs::read(&nested).unwrap(), b"{}");
+
+        // 父路径是个**文件**：create_dir_all 必失败，错误里要有那条路径
+        let blocked = d.path().join("afile");
+        std::fs::write(&blocked, b"x").unwrap();
+        let e = persist(&blocked.join("runtime.json"), b"{}").unwrap_err();
+        let msg = format!("{e:#}");
+        assert!(msg.contains("afile"), "{msg}");
+        assert!(msg.contains("创建目录"), "{msg}");
     }
 
     #[test]

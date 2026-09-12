@@ -6,8 +6,9 @@
 //! `server/core.sh:1722-1790`（面板单元 + xray drop-in）、
 //! `server/residential-helper.sh:507-522`（relay 单元）、`server/core.sh:884-891`（caddy drop-in）。
 //! v4 的变化（spec §3.4、审计 §3.1/§3.2）：六个单元都写**完整单元文件**（四个内核二进制都在
-//! `<base>/bin/`，不再 drop-in 覆盖发行版单元）；删掉两个 hysteria 的
-//! `ExecStartPre=…hy2-portjump-cleanup.sh`（v4 无任何 iptables/nft 规则）；`xray` 与 `b-ui-relay`
+//! `<base>/bin/`，不再 drop-in 覆盖发行版单元）；两个 hysteria 的
+//! `ExecStartPre=…hy2-portjump-cleanup.sh` 换成内置子命令
+//! `ExecStartPre=-{bin}/bui hy2-prestart <该实例的配置>`；`xray` 与 `b-ui-relay`
 //! 补上 v3 缺的 `MemoryHigh/MemoryMax`；全部 `LimitNOFILE=1048576`，四个数据面单元 `Nice=-5`；
 //! `b-ui.service` 自身 `MemoryMax=200M`；不生成任何 timer。
 
@@ -159,6 +160,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+ExecStartPre=-{bin}/bui hy2-prestart {base}/config.yaml
 ExecStart={bin}/hysteria server --config {base}/config.yaml
 User=root
 Group=root
@@ -186,6 +188,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+ExecStartPre=-{bin}/bui hy2-prestart {base}/config-residential.yaml
 ExecStart={bin}/hysteria server --config {base}/config-residential.yaml
 User=root
 Group=root
@@ -376,7 +379,7 @@ mod tests {
     }
 
     #[test]
-    fn hysteria_units_keep_v3_memory_tuning_and_drop_the_portjump_hook() {
+    fn hysteria_units_keep_v3_memory_tuning() {
         let arts = UnitsModule.render(&sample_state(), &ctx());
         let direct = unit_of(&arts, "hysteria-server");
         assert!(direct
@@ -386,12 +389,6 @@ mod tests {
         assert!(direct.contains("MemoryHigh=500M"));
         assert!(direct.contains("MemoryMax=700M"));
         assert!(direct.contains("TimeoutStopSec=15"));
-        assert!(
-            !direct.contains("ExecStartPre"),
-            "v4 没有端口跳跃 NAT 链，不需要清理钩子"
-        );
-        let low = direct.to_lowercase();
-        assert!(!low.contains("iptables") && !low.contains("nft"));
         let resi = unit_of(&arts, "hysteria-residential");
         assert!(resi.contains(
             "ExecStart=/opt/b-ui/bin/hysteria server --config /opt/b-ui/config-residential.yaml"
@@ -401,6 +398,56 @@ mod tests {
         assert!(resi.contains("MemoryMax=500M"));
         assert!(resi.contains("LimitNPROC=512"));
         assert!(resi.contains("After=network-online.target b-ui-relay.service"));
+    }
+
+    /// 事故回归（2026-09-12 20:33 UTC bwg-rick，M5 回滚演练之后）：`hysteria-residential`
+    /// 崩 52 次，日志「invalid config: listen: ip6tables [-w -t nat -N HYSTERIA-PR-c66a02d9]:
+    /// exit status 1: ip6tables: Chain already exists」——内置端口跳跃建的 nat 链在进程被
+    /// 非正常终止后残留，新进程 `-N` 同名链即 FATAL。所以两个 hysteria 单元都要在启动前跑
+    /// 一次**本实例**的孤儿链清理（逻辑见 `modules::portjump`）。
+    ///
+    /// 三个点是硬要求：① `ExecStartPre=-` 的 `-` 前缀（清理失败不得阻塞内核启动）；
+    /// ② 每个单元只传**自己**那份配置（链按该实例的 base 端口 / 跳跃区间定位，绝不跨实例误删，
+    /// 这正是 v3.5.1 共享 cleanup 翻车的修法）；③ 钩子是 `bui` 自己的子命令，不是 shell 脚本、
+    /// 单元里也不出现 `iptables`（v3 的 `hy2-portjump-cleanup.sh` 仍在 `LEGACY_FILES` 里被删）。
+    #[test]
+    fn both_hysteria_units_clean_their_own_portjump_chains_before_start() {
+        let arts = UnitsModule.render(&sample_state(), &ctx());
+        let direct = unit_of(&arts, "hysteria-server");
+        assert!(
+            direct.contains("ExecStartPre=-/opt/b-ui/bin/bui hy2-prestart /opt/b-ui/config.yaml\n"),
+            "{direct}"
+        );
+        let resi = unit_of(&arts, "hysteria-residential");
+        assert!(
+            resi.contains(
+                "ExecStartPre=-/opt/b-ui/bin/bui hy2-prestart /opt/b-ui/config-residential.yaml\n"
+            ),
+            "{resi}"
+        );
+        for (name, t) in [
+            ("hysteria-server", &direct),
+            ("hysteria-residential", &resi),
+        ] {
+            assert_eq!(
+                t.matches("ExecStartPre").count(),
+                1,
+                "{name} 只该有一条启动前钩子"
+            );
+            let low = t.to_lowercase();
+            assert!(
+                !low.contains("iptables") && !low.contains("nft") && !low.contains(".sh"),
+                "{name} 的钩子必须是 bui 子命令，不是脚本：{t}"
+            );
+        }
+        // 另外四个单元不该有任何启动前钩子
+        for name in ["b-ui", "xray", "b-ui-relay", "caddy"] {
+            assert!(
+                !unit_of(&arts, name).contains("ExecStartPre"),
+                "{name} 不需要端口跳跃清理"
+            );
+        }
+        assert!(LEGACY_FILES.contains(&"/opt/b-ui/hy2-portjump-cleanup.sh"));
     }
 
     #[test]
