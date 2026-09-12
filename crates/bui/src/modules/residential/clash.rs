@@ -1,20 +1,27 @@
-//! relay 的 Clash API 客户端（读/切 `resi-pool`）与 tag ↔ upstream 的唯一换算。
+//! relay 的 Clash API 客户端（读/切每个 selector）与 tag ↔ upstream 的唯一换算。
 //!
 //! 切换只经 Clash API，不写 state、不重启 relay（契约决策 §C）：relay 的
 //! `interrupt_exist_connections: false` 保证换选择不掐既有连接。
 
-use super::{CLASH_API, CLASH_TIMEOUT_SECS, MEMBER_PREFIX, POOL};
+use super::{CLASH_API, CLASH_TIMEOUT_SECS, MEMBER_PREFIX};
+// 生产实现按调用方传进来的 selector 拼路径，不再自己引用全局池的 tag；
+// `FakeClash` 与测试仍要用它当默认 selector
+#[cfg(test)]
+use super::POOL;
 use bui_schema::model::ResidentialGroup;
 use uuid::Uuid;
 
 /// relay 的 Clash API（`127.0.0.1:9091`，只监听回环）。**同步** trait，调用点在
 /// `spawn_blocking` 里（与 `Prober` 同一条铁律）。
+///
+/// `selector` 是 selector 出站的 tag：全局池是 [`POOL`]（`resi-pool`），每槽是
+/// `slot-<i>-pool`（[`super::slot_selector`]）。两层 selector 的语义见总纲裁决 D8。
 pub trait Clash: Send + Sync + 'static {
-    /// `GET /proxies/resi-pool` → `.now`；relay 未运行 / 无 clash_api → `None`
-    fn selected(&self) -> Option<String>;
-    /// `PUT /proxies/resi-pool` `{"name":"<tag>"}`；与配置切换走同一条 `SelectOutbound`
+    /// `GET /proxies/<selector>` → `.now`；relay 未运行 / 无此 selector → `None`
+    fn selected(&self, selector: &str) -> Option<String>;
+    /// `PUT /proxies/<selector>` `{"name":"<tag>"}`；与配置切换走同一条 `SelectOutbound`
     /// 路径（调研 S4），`interrupt_exist_connections: false` 保证不掐既有连接
-    fn select(&self, tag: &str) -> Result<(), ClashError>;
+    fn select(&self, selector: &str, tag: &str) -> Result<(), ClashError>;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -51,8 +58,8 @@ impl HttpClash {
             .map_err(|e| ClashError::Unreachable(e.to_string()))
     }
 
-    fn url(&self) -> String {
-        format!("http://{}/proxies/{POOL}", self.api)
+    fn url(&self, selector: &str) -> String {
+        format!("http://{}/proxies/{selector}", self.api)
     }
 }
 
@@ -63,11 +70,11 @@ impl Default for HttpClash {
 }
 
 impl Clash for HttpClash {
-    fn selected(&self) -> Option<String> {
+    fn selected(&self, selector: &str) -> Option<String> {
         let v: serde_json::Value = self
             .client()
             .ok()?
-            .get(self.url())
+            .get(self.url(selector))
             .send()
             .ok()?
             .json()
@@ -75,10 +82,10 @@ impl Clash for HttpClash {
         v.get("now")?.as_str().map(str::to_string)
     }
 
-    fn select(&self, tag: &str) -> Result<(), ClashError> {
+    fn select(&self, selector: &str, tag: &str) -> Result<(), ClashError> {
         let resp = self
             .client()?
-            .put(self.url())
+            .put(self.url(selector))
             .json(&serde_json::json!({ "name": tag }))
             .send()
             .map_err(|e| ClashError::Unreachable(e.to_string()))?;
@@ -120,7 +127,8 @@ pub fn id_of_tag(g: &ResidentialGroup, tag: &str) -> Option<Uuid> {
 #[cfg(test)]
 #[derive(Default)]
 pub struct FakeClashInner {
-    pub now: Option<String>,
+    /// 每个 selector 各记一份当前选择（键 = selector tag）
+    pub now: std::collections::BTreeMap<String, String>,
     /// 令 `select` 失败（测「切换失败只告警不改 runtime」）
     pub reject: bool,
     pub calls: Vec<String>,
@@ -133,10 +141,13 @@ pub struct FakeClash {
 
 #[cfg(test)]
 impl FakeClash {
+    /// `now` 播种在全局 selector [`POOL`] 上（每槽 selector 一开始都读不到）
     pub fn new(now: Option<&str>) -> Self {
         Self {
             inner: std::sync::Mutex::new(FakeClashInner {
-                now: now.map(str::to_string),
+                now: now
+                    .map(|t| [(POOL.to_string(), t.to_string())].into_iter().collect())
+                    .unwrap_or_default(),
                 ..Default::default()
             }),
         }
@@ -147,7 +158,7 @@ impl FakeClash {
         self
     }
 
-    /// "get" / "put:<tag>"
+    /// `get:<selector>` / `put:<selector>:<tag>`
     pub fn calls(&self) -> Vec<String> {
         self.inner.lock().unwrap().calls.clone()
     }
@@ -155,22 +166,22 @@ impl FakeClash {
 
 #[cfg(test)]
 impl Clash for FakeClash {
-    fn selected(&self) -> Option<String> {
+    fn selected(&self, selector: &str) -> Option<String> {
         let mut i = self.inner.lock().unwrap();
-        i.calls.push("get".into());
-        i.now.clone()
+        i.calls.push(format!("get:{selector}"));
+        i.now.get(selector).cloned()
     }
 
-    fn select(&self, tag: &str) -> Result<(), ClashError> {
+    fn select(&self, selector: &str, tag: &str) -> Result<(), ClashError> {
         let mut i = self.inner.lock().unwrap();
-        i.calls.push(format!("put:{tag}"));
+        i.calls.push(format!("put:{selector}:{tag}"));
         if i.reject {
             return Err(ClashError::Rejected {
                 tag: tag.to_string(),
                 status: 404,
             });
         }
-        i.now = Some(tag.to_string());
+        i.now.insert(selector.to_string(), tag.to_string());
         Ok(())
     }
 }
@@ -222,20 +233,37 @@ mod tests {
     }
 
     #[test]
-    fn fake_clash_records_calls() {
+    fn fake_clash_records_calls_per_selector() {
         let c = FakeClash::new(Some("resi-1"));
-        assert_eq!(c.selected().as_deref(), Some("resi-1"));
-        c.select("resi-2").unwrap();
-        assert_eq!(c.selected().as_deref(), Some("resi-2"), "切换后 now 跟着变");
+        assert_eq!(c.selected(POOL).as_deref(), Some("resi-1"));
+        // 每槽 selector 各自独立记账：一个槽切走不影响别的槽
+        assert_eq!(
+            c.selected("slot-1-pool"),
+            None,
+            "没播种过的 selector 读不到 now"
+        );
+        c.select(POOL, "resi-2").unwrap();
+        c.select("slot-1-pool", "resi-3").unwrap();
+        assert_eq!(c.selected(POOL).as_deref(), Some("resi-2"));
+        assert_eq!(c.selected("slot-1-pool").as_deref(), Some("resi-3"));
         c.with(|i| i.reject = true);
         assert!(matches!(
-            c.select("resi-1"),
+            c.select(POOL, "resi-1"),
             Err(ClashError::Rejected { .. })
         ));
-        assert_eq!(c.selected().as_deref(), Some("resi-2"), "失败不改 now");
+        assert_eq!(c.selected(POOL).as_deref(), Some("resi-2"), "失败不改 now");
         assert_eq!(
             c.calls(),
-            vec!["get", "put:resi-2", "get", "put:resi-1", "get"]
+            vec![
+                "get:resi-pool",
+                "get:slot-1-pool",
+                "put:resi-pool:resi-2",
+                "put:slot-1-pool:resi-3",
+                "get:resi-pool",
+                "get:slot-1-pool",
+                "put:resi-pool:resi-1",
+                "get:resi-pool",
+            ]
         );
     }
 
@@ -273,10 +301,10 @@ mod tests {
     fn http_clash_reads_now_puts_the_tag_and_maps_a_rejection() {
         let (api, h) = fake_clash_api(vec![OK_NOW, NO_CONTENT, NOT_FOUND]);
         let c = HttpClash::with_api(api, 2);
-        assert_eq!(c.selected().as_deref(), Some("resi-2"));
-        c.select("resi-3").unwrap();
+        assert_eq!(c.selected(POOL).as_deref(), Some("resi-2"));
+        c.select(POOL, "resi-3").unwrap();
         assert!(matches!(
-            c.select("resi-9"),
+            c.select(POOL, "resi-9"),
             Err(ClashError::Rejected { status: 404, .. })
         ));
         let reqs = h.join().unwrap();
@@ -305,13 +333,29 @@ mod tests {
         drop(l);
         let c = HttpClash::with_api(api, 1);
         assert_eq!(
-            c.selected(),
+            c.selected(POOL),
             None,
             "读不到当前选择 ⇒ 巡检本轮不切（T8 规则 5）"
         );
         assert!(matches!(
-            c.select("resi-1"),
+            c.select(POOL, "resi-1"),
             Err(ClashError::Unreachable(_))
         ));
+    }
+
+    #[test]
+    fn http_clash_addresses_the_selector_in_the_path() {
+        let (api, h) = fake_clash_api(vec![OK_NOW, NO_CONTENT]);
+        let c = HttpClash::with_api(api, 2);
+        assert_eq!(c.selected("slot-2-pool").as_deref(), Some("resi-2"));
+        c.select("slot-2-pool", "resi-3").unwrap();
+        let reqs = h.join().unwrap();
+        assert!(
+            reqs[0].starts_with("GET /proxies/slot-2-pool HTTP/1.1\r\n"),
+            "实际 {:?}",
+            reqs[0]
+        );
+        assert!(reqs[1].starts_with("PUT /proxies/slot-2-pool HTTP/1.1\r\n"));
+        assert!(reqs[1].contains(r#"{"name":"resi-3"}"#));
     }
 }

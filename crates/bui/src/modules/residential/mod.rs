@@ -102,6 +102,10 @@ pub const STUN_MAGIC_COOKIE: u32 = 0x2112_A442;
 pub const SWITCH_IMPROVE_ROUNDS: u32 = 3;
 pub const SWITCH_LATENCY_GAIN: f64 = 0.20;
 pub const SWITCH_SPEED_GAIN: f64 = 0.30;
+/// 按槽驱动的「切回防抖」（spec §5.6）：本槽自己的 IP 连续这么多轮健康且 Google 通，
+/// 才从借用状态切回本槽。**借用方向不设额外轮数**：`HealthState.active` 本身已经带
+/// 2 轮迟滞（[`FAIL_TO_UNHEALTHY`]），再叠一层只会让「本槽坏了还在往坏 IP 上打」多撑几分钟。
+pub const SLOT_BACK_ROUNDS: u32 = 3;
 /// 迟滞：连续 2 轮不达标 → 不健康；连续 2 轮达标 → 恢复（spec §5.3）
 pub const FAIL_TO_UNHEALTHY: u32 = 2;
 pub const OK_TO_HEALTHY: u32 = 2;
@@ -145,6 +149,12 @@ pub const PORT_PROBE_HOSTS: [(u16, &str); 5] = [
     (22, "github.com"),               // SSH
     (853, "dns.google"),              // DoT
 ];
+
+/// 槽 `index` 的 selector tag，与 `bui_schema::render::relay` 的 `selector_tag` 同规则。
+/// **唯一**一处做这个换算。
+pub fn slot_selector(index: u16) -> String {
+    format!("slot-{index}-pool")
+}
 
 /// 端口 → 探测目标主机。表里有就用真实主机，其余（基准 80/443 与 8080）用中性主机。
 pub fn port_probe_host(port: u16) -> &'static str {
