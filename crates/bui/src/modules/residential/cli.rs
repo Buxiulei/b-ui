@@ -53,6 +53,20 @@ pub enum ResidentialCmd {
         #[arg(long)]
         json: bool,
     },
+    /// 按槽列出 IP、当前实际出口、用户数与指标
+    Slots {
+        #[arg(long)]
+        json: bool,
+    },
+    /// 把某一槽的出口钉在指定上游上（`<uuid>`、`resi-N` / `url-N` 或 `<host:port>`）；
+    /// `--auto` 解除，回到「本槽优先 / 借用」的自动驱动。
+    /// **与 `blacklist pin`（钉域名走直连）无关**，钉的是槽位的出口 IP
+    SlotPin {
+        index: u16,
+        target: Option<String>,
+        #[arg(long)]
+        auto: bool,
+    },
     /// 黑名单（查看 / 钉住 / 立即应用）
     Blacklist {
         #[command(subcommand)]
@@ -143,6 +157,23 @@ pub fn to_request(
                 (false, None) => anyhow::bail!("select 要么给 <target>，要么给 --auto"),
             };
             ("POST", "/api/residential/select".into(), Some(body))
+        }
+        C::Slots { .. } => ("GET", "/api/residential/slots".into(), None),
+        C::SlotPin {
+            index,
+            target,
+            auto,
+        } => {
+            anyhow::ensure!(
+                !(*auto && target.is_some()),
+                "slot-pin 只能二选一：<target>（钉住）或 --auto（解除）"
+            );
+            let body = match (auto, target) {
+                (true, _) => serde_json::json!({"index": index, "auto": true}),
+                (false, Some(t)) => serde_json::json!({"index": index, "id": t}),
+                (false, None) => anyhow::bail!("slot-pin 要么给 <target>，要么给 --auto"),
+            };
+            ("POST", "/api/residential/slots/pin".into(), Some(body))
         }
         C::Blacklist { cmd } => return blacklist_request(cmd),
     })
@@ -392,6 +423,7 @@ pub fn format_status(v: &serde_json::Value) -> String {
     for a in as_arr(v, "alerts") {
         out.push(format!("告警：{}", a.as_str().unwrap_or_default()));
     }
+    out.extend(slot_lines(v));
     out.join("\n")
 }
 
@@ -457,7 +489,63 @@ pub fn format_health(v: &serde_json::Value) -> String {
     for a in as_arr(v, "alerts") {
         out.push(format!("告警：{}", a.as_str().unwrap_or_default()));
     }
+    out.extend(slot_lines(v));
     out.join("\n")
+}
+
+/// `bui residential slots` 的人类可读输出。
+pub fn format_slots(v: &serde_json::Value) -> String {
+    let mut out = vec![
+        "槽  IP                 当前出口    用户  延迟     HY2 端口        用户名".to_string(),
+    ];
+    for s in as_arr(v, "slots") {
+        let users = as_arr(s, "users")
+            .iter()
+            .filter_map(|x| x.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        out.push(format!(
+            "{:<3} {:<18} {:<11} {:<5} {:<8} {:<15} {}",
+            as_u64(s, "index"),
+            s.get("ip").and_then(|x| x.as_str()).unwrap_or("—"),
+            format!(
+                "{}{}",
+                s.get("active_tag").and_then(|x| x.as_str()).unwrap_or("—"),
+                if s.get("pinned").and_then(|x| x.as_bool()) == Some(true) {
+                    "(钉)"
+                } else if s.get("borrowed").and_then(|x| x.as_bool()) == Some(true) {
+                    "(借)"
+                } else {
+                    ""
+                }
+            ),
+            as_u64(s, "user_count"),
+            latency_text(s),
+            format!(
+                "{}+{}-{}",
+                as_u64(s, "hy2_port"),
+                as_arr(s, "hop")
+                    .first()
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0),
+                as_arr(s, "hop")
+                    .get(1)
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0)
+            ),
+            users
+        ));
+    }
+    out.join("\n")
+}
+
+/// `status` / `health` 末尾的槽位段（spec §5.6 要求两处都按槽列出）。
+/// 空池 / 没有 `slots` 字段时返回空 —— `format_slots` 那时只会打个表头。
+fn slot_lines(v: &serde_json::Value) -> Vec<String> {
+    if as_arr(v, "slots").is_empty() {
+        return Vec::new();
+    }
+    vec!["槽位：".to_string(), format_slots(v)]
 }
 
 /// `blacklist` 的人类可读渲染：pins / auto / 待生效 + 候选，末尾附局限说明。
@@ -559,6 +647,15 @@ pub async fn run(cmd: ResidentialCmd, socket: PathBuf) -> anyhow::Result<()> {
         ResidentialCmd::Blacklist {
             cmd: BlacklistCmd::List { json },
         } => print_or(*json, &v, format_blacklist),
+        ResidentialCmd::Slots { json } => print_or(*json, &v, format_slots),
+        ResidentialCmd::SlotPin { index, auto, .. } => println!(
+            "槽 {index} {}",
+            if *auto {
+                "已解除 pin，回到自动驱动"
+            } else {
+                "已钉住"
+            }
+        ),
         // 供脚本消费：只打印生效关键字数组（等价于 v3 `residential-helper.sh domains`）
         ResidentialCmd::Domains => println!(
             "{}",
@@ -569,7 +666,7 @@ pub async fn run(cmd: ResidentialCmd, socket: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 住宅子菜单的 8 项（两列渲染沿用 P1 的 [`crate::commands::menu::render_with`]）。
+/// 住宅子菜单的 10 项（两列渲染沿用 P1 的 [`crate::commands::menu::render_with`]）。
 pub fn menu_items() -> Vec<MenuItem> {
     vec![
         MenuItem {
@@ -605,6 +702,17 @@ pub fn menu_items() -> Vec<MenuItem> {
         MenuItem {
             key: "7",
             title: "黑名单（查看 / 钉住 / 立即应用）",
+            action: MenuAction::Residential,
+        },
+        // 文案要与「钉住域名」区分开：这两项钉的东西完全不同（spec §5.6）
+        MenuItem {
+            key: "8",
+            title: "按槽查看住宅出口",
+            action: MenuAction::Residential,
+        },
+        MenuItem {
+            key: "9",
+            title: "钉住某一槽的出口 IP",
             action: MenuAction::Residential,
         },
         MenuItem {
@@ -691,6 +799,29 @@ pub async fn menu(socket: PathBuf) -> anyhow::Result<()> {
             "7" => ResidentialCmd::Blacklist {
                 cmd: BlacklistCmd::List { json: false },
             },
+            "8" => ResidentialCmd::Slots { json: false },
+            "9" => {
+                let index = prompt("槽序号（见「按槽查看住宅出口」）: ")?;
+                let Ok(index) = index.parse::<u16>() else {
+                    println!("槽序号要填数字，实际 {index}");
+                    continue;
+                };
+                // 本地不解析上游定位串：uuid / resi-N / url-N / host:port 都交给服务端
+                let target = prompt("目标上游（<uuid>、resi-N 或 <host:port>，留空 = 解除）: ")?;
+                if target.is_empty() {
+                    ResidentialCmd::SlotPin {
+                        index,
+                        target: None,
+                        auto: true,
+                    }
+                } else {
+                    ResidentialCmd::SlotPin {
+                        index,
+                        target: Some(target),
+                        auto: false,
+                    }
+                }
+            }
             "0" => return Ok(()),
             other => {
                 println!("无效选择：{other}");
@@ -1037,11 +1168,14 @@ mod tests {
     }
 
     #[test]
-    fn the_menu_lists_eight_items_and_the_p1_menu_gains_one() {
+    fn the_menu_lists_ten_items_and_the_p1_menu_gains_one() {
         let items = menu_items();
-        assert_eq!(items.len(), 8);
+        assert_eq!(items.len(), 10);
         assert_eq!(items.last().unwrap().action, MenuAction::Quit);
         assert!(items.iter().any(|i| i.title.contains("黑名单")));
+        // 两处「钉住」的文案必须能区分开：一个钉域名，一个钉槽位的出口 IP（spec §5.6）
+        assert!(items.iter().any(|i| i.title.contains("按槽查看住宅出口")));
+        assert!(items.iter().any(|i| i.title == "钉住某一槽的出口 IP"));
         // P1 的主菜单必须有住宅入口
         let p1 = crate::commands::menu::items();
         assert!(
@@ -1144,6 +1278,54 @@ mod tests {
                     auto: false
                 }
             })
+        );
+    }
+
+    #[test]
+    fn slots_and_slot_pin_map_to_their_endpoints() {
+        assert_eq!(
+            to_request(&ResidentialCmd::Slots { json: true }).unwrap(),
+            ("GET", "/api/residential/slots".to_string(), None)
+        );
+        let (m, p, b) = to_request(&ResidentialCmd::SlotPin {
+            index: 2,
+            target: Some("resi-3".into()),
+            auto: false,
+        })
+        .unwrap();
+        assert_eq!((m, p.as_str()), ("POST", "/api/residential/slots/pin"));
+        assert_eq!(b.unwrap(), serde_json::json!({"index": 2, "id": "resi-3"}));
+        let (_, _, b) = to_request(&ResidentialCmd::SlotPin {
+            index: 0,
+            target: None,
+            auto: true,
+        })
+        .unwrap();
+        assert_eq!(b.unwrap(), serde_json::json!({"index": 0, "auto": true}));
+        assert!(to_request(&ResidentialCmd::SlotPin {
+            index: 0,
+            target: Some("resi-1".into()),
+            auto: true
+        })
+        .is_err());
+        assert!(to_request(&ResidentialCmd::SlotPin {
+            index: 0,
+            target: None,
+            auto: false
+        })
+        .is_err());
+        // 黑名单的 `pin` 还在原来的位置，没被劫持
+        assert_eq!(
+            to_request(&ResidentialCmd::Blacklist {
+                cmd: BlacklistCmd::Pin {
+                    value: "pay.google.com".into(),
+                    kind: "domain_suffix".into(),
+                    note: String::new(),
+                },
+            })
+            .unwrap()
+            .1,
+            "/api/residential/blacklist/pins"
         );
     }
 }

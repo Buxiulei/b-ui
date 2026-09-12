@@ -1190,6 +1190,56 @@ function loadResiHealth() {
             });
             body.appendChild(tbl);
         }
+
+        // v4 P3（spec §5.6）：按槽列出 IP、当前实际出口、用户数与用户名。
+        // 与成员表分开：成员表是「池里有哪些 IP」，槽位表是「哪个用户群走哪个 IP」。
+        const slots = Array.isArray(r.slots) ? r.slots : [];
+        if (slots.length) {
+            const tbl = document.createElement("div");
+            tbl.className = "resi-members";
+            const head = document.createElement("div");
+            head.className = "resi-member resi-member-head";
+            ["槽", "本槽 IP", "当前出口", "用户", "延迟", "HY2 端口", "用户名"].forEach(t => {
+                const c = document.createElement("span");
+                c.textContent = t;
+                head.appendChild(c);
+            });
+            tbl.appendChild(head);
+            slots.forEach(s => {
+                const row = document.createElement("div");
+                row.className = "resi-member" + (s.borrowed ? " warn" : "");
+                const cIdx = document.createElement("span");
+                cIdx.textContent = "#" + s.index;
+                cIdx.title = "selector " + _sysFmt(s.selector) + "，中继入站 127.0.0.1:" + _sysFmt(s.relay_port);
+                const cIp = document.createElement("span");
+                cIp.textContent = s.ip || "—";
+                cIp.title = _sysFmt(s.host) + ":" + _sysFmt(s.port);
+                const cNow = document.createElement("span");
+                // 「借用中」必须一眼看出来：它意味着这批用户此刻不在自己的 IP 上
+                const tag = s.active_tag || "—";
+                cNow.appendChild(_sysTag(
+                    tag + (s.pinned ? "（钉住）" : (s.borrowed ? "（借用）" : "")),
+                    s.pinned ? "warn" : (s.borrowed ? "warn" : "good")));
+                cNow.title = s.borrowed
+                    ? "借用自 " + _sysFmt(s.borrowed_from) + "；本槽恢复 "
+                      + _sysFmt(s.back_rounds) + "/" + _sysFmt(s.back_rounds_needed) + " 轮后切回"
+                    : "正在用本槽自己的 IP";
+                const cN = document.createElement("span");
+                cN.textContent = _sysFmt(s.user_count);
+                const cLat = document.createElement("span");
+                cLat.textContent = s.latency_p50_ms == null ? "—" : s.latency_p50_ms + "ms";
+                const cPort = document.createElement("span");
+                const hop = Array.isArray(s.hop) ? s.hop : [];
+                cPort.textContent = _sysFmt(s.hy2_port) + " + " + _sysFmt(hop[0]) + "-" + _sysFmt(hop[1]);
+                cPort.title = "这一槽的用户在订阅里拿到的 HY2 住宅端口与跳跃区间";
+                const cUsers = document.createElement("span");
+                cUsers.textContent = (s.users || []).join("、") || "—";
+                cUsers.title = cUsers.textContent;
+                row.append(cIdx, cIp, cNow, cN, cLat, cPort, cUsers);
+                tbl.appendChild(row);
+            });
+            body.appendChild(tbl);
+        }
     }).catch(() => {
         if (btn) { btn.disabled = false; btn.textContent = "检查"; }
         _sysErr(body, "读取失败", loadResiHealth);

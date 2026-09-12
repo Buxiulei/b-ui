@@ -9,7 +9,7 @@
 
 use super::{
     clash, proxy, state, HEALTH_INTERVAL_SECS, HEALTH_PROBE_HOST, HEALTH_PROBE_URL, HEALTH_TRIES,
-    SWITCH_IMPROVE_ROUNDS, SWITCH_LATENCY_GAIN, SWITCH_MIN_INTERVAL_SECS, SWITCH_SPEED_GAIN,
+    POOL, SWITCH_IMPROVE_ROUNDS, SWITCH_LATENCY_GAIN, SWITCH_MIN_INTERVAL_SECS, SWITCH_SPEED_GAIN,
 };
 use crate::api::Event;
 use crate::reconcile::DaemonCtx;
@@ -165,6 +165,20 @@ pub fn pick_target(
             return Some(m);
         }
     }
+    rank_healthy(g, r, healthy, now).into_iter().next()
+}
+
+/// 把健康成员按 [`pick_target`] 的排序键**全部**排好（不只取首位）。
+/// 按槽驱动要「借用排名最高的其他健康 IP」，需要的是整张排名而不是冠军。
+///
+/// **不含手动锁定的短路**：那是全局 selector（`resi-pool`）的语义，
+/// 每槽的手动 pin 在 `slots::drive_slots` 里单独处理。
+pub fn rank_healthy(
+    g: &ResidentialGroup,
+    r: &ResiRuntime,
+    healthy: &[Uuid],
+    now: OffsetDateTime,
+) -> Vec<Uuid> {
     let mut cands: Vec<SortKey> = healthy
         .iter()
         .filter_map(|id| {
@@ -194,7 +208,7 @@ pub fn pick_target(
         })
         .collect();
     cands.sort();
-    cands.into_iter().next().map(|c| c.7)
+    cands.into_iter().map(|c| c.7).collect()
 }
 
 /// 「候选比当前出口**明显**更优」（主理人 2026-09-12 的防抖判据）：延迟 p50 低
@@ -422,6 +436,23 @@ pub async fn check_round(
         .filter_map(|id| clash::tag_of(&g, *id))
         .collect();
 
+    // spec §5.6：按槽驱动各自的 selector。放在 healthy 算完、全局切换判定之前 ——
+    // 它与全局 selector 的决策彼此独立（D8），而且不管全局这一轮切不切，
+    // 每个槽都得按「本槽优先 / 借用 / 3 轮切回」收敛到位。
+    for o in
+        crate::modules::residential::slots::drive_slots(ctx, c.clone(), &g, &healthy, now).await
+    {
+        if o.switched {
+            out.notes.push(format!(
+                "槽 {} 切到 {}",
+                o.index,
+                clash::tag_of(&g, o.target).unwrap_or_else(|| o.target.to_string())
+            ));
+        } else if let Some(n) = &o.note {
+            out.notes.push(format!("槽 {}：{n}", o.index));
+        }
+    }
+
     // 规则 4：成员集在本轮内变化 → 只写 runtime，不切
     let after = ids_of(&state::group_of(&*ctx.store.read().await));
     if after != before {
@@ -435,7 +466,7 @@ pub async fn check_round(
 
     // 规则 5：读不到当前选择（relay 没起来或旧配置）→ 不切
     let cc = c.clone();
-    let sel_tag = tokio::task::spawn_blocking(move || cc.selected()).await?;
+    let sel_tag = tokio::task::spawn_blocking(move || cc.selected(POOL)).await?;
     let Some(sel_tag) = sel_tag else {
         out.notes
             .push("relay 的 Clash API 读不到当前选择（未运行或旧配置），本轮不切换".into());
@@ -495,7 +526,7 @@ pub async fn check_round(
             // tag 现算（位置键，不做主键）；cur 来自当前池，tag_of 必有值
             let tag = clash::tag_of(&g, cur).expect("cur 取自当前池");
             let (cc, t2) = (c.clone(), tag.clone());
-            match tokio::task::spawn_blocking(move || cc.select(&t2)).await? {
+            match tokio::task::spawn_blocking(move || cc.select(POOL, &t2)).await? {
                 Ok(()) => {
                     tracing::info!(from = %sel_tag, to = %tag, "relay 重启后重放住宅出口选择");
                     out.notes.push(format!(
@@ -682,7 +713,7 @@ async fn switch_to(
     out: &mut RoundOutcome,
 ) -> anyhow::Result<bool> {
     let (cc, t2) = (c, target_tag.to_string());
-    match tokio::task::spawn_blocking(move || cc.select(&t2)).await? {
+    match tokio::task::spawn_blocking(move || cc.select(POOL, &t2)).await? {
         Ok(()) => {
             let pending = Some(target_id) != g.selected_upstream_id;
             state::update(&ctx.runtime, move |r| {
@@ -779,6 +810,18 @@ pub async fn replay_loop(
     loop {
         match rx.recv().await {
             Ok(Event::RelayRestarted) => {
+                // spec §5.6：relay 重启后每槽的 selector 也回到配置里的 default（本槽 IP）。
+                // 把各槽的 current_upstream_id 清零 ⇒ 下一轮 drive_slots 无条件重 PUT，
+                // 不去赌 sing-box 的 `cache_file` 有没有把 selector 选择持久化下来。
+                // back_rounds 不清：它记的是「本槽自己健康了几轮」，与 relay 重启无关。
+                // **必须在下面那句 early continue 之前**：运行时还没选过全局出口时，
+                // 那个 `let ... else { continue }` 会直接跳过整支，槽位就永远清不掉。
+                state::update(&ctx.runtime, |r| {
+                    for s in r.slots.values_mut() {
+                        s.current_upstream_id = None;
+                    }
+                })
+                .await;
                 // relay 重启后 selector 回到配置里的 default（池首），把运行时选择重放回去。
                 // 没有这一步，每次黑名单批量或 pin 都会把出口悄悄换回池首。
                 // tag 现算：runtime 存的是 uuid，池增删后同一个 resi-N 可能已指向别人（§C）
@@ -791,7 +834,7 @@ pub async fn replay_loop(
                     continue;
                 };
                 let (cc, t2) = (c.clone(), tag.clone());
-                match tokio::task::spawn_blocking(move || cc.select(&t2)).await {
+                match tokio::task::spawn_blocking(move || cc.select(POOL, &t2)).await {
                     Ok(Ok(())) => tracing::info!(tag = %tag, "relay 重启后已重放住宅出口选择"),
                     other => {
                         tracing::warn!(tag = %tag, result = ?other, "重放住宅出口选择失败")
@@ -811,7 +854,7 @@ pub async fn select_manual(ctx: &DaemonCtx, c: Arc<dyn Clash>, id: Uuid) -> anyh
     let g = state::group_of(&*ctx.store.read().await);
     let tag = clash::tag_of(&g, id).ok_or_else(|| anyhow::anyhow!("上游不在当前池里"))?;
     let (cc, t2) = (c.clone(), tag.clone());
-    tokio::task::spawn_blocking(move || cc.select(&t2)).await??;
+    tokio::task::spawn_blocking(move || cc.select(POOL, &t2)).await??;
     let now = ctx.host.now();
     let pending = Some(id) != g.selected_upstream_id;
     state::update(&ctx.runtime, move |r| {
@@ -1019,7 +1062,7 @@ mod tests {
         assert_eq!(out.healthy, vec!["resi-1", "resi-2"]);
         assert_eq!(out.switched_to, None, "当前健康就粘住");
         assert_eq!(out.replayed_to, None, "两边一致，没什么可重放");
-        assert_eq!(clash.calls(), vec!["get"], "不发 PUT");
+        assert_eq!(clash.calls(), vec!["get:resi-pool"], "不发 PUT");
         assert_eq!(
             rstate::read(&c.runtime).await.selected_upstream_id,
             Some(Uuid::from_u128(1)),
@@ -1054,7 +1097,7 @@ mod tests {
             "{:?}",
             out.notes
         );
-        assert_eq!(clash.selected().as_deref(), Some("resi-2"));
+        assert_eq!(clash.selected(POOL).as_deref(), Some("resi-2"));
         let r = rstate::read(&c.runtime).await;
         assert_eq!(
             r.selected_upstream_id,
@@ -1111,7 +1154,7 @@ mod tests {
             Some("resi-3"),
             "priority 5 < 10 < 20"
         );
-        assert_eq!(clash.calls().last().unwrap(), "put:resi-3");
+        assert_eq!(clash.calls().last().unwrap(), "put:resi-pool:resi-3");
         let r = rstate::read(&c.runtime).await;
         assert_eq!(
             r.selected_upstream_id,
@@ -1371,7 +1414,7 @@ mod tests {
             .unwrap();
         assert_eq!(out.switched_to, None);
         assert_eq!(
-            clash.selected().as_deref(),
+            clash.selected(POOL).as_deref(),
             Some("resi-2"),
             "两条都健康时 priority 5 也抢不走手动锁定的 resi-2"
         );
@@ -1433,7 +1476,7 @@ mod tests {
         select_auto(&c).await;
         assert_eq!(rstate::read(&c.runtime).await.manual_selected_id, None);
         assert_eq!(
-            clash.selected().as_deref(),
+            clash.selected(POOL).as_deref(),
             Some("resi-2"),
             "解锁只清锁定位，不动 relay 当前选择（下一轮自己按选路规则挑）"
         );
@@ -1851,7 +1894,7 @@ mod tests {
             Some("resi-2"),
             "连续 3 轮更优 ⇒ 切"
         );
-        assert_eq!(clash.calls().last().unwrap(), "put:resi-2");
+        assert_eq!(clash.calls().last().unwrap(), "put:resi-pool:resi-2");
         let r = rstate::read(&c.runtime).await;
         assert_eq!(r.selected_upstream_id, Some(Uuid::from_u128(2)));
         assert_eq!(r.improve_rounds, 0, "切完归零，下一次要重新攒");
@@ -1896,7 +1939,7 @@ mod tests {
             let out = check_once(&c, p.clone(), clash.clone()).await.unwrap();
             assert_eq!(out.switched_to, None, "手动锁定压过延迟/速度");
         }
-        assert_eq!(clash.selected().as_deref(), Some("resi-1"));
+        assert_eq!(clash.selected(POOL).as_deref(), Some("resi-1"));
         assert_eq!(rstate::read(&c.runtime).await.improve_rounds, 0);
     }
 
@@ -1955,7 +1998,7 @@ mod tests {
         let p = by_host_with_google(&[], &[], &["isp1.example.net", "isp2.example.net"]);
         let out = check_once(&c, p, clash.clone()).await.unwrap();
         assert_eq!(out.switched_to, None);
-        assert_eq!(clash.selected().as_deref(), Some("resi-1"));
+        assert_eq!(clash.selected(POOL).as_deref(), Some("resi-1"));
         assert!(
             out.notes.iter().any(|n| n.contains("没有别的 Google 可用")),
             "{:?}",
@@ -1981,7 +2024,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(out.switched_to, None, "锁定的出口不因 Google 被封而挪走");
-        assert_eq!(clash.selected().as_deref(), Some("resi-1"));
+        assert_eq!(clash.selected(POOL).as_deref(), Some("resi-1"));
     }
 
     #[test]
@@ -2079,14 +2122,14 @@ mod tests {
         let task = tokio::spawn(replay_loop(c.clone(), clash.clone(), rx));
         c.bus.send(Event::RelayRestarted);
         for _ in 0..50 {
-            if clash.selected().as_deref() == Some("resi-2") {
+            if clash.selected(POOL).as_deref() == Some("resi-2") {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         task.abort();
         assert_eq!(
-            clash.selected().as_deref(),
+            clash.selected(POOL).as_deref(),
             Some("resi-2"),
             "spec §5.3：relay 重启后重放选择"
         );
@@ -2137,7 +2180,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(tag, "resi-2");
-        assert_eq!(clash.selected().as_deref(), Some("resi-2"));
+        assert_eq!(clash.selected(POOL).as_deref(), Some("resi-2"));
         assert_eq!(
             rstate::read(&c.runtime).await.selected_upstream_id,
             Some(Uuid::from_u128(2))
@@ -2148,5 +2191,86 @@ mod tests {
             Some(Uuid::from_u128(1))
         );
         assert!(select_manual(&c, clash, Uuid::from_u128(99)).await.is_err());
+    }
+
+    /// 用本文件 `mod tests` 里**已有**的 `upstream(i, priority)` 直接拼一个组
+    /// （`health.rs` 没有 `group_of_n` 这种夹具，只有 `upstream` 与 `ctx(&dir, &prios)`；
+    /// 本测试是纯函数测试，不需要 `ctx` 那套 Store/Runtime）。
+    #[test]
+    fn rank_healthy_is_pick_target_extended_to_the_whole_list() {
+        // resi-3 的 priority 最好（10）但 Google 被封；resi-1 / resi-2 同 priority，
+        // resi-2 的 HTTP 往返更低
+        let g = ResidentialGroup {
+            enabled: true,
+            upstreams: vec![upstream(1, 100), upstream(2, 100), upstream(3, 10)],
+            ..Default::default()
+        };
+        let ids = ids_of(&g);
+        let h = |google: Option<bool>, ms: u64| rstate::HealthState {
+            google_ok: google,
+            http_ms: vec![ms],
+            ..Default::default()
+        };
+        let mut r = ResiRuntime::default();
+        let now = OffsetDateTime::UNIX_EPOCH;
+        r.health.insert(ids[0].to_string(), h(Some(true), 300));
+        r.health.insert(ids[1].to_string(), h(Some(true), 100));
+        r.health.insert(ids[2].to_string(), h(Some(false), 10));
+        let ranked = rank_healthy(&g, &r, &ids, now);
+        assert_eq!(
+            ranked,
+            vec![ids[1], ids[0], ids[2]],
+            "Google 通排在 priority 之前，同 priority 再比延迟"
+        );
+        assert_eq!(
+            pick_target(&g, &r, &ids, now),
+            ranked.first().copied(),
+            "pick_target 必须与 rank_healthy 的首位一致（同一套排序键）"
+        );
+        assert!(rank_healthy(&g, &r, &[], now).is_empty());
+    }
+
+    /// spec §5.6：relay 一重启，每槽的 selector 都回落到配置里的 `default`（本槽 IP）。
+    /// 所以必须把各槽的运行时选择清零 —— 下一轮 `drive_slots` 就会无条件重 PUT，
+    /// 而不是去赌 sing-box 的 `cache_file` 有没有把 selector 的选择持久化下来。
+    #[tokio::test]
+    async fn a_relay_restart_clears_every_slot_selection() {
+        let d = tempfile::tempdir().unwrap();
+        let (c, _h) = ctx(&d, &[10, 20]).await;
+        rstate::update(&c.runtime, |r| {
+            r.slots.insert(
+                "1".into(),
+                rstate::SlotRuntime {
+                    current_upstream_id: Some(Uuid::from_u128(2)),
+                    pinned_upstream_id: None,
+                    back_rounds: 2,
+                },
+            );
+        })
+        .await;
+        let clash = Arc::new(FakeClash::new(Some("resi-1")));
+        // 先 subscribe 再 spawn（broadcast 丢弃「发送时还没有订阅者」的事件）
+        let rx = c.bus.subscribe();
+        let task = tokio::spawn(replay_loop(c.clone(), clash.clone(), rx));
+        c.bus.send(Event::RelayRestarted);
+        for _ in 0..50 {
+            if rstate::read(&c.runtime).await.slots["1"]
+                .current_upstream_id
+                .is_none()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        task.abort();
+        let r = rstate::read(&c.runtime).await;
+        assert!(
+            r.slots["1"].current_upstream_id.is_none(),
+            "relay 重启后各槽的运行时选择必须清零"
+        );
+        assert_eq!(
+            r.slots["1"].back_rounds, 2,
+            "切回轮数不清：它记的是「本槽自己健康了几轮」，与 relay 重启无关"
+        );
     }
 }

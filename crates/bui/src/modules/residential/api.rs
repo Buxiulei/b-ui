@@ -160,6 +160,8 @@ pub struct StatusResponse {
     pub switch_improve_needed: u32,
     pub switch_improve_candidate: Option<String>,
     pub last_speedtest_at: Option<String>,
+    /// 槽位表（spec §5.6）。与 [`HealthResponse::slots`] 同一个投影函数（[`slot_rows`]）
+    pub slots: Vec<SlotRow>,
 }
 
 /// v3 的 `urls[]` 行（`web/app.js:665-699 renderResidentialUrls` 逐字段读）
@@ -249,6 +251,8 @@ pub struct HealthResponse {
     pub switch_improve_candidate: Option<String>,
     /// 上一次全量测速的时间（面板据此知道速度数字有多新）
     pub last_speedtest_at: Option<String>,
+    /// 槽位表（spec §5.6）。与 [`StatusResponse::slots`] 同一个投影函数（[`slot_rows`]）
+    pub slots: Vec<SlotRow>,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -318,6 +322,57 @@ pub struct Metrics {
     pub udp_at: Option<String>,
 }
 
+/// `state` + `runtime` → 槽位表。**唯一**一份投影：`status` / `health` /
+/// `GET /slots` / CLI 都调它，三处显示的数字永远一致。
+pub fn slot_rows(s: &SchemaState, r: &state::ResiRuntime) -> Vec<SlotRow> {
+    let g = state::group_of(s);
+    let h = |id: Uuid| r.health.get(&id.to_string()).cloned().unwrap_or_default();
+    bui_schema::slots::sorted(&s.residential)
+        .into_iter()
+        .filter_map(|sl| {
+            let own = g.upstreams.iter().find(|u| u.id == sl.upstream_id)?;
+            let res = bui_schema::slots::resources_of(&s.node.ports, &s.residential, sl.index);
+            let sr = r
+                .slots
+                .get(&sl.index.to_string())
+                .cloned()
+                .unwrap_or_default();
+            let active = sr.current_upstream_id;
+            let borrowed = active.is_some_and(|a| a != sl.upstream_id);
+            let mut users: Vec<String> = bui_schema::slots::users_of_slot(s, sl.upstream_id)
+                .into_iter()
+                .map(|u| u.username.clone())
+                .collect();
+            users.sort();
+            Some(SlotRow {
+                index: sl.index,
+                selector: crate::modules::residential::slot_selector(sl.index),
+                upstream_id: sl.upstream_id,
+                upstream_tag: clash::tag_of(&g, sl.upstream_id).unwrap_or_default(),
+                host: own.host.clone(),
+                port: own.port,
+                ip: own.verified.as_ref().map(|v| v.ip.clone()),
+                active_upstream_id: active,
+                active_tag: active.and_then(|a| clash::tag_of(&g, a)),
+                borrowed,
+                borrowed_from: active
+                    .filter(|_| borrowed)
+                    .and_then(|a| g.upstreams.iter().find(|u| u.id == a))
+                    .map(|u| format!("{}:{}", u.host, u.port)),
+                pinned: sr.pinned_upstream_id.is_some(),
+                back_rounds: sr.back_rounds,
+                back_rounds_needed: crate::modules::residential::SLOT_BACK_ROUNDS,
+                relay_port: res.relay_port,
+                hy2_port: res.hy2_port,
+                hop: res.hop,
+                user_count: users.len(),
+                users,
+                metrics: metrics_of(&h(sl.upstream_id)),
+            })
+        })
+        .collect()
+}
+
 /// `runtime.health[<id>]` → [`Metrics`]。**唯一**一份投影
 pub fn metrics_of(h: &state::HealthState) -> Metrics {
     Metrics {
@@ -335,6 +390,52 @@ pub fn metrics_of(h: &state::HealthState) -> Metrics {
         udp_note: h.udp_note.clone(),
         udp_at: h.udp_at.clone(),
     }
+}
+
+/// 一个槽位在面板上的一行（spec §5.6「按槽列出 IP、当前实际出口、用户数与用户名、指标」）。
+#[derive(Debug, Serialize, PartialEq)]
+pub struct SlotRow {
+    pub index: u16,
+    /// relay 里这一槽的 selector tag
+    pub selector: String,
+    /// 本槽自己的 IP（上游 uuid 与它的成员 tag）
+    pub upstream_id: Uuid,
+    pub upstream_tag: String,
+    pub host: String,
+    pub port: u16,
+    /// 本槽 IP 的出口地址（`verified.ip`，未体检过为 `None`）
+    pub ip: Option<String>,
+    /// **当前实际出口**：本槽的 IP，或借用来的那条
+    pub active_upstream_id: Option<Uuid>,
+    pub active_tag: Option<String>,
+    pub borrowed: bool,
+    /// 借用来源（`borrowed` 为真时是那条上游的 `host:port`）
+    pub borrowed_from: Option<String>,
+    pub pinned: bool,
+    /// 借用中「本槽已连续恢复几轮」与门槛
+    pub back_rounds: u32,
+    pub back_rounds_needed: u32,
+    /// 这一槽的端口资源（面板据此告诉运维该放行什么、订阅里是哪个端口）
+    pub relay_port: u16,
+    pub hy2_port: u16,
+    pub hop: (u16, u16),
+    /// 落在这一槽上的用户（用户名，按名字升序）与数量
+    pub users: Vec<String>,
+    pub user_count: usize,
+    /// 与 [`MemberRow::metrics`] 同源同函数（[`metrics_of`]）
+    #[serde(flatten)]
+    pub metrics: Metrics,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PinSlotRequest {
+    pub index: u16,
+    /// `<uuid>` / `resi-N` / `url-N` / `<host:port>`，由 `upstream::resolve_upstream` 解析
+    #[serde(default)]
+    pub id: Option<String>,
+    /// 解除 pin
+    #[serde(default)]
+    pub auto: bool,
 }
 
 /// v3 `members[].egress`：`type` 是中文串（`web/app.js:1095` 用 `/IDC|机房/i` 判色）
@@ -477,6 +578,9 @@ pub fn routes_with(
             post(post_pin).delete(delete_pin),
         )
         .route("/api/residential/blacklist/apply", post(post_apply))
+        // ── 槽位（spec §5.6）──
+        .route("/api/residential/slots", get(get_slots))
+        .route("/api/residential/slots/pin", post(post_pin_slot))
         // ── v3 路径别名（契约决策 §A；前端零改动，P5 删兼容层时一并删掉本段）──
         .route(
             "/api/residential",
@@ -690,6 +794,7 @@ pub fn status_of(s: &SchemaState, r: &state::ResiRuntime) -> StatusResponse {
         switch_improve_needed: crate::modules::residential::SWITCH_IMPROVE_ROUNDS,
         switch_improve_candidate: r.improve_candidate_id.and_then(|id| clash::tag_of(&g, id)),
         last_speedtest_at: r.last_speedtest_at.clone(),
+        slots: slot_rows(s, r),
     }
 }
 
@@ -823,6 +928,40 @@ async fn get_status(State(app): State<AppState>) -> ApiResult {
     // 面板一刷新就干净，不必等下一轮巡检
     let r = state::purge_stale_alerts(&app.runtime, &state::group_of(&s)).await;
     Ok(Json(status_of(&s, &r)).into_response())
+}
+
+/// `GET /api/residential/slots`（spec §5.6）：按槽列出 IP、当前实际出口、用户与指标。
+async fn get_slots(State(app): State<AppState>) -> ApiResult {
+    // 纯读 state + runtime，不需要 Deps ⇒ 不写那个提取器（照 `get_status` 的写法）
+    let s = app.store.read().await;
+    let r = state::read(&app.runtime).await;
+    Ok(Json(serde_json::json!({ "slots": slot_rows(&s, &r) })).into_response())
+}
+
+/// `POST /api/residential/slots/pin`：把一槽的出口钉在指定上游上（`auto=true` 解除）。
+async fn post_pin_slot(
+    State(app): State<AppState>,
+    Extension(d): Extension<Deps>,
+    Json(req): Json<PinSlotRequest>,
+) -> ApiResult {
+    let ctx = ctx_of(&app, &d.paths);
+    let target = match (&req.id, req.auto) {
+        (Some(raw), _) => {
+            let g = state::group_of(&*app.store.read().await);
+            Some(upstream::resolve_upstream(&g, raw).map_err(map_upstream_err)?)
+        }
+        (None, true) => None,
+        (None, false) => {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "要么给 id（钉住），要么给 auto=true（解除）",
+            ))
+        }
+    };
+    crate::modules::residential::slots::pin_slot(&ctx, d.clash.clone(), req.index, target)
+        .await
+        .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    Ok(Json(serde_json::json!({ "success": true })).into_response())
 }
 
 async fn post_add(
@@ -964,8 +1103,12 @@ async fn post_restore_default(
 
 async fn get_health(State(app): State<AppState>) -> ApiResult {
     // **只读**：不碰 Prober / Clash，不推进迟滞，不切换（裁决 D6/D10）
-    let g = state::group_of(&*app.store.read().await);
+    let s = app.store.read().await;
+    let g = state::group_of(&s);
     let r = state::purge_stale_alerts(&app.runtime, &g).await;
+    // 槽位表与 `status` 同一个投影函数：两处显示的数字永远一致（spec §5.6）
+    let slots = slot_rows(&s, &r);
+    drop(s);
     let split = SplitRules::from_group(&g);
     let now = app.host.now();
     // active tag 现算：runtime 存 uuid（§C）
@@ -996,6 +1139,7 @@ async fn get_health(State(app): State<AppState>) -> ApiResult {
         switch_improve_needed: crate::modules::residential::SWITCH_IMPROVE_ROUNDS,
         switch_improve_candidate: r.improve_candidate_id.and_then(|id| clash::tag_of(&g, id)),
         last_speedtest_at: r.last_speedtest_at.clone(),
+        slots,
     };
     if !g.pool_active() {
         return Ok(Json(resp).into_response());
@@ -1283,6 +1427,7 @@ mod tests {
     use crate::modules::residential::clash::FakeClash;
     use crate::modules::residential::proxy::{FakeProber, HttpProbe};
     use crate::modules::residential::state as rstate;
+    use crate::modules::residential::POOL;
     use crate::state::runtime::Runtime;
     use crate::state::store::Store;
     use crate::sys::fake::FakeHost;
@@ -1990,7 +2135,7 @@ mod tests {
             (st, v["tag"].clone()),
             (StatusCode::OK, serde_json::json!("resi-2"))
         );
-        assert_eq!(h.clash.selected().as_deref(), Some("resi-2"));
+        assert_eq!(h.clash.selected(POOL).as_deref(), Some("resi-2"));
         let (st, _) = call(
             &h.app,
             "POST",
@@ -2265,5 +2410,140 @@ mod tests {
             rule_parts(&Rule::DomainSuffix("a.com".into())),
             ("domain_suffix".to_string(), "a.com".to_string())
         );
+    }
+
+    // ── T5：槽位表与 pin 端点（spec §5.6）──────────────────────────────────
+
+    /// 把 `harness` 的池扩到 `n` 条上游（`sample_group()` 自带 1 条），并同步槽位与分配。
+    /// **不改 `harness` 本身**：它是十几条既有测试的夹具，加参数会牵动全部调用点。
+    async fn grow_pool(h: &Harness, n: u16) {
+        let proto = rstate::group_of(&*h.ctx.store.read().await).upstreams[0].clone();
+        crate::modules::residential::slots::update_group_slots_as(
+            &h.ctx.store,
+            &h.ctx.bus,
+            crate::state::store::CALLER_UNLABELED,
+            move |g| {
+                while (g.upstreams.len() as u16) < n {
+                    let i = g.upstreams.len() as u16;
+                    g.upstreams.push(Upstream {
+                        id: Uuid::from_u128(0xa000 + u128::from(i)),
+                        name: format!("url-{}", i + 1),
+                        host: format!("isp{}.example.net", i + 1),
+                        ..proto.clone()
+                    });
+                }
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_slots_lists_ip_egress_users_and_metrics() {
+        let d = tempfile::tempdir().unwrap();
+        let h = harness(&d).await;
+        grow_pool(&h, 3).await;
+        // 把 alice 挪到槽 1（`sample_state` 只有她一个用户，默认落在槽 0）
+        let uid = h.ctx.store.read().await.users[0].user_id;
+        let slot1 = bui_schema::slots::sorted(&h.ctx.store.read().await.residential)[1].upstream_id;
+        assert!(
+            crate::modules::residential::slots::assign_user(&h.ctx, uid, slot1)
+                .await
+                .unwrap()
+        );
+
+        let (code, v) = call(&h.app, "GET", "/api/residential/slots", None).await;
+        assert_eq!(code, StatusCode::OK);
+        let rows = v["slots"].as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["index"], 0);
+        assert_eq!(rows[0]["selector"], "slot-0-pool");
+        assert_eq!(rows[0]["upstream_tag"], "resi-1");
+        assert_eq!(rows[1]["relay_port"], 2081);
+        assert_eq!(rows[1]["hy2_port"], 40001);
+        assert_eq!(rows[1]["hop"], serde_json::json!([44000, 46999]));
+        assert_eq!(rows[1]["user_count"], 1);
+        assert_eq!(
+            rows[1]["users"],
+            serde_json::json!(["alice"]),
+            "按槽列出用户名（spec §5.6「用户数与用户名」）"
+        );
+        assert_eq!(rows[0]["user_count"], 0);
+        // 指标与 health 的 members 同源（都经 metrics_of）
+        assert!(rows[0].as_object().unwrap().contains_key("latency_p50_ms"));
+        assert!(rows[0].as_object().unwrap().contains_key("down_mbps"));
+        // 绝不回凭据（`sample_group()` 的上游密码是 "p"，用整串字段名判，别用单字母子串）
+        let text = serde_json::to_string(&v).unwrap();
+        assert!(!text.contains("password"), "响应里不许出现密码字段：{text}");
+    }
+
+    #[tokio::test]
+    async fn status_and_health_both_carry_the_same_slot_rows() {
+        let d = tempfile::tempdir().unwrap();
+        let h = harness(&d).await;
+        grow_pool(&h, 2).await;
+        let (_, a) = call(&h.app, "GET", "/api/residential/status", None).await;
+        let (_, b) = call(&h.app, "GET", "/api/residential/health", None).await;
+        assert_eq!(a["slots"], b["slots"], "同一个投影函数，两处必须一致");
+        assert_eq!(a["slots"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn post_slots_pin_sets_and_clears_the_pin() {
+        let d = tempfile::tempdir().unwrap();
+        let h = harness(&d).await;
+        grow_pool(&h, 2).await;
+        let target =
+            bui_schema::slots::sorted(&h.ctx.store.read().await.residential)[1].upstream_id;
+        let (code, _) = call(
+            &h.app,
+            "POST",
+            "/api/residential/slots/pin",
+            Some(serde_json::json!({"index": 0, "id": target.to_string()})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(h.clash.selected("slot-0-pool").as_deref(), Some("resi-2"));
+        let (_, v) = call(&h.app, "GET", "/api/residential/slots", None).await;
+        assert_eq!(v["slots"][0]["pinned"], true);
+        assert_eq!(v["slots"][0]["active_tag"], "resi-2");
+        assert_eq!(v["slots"][0]["borrowed"], true);
+        assert_eq!(v["slots"][0]["borrowed_from"], "isp2.example.net:10007");
+
+        let (code, _) = call(
+            &h.app,
+            "POST",
+            "/api/residential/slots/pin",
+            Some(serde_json::json!({"index": 0, "auto": true})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        let (_, v) = call(&h.app, "GET", "/api/residential/slots", None).await;
+        assert_eq!(v["slots"][0]["pinned"], false);
+    }
+
+    #[tokio::test]
+    async fn post_slots_pin_rejects_a_bad_index_or_target() {
+        let d = tempfile::tempdir().unwrap();
+        let h = harness(&d).await;
+        grow_pool(&h, 2).await;
+        for (body, want) in [
+            // 槽序号不存在 ⇒ `pin_slot` 自己报错 ⇒ 400
+            (
+                serde_json::json!({"index": 9, "auto": true}),
+                StatusCode::BAD_REQUEST,
+            ),
+            // 上游定位串解析不出来 ⇒ 沿用 `map_upstream_err` 的 **404**（与 `/assign`、
+            // `/select` 等既有端点同一口径，Fable 2026-09-13 裁决）
+            (
+                serde_json::json!({"index": 0, "id": "isp9.example.net:1"}),
+                StatusCode::NOT_FOUND,
+            ),
+            // 既不给 id 又不给 auto ⇒ 请求本身没意义 ⇒ 400
+            (serde_json::json!({"index": 0}), StatusCode::BAD_REQUEST),
+        ] {
+            let (code, v) = call(&h.app, "POST", "/api/residential/slots/pin", Some(body)).await;
+            assert_eq!(code, want, "{v}");
+        }
     }
 }
