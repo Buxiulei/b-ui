@@ -163,6 +163,8 @@ async fn create_user(State(app): State<AppState>, body: Bytes) -> Response {
     if dup {
         return fail(StatusCode::BAD_REQUEST, "用户名已存在");
     }
+    // 新用户要有自己那条 `resi-u-<user_id>` 槽规则（D7），置脏交给对账末尾收敛
+    crate::modules::residential::slots::mark_xray_rules_dirty(&app.runtime).await;
     app.bus.send(Event::StateChanged("users"));
     let sni = app.store.read().await.node.reality.sni().to_string();
     ok_json(json!({
@@ -250,6 +252,8 @@ async fn delete_user(State(app): State<AppState>, Path(username): Path<String>) 
     if !removed {
         return fail(StatusCode::NOT_FOUND, "User not found");
     }
+    // 他那条 `resi-u-<user_id>` 槽规则要删掉（D7），置脏交给对账末尾收敛
+    crate::modules::residential::slots::mark_xray_rules_dirty(&app.runtime).await;
     app.bus.send(Event::StateChanged("users"));
     ok_json(json!({"success": true}))
 }
