@@ -66,7 +66,13 @@ pub fn format_status(h: &HealthResponse) -> String {
         }
     }
     if let Some(v) = &h.upgrade_available {
-        out.push(format!("新版本      {v} 可用（运行 b-ui upgrade）"));
+        // 版本号与正在跑的一样 ⇒ rc 通道的同版本重建（rc1 / rc2 / 正式版共用一个版本号），
+        // 报「已是最新」会让人白等（真机 bwg-rick 就这么卡住过）
+        if *v == h.version {
+            out.push("新构建      有同版本的新构建（rc 通道），可执行 bui upgrade".to_string());
+        } else {
+            out.push(format!("新版本      {v} 可用（运行 b-ui upgrade）"));
+        }
     }
     out.join("\n")
 }
@@ -225,6 +231,21 @@ mod tests {
         assert!(
             t.contains("4.0.1"),
             "有新版本要提示（spec §7 的每日自检结果）：{t}"
+        );
+    }
+
+    /// rc 通道（2026-09-12 bwg-rick）：rc1 / rc2 / 正式版的版本号都是同一个，所以每日自检报上来
+    /// 的「可升级版本」== 正在跑的版本时，说的是**同版本的新构建**，不是新版本号。
+    #[test]
+    fn a_same_version_rebuild_is_reported_as_a_new_build() {
+        let mut h = sample();
+        h.upgrade_available = Some(h.version.clone());
+        let t = format_status(&h);
+        assert!(t.contains("同版本的新构建"), "{t}");
+        assert!(t.contains("bui upgrade"), "要说清下一步怎么做：{t}");
+        assert!(
+            !t.contains("4.0.0 可用"),
+            "别报成「新版本 4.0.0 可用」：{t}"
         );
     }
 

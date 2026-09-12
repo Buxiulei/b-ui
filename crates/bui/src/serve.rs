@@ -307,15 +307,38 @@ pub async fn selfcheck_loop(
                     }
                     Err(e) => tracing::warn!(error = %e, "manifest 序列化失败"),
                 }
-                let newer = (m.version != env!("CARGO_PKG_VERSION")).then(|| m.version.clone());
+                // 「有没有新的 bui」不能只比版本号：rc 通道下 rc1 / rc2 / 正式版的 Cargo 版本号
+                // 都是同一个，同版本重建要靠 sha256 才认得出（`kernels::bui_build_differs`）。
+                // 读盘是阻塞调用，照本文件的铁律放进 spawn_blocking。
+                let (h, bin, mm) = (ctx.host.clone(), ctx.paths.bin_dir.clone(), m.clone());
+                let differs = tokio::task::spawn_blocking(move || {
+                    let arch = h.arch().unwrap_or_default();
+                    crate::kernels::bui_build_differs(
+                        h.as_ref(),
+                        &bin,
+                        &mm,
+                        env!("CARGO_PKG_VERSION"),
+                        &arch,
+                    )
+                })
+                .await
+                .unwrap_or(false);
+                let rebuild = differs && m.version == env!("CARGO_PKG_VERSION");
+                let newer = differs.then(|| m.version.clone());
                 if let Ok(mut guard) = manifest.write() {
                     *guard = Some(m);
                 }
                 ctx.runtime
                     .update(|r| r.upgrade_available = newer.clone())
                     .await;
-                if let Some(v) = &newer {
-                    tracing::info!(version = %v, "每日自检：有新版 bui，可运行 `b-ui upgrade`");
+                match (&newer, rebuild) {
+                    (Some(_), true) => tracing::info!(
+                        "每日自检：有同版本的新构建（rc 通道），可运行 `b-ui upgrade`"
+                    ),
+                    (Some(v), false) => {
+                        tracing::info!(version = %v, "每日自检：有新版 bui，可运行 `b-ui upgrade`")
+                    }
+                    (None, _) => {}
                 }
                 // 内核版本随 manifest 走：请求一次对账（不 force）
                 ctx.bus.send(Event::ReconcileRequested { force: false });
@@ -1070,6 +1093,54 @@ mod tests {
         assert_eq!(
             events.recv().await.unwrap(),
             Event::ReconcileRequested { force: false }
+        );
+        task.abort();
+    }
+
+    /// rc 通道（2026-09-12 bwg-rick）：rc1 / rc2 / 正式版的 Cargo 版本号都是同一个，所以每日
+    /// 自检只比版本号就会一直报「已是最新」。同版本但 manifest 里 bui 资产的 sha256 与盘上
+    /// `bin/bui` 不同时必须报成「有新构建」；sha 一致才是真的没东西可升。
+    #[tokio::test(start_paused = true)]
+    async fn selfcheck_reports_a_same_version_rebuild_as_upgradable() {
+        let host = Arc::new(FakeHost::new());
+        let d = tempfile::tempdir().unwrap();
+        let ctx = ctx_for(host.clone(), &d).await;
+        let jitter = jitter_secs(ctx.store.read().await.node.id);
+        let bui = ctx.paths.bin_dir.join("bui");
+        host.write_file(&bui, b"BUI-rc1", 0o755).unwrap();
+        // 版本号与本进程一致，只有 bui 资产换成了另一份构建
+        let manifest_json = serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "kernels": {},
+            "artifacts": { "bui-linux-amd64": {
+                "url": "https://x/bui",
+                "sha256": crate::kernels::sha256_hex(b"BUI-rc2"),
+            } }
+        })
+        .to_string();
+        let fetcher: Arc<dyn Fetcher> = Arc::new(FakeFetcher(Mutex::new(vec![(
+            "https://x/manifest.json".into(),
+            manifest_json.into_bytes(),
+        )])));
+        let task = tokio::spawn(selfcheck_loop(
+            ctx.clone(),
+            Arc::new(std::sync::RwLock::new(None)),
+            fetcher,
+            Some("https://x/manifest.json".to_string()),
+        ));
+        tokio::time::sleep(std::time::Duration::from_secs(jitter + 3)).await;
+        assert_eq!(
+            ctx.runtime.read().await.upgrade_available.as_deref(),
+            Some(env!("CARGO_PKG_VERSION")),
+            "同版本的新构建也要报可升级"
+        );
+        // 换上那一份之后（sha 一致）下一轮就该回到「没东西可升」
+        host.write_file(&bui, b"BUI-rc2", 0o755).unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(SELFCHECK_INTERVAL_SECS + 3)).await;
+        assert_eq!(
+            ctx.runtime.read().await.upgrade_available,
+            None,
+            "版本相同且 sha 相同才是已最新"
         );
         task.abort();
     }

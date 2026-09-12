@@ -1,7 +1,8 @@
 //! `bui upgrade` / `bui upgrade --rollback`（spec §7）。
 //!
-//! manifest（总纲 C4）是版本的唯一来源：`m.version` 决定要不要换 `bui` 自己，`m.kernels`
-//! 决定四个内核；资产一律按架构从 `m.artifacts` 查，没有 Rust target 三元组那一层。
+//! manifest（总纲 C4）是版本的唯一来源：`m.version`（版本号相同时再比 bui 资产的 sha256，
+//! 见 [`crate::kernels::bui_build_differs`]）决定要不要换 `bui` 自己，`m.kernels` 决定四个
+//! 内核；资产一律按架构从 `m.artifacts` 查，没有 Rust target 三元组那一层。
 //!
 //! 下载全部经 [`Fetcher`]，而 [`crate::kernels::HttpFetcher`] 用的是 `reqwest::blocking`，
 //! 在 async 上下文里会 panic——所以本文件的每个下载调用点都在 `tokio::task::spawn_blocking` 里。
@@ -55,9 +56,15 @@ pub fn version_lt(a: &str, b: &str) -> bool {
 
 /// 比对 manifest 与现装版本，产出升级计划。
 ///
+/// `bui` 自己的判据不止版本号：版本相同但 manifest 里 `bui-linux-<arch>` 的 sha256 与盘上
+/// `bin/bui` 的不同（rc 通道的同版本重建）也要换，详见
+/// [`crate::kernels::bui_build_differs`]。四个内核维持只按版本比对。
+///
 /// 顺带消费总纲 C4 的可选字段 `min_upgrade_from`：当前版本低于它就直接报错，
 /// 提示先升到那个中间版本（消费方规则在 P1，不在 P5）。
 pub fn plan_upgrade(
+    host: &dyn Host,
+    bin_dir: &Path,
     m: &Manifest,
     current_bui: &str,
     installed: &BTreeMap<String, String>,
@@ -73,7 +80,8 @@ pub fn plan_upgrade(
     }
     // 资产缺失就当场报错，别等下载才发现
     let _ = m.bui_asset(arch)?;
-    let self_to = (m.version != current_bui).then(|| m.version.clone());
+    let self_to = crate::kernels::bui_build_differs(host, bin_dir, m, current_bui, arch)
+        .then(|| m.version.clone());
     let mut kernels = Vec::new();
     for name in crate::kernels::KERNELS {
         // manifest 的 kernels 表用下划线键（sing_box），装在盘上的二进制名用连字符
@@ -156,7 +164,7 @@ pub fn prepare(
     arch: &str,
 ) -> anyhow::Result<(UpgradePlan, Asset)> {
     let installed = crate::kernels::installed_versions(host, &paths.bin_dir);
-    let plan = plan_upgrade(m, current_bui, &installed, arch)?;
+    let plan = plan_upgrade(host, &paths.bin_dir, m, current_bui, &installed, arch)?;
     let asset = m.bui_asset(arch)?.clone();
     if plan.self_to.is_some() || !plan.kernels.is_empty() {
         // 换任何东西之前先留一份回滚快照（manifest 缓存 + 四个内核）：`--rollback` 靠它
@@ -327,6 +335,10 @@ pub async fn run_with(
 pub fn format_plan(p: &UpgradePlan) -> String {
     let mut out = Vec::new();
     match &p.self_to {
+        // 版本号一样但 sha256 不一样：rc 通道的同版本重建（rc1 → rc2 → 正式版都是同一个版本号）
+        Some(to) if *to == p.self_from => {
+            out.push(format!("bui          {to}（同版本的新构建，rc 通道）"))
+        }
         Some(to) => out.push(format!("bui          {} → {to}", p.self_from)),
         None => out.push(format!("bui          {}（已最新）", p.self_from)),
     }
@@ -366,6 +378,17 @@ mod tests {
         }
     }
 
+    /// `plan_upgrade` 直接单测用的 `bin/` 目录（与 `apply_self` 的单测同一口径）。
+    const BIN: &str = "/opt/b-ui/bin";
+
+    /// 盘上装着一份 `bin/bui` 的假机器（内容即构建指纹，sha256 由它算）。
+    fn host_with_bui(body: &[u8]) -> FakeHost {
+        let h = FakeHost::new();
+        h.write_file(&std::path::Path::new(BIN).join("bui"), body, 0o755)
+            .unwrap();
+        h
+    }
+
     /// 总纲 C4 形状；只放 amd64 资产，用来顺带测「缺架构资产直接报错」
     fn manifest(bui: &str, sb: &str, sum: &str) -> Manifest {
         let a = |u: &str| Asset {
@@ -394,7 +417,15 @@ mod tests {
         );
         assert!(m.bui_asset("armv7l").is_err(), "架构本身不支持");
         assert!(
-            plan_upgrade(&m, "4.0.0", &BTreeMap::new(), "aarch64").is_err(),
+            plan_upgrade(
+                &host_with_bui(b"BUI"),
+                Path::new(BIN),
+                &m,
+                "4.0.0",
+                &BTreeMap::new(),
+                "aarch64"
+            )
+            .is_err(),
             "缺资产不许出计划"
         );
     }
@@ -414,22 +445,26 @@ mod tests {
         // 总纲 C4 的可选字段：低于此版本必须先升到它。消费方规则在 P1。
         let mut m = manifest("4.2.0", "1.13.19", "00");
         m.min_upgrade_from = Some("4.1.0".into());
-        let err = plan_upgrade(&m, "4.0.0", &BTreeMap::new(), "x86_64")
-            .unwrap_err()
-            .to_string();
+        let h = host_with_bui(b"BUI");
+        let plan = |m: &Manifest, cur: &str| {
+            plan_upgrade(&h, Path::new(BIN), m, cur, &BTreeMap::new(), "x86_64")
+        };
+        let err = plan(&m, "4.0.0").unwrap_err().to_string();
         assert!(err.contains("4.1.0"), "{err}");
         // 已经到了门槛版本就放行
-        assert!(plan_upgrade(&m, "4.1.0", &BTreeMap::new(), "x86_64").is_ok());
+        assert!(plan(&m, "4.1.0").is_ok());
         // 没有这个字段时一切照旧
         let m2 = manifest("4.2.0", "1.13.19", "00");
-        assert!(plan_upgrade(&m2, "4.0.0", &BTreeMap::new(), "x86_64").is_ok());
+        assert!(plan(&m2, "4.0.0").is_ok());
     }
 
     #[test]
     fn nothing_to_do_when_versions_match() {
-        let m = manifest("4.0.0", "1.13.19", "00");
+        // 「已最新」= 版本相同**且** manifest 里 bui 资产的 sha256 与盘上 bin/bui 一致
+        let m = manifest("4.0.0", "1.13.19", &crate::kernels::sha256_hex(b"BUI"));
         let installed = BTreeMap::from([("sing-box".to_string(), "1.13.19".to_string())]);
-        let p = plan_upgrade(&m, "4.0.0", &installed, "x86_64").unwrap();
+        let h = host_with_bui(b"BUI");
+        let p = plan_upgrade(&h, Path::new(BIN), &m, "4.0.0", &installed, "x86_64").unwrap();
         assert_eq!(
             p,
             UpgradePlan {
@@ -444,7 +479,8 @@ mod tests {
     fn plan_lists_self_and_kernel_upgrades() {
         let m = manifest("4.0.1", "1.14.2", "00");
         let installed = BTreeMap::from([("sing-box".to_string(), "1.13.19".to_string())]);
-        let p = plan_upgrade(&m, "4.0.0", &installed, "x86_64").unwrap();
+        let h = host_with_bui(b"BUI");
+        let p = plan_upgrade(&h, Path::new(BIN), &m, "4.0.0", &installed, "x86_64").unwrap();
         assert_eq!(p.self_to.as_deref(), Some("4.0.1"));
         assert_eq!(
             p.kernels,
@@ -624,13 +660,17 @@ mod tests {
     }
 
     /// 升级演练用的 manifest 缓存（总纲 C4 形状；只放 amd64 资产）。
-    fn manifest_json(bui: &str, kernels: [&str; 4]) -> String {
+    ///
+    /// `bui_body` 是这份 manifest 所指的 bui 二进制内容（资产 sha256 由它算出）：传盘上现有那
+    /// 一份就是「bui 已最新」，传别的就是「同版本的新构建」。
+    fn manifest_json(bui: &str, kernels: [&str; 4], bui_body: &str) -> String {
         let [hy, xray, sb, caddy] = kernels;
+        let bui_sum = crate::kernels::sha256_hex(bui_body.as_bytes());
         format!(
             r#"{{"version":"{bui}",
   "kernels":{{"hysteria":"{hy}","xray":"{xray}","sing_box":"{sb}","caddy":"{caddy}"}},
   "artifacts":{{
-    "bui-linux-amd64":      {{"url":"https://x/bui","sha256":"00"}},
+    "bui-linux-amd64":      {{"url":"https://x/bui","sha256":"{bui_sum}"}},
     "hysteria-linux-amd64": {{"url":"https://x/hy","sha256":"01"}},
     "xray-linux-amd64":     {{"url":"https://x/xray","sha256":"02"}},
     "sing-box-linux-amd64": {{"url":"https://x/sb","sha256":"03"}},
@@ -667,7 +707,7 @@ mod tests {
     /// 升级前的机器：manifest 缓存 + `bin/` 下五个二进制 + 四个内核的 `version` 输出。
     fn pre_upgrade(paths: &Paths) -> (FakeHost, String) {
         let h = FakeHost::new();
-        let manifest = manifest_json("4.0.0", OLD_KERNELS);
+        let manifest = manifest_json("4.0.0", OLD_KERNELS, OLD_BINS[0].1);
         h.write_file(
             &crate::paths::manifest_file(paths),
             manifest.as_bytes(),
@@ -754,7 +794,8 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let paths = scratch(&d);
         let (h, old_manifest) = pre_upgrade(&paths);
-        let m: Manifest = serde_json::from_str(&manifest_json("4.0.0", OLD_KERNELS)).unwrap();
+        let m: Manifest =
+            serde_json::from_str(&manifest_json("4.0.0", OLD_KERNELS, OLD_BINS[0].1)).unwrap();
         let (plan, _) = prepare(&h, &paths, &m, "4.0.0", "x86_64").unwrap();
         assert!(
             plan.self_to.is_none() && plan.kernels.is_empty(),
@@ -770,10 +811,61 @@ mod tests {
 
         // min_upgrade_from 直接 bail 的那次同样不许留下任何东西（尤其不许留新版缓存）
         let mut blocked: Manifest =
-            serde_json::from_str(&manifest_json("4.2.0", NEW_KERNELS)).unwrap();
+            serde_json::from_str(&manifest_json("4.2.0", NEW_KERNELS, "BUI-4.2.0")).unwrap();
         blocked.min_upgrade_from = Some("4.1.0".into());
         assert!(prepare(&h, &paths, &blocked, "4.0.0", "x86_64").is_err());
         assert_eq!(writes(&h), Vec::<String>::new(), "bail 之后一个字都不写");
+    }
+
+    /// 回归（2026-09-12 bwg-rick）：rc 通道下 `v4.0.0-rc1` / `rc2` / 正式版的 Cargo 版本号都是
+    /// 同一个 `4.0.0`，光比版本号 ⇒ 同版本重建永远升不上去。同版本但 manifest 里 bui 资产的
+    /// sha256 与盘上 `bin/bui` 不同时必须照常走完整流程（快照 → 新缓存 → 换二进制），
+    /// 而四个内核仍旧只按版本比对。
+    #[test]
+    fn a_same_version_rebuild_still_upgrades_bui_but_leaves_the_kernels_alone() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = scratch(&d);
+        let (h, old_manifest) = pre_upgrade(&paths);
+        // 版本还是 4.0.0、内核版本一个没动，只有 bui 资产换成了另一份构建
+        let m: Manifest =
+            serde_json::from_str(&manifest_json("4.0.0", OLD_KERNELS, "BUI-4.0.0-rc2")).unwrap();
+        let (plan, asset) = prepare(&h, &paths, &m, "4.0.0", "x86_64").unwrap();
+        assert_eq!(plan.self_to.as_deref(), Some("4.0.0"), "同版本新构建也要升");
+        assert_eq!(plan.kernels, vec![], "内核维持按版本比对：版本没变就不动");
+        assert!(
+            format_plan(&plan).contains("同版本"),
+            "计划文本要说清这是同版本重建：{}",
+            format_plan(&plan)
+        );
+        assert_eq!(
+            text(&h, &crate::paths::manifest_prev_file(&paths)).as_deref(),
+            Some(old_manifest.as_str()),
+            "同版本重建一样要先留回滚快照"
+        );
+
+        // 换上来的就是 manifest 里那一份（sha 校验 + .prev 保留照旧）
+        let f = F(Mutex::new(vec![(
+            "https://x/bui".to_string(),
+            b"BUI-4.0.0-rc2".to_vec(),
+        )]));
+        apply_self(&h, &f, &asset, &paths.bin_dir).unwrap();
+        assert_eq!(
+            text(&h, &paths.bin_dir.join("bui")).as_deref(),
+            Some("BUI-4.0.0-rc2")
+        );
+        assert_eq!(
+            text(&h, &paths.bin_dir.join("bui.prev")).as_deref(),
+            Some("BUI-4.0.0")
+        );
+
+        // 换完再跑一次：同版本同 sha ⇒ 零计划（菜单里的「检查升级」不许把 .prev 冲掉）
+        h.clear_ops();
+        let (plan, _) = prepare(&h, &paths, &m, "4.0.0", "x86_64").unwrap();
+        assert!(
+            plan.self_to.is_none() && plan.kernels.is_empty(),
+            "{plan:?}"
+        );
+        assert_eq!(writes(&h), Vec::<String>::new(), "无需升级就一个字都不写");
     }
 
     #[test]
@@ -781,7 +873,8 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let paths = scratch(&d);
         let (h, old_manifest) = pre_upgrade(&paths);
-        let m: Manifest = serde_json::from_str(&manifest_json("4.0.1", NEW_KERNELS)).unwrap();
+        let m: Manifest =
+            serde_json::from_str(&manifest_json("4.0.1", NEW_KERNELS, "BUI-4.0.1")).unwrap();
         let (plan, _) = prepare(&h, &paths, &m, "4.0.0", "x86_64").unwrap();
         assert_eq!(plan.self_to.as_deref(), Some("4.0.1"));
 
@@ -822,7 +915,7 @@ mod tests {
         snapshot_prev(&h, &paths).unwrap();
         h.write_file(
             &crate::paths::manifest_file(&paths),
-            manifest_json("4.0.1", NEW_KERNELS).as_bytes(),
+            manifest_json("4.0.1", NEW_KERNELS, "BUI-4.0.1").as_bytes(),
             0o644,
         )
         .unwrap();
@@ -939,7 +1032,7 @@ mod tests {
             .unwrap();
         h.write_file(
             &crate::paths::manifest_file(&paths),
-            manifest_json("4.0.1", NEW_KERNELS).as_bytes(),
+            manifest_json("4.0.1", NEW_KERNELS, "BUI-4.0.1").as_bytes(),
             0o644,
         )
         .unwrap();
