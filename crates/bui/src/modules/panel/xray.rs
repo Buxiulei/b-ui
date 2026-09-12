@@ -20,6 +20,7 @@ pub mod pb {
 
 use super::{TxRx, XrayApi};
 use bui_schema::paths::Paths;
+use bui_schema::render::xray::SlotRule;
 use prost::Message;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -32,6 +33,11 @@ use pb::xray::app::proxyman::command::{
     handler_service_client::HandlerServiceClient, AddUserOperation, AlterInboundRequest,
     RemoveUserOperation,
 };
+use pb::xray::app::router::command::{
+    routing_service_client::RoutingServiceClient, AddRuleRequest, ListRuleItem, ListRuleRequest,
+    RemoveRuleRequest,
+};
+use pb::xray::app::router::{routing_rule::TargetTag, Config as RouterConfig, RoutingRule};
 use pb::xray::app::stats::command::{
     stats_service_client::StatsServiceClient, QueryStatsRequest, Stat,
 };
@@ -43,6 +49,8 @@ use pb::xray::proxy::vless::Account;
 pub const TYPE_ADD_USER: &str = "xray.app.proxyman.command.AddUserOperation";
 pub const TYPE_REMOVE_USER: &str = "xray.app.proxyman.command.RemoveUserOperation";
 pub const TYPE_VLESS_ACCOUNT: &str = "xray.proxy.vless.Account";
+/// `AddRule` 载荷内层消息的全名（同样是 proto 消息全名，服务端按它反射解码）
+pub const TYPE_ROUTER_CONFIG: &str = "xray.app.router.Config";
 /// `QueryStats` 的 pattern：纯子串匹配（X6），`user>>>` 命中所有用户计数器
 pub const STATS_PATTERN: &str = "user>>>";
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -89,6 +97,45 @@ pub fn remove_user_request(tag: &str, user_id: Uuid) -> AlterInboundRequest {
         tag: tag.to_string(),
         operation: Some(typed(TYPE_REMOVE_USER, &op)),
     }
+}
+
+/// 组装 `AddRule` 请求：外层 `TypedMessage` 包 `xray.app.router.Config`，里面正好一条规则。
+/// 纯函数，可单测。
+pub fn add_rule_request(rule: &SlotRule) -> AddRuleRequest {
+    let r = RoutingRule {
+        rule_tag: rule.rule_tag.clone(),
+        inbound_tag: vec![rule.inbound_tag.clone()],
+        user_email: rule.emails.clone(),
+        target_tag: Some(TargetTag::Tag(rule.outbound_tag.clone())),
+        ..Default::default()
+    };
+    AddRuleRequest {
+        config: Some(typed(
+            TYPE_ROUTER_CONFIG,
+            &RouterConfig {
+                rule: vec![r],
+                ..Default::default()
+            },
+        )),
+        // 永远 true：`false` 的语义是「清空 rules + balancers 再全量装载」（D7）
+        should_append: true,
+    }
+}
+
+pub fn remove_rule_request(rule_tag: &str) -> RemoveRuleRequest {
+    RemoveRuleRequest {
+        rule_tag: rule_tag.to_string(),
+    }
+}
+
+/// `ListRuleResponse.rules` → `(ruleTag, outboundTag)`；没有 `ruleTag` 的规则
+/// （渲染里的 api / 直连两条）我们既不认也不删，直接丢掉。表序原样保留。
+pub fn rule_pairs(items: &[ListRuleItem]) -> Vec<(String, String)> {
+    items
+        .iter()
+        .filter(|i| !i.rule_tag.is_empty())
+        .map(|i| (i.rule_tag.clone(), i.tag.clone()))
+        .collect()
 }
 
 /// `user>>><email>>>>traffic>>>uplink|downlink` → (email, 方向)；不认的名字返回 None
@@ -221,16 +268,253 @@ impl XrayApi for XrayClient {
             .await?;
         Ok(deltas_from_stats(&resp.into_inner().stat))
     }
+
+    async fn add_rule(&self, rule: &SlotRule) -> anyhow::Result<()> {
+        let mut c = RoutingServiceClient::new(self.channel()?);
+        c.add_rule(add_rule_request(rule)).await?;
+        Ok(())
+    }
+
+    async fn remove_rule(&self, rule_tag: &str) -> anyhow::Result<()> {
+        let mut c = RoutingServiceClient::new(self.channel()?);
+        c.remove_rule(remove_rule_request(rule_tag)).await?;
+        Ok(())
+    }
+
+    async fn list_rules(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let mut c = RoutingServiceClient::new(self.channel()?);
+        let resp = c.list_rule(ListRuleRequest {}).await?;
+        Ok(rule_pairs(&resp.into_inner().rules))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sys::fake::FakeHost;
+    use bui_schema::render::xray::SlotRule;
     use pretty_assertions::assert_eq;
 
     fn uid() -> Uuid {
         Uuid::parse_str("8d5a1a1e-3b2c-4d1e-9f00-0000000000aa").unwrap()
+    }
+
+    fn user_rule() -> SlotRule {
+        SlotRule {
+            rule_tag: "resi-u-8d5a1a1e-3b2c-4d1e-9f00-0000000000aa".into(),
+            inbound_tag: "vless-residential".into(),
+            emails: vec!["8d5a1a1e-3b2c-4d1e-9f00-0000000000aa".into()],
+            outbound_tag: "relay-slot-1".into(),
+        }
+    }
+
+    fn fallback_rule() -> SlotRule {
+        SlotRule {
+            rule_tag: "resi-fallback".into(),
+            inbound_tag: "vless-residential".into(),
+            emails: vec![],
+            outbound_tag: "relay-slot-0".into(),
+        }
+    }
+
+    #[test]
+    fn add_rule_request_wraps_a_router_config_with_exactly_one_rule() {
+        let req = add_rule_request(&user_rule());
+        assert!(
+            req.should_append,
+            "只许追加：shouldAppend=false 会清空整张路由表（D7）"
+        );
+        let tm = req.config.expect("config 必须存在");
+        assert_eq!(tm.r#type, TYPE_ROUTER_CONFIG);
+        let cfg = pb::xray::app::router::Config::decode(tm.value.as_slice()).unwrap();
+        assert!(cfg.balancing_rule.is_empty(), "不带 balancer");
+        assert_eq!(cfg.rule.len(), 1, "一条请求只带一条规则");
+        let r = &cfg.rule[0];
+        assert_eq!(r.rule_tag, user_rule().rule_tag);
+        assert_eq!(r.inbound_tag, vec!["vless-residential".to_string()]);
+        assert_eq!(r.user_email, vec![user_rule().emails[0].clone()]);
+        assert_eq!(
+            r.target_tag,
+            Some(pb::xray::app::router::routing_rule::TargetTag::Tag(
+                "relay-slot-1".into()
+            )),
+            "出站走 oneof 的 tag 分支，不是 balancing_tag"
+        );
+    }
+
+    #[test]
+    fn a_fallback_rule_carries_no_user_email() {
+        let req = add_rule_request(&fallback_rule());
+        let cfg =
+            pb::xray::app::router::Config::decode(req.config.unwrap().value.as_slice()).unwrap();
+        assert!(
+            cfg.rule[0].user_email.is_empty(),
+            "兜底规则不按 user 过滤：它要兜住「一条规则都没有的 email」"
+        );
+        assert_eq!(cfg.rule[0].rule_tag, "resi-fallback");
+    }
+
+    #[test]
+    fn remove_rule_request_carries_only_the_rule_tag() {
+        assert_eq!(remove_rule_request("resi-u-x").rule_tag, "resi-u-x");
+    }
+
+    #[test]
+    fn rule_pairs_drops_the_untagged_rules() {
+        use pb::xray::app::router::command::ListRuleItem;
+        let items = vec![
+            ListRuleItem {
+                tag: "api".into(),
+                rule_tag: String::new(),
+            },
+            ListRuleItem {
+                tag: "relay-slot-1".into(),
+                rule_tag: "resi-u-a".into(),
+            },
+            ListRuleItem {
+                tag: "relay-slot-0".into(),
+                rule_tag: "resi-fallback".into(),
+            },
+        ];
+        assert_eq!(
+            rule_pairs(&items),
+            vec![
+                ("resi-u-a".to_string(), "relay-slot-1".to_string()),
+                ("resi-fallback".to_string(), "relay-slot-0".to_string())
+            ],
+            "没有 ruleTag 的规则（渲染里的 api / 直连两条）既不认也不删，顺序保持表序"
+        );
+    }
+
+    /// 真实 xray 的 gRPC 往返。这是「两层 `TypedMessage` 的 type 名写对了没」的唯一硬证据 ——
+    /// 编码错了服务端反射解码会直接报错，本地 fake 永远发现不了；D7 里那三条内核事实
+    /// （重名报错 / 删不存在算成功 / 追加即表尾）也由它守住。
+    ///
+    /// **对 Global Constraints「测试不碰真实系统」的一次有意例外**（P3 计划批准）：
+    /// 只在 `xray` 存在时跑，配置写在 `tempfile` 目录里，api inbound 绑 `127.0.0.1` 的
+    /// 临时端口，子进程在 `Drop` 里 kill —— 与 `clash.rs` / `proxy.rs` / `hy2.rs` 里
+    /// 既有的「起一个回环监听再打自己」是同一档次的动作，不碰 systemd、不碰 /opt。
+    #[tokio::test]
+    async fn routing_rules_round_trip_against_a_real_xray() {
+        use bui_schema::render::xray::FALLBACK_RULE_TAG;
+        if !have_xray() {
+            eprintln!("skipped: xray not found");
+            return;
+        }
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("xray.json");
+        let cfg = serde_json::json!({
+            "log": {"loglevel": "warning"},
+            // 少了 RoutingService 就是 gRPC Unimplemented（D11）
+            "api": {"tag": "api", "services": ["HandlerService", "RoutingService"]},
+            "inbounds": [{"tag": "api", "port": port, "listen": "127.0.0.1",
+                          "protocol": "dokodemo-door", "settings": {"address": "127.0.0.1"}}],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"},
+                          {"tag": "relay-slot-0", "protocol": "freedom"},
+                          {"tag": "relay-slot-1", "protocol": "freedom"}],
+            "routing": {"rules": [
+                {"type": "field", "inboundTag": ["api"], "outboundTag": "api"},
+                {"type": "field", "ruleTag": "resi-fallback",
+                 "inboundTag": ["vless-residential"], "outboundTag": "relay-slot-0"}
+            ]}
+        });
+        std::fs::write(&cfg_path, serde_json::to_vec_pretty(&cfg).unwrap()).unwrap();
+        let _xrayd = Xrayd::spawn(&cfg_path);
+        let c = XrayClient::with_addr(format!("127.0.0.1:{port}"));
+        // 起得来才继续（最多等 5 秒）
+        let mut ready = false;
+        for _ in 0..50 {
+            if c.list_rules().await.is_ok() {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(ready, "xray 没在 5 秒内接受 gRPC");
+
+        let fb = ("resi-fallback".to_string(), "relay-slot-0".to_string());
+        assert_eq!(
+            c.list_rules().await.unwrap(),
+            vec![fb.clone()],
+            "启动时的表来自配置文件；api 那条没有 ruleTag，不出现在这里"
+        );
+
+        let u = SlotRule {
+            rule_tag: "resi-u-a".into(),
+            inbound_tag: "vless-residential".into(),
+            emails: vec!["a".into()],
+            outbound_tag: "relay-slot-1".into(),
+        };
+        c.add_rule(&u).await.unwrap();
+        // 事实：AddRule 只能追加到**表尾**（所以每轮加完要把兜底删了再追加，D7）
+        assert_eq!(
+            c.list_rules().await.unwrap(),
+            vec![
+                fb.clone(),
+                ("resi-u-a".to_string(), "relay-slot-1".to_string())
+            ]
+        );
+        // 事实：ruleTag 重名 ⇒ 整条请求报错（所以 converge 必须先删再加）
+        let dup = c.add_rule(&u).await;
+        assert!(dup.is_err(), "重名 ruleTag 必须报错，实际：{dup:?}");
+        // 事实：删不存在的 tag 算成功（所以删是幂等的）
+        c.remove_rule("resi-u-nobody").await.unwrap();
+        // 把兜底挪回表尾
+        c.remove_rule(FALLBACK_RULE_TAG).await.unwrap();
+        c.add_rule(&SlotRule {
+            rule_tag: FALLBACK_RULE_TAG.into(),
+            inbound_tag: "vless-residential".into(),
+            emails: vec![],
+            outbound_tag: "relay-slot-0".into(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            c.list_rules().await.unwrap(),
+            vec![("resi-u-a".to_string(), "relay-slot-1".to_string()), fb],
+            "删+追加之后兜底回到表尾"
+        );
+        // 删掉用户那条，表回到初始形状
+        c.remove_rule("resi-u-a").await.unwrap();
+        assert_eq!(c.list_rules().await.unwrap().len(), 1);
+    }
+
+    fn have_xray() -> bool {
+        std::process::Command::new("xray")
+            .arg("version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// 跑在回环上的 xray 子进程；`Drop` 里 kill + wait，测试 panic 也不留孤儿进程。
+    struct Xrayd(std::process::Child);
+
+    impl Xrayd {
+        fn spawn(cfg: &std::path::Path) -> Self {
+            Self(
+                std::process::Command::new("xray")
+                    .args(["run", "-c"])
+                    .arg(cfg)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .expect("起 xray 子进程"),
+            )
+        }
+    }
+
+    impl Drop for Xrayd {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
 
     fn vid() -> Uuid {
@@ -415,6 +699,9 @@ mod tests {
             );
             n += 1;
         }
-        assert_eq!(n, 10, "调研 X8：闭包正好 10 个 .proto");
+        assert_eq!(
+            n, 13,
+            "10 个用户/统计面的 proto + RoutingService 闭包的 3 个（T0）"
+        );
     }
 }

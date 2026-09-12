@@ -106,6 +106,13 @@ pub trait XrayApi: Send + Sync {
     async fn remove_user(&self, tag: &str, user_id: Uuid) -> anyhow::Result<()>;
     /// `QueryStats(pattern="user>>>", reset=true)`：email（= `user_id` 的字符串）→ 本轮增量
     async fn query_user_deltas(&self) -> anyhow::Result<BTreeMap<String, TxRx>>;
+    /// 追加一条住宅槽路由规则（`RoutingService.AddRule`，`shouldAppend=true` ⇒ 落在表尾）。
+    /// `rule_tag` 与表内已有的重名会让**整条请求失败**，调用方必须先 `remove_rule`（D7）。
+    async fn add_rule(&self, rule: &bui_schema::render::xray::SlotRule) -> anyhow::Result<()>;
+    /// 按 `ruleTag` 删规则（`RoutingService.RemoveRule`）。tag 不存在也返回 `Ok`（内核语义，幂等）。
+    async fn remove_rule(&self, rule_tag: &str) -> anyhow::Result<()>;
+    /// 读回进程里**正在跑**的规则表：`(ruleTag, outboundTag)`，按表序；没有 `ruleTag` 的规则不列。
+    async fn list_rules(&self) -> anyhow::Result<Vec<(String, String)>>;
 }
 
 #[async_trait::async_trait]
