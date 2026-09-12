@@ -126,6 +126,36 @@ pub fn parse_proc_net(text: &str, listening_only: bool) -> BTreeSet<u16> {
     out
 }
 
+/// 公网 IP 探测源，按顺序试。**必须多源**：2026-09-12 bwg-rick 的 v3→v4 首切时
+/// `api.ipify.org` 返回了空串（事后手动 curl 同一地址正常），单源探测直接让
+/// `state.node.public_ip` 留空。
+pub const IP_PROBE_URLS: [&str; 3] = [
+    "https://api.ipify.org",
+    "https://api.ip.sb/ip",
+    "https://ifconfig.me/ip",
+];
+
+/// 依次探测 [`IP_PROBE_URLS`]，返回第一个**能解析成 IPv4** 的回答（空串、HTML 错误页、
+/// IPv6 都不算）；全都不行返回空串。
+///
+/// **阻塞**（`curl --max-time 5`）：只能在 `tokio::task::spawn_blocking` 里或纯同步的
+/// CLI 路径里调用。
+pub fn probe_public_ip(host: &dyn Host) -> String {
+    for url in IP_PROBE_URLS {
+        let Ok(out) = host.run("curl", &["-sS", "--max-time", "5", url]) else {
+            continue;
+        };
+        if !out.ok() {
+            continue;
+        }
+        let text = out.stdout.trim();
+        if text.parse::<std::net::Ipv4Addr>().is_ok() {
+            return text.to_string();
+        }
+    }
+    String::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,5 +191,68 @@ mod tests {
             parse_proc_net("nonsense\n\n   sl  local_address\n", false),
             BTreeSet::new()
         );
+    }
+
+    /// 2026-09-12 真机：ipify 返回空串（curl 退出码 0）→ 必须继续试下一个源。
+    #[test]
+    fn public_ip_probe_falls_through_to_the_third_source() {
+        let h = fake::FakeHost::new();
+        h.with(|i| {
+            // ① 连不上 ② 200 但回了个空串（真机形态）③ 才是真答案
+            i.scripted.push((
+                format!("curl -sS --max-time 5 {}", IP_PROBE_URLS[0]),
+                CmdOut::failure(7, "couldn't connect"),
+            ));
+            i.scripted.push((
+                format!("curl -sS --max-time 5 {}", IP_PROBE_URLS[1]),
+                CmdOut::success("\n"),
+            ));
+            i.scripted.push((
+                format!("curl -sS --max-time 5 {}", IP_PROBE_URLS[2]),
+                CmdOut::success("203.0.113.10\n"),
+            ));
+        });
+        assert_eq!(probe_public_ip(&h), "203.0.113.10");
+        assert_eq!(
+            h.ops(),
+            IP_PROBE_URLS
+                .iter()
+                .map(|u| format!("run:curl -sS --max-time 5 {u}"))
+                .collect::<Vec<_>>(),
+            "三个源按顺序试"
+        );
+    }
+
+    #[test]
+    fn public_ip_probe_rejects_non_ipv4_answers_and_stops_at_the_first_good_one() {
+        let h = fake::FakeHost::new();
+        h.with(|i| {
+            // 运营商的劫持页 / IPv6 都不算 IPv4
+            i.scripted.push((
+                format!("curl -sS --max-time 5 {}", IP_PROBE_URLS[0]),
+                CmdOut::success("<html>error</html>"),
+            ));
+            i.scripted.push((
+                format!("curl -sS --max-time 5 {}", IP_PROBE_URLS[1]),
+                CmdOut::success("2001:db8::1"),
+            ));
+            i.scripted.push((
+                format!("curl -sS --max-time 5 {}", IP_PROBE_URLS[2]),
+                CmdOut::success("198.51.100.7"),
+            ));
+        });
+        assert_eq!(probe_public_ip(&h), "198.51.100.7");
+        // 第一个源就成功时不再探后面两个
+        let h2 = fake::FakeHost::new();
+        h2.with(|i| {
+            i.scripted
+                .push(("curl".into(), CmdOut::success("203.0.113.10")))
+        });
+        assert_eq!(probe_public_ip(&h2), "203.0.113.10");
+        assert_eq!(h2.ops().len(), 1, "{:?}", h2.ops());
+        // 三个源全失败 → 空串（调用方据此提示「稍后在面板里补填」）
+        let h3 = fake::FakeHost::new();
+        h3.with(|i| i.scripted.push(("curl".into(), CmdOut::failure(7, "x"))));
+        assert_eq!(probe_public_ip(&h3), "");
     }
 }
