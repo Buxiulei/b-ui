@@ -486,8 +486,17 @@ pub async fn run_and_store(
     state::update(&ctx.runtime, |r| {
         r.checks.insert(id.to_string(), json);
         r.checking = None;
+        // 告警以 uuid 为键、文案用 host:port：`url-N` 是位置名，删掉一条上游后会被新
+        // 条目复用，新上游就顶着上一个账号的 407 告警（2026-09-12 bwg-rick 的真机事故）
         if report.auth_failed {
-            state::push_alert(r, format!("上游 {} 凭据失效（407），请更新凭据", up.name));
+            state::set_upstream_alert(
+                r,
+                id,
+                format!("上游 {}:{} 凭据失效（407），请更新凭据", up.host, up.port),
+            );
+        } else {
+            // 体检通过一次就消警：换完凭据不该还要人手动点
+            state::clear_upstream_alert(r, id);
         }
     })
     .await;
@@ -1021,12 +1030,25 @@ mod tests {
         assert!(r.auth_failed);
         assert_eq!(stored_ports(&ctx).await, Some(vec![80, 443]));
         let rt = state::read(&ctx.runtime).await;
-        assert!(
-            rt.alerts.iter().any(|a| a.contains("凭据失效")),
-            "{:?}",
-            rt.alerts
-        );
+        // 告警以 uuid 为键、文案用 host:port（url-N 是位置名，删条目后会被新条目复用）
+        let msg = rt
+            .upstream_alerts
+            .get(&up().id)
+            .cloned()
+            .unwrap_or_else(|| panic!("{:?}", rt.upstream_alerts));
+        assert!(msg.contains("凭据失效"), "{msg}");
+        assert!(msg.contains("isp.example.net:10007"), "{msg}");
+        assert!(!msg.contains("url-"), "{msg}");
         assert!(rt.checking.is_none());
         assert!(rt.checks.contains_key(&up().id.to_string()));
+
+        // 换过凭据后体检通过一次 ⇒ 该上游的 407 告警自动消掉
+        run_and_store(&ctx, std::sync::Arc::new(FakeProber::new()), up().id)
+            .await
+            .unwrap();
+        assert!(
+            state::read(&ctx.runtime).await.upstream_alerts.is_empty(),
+            "体检成功一次即清"
+        );
     }
 }

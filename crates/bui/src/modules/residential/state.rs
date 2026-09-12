@@ -42,8 +42,15 @@ pub struct ResiRuntime {
     pub checks: BTreeMap<String, serde_json::Value>,
     /// 正在跑的体检（面板据此显示「检测中…」，对应 R13 §4 的 `checking`）
     pub checking: Option<Checking>,
-    /// 最近告警（全不健康、凭据失效、journalctl 缺失…），上限 [`ALERTS_MAX`]，新的在前
+    /// 最近的**全局**告警（全员不达标、切换失败、journalctl 缺失…），上限
+    /// [`ALERTS_MAX`]，新的在前。上游级告警不进这里，见 [`ResiRuntime::upstream_alerts`]
     pub alerts: Vec<String>,
+    /// 上游级告警（407 凭据失效…），**以 uuid 为键**（契约决策 §C）。绝不能按 `url-N`
+    /// 存：位置名会被 `renumber` 复用，删掉一条后新加的上游会顶着上一个账号的告警
+    /// （2026-09-12 bwg-rick 的真机事故）。文案里也只写 `host:port`，不写 `url-N`。
+    /// 同一 uuid 只留最新一条；条目被删（[`super::upstream::remove`]）或探测/体检
+    /// 成功一次即清。输出侧一律经 [`visible_alerts`]，池里没有的 uuid 不显示。
+    pub upstream_alerts: BTreeMap<Uuid, String>,
     pub last_daily_at: Option<String>,
 }
 
@@ -168,6 +175,28 @@ pub fn push_alert(r: &mut ResiRuntime, msg: impl Into<String>) {
     r.alerts.truncate(ALERTS_MAX);
 }
 
+/// 记一条上游级告警（同一 uuid 只留最新一条）。`msg` 里请写 `host:port`，别写 `url-N`
+pub fn set_upstream_alert(r: &mut ResiRuntime, id: Uuid, msg: impl Into<String>) {
+    r.upstream_alerts.insert(id, msg.into());
+}
+
+/// 清掉该上游的告警：巡检/体检成功一次，或条目被删
+pub fn clear_upstream_alert(r: &mut ResiRuntime, id: Uuid) {
+    r.upstream_alerts.remove(&id);
+}
+
+/// 面板与 CLI 看到的告警：全局告警（新的在前）+ **仍在池里**的上游的告警（按池内顺序）。
+/// 池里已经没有的 uuid 一律不显示 —— 删掉的上游不该继续刷屏。
+pub fn visible_alerts(g: &ResidentialGroup, r: &ResiRuntime) -> Vec<String> {
+    let mut out = r.alerts.clone();
+    out.extend(
+        g.upstreams
+            .iter()
+            .filter_map(|u| r.upstream_alerts.get(&u.id).cloned()),
+    );
+    out
+}
+
 /// 读当前住宅分组（不存在时给 `Default`，等价于「池未启用」→ relay fail-open 直连）
 pub fn group_of(s: &State) -> ResidentialGroup {
     s.residential
@@ -266,7 +295,7 @@ pub fn health_summary(g: &ResidentialGroup, r: &ResiRuntime) -> serde_json::Valu
                        "pending": r.pending.len(), "candidates": r.candidates.len() },
         "checking": r.checking,
         "last_daily_at": r.last_daily_at,
-        "alerts": r.alerts,
+        "alerts": visible_alerts(g, r),
     })
 }
 
@@ -395,6 +424,46 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap(), Event::StateChanged("residential"));
     }
 
+    #[tokio::test]
+    async fn upstream_alerts_are_keyed_by_uuid_and_only_shown_for_members_still_in_the_pool() {
+        let d = tempfile::tempdir().unwrap();
+        let runtime = Runtime::load(d.path().join("runtime.json"));
+        let s = crate::modules::residential::sample_state_with_pool();
+        let g = group_of(&s);
+        let live = g.upstreams[0].id;
+        let gone = Uuid::from_u128(0xdead);
+        let r = update(&runtime, |r| {
+            push_alert(r, "机器上没有 journalctl，黑名单候选只能靠每日探针集");
+            set_upstream_alert(r, live, "上游 isp.example.net:10007 凭据失效（407）");
+            set_upstream_alert(r, gone, "上游 old.example.net:10007 凭据失效（407）");
+            // 同一 uuid 只留最新一条
+            set_upstream_alert(
+                r,
+                live,
+                "上游 isp.example.net:10007 凭据失效（407），请更新凭据",
+            );
+        })
+        .await;
+        assert_eq!(r.upstream_alerts.len(), 2);
+        let visible = visible_alerts(&g, &r);
+        assert_eq!(
+            visible,
+            vec![
+                "机器上没有 journalctl，黑名单候选只能靠每日探针集".to_string(),
+                "上游 isp.example.net:10007 凭据失效（407），请更新凭据".to_string(),
+            ],
+            "只显示池内现存 uuid 的告警，且文案用 host:port 而不是 url-N"
+        );
+        assert!(
+            !visible.iter().any(|a| a.contains("url-")),
+            "位置名会被新条目复用，告警文案里不许出现：{visible:?}"
+        );
+        // 恢复一次就清掉这条上游的告警
+        let r = update(&runtime, |r| clear_upstream_alert(r, live)).await;
+        assert!(!r.upstream_alerts.contains_key(&live));
+        assert_eq!(visible_alerts(&g, &r).len(), 1, "全局告警不受影响");
+    }
+
     #[test]
     fn health_summary_is_json_the_panel_can_read() {
         // 用本模块自己的夹具：P1 的 sample_state() 住宅段是空池（upstreams/pins 都是 0）
@@ -404,6 +473,13 @@ mod tests {
         let r = ResiRuntime {
             selected_upstream_id: Some(id),
             alerts: vec!["x".into()],
+            // 已被删掉的上游留下的告警：不该再出现在任何输出里
+            upstream_alerts: [(
+                Uuid::from_u128(0xdead),
+                "上游 old.example.net:1 凭据失效".into(),
+            )]
+            .into_iter()
+            .collect(),
             ..Default::default()
         };
         let v = health_summary(&g, &r);
@@ -413,6 +489,10 @@ mod tests {
         assert_eq!(v["unhealthy"], 0, "没探过的成员默认健康");
         assert_eq!(v["blacklist"]["pins"], 1);
         assert_eq!(v["blacklist"]["auto"], 1);
-        assert_eq!(v["alerts"][0], "x");
+        assert_eq!(
+            v["alerts"],
+            serde_json::json!(["x"]),
+            "/api/health 也只透出池内现存 uuid 的告警"
+        );
     }
 }

@@ -152,7 +152,9 @@ pub async fn check_round(
     let pp = p.clone();
     let results = super::fanout(ups.clone(), move |up| probe_member(pp.as_ref(), &up)).await;
 
-    let mut auth_alerts = Vec::new();
+    // 凭据失效的告警以 **uuid** 为键（契约决策 §C），文案用 `host:port`：按 `url-N` 存的
+    // 话，删掉一条上游后位置名会被新条目复用，新上游就顶着上一个账号的 407 告警
+    let mut auth_alerts: Vec<(Uuid, String)> = Vec::new();
     let mut probed: Vec<(Uuid, bool)> = Vec::new();
     for (i, up) in ups.iter().enumerate() {
         let probe = results.get(i).copied().flatten();
@@ -164,9 +166,12 @@ pub async fn check_round(
         // 凭据失效要单独告警：不是网络抖动，管理员必须换凭据（探测结果里直接带出来，
         // 不再为了补判而在 async 上下文里同步调一次 Prober）
         if probe.map(|x| x.auth_failed).unwrap_or(false) {
-            auth_alerts.push(format!(
-                "上游 {} 凭据失效（407 / SOCKS5 认证被拒），请更新凭据",
-                up.name
+            auth_alerts.push((
+                up.id,
+                format!(
+                    "上游 {}:{} 凭据失效（407 / SOCKS5 认证被拒），请更新凭据",
+                    up.host, up.port
+                ),
             ));
         }
         out.probed.push((tags[i].clone(), ok));
@@ -174,13 +179,21 @@ pub async fn check_round(
     }
 
     // 规则 3：迟滞 + 24h 样本。**一轮只写一次 runtime**：每次 update 都是
-    // tmp + fsync + rename，按成员各写一次等于一轮 N 次落盘。
+    // tmp + fsync + rename，按成员各写一次等于一轮 N 次落盘。凭据失效告警的写入与
+    // 「成功即清」也并进这一次写（下面各分支不再重复落它）。
     let samples = probed.clone();
     let rt = state::update(&ctx.runtime, move |r| {
         for (id, ok) in samples {
             let h = r.health.entry(id.to_string()).or_default();
             state::record_probe(h, ok, now);
             let _ = state::apply_hysteresis(h, ok);
+            // 探通一次就把这条上游的 407 告警清掉：换完凭据不该还要人手动消警
+            if ok {
+                state::clear_upstream_alert(r, id);
+            }
+        }
+        for (id, msg) in auth_alerts {
+            state::set_upstream_alert(r, id, msg);
         }
     })
     .await;
@@ -208,7 +221,6 @@ pub async fn check_round(
             before.len(),
             after.len()
         ));
-        persist_alerts(ctx, &auth_alerts).await;
         return Ok(out);
     }
 
@@ -218,7 +230,6 @@ pub async fn check_round(
     let Some(sel_tag) = sel_tag else {
         out.notes
             .push("relay 的 Clash API 读不到当前选择（未运行或旧配置），本轮不切换".into());
-        persist_alerts(ctx, &auth_alerts).await;
         return Ok(out);
     };
     // Clash 的 now 只说明「relay 此刻在用哪条」，**不是**「该用哪条」的真源（§C）
@@ -234,7 +245,7 @@ pub async fn check_round(
     let want = rt.selected_upstream_id.filter(|id| ids.contains(id));
     if let Some(want) = want {
         if healthy.contains(&want) {
-            let mut alerts = auth_alerts.clone();
+            let mut alerts: Vec<String> = Vec::new();
             if Some(want) != sel_id {
                 // tag 现算（位置键，不做主键）；want 来自当前池，tag_of 必有值
                 let tag = clash::tag_of(&g, want).expect("want 取自当前池");
@@ -270,13 +281,9 @@ pub async fn check_round(
         // 此时才拿 Clash 的 now 初始化 runtime，并粘在它上面
         if healthy.contains(&sel_id) {
             let pending = Some(sel_id) != g.selected_upstream_id;
-            let mut alerts = auth_alerts.clone();
             state::update(&ctx.runtime, move |r| {
                 r.selected_upstream_id = Some(sel_id);
                 r.selected_pending_persist = pending;
-                for a in alerts.drain(..) {
-                    state::push_alert(r, a);
-                }
             })
             .await;
             return Ok(out);
@@ -288,22 +295,22 @@ pub async fn check_round(
         out.notes.push(format!(
             "全部上游探测不达标，保持当前出口 {sel_tag}（降级总比乱切好）"
         ));
-        let mut alerts = auth_alerts.clone();
-        alerts.push("全部住宅上游探测不达标，出口已降级但未切换".into());
-        persist_alerts(ctx, &alerts).await;
+        persist_alerts(
+            ctx,
+            &["全部住宅上游探测不达标，出口已降级但未切换".to_string()],
+        )
+        .await;
         return Ok(out);
     }
 
     // 规则 8：选目标（uuid 进、uuid 出；tag 只在调 Clash API 时现算）
     let Some(target_id) = pick_target(&g, &rt, &healthy, now) else {
-        persist_alerts(ctx, &auth_alerts).await;
         return Ok(out);
     };
     let Some(target_tag) = clash::tag_of(&g, target_id) else {
         // healthy 全部来自当前池，走不到这里；真走到了说明池刚变过，按规则 4 处理
         out.notes
             .push("切换目标已不在池里（成员集刚变过），本轮不切换".into());
-        persist_alerts(ctx, &auth_alerts).await;
         return Ok(out);
     };
 
@@ -321,7 +328,6 @@ pub async fn check_round(
             "当前 {sel_tag} 不健康，需切到 {target_tag}，但切换限速中（剩余 {}s）",
             SWITCH_MIN_INTERVAL_SECS - since
         ));
-        persist_alerts(ctx, &auth_alerts).await;
         return Ok(out);
     }
 
@@ -330,14 +336,10 @@ pub async fn check_round(
     match tokio::task::spawn_blocking(move || cc.select(&t2)).await? {
         Ok(()) => {
             let pending = Some(target_id) != g.selected_upstream_id;
-            let mut alerts = auth_alerts.clone();
             state::update(&ctx.runtime, move |r| {
                 r.selected_upstream_id = Some(target_id);
                 r.last_switch_at = Some(fmt_rfc3339(now));
                 r.selected_pending_persist = pending;
-                for a in alerts.drain(..) {
-                    state::push_alert(r, a);
-                }
             })
             .await;
             tracing::info!(from = %sel_tag, to = %target_tag, "住宅出口切换");
@@ -345,9 +347,7 @@ pub async fn check_round(
         }
         Err(e) => {
             // 切换失败不改 runtime：下一轮重新评估（别把没生效的选择记成生效）
-            let mut alerts = auth_alerts.clone();
-            alerts.push(format!("切换住宅出口到 {target_tag} 失败：{e}"));
-            persist_alerts(ctx, &alerts).await;
+            persist_alerts(ctx, &[format!("切换住宅出口到 {target_tag} 失败：{e}")]).await;
             out.notes.push(format!("切换到 {target_tag} 失败：{e}"));
         }
     }
@@ -668,10 +668,50 @@ mod tests {
         assert_eq!(out.healthy, vec!["resi-2"]);
         assert_eq!(out.switched_to.as_deref(), Some("resi-2"));
         let r = rstate::read(&c.runtime).await;
+        // 告警以 uuid 为键（url-N 是位置名，删条目后会被新条目复用），文案用 host:port
+        let msg = r
+            .upstream_alerts
+            .get(&Uuid::from_u128(1))
+            .cloned()
+            .unwrap_or_else(|| panic!("要点名凭据失效：{:?}", r.upstream_alerts));
+        assert!(msg.contains("凭据"), "{msg}");
         assert!(
-            r.alerts.iter().any(|a| a.contains("凭据")),
-            "要点名凭据失效：{:?}",
+            msg.contains("isp1.example.net:10007"),
+            "文案要用 host:port：{msg}"
+        );
+        assert!(!msg.contains("url-"), "文案不许用位置名：{msg}");
+        assert!(
+            !r.upstream_alerts.contains_key(&Uuid::from_u128(2)),
+            "健康的那条不该有告警"
+        );
+        assert!(
+            !r.alerts.iter().any(|a| a.contains("凭据")),
+            "上游级告警不进全局列表：{:?}",
             r.alerts
+        );
+    }
+
+    #[tokio::test]
+    async fn one_good_round_clears_that_upstreams_credential_alert() {
+        // 换了凭据之后，巡检成功一次就该把 407 告警消掉，不必等人手动点。
+        let d = tempfile::tempdir().unwrap();
+        let (c, host) = ctx(&d, &[10, 20]).await;
+        let clash = Arc::new(FakeClash::new(Some("resi-1")));
+        let bad = by_host(&[], &["isp1.example.net"]);
+        check_once(&c, bad, clash.clone()).await.unwrap();
+        assert!(rstate::read(&c.runtime)
+            .await
+            .upstream_alerts
+            .contains_key(&Uuid::from_u128(1)));
+        host.advance(120);
+        check_once(&c, by_host(&[], &[]), clash.clone())
+            .await
+            .unwrap();
+        let r = rstate::read(&c.runtime).await;
+        assert!(
+            r.upstream_alerts.is_empty(),
+            "成功一轮即清：{:?}",
+            r.upstream_alerts
         );
     }
 
@@ -711,9 +751,11 @@ mod tests {
         assert!(out.healthy.is_empty());
         let r = rstate::read(&c.runtime).await;
         assert!(
-            r.alerts.iter().any(|a| a.contains("凭据")),
+            r.upstream_alerts
+                .values()
+                .any(|a| a.contains("凭据") && a.contains("isp1.example.net:10007")),
             "没有 CONNECT 补判，这条告警在真机上永远不会出现：{:?}",
-            r.alerts
+            r.upstream_alerts
         );
     }
 

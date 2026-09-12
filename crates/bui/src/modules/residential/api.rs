@@ -32,8 +32,9 @@ pub struct AddRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct RemoveRequest {
+    /// uuid / `resi-N` / `url-N` / `host:port`（见 [`upstream::resolve_upstream`]）
     #[serde(default)]
-    pub id: Option<Uuid>,
+    pub id: Option<String>,
     /// v3 的定位方式 `"host:port"`
     #[serde(default)]
     pub host_port: Option<String>,
@@ -66,15 +67,18 @@ pub struct DomainsRequest {
     pub reset: bool,
 }
 
+/// `id` 缺省 = 体检当前落点。取值见 [`upstream::resolve_upstream`]
 #[derive(Debug, Deserialize)]
 pub struct CheckRequest {
     #[serde(default)]
-    pub id: Option<Uuid>,
+    pub id: Option<String>,
 }
 
+/// `id` 取值见 [`upstream::resolve_upstream`]。**不是 `Uuid`**：面板传 uuid，运维照着
+/// `status` 里的 `resi-2` 敲也得认，否则只能拿到 serde 的「invalid character」
 #[derive(Debug, Deserialize)]
 pub struct SelectRequest {
-    pub id: Uuid,
+    pub id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -413,7 +417,7 @@ fn map_upstream_err(e: upstream::UpstreamError) -> (StatusCode, Json<ErrorBody>)
         | E::NotProxied(_)
         | E::PoolFull
         | E::PoolEmpty => StatusCode::BAD_REQUEST,
-        E::NotFound => StatusCode::NOT_FOUND,
+        E::NotFound | E::Unresolvable(_) => StatusCode::NOT_FOUND,
         E::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     err(code, e.to_string())
@@ -577,7 +581,7 @@ pub fn status_of(s: &SchemaState, r: &state::ResiRuntime) -> StatusResponse {
         },
         upstreams,
         notes: notes(),
-        alerts: r.alerts.clone(),
+        alerts: state::visible_alerts(&g, r),
     }
 }
 
@@ -755,8 +759,12 @@ async fn post_remove(
     Extension(d): Extension<Deps>,
     Json(b): Json<RemoveRequest>,
 ) -> ApiResult {
-    let sel = match (b.id, b.host_port.as_deref()) {
-        (Some(id), _) => upstream::UpstreamSel::Id(id),
+    let g = state::group_of(&*app.store.read().await);
+    let sel = match (b.id.as_deref(), b.host_port.as_deref()) {
+        // `id` 认 uuid / resi-N / url-N / host:port（CLI 的 remove 只送这一个字段）
+        (Some(raw), _) => upstream::UpstreamSel::Id(
+            upstream::resolve_upstream(&g, raw).map_err(map_upstream_err)?,
+        ),
         (None, Some(hp)) => upstream::UpstreamSel::parse_host_port(hp)
             .ok_or_else(|| err(StatusCode::BAD_REQUEST, "host_port 必须是 host:port"))?,
         (None, None) => return Err(err(StatusCode::BAD_REQUEST, "id 或 host_port 字段必填")),
@@ -866,7 +874,7 @@ async fn get_health(State(app): State<AppState>) -> ApiResult {
         current_egress_ip_test: None,
         egress_ip_type: "unknown".into(),
         via_proxy_isp: None,
-        alerts: r.alerts.clone(),
+        alerts: state::visible_alerts(&g, &r),
         last_daily_at: r.last_daily_at.clone(),
         notes: health_notes(),
     };
@@ -974,16 +982,14 @@ async fn post_check(
     Json(b): Json<CheckRequest>,
 ) -> ApiResult {
     let g = state::group_of(&*app.store.read().await);
-    let id = match b.id {
-        Some(id) => id,
+    let id = match b.id.as_deref() {
+        // resolve_upstream 已经保证 id 在池里（定位不到就是 404），不必再查一遍
+        Some(raw) => upstream::resolve_upstream(&g, raw).map_err(map_upstream_err)?,
         None => g
             .selected_upstream_id
             .or_else(|| g.upstreams.first().map(|u| u.id))
             .ok_or_else(|| err(StatusCode::BAD_REQUEST, "代理节点池为空"))?,
     };
-    if !g.upstreams.iter().any(|u| u.id == id) {
-        return Err(err(StatusCode::NOT_FOUND, "未找到匹配的上游"));
-    }
     let r = state::read(&app.runtime).await;
     if let Some(c) = r.checking {
         // 超过 10 分钟视为过期（R13 §4），否则一次卡住的体检会永久挡住按钮
@@ -1016,14 +1022,12 @@ async fn post_select(
     Extension(d): Extension<Deps>,
     Json(b): Json<SelectRequest>,
 ) -> ApiResult {
-    // 404 靠**预检**：select_manual 返回 anyhow::Error（文案「上游不在当前池里」），
-    // 没有类型可匹配。用 tag_of 判「在不在池里」，与 select_manual 内部同一判据。
+    // 定位与 404 都归 resolve_upstream：它认 uuid / resi-N / url-N / host:port，
+    // 并且只返回池内的 id（select_manual 只会返回 anyhow::Error，没有类型可匹配）
     let g = state::group_of(&*app.store.read().await);
-    if clash::tag_of(&g, b.id).is_none() {
-        return Err(err(StatusCode::NOT_FOUND, "未找到匹配的上游"));
-    }
+    let id = upstream::resolve_upstream(&g, &b.id).map_err(map_upstream_err)?;
     let ctx = ctx_of(&app, &d.paths);
-    let tag = health::select_manual(&ctx, d.clash.clone(), b.id)
+    let tag = health::select_manual(&ctx, d.clash.clone(), id)
         .await
         // 走到这里只剩「Clash API 调用失败」一种可能（池内判据已预检过）
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -1707,6 +1711,108 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn select_check_and_remove_take_resi_n_url_n_and_host_port_too() {
+        // 真机上运维照着 status / health 里的 resi-2 敲，端点只认 uuid 的话连 400 的
+        // 文案都是 serde 的「invalid character」。三条端点共用 resolve_upstream。
+        let d = tempfile::tempdir().unwrap();
+        let h = harness(&d).await;
+        rstate::update_group(&h.ctx.store, &h.ctx.bus, |g| {
+            let mut u = g.upstreams[0].clone();
+            u.id = Uuid::from_u128(77);
+            u.host = "isp2.example.net".into();
+            g.upstreams.push(u);
+            crate::modules::residential::upstream::renumber(&mut g.upstreams);
+        })
+        .await
+        .unwrap();
+        for raw in ["resi-2", "url-2", "isp2.example.net:10007"] {
+            let (st, v) = call(
+                &h.app,
+                "POST",
+                "/api/residential/select",
+                Some(serde_json::json!({"id": raw})),
+            )
+            .await;
+            assert_eq!(
+                (st, v["tag"].clone()),
+                (StatusCode::OK, serde_json::json!("resi-2")),
+                "{raw}"
+            );
+            let (st, v) = call(
+                &h.app,
+                "POST",
+                "/api/residential/check",
+                Some(serde_json::json!({"id": raw})),
+            )
+            .await;
+            assert_eq!(st, StatusCode::ACCEPTED, "{raw}");
+            assert_eq!(v["upstream_id"], Uuid::from_u128(77).to_string(), "{raw}");
+        }
+        // 定位不到时 404 + 三种写法的提示
+        let (st, v) = call(
+            &h.app,
+            "POST",
+            "/api/residential/select",
+            Some(serde_json::json!({"id": "resi-9"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        let msg = v["error"].as_str().unwrap();
+        for form in ["uuid", "resi-N", "url-N", "host:port"] {
+            assert!(msg.contains(form), "缺 {form}：{msg}");
+        }
+        // remove 也吃 resi-N（v3 的 host_port 字段照旧）
+        let (st, _) = call(
+            &h.app,
+            "POST",
+            "/api/residential/remove",
+            Some(serde_json::json!({"id": "resi-2"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(
+            rstate::group_of(&*h.ctx.store.read().await).upstreams.len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn status_and_health_only_show_alerts_of_upstreams_still_in_the_pool() {
+        let d = tempfile::tempdir().unwrap();
+        let h = harness(&d).await;
+        let id = rstate::group_of(&*h.ctx.store.read().await).upstreams[0].id;
+        rstate::update(&h.ctx.runtime, |r| {
+            rstate::push_alert(r, "全部住宅上游探测不达标，出口已降级但未切换");
+            rstate::set_upstream_alert(r, id, "上游 isp.example.net:10007 凭据失效（407）");
+            // 已被删掉的上游（新条目会复用它的 url-N 名字）留下的告警
+            rstate::set_upstream_alert(
+                r,
+                Uuid::from_u128(0xdead),
+                "上游 old.example.net:10007 凭据失效（407）",
+            );
+        })
+        .await;
+        for uri in ["/api/residential/status", "/api/residential/health"] {
+            let (st, v) = call(&h.app, "GET", uri, None).await;
+            assert_eq!(st, StatusCode::OK);
+            let alerts = v["alerts"].as_array().unwrap();
+            assert_eq!(alerts.len(), 2, "{uri}: {v}");
+            assert!(
+                alerts
+                    .iter()
+                    .any(|a| a.as_str().unwrap().contains("isp.example.net:10007")),
+                "{uri}: 文案用 host:port"
+            );
+            assert!(
+                !alerts
+                    .iter()
+                    .any(|a| a.as_str().unwrap().contains("old.example.net")),
+                "{uri}: 已移除的上游不该继续刷屏：{v}"
+            );
+        }
     }
 
     #[tokio::test]

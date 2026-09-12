@@ -9,7 +9,6 @@
 
 use crate::commands::menu::{MenuAction, MenuItem};
 use std::path::PathBuf;
-use uuid::Uuid;
 
 /// `bui residential` 的子命令。
 #[derive(Debug, Clone, clap::Subcommand, PartialEq, Eq)]
@@ -21,7 +20,7 @@ pub enum ResidentialCmd {
     },
     /// 加一条上游；`-` 表示从 stdin 读一行（凭据不进 argv，`ps` 看不到）
     Add { url: String },
-    /// 删一条上游（`<id>` 或 `<host:port>`）
+    /// 删一条上游（`<uuid>`、`resi-N` / `url-N` 或 `<host:port>`）
     Remove { target: String },
     /// 总开关：开
     Enable,
@@ -36,13 +35,14 @@ pub enum ResidentialCmd {
     Domains,
     /// 分流关键字回到跟随默认表
     RestoreDefault,
-    /// 体检（不带 `--id` 则体检当前选中的上游）
+    /// 体检（不带 `--id` 则体检当前选中的上游）。`--id` 收 `<uuid>`、`resi-N` / `url-N`
+    /// 或 `<host:port>`
     Check {
         #[arg(long)]
-        id: Option<Uuid>,
+        id: Option<String>,
     },
-    /// 手动切换当前出口
-    Select { id: Uuid },
+    /// 手动切换当前出口（`<uuid>`、`resi-N` / `url-N` 或 `<host:port>`）
+    Select { target: String },
     /// 巡检与出口画像
     Health {
         #[arg(long)]
@@ -95,14 +95,13 @@ pub fn to_request(
             "/api/residential/add".into(),
             Some(serde_json::json!({"url": url})),
         ),
-        C::Remove { target } => {
-            // 先按 uuid 解，不是 uuid 就当 host:port（与面板两种定位方式一致）
-            let body = match Uuid::parse_str(target) {
-                Ok(id) => serde_json::json!({"id": id}),
-                Err(_) => serde_json::json!({"host_port": target}),
-            };
-            ("POST", "/api/residential/remove".into(), Some(body))
-        }
+        // 定位字符串原样送到端点：CLI 不读 state（spec §2.4），uuid / resi-N / url-N /
+        // host:port 四种写法统一由服务端的 `upstream::resolve_upstream` 解析
+        C::Remove { target } => (
+            "POST",
+            "/api/residential/remove".into(),
+            Some(serde_json::json!({"id": target})),
+        ),
         C::Enable => (
             "POST",
             "/api/residential/enable".into(),
@@ -127,10 +126,10 @@ pub fn to_request(
                 None => serde_json::json!({}),
             }),
         ),
-        C::Select { id } => (
+        C::Select { target } => (
             "POST",
             "/api/residential/select".into(),
-            Some(serde_json::json!({"id": id})),
+            Some(serde_json::json!({"id": target})),
         ),
         C::Blacklist { cmd } => return blacklist_request(cmd),
     })
@@ -514,7 +513,7 @@ pub async fn menu(socket: PathBuf) -> anyhow::Result<()> {
                 ResidentialCmd::Add { url }
             }
             "3" => {
-                let target = prompt("要移除的上游（<id> 或 <host:port>）: ")?;
+                let target = prompt("要移除的上游（<uuid>、resi-N 或 <host:port>）: ")?;
                 if target.is_empty() {
                     println!("未输入，已取消");
                     continue;
@@ -523,14 +522,15 @@ pub async fn menu(socket: PathBuf) -> anyhow::Result<()> {
             }
             "4" => ResidentialCmd::Check { id: None },
             "5" => {
-                let raw = prompt("切换到哪个上游（<id>，见「住宅池状态」）: ")?;
-                match Uuid::parse_str(&raw) {
-                    Ok(id) => ResidentialCmd::Select { id },
-                    Err(e) => {
-                        println!("不是合法的上游 id：{e}");
-                        continue;
-                    }
+                // 本地不解析：resi-N / url-N / host:port / uuid 都交给服务端定位，
+                // 定位不到时端点回的那条文案已经把可用写法列全了
+                let target =
+                    prompt("切换到哪个上游（<uuid>、resi-N 或 <host:port>，见「住宅池状态」）: ")?;
+                if target.is_empty() {
+                    println!("未输入，已取消");
+                    continue;
                 }
+                ResidentialCmd::Select { target }
             }
             "6" => {
                 let on_off = prompt("分流模式（on = 全量走住宅 / off = 按关键字）: ")?;
@@ -559,6 +559,7 @@ pub async fn menu(socket: PathBuf) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use uuid::Uuid;
 
     /// 一条子命令期望翻译成的 `(method, path, body)`
     type Want = (&'static str, &'static str, Option<serde_json::Value>);
@@ -588,7 +589,7 @@ mod tests {
                 (
                     "POST",
                     "/api/residential/remove",
-                    Some(serde_json::json!({"host_port": "isp.example.net:10007"})),
+                    Some(serde_json::json!({"id": "isp.example.net:10007"})),
                 ),
             ),
             (
@@ -598,7 +599,18 @@ mod tests {
                 (
                     "POST",
                     "/api/residential/remove",
-                    Some(serde_json::json!({"id": id})),
+                    Some(serde_json::json!({"id": id.to_string()})),
+                ),
+            ),
+            // 池内序号也照原样送上去，由服务端的 resolve_upstream 定位（CLI 不读 state）
+            (
+                ResidentialCmd::Remove {
+                    target: "resi-3".into(),
+                },
+                (
+                    "POST",
+                    "/api/residential/remove",
+                    Some(serde_json::json!({"id": "resi-3"})),
                 ),
             ),
             (
@@ -646,11 +658,23 @@ mod tests {
                 ("POST", "/api/residential/restore-default", None),
             ),
             (
-                ResidentialCmd::Check { id: Some(id) },
+                ResidentialCmd::Check {
+                    id: Some(id.to_string()),
+                },
                 (
                     "POST",
                     "/api/residential/check",
-                    Some(serde_json::json!({"id": id})),
+                    Some(serde_json::json!({"id": id.to_string()})),
+                ),
+            ),
+            (
+                ResidentialCmd::Check {
+                    id: Some("url-2".into()),
+                },
+                (
+                    "POST",
+                    "/api/residential/check",
+                    Some(serde_json::json!({"id": "url-2"})),
                 ),
             ),
             (
@@ -662,11 +686,25 @@ mod tests {
                 ),
             ),
             (
-                ResidentialCmd::Select { id },
+                ResidentialCmd::Select {
+                    target: id.to_string(),
+                },
                 (
                     "POST",
                     "/api/residential/select",
-                    Some(serde_json::json!({"id": id})),
+                    Some(serde_json::json!({"id": id.to_string()})),
+                ),
+            ),
+            // `bui residential select resi-3`：以前在 clap 层就被 uuid 解析挡成
+            // 「invalid character」，现在原样送去服务端定位
+            (
+                ResidentialCmd::Select {
+                    target: "resi-3".into(),
+                },
+                (
+                    "POST",
+                    "/api/residential/select",
+                    Some(serde_json::json!({"id": "resi-3"})),
                 ),
             ),
             (
@@ -865,5 +903,27 @@ mod tests {
         );
         // global 只认 on/off
         assert!(crate::cli::Cli::try_parse_from(["bui", "residential", "global", "yes"]).is_err());
+        // `select resi-3` / `check --id url-3` 必须能过 clap（以前 Uuid 解析直接报
+        // 「invalid character」，运维照着 status 里的名字敲就用不了）
+        assert_eq!(
+            crate::cli::Cli::try_parse_from(["bui", "residential", "select", "resi-3"])
+                .unwrap()
+                .command,
+            Some(crate::cli::Command::Residential {
+                cmd: ResidentialCmd::Select {
+                    target: "resi-3".into()
+                }
+            })
+        );
+        assert_eq!(
+            crate::cli::Cli::try_parse_from(["bui", "residential", "check", "--id", "url-3"])
+                .unwrap()
+                .command,
+            Some(crate::cli::Command::Residential {
+                cmd: ResidentialCmd::Check {
+                    id: Some("url-3".into())
+                }
+            })
+        );
     }
 }
