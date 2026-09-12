@@ -432,6 +432,34 @@ pub fn asset_arch(arch: &str) -> anyhow::Result<&'static str> {
     }
 }
 
+/// manifest 里的 `bui` 与盘上 `bin/bui` 是不是**两个不同的构建**。
+///
+/// 版本号不是充分判据：rc 通道下 `v4.0.0-rc1` / `rc2` / 正式版的 Cargo 版本号都是同一个
+/// `4.0.0`（release.yml 的 check-version 把 `-rcN` 去掉后才比对），只按版本号判断的话
+/// 「同版本重建」永远不会被升级——2026-09-12 bwg-rick 上 `bui upgrade` 走不到新构建就是这个。
+/// 所以版本相同时再比一次 sha256：manifest 里 `bui-linux-<arch>` 的 vs 盘上 `bin/bui` 的。
+///
+/// 盘上二进制读不到（还没装 / 读失败）按「要升级」处理——本来就该给它装一份；manifest 缺该
+/// 架构资产同样按要升级返回，真正的报错留给 `plan_upgrade`（它在出计划前就会 bail）。
+pub fn bui_build_differs(
+    host: &dyn Host,
+    bin_dir: &Path,
+    m: &Manifest,
+    current_version: &str,
+    arch: &str,
+) -> bool {
+    if m.version != current_version {
+        return true;
+    }
+    let Ok(asset) = m.bui_asset(arch) else {
+        return true;
+    };
+    match host.read_file(&bin_dir.join("bui")).ok().flatten() {
+        Some(bytes) => !sha256_hex(&bytes).eq_ignore_ascii_case(&asset.sha256),
+        None => true,
+    }
+}
+
 /// 下载 → sha256 → `host.write_file(dest, bytes, 0o755)`。
 pub struct KernelInstaller<'a> {
     pub fetcher: &'a dyn Fetcher,
@@ -623,6 +651,36 @@ mod tests {
         );
         assert_eq!(m.bui_asset("x86_64").unwrap().url, "https://x/bui-amd64");
         assert!(m.bui_asset("armv7l").is_err());
+    }
+
+    /// rc 通道的回归：版本号相同、sha256 不同也算「有新构建」。
+    #[test]
+    fn bui_build_differs_falls_back_to_sha_when_the_version_is_unchanged() {
+        let (m, _) = fixture(b"BUI-rc2"); // manifest 版本 4.0.1，bui 资产 = sha256("BUI-rc2")
+        let bin = Path::new("/opt/b-ui/bin");
+        let h = FakeHost::new();
+        h.write_file(&bin.join("bui"), b"BUI-rc1", 0o755).unwrap();
+        assert!(
+            bui_build_differs(&h, bin, &m, "4.0.0", "x86_64"),
+            "版本不同：一眼就要升"
+        );
+        assert!(
+            bui_build_differs(&h, bin, &m, "4.0.1", "x86_64"),
+            "同版本但盘上是另一份构建（rc1 vs rc2）：也要升"
+        );
+        h.write_file(&bin.join("bui"), b"BUI-rc2", 0o755).unwrap();
+        assert!(
+            !bui_build_differs(&h, bin, &m, "4.0.1", "x86_64"),
+            "同版本同 sha 才是已最新"
+        );
+        assert!(
+            bui_build_differs(&FakeHost::new(), bin, &m, "4.0.1", "x86_64"),
+            "盘上读不到 bin/bui：按要升级处理"
+        );
+        assert!(
+            bui_build_differs(&h, bin, &m, "4.0.1", "aarch64"),
+            "manifest 没有该架构的 bui 资产：交给 plan_upgrade 去报错，这里按要升级算"
+        );
     }
 
     #[test]
