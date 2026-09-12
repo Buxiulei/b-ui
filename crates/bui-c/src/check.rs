@@ -1,7 +1,8 @@
 //! `bui-c check`：每分钟由 `bui-c.timer` 拉起的一次性巡检。
 //!
 //! 三件事：204 探测（socks 模式经本地 inbound，TUN 模式直连）+ TUN 接口与默认路由核对、
-//! 失败时按 1/2/4 分钟退避重启数据面单元、判定「今天该不该自更新」。
+//! 失败时按 1/2/4 分钟退避重启数据面单元、判定「今天该不该自更新」；
+//! 外加 TUN 模式下幂等重放 `bui-tun` 的两条 UFW 规则（`ufw reset` 会把它们清掉）。
 //! 状态落在 `/opt/bui-c/runtime.json`（0600），丢了能从零重建。
 
 use crate::engine::Engine;
@@ -9,6 +10,7 @@ use crate::net::{Net, Via};
 use crate::paths::{Paths, UNIT_MAIN};
 use crate::profiles::{Mode, Profiles};
 use crate::sys::{systemd, Sys};
+use crate::ufw;
 use crate::Result;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -34,6 +36,11 @@ pub struct Runtime {
     pub last_update_attempt_at: Option<i64>,
     /// 已加过 bui-tun 放行规则（T12 写，本模块只读写字段）。
     pub ufw_rules: bool,
+    /// 上一次检查更新的结论：manifest 版本与本机不同。菜单 `[6] ★ 有新版` 读它，
+    /// 不为了渲染一屏菜单去联网。由 `update` 子命令与巡检里的自更新写。
+    pub update_available: bool,
+    /// 上一次检查更新的时间（epoch 秒），与 `update_available` 同时写。
+    pub update_checked_at: Option<i64>,
 }
 
 impl Runtime {
@@ -132,6 +139,17 @@ pub fn run<S: Sys, N: Net>(sys: &S, net: &N, paths: &Paths) -> Result<Verdict> {
     }
     let mut rt = Runtime::load(sys, paths);
     let now = sys.now().unix_timestamp();
+
+    // 幂等重放 bui-tun 的两条 UFW 规则：`ufw reset` / 重装 ufw 会把它们清掉，
+    // 而 UFW 默认 FORWARD DROP 会掐掉隧道转发的 TCP。放在探测之前，好让这一轮就恢复。
+    // 失败只记日志：巡检的结论是「隧道通不通」，不该被防火墙报错顶掉。
+    if rt.ufw_rules && prof.mode == Mode::Tun {
+        match ufw::ensure_tun(sys) {
+            Ok(true) => tracing::info!("已重放 bui-tun 的 UFW 放行规则"),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(error = %e, "UFW 规则重放失败"),
+        }
+    }
 
     let failures = probe(sys, net, paths, &prof);
     if failures.is_empty() {
@@ -267,6 +285,94 @@ mod tests {
             format!("GET {PROBE_URL} via Direct"),
             "TUN 已接管，直连探测"
         );
+    }
+
+    /// TUN 模式下一切正常的机器（单元在跑、接口在、默认路由已接管、204 通）。
+    fn healthy_tun(s: &FakeSys, n: &FakeNet) {
+        s.put("/opt/bui-c/bin/sing-box", "ELF");
+        s.reply("systemctl is-active --quiet bui-c.service", 0, "");
+        s.reply("ip link show bui-tun", 0, "5: bui-tun");
+        s.reply(
+            "ip -4 route show table all",
+            0,
+            "default dev bui-tun table 2022\n",
+        );
+        n.route(PROBE_URL, FakeReply::Status(204));
+        profiles_tun().save(s, &paths()).unwrap();
+        Runtime {
+            ufw_rules: true,
+            ..Runtime::default()
+        }
+        .save(s, &paths())
+        .unwrap();
+    }
+
+    const UFW_WITH_TUN_RULES: &str = "Status: active\n\n\
+        To                         Action      From\n\
+        --                         ------      ----\n\
+        Anywhere on bui-tun        ALLOW IN    Anywhere\n\
+        Anywhere                   ALLOW FWD   Anywhere on bui-tun\n";
+
+    #[test]
+    fn check_replays_the_bui_tun_ufw_rules_when_they_went_missing() {
+        // 用户 `ufw reset` / 重装 ufw 之后两条规则会消失，FORWARD DROP 会掐掉隧道 TCP
+        let s = FakeSys::new();
+        let n = FakeNet::new();
+        healthy_tun(&s, &n);
+        s.reply(
+            "ufw status",
+            0,
+            "Status: active\n\nTo                Action      From\n",
+        );
+        assert_eq!(run(&s, &n, &paths()).unwrap(), Verdict::Ok);
+        assert!(s.called("ufw allow in on bui-tun"), "{:?}", s.calls());
+        assert!(s.called("ufw route allow in on bui-tun"), "{:?}", s.calls());
+    }
+
+    #[test]
+    fn check_does_not_re_add_ufw_rules_that_are_already_there() {
+        let s = FakeSys::new();
+        let n = FakeNet::new();
+        healthy_tun(&s, &n);
+        s.reply("ufw status", 0, UFW_WITH_TUN_RULES);
+        assert_eq!(run(&s, &n, &paths()).unwrap(), Verdict::Ok);
+        assert!(!s.called("ufw allow in on bui-tun"), "{:?}", s.calls());
+        assert!(!s.called("ufw route allow in on bui-tun"));
+    }
+
+    #[test]
+    fn check_leaves_ufw_alone_when_inactive_in_socks_mode_or_never_configured() {
+        // 墙没启用：没有 FORWARD DROP 要绕，不去替用户开墙
+        let s = FakeSys::new();
+        let n = FakeNet::new();
+        healthy_tun(&s, &n);
+        s.reply("ufw status", 0, "Status: inactive\n");
+        assert_eq!(run(&s, &n, &paths()).unwrap(), Verdict::Ok);
+        assert!(!s.called("ufw allow in on bui-tun"));
+
+        // socks 模式：本来就不该有 bui-tun 规则
+        let s = FakeSys::new();
+        let n = FakeNet::new();
+        healthy_socks(&s, &n);
+        Runtime {
+            ufw_rules: true,
+            ..Runtime::default()
+        }
+        .save(&s, &paths())
+        .unwrap();
+        s.reply("ufw status", 0, "Status: active\n");
+        assert_eq!(run(&s, &n, &paths()).unwrap(), Verdict::Ok);
+        assert!(!s.called("ufw allow in on bui-tun"));
+        assert!(!s.calls().iter().any(|c| c == "ufw status"));
+
+        // 从来没加过规则（ufw_rules=false）→ 连 ufw 都不问
+        let s = FakeSys::new();
+        let n = FakeNet::new();
+        healthy_tun(&s, &n);
+        Runtime::default().save(&s, &paths()).unwrap();
+        s.reply("ufw status", 0, "Status: active\n");
+        assert_eq!(run(&s, &n, &paths()).unwrap(), Verdict::Ok);
+        assert!(!s.calls().iter().any(|c| c == "ufw status"));
     }
 
     #[test]

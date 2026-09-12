@@ -189,8 +189,11 @@ impl<'a, S: Sys> Engine<'a, S> {
 
         let running = systemd::is_active(self.sys, UNIT_MAIN);
         let enabled = systemd::is_enabled(self.sys, UNIT_MAIN);
-        let will_start = !running || !enabled;
-        let will_restart = !will_start && (out.config_changed || out.units_changed);
+        // 重启语义（P4 终审）：没在跑 → start；在跑且配置/单元变了 → restart。
+        // 「在跑但被 disable」不能拿 `enable --now` 顶替 restart：--now 对已 active 的单元
+        // 是空操作，新配置根本不会被加载。enabled 状态单独用 `enable` 补齐。
+        let will_start = !running;
+        let will_restart = running && (out.config_changed || out.units_changed);
 
         // 内核前置只在真要（重）启动时做：残留接口会让 sing-box 起不来，
         // 但 sing-box 已经在跑且配置没变时去 `ip link delete` 一个活着的 TUN
@@ -207,11 +210,21 @@ impl<'a, S: Sys> Engine<'a, S> {
         }
 
         if will_start {
-            systemd::enable_now(self.sys, UNIT_MAIN)?;
+            // 一次调用同时把 enable 补上，少一次 systemctl
+            if enabled {
+                systemd::start(self.sys, UNIT_MAIN)?;
+            } else {
+                systemd::enable_now(self.sys, UNIT_MAIN)?;
+            }
             out.restarted = true;
-        } else if will_restart {
-            systemd::restart(self.sys, UNIT_MAIN)?;
-            out.restarted = true;
+        } else {
+            if will_restart {
+                systemd::restart(self.sys, UNIT_MAIN)?;
+                out.restarted = true;
+            }
+            if !enabled {
+                systemd::enable(self.sys, UNIT_MAIN)?;
+            }
         }
         if !systemd::is_active(self.sys, UNIT_TIMER) || !systemd::is_enabled(self.sys, UNIT_TIMER) {
             systemd::enable_now(self.sys, UNIT_TIMER)?;
@@ -340,6 +353,62 @@ mod tests {
             }
         );
         assert!(!s.called("systemctl restart bui-c.service"));
+    }
+
+    #[test]
+    fn running_but_disabled_unit_with_a_config_change_is_restarted_and_enabled() {
+        // 在跑的单元光 `enable --now` 不会重载配置（systemd 对已 active 的单元 --now 是空操作），
+        // 所以「在跑 + 配置变了」一律 restart，enabled 状态另外用 `enable` 补。
+        let s = FakeSys::new();
+        s.put("/opt/bui-c/bin/sing-box", "ELF");
+        s.reply("systemctl is-active --quiet bui-c.service", 0, "");
+        s.reply("systemctl is-enabled --quiet bui-c.service", 1, "");
+        let a = Engine::new(&s, &paths()).apply(&profiles_socks()).unwrap();
+        assert!(a.config_changed && a.restarted);
+        assert!(
+            s.called("systemctl restart bui-c.service"),
+            "{:?}",
+            s.calls()
+        );
+        assert!(
+            s.called("systemctl enable bui-c.service"),
+            "{:?}",
+            s.calls()
+        );
+        assert!(
+            !s.called("systemctl enable --now bui-c.service"),
+            "在跑的单元不能用 enable --now 顶替 restart"
+        );
+    }
+
+    #[test]
+    fn running_and_disabled_without_changes_is_only_enabled_not_restarted() {
+        let s = FakeSys::new();
+        let prof = profiles_socks();
+        let pt = paths();
+        let e = Engine::new(&s, &pt);
+        clean(&s);
+        e.apply(&prof).unwrap(); // 第一次：写盘 + enable --now
+        s.reply("systemctl is-active --quiet bui-c.service", 0, "");
+        s.reply("systemctl is-active --quiet bui-c.timer", 0, "");
+        s.reply("systemctl is-enabled --quiet bui-c.timer", 0, "");
+        let a = e.apply(&prof).unwrap(); // 配置没变，但单元被 disable 了
+        assert!(!a.restarted, "没有变更就不要打断在跑的隧道");
+        assert!(s.called("systemctl enable bui-c.service"));
+        assert!(!s.called("systemctl restart bui-c.service"));
+    }
+
+    #[test]
+    fn stopped_but_enabled_unit_is_started_not_enabled_again() {
+        let s = FakeSys::new();
+        s.put("/opt/bui-c/bin/sing-box", "ELF");
+        s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        s.reply("systemctl is-enabled --quiet bui-c.service", 0, "");
+        let a = Engine::new(&s, &paths()).apply(&profiles_socks()).unwrap();
+        assert!(a.restarted);
+        assert!(s.called("systemctl start bui-c.service"), "{:?}", s.calls());
+        assert!(!s.called("systemctl enable --now bui-c.service"));
+        assert!(!s.called("systemctl enable bui-c.service"));
     }
 
     #[test]

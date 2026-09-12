@@ -183,6 +183,11 @@ pub mod systemd {
     pub fn enable_now<S: Sys>(sys: &S, unit: &str) -> Result<()> {
         must(sys, &["enable", "--now", unit])
     }
+    /// 只补开机自启，不动运行状态：单元已经在跑时 `enable --now` 不会重载配置，
+    /// 「在跑 + 配置变了」要的是 `restart`（engine::apply 的重启语义）。
+    pub fn enable<S: Sys>(sys: &S, unit: &str) -> Result<()> {
+        must(sys, &["enable", unit])
+    }
     pub fn restart<S: Sys>(sys: &S, unit: &str) -> Result<()> {
         must(sys, &["restart", unit])
     }
