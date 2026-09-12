@@ -1,0 +1,47 @@
+name: setup-kernels
+description: 按 scripts/release/kernels.lock 准备内核裸二进制（带 actions/cache 与镜像回退；上游归档就地解包）
+inputs:
+  dir:
+    description: 落地目录
+    required: true
+  role:
+    description: all | target | check
+    required: false
+    default: all
+  arch:
+    description: amd64 | arm64
+    required: false
+    default: amd64
+runs:
+  using: composite
+  steps:
+    - name: 安装解包工具
+      shell: bash
+      run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends unzip
+    - name: 恢复内核缓存
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: ${{ inputs.dir }}
+        key: kernels-${{ runner.os }}-${{ inputs.arch }}-${{ hashFiles('scripts/release/kernels.lock') }}
+        restore-keys: |
+          kernels-${{ runner.os }}-${{ inputs.arch }}-
+    - name: 获取内核（缓存命中则零下载）
+      shell: bash
+      run: |
+        bash scripts/ci/fetch-kernels.sh \
+          --out "${{ inputs.dir }}" \
+          --arch "${{ inputs.arch }}" \
+          --role "${{ inputs.role }}"
+    - name: 打印版本（只对本机架构可执行）
+      if: ${{ inputs.arch == 'amd64' }}
+      shell: bash
+      run: |
+        "${{ inputs.dir }}/bin/sing-box" version
+        "${{ inputs.dir }}/bin/xray" version | head -1
+        "${{ inputs.dir }}/bin/hysteria" version | head -3
+        ls -1 "${{ inputs.dir }}/singbox" 2>/dev/null || true
+    - name: 清点文件（arm64 不能在 x86 runner 上执行，只看落点）
+      if: ${{ inputs.arch != 'amd64' }}
+      shell: bash
+      run: ls -l "${{ inputs.dir }}/bin"
