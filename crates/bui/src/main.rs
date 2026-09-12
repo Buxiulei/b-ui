@@ -96,6 +96,7 @@ async fn dispatch(command: Command) -> Result<()> {
             non_interactive,
             answers,
             yes,
+            manifest_url,
         } => {
             commands::install::run(
                 commands::install::InstallOpts {
@@ -106,6 +107,7 @@ async fn dispatch(command: Command) -> Result<()> {
                     non_interactive,
                     answers,
                     yes,
+                    manifest_url,
                     // socket 路径由调用方传入，install 自己不读常量（单元测试因此不碰真实 socket）
                     socket: PathBuf::from(paths::SOCKET_PATH),
                 },

@@ -252,6 +252,65 @@ assert_eq "$(printf -- '--domain\npanel.example.com\n--import-v3')" \
     "v3 机器上自动追加 --import-v3，用户参数不动"
 rm -f "$WORK/fresh/users.json"
 
+# ---- 5) 选定的 manifest 地址要交给 bui install（2026-09-12 真机 bwg-tizi）----
+# 那次 install.sh 从 releases/download/v4.0.0-rc2/ 正确下到了 manifest 与 bui，可 exec 之后
+# bui install 又去问 releases/latest 并 404 ⇒ 四个内核一个都没装、中止守卫把安装拦了。
+# 修法：get_manifest 把**实际用的**那个地址 export 成 BUI_MANIFEST_URL（与 C4 的覆盖同名同义），
+# 于是 exec 出去的 bui install 认同一份 manifest。
+manifest_env() { bash -c 'printf "%s" "${BUI_MANIFEST_URL-unset}"'; }
+
+# BUI_VERSION=vX ⇒ 交下去的是 releases/download/vX/manifest.json
+unset BUI_MANIFEST_URL
+MANIFEST_URL=""
+TAG="v4.0.1"
+get_manifest "$WORK/m4.json" > /dev/null 2>&1
+assert_eq "0" "$?" "指定版本时 manifest 下载成功"
+assert_eq "https://github.com/Buxiulei/b-ui/releases/download/v4.0.1/manifest.json" \
+    "$BUI_MANIFEST_URL" "BUI_VERSION=vX ⇒ BUI_MANIFEST_URL 指向该 tag 的 manifest"
+assert_eq "https://github.com/Buxiulei/b-ui/releases/download/v4.0.1/manifest.json" \
+    "$(manifest_env)" "真的 export 了（exec 出去的 bui install 能看到）"
+
+# latest 404 回退到预发布 ⇒ 交下去的是回退后那个 tag，不是 latest
+unset BUI_MANIFEST_URL
+MANIFEST_URL=""
+TAG=latest
+get_manifest "$WORK/m5.json" > /dev/null 2>&1
+assert_eq "0" "$?" "回退成功"
+assert_eq "https://github.com/Buxiulei/b-ui/releases/download/v4.0.0-rc2/manifest.json" \
+    "$BUI_MANIFEST_URL" "回退到预发布后交下去的是那个 tag 的 manifest（不是 latest）"
+assert_eq "https://github.com/Buxiulei/b-ui/releases/download/v4.0.0-rc2/manifest.json" \
+    "$(manifest_env)" "回退后的地址也 export 了"
+
+# 用户已显式设了 BUI_MANIFEST_URL ⇒ 原样不动（M5 演练的本机源）
+unset BUI_MANIFEST_URL
+MANIFEST_URL="http://127.0.0.1:8000/v4.0.0/manifest.json"
+TAG=latest
+get_manifest "$WORK/m6.json" > /dev/null 2>&1
+assert_eq "http://127.0.0.1:8000/v4.0.0/manifest.json" "$BUI_MANIFEST_URL" \
+    "用户显式给的 BUI_MANIFEST_URL 保持不变"
+
+# latest 成功（仓库已有正式版）⇒ 交下去的就是 latest 那一串
+unset BUI_MANIFEST_URL
+MANIFEST_URL=""
+TAG=latest
+(
+    fetch() { printf 'MANIFEST %s' "$1" > "$2"; }
+    get_manifest "$WORK/m7.json" > /dev/null 2>&1
+    printf '%s' "$BUI_MANIFEST_URL" > "$WORK/env7.txt"
+)
+assert_eq "https://github.com/Buxiulei/b-ui/releases/latest/download/manifest.json" \
+    "$(cat "$WORK/env7.txt")" "latest 拿到了就交 latest 那一串"
+
+# 取不到 manifest（列表里没有 v4*）⇒ 不设它，让 bui install 自己按 C4 解析
+unset BUI_MANIFEST_URL
+MANIFEST_URL=""
+TAG=latest
+FAKE_RELEASES="$WORK/fixtures/only-v3.json" get_manifest "$WORK/m8.json" > /dev/null 2>&1
+assert_eq "1" "$?" "取不到就退 1"
+assert_eq "unset" "$(manifest_env)" "没取到 manifest 时不乱设 BUI_MANIFEST_URL"
+MANIFEST_URL=""
+TAG=latest
+
 # ---- 顶部注释：一行命令与三个环境变量写清楚了 ----
 head=$(sed -n '1,20p' "$ROOT/install.sh")
 assert_contains "bash -s -- --domain" "$head" "顶部注释给出一行命令"

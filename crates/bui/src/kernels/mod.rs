@@ -8,7 +8,7 @@
 //! 执行，否则 block 的时候直接 panic。因此 [`Fetcher`] 是**同步** trait，[`HttpFetcher`] 只允许
 //! 在 `tokio::task::spawn_blocking` 的闭包里或纯同步的 CLI 路径里调用。
 //!
-//! manifest 地址只在 [`resolve_manifest_url`] / [`manifest_url`] 决定一次（总纲 C4「manifest
+//! manifest 地址只在 [`resolve_manifest_url`] / [`fetch_manifest`] 决定一次（总纲 C4「manifest
 //! 来源与覆盖」）：`--manifest-url` > `--version`（套模板）> `$BUI_MANIFEST_URL` > 内置 latest。
 //! 「什么都没指定」这一支还有一步回退：GitHub 的 `releases/latest` 不解析预发布，所以仓库里
 //! 只有 rc 时 `latest/download/manifest.json` 必然 404 —— [`fetch_manifest_with`] 这时**无条件**
@@ -277,12 +277,6 @@ pub fn resolve_manifest_url(
         (_, _, Some(u)) if !u.is_empty() => u.to_string(),
         _ => MANIFEST_URL.to_string(),
     }
-}
-
-/// 读进程环境后调 [`resolve_manifest_url`]；Task 15/16/17 一律用它，不再各自拼 URL。
-pub fn manifest_url(cli_override: Option<&str>, version: Option<&str>) -> String {
-    let env = std::env::var(MANIFEST_URL_ENV).ok();
-    resolve_manifest_url(cli_override, version, env.as_deref())
 }
 
 /// C4 那三个覆盖是否**都没给**（空串按没给算，与 [`resolve_manifest_url`] 同一口径）。

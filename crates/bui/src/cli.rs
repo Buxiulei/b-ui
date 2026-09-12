@@ -49,6 +49,10 @@ pub enum Command {
         /// 非交互：缺失项用默认值（`--non-interactive` 的简写别名，两者都接受）
         #[arg(long, short = 'y')]
         yes: bool,
+        /// 覆盖 manifest 地址：http(s) URL、`file://…` 或本地路径（与 `bui upgrade` 的同名
+        /// 选项同义，总纲 C4；`install.sh` 走 `$BUI_MANIFEST_URL` 把它选定的地址传下来）
+        #[arg(long, value_name = "URL|FILE")]
+        manifest_url: Option<String>,
     },
     /// 升级 bui 与内核二进制
     Upgrade {
@@ -136,6 +140,7 @@ mod tests {
                 non_interactive: false,
                 answers: None,
                 yes: false,
+                manifest_url: None,
             })
         );
     }
@@ -162,6 +167,7 @@ mod tests {
                 non_interactive: true,
                 answers: Some(PathBuf::from("/root/answers.json")),
                 yes: false,
+                manifest_url: None,
             })
         );
     }
@@ -198,6 +204,36 @@ mod tests {
                 non_interactive: false,
                 answers: None,
                 yes: true,
+                manifest_url: None,
+            })
+        );
+    }
+
+    /// `bui install --manifest-url`：与 `bui upgrade` 的同名选项同义（总纲 C4）。
+    /// `install.sh` 平时走 `$BUI_MANIFEST_URL`，M5 演练与离线源要能在 argv 上直接给。
+    #[test]
+    fn parses_install_with_a_manifest_url_override() {
+        let cli = Cli::try_parse_from([
+            "bui",
+            "install",
+            "--domain",
+            "example.com",
+            "--manifest-url",
+            "http://127.0.0.1:8000/manifest.json",
+            "--yes",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.command,
+            Some(Command::Install {
+                domain: Some("example.com".into()),
+                port: None,
+                admin_password_stdin: false,
+                import_v3: None,
+                non_interactive: false,
+                answers: None,
+                yes: true,
+                manifest_url: Some("http://127.0.0.1:8000/manifest.json".into()),
             })
         );
     }
