@@ -50,6 +50,18 @@ jsonwebtoken = "9"
 rand.workspace = true
 time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
 futures-util = "0.3"
+# P2：可注入的 gRPC / hysteria HTTP trait 要 `dyn` 化，原生 async fn in trait 不是对象安全的
+async-trait = "0.1"
+# P2：auth-hook 的密码比对走常量时间（spec §3.2）
+subtle = "2"
+# P2 Task 4：Xray gRPC（只做客户端、只连 127.0.0.1 明文，不需要 TLS）
+tonic = { version = "0.14", default-features = false, features = ["codegen", "transport"] }
+tonic-prost = "0.14"
+prost = "0.14"
+# P2 Task 11：把 web/ 的五个前端文件与 scripts/bui-c-install.sh 编进二进制。
+# 三个 feature 都是必需的：interpolate-folder-path 展开 $CARGO_MANIFEST_DIR、
+# include-exclude 启用 #[include]、debug-embed 让 debug 构建也真嵌入（默认是运行时读盘）。
+rust-embed = { version = "8", features = ["debug-embed", "include-exclude", "interpolate-folder-path"] }
 
 [dev-dependencies]
 pretty_assertions.workspace = true
@@ -58,3 +70,11 @@ tempfile.workspace = true
 # cargo 在 test 构建时把 dev-dependencies 的 feature 与 [dependencies] 的并集生效，生产构建不带这一项；
 # 少了这一行，`start_paused = true` 直接报 `no method named start_paused`，Task 11/15 的测试编译不过。
 tokio = { version = "1", features = ["test-util"] }
+
+[build-dependencies]
+# 本机与 CI 都没有系统 protoc，所以用 vendored 的（Task 4 的 build.rs 会用到；
+# 现在还没有 build.rs，这一节只参与依赖解析，不参与编译）。
+tonic-prost-build = "0.14"
+# 提供构建机自己架构的 protoc 二进制（纯 crates.io，不依赖系统包）；
+# 交叉编译到 aarch64-musl 时它仍然给 host 的 protoc，正是需要的那个
+protoc-bin-vendored = "3"
