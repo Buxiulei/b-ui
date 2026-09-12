@@ -10,8 +10,8 @@ use super::{Shared, TxRx, XRAY_INBOUND_TAGS};
 use crate::api::Event;
 use crate::reconcile::DaemonCtx;
 use bui_schema::model::{
-    Billing, Credentials, Entitlements, NodeParams, PortalAuth, Protocol, ResidentialEntitlement,
-    State, TrafficLimit, Usage, User, DEFAULT_GROUP,
+    Billing, Credentials, Entitlements, NodeParams, PortalAuth, Protocol, Residential,
+    ResidentialEntitlement, State, TrafficLimit, Usage, User, DEFAULT_GROUP,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -51,6 +51,18 @@ pub struct PanelUser {
     pub uuid: Uuid,
     pub sni: String,
     pub residential: bool,
+    /// 该用户所在的 IP 槽位序号（spec §5.6；没有住宅权益 ⇒ `None`）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slot: Option<u16>,
+    /// 该槽位 IP 的出口地址（未体检过 ⇒ `None`）
+    #[serde(rename = "slotIp", skip_serializing_if = "Option::is_none")]
+    pub slot_ip: Option<String>,
+    /// 该用户订阅里 HY2 住宅节点的端口
+    #[serde(rename = "slotPort", skip_serializing_if = "Option::is_none")]
+    pub slot_port: Option<u16>,
+    /// 该用户订阅里 HY2 住宅节点的跳跃区间（闭区间）
+    #[serde(rename = "slotHop", skip_serializing_if = "Option::is_none")]
+    pub slot_hop: Option<(u16, u16)>,
     pub disabled: bool,
     pub blocked: bool,
 }
@@ -67,7 +79,38 @@ pub fn protocol_label(e: &Entitlements) -> &'static str {
     }
 }
 
-pub fn project(u: &User, node: &NodeParams, blocked: &BTreeSet<Uuid>) -> PanelUser {
+pub fn project(
+    u: &User,
+    node: &NodeParams,
+    resi: &Residential,
+    blocked: &BTreeSet<Uuid>,
+) -> PanelUser {
+    // spec §5.6：面板要显示每个用户的槽位与 IP。端口口径与 `nodes_for` 完全一致
+    // （同一个 `slots::resources_of`），所以面板显示的端口就是订阅里的端口。
+    let slot = u.entitlements.residential.as_ref().map(|_| {
+        let idx = bui_schema::slots::index_of_user(u, resi);
+        let res = bui_schema::slots::resources_of(&node.ports, resi, idx);
+        // 槽位表为空（旧 state 首次启动、`reconcile` CLI 这条没跑过迁移的路径）时退回
+        // **池首上游**，与 `render::relay::slot_view` / `slots::fallback_index` 的 fail-open
+        // 同一口径（Fable 2026-09-13 裁决）：那时槽 0 事实上就是池里第一条，
+        // 面板显示的 IP 必须和 relay 真正在用的那条一致，不能因为「表还没建」就显示空白。
+        let ip = resi.default_group().and_then(|g| {
+            let by_slot = bui_schema::slots::sorted(resi)
+                .into_iter()
+                .find(|s| s.index == idx)
+                .and_then(|s| g.upstreams.iter().find(|x| x.id == s.upstream_id));
+            by_slot
+                .or_else(|| {
+                    if resi.slots.is_empty() {
+                        g.upstreams.first()
+                    } else {
+                        None
+                    }
+                })
+                .and_then(|x| x.verified.as_ref().map(|v| v.ip.clone()))
+        });
+        (idx, ip, res)
+    });
     PanelUser {
         username: u.username.clone(),
         protocol: protocol_label(&u.entitlements),
@@ -90,6 +133,10 @@ pub fn project(u: &User, node: &NodeParams, blocked: &BTreeSet<Uuid>) -> PanelUs
         // v4 没有 per-user sni：面板与订阅都用全局 REALITY 伪装域（v3.5.13 的修复口径）
         sni: node.reality.sni().to_string(),
         residential: u.entitlements.residential.is_some(),
+        slot: slot.as_ref().map(|(i, _, _)| *i),
+        slot_ip: slot.as_ref().and_then(|(_, ip, _)| ip.clone()),
+        slot_port: slot.as_ref().map(|(_, _, r)| r.hy2_port),
+        slot_hop: slot.as_ref().map(|(_, _, r)| r.hop),
         disabled: u.disabled,
         blocked: u.disabled || blocked.contains(&u.user_id),
     }
@@ -99,7 +146,7 @@ pub fn project_all(state: &State, blocked: &BTreeSet<Uuid>) -> Vec<PanelUser> {
     state
         .users
         .iter()
-        .map(|u| project(u, &state.node, blocked))
+        .map(|u| project(u, &state.node, &state.residential, blocked))
         .collect()
 }
 
@@ -614,7 +661,13 @@ mod tests {
             month_key: "2026-09".into(),
             last_seen_at: None,
         };
-        let v = serde_json::to_value(project(alice(&s), &s.node, &BTreeSet::new())).unwrap();
+        let v = serde_json::to_value(project(
+            alice(&s),
+            &s.node,
+            &s.residential,
+            &BTreeSet::new(),
+        ))
+        .unwrap();
         assert_eq!(v["username"], "alice");
         assert_eq!(v["protocol"], "fusion");
         assert_eq!(v["createdAt"], "2026-09-11T00:00:00Z");
@@ -642,10 +695,119 @@ mod tests {
     }
 
     #[test]
+    fn the_panel_user_carries_its_slot_ip_and_residential_port() {
+        let mut s = crate::modules::residential::sample_state_with_pool();
+        // 扩到 2 槽，把 alice 放到槽 1
+        let g = s
+            .residential
+            .groups
+            .get_mut(bui_schema::model::DEFAULT_GROUP)
+            .unwrap();
+        let mut second = g.upstreams[0].clone();
+        second.id = Uuid::from_u128(0xa001);
+        second.host = "isp2.example.net".into();
+        second.verified = Some(bui_schema::model::Verified {
+            ip: "198.51.100.8".into(),
+            asn: None,
+            org: None,
+            country: None,
+            at: "2026-09-13T00:00:00Z".into(),
+        });
+        g.upstreams.push(second);
+        bui_schema::slots::sync_slots(&mut s.residential);
+        let uid = s.users[0].user_id;
+        assert!(bui_schema::slots::assign(
+            &mut s,
+            uid,
+            Uuid::from_u128(0xa001)
+        ));
+
+        let rows = project_all(&s, &BTreeSet::new());
+        assert_eq!(rows.len(), 1);
+        let v = serde_json::to_value(&rows[0]).unwrap();
+        assert_eq!(v["slot"], 1);
+        assert_eq!(v["slotIp"], "198.51.100.8");
+        assert_eq!(v["slotPort"], 40001);
+        assert_eq!(v["slotHop"], serde_json::json!([45500, 50000]));
+        // v3 字段一个都不许动（前端按它们渲染）
+        assert_eq!(v["username"], "alice");
+        assert_eq!(v["protocol"], "fusion");
+        assert_eq!(v["residential"], true);
+    }
+
+    #[test]
+    fn a_user_without_the_residential_entitlement_has_no_slot_fields() {
+        let mut s = crate::modules::residential::sample_state_with_pool();
+        s.users[0].entitlements.residential = None;
+        let v = serde_json::to_value(&project_all(&s, &BTreeSet::new())[0]).unwrap();
+        assert!(v["slot"].is_null());
+        assert!(v["slotIp"].is_null());
+        assert!(v["slotPort"].is_null());
+    }
+
+    /// 槽位表还是空的（旧 state 首次启动、`reconcile` CLI 路径）：槽位显示退回
+    /// 「槽 0 + 池首上游」，与 `render::relay::slot_view` / `slots::fallback_index` 的
+    /// fail-open 同口径（Fable 2026-09-13 裁决）。面板显示的 IP 必须就是 relay 真正在用的那条。
+    #[test]
+    fn an_empty_slot_table_falls_back_to_the_head_of_the_pool() {
+        let s = crate::modules::residential::sample_state_with_pool();
+        assert!(
+            s.residential.slots.is_empty(),
+            "sample 没有槽位表，正是要测的那一档"
+        );
+        let v = serde_json::to_value(&project_all(&s, &BTreeSet::new())[0]).unwrap();
+        assert_eq!(v["slot"], 0);
+        assert_eq!(v["slotPort"], 40000);
+        assert_eq!(v["slotHop"], serde_json::json!([41000, 50000]));
+        assert_eq!(
+            v["slotIp"], "198.51.100.7",
+            "退回池首上游的 verified.ip（sample_group 的第一条）"
+        );
+    }
+
+    /// 池是空的（住宅没开）：槽位序号与端口照给（fail-open 的监听照在），IP 只能是空。
+    #[test]
+    fn an_empty_pool_reports_the_v3_port_with_no_ip() {
+        let mut s = crate::modules::residential::sample_state_with_pool();
+        s.residential
+            .groups
+            .get_mut(bui_schema::model::DEFAULT_GROUP)
+            .unwrap()
+            .upstreams
+            .clear();
+        let v = serde_json::to_value(&project_all(&s, &BTreeSet::new())[0]).unwrap();
+        assert_eq!(v["slot"], 0);
+        assert_eq!(v["slotPort"], 40000);
+        assert!(v["slotIp"].is_null());
+    }
+
+    /// 槽位表**非空**但这个用户指向的槽不在表里（刚被删掉的上游）：退回兜底槽的 IP，
+    /// **不**退回池首 —— 表非空时兜底槽就是表里序号最小的那个，池首可能根本没有槽位。
+    #[test]
+    fn a_stale_slot_id_falls_back_to_the_fallback_slots_ip() {
+        let mut s = crate::modules::residential::sample_state_with_pool();
+        bui_schema::slots::sync_slots(&mut s.residential);
+        assert_eq!(s.residential.slots.len(), 1);
+        let uid = s.users[0].user_id;
+        s.users
+            .iter_mut()
+            .find(|u| u.user_id == uid)
+            .unwrap()
+            .entitlements
+            .residential
+            .as_mut()
+            .unwrap()
+            .slot_id = Some(Uuid::from_u128(0xdead));
+        let v = serde_json::to_value(&project_all(&s, &BTreeSet::new())[0]).unwrap();
+        assert_eq!(v["slot"], 0);
+        assert_eq!(v["slotIp"], "198.51.100.7");
+    }
+
+    #[test]
     fn projection_marks_blocked_users() {
         let s = sample_state();
         let id = alice(&s).user_id;
-        let p = project(alice(&s), &s.node, &BTreeSet::from([id]));
+        let p = project(alice(&s), &s.node, &s.residential, &BTreeSet::from([id]));
         assert!(p.blocked);
         assert_eq!(project_all(&s, &BTreeSet::from([id])).len(), 1);
     }

@@ -1,6 +1,7 @@
 //! 权益 → 节点集合：把一个用户的 [`Entitlements`](crate::model::Entitlements) 展开成他订阅里该出现的节点。
 
 use crate::model::{NodeParams, Protocol, Residential, User};
+use crate::slots;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -134,9 +135,12 @@ pub fn nodes_for(user: &User, node: &NodeParams, resi: &Residential) -> Vec<Node
             ));
         }
         if resi_ok {
+            // spec §5.6：住宅 HY2 节点用**该用户槽位**的端口与跳跃区间。
+            // 单槽（含空池、旧 state）时它就是 40000 + 41000-50000，与 v3 逐字相同。
+            let res = slots::resources_of(&node.ports, resi, slots::index_of_user(user, resi));
             out.push(hy2(
-                node.ports.hy2_resi,
-                Some(node.ports.hy2_resi_hop),
+                res.hy2_port,
+                Some(res.hop),
                 NodeKind::Hy2Residential,
                 "HY2住宅",
                 None,
@@ -150,6 +154,7 @@ pub fn nodes_for(user: &User, node: &NodeParams, resi: &Residential) -> Vec<Node
 mod tests {
     use super::*;
     use crate::model::*;
+    use uuid::Uuid;
 
     fn node() -> NodeParams {
         serde_json::from_str(
@@ -266,6 +271,105 @@ mod tests {
         assert_eq!(
             ns.iter().map(|n| n.kind).collect::<Vec<_>>(),
             vec![NodeKind::RealityResidential]
+        );
+    }
+
+    /// 造一份 n 槽的住宅段（上游 uuid = index+1）。
+    fn resi_with_slots(n: u16) -> Residential {
+        let mut r = Residential::default();
+        let g = r.groups.get_mut(crate::model::DEFAULT_GROUP).unwrap();
+        g.enabled = true;
+        g.upstreams = (0..n)
+            .map(|i| crate::model::Upstream {
+                id: Uuid::from_u128(u128::from(i) + 1),
+                name: format!("url-{}", i + 1),
+                kind: crate::model::UpstreamKind::Socks5,
+                host: format!("isp{}.example.net", i + 1),
+                port: 10007,
+                username: "user1".into(),
+                password: "pw1".into(),
+                priority: 100,
+                provider: None,
+                region: None,
+                ports_allowed: None,
+                verified: None,
+            })
+            .collect();
+        r.slots = (0..n)
+            .map(|i| crate::model::Slot {
+                index: i,
+                upstream_id: Uuid::from_u128(u128::from(i) + 1),
+            })
+            .collect();
+        r
+    }
+
+    /// 单槽（含空池）时 HY2 住宅节点必须还是 40000 + 41000-50000 —— golden 的生命线。
+    #[test]
+    fn a_single_slot_keeps_the_v3_residential_hy2_port() {
+        let ns = nodes_for(
+            &user(vec![Protocol::Hysteria2], true),
+            &node(),
+            &Residential::default(),
+        );
+        let r = ns
+            .iter()
+            .find(|n| n.kind == NodeKind::Hy2Residential)
+            .unwrap();
+        assert_eq!(r.port, 40000);
+        assert_eq!(r.hop, Some((41000, 50000)));
+    }
+
+    #[test]
+    fn the_residential_hy2_node_follows_the_users_slot() {
+        let resi = resi_with_slots(3);
+        let mut u = user(vec![Protocol::Hysteria2, Protocol::Reality], true);
+        // 槽 1
+        u.entitlements.residential.as_mut().unwrap().slot_id = Some(Uuid::from_u128(2));
+        let ns = nodes_for(&u, &node(), &resi);
+        let r = ns
+            .iter()
+            .find(|n| n.kind == NodeKind::Hy2Residential)
+            .unwrap();
+        assert_eq!(r.port, 40001);
+        assert_eq!(r.hop, Some((44000, 46999)));
+        // 槽 2
+        u.entitlements.residential.as_mut().unwrap().slot_id = Some(Uuid::from_u128(3));
+        let ns = nodes_for(&u, &node(), &resi);
+        let r = ns
+            .iter()
+            .find(|n| n.kind == NodeKind::Hy2Residential)
+            .unwrap();
+        assert_eq!(r.port, 40002);
+        assert_eq!(r.hop, Some((47000, 50000)));
+        // 未分配 ⇒ 兜底槽（槽 0）
+        u.entitlements.residential.as_mut().unwrap().slot_id = None;
+        let ns = nodes_for(&u, &node(), &resi);
+        let r = ns
+            .iter()
+            .find(|n| n.kind == NodeKind::Hy2Residential)
+            .unwrap();
+        assert_eq!(r.port, 40000);
+        assert_eq!(r.hop, Some((41000, 43999)));
+    }
+
+    /// 槽位只动 HY2 住宅那一个节点：直连两条与 Reality 住宅（:10002）都不许变。
+    #[test]
+    fn slots_do_not_touch_any_other_node() {
+        let resi = resi_with_slots(3);
+        let mut u = user(vec![Protocol::Hysteria2, Protocol::Reality], true);
+        u.entitlements.residential.as_mut().unwrap().slot_id = Some(Uuid::from_u128(3));
+        let ns = nodes_for(&u, &node(), &resi);
+        let by = |k: NodeKind| ns.iter().find(|n| n.kind == k).unwrap().clone();
+        assert_eq!(by(NodeKind::RealityDirect).port, 10001);
+        assert_eq!(by(NodeKind::RealityResidential).port, 10002);
+        assert_eq!(by(NodeKind::RealityResidential).hop, None);
+        assert_eq!(by(NodeKind::Hy2Direct).port, 10000);
+        assert_eq!(by(NodeKind::Hy2Direct).hop, Some((20000, 30000)));
+        // 标签与顺序也不许变（v2rayN 里的节点名）
+        assert_eq!(
+            ns.iter().map(|n| n.label.as_str()).collect::<Vec<_>>(),
+            vec!["Reality直连", "Reality住宅", "HY2直连", "HY2住宅"]
         );
     }
 
