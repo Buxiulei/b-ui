@@ -95,17 +95,15 @@ pub const DEFAULT_KEYWORDS: &[&str] = &[
 mod tests {
     use super::*;
 
-    /// 与 v3 `server/residential-helper.sh` 的 `DEFAULT_DOMAINS` 逐项（含顺序）一致。
+    /// v3 的 `server/residential-helper.sh` 在 v4.0.0 发布时删除；表的权威副本落成 fixture。
+    /// fixture 是「一行一个关键字、无注释头」的纯文本（下面的断言只过滤空行，加 `#` 头会被
+    /// 当成关键字）。重生成需要一个还含 v3 文件的 git ref，做法与
+    /// `scripts/gen-v3-fixtures.sh` 一致：`git show <ref>:server/residential-helper.sh`
+    /// 取出 `DEFAULT_DOMAINS=(` 与 `)` 之间的带引号字面量，一行一个写进 fixture。
     #[test]
-    fn matches_v3_helper_table() {
-        let src = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../server/residential-helper.sh"
-        ))
-        .unwrap();
-        let start = src.find("DEFAULT_DOMAINS=(").unwrap();
-        let end = src[start..].find(')').unwrap() + start;
-        let v3: Vec<&str> = src[start..end].split('"').skip(1).step_by(2).collect();
+    fn matches_v3_snapshot() {
+        let src = include_str!("../tests/fixtures/v3/default-domains.txt");
+        let v3: Vec<&str> = src.lines().filter(|l| !l.trim().is_empty()).collect();
         assert_eq!(
             DEFAULT_KEYWORDS.to_vec(),
             v3,

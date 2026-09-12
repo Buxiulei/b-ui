@@ -176,12 +176,12 @@ for l in open('$J'):
 
 ## 7. 必须知道的坑与约定
 
-- 项目、UI、commit 全中文；`fix(scope):` / `feat(scope):` / `bump: vX.Y.Z`；`version.json` 是版本唯一真源。
-- 客户端 TUN 模板改动**必须** bump `TUN_SCHEMA_VERSION`；服务端 sing-box 订阅模板和客户端 TUN 模板是两个独立模板。
-- 节点集合逻辑目前在 4 处重复（三个订阅生成器 + `app.js genUri`），改端口/标签/obfs 要同时改。
+- 项目、UI、commit 全中文；`fix(scope):` / `feat(scope):` / `chore(scope):`；版本唯一真源是根 `Cargo.toml` 的 `[workspace.package] version`，发布 tag = `v<version>`，同时在 `CHANGELOG.md` 加一段。
+- 客户端配置模板改动不需要版本常量了：`bui-c` 每次 apply 重渲染 `config.json` 并按内容比对决定是否重写（`engine::write_if_changed`），v3 的 `TUN_SCHEMA_VERSION` 随 v3 客户端脚本一起在 v4.0.0 删除。
+- 节点集合只有 `bui-schema::nodes::nodes_for` 一处实现，三种订阅与客户端渲染都从它取；改端口/标签/obfs 只改 `bui-schema`。
 - 凭据绝不能上命令行（`ps` 泄漏），curl 代理凭据走 `-K -`。
 - sing-box 配置要同时兼容 1.13 和 1.14，不用 `rule_set`。真实二进制（macOS arm64）在 `/private/tmp/claude-501/-Users-woo-Desktop-b-ui--claude-worktrees-bui-c-tun-mode-issue-df82e5/df6c5c3f-03e2-4ccb-b279-60c80612f9cf/scratchpad/sbbin/{1.12.0,1.13.0,1.14.0}/sing-box`，随时可能被清理。
-- 本地验证：`bash -n install.sh server/*.sh b-ui-client.sh && node --check web/server.js && node --check web/app.js`。
+- 本地验证：`cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`；shell 侧 `bash -n install.sh $(git ls-files -- scripts | grep -E '\.sh$') && bash scripts/tests/run-all.sh`。
 - 别用裸 `git stash`（stash 栈与其他会话共享）。
 - MCP：`gitnexus`、`plugin:github:github` 本会话连不上；GitHub 用 `gh` CLI。
 - Workflow 监视：我用零 token 的 `Monitor` 轮询 journal 计数；grep `rate_limit` 会被面板源码里的 `RATE_LIMIT` 常量误中，**判断是否真限流看 `"result": null` 的数量**。

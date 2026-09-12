@@ -1,3 +1,7 @@
+> 本文描述 v3.6 的住宅出口实现（`server/residential-helper.sh`，已于 v4.0.0 删除）。v4 的住宅模块设计见
+> `docs/superpowers/specs/2026-09-11-v4-architecture-design.md` §5 与 `docs/superpowers/specs/2026-09-11-residential-auto-blacklist-design.md`；
+> 供应商实测与选型见 `docs/superpowers/research/2026-09-11-static-residential-proxy-providers.md`。命令从 `residential-helper.sh …` 改为 `bui residential` 子命令与面板。
+
 # 住宅代理选购与配置指南
 
 > 本文核对日期 **2026-09-10**，表格里的参数格式、端口、超时值全部来自各供应商当时的官方文档。

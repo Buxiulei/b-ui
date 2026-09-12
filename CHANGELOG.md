@@ -2,9 +2,13 @@
 
 本项目的版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)：`MAJOR.MINOR.PATCH`。
 发布 tag 一律为 `v<version>`（例：`v4.0.0`），tag 推送即触发 GitHub Actions 构建并生成 Release 与 `manifest.json`。
-`version` 的唯一来源是根 `Cargo.toml` 的 `[workspace.package] version`；改版本必须同时在本文件加一段，`scripts/release/check-version.sh` 会在 CI 里卡住不一致。
+预发布走 `v<version>-rcN`（例：`v4.0.0-rc1` / `v4.0.0-rc2`）：`release.yml` 对 `-rcN` 标签置 `prerelease=true`，
+而 `manifest.json` 的 `version` 按总纲 C4 必须是纯 semver，所以 rc1 / rc2 / 正式版共用本文件里**同一段**，
+不为 rc 单独开段——rc 之间的差异补进该段的条目里。
+`version` 的唯一来源是根 `Cargo.toml` 的 `[workspace.package] version`；改版本必须同时在本文件加一段，`scripts/release/check-version.sh` 会在 CI 里卡住不一致（它只认 `## [<version>]` 这个标题，日期不参与校验）。
+未发布的版本日期写「未发布」，由主理人打 tag 发版时替换成当天日期（UTC）。
 
-## [4.0.0] - 2026-09-18
+## [4.0.0] - 未发布
 
 v4 是一次完全重写：控制面与 Linux 客户端改为 Rust 单二进制，协议内核（Xray / hysteria / sing-box / Caddy）保持不变。
 端口、标签、UUID、密码与 v3 完全一致，**现有订阅者无需重新导入**。
@@ -24,7 +28,7 @@ v4 是一次完全重写：控制面与 Linux 客户端改为 Rust 单二进制�
 - 定时任务全部收进守护进程：不再有 cron 行，也不再有 `hy2-watchdog` / `b-ui-resi-health` 等独立 timer。
 
 ### 移除
-- v3 的 shell 与 Node 实现：`server/*.sh`、`web/server.js`、`b-ui-client.sh`、`b-ui-server.sh`、`version.json`。
+- v3 的 shell 与 Node 实现：`server/*.sh`（5 个）、`web/server.js`、`web/{package.json,package-lock.json,node_modules/}`、`b-ui-client.sh`、`b-ui-server.sh`、`version.json`、`test-hy2-tun-config.json`。前端三文件 `web/{index.html,app.js,style.css}` 保留，由 `bui` 内嵌。
 - `update.sh` 的 25 个迁移块（重装即对账，迁移逻辑不再需要）。
 - VLESS-WS-TLS「免流」节点与 `speedLimit` 字段（内核不支持按用户限速）。
 - 客户端的三引擎互斥、死菜单簇、gum/fzf 依赖。
