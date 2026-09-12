@@ -45,12 +45,26 @@ pub struct RoundOutcome {
 pub struct MemberProbe {
     pub ok: bool,
     pub auth_failed: bool,
+    /// 经该上游还能不能正常用 Google 搜索（`None` = 本轮没探到结论）。
+    /// 主理人硬要求「住宅上游不封 Google」，所以它参与选路（R2 ②）
+    pub google_ok: Option<bool>,
 }
 
-/// 单成员一轮探测：对 [`HEALTH_PROBE_URL`] 最多 [`HEALTH_TRIES`] 次，任一成功即本轮健康。
+/// 单成员一轮探测：可达性（[`HEALTH_PROBE_URL`]）+ Google 可达性各一轮。
+pub fn probe_member(p: &dyn Prober, up: &Upstream) -> MemberProbe {
+    let mut probe = probe_reachable(p, up);
+    // R2 ②：每轮额外经该上游打一次真实 Google 搜索。凭据失效时不打——每条连接都会
+    // 被拒，探不出任何关于 Google 的结论，只会白等 GOOGLE_PROBE_TIMEOUT_SECS。
+    if !probe.auth_failed {
+        probe.google_ok = proxy::google_ok_of(&p.google_search(up));
+    }
+    probe
+}
+
+/// 可达性那一半：对 [`HEALTH_PROBE_URL`] 最多 [`HEALTH_TRIES`] 次，任一成功即本轮健康。
 /// **407 / SOCKS5 认证被拒一律算不健康**（调研 §D：凭据失效的上游会把每条连接都拒掉，
 /// 它「可达」但不可用），并且立刻停止重试。
-pub fn probe_member(p: &dyn Prober, up: &Upstream) -> MemberProbe {
+fn probe_reachable(p: &dyn Prober, up: &Upstream) -> MemberProbe {
     for _ in 0..HEALTH_TRIES {
         match p.get(up, HEALTH_PROBE_URL) {
             // generate_204 正常回 204；任何 2xx/3xx 都说明隧道通了
@@ -58,6 +72,7 @@ pub fn probe_member(p: &dyn Prober, up: &Upstream) -> MemberProbe {
                 return MemberProbe {
                     ok: true,
                     auth_failed: false,
+                    google_ok: None,
                 }
             }
             // 调研 §D：407 的上游「可达」但每条连接都被拒 —— 一律不健康，且不必再试
@@ -65,6 +80,7 @@ pub fn probe_member(p: &dyn Prober, up: &Upstream) -> MemberProbe {
                 return MemberProbe {
                     ok: false,
                     auth_failed: true,
+                    google_ok: None,
                 }
             }
             _ => {}
@@ -78,6 +94,7 @@ pub fn probe_member(p: &dyn Prober, up: &Upstream) -> MemberProbe {
     MemberProbe {
         ok: false,
         auth_failed,
+        google_ok: None,
     }
 }
 
@@ -86,27 +103,36 @@ pub fn ids_of(g: &ResidentialGroup) -> Vec<Uuid> {
     g.upstreams.iter().map(|u| u.id).collect()
 }
 
-/// 切换目标：健康成员里 `priority` 最小者；同优先级按近 24h 成功率降序；再同按池内下标升序（稳定）。
-/// 进出都是 **uuid**（契约决策 §C：运行时主键不用位置键 tag）
+/// 切换目标。排序键依次是：**「Google 通」优先**（R2 ②，封 Google 的上游对主理人等于
+/// 不可用）→ `priority` 最小 → 近 24h 成功率降序 → 池内下标升序（稳定）。
+/// 管理员手动锁定的上游（`r.manual_selected_id`）只要还在池里且健康就**直接返回**，
+/// 不吃任何排序键（R2 ①）。进出都是 **uuid**（契约决策 §C：运行时主键不用位置键 tag）
 pub fn pick_target(
     g: &ResidentialGroup,
     r: &ResiRuntime,
     healthy: &[Uuid],
     now: OffsetDateTime,
 ) -> Option<Uuid> {
-    let mut cands: Vec<(u32, i64, usize, Uuid)> = healthy
+    // 手动锁定压过一切：管理员按了「切到这条」，巡检不许因为别人 priority 更好就抢走。
+    // 不在池里（删上游的残留）或已不健康时才落回自动排序，由调用方顺带清空锁定。
+    if let Some(m) = r.manual_selected_id {
+        if healthy.contains(&m) && g.upstreams.iter().any(|u| u.id == m) {
+            return Some(m);
+        }
+    }
+    let mut cands: Vec<(u8, u32, i64, usize, Uuid)> = healthy
         .iter()
         .filter_map(|id| {
             // 不在当前池里的 uuid 直接忽略（删上游与巡检并发时会出现）
             let idx = g.upstreams.iter().position(|u| u.id == *id)?;
-            let rate = r
-                .health
-                .get(&id.to_string())
-                .map(|h| state::success_rate_24h(h, now))
-                .unwrap_or(0.0);
+            let h = r.health.get(&id.to_string());
+            let rate = h.map(|h| state::success_rate_24h(h, now)).unwrap_or(0.0);
+            // 「未知」与「封了」一起排在「通」之后：没探到结论不该凭空赢过探过的成员
+            let google_rank = u8::from(h.and_then(|h| h.google_ok) != Some(true));
             // 成功率降序 = 放大后取负（f64 不能直接排序，也不想引 total_cmp 的歧义）；
-            // 第三项 idx 让同优先级同成功率时按池内下标稳定排序
+            // 第四项 idx 让前面全同时按池内下标稳定排序
             Some((
+                google_rank,
                 g.upstreams[idx].priority,
                 -((rate * 1_000_000.0) as i64),
                 idx,
@@ -115,7 +141,7 @@ pub fn pick_target(
         })
         .collect();
     cands.sort();
-    cands.into_iter().next().map(|(_, _, _, id)| id)
+    cands.into_iter().next().map(|(_, _, _, _, id)| id)
 }
 
 /// 一轮完整巡检（spec §5.3 的全部规则）：自己取「本轮开始时的成员集快照」再转调 [`check_round`]
@@ -156,6 +182,8 @@ pub async fn check_round(
     // 话，删掉一条上游后位置名会被新条目复用，新上游就顶着上一个账号的 407 告警
     let mut auth_alerts: Vec<(Uuid, String)> = Vec::new();
     let mut probed: Vec<(Uuid, bool)> = Vec::new();
+    // 本轮探到的 Google 结论（`None` = 没探到，写回时不动上次的结论）
+    let mut googles: Vec<(Uuid, Option<bool>)> = Vec::new();
     for (i, up) in ups.iter().enumerate() {
         let probe = results.get(i).copied().flatten();
         let ok = probe.map(|x| x.ok).unwrap_or(false);
@@ -176,12 +204,14 @@ pub async fn check_round(
         }
         out.probed.push((tags[i].clone(), ok));
         probed.push((up.id, ok));
+        googles.push((up.id, probe.and_then(|x| x.google_ok)));
     }
 
-    // 规则 3：迟滞 + 24h 样本。**一轮只写一次 runtime**：每次 update 都是
+    // 规则 3：迟滞 + 24h 样本 + Google 判定。**一轮只写一次 runtime**：每次 update 都是
     // tmp + fsync + rename，按成员各写一次等于一轮 N 次落盘。凭据失效告警的写入与
     // 「成功即清」也并进这一次写（下面各分支不再重复落它）。
     let samples = probed.clone();
+    let verdicts = googles.clone();
     let rt = state::update(&ctx.runtime, move |r| {
         for (id, ok) in samples {
             let h = r.health.entry(id.to_string()).or_default();
@@ -194,6 +224,10 @@ pub async fn check_round(
         }
         for (id, msg) in auth_alerts {
             state::set_upstream_alert(r, id, msg);
+        }
+        for (id, google) in verdicts {
+            let h = r.health.entry(id.to_string()).or_default();
+            state::record_google(h, google, now);
         }
     })
     .await;
@@ -332,6 +366,10 @@ pub async fn check_round(
     }
 
     // 规则 10/11：切换
+    // 切到的不是手动锁定的那条 ⇒ 锁定目标已不健康（否则 pick_target 会直接返回它），
+    // 解除锁定，别锁着一条坏上游不放（R2 ①）。切到的**就是**锁定目标时（规则 6a 的
+    // runtime 选择另有其人、已不健康）这一轮正是在把锁定目标放回去，锁必须留着。
+    let manual_dropped = rt.manual_selected_id.filter(|m| *m != target_id);
     let (cc, t2) = (c.clone(), target_tag.clone());
     match tokio::task::spawn_blocking(move || cc.select(&t2)).await? {
         Ok(()) => {
@@ -340,9 +378,18 @@ pub async fn check_round(
                 r.selected_upstream_id = Some(target_id);
                 r.last_switch_at = Some(fmt_rfc3339(now));
                 r.selected_pending_persist = pending;
+                if manual_dropped.is_some() {
+                    r.manual_selected_id = None;
+                }
             })
             .await;
             tracing::info!(from = %sel_tag, to = %target_tag, "住宅出口切换");
+            if let Some(m) = manual_dropped {
+                tracing::info!(manual = %m, to = %target_tag, "手动锁定的出口已不健康，自动切换并解除锁定");
+                out.notes.push(format!(
+                    "手动锁定的出口已不健康，已自动切到 {target_tag} 并解除手动锁定"
+                ));
+            }
             out.switched_to = Some(target_tag);
         }
         Err(e) => {
@@ -416,7 +463,8 @@ pub async fn replay_loop(
     }
 }
 
-/// 管理员手动切换（`POST /api/residential/select`）：只走 Clash API，不写 state（契约决策 §C）
+/// 管理员手动切换（`POST /api/residential/select`）：只走 Clash API，不写 state（契约决策 §C），
+/// 并**锁定**到这条上游，直到它不健康（R2 ①）——否则下一轮巡检按 priority 就把它换走了。
 pub async fn select_manual(ctx: &DaemonCtx, c: Arc<dyn Clash>, id: Uuid) -> anyhow::Result<String> {
     let g = state::group_of(&*ctx.store.read().await);
     let tag = clash::tag_of(&g, id).ok_or_else(|| anyhow::anyhow!("上游不在当前池里"))?;
@@ -426,11 +474,19 @@ pub async fn select_manual(ctx: &DaemonCtx, c: Arc<dyn Clash>, id: Uuid) -> anyh
     let pending = Some(id) != g.selected_upstream_id;
     state::update(&ctx.runtime, move |r| {
         r.selected_upstream_id = Some(id);
+        r.manual_selected_id = Some(id);
         r.last_switch_at = Some(fmt_rfc3339(now));
         r.selected_pending_persist = pending;
     })
     .await;
     Ok(tag)
+}
+
+/// 解除手动锁定（`POST /api/residential/select {"auto":true}` / `bui residential select --auto`）：
+/// 只清锁定位，**不动** relay 的当前选择 —— 下一轮巡检自己按 Google / priority 重新挑，
+/// 免得一按「自动」就无谓地掐一次连接。
+pub async fn select_auto(ctx: &DaemonCtx) {
+    state::update(&ctx.runtime, |r| r.manual_selected_id = None).await;
 }
 
 #[cfg(test)]
@@ -493,6 +549,8 @@ mod tests {
     struct ByHost {
         bad: std::collections::BTreeSet<String>,
         auth_failed: std::collections::BTreeSet<String>,
+        /// 经这些上游打 Google 搜索回 403（调研 §D 的 Bright Data 形态）
+        google_blocked: std::collections::BTreeSet<String>,
     }
     impl Prober for ByHost {
         fn connect(
@@ -518,6 +576,21 @@ mod tests {
                 body: String::new(),
             })
         }
+        fn google_search(&self, up: &Upstream) -> Result<HttpProbe, ProbeError> {
+            if self.auth_failed.contains(&up.host) {
+                return Err(ProbeError::AuthFailed);
+            }
+            if self.google_blocked.contains(&up.host) {
+                return Ok(HttpProbe {
+                    status: 403,
+                    body: "403 Forbidden serp domain".into(),
+                });
+            }
+            Ok(HttpProbe {
+                status: 200,
+                body: "<html>weather results".into(),
+            })
+        }
         fn udp_associate(&self, _u: &Upstream) -> Result<bool, ProbeError> {
             Ok(true)
         }
@@ -526,9 +599,17 @@ mod tests {
         }
     }
     fn by_host(bad: &[&str], auth_failed: &[&str]) -> Arc<dyn Prober> {
+        by_host_with_google(bad, auth_failed, &[])
+    }
+    fn by_host_with_google(
+        bad: &[&str],
+        auth_failed: &[&str],
+        google_blocked: &[&str],
+    ) -> Arc<dyn Prober> {
         Arc::new(ByHost {
             bad: bad.iter().map(|s| s.to_string()).collect(),
             auth_failed: auth_failed.iter().map(|s| s.to_string()).collect(),
+            google_blocked: google_blocked.iter().map(|s| s.to_string()).collect(),
         })
     }
 
@@ -734,6 +815,9 @@ mod tests {
                 // 隧道建立阶段就失败了，reqwest 给的就是这种不带线索的错误
                 Err(ProbeError::Unreachable("error trying to connect".into()))
             }
+            fn google_search(&self, _up: &Upstream) -> Result<HttpProbe, ProbeError> {
+                Err(ProbeError::Unreachable("error trying to connect".into()))
+            }
             fn udp_associate(&self, _u: &Upstream) -> Result<bool, ProbeError> {
                 Ok(true)
             }
@@ -835,6 +919,184 @@ mod tests {
         host.advance(120);
         let out2 = check_round(&c, p, clash.clone(), ids).await.unwrap();
         assert_eq!(out2.switched_to.as_deref(), Some("resi-2"));
+    }
+
+    #[tokio::test]
+    async fn a_manual_selection_stays_locked_until_it_goes_unhealthy() {
+        // R2 ①：手动切到 priority 更差的 resi-2 后，下一轮巡检不许按 priority 把它抢回
+        // resi-1（以前只有 Clash API 生效、runtime 没有锁定位，池一动就回到优先级排序）
+        let d = tempfile::tempdir().unwrap();
+        let (c, host) = ctx(&d, &[5, 20]).await;
+        let clash = Arc::new(FakeClash::new(Some("resi-1")));
+        select_manual(&c, clash.clone(), Uuid::from_u128(2))
+            .await
+            .unwrap();
+        assert_eq!(
+            rstate::read(&c.runtime).await.manual_selected_id,
+            Some(Uuid::from_u128(2)),
+            "手动切换要在 runtime 里留下锁定位"
+        );
+        host.advance(120);
+        let out = check_once(&c, by_host(&[], &[]), clash.clone())
+            .await
+            .unwrap();
+        assert_eq!(out.switched_to, None);
+        assert_eq!(
+            clash.selected().as_deref(),
+            Some("resi-2"),
+            "两条都健康时 priority 5 也抢不走手动锁定的 resi-2"
+        );
+        // 手动目标连续两轮不达标 ⇒ 自动切走并**解除**锁定（否则锁着一条坏上游不放）
+        let p = by_host(&["isp2.example.net"], &[]);
+        check_once(&c, p.clone(), clash.clone()).await.unwrap();
+        host.advance(120);
+        let out = check_once(&c, p, clash.clone()).await.unwrap();
+        assert_eq!(out.switched_to.as_deref(), Some("resi-1"));
+        assert!(
+            out.notes.iter().any(|n| n.contains("手动")),
+            "要说清是手动锁定失效后才切的：{:?}",
+            out.notes
+        );
+        assert_eq!(
+            rstate::read(&c.runtime).await.manual_selected_id,
+            None,
+            "手动目标不健康 ⇒ 清空锁定，下一轮回到自动选路"
+        );
+    }
+
+    #[tokio::test]
+    async fn switching_back_onto_the_locked_upstream_keeps_the_lock() {
+        // runtime 记的当前出口（resi-1）不健康，而手动锁定的 resi-2 还健康：这一轮是
+        // 把锁定目标放回去，锁**不能**跟着解除（解了下一轮 priority 5 就抢走了）
+        let d = tempfile::tempdir().unwrap();
+        let (c, host) = ctx(&d, &[5, 20]).await;
+        let clash = Arc::new(FakeClash::new(Some("resi-1")));
+        rstate::update(&c.runtime, |r| {
+            r.selected_upstream_id = Some(Uuid::from_u128(1));
+            r.manual_selected_id = Some(Uuid::from_u128(2));
+        })
+        .await;
+        let p = by_host(&["isp1.example.net"], &[]);
+        check_once(&c, p.clone(), clash.clone()).await.unwrap();
+        host.advance(120);
+        let out = check_once(&c, p, clash.clone()).await.unwrap();
+        assert_eq!(out.switched_to.as_deref(), Some("resi-2"));
+        assert!(
+            !out.notes.iter().any(|n| n.contains("解除手动锁定")),
+            "这不是「锁定目标失效」：{:?}",
+            out.notes
+        );
+        assert_eq!(
+            rstate::read(&c.runtime).await.manual_selected_id,
+            Some(Uuid::from_u128(2)),
+            "切到的就是锁定目标 ⇒ 锁留着"
+        );
+    }
+
+    #[tokio::test]
+    async fn select_auto_releases_the_manual_lock() {
+        let d = tempfile::tempdir().unwrap();
+        let (c, _h) = ctx(&d, &[5, 20]).await;
+        let clash = Arc::new(FakeClash::new(Some("resi-1")));
+        select_manual(&c, clash.clone(), Uuid::from_u128(2))
+            .await
+            .unwrap();
+        select_auto(&c).await;
+        assert_eq!(rstate::read(&c.runtime).await.manual_selected_id, None);
+        assert_eq!(
+            clash.selected().as_deref(),
+            Some("resi-2"),
+            "解锁只清锁定位，不动 relay 当前选择（下一轮自己按选路规则挑）"
+        );
+        // 解锁后 priority 重新说话
+        let out = check_once(&c, by_host(&["isp2.example.net"], &[]), clash.clone())
+            .await
+            .unwrap();
+        assert_eq!(out.switched_to, None, "第 1 轮失败还在迟滞里");
+    }
+
+    #[tokio::test]
+    async fn the_round_records_google_reachability_and_routes_around_a_blocked_upstream() {
+        // R2 ②：主理人硬要求「住宅上游不封 Google」。resi-2 的 priority 最好但对
+        // www.google.com 回 403 `Forbidden serp domain`（Bright Data 形态），
+        // 所以当前出口 resi-1 挂掉时必须切到 Google 能用的 resi-3。
+        let d = tempfile::tempdir().unwrap();
+        let (c, host) = ctx(&d, &[10, 5, 20]).await;
+        let clash = Arc::new(FakeClash::new(Some("resi-1")));
+        let p = by_host_with_google(&["isp1.example.net"], &[], &["isp2.example.net"]);
+        check_once(&c, p.clone(), clash.clone()).await.unwrap();
+        host.advance(120);
+        let out = check_once(&c, p, clash.clone()).await.unwrap();
+        assert_eq!(
+            out.switched_to.as_deref(),
+            Some("resi-3"),
+            "封 Google 的 resi-2 即使 priority 5 也不选"
+        );
+        let r = rstate::read(&c.runtime).await;
+        let h2 = &r.health[&Uuid::from_u128(2).to_string()];
+        let h3 = &r.health[&Uuid::from_u128(3).to_string()];
+        assert_eq!(h2.google_ok, Some(false));
+        assert_eq!(h3.google_ok, Some(true));
+        assert!(
+            h2.google_at.is_some(),
+            "要记下判定时间，面板才知道是什么时候的"
+        );
+    }
+
+    #[test]
+    fn pick_target_prefers_an_upstream_that_can_still_use_google_and_honours_the_manual_lock() {
+        let mut g = rstate::group_of(&crate::modules::residential::sample_state_with_pool());
+        g.upstreams = vec![upstream(1, 5), upstream(2, 20)];
+        let now = time::macros::datetime!(2026-09-12 00:00:00 UTC);
+        let healthy = vec![Uuid::from_u128(1), Uuid::from_u128(2)];
+        // google[i] = 这条上游最近一轮的 Google 判定
+        let runtime = |google: [Option<bool>; 2], manual: Option<Uuid>| {
+            let mut r = ResiRuntime {
+                manual_selected_id: manual,
+                ..Default::default()
+            };
+            for (i, ok) in google.iter().enumerate() {
+                let mut h = rstate::HealthState::default();
+                rstate::record_google(&mut h, *ok, now);
+                r.health
+                    .insert(Uuid::from_u128(i as u128 + 1).to_string(), h);
+            }
+            r
+        };
+        // priority 5 的 u1 封了 Google ⇒ 让给 priority 20 但 Google 能用的 u2
+        assert_eq!(
+            pick_target(&g, &runtime([Some(false), Some(true)], None), &healthy, now),
+            Some(Uuid::from_u128(2)),
+            "「Google 通」排在 priority 之前"
+        );
+        // 都能用 Google ⇒ 回到 priority
+        assert_eq!(
+            pick_target(&g, &runtime([Some(true), Some(true)], None), &healthy, now),
+            Some(Uuid::from_u128(1))
+        );
+        // 「未知」不凭空赢过「通」
+        assert_eq!(
+            pick_target(&g, &runtime([None, Some(true)], None), &healthy, now),
+            Some(Uuid::from_u128(2))
+        );
+        // 手动锁定压过 priority 与 Google 两个排序键：这里锁的正是两项都更差的 u2
+        let locked = runtime([Some(true), Some(true)], Some(Uuid::from_u128(2)));
+        assert_eq!(
+            pick_target(&g, &locked, &healthy, now),
+            Some(Uuid::from_u128(2)),
+            "手动锁定的出口不许被 priority 抢走"
+        );
+        // 手动目标不健康 ⇒ 锁定不生效，回到自动排序
+        assert_eq!(
+            pick_target(&g, &locked, &[Uuid::from_u128(1)], now),
+            Some(Uuid::from_u128(1))
+        );
+        // 手动目标已不在池里（删上游的残留）⇒ 同样忽略
+        let dangling = runtime([Some(true), Some(true)], Some(Uuid::from_u128(99)));
+        assert_eq!(
+            pick_target(&g, &dangling, &healthy, now),
+            Some(Uuid::from_u128(1))
+        );
     }
 
     #[test]

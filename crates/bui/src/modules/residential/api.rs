@@ -78,7 +78,12 @@ pub struct CheckRequest {
 /// `status` 里的 `resi-2` 敲也得认，否则只能拿到 serde 的「invalid character」
 #[derive(Debug, Deserialize)]
 pub struct SelectRequest {
-    pub id: String,
+    /// 切到这条上游并**锁定**到它不健康为止（R2 ①）
+    #[serde(default)]
+    pub id: Option<String>,
+    /// `true` = 解除手动锁定，回到自动选路（与 `bui residential select --auto` 同义）
+    #[serde(default)]
+    pub auto: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -181,6 +186,10 @@ pub struct UpstreamRow {
     pub region: Option<String>,
     pub ports_allowed: Option<Vec<u16>>,
     pub verified: Option<bui_schema::model::Verified>,
+    /// 经这条上游还能不能正常用 Google 搜索（最近一轮巡检的结论，`None` = 未知）。
+    /// 主理人硬要求「住宅上游不封 Google」，面板要能一眼看出是哪条封了（R2 ②）
+    pub google_ok: Option<bool>,
+    pub google_at: Option<String>,
     /// **只数这一条上游自己的 `auto` 条目**（`auto[].upstream_id == id`），一律经
     /// [`auto_count`]。**不含 `pins`**：pins 是全局强制直连规则，不属于任何上游，
     /// 计进去会让面板上每个上游都凭空多出 `pins.len()` 条。全局计数看
@@ -246,6 +255,12 @@ pub struct MemberRow {
     pub blacklist_count: usize,
     /// 最近一次巡检样本的结果（`None` = 还没探过）
     pub probe_ok: Option<bool>,
+    /// 管理员手动锁定在这条上游（`runtime.manual_selected_id`，R2 ①）：
+    /// 巡检不会因为别的成员 priority 更好就把它切走
+    pub manual_locked: bool,
+    /// 与 [`UpstreamRow::google_ok`] 同源（都读 `runtime.health[<id>]`，R2 ②）
+    pub google_ok: Option<bool>,
+    pub google_at: Option<String>,
     pub upstream_id: Uuid,
 }
 
@@ -540,6 +555,12 @@ pub fn status_of(s: &SchemaState, r: &state::ResiRuntime) -> StatusResponse {
             region: u.region.clone(),
             ports_allowed: u.ports_allowed.clone(),
             verified: u.verified.clone(),
+            // health 与 status 读同一处（runtime.health 以 uuid 为键，契约决策 §C）
+            google_ok: r.health.get(&u.id.to_string()).and_then(|h| h.google_ok),
+            google_at: r
+                .health
+                .get(&u.id.to_string())
+                .and_then(|h| h.google_at.clone()),
             blacklist_count: auto_count(&g, u.id),
             check: r.checks.get(&u.id.to_string()).cloned(),
         })
@@ -900,6 +921,9 @@ async fn get_health(State(app): State<AppState>) -> ApiResult {
             // 与 status_of 的 UpstreamRow 同一个函数：面板上是同一个数字
             blacklist_count: auto_count(&g, u.id),
             probe_ok: h.samples.last().map(|x| x.ok),
+            manual_locked: r.manual_selected_id == Some(u.id),
+            google_ok: h.google_ok,
+            google_at: h.google_at.clone(),
             upstream_id: u.id,
         });
         resp.urls.push(HealthUrlRow {
@@ -1016,22 +1040,31 @@ async fn post_check(
         .into_response())
 }
 
-/// `POST /api/residential/select`（手动切当前出口，只走 Clash API，不写 state）
+/// `POST /api/residential/select`（手动切当前出口，只走 Clash API，不写 state）。
+/// `{"auto": true}` = 解除手动锁定，回到自动选路（R2 ①）。
 async fn post_select(
     State(app): State<AppState>,
     Extension(d): Extension<Deps>,
     Json(b): Json<SelectRequest>,
 ) -> ApiResult {
+    let ctx = ctx_of(&app, &d.paths);
+    if b.auto {
+        health::select_auto(&ctx).await;
+        return Ok(Json(serde_json::json!({ "success": true, "auto": true })).into_response());
+    }
+    // 空载荷不当成解锁：那是笔误，解锁得明确写 `{"auto": true}`
+    let raw = b
+        .id
+        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "id 或 auto 字段必填"))?;
     // 定位与 404 都归 resolve_upstream：它认 uuid / resi-N / url-N / host:port，
     // 并且只返回池内的 id（select_manual 只会返回 anyhow::Error，没有类型可匹配）
     let g = state::group_of(&*app.store.read().await);
-    let id = upstream::resolve_upstream(&g, &b.id).map_err(map_upstream_err)?;
-    let ctx = ctx_of(&app, &d.paths);
+    let id = upstream::resolve_upstream(&g, &raw).map_err(map_upstream_err)?;
     let tag = health::select_manual(&ctx, d.clash.clone(), id)
         .await
         // 走到这里只剩「Clash API 调用失败」一种可能（池内判据已预检过）
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(Json(serde_json::json!({ "success": true, "tag": tag })).into_response())
+    Ok(Json(serde_json::json!({ "success": true, "tag": tag, "manual": true })).into_response())
 }
 
 async fn post_priority(
@@ -1780,39 +1813,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_and_health_only_show_alerts_of_upstreams_still_in_the_pool() {
+    async fn select_locks_manually_until_select_auto_releases_it_and_google_shows_up() {
         let d = tempfile::tempdir().unwrap();
         let h = harness(&d).await;
         let id = rstate::group_of(&*h.ctx.store.read().await).upstreams[0].id;
+        let (st, v) = call(
+            &h.app,
+            "POST",
+            "/api/residential/select",
+            Some(serde_json::json!({"id": id})),
+        )
+        .await;
+        assert_eq!((st, v["tag"].clone()), (StatusCode::OK, "resi-1".into()));
+        assert_eq!(
+            rstate::read(&h.ctx.runtime).await.manual_selected_id,
+            Some(id),
+            "手动切换要锁定到失效为止（R2 ①）"
+        );
+        // 巡检记下的 Google 判定要在 health / status 都看得见（R2 ②）
+        let now = h.ctx.host.now();
         rstate::update(&h.ctx.runtime, |r| {
-            rstate::push_alert(r, "全部住宅上游探测不达标，出口已降级但未切换");
-            rstate::set_upstream_alert(r, id, "上游 isp.example.net:10007 凭据失效（407）");
-            // 已被删掉的上游（新条目会复用它的 url-N 名字）留下的告警
-            rstate::set_upstream_alert(
-                r,
-                Uuid::from_u128(0xdead),
-                "上游 old.example.net:10007 凭据失效（407）",
-            );
+            let hs = r.health.entry(id.to_string()).or_default();
+            rstate::record_google(hs, Some(false), now);
         })
         .await;
-        for uri in ["/api/residential/status", "/api/residential/health"] {
-            let (st, v) = call(&h.app, "GET", uri, None).await;
-            assert_eq!(st, StatusCode::OK);
-            let alerts = v["alerts"].as_array().unwrap();
-            assert_eq!(alerts.len(), 2, "{uri}: {v}");
-            assert!(
-                alerts
-                    .iter()
-                    .any(|a| a.as_str().unwrap().contains("isp.example.net:10007")),
-                "{uri}: 文案用 host:port"
-            );
-            assert!(
-                !alerts
-                    .iter()
-                    .any(|a| a.as_str().unwrap().contains("old.example.net")),
-                "{uri}: 已移除的上游不该继续刷屏：{v}"
-            );
-        }
+        let (_, hv) = call(&h.app, "GET", "/api/residential/health", None).await;
+        assert_eq!(hv["members"][0]["manual_locked"], true);
+        assert_eq!(hv["members"][0]["google_ok"], false);
+        assert!(hv["members"][0]["google_at"].is_string());
+        let (_, sv) = call(&h.app, "GET", "/api/residential/status", None).await;
+        assert_eq!(sv["upstreams"][0]["google_ok"], false);
+        // `{"auto": true}` = 解除锁定
+        let (st, v) = call(
+            &h.app,
+            "POST",
+            "/api/residential/select",
+            Some(serde_json::json!({"auto": true})),
+        )
+        .await;
+        assert_eq!((st, v["auto"].clone()), (StatusCode::OK, true.into()));
+        assert_eq!(rstate::read(&h.ctx.runtime).await.manual_selected_id, None);
+        let (_, hv) = call(&h.app, "GET", "/api/residential/health", None).await;
+        assert_eq!(hv["members"][0]["manual_locked"], false);
+        // 既没 id 也没 auto ⇒ 400（别静默当成解锁）
+        let (st, _) = call(
+            &h.app,
+            "POST",
+            "/api/residential/select",
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

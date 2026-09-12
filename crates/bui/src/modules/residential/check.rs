@@ -63,6 +63,10 @@ pub struct CheckReport {
     pub sources: BTreeMap<String, String>,
     /// Google 搜索页是否落到 `/sorry/`；`None` = 没探到结论
     pub google_sorry: Option<bool>,
+    /// 经该上游还能不能正常用 Google 搜索（浏览器 UA 的真实搜索请求，R2 ②）；
+    /// `None` = 没探到结论。与 `google_sorry` 分开：那一项走普通 `get`（无 UA），
+    /// 看不出 Bright Data 这类上游对 serp 域名的整域硬拒
+    pub google_ok: Option<bool>,
     pub ai: BTreeMap<String, bool>,
     pub payments: BTreeMap<String, bool>,
     /// 端口 → `ConnectVerdict::label()`
@@ -357,6 +361,22 @@ pub async fn run(p: Arc<dyn Prober>, up: &Upstream, now: OffsetDateTime) -> Chec
         auth_failed = true;
     }
 
+    // ②b Google 可达性（R2 ②）：浏览器 UA 的真实搜索请求，判据与巡检同一份
+    // （`proxy::google_ok_of`）。单独一次 `spawn_blocking`：它与上面四个 GET 的
+    // 超时不同（GOOGLE_PROBE_TIMEOUT_SECS），塞进同一个 fanout 会混淆判据来源。
+    let (pp, u2) = (p.clone(), up.clone());
+    let google = tokio::task::spawn_blocking(move || pp.google_search(&u2)).await;
+    let google_ok = match &google {
+        Ok(r) => {
+            if matches!(r, Err(ProbeError::AuthFailed)) {
+                auth_failed = true;
+            }
+            super::proxy::google_ok_of(r)
+        }
+        // 探测任务 panic：没结论
+        Err(_) => None,
+    };
+
     // ③ AI 与支付可达性：CONNECT 到 443 即算可达（TLS 之后的业务码不是我们的判据）
     let hosts: Vec<String> = AI_HOSTS
         .iter()
@@ -429,6 +449,7 @@ pub async fn run(p: Arc<dyn Prober>, up: &Upstream, now: OffsetDateTime) -> Chec
         exit,
         sources,
         google_sorry,
+        google_ok,
         ai,
         payments,
         ports,
@@ -840,6 +861,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_report_carries_the_google_verdict() {
+        // R2 ②：体检要能回答「这条上游封不封 Google」——Bright Data 对 serp 域名
+        // 整域 403，只看 google_sorry（走 `get`）看不出来
+        let p = std::sync::Arc::new(FakeProber::new());
+        p.with(|i| {
+            i.google = Some(Ok(HttpProbe {
+                status: 403,
+                body: "403 Forbidden serp domain".into(),
+            }))
+        });
+        let r = run(p.clone(), &up(), t0()).await;
+        assert_eq!(r.google_ok, Some(false));
+        assert!(
+            p.calls().iter().any(|c| c == "google"),
+            "体检必须真打一次搜索请求：{:?}",
+            p.calls()
+        );
+        let p2 = std::sync::Arc::new(FakeProber::new());
+        p2.with(|i| {
+            i.google = Some(Ok(HttpProbe {
+                status: 200,
+                body: "<html>weather results".into(),
+            }))
+        });
+        assert_eq!(run(p2, &up(), t0()).await.google_ok, Some(true));
+        // 探不到就是未知（缺省的 FakeProber 不给 google）
+        assert_eq!(
+            run(std::sync::Arc::new(FakeProber::new()), &up(), t0())
+                .await
+                .google_ok,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_google_probe_that_fails_auth_marks_the_round_untrustworthy() {
+        let p = std::sync::Arc::new(FakeProber::new());
+        p.with(|i| i.google = Some(Err("__auth_failed__".into())));
+        let r = run(p, &up(), t0()).await;
+        assert!(r.auth_failed, "407 出现在哪一项都算整轮不可信");
+        assert_eq!(r.google_ok, None);
+        assert_eq!(r.ports_allowed, None);
+    }
+
+    #[tokio::test]
     async fn a_407_marks_the_whole_round_untrustworthy() {
         let p = std::sync::Arc::new(FakeProber::new());
         p.with(|i| {
@@ -900,6 +966,10 @@ mod tests {
             }
         }
         fn get(&self, _u: &Upstream, _url: &str) -> Result<HttpProbe, ProbeError> {
+            Err(ProbeError::Unreachable("no route".into()))
+        }
+        fn google_search(&self, _u: &Upstream) -> Result<HttpProbe, ProbeError> {
+            // 整域硬拒：CONNECT 到 www.google.com 就 403，GET 自然也到不了
             Err(ProbeError::Unreachable("no route".into()))
         }
         fn udp_associate(&self, _u: &Upstream) -> Result<bool, ProbeError> {
