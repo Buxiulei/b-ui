@@ -4,7 +4,7 @@
 #   snapshot --list  列出现有快照与年龄
 #   snapshot --prune 删掉 30 天以上的快照与清单
 #   restore          恢复 v3：停 v4 → 挪走 /opt/b-ui → 解包 → 删 v4 独有单元 → daemon-reload
-#                    → 起 v3 单元与定时器 → 回灌 cron → 核对 active
+#                    → 起 v3 单元与定时器 → 重建 CLI 符号链接 → 合并回灌 cron → 核对 active
 # 生产用法（root）：
 #   bash /opt/b-ui/ops/v3-cutover.sh snapshot
 #   bash /opt/b-ui/ops/v3-cutover.sh restore --from /var/backups/b-ui/v3-20260918T020000Z.tar.gz
@@ -36,9 +36,15 @@ V3_TIMER_UNITS="hy2-watchdog b-ui-cert-sync b-ui-resi-health"
 V4_ONLY_CANDIDATES="b-ui.service caddy.service"
 # v4 新增的常驻单元（总纲 C3），恢复 v3 前必须先停掉（它会把配置对账回 v4 期望态）
 V4_UNITS="b-ui"
+# CLI 入口符号链接所在目录与两个名字：v3 的 /usr/local/bin/b-ui 指向 /opt/b-ui/b-ui-cli.sh，
+# v4 install 把它改指 <base>/bin/bui 并另建 /usr/local/bin/bui（crates/bui/src/paths.rs 的
+# CLI_LINKS）。归档里没有 /usr/local/bin，只恢复 /opt/b-ui 的话 b-ui 会指着 v4 的路径悬空、
+# `sudo b-ui` 直接报错，所以快照逐条记下两个路径当时的指向（不存在记 absent），restore 照单重建。
+LINKDIR="/usr/local/bin"
+CLI_LINK_NAMES="b-ui bui"
 
 usage() {
-    printf '用法：\n  %s snapshot [--out <dir>] [--base <dir>] [--unit-dir <dir>] [--list] [--prune]\n  %s restore --from <v3-*.tar.gz> [--base <dir>] [--unit-dir <dir>]\n' "$0" "$0" >&2
+    printf '用法：\n  %s snapshot [--out <dir>] [--base <dir>] [--unit-dir <dir>] [--link-dir <dir>] [--list] [--prune]\n  %s restore --from <v3-*.tar.gz> [--base <dir>] [--unit-dir <dir>]\n' "$0" "$0" >&2
     exit 2
 }
 
@@ -53,7 +59,7 @@ v3_unit_files() {
 }
 
 do_snapshot() {
-    local ts snap man files=() present=() f u
+    local ts snap man files=() present=() f u t
     if [[ "$LIST" -eq 1 ]]; then
         [[ -d "$OUT" ]] || { printf '还没有任何快照：%s 不存在\n' "$OUT" >&2; exit 2; }
         while IFS= read -r f; do
@@ -87,6 +93,11 @@ do_snapshot() {
         done
         printf '# unitfiles\n'
         for f in ${present[@]+"${present[@]}"}; do printf '%s\n' "$f"; done
+        printf '# clilinks\n'
+        for u in $CLI_LINK_NAMES; do
+            t=$(readlink "$LINKDIR/$u" 2>/dev/null)
+            printf '%s %s\n' "$LINKDIR/$u" "${t:-absent}"
+        done
         printf '# crontab\n'
         crontab -l 2>/dev/null || printf '(空)\n'
     } > "$man"
@@ -105,6 +116,7 @@ do_snapshot() {
 
 do_restore() {
     local u st rc=0 members man moved cron timers=() f
+    local p t cur_t cur line merged added
     [[ -n "$FROM" && -f "$FROM" ]] || { printf '找不到快照：%s\n' "${FROM:-<未给 --from>}" >&2; exit 2; }
     log "开始恢复 v3：$FROM"
     members=$(tar -tzf "$FROM") || { printf '快照读不出内容（已损坏？）：%s\n' "$FROM" >&2; exit 2; }
@@ -147,19 +159,53 @@ do_restore() {
     done
     man="${FROM%.tar.gz}.manifest"
     if [[ -f "$man" ]]; then
+        # CLI 符号链接：照 # clilinks 段重建（absent 则删）。幂等——已经指对了就只报一句。
+        while read -r p t; do
+            [[ -n "$p" && -n "$t" ]] || continue
+            cur_t=$(readlink "$p" 2>/dev/null)
+            if [[ "$t" == "absent" ]]; then
+                # 只删符号链接：v4 装机时 b-ui/bui 都是 ln -s 出来的。万一是普通文件（不是
+                # 本脚本认识的形态）就只报警不删，免得吃掉别人的东西。
+                if [[ -L "$p" ]]; then
+                    rm -f "$p" && log "删除 $p（快照记它当时不存在）"
+                elif [[ -e "$p" ]]; then
+                    printf '跳过 %s：快照记它当时不存在，但现在是普通文件，未敢删\n' "$p" >&2
+                fi
+            elif [[ "$cur_t" == "$t" ]]; then
+                log "$p → $t 已经指对，跳过"
+            elif ln -sfn -- "$t" "$p"; then
+                log "重建 $p → $t"
+            else
+                printf '重建符号链接失败：%s → %s\n' "$p" "$t" >&2
+                rc=1
+            fi
+        done < <(awk '/^# clilinks$/{f=1;next} /^# /{f=0} f' "$man")
+        # cron：bui import-v3 只删含 /opt/b-ui/ 的行、别的项目的行留着，所以切换后 crontab
+        # 必然非空——不能「非空就跳过」，否则 v3 的三行永远回不来。按快照清单逐行幂等合并：
+        # 快照里有、当前没有逐字相同行的才补，已有的不重复，别人的行原样保留。
         cron=$(awk '/^# crontab$/{f=1;next} f&&!/^\(空\)$/' "$man")
-        if [[ -n "$(crontab -l 2>/dev/null)" ]]; then
-            log "crontab 非空，跳过回灌（现有内容保持不动）"
-        elif [[ -z "$cron" ]]; then
+        cur=$(crontab -l 2>/dev/null)
+        added=0
+        merged=""
+        [[ -z "$cur" ]] || merged="$cur"$'\n'
+        while IFS= read -r line; do
+            [[ -n "${line//[[:space:]]/}" ]] || continue
+            printf '%s\n' "$cur" | grep -qxF -- "$line" && continue
+            merged+="$line"$'\n'
+            added=$((added + 1))
+        done <<< "$cron"
+        if [[ -z "$cron" ]]; then
             log "清单里没有 cron 行，无需回灌"
-        elif printf '%s\n' "$cron" | crontab -; then
-            log "crontab 为空，已按清单回灌 $(printf '%s\n' "$cron" | wc -l) 行 v3 cron"
+        elif [[ "$added" -eq 0 ]]; then
+            log "清单里的 cron 行都已在 crontab 中，无需回灌"
+        elif printf '%s' "$merged" | crontab -; then
+            log "已按清单补齐 $added 行 v3 cron（现有 $(printf '%s\n' "$cur" | grep -c .) 行原样保留）"
         else
             printf '回灌 crontab 失败，请手工照 %s 的 # crontab 段恢复\n' "$man" >&2
             rc=1
         fi
     else
-        log "快照没有同名清单（${man##*/}），跳过 cron 回灌与单元核对基线"
+        log "快照没有同名清单（${man##*/}），跳过 cron 回灌、CLI 符号链接恢复与单元核对基线"
     fi
     for u in $V3_UNITS ${timers[@]+"${timers[@]}"}; do
         st=$(systemctl is-active "$u" 2>/dev/null)
@@ -186,6 +232,7 @@ while [[ $# -gt 0 ]]; do
         --out) OUT="${2:-}"; shift 2 ;;
         --base) BASE="${2:-}"; shift 2 ;;
         --unit-dir) UNITDIR="${2:-}"; shift 2 ;;
+        --link-dir) LINKDIR="${2:-}"; shift 2 ;;
         --from) FROM="${2:-}"; shift 2 ;;
         --list) LIST=1; shift ;;
         --prune) PRUNE=1; shift ;;
