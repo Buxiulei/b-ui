@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # b-ui v4 M3 机器化验收（spec §9 的 M3 行）。逐项判定四条判据：
 #   ① 加用户时内核 NRestarts / MainPID 不变，且在线会话不断
-#   ② 100MB 已知流量的计数误差 ±5%
+#   ② 已知字节数（下载源实报的 Content-Length）的流量计数误差 ±5%
 #   ③ 到期用户新登录被拒、既有连接被踢
 #   ④ 重启守护进程后计数不重复（不翻倍）
 #
@@ -10,7 +10,7 @@
 #
 # 选项：--admin-password-file <文件>  管理员密码（`ADMIN_PASSWORD=` 行或整行密码）；
 #                                    缺省读 <base>/v3-backup/admin.env
-#       --download-url <url>         100MB 下载源（缺省 speed.cloudflare.com）
+#       --download-url <url>         下载源（缺省按候选列表逐个 HEAD 探活取第一个可用的）
 #       --keep-url <url>             保活用的小文件（缺省同站 2KB）
 #       --base <目录>                缺省 /opt/b-ui
 # 环境变量：M3_ADD_WAIT / M3_FLUSH_WAIT / M3_STABLE_WAIT / M3_KICK_WAIT /
@@ -25,14 +25,28 @@ LC_ALL=C
 
 BASE=${BASE:-/opt/b-ui}
 ADMIN_PW_FILE=""
-DOWNLOAD_URL="https://speed.cloudflare.com/__down?bytes=104857600"
 KEEP_URL="https://speed.cloudflare.com/__down?bytes=2048"
 SELF_TEST=0
 
-# 判据 ② 的已知流量（缺省下载源恰好就是这个字节数）与容差
-EXPECT_BYTES=104857600
+# 判据 ② 的下载源：不写死一个站。真机 rick 实测（2026-09-13）
+# `https://speed.cloudflare.com/__down` 返 403（实收 1 字节）、OVH 的 100Mio 档 404，所以
+# 缺省改成一串候选，逐个 HEAD 探活取**第一个 200 且 Content-Length 已知**的那个。候选之间
+# 大小不保证一致（各站按 MB / Mb 命名的口径不同，随时也会换文件），所以判据 ② 的「已知
+# 字节数」一律取该源实报的 Content-Length，不写死 104857600。
+DOWNLOAD_CANDIDATES=(
+  "http://speedtest.tele2.net/100MB.zip"
+  "https://speed.hetzner.de/100MB.bin"
+  "https://proof.ovh.net/files/100Mb.dat"
+)
+# 非空 = `--download-url` 显式指定（只探它自己）；空 = 走候选列表
+DOWNLOAD_URL=""
+# 探活后填成选中源的 Content-Length；探活前没有可信值
+EXPECT_BYTES=0
+# 探活的逐个失败原因（全失败时进判据 ② 的 FAIL 文案）
+PROBE_DETAIL=""
 TOL_PCT=5
 DL_TIMEOUT=600
+HEAD_TIMEOUT=20
 
 # 判据 ① 看这三个内核单元；判据 ④ 重启的是守护进程
 KERNEL_UNITS="hysteria-server hysteria-residential xray"
@@ -382,6 +396,44 @@ download_via_socks() {
     -o /dev/null -w '%{size_download} %{http_code}' "$2" 2>/dev/null
 }
 
+# $1=url → 「<HTTP 状态码> <Content-Length，未知写 `-`>」。HEAD 直连本机出网（下载本身才
+# 走 socks），curl 起不来 / 没回状态行就报 `000 -`。跟随重定向，取最后一段的头。
+probe_download_head() {
+  local hdr code len
+  hdr=$(curl -s -L -I --max-time "$HEAD_TIMEOUT" "$1" 2>/dev/null)
+  code=$(printf '%s\n' "$hdr" |
+    awk '/^HTTP\//{c = $2} END {print (c == "") ? "000" : c}')
+  len=$(printf '%s\n' "$hdr" |
+    awk 'tolower($1) == "content-length:" {gsub(/\r/, "", $2); l = $2} END {print (l == "") ? "-" : l}')
+  printf '%s %s\n' "$code" "$len"
+}
+
+# 选定判据 ② 的下载源：显式 `--download-url` 只探它自己，否则按 DOWNLOAD_CANDIDATES 顺序
+# 取第一个「200 且 Content-Length 是正整数」的源。成功 ⇒ 设 DOWNLOAD_URL / EXPECT_BYTES 并
+# 回 0；全失败 ⇒ 回 1，逐个失败原因留在 PROBE_DETAIL。
+resolve_download_url() {
+  local url code len num
+  local -a cands
+  if [ -n "$DOWNLOAD_URL" ]; then
+    cands=("$DOWNLOAD_URL")
+  else
+    cands=("${DOWNLOAD_CANDIDATES[@]}")
+  fi
+  PROBE_DETAIL=""
+  for url in "${cands[@]}"; do
+    read -r code len < <(probe_download_head "$url")
+    num=$len
+    case "$num" in '' | *[!0-9]*) num=0 ;; esac
+    if [ "$code" = "200" ] && [ "$num" -gt 0 ]; then
+      DOWNLOAD_URL=$url
+      EXPECT_BYTES=$num
+      return 0
+    fi
+    PROBE_DETAIL="${PROBE_DETAIL:+$PROBE_DETAIL；}$url → HTTP $code、Content-Length $len"
+  done
+  return 1
+}
+
 # $1=用户名 → `$BASE/auth-hook.log` 里最近一条属于该用户的**判定结果**字段。
 # 格式是 `<RFC3339> <addr> <用户名> <结果>`（auth_hook.rs::log_line），到期与封禁分别记
 # `expired` / `blocked`。用它把「钩子把人拒了」和「服务端宕了/端口不通」区分开 —— 后者
@@ -600,7 +652,8 @@ check_add_user() {
   stop_client "$client"
 }
 
-# 判据 ②：100MB 已知流量的计数误差 ±5%。
+# 判据 ②：已知字节数的流量计数误差 ±5%。已知字节数来自下载源 HEAD 探活实报的
+# Content-Length（不写死 104857600 —— 候选源换了、或换成小一号的文件都不该让判据失真）。
 # 口径（以代码为准）：面板 `usage.total` = 上下行之和 —— `TxRx::total()` 是 `tx + rx`
 # （crates/bui/src/modules/panel/mod.rs:59），hysteria 的 tx 是「发给客户端」、rx 是
 # 「从客户端收到」的字节，所以一次纯下载 ≈ 100MB(tx) + 请求头/TLS 记录开销(rx)，
@@ -611,11 +664,18 @@ check_add_user() {
 check_traffic() {
   local t0 t1 socks cfg pid out size code dev
   if [ -z "$TMP_USER" ] || [ -z "$TMP_PASS" ]; then
-    skip "step2 100MB 计数误差（没有临时用户）"
+    skip "step2 已知字节数的计数误差（没有临时用户）"
     return
   fi
   if [ ! -x "$BASE/bin/hysteria" ]; then
-    skip "step2 100MB 计数误差（$BASE/bin/hysteria 不可执行）"
+    skip "step2 已知字节数的计数误差（$BASE/bin/hysteria 不可执行）"
+    return
+  fi
+  # 先定下载源：拿不到任何「200 + 已知 Content-Length」的源就没有可信的已知字节数，
+  # 判据 ② 直接 FAIL（不能拿写死的 100MB 顶）。
+  if ! resolve_download_url; then
+    no "step2 没有可用的下载源 ⇒ 判据②无法测量（候选逐个 HEAD 探活全失败）" \
+      "$PROBE_DETAIL；可用 --download-url <url> 显式指定一个返回 200 且带 Content-Length 的源"
     return
   fi
   t0=$(read_user_total "$TMP_USER")
@@ -633,7 +693,7 @@ check_traffic() {
   stop_client "$pid"
 
   if [ "$code" != "200" ] || [ "${size:-0}" -lt $((EXPECT_BYTES / 10 * 9)) ]; then
-    no "step2 没下满 100MB（HTTP ${code:-空}，实收 ${size:-0} 字节）" \
+    no "step2 没下满已知字节数（HTTP ${code:-空}，实收 ${size:-0} / 应 $EXPECT_BYTES 字节）" \
       "下载源 $DOWNLOAD_URL；客户端日志末行：$(tail -n 1 "$WORK/dl.client.log" 2>/dev/null)"
     return
   fi
@@ -646,9 +706,9 @@ check_traffic() {
   out=$(judge_usage "$((t1 - t0))" "$size" "$TOL_PCT")
   dev=$(usage_dev "$((t1 - t0))" "$size")
   if [ -z "$out" ]; then
-    ok "step2 100MB 计数偏差 $dev%（面板 $t0→$t1 字节，已知 $size 字节，口径 tx+rx）"
+    ok "step2 计数偏差 $dev%（面板 $t0→$t1 字节，已知 $size 字节，源 $DOWNLOAD_URL 报 $EXPECT_BYTES 字节，口径 tx+rx）"
   else
-    no "step2 100MB 计数超出 ±$TOL_PCT%" "$out"
+    no "step2 计数超出 ±$TOL_PCT%" "$out（源 $DOWNLOAD_URL 报 $EXPECT_BYTES 字节）"
   fi
 }
 
@@ -1089,6 +1149,10 @@ JSON
   EXPIRE_TTL=1
   FIRST_OK_WAIT=3
   BLOCK_WAIT=2
+
+  # 自测不出网：HEAD 探活整体桩成「首个候选就 200 + 100MB」。要摆 403 / 全挂的场景，
+  # 各用例在自己的子外壳里再覆盖一次。
+  probe_download_head() { printf '200 104857600\n'; }
 }
 
 st_teardown() {
@@ -1328,7 +1392,24 @@ st_check_traffic() {
     download_via_socks() { printf '1024 000\n'; }
     check_traffic
   )
-  if [[ "$out" == *没下满* ]]; then ok "自测：判据②（没下满 100MB）FAIL"; else no "自测：没下满没被判失败" "$out"; fi
+  if [[ "$out" == *没下满* ]]; then ok "自测：判据②（没下满已知字节数）FAIL"; else no "自测：没下满没被判失败" "$out"; fi
+  st_stub_reset
+  # ③' 失败：所有候选下载源都探不活 ⇒ 判据②直接 FAIL，文案说明「没有可用的下载源」
+  out=$(
+    TMP_USER=m3-selftest
+    TMP_PASS=pw
+    DOWNLOAD_URL=""
+    st_stub_set users "[{\"username\": \"$TMP_USER\", \"usage\": {\"total\": 0, \"monthly\": {}}, \"limits\": {}, \"blocked\": false}]"
+    start_hy2_client() { st_fake_client; }
+    probe_download_head() { printf '403 -\n'; }
+    download_via_socks() { printf '0 000\n'; }
+    check_traffic
+  )
+  if [[ "$out" == FAIL*没有可用的下载源* && "$out" == *tele2*hetzner*ovh* ]]; then
+    ok "自测：判据②（候选下载源全挂 ⇒ 无法测量）FAIL"
+  else
+    no "自测：下载源全挂没被判失败 / 文案没说明" "$out"
+  fi
   st_stub_reset
   # ④ 通过：一次下载跨过落盘 tick ⇒ 面板先落半截、再落全量（面板桩的 ramp_seq 每次
   # GET /api/users 取走一格，正是「一个轮询一格」）。终值必须等到全量那一格。
@@ -1363,6 +1444,73 @@ st_check_traffic() {
     no "自测：半截场景没判别力（压小 STABLE_WAIT 仍拿到终值）" "$out"
   fi
   st_stub_reset
+}
+
+# 下载源候选列表 + HEAD 探活：回退顺序、已知字节数取实报 Content-Length、显式指定只探它。
+st_download_source() {
+  local out
+  # ① 第一个源 403（真机 cloudflare 的形态）⇒ 回退到第二个，已知字节数取它报的长度
+  out=$(
+    DOWNLOAD_URL=""
+    probe_download_head() {
+      case "$1" in
+        *tele2*) printf '403 -\n' ;;
+        *hetzner*) printf '200 104857600\n' ;;
+        *) printf '404 -\n' ;;
+      esac
+    }
+    resolve_download_url && printf '%s %s\n' "$DOWNLOAD_URL" "$EXPECT_BYTES"
+  )
+  if [ "$out" = "https://speed.hetzner.de/100MB.bin 104857600" ]; then
+    ok "自测：第一个源 403 ⇒ 回退到第二个候选"
+  else
+    no "自测：403 没回退到第二个候选" "$out"
+  fi
+  # ② 前两个挂（403 + 200 但没报长度）⇒ 用第三个，已知字节数就取它实报的（这里刻意不是 100MB）
+  out=$(
+    DOWNLOAD_URL=""
+    probe_download_head() {
+      case "$1" in
+        *tele2*) printf '403 -\n' ;;
+        *hetzner*) printf '200 -\n' ;;
+        *) printf '200 13107200\n' ;;
+      esac
+    }
+    resolve_download_url && printf '%s %s\n' "$DOWNLOAD_URL" "$EXPECT_BYTES"
+  )
+  if [ "$out" = "https://proof.ovh.net/files/100Mb.dat 13107200" ]; then
+    ok "自测：200 但 Content-Length 未知的源被跳过，已知字节数取实报值（非 104857600）"
+  else
+    no "自测：未知长度的源没被跳过 / 字节数没取实报值" "$out"
+  fi
+  # ③ 显式 --download-url 只探它自己（不回退到候选列表）
+  out=$(
+    DOWNLOAD_URL="http://example.invalid/blob.bin"
+    probe_download_head() {
+      case "$1" in
+        *example.invalid*) printf '200 4096\n' ;;
+        *) printf '200 104857600\n' ;;
+      esac
+    }
+    resolve_download_url && printf '%s %s\n' "$DOWNLOAD_URL" "$EXPECT_BYTES"
+  )
+  if [ "$out" = "http://example.invalid/blob.bin 4096" ]; then
+    ok "自测：显式 --download-url 只探自己并取它的 Content-Length"
+  else
+    no "自测：显式 --download-url 没被优先用" "$out"
+  fi
+  # ④ 全挂 ⇒ 回非 0，失败原因逐条留在 PROBE_DETAIL
+  out=$(
+    DOWNLOAD_URL=""
+    probe_download_head() { printf '403 -\n'; }
+    resolve_download_url
+    printf '%s|%s\n' "$?" "$PROBE_DETAIL"
+  )
+  if [[ "$out" == 1\|*tele2*hetzner*ovh* ]]; then
+    ok "自测：候选全挂时探活回非 0 并列出每个源的状态码"
+  else
+    no "自测：全挂的返回值 / 失败明细不对" "$out"
+  fi
 }
 
 st_check_expiry() {
@@ -1463,6 +1611,7 @@ self_test() {
   st_login_and_crud
   st_neighbour
   st_check_add_user
+  st_download_source
   st_check_traffic
   st_check_expiry
   st_check_restart
