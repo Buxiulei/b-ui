@@ -5,10 +5,10 @@
 //! `singbox-relay.json`，改完 state 由 P1 的对账器重渲染并重启 `b-ui-relay`。
 
 use super::proxy::{ProbeError, Prober};
-use super::{check, proxy, state, EXIT_IP_HOST, EXIT_IP_URL, MAX_UPSTREAMS};
+use super::{check, proxy, state, EXIT_IP_HOST, EXIT_IP_URL, MAX_UPSTREAMS, MEMBER_PREFIX};
 use crate::reconcile::DaemonCtx;
 use crate::util::fmt_rfc3339;
-use bui_schema::model::{ResiMode, Upstream, UpstreamKind};
+use bui_schema::model::{ResiMode, ResidentialGroup, Upstream, UpstreamKind};
 use bui_schema::parse::{upstream_url, ParseError, UpstreamInput};
 use serde::Serialize;
 use std::sync::Arc;
@@ -39,6 +39,8 @@ pub enum UpstreamError {
     PoolFull,
     #[error("未找到匹配的上游")]
     NotFound,
+    #[error("定位不到上游「{0}」：请用 uuid、resi-N / url-N（N 是池内序号，见 status / health）或 host:port")]
+    Unresolvable(String),
     #[error("代理节点池为空，请先添加至少 1 个住宅上游")]
     PoolEmpty,
     #[error(transparent)]
@@ -66,13 +68,63 @@ impl UpstreamSel {
     }
 }
 
+/// 上游显示名的前缀：`url-1..url-N`（面板与 CLI 的 `status` 列的就是它）
+pub const NAME_PREFIX: &str = "url-";
+
 /// `url-1..url-N` 稠密重排（v3 `add_url_to_config` 的 `to_entries|map(name:…)`）。
 /// 名字**必须**跟着下标重排，否则删掉中间一条后 `url-3` 与 `resi-2` 对不上，面板表与
 /// relay 成员就错位了。
 pub fn renumber(ups: &mut [Upstream]) {
     for (i, u) in ups.iter_mut().enumerate() {
-        u.name = format!("url-{}", i + 1);
+        u.name = format!("{NAME_PREFIX}{}", i + 1);
     }
+}
+
+/// `resi-3` / `url-3` → `3`（大小写不敏感）。`0`、负数与非数字返回 `None`。
+/// 两个前缀同一口径：`resi-N` 是 relay 的成员 tag（`clash::tags`），`url-N` 是
+/// [`renumber`] 排的显示名，二者都等于**池内 1 起下标**。
+fn pool_index(s: &str) -> Option<usize> {
+    let low = s.to_ascii_lowercase();
+    let digits = low
+        .strip_prefix(MEMBER_PREFIX)
+        .or_else(|| low.strip_prefix(NAME_PREFIX))?;
+    let n: usize = digits.parse().ok()?;
+    (n >= 1).then_some(n)
+}
+
+/// 定位一条上游：接受 uuid、`resi-N` / `url-N`（N 是池内 1 起下标，与 `status` /
+/// `health` 的成员序号、relay 的成员 tag 同一口径）与 `host:port`。
+///
+/// **CLI 的 `select` / `check --id` / `remove` 与对应端点共用它**（CLI 自己不读 state，
+/// 原样把字符串送到端点）：只认 uuid 的话，运维照着 `status` 里的 `resi-3` 敲进去只会
+/// 拿到 serde 的「invalid character」，没人知道该填什么。错误文案因此列出全部写法。
+pub fn resolve_upstream(g: &ResidentialGroup, raw: &str) -> Result<Uuid, UpstreamError> {
+    let s = raw.trim();
+    let unresolvable = || UpstreamError::Unresolvable(s.to_string());
+    if let Ok(id) = Uuid::parse_str(s) {
+        return g
+            .upstreams
+            .iter()
+            .find(|u| u.id == id)
+            .map(|u| u.id)
+            .ok_or_else(unresolvable);
+    }
+    if let Some(n) = pool_index(s) {
+        return g
+            .upstreams
+            .get(n - 1)
+            .map(|u| u.id)
+            .ok_or_else(unresolvable);
+    }
+    if let Some(UpstreamSel::HostPort { host, port }) = UpstreamSel::parse_host_port(s) {
+        return g
+            .upstreams
+            .iter()
+            .find(|u| u.host == host && u.port == port)
+            .map(|u| u.id)
+            .ok_or_else(unresolvable);
+    }
+    Err(unresolvable())
 }
 
 /// 类型自动探测：`socks5` → `http`，**整轮重试一次**（v3.6.2 R12：实测有效的端口也会偶发
@@ -282,6 +334,9 @@ pub async fn remove(ctx: &DaemonCtx, sel: &UpstreamSel) -> Result<(), UpstreamEr
         // 运行时主键是 uuid（契约决策 §C）：健康 streak 与「当前生效」都得跟着清，
         // 否则 replay_loop 会去重放一条已经不存在的上游，24h 成功率也会留着僵尸样本
         r.health.remove(&id.to_string());
+        // 告警也跟着 uuid 走：留着的话，下一条上游会复用它的 url-N 名字并顶着这条
+        // 「凭据失效 407」（2026-09-12 bwg-rick 的真机事故）
+        state::clear_upstream_alert(r, id);
         if r.selected_upstream_id == Some(id) {
             r.selected_upstream_id = None;
             r.selected_pending_persist = false;
@@ -717,6 +772,92 @@ mod tests {
             "别让 replay_loop 去重放一条已删的上游"
         );
         assert!(!r.selected_pending_persist);
+    }
+
+    #[tokio::test]
+    async fn resolve_upstream_takes_a_uuid_a_pool_index_or_a_host_port() {
+        // 真机上运维照着 status / health 里的 resi-3 / url-3 敲进 `bui residential select`，
+        // 只认 uuid 的话得到的是「invalid character」——四种写法必须都能定位。
+        let d = tempfile::tempdir().unwrap();
+        let c = ctx(&d).await;
+        let p = prober_ok("198.51.100.7");
+        for i in 1..=3 {
+            add(
+                &c,
+                p.clone(),
+                &format!("http://user1:pw1@isp{i}.example.net:1000{i}"),
+            )
+            .await
+            .unwrap();
+        }
+        let g = rstate::group_of(&*c.store.read().await);
+        let third = g.upstreams[2].id;
+        for raw in [
+            third.to_string(),
+            "resi-3".to_string(),
+            "url-3".to_string(),
+            "RESI-3".to_string(),
+            "isp3.example.net:10003".to_string(),
+            " resi-3 ".to_string(),
+        ] {
+            assert_eq!(
+                resolve_upstream(&g, &raw).unwrap(),
+                third,
+                "写法 {raw:?} 必须能定位到池内第 3 条"
+            );
+        }
+        // 池内序号与 relay 的成员 tag / status 的 url-N 同一口径
+        assert_eq!(
+            resolve_upstream(&g, "resi-1").unwrap(),
+            g.upstreams[0].id,
+            "resi-N 是 1 起下标"
+        );
+        // 定位不到时文案要把三种写法列出来，否则运维只能猜
+        for raw in ["resi-9", "url-0", "resi-x", "nope.example.net:1", "", "abc"] {
+            let e = resolve_upstream(&g, raw).unwrap_err();
+            assert!(matches!(e, UpstreamError::Unresolvable(_)), "{raw}: {e}");
+            let msg = e.to_string();
+            for form in ["uuid", "resi-N", "url-N", "host:port"] {
+                assert!(msg.contains(form), "{raw} 的错误文案缺 {form}：{msg}");
+            }
+        }
+        // 池里没有的 uuid 同样报「定位不到」，不是 500
+        assert!(matches!(
+            resolve_upstream(&g, &Uuid::from_u128(999).to_string()),
+            Err(UpstreamError::Unresolvable(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn remove_drops_the_upstreams_alert_so_a_new_entry_never_inherits_it() {
+        // 真机事故（2026-09-12 bwg-rick）：告警按 url-N 存，删条目后名字被新条目复用，
+        // 新 Decodo 顶着上一个账号的「凭据失效 407」告警。告警以 uuid 为键 + 删条目即清。
+        let d = tempfile::tempdir().unwrap();
+        let c = ctx(&d).await;
+        let p = prober_ok("198.51.100.7");
+        let a = add(&c, p.clone(), "http://user1:pw1@old.example.net:10007")
+            .await
+            .unwrap();
+        rstate::update(&c.runtime, |r| {
+            rstate::set_upstream_alert(r, a.id, "上游 old.example.net:10007 凭据失效（407）");
+        })
+        .await;
+        remove(&c, &UpstreamSel::Id(a.id)).await.unwrap();
+        assert!(
+            rstate::read(&c.runtime).await.upstream_alerts.is_empty(),
+            "删条目连告警一起清"
+        );
+        // 新条目占用同一个 url-1 名字，绝不能继承旧告警
+        let b = add(&c, p, "http://user2:pw2@new.example.net:10007")
+            .await
+            .unwrap();
+        assert_ne!(b.id, a.id);
+        let g = rstate::group_of(&*c.store.read().await);
+        assert_eq!(g.upstreams[0].name, "url-1", "名字确实被复用了");
+        assert!(
+            rstate::visible_alerts(&g, &rstate::read(&c.runtime).await).is_empty(),
+            "新上游不背旧账号的告警"
+        );
     }
 
     #[tokio::test]
