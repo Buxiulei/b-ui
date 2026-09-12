@@ -46,7 +46,8 @@ pub struct AppState {
     pub host: Arc<dyn Host>,
     pub started_at: OffsetDateTime,
     pub version: &'static str,
-    // Task 13 追加：pub login: crate::api::auth::LoginLimiter
+    /// 登录限速表：**每个 router 实例一份**（随 `AppState` 克隆），理由见 `auth::LoginLimiter`。
+    pub login: crate::api::auth::LoginLimiter,
 }
 
 #[cfg(test)]
