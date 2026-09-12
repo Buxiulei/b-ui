@@ -5,6 +5,7 @@
 pub mod engine;
 pub mod error;
 pub mod fake;
+pub mod menu;
 pub mod net;
 pub mod paths;
 pub mod profiles;
