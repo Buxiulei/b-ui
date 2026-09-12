@@ -294,6 +294,130 @@ check_hy2_auth() {
   return 0
 }
 
+# step 7（spec §5.6）：IP 池槽位。端口与槽位的换算**只从 bui 自己的 API 取**，
+# 脚本不重算（重算就会有第二份口径）。
+#
+# 槽位表 JSON → 问题描述（空串 = 自洽）。抽成独立函数是为了让自测能直接喂数据：
+# 不需要 $BUI、不碰 systemd（与 check_status_json 同形）。
+slots_json_problems() {
+  python3 - "$1" <<'PY'
+import json, sys
+try:
+    rows = (json.loads(sys.argv[1]) or {}).get("slots") or []
+except Exception as e:
+    print("slots JSON 解析失败: %s" % e)
+    raise SystemExit(0)
+p = []
+if not rows:
+    print("")
+    raise SystemExit(0)
+idx = [r["index"] for r in rows]
+if 0 not in idx:
+    p.append("没有槽 0（40000 / 2080 / hysteria-residential.service 会悬空）")
+# 端口不许重叠、跳跃区间不许交叉
+hops = sorted((r["hop"][0], r["hop"][1], r["index"]) for r in rows)
+for a, b in zip(hops, hops[1:]):
+    if a[1] >= b[0]:
+        p.append("槽 %d 与槽 %d 的跳跃区间重叠" % (a[2], b[2]))
+if len({r["hy2_port"] for r in rows}) != len(rows):
+    p.append("HY2 端口有重复")
+if len({r["relay_port"] for r in rows}) != len(rows):
+    p.append("中继入站端口有重复")
+borrow = [r["index"] for r in rows if r.get("borrowed")]
+if borrow:
+    p.append("槽 %s 正在借用别的 IP（不是错误，但验收时应为空）" % borrow)
+print("; ".join(p))
+PY
+}
+
+# 槽位表 JSON → 每行 `<槽序号> <HY2 端口>`
+slots_ports() {
+  printf '%s' "$1" | python3 -c 'import json, sys
+try:
+    rows = (json.load(sys.stdin) or {}).get("slots") or []
+except Exception:
+    rows = []
+for r in rows:
+    print(r["index"], r["hy2_port"])'
+}
+
+# 槽位表 JSON → 每行 `<HY2 端口> <用户名>`（一个槽上有几个用户就几行）
+slots_users() {
+  printf '%s' "$1" | python3 -c 'import json, sys
+try:
+    rows = (json.load(sys.stdin) or {}).get("slots") or []
+except Exception:
+    rows = []
+for r in rows:
+    for u in r.get("users") or []:
+        print(r["hy2_port"], u)'
+}
+
+# 面板端口（state.json 的 node.ports.admin），读不到按 8080
+admin_port() {
+  python3 - "$1" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    print(8080)
+    raise SystemExit(0)
+print(((d.get("node") or {}).get("ports") or {}).get("admin") or 8080)
+PY
+}
+
+# 核对「槽位表自洽」、每槽的实例在跑且端口在听、每个住宅用户的订阅里的 HY2 住宅端口
+# == 他槽位的端口。
+check_slots() {
+  local slots out port i user unit aport want
+  slots=$("$BUI" residential slots --json 2>/dev/null)
+  if [ -z "$slots" ]; then
+    skip "step7 槽位（bui residential slots 无输出，可能住宅未启用）"
+    return 0
+  fi
+  out=$(slots_json_problems "$slots")
+  if [ -z "$out" ]; then
+    ok "step7 槽位表自洽（含槽 0、端口不重复、跳跃区间不重叠、无借用）"
+  else
+    no "step7 槽位表有问题" "$out"
+  fi
+
+  # 每槽一个 hysteria 实例：单元在跑 + UDP 端口在听
+  while read -r i port; do
+    [ -n "$i" ] || continue
+    if [ "$i" = "0" ]; then unit="hysteria-residential"; else unit="hysteria-residential-$i"; fi
+    if systemctl is-active --quiet "$unit"; then
+      ok "step7 $unit 在跑"
+    else
+      no "step7 $unit 未运行" "$(systemctl is-active "$unit" 2>&1)"
+    fi
+    if ss -lnu 2>/dev/null | grep -q ":$port\b"; then
+      ok "step7 $unit 监听 :$port/udp"
+    else
+      no "step7 $unit 没在听 :$port/udp" "$(ss -lnu 2>/dev/null | head -5)"
+    fi
+  done <<EOF
+$(slots_ports "$slots")
+EOF
+
+  # 订阅口径一致：用户的 HY2 住宅节点端口 == 他槽位的 hy2_port
+  aport=$(admin_port "$BASE/state.json")
+  while read -r want user; do
+    [ -n "$user" ] || continue
+    port=$(curl -fsS --max-time 10 "http://127.0.0.1:$aport/api/sub/$user" 2>/dev/null |
+      base64 -d 2>/dev/null | grep -F 'HY2%E4%BD%8F%E5%AE%85' |
+      sed -n 's#.*@[^:]*:\([0-9]*\)?.*#\1#p' | head -1)
+    if [ "$want" = "$port" ]; then
+      ok "step7 $user 的订阅住宅端口 = $want"
+    else
+      no "step7 $user 的订阅住宅端口不对" "期望 $want，实际 ${port:-取不到}"
+    fi
+  done <<EOF
+$(slots_users "$slots")
+EOF
+  return 0
+}
+
 # 二次 install 的输出 → 问题描述（空串 = 走了对账路径）。
 # **整份输出**里找「已安装」，不许先 tail 截尾：已装机上 `install --yes` 之后还要打自检表与
 # 结尾摘要，「已安装（…）执行对账」那行离尾巴几十行远，截尾窗口一概看不到它
@@ -410,6 +534,9 @@ PY
 
   # step 6：两台 Hysteria2 真跑一次鉴权 + 出网（事故回归，见上面那段说明）
   check_hy2_auth
+
+  # step 7：IP 池槽位（spec §5.6）
+  check_slots
 }
 
 self_test() {
@@ -434,6 +561,34 @@ self_test() {
   self_test_reinstall_output
   self_test_external_sites
   self_test_hy2_auth
+  self_test_slots
+}
+
+# step 7 的自测：只喂 JSON 给纯判定函数，不需要 $BUI、不碰 systemd
+self_test_slots() {
+  local good bad out
+  good='{"slots":[{"index":0,"hy2_port":40000,"relay_port":2080,"hop":[41000,43999],"borrowed":false,"users":["a"]},
+                  {"index":1,"hy2_port":40001,"relay_port":2081,"hop":[44000,46999],"borrowed":false,"users":[]},
+                  {"index":2,"hy2_port":40002,"relay_port":2082,"hop":[47000,50000],"borrowed":false,"users":["b"]}]}'
+  bad='{"slots":[{"index":1,"hy2_port":40001,"relay_port":2081,"hop":[41000,46999],"borrowed":true,"users":[]},
+                 {"index":2,"hy2_port":40001,"relay_port":2082,"hop":[44000,50000],"borrowed":false,"users":[]}]}'
+  out=$(slots_json_problems "$good")
+  if [ -z "$out" ]; then ok "自测：自洽的槽位表判通过"; else no "自测：自洽的槽位表被误判" "$out"; fi
+  out=$(slots_json_problems "$bad")
+  if [[ "$out" == *槽\ 0* && "$out" == *重叠* && "$out" == *重复* && "$out" == *借用* ]]; then
+    ok "自测：坏槽位表四项全报出"
+  else
+    no "自测：坏槽位表漏报" "$out"
+  fi
+  out=$(slots_json_problems '{"slots":[]}')
+  if [ -z "$out" ]; then ok "自测：空槽位表不报错（住宅未启用）"; else no "自测：空槽位表被误判" "$out"; fi
+  out=$(slots_ports "$good")
+  if [ "$out" = "0 40000
+1 40001
+2 40002" ]; then ok "自测：slots_ports 逐槽给出 HY2 端口"; else no "自测：slots_ports 结果不对" "$out"; fi
+  out=$(slots_users "$good")
+  if [ "$out" = "40000 a
+40002 b" ]; then ok "自测：slots_users 给出端口与用户名"; else no "自测：slots_users 结果不对" "$out"; fi
 }
 
 # step 2 的自测：只验「已安装」这一行的判定，重点是**输出很长也不能漏**（旧版 tail -n 20 就漏了）

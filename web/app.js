@@ -1255,6 +1255,29 @@ function loadResiHealth() {
     });
 }
 
+// v4 P3（spec §5.6）：把住宅用户在各槽间均匀重排。约 1 秒后（对账 + gRPC 收口）生效，
+// xray 不重启、现有连接不断；二次确认只为「别误点」——被挪动的用户订阅里的住宅
+// HY2 端口会变，需要重新导入一次。
+function rebalanceSlots() {
+    if (!confirm("按槽重排全部住宅用户？\n约 1 秒后生效（不重启 xray）；被挪动的用户要重新导入订阅。")) return;
+    const btn = document.getElementById("resi-rebalance");
+    if (btn) { btn.disabled = true; btn.textContent = "重排中…"; }
+    api("/residential/rebalance", { method: "POST" }).then(r => {
+        if (btn) { btn.disabled = false; btn.textContent = "按槽重排"; }
+        if (r && r.success) {
+            toast("已重排 " + (r.moved || 0) + " 个用户" +
+                (r.xray_rules_pending ? "，约 1 秒后槽路由生效（不重启 xray）" : ""));
+            loadResiHealth();
+            load();   // 用户列表的槽位列跟着刷新
+        } else {
+            toast((r && r.error) || "重排失败", true);
+        }
+    }).catch(e => {
+        if (btn) { btn.disabled = false; btn.textContent = "按槽重排"; }
+        toast(e.message || "请求失败", true);
+    });
+}
+
 function loadWatchdogStatus() {
     const body = document.getElementById("sys-wd-body");
     const btn  = document.getElementById("wd-refresh");

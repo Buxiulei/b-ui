@@ -113,9 +113,9 @@ Cargo workspace：
 | 内核 | 单元 | 监听 | 出口 | 变化 |
 |---|---|---|---|---|
 | hysteria-server | `hysteria-server.service` | `:10000,20000-30000`（`listen:` 一行） | 内置 direct，`mode: 4` | 鉴权改 `command`；**不再有任何 iptables/nft 规则**，`hy2-portjump-cleanup.sh` 与面板的 iptables REDIRECT 路径删除 |
-| hysteria-residential | `hysteria-residential.service` | `:40000,41000-50000` | `acl: relay(all)` → socks5 127.0.0.1:2080 | 同上 |
-| xray | `xray.service` | `:10001` vless-direct、`:10002` vless-residential（同一 REALITY 密钥、同一 UUID 集）、`127.0.0.1:10085` api | freedom ForceIPv4 / socks 127.0.0.1:2080 | 用户增删走 gRPC |
-| sing-box relay | `b-ui-relay.service` | `127.0.0.1:2080` socks、`127.0.0.1:9091` Clash API | resi-pool selector / direct | 规则见 §5 |
+| hysteria-residential | `hysteria-residential[-<i>].service`（每槽一个，槽 0 用无后缀名） | `:(40000+i),<41000-50000 按槽位空间等分的第 i 片>` | `acl: relay(all)` → socks5 `127.0.0.1:(2080+i)` | 同上；实例数 = 槽位数（§5.6） |
+| xray | `xray.service` | `:10001` vless-direct、`:10002` vless-residential（同一 REALITY 密钥、同一 UUID 集）、`127.0.0.1:10085` api（services：Handler / Stats / **Routing**） | freedom ForceIPv4 / socks `127.0.0.1:(2080+i)`，住宅入站按**用户 email** 路由到槽（每个用户一条带 `ruleTag` 的规则，增删走 `RoutingService` gRPC，不重启） | 用户增删走 gRPC |
+| sing-box relay | `b-ui-relay.service` | `127.0.0.1:(2080+i)` socks（每槽一个入站）、`127.0.0.1:9091` Clash API | `slot-<i>-pool` selector（每槽一个，本槽优先）/ `resi-pool`（DNS detour 与全局最优）/ `direct` | 规则见 §5 |
 | Caddy | `caddy.service` | 80/443 | reverse_proxy 127.0.0.1:8080 | 不变 |
 
 四个内核都是从各自 GitHub Releases 下载的静态二进制（sha256 校验），放 `/opt/b-ui/bin/`；不再调用 `get.hy2.sh` / Xray-install / 发行版包，不再装 Node.js。sing-box 上限 1.14（v2rayN 7.25 封顶）。
@@ -136,7 +136,7 @@ tonic 客户端，proto 从 Xray-core `v26.3.27` vendor 进仓（以仓库根为
 - 证书：Caddy 继续签；守护进程 inotify 监听 Caddy 证书目录，内容变化才复制到 `/opt/b-ui/certs/`，然后**间隔 10 秒**依次重启两个 hysteria。
 - 静态 DNS：`system.static_dns=true` 时写 `/etc/resolv.conf`（1.1.1.1 / 8.8.8.8）并 `chattr +i`，systemd-resolved 存在则先禁用；两台机统一行为；可在 state 关闭。
 - sysctl：BBR、somaxconn、按内存分档的 `nf_conntrack_max`（131072 / 262144 / 524288），与 v3 同值。
-- 防火墙：装了 ufw/firewalld → 开 22/`PORT`/80/443/10001/10002/40000 + 两个跳跃段；否则体检提示。
+- 防火墙：装了 ufw/firewalld → 开 22/`PORT`/80/443/10001/10002/`40000..40000+span-1` + 两个跳跃段；否则体检提示。`span` 是**槽位空间宽度**（最高槽序号 + 1，`bui_schema::slots::slot_span`），不是 IP 个数：序号有空洞时（删掉中间那条上游）会多放一个没人监听的 UDP 端口，可接受（§5.6 落地细节 D3 的连带效果）。住宅跳跃段 41000–50000 整段放行，各槽只用其中一片。
 - SSH 硬化：一份实现（禁密码登录，仅当存在公钥；`sshd -t` 失败则不写并记录），装机与 `b-ui harden-ssh` 同一函数。
 - systemd 单元全部带 `LimitNOFILE=1048576`；两个 hysteria 与 relay、xray 带 `MemoryHigh/MemoryMax`（relay 与 xray 是 v3 缺的）；`Nice=-5`；`b-ui.service` 自身 `MemoryMax=200M`、`Restart=always`。
 - watchdog：守护进程每 60 秒检查四个内核（单元 active + 监听端口存在，读 `/proc/net/{udp,tcp}`）：进程不 active 交给 systemd `Restart=always` 自愈，watchdog 不插手；只对「active 但端口不在听/探测失败」连续 2 次的情况执行 `systemctl restart`（退避 1/2/4 分钟），体检显示最近重启记录。`/tmp/hy2-watchdog-*` 文件与 timer 删除。
@@ -271,6 +271,20 @@ tonic 客户端，proto 从 Xray-core `v26.3.27` vendor 进仓（以仓库根为
 4. 升级迁移：已有用户按创建时间顺序轮流落槽（如 5 人 3 IP ⇒ 2/2/1）；非槽 0 的用户住宅 HY2 端口会变，需刷新一次订阅（主理人已接受）。
 
 **订阅**：住宅 HY2 节点用该用户槽位的端口与跳跃区间；REALITY 住宅节点不变；直连节点不变。**展示**：`bui residential status/health` 与面板按槽列出 IP、当前实际出口（本槽/借用自 X）、用户数与用户名、指标；用户列表显示其槽位/IP。**不做**：连接级轮询多 IP（风控）。
+
+#### 落地细节（2026-09-13 实施计划 D1–D11，`docs/superpowers/plans/2026-09-13-v4-p3-ip-pool.md`）
+
+- **D1 槽位是持久化状态，不是池顺序的派生视图**：`state.residential.slots[] = [{index, upstream_id}]`，序号取 0..7 里**最小空闲值**。不从 `upstreams` 的下标派生 —— `upstream::add` 覆盖同 `host:port` 时先 `retain` 再 `push`，派生方案下改一次凭据就会让所有序号集体错位。
+- **D2 槽位不变量：池非空 ⇒ 序号 0 的槽一定存在**。`slots::sync_slots` 维护它（序号 0 被释放时把现存最小序号的槽搬到 0）。`40000` / `2080` / `9998` / `hysteria-residential.service` 这四个名字是 v3 兼容面，M1 验收、`watchdog::targets`、漂移白名单与面板都按它们写死。代价：删掉序号 0 那条上游时另一个槽的用户端口下移一次，需刷新订阅（与「非槽 0 用户需刷新订阅」同一性质）。搬动序号**不置** `xray_slot_rules_dirty`：它只改端口，由对账重渲染 + 重启对应 `hysteria-residential*` 承接；xray 那边出站表本身也变了 ⇒ `structural_hash` 变 ⇒ 本来就要重启。
+- **D3 跳跃区间按「槽位空间」等分，不是按「槽位个数」**：`slot_span = 最高序号 + 1`（空池按 1）。序号有空洞时那一片暂时闲置，**不重切**（重切会让所有存活槽的 `mport=` 一起改）。单槽 ⇒ 槽 0 拿到完整 `41000-50000`，与 v3 单实例逐字等价。
+- **D4 槽位端口全部是序号的纯函数**：`relay_port = 2080 + i`、`hy2_port = ports.hy2_resi + i`、`stats_port = 9998 - i`（只能递减：`9999` 已被直连实例占用，8 个槽占 `9991..9998`，全部只监听回环）、`hop = hop_slice(ports.hy2_resi_hop, i, slot_span)`。唯一实现在 `bui_schema::slots`。
+- **D5 `MAX_SLOTS = 8`**，与 `residential::MAX_UPSTREAMS` 同值（池上限即槽位上限），有守门测试断言两者相等。
+- **D6 三处 C1 签名变更**：`render::relay::config(&ResidentialGroup, &[Slot], &RelayOpts)`、新增 `render::hysteria::residential_slot_yaml(&NodeParams, &Paths, &SlotRes)`（`residential_yaml` 保留为槽 0 的薄包装）、`render::xray::config(&NodeParams, &[User], &Residential, &Paths)`。`nodes::nodes_for` 与三个订阅渲染器的签名不变。
+- **D7 Xray 的槽路由靠 `RoutingService` gRPC 增删，xray 不重启**：规则粒度是「每个用户一条」`{"type":"field","ruleTag":"resi-u-<user_id>","inboundTag":["vless-residential"],"user":["<user_id>"],"outboundTag":"relay-slot-<i>"}`，末尾一条无 `user` 的兜底 `resi-fallback`（兜底槽的用户同样各有自己的一条规则）。三条内核事实：① `AddRule` 的 `ruleTag` 重名会让整条请求报错 ⇒ 加之前必须先删；② `RemoveRule` 对不存在的 tag 返回成功（幂等）；③ 空 `ruleTag` 永不参与重名判定。追加即表尾 ⇒ 每轮追加过用户规则就要把兜底规则删掉再追加一次。`structural_hash` 除了剔掉 `inbounds[].settings.clients`，**再剔掉 `routing.rules` 里带 `user` 的规则**（兜底规则没有 `user`，留在哈希里）。磁盘上的 `xray-config.json` 仍渲染完整规则表供启动加载；`slot_rules_hash`（只看带 `user` 的规则）是「跑着的那份 vs 期望的那份」的比对键。收敛的唯一入口是 `residential::slots::converge_xray`，挂在对账 consumer 的末尾：**`ListRule()` 是真源**，与期望态求差后只对差集调 `RemoveRule` / `AddRule`；任一步 gRPC 失败才退回 —— **仅当磁盘上那份 `xray-config.json` 的 `slot_rules_hash` 已等于期望值**（对账刚写完）才 `systemctl restart xray`，成功后记哈希、清脏并 `push_alert`；磁盘还没落地就什么都不做、脏标记留到下一轮。
+- **D8 巡检分两层**：既有的 `resi-pool` 全局最优逻辑（手动锁定、更优候选防抖、DNS detour）原样保留；新增**按槽驱动**器 —— 手动 pin 优先，其次本槽 IP 健康且 Google 通就用本槽，否则借用排名最高的其他健康 IP，本槽连续 3 轮恢复后切回；一个健康的都没有时本轮**保持沉默**（不 PUT、不改 `current_upstream_id`，fail-open）。
+- **D9 升级时 `b-ui-relay` 与 `xray` 各重启一次**（中继入站改成每槽一个 `slot-<i>`、xray 住宅出站改名 `relay-slot-<i>` 且 `api.services` 追加 `RoutingService`），此后稳定。
+- **D10 两个新模型字段不进默认序列化**：`Residential.slots` 与 `ResidentialEntitlement.slot_id` 为空时不写进 `state.json`，旧 state 直接可读，golden 不动。
+- **D11 `api.services` 追加 `RoutingService`**；vendor 的 proto 从 10 个变 13 个（新增 `app/router/command/command.proto`、`app/router/config.proto`、`common/net/network.proto`）。
 
 ### 5.7 日志哨兵与预案（2026-09-13 主理人要求：监听后台日志，出错立即处置）
 

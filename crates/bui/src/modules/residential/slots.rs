@@ -284,6 +284,24 @@ pub async fn assign_user(
     Ok(ok)
 }
 
+/// spec §5.6 规则 3：把住宅用户在各槽间均匀重排。返回被改动的用户数。
+///
+/// **只写 state + 置脏 + 发事件，不自己碰 xray**（D7）：让那次 `StateChanged` 触发的对账
+/// 把新的 `xray-config.json` 写下去（给下次启动用），对账末尾的 [`converge_xray`] 再走
+/// `RoutingService` gRPC 把**被挪动的那些用户**的规则增删掉 —— 从按下按钮到槽路由生效
+/// 约 1 秒（500ms 去抖 + 一轮对账），**xray 不重启、在线连接不断**。
+pub async fn rebalance_users(ctx: &DaemonCtx) -> anyhow::Result<usize> {
+    let mut moved = 0usize;
+    let n = &mut moved;
+    ctx.store.update(|s| *n = slots::rebalance(s)).await?;
+    if moved > 0 {
+        ctx.bus.send(Event::StateChanged("residential"));
+        mark_xray_rules_dirty(&ctx.runtime).await;
+        tracing::info!(moved, "住宅用户按槽重排（spec §5.6 规则 3），等对账后收口");
+    }
+    Ok(moved)
+}
+
 // ── 按槽驱动 selector（spec §5.6，裁决 D8）────────────────────────────────────
 
 /// 一个槽在这一轮的驱动结果。
@@ -1250,6 +1268,46 @@ mod tests {
         assert_eq!(s1.target, s1.own);
         assert!(s1.switched, "重 PUT 回本槽");
         assert_eq!(clash.selected("slot-1-pool").as_deref(), Some("resi-2"));
+    }
+
+    // ── T7：`rebalance` ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn rebalance_users_evens_out_the_slots_and_marks_xray_dirty() {
+        let d = tempfile::tempdir().unwrap();
+        let (store, bus) = store_with(d.path(), 3, 5).await;
+        let (ctx, host) = ctx_of(d.path(), store, bus).await;
+        migrate_on_start(&ctx.store, &ctx.bus).await.unwrap();
+        // 人为压到槽 0
+        let slot0 = slots::sorted(&ctx.store.read().await.residential)[0].upstream_id;
+        ctx.store
+            .update(|s| {
+                for u in s.users.iter_mut() {
+                    if let Some(e) = u.entitlements.residential.as_mut() {
+                        e.slot_id = Some(slot0);
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        state::update(&ctx.runtime, |r| r.xray_slot_rules_dirty = false).await;
+
+        assert_eq!(rebalance_users(&ctx).await.unwrap(), 3);
+        let s = ctx.store.read().await;
+        let mut load = vec![0usize; 3];
+        for u in &s.users {
+            load[slots::index_of_user(u, &s.residential) as usize] += 1;
+        }
+        assert_eq!(load, vec![2, 2, 1]);
+        drop(s);
+        assert!(state::read(&ctx.runtime).await.xray_slot_rules_dirty);
+        assert_eq!(
+            restarts_of_xray(&host),
+            0,
+            "rebalance 自己不碰 xray：收口交给对账末尾的 converge_xray（走 gRPC 增删，D7）"
+        );
+        // 幂等
+        assert_eq!(rebalance_users(&ctx).await.unwrap(), 0);
     }
 
     #[tokio::test]

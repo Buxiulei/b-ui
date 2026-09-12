@@ -22,24 +22,26 @@ Cargo workspace，三个 crate + 保留的前端三文件：
 
 ### Server topology
 
-两个 Hysteria2 实例 + 两个 Xray 入站，全部由 `bui-schema` 的渲染器产出、由对账器写盘：
+一台直连 Hysteria2 + 每个住宅槽位一台 Hysteria2 + 两个 Xray 入站，全部由 `bui-schema` 的渲染器产出、由对账器写盘（`i` = 槽序号）：
 
 | Path | Listener | Egress |
 |---|---|---|
 | `hysteria-server` (`config.yaml`) | `:PORT` (+ built-in port hopping range in the same `listen:` line) | built-in direct, `mode: 4` (IPv4-only) |
-| `hysteria-residential` (`config-residential.yaml`) | `:40000,41000-50000` | `outbounds: relay` → `socks5 127.0.0.1:2080` via `acl: relay(all)` |
+| `hysteria-residential[-<i>]` (`config-residential[-<i>].yaml`) | `:(40000+i),<41000-50000 按槽位空间等分的第 i 片>` | `outbounds: relay` → `socks5 127.0.0.1:(2080+i)` via `acl: relay(all)` |
 | xray `vless-direct` (`xray-config.json`) | `:10001` REALITY | `freedom` with `domainStrategy: ForceIPv4` |
-| xray `vless-residential` | `:10002` REALITY | `socks 127.0.0.1:2080` |
+| xray `vless-residential` | `:10002` REALITY | `socks 127.0.0.1:(2080+i)`，按用户 email 路由到槽（每人一条 `ruleTag` 规则，增删走 `RoutingService` gRPC，不重启 xray） |
 
 `127.0.0.1:2080` 是常驻的本地 sing-box 中继（`b-ui-relay.service`，配置 `/opt/b-ui/singbox-relay.json`，由 `render::relay::config` 渲染）：住宅上游池非空时把 AI 域名关键字（global 模式则全部）送进 `resi-pool`，池空则全部直连（fail-open）。目标域名不在本机解析，原样交给上游。上游可以是 `socks5` 或 `http`（`model::UpstreamKind`，粘贴 `socks5://u:p@h:port`、`http://…`、`h:port:u:p`、`u:p@h:port` 四种写法都由 `parse::upstream_url` 归一）；Bright Data 用 HTTP 端口（44445），它的 SOCKS5 端口拒绝明文 HTTP 目标（2026-09-10 实测）。池状态、凭据、黑名单与选中的上游都在 `state.json` 的 `residential` 里（600），没有独立的 `residential-proxy.json`；体检与自动黑名单是守护进程里的任务，切换上游经中继的 Clash API 而不重启内核。
 
-受管单元只有六个（`reconcile::MANAGED_UNITS`）：`b-ui`、`hysteria-server`、`hysteria-residential`、`xray`、`b-ui-relay`、`caddy`；v3 的九个遗留单元与定时器列在 `reconcile::LEGACY_UNITS`，对账器只负责把它们停掉、删掉。
+池里每个 IP 是一个槽位（`state.residential.slots`，spec §5.6）：每槽一个中继入站 `2080+i`、一个 `hysteria-residential[-<i>]` 实例 `40000+i`，Xray 住宅入站按用户 email 路由到槽；用户经 `entitlements.residential.slot_id` 粘在一个 IP 上（多个用户可以共用一个 IP），端口换算只在 `bui_schema::slots` 一处。新建用户分到负载最少的槽，`bui residential rebalance` / `assign` 手动调整，`bui residential slots` 与面板按槽展示。
+
+受管单元 = `reconcile::MANAGED_UNITS` 六个固定名字（`b-ui`、`hysteria-server`、`hysteria-residential`、`xray`、`b-ui-relay`、`caddy`）+ 每个住宅槽位一个 `hysteria-residential-<i>`；枚举一律经 `reconcile::managed_units(&state)`，词法判定用 `reconcile::is_managed_unit`。v3 的九个遗留单元与定时器列在 `reconcile::LEGACY_UNITS`，对账器只负责把它们停掉、删掉。
 
 VPS 没有 IPv6 出口：服务端每条出口都钉在 IPv4，客户端配置接管 IPv6 并拒绝裸 IPv6 目标，让应用回落 IPv4（spec：`docs/superpowers/specs/2026-09-10-ipv6-takeover-design.md`）。
 
 ### Subscriptions (`crates/bui-schema/src/render/subscription.rs`)
 
-三个免鉴权端点，节点集合都来自 `nodes::nodes_for`（fusion = Reality直连 :10001 / Reality住宅 :10002 / HY2直连 / HY2住宅 :40000）：
+三个免鉴权端点，节点集合都来自 `nodes::nodes_for`（fusion = Reality直连 :10001 / Reality住宅 :10002 / HY2直连 / HY2住宅 `:(40000+用户槽位)`）：
 - `/api/sub/<user>` — base64 `vless://`/`hysteria2://` URIs (what v2rayN uses)。端口跳跃（`mport=`）来自期望态的 `ports.hy2_hop` / `hy2_resi_hop`。
 - `/api/subscription/<user>` — a complete sing-box config (TUN + DNS + route). Must stay valid for **sing-box 1.12 through 1.14**: typed DNS servers, TUN `address` array, rule actions (`sniff`/`hijack-dns`/`reject`), `route.default_domain_resolver`, no `rule_set`/`download_detour` (1.13 and 1.15 disagree on those fields).
 - `/api/clash/<user>` — mihomo YAML.
