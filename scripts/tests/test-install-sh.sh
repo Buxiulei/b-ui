@@ -166,27 +166,43 @@ assert_eq "rc=0" "$out" "没给域名但 /dev/tty 能开 → 放行，由 bui in
 assert_eq "/dev/tty" "$(tty_readable() { true; }; tty_source < /dev/null)" "管道里跑且 /dev/tty 可开 → /dev/tty"
 assert_eq "" "$(tty_readable() { false; }; tty_source < /dev/null)" "/dev/tty 开不了 → 空串（原样继承 stdin）"
 
-# 交接不是无条件的：stdin 正在给 --admin-password-stdin 送密码、或域名已定时，换成终端就是拆台
-# （`sudo bash install.sh --non-interactive --answers a.json --admin-password-stdin < pw.txt`
-#  被换掉 stdin ⇒ bui install 读到空密码、密码文件被静默忽略。2026-09-12 第三轮审查 blocking）
+# 交接条件 = 「bui install 将要提问」（2026-09-12 裁决「一行命令后问答式配置」）：
+# 非 --yes/--non-interactive + 参数里没有 --admin-password-stdin + $BUI_DOMAIN 为空 +
+# stdin 非终端 + /dev/tty 可开。
+# 不再只看命令行上的域名是否已知：`--domain` 之后还有面板密码（默认随机）、HY2 端口、
+# REALITY 伪装站、第一个用户名、节点名、公网 IP 要问，`--domain` 给了那几问照样得开口。
 BUI_DOMAIN=""
 assert_eq "" "$(tty_readable() { true; }; tty_source --non-interactive --answers /root/a.json --admin-password-stdin < /dev/null)" \
     "参数里有 --admin-password-stdin → 不交接（stdin 留给密码）"
-assert_eq "" "$(tty_readable() { true; }; tty_source --domain panel.example.com < /dev/null)" \
-    "域名已给 → 不交接（bui install 那一问不会开口）"
-assert_eq "/dev/tty" "$(tty_readable() { true; }; tty_source --yes --port 20000 < /dev/null)" \
-    "两者都没有 + stdin 非终端 + /dev/tty 可开 → 交接"
-# 域名「已定」的其余三种来源，与 domain_known 的宽松判定（答案文件给了就算）区分开
-assert_eq "" "$(tty_readable() { true; }; BUI_DOMAIN=panel.example.com tty_source --yes < /dev/null)" \
-    "BUI_DOMAIN 也算域名已定 → 不交接"
-assert_eq "" "$(tty_readable() { true; }; tty_source --import-v3 < /dev/null)" \
-    "从 v3 导入沿用 v3 域名 → 不交接"
+assert_eq "" "$(tty_readable() { true; }; tty_source --domain panel.example.com --admin-password-stdin < /dev/null)" \
+    "--admin-password-stdin 单独出现也不交接"
+assert_eq "" "$(tty_readable() { true; }; tty_source --yes --port 20000 < /dev/null)" \
+    "--yes 一个问题都不问 → 不交接"
+assert_eq "" "$(tty_readable() { true; }; tty_source -y < /dev/null)" \
+    "-y 是 --yes 的简写 → 不交接"
+assert_eq "" "$(tty_readable() { true; }; tty_source --non-interactive --answers /root/a.json < /dev/null)" \
+    "--non-interactive → 不交接"
+assert_eq "/dev/tty" "$(tty_readable() { true; }; tty_source --port 20000 < /dev/null)" \
+    "要提问 + stdin 非终端 + /dev/tty 可开 → 交接"
+assert_eq "" "$(tty_readable() { false; }; tty_source --port 20000 < /dev/null)" \
+    "/dev/tty 开不了 → 不交接（原样继承 stdin）"
+# --domain 已给也照样交接：这正是本次改掉的那一条（旧版只看域名，密码等几问全被闷掉）
+assert_eq "/dev/tty" "$(tty_readable() { true; }; tty_source --domain panel.example.com < /dev/null)" \
+    "--domain 已给但面板密码/端口/伪装站/首用户还要问 → 交接"
+# $BUI_DOMAIN 非空则相反：裁决「已给的项不问」把它定成等同 --yes（bui install 的 asks_nothing
+# 同一条），一个问题都不问，这里交接一个 fd 过去没人读
+assert_eq "" "$(tty_readable() { true; }; BUI_DOMAIN=panel.example.com tty_source < /dev/null)" \
+    "BUI_DOMAIN 非空 = 无人值守 → 不交接"
+assert_eq "/dev/tty" "$(tty_readable() { true; }; BUI_DOMAIN="   " tty_source --port 20000 < /dev/null)" \
+    "BUI_DOMAIN 纯空白 = 打错了，bui install 的 asks_nothing 照样要问域名 → 交接"
+assert_eq "/dev/tty" "$(tty_readable() { true; }; tty_source --import-v3 < /dev/null)" \
+    "--import-v3 沿用 v3 的值、其实什么都不问，但交接无害（bui install 不会去读）"
 printf '{"node_name":"bwg","masquerade_domain":"www.bing.com"}\n' > "$WORK/fixtures/answers-nodomain.json"
 printf '{"domain": "panel.example.com"}\n' > "$WORK/fixtures/answers-domain.json"
-assert_eq "/dev/tty" "$(tty_readable() { true; }; tty_source --non-interactive --answers "$WORK/fixtures/answers-nodomain.json" < /dev/null)" \
-    "答案文件里没有 domain（且没有 --admin-password-stdin）→ 仍要交接，那一问还得问"
+assert_eq "/dev/tty" "$(tty_readable() { true; }; tty_source --answers "$WORK/fixtures/answers-nodomain.json" < /dev/null)" \
+    "答案文件没有 --non-interactive 时照旧要问 → 交接"
 assert_eq "" "$(tty_readable() { true; }; tty_source --non-interactive --answers="$WORK/fixtures/answers-domain.json" < /dev/null)" \
-    "答案文件里有 domain（--answers=值 写法）→ 不交接"
+    "--non-interactive 一个都不问 → 不交接"
 answers_domain --answers "$WORK/fixtures/answers-nodomain.json"
 assert_eq "1" "$?" "masquerade_domain 这种带前缀的键不误命中 domain"
 

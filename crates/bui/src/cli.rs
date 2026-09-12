@@ -26,9 +26,9 @@ pub struct Cli {
 /// 全部子命令（形状是 C5 的字面约定）。
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum Command {
-    /// 首次安装：交互收集参数 → 写 state.json → 对账
+    /// 首次安装：问答式收集关键信息（域名必填，其余每题回车即默认）→ 写 state.json → 对账
     Install {
-        /// 面板域名
+        /// 面板域名（唯一必填项；不给就在问答里问。也可用 $BUI_DOMAIN，但那条写法等同 --yes：一个问题都不问）
         #[arg(long)]
         domain: Option<String>,
         /// Hysteria2 直连端口（默认 10000）

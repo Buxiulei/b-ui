@@ -138,13 +138,42 @@
 
 ### 一键安装（v4）
 
-新服务器上一行命令装完全部（**唯一必填是面板域名**，其余全自动）：
+新服务器上一行命令，跑起来后问几个关键信息（**只有面板域名必填**，其余每题**直接回车**用默认值）：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Buxiulei/b-ui/v4/install.sh | bash -s -- --domain panel.example.com
+curl -fsSL https://raw.githubusercontent.com/Buxiulei/b-ui/v4/install.sh | bash
 ```
 
-不带 `--domain` 时，只要终端可用（`/dev/tty`）就只问「面板域名」这一个问题；既没给域名又没有终端（比如 CI）则打印用法并以非 0 退出，**不会装一半**。域名之外的事——架构、发行版与包管理器、公网 IP、SELinux、时间同步、关键端口占用、域名解析核对、IPv6 出口、v3 迁移、防火墙——全部自动探测处理，装完打印一张「环境」表、一张自检 PASS/FAIL 表，以及面板地址、一次性管理员密码与订阅地址。
+问答顺序与默认值：
+
+| 问 | 默认值（回车即用） |
+|---|---|
+| 面板域名 | **无默认，必填**（空回车重问，3 次后报错退出，不会装一半） |
+| 面板管理员密码 | 随机 16 位十六进制，**提示里直接显示**，回车即用 |
+| Hysteria2 直连端口 | `10000` |
+| REALITY 伪装站 | `www.bing.com:443` |
+| 第一个用户名 | `低空飞行`（HY2 密码与 UUID 随机生成，权益默认全开：两协议 + 直连 + 住宅、不限期不限量） |
+| 节点名 | 主机名 |
+| 公网 IP | 自动探测值 |
+
+先给好的项不会再问那一项：`--domain`（域名那一问）、`--port`（HY2 端口那一问）、`--admin-password-stdin`（面板密码那一问）、`--answers` 文件里**显式写了**的键（`domain` / `node_name` / `public_ip` / `masquerade` / `ports` 各对应那一问）。
+
+**一个问题都不问**的三种写法：`--yes` / `--non-interactive`、`BUI_DOMAIN=<域名>`（环境变量那条写法的语义就是无人值守）、`--import-v3`（沿用 v3 的值）。
+
+```bash
+# 域名先给好，密码/端口/伪装站/首用户照问
+curl -fsSL https://raw.githubusercontent.com/Buxiulei/b-ui/v4/install.sh | bash -s -- --domain panel.example.com
+
+# 无人值守：一个问题都不问，面板密码随机生成并在最后一屏打印一次（下面两行等价）
+curl -fsSL https://raw.githubusercontent.com/Buxiulei/b-ui/v4/install.sh | bash -s -- --domain panel.example.com --yes
+curl -fsSL https://raw.githubusercontent.com/Buxiulei/b-ui/v4/install.sh | BUI_DOMAIN=panel.example.com bash
+
+# 无人值守 + 自己指定面板密码（凭据不进命令行，从 stdin 读）
+curl -fsSL https://raw.githubusercontent.com/Buxiulei/b-ui/v4/install.sh \
+  | bash -s -- --domain panel.example.com --yes --admin-password-stdin < /root/panel-password.txt
+```
+
+没有终端可问（CI、`/dev/tty` 也开不了）时同样全用默认值；不问的这几种情形下域名仍然缺不得——没给就打印用法并以非 0 退出，**不会装一半**。域名之外的事——架构、发行版与包管理器、公网 IP、SELinux、时间同步、关键端口占用、域名解析核对、IPv6 出口、v3 迁移、防火墙——全部自动探测处理，装完打印一张「环境」表、一张自检 PASS/FAIL 表，以及面板地址、一次性管理员密码、第一个用户名与他那三条订阅地址（`/api/sub`、`/api/subscription`、`/api/clash`）。
 
 全新服务器上首张证书要等 Caddy 签到，自检会先有界等待（最多 2 分钟）；到点还没签下来时，
 「两个 hysteria 单元 / HY2 的 UDP 端口 / HY2 回环鉴权」这三行报 `SKIP 待证书` 而**不算失败**
