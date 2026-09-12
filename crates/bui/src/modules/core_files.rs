@@ -33,11 +33,6 @@ impl CoreFilesModule {
         }
     }
 
-    /// 从共享锁构造（`serve::modules()` 用它，把同一个锁交给每日自检任务）。
-    pub fn with_handle(handle: Arc<RwLock<Option<Manifest>>>) -> Self {
-        Self { manifest: handle }
-    }
-
     pub fn manifest_handle(&self) -> Arc<RwLock<Option<Manifest>>> {
         self.manifest.clone()
     }

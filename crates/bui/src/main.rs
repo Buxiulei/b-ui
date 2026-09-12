@@ -1,7 +1,16 @@
-// 分任务落地期间，被调用方常常先于调用方合并（例如 Task 2 的 Store 在 Task 13 之前），
-// 非 test 构建下它们还没人用，`-D warnings` 会因 dead_code 直接失败。
-// 这一行在 Task 17 收口（最后一个子命令接上）时删除，并修掉真正的死代码。
-#![allow(dead_code)]
+// Task 17 收口：Task 1 的**无条件** `#![allow(dead_code)]` 已按计划删掉，这里换成只作用于
+// 非 test 构建的一条。理由（计划 Step 5 没预见到的情况）：
+//
+// `bui` 是 bin-only crate，`dead_code` 分析从 `main` 出发，而 `--all-targets` 会**同时**编
+// 非 test 的 bin。剩下的十三处告警（`Store::update` 与它的备份轮转 / `CmdOut::success` /
+// `sys::cmd_line` / `Host::is_symlink` / `ReconcileReport::is_clean` / `Module::name` /
+// `Event::StateChanged` / `CoreFilesModule::with_handle` / `Verify::service` / …）**全部**
+// 有通过的单元测试，或是 P2/P3 明文要消费的契约面：它们不是「真正没人用的函数」，删掉就等于
+// 毁掉 Task 2/3 的交付。唯一真正谁都没用的 `Store::path` 已就地删除。
+//
+// 所以这条 allow 收窄成 `not(test)`：test 构建（含全部单元测试）仍然严格拦 dead_code，
+// P2/P3 把这些调用方补上之后就该整条删掉。
+#![cfg_attr(not(test), allow(dead_code))]
 
 mod api;
 mod cli;
@@ -82,7 +91,20 @@ async fn dispatch(command: Command) -> Result<()> {
             )
             .await
         }
-        Command::Upgrade { .. } => not_yet("upgrade"),
+        Command::Upgrade {
+            rollback,
+            version,
+            manifest_url,
+        } => {
+            commands::upgrade::run(
+                rollback,
+                version,
+                manifest_url,
+                bui_schema::paths::Paths::default_server(),
+                std::sync::Arc::new(sys::real::RealHost::new()),
+            )
+            .await
+        }
         Command::Serve => {
             serve::run(
                 bui_schema::paths::Paths::default_server(),
@@ -100,7 +122,14 @@ async fn dispatch(command: Command) -> Result<()> {
             )
             .await
         }
-        Command::Status { .. } => not_yet("status"),
+        Command::Status { json } => {
+            commands::status::run(
+                json,
+                bui_schema::paths::Paths::default_server(),
+                std::sync::Arc::new(sys::real::RealHost::new()),
+            )
+            .await
+        }
         Command::ImportV3 { dir, out } => {
             commands::import_v3::run(
                 dir,
@@ -111,7 +140,13 @@ async fn dispatch(command: Command) -> Result<()> {
             .await
         }
         Command::AuthHook { .. } => unreachable!("auth-hook 已在 main 里提前返回"),
-        Command::Menu => not_yet("menu"),
+        Command::Menu => {
+            commands::menu::run(
+                bui_schema::paths::Paths::default_server(),
+                std::sync::Arc::new(sys::real::RealHost::new()),
+            )
+            .await
+        }
         Command::HardenSsh => {
             commands::harden_ssh::run(
                 bui_schema::paths::Paths::default_server(),
@@ -120,9 +155,4 @@ async fn dispatch(command: Command) -> Result<()> {
             .await
         }
     }
-}
-
-/// 脚手架：后续任务逐个替换对应 arm；最后一个 arm 被替换时连这个函数一起删（Task 17）。
-fn not_yet(what: &str) -> Result<()> {
-    anyhow::bail!("子命令 {what} 尚未在本分支实现")
 }
