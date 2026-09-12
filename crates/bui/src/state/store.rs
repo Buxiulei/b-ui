@@ -8,6 +8,17 @@ use tokio::sync::{Mutex, RwLock};
 /// 备份保留份数（spec §2.1）。
 pub const BACKUP_KEEP: usize = 10;
 
+/// [`Store::update_as`] 的缺省调用点标签：没人标注时就是它，出现在拒写日志里。
+pub const CALLER_UNLABELED: &str = "unlabeled";
+/// **唯一**允许让 `residential.groups[*].upstreams` 变短的调用点
+/// （`modules::residential::upstream::remove`，经 `state::update_group_as` 传进来）。
+///
+/// R3 ①（2026-09-12 bwg-rick）：真机上池里 5 条中的 2 条无任何日志地从 `state.json`
+/// 消失，`state.backups` 只剩 10 份已无法回溯。审计没找到第二条能缩短上游池的代码路径，
+/// 所以在**唯一的写盘入口**上立一道防线：非 remove 调用点一旦让池变短，记 `error`
+/// 并拒写——宁可让那一次改动失败并留下证据，也不要再次静默少两条。
+pub const CALLER_RESI_REMOVE: &str = "residential::upstream::remove";
+
 /// 单进程唯一持有 `State`；写 = 临时文件 + rename + 备份 10 份。
 #[derive(Clone)]
 pub struct Store(Arc<Inner>);
@@ -58,12 +69,28 @@ impl Store {
     }
 
     /// 改期望态：串行化（`write` 锁）+ 零变更不写盘 + 写盘前备份上一版。
+    /// 调用点未标注 ⇒ [`CALLER_UNLABELED`]，不允许缩短住宅上游池（见 [`Store::update_as`]）。
     pub async fn update(&self, f: impl FnOnce(&mut State)) -> Result<Arc<State>> {
+        self.update_as(CALLER_UNLABELED, f).await
+    }
+
+    /// 同 [`Store::update`]，但带**调用点标签**：标签只影响 [`upstream_shrink_refusal`]
+    /// 这一道防线（谁可以让住宅上游池变短），不改变落盘语义。
+    pub async fn update_as(
+        &self,
+        caller: &'static str,
+        f: impl FnOnce(&mut State),
+    ) -> Result<Arc<State>> {
         let _guard = self.0.write.lock().await;
         let current = self.read().await;
         let old_bytes = serde_json::to_vec_pretty(&*current)?;
         let mut next = (*current).clone();
         f(&mut next);
+        if let Some(why) = upstream_shrink_refusal(&current, &next, caller) {
+            // error 级：这是「数据要没了」级别的事件，运维必须在 journal 里看得见
+            tracing::error!(caller, "{why}");
+            anyhow::bail!("{why}");
+        }
         let new_bytes = serde_json::to_vec_pretty(&next)?;
         if new_bytes == old_bytes {
             return Ok(current);
@@ -81,6 +108,41 @@ impl Store {
         *self.0.cache.write().await = next.clone();
         Ok(next)
     }
+}
+
+/// 住宅上游池变短的拒写判据（R3 ①）：返回 `Some(理由)` 就拒绝这次写盘。
+///
+/// 只有 [`CALLER_RESI_REMOVE`] 能让池变短——`upstream::add` 覆盖同 `host:port` 时是
+/// 「先 retain 再 push」，净变化不为负；别的模块根本不该碰住宅段。理由里只带
+/// `name` 与 `id`，**不带 host/凭据**（拒写日志会进 journal）。
+fn upstream_shrink_refusal(current: &State, next: &State, caller: &str) -> Option<String> {
+    if caller == CALLER_RESI_REMOVE {
+        return None;
+    }
+    for (name, before) in &current.residential.groups {
+        let after = next.residential.groups.get(name);
+        let after_len = after.map(|g| g.upstreams.len()).unwrap_or(0);
+        if after_len >= before.upstreams.len() {
+            continue;
+        }
+        let lost: Vec<String> = before
+            .upstreams
+            .iter()
+            .filter(|u| {
+                after
+                    .map(|g| !g.upstreams.iter().any(|x| x.id == u.id))
+                    .unwrap_or(true)
+            })
+            .map(|u| format!("{}({})", u.name, u.id))
+            .collect();
+        return Some(format!(
+            "拒绝写入 state.json：住宅分组 {name} 的上游池要从 {} 条缩到 {after_len} 条\
+             （丢失 {}），而调用点是 {caller} 而不是 upstream::remove",
+            before.upstreams.len(),
+            lost.join("、")
+        ));
+    }
+    None
 }
 
 /// `pub(crate)`：`state::runtime::Runtime::update` 复用它，保证 `runtime.json` 也是
@@ -300,5 +362,114 @@ mod tests {
     async fn open_missing_file_errors() {
         let d = dir();
         assert!(Store::open(d.path().join("nope.json")).await.is_err());
+    }
+
+    /// 池里 `n` 条上游的期望态（住宅段的其余字段不参与本节断言）
+    fn state_with_pool(n: u128) -> bui_schema::model::State {
+        use bui_schema::model::{Upstream, UpstreamKind};
+        let mut s = sample_state();
+        let g = s
+            .residential
+            .groups
+            .entry("default".to_string())
+            .or_default();
+        g.upstreams = (1..=n)
+            .map(|i| Upstream {
+                id: uuid::Uuid::from_u128(i),
+                name: format!("url-{i}"),
+                kind: UpstreamKind::Socks5,
+                host: format!("isp{i}.example.net"),
+                port: 1080,
+                username: "u".into(),
+                password: "pw-secret".into(),
+                priority: 100,
+                provider: None,
+                region: None,
+                ports_allowed: None,
+                verified: None,
+            })
+            .collect();
+        s
+    }
+
+    /// R3 ①：住宅上游池只能由 `upstream::remove` 变短。任何别的调用点（陈旧克隆被写回、
+    /// 并发写互相覆盖、将来某个模块顺手改了住宅段）都必须**拒写**，而不是静默少两条。
+    #[tokio::test]
+    async fn only_the_remove_caller_may_shrink_the_residential_pool() {
+        let d = dir();
+        let p = d.path().join("state.json");
+        let store = Store::create(&p, state_with_pool(5)).await.unwrap();
+        let e = store
+            .update(|s| {
+                let g = s.residential.groups.get_mut("default").unwrap();
+                g.upstreams.retain(|u| u.port != 1080); // 一把清空：模拟陈旧克隆被写回
+            })
+            .await
+            .expect_err("未标注调用点缩短上游池必须被拒");
+        let msg = e.to_string();
+        assert!(
+            msg.contains("upstream::remove"),
+            "错误信息要点名判据：{msg}"
+        );
+        assert!(msg.contains("url-1"), "错误信息要列出丢失的成员：{msg}");
+        assert!(!msg.contains("pw-secret"), "拒写日志不能泄露凭据：{msg}");
+        // 内存缓存与磁盘都不能被改
+        let g = crate::modules::residential::state::group_of(&*store.read().await);
+        assert_eq!(g.upstreams.len(), 5, "拒写之后缓存必须保持原样");
+        let on_disk: bui_schema::model::State =
+            serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        assert_eq!(
+            on_disk.residential.groups["default"].upstreams.len(),
+            5,
+            "拒写之后磁盘必须保持原样"
+        );
+        // 整个分组被删掉也算缩短
+        assert!(
+            store
+                .update(|s| {
+                    s.residential.groups.remove("default");
+                })
+                .await
+                .is_err(),
+            "整份住宅分组消失也要拒写"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_remove_caller_may_shrink_and_growth_is_always_allowed() {
+        let d = dir();
+        let p = d.path().join("state.json");
+        let store = Store::create(&p, state_with_pool(3)).await.unwrap();
+        // 增加：任何调用点都放行
+        store
+            .update(|s| {
+                let g = s.residential.groups.get_mut("default").unwrap();
+                let mut u = g.upstreams[0].clone();
+                u.id = uuid::Uuid::from_u128(99);
+                u.host = "isp99.example.net".into();
+                g.upstreams.push(u);
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store.read().await.residential.groups["default"]
+                .upstreams
+                .len(),
+            4
+        );
+        // 缩短：只有 remove 这个调用点放行
+        store
+            .update_as(CALLER_RESI_REMOVE, |s| {
+                let g = s.residential.groups.get_mut("default").unwrap();
+                g.upstreams.retain(|u| u.id != uuid::Uuid::from_u128(99));
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store.read().await.residential.groups["default"]
+                .upstreams
+                .len(),
+            3
+        );
     }
 }

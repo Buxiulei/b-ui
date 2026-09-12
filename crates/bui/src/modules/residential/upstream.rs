@@ -312,20 +312,32 @@ pub async fn remove(ctx: &DaemonCtx, sel: &UpstreamSel) -> Result<(), UpstreamEr
         .cloned()
         .ok_or(UpstreamError::NotFound)?;
     let id = target.id;
-    state::update_group(&ctx.store, &ctx.bus, move |g| {
-        g.upstreams.retain(|u| u.id != id);
-        renumber(&mut g.upstreams);
-        // 该上游的 auto 条目一起删：留着没人复核，还会被 render/relay 的
-        // `upstream_id == selected` 过滤悄悄忽略
-        g.blacklist.auto.retain(|e| e.upstream_id != id);
-        if g.selected_upstream_id == Some(id) {
-            g.selected_upstream_id = g.upstreams.first().map(|u| u.id);
-        }
-        if g.upstreams.is_empty() {
-            g.enabled = false; // relay 回落 fail-open 直连（v3 `enable --remove` 同语义）
-            g.selected_upstream_id = None;
-        }
-    })
+    // R3 ①：删上游是**唯一**允许缩短池子的路径，所以它自己必须留下日志——真机上
+    // 那两条上游「无任何日志地消失」时，这里一个字都没记，事后连「是谁删的」都无从判断。
+    // 只记 name/id/host:port，不记凭据。
+    tracing::info!(
+        upstream = %target.name, id = %id, endpoint = %format!("{}:{}", target.host, target.port),
+        "删除住宅上游"
+    );
+    state::update_group_as(
+        &ctx.store,
+        &ctx.bus,
+        crate::state::store::CALLER_RESI_REMOVE,
+        move |g| {
+            g.upstreams.retain(|u| u.id != id);
+            renumber(&mut g.upstreams);
+            // 该上游的 auto 条目一起删：留着没人复核，还会被 render/relay 的
+            // `upstream_id == selected` 过滤悄悄忽略
+            g.blacklist.auto.retain(|e| e.upstream_id != id);
+            if g.selected_upstream_id == Some(id) {
+                g.selected_upstream_id = g.upstreams.first().map(|u| u.id);
+            }
+            if g.upstreams.is_empty() {
+                g.enabled = false; // relay 回落 fail-open 直连（v3 `enable --remove` 同语义）
+                g.selected_upstream_id = None;
+            }
+        },
+    )
     .await?;
     state::update(&ctx.runtime, |r| {
         r.checks.remove(&id.to_string());
@@ -903,5 +915,215 @@ mod tests {
         );
         set_enabled(&c, false).await.unwrap();
         assert!(!rstate::group_of(&*c.store.read().await).enabled);
+    }
+
+    // ───────────────────────────────────────────────────────────────────────────────
+    // R3 ①（2026-09-12 bwg-rick）：池里 5 条中的 2 条无任何日志地从 state.json 消失。
+    // 下面这几条把当时真机上并发跑着的那些路径（异步体检收尾、手动 select、巡检轮、
+    // relay 重启触发的重放、录入）与增删交错起来跑，锁住「池子只会因 remove 变短」。
+    // ───────────────────────────────────────────────────────────────────────────────
+
+    /// 池内成员数与 `host:port` 集合（断言用）
+    async fn pool(c: &DaemonCtx) -> Vec<String> {
+        let mut v: Vec<String> = rstate::group_of(&*c.store.read().await)
+            .upstreams
+            .iter()
+            .map(|u| format!("{}:{}", u.host, u.port))
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_adds_never_lose_an_upstream() {
+        let d = tempfile::tempdir().unwrap();
+        let c = ctx(&d).await;
+        let p = prober_ok("198.51.100.7");
+        let mut hs = Vec::new();
+        for i in 1..=5u16 {
+            let (c2, p2) = (c.clone(), p.clone());
+            hs.push(tokio::spawn(async move {
+                add(
+                    &c2,
+                    p2,
+                    &format!("socks5://u:pw@isp{i}.example.net:{}", 1080 + i),
+                )
+                .await
+            }));
+        }
+        for h in hs {
+            h.await.unwrap().unwrap();
+        }
+        let g = rstate::group_of(&*c.store.read().await);
+        assert_eq!(
+            g.upstreams.len(),
+            5,
+            "5 次并发录入不能互相覆盖：{:?}",
+            pool(&c).await
+        );
+        assert_eq!(
+            g.upstreams
+                .iter()
+                .map(|u| u.name.clone())
+                .collect::<Vec<_>>(),
+            vec!["url-1", "url-2", "url-3", "url-4", "url-5"],
+            "名字必须稠密重排"
+        );
+        let ids: std::collections::BTreeSet<Uuid> = g.upstreams.iter().map(|u| u.id).collect();
+        assert_eq!(ids.len(), 5, "id 不能重复");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn re_adding_the_same_endpoint_concurrently_keeps_one_entry_and_drops_no_other() {
+        let d = tempfile::tempdir().unwrap();
+        let c = ctx(&d).await;
+        let p = prober_ok("198.51.100.7");
+        add(&c, p.clone(), "socks5://u:pw@keep1.example.net:1081")
+            .await
+            .unwrap();
+        add(&c, p.clone(), "socks5://u:pw@keep2.example.net:1082")
+            .await
+            .unwrap();
+        // 同一个 host:port 连续三次录入（面板双击 / CLI 重跑）：覆盖语义 ⇒ 只留一条，
+        // 而且**绝不能**顺带带走别的成员
+        let mut hs = Vec::new();
+        for _ in 0..3 {
+            let (c2, p2) = (c.clone(), p.clone());
+            hs.push(tokio::spawn(async move {
+                add(&c2, p2, "socks5://u:pw2@dup.example.net:1083").await
+            }));
+        }
+        for h in hs {
+            h.await.unwrap().unwrap();
+        }
+        assert_eq!(
+            pool(&c).await,
+            vec![
+                "dup.example.net:1083".to_string(),
+                "keep1.example.net:1081".to_string(),
+                "keep2.example.net:1082".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_add_a_remove_and_a_finishing_check_only_drop_the_removed_member() {
+        let d = tempfile::tempdir().unwrap();
+        let c = ctx(&d).await;
+        let p = prober_ok("198.51.100.7");
+        for i in 1..=3u16 {
+            add(
+                &c,
+                p.clone(),
+                &format!("socks5://u:pw@isp{i}.example.net:{}", 1080 + i),
+            )
+            .await
+            .unwrap();
+        }
+        let g = rstate::group_of(&*c.store.read().await);
+        let (first, second) = (g.upstreams[0].id, g.upstreams[1].id);
+        // 三件事同时在跑：异步体检收尾（run_and_store 写回 verified/ports_allowed）、
+        // 删一条、再录一条
+        let (c1, c2, c3) = (c.clone(), c.clone(), c.clone());
+        let (p1, p3) = (p.clone(), p.clone());
+        let check = tokio::spawn(async move {
+            crate::modules::residential::check::run_and_store(&c1, p1, second).await
+        });
+        let rm = tokio::spawn(async move { remove(&c2, &UpstreamSel::Id(first)).await });
+        let added =
+            tokio::spawn(async move { add(&c3, p3, "socks5://u:pw@isp4.example.net:1084").await });
+        let _ = check.await.unwrap();
+        rm.await.unwrap().unwrap();
+        added.await.unwrap().unwrap();
+        assert_eq!(
+            pool(&c).await,
+            vec![
+                "isp2.example.net:1082".to_string(),
+                "isp3.example.net:1083".to_string(),
+                "isp4.example.net:1084".to_string()
+            ],
+            "只有被 remove 的那条可以消失"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_health_round_a_manual_select_and_a_replay_never_shrink_the_pool() {
+        use crate::api::Event;
+        use crate::modules::residential::clash::FakeClash;
+        use crate::modules::residential::health;
+        let d = tempfile::tempdir().unwrap();
+        let c = ctx(&d).await;
+        let p = prober_ok("198.51.100.7");
+        for i in 1..=2u16 {
+            add(
+                &c,
+                p.clone(),
+                &format!("socks5://u:pw@isp{i}.example.net:{}", 1080 + i),
+            )
+            .await
+            .unwrap();
+        }
+        let before = pool(&c).await;
+        let clash = std::sync::Arc::new(FakeClash::new(Some("resi-1")));
+        // replay_loop 必须先 subscribe 再 spawn（broadcast 丢弃无订阅者时的事件）
+        let rx = c.bus.subscribe();
+        let replay = tokio::spawn(health::replay_loop(c.clone(), clash.clone(), rx));
+        let ids = health::ids_of(&rstate::group_of(&*c.store.read().await));
+        let (c1, c2, c3) = (c.clone(), c.clone(), c.clone());
+        let (p1, cl1, cl2) = (p.clone(), clash.clone(), clash.clone());
+        let round = tokio::spawn(async move { health::check_round(&c1, p1, cl1, ids).await });
+        let sel_id = rstate::group_of(&*c.store.read().await).upstreams[1].id;
+        let select = tokio::spawn(async move { health::select_manual(&c2, cl2, sel_id).await });
+        // relay 重启多次：每次都触发一轮重放
+        for _ in 0..3 {
+            c.bus.send(Event::RelayRestarted);
+        }
+        let add3 = tokio::spawn(async move {
+            add(
+                &c3,
+                prober_ok("198.51.100.9"),
+                "socks5://u:pw@isp3.example.net:1083",
+            )
+            .await
+        });
+        round.await.unwrap().unwrap();
+        select.await.unwrap().unwrap();
+        add3.await.unwrap().unwrap();
+        // 给 replay_loop 一次调度机会后收工
+        tokio::task::yield_now().await;
+        replay.abort();
+        let after = pool(&c).await;
+        for e in &before {
+            assert!(
+                after.contains(e),
+                "巡检/手动切换/重放把 {e} 弄丢了：{after:?}"
+            );
+        }
+        assert_eq!(after.len(), 3, "只多了刚录入的那条：{after:?}");
+    }
+
+    /// 防线本身的回归：住宅段的任何**非 remove** 调用点都不许让池变短（R3 ①）。
+    #[tokio::test]
+    async fn an_unlabelled_group_update_cannot_shrink_the_pool() {
+        let d = tempfile::tempdir().unwrap();
+        let c = ctx(&d).await;
+        let p = prober_ok("198.51.100.7");
+        add(&c, p.clone(), "socks5://u:pw@isp1.example.net:1081")
+            .await
+            .unwrap();
+        add(&c, p, "socks5://u:pw@isp2.example.net:1082")
+            .await
+            .unwrap();
+        let e = rstate::update_group(&c.store, &c.bus, |g| {
+            g.upstreams.truncate(1); // 任何「顺手改住宅段」的代码都长这样
+        })
+        .await
+        .expect_err("非 remove 调用点缩短上游池必须被拒");
+        assert!(e.to_string().contains("upstream::remove"), "{e}");
+        assert_eq!(pool(&c).await.len(), 2, "拒写之后池子原样");
+        // 真正的删除路径照旧可用
+        let id = rstate::group_of(&*c.store.read().await).upstreams[0].id;
+        remove(&c, &UpstreamSel::Id(id)).await.unwrap();
+        assert_eq!(pool(&c).await, vec!["isp2.example.net:1082".to_string()]);
     }
 }

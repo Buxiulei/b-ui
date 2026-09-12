@@ -1665,10 +1665,18 @@ mod tests {
         );
         let (st, _) = call(&h.app, "POST", "/api/residential/enable", None).await;
         assert_eq!(st, StatusCode::OK);
-        // 空池启用 → 400（v3 同）
-        rstate::update_group(&h.ctx.store, &h.ctx.bus, |g| g.upstreams.clear())
-            .await
-            .unwrap();
+        // 空池启用 → 400（v3 同）。清空只走真正的删除路径：`Store::update_as` 的防线
+        // 只让 `upstream::remove` 缩短上游池（R3 ①），夹具不能绕过它。
+        for id in rstate::group_of(&*h.ctx.store.read().await)
+            .upstreams
+            .iter()
+            .map(|u| u.id)
+            .collect::<Vec<_>>()
+        {
+            upstream::remove(&h.ctx, &upstream::UpstreamSel::Id(id))
+                .await
+                .unwrap();
+        }
         let (st, v) = call(
             &h.app,
             "POST",
