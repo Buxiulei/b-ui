@@ -52,7 +52,7 @@ pub fn modules(manifest: Option<Manifest>) -> Registry {
             Arc::new(CertsModule),
             Arc::new(WatchdogModule),
             // P2 在此追加 UsersModule（面板 API + 采样 + auth 快照）
-            // P3 在此追加 ResidentialModule（体检 + 健康切换 + 黑名单）
+            Arc::new(crate::modules::residential::ResidentialModule::new()),
         ],
         manifest: handle,
     }
@@ -1017,10 +1017,24 @@ mod tests {
     fn p1_registers_exactly_six_modules_and_shares_the_manifest_handle() {
         let reg = modules(None);
         let names: Vec<&str> = reg.modules.iter().map(|m| m.name()).collect();
-        assert_eq!(
-            names,
-            vec!["core-files", "units", "system", "ssh", "certs", "watchdog"]
-        );
+        // 裁决 D14：子集断言，不再精确计数——P2 在这张表里加自己的模块名、P3 加
+        // "residential"，两条车道各追加一行字符串，`git` 冲突机械可解。注册顺序仍
+        // 由 modules() 自己保证：residential 的 render 返回空，同路径 artifact 的
+        // 覆盖顺序不受它影响（见契约决策 §B）
+        for want in [
+            "core-files",
+            "units",
+            "system",
+            "ssh",
+            "certs",
+            "watchdog",
+            "residential",
+        ] {
+            assert!(
+                names.contains(&want),
+                "模块 {want} 必须注册，实际 {names:?}"
+            );
+        }
         *reg.manifest.write().unwrap() = Some(Manifest {
             version: "4.0.1".into(),
             kernels: BTreeMap::new(),
