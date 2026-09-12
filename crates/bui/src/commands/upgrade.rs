@@ -544,6 +544,63 @@ mod tests {
         assert!(h.ops().contains(&"systemd:restart:b-ui".to_string()));
     }
 
+    /// 事故回归（2026-09-12 bwg-rick）：Hysteria2 的 `auth.command` 指的是
+    /// `<base>/bin/bui-auth-hook`，而那是一条目标为**相对** `bui` 的符号链接。
+    /// 升级与回滚都只是原地换掉 `bin/bui` 这个文件，所以链接天然指向换上来的那一版：
+    /// 谁都不需要重建它，反过来谁也不许把它删了。
+    ///
+    /// 上半段走真实文件系统（相对链接的解析语义正是被测对象，FakeHost 的 symlink 表证明不了
+    /// 这一点），只用 `apply_self`——它只读写文件，不碰 systemd；下半段拿 FakeHost 跑真正的
+    /// `rollback()`，确认它换完二进制之后链接还在、目标没被改写。
+    #[test]
+    fn the_auth_hook_symlink_keeps_pointing_at_bui_across_upgrade_and_rollback() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = bui_schema::paths::Paths {
+            base_dir: d.path().into(),
+            certs_dir: d.path().join("certs"),
+            bin_dir: d.path().join("bin"),
+        };
+        let real = crate::sys::real::RealHost::new();
+        let bui = paths.bin_dir.join("bui");
+        let hook = paths.auth_hook_bin();
+        real.write_file(&bui, b"OLDBUI", 0o755).unwrap();
+        real.symlink(std::path::Path::new("bui"), &hook).unwrap();
+        assert_eq!(std::fs::read(&hook).unwrap(), b"OLDBUI");
+
+        let payload = b"NEWBUI".to_vec();
+        let sum = crate::kernels::sha256_hex(&payload);
+        let m = manifest("4.0.1", "1.13.19", &sum);
+        let f = F(Mutex::new(vec![("https://x/bui".to_string(), payload)]));
+        apply_self(&real, &f, m.bui_asset("x86_64").unwrap(), &paths.bin_dir).unwrap();
+        assert_eq!(
+            std::fs::read(&hook).unwrap(),
+            b"NEWBUI",
+            "升级换掉 bin/bui 之后，钩子入口必须跟着走"
+        );
+        // 回滚那一步也只是把旧字节写回同一个文件名
+        real.write_file(&bui, b"OLDBUI", 0o755).unwrap();
+        assert_eq!(std::fs::read(&hook).unwrap(), b"OLDBUI");
+        assert_eq!(
+            real.read_link(&hook).unwrap().as_deref(),
+            Some(std::path::Path::new("bui")),
+            "目标必须一直是同目录的相对 `bui`，不许被重建成绝对路径"
+        );
+
+        // 真正的 rollback()：换完二进制不许动这条链接
+        let h = FakeHost::new();
+        h.write_file(&paths.bin_dir.join("bui.prev"), b"OLDBUI", 0o755)
+            .unwrap();
+        h.write_file(&bui, b"NEWBUI", 0o755).unwrap();
+        h.symlink(std::path::Path::new("bui"), &hook).unwrap();
+        rollback(&h, &paths).unwrap();
+        assert_eq!(h.text(bui.to_str().unwrap()).as_deref(), Some("OLDBUI"));
+        assert_eq!(
+            h.read_link(&hook).unwrap().as_deref(),
+            Some(std::path::Path::new("bui")),
+            "rollback 不许删掉或改写 bin/bui-auth-hook"
+        );
+    }
+
     #[test]
     fn rollback_without_a_previous_binary_is_an_explicit_error() {
         let d = tempfile::tempdir().unwrap();

@@ -34,12 +34,35 @@ use clap::{CommandFactory, Parser};
 use cli::{Cli, Command};
 use std::path::PathBuf;
 
-// main 是**同步**的：spec §3.2 要求 `bui auth-hook` 不初始化 tokio、不初始化 tracing、不加载 state
-// （M5 有 200 建连/秒、p99 < 20ms 的门槛，每次建连都要 fork 一个 bui），所以派发在建 runtime 之前
-// 先把 AuthHook 摘出去。其余子命令再建 runtime、初始化日志。P2 落地钩子时只替换下面那一支，
-// 不必回头重构入口。
+/// argv[0] 的文件名是否 `bui-auth-hook`（= Hysteria2 `auth.command` 指向的那条符号链接）。
+///
+/// 事故（2026-09-12 bwg-rick）：`auth.command` 只接受**单个可执行路径**——内核的
+/// `CommandAuthenticator` 直接 `exec.Command(a.Cmd, addr, auth, tx)`，不过 shell、不拆空格，
+/// 所以 `command: /opt/b-ui/bin/bui auth-hook` 被当成一个文件名带空格的可执行文件，钩子从未
+/// 被调用、两台 Hysteria2 实例全员鉴权失败（调研 H15）。正解是给 `bui` 加一个多调用名：
+/// `<base>/bin/bui-auth-hook` → `bui`，靠 argv[0] 分发。
+fn is_auth_hook_argv0(argv0: &std::ffi::OsStr) -> bool {
+    std::path::Path::new(argv0).file_name()
+        == Some(std::ffi::OsStr::new(bui_schema::paths::AUTH_HOOK_BIN))
+}
+
+// main 是**同步**的：spec §3.2 要求钩子不初始化 tokio、不初始化 tracing、不加载 state
+// （M5 有 200 建连/秒、p99 < 20ms 的门槛，每次建连都要 fork 一个 bui），所以两条钩子入口
+// （argv[0] = `bui-auth-hook`，以及保留的 `bui auth-hook` 子命令）都在建 runtime 之前摘出去。
+// 其余子命令再建 runtime、初始化日志。
 fn main() -> Result<()> {
-    let argv0 = std::env::args().next().unwrap_or_default();
+    // argv[0] 分发必须在 clap **之前**：内核调的是 `bui-auth-hook <addr> <auth> <tx>`，
+    // 里面没有子命令，交给 clap 只会被判成未知参数（退出码 2 = 拒绝，但连日志都没有）。
+    let mut argv = std::env::args_os();
+    let argv0 = argv.next().unwrap_or_default();
+    if is_auth_hook_argv0(&argv0) {
+        let args: Vec<String> = argv
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        // 与下面那一支同样的极简路径：不建 tokio runtime、不初始化 tracing、不加载 state
+        std::process::exit(modules::panel::auth_hook::run(&args));
+    }
+    let argv0 = argv0.to_string_lossy().into_owned();
     let args = Cli::parse();
     // 总纲 C5：只打印版本号
     if args.version {
@@ -157,5 +180,49 @@ async fn dispatch(command: Command) -> Result<()> {
             )
             .await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    /// 事故回归（2026-09-12）：`auth.command` 只能是一个**不带参数**的可执行路径，
+    /// 所以钩子的入口是 `bin/bui-auth-hook` 这个符号链接 + argv[0] 分发。
+    /// 判定只看**文件名**（内核给的是绝对路径），且必须在 clap 解析之前生效：
+    /// `bui-auth-hook <addr> <auth> <tx>` 里没有子命令，交给 clap 只会被判成未知参数。
+    #[test]
+    fn recognizes_the_auth_hook_entry_by_its_file_name() {
+        for yes in [
+            "bui-auth-hook",
+            "/opt/b-ui/bin/bui-auth-hook",
+            "./bui-auth-hook",
+            "/tmp/x/bui-auth-hook",
+        ] {
+            assert!(is_auth_hook_argv0(OsStr::new(yes)), "{yes} 应该进钩子");
+        }
+        for no in [
+            "bui",
+            "/opt/b-ui/bin/bui",
+            "b-ui",
+            "/usr/local/bin/b-ui",
+            "bui-auth-hook2",
+            "bui-auth-hookx",
+            "xbui-auth-hook",
+            "bui auth-hook", // 事故现场那个「文件名带空格」的兜底包装脚本
+            "",
+            "/opt/b-ui/bin/",
+        ] {
+            assert!(!is_auth_hook_argv0(OsStr::new(no)), "{no} 不该进钩子");
+        }
+        // 非 UTF-8 的 argv[0] 也不能 panic（file_name 比对走字节）
+        assert!(!is_auth_hook_argv0(OsStr::from_bytes(b"/bin/\xff\xfe")));
+        assert!(is_auth_hook_argv0(
+            bui_schema::paths::Paths::default_server()
+                .auth_hook_bin()
+                .as_os_str()
+        ));
     }
 }
