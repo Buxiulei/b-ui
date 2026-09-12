@@ -184,8 +184,20 @@ pub async fn update_group(
     bus: &EventBus,
     f: impl FnOnce(&mut ResidentialGroup),
 ) -> anyhow::Result<()> {
+    update_group_as(store, bus, crate::state::store::CALLER_UNLABELED, f).await
+}
+
+/// 同 [`update_group`]，但带调用点标签。**只有 `upstream::remove` 需要它**：
+/// `Store::update_as` 的防线只让 [`crate::state::store::CALLER_RESI_REMOVE`]
+/// 缩短上游池（R3 ①）。
+pub async fn update_group_as(
+    store: &Store,
+    bus: &EventBus,
+    caller: &'static str,
+    f: impl FnOnce(&mut ResidentialGroup),
+) -> anyhow::Result<()> {
     store
-        .update(|s| {
+        .update_as(caller, |s| {
             let g = s
                 .residential
                 .groups

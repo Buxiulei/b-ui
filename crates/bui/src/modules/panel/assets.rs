@@ -48,9 +48,28 @@ pub fn content_type(name: &str) -> &'static str {
     }
 }
 
-/// 取一个嵌入的前端文件（不存在返回 None）
+/// `index.html` 里的版本号占位符（v3 `web/server.js:1234` 的 `loadHTML()` 同样在发出前替换）
+pub const VERSION_PLACEHOLDER: &str = "${VERSION}";
+
+/// 取一个嵌入的前端文件（不存在返回 None）。
+///
+/// `index.html` 的 `${VERSION}` **全部**替换成本二进制的版本号：v3 由
+/// `web/server.js` 的 `loadHTML()` 在发出前 `replace(/\${VERSION}/g, VERSION)`，
+/// v4 把前端编进二进制后这一步一度漏掉，面板首页于是字面显示 `v${VERSION}`。
+/// 其余资源（`app.js` / `style.css` / `qrcode.min.js` / `logo.jpg`）原样返回。
 pub fn web_file(name: &str) -> Option<Vec<u8>> {
-    Web::get(name).map(|f| f.data.into_owned())
+    let bytes = Web::get(name).map(|f| f.data.into_owned())?;
+    if name != "index.html" {
+        return Some(bytes);
+    }
+    // index.html 是仓库里的 UTF-8 文本；真出现非法字节时宁可原样发出，也不要 500
+    match String::from_utf8(bytes) {
+        Ok(html) => Some(
+            html.replace(VERSION_PLACEHOLDER, env!("CARGO_PKG_VERSION"))
+                .into_bytes(),
+        ),
+        Err(e) => Some(e.into_bytes()),
+    }
 }
 
 /// 取嵌入的 `bui-c-install.sh`（P4 Task 13 未合并时返回 None）
@@ -166,6 +185,43 @@ mod tests {
         assert!(
             js.contains("api(\"/users\", {"),
             "addUser 没改成 POST /api/users"
+        );
+    }
+
+    /// 面板首页不能再字面显示 `v${VERSION}`（v3 `web/server.js` 的 `loadHTML()` 会替换，
+    /// v4 把前端编进二进制后漏了这一步）。只对 index.html 替换，其余资源必须原样。
+    #[tokio::test]
+    async fn index_html_gets_the_real_version_and_other_assets_stay_byte_identical() {
+        let html = String::from_utf8(web_file("index.html").unwrap()).unwrap();
+        assert!(
+            !html.contains(VERSION_PLACEHOLDER),
+            "index.html 还留着 {VERSION_PLACEHOLDER} 占位符"
+        );
+        let want = format!("v{}", env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            html.matches(&want).count(),
+            2,
+            "index.html 里两处版本号都要替换（登录副标题 + 顶部 ver-tag）"
+        );
+        for name in ["app.js", "style.css", "qrcode.min.js", "logo.jpg"] {
+            assert_eq!(
+                web_file(name).unwrap(),
+                Web::get(name).unwrap().data.into_owned(),
+                "{name} 不该被改一个字节"
+            );
+        }
+        // 真发出去的那份也替换过，且 Content-Length 跟着替换后的长度走（axum 按 body 现算）
+        let h = harness().await;
+        let router = full_with(&h.app, axum::Router::new(), public_routes(h.shared.clone()));
+        let (s, headers, bytes) = raw(&router, "GET", "/", None, None).await;
+        assert_eq!(s, axum::http::StatusCode::OK);
+        let served = String::from_utf8(bytes.clone()).unwrap();
+        assert!(!served.contains(VERSION_PLACEHOLDER), "/ 发出的还是占位符");
+        assert!(served.contains(&want));
+        assert_eq!(
+            headers["content-length"].to_str().unwrap(),
+            bytes.len().to_string(),
+            "Content-Length 要与替换后的正文一致"
         );
     }
 
