@@ -1,1 +1,983 @@
-//! placeholder filled by Task 8
+//! 管理员 API（spec §4.3）。路径与响应形状沿用 v3（`web/app.js` 不改），四处改动见计划的契约表。
+//!
+//! 所有 handler 只改 `state` 并发 `Event::StateChanged(..)`：快照重写与 Xray gRPC 差分由
+//! `users::sync_loop` 统一做（幂等 + 60 秒安全网），内核配置重渲染与重启映射由 P1 的对账做。
+
+use super::users;
+use super::{Shared, HY2_STATS_PORT_DIRECT, HY2_STATS_PORT_RESI};
+use crate::api::{AppState, Event};
+use crate::state::runtime::WatchdogRecord;
+use axum::body::Bytes;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use bui_schema::model::State as BuiState;
+use serde::de::DeserializeOwned;
+use serde::Serialize;
+use serde_json::json;
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+fn ok_json<T: Serialize>(v: T) -> Response {
+    (StatusCode::OK, Json(v)).into_response()
+}
+
+fn fail(status: StatusCode, msg: impl Into<String>) -> Response {
+    (status, Json(json!({"error": msg.into()}))).into_response()
+}
+
+/// v3 对坏请求体回 `400 {"error":"请求格式错误（JSON 解析失败）"}`（`web/server.js:1948-1955`），
+/// 而 axum 的 `Json<T>` 提取器回 422 + 自己的文案，所以这里手工解析。
+///
+/// 返回 `Option` 而不是 `Result<T, Response>`：`Response` 有 128 字节，
+/// 塞进 `Err` 会打红 `clippy::result_large_err`。空体与坏 JSON 的回包完全一样，
+/// 所以区分二者没有意义，失败一律由 [`bad_json`] 生成回包。
+fn parse_json<T: DeserializeOwned>(body: &Bytes) -> Option<T> {
+    if body.is_empty() {
+        return None;
+    }
+    serde_json::from_slice(body).ok()
+}
+
+fn bad_json() -> Response {
+    fail(StatusCode::BAD_REQUEST, "请求格式错误（JSON 解析失败）")
+}
+
+/// `GET /api/config` 的响应（形状逐字段照 v3 `getConfig`，`web/server.js:392-489`）
+pub fn config_payload(s: &BuiState) -> serde_json::Value {
+    let ph = match s.node.ports.hy2_hop {
+        Some((start, end)) => json!({"enabled": true, "start": start, "end": end}),
+        // v3 在没有区间时给的也是这对默认值（`getConfig` 的 portHopping 初值）
+        None => json!({"enabled": false, "start": 20000, "end": 30000}),
+    };
+    json!({
+        "domain": s.node.domain,
+        // v3 的 `port` 来自正则捕获，是**字符串**；前端直接拼进 URL，这里保持同型
+        "port": s.node.ports.hy2.to_string(),
+        "xrayPort": s.node.ports.reality_direct,
+        "pubKey": s.node.reality.public_key,
+        "shortId": s.node.reality.short_id(),
+        "sni": s.node.reality.sni(),
+        "portHopping": ph,
+        "obfs": {
+            "enabled": s.node.obfs.enabled,
+            "type": if s.node.obfs.enabled { "salamander" } else { "" },
+            "password": s.node.obfs.password,
+        },
+    })
+}
+
+/// `GET /api/masquerade` 的响应
+pub fn masquerade_payload(s: &BuiState) -> serde_json::Value {
+    let d = s.node.reality.sni();
+    json!({"masqueradeUrl": format!("https://{d}/"), "masqueradeDomain": d})
+}
+
+/// 移植 v3 的 `b.url.replace(/https?:\/\/([^/:]+).*/, "$1")`（`web/server.js:2588`）。
+pub fn host_of(url: &str) -> String {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    rest.split(['/', ':']).next().unwrap_or("").to_string()
+}
+
+/// `runtime.watchdog` → v3 `/api/hy2/watchdog/status` 的形状（兼容 shim，见契约表 #21）
+pub fn watchdog_payload(w: &BTreeMap<String, WatchdogRecord>) -> serde_json::Value {
+    let fail_count: u32 = w.values().map(|r| r.fails).sum();
+    let last_run_at = w.values().filter_map(|r| r.last_restart_at.clone()).max();
+    let mut lines: Vec<String> = w
+        .iter()
+        .filter_map(|(unit, r)| {
+            r.last_restart_at.as_ref().map(|t| {
+                format!(
+                    "{t} {unit} 已重启 {} 次（连续失败 {}）",
+                    r.restarts, r.fails
+                )
+            })
+        })
+        .collect();
+    lines.sort();
+    lines.reverse();
+    lines.truncate(5);
+    json!({
+        // v4 的 watchdog 是守护进程内的常驻任务，没有 timer；只要面板答得出这一问，它就在跑
+        "watchdog_active": true,
+        "next_run_at": serde_json::Value::Null,
+        "last_run_at": last_run_at,
+        "fail_count": fail_count,
+        "log_recent_lines": lines,
+    })
+}
+
+async fn blocked_now(app: &AppState, shared: &Shared) -> std::collections::BTreeSet<uuid::Uuid> {
+    let now = app.host.now();
+    let pending = shared.pending().await.clone();
+    let state = app.store.read().await;
+    users::blocked_set(&state, &pending, now)
+}
+
+async fn list_users(State(app): State<AppState>, shared: Arc<Shared>) -> Response {
+    let blocked = blocked_now(&app, &shared).await;
+    let state = app.store.read().await;
+    ok_json(users::project_all(&state, &blocked))
+}
+
+async fn create_user(State(app): State<AppState>, body: Bytes) -> Response {
+    let Some(req) = parse_json::<users::CreateRequest>(&body) else {
+        return bad_json();
+    };
+    let user = match users::new_user(&req, app.host.now()) {
+        Ok(u) => u,
+        Err(e) => return fail(StatusCode::BAD_REQUEST, e),
+    };
+    let mut dup = false;
+    let to_push = user.clone();
+    if let Err(e) = app
+        .store
+        .update(|s| {
+            if s.users.iter().any(|u| u.username == to_push.username) {
+                dup = true;
+                return;
+            }
+            s.users.push(to_push);
+        })
+        .await
+    {
+        return fail(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Save failed: {e}"),
+        );
+    }
+    if dup {
+        return fail(StatusCode::BAD_REQUEST, "用户名已存在");
+    }
+    app.bus.send(Event::StateChanged("users"));
+    let sni = app.store.read().await.node.reality.sni().to_string();
+    ok_json(json!({
+        "success": true,
+        "user": user.username,
+        "password": user.credentials.hy2_password,
+        "uuid": user.credentials.vless_uuid,
+        // 回显真正生效的 SNI（v4 全局唯一），请求里的 `sni` 被忽略（决策 D13）
+        "sni": sni,
+    }))
+}
+
+async fn update_user(
+    State(app): State<AppState>,
+    Path(username): Path<String>,
+    body: Bytes,
+) -> Response {
+    if let Err(e) = users::validate_username(&username) {
+        return fail(StatusCode::BAD_REQUEST, format!("URL 中的 {e}"));
+    }
+    let Some(req) = parse_json::<users::UpdateRequest>(&body) else {
+        return bad_json();
+    };
+    let now = app.host.now();
+    let mut missing = false;
+    let mut problem: Option<String> = None;
+    let mut new_name = username.clone();
+    if let Err(e) = app
+        .store
+        .update(|s| {
+            if let Some(n) = &req.username {
+                if n != &username && s.users.iter().any(|u| &u.username == n) {
+                    problem = Some("Username already exists".into());
+                    return;
+                }
+            }
+            match s.users.iter().position(|u| u.username == username) {
+                None => missing = true,
+                Some(i) => {
+                    // 改在副本上，成功才写回：`apply_update` 中途报错不能留下半改的用户
+                    let mut copy = s.users[i].clone();
+                    match users::apply_update(&mut copy, &req, now) {
+                        Ok(()) => {
+                            new_name = copy.username.clone();
+                            s.users[i] = copy;
+                        }
+                        Err(e) => problem = Some(e),
+                    }
+                }
+            }
+        })
+        .await
+    {
+        return fail(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Save failed: {e}"),
+        );
+    }
+    if missing {
+        return fail(StatusCode::NOT_FOUND, "User not found");
+    }
+    if let Some(e) = problem {
+        return fail(StatusCode::BAD_REQUEST, e);
+    }
+    app.bus.send(Event::StateChanged("users"));
+    ok_json(json!({"success": true, "user": new_name}))
+}
+
+async fn delete_user(State(app): State<AppState>, Path(username): Path<String>) -> Response {
+    let mut removed = false;
+    if let Err(e) = app
+        .store
+        .update(|s| {
+            let before = s.users.len();
+            s.users.retain(|u| u.username != username);
+            removed = s.users.len() != before;
+        })
+        .await
+    {
+        return fail(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Save failed: {e}"),
+        );
+    }
+    if !removed {
+        return fail(StatusCode::NOT_FOUND, "User not found");
+    }
+    app.bus.send(Event::StateChanged("users"));
+    ok_json(json!({"success": true}))
+}
+
+async fn get_stats(shared: Arc<Shared>) -> Response {
+    ok_json(shared.cache().await.stats.clone())
+}
+
+async fn get_online(shared: Arc<Shared>) -> Response {
+    ok_json(shared.cache().await.online.clone())
+}
+
+async fn kick(State(app): State<AppState>, shared: Arc<Shared>, body: Bytes) -> Response {
+    let Some(names) = parse_json::<Vec<String>>(&body) else {
+        return bad_json();
+    };
+    let ids: Vec<String> = {
+        let state = app.store.read().await;
+        state
+            .users
+            .iter()
+            .filter(|u| names.contains(&u.username))
+            .map(|u| u.user_id.to_string())
+            .collect()
+    };
+    let mut all_ok = true;
+    for port in [HY2_STATS_PORT_DIRECT, HY2_STATS_PORT_RESI] {
+        if let Err(e) = shared.hy2().kick(port, &ids).await {
+            tracing::warn!(port, error = %e, "kick 失败");
+            all_ok = false;
+        }
+    }
+    ok_json(json!({"success": all_ok, "kicked": ids.len()}))
+}
+
+async fn get_config(State(app): State<AppState>) -> Response {
+    let s = app.store.read().await;
+    ok_json(config_payload(&s))
+}
+
+async fn set_password(State(app): State<AppState>, body: Bytes) -> Response {
+    let Some(v) = parse_json::<serde_json::Value>(&body) else {
+        return bad_json();
+    };
+    let pw = v.get("newPassword").and_then(|x| x.as_str()).unwrap_or("");
+    if pw.chars().count() < 6 {
+        return fail(StatusCode::BAD_REQUEST, "密码至少6位");
+    }
+    let hash = match crate::api::auth::hash_password(pw) {
+        Ok(h) => h,
+        Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, format!("哈希失败：{e}")),
+    };
+    // 决策 D11：轮换 JWT 密钥，让旧 token 立即失效（v3 靠重启进程达到同样效果）
+    let secret = hex::encode(rand::random::<[u8; 32]>());
+    tracing::info!(password = %crate::redact::secret(pw), "管理员密码已更新并轮换 JWT 密钥");
+    if let Err(e) = app
+        .store
+        .update(|s| {
+            s.admin.password_hash = hash;
+            s.admin.jwt_secret = secret;
+        })
+        .await
+    {
+        return fail(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Save failed: {e}"),
+        );
+    }
+    ok_json(json!({"success": true, "message": "密码已更新，请重新登录"}))
+}
+
+async fn get_masquerade(State(app): State<AppState>) -> Response {
+    let s = app.store.read().await;
+    ok_json(masquerade_payload(&s))
+}
+
+async fn set_masquerade(State(app): State<AppState>, body: Bytes) -> Response {
+    let Some(v) = parse_json::<serde_json::Value>(&body) else {
+        return bad_json();
+    };
+    let Some(url) = v.get("url").and_then(|x| x.as_str()) else {
+        return fail(StatusCode::BAD_REQUEST, "URL required");
+    };
+    let domain = host_of(url);
+    if domain.is_empty() || !domain.contains('.') {
+        return fail(StatusCode::BAD_REQUEST, "URL required");
+    }
+    let d = domain.clone();
+    if let Err(e) = app
+        .store
+        .update(|s| {
+            s.node.reality.dest = format!("{d}:443");
+            s.node.reality.server_names = vec![d];
+        })
+        .await
+    {
+        return fail(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Save failed: {e}"),
+        );
+    }
+    // 对账会重写 xray-config.json（结构哈希变 ⇒ 重启 xray）与两份 hysteria 配置
+    // （`masquerade.proxy.url` 由 `reality.sni()` 推导 ⇒ 重启两个 hysteria）
+    app.bus.send(Event::StateChanged("masquerade"));
+    ok_json(json!({"success": true, "domain": domain}))
+}
+
+async fn get_bandwidth() -> Response {
+    // 决策 D5：v4 的 hysteria 配置固定 `ignoreClientBandwidth: true`，没有服务端带宽设置
+    ok_json(json!({"up": 0, "down": 0}))
+}
+
+async fn set_bandwidth() -> Response {
+    fail(
+        StatusCode::NOT_IMPLEMENTED,
+        "v4 不再设置服务端带宽：config.yaml 固定 ignoreClientBandwidth: true",
+    )
+}
+
+async fn get_port_hopping(State(app): State<AppState>) -> Response {
+    let s = app.store.read().await;
+    match s.node.ports.hy2_hop {
+        Some((start, end)) => ok_json(json!({"enabled": true, "start": start, "end": end})),
+        None => ok_json(json!({"enabled": false, "start": 20000, "end": 30000})),
+    }
+}
+
+async fn set_port_hopping(State(app): State<AppState>, body: Bytes) -> Response {
+    let Some(v) = parse_json::<serde_json::Value>(&body) else {
+        return bad_json();
+    };
+    let enabled = v.get("enabled").and_then(|x| x.as_bool()).unwrap_or(false);
+    let start = v.get("start").and_then(|x| x.as_u64()).unwrap_or(20000) as u16;
+    let end = v.get("end").and_then(|x| x.as_u64()).unwrap_or(30000) as u16;
+    if enabled && start >= end {
+        return fail(StatusCode::BAD_REQUEST, "起始端口必须小于结束端口");
+    }
+    let want = if enabled { Some((start, end)) } else { None };
+    // 值没变就不发事件：`StateChanged("ports")` 会触发一轮去抖对账，而对账把 `listen:` 行
+    // 判成「要改」时会**重启 hysteria-server**。前端的「关掉→再关掉」不该踢掉所有连接。
+    let changed = app.store.read().await.node.ports.hy2_hop != want;
+    if changed {
+        if let Err(e) = app.store.update(|s| s.node.ports.hy2_hop = want).await {
+            return fail(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Save failed: {e}"),
+            );
+        }
+        // 审计 web-C13：v3 在这里写 iptables REDIRECT；v4 改 `listen:` 行 + 重启，零 iptables 规则
+        app.bus.send(Event::StateChanged("ports"));
+    }
+    ok_json(json!({"success": true, "enabled": enabled, "start": start, "end": end}))
+}
+
+async fn watchdog_status(State(app): State<AppState>) -> Response {
+    ok_json(watchdog_payload(&app.runtime.read().await.watchdog))
+}
+
+/// 裁决 D2：`/api/health` 不加用户段，摘要由这条管理员端点透出（写入侧是 T7 的 `write_health_summary`）
+pub fn users_health_payload(rt: &crate::state::runtime::RuntimeData) -> serde_json::Value {
+    rt.extra
+        .get("users")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}))
+}
+
+async fn users_health(State(app): State<AppState>) -> Response {
+    ok_json(users_health_payload(&app.runtime.read().await))
+}
+
+/// 全部端点都要求 JWT（由 P1 的 `require_admin` 统一拦），路径与响应形状照 v3
+pub fn routes(shared: Arc<Shared>) -> axum::Router<AppState> {
+    use axum::routing::{get, post};
+    let s_list = shared.clone();
+    let s_stats = shared.clone();
+    let s_online = shared.clone();
+    let s_kick = shared.clone();
+    axum::Router::new()
+        .route(
+            "/api/users",
+            get(move |st: State<AppState>| list_users(st, s_list.clone())).post(create_user),
+        )
+        .route(
+            "/api/users/{username}",
+            axum::routing::put(update_user).delete(delete_user),
+        )
+        .route("/api/stats", get(move || get_stats(s_stats.clone())))
+        .route("/api/online", get(move || get_online(s_online.clone())))
+        .route(
+            "/api/kick",
+            post(move |st: State<AppState>, body: Bytes| kick(st, s_kick.clone(), body)),
+        )
+        .route("/api/config", get(get_config))
+        .route("/api/password", post(set_password))
+        .route("/api/masquerade", get(get_masquerade).post(set_masquerade))
+        .route("/api/bandwidth", get(get_bandwidth).post(set_bandwidth))
+        .route(
+            "/api/port-hopping",
+            get(get_port_hopping).post(set_port_hopping),
+        )
+        .route("/api/hy2/watchdog/status", get(watchdog_status))
+        // 静态段优先于 `/api/users/{username}`（matchit 的静态优先规则），所以它不会被
+        // 路径参数吃掉；`{username}` 只挂 PUT / DELETE，GET 也不冲突
+        .route("/api/users/health", get(users_health))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::modules::panel::testsupport::{full_with, harness, mount, send, token, Harness};
+    use crate::modules::panel::TxRx;
+    use pretty_assertions::assert_eq;
+
+    async fn app(h: &Harness) -> (axum::Router, String) {
+        (mount(&h.app, routes(h.shared.clone())), token(h).await)
+    }
+
+    #[test]
+    fn host_of_strips_scheme_port_and_path() {
+        assert_eq!(host_of("https://www.bing.com/"), "www.bing.com");
+        assert_eq!(host_of("http://www.bing.com"), "www.bing.com");
+        assert_eq!(host_of("https://a.example.com:8443/x?y=1"), "a.example.com");
+        assert_eq!(host_of("www.bing.com"), "www.bing.com");
+        assert_eq!(host_of(""), "");
+    }
+
+    #[tokio::test]
+    async fn config_matches_the_v3_shape() {
+        let h = harness().await;
+        let (r, t) = app(&h).await;
+        let (s, v) = send(&r, "GET", "/api/config", Some(&t), None).await;
+        assert_eq!(s, axum::http::StatusCode::OK);
+        assert_eq!(v["domain"], "example.com");
+        assert_eq!(v["port"], "10000", "v3 的 port 是字符串");
+        assert_eq!(v["xrayPort"], 10001);
+        assert_eq!(v["pubKey"], "cTpW46LZoWSn3XlHahzkRh3CMpu-pEQUOk7-seT7W1c");
+        assert_eq!(v["shortId"], "0123456789abcdef");
+        assert_eq!(v["sni"], "www.bing.com");
+        assert_eq!(
+            v["portHopping"],
+            serde_json::json!({"enabled": true, "start": 20000, "end": 30000})
+        );
+        assert_eq!(
+            v["obfs"],
+            serde_json::json!({"enabled": false, "type": "", "password": ""})
+        );
+    }
+
+    #[tokio::test]
+    async fn users_list_is_the_v3_projection() {
+        let h = harness().await;
+        let (r, t) = app(&h).await;
+        let (s, v) = send(&r, "GET", "/api/users", Some(&t), None).await;
+        assert_eq!(s, axum::http::StatusCode::OK);
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["username"], "alice");
+        assert_eq!(arr[0]["protocol"], "fusion");
+        assert_eq!(arr[0]["usage"]["total"], 0);
+    }
+
+    #[tokio::test]
+    async fn creating_a_user_uses_post_with_jwt_and_emits_a_state_change() {
+        let h = harness().await;
+        let (r, t) = app(&h).await;
+        let mut rx = h.app.bus.subscribe();
+        let (s, v) = send(
+            &r,
+            "POST",
+            "/api/users",
+            Some(&t),
+            Some(serde_json::json!({
+                "username": "bob", "days": 30, "traffic": 1.5, "monthly": 0,
+                "protocol": "fusion", "residential": true, "sni": "ignored", "speed": 100
+            })),
+        )
+        .await;
+        assert_eq!(s, axum::http::StatusCode::OK);
+        assert_eq!(v["success"], true);
+        assert_eq!(v["user"], "bob");
+        assert_eq!(v["password"].as_str().unwrap().len(), 16);
+        assert_eq!(
+            v["sni"], "www.bing.com",
+            "回显真正生效的 SNI，不是请求里那个（决策 D13）"
+        );
+        assert!(v["uuid"].as_str().is_some());
+        assert_eq!(h.store.read().await.users.len(), 2);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            crate::api::Event::StateChanged("users")
+        );
+    }
+
+    #[tokio::test]
+    async fn create_rejects_duplicates_bad_names_bad_protocols_and_broken_json() {
+        let h = harness().await;
+        let (r, t) = app(&h).await;
+        let (s, v) = send(
+            &r,
+            "POST",
+            "/api/users",
+            Some(&t),
+            Some(serde_json::json!({"username": "alice"})),
+        )
+        .await;
+        assert_eq!(s, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(v["error"], "用户名已存在");
+        let (s2, v2) = send(
+            &r,
+            "POST",
+            "/api/users",
+            Some(&t),
+            Some(serde_json::json!({"username": "a/b"})),
+        )
+        .await;
+        assert_eq!(s2, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            v2["error"],
+            "username 仅允许字母/数字/中文/下划线/连字符/点"
+        );
+        let (s3, _) = send(
+            &r,
+            "POST",
+            "/api/users",
+            Some(&t),
+            Some(serde_json::json!({"username": "c", "protocol": "vless-ws-tls"})),
+        )
+        .await;
+        assert_eq!(s3, axum::http::StatusCode::BAD_REQUEST);
+        // 空 / 坏请求体要回 v3 的 400 文案，不是 axum 默认的 422
+        let (s4, v4) = send(&r, "POST", "/api/users", Some(&t), None).await;
+        assert_eq!(s4, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(v4["error"], "请求格式错误（JSON 解析失败）");
+        assert_eq!(h.store.read().await.users.len(), 1, "失败请求不能改 state");
+    }
+
+    #[tokio::test]
+    async fn update_and_delete_follow_the_v3_contract() {
+        let h = harness().await;
+        let (r, t) = app(&h).await;
+        let (s, v) = send(
+            &r,
+            "PUT",
+            "/api/users/alice",
+            Some(&t),
+            Some(
+                serde_json::json!({"username": "alice2", "days": 10, "traffic": 2, "monthly": 0, "speed": 50}),
+            ),
+        )
+        .await;
+        assert_eq!(s, axum::http::StatusCode::OK);
+        assert_eq!(v, serde_json::json!({"success": true, "user": "alice2"}));
+        assert_eq!(h.store.read().await.users[0].username, "alice2");
+        let (s404, v404) = send(
+            &r,
+            "PUT",
+            "/api/users/nope",
+            Some(&t),
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(s404, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(v404["error"], "User not found");
+        let (sd, vd) = send(&r, "DELETE", "/api/users/alice2", Some(&t), None).await;
+        assert_eq!(sd, axum::http::StatusCode::OK);
+        assert_eq!(vd, serde_json::json!({"success": true}));
+        assert!(h.store.read().await.users.is_empty());
+        assert_eq!(
+            send(&r, "DELETE", "/api/users/alice2", Some(&t), None)
+                .await
+                .0,
+            axum::http::StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn renaming_onto_an_existing_username_is_rejected_and_changes_nothing() {
+        let h = harness().await;
+        let (r, t) = app(&h).await;
+        send(
+            &r,
+            "POST",
+            "/api/users",
+            Some(&t),
+            Some(serde_json::json!({"username": "bob"})),
+        )
+        .await;
+        let (s, v) = send(
+            &r,
+            "PUT",
+            "/api/users/bob",
+            Some(&t),
+            Some(serde_json::json!({"username": "alice"})),
+        )
+        .await;
+        assert_eq!(s, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(v["error"], "Username already exists");
+        let names: Vec<String> = h
+            .store
+            .read()
+            .await
+            .users
+            .iter()
+            .map(|u| u.username.clone())
+            .collect();
+        assert_eq!(names, vec!["alice".to_string(), "bob".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn stats_and_online_come_from_the_shared_cache() {
+        let h = harness().await;
+        let (r, t) = app(&h).await;
+        {
+            let mut c = h.shared.cache_mut().await;
+            c.stats.insert("alice".into(), TxRx { tx: 7, rx: 8 });
+            c.online.insert("alice".into(), 2);
+        }
+        let (_, v) = send(&r, "GET", "/api/stats", Some(&t), None).await;
+        assert_eq!(v, serde_json::json!({"alice": {"tx": 7, "rx": 8}}));
+        let (_, o) = send(&r, "GET", "/api/online", Some(&t), None).await;
+        assert_eq!(o, serde_json::json!({"alice": 2}));
+    }
+
+    #[tokio::test]
+    async fn kick_translates_usernames_into_user_ids_for_both_instances() {
+        let h = harness().await;
+        let (r, t) = app(&h).await;
+        let id = h.store.read().await.users[0].user_id;
+        let (s, v) = send(
+            &r,
+            "POST",
+            "/api/kick",
+            Some(&t),
+            Some(serde_json::json!(["alice", "ghost"])),
+        )
+        .await;
+        assert_eq!(s, axum::http::StatusCode::OK);
+        assert_eq!(v, serde_json::json!({"success": true, "kicked": 1}));
+        assert_eq!(
+            h.hy2.calls(),
+            vec![format!("kick:9999:{id}"), format!("kick:9998:{id}")]
+        );
+    }
+
+    #[tokio::test]
+    async fn changing_the_admin_password_rehashes_and_rotates_the_jwt_secret() {
+        let h = harness().await;
+        let (r, t) = app(&h).await;
+        let before = h.store.read().await.admin.jwt_secret.clone();
+        let (s, v) = send(
+            &r,
+            "POST",
+            "/api/password",
+            Some(&t),
+            Some(serde_json::json!({"newPassword": "short"})),
+        )
+        .await;
+        assert_eq!(s, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(v["error"], "密码至少6位");
+        let (s2, v2) = send(
+            &r,
+            "POST",
+            "/api/password",
+            Some(&t),
+            Some(serde_json::json!({"newPassword": "newpass123"})),
+        )
+        .await;
+        assert_eq!(s2, axum::http::StatusCode::OK);
+        assert_eq!(
+            v2,
+            serde_json::json!({"success": true, "message": "密码已更新，请重新登录"})
+        );
+        let st = h.store.read().await;
+        assert!(crate::api::auth::verify_password(
+            &st.admin.password_hash,
+            "newpass123"
+        ));
+        assert_ne!(st.admin.jwt_secret, before, "决策 D11：旧 token 立即失效");
+    }
+
+    #[tokio::test]
+    async fn masquerade_reads_and_writes_the_reality_dest() {
+        let h = harness().await;
+        let (r, t) = app(&h).await;
+        let (_, v) = send(&r, "GET", "/api/masquerade", Some(&t), None).await;
+        assert_eq!(
+            v,
+            serde_json::json!({"masqueradeUrl": "https://www.bing.com/", "masqueradeDomain": "www.bing.com"})
+        );
+        let mut rx = h.app.bus.subscribe();
+        let (s, out) = send(
+            &r,
+            "POST",
+            "/api/masquerade",
+            Some(&t),
+            Some(serde_json::json!({"url": "https://www.apple.com/"})),
+        )
+        .await;
+        assert_eq!(s, axum::http::StatusCode::OK);
+        assert_eq!(
+            out,
+            serde_json::json!({"success": true, "domain": "www.apple.com"})
+        );
+        let st = h.store.read().await;
+        assert_eq!(st.node.reality.dest, "www.apple.com:443");
+        assert_eq!(
+            st.node.reality.server_names,
+            vec!["www.apple.com".to_string()]
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            crate::api::Event::StateChanged("masquerade")
+        );
+        let (bad, _) = send(
+            &r,
+            "POST",
+            "/api/masquerade",
+            Some(&t),
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(bad, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn port_hopping_writes_the_listen_range_instead_of_iptables() {
+        let h = harness().await;
+        let (r, t) = app(&h).await;
+        let (_, v) = send(&r, "GET", "/api/port-hopping", Some(&t), None).await;
+        assert_eq!(
+            v,
+            serde_json::json!({"enabled": true, "start": 20000, "end": 30000})
+        );
+        let mut rx = h.app.bus.subscribe();
+        let (s, out) = send(
+            &r,
+            "POST",
+            "/api/port-hopping",
+            Some(&t),
+            Some(serde_json::json!({"enabled": true, "start": 21000, "end": 22000})),
+        )
+        .await;
+        assert_eq!(s, axum::http::StatusCode::OK);
+        assert_eq!(
+            out,
+            serde_json::json!({"success": true, "enabled": true, "start": 21000, "end": 22000})
+        );
+        assert_eq!(
+            h.store.read().await.node.ports.hy2_hop,
+            Some((21000, 22000))
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            crate::api::Event::StateChanged("ports")
+        );
+        // 关掉 = 清空区间（对账会把 `listen:` 写回单端口并重启 hysteria-server）
+        send(
+            &r,
+            "POST",
+            "/api/port-hopping",
+            Some(&t),
+            Some(serde_json::json!({"enabled": false})),
+        )
+        .await;
+        assert_eq!(h.store.read().await.node.ports.hy2_hop, None);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            crate::api::Event::StateChanged("ports")
+        );
+        // 再关一次：值没变 ⇒ 不发事件。否则「关掉→关掉」会白触发一轮对账，
+        // 而对账认为 `listen:` 要改时会重启 hysteria-server、踢掉所有在线连接。
+        let (again, _) = send(
+            &r,
+            "POST",
+            "/api/port-hopping",
+            Some(&t),
+            Some(serde_json::json!({"enabled": false})),
+        )
+        .await;
+        assert_eq!(again, axum::http::StatusCode::OK, "幂等请求仍然回 200");
+        assert!(
+            rx.try_recv().is_err(),
+            "值没变还发事件 ⇒ 白重启一次 hysteria-server"
+        );
+        // 起点不小于终点直接拒绝
+        let (bad, bv) = send(
+            &r,
+            "POST",
+            "/api/port-hopping",
+            Some(&t),
+            Some(serde_json::json!({"enabled": true, "start": 30000, "end": 20000})),
+        )
+        .await;
+        assert_eq!(bad, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(bv["error"], "起始端口必须小于结束端口");
+        assert!(
+            h.host.ops().iter().all(|o| !o.starts_with("run:iptables")),
+            "v4 不写任何 iptables 规则"
+        );
+    }
+
+    #[tokio::test]
+    async fn bandwidth_is_read_only_in_v4() {
+        let h = harness().await;
+        let (r, t) = app(&h).await;
+        let (s, v) = send(&r, "GET", "/api/bandwidth", Some(&t), None).await;
+        assert_eq!(s, axum::http::StatusCode::OK);
+        assert_eq!(v, serde_json::json!({"up": 0, "down": 0}));
+        let (s2, v2) = send(
+            &r,
+            "POST",
+            "/api/bandwidth",
+            Some(&t),
+            Some(serde_json::json!({"up": 100, "down": 100})),
+        )
+        .await;
+        assert_eq!(s2, axum::http::StatusCode::NOT_IMPLEMENTED);
+        assert!(
+            v2["error"]
+                .as_str()
+                .unwrap()
+                .contains("ignoreClientBandwidth"),
+            "{v2}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_watchdog_shim_keeps_the_v3_keys() {
+        let h = harness().await;
+        let (r, t) = app(&h).await;
+        h.runtime
+            .update(|rt| {
+                rt.watchdog.insert(
+                    "hysteria-server".into(),
+                    crate::state::runtime::WatchdogRecord {
+                        fails: 2,
+                        restarts: 1,
+                        last_restart_at: Some("2026-09-11T00:00:00Z".into()),
+                        backoff_until: None,
+                    },
+                );
+            })
+            .await;
+        let (s, v) = send(&r, "GET", "/api/hy2/watchdog/status", Some(&t), None).await;
+        assert_eq!(s, axum::http::StatusCode::OK);
+        assert_eq!(v["watchdog_active"], true);
+        assert_eq!(v["next_run_at"], serde_json::Value::Null);
+        assert_eq!(v["last_run_at"], "2026-09-11T00:00:00Z");
+        assert_eq!(v["fail_count"], 2);
+        let lines = v["log_recent_lines"].as_array().unwrap();
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].as_str().unwrap().contains("hysteria-server"),
+            "{lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_user_health_endpoint_serves_the_runtime_summary() {
+        let h = harness().await;
+        let (r, t) = app(&h).await;
+        // 还没采样过：空对象，不是 404、也不是 null（裁决 D2：摘要只在这条端点上）
+        let (s0, v0) = send(&r, "GET", "/api/users/health", Some(&t), None).await;
+        assert_eq!(s0, axum::http::StatusCode::OK);
+        assert_eq!(v0, serde_json::json!({}));
+        h.runtime
+            .update(|rt| {
+                rt.extra.insert(
+                    "users".into(),
+                    serde_json::json!({"total": 2, "blocked": 1}),
+                );
+            })
+            .await;
+        let (s, v) = send(&r, "GET", "/api/users/health", Some(&t), None).await;
+        assert_eq!(s, axum::http::StatusCode::OK);
+        assert_eq!(v, serde_json::json!({"total": 2, "blocked": 1}));
+    }
+
+    #[tokio::test]
+    async fn every_admin_endpoint_is_401_without_a_token() {
+        let h = harness().await;
+        // 必须用 full_with 挂**本文件的** routes()：`h.router()` 挂的是 PanelModule，
+        // 而它的 routes() 要到 T13 才接线，这里会一律拿到 404 而不是 401。
+        let router = full_with(&h.app, routes(h.shared.clone()), axum::Router::new());
+        for (m, p) in [
+            ("GET", "/api/users"),
+            ("POST", "/api/users"),
+            ("GET", "/api/stats"),
+            ("GET", "/api/online"),
+            ("POST", "/api/kick"),
+            ("GET", "/api/config"),
+            ("POST", "/api/password"),
+            ("GET", "/api/masquerade"),
+            ("GET", "/api/bandwidth"),
+            ("GET", "/api/port-hopping"),
+            ("GET", "/api/hy2/watchdog/status"),
+            ("GET", "/api/users/health"),
+        ] {
+            let (s, _) = send(&router, m, p, None, None).await;
+            assert_eq!(
+                s,
+                axum::http::StatusCode::UNAUTHORIZED,
+                "{m} {p} 居然不需要鉴权"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_deleted_v3_endpoints_are_gone() {
+        let h = harness().await;
+        // 同上：挂本文件的 routes()，确认这些路径**在管理员这棵子树里**确实不存在
+        let router = full_with(&h.app, routes(h.shared.clone()), axum::Router::new());
+        let t = token(&h).await;
+        for p in [
+            "/api/manage?key=x&action=list",
+            "/api/version",
+            "/api/kernel-versions",
+            "/api/kernel-downloads",
+            "/packages",
+            "/install-client?key=x",
+        ] {
+            let (s, _) = send(&router, "GET", p, Some(&t), None).await;
+            assert_eq!(s, axum::http::StatusCode::NOT_FOUND, "{p} 应该已被删除");
+        }
+        // 带 token 发：P1 的 `require_admin` 套在整棵受保护子树（含它的 fallback）上，
+        // 无 token 的未命中路径先拿 401 再谈 404，那证不出「路由不存在」。
+        let (s, _) = send(
+            &router,
+            "POST",
+            "/auth/hysteria",
+            Some(&t),
+            Some(serde_json::json!({"auth": "a:b"})),
+        )
+        .await;
+        assert_eq!(
+            s,
+            axum::http::StatusCode::NOT_FOUND,
+            "/auth/hysteria 已由 auth-hook 取代"
+        );
+    }
+}
