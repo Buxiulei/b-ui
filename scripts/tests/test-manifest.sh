@@ -56,8 +56,25 @@ assert_eq "2" "$(jq -r '[.artifacts | keys[] | select(startswith("bui-c-"))] | l
 assert_not_contains "1.13.19" "$(cat "$M")" "check 用的旧 minor 不进 manifest"
 assert_not_contains "1.13.21" "$(cat "$M")" "check 行的版本不进 kernels"
 assert_eq "https://github.com/Buxiulei/b-ui/releases/tag/v4.0.0" "$(jq -r '.changelog_url' "$M")" "changelog_url 指向 Release 页"
+assert_eq "v4.0.0" "$(jq -r '.tag' "$M")" "不传 --tag 时 tag 默认 v<version>"
 assert_eq "2026-09-18T07:22:10Z" "$(jq -r '.released' "$M")" "released 原样写入"
 assert_eq "4.0.0" "$(jq -r '.min_upgrade_from' "$M")" "min_upgrade_from"
+
+# --tag：预发布（裁决记录「发布：预发布与首推（2026-09-12）」）的 tag 是 v<x.y.z>-rcN，
+# 而 manifest.version 仍必须是纯 semver（C4），所以 tag 要单独传
+MR="$WORK/manifest-rc.json"
+bash "$ROOT/scripts/release/gen-manifest.sh" --version 4.0.0 --tag v4.0.0-rc1 --dist "$DIST" \
+    --lock "$LOCK" --released 2026-09-18T07:22:10Z > "$MR"
+assert_eq "0" "$?" "gen-manifest 接受 --tag"
+assert_eq "4.0.0" "$(jq -r '.version' "$MR")" "预发布的 manifest.version 仍是纯 semver"
+assert_eq "v4.0.0-rc1" "$(jq -r '.tag' "$MR")" \
+    "tag 原样写进 manifest（bui 靠缓存里这个字段认出自己在预发布通道）"
+assert_eq "https://github.com/Buxiulei/b-ui/releases/tag/v4.0.0-rc1" \
+    "$(jq -r '.changelog_url' "$MR")" "changelog_url 指向 rc tag 的 Release 页"
+assert_eq "https://github.com/Buxiulei/b-ui/releases/download/v4.0.0-rc1/bui-linux-amd64" \
+    "$(jq -r '.artifacts."bui-linux-amd64".url' "$MR")" "默认 base-url 跟 --tag 走（rc 资产挂在 rc 的 Release 下）"
+bash "$ROOT/scripts/release/validate-manifest.sh" "$MR" > /dev/null
+assert_eq "0" "$?" "预发布的 manifest 仍过 C4 校验"
 
 # --base-url：M5 演练把 manifest 指到本机 python3 -m http.server
 ML="$WORK/manifest-local.json"

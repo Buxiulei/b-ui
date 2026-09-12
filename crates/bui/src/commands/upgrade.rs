@@ -276,11 +276,19 @@ pub async fn run_with(
         return Ok(());
     }
     let (h, f, p) = (host.clone(), fetcher.clone(), paths.clone());
-    // 总纲 C4 的解析顺序在 kernels 里一处实现：--manifest-url > --version（模板）> $BUI_MANIFEST_URL > latest
-    let url = crate::kernels::manifest_url(manifest_url.as_deref(), version.as_deref());
     let want = version.clone();
+    let cli = manifest_url.clone();
     let (plan, asset) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        let m = Manifest::from_url(f.as_ref(), &url)?;
+        // 总纲 C4 的解析顺序在 kernels 里一处实现：--manifest-url > --version（模板）
+        // > $BUI_MANIFEST_URL > latest；什么都没指定且 latest 404 时，预发布通道的机器
+        // 改跟最新的 rc（缓存 manifest 里记的 tag 是判断信号之一）
+        let cached = crate::serve::load_cached_manifest(h.as_ref(), &p).and_then(|m| m.tag);
+        let (_, m) = crate::kernels::fetch_manifest(
+            f.as_ref(),
+            cli.as_deref(),
+            want.as_deref(),
+            cached.as_deref(),
+        )?;
         if let Some(v) = want.as_deref() {
             // 指定了版本就必须拿到那一版（本地文件或 $BUI_MANIFEST_URL 里可能是别的版本）
             anyhow::ensure!(
@@ -372,6 +380,7 @@ mod tests {
                 ("sing-box-linux-amd64".to_string(), a("https://x/sb")),
             ]),
             min_upgrade_from: None,
+            tag: None,
         }
     }
 

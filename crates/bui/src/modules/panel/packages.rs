@@ -280,6 +280,7 @@ mod tests {
             ]),
             artifacts,
             min_upgrade_from: None,
+            tag: None,
         }
     }
 

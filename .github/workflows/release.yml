@@ -139,6 +139,13 @@ jobs:
           rustup target add ${{ matrix.target }}
           cargo install cross --locked --version 0.2.5
       - name: 构建
+        # 发布 tag 编译进二进制（kernels::BUILD_TAG）：预发布机器靠它认出自己在 rc 通道上，
+        # 否则 `bui upgrade` 与每日自检会永远停在 latest 的 404 上——CARGO_PKG_VERSION 是纯
+        # semver（check-version.sh 强制 + verify 先剥掉 -rcN），认不出 rc。
+        # cross 把编译放进容器里跑，非白名单的环境变量要靠 CROSS_BUILD_ENV_PASSTHROUGH 透传。
+        env:
+          BUI_BUILD_TAG: ${{ needs.verify.outputs.tag }}
+          CROSS_BUILD_ENV_PASSTHROUGH: BUI_BUILD_TAG
         run: |
           set -euo pipefail
           if [[ "${{ matrix.cross }}" == "true" ]]; then
@@ -146,6 +153,16 @@ jobs:
           else
             cargo build --release --locked --target ${{ matrix.target }} -p bui -p bui-c
           fi
+      - name: 确认发布 tag 真编进了 bui
+        # option_env! 拿不到值不报错、只静默变 None（cross 漏透传就是这种情形），所以在这里断言：
+        # 字符串常量落在 rodata 里，grep 得到才算编进去了。漏了就当场判红，别等 rc 装到机器上
+        # 才发现升级通道是死的。
+        env:
+          T: ${{ needs.verify.outputs.tag }}
+        run: |
+          set -euo pipefail
+          grep -qaF -- "$T" "target/${{ matrix.target }}/release/bui" \
+            || { echo "BUI_BUILD_TAG=$T 没编进 bui：预发布通道回退会失效"; exit 1; }
       - name: 确认是静态二进制
         run: |
           set -euo pipefail
@@ -214,9 +231,10 @@ jobs:
           R: ${{ github.repository }}
         run: |
           set -euo pipefail
-          # 前缀用真实 tag（预发布是 v<x.y.z>-rcN），manifest.version 仍是纯 semver
+          # 前缀用真实 tag（预发布是 v<x.y.z>-rcN），manifest.version 仍是纯 semver；
+          # --tag 让 changelog_url 指向这次发布的 Release 页（rc 的页面是 tag/v<x.y.z>-rcN）
           BASE="https://github.com/$R/releases/download/$T/"
-          bash scripts/release/gen-manifest.sh --version "$V" --dist dist --base-url "$BASE" \
+          bash scripts/release/gen-manifest.sh --version "$V" --tag "$T" --dist dist --base-url "$BASE" \
             --released "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > dist/manifest.json
           bash scripts/release/validate-manifest.sh dist/manifest.json --require-prefix "$BASE"
           cat dist/manifest.json
