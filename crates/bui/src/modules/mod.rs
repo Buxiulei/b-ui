@@ -2,6 +2,7 @@
 pub mod certs;
 pub mod core_files;
 pub mod panel;
+pub mod portjump;
 pub mod residential;
 pub mod ssh;
 pub mod system;

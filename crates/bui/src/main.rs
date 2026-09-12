@@ -165,6 +165,9 @@ async fn dispatch(command: Command) -> Result<()> {
             .await
         }
         Command::AuthHook { .. } => unreachable!("auth-hook 已在 main 里提前返回"),
+        Command::Hy2Prestart { config } => {
+            modules::portjump::run(&sys::real::RealHost::new(), &config)
+        }
         Command::Residential { cmd } => {
             modules::residential::cli::run(cmd, PathBuf::from(paths::SOCKET_PATH)).await
         }

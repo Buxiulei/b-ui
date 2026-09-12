@@ -10,9 +10,11 @@
 
 use crate::reconcile::{Artifact, DaemonCtx, Module, RenderCtx};
 use crate::state::runtime::WatchdogRecord;
-use crate::sys::Proto;
+use crate::sys::{Host, Proto};
 use crate::util::{fmt_rfc3339, parse_rfc3339};
 use bui_schema::model::State;
+use bui_schema::paths::Paths;
+use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 /// 一轮检查的间隔。
@@ -25,6 +27,87 @@ pub const BACKOFF_MINUTES: [i64; 3] = [1, 2, 4];
 /// （`RuntimeData::extra` 是 flatten 的扩展位，不必为两个字段改 `runtime.rs`）。
 /// 面板 `GET /api/hy2/watchdog/status` 原样透出这两个字段。
 pub const RUN_KEY: &str = "watchdog_run";
+
+/// 两个 hysteria 实例与各自的配置文件名。端口跳跃的 nat 链按**实例**定位（base 端口 +
+/// 跳跃区间都在这份配置的 `listen:` 行里），所以自愈时要把对应的那一份传给
+/// [`crate::modules::portjump::cleanup`]。
+pub const HY2_CONFIGS: [(&str, &str); 2] = [
+    ("hysteria-server", "config.yaml"),
+    ("hysteria-residential", "config-residential.yaml"),
+];
+
+/// 崩溃循环的判据：日志里的这句话（真机实录「ip6tables: Chain already exists」）。
+pub const CHAIN_MARKER: &str = "Chain already exists";
+
+/// 每轮看多少行日志。
+pub const JOURNAL_LINES: &str = "50";
+
+/// 自愈事件落 `runtime.extra` 的键：`{ "<单元>": ChainHeal }`。
+/// 面板与 `bui status` 从 `runtime.json` 原样读得到。
+pub const HEAL_KEY: &str = "hy2_chain_heal";
+
+/// 同一个单元两次自愈之间的最短间隔：清完链还起不来说明另有原因，
+/// 不能每 60 秒无脑 restart 一次（那就是自己制造崩溃循环）。
+pub const HEAL_COOLDOWN_MINUTES: i64 = 10;
+
+/// 一个单元的孤儿链自愈记录（累计次数 + 最近一次的时刻与清掉的链）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ChainHeal {
+    pub at: String,
+    pub count: u32,
+    /// 最近一次清理做过的事（`modules::portjump::cleanup` 的返回值，每行一条）
+    pub done: Vec<String>,
+}
+
+/// 冷却判据：`last` 是上次自愈时刻（`None` = 没治过）。
+pub fn should_heal(last: Option<OffsetDateTime>, now: OffsetDateTime) -> bool {
+    match last {
+        None => true,
+        Some(t) => now - t >= time::Duration::minutes(HEAL_COOLDOWN_MINUTES),
+    }
+}
+
+/// 「这个单元正卡在崩溃循环里」：`ActiveState` 是 `failed`（已撞上 systemd 的 start limit）
+/// 或 `activating`（`auto-restart` 间隙）。
+///
+/// **不看 `inactive`**：运维 `systemctl stop` 停掉的单元就是 inactive，自愈不该把它拉起来。
+pub fn is_crash_looping(state: Option<&str>) -> bool {
+    matches!(state, Some("failed") | Some("activating"))
+}
+
+/// 一个 hysteria 单元的自愈：`ActiveState` 判崩溃循环 → 日志里找 [`CHAIN_MARKER`] →
+/// 清本实例的孤儿链 → `reset-failed` + `restart`。返回 `Some(清理做过的事)` 表示治过一次。
+///
+/// `reset-failed` 是必须的：52 次崩溃早已撞上 `StartLimitBurst`，不清计数直接 `restart`
+/// 会被 systemd 以 "start request repeated too quickly" 挡掉。
+fn heal_chain_conflict(
+    host: &dyn Host,
+    paths: &Paths,
+    unit: &str,
+    conf: &str,
+) -> Option<Vec<String>> {
+    let active_state = host.unit_property(unit, "ActiveState").ok().flatten();
+    if !is_crash_looping(active_state.as_deref()) {
+        return None;
+    }
+    let log = host
+        .run(
+            "journalctl",
+            &["-u", unit, "-n", JOURNAL_LINES, "--no-pager"],
+        )
+        .ok()?;
+    if !log.ok() || !log.stdout.contains(CHAIN_MARKER) {
+        return None;
+    }
+    tracing::warn!(
+        unit = %unit,
+        "日志含「{CHAIN_MARKER}」：清本实例的端口跳跃孤儿链后重启"
+    );
+    let done = crate::modules::portjump::cleanup(host, &paths.base_dir.join(conf));
+    let _ = host.systemd("reset-failed", unit);
+    let _ = host.systemd("restart", unit);
+    Some(done)
+}
 
 /// 一个探测目标：单元名 + 协议 + 监听端口。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,38 +212,69 @@ pub fn run_stamp(now: OffsetDateTime) -> serde_json::Value {
     })
 }
 
-/// 跑一轮：读单元状态与监听端口（都经 `Host`，时钟也取 `host.now()`），按裁决重启，落 `runtime.json`。
+/// 跑一轮：先治 hysteria 的端口跳跃孤儿链崩溃循环（[`heal_chain_conflict`]），再读单元状态与
+/// 监听端口（都经 `Host`，时钟也取 `host.now()`），按裁决重启，落 `runtime.json`。
 pub async fn check_once(ctx: &DaemonCtx) -> anyhow::Result<Vec<(String, Decision)>> {
     let state = ctx.store.read().await;
     let targets = targets(&state);
-    let mut records = ctx.runtime.read().await.watchdog;
+    let rt = ctx.runtime.read().await;
+    let mut heals: std::collections::BTreeMap<String, ChainHeal> = rt
+        .extra
+        .get(HEAL_KEY)
+        .cloned()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
+    let mut records = rt.watchdog;
     let host = ctx.host.clone();
-    let (decisions, records, now) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        let now = host.now();
-        let udp = host.listening_ports(Proto::Udp).unwrap_or_default();
-        let tcp = host.listening_ports(Proto::Tcp).unwrap_or_default();
-        let mut out = Vec::with_capacity(targets.len());
-        for t in &targets {
-            let rec = records.entry(t.unit.clone()).or_default();
-            let alive = host.unit_is_active(&t.unit).unwrap_or(false);
-            let listening = match t.proto {
-                Proto::Udp => udp.contains(&t.port),
-                Proto::Tcp => tcp.contains(&t.port),
-            };
-            let d = decide(rec, alive, listening, now);
-            if d == Decision::Restart {
-                tracing::warn!(unit = %t.unit, port = t.port, "监听失活连续 2 轮，重启");
-                let _ = host.systemd("restart", &t.unit);
+    let paths = ctx.paths.clone();
+    let (decisions, records, heals, now) =
+        tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let now = host.now();
+            // 孤儿链自愈排在监听探测之前：崩溃循环里的实例根本没进程，按端口判只会得出
+            // `Healthy`（`!alive` 交给 systemd），而 systemd 的 `Restart=always` 在这个错误上
+            // 永远治不好——链不清掉，下一次 `-N` 还是 "Chain already exists"。
+            for (unit, conf) in HY2_CONFIGS {
+                let last = heals.get(unit).and_then(|h| parse_rfc3339(&h.at));
+                if !should_heal(last, now) {
+                    continue;
+                }
+                if let Some(done) = heal_chain_conflict(&*host, &paths, unit, conf) {
+                    let rec = heals.entry(unit.to_string()).or_default();
+                    rec.at = fmt_rfc3339(now);
+                    rec.count += 1;
+                    rec.done = done;
+                }
             }
-            out.push((t.unit.clone(), d));
-        }
-        Ok((out, records, now))
-    })
-    .await??;
+            let udp = host.listening_ports(Proto::Udp).unwrap_or_default();
+            let tcp = host.listening_ports(Proto::Tcp).unwrap_or_default();
+            let mut out = Vec::with_capacity(targets.len());
+            for t in &targets {
+                let rec = records.entry(t.unit.clone()).or_default();
+                let alive = host.unit_is_active(&t.unit).unwrap_or(false);
+                let listening = match t.proto {
+                    Proto::Udp => udp.contains(&t.port),
+                    Proto::Tcp => tcp.contains(&t.port),
+                };
+                let d = decide(rec, alive, listening, now);
+                if d == Decision::Restart {
+                    tracing::warn!(unit = %t.unit, port = t.port, "监听失活连续 2 轮，重启");
+                    let _ = host.systemd("restart", &t.unit);
+                }
+                out.push((t.unit.clone(), d));
+            }
+            Ok((out, records, heals, now))
+        })
+        .await??;
     ctx.runtime
         .update(|r| {
             r.watchdog = records;
             r.extra.insert(RUN_KEY.into(), run_stamp(now));
+            // 治过才写这个键：没治过的机器上 `runtime.json` 里连它都不该出现
+            if !heals.is_empty() {
+                if let Ok(v) = serde_json::to_value(&heals) {
+                    r.extra.insert(HEAL_KEY.into(), v);
+                }
+            }
         })
         .await;
     Ok(decisions)
@@ -353,6 +467,188 @@ mod tests {
         let rt = c.runtime.read().await;
         assert_eq!(rt.watchdog["hysteria-server"].restarts, 1);
         assert_eq!(rt.watchdog["xray"].fails, 0);
+    }
+
+    #[test]
+    fn only_a_failed_or_auto_restarting_unit_counts_as_a_crash_loop() {
+        assert!(is_crash_looping(Some("failed")));
+        assert!(is_crash_looping(Some("activating")));
+        // 运维手动 stop 的单元不许被自愈拉起来
+        assert!(!is_crash_looping(Some("inactive")));
+        assert!(!is_crash_looping(Some("active")));
+        assert!(!is_crash_looping(Some("deactivating")));
+        assert!(!is_crash_looping(None));
+    }
+
+    #[test]
+    fn healing_the_same_unit_again_waits_out_the_cooldown() {
+        assert!(should_heal(None, t0()), "没治过就治");
+        assert!(!should_heal(Some(t0()), t0() + time::Duration::minutes(9)));
+        assert!(should_heal(
+            Some(t0()),
+            t0() + time::Duration::minutes(HEAL_COOLDOWN_MINUTES)
+        ));
+    }
+
+    /// 播种真机事故现场（bwg-rick 2026-09-12 20:33 UTC）：`hysteria-residential` 在崩溃循环，
+    /// journal 里是「ip6tables: Chain already exists」，`ip6tables` 的 nat 表里只剩 OUTPUT
+    /// 一条跳转（链本身是空的）。
+    fn crash_looping_host() -> Arc<FakeHost> {
+        let host = Arc::new(FakeHost::new());
+        host.with(|i| {
+            i.units_active.insert("hysteria-server.service".into());
+            i.units_active.insert("xray.service".into());
+            i.units_active.insert("b-ui-relay.service".into());
+            i.unit_props.insert(
+                ("hysteria-server.service".into(), "ActiveState".into()),
+                "active".into(),
+            );
+            i.unit_props.insert(
+                ("hysteria-residential.service".into(), "ActiveState".into()),
+                "failed".into(),
+            );
+            i.scripted.push((
+                "journalctl -u hysteria-residential".into(),
+                crate::sys::CmdOut::success(
+                    "hysteria[1234]: invalid config: listen: ip6tables [-w -t nat -N \
+                     HYSTERIA-PR-c66a02d9]: exit status 1: ip6tables: Chain already exists\n",
+                ),
+            ));
+            i.which.insert("ip6tables".into());
+            i.scripted.push((
+                "ip6tables -t nat -S".into(),
+                crate::sys::CmdOut::success(
+                    "-N HYSTERIA-PR-c66a02d9\n-A OUTPUT -p udp -m udp --dport 41000:50000 \
+                     -j HYSTERIA-PR-c66a02d9\n",
+                ),
+            ));
+            i.files.insert(
+                "/opt/b-ui/config-residential.yaml".into(),
+                (b"listen: :40000,41000-50000\n".to_vec(), 0o600),
+            );
+            i.listening
+                .insert(Proto::Udp, [10000].into_iter().collect());
+            i.listening
+                .insert(Proto::Tcp, [10001, 2080].into_iter().collect());
+        });
+        host
+    }
+
+    /// 事故回归：崩溃循环 + 日志含「Chain already exists」→ 先清本实例的孤儿链，
+    /// 再 `reset-failed`（52 次重启早撞上 start limit，不清计数 restart 会被挡）+ `restart`，
+    /// 并把事件记进 `runtime.json`。直连实例（active）一个命令都不许收到。
+    #[tokio::test]
+    async fn a_chain_conflict_crash_loop_is_healed_before_the_port_probe() {
+        let host = crash_looping_host();
+        let (c, _d) = ctx(host.clone()).await;
+        check_once(&c).await.unwrap();
+        let ops = host.ops();
+        let i = |needle: &str| {
+            ops.iter()
+                .position(|o| o.contains(needle))
+                .unwrap_or_else(|| panic!("没有 {needle}：{ops:?}"))
+        };
+        assert!(i("-D OUTPUT") < i("-X HYSTERIA-PR-c66a02d9"), "{ops:?}");
+        assert!(
+            i("-X HYSTERIA-PR-c66a02d9") < i("systemd:reset-failed:hysteria-residential"),
+            "清链必须在重启之前，否则起来照样撞同名链：{ops:?}"
+        );
+        assert!(
+            i("systemd:reset-failed:hysteria-residential")
+                < i("systemd:restart:hysteria-residential"),
+            "{ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|o| o.contains("hysteria-server")),
+            "直连实例是 active，不该被碰：{ops:?}"
+        );
+        // 事件落盘
+        let heals: std::collections::BTreeMap<String, ChainHeal> =
+            serde_json::from_value(c.runtime.read().await.extra[HEAL_KEY].clone()).unwrap();
+        let rec = &heals["hysteria-residential"];
+        assert_eq!(rec.count, 1);
+        assert_eq!(rec.at, "2026-09-11T00:00:00Z");
+        assert_eq!(
+            rec.done,
+            vec!["已清理 ip6tables nat 链 HYSTERIA-PR-c66a02d9（本实例端口跳跃孤儿）"]
+        );
+    }
+
+    /// 冷却窗口内不再治第二次（清完链还起不来说明另有原因，每 60 秒 restart 一次就是
+    /// 自己造崩溃循环）；过了窗口再治，计数累加。
+    #[tokio::test]
+    async fn the_second_round_waits_for_the_cooldown_then_heals_again() {
+        let host = crash_looping_host();
+        let (c, _d) = ctx(host.clone()).await;
+        check_once(&c).await.unwrap();
+        host.clear_ops();
+
+        host.advance(60);
+        check_once(&c).await.unwrap();
+        assert!(
+            host.ops()
+                .iter()
+                .all(|o| !o.contains("journalctl") && !o.contains("tables")),
+            "冷却期内连 journalctl 与 iptables 都不该跑：{:?}",
+            host.ops()
+        );
+
+        host.advance(HEAL_COOLDOWN_MINUTES * 60);
+        check_once(&c).await.unwrap();
+        assert!(host
+            .ops()
+            .iter()
+            .any(|o| o == "systemd:restart:hysteria-residential"));
+        let heals: std::collections::BTreeMap<String, ChainHeal> =
+            serde_json::from_value(c.runtime.read().await.extra[HEAL_KEY].clone()).unwrap();
+        assert_eq!(heals["hysteria-residential"].count, 2);
+    }
+
+    /// 崩溃循环但日志里**不是**这个错误（证书过期、端口被占…）→ 不清链、不重启：
+    /// 那些错误清 nat 链治不好，`Restart=always` 与体检各归各管。
+    #[tokio::test]
+    async fn a_crash_loop_with_another_error_is_left_alone() {
+        let host = crash_looping_host();
+        host.with(|i| {
+            i.scripted.clear();
+            i.scripted.push((
+                "journalctl -u hysteria-residential".into(),
+                crate::sys::CmdOut::success("hysteria: failed to load cert: no such file\n"),
+            ));
+        });
+        let (c, _d) = ctx(host.clone()).await;
+        check_once(&c).await.unwrap();
+        assert!(
+            host.ops()
+                .iter()
+                .all(|o| !o.starts_with("systemd:restart") && !o.contains("ip6tables")),
+            "{:?}",
+            host.ops()
+        );
+        assert!(!c.runtime.read().await.extra.contains_key(HEAL_KEY));
+    }
+
+    /// 运维 `systemctl stop` 停掉的实例（`ActiveState=inactive`）即使日志里还留着那句错误，
+    /// 也不许被自愈拉起来。
+    #[tokio::test]
+    async fn a_deliberately_stopped_unit_is_not_restarted() {
+        let host = crash_looping_host();
+        host.with(|i| {
+            i.unit_props.insert(
+                ("hysteria-residential.service".into(), "ActiveState".into()),
+                "inactive".into(),
+            );
+        });
+        let (c, _d) = ctx(host.clone()).await;
+        check_once(&c).await.unwrap();
+        assert!(
+            host.ops()
+                .iter()
+                .all(|o| !o.contains("hysteria-residential")),
+            "{:?}",
+            host.ops()
+        );
+        assert!(!c.runtime.read().await.extra.contains_key(HEAL_KEY));
     }
 
     #[tokio::test]
