@@ -1,3 +1,3 @@
-fn main() {
-    println!("bui-c {}", bui_c::VERSION);
+fn main() -> std::process::ExitCode {
+    bui_c::cli::run()
 }
