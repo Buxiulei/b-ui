@@ -1053,9 +1053,8 @@ async fn post_select(
         return Ok(Json(serde_json::json!({ "success": true, "auto": true })).into_response());
     }
     // 空载荷不当成解锁：那是笔误，解锁得明确写 `{"auto": true}`
-    let raw = b
-        .id
-        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "id 或 auto 字段必填"))?;
+    let raw =
+        b.id.ok_or_else(|| err(StatusCode::BAD_REQUEST, "id 或 auto 字段必填"))?;
     // 定位与 404 都归 resolve_upstream：它认 uuid / resi-N / url-N / host:port，
     // 并且只返回池内的 id（select_manual 只会返回 anyhow::Error，没有类型可匹配）
     let g = state::group_of(&*app.store.read().await);
