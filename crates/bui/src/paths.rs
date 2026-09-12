@@ -53,6 +53,25 @@ pub fn caddyfile(p: &Paths) -> PathBuf {
     p.base_dir.join("Caddyfile")
 }
 
+/// 外部站点通道（2026-09-13 裁决）：Caddyfile 末尾 `import <这个目录>/*.caddy`。
+/// 目录由对账器建出来（[`caddy_sites_readme`] 那个占位文件），里面的 `*.caddy` **归用户管**：
+/// bui 不渲染、不覆盖、不删除，漂移扫描也不看（`caddy` 在 `BASE_WHITELIST` 里且不递归）。
+pub fn caddy_sites(p: &Paths) -> PathBuf {
+    caddy_xdg(p).join("sites")
+}
+
+/// 站点目录的占位说明文件：它同时承担「把目录建出来」的职责（写文件会建父目录），
+/// 后缀不是 `.caddy` 所以不会被 import 进配置。
+pub fn caddy_sites_readme(p: &Paths) -> PathBuf {
+    caddy_sites(p).join("README.txt")
+}
+
+/// `import-v3` 把 `/etc/caddy/Caddyfile` 里非 b-ui 的站点块原样导到这里（0644）。
+/// 写完就归用户管：之后的对账绝不再碰它。
+pub fn caddy_sites_imported(p: &Paths) -> PathBuf {
+    caddy_sites(p).join("imported-from-v3.caddy")
+}
+
 /// hysteria 鉴权钩子读的快照（`bui install` 写初版，P2 的用户模块接手后原子重写）。
 pub fn auth_snapshot_file(p: &Paths) -> PathBuf {
     p.base_dir.join("auth-snapshot.json")
@@ -75,6 +94,15 @@ mod tests {
         assert_eq!(caddy_xdg(&p), PathBuf::from("/opt/b-ui/caddy"));
         assert_eq!(caddy_data(&p), PathBuf::from("/opt/b-ui/caddy/caddy"));
         assert_eq!(caddyfile(&p), PathBuf::from("/opt/b-ui/Caddyfile"));
+        assert_eq!(caddy_sites(&p), PathBuf::from("/opt/b-ui/caddy/sites"));
+        assert_eq!(
+            caddy_sites_readme(&p),
+            PathBuf::from("/opt/b-ui/caddy/sites/README.txt")
+        );
+        assert_eq!(
+            caddy_sites_imported(&p),
+            PathBuf::from("/opt/b-ui/caddy/sites/imported-from-v3.caddy")
+        );
         assert_eq!(
             auth_snapshot_file(&p),
             PathBuf::from("/opt/b-ui/auth-snapshot.json")

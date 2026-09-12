@@ -224,6 +224,9 @@ LogRateLimitBurst=200
 WantedBy=multi-user.target
 "
         ),
+        // `User=root` + 零沙箱指令是硬要求（2026-09-13 裁决「Caddy 外部站点通道」）：
+        // 从 v3 导过来的外部站点块可能 `tls /etc/caddy/certs/*.crt`，发行版单元的
+        // `ProtectSystem=full` 那一套会让这些绝对路径读不到 → 外部站点 443 全挂。
         "caddy" => {
             let xdg = caddy_xdg(&ctx.paths);
             let xdg = xdg.display();
@@ -238,6 +241,8 @@ Wants=network-online.target
 Type=notify
 ExecStart={bin}/caddy run --config {base}/Caddyfile --adapter caddyfile
 ExecReload={bin}/caddy reload --config {base}/Caddyfile --adapter caddyfile --force
+User=root
+Group=root
 Restart=always
 RestartSec=5
 LimitNOFILE=1048576
@@ -403,6 +408,31 @@ mod tests {
         assert!(t.contains("ExecReload=/opt/b-ui/bin/caddy reload --config /opt/b-ui/Caddyfile --adapter caddyfile --force"));
         assert!(t.contains("Environment=XDG_DATA_HOME=/opt/b-ui/caddy"));
         assert!(t.contains("Environment=XDG_CONFIG_HOME=/opt/b-ui/caddy"));
+    }
+
+    /// 2026-09-13 裁决「P1：Caddy 外部站点通道」：导入的站点块可能 `tls /etc/caddy/certs/x.crt …`
+    /// （发行版 caddy 以 `caddy` 用户跑、证书就放在那儿）。v4 的 caddy 必须以 **root** 运行且
+    /// **不带任何沙箱指令**，否则那些绝对路径读不到 → 外部站点 443 全挂。
+    #[test]
+    fn caddy_unit_runs_as_root_so_external_site_certs_stay_readable() {
+        let t = unit_of(&UnitsModule.render(&sample_state(), &ctx()), "caddy");
+        assert!(t.contains("\nUser=root\n"), "必须显式 root：{t}");
+        assert!(t.contains("\nGroup=root\n"));
+        for sandbox in [
+            "ProtectSystem",
+            "ProtectHome",
+            "ReadOnlyPaths",
+            "ReadWritePaths",
+            "PrivateTmp",
+            "DynamicUser",
+            "InaccessiblePaths",
+            "TemporaryFileSystem",
+        ] {
+            assert!(
+                !t.contains(sandbox),
+                "{sandbox} 会挡住 /etc/caddy/certs（发行版单元的 ProtectSystem=full 就是 v3 的老坑）：{t}"
+            );
+        }
     }
 
     #[test]

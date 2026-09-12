@@ -527,16 +527,31 @@ pub async fn run_with(
                 build_state(&answers, keys, versions)?
             }
         };
+        let (domain, admin_port) = (state.node.domain.clone(), state.node.ports.admin);
         Store::create(&state_path, state).await?;
         // 7：先卸 v3（停 b-ui-admin 腾出 :8080、停 v3 timer），再对账
         if opts.import_v3.is_some() {
             let (h, p) = (host.clone(), paths.clone());
             let done = tokio::task::spawn_blocking(move || {
-                crate::commands::import_v3::uninstall_v3(h.as_ref(), &p)
+                crate::commands::import_v3::uninstall_v3(h.as_ref(), &p, &domain, admin_port)
             })
             .await?;
-            for line in done {
-                println!("{line}");
+            match done {
+                Ok(lines) => {
+                    for line in lines {
+                        println!("{line}");
+                    }
+                }
+                // 外部站点通道的闸门没过（2026-09-13 裁决）：此时**一个破坏性动作都还没做**，
+                // 发行版 caddy 照旧在跑。把刚写出的 state.json 删掉再退出——留着它，下次重跑
+                // install 会走「已安装」分支，v3 就永远卸不掉了。
+                Err(e) => {
+                    let _ = std::fs::remove_file(&state_path);
+                    return Err(e.context(format!(
+                        "已中止 v3 导入并回滚 {}（发行版 caddy 仍在运行）；修好站点配置后重跑 install",
+                        state_path.display()
+                    )));
+                }
             }
         }
     } else {
@@ -1063,6 +1078,63 @@ mod tests {
             .filter(|o| o.starts_with("write:") && !o.starts_with(&verify_prefix))
             .collect();
         assert_eq!(writes, Vec::<String>::new(), "幂等：第二次 install 零写入");
+    }
+
+    /// 2026-09-13 裁决「P1：Caddy 外部站点通道」：新 Caddyfile（含导入的外部站点）过不了
+    /// `caddy validate` → 中止 import，发行版 caddy 保持运行，刚写出的 `state.json` 回滚
+    /// （不回滚的话下次重跑 install 走「已安装」分支，v3 永远卸不掉）。
+    #[tokio::test]
+    async fn install_with_import_v3_aborts_and_rolls_back_when_the_new_caddyfile_is_invalid() {
+        let src = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../bui-schema/tests/fixtures/v3/src"
+        ));
+        if !src.exists() {
+            eprintln!("skipped: 缺 P0 的 v3 fixture");
+            return;
+        }
+        let d = tempfile::tempdir().unwrap();
+        let paths = scratch(&d);
+        let host = host_for_install(&paths);
+        host.with(|i| {
+            i.files.insert(
+                crate::commands::import_v3::V3_CADDYFILE.into(),
+                (
+                    b"example.com {\n\treverse_proxy 127.0.0.1:8080\n}\n\nblog.example.com {\n\tbroken_directive\n}\n".to_vec(),
+                    0o644,
+                ),
+            );
+            i.scripted.push((
+                format!("{} validate", paths.bin_dir.join("caddy").display()),
+                CmdOut::failure(1, "unrecognized directive: broken_directive"),
+            ));
+            i.units_active.insert("caddy.service".into());
+        });
+        let mut o = opts(&d);
+        o.import_v3 = Some(src.to_path_buf());
+        let err = run_with(
+            o,
+            answers(),
+            murl(),
+            paths.clone(),
+            host.clone(),
+            fetcher_with_manifest(),
+        )
+        .await
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("已中止 v3 导入"), "{msg}");
+        assert!(msg.contains("broken_directive"), "{msg}");
+        assert!(
+            !crate::paths::state_file(&paths).exists(),
+            "state.json 必须回滚掉"
+        );
+        assert!(
+            !host.ops().iter().any(|o| o == "systemd:stop:caddy"),
+            "发行版 caddy 不许停：{:?}",
+            host.ops()
+        );
+        assert!(host.unit_is_active("caddy").unwrap(), "发行版 caddy 还在跑");
     }
 
     #[tokio::test]
