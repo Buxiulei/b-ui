@@ -641,11 +641,7 @@ pub async fn run(
                 String::new()
             };
             let ip = if need_ip {
-                h.run("curl", &["-sS", "--max-time", "5", "https://api.ipify.org"])
-                    .ok()
-                    .filter(|o| o.ok())
-                    .map(|o| o.stdout.trim().to_string())
-                    .unwrap_or_default()
+                crate::sys::probe_public_ip(h.as_ref())
             } else {
                 String::new()
             };
@@ -1424,5 +1420,66 @@ blog.example.com {
             !host.ops().iter().any(|o| o.starts_with("run:curl")),
             "导入值非空就别探测"
         );
+    }
+
+    /// 2026-09-12 真机：v3 目录里没有 IP 且 ipify 返回空串 → `node.public_ip` 留空。
+    /// 探测必须过三个源（`crate::sys::probe_public_ip`），第一个不灵就换下一个。
+    #[tokio::test]
+    async fn import_falls_through_to_the_next_ip_source() {
+        let Some(src) = fixture_without_server_ip() else {
+            return;
+        };
+        let d = tempfile::tempdir().unwrap();
+        let paths = scratch(&d);
+        let host = std::sync::Arc::new(FakeHost::new());
+        host.with(|i| {
+            i.scripted.push((
+                format!("curl -sS --max-time 5 {}", crate::sys::IP_PROBE_URLS[0]),
+                // 真机形态：HTTP 200 但回了个空串
+                CmdOut::success("\n"),
+            ));
+            i.scripted.push((
+                format!("curl -sS --max-time 5 {}", crate::sys::IP_PROBE_URLS[1]),
+                CmdOut::success("198.51.100.7\n"),
+            ));
+        });
+        run(src.path().to_path_buf(), None, paths.clone(), host.clone())
+            .await
+            .unwrap();
+        let state: bui_schema::model::State =
+            serde_json::from_slice(&std::fs::read(crate::paths::state_file(&paths)).unwrap())
+                .unwrap();
+        assert_eq!(state.node.public_ip, "198.51.100.7");
+    }
+
+    /// v3 fixture 的副本，去掉 `server_ip.txt`（导入值为空 → 走探测那一支）。
+    fn fixture_without_server_ip() -> Option<tempfile::TempDir> {
+        let src = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../bui-schema/tests/fixtures/v3/src"
+        ));
+        if !src.exists() {
+            eprintln!("skipped: 缺 P0 的 v3 fixture");
+            return None;
+        }
+        let dst = tempfile::tempdir().unwrap();
+        for e in std::fs::read_dir(src).unwrap() {
+            let e = e.unwrap();
+            let name = e.file_name();
+            if name == "server_ip.txt" {
+                continue;
+            }
+            let (from, to) = (e.path(), dst.path().join(&name));
+            if from.is_dir() {
+                std::fs::create_dir_all(&to).unwrap();
+                for f in std::fs::read_dir(&from).unwrap() {
+                    let f = f.unwrap();
+                    std::fs::copy(f.path(), to.join(f.file_name())).unwrap();
+                }
+            } else {
+                std::fs::copy(&from, &to).unwrap();
+            }
+        }
+        Some(dst)
     }
 }

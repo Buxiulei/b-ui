@@ -280,8 +280,20 @@ fn versions_from_disk(host: &dyn Host, paths: &Paths) -> Versions {
     }
 }
 
+/// manifest 拉不到时打到 **stdout** 的那一行。tracing 在 systemd 机器上走 journald，运维在
+/// `bui install` 的终端输出里看不到那条 warn（2026-09-12 真机实录：整份日志里没有任何
+/// manifest/下载行，于是没人发现内核根本没装）。地址经 `redact` 脱敏。
+fn manifest_failure_notice(url: &str, err: &str) -> String {
+    format!(
+        "⚠ 拉取 manifest 失败（{}）：{err}；未安装任何内核。请设 {}=<可用的 manifest 地址> 或先把内核二进制放进 bin/ 后重跑",
+        crate::redact::url_credentials(url),
+        crate::kernels::MANIFEST_URL_ENV,
+    )
+}
+
 /// 第 3 + 4 步：拉 manifest → 缓存（内容相同不写）→ 把四个内核装到 `bin/`（版本一致则跳过）。
-/// manifest 拉不到只警告并返回 `None`（离线装机继续，对账跳过 `Binary`）。
+/// manifest 拉不到只警告并返回 `None`；**是否继续装机由调用方的内核闸门决定**
+/// （[`run_with`] 的「内核缺一即中止」）。
 fn fetch_and_install_kernels(
     host: &dyn Host,
     fetcher: &dyn Fetcher,
@@ -297,6 +309,7 @@ fn fetch_and_install_kernels(
                 env = crate::kernels::MANIFEST_URL_ENV,
                 "拉取 manifest 失败，跳过内核安装（可用该环境变量覆盖地址）"
             );
+            println!("{}", manifest_failure_notice(manifest_url, &e.to_string()));
             return None;
         }
     };
@@ -404,12 +417,7 @@ async fn collect_answers(
         let h = host.clone();
         tokio::task::spawn_blocking(move || {
             let hostname = h.hostname().unwrap_or_default();
-            let ip = h
-                .run("curl", &["-sS", "--max-time", "5", "https://api.ipify.org"])
-                .ok()
-                .filter(|o| o.ok())
-                .map(|o| o.stdout.trim().to_string())
-                .unwrap_or_default();
+            let ip = crate::sys::probe_public_ip(h.as_ref());
             (hostname, ip)
         })
         .await?
@@ -442,6 +450,12 @@ async fn collect_answers(
         let mut buf = String::new();
         std::io::stdin().read_line(&mut buf)?;
         answers.admin_password = buf.trim_end_matches('\n').to_string();
+        None
+    } else if opts.import_v3.is_some() {
+        // 导入路径的管理员密码来自 v3（`admin.env` 的 `ADMIN_PASSWORD`；v3 缺 admin.env 时由
+        // `bui_schema::v3::import` 生成随机密码并带一条「请用 CLI 重设」的导入提示）。
+        // `run_with` 的导入分支整份用 `report.state`，`answers.admin_password` 一个字都不看 ——
+        // 2026-09-12 真机日志第一行「已生成随机管理员密码：…」而面板实际仍用 v3 密码，纯误导。
         None
     } else {
         let pw = random_hex(8);
@@ -504,7 +518,32 @@ pub async fn run_with(
         })
         .await?
     };
+    // 4.5：**内核缺一即中止**（2026-09-12 bwg-rick 真机实录）。manifest 服务没起来时第 3 步只
+    // 警告，旧代码接着写单元、接着 `uninstall_v3`：v3 被拆掉而 `bin/` 里只有 bui，
+    // hysteria×2/relay 全 203/EXEC、caddy 也起不来，外部生产站点跟着断。
+    //
+    // 闸门必须在**写任何单元/配置与 `uninstall_v3` 之前**：此时一个破坏性动作都还没做，
+    // 报错退出后 v3 一字不动、`state.json` 也还没落盘（下次修好 manifest 重跑即可）。
+    // 只管全新装机与导入：活机器上重跑 install 只对账，内核该由 `bui upgrade` 补。
     if fresh {
+        let missing = {
+            // 探测走 spawn_blocking：`installed_versions` 会 run 四次 `<bin>/<kernel> version`
+            let (h, p) = (host.clone(), paths.clone());
+            tokio::task::spawn_blocking(move || {
+                crate::kernels::missing_kernels(h.as_ref(), &p.bin_dir)
+            })
+            .await?
+        };
+        if !missing.is_empty() {
+            anyhow::bail!(
+                "缺少内核：{}（manifest：{}）；已中止安装，v3 与现有服务一字未动。\
+                 请先把这些二进制放进 {}/，或设 {}=<可用的 manifest 地址> 后重跑 bui install",
+                missing.join("、"),
+                crate::redact::url_credentials(&manifest_url),
+                paths.bin_dir.display(),
+                crate::kernels::MANIFEST_URL_ENV,
+            );
+        }
         // 5 + 6：生成或导入 state
         let state = match &opts.import_v3 {
             Some(dir) => {
@@ -1078,6 +1117,195 @@ mod tests {
             .filter(|o| o.starts_with("write:") && !o.starts_with(&verify_prefix))
             .collect();
         assert_eq!(writes, Vec::<String>::new(), "幂等：第二次 install 零写入");
+    }
+
+    /// v3 fixture 的路径（缺则跳过：P0 的 fixture 不在时不该红）。
+    fn v3_fixture() -> Option<&'static Path> {
+        let src = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../bui-schema/tests/fixtures/v3/src"
+        ));
+        if src.exists() {
+            Some(src)
+        } else {
+            eprintln!("skipped: 缺 P0 的 v3 fixture");
+            None
+        }
+    }
+
+    /// 2026-09-12 bwg-rick 真机实录：本机 manifest 服务没起来 → `bui install --import-v3 --yes`
+    /// 拉 manifest 失败**却继续跑**，`uninstall_v3` 把 v3 拆了而 `bin/` 里只有 bui，
+    /// hysteria×2/relay 全 203/EXEC、caddy 也起不来，外部生产站点断了几分钟。
+    /// 内核缺一即中止：v3 一字不动、`state.json` 不落盘。
+    #[tokio::test]
+    async fn import_v3_aborts_before_touching_anything_when_a_kernel_is_missing() {
+        let Some(src) = v3_fixture() else { return };
+        let d = tempfile::tempdir().unwrap();
+        let paths = scratch(&d);
+        // `bin/` 里只有 bui（真机形态）；manifest 拉不到 → 一个内核都装不上
+        let host = Arc::new(FakeHost::new());
+        host.with(|i| {
+            i.files
+                .insert(paths.bin_dir.join("bui"), (b"ELF".to_vec(), 0o755));
+            for u in crate::commands::import_v3::V3_UNITS {
+                i.files.insert(
+                    format!("/etc/systemd/system/{u}").into(),
+                    (b"x".to_vec(), 0o644),
+                );
+                i.units_enabled.insert(u.to_string());
+                i.units_active.insert(u.to_string());
+            }
+            i.units_active.insert("caddy.service".into());
+        });
+        let empty: Arc<dyn Fetcher> = Arc::new(FakeFetcher(Mutex::new(vec![])));
+        let mut o = opts(&d);
+        o.import_v3 = Some(src.to_path_buf());
+        let err = run_with(
+            o,
+            answers(),
+            // 带 userinfo：错误信息里的 manifest 地址必须经 redact
+            "https://ops:s3cr3t@manifest.example.invalid/manifest.json".into(),
+            paths.clone(),
+            host.clone(),
+            empty,
+        )
+        .await
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        for k in crate::kernels::KERNELS {
+            assert!(msg.contains(k), "缺的内核要逐个点名：{msg}");
+        }
+        assert!(msg.contains("BUI_MANIFEST_URL"), "{msg}");
+        assert!(
+            msg.contains(&paths.bin_dir.display().to_string()),
+            "要告诉人把二进制放哪：{msg}"
+        );
+        assert!(
+            msg.contains("manifest.example.invalid") && msg.contains("***:***"),
+            "manifest 地址要给、凭据要脱敏：{msg}"
+        );
+        assert!(!msg.contains("s3cr3t"), "凭据泄漏：{msg}");
+        assert!(
+            !crate::paths::state_file(&paths).exists(),
+            "state.json 不许落盘（留着它下次 install 会走「已安装」分支，v3 永远卸不掉）"
+        );
+        // v3 一字不动：单元没停没删、没写过任何单元/配置
+        for u in crate::commands::import_v3::V3_UNITS {
+            assert!(
+                host.text(&format!("/etc/systemd/system/{u}")).is_some(),
+                "{u} 被删了"
+            );
+            assert!(host.unit_is_active(u).unwrap(), "{u} 被停了");
+        }
+        assert!(host.unit_is_active("caddy").unwrap(), "发行版 caddy 被停了");
+        let bad: Vec<String> = host
+            .ops()
+            .into_iter()
+            .filter(|o| {
+                o.starts_with("write:") || o.starts_with("remove:") || o.starts_with("systemd:")
+            })
+            .collect();
+        assert_eq!(bad, Vec::<String>::new(), "任何破坏性动作都不该发生");
+    }
+
+    /// 全新装机路径同样卡住（此时 v3 不在，但也不该写出半成品的单元与配置）。
+    #[tokio::test]
+    async fn a_fresh_install_aborts_when_a_kernel_is_missing() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = scratch(&d);
+        let host = host_for_install(&paths);
+        // xray 在 bin/ 下（能生成 REALITY 密钥），另外三个内核缺
+        host.with(|i| {
+            i.files
+                .insert(paths.bin_dir.join("xray"), (b"ELF".to_vec(), 0o755));
+        });
+        let empty: Arc<dyn Fetcher> = Arc::new(FakeFetcher(Mutex::new(vec![])));
+        let err = run_with(
+            opts(&d),
+            answers(),
+            murl(),
+            paths.clone(),
+            host.clone(),
+            empty,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("hysteria") && err.contains("sing-box") && err.contains("caddy"),
+            "{err}"
+        );
+        assert!(!err.contains("xray"), "xray 在位就不该点它的名：{err}");
+        assert!(!crate::paths::state_file(&paths).exists());
+        assert!(
+            host.text("/etc/systemd/system/b-ui.service").is_none(),
+            "不该写出任何单元"
+        );
+        assert!(host
+            .text(&d.path().join("config.yaml").display().to_string())
+            .is_none());
+    }
+
+    /// manifest 拉不到时的提示必须进 **stdout**：守护进程/CLI 的 tracing 在 systemd 机器上
+    /// 走 journald，运维在 `bui install` 的终端输出里根本看不到那条 warn（2026-09-12 真机）。
+    #[test]
+    fn the_manifest_failure_notice_is_actionable_and_redacted() {
+        let line = manifest_failure_notice(
+            "https://ops:s3cr3t@manifest.example.invalid/manifest.json",
+            "connection refused",
+        );
+        assert!(line.contains("manifest"), "{line}");
+        assert!(line.contains("connection refused"), "{line}");
+        assert!(line.contains("BUI_MANIFEST_URL"), "{line}");
+        assert!(
+            line.contains("***:***") && !line.contains("s3cr3t"),
+            "{line}"
+        );
+    }
+
+    /// 2026-09-12 真机：日志第一行「已生成随机管理员密码：…」，而面板实际仍用 v3 的密码
+    /// （导入的哈希没被覆盖）——纯误导。`--import-v3` 一律不生成、不打印随机密码。
+    #[tokio::test]
+    async fn import_v3_neither_generates_nor_prints_a_random_admin_password() {
+        let Some(src) = v3_fixture() else { return };
+        let d = tempfile::tempdir().unwrap();
+        let paths = scratch(&d);
+        let host = host_for_install(&paths);
+        let mut o = opts(&d);
+        o.import_v3 = Some(src.to_path_buf());
+        // `notice` 是「已生成随机管理员密码」唯一的出口（run() 把它 println 出去）
+        let (a, notice) = collect_answers(&o, None, host.clone()).await.unwrap();
+        assert_eq!(notice, None, "导入路径不许打印随机管理员密码");
+        assert!(a.admin_password.is_empty(), "导入路径不许生成密码");
+        // 端到端：state 里的哈希就是 v3 admin.env 的密码
+        run_with(
+            {
+                let mut o = opts(&d);
+                o.import_v3 = Some(src.to_path_buf());
+                o
+            },
+            Answers {
+                admin_password: "cli-side-password-must-be-ignored".into(),
+                ..answers()
+            },
+            murl(),
+            paths.clone(),
+            host.clone(),
+            fetcher_with_manifest(),
+        )
+        .await
+        .unwrap();
+        let state: bui_schema::model::State =
+            serde_json::from_slice(&std::fs::read(crate::paths::state_file(&paths)).unwrap())
+                .unwrap();
+        assert!(
+            crate::api::auth::verify_password(&state.admin.password_hash, "test123"),
+            "面板密码必须是 v3 admin.env 里的那个"
+        );
+        assert!(!crate::api::auth::verify_password(
+            &state.admin.password_hash,
+            "cli-side-password-must-be-ignored"
+        ));
     }
 
     /// 2026-09-13 裁决「P1：Caddy 外部站点通道」：新 Caddyfile（含导入的外部站点）过不了

@@ -325,9 +325,40 @@ pub fn jitter_secs(node_id: uuid::Uuid) -> u64 {
     n % 3600
 }
 
+/// `state.node.public_ip` 为空时探测一次并写回 `state.json`。
+///
+/// 2026-09-12 真机：`--import-v3` 时 `api.ipify.org` 返回空串，`node.public_ip` 就此留空，
+/// 之后谁也不会再补（relay 的本机 IP 直连例外、订阅里的地址都靠它）。启动时补一次最省事。
+/// **不阻塞启动**：探测失败或写盘失败只 warn。
+pub async fn backfill_public_ip(store: &Store, host: Arc<dyn Host>) {
+    if !store.read().await.node.public_ip.is_empty() {
+        return;
+    }
+    let h = host.clone();
+    let ip =
+        match tokio::task::spawn_blocking(move || crate::sys::probe_public_ip(h.as_ref())).await {
+            Ok(ip) => ip,
+            Err(e) => {
+                tracing::warn!(error = %e, "公网 IP 探测任务 panic");
+                return;
+            }
+        };
+    if ip.is_empty() {
+        tracing::warn!("state.node.public_ip 为空且探测失败，请在面板里补填");
+        return;
+    }
+    let value = ip.clone();
+    match store.update(|s| s.node.public_ip = value).await {
+        Ok(_) => tracing::info!(public_ip = %ip, "已回填 state.node.public_ip"),
+        Err(e) => tracing::warn!(error = %e, "回填 state.node.public_ip 写盘失败"),
+    }
+}
+
 /// `bui serve`：装好 Router 与全部后台任务，监听面板 HTTP 与 unix socket。
 pub async fn run(paths: Paths, host: Arc<dyn Host>) -> anyhow::Result<()> {
     let store = Store::open(crate::paths::state_file(&paths)).await?;
+    // 在启动对账之前补：渲染出来的配置与订阅都读 `node.public_ip`
+    backfill_public_ip(&store, host.clone()).await;
     let runtime = Runtime::load(crate::paths::runtime_file(&paths));
     let bus = EventBus::new();
     let cached = {
@@ -1092,5 +1123,59 @@ mod tests {
         };
         let _ = reg.modules[0].render(&state, &ctx); // 不 panic 即证明锁未被 poison
         assert!(reg.manifest.read().unwrap().is_some());
+    }
+
+    /// 2026-09-12 真机：`--import-v3` 时 ipify 返回空串 → `node.public_ip` 留空，之后没人再补。
+    /// 守护进程启动时补一次；已有值就一次探测都不发。
+    #[tokio::test]
+    async fn serve_backfills_an_empty_public_ip_on_startup() {
+        let d = tempfile::tempdir().unwrap();
+        let host = Arc::new(FakeHost::new());
+        host.with(|i| {
+            // 前两个源不灵（真机形态：ipify 回空串），第三个才给出答案
+            i.scripted.push((
+                format!("curl -sS --max-time 5 {}", crate::sys::IP_PROBE_URLS[0]),
+                CmdOut::success(""),
+            ));
+            i.scripted.push((
+                format!("curl -sS --max-time 5 {}", crate::sys::IP_PROBE_URLS[1]),
+                CmdOut::failure(7, "couldn't connect"),
+            ));
+            i.scripted.push((
+                format!("curl -sS --max-time 5 {}", crate::sys::IP_PROBE_URLS[2]),
+                CmdOut::success("198.51.100.7\n"),
+            ));
+        });
+        let mut empty = crate::testutil::sample_state();
+        empty.node.public_ip = String::new();
+        let path = d.path().join("state.json");
+        let store = Store::create(&path, empty).await.unwrap();
+        backfill_public_ip(&store, host.clone()).await;
+        assert_eq!(store.read().await.node.public_ip, "198.51.100.7");
+        // 写回了磁盘，不只是内存缓存
+        let on_disk: State = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(on_disk.node.public_ip, "198.51.100.7");
+        // 已有值时：一次探测都不发
+        host.clear_ops();
+        backfill_public_ip(&store, host.clone()).await;
+        assert_eq!(host.ops(), Vec::<String>::new(), "{:?}", host.ops());
+    }
+
+    /// 探测全失败不许阻塞启动，也不许把空串写进 state（那是一次无谓的备份 + 写盘）。
+    #[tokio::test]
+    async fn a_failed_public_ip_probe_does_not_block_startup() {
+        let d = tempfile::tempdir().unwrap();
+        let host = Arc::new(FakeHost::new());
+        host.with(|i| i.scripted.push(("curl".into(), CmdOut::failure(6, "dns"))));
+        let mut empty = crate::testutil::sample_state();
+        empty.node.public_ip = String::new();
+        let path = d.path().join("state.json");
+        let store = Store::create(&path, empty).await.unwrap();
+        backfill_public_ip(&store, host.clone()).await;
+        assert_eq!(store.read().await.node.public_ip, "");
+        assert!(
+            !d.path().join("state.backups").exists(),
+            "没探到就别写盘（写盘会顺带备份一份）"
+        );
     }
 }

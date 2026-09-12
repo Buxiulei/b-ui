@@ -247,6 +247,17 @@ pub fn installed_versions(host: &dyn Host, bin_dir: &Path) -> BTreeMap<String, S
         .collect()
 }
 
+/// [`KERNELS`] 里「`bin/` 下没有该二进制、或有但探不出版本」的那些（顺序同 `KERNELS`）。
+/// 探不出版本与不存在同等对待：真机上 203/EXEC 的单元就是「文件在、但根本跑不起来」。
+pub fn missing_kernels(host: &dyn Host, bin_dir: &Path) -> Vec<&'static str> {
+    let have = installed_versions(host, bin_dir);
+    KERNELS
+        .iter()
+        .copied()
+        .filter(|k| !have.contains_key(*k))
+        .collect()
+}
+
 pub fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     hex::encode(Sha256::digest(bytes))
@@ -338,6 +349,21 @@ mod tests {
             v.get("hysteria"),
             None,
             "文件不存在就不进表，diff 会判成要装"
+        );
+        // 2026-09-12 真机：bin/ 里只有 bui，install 却照着往下跑把 v3 拆了。
+        // 「缺哪些」必须能一口气问出来，且探不出版本与不存在同等对待。
+        h.with(|i| {
+            i.files
+                .insert("/opt/b-ui/bin/caddy".into(), (b"garbage".to_vec(), 0o755));
+            // 203/EXEC 的形态：文件在，但根本跑不出版本
+            i.scripted.push((
+                "/opt/b-ui/bin/caddy version".into(),
+                CmdOut::failure(127, ""),
+            ));
+        });
+        assert_eq!(
+            missing_kernels(&h, std::path::Path::new("/opt/b-ui/bin")),
+            vec!["hysteria", "caddy"],
         );
     }
 
