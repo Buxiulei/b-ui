@@ -1,5 +1,6 @@
-//! systemd 单元模块：六个 v4 单元的完整单元文件、两个 CLI 入口符号链接、
-//! 六个单元的启用态，以及 v3 遗留单元 / 遗留文件的删除项。
+//! systemd 单元模块：六个 v4 单元的完整单元文件、三条入口符号链接（两个 CLI 入口 +
+//! Hysteria2 鉴权钩子 `bin/bui-auth-hook`）、六个单元的启用态，以及 v3 遗留单元 /
+//! 遗留文件的删除项。
 //!
 //! 移植参照：`server/core.sh:197-274`（两个 hysteria 的资源限制与内存调优）、
 //! `server/core.sh:1722-1790`（面板单元 + xray drop-in）、
@@ -68,6 +69,21 @@ impl Module for UnitsModule {
                 target: target.clone(),
             });
         }
+
+        // 第三个入口：Hysteria2 `auth.command` 指向的 `<base>/bin/bui-auth-hook`
+        // （事故 2026-09-12 / 调研 H15：`auth.command` 只接受单个不带参数的可执行路径，
+        // `exec.Command(a.Cmd, addr, auth, tx)` 不过 shell、不拆空格）。
+        //
+        // 归 units 而不是 core_files：core_files 管的是四个内核二进制与它们的配置，而这条链接
+        // 与上面两条 CLI 入口是同一件事——把 `<base>/bin/bui` 暴露成另一个入口名，靠 argv[0]
+        // 分发；三条一起渲染，`bui reconcile` 才能一并自愈被误删的入口。
+        //
+        // 目标写**相对**的 `bui`（同目录）：`bui upgrade` 与 `--rollback` 都是原地换掉
+        // `bin/bui` 这个文件，相对链接因此天然指向换上来的那一版。
+        out.push(Artifact::Symlink {
+            path: ctx.paths.auth_hook_bin(),
+            target: "bui".into(),
+        });
 
         // 六个单元都 enable + start。
         for name in MANAGED_UNITS {
@@ -527,6 +543,40 @@ mod tests {
             path: "/usr/local/bin/b-ui".into(),
             target: "/opt/b-ui/bin/bui".into()
         }));
+    }
+
+    /// 事故回归（2026-09-12 bwg-rick）：Hysteria2 的 `auth.command` 只接受单个可执行路径
+    /// （`exec.Command(a.Cmd, addr, auth, tx)`，不过 shell、不拆空格），所以钩子的入口是
+    /// `<base>/bin/bui-auth-hook` 这条符号链接，由 `bui` 按 argv[0] 分发。
+    ///
+    /// 目标必须是**相对**的 `bui`（同目录）：`bui upgrade` 与 `--rollback` 都是原地替换
+    /// `bin/bui` 这个文件名，相对链接因此天然指向换上来的那一版，不需要重建
+    /// （绝对路径同样指得到，但相对目标连 `<base>` 整体搬迁也活得下来）。
+    #[test]
+    fn the_hysteria_auth_hook_entry_is_a_relative_symlink_to_bui() {
+        let arts = UnitsModule.render(&sample_state(), &ctx());
+        assert!(
+            arts.contains(&Artifact::Symlink {
+                path: "/opt/b-ui/bin/bui-auth-hook".into(),
+                target: "bui".into(),
+            }),
+            "缺 bin/bui-auth-hook 链接（或目标不是同目录的相对 `bui`）：{:?}",
+            arts.iter()
+                .filter(|a| matches!(a, Artifact::Symlink { .. }))
+                .collect::<Vec<_>>()
+        );
+        // 路径由 Paths 派生，不是第二处硬编码
+        let p = Paths::default_server();
+        assert!(arts.contains(&Artifact::Symlink {
+            path: p.auth_hook_bin(),
+            target: "bui".into(),
+        }));
+        // 渲染进配置的那条路径与这条链接必须是同一个（否则内核指向一个不存在的文件）
+        let yaml = bui_schema::render::hysteria::direct_yaml(&sample_state().node, &p);
+        assert!(
+            yaml.contains(&format!("command: {}\n", p.auth_hook_bin().display())),
+            "config.yaml 的 auth.command 与链接不一致：\n{yaml}"
+        );
     }
 
     #[test]

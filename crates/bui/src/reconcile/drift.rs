@@ -27,6 +27,8 @@ pub const BASE_WHITELIST: [&str; 14] = [
     "manifest.json",
     // `bui upgrade` 留下的回滚快照。同一批的 `bin/bui.prev` 与 `bin/<kernel>.prev` 不用单独
     // 列：`stray_file` 只看顶层直接子项，`bin` 本身已在白名单里且不递归（见 `scan` 的说明）。
+    // 同理，units 模块渲染的钩子入口链接 `bin/bui-auth-hook`（事故 2026-09-12）也不用列——
+    // 它在 `bin/` 里，而这份白名单比的是 `file_name()`，写成 `bin/bui-auth-hook` 也比不到。
     "manifest.prev.json",
     "relay-cache.db",
     "auth-snapshot.json",
@@ -416,6 +418,46 @@ mod tests {
             scan(&h, &managed(), &Paths::default_server()),
             vec![],
             "健康装机必须零漂移"
+        );
+    }
+
+    /// 事故回归（2026-09-12）配套：`<base>/bin/bui-auth-hook` 这条钩子入口链接永远不许被
+    /// 报成漂移——否则 `/api/health` 每 10 分钟 degraded，`bui reconcile --force` 还会把它
+    /// 删掉，Hysteria2 的 `auth.command` 当场指向一个不存在的文件（= 事故本身）。
+    ///
+    /// 它**不需要**往 [`BASE_WHITELIST`] 加条目：`stray_file` 只看 `<base>` 顶层直接子项，
+    /// 而 `bin` 已在白名单里且不递归；白名单比的也是 `file_name()`，加一条 `bin/bui-auth-hook`
+    /// 根本比不到。这条测试把这个推理钉死，免得后人「补白名单」时把 scan 改成递归。
+    #[test]
+    fn the_auth_hook_symlink_is_never_reported_as_drift() {
+        let paths = Paths::default_server();
+        let hook = paths.auth_hook_bin();
+        assert_eq!(
+            hook.parent(),
+            Some(paths.bin_dir.as_path()),
+            "钩子入口必须在 bin/ 里，顶层扫不到"
+        );
+        assert!(BASE_WHITELIST.contains(&"bin"));
+
+        let h = FakeHost::new();
+        h.with(|i| {
+            i.files
+                .insert("/opt/b-ui/bin/bui".into(), (b"ELF".to_vec(), 0o755));
+            i.scripted.push((
+                "crontab -l".into(),
+                CmdOut::failure(1, "no crontab for root"),
+            ));
+        });
+        h.symlink(Path::new("bui"), &hook).unwrap();
+        let mut arts = managed();
+        arts.push(Artifact::Symlink {
+            path: hook.clone(),
+            target: "bui".into(),
+        });
+        assert_eq!(scan(&h, &arts, &paths), vec![], "bin/ 下的钩子入口不算漂移");
+        assert!(
+            artifact_paths(&arts).contains(&hook),
+            "它是受管 artifact：将来就算 scan 递归进 bin/，也在受管路径集合里"
         );
     }
 

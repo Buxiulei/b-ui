@@ -135,6 +135,165 @@ check_external_sites() {
   done
 }
 
+# ---------------------------------------------------------------------------
+# step 6：Hysteria2 端到端鉴权（事故回归，2026-09-12 bwg-rick 真机）
+#
+# `auth.command` 只接受**单个可执行文件路径**：内核 `CommandAuthenticator` 直接
+# `exec.Command(a.Cmd, addr, auth, tx)`，不过 shell、不按空格拆参数（调研 H15）。v4 一度渲染成
+# `command: /opt/b-ui/bin/bui auth-hook`，内核于是去找一个**文件名带空格**的可执行文件，
+# 钩子从未被调用，两台 Hysteria2 实例全员鉴权失败（客户端 404）约一小时。
+# 这种错配 `sing-box check` / `xray -test` 一类的静态校验一概看不出来，只能真跑一次鉴权：
+# 拿 state.json 里第一个未禁用用户的凭据起 bundled hysteria 客户端，经它的 socks5 打一次 https，
+# 再看 <base>/auth-hook.log 最后一行是不是 allow（= 钩子真的被调用并放行了）。
+#
+# 凭据只写进 0600 的临时配置文件，**绝不进 argv**（ps 会泄露）；无论成败都杀进程、删临时目录。
+# ---------------------------------------------------------------------------
+
+# state.json → 三行：用户名 / HY2 密码 / 面板域名（缺任何一样就什么都不打印 ⇒ 上层 SKIP）
+hy2_probe_creds() {
+  python3 - "$1" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    raise SystemExit(0)
+domain = (d.get("node") or {}).get("domain") or ""
+for u in d.get("users") or []:
+    if u.get("disabled"):
+        continue
+    pw = (u.get("credentials") or {}).get("hy2_password") or ""
+    if u.get("username") and pw and domain:
+        print(u["username"])
+        print(pw)
+        print(domain)
+        break
+PY
+}
+
+# hysteria 配置的 listen 行 → 端口号（`listen: :10000,20000-30000` → 10000）
+listen_port() {
+  [ -f "$1" ] || return 0
+  sed -n '/^listen:/{s/[^0-9]*\([0-9][0-9]*\).*/\1/p;q;}' "$1"
+}
+
+# 一个空闲的本地 TCP 端口（给客户端的 socks5 入站用）
+free_port() {
+  python3 -c 'import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()'
+}
+
+# 后台起 bundled hysteria 客户端、等它的 socks 端口就绪，回显 PID（自测里整条被换成 fake）
+start_hy2_client() {
+  local cfg=$1 log=$2 socks=$3 pid i=0
+  "$BASE/bin/hysteria" client -c "$cfg" >"$log" 2>&1 &
+  pid=$!
+  while [ "$i" -lt 40 ]; do
+    kill -0 "$pid" 2>/dev/null || break
+    (exec 3<>"/dev/tcp/127.0.0.1/$socks") 2>/dev/null && break
+    sleep 0.25
+    i=$((i + 1))
+  done
+  echo "$pid"
+}
+
+# 经客户端的 socks5 打一次 https，回显状态码（自测里被换成 fake）
+probe_socks_code() {
+  curl -s --socks5-hostname "127.0.0.1:$1" --max-time 20 \
+    -o /dev/null -w '%{http_code}' https://api.ipify.org 2>/dev/null
+}
+
+# 钩子自己写的日志的最后一行（spec §3.2：`<RFC3339> <addr> <username> <结果>`）
+auth_log_tail() {
+  tail -n 1 "$BASE/auth-hook.log" 2>/dev/null
+}
+
+# 对一个 Hysteria2 监听端口跑一次真实鉴权 + 出网
+hy2_auth_probe() {
+  local label=$1 port=$2 sni=$3 user=$4 upass=$5
+  local dir cfg log socks pid code line auth i
+  dir=$(mktemp -d) || { no "step6 $label：建不出临时目录"; return; }
+  chmod 700 "$dir"
+  cfg="$dir/client.yaml"
+  log="$dir/client.log"
+  socks=$(free_port)
+  if [ -z "$socks" ]; then
+    no "step6 $label：分配不到本地端口"
+    rm -rf "$dir"
+    return
+  fi
+  # `user:pass` 原串就是 auth 载荷（调研 H1）；双引号标量 + 转义，密码里的 : # { 都不会歪
+  auth="$user:$upass"
+  auth=${auth//\\/\\\\}
+  auth=${auth//\"/\\\"}
+  (
+    umask 077
+    cat > "$cfg" <<EOF
+server: 127.0.0.1:$port
+auth: "$auth"
+tls:
+  sni: $sni
+  insecure: true
+socks5:
+  listen: 127.0.0.1:$socks
+EOF
+  )
+  pid=$(start_hy2_client "$cfg" "$log" "$socks")
+  code=$(probe_socks_code "$socks")
+  line=$(auth_log_tail)
+  # `wait` 用不上：客户端是命令替换那个子 shell 的子进程，不是本 shell 的
+  if [ -n "$pid" ]; then
+    kill "$pid" 2>/dev/null
+    i=0
+    while [ "$i" -lt 20 ] && kill -0 "$pid" 2>/dev/null; do
+      sleep 0.1
+      i=$((i + 1))
+    done
+    kill -9 "$pid" 2>/dev/null
+  fi
+  rm -rf "$dir"
+  if [ "$code" != "200" ]; then
+    no "step6 $label 经 Hysteria2 出不了网（HTTP ${code:-空}）" \
+      "auth-hook.log 末行：${line:-空}（钩子没被调用时这里不会有新行）"
+    return
+  fi
+  case $line in
+    *allow*) ok "step6 $label 端到端鉴权通过（HTTP 200，钩子判 allow）" ;;
+    *) no "step6 $label 出网通了但钩子没记 allow" "auth-hook.log 末行：${line:-空}" ;;
+  esac
+}
+
+check_hy2_auth() {
+  local creds user upass sni direct resi
+  if [ ! -x "$BASE/bin/hysteria" ]; then
+    skip "step6 Hysteria2 端到端鉴权（$BASE/bin/hysteria 不可执行）"
+    return 0
+  fi
+  if ! command -v curl >/dev/null 2>&1; then
+    skip "step6 Hysteria2 端到端鉴权（本机没有 curl）"
+    return 0
+  fi
+  creds=$(hy2_probe_creds "$BASE/state.json")
+  user=$(printf '%s\n' "$creds" | sed -n 1p)
+  upass=$(printf '%s\n' "$creds" | sed -n 2p)
+  sni=$(printf '%s\n' "$creds" | sed -n 3p)
+  if [ -z "$user" ] || [ -z "$upass" ] || [ -z "$sni" ]; then
+    skip "step6 Hysteria2 端到端鉴权（state.json 里没有可用的未禁用用户）"
+    return 0
+  fi
+  direct=$(listen_port "$BASE/config.yaml")
+  resi=$(listen_port "$BASE/config-residential.yaml")
+  if [ -z "$direct" ] && [ -z "$resi" ]; then
+    no "step6 取不到 Hysteria2 监听端口" "config.yaml / config-residential.yaml 里没有 listen 行"
+    return 0
+  fi
+  [ -n "$direct" ] && hy2_auth_probe "直连 :$direct" "$direct" "$sni" "$user" "$upass"
+  [ -n "$resi" ] && hy2_auth_probe "住宅 :$resi" "$resi" "$sni" "$user" "$upass"
+  return 0
+}
+
 # 对账报告 JSON → 问题描述（空串 = 零变更零错误）
 check_report_clean() {
   python3 - "$1" <<'PY'
@@ -229,6 +388,9 @@ PY
 
   # step 5：从 v3 导过来的外部站点仍然可达
   check_external_sites "${SITES_FILE:-$BASE/caddy/sites/imported-from-v3.caddy}"
+
+  # step 6：两台 Hysteria2 真跑一次鉴权 + 出网（事故回归，见上面那段说明）
+  check_hy2_auth
 }
 
 self_test() {
@@ -251,6 +413,86 @@ self_test() {
   out=$(check_report_clean '{"changed":["/opt/b-ui/config.yaml"],"restarted":["hysteria-server"],"errors":[],"verify_failures":[],"drift":[],"notes":[]}')
   if [[ "$out" == *config.yaml* ]]; then ok "自测：有变更的报告被判失败"; else no "自测：漏判变更" "$out"; fi
   self_test_external_sites
+  self_test_hy2_auth
+}
+
+# step 6 的自测：hysteria 客户端与 curl 都换成 fake，只验「取凭据 / 取端口 / 判定 / SKIP」
+self_test_hy2_auth() {
+  local d out
+  d=$(mktemp -d) || { no "自测：建不出临时目录"; return; }
+  mkdir -p "$d/bin"
+  printf '#!/bin/sh\nexit 0\n' > "$d/bin/hysteria"
+  chmod 755 "$d/bin/hysteria"
+  printf 'listen: :10000,20000-30000\nauth:\n  type: command\n  command: /opt/b-ui/bin/bui-auth-hook\n' > "$d/config.yaml"
+  printf 'listen: :40000,41000-50000\n' > "$d/config-residential.yaml"
+  printf '2026-09-12T09:00:00Z 1.2.3.4:51820 alice allow\n' > "$d/auth-hook.log"
+  printf '%s\n' '{"node":{"domain":"panel.example.com"},' \
+    ' "users":[{"username":"ghost","disabled":true,"credentials":{"hy2_password":"x"}},' \
+    '          {"username":"alice","disabled":false,"credentials":{"hy2_password":"pw:with:colons"}}]}' \
+    > "$d/state.json"
+
+  out=$(hy2_probe_creds "$d/state.json")
+  if [ "$out" = "alice
+pw:with:colons
+panel.example.com" ]; then
+    ok "自测：跳过禁用用户，取第一个可用用户的凭据与域名"
+  else
+    no "自测：凭据解析不对" "$out"
+  fi
+  if [ "$(listen_port "$d/config.yaml")" = "10000" ] &&
+    [ "$(listen_port "$d/config-residential.yaml")" = "40000" ]; then
+    ok "自测：从两份配置的 listen 行取到端口（带端口跳跃区间也只取第一个数）"
+  else
+    no "自测：listen 端口解析不对" \
+      "$(listen_port "$d/config.yaml") / $(listen_port "$d/config-residential.yaml")"
+  fi
+
+  # ① 通过：两条通路各一条 PASS
+  # shellcheck disable=SC2317  # 在 $( ) 子 shell 里覆盖真客户端与真 curl，下面那次调用会用到
+  out=$(
+    BASE=$d
+    start_hy2_client() {
+      sleep 5 &
+      echo $!
+    }
+    probe_socks_code() { echo 200; }
+    check_hy2_auth
+  )
+  if [ "$(printf '%s\n' "$out" | grep -c '^PASS')" = "2" ] && [[ "$out" == *allow* ]]; then
+    ok "自测：两条通路都鉴权通过 → 两条 PASS"
+  else
+    no "自测：鉴权通了却没判通过" "$out"
+  fi
+
+  # ② 失败：出不了网（事故当天的形态——钩子没被调用，客户端 404）
+  # shellcheck disable=SC2317
+  out=$(
+    BASE=$d
+    start_hy2_client() {
+      sleep 5 &
+      echo $!
+    }
+    probe_socks_code() { echo 000; }
+    check_hy2_auth
+  )
+  if [ "$(printf '%s\n' "$out" | grep -c '^FAIL')" = "2" ]; then
+    ok "自测：出不了网判失败"
+  else
+    no "自测：出不了网没被判失败" "$out"
+  fi
+
+  # ③ 没有可用用户 → SKIP（新装机还没加用户时不该报红）
+  printf '%s\n' '{"node":{"domain":"panel.example.com"},"users":[{"username":"ghost","disabled":true,"credentials":{"hy2_password":"x"}}]}' > "$d/state.json"
+  out=$(
+    BASE=$d
+    check_hy2_auth
+  )
+  if [[ "$out" == SKIP* ]]; then
+    ok "自测：state.json 里没有未禁用用户 → SKIP"
+  else
+    no "自测：缺用户该 SKIP" "$out"
+  fi
+  rm -rf "$d"
 }
 
 # step 5 的自测：真 curl 换成 fake，只验「站点地址解析 + 状态码判定」

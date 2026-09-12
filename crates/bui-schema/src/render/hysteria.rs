@@ -1,6 +1,6 @@
 //! Hysteria2 两个实例的配置渲染（模板移植自 v3 `server/core.sh:527-580` 直连、`595-660` 住宅）。
 //!
-//! 与 v3 的差别：`auth` 段从 `http` / `userpass` 改为 `command`（钩子 `bui auth-hook`，见 spec §3.2）；
+//! 与 v3 的差别：`auth` 段从 `http` / `userpass` 改为 `command`（钩子 `bin/bui-auth-hook`，见 spec §3.2）；
 //! `masquerade.proxy.url` 由 REALITY 伪装域推导；`obfs` 段只在启用时输出。
 use crate::model::NodeParams;
 use crate::paths::Paths;
@@ -84,10 +84,10 @@ fn common_doc(node: &NodeParams, paths: &Paths, listen: &str, traffic_port: u16)
         key("auth"),
         map(vec![
             ("type", str_val("command")),
-            (
-                "command",
-                str_val(&format!("{}/bui auth-hook", paths.bin_dir.display())),
-            ),
+            // 必须是**单个不带参数**的可执行路径：内核 `exec.Command(a.Cmd, addr, auth, tx)`
+            // 不过 shell、不按空格拆参数（调研 H15）。`bin/bui-auth-hook` 是 `bin/bui` 的
+            // 符号链接，`bui` 按 argv[0] 认出这个名字就直接进钩子。
+            ("command", str_val(&paths.auth_hook_bin().to_string_lossy())),
         ]),
     );
     doc.insert(
