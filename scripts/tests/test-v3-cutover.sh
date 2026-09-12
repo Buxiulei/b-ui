@@ -9,8 +9,11 @@ ROOT=$(cd "$HERE/../.." && pwd)
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
-mkdir -p "$WORK/bin" "$WORK/base" "$WORK/out" "$WORK/units/caddy.service.d"
+mkdir -p "$WORK/bin" "$WORK/base" "$WORK/out" "$WORK/units/caddy.service.d" "$WORK/sbin"
 printf 'users\n' > "$WORK/base/users.json"
+printf 'v3 cli\n' > "$WORK/base/b-ui-cli.sh"
+# v3 的 CLI 入口现状：/usr/local/bin/b-ui → /opt/b-ui/b-ui-cli.sh，没有 /usr/local/bin/bui
+ln -sfn "$WORK/base/b-ui-cli.sh" "$WORK/sbin/b-ui"
 # 造一台「典型 v3 机器」的单元目录：五个服务单元 + 两组 timer（hy2-watchdog、b-ui-resi-health）
 # + caddy 的 drop-in 目录。故意不放 caddy.service（v3 用 apt 包的 /lib 单元）、
 # 也不放 b-ui-cert-sync.*（没配域名的机器就没有它）。
@@ -52,21 +55,30 @@ case "${1:-}" in
   *) : ;;
 esac
 STUB
-# crontab stub：-l 打印 v3 的两条 cron 行（FAKE_CRON_EMPTY=1 则装作空）；`crontab -` 收进文件
+# crontab stub：当前 crontab 存在 CRON_CUR 文件里（测试可随时改写，模拟切换后的真实机器）；
+# -l 原样回放（空则退 1，跟真 crontab 一致）；FAKE_CRON_EMPTY=1 装作空；
+# `crontab -` 收进 CRON_IN 并同步进 CRON_CUR（这样二次 restore 看到的就是上次写进去的）
 cat > "$WORK/bin/crontab" <<'STUB'
 #!/usr/bin/env bash
-if [[ "${1:-}" == "-" ]]; then cat > "$CRON_IN"; exit 0; fi
+if [[ "${1:-}" == "-" ]]; then cat > "$CRON_IN"; cp "$CRON_IN" "$CRON_CUR"; exit 0; fi
 [[ "${FAKE_CRON_EMPTY:-0}" == "1" ]] && exit 0
-printf '0 */6 * * * /opt/b-ui/update.sh auto\n0 */12 * * * /opt/b-ui/update.sh kernel\n'
+[[ -s "$CRON_CUR" ]] || exit 1
+cat "$CRON_CUR"
 STUB
 chmod +x "$WORK/bin"/*
 export PATH="$WORK/bin:$PATH" TAR_LOG="$WORK/tar.log" SC_LOG="$WORK/sc.log" \
-    TAR_LIST="$WORK/tar.list" CRON_IN="$WORK/cron.in"
+    TAR_LIST="$WORK/tar.list" CRON_IN="$WORK/cron.in" CRON_CUR="$WORK/cron.cur"
+# 打快照时机器上的 v3 三行 cron（update.sh auto / update.sh kernel / cert-check.sh）
+cat > "$CRON_CUR" <<'CRON'
+0 */6 * * * /opt/b-ui/update.sh auto
+0 */12 * * * /opt/b-ui/update.sh kernel
+17 3 * * * /opt/b-ui/cert-check.sh
+CRON
 
 CUT="$ROOT/scripts/ops/v3-cutover.sh"
 
 # ---- snapshot ----
-out=$(bash "$CUT" snapshot --out "$WORK/out" --base "$WORK/base" --unit-dir "$WORK/units" 2>&1); rc=$?
+out=$(bash "$CUT" snapshot --out "$WORK/out" --base "$WORK/base" --unit-dir "$WORK/units" --link-dir "$WORK/sbin" 2>&1); rc=$?
 assert_eq "0" "$rc" "snapshot 退 0"
 assert_eq "1" "$(find "$WORK/out" -name 'v3-*.tar.gz' | wc -l)" "产出一个快照归档"
 assert_eq "1" "$(find "$WORK/out" -name 'v3-*.manifest' | wc -l)" "产出一份内容清单"
@@ -74,6 +86,10 @@ man=$(find "$WORK/out" -name 'v3-*.manifest' | head -1)
 assert_contains "hysteria-residential.service" "$(cat "$man")" "清单含 v3 服务单元"
 assert_contains "hy2-watchdog.timer enabled=" "$(cat "$man")" "清单含 v3 定时器状态"
 assert_contains "update.sh auto" "$(cat "$man")" "清单含 v3 的 cron 行"
+assert_contains "cert-check.sh" "$(cat "$man")" "清单含 v3 的第三条 cron 行"
+assert_contains "# clilinks" "$(cat "$man")" "清单记下 CLI 入口符号链接段"
+assert_contains "$WORK/sbin/b-ui $WORK/base/b-ui-cli.sh" "$(cat "$man")" "记下 b-ui 当时指向 v3 的 b-ui-cli.sh"
+assert_contains "$WORK/sbin/bui absent" "$(cat "$man")" "v3 没有 bui 这个入口，记 absent"
 assert_contains "# unitfiles" "$(cat "$man")" "清单记下「快照里有哪些单元文件」（restore 反推 v4 独有单元要用）"
 assert_contains "$WORK/units/hy2-watchdog.service" "$(cat "$man")" "unitfiles 段含 timer 的同名 service"
 tl=$(cat "$WORK/tar.list")
@@ -102,6 +118,9 @@ assert_eq "1" "$(find "$WORK/out" -name 'v3-*.tar.gz' | wc -l)" "--prune 只删�
 snap=$(find "$WORK/out" -name 'v3-*.tar.gz' | head -1)
 : > "$WORK/units/b-ui.service"      # v4 装机时写的新单元
 : > "$WORK/units/caddy.service"     # v4 自己的 caddy 单元（ExecStart 指向 /opt/b-ui/bin/caddy）
+# v4 install 把 b-ui 改指 <base>/bin/bui 并另建 bui（crates/bui/src/paths.rs CLI_LINKS）
+ln -sfn "$WORK/base/bin/bui" "$WORK/sbin/b-ui"
+ln -sfn "$WORK/base/bin/bui" "$WORK/sbin/bui"
 : > "$SC_LOG"
 out=$(bash "$CUT" restore --from "$snap" --base "$WORK/base" --unit-dir "$WORK/units" 2>&1); rc=$?
 assert_eq "0" "$rc" "restore 全部 active 时退 0"
@@ -124,7 +143,12 @@ assert_eq "1" "$([[ "$stop_ln" -lt "$start_ln" ]] && echo 1 || echo 0)" "先停 
 rm_ln=$(printf '%s\n' "$out" | grep -n '删除 v4 独有单元' | head -1 | cut -d: -f1)
 rl_ln=$(printf '%s\n' "$out" | grep -n 'daemon-reload' | head -1 | cut -d: -f1)
 assert_eq "1" "$([[ "$rm_ln" -lt "$rl_ln" ]] && echo 1 || echo 0)" "先删 v4 单元再 daemon-reload"
-assert_contains "crontab 非空，跳过回灌" "$out" "现有 crontab 非空时不覆盖"
+assert_contains "无需回灌" "$out" "现有 crontab 已含清单里的行时不重复写"
+assert_eq "0" "$([[ -e "$WORK/cron.in" ]] && echo 1 || echo 0)" "无需回灌时根本不动 crontab"
+assert_eq "$WORK/base/b-ui-cli.sh" "$(readlink "$WORK/sbin/b-ui")" "b-ui 从 v4 的 bin/bui 改回 v3 的 b-ui-cli.sh（不然 sudo b-ui 悬空）"
+assert_eq "0" "$([[ -L "$WORK/sbin/bui" ]] && echo 1 || echo 0)" "快照记 absent 的 bui 被删掉"
+assert_contains "重建 $WORK/sbin/b-ui" "$out" "点名重建的符号链接"
+assert_contains "删除 $WORK/sbin/bui" "$out" "点名删掉的 v4 符号链接"
 assert_contains "恢复完成" "$out" "打印恢复结论"
 
 # ---- restore：crontab 为空则按清单回灌 ----
@@ -132,7 +156,37 @@ mkdir -p "$WORK/base"
 out=$(FAKE_CRON_EMPTY=1 bash "$CUT" restore --from "$snap" --base "$WORK/base" --unit-dir "$WORK/units" 2>&1); rc=$?
 assert_eq "0" "$rc" "回灌 cron 后仍退 0"
 assert_contains "update.sh auto" "$(cat "$WORK/cron.in")" "把清单里的 cron 行灌回 crontab"
-assert_eq "2" "$(wc -l < "$WORK/cron.in")" "只灌两条 v3 cron 行，不带清单的注释头"
+assert_eq "3" "$(wc -l < "$WORK/cron.in")" "只灌三条 v3 cron 行，不带清单的注释头"
+
+# ---- restore：crontab 非空（import-v3 只删含 /opt/b-ui/ 的行，别的项目的行留着）→ 幂等合并 ----
+cat > "$CRON_CUR" <<'CRON'
+0 3 * * * /opt/other/backup.sh
+*/5 * * * * /usr/local/bin/othercheck
+CRON
+rm -f "$WORK/cron.in"
+mkdir -p "$WORK/base"
+out=$(bash "$CUT" restore --from "$snap" --base "$WORK/base" --unit-dir "$WORK/units" 2>&1); rc=$?
+assert_eq "0" "$rc" "非空 crontab 下合并回灌仍退 0"
+cronin=$(cat "$WORK/cron.in")
+assert_contains "/opt/b-ui/update.sh auto" "$cronin" "补回 v3 的 update.sh auto"
+assert_contains "/opt/b-ui/update.sh kernel" "$cronin" "补回 v3 的 update.sh kernel"
+assert_contains "/opt/b-ui/cert-check.sh" "$cronin" "补回 v3 的 cert-check.sh"
+assert_contains "/opt/other/backup.sh" "$cronin" "别的项目的 cron 行原样保留"
+assert_contains "/usr/local/bin/othercheck" "$cronin" "别的项目的第二条 cron 行原样保留"
+assert_eq "5" "$(wc -l < "$WORK/cron.in")" "合并后 2 行别人的 + 3 行 v3，不重不漏"
+assert_contains "补齐 3 行 v3 cron" "$out" "报出补了几行"
+
+# ---- restore：二次恢复幂等（cron 不重复、符号链接不重建）----
+rm -f "$WORK/cron.in"
+mkdir -p "$WORK/base"
+out=$(bash "$CUT" restore --from "$snap" --base "$WORK/base" --unit-dir "$WORK/units" 2>&1); rc=$?
+assert_eq "0" "$rc" "二次 restore 退 0"
+assert_contains "都已在 crontab 中，无需回灌" "$out" "二次 restore 不再写 crontab"
+assert_eq "0" "$([[ -e "$WORK/cron.in" ]] && echo 1 || echo 0)" "二次 restore 完全不调 crontab -"
+assert_eq "5" "$(wc -l < "$CRON_CUR")" "crontab 仍是 5 行，没被灌成重复行"
+assert_contains "已经指对，跳过" "$out" "符号链接已正确则不重建"
+assert_eq "$WORK/base/b-ui-cli.sh" "$(readlink "$WORK/sbin/b-ui")" "二次 restore 后 b-ui 仍指 v3"
+assert_eq "0" "$([[ -L "$WORK/sbin/bui" ]] && echo 1 || echo 0)" "二次 restore 不把 absent 的 bui 造回来"
 
 # ---- restore：服务或定时器起不来 → 退 1 并点名 ----
 mkdir -p "$WORK/base"
