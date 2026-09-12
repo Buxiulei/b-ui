@@ -24,6 +24,9 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// 第一个用户的默认名（裁决 2026-09-12）。
+pub const DEFAULT_FIRST_USER: &str = "低空飞行";
+
 /// 装机要问的全部问题（住宅上游归 P3，这里没有那一问）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Answers {
@@ -33,6 +36,8 @@ pub struct Answers {
     pub public_ip: String,
     pub ports: Ports,
     pub masquerade: String,
+    /// 全新装机要建的第一个用户名（空串 = 不建；`--import-v3` 路径不看这一项，用户从 v3 来）
+    pub first_user: String,
 }
 
 impl Answers {
@@ -44,6 +49,7 @@ impl Answers {
             admin_password: String::new(),
             node_name: hostname.to_string(),
             public_ip: public_ip.to_string(),
+            first_user: DEFAULT_FIRST_USER.to_string(),
             ports: Ports {
                 hy2: 10000,
                 hy2_hop: Some((20000, 30000)),
@@ -82,12 +88,32 @@ pub struct AnswersFile {
     pub ports: Option<Ports>,
 }
 
-pub fn load_answers(path: &Path, defaults: Answers) -> anyhow::Result<Answers> {
+/// `--answers` 文件里**显式给了**哪些项。裁决「`--answers` 文件……有则不问对应项」要的就是它：
+/// 只看合并后的 `Answers` 分不清「文件给的值」和「与默认值恰好相同」，于是照样会再问一遍
+/// （2026-09-12 审查 blocking：README 说文件里给了的项不会再问，代码却只把它当默认值显示）。
+///
+/// `domain` 不在这里：它由 [`pick_domain`] 统一排优先级，文件里有非空 domain 就是一个来源、
+/// 那一问根本不开口。`first_user` 与 `admin_password` 也不在文件里（见 [`AnswersFile`]）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FromFile {
+    pub node_name: bool,
+    pub public_ip: bool,
+    pub masquerade: bool,
+    pub ports: bool,
+}
+
+pub fn load_answers(path: &Path, defaults: Answers) -> anyhow::Result<(Answers, FromFile)> {
     let bytes =
         std::fs::read(path).map_err(|e| anyhow::anyhow!("读取 {} 失败：{e}", path.display()))?;
     let f: AnswersFile = serde_json::from_slice(&bytes)
         .map_err(|e| anyhow::anyhow!("{} 不是合法的 answers JSON：{e}", path.display()))?;
-    Ok(Answers {
+    let given = FromFile {
+        node_name: f.node_name.is_some(),
+        public_ip: f.public_ip.is_some(),
+        masquerade: f.masquerade.is_some(),
+        ports: f.ports.is_some(),
+    };
+    let answers = Answers {
         domain: f.domain.unwrap_or(defaults.domain),
         // 密码永远不从文件里来（会落盘、会进 P5 脚本的 git 历史）：只认 --admin-password-stdin
         admin_password: defaults.admin_password,
@@ -95,7 +121,9 @@ pub fn load_answers(path: &Path, defaults: Answers) -> anyhow::Result<Answers> {
         public_ip: f.public_ip.unwrap_or(defaults.public_ip),
         ports: f.ports.unwrap_or(defaults.ports),
         masquerade: f.masquerade.unwrap_or(defaults.masquerade),
-    })
+        first_user: defaults.first_user,
+    };
+    Ok((answers, given))
 }
 
 pub struct InstallOpts {
@@ -467,40 +495,173 @@ pub fn pick_domain(
     )
 }
 
-/// 只问「面板域名」这一问；回答空串视为没答。
+/// 装机问答的输入源。测试注入脚本化答案，生产用 [`TtyPrompt`]。
 ///
-/// `curl … | bash` 时 stdin 是管道：`install.sh` 已经把 `/dev/tty` 接了进来（那时 stdin 就是
-/// 终端），没接上则这里自己开一次 `/dev/tty`——两条路都不通返回 `None`。
-fn ask_domain() -> Option<String> {
-    use std::io::{BufRead, Write};
-    // 先确定「有没有地方可读」，再打提示：反了的话无终端时会先留下一行悬空的提问
-    // 才报「缺少面板域名」（2026-09-12 审查 nit）。
-    let mut reader: Box<dyn BufRead> = if std::io::stdin().is_terminal() {
-        Box::new(std::io::BufReader::new(std::io::stdin()))
-    } else {
-        Box::new(std::io::BufReader::new(
-            std::fs::File::open("/dev/tty").ok()?,
-        ))
-    };
-    print!("面板域名（唯一必填，例如 panel.example.com）: ");
-    let _ = std::io::stdout().flush();
-    let mut line = String::new();
-    reader.read_line(&mut line).ok()?;
-    let v = line.trim().to_string();
-    (!v.is_empty()).then_some(v)
+/// `ask` 打出提问（提示里带默认值）后读一行：`Some(去掉首尾空白的答案)`，空串 = 直接回车；
+/// `None` = 读不到了（EOF / 无终端），调用方一律改用默认值。
+pub trait Prompt {
+    fn ask(&mut self, label: &str) -> Option<String>;
+}
+
+/// 真终端上的问答。`curl … | bash` 时 stdin 是管道：`install.sh` 已经把 `/dev/tty` 接了进来
+/// （那时 stdin 就是终端），没接上则这里自己开一次 `/dev/tty`——两条路都不通
+/// [`TtyPrompt::open`] 返回 `None`，于是一个问题都不问、全用默认值。
+///
+/// 两支分开写、**不**折叠成一个 `Box<dyn BufRead>`：stdin 那一支必须是每次 `ask` 临时取锁、
+/// 读完就放（见 [`TtyPrompt::Stdin`]）。
+pub enum TtyPrompt {
+    /// stdin 本身就是终端。每次 `ask` 走 [`std::io::Stdin::read_line`]（它内部临时 `lock()`
+    /// 一次就放），**绝不跨调用持有 `StdinLock`**：`Stdin` 的全局 `BufReader` 只有一份，
+    /// 不会像自己再套一层 `BufReader` 那样把 `--admin-password-stdin` 的后续 `read_line`
+    /// 吞掉（2026-09-12 审查 nit），而跨调用持锁则会让同一线程后面那次 `read_line`
+    /// 重入同一把 `Mutex` ⇒ 永久挂死（2026-09-13 审查 blocking：
+    /// `bui install --domain x --admin-password-stdin` 在真终端里一句提示都不打就挂住）。
+    Stdin,
+    /// stdin 不是终端且 `install.sh` 没把 `/dev/tty` 接进来：自己开一次。这一支与 stdin
+    /// 的缓冲互不相干，套 `BufReader` 无碍。
+    Tty(std::io::BufReader<std::fs::File>),
+}
+
+impl TtyPrompt {
+    pub fn open() -> Option<Self> {
+        // 先确定「有没有地方可读」，再打提示：反了的话无终端时会先留下一行悬空的提问
+        // 才报「缺少面板域名」（2026-09-12 审查 nit）。
+        if std::io::stdin().is_terminal() {
+            Some(Self::Stdin)
+        } else {
+            Some(Self::Tty(std::io::BufReader::new(
+                std::fs::File::open("/dev/tty").ok()?,
+            )))
+        }
+    }
+
+    fn read_line(&mut self, line: &mut String) -> std::io::Result<usize> {
+        match self {
+            // Stdin::read_line 自己取一次锁又放掉：这里不留任何 StdinLock
+            Self::Stdin => std::io::stdin().read_line(line),
+            Self::Tty(r) => {
+                use std::io::BufRead;
+                r.read_line(line)
+            }
+        }
+    }
+}
+
+impl Prompt for TtyPrompt {
+    fn ask(&mut self, label: &str) -> Option<String> {
+        use std::io::Write;
+        print!("{label}: ");
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        // read_line 回 0 = EOF：此后每一问都读不到，一律用默认值
+        (self.read_line(&mut line).ok()? > 0).then(|| line.trim().to_string())
+    }
+}
+
+/// `--admin-password-stdin` 那一行密码：只去掉行尾换行（密码里的空格得留着）。
+///
+/// 抽成走 `&mut dyn BufRead` 的函数，一是能用 `Cursor` 直接测，二是调用处那句
+/// `stdin().lock()` 的作用域一眼看得完——[`TtyPrompt`] 若同时持着锁就是同线程重入死锁。
+fn read_password_line(r: &mut dyn std::io::BufRead) -> anyhow::Result<String> {
+    let mut buf = String::new();
+    r.read_line(&mut buf)?;
+    Ok(buf.trim_end_matches('\n').to_string())
+}
+
+/// 必填项与非法端口最多重问几次。
+const ASK_TRIES: usize = 3;
+
+/// 有默认值的一问：提示里带上默认值，回车（空答）或读不到就用默认值。
+fn ask_or(p: &mut dyn Prompt, label: &str, default: &str) -> String {
+    match p.ask(&format!("{label} [默认: {default}]")) {
+        Some(v) if !v.is_empty() => v,
+        _ => default.to_string(),
+    }
+}
+
+/// 必填的一问（只有面板域名）：空回车重问，最多 [`ASK_TRIES`] 次；读不到立刻放弃。
+fn ask_required(p: &mut dyn Prompt, label: &str) -> Option<String> {
+    for _ in 0..ASK_TRIES {
+        match p.ask(label) {
+            Some(v) if !v.is_empty() => return Some(v),
+            Some(_) => println!("这一项必填，不能直接回车"),
+            None => return None,
+        }
+    }
+    None
+}
+
+/// 端口那一问：回车即默认；填了但不是 1-65535 的整数就重问（最多 [`ASK_TRIES`] 次后用默认值）。
+fn ask_port(p: &mut dyn Prompt, label: &str, default: u16) -> u16 {
+    for _ in 0..ASK_TRIES {
+        let v = ask_or(p, label, &default.to_string());
+        match v.parse::<u16>() {
+            Ok(n) if n > 0 => return n,
+            _ => println!("端口要是 1-65535 的整数：{v}"),
+        }
+    }
+    default
+}
+
+/// 第一个用户名那一问：填了但不合面板的用户名规则（含空格 / `@` / 斜杠，或超 64 字）就重问，
+/// 最多 [`ASK_TRIES`] 次后用默认名。
+///
+/// 校验必须落在问答阶段：不然坏名字要等下载完四个内核（可能数分钟）、跑完环境探测、
+/// `build_state` 之后才由 [`first_user`] 报错退出，用户得重跑并**重答全部问题**
+/// （2026-09-12 审查 blocking）。规则直接用面板那一处 [`crate::modules::panel::users::validate_username`]，
+/// 两边不会分叉。
+fn ask_username(p: &mut dyn Prompt, label: &str, default: &str) -> String {
+    for _ in 0..ASK_TRIES {
+        let v = ask_or(p, label, default);
+        match crate::modules::panel::users::validate_username(&v) {
+            Ok(()) => return v,
+            Err(e) => println!("{e}（填的是「{v}」）"),
+        }
+    }
+    default.to_string()
+}
+
+/// 第一个用户：权益**默认全开**（fusion = HY2 + REALITY、直连 + 住宅默认分组、不限期不限量），
+/// HY2 密码与 VLESS UUID 随机。生成逻辑复用面板建用户那一处（`panel::users::new_user`），
+/// 免得两边对「新用户长什么样」各有一套。
+fn first_user(username: &str) -> anyhow::Result<bui_schema::model::User> {
+    use crate::modules::panel::users::{new_user, CreateRequest};
+    new_user(
+        &CreateRequest {
+            username: username.to_string(),
+            protocol: Some("fusion".into()),
+            residential: Some(true),
+            ..Default::default()
+        },
+        time::OffsetDateTime::now_utc(),
+    )
+    .map_err(|e| anyhow::anyhow!("建第一个用户「{username}」失败：{e}"))
 }
 
 /// 装机最后一屏（spec §7 第 10 步）：面板地址、一次性管理员密码（只有全新装机才有）、
-/// 三种订阅地址的形状、两个入口。
+/// 第一个用户与他那三条**能直接粘进客户端**的订阅地址、两个入口。
+///
+/// 没有用户（`state.users` 为空）时退回 `<用户名>` 形状：那时没有任何地址能填得出来。
 pub fn summary(state: &State, password_notice: Option<&str>) -> String {
     let d = &state.node.domain;
     let mut out = vec![format!("面板        https://{d}/")];
     if let Some(line) = password_notice {
         out.push(format!("管理员      {line}"));
     }
-    out.push(format!(
-        "订阅        https://{d}/api/sub/<用户名>（v2rayN）· /api/subscription/<用户名>（sing-box）· /api/clash/<用户名>（mihomo）"
-    ));
+    match state.users.first() {
+        Some(u) => {
+            let n = &u.username;
+            out.push(format!("第一个用户  {n}"));
+            out.push(format!("订阅        https://{d}/api/sub/{n}（v2rayN）"));
+            out.push(format!(
+                "            https://{d}/api/subscription/{n}（sing-box）"
+            ));
+            out.push(format!("            https://{d}/api/clash/{n}（mihomo）"));
+        }
+        None => out.push(format!(
+            "订阅        https://{d}/api/sub/<用户名>（v2rayN）· /api/subscription/<用户名>（sing-box）· /api/clash/<用户名>（mihomo）"
+        )),
+    }
     out.push("后续        `b-ui` 进菜单 / `bui status` 看体检 / `bui reconcile` 手动对账".into());
     out.join("\n")
 }
@@ -516,7 +677,20 @@ fn answers_from_state(state: &State) -> Answers {
         public_ip: state.node.public_ip.clone(),
         ports: state.node.ports.clone(),
         masquerade: state.node.reality.dest.clone(),
+        // 已装机不再建用户（面板/CLI 的活）
+        first_user: String::new(),
     }
+}
+
+/// 「一行命令、一个问题都不问」的判据（裁决 2026-09-12）：`--yes` / `--non-interactive`，或
+/// `$BUI_DOMAIN` 非空——环境变量那条写法的语义就是无人值守（`install.sh` 的 `tty_source`
+/// 据同一条不交接 `/dev/tty`）。[`run`] 用它决定要不要开 `/dev/tty`，[`collect_answers`]
+/// 再挡一次（测试直接喂 `Prompt`，不经 [`run`]）。
+///
+/// `env_domain` 由入口读一次就传下来（与 [`ManifestSource::from_env`] 同一套路）：单元测试于是
+/// 不读开发机环境，也不必去 `set_var`（同一个测试进程里并发跑，改环境变量会互相干扰）。
+fn asks_nothing(opts: &InstallOpts, env_domain: Option<&str>) -> bool {
+    opts.quiet() || env_domain.is_some_and(|d| !d.trim().is_empty())
 }
 
 /// 收集 `Answers`。返回的第二项是 [`run`] 要打到 stdout 的那一行提示（随机管理员密码**只**在
@@ -525,10 +699,22 @@ fn answers_from_state(state: &State) -> Answers {
 /// `installed` 是已装机时读到的期望态：非 `None` 时既不探公网 IP（省一次 5s 的 curl，离线机器
 /// 上也不再刷提示），也不生成随机密码——活机器上重跑 `bui install` 打印「已生成随机管理员密码」
 /// 会让人以为面板密码被换了，而 `state.json` 里的哈希其实一个字没动。
+///
+/// `prompt` = 问答的输入源（`None` = 没有终端可问 ⇒ 一个都不问，全用默认值）。主理人
+/// 2026-09-12「一行命令输入后，能询问关键信息，输入域名后，面板的密码（默认随机密码），
+/// 别的选项默认敲回车就可以快速配置完」：按 **域名 → 面板密码 → HY2 端口 → REALITY 伪装站
+/// → 第一个用户名 → 节点名 → 公网 IP** 的顺序问，除域名外每题回车即默认。
+///
+/// **全程一个问题都不问**的三种情形（裁决 2026-09-12）：`--yes` / `--non-interactive`、
+/// `$BUI_DOMAIN` 非空（环境变量那条写法的语义就是「无人值守」，`install.sh` 的 `tty_source`
+/// 同步不交接 `/dev/tty`）、`--import-v3`（沿用 v3 的值）。
+/// 单项已给的也不再问那一项：`--domain` / `--port` / `--admin-password-stdin`，以及
+/// `--answers` 文件里显式给了的键（见 [`FromFile`]）。
 async fn collect_answers(
     opts: &InstallOpts,
     installed: Option<&State>,
     host: Arc<dyn Host>,
+    prompt: Option<&mut dyn Prompt>,
 ) -> anyhow::Result<(Answers, Option<String>)> {
     if let Some(state) = installed {
         return Ok((answers_from_state(state), None));
@@ -546,14 +732,21 @@ async fn collect_answers(
         println!("提示：未能探测到公网 IP，可稍后在面板里补填（只影响 relay 的本机 IP 直连例外）");
     }
     let defaults = Answers::defaults(&hostname, &probed_ip);
-    let mut answers = match &opts.answers {
+    let (mut answers, given) = match &opts.answers {
         Some(f) => load_answers(f, defaults)?,
-        None => defaults,
+        None => (defaults, FromFile::default()),
     };
-    // 域名是唯一必填项，也是唯一还会问的一问；节点名 / 公网 IP / 伪装目标 / 端口全用探测值与
-    // 默认值（`--answers` 文件仍可逐项覆盖），于是「一行命令完成新服务器的所有安装」成立。
     let env_domain = std::env::var(DOMAIN_ENV).ok();
-    answers.domain = if opts.import_v3.is_some() {
+    // 全程不问（`--yes` / `--non-interactive` / `$BUI_DOMAIN` 非空）时把 prompt 丢掉：
+    // 缺域名于是报错而不是挂住。`--import-v3` 在下面逐问挡掉。
+    let mut prompt = if asks_nothing(opts, env_domain.as_deref()) {
+        None
+    } else {
+        prompt
+    };
+    let import = opts.import_v3.is_some();
+    // ① 面板域名：唯一必填、唯一没有默认值的一问（空回车重问，最多 ASK_TRIES 次后报错退出）
+    answers.domain = if import {
         // v3 导入：域名沿用 v3 的 Caddyfile（`run_with` 的导入分支整份用 `report.state`），
         // 所以这里既不要求也不追问；命令行/环境变量给了就以它为准。
         opts.domain.clone().or(env_domain).unwrap_or(answers.domain)
@@ -562,18 +755,23 @@ async fn collect_answers(
             opts.domain.as_deref(),
             env_domain.as_deref(),
             &answers.domain,
-            || (!opts.quiet()).then(ask_domain).flatten(),
+            || {
+                prompt
+                    .as_deref_mut()
+                    .and_then(|p| ask_required(p, "面板域名（必填，例如 panel.example.com）"))
+            },
         )?
     };
     if let Some(p) = opts.port {
         answers.ports.hy2 = p;
     }
+    // ② 面板管理员密码：`--admin-password-stdin` 优先（凭据不进 argv），其次问答——默认值就是
+    // 随机的 16 位十六进制且**在提示里直接显示**，回车即用它。
     let notice = if opts.admin_password_stdin {
-        let mut buf = String::new();
-        std::io::stdin().read_line(&mut buf)?;
-        answers.admin_password = buf.trim_end_matches('\n').to_string();
+        // 这里取的锁读完这一行就放；`prompt`（[`TtyPrompt::Stdin`]）从不持锁，两边不会撞上
+        answers.admin_password = read_password_line(&mut std::io::stdin().lock())?;
         None
-    } else if opts.import_v3.is_some() {
+    } else if import {
         // 导入路径的管理员密码来自 v3（`admin.env` 的 `ADMIN_PASSWORD`；v3 缺 admin.env 时由
         // `bui_schema::v3::import` 生成随机密码并带一条「请用 CLI 重设」的导入提示）。
         // `run_with` 的导入分支整份用 `report.state`，`answers.admin_password` 一个字都不看 ——
@@ -581,12 +779,36 @@ async fn collect_answers(
         None
     } else {
         let pw = random_hex(8);
-        // Global Constraints：密码不进日志。`secret` 只记长度，不记内容
-        tracing::info!(password = %crate::redact::secret(&pw), "已生成随机管理员密码");
-        let notice = format!("已生成随机管理员密码：{pw}（只显示这一次，请立刻存好）");
-        answers.admin_password = pw;
-        Some(notice)
+        let answered = match prompt.as_deref_mut() {
+            Some(p) => ask_or(p, "面板管理员密码", &pw),
+            None => pw.clone(),
+        };
+        answers.admin_password = answered.clone();
+        // 自己输的密码不该被当成「随机生成」再打一遍（他已经知道了）
+        (answered == pw).then(|| {
+            // Global Constraints：密码不进日志。`secret` 只记长度，不记内容
+            tracing::info!(password = %crate::redact::secret(&pw), "已生成随机管理员密码");
+            format!("已生成随机管理员密码：{pw}（只显示这一次，请立刻存好）")
+        })
     };
+    // ③～⑦ 其余各问：每题回车即默认（`--import-v3` 沿用 v3 的值，一概不问）。
+    // `--answers` 文件里显式给了的键跳过对应那一问（裁决「有则不问对应项」）：`given.ports`
+    // 一真就连 HY2 端口也不问——文件里的 `ports` 必须给全，再问一遍只会让人以为能只改一个。
+    if let (false, Some(p)) = (import, prompt) {
+        if opts.port.is_none() && !given.ports {
+            answers.ports.hy2 = ask_port(p, "Hysteria2 直连端口", answers.ports.hy2);
+        }
+        if !given.masquerade {
+            answers.masquerade = ask_or(p, "REALITY 伪装站", &answers.masquerade);
+        }
+        answers.first_user = ask_username(p, "第一个用户名", &answers.first_user);
+        if !given.node_name {
+            answers.node_name = ask_or(p, "节点名", &answers.node_name);
+        }
+        if !given.public_ip {
+            answers.public_ip = ask_or(p, "公网 IP", &answers.public_ip);
+        }
+    }
     Ok((answers, notice))
 }
 
@@ -611,7 +833,20 @@ pub async fn run(opts: InstallOpts, paths: Paths, host: Arc<dyn Host>) -> anyhow
     } else {
         None
     };
-    let (answers, notice) = collect_answers(&opts, installed.as_deref(), host.clone()).await?;
+    // 问答的输入源：全程不问（见 [`asks_nothing`]）时连 `/dev/tty` 都不开（`collect_answers`
+    // 里也再挡一次），没有终端可问（stdin 不是终端且 /dev/tty 也开不了）则 `None` ⇒ 全用默认值
+    let mut prompt = if asks_nothing(&opts, std::env::var(DOMAIN_ENV).ok().as_deref()) {
+        None
+    } else {
+        TtyPrompt::open()
+    };
+    let (answers, notice) = collect_answers(
+        &opts,
+        installed.as_deref(),
+        host.clone(),
+        prompt.as_mut().map(|p| p as &mut dyn Prompt),
+    )
+    .await?;
     // C4 的两个覆盖读一次就固定（`install.sh` 把它选定的那个 tag export 成 `$BUI_MANIFEST_URL`）
     let manifest = ManifestSource::from_env(opts.manifest_url.clone());
     let outcome = run_with(
@@ -765,7 +1000,13 @@ pub async fn run_with_wait(
                     let (h, p) = (host.clone(), paths.clone());
                     tokio::task::spawn_blocking(move || versions_from_disk(h.as_ref(), &p)).await?
                 };
-                build_state(&answers, keys, versions)?
+                let mut state = build_state(&answers, keys, versions)?;
+                // 第一个用户（裁决 2026-09-12）：以前装完面板是空的、订阅地址无处可填，
+                // 运维还得先进面板建一个人才能连上。
+                if !answers.first_user.is_empty() {
+                    state.users.push(first_user(&answers.first_user)?);
+                }
+                state
             }
         };
         let (domain, admin_port) = (state.node.domain.clone(), state.node.ports.admin);
@@ -957,6 +1198,10 @@ mod tests {
         assert_eq!(a.ports.admin, 8080);
         assert_eq!(a.masquerade, "www.bing.com:443");
         assert_eq!(a.node_name, "node-a");
+        assert_eq!(
+            a.first_user, "低空飞行",
+            "第一个用户名的默认值（裁决 2026-09-12）"
+        );
     }
 
     #[test]
@@ -1230,8 +1475,24 @@ mod tests {
             .to_string();
         let snap: serde_json::Value =
             serde_json::from_str(&host.text(&snap_path).unwrap()).unwrap();
-        // 形状逐字照总纲 C5：顶层 schema + users；全新装机没有用户 → users 是空对象（不是缺文件）
-        assert_eq!(snap, serde_json::json!({ "schema": 1, "users": {} }));
+        // 形状逐字照总纲 C5：顶层 schema + users；全新装机建了第一个用户，他必须在快照里
+        assert_eq!(snap["schema"], 1);
+        assert_eq!(
+            snap["users"].as_object().map(|o| o.len()),
+            Some(1),
+            "{snap}"
+        );
+        assert!(
+            snap["users"][DEFAULT_FIRST_USER]["user_id"].is_string(),
+            "{snap}"
+        );
+        // 空 state 时 users 是空对象（不是缺文件）
+        let mut empty = crate::testutil::sample_state();
+        empty.users.clear();
+        assert_eq!(
+            auth_snapshot(&empty),
+            serde_json::json!({ "schema": 1, "users": {} })
+        );
         assert_eq!(
             host.mode(&snap_path),
             Some(0o600),
@@ -1265,7 +1526,7 @@ mod tests {
         let state = crate::testutil::sample_state();
         host.clear_ops();
         // `notice` 就是 run() 要打到 stdout 的那一行（密码只在这一处出现）
-        let (a, notice) = collect_answers(&opts(&d), Some(&state), host.clone())
+        let (a, notice) = collect_answers(&opts(&d), Some(&state), host.clone(), None)
             .await
             .unwrap();
         assert_eq!(notice, None, "已装机不生成、不打印随机管理员密码");
@@ -1279,7 +1540,7 @@ mod tests {
         assert_eq!(host.ops(), Vec::<String>::new(), "{:?}", host.ops());
         // 全新装机（没有 state.json）那一支照旧探 IP、生成并打印密码
         host.clear_ops();
-        let (b, notice) = collect_answers(&opts(&d), None, host.clone())
+        let (b, notice) = collect_answers(&opts(&d), None, host.clone(), None)
             .await
             .unwrap();
         let line = notice.expect("全新装机必须给出密码");
@@ -1304,13 +1565,25 @@ mod tests {
                 "hy2_resi_hop":[41000,50000],"reality_direct":10001,"reality_resi":10002,"admin":8080}}"#,
         )
         .unwrap();
-        let a = load_answers(&f, Answers::defaults("node-a", "203.0.113.10")).unwrap();
+        let (a, given) = load_answers(&f, Answers::defaults("node-a", "203.0.113.10")).unwrap();
         assert_eq!(a.domain, "example.com");
         assert_eq!(a.ports.hy2, 10500);
         assert_eq!(a.node_name, "node-a", "文件里没写的项沿用默认");
         assert_eq!(a.public_ip, "203.0.113.10");
         assert_eq!(a.masquerade, "www.bing.com:443");
+        assert_eq!(
+            a.first_user, DEFAULT_FIRST_USER,
+            "文件里没有这一项，沿用默认"
+        );
         assert!(a.admin_password.is_empty(), "答案文件里不放管理员密码");
+        // 「文件里给了哪些」要分得清（给了的那一项不再问）：只看合并后的值分不出来
+        assert_eq!(
+            given,
+            FromFile {
+                ports: true,
+                ..FromFile::default()
+            }
+        );
         assert!(
             load_answers(&d.path().join("nope.json"), Answers::defaults("node-a", "")).is_err()
         );
@@ -1612,7 +1885,7 @@ mod tests {
         let mut o = opts(&d);
         o.import_v3 = Some(src.to_path_buf());
         // `notice` 是「已生成随机管理员密码」唯一的出口（run() 把它 println 出去）
-        let (a, notice) = collect_answers(&o, None, host.clone()).await.unwrap();
+        let (a, notice) = collect_answers(&o, None, host.clone(), None).await.unwrap();
         assert_eq!(notice, None, "导入路径不许打印随机管理员密码");
         assert!(a.admin_password.is_empty(), "导入路径不许生成密码");
         // 端到端：state 里的哈希就是 v3 admin.env 的密码
@@ -1975,27 +2248,29 @@ mod tests {
         let host = host_for_install(&paths);
         let mut o = opts(&d);
         o.domain = None; // opts() 里 yes = true
-        let err = collect_answers(&o, None, host.clone())
+        let err = collect_answers(&o, None, host.clone(), None)
             .await
             .unwrap_err()
             .to_string();
         assert!(err.contains("缺少面板域名"), "{err}");
     }
 
-    /// 域名之外一个都不问：节点名、公网 IP、伪装目标、端口全用探测值与默认值。
+    /// 没有终端可问（`curl … | bash` 且 `/dev/tty` 也开不了、CI 里）时一个都不问：
+    /// 域名走命令行/环境变量/答案文件，其余全用探测值与默认值——「一行命令装完」仍成立。
     #[tokio::test]
-    async fn nothing_but_the_domain_is_ever_asked() {
+    async fn without_a_terminal_every_answer_falls_back_to_its_default() {
         let d = tempfile::tempdir().unwrap();
         let paths = scratch(&d);
         let host = host_for_install(&paths);
         let mut o = opts(&d);
-        (o.yes, o.non_interactive) = (false, false); // 交互模式，但域名已由 --domain 给出
-        let (a, _) = collect_answers(&o, None, host.clone()).await.unwrap();
+        (o.yes, o.non_interactive) = (false, false); // 交互模式，但没有 prompt 可问
+        let (a, _) = collect_answers(&o, None, host.clone(), None).await.unwrap();
         assert_eq!(a.domain, "example.com");
-        assert_eq!(a.node_name, "node-a", "节点名用 hostname，不问");
-        assert_eq!(a.public_ip, "203.0.113.10", "公网 IP 用探测值，不问");
-        assert_eq!(a.masquerade, "www.bing.com:443", "伪装目标用默认值，不问");
-        assert_eq!(a.ports.hy2, 10000, "端口用默认值，不问");
+        assert_eq!(a.node_name, "node-a", "节点名用 hostname");
+        assert_eq!(a.public_ip, "203.0.113.10", "公网 IP 用探测值");
+        assert_eq!(a.masquerade, "www.bing.com:443", "伪装目标用默认值");
+        assert_eq!(a.ports.hy2, 10000, "端口用默认值");
+        assert_eq!(a.first_user, DEFAULT_FIRST_USER, "首用户用默认名");
     }
 
     /// 关键端口被非本栈进程占着 ⇒ 中止，不写单元、不落 `state.json`（腾了端口重跑即可）。
@@ -2154,7 +2429,7 @@ mod tests {
     }
 
     #[test]
-    fn the_summary_gives_the_panel_the_one_time_password_and_the_subscription_shapes() {
+    fn the_summary_gives_the_panel_the_one_time_password_and_the_first_user_subscriptions() {
         let state = crate::testutil::sample_state();
         let s = summary(
             &state,
@@ -2162,6 +2437,22 @@ mod tests {
         );
         assert!(s.contains("https://example.com/"), "{s}");
         assert!(s.contains("hunter2"), "一次性密码只在摘要里出现这一次：{s}");
+        assert!(s.contains("alice"), "第一个用户名要在摘要里：{s}");
+        // 有用户时给的是**能直接粘进客户端**的三条真地址，而不是 `<用户名>` 形状
+        for url in [
+            "https://example.com/api/sub/alice",
+            "https://example.com/api/subscription/alice",
+            "https://example.com/api/clash/alice",
+        ] {
+            assert!(s.contains(url), "订阅地址缺 {url}：{s}");
+        }
+        assert!(s.contains("`b-ui`") && s.contains("bui status"), "{s}");
+        // 已装机重跑（没有一次性密码）时不出现「管理员」那一行
+        assert!(!summary(&state, None).contains("管理员"));
+        // 没有用户（v3 导入前的空盘、或用户被删光）时退回 `<用户名>` 形状
+        let mut empty = crate::testutil::sample_state();
+        empty.users.clear();
+        let s = summary(&empty, None);
         for shape in [
             "/api/sub/<用户名>",
             "/api/subscription/<用户名>",
@@ -2169,8 +2460,507 @@ mod tests {
         ] {
             assert!(s.contains(shape), "订阅形状缺 {shape}：{s}");
         }
-        assert!(s.contains("`b-ui`") && s.contains("bui status"), "{s}");
-        // 已装机重跑（没有一次性密码）时不出现「管理员」那一行
-        assert!(!summary(&state, None).contains("管理员"));
+    }
+
+    /// 按顺序吐出预置答案（吐完一律回空串 = 直接回车），并记下每一句提问原文。
+    #[derive(Default)]
+    struct ScriptedPrompt {
+        answers: std::collections::VecDeque<String>,
+        asked: Vec<String>,
+    }
+
+    impl ScriptedPrompt {
+        fn new(answers: &[&str]) -> Self {
+            Self {
+                answers: answers.iter().map(|s| s.to_string()).collect(),
+                asked: Vec::new(),
+            }
+        }
+        /// 某一问的提示里显示的默认值（`… [默认: X]` 里的 X）
+        fn shown_default(&self, label: &str) -> Option<String> {
+            let line = self.asked.iter().find(|l| l.starts_with(label))?;
+            let v = line.split_once("[默认: ")?.1;
+            Some(v.trim_end_matches(']').to_string())
+        }
+    }
+
+    impl Prompt for ScriptedPrompt {
+        fn ask(&mut self, label: &str) -> Option<String> {
+            self.asked.push(label.to_string());
+            Some(self.answers.pop_front().unwrap_or_default())
+        }
+    }
+
+    /// 一个问题都不许问：问了就 panic。
+    struct NoPrompt;
+    impl Prompt for NoPrompt {
+        fn ask(&mut self, label: &str) -> Option<String> {
+            panic!("不该问：{label}");
+        }
+    }
+
+    /// `TtyPrompt` 的 stdin 那一支**不跨调用持有 `StdinLock`**（2026-09-13 审查 blocking）。
+    ///
+    /// 老写法把 `stdin().lock()`（`StdinLock<'static>`）装进 `Box` 拿一整个 `run()`，随后
+    /// `--admin-password-stdin` 那支再 `read_line` 就重入同一把 `std::sync::Mutex` ⇒ 同线程
+    /// 死锁：`bui install --domain x --admin-password-stdin` 在真终端里一句提示都不打就挂住。
+    /// 这里把那条时序原样摆出来——先拿着 `TtyPrompt::Stdin`，再像密码那一行那样取 stdin 的锁。
+    /// 只取锁不读（测试进程的 stdin 可能是开发者的终端，读会等输入）：死锁发生在取锁那一步，
+    /// 换回老写法这个测试就挂死。
+    #[test]
+    fn the_stdin_prompt_holds_no_stdin_lock() {
+        let prompt = TtyPrompt::Stdin;
+        // 老写法（`Box<StdinLock<'static>>` 跨调用持锁）下这一行同线程重入同一把 Mutex ⇒ 挂死
+        drop(std::io::stdin().lock());
+        // 直到这里 `prompt` 还活着：老写法下它就是那把一直没放的锁
+        assert!(matches!(prompt, TtyPrompt::Stdin));
+        // 密码那一行读完也照样能再取一次（`read_password_line` 的锁作用域只有那一句）
+        drop(std::io::stdin().lock());
+    }
+
+    /// `--admin-password-stdin` 读的是**一行**：行尾换行去掉，密码里的空格与 `#` 原样留着，
+    /// 后面还有内容也只吃第一行。
+    #[test]
+    fn the_password_line_keeps_everything_but_the_newline() {
+        let mut c = std::io::Cursor::new(b"  hunter 2 #x  \nnext\n".to_vec());
+        assert_eq!(read_password_line(&mut c).unwrap(), "  hunter 2 #x  ");
+        let mut c = std::io::Cursor::new(b"nolf".to_vec());
+        assert_eq!(read_password_line(&mut c).unwrap(), "nolf");
+        let mut c = std::io::Cursor::new(Vec::new());
+        assert_eq!(read_password_line(&mut c).unwrap(), "", "EOF ⇒ 空密码");
+    }
+
+    /// 主理人 2026-09-12「一行命令输入后，能询问关键信息……别的选项默认敲回车就可以快速配置完」：
+    /// 七问的顺序与默认值定死，除面板域名外每题回车即默认。
+    #[tokio::test]
+    async fn the_interview_asks_seven_things_in_order_and_takes_enter_for_defaults() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = scratch(&d);
+        let host = host_for_install(&paths);
+        let mut o = opts(&d);
+        (o.yes, o.non_interactive, o.domain) = (false, false, None);
+        // 第一问答域名（必填、没有默认值），其余全部直接回车
+        let mut p = ScriptedPrompt::new(&["panel.example.com"]);
+        let (a, notice) = collect_answers(&o, None, host.clone(), Some(&mut p))
+            .await
+            .unwrap();
+        let heads: Vec<&str> = p
+            .asked
+            .iter()
+            .map(|l| l.split_whitespace().next().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            heads,
+            vec![
+                "面板域名（必填，例如",
+                "面板管理员密码",
+                "Hysteria2",
+                "REALITY",
+                "第一个用户名",
+                "节点名",
+                "公网",
+            ],
+            "问答顺序：域名 → 面板密码 → HY2 端口 → 伪装站 → 首用户 → 节点名 → 公网 IP"
+        );
+        assert_eq!(a.domain, "panel.example.com");
+        assert_eq!(a.ports.hy2, 10000, "回车用默认端口");
+        assert_eq!(a.masquerade, "www.bing.com:443", "回车用默认伪装站");
+        assert_eq!(a.first_user, DEFAULT_FIRST_USER, "回车用默认首用户名");
+        assert_eq!(a.first_user, "低空飞行");
+        assert_eq!(a.node_name, "node-a", "回车用主机名");
+        assert_eq!(a.public_ip, "203.0.113.10", "回车用探测到的公网 IP");
+        // 随机面板密码**在提示里直接显示**，回车即用它；那一行提示也是它唯一的出口
+        assert_eq!(a.admin_password.len(), 16);
+        assert!(a.admin_password.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(
+            p.shown_default("面板管理员密码").as_deref(),
+            Some(a.admin_password.as_str()),
+            "提示里要直接显示那个随机密码：{:?}",
+            p.asked
+        );
+        let line = notice.expect("回车用随机密码 ⇒ 要有一次性提示");
+        assert!(line.contains(&a.admin_password), "{line}");
+        // 有默认值的每一问都要把默认值写在提示里
+        assert_eq!(p.shown_default("Hysteria2").as_deref(), Some("10000"));
+        assert_eq!(
+            p.shown_default("REALITY").as_deref(),
+            Some("www.bing.com:443")
+        );
+        assert_eq!(p.shown_default("第一个用户名").as_deref(), Some("低空飞行"));
+        assert_eq!(p.shown_default("节点名").as_deref(), Some("node-a"));
+        assert_eq!(p.shown_default("公网").as_deref(), Some("203.0.113.10"));
+        assert!(
+            !p.asked[0].contains("默认"),
+            "域名没有默认值：{}",
+            p.asked[0]
+        );
+    }
+
+    /// 逐项填了就用填的；自己输了面板密码就不该再打「已生成随机管理员密码」。
+    #[tokio::test]
+    async fn the_interview_takes_what_the_operator_types() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = scratch(&d);
+        let host = host_for_install(&paths);
+        let mut o = opts(&d);
+        (o.yes, o.non_interactive, o.domain) = (false, false, None);
+        let mut p = ScriptedPrompt::new(&[
+            "panel.example.com",
+            "hunter2",
+            "20443",
+            "www.apple.com:443",
+            "张三",
+            "hk-01",
+            "198.51.100.7",
+        ]);
+        let (a, notice) = collect_answers(&o, None, host.clone(), Some(&mut p))
+            .await
+            .unwrap();
+        assert_eq!(a.domain, "panel.example.com");
+        assert_eq!(a.admin_password, "hunter2");
+        assert_eq!(notice, None, "自己输的密码不该被当成随机密码打印");
+        assert_eq!(a.ports.hy2, 20443);
+        assert_eq!(a.masquerade, "www.apple.com:443");
+        assert_eq!(a.first_user, "张三");
+        assert_eq!(a.node_name, "hk-01");
+        assert_eq!(a.public_ip, "198.51.100.7");
+    }
+
+    /// 第一个用户名在**问答阶段**就按面板规则校验并重问（2026-09-12 审查 blocking）：
+    /// 坏名字不该等到下载完四个内核、`build_state` 之后才由 `first_user` 报错退出——那时
+    /// 用户得重跑并重答全部问题。
+    #[tokio::test]
+    async fn a_bad_first_username_is_asked_again_at_most_three_times() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = scratch(&d);
+        let host = host_for_install(&paths);
+        let mut o = opts(&d);
+        // 域名由 opts() 给成 example.com、端口由 --port 给定 ⇒ 提问只剩密码/伪装站/首用户/节点名/公网 IP
+        (o.yes, o.non_interactive) = (false, false);
+        o.port = Some(30000);
+        // 密码、伪装站回车，首用户连填三个坏名字（空格 / 斜杠 / @ 都不合面板规则）
+        let mut p = ScriptedPrompt::new(&["", "", "张 三", "a/b", "bob@example.com"]);
+        let (a, _) = collect_answers(&o, None, host.clone(), Some(&mut p))
+            .await
+            .unwrap();
+        assert_eq!(
+            a.first_user, DEFAULT_FIRST_USER,
+            "三次都不合规 ⇒ 退回默认名，而不是把坏名字带进 build_state"
+        );
+        let tries = p
+            .asked
+            .iter()
+            .filter(|l| l.starts_with("第一个用户名"))
+            .count();
+        assert_eq!(tries, ASK_TRIES, "坏名字要重问满 3 次：{:?}", p.asked);
+        // 三个坏名字每一个都真的被面板那一处规则判为非法（规则只有一份，不会分叉）
+        for bad in ["张 三", "a/b", "bob@example.com"] {
+            assert!(
+                crate::modules::panel::users::validate_username(bad).is_err(),
+                "{bad}"
+            );
+        }
+        // 坏名字之后填对了就收下，并继续往后问
+        let mut p = ScriptedPrompt::new(&["", "", "a b", "张三_a-b.c", "hk-01", "198.51.100.7"]);
+        let (a, _) = collect_answers(&o, None, host.clone(), Some(&mut p))
+            .await
+            .unwrap();
+        assert_eq!(a.first_user, "张三_a-b.c");
+        assert_eq!(a.node_name, "hk-01", "重问没有吃掉后面几问的答案");
+        assert_eq!(a.public_ip, "198.51.100.7");
+    }
+
+    /// `--answers` 文件里显式给了的项不再问那一项（裁决 2026-09-12「已给的项不问」）：
+    /// 以前只把文件里的值当默认值显示，照样会再问一遍。
+    #[tokio::test]
+    async fn what_the_answers_file_pinned_is_not_asked_again() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = scratch(&d);
+        let host = host_for_install(&paths);
+        let f = d.path().join("answers.json");
+        std::fs::write(
+            &f,
+            r#"{"node_name":"hk-01","public_ip":"198.51.100.7","masquerade":"www.apple.com:443"}"#,
+        )
+        .unwrap();
+        let mut o = opts(&d);
+        (o.yes, o.non_interactive) = (false, false);
+        o.answers = Some(f);
+        let mut p = ScriptedPrompt::new(&[]);
+        let (a, _) = collect_answers(&o, None, host.clone(), Some(&mut p))
+            .await
+            .unwrap();
+        let joined = p.asked.join("|");
+        for pinned in ["节点名", "公网", "REALITY"] {
+            assert!(
+                !joined.contains(pinned),
+                "文件里给了「{pinned}」，不该再问：{joined}"
+            );
+        }
+        assert_eq!(a.node_name, "hk-01");
+        assert_eq!(a.public_ip, "198.51.100.7");
+        assert_eq!(a.masquerade, "www.apple.com:443");
+        // 文件里没给的项照问
+        assert!(joined.contains("面板管理员密码"), "{joined}");
+        assert!(joined.contains("Hysteria2"), "{joined}");
+        assert!(joined.contains("第一个用户名"), "{joined}");
+
+        // `ports` 那一支单独覆盖：文件里的 `ports` 必须给全，给了就连 HY2 端口也不问
+        // （再问一遍只会让人以为能只改一个）。`domain` 也在文件里 ⇒ 域名那一问也不开口
+        // （`pick_domain` 的第三优先级）。
+        let f = d.path().join("answers-ports.json");
+        std::fs::write(
+            &f,
+            r#"{"domain":"panel.example.com","ports":{"hy2":20443,"hy2_resi":40000,
+               "hy2_resi_hop":[41000,50000],"reality_direct":10001,"reality_resi":10002,
+               "admin":8080}}"#,
+        )
+        .unwrap();
+        let mut o = opts(&d);
+        (o.yes, o.non_interactive, o.domain) = (false, false, None);
+        o.answers = Some(f);
+        let mut p = ScriptedPrompt::new(&[]);
+        let (a, _) = collect_answers(&o, None, host.clone(), Some(&mut p))
+            .await
+            .unwrap();
+        assert_eq!(a.ports.hy2, 20443, "文件里的端口照用");
+        assert_eq!(a.domain, "panel.example.com");
+        let joined = p.asked.join("|");
+        assert!(
+            !joined.contains("Hysteria2"),
+            "文件里给了 ports，不该再问 HY2 端口：{joined}"
+        );
+        assert!(
+            !joined.contains("面板域名"),
+            "文件里给了 domain，不该再问域名：{joined}"
+        );
+        // 文件里没给的项照问（节点名/公网 IP/伪装站这次都没给）
+        for asked in ["节点名", "公网", "REALITY", "第一个用户名"] {
+            assert!(joined.contains(asked), "「{asked}」该问：{joined}");
+        }
+    }
+
+    /// `$BUI_DOMAIN` 非空 = 无人值守（裁决 2026-09-12）：全程一个问题都不问，
+    /// 判据与 `install.sh` 的 `tty_source` 同一条（那边同步不交接 `/dev/tty`）。
+    #[test]
+    fn a_domain_in_the_environment_means_unattended() {
+        let d = tempfile::tempdir().unwrap();
+        let mut o = opts(&d);
+        (o.yes, o.non_interactive) = (false, false);
+        assert!(!asks_nothing(&o, None), "什么都没给 ⇒ 要问");
+        assert!(!asks_nothing(&o, Some("")), "环境变量是空串 ⇒ 照问");
+        assert!(!asks_nothing(&o, Some("  ")), "纯空白是打错了 ⇒ 照问");
+        assert!(
+            asks_nothing(&o, Some("panel.example.com")),
+            "$BUI_DOMAIN 非空 ⇒ 一个问题都不问"
+        );
+        o.yes = true;
+        assert!(asks_nothing(&o, None), "--yes ⇒ 一个问题都不问");
+    }
+
+    /// 面板域名是唯一必填项：空回车重问，最多 3 次后报错退出（不装一半）。
+    #[tokio::test]
+    async fn an_empty_domain_is_asked_again_at_most_three_times() {
+        if std::env::var_os(DOMAIN_ENV).is_some() {
+            eprintln!("skipped: 开发机上设了 {DOMAIN_ENV}");
+            return;
+        }
+        let d = tempfile::tempdir().unwrap();
+        let paths = scratch(&d);
+        let host = host_for_install(&paths);
+        let mut o = opts(&d);
+        (o.yes, o.non_interactive, o.domain) = (false, false, None);
+        // 三次都直接回车
+        let mut p = ScriptedPrompt::new(&[]);
+        let err = collect_answers(&o, None, host.clone(), Some(&mut p))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("缺少面板域名"), "{err}");
+        assert_eq!(p.asked.len(), 3, "重问 3 次就够了：{:?}", p.asked);
+        // 前两次空、第三次填上 ⇒ 接着往下问
+        let mut p = ScriptedPrompt::new(&["", "", "panel.example.com"]);
+        let (a, _) = collect_answers(&o, None, host.clone(), Some(&mut p))
+            .await
+            .unwrap();
+        assert_eq!(a.domain, "panel.example.com");
+        assert!(p.asked.len() > 3, "第三次答上了就继续问后面几项");
+    }
+
+    /// 命令行/环境变量已给的项不再问（`--domain` 已给但密码等其余项照问）。
+    #[tokio::test]
+    async fn what_the_command_line_already_pinned_is_not_asked_again() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = scratch(&d);
+        let host = host_for_install(&paths);
+        let mut o = opts(&d);
+        (o.yes, o.non_interactive) = (false, false); // --domain 由 opts() 给成 example.com
+        o.port = Some(30000);
+        let mut p = ScriptedPrompt::new(&[]);
+        let (a, _) = collect_answers(&o, None, host.clone(), Some(&mut p))
+            .await
+            .unwrap();
+        assert_eq!(a.domain, "example.com");
+        assert_eq!(a.ports.hy2, 30000, "--port 给了就照它");
+        let joined = p.asked.join("|");
+        assert!(!joined.contains("面板域名"), "域名已给，不该再问：{joined}");
+        assert!(
+            !joined.contains("Hysteria2"),
+            "--port 已给，不该再问：{joined}"
+        );
+        assert!(joined.contains("面板管理员密码"), "密码照问：{joined}");
+        assert!(joined.contains("第一个用户名"), "首用户照问：{joined}");
+    }
+
+    /// `--yes` / `--non-interactive` 与 `--import-v3` 一律不问（后者沿用 v3 的值）。
+    #[tokio::test]
+    async fn quiet_and_import_installs_ask_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = scratch(&d);
+        let host = host_for_install(&paths);
+        // --yes：给了 prompt 也不许开口
+        let (a, notice) = collect_answers(&opts(&d), None, host.clone(), Some(&mut NoPrompt))
+            .await
+            .unwrap();
+        assert_eq!(a.domain, "example.com");
+        assert_eq!(a.first_user, DEFAULT_FIRST_USER);
+        assert!(notice.is_some(), "--yes 照旧生成随机密码并打印");
+        // --import-v3：域名与用户都来自 v3
+        let Some(src) = v3_fixture() else { return };
+        let mut o = opts(&d);
+        (o.yes, o.non_interactive) = (false, false);
+        o.import_v3 = Some(src.to_path_buf());
+        let (_, notice) = collect_answers(&o, None, host.clone(), Some(&mut NoPrompt))
+            .await
+            .unwrap();
+        assert_eq!(notice, None, "导入路径不生成随机密码");
+    }
+
+    /// v4 到这个任务之前装完一个用户都没有（面板空的、订阅地址无处可填）。全新装机要按
+    /// bui-schema 的 `User` 模型建第一个用户，权益默认全开，凭据随机。
+    #[tokio::test]
+    async fn a_fresh_install_creates_the_first_user_with_every_entitlement_on() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = scratch(&d);
+        let host = host_for_install(&paths);
+        run_with_wait(
+            opts(&d),
+            answers(),
+            murl(),
+            paths.clone(),
+            host.clone(),
+            fetcher_with_manifest(),
+            crate::commands::selfcheck::Wait::NONE,
+        )
+        .await
+        .unwrap();
+        let state: bui_schema::model::State =
+            serde_json::from_slice(&std::fs::read(crate::paths::state_file(&paths)).unwrap())
+                .unwrap();
+        assert_eq!(state.users.len(), 1);
+        let u = &state.users[0];
+        assert_eq!(u.username, DEFAULT_FIRST_USER);
+        assert!(!u.disabled);
+        // 凭据随机：HY2 密码与面板建用户同形（16 hex），UUID 不是全零
+        assert_eq!(u.credentials.hy2_password.len(), 16);
+        assert!(u
+            .credentials
+            .hy2_password
+            .chars()
+            .all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(u.credentials.vless_uuid, uuid::Uuid::nil());
+        // 权益默认全开：两种协议 + 直连 + 住宅分组，不限期、不限量
+        assert_eq!(
+            u.entitlements.protocols,
+            vec![
+                bui_schema::model::Protocol::Hysteria2,
+                bui_schema::model::Protocol::Reality
+            ]
+        );
+        assert!(u.entitlements.direct);
+        assert_eq!(
+            u.entitlements
+                .residential
+                .as_ref()
+                .map(|r| r.group_id.as_str()),
+            Some(bui_schema::model::DEFAULT_GROUP)
+        );
+        assert_eq!(u.entitlements.expires_at, None);
+        assert_eq!(u.entitlements.traffic_limit.total_bytes, None);
+        assert_eq!(u.entitlements.traffic_limit.monthly_bytes, None);
+        assert!(!u.created_at.is_empty());
+        // 鉴权快照里必须有他，否则第一次建连就 fail-closed
+        let snap: serde_json::Value = serde_json::from_str(
+            &host
+                .text(
+                    &crate::paths::auth_snapshot_file(&paths)
+                        .display()
+                        .to_string(),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            snap["users"][DEFAULT_FIRST_USER]["hy2_password"],
+            serde_json::json!(u.credentials.hy2_password)
+        );
+        // 装完那一屏打出去的三条订阅地址必须真的渲染得出东西来（2026-09-12 审查 blocking：
+        // 只断言 state 里有这个用户，渲染不出来照样是「面板空的、订阅无处可填」）。
+        // 走面板 `/api/sub`、`/api/subscription`、`/api/clash` 同一个入口取节点与分流规则。
+        let (nodes, split) =
+            crate::modules::panel::api_public::nodes_and_split(&state, DEFAULT_FIRST_USER)
+                .expect("第一个用户要取得出节点集合");
+        assert!(
+            !nodes.is_empty(),
+            "权益全开却一个节点都没有：{:?}",
+            u.entitlements
+        );
+        // /api/sub：v2rayN 直接吃的那一串（base64，这里解回明文逐条核对）
+        let b64 = bui_schema::render::subscription::uri_list(&nodes, DEFAULT_FIRST_USER);
+        let uris = String::from_utf8(
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &b64)
+                .expect("/api/sub 的载荷要是合法 base64"),
+        )
+        .unwrap();
+        assert!(uris.contains("hysteria2://"), "缺 HY2 节点：{uris}");
+        assert!(uris.contains("vless://"), "缺 REALITY 节点：{uris}");
+        assert!(
+            uris.contains(&u.credentials.hy2_password),
+            "HY2 URI 里没带这个用户的密码：{uris}"
+        );
+        assert!(
+            uris.contains(&u.credentials.vless_uuid.to_string()),
+            "VLESS URI 里没带这个用户的 UUID：{uris}"
+        );
+        // /api/subscription：sing-box 配置，能序列化成 JSON 且四个节点各有一个出站
+        // （sing-box 的出站 tag 是固定的四个，不带用户名——用户名只出现在 HY2 的 password 里）
+        let sb = bui_schema::render::subscription::singbox(&nodes, &split, &state.node.public_ip);
+        let sb_text = serde_json::to_string(&sb).expect("sing-box 配置要能序列化");
+        let tags: Vec<&str> = sb["outbounds"]
+            .as_array()
+            .expect("outbounds 要是数组")
+            .iter()
+            .filter_map(|o| o["tag"].as_str())
+            .collect();
+        for tag in [
+            "vless-direct",
+            "vless-residential",
+            "hy2-direct",
+            "hy2-residential",
+        ] {
+            assert!(tags.contains(&tag), "sing-box 配置缺出站 {tag}：{tags:?}");
+        }
+        assert!(
+            sb_text.contains(&u.credentials.hy2_password)
+                && sb_text.contains(&u.credentials.vless_uuid.to_string()),
+            "sing-box 配置里没带这个用户的凭据：{sb_text}"
+        );
+        // /api/clash：mihomo YAML 非空且解析得开
+        let clash = bui_schema::render::subscription::clash(&nodes, DEFAULT_FIRST_USER, &split);
+        assert!(!clash.trim().is_empty(), "clash YAML 是空的");
+        assert!(
+            clash.contains(&u.credentials.hy2_password),
+            "clash YAML 里没带这个用户的密码"
+        );
     }
 }

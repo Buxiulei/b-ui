@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
 # b-ui v4 一键安装引导：架构识别 → 多源下载 manifest 与 bui → sha256 校验 → exec bui install。
 #
-# 新服务器一行命令（唯一必填是面板域名；其余全自动）：
+# 新服务器一行命令（跑起来后问答式配置：面板域名必填，其余每题回车即默认）：
+#   curl -fsSL https://raw.githubusercontent.com/Buxiulei/b-ui/v4/install.sh | bash
+# 域名先给好、其余照问（同样问答）：
 #   curl -fsSL https://raw.githubusercontent.com/Buxiulei/b-ui/v4/install.sh | bash -s -- --domain panel.example.com
+# 一个都不问（无人值守，面板密码随机生成并在最后打印一次）：
+#   curl -fsSL https://raw.githubusercontent.com/Buxiulei/b-ui/v4/install.sh | bash -s -- --domain panel.example.com --yes
+#   curl -fsSL https://raw.githubusercontent.com/Buxiulei/b-ui/v4/install.sh | BUI_DOMAIN=panel.example.com bash
 #
 # 三个常用环境变量：
-#   BUI_DOMAIN=<面板域名>   等价于 --domain（凭据/域名不想进 argv 时用它）
+#   BUI_DOMAIN=<面板域名>   给域名且**一个问题都不问**（等价于 --domain --yes；裁决 2026-09-12：
+#                           环境变量那条写法的语义就是无人值守）。想要问答就用 --domain。
 #   BUI_VERSION=v4.0.1      指定版本（默认 latest；只有预发布时 latest 会 404，自动回退到最新 v4* 标签）
 #   BUI_MANIFEST_URL=<url>  直接指定 manifest（覆盖 BUI_VERSION；M5 演练用本机 http.server 托管的那份，
 #                           环境变量会随 exec 传给 bui install，与 C5 的 BUI_MANIFEST_URL 同名同义）。
@@ -48,7 +54,7 @@ pick_dl() { if command -v curl > /dev/null 2>&1; then printf 'curl\n'; elif comm
 # 两个独立判定，别混成一个（混过一次：`sudo bash install.sh` 不给域名被直接拒，
 # 只有 curl|bash 那一种形态碰巧能过）：
 #   has_tty     有没有终端可问 —— stdin 本身就是终端，或 /dev/tty 能打开。require_domain 用它。
-#   tty_source  要不要把 /dev/tty 交接给 bui install —— 见下面那段注释，三个条件缺一不交接。
+#   tty_source  要不要把 /dev/tty 交接给 bui install —— 见下面那段注释，四个条件缺一不交接。
 # 测试里覆盖 tty_readable 即可；`[[ -t 0 ]]` 那一半由伪终端里的真跑覆盖。
 tty_readable() { { : < /dev/tty; } 2> /dev/null; }
 has_tty() { [[ -t 0 ]] || tty_readable; }
@@ -62,8 +68,8 @@ answers_domain() {
     grep -Eq '"domain"[[:space:]]*:[[:space:]]*"[^"]+"' "$f"
 }
 
-# 域名来源判定分两档，差别只在 --answers：
-#   domain_pinned 域名已定、bui install 那一问根本不会开口 —— 答案文件里要真有 domain。tty_source 用它。
+# 域名来源判定分两档，差别只在 --answers（两档都只服务 require_domain 的早退）：
+#   domain_pinned 域名已定、bui install 那一问根本不会开口 —— 答案文件里要真有 domain。
 #   domain_known  给了答案文件就算有来源（内容留给 bui install 解释）—— require_domain 只为
 #                 「什么都没有又没终端」时早退，宁松不宁紧，不替 bui install 解释文件。
 domain_pinned() {
@@ -78,15 +84,25 @@ domain_known() {
 }
 
 tty_source() {
-    # 要不要把 /dev/tty 交接给 bui install。三个条件缺一不交接（不输出 = 原样继承 stdin）：
+    # 要不要把 /dev/tty 交接给 bui install。判据是「bui install 将要提问」，四个条件缺一
+    # 不交接（不输出 = 原样继承 stdin）：
     #   1. stdin 是管道（curl … | bash）且 /dev/tty 能打开 —— stdin 已是终端就不用换
     #   2. 参数里没有 --admin-password-stdin —— 那是把管理员密码喂进 bui install 的唯一通道
     #      （`bash install.sh --non-interactive --answers a.json --admin-password-stdin < pw.txt`），
     #      把 stdin 换成终端会让它读到空密码、密码文件被静默忽略（2026-09-12 第三轮审查 blocking）
-    #   3. 域名未知 —— 域名已定时它一个问题都不问，没有任何理由动人家的 stdin
+    #   3. 没有 --yes / -y / --non-interactive —— 那两个开关的语义就是一个问题都不问
+    #   4. $BUI_DOMAIN 去掉空白后为空 —— 非空时 bui install 的 asks_nothing 判它等同 --yes
+    #      （裁决 2026-09-12「已给的项不问」：环境变量那条写法的语义就是无人值守），一个问题
+    #      都不问，两边判据必须同步，不然这里白交接一个 fd 过去。去空白与 asks_nothing 的
+    #      `trim()` 对齐：纯空白是打错了，那边照样要问域名，这边就得把 /dev/tty 交过去
+    # 不再看命令行上的域名是否已知（2026-09-12 裁决「一行命令后问答式配置」）：`--domain` 之后
+    # 还有面板密码（默认随机）、HY2 端口、REALITY 伪装站、第一个用户名、节点名、公网 IP 要问，
+    # 只看域名会把 `curl … | bash -s -- --domain x` 的后面几问全闷掉（stdin 是管道，问了读不到）。
+    # `--import-v3` 沿用 v3 的值、其实什么都不问，交接无害（bui install 不会去读那个 fd）。
     local arg; { [[ -t 0 ]] || ! tty_readable; } && return 0
-    for arg in "$@"; do case "$arg" in --admin-password-stdin) return 0 ;; esac; done
-    domain_pinned "$@" || printf '/dev/tty\n'
+    [[ -n "${BUI_DOMAIN:-}" && -n "${BUI_DOMAIN//[[:space:]]/}" ]] && return 0
+    for arg in "$@"; do case "$arg" in --admin-password-stdin | --yes | -y | --non-interactive) return 0 ;; esac; done
+    printf '/dev/tty\n'
 }
 
 require_domain() {
@@ -225,8 +241,8 @@ main() {
         print_warning "检测到 v3 安装（$BASE_DIR/users.json），将以 --import-v3 迁移现有用户与配置"
     fi
     print_info "交给 bui install ${args[*]-}"
-    # 管道里跑、域名又没来源时把 /dev/tty 接给 bui install，它才能问出「面板域名」那一问；
-    # 域名已定或 stdin 正给 --admin-password-stdin 送密码时原样继承 stdin（见 tty_source）
+    # 管道里跑（curl … | bash）时把 /dev/tty 接给 bui install，它才问得出那几问；
+    # --yes/--non-interactive 或 stdin 正给 --admin-password-stdin 送密码时原样继承 stdin（见 tty_source）
     if [[ -n "$(tty_source "${args[@]+"${args[@]}"}")" ]]; then exec "$BIN_PATH" install "${args[@]+"${args[@]}"}" < /dev/tty; fi
     exec "$BIN_PATH" install "${args[@]+"${args[@]}"}"
 }
