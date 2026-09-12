@@ -8,7 +8,9 @@
 #   BUI_DOMAIN=<面板域名>   等价于 --domain（凭据/域名不想进 argv 时用它）
 #   BUI_VERSION=v4.0.1      指定版本（默认 latest；只有预发布时 latest 会 404，自动回退到最新 v4* 标签）
 #   BUI_MANIFEST_URL=<url>  直接指定 manifest（覆盖 BUI_VERSION；M5 演练用本机 http.server 托管的那份，
-#                           环境变量会随 exec 传给 bui install，与 C5 的 BUI_MANIFEST_URL 同名同义）
+#                           环境变量会随 exec 传给 bui install，与 C5 的 BUI_MANIFEST_URL 同名同义）。
+#                           没设时本脚本会把**自己实际用的**那个地址（BUI_VERSION 指定的 tag，或
+#                           latest→预发布回退后的 tag）export 成它，免得 bui install 又去问 latest。
 # 其余：
 #   BUI_MIRRORS="https://a/ https://b/"  覆盖镜像前缀（按序回退，拼在完整 URL 前）
 #   BUI_MIRRORS=""      只用直连，不试任何镜像（故用 ${VAR-默认} 而非 ${VAR:-默认}）
@@ -133,12 +135,20 @@ get_manifest() {
     #
     # 第一次尝试走 quiet：预发布期 releases/latest **必然** 404，那条「直连与全部镜像均不可达」
     # 对 404 是误导（源好得很，只是还没有正式版）。真的取不到时由下面两条自己说清楚。
+    #
+    # 取到之后把**实际用的**那个地址 export 成 BUI_MANIFEST_URL 交给 bui install（见 main 末尾的
+    # exec）：2026-09-12 真机 bwg-tizi 上 install.sh 从 releases/download/v4.0.0-rc2/ 正确下到了
+    # manifest 与 bui，可 bui install 又按内置默认去问 releases/latest、404、一个内核都没装。
+    # 用户已显式设了 BUI_MANIFEST_URL 时 murl 就是它本身，export 回去是原样不动。
     local murl="${MANIFEST_URL:-$(gh_url manifest.json)}"
-    fetch "$murl" "$1" quiet && return 0
+    if fetch "$murl" "$1" quiet; then export BUI_MANIFEST_URL="$murl"; return 0; fi
     [[ -z "$MANIFEST_URL" && "$TAG" == "latest" ]] || { print_error "manifest.json 下载失败（$murl）：直连与全部镜像均不可达"; return 1; }
     TAG=$(latest_v4_tag "$(dirname "$1")") || TAG=""
     [[ -n "$TAG" ]] || { print_error "取不到可用版本：releases/latest 与 releases 列表都不可达。请设 BUI_VERSION=vX.Y.Z-rcN（预发布也可）或 BUI_MANIFEST_URL=<manifest 地址>"; return 1; }
-    print_warning "releases/latest 里没有 manifest.json（仓库里只有预发布），回退到预发布 $TAG"; fetch "$(gh_url manifest.json)" "$1"
+    print_warning "releases/latest 里没有 manifest.json（仓库里只有预发布），回退到预发布 $TAG"
+    murl=$(gh_url manifest.json)
+    fetch "$murl" "$1" || return 1
+    export BUI_MANIFEST_URL="$murl"
 }
 
 manifest_field() {

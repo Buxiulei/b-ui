@@ -106,6 +106,8 @@ pub struct InstallOpts {
     pub non_interactive: bool,
     pub answers: Option<PathBuf>,
     pub yes: bool,
+    /// `--manifest-url`（与 `bui upgrade` 的同名选项同义，总纲 C4）
+    pub manifest_url: Option<String>,
     /// 第 9 步探测守护进程用的 unix socket。**必须由调用方传入**（`main.rs` 传
     /// `PathBuf::from(crate::paths::SOCKET_PATH)`），不许在函数体里读常量：install 的测试都会
     /// 走到第 9 步，硬编码 `/run/b-ui.sock` 会让它们在跑着 v4 守护进程的机器上真的
@@ -117,6 +119,51 @@ impl InstallOpts {
     /// 一个问题都不问。
     pub fn quiet(&self) -> bool {
         self.yes || self.non_interactive
+    }
+}
+
+/// manifest 的来源：总纲 C4 的两个覆盖（`--manifest-url` 与 `$BUI_MANIFEST_URL`）在入口读一次
+/// 就固定下来，一路传到 [`fetch_and_install_kernels`]，由
+/// [`crate::kernels::fetch_manifest_with`] 按同一顺序解析（`bui upgrade` 走的也是它），
+/// 包括「latest 404 ⇒ 改跟 releases 列表里最新预发布」那一步。
+///
+/// 传结构体而不是解析好的 url：回退需要知道「三个覆盖是不是都没给」，url 一旦算成字符串就分不清
+/// 「用户把地址设成了内置 latest」和「什么都没设」。`env` 也显式带着，于是单元测试不读开发机环境。
+#[derive(Debug, Clone, Default)]
+pub struct ManifestSource {
+    /// `--manifest-url`（最高优先）
+    pub cli_override: Option<String>,
+    /// `$BUI_MANIFEST_URL`：`install.sh` 会把它**实际用的**那个地址 export 下来
+    pub env: Option<String>,
+}
+
+impl ManifestSource {
+    /// `--manifest-url` + 进程环境里的 `$BUI_MANIFEST_URL`。
+    pub fn from_env(cli_override: Option<String>) -> Self {
+        Self {
+            cli_override,
+            env: std::env::var(crate::kernels::MANIFEST_URL_ENV).ok(),
+        }
+    }
+
+    /// 按 C4 的顺序算出的地址（只用于报错文案；真正的拉取走 `fetch_manifest_with`，
+    /// 它可能因 404 回退到另一个 tag）。
+    fn resolved(&self) -> String {
+        crate::kernels::resolve_manifest_url(
+            self.cli_override.as_deref(),
+            None,
+            self.env.as_deref(),
+        )
+    }
+}
+
+impl From<&str> for ManifestSource {
+    /// 钉死一个地址（等价于 `--manifest-url`）：不读进程环境、也不回退预发布通道。
+    fn from(url: &str) -> Self {
+        Self {
+            cli_override: Some(url.to_string()),
+            env: None,
+        }
     }
 }
 
@@ -294,23 +341,33 @@ fn manifest_failure_notice(url: &str, err: &str) -> String {
 /// 第 3 + 4 步：拉 manifest → 缓存（内容相同不写）→ 把四个内核装到 `bin/`（版本一致则跳过）。
 /// manifest 拉不到只警告并返回 `None`；**是否继续装机由调用方的内核闸门决定**
 /// （[`run_with`] 的「内核缺一即中止」）。
+///
+/// 返回 **(实际用的 manifest 地址, manifest)**：地址由
+/// [`crate::kernels::fetch_manifest_with`] 定（可能是 404 回退后的预发布 tag），闸门的报错文案
+/// 要报的正是它，而不是解析前的那一串。
 fn fetch_and_install_kernels(
     host: &dyn Host,
     fetcher: &dyn Fetcher,
     paths: &Paths,
-    manifest_url: &str,
-) -> Option<Manifest> {
-    let manifest = match Manifest::from_url(fetcher, manifest_url) {
-        Ok(m) => m,
+    src: &ManifestSource,
+) -> (String, Option<Manifest>) {
+    let (manifest_url, manifest) = match crate::kernels::fetch_manifest_with(
+        fetcher,
+        src.cli_override.as_deref(),
+        None,
+        src.env.as_deref(),
+    ) {
+        Ok((url, m)) => (url, m),
         Err(e) => {
+            let url = src.resolved();
             tracing::warn!(
                 error = %e,
-                url = %crate::redact::url_credentials(manifest_url),
+                url = %crate::redact::url_credentials(&url),
                 env = crate::kernels::MANIFEST_URL_ENV,
                 "拉取 manifest 失败，跳过内核安装（可用该环境变量覆盖地址）"
             );
-            println!("{}", manifest_failure_notice(manifest_url, &e.to_string()));
-            return None;
+            println!("{}", manifest_failure_notice(&url, &e.to_string()));
+            return (url, None);
         }
     };
     if let Ok(bytes) = serde_json::to_vec_pretty(&manifest) {
@@ -361,7 +418,7 @@ fn fetch_and_install_kernels(
             paths.bin_dir.display()
         );
     }
-    Some(manifest)
+    (manifest_url, Some(manifest))
 }
 
 /// 面板域名的环境变量（与 `install.sh` 的 `BUI_DOMAIN` 同名同义：一行命令里不想把域名写进
@@ -555,11 +612,12 @@ pub async fn run(opts: InstallOpts, paths: Paths, host: Arc<dyn Host>) -> anyhow
         None
     };
     let (answers, notice) = collect_answers(&opts, installed.as_deref(), host.clone()).await?;
-    let manifest_url = crate::kernels::manifest_url(None, None);
+    // C4 的两个覆盖读一次就固定（`install.sh` 把它选定的那个 tag export 成 `$BUI_MANIFEST_URL`）
+    let manifest = ManifestSource::from_env(opts.manifest_url.clone());
     let outcome = run_with(
         opts,
         answers,
-        manifest_url,
+        manifest,
         paths,
         host,
         Arc::new(HttpFetcher::new()),
@@ -584,12 +642,12 @@ pub async fn run(opts: InstallOpts, paths: Paths, host: Arc<dyn Host>) -> anyhow
     outcome
 }
 
-/// spec §7 的十步。`manifest_url` 由调用方算好（[`crate::kernels::manifest_url`]），
-/// 测试直接传固定值，不读进程环境。
+/// spec §7 的十步。`manifest` 是 C4 的覆盖来源（[`ManifestSource`]），由调用方读一次；
+/// 测试传 `"<url>".into()` 钉死地址，不读进程环境。
 pub async fn run_with(
     opts: InstallOpts,
     answers: Answers,
-    manifest_url: String,
+    manifest: ManifestSource,
     paths: Paths,
     host: Arc<dyn Host>,
     fetcher: Arc<dyn Fetcher>,
@@ -597,7 +655,7 @@ pub async fn run_with(
     run_with_wait(
         opts,
         answers,
-        manifest_url,
+        manifest,
         paths,
         host,
         fetcher,
@@ -613,7 +671,7 @@ pub async fn run_with(
 pub async fn run_with_wait(
     opts: InstallOpts,
     answers: Answers,
-    manifest_url: String,
+    manifest_src: ManifestSource,
     paths: Paths,
     host: Arc<dyn Host>,
     fetcher: Arc<dyn Fetcher>,
@@ -621,16 +679,17 @@ pub async fn run_with_wait(
 ) -> anyhow::Result<()> {
     let state_path = crate::paths::state_file(&paths);
     let fresh = !state_path.exists();
-    // 3 + 4：拉 manifest → 缓存 → 装四个内核（阻塞线程）
-    let manifest = {
-        let (h, f, p, u) = (
+    // 3 + 4：拉 manifest（C4 解析 + latest 404 回退预发布，与 `bui upgrade` 同一处实现）
+    // → 缓存 → 装四个内核（阻塞线程）
+    let (manifest_url, manifest) = {
+        let (h, f, p, s) = (
             host.clone(),
             fetcher.clone(),
             paths.clone(),
-            manifest_url.clone(),
+            manifest_src.clone(),
         );
         tokio::task::spawn_blocking(move || {
-            fetch_and_install_kernels(h.as_ref(), f.as_ref(), &p, &u)
+            fetch_and_install_kernels(h.as_ref(), f.as_ref(), &p, &s)
         })
         .await?
     };
@@ -943,6 +1002,8 @@ mod tests {
         assert_eq!(s.versions.bui, "4.0.0");
     }
 
+    /// 表里没有的地址回 [`crate::kernels::NotFound`]，与 `HttpFetcher` 的 404 同形：
+    /// 「latest 404 ⇒ 回退预发布」认的就是这个错误类型。
     struct FakeFetcher(Mutex<Vec<(String, Vec<u8>)>>);
     impl Fetcher for FakeFetcher {
         fn get_bytes(&self, url: &str) -> anyhow::Result<Vec<u8>> {
@@ -952,11 +1013,12 @@ mod tests {
                 .iter()
                 .find(|(u, _)| u == url)
                 .map(|(_, b)| b.clone())
-                .ok_or_else(|| anyhow::anyhow!("404 {url}"))
+                .ok_or_else(|| crate::kernels::NotFound(url.to_string()).into())
         }
     }
 
-    fn fetcher_with_manifest() -> Arc<dyn Fetcher> {
+    /// 一份能装成的 manifest 挂在 `manifest_url` 上，外加它引用的五个资产。
+    fn manifest_files(manifest_url: &str) -> Vec<(String, Vec<u8>)> {
         let payload = b"ELF".to_vec();
         let sum = crate::kernels::sha256_hex(&payload);
         let asset = |n: &str| serde_json::json!({"url": format!("https://x/{n}"), "sha256": sum});
@@ -971,13 +1033,29 @@ mod tests {
                 "caddy-linux-amd64": asset("caddy")
             }
         });
-        let mut files = vec![(
-            crate::kernels::MANIFEST_URL.to_string(),
-            manifest.to_string().into_bytes(),
-        )];
+        let mut files = vec![(manifest_url.to_string(), manifest.to_string().into_bytes())];
         for n in ["bui", "hysteria", "xray", "sing-box", "caddy"] {
             files.push((format!("https://x/{n}"), payload.clone()));
         }
+        files
+    }
+
+    fn fetcher_with_manifest() -> Arc<dyn Fetcher> {
+        Arc::new(FakeFetcher(Mutex::new(manifest_files(
+            crate::kernels::MANIFEST_URL,
+        ))))
+    }
+
+    /// 2026-09-12 真机 bwg-tizi 的服务端形态：仓库里只有预发布，`releases/latest/download/`
+    /// 404，manifest 只挂在 `releases/download/v4.0.0-rc2/` 下。
+    const RC_TAG: &str = "v4.0.0-rc2";
+
+    fn fetcher_with_prerelease_only() -> Arc<dyn Fetcher> {
+        let mut files = manifest_files(&crate::kernels::manifest_url_for_tag(RC_TAG));
+        files.push((
+            crate::kernels::RELEASES_API_URL.to_string(),
+            format!(r#"[{{"tag_name":"{RC_TAG}","prerelease":true}}]"#).into_bytes(),
+        ));
         Arc::new(FakeFetcher(Mutex::new(files)))
     }
 
@@ -1063,13 +1141,14 @@ mod tests {
             non_interactive: false,
             answers: None,
             yes: true,
+            manifest_url: None,
             socket: d.path().join("absent.sock"),
         }
     }
 
     /// 测试一律显式传 manifest 地址，不读进程环境（`$BUI_MANIFEST_URL` 在开发机上可能有值）
-    fn murl() -> String {
-        crate::kernels::MANIFEST_URL.to_string()
+    fn murl() -> ManifestSource {
+        crate::kernels::MANIFEST_URL.into()
     }
 
     fn answers() -> Answers {
@@ -1235,6 +1314,78 @@ mod tests {
         assert!(
             load_answers(&d.path().join("nope.json"), Answers::defaults("node-a", "")).is_err()
         );
+    }
+
+    /// 2026-09-12 真机 bwg-tizi：`install.sh` 从 `releases/download/v4.0.0-rc2/` 正确下到了
+    /// manifest 与 bui，`bui install` 却按内置默认去问 `releases/latest` ⇒ 404 ⇒ 四个内核
+    /// 一个都没装、被中止守卫拦下。install 与 upgrade 走同一处 manifest 解析后，
+    /// 「什么都没指定 + latest 404」就该自己改跟 releases 列表里最新的预发布。
+    #[tokio::test]
+    async fn install_follows_the_prerelease_channel_when_latest_is_404() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = scratch(&d);
+        let host = host_for_install(&paths);
+        run_with_wait(
+            opts(&d),
+            answers(),
+            // 三个覆盖一个都不给：这正是真机上 `bui install` 的处境
+            ManifestSource::default(),
+            paths.clone(),
+            host.clone(),
+            fetcher_with_prerelease_only(),
+            crate::commands::selfcheck::Wait::NONE,
+        )
+        .await
+        .unwrap();
+        for k in crate::kernels::KERNELS {
+            assert_eq!(
+                host.mode(&paths.bin_dir.join(k).display().to_string()),
+                Some(0o755),
+                "{k} 该从预发布 manifest 装上"
+            );
+        }
+        assert!(
+            host.text(&d.path().join("manifest.json").display().to_string())
+                .is_some(),
+            "预发布 manifest 也要缓存下来给对账用"
+        );
+    }
+
+    /// `install.sh` 把它**实际用的**地址 export 成 `$BUI_MANIFEST_URL`（本次一起修的 A 面）：
+    /// `bui install` 必须认它，而不是回到内置 latest。认了它就不再去问 releases 列表
+    /// （这个 fetcher 里根本没有那一条，去问就会失败）。
+    #[tokio::test]
+    async fn install_uses_the_manifest_url_handed_down_by_install_sh() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = scratch(&d);
+        let host = host_for_install(&paths);
+        let rc_url = crate::kernels::manifest_url_for_tag(RC_TAG);
+        let fetcher: Arc<dyn Fetcher> = Arc::new(FakeFetcher(Mutex::new(manifest_files(&rc_url))));
+        run_with_wait(
+            opts(&d),
+            answers(),
+            ManifestSource {
+                cli_override: None,
+                env: Some(rc_url),
+            },
+            paths.clone(),
+            host.clone(),
+            fetcher,
+            crate::commands::selfcheck::Wait::NONE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            host.mode(&paths.bin_dir.join("xray").display().to_string()),
+            Some(0o755),
+            "$BUI_MANIFEST_URL 指的那份 manifest 要真被用上"
+        );
+        // `--manifest-url` 压过环境变量（C4 的顺序，与 upgrade 同）
+        let src = ManifestSource {
+            cli_override: Some("https://cli/manifest.json".into()),
+            env: Some("https://env/manifest.json".into()),
+        };
+        assert_eq!(src.resolved(), "https://cli/manifest.json");
     }
 
     #[tokio::test]
