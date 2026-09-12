@@ -118,7 +118,8 @@ pub async fn mark_xray_rules_dirty(runtime: &Runtime) {
 ///    （这一轮的变化与槽路由无关，例如加了个没有住宅权益的用户）；
 /// 3. 否则 `ListRule()` 读回**进程里正在跑的**那张表，与期望态求差，只对差集调
 ///    `RemoveRule` / `AddRule`（每个用户一条规则，`ruleTag` = `resi-u-<user_id>`），
-///    最后把兜底规则挪回表尾；全成功 ⇒ 记哈希、清脏；
+///    最后把兜底规则挪回表尾。差分连**表序**一起比：内容一致但兜底不在表尾也算差异，
+///    所以哈希只在顺序与内容都收敛之后才写；全成功 ⇒ 记哈希、清脏；
 /// 4. 任一步 gRPC 失败 ⇒ [`restart_fallback`]：只有磁盘上那份 `xray-config.json` 已经
 ///    是新规则时才重启一次并记事件，否则什么都不做、脏标记留着。
 ///
@@ -172,8 +173,14 @@ pub async fn converge_xray(ctx: &DaemonCtx, xray: &dyn XrayApi) -> ConvergeOutco
 /// 用 `ListRule` 读回进程里真正在跑的那张表，只对差集调 `RemoveRule` / `AddRule`。
 /// 返回发出的增删条数（0 = 本来就一致）。任一调用失败立刻返回 `Err`，**不回滚** ——
 /// 下一轮 `ListRule` 会看到真实状态再补差分（幂等）。
+///
+/// 差分要**连表序一起比**：Xray 按表序首条匹配，兜底规则（没有 `user` 条件，吃掉
+/// 整个住宅入站）一旦排在某条用户规则之前，那个用户就会被路由到兜底槽而不是自己的槽。
+/// 所以「内容一致但兜底不在表尾」也算差异 —— 否则上一轮把兜底挪回表尾那步失败之后，
+/// 下一轮会误判为一致、记哈希清脏，把错序永久固化下来。
 async fn apply_slot_rules(xray: &dyn XrayApi, want: &[SlotRule]) -> anyhow::Result<usize> {
-    let live: BTreeMap<String, String> = xray
+    // 保留 `ListRule` 的原始表序：顺序本身就是要收敛的一部分
+    let live: Vec<(String, String)> = xray
         .list_rules()
         .await?
         .into_iter()
@@ -181,10 +188,14 @@ async fn apply_slot_rules(xray: &dyn XrayApi, want: &[SlotRule]) -> anyhow::Resu
             tag.starts_with(xray_render::USER_RULE_PREFIX) || tag == xray_render::FALLBACK_RULE_TAG
         })
         .collect();
+    let by_tag: BTreeMap<&str, &str> = live
+        .iter()
+        .map(|(tag, out)| (tag.as_str(), out.as_str()))
+        .collect();
     let wanted: BTreeSet<&str> = want.iter().map(|r| r.rule_tag.as_str()).collect();
     let mut calls = 0usize;
     // ① 多出来的（用户删了 / 没了住宅权益 / 换了 tag 写法）
-    for tag in live.keys() {
+    for (tag, _) in &live {
         if !wanted.contains(tag.as_str()) {
             xray.remove_rule(tag).await?;
             calls += 1;
@@ -194,10 +205,10 @@ async fn apply_slot_rules(xray: &dyn XrayApi, want: &[SlotRule]) -> anyhow::Resu
     let fallback = want.last().expect("slot_rules 末尾一定是兜底规则").clone();
     let mut appended = false;
     for r in want.iter().filter(|r| r.rule_tag != fallback.rule_tag) {
-        if live.get(&r.rule_tag).map(String::as_str) == Some(r.outbound_tag.as_str()) {
+        if by_tag.get(r.rule_tag.as_str()).copied() == Some(r.outbound_tag.as_str()) {
             continue;
         }
-        if live.contains_key(&r.rule_tag) {
+        if by_tag.contains_key(r.rule_tag.as_str()) {
             xray.remove_rule(&r.rule_tag).await?;
             calls += 1;
         }
@@ -205,13 +216,20 @@ async fn apply_slot_rules(xray: &dyn XrayApi, want: &[SlotRule]) -> anyhow::Resu
         calls += 1;
         appended = true;
     }
-    // ③ `AddRule` 只能追加到表尾 ⇒ 这一轮追加过（或兜底本身缺了/指错了）就把兜底
-    //    删掉再追加一次，让它回到全部用户规则之后。两次调用之间有个亚毫秒窗口，
-    //    期间「一条规则都没有的 email」落到首个出站 direct（D7 已接受）。
-    if appended
-        || live.get(&fallback.rule_tag).map(String::as_str) != Some(fallback.outbound_tag.as_str())
-    {
-        if live.contains_key(&fallback.rule_tag) {
+    // ③ `AddRule` 只能追加到表尾 ⇒ 这一轮追加过、或兜底本身缺了 / 指错了 / 排在别的
+    //    槽规则前面，就把兜底删掉再追加一次，让它回到全部用户规则之后。两次调用之间
+    //    有个亚毫秒窗口，期间「一条规则都没有的 email」落到首个出站 direct（D7 已接受）。
+    //    ①删掉的那些不算数：判位置只看留下来的（`wanted` 里的）那些规则的相对次序。
+    let last_kept = live
+        .iter()
+        .rev()
+        .find(|(tag, _)| wanted.contains(tag.as_str()))
+        .map(|(tag, _)| tag.as_str());
+    let fallback_ok = by_tag.get(fallback.rule_tag.as_str()).copied()
+        == Some(fallback.outbound_tag.as_str())
+        && last_kept == Some(fallback.rule_tag.as_str());
+    if appended || !fallback_ok {
+        if by_tag.contains_key(fallback.rule_tag.as_str()) {
             xray.remove_rule(&fallback.rule_tag).await?;
             calls += 1;
         }
@@ -836,6 +854,45 @@ mod tests {
         );
         assert_same_rules(&x.rules(), &want_rules(&ctx).await);
         assert_eq!(restarts_of_xray(&host), 0, "{:?}", host.ops());
+    }
+
+    /// 上一轮「把兜底挪回表尾」那步失败留下的错序（兜底排在用户规则中间）：
+    /// 内容一模一样，但 Xray 首条匹配会把后面那些用户吃到兜底槽。差分必须看见这个差异，
+    /// 把兜底挪回表尾，而且**不重启** xray。
+    #[tokio::test]
+    async fn a_fallback_stuck_in_the_middle_is_moved_back_to_the_tail() {
+        let d = tempfile::tempdir().unwrap();
+        let (store, bus) = store_with(d.path(), 2, 2).await;
+        let (ctx, host) = ctx_of(d.path(), store, bus).await;
+        migrate_on_start(&ctx.store, &ctx.bus).await.unwrap();
+        mark_xray_rules_dirty(&ctx.runtime).await;
+        let x = FakeXray::new();
+        // 期望态的全部规则都在表里，只是兜底被塞在了第一条（内容一致、顺序错）
+        let want = want_rules(&ctx).await;
+        let mut live = vec![want.last().unwrap().clone()];
+        live.extend(want.iter().take(want.len() - 1).cloned());
+        x.with(|i| i.rules = live);
+
+        assert!(matches!(
+            converge_xray(&ctx, &x).await,
+            ConvergeOutcome::Applied(_)
+        ));
+        assert_eq!(
+            x.calls(),
+            vec![
+                "list-rules".to_string(),
+                "remove-rule:resi-fallback".to_string(),
+                "add-rule:resi-fallback:relay-slot-0".to_string(),
+            ],
+            "只挪兜底，用户规则一条都不碰"
+        );
+        assert_same_rules(&x.rules(), &want);
+        assert_eq!(restarts_of_xray(&host), 0, "{:?}", host.ops());
+        // 收敛之后才记哈希：再置脏一轮就什么都不发了
+        x.clear_calls();
+        mark_xray_rules_dirty(&ctx.runtime).await;
+        assert_eq!(converge_xray(&ctx, &x).await, ConvergeOutcome::Clean);
+        assert_eq!(x.calls(), Vec::<String>::new());
     }
 
     /// 删用户只发一次 `RemoveRule`，连兜底都不用动（删规则不会打乱顺序）。
