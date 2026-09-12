@@ -34,10 +34,12 @@ pub fn upstream_url(raw: &str) -> Result<UpstreamInput, ParseError> {
     //   写了 scheme → 按 URL 语义，先试 user:pass@host:port（以最后一个 @ 切分）
     let csv = csv_form(s);
     let at = at_form(s);
-    let (host, port, username, password) = match csv {
-        Some(v) if kind.is_none() || at.is_none() => v,
+    // decode = 走的是 URL 形态（写了 scheme 且按 user:pass@host:port 切开），
+    // 此时 userinfo 按 RFC 3986 是百分号编码的；两种粘贴形态原样不解码
+    let ((host, port, username, password), decode) = match csv {
+        Some(v) if kind.is_none() || at.is_none() => (v, false),
         _ => match at {
-            Some(v) => v,
+            Some(v) => (v, kind.is_some()),
             None => return Err(ParseError::Format),
         },
     };
@@ -45,14 +47,35 @@ pub fn upstream_url(raw: &str) -> Result<UpstreamInput, ParseError> {
     if host.is_empty() || username.is_empty() || password.is_empty() {
         return Err(ParseError::Other("解析结果包含空字段".into()));
     }
+    let (username, password) = if decode {
+        (percent_decode(username), percent_decode(password))
+    } else {
+        (username.to_string(), password.to_string())
+    };
+    // `%0A` 解出来就是换行，上面那次检查挡不住，解码后再挡一次
+    if [&username, &password]
+        .iter()
+        .any(|v| v.contains('\n') || v.contains('\r'))
+    {
+        return Err(ParseError::Other("凭据含换行符，非法".into()));
+    }
 
     Ok(UpstreamInput {
         kind,
         host: host.to_string(),
         port: parse_port(port)?,
-        username: username.to_string(),
-        password: password.to_string(),
+        username,
+        password,
     })
+}
+
+/// userinfo 百分号解码：没有 `%XX` 序列时原样返回（孤立的 `%` 也原样，
+/// `percent_decode_str` 对非法序列就是照抄），解不出 UTF-8 时退回原串。
+fn percent_decode(s: &str) -> String {
+    percent_encoding::percent_decode_str(s)
+        .decode_utf8()
+        .map(|c| c.into_owned())
+        .unwrap_or_else(|_| s.to_string())
 }
 
 /// 去掉成对的首尾引号。
@@ -229,5 +252,46 @@ mod tests {
     #[test]
     fn rejects_newline_in_credentials() {
         assert!(upstream_url("socks5://u:p\nq@h:1").is_err());
+    }
+
+    /// URL 形态的 userinfo 按 percent-encoding 解码：密码里的 `=` 必须写成 `%3D`，
+    /// 不解码就会拿着字面量 `%3D` 去认证，上游回「incorrect user name or password」。
+    #[test]
+    fn url_form_percent_decodes_userinfo() {
+        let u = upstream_url("socks5://u:p%3D@h:1080").unwrap();
+        assert_eq!(u.password, "p=");
+        let u = upstream_url("http://u:p%40x@h:1080").unwrap();
+        assert_eq!(u.kind, Some(UpstreamKind::Http));
+        assert_eq!(u.host, "h");
+        assert_eq!(u.password, "p@x");
+        // 用户名同样解码
+        let u = upstream_url("socks5h://user%2Dname:p@h:1").unwrap();
+        assert_eq!(u.username, "user-name");
+    }
+
+    /// 已存凭据不受影响：没有 `%XX` 序列时原样，孤立的 `%` 也原样（不报错、不吞字符）。
+    #[test]
+    fn percent_decoding_leaves_existing_credentials_alone() {
+        let u = upstream_url("socks5://user-x-ip-1.2.3.4:+bz/x@isp.example:10007").unwrap();
+        assert_eq!(u.username, "user-x-ip-1.2.3.4");
+        assert_eq!(u.password, "+bz/x");
+        let u = upstream_url("socks5://u:100%pw@h:1").unwrap();
+        assert_eq!(u.password, "100%pw");
+    }
+
+    /// 两种非 URL 粘贴格式（供应商整行 / 无 scheme）原样不解码：那里的 `%` 是密码本身。
+    #[test]
+    fn paste_forms_are_not_percent_decoded() {
+        let u = upstream_url("h:1084:u:p%3Dx").unwrap();
+        assert_eq!(u.password, "p%3Dx");
+        let u = upstream_url("u:p%3Dx@h:1080").unwrap();
+        assert_eq!(u.password, "p%3Dx");
+    }
+
+    /// `%0A` 解出来是换行：解码后要再挡一次，否则 R3 的换行拒绝被绕开。
+    #[test]
+    fn rejects_percent_encoded_newline() {
+        assert!(upstream_url("socks5://u:p%0Aq@h:1").is_err());
+        assert!(upstream_url("socks5://u%0D:p@h:1").is_err());
     }
 }

@@ -68,10 +68,16 @@ pub fn config(g: &ResidentialGroup, opts: &RelayOpts) -> Value {
             route_rules.push(json!({ "port_range": ranges, "outbound": "direct" }));
         }
     }
-    // 住宅上游基本不支持 UDP ASSOCIATE：DNS 直连、QUIC 拒绝（浏览器回退 TCP 走住宅）、其余 UDP 直连
+    // 客户端的明文 DNS 一律由本机解析（与 dns 段的 dns_direct 同语义），行为不随池类型变
     route_rules.push(json!({ "network": "udp", "port": 53, "outbound": "direct" }));
-    route_rules.push(json!({ "network": "udp", "port": 443, "action": "reject" }));
-    route_rules.push(json!({ "network": "udp", "outbound": "direct" }));
+    // 池里混有 http 上游（sing-box 的 http 出站没有 UDP 能力，selector 选到它会报错）时，
+    // 沿用 v3 的降级：QUIC 拒绝（浏览器回退 TCP 走住宅）、其余 UDP 直连。
+    // 全 socks5 池则什么都不拦，UDP 跟 TCP 一样交给 route.final / 关键字规则走住宅
+    // （否则 UDP 应用永远暴露 VPS 自身 IP）。判据见 [`ResidentialGroup::udp_via_pool`]。
+    if !g.udp_via_pool() {
+        route_rules.push(json!({ "network": "udp", "port": 443, "action": "reject" }));
+        route_rules.push(json!({ "network": "udp", "outbound": "direct" }));
+    }
     let mut ip_cidr: Vec<String> = PRIVATE_CIDRS.iter().map(|c| c.to_string()).collect();
     if let Some(ip) = &opts.server_ip {
         ip_cidr.push(format!("{ip}/32"));

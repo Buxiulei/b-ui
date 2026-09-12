@@ -1,7 +1,7 @@
 //! relay（sing-box 本地中继）配置渲染：规则顺序、黑名单、端口白名单、fail-open，并用真实内核校验。
 mod common;
 
-use bui_schema::model::{Pin, Rule};
+use bui_schema::model::{Pin, Rule, UpstreamKind};
 use bui_schema::render::relay::{self, RelayOpts};
 
 fn opts() -> RelayOpts {
@@ -127,6 +127,86 @@ fn relay_blacklist_takes_pins_and_selected_upstream_auto_only() {
         .unwrap()
         .contains("other.example.net"));
     common::check_singbox(&cfg);
+}
+
+/// 全 socks5 池：UDP ASSOCIATE 可用（2026-09-12 实测 Decodo ISP，QUIC 握手双向 1200 字节通），
+/// 所以只保留 UDP/53 直连，其余 UDP 交给 `route.final`（global 时 = resi-pool）。
+#[test]
+fn relay_all_socks5_pool_lets_udp_reach_the_pool() {
+    let s = common::state("global");
+    let mut g = s.residential.default_group().unwrap().clone();
+    for u in &mut g.upstreams {
+        u.kind = UpstreamKind::Socks5;
+    }
+    let cfg = relay::config(&g, &opts());
+    let rules = cfg["route"]["rules"].as_array().unwrap();
+    assert!(
+        udp_dns_direct(rules),
+        "客户端明文 DNS 仍由本机解析：{rules:#?}"
+    );
+    assert!(
+        !rules
+            .iter()
+            .any(|r| r["network"] == "udp" && r["port"] == 443),
+        "UDP/443 不再 reject：{rules:#?}"
+    );
+    assert!(
+        !udp_catch_all_direct(rules),
+        "「其余 UDP 直连」那条要删掉（否则 UDP 永远暴露 VPS 自身 IP）：{rules:#?}"
+    );
+    assert_eq!(cfg["route"]["final"], "resi-pool");
+    common::check_singbox_all(&cfg);
+}
+
+/// 混合池（fixture 自带 http + socks5）：http 出站没有 UDP 能力，规则保持 v3 三条。
+#[test]
+fn relay_mixed_pool_keeps_the_three_udp_rules() {
+    let s = common::state("global");
+    let g = s.residential.default_group().unwrap().clone();
+    assert!(g.upstreams.iter().any(|u| u.kind == UpstreamKind::Http));
+    assert!(g.upstreams.iter().any(|u| u.kind == UpstreamKind::Socks5));
+    let cfg = relay::config(&g, &opts());
+    let rules = cfg["route"]["rules"].as_array().unwrap();
+    assert!(udp_dns_direct(rules));
+    assert!(rules
+        .iter()
+        .any(|r| r["network"] == "udp" && r["port"] == 443 && r["action"] == "reject"));
+    assert!(udp_catch_all_direct(rules));
+    common::check_singbox_all(&cfg);
+}
+
+/// 全 http 池：同上，三条规则一条不少。
+#[test]
+fn relay_all_http_pool_keeps_the_three_udp_rules() {
+    let s = common::state("split");
+    let mut g = s.residential.default_group().unwrap().clone();
+    for u in &mut g.upstreams {
+        u.kind = UpstreamKind::Http;
+    }
+    let cfg = relay::config(&g, &opts());
+    let rules = cfg["route"]["rules"].as_array().unwrap();
+    assert!(udp_dns_direct(rules));
+    assert!(rules
+        .iter()
+        .any(|r| r["network"] == "udp" && r["port"] == 443 && r["action"] == "reject"));
+    assert!(udp_catch_all_direct(rules));
+    common::check_singbox_all(&cfg);
+}
+
+fn udp_dns_direct(rules: &[serde_json::Value]) -> bool {
+    rules
+        .iter()
+        .any(|r| r["network"] == "udp" && r["port"] == 53 && r["outbound"] == "direct")
+}
+
+/// 「其余 UDP 一律直连」= 只带 `network: udp` 的那条兜底规则
+fn udp_catch_all_direct(rules: &[serde_json::Value]) -> bool {
+    rules.iter().any(|r| {
+        r["network"] == "udp"
+            && r["outbound"] == "direct"
+            && r.get("port").is_none()
+            && r.get("port_range").is_none()
+    })
 }
 
 #[test]

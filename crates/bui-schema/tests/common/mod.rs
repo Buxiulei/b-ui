@@ -48,20 +48,37 @@ pub fn have(bin: &str) -> bool {
 
 /// 用真实 sing-box 校验一份配置；二进制缺失时跳过。
 pub fn check_singbox(cfg: &serde_json::Value) {
-    if !have("sing-box") {
-        eprintln!("skipped: sing-box not found");
+    check_singbox_with("sing-box", cfg);
+}
+
+/// 订阅与 relay 配置要同时在 sing-box 1.12 / 1.13 / 1.14 上过 check（v2rayN 7.25 封顶 1.14）。
+/// 除默认的 `sing-box` 外，另跑 PATH 上的 `sing-box-1.12` / `-1.13` / `-1.14`，缺哪版跳哪版。
+pub fn check_singbox_all(cfg: &serde_json::Value) {
+    for bin in [
+        "sing-box",
+        "sing-box-1.12",
+        "sing-box-1.13",
+        "sing-box-1.14",
+    ] {
+        check_singbox_with(bin, cfg);
+    }
+}
+
+fn check_singbox_with(bin: &str, cfg: &serde_json::Value) {
+    if !have(bin) {
+        eprintln!("skipped: {bin} not found");
         return;
     }
     let f = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(f.path(), serde_json::to_vec_pretty(cfg).unwrap()).unwrap();
-    let out = std::process::Command::new("sing-box")
+    let out = std::process::Command::new(bin)
         .args(["check", "-c"])
         .arg(f.path())
         .output()
         .unwrap();
     assert!(
         out.status.success(),
-        "{}",
+        "{bin}: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 }
