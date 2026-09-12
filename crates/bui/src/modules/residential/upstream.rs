@@ -271,17 +271,22 @@ pub async fn add(
         .collect::<Vec<_>>()
         .join(" ");
     let up2 = up.clone();
-    state::update_group(&ctx.store, &ctx.bus, move |g| {
-        // 同 host:port 视为同一上游，覆盖（v3 add_url_to_config 的 map(select(…)) 同语义）
-        g.upstreams
-            .retain(|u| !(u.host == up2.host && u.port == up2.port));
-        g.upstreams.push(up2);
-        renumber(&mut g.upstreams);
-        g.enabled = true;
-        if g.selected_upstream_id.is_none() {
-            g.selected_upstream_id = g.upstreams.first().map(|u| u.id);
-        }
-    })
+    let _sync = crate::modules::residential::slots::update_group_slots_as(
+        &ctx.store,
+        &ctx.bus,
+        crate::state::store::CALLER_UNLABELED,
+        move |g| {
+            // 同 host:port 视为同一上游，覆盖（v3 add_url_to_config 的 map(select(…)) 同语义）
+            g.upstreams
+                .retain(|u| !(u.host == up2.host && u.port == up2.port));
+            g.upstreams.push(up2);
+            renumber(&mut g.upstreams);
+            g.enabled = true;
+            if g.selected_upstream_id.is_none() {
+                g.selected_upstream_id = g.upstreams.first().map(|u| u.id);
+            }
+        },
+    )
     .await?;
     let added = state::group_of(&*ctx.store.read().await)
         .upstreams
@@ -319,7 +324,7 @@ pub async fn remove(ctx: &DaemonCtx, sel: &UpstreamSel) -> Result<(), UpstreamEr
         upstream = %target.name, id = %id, endpoint = %format!("{}:{}", target.host, target.port),
         "删除住宅上游"
     );
-    state::update_group_as(
+    let sync = crate::modules::residential::slots::update_group_slots_as(
         &ctx.store,
         &ctx.bus,
         crate::state::store::CALLER_RESI_REMOVE,
@@ -339,6 +344,13 @@ pub async fn remove(ctx: &DaemonCtx, sel: &UpstreamSel) -> Result<(), UpstreamEr
         },
     )
     .await?;
+    if !sync.released.is_empty() {
+        tracing::info!(
+            released = ?sync.released.iter().map(|s| s.index).collect::<Vec<_>>(),
+            reassigned = sync.reassigned,
+            "释放槽位并重新分配其用户（spec §5.6 规则 2）"
+        );
+    }
     state::update(&ctx.runtime, |r| {
         r.checks.remove(&id.to_string());
         r.candidates.retain(|_, c| c.upstream_id != id);
@@ -357,6 +369,10 @@ pub async fn remove(ctx: &DaemonCtx, sel: &UpstreamSel) -> Result<(), UpstreamEr
         if r.manual_selected_id == Some(id) {
             r.manual_selected_id = None;
         }
+        // 槽位的运行时状态跟着槽走：留着会让面板显示一条指向已删上游的「借用中」
+        r.slots
+            .retain(|_, v| v.current_upstream_id != Some(id) && v.pinned_upstream_id != Some(id));
+        r.xray_slot_rules_dirty = true;
     })
     .await;
     Ok(())

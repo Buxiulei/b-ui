@@ -17,6 +17,7 @@ pub mod cli;
 pub mod health;
 pub mod journal;
 pub mod proxy;
+pub mod slots;
 pub mod state;
 pub mod upstream;
 

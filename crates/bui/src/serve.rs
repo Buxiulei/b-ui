@@ -426,6 +426,11 @@ pub async fn run(paths: Paths, host: Arc<dyn Host>) -> anyhow::Result<()> {
         .update(|r| r.started_at = Some(crate::util::fmt_rfc3339(host.now())))
         .await;
     let app = crate::api::router(app_state, &mods);
+    // spec §5.6 规则 4：旧 state 没有 slots 字段时补齐，既有住宅用户按创建时间轮流落槽。
+    // 幂等，所以每次启动无条件跑一次；失败只告警（对账仍能按单槽视图渲染，行为退回 v3）。
+    if let Err(e) = crate::modules::residential::slots::migrate_on_start(&ctx.store, &bus).await {
+        tracing::warn!(error = %e, "住宅槽位迁移失败，本次启动按单槽渲染");
+    }
     // 启动时先对账一次，再拉起后台任务
     match reconcile_from_ctx(&ctx, &mods, fetcher.clone(), false, false).await {
         Ok(r) => {
