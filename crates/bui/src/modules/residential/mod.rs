@@ -47,6 +47,16 @@ pub const HEALTH_PROBE_URL: &str = "https://www.gstatic.com/generate_204";
 /// 那一步只要 host，不要 URL
 pub const HEALTH_PROBE_HOST: &str = "www.gstatic.com";
 pub const HEALTH_TRIES: u32 = 2;
+/// Google 可达性探测（主理人硬要求「住宅上游不封 Google」，R2 ②）：巡检每轮每成员
+/// 多打这一次，体检也带这一项。**必须打真实搜索路径**：Bright Data 这类上游对 serp
+/// 域名整域硬拒（`403 Forbidden serp domain`），只探首页看不出来。
+pub const GOOGLE_PROBE_URL: &str = "https://www.google.com/search?q=weather";
+/// 浏览器 UA：无 UA / 脚本 UA 会被 Google 自己判机器人（回 `/sorry/`），
+/// 那测出来的是「我们像机器人」，不是「这条上游封了 Google」
+pub const GOOGLE_PROBE_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+     (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+/// Google 探测的硬超时：比 [`PROBE_TIMEOUT_SECS`] 短，一轮巡检多这一次请求不能拖垮整轮
+pub const GOOGLE_PROBE_TIMEOUT_SECS: u64 = 8;
 /// 迟滞：连续 2 轮不达标 → 不健康；连续 2 轮达标 → 恢复（spec §5.3）
 pub const FAIL_TO_UNHEALTHY: u32 = 2;
 pub const OK_TO_HEALTHY: u32 = 2;
@@ -355,6 +365,15 @@ mod tests {
         // confirm_auth_failure）拿它们去开隧道，写歪了就补判到别的站点上去了
         assert!(HEALTH_PROBE_URL.starts_with(&format!("https://{HEALTH_PROBE_HOST}/")));
         assert_eq!(EXIT_IP_URL, format!("https://{EXIT_IP_HOST}"));
+        // R2 ②：打真实搜索路径（首页看不出 serp 整域硬拒），UA 得像浏览器
+        assert_eq!(GOOGLE_PROBE_URL, "https://www.google.com/search?q=weather");
+        assert!(GOOGLE_PROBE_UA.starts_with("Mozilla/5.0 "));
+        // 巡检每轮每成员多这一次请求，所以超时要比普通探测短
+        assert_eq!(
+            (GOOGLE_PROBE_TIMEOUT_SECS, PROBE_TIMEOUT_SECS),
+            (8, 10),
+            "Google 探测的超时必须短于普通探测"
+        );
     }
 
     #[test]

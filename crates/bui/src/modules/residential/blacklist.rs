@@ -713,6 +713,12 @@ mod tests {
                 body: String::new(),
             })
         }
+        fn google_search(&self, _u: &Upstream) -> Result<HttpProbe, ProbeError> {
+            Ok(HttpProbe {
+                status: 200,
+                body: "<html>weather results".into(),
+            })
+        }
         fn udp_associate(&self, _u: &Upstream) -> Result<bool, ProbeError> {
             Ok(true)
         }

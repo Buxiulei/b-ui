@@ -41,8 +41,12 @@ pub enum ResidentialCmd {
         #[arg(long)]
         id: Option<Uuid>,
     },
-    /// 手动切换当前出口
-    Select { id: Uuid },
+    /// 手动切换当前出口（锁定到它不健康为止）；`--auto` 解除锁定回到自动选路
+    Select {
+        id: Option<Uuid>,
+        #[arg(long)]
+        auto: bool,
+    },
     /// 巡检与出口画像
     Health {
         #[arg(long)]
@@ -127,11 +131,19 @@ pub fn to_request(
                 None => serde_json::json!({}),
             }),
         ),
-        C::Select { id } => (
-            "POST",
-            "/api/residential/select".into(),
-            Some(serde_json::json!({"id": id})),
-        ),
+        C::Select { id, auto } => {
+            // 两种形态互斥：`select <id>` 锁定，`select --auto` 解锁
+            anyhow::ensure!(
+                !(*auto && id.is_some()),
+                "select 只能二选一：<id>（手动锁定）或 --auto（解除锁定）"
+            );
+            let body = match (auto, id) {
+                (true, _) => serde_json::json!({"auto": true}),
+                (false, Some(id)) => serde_json::json!({"id": id}),
+                (false, None) => anyhow::bail!("select 要么给 <id>，要么给 --auto"),
+            };
+            ("POST", "/api/residential/select".into(), Some(body))
+        }
         C::Blacklist { cmd } => return blacklist_request(cmd),
     })
 }
@@ -200,6 +212,15 @@ fn as_arr<'a>(v: &'a serde_json::Value, k: &str) -> &'a [serde_json::Value] {
         .unwrap_or(&[])
 }
 
+/// `google_ok` 的人类可读形态（`null` = 还没探到结论，R2 ②）
+fn google_label(v: &serde_json::Value) -> &'static str {
+    match v.get("google_ok").and_then(|x| x.as_bool()) {
+        Some(true) => "Google 通",
+        Some(false) => "Google 封",
+        None => "Google 未知",
+    }
+}
+
 /// 百分比（`success_rate_24h` 是 0.0–1.0）
 fn pct(v: &serde_json::Value, k: &str) -> i64 {
     (v.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0) * 100.0).round() as i64
@@ -241,16 +262,24 @@ pub fn format_status(v: &serde_json::Value) -> String {
         out.push("  自动切换后的落点尚未持久化，将在每日 04:00 写回".to_string());
     }
     let urls = as_arr(v, "urls");
+    // Google 判定在 v4 追加的 `upstreams[]` 里（`urls[]` 是 v3 契约），按 id 对上
+    let ups = as_arr(v, "upstreams");
     out.push(format!("上游 {} 条：", urls.len()));
     for u in urls {
+        let row = ups
+            .iter()
+            .find(|x| x.get("id") == u.get("id"))
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
         out.push(format!(
-            "  - {} [{}] {}:{} 出口 {} 优先级 {} {}",
+            "  - {} [{}] {}:{} 出口 {} 优先级 {} {} {}",
             as_str(u, "name"),
             as_str(u, "type"),
             as_str(u, "host"),
             as_u64(u, "port"),
             as_str(u, "lastVerifiedIp"),
             as_u64(u, "priority"),
+            google_label(&row),
             as_str(u, "displayUrl"),
         ));
     }
@@ -298,17 +327,20 @@ pub fn format_health(v: &serde_json::Value) -> String {
         let tag = as_str(m, "tag");
         let e = m.get("egress").cloned().unwrap_or(serde_json::json!({}));
         out.push(format!(
-            "{} {} [{}] {}:{} {} 连续成功 {} / 连续失败 {} 24h 成功率 {}% 优先级 {} 出口 {}（{}，{}）黑名单 {} 条",
+            "{} {} [{}] {}:{} {}{} 连续成功 {} / 连续失败 {} 24h 成功率 {}% 优先级 {} {} 出口 {}（{}，{}）黑名单 {} 条",
             if tag == selected { "*" } else { " " },
             tag,
             as_str(m, "type"),
             as_str(m, "host"),
             as_u64(m, "port"),
             if as_bool(m, "active") { "健康" } else { "不健康" },
+            // 手动锁定：巡检不会按 priority 把它切走（R2 ①）
+            if as_bool(m, "manual_locked") { "（手动锁定）" } else { "" },
             as_u64(m, "okstreak"),
             as_u64(m, "failstreak"),
             pct(m, "success_rate_24h"),
             as_u64(m, "priority"),
+            google_label(m),
             as_str(&e, "ip"),
             as_str(&e, "type"),
             as_str(&e, "isp"),
@@ -523,12 +555,23 @@ pub async fn menu(socket: PathBuf) -> anyhow::Result<()> {
             }
             "4" => ResidentialCmd::Check { id: None },
             "5" => {
-                let raw = prompt("切换到哪个上游（<id>，见「住宅池状态」）: ")?;
-                match Uuid::parse_str(&raw) {
-                    Ok(id) => ResidentialCmd::Select { id },
-                    Err(e) => {
-                        println!("不是合法的上游 id：{e}");
-                        continue;
+                let raw =
+                    prompt("切换到哪个上游（<id>，见「住宅池状态」；auto = 解除手动锁定）: ")?;
+                if raw == "auto" {
+                    ResidentialCmd::Select {
+                        id: None,
+                        auto: true,
+                    }
+                } else {
+                    match Uuid::parse_str(&raw) {
+                        Ok(id) => ResidentialCmd::Select {
+                            id: Some(id),
+                            auto: false,
+                        },
+                        Err(e) => {
+                            println!("不是合法的上游 id：{e}");
+                            continue;
+                        }
                     }
                 }
             }
@@ -662,11 +705,26 @@ mod tests {
                 ),
             ),
             (
-                ResidentialCmd::Select { id },
+                ResidentialCmd::Select {
+                    id: Some(id),
+                    auto: false,
+                },
                 (
                     "POST",
                     "/api/residential/select",
                     Some(serde_json::json!({"id": id})),
+                ),
+            ),
+            (
+                // `--auto` = 解除手动锁定，回到自动选路（R2 ①）
+                ResidentialCmd::Select {
+                    id: None,
+                    auto: true,
+                },
+                (
+                    "POST",
+                    "/api/residential/select",
+                    Some(serde_json::json!({"auto": true})),
                 ),
             ),
             (
@@ -718,6 +776,12 @@ mod tests {
             blacklist_request(&BlacklistCmd::Apply).unwrap(),
             ("POST", "/api/residential/blacklist/apply".to_string(), None)
         );
+        // select 既没 id 也没 --auto ⇒ CLI 侧就挡掉
+        assert!(to_request(&ResidentialCmd::Select {
+            id: None,
+            auto: false
+        })
+        .is_err());
         // 非法 kind 在 CLI 侧就挡掉，不必往服务端跑一趟
         assert!(blacklist_request(&BlacklistCmd::Pin {
             value: ".*".into(),
@@ -757,8 +821,9 @@ mod tests {
         let v = serde_json::json!({
             "enabled": true, "global": true,
             "urls": [{"host": "isp.example.net", "port": 10007, "name": "url-1", "type": "http",
-                      "username": "user1", "lastVerifiedIp": "198.51.100.7",
+                      "username": "user1", "lastVerifiedIp": "198.51.100.7", "id": "u-1",
                       "displayUrl": "http://us***@isp.example.net:10007"}],
+            "upstreams": [{"id": "u-1", "google_ok": false}],
             "domains": ["openai.com"], "domainsFollowDefault": true,
             "active_tag": "resi-1", "active_upstream_id": "8d5a1a1e-3b2c-4d1e-9f00-0000000000bb",
             "selected_pending_persist": false,
@@ -773,12 +838,17 @@ mod tests {
         assert!(out.contains("跟随默认"));
         assert!(out.contains("resi-1"));
         assert!(out.contains("全部住宅上游探测不达标"));
+        assert!(
+            out.contains("Google 封"),
+            "封 Google 的上游要在 status 里看得见：{out}"
+        );
         assert!(!out.contains("pw1"), "凭据绝不进 CLI 输出");
         let h = serde_json::json!({
             "enabled": true, "mode": "selector", "selected": "resi-1", "domains_count": 67,
             "members": [{"tag": "resi-1", "type": "http", "host": "isp.example.net", "port": 10007,
                          "active": true, "failstreak": 0, "okstreak": 3, "priority": 10,
                          "success_rate_24h": 0.97, "blacklist_count": 2,
+                         "manual_locked": true, "google_ok": true,
                          "egress": {"ip": "198.51.100.7", "type": "家庭宽带 IP", "isp": "AS33667 Comcast"}}],
             "current_egress_ip_test": "198.51.100.7", "egress_ip_type": "家庭宽带 IP", "alerts": []
         });
@@ -786,6 +856,8 @@ mod tests {
         assert!(out.contains("resi-1"));
         assert!(out.contains("家庭宽带 IP"));
         assert!(out.contains("97"), "成功率按百分比显示：{out}");
+        assert!(out.contains("Google 通"), "{out}");
+        assert!(out.contains("手动锁定"), "{out}");
         let b = serde_json::json!({
             "pins": [{"kind": "domain_suffix", "value": "pay.google.com", "note": "", "created_at": "2026-09-12T00:00:00Z"}],
             "auto": [{"upstream_id": "00000000-0000-0000-0000-000000000001", "upstream_name": "url-1",
@@ -865,5 +937,29 @@ mod tests {
         );
         // global 只认 on/off
         assert!(crate::cli::Cli::try_parse_from(["bui", "residential", "global", "yes"]).is_err());
+        // select 的两种形态：<id> 与 --auto
+        assert_eq!(
+            crate::cli::Cli::try_parse_from(["bui", "residential", "select", "--auto"])
+                .unwrap()
+                .command,
+            Some(crate::cli::Command::Residential {
+                cmd: ResidentialCmd::Select {
+                    id: None,
+                    auto: true
+                }
+            })
+        );
+        let id = Uuid::from_u128(7);
+        assert_eq!(
+            crate::cli::Cli::try_parse_from(["bui", "residential", "select", &id.to_string()])
+                .unwrap()
+                .command,
+            Some(crate::cli::Command::Residential {
+                cmd: ResidentialCmd::Select {
+                    id: Some(id),
+                    auto: false
+                }
+            })
+        );
     }
 }

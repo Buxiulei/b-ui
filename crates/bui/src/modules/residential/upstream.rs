@@ -286,6 +286,10 @@ pub async fn remove(ctx: &DaemonCtx, sel: &UpstreamSel) -> Result<(), UpstreamEr
             r.selected_upstream_id = None;
             r.selected_pending_persist = false;
         }
+        // 手动锁定也跟着清：留着会让面板显示一条锁在「已移除」上游上的锁定（R2 ①）
+        if r.manual_selected_id == Some(id) {
+            r.manual_selected_id = None;
+        }
     })
     .await;
     Ok(())

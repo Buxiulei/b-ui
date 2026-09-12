@@ -26,6 +26,10 @@ pub struct ResiRuntime {
     pub health: BTreeMap<String, HealthState>,
     /// 当前实际生效的上游（Clash API 真源快照；tag 由 `clash::tag_of` 现算，契约决策 §C）
     pub selected_upstream_id: Option<Uuid>,
+    /// 管理员**手动锁定**的上游（`POST /api/residential/select`）：只要它还健康，巡检就
+    /// 不按 priority / Google 排序把它切走（R2 ①）。它变不健康时由巡检清空并自动切换；
+    /// `POST /api/residential/select {"auto":true}` 也能主动解锁
+    pub manual_selected_id: Option<Uuid>,
     pub last_switch_at: Option<String>,
     /// `state.selected_upstream_id` 与 `selected_upstream_id` 已漂移，等下一个 04:00 窗口写回
     pub selected_pending_persist: bool,
@@ -56,6 +60,11 @@ pub struct HealthState {
     pub okstreak: u32,
     pub failstreak: u32,
     pub samples: Vec<ProbeSample>,
+    /// 最近一次**探到结论**的 Google 可达性（`None` = 还没探到）。参与选路：
+    /// [`super::health::pick_target`] 把「Google 通」排在 `priority` 之前（R2 ②）
+    pub google_ok: Option<bool>,
+    /// 上一行那个结论是什么时候的（面板显示用）
+    pub google_at: Option<String>,
 }
 
 impl Default for HealthState {
@@ -66,6 +75,9 @@ impl Default for HealthState {
             okstreak: 0,
             failstreak: 0,
             samples: Vec::new(),
+            // Google 可达性没有「默认通」：没探过就是未知，别让它凭空赢过探过的成员
+            google_ok: None,
+            google_at: None,
         }
     }
 }
@@ -233,6 +245,15 @@ pub fn record_probe(h: &mut HealthState, ok: bool, now: OffsetDateTime) {
     }
 }
 
+/// 记一次 Google 可达性判定（R2 ②）。`None` = 本轮没探到结论 ⇒ **不动**上次的结论：
+/// 这一项参与选路，一次超时把「通」翻成「封」就会把好上游踢到队尾。
+pub fn record_google(h: &mut HealthState, ok: Option<bool>, now: OffsetDateTime) {
+    if let Some(ok) = ok {
+        h.google_ok = Some(ok);
+        h.google_at = Some(fmt_rfc3339(now));
+    }
+}
+
 /// 近 24h 成功率；无样本返回 0.0（「没数据」不该赢过「有数据且全成功」）
 pub fn success_rate_24h(h: &HealthState, now: OffsetDateTime) -> f64 {
     let cutoff = now - time::Duration::seconds(RATE_WINDOW_SECS);
@@ -350,6 +371,34 @@ mod tests {
             raw.get("restart_keys").is_some(),
             "P1 自己的字段不被本模块碰掉"
         );
+    }
+
+    #[test]
+    fn a_google_verdict_is_only_overwritten_by_a_conclusive_round() {
+        let mut h = HealthState::default();
+        assert_eq!(h.google_ok, None, "没探过就是未知");
+        record_google(&mut h, Some(true), t0());
+        assert_eq!(h.google_ok, Some(true));
+        assert_eq!(h.google_at.as_deref(), Some("2026-09-12T00:00:00Z"));
+        // 一轮没探到结论（超时 / 407）不该把「通」翻成「封」：它参与选路
+        record_google(&mut h, None, t0() + time::Duration::hours(1));
+        assert_eq!(h.google_ok, Some(true));
+        assert_eq!(h.google_at.as_deref(), Some("2026-09-12T00:00:00Z"));
+        record_google(&mut h, Some(false), t0() + time::Duration::hours(2));
+        assert_eq!(h.google_ok, Some(false));
+        assert_eq!(h.google_at.as_deref(), Some("2026-09-12T02:00:00Z"));
+    }
+
+    #[tokio::test]
+    async fn the_manual_lock_round_trips_through_the_extra_map() {
+        let d = tempfile::tempdir().unwrap();
+        let runtime = Runtime::load(d.path().join("runtime.json"));
+        let id = Uuid::from_u128(3);
+        update(&runtime, |r| r.manual_selected_id = Some(id)).await;
+        assert_eq!(read(&runtime).await.manual_selected_id, Some(id));
+        // 重启也要记得锁定（runtime.json 落盘）
+        let again = Runtime::load(d.path().join("runtime.json"));
+        assert_eq!(read(&again).await.manual_selected_id, Some(id));
     }
 
     #[tokio::test]

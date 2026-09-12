@@ -57,6 +57,11 @@ pub trait Prober: Send + Sync + 'static {
     fn connect(&self, up: &Upstream, host: &str, port: u16) -> ConnectVerdict;
     /// 经上游发一次 HTTPS GET
     fn get(&self, up: &Upstream, url: &str) -> Result<HttpProbe, ProbeError>;
+    /// 经上游发一次**浏览器式**的 Google 搜索 GET（[`super::GOOGLE_PROBE_URL`]，
+    /// 带 [`super::GOOGLE_PROBE_UA`]、超时 [`super::GOOGLE_PROBE_TIMEOUT_SECS`]）。
+    /// 单独一个方法而不是复用 [`Prober::get`]：判据要的是「真人搜索能不能用」，
+    /// 没有浏览器 UA 时 Google 会直接回 `/sorry/`，那会把「上游没封」误判成「封了」。
+    fn google_search(&self, up: &Upstream) -> Result<HttpProbe, ProbeError>;
     /// 经上游做一次 SOCKS5 UDP ASSOCIATE；HTTP 上游一律 `Ok(false)`（协议里没这回事）
     fn udp_associate(&self, up: &Upstream) -> Result<bool, ProbeError>;
     /// **不经上游**的直连 TCP 对照（黑名单确认的第二条件：直连同目标可达）
@@ -134,6 +139,29 @@ pub fn looks_like_proxy_auth(msg: &str) -> bool {
     let m = msg.to_ascii_lowercase();
     // reqwest / hyper 在 CONNECT 阶段拿到 407 时，错误链里带的是状态行或这句标准原因短语
     m.contains("407") || m.contains("proxy authentication")
+}
+
+/// Google 搜索页的 GET 结果 →「经这条上游还能不能正常用 Google 搜索」。
+/// **唯一**一份判据：巡检（[`super::health::probe_member`]）与体检（[`super::check::run`]）
+/// 都调它。`None` = 本轮没探到结论 —— 这一项参与选路（spec R2 ②），把一次抖动记成
+/// 「封了」会把好上游踢到队尾，所以宁可不下结论。
+pub fn google_ok_of(r: &Result<HttpProbe, ProbeError>) -> Option<bool> {
+    let Ok(hp) = r else {
+        // 超时 / 连不上 / 407：说明不了 Google 的事
+        return None;
+    };
+    // 调研 §D 的 Bright Data 形态：对 serp 域名整域硬拒（`403 Forbidden serp domain`）；
+    // Google 自己判机器人时回 429
+    if matches!(hp.status, 403 | 429) {
+        return Some(false);
+    }
+    let b = hp.body.to_ascii_lowercase();
+    // 200 也可能是拦截页：`/sorry/` 跳转页与「unusual traffic」提示都是被判机器人
+    if b.contains("unusual traffic") || b.contains("/sorry/") {
+        return Some(false);
+    }
+    // 其余 4xx/5xx 是上游或站点自己的毛病，不算「Google 被封」
+    (hp.status < 400).then_some(true)
 }
 
 /// `get` 失败后的**补判**：经该上游对 `host:443` 自写一次 CONNECT / SOCKS5 握手，
@@ -216,6 +244,24 @@ impl ReqwestProber {
         socks5_request(&mut s, &req)
     }
 
+    /// 经该上游发 HTTP 请求的客户端（凭据走 `Proxy::basic_auth`，不进 URL）。
+    /// `timeout` 单独给：Google 探测比普通 GET 短（每轮每成员都多打一次）
+    fn proxied_client(
+        &self,
+        up: &Upstream,
+        timeout: std::time::Duration,
+    ) -> Result<reqwest::blocking::Client, ProbeError> {
+        let proxy = reqwest::Proxy::all(proxy_url(up))
+            .map_err(|e| ProbeError::Unreachable(e.to_string()))?
+            .basic_auth(&up.username, &up.password);
+        reqwest::blocking::Client::builder()
+            .proxy(proxy)
+            .timeout(timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| ProbeError::Unreachable(e.to_string()))
+    }
+
     /// RFC1928 §4：CMD=03（UDP ASSOCIATE），绑定地址 0.0.0.0:0
     fn socks5_udp(&self, up: &Upstream) -> Result<bool, ProbeError> {
         let mut s = self
@@ -267,6 +313,43 @@ fn socks5_handshake(s: &mut std::net::TcpStream, up: &Upstream) -> std::io::Resu
     })
 }
 
+/// `reqwest` 的发送错误 → [`ProbeError`]。https 目标经 HTTP 上游走 CONNECT 隧道，
+/// 407 在隧道建立阶段就失败了 ⇒ reqwest 只给一个 Err，拿不到状态码。把整条 `source`
+/// 链的文字拼出来扫一遍，是这里唯一能识别凭据失效的办法（第二层补判在调用方，
+/// 见 [`confirm_auth_failure`] 的注释）。
+fn send_error(url: &str, e: reqwest::Error) -> ProbeError {
+    tracing::debug!(url = %crate::redact::url_credentials(url), error = %e, "经上游 GET 失败");
+    let mut chain = e.to_string();
+    let mut src: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(&e);
+    while let Some(s) = src {
+        chain.push_str("; ");
+        chain.push_str(&s.to_string());
+        src = s.source();
+    }
+    if looks_like_proxy_auth(&chain) {
+        ProbeError::AuthFailed
+    } else {
+        ProbeError::Unreachable(e.to_string())
+    }
+}
+
+/// 响应 → [`HttpProbe`]（正文截到 64KB）。状态码 407 只有「明文 HTTP 目标」才会走到
+/// 这里（本模块的探测 URL 全是 https，407 走 [`send_error`] 那条分支）。留着是为了
+/// 将来真加明文目标时不必再想一遍。
+fn http_probe_of(resp: reqwest::blocking::Response) -> Result<HttpProbe, ProbeError> {
+    let status = resp.status().as_u16();
+    if status == 407 {
+        return Err(ProbeError::AuthFailed);
+    }
+    let body: String = resp
+        .text()
+        .unwrap_or_default()
+        .chars()
+        .take(65_536)
+        .collect();
+    Ok(HttpProbe { status, body })
+}
+
 /// 发一条 SOCKS5 请求并读回 REP 字节（前 4 字节即够判定，BND 地址不读）
 fn socks5_request(s: &mut std::net::TcpStream, req: &[u8]) -> std::io::Result<ConnectVerdict> {
     use std::io::{Read, Write};
@@ -306,47 +389,27 @@ impl Prober for ReqwestProber {
     }
 
     fn get(&self, up: &Upstream, url: &str) -> Result<HttpProbe, ProbeError> {
-        let proxy = reqwest::Proxy::all(proxy_url(up))
-            .map_err(|e| ProbeError::Unreachable(e.to_string()))?
-            .basic_auth(&up.username, &up.password);
-        let client = reqwest::blocking::Client::builder()
-            .proxy(proxy)
-            .timeout(self.timeout)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|e| ProbeError::Unreachable(e.to_string()))?;
-        let resp = client.get(url).send().map_err(|e| {
-            tracing::debug!(url = %crate::redact::url_credentials(url), error = %e, "经上游 GET 失败");
-            // https 目标经 HTTP 上游走 CONNECT 隧道，407 在隧道建立阶段就失败了 ⇒
-            // reqwest 只给一个 Err，拿不到状态码。把整条 source 链的文字拼出来扫一遍，
-            // 这是 `get` 自己唯一能识别凭据失效的办法（第二层补判在调用方，见
-            // `confirm_auth_failure` 的注释）。
-            let mut chain = e.to_string();
-            let mut src: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(&e);
-            while let Some(s) = src {
-                chain.push_str("; ");
-                chain.push_str(&s.to_string());
-                src = s.source();
-            }
-            if looks_like_proxy_auth(&chain) {
-                ProbeError::AuthFailed
-            } else {
-                ProbeError::Unreachable(e.to_string())
-            }
-        })?;
-        let status = resp.status().as_u16();
-        // 只有「明文 HTTP 目标」才会走到这里（本模块的探测 URL 全是 https，407 走上面
-        // 那条 Err 分支）。留着是为了将来真加明文目标时不必再想一遍。
-        if status == 407 {
-            return Err(ProbeError::AuthFailed);
-        }
-        let body: String = resp
-            .text()
-            .unwrap_or_default()
-            .chars()
-            .take(65_536)
-            .collect();
-        Ok(HttpProbe { status, body })
+        let resp = self
+            .proxied_client(up, self.timeout)?
+            .get(url)
+            .send()
+            .map_err(|e| send_error(url, e))?;
+        http_probe_of(resp)
+    }
+
+    fn google_search(&self, up: &Upstream) -> Result<HttpProbe, ProbeError> {
+        let url = super::GOOGLE_PROBE_URL;
+        let resp = self
+            .proxied_client(
+                up,
+                std::time::Duration::from_secs(super::GOOGLE_PROBE_TIMEOUT_SECS),
+            )?
+            // 无 UA / 脚本 UA 会被 Google 直接判机器人，那测的就不是上游了
+            .get(url)
+            .header(reqwest::header::USER_AGENT, super::GOOGLE_PROBE_UA)
+            .send()
+            .map_err(|e| send_error(url, e))?;
+        http_probe_of(resp)
     }
 
     fn udp_associate(&self, up: &Upstream) -> Result<bool, ProbeError> {
@@ -381,6 +444,9 @@ pub struct FakeProberInner {
     /// T6/T7/T8 的测试都依赖它）：值为 `Err("__auth_failed__")` 时 `get` 返回
     /// `ProbeError::AuthFailed`，其余字符串返回 `ProbeError::Unreachable(那个字符串)`
     pub gets: std::collections::BTreeMap<String, Result<HttpProbe, String>>,
+    /// [`Prober::google_search`] 的返回，缺省 `Err(Unreachable("no route"))`（= 没结论）。
+    /// 错误哨兵与 `gets` 同约定：`Err("__auth_failed__")` ⇒ `ProbeError::AuthFailed`
+    pub google: Option<Result<HttpProbe, String>>,
     pub udp: bool,
     /// 直连可达的 `"<host>:<port>"`；不在集合里即不可达
     pub direct: std::collections::BTreeSet<String>,
@@ -433,6 +499,17 @@ impl Prober for FakeProber {
         match i.gets.get(url) {
             Some(Ok(hp)) => Ok(hp.clone()),
             // 哨兵：让测试能构造「上游凭据失效」这一条路径（T7 的 407 用例）
+            Some(Err(e)) if e == "__auth_failed__" => Err(ProbeError::AuthFailed),
+            Some(Err(e)) => Err(ProbeError::Unreachable(e.clone())),
+            None => Err(ProbeError::Unreachable("no route".into())),
+        }
+    }
+
+    fn google_search(&self, _up: &Upstream) -> Result<HttpProbe, ProbeError> {
+        let mut i = self.inner.lock().expect("FakeProber 锁被毒化");
+        i.calls.push("google".into());
+        match i.google.as_ref() {
+            Some(Ok(hp)) => Ok(hp.clone()),
             Some(Err(e)) if e == "__auth_failed__" => Err(ProbeError::AuthFailed),
             Some(Err(e)) => Err(ProbeError::Unreachable(e.clone())),
             None => Err(ProbeError::Unreachable("no route".into())),
@@ -632,6 +709,90 @@ mod tests {
             !p.udp_associate(&up(UpstreamKind::Socks5)).unwrap(),
             "inner.udp 默认 false"
         );
+    }
+
+    #[test]
+    fn google_verdict_reads_the_serp_block_the_sorry_page_and_stays_none_when_unknown() {
+        // 主理人硬要求「住宅上游不封 Google」，判据只有这一份（巡检与体检都调它）
+        assert_eq!(
+            google_ok_of(&Ok(HttpProbe {
+                status: 200,
+                body: "<html>weather results".into()
+            })),
+            Some(true)
+        );
+        // 调研 §D 的 Bright Data 形态：对 serp 域名整域硬拒
+        assert_eq!(
+            google_ok_of(&Ok(HttpProbe {
+                status: 403,
+                body: "403 Forbidden serp domain".into()
+            })),
+            Some(false)
+        );
+        assert_eq!(
+            google_ok_of(&Ok(HttpProbe {
+                status: 429,
+                body: String::new()
+            })),
+            Some(false)
+        );
+        // 200 也可能是拦截页：Google 判机器人时回 /sorry/ 或「unusual traffic」
+        assert_eq!(
+            google_ok_of(&Ok(HttpProbe {
+                status: 200,
+                body: "Our systems have detected unusual traffic from your network".into()
+            })),
+            Some(false)
+        );
+        assert_eq!(
+            google_ok_of(&Ok(HttpProbe {
+                status: 200,
+                body: "<a href=\"https://www.google.com/sorry/index\">".into()
+            })),
+            Some(false)
+        );
+        // 探不到就不下结论：这一项参与选路，把抖动记成「封了」会把好上游踢到队尾
+        assert_eq!(
+            google_ok_of(&Err(ProbeError::Unreachable("timeout".into()))),
+            None
+        );
+        assert_eq!(google_ok_of(&Err(ProbeError::AuthFailed)), None);
+        assert_eq!(
+            google_ok_of(&Ok(HttpProbe {
+                status: 502,
+                body: String::new()
+            })),
+            None,
+            "上游自己 5xx 不是 Google 封的"
+        );
+    }
+
+    #[test]
+    fn fake_prober_google_search_is_programmable_and_records_a_call() {
+        let p = FakeProber::new();
+        assert!(
+            matches!(
+                p.google_search(&up(UpstreamKind::Http)),
+                Err(ProbeError::Unreachable(_))
+            ),
+            "缺省不给结论"
+        );
+        p.with(|i| {
+            i.google = Some(Ok(HttpProbe {
+                status: 403,
+                body: "403 Forbidden serp domain".into(),
+            }))
+        });
+        assert_eq!(
+            google_ok_of(&p.google_search(&up(UpstreamKind::Http))),
+            Some(false)
+        );
+        p.with(|i| i.google = Some(Err("__auth_failed__".into())));
+        assert!(matches!(
+            p.google_search(&up(UpstreamKind::Http)),
+            Err(ProbeError::AuthFailed)
+        ));
+        assert_eq!(p.calls(), vec!["google", "google", "google"]);
     }
 
     #[test]
