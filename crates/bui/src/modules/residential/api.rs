@@ -1,1 +1,1857 @@
-//! placeholder filled by Task 10
+//! 住宅模块的面板端点（spec §4.3 + 契约决策 §A）：规范路径 + v3 路径别名，
+//! 共 18 条路由。`status` / `health` 的字段名逐字照 v3（`web/app.js` 直接读），
+//! v4 的新字段一律**追加**。
+//!
+//! 鉴权由 P1 的 `api::router()` 统一 `layer(require_admin)`，本模块**不加**中间件。
+
+use super::clash::Clash;
+use super::proxy::Prober;
+use super::{blacklist, check, clash, health, state, upstream, MANUAL_ROUND_MIN_GAP_SECS};
+use crate::api::AppState;
+use crate::reconcile::DaemonCtx;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::routing::{delete, get, post};
+use axum::{Extension, Json};
+// `State` 这个名字被 axum 的提取器占了，模型态一律用 `SchemaState`
+use bui_schema::model::{
+    ResiMode, ResidentialGroup, Rule, State as SchemaState, Upstream, UpstreamKind,
+};
+use bui_schema::paths::Paths;
+use bui_schema::render::SplitRules;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use uuid::Uuid;
+
+// ── 请求体 ───────────────────────────────────────────────────────────────
+#[derive(Debug, Deserialize)]
+pub struct AddRequest {
+    pub url: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RemoveRequest {
+    #[serde(default)]
+    pub id: Option<Uuid>,
+    /// v3 的定位方式 `"host:port"`
+    #[serde(default)]
+    pub host_port: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GlobalRequest {
+    pub global: bool,
+}
+
+/// v3 的 `POST /api/residential/enable` 是**空体、且不带 `Content-Type`**，所以 handler 的
+/// 提取器必须是 `Option<Json<EnableRequest>>`（`None` ⇒ `enabled = true`）；`#[serde(default)]`
+/// 只救得了 `{}` 这种「有 JSON 但缺字段」的请求，救不了「没有 body」的 415
+#[derive(Debug, Deserialize)]
+pub struct EnableRequest {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DomainsRequest {
+    /// `null` 或缺省 = 回到跟随默认表
+    #[serde(default)]
+    pub domains: Option<Vec<String>>,
+    #[serde(default)]
+    pub reset: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CheckRequest {
+    #[serde(default)]
+    pub id: Option<Uuid>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SelectRequest {
+    pub id: Uuid,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PinRequest {
+    /// `domain_suffix`（缺省）| `domain` | `port`
+    #[serde(default)]
+    pub kind: Option<String>,
+    pub value: String,
+    #[serde(default)]
+    pub note: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ForgetAutoRequest {
+    pub upstream_id: Uuid,
+    #[serde(default)]
+    pub kind: Option<String>,
+    pub value: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PriorityRequest {
+    pub id: Uuid,
+    pub priority: u32,
+}
+
+/// v3 的 `POST /api/residential`（一条路径三种语义：加上游 / 设关键字 / 恢复默认）
+#[derive(Debug, Deserialize)]
+pub struct V3PostRequest {
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub domains: Option<Vec<String>>,
+    #[serde(default)]
+    pub reset: bool,
+}
+
+// ── 响应体 ───────────────────────────────────────────────────────────────
+/// `GET /api/residential/status`（= v3 `GET /api/residential`）。
+/// **前 7 个字段名逐字照 v3**（`web/app.js:827/875/964` 直接读），其余是 v4 追加项。
+#[derive(Debug, Serialize, PartialEq)]
+pub struct StatusResponse {
+    pub enabled: bool,
+    pub global: bool,
+    pub urls: Vec<UrlRow>,
+    pub domains: Vec<String>,
+    #[serde(rename = "domainsFollowDefault")]
+    pub domains_follow_default: bool,
+    #[serde(rename = "lastVerifiedIp")]
+    pub last_verified_ip: String,
+    #[serde(rename = "lastVerifiedIspInfo")]
+    pub last_verified_isp_info: String,
+    // v4 追加（只追加，不改不删任何 v3 字段）
+    pub mode: ResiMode,
+    /// **state 里的配置落点**（selector 的 default、`ports_allowed` 取反与 `auto` 过滤的依据）
+    pub selected_upstream_id: Option<Uuid>,
+    /// **当前实际生效的上游**（`runtime.selected_upstream_id`，契约决策 §C）
+    pub active_upstream_id: Option<Uuid>,
+    /// 上一行对应的成员 tag，由 `clash::tag_of` 现算（面板显示用，不做主键）
+    pub active_tag: Option<String>,
+    pub selected_pending_persist: bool,
+    pub checking: Option<state::Checking>,
+    pub blacklist: BlacklistCounts,
+    pub upstreams: Vec<UpstreamRow>,
+    pub notes: Vec<String>,
+    pub alerts: Vec<String>,
+}
+
+/// v3 的 `urls[]` 行（`web/app.js:665-699 renderResidentialUrls` 逐字段读）
+#[derive(Debug, Serialize, PartialEq)]
+pub struct UrlRow {
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub name: String,
+    /// `"socks5"` | `"http"`（v3 的取值，不是 `UpstreamKind` 的 serde 名 —— 它俩恰好一致，
+    /// 但这里显式转，免得以后改了 model 打死前端）
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(rename = "lastVerifiedIp")]
+    pub last_verified_ip: String,
+    #[serde(rename = "displayUrl")]
+    pub display_url: String,
+    // v4 追加
+    pub id: Uuid,
+    pub priority: u32,
+}
+
+/// v4 追加的上游明细（面板新卡片用；**永不含 password**）
+#[derive(Debug, Serialize, PartialEq)]
+pub struct UpstreamRow {
+    pub id: Uuid,
+    pub name: String,
+    pub kind: String,
+    pub host: String,
+    pub port: u16,
+    pub username_masked: String,
+    pub priority: u32,
+    pub provider: Option<String>,
+    pub region: Option<String>,
+    pub ports_allowed: Option<Vec<u16>>,
+    pub verified: Option<bui_schema::model::Verified>,
+    /// **只数这一条上游自己的 `auto` 条目**（`auto[].upstream_id == id`），一律经
+    /// [`auto_count`]。**不含 `pins`**：pins 是全局强制直连规则，不属于任何上游，
+    /// 计进去会让面板上每个上游都凭空多出 `pins.len()` 条。全局计数看
+    /// [`StatusResponse::blacklist`]（`BlacklistCounts{pins,auto,pending,candidates}`）
+    pub blacklist_count: usize,
+    /// 最近一次体检报告（`check::CheckReport` 的 JSON）
+    pub check: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+pub struct BlacklistCounts {
+    pub pins: usize,
+    pub auto: usize,
+    pub pending: usize,
+    pub candidates: usize,
+}
+
+/// `GET /api/residential/health`（= v3 同名端点）。前 9 个字段名逐字照 v3。
+#[derive(Debug, Serialize, PartialEq)]
+pub struct HealthResponse {
+    pub enabled: bool,
+    pub urls: Vec<HealthUrlRow>,
+    pub domains_count: usize,
+    /// `"selector"`（池有效）| `"none"`
+    pub mode: String,
+    pub selected: Option<String>,
+    pub members: Vec<MemberRow>,
+    pub current_egress_ip_test: Option<String>,
+    pub egress_ip_type: String,
+    pub via_proxy_isp: Option<String>,
+    // v4 追加
+    pub alerts: Vec<String>,
+    pub last_daily_at: Option<String>,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+pub struct HealthUrlRow {
+    pub host: String,
+    pub port: u16,
+    pub last_verified_at: Option<String>,
+    pub last_verified_ip: Option<String>,
+    pub last_verified_isp: Option<String>,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+pub struct MemberRow {
+    pub tag: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub host: String,
+    pub port: u16,
+    pub active: bool,
+    pub failstreak: u32,
+    pub okstreak: u32,
+    pub egress: Option<Egress>,
+    // v4 追加
+    pub priority: u32,
+    pub success_rate_24h: f64,
+    /// 与 [`UpstreamRow::blacklist_count`] **同一语义、同一函数**（[`auto_count`]）：
+    /// 只数 `auto[].upstream_id == upstream_id` 的条目，不含 `pins`。`status` 与
+    /// `health` 的同名字段必须永远相等，所以两处都不许自己写过滤式
+    pub blacklist_count: usize,
+    /// 最近一次巡检样本的结果（`None` = 还没探过）
+    pub probe_ok: Option<bool>,
+    pub upstream_id: Uuid,
+}
+
+/// v3 `members[].egress`：`type` 是中文串（`web/app.js:1095` 用 `/IDC|机房/i` 判色）
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct Egress {
+    pub ip: Option<String>,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub isp: Option<String>,
+    pub country: Option<String>,
+    pub city: Option<String>,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+pub struct BlacklistResponse {
+    pub pins: Vec<PinRow>,
+    pub auto: Vec<AutoRow>,
+    pub pending: Vec<PendingRow>,
+    pub candidates: Vec<CandidateRow>,
+    pub checking: Option<state::Checking>,
+    pub last_daily_at: Option<String>,
+    /// 面板说明文案（spec §5.4「局限」）
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+pub struct PinRow {
+    pub kind: String,
+    pub value: String,
+    pub note: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+pub struct AutoRow {
+    pub upstream_id: Uuid,
+    pub upstream_name: String,
+    pub kind: String,
+    pub value: String,
+    pub hits: u64,
+    pub confirmed_at: String,
+    pub last_verified_at: String,
+    pub passes: u32,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+pub struct PendingRow {
+    pub upstream_id: Uuid,
+    pub host: String,
+    pub port: u16,
+    pub confirms: u32,
+    pub last_confirm_at: String,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+pub struct CandidateRow {
+    pub upstream_id: Uuid,
+    pub host: String,
+    pub port: u16,
+    pub hits: u64,
+    pub last_seen: String,
+}
+
+/// 出错时的统一形状，与 v3 一致：`{"error":"…"}`（`web/app.js` 各处读 `r.error`）
+#[derive(Debug, Serialize)]
+pub struct ErrorBody {
+    pub error: String,
+}
+
+/// 四个句柄经请求扩展下发给全部 handler（用 `Extension` 而不是闭包捕获：闭包把
+/// `Deps` move 进被调函数后只能调一次，推出来是 `FnOnce`，而 axum 0.8 的 `Handler`
+/// 要求 `Fn + Clone`；写成「闭包内再克隆」则要 40 多处样板）。
+#[derive(Clone)]
+struct Deps {
+    prober: Arc<dyn Prober>,
+    clash: Arc<dyn Clash>,
+    paths: Paths,
+    background: bool,
+}
+
+/// 把 `AppState` 补齐成后台任务用的 `DaemonCtx`（两者字段同源，`paths` 由模块持有）
+pub fn ctx_of(app: &AppState, paths: &Paths) -> DaemonCtx {
+    DaemonCtx {
+        store: app.store.clone(),
+        runtime: app.runtime.clone(),
+        bus: app.bus.clone(),
+        host: app.host.clone(),
+        paths: paths.clone(),
+    }
+}
+
+/// 本模块的全部路由。P1 的 `api::router` 会把它 merge 进 protected 分支并统一
+/// `layer(require_admin)`，所以这里**不加**任何鉴权中间件。
+pub fn routes(
+    prober: Arc<dyn Prober>,
+    clash: Arc<dyn Clash>,
+    paths: Paths,
+) -> axum::Router<AppState> {
+    routes_with(prober, clash, paths, true)
+}
+
+/// 同上，但可关掉 handler 里的后台任务（`post_add` / `post_check` 的 `tokio::spawn`）。
+/// **测试一律用 `background = false`**：FakeProber 秒回，后台体检会与下一个请求抢
+/// `runtime.checking` 与 `state`，断言随调度时序飘。生产即 `routes(..)`。
+pub fn routes_with(
+    prober: Arc<dyn Prober>,
+    clash: Arc<dyn Clash>,
+    paths: Paths,
+    background: bool,
+) -> axum::Router<AppState> {
+    let d = Deps {
+        prober,
+        clash,
+        paths,
+        background,
+    };
+    axum::Router::new()
+        // ── 规范路径（外加 v3 的 enable：spec §4.3 没有它，原样保留，见 §A）──
+        .route("/api/residential/status", get(get_status))
+        .route("/api/residential/add", post(post_add))
+        .route("/api/residential/remove", post(post_remove))
+        .route("/api/residential/enable", post(post_enable))
+        .route("/api/residential/global", post(post_global))
+        .route("/api/residential/domains", post(post_domains))
+        .route(
+            "/api/residential/restore-default",
+            post(post_restore_default),
+        )
+        .route("/api/residential/health", get(get_health))
+        .route("/api/residential/health/check", post(post_health_check))
+        .route("/api/residential/check", post(post_check))
+        .route("/api/residential/select", post(post_select))
+        .route("/api/residential/priority", post(post_priority))
+        .route(
+            "/api/residential/blacklist",
+            get(get_blacklist).delete(delete_auto),
+        )
+        .route(
+            "/api/residential/blacklist/pins",
+            post(post_pin).delete(delete_pin),
+        )
+        .route("/api/residential/blacklist/apply", post(post_apply))
+        // ── v3 路径别名（契约决策 §A；前端零改动，P5 删兼容层时一并删掉本段）──
+        .route(
+            "/api/residential",
+            get(get_status).post(v3_post).delete(post_enable_off),
+        )
+        .route("/api/residential/urls", post(post_add))
+        .route("/api/residential/urls/{host_port}", delete(delete_url))
+        // `Router::layer` 只包住**此刻已注册**的这些路由，`api::router` 后面的 `merge`
+        // 与统一 `layer(require_admin)` 都不影响它。
+        .layer(axum::Extension(d))
+}
+
+type ApiResult = Result<axum::response::Response, (StatusCode, Json<ErrorBody>)>;
+
+fn err(code: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<ErrorBody>) {
+    (code, Json(ErrorBody { error: msg.into() }))
+}
+
+/// `UpstreamError` → 状态码（与 v3 一致：校验类 400、找不到 404、其余 500）
+fn map_upstream_err(e: upstream::UpstreamError) -> (StatusCode, Json<ErrorBody>) {
+    use upstream::UpstreamError as E;
+    let code = match &e {
+        E::Parse(_)
+        | E::Unverifiable { .. }
+        | E::AuthFailed
+        | E::NotProxied(_)
+        | E::PoolFull
+        | E::PoolEmpty => StatusCode::BAD_REQUEST,
+        E::NotFound => StatusCode::NOT_FOUND,
+        E::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    err(code, e.to_string())
+}
+
+pub fn rule_of(kind: Option<&str>, value: &str) -> Option<Rule> {
+    let ok_host = |v: &str| {
+        !v.is_empty()
+            && v.len() <= 253
+            && v.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'-'))
+    };
+    match kind.unwrap_or("domain_suffix") {
+        "domain_suffix" => ok_host(value).then(|| Rule::DomainSuffix(value.to_string())),
+        "domain" => ok_host(value).then(|| Rule::Domain(value.to_string())),
+        "port" => value.parse().ok().map(Rule::Port),
+        _ => None,
+    }
+}
+
+/// `Rule` → `(kind, value)`（响应用）
+pub fn rule_parts(r: &Rule) -> (String, String) {
+    match r {
+        Rule::DomainSuffix(v) => ("domain_suffix".into(), v.clone()),
+        Rule::Domain(v) => ("domain".into(), v.clone()),
+        Rule::Port(p) => ("port".into(), p.to_string()),
+    }
+}
+
+/// 用户名打码：前两字符 + `***`（v3 `resiRow` 的 `slice(0,2) + "***"`）
+fn mask(u: &str) -> String {
+    format!("{}***", u.chars().take(2).collect::<String>())
+}
+
+fn kind_str(u: &Upstream) -> String {
+    match u.kind {
+        UpstreamKind::Http => "http".to_string(),
+        UpstreamKind::Socks5 => "socks5".to_string(),
+    }
+}
+
+/// 一条上游自己的 `auto` 条目数。**`pins` 不计入**：pins 是管理员钉的全局强制直连
+/// 规则，跟哪条上游都没关系；把 `pins.len()` 加进来会让面板上每个上游都凭空多出
+/// 同样多的条数，运维会以为是这条上游自己学到的。全局计数走 `BlacklistCounts`。
+/// `UpstreamRow`（status）与 `MemberRow`（health）都只调这一个函数。
+pub fn auto_count(g: &ResidentialGroup, id: Uuid) -> usize {
+    g.blacklist
+        .auto
+        .iter()
+        .filter(|a| a.upstream_id == id)
+        .count()
+}
+
+/// 面板说明文案（spec §5.4「局限」；`blacklist` 与 `status` 共用）
+fn notes() -> Vec<String> {
+    vec![
+        "软封锁（上游返回 200 拦截页）无法自动识别，请手动钉住（pins）".into(),
+        "端口类拒绝不进黑名单，由该上游体检学到的端口白名单（ports_allowed）表达".into(),
+        "自动条目每日 04:00 批量生效；钉住与「立即应用」即时生效，会重启 b-ui-relay 并掐断住宅连接"
+            .into(),
+    ]
+}
+
+/// `GET /api/residential/health` 的面板说明：把「这些数字是什么时候的」讲清楚，
+/// 免得运维以为刷新一次就重新探过了（裁决 D6）
+fn health_notes() -> Vec<String> {
+    vec![
+        "成员状态来自最近一轮健康巡检（后台每 2 分钟一轮）；要立刻探一轮请点「立即巡检」（POST /api/residential/health/check，60 秒内限一次）".into(),
+        "出口 IP 与归属来自最近一次体检（添加上游或点「体检」时刷新），不是本次请求现拨".into(),
+    ]
+}
+
+pub fn status_of(s: &SchemaState, r: &state::ResiRuntime) -> StatusResponse {
+    let g = state::group_of(s);
+    // keywords = null/空 ⇒ 回生效默认表，并把 domainsFollowDefault 置 true。
+    // 面板要能区分「跟随默认」与「自定义」，否则用户一保存就把当时的默认表固化了（R12）。
+    let split = SplitRules::from_group(&g);
+    let follow_default = g.keywords.as_ref().map(|k| k.is_empty()).unwrap_or(true);
+    let selected = g
+        .selected_upstream_id
+        .and_then(|id| g.upstreams.iter().find(|u| u.id == id))
+        .or_else(|| g.upstreams.first());
+    let urls = g
+        .upstreams
+        .iter()
+        .map(|u| UrlRow {
+            host: u.host.clone(),
+            port: u.port,
+            username: u.username.clone(),
+            name: u.name.clone(),
+            kind: kind_str(u),
+            last_verified_ip: u
+                .verified
+                .as_ref()
+                .map(|v| v.ip.clone())
+                .unwrap_or_default(),
+            display_url: format!(
+                "{}://{}@{}:{}",
+                kind_str(u),
+                mask(&u.username),
+                u.host,
+                u.port
+            ),
+            id: u.id,
+            priority: u.priority,
+        })
+        .collect();
+    let upstreams = g
+        .upstreams
+        .iter()
+        .map(|u| UpstreamRow {
+            id: u.id,
+            name: u.name.clone(),
+            kind: kind_str(u),
+            host: u.host.clone(),
+            port: u.port,
+            username_masked: mask(&u.username),
+            priority: u.priority,
+            provider: u.provider.clone(),
+            region: u.region.clone(),
+            ports_allowed: u.ports_allowed.clone(),
+            verified: u.verified.clone(),
+            blacklist_count: auto_count(&g, u.id),
+            check: r.checks.get(&u.id.to_string()).cloned(),
+        })
+        .collect();
+    let v = selected.and_then(|u| u.verified.clone());
+    StatusResponse {
+        enabled: g.pool_active(),
+        global: matches!(g.mode, ResiMode::Global),
+        urls,
+        domains: split.keywords,
+        domains_follow_default: follow_default,
+        last_verified_ip: v.as_ref().map(|v| v.ip.clone()).unwrap_or_default(),
+        last_verified_isp_info: v
+            .as_ref()
+            .map(|v| {
+                [
+                    v.asn.map(|a| format!("AS{a}")),
+                    v.org.clone(),
+                    v.country.clone(),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(", ")
+            })
+            .unwrap_or_default(),
+        mode: g.mode,
+        selected_upstream_id: g.selected_upstream_id,
+        active_upstream_id: r.selected_upstream_id,
+        // tag 现算：runtime 存的是 uuid，池增删后同一个 resi-N 可能已指向别人（§C）
+        active_tag: r.selected_upstream_id.and_then(|id| clash::tag_of(&g, id)),
+        selected_pending_persist: r.selected_pending_persist,
+        checking: r.checking.clone(),
+        blacklist: BlacklistCounts {
+            pins: g.blacklist.pins.len(),
+            auto: g.blacklist.auto.len(),
+            pending: r.pending.len(),
+            candidates: r.candidates.len(),
+        },
+        upstreams,
+        notes: notes(),
+        alerts: r.alerts.clone(),
+    }
+}
+
+pub fn blacklist_of(s: &SchemaState, r: &state::ResiRuntime) -> BlacklistResponse {
+    let g = state::group_of(s);
+    let name_of = |id: Uuid| {
+        g.upstreams
+            .iter()
+            .find(|u| u.id == id)
+            .map(|u| u.name.clone())
+            .unwrap_or_else(|| "(已移除)".into())
+    };
+    BlacklistResponse {
+        pins: g
+            .blacklist
+            .pins
+            .iter()
+            .map(|p| {
+                let (kind, value) = rule_parts(&p.rule);
+                PinRow {
+                    kind,
+                    value,
+                    note: p.note.clone(),
+                    created_at: p.created_at.clone(),
+                }
+            })
+            .collect(),
+        auto: g
+            .blacklist
+            .auto
+            .iter()
+            .map(|a| {
+                let (kind, value) = rule_parts(&a.rule);
+                AutoRow {
+                    upstream_id: a.upstream_id,
+                    upstream_name: name_of(a.upstream_id),
+                    kind,
+                    value,
+                    hits: a.hits,
+                    confirmed_at: a.confirmed_at.clone(),
+                    last_verified_at: a.last_verified_at.clone(),
+                    passes: a.passes,
+                }
+            })
+            .collect(),
+        pending: r
+            .pending
+            .iter()
+            .map(|e| PendingRow {
+                upstream_id: e.upstream_id,
+                host: e.host.clone(),
+                port: e.port,
+                confirms: e.confirms,
+                last_confirm_at: e.last_confirm_at.clone(),
+            })
+            .collect(),
+        candidates: r
+            .candidates
+            .values()
+            .map(|c| CandidateRow {
+                upstream_id: c.upstream_id,
+                host: c.host.clone(),
+                port: c.port,
+                hits: c.hits,
+                last_seen: c.last_seen.clone(),
+            })
+            .collect(),
+        checking: r.checking.clone(),
+        last_daily_at: r.last_daily_at.clone(),
+        notes: notes(),
+    }
+}
+
+/// 出口画像来自缓存：优先上一次体检报告，退回 `verified`（裁决 D6）
+fn egress_of(u: &Upstream, r: &state::ResiRuntime) -> Option<Egress> {
+    if let Some(rep) = r.checks.get(&u.id.to_string()) {
+        let ip = rep
+            .pointer("/exit/ip")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        if ip.is_some() {
+            return Some(Egress {
+                ip,
+                kind: rep
+                    .get("class_label")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string(),
+                isp: rep
+                    .pointer("/exit/org")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                country: rep
+                    .pointer("/exit/country")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                city: rep
+                    .pointer("/exit/city")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+            });
+        }
+    }
+    let v = u.verified.as_ref()?;
+    Some(Egress {
+        ip: Some(v.ip.clone()),
+        // verified 只记归属，没有分类结论 —— 明确写 unknown，不猜
+        kind: check::ExitClass::Unknown.label().to_string(),
+        isp: v.org.clone(),
+        country: v.country.clone(),
+        city: None,
+    })
+}
+
+/// 分流关键字的公共响应体（`domains` / `restore-default` / v3 的 `{reset:true}` 共用）
+async fn domains_body(app: &AppState) -> serde_json::Value {
+    let g = state::group_of(&*app.store.read().await);
+    let split = SplitRules::from_group(&g);
+    let follow = g.keywords.as_ref().map(|k| k.is_empty()).unwrap_or(true);
+    serde_json::json!({
+        "success": true,
+        "domains": split.keywords,
+        "domainsFollowDefault": follow,
+    })
+}
+
+async fn get_status(State(app): State<AppState>) -> ApiResult {
+    // 纯读 state + runtime，不需要 Deps ⇒ 不写那个提取器
+    let s = app.store.read().await;
+    let r = state::read(&app.runtime).await;
+    Ok(Json(status_of(&s, &r)).into_response())
+}
+
+async fn post_add(
+    State(app): State<AppState>,
+    Extension(d): Extension<Deps>,
+    Json(b): Json<AddRequest>,
+) -> ApiResult {
+    let raw = b.url.trim().to_string();
+    if raw.is_empty() {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "请粘贴供应商给的代理，如 socks5://user:pass@host:port 或 host:port:user:pass",
+        ));
+    }
+    let ctx = ctx_of(&app, &d.paths);
+    let out = upstream::add(&ctx, d.prober.clone(), &raw)
+        .await
+        .map_err(map_upstream_err)?;
+    // 录入即探测（R13 §7）：端口白名单与支付/AI 可达性在后台补，面板轮询 checking 消失。
+    // `background` 为假时不起（测试里 FakeProber 秒回，后台体检会与下一个请求抢 runtime/state）
+    if d.background {
+        let (c2, p2, id) = (ctx.clone(), d.prober.clone(), out.id);
+        tokio::spawn(async move {
+            if let Err(e) = check::run_and_store(&c2, p2, id).await {
+                tracing::warn!(error = %e, "新增上游后的体检失败");
+            }
+        });
+    }
+    // 响应字段照 v3 的 add：success / exitIp / ispInfo / type
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "exitIp": out.exit_ip,
+        "ispInfo": out.isp,
+        "type": match out.kind { UpstreamKind::Http => "http", UpstreamKind::Socks5 => "socks5" },
+        "id": out.id,
+        "name": out.name,
+        "class": out.class_label,
+    }))
+    .into_response())
+}
+
+async fn post_remove(
+    State(app): State<AppState>,
+    Extension(d): Extension<Deps>,
+    Json(b): Json<RemoveRequest>,
+) -> ApiResult {
+    let sel = match (b.id, b.host_port.as_deref()) {
+        (Some(id), _) => upstream::UpstreamSel::Id(id),
+        (None, Some(hp)) => upstream::UpstreamSel::parse_host_port(hp)
+            .ok_or_else(|| err(StatusCode::BAD_REQUEST, "host_port 必须是 host:port"))?,
+        (None, None) => return Err(err(StatusCode::BAD_REQUEST, "id 或 host_port 字段必填")),
+    };
+    let ctx = ctx_of(&app, &d.paths);
+    upstream::remove(&ctx, &sel)
+        .await
+        .map_err(map_upstream_err)?;
+    Ok(Json(serde_json::json!({ "success": true })).into_response())
+}
+
+/// v3 别名 `DELETE /api/residential/urls/<host:port>`（路径段是 URL 编码的 `host:port`）
+async fn delete_url(
+    State(app): State<AppState>,
+    Extension(d): Extension<Deps>,
+    Path(host_port): Path<String>,
+) -> ApiResult {
+    let sel = upstream::UpstreamSel::parse_host_port(&host_port)
+        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "路径必须是 host:port"))?;
+    let ctx = ctx_of(&app, &d.paths);
+    upstream::remove(&ctx, &sel)
+        .await
+        .map_err(map_upstream_err)?;
+    Ok(Json(serde_json::json!({ "success": true })).into_response())
+}
+
+/// v3 的空体启用请求（`web/app.js:37-50` 不带 `Content-Type`）：提取器必须是
+/// `Option<Json<..>>`，否则 axum 0.8 直接回 415
+async fn post_enable(
+    State(app): State<AppState>,
+    Extension(d): Extension<Deps>,
+    body: Option<Json<EnableRequest>>,
+) -> ApiResult {
+    let enabled = body.map(|Json(b)| b.enabled).unwrap_or(true);
+    let ctx = ctx_of(&app, &d.paths);
+    upstream::set_enabled(&ctx, enabled)
+        .await
+        .map_err(map_upstream_err)?;
+    Ok(Json(serde_json::json!({ "success": true, "enabled": enabled })).into_response())
+}
+
+async fn post_enable_off(State(app): State<AppState>, Extension(d): Extension<Deps>) -> ApiResult {
+    // v3 的「禁用」是 DELETE /api/residential（无 body）
+    let ctx = ctx_of(&app, &d.paths);
+    upstream::set_enabled(&ctx, false)
+        .await
+        .map_err(map_upstream_err)?;
+    Ok(Json(serde_json::json!({ "success": true, "enabled": false })).into_response())
+}
+
+async fn post_global(
+    State(app): State<AppState>,
+    Extension(d): Extension<Deps>,
+    Json(b): Json<GlobalRequest>,
+) -> ApiResult {
+    let ctx = ctx_of(&app, &d.paths);
+    upstream::set_mode(&ctx, b.global)
+        .await
+        .map_err(map_upstream_err)?;
+    Ok(Json(serde_json::json!({ "success": true, "global": b.global })).into_response())
+}
+
+async fn post_domains(
+    State(app): State<AppState>,
+    Extension(d): Extension<Deps>,
+    Json(b): Json<DomainsRequest>,
+) -> ApiResult {
+    let ctx = ctx_of(&app, &d.paths);
+    // reset 或 domains = null/空 ⇒ 回到跟随默认表（`set_keywords` 自己也做这层归一）
+    let kw = if b.reset { None } else { b.domains };
+    upstream::set_keywords(&ctx, kw)
+        .await
+        .map_err(map_upstream_err)?;
+    Ok(Json(domains_body(&app).await).into_response())
+}
+
+async fn post_restore_default(
+    State(app): State<AppState>,
+    Extension(d): Extension<Deps>,
+) -> ApiResult {
+    let ctx = ctx_of(&app, &d.paths);
+    upstream::set_keywords(&ctx, None)
+        .await
+        .map_err(map_upstream_err)?;
+    Ok(Json(domains_body(&app).await).into_response())
+}
+
+async fn get_health(State(app): State<AppState>) -> ApiResult {
+    // **只读**：不碰 Prober / Clash，不推进迟滞，不切换（裁决 D6/D10）
+    let g = state::group_of(&*app.store.read().await);
+    let r = state::read(&app.runtime).await;
+    let split = SplitRules::from_group(&g);
+    let now = app.host.now();
+    // active tag 现算：runtime 存 uuid（§C）
+    let active_tag = r.selected_upstream_id.and_then(|id| clash::tag_of(&g, id));
+    let mut resp = HealthResponse {
+        enabled: g.pool_active(),
+        urls: vec![],
+        domains_count: split.keywords.len(),
+        mode: if g.pool_active() {
+            "selector".into()
+        } else {
+            "none".into()
+        },
+        selected: active_tag.clone(),
+        members: vec![],
+        current_egress_ip_test: None,
+        egress_ip_type: "unknown".into(),
+        via_proxy_isp: None,
+        alerts: r.alerts.clone(),
+        last_daily_at: r.last_daily_at.clone(),
+        notes: health_notes(),
+    };
+    if !g.pool_active() {
+        return Ok(Json(resp).into_response());
+    }
+    resp.selected = active_tag.or_else(|| clash::tags(&g).first().cloned());
+    for (i, tag) in clash::tags(&g).iter().enumerate() {
+        let u = &g.upstreams[i];
+        // runtime.health 以 uuid 的字符串形式为键（契约决策 §C），不是 tag
+        let h = r.health.get(&u.id.to_string()).cloned().unwrap_or_default();
+        resp.members.push(MemberRow {
+            tag: tag.clone(),
+            kind: kind_str(u),
+            host: u.host.clone(),
+            port: u.port,
+            active: h.active,
+            failstreak: h.failstreak,
+            okstreak: h.okstreak,
+            egress: egress_of(u, &r),
+            priority: u.priority,
+            success_rate_24h: state::success_rate_24h(&h, now),
+            // 与 status_of 的 UpstreamRow 同一个函数：面板上是同一个数字
+            blacklist_count: auto_count(&g, u.id),
+            probe_ok: h.samples.last().map(|x| x.ok),
+            upstream_id: u.id,
+        });
+        resp.urls.push(HealthUrlRow {
+            host: u.host.clone(),
+            port: u.port,
+            last_verified_at: u.verified.as_ref().map(|v| v.at.clone()),
+            last_verified_ip: u.verified.as_ref().map(|v| v.ip.clone()),
+            last_verified_isp: u.verified.as_ref().and_then(|v| v.org.clone()),
+        });
+    }
+    // 顶层旧字段由「当前生效成员」派生（v3 同语义，面板旧渲染继续可用）
+    let cur = resp
+        .members
+        .iter()
+        .find(|m| Some(&m.tag) == resp.selected.as_ref())
+        .or_else(|| resp.members.first())
+        .and_then(|m| m.egress.clone());
+    if let Some(e) = cur {
+        resp.current_egress_ip_test = e.ip.clone();
+        resp.egress_ip_type = e.kind.clone();
+        let place = match (&e.city, &e.country) {
+            (Some(c), Some(n)) => format!(" ({c}, {n})"),
+            (None, Some(n)) => format!(" ({n})"),
+            _ => String::new(),
+        };
+        let isp = format!("{}{}", e.isp.clone().unwrap_or_default(), place)
+            .trim()
+            .to_string();
+        resp.via_proxy_isp = (!isp.is_empty()).then_some(isp);
+    }
+    Ok(Json(resp).into_response())
+}
+
+/// 面板「立即巡检一轮」（裁决 D10）：跑一次 `health::check_once`（会推进迟滞、可能切换），
+/// 所以按 `MANUAL_ROUND_MIN_GAP_SECS` 限速，超频回 429。
+async fn post_health_check(
+    State(app): State<AppState>,
+    Extension(d): Extension<Deps>,
+) -> ApiResult {
+    let now = app.host.now();
+    let r = state::read(&app.runtime).await;
+    if let Some(t) = r
+        .last_manual_round_at
+        .as_deref()
+        .and_then(crate::util::parse_rfc3339)
+    {
+        let gap = (now - t).whole_seconds();
+        // 时钟回跳（NTP 校时）不该把按钮永久锁死，所以只在 [0, 上限) 区间内拦
+        if (0..MANUAL_ROUND_MIN_GAP_SECS).contains(&gap) {
+            return Err(err(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "巡检限速中，请 {} 秒后再试",
+                    MANUAL_ROUND_MIN_GAP_SECS - gap
+                ),
+            ));
+        }
+    }
+    let stamp = crate::util::fmt_rfc3339(now);
+    state::update(&app.runtime, move |r| r.last_manual_round_at = Some(stamp)).await;
+    let ctx = ctx_of(&app, &d.paths);
+    let out = health::check_once(&ctx, d.prober.clone(), d.clash.clone())
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "healthy": out.healthy,
+        "probed": out.probed,
+        "switched_to": out.switched_to,
+        // 重放与切换是两件事：面板要能区分「relay 刚重启过，已把你选的出口放回去」
+        // 与「你选的出口坏了，已自动切走」
+        "replayed_to": out.replayed_to,
+        "notes": out.notes,
+    }))
+    .into_response())
+}
+
+async fn post_check(
+    State(app): State<AppState>,
+    Extension(d): Extension<Deps>,
+    Json(b): Json<CheckRequest>,
+) -> ApiResult {
+    let g = state::group_of(&*app.store.read().await);
+    let id = match b.id {
+        Some(id) => id,
+        None => g
+            .selected_upstream_id
+            .or_else(|| g.upstreams.first().map(|u| u.id))
+            .ok_or_else(|| err(StatusCode::BAD_REQUEST, "代理节点池为空"))?,
+    };
+    if !g.upstreams.iter().any(|u| u.id == id) {
+        return Err(err(StatusCode::NOT_FOUND, "未找到匹配的上游"));
+    }
+    let r = state::read(&app.runtime).await;
+    if let Some(c) = r.checking {
+        // 超过 10 分钟视为过期（R13 §4），否则一次卡住的体检会永久挡住按钮
+        let stale = crate::util::parse_rfc3339(&c.started_at)
+            .map(|t| (app.host.now() - t).whole_seconds() > 600)
+            .unwrap_or(true);
+        if !stale {
+            return Err(err(StatusCode::CONFLICT, "已有体检在进行中，请稍候"));
+        }
+    }
+    if d.background {
+        let ctx = ctx_of(&app, &d.paths);
+        let p = d.prober.clone();
+        tokio::spawn(async move {
+            if let Err(e) = check::run_and_store(&ctx, p, id).await {
+                tracing::warn!(error = %e, "体检失败");
+            }
+        });
+    }
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "started": true, "upstream_id": id })),
+    )
+        .into_response())
+}
+
+/// `POST /api/residential/select`（手动切当前出口，只走 Clash API，不写 state）
+async fn post_select(
+    State(app): State<AppState>,
+    Extension(d): Extension<Deps>,
+    Json(b): Json<SelectRequest>,
+) -> ApiResult {
+    // 404 靠**预检**：select_manual 返回 anyhow::Error（文案「上游不在当前池里」），
+    // 没有类型可匹配。用 tag_of 判「在不在池里」，与 select_manual 内部同一判据。
+    let g = state::group_of(&*app.store.read().await);
+    if clash::tag_of(&g, b.id).is_none() {
+        return Err(err(StatusCode::NOT_FOUND, "未找到匹配的上游"));
+    }
+    let ctx = ctx_of(&app, &d.paths);
+    let tag = health::select_manual(&ctx, d.clash.clone(), b.id)
+        .await
+        // 走到这里只剩「Clash API 调用失败」一种可能（池内判据已预检过）
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(serde_json::json!({ "success": true, "tag": tag })).into_response())
+}
+
+async fn post_priority(
+    State(app): State<AppState>,
+    Extension(d): Extension<Deps>,
+    Json(b): Json<PriorityRequest>,
+) -> ApiResult {
+    let ctx = ctx_of(&app, &d.paths);
+    upstream::set_priority(&ctx, b.id, b.priority)
+        .await
+        .map_err(map_upstream_err)?;
+    Ok(
+        Json(serde_json::json!({ "success": true, "id": b.id, "priority": b.priority }))
+            .into_response(),
+    )
+}
+
+async fn get_blacklist(State(app): State<AppState>) -> ApiResult {
+    let s = app.store.read().await;
+    let r = state::read(&app.runtime).await;
+    Ok(Json(blacklist_of(&s, &r)).into_response())
+}
+
+/// `POST /api/residential/blacklist/pins`（钉住，立即生效 ⇒ 会重启 relay）
+async fn post_pin(
+    State(app): State<AppState>,
+    Extension(d): Extension<Deps>,
+    Json(b): Json<PinRequest>,
+) -> ApiResult {
+    let rule = rule_of(b.kind.as_deref(), &b.value)
+        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "规则类型或取值非法"))?;
+    let ctx = ctx_of(&app, &d.paths);
+    blacklist::add_pin(&ctx, rule, b.note)
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(serde_json::json!({ "success": true })).into_response())
+}
+
+/// `DELETE /api/residential/blacklist/pins`（取消钉住，立即生效 ⇒ 会重启 relay）
+async fn delete_pin(
+    State(app): State<AppState>,
+    Extension(d): Extension<Deps>,
+    Json(b): Json<PinRequest>,
+) -> ApiResult {
+    let rule = rule_of(b.kind.as_deref(), &b.value)
+        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "规则类型或取值非法"))?;
+    let ctx = ctx_of(&app, &d.paths);
+    let removed = blacklist::remove_pin(&ctx, &rule)
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // `Ok(false)` = 本来就没这条 ⇒ 404，别回 200 让面板以为删掉了
+    if !removed {
+        return Err(err(StatusCode::NOT_FOUND, "未找到该钉住规则"));
+    }
+    Ok(Json(serde_json::json!({ "success": true })).into_response())
+}
+
+/// `DELETE /api/residential/blacklist`（删一条 auto，裁决 D8；立即生效 ⇒ 会重启 relay）
+async fn delete_auto(
+    State(app): State<AppState>,
+    Extension(d): Extension<Deps>,
+    Json(b): Json<ForgetAutoRequest>,
+) -> ApiResult {
+    let rule = rule_of(b.kind.as_deref(), &b.value)
+        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "规则类型或取值非法"))?;
+    let ctx = ctx_of(&app, &d.paths);
+    let removed = blacklist::remove_auto(&ctx, b.upstream_id, &rule)
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !removed {
+        return Err(err(StatusCode::NOT_FOUND, "未找到该自动黑名单条目"));
+    }
+    Ok(Json(serde_json::json!({ "success": true })).into_response())
+}
+
+/// `POST /api/residential/blacklist/apply`（把 `runtime.pending` 全量写进 state）
+async fn post_apply(State(app): State<AppState>, Extension(d): Extension<Deps>) -> ApiResult {
+    let ctx = ctx_of(&app, &d.paths);
+    let n = blacklist::apply_now(&ctx)
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(serde_json::json!({ "success": true, "applied": n })).into_response())
+}
+
+/// v3 的 `POST /api/residential`：一条路径三种语义，按体分派（契约决策 §A）
+async fn v3_post(
+    State(app): State<AppState>,
+    Extension(d): Extension<Deps>,
+    Json(b): Json<V3PostRequest>,
+) -> ApiResult {
+    if let Some(url) = b.url {
+        return post_add(State(app), Extension(d), Json(AddRequest { url })).await;
+    }
+    if b.reset || b.domains.as_ref().map(|x| x.is_empty()).unwrap_or(false) {
+        return post_restore_default(State(app), Extension(d)).await;
+    }
+    match b.domains {
+        Some(domains) => {
+            post_domains(
+                State(app),
+                Extension(d),
+                Json(DomainsRequest {
+                    domains: Some(domains),
+                    reset: false,
+                }),
+            )
+            .await
+        }
+        None => Err(err(StatusCode::BAD_REQUEST, "url 或 domains 字段必填")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::{AppState, EventBus};
+    use crate::modules::residential::clash::FakeClash;
+    use crate::modules::residential::proxy::{FakeProber, HttpProbe};
+    use crate::modules::residential::state as rstate;
+    use crate::state::runtime::Runtime;
+    use crate::state::store::Store;
+    use crate::sys::fake::FakeHost;
+    use crate::sys::Host;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use pretty_assertions::assert_eq;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    struct Harness {
+        app: axum::Router,
+        ctx: DaemonCtx,
+        /// 假时钟的句柄（`ctx.host` 是 `Arc<dyn Host>`，没有 `advance`）
+        host: Arc<FakeHost>,
+        prober: Arc<FakeProber>,
+        clash: Arc<FakeClash>,
+    }
+
+    async fn harness(d: &tempfile::TempDir) -> Harness {
+        // **必须**用本模块的夹具：P1 的 crate::testutil::sample_state() 住宅段是空池
+        // （enabled:false / upstreams:[] / pins:[] / auto:[]），下面每一条断言都会崩
+        let s = crate::modules::residential::sample_state_with_pool();
+        let host = Arc::new(FakeHost::new());
+        let store = Store::create(d.path().join("state.json"), s).await.unwrap();
+        let runtime = Runtime::load(d.path().join("runtime.json"));
+        let bus = EventBus::new();
+        let paths = bui_schema::paths::Paths::default_server();
+        let app_state = AppState {
+            store: store.clone(),
+            bus: bus.clone(),
+            runtime: runtime.clone(),
+            host: host.clone(),
+            started_at: host.now(),
+            version: "4.0.0",
+            login: Default::default(),
+        };
+        let prober = Arc::new(FakeProber::new());
+        prober.with(|i| {
+            i.gets.insert(
+                crate::modules::residential::EXIT_IP_URL.into(),
+                Ok(HttpProbe {
+                    status: 200,
+                    body: "198.51.100.7".into(),
+                }),
+            );
+            i.gets.insert(
+                crate::modules::residential::check::EXIT_SOURCES[0].1.into(),
+                Ok(HttpProbe {
+                    status: 200,
+                    body: serde_json::json!({"ip":"198.51.100.7","asn":33667,
+                        "asOrganization":"Comcast","country":"US","isResidential":true})
+                    .to_string(),
+                }),
+            );
+            // `POST /api/residential/health/check` 会真探一轮（裁决 D10），这条不给就探不通
+            i.gets.insert(
+                crate::modules::residential::HEALTH_PROBE_URL.into(),
+                Ok(HttpProbe {
+                    status: 204,
+                    body: String::new(),
+                }),
+            );
+        });
+        // 出口画像读缓存（裁决 D6）：预置一份体检报告，否则 egress 只能退回 verified 的 unknown
+        let up_id = rstate::group_of(&*store.read().await).upstreams[0].id;
+        rstate::update(&runtime, |r| {
+            // runtime 的「当前生效」记 uuid（契约决策 §C）
+            r.selected_upstream_id = Some(up_id);
+            r.checks.insert(
+                up_id.to_string(),
+                serde_json::json!({
+                    "class_label": "家庭宽带 IP",
+                    "exit": {"ip": "198.51.100.7", "org": "AS33667 Comcast", "country": "US", "city": "Denver"}
+                }),
+            );
+        })
+        .await;
+        let clash = Arc::new(FakeClash::new(Some("resi-1")));
+        // 直接用本模块的 routes_with()：P1 的 require_admin 在 api::router 里统一套，
+        // 这里单测 handler 本身，不再套一层鉴权（鉴权由 P1 Task 13 的测试覆盖）。
+        // `background = false`：FakeProber 秒回，后台体检会与下一个请求抢 runtime.checking，
+        // 不关掉 `check_is_202_and_409…` 会随调度时序飘
+        let app =
+            routes_with(prober.clone(), clash.clone(), paths.clone(), false).with_state(app_state);
+        Harness {
+            app,
+            ctx: DaemonCtx {
+                store,
+                runtime,
+                bus,
+                host: host.clone(),
+                paths,
+            },
+            host,
+            prober,
+            clash,
+        }
+    }
+
+    async fn call(
+        app: &axum::Router,
+        method: &str,
+        uri: &str,
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, serde_json::Value) {
+        let req = Request::builder().method(method).uri(uri);
+        let req = match body {
+            Some(v) => req
+                .header("content-type", "application/json")
+                .body(Body::from(v.to_string())),
+            None => req.body(Body::empty()),
+        }
+        .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, v)
+    }
+
+    #[tokio::test]
+    async fn status_keeps_every_v3_field_name_the_panel_reads() {
+        let d = tempfile::tempdir().unwrap();
+        let h = harness(&d).await;
+        let (st, v) = call(&h.app, "GET", "/api/residential/status", None).await;
+        assert_eq!(st, StatusCode::OK);
+        // web/app.js:827-930 读的全部字段
+        assert_eq!(v["enabled"], true);
+        assert_eq!(v["global"], true);
+        assert_eq!(v["urls"][0]["host"], "isp.example.net");
+        assert_eq!(v["urls"][0]["port"], 10007);
+        assert_eq!(v["urls"][0]["name"], "url-1");
+        assert_eq!(v["urls"][0]["type"], "http");
+        assert_eq!(v["urls"][0]["username"], "u");
+        assert_eq!(v["urls"][0]["lastVerifiedIp"], "198.51.100.7");
+        assert_eq!(
+            v["urls"][0]["displayUrl"],
+            "http://u***@isp.example.net:10007"
+        );
+        assert!(
+            v["domains"].as_array().unwrap().len() >= 67,
+            "keywords=null ⇒ 回生效默认表"
+        );
+        assert_eq!(v["domainsFollowDefault"], true);
+        assert_eq!(
+            v["lastVerifiedIp"], "198.51.100.7",
+            "顶层旧字段由当前落点派生"
+        );
+        // 密码绝不外泄
+        assert!(
+            !serde_json::to_string(&v).unwrap().contains("\"p\""),
+            "响应里不能出现密码"
+        );
+        // v4 追加项
+        assert_eq!(v["mode"], "global");
+        let id = rstate::group_of(&*h.ctx.store.read().await).upstreams[0].id;
+        assert_eq!(
+            v["selected_upstream_id"],
+            id.to_string(),
+            "state 的配置落点"
+        );
+        assert_eq!(
+            v["active_upstream_id"],
+            id.to_string(),
+            "runtime 的当前生效（uuid，§C）"
+        );
+        assert_eq!(
+            v["active_tag"], "resi-1",
+            "tag 是现算出来给面板看的，不是主键"
+        );
+        assert_eq!(v["selected_pending_persist"], false);
+        assert_eq!(v["blacklist"]["pins"], 1);
+        // blacklist_count 只数这条上游自己的 auto（夹具里恰好 1 条）。夹具同时有 1 条
+        // 全局 pin，若实现里手滑加上 pins.len() 这里就会是 2 —— 这条断言专治那个手滑。
+        assert_eq!(
+            v["upstreams"][0]["blacklist_count"], 1,
+            "pins 是全局规则，不计入单个上游：{v}"
+        );
+        assert_eq!(v["upstreams"][0]["username_masked"], "u***");
+        assert!(v["upstreams"][0].get("password").is_none());
+        // v3 别名同结果
+        let (st2, v2) = call(&h.app, "GET", "/api/residential", None).await;
+        assert_eq!((st2, v2), (StatusCode::OK, v));
+    }
+
+    #[tokio::test]
+    async fn health_keeps_every_v3_field_and_the_chinese_egress_type() {
+        let d = tempfile::tempdir().unwrap();
+        let h = harness(&d).await;
+        let (st, v) = call(&h.app, "GET", "/api/residential/health", None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["enabled"], true);
+        assert_eq!(v["mode"], "selector");
+        assert_eq!(v["selected"], "resi-1");
+        assert!(v["domains_count"].as_u64().unwrap() >= 67);
+        assert_eq!(v["members"][0]["tag"], "resi-1");
+        assert_eq!(v["members"][0]["type"], "http");
+        assert_eq!(v["members"][0]["host"], "isp.example.net");
+        assert_eq!(v["members"][0]["active"], true);
+        assert_eq!(v["members"][0]["failstreak"], 0);
+        // GET 只读（裁决 D6）：没探过就是 0，绝不因为「刷新了一下面板」而推进迟滞
+        assert_eq!(v["members"][0]["okstreak"], 0);
+        assert_eq!(
+            v["members"][0]["probe_ok"],
+            serde_json::Value::Null,
+            "还没探过"
+        );
+        assert!(h.prober.calls().is_empty(), "GET /health 一次探测都不该发");
+        assert!(
+            v["notes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|n| n.as_str().unwrap().contains("立即巡检")),
+            "面板要知道这些数字是什么时候的：{v}"
+        );
+        // egress.type 必须是中文串：app.js:1095 用 /IDC|机房/i 判色
+        assert_eq!(v["members"][0]["egress"]["ip"], "198.51.100.7");
+        assert_eq!(v["egress_ip_type"], "家庭宽带 IP");
+        assert_eq!(v["current_egress_ip_test"], "198.51.100.7");
+        assert!(v["via_proxy_isp"].as_str().unwrap().contains("Comcast"));
+        // v4 追加。与 status 的 upstreams[0].blacklist_count 同源（都走 auto_count）：
+        // 夹具里这条上游有 1 条 auto、全局有 1 条 pin，pins 不计入 ⇒ 1 而不是 2
+        assert_eq!(v["members"][0]["blacklist_count"], 1);
+        let (_, sv) = call(&h.app, "GET", "/api/residential/status", None).await;
+        assert_eq!(
+            v["members"][0]["blacklist_count"], sv["upstreams"][0]["blacklist_count"],
+            "status 与 health 的同名字段必须永远相等（同一个 auto_count）"
+        );
+        assert!(v["members"][0]["priority"].is_number());
+    }
+
+    #[tokio::test]
+    async fn the_manual_round_endpoint_probes_once_and_is_rate_limited() {
+        let d = tempfile::tempdir().unwrap();
+        let h = harness(&d).await;
+        let (st, v) = call(&h.app, "POST", "/api/residential/health/check", None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["healthy"][0], "resi-1");
+        assert!(
+            h.prober.calls().iter().any(|c| c.starts_with("get:")),
+            "这条端点才真的探：{:?}",
+            h.prober.calls()
+        );
+        // 迟滞被推进了（这正是它不能挂在 GET 上的原因）
+        let (_, hv) = call(&h.app, "GET", "/api/residential/health", None).await;
+        assert_eq!(hv["members"][0]["okstreak"], 1);
+        // 60 秒内再点一次 → 429
+        let (st2, v2) = call(&h.app, "POST", "/api/residential/health/check", None).await;
+        assert_eq!(st2, StatusCode::TOO_MANY_REQUESTS);
+        assert!(v2["error"].as_str().unwrap().contains("限速"), "{v2}");
+        // 过了限速窗口就放行
+        h.host.advance(61);
+        let (st3, _) = call(&h.app, "POST", "/api/residential/health/check", None).await;
+        assert_eq!(st3, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn health_on_a_disabled_pool_returns_the_v3_shape() {
+        let d = tempfile::tempdir().unwrap();
+        let h = harness(&d).await;
+        rstate::update_group(&h.ctx.store, &h.ctx.bus, |g| g.enabled = false)
+            .await
+            .unwrap();
+        let (st, v) = call(&h.app, "GET", "/api/residential/health", None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["enabled"], false);
+        assert_eq!(v["mode"], "none");
+        assert_eq!(v["members"].as_array().unwrap().len(), 0);
+        assert_eq!(v["egress_ip_type"], "unknown");
+    }
+
+    #[tokio::test]
+    async fn add_and_remove_work_on_both_the_canonical_and_the_v3_paths() {
+        let d = tempfile::tempdir().unwrap();
+        let h = harness(&d).await;
+        // 规范路径
+        let (st, v) = call(
+            &h.app,
+            "POST",
+            "/api/residential/add",
+            Some(serde_json::json!({"url": "http://user1:pw1@isp2.example.net:10007"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["success"], true);
+        assert_eq!(
+            v["type"], "http",
+            "v3 的 add 响应字段：success/exitIp/ispInfo/type"
+        );
+        assert_eq!(v["exitIp"], "198.51.100.7");
+        // v3 别名
+        let (st, _) = call(
+            &h.app,
+            "POST",
+            "/api/residential/urls",
+            Some(serde_json::json!({"url": "socks5://user1:pw1@isp3.example.net:1080"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(
+            rstate::group_of(&*h.ctx.store.read().await).upstreams.len(),
+            3
+        );
+        // v3 的删除定位方式（URL 编码的 host:port）
+        let (st, v) = call(
+            &h.app,
+            "DELETE",
+            "/api/residential/urls/isp3.example.net%3A1080",
+            None,
+        )
+        .await;
+        assert_eq!(
+            (st, v["success"].clone()),
+            (StatusCode::OK, serde_json::json!(true))
+        );
+        let (st, v) = call(
+            &h.app,
+            "DELETE",
+            "/api/residential/urls/nope.example.net%3A1",
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        assert!(v["error"].is_string());
+        // 规范路径按 id 删
+        let id = rstate::group_of(&*h.ctx.store.read().await).upstreams[1].id;
+        let (st, _) = call(
+            &h.app,
+            "POST",
+            "/api/residential/remove",
+            Some(serde_json::json!({"id": id})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(
+            rstate::group_of(&*h.ctx.store.read().await).upstreams.len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bad_paste_returns_400_with_the_parser_message() {
+        let d = tempfile::tempdir().unwrap();
+        let h = harness(&d).await;
+        let (st, v) = call(
+            &h.app,
+            "POST",
+            "/api/residential/add",
+            Some(serde_json::json!({"url": "https://u:p@h:1"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert!(
+            v["error"].as_str().unwrap().contains("https"),
+            "文案要点名问题：{v}"
+        );
+        let (st, _) = call(
+            &h.app,
+            "POST",
+            "/api/residential/add",
+            Some(serde_json::json!({"url": "   "})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn the_v3_post_route_dispatches_by_body() {
+        let d = tempfile::tempdir().unwrap();
+        let h = harness(&d).await;
+        // {domains:[…]} → 设关键字
+        let (st, v) = call(
+            &h.app,
+            "POST",
+            "/api/residential",
+            Some(serde_json::json!({"domains": ["openai.com"]})),
+        )
+        .await;
+        assert_eq!(
+            (st, v["success"].clone()),
+            (StatusCode::OK, serde_json::json!(true))
+        );
+        assert_eq!(
+            rstate::group_of(&*h.ctx.store.read().await).keywords,
+            Some(vec!["openai.com".to_string()])
+        );
+        // {reset:true} → 回到跟随默认
+        let (st, v) = call(
+            &h.app,
+            "POST",
+            "/api/residential",
+            Some(serde_json::json!({"reset": true})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["domainsFollowDefault"], true);
+        assert!(v["domains"].as_array().unwrap().len() >= 67);
+        assert_eq!(rstate::group_of(&*h.ctx.store.read().await).keywords, None);
+        // {url:…} → 加上游
+        let (st, v) = call(
+            &h.app,
+            "POST",
+            "/api/residential",
+            Some(serde_json::json!({"url": "http://user1:pw1@isp9.example.net:10007"})),
+        )
+        .await;
+        assert_eq!(
+            (st, v["success"].clone()),
+            (StatusCode::OK, serde_json::json!(true))
+        );
+        // 空体 → 400（没有语义）
+        let (st, _) = call(
+            &h.app,
+            "POST",
+            "/api/residential",
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn global_enable_and_disable_match_v3() {
+        let d = tempfile::tempdir().unwrap();
+        let h = harness(&d).await;
+        let (st, v) = call(
+            &h.app,
+            "POST",
+            "/api/residential/global",
+            Some(serde_json::json!({"global": false})),
+        )
+        .await;
+        assert_eq!(
+            (st, v["global"].clone()),
+            (StatusCode::OK, serde_json::json!(false))
+        );
+        assert_eq!(
+            rstate::group_of(&*h.ctx.store.read().await).mode,
+            ResiMode::Split
+        );
+        let (st, _) = call(
+            &h.app,
+            "POST",
+            "/api/residential/global",
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "缺 global 字段由 axum 的 Json 提取器挡掉"
+        );
+        // v3 的禁用：DELETE /api/residential
+        let (st, _) = call(&h.app, "DELETE", "/api/residential", None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(!rstate::group_of(&*h.ctx.store.read().await).enabled);
+        // v3 的启用：POST /api/residential/enable —— **既没有 body 也没有 Content-Type**
+        // （web/app.js:37-50 只在有 string body 时才加），所以 handler 必须收
+        // Option<Json<EnableRequest>>；用 Json<..> 这里会是 415
+        let (st, v) = call(&h.app, "POST", "/api/residential/enable", None).await;
+        assert_eq!(st, StatusCode::OK, "空体启用不能是 415：{v}");
+        assert_eq!(v["enabled"], true);
+        assert!(rstate::group_of(&*h.ctx.store.read().await).enabled);
+        // 显式关
+        let (st, v) = call(
+            &h.app,
+            "POST",
+            "/api/residential/enable",
+            Some(serde_json::json!({"enabled": false})),
+        )
+        .await;
+        assert_eq!(
+            (st, v["enabled"].clone()),
+            (StatusCode::OK, serde_json::json!(false))
+        );
+        let (st, _) = call(&h.app, "POST", "/api/residential/enable", None).await;
+        assert_eq!(st, StatusCode::OK);
+        // 空池启用 → 400（v3 同）
+        rstate::update_group(&h.ctx.store, &h.ctx.bus, |g| g.upstreams.clear())
+            .await
+            .unwrap();
+        let (st, v) = call(
+            &h.app,
+            "POST",
+            "/api/residential/enable",
+            Some(serde_json::json!({"enabled": true})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert!(v["error"].as_str().unwrap().contains("为空"));
+    }
+
+    #[tokio::test]
+    async fn check_is_202_and_409_while_running_then_select_switches_via_clash() {
+        let d = tempfile::tempdir().unwrap();
+        let h = harness(&d).await;
+        let id = rstate::group_of(&*h.ctx.store.read().await).upstreams[0].id;
+        let (st, v) = call(
+            &h.app,
+            "POST",
+            "/api/residential/check",
+            Some(serde_json::json!({"id": id})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::ACCEPTED);
+        assert_eq!(v["started"], true);
+        assert_eq!(v["upstream_id"], id.to_string());
+        // harness 用 background = false，所以这里没有后台体检来抢 runtime.checking：
+        // 409 分支靠下面手动置 checking 触发，结果与调度时序无关
+        assert_eq!(rstate::read(&h.ctx.runtime).await.checking, None);
+        // 人为把 checking 置上，第二次要 409（R13 §8.4）
+        rstate::update(&h.ctx.runtime, |r| {
+            r.checking = Some(rstate::Checking {
+                upstream_id: id,
+                started_at: crate::util::fmt_rfc3339(h.ctx.host.now()),
+            });
+        })
+        .await;
+        let (st, _) = call(
+            &h.app,
+            "POST",
+            "/api/residential/check",
+            Some(serde_json::json!({"id": id})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CONFLICT);
+        // select
+        rstate::update_group(&h.ctx.store, &h.ctx.bus, |g| {
+            let mut u = g.upstreams[0].clone();
+            u.id = Uuid::from_u128(77);
+            u.host = "isp2.example.net".into();
+            g.upstreams.push(u);
+            crate::modules::residential::upstream::renumber(&mut g.upstreams);
+        })
+        .await
+        .unwrap();
+        let (st, v) = call(
+            &h.app,
+            "POST",
+            "/api/residential/select",
+            Some(serde_json::json!({"id": Uuid::from_u128(77)})),
+        )
+        .await;
+        assert_eq!(
+            (st, v["tag"].clone()),
+            (StatusCode::OK, serde_json::json!("resi-2"))
+        );
+        assert_eq!(h.clash.selected().as_deref(), Some("resi-2"));
+        let (st, _) = call(
+            &h.app,
+            "POST",
+            "/api/residential/select",
+            Some(serde_json::json!({"id": Uuid::from_u128(999)})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn blacklist_endpoints_read_pins_auto_pending_and_candidates() {
+        let d = tempfile::tempdir().unwrap();
+        let h = harness(&d).await;
+        let (st, v) = call(&h.app, "GET", "/api/residential/blacklist", None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["pins"][0]["kind"], "domain_suffix");
+        assert_eq!(v["pins"][0]["value"], "pay.google.com");
+        assert!(
+            v["notes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|n| n.as_str().unwrap().contains("软封锁")),
+            "spec §5.4 的局限说明要出现在面板里：{v}"
+        );
+        // 加 pin
+        let (st, _) = call(
+            &h.app,
+            "POST",
+            "/api/residential/blacklist/pins",
+            Some(serde_json::json!({"value": "www.paypal.com", "note": "支付直连"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(
+            rstate::group_of(&*h.ctx.store.read().await)
+                .blacklist
+                .pins
+                .len(),
+            2
+        );
+        // 非法 kind → 400
+        let (st, _) = call(
+            &h.app,
+            "POST",
+            "/api/residential/blacklist/pins",
+            Some(serde_json::json!({"kind": "regex", "value": ".*"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        // 端口类 pin
+        let (st, _) = call(
+            &h.app,
+            "POST",
+            "/api/residential/blacklist/pins",
+            Some(serde_json::json!({"kind": "port", "value": "5228"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        // 删 pin
+        let (st, _) = call(
+            &h.app,
+            "DELETE",
+            "/api/residential/blacklist/pins",
+            Some(serde_json::json!({"value": "www.paypal.com"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, _) = call(
+            &h.app,
+            "DELETE",
+            "/api/residential/blacklist/pins",
+            Some(serde_json::json!({"value": "www.paypal.com"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        // apply：pending → auto
+        let up_id = rstate::group_of(&*h.ctx.store.read().await).upstreams[0].id;
+        rstate::update(&h.ctx.runtime, |r| {
+            r.pending.push(rstate::PendingEntry {
+                upstream_id: up_id,
+                host: "gateway.icloud.com".into(),
+                port: 443,
+                hits: 5,
+                confirms: 2,
+                last_confirm_at: crate::util::fmt_rfc3339(h.ctx.host.now()),
+            });
+        })
+        .await;
+        let (st, v) = call(&h.app, "POST", "/api/residential/blacklist/apply", None).await;
+        assert_eq!(
+            (st, v["applied"].clone()),
+            (StatusCode::OK, serde_json::json!(1))
+        );
+        let (_, v) = call(&h.app, "GET", "/api/residential/blacklist", None).await;
+        assert_eq!(v["auto"].as_array().unwrap().len(), 2);
+        assert_eq!(v["auto"][1]["value"], "gateway.icloud.com");
+        assert_eq!(v["auto"][1]["upstream_name"], "url-1");
+        // 删一条 auto（裁决 D8）
+        let (st, _) = call(
+            &h.app,
+            "DELETE",
+            "/api/residential/blacklist",
+            Some(serde_json::json!({"upstream_id": up_id, "value": "gateway.icloud.com"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn priority_endpoint_updates_the_switch_ordering_key() {
+        let d = tempfile::tempdir().unwrap();
+        let h = harness(&d).await;
+        let id = rstate::group_of(&*h.ctx.store.read().await).upstreams[0].id;
+        let (st, _) = call(
+            &h.app,
+            "POST",
+            "/api/residential/priority",
+            Some(serde_json::json!({"id": id, "priority": 3})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(
+            rstate::group_of(&*h.ctx.store.read().await).upstreams[0].priority,
+            3
+        );
+    }
+
+    #[test]
+    fn rule_conversion_covers_the_three_kinds_and_rejects_the_rest() {
+        assert_eq!(
+            rule_of(None, "a.com"),
+            Some(Rule::DomainSuffix("a.com".into())),
+            "缺省是 domain_suffix"
+        );
+        assert_eq!(
+            rule_of(Some("domain"), "a.com"),
+            Some(Rule::Domain("a.com".into()))
+        );
+        assert_eq!(rule_of(Some("port"), "5228"), Some(Rule::Port(5228)));
+        assert_eq!(rule_of(Some("port"), "abc"), None);
+        assert_eq!(rule_of(Some("regex"), ".*"), None);
+        // 主机名校验（v3 R13 §8.4 的 `^[a-z0-9.-]{1,253}$`）
+        assert_eq!(rule_of(None, "a b.com"), None);
+        assert_eq!(rule_of(None, ""), None);
+        assert_eq!(
+            rule_parts(&Rule::Port(853)),
+            ("port".to_string(), "853".to_string())
+        );
+        assert_eq!(
+            rule_parts(&Rule::DomainSuffix("a.com".into())),
+            ("domain_suffix".to_string(), "a.com".to_string())
+        );
+    }
+}
