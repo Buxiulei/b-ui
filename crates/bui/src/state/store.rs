@@ -81,10 +81,6 @@ impl Store {
         *self.0.cache.write().await = next.clone();
         Ok(next)
     }
-
-    pub fn path(&self) -> &Path {
-        &self.0.path
-    }
 }
 
 /// `pub(crate)`：`state::runtime::Runtime::update` 复用它，保证 `runtime.json` 也是
