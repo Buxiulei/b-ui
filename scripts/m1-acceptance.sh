@@ -294,6 +294,18 @@ check_hy2_auth() {
   return 0
 }
 
+# 二次 install 的输出 → 问题描述（空串 = 走了对账路径）。
+# **整份输出**里找「已安装」，不许先 tail 截尾：已装机上 `install --yes` 之后还要打自检表与
+# 结尾摘要，「已安装（…）执行对账」那行离尾巴几十行远，截尾窗口一概看不到它
+# （2026-09-13 bwg-rick 真机据此误判 step2）。
+check_reinstall_output() {
+  if printf '%s' "$1" | grep -q "已安装"; then
+    return 0
+  fi
+  printf '整份输出（%d 行）里没有「已安装」，这趟像是走了全新装机路径\n' \
+    "$(printf '%s\n' "$1" | wc -l)"
+}
+
 # 对账报告 JSON → 问题描述（空串 = 零变更零错误）
 check_report_clean() {
   python3 - "$1" <<'PY'
@@ -319,8 +331,15 @@ run_checks() {
   if [ -z "$out" ]; then ok "step1 体检：无漂移、无错误、六单元在跑"; else no "step1 体检不干净" "$out"; fi
 
   # step 2：二次 install 零变更 + 二次对账零变更
-  out=$("$BUI" install --yes 2>&1 | tail -n 20)
-  if printf '%s' "$out" | grep -q "已安装"; then ok "step2 二次 install 走对账路径（不覆盖 state）"; else no "step2 二次 install 行为异常" "$out"; fi
+  local install_out
+  install_out=$("$BUI" install --yes 2>&1)
+  out=$(check_reinstall_output "$install_out")
+  if [ -z "$out" ]; then
+    ok "step2 二次 install 走对账路径（不覆盖 state）"
+  else
+    # 判定看的是整份输出，失败时才只贴尾巴几十行（整份太长，贴出来没人看）
+    no "step2 二次 install 行为异常" "$out$(printf '%s\n' "$install_out" | tail -n 20)"
+  fi
   local report
   report=$("$BUI" reconcile --dry-run 2>/dev/null)
   out=$(check_report_clean "$report")
@@ -412,8 +431,29 @@ self_test() {
   if [ -z "$out" ]; then ok "自测：零变更报告判通过"; else no "自测：零变更报告被误判" "$out"; fi
   out=$(check_report_clean '{"changed":["/opt/b-ui/config.yaml"],"restarted":["hysteria-server"],"errors":[],"verify_failures":[],"drift":[],"notes":[]}')
   if [[ "$out" == *config.yaml* ]]; then ok "自测：有变更的报告被判失败"; else no "自测：漏判变更" "$out"; fi
+  self_test_reinstall_output
   self_test_external_sites
   self_test_hy2_auth
+}
+
+# step 2 的自测：只验「已安装」这一行的判定，重点是**输出很长也不能漏**（旧版 tail -n 20 就漏了）
+self_test_reinstall_output() {
+  local long out
+  long="已安装（/opt/b-ui/state.json 已存在），执行对账"$'\n'
+  long+=$(for i in $(seq 1 80); do printf 'PASS  自检项 %d\n' "$i"; done)
+  long+=$'\n面板        https://example.com/\n用户        3 个（订阅见面板）'
+  out=$(check_reinstall_output "$long")
+  if [ -z "$out" ]; then
+    ok "自测：输出 80+ 行、「已安装」在最前面也判通过（不截尾）"
+  else
+    no "自测：长输出里的「已安装」被漏掉" "$out"
+  fi
+  out=$(check_reinstall_output "$(printf '开始全新装机\nPASS  自检项 1\n')")
+  if [[ "$out" == *已安装* ]]; then
+    ok "自测：输出里没有「已安装」判失败"
+  else
+    no "自测：没有「已安装」却没被判失败" "$out"
+  fi
 }
 
 # step 6 的自测：hysteria 客户端与 curl 都换成 fake，只验「取凭据 / 取端口 / 判定 / SKIP」

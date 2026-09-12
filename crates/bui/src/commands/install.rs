@@ -642,25 +642,36 @@ fn first_user(username: &str) -> anyhow::Result<bui_schema::model::User> {
 /// 第一个用户与他那三条**能直接粘进客户端**的订阅地址、两个入口。
 ///
 /// 没有用户（`state.users` 为空）时退回 `<用户名>` 形状：那时没有任何地址能填得出来。
-pub fn summary(state: &State, password_notice: Option<&str>) -> String {
+///
+/// `fresh` = 这一趟是不是全新装机（判据与 [`run`] / [`run_with`] 同一条：`state.json` 在不在）。
+/// 已装机上重跑 `bui install` 只是对账，没有新建任何用户，照打「第一个用户 <名>」+ 他的订阅会
+/// 让人以为刚给他建了号（2026-09-13 bwg-rick 真机误读）——那条路径只报一行用户数。
+pub fn summary(state: &State, password_notice: Option<&str>, fresh: bool) -> String {
     let d = &state.node.domain;
     let mut out = vec![format!("面板        https://{d}/")];
     if let Some(line) = password_notice {
         out.push(format!("管理员      {line}"));
     }
-    match state.users.first() {
-        Some(u) => {
-            let n = &u.username;
-            out.push(format!("第一个用户  {n}"));
-            out.push(format!("订阅        https://{d}/api/sub/{n}（v2rayN）"));
-            out.push(format!(
-                "            https://{d}/api/subscription/{n}（sing-box）"
-            ));
-            out.push(format!("            https://{d}/api/clash/{n}（mihomo）"));
+    if !fresh {
+        out.push(format!(
+            "用户        {} 个（订阅见面板）",
+            state.users.len()
+        ));
+    } else {
+        match state.users.first() {
+            Some(u) => {
+                let n = &u.username;
+                out.push(format!("第一个用户  {n}"));
+                out.push(format!("订阅        https://{d}/api/sub/{n}（v2rayN）"));
+                out.push(format!(
+                    "            https://{d}/api/subscription/{n}（sing-box）"
+                ));
+                out.push(format!("            https://{d}/api/clash/{n}（mihomo）"));
+            }
+            None => out.push(format!(
+                "订阅        https://{d}/api/sub/<用户名>（v2rayN）· /api/subscription/<用户名>（sing-box）· /api/clash/<用户名>（mihomo）"
+            )),
         }
-        None => out.push(format!(
-            "订阅        https://{d}/api/sub/<用户名>（v2rayN）· /api/subscription/<用户名>（sing-box）· /api/clash/<用户名>（mihomo）"
-        )),
     }
     out.push("后续        `b-ui` 进菜单 / `bui status` 看体检 / `bui reconcile` 手动对账".into());
     out.join("\n")
@@ -819,9 +830,9 @@ async fn collect_answers(
 /// 而全新服务器上证书签发或校验器失败非常常见。一次性管理员密码只有这一屏机会（`state.json`
 /// 里只存 argon2 hash，面板 `/api/password` 又要先登录），漏打就只剩「删 state.json 整机重装」
 /// ——REALITY 密钥等全部重生成——这一条路。
-async fn final_summary(state_path: &Path, notice: Option<&str>) -> Option<String> {
+async fn final_summary(state_path: &Path, notice: Option<&str>, fresh: bool) -> Option<String> {
     let store = Store::open(state_path).await.ok()?;
-    Some(summary(store.read().await.as_ref(), notice))
+    Some(summary(store.read().await.as_ref(), notice, fresh))
 }
 
 /// 面向真实终端的入口：读已装机的期望态 → 收集 `Answers` → 交给 [`run_with`]。
@@ -864,7 +875,7 @@ pub async fn run(opts: InstallOpts, paths: Paths, host: Arc<dyn Host>) -> anyhow
         Err(e) => e.downcast_ref::<SelfCheckFailed>().map(|f| f.0),
         Ok(()) => None,
     };
-    if let Some(text) = final_summary(&state_path, notice.as_deref()).await {
+    if let Some(text) = final_summary(&state_path, notice.as_deref(), installed.is_none()).await {
         println!("{text}");
     }
     if let Some(n) = failed {
@@ -2413,7 +2424,7 @@ mod tests {
             "state.json 已落盘（密码的 hash 在里面）"
         );
         let line = "已生成随机管理员密码：hunter2（只显示这一次，请立刻存好）";
-        let text = final_summary(&state_path, Some(line))
+        let text = final_summary(&state_path, Some(line), true)
             .await
             .expect("state.json 在就该有摘要");
         assert!(text.contains("hunter2"), "装到一半失败也要打出密码：{text}");
@@ -2421,9 +2432,13 @@ mod tests {
         // state.json 还没落盘（如端口被占、缺内核）时没有摘要可打：那时密码一次都没用上
         let empty = tempfile::tempdir().unwrap();
         assert!(
-            final_summary(&crate::paths::state_file(&scratch(&empty)), Some(line))
-                .await
-                .is_none(),
+            final_summary(
+                &crate::paths::state_file(&scratch(&empty)),
+                Some(line),
+                true
+            )
+            .await
+            .is_none(),
             "state.json 不在就不该打摘要"
         );
     }
@@ -2434,6 +2449,7 @@ mod tests {
         let s = summary(
             &state,
             Some("已生成随机管理员密码：hunter2（只显示这一次，请立刻存好）"),
+            true,
         );
         assert!(s.contains("https://example.com/"), "{s}");
         assert!(s.contains("hunter2"), "一次性密码只在摘要里出现这一次：{s}");
@@ -2448,11 +2464,11 @@ mod tests {
         }
         assert!(s.contains("`b-ui`") && s.contains("bui status"), "{s}");
         // 已装机重跑（没有一次性密码）时不出现「管理员」那一行
-        assert!(!summary(&state, None).contains("管理员"));
+        assert!(!summary(&state, None, true).contains("管理员"));
         // 没有用户（v3 导入前的空盘、或用户被删光）时退回 `<用户名>` 形状
         let mut empty = crate::testutil::sample_state();
         empty.users.clear();
-        let s = summary(&empty, None);
+        let s = summary(&empty, None, true);
         for shape in [
             "/api/sub/<用户名>",
             "/api/subscription/<用户名>",
@@ -2460,6 +2476,43 @@ mod tests {
         ] {
             assert!(s.contains(shape), "订阅形状缺 {shape}：{s}");
         }
+    }
+
+    /// 已装机上重跑 `bui install` 只对账、一个用户都没新建，摘要于是不许再写「第一个用户 <名>」
+    /// 与他的订阅——真机上那行被读成「又给他建了一个号」（2026-09-13 bwg-rick）。
+    /// 那条路径只报一行用户数；全新装机那条照旧给三条能直接粘的地址。
+    #[test]
+    fn the_summary_only_names_the_first_user_on_a_fresh_install() {
+        let state = crate::testutil::sample_state();
+        let fresh = summary(&state, None, true);
+        let again = summary(&state, None, false);
+        assert!(fresh.contains("第一个用户  alice"), "{fresh}");
+        assert!(
+            !again.contains("第一个用户"),
+            "已装机路径不许写「第一个用户」：{again}"
+        );
+        assert!(
+            !again.contains("alice") && !again.contains("/api/sub/"),
+            "已装机路径不许列某个用户的订阅：{again}"
+        );
+        assert!(
+            again.contains("用户        1 个（订阅见面板）"),
+            "已装机路径只报用户数：{again}"
+        );
+        // 面板地址、一次性密码、两个入口两条路径都要有
+        for both in ["https://example.com/", "`b-ui`", "bui status"] {
+            assert!(fresh.contains(both) && again.contains(both), "{again}");
+        }
+        assert!(
+            summary(&state, Some("已生成随机管理员密码：hunter2"), false).contains("hunter2"),
+            "已装机路径有密码行时照打"
+        );
+        // 用户被删光的已装机机器：还是那一行，不退回 `<用户名>` 形状
+        let mut empty = crate::testutil::sample_state();
+        empty.users.clear();
+        let none = summary(&empty, None, false);
+        assert!(none.contains("用户        0 个（订阅见面板）"), "{none}");
+        assert!(!none.contains("<用户名>"), "{none}");
     }
 
     /// 按顺序吐出预置答案（吐完一律回空串 = 直接回车），并记下每一句提问原文。
