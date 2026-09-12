@@ -25,8 +25,9 @@ pub mod upstream;
 pub const RUNTIME_KEY: &str = "residential";
 /// 住宅分组（v4 只有一个；直接用 `bui-schema` 的常量，不另立字符串）
 pub const GROUP_DEFAULT: &str = DEFAULT_GROUP;
-/// relay 里 selector 的 tag（`bui_schema::render::relay` 写死同名）
-pub const POOL: &str = "resi-pool";
+/// relay 里全局 selector 的 tag（真源在 `bui_schema::render::relay`，这里只是转出来给
+/// 巡检与 Clash 客户端用）
+pub const POOL: &str = bui_schema::render::relay::POOL;
 /// 成员 tag 前缀，`resi-1..resi-N`，N = `upstreams` 的下标 +1（与 render/relay.rs 的 `tag()` 同规则）
 pub const MEMBER_PREFIX: &str = "resi-";
 /// 池上限：relay 每个成员一个出站，再多面板表格与 Clash API 都不好用了（v3 面板 `slice(0,8)`）

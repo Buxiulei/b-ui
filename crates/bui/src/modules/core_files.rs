@@ -158,7 +158,11 @@ impl Module for CoreFilesModule {
             .restart_key(hash),
         );
         let group = s.residential.default_group().cloned().unwrap_or_default();
-        let relay = bui_schema::render::relay::config(&group, &relay_opts(s, p));
+        let relay = bui_schema::render::relay::config(
+            &group,
+            &bui_schema::slots::sorted(&s.residential),
+            &relay_opts(s, p),
+        );
         out.push(
             Artifact::file(
                 p.base_dir.join("singbox-relay.json"),
@@ -411,8 +415,11 @@ mod tests {
         assert_eq!(opts.api, RELAY_CLASH_API);
         assert_eq!(opts.cache_path, "/opt/b-ui/relay-cache.db");
         assert_eq!(opts.server_ip.as_deref(), Some("203.0.113.10"));
-        let expect =
-            bui_schema::render::relay::config(s.residential.default_group().unwrap(), &opts);
+        let expect = bui_schema::render::relay::config(
+            s.residential.default_group().unwrap(),
+            &bui_schema::slots::sorted(&s.residential),
+            &opts,
+        );
         match find_file(&arts, "/opt/b-ui/singbox-relay.json") {
             Artifact::File {
                 content,
