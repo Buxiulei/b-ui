@@ -23,6 +23,7 @@ mod util;
 use anyhow::Result;
 use clap::{CommandFactory, Parser};
 use cli::{Cli, Command};
+use std::path::PathBuf;
 
 // main 是**同步**的：spec §3.2 要求 `bui auth-hook` 不初始化 tokio、不初始化 tracing、不加载 state
 // （M5 有 200 建连/秒、p99 < 20ms 的门槛，每次建连都要 fork 一个 bui），所以派发在建 runtime 之前
@@ -57,8 +58,23 @@ async fn dispatch(command: Command) -> Result<()> {
     match command {
         Command::Install { .. } => not_yet("install"),
         Command::Upgrade { .. } => not_yet("upgrade"),
-        Command::Serve => not_yet("serve"),
-        Command::Reconcile { .. } => not_yet("reconcile"),
+        Command::Serve => {
+            serve::run(
+                bui_schema::paths::Paths::default_server(),
+                std::sync::Arc::new(sys::real::RealHost::new()),
+            )
+            .await
+        }
+        Command::Reconcile { force, dry_run } => {
+            serve::reconcile_cli(
+                bui_schema::paths::Paths::default_server(),
+                std::sync::Arc::new(sys::real::RealHost::new()),
+                PathBuf::from(paths::SOCKET_PATH),
+                force,
+                dry_run,
+            )
+            .await
+        }
         Command::Status { .. } => not_yet("status"),
         Command::ImportV3 { .. } => not_yet("import-v3"),
         Command::AuthHook { .. } => unreachable!("auth-hook 已在 main 里提前返回"),
