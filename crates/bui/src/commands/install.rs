@@ -223,6 +223,17 @@ fn xray_program(host: &dyn Host, paths: &Paths) -> Option<String> {
     host.which("xray").then(|| "xray".to_string())
 }
 
+/// `xray x25519` 解析失败时**唯一**可以进错误信息的上下文：行数 + 首行前 40 字符（先脱敏再截）。
+/// 那段输出里就有 REALITY 私钥，整段回传会让它进用户的终端记录与 journal。
+fn x25519_parse_hint(text: &str) -> String {
+    let head: String =
+        crate::redact::url_credentials(text.lines().next().unwrap_or_default().trim())
+            .chars()
+            .take(40)
+            .collect();
+    format!("共 {} 行，首行前 40 字符：{head}", text.lines().count())
+}
+
 /// 生成 REALITY 密钥；`dest` 与 `server_names` 留空占位，由 [`build_state`] 按
 /// `answers.masquerade` 一起填。
 fn generate_reality(host: &dyn Host, paths: &Paths) -> anyhow::Result<Reality> {
@@ -241,7 +252,10 @@ fn generate_reality(host: &dyn Host, paths: &Paths) -> anyhow::Result<Reality> {
         &out.stdout
     };
     let Some((private_key, public_key)) = parse_x25519(text) else {
-        anyhow::bail!("解析 `xray x25519` 的输出失败：{}", text.trim());
+        anyhow::bail!(
+            "解析 `xray x25519` 的输出失败（{}）；请核对该版本 xray 的输出格式",
+            x25519_parse_hint(text)
+        );
     };
     Ok(Reality {
         private_key,
@@ -358,8 +372,34 @@ fn ask(prompt: &str, default: &str) -> String {
     }
 }
 
-/// 面向真实终端的入口：探事实 → 收集 `Answers` → 交给 [`run_with`]。
-pub async fn run(opts: InstallOpts, paths: Paths, host: Arc<dyn Host>) -> anyhow::Result<()> {
+/// 已装机时的 `Answers`：事实全部复用 `state.json`，密码留空。
+/// （[`run_with`] 的非全新路径只对账，`answers` 一概不看；这里给出的是「与现状一致」的形状，
+/// 而不是一组会误导人的新值。）
+fn answers_from_state(state: &State) -> Answers {
+    Answers {
+        domain: state.node.domain.clone(),
+        admin_password: String::new(),
+        node_name: state.node.name.clone(),
+        public_ip: state.node.public_ip.clone(),
+        ports: state.node.ports.clone(),
+        masquerade: state.node.reality.dest.clone(),
+    }
+}
+
+/// 收集 `Answers`。返回的第二项是 [`run`] 要打到 stdout 的那一行提示（随机管理员密码**只**在
+/// 这里出现一次），`None` = 没有要打的。
+///
+/// `installed` 是已装机时读到的期望态：非 `None` 时既不探公网 IP（省一次 5s 的 curl，离线机器
+/// 上也不再刷提示），也不生成随机密码——活机器上重跑 `bui install` 打印「已生成随机管理员密码」
+/// 会让人以为面板密码被换了，而 `state.json` 里的哈希其实一个字没动。
+async fn collect_answers(
+    opts: &InstallOpts,
+    installed: Option<&State>,
+    host: Arc<dyn Host>,
+) -> anyhow::Result<(Answers, Option<String>)> {
+    if let Some(state) = installed {
+        return Ok((answers_from_state(state), None));
+    }
     let (hostname, probed_ip) = {
         let h = host.clone();
         tokio::task::spawn_blocking(move || {
@@ -398,17 +438,35 @@ pub async fn run(opts: InstallOpts, paths: Paths, host: Arc<dyn Host>) -> anyhow
     if let Some(p) = opts.port {
         answers.ports.hy2 = p;
     }
-    answers.admin_password = if opts.admin_password_stdin {
+    let notice = if opts.admin_password_stdin {
         let mut buf = String::new();
         std::io::stdin().read_line(&mut buf)?;
-        buf.trim_end_matches('\n').to_string()
+        answers.admin_password = buf.trim_end_matches('\n').to_string();
+        None
     } else {
         let pw = random_hex(8);
-        println!("已生成随机管理员密码：{pw}（只显示这一次，请立刻存好）");
         // Global Constraints：密码不进日志。`secret` 只记长度，不记内容
         tracing::info!(password = %crate::redact::secret(&pw), "已生成随机管理员密码");
-        pw
+        let notice = format!("已生成随机管理员密码：{pw}（只显示这一次，请立刻存好）");
+        answers.admin_password = pw;
+        Some(notice)
     };
+    Ok((answers, notice))
+}
+
+/// 面向真实终端的入口：读已装机的期望态 → 收集 `Answers` → 交给 [`run_with`]。
+pub async fn run(opts: InstallOpts, paths: Paths, host: Arc<dyn Host>) -> anyhow::Result<()> {
+    // 判据与 `run_with` 的 `fresh` 完全同一条（`state.json` 在不在），两边不会分叉
+    let state_path = crate::paths::state_file(&paths);
+    let installed = if state_path.exists() {
+        Some(Store::open(&state_path).await?.read().await)
+    } else {
+        None
+    };
+    let (answers, notice) = collect_answers(&opts, installed.as_deref(), host.clone()).await?;
+    if let Some(line) = notice {
+        println!("{line}");
+    }
     let manifest_url = crate::kernels::manifest_url(None, None);
     run_with(
         opts,
@@ -572,6 +630,46 @@ mod tests {
             ))
         );
         assert_eq!(parse_x25519("nothing useful"), None);
+    }
+
+    #[test]
+    fn x25519_parse_failure_never_echoes_the_whole_output() {
+        // `xray x25519` 的输出里就有私钥：解析失败时把整段回传给用户，私钥会进终端记录与
+        // journal（错误一路往上冒到 main 的 tracing::error）。错误只许带行数与首行前 40 字符。
+        let d = tempfile::tempdir().unwrap();
+        let paths = scratch(&d);
+        let xray = paths.bin_dir.join("xray").display().to_string();
+        let h = FakeHost::new();
+        h.with(|i| {
+            i.files
+                .insert(paths.bin_dir.join("xray"), (b"ELF".to_vec(), 0o755));
+            i.scripted.push((
+                format!("{xray} x25519"),
+                // 首行是个报错，后面两行照旧带着密钥（真机上 xray 换输出格式时就是这形状）
+                CmdOut::success(
+                    "unknown flag: x25519 —— 这一行超过四十个字符，尾巴必须被截掉\nPrivateKeyX: CBuMG2F9fOCyzMKCniVKSS6lmXyKRmD9stuXyXeKSF4\nHash32: 3Vnzmd-rq4njP5IfMf_wYgFrGEuMBpJqgOh-UAdLOUY\n",
+                ),
+            ));
+        });
+        let err = generate_reality(&h, &paths).unwrap_err().to_string();
+        assert!(
+            !err.contains("CBuMG2F9") && !err.contains("PrivateKeyX"),
+            "整段输出不许回传：{err}"
+        );
+        assert!(err.contains("3 行"), "要带行数：{err}");
+        assert!(err.contains("unknown flag: x25519"), "要带首行开头：{err}");
+        // 首行前 40 字符（按字符数，不是字节数：中文不能把 UTF-8 切断）
+        let head: String = "unknown flag: x25519 —— 这一行超过四十个字符，尾巴必须被截掉"
+            .chars()
+            .take(40)
+            .collect();
+        assert!(err.contains(&head), "{err}");
+        assert!(!err.contains("尾巴必须被截掉"), "首行也要截断：{err}");
+        // userinfo 形态的凭据经 redact
+        assert_eq!(
+            x25519_parse_hint("socks5://user:pa:ss@isp.example.net:10007 拒绝连接\n"),
+            "共 1 行，首行前 40 字符：socks5://***:***@isp.example.net:10007 拒"
+        );
     }
 
     #[test]
@@ -839,6 +937,45 @@ mod tests {
             })
         );
         assert!(snap["users"].get("nobody").is_none());
+    }
+
+    #[tokio::test]
+    async fn reinstall_on_an_installed_machine_generates_no_password_and_probes_no_ip() {
+        // 活机器上重跑 `bui install`（升级脚本、`--yes` 的自动化都会）只该对账：
+        // ① 再打印一行「已生成随机管理员密码」会让运维以为面板密码被换了（其实 state.json 里
+        //    的哈希一个字没动）；② 公网 IP 已在 state 里，没必要再花 5s curl 一次 ipify。
+        let d = tempfile::tempdir().unwrap();
+        let paths = scratch(&d);
+        let host = host_for_install(&paths);
+        let state = crate::testutil::sample_state();
+        host.clear_ops();
+        // `notice` 就是 run() 要打到 stdout 的那一行（密码只在这一处出现）
+        let (a, notice) = collect_answers(&opts(&d), Some(&state), host.clone())
+            .await
+            .unwrap();
+        assert_eq!(notice, None, "已装机不生成、不打印随机管理员密码");
+        assert!(a.admin_password.is_empty());
+        assert_eq!(a.public_ip, "203.0.113.10", "复用 state.node.public_ip");
+        assert_eq!(a.node_name, "node-a");
+        assert_eq!(a.domain, "example.com");
+        assert_eq!(a.ports.hy2, 10000);
+        assert_eq!(a.masquerade, "www.bing.com:443");
+        // IP 探测是 Host 上的一次 curl（Fetcher 不参与装机探测）：一条流水都不该有
+        assert_eq!(host.ops(), Vec::<String>::new(), "{:?}", host.ops());
+        // 全新装机（没有 state.json）那一支照旧探 IP、生成并打印密码
+        host.clear_ops();
+        let (b, notice) = collect_answers(&opts(&d), None, host.clone())
+            .await
+            .unwrap();
+        let line = notice.expect("全新装机必须给出密码");
+        assert!(line.contains("已生成随机管理员密码"), "{line}");
+        assert!(line.contains(&b.admin_password));
+        assert_eq!(b.admin_password.len(), 16);
+        assert!(
+            host.ops().iter().any(|o| o.contains("api.ipify.org")),
+            "{:?}",
+            host.ops()
+        );
     }
 
     #[test]

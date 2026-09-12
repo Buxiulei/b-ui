@@ -122,14 +122,13 @@ pub fn rollback(host: &dyn Host, paths: &Paths) -> anyhow::Result<Vec<String>> {
         .ok_or_else(|| anyhow::anyhow!("没有 {}，无法回滚二进制", prev.display()))?;
     host.write_file(&paths.bin_dir.join("bui"), &bytes, 0o755)?;
     let mut done = vec![format!("已恢复上一版 bui（{}）", prev.display())];
-    let backups = crate::paths::backups_dir(paths);
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(&backups)
-        .map(|it| it.filter_map(|e| e.ok().map(|e| e.path())).collect())
-        .unwrap_or_default();
-    // 备份名是 `state-<stamp>-<nnn>.json`（零填充，Task 2）⇒ 字典序 == 时间序
-    entries.sort();
-    if let Some(newest) = entries.last() {
-        std::fs::copy(newest, crate::paths::state_file(paths))?;
+    // 备份名是 `state-<stamp>-<nnn>.json`（零填充，Task 2）⇒ 字典序 == 时间序，而 `list_dir`
+    // 的契约就是「直接子项、按路径名升序」⇒ 最后一项就是最近一份。目录不存在时它给空表。
+    if let Some(newest) = host.list_dir(&crate::paths::backups_dir(paths))?.pop() {
+        let bytes = host
+            .read_file(&newest)?
+            .ok_or_else(|| anyhow::anyhow!("读取备份 {} 失败", newest.display()))?;
+        host.write_file(&crate::paths::state_file(paths), &bytes, 0o600)?;
         done.push(format!("已恢复期望态备份 {}", newest.display()));
     }
     let _ = host.systemd("restart", "b-ui");
@@ -404,19 +403,22 @@ mod tests {
             certs_dir: d.path().join("certs"),
             bin_dir: d.path().join("bin"),
         };
-        std::fs::create_dir_all(crate::paths::backups_dir(&paths)).unwrap();
-        std::fs::write(
-            crate::paths::backups_dir(&paths).join("state-20260910T000000Z.json"),
-            b"{\"old\":1}",
-        )
-        .unwrap();
-        std::fs::write(
-            crate::paths::backups_dir(&paths).join("state-20260911T000000Z.json"),
-            b"{\"new\":1}",
-        )
-        .unwrap();
-        std::fs::write(crate::paths::state_file(&paths), b"{\"current\":1}").unwrap();
+        // 回滚的每一次读写都经 Host（与 upgrade 的其它路径同一口径），所以夹具全在 FakeHost 里，
+        // tempdir 只用来给出一组互不冲突的绝对路径。
         let h = FakeHost::new();
+        h.with(|i| {
+            for (name, body) in [
+                ("state-20260910T000000Z-001.json", b"{\"old\":1}".to_vec()),
+                ("state-20260911T000000Z-001.json", b"{\"new\":1}".to_vec()),
+            ] {
+                i.files
+                    .insert(crate::paths::backups_dir(&paths).join(name), (body, 0o600));
+            }
+            i.files.insert(
+                crate::paths::state_file(&paths),
+                (b"{\"current\":1}".to_vec(), 0o600),
+            );
+        });
         h.write_file(&paths.bin_dir.join("bui.prev"), b"OLDBUI", 0o755)
             .unwrap();
         h.write_file(&paths.bin_dir.join("bui"), b"NEWBUI", 0o755)
@@ -427,14 +429,20 @@ mod tests {
                 .as_deref(),
             Some("OLDBUI")
         );
+        let state = crate::paths::state_file(&paths).display().to_string();
         assert_eq!(
-            std::fs::read_to_string(crate::paths::state_file(&paths)).unwrap(),
-            "{\"new\":1}",
+            h.text(&state).as_deref(),
+            Some("{\"new\":1}"),
             "恢复最近一份备份"
+        );
+        assert_eq!(h.mode(&state), Some(0o600), "state.json 含秘密，必须 0600");
+        assert!(
+            !std::fs::exists(crate::paths::state_file(&paths)).unwrap(),
+            "不许绕过 Host 直接写真实文件系统"
         );
         assert!(done
             .iter()
-            .any(|l| l.contains("state-20260911T000000Z.json")));
+            .any(|l| l.contains("state-20260911T000000Z-001.json")));
         assert!(h.ops().contains(&"systemd:restart:b-ui".to_string()));
     }
 
