@@ -14,7 +14,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 /// `<base>` 顶层允许存在、但不是 artifact 的条目（少一项就会每轮报永久漂移）
-pub const BASE_WHITELIST: [&str; 13] = [
+pub const BASE_WHITELIST: [&str; 14] = [
     "bin",
     "certs",
     "caddy",
@@ -25,6 +25,9 @@ pub const BASE_WHITELIST: [&str; 13] = [
     "state.json",
     "runtime.json",
     "manifest.json",
+    // `bui upgrade` 留下的回滚快照。同一批的 `bin/bui.prev` 与 `bin/<kernel>.prev` 不用单独
+    // 列：`stray_file` 只看顶层直接子项，`bin` 本身已在白名单里且不递归（见 `scan` 的说明）。
+    "manifest.prev.json",
     "relay-cache.db",
     "auth-snapshot.json",
     "auth-hook.log",
@@ -360,6 +363,11 @@ mod tests {
                 .insert("/opt/b-ui/runtime.json".into(), (b"{}".to_vec(), 0o600));
             i.files
                 .insert("/opt/b-ui/manifest.json".into(), (b"{}".to_vec(), 0o644));
+            // `bui upgrade` 留下的回滚快照（`--rollback` 靠它回退内核与内核版本表）
+            i.files.insert(
+                "/opt/b-ui/manifest.prev.json".into(),
+                (b"{}".to_vec(), 0o644),
+            );
             i.files.insert(
                 "/opt/b-ui/relay-cache.db".into(),
                 (b"sqlite".to_vec(), 0o644),
@@ -372,6 +380,12 @@ mod tests {
                 .insert("/opt/b-ui/bin/xray".into(), (b"ELF".to_vec(), 0o755));
             i.files
                 .insert("/opt/b-ui/bin/bui.prev".into(), (b"ELF".to_vec(), 0o755));
+            for k in crate::kernels::KERNELS {
+                i.files.insert(
+                    format!("/opt/b-ui/bin/{k}.prev").into(),
+                    (b"ELF".to_vec(), 0o755),
+                );
+            }
             i.files.insert(
                 "/opt/b-ui/certs/fullchain.pem".into(),
                 (b"CERT".to_vec(), 0o644),
