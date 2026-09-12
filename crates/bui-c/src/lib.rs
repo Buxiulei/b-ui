@@ -10,6 +10,8 @@ pub mod paths;
 pub mod profiles;
 pub mod sys;
 pub mod testutil;
+pub mod ufw;
+pub mod uninstall;
 pub mod units;
 
 pub use error::{Error, Result};
