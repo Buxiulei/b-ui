@@ -2,7 +2,8 @@
 //! v3.6 在 TUN 期间 `ufw disable` 把整墙关掉；v4 只加两条接口规则，墙全程开着。
 //!
 //! 编排在 T12 的 CLI：TUN 模式 `apply` 前 [`allow_tun`]，切 socks 与 `uninstall` 后
-//! [`revoke_tun`]。`engine` 不认识 ufw，保持单一职责。
+//! [`revoke_tun`]；巡检（`check`）每分钟用 [`ensure_tun`] 幂等重放缺掉的规则。
+//! `engine` 不认识 ufw，保持单一职责。
 
 use crate::paths::TUN_IFACE;
 use crate::sys::Sys;
@@ -51,9 +52,35 @@ pub fn allow_tun<S: Sys>(sys: &S) -> Result<bool> {
     if !active(sys) {
         return Ok(false);
     }
-    must(sys, &["allow", "in", "on", TUN_IFACE])?;
-    must(sys, &["route", "allow", "in", "on", TUN_IFACE])?;
+    add_tun_rules(sys)?;
     Ok(true)
+}
+
+fn add_tun_rules<S: Sys>(sys: &S) -> Result<()> {
+    must(sys, &["allow", "in", "on", TUN_IFACE])?;
+    must(sys, &["route", "allow", "in", "on", TUN_IFACE])
+}
+
+/// `ufw status` 里 `bui-tun` 的两条规则是否都在：接口规则渲染成
+/// `Anywhere on bui-tun … ALLOW IN`，转发规则渲染成 `… ALLOW FWD … on bui-tun`。
+fn rules_present(status: &str) -> bool {
+    let lines: Vec<&str> = status.lines().filter(|l| l.contains(TUN_IFACE)).collect();
+    lines.iter().any(|l| l.contains("ALLOW IN")) && lines.iter().any(|l| l.contains("ALLOW FWD"))
+}
+
+/// 幂等重放（`check` 每分钟调一次）：两条规则都在就什么都不做，缺了就补齐。
+/// 用户 `ufw reset` / 重装 ufw 会把规则清掉，而 UFW 默认 FORWARD DROP 会掐掉
+/// sing-box 转发的 TCP——隧道看着「在跑」却什么都打不开。
+///
+/// 未装或未启用 → `Ok(false)`（不替用户开墙）；真补了规则 → `Ok(true)`。
+pub fn ensure_tun<S: Sys>(sys: &S) -> Result<bool> {
+    match status(sys) {
+        Some(s) if s.contains("Status: active") && !rules_present(&s) => {
+            add_tun_rules(sys)?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
 }
 
 /// 撤回两条规则。未装 → `Ok(false)`；墙当前关着也照样撤（规则还在配置里）。
@@ -110,6 +137,41 @@ mod tests {
         assert!(revoke_tun(&s).unwrap());
         assert!(s.called("ufw delete allow in on bui-tun"));
         assert!(s.called("ufw route delete allow in on bui-tun"));
+    }
+
+    #[test]
+    fn ensure_tun_is_idempotent_and_only_runs_on_an_active_wall() {
+        let with_rules = "Status: active\n\n\
+            To                         Action      From\n\
+            Anywhere on bui-tun        ALLOW IN    Anywhere\n\
+            Anywhere                   ALLOW FWD   Anywhere on bui-tun\n";
+        // 规则都在 → 不重复
+        let s = FakeSys::new();
+        s.reply("ufw status", 0, with_rules);
+        assert!(!ensure_tun(&s).unwrap());
+        assert!(!s.called("ufw allow in on bui-tun"));
+
+        // 只剩转发规则（另一条被 `ufw delete` 掉了）→ 两条都补
+        let s = FakeSys::new();
+        s.reply(
+            "ufw status",
+            0,
+            "Status: active\n\nAnywhere        ALLOW FWD   Anywhere on bui-tun\n",
+        );
+        assert!(ensure_tun(&s).unwrap());
+        assert!(s.called("ufw allow in on bui-tun"));
+        assert!(s.called("ufw route allow in on bui-tun"));
+
+        // 墙关着 / 没装 → 什么都不做
+        for st in [Some("Status: inactive\n"), None] {
+            let s = FakeSys::new();
+            match st {
+                Some(out) => s.reply("ufw status", 0, out),
+                None => s.reply("ufw status", 127, ""),
+            }
+            assert!(!ensure_tun(&s).unwrap());
+            assert!(!s.called("ufw allow in on bui-tun"));
+        }
     }
 
     #[test]

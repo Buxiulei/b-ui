@@ -159,9 +159,18 @@ fn engine_status<S: Sys, N: Net, P: Prompt>(ctx: &Ctx<'_, S, N, P>, prof: &Profi
         tun_up: Engine::new(ctx.sys, ctx.paths).tun_up(),
         socks_port: prof.socks_port,
         http_port: prof.http_port,
-        update_available: false,
+        // 上一次检查更新的结论，不为渲染一屏菜单去联网（写在 `update` / 巡检自更新里）
+        update_available: Runtime::load(ctx.sys, ctx.paths).update_available,
         auto_update: prof.auto_update,
     }
+}
+
+/// 这次检查之后「还有新版没装」吗——菜单 `[6] ★ 有新版` 的口径。
+///
+/// 刚刚自替换成 manifest 版本时要算「没有新版」：本进程的 `VERSION` 还是旧二进制的，
+/// 光比版本号会让菜单一直挂着 ★，直到下次检查。
+fn new_version_pending(r: &update::Report) -> bool {
+    r.manifest_version != crate::VERSION && !r.self_updated
 }
 
 /// 唯一的「改机器」路径：装内核 → 同步 UFW → apply。
@@ -421,6 +430,9 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
                 match update::run(ctx.sys, ctx.net, ctx.paths, &prof, false) {
                     Ok(r) => {
                         rt.last_update_at = Some(ctx.sys.now().unix_timestamp());
+                        // 自更新也是一次「检查更新」：装完了就把菜单上的 ★ 摘掉
+                        rt.update_available = new_version_pending(&r);
+                        rt.update_checked_at = rt.last_update_at;
                         rt.save(ctx.sys, ctx.paths)?;
                         if r.self_updated || r.kernel_updated {
                             ctx.say(format!(
@@ -462,12 +474,16 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
                     "自身更新={} 内核更新={} 已重启={}",
                     r.self_updated, r.kernel_updated, r.restarted
                 ));
-                let mut rt = Runtime::load(ctx.sys, ctx.paths);
-                let now = ctx.sys.now().unix_timestamp();
+            }
+            let mut rt = Runtime::load(ctx.sys, ctx.paths);
+            let now = ctx.sys.now().unix_timestamp();
+            rt.update_available = new_version_pending(&r);
+            rt.update_checked_at = Some(now);
+            if !*check_only {
                 rt.last_update_at = Some(now);
                 rt.last_update_attempt_at = Some(now);
-                rt.save(ctx.sys, ctx.paths)?;
             }
+            rt.save(ctx.sys, ctx.paths)?;
             Ok(())
         }
         Cmd::ImportV3 { base } => {
@@ -1073,6 +1089,58 @@ mod tests {
         assert!(s.called("systemctl stop hysteria-client.service"));
         assert!(s.exists(std::path::Path::new("/opt/bui-c/config.json")));
         assert!(ctx.out.contains("导入 1 个节点"));
+    }
+
+    #[test]
+    fn update_check_only_caches_the_new_version_flag_for_the_menu() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        let mut prof = profiles_socks();
+        prof.panel = Some(crate::profiles::Panel {
+            base_url: "https://panel.example.com".into(),
+            username: "alice".into(),
+        });
+        prof.save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        let manifest = |ver: &str| {
+            FakeReply::Text(format!(
+                r#"{{"version":"{ver}","kernels":{{"client_sing_box":"1.14.5"}},"artifacts":{{}}}}"#
+            ))
+        };
+        n.route(
+            "https://panel.example.com/packages/manifest.json",
+            manifest("9.9.9"),
+        );
+
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["update", "--check-only"]), &mut ctx).unwrap();
+        let rt = Runtime::load(&s, &pp);
+        assert!(rt.update_available, "检查到新版要落盘给菜单用");
+        assert_eq!(rt.update_checked_at, Some(s.now().unix_timestamp()));
+
+        // 菜单 / status 从 runtime.json 读这个标记，不再联网
+        let n2 = FakeNet::new(); // 一个源都没登记：真联网必然报错
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n2, &pp, &mut p, false, false);
+        dispatch(&parse(&["status"]), &mut ctx).unwrap();
+        assert!(ctx.out.contains("★ 有新版"), "{}", ctx.out);
+        assert!(n2.log().is_empty(), "渲染菜单不该联网");
+
+        // 再查一次，manifest 与本机同版 → 标记清掉
+        n.route(
+            "https://panel.example.com/packages/manifest.json",
+            manifest(crate::VERSION),
+        );
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["update", "--check-only"]), &mut ctx).unwrap();
+        assert!(!Runtime::load(&s, &pp).update_available);
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n2, &pp, &mut p, false, false);
+        dispatch(&parse(&["status"]), &mut ctx).unwrap();
+        assert!(!ctx.out.contains("★ 有新版"), "{}", ctx.out);
     }
 
     #[test]

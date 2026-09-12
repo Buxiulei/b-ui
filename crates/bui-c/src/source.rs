@@ -23,14 +23,26 @@ pub struct NodesPayload {
     pub nodes: Vec<Node>,
 }
 
+/// 跳过项里没有 `://` 时的占位：这种行拿不到 scheme，为免带出凭据一个字符都不留。
+pub const NO_SCHEME: &str = "(无 scheme)";
+
 /// 一次取节点的结果。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Fetched {
     pub user: String,
     pub split: SplitRules,
     pub nodes: Vec<Node>,
-    /// 无法解析的行，已脱敏（只留前 24 字符）。
+    /// 无法解析的行，已脱敏（只留到 `://` 为止的 scheme，见 [`scheme_only`]）。
     pub skipped: Vec<String>,
+}
+
+/// 脱敏：只留到 `://` 为止。`hysteria2://` 的 userinfo 段就是密码，
+/// 留前 24 字符会把 `hysteria2://alice:hy2-pw` 原样打进日志。
+pub fn scheme_only(line: &str) -> String {
+    match line.split_once("://") {
+        Some((scheme, _)) => format!("{scheme}://"),
+        None => NO_SCHEME.to_string(),
+    }
 }
 
 pub fn nodes_url(base_url: &str, user: &str) -> String {
@@ -113,8 +125,7 @@ fn collect(lines: &[String]) -> Result<Fetched> {
         }
         match bui_schema::parse::node_uri(t) {
             Ok(n) => nodes.push(n),
-            // 跳过项只留前 24 字符：hysteria2:// 的 userinfo 段就是密码
-            Err(_) => skipped.push(t.chars().take(24).collect()),
+            Err(_) => skipped.push(scheme_only(t)),
         }
     }
     if nodes.is_empty() {
@@ -250,7 +261,30 @@ mod tests {
         let f = from_subscription(&n, "https://panel.example.com/api/sub/alice").unwrap();
         assert_eq!(f.nodes.len(), 1);
         assert_eq!(f.skipped.len(), 2, "空行忽略不计，ss:// 与注释行计为跳过");
-        assert!(f.skipped[0].len() <= 24);
+        assert_eq!(f.skipped, vec!["ss://", NO_SCHEME]);
+    }
+
+    #[test]
+    fn skipped_lines_keep_only_the_scheme_never_the_userinfo() {
+        // hysteria2:// 的 userinfo 段就是密码：前 24 字符已经够带出 `hysteria2://alice:hy2-pw`
+        let lines = vec![
+            "hysteria2://alice:hy2-pw@panel.example.com?no-port=1".to_string(),
+            "ss://not-supported@h:1#x".to_string(),
+            "# 注释行".to_string(),
+            "hysteria2://alice:hy2-pw@panel.example.com:10000/?sni=panel.example.com#ok"
+                .to_string(),
+        ];
+        let f = from_uris(&lines).unwrap();
+        assert_eq!(f.nodes.len(), 1, "最后一行能解析");
+        assert_eq!(
+            f.skipped,
+            vec!["hysteria2://", "ss://", NO_SCHEME],
+            "只留 scheme，没有 scheme 的行连内容都不留"
+        );
+        for s in &f.skipped {
+            assert!(!s.contains("hy2-pw"), "跳过项不能带凭据：{s}");
+            assert!(!s.contains('@'), "跳过项不能带 userinfo：{s}");
+        }
     }
 
     #[test]
