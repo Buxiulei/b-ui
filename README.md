@@ -132,12 +132,36 @@
 
 **系统要求**: Ubuntu / Debian / CentOS / RHEL (需 root 权限)
 
-### 一键安装
+### 一键安装（v4）
+
+新服务器上一行命令装完全部（**唯一必填是面板域名**，其余全自动）：
+
 ```bash
-sudo -i
-bash <(curl -fsSL "https://raw.githubusercontent.com/Buxiulei/b-ui/main/install.sh?$(date +%s)")
+curl -fsSL https://raw.githubusercontent.com/Buxiulei/b-ui/v4/install.sh | bash -s -- --domain panel.example.com
 ```
-*国内镜像*: `bash <(curl -fsSL "https://raw.githack.com/Buxiulei/b-ui/main/install.sh?$(date +%s)")`
+
+不带 `--domain` 时，只要终端可用（`/dev/tty`）就只问「面板域名」这一个问题；既没给域名又没有终端（比如 CI）则打印用法并以非 0 退出，**不会装一半**。域名之外的事——架构、发行版与包管理器、公网 IP、SELinux、时间同步、关键端口占用、域名解析核对、IPv6 出口、v3 迁移、防火墙——全部自动探测处理，装完打印一张「环境」表、一张自检 PASS/FAIL 表，以及面板地址、一次性管理员密码与订阅地址。
+
+全新服务器上首张证书要等 Caddy 签到，自检会先有界等待（最多 2 分钟）；到点还没签下来时，
+「两个 hysteria 单元 / HY2 的 UDP 端口 / HY2 回环鉴权」这三行报 `SKIP 待证书` 而**不算失败**
+（证书到位后 systemd 会自动把它们拉起，`bui status` 复检即可）。
+
+三个环境变量（等价写法 / 覆盖项）：
+
+| 变量 | 作用 |
+|---|---|
+| `BUI_DOMAIN` | 等价于 `--domain`，域名不想进命令行时用它 |
+| `BUI_VERSION` | 指定版本，如 `v4.0.0-rc1`；默认 `latest`，仓库只有预发布时自动回退到最新的 `v4*` 标签 |
+| `BUI_MANIFEST_URL` | 直接指定 manifest 地址（离线源 / 演练用），覆盖 `BUI_VERSION` |
+
+v3 机器上原地切 v4：检测到 `/opt/b-ui/users.json` 会自动补 `--import-v3`，沿用 v3 的域名与全部用户。
+
+升级与回滚：
+
+```bash
+sudo bui upgrade              # 升 bui 与四个内核，失败自动回退
+sudo bui upgrade --rollback   # 回到上一版二进制、内核与最近一份 state
+```
 
 ### 管理与更新
 安装后可通过终端命令 `b-ui` 进行管理：

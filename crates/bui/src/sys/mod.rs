@@ -6,6 +6,7 @@
 //! 接口一律**同步**（总纲裁决「`Host` trait 同步 + `spawn_blocking`」）：对账整体在
 //! `tokio::task::spawn_blocking` 里跑，async 运行时不会被这些阻塞调用拖住。
 
+pub mod env_probe;
 #[cfg(test)]
 pub mod fake;
 pub mod real;
