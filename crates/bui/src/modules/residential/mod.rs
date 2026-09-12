@@ -75,6 +75,29 @@ pub const DAILY_TICK_SECS: u64 = 600;
 pub const PROBE_PORTS: [u16; 6] = [5228, 5223, 993, 22, 8080, 853];
 /// 体检必测的基准端口：它们通不通决定 `ports_allowed` 有没有意义
 pub const BASE_PORTS: [u16; 2] = [80, 443];
+/// 端口集探测的**中性**目标主机：经任何上游 CONNECT 到它的 80/443 都应该通。
+/// **绝不能用 `www.google.com`**：Bright Data 对搜索域名整域硬拒（policy_20110），
+/// 基准端口会被判成不通，于是 [`check::derive_ports_allowed`] / [`blacklist::port_learn`]
+/// 一条白名单都学不出来（返回 `None` = 不限），端口策略静默失效。
+pub const PORT_PROBE_HOST: &str = "www.gstatic.com";
+/// 固定端口集各自的真实目标主机：必须是**真在那个端口上监听**的站点，否则上游放行了
+/// 该端口、目标却不监听时上游回 502/504，会被记成「端口被拒」。
+/// 8080 没有公认的公共监听点，退回中性主机（[`port_probe_host`] 的缺省分支）。
+pub const PORT_PROBE_HOSTS: [(u16, &str); 5] = [
+    (5228, "mtalk.google.com"),       // FCM（调研 §8 的实测目标）
+    (5223, "courier.push.apple.com"), // APNs（同上）
+    (993, "imap.gmail.com"),          // IMAPS
+    (22, "github.com"),               // SSH
+    (853, "dns.google"),              // DoT
+];
+
+/// 端口 → 探测目标主机。表里有就用真实主机，其余（基准 80/443 与 8080）用中性主机。
+pub fn port_probe_host(port: u16) -> &'static str {
+    PORT_PROBE_HOSTS
+        .iter()
+        .find(|(p, _)| *p == port)
+        .map_or(PORT_PROBE_HOST, |(_, h)| *h)
+}
 /// 体检的 AI 可达性目标（spec §5.2）
 pub const AI_HOSTS: [&str; 3] = ["gemini.google.com", "api.openai.com", "api.anthropic.com"];
 /// 体检的支付可达性目标（spec §5.2；调研 §D：Decodo 上 pay.google.com / www.paypal.com 是 403）
@@ -310,6 +333,23 @@ mod tests {
         );
         assert_eq!(PROBE_PORTS, [5228, 5223, 993, 22, 8080, 853]);
         assert_eq!(AI_HOSTS[2], "api.anthropic.com");
+        // 基准端口打中性主机：Bright Data 整域硬拒 www.google.com，用它当基准会让
+        // ports_allowed 永远学不出来（见 PORT_PROBE_HOST 的注释）
+        for p in BASE_PORTS {
+            assert_eq!(port_probe_host(p), "www.gstatic.com", "基准端口 {p}");
+        }
+        assert_ne!(
+            port_probe_host(443),
+            "www.google.com",
+            "基准主机绝不能是搜索域名"
+        );
+        // 固定端口集打各自真实监听的主机
+        assert_eq!(port_probe_host(5228), "mtalk.google.com");
+        assert_eq!(port_probe_host(5223), "courier.push.apple.com");
+        assert_eq!(port_probe_host(993), "imap.gmail.com");
+        assert_eq!(port_probe_host(22), "github.com");
+        assert_eq!(port_probe_host(853), "dns.google");
+        assert_eq!(port_probe_host(8080), PORT_PROBE_HOST, "8080 无公共监听点");
         assert_eq!(PAY_HOSTS[1], "pay.google.com");
         // 这两个 host 必须与对应 URL 的主机名严格一致：CONNECT 补判（T3
         // confirm_auth_failure）拿它们去开隧道，写歪了就补判到别的站点上去了

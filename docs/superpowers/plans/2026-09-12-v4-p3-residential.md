@@ -7518,10 +7518,10 @@ git commit -m "feat(resi): bui residential 子命令、住宅数字菜单与 /ap
 | §5.2 类型自动探测 SOCKS5→HTTP、整轮重试一次 | T7 `detect_kind`（测试断言 4 次 GET） |
 | §5.2 记 `verified` | T7 调 `check::to_verified`（实现与测试都在 T6 Step 3/1） |
 | §5.2 三方交叉 + Cloudflare 挑战页判「未知」 | T6 `fold_sources`（唯一一份交叉逻辑，`probe_exit` 与 `run` 共用）/ `cross_class` / `is_cloudflare_challenge` |
-| §5.2 Google `/sorry/` | T6 `sorry_of` / `google_sorry` |
+| §5.2 Google `/sorry/` | T6 `sorry_of`（唯一一份判定；同步包装 `google_sorry` 无调用点，终审已删） |
 | §5.2 gemini / api.openai.com / api.anthropic.com | T6 `AI_HOSTS` |
 | §5.2 checkout.stripe.com / pay.google.com / www.paypal.com | T6 `PAY_HOSTS` |
-| §5.2 固定端口集 5228/5223/993/22/8080/853 的 CONNECT 状态 | T6 `PROBE_PORTS` + T3 `parse_connect_status` |
+| §5.2 固定端口集 5228/5223/993/22/8080/853 的 CONNECT 状态 | T6 `PROBE_PORTS` + T3 `parse_connect_status`；目标主机由 T1 `port_probe_host` 给（基准 80/443 打中性主机 `www.gstatic.com`，固定端口集打各自真在该端口监听的主机） |
 | §5.2 SOCKS5 UDP ASSOCIATE | T3 `udp_associate`（RFC1928 CMD=03）+ T6 |
 | §5.2 写 `verified` 与 `ports_allowed` | T6 `run_and_store` |
 | §5.2 reqwest 走代理、两种上游都带鉴权 | T3（`Proxy::basic_auth` / CONNECT Basic / RFC1929） |
@@ -7559,7 +7559,7 @@ git commit -m "feat(resi): bui residential 子命令、住宅数字菜单与 /ap
 
 ### 3. 类型一致性（跨任务逐个核对）
 
-- `ConnectVerdict` 四变体：T3 定义 → T6 `port_matrix` / T9 `confirm_once` 消费，`is_hard_reject()` 只在 `Refused` 为真，三处一致。
+- `ConnectVerdict` 四变体：T3 定义 → T6 `port_matrix` / T9 `confirm_once` 消费，「硬拒」只有 `Refused` 一种（谓词 `is_hard_reject()` 无调用点，终审已删，判定就地 `match`），三处一致。
 - `ProbeError::AuthFailed`：T3 定义 → T6（`auth_failed` 标记）、T7（`UpstreamError::AuthFailed`）、T8（判不健康）三处都按「整条上游不可用」处理，无第二种解读。
 - `HealthState` / `Candidate` / `PendingEntry` / `Checking`：T2 定义，T8/T9/T10 只按字段名读写，无重复定义。`Candidate` 带 `confirms` / `last_confirm_at`（确认进度，由 T9 `journal_loop` 每 `JOURNAL_POLL_SECS` 一轮推进），`PendingEntry` 里的同名字段只是「已确认完毕」的留档，`flush_pending` / `apply_now` 不再判它。
 - **端口白名单判定只有一处**：T9 `port_allowed(up, port)`（`ports_allowed` 为 `None` 时用 T1 的 `BASE_PORTS`），`learn_from_journal` 与 `daily_round` ② 都调它；T6 只负责**学**出 `ports_allowed`（`derive_ports_allowed`），不做这个判定。
@@ -7610,3 +7610,4 @@ T2/T3/T4/T5 各写一个文件；T7/T8/T9 各写一个文件；T1 一次建齐�
 | D8 | `DELETE /api/residential/blacklist`（删一条 `auto`，spec §4.3 只列了 GET） | 给端点，落实 spec §5.4「面板可删条目」 | 删该方法与测试，误伤只能等每日复核自动移除（最快 3 天） |
 | D9 | 池上限 `MAX_UPSTREAMS = 8`（spec 未规定，取 v3 面板 `slice(0,8)`） | 超过回 400 | 调大常量；面板成员表与 Clash API 的可用性需重新评估 |
 | D11 | spec §5.3「relay **任何**重启后立即重放」：relay 有三条重启来路，只有对账那条发 `Event::RelayRestarted`（看门狗 `watchdog.rs:141` 与 `POST /api/services/b-ui-relay/restart` 都不发，§C 末段） | **P3 自己兜住**：T8 巡检规则 6a 每轮（≤ 120 秒）把 `runtime.selected_upstream_id` 重放回 Clash，绝不采纳 Clash 的 `now`。不改 P1 的第八处文件；代价是那两条来路最坏 120 秒漂移（不断网，只是出口可能回到池首） | 向 P1 提一条追加改动：`watchdog.rs` 的重启分支与 `system::service_action` 的 `unit == "b-ui-relay"` 分支各加一行 `bus.send(Event::RelayRestarted)`，漂移窗口降到事件延迟。规则 6a 照旧保留（重放幂等，两者不冲突） |
+| D12 | `GET /api/residential/status` 的 `urls[].username` 回**明文**完整用户名（v3 `web/app.js:665-699 renderResidentialUrls` 逐字段读） | **保留 v3 兼容的完整用户名**：整条管理员域在 JWT 之后，面板本来就是唯一读者；`password` 永不出现在任何响应里（`UpstreamRow` 与 `display_url` 都只给 `mask()` 过的用户名）。新前端用 `upstreams[].username_masked`，不要再读 `urls[].username` | 两处都只回打码值，并同批改 `web/app.js` 的 `renderResidentialUrls`（v3 面板会显示成 `u***`，运维核对凭据要改去看 `state.json`） |

@@ -25,10 +25,6 @@ pub enum ConnectVerdict {
 }
 
 impl ConnectVerdict {
-    pub fn is_hard_reject(&self) -> bool {
-        matches!(self, ConnectVerdict::Refused { .. })
-    }
-
     pub fn label(&self) -> String {
         match self {
             ConnectVerdict::Open => "open".into(),
@@ -523,13 +519,14 @@ mod tests {
             ConnectVerdict::Refused { code: 5 },
             "connection refused"
         );
-        assert!(ConnectVerdict::Refused { code: 2 }.is_hard_reject());
-        assert!(
-            !ConnectVerdict::AuthFailed.is_hard_reject(),
-            "凭据失效不是目标被拒"
-        );
-        assert!(!ConnectVerdict::Unreachable { detail: "x".into() }.is_hard_reject());
+        // 硬拒只有 Refused 一种：凭据失效与连不上都不是「这个目标被拒」，
+        // `label()` 的四个取值就是黑名单与体检读到的全部判据
         assert_eq!(ConnectVerdict::Refused { code: 403 }.label(), "refused:403");
+        assert_eq!(ConnectVerdict::Open.label(), "open");
+        assert_eq!(
+            ConnectVerdict::Unreachable { detail: "x".into() }.label(),
+            "unreachable"
+        );
         assert_eq!(ConnectVerdict::AuthFailed.label(), "auth_failed");
     }
 
@@ -807,7 +804,6 @@ mod tests {
             matches!(v, ConnectVerdict::Unreachable { .. }),
             "实际 {v:?}"
         );
-        assert!(!v.is_hard_reject());
         drop(l);
     }
 }
