@@ -7,10 +7,10 @@
 //! 判定失败一律 fail-closed（退出码 1）。stderr 不会进 `hysteria-server` 的 journal（H5），
 //! 诊断写 `<base>/auth-hook.log`（0600，只记用户名与结果，**不记密码**）。
 
-use crate::modules::panel::snapshot::{self, Snapshot};
+use crate::modules::panel::snapshot::Snapshot;
 use bui_schema::paths::Paths;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use subtle::ConstantTimeEq;
 
@@ -21,6 +21,8 @@ pub const HOOK_TIMEOUT: Duration = Duration::from_secs(2);
 pub const LOG_MAX_BYTES: u64 = 1024 * 1024;
 /// 原地截断后保留的尾部字节数。
 pub const LOG_KEEP_BYTES: u64 = 256 * 1024;
+/// 非阻塞 fd 上 `EAGAIN` 的重试间隔（只有快照不是普通文件时才会走到，见 [`read_snapshot`]）。
+const READ_POLL: Duration = Duration::from_millis(2);
 
 /// `<base>/auth-hook.log`（在 P1 的 `reconcile::drift::BASE_WHITELIST` 里）。
 pub fn log_path(paths: &Paths) -> PathBuf {
@@ -86,13 +88,29 @@ pub fn decide(snap: &Snapshot, auth: &str, now: time::OffsetDateTime) -> Decisio
     }
 }
 
+/// 只为**本机微基准**留的 base 覆盖（`scripts/ops/authhook-microbench.sh`）。
+///
+/// 生产上钩子的环境由 systemd 给的 `hysteria-server` / `hysteria-residential` 决定，能改它
+/// 的环境就已经是 root，所以这条覆盖不放大攻击面；但它确实只为测量存在，别写进任何单元文件。
+const BASE_DIR_ENV: &str = "BUI_BASE_DIR";
+
+fn paths_from_env() -> Paths {
+    match std::env::var_os(BASE_DIR_ENV) {
+        Some(d) if !d.is_empty() => {
+            let base = PathBuf::from(d);
+            Paths {
+                certs_dir: base.join("certs"),
+                bin_dir: base.join("bin"),
+                base_dir: base,
+            }
+        }
+        _ => Paths::default_server(),
+    }
+}
+
 /// 进程入口：返回**进程退出码**（0 = 放行），放行时先把 `user_id` 打到 stdout。
 pub fn run(args: &[String]) -> i32 {
-    let (code, out) = run_with(
-        &Paths::default_server(),
-        args,
-        time::OffsetDateTime::now_utc(),
-    );
+    let (code, out) = run_with(&paths_from_env(), args, time::OffsetDateTime::now_utc());
     if let Some(id) = out {
         println!("{id}");
     }
@@ -110,24 +128,65 @@ pub fn run_with(
         log_line(paths, now, &addr, "-", "missing-args");
         return (1, None);
     };
-    // 内核不设超时（H8）：把「读文件 + 判定」放子线程，主线程自己掐 2 秒
-    let (tx, rx) = std::sync::mpsc::channel::<Decision>();
+    // 内核不设超时（H8），所以钩子自己掐 2 秒 —— 但**不起线程**：2026-09-13 bwg-rick 实测
+    // 每次调用有 ≈15ms 的固定开销，本机 strace -c 里 clone + futex + sigaltstack + 线程栈的
+    // mmap/munmap 是最大的一块（约 300µs / 次）。超时改由 [`read_snapshot`] 自己看表。
     let file = crate::paths::auth_snapshot_file(paths);
-    let auth_for_thread = auth.clone();
-    std::thread::spawn(move || {
-        let snap = snapshot::read(&file);
+    let decision = match read_snapshot(&file, std::time::Instant::now() + HOOK_TIMEOUT) {
         // 空快照（文件缺失或坏 JSON）里查不到任何用户 ⇒ no-such-user ⇒ 拒绝
-        let _ = tx.send(decide(&snap, &auth_for_thread, now));
-    });
-    let decision = rx
-        .recv_timeout(HOOK_TIMEOUT)
-        .unwrap_or(Decision::Deny { reason: "timeout" });
+        Some(snap) => decide(&snap, &auth, now),
+        None => Decision::Deny { reason: "timeout" },
+    };
     let username = auth.split_once(':').map(|(u, _)| u).unwrap_or("-");
     log_line(paths, now, &addr, username, decision.label());
     match decision {
         Decision::Allow { user_id } => (0, Some(user_id)),
         Decision::Deny { .. } => (1, None),
     }
+}
+
+/// 读快照并解析。只有**到点还没读完**才返回 `None`（= 超时）；文件缺失、权限不对、内容
+/// 不是 JSON 一律返回 [`Snapshot::empty`]（里面查不到用户 ⇒ 调用方拒绝，fail-closed）。
+///
+/// 两处刻意的写法，都是为了在**不起线程**的前提下仍然守住 2 秒：
+/// - `O_NONBLOCK` 打开。钩子唯一可能卡在 `open` 上的情形是快照不再是普通文件（被换成
+///   FIFO / 字符设备），这个标志让 `open` 立刻返回；普通文件上它是空操作。
+/// - 自己写 `read` 循环而不用 `std::fs::read`。后者的 `read_to_end` 在 `EINTR` 上无条件
+///   重试、在非阻塞 fd 上直接报错，卡住就是永远卡住；这里每轮先看一眼表。
+///
+/// 守不住的那一类和老写法一样：快照躺在卡死的块设备上时 `open` 进不可中断睡眠，谁也叫不醒
+/// 它——老写法的主线程虽然 2 秒就返回，可 `std::process::exit` 带不走那条卡在 D 状态的线程，
+/// 内核仍要等 I/O 结束才让进程消失，Hysteria 那边照样在等。
+fn read_snapshot(path: &Path, deadline: std::time::Instant) -> Option<Snapshot> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut buf = Vec::with_capacity(4096);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits())
+        .open(path)
+    {
+        let mut chunk = [0u8; 8192];
+        loop {
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            match f.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                // 只有非普通文件会走到 WouldBlock（普通文件的 read 不返回 EAGAIN）
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(READ_POLL)
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => {
+                    buf.clear();
+                    break;
+                }
+            }
+        }
+    }
+    Some(serde_json::from_slice(&buf).unwrap_or_else(|_| Snapshot::empty()))
 }
 
 /// 追加一行 `<RFC3339> <addr> <username> <结果>`。失败一律忽略——钩子不能因为写不了日志
@@ -357,6 +416,42 @@ mod tests {
         assert_eq!(out, None);
         assert_eq!(run_with(&p, &["only-addr".into()], t0()).0, 1);
         assert_eq!(run_with(&p, &[], t0()).0, 1);
+    }
+
+    /// 超时兜底（原来是「子线程 + `recv_timeout`」，现在是 [`read_snapshot`] 自己看表）。
+    ///
+    /// Fake：把快照路径做成一条 FIFO，并在测试里一直**持着写端不写**（写端不存在时
+    /// 非阻塞读会直接拿到 EOF，那是另一条路径）。钩子于是永远读不到数据，正是它唯一可能
+    /// 卡住的那类情形。判据两条：2 秒左右必须返回，且必须是拒绝。这条用例自身要跑满 2 秒。
+    #[test]
+    fn a_snapshot_read_that_blocks_is_denied_within_the_timeout() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let p = paths(&d);
+        let fifo = crate::paths::auth_snapshot_file(&p);
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+        // O_RDWR 打开 FIFO 是 Linux 扩展：一次拿到读写两端，不会像 O_WRONLY 那样在
+        // 没有读端时报 ENXIO。这个 fd 活着 = 写端存在 = 钩子那边读到的是 EAGAIN。
+        let _keep_writer = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits())
+            .open(&fifo)
+            .unwrap();
+
+        let t = std::time::Instant::now();
+        let (code, out) = run_with(&p, &["a".into(), "alice:pw".into(), "0".into()], t0());
+        let took = t.elapsed();
+
+        assert_eq!(code, 1, "读不到快照必须拒绝");
+        assert_eq!(out, None);
+        assert!(
+            took >= Duration::from_millis(900) && took < Duration::from_secs(5),
+            "应该在 2 秒左右兜底返回，实测 {took:?}"
+        );
+        let log = std::fs::read_to_string(log_path(&p)).unwrap();
+        assert!(log.trim_end().ends_with("timeout"), "要记成超时：{log}");
+        assert!(!log.contains(":pw"), "密码绝不能进日志：{log}");
     }
 
     #[test]
