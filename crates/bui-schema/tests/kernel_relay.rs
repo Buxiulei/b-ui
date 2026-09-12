@@ -23,7 +23,16 @@ fn relay_global_with_blacklist_and_ports_allowed() {
         note: "".into(),
         created_at: "2026-09-11T00:00:00Z".into(),
     });
-    let cfg = relay::config(&g, &opts());
+    let slots: Vec<bui_schema::model::Slot> = g
+        .upstreams
+        .iter()
+        .enumerate()
+        .map(|(i, u)| bui_schema::model::Slot {
+            index: i as u16,
+            upstream_id: u.id,
+        })
+        .collect();
+    let cfg = relay::config(&g, &slots, &opts());
 
     let tags: Vec<_> = cfg["outbounds"]
         .as_array()
@@ -31,7 +40,17 @@ fn relay_global_with_blacklist_and_ports_allowed() {
         .iter()
         .map(|o| o["tag"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(tags, vec!["resi-1", "resi-2", "resi-pool", "direct"]);
+    assert_eq!(
+        tags,
+        vec![
+            "resi-1",
+            "resi-2",
+            "slot-0-pool",
+            "slot-1-pool",
+            "resi-pool",
+            "direct"
+        ]
+    );
     assert_eq!(cfg["outbounds"][0]["type"], "http");
     assert_eq!(cfg["outbounds"][1]["type"], "socks");
     assert_eq!(cfg["outbounds"][1]["version"], "5");
@@ -68,10 +87,10 @@ fn relay_global_with_blacklist_and_ports_allowed() {
 fn relay_split_uses_keywords_and_direct_final() {
     let s = common::state("split");
     let g = s.residential.default_group().unwrap().clone();
-    let cfg = relay::config(&g, &opts());
+    let cfg = relay::config(&g, &[], &opts());
     assert_eq!(cfg["route"]["final"], "direct");
     let last = cfg["route"]["rules"].as_array().unwrap().last().unwrap();
-    assert_eq!(last["outbound"], "resi-pool");
+    assert_eq!(last["outbound"], "slot-0-pool");
     assert_eq!(
         last["domain_keyword"].as_array().unwrap().len(),
         bui_schema::keywords::DEFAULT_KEYWORDS.len()
@@ -113,7 +132,7 @@ fn relay_blacklist_takes_pins_and_selected_upstream_auto_only() {
         .auto
         .push(entry(other, Rule::DomainSuffix("other.example.net".into())));
 
-    let cfg = relay::config(&g, &opts());
+    let cfg = relay::config(&g, &[], &opts());
     let rules = cfg["route"]["rules"].as_array().unwrap();
     assert_eq!(rules[1]["domain"], serde_json::json!(["www.paypal.com"]));
     assert_eq!(
@@ -138,7 +157,7 @@ fn relay_all_socks5_pool_lets_udp_reach_the_pool() {
     for u in &mut g.upstreams {
         u.kind = UpstreamKind::Socks5;
     }
-    let cfg = relay::config(&g, &opts());
+    let cfg = relay::config(&g, &[], &opts());
     let rules = cfg["route"]["rules"].as_array().unwrap();
     assert!(
         udp_dns_direct(rules),
@@ -165,7 +184,7 @@ fn relay_mixed_pool_keeps_the_three_udp_rules() {
     let g = s.residential.default_group().unwrap().clone();
     assert!(g.upstreams.iter().any(|u| u.kind == UpstreamKind::Http));
     assert!(g.upstreams.iter().any(|u| u.kind == UpstreamKind::Socks5));
-    let cfg = relay::config(&g, &opts());
+    let cfg = relay::config(&g, &[], &opts());
     let rules = cfg["route"]["rules"].as_array().unwrap();
     assert!(udp_dns_direct(rules));
     assert!(rules
@@ -183,7 +202,7 @@ fn relay_all_http_pool_keeps_the_three_udp_rules() {
     for u in &mut g.upstreams {
         u.kind = UpstreamKind::Http;
     }
-    let cfg = relay::config(&g, &opts());
+    let cfg = relay::config(&g, &[], &opts());
     let rules = cfg["route"]["rules"].as_array().unwrap();
     assert!(udp_dns_direct(rules));
     assert!(rules
@@ -215,7 +234,7 @@ fn relay_fail_open_when_pool_empty() {
         enabled: true,
         ..Default::default()
     };
-    let cfg = relay::config(&g, &opts());
+    let cfg = relay::config(&g, &[], &opts());
     assert_eq!(cfg["route"]["final"], "direct");
     assert!(cfg["outbounds"]
         .as_array()
@@ -231,11 +250,37 @@ fn relay_disabled_group_is_direct_only() {
     let s = common::state("global");
     let mut g = s.residential.default_group().unwrap().clone();
     g.enabled = false;
-    let cfg = relay::config(&g, &opts());
+    let cfg = relay::config(&g, &[], &opts());
     assert_eq!(cfg["route"]["final"], "direct");
     assert_eq!(cfg["dns"]["final"], "dns_direct");
     assert!(!serde_json::to_string(&cfg)
         .unwrap()
         .contains("isp.example.net"));
     common::check_singbox(&cfg);
+}
+
+/// 多槽配置必须在 1.12 / 1.13 / 1.14 三版上都过 `sing-box check`：每槽一个 socks 入站、
+/// 每槽一个 selector、按 `inbound` 分流 —— 这三样都是 `check` 会严格校验的字段。
+#[test]
+fn a_three_slot_relay_passes_singbox_check_on_all_versions() {
+    let s = common::state("global");
+    let mut g = s.residential.default_group().unwrap().clone();
+    // fixture 自带 2 条上游，补到 3 条
+    let mut third = g.upstreams[0].clone();
+    third.id = uuid::Uuid::from_u128(0xdead);
+    third.host = "isp3.example.net".into();
+    third.kind = bui_schema::model::UpstreamKind::Socks5;
+    g.upstreams.push(third);
+    let slots: Vec<bui_schema::model::Slot> = g
+        .upstreams
+        .iter()
+        .enumerate()
+        .map(|(i, u)| bui_schema::model::Slot {
+            index: i as u16,
+            upstream_id: u.id,
+        })
+        .collect();
+    let cfg = relay::config(&g, &slots, &opts());
+    assert_eq!(cfg["inbounds"].as_array().unwrap().len(), 3);
+    common::check_singbox_all(&cfg);
 }
