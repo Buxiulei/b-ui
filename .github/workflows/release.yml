@@ -1,0 +1,299 @@
+name: Release
+
+on:
+  push:
+    # 预发布 tag（v<x.y.z>-rcN）也进来：总纲裁决记录「发布：预发布与首推（2026-09-12）」
+    # 允许在 M5 之前打 v4.0.0-rc1 预发布，供新服务器一行命令安装用。
+    tags: ["v[0-9]+.[0-9]+.[0-9]+", "v[0-9]+.[0-9]+.[0-9]+-rc[0-9]+"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 要构建的 tag（形如 v4.0.0；必须与 workspace version 一致）
+        required: true
+      dry_run:
+        description: 演练模式：只构建与生成 manifest，不创建任何 Release（默认开，dispatch 路径也只允许开着）
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: 发版前校验
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: dispatch 路径不允许发布
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == false }}
+        run: |
+          echo "dispatch 只做演练：dry_run 必须保持 true。"
+          echo "真发布只有一条路——主理人在 v4 分支的 commit 上 git tag v<version> && git push origin v<version>。"
+          exit 1
+      - name: 解析 tag 与版本号
+        id: v
+        # dispatch 的 tag 是自由文本（虽然只有有写权限的人能 dispatch），经 env 进 shell
+        # 而不是直接插值进 run，避免命令注入
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          # C4 的 manifest.version 必须是纯 semver，所以预发布 tag 的版本号取掉 -rcN；
+          # 资产 URL 与 Release 本身仍用真实 tag（rc 的资产挂在 rc 的 Release 下）。
+          # 整串锚定匹配：case 通配只能锚一位数字，v4.0.0-rc1-rc2 / v4.0.0-rc1x 都会漏过去
+          if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            PRERELEASE=false
+          elif [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rc[0-9]+$ ]]; then
+            PRERELEASE=true
+          else
+            printf 'tag %s 不符合 v<x.y.z> 或 v<x.y.z>-rcN\n' "$TAG" >&2
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          VERSION="${VERSION%-rc*}"
+          bash scripts/release/check-version.sh "v$VERSION"
+          {
+            printf 'version=%s\n' "$VERSION"
+            printf 'tag=%s\n' "$TAG"
+            printf 'prerelease=%s\n' "$PRERELEASE"
+          } >> "$GITHUB_OUTPUT"
+      - name: 内核 lock 是否还贴着轨道（只告警，不卡发版）
+        run: |
+          bash scripts/release/pin-kernels.sh --check \
+            || echo "::warning::kernels.lock 与版本轨道有漂移（上游出了新 patch）。本次发布用的是 lock 里的版本，产物不受影响；要跟上游就在 v4 分支重跑 pin-kernels.sh --write、commit、再打新 tag。"
+      - name: 准备内核
+        uses: ./.github/actions/setup-kernels
+        with:
+          dir: ${{ runner.temp }}/kernels-amd64
+          role: all
+          arch: amd64
+      - name: 全量测试（sing-box 1.14 = target）
+        run: |
+          set -euo pipefail
+          BIN="$RUNNER_TEMP/pathbin"
+          mkdir -p "$BIN"
+          ln -sf "$RUNNER_TEMP/kernels-amd64/bin/sing-box" "$BIN/sing-box"
+          ln -sf "$RUNNER_TEMP/kernels-amd64/bin/xray" "$BIN/xray"
+          ln -sf "$RUNNER_TEMP/kernels-amd64/bin/hysteria" "$BIN/hysteria"
+          export PATH="$BIN:$PATH"
+          # caddy 的 validate 用例（core_files.rs）不查 PATH，只认三个绝对路径，
+          # 而 ubuntu-24.04 镜像不预装 caddy：软链进 /usr/local/bin 才能真跑校验（同 ci.yml）。
+          sudo ln -sf "$RUNNER_TEMP/kernels-amd64/bin/caddy" /usr/local/bin/caddy
+          cargo test --workspace -- --nocapture 2>&1 | tee "$RUNNER_TEMP/test.log"
+          # 只判「内核校验漏跑」这一种 skip（与 ci.yml 同一口径）：测试里另有两种设计内的
+          # skip（缺 P0 的 v3 fixture、Task 13 删掉 server/core.sh 后的 v3 sysctl 对照），
+          # 不能算漏跑判红——否则 Task 13 之后每次发版都会无故红。
+          if grep -Eq 'skipped: ((sing-box|xray|hysteria) not found|本机没有 caddy 二进制)' "$RUNNER_TEMP/test.log"; then
+            echo "内核校验被跳过，说明没找到内核二进制：发版不接受 skip"
+            grep -E 'skipped: ' "$RUNNER_TEMP/test.log"
+            exit 1
+          fi
+      - name: 脚本测试
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends zip unzip
+          bash scripts/tests/run-all.sh
+
+  build:
+    name: 构建 ${{ matrix.target }}
+    needs: verify
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            arch: amd64
+            cross: false
+          - target: aarch64-unknown-linux-musl
+            arch: arm64
+            cross: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: 缓存 cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-release-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+      - name: 原生 musl 工具链（amd64）
+        if: ${{ !matrix.cross }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends musl-tools
+          rustup target add ${{ matrix.target }}
+      - name: cross（arm64）
+        if: ${{ matrix.cross }}
+        run: |
+          set -euo pipefail
+          # 显式装 target，不依赖 cross 自动装：cross 0.2.5 在容器里用自己的 sysroot，
+          # 但 `cross build` 仍要求宿主 rustup 里存在该 target 的 std。
+          rustup target add ${{ matrix.target }}
+          cargo install cross --locked --version 0.2.5
+      - name: 构建
+        run: |
+          set -euo pipefail
+          if [[ "${{ matrix.cross }}" == "true" ]]; then
+            cross build --release --locked --target ${{ matrix.target }} -p bui -p bui-c
+          else
+            cargo build --release --locked --target ${{ matrix.target }} -p bui -p bui-c
+          fi
+      - name: 确认是静态二进制
+        run: |
+          set -euo pipefail
+          # Rust 的 musl target 默认出 static-pie，file(1) 打印的是 "static-pie linked"
+          # 而不是 "statically linked"（本机 x86_64-unknown-linux-musl 实测），两种都接受。
+          for b in bui bui-c; do
+            f="target/${{ matrix.target }}/release/$b"
+            file "$f"
+            file "$f" | grep -qE 'static-pie linked|statically linked' || { echo "$b 不是静态链接"; exit 1; }
+          done
+      - name: 按 C4 的资产名归集
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          install -m 755 "target/${{ matrix.target }}/release/bui"   "dist/bui-linux-${{ matrix.arch }}"
+          install -m 755 "target/${{ matrix.target }}/release/bui-c" "dist/bui-c-linux-${{ matrix.arch }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: 生成 manifest 并发 Release
+    needs: [verify, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - name: 准备内核（amd64）
+        uses: ./.github/actions/setup-kernels
+        with:
+          dir: ${{ runner.temp }}/kernels-amd64
+          role: target
+          arch: amd64
+      - name: 准备内核（arm64）
+        uses: ./.github/actions/setup-kernels
+        with:
+          dir: ${{ runner.temp }}/kernels-arm64
+          role: target
+          arch: arm64
+      - name: 把上游内核以裸二进制归集进 dist（C4：artifacts 全是裸二进制）
+        run: |
+          set -euo pipefail
+          # setup-kernels 已经把上游 tar.gz / zip 就地解包成 <dir>/bin/<kernel>（scripts/ci/fetch-kernels.sh），
+          # 这里只是改名归集；Release 因此不含任何归档，install.sh 与 bui upgrade 拿到的都是裸二进制。
+          for a in amd64 arm64; do
+            for k in hysteria xray sing-box caddy; do
+              install -m 755 "$RUNNER_TEMP/kernels-$a/bin/$k" "dist/$k-linux-$a"
+            done
+          done
+      - name: 清点产物（4 个自家二进制 + 8 个内核 = 12）
+        run: |
+          set -euo pipefail
+          ls -l dist
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 12
+      - name: 生成并校验 manifest.json
+        # tag 一律经 env 进 shell（dispatch 路径的 tag 是自由文本），不直接插值进 run
+        env:
+          V: ${{ needs.verify.outputs.version }}
+          T: ${{ needs.verify.outputs.tag }}
+          R: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # 前缀用真实 tag（预发布是 v<x.y.z>-rcN），manifest.version 仍是纯 semver
+          BASE="https://github.com/$R/releases/download/$T/"
+          bash scripts/release/gen-manifest.sh --version "$V" --dist dist --base-url "$BASE" \
+            --released "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > dist/manifest.json
+          bash scripts/release/validate-manifest.sh dist/manifest.json --require-prefix "$BASE"
+          cat dist/manifest.json
+      - name: sha256sums.txt 与 install.sh
+        run: |
+          set -euo pipefail
+          cp install.sh dist/install.sh
+          cd dist
+          # 用 `--` 而不是 `./` 前缀：sha256sums.txt 里的条目名要与 Release 资产名逐字相同
+          sha256sum -- *-linux-amd64 *-linux-arm64 manifest.json install.sh > sha256sums.txt
+          cat sha256sums.txt
+      - name: Release notes
+        env:
+          V: ${{ needs.verify.outputs.version }}
+          TAG: ${{ needs.verify.outputs.tag }}
+          PRERELEASE: ${{ needs.verify.outputs.prerelease }}
+          R: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          bash scripts/release/changelog-section.sh "$V" > notes.md
+          # 预发布的一行命令必须把 tag 钉死：GitHub 的 releases/latest 只解析到最近的**非**
+          # prerelease 版本，rc1 发布时仓库里还没有任何正式版，latest/download/... 直接 404，
+          # 而裁决记录「发布：预发布与首推（2026-09-12）」打 rc1 的唯一目的就是一行命令装新机。
+          if [[ "$PRERELEASE" == "true" ]]; then
+            DL="https://github.com/$R/releases/download/$TAG"
+            ENVP="BUI_VERSION=$TAG "
+          else
+            DL="https://github.com/$R/releases/latest/download"
+            ENVP=""
+          fi
+          {
+            printf '\n---\n\n'
+            if [[ "$PRERELEASE" == "true" ]]; then
+              printf '> 预发布（rc）：GitHub 的 `releases/latest` 不解析预发布，下面的命令与 `BUI_VERSION` 都钉死在 `%s`。\n\n' "$TAG"
+            fi
+            printf '安装（root，唯一必填是面板域名）：\n\n'
+            printf '```bash\ncurl -fsSL %s/install.sh | %sbash -s -- --domain <域名>\n```\n' "$DL" "$ENVP"
+            printf '\n国内网络不通时把 `BUI_MIRRORS` 指向可用的 GitHub 镜像前缀：\n\n'
+            printf '```bash\ncurl -fsSL https://ghfast.top/%s/install.sh | %sBUI_MIRRORS="https://ghfast.top/" bash -s -- --domain <域名>\n```\n' "$DL" "$ENVP"
+            printf '\n资产：`bui` / `bui-c` 与四个内核的裸二进制（amd64 / arm64 各一份）、`manifest.json`（总纲 C4 形状）、`sha256sums.txt`、`install.sh`。\n'
+          } >> notes.md
+          cat notes.md
+      - name: 上传整份 dist（M5 演练的数据源，两条路径都上传）
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-dist-${{ needs.verify.outputs.version }}
+          path: dist/
+          if-no-files-found: error
+      - name: 演练模式：只清点资产，不创建 Release
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          TAG: ${{ inputs.tag }}
+          RUN_ID: ${{ github.run_id }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          printf '演练模式（dispatch）：以下 15 个资产不会上传，也不会创建 tag %s\n' "$TAG"
+          ls -l dist
+          printf '用 gh run download %s -n release-dist-%s 取走 dist，M5 的升级/回滚演练用本机 http.server 托管它\n' \
+            "$RUN_ID" "$VERSION"
+      - name: 发布（只有 tag 推送这条路径会创建 Release）
+        if: ${{ github.event_name == 'push' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          PRERELEASE: ${{ needs.verify.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          # tag 由主理人打：v<x.y.z>-rcN 是预发布（裁决记录 2026-09-12，供一行命令装机），
+          # 纯 v<x.y.z> 是 M5 验收通过后的正式版。
+          flags=()
+          if [[ "$PRERELEASE" == "true" ]]; then
+            flags+=(--prerelease)
+          fi
+          # 资产逐类列清：`dist/*` 会把 notes.md 之类的中间文件也传上去
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --notes-file notes.md \
+            "${flags[@]}" \
+            dist/*-linux-amd64 dist/*-linux-arm64 dist/manifest.json dist/sha256sums.txt dist/install.sh
