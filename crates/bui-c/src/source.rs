@@ -219,7 +219,8 @@ pub fn from_uris(lines: &[String]) -> Result<Fetched> {
         schemes.join("、")
     );
     if lines.iter().any(|l| is_http_url(l)) {
-        msg.push_str("。订阅地址请单独粘贴一行，或用 `bui-c import --sub <url>`");
+        // 命令行 `bui-c import -` 与菜单 [3] 都会走到这里：说法得两边都成立
+        msg.push_str("。订阅地址请用 `bui-c import --sub <url>`，或在菜单 [3] 里单独粘贴一行");
     }
     Err(Error::msg(msg))
 }
@@ -424,8 +425,8 @@ mod tests {
             "订阅地址要指向 `bui-c import --sub <url>`：{msg}"
         );
         assert!(
-            msg.contains("订阅地址请单独粘贴一行"),
-            "菜单里单独一行的订阅地址能直接导入：{msg}"
+            msg.contains("或在菜单 [3] 里单独粘贴一行"),
+            "这条错误在命令行 `bui-c import -` 与菜单里都会出现，说法要两边都成立：{msg}"
         );
         assert!(msg.contains("https://"), "列出脱敏后的 scheme：{msg}");
         assert!(
