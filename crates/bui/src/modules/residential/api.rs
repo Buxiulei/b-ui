@@ -481,6 +481,10 @@ pub struct PinRow {
 pub struct AutoRow {
     pub upstream_id: Uuid,
     pub upstream_name: String,
+    /// 该上游的槽序号（已移除的上游为 `null`）；CLI 按上游分组时写进组标题
+    pub upstream_slot: Option<u16>,
+    /// 该上游的 `host:port`（已移除的上游为空串）
+    pub upstream_addr: String,
     pub kind: String,
     pub value: String,
     pub hits: u64,
@@ -492,6 +496,9 @@ pub struct AutoRow {
 #[derive(Debug, Serialize, PartialEq)]
 pub struct PendingRow {
     pub upstream_id: Uuid,
+    pub upstream_name: String,
+    pub upstream_slot: Option<u16>,
+    pub upstream_addr: String,
     pub host: String,
     pub port: u16,
     pub confirms: u32,
@@ -501,6 +508,9 @@ pub struct PendingRow {
 #[derive(Debug, Serialize, PartialEq)]
 pub struct CandidateRow {
     pub upstream_id: Uuid,
+    pub upstream_name: String,
+    pub upstream_slot: Option<u16>,
+    pub upstream_addr: String,
     pub host: String,
     pub port: u16,
     pub hits: u64,
@@ -810,12 +820,18 @@ pub fn status_of(s: &SchemaState, r: &state::ResiRuntime) -> StatusResponse {
 
 pub fn blacklist_of(s: &SchemaState, r: &state::ResiRuntime) -> BlacklistResponse {
     let g = state::group_of(s);
-    let name_of = |id: Uuid| {
-        g.upstreams
+    // 名字 / 槽位 / host:port 同一处解析，auto / pending / 候选三段口径一致
+    let who = |id: Uuid| {
+        let slot = s
+            .residential
+            .slots
             .iter()
-            .find(|u| u.id == id)
-            .map(|u| u.name.clone())
-            .unwrap_or_else(|| "(已移除)".into())
+            .find(|sl| sl.upstream_id == id)
+            .map(|sl| sl.index);
+        match g.upstreams.iter().find(|u| u.id == id) {
+            Some(u) => (u.name.clone(), slot, format!("{}:{}", u.host, u.port)),
+            None => ("(已移除)".into(), slot, String::new()),
+        }
     };
     BlacklistResponse {
         pins: g
@@ -838,9 +854,12 @@ pub fn blacklist_of(s: &SchemaState, r: &state::ResiRuntime) -> BlacklistRespons
             .iter()
             .map(|a| {
                 let (kind, value) = rule_parts(&a.rule);
+                let (upstream_name, upstream_slot, upstream_addr) = who(a.upstream_id);
                 AutoRow {
                     upstream_id: a.upstream_id,
-                    upstream_name: name_of(a.upstream_id),
+                    upstream_name,
+                    upstream_slot,
+                    upstream_addr,
                     kind,
                     value,
                     hits: a.hits,
@@ -853,23 +872,35 @@ pub fn blacklist_of(s: &SchemaState, r: &state::ResiRuntime) -> BlacklistRespons
         pending: r
             .pending
             .iter()
-            .map(|e| PendingRow {
-                upstream_id: e.upstream_id,
-                host: e.host.clone(),
-                port: e.port,
-                confirms: e.confirms,
-                last_confirm_at: e.last_confirm_at.clone(),
+            .map(|e| {
+                let (upstream_name, upstream_slot, upstream_addr) = who(e.upstream_id);
+                PendingRow {
+                    upstream_id: e.upstream_id,
+                    upstream_name,
+                    upstream_slot,
+                    upstream_addr,
+                    host: e.host.clone(),
+                    port: e.port,
+                    confirms: e.confirms,
+                    last_confirm_at: e.last_confirm_at.clone(),
+                }
             })
             .collect(),
         candidates: r
             .candidates
             .values()
-            .map(|c| CandidateRow {
-                upstream_id: c.upstream_id,
-                host: c.host.clone(),
-                port: c.port,
-                hits: c.hits,
-                last_seen: c.last_seen.clone(),
+            .map(|c| {
+                let (upstream_name, upstream_slot, upstream_addr) = who(c.upstream_id);
+                CandidateRow {
+                    upstream_id: c.upstream_id,
+                    upstream_name,
+                    upstream_slot,
+                    upstream_addr,
+                    host: c.host.clone(),
+                    port: c.port,
+                    hits: c.hits,
+                    last_seen: c.last_seen.clone(),
+                }
             })
             .collect(),
         checking: r.checking.clone(),
@@ -2432,6 +2463,76 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::OK);
+    }
+
+    /// 三个上游各自学到同一条 pending / 候选：每条都带上游 id / 名字 / 槽位 / host:port，
+    /// 让 CLI 与面板能按上游分组；status 摘要的计数仍是原始条数。
+    #[tokio::test]
+    async fn blacklist_rows_name_their_upstream_and_status_counts_stay_raw() {
+        let d = tempfile::tempdir().unwrap();
+        let h = harness(&d).await;
+        grow_pool(&h, 3).await;
+        let s = h.ctx.store.read().await.clone();
+        let g = rstate::group_of(&s);
+        let ids: Vec<Uuid> = g.upstreams.iter().map(|u| u.id).collect();
+        rstate::update(&h.ctx.runtime, |r| {
+            for id in &ids {
+                r.pending.push(rstate::PendingEntry {
+                    upstream_id: *id,
+                    host: "api.stripe.com".into(),
+                    port: 443,
+                    hits: 5,
+                    confirms: 2,
+                    last_confirm_at: "2026-09-12T00:00:00Z".into(),
+                });
+                r.candidates.insert(
+                    format!("{id}|pay.google.com:443"),
+                    rstate::Candidate {
+                        upstream_id: *id,
+                        host: "pay.google.com".into(),
+                        port: 443,
+                        hits: 1,
+                        first_seen: "2026-09-12T00:00:00Z".into(),
+                        last_seen: "2026-09-12T00:00:00Z".into(),
+                        confirms: 0,
+                        last_confirm_at: None,
+                    },
+                );
+            }
+        })
+        .await;
+        let (st, v) = call(&h.app, "GET", "/api/residential/blacklist", None).await;
+        assert_eq!(st, StatusCode::OK);
+        for key in ["pending", "candidates"] {
+            let rows = v[key].as_array().unwrap();
+            assert_eq!(rows.len(), 3, "{key}：{v}");
+            for (i, u) in g.upstreams.iter().enumerate() {
+                let row = rows
+                    .iter()
+                    .find(|r| r["upstream_id"] == serde_json::json!(u.id))
+                    .unwrap_or_else(|| panic!("{key} 缺上游 {i}：{v}"));
+                assert_eq!(row["upstream_name"], u.name.as_str(), "{key}");
+                assert_eq!(
+                    row["upstream_addr"],
+                    format!("{}:{}", u.host, u.port).as_str(),
+                    "{key}"
+                );
+                let slot = s
+                    .residential
+                    .slots
+                    .iter()
+                    .find(|sl| sl.upstream_id == u.id)
+                    .unwrap()
+                    .index;
+                assert_eq!(row["upstream_slot"], slot, "{key}");
+            }
+        }
+        // auto 行同样带槽位与 host:port
+        assert!(v["auto"][0].get("upstream_slot").is_some(), "{v}");
+        assert!(v["auto"][0].get("upstream_addr").is_some(), "{v}");
+        let (_, sv) = call(&h.app, "GET", "/api/residential/status", None).await;
+        assert_eq!(sv["blacklist"]["pending"], 3);
+        assert_eq!(sv["blacklist"]["candidates"], 3);
     }
 
     #[tokio::test]
