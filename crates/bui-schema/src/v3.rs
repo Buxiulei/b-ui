@@ -139,7 +139,7 @@ pub fn import(dir: &Path) -> Result<ImportReport, ImportError> {
 
     let users = v3_users
         .into_iter()
-        .map(user_from_v3)
+        .map(|u| user_from_v3(u, &mut warnings))
         .collect::<Result<Vec<_>, _>>()?;
 
     let state = State {
@@ -258,33 +258,62 @@ struct V3Upstream {
 
 // ── 映射 ─────────────────────────────────────────────────────────────
 
-fn user_from_v3(u: V3User) -> Result<User, ImportError> {
-    let protocol = u.protocol.as_deref().unwrap_or("fusion");
-    let protocols = match protocol {
-        "fusion" => vec![Protocol::Hysteria2, Protocol::Reality],
-        "hysteria2" => vec![Protocol::Hysteria2],
-        "vless-reality" => vec![Protocol::Reality],
-        other => {
+/// 把一条 v3 用户记录映射成 v4 用户；缺字段按 v3 的渲染语义补齐，补齐动作记进 `warnings`。
+///
+/// v3 最早期的记录（REALITY 出现前由安装脚本写的首个用户，v3.5.20 之前的
+/// `server/core.sh:516`）只有 `username` / `password` / `createdAt` / `limits`。v3 对缺字段的
+/// 处理（行号指删除提交 fc3e757 的父提交里的 `web/server.js`）：
+/// - 缺 `protocol`：订阅三端都按 `user.protocol || "fusion"` 渲染（:1848 / :652 / :852）；
+///   hy2 鉴权把它和 hysteria2 归为一类（:280 `!x.protocol`）。
+/// - 缺 `uuid`：VLESS 节点一个都不出（:1826 `if (!user.uuid …) return null`，
+///   :661 / :860 `hasVless = user.uuid && …`），xray 客户端表也不收（:282 `filter(x => x.uuid)`）。
+///   所以缺 protocol 又缺 uuid 的用户在 v3 里实际拿到的是 fusion 的 HY2 那一半：HY2直连 + HY2住宅，
+///   v4 用 `[Hysteria2]` 权益原样复现，生成的 UUID 不进订阅。
+/// - 缺 `sni`：v3 用 `cfg.sni || user.sni || "www.bing.com"`（:1821），服务端 REALITY
+///   serverNames 优先，per-user sni 本来就不生效；v4 不存 per-user sni，这里不读。
+/// - 缺 `usage`：按 0 计（:1436 `if (!u.usage) u.usage = { total: 0, monthly: {} }`），
+///   由 [`V3Usage`] 的 `#[serde(default)]` 承担。
+fn user_from_v3(u: V3User, warnings: &mut Vec<String>) -> Result<User, ImportError> {
+    let uuid_str = u.uuid.as_deref().filter(|s| !s.is_empty());
+    let protocols = match u.protocol.as_deref() {
+        // 早期记录：v3 的 fusion 在没有 uuid 时只剩 HY2 两个节点（见函数文档）
+        None if uuid_str.is_none() => vec![Protocol::Hysteria2],
+        None | Some("fusion") => vec![Protocol::Hysteria2, Protocol::Reality],
+        Some("hysteria2") => vec![Protocol::Hysteria2],
+        Some("vless-reality") => vec![Protocol::Reality],
+        Some(other) => {
             return Err(ImportError::Invalid(format!(
                 "用户 {} 的 protocol「{}」在 v4 没有对应权益，请先在 v3 面板改成 fusion / hysteria2 / vless-reality",
                 u.username, other
             )))
         }
     };
-    let uuid_str = u.uuid.filter(|s| !s.is_empty()).ok_or_else(|| {
-        ImportError::Invalid(format!(
-            "用户 {} 缺少 uuid，请先在 v3 面板重建该用户后再导入",
-            u.username
-        ))
-    })?;
-    let vless_uuid = Uuid::parse_str(&uuid_str)
-        .map_err(|e| ImportError::Invalid(format!("用户 {} 的 uuid 非法: {}", u.username, e)))?;
     let hy2_password = u.password.filter(|s| !s.is_empty()).ok_or_else(|| {
         ImportError::Invalid(format!(
             "用户 {} 缺少 password，请先在 v3 面板重设该用户密码后再导入",
             u.username
         ))
     })?;
+    let vless_uuid = match uuid_str {
+        Some(s) => Uuid::parse_str(s).map_err(|e| {
+            ImportError::Invalid(format!("用户 {} 的 uuid 非法: {}", u.username, e))
+        })?,
+        // v3 没 uuid 就不渲染 VLESS；v4 的凭据必须有 UUID，生成一个
+        None => {
+            warnings.push(if protocols.contains(&Protocol::Reality) {
+                format!(
+                    "用户 {} 在 v3 里没有 VLESS UUID，已生成，需该用户刷新订阅以获得 REALITY 节点",
+                    u.username
+                )
+            } else {
+                format!(
+                    "用户 {} 在 v3 里没有 VLESS UUID，已生成（不影响现有订阅）",
+                    u.username
+                )
+            });
+            Uuid::new_v4()
+        }
+    };
     // v3 的 residential 缺省视为开通（web/server.js 用 `!== false` 判定）
     let residential = (u.residential != Some(false)).then(|| ResidentialEntitlement {
         group_id: DEFAULT_GROUP.to_string(),
