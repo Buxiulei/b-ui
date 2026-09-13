@@ -92,3 +92,80 @@ pub fn profiles_socks() -> Profiles {
 pub fn profiles_tun() -> Profiles {
     one(Mode::Tun)
 }
+
+/// 叫 `name` 的节点：全局分流，来自面板 `/api/nodes`。
+pub fn named(name: &str, node: Node) -> Profile {
+    Profile {
+        name: name.into(),
+        node,
+        split: split_global(),
+        source: Source::ApiNodes,
+        imported_at: "2026-09-11T00:00:00Z".into(),
+    }
+}
+
+/// 真机（baiyi）形态的 9 个节点：名字 3–38 列、label 最长 26 列、host:port 最长 29 列。
+/// 端点与凭据是合成的，只有各字段的长度照抄真机。活动节点是第 2 个（短名）。
+/// 菜单的宽度守门表与删除流程的测试都用它。
+pub fn baiyi_like() -> Profiles {
+    let node = |kind: NodeKind, label: &str, host: &str, port: u16| Node {
+        kind,
+        label: label.into(),
+        host: host.into(),
+        port,
+        ..match kind {
+            NodeKind::RealityDirect | NodeKind::RealityResidential => reality_direct_node(),
+            NodeKind::Hy2Direct | NodeKind::Hy2Residential => hy2_direct_node(),
+        }
+    };
+    let bwg = "tizi.example.test";
+    let cl = "rick-node.example-a.net";
+    let mut p = Profiles::new_default();
+    for (name, n) in [
+        (
+            "HY2",
+            node(NodeKind::Hy2Residential, "示例专用名-HY2住宅", bwg, 40000),
+        ),
+        (
+            "hysteria2-1778329470",
+            node(NodeKind::Hy2Direct, "示例专用名", bwg, 10000),
+        ),
+        (
+            "reality-Reality",
+            node(
+                NodeKind::RealityDirect,
+                "示例名-reality-Reality直连",
+                bwg,
+                10001,
+            ),
+        ),
+        (
+            "rick-node.example-a.net-reality-direct",
+            node(NodeKind::RealityDirect, "Reality直连", cl, 10001),
+        ),
+        (
+            "rick-node.example-a.net-reality-resi",
+            node(NodeKind::RealityResidential, "Reality住宅", cl, 10002),
+        ),
+        (
+            "rick-node.example-a.net-hy2-direct",
+            node(NodeKind::Hy2Direct, "HY2直连", cl, 10000),
+        ),
+        (
+            "rick-node.example-a.net-hy2-resi",
+            node(NodeKind::Hy2Residential, "HY2住宅", cl, 40001),
+        ),
+        (
+            "tizi.example.test-reality-resi",
+            node(NodeKind::RealityResidential, "Reality住宅", bwg, 10002),
+        ),
+        (
+            "tizi.example.test-hy2-resi",
+            node(NodeKind::Hy2Residential, "HY2住宅", bwg, 40002),
+        ),
+    ] {
+        p.profiles.push(named(name, n));
+    }
+    p.active = Some("hysteria2-1778329470".into());
+    p
+}

@@ -9,7 +9,8 @@ use crate::menu::{self, Action, Prompt, Status};
 use crate::net::Net;
 use crate::paths::{Paths, UNIT_MAIN, UNIT_TIMER};
 use crate::profiles::{
-    https_base, profile_name, rfc3339, same_account, Mode, Panel, Profile, Profiles, Source, Upsert,
+    https_base, kind_slug, profile_name, rfc3339, same_account, Mode, Panel, Profile, Profiles,
+    Source, Upsert,
 };
 use crate::source::{self, Fetched};
 use crate::sys::{systemd, Sys};
@@ -159,6 +160,8 @@ impl<'a, S: Sys, N: Net, P: Prompt> Ctx<'a, S, N, P> {
             .map_or(80, usize::from)
     }
     /// 终端行数；拿不到按 24。报 0 行（只设了列数的 pty）也算拿不到。
+    /// 算一屏还能放几行时一律写 `rows().saturating_sub(2)`（留给提示符与最后一行），
+    /// 不指望这里的回落值防下溢。
     pub fn rows(&self) -> usize {
         self.sys
             .term_size()
@@ -253,6 +256,12 @@ fn engine_status<S: Sys, N: Net, P: Prompt>(ctx: &Ctx<'_, S, N, P>, prof: &Profi
     Status {
         node: p.map(|x| x.name.clone()).unwrap_or_default(),
         label: p.map(|x| x.node.label.clone()).unwrap_or_default(),
+        kind: p
+            .map(|x| kind_slug(x.node.kind).to_string())
+            .unwrap_or_default(),
+        host_port: p
+            .map(|x| format!("{}:{}", x.node.host, x.node.port))
+            .unwrap_or_default(),
         mode: prof.mode,
         service_running: systemd::is_active(ctx.sys, UNIT_MAIN),
         tun_up: Engine::new(ctx.sys, ctx.paths).tun_up(),
@@ -525,7 +534,8 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
                     .map_err(|e| Error::parse("status", e.to_string()))?;
                 ctx.out.push('\n');
             } else {
-                let text = menu::render_status(&st);
+                // 终端里跟着宽度走，管道里（拿不到尺寸）按 80 列排
+                let text = menu::render_status(&st, ctx.width());
                 ctx.show(text.trim_end());
             }
             Ok(())
@@ -547,7 +557,7 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
                     .map_err(|e| Error::parse("list", e.to_string()))?;
                 ctx.out.push('\n');
             } else {
-                let text = menu::render_nodes(&prof, false);
+                let text = menu::render_nodes(&prof, false, ctx.width());
                 ctx.show(text.trim_end());
             }
             Ok(())
@@ -884,7 +894,8 @@ fn menu_body<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()
     loop {
         let prof = Profiles::load(ctx.sys, ctx.paths)?;
         let st = engine_status(ctx, &prof);
-        let screen = menu::render(&st);
+        // 每次重画都重新取宽度：窗口缩放、手机转屏立刻生效
+        let screen = menu::render(&st, ctx.width(), None);
         ctx.show(screen.trim_end());
         ctx.flush();
         if ctx.stdout_closed {
@@ -913,7 +924,7 @@ fn menu_body<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()
         let cmd = match action {
             Action::Quit => return Ok(()),
             Action::SwitchNode => {
-                let list = menu::render_node_picker(&prof);
+                let list = menu::render_node_picker(&prof, ctx.width());
                 ctx.show(list.trim_end());
                 let len = prof.profiles.len();
                 if len == 0 {
@@ -1227,7 +1238,10 @@ fn restart_service<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>, mode: 
 fn show_journal<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>, n: u32) {
     match journal_tail(ctx.sys, n) {
         Ok(text) => {
-            let mut block = format!("\n  ── {UNIT_MAIN} 最近 {n} 行日志 ──");
+            let mut block = format!(
+                "\n{}",
+                menu::title_bar(&format!("{UNIT_MAIN} 最近 {n} 行日志"))
+            );
             for l in text.lines() {
                 block.push('\n');
                 if !l.is_empty() {
@@ -2416,7 +2430,7 @@ mod tests {
         assert!(n2.log().is_empty(), "渲染菜单不该联网");
         // ★ 只在菜单选项块里（一次性 status 不打菜单块），同样只读 runtime.json
         let prof2 = Profiles::load(&s, &pp).unwrap();
-        assert!(menu::render_options(&engine_status(&ctx, &prof2)).contains("★ 有新版"));
+        assert!(menu::render_options(&engine_status(&ctx, &prof2), 80).contains("★ 有新版"));
 
         // 再查一次，manifest 与本机同版、且盘上就是那一份构建 → 标记清掉
         n.route(
@@ -2432,7 +2446,7 @@ mod tests {
         let mut ctx = Ctx::new(&s, &n2, &pp, &mut p, false, false);
         dispatch(&parse(&["status"]), &mut ctx).unwrap();
         let prof3 = Profiles::load(&s, &pp).unwrap();
-        assert!(!menu::render_options(&engine_status(&ctx, &prof3)).contains("★ 有新版"));
+        assert!(!menu::render_options(&engine_status(&ctx, &prof3), 80).contains("★ 有新版"));
     }
 
     /// 与服务端 `kernels::bui_build_differs` 同口径：版本相同、但 manifest 里本机架构的 bui-c
@@ -2781,7 +2795,8 @@ mod tests {
 
     #[test]
     fn ctx_size_treats_a_zero_count_as_unknown() {
-        // 有的 pty 只设了列数、行数报 0：按拿不到回落，后面的 `rows − 2` 不会下溢
+        // 有的 pty 只设了列数、行数报 0：按拿不到回落到 24 行。
+        // 用行数算可用高度的地方另外一律写 `rows().saturating_sub(2)`，不靠这里防下溢
         let pp = paths();
         let s = FakeSys::new();
         let n = FakeNet::new();
@@ -2812,10 +2827,68 @@ mod tests {
         );
         assert!(t.lines().any(|l| l == "  已切到 TUN 模式"), "{t}");
         // 菜单本身已经排好版，不能再叠一层缩进
-        assert!(t.lines().any(|l| l.starts_with("  ─────  B-UI")), "{t}");
+        assert!(t.lines().any(|l| l.starts_with("  ── B-UI")), "{t}");
         assert!(t.lines().any(|l| l.starts_with("     [1] ")), "{t}");
-        assert!(!t.lines().any(|l| l.starts_with("    ─────  B-UI")), "{t}");
+        assert!(!t.lines().any(|l| l.starts_with("    ── B-UI")), "{t}");
         assert_eq!(ctx.indent, "", "退出菜单后恢复顶格");
+    }
+
+    #[test]
+    fn status_list_and_menu_follow_the_terminal_width() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        two_nodes(&s, &pp);
+        let n = FakeNet::new();
+        let run = |args: &[&str]| {
+            let mut p = Scripted::from([]);
+            let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+            dispatch(&parse(args), &mut ctx).unwrap();
+            ctx.transcript
+        };
+        // 管道里拿不到尺寸：按 80 列排，标准版式，详情行带 kind
+        let status = run(&["status"]);
+        assert!(
+            status.contains(
+                "   节点   ●  运行中  alice-hy2-direct\n          HY2直连  hy2-direct  panel.example.com:10000\n"
+            ),
+            "{status}"
+        );
+        let list = run(&["list"]);
+        assert!(
+            list.contains("    HY2直连  hy2-direct  panel.example.com:10000\n"),
+            "{list}"
+        );
+        // 40 列终端：窄版式，每一行按容量口径都不超过 39 列
+        s.set_term_size(Some((40, 20)));
+        let status = run(&["status"]);
+        assert!(
+            status.contains("   节点 ● 运行中\n        alice-hy2-direct\n"),
+            "{status}"
+        );
+        assert!(
+            status.contains("   代理 SOCKS5 :1080  HTTP :8080\n"),
+            "{status}"
+        );
+        let list = run(&["list"]);
+        assert!(
+            list.contains("    Reality直连\n"),
+            "放不下服务器就只留 label：{list}"
+        );
+        // 1 进节点列表 → 0 返回 → 0 退出
+        let mut p = Scripted::from(["1", "0", "0"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert!(
+            t.lines().any(|l| l == "  [0] 返回"),
+            "节点列表用窄版式：\n{t}"
+        );
+        for text in [&status, &list, &t] {
+            for l in text.lines() {
+                assert!(menu::budget_width(l) <= 39, "{l:?}\n{text}");
+            }
+        }
     }
 
     #[test]

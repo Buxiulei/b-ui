@@ -200,6 +200,10 @@ pub enum Action {
 pub struct Status {
     pub node: String,
     pub label: String,
+    /// 活动节点的 kind（[`kind_slug`]），状态区详情行用；没有节点时为空。
+    pub kind: String,
+    /// 活动节点的 `服务器:端口`；没有节点时为空。
+    pub host_port: String,
     pub mode: Mode,
     pub service_running: bool,
     pub tun_up: bool,
@@ -396,58 +400,164 @@ fn row(n1: &str, l1: &str, n2: &str, l2: &str) -> String {
     format!("     [{n1}] {}  [{n2}] {l2}\n", pad(l1, LEFT_WIDTH))
 }
 
-/// 标题条 + 三行状态 + 两列数字菜单。
-pub fn render(st: &Status) -> String {
-    let mut out = render_status(st);
-    out.push_str(&render_options(st));
+/// 标题条与分隔线的横线字符。它在 [`AMBIGUOUS`] 里，容量口径按 2 列；哪天发现哪种客户端
+/// 还是折行，只改这一处，换成 ASCII `-`（spec §2.2）。
+pub const RULE: char = '─';
+
+/// 终端宽度不小于它用标准版式；40 ≤ W < 它用窄版式：状态区的名字单独一行、节点列表缩进
+/// 2 列、不显示 kind（spec §2.2）。50 列时列表名字的可用宽度是 38 列，正好放下真机最长的名字。
+pub const STANDARD_WIDTH: usize = 50;
+
+fn is_narrow(width: usize) -> bool {
+    width < STANDARD_WIDTH
+}
+
+/// 标题条 `  ── {text} ──`，所有宽度同一个样子。以前的 `─────  … · v…  ─────…` 在把 `─`
+/// 画成 2 列的手机客户端上最坏占 81 列，80 列也折行。
+pub fn title_bar(text: &str) -> String {
+    format!("  {RULE}{RULE} {text} {RULE}{RULE}")
+}
+
+/// 分隔线：`min(max, (line_limit(width) − indent) / 2)` 个 [`RULE`]，不含缩进（调用方自己加）。
+/// 除的是 `RULE` 的容量口径列宽（`─` 为 2），所以连同缩进不超过行宽上限；`max` 是它本来该有的长度。
+pub fn rule(width: usize, indent: usize, max: usize) -> String {
+    let fit = line_limit(width).saturating_sub(indent) / char_budget(RULE);
+    RULE.to_string().repeat(max.min(fit))
+}
+
+/// 用两个空格把非空的几段接起来：某段为空（例如没有 label）时不留空洞。
+fn join2(parts: &[&str]) -> String {
+    parts
+        .iter()
+        .filter(|p| !p.is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join("  ")
+}
+
+/// 标题条 + 状态区 + 两列数字菜单；`last` 有内容时，底下再接一行 `  上次：…`。
+pub fn render(st: &Status, width: usize, last: Option<&str>) -> String {
+    let mut out = render_status(st, width);
+    out.push_str(&render_options(st, width));
+    if let Some(text) = last.filter(|t| !t.is_empty()) {
+        out.push_str(&last_line(text, width));
+    }
     out
 }
 
-/// 只有标题条与节点 / 代理 / 模式三行：一次性 `bui-c status` 用它，不打菜单块
+/// 「上次：」行的前缀，含 2 列缩进。
+const LAST_HEAD: &str = "  上次：";
+
+/// 主菜单底部的「上次：」行（含换行）：先净化，再尾部截断到行宽上限。
+/// 摘要里名字的中间截断由拼摘要的调用方做（spec §0.2 R6），这里只保证整行不折。
+fn last_line(text: &str, width: usize) -> String {
+    let room = line_limit(width) - budget_width(LAST_HEAD);
+    format!("{LAST_HEAD}{}\n", truncate_end(&sanitize(text), room))
+}
+
+/// 标题条与状态区（节点 / 代理 / 模式）：一次性 `bui-c status` 用它，不打菜单块
 /// （命令行里 `[1] 切换节点` 无处可点）。
-pub fn render_status(st: &Status) -> String {
-    let mut out = String::new();
-    out.push_str(&format!(
-        "\n  ─────  B-UI 客户端 · v{}  ──────────────────────\n\n",
-        crate::VERSION
-    ));
+///
+/// 标准版式：`   节点   ●  运行中  {名字}`，连名字放不下时名字另起一行；下面是详情行
+/// `label  kind  服务器:端口`，缩进到 `●` 那一列。窄版式：状态词、名字、详情各占一行，前缀收紧。
+/// 名字只做中间截断；详情怎么降级见 [`status_detail`]。
+pub fn render_status(st: &Status, width: usize) -> String {
+    let limit = line_limit(width);
+    let narrow = is_narrow(width);
+    let mut out = format!(
+        "\n{}\n\n",
+        title_bar(&format!("B-UI 客户端 v{}", crate::VERSION))
+    );
     // 没有节点时服务就算在跑也没东西可用：不亮绿灯，也不报「已停止」这种无关的状态
-    let node = if st.node.is_empty() {
-        "○  (未设置)".to_string()
+    let (dot, word) = if st.node.is_empty() {
+        ("○", "(未设置)")
     } else if st.service_running {
-        format!("●  运行中  {}  {}", st.node, st.label)
+        ("●", "运行中")
     } else {
-        format!("○  已停止  {}  {}", st.node, st.label)
+        ("○", "已停止")
     };
-    out.push_str(&format!("   节点   {node}\n"));
-    out.push_str(&format!(
-        "   代理      SOCKS5 :{}   HTTP :{}\n",
-        st.socks_port, st.http_port
-    ));
-    // 两种模式的状态平行给：SOCKS 以前恒亮「● 本地入口」，服务停了也照亮，是假绿灯
-    let mode = match st.mode {
-        Mode::Tun => {
-            if st.tun_up {
-                "TUN   ●  运行中".to_string()
-            } else {
-                "TUN   ○  未就绪".to_string()
-            }
-        }
-        // 端口不在这里重复：「代理」那一行已经写了（TUN 模式下 1080/8080 也在监听）
-        Mode::Socks => {
-            if st.service_running {
-                "SOCKS ●  运行中".to_string()
-            } else {
-                "SOCKS ○  已停止".to_string()
-            }
-        }
+    // 另起的名字行与详情行缩进到 `●` 那一列
+    let (head, indent) = if narrow {
+        (format!("   节点 {dot} {word}"), 8)
+    } else {
+        (format!("   节点   {dot}  {word}"), 10)
     };
-    out.push_str(&format!("   模式   {mode}\n\n"));
+    let room = limit - indent;
+    let pad = " ".repeat(indent);
+    if st.node.is_empty() {
+        out.push_str(&format!("{head}\n"));
+    } else {
+        let name = sanitize(&st.node);
+        let one = format!("{head}  {name}");
+        if !narrow && budget_width(&one) <= limit {
+            out.push_str(&format!("{one}\n"));
+        } else {
+            // 另起一行后 60 列放得下 38 列的长名字，40 列才要中间截断
+            out.push_str(&format!("{head}\n{pad}{}\n", truncate_middle(&name, room)));
+        }
+        for l in status_detail(st, narrow, room) {
+            out.push_str(&format!("{pad}{l}\n"));
+        }
+    }
+    // 窄版式收紧对齐空格：两个端口都是 5 位数时，标准写法有 40 列
+    if narrow {
+        out.push_str(&format!(
+            "   代理 SOCKS5 :{}  HTTP :{}\n",
+            st.socks_port, st.http_port
+        ));
+    } else {
+        out.push_str(&format!(
+            "   代理      SOCKS5 :{}   HTTP :{}\n",
+            st.socks_port, st.http_port
+        ));
+    }
+    // 两种模式的状态平行给：SOCKS 以前恒亮「● 本地入口」，服务停了也照亮，是假绿灯。
+    // 端口不在这里重复：「代理」那一行已经写了（TUN 模式下 1080/8080 也在监听）
+    let (mode, up, down) = match st.mode {
+        Mode::Tun => ("TUN", st.tun_up, "未就绪"),
+        Mode::Socks => ("SOCKS", st.service_running, "已停止"),
+    };
+    let (dot, word) = if up {
+        ("●", "运行中")
+    } else {
+        ("○", down)
+    };
+    if narrow {
+        out.push_str(&format!("   模式 {mode} {dot} {word}\n\n"));
+    } else {
+        out.push_str(&format!("   模式   {mode:<5} {dot}  {word}\n\n"));
+    }
     out
 }
 
-/// 两列数字菜单块：`[1]`~`[9]` + 分隔线 + `[0] 退出`。
-pub fn render_options(st: &Status) -> String {
+/// 状态区的详情行（spec §2.4）：`label  kind  服务器:端口` 放不下就去掉 kind（窄版式本来就不显示），
+/// 还放不下就 label 一行、服务器:端口一行，各自尾部截断到 `room`。三段都空时一行也不出。
+fn status_detail(st: &Status, narrow: bool, room: usize) -> Vec<String> {
+    let label = sanitize(&st.label);
+    let hp = sanitize(&st.host_port);
+    let full = join2(&[&label, &sanitize(&st.kind), &hp]);
+    let short = join2(&[&label, &hp]);
+    let line = if !narrow && budget_width(&full) <= room {
+        full
+    } else if budget_width(&short) <= room {
+        short
+    } else {
+        return [&label, &hp]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .map(|s| truncate_end(s, room))
+            .collect();
+    };
+    if line.is_empty() {
+        Vec::new()
+    } else {
+        vec![line]
+    }
+}
+
+/// 两列数字菜单块：`[1]`~`[9]` + 分隔线 + `[0] 退出`。两列排布任何宽度都不转单列（spec §2.2），
+/// 跟着宽度变的只有分隔线。
+pub fn render_options(st: &Status, width: usize) -> String {
     let mut out = String::new();
     let update = if st.update_available {
         "检查更新 ★ 有新版"
@@ -471,7 +581,7 @@ pub fn render_options(st: &Status) -> String {
         ),
     ];
     // 分隔线跟实际最宽的那行选项等宽：[2] 的目标模式与 [6] 的「★ 有新版」都会改变行宽，
-    // 写死的线要么比选项长、要么短一截
+    // 写死的线要么比选项长、要么短一截。再按容量口径封顶：`─` 在有的手机客户端上画成 2 列
     let widest = rows
         .iter()
         .map(|r| display_width(r.trim_end()))
@@ -482,10 +592,40 @@ pub fn render_options(st: &Status) -> String {
     }
     out.push_str(&format!(
         "     {}\n",
-        "\u{2500}".repeat(widest.saturating_sub(5))
+        rule(width, 5, widest.saturating_sub(5))
     ));
     out.push_str("     [0] 退出\n");
     out
+}
+
+/// label 至少留几列，才值得跟服务器:端口挤在一行（spec §2.4）。
+const LABEL_MIN: usize = 8;
+
+/// 节点名里带不带它的服务器：面板导入的名字形如 `{服务器}-reality-direct`。
+fn host_in_name(name: &str, host: &str) -> bool {
+    !host.is_empty()
+        && name
+            .to_ascii_lowercase()
+            .contains(&host.to_ascii_lowercase())
+}
+
+/// 节点列表里不显示 kind 时的一行详情（spec §2.4 第 2 条）：`label  服务器:端口` 放得下就原样；
+/// 放不下时，`keep_label`（窄版式，或名字里已经带着服务器、上一行看得见）保住 label，尾部截断；
+/// 否则保住服务器:端口，label 尾截、至少留 [`LABEL_MIN`] 列，不够就只剩服务器:端口。
+/// 窄版式保 label 是因为那是家人自己起的备注，v3 迁来的节点只靠它辨认。
+fn list_detail(label: &str, hp: &str, keep_label: bool, room: usize) -> String {
+    let both = join2(&[label, hp]);
+    if budget_width(&both) <= room {
+        return both;
+    }
+    if keep_label && !label.is_empty() {
+        return truncate_end(label, room);
+    }
+    let label_room = room.saturating_sub(budget_width(hp) + 2);
+    if !label.is_empty() && label_room >= LABEL_MIN {
+        return format!("{}  {hp}", truncate_end(label, label_room));
+    }
+    truncate_end(hp, room)
 }
 
 /// 节点列表：每个节点两行，当前节点名字前带 `★`。
@@ -502,9 +642,14 @@ pub fn render_options(st: &Status) -> String {
 /// 编号行与主菜单选项同为 5 列缩进；第二行缩进到名字起始列（`★ ` 按终端里的 2 列算，
 /// 与两个空格同宽）。
 ///
+/// 按宽度排（spec §2.2、§2.4）：名字放不下就中间截断；只要有一行放不下完整的
+/// `label  kind  服务器:端口`，整张表都不显示 kind（同一张表的列要一致），仍放不下的行按
+/// [`list_detail`] 降级。窄版式（40–49 列）编号行缩进 2 列，不显示 kind。
+/// 名字、label、服务器先过 [`sanitize`]。
+///
 /// `with_back`：菜单里选节点要打编号与 `[0] 返回`；一次性 `bui-c list` 不打编号
 /// （`bui-c switch` 只认名字），第一行形如 `  ★ name` / `    name`。
-pub fn render_nodes(prof: &Profiles, with_back: bool) -> String {
+pub fn render_nodes(prof: &Profiles, with_back: bool, width: usize) -> String {
     if prof.profiles.is_empty() {
         return if with_back {
             "  没有节点，先用 [3] 导入节点\n".to_string()
@@ -512,40 +657,66 @@ pub fn render_nodes(prof: &Profiles, with_back: bool) -> String {
             "  没有节点，先 `bui-c import …`\n".to_string()
         };
     }
+    let limit = line_limit(width);
+    let narrow = is_narrow(width);
+    let margin = if narrow { "  " } else { "     " };
     // 两位数编号时补齐 `[n]`，名字仍然对齐在同一列
     let num_w = format!("[{}]", prof.profiles.len()).len();
+    let lead = |i: usize| {
+        if with_back {
+            format!("{margin}{} ", pad(&format!("[{}]", i + 1), num_w))
+        } else {
+            "  ".to_string()
+        }
+    };
+    // lead 全是 ASCII，字节数就是列数；再加名字前的 `★ ` 或两个空格
+    let indent = " ".repeat(lead(0).len() + 2);
+    let room = limit - indent.len();
+    let details: Vec<(String, String, String)> = prof
+        .profiles
+        .iter()
+        .map(|p| {
+            let label = sanitize(&p.node.label).into_owned();
+            let hp = sanitize(&format!("{}:{}", p.node.host, p.node.port)).into_owned();
+            let full = join2(&[&label, kind_slug(p.node.kind), &hp]);
+            (label, hp, full)
+        })
+        .collect();
+    let show_kind = !narrow
+        && details
+            .iter()
+            .all(|(_, _, full)| budget_width(full) <= room);
     let mut out = String::new();
-    for (i, p) in prof.profiles.iter().enumerate() {
+    for (i, (p, (label, hp, full))) in prof.profiles.iter().zip(&details).enumerate() {
         let mark = if prof.active.as_deref() == Some(p.name.as_str()) {
             "★ "
         } else {
             "  "
         };
-        let lead = if with_back {
-            format!("     {} ", pad(&format!("[{}]", i + 1), num_w))
-        } else {
-            "  ".to_string()
-        };
-        let indent = " ".repeat(lead.len() + 2);
-        out.push_str(&format!("{lead}{mark}{}\n", p.name));
+        let lead = lead(i);
+        let name_room = limit - budget_width(&lead) - budget_width(mark);
         out.push_str(&format!(
-            "{indent}{}  {}  {}:{}\n",
-            p.node.label,
-            kind_slug(p.node.kind),
-            p.node.host,
-            p.node.port
+            "{lead}{mark}{}\n",
+            truncate_middle(&sanitize(&p.name), name_room)
         ));
+        let detail = if show_kind {
+            full.clone()
+        } else {
+            let keep_label = narrow || host_in_name(&p.name, &p.node.host);
+            list_detail(label, hp, keep_label, room)
+        };
+        out.push_str(&format!("{indent}{detail}\n"));
     }
     if with_back {
-        out.push_str("     [0] 返回\n");
+        out.push_str(&format!("{margin}[0] 返回\n"));
     }
     out
 }
 
 /// 菜单 `[1] 切换节点` 的一屏：前空一行、两列缩进的标题，再接带编号的 [`render_nodes`]——
 /// 与 [`render_service_options`] 同一个样式。一次性 `bui-c list` 不用它，不加标题。
-pub fn render_node_picker(prof: &Profiles) -> String {
-    format!("\n  切换节点\n{}", render_nodes(prof, true))
+pub fn render_node_picker(prof: &Profiles, width: usize) -> String {
+    format!("\n  切换节点\n{}", render_nodes(prof, true, width))
 }
 
 /// `[4] 服务控制` 的二级菜单里的一次选择。
@@ -697,13 +868,15 @@ pub fn pick_index(input: &str, len: usize) -> Option<usize> {
 mod tests {
     use super::*;
     use crate::profiles::{Mode, Profile, Profiles, Source};
-    use crate::testutil::{hy2_direct_node, reality_direct_node, split_global};
+    use crate::testutil::{baiyi_like, hy2_direct_node, named, reality_direct_node, split_global};
     use pretty_assertions::assert_eq;
 
     fn st() -> Status {
         Status {
             node: "alice-hy2-direct".into(),
             label: "HY2直连".into(),
+            kind: "hy2-direct".into(),
+            host_port: "panel.example.com:10000".into(),
             mode: Mode::Tun,
             service_running: true,
             tun_up: true,
@@ -864,30 +1037,33 @@ mod tests {
 
     #[test]
     fn menu_is_two_columns_of_numbers_with_zero_to_quit() {
-        let out = render(&st());
-        assert!(out.contains("[1] 切换节点"));
-        assert!(out.contains("[2] 切到 SOCKS"));
-        assert!(out.contains("[3] 导入节点"));
-        assert!(out.contains("[4] 服务控制"));
-        assert!(out.contains("[5] 连接检查"));
-        assert!(out.contains("[6] 检查更新"));
-        assert!(out.contains("[7] 从 v3 导入"));
-        assert!(out.contains("[8] 卸载"));
-        assert!(out.contains("[9] 自动更新"));
-        assert!(out.contains("[0] 退出"));
-        // 每个选项行恰好两栏
-        let rows: Vec<&str> = out
-            .lines()
-            .filter(|l| {
-                l.contains("[1]") || l.contains("[3]") || l.contains("[5]") || l.contains("[7]")
-            })
-            .collect();
-        assert_eq!(rows.len(), 4);
-        for r in rows {
-            assert_eq!(r.matches('[').count(), 2, "两列：{r}");
+        // 40 列也不转单列：最宽的选项行 39 列，正好是 40 列的行宽上限（spec §2.2）
+        for w in [40, 80] {
+            let out = render(&st(), w, None);
+            assert!(out.contains("[1] 切换节点"));
+            assert!(out.contains("[2] 切到 SOCKS"));
+            assert!(out.contains("[3] 导入节点"));
+            assert!(out.contains("[4] 服务控制"));
+            assert!(out.contains("[5] 连接检查"));
+            assert!(out.contains("[6] 检查更新"));
+            assert!(out.contains("[7] 从 v3 导入"));
+            assert!(out.contains("[8] 卸载"));
+            assert!(out.contains("[9] 自动更新"));
+            assert!(out.contains("[0] 退出"));
+            // 每个选项行恰好两栏
+            let rows: Vec<&str> = out
+                .lines()
+                .filter(|l| {
+                    l.contains("[1]") || l.contains("[3]") || l.contains("[5]") || l.contains("[7]")
+                })
+                .collect();
+            assert_eq!(rows.len(), 4);
+            for r in rows {
+                assert_eq!(r.matches('[').count(), 2, "两列 @{w}：{r}");
+            }
+            assert!(!out.contains('\u{1b}'), "不含 ANSI 转义（快照稳定）");
+            assert!(!out.contains("↑") && !out.contains("↓"), "不做箭头菜单");
         }
-        assert!(!out.contains('\u{1b}'), "不含 ANSI 转义（快照稳定）");
-        assert!(!out.contains("↑") && !out.contains("↓"), "不做箭头菜单");
     }
 
     #[test]
@@ -903,7 +1079,8 @@ mod tests {
             ..st()
         };
         for (case, s) in [("TUN", tun), ("SOCKS", socks), ("有新版", update)] {
-            let out = render_options(&s);
+            // 100 列放得下原长：分隔线结束列 = 最宽选项行的结束列
+            let out = render_options(&s, 100);
             let rule = out.lines().find(|l| l.contains('─')).unwrap();
             let widest = out
                 .lines()
@@ -921,24 +1098,49 @@ mod tests {
                 5,
                 "与选项同为 5 列缩进"
             );
+            // 窄了就按容量口径封顶（`─` 按 2 列算）：整行不超上限，也不比最宽选项行长
+            for w in [40, 50, 60, 80] {
+                let out = render_options(&s, w);
+                let rule = out.lines().find(|l| l.contains('─')).unwrap();
+                assert!(budget_width(rule) <= line_limit(w), "{case} @{w}：{rule}");
+                assert!(display_width(rule) <= widest, "{case} @{w}：{rule}");
+            }
         }
+        // spec §2.2：菜单分隔线 60 列 27 个、40 列 17 个；80 列放得下原长 34 个
+        let count = |w: usize| {
+            render_options(&st(), w)
+                .lines()
+                .find(|l| l.contains('─'))
+                .unwrap()
+                .matches(RULE)
+                .count()
+        };
+        assert_eq!((count(40), count(60), count(80)), (17, 27, 34));
     }
 
     #[test]
     fn status_lines_show_node_mode_and_ports() {
-        let out = render(&st());
+        let out = render(&st(), 80, None);
         assert!(out.contains("alice-hy2-direct"));
         assert!(out.contains("HY2直连"));
+        assert!(
+            out.contains("HY2直连  hy2-direct  panel.example.com:10000"),
+            "详情行：label、kind、服务器:端口\n{out}"
+        );
         assert!(out.contains("SOCKS5 :1080"));
         assert!(out.contains("HTTP :8080"));
         assert!(out.contains("TUN"));
         assert!(out.contains(crate::VERSION));
+        assert!(
+            out.contains(&format!("\n  ── B-UI 客户端 v{} ──\n", crate::VERSION)),
+            "短标题条，不带歧义字符 ·：\n{out}"
+        );
         let mut s2 = st();
         s2.node = String::new();
         s2.service_running = false;
         s2.tun_up = false;
         s2.mode = Mode::Socks;
-        let out2 = render(&s2);
+        let out2 = render(&s2, 80, None);
         assert!(out2.contains("(未设置)"));
         assert!(out2.contains("已停止"));
         assert!(out2.contains("SOCKS"));
@@ -951,38 +1153,47 @@ mod tests {
             let s = Status {
                 node: String::new(),
                 label: String::new(),
+                kind: String::new(),
+                host_port: String::new(),
                 service_running: running,
                 ..st()
             };
-            let line = render_status(&s)
-                .lines()
-                .find(|l| l.contains("节点"))
-                .unwrap()
-                .to_string();
-            assert_eq!(line, "   节点   ○  (未设置)", "service_running={running}");
+            for (w, want) in [(80, "   节点   ○  (未设置)"), (40, "   节点 ○ (未设置)")]
+            {
+                let out = render_status(&s, w);
+                let lines: Vec<&str> = out.lines().collect();
+                let i = lines.iter().position(|l| l.contains("节点")).unwrap();
+                assert_eq!(lines[i], want, "service_running={running} @{w}");
+                assert!(
+                    lines[i + 1].starts_with("   代理"),
+                    "没有节点就没有详情行：\n{out}"
+                );
+            }
         }
-        // 有节点时照旧跟着服务状态
-        let line = render_status(&st())
-            .lines()
-            .find(|l| l.contains("节点"))
-            .unwrap()
-            .to_string();
-        assert_eq!(line, "   节点   ●  运行中  alice-hy2-direct  HY2直连");
+        // 有节点时照旧跟着服务状态；详情行缩进到 ● 那一列
+        let out = render_status(&st(), 80);
+        let lines: Vec<&str> = out.lines().collect();
+        let i = lines.iter().position(|l| l.contains("节点")).unwrap();
+        assert_eq!(lines[i], "   节点   ●  运行中  alice-hy2-direct");
+        assert_eq!(
+            lines[i + 1],
+            "          HY2直连  hy2-direct  panel.example.com:10000"
+        );
     }
 
     #[test]
     fn mode_option_names_the_target_mode() {
         let mut s = st(); // Tun
-        let tun = render_options(&s);
+        let tun = render_options(&s, 80);
         assert!(tun.contains("[2] 切到 SOCKS"), "{tun}");
         assert!(!tun.contains("切换模式"), "别让用户猜切到哪边：{tun}");
         s.mode = Mode::Socks;
-        assert!(render_options(&s).contains("[2] 切到 TUN"));
+        assert!(render_options(&s, 80).contains("[2] 切到 TUN"));
     }
 
-    /// 状态块里的「模式」那一行。
+    /// 状态块里的「模式」那一行（80 列，标准版式）。
     fn mode_line(st: &Status) -> String {
-        render_status(st)
+        render_status(st, 80)
             .lines()
             .find(|l| l.contains("模式"))
             .unwrap()
@@ -1003,7 +1214,7 @@ mod tests {
             !up.contains(":1081") && !up.contains(":8081"),
             "端口「代理」那一行已经写了，模式行不再重复：{up}"
         );
-        let proxy = render_status(&s)
+        let proxy = render_status(&s, 80)
             .lines()
             .find(|l| l.contains("代理"))
             .unwrap()
@@ -1026,18 +1237,18 @@ mod tests {
 
     #[test]
     fn auto_update_row_reflects_the_switch() {
-        assert!(render(&st()).contains("[9] 自动更新 开"));
+        assert!(render(&st(), 80, None).contains("[9] 自动更新 开"));
         let mut s = st();
         s.auto_update = false;
-        assert!(render(&s).contains("[9] 自动更新 关"));
+        assert!(render(&s, 80, None).contains("[9] 自动更新 关"));
     }
 
     #[test]
     fn update_marker_shows_only_when_available() {
-        assert!(!render(&st()).contains("★ 有新版"));
+        assert!(!render(&st(), 80, None).contains("★ 有新版"));
         let mut s = st();
         s.update_available = true;
-        assert!(render(&s).contains("★ 有新版"));
+        assert!(render(&s, 80, None).contains("★ 有新版"));
     }
 
     #[test]
@@ -1056,27 +1267,40 @@ mod tests {
             });
         }
         p.active = Some("alice-reality-direct".into());
-        let out = render_nodes(&p, true);
+        let out = render_nodes(&p, true, 80);
         assert!(out.contains("[1]   alice-hy2-direct"), "{out}");
         assert!(out.contains("[2] ★ alice-reality-direct"), "{out}");
         assert!(
             out.contains("HY2直连") && out.contains("Reality直连"),
             "显示 label 便于辨认"
         );
-        assert!(render_nodes(&Profiles::new_default(), true).contains("没有节点"));
+        assert!(render_nodes(&Profiles::new_default(), true, 80).contains("没有节点"));
     }
 
     #[test]
     fn render_splits_into_status_and_options() {
         let s = st();
-        let status = render_status(&s);
-        let options = render_options(&s);
+        let status = render_status(&s, 80);
+        let options = render_options(&s, 80);
         assert_eq!(
-            render(&s),
+            render(&s, 80, None),
             format!("{status}{options}"),
             "render = 两者相接"
         );
-        assert!(status.contains("alice-hy2-direct"), "状态块留标题条与三行");
+        assert_eq!(
+            render(&s, 80, Some("已切到 alice-reality-direct")),
+            format!("{status}{options}  上次：已切到 alice-reality-direct\n"),
+            "「上次：」行接在 [0] 退出 下面"
+        );
+        assert_eq!(
+            render(&s, 80, Some("")),
+            render(&s, 80, None),
+            "空摘要不出「上次：」行"
+        );
+        assert!(
+            status.contains("alice-hy2-direct"),
+            "状态块留标题条与节点行"
+        );
         assert!(status.contains(crate::VERSION));
         assert!(!status.contains("[1] "), "状态块不带菜单：{status}");
         assert!(!status.contains("[0] 退出"));
@@ -1095,97 +1319,126 @@ mod tests {
             imported_at: "2026-09-11T00:00:00Z".into(),
         });
         assert!(
-            render_nodes(&p, true).contains("[0] 返回"),
+            render_nodes(&p, true, 80).contains("[0] 返回"),
             "菜单里要能返回"
         );
         assert!(
-            !render_nodes(&p, false).contains("[0] 返回"),
+            !render_nodes(&p, false, 80).contains("[0] 返回"),
             "一次性 list 没有可返回的地方"
         );
         // 空列表的引导按场景给：菜单里指菜单项（统一写「[3] 导入节点」），命令行里指命令
         assert_eq!(
-            render_nodes(&Profiles::new_default(), true),
+            render_nodes(&Profiles::new_default(), true, 80),
             "  没有节点，先用 [3] 导入节点\n"
         );
-        let empty = render_nodes(&Profiles::new_default(), false);
+        let empty = render_nodes(&Profiles::new_default(), false, 80);
         assert!(empty.contains("bui-c import"), "{empty}");
         assert!(!empty.contains("[3]"), "{empty}");
     }
 
-    fn named(name: &str, node: bui_schema::nodes::Node) -> Profile {
-        Profile {
-            name: name.into(),
-            node,
-            split: split_global(),
-            source: Source::ApiNodes,
-            imported_at: "2026-09-11T00:00:00Z".into(),
+    /// 宽度守门表：之后的任务把自己新增的渲染也加进 `screens()`。
+    fn screens(width: usize) -> Vec<(&'static str, String)> {
+        let mut out = Vec::new();
+        let mut prof = baiyi_like();
+        for i in 0..prof.profiles.len() {
+            prof.active = Some(prof.profiles[i].name.clone());
+            let mut s = st();
+            s.node = prof.profiles[i].name.clone();
+            s.label = prof.profiles[i].node.label.clone();
+            out.push((
+                "render",
+                render(
+                    &s,
+                    width,
+                    Some("已删 1 个，切到 rick-node.example-a.net-reality-direct"),
+                ),
+            ));
+        }
+        out.push(("nodes", render_nodes(&prof, true, width)));
+        out.push(("picker", render_node_picker(&prof, width)));
+        out.push(("service", render_service_options()));
+        // 下面是另补的形态：状态区带上各节点真实的 kind 与服务器:端口（上面只换了名字与 label，
+        // 服务器:端口一直是 st() 的 23 列）、每个节点轮流当活动节点时的菜单列表与一次性 list、
+        // 没有节点、SOCKS 模式服务停了且端口是 5 位数。有新版时 [6] 右栏的「检查更新 ★ 有新版」
+        // 在 40–47 列放不下；主菜单重排把 ★ 挪到左栏之后，把 update_available 也加进来
+        for p in &prof.profiles {
+            let s = Status {
+                node: p.name.clone(),
+                label: p.node.label.clone(),
+                kind: kind_slug(p.node.kind).to_string(),
+                host_port: format!("{}:{}", p.node.host, p.node.port),
+                ..st()
+            };
+            out.push(("status", render_status(&s, width)));
+        }
+        for i in 0..prof.profiles.len() {
+            prof.active = Some(prof.profiles[i].name.clone());
+            out.push(("nodes", render_nodes(&prof, true, width)));
+            out.push(("list", render_nodes(&prof, false, width)));
+        }
+        let empty = Status {
+            node: String::new(),
+            label: String::new(),
+            kind: String::new(),
+            host_port: String::new(),
+            ..st()
+        };
+        out.push((
+            "empty",
+            render(&empty, width, Some("已删光节点，按 [3] 导入")),
+        ));
+        out.push((
+            "no-nodes",
+            render_node_picker(&Profiles::new_default(), width),
+        ));
+        out.push((
+            "no-nodes-list",
+            render_nodes(&Profiles::new_default(), false, width),
+        ));
+        let socks = Status {
+            mode: Mode::Socks,
+            service_running: false,
+            socks_port: 65535,
+            http_port: 65535,
+            ..st()
+        };
+        out.push(("socks", render(&socks, width, None)));
+        out
+    }
+
+    #[test]
+    fn every_line_fits_by_budget() {
+        for w in [40, 50, 60, 80, 100] {
+            for (name, text) in screens(w) {
+                for l in text.lines() {
+                    assert!(
+                        budget_width(l) <= line_limit(w),
+                        "{name} @{w}: {l:?} = {}",
+                        budget_width(l)
+                    );
+                    for c in l.chars() {
+                        let known = c.is_ascii()
+                            || display_width(&c.to_string()) == 2
+                            || AMBIGUOUS.contains(c)
+                            || NARROW.contains(c);
+                        assert!(known, "{name}: 未归类的字符 {c:?}");
+                    }
+                }
+            }
         }
     }
 
-    /// 真机（baiyi）形态的 9 个节点：名字 3–38 列、label 最长 26 列、host:port 最长 29 列。
-    /// 端点与凭据是合成的，只有各字段的长度照抄真机。
-    fn baiyi_like() -> Profiles {
-        use bui_schema::nodes::{Node, NodeKind};
-        let node = |kind: NodeKind, label: &str, host: &str, port: u16| Node {
-            kind,
-            label: label.into(),
-            host: host.into(),
-            port,
-            ..match kind {
-                NodeKind::RealityDirect | NodeKind::RealityResidential => reality_direct_node(),
-                NodeKind::Hy2Direct | NodeKind::Hy2Residential => hy2_direct_node(),
-            }
-        };
-        let bwg = "tizi.example.test";
-        let cl = "rick-node.example-a.net";
-        let mut p = Profiles::new_default();
-        for (name, n) in [
-            (
-                "HY2",
-                node(NodeKind::Hy2Residential, "示例专用名-HY2住宅", bwg, 40000),
-            ),
-            (
-                "hysteria2-1778329470",
-                node(NodeKind::Hy2Direct, "示例专用名", bwg, 10000),
-            ),
-            (
-                "reality-Reality",
-                node(
-                    NodeKind::RealityDirect,
-                    "示例名-reality-Reality直连",
-                    bwg,
-                    10001,
-                ),
-            ),
-            (
-                "rick-node.example-a.net-reality-direct",
-                node(NodeKind::RealityDirect, "Reality直连", cl, 10001),
-            ),
-            (
-                "rick-node.example-a.net-reality-resi",
-                node(NodeKind::RealityResidential, "Reality住宅", cl, 10002),
-            ),
-            (
-                "rick-node.example-a.net-hy2-direct",
-                node(NodeKind::Hy2Direct, "HY2直连", cl, 10000),
-            ),
-            (
-                "rick-node.example-a.net-hy2-resi",
-                node(NodeKind::Hy2Residential, "HY2住宅", cl, 40001),
-            ),
-            (
-                "tizi.example.test-reality-resi",
-                node(NodeKind::RealityResidential, "Reality住宅", bwg, 10002),
-            ),
-            (
-                "tizi.example.test-hy2-resi",
-                node(NodeKind::Hy2Residential, "HY2住宅", bwg, 40002),
-            ),
-        ] {
-            p.profiles.push(named(name, n));
-        }
-        p.active = Some("hysteria2-1778329470".into());
-        p
+    #[test]
+    fn a_long_active_name_splits_at_60_and_is_middle_truncated_at_40() {
+        let mut s = st();
+        s.node = "rick-node.example-a.net-reality-direct".into();
+        s.label = "Reality直连".into();
+        let at60 = render_status(&s, 60);
+        assert!(at60
+            .lines()
+            .any(|l| l.contains("rick-node.example-a.net-reality-direct")));
+        let at40 = render_status(&s, 40);
+        assert!(at40.contains('…') && at40.contains("direct"), "{at40}");
     }
 
     #[test]
@@ -1212,7 +1465,7 @@ mod tests {
         );
 
         for with_back in [true, false] {
-            let out = render_nodes(&p, with_back);
+            let out = render_nodes(&p, with_back, 80);
             for l in out.lines() {
                 assert!(
                     display_width(l) <= 80,
@@ -1225,7 +1478,8 @@ mod tests {
 
     #[test]
     fn node_list_is_two_lines_per_node_indented_to_the_name() {
-        let out = render_nodes(&baiyi_like(), true);
+        // 80 列：与改版前逐字节相同（spec §2.1）
+        let out = render_nodes(&baiyi_like(), true, 80);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 9 * 2 + 1, "每个节点两行 + [0] 返回：\n{out}");
         assert_eq!(
@@ -1243,7 +1497,7 @@ mod tests {
         );
         assert_eq!(lines[18], "     [0] 返回", "与编号行同为 5 列缩进");
         // 编号行与主菜单选项同为 5 列缩进
-        let menu_indent = render_options(&st())
+        let menu_indent = render_options(&st(), 80)
             .lines()
             .find(|l| l.contains("[1]"))
             .map(|l| l.len() - l.trim_start().len())
@@ -1258,7 +1512,7 @@ mod tests {
     fn two_digit_numbers_keep_names_in_one_column() {
         let mut p = baiyi_like();
         p.profiles.push(named("n10", hy2_direct_node()));
-        let out = render_nodes(&p, true);
+        let out = render_nodes(&p, true, 80);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "     [1]    HY2", "{out}");
         assert_eq!(lines[18], "     [10]   n10", "{out}");
@@ -1271,7 +1525,7 @@ mod tests {
     #[test]
     fn one_shot_node_list_has_no_numbers() {
         // `bui-c switch` 只认名字：一次性 list 不打 [n]
-        let out = render_nodes(&baiyi_like(), false);
+        let out = render_nodes(&baiyi_like(), false, 80);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 9 * 2, "{out}");
         assert_eq!(
@@ -1280,6 +1534,165 @@ mod tests {
             "\n{out}"
         );
         assert!(!out.contains('['), "不打编号：{out}");
+    }
+
+    #[test]
+    fn title_bar_and_rules_stay_within_the_budget() {
+        let t = title_bar("B-UI 客户端 v4.0.0");
+        assert_eq!(t, "  ── B-UI 客户端 v4.0.0 ──");
+        assert_eq!(
+            (display_width(&t), budget_width(&t)),
+            (26, 30),
+            "spec §2.2：26 列，歧义字符画成 2 列时 30 列"
+        );
+        // spec §2.2：缩进 5 的菜单分隔线 60 列 27 个、40 列 17 个；缩进 2 的报告分隔线 28 / 18 个
+        for (w, indent, n) in [
+            (60, 5, 27),
+            (40, 5, 17),
+            (60, 2, 28),
+            (40, 2, 18),
+            (30, 5, 17),
+        ] {
+            assert_eq!(
+                rule(w, indent, 99),
+                RULE.to_string().repeat(n),
+                "{w} 列，缩进 {indent}"
+            );
+        }
+        assert_eq!(
+            rule(80, 5, 34),
+            RULE.to_string().repeat(34),
+            "放得下就取原长"
+        );
+        assert_eq!(rule(40, 60, 10), "", "缩进比上限还宽也不下溢");
+    }
+
+    #[test]
+    fn status_area_follows_the_width() {
+        let v = crate::VERSION;
+        let long = Status {
+            node: "rick-node.example-a.net-reality-direct".into(),
+            label: "Reality直连".into(),
+            kind: "reality-direct".into(),
+            host_port: "rick-node.example-a.net:10001".into(),
+            ..st()
+        };
+        // 80 列：名字跟在状态后面，详情行带 kind（spec §3a-80）
+        assert_eq!(
+            render_status(&long, 80),
+            format!(
+                "\n  ── B-UI 客户端 v{v} ──\n\n   节点   ●  运行中  rick-node.example-a.net-reality-direct\n          Reality直连  reality-direct  rick-node.example-a.net:10001\n   代理      SOCKS5 :1080   HTTP :8080\n   模式   TUN   ●  运行中\n\n"
+            )
+        );
+        // 60 列：连状态带名字按容量口径是 60 列（● 算 2），名字另起一行；详情去掉 kind
+        assert_eq!(
+            render_status(&long, 60),
+            format!(
+                "\n  ── B-UI 客户端 v{v} ──\n\n   节点   ●  运行中\n          rick-node.example-a.net-reality-direct\n          Reality直连  rick-node.example-a.net:10001\n   代理      SOCKS5 :1080   HTTP :8080\n   模式   TUN   ●  运行中\n\n"
+            )
+        );
+        // 40 列窄版式：状态词、中间截断的名字、label、服务器各占一行，前缀收紧（spec §3a-40）
+        assert_eq!(
+            render_status(&long, 40),
+            format!(
+                "\n  ── B-UI 客户端 v{v} ──\n\n   节点 ● 运行中\n        rick-node.e…net-reality-direct\n        Reality直连\n        rick-node.example-a.net:10001\n   代理 SOCKS5 :1080  HTTP :8080\n   模式 TUN ● 运行中\n\n"
+            )
+        );
+        // 短名字在窄版式里也单独一行
+        let at40 = render_status(&st(), 40);
+        assert!(
+            at40.contains(
+                "   节点 ● 运行中\n        alice-hy2-direct\n        HY2直连\n        panel.example.com:10000\n"
+            ),
+            "{at40}"
+        );
+    }
+
+    #[test]
+    fn node_list_drops_kind_for_the_whole_table_and_keeps_labels_when_narrow() {
+        let p = baiyi_like();
+        let details = |w: usize| -> Vec<String> {
+            render_nodes(&p, true, w)
+                .lines()
+                .skip(1)
+                .step_by(2)
+                .take(9)
+                .map(str::to_string)
+                .collect()
+        };
+        let kinds = ["hy2-direct", "hy2-resi", "reality-direct", "reality-resi"];
+        // 80 列：每行都放得下完整三段，都显示 kind
+        for l in details(80) {
+            assert!(kinds.iter().any(|k| l.contains(k)), "{l}");
+        }
+        // 60 列：[3] 那一行放不下完整三段，整张表都不显示 kind；只有它的 label 被尾截
+        let at60 = details(60);
+        for l in &at60 {
+            assert!(!kinds.iter().any(|k| l.contains(k)), "{l}");
+        }
+        assert_eq!(
+            at60[2],
+            "           示例名-reality-Realit…  tizi.example.test:10001"
+        );
+        assert_eq!(
+            at60[3],
+            "           Reality直连  rick-node.example-a.net:10001"
+        );
+        // 50 列：名字里带着服务器的保住 label；别的保住服务器:端口、label 尾截
+        let at50 = details(50);
+        assert_eq!(at50[0], "           示例专用名-…  tizi.example.test:40000");
+        assert_eq!(at50[3], "           Reality直连");
+        assert_eq!(at50[5], "           HY2直连  rick-node.example-a.net:10000");
+        // 40 列窄版式：缩进 2 / 8，第二行只剩 label；长名字中间截断，尾部的 kind 还分得清（spec §3b-40）
+        let out = render_nodes(&p, true, 40);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            lines[..4].join("\n"),
+            "  [1]   HY2\n        示例专用名-HY2住宅\n  [2] ★ hysteria2-1778329470\n        示例专用名"
+        );
+        assert_eq!(lines[6], "  [4]   rick-node.e…net-reality-direct");
+        assert_eq!(lines[7], "        Reality直连");
+        assert_eq!(lines[8], "  [5]   rick-node.e…a.net-reality-resi");
+        assert_eq!(lines[18], "  [0] 返回");
+    }
+
+    #[test]
+    fn external_text_is_sanitized_before_it_reaches_the_screen() {
+        let bad = |c: char| matches!(c, '\u{1b}' | '\u{7}' | '\u{202e}' | '\u{200b}');
+        let s = Status {
+            node: "evil\u{1b}[2Jname".into(),
+            label: "lab\u{202e}el".into(),
+            host_port: "h\u{7}ost:1".into(),
+            ..st()
+        };
+        let mut p = baiyi_like();
+        p.profiles[0].name = "x\u{1b}]0;t\u{7}y".into();
+        p.profiles[0].node.label = "\u{200b}标签".into();
+        for w in [40, 80] {
+            let screen = render(&s, w, Some("上次\u{1b}[31m"));
+            assert!(!screen.chars().any(bad), "{screen:?}");
+            assert!(screen.contains("evil?[2Jname"), "{screen}");
+            let list = render_nodes(&p, true, w);
+            assert!(!list.chars().any(bad), "{list:?}");
+            assert!(
+                list.contains("x?]0;t?y") && list.contains("?标签"),
+                "{list}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_last_line_is_tail_truncated_to_the_line_limit() {
+        let last = "已删 1 个，切到 rick-node.example-a.net-reality-direct";
+        let at80 = render(&st(), 80, Some(last));
+        assert_eq!(
+            at80.lines().last(),
+            Some(format!("  上次：{last}").as_str())
+        );
+        let at40 = render(&st(), 40, Some(last));
+        let l = at40.lines().last().unwrap();
+        assert_eq!(l, "  上次：已删 1 个，切到 rick-node.exa…");
+        assert!(budget_width(l) <= line_limit(40));
     }
 
     #[test]
