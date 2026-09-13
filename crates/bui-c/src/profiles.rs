@@ -89,13 +89,24 @@ pub fn sanitize(raw: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
-/// `<用户名>-<kind slug>`；用户名 sanitize 后为空就只剩 kind slug。
+/// `<用户名>-<kind slug>`；用户名 sanitize 后为空则回落成 `<主机名>-<kind slug>`。
+///
+/// 回落是必须的，不能只剩 kind slug：这套部署的面板用户名全是中文
+/// （`示例用户甲`、`示例专用名-小组` …），[`sanitize`] 只留 ASCII，它们一律为空，
+/// 于是所有服务器的同类节点都会叫 `hy2-direct`。而 profile 名是
+/// [`Profiles::upsert`] 的主键，同名即「同一个节点位」——不同服务器的节点会互相覆盖。
+/// 主机名把它们分开：同一主机的同一 kind 本来就是同一个节点位。
+/// 主机名 sanitize 后也为空（理论上不会，主机名本就是 ASCII）才退到光秃秃的 kind slug。
 pub fn profile_name(user: &str, node: &Node) -> String {
-    let u = sanitize(user);
-    if u.is_empty() {
-        kind_slug(node.kind).to_string()
+    let kind = kind_slug(node.kind);
+    let prefix = match sanitize(user) {
+        u if !u.is_empty() => u,
+        _ => sanitize(&node.host),
+    };
+    if prefix.is_empty() {
+        kind.to_string()
     } else {
-        format!("{u}-{}", kind_slug(node.kind))
+        format!("{prefix}-{kind}")
     }
 }
 
@@ -340,14 +351,38 @@ mod tests {
             "alice-hy2-direct"
         );
         assert_eq!(profile_name("alice", &hy2_resi_node()), "alice-hy2-resi");
+        // 用户名 sanitize 后为空（这套部署的面板用户名全是中文）→ 回落到主机名，
+        // 而不是只剩 kind slug：否则不同服务器的同类节点都叫 `hy2-direct`，
+        // 而 profile 名是 upsert 的主键，它们会互相覆盖。
         assert_eq!(
             profile_name("", &crate::testutil::reality_direct_node()),
-            "reality-direct"
+            "panel.example.com-reality-direct"
         );
-        // 纯中文备注 sanitize 后为空 → 回落到 kind slug，不再像 v3 那样产生时间戳名
-        assert_eq!(profile_name("香港节点", &hy2_direct_node()), "hy2-direct");
+        assert_eq!(
+            profile_name("香港节点", &hy2_direct_node()),
+            "panel.example.com-hy2-direct"
+        );
         assert_eq!(sanitize(" My Node!! v2 "), "My-Node-v2");
         assert_eq!(sanitize("---"), "");
+    }
+
+    #[test]
+    fn chinese_usernames_on_different_hosts_do_not_collide() {
+        let a = Node {
+            host: "a.example.com".into(),
+            ..hy2_direct_node()
+        };
+        let b = Node {
+            host: "b.example.com".into(),
+            ..hy2_direct_node()
+        };
+        assert_eq!(profile_name("示例用户甲", &a), "a.example.com-hy2-direct");
+        assert_eq!(profile_name("示例用户甲", &b), "b.example.com-hy2-direct");
+        assert_ne!(
+            profile_name("示例用户甲", &a),
+            profile_name("示例用户甲", &b),
+            "同 kind 不同主机必须是两个 profile，否则 store_fetched 会互相覆盖"
+        );
     }
 
     #[test]

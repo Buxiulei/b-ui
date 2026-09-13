@@ -4,12 +4,15 @@
 //! 这类非交互路径不自动导入——那等于让 timer 悄悄改用户配置（决策 10）。
 //!
 //! 不删 `<base>` 目录：v3 的 `uri.txt` 是回滚素材，清理交给 `uninstall --purge-v3`。
+//!
+//! profile 名沿用 v3 的目录名（`hysteria2-1785892136`、`HY2`、`reality-Reality` …）：
+//! v3 用户在 v3 里就是拿目录名切节点的，原地升级后名字不变，认得出哪个是哪个。
 
 use crate::engine::Engine;
 use crate::net::Net;
 use crate::paths::{Paths, TUN_IFACE};
 use crate::profiles::{
-    default_split, profile_name, rfc3339, Mode, Panel, Profile, Profiles, Source,
+    default_split, profile_name, rfc3339, sanitize, Mode, Panel, Profile, Profiles, Source,
 };
 use crate::sys::{systemd, Sys};
 use crate::{update, Error, Result};
@@ -76,6 +79,9 @@ fn user_from_label(label: &str) -> String {
 /// 把 `<base>/configs/*` 里能解析的节点收进 `prof`，端口与面板取 v3 的记录。
 ///
 /// 单个目录坏掉只记进 `skipped`，不打断整次导入；一个都没成功才报错。
+///
+/// profile 名取 v3 的目录名（见模块文档），目录名 sanitize 后为空时才回落到
+/// [`profile_name`]。[`user_from_label`] 仍用来推导 [`Panel::username`]。
 pub fn import<S: Sys>(sys: &S, base: &Path, prof: &mut Profiles) -> Result<Report> {
     let mut r = Report::default();
     let v3_active = read_str(sys, &base.join("active")).unwrap_or_default();
@@ -105,8 +111,14 @@ pub fn import<S: Sys>(sys: &S, base: &Path, prof: &mut Profiles) -> Result<Repor
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or(serde_json::Value::Null);
         let user = user_from_label(&node.label);
-        // free_name 对不冲突的名字原样返回，同 kind 的第二个节点自动变 `…-2`
-        let name = prof.free_name(&profile_name(&user, &node));
+        // profile 名沿用 v3 的目录名：用户在 v3 里就是拿它 `switch` 的，原地升级后
+        // 名字不变，一眼认得出哪个是哪个。目录名 sanitize 后为空（全非 ASCII）才回落
+        // 到 profile_name。free_name 对不冲突的名字原样返回。
+        let name_base = match sanitize(&dir_name) {
+            d if !d.is_empty() => d,
+            _ => profile_name(&user, &node),
+        };
+        let name = prof.free_name(&name_base);
 
         if dir_name == v3_active {
             r.active = Some(name.clone());
@@ -361,17 +373,18 @@ mod tests {
         assert_eq!(
             r.imported,
             vec![
-                "alice-hy2-direct".to_string(),
-                "alice-reality-direct".to_string()
-            ]
+                "hysteria2-1757000000".to_string(),
+                "vless-1757000001".to_string()
+            ],
+            "profile 名沿用 v3 目录名：用户在 v3 里就是拿它 switch 的"
         );
         assert!(r.skipped.is_empty());
         assert_eq!(
             r.active.as_deref(),
-            Some("alice-reality-direct"),
+            Some("vless-1757000001"),
             "v3 的 active 目录映射到新 profile 名"
         );
-        assert_eq!(prof.active.as_deref(), Some("alice-reality-direct"));
+        assert_eq!(prof.active.as_deref(), Some("vless-1757000001"));
         assert_eq!(prof.profiles.len(), 2);
         assert!(prof.profiles.iter().all(|p| p.source == Source::V3));
         // 端口取「active 那个节点」的 meta（v4 的端口是全局设置，不再按节点存）
@@ -516,7 +529,7 @@ mod tests {
         assert!(s.called("systemctl daemon-reload"));
         let saved = Profiles::load(&s, &paths()).unwrap();
         assert_eq!(saved.profiles.len(), 2);
-        assert_eq!(saved.active.as_deref(), Some("alice-reality-direct"));
+        assert_eq!(saved.active.as_deref(), Some("vless-1757000001"));
         assert_eq!(s.mode("/opt/bui-c/profiles.json"), Some(0o600));
     }
 
@@ -678,12 +691,33 @@ mod tests {
 
         let mut prof = Profiles::new_default();
         let r = import(&s, Path::new(V3_BASE), &mut prof).unwrap();
-        assert_eq!(r.imported.len(), 5, "五个目录一个都不能丢：{r:?}");
         assert!(r.skipped.is_empty(), "不该有跳过的目录：{:?}", r.skipped);
-        let mut names = r.imported.clone();
-        names.sort();
-        names.dedup();
-        assert_eq!(names.len(), 5, "同 kind 的重名要自动让位：{:?}", r.imported);
+        // 名字精确等于 v3 目录名（read_dir 已排序），不再是 `hy2-direct` / `-2` / `-3`：
+        // 五个节点的用户名都是中文，旧规则 sanitize 后全塌成同一个 kind slug。
+        assert_eq!(
+            r.imported,
+            vec![
+                "HY2".to_string(),
+                "hysteria2-1757000001".to_string(),
+                "hysteria2-1757000002".to_string(),
+                "hysteria2-1757000003".to_string(),
+                "reality-Reality".to_string(),
+            ]
+        );
         assert_eq!(prof.profiles.len(), 5);
+        assert_eq!(prof.active.as_deref(), Some("HY2"));
+    }
+
+    /// 目录名全是非 ASCII（sanitize 后为空）时才回落到 [`profile_name`]。
+    #[test]
+    fn dir_names_that_sanitize_to_nothing_fall_back_to_profile_name() {
+        let s = FakeSys::new();
+        s.put(
+            "/opt/hysteria-client/configs/中文目录/uri.txt",
+            "hysteria2://alice:hy2-pw@h9.example.com:10000/?sni=h9.example.com&mport=20000-30000#alice-HY2%E7%9B%B4%E8%BF%9E",
+        );
+        let mut prof = Profiles::new_default();
+        let r = import(&s, Path::new(V3_BASE), &mut prof).unwrap();
+        assert_eq!(r.imported, vec!["alice-hy2-direct".to_string()]);
     }
 }

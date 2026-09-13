@@ -1164,7 +1164,7 @@ mod tests {
         dispatch(&parse(&["import-v3"]), &mut ctx).unwrap();
         let saved = Profiles::load(&s, &pp).unwrap();
         assert_eq!(saved.profiles.len(), 1);
-        assert_eq!(saved.active.as_deref(), Some("alice-hy2-direct"));
+        assert_eq!(saved.active.as_deref(), Some("hysteria2-1"));
         assert!(s.called("systemctl stop hysteria-client.service"));
         assert!(s.exists(std::path::Path::new("/opt/bui-c/config.json")));
         assert!(ctx.out.contains("导入 1 个节点"));
@@ -1319,7 +1319,7 @@ mod tests {
         menu_loop(&mut ctx).unwrap();
         let saved = Profiles::load(&s, &pp).unwrap();
         assert_eq!(saved.profiles.len(), 1);
-        assert_eq!(saved.active.as_deref(), Some("alice-hy2-direct"));
+        assert_eq!(saved.active.as_deref(), Some("hysteria2-1"));
         assert!(s.called("systemctl stop hysteria-client.service"));
 
         // 答 n：不导入，只提示一次，菜单照常进（ctx.out 会被 flush 清空，断言看 transcript）
