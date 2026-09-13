@@ -170,7 +170,7 @@ tonic 客户端，proto 从 Xray-core `v26.3.27` vendor 进仓（以仓库根为
 }
 ```
 
-- v3 `protocol` 映射：`fusion` → 两协议 + direct + residential(default)；`hysteria2` → `["hysteria2"]` + direct + residential(default)；`vless-reality` → `["reality"]` + 同上。
+- v3 `protocol` 映射（与 v3 订阅逐项等价，2026-09-13 裁决）：`fusion` → 两协议 + `direct=true` + residential(default)（缺 `protocol` 的早期记录按 v3 的 `user.protocol || "fusion"` 同样 `direct=true`）；单协议 `hysteria2` → `["hysteria2"]`、`vless-reality` → `["reality"]`，直连与住宅**二选一**：住宅开通（v3 `residential !== false`）⇒ residential(default) + `direct=false`（只发住宅版），否则 `direct=true` 且无住宅权益（只发直连版）。v3 `residential: false` 的 fusion 用户同样无住宅权益。面板新建用户同一口径（`bui_schema::v3::direct_entitlement`）。
 - **节点集合 = f(权益)**：`bui-schema::nodes_for(user, node)` 返回该用户可用的节点列表（最多 4 个：HY2 直连 / Reality 直连 / HY2 住宅 / Reality 住宅），三种订阅、`/api/nodes`、面板显示都只调用它。
 - 订单记录：`{ "order_id", "sku", "amount_minor", "status": "pending|paid|fulfilled|cancelled", "external_ref", "created_at" }`，追加式；`catalog[]`：`{ "sku", "title", "kind": "residential_ip|plan", "region", "price_minor", "period_days" }`。v4 只定义结构与读写，不做支付与履约。
 
@@ -198,7 +198,7 @@ tonic 客户端，proto 从 Xray-core `v26.3.27` vendor 进仓（以仓库根为
 
 ### 4.4 订阅
 
-三种订阅与 v3 逐项等价（节点集、端口、UUID、密码、标签、`mport=`、obfs 参数、住宅分流规则），由 `bui-schema` 从同一节点列表渲染；唯一有意的差异：v3 对「单协议 + 住宅」用户只发住宅版节点，v4 按权益（`direct=true`）多发一个直连版——等价口径是「v3 有的节点逐项相等」（P0 golden 测试的 `v3_nodes_only` 过滤）；sing-box JSON 保持 1.12–1.14 兼容子集（typed DNS、TUN `address` 数组、rule action、无 `rule_set`）；Clash/mihomo YAML 另有一处有意新增（2026-09-12 裁决）：`ipv6: true` + `dns.ipv6: false` + `tun` 接管参数（`stack: mixed`、`auto-route`/`strict-route`/`auto-detect-interface`、`inet6-address`、`dns-hijack`，不下发 `enable`）+ 三条 `IP-CIDR6` 规则（ULA/link-local 直连、其余 `::/0` REJECT），与 sing-box 侧的 IPv6 接管同构。CI 用 v3 抓取的脱敏样本做 golden 比对（§8）。
+三种订阅与 v3 逐项等价（节点集、端口、UUID、密码、标签、`mport=`、obfs 参数、住宅分流规则），由 `bui-schema` 从同一节点列表渲染；单协议 + 住宅用户与 v3 一样只发住宅版节点（§4.1 映射的 `direct=false`；2026-09-13 裁决撤销了此前「v4 多发一个直连版」的例外，golden 比对不再过滤）；sing-box JSON 保持 1.12–1.14 兼容子集（typed DNS、TUN `address` 数组、rule action、无 `rule_set`）；Clash/mihomo YAML 另有一处有意新增（2026-09-12 裁决）：`ipv6: true` + `dns.ipv6: false` + `tun` 接管参数（`stack: mixed`、`auto-route`/`strict-route`/`auto-detect-interface`、`inet6-address`、`dns-hijack`，不下发 `enable`）+ 三条 `IP-CIDR6` 规则（ULA/link-local 直连、其余 `::/0` REJECT），与 sing-box 侧的 IPv6 接管同构。CI 用 v3 抓取的脱敏样本做 golden 比对（§8）。
 
 ---
 

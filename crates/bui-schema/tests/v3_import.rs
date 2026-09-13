@@ -1,6 +1,6 @@
 //! v3 状态导入的验收测试（fixture 为合成的 v3 安装目录）。
 use bui_schema::model::*;
-use bui_schema::nodes::nodes_for;
+use bui_schema::nodes::{nodes_for, NodeKind};
 use bui_schema::render::subscription;
 use std::path::Path;
 
@@ -247,6 +247,87 @@ fn reality_user_without_uuid_gets_generated_uuid_and_refresh_warning() {
         ivan.credentials.vless_uuid.to_string(),
         "99999999-9999-4999-8999-999999999999"
     );
+}
+
+fn entitlements<'a>(s: &'a State, username: &str) -> &'a Entitlements {
+    &s.users
+        .iter()
+        .find(|u| u.username == username)
+        .unwrap()
+        .entitlements
+}
+
+fn node_kinds(s: &State, username: &str) -> Vec<NodeKind> {
+    let user = s.users.iter().find(|u| u.username == username).unwrap();
+    nodes_for(user, &s.node, &s.residential)
+        .into_iter()
+        .map(|n| n.kind)
+        .collect()
+}
+
+/// v3 对单协议用户是二选一（删除提交 fc3e757 的父提交里 `web/server.js` 的 `/api/sub`
+/// :1893-1904 与 Clash 生成器 :915-930）：开住宅（`residential !== false`，缺省即开）只发住宅版，
+/// 不开只发直连版。导入按 v3 的原始 protocol 算 `direct`，订阅与 v3 逐项等价——2026-09-13
+/// bwg-tizi 切换验收发现一个单协议 hysteria2 用户 v3 订阅 1 个节点、v4 多出一个直连版。
+#[test]
+fn single_protocol_users_get_either_the_residential_or_the_direct_node() {
+    let tmp = fixture_with_users(
+        r#"[
+ {"username":"bob","password":"pw-bob-02","uuid":"22222222-2222-4222-8222-222222222222","protocol":"hysteria2","residential":true,"limits":{}},
+ {"username":"carol","password":"pw-carol-03","uuid":"33333333-3333-4333-8333-333333333333","protocol":"vless-reality","limits":{}},
+ {"username":"erin","password":"pw-erin-05","uuid":"55555555-5555-4555-8555-555555555555","protocol":"hysteria2","residential":false,"limits":{}}
+]"#,
+    );
+    let s = bui_schema::v3::import(tmp.path()).unwrap().state;
+
+    // 单协议 + 住宅：只有住宅版
+    assert!(!entitlements(&s, "bob").direct);
+    assert_eq!(node_kinds(&s, "bob"), vec![NodeKind::Hy2Residential]);
+    assert!(
+        !entitlements(&s, "carol").direct,
+        "residential 缺省即开通（v3 的 `!== false`）"
+    );
+    assert_eq!(node_kinds(&s, "carol"), vec![NodeKind::RealityResidential]);
+    // 单协议 + 不开住宅：只有直连版
+    assert!(entitlements(&s, "erin").direct);
+    assert!(entitlements(&s, "erin").residential.is_none());
+    assert_eq!(node_kinds(&s, "erin"), vec![NodeKind::Hy2Direct]);
+}
+
+/// fusion 以及缺 protocol 的早期记录（v3 订阅按 `user.protocol || "fusion"` 渲染）不是单协议：
+/// 直连版照给，住宅开通时再加住宅版。缺 protocol 又缺 uuid 的记录权益只剩 `[Hysteria2]`，
+/// 但它在 v3 里是 fusion 的 HY2 那一半，直连同样不能丢——所以 `direct` 按原始 protocol 算，
+/// 不按导入后的协议个数算。
+#[test]
+fn fusion_and_protocol_less_users_keep_the_direct_nodes() {
+    let tmp = fixture_with_users(
+        r#"[
+ {"username":"alice","password":"pw-alice-01","uuid":"11111111-1111-4111-8111-111111111111","protocol":"fusion","residential":true,"limits":{}},
+ {"username":"frank","password":"pw-frank-06","limits":{}},
+ {"username":"ivan","password":"pw-ivan-09","uuid":"99999999-9999-4999-8999-999999999999","limits":{}}
+]"#,
+    );
+    let s = bui_schema::v3::import(tmp.path()).unwrap().state;
+    let all_four = vec![
+        NodeKind::RealityDirect,
+        NodeKind::RealityResidential,
+        NodeKind::Hy2Direct,
+        NodeKind::Hy2Residential,
+    ];
+
+    assert!(entitlements(&s, "alice").direct);
+    assert_eq!(node_kinds(&s, "alice"), all_four);
+    assert_eq!(
+        entitlements(&s, "frank").protocols,
+        vec![Protocol::Hysteria2]
+    );
+    assert!(entitlements(&s, "frank").direct);
+    assert_eq!(
+        node_kinds(&s, "frank"),
+        vec![NodeKind::Hy2Direct, NodeKind::Hy2Residential]
+    );
+    assert!(entitlements(&s, "ivan").direct);
+    assert_eq!(node_kinds(&s, "ivan"), all_four);
 }
 
 /// 真正无法导入的记录（缺 password）仍然报错。
