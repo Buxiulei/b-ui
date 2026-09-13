@@ -320,6 +320,8 @@ fn apply_with_ufw<S: Sys, N: Net, P: Prompt>(
 struct Stored {
     added: usize,
     names: Vec<String>,
+    /// upsert 结果为 [`Upsert::Replaced`] 的 profile 名：原地更新了活动节点就得 apply
+    replaced: Vec<String>,
 }
 
 /// profile 名是 upsert 的主键，名字按连接身份定：
@@ -341,6 +343,7 @@ fn store_fetched<S: Sys, N: Net, P: Prompt>(
     let mut out = Stored {
         added: 0,
         names: Vec::with_capacity(f.nodes.len()),
+        replaced: Vec::new(),
     };
     for node in &f.nodes {
         let name = match prof.find_same_endpoint(node) {
@@ -368,7 +371,10 @@ fn store_fetched<S: Sys, N: Net, P: Prompt>(
         });
         match r {
             Upsert::Added => out.added += 1,
-            Upsert::Replaced => ctx.say(format!("更新节点 {name}")),
+            Upsert::Replaced => {
+                ctx.say(format!("更新节点 {name}"));
+                out.replaced.push(name.clone());
+            }
             Upsert::Unchanged => ctx.say(format!("节点 {name} 无变化")),
         }
         out.names.push(name);
@@ -434,7 +440,7 @@ fn fetch_sub<N: Net>(net: &N, url: &str) -> Result<Incoming> {
     })
 }
 
-/// 落盘一批节点；首次导入或 `activate` 时激活第一个并 apply。
+/// 落盘一批节点；首次导入或 `activate` 时激活第一个并 apply，原地更新了活动节点也 apply。
 fn save_import<S: Sys, N: Net, P: Prompt>(
     ctx: &mut Ctx<'_, S, N, P>,
     inc: Incoming,
@@ -464,6 +470,14 @@ fn save_import<S: Sys, N: Net, P: Prompt>(
             "当前节点：{}",
             prof.active.clone().unwrap_or_default()
         ));
+    } else if prof
+        .active
+        .as_ref()
+        .is_some_and(|a| stored.replaced.contains(a))
+    {
+        // 活动节点被原地更新（凭据轮换、端口变了）：不 apply 的话还跑着旧配置。
+        // 只改了 label 时渲出的配置字节不变，engine 不会重启
+        apply_with_ufw(ctx, &prof)?;
     }
     Ok(())
 }
@@ -524,6 +538,8 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
                 )));
             }
             if prof.active.as_deref() == Some(name.as_str()) {
+                // 兜底 apply 一次：配置丢了、单元没建时这是唯一不绕路的补救；配置没变就不重启
+                apply_with_ufw(ctx, &prof)?;
                 ctx.say(format!("已是当前节点：{name}"));
                 return Ok(());
             }
@@ -1694,6 +1710,105 @@ mod tests {
         assert_eq!(hy2_credentials(&saved.profiles[0]), ("u1", "pw-rotated"));
         assert!(t.contains("更新节点 panel.example.com-hy2-direct"), "{t}");
         assert!(!t.contains("占用"), "同一账号不算占用：{t}");
+    }
+
+    /// 原地更新了活动节点（面板轮换了密码）：新凭据要立刻生效，不能等下次切换。
+    /// 只改了 label 的也走一遍 apply，但配置字节没变，不重启。
+    #[test]
+    fn updating_the_active_node_in_place_applies_it() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        import_from_panel(&s, &pp, "alice", vec![hy2_account("alice", "pw1")]);
+        assert!(s
+            .get("/opt/bui-c/config.json")
+            .is_some_and(|c| c.contains("pw1")));
+
+        let before = s.calls().len();
+        let t = import_from_panel(&s, &pp, "alice", vec![hy2_account("alice", "pw2")]);
+        let calls: Vec<String> = s.calls().into_iter().skip(before).collect();
+        assert!(t.contains("更新节点 alice-hy2-direct"), "{t}");
+        assert!(
+            s.get("/opt/bui-c/config.json")
+                .is_some_and(|c| c.contains("pw2") && !c.contains("pw1")),
+            "活动节点换了密码要重渲配置：\n{t}"
+        );
+        assert!(
+            calls.iter().any(|c| c == "systemctl restart bui-c.service"),
+            "配置变了要重启：{calls:?}\n{t}"
+        );
+
+        // 只改 label：apply 一遍，配置不变 → 不重启
+        let relabelled = bui_schema::nodes::Node {
+            label: "改过的备注".into(),
+            ..hy2_account("alice", "pw2")
+        };
+        let before = s.calls().len();
+        let t = import_from_panel(&s, &pp, "alice", vec![relabelled.clone()]);
+        let calls: Vec<String> = s.calls().into_iter().skip(before).collect();
+        assert!(t.contains("更新节点 alice-hy2-direct"), "{t}");
+        assert!(
+            calls.iter().any(|c| c.contains("sing-box check")),
+            "要走 apply：{calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c == "systemctl restart bui-c.service"),
+            "只改 label 配置字节不变，不重启：{calls:?}"
+        );
+
+        // 更新的不是活动节点：不碰服务
+        let before = s.calls().len();
+        import_from_panel(
+            &s,
+            &pp,
+            "alice",
+            vec![relabelled.clone(), reality_direct_node()],
+        );
+        import_from_panel(
+            &s,
+            &pp,
+            "alice",
+            vec![
+                relabelled,
+                bui_schema::nodes::Node {
+                    label: "另一个备注".into(),
+                    ..reality_direct_node()
+                },
+            ],
+        );
+        let calls: Vec<String> = s.calls().into_iter().skip(before).collect();
+        assert!(
+            !calls.iter().any(|c| c.contains("sing-box check")),
+            "非活动节点的更新不 apply：{calls:?}"
+        );
+    }
+
+    /// `bui-c switch <当前节点>`：以前只说「已是当前节点」就返回，配置丢了、单元没建的机器
+    /// 永远拉不回来。现在兜底 apply 一次（配置没变就不重启）。
+    #[test]
+    fn switching_to_the_current_node_still_applies_it() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        profiles_socks().save(&s, &pp).unwrap(); // 活动节点在，但 config.json 与单元都没有
+        let n = FakeNet::new();
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["switch", "alice-hy2-direct"]), &mut ctx).unwrap();
+        assert!(s.exists(std::path::Path::new("/opt/bui-c/config.json")));
+        assert!(s.exists(std::path::Path::new("/etc/systemd/system/bui-c.service")));
+        assert_eq!(ctx.out, "已是当前节点：alice-hy2-direct\n");
+
+        // 再切一次：配置没变，不重启
+        let before = s.calls().len();
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["switch", "alice-hy2-direct"]), &mut ctx).unwrap();
+        let calls: Vec<String> = s.calls().into_iter().skip(before).collect();
+        assert!(
+            !calls.iter().any(|c| c == "systemctl restart bui-c.service"),
+            "{calls:?}"
+        );
+        assert_eq!(ctx.out, "已是当前节点：alice-hy2-direct\n");
     }
 
     /// 换掉自动更新来源（= root 自更新的 manifest 与二进制来源）要让人看见；同一个面板重复
