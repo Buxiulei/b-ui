@@ -233,6 +233,46 @@ async fn update_user(
     ok_json(json!({"success": true, "user": new_name}))
 }
 
+/// `POST /api/users/{username}/rotate`（2026-09-14 裁决）：换订阅 token + hy2 密码 + vless uuid，
+/// 并停用这个用户的「用户名链接」。请求体是空对象（没有可调项，所以一个字节都不读）。
+///
+/// 回包直接给出新凭据 —— 与 `create_user` 同口径：这条路由在 `require_admin` 里面，
+/// 面板本来就在显示每个用户的密码与 uuid（`PanelUser`）。
+async fn rotate_user(State(app): State<AppState>, Path(username): Path<String>) -> Response {
+    if let Err(e) = users::validate_username(&username) {
+        return fail(StatusCode::BAD_REQUEST, format!("URL 中的 {e}"));
+    }
+    let mut rotated: Option<bui_schema::model::User> = None;
+    if let Err(e) = app
+        .store
+        .update(|s| {
+            if let Some(u) = s.users.iter_mut().find(|u| u.username == username) {
+                users::rotate(u);
+                rotated = Some(u.clone());
+            }
+        })
+        .await
+    {
+        return fail(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Save failed: {e}"),
+        );
+    }
+    let Some(u) = rotated else {
+        return fail(StatusCode::NOT_FOUND, "User not found");
+    };
+    // 凭据变了 ⇒ 重写鉴权快照 + 把 xray 里的旧 uuid 换掉，都由 `users::sync_loop` 收敛
+    app.bus.send(Event::StateChanged("users"));
+    tracing::info!(user = %u.username, "已轮换订阅凭据并停用该用户的用户名链接");
+    ok_json(json!({
+        "success": true,
+        "user": u.username,
+        "subToken": u.sub_token,
+        "password": u.credentials.hy2_password,
+        "uuid": u.credentials.vless_uuid,
+    }))
+}
+
 async fn delete_user(State(app): State<AppState>, Path(username): Path<String>) -> Response {
     let mut removed = false;
     if let Err(e) = app
@@ -442,6 +482,7 @@ pub fn routes(shared: Arc<Shared>) -> axum::Router<AppState> {
             "/api/users/{username}",
             axum::routing::put(update_user).delete(delete_user),
         )
+        .route("/api/users/{username}/rotate", post(rotate_user))
         .route("/api/stats", get(move || get_stats(s_stats.clone())))
         .route("/api/online", get(move || get_online(s_online.clone())))
         .route(
@@ -629,6 +670,71 @@ mod tests {
                 .0,
             axum::http::StatusCode::NOT_FOUND
         );
+    }
+
+    /// `POST /api/users/{u}/rotate`（2026-09-14 裁决）：三样凭据一起换、回包给出新值、
+    /// 停用这个用户的「用户名链接」，并发一次 `StateChanged` 让快照与 xray 收敛。
+    #[tokio::test]
+    async fn rotating_a_user_swaps_all_three_credentials_and_kills_his_username_link() {
+        let h = harness().await;
+        let (r, t) = app(&h).await;
+        let before = h.store.read().await.users[0].clone();
+        let mut rx = h.app.bus.subscribe();
+        let (s, v) = send(
+            &r,
+            "POST",
+            "/api/users/alice/rotate",
+            Some(&t),
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(s, axum::http::StatusCode::OK);
+        assert_eq!(v["success"], true);
+        assert_eq!(v["user"], "alice");
+        let after = h.store.read().await.users[0].clone();
+        let token_now = after.sub_token.clone().expect("轮换后必须有 token");
+        assert!(bui_schema::sub::is_sub_token(&token_now), "{token_now}");
+        assert_ne!(after.sub_token, before.sub_token);
+        assert_ne!(
+            after.credentials.hy2_password,
+            before.credentials.hy2_password
+        );
+        assert_ne!(after.credentials.vless_uuid, before.credentials.vless_uuid);
+        assert!(
+            after.legacy_sub_disabled,
+            "轮换必须立刻停用用户名链接，否则旧链接还能取到新凭据"
+        );
+        // 回包就是落盘的那三样（与 create_user 同口径：这条路由在 require_admin 里面）
+        assert_eq!(v["subToken"], token_now);
+        assert_eq!(v["password"], after.credentials.hy2_password);
+        assert_eq!(v["uuid"], after.credentials.vless_uuid.to_string());
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            crate::api::Event::StateChanged("users")
+        );
+        // 面板列表跟着给出新 token（前端据此拼订阅链接）
+        let (_, list) = send(&r, "GET", "/api/users", Some(&t), None).await;
+        assert_eq!(list[0]["subToken"], token_now);
+    }
+
+    #[tokio::test]
+    async fn rotating_an_unknown_or_illegal_username_changes_nothing() {
+        let h = harness().await;
+        let (r, t) = app(&h).await;
+        let before = h.store.read().await.users[0].clone();
+        let (s, v) = send(
+            &r,
+            "POST",
+            "/api/users/ghost/rotate",
+            Some(&t),
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(s, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(v["error"], "User not found");
+        let (s2, _) = send(&r, "POST", "/api/users/a%2Fb/rotate", Some(&t), None).await;
+        assert_eq!(s2, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(h.store.read().await.users[0], before, "一个字段都不许动");
     }
 
     #[tokio::test]
@@ -1017,6 +1123,7 @@ mod tests {
         for (m, p) in [
             ("GET", "/api/users"),
             ("POST", "/api/users"),
+            ("POST", "/api/users/alice/rotate"),
             ("GET", "/api/stats"),
             ("GET", "/api/online"),
             ("POST", "/api/kick"),

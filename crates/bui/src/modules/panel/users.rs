@@ -54,6 +54,11 @@ pub struct PanelUser {
     pub usage: PanelUsage,
     pub password: String,
     pub uuid: Uuid,
+    /// 该用户四个免鉴权订阅端点的路径末段（`User::sub_token`，2026-09-14 裁决）：
+    /// 前端据此拼订阅链接，不再拿用户名拼。老 `state.json` 还没补齐 token 时不出现
+    /// （补齐由守护进程启动时的 [`backfill_sub_tokens`] 做，所以这一档只在那之前可见）。
+    #[serde(rename = "subToken", skip_serializing_if = "Option::is_none")]
+    pub sub_token: Option<String>,
     pub sni: String,
     pub residential: bool,
     /// 该用户所在的 IP 槽位序号（spec §5.6；没有住宅权益 ⇒ `None`）
@@ -135,6 +140,7 @@ pub fn project(
         },
         password: u.credentials.hy2_password.clone(),
         uuid: u.credentials.vless_uuid,
+        sub_token: u.sub_token.clone(),
         // v4 没有 per-user sni：面板与订阅都用全局 REALITY 伪装域（v3.5.13 的修复口径）
         sni: node.reality.sni().to_string(),
         residential: u.entitlements.residential.is_some(),
@@ -297,6 +303,22 @@ pub async fn backfill_sub_tokens(store: &Store, now: OffsetDateTime) -> anyhow::
         );
     }
     Ok(filled)
+}
+
+/// 轮换一个用户的订阅凭据（2026-09-14 裁决，`POST /api/users/{name}/rotate`）：
+/// 订阅 token、hy2 密码、vless uuid **同时**换掉，并停用他的「用户名链接」。
+///
+/// 三样一起换是这个接口的全部意义：泄露的链接里同时有 token（路径）、hy2 明文密码与
+/// vless uuid（响应体），只换其中一样等于没换。停用用户名链接则是为了让轮换在全局宽限期
+/// （`system.legacy_sub_until`）还没到期时也立刻生效 —— 否则旧链接照样能取到新凭据。
+///
+/// hy2 密码沿用 [`random_hy2_password`]（16 个 hex 字符，v3 同形），因此鉴权快照一重写
+/// 旧密码当场被拒；uuid 的生效靠 [`sync_users`] 的换 uuid 路径（先 RemoveUser 再 AddUser）。
+pub fn rotate(u: &mut User) {
+    u.sub_token = Some(bui_schema::sub::new_sub_token());
+    u.credentials.hy2_password = random_hy2_password();
+    u.credentials.vless_uuid = Uuid::new_v4();
+    u.legacy_sub_disabled = true;
 }
 
 pub fn apply_update(u: &mut User, req: &UpdateRequest, now: OffsetDateTime) -> Result<(), String> {
@@ -507,10 +529,15 @@ pub async fn sync_users(ctx: &DaemonCtx, shared: &Shared, blocked: &BTreeSet<Uui
                 want_removed.insert(*id);
             }
         }
-        let to_add: Vec<(Uuid, Uuid)> = desired
+        // 第三元 = 「这个 email 在 xray 侧挂的是**另一个** uuid」（轮换、或面板给
+        // 只有 Reality 权益的用户改 UUID）。此时必须先 RemoveUser 再 AddUser：xray 的
+        // AddUser 撞同名 email 会报「已存在」，而那条错误本来被
+        // `target_already_reached` 记成成功 ⇒ 新 uuid 要等 xray 重启才生效，而
+        // `render::xray::structural_hash` 剥掉了 clients，对账也不会重启它（2026-09-14 裁决）。
+        let to_add: Vec<(Uuid, Uuid, bool)> = desired
             .iter()
             .filter(|(id, vid)| applied.xray_users.get(id) != Some(vid))
-            .map(|(id, vid)| (*id, *vid))
+            .map(|(id, vid)| (*id, *vid, applied.xray_users.contains_key(id)))
             .collect();
         let to_remove: Vec<Uuid> = want_removed
             .iter()
@@ -524,12 +551,30 @@ pub async fn sync_users(ctx: &DaemonCtx, shared: &Shared, blocked: &BTreeSet<Uui
 
     // ⑤ gRPC 差分（不持 `applied`）。两个 inbound 都成功才记账，否则留给 60 秒安全网重试。
     let mut added: Vec<(Uuid, Uuid)> = Vec::new();
-    for (id, vid) in to_add {
+    for (id, vid, replaces_uuid) in to_add {
         let mut ok = true;
         for tag in XRAY_INBOUND_TAGS {
+            // 换 uuid：先把挂着旧 uuid 的同名 email 摘掉，给 AddUser 腾位置
+            if replaces_uuid {
+                if let Err(e) = shared.xray().remove_user(tag, id).await {
+                    let msg = e.to_string();
+                    if target_already_reached(&msg) {
+                        tracing::debug!(tag, %id, "换 uuid 前 RemoveUser 报不存在，直接 AddUser");
+                    } else {
+                        // 位置没腾出来，AddUser 只会再撞一次「已存在」：这一轮不加，
+                        // 留给 60 秒安全网重试（幂等）
+                        ok = false;
+                        out.errors
+                            .push(format!("换 uuid 前 RemoveUser {tag} 失败：{msg}"));
+                        continue;
+                    }
+                }
+            }
             if let Err(e) = shared.xray().add_user(tag, id, vid).await {
                 let msg = e.to_string();
-                if target_already_reached(&msg) {
+                // 换 uuid 那一路**不**吃「已存在」：吃下去就等于把旧 uuid 记成新 uuid，
+                // 用户手里的新凭据到 xray 重启才生效（2026-09-14 裁决）
+                if !replaces_uuid && target_already_reached(&msg) {
                     tracing::debug!(tag, %id, "AddUser 报已存在，按成功处理");
                 } else {
                     ok = false;
@@ -589,6 +634,9 @@ pub async fn sync_users(ctx: &DaemonCtx, shared: &Shared, blocked: &BTreeSet<Uui
 
 /// xray 的 `AddUser` 撞上「email 已存在」、`RemoveUser` 撞上「email 不存在」时都返回错误，
 /// 而这两种情形下目标状态其实已经达成，所以按成功处理。
+///
+/// **一个例外**：换 uuid 那一路（`to_add` 的第三元为真）不许吃 AddUser 的「已存在」——
+/// 那时「已存在」的是挂着**旧** uuid 的同名 email，目标根本没达成（2026-09-14 裁决）。
 ///
 /// 错误文案本身**没有实机核对过**（调研 X1–X11 只覆盖 proto 与服务端调用链，没记错误串），
 /// 所以这里宽匹配三个子串；M3 真内核联调（bwg-rick）时按 xray 的实际文案核对一次，
@@ -1029,6 +1077,72 @@ mod tests {
 
         assert_eq!(backfill_sub_tokens(&store, t0()).await.unwrap(), 0);
         assert_eq!(store.read().await.system.legacy_sub_until, None);
+    }
+
+    /// 2026-09-14 裁决：轮换把订阅 token、hy2 密码、vless uuid **一起**换掉
+    /// （只换一样等于没换：泄露的链接里三样都有），并停用这个用户的「用户名链接」。
+    #[test]
+    fn rotate_swaps_all_three_credentials_and_disables_the_username_link() {
+        let mut s = sample_state();
+        let before = s.users[0].clone();
+        rotate(&mut s.users[0]);
+        let after = s.users[0].clone();
+
+        let token = after.sub_token.as_deref().expect("轮换后必须有 token");
+        assert!(bui_schema::sub::is_sub_token(token), "{token}");
+        assert_ne!(after.sub_token, before.sub_token);
+        assert_ne!(
+            after.credentials.hy2_password,
+            before.credentials.hy2_password
+        );
+        assert_eq!(
+            after.credentials.hy2_password.len(),
+            16,
+            "与 v3 同形的 16 个 hex 字符"
+        );
+        assert_ne!(after.credentials.vless_uuid, before.credentials.vless_uuid);
+        assert!(after.legacy_sub_disabled, "旧用户名链接必须立刻失效");
+
+        // 别的字段一个都不许动（权益、用量、账务、槽位都在里面）
+        let mut restored = after.clone();
+        restored.sub_token = before.sub_token.clone();
+        restored.credentials = before.credentials.clone();
+        restored.legacy_sub_disabled = before.legacy_sub_disabled;
+        assert_eq!(restored, before);
+
+        // 每次轮换都是新随机值
+        rotate(&mut s.users[0]);
+        assert_ne!(s.users[0].sub_token, after.sub_token);
+        assert_ne!(
+            s.users[0].credentials.vless_uuid,
+            after.credentials.vless_uuid
+        );
+    }
+
+    /// 前端要拿 `subToken` 拼订阅链接（用户名链接只在宽限期内可用），所以投影必须带它。
+    #[test]
+    fn the_panel_user_carries_the_sub_token() {
+        let mut s = sample_state();
+        let v = serde_json::to_value(project(
+            alice(&s),
+            &s.node,
+            &s.residential,
+            &BTreeSet::new(),
+        ))
+        .unwrap();
+        assert!(
+            v.get("subToken").is_none(),
+            "老 state 还没补齐 token ⇒ 字段不出现"
+        );
+        s.users[0].sub_token = Some("0123456789abcdef0123456789abcdef".into());
+        let v2 = serde_json::to_value(project(
+            alice(&s),
+            &s.node,
+            &s.residential,
+            &BTreeSet::new(),
+        ))
+        .unwrap();
+        assert_eq!(v2["subToken"], "0123456789abcdef0123456789abcdef");
     }
 
     #[test]
@@ -1538,6 +1652,142 @@ mod tests {
             out.errors
         );
         assert_eq!(out.added, vec![id], "记进 applied，第二轮就不再 AddUser");
+    }
+
+    /// 2026-09-14 裁决的回归：uuid 变了（轮换、或面板给 Reality 用户改 UUID）就必须
+    /// **先 RemoveUser 再 AddUser**。原来只发 AddUser，xray 报「已存在」又被
+    /// `target_already_reached` 记成成功 ⇒ 新 uuid 要等 xray 重启才生效，而
+    /// `render::xray::structural_hash` 剥掉了 clients，对账也不会重启它。
+    #[tokio::test]
+    async fn rotating_a_uuid_removes_the_old_one_before_adding_the_new_one() {
+        let h = harness().await;
+        let ctx = ctx_of(&h);
+        let id = h.store.read().await.users[0].user_id;
+        let old = h.store.read().await.users[0].credentials.vless_uuid;
+        sync_users(&ctx, &h.shared, &BTreeSet::new()).await;
+
+        // uuid 没变 ⇒ 一个 gRPC 请求都不发
+        h.xray.clear_calls();
+        sync_users(&ctx, &h.shared, &BTreeSet::new()).await;
+        assert!(h.xray.calls().is_empty(), "{:?}", h.xray.calls());
+
+        h.store.update(|s| rotate(&mut s.users[0])).await.unwrap();
+        let new = h.store.read().await.users[0].credentials.vless_uuid;
+        assert_ne!(new, old);
+        let out = sync_users(&ctx, &h.shared, &BTreeSet::new()).await;
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(out.added, vec![id]);
+        assert!(out.removed.is_empty(), "换 uuid 不是「删用户」");
+        assert_eq!(
+            h.xray.calls(),
+            vec![
+                format!("remove:vless-direct:{id}"),
+                format!("add:vless-direct:{id}:{new}"),
+                format!("remove:vless-residential:{id}"),
+                format!("add:vless-residential:{id}:{new}"),
+            ],
+            "每个 inbound 都要先 remove 再 add"
+        );
+
+        // 记账已经指向新 uuid ⇒ 再同步一轮零请求
+        h.xray.clear_calls();
+        sync_users(&ctx, &h.shared, &BTreeSet::new()).await;
+        assert!(h.xray.calls().is_empty(), "{:?}", h.xray.calls());
+    }
+
+    /// 换 uuid 时 AddUser 还报「已存在」= 旧 uuid 仍挂着，目标根本没达成：必须记成失败
+    /// 交给 60 秒安全网重试，**不许**像新增那一路那样吃掉这条错误。
+    #[tokio::test]
+    async fn an_already_exists_while_replacing_a_uuid_is_a_real_error() {
+        let h = harness().await;
+        let ctx = ctx_of(&h);
+        let id = h.store.read().await.users[0].user_id;
+        sync_users(&ctx, &h.shared, &BTreeSet::new()).await;
+        h.store.update(|s| rotate(&mut s.users[0])).await.unwrap();
+        let new = h.store.read().await.users[0].credentials.vless_uuid;
+
+        let add_key = format!("add:vless-direct:{id}:{new}");
+        h.xray.with(|i| {
+            i.fail_on.insert(add_key.clone());
+            i.error_text
+                .insert(add_key, format!("User {id} already exists."));
+        });
+        let out = sync_users(&ctx, &h.shared, &BTreeSet::new()).await;
+        assert!(
+            out.errors
+                .iter()
+                .any(|e| e.contains("AddUser vless-direct")),
+            "{:?}",
+            out.errors
+        );
+        assert!(out.added.is_empty(), "没换成就不许记账，等安全网重试");
+
+        // 腾位置的那次 RemoveUser 自己失败：这一轮连 AddUser 都不发（发了也只会再撞一次）
+        h.xray.with(|i| {
+            i.fail_on.clear();
+            i.fail_on.insert(format!("remove:vless-direct:{id}"));
+        });
+        h.xray.clear_calls();
+        let out2 = sync_users(&ctx, &h.shared, &BTreeSet::new()).await;
+        assert!(
+            out2.errors
+                .iter()
+                .any(|e| e.contains("换 uuid 前 RemoveUser vless-direct")),
+            "{:?}",
+            out2.errors
+        );
+        assert!(
+            !h.xray
+                .calls()
+                .contains(&format!("add:vless-direct:{id}:{new}")),
+            "{:?}",
+            h.xray.calls()
+        );
+        assert!(
+            h.xray
+                .calls()
+                .contains(&format!("add:vless-residential:{id}:{new}")),
+            "另一个 inbound 照旧推进：{:?}",
+            h.xray.calls()
+        );
+    }
+
+    /// 轮换后鉴权快照重写：新 hy2 密码通过、旧密码被拒。判定走的是钩子与 http 鉴权
+    /// 共用的那一份 `auth_hook::decide`，所以这条就是真机上「旧密码还能连吗」的答案。
+    #[tokio::test]
+    async fn a_rotated_hy2_password_is_the_only_one_the_auth_snapshot_accepts() {
+        use crate::modules::panel::auth_hook::{decide, Decision};
+        let h = harness().await;
+        let ctx = ctx_of(&h);
+        let old_pw = h.store.read().await.users[0]
+            .credentials
+            .hy2_password
+            .clone();
+        sync_users(&ctx, &h.shared, &BTreeSet::new()).await;
+
+        h.store.update(|s| rotate(&mut s.users[0])).await.unwrap();
+        let user = h.store.read().await.users[0].clone();
+        let out = sync_users(&ctx, &h.shared, &BTreeSet::new()).await;
+        assert!(out.snapshot_written, "凭据变了必须重写鉴权快照");
+
+        let snap = crate::modules::panel::snapshot::read(&h.shared.snapshot_path());
+        assert_eq!(
+            decide(
+                &snap,
+                &format!("alice:{}", user.credentials.hy2_password),
+                t0()
+            ),
+            Decision::Allow {
+                user_id: user.user_id.to_string()
+            }
+        );
+        assert_eq!(
+            decide(&snap, &format!("alice:{old_pw}"), t0()),
+            Decision::Deny {
+                reason: "bad-password"
+            },
+            "旧密码必须当场被拒"
+        );
     }
 
     #[tokio::test]
