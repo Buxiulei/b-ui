@@ -261,17 +261,15 @@ pub fn render_status(st: &Status) -> String {
         "\n  ─────  B-UI 客户端 · v{}  ──────────────────────\n\n",
         crate::VERSION
     ));
+    // 没有节点时服务就算在跑也没东西可用：不亮绿灯，也不报「已停止」这种无关的状态
     let node = if st.node.is_empty() {
-        "(未设置)".to_string()
+        "○  (未设置)".to_string()
+    } else if st.service_running {
+        format!("●  运行中  {}  {}", st.node, st.label)
     } else {
-        format!("{}  {}", st.node, st.label)
+        format!("○  已停止  {}  {}", st.node, st.label)
     };
-    let svc = if st.service_running {
-        "●  运行中"
-    } else {
-        "○  已停止"
-    };
-    out.push_str(&format!("   节点   {svc}  {node}\n"));
+    out.push_str(&format!("   节点   {node}\n"));
     out.push_str(&format!(
         "   代理      SOCKS5 :{}   HTTP :{}\n",
         st.socks_port, st.http_port
@@ -667,6 +665,32 @@ mod tests {
         assert!(out2.contains("(未设置)"));
         assert!(out2.contains("已停止"));
         assert!(out2.contains("SOCKS"));
+    }
+
+    /// 没有节点时 sing-box 就算在跑也没什么可用的：节点行不能亮绿灯。
+    #[test]
+    fn node_line_without_a_node_is_never_green() {
+        for running in [true, false] {
+            let s = Status {
+                node: String::new(),
+                label: String::new(),
+                service_running: running,
+                ..st()
+            };
+            let line = render_status(&s)
+                .lines()
+                .find(|l| l.contains("节点"))
+                .unwrap()
+                .to_string();
+            assert_eq!(line, "   节点   ○  (未设置)", "service_running={running}");
+        }
+        // 有节点时照旧跟着服务状态
+        let line = render_status(&st())
+            .lines()
+            .find(|l| l.contains("节点"))
+            .unwrap()
+            .to_string();
+        assert_eq!(line, "   节点   ●  运行中  alice-hy2-direct  HY2直连");
     }
 
     #[test]
