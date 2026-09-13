@@ -1,0 +1,4 @@
+[
+ {"username":"frank","password":"pw-frank-06","createdAt":"2026-01-06T00:00:00+00:00","limits":{"speedLimit":100000000}},
+ {"username":"grace","password":"pw-grace-07","uuid":"77777777-7777-4777-8777-777777777777","sni":"www.bing.com","protocol":"fusion","residential":true,"createdAt":"2026-05-07T00:00:00.000Z","limits":{},"usage":{"total":4096,"monthly":{"2026-09":1024}}}
+]
