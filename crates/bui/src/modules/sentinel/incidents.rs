@@ -62,6 +62,62 @@ pub fn push(rt: &mut RuntimeData, inc: Incident) {
     }
 }
 
+impl Level {
+    /// 终端与面板上的中文等级
+    pub fn label(self) -> &'static str {
+        match self {
+            Level::Info => "信息",
+            Level::Warn => "警告",
+            Level::Error => "告警",
+        }
+    }
+}
+
+/// 一行人读：`<时间> [<等级>] <单元> <签名> <对象> → <动作>：<结果>`
+pub fn format_line(i: &Incident) -> String {
+    format!(
+        "{} [{}] {} {} {} → {}：{}",
+        i.at,
+        i.level.label(),
+        i.unit,
+        i.signature,
+        i.subject,
+        i.action,
+        i.result
+    )
+}
+
+pub fn format_list(v: &[Incident]) -> String {
+    if v.is_empty() {
+        return "（暂无事件）".into();
+    }
+    v.iter().map(format_line).collect::<Vec<_>>().join("\n")
+}
+
+/// CLI 取最近 `n` 条：守护进程在跑就经 socket 调 `/api/incidents`，否则直接读 `runtime.json`。
+/// 返回 `(事件, 是否来自守护进程)`。
+pub async fn load_recent(
+    socket: &std::path::Path,
+    paths: &bui_schema::paths::Paths,
+    n: usize,
+) -> (Vec<Incident>, bool) {
+    let client = crate::ipc::Client::new(socket);
+    if client.available().await {
+        if let Ok((200, v)) = client
+            .request("GET", &format!("/api/incidents?limit={n}"), None)
+            .await
+        {
+            if let Ok(r) = serde_json::from_value::<super::api::IncidentsResponse>(v) {
+                return (r.incidents, true);
+            }
+        }
+    }
+    let rt = crate::state::runtime::Runtime::load(crate::paths::runtime_file(paths))
+        .read()
+        .await;
+    (from_runtime(&rt).into_iter().take(n).collect(), false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,5 +182,40 @@ mod tests {
             serde_json::to_value(&with).unwrap()["sample"],
             "dial tcp 198.51.100.8:10007: i/o timeout"
         );
+    }
+
+    #[test]
+    fn one_line_per_incident_for_the_terminal() {
+        let mut i = inc(7);
+        i.result = "IP 198.51.100.8 不可达，槽 1 已临时切到 198.51.100.7".into();
+        assert_eq!(
+            format_line(&i),
+            "2026-09-11T00:00:07Z [告警] b-ui-relay relay_upstream_error isp2.example.net:10007 \
+             → probe_and_borrow：IP 198.51.100.8 不可达，槽 1 已临时切到 198.51.100.7"
+        );
+        assert_eq!(format_list(&[]), "（暂无事件）");
+        assert_eq!(format_list(&[inc(1), inc(2)]).lines().count(), 2);
+    }
+
+    /// 守护进程没跑（socket 连不上）⇒ 直接读 runtime.json，并如实报告来源
+    #[tokio::test]
+    async fn load_recent_falls_back_to_runtime_json_when_the_daemon_is_down() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = bui_schema::paths::Paths {
+            base_dir: d.path().to_path_buf(),
+            certs_dir: d.path().join("certs"),
+            bin_dir: d.path().join("bin"),
+        };
+        let rt = crate::state::runtime::Runtime::load(crate::paths::runtime_file(&paths));
+        rt.update(|r| {
+            for n in 0..8 {
+                push(r, inc(n));
+            }
+        })
+        .await;
+        let (v, live) = load_recent(&d.path().join("no.sock"), &paths, 5).await;
+        assert!(!live);
+        assert_eq!(v.len(), 5);
+        assert_eq!(v[0].result, "第 7 条");
     }
 }

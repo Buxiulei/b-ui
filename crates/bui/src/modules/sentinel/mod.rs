@@ -5,6 +5,7 @@
 //! `system` 系统）→ `incidents`（事件落 `runtime.extra["incidents"]`）；`run` 是主循环。
 //! 边界：只做「探测 → 借用 / 重试 / 告警」，**不增删池成员、不做切回**（切回归巡检的 `drive_slots`）。
 
+pub mod api;
 pub mod engine;
 pub mod incidents;
 pub mod resi;
@@ -88,6 +89,10 @@ impl Module for SentinelModule {
     /// 没有期望项，只有后台任务（与 watchdog 同）
     fn render(&self, _s: &State, _ctx: &RenderCtx) -> Vec<Artifact> {
         Vec::new()
+    }
+
+    fn routes(&self) -> axum::Router<crate::api::AppState> {
+        api::routes()
     }
 
     fn spawn(&self, ctx: DaemonCtx) -> Vec<tokio::task::JoinHandle<()>> {
