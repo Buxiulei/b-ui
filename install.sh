@@ -142,7 +142,9 @@ latest_v4_tag() {
     local list="$1/releases.json"; fetch "https://api.github.com/repos/$REPO/releases?per_page=100" "$list" >&2 || return 1
     # 逐字段比对键名（$2=="tag_name"）而不是 /"tag_name"/：release body 里出现字面 \"tag_name\" 时
     # 正则会误命中，字段比对不会（tr 后每片形如 {"tag_name":"v4.0.0-rc2"，以 " 切分 $2 即键名）。
-    tr ',' '\n' < "$list" | awk -F'"' '$2 == "tag_name" && $4 ~ /^v4/ { print $4; exit }'
+    # awk 命中后**不能** exit：真实列表 200KB+，提前退出时 tr 还有 ≫64KB（管道缓冲）没写完 ⇒
+    # SIGPIPE（141）⇒ pipefail 判整条管道失败 ⇒ 回退失效（客户端脚本 784c525 修过同一处）。
+    tr ',' '\n' < "$list" | awk -F'"' '!found && $2 == "tag_name" && $4 ~ /^v4/ { print $4; found = 1 }'
 }
 
 get_manifest() {

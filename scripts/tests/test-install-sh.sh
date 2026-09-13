@@ -105,6 +105,28 @@ assert_eq "1" "$rc" "取不到 v4 标签 → 退 1"
 assert_contains "BUI_VERSION=vX.Y.Z-rcN" "$out" "提示可指定预发布版本"
 assert_contains "BUI_MANIFEST_URL" "$out" "提示可直接指定 manifest 地址"
 
+# 大响应 + pipefail（bui-c 负责人 2026-09-13 报告，客户端脚本 784c525 修过同一处）：真实的
+# releases 列表 200KB+，最新 rc 在最前。`tr | awk '{…; exit}'` 命中即退，tr 还有 ≫64KB（管道缓冲）
+# 没写完 ⇒ SIGPIPE（141）⇒ pipefail 判整条管道失败 ⇒ 回退失效。本测试外壳开着 pipefail，
+# 与 install.sh 的 set -euo pipefail 同条件。3000 条旧 rc 各带 100 字节正文，把体积撑到 ~400KB。
+awk 'BEGIN {
+    printf "[{\"tag_name\":\"v4.0.1-rc3\",\"prerelease\":true,\"body\":\"最新预发布\"}"
+    for (i = 3000; i > 0; i--) printf ",{\"tag_name\":\"v4.0.0-rc%d\",\"prerelease\":true,\"body\":\"%0100d\"}", i, 0
+    print "]"
+}' > "$WORK/fixtures/releases-big.json"
+assert_eq "1" "$([[ $(wc -c < "$WORK/fixtures/releases-big.json") -gt 262144 ]] && echo 1 || echo 0)" \
+    "大夹具确实超过 256KB（小了测不出 SIGPIPE）"
+mkdir -p "$WORK/big"
+tag=$(FAKE_RELEASES="$WORK/fixtures/releases-big.json" latest_v4_tag "$WORK/big" 2> /dev/null); rc=$?
+assert_eq "0" "$rc" "releases 列表 >256KB 时 latest_v4_tag 退出码 0（不被 SIGPIPE 误杀）"
+assert_eq "v4.0.1-rc3" "$tag" "大列表里仍取第一个 v4* 标签（只打印一个）"
+: > "$DL_LOG"
+TAG=latest
+FAKE_RELEASES="$WORK/fixtures/releases-big.json" get_manifest "$WORK/big/m.json" > /dev/null 2>&1
+assert_eq "0" "$?" "大列表下 latest 404 → 回退预发布照样成功"
+assert_eq "v4.0.1-rc3" "$TAG" "回退到大列表里最新的 rc"
+TAG=latest
+
 # BUI_MANIFEST_URL 给了就只认它，不去问 releases 列表（M5 演练 / 离线源）
 : > "$DL_LOG"
 TAG=latest
