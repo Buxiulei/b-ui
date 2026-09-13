@@ -2340,6 +2340,96 @@ mod tests {
         out.push(("delete-long-label", switch));
         let passive = render_delete_confirm(&long, &[2], None, width, 40);
         out.push(("delete-long-label-passive", passive));
+        // T7：删除执行路径新出现的整屏与行——失败的停顿页（预检不过 / 内核缺失 / 切换失败并
+        // 换回 / 换回也失败 / 停不下来 / 快照变了）、确认时的几句提示、删除后的「上次：」行。
+        // 文案都从 crate::delete 取，屏上打的就是这几句（cli 经 delete::page 折行）
+        use crate::delete;
+        let victim = "rick-node.example-a.net-reality-direct";
+        let pages: Vec<Vec<String>> = vec![
+            vec![
+                format!("删除没做：切到 {victim} 的配置校验不通过"),
+                "sing-box check 不通过：outbounds[0]: 解析失败".to_string(),
+                delete::STILL_THERE.to_string(),
+                delete::NEXT_PICK_ANOTHER.to_string(),
+            ],
+            vec![
+                format!("删除没做：内核缺失，切不到 {victim}"),
+                "内核缺失：/opt/bui-c/bin/sing-box，先跑 `bui-c update` 安装 sing-box".to_string(),
+                delete::STILL_THERE.to_string(),
+                delete::NEXT_KERNEL.to_string(),
+            ],
+            vec![
+                format!("删除没做：切到 {victim} 失败"),
+                "bui-tun 接口 5 秒内没起来".to_string(),
+                delete::ROLLED_BACK.to_string(),
+            ],
+            vec![
+                "删除没做：写 profiles.json 失败".to_string(),
+                "读写 /opt/bui-c/profiles.json 失败：permission denied".to_string(),
+                format!(
+                    "{}：命令 systemctl restart bui-c.service 执行失败（退出码 1）",
+                    delete::ROLLBACK_FAILED
+                ),
+                delete::ROLLBACK_NEXT.to_string(),
+            ],
+            vec![
+                "删除没做：停止代理失败：bui-c.service 还在跑".to_string(),
+                delete::STILL_THERE.to_string(),
+            ],
+            vec![delete::SNAPSHOT_CHANGED.to_string()],
+        ];
+        for p in &pages {
+            out.push(("delete-failed", delete::page(p, width)));
+        }
+        for line in [
+            delete::CANCELLED.to_string(),
+            delete::NEEDS_YES.to_string(),
+            delete::UFW_LEFT.to_string(),
+            delete::NO_NODES.to_string(),
+            delete::only_y(true),
+            delete::only_y(false),
+            delete::also_a_target(11),
+            format!("正在切到 {victim}…"),
+            "正在停止代理…".to_string(),
+            "已安装 sing-box 内核".to_string(),
+            SelError::OutOfRange(vec!["99999999999999999999".to_string()]).message(9),
+            SelError::Junk("a".to_string()).message(9),
+            SelError::Reversed("5-3".to_string()).message(9),
+            SelError::ZeroMixed.message(9),
+        ] {
+            out.push(("delete-line", delete::page(&[line], width)));
+        }
+        // 删除后的「上次：」行：三种形态，名字单独中间截断（R6）
+        for r in [
+            delete::Report {
+                deleted: vec!["HY2".to_string()],
+                active: Some("hysteria2-1778329470".to_string()),
+                switched: false,
+                stopped: false,
+                remaining: 8,
+            },
+            delete::Report {
+                deleted: vec!["HY2".to_string(), "reality-Reality".to_string()],
+                active: Some(victim.to_string()),
+                switched: true,
+                stopped: false,
+                remaining: 7,
+            },
+            delete::Report {
+                deleted: vec!["HY2".to_string()],
+                active: None,
+                switched: false,
+                stopped: true,
+                remaining: 0,
+            },
+        ] {
+            let last = delete::summary(&r, width);
+            out.push(("delete-last", render(&st(), width, Some(&last))));
+        }
+        // 确认时打编号改了替换目标，菜单补打的那一行
+        for k in [0, 3, 8] {
+            out.push(("delete-switch-to", render_switch_to(&del, k, width)));
+        }
         out
     }
 

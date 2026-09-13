@@ -28,6 +28,10 @@ pub enum Error {
         schemes: Vec<String>,
         has_http: bool,
     },
+    /// 用法错误：非终端下没加 `-y`、`--json` 没带 `-y` 这类。`finish()` 映射到退出码 2，
+    /// 与 clap 的用法错误同码（spec §0.2 R15）。
+    #[error("{0}")]
+    Usage(String),
     #[error("{0}")]
     Msg(String),
 }
@@ -68,6 +72,17 @@ impl Error {
     }
     pub fn msg(m: impl Into<String>) -> Self {
         Error::Msg(m.into())
+    }
+    pub fn usage(m: impl Into<String>) -> Self {
+        Error::Usage(m.into())
+    }
+    /// 退出码（spec §0.2 R15）：用法错误 2，其余执行失败 1。「不是 root」在 `run()` 里
+    /// 也返回 2，不经这里。
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            Error::Usage(_) => 2,
+            _ => 1,
+        }
     }
 }
 
@@ -113,6 +128,19 @@ mod tests {
         );
         assert_eq!(redact_url("not a url"), "<非法 URL>");
     }
+    #[test]
+    fn usage_errors_map_to_exit_code_two() {
+        // spec §0.2 R15：2 = 用法错误（与 clap 同码），1 = 执行失败
+        assert_eq!(Error::usage("--json 要和 -y 一起用").exit_code(), 2);
+        assert_eq!(
+            Error::usage("x").to_string(),
+            "x",
+            "用法错误的文案不加前缀，finish 自己写「错误：」"
+        );
+        assert_eq!(Error::msg("节点 nope 不存在").exit_code(), 1);
+        assert_eq!(Error::Verify("check 不通过".into()).exit_code(), 1);
+    }
+
     #[test]
     fn command_error_message_is_chinese_and_has_code() {
         let e = Error::Command {

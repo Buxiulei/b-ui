@@ -7,7 +7,7 @@ use crate::net::{Download, Net, Probe, ProbeError, Via};
 use crate::sys::{Output, Sys};
 use crate::{Error, Result};
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -25,6 +25,10 @@ pub struct FakeSys {
     sleeps: RefCell<Vec<u64>>,
     /// 终端尺寸 `(列, 行)`；默认 `None`，等于「stdout 不是终端」。
     term: Cell<Option<(u16, u16)>>,
+    /// 注入写失败的路径（[`FakeSys::fail_write`]）。
+    write_fails: RefCell<BTreeSet<PathBuf>>,
+    /// 每次 [`Sys::write`] 的目标路径，按顺序（失败的也记）。
+    written: RefCell<Vec<PathBuf>>,
 }
 
 impl Default for FakeSys {
@@ -37,6 +41,8 @@ impl Default for FakeSys {
             now: RefCell::new(datetime!(2026-09-11 00:00:00 UTC)),
             sleeps: RefCell::default(),
             term: Cell::new(None),
+            write_fails: RefCell::default(),
+            written: RefCell::default(),
         }
     }
 }
@@ -129,6 +135,17 @@ impl FakeSys {
     pub fn set_term_size(&self, v: Option<(u16, u16)>) {
         self.term.set(v);
     }
+    /// 注入写失败：之后对这个路径的 [`Sys::write`] 一律返回 `Err`（磁盘满、只读文件系统）。
+    /// 删除流程的回滚分支靠它测：写 `config.json` 或 `profiles.json` 失败时要换回原配置。
+    pub fn fail_write(&self, path: &str) {
+        self.write_fails.borrow_mut().insert(PathBuf::from(path));
+    }
+    /// 对这个路径调用过几次 [`Sys::write`]（失败的也算）。用来钉住「profiles 与 active
+    /// 同一次 save」这类断言。
+    pub fn writes(&self, path: &str) -> usize {
+        let want = PathBuf::from(path);
+        self.written.borrow().iter().filter(|p| **p == want).count()
+    }
 }
 
 impl Sys for FakeSys {
@@ -154,6 +171,13 @@ impl Sys for FakeSys {
             .ok_or_else(|| Error::io(path, std::io::Error::from(std::io::ErrorKind::NotFound)))
     }
     fn write(&self, path: &Path, data: &[u8], mode: u32) -> Result<()> {
+        self.written.borrow_mut().push(path.to_path_buf());
+        if self.write_fails.borrow().contains(path) {
+            return Err(Error::io(
+                path,
+                std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            ));
+        }
         self.files
             .borrow_mut()
             .insert(path.to_path_buf(), (data.to_vec(), mode));
@@ -376,6 +400,22 @@ mod tests {
         assert!(s.run("systemctl", &["daemon-reload"]).unwrap().ok());
         assert!(s.called("systemctl daemon-reload"));
         assert_eq!(s.calls().len(), 3);
+    }
+
+    #[test]
+    fn injected_write_failures_keep_the_old_bytes_and_still_count() {
+        let s = FakeSys::new();
+        let p = Path::new("/opt/bui-c/profiles.json");
+        s.write(p, b"old", 0o600).unwrap();
+        s.fail_write("/opt/bui-c/profiles.json");
+        let e = s.write(p, b"new", 0o600).unwrap_err();
+        assert!(e.to_string().contains("profiles.json"), "{e}");
+        assert_eq!(s.read(p).unwrap(), b"old", "写失败不能改动原文件");
+        assert_eq!(s.writes("/opt/bui-c/profiles.json"), 2, "失败的也算一次");
+        assert_eq!(s.writes("/opt/bui-c/config.json"), 0);
+        // 只影响登记过的那个路径
+        s.write(Path::new("/opt/bui-c/config.json"), b"{}", 0o600)
+            .unwrap();
     }
 
     #[test]

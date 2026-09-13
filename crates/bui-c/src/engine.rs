@@ -20,6 +20,10 @@ const POLL_INTERVAL_MS: u64 = 500;
 /// [`Engine::wait_tun_ready`] 最多等几秒，给提示文案用。
 pub const TUN_READY_WAIT_S: u64 = APPLY_POLL_STEPS as u64 * POLL_INTERVAL_MS / 1000;
 
+/// 「内核缺失」错误的开头：[`Engine::apply`] 与 [`Engine::preflight`] 共用一句话，
+/// 删除流程据它把停顿页的下一步换成「先检查更新」（spec §0.2 R1）。
+pub const KERNEL_MISSING: &str = "内核缺失";
+
 /// 一次 `apply` 实际改了什么，菜单与 `check` 据此决定提示语与后续动作。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Applied {
@@ -162,12 +166,98 @@ impl<'a, S: Sys> Engine<'a, S> {
         false
     }
 
+    /// 内核不在盘上时的错误：`apply` 与 `preflight` 同一句话（[`KERNEL_MISSING`]）。
+    fn kernel_missing(&self) -> Error {
+        Error::msg(format!(
+            "{KERNEL_MISSING}：{}，先跑 `bui-c update` 安装 sing-box",
+            self.paths.singbox().display()
+        ))
+    }
+
+    /// 改数据面之前的预检（spec §5.5 第 3 步、§0.2 R2）：
+    ///
+    /// 1. 清掉残留的 `.config.json.new` 与 `.config.json.*.tmp`（里面有凭据，R10）；
+    /// 2. 内核还缺就报 [`KERNEL_MISSING`] 中止——`Engine` 没有 `Net`，**不装内核**
+    ///    （装内核在锁外做完了）；
+    /// 3. 渲染 + `sing-box check`。
+    ///
+    /// 只写 `verify` 那份临时文件（它自己删掉），`config.json`、单元、systemd 一个都不动。
+    pub fn preflight(&self, prof: &Profiles) -> Result<()> {
+        self.clear_config_leftovers()?;
+        if !self.sys.exists(&self.paths.singbox()) {
+            return Err(self.kernel_missing());
+        }
+        let p = prof
+            .active_profile()
+            .ok_or_else(|| Error::msg("没有激活的节点"))?;
+        let cfg = self.render(prof, p)?;
+        self.verify(&cfg)
+    }
+
+    /// 删光节点时拆掉数据面（spec §0.2 R10 的顺序，到「删配置」为止）：
+    ///
+    /// `stop` → 复查 `is-active`，还在就再 `stop` 一次，仍在就报错中止（**这之前什么都没改**，
+    /// 调用方据此不写 `profiles.json`）→ 不可回头段：`disable` + `reset-failed` → 删主单元文件
+    /// → `daemon-reload` → `ip link delete bui-tun` → 删 `config.json` 与两种临时文件。
+    ///
+    /// `bui-c.timer` 与 `bui-c-check.service` **不动**：没有节点时巡检走 `NoProfile`，
+    /// 每日自更新与中断收敛还要有地方跑（R10）。撤 UFW、写 runtime 由 cli 层在写完
+    /// `profiles.json` 之后尽力而为。
+    pub fn teardown_main(&self) -> Result<()> {
+        systemd::stop_quiet(self.sys, UNIT_MAIN);
+        if systemd::is_active(self.sys, UNIT_MAIN) {
+            // 删掉正在跑的单元的文件并不会停掉它的进程，所以这一步必须过（spec §5.5 第 6 步）
+            systemd::stop_quiet(self.sys, UNIT_MAIN);
+            if systemd::is_active(self.sys, UNIT_MAIN) {
+                return Err(Error::msg(format!("停止代理失败：{UNIT_MAIN} 还在跑")));
+            }
+        }
+        systemd::disable_quiet(self.sys, UNIT_MAIN);
+        systemd::reset_failed_quiet(self.sys, UNIT_MAIN);
+        let unit = self.paths.unit(UNIT_MAIN);
+        if self.sys.exists(&unit) {
+            self.sys.remove_file(&unit)?;
+        }
+        systemd::daemon_reload(self.sys)?;
+        // 单元停了接口通常自己就没了；留下的残骸删掉，没有也不算错
+        let _ = self.sys.run("ip", &["link", "delete", TUN_IFACE]);
+        self.sys.remove_file(&self.paths.config())?;
+        self.clear_config_leftovers()
+    }
+
+    /// 清掉渲染留下的临时文件：`verify` 写的 `.config.json.new`，以及上一轮崩在半路的
+    /// `.config.json.<pid>.tmp`。两者都是 0600 的完整配置，里面有节点凭据（R10）。
+    fn clear_config_leftovers(&self) -> Result<()> {
+        self.sys
+            .remove_file(&self.paths.base.join(".config.json.new"))?;
+        self.clear_tmp("config.json")
+    }
+
+    /// 删光节点之后再清 `.profiles.json.<pid>.tmp`：里面有被删节点的凭据（R10）。
+    pub fn clear_profile_leftovers(&self) -> Result<()> {
+        self.clear_tmp("profiles.json")
+    }
+
+    /// 删掉 `<base>/.<name>.*.tmp`。读不到目录（新机器）不算错。
+    fn clear_tmp(&self, name: &str) -> Result<()> {
+        let head = format!(".{name}.");
+        let Ok(entries) = self.sys.read_dir(&self.paths.base) else {
+            return Ok(());
+        };
+        for e in entries {
+            let Some(f) = e.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if f.starts_with(&head) && f.ends_with(".tmp") {
+                self.sys.remove_file(&e)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn apply(&self, prof: &Profiles) -> Result<Applied> {
         if !self.sys.exists(&self.paths.singbox()) {
-            return Err(Error::msg(format!(
-                "内核缺失：{}，先跑 `bui-c update` 安装 sing-box",
-                self.paths.singbox().display()
-            )));
+            return Err(self.kernel_missing());
         }
         let p = prof
             .active_profile()
@@ -665,6 +755,115 @@ mod tests {
         let cfg = e.render(&socks, socks.active_profile().unwrap()).unwrap();
         assert_eq!(cfg["inbounds"][0]["listen_port"], 11080);
         assert_eq!(cfg["inbounds"][1]["listen_port"], 18080);
+    }
+
+    #[test]
+    fn preflight_clears_leftovers_and_never_touches_the_data_plane() {
+        let s = FakeSys::new();
+        clean(&s);
+        s.put("/opt/bui-c/config.json", "{\"old\":true}");
+        // 上一轮崩在半路留下的两种临时文件（0600 的完整配置，含凭据）
+        s.put("/opt/bui-c/.config.json.new", "残留");
+        s.put("/opt/bui-c/.config.json.4242.tmp", "残留");
+        s.put("/opt/bui-c/.profiles.json.4242.tmp", "残留");
+        let pt = paths();
+        let e = Engine::new(&s, &pt);
+        e.preflight(&profiles_socks()).unwrap();
+        assert!(!s.exists(std::path::Path::new("/opt/bui-c/.config.json.new")));
+        assert!(!s.exists(std::path::Path::new("/opt/bui-c/.config.json.4242.tmp")));
+        assert!(
+            s.exists(std::path::Path::new("/opt/bui-c/.profiles.json.4242.tmp")),
+            "profiles 的临时文件留给删光那一步清"
+        );
+        assert_eq!(
+            s.get("/opt/bui-c/config.json").unwrap(),
+            "{\"old\":true}",
+            "预检不动 config.json"
+        );
+        assert!(!s.called("systemctl restart bui-c.service"));
+        assert!(!s.called("systemctl daemon-reload"));
+        assert!(
+            s.calls().iter().any(|c| c.contains("check -c")),
+            "{:?}",
+            s.calls()
+        );
+        // 删光之后才清 profiles 的临时文件
+        e.clear_profile_leftovers().unwrap();
+        assert!(!s.exists(std::path::Path::new("/opt/bui-c/.profiles.json.4242.tmp")));
+
+        // 内核缺失：报 KERNEL_MISSING，不去装（Engine 没有 Net）
+        let s = FakeSys::new();
+        let e = Engine::new(&s, &pt)
+            .preflight(&profiles_socks())
+            .unwrap_err();
+        assert!(e.to_string().starts_with(KERNEL_MISSING), "{e}");
+        // check 不通过：报 Verify，config.json 照旧
+        let s = FakeSys::new();
+        clean(&s);
+        s.reply(
+            "/opt/bui-c/bin/sing-box check -c /opt/bui-c/.config.json.new",
+            1,
+            "",
+        );
+        let e = Engine::new(&s, &pt)
+            .preflight(&profiles_socks())
+            .unwrap_err();
+        assert!(matches!(e, crate::Error::Verify(_)), "{e}");
+    }
+
+    #[test]
+    fn teardown_main_stops_first_deletes_the_unit_and_keeps_the_timer() {
+        let s = FakeSys::new();
+        clean_and_starts(&s);
+        let pt = paths();
+        let e = Engine::new(&s, &pt);
+        // SOCKS 模式装一遍：三个单元 + config.json，且 apply 不会自己去 `ip link delete`
+        e.apply(&profiles_socks()).unwrap();
+        assert!(s.exists(&pt.unit(UNIT_MAIN)));
+        // stop 之后不再 active
+        s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        e.teardown_main().unwrap();
+        let calls = s.calls();
+        let at = |c: &str| {
+            calls
+                .iter()
+                .position(|x| x == c)
+                .unwrap_or_else(|| panic!("没有调用 {c}：{calls:?}"))
+        };
+        assert!(at("systemctl stop bui-c.service") < at("systemctl disable bui-c.service"));
+        assert!(at("systemctl disable bui-c.service") < at("ip link delete bui-tun"));
+        assert!(s.called("systemctl reset-failed bui-c.service"));
+        assert!(!s.exists(&pt.unit(UNIT_MAIN)), "主单元文件删掉");
+        assert!(
+            s.exists(&pt.unit(UNIT_TIMER)) && s.exists(&pt.unit(UNIT_CHECK)),
+            "timer 与巡检单元留着（R10）"
+        );
+        assert!(!s.called("systemctl stop bui-c.timer"));
+        assert!(!s.called("systemctl disable bui-c.timer"));
+        assert!(!s.exists(&pt.config()));
+        assert!(s.exists(&pt.singbox()), "内核留着");
+    }
+
+    #[test]
+    fn teardown_main_aborts_while_the_unit_is_still_active() {
+        let s = FakeSys::new();
+        clean_and_starts(&s); // is-active 一直是 0：stop 了两次也停不下来
+        let pt = paths();
+        let e = Engine::new(&s, &pt);
+        e.apply(&profiles_socks()).unwrap();
+        let err = e.teardown_main().unwrap_err();
+        assert!(err.to_string().contains("停止代理失败"), "{err}");
+        assert_eq!(
+            s.calls()
+                .iter()
+                .filter(|c| *c == "systemctl stop bui-c.service")
+                .count(),
+            2,
+            "复查没过就再停一次，然后中止"
+        );
+        assert!(s.exists(&pt.unit(UNIT_MAIN)), "数据面一点都没动");
+        assert!(s.exists(&pt.config()));
+        assert!(!s.called("systemctl disable bui-c.service"));
     }
 
     #[test]

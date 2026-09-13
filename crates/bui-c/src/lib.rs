@@ -6,10 +6,12 @@
 //! - 单元：`bui-c.service`（sing-box）、`bui-c-check.service`（oneshot 巡检）、`bui-c.timer`（每分钟）。
 pub mod check;
 pub mod cli;
+pub mod delete;
 pub mod engine;
 pub mod error;
 pub mod fake;
 pub mod import_v3;
+pub mod lock;
 pub mod menu;
 pub mod net;
 pub mod paths;
