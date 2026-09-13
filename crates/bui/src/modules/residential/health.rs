@@ -14,11 +14,13 @@ use super::{
 use crate::api::Event;
 use crate::reconcile::DaemonCtx;
 use crate::util::{fmt_rfc3339, parse_rfc3339};
-use bui_schema::model::{ResidentialGroup, Upstream};
+use bui_schema::model::{ResidentialGroup, Slot, Upstream};
 use clash::Clash;
 use proxy::{ProbeError, Prober};
 use state::ResiRuntime;
+use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Duration;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -798,7 +800,245 @@ pub async fn health_loop(ctx: DaemonCtx, p: Arc<dyn Prober>, c: Arc<dyn Clash>) 
     }
 }
 
-/// 重放 `runtime.selected_upstream_id`（spec §5.3 最后一句）。
+/// relay 重启后重放的退避：首个间隔 0.3 秒、此后翻倍（0.3/0.6/1.2/2.4/4.8…），
+/// 最后一段截到 [`REPLAY_RETRY_BUDGET`] 用完为止
+const REPLAY_RETRY_FIRST: Duration = Duration::from_millis(300);
+/// 重放的退避总预算（从第一次尝试算起）。Clash API 单次调用另有
+/// [`super::CLASH_TIMEOUT_SECS`] 的超时，最后一次尝试本身的耗时不计在内
+pub const REPLAY_RETRY_BUDGET: Duration = Duration::from_secs(15);
+/// 重放最终失败那条告警的固定前缀：下一次重放全部成功时按它认领、清掉
+const REPLAY_FAIL_ALERT: &str = "relay 重启后重放住宅出口选择失败";
+
+/// [`replay_after_restart`] 的结论（给测试与日志）
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ReplayOutcome {
+    /// 重放成功的 `(selector, tag)`
+    pub replayed: Vec<(String, String)>,
+    /// 最终仍失败的 `(selector, tag, 原因)`
+    pub failed: Vec<(String, String, String)>,
+}
+
+/// 一条要重放的 selector 选择
+#[derive(Debug, Clone)]
+struct ReplayItem {
+    selector: String,
+    tag: String,
+    /// 槽 selector 才有：`(槽序号, 事件时 runtime 记的 current_upstream_id, 重放目标)`
+    slot: Option<(u16, Option<Uuid>, Uuid)>,
+}
+
+/// relay 重启后该重放哪些 selector（纯函数；tag 现算，runtime 只存 uuid，§C）：
+/// - 全局 [`POOL`] → `runtime.selected_upstream_id`（还在池里就重放，与以前一样不比 default）；
+/// - 每槽 `slot-<i>-pool` → 手动 pin（还在池里）优先，否则 `current_upstream_id`；
+///   与本槽自己的 IP（selector 的 `default`）相同的不必重放。
+fn replay_plan(g: &ResidentialGroup, view: &[Slot], r: &ResiRuntime) -> Vec<ReplayItem> {
+    let in_pool = |id: Uuid| g.upstreams.iter().any(|u| u.id == id);
+    let mut plan = Vec::new();
+    if let Some(id) = r.selected_upstream_id {
+        match clash::tag_of(g, id) {
+            Some(tag) => plan.push(ReplayItem {
+                selector: POOL.to_string(),
+                tag,
+                slot: None,
+            }),
+            None => tracing::warn!(%id, "运行时选中的上游已不在池里，跳过重放"),
+        }
+    }
+    for s in view {
+        // 本槽 IP 不在池里 ⇒ relay 没渲染这个 selector（slot_view 已过滤掉）
+        if !in_pool(s.upstream_id) {
+            continue;
+        }
+        let Some(sr) = r.slots.get(&s.index.to_string()) else {
+            continue;
+        };
+        let want = sr
+            .pinned_upstream_id
+            .filter(|p| in_pool(*p))
+            .or(sr.current_upstream_id);
+        let Some(want) = want.filter(|w| *w != s.upstream_id) else {
+            continue;
+        };
+        let Some(tag) = clash::tag_of(g, want) else {
+            continue;
+        };
+        plan.push(ReplayItem {
+            selector: super::slot_selector(s.index),
+            tag,
+            slot: Some((s.index, sr.current_upstream_id, want)),
+        });
+    }
+    plan
+}
+
+/// 逐轮重放：每轮先探 Clash API 可用（[`Clash::ready`]）再逐条 select。连接类失败
+/// （探不通、[`clash::ClashError::Unreachable`]）按 0.3/0.6/1.2/… 秒退避重试，总时长不超过
+/// [`REPLAY_RETRY_BUDGET`]；Clash 明确拒绝（`Rejected`：selector / 成员不存在）重试也没用，
+/// 当轮就记失败。返回 `(成功, 失败 + 原因, 尝试次数)`。
+async fn select_with_retry(
+    c: Arc<dyn Clash>,
+    plan: Vec<ReplayItem>,
+) -> (Vec<ReplayItem>, Vec<(ReplayItem, String)>, u32) {
+    let deadline = tokio::time::Instant::now() + REPLAY_RETRY_BUDGET;
+    let mut delay = REPLAY_RETRY_FIRST;
+    let (mut pending, mut done, mut failed) = (plan, Vec::new(), Vec::new());
+    let mut attempts = 0u32;
+    loop {
+        attempts += 1;
+        let (cc, batch) = (c.clone(), pending.clone());
+        let res = tokio::task::spawn_blocking(move || {
+            cc.ready().then(|| {
+                batch
+                    .iter()
+                    .map(|i| cc.select(&i.selector, &i.tag))
+                    .collect::<Vec<_>>()
+            })
+        })
+        .await;
+        let mut why = "Clash API 未就绪（relay 多半刚重启、还没起监听）".to_string();
+        match res {
+            Ok(Some(results)) => {
+                let mut again = Vec::new();
+                for (item, r) in pending.drain(..).zip(results) {
+                    match r {
+                        Ok(()) => done.push(item),
+                        Err(e @ clash::ClashError::Unreachable(_)) => {
+                            why = e.to_string();
+                            again.push(item);
+                        }
+                        Err(e) => failed.push((item, e.to_string())),
+                    }
+                }
+                pending = again;
+            }
+            Ok(None) => {}
+            // 阻塞任务 panic：重试也只会再炸一次
+            Err(e) => failed.extend(pending.drain(..).map(|i| (i, format!("重放任务异常：{e}")))),
+        }
+        if pending.is_empty() {
+            return (done, failed, attempts);
+        }
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            failed.extend(pending.into_iter().map(|i| (i, why.clone())));
+            return (done, failed, attempts);
+        }
+        let wait = delay.min(left);
+        tracing::debug!(wait = ?wait, pending = pending.len(), reason = %why, "Clash API 暂时连不上，退避后重放");
+        tokio::time::sleep(wait).await;
+        delay *= 2;
+    }
+}
+
+/// relay 重启后把选择重放回去（spec §5.3 最后一句 + §5.6）：全局 [`POOL`] 与每个借用 /
+/// pin 中的槽 selector。
+///
+/// 2026-09-13 04:05:47 UTC bwg-rick 实录：每日黑名单批量重启 b-ui-relay 后紧接着重放，
+/// 那一刻 Clash API 还没起监听，一次失败就放弃了；槽 selector 也从没重放过（借用 / pin
+/// 中的槽被 relay 打回默认）。所以每轮先探 Clash API 可用再 select，连接类失败按退避
+/// 重试（[`select_with_retry`]）。
+///
+/// 落账：
+/// - 不需要重放的槽，`current_upstream_id` 照旧清零 ⇒ 下一轮 `drive_slots` 无条件按本槽
+///   优先重 PUT 一次，不去赌 sing-box 的 `cache_file` 有没有把选择持久化下来；
+/// - 重放成功的槽保留 current（借用中的切回防抖不因 relay 重启被绕过）；
+/// - 最终失败的槽清零、全局选择不动，并记一条告警 —— 下一轮巡检由现有逻辑兜底
+///   （`drive_slots` 重 PUT；规则 6a 发现 now 与运行时不一致就重放）；
+/// - `back_rounds` 一律不清：它记的是「本槽自己健康了几轮」，与 relay 重启无关。
+pub async fn replay_after_restart(ctx: &DaemonCtx, c: Arc<dyn Clash>) -> ReplayOutcome {
+    let (g, view) = {
+        let s = ctx.store.read().await;
+        (
+            state::group_of(&s),
+            bui_schema::slots::sorted(&s.residential),
+        )
+    };
+    // 池无效时 relay 里一个 selector 都没有（fail-open 直连），没什么可重放
+    let plan = if g.pool_active() {
+        replay_plan(&g, &view, &state::read(&ctx.runtime).await)
+    } else {
+        Vec::new()
+    };
+    let kept: BTreeSet<String> = plan
+        .iter()
+        .filter_map(|i| i.slot)
+        .map(|(idx, _, _)| idx.to_string())
+        .collect();
+    state::update(&ctx.runtime, move |r| {
+        for (k, s) in r.slots.iter_mut() {
+            if !kept.contains(k) {
+                s.current_upstream_id = None;
+            }
+        }
+    })
+    .await;
+    if plan.is_empty() {
+        return ReplayOutcome::default();
+    }
+
+    let (done, failed, attempts) = select_with_retry(c, plan).await;
+    let out = ReplayOutcome {
+        replayed: done
+            .iter()
+            .map(|i| (i.selector.clone(), i.tag.clone()))
+            .collect(),
+        failed: failed
+            .iter()
+            .map(|(i, e)| (i.selector.clone(), i.tag.clone(), e.clone()))
+            .collect(),
+    };
+    // 槽的落账与告警并成一次写。重放期间巡检也可能动过某一槽（drive_slots 同样会 PUT）：
+    // 只在 current 还是事件时那个值时才改，别覆盖它
+    let slot_writes: Vec<(u16, Option<Uuid>, Option<Uuid>)> = done
+        .iter()
+        .filter_map(|i| i.slot)
+        .map(|(idx, seen, want)| (idx, seen, Some(want)))
+        .chain(
+            failed
+                .iter()
+                .filter_map(|(i, _)| i.slot)
+                .map(|(idx, seen, _)| (idx, seen, None)),
+        )
+        .collect();
+    let failed_list = out
+        .failed
+        .iter()
+        .map(|(s, t, e)| format!("{s} → {t}：{e}"))
+        .collect::<Vec<_>>()
+        .join("；");
+    let alert = (!out.failed.is_empty())
+        .then(|| format!("{REPLAY_FAIL_ALERT}（{failed_list}），下一轮巡检兜底"));
+    state::update(&ctx.runtime, move |r| {
+        for (idx, seen, landed) in slot_writes {
+            if let Some(e) = r.slots.get_mut(&idx.to_string()) {
+                if e.current_upstream_id == seen {
+                    e.current_upstream_id = landed;
+                }
+            }
+        }
+        // 只留最新一次的结论：全部成功 ⇒ 认领以前的失败告警
+        state::remove_alerts_with_prefix(r, REPLAY_FAIL_ALERT);
+        if let Some(a) = alert {
+            state::push_alert(r, a);
+        }
+    })
+    .await;
+
+    let replayed = out
+        .replayed
+        .iter()
+        .map(|(s, t)| format!("{s} → {t}"))
+        .collect::<Vec<_>>()
+        .join("；");
+    if out.failed.is_empty() {
+        tracing::info!(%replayed, attempts, "relay 重启后已重放住宅出口选择");
+    } else {
+        tracing::warn!(%replayed, failed = %failed_list, attempts, "relay 重启后重放住宅出口选择失败，下一轮巡检兜底");
+    }
+    out
+}
+
+/// relay 重启后重放选择（spec §5.3 最后一句），做法见 [`replay_after_restart`]。
 /// **`rx` 由调用方先 `bus.subscribe()` 拿到再传进来**：broadcast 会丢弃「发送时还没有
 /// 订阅者」的事件，若在本函数里 subscribe，调用方 spawn 之后立刻 send 的那条必丢
 /// （current_thread 运行时下 100% 丢）。T11 的 `spawn` 与 T8 的测试都按这个顺序写。
@@ -810,36 +1050,7 @@ pub async fn replay_loop(
     loop {
         match rx.recv().await {
             Ok(Event::RelayRestarted) => {
-                // spec §5.6：relay 重启后每槽的 selector 也回到配置里的 default（本槽 IP）。
-                // 把各槽的 current_upstream_id 清零 ⇒ 下一轮 drive_slots 无条件重 PUT，
-                // 不去赌 sing-box 的 `cache_file` 有没有把 selector 选择持久化下来。
-                // back_rounds 不清：它记的是「本槽自己健康了几轮」，与 relay 重启无关。
-                // **必须在下面那句 early continue 之前**：运行时还没选过全局出口时，
-                // 那个 `let ... else { continue }` 会直接跳过整支，槽位就永远清不掉。
-                state::update(&ctx.runtime, |r| {
-                    for s in r.slots.values_mut() {
-                        s.current_upstream_id = None;
-                    }
-                })
-                .await;
-                // relay 重启后 selector 回到配置里的 default（池首），把运行时选择重放回去。
-                // 没有这一步，每次黑名单批量或 pin 都会把出口悄悄换回池首。
-                // tag 现算：runtime 存的是 uuid，池增删后同一个 resi-N 可能已指向别人（§C）
-                let Some(id) = state::read(&ctx.runtime).await.selected_upstream_id else {
-                    continue;
-                };
-                let g = state::group_of(&*ctx.store.read().await);
-                let Some(tag) = clash::tag_of(&g, id) else {
-                    tracing::warn!(%id, "运行时选中的上游已不在池里，跳过重放");
-                    continue;
-                };
-                let (cc, t2) = (c.clone(), tag.clone());
-                match tokio::task::spawn_blocking(move || cc.select(POOL, &t2)).await {
-                    Ok(Ok(())) => tracing::info!(tag = %tag, "relay 重启后已重放住宅出口选择"),
-                    other => {
-                        tracing::warn!(tag = %tag, result = ?other, "重放住宅出口选择失败")
-                    }
-                }
+                replay_after_restart(&ctx, c.clone()).await;
             }
             Ok(_) => {}
             Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
@@ -2231,8 +2442,9 @@ mod tests {
     }
 
     /// spec §5.6：relay 一重启，每槽的 selector 都回落到配置里的 `default`（本槽 IP）。
-    /// 所以必须把各槽的运行时选择清零 —— 下一轮 `drive_slots` 就会无条件重 PUT，
-    /// 而不是去赌 sing-box 的 `cache_file` 有没有把 selector 的选择持久化下来。
+    /// **没被重放的**槽（这里 state 里没有槽位，无从重放）必须把运行时选择清零 —— 下一轮
+    /// `drive_slots` 就会无条件重 PUT，而不是去赌 sing-box 的 `cache_file` 有没有把
+    /// selector 的选择持久化下来。借用 / pin 中的槽会被重放回去，见下面的重放用例。
     #[tokio::test]
     async fn a_relay_restart_clears_every_slot_selection() {
         let d = tempfile::tempdir().unwrap();
@@ -2272,5 +2484,257 @@ mod tests {
             r.slots["1"].back_rounds, 2,
             "切回轮数不清：它记的是「本槽自己健康了几轮」，与 relay 重启无关"
         );
+    }
+
+    // ── relay 重启后的重放：退避重试 + 覆盖各槽 selector ─────────────────────────
+
+    /// 带槽位的 ctx：`n` 条上游（priority 全 10），槽 i ↔ 上游 `i+1`（`resi-(i+1)`）
+    async fn slot_ctx(d: &tempfile::TempDir, n: usize) -> DaemonCtx {
+        let (c, _h) = ctx(d, &vec![10; n]).await;
+        crate::modules::residential::slots::migrate_on_start(&c.store, &c.bus)
+            .await
+            .unwrap();
+        c
+    }
+
+    fn slot_rt(
+        current: Option<u128>,
+        pinned: Option<u128>,
+        back_rounds: u32,
+    ) -> rstate::SlotRuntime {
+        rstate::SlotRuntime {
+            current_upstream_id: current.map(Uuid::from_u128),
+            pinned_upstream_id: pinned.map(Uuid::from_u128),
+            back_rounds,
+        }
+    }
+
+    /// 2026-09-13 04:05:47 UTC bwg-rick 实录：每日黑名单批量重启 b-ui-relay，replay_loop
+    /// 收到事件的那一刻 Clash API 还没起监听，重放一次失败就放弃了；而且只重放全局
+    /// resi-pool，借用 / pin 中的槽 selector 被 relay 打回默认。现在：每轮先探 API 可用
+    /// 再 select，连接类失败按退避重试；全局与各槽的选择都要恢复。
+    #[tokio::test(start_paused = true)]
+    async fn a_relay_restart_retries_until_the_clash_api_is_up_and_replays_every_selector() {
+        let d = tempfile::tempdir().unwrap();
+        let c = slot_ctx(&d, 3).await;
+        rstate::update(&c.runtime, |r| {
+            r.selected_upstream_id = Some(Uuid::from_u128(2));
+            // 槽 0 用的就是本槽 IP（= selector 的 default），不必重放
+            r.slots.insert("0".into(), slot_rt(Some(1), None, 0));
+            // 槽 1 正借用 resi-3，本槽已恢复 1 轮
+            r.slots.insert("1".into(), slot_rt(Some(3), None, 1));
+            // 槽 2 被管理员 pin 到 resi-1
+            r.slots.insert("2".into(), slot_rt(Some(1), Some(1), 0));
+            rstate::push_alert(r, "机器上没有 journalctl，黑名单候选只能靠每日探针集");
+            rstate::push_alert(
+                r,
+                format!(
+                    "{REPLAY_FAIL_ALERT}（resi-pool → resi-2：Clash API 不可达），下一轮巡检兜底"
+                ),
+            );
+        })
+        .await;
+        // relay 刚重启：前两次连 Clash API 都被拒
+        let clash = Arc::new(FakeClash::new(Some("resi-1")));
+        clash.with(|i| i.refuse = 2);
+
+        let out = replay_after_restart(&c, clash.clone()).await;
+
+        assert!(out.failed.is_empty(), "{out:?}");
+        assert_eq!(
+            clash.calls(),
+            vec![
+                "ready",
+                "ready",
+                "ready",
+                "put:resi-pool:resi-2",
+                "put:slot-1-pool:resi-3",
+                "put:slot-2-pool:resi-1",
+            ],
+            "每轮先探 Clash API 可用再 select；探不通的那两轮一个 PUT 都不发"
+        );
+        assert_eq!(clash.peek(POOL).as_deref(), Some("resi-2"));
+        assert_eq!(
+            clash.peek("slot-1-pool").as_deref(),
+            Some("resi-3"),
+            "借用中的槽重放回借用目标"
+        );
+        assert_eq!(
+            clash.peek("slot-2-pool").as_deref(),
+            Some("resi-1"),
+            "pin 住的槽重放回 pin"
+        );
+        assert_eq!(clash.peek("slot-0-pool"), None, "用本槽 IP 的槽不发 PUT");
+        let r = rstate::read(&c.runtime).await;
+        assert_eq!(r.slots["1"].current_upstream_id, Some(Uuid::from_u128(3)));
+        assert_eq!(r.slots["1"].back_rounds, 1);
+        assert_eq!(r.slots["2"].current_upstream_id, Some(Uuid::from_u128(1)));
+        assert_eq!(
+            r.slots["0"].current_upstream_id, None,
+            "不重放的槽照旧清零 ⇒ 下一轮 drive_slots 无条件重 PUT 本槽"
+        );
+        assert_eq!(
+            r.alerts,
+            vec!["机器上没有 journalctl，黑名单候选只能靠每日探针集".to_string()],
+            "全部成功 ⇒ 认领上一次重放失败留下的告警，别的告警不动"
+        );
+    }
+
+    /// 槽 1 借用中遇上 relay 重启：selector 被重放回借用目标，而且切回防抖不被重启清掉 ——
+    /// 以前 current 被清零，下一轮 drive_slots 会跳过「攒满 3 轮」直接切回本槽。
+    /// 运行时还没选过全局出口：旧实现在这里直接 continue，一个槽都不重放。
+    #[tokio::test]
+    async fn a_borrowing_slot_is_replayed_to_its_borrow_target_and_keeps_its_debounce() {
+        let d = tempfile::tempdir().unwrap();
+        let c = slot_ctx(&d, 3).await;
+        rstate::update(&c.runtime, |r| {
+            r.slots.insert("1".into(), slot_rt(Some(3), None, 1));
+        })
+        .await;
+        let clash = Arc::new(FakeClash::new(Some("resi-1")));
+
+        let out = replay_after_restart(&c, clash.clone()).await;
+
+        assert_eq!(
+            out.replayed,
+            vec![("slot-1-pool".to_string(), "resi-3".to_string())]
+        );
+        assert!(out.failed.is_empty(), "{out:?}");
+        assert_eq!(clash.peek("slot-1-pool").as_deref(), Some("resi-3"));
+        // 下一轮巡检：本槽已健康，但借用中要攒满 SLOT_BACK_ROUNDS 轮才切回
+        let g = rstate::group_of(&*c.store.read().await);
+        let all = ids_of(&g);
+        let o = crate::modules::residential::slots::drive_slots(
+            &c,
+            clash.clone(),
+            &g,
+            &all,
+            OffsetDateTime::UNIX_EPOCH,
+        )
+        .await;
+        let s1 = o.iter().find(|o| o.index == 1).unwrap();
+        assert!(s1.borrowed && !s1.switched, "{s1:?}");
+        assert_eq!(clash.peek("slot-1-pool").as_deref(), Some("resi-3"));
+        assert_eq!(rstate::read(&c.runtime).await.slots["1"].back_rounds, 2);
+    }
+
+    /// Clash API 一直起不来：退避总时长封顶 [`REPLAY_RETRY_BUDGET`]，之后写一条告警、
+    /// 把重放失败的槽交还给下一轮 drive_slots（current 清零 ⇒ 无条件重 PUT），全局选择
+    /// 由下一轮规则 6a 兜底；replay_loop 本身不 panic、继续收事件。
+    #[tokio::test(start_paused = true)]
+    async fn a_clash_api_that_never_comes_up_leaves_an_alert_and_hands_over_to_the_next_round() {
+        let d = tempfile::tempdir().unwrap();
+        let c = slot_ctx(&d, 3).await;
+        rstate::update(&c.runtime, |r| {
+            r.selected_upstream_id = Some(Uuid::from_u128(2));
+            r.slots.insert("1".into(), slot_rt(Some(3), None, 1));
+        })
+        .await;
+        let clash = Arc::new(FakeClash::new(Some("resi-1")));
+        clash.with(|i| i.refuse = u32::MAX);
+
+        let t0 = tokio::time::Instant::now();
+        let out = replay_after_restart(&c, clash.clone()).await;
+        let waited = t0.elapsed();
+
+        assert!(
+            waited <= REPLAY_RETRY_BUDGET,
+            "退避总时长超预算：{waited:?}"
+        );
+        assert!(
+            waited > REPLAY_RETRY_BUDGET / 2,
+            "预算没用满就放弃了：{waited:?}"
+        );
+        assert!(out.replayed.is_empty(), "{out:?}");
+        assert_eq!(
+            out.failed
+                .iter()
+                .map(|(s, t, _)| (s.as_str(), t.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("resi-pool", "resi-2"), ("slot-1-pool", "resi-3")]
+        );
+        let calls = clash.calls();
+        assert!(
+            calls.iter().filter(|c| *c == "ready").count() >= 5,
+            "{calls:?}"
+        );
+        assert!(
+            calls.iter().all(|c| !c.starts_with("put:")),
+            "探不通就不发 PUT：{calls:?}"
+        );
+        let r = rstate::read(&c.runtime).await;
+        assert_eq!(r.alerts.len(), 1, "{:?}", r.alerts);
+        assert!(r.alerts[0].starts_with(REPLAY_FAIL_ALERT), "{:?}", r.alerts);
+        assert!(
+            r.alerts[0].contains("resi-pool") && r.alerts[0].contains("slot-1-pool"),
+            "{:?}",
+            r.alerts
+        );
+        assert_eq!(
+            r.slots["1"].current_upstream_id, None,
+            "重放失败的槽交还给下一轮 drive_slots 无条件重 PUT"
+        );
+        assert_eq!(
+            r.selected_upstream_id,
+            Some(Uuid::from_u128(2)),
+            "运行时选择是真源，不因重放失败改动（规则 6a 下一轮会把它重放回去）"
+        );
+
+        // 同样的失败发生在 replay_loop 里：只写告警，循环还活着
+        let rx = c.bus.subscribe();
+        let task = tokio::spawn(replay_loop(c.clone(), clash.clone(), rx));
+        c.bus.send(Event::RelayRestarted);
+        tokio::time::sleep(REPLAY_RETRY_BUDGET * 2).await;
+        assert!(!task.is_finished(), "重放失败不许把 replay_loop 带崩");
+        task.abort();
+    }
+
+    /// Clash 明确拒绝（selector / 成员不存在，HTTP 4xx）不是「还没起来」，重试也没用：
+    /// 当轮就记失败，不退避。
+    #[tokio::test(start_paused = true)]
+    async fn a_rejected_replay_is_not_retried() {
+        let d = tempfile::tempdir().unwrap();
+        let c = slot_ctx(&d, 2).await;
+        rstate::update(&c.runtime, |r| {
+            r.selected_upstream_id = Some(Uuid::from_u128(2))
+        })
+        .await;
+        let clash = Arc::new(FakeClash::new(Some("resi-1")));
+        clash.with(|i| i.reject = true);
+
+        let t0 = tokio::time::Instant::now();
+        let out = replay_after_restart(&c, clash.clone()).await;
+
+        assert!(t0.elapsed() < REPLAY_RETRY_FIRST, "{:?}", t0.elapsed());
+        assert_eq!(clash.calls(), vec!["ready", "put:resi-pool:resi-2"]);
+        assert_eq!(out.failed.len(), 1, "{out:?}");
+        assert!(rstate::read(&c.runtime)
+            .await
+            .alerts
+            .iter()
+            .any(|a| a.starts_with(REPLAY_FAIL_ALERT)));
+    }
+
+    /// 池未启用 ⇒ relay 里一个 selector 都没有（fail-open 直连），没什么可重放，
+    /// 更不能退避 15 秒后写一条假告警。
+    #[tokio::test]
+    async fn a_disabled_pool_has_nothing_to_replay() {
+        let d = tempfile::tempdir().unwrap();
+        let c = slot_ctx(&d, 2).await;
+        rstate::update(&c.runtime, |r| {
+            r.selected_upstream_id = Some(Uuid::from_u128(2))
+        })
+        .await;
+        rstate::update_group(&c.store, &c.bus, |g| g.enabled = false)
+            .await
+            .unwrap();
+        let clash = Arc::new(FakeClash::new(Some("resi-1")));
+        clash.with(|i| i.refuse = u32::MAX);
+
+        let out = replay_after_restart(&c, clash.clone()).await;
+
+        assert_eq!(out, ReplayOutcome::default());
+        assert!(clash.calls().is_empty(), "{:?}", clash.calls());
+        assert!(rstate::read(&c.runtime).await.alerts.is_empty());
     }
 }
