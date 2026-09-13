@@ -75,6 +75,20 @@ pub fn probe_member(p: &dyn Prober, up: &Upstream) -> MemberProbe {
     probe
 }
 
+/// 哨兵（spec §5.7，设计裁决 D5）的带外快探：先量到上游网关的 TCP 建连，**连不上直接判不可达**
+/// ——网关都连不上，隧道不可能通，再等一次 HTTP 超时只会拖慢预案（上游被丢包时巡检那套
+/// [`probe_member`] 要走 ~40 秒）；连得上再走一轮与巡检同口径的 [`probe_reachable`]（含 407 补判）。
+/// **不测 Google / UDP / 测速**：那些是巡检的指标，预案只关心「这条上游此刻还能不能用」。
+/// 超时由调用方的 `Prober` 决定（哨兵用 `ReqwestProber::with_timeout(5)`）。
+pub fn probe_quick(p: &dyn Prober, up: &Upstream) -> MemberProbe {
+    let Some(tcp_ms) = p.gateway_tcp_ms(up) else {
+        return MemberProbe::default();
+    };
+    let mut probe = probe_reachable(p, up);
+    probe.tcp_ms = Some(tcp_ms);
+    probe
+}
+
 /// 可达性那一半：最多 [`HEALTH_TRIES`] 次，任一成功即本轮健康。
 /// **第 1 次打 [`super::LATENCY_PROBE_URL`] 并计时**——延迟样本与连通性判定复用同一次
 /// 请求，所以加了指标之后健康成员每轮的 HTTP 请求数没变（主理人口径「避免多发」）；
@@ -2736,5 +2750,59 @@ mod tests {
         assert_eq!(out, ReplayOutcome::default());
         assert!(clash.calls().is_empty(), "{:?}", clash.calls());
         assert!(rstate::read(&c.runtime).await.alerts.is_empty());
+    }
+
+    // ── 哨兵的带外快探（spec §5.7，设计裁决 D5）──
+
+    #[test]
+    fn the_quick_probe_gives_up_at_once_when_the_gateway_is_unreachable() {
+        let p = crate::modules::residential::proxy::FakeProber::new(); // tcp_ms 缺省 None = 连不上
+        let r = probe_quick(&p, &upstream(2, 10));
+        assert!(!r.ok && !r.auth_failed);
+        assert_eq!(
+            p.calls(),
+            vec!["tcp"],
+            "网关都连不上就不再发 HTTP（丢包时每次都要等满超时）"
+        );
+    }
+
+    #[test]
+    fn the_quick_probe_tunnels_once_when_the_gateway_answers() {
+        let p = crate::modules::residential::proxy::FakeProber::new();
+        p.with(|i| {
+            i.tcp_ms = Some(30);
+            i.gets.insert(
+                crate::modules::residential::LATENCY_PROBE_URL.into(),
+                Ok(HttpProbe {
+                    status: 204,
+                    body: String::new(),
+                }),
+            );
+        });
+        let r = probe_quick(&p, &upstream(2, 10));
+        assert!(r.ok);
+        assert_eq!(r.tcp_ms, Some(30));
+        assert_eq!(
+            p.calls(),
+            vec![
+                "tcp".to_string(),
+                format!("timed:{}", crate::modules::residential::LATENCY_PROBE_URL)
+            ],
+            "快探不测 Google / UDP / 测速"
+        );
+    }
+
+    #[test]
+    fn the_quick_probe_still_tells_a_credential_failure_apart() {
+        let p = crate::modules::residential::proxy::FakeProber::new();
+        p.with(|i| {
+            i.tcp_ms = Some(30);
+            i.gets.insert(
+                crate::modules::residential::LATENCY_PROBE_URL.into(),
+                Err("__auth_failed__".into()),
+            );
+        });
+        let r = probe_quick(&p, &upstream(2, 10));
+        assert!(!r.ok && r.auth_failed);
     }
 }
