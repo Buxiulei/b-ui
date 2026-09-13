@@ -84,6 +84,9 @@ pub trait Host: Send + Sync {
     fn hostname(&self) -> Result<String>;
     fn listening_ports(&self, proto: Proto) -> Result<BTreeSet<u16>>;
     fn now(&self) -> time::OffsetDateTime;
+    /// 读 `units` 在 `from` 之后的新日志（日志哨兵，spec §5.7）。journalctl 不存在 →
+    /// `Err(JOURNALCTL_MISSING)`；游标失效等非零退出 → `Err`（调用方丢游标、从「现在」重来）。
+    fn journal_read(&self, units: &[String], from: &JournalFrom) -> Result<Vec<JournalRecord>>;
 }
 
 /// 单元名归一化：不含 `.` 的裸名补 `.service`，已带后缀（`.service` / `.timer`）原样返回。
@@ -103,6 +106,108 @@ fn cmd_line(program: &str, args: &[&str]) -> String {
     } else {
         format!("{program} {}", args.join(" "))
     }
+}
+
+/// 日志哨兵（spec §5.7）读 journald 的起点。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JournalFrom {
+    /// 上一轮读到的最后一条的 `__CURSOR`：只读它之后的新条目
+    Cursor(String),
+    /// 没有游标（首次启动 / 游标失效）：从这一刻读起，**不回放历史**
+    Since(time::OffsetDateTime),
+}
+
+/// `journalctl -o json` 的一条记录，只留哨兵要的四样。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournalRecord {
+    /// `__CURSOR`：下一轮 `--after-cursor` 的参数
+    pub cursor: String,
+    /// 裸单元名（`xray`，不带 `.service`）
+    pub unit: String,
+    /// `__REALTIME_TIMESTAMP`（微秒）换成的 UTC 时刻
+    pub ts: time::OffsetDateTime,
+    /// 去掉 ANSI 色码的 `MESSAGE`；带 tracing-journald 的 `F_ERROR` 字段时追加 ` error=<值>`
+    pub message: String,
+}
+
+/// `journal_read` 在机器上找不到 journalctl 时的错误文案。
+pub const JOURNALCTL_MISSING: &str = "机器上没有 journalctl";
+
+/// `journalctl` 的参数：`-o json` 每行一条、`-q` 不打「-- No entries --」、每个单元一个 `-u`；
+/// 有游标用 `--after-cursor`，否则 `--since @<unix 秒>`（systemd.time(7) 的 `@` 写法，与时区无关）。
+pub fn journal_args(units: &[String], from: &JournalFrom) -> Vec<String> {
+    let mut v: Vec<String> = ["--no-pager", "-q", "-o", "json"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    for u in units {
+        v.push("-u".into());
+        v.push(unit_full(u));
+    }
+    match from {
+        JournalFrom::Cursor(c) => {
+            v.push("--after-cursor".into());
+            v.push(c.clone());
+        }
+        JournalFrom::Since(t) => {
+            v.push("--since".into());
+            v.push(format!("@{}", t.unix_timestamp()));
+        }
+    }
+    v
+}
+
+/// journald 的 JSON 字段值 → 文本。字段里含不可打印字节（sing-box 的 ANSI 色码就是 ESC）时，
+/// `journalctl -o json` 把它编成**字节数组**而不是字符串。
+fn journal_text(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Array(a) => {
+            let bytes = a
+                .iter()
+                .map(|b| b.as_u64().and_then(|n| u8::try_from(n).ok()))
+                .collect::<Option<Vec<u8>>>()?;
+            Some(String::from_utf8_lossy(&bytes).into_owned())
+        }
+        _ => None,
+    }
+}
+
+fn bare_unit(u: &str) -> String {
+    u.strip_suffix(".service").unwrap_or(u).to_string()
+}
+
+/// 解析 `journalctl -o json` 的输出（每行一个 JSON 对象）。不在 `units` 里的记录、缺字段的行、
+/// 非 JSON 行一律丢掉。单元名先看 `UNIT` 再看 `_SYSTEMD_UNIT`：systemd 自己关于某单元的消息
+/// （「Start request repeated too quickly」「restart counter is at 5」）的 `_SYSTEMD_UNIT` 是
+/// `init.scope`，单元名在 `UNIT` 里。
+pub fn parse_journal_json(stdout: &str, units: &[String]) -> Vec<JournalRecord> {
+    let want: BTreeSet<String> = units.iter().map(|u| bare_unit(u)).collect();
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+            let cursor = v.get("__CURSOR")?.as_str()?.to_string();
+            let us: i128 = v.get("__REALTIME_TIMESTAMP")?.as_str()?.parse().ok()?;
+            let ts = time::OffsetDateTime::from_unix_timestamp_nanos(us * 1000).ok()?;
+            let unit = ["UNIT", "_SYSTEMD_UNIT"]
+                .iter()
+                .filter_map(|k| v.get(*k).and_then(|x| x.as_str()))
+                .map(bare_unit)
+                .find(|u| want.contains(u))?;
+            let mut message = journal_text(v.get("MESSAGE")?)?;
+            if let Some(e) = v.get("F_ERROR").and_then(journal_text) {
+                message.push_str(" error=");
+                message.push_str(&e);
+            }
+            Some(JournalRecord {
+                cursor,
+                unit,
+                ts,
+                message: crate::util::strip_ansi(&message),
+            })
+        })
+        .collect()
 }
 
 /// `/proc/net/{tcp,udp,tcp6,udp6}` 的本地端口解析。
@@ -255,5 +360,134 @@ mod tests {
         let h3 = fake::FakeHost::new();
         h3.with(|i| i.scripted.push(("curl".into(), CmdOut::failure(7, "x"))));
         assert_eq!(probe_public_ip(&h3), "");
+    }
+
+    fn j0() -> time::OffsetDateTime {
+        time::macros::datetime!(2026-09-11 00:00:00 UTC)
+    }
+
+    /// `__REALTIME_TIMESTAMP` 是**微秒**的十进制串
+    fn us(secs: i64) -> String {
+        ((j0().unix_timestamp() + secs) * 1_000_000).to_string()
+    }
+
+    /// 真机三种形态：① sing-box 带色输出（含 ESC ⇒ journald 把 MESSAGE 编成字节数组）
+    /// ② systemd 关于某单元的消息（`_SYSTEMD_UNIT=init.scope`，单元名在 `UNIT`）
+    /// ③ 守护进程自己的 tracing 事件（tracing-journald 0.3.2 默认前缀：`error` 字段落在 `F_ERROR`）
+    #[test]
+    fn journal_json_decodes_byte_arrays_systemd_messages_and_tracing_error_fields() {
+        let units: Vec<String> = ["b-ui-relay", "xray", "b-ui"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let colored = "\x1b[31mERROR\x1b[0m[4006] [\x1b[38;5;48m2302991392\x1b[0m 6.42s] \
+                       connection: open connection to www.gstatic.com:443 using \
+                       outbound/socks[resi-2]: dial tcp 198.51.100.8:10007: i/o timeout";
+        let l1 = serde_json::json!({"__CURSOR": "s=a;i=1", "__REALTIME_TIMESTAMP": us(1),
+            "_SYSTEMD_UNIT": "b-ui-relay.service", "MESSAGE": colored.as_bytes()})
+        .to_string();
+        let l2 = serde_json::json!({"__CURSOR": "s=a;i=2", "__REALTIME_TIMESTAMP": us(2),
+            "_SYSTEMD_UNIT": "init.scope", "UNIT": "xray.service",
+            "MESSAGE": "xray.service: Start request repeated too quickly."})
+        .to_string();
+        let l3 = serde_json::json!({"__CURSOR": "s=a;i=3", "__REALTIME_TIMESTAMP": us(3),
+            "_SYSTEMD_UNIT": "b-ui.service", "MESSAGE": "用户同步有失败项，下一轮安全网会重试",
+            "F_ERROR": "AddUser vless-direct 失败：code: 'The service is currently unavailable'"})
+        .to_string();
+        // 不在单元集合里 / 非 JSON / 缺 __CURSOR：一律丢掉
+        let l4 = serde_json::json!({"__CURSOR": "s=a;i=4", "__REALTIME_TIMESTAMP": us(4),
+            "_SYSTEMD_UNIT": "sshd.service", "MESSAGE": "Accepted publickey"})
+        .to_string();
+        let l6 = serde_json::json!({"__REALTIME_TIMESTAMP": us(5),
+            "_SYSTEMD_UNIT": "xray.service", "MESSAGE": "x"})
+        .to_string();
+        let text = [l1, l2, l3, l4, "-- No entries --".to_string(), l6].join("\n");
+        let out = parse_journal_json(&text, &units);
+        assert_eq!(out.len(), 3, "{out:?}");
+        assert_eq!(out[0].unit, "b-ui-relay");
+        assert_eq!(out[0].cursor, "s=a;i=1");
+        assert_eq!(out[0].ts, j0() + time::Duration::seconds(1));
+        assert!(
+            out[0].message.starts_with(
+                "ERROR[4006] [2302991392 6.42s] connection: open connection to www.gstatic.com:443"
+            ),
+            "{}",
+            out[0].message
+        );
+        assert!(!out[0].message.contains('\x1b'), "色码必须剥掉");
+        assert_eq!(out[1].unit, "xray", "systemd 自己的消息按 UNIT 归属");
+        assert_eq!(
+            out[2].message,
+            "用户同步有失败项，下一轮安全网会重试 error=AddUser vless-direct 失败：\
+             code: 'The service is currently unavailable'"
+        );
+    }
+
+    #[test]
+    fn journal_args_use_after_cursor_or_an_epoch_since() {
+        let units = vec![
+            "b-ui-relay".to_string(),
+            "hysteria-residential-1".to_string(),
+        ];
+        assert_eq!(
+            journal_args(&units, &JournalFrom::Cursor("s=abc;i=9".into())),
+            [
+                "--no-pager",
+                "-q",
+                "-o",
+                "json",
+                "-u",
+                "b-ui-relay.service",
+                "-u",
+                "hysteria-residential-1.service",
+                "--after-cursor",
+                "s=abc;i=9"
+            ]
+            .map(String::from)
+            .to_vec()
+        );
+        let since = journal_args(&units, &JournalFrom::Since(j0()));
+        assert_eq!(
+            since[since.len() - 2..].to_vec(),
+            vec!["--since".to_string(), format!("@{}", j0().unix_timestamp())],
+            "systemd.time(7) 的 @<unix 秒> 写法，与时区无关"
+        );
+    }
+
+    #[test]
+    fn the_fake_journal_pops_scripted_batches_and_records_where_it_read_from() {
+        let h = fake::FakeHost::new();
+        let r = JournalRecord {
+            cursor: "c1".into(),
+            unit: "xray".into(),
+            ts: j0(),
+            message: "m".into(),
+        };
+        h.with(|i| {
+            i.journal.push_back(Ok(vec![r.clone()]));
+            i.journal.push_back(Err("Failed to seek to cursor".into()));
+        });
+        let units = vec!["xray".to_string(), "caddy".to_string()];
+        assert_eq!(
+            h.journal_read(&units, &JournalFrom::Since(j0())).unwrap(),
+            vec![r]
+        );
+        assert!(h
+            .journal_read(&units, &JournalFrom::Cursor("c1".into()))
+            .is_err());
+        assert!(
+            h.journal_read(&units, &JournalFrom::Cursor("c1".into()))
+                .unwrap()
+                .is_empty(),
+            "弹空后返回空批"
+        );
+        assert_eq!(
+            h.ops(),
+            vec![
+                "journal:xray,caddy:since=2026-09-11T00:00:00Z",
+                "journal:xray,caddy:cursor=c1",
+                "journal:xray,caddy:cursor=c1"
+            ]
+        );
     }
 }

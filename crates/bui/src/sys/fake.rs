@@ -5,9 +5,10 @@
 //! `write:<path>:<mode 八进制三位>`、`remove:<path>`、`rmdir:<path>`、
 //! `symlink:<link>-><target>`、`chattr:+i:<path>` / `chattr:-i:<path>`、`daemon-reload`、
 //! `systemd:<verb>:<unit>`、`sysctl:<key>=<value>`、`modprobe:<module>`、
-//! `run:<program> <args 以空格连接>`。
+//! `run:<program> <args 以空格连接>`、`journal:<units 以逗号连接>:cursor=<c>` /
+//! `journal:<units>:since=<RFC3339>`。
 
-use super::{cmd_line, unit_full, CmdOut, Host, Proto};
+use super::{cmd_line, unit_full, CmdOut, Host, JournalFrom, JournalRecord, Proto};
 use anyhow::Result;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -42,6 +43,9 @@ pub struct FakeInner {
     pub arch: String,
     pub hostname: String,
     pub now: time::OffsetDateTime,
+    /// `journal_read` 的脚本化返回，按调用顺序逐个弹出；弹空后返回 `Ok(vec![])`。
+    /// `Err(文案)` 模拟 journalctl 失败（游标失效 / 没装）。
+    pub journal: std::collections::VecDeque<Result<Vec<JournalRecord>, String>>,
     /// 操作流水（顺序可断言）
     pub ops: Vec<String>,
 }
@@ -71,6 +75,7 @@ impl Default for FakeInner {
             arch: "x86_64".into(),
             hostname: "node-a".into(),
             now: time::macros::datetime!(2026-09-11 00:00:00 UTC),
+            journal: std::collections::VecDeque::new(),
             ops: Vec::new(),
         }
     }
@@ -357,6 +362,20 @@ impl Host for FakeHost {
 
     fn now(&self) -> time::OffsetDateTime {
         self.lock().now
+    }
+
+    fn journal_read(&self, units: &[String], from: &JournalFrom) -> Result<Vec<JournalRecord>> {
+        let from = match from {
+            JournalFrom::Cursor(c) => format!("cursor={c}"),
+            JournalFrom::Since(t) => format!("since={}", crate::util::fmt_rfc3339(*t)),
+        };
+        let mut i = self.lock();
+        i.ops.push(format!("journal:{}:{from}", units.join(",")));
+        match i.journal.pop_front() {
+            Some(Ok(v)) => Ok(v),
+            Some(Err(e)) => Err(anyhow::anyhow!(e)),
+            None => Ok(Vec::new()),
+        }
     }
 }
 

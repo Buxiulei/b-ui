@@ -292,6 +292,24 @@ impl Host for RealHost {
     fn now(&self) -> time::OffsetDateTime {
         time::OffsetDateTime::now_utc()
     }
+
+    fn journal_read(
+        &self,
+        units: &[String],
+        from: &super::JournalFrom,
+    ) -> Result<Vec<super::JournalRecord>> {
+        if !self.which("journalctl") {
+            bail!(super::JOURNALCTL_MISSING);
+        }
+        let args = super::journal_args(units, from);
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = self.run("journalctl", &refs)?;
+        if !out.ok() {
+            // 游标失效（日志轮转 / vacuum 之后）就是这一支：调用方丢游标、从「现在」重来
+            bail!("journalctl 退出码 {}：{}", out.status, out.stderr.trim());
+        }
+        Ok(super::parse_journal_json(&out.stdout, units))
+    }
 }
 
 #[cfg(test)]
