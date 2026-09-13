@@ -373,8 +373,15 @@ fn store_fetched<S: Sys, N: Net, P: Prompt>(
         }
         out.names.push(name);
     }
+    // panel 是 root 自更新的来源：换掉它必须让人看见。同一个面板只跟着改用户名，不出声
     if let Some(p) = panel {
-        prof.panel = Some(p);
+        match prof.panel.as_mut() {
+            Some(cur) if cur.base_url == p.base_url => cur.username = p.username,
+            _ => {
+                ctx.say(format!("自动更新来源改为 {}", p.base_url));
+                prof.panel = Some(p);
+            }
+        }
     }
     for skip in &f.skipped {
         ctx.say(format!("跳过无法解析的行：{skip}…"));
@@ -434,6 +441,7 @@ fn save_import<S: Sys, N: Net, P: Prompt>(
     activate: bool,
 ) -> Result<()> {
     let mut prof = Profiles::load(ctx.sys, ctx.paths)?;
+    let loaded = prof.clone();
     let had_active = prof.active_profile().is_some();
     let stored = store_fetched(ctx, &mut prof, &inc.fetched, inc.src, inc.panel);
     if activate || !had_active {
@@ -441,7 +449,10 @@ fn save_import<S: Sys, N: Net, P: Prompt>(
             prof.active = Some(name.clone());
         }
     }
-    prof.save(ctx.sys, ctx.paths)?;
+    // 什么都没变（重复导入同一个面板）就不重写 profiles.json
+    if prof != loaded {
+        prof.save(ctx.sys, ctx.paths)?;
+    }
     ctx.say(format!(
         "导入 {} 个新节点，共 {} 个",
         stored.added,
@@ -1683,6 +1694,73 @@ mod tests {
         assert_eq!(hy2_credentials(&saved.profiles[0]), ("u1", "pw-rotated"));
         assert!(t.contains("更新节点 panel.example.com-hy2-direct"), "{t}");
         assert!(!t.contains("占用"), "同一账号不算占用：{t}");
+    }
+
+    /// 换掉自动更新来源（= root 自更新的 manifest 与二进制来源）要让人看见；同一个面板重复
+    /// 导入不出声，也不动 profiles.json 的一个字节。
+    #[test]
+    fn changing_the_update_source_is_announced_and_a_repeat_import_changes_nothing() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        let t = import_from_panel(&s, &pp, "alice", vec![hy2_direct_node()]);
+        assert!(
+            t.lines()
+                .any(|l| l == "自动更新来源改为 https://panel.example.com"),
+            "从无到有也是换来源：\n{t}"
+        );
+
+        let before = s.get("/opt/bui-c/profiles.json").unwrap();
+        let t = import_from_panel(&s, &pp, "alice", vec![hy2_direct_node()]);
+        assert!(!t.contains("自动更新来源"), "来源没变不出声：\n{t}");
+        assert!(t.contains("节点 alice-hy2-direct 无变化"), "{t}");
+        assert_eq!(
+            s.get("/opt/bui-c/profiles.json").unwrap(),
+            before,
+            "节点无变化且面板相同：profiles.json 逐字节不变"
+        );
+
+        // 同一个面板换了用户名：只更新 username，不提示
+        let t = import_from_panel(&s, &pp, "bob", vec![hy2_direct_node()]);
+        assert!(!t.contains("自动更新来源"), "{t}");
+        let saved = Profiles::load(&s, &pp).unwrap();
+        assert_eq!(
+            saved
+                .panel
+                .as_ref()
+                .map(|x| (x.base_url.as_str(), x.username.as_str())),
+            Some(("https://panel.example.com", "bob"))
+        );
+
+        // 换了面板：写并提示
+        let n = FakeNet::new();
+        n.route(
+            "https://other.example.com/api/nodes/bob",
+            nodes_payload("bob", vec![hy2_direct_node()]),
+        );
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(
+            &parse(&[
+                "import",
+                "--panel",
+                "https://other.example.com",
+                "--user",
+                "bob",
+            ]),
+            &mut ctx,
+        )
+        .unwrap();
+        let t = ctx.transcript.clone();
+        assert!(
+            t.lines()
+                .any(|l| l == "自动更新来源改为 https://other.example.com"),
+            "{t}"
+        );
+        assert_eq!(
+            Profiles::load(&s, &pp).unwrap().panel.map(|x| x.base_url),
+            Some("https://other.example.com".to_string())
+        );
     }
 
     /// 同一批里两个账号定出同一个名字（粘贴 / 订阅可能混入多个用户）：upsert 逐个做，
