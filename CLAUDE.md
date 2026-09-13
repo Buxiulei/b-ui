@@ -61,7 +61,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace                     # 内核校验用例在 PATH 上找 sing-box / xray / hysteria，缺则 skip
 
 # Shell 侧（install.sh 与 scripts/；git 的 ** 要求中间至少一层目录，所以过滤后缀而不是写 pathspec 通配）
-bash -n install.sh $(git ls-files -- scripts | grep -E '\.sh$')
+# bash -n 只检查第一个文件（其余都成了它的位置参数），所以逐文件跑；shellcheck 认多文件
+rc=0; for f in install.sh $(git ls-files -- scripts | grep -E '\.sh$'); do bash -n "$f" || rc=1; done; [ "$rc" = 0 ]
 shellcheck -S error install.sh $(git ls-files -- scripts | grep -E '\.sh$')
 bash scripts/tests/run-all.sh
 
