@@ -43,10 +43,13 @@ pub fn node_uri(raw: &str) -> Result<Node, ParseError> {
             // 解码后再按第一个 `:` 拆一次——与 hysteria 服务端 userpass 的拆法一致。
             let (username, password) = match u.password() {
                 Some(p) => (decode(u.username())?, decode(p)?),
-                None => match decode(u.username())?.split_once(':') {
-                    Some((a, b)) => (a.to_string(), b.to_string()),
-                    None => (decode(u.username())?, String::new()),
-                },
+                None => {
+                    let whole = decode(u.username())?;
+                    match whole.split_once(':') {
+                        Some((a, b)) => (a.to_string(), b.to_string()),
+                        None => (whole, String::new()),
+                    }
+                }
             };
             if username.is_empty() || password.is_empty() {
                 return Err(ParseError::Other("hysteria2 URI 缺少用户名或密码".into()));
