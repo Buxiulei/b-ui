@@ -345,6 +345,11 @@ fn with_panel_override<S: Sys>(sys: &S, prof: &Profiles) -> Profiles {
     out
 }
 
+/// apply 之后 bui-tun 接口没起来时打的那一行。菜单切节点靠它认出「切了，但 TUN 没通」
+/// （[`switch_node`]），所以打印与识别共用这一个常量。
+const TUN_NOT_READY: &str =
+    "警告：bui-c.service 已启动但 bui-tun 接口未就绪，查 `journalctl -u bui-c`";
+
 /// 唯一的「改机器」路径：装内核 → 同步 UFW → apply。
 fn apply_with_ufw<S: Sys, N: Net, P: Prompt>(
     ctx: &mut Ctx<'_, S, N, P>,
@@ -378,7 +383,7 @@ fn apply_with_ufw<S: Sys, N: Net, P: Prompt>(
     }
     let applied = Engine::new(ctx.sys, ctx.paths).apply(prof)?;
     if applied.tun_ready == Some(false) {
-        ctx.say("警告：bui-c.service 已启动但 bui-tun 接口未就绪，查 `journalctl -u bui-c`");
+        ctx.say(TUN_NOT_READY);
     }
     Ok(applied)
 }
@@ -1003,7 +1008,9 @@ fn note<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>, text: impl Into<S
 
 /// 菜单里切节点（[1] 选编号、[3] 导入后答 y）：经 [`run_sub`] 转手 `Cmd::Switch`，停不停照
 /// [`outcome_since`]。摘要显式写切换的结果（spec §11.2），不取第一行：TUN 下第一次切换时第一行
-/// 是「已为 bui-tun 接口放行 UFW…」。失败照旧用「失败：…」那一行。
+/// 是「已为 bui-tun 接口放行 UFW…」。失败照旧用「失败：…」那一行。切过去了但 apply 报了
+/// [`TUN_NOT_READY`]：摘要写「已切到 X，但 bui-tun 没起来」——「上次：」行是给回到主菜单的人
+/// 记成败的（spec §4.2），不能把没通说成切好了。
 ///
 /// 摘要里的节点名按当前宽度单独中间截断（spec §0.2 R6）：整行截尾会把 `…-reality-direct`
 /// 与 `…-reality-resi` 截成一个样子。
@@ -1011,12 +1018,20 @@ fn switch_node<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>, name: Stri
     let width = ctx.width();
     let already = Profiles::load(ctx.sys, ctx.paths)
         .is_ok_and(|p| p.active.as_deref() == Some(name.as_str()));
+    let start = ctx.transcript.len();
+    let out = run_sub(ctx, Cmd::Switch { name: name.clone() });
+    // transcript 只追加不截断，`start` 一定落在字符边界上
+    let tun_down = ctx.transcript[start..]
+        .lines()
+        .any(|l| l.trim() == TUN_NOT_READY);
     let done = if already {
         format!("已是当前节点：{name}")
+    } else if tun_down {
+        format!("已切到 {name}，但 bui-tun 没起来")
     } else {
         format!("已切到 {name}")
     };
-    run_sub(ctx, Cmd::Switch { name: name.clone() }).map_summary(|s| {
+    out.map_summary(|s| {
         let s = if s.starts_with("失败：") { s } else { done };
         menu::fit_name_in_last(&s, &name, width)
     })
@@ -3732,6 +3747,64 @@ mod tests {
             "「上次：」行写切换的结果，不是第一行：\n{}",
             r.t
         );
+    }
+
+    /// 切完 TUN 没起来：先打「警告：…bui-tun 接口未就绪…」再打「已切到 X」。两行照 §4.3 停一次，
+    /// 但「上次：」行不能只写「已切到 X」——回到主菜单的人会以为切成了（spec §4.2）。
+    #[test]
+    fn the_switch_summary_admits_the_tun_never_came_up() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        s.reply("ip link show bui-tun", 1, "");
+        two_nodes(&s, &pp);
+        let mut prof = Profiles::load(&s, &pp).unwrap();
+        prof.mode = Mode::Tun;
+        prof.save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        let r = run_menu(&s, &n, &pp, &["1", "2", "", "0"], true);
+        assert!(r.t.contains("bui-tun 接口未就绪"), "{}", r.t);
+        assert_eq!(pauses(&r.asked), 1, "两行结果照 §4.3 要停：{:?}", r.asked);
+        assert!(
+            r.t.lines()
+                .any(|l| l == "  上次：已切到 alice-reality-direct，但 bui-tun 没起来"),
+            "「上次：」行要说 TUN 没起来：\n{}",
+            r.t
+        );
+    }
+
+    /// 同上，40 列、名字 38 列：名字单独中间截断（spec §0.2 R6），「，但 bui-tun 没起来」整句
+    /// 留住，整行按容量口径不超过行宽上限。
+    #[test]
+    fn the_tun_down_switch_summary_fits_40_columns_and_keeps_bui_tun() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        s.reply("ip link show bui-tun", 1, "");
+        let mut prof = crate::testutil::baiyi_like();
+        prof.mode = Mode::Tun;
+        prof.save(&s, &pp).unwrap();
+        s.set_term_size(Some((40, 30)));
+        let n = FakeNet::new();
+        // [4] 是 rick-node.example-a.net-reality-direct（38 列）
+        let r = run_menu(&s, &n, &pp, &["1", "4", "", "0"], true);
+        assert_eq!(
+            Profiles::load(&s, &pp).unwrap().active.as_deref(),
+            Some("rick-node.example-a.net-reality-direct")
+        );
+        assert_eq!(pauses(&r.asked), 1, "{:?}", r.asked);
+        let last =
+            r.t.lines()
+                .find(|l| l.starts_with("  上次："))
+                .unwrap_or_else(|| panic!("{}", r.t));
+        assert!(menu::budget_width(last) <= menu::line_limit(40), "{last}");
+        assert!(last.contains("bui-tun"), "{last}");
+        assert!(
+            last.starts_with("  上次：已切到 ") && last.ends_with("，但 bui-tun 没起来"),
+            "名字单独中间截断，后半句不被尾截：{last}"
+        );
+        // 名字的预算 = 39 −「  上次：」8 −「已切到 」7 −「，但 bui-tun 没起来」19 = 5
+        assert_eq!(last, "  上次：已切到 r…ct，但 bui-tun 没起来");
     }
 
     #[test]

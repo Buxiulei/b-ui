@@ -1498,6 +1498,7 @@ mod tests {
             for summary in [
                 format!("已切到 {}", p.name),
                 format!("已是当前节点：{}", p.name),
+                format!("已切到 {}，但 bui-tun 没起来", p.name),
             ] {
                 let last = fit_name_in_last(&summary, &p.name, width);
                 out.push(("last-name", render(&st(), width, Some(&last))));
