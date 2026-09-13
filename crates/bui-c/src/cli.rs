@@ -670,9 +670,15 @@ pub fn menu_loop<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Resul
                 activate: false,
             }),
             Action::Service => {
-                // 服务控制：只保留「重启当前配置」这一个真实动作（v3 的服务子菜单大半是死代码）
-                systemd::restart(ctx.sys, UNIT_MAIN)?;
-                ctx.say("已重启 bui-c.service");
+                // 服务控制：只保留「重启当前配置」这一个真实动作（v3 的服务子菜单大半是死代码）。
+                // 单元还没建就别 restart——systemd 只会回 `Unit bui-c.service not found`，
+                // 用户看不出该干什么（缺陷 5）。
+                if ctx.sys.exists(&ctx.paths.unit(UNIT_MAIN)) {
+                    systemd::restart(ctx.sys, UNIT_MAIN)?;
+                    ctx.say("已重启 bui-c.service");
+                } else {
+                    ctx.say("还没有安装引擎与单元：先导入节点（菜单 3 / 7）或跑 `bui-c update`");
+                }
                 None
             }
             Action::Check => Some(Cmd::Check),
@@ -1477,5 +1483,23 @@ mod tests {
             Some("https://panel.example.com"),
             "只在内存里覆盖，不改 profiles.json"
         );
+    }
+
+    #[test]
+    fn menu_service_control_without_units_points_to_install() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s); // ready 只登记 systemctl 回答，不建单元文件
+        profiles_socks().save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        let mut p = Scripted::from(["4", "0"]); // 4 = 服务控制 → 0 退出
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        assert!(
+            ctx.transcript.contains("bui-c update"),
+            "单元不存在时应引导先装引擎：{}",
+            ctx.transcript
+        );
+        assert!(!s.called("systemctl restart bui-c.service"));
     }
 }
