@@ -641,10 +641,10 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
                 } else {
                     format!("清掉 {} 个残留的 v3 单元", r.removed_units.len())
                 };
+                // 不串名字：真机 9 个节点 join 起来一行两百多列，名字 `bui-c list` 里都看得到
                 ctx.say(format!(
-                    "v3 的 {} 个节点都已导入过（{}），{tail}",
-                    r.existing.len(),
-                    r.existing.join("、")
+                    "v3 的 {} 个节点都已导入过，{tail}",
+                    r.existing.len()
                 ));
                 for s in &r.skipped {
                     ctx.say(format!("跳过：{s}"));
@@ -1914,6 +1914,21 @@ mod tests {
             "不该冒出重复节点"
         );
         assert_eq!(after_second, after_first, "profiles.json 一个字段都不该动");
+        // 真机 9 个节点时这一行把全部名字 join 起来，一行两百多列
+        assert_eq!(
+            ctx.out, "v3 的 1 个节点都已导入过，未做任何改动\n",
+            "不串节点名"
+        );
+
+        // 有残留的 v3 单元（比如手动装回来过）：同样不串名字
+        s.put("/etc/systemd/system/xray-client.service", "[Unit]");
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["import-v3"]), &mut ctx).unwrap();
+        assert_eq!(
+            ctx.out,
+            "v3 的 1 个节点都已导入过，清掉 1 个残留的 v3 单元\n"
+        );
     }
 
     #[test]
