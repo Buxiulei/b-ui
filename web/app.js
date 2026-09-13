@@ -109,8 +109,9 @@ function init() {
 }
 
 // Load data
+// 返回 Promise：轮换凭据后要等用户列表刷新完再按新 token 重画配置弹窗（见 rotateSub）
 function load() {
-    Promise.all([api("/users"), api("/online"), api("/stats")]).then(([u, o, s]) => {
+    return Promise.all([api("/users"), api("/online"), api("/stats")]).then(([u, o, s]) => {
         $("#st-u").innerText = u.length;
         // 在线设备：累加所有用户的连接数
         let totalOnline = 0;
@@ -302,13 +303,23 @@ function saveUser() {
     });
 }
 
+// 2026-09-14：四个免鉴权订阅端点的路径末段是每用户的随机订阅 token，不再是用户名
+// （响应体里有 hy2 明文密码与 vless uuid，「域名 + 用户名」在旧口径下就等于订阅凭据）。
+// 老 state 还没补齐 token 时 subPath 返回 null，调用方给一行中文提示，不拼出坏链接。
+const SUB_TOKEN_MISSING = "该用户还没有订阅 token：重启 b-ui 会自动补齐，也可点「重置订阅链接与凭据」立即生成";
+
+function subPath(x, kind) {
+    return x && x.subToken ? "/api/" + kind + "/" + encodeURIComponent(x.subToken) : null;
+}
+
 // Generate URI - 根据协议类型生成不同的链接
 function genUri(x) {
     // 融合订阅用户: 返回 v2rayN 原生订阅 URL (带备注)
     if (x.protocol === "fusion") {
-        const host = location.host;
+        const path = subPath(x, "sub");
+        if (!path) return "";
         // URL 末尾的 #备注 会被 v2rayNG 识别为订阅名称（不编码）
-        return "https://" + host + "/api/sub/" + x.username + "#" + x.username;
+        return "https://" + location.host + path + "#" + x.username;
     }
     // v3.6.0: 单协议用户按 residential 选直连版/住宅版端口与备注，
     // 判定与 server.js /api/sub 的 includeResi 完全一致（未设 residential 视为开）
@@ -369,6 +380,7 @@ function renderQR(uri) {
     const el = $("#qrcode");
     if (!el) return;
     el.innerHTML = "";
+    if (!uri) return;
     if (typeof QRCode === "undefined") { el.innerText = "二维码库未加载"; return; }
     new QRCode(el, { text: uri, width: 200, height: 200, correctLevel: QRCode.CorrectLevel.M });
     const img = el.querySelector("canvas, img");
@@ -381,7 +393,7 @@ function showU(uname) {
     if (!x) return;
     currentShowUser = x;
     const uri = genUri(x);
-    $("#uri").innerText = uri;
+    $("#uri").innerText = uri || SUB_TOKEN_MISSING;
 
     // 融合订阅用户显示订阅链接
     if (x.protocol === "fusion") {
@@ -423,9 +435,10 @@ function showU(uname) {
 
 // Copy URI
 function copy() {
-    const uri = $("#uri").innerText;
-    navigator.clipboard.writeText(uri);
-    if (currentShowUser && currentShowUser.protocol === "fusion") {
+    const fusion = currentShowUser && currentShowUser.protocol === "fusion";
+    if (fusion && !currentShowUser.subToken) return toast(SUB_TOKEN_MISSING, 1);
+    navigator.clipboard.writeText($("#uri").innerText);
+    if (fusion) {
         toast("订阅链接已复制，可粘贴到 v2rayN / Shadowrocket");
     } else {
         toast("链接已复制到剪贴板");
@@ -435,21 +448,46 @@ function copy() {
 // 下载 sing-box 融合订阅配置
 function downloadSubscription() {
     if (!currentShowUser) return toast("请先选择用户", 1);
-    const url = "/api/subscription/" + encodeURIComponent(currentShowUser.username);
-    window.open(url, "_blank");
+    const path = subPath(currentShowUser, "subscription");
+    if (!path) return toast(SUB_TOKEN_MISSING, 1);
+    window.open(path, "_blank");
     toast("正在下载 sing-box 配置...");
 }
 
 // 复制 Clash Verge Rev 订阅链接
 function copyClash() {
     if (!currentShowUser) return toast("请先选择用户", 1);
-    const clashUrl = "https://" + location.host + "/api/clash/" + encodeURIComponent(currentShowUser.username);
-    navigator.clipboard.writeText(clashUrl)
+    const path = subPath(currentShowUser, "clash");
+    if (!path) return toast(SUB_TOKEN_MISSING, 1);
+    navigator.clipboard.writeText("https://" + location.host + path)
         .then(() => toast("Clash 订阅链接已复制，可导入 Clash Verge Rev"))
         .catch(() => toast("复制失败", 1));
 }
 
-
+// 重置订阅链接与凭据（2026-09-14）：POST /api/users/{name}/rotate 同时换随机订阅 token、
+// hy2 密码与 vless uuid，并停用该用户的旧「用户名链接」。旧订阅与旧客户端立刻失效，
+// 所以要二次确认；成功后刷新用户列表，再按新 token 重画这个弹窗。
+function rotateSub() {
+    const x = currentShowUser;
+    if (!x) return toast("请先选择用户", 1);
+    if (!confirm("重置用户 " + x.username + " 的订阅链接与凭据？\n\n" +
+        "旧订阅链接、旧 Hysteria2 密码与旧 VLESS UUID 立刻失效：该用户现有的客户端会断连，" +
+        "必须把新链接重新导入一次。")) return;
+    const btn = document.getElementById("cfg-rotate");
+    const done = () => { if (btn) { btn.disabled = false; btn.textContent = "重置订阅链接与凭据"; } };
+    if (btn) { btn.disabled = true; btn.textContent = "重置中…"; }
+    api("/users/" + encodeURIComponent(x.username) + "/rotate", { method: "POST", body: JSON.stringify({}) })
+        .then(r => {
+            if (!r || !r.success) { done(); return toast((r && r.error) || "重置失败", 1); }
+            // 链接与二维码都来自 allUsers 里的面板投影，等列表刷新完再按新 token 重画
+            return load().then(() => {
+                done();
+                showU(x.username);
+                toast("已重置，请把新订阅链接重新导入客户端");
+            });
+        })
+        .catch(e => { done(); toast(e.message || "请求失败", 1); });
+}
 
 // Change password
 function changePwd() {

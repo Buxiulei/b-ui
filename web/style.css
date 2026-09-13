@@ -519,6 +519,20 @@ tr:hover td      { background: rgba(201, 169, 97, 0.05); }
     box-shadow: var(--elev-2);
 }
 
+/* 破坏性操作（重置订阅链接与凭据）：与 .ibtn.danger / .resi-del-btn 同一套 danger 色 */
+.btn-danger {
+    background: var(--danger-bg);
+    color: var(--danger);
+    border: 1px solid rgba(139, 26, 43, 0.16);
+    box-shadow: var(--elev-1);
+}
+
+.btn-danger:hover {
+    background: rgba(139, 26, 43, 0.14);
+    border-color: rgba(139, 26, 43, 0.28);
+    box-shadow: var(--elev-2);
+}
+
 /* ---------- Icon Buttons ---------- */
 .ibtn {
     width: 40px;
