@@ -18,7 +18,12 @@ const RULE_WIDTH: usize = 4 + LEFT_WIDTH + 2 + 14;
 
 /// 交互输入：真实终端用 [`Stdin`]，测试与 `--yes` 路径用 [`Scripted`]。
 pub trait Prompt {
-    fn line(&mut self, prompt: &str) -> Result<String>;
+    /// 读一行（去首尾空白）；EOF 返回 `None`。主菜单靠它区分「回车」（重画）与「EOF」（退出）。
+    fn read(&mut self, prompt: &str) -> Result<Option<String>>;
+    /// 读一行，EOF 当空串：子提示里两者都是「取消 / 返回」。
+    fn line(&mut self, prompt: &str) -> Result<String> {
+        Ok(self.read(prompt)?.unwrap_or_default())
+    }
     /// 批量粘贴：空行结束。
     fn lines_until_blank(&mut self, prompt: &str) -> Result<Vec<String>>;
     /// 只有 `y` / `yes`（忽略大小写）算是。
@@ -54,14 +59,13 @@ fn read_line_from<R: std::io::BufRead>(r: &mut R) -> Result<Option<String>> {
 }
 
 impl Prompt for Stdin {
-    fn line(&mut self, prompt: &str) -> Result<String> {
+    fn read(&mut self, prompt: &str) -> Result<Option<String>> {
         use std::io::Write as _;
         print!("{}", prompt_text(prompt));
         std::io::stdout()
             .flush()
             .map_err(|e| Error::io(std::path::Path::new("<stdout>"), e))?;
-        // EOF：返回空串，调用方按「取消」处理
-        Ok(read_line_from(&mut std::io::stdin().lock())?.unwrap_or_default())
+        read_line_from(&mut std::io::stdin().lock())
     }
 
     fn lines_until_blank(&mut self, prompt: &str) -> Result<Vec<String>> {
@@ -82,7 +86,8 @@ impl Prompt for Stdin {
     }
 }
 
-/// 脚本化输入：测试用，也给 `--yes` 路径喂固定答案。队列空了当 EOF（空串 / 否 / 空列表）。
+/// 脚本化输入：测试用，也给 `--yes` 路径喂固定答案。队列空了当 EOF（`read` 为 `None`，
+/// `line` 为空串 / 否 / 空列表）。
 pub struct Scripted {
     pub queue: VecDeque<String>,
 }
@@ -96,8 +101,8 @@ impl<'a, const N: usize> From<[&'a str; N]> for Scripted {
 }
 
 impl Prompt for Scripted {
-    fn line(&mut self, _prompt: &str) -> Result<String> {
-        Ok(self.queue.pop_front().unwrap_or_default())
+    fn read(&mut self, _prompt: &str) -> Result<Option<String>> {
+        Ok(self.queue.pop_front())
     }
 
     fn lines_until_blank(&mut self, _prompt: &str) -> Result<Vec<String>> {
@@ -795,5 +800,14 @@ mod tests {
         );
         // 队列空了 → 当成 EOF：返回空串，调用方按「取消」处理
         assert_eq!(p.line("选择").unwrap(), "");
+    }
+
+    #[test]
+    fn scripted_read_tells_a_blank_line_from_eof() {
+        let mut p = Scripted::from(["", "1"]);
+        assert_eq!(p.read("选择").unwrap().as_deref(), Some(""), "回车");
+        assert_eq!(p.read("选择").unwrap().as_deref(), Some("1"));
+        assert_eq!(p.read("选择").unwrap(), None, "队列空 = EOF");
+        assert_eq!(p.line("选择").unwrap(), "", "line 把 EOF 折成空串");
     }
 }

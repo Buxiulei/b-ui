@@ -678,9 +678,13 @@ fn menu_body<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()
         let screen = menu::render(&st);
         ctx.show(screen.trim_end());
         ctx.flush();
-        let choice = ctx.prompt.line("选择 [0-9]")?;
+        // EOF（Ctrl-D、stdin=/dev/null）→ 退出，不留在死循环里；直接回车只重画，
+        // 不打「无效选项」——手滑多按一下回车不该把人踢出菜单
+        let Some(choice) = ctx.prompt.read("选择 [0-9]")? else {
+            return Ok(());
+        };
         if choice.is_empty() {
-            return Ok(()); // EOF / 直接回车 → 退出，不留在死循环里
+            continue;
         }
         let action = match menu::parse_choice(&choice) {
             Some(a) => a,
@@ -1564,6 +1568,36 @@ mod tests {
             Mode::Socks,
             "什么都没改"
         );
+    }
+
+    #[test]
+    fn menu_loop_redraws_on_blank_line_and_only_eof_or_zero_quits() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        s.reply("ip link show bui-tun", 0, "5: bui-tun");
+        profiles_socks().save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        // 回车 → 重画（不退出）→ 2 切到 TUN → y → 队列空 = EOF 退出
+        let mut p = Scripted::from(["", "2", "y"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        assert_eq!(
+            Profiles::load(&s, &pp).unwrap().mode,
+            Mode::Tun,
+            "空行只是重画，后面的 2 照样生效\n{}",
+            ctx.transcript
+        );
+        let t = ctx.transcript.clone();
+        assert_eq!(t.matches("B-UI 客户端").count(), 3, "三屏菜单：\n{t}");
+        assert!(!t.contains("无效选项"), "空行不打任何字：\n{t}");
+
+        // 0 仍然退出：后面的 2 不该被读到
+        let mut p = Scripted::from(["", "0", "2", "y"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        assert_eq!(Profiles::load(&s, &pp).unwrap().mode, Mode::Tun);
+        assert_eq!(ctx.transcript.matches("B-UI 客户端").count(), 2);
     }
 
     #[test]
