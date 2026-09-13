@@ -1,8 +1,8 @@
 # B-UI Hysteria2 TLS 故障排查报告
 
 > **日期**: 2026-03-04 13:40 ~ 13:52 (UTC+8)  
-> **域名**: bwg.baiyibaiyi.cn  
-> **服务器**: honest-bump-6 (138.128.195.22)
+> **域名**: bwg-tizi.example  
+> **服务器**: bwg-tizi (203.0.113.10)
 
 ---
 
@@ -28,7 +28,7 @@ CRYPTO_ERROR 0x150 (remote): tls: internal error
 |---|---|
 | cert1.pem 过期时间 | May 29, 2026 GMT |
 | cert2.pem 过期时间 | Jun 02, 2026 GMT |
-| 证书路径 | `/etc/letsencrypt/live/bwg.baiyibaiyi.cn/` |
+| 证书路径 | `/etc/letsencrypt/live/bwg-tizi.example/` |
 | 权限 | fullchain: 644, privkey: 600 (正确) |
 
 > **结论**: 证书未过期，排除证书过期作为根因。
@@ -37,7 +37,7 @@ CRYPTO_ERROR 0x150 (remote): tls: internal error
 
 - **故障期间**: PID 8401 运行中，服务端日志**无 TLS 错误**
 - **重启后** (13:49:44): PID 14754，客户端立即恢复连接
-- **成功连接的客户端**: 白衣挚友、一家人（重启后 ~1 分钟内）
+- **成功连接的客户端**: alice、bob（重启后 ~1 分钟内）
 
 ### 2.3 服务端日志分析
 

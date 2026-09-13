@@ -152,7 +152,7 @@ curl -fsSL https://raw.githubusercontent.com/Buxiulei/b-ui/v4/install.sh | bash
 | 面板管理员密码 | 随机 16 位十六进制，**提示里直接显示**，回车即用 |
 | Hysteria2 直连端口 | `10000` |
 | REALITY 伪装站 | `www.bing.com:443` |
-| 第一个用户名 | `低空飞行`（HY2 密码与 UUID 随机生成，权益默认全开：两协议 + 直连 + 住宅、不限期不限量） |
+| 第一个用户名 | `user1`（HY2 密码与 UUID 随机生成，权益默认全开：两协议 + 直连 + 住宅、不限期不限量） |
 | 节点名 | 主机名 |
 | 公网 IP | 自动探测值 |
 

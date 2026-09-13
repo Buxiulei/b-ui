@@ -91,4 +91,4 @@
 3. resi-health：http 成员的 curl 配置为 `proxy = "http://…"`，socks 成员不变；混合池切换正常。
 4. server.js：POST 三种格式均 200，`type` 回传；spawn 的 argv 不含 URL；health 对 http 成员用 http 代理行；status 行带 type。
 5. app.js：`parseResiInput` 单测（vm）覆盖四种格式与错误分支；DOM 影子：输入即预览、按钮禁用态、成功/失败渲染、列表徽标。
-6. 主理人线上验收：粘贴 `brd.superproxy.io:44445:…` 一行 → 预览显示自动探测 → 校验并添加 → 类型 HTTP、出口 168.158.161.12、体检卡显示住宅判定。
+6. 主理人线上验收：粘贴 `brd.superproxy.io:44445:…` 一行 → 预览显示自动探测 → 校验并添加 → 类型 HTTP、出口 203.0.113.12、体检卡显示住宅判定。

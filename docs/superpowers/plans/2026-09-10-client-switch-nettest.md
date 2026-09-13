@@ -165,7 +165,7 @@ cat > "$T/bin/curl" <<'STUB'
 a="$*"
 if [[ "$a" == *"my.ippure.com"* ]]; then
   [[ "${MODE:-}" == *ippure_fail* ]] && exit 7
-  echo '{"ip":"199.19.108.8","asn":25820,"asOrganization":"Cluster Logic Inc","country":"United States","countryCode":"US","region":"California","city":"Los Angeles","fraudScore":12,"isResidential":false}'; exit 0
+  echo '{"ip":"203.0.113.8","asn":25820,"asOrganization":"Cluster Logic Inc","country":"United States","countryCode":"US","region":"California","city":"Los Angeles","fraudScore":12,"isResidential":false}'; exit 0
 fi
 if [[ "$a" == *"api6.ipify.org"* || "$a" == *"ipv6.icanhazip.com"* ]]; then [[ "${MODE:-}" == *v6_ok* ]] && { echo "2001:db8::1234"; exit 0; } || exit 7; fi
 if [[ "$a" == *"ip-api.com/json/2001:db8::1234"* ]]; then echo '{"status":"success","country":"Japan","regionName":"Tokyo","city":"Tokyo","isp":"NTT","org":"NTT","as":"AS2914","mobile":false,"proxy":false,"hosting":false}'; exit 0; fi
@@ -177,7 +177,7 @@ run4() { bash -c "source '$T/lib.sh'; probe_egress 4 ${1:-}"; }
 run6() { bash -c "source '$T/lib.sh'; probe_egress 6 ${1:-}"; }
 # A. ippure 成功
 out=$(MODE=ippure_ok run4)
-grep -qx 'ip=199.19.108.8' <<<"$out" && grep -qx 'source=ippure' <<<"$out" && grep -q '^type=.*机房' <<<"$out" && grep -qx 'score=12' <<<"$out" && grep -q '^country=United States' <<<"$out" || { echo "FAIL A: $out"; fail=1; }
+grep -qx 'ip=203.0.113.8' <<<"$out" && grep -qx 'source=ippure' <<<"$out" && grep -q '^type=.*机房' <<<"$out" && grep -qx 'score=12' <<<"$out" && grep -q '^country=United States' <<<"$out" || { echo "FAIL A: $out"; fail=1; }
 # B. ippure 失败 → ip-api 回退
 out=$(MODE=ippure_fail run4)
 grep -qx 'ip=5.6.7.8' <<<"$out" && grep -qx 'source=ip-api' <<<"$out" && grep -q '^type=.*机房' <<<"$out" || { echo "FAIL B: $out"; fail=1; }
@@ -195,7 +195,7 @@ chmod +x "$T/bin/curl"; export ARGLOG="$T/args"; : > "$ARGLOG"; MODE= run4 1080 
 # F. 渲染分支：TUN 且无 v6 → "无泄漏"；TUN 有 v6 → "泄漏"
 cat > "$T/bin/curl" <<'STUB'
 #!/bin/bash
-a="$*"; [[ "$a" == *"my.ippure.com"* ]] && { echo '{"ip":"199.19.108.8","asOrganization":"X","country":"US","region":"CA","city":"LA","fraudScore":1,"isResidential":true}'; exit 0; }
+a="$*"; [[ "$a" == *"my.ippure.com"* ]] && { echo '{"ip":"203.0.113.8","asOrganization":"X","country":"US","region":"CA","city":"LA","fraudScore":1,"isResidential":true}'; exit 0; }
 [[ "$a" == *"api6.ipify.org"* ]] && { [[ "${MODE:-}" == v6_ok ]] && { echo "2001:db8::1"; exit 0; }; exit 7; }
 [[ "$a" == *"ip-api.com/json/2001"* ]] && { echo '{"status":"success","country":"JP","regionName":"","city":"","isp":"NTT","org":"","as":"","mobile":false,"proxy":false,"hosting":false}'; exit 0; }; exit 7
 STUB
