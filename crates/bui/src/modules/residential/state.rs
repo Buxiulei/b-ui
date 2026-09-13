@@ -383,6 +383,16 @@ pub fn apply_hysteresis(h: &mut HealthState, ok: bool) -> bool {
     h.active
 }
 
+/// 哨兵带外探测确认不可达（spec §5.7，设计裁决 D6）：**立即**判不健康（不等巡检的 2 轮迟滞），
+/// 并记一条失败样本。否则下一轮巡检里它仍是 `active`，按槽驱动会把「还坏着的一轮」当成
+/// 「恢复第 1 轮」。恢复照旧走 [`apply_hysteresis`]（连续 [`OK_TO_HEALTHY`] 轮）。
+pub fn mark_unhealthy(h: &mut HealthState, now: OffsetDateTime) {
+    record_probe(h, false, now);
+    h.active = false;
+    h.okstreak = 0;
+    h.failstreak = h.failstreak.max(FAIL_TO_UNHEALTHY);
+}
+
 /// 记一条样本并裁掉窗口外/超量的（`now` 由 `Host::now()` 给，测试可推进）
 pub fn record_probe(h: &mut HealthState, ok: bool, now: OffsetDateTime) {
     h.samples.push(ProbeSample {
@@ -969,5 +979,18 @@ mod tests {
             serde_json::json!(["x"]),
             "/api/health 也只透出池内现存 uuid 的告警"
         );
+    }
+
+    /// 哨兵带外确认不可达 ⇒ 立即不健康；恢复仍走巡检的 2 轮迟滞（设计裁决 D6）
+    #[test]
+    fn an_out_of_band_failure_marks_a_member_down_at_once_but_recovery_still_needs_two_rounds() {
+        let mut h = HealthState::default();
+        mark_unhealthy(&mut h, t0());
+        assert!(!h.active);
+        assert_eq!((h.okstreak, h.failstreak), (0, FAIL_TO_UNHEALTHY));
+        assert_eq!(h.samples.len(), 1);
+        assert!(!h.samples[0].ok, "带外失败也进 24h 成功率");
+        assert!(!apply_hysteresis(&mut h, true), "第 1 轮探通还不恢复");
+        assert!(apply_hysteresis(&mut h, true), "第 2 轮才恢复");
     }
 }

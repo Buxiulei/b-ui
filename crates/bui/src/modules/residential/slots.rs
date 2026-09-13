@@ -490,6 +490,64 @@ pub struct SlotOutcome {
     pub note: Option<String>,
 }
 
+/// 按槽切换的互斥（设计裁决 D7）：[`drive_slots`] 整轮「读快照 → 逐槽 PUT → 按快照写回
+/// `current_upstream_id`」，[`borrow_now`] 若落在中间，它写的记录会被那轮写回盖成旧值（relay 的
+/// selector 已经切走，runtime 还记着旧值）。两者各自整段持锁；持锁期间只有毫秒级的 Clash PUT。
+///
+/// **每个守护进程一把**（按 `ctx.host` 这个 `Arc` 的地址区分，`DaemonCtx` 的克隆共用它）：生产上
+/// 一个进程只有一个 `DaemonCtx`，等于进程级一把。不写成进程级 `static`：同一个测试二进制里的多个
+/// `#[tokio::test]` 会共用这把锁，`start_paused` 的测试在等别的测试放锁时假时钟自动推进，
+/// 「等到出现」的循环瞬间耗尽（同 `api::auth::LoginLimiter` 不用进程级 `OnceLock` 的理由）。
+fn slot_switch(ctx: &DaemonCtx) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: std::sync::Mutex<BTreeMap<usize, Arc<tokio::sync::Mutex<()>>>> =
+        std::sync::Mutex::new(BTreeMap::new());
+    let key = Arc::as_ptr(&ctx.host).cast::<()>() as usize;
+    LOCKS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(key)
+        .or_default()
+        .clone()
+}
+
+/// [`put_slot`] 没切成的原因。文案与抽出前的 `drive_slots` 逐字相同（面板与 CLI 直接显示）。
+enum PutFail {
+    /// 目标已不在池里
+    Gone,
+    /// Clash API 拒绝 / 不可达
+    Rejected(String),
+    /// `spawn_blocking` 任务异常
+    Task(String),
+}
+
+impl PutFail {
+    fn note(&self) -> String {
+        match self {
+            PutFail::Gone => "目标已不在池里，本轮不切".into(),
+            PutFail::Rejected(s) | PutFail::Task(s) => s.clone(),
+        }
+    }
+}
+
+/// 把槽 `index` 的 selector 切到 `target`：成功返回目标 tag。[`drive_slots`] 与 [`borrow_now`]
+/// 共用，「切一槽」只有这一份实现。
+async fn put_slot(
+    c: Arc<dyn Clash>,
+    g: &ResidentialGroup,
+    index: u16,
+    target: Uuid,
+) -> Result<String, PutFail> {
+    let Some(tag) = clash::tag_of(g, target) else {
+        return Err(PutFail::Gone);
+    };
+    let (sel, t) = (super::slot_selector(index), tag.clone());
+    match tokio::task::spawn_blocking(move || c.select(&sel, &t)).await {
+        Ok(Ok(())) => Ok(tag),
+        Ok(Err(e)) => Err(PutFail::Rejected(format!("切到 {tag} 失败：{e}"))),
+        Err(e) => Err(PutFail::Task(format!("切换任务异常：{e}"))),
+    }
+}
+
 /// 按槽驱动各自的 selector（spec §5.6）。每轮巡检的**最后一步**，由
 /// `health::check_round` 调用；`healthy` 就是那一轮算出来的健康成员集。
 ///
@@ -512,6 +570,7 @@ pub async fn drive_slots(
     healthy: &[Uuid],
     now: OffsetDateTime,
 ) -> Vec<SlotOutcome> {
+    let _switch = slot_switch(ctx).lock_owned().await;
     let view = slots::sorted(&ctx.store.read().await.residential);
     if view.is_empty() {
         return Vec::new();
@@ -578,22 +637,17 @@ pub async fn drive_slots(
 
         let mut switched = false;
         if !hold && current != Some(target) {
-            match clash::tag_of(g, target) {
-                Some(tag) => {
-                    let (cc, sel, t) = (c.clone(), super::slot_selector(s.index), tag.clone());
-                    match tokio::task::spawn_blocking(move || cc.select(&sel, &t)).await {
-                        Ok(Ok(())) => {
-                            switched = true;
-                            tracing::info!(slot = s.index, to = %tag, "按槽切换住宅出口");
-                        }
-                        Ok(Err(e)) => {
-                            note = Some(format!("切到 {tag} 失败：{e}"));
-                            rounds = sr.back_rounds; // 没切成就别把轮数清掉
-                        }
-                        Err(e) => note = Some(format!("切换任务异常：{e}")),
-                    }
+            match put_slot(c.clone(), g, s.index, target).await {
+                Ok(tag) => {
+                    switched = true;
+                    tracing::info!(slot = s.index, to = %tag, "按槽切换住宅出口");
                 }
-                None => note = Some("目标已不在池里，本轮不切".into()),
+                Err(f) => {
+                    if matches!(f, PutFail::Rejected(_)) {
+                        rounds = sr.back_rounds; // 没切成就别把轮数清掉
+                    }
+                    note = Some(f.note());
+                }
             }
         }
         let landed = if switched || current == Some(target) {
@@ -623,6 +677,115 @@ pub async fn drive_slots(
             // 池缩小后留下的槽位运行时条目
             r.slots
                 .retain(|k, _| k.parse::<u16>().is_ok_and(|i| i < slots::MAX_SLOTS));
+        })
+        .await;
+    }
+    out
+}
+
+/// 哨兵的立即借用（spec §5.7，设计裁决 D7）：`failed` 已被带外探测确认不可用（不可达 /
+/// Google 被封），把**此刻正压在它身上**的槽立刻挪走，不等下一轮巡检。
+///
+/// 与 [`drive_slots`] 同一口径、只做「借出」这一半：
+/// - 只动「当前出口 == `failed`」的槽：本槽 IP 就是它（`current_upstream_id = None` 时 selector
+///   停在配置里的 default = 本槽 IP），或正借用它；
+/// - 手动 pin 的槽不动（管理员的判断压过哨兵，同 [`drive_slots`] 规则 1）；
+/// - 目标：本槽 IP 不是 `failed` 且健康、Google 未被封 ⇒ 回本槽；否则
+///   [`health::rank_healthy`] 里排名最高的非 `failed` 健康 IP；一个都没有 ⇒ 保持现状（fail-open）；
+/// - 被挪动的槽 `back_rounds` 归零；**不推进任何槽的 `back_rounds`，切回永远只由巡检的
+///   [`drive_slots`] 负责**（连续 [`SLOT_BACK_ROUNDS`] 轮）。
+///
+/// 「健康」= runtime 里 `active` 的成员（调用方先 `mark_unhealthy` 再调本函数）。
+/// 与 [`drive_slots`] 共用 [`slot_switch`] 那把锁：不会落在巡检那一轮的读快照与写回之间。
+pub async fn borrow_now(
+    ctx: &DaemonCtx,
+    c: Arc<dyn Clash>,
+    failed: Uuid,
+    now: OffsetDateTime,
+) -> Vec<SlotOutcome> {
+    let _switch = slot_switch(ctx).lock_owned().await;
+    let s = ctx.store.read().await;
+    let view = slots::sorted(&s.residential);
+    let g = state::group_of(&s);
+    drop(s);
+    let rt = state::read(&ctx.runtime).await;
+    let healthy: Vec<Uuid> = g
+        .upstreams
+        .iter()
+        .map(|u| u.id)
+        .filter(|id| {
+            *id != failed
+                && rt
+                    .health
+                    .get(&id.to_string())
+                    .map(|h| h.active)
+                    .unwrap_or(true)
+        })
+        .collect();
+    let ranked = health::rank_healthy(&g, &rt, &healthy, now);
+    let google_ok =
+        |id: Uuid| rt.health.get(&id.to_string()).and_then(|h| h.google_ok) != Some(false);
+    let in_pool = |id: Uuid| g.upstreams.iter().any(|u| u.id == id);
+
+    let mut out = Vec::new();
+    let mut writes: Vec<(u16, Uuid)> = Vec::new();
+    for sl in &view {
+        if !in_pool(sl.upstream_id) {
+            continue;
+        }
+        let sr = rt
+            .slots
+            .get(&sl.index.to_string())
+            .cloned()
+            .unwrap_or_default();
+        if sr.pinned_upstream_id.is_some_and(in_pool) {
+            continue;
+        }
+        let own = sl.upstream_id;
+        let current = sr.current_upstream_id.unwrap_or(own);
+        if current != failed {
+            continue;
+        }
+        let target = if own != failed && healthy.contains(&own) && google_ok(own) {
+            Some(own)
+        } else {
+            ranked.first().copied()
+        };
+        let stay = |note: String| SlotOutcome {
+            index: sl.index,
+            own,
+            target: current,
+            borrowed: current != own,
+            switched: false,
+            note: Some(note),
+        };
+        let Some(target) = target else {
+            out.push(stay("没有可借用的健康 IP，保持现状".into()));
+            continue;
+        };
+        match put_slot(c.clone(), &g, sl.index, target).await {
+            Ok(tag) => {
+                tracing::warn!(slot = sl.index, to = %tag, "哨兵：本槽当前出口不可用，立即借用");
+                writes.push((sl.index, target));
+                out.push(SlotOutcome {
+                    index: sl.index,
+                    own,
+                    target,
+                    borrowed: target != own,
+                    switched: true,
+                    note: None,
+                });
+            }
+            Err(f) => out.push(stay(f.note())),
+        }
+    }
+    if !writes.is_empty() {
+        state::update(&ctx.runtime, move |r| {
+            for (index, target) in writes {
+                let e = r.slots.entry(index.to_string()).or_default();
+                e.current_upstream_id = Some(target);
+                e.back_rounds = 0;
+            }
         })
         .await;
     }
@@ -1723,5 +1886,244 @@ mod tests {
         assert!(pin_slot(&ctx, clash, 9, Some(Uuid::from_u128(1)))
             .await
             .is_err());
+    }
+
+    // ── 哨兵的立即借用（spec §5.7，设计裁决 D7）──────────────────────────────
+
+    #[tokio::test]
+    async fn borrow_now_moves_only_the_slots_sitting_on_the_failed_ip() {
+        let d = tempfile::tempdir().unwrap();
+        let (ctx, clash) = three_slot_ctx(d.path()).await;
+        seed_health(
+            &ctx,
+            &[
+                (1, Some(true), 300, true),
+                (2, Some(true), 100, false),
+                (3, Some(true), 50, true),
+            ],
+        )
+        .await;
+        state::update(&ctx.runtime, |r| {
+            r.slots.entry("1".into()).or_default().back_rounds = 2;
+        })
+        .await;
+        let out = borrow_now(
+            &ctx,
+            clash.clone(),
+            Uuid::from_u128(2),
+            OffsetDateTime::UNIX_EPOCH,
+        )
+        .await;
+        assert_eq!(out.len(), 1, "只有槽 1 压在故障 IP 上：{out:?}");
+        let o = &out[0];
+        assert_eq!(
+            (o.index, o.target, o.borrowed, o.switched),
+            (1, Uuid::from_u128(3), true, true),
+            "借排名最高的健康 IP（延迟最低的 resi-3）"
+        );
+        assert_eq!(
+            clash.calls(),
+            vec!["put:slot-1-pool:resi-3"],
+            "槽 0 / 槽 2 一次 PUT 都不许有"
+        );
+        let r = state::read(&ctx.runtime).await;
+        assert_eq!(r.slots["1"].current_upstream_id, Some(Uuid::from_u128(3)));
+        assert_eq!(r.slots["1"].back_rounds, 0, "被挪走的槽从头数切回轮数");
+    }
+
+    #[tokio::test]
+    async fn a_slot_borrowing_the_failed_ip_goes_home_when_its_own_ip_is_fine() {
+        let d = tempfile::tempdir().unwrap();
+        let (ctx, clash) = three_slot_ctx(d.path()).await;
+        seed_health(
+            &ctx,
+            &[
+                (1, Some(true), 300, true),
+                (2, Some(true), 100, true),
+                (3, Some(true), 50, true),
+            ],
+        )
+        .await;
+        // 槽 2 此刻借用着 IP 1
+        state::update(&ctx.runtime, |r| {
+            r.slots.entry("2".into()).or_default().current_upstream_id = Some(Uuid::from_u128(1));
+        })
+        .await;
+        let out = borrow_now(
+            &ctx,
+            clash.clone(),
+            Uuid::from_u128(1),
+            OffsetDateTime::UNIX_EPOCH,
+        )
+        .await;
+        let s0 = out.iter().find(|o| o.index == 0).unwrap();
+        assert_eq!(
+            s0.target,
+            Uuid::from_u128(3),
+            "槽 0 的本槽 IP 就是故障 IP ⇒ 借排名最高的"
+        );
+        let s2 = out.iter().find(|o| o.index == 2).unwrap();
+        assert_eq!(
+            (s2.target, s2.borrowed),
+            (Uuid::from_u128(3), false),
+            "槽 2 自己的 IP 好好的 ⇒ 回本槽"
+        );
+        assert!(out.iter().all(|o| o.index != 1), "槽 1 没压在 IP 1 上");
+    }
+
+    #[tokio::test]
+    async fn borrow_now_leaves_a_pinned_slot_alone() {
+        let d = tempfile::tempdir().unwrap();
+        let (ctx, clash) = three_slot_ctx(d.path()).await;
+        state::update(&ctx.runtime, |r| {
+            let e = r.slots.entry("1".into()).or_default();
+            e.pinned_upstream_id = Some(Uuid::from_u128(2));
+            e.current_upstream_id = Some(Uuid::from_u128(2));
+        })
+        .await;
+        let out = borrow_now(
+            &ctx,
+            clash.clone(),
+            Uuid::from_u128(2),
+            OffsetDateTime::UNIX_EPOCH,
+        )
+        .await;
+        assert!(out.is_empty(), "管理员的 pin 压过哨兵：{out:?}");
+        assert!(clash.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn with_nothing_healthy_to_borrow_the_slot_holds_still() {
+        let d = tempfile::tempdir().unwrap();
+        let (ctx, clash) = three_slot_ctx(d.path()).await;
+        seed_health(
+            &ctx,
+            &[
+                (1, Some(true), 100, false),
+                (2, Some(true), 100, true),
+                (3, Some(true), 100, false),
+            ],
+        )
+        .await;
+        let out = borrow_now(
+            &ctx,
+            clash.clone(),
+            Uuid::from_u128(2),
+            OffsetDateTime::UNIX_EPOCH,
+        )
+        .await;
+        assert_eq!(out.len(), 1);
+        assert!(!out[0].switched);
+        assert_eq!(
+            out[0].note.as_deref(),
+            Some("没有可借用的健康 IP，保持现状")
+        );
+        assert!(
+            clash.calls().is_empty(),
+            "fail-open：不许 PUT 一条不健康的 IP"
+        );
+        assert_eq!(
+            state::read(&ctx.runtime)
+                .await
+                .slots
+                .get("1")
+                .and_then(|s| s.current_upstream_id),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_put_leaves_the_runtime_untouched() {
+        let d = tempfile::tempdir().unwrap();
+        let (ctx, clash) = three_slot_ctx(d.path()).await;
+        seed_health(
+            &ctx,
+            &[
+                (1, Some(true), 300, true),
+                (2, Some(true), 100, true),
+                (3, Some(true), 50, true),
+            ],
+        )
+        .await;
+        clash.with(|i| i.reject = true);
+        let out = borrow_now(
+            &ctx,
+            clash.clone(),
+            Uuid::from_u128(2),
+            OffsetDateTime::UNIX_EPOCH,
+        )
+        .await;
+        assert!(!out[0].switched);
+        assert!(
+            out[0]
+                .note
+                .as_deref()
+                .unwrap()
+                .starts_with("切到 resi-3 失败"),
+            "{:?}",
+            out[0].note
+        );
+        assert_eq!(
+            state::read(&ctx.runtime)
+                .await
+                .slots
+                .get("1")
+                .and_then(|s| s.current_upstream_id),
+            None,
+            "没切成就别记成切了"
+        );
+    }
+
+    /// 设计裁决 D7：`borrow_now` 与 `drive_slots` 共用 [`slot_switch`] 那把锁。锁被占着（另一方正在
+    /// 「读快照 → PUT → 写回」）时两者都得等，一次 PUT 都不发；放开后各自照常做完。
+    #[tokio::test]
+    async fn borrow_now_and_drive_slots_wait_for_each_other_on_the_slot_switch_lock() {
+        let d = tempfile::tempdir().unwrap();
+        let (ctx, clash) = three_slot_ctx(d.path()).await;
+        seed_health(
+            &ctx,
+            &[
+                (1, Some(true), 300, true),
+                (2, Some(true), 100, false),
+                (3, Some(true), 50, true),
+            ],
+        )
+        .await;
+        let grp = state::group_of(&*ctx.store.read().await);
+        let healthy = vec![Uuid::from_u128(1), Uuid::from_u128(3)];
+        let wait = std::time::Duration::from_millis(50);
+
+        let held = slot_switch(&ctx).lock_owned().await;
+        let borrow = borrow_now(
+            &ctx,
+            clash.clone(),
+            Uuid::from_u128(2),
+            OffsetDateTime::UNIX_EPOCH,
+        );
+        tokio::pin!(borrow);
+        assert!(
+            tokio::time::timeout(wait, &mut borrow).await.is_err(),
+            "锁被占着，借用必须等"
+        );
+        let drive = drive_slots(
+            &ctx,
+            clash.clone(),
+            &grp,
+            &healthy,
+            OffsetDateTime::UNIX_EPOCH,
+        );
+        tokio::pin!(drive);
+        assert!(
+            tokio::time::timeout(wait, &mut drive).await.is_err(),
+            "锁被占着，巡检也得等"
+        );
+        assert!(clash.calls().is_empty(), "等锁期间一次 PUT 都不许发");
+        drop(held);
+        assert_eq!(
+            borrow.await.len(),
+            1,
+            "放开后借用照常做完（只有槽 1 压在 IP 2 上）"
+        );
+        assert_eq!(drive.await.len(), 3, "放开后巡检照常做完三个槽");
     }
 }
