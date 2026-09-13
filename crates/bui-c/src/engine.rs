@@ -17,6 +17,8 @@ use std::time::Duration;
 /// TUN 就绪轮询次数：10 × 500ms = 5s。
 pub const APPLY_POLL_STEPS: u32 = 10;
 const POLL_INTERVAL_MS: u64 = 500;
+/// [`Engine::wait_tun_ready`] 最多等几秒，给提示文案用。
+pub const TUN_READY_WAIT_S: u64 = APPLY_POLL_STEPS as u64 * POLL_INTERVAL_MS / 1000;
 
 /// 一次 `apply` 实际改了什么，菜单与 `check` 据此决定提示语与后续动作。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -147,6 +149,19 @@ impl<'a, S: Sys> Engine<'a, S> {
             .unwrap_or(false)
     }
 
+    /// 刚（重）启完单元后等 TUN 就绪：[`APPLY_POLL_STEPS`] × 500ms 轮询
+    /// `is_active && tun_up`，先睡再查。`Type=simple` 的 is-active 在 exec 后立刻为真，
+    /// 必须连接口一起等（v3.6.0 的教训）。`apply` 与菜单 `[4] 重启` 共用。
+    pub fn wait_tun_ready(&self) -> bool {
+        for _ in 0..APPLY_POLL_STEPS {
+            self.sys.sleep(Duration::from_millis(POLL_INTERVAL_MS));
+            if systemd::is_active(self.sys, UNIT_MAIN) && self.tun_up() {
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn apply(&self, prof: &Profiles) -> Result<Applied> {
         if !self.sys.exists(&self.paths.singbox()) {
             return Err(Error::msg(format!(
@@ -232,16 +247,7 @@ impl<'a, S: Sys> Engine<'a, S> {
 
         if prof.mode == Mode::Tun {
             out.tun_ready = Some(if out.restarted {
-                // Type=simple 的 is-active 在 exec 后立刻为真，必须连接口一起等（v3.6.0 的教训）
-                let mut ready = false;
-                for _ in 0..APPLY_POLL_STEPS {
-                    self.sys.sleep(Duration::from_millis(POLL_INTERVAL_MS));
-                    if systemd::is_active(self.sys, UNIT_MAIN) && self.tun_up() {
-                        ready = true;
-                        break;
-                    }
-                }
-                ready
+                self.wait_tun_ready()
             } else {
                 // 什么都没改：不睡，直接报接口现状
                 systemd::is_active(self.sys, UNIT_MAIN) && self.tun_up()
@@ -440,6 +446,25 @@ mod tests {
             APPLY_POLL_STEPS as usize,
             "轮询 10 × 500ms，不用固定 sleep 2"
         );
+    }
+
+    #[test]
+    fn wait_tun_ready_polls_until_the_unit_is_active_and_the_interface_is_up() {
+        let s = FakeSys::new();
+        let pt = paths();
+        let e = Engine::new(&s, &pt);
+        s.reply("systemctl is-active --quiet bui-c.service", 0, "");
+        s.reply("ip link show bui-tun", 0, "5: bui-tun");
+        assert!(e.wait_tun_ready());
+        assert_eq!(s.sleeps(), vec![500], "先睡一拍再查，查到就停");
+
+        let s = FakeSys::new();
+        let e = Engine::new(&s, &pt);
+        s.reply("systemctl is-active --quiet bui-c.service", 0, "");
+        s.reply("ip link show bui-tun", 1, "");
+        assert!(!e.wait_tun_ready(), "单元 active 但接口没起来不算就绪");
+        assert_eq!(s.sleeps().len(), APPLY_POLL_STEPS as usize);
+        assert_eq!(TUN_READY_WAIT_S, 5, "提示文案里的「5 秒」");
     }
 
     #[test]

@@ -321,6 +321,73 @@ pub fn render_nodes(prof: &Profiles, with_back: bool) -> String {
     out
 }
 
+/// `[4] 服务控制` 的二级菜单里的一次选择。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceAction {
+    Restart,
+    Logs,
+    Back,
+}
+
+/// `[4] 服务控制` 二级菜单的日志行数，与选项文案同源。
+pub const SERVICE_LOG_LINES: u32 = 50;
+
+/// `[4] 服务控制` 的二级数字菜单（缩进与节点列表一致）。
+pub fn render_service_options() -> String {
+    format!("  [1] 重启 bui-c.service\n  [2] 最近 {SERVICE_LOG_LINES} 行日志\n  [0] 返回\n")
+}
+
+/// 二级菜单：空行与 `0` 返回，别的无法识别 → `None`（调用方打「无效选项」后返回）。
+pub fn parse_service_choice(input: &str) -> Option<ServiceAction> {
+    match normalize_digits(input).as_str() {
+        "" | "0" => Some(ServiceAction::Back),
+        "1" => Some(ServiceAction::Restart),
+        "2" => Some(ServiceAction::Logs),
+        _ => None,
+    }
+}
+
+/// 去掉 ANSI 转义：CSI（`ESC [ … 终止字节`，颜色就是它）、OSC（`ESC ] … BEL|ESC \`）
+/// 与其余两字节转义。sing-box 往 journald 里写带颜色的级别（`\x1b[36mINFO\x1b[0m`），
+/// 菜单约定无 ANSI，原样打出来在不认颜色的终端里是一串乱码。
+pub fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match it.next() {
+            // CSI：参数与中间字节之后，以 0x40..=0x7E 的终止字节收尾
+            Some('[') => {
+                for c in it.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            // OSC：以 BEL 或 ST（ESC \）收尾
+            Some(']') => {
+                while let Some(c) = it.next() {
+                    if c == '\u{7}' {
+                        break;
+                    }
+                    if c == '\u{1b}' {
+                        if it.peek() == Some(&'\\') {
+                            it.next();
+                        }
+                        break;
+                    }
+                }
+            }
+            // 其余两字节转义（`ESC c` 之类）连同那个字节一起丢；末尾孤零零的 ESC 也丢
+            _ => {}
+        }
+    }
+    out
+}
+
 /// 去空白 + 把全角数字（U+FF10..=U+FF19）折成 ASCII。
 ///
 /// 中文输入法下 `１` 是常见误触：真机截屏里就被判成了「无效选项」。
@@ -786,6 +853,46 @@ mod tests {
             Some("最后一行没换行")
         );
         assert_eq!(read_line_from(&mut r).unwrap(), None);
+    }
+
+    #[test]
+    fn strip_ansi_removes_colors_and_other_escapes() {
+        assert_eq!(
+            strip_ansi("\u{1b}[36mINFO\u{1b}[0m[0000] started"),
+            "INFO[0000] started"
+        );
+        assert_eq!(strip_ansi("\u{1b}[1;31mFATAL\u{1b}[m x"), "FATAL x");
+        assert_eq!(
+            strip_ansi("\u{1b}]0;title\u{7}正文"),
+            "正文",
+            "OSC 以 BEL 收尾"
+        );
+        assert_eq!(
+            strip_ansi("\u{1b}]8;;u\u{1b}\\链接"),
+            "链接",
+            "OSC 以 ST 收尾"
+        );
+        assert_eq!(strip_ansi("a\u{1b}cb"), "ab", "两字节转义");
+        assert_eq!(strip_ansi("尾巴\u{1b}"), "尾巴", "末尾孤立的 ESC");
+        assert_eq!(
+            strip_ansi("没有转义 [0000] 中文\n第二行"),
+            "没有转义 [0000] 中文\n第二行",
+            "普通文字与换行原样保留"
+        );
+    }
+
+    #[test]
+    fn service_submenu_is_numbered_and_parses_back_on_blank_or_zero() {
+        assert_eq!(
+            render_service_options(),
+            "  [1] 重启 bui-c.service\n  [2] 最近 50 行日志\n  [0] 返回\n"
+        );
+        assert_eq!(parse_service_choice("1"), Some(ServiceAction::Restart));
+        assert_eq!(parse_service_choice(" ２ "), Some(ServiceAction::Logs));
+        assert_eq!(parse_service_choice("0"), Some(ServiceAction::Back));
+        assert_eq!(parse_service_choice(""), Some(ServiceAction::Back));
+        assert_eq!(parse_service_choice("3"), None);
+        assert_eq!(parse_service_choice("x"), None);
     }
 
     #[test]

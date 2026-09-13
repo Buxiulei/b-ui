@@ -728,12 +728,10 @@ fn menu_body<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()
                 activate: false,
             }),
             Action::Service => {
-                // 服务控制：只保留「重启当前配置」这一个真实动作（v3 的服务子菜单大半是死代码）。
-                // 单元还没建就别 restart——systemd 只会回 `Unit bui-c.service not found`，
+                // 单元还没建就别进子菜单——systemd 只会回 `Unit bui-c.service not found`，
                 // 用户看不出该干什么（缺陷 5）。
                 if ctx.sys.exists(&ctx.paths.unit(UNIT_MAIN)) {
-                    systemd::restart(ctx.sys, UNIT_MAIN)?;
-                    ctx.say("已重启 bui-c.service");
+                    service_menu(ctx, prof.mode)?;
                 } else {
                     ctx.say("还没有安装引擎与单元：先导入节点（菜单 3 / 7）或跑 `bui-c update`");
                 }
@@ -770,6 +768,76 @@ fn menu_body<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()
             }
         }
         ctx.flush();
+    }
+}
+
+/// `[4] 服务控制` 的二级菜单：重启 / 看日志 / 返回（v3 的服务子菜单大半是死代码，
+/// 这里只留两个真实动作）。
+fn service_menu<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>, mode: Mode) -> Result<()> {
+    ctx.show(menu::render_service_options().trim_end());
+    ctx.flush();
+    let pick = ctx.prompt.line("选择 [0-2]")?;
+    match menu::parse_service_choice(&pick) {
+        Some(menu::ServiceAction::Back) => {}
+        None => ctx.say(format!("无效选项：{pick}")),
+        Some(menu::ServiceAction::Restart) => restart_service(ctx, mode),
+        Some(menu::ServiceAction::Logs) => match journal_tail(ctx.sys, menu::SERVICE_LOG_LINES) {
+            Ok(text) => ctx.show(text),
+            Err(why) => ctx.say(why),
+        },
+    }
+    Ok(())
+}
+
+/// 菜单里的「重启」：TUN 模式要等接口起来才算数（is-active 在 exec 后立刻为真），
+/// 没起来就把最近几行日志带出来，省得用户再去翻 journalctl。
+fn restart_service<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>, mode: Mode) {
+    if let Err(e) = systemd::restart(ctx.sys, UNIT_MAIN) {
+        ctx.say(format!("失败：{e}"));
+        return;
+    }
+    if mode == Mode::Socks {
+        ctx.say("已重启 bui-c.service");
+        return;
+    }
+    if Engine::new(ctx.sys, ctx.paths).wait_tun_ready() {
+        ctx.say("已重启 bui-c.service，bui-tun 已就绪");
+        return;
+    }
+    ctx.say(format!(
+        "已重启 bui-c.service，但 bui-tun 接口 {} 秒内没起来，最近日志：",
+        crate::engine::TUN_READY_WAIT_S
+    ));
+    match journal_tail(ctx.sys, 10) {
+        Ok(text) => ctx.show(text),
+        Err(why) => ctx.say(why),
+    }
+}
+
+/// `journalctl` 取 bui-c.service 最近 `n` 行，去掉 ANSI 颜色；取不到时 `Err` 是一句给用户看的说明。
+fn journal_tail<S: Sys>(sys: &S, n: u32) -> std::result::Result<String, String> {
+    let n = n.to_string();
+    let args = ["-u", UNIT_MAIN, "-n", &n, "--no-pager", "--output", "cat"];
+    match sys.run("journalctl", &args) {
+        Ok(o) if o.ok() => {
+            let text = menu::strip_ansi(o.stdout.trim_end());
+            if text.trim().is_empty() {
+                Err(format!("journalctl 里还没有 {UNIT_MAIN} 的日志"))
+            } else {
+                Ok(text)
+            }
+        }
+        Ok(o) => {
+            let detail = match o.stderr.trim() {
+                "" => String::new(),
+                e => format!("：{e}"),
+            };
+            Err(format!(
+                "读不到 {UNIT_MAIN} 的日志（journalctl 退出码 {}）{detail}",
+                o.code
+            ))
+        }
+        Err(e) => Err(format!("读不到 {UNIT_MAIN} 的日志（{e}）")),
     }
 }
 
@@ -1712,6 +1780,208 @@ mod tests {
         );
     }
 
+    /// 单元文件已经在（引擎装好了）的机器。
+    fn with_unit(s: &FakeSys) {
+        s.put("/etc/systemd/system/bui-c.service", "[Unit]");
+    }
+
+    const JOURNAL_50: &str = "journalctl -u bui-c.service -n 50 --no-pager --output cat";
+    const JOURNAL_10: &str = "journalctl -u bui-c.service -n 10 --no-pager --output cat";
+
+    #[test]
+    fn menu_service_control_is_a_numbered_submenu() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        with_unit(&s);
+        profiles_socks().save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        // 4 = 服务控制 → 0 返回（不重启）→ 0 退出
+        let mut p = Scripted::from(["4", "0", "0"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        for row in [
+            "  [1] 重启 bui-c.service",
+            "  [2] 最近 50 行日志",
+            "  [0] 返回",
+        ] {
+            assert!(t.lines().any(|l| l == row), "缺 {row:?}：\n{t}");
+        }
+        assert!(
+            !s.called("systemctl restart bui-c.service"),
+            "进子菜单不等于重启"
+        );
+        assert_eq!(
+            t.matches("B-UI 客户端").count(),
+            2,
+            "返回后重画主菜单：\n{t}"
+        );
+    }
+
+    #[test]
+    fn menu_service_submenu_blank_returns_and_junk_is_reported() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        with_unit(&s);
+        profiles_socks().save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        let mut p = Scripted::from(["4", "", "4", "x", "0"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert_eq!(
+            t.lines()
+                .filter(|l| l.contains("无效选项"))
+                .collect::<Vec<_>>(),
+            vec!["  无效选项：x"],
+            "空行静默返回，x 报一次：\n{t}"
+        );
+        assert!(!s.called("systemctl restart bui-c.service"));
+        assert_eq!(t.matches("B-UI 客户端").count(), 3, "{t}");
+    }
+
+    #[test]
+    fn menu_service_restart_in_socks_mode_does_not_wait_for_tun() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        with_unit(&s);
+        profiles_socks().save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        let mut p = Scripted::from(["4", "1", "0"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        assert!(s.called("systemctl restart bui-c.service"));
+        let t = ctx.transcript.clone();
+        assert!(t.lines().any(|l| l == "  已重启 bui-c.service"), "{t}");
+        assert!(
+            t.contains("[2] 最近 50 行日志"),
+            "先出子菜单，1 是子菜单里的「重启」：\n{t}"
+        );
+        assert!(
+            !t.contains("[1] alice-hy2-direct"),
+            "1 不能漏到主菜单去切节点：\n{t}"
+        );
+        assert!(s.sleeps().is_empty(), "SOCKS 模式没有接口可等");
+    }
+
+    #[test]
+    fn menu_service_restart_in_tun_mode_reports_the_interface() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        with_unit(&s);
+        s.reply("ip link show bui-tun", 0, "5: bui-tun");
+        crate::testutil::profiles_tun().save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        let mut p = Scripted::from(["4", "1", "0"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        assert!(s.called("systemctl restart bui-c.service"));
+        let t = ctx.transcript.clone();
+        assert!(
+            t.lines()
+                .any(|l| l == "  已重启 bui-c.service，bui-tun 已就绪"),
+            "{t}"
+        );
+        assert!(
+            !s.sleeps().is_empty(),
+            "要等接口起来，不能 restart 完就报好"
+        );
+        assert!(!s.called(JOURNAL_10), "就绪了不必翻日志");
+    }
+
+    #[test]
+    fn menu_service_restart_in_tun_mode_shows_logs_when_the_interface_never_comes_up() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        with_unit(&s);
+        s.reply("ip link show bui-tun", 1, "");
+        s.reply(
+            JOURNAL_10,
+            0,
+            "\u{1b}[31mFATAL\u{1b}[0m[0000] start service: open tun: operation not permitted\n",
+        );
+        crate::testutil::profiles_tun().save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        let mut p = Scripted::from(["4", "1", "0"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert!(
+            t.lines()
+                .any(|l| l == "  已重启 bui-c.service，但 bui-tun 接口 5 秒内没起来，最近日志："),
+            "{t}"
+        );
+        assert!(
+            t.lines()
+                .any(|l| l == "FATAL[0000] start service: open tun: operation not permitted"),
+            "日志原样打出、去掉颜色：\n{t}"
+        );
+        assert!(!t.contains('\u{1b}'), "菜单约定无 ANSI");
+        assert_eq!(
+            s.sleeps().len(),
+            crate::engine::APPLY_POLL_STEPS as usize,
+            "与 apply 同一段轮询：10 × 500ms"
+        );
+    }
+
+    #[test]
+    fn menu_service_logs_are_printed_without_ansi() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        with_unit(&s);
+        s.reply(
+            JOURNAL_50,
+            0,
+            "\u{1b}[36mINFO\u{1b}[0m[0000] sing-box started (0.12s)\n\u{1b}[33mWARN\u{1b}[0m[0001] inbound/mixed[mixed-in]: 127.0.0.1:1080\n",
+        );
+        profiles_socks().save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        let mut p = Scripted::from(["4", "2", "0"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        assert!(s.called(JOURNAL_50), "{:?}", s.calls());
+        assert!(!s.called("systemctl restart bui-c.service"));
+        let t = ctx.transcript.clone();
+        assert!(
+            t.lines()
+                .any(|l| l == "INFO[0000] sing-box started (0.12s)"),
+            "{t}"
+        );
+        assert!(
+            t.lines()
+                .any(|l| l == "WARN[0001] inbound/mixed[mixed-in]: 127.0.0.1:1080"),
+            "{t}"
+        );
+        assert!(!t.contains('\u{1b}'), "菜单约定无 ANSI：{t:?}");
+    }
+
+    #[test]
+    fn menu_service_logs_explain_when_journalctl_fails() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        with_unit(&s);
+        s.reply(JOURNAL_50, 1, "");
+        profiles_socks().save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        let mut p = Scripted::from(["4", "2", "0"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert!(
+            t.lines()
+                .any(|l| l.starts_with("  读不到 bui-c.service 的日志")),
+            "{t}"
+        );
+        assert!(!t.contains("失败："), "不当成菜单操作失败：{t}");
+    }
+
     #[test]
     fn menu_service_control_without_units_points_to_install() {
         let pp = paths();
@@ -1725,6 +1995,11 @@ mod tests {
         assert!(
             ctx.transcript.contains("bui-c update"),
             "单元不存在时应引导先装引擎：{}",
+            ctx.transcript
+        );
+        assert!(
+            !ctx.transcript.contains("最近 50 行日志"),
+            "没有单元就不进子菜单：{}",
             ctx.transcript
         );
         assert!(!s.called("systemctl restart bui-c.service"));
