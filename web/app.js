@@ -140,6 +140,7 @@ function load() {
 
         const m = new Date().toISOString().slice(0, 7);
         allUsers = u;
+        syncOpenConfig(u);
 
         // 二维码现在本地生成（见 renderQR），无需预取外部图片
 
@@ -305,8 +306,12 @@ function saveUser() {
 
 // 2026-09-14：四个免鉴权订阅端点的路径末段是每用户的随机订阅 token，不再是用户名
 // （响应体里有 hy2 明文密码与 vless uuid，「域名 + 用户名」在旧口径下就等于订阅凭据）。
-// 老 state 还没补齐 token 时 subPath 返回 null，调用方给一行中文提示，不拼出坏链接。
-const SUB_TOKEN_MISSING = "该用户还没有订阅 token：重启 b-ui 会自动补齐，也可点「重置订阅链接与凭据」立即生成";
+// 投影里取不到 token 时 subPath 返回 null，调用方只给一行提示，不拼出坏链接。
+//
+// 这一档在正常安装里不可达：三条建用户路径都自带 token，守护进程每次启动还会无条件补齐。
+// 它真出现就只有一种成因 —— 面板与服务端版本不匹配（投影没发 subToken），而那时
+// 「重启」和「点重置」都救不回来，所以文案不承诺任何自救动作（审查 6）。
+const SUB_TOKEN_MISSING = "取不到该用户的订阅 token，请联系运维核对面板与服务端版本是否匹配";
 
 function subPath(x, kind) {
     return x && x.subToken ? "/api/" + kind + "/" + encodeURIComponent(x.subToken) : null;
@@ -433,6 +438,21 @@ function showU(uname) {
     openM("m-cfg");
 }
 
+// 弹窗打开期间凭据被轮换（另一个管理员会话、或服务器上的 CLI）时按新值重画（审查 5）：
+// 订阅链接末段的 token、hy2 密码与 vless uuid 三样都是可轮换的凭据，旧值复制或下载出去
+// 拿到的是 404（端点对作废 token 一律回「User not found」的不可区分口径），管理员不会
+// 收到任何提示。以前末段是用户名、永不变，所以「弹窗打开期间不刷新」是安全的。
+// 用户被删或改名不在这里处理：弹窗留着，下次手动打开即可。
+function syncOpenConfig(users) {
+    const old = currentShowUser;
+    if (!old || !$("#m-cfg").classList.contains("on")) return;
+    const fresh = users.find(u => u.username === old.username);
+    if (!fresh) return;
+    if (["subToken", "password", "uuid"].every(k => fresh[k] === old[k])) return;
+    showU(fresh.username);
+    toast("该用户的订阅链接与凭据已被重置，弹窗已按新值刷新", 1);
+}
+
 // Copy URI
 function copy() {
     const fusion = currentShowUser && currentShowUser.protocol === "fusion";
@@ -479,7 +499,11 @@ function rotateSub() {
     api("/users/" + encodeURIComponent(x.username) + "/rotate", { method: "POST", body: JSON.stringify({}) })
         .then(r => {
             if (!r || !r.success) { done(); return toast((r && r.error) || "重置失败", 1); }
-            // 链接与二维码都来自 allUsers 里的面板投影，等列表刷新完再按新 token 重画
+            // 链接与二维码都来自 allUsers 里的面板投影，等列表刷新完再按新 token 重画。
+            // 先清掉 currentShowUser：本会话自己发起的这次变化不该再被 syncOpenConfig
+            // 当成「别人改的」弹第二条提示；这段空窗里点复制会提示「请先选择用户」，
+            // 比复制出一条已作废的链接好。
+            currentShowUser = null;
             return load().then(() => {
                 done();
                 showU(x.username);
