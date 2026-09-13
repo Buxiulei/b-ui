@@ -99,25 +99,30 @@ BUI_C_GITHUB="$gh404" BUI_C_RELEASES_API="$api404" \
 test -x "$work/bin5/bui-c" || { echo "FAIL: 面板占位符版没装上"; exit 1; }
 cmp -s "$pkg/bui-c-linux-amd64" "$work/bin5/bui-c" || { echo "FAIL: 面板占位符版内容不一致"; exit 1; }
 
-# 6) 面板源 404 → GitHub releases/latest 404 → 回退到 releases 列表里最新的预发布 tag
-ghdir="$pkg/gh/releases/download/v4.0.0-rc9"
+# 6) 面板源 404 → GitHub releases/latest 404 → 回退到 releases 列表里版本号最大的预发布 tag
+ghdir="$pkg/gh/releases/download/v4.0.0-rc10"
 mkdir -p "$ghdir"
 printf 'prerelease-bui-c-binary\n' > "$ghdir/bui-c-linux-amd64"
 cp "$ghdir/bui-c-linux-amd64" "$ghdir/bui-c-linux-arm64"
 ghsha="$(sha256sum "$ghdir/bui-c-linux-amd64" | cut -d' ' -f1)"
 write_manifest "$ghdir/manifest.json" "$ghsha"
-# 仿 GitHub API 的 releases 列表（新→旧）：带空格与换行的 pretty JSON。
-#   第一条 v4.0.1 不是 vX.Y.Z-rcN 形状（且 prerelease=false）→ 必须跳过；它的正文里故意
-#   写了字面的 \"tag_name\": \"v9.9.9\"，用来验证按字段名比对（$2 == "tag_name"）不会误命中；
-#   第二条 nightly 也不是 rc 形状 → 跳过；第三条 v4.0.0-rc9 才是要选的那个；
-#   第四条 v4.0.0-rc8 更旧，守住「只取第一个匹配」（选中它下面的 cmp 就过不了）。
+# 仿 GitHub API 的 releases 列表：带空格与换行的 pretty JSON，rc 的顺序照 2026-09-13 实测
+# （rc9 → rc8 → rc7 → rc10 → rc6，最新的 rc10 排第 4：这个列表不按创建时间倒序）。
+# 要选的是版本号最大的 rc10，排在它前面的都是干扰项：
+#   v4.0.1 不是 vX.Y.Z-rcN 形状（且 prerelease=false）→ 跳过；它的正文里故意写了字面的
+#     \"tag_name\": \"v9.9.9\"，用来验证按字段名比对（$2 == "tag_name"）不会误命中；
+#   nightly 不是 rc 形状 → 跳过；
+#   v4.0.2-rc1 是 rc 形状、版本号更大，但 prerelease=false → 跳过；
+#   v4.0.0-rc4294967296 超出 u32 → 跳过（与 bui-c 的 rc_version 同一个上界）；
+#   v4.0.0-rc9 是排在最前的预发布 rc：选中它就是本次缺陷（下面的 cmp 过不了）。
 #
 # 夹具必须撑到 300KB 这么大，小了测不出真正的缺陷。脚本里那条 `tr … | awk …` 跑在
 # `set -o pipefail` 下：awk 命中后若提前 exit，tr 会继续往已关闭的管道写而吃到 SIGPIPE
 # （退出码 141），pipefail 把整条管道判为非零，set -e 于是静默杀掉整个脚本（2026-09-13
 # 在 baiyi 真机 `bash -x` 复现，rc=141 且什么都不打印；真实 GitHub 响应 251KB）。
+# 现在取最大值本来就要读完整个列表，这两段填充留作回归守门（谁再加回提前 exit 就会炸）。
 # 管道缓冲是 64KB，所以两段填充缺一不可：
-#   * 第一条 body 里的 100KB，把命中的 rc tag 顶到 64KB 之后；
+#   * 第一条 body 里的 100KB，把要选的 rc tag 顶到 64KB 之后；
 #   * 最后一条 body 里的 200KB，保证 awk 退出时 tr 还剩 ≫64KB 没写完 —— 只填前面的话，
 #     awk 读到命中位置时 tr 早已写完并正常退出，SIGPIPE 根本不会发生（实测 rc=0）。
 # 填充不含逗号，免得被脚本里的 `tr ',' '\n'` 切开。
@@ -136,12 +141,37 @@ write_manifest "$ghdir/manifest.json" "$ghsha"
     "body": "不是 vX.Y.Z-rcN 形状 必须跳过"
   },
   {
+    "tag_name": "v4.0.2-rc1",
+    "prerelease": false,
+    "body": "rc 形状但不是预发布 必须跳过"
+  },
+  {
+    "tag_name": "v4.0.0-rc4294967296",
+    "prerelease": true,
+    "body": "超出 u32 必须跳过"
+  },
+  {
     "tag_name": "v4.0.0-rc9",
     "prerelease": true,
-    "body": "预发布 应当选中它"
+    "body": "排在最前的预发布 rc 不是最新的"
   },
   {
     "tag_name": "v4.0.0-rc8",
+    "prerelease": true,
+    "body": "更旧"
+  },
+  {
+    "tag_name": "v4.0.0-rc7",
+    "prerelease": true,
+    "body": "更旧"
+  },
+  {
+    "tag_name": "v4.0.0-rc10",
+    "prerelease": true,
+    "body": "版本号最大 应当选中它"
+  },
+  {
+    "tag_name": "v4.0.0-rc6",
     "prerelease": true,
     "body": "更旧的预发布 不该被选中；正文填充把管道撑过 64KB '
   head -c 200000 /dev/zero | tr '\0' 'y'
@@ -150,17 +180,52 @@ write_manifest "$ghdir/manifest.json" "$ghsha"
 ]'
 } > "$pkg/gh/releases.json"
 BUI_C_SOURCE="$base/nope" BUI_C_GITHUB="$base/gh" BUI_C_RELEASES_API="$base/gh/releases.json" \
-  BUI_C_PREFIX="$work/bin6" bash "$here/bui-c-install.sh" 2>"$work/err6"
+  BUI_C_PREFIX="$work/bin6" bash "$here/bui-c-install.sh" 2>"$work/err6" \
+  || { echo "FAIL: 预发布回退失败"; cat "$work/err6"; exit 1; }
 test -x "$work/bin6/bui-c" || { echo "FAIL: 预发布回退没装上"; cat "$work/err6"; exit 1; }
 cmp -s "$ghdir/bui-c-linux-amd64" "$work/bin6/bui-c" \
   || { echo "FAIL: 装的不是预发布 tag 下的那份产物"; exit 1; }
-grep -q "回退到预发布 v4.0.0-rc9" "$work/err6" \
-  || { echo "FAIL: 没报回退到 v4.0.0-rc9"; cat "$work/err6"; exit 1; }
+grep -q "回退到预发布 v4.0.0-rc10" "$work/err6" \
+  || { echo "FAIL: 没报回退到 v4.0.0-rc10"; cat "$work/err6"; exit 1; }
 # 探测型尝试（面板源、releases/latest）失败时已有中文提示，curl 自己的英文报错行只是噪音：
 # 2026-09-13 baiyi 真机上每次都先蹦一行 `curl: (22) The requested URL returned error: 404`
 if grep -q '^curl:' "$work/err6"; then
   echo "FAIL: 探测失败不该打出 curl 的原始报错行"; cat "$work/err6"; exit 1
 fi
+
+# 6b) 跨版本按数值比：v4.0.1-rc1 > v4.0.0-rc10 > v4.0.0-rc9（排在列表最后也要选中）
+gh2="$pkg/gh2/releases/download/v4.0.1-rc1"
+mkdir -p "$gh2"
+cp "$ghdir/bui-c-linux-amd64" "$gh2/bui-c-linux-amd64"
+cp "$ghdir/bui-c-linux-amd64" "$gh2/bui-c-linux-arm64"
+write_manifest "$gh2/manifest.json" "$ghsha"
+printf '%s\n' '[{"tag_name":"v4.0.0-rc9","prerelease":true},{"tag_name":"v4.0.0-rc10","prerelease":true},{"tag_name":"v4.0.1-rc1","prerelease":true}]' \
+  > "$pkg/gh2/releases.json"
+BUI_C_SOURCE="$base/nope" BUI_C_GITHUB="$base/gh2" BUI_C_RELEASES_API="$base/gh2/releases.json" \
+  BUI_C_PREFIX="$work/bin6b" bash "$here/bui-c-install.sh" 2>"$work/err6b" \
+  || { echo "FAIL: 跨版本回退失败"; cat "$work/err6b"; exit 1; }
+grep -q "回退到预发布 v4.0.1-rc1" "$work/err6b" \
+  || { echo "FAIL: 跨版本没取到 v4.0.1-rc1"; cat "$work/err6b"; exit 1; }
+
+# 6c) 前导零按数值比、数值相同取后出现的那个（release.yml 的 tag 正则 ^v[0-9]+\.[0-9]+\.[0-9]+-rc[0-9]+$
+#     放前导零过，这种 tag 会被标成预发布）。要选的是排在最后的 v4.10.0-rc10，前面都是干扰项：
+#   v4.9.0-rc9      minor 按字典序比（"9" > "010"）会选中它；
+#   v4.010.0-rc9    rc 按字典序比（"9" > "010"）会选中它；
+#   v4.010.0-rc010  与 v4.10.0-rc10 数值相同 (4, 10, 0, 10)：平局取列表里后出现的那个（与 bui-c 的
+#                   max_by_key 并列返回最后一个、install.sh 的 awk 一致），平局取前者会选中它。
+#   只有 v4.10.0-rc10 下放了产物，选错哪一个都取不到 manifest。
+gh3="$pkg/gh3/releases/download/v4.10.0-rc10"
+mkdir -p "$gh3"
+cp "$ghdir/bui-c-linux-amd64" "$gh3/bui-c-linux-amd64"
+cp "$ghdir/bui-c-linux-amd64" "$gh3/bui-c-linux-arm64"
+write_manifest "$gh3/manifest.json" "$ghsha"
+printf '%s\n' '[{"tag_name":"v4.9.0-rc9","prerelease":true},{"tag_name":"v4.010.0-rc9","prerelease":true},{"tag_name":"v4.010.0-rc010","prerelease":true},{"tag_name":"v4.10.0-rc10","prerelease":true}]' \
+  > "$pkg/gh3/releases.json"
+BUI_C_SOURCE="$base/nope" BUI_C_GITHUB="$base/gh3" BUI_C_RELEASES_API="$base/gh3/releases.json" \
+  BUI_C_PREFIX="$work/bin6c" bash "$here/bui-c-install.sh" 2>"$work/err6c" \
+  || { echo "FAIL: 前导零 / 平局回退失败"; cat "$work/err6c"; exit 1; }
+grep -q "回退到预发布 v4.10.0-rc10" "$work/err6c" \
+  || { echo "FAIL: 前导零 / 平局没取到 v4.10.0-rc10"; cat "$work/err6c"; exit 1; }
 
 # 7) 三条来源都不通 → 报错退出，不写任何文件
 if BUI_C_SOURCE="$base/nope" BUI_C_GITHUB="$gh404" BUI_C_RELEASES_API="$api404" \

@@ -12,7 +12,7 @@
 # 三个常用环境变量：
 #   BUI_DOMAIN=<面板域名>   给域名且**一个问题都不问**（等价于 --domain --yes；裁决 2026-09-12：
 #                           环境变量那条写法的语义就是无人值守）。想要问答就用 --domain。
-#   BUI_VERSION=v4.0.1      指定版本（默认 latest；只有预发布时 latest 会 404，自动回退到最新 v4* 标签）
+#   BUI_VERSION=v4.0.1      指定版本（默认 latest；只有预发布时 latest 会 404，自动回退到版本号最大的 rc 预发布）
 #   BUI_MANIFEST_URL=<url>  直接指定 manifest（覆盖 BUI_VERSION；M5 演练用本机 http.server 托管的那份，
 #                           环境变量会随 exec 传给 bui install，与 C5 的 BUI_MANIFEST_URL 同名同义）。
 #                           没设时本脚本会把**自己实际用的**那个地址（BUI_VERSION 指定的 tag，或
@@ -138,18 +138,25 @@ fetch() {
 
 latest_v4_tag() {
     # $1 = 临时目录。GitHub 的 releases/latest 只认正式版：仓库里只有 v4.0.0-rc1 这类**预发布**时
-    # 它 404（2026-09-12 裁决「预发布与首推」），于是从 releases 列表（新→旧，含预发布）取第一个 v4*。
+    # 它 404（2026-09-12 裁决「预发布与首推」），于是从 releases 列表（含预发布）里挑。
     local list="$1/releases.json"; fetch "https://api.github.com/repos/$REPO/releases?per_page=100" "$list" >&2 || return 1
+    # 挑法与 bui / bui-c 的 latest_rc_tag 同口径：prerelease=true 且形如 vX.Y.Z-rcN 的里按 (x, y, z, N)
+    # 数值取最大，任一段超出 u32（4294967295）的跳过。**不看列表顺序**：这个列表不按创建时间倒序
+    # （2026-09-13 实测返回 rc9 → rc8 → rc7 → rc10 → rc6，最新的 rc10 排第 4，取第一个会装成 rc9）。
     # 逐字段比对键名（$2=="tag_name"）而不是 /"tag_name"/：release body 里出现字面 \"tag_name\" 时
     # 正则会误命中，字段比对不会（tr 后每片形如 {"tag_name":"v4.0.0-rc2"，以 " 切分 $2 即键名）。
-    # awk 命中后**不能** exit：真实列表 200KB+，提前退出时 tr 还有 ≫64KB（管道缓冲）没写完 ⇒
-    # SIGPIPE（141）⇒ pipefail 判整条管道失败 ⇒ 回退失效（客户端脚本 784c525 修过同一处）。
-    tr ',' '\n' < "$list" | awk -F'"' '!found && $2 == "tag_name" && $4 ~ /^v4/ { print $4; found = 1 }'
+    # GitHub 的 release 对象里 tag_name 在 prerelease 之前，所以 prerelease 那片配的就是刚读到的 t。
+    # awk 读完整个流才在 END 打印（取最大值本来就得读完）：真实列表 200KB+，提前 exit 时 tr 还有
+    # ≫64KB（管道缓冲）没写完 ⇒ SIGPIPE（141）⇒ pipefail 判整条管道失败 ⇒ 回退失效（客户端脚本
+    # 784c525 修过同一处）。两行写法是为了守住有效代码 ≤150 行（test-install.sh），与
+    # scripts/bui-c-install.sh 里分行写的那段逻辑逐句相同。
+    tr ',' '\n' < "$list" | awk -F'"' '$2 == "tag_name" { t = $4 } $2 == "prerelease" && $3 ~ /true/ && t ~ /^v[0-9]+\.[0-9]+\.[0-9]+-rc[0-9]+$/ { split(substr(t, 2), v, /\.|-rc/)
+        for (i = 1; i <= 4; i++) if (v[i] + 0 > 4294967295) next; for (i = 1; i <= 4 && v[i] + 0 == b[i] + 0; i++); if (i > 4 || v[i] + 0 > b[i] + 0) { best = t; split(substr(t, 2), b, /\.|-rc/) } } END { if (best != "") print best }'
 }
 
 get_manifest() {
     # $1 = manifest 落地路径。BUI_MANIFEST_URL 直接用；否则先试 releases/latest，
-    # 它 404（仓库里只有预发布）时回退到 releases 列表里最新的 v4* 标签。
+    # 它 404（仓库里只有预发布）时回退到 releases 列表里版本号最大的 rc 预发布（见 latest_v4_tag）。
     #
     # 第一次尝试走 quiet：预发布期 releases/latest **必然** 404，那条「直连与全部镜像均不可达」
     # 对 404 是误导（源好得很，只是还没有正式版）。真的取不到时由下面两条自己说清楚。

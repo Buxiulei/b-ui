@@ -52,10 +52,11 @@ pub const MANIFEST_URL_ENV: &str = "BUI_MANIFEST_URL";
 /// 所以切换预发布通道那一行日志带上它。
 pub const BUILD_TAG: Option<&str> = option_env!("BUI_BUILD_TAG");
 
-/// GitHub 的 releases 列表（**无凭据**，只取最近 10 条）：`releases/latest` 不解析预发布，
-/// 预发布通道靠它找最新的 rc tag。仓库与 [`MANIFEST_URL`] 必须是同一个。
+/// GitHub 的 releases 列表（**无凭据**，一页取满 100 条——API 的上限）：`releases/latest` 不解析
+/// 预发布，预发布通道靠它找最新的 rc tag。这个列表不按创建时间排序（见 [`latest_rc_tag`]），
+/// 页小了新 rc 可能落在第一页之外。仓库与 [`MANIFEST_URL`] 必须是同一个。
 pub const RELEASES_API_URL: &str =
-    "https://api.github.com/repos/Buxiulei/b-ui/releases?per_page=10";
+    "https://api.github.com/repos/Buxiulei/b-ui/releases?per_page=100";
 
 /// 总纲 C4 的形状：`version` 是 bui 自己的版本，`kernels` 是版本表（键 = state `versions` 的
 /// 字段名，下划线），`artifacts` 的键固定 `<name>-linux-<amd64|arm64>`（name = 二进制名，
@@ -252,16 +253,37 @@ struct GhRelease {
     prerelease: bool,
 }
 
-/// releases 列表里最新的预发布 rc tag：列表按创建时间倒序，取第一个 `prerelease=true`
-/// 且 tag 形如 `v<x.y.z>-rcN` 的。没有就 `None`（调用方把原来的 404 上抛）。
+/// rc tag 的 (x, y, z, N)，按数值比大小用。不是 rc tag（[`is_rc_tag`]）或任一段超出 `u32`
+/// （超长 / 溢出）就 `None`，调用方跳过这条。
+fn rc_version(tag: &str) -> Option<(u32, u32, u32, u32)> {
+    if !is_rc_tag(tag) {
+        return None;
+    }
+    let (core, rc) = tag.strip_prefix('v')?.split_once("-rc")?;
+    let mut seg = core.split('.').map(str::parse::<u32>);
+    Some((
+        seg.next()?.ok()?,
+        seg.next()?.ok()?,
+        seg.next()?.ok()?,
+        rc.parse().ok()?,
+    ))
+}
+
+/// releases 列表里版本号最大的预发布 rc tag：所有 `prerelease=true` 且 tag 形如
+/// `v<x.y.z>-rcN` 的条目按 (x, y, z, N) 数值取最大（v4.0.1-rc1 > v4.0.0-rc10 > v4.0.0-rc9），
+/// **不看列表顺序**。这个 API 的返回不按创建时间倒序：2026-09-13 实测 `?per_page=5` 返回
+/// rc9 → rc8 → rc7 → rc10 → rc6，最新的 rc10 排第 4；取第一个就让 bwg-rick 在 rc9 上
+/// `bui upgrade` 拿到 rc9 的 manifest、打印「已最新」。没有就 `None`（调用方把原来的 404 上抛）。
 pub fn latest_rc_tag(fetcher: &dyn Fetcher) -> anyhow::Result<Option<String>> {
     let bytes = fetcher.get_bytes(RELEASES_API_URL)?;
     let list: Vec<GhRelease> =
         serde_json::from_slice(&bytes).context("解析 GitHub releases 列表失败")?;
     Ok(list
         .into_iter()
-        .find(|r| r.prerelease && is_rc_tag(&r.tag_name))
-        .map(|r| r.tag_name))
+        .filter(|r| r.prerelease)
+        .filter_map(|r| rc_version(&r.tag_name).map(|v| (v, r.tag_name)))
+        .max_by_key(|(v, _)| *v)
+        .map(|(_, tag)| tag))
 }
 
 /// **唯一**一处决定 manifest 地址（纯函数，便于测试）：
@@ -730,8 +752,8 @@ mod tests {
         r#"{"version":"4.0.0","tag":"v4.0.0-rc2","kernels":{},"artifacts":{}}"#;
     const PLAIN_MANIFEST: &str =
         r#"{"version":"4.0.0","tag":"v4.0.0","kernels":{},"artifacts":{}}"#;
-    /// GitHub 的 releases 列表按创建时间倒序。第 1 条是 rc 形状但 `prerelease=false`
-    /// （必须跳过），第 2 条是 prerelease 但 tag 不匹配（必须跳过）。
+    /// 第 1 条是 rc 形状、版本号最大但 `prerelease=false`（必须跳过），第 2 条是 prerelease 但
+    /// tag 不匹配（必须跳过），剩下的里取版本号最大的 rc2。
     const RELEASES_JSON: &str = r#"[
       {"tag_name": "v4.0.1-rc1", "prerelease": false},
       {"tag_name": "nightly",    "prerelease": true},
@@ -750,6 +772,141 @@ mod tests {
         assert!(!is_rc_tag("v4.0.0-rc"), "rc 后面必须有数字");
         assert!(!is_rc_tag("v4.0.0-rc1x"), "整串锚定：后面不许有尾巴");
         assert!(!is_rc_tag("v4.0.0-rc1-rc2"), "整串锚定：不许接第二个 rc");
+    }
+
+    /// 2026-09-13 实测 `GET …/releases?per_page=5` 的返回顺序：最新的 rc10（13:54Z 创建）排在
+    /// rc9（13:07Z）、rc8（11:39Z）、rc7（04:02Z）之后——这个列表**不**按创建时间倒序。
+    const RELEASES_JSON_OBSERVED: &str = r#"[
+      {"tag_name": "v4.0.0-rc9",  "prerelease": true},
+      {"tag_name": "v4.0.0-rc8",  "prerelease": true},
+      {"tag_name": "v4.0.0-rc7",  "prerelease": true},
+      {"tag_name": "v4.0.0-rc10", "prerelease": true},
+      {"tag_name": "v4.0.0-rc6",  "prerelease": true}
+    ]"#;
+
+    fn rc_from(list: &str) -> Option<String> {
+        latest_rc_tag(&FakeFetcher::new(vec![(RELEASES_API_URL, list)])).unwrap()
+    }
+
+    #[test]
+    fn the_rc_channel_picks_the_highest_version_not_the_first_listed() {
+        // bwg-rick 在 rc9 上跑 `bui upgrade`：取「第一个」拿到的是 rc9 的 manifest，打印「已最新」
+        assert_eq!(
+            rc_from(RELEASES_JSON_OBSERVED).as_deref(),
+            Some("v4.0.0-rc10")
+        );
+        let rc10 = manifest_url_for_tag("v4.0.0-rc10");
+        let f = FakeFetcher::new(vec![
+            (RELEASES_API_URL, RELEASES_JSON_OBSERVED),
+            (&rc10, RC_MANIFEST),
+        ]);
+        let (url, _) = fetch_manifest_with(&f, None, None, None).unwrap();
+        assert_eq!(url, rc10, "latest 404 之后跟的是 rc10 的 manifest");
+    }
+
+    #[test]
+    fn rc_tags_compare_numerically_across_versions() {
+        // 按数值比 (x, y, z, N)：rc10 > rc9（不是字典序），v4.0.1-rc1 > v4.0.0-rc10（跨 patch）
+        let list = r#"[
+          {"tag_name": "v4.0.0-rc9",  "prerelease": true},
+          {"tag_name": "v4.0.0-rc10", "prerelease": true},
+          {"tag_name": "v4.0.1-rc1",  "prerelease": true}
+        ]"#;
+        assert_eq!(rc_from(list).as_deref(), Some("v4.0.1-rc1"));
+        let list = r#"[
+          {"tag_name": "v9.9.9-rc9",  "prerelease": true},
+          {"tag_name": "v4.1.0-rc1",  "prerelease": true},
+          {"tag_name": "v10.0.0-rc1", "prerelease": true},
+          {"tag_name": "v4.0.9-rc99", "prerelease": true}
+        ]"#;
+        assert_eq!(rc_from(list).as_deref(), Some("v10.0.0-rc1"));
+    }
+
+    #[test]
+    fn rc_shaped_tags_that_are_not_prereleases_are_skipped() {
+        // 版本号最大的两条都不是预发布（一条显式 false，一条缺字段按 false 算）
+        let list = r#"[
+          {"tag_name": "v4.0.2-rc1",  "prerelease": false},
+          {"tag_name": "v4.0.1-rc3"},
+          {"tag_name": "v4.0.0-rc9",  "prerelease": true},
+          {"tag_name": "v4.0.0-rc10", "prerelease": true}
+        ]"#;
+        assert_eq!(rc_from(list).as_deref(), Some("v4.0.0-rc10"));
+        assert_eq!(
+            rc_from(r#"[{"tag_name":"v4.0.2-rc1","prerelease":false}]"#),
+            None
+        );
+    }
+
+    #[test]
+    fn malformed_or_overflowing_rc_tags_are_skipped_without_panicking() {
+        // 每一段按 u32 解析，解析不了（超长 / 溢出）就跳过；形状不对的本来就不是 rc tag
+        let list = r#"[
+          {"tag_name": "v4.0.0-rc4294967296",            "prerelease": true},
+          {"tag_name": "v4.0.99999999999999999999-rc1",  "prerelease": true},
+          {"tag_name": "v99999999999999999999.0.0-rc1",  "prerelease": true},
+          {"tag_name": "v5.0.0-rc1x",                    "prerelease": true},
+          {"tag_name": "v5.0-rc1",                       "prerelease": true},
+          {"tag_name": "v5.0.0-rc",                      "prerelease": true},
+          {"tag_name": "v5.0.0",                         "prerelease": true},
+          {"tag_name": "nightly",                        "prerelease": true},
+          {"tag_name": "v4.0.0-rc9",                     "prerelease": true},
+          {"tag_name": "v4.0.0-rc10",                    "prerelease": true}
+        ]"#;
+        assert_eq!(rc_from(list).as_deref(), Some("v4.0.0-rc10"));
+        // u32::MAX 本身还解析得了（shell 那两份按同一个上界比）
+        let list = r#"[
+          {"tag_name": "v4.0.0-rc10",         "prerelease": true},
+          {"tag_name": "v4.0.0-rc4294967295", "prerelease": true}
+        ]"#;
+        assert_eq!(rc_from(list).as_deref(), Some("v4.0.0-rc4294967295"));
+        assert_eq!(
+            rc_from(r#"[{"tag_name":"v4.0.0-rc4294967296","prerelease":true}]"#),
+            None
+        );
+    }
+
+    /// 两条都是 prerelease 的列表，给下面按 tag 对拍的用例用（test-install-sh.sh 的 pick2 同一形状）。
+    fn two_prereleases(a: &str, b: &str) -> String {
+        format!(
+            r#"[{{"tag_name":"{a}","prerelease":true}},{{"tag_name":"{b}","prerelease":true}}]"#
+        )
+    }
+
+    #[test]
+    fn leading_zeros_compare_by_value_not_lexically() {
+        // release.yml 的 tag 正则 `^v[0-9]+\.[0-9]+\.[0-9]+-rc[0-9]+$` 放前导零过，这种 tag 发得出去、
+        // 会被标成 prerelease。每段按数值比：rc010 = 10 > 9，v4.010.0 = v4.10.0 > v4.9.0（字典序
+        // 正好反过来）。两种排列取到同一个，与列表顺序无关。
+        for (a, b, want) in [
+            ("v4.0.0-rc9", "v4.0.0-rc010", "v4.0.0-rc010"),
+            ("v4.0.0-rc010", "v4.0.0-rc9", "v4.0.0-rc010"),
+            ("v4.9.0-rc1", "v4.010.0-rc1", "v4.010.0-rc1"),
+            ("v4.010.0-rc1", "v4.9.0-rc1", "v4.010.0-rc1"),
+        ] {
+            assert_eq!(
+                rc_from(&two_prereleases(a, b)).as_deref(),
+                Some(want),
+                "[{a}, {b}]"
+            );
+        }
+    }
+
+    #[test]
+    fn equal_versions_resolve_to_the_later_listed_tag() {
+        // rc1 与 rc01 数值相同：取列表里后出现的那个。这边靠 max_by_key 并列时返回最后一个，
+        // install.sh / bui-c-install.sh 的 awk 靠 `i > 4 ||` 那一支替换；test-install-sh.sh 与
+        // test-bui-c-install.sh 断言同样的结果，谁改了任一边的比较分支，Rust 与 shell 就在这里分叉。
+        for (a, b, want) in [
+            ("v4.0.0-rc1", "v4.0.0-rc01", "v4.0.0-rc01"),
+            ("v4.0.0-rc01", "v4.0.0-rc1", "v4.0.0-rc1"),
+        ] {
+            assert_eq!(
+                rc_from(&two_prereleases(a, b)).as_deref(),
+                Some(want),
+                "[{a}, {b}]"
+            );
+        }
     }
 
     #[test]
@@ -787,7 +944,7 @@ mod tests {
             (&rc_url, RC_MANIFEST),
         ]);
         let (url, m) = fetch_manifest_with(&f, None, None, None).unwrap();
-        assert_eq!(url, rc_url, "取列表里第一个 prerelease=true 且 tag 匹配的");
+        assert_eq!(url, rc_url, "prerelease=true 且 tag 匹配的里取版本号最大的");
         assert_eq!(m.version, "4.0.0");
         assert_eq!(m.tag.as_deref(), Some("v4.0.0-rc2"));
         assert_eq!(
