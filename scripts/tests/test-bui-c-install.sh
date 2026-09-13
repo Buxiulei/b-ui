@@ -156,6 +156,11 @@ cmp -s "$ghdir/bui-c-linux-amd64" "$work/bin6/bui-c" \
   || { echo "FAIL: 装的不是预发布 tag 下的那份产物"; exit 1; }
 grep -q "回退到预发布 v4.0.0-rc9" "$work/err6" \
   || { echo "FAIL: 没报回退到 v4.0.0-rc9"; cat "$work/err6"; exit 1; }
+# 探测型尝试（面板源、releases/latest）失败时已有中文提示，curl 自己的英文报错行只是噪音：
+# 2026-09-13 baiyi 真机上每次都先蹦一行 `curl: (22) The requested URL returned error: 404`
+if grep -q '^curl:' "$work/err6"; then
+  echo "FAIL: 探测失败不该打出 curl 的原始报错行"; cat "$work/err6"; exit 1
+fi
 
 # 7) 三条来源都不通 → 报错退出，不写任何文件
 if BUI_C_SOURCE="$base/nope" BUI_C_GITHUB="$gh404" BUI_C_RELEASES_API="$api404" \

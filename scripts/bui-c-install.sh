@@ -54,13 +54,21 @@ if [ -z "$SOURCE" ]; then
     esac
 fi
 
-fetch_manifest() { curl -fsSL --max-time 30 "$1/manifest.json" -o "$MANIFEST"; }
+# $2=quiet：探测型尝试（① 与 ②）失败时后面有自己的中文提示，curl 那行英文报错只是噪音
+# （2026-09-13 baiyi 真机：releases/latest 必然 404，每次都先蹦一行 `curl: (22) … 404`）。
+fetch_manifest() {
+    if [ "${2:-}" = quiet ]; then
+        curl -fsL --max-time 30 "$1/manifest.json" -o "$MANIFEST"
+    else
+        curl -fsSL --max-time 30 "$1/manifest.json" -o "$MANIFEST"
+    fi
+}
 
 GOT=""
 # ① 面板下发的源，或用户显式指定的源
 if [ -n "$SOURCE" ]; then
     print_info "读取 $SOURCE/manifest.json"
-    if fetch_manifest "$SOURCE"; then
+    if fetch_manifest "$SOURCE" quiet; then
         GOT=1
     else
         print_warning "$SOURCE/manifest.json 取不到，改试 GitHub Releases"
@@ -71,7 +79,7 @@ fi
 if [ -z "$GOT" ]; then
     SOURCE="$GITHUB/releases/latest/download"
     print_info "读取 $SOURCE/manifest.json"
-    if fetch_manifest "$SOURCE"; then
+    if fetch_manifest "$SOURCE" quiet; then
         GOT=1
     fi
 fi
