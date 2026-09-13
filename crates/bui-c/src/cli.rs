@@ -119,6 +119,9 @@ pub struct Ctx<'a, S: Sys, N: Net, P: Prompt> {
     pub out: String,
     /// 说过的全部话，`flush()` 不清空。菜单循环里每轮都 flush，测试只能靠它断言
     pub transcript: String,
+    /// [`say`](Self::say) 每行前加的缩进。默认顶格；菜单循环里设成两列，让「无效选项」
+    /// 「已切到…」这类结果行跟菜单对齐，而不是顶在最左边。
+    pub indent: &'static str,
 }
 
 impl<'a, S: Sys, N: Net, P: Prompt> Ctx<'a, S, N, P> {
@@ -139,13 +142,30 @@ impl<'a, S: Sys, N: Net, P: Prompt> Ctx<'a, S, N, P> {
             yes,
             out: String::new(),
             transcript: String::new(),
+            indent: "",
         }
     }
+    /// 说一句（可多行）：每个非空行前加 [`indent`](Self::indent)，空行不留尾随空格。
     pub fn say(&mut self, line: impl AsRef<str>) {
-        self.out.push_str(line.as_ref());
-        self.out.push('\n');
-        self.transcript.push_str(line.as_ref());
-        self.transcript.push('\n');
+        let mut text = String::new();
+        for l in line.as_ref().split('\n') {
+            if !l.is_empty() {
+                text.push_str(self.indent);
+            }
+            text.push_str(l);
+            text.push('\n');
+        }
+        self.emit(&text);
+    }
+    /// 原样打一块已经排好版的文字（菜单、节点列表、状态块），不叠 `indent`。
+    pub fn show(&mut self, block: impl AsRef<str>) {
+        let mut text = block.as_ref().to_string();
+        text.push('\n');
+        self.emit(&text);
+    }
+    fn emit(&mut self, text: &str) {
+        self.out.push_str(text);
+        self.transcript.push_str(text);
     }
     pub fn flush(&mut self) {
         if !self.out.is_empty() {
@@ -307,7 +327,7 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
                     .map_err(|e| Error::parse("status", e.to_string()))?;
             } else {
                 let text = menu::render_status(&st);
-                ctx.say(text.trim_end());
+                ctx.show(text.trim_end());
             }
             Ok(())
         }
@@ -328,7 +348,7 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
                     .map_err(|e| Error::parse("list", e.to_string()))?;
             } else {
                 let text = menu::render_nodes(&prof, false);
-                ctx.say(text.trim_end());
+                ctx.show(text.trim_end());
             }
             Ok(())
         }
@@ -642,12 +662,21 @@ fn offer_v3_import<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Res
 }
 
 pub fn menu_loop<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()> {
+    // 菜单里的结果行缩进两列跟菜单对齐；任何出口（含 `?` 冒上来的错误）都恢复，
+    // 否则 run() 接着打的「错误：…」会沿用菜单缩进
+    let saved = std::mem::replace(&mut ctx.indent, "  ");
+    let r = menu_body(ctx);
+    ctx.indent = saved;
+    r
+}
+
+fn menu_body<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()> {
     offer_v3_import(ctx)?;
     loop {
         let prof = Profiles::load(ctx.sys, ctx.paths)?;
         let st = engine_status(ctx, &prof);
         let screen = menu::render(&st);
-        ctx.say(screen.trim_end());
+        ctx.show(screen.trim_end());
         ctx.flush();
         let choice = ctx.prompt.line("选择 [0-9]")?;
         if choice.is_empty() {
@@ -665,7 +694,7 @@ pub fn menu_loop<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Resul
             Action::Quit => return Ok(()),
             Action::SwitchNode => {
                 let list = menu::render_nodes(&prof, true);
-                ctx.say(list.trim_end());
+                ctx.show(list.trim_end());
                 ctx.flush();
                 let pick = ctx.prompt.line("选择节点编号")?;
                 menu::pick_index(&pick, prof.profiles.len()).map(|i| Cmd::Switch {
@@ -1462,6 +1491,62 @@ mod tests {
         let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
         menu_loop(&mut ctx).unwrap();
         assert_eq!(Profiles::load(&s, &pp).unwrap().mode, Mode::Tun);
+    }
+
+    #[test]
+    fn say_indents_every_non_empty_line() {
+        let pp = paths();
+        let s = FakeSys::new();
+        let n = FakeNet::new();
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        assert_eq!(ctx.indent, "", "默认顶格：一次性命令不缩进");
+        ctx.say("顶格");
+        ctx.indent = "  ";
+        ctx.say("一\n\n二");
+        assert_eq!(ctx.out, "顶格\n  一\n\n  二\n", "空行不留尾随空格");
+        assert_eq!(ctx.transcript, ctx.out, "transcript 也带缩进");
+    }
+
+    #[test]
+    fn menu_loop_indents_result_lines_like_the_menu() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        s.reply("ip link show bui-tun", 0, "5: bui-tun");
+        profiles_socks().save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        // x = 无效选项 → 2 切到 TUN → y 确认 → 0 退出
+        let mut p = Scripted::from(["x", "2", "y", "0"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert!(
+            t.lines().any(|l| l == "  无效选项：x"),
+            "结果行跟菜单一样缩进两列：\n{t}"
+        );
+        assert!(t.lines().any(|l| l == "  已切到 TUN 模式"), "{t}");
+        // 菜单本身已经排好版，不能再叠一层缩进
+        assert!(t.lines().any(|l| l.starts_with("  ─────  B-UI")), "{t}");
+        assert!(t.lines().any(|l| l.starts_with("     [1] ")), "{t}");
+        assert!(!t.lines().any(|l| l.starts_with("    ─────  B-UI")), "{t}");
+        assert_eq!(ctx.indent, "", "退出菜单后恢复顶格");
+    }
+
+    #[test]
+    fn menu_loop_restores_indent_even_when_it_errors() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        s.put("/opt/bui-c/profiles.json", "{ 不是 json");
+        let n = FakeNet::new();
+        let mut p = Scripted::from(["0"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        assert!(menu_loop(&mut ctx).is_err());
+        assert_eq!(
+            ctx.indent, "",
+            "run() 接着打的「错误：…」要顶格，不能沿用菜单缩进"
+        );
     }
 
     #[test]
