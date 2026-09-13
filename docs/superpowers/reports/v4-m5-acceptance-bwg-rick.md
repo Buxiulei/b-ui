@@ -1,7 +1,7 @@
 # v4 M5 硬化验收报告（bwg-rick）——初稿
 
 撰写：Opus（P5 Task 12 初稿）　裁决人：Fable　成稿日：2026-09-13（实测日期 2026-09-12 / 09-13）
-被测版本：`bui 4.0.0-rc1` → `rc8`（GitHub 预发布通道，按总纲裁决记录「发布：预发布与首推（2026-09-12）」放开；本任务自己未打任何 tag、未建 Release）
+被测版本：`bui 4.0.0-rc1` → `rc11`（GitHub 预发布通道，按总纲裁决记录「发布：预发布与首推（2026-09-12）」放开；rc 由主会话打 tag、Actions 发 Release）
 内核：rc2 起 sing-box 1.14.0（由 1.13.19 随 manifest 升级），其余三个内核以 rc8 的 `manifest.json` 为准（本稿未逐项抄录）
 脚本：`scripts/ops/{soak-sample,soak-report,authhook-bench,authhook-report,authhttp-bench.py,upgrade-drill,v3-cutover}`、`scripts/{m1,m3}-acceptance.sh`（以 `v4` @ `7f723b1` 为准）
 
@@ -16,14 +16,16 @@
 | 鉴权 200 建连/秒 p99 < 20ms（spec §9 M5） | rc7 http 模式：p99 12.38 ms，0 失败 | **PASS** |
 | `upgrade` 演练成功（spec §9 M5） | rc1→rc8 全部经 `bui upgrade` 完成 | **PASS** |
 | `--rollback` 演练成功（spec §9 M5） | 流程本身正确（bui 与四内核往返 .prev、版本指纹一致）；暴露孤儿链事故，rc5 修复并复验 | **PASS**（附事故，见 §5） |
-| v3 恢复 < 10 分钟（spec §9「bwg-tizi 上线」，本计划 Task 12 Step 7） | 本初稿没有收到实测数据 | **待测** |
-| 日志哨兵断网演练判据 ①–④（`2026-09-13-v4-log-sentinel.md` Task 10） | 哨兵合并后执行 | **待测** |
+| v3 恢复 < 10 分钟（spec §9「bwg-tizi 上线」，本计划 Task 12 Step 7） | bwg-tizi 2026-09-13：`restore` 15 秒完成，6 个服务 + 2 个定时器 active，7 个订阅与切换前逐字相同；随后一行命令装回 rc11，无漂移（见 §4） | **PASS** |
+| 日志哨兵断网演练判据 ①–④（`2026-09-13-v4-log-sentinel.md` Task 10） | rc10：① 首条错误后 2.3 秒记事件、② 借到别槽 IP、③ 回环出网 IP 改变、④ 恢复后 350 秒切回；4 PASS / 0 FAIL（见 §7） | **PASS** |
 
 M1–M4 与 IP 池的回顾见 §6，均已通过（IP 池有两项待测）。
 
 ## 1. 72h soak（spec §9 M5：Xray RSS 无单调增长、`bui` RSS < 50MB）
 
 - **结论：待测。**
+- rc11 浸泡：2026-09-13T15:25:36Z 起（bwg-rick，8 个单元 = 6 个固定单元 + hysteria-residential-1/-2，`--interval 60`），预计 09-16 15:25Z 采满。rc10 那轮只采了 6 个固定单元，随 rc11 升级作废。
+- 采样器重启的坑：kill 旧采样器后，bash 要等当前的 `sleep 60` 结束才跑 EXIT trap；这时旧目录已被挪走、新目录同名，旧采样器把 `DONE`（reason=signal）写进了新目录。已改名为 `DONE.stray-from-rc10-sampler`。以后先等旧进程退出（按 pid 轮询 `kill -0`）再挪目录。
 - 首轮：2026-09-12 14:57 UTC 起采样。窗口内 rick 被连续升级（rc 迭代），`b-ui` 出现 11 个 pid、`xray` 出现 3 个。RSS 曲线在每次重启时归零，斜率与「首末 1/4 均值」都失去意义，所以整轮**作废**，不出判读表。
 - 重跑计划：日志哨兵合并后，在打出的那个 rc 上，从升级完成算起采满 72h，**窗口内不再升级、不重启受管单元**。
   ```bash
@@ -66,6 +68,7 @@ M1–M4 与 IP 池的回顾见 §6，均已通过（IP 池有两项待测）。
   - rc2 这一跳顺带把 sing-box 从 1.13.19 升到 1.14.0，四个内核的 `.prev` 都保留了下来（`f3f08f0`）。
 - **与计划 Step 2/6 的差异**：计划原本用「CI 产物 + 本机 `http.server` + 造一个 4.0.1 补丁版」来演练。总纲裁决放开 rc 预发布之后，实际走的是真实的发布通道，所以既没造 4.0.1，也没本机托管。「内核随 manifest 升级」由 rc2 的 sing-box 升级覆盖。计划骨架里逐个二进制的 sha 比对表，本稿未收到数据。
 - **结论**：**PASS**。
+- **rc 选取缺陷（rc11 修复）**：GitHub releases 列表不按创建时间排序（2026-09-13 实测 rc9、rc8、rc7、rc10、rc6），rc10 及以前的无参 `bui upgrade`、一行安装、`bui-c update`、bui-c 安装都取列表里第一个预发布。rick 在 rc10 上无参升级时被「升级」回了 rc9（同版本不同构建）。rc11 按 (x, y, z, N) 数值取最大。**已装 ≤ rc10 的机器要先用 `bui upgrade --manifest-url …/v4.0.0-rc11/manifest.json` 升一次**，之后无参升级才对：rick 上 rc11 的无参升级回「已最新」，tizi 的一行安装不钉版本装到 rc11。
 
 ### 3.2 回滚
 
@@ -75,12 +78,21 @@ M1–M4 与 IP 池的回顾见 §6，均已通过（IP 池有两项待测）。
   - 但过程中 `hysteria-residential` 被重启，暴露了一起事故：住宅 HY2 中断约 4 分钟，手工清链后恢复。详见 §5 事故 1。
 - **修复与复验**：rc5 修复。真机上 `kill -9` 住宅实例后，重启 1 次即恢复，v4 / v6 两张 nat 表的孤儿链都被清掉；当时的验收 13/13。
 - **结论**：**PASS**（回滚流程本身）。修复复验用的是 `kill -9` 住宅实例，**不是**再跑一遍完整的 `--rollback`。在最终 rc 上是否复跑一次回滚演练，由 Fable 定（见 §7）。
+- **最终 rc 上的往返复验**（§8 裁决；bwg-tizi，2026-09-13 15:31Z）：rc11 → `upgrade --manifest-url …/v4.0.0-rc10/manifest.json`（同版本另一份构建）→ `upgrade --rollback` → 无参 `upgrade`。
+  - 回滚恢复了 `manifest.prev.json` 与升级前那份期望态备份；bui 与四个内核的 sha256 指纹回到起点，逐项一致。
+  - 每一步后 8 个受管单元都是 active，四个 hysteria 单元的 NRestarts 始终为 0；无参升级回「已最新」；`bui status` 无漂移，M1 24 PASS / 0 FAIL。
+  - 覆盖范围：rc10 与 rc11 的内核相同，这一轮只换了 bui、没有重启 hysteria，所以孤儿链修复（§5 事故 1）仍然只由 rc5 的 `kill -9` 复验覆盖。端口跳跃规则：rick 在 iptables（每个实例一条 `HYSTERIA-PR-*` 链），tizi 在 nftables（18 条 redirect）。
+- **结论**：**PASS**。
 
 ## 4. v3 恢复演练（spec §9「bwg-tizi 上线」的回滚路径，Task 12 Step 7）
 
 - **判据**：`v3-cutover.sh restore` 退出码为 0，`real` < 10 分钟；恢复后 v3 的六个服务与快照里的定时器都是 `active`；订阅返回 200；重新装回 v4 后无漂移。
-- **实测**：本初稿**没有收到**这一项的执行记录。
-- **结论**：**待测（待补）**。执行方式照计划 Task 12 Step 7：在 v3 状态下用 `v3-cutover.sh snapshot` 现打快照，计时 `restore`，确认后装回 v4。bwg-tizi 上线前必须有这一项的实测。
+- **实测**（bwg-tizi，2026-09-13 15:22Z，从 rc10 的 v4 恢复到切换前 13:17Z 打的快照）：
+  - `restore` 自己的汇总是「v3 的 6 个服务 + 2 个定时器全部 active」：hysteria-server / hysteria-residential / xray / b-ui-admin / b-ui-relay / caddy，hy2-watchdog.timer / b-ui-cert-sync.timer。快照里本来就是 inactive 的 b-ui-resi-health.timer 恢复后同样 inactive。
+  - 从执行 `restore` 到 7 个用户的 `/api/sub` 与切换前抓下的订阅**逐字相同**，共 **15 秒**。
+  - 随后按 README 的一行命令（不钉版本）装回 v4：装上的是 rc11，v3 导入 7 个用户。v3 遗留的一个调试 drop-in（把住宅 HY2 的 ExecStart 改成旧二进制加 debug 日志）与九个陌生文件挪进 `v3-backup/leftovers` 后 `bui status` 无漂移；M1 验收 24 PASS / 0 FAIL，订阅 7/7 与 v3 等价，M3 8 PASS / 0 FAIL。
+  - 流量计数：恢复会回到快照时刻的 v3 计数；重新导入后按「恢复前 v4 计数 + 恢复窗口内 v3 新增」补回，7 个用户都补了。
+- **结论**：**PASS**。
 
 ## 5. 事故与修复
 
@@ -157,15 +169,18 @@ M1–M4 与 IP 池的回顾见 §6，均已通过（IP 池有两项待测）。
 
 ## 7. 日志哨兵断网演练（spec §5.7；`docs/superpowers/plans/2026-09-13-v4-log-sentinel.md` Task 10）
 
-- **结论：待测。** 哨兵 Task 1–6 已合并进 `v4`。演练脚本 `scripts/ops/sentinel-drill.sh` 属于 Task 10，合并后才执行。
+- **结论：PASS**（rc10，bwg-rick 槽 1，2026-09-13 14:21:49Z 起跑，4 PASS / 0 FAIL，退出码 0，丢包规则由 trap 删净）。rc11 没动哨兵（只改 rc 选取与单协议直连权益），结论沿用。
+- 实测：① 首条 relay 连接错误后 **2.3 秒**记事件（含借用）；② 槽 1 借到 resi-1；③ 回环出网 IP 改变；④ 删规则后 **350 秒**切回本槽 IP（限 660 秒）。
+- rc9 的首跑 ① 用了 30.3 秒（超 15 秒）。根因是网关解析出 6 个 IPv4，旧的 TCP 检查逐个串行、每个 5 秒超时。rc10（`9e2183f`）改为轮询 2 秒、连接类门槛 2 条、网关 TCP 快探并发且总时限 3 秒、连不上即借用。
+- rc10 的第一次演练（14:18:46Z）是**假失败**：它落在被中断的 rc9 演练于 14:12:08Z 借用之后的 600 秒动作冷却窗里。冷却表落盘、跨守护进程重启仍然有效，所以哨兵按设计不动作，①②③ 随之失败。以后同一上游的两次演练至少间隔 600 秒（看 `bui incidents` 里该上游最后一次动作的时刻）。
 - 判据（照搬 Task 10，不增不改）：
   1. 从该上游第一条 relay 连接错误起，≤ 15 秒记下事件（含借用）。
   2. 该槽借用到其它 IP（`borrowed=true`，active ≠ 本槽）。
   3. 该槽用户的回环出网 IP 改变。
   4. 删掉丢包规则后，巡检在 660 秒内切回本槽（恢复后第 4 轮巡检）。
 - 前置：
-  - 哨兵计划文末「恢复后 3 轮内切回」的口径必须先拿到裁决。维持 D6 就按 660 秒判；若裁决为严格 3 轮，先改实现，再把 `DRILL_BACK_WAIT` 改成 420 秒，然后才跑。
-  - 在低峰窗口执行：演练期间该槽用户会断流约一分钟。
+  - 切回口径按 D6（恢复后第 4 轮，660 秒）判，与哨兵计划终稿一致。
+  - 演练期间该槽用户会断流数秒到数十秒（直到哨兵借到别的 IP）；主理人 2026-09-13 裁决生产测试不等低峰。
 - 执行：
   ```bash
   scp scripts/ops/sentinel-drill.sh bwg-rick:/opt/b-ui/ops/
@@ -179,15 +194,14 @@ M1–M4 与 IP 池的回顾见 §6，均已通过（IP 池有两项待测）。
 
 - **v4.0.0 当前不可发**（不打 `v4.0.0` tag）。阻塞项：
   1. 72h soak 待测（§1）。
-  2. 日志哨兵断网演练待测（§7），前置是切回轮数的口径裁决。
-  3. v3 恢复演练的实测未收录（§4）。
-- 建议由 Fable 裁决：修复孤儿链（§5 事故 1）之后，要不要在最终 rc 上再跑一遍完整的 `upgrade` → `--rollback` → `upgrade`。rc5 的复验只覆盖了 `kill -9` 这条路径。
+- 裁决（2026-09-13）：在最终 rc 上再跑一遍完整的 `upgrade` → `--rollback` → `upgrade`。rick 在浸泡不能动，放在 bwg-tizi 上跑。
 - 发布命令只由主理人执行，照计划 Task 12 Step 8 §5：
   - 先跑 `pin-kernels.sh --check`。
   - 在 `v4` HEAD 上打 `v4.0.0` tag。
   - 用 `gh release view` 核对 15 个资产。
-- bwg-tizi 上线前必须复核：
-  - 低峰窗口。
-  - 在 tizi 上先打一份 `v3-cutover.sh snapshot`，并在 tizi 上重跑一次 `restore` 演练。
-  - 核对共享的外部站点：切换前后 `curl --resolve` 状态码一致。
-  - `bui-c` 的 `/packages/` 同步链路归属。
+- 已知问题（留 4.0.1，不阻塞发版）：`bui reconcile` 与菜单里的手动对账经 socket 提交后，立刻打印的是**上一轮**的对账报告——守护进程把请求放进 500ms 去抖队列异步执行，接口直接回了 `last_reconcile`。紧跟守护进程启动或文件变动时，会显示已经不存在的漂移。以 `bui status` 为准，或隔几秒再跑一次。
+- bwg-tizi 上线（2026-09-13，rc11）复核：
+  - 低峰窗口：主理人裁决生产测试不等低峰。
+  - 快照与 `restore` 演练：已做，见 §4。
+  - 外部站点：tizi 没有从 v3 导入的站点（M1 step5 SKIP）。
+  - `bui-c` 的 `/packages/` 同步链路：本轮没有复核（M4 由另一会话在 baiyi 验收）。
