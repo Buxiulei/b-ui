@@ -12,6 +12,10 @@ pub const LEFT_WIDTH: usize = 14;
 /// 节点列表里名字列的封顶列宽：再长就破格，不拖着所有行一起变宽。
 pub const NAME_CAP: usize = 40;
 
+/// 选项块分隔线的列宽 = 两列选项的宽度：`[n] ` 4 + 左栏 LEFT_WIDTH + 栏距 2 +
+/// 右栏 `[n] 四字标签` 12。写死 9 格的短线看着像断了。
+const RULE_WIDTH: usize = 4 + LEFT_WIDTH + 2 + 12;
+
 /// 交互输入：真实终端用 [`Stdin`]，测试与 `--yes` 路径用 [`Scripted`]。
 pub trait Prompt {
     fn line(&mut self, prompt: &str) -> Result<String>;
@@ -225,7 +229,7 @@ pub fn render_options(st: &Status) -> String {
         "     [9] 自动更新 {}\n",
         if st.auto_update { "开" } else { "关" }
     ));
-    out.push_str("     ─────────\n");
+    out.push_str(&format!("     {}\n", "\u{2500}".repeat(RULE_WIDTH)));
     out.push_str("     [0] 退出\n");
     out
 }
@@ -373,6 +377,24 @@ mod tests {
         }
         assert!(!out.contains('\u{1b}'), "不含 ANSI 转义（快照稳定）");
         assert!(!out.contains("↑") && !out.contains("↓"), "不做箭头菜单");
+    }
+
+    #[test]
+    fn options_rule_is_as_wide_as_the_two_columns() {
+        let out = render_options(&st());
+        let rule = out.lines().find(|l| l.contains('─')).unwrap();
+        let row1 = out.lines().find(|l| l.contains("[1]")).unwrap();
+        assert_eq!(
+            display_width(rule.trim_start()),
+            display_width(row1.trim_start()),
+            "分隔线要跟两列选项等宽\n{out}"
+        );
+        assert_eq!(display_width(rule.trim_start()), 32, "{rule:?}");
+        assert_eq!(
+            rule.len() - rule.trim_start().len(),
+            row1.len() - row1.trim_start().len(),
+            "缩进也要一致"
+        );
     }
 
     #[test]
