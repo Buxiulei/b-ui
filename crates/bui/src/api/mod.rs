@@ -46,7 +46,21 @@ pub fn router(state: AppState, modules: &[Arc<dyn Module>]) -> axum::Router {
             state.clone(),
             auth::require_admin,
         )))
-        .layer(tower_http::trace::TraceLayer::new_for_http())
+        // `DefaultMakeSpan` 把整条 URI 记进 span ⇒ `--log debug` 一开，四个免鉴权订阅端点的
+        // 路径末段（订阅 token，或宽限期内的用户名）就进了 journald。那一段本身就是凭据
+        // （2026-09-14 裁决），所以自己造 span，URI 先过 `redact::sub_path`。
+        .layer(
+            tower_http::trace::TraceLayer::new_for_http().make_span_with(
+                |req: &axum::http::Request<axum::body::Body>| {
+                    tracing::debug_span!(
+                        "request",
+                        method = %req.method(),
+                        uri = %crate::redact::sub_path(&req.uri().to_string()),
+                        version = ?req.version(),
+                    )
+                },
+            ),
+        )
         .with_state(state)
 }
 
@@ -541,6 +555,70 @@ mod tests {
         assert_eq!(
             get_status(&app, "/api/health", None).await,
             StatusCode::UNAUTHORIZED
+        );
+    }
+
+    /// 收 `TraceLayer` 造出来的 span 字段（`--log debug` 会把它们打进 journald）。
+    #[derive(Clone, Default)]
+    struct SpanFields(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SpanFields {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            _id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Visitor<'a>(&'a mut Vec<String>);
+            impl tracing::field::Visit for Visitor<'_> {
+                fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                    self.0.push(format!("{}={v:?}", f.name()));
+                }
+            }
+            attrs.record(&mut Visitor(&mut self.0.lock().unwrap()));
+        }
+    }
+
+    /// 2026-09-14 裁决：四个免鉴权订阅端点的路径末段就是凭据，`--log debug` 也不许把它打出来。
+    /// 这里真的挂一个 DEBUG 订阅者跑一次请求，核对 span 里落下的是 `/api/sub/***`。
+    #[tokio::test]
+    async fn the_request_span_masks_the_subscription_token_even_at_debug() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let cap = SpanFields::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry()
+                .with(tracing_subscriber::filter::LevelFilter::DEBUG)
+                .with(cap.clone()),
+        );
+        let (app, _d, _h) = app().await;
+        // `router()` 那条 span 的 callsite 是整个测试进程共用的：谁第一次打到它，兴趣就按
+        // **那个线程**当时的订阅者缓存下来。别的用例（在没有订阅者的线程上）先打到就会缓存成
+        // `Interest::never()`，而 `set_default` 不重算缓存 ⇒ 不处理的话这个用例单跑绿、
+        // 全量并行跑红。所以先空跑一次把 callsite 注册掉，再显式重算一次兴趣。
+        let warmup = Request::builder()
+            .uri("/api/login")
+            .body(Body::empty())
+            .unwrap();
+        let _ = app.clone().oneshot(warmup).await.unwrap();
+        tracing::callsite::rebuild_interest_cache();
+        cap.0.lock().unwrap().clear();
+
+        let token = "0123456789abcdef0123456789abcdef";
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sub/{token}?x=1"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let fields = cap.0.lock().unwrap().join(" | ");
+        assert!(!fields.contains(token), "token 进了 span：{fields}");
+        assert!(
+            fields.contains("/api/sub/***?x=1"),
+            "URI 该留着路径与查询串、只换末段：{fields}"
         );
     }
 }

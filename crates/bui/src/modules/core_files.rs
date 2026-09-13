@@ -94,7 +94,16 @@ pub fn sites_glob(paths: &Paths) -> String {
         .to_string()
 }
 
+/// 四个免鉴权订阅端点的 path 匹配器（`log_skip` 用）。末段是订阅 token 或宽限期内的
+/// 用户名，两者都是凭据（2026-09-14 裁决）。Caddy 的 `path` 匹配器**不分大小写**，
+/// 所以 `/API/SUB/<token>` 这种请求也一并跳过。
+pub const SUB_PATHS_MATCHER: &str = "/api/sub/* /api/subscription/* /api/clash/* /api/nodes/*";
+
 /// Caddyfile：只反代面板端口，日志进 stderr（journald 收），不再写 `/var/log/caddy`。
+///
+/// 面板块的访问日志会把完整 URI 写进 journald，而四个免鉴权订阅端点的路径末段本身就是
+/// 凭据 ⇒ 给它们加一条 `log_skip`（[`SUB_PATHS_MATCHER`]，2026-09-14 裁决），其余请求
+/// 照旧记日志。守护进程自己那一侧的脱敏在 `crate::redact::sub_path`。
 ///
 /// `sites_glob` 是外部站点通道的 import 通配（2026-09-13 裁决），由 [`crate::paths`] 派生传进来，
 /// **必须排在面板站点块之后**：写进块里就变成站点内指令了。glob 一个文件都没匹配到时
@@ -104,6 +113,9 @@ pub fn caddyfile_text(domain: &str, admin_port: u16, sites_glob: &str) -> String
         "\
 # B-UI v4 —— 由 bui 对账器生成，手改会被覆盖
 {domain} {{
+\t# 订阅链接的末段就是凭据，不进访问日志
+\t@sub path {SUB_PATHS_MATCHER}
+\tlog_skip @sub
 \treverse_proxy 127.0.0.1:{admin_port}
 \tlog {{
 \t\toutput stderr
@@ -547,6 +559,30 @@ mod tests {
             caddyfile_text("example.com", 8080, "/opt/b-ui/caddy/sites/*.caddy"),
             caddyfile_text("example.com", 8080, "/opt/b-ui/caddy/sites/*.caddy")
         );
+    }
+
+    /// 2026-09-14 裁决「每用户随机订阅 token」：四个免鉴权订阅端点的末段是凭据，
+    /// 面板块的访问日志（`output stderr` → journald）不许收它们；其余请求照旧记。
+    #[test]
+    fn caddyfile_skips_the_access_log_for_the_four_subscription_paths() {
+        let arts = CoreFilesModule::new(None).render(&sample_state(), &ctx());
+        let text = match find_file(&arts, "/opt/b-ui/Caddyfile") {
+            Artifact::File { content, .. } => String::from_utf8(content).unwrap(),
+            other => panic!("{other:?}"),
+        };
+        assert!(
+            text.contains("\t@sub path /api/sub/* /api/subscription/* /api/clash/* /api/nodes/*\n"),
+            "四条路径一条都不能少：\n{text}"
+        );
+        assert!(text.contains("\tlog_skip @sub\n"), "\n{text}");
+        // 必须在面板站点块**里面**（块外的 log_skip 不是合法的顶层指令）
+        let block_end = text.find("\n}\n").expect("面板块顶格的右花括号");
+        assert!(
+            text.find("log_skip @sub").unwrap() < block_end,
+            "log_skip 得落在面板站点块里：\n{text}"
+        );
+        // 只跳这四条，别把整个面板的访问日志一起关掉
+        assert!(text.contains("output stderr"), "\n{text}");
     }
 
     /// 2026-09-13 裁决「P1：Caddy 外部站点通道」：面板块之后追加 import 行，
