@@ -514,6 +514,18 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
                     for f in failures {
                         ctx.say(format!("  - {f}"));
                     }
+                    // is-active 在 exec 之后立刻为真，TUN 接口还没起来；timer 巡检也一样等
+                    // （最多 5 秒，只在刚重启过时发生）
+                    if Profiles::load(ctx.sys, ctx.paths)?.mode == Mode::Tun {
+                        if Engine::new(ctx.sys, ctx.paths).wait_tun_ready() {
+                            ctx.say("bui-tun 已就绪");
+                        } else {
+                            ctx.say(format!(
+                                "bui-tun 接口 {} 秒内没起来，查 [4] 服务控制 → 最近日志",
+                                crate::engine::TUN_READY_WAIT_S
+                            ));
+                        }
+                    }
                 }
                 Verdict::Waiting {
                     failures,
@@ -1711,6 +1723,63 @@ mod tests {
         for debug in ["UnitDown", "Probe", "TunMissing", "TunNoDefaultRoute"] {
             assert!(!t.contains(debug), "不打 Rust Debug 名 {debug}：{t}");
         }
+    }
+
+    /// `[5] 连接检查` 与 timer 巡检：TUN 模式下重启完 is-active 立刻为真，接口还没起来。
+    /// 跟菜单里的「重启」一样等接口，就绪 / 超时各补一句。
+    #[test]
+    fn check_restart_in_tun_mode_waits_for_the_interface() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        s.reply("ip link show bui-tun", 0, "5: bui-tun");
+        let mut prof = crate::testutil::profiles_tun();
+        prof.auto_update = false;
+        prof.save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        n.route(crate::check::PROBE_URL, FakeReply::Status(502));
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["check"]), &mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert!(t.contains("已重启 bui-c.service"), "{t}");
+        assert!(!s.sleeps().is_empty(), "重启后要等接口：{t}");
+        assert_eq!(
+            t.lines().last(),
+            Some("bui-tun 已就绪"),
+            "就绪补一句：\n{t}"
+        );
+
+        // 接口一直没起来：等满 5 秒，指到 [4] 的日志
+        let s = FakeSys::new();
+        ready(&s);
+        s.reply("ip link show bui-tun", 1, "");
+        prof.save(&s, &pp).unwrap();
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["check"]), &mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert_eq!(
+            s.sleeps().len(),
+            crate::engine::APPLY_POLL_STEPS as usize,
+            "{t}"
+        );
+        assert_eq!(
+            t.lines().last(),
+            Some("bui-tun 接口 5 秒内没起来，查 [4] 服务控制 → 最近日志"),
+            "\n{t}"
+        );
+
+        // SOCKS 模式没有接口可等
+        let s = FakeSys::new();
+        ready(&s);
+        let mut socks = profiles_socks();
+        socks.auto_update = false;
+        socks.save(&s, &pp).unwrap();
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["check"]), &mut ctx).unwrap();
+        assert!(ctx.transcript.contains("已重启 bui-c.service"));
+        assert!(s.sleeps().is_empty());
+        assert!(!ctx.transcript.contains("bui-tun"), "{}", ctx.transcript);
     }
 
     #[test]
