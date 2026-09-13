@@ -710,6 +710,27 @@ fn list_detail(label: &str, hp: &str, keep_label: bool, room: usize) -> String {
     truncate_end(hp, room)
 }
 
+/// 带编号的节点列表的左缩进：标准版式 5 列（与主菜单选项同列），窄版式 2 列。
+fn list_margin(width: usize) -> &'static str {
+    if is_narrow(width) {
+        "  "
+    } else {
+        "     "
+    }
+}
+
+/// 带编号的节点行开头 `{缩进}[n] `：两位数编号时 `[n]` 右补空格，名字仍对齐在同一列。全是 ASCII，
+/// 字节数就是列数。节点列表（[1] 切换、[6] 删除页）与删除确认块的被删清单、可换节点都用它：
+/// 编号的排法只有这一处，眼睛能直接对上。
+fn number_lead(prof: &Profiles, i: usize, width: usize) -> String {
+    let num_w = format!("[{}]", prof.profiles.len()).len();
+    format!(
+        "{}{} ",
+        list_margin(width),
+        pad(&format!("[{}]", i + 1), num_w)
+    )
+}
+
 /// 节点列表：每个节点两行，当前节点名字前带 `★`。
 ///
 /// ```text
@@ -742,12 +763,9 @@ pub fn render_nodes(prof: &Profiles, with_back: bool, width: usize) -> String {
     }
     let limit = line_limit(width);
     let narrow = is_narrow(width);
-    let margin = if narrow { "  " } else { "     " };
-    // 两位数编号时补齐 `[n]`，名字仍然对齐在同一列
-    let num_w = format!("[{}]", prof.profiles.len()).len();
     let lead = |i: usize| {
         if with_back {
-            format!("{margin}{} ", pad(&format!("[{}]", i + 1), num_w))
+            number_lead(prof, i, width)
         } else {
             "  ".to_string()
         }
@@ -794,7 +812,7 @@ pub fn render_nodes(prof: &Profiles, with_back: bool, width: usize) -> String {
         out.push_str(&format!("{indent}{detail}\n"));
     }
     if with_back {
-        out.push_str(&format!("{margin}[0] 返回\n"));
+        out.push_str(&format!("{}[0] 返回\n", list_margin(width)));
     }
     out
 }
@@ -905,18 +923,12 @@ pub fn compact_journal_line(line: &str) -> String {
     parse(line).unwrap_or_else(|| line.to_string())
 }
 
-/// 去空白 + 把全角数字（U+FF10..=U+FF19）折成 ASCII。
+/// 去首尾空白，再把全角 ASCII 折成半角（[`fold_fullwidth`]：数字、字母、`，`、`－`、`～` 等）。
+/// 主菜单与子菜单的数字、删除页的编号、确认的回答都经它：全角折叠只有 `fold_fullwidth` 一处。
 ///
 /// 中文输入法下 `１` 是常见误触：真机截屏里就被判成了「无效选项」。
 fn normalize_digits(input: &str) -> String {
-    input
-        .trim()
-        .chars()
-        .map(|c| match u32::from(c) {
-            cp @ 0xFF10..=0xFF19 => char::from_digit(cp - 0xFF10, 10).unwrap_or(c),
-            _ => c,
-        })
-        .collect()
+    fold_fullwidth(input.trim())
 }
 
 /// 主菜单只认数字，别的一律 `None`（调用方重画菜单）。
@@ -948,6 +960,717 @@ pub fn pick_index(input: &str, len: usize) -> Option<usize> {
         return None;
     }
     Some(n - 1)
+}
+
+// [6] 删除节点：选择语法、确认输入与确认块（spec §5.2、§5.3、§0.2 R1）。
+// 菜单与 `bui-c delete` 在终端里的确认块都从这里出；执行编排在 cli。
+
+/// 全角 ASCII（U+FF01..=U+FF5E）折成半角：中文输入法下打出来的 `１２`、`ｙｅｓ`、`－`、`～`、`，`。
+fn fold_fullwidth(s: &str) -> String {
+    s.chars()
+        .map(|c| match u32::from(c) {
+            cp @ 0xFF01..=0xFF5E => char::from_u32(cp - 0xFEE0).unwrap_or(c),
+            _ => c,
+        })
+        .collect()
+}
+
+/// 去掉数字串的前导零；全是零时留一个 `0`。调用方保证非空。
+fn strip_zeros(digits: &str) -> &str {
+    let t = digits.trim_start_matches('0');
+    if t.is_empty() {
+        "0"
+    } else {
+        t
+    }
+}
+
+/// [`parse_selection`] 的结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Selection {
+    /// 空行、全是分隔符、单独的 0（含 `０`、`00`）：回主菜单，什么都不打。
+    Back,
+    /// 选中的节点下标（0-based），按列表顺序、去重。
+    Picks(Vec<usize>),
+}
+
+/// 选择写错了：整行作废、原地重问，只报优先级最高的一类（spec §5.2）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelError {
+    /// 看不懂的片段：只记第一个，原样（不折全角）。
+    Junk(String),
+    /// 0（返回）和编号写在了一起。
+    ZeroMixed,
+    /// 范围写反了（第一个；两头都是有的编号才算），规整成半角 `5-3`。
+    Reversed(String),
+    /// 没有这些编号（含解析溢出、范围里带 0），规整成半角 `10-12`、`99`，按输入顺序去重。
+    OutOfRange(Vec<String>),
+}
+
+/// 回显的片段最多几列（spec §5.2：超过 12 列就尾截）。
+const SEL_FRAG_MAX: usize = 12;
+
+/// 选择报错文案的容量上限：固定文案不超过 59 列（spec §11 的 T6 测试）。
+const SEL_MSG_MAX: usize = 59;
+
+impl SelError {
+    /// spec §5.2 表里的文案（不含缩进），接在输入下面一行、原地重问；`len` 拼进「可选 1-N」。
+    /// 回显的片段先净化、超过 12 列尾截；越界的片段多到放不下时只列前几个，后面写「等 N 个」。
+    /// 整句按容量口径不超过 59 列；40 列终端上由调用方用 [`wrap`] 折行。
+    pub fn message(&self, len: usize) -> String {
+        match self {
+            SelError::Junk(x) => format!(
+                "看不懂「{}」：只能写数字、逗号和 -",
+                truncate_end(&sanitize(x), SEL_FRAG_MAX)
+            ),
+            SelError::ZeroMixed => "0 是返回，不能和编号写在一起".to_string(),
+            SelError::Reversed(x) => {
+                let x = sanitize(x);
+                match x.split_once('-') {
+                    Some((a, b)) => format!("范围写反了：{a}-{b}，要写成 {b}-{a}"),
+                    None => format!("范围写反了：{x}"),
+                }
+            }
+            SelError::OutOfRange(v) => {
+                let head = "没有编号 ";
+                let tail = match len {
+                    0 => "（没有可选的编号）".to_string(),
+                    1 => "（可选 1）".to_string(),
+                    n => format!("（可选 1-{n}）"),
+                };
+                let room = SEL_MSG_MAX.saturating_sub(budget_width(head) + budget_width(&tail));
+                let pieces: Vec<String> = v
+                    .iter()
+                    .map(|f| truncate_end(&sanitize(f), SEL_FRAG_MAX))
+                    .collect();
+                let mut list = pieces.join("、");
+                if budget_width(&list) > room {
+                    let more = format!(" 等 {} 个", pieces.len());
+                    let mut shown = String::new();
+                    for p in &pieces {
+                        let next = if shown.is_empty() {
+                            p.clone()
+                        } else {
+                            format!("{shown}、{p}")
+                        };
+                        if budget_width(&next) + budget_width(&more) > room {
+                            break;
+                        }
+                        shown = next;
+                    }
+                    list = format!("{shown}{more}");
+                }
+                format!("{head}{list}{tail}")
+            }
+        }
+    }
+}
+
+/// 选择里片段之间的分隔符：空白（含全角空格）、`,`、`，`、`、`。
+fn is_sel_sep(c: char) -> bool {
+    c.is_whitespace() || matches!(c, ',' | '，' | '、')
+}
+
+/// 范围的连接号（全角已折成半角）：`-`、`~`。
+fn is_range_dash(c: char) -> bool {
+    matches!(c, '-' | '~')
+}
+
+/// 一个片段的归类；看不懂的不在这里（[`sel_frag`] 返回 `None`）。
+enum SelFrag {
+    Zero,
+    /// 0-based 闭区间，两头都是有的编号、不写反
+    Range(usize, usize),
+    Reversed(String),
+    Out(String),
+}
+
+/// `N` 或 `A-B`（全角已折）；数字以外的字、多余或落单的连接号 → `None`（看不懂）。
+fn sel_frag(raw: &str, len: usize) -> Option<SelFrag> {
+    let s = normalize_digits(raw);
+    let (a, b) = match s.split_once(is_range_dash) {
+        Some((a, b)) => (a, Some(b)),
+        None => (s.as_str(), None),
+    };
+    let digits = |t: &str| !t.is_empty() && t.bytes().all(|c| c.is_ascii_digit());
+    if !digits(a) || b.is_some_and(|b| !digits(b)) {
+        return None;
+    }
+    // 编号 1..=len 才算有；位数多到 usize 放不下也是没有
+    let have = |t: &str| t.parse::<usize>().ok().filter(|n| (1..=len).contains(n));
+    let a = strip_zeros(a);
+    Some(match b.map(strip_zeros) {
+        None if a == "0" => SelFrag::Zero,
+        None => match have(a) {
+            Some(n) => SelFrag::Range(n - 1, n - 1),
+            None => SelFrag::Out(a.to_string()),
+        },
+        // 两头都是有的编号才叫写反（教人改成 3-5 才有意义）；否则先说没有这个编号
+        Some(b) => match (have(a), have(b)) {
+            (Some(x), Some(y)) if x > y => SelFrag::Reversed(format!("{a}-{b}")),
+            (Some(x), Some(y)) => SelFrag::Range(x - 1, y - 1),
+            _ => SelFrag::Out(format!("{a}-{b}")),
+        },
+    })
+}
+
+/// [6] 删除页的选择（spec §5.2）。片段之间用空白、`,`、`，`、`、` 隔开；片段是 `N` 或 `A-B`，
+/// 连接号认 `-`、`－`、`~`、`～`；全角数字折半角，允许前导零（`03` 就是 3）。
+///
+/// - 空行、全是分隔符、单独的 0（含 `０`、`00`）→ [`Selection::Back`]；
+/// - 重复与重叠静默去重（确认块会列出最终集合），结果按列表顺序；
+/// - 只要有一个片段不对就整行作废，按优先级只报一类：看不懂（第一个）> 0 与编号混写 >
+///   范围写反（第一个）> 越界（全部）。不做「只删合法的那几个」：破坏性操作不能部分执行。
+pub fn parse_selection(input: &str, len: usize) -> std::result::Result<Selection, SelError> {
+    let mut frags = Vec::new();
+    for raw in input.split(is_sel_sep).filter(|f| !f.is_empty()) {
+        // 看不懂的优先级最高：遇到第一个就报
+        frags.push(sel_frag(raw, len).ok_or_else(|| SelError::Junk(raw.to_string()))?);
+    }
+    let zeros = frags.iter().filter(|f| matches!(f, SelFrag::Zero)).count();
+    if zeros == frags.len() {
+        return Ok(Selection::Back);
+    }
+    if zeros > 0 {
+        return Err(SelError::ZeroMixed);
+    }
+    if let Some(r) = frags.iter().find_map(|f| match f {
+        SelFrag::Reversed(r) => Some(r.clone()),
+        _ => None,
+    }) {
+        return Err(SelError::Reversed(r));
+    }
+    let mut missing: Vec<String> = Vec::new();
+    for s in frags.iter().filter_map(|f| match f {
+        SelFrag::Out(s) => Some(s),
+        _ => None,
+    }) {
+        if !missing.contains(s) {
+            missing.push(s.clone());
+        }
+    }
+    if !missing.is_empty() {
+        return Err(SelError::OutOfRange(missing));
+    }
+    let mut chosen = vec![false; len];
+    for f in &frags {
+        if let SelFrag::Range(a, b) = f {
+            chosen[*a..=*b].fill(true);
+        }
+    }
+    Ok(Selection::Picks((0..len).filter(|&i| chosen[i]).collect()))
+}
+
+/// 删除确认那一问的回答（spec §5.3 的输入表、§0.2 R1）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmInput {
+    /// 确认删除。
+    Yes,
+    /// 打了一个编号（0-based，没核对范围）：「删完切到」形态下改替换目标；越界、在删除之列、
+    /// 不在这个形态，由调用方分别报。越界时回显用户的原始输入，不要打 `i + 1`（见 [`parse_confirm`]）。
+    Pick(usize),
+    /// 空行、`n`、`0` 与其它一切：取消，默认否。
+    Cancel,
+    /// 会断网的删除只输了 `y`：按取消处理，调用方提示「会断网的删除要输入 yes」。
+    NeedWord,
+}
+
+/// 解析删除确认的回答（先去首尾空白、全角折半角、不分大小写）：
+///
+/// - `yes`、「是」→ `Yes`；`y` 在 `needs_word`（会断网：删到当前节点、或删光）时是 `NeedWord`，否则 `Yes`；
+/// - 一个编号 → `Pick(编号 − 1)`，前导零可以；越界（`i >= len`）照样交回，由调用方报「没有编号」。
+///   位数多到 usize 放不下时交回 `Pick(len)`：这时 `i` 不是用户打的那个数，所以报越界时要回显用户的
+///   原始输入（净化、截短后，例如 `SelError::OutOfRange(vec![输入.trim().into()]).message(len)`），
+///   不要拿 `i + 1` 拼文案；
+/// - `0`（菜单里的「返回」）、空行、`n`、几个编号、别的字 → `Cancel`。
+///
+/// 这一问用 `Prompt::line` 读、不用 `confirm`（要认编号）；菜单里不认全局 `-y`（D11）。
+pub fn parse_confirm(input: &str, len: usize, needs_word: bool) -> ConfirmInput {
+    let s = normalize_digits(input).to_ascii_lowercase();
+    match s.as_str() {
+        "yes" | "是" => ConfirmInput::Yes,
+        "y" if needs_word => ConfirmInput::NeedWord,
+        "y" => ConfirmInput::Yes,
+        d if !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()) => match strip_zeros(d) {
+            "0" => ConfirmInput::Cancel,
+            n => ConfirmInput::Pick(n.parse::<usize>().map_or(len, |n| n - 1)),
+        },
+        _ => ConfirmInput::Cancel,
+    }
+}
+
+/// `[6] 删除节点` 的一屏（spec §5.1）：前空一行、两列缩进的标题（带数量与 ★ 图例）；`hint` 是
+/// 过渡提示（调用方只在每个菜单会话第一次进这一页时给），放在标题下一行、放不下就折行；再接与 [1]
+/// 同一个带编号的 [`render_nodes`]，最下面一行是写法。「删除哪几个」由调用方问。
+pub fn render_delete_picker(prof: &Profiles, width: usize, hint: Option<&str>) -> String {
+    let mut out = format!("\n  删除节点（共 {} 个，★ 为当前）\n", prof.profiles.len());
+    if let Some(h) = hint.filter(|h| !h.is_empty()) {
+        out.push_str(&wrap(h, 2, width));
+    }
+    out.push_str(&render_nodes(prof, true, width));
+    if !prof.profiles.is_empty() {
+        out.push_str("  可多选：1 3 5 或 2-4，空行返回\n");
+    }
+    out
+}
+
+/// 折行时可以在它后面断开的中文标点。
+const BREAK_AFTER: &str = "，：、；。";
+
+/// 不能落在行首的标点（行首禁则）：硬折时把前一个字一起挪到下一行。
+const NO_LINE_START: &str = "，：、；。？！）」";
+
+/// 把 `text` 排成若干行（不含缩进与换行）：第一行最多 `first` 列、续行最多 `rest` 列（容量口径）。
+///
+/// 折点有两种：中文标点（`，：、；。`）之后；后面紧跟 ASCII 字的空格处（空格丢掉）。空格算不算折点
+/// 要等下一个字到了才定，下一个字不是 ASCII 就不算：所以 `12 个`、`TUN 模式` 这种数字、ASCII 词与
+/// 后面的中文不会拆开，要断就断在 `12` 前面。放不下时断在最后一个放得下的折点；最新的折点本身放不下
+/// （比如溢出的正是那个「，」），就退回前一个折点，不硬折。一个折点都用不上时才按字硬折（[`hard_cut`]），
+/// 拼回去一字不差：确认块里的名字、label、主机「完整不截」靠的就是它。
+fn wrap_pieces(text: &str, first: usize, rest: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut line = String::new();
+    // line 里的折点（字节位置，递增）：断在这里，前半收成一行，后半去掉开头的空格留给下一行
+    let mut brks: Vec<usize> = Vec::new();
+    // 最近一个还没定的空格：等下一个字到了再看它算不算折点
+    let mut space: Option<usize> = None;
+    for c in text.chars() {
+        if c == ' ' {
+            space = Some(line.len());
+        } else if let Some(s) = space.take() {
+            if c.is_ascii() {
+                brks.push(s);
+            }
+        }
+        line.push(c);
+        if BREAK_AFTER.contains(c) {
+            brks.push(line.len());
+        }
+        loop {
+            let room = if lines.is_empty() { first } else { rest };
+            if budget_width(line.trim_end()) <= room {
+                break;
+            }
+            let fits = |b: usize| {
+                let head = line[..b].trim_end();
+                !head.is_empty() && budget_width(head) <= room
+            };
+            let cut = brks
+                .iter()
+                .rev()
+                .copied()
+                .find(|&b| fits(b))
+                .unwrap_or_else(|| hard_cut(&line, room));
+            let tail = line.split_off(cut);
+            lines.push(line.trim_end().to_string());
+            let kept = tail.trim_start();
+            // 折点与待定的空格挪进新的一行：落在切掉的部分（含行首空格）里的丢掉
+            let shift = cut + (tail.len() - kept.len());
+            brks = brks
+                .iter()
+                .filter_map(|&b| b.checked_sub(shift))
+                .filter(|&b| b > 0)
+                .collect();
+            space = space.and_then(|s| s.checked_sub(shift));
+            line = kept.to_string();
+        }
+    }
+    if !line.trim().is_empty() {
+        lines.push(line.trim_end().to_string());
+    }
+    lines
+}
+
+/// 没有折点可用时的硬折位置：放得下的最长前缀。下一行会以 `，）」` 这类标点开头时（[`NO_LINE_START`]），
+/// 把前一个字一起挪下去；至少留一个字，免得原地打转。
+fn hard_cut(line: &str, room: usize) -> usize {
+    let first = line.chars().next().map_or(0, char::len_utf8);
+    let mut cut = prefix_within(line, room).len().max(first);
+    while cut > first && line[cut..].starts_with(|c: char| NO_LINE_START.contains(c)) {
+        cut -= line[..cut].chars().next_back().map_or(0, char::len_utf8);
+    }
+    cut
+}
+
+/// 一段文字按行宽上限折成几行：每行缩进 `indent` 列、以换行结尾，折法见 [`wrap_pieces`]。
+/// 给放不下一行的固定文案与报错用（例如 40 列终端上的 [`SelError::message`]）；空文本返回空串。
+pub fn wrap(text: &str, indent: usize, width: usize) -> String {
+    let room = line_limit(width).saturating_sub(indent);
+    let pad = " ".repeat(indent);
+    wrap_pieces(text, room, room)
+        .into_iter()
+        .map(|l| format!("{pad}{l}\n"))
+        .collect()
+}
+
+/// 确认块的三种形态（与删除计划的 Passive / Switch / Empty 同义，这里只按编号推断，给文案用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeleteForm {
+    /// 活动节点不在删除之列（或本来就没有），还剩节点：不断网。
+    Passive,
+    /// 删到活动节点、还剩节点：切到替换节点。
+    Switch,
+    /// 一个不剩：代理停止。
+    Empty,
+}
+
+/// 活动节点在列表里的下标；没有活动节点、或名字对不上时为 `None`。
+fn active_index(prof: &Profiles) -> Option<usize> {
+    let name = prof.active.as_deref()?;
+    prof.profiles.iter().position(|p| p.name == name)
+}
+
+/// `picks` 已按列表顺序去重、都在范围里。
+fn delete_form(prof: &Profiles, picks: &[usize]) -> DeleteForm {
+    if picks.len() >= prof.profiles.len() {
+        DeleteForm::Empty
+    } else if active_index(prof).is_some_and(|a| picks.contains(&a)) {
+        DeleteForm::Switch
+    } else {
+        DeleteForm::Passive
+    }
+}
+
+/// 名字至少要留几列才带进提问：再少只剩「hy…70」这种认不出来的样子，不如退回「这 N 个节点」。
+const QUESTION_NAME_MIN: usize = 8;
+
+/// 确认的提问（交给 `Prompt::line`，不含 `  ▸ ` 与冒号）。R1：带上第一个名字，
+/// `确认删除 {名字}？` / `确认删除 {名字} 等 N 个节点？`；会断网的写 `[yes/N]`，否则 `[y/N]`。
+/// 连 `  ▸ ` 与冒号整行放不下时名字中间截断；可用不到 [`QUESTION_NAME_MIN`] 列时退回
+/// `确认删除这 N 个节点？`（R1 的窄屏例外：40–44 列删几个长名字的节点时），被删清单就在上面几行。
+/// 删单个节点时 40 列也有 15 列给名字。
+fn delete_question(prof: &Profiles, picks: &[usize], form: DeleteForm, width: usize) -> String {
+    let n = picks.len();
+    let tag = if form == DeleteForm::Passive {
+        "[y/N]"
+    } else {
+        "[yes/N]"
+    };
+    let plain = format!("确认删除这 {n} 个节点？{tag}");
+    let Some(&first) = picks.first() else {
+        return plain;
+    };
+    let name = sanitize(&prof.profiles[first].name);
+    let after = if n == 1 {
+        format!("？{tag}")
+    } else {
+        format!(" 等 {n} 个节点？{tag}")
+    };
+    let used = budget_width(&prompt_text(&format!("确认删除 {after}")));
+    let room = line_limit(width).saturating_sub(used);
+    if budget_width(&name) <= room {
+        format!("确认删除 {name}{after}")
+    } else if room >= QUESTION_NAME_MIN {
+        format!("确认删除 {}{after}", truncate_middle(&name, room))
+    } else {
+        plain
+    }
+}
+
+/// 确认块里被删节点的行（spec §5.3 第 2 条、§2.4）：`[编号] ★ 名字`，下面是 label 与服务器:端口。
+///
+/// 编号、缩进与 [`render_nodes`] 相同，眼睛能直接对上。名字中间截断；两个被删节点截断后一样
+/// （全名其实不同）时改成全名、按行宽折行（§2.3 撞名保护）。label 与服务器:端口完整不截：
+/// `label  kind  服务器:端口` 有一个放不下就整块去掉 kind（窄版式本来就不显示），还放不下就
+/// 各占一行，一行仍放不下就折行。外来文字先过 [`sanitize`]。
+fn victim_lines(prof: &Profiles, picks: &[usize], width: usize) -> Vec<String> {
+    struct Victim {
+        head: String,
+        name: String,
+        short: String,
+        name_room: usize,
+        label: String,
+        hp: String,
+        full: String,
+    }
+    let limit = line_limit(width);
+    let narrow = is_narrow(width);
+    // 详情行与折下来的名字缩进到名字起始列：`★ ` 在终端里是 2 列，与两个空格同宽
+    let indent_w = number_lead(prof, 0, width).len() + 2;
+    let indent = " ".repeat(indent_w);
+    let room = limit.saturating_sub(indent_w);
+    let active = active_index(prof);
+    let victims: Vec<Victim> = picks
+        .iter()
+        .map(|&i| {
+            let p = &prof.profiles[i];
+            let mark = if active == Some(i) { "★ " } else { "  " };
+            let head = format!("{}{mark}", number_lead(prof, i, width));
+            let name_room = limit.saturating_sub(budget_width(&head));
+            let name = sanitize(&p.name).into_owned();
+            let short = truncate_middle(&name, name_room);
+            let label = sanitize(&p.node.label).into_owned();
+            let hp = sanitize(&format!("{}:{}", p.node.host, p.node.port)).into_owned();
+            let full = join2(&[&label, kind_slug(p.node.kind), &hp]);
+            Victim {
+                head,
+                name,
+                short,
+                name_room,
+                label,
+                hp,
+                full,
+            }
+        })
+        .collect();
+    let show_kind = !narrow && victims.iter().all(|v| budget_width(&v.full) <= room);
+    let mut out = Vec::new();
+    for (k, v) in victims.iter().enumerate() {
+        let clash = victims
+            .iter()
+            .enumerate()
+            .any(|(j, w)| j != k && w.short == v.short && w.name != v.name);
+        if clash {
+            for (n, piece) in wrap_pieces(&v.name, v.name_room, room).iter().enumerate() {
+                let lead = if n == 0 { v.head.as_str() } else { &indent };
+                out.push(format!("{lead}{piece}"));
+            }
+        } else {
+            out.push(format!("{}{}", v.head, v.short));
+        }
+        let both = join2(&[&v.label, &v.hp]);
+        let detail: Vec<String> = if show_kind {
+            vec![v.full.clone()]
+        } else if budget_width(&both) <= room {
+            vec![both]
+        } else {
+            [&v.label, &v.hp]
+                .into_iter()
+                .flat_map(|s| wrap_pieces(s, room, room))
+                .collect()
+        };
+        out.extend(
+            detail
+                .into_iter()
+                .filter(|l| !l.is_empty())
+                .map(|l| format!("{indent}{l}")),
+        );
+    }
+    out
+}
+
+/// 可换节点的 label 至少要剩几列才显示（spec §5.3：少于 5 列就不显示）。
+const ALT_LABEL_MIN: usize = 5;
+
+/// 删到当前节点时逐行列出的可换节点（spec §5.3 第 3 条）：`[编号] 名字  label`，编号保留原来的，
+/// 列表滚出屏幕也能照着打。名字中间截断；label 尾截，剩不到 5 列就不显示；窄版式只显示名字。
+fn alternative_lines(prof: &Profiles, remaining: &[usize], width: usize) -> Vec<String> {
+    let limit = line_limit(width);
+    let narrow = is_narrow(width);
+    remaining
+        .iter()
+        .map(|&k| {
+            let p = &prof.profiles[k];
+            let lead = number_lead(prof, k, width);
+            let room = limit.saturating_sub(budget_width(&lead));
+            let name = truncate_middle(&sanitize(&p.name), room);
+            let label = sanitize(&p.node.label);
+            let label_room = room.saturating_sub(budget_width(&name) + 2);
+            if narrow || label.is_empty() || label_room < ALT_LABEL_MIN {
+                format!("{lead}{name}")
+            } else {
+                format!("{lead}{name}  {}", truncate_end(&label, label_room))
+            }
+        })
+        .collect()
+}
+
+/// 删除确认块拆成两段给菜单用：`body` 原样打出，`question` 交给 `Prompt::line`（它自己加
+/// `  ▸ ` 与冒号），`needs_word` 交给 [`parse_confirm`]。提示里的 `[yes/N]` 与行为出自同一处，
+/// 对得上。确认时改了替换目标、输错了编号，重问用的还是同一个 `question`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteConfirm {
+    /// 以空行开头、每行以换行结尾，不含提问。
+    pub body: String,
+    /// `确认删除 {名字}？[y/N]` 这类提问，不含 `  ▸ ` 与冒号。
+    pub question: String,
+    /// 会断网（删到当前节点且还剩节点，或删光）：要输入 `yes` 或「是」才算确认。
+    pub needs_word: bool,
+}
+
+/// 删除确认块（spec §5.3，按 §0.2 R1 排），菜单用。`picks` 是列表下标（0-based；顺序与重复不要紧，
+/// 这里按列表顺序去重，越界的忽略）。
+///
+/// 顺序：① 删到当前节点时，`删完切到 [n] 名字`；剩下的节点都在被删节点所在的服务器上时，下面多一行
+/// 说明（剩下的只在 1 台上：`剩下的节点都在同一台服务器上`；分在多台上：`剩下的节点都在被删节点所在的
+/// 服务器上`）；再是可换节点（逐行 `[k] 名字  label`，只剩替换目标一个时不列）；② `将删除 N 个节点…`
+/// 与被删清单；③ 影响说明（不含当前节点：删完还剩 M 个、不会断网；删到当前节点：TUN 下断网几秒；
+/// 删光：代理会停止，TUN 下本机直连）与复活说明（§5.3 第 4 条）；④ 提问。被删清单永远紧挨着提问。
+///
+/// `rows` 传 `ctx.rows()` 的原值，函数里自己减 2（留给提示符与最后一行），调用方不要再减。整块（连开头的
+/// 空行与提问）超过 `rows − 2` 行时，可换节点压成一行 `可换：1 4 5（编号同上面列表）`：手机横屏只有约 17 行。
+///
+/// 前提：删到当前节点、还剩节点时，`replacement` 必须是剩下的节点之一（调用方按 `delete::default_to`
+/// 或用户打的编号算好）。给 `None`、或给了被删的节点，是调用方的错：debug 构建里 panic，发布构建里
+/// 只是少打「删完切到」那一行。别的形态不看 `replacement`。
+pub fn delete_confirm(
+    prof: &Profiles,
+    picks: &[usize],
+    replacement: Option<usize>,
+    width: usize,
+    rows: usize,
+) -> DeleteConfirm {
+    confirm_block(prof, picks, replacement, width, Some(rows))
+}
+
+/// `bui-c delete` 在终端里的确认块（spec §5.10）。命令行不认编号（换目标用 `--switch-to`），所以不列
+/// 可换节点：没有「想换就输入下面的编号：」，也不压成「可换：…」。其余与 [`delete_confirm`] 逐字相同：
+/// 「删完切到」与同服务器那一行都在，`question` 与 `needs_word` 一样。没有行数参数：命令行一次打完。
+/// `to` 的前提同 [`delete_confirm`] 的 `replacement`。
+pub fn delete_confirm_cli(
+    prof: &Profiles,
+    picks: &[usize],
+    to: Option<usize>,
+    width: usize,
+) -> DeleteConfirm {
+    confirm_block(prof, picks, to, width, None)
+}
+
+/// [`delete_confirm`] 与 [`delete_confirm_cli`] 共用的实现；`rows` 为 `None` 是命令行版（不列可换节点）。
+fn confirm_block(
+    prof: &Profiles,
+    picks: &[usize],
+    replacement: Option<usize>,
+    width: usize,
+    rows: Option<usize>,
+) -> DeleteConfirm {
+    let len = prof.profiles.len();
+    let mut picks: Vec<usize> = picks.iter().copied().filter(|&i| i < len).collect();
+    picks.sort_unstable();
+    picks.dedup();
+    let remaining: Vec<usize> = (0..len)
+        .filter(|i| picks.binary_search(i).is_err())
+        .collect();
+    let form = delete_form(prof, &picks);
+    debug_assert!(
+        form != DeleteForm::Switch || replacement.is_some_and(|r| remaining.contains(&r)),
+        "删到当前节点时要给一个剩下的节点作替换目标，给的是 {replacement:?}"
+    );
+    let limit = line_limit(width);
+    let n = picks.len();
+    let tun = prof.mode == Mode::Tun;
+    // 缩进 2 列的一句，放不下就折行
+    let say = |text: &str| -> Vec<String> {
+        let room = limit.saturating_sub(2);
+        wrap_pieces(text, room, room)
+            .into_iter()
+            .map(|l| format!("  {l}"))
+            .collect()
+    };
+
+    // ① 删完切到哪个、还能换哪个
+    let mut switch_to = Vec::new();
+    let (mut alts, mut alts_short) = (Vec::new(), Vec::new());
+    if form == DeleteForm::Switch {
+        if let Some(r) = replacement.filter(|r| remaining.contains(r)) {
+            switch_to.push(render_switch_to(prof, r, width).trim_end().to_string());
+        }
+        // R1：剩下的节点都在被删节点所在的服务器上（host 转小写后比较）时多一行说明。条件与默认替换
+        // 目标「都没有就取剩下第一个」那一分支相同；说的是剩下的节点本身，替换目标从哪儿来都成立。
+        // 剩下的只在 1 台上才说「同一台」，分在多台上说「被删节点所在的服务器」
+        let host = |i: &usize| prof.profiles[*i].node.host.to_lowercase();
+        let gone: std::collections::HashSet<String> = picks.iter().map(host).collect();
+        let left: std::collections::HashSet<String> = remaining.iter().map(host).collect();
+        if left.is_subset(&gone) {
+            switch_to.extend(say(if left.len() == 1 {
+                "剩下的节点都在同一台服务器上"
+            } else {
+                "剩下的节点都在被删节点所在的服务器上"
+            }));
+        }
+        // 命令行版不认编号，不列可换节点
+        if rows.is_some() && remaining.len() > 1 {
+            alts = say("想换就输入下面的编号：");
+            alts.extend(alternative_lines(prof, &remaining, width));
+            let nums: Vec<String> = remaining.iter().map(|k| (k + 1).to_string()).collect();
+            let text = format!("可换：{}（编号同上面列表）", nums.join(" "));
+            // 续行对齐到「可换：」后面
+            let hang = 2 + budget_width("可换：");
+            alts_short = wrap_pieces(&text, limit.saturating_sub(2), limit.saturating_sub(hang))
+                .into_iter()
+                .enumerate()
+                .map(|(i, l)| {
+                    let lead = if i == 0 { 2 } else { hang };
+                    format!("{}{l}", " ".repeat(lead))
+                })
+                .collect();
+        }
+    }
+
+    // ② 被删清单
+    let mut tail = say(&match form {
+        DeleteForm::Empty => format!("将删除全部 {n} 个节点："),
+        DeleteForm::Switch => format!("将删除 {n} 个节点，含当前节点："),
+        DeleteForm::Passive => format!("将删除 {n} 个节点："),
+    });
+    tail.extend(victim_lines(prof, &picks, width));
+
+    // ③ 影响说明与复活说明
+    match form {
+        DeleteForm::Passive => {
+            let m = remaining.len();
+            tail.extend(say(&if active_index(prof).is_some() {
+                format!("删完还剩 {m} 个，当前节点不变，不会断网")
+            } else {
+                format!("删完还剩 {m} 个，不会断网")
+            }));
+        }
+        DeleteForm::Switch => {
+            if tun {
+                tail.extend(say("TUN 模式：切换时会断网几秒"));
+            }
+        }
+        DeleteForm::Empty => {
+            tail.extend(say("删完就没有节点了，代理会停止"));
+            if tun {
+                tail.extend(say("TUN 撤掉后本机直连，国外网站打不开"));
+            }
+        }
+    }
+    let them = if n == 1 { "它" } else { "它们" };
+    tail.extend(say(&format!("以后导入时会先跳过{them}，再问你要不要加回")));
+
+    // ④ 提问；整块超过 rows − 2 行就把可换节点压成一行
+    let question = delete_question(prof, &picks, form, width);
+    let total = 1 + switch_to.len() + alts.len() + tail.len() + 1;
+    let alts = match rows {
+        Some(rows) if total > rows.saturating_sub(2) => alts_short,
+        _ => alts,
+    };
+    let mut body = String::from("\n");
+    for l in switch_to.iter().chain(&alts).chain(&tail) {
+        body.push_str(l);
+        body.push('\n');
+    }
+    DeleteConfirm {
+        body,
+        question,
+        needs_word: form != DeleteForm::Passive,
+    }
+}
+
+/// 菜单版删除确认块连同提问那一行，就是屏幕上看到的样子（最后一行 `  ▸ 确认删除 …？[yes/N]：`）。
+/// 宽度守门表与测试用它；菜单要分开打正文与提问，用 [`delete_confirm`]；命令行用 [`delete_confirm_cli`]。
+pub fn render_delete_confirm(
+    prof: &Profiles,
+    picks: &[usize],
+    replacement: Option<usize>,
+    width: usize,
+    rows: usize,
+) -> String {
+    let c = delete_confirm(prof, picks, replacement, width, rows);
+    format!("{}{}\n", c.body, prompt_text(&c.question))
+}
+
+/// `  删完切到 [n] 名字`（含换行）：确认块①的第一行；确认时打编号改了替换目标，菜单再打一行
+/// 同样的。名字中间截断到行宽上限；编号不存在时返回空串。
+pub fn render_switch_to(prof: &Profiles, to: usize, width: usize) -> String {
+    let Some(p) = prof.profiles.get(to) else {
+        return String::new();
+    };
+    let head = format!("  删完切到 [{}] ", to + 1);
+    let room = line_limit(width).saturating_sub(budget_width(&head));
+    format!("{head}{}\n", truncate_middle(&sanitize(&p.name), room))
 }
 
 #[cfg(test)]
@@ -1530,6 +2253,93 @@ mod tests {
                 format!("  {}\n", invalid_service_choice(input, width)),
             ));
         }
+        // T6：删除页（有无过渡提示）与确认块（Passive / Switch / Empty，SOCKS 与 TUN，行数够与不够）
+        let del = baiyi_like();
+        out.push(("delete-picker", render_delete_picker(&del, width, None)));
+        out.push((
+            "delete-picker-hint",
+            render_delete_picker(
+                &del,
+                width,
+                Some("（原来的高级设置已取消，检查更新在 [7]）"),
+            ),
+        ));
+        let all: Vec<usize> = (0..del.profiles.len()).collect();
+        for mode in [Mode::Socks, Mode::Tun] {
+            let mut p = baiyi_like();
+            p.mode = mode;
+            for rows in [17, 40] {
+                let passive = render_delete_confirm(&p, &[2], None, width, rows);
+                out.push(("delete-passive", passive));
+                let many = render_delete_confirm(&p, &[0, 2, 3, 4, 5, 6, 7, 8], None, width, rows);
+                out.push(("delete-passive-many", many));
+                let switch = render_delete_confirm(&p, &[1, 2], Some(3), width, rows);
+                out.push(("delete-switch", switch));
+                out.push((
+                    "delete-empty",
+                    render_delete_confirm(&p, &all, None, width, rows),
+                ));
+            }
+            for i in 0..p.profiles.len() {
+                p.active = Some(p.profiles[i].name.clone());
+                let to = (i + 1) % p.profiles.len();
+                let each = render_delete_confirm(&p, &[i], Some(to), width, 40);
+                out.push(("delete-switch-each", each));
+            }
+        }
+        // T6 补充：剩下的节点都在被删节点的服务器上，确认块多一行说明
+        let mut same = baiyi_like();
+        same.profiles.retain(|p| p.node.host == "tizi.example.test");
+        for mode in [Mode::Socks, Mode::Tun] {
+            same.mode = mode;
+            for rows in [17, 40] {
+                let note = render_delete_confirm(&same, &[1], Some(0), width, rows);
+                out.push(("delete-switch-same-host", note));
+            }
+        }
+        // 审查后补：命令行版确认块，两位数编号（编号列宽 4），撞名改全名后折行，长 label 折行
+        let del = baiyi_like();
+        for (p, picks, to) in [(&del, vec![1, 2], Some(3)), (&same, vec![1], Some(0))] {
+            let cli = delete_confirm_cli(p, &picks, to, width);
+            out.push((
+                "delete-cli",
+                format!("{}{}\n", cli.body, prompt_text(&cli.question)),
+            ));
+        }
+        let mut many = baiyi_like();
+        for k in 10..=12 {
+            let name = format!("tizi.example.test-hy2-direct-{k}");
+            many.profiles.push(named(&name, hy2_direct_node()));
+        }
+        let every: Vec<usize> = (0..many.profiles.len()).collect();
+        out.push(("delete-picker-12", render_delete_picker(&many, width, None)));
+        for rows in [17, 40] {
+            let passive = render_delete_confirm(&many, &[9, 10, 11], None, width, rows);
+            out.push(("delete-passive-12", passive));
+            let switch = render_delete_confirm(&many, &[1, 11], Some(9), width, rows);
+            out.push(("delete-switch-12", switch));
+            let empty = render_delete_confirm(&many, &every, None, width, rows);
+            out.push(("delete-empty-12", empty));
+        }
+        let mut clash = baiyi_like();
+        for place in ["tokyo", "osaka"] {
+            let name = format!("rick-node.example-a.net-{place}-hy2-residential-direct");
+            clash.profiles.push(named(&name, hy2_direct_node()));
+        }
+        let passive = render_delete_confirm(&clash, &[9, 10], None, width, 40);
+        out.push(("delete-clash", passive));
+        clash.active = Some(clash.profiles[9].name.clone());
+        let switch = render_delete_confirm(&clash, &[9, 10], Some(0), width, 40);
+        out.push(("delete-clash-switch", switch));
+        let mut long = baiyi_like();
+        long.mode = Mode::Tun;
+        let label = "示例专用名-一个特别特别长的备注-给家里人看的-不要删";
+        long.profiles[1].node.label = label.into();
+        long.profiles[2].node.label = label.into();
+        let switch = render_delete_confirm(&long, &[1, 2], Some(3), width, 40);
+        out.push(("delete-long-label", switch));
+        let passive = render_delete_confirm(&long, &[2], None, width, 40);
+        out.push(("delete-long-label-passive", passive));
         out
     }
 
@@ -2211,5 +3021,823 @@ mod tests {
         assert_eq!(p.read("选择").unwrap().as_deref(), Some("1"));
         assert_eq!(p.read("选择").unwrap(), None, "队列空 = EOF");
         assert_eq!(p.line("选择").unwrap(), "", "line 把 EOF 折成空串");
+    }
+}
+
+/// T6：删除页的选择语法、确认输入与确认块（spec §5.2、§5.3、§0.2 R1）。
+#[cfg(test)]
+mod delete_tests {
+    use super::*;
+    use crate::testutil::{baiyi_like, hy2_direct_node, named};
+    use pretty_assertions::assert_eq;
+
+    fn tun(mut p: Profiles) -> Profiles {
+        p.mode = Mode::Tun;
+        p
+    }
+
+    /// 9 个节点时选中的下标；不是 `Picks` 就直接失败。
+    fn picked(s: &str) -> Vec<usize> {
+        match parse_selection(s, 9) {
+            Ok(Selection::Picks(v)) => v,
+            other => panic!("{s:?}: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn selection_follows_the_spec_table() {
+        use Selection::*;
+        assert!(matches!(parse_selection("", 9), Ok(Back)));
+        assert!(matches!(parse_selection("０", 9), Ok(Back)));
+        assert!(matches!(parse_selection("1 1 3", 9), Ok(Picks(v)) if v == vec![0, 2]));
+        assert!(matches!(parse_selection("1-3 2", 9), Ok(Picks(v)) if v == vec![0, 1, 2]));
+        assert!(matches!(parse_selection("１，３", 9), Ok(Picks(v)) if v == vec![0, 2]));
+        assert!(matches!(parse_selection("03", 9), Ok(Picks(v)) if v == vec![2]));
+        assert!(matches!(parse_selection("1 a 3", 9), Err(SelError::Junk(x)) if x == "a"));
+        assert!(matches!(
+            parse_selection("0 3", 9),
+            Err(SelError::ZeroMixed)
+        ));
+        assert!(matches!(parse_selection("5-3", 9), Err(SelError::Reversed(x)) if x == "5-3"));
+        assert!(
+            matches!(parse_selection("3 10-12 99", 9), Err(SelError::OutOfRange(v)) if v == vec!["10-12", "99"])
+        );
+        assert_eq!(
+            parse_selection("99", 9).unwrap_err().message(9),
+            "没有编号 99（可选 1-9）"
+        );
+    }
+
+    #[test]
+    fn disruptive_deletes_need_the_word_yes() {
+        assert_eq!(parse_confirm("y", 9, false), ConfirmInput::Yes);
+        assert_eq!(parse_confirm("y", 9, true), ConfirmInput::NeedWord);
+        assert_eq!(parse_confirm("YES", 9, true), ConfirmInput::Yes);
+        assert_eq!(parse_confirm("是", 9, true), ConfirmInput::Yes);
+        assert_eq!(parse_confirm("4", 9, true), ConfirmInput::Pick(3));
+        assert_eq!(parse_confirm("", 9, true), ConfirmInput::Cancel);
+    }
+
+    #[test]
+    fn the_confirm_block_keeps_the_victims_next_to_the_prompt_and_fits_17_rows() {
+        let mut prof = baiyi_like();
+        prof.active = Some(prof.profiles[1].name.clone());
+        let text = render_delete_confirm(&prof, &[1, 2], Some(3), 47, 17);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines.len() <= 15, "{text}");
+        let prompt = lines.last().unwrap();
+        assert!(
+            prompt.contains("[yes/N]") && prompt.contains("等 2 个节点"),
+            "{prompt}"
+        );
+        let victims = lines.iter().position(|l| l.contains("将删除")).unwrap();
+        let alt = lines
+            .iter()
+            .position(|l| l.contains("可换") || l.contains("想换"))
+            .unwrap();
+        assert!(alt < victims, "可换节点在前，被删清单紧挨提问");
+    }
+
+    /// §5.2 表第 1 行：看不懂的片段优先级最高，只报第一个，原样回显（不折全角），超过 12 列尾截。
+    #[test]
+    fn junk_is_reported_first_and_verbatim() {
+        for (input, frag) in [
+            ("1 a 3", "a"),
+            ("3-", "3-"),
+            ("-3", "-3"),
+            ("1.5", "1.5"),
+            ("1--3", "1--3"),
+            ("１ｂ", "１ｂ"),
+            ("1 a b", "a"),
+            ("0 5-3 99 x", "x"),
+        ] {
+            assert_eq!(
+                parse_selection(input, 9),
+                Err(SelError::Junk(frag.to_string())),
+                "{input}"
+            );
+        }
+        assert_eq!(
+            SelError::Junk("a".into()).message(9),
+            "看不懂「a」：只能写数字、逗号和 -"
+        );
+        assert_eq!(
+            SelError::Junk("abcdefghijklmnopqrstuvwxyz".into()).message(9),
+            "看不懂「abcdefghij…」：只能写数字、逗号和 -",
+            "片段超过 12 列就尾截"
+        );
+        assert_eq!(
+            SelError::Junk("a\u{1b}[2J".into()).message(9),
+            "看不懂「a?[2J」：只能写数字、逗号和 -",
+            "用户打的字也先净化再回显"
+        );
+    }
+
+    /// spec §12.1（T6）与 §5.2 表第 1–4 行的优先级：看不懂 > 0 混写 > 范围写反 > 越界；
+    /// 越界的片段一起列出、按输入顺序去重。
+    #[test]
+    fn selection_errors_by_priority() {
+        use SelError::*;
+        let err = |s: &str| parse_selection(s, 9).unwrap_err();
+        assert_eq!(err("1 a 5-3"), Junk("a".into()), "看不懂排在最前");
+        assert_eq!(err("3-"), Junk("3-".into()));
+        assert_eq!(err("1--3"), Junk("1--3".into()));
+        assert_eq!(err("0 3"), ZeroMixed);
+        assert_eq!(err("3,0"), ZeroMixed);
+        assert_eq!(err("０ 5-3 99"), ZeroMixed, "0 混写排在写反、越界前面");
+        assert_eq!(err("5-3 99"), Reversed("5-3".into()), "写反排在越界前面");
+        assert_eq!(
+            err("２ ７～４ ５－３"),
+            Reversed("7-4".into()),
+            "只报第一个，写法规整成半角"
+        );
+        assert_eq!(
+            err("3 10-12 99"),
+            OutOfRange(vec!["10-12".into(), "99".into()])
+        );
+        assert_eq!(
+            err("0-2"),
+            OutOfRange(vec!["0-2".into()]),
+            "范围里带 0 算越界"
+        );
+        assert_eq!(
+            err("99999999999999999999"),
+            OutOfRange(vec!["99999999999999999999".into()]),
+            "解析溢出算越界"
+        );
+        assert_eq!(
+            err("12-10"),
+            OutOfRange(vec!["12-10".into()]),
+            "两头都没有这个编号：先说没有，不教人改成 10-12"
+        );
+        assert_eq!(
+            err("99 099 10"),
+            OutOfRange(vec!["99".into(), "10".into()]),
+            "去重，前导零折掉"
+        );
+
+        assert_eq!(ZeroMixed.message(9), "0 是返回，不能和编号写在一起");
+        assert_eq!(
+            Reversed("5-3".into()).message(9),
+            "范围写反了：5-3，要写成 3-5"
+        );
+        assert_eq!(
+            OutOfRange(vec!["10-12".into(), "99".into()]).message(9),
+            "没有编号 10-12、99（可选 1-9）"
+        );
+        assert_eq!(
+            OutOfRange(vec!["2".into()]).message(1),
+            "没有编号 2（可选 1）"
+        );
+    }
+
+    /// spec §12.1（T6）：分隔符（空白含全角空格、`,`、`，`、`、`）与连接号（`-`、`－`、`~`、`～`）
+    /// 都认，全角数字折半角，前导零可以。
+    #[test]
+    fn selection_accepts_all_separators() {
+        assert_eq!(picked("1 3 5"), vec![0, 2, 4]);
+        assert_eq!(picked("2-4"), vec![1, 2, 3]);
+        assert_eq!(picked("１，３"), vec![0, 2]);
+        assert_eq!(picked("2-3，5"), vec![1, 2, 4]);
+        assert_eq!(picked("03"), vec![2]);
+        assert_eq!(picked("1、2"), vec![0, 1]);
+        assert_eq!(picked("5、1，3,7\t9\u{3000}2"), vec![0, 1, 2, 4, 6, 8]);
+        for r in ["2-4", "2－4", "2~4", "2～4", "２－４", "02-004"] {
+            assert_eq!(picked(r), vec![1, 2, 3], "{r}");
+        }
+    }
+
+    /// spec §12.1（T6）与 §5.2 表最后一行：重复与重叠静默去重，结果按列表顺序。
+    #[test]
+    fn selection_dedupes_and_sorts() {
+        assert_eq!(picked("3 1 1 2-3"), vec![0, 1, 2]);
+        assert_eq!(picked("１ １，３"), vec![0, 2]);
+        assert_eq!(picked("4-4 3-5"), vec![2, 3, 4]);
+        assert_eq!(picked("9 1-9"), (0..9).collect::<Vec<_>>());
+    }
+
+    /// spec §12.1（T6）：空行、全是分隔符、单独的 0（含全角、前导零）回主菜单。
+    #[test]
+    fn selection_back_inputs() {
+        for back in ["", "  ", "0", "０", ",,", "00", "0 0", ",，、 "] {
+            assert_eq!(parse_selection(back, 9), Ok(Selection::Back), "{back:?}");
+        }
+    }
+
+    /// spec §11 测试表（T6）：所有 SelError 文案按容量口径 ≤ 59 列；越界的太多就写「等 N 个」。
+    #[test]
+    fn selection_messages_fit_59_columns() {
+        let many = (10..=30)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let inputs = [
+            "1 a 3".to_string(),
+            "0 3".into(),
+            "5-3".into(),
+            "99".into(),
+            "3 10-12 99".into(),
+            "abcdefghijklmnopqrstuvwxyz0123456789".into(),
+            "示例专用名示例专用名示例专用名".into(),
+            "9".repeat(40),
+            format!("10-{} {}-3", "9".repeat(30), "1".repeat(30)),
+            many.clone(),
+            "\u{1b}[31m".into(),
+        ];
+        for s in &inputs {
+            let m = parse_selection(s, 9).unwrap_err().message(9);
+            assert!(budget_width(&m) <= 59, "{s}: {m} = {}", budget_width(&m));
+            assert!(!m.contains('\u{1b}'), "{m:?}");
+        }
+        assert_eq!(
+            parse_selection(&many, 9).unwrap_err().message(9),
+            "没有编号 10、11、12、13、14、15、16 等 21 个（可选 1-9）"
+        );
+    }
+
+    /// spec §11 测试表（T6）与 R1：会断网的删除要输入 yes 或「是」；0 与多个编号都算取消。
+    #[test]
+    fn confirm_input_parses() {
+        use ConfirmInput::*;
+        for y in ["y", "Y", "yes", "YES", "Yes", "ｙ", "ＹＥＳ", "是", " y "] {
+            assert_eq!(parse_confirm(y, 9, false), Yes, "{y:?}");
+        }
+        for y in ["yes", "YES", "ｙｅｓ", "是", " yes\u{3000}"] {
+            assert_eq!(parse_confirm(y, 9, true), Yes, "{y:?}");
+        }
+        for y in ["y", "Y", "ｙ"] {
+            assert_eq!(parse_confirm(y, 9, true), NeedWord, "{y:?}");
+        }
+        assert_eq!(parse_confirm("8", 9, false), Pick(7));
+        assert_eq!(parse_confirm("８", 9, true), Pick(7));
+        assert_eq!(parse_confirm("04", 9, true), Pick(3));
+        assert_eq!(
+            parse_confirm("12", 9, true),
+            Pick(11),
+            "越界照样交回，由调用方报「没有编号 12」"
+        );
+        assert_eq!(
+            parse_confirm(&"9".repeat(30), 9, true),
+            Pick(9),
+            "usize 放不下：按第一个越界的编号交回"
+        );
+        for no in [
+            "",
+            "n",
+            "N",
+            "no",
+            "x",
+            "0",
+            "００",
+            "4 5",
+            "yes please",
+            "是的",
+            "ye",
+        ] {
+            assert_eq!(parse_confirm(no, 9, true), Cancel, "{no:?}");
+            assert_eq!(parse_confirm(no, 9, false), Cancel, "{no:?}");
+        }
+    }
+
+    /// spec §12.1（T6）：Passive 不含当前节点，照旧 [y/N]，写「删完还剩 M 个」；不提切换、不列可换节点。
+    #[test]
+    fn confirm_block_counts_and_remaining() {
+        let prof = baiyi_like(); // 活动节点是 [2]
+        let c = delete_confirm(&prof, &[2], None, 60, 24);
+        assert!(!c.needs_word);
+        assert_eq!(c.question, "确认删除 reality-Reality？[y/N]");
+        for want in [
+            "\n  将删除 1 个节点：\n     [3]   reality-Reality\n",
+            "  删完还剩 8 个，当前节点不变，不会断网\n",
+            "  以后导入时会先跳过它，再问你要不要加回\n",
+        ] {
+            assert!(c.body.contains(want), "{want}\n{}", c.body);
+        }
+        for no in ["切到", "可换", "想换", "断网几秒"] {
+            assert!(!c.body.contains(no), "{no}\n{}", c.body);
+        }
+        assert_eq!(
+            render_delete_confirm(&prof, &[2], None, 60, 24),
+            format!("{}  ▸ {}：\n", c.body, c.question),
+            "整块 = 正文 + 屏幕上的那一行提问"
+        );
+        let two = delete_confirm(&prof, &[2, 3], None, 60, 24);
+        assert_eq!(two.question, "确认删除 reality-Reality 等 2 个节点？[y/N]");
+        assert!(two.body.contains("  将删除 2 个节点：\n"), "{}", two.body);
+        assert!(
+            two.body
+                .contains("  删完还剩 7 个，当前节点不变，不会断网\n"),
+            "{}",
+            two.body
+        );
+        // 本来就没有活动节点：不说「当前节点不变」
+        let mut none = baiyi_like();
+        none.active = None;
+        let c = delete_confirm(&none, &[2, 3], None, 60, 24);
+        assert!(c.body.contains("  删完还剩 7 个，不会断网\n"), "{}", c.body);
+        assert!(c.body.contains("跳过它们"), "{}", c.body);
+    }
+
+    /// spec §12.1（T6）与 R1 的顺序：替换目标与可换节点在前（逐行列出，编号与列表一致），
+    /// 被删清单紧挨提问；要输入 yes。
+    #[test]
+    fn switch_form_lists_alternatives() {
+        let prof = tun(baiyi_like());
+        let c = delete_confirm(&prof, &[1, 2], Some(3), 60, 40); // 行数够：逐行列出
+        assert!(c.needs_word);
+        assert_eq!(
+            c.question,
+            "确认删除 hysteria2-1778329470 等 2 个节点？[yes/N]"
+        );
+        let lines: Vec<&str> = c.body.lines().collect();
+        let at = |needle: &str| {
+            lines
+                .iter()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("{needle}\n{}", c.body))
+        };
+        let order = [
+            at("删完切到 [4] rick-node.example-a.net-reality-direct"),
+            at("想换就输入下面的编号："),
+            at("[1] HY2  示例专用名-HY2住宅"),
+            at("[9] tizi.example.test-hy2-resi"),
+            at("将删除 2 个节点，含当前节点："),
+            at("[2] ★ hysteria2-1778329470"),
+            at("[3]   reality-Reality"),
+            at("TUN 模式：切换时会断网几秒"),
+            at("以后导入时会先跳过它们，再问你要不要加回"),
+        ];
+        assert!(
+            order.windows(2).all(|w| w[0] < w[1]),
+            "{order:?}\n{}",
+            c.body
+        );
+        // 可换的就是剩下的 7 个，编号保留原来的；被删的不在里面
+        let nums: Vec<&str> = lines[order[1] + 1..order[4]]
+            .iter()
+            .map(|l| l.split_whitespace().next().unwrap())
+            .collect();
+        assert_eq!(
+            nums,
+            ["[1]", "[4]", "[5]", "[6]", "[7]", "[8]", "[9]"],
+            "{}",
+            c.body
+        );
+    }
+
+    /// Empty：删光也会断网，要输入 yes；TUN 下说清撤掉后本机直连。
+    #[test]
+    fn deleting_everything_says_the_proxy_stops_and_needs_yes() {
+        let all: Vec<usize> = (0..9).collect();
+        let socks = delete_confirm(&baiyi_like(), &all, None, 60, 24);
+        assert!(socks.needs_word);
+        assert_eq!(socks.question, "确认删除 HY2 等 9 个节点？[yes/N]");
+        assert!(
+            socks.body.starts_with("\n  将删除全部 9 个节点：\n"),
+            "{}",
+            socks.body
+        );
+        assert!(
+            socks.body.contains("  删完就没有节点了，代理会停止\n"),
+            "{}",
+            socks.body
+        );
+        for no in ["TUN", "切到", "可换", "想换", "还剩"] {
+            assert!(!socks.body.contains(no), "{no}\n{}", socks.body);
+        }
+        let t = delete_confirm(&tun(baiyi_like()), &all, None, 60, 24);
+        assert!(
+            t.body
+                .contains("  删完就没有节点了，代理会停止\n  TUN 撤掉后本机直连，国外网站打不开\n"),
+            "{}",
+            t.body
+        );
+    }
+
+    /// R1：确认块超过 rows − 2 行时，可换节点压成一行，编号照旧；只剩替换目标一个时不列。
+    #[test]
+    fn alternatives_collapse_into_one_line_when_rows_run_out() {
+        let prof = tun(baiyi_like());
+        let tall = render_delete_confirm(&prof, &[1, 2], Some(3), 60, 40);
+        let short = render_delete_confirm(&prof, &[1, 2], Some(3), 60, 17);
+        assert!(tall.contains("  想换就输入下面的编号：\n"), "{tall}");
+        assert!(tall.lines().count() > 15, "{tall}");
+        assert!(!short.contains("想换"), "{short}");
+        assert!(
+            short.contains(
+                "  删完切到 [4] rick-node.example-a.net-reality-direct\n  可换：1 4 5 6 7 8 9（编号同上面列表）\n  将删除 2 个节点，含当前节点：\n"
+            ),
+            "{short}"
+        );
+        assert!(short.lines().count() <= 15, "{short}");
+        let mut two = baiyi_like();
+        two.profiles.truncate(2);
+        let c = delete_confirm(&two, &[1], Some(0), 60, 40);
+        assert!(c.body.contains("  删完切到 [1] HY2\n"), "{}", c.body);
+        assert!(
+            !c.body.contains("可换") && !c.body.contains("想换"),
+            "{}",
+            c.body
+        );
+    }
+
+    /// R1：提问带第一个名字；窄到连截断的名字都放不下时退回「这 N 个节点」。
+    #[test]
+    fn the_question_names_the_first_victim() {
+        let prof = baiyi_like();
+        let q = |picks: &[usize], to: Option<usize>, w: usize| {
+            delete_confirm(&prof, picks, to, w, 24).question
+        };
+        assert_eq!(q(&[2], None, 80), "确认删除 reality-Reality？[y/N]");
+        assert_eq!(
+            q(&[5, 2], None, 80),
+            "确认删除 reality-Reality 等 2 个节点？[y/N]",
+            "第一个 = 列表顺序上的第一个"
+        );
+        assert_eq!(
+            q(&[1], Some(0), 80),
+            "确认删除 hysteria2-1778329470？[yes/N]"
+        );
+        assert_eq!(
+            q(&[1, 2], Some(3), 47),
+            "确认删除 hys…29470 等 2 个节点？[yes/N]"
+        );
+        assert_eq!(
+            q(&[1, 2], Some(3), 40),
+            "确认删除这 2 个节点？[yes/N]",
+            "名字只剩 3 列：不带"
+        );
+        // R1 的窄屏例外：名字可用不到 8 列就不带；删 2 个、要输 yes 时门槛落在 44 / 45 列之间
+        assert_eq!(q(&[1, 2], Some(3), 44), "确认删除这 2 个节点？[yes/N]");
+        assert_eq!(
+            q(&[1, 2], Some(3), 45),
+            "确认删除 hy…9470 等 2 个节点？[yes/N]"
+        );
+        assert_eq!(
+            q(&[0, 2], None, 40),
+            "确认删除 HY2 等 2 个节点？[y/N]",
+            "短名字照样带上"
+        );
+        for w in [40, 47, 50, 60, 80] {
+            for picks in [&[1][..], &[1, 2], &[0, 2], &[3, 4, 5], &[5]] {
+                let line = prompt_text(&q(picks, Some(8), w));
+                assert!(budget_width(&line) <= line_limit(w), "@{w}: {line}");
+            }
+        }
+    }
+
+    /// spec §12.1（T6）与 §2.3 撞名保护：两个被删节点截断后一样，就显示全名（按行宽折行），
+    /// 宁可难看也要分得清。
+    #[test]
+    fn colliding_truncations_fall_back_to_full_names() {
+        let a = "rick-node.example-a.net-tokyo-hy2-residential-direct";
+        let b = "rick-node.example-a.net-osaka-hy2-residential-direct";
+        let mut prof = baiyi_like();
+        prof.profiles.push(named(a, hy2_direct_node()));
+        prof.profiles.push(named(b, hy2_direct_node()));
+        // 前提：40 列窄版式、两位数编号时名字可用 30 列，中间截断后两者一样
+        assert_eq!(truncate_middle(a, 30), truncate_middle(b, 30));
+        let text = render_delete_confirm(&prof, &[9, 10], None, 40, 24);
+        let flat: String = text.lines().map(str::trim_start).collect();
+        assert!(flat.contains(a) && flat.contains(b), "{text}");
+        for l in text.lines() {
+            assert!(budget_width(l) <= line_limit(40), "{l:?}\n{text}");
+        }
+        // 不撞名时照旧中间截断
+        let plain = render_delete_confirm(&prof, &[3, 9], None, 40, 24);
+        assert!(plain.contains("rick-node.e…"), "{plain}");
+        assert!(!plain.contains(a), "{plain}");
+    }
+
+    /// §5.3 第 2 条：确认块里 label 与服务器:端口完整不截，放不下就拆行、再放不下就折行。
+    #[test]
+    fn labels_and_hosts_in_the_block_are_wrapped_not_truncated() {
+        let mut prof = baiyi_like();
+        let label = "示例专用名-一个特别特别长的备注-给家里人看的-不要删";
+        prof.profiles[2].node.label = label.into();
+        for w in [40, 60] {
+            let text = render_delete_confirm(&prof, &[2], None, w, 24);
+            let flat: String = text.lines().map(str::trim_start).collect();
+            assert!(
+                flat.contains(label) && flat.contains("tizi.example.test:10001"),
+                "@{w}\n{text}"
+            );
+            assert!(!text.contains('…'), "@{w}：不截断\n{text}");
+            for l in text.lines() {
+                assert!(budget_width(l) <= line_limit(w), "@{w}: {l:?}");
+            }
+        }
+    }
+
+    /// 提问里的 [yes/N] 与 parse_confirm 要不要 yes 永远一致：标签与行为对得上。
+    #[test]
+    fn needs_word_always_matches_the_prompt_tag() {
+        let all: Vec<usize> = (0..9).collect();
+        for active in [None, Some(1), Some(8)] {
+            let mut prof = baiyi_like();
+            prof.active = active.map(|i: usize| prof.profiles[i].name.clone());
+            for picks in [
+                vec![0],
+                vec![1],
+                vec![1, 2],
+                vec![2, 3],
+                vec![8],
+                all.clone(),
+            ] {
+                let c = delete_confirm(&prof, &picks, Some(4), 60, 24);
+                let disrupts = picks.len() == 9 || active.is_some_and(|a| picks.contains(&a));
+                assert_eq!(c.needs_word, disrupts, "{active:?} {picks:?}");
+                assert_eq!(c.question.ends_with("[yes/N]"), disrupts, "{c:?}");
+                assert_eq!(c.question.ends_with("[y/N]"), !disrupts, "{c:?}");
+                let screen = render_delete_confirm(&prof, &picks, Some(4), 60, 24);
+                assert!(screen.ends_with(&format!("{}：\n", c.question)), "{screen}");
+            }
+        }
+    }
+
+    /// 确认时改了替换目标，菜单再打一行「删完切到」：与确认块里那一行同一个样子。
+    #[test]
+    fn the_switch_to_line_middle_truncates_the_replacement() {
+        let prof = baiyi_like();
+        assert_eq!(
+            render_switch_to(&prof, 5, 60),
+            "  删完切到 [6] rick-node.example-a.net-hy2-direct\n"
+        );
+        let at40 = render_switch_to(&prof, 5, 40);
+        assert!(
+            at40.starts_with("  删完切到 [6] rick-")
+                && at40.ends_with("hy2-direct\n")
+                && at40.contains('…'),
+            "{at40}"
+        );
+        assert!(budget_width(at40.trim_end()) <= line_limit(40), "{at40}");
+        assert_eq!(render_switch_to(&prof, 99, 60), "", "编号不存在就不打");
+        let block = delete_confirm(&prof, &[1], Some(5), 40, 24).body;
+        assert!(block.contains(&at40), "{block}");
+    }
+
+    /// [6] 删除页：标题带数量与图例，过渡提示（调用方只在第一次进时给）在标题下，列表下面是写法。
+    #[test]
+    fn the_delete_picker_shows_the_title_hint_list_and_syntax() {
+        let prof = baiyi_like();
+        let hint = "（原来的高级设置已取消，检查更新在 [7]）";
+        assert_eq!(
+            render_delete_picker(&prof, 60, None),
+            format!(
+                "\n  删除节点（共 9 个，★ 为当前）\n{}  可多选：1 3 5 或 2-4，空行返回\n",
+                render_nodes(&prof, true, 60)
+            ),
+            "列表与 [1] 同一个 render_nodes"
+        );
+        let hinted = render_delete_picker(&prof, 60, Some(hint));
+        assert!(
+            hinted.starts_with(&format!(
+                "\n  删除节点（共 9 个，★ 为当前）\n  {hint}\n     [1]   HY2\n"
+            )),
+            "{hinted}"
+        );
+        // 40 列放不下就折行：断在最后一个放得下的折点，这里是「[7]」前面的空格（后面是 ASCII）
+        let narrow = render_delete_picker(&prof, 40, Some(hint));
+        assert!(
+            narrow.starts_with(
+                "\n  删除节点（共 9 个，★ 为当前）\n  （原来的高级设置已取消，检查更新在\n  [7]）\n  [1]   HY2\n"
+            ),
+            "{narrow}"
+        );
+    }
+
+    /// 外来的名字、label、主机先净化再上屏（spec §2.3，D18）。
+    #[test]
+    fn external_text_in_the_block_is_sanitized() {
+        let mut prof = tun(baiyi_like());
+        prof.profiles[1].name = "evil\u{1b}[2Jname".into();
+        prof.active = Some(prof.profiles[1].name.clone());
+        prof.profiles[1].node.label = "lab\u{202e}el".into();
+        prof.profiles[3].node.label = "x\u{7}y".into();
+        for w in [40, 60] {
+            let text = render_delete_confirm(&prof, &[1], Some(3), w, 40);
+            assert!(
+                !text
+                    .chars()
+                    .any(|c| matches!(c, '\u{1b}' | '\u{7}' | '\u{202e}')),
+                "{text:?}"
+            );
+            assert!(
+                text.contains("evil?[2Jname") && text.contains("lab?el"),
+                "{text}"
+            );
+        }
+    }
+
+    /// 折行工具：断在最后一个放得下的折点（中文标点之后，或后面是 ASCII 的空格处），
+    /// 没有折点就按字硬折，拼回去一字不差。
+    #[test]
+    fn wrap_breaks_at_the_last_fitting_point_and_hard_breaks_long_words() {
+        assert_eq!(
+            wrap("删完还剩 8 个，当前节点不变，不会断网", 2, 40),
+            "  删完还剩 8 个，当前节点不变，不会断网\n"
+        );
+        assert_eq!(
+            wrap("删完还剩 12 个，当前节点不变，不会断网", 2, 40),
+            "  删完还剩 12 个，当前节点不变，\n  不会断网\n"
+        );
+        assert_eq!(
+            wrap("（原来的高级设置已取消，检查更新在 [7]）", 2, 40),
+            "  （原来的高级设置已取消，检查更新在\n  [7]）\n"
+        );
+        let long = "rick-node.example-a.net-reality-direct-and-then-some";
+        let out = wrap(long, 8, 40);
+        assert_eq!(out.lines().map(str::trim_start).collect::<String>(), long);
+        assert!(
+            out.lines().all(|l| budget_width(l) <= line_limit(40)),
+            "{out}"
+        );
+        assert_eq!(wrap("", 2, 40), "");
+    }
+
+    /// 删到当前节点的两张定稿屏（spec §3c-S，按 R1 重排）：60 列行数够时逐行列出可换节点；
+    /// 40 列、17 行（手机横屏）压成一行，提问里放不下长名字就不带。
+    #[test]
+    fn the_switch_block_is_pinned_at_60_and_40_columns() {
+        let prof = tun(baiyi_like());
+        assert_eq!(
+            render_delete_confirm(&prof, &[1, 2], Some(3), 60, 24),
+            "\n  删完切到 [4] rick-node.example-a.net-reality-direct\n  想换就输入下面的编号：\n     [1] HY2  示例专用名-HY2住宅\n     [4] rick-node.example-a.net-reality-direct  Reality…\n     [5] rick-node.example-a.net-reality-resi  Reality住宅\n     [6] rick-node.example-a.net-hy2-direct  HY2直连\n     [7] rick-node.example-a.net-hy2-resi  HY2住宅\n     [8] tizi.example.test-reality-resi  Reality住宅\n     [9] tizi.example.test-hy2-resi  HY2住宅\n  将删除 2 个节点，含当前节点：\n     [2] ★ hysteria2-1778329470\n           示例专用名  tizi.example.test:10000\n     [3]   reality-Reality\n           示例名-reality-Reality直连\n           tizi.example.test:10001\n  TUN 模式：切换时会断网几秒\n  以后导入时会先跳过它们，再问你要不要加回\n  ▸ 确认删除 hysteria2-1778329470 等 2 个节点？[yes/N]：\n"
+        );
+        assert_eq!(
+            render_delete_confirm(&prof, &[1, 2], Some(3), 40, 17),
+            "\n  删完切到 [4] rick-nod…reality-direct\n  可换：1 4 5 6 7 8 9（编号同上面列表）\n  将删除 2 个节点，含当前节点：\n  [2] ★ hysteria2-1778329470\n        示例专用名\n        tizi.example.test:10000\n  [3]   reality-Reality\n        示例名-reality-Reality直连\n        tizi.example.test:10001\n  TUN 模式：切换时会断网几秒\n  以后导入时会先跳过它们，\n  再问你要不要加回\n  ▸ 确认删除这 2 个节点？[yes/N]：\n"
+        );
+    }
+
+    /// R1：删到当前节点、剩下的节点又都在被删节点所在的服务器上（host 不分大小写）时，确认块多一行
+    /// 说明，紧跟「删完切到」、在可换节点前面。剩下的只在 1 台服务器上写「都在同一台服务器上」，
+    /// 分在多台上写「都在被删节点所在的服务器上」；剩下的里有别的服务器，或不是删到当前节点，都不加。
+    #[test]
+    fn a_note_appears_when_every_remaining_node_is_on_a_deleted_server() {
+        const NOTE: &str = "  剩下的节点都在同一台服务器上\n";
+        // 只留 tizi 上的 5 个节点，删掉 tizi 上的活动节点 [2]：剩下 4 个也都在 tizi 上
+        let mut same = baiyi_like();
+        same.profiles.retain(|p| p.node.host == "tizi.example.test");
+        assert_eq!(same.profiles.len(), 5);
+        assert_eq!(same.active.as_deref(), Some(same.profiles[1].name.as_str()));
+        same.profiles[3].node.host = "TIZI.Example.Test".into();
+        for (w, rows) in [(40, 17), (40, 40), (60, 17), (60, 40)] {
+            let c = delete_confirm(&same, &[1], Some(0), w, rows);
+            assert!(c.body.contains(NOTE), "@{w}x{rows}\n{}", c.body);
+            let lines: Vec<&str> = c.body.lines().collect();
+            let at = |s: &str| lines.iter().position(|l| l.contains(s)).unwrap();
+            assert_eq!(
+                at("剩下的节点都在同一台服务器上"),
+                at("删完切到 [1] HY2") + 1,
+                "紧跟「删完切到」\n{}",
+                c.body
+            );
+            assert!(
+                at("剩下的节点都在同一台服务器上") < at("将删除"),
+                "{}",
+                c.body
+            );
+        }
+        // 连同 rick-node 上的 4 个一起删：剩下的只在 tizi 一台上，还是「同一台」
+        let prof = baiyi_like();
+        let mixed = delete_confirm(&prof, &[1, 3, 4, 5, 6], Some(0), 60, 40);
+        assert!(mixed.body.contains(NOTE), "{}", mixed.body);
+        // 删 [2]（tizi）与 [4]（rick-node）：剩下的分在两台上、又都是被删节点所在的服务器，写长文案
+        for w in [40, 60] {
+            let split = delete_confirm(&prof, &[1, 3], Some(0), w, 40);
+            assert!(
+                split
+                    .body
+                    .contains("  删完切到 [1] HY2\n  剩下的节点都在被删节点所在的服务器上\n"),
+                "@{w}\n{}",
+                split.body
+            );
+            assert!(!split.body.contains("同一台"), "@{w}\n{}", split.body);
+        }
+        // 反例：剩下的里还有别的服务器
+        for picks in [&[1][..], &[1, 2], &[0, 1, 2, 7, 8]] {
+            let c = delete_confirm(&prof, picks, Some(3), 60, 40);
+            assert!(!c.body.contains("剩下的节点都在"), "{picks:?}\n{}", c.body);
+        }
+        // 不是删到当前节点：Passive、Empty 都不加
+        let passive = delete_confirm(&same, &[0], None, 60, 40);
+        assert!(!passive.body.contains("剩下的节点都在"), "{}", passive.body);
+        let all: Vec<usize> = (0..same.profiles.len()).collect();
+        let empty = delete_confirm(&same, &all, None, 60, 40);
+        assert!(!empty.body.contains("剩下的节点都在"), "{}", empty.body);
+    }
+
+    /// 审查意见：空格算不算折点要等下一个字到了再定，下一个字不是 ASCII 就不算，所以「12 个」不会
+    /// 拆成「12」「个」（要断就断在数字前面）。选择报错文案在 40 列折行后，没有一行以「个」开头。
+    #[test]
+    fn wrap_keeps_a_number_with_the_word_after_it() {
+        let got = wrap_pieces("将删除 12 个节点", 11, 11);
+        assert_ne!(got, ["将删除 12", "个节点"]);
+        assert_eq!(got, ["将删除", "12 个节点"]);
+        for start in 10..=40usize {
+            for end in start..=start + 40 {
+                let v: Vec<String> = (start..=end).map(|n| n.to_string()).collect();
+                let w = wrap(&SelError::OutOfRange(v).message(9), 2, 40);
+                for l in w.lines().skip(1) {
+                    assert!(!l.trim_start().starts_with('个'), "{start}..={end}\n{w}");
+                }
+            }
+        }
+    }
+
+    /// 审查意见：最新的折点放不下（溢出的正是那个「，」）就退回前一个折点，不硬折；
+    /// 实在要硬折，也不让「，」「）」这类标点落到行首（把前一个字一起挪下去）。
+    #[test]
+    fn wrap_never_starts_a_line_with_punctuation() {
+        assert_eq!(
+            wrap_pieces("甲乙丙丁，戊己庚辛壬，癸", 21, 21),
+            ["甲乙丙丁，", "戊己庚辛壬，癸"]
+        );
+        for text in [
+            "甲乙丙丁，戊己庚辛壬，癸",
+            "甲乙丙丁戊己庚辛壬，癸",
+            "以后导入时会先跳过它们，再问你要不要加回",
+            "家里人用的，备注家里人用的备注，别删",
+            "（原来的高级设置已取消，检查更新在 [7]）",
+        ] {
+            for room in 4..=40 {
+                let lines = wrap_pieces(text, room, room);
+                for l in &lines {
+                    assert!(budget_width(l) <= room, "{text} @{room}: {lines:?}");
+                    assert!(
+                        !l.starts_with(|c: char| NO_LINE_START.contains(c)),
+                        "{text} @{room}: {lines:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 审查意见：命令行不认编号（换目标用 --switch-to），确认块不列可换节点、也不压成「可换：…」，
+    /// 其余与菜单版逐字相同：「删完切到」与同服务器那一行都保留，提问与 needs_word 也一样。
+    #[test]
+    fn the_cli_block_has_no_alternatives_but_keeps_the_switch_target() {
+        let prof = tun(baiyi_like());
+        let menu = delete_confirm(&prof, &[1, 2], Some(3), 60, 100);
+        let cli = delete_confirm_cli(&prof, &[1, 2], Some(3), 60);
+        assert_eq!(
+            (cli.needs_word, cli.question.as_str()),
+            (menu.needs_word, menu.question.as_str())
+        );
+        for no in ["想换", "可换"] {
+            assert!(!cli.body.contains(no), "{no}\n{}", cli.body);
+        }
+        assert!(
+            cli.body
+                .contains("  删完切到 [4] rick-node.example-a.net-reality-direct\n"),
+            "{}",
+            cli.body
+        );
+        // 菜单版去掉「想换就输入下面的编号：」与下面 7 行可换节点，就是命令行版
+        let mut want: Vec<&str> = menu.body.lines().collect();
+        let k = want
+            .iter()
+            .position(|l| l.contains("想换就输入下面的编号："))
+            .unwrap();
+        want.drain(k..k + 1 + 7);
+        assert_eq!(cli.body.lines().collect::<Vec<_>>(), want);
+        // 窄屏也一样；同服务器那一行照样有
+        let mut same = baiyi_like();
+        same.profiles.retain(|p| p.node.host == "tizi.example.test");
+        for w in [40, 60] {
+            let c = delete_confirm_cli(&same, &[1], Some(0), w);
+            assert!(
+                c.body.contains(
+                    "  删完切到 [1] HY2\n  剩下的节点都在同一台服务器上\n  将删除 1 个节点，含当前节点：\n"
+                ),
+                "@{w}\n{}",
+                c.body
+            );
+        }
+        // Passive、Empty 本来就没有可换节点：两版逐字相同
+        let all: Vec<usize> = (0..9).collect();
+        for picks in [vec![2], vec![0, 2], all] {
+            assert_eq!(
+                delete_confirm_cli(&prof, &picks, None, 60),
+                delete_confirm(&prof, &picks, None, 60, 24)
+            );
+        }
+    }
+
+    /// 删到当前节点却没给替换目标，是调用方的错：debug 构建里直接 panic。
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "替换目标")]
+    fn switch_without_a_replacement_is_a_caller_bug() {
+        delete_confirm(&baiyi_like(), &[1], None, 60, 24);
+    }
+
+    /// 替换目标本身在删除之列，同样是调用方的错；命令行版也查。
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "替换目标")]
+    fn switching_to_a_deleted_node_is_a_caller_bug() {
+        delete_confirm_cli(&baiyi_like(), &[1, 2], Some(2), 60);
     }
 }
