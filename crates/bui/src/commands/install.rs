@@ -661,15 +661,18 @@ pub fn summary(state: &State, password_notice: Option<&str>, fresh: bool) -> Str
         match state.users.first() {
             Some(u) => {
                 let n = &u.username;
+                // 2026-09-14 裁决：链接末段是这个用户的随机订阅 token，不是用户名 ——
+                // 全新装机不设宽限期（`system.legacy_sub_until` 为 None），用户名链接根本
+                // 不通，照打就是给人一条死链。`None` 只可能出现在还没补齐 token 的老
+                // `state.json` 上（那时宽限期还在），退回用户名。
+                let urls = bui_schema::sub::sub_urls(d, u.sub_token.as_deref().unwrap_or(n));
                 out.push(format!("第一个用户  {n}"));
-                out.push(format!("订阅        https://{d}/api/sub/{n}（v2rayN）"));
-                out.push(format!(
-                    "            https://{d}/api/subscription/{n}（sing-box）"
-                ));
-                out.push(format!("            https://{d}/api/clash/{n}（mihomo）"));
+                out.push(format!("订阅        {}（v2rayN）", urls.uri));
+                out.push(format!("            {}（sing-box）", urls.singbox));
+                out.push(format!("            {}（mihomo）", urls.clash));
             }
             None => out.push(format!(
-                "订阅        https://{d}/api/sub/<用户名>（v2rayN）· /api/subscription/<用户名>（sing-box）· /api/clash/<用户名>（mihomo）"
+                "订阅        https://{d}/api/sub/<订阅token>（v2rayN）· /api/subscription/<订阅token>（sing-box）· /api/clash/<订阅token>（mihomo）"
             )),
         }
     }
@@ -2465,17 +2468,36 @@ mod tests {
         assert!(s.contains("`b-ui`") && s.contains("bui status"), "{s}");
         // 已装机重跑（没有一次性密码）时不出现「管理员」那一行
         assert!(!summary(&state, None, true).contains("管理员"));
-        // 没有用户（v3 导入前的空盘、或用户被删光）时退回 `<用户名>` 形状
+        // 没有用户（v3 导入前的空盘、或用户被删光）时退回 `<订阅token>` 形状
         let mut empty = crate::testutil::sample_state();
         empty.users.clear();
         let s = summary(&empty, None, true);
         for shape in [
-            "/api/sub/<用户名>",
-            "/api/subscription/<用户名>",
-            "/api/clash/<用户名>",
+            "/api/sub/<订阅token>",
+            "/api/subscription/<订阅token>",
+            "/api/clash/<订阅token>",
         ] {
             assert!(s.contains(shape), "订阅形状缺 {shape}：{s}");
         }
+    }
+
+    /// 2026-09-14 裁决：全新装机不设宽限期，所以摘要里那三条必须是**随机 token** 链接 ——
+    /// 打用户名链接等于给人三条死链（真机上会当场报 404）。
+    #[test]
+    fn the_first_user_subscriptions_use_his_random_sub_token() {
+        let mut state = crate::testutil::sample_state();
+        let token = "0123456789abcdef0123456789abcdef";
+        state.users[0].sub_token = Some(token.into());
+        let s = summary(&state, None, true);
+        for url in [
+            format!("https://example.com/api/sub/{token}"),
+            format!("https://example.com/api/subscription/{token}"),
+            format!("https://example.com/api/clash/{token}"),
+        ] {
+            assert!(s.contains(&url), "订阅地址缺 {url}：{s}");
+        }
+        assert!(s.contains("第一个用户  alice"), "用户名还是要报的：{s}");
+        assert!(!s.contains("/api/sub/alice"), "不许再打用户名链接：{s}");
     }
 
     /// 已装机上重跑 `bui install` 只对账、一个用户都没新建，摘要于是不许再写「第一个用户 <名>」
@@ -2942,6 +2964,18 @@ mod tests {
         assert_eq!(u.entitlements.traffic_limit.total_bytes, None);
         assert_eq!(u.entitlements.traffic_limit.monthly_bytes, None);
         assert!(!u.created_at.is_empty());
+        // 2026-09-14 裁决：建号时就有随机订阅 token，而**全新装机不设宽限期** ——
+        // 这台机器上从来没人用过用户名链接，`/api/sub/<用户名>` 一开始就不该通。
+        let token = u
+            .sub_token
+            .as_deref()
+            .expect("首用户建号时就该有订阅 token");
+        assert!(bui_schema::sub::is_sub_token(token), "{token}");
+        assert!(!u.legacy_sub_disabled);
+        assert_eq!(
+            state.system.legacy_sub_until, None,
+            "全新装机不给旧用户名链接开宽限期"
+        );
         // 鉴权快照里必须有他，否则第一次建连就 fail-closed
         let snap: serde_json::Value = serde_json::from_str(
             &host

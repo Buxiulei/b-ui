@@ -5,6 +5,7 @@
 //! v3 的 `server_ip.txt` 只有 `web/server.js` 读、没人写，真实安装上基本不存在，
 //! 因此 `public_ip` 常常为空并附一条 warning，需要 P1 装机阶段现场探测后回填。
 use crate::model::*;
+use crate::sub::{legacy_sub_deadline, new_sub_token};
 use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::{PasswordHasher, SaltString};
 use argon2::Argon2;
@@ -167,7 +168,13 @@ pub fn import(dir: &Path) -> Result<ImportReport, ImportError> {
         },
         users,
         residential,
-        system: SystemSettings::default(),
+        // 2026-09-14 裁决：v3 用户手里全是「用户名链接」，导入后给
+        // `sub::LEGACY_SUB_GRACE_DAYS` 天宽限期，期间两种链接都认；到期（或运维提前
+        // `bui set legacy-sub off`）之后只认随机 token。
+        system: SystemSettings {
+            legacy_sub_until: Some(legacy_sub_deadline(time::OffsetDateTime::now_utc())),
+            ..SystemSettings::default()
+        },
         // 内核版本由 P1 装机阶段现场探测后填入
         versions: Versions::default(),
         catalog: Vec::new(),
@@ -375,6 +382,10 @@ fn user_from_v3(u: V3User, warnings: &mut Vec<String>) -> Result<User, ImportErr
         },
         portal_auth: PortalAuth::default(),
         billing: Billing::default(),
+        // 2026-09-14 裁决：导入出来的用户一律带随机订阅 token；他手里那条用户名链接
+        // 由 `system.legacy_sub_until` 的宽限期兜着（见 `import`），不在这里停用。
+        sub_token: Some(new_sub_token()),
+        legacy_sub_disabled: false,
     })
 }
 

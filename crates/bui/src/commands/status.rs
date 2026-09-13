@@ -13,12 +13,19 @@ use bui_schema::model::Hy2Auth;
 use bui_schema::paths::Paths;
 use std::path::PathBuf;
 use std::sync::Arc;
+use time::OffsetDateTime;
 
 /// 把 `/api/health` 渲染成人读文本。
 ///
-/// `hy2_auth` 单独传：`/api/health` 里没有这一位（P2 的 `HealthResponse` 是回归锁死的形状），
-/// 而运维在排「谁都登不上」时第一件要看的就是当前走的是 http 还是 command。
-pub fn format_status(h: &HealthResponse, hy2_auth: Hy2Auth) -> String {
+/// `hy2_auth` 与 `legacy_sub_until` 单独传：`/api/health` 里没有这两位（P2 的
+/// `HealthResponse` 是回归锁死的形状），而运维在排「谁都登不上」时第一件要看的就是当前
+/// 走的是 http 还是 command，排「订阅取不到」时要看旧用户名链接还认不认。
+pub fn format_status(
+    h: &HealthResponse,
+    hy2_auth: Hy2Auth,
+    legacy_sub_until: Option<&str>,
+    now: OffsetDateTime,
+) -> String {
     let mut out = vec![format!(
         "b-ui v{} @ {}     状态: {}     运行: {}",
         h.version,
@@ -55,6 +62,7 @@ pub fn format_status(h: &HealthResponse, hy2_auth: Hy2Auth) -> String {
             Hy2Auth::Command => "auth.type=command（钩子 bin/bui-auth-hook，退路）",
         }
     ));
+    out.push(format_legacy_sub(legacy_sub_until, now));
     if let Some(r) = &h.reconcile {
         out.push(format!(
             "上次对账    {}  变更 {} 项{}",
@@ -88,6 +96,22 @@ pub fn format_status(h: &HealthResponse, hy2_auth: Hy2Auth) -> String {
     out.join("\n")
 }
 
+/// `bui status` 的「旧订阅链接」一行（2026-09-14 裁决）：四个免鉴权订阅端点按每用户随机
+/// token 取，旧的「用户名链接」只在全局宽限期（`system.legacy_sub_until`）内还认。
+///
+/// `None`、以及解析不出来的时刻，都报「已停用」——端点侧要的是「当前时间早于它」，
+/// 判不出来就一律不认（fail-closed），所以这两种情况的实际效果就是停用。
+pub fn format_legacy_sub(until: Option<&str>, now: OffsetDateTime) -> String {
+    match until.and_then(|t| crate::util::parse_rfc3339(t).map(|d| (t, d))) {
+        None => "旧订阅链接  已停用（只认随机 token 链接）".to_string(),
+        Some((raw, deadline)) if deadline > now => format!(
+            "旧订阅链接  用户名链接还剩 {} 到期（{raw}）",
+            crate::util::human_duration((deadline - now).whole_seconds().max(0) as u64)
+        ),
+        Some((raw, _)) => format!("旧订阅链接  已过期（{raw}），只认随机 token 链接"),
+    }
+}
+
 /// `bui status` 末尾显示几条事件（spec §5.7；全量看 `bui incidents`）
 pub const STATUS_INCIDENTS: usize = 5;
 
@@ -117,6 +141,7 @@ pub async fn run_with(
     host: Arc<dyn Host>,
     socket: PathBuf,
 ) -> Result<()> {
+    let now = host.now();
     let health = match fetch_over_socket(&socket).await {
         Some(h) => h,
         None => {
@@ -124,16 +149,22 @@ pub async fn run_with(
             local_health(&paths, host).await?
         }
     };
-    // 鉴权模式读期望态：守护进程在不在跑都读得到，`--json` 那一支不动
+    // 鉴权模式与旧链接宽限期读期望态：守护进程在不在跑都读得到，`--json` 那一支不动
     // （`HealthResponse` 的形状是 P2 锁死的回归面）。
-    let hy2_auth = match Store::open(crate::paths::state_file(&paths)).await {
-        Ok(store) => store.read().await.system.hy2_auth,
-        Err(_) => Hy2Auth::default(),
+    let (hy2_auth, legacy_sub_until) = match Store::open(crate::paths::state_file(&paths)).await {
+        Ok(store) => {
+            let s = store.read().await;
+            (s.system.hy2_auth, s.system.legacy_sub_until.clone())
+        }
+        Err(_) => (Hy2Auth::default(), None),
     };
     if json {
         println!("{}", serde_json::to_string_pretty(&health)?);
     } else {
-        println!("{}", format_status(&health, hy2_auth));
+        println!(
+            "{}",
+            format_status(&health, hy2_auth, legacy_sub_until.as_deref(), now)
+        );
         let (recent, _) =
             crate::modules::sentinel::incidents::load_recent(&socket, &paths, STATUS_INCIDENTS)
                 .await;
@@ -229,6 +260,11 @@ mod tests {
     use super::*;
     use crate::api::health::{HealthResponse, ServiceStatus};
     use crate::state::runtime::{DriftItem, ReconcileReport};
+    use time::macros::datetime;
+
+    fn t0() -> OffsetDateTime {
+        datetime!(2026-09-14 00:00:00 UTC)
+    }
 
     fn sample() -> HealthResponse {
         HealthResponse {
@@ -269,7 +305,7 @@ mod tests {
 
     #[test]
     fn status_text_shows_units_uptime_errors_and_drift() {
-        let t = format_status(&sample(), Hy2Auth::Http);
+        let t = format_status(&sample(), Hy2Auth::Http, None, t0());
         assert!(t.contains("node-a"));
         assert!(t.contains("4.0.0"));
         assert!(t.contains("1h 2m"), "uptime 要人读得懂：{t}");
@@ -289,7 +325,7 @@ mod tests {
     fn a_same_version_rebuild_is_reported_as_a_new_build() {
         let mut h = sample();
         h.upgrade_available = Some(h.version.clone());
-        let t = format_status(&h, Hy2Auth::Http);
+        let t = format_status(&h, Hy2Auth::Http, None, t0());
         assert!(t.contains("同版本的新构建"), "{t}");
         assert!(t.contains("bui upgrade"), "要说清下一步怎么做：{t}");
         assert!(
@@ -301,15 +337,41 @@ mod tests {
     /// 排「谁都登不上」时第一眼要看的就是这一行（2026-09-13 裁决：默认 http，command 是退路）。
     #[test]
     fn status_text_names_the_current_hysteria_auth_mode() {
-        let t = format_status(&sample(), Hy2Auth::Http);
+        let t = format_status(&sample(), Hy2Auth::Http, None, t0());
         assert!(
             t.contains("鉴权模式") && t.contains("auth.type=http"),
             "{t}"
         );
         assert!(!t.contains("auth.type=command"), "{t}");
-        let t = format_status(&sample(), Hy2Auth::Command);
+        let t = format_status(&sample(), Hy2Auth::Command, None, t0());
         assert!(t.contains("auth.type=command") && t.contains("退路"), "{t}");
         assert!(!t.contains("auth.type=http"), "{t}");
+    }
+
+    /// 2026-09-14 裁决：订阅按随机 token 取，旧用户名链接只在宽限期内还认。
+    /// 运维排「订阅取不到」时要一眼看出现在是哪一种。
+    #[test]
+    fn status_text_says_whether_the_username_links_still_work() {
+        // 没设宽限期（全新装机、或运维 `bui set legacy-sub off`）⇒ 已停用
+        let t = format_status(&sample(), Hy2Auth::Http, None, t0());
+        assert!(t.contains("旧订阅链接  已停用"), "{t}");
+        // 宽限期内 ⇒ 报还剩多久
+        let t = format_status(&sample(), Hy2Auth::Http, Some("2026-09-21T00:00:00Z"), t0());
+        assert!(
+            t.contains("旧订阅链接  用户名链接还剩 7d 0h 到期（2026-09-21T00:00:00Z）"),
+            "{t}"
+        );
+        // 到期 ⇒ 已过期
+        let t = format_status(&sample(), Hy2Auth::Http, Some("2026-09-13T23:59:59Z"), t0());
+        assert!(
+            t.contains("旧订阅链接  已过期（2026-09-13T23:59:59Z）"),
+            "{t}"
+        );
+        // 解析不出来的时刻按停用报（端点侧判不出「早于」，一律不认）
+        assert!(
+            format_legacy_sub(Some("下周"), t0()).contains("已停用"),
+            "垃圾值按停用报"
+        );
     }
 
     #[test]
@@ -320,7 +382,7 @@ mod tests {
         h.reconcile = None;
         h.drift.clear();
         h.upgrade_available = None;
-        let t = format_status(&h, Hy2Auth::Http);
+        let t = format_status(&h, Hy2Auth::Http, None, t0());
         assert!(t.contains("无漂移"));
         assert!(!t.contains("重启失败"));
         assert!(!t.contains("4.0.1"));

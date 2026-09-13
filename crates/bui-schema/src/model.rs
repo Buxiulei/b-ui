@@ -109,6 +109,22 @@ pub struct User {
     pub portal_auth: PortalAuth,
     #[serde(default)]
     pub billing: Billing,
+    /// 该用户的**随机订阅 token**（32 位小写十六进制，见 [`crate::sub`]）：四个免鉴权订阅
+    /// 端点的路径末段。「域名 + 用户名」在 v3 口径下等于订阅凭据，而仓库是公开的，所以
+    /// 末段改成不可猜、可轮换的 token（2026-09-14 裁决）。
+    ///
+    /// `None` = 还没补齐（升级上来的老 `state.json`），由守护进程启动时的一次补齐写入；
+    /// 三条建用户路径（面板 / 装机首用户 / v3 导入）建出来的用户一律带 token。
+    ///
+    /// `skip_serializing_if`（D10）：缺省一个字节都不进 `state.json` —— 与同文件的
+    /// `slot_id` / 三个 `speedtest_*` 同风格，也让 `tests::state_round_trips` 的
+    /// `to_value(&s) == SAMPLE` 继续成立（**不许改那两份 SAMPLE**）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub_token: Option<String>,
+    /// 该用户的「用户名链接」是否已停用。轮换（`POST /api/users/{name}/rotate`）置 true：
+    /// 全局宽限期还没到也立刻失效，否则换了凭据旧链接还能取到新凭据，轮换就是空转。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub legacy_sub_disabled: bool,
 }
 
 /// 用户在两种协议上的凭据。
@@ -142,6 +158,11 @@ pub struct Entitlements {
 
 fn default_true() -> bool {
     true
+}
+
+/// `skip_serializing_if` 用：默认 false 的 bool 缺省不落盘（`Not::not` 收 `bool` 不收 `&bool`）。
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// 住宅权益：指向某个住宅分组，以及该用户粘住的 IP 槽位。
@@ -481,6 +502,14 @@ pub struct SystemSettings {
     /// Hysteria2 鉴权方式（默认 http；旧 state 缺字段就是 http）
     #[serde(default)]
     pub hy2_auth: Hy2Auth,
+    /// 旧「用户名订阅链接」的全局宽限期截止时刻（RFC3339）。`None` = **一概不认**用户名
+    /// 链接（全新装机就是 None：那台机器上从来没人用过用户名链接）。v3 导入与老 v4 安装
+    /// 补 token 时设成「那一刻 + [`crate::sub::LEGACY_SUB_GRACE_DAYS`] 天」，运维可以用
+    /// `bui set legacy-sub off` 提前收口、`bui set legacy-sub <RFC3339>` 改期。
+    ///
+    /// `skip_serializing_if`（D10）：缺省不落盘，理由同 [`User::sub_token`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_sub_until: Option<String>,
 }
 
 fn default_auto() -> String {
@@ -495,6 +524,7 @@ impl Default for SystemSettings {
             sysctl_profile: "auto".into(),
             firewall: "auto".into(),
             hy2_auth: Hy2Auth::Http,
+            legacy_sub_until: None,
         }
     }
 }
@@ -621,6 +651,35 @@ mod tests {
         assert_eq!("command".parse::<Hy2Auth>().unwrap(), Hy2Auth::Command);
         assert!("userpass".parse::<Hy2Auth>().is_err());
         assert_eq!(Hy2Auth::Http.to_string(), "http");
+    }
+
+    /// 2026-09-14 裁决（每用户随机订阅 token）：三个新字段缺省一律不落盘。
+    /// 上面 `state_round_trips` 的 `to_value(&s) == SAMPLE` 就靠这一条成立 ——
+    /// 多出一个 `"sub_token": null` 就会红，所以这条是它的前哨。
+    #[test]
+    fn sub_token_fields_default_and_do_not_serialize() {
+        let s: State = serde_json::from_str(SAMPLE).expect("parse");
+        assert_eq!(s.users[0].sub_token, None, "旧 state 没有这个字段");
+        assert!(!s.users[0].legacy_sub_disabled);
+        assert_eq!(s.system.legacy_sub_until, None, "缺省 = 不认用户名链接");
+        let plain = serde_json::to_value(&s).unwrap();
+        assert!(plain["users"][0].get("sub_token").is_none());
+        assert!(plain["users"][0].get("legacy_sub_disabled").is_none());
+        assert!(plain["system"].get("legacy_sub_until").is_none());
+
+        let mut s2 = s.clone();
+        s2.users[0].sub_token = Some("0123456789abcdef0123456789abcdef".into());
+        s2.users[0].legacy_sub_disabled = true;
+        s2.system.legacy_sub_until = Some("2026-09-21T00:00:00Z".into());
+        let json = serde_json::to_value(&s2).unwrap();
+        assert_eq!(
+            json["users"][0]["sub_token"],
+            "0123456789abcdef0123456789abcdef"
+        );
+        assert_eq!(json["users"][0]["legacy_sub_disabled"], true);
+        assert_eq!(json["system"]["legacy_sub_until"], "2026-09-21T00:00:00Z");
+        let back: State = serde_json::from_value(json).unwrap();
+        assert_eq!(back, s2, "写出去再读回来要一模一样");
     }
 
     #[test]

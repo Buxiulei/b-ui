@@ -352,3 +352,44 @@ fn copy_tree(from: &Path, to: &Path) {
         }
     }
 }
+
+/// 2026-09-14 裁决：v3 用户手里全是「用户名链接」，所以导入时每人生成一个随机订阅 token，
+/// 并把全局宽限期设成「导入时刻 + `LEGACY_SUB_GRACE_DAYS` 天」——那之后只认 token。
+#[test]
+fn every_imported_user_gets_a_sub_token_and_a_seven_day_grace_window() {
+    use std::collections::BTreeSet;
+    use time::format_description::well_known::Rfc3339;
+    use time::{Duration, OffsetDateTime};
+
+    let before = OffsetDateTime::now_utc();
+    let s = bui_schema::v3::import(fixture()).unwrap().state;
+    let after = OffsetDateTime::now_utc();
+
+    let mut tokens = BTreeSet::new();
+    for u in &s.users {
+        let t = u
+            .sub_token
+            .as_deref()
+            .unwrap_or_else(|| panic!("用户 {} 导入后没有订阅 token", u.username));
+        assert!(bui_schema::sub::is_sub_token(t), "{t} 不是 32 位小写 hex");
+        assert!(
+            tokens.insert(t.to_string()),
+            "两个用户拿到了同一个 token：{t}"
+        );
+        assert!(
+            !u.legacy_sub_disabled,
+            "导入不停用用户名链接（宽限期内两种都认）：{}",
+            u.username
+        );
+    }
+    assert_eq!(tokens.len(), 4, "fixture 里四个用户，四个不同的 token");
+
+    let raw = s.system.legacy_sub_until.expect("导入必须设宽限期");
+    let until = OffsetDateTime::parse(&raw, &Rfc3339).expect(&raw);
+    let grace = Duration::days(bui_schema::sub::LEGACY_SUB_GRACE_DAYS);
+    // 截止时刻抹到秒，所以下界减 1 秒
+    assert!(
+        until >= before + grace - Duration::seconds(1) && until <= after + grace,
+        "宽限期要是「导入时刻 + 7 天」，拿到的是 {raw}"
+    );
+}

@@ -1,5 +1,5 @@
-//! CLI 通过 unix socket 调的三个系统端点（spec §2.4）：触发一轮对账、动一个受管单元、
-//! 切 Hysteria2 的鉴权方式。
+//! CLI 通过 unix socket 调的四个系统端点（spec §2.4）：触发一轮对账、动一个受管单元、
+//! 切 Hysteria2 的鉴权方式、改旧订阅链接的宽限期。
 //!
 //! 这两个端点是「菜单与 CLI 不自己动手」的唯一出口：`sudo b-ui` 的重启/停止都经过这里，
 //! 于是三条对账路径（启动、去抖、10 分钟巡检）仍只有守护进程里那一个 consumer 在跑（S6）。
@@ -66,6 +66,55 @@ pub async fn set_hy2_auth(
             )
                 .into_response()
         }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LegacySubRequest {
+    /// `null` = 停用全部「用户名订阅链接」；否则 RFC3339 截止时刻。
+    #[serde(default)]
+    pub until: Option<String>,
+}
+
+/// `POST /api/system/legacy-sub`：改旧「用户名订阅链接」的全局宽限期
+/// （`bui set legacy-sub` 的落点，2026-09-14 裁决）。
+///
+/// 只写期望态、**不发 `StateChanged`**：四个免鉴权端点每次请求都现读 `state.json` 的内存
+/// 副本，没有任何渲染产物依赖这一位，不必为它跑一轮对账。
+pub async fn set_legacy_sub(
+    State(app): State<AppState>,
+    Json(req): Json<LegacySubRequest>,
+) -> Response {
+    // 校验与 CLI 同一处（`commands::config::parse_legacy_sub`）：`null` 直接就是停用
+    let until = match req.until.as_deref() {
+        None => None,
+        Some(raw) => match crate::commands::config::parse_legacy_sub(raw) {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": e.to_string()})),
+                )
+                    .into_response()
+            }
+        },
+    };
+    let stored = until.clone();
+    match app
+        .store
+        .update(|s| s.system.legacy_sub_until = stored)
+        .await
+    {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"ok": true, "legacy_sub_until": until})),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),

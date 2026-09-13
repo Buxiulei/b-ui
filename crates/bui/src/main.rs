@@ -189,6 +189,14 @@ async fn dispatch(command: Command) -> Result<()> {
                 )
                 .await
             }
+            cli::SetCmd::LegacySub { value } => {
+                commands::config::run_legacy_sub(
+                    &value,
+                    bui_schema::paths::Paths::default_server(),
+                    std::sync::Arc::new(sys::real::RealHost::new()),
+                )
+                .await
+            }
         },
         Command::Menu => {
             commands::menu::run(
