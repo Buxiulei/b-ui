@@ -34,7 +34,8 @@ pub struct Report {
     pub imported: Vec<String>,
     /// 解析失败的 v3 目录名
     pub skipped: Vec<String>,
-    /// v3 目录里的节点已经在 profiles 里（整个 `Node` 相同），这次原样跳过的 profile 名
+    /// v3 目录里的节点已经在 profiles 里（同一个连接，见
+    /// [`same_endpoint`](crate::profiles::same_endpoint)），这次原样跳过的 profile 名
     pub existing: Vec<String>,
     pub active: Option<String>,
     pub removed_units: Vec<String>,
@@ -125,10 +126,11 @@ pub fn import<S: Sys>(sys: &S, base: &Path, prof: &mut Profiles) -> Result<Repor
                 });
             }
         }
-        // 重跑幂等：同一个 `Node` 已经在 profiles 里就原样跳过——不新建、不改名。
+        // 重跑幂等：同一个连接已经在 profiles 里就原样跳过——不新建、不改名、不回写。
         // v3 的 `<base>/configs` 按约定保留着（`detect` 恒为真），少了这一步，
-        // 在已迁移的机器上按一次菜单 [7] 就多出一批 `-2` 重复节点。
-        if let Some(existing) = prof.find_by_node(&node) {
+        // 在已迁移的机器上按一次菜单 [7] 就多出一批 `-2` 重复节点。按连接身份认而不是
+        // 整个 `Node` 相等：面板导入过一次后 label 已是 `HY2直连`，不再是 v3 的备注。
+        if let Some(existing) = prof.find_same_endpoint(&node) {
             let name = existing.name.clone();
             if dir_name == v3_active {
                 r.active = Some(name.clone());
@@ -794,6 +796,37 @@ mod tests {
             (prof.socks_port, prof.http_port),
             (11080, 18080),
             "端口同理保持原样"
+        );
+    }
+
+    /// 面板刷新过 label（`HY2直连` 取代 v3 备注）之后重跑 import-v3：整个 `Node` 已经不等，
+    /// 但仍是同一个连接——计入 `existing`，不新建 `-2`，也不拿 v3 的旧数据回写它。
+    #[test]
+    fn rerun_recognises_nodes_whose_label_was_updated_by_the_panel() {
+        let s = v3_machine();
+        let mut prof = Profiles::new_default();
+        import(&s, Path::new(V3_BASE), &mut prof).unwrap();
+        let hy2 = prof
+            .profiles
+            .iter_mut()
+            .find(|p| p.name == "hysteria2-1757000000")
+            .unwrap();
+        hy2.node.label = "HY2直连".into();
+        hy2.source = Source::ApiNodes;
+
+        let r = import(&s, Path::new(V3_BASE), &mut prof).unwrap();
+        assert!(r.imported.is_empty(), "{:?}", r.imported);
+        assert_eq!(
+            r.existing,
+            vec![
+                "hysteria2-1757000000".to_string(),
+                "vless-1757000001".to_string()
+            ]
+        );
+        assert_eq!(prof.profiles.len(), 2, "不该冒出 `-2` 后缀的重复条目");
+        assert_eq!(
+            prof.profiles[0].node.label, "HY2直连",
+            "面板刷新过的节点不被回写"
         );
     }
 

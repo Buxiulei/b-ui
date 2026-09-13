@@ -8,7 +8,9 @@ use crate::engine::{Applied, Engine};
 use crate::menu::{self, Action, Prompt, Status};
 use crate::net::Net;
 use crate::paths::{Paths, UNIT_MAIN, UNIT_TIMER};
-use crate::profiles::{profile_name, rfc3339, Mode, Panel, Profile, Profiles, Source, Upsert};
+use crate::profiles::{
+    profile_name, rfc3339, same_account, Mode, Panel, Profile, Profiles, Source, Upsert,
+};
 use crate::source::{self, Fetched};
 use crate::sys::{systemd, Sys};
 use crate::{import_v3, ufw, uninstall, update, Error, Result};
@@ -265,7 +267,15 @@ struct Stored {
     names: Vec<String>,
 }
 
-/// profile 名即主键：同名视为「同一个节点位」，凭据轮换直接替换，不堆重复条目。
+/// profile 名是 upsert 的主键，名字按连接身份定：
+///
+/// 1. 已有同一个连接（[`Profiles::find_same_endpoint`]）→ 沿用它的名字，原地更新
+///    label / hop / 分流 / 来源（import-v3 的 `hysteria2-<ts>` 经面板导入不会多出一份）；
+/// 2. 否则取 [`profile_name`]：同名的是同一账号（[`same_account`]，换了密码或主机）→
+///    凭据轮换，替换；同名的是**另一个**账号 → `-2`、`-3` 另起，绝不覆盖——面板用户名
+///    全是中文时名字回落成 `<主机名>-<kind>`，同一台服务器上的家人账号必然撞名。
+///
+/// upsert 逐个做，同一批里后一个节点看到的「已有同名」就包括前一个，规则一样成立。
 fn store_fetched<S: Sys, N: Net, P: Prompt>(
     ctx: &mut Ctx<'_, S, N, P>,
     prof: &mut Profiles,
@@ -278,11 +288,22 @@ fn store_fetched<S: Sys, N: Net, P: Prompt>(
         names: Vec::with_capacity(f.nodes.len()),
     };
     for node in &f.nodes {
-        // 同一个节点已在别的名字下 → 沿用那个名字，不新建
-        let name = prof
-            .find_by_node(node)
-            .map(|p| p.name.clone())
-            .unwrap_or_else(|| profile_name(&f.user, node));
+        let name = match prof.find_same_endpoint(node) {
+            Some(same) => same.name.clone(),
+            None => {
+                let wanted = profile_name(&f.user, node);
+                match prof.profiles.iter().find(|p| p.name == wanted) {
+                    Some(taken) if !same_account(&taken.node, node) => {
+                        let fresh = prof.free_name(&wanted);
+                        ctx.say(format!(
+                            "节点名 {wanted} 已被另一个账号占用，新节点命名为 {fresh}"
+                        ));
+                        fresh
+                    }
+                    _ => wanted,
+                }
+            }
+        };
         let r = prof.upsert(Profile {
             name: name.clone(),
             node: node.clone(),
@@ -1360,6 +1381,169 @@ mod tests {
             "位置参数要提醒改用标准输入：{}",
             ctx.out
         );
+    }
+
+    /// 合成的 HY2 直连账号：host/port/hop/sni 都同 [`hy2_direct_node`]，只有凭据不同。
+    fn hy2_account(username: &str, password: &str) -> bui_schema::nodes::Node {
+        bui_schema::nodes::Node {
+            transport: bui_schema::nodes::Transport::Hysteria2 {
+                username: username.into(),
+                password: password.into(),
+                sni: "panel.example.com".into(),
+                obfs_password: None,
+            },
+            ..hy2_direct_node()
+        }
+    }
+
+    fn hy2_credentials(p: &crate::profiles::Profile) -> (&str, &str) {
+        match &p.node.transport {
+            bui_schema::nodes::Transport::Hysteria2 {
+                username, password, ..
+            } => (username, password),
+            other => panic!("不是 HY2 节点：{other:?}"),
+        }
+    }
+
+    /// `bui-c import --panel https://panel.example.com --user <user>`，返回这次会话说过的话。
+    fn import_from_panel(
+        s: &FakeSys,
+        pp: &Paths,
+        user: &str,
+        nodes: Vec<bui_schema::nodes::Node>,
+    ) -> String {
+        let n = FakeNet::new();
+        n.route(
+            &crate::source::nodes_url("https://panel.example.com", user),
+            nodes_payload(user, nodes),
+        );
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(s, &n, pp, &mut p, false, false);
+        dispatch(
+            &parse(&[
+                "import",
+                "--panel",
+                "https://panel.example.com",
+                "--user",
+                user,
+            ]),
+            &mut ctx,
+        )
+        .unwrap();
+        ctx.transcript.clone()
+    }
+
+    /// 缺陷：面板用户名全是中文，`profile_name` 回落成 `<主机名>-<kind>`，同一台服务器上
+    /// 第二个账号（家人）的节点跟第一个同名，`upsert` 直接 Replace——第一个账号能用的
+    /// 凭据被悄悄换掉。
+    #[test]
+    fn importing_a_second_account_on_the_same_host_does_not_overwrite_the_first() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        import_from_panel(&s, &pp, "示例用户甲", vec![hy2_account("u1", "pw1")]);
+        let t = import_from_panel(&s, &pp, "示例用户", vec![hy2_account("u2", "pw2")]);
+        assert_eq!(
+            names(&s, &pp),
+            vec![
+                "panel.example.com-hy2-direct",
+                "panel.example.com-hy2-direct-2"
+            ],
+            "{t}"
+        );
+        let saved = Profiles::load(&s, &pp).unwrap();
+        assert_eq!(
+            hy2_credentials(&saved.profiles[0]),
+            ("u1", "pw1"),
+            "第一个账号的凭据不能被第二个账号覆盖：\n{t}"
+        );
+        assert_eq!(hy2_credentials(&saved.profiles[1]), ("u2", "pw2"));
+        assert!(
+            t.contains(
+                "节点名 panel.example.com-hy2-direct 已被另一个账号占用，新节点命名为 panel.example.com-hy2-direct-2"
+            ),
+            "{t}"
+        );
+        assert_eq!(
+            saved.active.as_deref(),
+            Some("panel.example.com-hy2-direct"),
+            "已有活动节点，不抢"
+        );
+    }
+
+    /// 缺陷：import-v3 导进来的节点 label 是 v3 备注，面板给的是 `HY2直连`，整个 `Node`
+    /// 不相等就被当成新节点——同一个连接在列表里出现两份。
+    #[test]
+    fn reimporting_a_v3_node_from_the_panel_updates_it_in_place() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        let mut prof = Profiles::new_default();
+        prof.upsert(crate::profiles::Profile {
+            name: "hysteria2-1785892136".into(),
+            node: bui_schema::nodes::Node {
+                label: "示例专用名-小组".into(),
+                ..hy2_account("u1", "pw1")
+            },
+            split: crate::profiles::default_split(),
+            source: crate::profiles::Source::V3,
+            imported_at: "2026-09-11T00:00:00Z".into(),
+        });
+        prof.active = Some("hysteria2-1785892136".into());
+        prof.save(&s, &pp).unwrap();
+
+        let t = import_from_panel(&s, &pp, "示例专用名", vec![hy2_account("u1", "pw1")]);
+        assert_eq!(names(&s, &pp), vec!["hysteria2-1785892136"], "{t}");
+        let saved = Profiles::load(&s, &pp).unwrap();
+        assert_eq!(saved.profiles[0].node.label, "HY2直连", "{t}");
+        assert_eq!(saved.profiles[0].source, crate::profiles::Source::ApiNodes);
+        assert!(t.contains("更新节点 hysteria2-1785892136"), "{t}");
+    }
+
+    /// 凭据轮换：同名、同一账号（username 相同）换了密码 → 原地替换，不另起 `-2`。
+    #[test]
+    fn password_rotation_for_the_same_account_replaces_in_place() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        import_from_panel(&s, &pp, "示例用户甲", vec![hy2_account("u1", "pw1")]);
+        let t = import_from_panel(&s, &pp, "示例用户甲", vec![hy2_account("u1", "pw-rotated")]);
+        assert_eq!(names(&s, &pp), vec!["panel.example.com-hy2-direct"], "{t}");
+        let saved = Profiles::load(&s, &pp).unwrap();
+        assert_eq!(hy2_credentials(&saved.profiles[0]), ("u1", "pw-rotated"));
+        assert!(t.contains("更新节点 panel.example.com-hy2-direct"), "{t}");
+        assert!(!t.contains("占用"), "同一账号不算占用：{t}");
+    }
+
+    /// 同一批里两个账号定出同一个名字（粘贴 / 订阅可能混入多个用户）：upsert 逐个做，
+    /// 第二个看到的「已有同名」就是第一个，按 same_account 判定另起 `-2`。
+    #[test]
+    fn two_accounts_in_one_pasted_batch_under_the_same_name_are_both_kept() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        let n = FakeNet::new();
+        let mut p = Scripted::from([
+            "hysteria2://u1:pw1@panel.example.com:10000/?sni=panel.example.com&mport=20000-30000#u1-HY2",
+            "hysteria2://u2:pw2@panel.example.com:10000/?sni=panel.example.com&mport=20000-30000#u2-HY2",
+            "",
+        ]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["import", "-"]), &mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert_eq!(
+            names(&s, &pp),
+            vec![
+                "panel.example.com-hy2-direct",
+                "panel.example.com-hy2-direct-2"
+            ],
+            "{t}"
+        );
+        let saved = Profiles::load(&s, &pp).unwrap();
+        assert_eq!(hy2_credentials(&saved.profiles[0]), ("u1", "pw1"));
+        assert_eq!(hy2_credentials(&saved.profiles[1]), ("u2", "pw2"));
+        assert!(t.contains("已被另一个账号占用"), "{t}");
+        assert!(t.contains("导入 2 个新节点，共 2 个"), "{t}");
     }
 
     #[test]
