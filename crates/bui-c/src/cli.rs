@@ -881,16 +881,20 @@ fn run_check<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>, manual: bool
 }
 
 /// 决策 10 / spec §6「import-v3：首次运行从 /opt/hysteria-client/ 导入」的接线点：
-/// 没有任何 profile 且机器上有 v3 客户端目录时，进菜单前问一次。只问一次；
-/// 答否就给出手动入口。`check` / `update` 这类非交互路径**不**走这里——
-/// 让 timer 悄悄改用户配置是更坏的行为。
+/// 没有任何 profile、机器上有 v3 客户端目录、且 v3 主单元文件至少还剩一个（还没迁移）时，
+/// 进菜单前问一次。已迁移的机器按约定留着 v3 目录当回滚素材，单元文件已卸掉，删光节点后
+/// 不再邀请（spec §5.7）。只问一次；答否就给出手动入口。`check` / `update` 这类非交互路径
+/// **不**走这里——让 timer 悄悄改用户配置是更坏的行为。
 fn offer_v3_import<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()> {
     let prof = Profiles::load(ctx.sys, ctx.paths)?;
     if !prof.profiles.is_empty() {
         return Ok(());
     }
     let base = PathBuf::from(import_v3::V3_BASE);
-    if !import_v3::detect(ctx.sys, &base) {
+    let unmigrated = import_v3::V3_UNITS
+        .iter()
+        .any(|u| ctx.sys.exists(&ctx.paths.unit(u)));
+    if !import_v3::detect(ctx.sys, &base) || !unmigrated {
         return Ok(());
     }
     ctx.say(format!("发现 v3 客户端目录 {}", base.display()));
@@ -2875,8 +2879,9 @@ mod tests {
             "hysteria2://alice:hy2-pw@panel.example.com:10000/?sni=panel.example.com&mport=20000-30000#alice-HY2%E7%9B%B4%E8%BF%9E",
         );
         s.put("/opt/hysteria-client/active", "hysteria2-1");
+        s.put("/etc/systemd/system/hysteria-client.service", "[Unit]");
         let n = FakeNet::new();
-        // 没有 profiles.json + 有 v3 目录 → 进菜单前问一次；y 导入，再 0 退出
+        // 没有 profiles.json + 有 v3 目录 + v3 单元还在 → 进菜单前问一次；y 导入，再 0 退出
         let mut p = Scripted::from(["y", "0"]);
         let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
         menu_loop(&mut ctx).unwrap();
@@ -2892,6 +2897,7 @@ mod tests {
             "/opt/hysteria-client/configs/hysteria2-1/uri.txt",
             "hysteria2://alice:hy2-pw@panel.example.com:10000/?sni=panel.example.com#alice-HY2%E7%9B%B4%E8%BF%9E",
         );
+        s2.put("/etc/systemd/system/hysteria-client.service", "[Unit]");
         let mut p2 = Scripted::from(["n", "0"]);
         let mut ctx2 = Ctx::new(&s2, &n, &pp, &mut p2, false, false);
         menu_loop(&mut ctx2).unwrap();
@@ -2904,6 +2910,50 @@ mod tests {
             ctx2.transcript
         );
         assert!(!s2.called("systemctl stop hysteria-client.service"));
+    }
+
+    /// 已迁移的机器：v3 目录按约定留着当回滚素材，v3 单元已被卸掉。删光节点后再进菜单，
+    /// 不该再邀请从 v3 导入（spec §5.7 表第 4 行）。只认三个主单元，health 定时器的残留不算。
+    #[test]
+    fn first_run_offer_needs_a_live_v3_unit() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        s.put(
+            "/opt/hysteria-client/configs/hysteria2-1/uri.txt",
+            "hysteria2://alice:hy2-pw@panel.example.com:10000/?sni=panel.example.com#alice-HY2%E7%9B%B4%E8%BF%9E",
+        );
+        s.put("/etc/systemd/system/hysteria-health.timer", "[Unit]");
+        let n = FakeNet::new();
+
+        // 有 v3 目录，主单元一个都不在 → 不问，直接进菜单；0 退出
+        let mut p = Scripted::from(["0"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert!(!t.contains("发现 v3 客户端目录"), "{t}");
+        assert!(
+            !p.asked.iter().any(|q| q.contains("导入 v3 的节点")),
+            "{:?}",
+            p.asked
+        );
+
+        // 补上一个主单元文件（还没迁移）→ 问；答 n，再 0 退出
+        s.put("/etc/systemd/system/xray-client.service", "[Unit]");
+        let mut p = Scripted::from(["n", "0"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert!(
+            t.lines()
+                .any(|l| l == "  发现 v3 客户端目录 /opt/hysteria-client"),
+            "{t}"
+        );
+        assert!(
+            p.asked.iter().any(|q| q.contains("导入 v3 的节点")),
+            "{:?}",
+            p.asked
+        );
     }
 
     #[test]
