@@ -34,6 +34,29 @@ pub fn human_duration(secs: u64) -> String {
     }
 }
 
+/// 去掉 ANSI 色码（sing-box 往 journald 写带色输出，R13 §6.2 踩过）。
+/// 黑名单的日志候选（`residential::journal`）与日志哨兵的 journald 解析（`sys`）共用这一份。
+pub fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        // CSI 序列：ESC [ 参数… 终止字母
+        if chars.peek() == Some(&'[') {
+            chars.next();
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

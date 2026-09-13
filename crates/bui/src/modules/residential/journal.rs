@@ -22,27 +22,9 @@ pub struct JournalBatch {
     pub cursor: Option<String>,
 }
 
-/// 去掉 ANSI 色码（sing-box 往 journald 写带色输出，R13 §6.2 踩过）
-pub fn strip_ansi(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '\x1b' {
-            out.push(c);
-            continue;
-        }
-        // CSI 序列：ESC [ 参数… 终止字母
-        if chars.peek() == Some(&'[') {
-            chars.next();
-            for c in chars.by_ref() {
-                if c.is_ascii_alphabetic() {
-                    break;
-                }
-            }
-        }
-    }
-    out
-}
+/// 去掉 ANSI 色码：实现挪到 `crate::util`（日志哨兵的 journald 解析也要用），这里转出来，
+/// 既有调用点与测试（`strip_ansi_removes_color_codes_only`）不变。
+pub use crate::util::strip_ansi;
 
 /// 解析一行；不是拒绝行（或不含状态/拒绝语义）→ `None`
 pub fn parse_line(line: &str) -> Option<RejectLine> {
