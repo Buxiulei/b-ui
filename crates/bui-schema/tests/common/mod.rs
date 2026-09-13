@@ -82,25 +82,3 @@ fn check_singbox_with(bin: &str, cfg: &serde_json::Value) {
         String::from_utf8_lossy(&out.stderr)
     );
 }
-
-/// v3 单协议 + residential=true 只有住宅版；v4 多给直连版。golden 比对只看 v3 有的节点。
-pub fn v3_nodes_only(
-    nodes: Vec<bui_schema::nodes::Node>,
-    user: &User,
-) -> Vec<bui_schema::nodes::Node> {
-    let single = user.entitlements.protocols.len() == 1 && user.entitlements.residential.is_some();
-    if single {
-        nodes
-            .into_iter()
-            .filter(|n| {
-                matches!(
-                    n.kind,
-                    bui_schema::nodes::NodeKind::RealityResidential
-                        | bui_schema::nodes::NodeKind::Hy2Residential
-                )
-            })
-            .collect()
-    } else {
-        nodes
-    }
-}

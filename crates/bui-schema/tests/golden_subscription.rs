@@ -10,10 +10,11 @@ use pretty_assertions::assert_eq;
 const USERS: [&str; 4] = ["alice", "bob", "carol", "dave"];
 const MODES: [&str; 3] = ["global", "split", "obfs"];
 
-/// 某用户在 golden 里应有的节点集合（v3 单协议只发住宅版，见 `common::v3_nodes_only`）。
+/// 某用户的完整节点集合，不做任何过滤就与 v3 golden 逐项相等：单协议 + 住宅的 bob / carol
+/// 导入后 `direct=false`，与 v3 一样只有住宅版（2026-09-13 裁决撤销了此前的 `v3_nodes_only` 例外）。
 fn nodes_of(s: &State, username: &str) -> Vec<Node> {
     let user = s.users.iter().find(|u| u.username == username).unwrap();
-    common::v3_nodes_only(nodes_for(user, &s.node, &s.residential), user)
+    nodes_for(user, &s.node, &s.residential)
 }
 
 fn split_of(s: &State) -> SplitRules {

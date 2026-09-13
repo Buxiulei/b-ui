@@ -71,6 +71,8 @@
 //!
 //! - [`v3::import`]：读取 v3 的 `/opt/b-ui` 目录，产出 [`ImportReport`](v3::ImportReport)
 //!   （`state` + `warnings`），失败返回 [`ImportError`](v3::ImportError)。
+//! - [`v3::direct_entitlement`]：按 v3 协议名 + 住宅开关算直连权益（单协议开住宅 ⇒ 无直连），
+//!   导入与面板新建用户共用，保证订阅与 v3 逐项等价。
 //!
 //! ## 路径 —— [`paths`]
 //!

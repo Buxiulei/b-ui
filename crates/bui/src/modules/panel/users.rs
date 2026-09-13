@@ -223,7 +223,8 @@ pub fn new_user(req: &CreateRequest, now: OffsetDateTime) -> Result<User, String
     if let Some(pw) = &req.password {
         validate_password(pw)?;
     }
-    let protocols = protocols_from_label(req.protocol.as_deref().unwrap_or("hysteria2"))?;
+    let label = req.protocol.as_deref().unwrap_or("hysteria2");
+    let protocols = protocols_from_label(label)?;
     // v3.5.5：`residential` 缺省 true
     let residential = req.residential.unwrap_or(true);
     Ok(User {
@@ -238,7 +239,8 @@ pub fn new_user(req: &CreateRequest, now: OffsetDateTime) -> Result<User, String
         },
         entitlements: Entitlements {
             protocols,
-            direct: true,
+            // 单协议开住宅只发住宅版（与 v3 订阅逐项等价，口径同 v3 导入）
+            direct: bui_schema::v3::direct_entitlement(label, residential),
             residential: residential.then(|| ResidentialEntitlement {
                 group_id: DEFAULT_GROUP.to_string(),
                 // 分槽在 `create_user` 的那一次 `store.update` 里做（spec §5.6 规则 1）
@@ -952,6 +954,100 @@ mod tests {
             t0()
         )
         .is_err());
+    }
+
+    /// 直连权益与 v3 订阅逐项等价（2026-09-13 裁决）：单协议（hysteria2 / vless-reality）开住宅
+    /// 只发住宅版 ⇒ `direct=false`；单协议不开住宅只发直连版、fusion 直连照给 ⇒ `direct=true`。
+    /// 与 `bui_schema::v3::import` 同一个判定（`v3::direct_entitlement`）。
+    #[test]
+    fn a_single_protocol_user_with_residential_gets_no_direct_entitlement() {
+        let make = |protocol: Option<&str>, residential: Option<bool>| {
+            new_user(
+                &CreateRequest {
+                    username: "bob".into(),
+                    protocol: protocol.map(str::to_string),
+                    residential,
+                    ..Default::default()
+                },
+                t0(),
+            )
+            .unwrap()
+        };
+        let hy2 = make(Some("hysteria2"), Some(true));
+        assert!(!hy2.entitlements.direct);
+        assert!(hy2.entitlements.residential.is_some());
+        let reality = make(Some("vless-reality"), Some(true));
+        assert!(!reality.entitlements.direct);
+        assert!(
+            !make(None, None).entitlements.direct,
+            "缺省（v3：protocol 缺省 hysteria2、residential 缺省 true）就是单协议 + 住宅"
+        );
+        let hy2_direct = make(Some("hysteria2"), Some(false));
+        assert!(
+            hy2_direct.entitlements.direct,
+            "单协议不开住宅 ⇒ 只有直连版"
+        );
+        assert!(hy2_direct.entitlements.residential.is_none());
+        assert!(make(Some("fusion"), Some(true)).entitlements.direct);
+        assert!(make(Some("fusion"), Some(false)).entitlements.direct);
+
+        // 面板回显不看 direct：protocol 仍按协议集合回显 v3 名字，住宅与槽位字段照旧
+        let s = sample_state();
+        for (u, label) in [(&hy2, "hysteria2"), (&reality, "vless-reality")] {
+            let v = serde_json::to_value(project(u, &s.node, &s.residential, &BTreeSet::new()))
+                .unwrap();
+            assert_eq!(v["protocol"], label);
+            assert_eq!(v["residential"], true);
+            assert_eq!(v["slot"], 0);
+            assert_eq!(v["slotPort"], 40000);
+        }
+    }
+
+    /// 面板编辑（`PUT /api/users/:u` → `apply_update`）改不了协议与住宅：`UpdateRequest` 没有这两个
+    /// 字段（v3 的 PUT 同样不收，前端编辑框也不发），请求体里带了也被忽略。所以 direct 只在新建时
+    /// 算一次，编辑哪个字段都不动它；将来给 `UpdateRequest` 加 protocol / residential 时会先撞上
+    /// 这里的第二段断言，届时必须按变更后的值重算 direct（`bui_schema::v3::direct_entitlement`）。
+    #[test]
+    fn editing_a_user_never_touches_the_direct_entitlement() {
+        let mut u = new_user(
+            &CreateRequest {
+                username: "bob".into(),
+                protocol: Some("hysteria2".into()),
+                residential: Some(true),
+                ..Default::default()
+            },
+            t0(),
+        )
+        .unwrap();
+        assert!(!u.entitlements.direct);
+        let protocols = u.entitlements.protocols.clone();
+        let residential = u.entitlements.residential.clone();
+        apply_update(
+            &mut u,
+            &UpdateRequest {
+                username: Some("bob2".into()),
+                password: Some("pw2".into()),
+                days: Some(3.0),
+                traffic: Some(1.0),
+                monthly: Some(1.0),
+                speed: Some(10.0),
+                disabled: Some(true),
+            },
+            t0(),
+        )
+        .unwrap();
+        assert!(!u.entitlements.direct, "只改别的字段 ⇒ direct 不变");
+        assert_eq!(u.entitlements.protocols, protocols);
+        assert_eq!(u.entitlements.residential, residential);
+
+        let before = u.clone();
+        let upd: UpdateRequest =
+            serde_json::from_str(r#"{"residential":false,"protocol":"fusion"}"#).unwrap();
+        apply_update(&mut u, &upd, t0()).unwrap();
+        assert_eq!(
+            u, before,
+            "PUT 不收 protocol / residential（与 v3 相同），用户一个字段都不变"
+        );
     }
 
     #[test]

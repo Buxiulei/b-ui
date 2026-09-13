@@ -258,6 +258,21 @@ struct V3Upstream {
 
 // ── 映射 ─────────────────────────────────────────────────────────────
 
+/// 直连权益（[`Entitlements::direct`]）按 v3 订阅的节点集合取值，导入与面板新建用户共用。
+///
+/// v3 对单协议用户是二选一（行号指删除提交 fc3e757 的父提交里的 `web/server.js`：
+/// `/api/sub` :1893-1904、Clash 生成器 :915-930）：`hysteria2` / `vless-reality` 开住宅时只发
+/// 住宅版、不开时只发直连版；`fusion` 直连照发、开住宅再加住宅版。所以只有「单协议且开住宅」
+/// 没有直连权益。
+///
+/// `protocol` 是 v3 的协议名，缺省值由调用方按各自的 v3 语义补齐：导入按订阅渲染的
+/// `user.protocol || "fusion"`，面板新建按 `handleManage` 的 `protocol || "hysteria2"`。
+/// 必须按协议名而不是导入后的协议个数判定——缺 protocol 又缺 uuid 的早期记录权益只剩
+/// `[Hysteria2]`，但它在 v3 里是 fusion，直连不能丢。
+pub fn direct_entitlement(protocol: &str, residential: bool) -> bool {
+    !(residential && matches!(protocol, "hysteria2" | "vless-reality"))
+}
+
 /// 把一条 v3 用户记录映射成 v4 用户；缺字段按 v3 的渲染语义补齐，补齐动作记进 `warnings`。
 ///
 /// v3 最早期的记录（REALITY 出现前由安装脚本写的首个用户，v3.5.20 之前的
@@ -315,7 +330,10 @@ fn user_from_v3(u: V3User, warnings: &mut Vec<String>) -> Result<User, ImportErr
         }
     };
     // v3 的 residential 缺省视为开通（web/server.js 用 `!== false` 判定）
-    let residential = (u.residential != Some(false)).then(|| ResidentialEntitlement {
+    let resi_on = u.residential != Some(false);
+    // v3 订阅按 `user.protocol || "fusion"` 渲染：缺 protocol 的早期记录不算单协议
+    let direct = direct_entitlement(u.protocol.as_deref().unwrap_or("fusion"), resi_on);
+    let residential = resi_on.then(|| ResidentialEntitlement {
         group_id: DEFAULT_GROUP.to_string(),
         // 导入时还没有槽位表，由守护进程启动时的迁移补齐（spec §5.6 规则 4）
         slot_id: None,
@@ -341,7 +359,7 @@ fn user_from_v3(u: V3User, warnings: &mut Vec<String>) -> Result<User, ImportErr
         },
         entitlements: Entitlements {
             protocols,
-            direct: true,
+            direct,
             residential,
             expires_at: u.limits.expires_at,
             traffic_limit: TrafficLimit {
