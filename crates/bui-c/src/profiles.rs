@@ -37,6 +37,23 @@ pub struct Panel {
     pub username: String,
 }
 
+/// 能当 [`Panel::base_url`] 的地址：`https://<主机>`，去掉首尾空白与尾斜杠后原样返回；
+/// 别的一律 `None`。
+///
+/// panel 是 root 每日自更新的 manifest 与二进制首选来源，sha256 也出自同一份 manifest、
+/// 没有签名——明文 http 在路上谁都能改，所以只收 https。
+pub fn https_base(url: &str) -> Option<String> {
+    let base = url.trim().trim_end_matches('/');
+    let host = base
+        .get(..8)
+        .filter(|scheme| scheme.eq_ignore_ascii_case("https://"))
+        .map(|_| &base[8..])?;
+    if host.is_empty() || host.starts_with('/') {
+        return None;
+    }
+    Some(base.to_string())
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Profile {
     pub name: String,
@@ -531,6 +548,28 @@ mod tests {
             profile_name("示例用户甲", &b),
             "同 kind 不同主机必须是两个 profile，否则 store_fetched 会互相覆盖"
         );
+    }
+
+    #[test]
+    fn https_base_only_accepts_https_with_a_host() {
+        assert_eq!(
+            https_base(" https://panel.example.com/ ").as_deref(),
+            Some("https://panel.example.com")
+        );
+        assert_eq!(
+            https_base("HTTPS://panel.example.com:8443").as_deref(),
+            Some("HTTPS://panel.example.com:8443")
+        );
+        for bad in [
+            "http://panel.example.com",
+            "panel.example.com",
+            "https://",
+            "https:///x",
+            "ftp://panel.example.com",
+            "",
+        ] {
+            assert_eq!(https_base(bad), None, "{bad:?}");
+        }
     }
 
     #[test]

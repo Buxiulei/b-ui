@@ -12,7 +12,8 @@ use crate::engine::Engine;
 use crate::net::Net;
 use crate::paths::{Paths, TUN_IFACE, UNIT_MAIN};
 use crate::profiles::{
-    default_split, profile_name, rfc3339, sanitize, Mode, Panel, Profile, Profiles, Source,
+    default_split, https_base, profile_name, rfc3339, sanitize, Mode, Panel, Profile, Profiles,
+    Source,
 };
 use crate::sys::{systemd, Sys};
 use crate::{update, Error, Result};
@@ -48,7 +49,8 @@ pub struct Report {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunOpts {
     /// `--panel`：覆盖从 v3 `server_address` 推导的面板地址。v3 面板没有 `/packages`，
-    /// 预发布期得给个显式出口。只换 `base_url`，`username` 仍用推导值。
+    /// 预发布期得给个显式出口。只换 `base_url`，`username` 仍用推导值。只收 https：
+    /// 它会落成 root 自更新的来源。
     pub panel: Option<String>,
     /// `--mode`：覆盖「v3 的 bui-tun 是否 enabled」推导出的模式。
     pub mode: Option<Mode>,
@@ -256,6 +258,18 @@ pub fn run<S: Sys, N: Net>(
             base.display()
         )));
     }
+    // 覆盖的面板就是 manifest 与内核的来源，也会落成 root 自更新的 panel：只收 https。
+    // 在动任何东西之前查，错了 v3 一字不动。
+    let panel_override = match opts.panel.as_deref() {
+        None => None,
+        Some(raw) => Some(https_base(raw).ok_or_else(|| {
+            Error::msg(format!(
+                "面板地址 {} 不是 https，不能作为 manifest 与内核来源，v3 客户端原样保留；\
+                 请改用 https:// 开头的面板地址",
+                raw.trim()
+            ))
+        })?),
+    };
     let mut r = import(sys, base, prof)?;
     // 重跑幂等：新节点一个没有、v3 单元也一个不剩 → 无事可做，直接回。
     // 继续往下是有害的：`ensure_kernel` / 自检 / 落盘全是空转，而 `teardown` 会去删
@@ -267,9 +281,9 @@ pub fn run<S: Sys, N: Net>(
     if r.imported.is_empty() && !leftovers {
         return Ok(r);
     }
-    if let Some(url) = &opts.panel {
+    if let Some(base_url) = panel_override {
         prof.panel = Some(Panel {
-            base_url: url.trim().trim_end_matches('/').to_string(),
+            base_url,
             username: prof
                 .panel
                 .as_ref()
@@ -687,6 +701,33 @@ mod tests {
             "manifest 应当去 --panel 指定的面板取：{:?}",
             n.log()
         );
+    }
+
+    /// `--panel` / `BUI_C_PANEL` 指定的面板是 root 自更新的 manifest 与二进制来源（sha256 也来自
+    /// 同一份 manifest，没有签名）：明文 http 谁都能在路上改，不能要。报错时 v3 一字不动。
+    #[test]
+    fn run_refuses_a_non_https_panel_override_and_leaves_v3_alone() {
+        let s = v3_machine();
+        with_v3_units(&s);
+        let n = FakeNet::new();
+        let bin = b"ELF-sing-box".to_vec();
+        serve_kernel(&n, "http://other.example.com", &bin);
+        let mut prof = Profiles::new_default();
+        let opts = RunOpts {
+            panel: Some("http://other.example.com".into()),
+            mode: None,
+        };
+        let e = run(&s, &n, &paths(), Path::new(V3_BASE), &mut prof, &opts).unwrap_err();
+        let msg = e.to_string();
+        assert!(msg.contains("https"), "要说清楚得用 https：{msg}");
+        assert!(msg.contains("v3 客户端原样保留"), "{msg}");
+        assert_v3_untouched(&s);
+        assert!(
+            n.log().is_empty(),
+            "不该去 http 源取 manifest：{:?}",
+            n.log()
+        );
+        assert!(!s.exists(Path::new("/opt/bui-c/bin/sing-box")));
     }
 
     /// 回归保护（缺陷 3，解析层已由 688f88a 的 `parse::node_uri` 修好，这条只是钉住它）：

@@ -9,7 +9,7 @@ use crate::menu::{self, Action, Prompt, Status};
 use crate::net::Net;
 use crate::paths::{Paths, UNIT_MAIN, UNIT_TIMER};
 use crate::profiles::{
-    profile_name, rfc3339, same_account, Mode, Panel, Profile, Profiles, Source, Upsert,
+    https_base, profile_name, rfc3339, same_account, Mode, Panel, Profile, Profiles, Source, Upsert,
 };
 use crate::source::{self, Fetched};
 use crate::sys::{systemd, Sys};
@@ -72,7 +72,7 @@ pub enum Cmd {
     ImportV3 {
         #[arg(long)]
         base: Option<PathBuf>,
-        /// 面板地址（取 manifest 与内核；默认用 v3 记录的 server_address，也可用环境变量 BUI_C_PANEL）
+        /// 面板地址，须 https（取 manifest 与内核；默认用 v3 记录的 server_address，也可用环境变量 BUI_C_PANEL）
         #[arg(long)]
         panel: Option<String>,
         /// 覆盖升级后的模式（默认沿用 v3：bui-tun 曾 enable 则 tun，否则 socks）
@@ -254,12 +254,17 @@ fn new_version_pending(r: &update::Report) -> bool {
 /// `BUI_C_PANEL=<url>`：本次进程里把面板地址换成它（只在内存里，不落盘），给预发布期
 /// 「v3 推导的面板没有 `/packages`」这类情况一个显式出口。经 `Sys::env` 读（决策 11，
 /// 测试可注入）。只换 `base_url`，`username` 照旧——它是订阅路径，跟 manifest 来源无关。
+///
+/// 只认 https（[`https_base`]）：这里换掉的正是 root 自更新的来源，明文地址忽略并记一条警告。
 fn with_panel_override<S: Sys>(sys: &S, prof: &Profiles) -> Profiles {
-    let Some(url) = sys
-        .env("BUI_C_PANEL")
-        .map(|u| u.trim().trim_end_matches('/').to_string())
-        .filter(|u| !u.is_empty())
-    else {
+    let Some(raw) = sys.env("BUI_C_PANEL").filter(|u| !u.trim().is_empty()) else {
+        return prof.clone();
+    };
+    let Some(url) = https_base(&raw) else {
+        tracing::warn!(
+            panel = %crate::error::redact_url(raw.trim()),
+            "BUI_C_PANEL 不是 https 地址，已忽略"
+        );
         return prof.clone();
     };
     let mut out = prof.clone();
@@ -384,30 +389,41 @@ struct Incoming {
     panel: Option<Panel>,
 }
 
-/// 面板 `/api/nodes/<user>`：唯一带服务端分流规则的来源。
-fn fetch_panel<N: Net>(net: &N, base: &str, user: &str) -> Result<Incoming> {
-    Ok(Incoming {
-        fetched: source::from_panel(net, base, user)?,
-        src: Source::ApiNodes,
-        panel: Some(Panel {
-            base_url: base.trim_end_matches('/').to_string(),
+/// 面板 `/api/nodes/<user>`：唯一带服务端分流规则的来源，也是唯一会记下 panel 的来源。
+///
+/// panel 是 root 每日自更新的 manifest 与二进制首选来源（sha256 出自同一份 manifest，
+/// 没有签名），所以要两样都成立才记：`/api/nodes` 返回了合法载荷（证明是 v4 面板），
+/// 且地址是 https。`http://` 面板照样导节点，只是不当自更新来源。
+fn fetch_panel<S: Sys, N: Net, P: Prompt>(
+    ctx: &mut Ctx<'_, S, N, P>,
+    base: &str,
+    user: &str,
+) -> Result<Incoming> {
+    let fetched = source::from_panel(ctx.net, base, user)?;
+    let panel = match https_base(base) {
+        Some(base_url) => Some(Panel {
+            base_url,
             username: user.to_string(),
         }),
+        None => {
+            ctx.say("面板地址不是 https，不作为自动更新来源");
+            None
+        }
+    };
+    Ok(Incoming {
+        fetched,
+        src: Source::ApiNodes,
+        panel,
     })
 }
 
-/// 订阅地址（base64 URI 列表）。
+/// 订阅地址（base64 URI 列表）。不记 panel：订阅主机可能是任意第三方（机场、转换服务），
+/// 能返回节点列表证明不了它是 v4 面板，不能让它成为 root 自更新来源。
 fn fetch_sub<N: Net>(net: &N, url: &str) -> Result<Incoming> {
-    let fetched = source::from_subscription(net, url)?;
-    // 从订阅 URL 反推面板地址：不记的话每日自更新会跳过面板源，只打 GitHub
-    let panel = source::origin(url).map(|base_url| Panel {
-        base_url,
-        username: fetched.user.clone(),
-    });
     Ok(Incoming {
-        fetched,
+        fetched: source::from_subscription(net, url)?,
         src: Source::Subscription,
-        panel,
+        panel: None,
     })
 }
 
@@ -526,7 +542,7 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
             activate,
         } => {
             let inc = if let (Some(base), Some(u)) = (panel.as_ref(), user.as_ref()) {
-                fetch_panel(ctx.net, base, u)?
+                fetch_panel(ctx, base, u)?
             } else if let Some(url) = sub.as_ref() {
                 fetch_sub(ctx.net, url)?
             } else if let Some(raw) = uri.as_ref() {
@@ -1020,7 +1036,7 @@ fn menu_import<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<
 /// 后面 apply 失败时再按订阅导一遍，会把服务端分流规则换成默认表。
 fn import_http<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>, url: &str) -> Result<()> {
     let inc = match source::panel_link(url) {
-        Some(link) => match fetch_panel(ctx.net, &link.base_url, &link.user) {
+        Some(link) => match fetch_panel(ctx, &link.base_url, &link.user) {
             Ok(inc) => inc,
             Err(e) if link.path == source::PanelPath::Sub => {
                 ctx.say(format!("面板接口取不到（{e}），改用订阅地址导入"));
@@ -2059,8 +2075,12 @@ mod tests {
         assert!(n.log().is_empty());
     }
 
+    /// `Profiles.panel` 是 root 每日自更新的 manifest 与二进制首选来源，sha256 也出自同一份
+    /// manifest（没有签名）：谁被记成 panel，谁就能在这台机器上以 root 跑代码。订阅地址可以是
+    /// 任意第三方主机（机场、转换服务），光凭「能返回 base64 节点列表」证明不了它是 v4 面板，
+    /// 所以 `--sub` 只导节点、不记 panel。
     #[test]
-    fn import_sub_records_the_panel_for_later_updates() {
+    fn import_sub_does_not_record_the_panel_as_an_update_source() {
         let pp = paths();
         let s = FakeSys::new();
         ready(&s);
@@ -2079,15 +2099,135 @@ mod tests {
         .unwrap();
         let saved = Profiles::load(&s, &pp).unwrap();
         assert_eq!(saved.profiles.len(), 1);
-        // 面板地址从订阅 URL 反推：不记的话每日自更新只会去打 GitHub
-        assert_eq!(
-            saved.panel.as_ref().map(|x| x.base_url.as_str()),
-            Some("https://panel.example.com")
+        assert_eq!(saved.panel, None, "订阅主机不能成为 root 自更新来源");
+    }
+
+    /// 菜单 `[3]` 里 `/api/sub` 在面板接口取不到时退回订阅、以及其它 http(s) 订阅地址：
+    /// 同样只导节点，不记 panel（理由见上一条）。已有的 panel 也不被清掉。
+    #[test]
+    fn menu_subscription_imports_never_record_the_panel() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        profiles_socks().save(&s, &pp).unwrap(); // panel 为空
+        let n = FakeNet::new();
+        n.route(
+            "https://sub.example.com/api/nodes/alice",
+            FakeReply::Status(404),
         );
+        n.route("https://sub.example.com/api/sub/alice", b64(BOB_REALITY));
+        let mut p = Scripted::from(["3", "https://sub.example.com/api/sub/alice", "", "n", "0"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        let saved = Profiles::load(&s, &pp).unwrap();
+        assert_eq!(saved.profiles.len(), 2, "{t}");
+        assert_eq!(saved.panel, None, "/api/sub 回退不证明是 v4 面板：\n{t}");
+
+        let n = FakeNet::new();
+        n.route("https://other.example.com/link/abc", b64(BOB_REALITY));
+        let mut p = Scripted::from(["3", "https://other.example.com/link/abc", "", "n", "0"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
         assert_eq!(
-            saved.panel.as_ref().map(|x| x.username.as_str()),
-            Some("alice")
+            Profiles::load(&s, &pp).unwrap().panel,
+            None,
+            "{}",
+            ctx.transcript
         );
+    }
+
+    /// `http://` 面板照样能导节点（`/api/nodes` 证明是 v4 面板），但明文源不当自更新来源。
+    #[test]
+    fn import_from_an_http_panel_keeps_the_nodes_but_not_the_update_source() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        let n = FakeNet::new();
+        n.route(
+            "http://panel.example.com/api/nodes/alice",
+            nodes_payload("alice", vec![hy2_direct_node()]),
+        );
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(
+            &parse(&[
+                "import",
+                "--panel",
+                "http://panel.example.com",
+                "--user",
+                "alice",
+            ]),
+            &mut ctx,
+        )
+        .unwrap();
+        let t = ctx.transcript.clone();
+        let saved = Profiles::load(&s, &pp).unwrap();
+        assert_eq!(saved.profiles.len(), 1, "{t}");
+        assert_eq!(saved.panel, None, "{t}");
+        assert!(
+            t.lines()
+                .any(|l| l == "面板地址不是 https，不作为自动更新来源"),
+            "{t}"
+        );
+
+        // https 面板照旧记下
+        let n = FakeNet::new();
+        n.route(
+            "https://panel.example.com/api/nodes/alice",
+            nodes_payload("alice", vec![hy2_direct_node()]),
+        );
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(
+            &parse(&[
+                "import",
+                "--panel",
+                "https://panel.example.com",
+                "--user",
+                "alice",
+            ]),
+            &mut ctx,
+        )
+        .unwrap();
+        assert_eq!(
+            Profiles::load(&s, &pp).unwrap().panel.map(|x| x.base_url),
+            Some("https://panel.example.com".to_string())
+        );
+        assert!(!ctx.transcript.contains("不是 https"), "{}", ctx.transcript);
+    }
+
+    /// `BUI_C_PANEL=http://…` 不能把 root 自更新引到明文源上：忽略它，照旧用记下的 https 面板。
+    #[test]
+    fn bui_c_panel_env_is_ignored_unless_https() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        s.set_env("BUI_C_PANEL", "http://env.example.com");
+        let mut prof = profiles_socks();
+        prof.panel = Some(crate::profiles::Panel {
+            base_url: "https://panel.example.com".into(),
+            username: "alice".into(),
+        });
+        prof.save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        let manifest = FakeReply::Text(format!(
+            r#"{{"version":"{}","kernels":{{"client_sing_box":"1.14.5"}},"artifacts":{{}}}}"#,
+            crate::VERSION
+        ));
+        n.route(
+            "http://env.example.com/packages/manifest.json",
+            manifest.clone(),
+        );
+        n.route("https://panel.example.com/packages/manifest.json", manifest);
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["update", "--check-only"]), &mut ctx).unwrap();
+        assert!(
+            !n.log().iter().any(|l| l.contains("env.example.com")),
+            "{:?}",
+            n.log()
+        );
+        assert!(ctx.transcript.contains("来源 面板"), "{}", ctx.transcript);
     }
 
     #[test]

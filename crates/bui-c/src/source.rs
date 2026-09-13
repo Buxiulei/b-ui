@@ -150,9 +150,9 @@ pub fn panel_link(url: &str) -> Option<PanelLink> {
     })
 }
 
-/// 从订阅 URL 取 `scheme://host[:port]`，回填 `Panel::base_url`。
+/// 从 URL 取 `scheme://host[:port]`（[`panel_link`] 用它得出面板地址）。
 ///
-/// 不回填的话每日自更新会跳过面板源、只打 GitHub（T12 `Cmd::Import` 的 sub 分支用它）。
+/// 订阅地址不再据此回填 `Panel`：订阅主机可能是任意第三方，不能成为 root 自更新来源。
 pub fn origin(url: &str) -> Option<String> {
     let (scheme, rest) = url.split_once("://")?;
     let host = rest.split(['/', '?', '#']).next().unwrap_or("");
