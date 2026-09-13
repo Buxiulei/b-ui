@@ -60,6 +60,8 @@ impl Manifest {
 pub struct Report {
     pub manifest_source: String,
     pub manifest_version: String,
+    /// manifest 里的 bui-c 与已装的不是同一份构建（[`self_build_differs`]）；`check_only` 也会填
+    pub self_outdated: bool,
     /// `/usr/local/bin/bui-c` 被替换
     pub self_updated: bool,
     /// `bin/sing-box` 被替换
@@ -283,8 +285,31 @@ pub fn ensure_kernel<S: Sys, N: Net>(
     install_kernel(sys, net, paths, prof.panel.as_ref(), &m)
 }
 
-/// 版本比较是「字符串不等即升级」，不做 semver 排序：manifest 是唯一权威，
-/// 降级也由主理人改 manifest 完成（`bui upgrade --rollback` 是服务端能力，见 C5）。
+/// manifest 里的 bui-c 与盘上 `/usr/local/bin/bui-c` 是不是**两个不同的构建**（与服务端
+/// `kernels::bui_build_differs` 同一口径，2026-09-13 服务端裁决）。
+///
+/// 版本号不是充分判据：rc 通道下 `v4.0.0-rc1` / `rc2` / 正式版的 Cargo 版本号都是同一个
+/// `4.0.0`，只按版本号判断的话，已装的 rc6 / rc7 永远收不到同版本的新构建。所以版本相同时
+/// 再比一次 sha256：manifest 里 `bui-c-linux-<arch>` 的 vs 盘上二进制的（大小写不敏感）。
+///
+/// 盘上二进制读不到按「要升级」处理——本来就该给它装一份；manifest 缺本机架构的资产同样按
+/// 要升级返回，真正的报错留给下载那一步（[`sources`] 会说清缺哪个产物）。
+pub fn self_build_differs<S: Sys>(sys: &S, m: &Manifest) -> bool {
+    if m.version != crate::VERSION {
+        return true;
+    }
+    let Ok(want) = m.artifact(&format!("bui-c-linux-{}", arch_suffix())) else {
+        return true;
+    };
+    match sys.read(Path::new(SELF_BIN)) {
+        Ok(bytes) => !sha256_hex(&bytes).eq_ignore_ascii_case(&want.sha256),
+        Err(_) => true,
+    }
+}
+
+/// 自身按 [`self_build_differs`]（版本不同，或同版本不同构建）决定换不换；内核维持只按版本比对。
+/// 版本不做 semver 排序：manifest 是唯一权威，降级也由主理人改 manifest 完成
+/// （`bui upgrade --rollback` 是服务端能力，见 C5）。
 pub fn run<S: Sys, N: Net>(
     sys: &S,
     net: &N,
@@ -296,13 +321,14 @@ pub fn run<S: Sys, N: Net>(
     let mut r = Report {
         manifest_source: src,
         manifest_version: m.version.clone(),
+        self_outdated: self_build_differs(sys, &m),
         ..Report::default()
     };
     if check_only {
         return Ok(r);
     }
 
-    if m.version != crate::VERSION {
+    if r.self_outdated {
         let file = format!("bui-c-linux-{}", arch_suffix());
         let srcs = sources(prof.panel.as_ref(), &m, &file)?;
         let (_s, data) = fetch_verified(net, &srcs, &m.artifact(&file)?.sha256)?;
@@ -650,10 +676,11 @@ mod tests {
         prof.panel = Some(panel());
         let bin = b"ELF-new".to_vec();
         let sha = sha256_hex(&bin);
-        // 自身已是最新（manifest 版本 == crate 版本）→ 只升内核
+        // 自身已是最新（版本相同，盘上也正是 manifest 里那份构建）→ 只升内核
+        let self_sha = installed_self(&s, "bui-c-current");
         n.route(
             "https://panel.example.com/packages/manifest.json",
-            FakeReply::Text(manifest_json(crate::VERSION, &"a".repeat(64), &sha)),
+            FakeReply::Text(manifest_json(crate::VERSION, &self_sha, &sha)),
         );
         n.route(
             &format!(
@@ -692,13 +719,10 @@ mod tests {
         let mut prof = Profiles::new_default();
         prof.panel = Some(panel());
         let bin = b"ELF-new".to_vec();
+        let self_sha = installed_self(&s, "bui-c-current");
         n.route(
             "https://panel.example.com/packages/manifest.json",
-            FakeReply::Text(manifest_json(
-                crate::VERSION,
-                &"a".repeat(64),
-                &sha256_hex(&bin),
-            )),
+            FakeReply::Text(manifest_json(crate::VERSION, &self_sha, &sha256_hex(&bin))),
         );
         n.route(
             &format!(
@@ -731,13 +755,10 @@ mod tests {
         let n = FakeNet::new();
         let mut prof = profiles_socks();
         prof.panel = Some(panel());
+        let self_sha = installed_self(&s, "bui-c-current");
         n.route(
             "https://panel.example.com/packages/manifest.json",
-            FakeReply::Text(manifest_json(
-                crate::VERSION,
-                &"a".repeat(64),
-                &"b".repeat(64),
-            )),
+            FakeReply::Text(manifest_json(crate::VERSION, &self_sha, &"b".repeat(64))),
         );
         s.put("/opt/bui-c/bin/sing-box", "ELF");
         s.reply(
@@ -795,5 +816,117 @@ mod tests {
         assert_eq!(kernel_version(&s, &paths()).as_deref(), Some("1.14.5"));
         let s2 = FakeSys::new();
         assert_eq!(kernel_version(&s2, &paths()), None, "二进制不存在");
+    }
+
+    /// 把盘上的 `/usr/local/bin/bui-c` 摆成 `bytes`，返回它的 sha256——manifest 里写这个值，
+    /// 就表示「已装的正是 manifest 里那一份构建」。
+    fn installed_self(s: &FakeSys, bytes: &str) -> String {
+        s.put(SELF_BIN, bytes);
+        sha256_hex(bytes.as_bytes())
+    }
+
+    /// 回归（与服务端 `kernels::bui_build_differs` 同口径）：rc 通道下 `v4.0.0-rc1` / `rc2` /
+    /// 正式版的 Cargo 版本号都是 `4.0.0`，光比版本号 ⇒ 已装的 rc6 / rc7 永远收不到同版本的新构建。
+    /// 版本相同时再比 manifest 里 `bui-c-linux-<arch>` 的 sha256 与盘上 `/usr/local/bin/bui-c` 的。
+    #[test]
+    fn self_build_differs_falls_back_to_sha_when_the_version_is_unchanged() {
+        let s = FakeSys::new();
+        let rc2 = sha256_hex(b"BUI-C-rc2");
+        let m: Manifest =
+            serde_json::from_str(&manifest_json(crate::VERSION, &rc2, &"b".repeat(64))).unwrap();
+        installed_self(&s, "BUI-C-rc1");
+        assert!(
+            self_build_differs(&s, &manifest("9.9.9")),
+            "版本不同：一眼就要升"
+        );
+        assert!(
+            self_build_differs(&s, &m),
+            "同版本但盘上是另一份构建（rc1 vs rc2）：也要升"
+        );
+        installed_self(&s, "BUI-C-rc2");
+        assert!(!self_build_differs(&s, &m), "同版本同 sha 才是已最新");
+        let mut upper = m.clone();
+        for a in upper.artifacts.values_mut() {
+            a.sha256 = a.sha256.to_uppercase();
+        }
+        assert!(!self_build_differs(&s, &upper), "sha256 比较不分大小写");
+        assert!(
+            self_build_differs(&FakeSys::new(), &m),
+            "盘上读不到 /usr/local/bin/bui-c：按要升级处理"
+        );
+        let mut no_asset = m.clone();
+        no_asset.artifacts.retain(|k, _| !k.starts_with("bui-c-"));
+        assert!(
+            self_build_differs(&s, &no_asset),
+            "manifest 没有本机架构的 bui-c：按要升级算，报错留给下载那一步"
+        );
+    }
+
+    #[test]
+    fn a_same_version_rebuild_replaces_self_but_leaves_the_kernel_alone() {
+        let s = FakeSys::new();
+        let n = FakeNet::new();
+        let mut prof = profiles_socks();
+        prof.panel = Some(panel());
+        installed_self(&s, "bui-c-rc6");
+        let rc7 = b"bui-c-rc7".to_vec();
+        n.route(
+            "https://panel.example.com/packages/manifest.json",
+            FakeReply::Text(manifest_json(
+                crate::VERSION,
+                &sha256_hex(&rc7),
+                &"b".repeat(64),
+            )),
+        );
+        n.route(
+            &format!(
+                "https://panel.example.com/packages/bui-c-linux-{}",
+                arch_suffix()
+            ),
+            FakeReply::Bytes(rc7),
+        );
+        s.put("/opt/bui-c/bin/sing-box", "ELF");
+        s.reply(
+            "/opt/bui-c/bin/sing-box version",
+            0,
+            "sing-box version 1.14.5\n",
+        );
+        s.put("/etc/systemd/system/bui-c.service", "[Unit]");
+
+        let r = run(&s, &n, &paths(), &prof, false).unwrap();
+        assert!(
+            r.self_outdated && r.self_updated,
+            "同版本新构建也要换：{r:?}"
+        );
+        assert!(!r.kernel_updated, "内核维持按版本比对：版本没变就不动");
+        assert_eq!(s.get(SELF_BIN).unwrap(), "bui-c-rc7");
+
+        // 换完再跑一次：同版本同 sha ⇒ 什么都不做
+        let r = run(&s, &n, &paths(), &prof, false).unwrap();
+        assert_eq!(
+            (r.self_outdated, r.self_updated, r.kernel_updated),
+            (false, false, false)
+        );
+    }
+
+    #[test]
+    fn check_only_flags_a_same_version_rebuild_without_touching_disk() {
+        let s = FakeSys::new();
+        let n = FakeNet::new();
+        let mut prof = profiles_socks();
+        prof.panel = Some(panel());
+        installed_self(&s, "bui-c-rc6");
+        n.route(
+            "https://panel.example.com/packages/manifest.json",
+            FakeReply::Text(manifest_json(
+                crate::VERSION,
+                &sha256_hex(b"bui-c-rc7"),
+                &"b".repeat(64),
+            )),
+        );
+        let r = run(&s, &n, &paths(), &prof, true).unwrap();
+        assert!(r.self_outdated && !r.self_updated, "{r:?}");
+        assert_eq!(s.get(SELF_BIN).unwrap(), "bui-c-rc6", "只检查不换");
+        assert!(s.calls().is_empty(), "check_only 不该跑任何命令");
     }
 }
