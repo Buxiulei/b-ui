@@ -127,7 +127,7 @@ Cargo workspace：
 - **监听面**：`127.0.0.1:18789` 是**独立**的监听（`bui_schema::render::hysteria::AUTH_HTTP_PORT`），不挂在面板端口上 —— 面板经 Caddy 对外，挂上去等于把鉴权面暴露到公网。只有 `POST /auth` 一条路由，服务端自设 1 秒超时。
 - **判定与数据源**：与钩子同一份 `auth_hook::decide`（按第一个 `:` 拆 `user:pass`、常量时间比对密码、`blocked`、`expires_at`；调研 H1–H7）。数据源是守护进程内存里的鉴权快照，与 `auth-snapshot.json` **同源**（都是 `Snapshot::from_state(state, blocked)`），在 `StateChanged` 时刷新、另有 60 秒安全网，请求路径上**不读盘**。
 - **fail-closed**：请求解析不了、快照还没刷过、判定超时、任何内部错误 ⇒ `{"ok": false}`；守护进程没在听 ⇒ 内核侧全员拒绝。日志仍由 `auth-hook.log`（0600，按大小原地截断）承担，格式不变：`<RFC3339> <addr> <用户名> <结果>`，**不记密码**，两条鉴权路径写出来的逐字相同。
-- **哨兵**：watchdog 每轮读两个 hysteria 单元的 journal，同一轮里「鉴权请求 connection refused / 超时」≥ 3 条就检查守护进程是否还在听 18789 并记一条事件到 `runtime.extra.hy2_auth_http`（同单元 10 分钟冷却）。**只报不改**：`b-ui.service` 由 systemd `Restart=always` 拉起，watchdog 再去重启它只会打断正在收敛的那一轮对账。
+- **哨兵**：由日志哨兵（§5.7，`modules::sentinel`）承担：hysteria 的「鉴权请求 connection refused / 超时」60 秒内 ≥ 3 条就记一条事件（`runtime.incidents`，签名 `hy2_auth_http_failed`）并告警，附带守护进程是否还在听 18789（同动作 10 分钟冷却；`hy2_auth = command` 时忽略）。早先 watchdog 每 60 秒翻 journal、记到 `runtime.extra.hy2_auth_http` 的那一版已迁到哨兵。**只报不改**：`b-ui.service` 由 systemd `Restart=always` 拉起，watchdog 再去重启它只会打断正在收敛的那一轮对账。
 
 **退路开关**：`bui set hy2-auth command` 切回 `auth: { type: command, command: /opt/b-ui/bin/bui-auth-hook }`（`bui set hy2-auth http` 切回来）。内核对每条新连接 `exec.Command(a.Cmd, addr, auth, tx)`，不过 shell、不拆空格，所以 `auth.command` 只能是一个不带参数的可执行路径（`bin/bui-auth-hook` 是 `bin/bui` 的符号链接，按 argv[0] 分发；调研 H15）。钩子读 `/opt/b-ui/auth-snapshot.json`（600），自设 ≤ 2 秒硬超时，走极简路径（不初始化 tokio/tracing、不加载 state）；内核对钩子不设超时也不限流（H8/H9），stderr 不进 journal（H5）。
 
@@ -297,18 +297,27 @@ tonic 客户端，proto 从 Xray-core `v26.3.27` vendor 进仓（以仓库根为
 
 ### 5.7 日志哨兵与预案（2026-09-13 主理人要求：监听后台日志，出错立即处置）
 
-**哨兵**：守护进程内一个任务 `journal follow` 四个单元（b-ui-relay / hysteria-server / hysteria-residential-* / xray，caddy 只看证书类错误），按签名表匹配并触发动作；每类签名带去抖窗口（同签名 60s 内只触发一次）与冷却（同动作 10 分钟内不重复）。所有触发都写 `runtime.incidents[]`（时间、单元、签名、动作、结果），面板「事件」卡与 `bui status` 显示最近 20 条，`bui incidents` 可查全量。
+落地计划：`docs/superpowers/plans/2026-09-13-v4-log-sentinel.md`（设计裁决 D1–D16，本节按它修订）。
 
-| 签名（示例） | 动作 |
-|---|---|
-| relay：到某上游 `connection refused / timeout / socks5 auth failed / 407` 连续 ≥3 条（60s 内） | 立刻对该上游做一次带外巡检（不等 2 分钟周期）；失败即按 §5.6 让该槽借用健康 IP，并在面板与 `bui status` 亮告警「IP X 不可达，槽 i 已临时切到 Y」 |
-| relay：某上游对目标 `403 serp domain` / sorry 页 | 标记该上游 google_ok=false，触发该槽借用 |
-| hysteria：`auth command failed / timeout` | 对钩子做一次自检（回环鉴权），失败则重启 b-ui 并告警 |
-| hysteria/xray：`bind: address already in use` / 单元崩溃循环 | 交给现有看门狗（退避重启），哨兵只记事件 |
-| xray：gRPC `Unavailable` 连续 | 用户同步安全网立即重试一轮 |
-| caddy：`obtaining certificate ... failed` | 告警（不自动动作） |
+**采集**：守护进程内一个任务（`modules::sentinel`），每 5 秒用 `journalctl -o json --after-cursor <c>` 增量读受管单元全集（`reconcile::managed_units`：`b-ui-relay`、`hysteria-server`、每个住宅槽的 `hysteria-residential[-i]`、`xray`、`caddy`，外加 `b-ui` 自己——xray gRPC 的失败只出现在守护进程自己的日志里）。首次启动或游标失效时用 `--since @<现在>`，**不回放历史**。游标以内存为准，落 `runtime.extra["sentinel"]`（有事件立即落，只是游标前进至少隔 60 秒落一次；重启后续读，早于签名窗口的积压不计数）。读取经 `Host::journal_read`（测试用 `FakeHost` 的队列）；`MESSAGE` 含 ANSI 色码时 journald 编成字节数组，按字节解码后剥色码；tracing-journald 的 `error` 字段在 `F_ERROR`。
 
-**预案边界**：哨兵只做「探测 → 切换/重试/告警」，不改 state 里的池成员；替换 IP 仍由管理员在面板/CLI 执行，替换后 §5.6 的重分配自动完成。告警渠道：面板 + `bui status`；外部通知（Telegram/Webhook）作为可选项留接口，本期不做。
+**去抖与冷却**：同签名同对象在各自窗口内达门槛才触发，触发后 60 秒内不再触发；同「动作 + 对象」10 分钟内不重复执行（冷却表持久化，重启不失忆），冷却中的触发不记事件。
+
+| 签名 id | 判据 | 门槛 | 动作 |
+|---|---|---|---|
+| `relay_upstream_error` | relay `open connection to … using outbound/(http 或 socks)[resi-N]: <原因>`，原因是 connection refused / i/o timeout / deadline exceeded / no route / network unreachable / 407 / SOCKS5 认证被拒。目标级的其它 4xx/5xx 与 SOCKS5 REP 拒绝归 §5.4 黑名单，哨兵不计 | 同一上游 60 秒 ≥3 条 | 带外快探（先 TCP 连上游网关、5 秒超时，连不上即判不可达；连得上再走巡检同口径的可达性探测，含 407 补判）；失败 ⇒ 立即判不健康 + 按 §5.6 让**当前出口就是它**的槽立即借用最佳健康 IP（手动 pin 的槽不动）+ 上游级告警「IP X 不可达，槽 i 已临时切到 Y」 |
+| `relay_google_blocked` | 同上形态，`403` 且含 `serp` 或目标是 Google 搜索域名 | 1 条 | 带外 Google 搜索复核：可用 ⇒ 不动作；被封（403 / 429 / sorry 页）或没结论 ⇒ `google_ok=false` + 借用 + 告警 |
+| `hy2_auth_http_failed` | hysteria 连不上 `127.0.0.1:18789/auth`（仅 `hy2_auth=http`） | 60 秒 ≥3 条 | 事件 + 告警（带「守护进程是否在听」）。**不重启 b-ui**（由 systemd 拉起；原表「失败则重启 b-ui」改判）；原 watchdog 每 60 秒翻日志的同名检测迁到这里 |
+| `kernel_bind_in_use` / `kernel_crash_loop` | hysteria / xray `bind: address already in use`；systemd `Start request repeated too quickly` / `restart counter is at N`（N ≥ 5） | 1 条 | 交给现有看门狗与 systemd，只记事件 |
+| `xray_grpc_unavailable` | `b-ui` 自己的「用户同步有失败项」行且错误含 Unavailable | 150 秒 ≥2 条 | xray API 端口在听 ⇒ 立即重跑一轮用户同步安全网；不在听 ⇒ 只记事件 |
+| `caddy_cert_failed` | caddy `"level":"error"` 且含 obtaining certificate / could not get certificate | 1 条 | 告警（不自动动作） |
+| `upstream_long_unreachable` | （巡查，非日志）住宅上游被判不健康连续 30 分钟 | — | 一次性告警建议替换（恢复即清） |
+
+**切回**：哨兵不做切回。带外确认不可达的 IP 立即判不健康，恢复要巡检连续 2 轮探通（§5.3 迟滞）才重新算健康，再攒满 §5.6 按槽切回的 3 轮，所以**恢复后第 4 轮巡检（约 8 分钟）切回**。
+
+**事件**：`runtime.incidents`（`runtime.extra["incidents"]`）环形保留最近 200 条，新的在前，字段 `at / unit / signature / subject / action / result / level / sample`（`sample` 是先脱敏后截断的原文；上游只以 `host:port` 或体检学到的出口 IP 指称，绝不带凭据）。`bui status` 末尾显示最近 5 条（`--json` 不变），`bui incidents [--json] [-n N]` 查询（守护进程未运行时读 `runtime.json`），面板 `GET /api/incidents?limit=N`（管理员鉴权，缺省 50）+「事件」卡（20 条）。
+
+**预案边界**：哨兵只做「探测 → 借用 / 重试 / 告警」，不改 state 里的池成员；只挪每槽的 `slot-<i>-pool`，不动全局 `resi-pool`（`dns_resi` 的 detour 用它；故障 IP 恰好是全局选择时由下一轮巡检切走）；按槽借用与巡检的 `drive_slots` 互斥；替换 IP 仍由管理员在面板/CLI 执行，替换后 §5.6 的重分配自动完成。告警渠道：面板 + `bui status` + `bui incidents`；外部通知（Telegram/Webhook）只留 `Notifier` 接口，本期不做。**验收**：`scripts/ops/sentinel-drill.sh` 在生产机用 iptables 只丢弃发往某一上游 IP:端口 的 TCP（trap 兜底恢复），判据：首条 relay 连接错误后 ≤15 秒记事件（事件在借用做完后才盖时间戳）、该槽借用、该槽回环出网 IP 改变（探测 URL 必须走本槽 selector：split 模式下须命中分流关键字，脚本开跑前自查）、恢复后 ≤660 秒切回。
 
 ## 6. Linux 客户端 `bui-c`（§⑤）
 
