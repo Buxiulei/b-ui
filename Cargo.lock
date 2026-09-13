@@ -263,6 +263,7 @@ dependencies = [
  "clap",
  "hex",
  "nix",
+ "percent-encoding",
  "pretty_assertions",
  "reqwest",
  "serde",

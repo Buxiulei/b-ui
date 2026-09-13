@@ -306,6 +306,70 @@ fn store_fetched<S: Sys, N: Net, P: Prompt>(
     out
 }
 
+/// 取到手、还没落盘的一批节点：来源与要记下的面板。
+struct Incoming {
+    fetched: Fetched,
+    src: Source,
+    panel: Option<Panel>,
+}
+
+/// 面板 `/api/nodes/<user>`：唯一带服务端分流规则的来源。
+fn fetch_panel<N: Net>(net: &N, base: &str, user: &str) -> Result<Incoming> {
+    Ok(Incoming {
+        fetched: source::from_panel(net, base, user)?,
+        src: Source::ApiNodes,
+        panel: Some(Panel {
+            base_url: base.trim_end_matches('/').to_string(),
+            username: user.to_string(),
+        }),
+    })
+}
+
+/// 订阅地址（base64 URI 列表）。
+fn fetch_sub<N: Net>(net: &N, url: &str) -> Result<Incoming> {
+    let fetched = source::from_subscription(net, url)?;
+    // 从订阅 URL 反推面板地址：不记的话每日自更新会跳过面板源，只打 GitHub
+    let panel = source::origin(url).map(|base_url| Panel {
+        base_url,
+        username: fetched.user.clone(),
+    });
+    Ok(Incoming {
+        fetched,
+        src: Source::Subscription,
+        panel,
+    })
+}
+
+/// 落盘一批节点；首次导入或 `activate` 时激活第一个并 apply。
+fn save_import<S: Sys, N: Net, P: Prompt>(
+    ctx: &mut Ctx<'_, S, N, P>,
+    inc: Incoming,
+    activate: bool,
+) -> Result<()> {
+    let mut prof = Profiles::load(ctx.sys, ctx.paths)?;
+    let had_active = prof.active_profile().is_some();
+    let stored = store_fetched(ctx, &mut prof, &inc.fetched, inc.src, inc.panel);
+    if activate || !had_active {
+        if let Some(name) = stored.names.first() {
+            prof.active = Some(name.clone());
+        }
+    }
+    prof.save(ctx.sys, ctx.paths)?;
+    ctx.say(format!(
+        "导入 {} 个新节点，共 {} 个",
+        stored.added,
+        prof.profiles.len()
+    ));
+    if activate || !had_active {
+        apply_with_ufw(ctx, &prof)?;
+        ctx.say(format!(
+            "当前节点：{}",
+            prof.active.clone().unwrap_or_default()
+        ));
+    }
+    Ok(())
+}
+
 pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>) -> Result<()> {
     match cli.cmd.as_ref().unwrap_or(&Cmd::Menu) {
         Cmd::Menu => menu_loop(ctx),
@@ -388,28 +452,10 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
             sub,
             activate,
         } => {
-            let mut prof = Profiles::load(ctx.sys, ctx.paths)?;
-            let had_active = prof.active_profile().is_some();
-            let (fetched, src, panel_rec) = if let (Some(base), Some(u)) =
-                (panel.as_ref(), user.as_ref())
-            {
-                let f = source::from_panel(ctx.net, base, u)?;
-                (
-                    f,
-                    Source::ApiNodes,
-                    Some(Panel {
-                        base_url: base.trim_end_matches('/').to_string(),
-                        username: u.clone(),
-                    }),
-                )
+            let inc = if let (Some(base), Some(u)) = (panel.as_ref(), user.as_ref()) {
+                fetch_panel(ctx.net, base, u)?
             } else if let Some(url) = sub.as_ref() {
-                let f = source::from_subscription(ctx.net, url)?;
-                // 从订阅 URL 反推面板地址：不记的话每日自更新会跳过面板源，只打 GitHub
-                let rec = source::origin(url).map(|base_url| Panel {
-                    base_url,
-                    username: f.user.clone(),
-                });
-                (f, Source::Subscription, rec)
+                fetch_sub(ctx.net, url)?
             } else if let Some(raw) = uri.as_ref() {
                 if raw != "-" {
                     ctx.say("提示：位置参数会把 HY2 密码留在 shell 历史与 ps 里，下次用 `bui-c import -` 从标准输入粘贴");
@@ -419,32 +465,17 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
                 } else {
                     vec![raw.clone()]
                 };
-                (source::from_uris(&lines)?, Source::Paste, None)
+                Incoming {
+                    fetched: source::from_uris(&lines)?,
+                    src: Source::Paste,
+                    panel: None,
+                }
             } else {
                 return Err(Error::msg(
                     "给一个节点链接，或用 --panel <地址> --user <用户名>，或 --sub <订阅地址>",
                 ));
             };
-            let stored = store_fetched(ctx, &mut prof, &fetched, src, panel_rec);
-            if *activate || !had_active {
-                if let Some(name) = stored.names.first() {
-                    prof.active = Some(name.clone());
-                }
-            }
-            prof.save(ctx.sys, ctx.paths)?;
-            ctx.say(format!(
-                "导入 {} 个新节点，共 {} 个",
-                stored.added,
-                prof.profiles.len()
-            ));
-            if *activate || !had_active {
-                apply_with_ufw(ctx, &prof)?;
-                ctx.say(format!(
-                    "当前节点：{}",
-                    prof.active.clone().unwrap_or_default()
-                ));
-            }
-            Ok(())
+            save_import(ctx, inc, *activate)
         }
         Cmd::Check => {
             let v = check::run(ctx.sys, ctx.net, ctx.paths)?;
@@ -720,13 +751,10 @@ fn menu_body<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()
                     None
                 }
             }
-            Action::ImportNode => Some(Cmd::Import {
-                uri: Some("-".into()),
-                panel: None,
-                user: None,
-                sub: None,
-                activate: false,
-            }),
+            Action::ImportNode => {
+                menu_import(ctx)?;
+                None
+            }
             Action::Service => {
                 // 单元还没建就别进子菜单——systemd 只会回 `Unit bui-c.service not found`，
                 // 用户看不出该干什么（缺陷 5）。
@@ -769,6 +797,94 @@ fn menu_body<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()
         }
         ctx.flush();
     }
+}
+
+/// 菜单 `[3]` 的粘贴提示（`lines_until_blank` 自己补「每行一个，空行结束」）。
+const PASTE_PROMPT: &str = "粘贴 hysteria2:// 或 vless:// 节点链接，或面板给的订阅地址";
+
+/// 菜单 `[3] 导入节点`：节点链接与面板 / 订阅地址都从这一个口子进。
+///
+/// 导入失败只打「失败：…」留在菜单里。导入了新节点、而活动节点不在其中时追问一次要不要
+/// 切过去——命令行 `bui-c import` 不问，保持非交互。
+fn menu_import<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()> {
+    let lines: Vec<String> = ctx
+        .prompt
+        .lines_until_blank(PASTE_PROMPT)?
+        .into_iter()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines.is_empty() {
+        ctx.say("已取消，没有导入任何节点");
+        return Ok(());
+    }
+    let before: Vec<String> = Profiles::load(ctx.sys, ctx.paths)?
+        .profiles
+        .into_iter()
+        .map(|p| p.name)
+        .collect();
+    let imported = match lines.as_slice() {
+        [url] if source::is_http_url(url) => import_http(ctx, url),
+        _ => source::from_uris(&lines).and_then(|fetched| {
+            let inc = Incoming {
+                fetched,
+                src: Source::Paste,
+                panel: None,
+            };
+            save_import(ctx, inc, false)
+        }),
+    };
+    if let Err(e) = imported {
+        ctx.say(format!("失败：{e}"));
+        return Ok(());
+    }
+    let after = Profiles::load(ctx.sys, ctx.paths)?;
+    let fresh: Vec<&str> = after
+        .profiles
+        .iter()
+        .map(|p| p.name.as_str())
+        .filter(|n| !before.iter().any(|b| b == n))
+        .collect();
+    let Some(first) = fresh.first() else {
+        return Ok(());
+    };
+    if after.active.as_deref().is_some_and(|a| fresh.contains(&a)) {
+        return Ok(()); // 首次导入已经激活了新节点
+    }
+    ctx.flush();
+    if ctx.prompt.confirm(&format!("切换到新导入的 {first}？"))? {
+        let sub = Cli {
+            json: false,
+            yes: ctx.yes,
+            cmd: Some(Cmd::Switch {
+                name: first.to_string(),
+            }),
+        };
+        if let Err(e) = dispatch(&sub, ctx) {
+            ctx.say(format!("失败：{e}"));
+        }
+    }
+    Ok(())
+}
+
+/// 单独一行的 http(s) 地址：面板的四种按用户地址走 `/api/nodes`（带分流规则），
+/// 其余当订阅地址。`/api/sub/` 在面板接口取不到时退回订阅——v3 面板（bwg-tizi）
+/// 没有 `/api/nodes`，但 `/api/sub` 在。只在「取」失败时退回：面板节点取到了、
+/// 后面 apply 失败时再按订阅导一遍，会把服务端分流规则换成默认表。
+fn import_http<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>, url: &str) -> Result<()> {
+    let inc = match source::panel_link(url) {
+        Some(link) => match fetch_panel(ctx.net, &link.base_url, &link.user) {
+            Ok(inc) => inc,
+            Err(e) if link.path == source::PanelPath::Sub => {
+                ctx.say(format!("面板接口取不到（{e}），改用订阅地址导入"));
+                ctx.flush();
+                fetch_sub(ctx.net, url)?
+            }
+            Err(e) => return Err(e),
+        },
+        None => fetch_sub(ctx.net, url)?,
+    };
+    save_import(ctx, inc, false)
 }
 
 /// `[4] 服务控制` 的二级菜单：重启 / 看日志 / 返回（v3 的服务子菜单大半是死代码，
@@ -1778,6 +1894,294 @@ mod tests {
             Some("https://panel.example.com"),
             "只在内存里覆盖，不改 profiles.json"
         );
+    }
+
+    const BOB_REALITY: &str = "vless://11111111-1111-4111-8111-111111111111@panel.example.com:10001?encryption=none&security=reality&sni=www.bing.com&fp=chrome&pbk=PUB&sid=0123456789abcdef&flow=xtls-rprx-vision&type=tcp#bob-Reality%E7%9B%B4%E8%BF%9E";
+
+    fn nodes_payload(user: &str, nodes: Vec<bui_schema::nodes::Node>) -> FakeReply {
+        FakeReply::Text(
+            serde_json::to_string(&crate::source::NodesPayload {
+                user: user.into(),
+                split: split_keywords(),
+                nodes,
+            })
+            .unwrap(),
+        )
+    }
+
+    fn b64(text: &str) -> FakeReply {
+        FakeReply::Text(base64::engine::general_purpose::STANDARD.encode(text))
+    }
+
+    fn names(s: &FakeSys, pp: &Paths) -> Vec<String> {
+        Profiles::load(s, pp)
+            .unwrap()
+            .profiles
+            .iter()
+            .map(|p| p.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn menu_import_with_nothing_pasted_is_a_cancel_not_a_failure() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        profiles_socks().save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        // 3 = 导入节点 → 直接空行 → 0 退出
+        let mut p = Scripted::from(["3", "", "0"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert!(t.lines().any(|l| l == "  已取消，没有导入任何节点"), "{t}");
+        assert!(!t.contains("失败"), "什么都没粘贴不是失败：{t}");
+        assert!(
+            p.asked.contains(
+                &"粘贴 hysteria2:// 或 vless:// 节点链接，或面板给的订阅地址".to_string()
+            ),
+            "提示要说清楚两种都能贴：{:?}",
+            p.asked
+        );
+    }
+
+    #[test]
+    fn menu_import_panel_url_goes_through_api_nodes_and_offers_the_switch() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        profiles_socks().save(&s, &pp).unwrap(); // 已有活动节点 alice-hy2-direct
+        let n = FakeNet::new();
+        n.route(
+            "https://panel.example.com:8443/api/nodes/alice",
+            nodes_payload("alice", vec![reality_direct_node(), hy2_direct_node()]),
+        );
+        // 带尾斜杠与 query 的 /api/subscription 地址也认成面板 → y 切到新节点 → 0 退出
+        let mut p = Scripted::from([
+            "3",
+            "https://panel.example.com:8443/api/subscription/alice/?format=json",
+            "",
+            "y",
+            "0",
+        ]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert!(
+            n.log().contains(
+                &"GET https://panel.example.com:8443/api/nodes/alice via Direct".to_string()
+            ),
+            "{:?}\n{t}",
+            n.log()
+        );
+        assert!(
+            !n.log().iter().any(|l| l.contains("/api/subscription/")),
+            "面板导入不去取 sing-box 配置：{:?}",
+            n.log()
+        );
+        let saved = Profiles::load(&s, &pp).unwrap();
+        assert_eq!(
+            saved
+                .panel
+                .as_ref()
+                .map(|x| (x.base_url.as_str(), x.username.as_str())),
+            Some(("https://panel.example.com:8443", "alice"))
+        );
+        assert_eq!(saved.profiles[0].source, crate::profiles::Source::ApiNodes);
+        assert_eq!(
+            saved.active.as_deref(),
+            Some("alice-reality-direct"),
+            "答 y 切到第一个新节点：\n{t}"
+        );
+        assert!(s.called("systemctl restart bui-c.service"), "切换要生效");
+        assert!(!t.contains("失败"), "{t}");
+        assert!(
+            p.asked
+                .contains(&"切换到新导入的 alice-reality-direct？".to_string()),
+            "{:?}",
+            p.asked
+        );
+    }
+
+    #[test]
+    fn menu_import_percent_decodes_the_username_and_n_keeps_the_active_node() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        profiles_socks().save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        n.route(
+            "https://panel.example.com/api/nodes/%E5%BC%A0%E4%B8%89",
+            nodes_payload("张三", vec![reality_direct_node()]),
+        );
+        let mut p = Scripted::from([
+            "3",
+            "https://panel.example.com/api/clash/%E5%BC%A0%E4%B8%89",
+            "",
+            "n",
+            "0",
+        ]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        let saved = Profiles::load(&s, &pp).unwrap();
+        assert_eq!(
+            saved.panel.as_ref().map(|x| x.username.as_str()),
+            Some("张三"),
+            "落盘的是解码后的用户名：\n{t}"
+        );
+        assert_eq!(saved.profiles.len(), 2, "{t}");
+        assert_eq!(
+            saved.active.as_deref(),
+            Some("alice-hy2-direct"),
+            "答 n 不切"
+        );
+        assert!(!s.called("systemctl restart bui-c.service"));
+    }
+
+    #[test]
+    fn menu_import_api_sub_url_falls_back_to_the_subscription_when_the_panel_has_no_api_nodes() {
+        // bwg-tizi 还是 v3 面板：没有 /api/nodes，但 /api/sub 在
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        profiles_socks().save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        n.route(
+            "https://panel.example.com/api/nodes/alice",
+            FakeReply::Status(404),
+        );
+        n.route("https://panel.example.com/api/sub/alice", b64(BOB_REALITY));
+        let mut p = Scripted::from(["3", "https://panel.example.com/api/sub/alice", "", "n", "0"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        let line = t
+            .lines()
+            .find(|l| l.contains("面板接口取不到"))
+            .unwrap_or_else(|| panic!("要说明为什么改走订阅：\n{t}"));
+        assert!(line.starts_with("  面板接口取不到（"), "{line}");
+        assert!(line.ends_with("），改用订阅地址导入"), "{line}");
+        assert!(line.contains("HTTP 404"), "带上原因：{line}");
+        assert!(!line.contains("alice"), "原因里不带用户名：{line}");
+        let saved = Profiles::load(&s, &pp).unwrap();
+        assert_eq!(saved.profiles.len(), 2, "{t}");
+        assert_eq!(
+            saved.profiles[1].source,
+            crate::profiles::Source::Subscription
+        );
+        assert!(
+            !t.lines().any(|l| l.starts_with("  失败：")),
+            "退回订阅成功就不算失败（原因里的「请求…失败」除外）：{t}"
+        );
+    }
+
+    #[test]
+    fn menu_import_only_api_sub_falls_back() {
+        // /api/clash 返回 YAML，没法当订阅解析：面板取不到就直接报失败
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        profiles_socks().save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        let mut p = Scripted::from(["3", "https://panel.example.com/api/clash/alice", "", "0"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert!(t.lines().any(|l| l.starts_with("  失败：")), "{t}");
+        assert!(!t.contains("改用订阅地址导入"), "{t}");
+        assert_eq!(n.log().len(), 1, "只试了面板接口：{:?}", n.log());
+    }
+
+    #[test]
+    fn menu_import_other_http_url_is_imported_as_a_subscription() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        profiles_socks().save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        n.route("https://sub.example.com/link/abc?token=1", b64(BOB_REALITY));
+        let mut p = Scripted::from([
+            "3",
+            "https://sub.example.com/link/abc?token=1",
+            "",
+            "n",
+            "0",
+        ]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert_eq!(
+            n.log(),
+            vec!["GET https://sub.example.com/link/abc?token=1 via Direct".to_string()],
+            "{t}"
+        );
+        assert_eq!(names(&s, &pp).len(), 2, "{t}");
+    }
+
+    #[test]
+    fn menu_import_pasted_uris_offer_to_switch_to_the_first_new_node() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        profiles_socks().save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        let mut p = Scripted::from(["3", BOB_REALITY, "", "y", "0"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        let saved = Profiles::load(&s, &pp).unwrap();
+        assert_eq!(saved.profiles.len(), 2, "{t}");
+        assert_eq!(
+            saved.active.as_deref(),
+            Some(saved.profiles[1].name.as_str()),
+            "{t}"
+        );
+        assert!(n.log().is_empty(), "粘贴的节点链接不联网");
+    }
+
+    #[test]
+    fn menu_import_first_nodes_are_activated_without_asking() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s); // 没有 profiles.json，也没有 v3 目录
+        let n = FakeNet::new();
+        // 没有追问：粘贴 → 空行 → 0 直接退出；要是追问了，0 会被当成「否」吞掉，
+        // 队列耗尽后菜单照样退出，所以另外断言 0 是被主菜单读走的（屏数）
+        let mut p = Scripted::from(["3", BOB_REALITY, "", "0"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        let saved = Profiles::load(&s, &pp).unwrap();
+        assert_eq!(saved.profiles.len(), 1, "{t}");
+        assert_eq!(
+            saved.active.as_deref(),
+            Some(saved.profiles[0].name.as_str()),
+            "首次导入自动激活：\n{t}"
+        );
+        assert!(!t.contains("失败"), "{t}");
+        assert!(
+            !p.asked.iter().any(|q| q.starts_with("切换到新导入的")),
+            "新节点已经是活动节点，不必追问：{:?}",
+            p.asked
+        );
+    }
+
+    #[test]
+    fn cli_import_never_asks_to_switch() {
+        // 命令行 `bui-c import` 保持非交互：脚本里跑它不能卡在一个 [y/N] 上
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        profiles_socks().save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        let mut p = Scripted::from([BOB_REALITY, ""]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["import", "-"]), &mut ctx).unwrap();
+        let saved = Profiles::load(&s, &pp).unwrap();
+        assert_eq!(saved.profiles.len(), 2);
+        assert_eq!(saved.active.as_deref(), Some("alice-hy2-direct"));
+        assert_eq!(p.asked, vec!["粘贴节点链接".to_string()], "只有粘贴那一问");
     }
 
     /// 单元文件已经在（引擎装好了）的机器。

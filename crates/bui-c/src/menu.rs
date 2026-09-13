@@ -90,22 +90,28 @@ impl Prompt for Stdin {
 /// `line` 为空串 / 否 / 空列表）。
 pub struct Scripted {
     pub queue: VecDeque<String>,
+    /// 按顺序记下被问过的每条提示（`read` / `line` / `confirm` / `lines_until_blank`），
+    /// 测试靠它断言提示文案、以及「某一问根本没出现」。
+    pub asked: Vec<String>,
 }
 
 impl<'a, const N: usize> From<[&'a str; N]> for Scripted {
     fn from(v: [&'a str; N]) -> Self {
         Self {
             queue: v.iter().map(|s| s.to_string()).collect(),
+            asked: Vec::new(),
         }
     }
 }
 
 impl Prompt for Scripted {
-    fn read(&mut self, _prompt: &str) -> Result<Option<String>> {
+    fn read(&mut self, prompt: &str) -> Result<Option<String>> {
+        self.asked.push(prompt.to_string());
         Ok(self.queue.pop_front())
     }
 
-    fn lines_until_blank(&mut self, _prompt: &str) -> Result<Vec<String>> {
+    fn lines_until_blank(&mut self, prompt: &str) -> Result<Vec<String>> {
+        self.asked.push(prompt.to_string());
         let mut out = Vec::new();
         while let Some(l) = self.queue.pop_front() {
             if l.is_empty() {
@@ -116,9 +122,9 @@ impl Prompt for Scripted {
         Ok(out)
     }
 
-    fn confirm(&mut self, _prompt: &str) -> Result<bool> {
+    fn confirm(&mut self, prompt: &str) -> Result<bool> {
         Ok(matches!(
-            self.line("")?.to_ascii_lowercase().as_str(),
+            self.line(prompt)?.to_ascii_lowercase().as_str(),
             "y" | "yes"
         ))
     }
@@ -907,6 +913,15 @@ mod tests {
         );
         // 队列空了 → 当成 EOF：返回空串，调用方按「取消」处理
         assert_eq!(p.line("选择").unwrap(), "");
+    }
+
+    #[test]
+    fn scripted_records_every_prompt_it_was_asked() {
+        let mut p = Scripted::from(["1", "y"]);
+        p.line("选择 [0-9]").unwrap();
+        p.confirm("切换？").unwrap();
+        p.lines_until_blank("粘贴").unwrap();
+        assert_eq!(p.asked, vec!["选择 [0-9]", "切换？", "粘贴"]);
     }
 
     #[test]
