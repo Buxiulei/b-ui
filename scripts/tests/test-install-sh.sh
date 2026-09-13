@@ -16,8 +16,8 @@ WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/bin" "$WORK/fresh" "$WORK/fixtures"
 
-# releases 列表的真实形状：一行紧凑 JSON，按「新 → 旧」，含预发布。
-# 头一条故意是 v3 的补丁版（v3 热修可能比 rc 更新），回退必须跳过它只认 v4*。
+# releases 列表的形状：一行紧凑 JSON，含预发布；顺序不可信（见下面「按版本号取最大」那段）。
+# 头一条故意是 v3 的补丁版（v3 热修可能比 rc 更新）：它不是预发布 rc，回退必须跳过它。
 # 放 fixtures/ 而不是 $WORK 根：latest_v4_tag 会往 <manifest 同目录>/releases.json 落地，
 # 同名会被 `> "$out"` 先截断，cat 到的就是空文件。
 cat > "$WORK/fixtures/releases.json" <<'EOF'
@@ -69,13 +69,13 @@ BUI_MIRRORS=""   # 只试直连，日志里只剩要断言的那几条
 # install.sh 顶部是 set -euo pipefail，源入后会污染测试外壳（测试要主动读非零退出码），必须关掉
 set +eu
 
-# ---- 1) BUI_VERSION 未设：releases/latest 404 → 回退到 releases 列表里最新的 v4* 标签 ----
+# ---- 1) BUI_VERSION 未设：releases/latest 404 → 回退到 releases 列表里版本号最大的预发布 rc ----
 : > "$DL_LOG"
 TAG=latest
 MANIFEST_URL=""
 get_manifest "$WORK/m.json" > "$WORK/out.txt" 2>&1
 assert_eq "0" "$?" "latest 404 后回退成功"
-assert_eq "v4.0.0-rc2" "$TAG" "回退取 releases 列表里第一个 v4* 标签（跳过更新的 v3 补丁版）"
+assert_eq "v4.0.0-rc2" "$TAG" "回退取版本号最大的预发布 rc（跳过更新的 v3 补丁版）"
 assert_eq "MANIFEST https://github.com/Buxiulei/b-ui/releases/download/v4.0.0-rc2/manifest.json" \
     "$(cat "$WORK/m.json")" "落地的是那个预发布 tag 的 manifest"
 assert_eq "curl https://github.com/Buxiulei/b-ui/releases/latest/download/manifest.json" \
@@ -96,12 +96,12 @@ out=$(fetch "https://github.com/Buxiulei/b-ui/releases/latest/download/manifest.
 assert_eq "1" "$rc" "quiet 也返回 1"
 assert_not_contains "直连与全部镜像均不可达" "$out" "quiet 时不报那句"
 
-# 列表里没有 v4* → 明确提示怎么办（不静默装个 v3）
+# 列表里没有预发布 rc → 明确提示怎么办（不静默装个 v3）
 : > "$DL_LOG"
 TAG=latest
 printf '[{"tag_name":"v3.6.3","prerelease":false}]\n' > "$WORK/fixtures/only-v3.json"
 out=$(FAKE_RELEASES="$WORK/fixtures/only-v3.json" get_manifest "$WORK/m2.json" 2>&1); rc=$?
-assert_eq "1" "$rc" "取不到 v4 标签 → 退 1"
+assert_eq "1" "$rc" "取不到预发布 rc → 退 1"
 assert_contains "BUI_VERSION=vX.Y.Z-rcN" "$out" "提示可指定预发布版本"
 assert_contains "BUI_MANIFEST_URL" "$out" "提示可直接指定 manifest 地址"
 
@@ -119,13 +119,36 @@ assert_eq "1" "$([[ $(wc -c < "$WORK/fixtures/releases-big.json") -gt 262144 ]] 
 mkdir -p "$WORK/big"
 tag=$(FAKE_RELEASES="$WORK/fixtures/releases-big.json" latest_v4_tag "$WORK/big" 2> /dev/null); rc=$?
 assert_eq "0" "$rc" "releases 列表 >256KB 时 latest_v4_tag 退出码 0（不被 SIGPIPE 误杀）"
-assert_eq "v4.0.1-rc3" "$tag" "大列表里仍取第一个 v4* 标签（只打印一个）"
+assert_eq "v4.0.1-rc3" "$tag" "大列表里取版本号最大的那个（只打印一个）"
 : > "$DL_LOG"
 TAG=latest
 FAKE_RELEASES="$WORK/fixtures/releases-big.json" get_manifest "$WORK/big/m.json" > /dev/null 2>&1
 assert_eq "0" "$?" "大列表下 latest 404 → 回退预发布照样成功"
 assert_eq "v4.0.1-rc3" "$TAG" "回退到大列表里最新的 rc"
 TAG=latest
+
+# rc 通道按版本号 (x, y, z, N) 取最大、不看列表顺序（与 bui / bui-c 的 latest_rc_tag 同口径）：
+# 2026-09-13 实测 GitHub 的 releases 列表返回 rc9 → rc8 → rc7 → rc10 → rc6，最新的 rc10 排第 4。
+# 第一条用带空格与换行的 pretty 形状，其余用紧凑形状，两种写法都要认。
+mkdir -p "$WORK/pick"
+pick() { printf '%s\n' "$1" > "$WORK/fixtures/pick.json"; FAKE_RELEASES="$WORK/fixtures/pick.json" latest_v4_tag "$WORK/pick" 2> /dev/null; }
+assert_eq "v4.0.0-rc10" "$(pick '[
+  {"tag_name": "v4.0.0-rc9", "prerelease": true},
+  {"tag_name": "v4.0.0-rc8", "prerelease": true},
+  {"tag_name": "v4.0.0-rc7", "prerelease": true},
+  {"tag_name": "v4.0.0-rc10", "prerelease": true},
+  {"tag_name": "v4.0.0-rc6", "prerelease": true}
+]')" "真实乱序里取 rc10（不是排第一的 rc9）"
+assert_eq "v4.0.1-rc1" "$(pick '[{"tag_name":"v4.0.0-rc9","prerelease":true},{"tag_name":"v4.0.0-rc10","prerelease":true},{"tag_name":"v4.0.1-rc1","prerelease":true}]')" \
+    "跨版本按数值比：v4.0.1-rc1 > v4.0.0-rc10 > v4.0.0-rc9"
+assert_eq "v10.0.0-rc1" "$(pick '[{"tag_name":"v9.9.9-rc9","prerelease":true},{"tag_name":"v10.0.0-rc1","prerelease":true},{"tag_name":"v4.1.0-rc1","prerelease":true}]')" \
+    "主版本也按数值比（v10 > v9，不是字典序）"
+assert_eq "v4.0.0-rc10" "$(pick '[{"tag_name":"v4.0.2-rc1","prerelease":false},{"tag_name":"v4.0.0-rc9","prerelease":true},{"tag_name":"v4.0.0-rc10","prerelease":true}]')" \
+    "prerelease=false 的 rc 形 tag 跳过（哪怕版本号最大）"
+assert_eq "v4.0.0-rc10" "$(pick '[{"tag_name":"v4.0.0-rc4294967296","prerelease":true},{"tag_name":"v4.0.99999999999999999999-rc1","prerelease":true},{"tag_name":"v5.0.0-rc1x","prerelease":true},{"tag_name":"v5.0-rc1","prerelease":true},{"tag_name":"v5.0.0","prerelease":true},{"tag_name":"nightly","prerelease":true},{"tag_name":"v4.0.0-rc9","prerelease":true},{"tag_name":"v4.0.0-rc10","prerelease":true}]')" \
+    "畸形与超出 u32 的 tag 跳过（与 Rust 侧同一个上界）"
+assert_eq "v4.0.0-rc4294967295" "$(pick '[{"tag_name":"v4.0.0-rc10","prerelease":true},{"tag_name":"v4.0.0-rc4294967295","prerelease":true}]')" \
+    "u32 上界本身还算数"
 
 # BUI_MANIFEST_URL 给了就只认它，不去问 releases 列表（M5 演练 / 离线源）
 : > "$DL_LOG"

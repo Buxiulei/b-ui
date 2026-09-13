@@ -7,7 +7,7 @@ set -euo pipefail
 # 制品源按序试三条，取到 manifest 的那条也用来取二进制：
 #   ① $BUI_C_SOURCE，或面板下发本脚本时写进 PANEL_SOURCE 的那个 /packages
 #   ② GitHub releases/latest
-#   ③ releases 列表里最新的预发布 tag（仓库里只有预发布时 ② 必然 404）
+#   ③ releases 列表里版本号最大的预发布 rc tag（仓库里只有预发布时 ② 必然 404）
 SOURCE="${BUI_C_SOURCE:-}"
 
 # 面板经 /packages/bui-c-install.sh 下发本脚本时，把下面这行的占位符替换成
@@ -19,7 +19,7 @@ PANEL_SOURCE="__BUI_C_PANEL_SOURCE__"
 # 这两个只为测试（scripts/tests/test-bui-c-install.sh 把它们指到 127.0.0.1）与镜像存在，
 # 正常安装不用设。
 GITHUB="${BUI_C_GITHUB:-https://github.com/Buxiulei/b-ui}"
-RELEASES_API="${BUI_C_RELEASES_API:-https://api.github.com/repos/Buxiulei/b-ui/releases?per_page=20}"
+RELEASES_API="${BUI_C_RELEASES_API:-https://api.github.com/repos/Buxiulei/b-ui/releases?per_page=100}"
 
 PREFIX="${BUI_C_PREFIX:-/usr/local/bin}"
 TARGET="$PREFIX/bui-c"
@@ -84,19 +84,30 @@ if [ -z "$GOT" ]; then
     fi
 fi
 
-# ③ releases 列表里最新的预发布（照搬服务端 install.sh 的 latest_v4_tag 口径）
+# ③ releases 列表里版本号最大的预发布（与服务端 install.sh 的 latest_v4_tag、bui-c 的 latest_rc_tag 同口径）
 if [ -z "$GOT" ]; then
     TAG=""
     if curl -fsSL --max-time 30 "$RELEASES_API" -o "$TMP/releases.json"; then
+        # prerelease=true 且形如 vX.Y.Z-rcN 的里按 (x, y, z, N) 数值取最大，任一段超出 u32
+        # （4294967295）的跳过。**不看列表顺序**：这个列表不按创建时间倒序（2026-09-13 实测返回
+        # rc9 → rc8 → rc7 → rc10 → rc6，最新的 rc10 排第 4，取第一个会装成 rc9）。
         # 逐字段比对键名（$2 == "tag_name"）而不是 /"tag_name"/：release 正文里出现字面
         # \"tag_name\" 时正则会误命中，字段比对不会（tr 后每片形如 {"tag_name":"v4.0.0-rc9"，
-        # 以 " 切分 $2 即键名）。只认 vX.Y.Z-rcN 形状的预发布。
-        # awk 命中后**不能** exit：真实响应有 200KB+（7 个 release 带正文），提前退出会让上游
-        # 的 tr 往已关闭的管道继续写而吃到 SIGPIPE（141），set -o pipefail 把整条管道判为非零、
-        # set -e 于是静默杀掉整个脚本（2026-09-13 在 baiyi 真机复现：rc=141，一行都不打印）。
-        # 所以读完整个流，只打印第一个匹配（found 标记）。
-        TAG="$(tr ',' '\n' < "$TMP/releases.json" \
-            | awk -F'"' '!found && $2 == "tag_name" && $4 ~ /^v[0-9]+\.[0-9]+\.[0-9]+-rc[0-9]+$/ { print $4; found = 1 }')"
+        # 以 " 切分 $2 即键名）。GitHub 的 release 对象里 tag_name 在 prerelease 之前，所以
+        # prerelease 那片配的就是刚读到的 t。
+        # awk 读完整个流才在 END 打印（取最大值本来就得读完）：真实响应有 200KB+（7 个 release
+        # 带正文），提前 exit 会让上游的 tr 往已关闭的管道继续写而吃到 SIGPIPE（141），
+        # set -o pipefail 把整条管道判为非零、set -e 于是静默杀掉整个脚本（2026-09-13 在 baiyi
+        # 真机复现：rc=141，一行都不打印）。
+        TAG="$(tr ',' '\n' < "$TMP/releases.json" | awk -F'"' '
+            $2 == "tag_name" { t = $4 }
+            $2 == "prerelease" && $3 ~ /true/ && t ~ /^v[0-9]+\.[0-9]+\.[0-9]+-rc[0-9]+$/ {
+                split(substr(t, 2), v, /\.|-rc/)
+                for (i = 1; i <= 4; i++) if (v[i] + 0 > 4294967295) next
+                for (i = 1; i <= 4 && v[i] + 0 == b[i] + 0; i++);
+                if (i > 4 || v[i] + 0 > b[i] + 0) { best = t; split(substr(t, 2), b, /\.|-rc/) }
+            }
+            END { if (best != "") print best }')"
     fi
     [ -n "$TAG" ] || {
         print_error "取不到 manifest.json：面板源、releases/latest 与 releases 列表都不可达。用 BUI_C_SOURCE=https://<面板域名>/packages 指定源再重试"
