@@ -69,6 +69,11 @@ fn pause_text(prompt: &str) -> String {
     format!("  ▸ {prompt}")
 }
 
+/// [`Prompt::lines_until_blank`] 在终端里打的那一行说明（含 2 列缩进，不含换行）。
+pub fn paste_head(prompt: &str) -> String {
+    format!("  {prompt}（每行一个，空行结束）")
+}
+
 /// 读一行（去首尾空白）；EOF（0 字节）返回 `None`。
 ///
 /// 按字节读到 `\n` 再有损转码：`read_line` 遇到非 UTF-8 字节（GBK 终端、误触的控制键）
@@ -105,7 +110,7 @@ impl Prompt for Stdin {
     }
 
     fn lines_until_blank(&mut self, prompt: &str) -> Result<Vec<String>> {
-        let head = format!("  {prompt}（每行一个，空行结束）\n");
+        let head = format!("{}\n", paste_head(prompt));
         if !prompt_out(self.interactive(), &mut std::io::stdout().lock(), &head)? {
             return Ok(Vec::new());
         }

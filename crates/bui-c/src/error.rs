@@ -33,9 +33,10 @@ pub enum Error {
 }
 
 /// [`Error::NoNodes`] 两个出口共用的主句（不带任何「下一步去哪」的指引）。
+/// 菜单里前面还有「  失败：」，常见的一两种 scheme 时整行要在 80 列内。
 pub fn no_nodes_summary(skipped: usize, schemes: &[String]) -> String {
     format!(
-        "没有可用节点（{skipped} 行无法解析：{}），只支持 hysteria2:// 与 vless://",
+        "{skipped} 行都不是 hysteria2:// 或 vless:// 链接（{}）",
         schemes.join("、")
     )
 }

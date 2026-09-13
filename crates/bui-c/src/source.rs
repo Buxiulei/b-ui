@@ -427,7 +427,7 @@ mod tests {
         // Display 只给命令行用（菜单拿变体自己组织文案），所以只指向 --sub，不再提菜单
         assert_eq!(
             e.to_string(),
-            "没有可用节点（1 行无法解析：https://），只支持 hysteria2:// 与 vless://；订阅地址请用 bui-c import --sub <url>"
+            "1 行都不是 hysteria2:// 或 vless:// 链接（https://）；订阅地址请用 bui-c import --sub <url>"
         );
         assert!(
             !e.to_string().contains("alice"),
@@ -469,7 +469,7 @@ mod tests {
         let msg = e.to_string();
         assert_eq!(
             msg,
-            "没有可用节点（4 行无法解析：ss://、trojan://、(无 scheme)），只支持 hysteria2:// 与 vless://"
+            "4 行都不是 hysteria2:// 或 vless:// 链接（ss://、trojan://、(无 scheme)）"
         );
         assert!(!msg.contains("secret"), "只列 scheme，不带内容：{msg}");
         assert!(!msg.contains("--sub"), "没有 http(s) 行就别提订阅：{msg}");

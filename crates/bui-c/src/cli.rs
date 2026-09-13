@@ -981,7 +981,8 @@ fn pick_node<S: Sys, N: Net, P: Prompt>(
 }
 
 /// 菜单 `[3]` 的粘贴提示（`lines_until_blank` 自己补「每行一个，空行结束」）。
-const PASTE_PROMPT: &str = "粘贴 hysteria2:// 或 vless:// 节点链接，或面板给的订阅地址";
+/// 要在 80 列里放下：支持哪些 scheme 留给失败行去说。
+const PASTE_PROMPT: &str = "粘贴节点链接或订阅地址";
 
 /// 菜单 `[3] 导入节点`：节点链接与面板 / 订阅地址都从这一个口子进。
 ///
@@ -3095,11 +3096,47 @@ mod tests {
         assert!(t.lines().any(|l| l == "  已取消，没有导入任何节点"), "{t}");
         assert!(!t.contains("失败"), "什么都没粘贴不是失败：{t}");
         assert!(
-            p.asked.contains(
-                &"粘贴 hysteria2:// 或 vless:// 节点链接，或面板给的订阅地址".to_string()
-            ),
+            p.asked.contains(&"粘贴节点链接或订阅地址".to_string()),
             "提示要说清楚两种都能贴：{:?}",
             p.asked
+        );
+    }
+
+    /// 菜单 `[3]` 的粘贴说明与「失败」行在 80 列终端里不折行（含 2 列缩进）：
+    /// 以前分别是 82 列与 84 列。
+    #[test]
+    fn menu_import_prompt_and_failure_lines_fit_in_80_columns() {
+        let head = menu::paste_head(PASTE_PROMPT);
+        assert_eq!(head, "  粘贴节点链接或订阅地址（每行一个，空行结束）");
+        assert!(
+            menu::display_width(&head) <= 80,
+            "{} 列：{head}",
+            menu::display_width(&head)
+        );
+
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        profiles_socks().save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        let mut p = Scripted::from([
+            "3",
+            "ss://secret@h:1#x",
+            "https://panel.example.com/api/sub/alice",
+            "",
+            "0",
+        ]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        let fail = t
+            .lines()
+            .find(|l| l.starts_with("  失败："))
+            .unwrap_or_else(|| panic!("{t}"));
+        assert!(
+            menu::display_width(fail) <= 80,
+            "{} 列：{fail}",
+            menu::display_width(fail)
         );
     }
 
@@ -3129,17 +3166,14 @@ mod tests {
         assert_eq!(
             lines[at..at + 2],
             [
-                "  失败：没有可用节点（2 行无法解析：ss://、https://），只支持 hysteria2:// 与 vless://",
+                "  失败：2 行都不是 hysteria2:// 或 vless:// 链接（ss://、https://）",
                 "  订阅地址请单独粘贴一行再回车",
             ],
             "\n{t}"
         );
         assert!(!t.contains("bui-c import"), "菜单里不提命令行：{t}");
         assert!(!t.contains("菜单 [3]"), "人就在菜单 [3] 里：{t}");
-        assert!(
-            !t.contains("节点："),
-            "不出现「失败：没有可用节点：」双冒号：{t}"
-        );
+        assert!(!t.contains("节点："), "不出现双冒号：{t}");
         assert!(!t.contains("secret"), "{t}");
 
         // 没有 http(s) 行：只有第一行
@@ -3148,8 +3182,8 @@ mod tests {
         menu_loop(&mut ctx).unwrap();
         let t = ctx.transcript.clone();
         assert!(
-            t.lines().any(|l| l
-                == "  失败：没有可用节点（1 行无法解析：trojan://），只支持 hysteria2:// 与 vless://"),
+            t.lines()
+                .any(|l| l == "  失败：1 行都不是 hysteria2:// 或 vless:// 链接（trojan://）"),
             "{t}"
         );
         assert!(!t.contains("订阅地址"), "{t}");
