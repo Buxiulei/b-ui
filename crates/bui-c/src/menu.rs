@@ -369,9 +369,12 @@ pub enum ServiceAction {
 /// `[4] 服务控制` 二级菜单的日志行数，与选项文案同源。
 pub const SERVICE_LOG_LINES: u32 = 50;
 
-/// `[4] 服务控制` 的二级数字菜单（缩进与节点列表一致）。
+/// `[4] 服务控制` 的二级数字菜单：样式与主菜单一致——前空一行、两列缩进的标题、
+/// 选项 5 列缩进。以前两列缩进直接接在主菜单下面，看着像主菜单多出来的几行。
 pub fn render_service_options() -> String {
-    format!("  [1] 重启 bui-c.service\n  [2] 最近 {SERVICE_LOG_LINES} 行日志\n  [0] 返回\n")
+    format!(
+        "\n  服务控制\n     [1] 重启 bui-c.service\n     [2] 最近 {SERVICE_LOG_LINES} 行日志\n     [0] 返回\n"
+    )
 }
 
 /// 二级菜单：空行与 `0` 返回，别的无法识别 → `None`（调用方打「无效选项」后返回）。
@@ -1108,7 +1111,8 @@ mod tests {
     fn service_submenu_is_numbered_and_parses_back_on_blank_or_zero() {
         assert_eq!(
             render_service_options(),
-            "  [1] 重启 bui-c.service\n  [2] 最近 50 行日志\n  [0] 返回\n"
+            "\n  服务控制\n     [1] 重启 bui-c.service\n     [2] 最近 50 行日志\n     [0] 返回\n",
+            "与主菜单一致：前空一行、标题、选项 5 列缩进"
         );
         assert_eq!(parse_service_choice("1"), Some(ServiceAction::Restart));
         assert_eq!(parse_service_choice(" ２ "), Some(ServiceAction::Logs));

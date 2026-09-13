@@ -2828,13 +2828,22 @@ mod tests {
         let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
         menu_loop(&mut ctx).unwrap();
         let t = ctx.transcript.clone();
-        for row in [
-            "  [1] 重启 bui-c.service",
-            "  [2] 最近 50 行日志",
-            "  [0] 返回",
-        ] {
-            assert!(t.lines().any(|l| l == row), "缺 {row:?}：\n{t}");
-        }
+        let lines: Vec<&str> = t.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| *l == "  服务控制")
+            .unwrap_or_else(|| panic!("缺标题：\n{t}"));
+        assert_eq!(
+            lines[at - 1..at + 4],
+            [
+                "",
+                "  服务控制",
+                "     [1] 重启 bui-c.service",
+                "     [2] 最近 50 行日志",
+                "     [0] 返回",
+            ],
+            "样式与主菜单一致：\n{t}"
+        );
         assert!(
             !s.called("systemctl restart bui-c.service"),
             "进子菜单不等于重启"
