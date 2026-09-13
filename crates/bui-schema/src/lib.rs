@@ -66,6 +66,10 @@
 //!
 //! - [`render::client::tun_config`] / [`render::client::mixed_config`]：`bui-c` 的 TUN 模式与
 //!   本地混合端口模式，选项见 [`ClientOpts`](render::client::ClientOpts)。
+//! - [`render::client::node_outbound`]：节点 → sing-box 出站（主配置用 `proxy-out`，测速配置用 `probe-<i>`）。
+//! - [`render::client::probe_config`]：`bui-c` 测速配置，每个 [`ProbeTarget`](render::client::ProbeTarget)
+//!   一个带认证（凭据由调用方随机生成）的 `127.0.0.1` socks 入站，按入站分流到各自节点；
+//!   标签由函数按下标生成（出站 `probe-<i>`、入站 `probe-in-<i>`）。
 //!
 //! ## v3 导入 —— [`v3`]
 //!

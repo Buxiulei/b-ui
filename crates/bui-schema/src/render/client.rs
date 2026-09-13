@@ -4,6 +4,7 @@
 //! `interface_name: bui-tun`、`address` 数组、`stack: mixed`、CN 域名直连 DNS、
 //! `sniff` + `hijack-dns`、cloudflared QUIC 例外、裸 IPv6 就地 reject。
 //! mixed 形态用同一套出站与路由，只把 TUN inbound 换成两个 `mixed` 监听、去掉 DNS 劫持。
+//! 另有 [`probe_config`]：`bui-c` 节点测速用的多入站配置，出站与主配置同源（[`node_outbound`]）。
 
 use crate::nodes::{Node, NodeKind, Transport};
 use crate::render::SplitRules;
@@ -41,6 +42,71 @@ pub fn tun_config(node: &Node, opts: &ClientOpts) -> Value {
 /// mixed 形态配置（无 TUN、无 DNS 劫持）。
 pub fn mixed_config(node: &Node, opts: &ClientOpts) -> Value {
     config(node, opts, false)
+}
+
+/// 测速的一个目标：节点 + 本地 socks 入站端口 + 这个入站的凭据（调用方随机生成）。
+///
+/// 没有 tag 字段：标签由 [`probe_config`] 按下标生成，调用方按 `listen_port` 认目标。
+/// 不派生 `Debug`：`user` / `pass` 是凭据，不该经 `{:?}` 进日志。
+pub struct ProbeTarget<'a> {
+    /// 要测的节点（同一个节点、同名节点都可以出现多次）
+    pub node: &'a Node,
+    /// 本地 socks 入站端口（只监听 127.0.0.1；由调用方分配，各目标互不相同）
+    pub listen_port: u16,
+    /// 入站认证的用户名（调用方随机生成）
+    pub user: String,
+    /// 入站认证的密码（调用方随机生成）
+    pub pass: String,
+}
+
+/// 多节点测速配置（`bui-c` 菜单的 `[9]`）：每个目标一个带认证的 `127.0.0.1` socks 入站，
+/// 按入站分流到各自节点的出站，其余流量 `final: direct-out`。
+///
+/// - 标签按目标在 `targets` 里的下标 `i`（从 0 开始）生成：出站 `probe-<i>`、入站 `probe-in-<i>`，
+///   路由规则 `probe-in-<i>` → `probe-<i>`。标签与节点名无关：同一个节点测两次、两台服务器上的
+///   同名节点都不会撞 tag，也碰不到 `direct-out`。
+/// - `route.auto_detect_interface = true` 必需：不设的话出站连接会被本机正在跑的 TUN 截走。
+/// - DNS 只有 `local-dns`（udp 223.5.5.5），[`node_outbound`] 的 `domain_resolver` 写死引用它；
+///   `default_domain_resolver` 与 `strategy: ipv4_only` 同主配置。
+/// - 没有 tun、hijack-dns、sniff、rule_set、download_detour、cache_file；
+///   `log.level = error`（sing-box 的日志可能带出服务器地址，调用方也不读）。
+/// - `targets` 为空时产出没有入站的配置，调用方不要这样调。
+pub fn probe_config(targets: &[ProbeTarget<'_>]) -> Value {
+    let mut inbounds = Vec::with_capacity(targets.len());
+    let mut outbounds = Vec::with_capacity(targets.len() + 1);
+    let mut rules = Vec::with_capacity(targets.len());
+    for (i, t) in targets.iter().enumerate() {
+        let in_tag = format!("probe-in-{i}");
+        let out_tag = format!("probe-{i}");
+        inbounds.push(json!({
+            "type": "socks",
+            "tag": in_tag,
+            "listen": "127.0.0.1",
+            "listen_port": t.listen_port,
+            "users": [{ "username": t.user, "password": t.pass }],
+        }));
+        outbounds.push(node_outbound(t.node, &out_tag));
+        rules.push(json!({ "inbound": [in_tag], "outbound": out_tag }));
+    }
+    outbounds.push(json!({ "type": "direct", "tag": "direct-out" }));
+
+    json!({
+        "log": { "level": "error" },
+        "dns": {
+            "servers": [
+                { "tag": "local-dns", "type": "udp", "server": "223.5.5.5" },
+            ],
+            "strategy": "ipv4_only",
+        },
+        "inbounds": inbounds,
+        "outbounds": outbounds,
+        "route": {
+            "rules": rules,
+            "final": "direct-out",
+            "auto_detect_interface": true,
+            "default_domain_resolver": "local-dns",
+        },
+    })
 }
 
 /// DNS 走国内递归的域名后缀（v3 `b-ui-client.sh` dns.rules）。
@@ -220,8 +286,16 @@ fn config(node: &Node, opts: &ClientOpts, tun: bool) -> Value {
     })
 }
 
-/// 节点 → `proxy-out` 出站。
+/// 节点 → `proxy-out` 出站（客户端主配置用）。
 fn outbound(node: &Node) -> Value {
+    node_outbound(node, "proxy-out")
+}
+
+/// 节点 → sing-box 出站 JSON。客户端主配置用 `proxy-out`，[`probe_config`] 用 `probe-<i>`。
+///
+/// `domain_resolver` 写死引用 tag 为 `local-dns` 的 DNS 服务器：放进哪份配置，
+/// 那份配置里就得有它（主配置与 [`probe_config`] 都有）。
+pub fn node_outbound(node: &Node, tag: &str) -> Value {
     match &node.transport {
         Transport::Hysteria2 {
             username,
@@ -231,7 +305,7 @@ fn outbound(node: &Node) -> Value {
         } => {
             let mut o = json!({
                 "type": "hysteria2",
-                "tag": "proxy-out",
+                "tag": tag,
                 "server": node.host,
                 "server_port": node.port,
                 "password": format!("{username}:{password}"),
@@ -260,7 +334,7 @@ fn outbound(node: &Node) -> Value {
             flow,
         } => json!({
             "type": "vless",
-            "tag": "proxy-out",
+            "tag": tag,
             "server": node.host,
             "server_port": node.port,
             "uuid": uuid.to_string(),
