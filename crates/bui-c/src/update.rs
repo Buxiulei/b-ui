@@ -308,8 +308,11 @@ pub fn run<S: Sys, N: Net>(
     if kernel_version(sys, paths).as_deref() != Some(m.kernels.client_sing_box.as_str()) {
         install_kernel(sys, net, paths, prof.panel.as_ref(), &m)?;
         r.kernel_updated = true;
-        systemd::restart(sys, UNIT_MAIN)?;
-        r.restarted = true;
+        // 新机器还没导入过节点，单元文件都没写：没有可重启的，第一次 apply 会把它拉起来
+        if sys.exists(&paths.unit(UNIT_MAIN)) {
+            systemd::restart(sys, UNIT_MAIN)?;
+            r.restarted = true;
+        }
     }
     Ok(r)
 }
@@ -629,6 +632,8 @@ mod tests {
             0,
             "sing-box version 1.13.19\n",
         );
+        // 单元已经装好的机器（没有单元时不重启，见下一条）
+        s.put("/etc/systemd/system/bui-c.service", "[Unit]");
 
         let r = run(&s, &n, &paths(), &prof, false).unwrap();
         assert!(r.kernel_updated && !r.self_updated);
@@ -640,6 +645,48 @@ mod tests {
         );
         assert!(s.called("systemctl restart bui-c.service"));
         assert!(r.restarted);
+    }
+
+    /// 新机器（还没导入过节点）上跑 `bui-c update`：内核照装，但没有 bui-c.service 可重启——
+    /// 以前在这里以「Unit bui-c.service not found」失败。
+    #[test]
+    fn run_on_a_machine_without_the_unit_installs_the_kernel_but_does_not_restart() {
+        let s = FakeSys::new();
+        let n = FakeNet::new();
+        let mut prof = Profiles::new_default();
+        prof.panel = Some(panel());
+        let bin = b"ELF-new".to_vec();
+        n.route(
+            "https://panel.example.com/packages/manifest.json",
+            FakeReply::Text(manifest_json(
+                crate::VERSION,
+                &"a".repeat(64),
+                &sha256_hex(&bin),
+            )),
+        );
+        n.route(
+            &format!(
+                "https://panel.example.com/packages/sing-box-linux-{}",
+                arch_suffix()
+            ),
+            FakeReply::Bytes(bin),
+        );
+        // 真机上 restart 一个不存在的单元会失败
+        s.reply(
+            "systemctl restart bui-c.service",
+            5,
+            "Failed to restart bui-c.service: Unit bui-c.service not found.",
+        );
+
+        let r = run(&s, &n, &paths(), &prof, false).unwrap();
+        assert!(r.kernel_updated);
+        assert!(!r.restarted);
+        assert_eq!(s.get("/opt/bui-c/bin/sing-box").unwrap(), "ELF-new");
+        assert!(
+            !s.called("systemctl restart bui-c.service"),
+            "{:?}",
+            s.calls()
+        );
     }
 
     #[test]

@@ -897,11 +897,20 @@ fn menu_body<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()
             }
             Action::Service => {
                 // 单元还没建就别进子菜单——systemd 只会回 `Unit bui-c.service not found`，
-                // 用户看不出该干什么（缺陷 5）。
+                // 用户看不出该干什么（缺陷 5）。引擎与单元是导入节点时 apply 装上的，
+                // `bui-c update` 在新机器上只装内核、不建单元，不是出路。
                 if ctx.sys.exists(&ctx.paths.unit(UNIT_MAIN)) {
                     service_menu(ctx, prof.mode)?;
                 } else {
-                    ctx.say("还没有安装引擎与单元：先导入节点（菜单 3 / 7）或跑 `bui-c update`");
+                    let v3 = import_v3::detect(ctx.sys, std::path::Path::new(import_v3::V3_BASE));
+                    ctx.say(format!(
+                        "还没有安装引擎与单元：先用 [3] 导入节点{}",
+                        if v3 {
+                            "（v3 客户端用 [7] 从 v3 导入）"
+                        } else {
+                            ""
+                        }
+                    ));
                 }
                 None
             }
@@ -3633,16 +3642,35 @@ mod tests {
         let mut p = Scripted::from(["4", "0"]); // 4 = 服务控制 → 0 退出
         let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
         menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        // 新机器上 `bui-c update` 走不通（没单元可重启），装引擎与单元的路是导入节点
         assert!(
-            ctx.transcript.contains("bui-c update"),
-            "单元不存在时应引导先装引擎：{}",
-            ctx.transcript
+            t.lines()
+                .any(|l| l == "  还没有安装引擎与单元：先用 [3] 导入节点"),
+            "单元不存在时应引导先导入节点：\n{t}"
         );
+        assert!(!t.contains("bui-c update"), "{t}");
         assert!(
-            !ctx.transcript.contains("最近 50 行日志"),
-            "没有单元就不进子菜单：{}",
-            ctx.transcript
+            !t.contains("v3 客户端用 [7]"),
+            "没有 v3 目录就不提 [7]：\n{t}"
         );
+        assert!(!t.contains("最近 50 行日志"), "没有单元就不进子菜单：\n{t}");
         assert!(!s.called("systemctl restart bui-c.service"));
+
+        // 机器上有 v3 客户端：补一句 [7]
+        s.put(
+            "/opt/hysteria-client/configs/hysteria2-1/uri.txt",
+            "hysteria2://alice:hy2-pw@panel.example.com:10000/?sni=panel.example.com#a",
+        );
+        let mut p = Scripted::from(["4", "0"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert!(
+            t.lines()
+                .any(|l| l
+                    == "  还没有安装引擎与单元：先用 [3] 导入节点（v3 客户端用 [7] 从 v3 导入）"),
+            "\n{t}"
+        );
     }
 }
