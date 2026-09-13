@@ -730,11 +730,23 @@ fn menu_body<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()
             Action::SwitchNode => {
                 let list = menu::render_nodes(&prof, true);
                 ctx.show(list.trim_end());
-                ctx.flush();
-                let pick = ctx.prompt.line("选择节点编号")?;
-                menu::pick_index(&pick, prof.profiles.len()).map(|i| Cmd::Switch {
-                    name: prof.profiles[i].name.clone(),
-                })
+                let len = prof.profiles.len();
+                if len == 0 {
+                    None // 列表里已经给了「先导入」的引导，没有编号可选
+                } else {
+                    ctx.flush();
+                    let pick = ctx.prompt.line("选择节点编号")?;
+                    if menu::is_back(&pick) {
+                        None
+                    } else if let Some(i) = menu::pick_index(&pick, len) {
+                        Some(Cmd::Switch {
+                            name: prof.profiles[i].name.clone(),
+                        })
+                    } else {
+                        ctx.say(format!("无效编号：{pick}（可选 1-{len}，0 返回）"));
+                        None
+                    }
+                }
             }
             Action::ToggleMode => {
                 let want = match prof.mode {
@@ -748,6 +760,7 @@ fn menu_body<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()
                 if ctx.prompt.confirm(q)? {
                     Some(Cmd::Mode { mode: want })
                 } else {
+                    ctx.say("已取消，模式未变");
                     None
                 }
             }
@@ -778,6 +791,17 @@ fn menu_body<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()
                     Switch::On
                 }),
             }),
+            // 没有 v3 目录不是失败：菜单里如实说一句。命令行 `bui-c import-v3` 照旧报错，
+            // 脚本要靠退出码
+            Action::ImportV3
+                if !import_v3::detect(ctx.sys, std::path::Path::new(import_v3::V3_BASE)) =>
+            {
+                ctx.say(format!(
+                    "这台机器上没有 v3 客户端（{} 不存在），不需要导入",
+                    import_v3::V3_BASE
+                ));
+                None
+            }
             Action::ImportV3 => Some(Cmd::ImportV3 {
                 base: None,
                 panel: None,
@@ -1782,6 +1806,113 @@ mod tests {
         menu_loop(&mut ctx).unwrap();
         assert_eq!(Profiles::load(&s, &pp).unwrap().mode, Mode::Tun);
         assert_eq!(ctx.transcript.matches("B-UI 客户端").count(), 2);
+    }
+
+    fn two_nodes(s: &FakeSys, pp: &Paths) {
+        let mut prof = profiles_socks();
+        prof.upsert(crate::profiles::Profile {
+            name: "alice-reality-direct".into(),
+            node: reality_direct_node(),
+            split: split_keywords(),
+            source: crate::profiles::Source::ApiNodes,
+            imported_at: "2026-09-11T00:00:00Z".into(),
+        });
+        prof.save(s, pp).unwrap();
+    }
+
+    #[test]
+    fn menu_node_pick_blank_or_zero_returns_silently_and_junk_is_reported() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        two_nodes(&s, &pp);
+        let n = FakeNet::new();
+        let mut p = Scripted::from([
+            "1", "", // 空行：静默返回
+            "1", "０", // 全角 0 也是返回
+            "1", "9", // 越界
+            "1", "abc", // 不是数字
+            "0",
+        ]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert_eq!(
+            t.lines().filter(|l| l.contains("无效")).collect::<Vec<_>>(),
+            vec![
+                "  无效编号：9（可选 1-2，0 返回）",
+                "  无效编号：abc（可选 1-2，0 返回）"
+            ],
+            "{t}"
+        );
+        assert_eq!(
+            Profiles::load(&s, &pp).unwrap().active.as_deref(),
+            Some("alice-hy2-direct")
+        );
+        assert_eq!(t.matches("B-UI 客户端").count(), 5, "每次都回到主菜单：{t}");
+    }
+
+    #[test]
+    fn menu_node_pick_with_no_profiles_does_not_ask_for_a_number() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s); // 没有 profiles.json，也没有 v3 目录
+        let n = FakeNet::new();
+        let mut p = Scripted::from(["1", "0"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert!(t.contains("没有节点，先导入（主菜单 3）"), "{t}");
+        assert!(
+            !p.asked.iter().any(|q| q == "选择节点编号"),
+            "空列表没有编号可选（不能出现「可选 1-0」）：{:?}",
+            p.asked
+        );
+        assert_eq!(t.matches("B-UI 客户端").count(), 2, "0 被主菜单读走：{t}");
+    }
+
+    #[test]
+    fn menu_toggle_mode_declined_says_so() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        profiles_socks().save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        let mut p = Scripted::from(["2", "n", "2", "", "0"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert_eq!(
+            t.lines().filter(|l| *l == "  已取消，模式未变").count(),
+            2,
+            "答 n 与直接回车都要有回应：{t}"
+        );
+        assert_eq!(Profiles::load(&s, &pp).unwrap().mode, Mode::Socks);
+    }
+
+    #[test]
+    fn menu_import_v3_without_a_v3_client_is_not_a_failure() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        profiles_socks().save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        let mut p = Scripted::from(["7", "0"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert!(
+            t.lines()
+                .any(|l| l
+                    == "  这台机器上没有 v3 客户端（/opt/hysteria-client 不存在），不需要导入"),
+            "{t}"
+        );
+        assert!(!t.contains("失败"), "{t}");
+
+        // 命令行仍然报错：脚本靠退出码判断
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        assert!(dispatch(&parse(&["import-v3"]), &mut ctx).is_err());
     }
 
     #[test]

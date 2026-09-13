@@ -236,12 +236,10 @@ pub fn render_status(st: &Status) -> String {
                 "TUN   ○  未就绪".to_string()
             }
         }
+        // 端口不在这里重复：「代理」那一行已经写了（TUN 模式下 1080/8080 也在监听）
         Mode::Socks => {
             if st.service_running {
-                format!(
-                    "SOCKS ●  运行中（本地 :{}/:{}）",
-                    st.socks_port, st.http_port
-                )
+                "SOCKS ●  运行中".to_string()
             } else {
                 "SOCKS ○  已停止".to_string()
             }
@@ -425,7 +423,12 @@ pub fn parse_choice(input: &str) -> Option<Action> {
     }
 }
 
-/// `"2"` → `Some(1)`；`0` / 空 / 非数字 / 越界 → `None`（`0` 是「返回」）。
+/// 子提示里的「返回」：空行或 `0`（含全角 `０`）。
+pub fn is_back(input: &str) -> bool {
+    matches!(normalize_digits(input).as_str(), "" | "0")
+}
+
+/// `"2"` → `Some(1)`；`0` / 空 / 非数字 / 越界 → `None`（`0` 是「返回」，先用 [`is_back`] 分开）。
 pub fn pick_index(input: &str, len: usize) -> Option<usize> {
     let n: usize = normalize_digits(input).parse().ok()?;
     if n == 0 || n > len {
@@ -570,9 +573,19 @@ mod tests {
         s.http_port = 8081;
         s.service_running = true;
         let up = mode_line(&s);
+        assert!(up.ends_with("SOCKS ●  运行中"), "{up}");
         assert!(
-            up.contains("SOCKS ●  运行中（本地 :1081/:8081）"),
-            "端口从 Status 取：{up}"
+            !up.contains(":1081") && !up.contains(":8081"),
+            "端口「代理」那一行已经写了，模式行不再重复：{up}"
+        );
+        let proxy = render_status(&s)
+            .lines()
+            .find(|l| l.contains("代理"))
+            .unwrap()
+            .to_string();
+        assert!(
+            proxy.contains("SOCKS5 :1081") && proxy.contains("HTTP :8081"),
+            "端口从 Status 取：{proxy}"
         );
         s.service_running = false;
         let down = mode_line(&s);
@@ -797,6 +810,17 @@ mod tests {
         assert_eq!(pick_index("３", 3), Some(2));
         assert_eq!(pick_index("４", 3), None);
         assert_eq!(pick_index("０", 3), None);
+    }
+
+    #[test]
+    fn back_is_blank_or_zero() {
+        assert!(is_back(""));
+        assert!(is_back("  "));
+        assert!(is_back("0"));
+        assert!(is_back("０"));
+        assert!(!is_back("00"));
+        assert!(!is_back("1"));
+        assert!(!is_back("x"));
     }
 
     #[test]
