@@ -24,6 +24,21 @@ pub fn url_credentials(s: &str) -> String {
     }
 }
 
+/// 整行日志脱敏：按空格切分，含 `@` 的片段逐个过 [`url_credentials`]（`socks5://u:p@h:port`、
+/// `"http://u:p@h/x"`、`u:p@h:port` 都能认）。日志哨兵把日志原文放进事件的 `sample` 之前必须过它。
+pub fn line(s: &str) -> String {
+    s.split(' ')
+        .map(|tok| {
+            if tok.contains('@') {
+                url_credentials(tok)
+            } else {
+                tok.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// 只暴露长度，不暴露内容。
 pub fn secret(s: &str) -> String {
     if s.is_empty() {
@@ -76,5 +91,25 @@ mod tests {
         assert_eq!(secret("hunter2hunter2"), "***(14 字符)");
         assert_eq!(secret(""), "<empty>");
         assert!(!secret("pw-alice-01").contains("alice"));
+    }
+
+    /// 一整行日志里每个带 userinfo 的片段都要脱敏（哨兵把日志原文放进事件的 `sample`）
+    #[test]
+    fn line_redacts_every_credential_bearing_token() {
+        // 密码夹具用唯一串：写成 `p2` 会误中脱敏后照样保留的 `isp2.example.net`
+        let s = "dial socks5://user1:pw1@isp1.example.net:10007 failed, retry \
+                 \"http://u2:pw2@isp2.example.net:44445/x\" and user1:pw1@isp3.example.net:10007";
+        let out = line(s);
+        assert!(!out.contains("pw1") && !out.contains("pw2"), "{out}");
+        assert!(
+            out.contains("socks5://***:***@isp1.example.net:10007"),
+            "{out}"
+        );
+        assert!(
+            out.contains("\"http://***:***@isp2.example.net:44445/x\""),
+            "{out}"
+        );
+        assert!(out.contains("***:***@isp3.example.net:10007"), "{out}");
+        assert_eq!(line("plain text, no creds"), "plain text, no creds");
     }
 }
