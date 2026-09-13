@@ -20,8 +20,34 @@ pub enum Error {
     Net { url: String, detail: String },
     #[error("校验失败：{0}")]
     Verify(String),
+    /// 粘贴的内容一行节点都解析不出来。`schemes` 已脱敏去重（只留到 `://`），
+    /// `skipped` 是无法解析的行数（去重前）。
+    #[error("{}", no_nodes_display(*.skipped, .schemes, *.has_http))]
+    NoNodes {
+        skipped: usize,
+        schemes: Vec<String>,
+        has_http: bool,
+    },
     #[error("{0}")]
     Msg(String),
+}
+
+/// [`Error::NoNodes`] 两个出口共用的主句（不带任何「下一步去哪」的指引）。
+pub fn no_nodes_summary(skipped: usize, schemes: &[String]) -> String {
+    format!(
+        "没有可用节点（{skipped} 行无法解析：{}），只支持 hysteria2:// 与 vless://",
+        schemes.join("、")
+    )
+}
+
+/// 命令行（`bui-c import -`）看到的全文：有 http(s) 行时指到 `--sub`。
+/// 菜单 `[3]` 不用它，自己拿变体组织两行（不提命令行）。
+fn no_nodes_display(skipped: usize, schemes: &[String], has_http: bool) -> String {
+    let mut msg = no_nodes_summary(skipped, schemes);
+    if has_http {
+        msg.push_str("；订阅地址请用 bui-c import --sub <url>");
+    }
+    msg
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

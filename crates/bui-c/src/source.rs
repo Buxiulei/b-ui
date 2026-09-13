@@ -198,7 +198,9 @@ pub fn from_subscription<N: Net>(net: &N, url: &str) -> Result<Fetched> {
 /// 粘贴来源：用户手抄的节点链接，没有用户名。
 ///
 /// http(s) 行不再整批拒绝：与不支持的 scheme 一样记进 `skipped`，同一次粘贴里能用的节点
-/// 照样导入。一个都解析不出来时，报错里列出全部（去重的）脱敏 scheme。
+/// 照样导入。一个都解析不出来时返回 [`Error::NoNodes`]（全部去重的脱敏 scheme）：
+/// 命令行 `bui-c import -` 与菜单 `[3]` 都会走到这里，下一步该怎么做两边说法不同，
+/// 由各自的出口组织文案。
 pub fn from_uris(lines: &[String]) -> Result<Fetched> {
     let f = collect(lines);
     if !f.nodes.is_empty() {
@@ -207,22 +209,17 @@ pub fn from_uris(lines: &[String]) -> Result<Fetched> {
     if f.skipped.is_empty() {
         return Err(Error::msg("没有输入任何链接"));
     }
-    let mut schemes: Vec<&str> = Vec::new();
+    let mut schemes: Vec<String> = Vec::new();
     for s in &f.skipped {
-        if !schemes.contains(&s.as_str()) {
-            schemes.push(s);
+        if !schemes.contains(s) {
+            schemes.push(s.clone());
         }
     }
-    let mut msg = format!(
-        "没有可用节点：{} 行无法解析（{}），只支持 hysteria2:// 与 vless://",
-        f.skipped.len(),
-        schemes.join("、")
-    );
-    if lines.iter().any(|l| is_http_url(l)) {
-        // 命令行 `bui-c import -` 与菜单 [3] 都会走到这里：说法得两边都成立
-        msg.push_str("。订阅地址请用 `bui-c import --sub <url>`，或在菜单 [3] 里单独粘贴一行");
-    }
-    Err(Error::msg(msg))
+    Err(Error::NoNodes {
+        skipped: f.skipped.len(),
+        schemes,
+        has_http: lines.iter().any(|l| is_http_url(l)),
+    })
 }
 
 fn collect(lines: &[String]) -> Fetched {
@@ -419,19 +416,22 @@ mod tests {
     fn from_uris_rejects_http_urls_with_a_pointer_to_the_right_flag() {
         // v3 的 tui_import_node 在这里指向一个已经死掉的订阅导入分支（审计 client-C7）
         let e = from_uris(&["https://panel.example.com/api/sub/alice".to_string()]).unwrap_err();
-        let msg = e.to_string();
         assert!(
-            msg.contains("--sub"),
-            "订阅地址要指向 `bui-c import --sub <url>`：{msg}"
+            matches!(
+                &e,
+                crate::Error::NoNodes { skipped: 1, schemes, has_http: true }
+                    if schemes == &["https://".to_string()]
+            ),
+            "{e:?}"
+        );
+        // Display 只给命令行用（菜单拿变体自己组织文案），所以只指向 --sub，不再提菜单
+        assert_eq!(
+            e.to_string(),
+            "没有可用节点（1 行无法解析：https://），只支持 hysteria2:// 与 vless://；订阅地址请用 bui-c import --sub <url>"
         );
         assert!(
-            msg.contains("或在菜单 [3] 里单独粘贴一行"),
-            "这条错误在命令行 `bui-c import -` 与菜单里都会出现，说法要两边都成立：{msg}"
-        );
-        assert!(msg.contains("https://"), "列出脱敏后的 scheme：{msg}");
-        assert!(
-            !msg.contains("alice"),
-            "订阅路径里的用户名不能带出来：{msg}"
+            !e.to_string().contains("alice"),
+            "订阅路径里的用户名不能带出来：{e}"
         );
     }
 
@@ -457,19 +457,29 @@ mod tests {
             "# 注释行".to_string(),
             "ss://secret-c@h:3#z".to_string(),
         ];
-        let msg = from_uris(&lines).unwrap_err().to_string();
-        for want in ["ss://", "trojan://", NO_SCHEME, "hysteria2://", "vless://"] {
-            assert!(msg.contains(want), "缺 {want}：{msg}");
-        }
+        let e = from_uris(&lines).unwrap_err();
+        assert!(
+            matches!(
+                &e,
+                crate::Error::NoNodes { skipped: 4, schemes, has_http: false }
+                    if schemes == &["ss://", "trojan://", NO_SCHEME]
+            ),
+            "行数按去重前算，scheme 去重：{e:?}"
+        );
+        let msg = e.to_string();
+        assert_eq!(
+            msg,
+            "没有可用节点（4 行无法解析：ss://、trojan://、(无 scheme)），只支持 hysteria2:// 与 vless://"
+        );
         assert!(!msg.contains("secret"), "只列 scheme，不带内容：{msg}");
         assert!(!msg.contains("--sub"), "没有 http(s) 行就别提订阅：{msg}");
     }
 
     #[test]
     fn from_uris_with_only_blank_lines_says_nothing_was_entered() {
-        let msg = from_uris(&[String::new(), "   ".to_string()])
-            .unwrap_err()
-            .to_string();
+        let e = from_uris(&[String::new(), "   ".to_string()]).unwrap_err();
+        assert!(matches!(e, crate::Error::Msg(_)), "不是 NoNodes：{e:?}");
+        let msg = e.to_string();
         assert!(msg.contains("没有输入任何链接"), "{msg}");
         assert!(!msg.contains("0 行"), "别报「0 行无法解析」：{msg}");
     }

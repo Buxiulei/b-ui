@@ -904,9 +904,27 @@ fn menu_import<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<
             save_import(ctx, inc, false)
         }),
     };
-    if let Err(e) = imported {
-        ctx.say(format!("失败：{e}"));
-        return Ok(());
+    match imported {
+        Ok(()) => {}
+        // 人就在菜单 [3] 里：不提命令行、不提「菜单 [3]」
+        Err(Error::NoNodes {
+            skipped,
+            schemes,
+            has_http,
+        }) => {
+            ctx.say(format!(
+                "失败：{}",
+                crate::error::no_nodes_summary(skipped, &schemes)
+            ));
+            if has_http {
+                ctx.say("订阅地址请单独粘贴一行再回车");
+            }
+            return Ok(());
+        }
+        Err(e) => {
+            ctx.say(format!("失败：{e}"));
+            return Ok(());
+        }
     }
     let after = Profiles::load(ctx.sys, ctx.paths)?;
     let fresh: Vec<&str> = after
@@ -2496,6 +2514,58 @@ mod tests {
             "提示要说清楚两种都能贴：{:?}",
             p.asked
         );
+    }
+
+    #[test]
+    fn menu_import_unparsable_paste_says_what_to_do_in_menu_terms() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        profiles_socks().save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        // 两行一起贴：不支持的 ss:// + 订阅地址（单独一行才会被当成订阅）
+        let mut p = Scripted::from([
+            "3",
+            "ss://secret@h:1#x",
+            "https://panel.example.com/api/sub/alice",
+            "",
+            "0",
+        ]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        let at = t
+            .lines()
+            .position(|l| l.starts_with("  失败："))
+            .unwrap_or_else(|| panic!("{t}"));
+        let lines: Vec<&str> = t.lines().collect();
+        assert_eq!(
+            lines[at..at + 2],
+            [
+                "  失败：没有可用节点（2 行无法解析：ss://、https://），只支持 hysteria2:// 与 vless://",
+                "  订阅地址请单独粘贴一行再回车",
+            ],
+            "\n{t}"
+        );
+        assert!(!t.contains("bui-c import"), "菜单里不提命令行：{t}");
+        assert!(!t.contains("菜单 [3]"), "人就在菜单 [3] 里：{t}");
+        assert!(
+            !t.contains("节点："),
+            "不出现「失败：没有可用节点：」双冒号：{t}"
+        );
+        assert!(!t.contains("secret"), "{t}");
+
+        // 没有 http(s) 行：只有第一行
+        let mut p = Scripted::from(["3", "trojan://secret@h:2#y", "", "0"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert!(
+            t.lines().any(|l| l
+                == "  失败：没有可用节点（1 行无法解析：trojan://），只支持 hysteria2:// 与 vless://"),
+            "{t}"
+        );
+        assert!(!t.contains("订阅地址"), "{t}");
     }
 
     #[test]
