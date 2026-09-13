@@ -554,11 +554,17 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
             let want: Mode = (*mode).into();
             prof.mode = want;
             prof.save(ctx.sys, ctx.paths)?;
+            let label = match want {
+                Mode::Tun => "TUN",
+                Mode::Socks => "SOCKS",
+            };
+            // 还没有节点：只记下选择。apply 会先去下内核、改 UFW，最后才因为没有节点失败
+            if prof.active_profile().is_none() {
+                ctx.say(format!("已记下 {label} 模式，导入节点后生效"));
+                return Ok(());
+            }
             apply_with_ufw(ctx, &prof)?;
-            ctx.say(match want {
-                Mode::Tun => "已切到 TUN 模式",
-                Mode::Socks => "已切到 SOCKS 模式",
-            });
+            ctx.say(format!("已切到 {label} 模式"));
             Ok(())
         }
         Cmd::Import {
@@ -1510,6 +1516,31 @@ mod tests {
             Some("alice-hy2-direct")
         );
         assert!(!s.called("systemctl restart bui-c.service"));
+    }
+
+    #[test]
+    fn mode_without_any_node_only_records_the_choice() {
+        // 新机器还没导入节点就按 [2]：以前先下 81MB 内核、改 UFW，最后才报「没有激活的节点」
+        let pp = paths();
+        let s = FakeSys::new(); // 没有内核、没有单元、没有 profiles.json
+        let n = FakeNet::new();
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["mode", "tun"]), &mut ctx).unwrap();
+        assert_eq!(Profiles::load(&s, &pp).unwrap().mode, Mode::Tun);
+        assert!(n.log().is_empty(), "不该去下内核：{:?}", n.log());
+        assert!(
+            !s.calls()
+                .iter()
+                .any(|c| c.starts_with("systemctl") || c.starts_with("ufw")),
+            "没有节点就不动服务与防火墙：{:?}",
+            s.calls()
+        );
+        assert!(
+            ctx.transcript.contains("导入节点后生效"),
+            "{}",
+            ctx.transcript
+        );
     }
 
     #[test]
