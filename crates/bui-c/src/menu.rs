@@ -9,10 +9,6 @@ use std::collections::VecDeque;
 /// 两列菜单左栏的列宽（按 [`display_width`] 计）。
 pub const LEFT_WIDTH: usize = 14;
 
-/// 选项块分隔线的列宽 = 两列选项的宽度：`[n] ` 4 + 左栏 LEFT_WIDTH + 栏距 2 +
-/// 右栏 `[2] 切到 SOCKS` 14。写死 9 格的短线看着像断了。
-const RULE_WIDTH: usize = 4 + LEFT_WIDTH + 2 + 14;
-
 /// 交互输入：真实终端用 [`Stdin`]，测试与 `--yes` 路径用 [`Scripted`]。
 pub trait Prompt {
     /// 读一行（去首尾空白）；EOF 返回 `None`。主菜单靠它区分「回车」（重画）与「EOF」（退出）。
@@ -279,16 +275,31 @@ pub fn render_options(st: &Status) -> String {
         Mode::Tun => "切到 SOCKS",
         Mode::Socks => "切到 TUN",
     };
-    out.push_str(&row("1", "切换节点", "2", to_mode));
-    out.push_str(&row("3", "导入节点", "4", "服务控制"));
-    out.push_str(&row("5", "连接检查", "6", update));
-    out.push_str(&row("7", "从 v3 导入", "8", "卸载"));
-    // 第 9 项单独一行：spec §6 的「每日自动更新，可关」需要一个用户能点的开关
+    let rows = [
+        row("1", "切换节点", "2", to_mode),
+        row("3", "导入节点", "4", "服务控制"),
+        row("5", "连接检查", "6", update),
+        row("7", "从 v3 导入", "8", "卸载"),
+        // 第 9 项单独一行：spec §6 的「每日自动更新，可关」需要一个用户能点的开关
+        format!(
+            "     [9] 自动更新 {}\n",
+            if st.auto_update { "开" } else { "关" }
+        ),
+    ];
+    // 分隔线跟实际最宽的那行选项等宽：[2] 的目标模式与 [6] 的「★ 有新版」都会改变行宽，
+    // 写死的线要么比选项长、要么短一截
+    let widest = rows
+        .iter()
+        .map(|r| display_width(r.trim_end()))
+        .max()
+        .unwrap_or(0);
+    for r in &rows {
+        out.push_str(r);
+    }
     out.push_str(&format!(
-        "     [9] 自动更新 {}\n",
-        if st.auto_update { "开" } else { "关" }
+        "     {}\n",
+        "\u{2500}".repeat(widest.saturating_sub(5))
     ));
-    out.push_str(&format!("     {}\n", "\u{2500}".repeat(RULE_WIDTH)));
     out.push_str("     [0] 退出\n");
     out
 }
@@ -560,21 +571,37 @@ mod tests {
     }
 
     #[test]
-    fn options_rule_is_as_wide_as_the_two_columns() {
-        let out = render_options(&st());
-        let rule = out.lines().find(|l| l.contains('─')).unwrap();
-        let row1 = out.lines().find(|l| l.contains("[1]")).unwrap();
-        assert_eq!(
-            display_width(rule.trim_start()),
-            display_width(row1.trim_start()),
-            "分隔线要跟两列选项等宽\n{out}"
-        );
-        assert_eq!(display_width(rule.trim_start()), 34, "{rule:?}");
-        assert_eq!(
-            rule.len() - rule.trim_start().len(),
-            row1.len() - row1.trim_start().len(),
-            "缩进也要一致"
-        );
+    fn options_rule_ends_where_the_widest_option_row_ends() {
+        // 写死 34 列：SOCKS 模式（[2] 切到 TUN）比选项长 2 列，有新版时又比 [6] 那行短 8 列
+        let tun = st();
+        let socks = Status {
+            mode: Mode::Socks,
+            ..st()
+        };
+        let update = Status {
+            update_available: true,
+            ..st()
+        };
+        for (case, s) in [("TUN", tun), ("SOCKS", socks), ("有新版", update)] {
+            let out = render_options(&s);
+            let rule = out.lines().find(|l| l.contains('─')).unwrap();
+            let widest = out
+                .lines()
+                .filter(|l| (1..=9).any(|n| l.contains(&format!("[{n}]"))))
+                .map(display_width)
+                .max()
+                .unwrap();
+            assert_eq!(
+                display_width(rule),
+                widest,
+                "{case}：分隔线结束列要等于最宽选项行的结束列\n{out}"
+            );
+            assert_eq!(
+                rule.len() - rule.trim_start().len(),
+                5,
+                "与选项同为 5 列缩进"
+            );
+        }
     }
 
     #[test]
