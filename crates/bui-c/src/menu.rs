@@ -2,12 +2,15 @@
 //!
 //! 渲染输出不含 ANSI 颜色：颜色会让快照测试变脆，可读性靠对齐与 `●`/`○`/`★` 够用。
 
-use crate::profiles::{Mode, Profiles};
+use crate::profiles::{kind_slug, Mode, Profile, Profiles};
 use crate::{Error, Result};
 use std::collections::VecDeque;
 
 /// 两列菜单左栏的列宽（按 [`display_width`] 计）。
 pub const LEFT_WIDTH: usize = 14;
+
+/// 节点列表里名字列的封顶列宽：再长就破格，不拖着所有行一起变宽。
+pub const NAME_CAP: usize = 40;
 
 /// 交互输入：真实终端用 [`Stdin`]，测试与 `--yes` 路径用 [`Scripted`]。
 pub trait Prompt {
@@ -238,6 +241,20 @@ pub fn render_nodes(prof: &Profiles, with_back: bool) -> String {
             "  没有节点，先 `bui-c import …`\n".to_string()
         };
     }
+    // 列宽跟着本次列表最宽的那个走：真机上名字从 3 列（v3 目录名）到 38 列都有，
+    // 写死 26 会让长名字挤掉后面所有列。超过 NAME_CAP 的名字原样输出（破格），
+    // 后面只留两个空格——宁可一行歪，也不让所有行为它变宽。
+    let width = |f: fn(&Profile) -> &str, cap: usize| {
+        prof.profiles
+            .iter()
+            .map(|p| display_width(f(p)))
+            .max()
+            .unwrap_or(0)
+            .min(cap)
+    };
+    let name_w = width(|p| p.name.as_str(), NAME_CAP);
+    let label_w = width(|p| p.node.label.as_str(), usize::MAX);
+    let kind_w = width(|p| kind_slug(p.node.kind), usize::MAX);
     let mut out = String::new();
     for (i, p) in prof.profiles.iter().enumerate() {
         let mark = if prof.active.as_deref() == Some(p.name.as_str()) {
@@ -246,10 +263,13 @@ pub fn render_nodes(prof: &Profiles, with_back: bool) -> String {
             ""
         };
         out.push_str(&format!(
-            "  [{}] {}  {}{}\n",
+            "  [{}] {}  {}  {}  {}:{}{}\n",
             i + 1,
-            pad(&p.name, 26),
-            p.node.label,
+            pad(&p.name, name_w),
+            pad(&p.node.label, label_w),
+            pad(kind_slug(p.node.kind), kind_w),
+            p.node.host,
+            p.node.port,
             mark
         ));
     }
@@ -289,7 +309,7 @@ pub fn pick_index(input: &str, len: usize) -> Option<usize> {
 mod tests {
     use super::*;
     use crate::profiles::{Mode, Profile, Profiles, Source};
-    use crate::testutil::{hy2_direct_node, reality_direct_node, split_global};
+    use crate::testutil::{hy2_direct_node, hy2_resi_node, reality_direct_node, split_global};
     use pretty_assertions::assert_eq;
 
     fn st() -> Status {
@@ -463,6 +483,100 @@ mod tests {
         let empty = render_nodes(&Profiles::new_default(), false);
         assert!(empty.contains("bui-c import"), "{empty}");
         assert!(!empty.contains("主菜单"), "{empty}");
+    }
+
+    /// 行里 `label` 之前占了多少列——用来断言各行的 label 起始列一致。
+    fn label_col(line: &str, label: &str) -> usize {
+        let i = line
+            .find(label)
+            .unwrap_or_else(|| panic!("行里没有 {label}：{line}"));
+        display_width(&line[..i])
+    }
+
+    fn named(name: &str, node: bui_schema::nodes::Node) -> Profile {
+        Profile {
+            name: name.into(),
+            node,
+            split: split_global(),
+            source: Source::ApiNodes,
+            imported_at: "2026-09-11T00:00:00Z".into(),
+        }
+    }
+
+    fn reality_resi_node() -> bui_schema::nodes::Node {
+        bui_schema::nodes::Node {
+            kind: bui_schema::nodes::NodeKind::RealityResidential,
+            label: "Reality住宅".into(),
+            port: 10002,
+            ..reality_direct_node()
+        }
+    }
+
+    #[test]
+    fn node_list_columns_align_and_show_kind_and_endpoint() {
+        // 真机上的混排：38 列的长名字 + 3 列的 v3 目录名
+        let long = "rick-node.example-a.net-reality-direct";
+        assert_eq!(display_width(long), 38, "样例得是 38 列");
+        let mut p = Profiles::new_default();
+        for (n, node) in [
+            (long, reality_direct_node()),
+            ("HY2", hy2_direct_node()),
+            ("reality-Reality", reality_resi_node()),
+            ("hysteria2-1778329470", hy2_resi_node()),
+        ] {
+            p.upsert(named(n, node));
+        }
+        let out = render_nodes(&p, true);
+        let rows: Vec<&str> = out.lines().filter(|l| !l.contains("[0]")).collect();
+        assert_eq!(rows.len(), 4, "{out}");
+
+        // label 列起始列必须一致（截屏里四行各自起始列不同就是这条）
+        let cols: Vec<usize> = rows
+            .iter()
+            .zip(["Reality直连", "HY2直连", "Reality住宅", "HY2住宅"])
+            .map(|(l, lb)| label_col(l, lb))
+            .collect();
+        assert!(
+            cols.windows(2).all(|w| w[0] == w[1]),
+            "label 起始列 {cols:?}\n{out}"
+        );
+
+        // 每行多一列 kind + host:port
+        for (l, kind) in
+            rows.iter()
+                .zip(["reality-direct", "hy2-direct", "reality-resi", "hy2-resi"])
+        {
+            assert!(l.contains(kind), "{l}");
+            assert!(l.contains("panel.example.com:"), "{l}");
+        }
+        assert!(rows[1].contains("panel.example.com:10000"), "{}", rows[1]);
+        assert!(rows[3].contains("panel.example.com:40000"), "{}", rows[3]);
+    }
+
+    #[test]
+    fn node_name_column_follows_the_widest_name_and_caps_at_40() {
+        let mut narrow = Profiles::new_default();
+        narrow.upsert(named("HY2", hy2_direct_node()));
+        let line = render_nodes(&narrow, false);
+        assert!(
+            line.starts_with("  [1] HY2  HY2直连"),
+            "短名字不再补到写死的 26 列：{line:?}"
+        );
+
+        // 超过 40 列的名字原样输出，后面只留两个空格
+        let huge = "x".repeat(45);
+        let mut wide = Profiles::new_default();
+        wide.upsert(named(&huge, hy2_direct_node()));
+        wide.upsert(named("HY2", reality_direct_node()));
+        let out = render_nodes(&wide, false);
+        let rows: Vec<&str> = out.lines().collect();
+        assert!(rows[0].contains(&format!("{huge}  HY2直连")), "{}", rows[0]);
+        assert_eq!(
+            label_col(rows[1], "Reality直连"),
+            6 + 40 + 2,
+            "其余名字补到封顶的 40 列：{}",
+            rows[1]
+        );
     }
 
     #[test]
