@@ -170,6 +170,9 @@ async fn create_user(State(app): State<AppState>, body: Bytes) -> Response {
     ok_json(json!({
         "success": true,
         "user": user.username,
+        // 建号即生成（`users::new_user`）；与 `rotate_user` 同口径一起回包，
+        // 省掉前端「建完再 GET /api/users 才拿得到订阅链接末段」那一次往返（审查意见④）
+        "subToken": user.sub_token,
         "password": user.credentials.hy2_password,
         "uuid": user.credentials.vless_uuid,
         // 回显真正生效的 SNI（v4 全局唯一），请求里的 `sni` 被忽略（决策 D13）
@@ -244,6 +247,11 @@ async fn update_user(
 /// 所以不踢的话拿着泄露凭据的那一方照旧有流量，直到连接自己断 —— 那就不叫轮换了。
 /// 踢是 best-effort（失败只记 warn）：新凭据已经落盘生效，踢不动只是旧会话多活一会儿。
 ///
+/// URL 里的用户名**只用来查**，不跑 `validate_username`（审查意见③，与 `delete_user` 同口径）：
+/// `v3.rs` 的导入原样照抄 v3 的 `username`、v3 的 `server/core.sh` 也能直接往用户表里塞人，
+/// 所以存量里可能有不合今天规则的名字。卡在校验上会让这种用户能改、能删、能取订阅，
+/// 却永远轮换不了 —— 而他恰恰是最该轮换的那个。查不到一律 404。
+///
 /// 两个已知边界，都不在本次范围内：
 /// - Reality 那条**已建立**的连接没有对应手段（xray 没有 kick），要等它自己断；
 /// - 踢的是「这一刻的期望态里该有的」全部 hy2 实例（`traffic::stats_ports`），
@@ -253,9 +261,6 @@ async fn rotate_user(
     Path(username): Path<String>,
     shared: Arc<Shared>,
 ) -> Response {
-    if let Err(e) = users::validate_username(&username) {
-        return fail(StatusCode::BAD_REQUEST, format!("URL 中的 {e}"));
-    }
     let mut rotated: Option<bui_schema::model::User> = None;
     if let Err(e) = app
         .store
@@ -609,6 +614,14 @@ mod tests {
             "回显真正生效的 SNI，不是请求里那个（决策 D13）"
         );
         assert!(v["uuid"].as_str().is_some());
+        // 审查意见④：建号即生成 token，回包就带上，前端不必再 GET /api/users 拼链接
+        let tok = v["subToken"].as_str().expect("回包必须带 subToken");
+        assert!(bui_schema::sub::is_sub_token(tok), "{tok}");
+        assert_eq!(
+            h.store.read().await.users[1].sub_token.as_deref(),
+            Some(tok),
+            "回包给的就是落盘的那一个"
+        );
         assert_eq!(h.store.read().await.users.len(), 2);
         assert_eq!(
             rx.try_recv().unwrap(),
@@ -754,7 +767,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rotating_an_unknown_or_illegal_username_changes_nothing() {
+    async fn rotating_an_unknown_username_changes_nothing() {
         let h = harness().await;
         let (r, t) = app(&h).await;
         let before = h.store.read().await.users[0].clone();
@@ -768,10 +781,44 @@ mod tests {
         .await;
         assert_eq!(s, axum::http::StatusCode::NOT_FOUND);
         assert_eq!(v["error"], "User not found");
-        let (s2, _) = send(&r, "POST", "/api/users/a%2Fb/rotate", Some(&t), None).await;
-        assert_eq!(s2, axum::http::StatusCode::BAD_REQUEST);
+        // 不合今天规则的名字也只是「查不到」⇒ 404，不是 400（审查意见③）
+        let (s2, v2) = send(&r, "POST", "/api/users/a%2Fb/rotate", Some(&t), None).await;
+        assert_eq!(s2, axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(v2["error"], "User not found");
         assert_eq!(h.store.read().await.users[0], before, "一个字段都不许动");
         assert!(h.hy2.calls().is_empty(), "也不许踢任何人下线");
+    }
+
+    /// 审查意见③：v3 导入 / v3 的 `server/core.sh` 都能留下不合今天规则的用户名
+    /// （`validate_username` 只放过字母数字与 `_-.`）。这种用户能改、能删、能取订阅，
+    /// 所以也必须能轮换 —— 他恰恰是最该轮换的那个。
+    #[tokio::test]
+    async fn a_legacy_username_that_fails_todays_rules_can_still_be_rotated() {
+        let h = harness().await;
+        let (r, t) = app(&h).await;
+        let legacy = "alice@old";
+        assert!(
+            users::validate_username(legacy).is_err(),
+            "这个名字今天建不出来，只可能是存量"
+        );
+        h.store
+            .update(|s| s.users[0].username = legacy.into())
+            .await
+            .unwrap();
+        let before = h.store.read().await.users[0].clone();
+        let (s, v) = send(
+            &r,
+            "POST",
+            "/api/users/alice%40old/rotate",
+            Some(&t),
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(s, axum::http::StatusCode::OK, "{v}");
+        assert_eq!(v["user"], legacy);
+        let after = h.store.read().await.users[0].clone();
+        assert_ne!(after.sub_token, before.sub_token);
+        assert_ne!(after.credentials.vless_uuid, before.credentials.vless_uuid);
     }
 
     #[tokio::test]

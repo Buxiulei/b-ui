@@ -7,8 +7,17 @@ use uuid::Uuid;
 
 #[derive(Default)]
 pub struct FakeXrayInner {
-    /// `"add:<tag>:<user_id>:<uuid>"` / `"remove:<tag>:<user_id>"` / `"query"`
+    /// **写**与统计的调用：`"add:<tag>:<user_id>:<uuid>"` / `"remove:<tag>:<user_id>"` /
+    /// `"query"` / `"add-rule:…"` / `"remove-rule:…"` / `"list-rules"`。
+    /// `inbound_user_uuid` 那种纯读调用记在 [`FakeXrayInner::gets`]，不混进来 ——
+    /// 断言「这一轮没动内核」看的就是本列表。
     pub calls: Vec<String>,
+    /// `inbound_user_uuid` 的调用：`"get:<tag>:<user_id>"`
+    pub gets: Vec<String>,
+    /// 内核里「现在挂着」的用户：`(tag, user_id)` → vless uuid。`add_user` / `remove_user`
+    /// 成功时跟着变，`inbound_user_uuid` 从这里读 —— 测试要模拟「内核里挂着旧 uuid」
+    /// 直接往这里塞（`sync_users` 先读后写，光靠 `error_text` 已经描述不了内核状态）。
+    pub users: BTreeMap<(String, Uuid), Uuid>,
     /// `query_user_deltas` 的下一次返回值（返回后清空，对应 `reset=true` 语义）
     pub deltas: BTreeMap<String, TxRx>,
     /// 命中就返回 `Err`，用来测退路
@@ -47,7 +56,13 @@ impl FakeXray {
     }
 
     pub fn clear_calls(&self) {
-        self.0.lock().unwrap().calls.clear();
+        let mut i = self.0.lock().unwrap();
+        i.calls.clear();
+        i.gets.clear();
+    }
+
+    pub fn gets(&self) -> Vec<String> {
+        self.0.lock().unwrap().gets.clone()
     }
 
     pub fn rules(&self) -> Vec<(String, String)> {
@@ -69,6 +84,7 @@ impl XrayApi for FakeXray {
                 .unwrap_or_else(|| format!("fake AddUser 失败：{key}"));
             anyhow::bail!("{msg}");
         }
+        i.users.insert((tag.to_string(), user_id), vless_uuid);
         Ok(())
     }
 
@@ -84,7 +100,23 @@ impl XrayApi for FakeXray {
                 .unwrap_or_else(|| format!("fake RemoveUser 失败：{key}"));
             anyhow::bail!("{msg}");
         }
+        i.users.remove(&(tag.to_string(), user_id));
         Ok(())
+    }
+
+    async fn inbound_user_uuid(&self, tag: &str, user_id: Uuid) -> anyhow::Result<Option<Uuid>> {
+        let key = format!("get:{tag}:{user_id}");
+        let mut i = self.0.lock().unwrap();
+        i.gets.push(key.clone());
+        if i.fail_on.contains(&key) {
+            let msg = i
+                .error_text
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| format!("fake GetInboundUsers 失败：{key}"));
+            anyhow::bail!("{msg}");
+        }
+        Ok(i.users.get(&(tag.to_string(), user_id)).copied())
     }
 
     async fn query_user_deltas(&self) -> anyhow::Result<BTreeMap<String, TxRx>> {
