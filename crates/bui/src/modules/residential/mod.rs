@@ -141,13 +141,16 @@ pub const BASE_PORTS: [u16; 2] = [80, 443];
 pub const PORT_PROBE_HOST: &str = "www.gstatic.com";
 /// 固定端口集各自的真实目标主机：必须是**真在那个端口上监听**的站点，否则上游放行了
 /// 该端口、目标却不监听时上游回 502/504，会被记成「端口被拒」。
-/// 8080 没有公认的公共监听点，退回中性主机（[`port_probe_host`] 的缺省分支）。
-pub const PORT_PROBE_HOSTS: [(u16, &str); 5] = [
+/// 没有公认公共监听点的端口（8080）打 `portquiz.net`：它在所有 TCP 端口监听，专为出站
+/// 端口测试设计。打中性主机不行——`www.gstatic.com` 的 8080 没监听，恒判 unreachable，
+/// 抖动保护于是让任何上游都学不出结论（2026-09-13 真机）。
+pub const PORT_PROBE_HOSTS: [(u16, &str); 6] = [
     (5228, "mtalk.google.com"),       // FCM（调研 §8 的实测目标）
     (5223, "courier.push.apple.com"), // APNs（同上）
     (993, "imap.gmail.com"),          // IMAPS
     (22, "github.com"),               // SSH
     (853, "dns.google"),              // DoT
+    (8080, "portquiz.net"),           // 全端口监听的出站端口测试站
 ];
 
 /// 槽 `index` 的 selector tag，与 `bui_schema::render::relay` 的 `selector_tag` 同规则。
@@ -156,7 +159,7 @@ pub fn slot_selector(index: u16) -> String {
     format!("slot-{index}-pool")
 }
 
-/// 端口 → 探测目标主机。表里有就用真实主机，其余（基准 80/443 与 8080）用中性主机。
+/// 端口 → 探测目标主机。表里有就用真实主机，其余（基准 80/443）用中性主机。
 pub fn port_probe_host(port: u16) -> &'static str {
     PORT_PROBE_HOSTS
         .iter()
@@ -414,7 +417,9 @@ mod tests {
         assert_eq!(port_probe_host(993), "imap.gmail.com");
         assert_eq!(port_probe_host(22), "github.com");
         assert_eq!(port_probe_host(853), "dns.google");
-        assert_eq!(port_probe_host(8080), PORT_PROBE_HOST, "8080 无公共监听点");
+        // 8080 没有公认的公共监听点：打中性主机会恒 unreachable（2026-09-13 真机），
+        // 抖动保护于是让任何上游都学不出结论。portquiz.net 在所有 TCP 端口监听
+        assert_eq!(port_probe_host(8080), "portquiz.net");
         assert_eq!(PAY_HOSTS[1], "pay.google.com");
         // 这两个 host 必须与对应 URL 的主机名严格一致：CONNECT 补判（T3
         // confirm_auth_failure）拿它们去开隧道，写歪了就补判到别的站点上去了

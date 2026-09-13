@@ -1154,6 +1154,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn port_8080_is_probed_on_portquiz_so_an_all_open_upstream_learns_unrestricted() {
+        // 2026-09-13 真机（Decodo SOCKS5 10001）：993 / 22 / 5228 / 853 / 443 全通、
+        // portquiz.net:8080 HTTP 200。以前 8080 打中性主机 www.gstatic.com（8080 无监听）
+        // ⇒ 恒 unreachable ⇒ 抖动保护让任何上游都学不出结论。
+        let d = tempfile::tempdir().unwrap();
+        let ctx = store_ctx(&d, Some(vec![80, 443])).await;
+        let neutral_8080_dead = |i: &mut crate::modules::residential::proxy::FakeProberInner| {
+            i.connects.insert(
+                "www.gstatic.com:8080".into(),
+                ConnectVerdict::Unreachable {
+                    detail: "timeout".into(),
+                },
+            );
+        };
+        // portquiz.net 自己这一轮抖了：抖动保护照旧，已学到的白名单一个字节都不动
+        let flaky = std::sync::Arc::new(FakeProber::new());
+        flaky.with(|i| {
+            neutral_8080_dead(i);
+            i.connects.insert(
+                "portquiz.net:8080".into(),
+                ConnectVerdict::Unreachable {
+                    detail: "timeout".into(),
+                },
+            );
+        });
+        let r = run_and_store(&ctx, flaky, up().id).await.unwrap();
+        assert_eq!(r.ports[&8080], "unreachable");
+        assert_eq!(stored_ports(&ctx).await, Some(vec![80, 443]));
+        // 干净一轮：8080 打 portquiz.net，全通 ⇒ 学成「不限」并写回
+        let p = std::sync::Arc::new(FakeProber::new());
+        p.with(neutral_8080_dead);
+        let r = run_and_store(&ctx, p.clone(), up().id).await.unwrap();
+        let calls = p.calls();
+        assert!(
+            calls.iter().any(|c| c == "connect:portquiz.net:8080"),
+            "{calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c == "connect:www.gstatic.com:8080"),
+            "{calls:?}"
+        );
+        assert_eq!(r.ports[&8080], "open");
+        assert_eq!(r.ports_allowed, None, "全通 ⇒ 不限");
+        assert_eq!(stored_ports(&ctx).await, None, "干净一轮的「不限」是真结论");
+    }
+
+    #[tokio::test]
     async fn a_manual_check_carries_a_full_speedtest_and_the_udp_exit_ip() {
         // 主理人 2026-09-12：「手动体检（check / POST /api/residential/check）附带一次全量测速」
         let d = tempfile::tempdir().unwrap();

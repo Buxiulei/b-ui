@@ -860,6 +860,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn only_a_socks5_ruleset_rejection_becomes_a_candidate() {
+        // 2026-09-13 真机原文（经 Decodo SOCKS5）：sing-box 把 SOCKS5 REP 写成
+        // `socks5: request rejected, code=<REP>`。REP=2（connection not allowed by ruleset）
+        // 才是上游的策略拒绝；REP=1（通用失败）/ 4（主机不可达）是目标或网络的问题，
+        // 学进黑名单等于把目标自己的故障判成「这个上游代理不了它」
+        const CODE2: &str = "connection: open connection to smtp.gmail.com:465 using outbound/socks[resi-1]: socks5: request rejected, code=2";
+        const CODE4: &str = "connection: open connection to gateway.push.apple.com:5223 using outbound/socks[resi-1]: socks5: request rejected, code=4";
+        const CODE1: &str = "connection: open connection to flaky.example.com:443 using outbound/socks[resi-1]: socks5: request rejected, code=1";
+        let d = tempfile::tempdir().unwrap();
+        let (c, host) = ctx(&d).await;
+        // 端口都在白名单里：本测试只看 REP 码，不让端口裁决把结论掩盖掉
+        rstate::update_group(&c.store, &c.bus, |g| {
+            g.upstreams[0].kind = UpstreamKind::Socks5;
+            g.upstreams[0].ports_allowed = Some(vec![80, 443, 465, 5223]);
+        })
+        .await
+        .unwrap();
+        host.with(|i| {
+            i.scripted.push((
+                format!(
+                    "journalctl -u {} --no-pager",
+                    crate::modules::residential::JOURNAL_UNIT
+                ),
+                CmdOut::success(&format!(
+                    "{CODE2}\n{CODE4}\n{CODE4}\n{CODE4}\n{CODE1}\n{CODE1}\n{CODE1}\n-- cursor: s=1\n"
+                )),
+            ));
+        });
+        assert_eq!(
+            learn_from_journal(&c).await.unwrap(),
+            1,
+            "只有 code=2 那条计候选"
+        );
+        let r = rstate::read(&c.runtime).await;
+        assert_eq!(
+            r.candidates.keys().cloned().collect::<Vec<_>>(),
+            vec![candidate_key(Uuid::from_u128(1), "smtp.gmail.com", 465)],
+            "code=4 / code=1 不进候选"
+        );
+    }
+
+    #[tokio::test]
     async fn a_missing_journalctl_only_alerts() {
         let d = tempfile::tempdir().unwrap();
         let (c, host) = ctx(&d).await;
@@ -1356,7 +1398,7 @@ mod tests {
                 "imap.gmail.com:993",
                 "github.com:22",
                 "dns.google:853",
-                "www.gstatic.com:8080",
+                "portquiz.net:8080",
             ],
             &[],
         );
