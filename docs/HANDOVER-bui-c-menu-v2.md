@@ -1,98 +1,160 @@
-# bui-c 菜单 v2（节点管理与界面优化）交接手册
+# bui-c 菜单 v2（删除节点、连接检查补齐、清屏与窄屏）交接手册
 
-> 2026-09-13。给接手 bui-c 下一阶段的 agent / 工程师。先读完 [HANDOVER-bui-c.md](HANDOVER-bui-c.md)（客户端现状、M4 验收、四批菜单修复、约定与边界），再读这份。
-> 公开文档不写真实域名、IP、用户名与凭据。本文用别名：`bwg-rick`（v4 面板）、`bwg-tizi`（仍是 v3 面板）、`baiyi`（国内 Linux 客户端真机，SSH 别名）。真实值在本机 Claude 记忆 `baiyi-linux-client` 里。
+> 2026-09-13 晚，上一会话额度用尽时写。先读 [HANDOVER-bui-c.md](HANDOVER-bui-c.md) 了解客户端全貌，再读这份。
+> 公开文档只用别名与示例值：`bwg-rick`、`bwg-tizi`（服务器）、`baiyi`（国内 Linux 客户端真机，SSH 别名）；示例域名 `rick-node.example-a.net`、`tizi.example.test`。真实值只在本机 Claude 记忆里。
+
+**给下一个 agent 的一句话：** 先读本手册第 3、4 节和计划 `docs/superpowers/plans/2026-09-13-bui-c-menu-v2.md`，从 T7（删除节点）按 brief 开工、T11 分支先送审再合并，每个任务都走「实现 → 审查 → 修复」闭环，推送前用敏感值清单 grep 一遍，永远不要 push `v4`、`main` 以及 `opus/*`、`worktree-agent-*` 分支。
 
 ## 1. 用户要什么
 
-用户看完上一轮报告后的原话：
+- 原话：「bui-c 数字菜单要能删除节点，要考虑更充分，还要优化显示界面和操作，包括 60 列终端下状态行折行的问题」。
+- 追加：[5] 连接检查要对照 v3.6.2 补齐（原来只有一句话）；回菜单要清屏、操作要连贯。
+- 已拍板：删掉的节点记进墓碑，重新导入时先跳过再问要不要加回；主菜单 `[1] 切换 [2] 模式 [3] 导入 [4] 服务控制 [5] 连接检查 [6] 删除节点 [7] 更新与维护 [8] 卸载 [9] 节点测速 [0] 退出`。
+- 硬约束：
+  - 菜单只数字直选，不要箭头、gum、fzf；文案全中文；家人用手机 SSH 登录，40 列左右也要能用。
+  - 凭据不进命令行参数和日志；不改根 `Cargo.toml`（服务端共用）。
+  - 不用 emoji（回复、文档、提交、注释、测试数据都不写 emoji 字面量，要测宽度就写 `\u{…}`）；需要图标时只用 SVG。菜单现有的 ★ ☆ ● ○ ✓ ✗ ▸ 是文本字形，用户确认保留。
+  - 仓库公开，`/api/sub/<用户名>` 免鉴权：代码、文档、commit 只用示例值。
 
-- 「需要有删除选项」——针对「菜单里没有删除节点的入口」。
-- 「考虑更充分一些」。
-- 「优化这个体验，还需要优化显示界面，优化操作」——针对「60 列终端下状态行会折行」和整体菜单体验。
+## 2. 设计与计划（已定稿，都在仓库里）
 
-硬约束（用户持久偏好）：菜单**数字直选**，不要箭头、不要 gum/fzf；全中文；家人会从手机 SSH 客户端登录，窄屏要能用。
+- spec：`docs/superpowers/specs/2026-09-13-bui-c-menu-v2-design.md`。§0.2 的 R1–R16 是规范性覆盖，和正文冲突时以 R 条为准。
+- 计划：`docs/superpowers/plans/2026-09-13-bui-c-menu-v2.md`，任务表在 spec §13.0。顺序：T1→T2→T3→T4→T5∥T6→T7→T7b→T8→T9→T10→T11→T12a→T12b→T12c →**真机验收第一轮**→ T13→T15→T16→T17→T18→T19；T14 随时可做。
+- 关键技术决定（都已写进 spec）：进程锁用 `nix::fcntl::Flock`（现有 features 就够，不改 Cargo）；终端尺寸用 stdout 上一次 `ioctl(TIOCGWINSZ)`（全 crate 唯一的 `unsafe`）；宽度按「容量口径」算（歧义字符算 2 列），固定文案 ≤ 59 列、40 列可辨认；测速走「临时 sing-box + 带随机认证的 socks 入站」，必须 `route.auto_detect_interface: true`。
 
-## 2. 进度
+## 3. 分支与进度
 
-| 阶段 | 状态 |
-|---|---|
-| 客户端缺陷修复、M4 真机验收、菜单三轮真机测试与四批修复 | 完成，分支 `Baiyi/bui-c-completion-aa7d30` 已推到 origin，**未合入 `v4`**，等服务端负责人审查 |
-| 菜单 v2 设计 | **刚开始就中断**：设计 workflow 在「调研」阶段被停止（会话额度用尽），没有产出设计文档 |
-| 菜单 v2 实现、真机验收 | 未开始 |
+### 3.1 分支
 
-分支与合并：
-- 分支从 `6318b77` 起，51 个 commit。与 `origin/v4`（多出 Hysteria2 鉴权改 http 的 3 个 commit）`git merge-tree` 无冲突；合并树在 baiyi 上跑过 fmt / clippy / `cargo test --workspace` / `scripts/tests/run-all.sh`，全绿（`bui` 700 个、`bui-c` 244 个测试）。
-- 推送前把整段历史做了一次脱敏重写：测试与文档里原先出现的真实域名、面板用户名、出口 IP 换成了等长的示例值（`rick-node.example-a.net`、`tizi.example.test`、`示例用户甲`、`示例专用名` 等），列宽断言不受影响。**所以 commit 哈希与会话记录里的不一致**，按 commit 主题找。
-- 本地还留着若干子 agent 的临时分支（`opus/*`、`worktree-agent-*`），它们的历史里有真实值，**不要 push**，确认不用后删掉。
+| 分支（都已推到 origin） | 内容 | 状态 |
+|---|---|---|
+| `Baiyi/bui-c-menu-node-deletion-e6aee1` | 主线，基于 `38e5d79`（当时的 `origin/v4`） | T1–T6、T8、T14 已完成并审查通过；门禁全绿（macOS 与 baiyi Linux，`bui-c` 327 个测试） |
+| `Baiyi/bui-c-menu-v2-t11-nettest` | T11 连接检查，一个提交 `f417b59`，基于主线的 `4f3a854` | 已实现、门禁全绿（317），**未审查**；合进主线时 `cli.rs` / `menu.rs` 会有冲突要手工合 |
 
-baiyi 现场：
-- `/usr/local/bin/bui-c` 是本分支最终源码构建（sha256 前缀 `74555d02`），TUN 模式，9 个节点，活动节点是 v3 迁来的 bwg-tizi 直连 HY2。
-- 其中 1 个节点指向已下线的临时服务器，探测必失败——正是用户想删却删不掉的那个，适合做删除功能的真机验收对象（验收前先备份 `profiles.json`）。
+之前的 `Baiyi/bui-c-completion-aa7d30`、`Baiyi/bui-c-update-sha256` 已由服务端会话合进 `v4`。本机若还有 `opus/*`、`worktree-agent-*` 旧分支，它们历史里有真实值，**绝不能 push**。
 
-## 3. 菜单 v2 的设计输入（已收集到的事实）
+### 3.2 主线提交（按顺序）
 
-**v3 客户端有、v4 还没有的**（`git show fc3e757^:b-ui-client.sh`，5810 行）：
-- `delete_config()`（约 2995 行）：删除节点。
-- `test_proxy()`（约 4240 行）：连接测试。
-- 主菜单 `[6] 高级设置`（`show_menu()` 约 5193 行）。
-- `import_from_subscription()`（约 3286 行）、`_get_node_display_name()`（约 2382 行）。
-- v3 主菜单：`[1] 切换节点 [2] 开启/停止 TUN [3] 导入节点 [4] 服务控制 [5] 连接测试 [6] 高级设置 [7] 一键更新 ★ [8] 卸载 [0] 退出`，两栏数字直选。
+| 提交 | 内容 | 审查 |
+|---|---|---|
+| `4c7be25` | fix(schema)：`node_uri` 无冒号分支只解码一次用户名（**跨 crate**） | 已审 |
+| `7014682` `088182b` `11e7167` `487debd` `48fff10` `70f6600` | spec 与计划，以及执行中的对齐修订 | — |
+| `a66d2ec` + `dadf300` | T1 宽度工具（`display_width` / `budget_width` / `sanitize` / 截断） | 通过 |
+| `1bca2a9` | T2 `term_size`，非终端回落 80×24 | 通过 |
+| `e079950` | T3 按宽度排版，宽度守门表 `screens()` | 通过 |
+| `c84f5a6` | T14 测速探测配置 `node_outbound` / `probe_config`（**跨 crate**，标签按下标生成） | 通过 |
+| `3067043` + `e4ab2f0` | T4 清屏重画、「上次」行、输错原地重问、菜单不认 `-y`；修复：v3 邀请结果不被清屏抹掉等 | 通过 |
+| `4f3a854` | T5 `Net` 的 `text_via` / `probe` / `download_via`，`Net: Sync` | 通过 |
+| `e561f50` | T1/T3 审查遗留：窄屏列表只出 label 等 | **未单独审**，最终审查点名看 |
+| `63b184e` | T8 v3 导入邀请只在还没迁移时出现 | 通过 |
+| `57b3d91` | T4 遗留：TUN 没起来时「上次」行不再说切换成功 | **未单独审**，最终审查点名看 |
+| `58ae637` | T6 批量编号解析、确认输入解析、删除确认块（含命令行变体 `delete_confirm_cli`） | 通过 |
 
-**v4 当前主菜单**（数字 0–9 已用满）：`[1] 切换节点 [2] 切到 SOCKS/TUN [3] 导入节点 [4] 服务控制（重启 / 最近 50 行日志） [5] 连接检查 [6] 检查更新 [7] 从 v3 导入 [8] 卸载 [9] 自动更新 开/关 [0] 退出`。要加节点管理，多半得重新编排（例如 [7] 只在有 v3 目录时出现、[9] 并入更新子页）。
+### 3.3 还没做的
 
-**代码里现成的**：
-- `Profiles::remove(name) -> bool` 已有，无人调用；`upsert` / `free_name` / `find_same_endpoint` / `active_profile` 可复用（`crates/bui-c/src/profiles.rs`）。
-- 子页模板照抄 `cli.rs` 的 `service_menu` 与 `pick_node`：输错原地重问、空行或 `0` 返回、EOF 返回；测试用 `Scripted` + `menu_loop` + `ctx.transcript`。
-- 渲染：`menu::display_width`（中文 2 列）、`render_status` / `render_options` / `render_nodes(prof, with_back)` / `render_node_picker`。节点列表已是每节点两行、≤ 80 列。
-- 删除活动节点、删除最后一个节点时要停服务：参考 `engine.rs` 的 `stop` 与 `uninstall.rs`。
+T7（删除节点与 `bui-c delete`，核心）、T7b（墓碑）、T9（菜单重排与 [7] 子页）、T10（检查更新先确认）、T11 的审查与合并、T12a/b/c（进程锁、更新拆锁、pending.json 收敛）、真机验收第一轮、T13、T15–T18（P1：卸载清单、Sys 扩展、[9] 测速、巡检连续失败行、`bui-c test`）、T19（文档与 CHANGELOG）、最终整分支审查。
 
-**设计时必须想清楚的边界**（「考虑更充分」）：
-- 删除当前活动节点：先让用户选替换节点，还是切到剩下的第一个，还是停服务？只剩一个节点时怎么办？TUN 正在跑时删除会断网多久？
-- 批量删除的输入格式（`1 3 5`、`1-3`）与输错（`1 1 3`、`3-1`、`99`、全角、`0`），确认文案里列出将删除的名字与服务器。
-- 从面板再次导入会把删掉的节点加回来：要不要提示，要不要记「已忽略」？
-- 撤销：删除前备份一份 `profiles.json`，提供一次撤销？
-- 命令行对应：`bui-c delete <名字>...`（`-y` 跳过确认、`--json`），与菜单共用同一实现。
-- 并发：`bui-c.timer` 每分钟跑的 `check` 也会写 `profiles.json`/`runtime.json`，目前**没有进程锁**（要加 `flock` 需给根 `Cargo.toml` 的 `nix` 加 `fs` 特性，属服务端共用文件，先与服务端负责人确认；或把 MSRV 1.85 提到 1.89 用 `File::try_lock`）。
-- 宽度自适应：状态行在 60 列折行。真机上 `Command::new("stty").arg("size")` 继承终端 stdin 应能拿到列数（待验证；非终端时拿不到要有回落）。长名字按宽度截断加 `…`。
-- 可选的体验项（需要做价值判断，标 P0/P1/P2）：节点测速/可用性（帮用户找出该删的死节点）、节点重命名（面板导入的名字形如 `<域名>-hy2-resi`，太长）、节点详情、从面板刷新节点、按服务器分组显示、[6] 更新前先显示版本再确认。
+T7 在额度用尽前刚派出就停了，没有留下任何代码改动。
 
-**测速的技术路线（未验证，设计 workflow 正准备在 baiyi 上验证）**：
-- 方案 A：`sing-box tools fetch -c <只含出站的临时配置> <探测 URL>`，看它能否指定出站、在 TUN 运行中是否直连节点服务器而不被 TUN 绕一圈。
-- 方案 B：临时 sing-box 起 `127.0.0.1` 随机端口 socks 入站、`route.final` 指向该节点出站，`timeout` 包住，经 socks 探测 `generate_204`。
-- 两个方案都要：临时配置含凭据，只放 0700 临时目录、不打印、测完删除；确认不影响在跑的 `bui-c.service`；单节点配置应由 `bui-schema::render::client` 提供函数渲染，不在 bui-c 里手拼。
+## 4. 计划之外、执行中追加的要求（开工前必读）
 
-## 4. 建议的做法（照上一阶段跑通的流程）
+计划文件里的 brief 是开工前写的，下面这些是后来的审查与裁定追加的，派任务时要一起交代：
 
-1. **设计**（上一会话写好的 workflow 在额度用尽前被停止，思路可复用）：
-   - 并行调研五路：代码现状、v3 旧菜单、真机截屏与终端宽度探测、测速可行性、同类数字菜单工具（ShellCrash、233boy、fscarmen、x-ui）的节点管理模式。
-   - 从三个角度各出一套完整设计：高频操作优先、以节点为中心、安全与窄屏优先。每套含 80 列与 60 列屏幕稿、删除流程、文案表、数据改动、任务拆分。
-   - 三名评审打分，合成一版，再从边界安全、真实体验、可实现性三个方向对抗审查后修订。
-   - 设计文档放 `docs/superpowers/specs/2026-09-1x-bui-c-menu-v2-design.md`，计划放 `docs/superpowers/plans/`。
-2. **实现**：一个任务一个 commit，TDD（先看到失败），每步 `cargo fmt --all -- --check`、`cargo clippy -p bui-c -p bui-schema --all-targets -- -D warnings`、`cargo test -p bui-c` 全绿。改同一批文件（`menu.rs`、`cli.rs`）的任务不要并行。
-3. **真机验收**：在 baiyi 上用独立 tmux socket 逐键操作，截屏交给「截屏判定 + 代码判定」两人独立判定，再找回归。
-4. **收尾**：更新两份交接手册与 CHANGELOG，推分支，等服务端负责人合入。
+- **T7**
+  - 用 T6 的接口，确切签名看 `menu.rs` 的 `delete_confirm` / `delete_confirm_cli` / `render_delete_picker` / `parse_selection` / `parse_confirm` / `wrap`。
+  - `delete_confirm` 的 `rows` 传 `ctx.rows()` 原值（函数内部已减 2）。
+  - 断言 `needs_word == !matches!(plan.kind, PlanKind::Passive)`。
+  - 补测试：没有测速结果时，「剩下的节点都在…」这一行出现当且仅当 `default_to` 走了回落分支。
+  - Empty 形态要输 yes，不能用「这一步只认 y」的说法。
+  - 越界编号 `Pick(len)` 报错时回显用户原始输入（净化、截短），不打 `i+1`。
+  - `bui-c delete` 用 `delete_confirm_cli`，替换目标用 `--switch-to`。
+  - `SelError::message` 在 40 列用 `menu::wrap(&e.message(len), 2, width)` 折行。
+  - 删除后的「上次」行来自 `summary(r, width)`，名字按 R6 中间截断（与 `fit_name_in_last` 同规则）。
+  - `delete_menu` 本任务不接进主菜单（T9 接）。
+  - `lock::acquire` 先做桩，T12a 换真的。
+  - 墓碑留给 T7b。
+  - 新出现的整屏加进 `screens()`。
+- **T7b**
+  - 菜单 [3] 的「上次」行必须是导入结果本身（`导入 N 个新节点`、`失败：…`），不是结果前面的附加提示。
+  - 顺手把 T4 在 `outcome_since` 里按行首 `CURRENT_NODE_HEAD` 豁免的写法，改成由打印方直接报「有没有附加行」。
+- **T9**
+  - 把「有新版」形态的主菜单（左栏 `[7] 更新与维护 ★`）加进 `screens()`，40 列要放得下。
+  - 跳过 v3 导入后的提示现在只活在「上次」行里：换 §11.1 新文案时把菜单入口放前面，40 列放得下。
+  - 删除页的过渡提示实际上限是 37 列（加 2 列缩进 ≤ 39），R1 写的「≤ 39」要改。
+  - brief 里的行号已过时，四处文案按内容找：`offer_v3_import` 的跳过提示及其断言；服务控制没有单元时的引导及测试 `menu_service_control_without_units_points_to_install`。
+- **T10**：[7]→[1] 检查更新成功时，「上次」行现在是「manifest …（来源 …）」，要改成人话。
+- **T11**（分支已实现，审查时逐条判断）
+  - GitHub 探测地址改成了 `https://github.com/robots.txt`：spec 写的是根路径，但根路径是每日自更新 manifest 地址的前缀，会让「timer 不访问检测站」的守门测试必红。建议接受并改 spec §6.2。
+  - SOCKS 的 DNS 行失败用 ○ 不用 ✗（不计分项）；汇总写「YouTube 没通，不计分」。
+  - **Google 那句判断带缩进 60 列，60 列终端会折行，要改到 ≤ 59**。
+  - 修复路径会多探测一次（最坏多等约 8 秒），T12a 拆段后去掉。
+  - 检查失败时，下一步小菜单会读走管道输入的一行。
+  - 40 列日志页时间戳占 25 列，消息只剩不到 12 列，建议窄屏缩短时间戳。
+  - `RealSys` 的 `tcp_listening` / `resolve` 只能真机验。
+- **T12a**：依赖 T7 的删除流程和锁桩，不能提前。
+- **T13**：卸载成功要退出菜单（`Outcome::Exit`）。
+- **T16**：给端口分配补「互不相同」的单元测试（`sing-box check` 不绑端口，查不出重复）；更多连接失败归 `Other("connect")`，结果页显示「✗ 失败」。
 
-## 5. baiyi 上的操作要点
+## 5. 留给最终审查的小问题
 
-- 构建：本机 macOS 编不了 musl 且 `crates/bui` 因 inotify 编不过。`rsync -az --delete --exclude target --exclude .git --exclude .claude <仓库>/ baiyi:~/b-ui-build/`，然后在 baiyi 上：
+- `FakeSys::term_size` 按契约归一（列 0 → None），删掉 `width` 里的过滤与 `(0,30)` 断言。
+- `char_width` 是手挑的宽字子集（文档已写明没收的段），带 U+FE0F 的 emoji 按 1+1 算。
+- `wrap` 的行首禁则只守了硬折，没守折点路径：`wrap_pieces("备注（家里人用的，）别删", 18, 18)` 会得到以「）」开头的行；`fits` 要再检查下一行开头不在 `NO_LINE_START` 里。
+- spec 残留：§5.3 输入表与 §11.3 的「`y`、`yes` → 执行」「这一步只认 y」在 Empty 形态下与 R1 冲突；§10.3 的 `ConfirmInput` / `parse_confirm` / `render_delete_picker` / `render_delete_confirm` 签名是旧的。
+- TUN 没起来时「上次」行的文案裁定：后缀缩短为「，但 TUN 没起来」；名字可用不到 8 列时不写名字，改「已切换节点，但 TUN 没起来」；「已是当前节点」加 TUN 没起来同样处理。
+- 40 列下切换结果行本身 47 列（一闪即被清屏）。
+- T14 的 golden 是四份单行常量，难审（已有 `#[ignore]` 重录用例）。
+- `e561f50`、`57b3d91` 两个小修没单独审过。
 
-```bash
-CC_x86_64_unknown_linux_musl=gcc AR_x86_64_unknown_linux_musl=ar cargo build --release --locked --target x86_64-unknown-linux-musl -p bui-c
-```
+## 6. 真机验收要核对的（第一轮在 T12c 之后）
 
-  增量约 17 秒。全量门禁脚本在 `~/gate2.sh`（fmt / clippy / test / bash -n / run-all）。
-- 装新二进制：`sudo -n install -m 0755 <产物> /usr/local/bin/bui-c`。
-- 真人式测试：`tmux -L buitest new-session -d -s t -x 100 -y 40`，`send-keys -l` 逐字符打，`capture-pane -p` 截屏，收尾 `tmux -L buitest kill-server`。**主人自己的 tmux 会话绝对不能碰。**
-- 改 `profiles.json` 的测试前 `sudo -n cp -a /opt/bui-c/profiles.json /root/bui-c-profiles.bak.json`，测完按 sha256 核对恢复。切 SOCKS/TUN 前挂保险丝：`sudo -n systemd-run --quiet --on-active=300 --unit=buitest-revert /usr/local/bin/bui-c mode tun`，验完 `systemctl stop buitest-revert.timer`。
-- 沙箱 `BUI_C_BASE=/tmp/x BUI_C_UNIT_DIR=/tmp/y` **只隔离文件、不隔离 systemd**，会 apply 的路径会重启真实服务；首跑的 v3 导入邀请只能答 n。
-- 回滚到 v3 客户端（30 秒）：`sudo tar xzf /root/bui-c-v3-backup/hysteria-client-*.tgz -C / && sudo systemctl daemon-reload && sudo systemctl enable --now bui-tun.service`。
-- v3 脚本备份 `/usr/local/bin/bui-c.v3` 的 `--version` 会覆盖 `/usr/local/bin/bui-c`，辨认只用 `file`/`sha256sum`。
-- ssh 命令串里不要出现能被 `pkill -f` 模式匹配到自己的写法（会把远端 shell 杀掉）。
+- sing-box 对坏域名、坏端口实际回的 SOCKS 应答码；如果 sing-box 放弃拨号比 bui-c 的计时器早并回 0x01，超时会被判成「解析失败」（[5] 第 4、5 行，8 秒 / 6 秒，风险最大）。
+- 探测不跟重定向：YouTube 拿到 3xx 算通。
+- 下载在 5 秒到点时显示结果，不是报错。
+- 管道输入时停顿不读：`printf '5\n0\n' | sudo bui-c`。
+- `tcp_listening` / `resolve` 的真实行为。
+- 40 / 60 / 80 / 100 列 tmux 逐键操作截屏；手机 SSH 客户端与歧义宽度终端的截屏要用户提供（spec R9 ②）。
 
-## 6. 仍未处理、与菜单 v2 可能相关的遗留
+## 7. 怎么接着干
 
-- 已装 rc6/rc7 的客户端收不到修复：各 rc 的 manifest `version` 都是 `4.0.0`，`update::run` 只比版本字符串。需要服务端负责人决定（版本号前进，或 manifest 带构建标识）。
-- 服务端 `install.sh` 的 `latest_v4_tag` 与客户端安装脚本修掉的是同一个 `tr | awk … exit` SIGPIPE 写法，属服务端负责人的文件。
-- 全新主机「安装脚本 → 导入 → 首次 apply 建单元 → 切模式 → 卸载」没在干净的 systemd 主机上真机走过。
-- 旧版本经 `--sub` 记下的第三方 https panel 无法从文件本身分辨。
+- **流程**
+  - 用 superpowers 的 subagent-driven-development：每个任务派一个执行者，完成后派审查员，拿到 spec 符合度和代码质量两个结论。Critical / Important 必须修完再复审；Minor 记账，最后统一处理。
+  - brief 用插件脚本 `task-brief <计划文件> <任务号>` 从计划里抽；审查包用 `review-package <基> <头>` 生成。
+  - 执行者和审查员都用 Opus 档。
+- **并行**
+  - 改的文件不相交的任务可以各开一个 worktree 并行做（本会话 T5、T6、T8、T11、T14 都这样做过），完成后 cherry-pick 回主线，多个提交先压成一个。
+  - 派到别的 worktree 的 agent，Edit 工具可能拒写，要先 `EnterWorktree(path=…)` 切进去。
+  - 审查员一律用 `git show <SHA>:<路径>` 读代码，免得读到正在变的工作区。
+- **门禁**（每个提交）：`cargo fmt --all -- --check`、`cargo clippy -p bui-c -p bui-schema --all-targets -- -D warnings`、`cargo test -p bui-c`（碰了 bui-schema 再加 `cargo test -p bui-schema`）。这三条在 macOS 能直接跑；`crates/bui` 在 macOS 编不过，不要跑 `--workspace`。
+- **Linux 门禁**（每合进几个任务跑一次）：
+  - `git archive <SHA> | tar -x -C <临时目录>`，再 `rsync -az --delete --exclude target --exclude .git --exclude .claude <临时目录>/ baiyi:~/b-ui-build-menu/`。用单独的目录，不碰别人可能在用的 `~/b-ui-build`。
+  - 在 baiyi 上跑 `CC_x86_64_unknown_linux_musl=gcc AR_x86_64_unknown_linux_musl=ar cargo check --locked --target x86_64-unknown-linux-musl -p bui-c`，再跑 clippy 和 test。
+- **推送前**
+  - 用本机敏感值清单（真实域名、面板用户名、IP，路径记在 Claude 记忆 `bui-c-menu-v2-pending` 里，不进仓库）对 `git log -p <基>..<分支>` 做 `grep -c -i -F -f`，结果必须是 0。
+  - 清单文件里的空行要先去掉，否则空模式会匹配一切。
+- **收尾**
+  - 更新本手册、[HANDOVER-bui-c.md](HANDOVER-bui-c.md) 和 `CHANGELOG.md`，推分支。
+  - 把跨 crate 的 `4c7be25`、`c84f5a6` 连同分支交给服务端会话（名字 `bui`，用 SendMessage 按名字发）审查。
+  - 合入 `v4` 前先与当时的 `origin/v4` 合并或变基。
+
+## 8. baiyi 真机要点
+
+- **tmux**
+  - 真人式测试一律用独立 socket：`tmux -L buitest new-session -d -s t -x 100 -y 40`。
+  - 用 `send-keys -l` 逐字符打，`capture-pane -p` 截屏，收尾 `tmux -L buitest kill-server`。
+  - **主人自己的 tmux 会话绝对不能碰。**
+- **动配置前**
+  - 改 `profiles.json` 之前先备份：`sudo -n cp -a /opt/bui-c/profiles.json /root/bui-c-profiles.bak.json`，测完按 sha256 核对恢复。
+  - 切 SOCKS / TUN 之前先挂保险丝：`sudo -n systemd-run --quiet --on-active=300 --unit=buitest-revert /usr/local/bin/bui-c mode tun`，验完 `systemctl stop buitest-revert.timer`。
+- **沙箱**：`BUI_C_BASE` / `BUI_C_UNIT_DIR` 只隔离文件，不隔离 systemd，会 apply 的操作仍会重启真实服务。
+- **v3 备份**：`/usr/local/bin/bui-c.v3`（及其它 v3 备份）的任何子命令都不要跑，它会覆盖 `/usr/local/bin/bui-c`；辨认只用 `file` / `sha256sum`。
+- **pkill**：ssh 命令串里不要出现能被 `pkill -f` 模式匹配到自己的写法。
+- **删除功能的验收对象**：9 个节点里有 1 个指向已下线的临时服务器，探测必失败，正好用来验收删除；验收前先备份 `profiles.json`。
+
+## 9. 需要用户或服务端负责人决定的
+
+- 跨 crate 提交 `4c7be25`（`node_uri`）与 `c84f5a6`（`probe_config` / `node_outbound` / `ProbeTarget`，C1 契约新增）要服务端负责人审查。
+- 公开仓库历史里曾出现过真实值：凭据轮换和历史重写，要服务端负责人与用户一起定。
+- 本地分流规则功能没做。
+- T11 的 GitHub 探测地址改为 `robots.txt`，建议接受。
+- 手机与歧义宽度终端的实机截屏，要用户提供。
