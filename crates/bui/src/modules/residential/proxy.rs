@@ -785,9 +785,10 @@ pub struct FakeProber {
 pub struct FakeProberInner {
     /// key = `"<host>:<port>"`，缺省 `Open`
     pub connects: std::collections::BTreeMap<String, ConnectVerdict>,
-    /// key = URL，缺省 `Err(Unreachable("no route"))`。**错误哨兵约定**（跨任务契约，
-    /// T6/T7/T8 的测试都依赖它）：值为 `Err("__auth_failed__")` 时 `get` 返回
-    /// `ProbeError::AuthFailed`，其余字符串返回 `ProbeError::Unreachable(那个字符串)`
+    /// key = URL 或 `"<host>:<port> <URL>"`（按上游限定的那条优先），缺省
+    /// `Err(Unreachable("no route"))`。**错误哨兵约定**（跨任务契约，T6/T7/T8 的测试都依赖它）：
+    /// 值为 `Err("__auth_failed__")` 时 `get` 返回 `ProbeError::AuthFailed`，
+    /// 其余字符串返回 `ProbeError::Unreachable(那个字符串)`
     pub gets: std::collections::BTreeMap<String, Result<HttpProbe, String>>,
     /// [`Prober::google_search`] 的返回，缺省 `Err(Unreachable("no route"))`（= 没结论）。
     /// 错误哨兵与 `gets` 同约定：`Err("__auth_failed__")` ⇒ `ProbeError::AuthFailed`
@@ -798,6 +799,9 @@ pub struct FakeProberInner {
     /// [`Prober::gateway_tcp_ms`] 与 [`Prober::gateway_tcp_within`] 的返回，缺省 `None`
     /// （= 连不上，「未知」不许变成好成绩）
     pub tcp_ms: Option<u64>,
+    /// 按 `"<host>:<port>"` 覆盖上面那一格；未命中才落回 `tcp_ms`。哨兵借用后要**逐条**
+    /// 带外验证（spec §5.7），同一网关的不同端口必须能给出不同结论，所以假件按端点作答
+    pub tcp_by_endpoint: std::collections::BTreeMap<String, Option<u64>>,
     /// `gateway_tcp_within` 连不上时带着时限调一次：测试用它把「丢包时等满时限」记到假时钟上
     pub on_tcp_fail: Option<Box<dyn Fn(std::time::Duration) + Send>>,
     /// [`Prober::timed_get`] 的耗时；结果本身仍查 `gets`（同一份 URL 表）
@@ -829,6 +833,24 @@ impl FakeProber {
             .calls
             .clone()
     }
+
+    /// 让这些 `"<host>:<port>"` 的网关连得通、经它的 [`super::LATENCY_PROBE_URL`] 回 204
+    /// （= [`super::health::probe_quick`] 判 `ok`）；没列到的上游仍走缺省「网关连不上」。
+    /// 哨兵借用后按上游逐条验证，一次调用里要对不同上游给出不同结论
+    pub fn with_gateways_up(&self, endpoints: &[&str]) -> &Self {
+        self.with(|i| {
+            for e in endpoints {
+                i.tcp_by_endpoint.insert((*e).to_string(), Some(20));
+            }
+            i.gets.insert(
+                super::LATENCY_PROBE_URL.to_string(),
+                Ok(HttpProbe {
+                    status: 204,
+                    body: String::new(),
+                }),
+            );
+        })
+    }
 }
 
 #[cfg(test)]
@@ -851,6 +873,23 @@ fn fake_result(v: Option<&Result<HttpProbe, String>>) -> Result<HttpProbe, Probe
     }
 }
 
+/// `gets` 表的查法：先找按上游限定的 `"<host>:<port> <url>"`，再找裸 URL。
+/// 一次调用里探两条上游（借用后的带外验证）时，同一个 URL 要能对不同上游给出不同结论
+#[cfg(test)]
+fn fake_get(i: &FakeProberInner, up: &Upstream, url: &str) -> Result<HttpProbe, ProbeError> {
+    let keyed = format!("{}:{} {url}", up.host, up.port);
+    fake_result(i.gets.get(&keyed).or_else(|| i.gets.get(url)))
+}
+
+/// 假件的 `host:port` → 网关 TCP 建连耗时：按端点覆盖优先，未命中落回 `tcp_ms`
+#[cfg(test)]
+fn fake_tcp_ms(i: &FakeProberInner, up: &Upstream) -> Option<u64> {
+    i.tcp_by_endpoint
+        .get(&format!("{}:{}", up.host, up.port))
+        .copied()
+        .unwrap_or(i.tcp_ms)
+}
+
 #[cfg(test)]
 impl Prober for FakeProber {
     fn connect(&self, _up: &Upstream, host: &str, port: u16) -> ConnectVerdict {
@@ -862,10 +901,10 @@ impl Prober for FakeProber {
             .unwrap_or(ConnectVerdict::Open)
     }
 
-    fn get(&self, _up: &Upstream, url: &str) -> Result<HttpProbe, ProbeError> {
+    fn get(&self, up: &Upstream, url: &str) -> Result<HttpProbe, ProbeError> {
         let mut i = self.inner.lock().expect("FakeProber 锁被毒化");
         i.calls.push(format!("get:{url}"));
-        fake_result(i.gets.get(url))
+        fake_get(&i, up, url)
     }
 
     fn google_search(&self, _up: &Upstream) -> Result<HttpProbe, ProbeError> {
@@ -886,31 +925,32 @@ impl Prober for FakeProber {
         i.direct.contains(&format!("{host}:{port}"))
     }
 
-    fn gateway_tcp_ms(&self, _up: &Upstream) -> Option<u64> {
+    fn gateway_tcp_ms(&self, up: &Upstream) -> Option<u64> {
         let mut i = self.inner.lock().expect("FakeProber 锁被毒化");
         i.calls.push("tcp".into());
-        i.tcp_ms
+        fake_tcp_ms(&i, up)
     }
 
-    fn gateway_tcp_within(&self, _up: &Upstream, within: std::time::Duration) -> Option<u64> {
+    fn gateway_tcp_within(&self, up: &Upstream, within: std::time::Duration) -> Option<u64> {
         let mut i = self.inner.lock().expect("FakeProber 锁被毒化");
         i.calls.push("tcp".into());
-        if i.tcp_ms.is_none() {
+        let ms = fake_tcp_ms(&i, up);
+        if ms.is_none() {
             if let Some(f) = &i.on_tcp_fail {
                 f(within);
             }
         }
-        i.tcp_ms
+        ms
     }
 
-    fn timed_get(&self, _up: &Upstream, url: &str) -> (Option<u64>, Result<HttpProbe, ProbeError>) {
+    fn timed_get(&self, up: &Upstream, url: &str) -> (Option<u64>, Result<HttpProbe, ProbeError>) {
         let mut i = self.inner.lock().expect("FakeProber 锁被毒化");
         // 只记一条 `timed:`：真实实现就是**一次**请求，记两条会让按 calls() 数请求数的
         // 测试把它当成两次
         i.calls.push(format!("timed:{url}"));
         // 结果查同一份 `gets` 表（真实实现也是一次普通 GET，只是带 UA 并计时）；
         // 失败时不给耗时，与 `ReqwestProber::timed_get` 同口径
-        let r = fake_result(i.gets.get(url));
+        let r = fake_get(&i, up, url);
         (r.is_ok().then_some(i.http_ms).flatten(), r)
     }
 

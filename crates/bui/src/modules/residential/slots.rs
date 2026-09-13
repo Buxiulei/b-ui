@@ -8,6 +8,7 @@
 use crate::api::{Event, EventBus};
 use crate::modules::panel::XrayApi;
 use crate::modules::residential::clash::{self, Clash};
+use crate::modules::residential::proxy::Prober;
 use crate::modules::residential::state;
 use crate::modules::residential::{health, SLOT_BACK_ROUNDS};
 use crate::reconcile::DaemonCtx;
@@ -15,7 +16,7 @@ use crate::state::runtime::Runtime;
 use crate::state::store::Store;
 use crate::sys::Host;
 use crate::util::parse_rfc3339;
-use bui_schema::model::{ResidentialGroup, Slot, State, DEFAULT_GROUP};
+use bui_schema::model::{ResidentialGroup, Slot, State, Upstream, DEFAULT_GROUP};
 use bui_schema::render::xray as xray_render;
 use bui_schema::render::xray::SlotRule;
 use bui_schema::slots;
@@ -490,14 +491,18 @@ pub struct SlotOutcome {
     pub index: u16,
     /// 本槽自己的 IP
     pub own: Uuid,
-    /// 本轮该用的 IP
+    /// **终态**：这一槽的 selector 现在指着哪条上游
     pub target: Uuid,
     /// `target != own`
     pub borrowed: bool,
-    /// 本轮真的发了一次 Clash PUT
+    /// 切成了：`target` 已生效（[`borrow_now`] 里还要求它当下带外验证通过）
     pub switched: bool,
     /// 没切 / 切失败的原因（面板与 CLI 直接显示）
     pub note: Option<String>,
+    /// [`borrow_now`] 借用时**逐条带外验证没通过**的候选（按尝试顺序，每条都已
+    /// `mark_unhealthy`）。非空且 `switched = false` ⇒ 候选全不通、selector 已按
+    /// spec §5.7 放回 `own`（`note` 非空 = 连放回都失败）。[`drive_slots`] 永远留空
+    pub dead: Vec<Uuid>,
 }
 
 /// 按槽切换的互斥（设计裁决 D7）：[`drive_slots`] 整轮「读快照 → 逐槽 PUT → 按快照写回
@@ -570,6 +575,9 @@ async fn put_slot(
 ///    `current_upstream_id`，只记一条 note（fail-open，降级总比乱切好）。首轮就全池不健康
 ///    时 `current` 还是 `None`，这条规则同样必须**保持沉默** —— 此时随便 PUT 一条不健康的
 ///    IP 只是把故障固化下来，relay 的 selector 本来就停在配置里的 `default`（本槽 IP）上。
+///
+/// 规则 2 的「攒满轮数才切回」与 [`borrow_now`] 的「当下探一次就借」故意不对称，理由见
+/// [`borrow_now`] 的文档：**失败会静默的方向要即时证据，失败会吵闹的方向要持续证据。**
 ///
 /// 每槽独立：一个槽切换不影响别的槽的连接（各自一个 selector，
 /// `interrupt_exist_connections: false`）。整轮只写一次 runtime。
@@ -673,6 +681,7 @@ pub async fn drive_slots(
             borrowed: landed.is_some_and(|l| l != s.upstream_id),
             switched,
             note,
+            dead: Vec::new(),
         });
     }
 
@@ -696,6 +705,13 @@ pub async fn drive_slots(
 /// [`borrow_now`] 遇到压在故障 IP 上、但被手动 pin 的槽时记的 note
 pub const PINNED_UNTOUCHED_NOTE: &str = "已手动锁定，未动";
 
+/// [`borrow_now`] 一槽最多试几个候选（每个 = 一次 Clash PUT + 一次 [`health::probe_quick`]）。
+/// 2 是演练判据的延迟预算算出来的，「首条 relay 错误 → 事件」那一段：等第 2 条错误，加哨兵
+/// 轮询 ≤2 秒，加原上游快探 ≤3 秒，加 `BORROW_MAX_TRIES` ×（PUT 加快探 ≤3 秒），加收尾那次
+/// PUT，合计 **≤12 秒**，仍在「有可用出口 ≤15 秒」之内；全不通那条路给到 25 秒（演练的
+/// `DRILL_NOEXIT_SLA`）。死候选在网关 TCP 超时就返回、不会再发 HTTP，所以 3 秒是每次的上界
+pub const BORROW_MAX_TRIES: usize = 2;
+
 /// 哨兵的立即借用（spec §5.7，设计裁决 D7）：`failed` 已被带外探测确认不可用（不可达 /
 /// Google 被封），把**此刻正压在它身上**的槽立刻挪走，不等下一轮巡检。
 ///
@@ -704,18 +720,37 @@ pub const PINNED_UNTOUCHED_NOTE: &str = "已手动锁定，未动";
 ///   停在配置里的 default = 本槽 IP），或正借用它；
 /// - 手动 pin 的槽不动（管理员的判断压过哨兵，同 [`drive_slots`] 规则 1），但压在 `failed` 上的
 ///   照样出现在结果里，note = [`PINNED_UNTOUCHED_NOTE`]（告警据此如实说明，不说成「没有槽经它出网」）；
-/// - 目标：本槽 IP 不是 `failed` 且健康、Google 未被封 ⇒ 回本槽；否则
-///   [`health::rank_healthy`] 里排名最高的非 `failed` 健康 IP；一个都没有 ⇒ 保持现状（fail-open）；
+/// - 候选顺序：本槽 IP 不是 `failed` 且健康、Google 未被封 ⇒ 先回本槽；其余按
+///   [`health::rank_healthy`] 的排名；一个候选都没有 ⇒ 保持现状（fail-open）；
+/// - **每切一条都当下验证**：`put_slot` 成功后对刚切过去的那条跑一次 [`health::probe_quick`]
+///   （同一个函数、同一个 `prober`、同一个网关 TCP 时限 `tcp_within`）。探通才算借到；探不通就把
+///   **这一条**记 `mark_unhealthy` 并试下一个候选，最多 [`BORROW_MAX_TRIES`] 个。
+///   验证**逐条按 `host:port` 探，绝不按网关主机归组**：池里多条上游常常是同一个网关的不同静态
+///   端口、每个端口一个出口 IP，「单个出口 IP 挂掉」是最常见的故障形态，此时借兄弟端口正是
+///   「住宅 IP 连不通立刻分配新 IP」唯一可行的做法；归组会把整组判死、直接砸掉这个功能。
+///   整网关挂掉时逐条探也只是每条在 TCP 超时（≤ `tcp_within`）返回，代价是多探几次而不是判错；
+/// - 候选全不通 ⇒ 把 selector **PUT 回本槽自己的上游**（`own`），恢复到事件前的指向，
+///   `switched = false`、`dead` 记下验证不通的候选，调用方据此如实报「当前无可用出口」。
+///   不补探 `own`（哨兵刚探过、巡检每轮还会探，补探换不到新信息只吃预算）；连这次 PUT 都失败
+///   时 note 说出这一层（终态可能仍停在最后一个候选上），不吞掉；
 /// - 被挪动的槽 `back_rounds` 归零；**不推进任何槽的 `back_rounds`，切回永远只由巡检的
 ///   [`drive_slots`] 负责**（连续 [`SLOT_BACK_ROUNDS`] 轮）。
 ///
-/// 「健康」= runtime 里 `active` 的成员（调用方先 `mark_unhealthy` 再调本函数）。
+/// 与 [`drive_slots`] 的判据**故意不对称**（切回要连续几轮确认、借用只要当下一次），不是一边严
+/// 一边松，而是判错的代价形状不同：借用判错是**静默失败**（用户没网，事件 / `bui status` /
+/// 面板三处都说已自愈，没人会去看），切回判错是**吵闹失败**（来回抖动，抖动本身就是信号）。
+/// 一句话：**失败会静默的方向要即时证据，失败会吵闹的方向要持续证据。**
+///
+/// 「健康」= runtime 里 `active` 的成员（调用方先 `mark_unhealthy` 再调本函数），它只用来排候选
+/// 顺序 —— 这张表来自上一轮巡检、最坏情况已经过期，所以「真的能用」一律由上面那次验证说话。
 /// 与 [`drive_slots`] 共用 [`slot_switch`] 那把锁：不会落在巡检那一轮的读快照与写回之间。
 pub async fn borrow_now(
     ctx: &DaemonCtx,
+    prober: Arc<dyn Prober>,
     c: Arc<dyn Clash>,
     failed: Uuid,
     now: OffsetDateTime,
+    tcp_within: Duration,
 ) -> Vec<SlotOutcome> {
     let _switch = slot_switch(ctx).lock_owned().await;
     let s = ctx.store.read().await;
@@ -743,6 +778,8 @@ pub async fn borrow_now(
 
     let mut out = Vec::new();
     let mut writes: Vec<(u16, Uuid)> = Vec::new();
+    // 本次调用里已经当下验证过、确认不通的候选：后面的槽不必再白探一遍
+    let mut proven_dead: BTreeSet<Uuid> = BTreeSet::new();
     for sl in &view {
         if !in_pool(sl.upstream_id) {
             continue;
@@ -764,47 +801,129 @@ pub async fn borrow_now(
             borrowed: current != own,
             switched: false,
             note: Some(note),
+            dead: Vec::new(),
         };
         if sr.pinned_upstream_id.is_some_and(in_pool) {
             out.push(stay(PINNED_UNTOUCHED_NOTE.into()));
             continue;
         }
-        let target = if own != failed && healthy.contains(&own) && google_ok(own) {
-            Some(own)
-        } else {
-            ranked.first().copied()
-        };
-        let Some(target) = target else {
+        // 本槽 IP 够好就排在最前，其余按排名；去重后取前 BORROW_MAX_TRIES 个
+        let mut cands: Vec<Upstream> = Vec::new();
+        let order = std::iter::once(own)
+            .filter(|_| own != failed && healthy.contains(&own) && google_ok(own))
+            .chain(ranked.iter().copied());
+        for id in order {
+            if proven_dead.contains(&id) || cands.iter().any(|u| u.id == id) {
+                continue;
+            }
+            if let Some(up) = g.upstreams.iter().find(|u| u.id == id) {
+                cands.push(up.clone());
+            }
+            if cands.len() == BORROW_MAX_TRIES {
+                break;
+            }
+        }
+        if cands.is_empty() {
             out.push(stay("没有可借用的健康 IP，保持现状".into()));
             continue;
-        };
-        match put_slot(c.clone(), &g, sl.index, target).await {
-            Ok(tag) => {
-                tracing::warn!(slot = sl.index, to = %tag, "哨兵：本槽当前出口不可用，立即借用");
-                writes.push((sl.index, target));
-                out.push(SlotOutcome {
-                    index: sl.index,
-                    own,
-                    target,
-                    borrowed: target != own,
-                    switched: true,
-                    note: None,
-                });
-            }
-            Err(f) => out.push(stay(f.note())),
         }
+
+        let mut dead: Vec<Uuid> = Vec::new();
+        let mut landed: Option<Uuid> = None; // 最后一次成功的 PUT：selector 此刻指着它
+        let mut put_err: Option<String> = None;
+        let mut borrowed_to: Option<Uuid> = None;
+        for up in &cands {
+            match put_slot(c.clone(), &g, sl.index, up.id).await {
+                Ok(tag) => {
+                    landed = Some(up.id);
+                    if verify_target(&prober, up.clone(), tcp_within).await {
+                        tracing::warn!(slot = sl.index, to = %tag, "哨兵：本槽当前出口不可用，立即借用");
+                        borrowed_to = Some(up.id);
+                        break;
+                    }
+                    tracing::warn!(slot = sl.index, cand = %tag, "哨兵：候选切过去也探不通，记不健康后试下一个");
+                    dead.push(up.id);
+                    proven_dead.insert(up.id);
+                }
+                Err(f) => {
+                    put_err = Some(f.note());
+                    break;
+                }
+            }
+        }
+        if let Some(target) = borrowed_to {
+            writes.push((sl.index, target));
+            out.push(SlotOutcome {
+                index: sl.index,
+                own,
+                target,
+                borrowed: target != own,
+                switched: true,
+                note: None,
+                dead,
+            });
+            continue;
+        }
+        let Some(at) = landed else {
+            // 第一个候选的 PUT 就没成：与验证无关，按原样记一笔原因，runtime 不动
+            out.push(stay(put_err.expect(
+                "候选非空 ⇒ 至少试过一次；没 landed 只可能是这次 PUT 失败",
+            )));
+            continue;
+        };
+        // 候选全不通：selector 正停在最后一个死候选上。这个终态不可接受（路由指着一条我们
+        // 自己挑的死路），放回本槽自己的上游，由调用方如实报「当前无可用出口」
+        let mut target = at;
+        let mut note = put_err.map(|e| format!("{e}；已放回本槽 IP"));
+        if target != own {
+            match put_slot(c.clone(), &g, sl.index, own).await {
+                Ok(_) => target = own,
+                Err(f) => {
+                    note = Some(format!(
+                        "放回本槽 IP 也失败：{}，当前可能仍停在最后一个候选上",
+                        f.note()
+                    ))
+                }
+            }
+        }
+        writes.push((sl.index, target));
+        out.push(SlotOutcome {
+            index: sl.index,
+            own,
+            target,
+            borrowed: target != own,
+            switched: false,
+            note,
+            dead,
+        });
     }
-    if !writes.is_empty() {
+    if !writes.is_empty() || !proven_dead.is_empty() {
+        let unhealthy: Vec<Uuid> = proven_dead.into_iter().collect();
         state::update(&ctx.runtime, move |r| {
             for (index, target) in writes {
                 let e = r.slots.entry(index.to_string()).or_default();
                 e.current_upstream_id = Some(target);
                 e.back_rounds = 0;
             }
+            for id in unhealthy {
+                state::mark_unhealthy(r.health.entry(id.to_string()).or_default(), now);
+            }
         })
         .await;
     }
     out
+}
+
+/// 借用后的带外验证：与哨兵判「原上游坏了」用的是**同一个** [`health::probe_quick`]
+/// ——同一个 `prober` 抽象、同一个网关 TCP 时限，逐条按 `host:port` 探。
+/// `Prober` 是同步的（`reqwest::blocking`），照例进 `spawn_blocking`；任务本身异常
+/// 也算没验证通过（拿不到证据就不许报「已临时切到」）。
+async fn verify_target(prober: &Arc<dyn Prober>, up: Upstream, tcp_within: Duration) -> bool {
+    let p = prober.clone();
+    matches!(
+        tokio::task::spawn_blocking(move || health::probe_quick(p.as_ref(), &up, tcp_within)).await,
+        Ok(probe) if probe.ok
+    )
 }
 
 /// 手动把一槽钉在某条上游上（`target = None` 解除）。钉住后立刻生效一次，
@@ -1583,17 +1702,38 @@ mod tests {
     // ── T5：巡检按槽驱动 selector + 手动 pin ─────────────────────────────────
 
     use crate::modules::residential::clash::{Clash, FakeClash};
+    use crate::modules::residential::proxy::FakeProber;
     use crate::modules::residential::state::HealthState;
-    use crate::modules::residential::SLOT_BACK_ROUNDS;
+    use crate::modules::residential::{LATENCY_PROBE_URL, SLOT_BACK_ROUNDS};
     use std::sync::Arc;
     use time::OffsetDateTime;
 
-    /// 三槽 + 三个上游，健康状态可注入。
-    async fn three_slot_ctx(dir: &std::path::Path) -> (DaemonCtx, Arc<FakeClash>) {
-        let (store, bus) = store_with(dir, 3, 3).await;
+    /// `n` 槽 + `n` 个上游（`upstream(i)` = `isp(i+1).example.net:10007`），健康状态可注入。
+    async fn slot_ctx(dir: &std::path::Path, n: u16) -> (DaemonCtx, Arc<FakeClash>) {
+        let (store, bus) = store_with(dir, n, 3).await;
         let (ctx, _host) = ctx_of(dir, store, bus).await;
         migrate_on_start(&ctx.store, &ctx.bus).await.unwrap();
         (ctx, Arc::new(FakeClash::new(Some("resi-1"))))
+    }
+
+    /// 三槽 + 三个上游，健康状态可注入。
+    async fn three_slot_ctx(dir: &std::path::Path) -> (DaemonCtx, Arc<FakeClash>) {
+        slot_ctx(dir, 3).await
+    }
+
+    /// 借用后带外验证（spec §5.7）的网关 TCP 时限。假件不真的等，只是同口径传参
+    const QUICK: Duration = Duration::from_secs(3);
+
+    /// 只有这些 `"<host>:<port>"` 探得通的假探测器（其余缺省「网关连不上」）
+    fn prober_up(endpoints: &[&str]) -> Arc<FakeProber> {
+        let p = Arc::new(FakeProber::new());
+        p.with_gateways_up(endpoints);
+        p
+    }
+
+    /// 一次成功的带外验证记下的两条调用（网关 TCP + 经隧道一次 GET）
+    fn probe_ok_calls() -> Vec<String> {
+        vec!["tcp".into(), format!("timed:{LATENCY_PROBE_URL}")]
     }
 
     fn healthy_state(google: Option<bool>, ms: u64) -> HealthState {
@@ -1933,11 +2073,14 @@ mod tests {
             r.slots.entry("1".into()).or_default().back_rounds = 2;
         })
         .await;
+        let p = prober_up(&["isp3.example.net:10007"]);
         let out = borrow_now(
             &ctx,
+            p.clone(),
             clash.clone(),
             Uuid::from_u128(2),
             OffsetDateTime::UNIX_EPOCH,
+            QUICK,
         )
         .await;
         assert_eq!(out.len(), 1, "只有槽 1 压在故障 IP 上：{out:?}");
@@ -1947,10 +2090,16 @@ mod tests {
             (1, Uuid::from_u128(3), true, true),
             "借排名最高的健康 IP（延迟最低的 resi-3）"
         );
+        assert!(o.dead.is_empty() && o.note.is_none(), "{o:?}");
         assert_eq!(
             clash.calls(),
             vec!["put:slot-1-pool:resi-3"],
             "槽 0 / 槽 2 一次 PUT 都不许有"
+        );
+        assert_eq!(
+            p.calls(),
+            probe_ok_calls(),
+            "探通就到此为止：只验证刚切过去的这一条"
         );
         let r = state::read(&ctx.runtime).await;
         assert_eq!(r.slots["1"].current_upstream_id, Some(Uuid::from_u128(3)));
@@ -1975,11 +2124,14 @@ mod tests {
             r.slots.entry("2".into()).or_default().current_upstream_id = Some(Uuid::from_u128(1));
         })
         .await;
+        let p = prober_up(&["isp3.example.net:10007"]);
         let out = borrow_now(
             &ctx,
+            p.clone(),
             clash.clone(),
             Uuid::from_u128(1),
             OffsetDateTime::UNIX_EPOCH,
+            QUICK,
         )
         .await;
         let s0 = out.iter().find(|o| o.index == 0).unwrap();
@@ -1995,6 +2147,12 @@ mod tests {
             "槽 2 自己的 IP 好好的 ⇒ 回本槽"
         );
         assert!(out.iter().all(|o| o.index != 1), "槽 1 没压在 IP 1 上");
+        assert_eq!(
+            p.calls().len(),
+            4,
+            "两个槽各验证一次自己的目标（借用的 resi-3 与回本槽的 resi-3）：{:?}",
+            p.calls()
+        );
     }
 
     #[tokio::test]
@@ -2011,11 +2169,14 @@ mod tests {
             e.current_upstream_id = Some(Uuid::from_u128(3));
         })
         .await;
+        let p = prober_up(&["isp3.example.net:10007"]);
         let out = borrow_now(
             &ctx,
+            p.clone(),
             clash.clone(),
             Uuid::from_u128(2),
             OffsetDateTime::UNIX_EPOCH,
+            QUICK,
         )
         .await;
         assert_eq!(out.len(), 1, "{out:?}");
@@ -2029,7 +2190,7 @@ mod tests {
             (1, Uuid::from_u128(2), false, Some("已手动锁定，未动")),
             "管理员的 pin 压过哨兵，但结果里要记一笔（告警不能说成没有槽经它出网）"
         );
-        assert!(clash.calls().is_empty());
+        assert!(clash.calls().is_empty() && p.calls().is_empty());
     }
 
     #[tokio::test]
@@ -2045,15 +2206,18 @@ mod tests {
             ],
         )
         .await;
+        let p = prober_up(&["isp3.example.net:10007"]);
         let out = borrow_now(
             &ctx,
+            p.clone(),
             clash.clone(),
             Uuid::from_u128(2),
             OffsetDateTime::UNIX_EPOCH,
+            QUICK,
         )
         .await;
         assert_eq!(out.len(), 1);
-        assert!(!out[0].switched);
+        assert!(!out[0].switched && out[0].dead.is_empty());
         assert_eq!(
             out[0].note.as_deref(),
             Some("没有可借用的健康 IP，保持现状")
@@ -2062,6 +2226,7 @@ mod tests {
             clash.calls().is_empty(),
             "fail-open：不许 PUT 一条不健康的 IP"
         );
+        assert!(p.calls().is_empty(), "没有候选可切 ⇒ 一次带外探测都不发");
         assert_eq!(
             state::read(&ctx.runtime)
                 .await
@@ -2086,14 +2251,21 @@ mod tests {
         )
         .await;
         clash.with(|i| i.reject = true);
+        let p = prober_up(&["isp3.example.net:10007"]);
         let out = borrow_now(
             &ctx,
+            p.clone(),
             clash.clone(),
             Uuid::from_u128(2),
             OffsetDateTime::UNIX_EPOCH,
+            QUICK,
         )
         .await;
-        assert!(!out[0].switched);
+        assert!(!out[0].switched && out[0].dead.is_empty());
+        assert!(
+            p.calls().is_empty(),
+            "PUT 都没成，没有「刚切过去的目标」可验证"
+        );
         assert!(
             out[0]
                 .note
@@ -2136,9 +2308,11 @@ mod tests {
         let held = slot_switch(&ctx).lock_owned().await;
         let borrow = borrow_now(
             &ctx,
+            prober_up(&["isp3.example.net:10007"]),
             clash.clone(),
             Uuid::from_u128(2),
             OffsetDateTime::UNIX_EPOCH,
+            QUICK,
         );
         tokio::pin!(borrow);
         assert!(
@@ -2165,5 +2339,308 @@ mod tests {
             "放开后借用照常做完（只有槽 1 压在 IP 2 上）"
         );
         assert_eq!(drive.await.len(), 3, "放开后巡检照常做完三个槽");
+    }
+
+    // ── 借用后的带外验证（spec §5.7）────────────────────────────────────────
+
+    /// 把池改成「同一个网关主机、不同静态端口」——生产拓扑就是这样，每个端口一个出口 IP，
+    /// 「一个出口 IP 挂了」时同主机的兄弟端口照常可用。
+    async fn same_gateway(ctx: &DaemonCtx) {
+        ctx.store
+            .update(|s| {
+                let g = s
+                    .residential
+                    .groups
+                    .get_mut(DEFAULT_GROUP)
+                    .expect("store_with 自带 default 组");
+                for (i, u) in g.upstreams.iter_mut().enumerate() {
+                    u.host = "gw.example.net".into();
+                    u.port = 10001 + i as u16;
+                }
+            })
+            .await
+            .unwrap();
+    }
+
+    /// 上一轮巡检留下的 `runtime.health` 可能已过期：第一候选切过去才发现也不通 ⇒
+    /// 只把**这一条**记为不健康，换下一个候选。
+    #[tokio::test]
+    async fn a_candidate_that_fails_its_own_probe_is_marked_and_the_next_one_is_tried() {
+        let d = tempfile::tempdir().unwrap();
+        let (ctx, clash) = three_slot_ctx(d.path()).await;
+        seed_health(
+            &ctx,
+            &[
+                (1, Some(true), 300, true),
+                (2, Some(true), 100, false),
+                (3, Some(true), 50, true),
+            ],
+        )
+        .await;
+        let p = prober_up(&["isp1.example.net:10007"]); // 只有 resi-1 真的通
+        let out = borrow_now(
+            &ctx,
+            p.clone(),
+            clash.clone(),
+            Uuid::from_u128(2),
+            OffsetDateTime::UNIX_EPOCH,
+            QUICK,
+        )
+        .await;
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(
+            (
+                out[0].target,
+                out[0].borrowed,
+                out[0].switched,
+                out[0].dead.clone(),
+                out[0].note.clone()
+            ),
+            (
+                Uuid::from_u128(1),
+                true,
+                true,
+                vec![Uuid::from_u128(3)],
+                None
+            ),
+            "排名最高的 resi-3 探不通 ⇒ 换 resi-1"
+        );
+        assert_eq!(
+            clash.calls(),
+            vec!["put:slot-1-pool:resi-3", "put:slot-1-pool:resi-1"]
+        );
+        assert_eq!(
+            p.calls(),
+            ["tcp".to_string()]
+                .into_iter()
+                .chain(probe_ok_calls())
+                .collect::<Vec<_>>(),
+            "逐条探：死的那条在网关 TCP 就返回，活的那条走完快探"
+        );
+        let r = state::read(&ctx.runtime).await;
+        assert!(
+            !r.health[&Uuid::from_u128(3).to_string()].active,
+            "探不通的候选立刻记不健康，巡检与下一次借用都不再选它"
+        );
+        assert!(
+            r.health[&Uuid::from_u128(1).to_string()].active,
+            "别的上游不许被连坐"
+        );
+        assert_eq!(r.slots["1"].current_upstream_id, Some(Uuid::from_u128(1)));
+        assert_eq!(r.slots["1"].back_rounds, 0);
+    }
+
+    /// **不按网关主机归组**：池里多条上游常常是同一个网关的不同静态端口（每个端口一个
+    /// 出口 IP），「单个出口 IP 挂掉」时借兄弟端口是唯一可行的处置。
+    #[tokio::test]
+    async fn candidates_are_probed_per_endpoint_so_a_sibling_port_can_still_be_borrowed() {
+        let d = tempfile::tempdir().unwrap();
+        let (ctx, clash) = three_slot_ctx(d.path()).await;
+        same_gateway(&ctx).await;
+        seed_health(
+            &ctx,
+            &[
+                (1, Some(true), 300, true),
+                (2, Some(true), 100, true),
+                (3, Some(true), 50, true),
+            ],
+        )
+        .await;
+        // 同一网关的三个端口，只有 10002（resi-2）这一个出口 IP 还活着
+        let p = prober_up(&["gw.example.net:10002"]);
+        let out = borrow_now(
+            &ctx,
+            p.clone(),
+            clash.clone(),
+            Uuid::from_u128(1),
+            OffsetDateTime::UNIX_EPOCH,
+            QUICK,
+        )
+        .await;
+        assert_eq!(out.len(), 1, "只有槽 0 压在 gw:10001 上：{out:?}");
+        assert_eq!(
+            (out[0].index, out[0].target, out[0].switched),
+            (0, Uuid::from_u128(2), true),
+            "gw:10003 探不通 ⇒ 借同一网关的 gw:10002"
+        );
+        assert_eq!(out[0].dead, vec![Uuid::from_u128(3)]);
+        assert_eq!(
+            clash.calls(),
+            vec!["put:slot-0-pool:resi-3", "put:slot-0-pool:resi-2"]
+        );
+        assert_eq!(
+            p.calls().len(),
+            3,
+            "按端点各探一次，不按网关归组（归组会把整组判死、直接砸掉借用）：{:?}",
+            p.calls()
+        );
+        let r = state::read(&ctx.runtime).await;
+        assert!(
+            r.health[&Uuid::from_u128(2).to_string()].active,
+            "同主机的兄弟端口不许被连坐"
+        );
+    }
+
+    /// 候选全不通：每个候选都发过 PUT，所以终态必须明确——把 selector 放回本槽自己的
+    /// 上游，`SlotOutcome` 如实反映，绝不出现「已临时切到」一条死路。
+    #[tokio::test]
+    async fn with_every_candidate_dead_the_slot_goes_back_to_its_own_ip() {
+        let d = tempfile::tempdir().unwrap();
+        let (ctx, clash) = three_slot_ctx(d.path()).await;
+        seed_health(
+            &ctx,
+            &[
+                (1, Some(true), 300, true),
+                (2, Some(true), 100, true),
+                (3, Some(true), 50, true),
+            ],
+        )
+        .await;
+        let p = Arc::new(FakeProber::new()); // 整个网关都连不上
+        let out = borrow_now(
+            &ctx,
+            p.clone(),
+            clash.clone(),
+            Uuid::from_u128(2),
+            OffsetDateTime::UNIX_EPOCH,
+            QUICK,
+        )
+        .await;
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(
+            (
+                out[0].target,
+                out[0].borrowed,
+                out[0].switched,
+                out[0].dead.clone(),
+                out[0].note.clone()
+            ),
+            (
+                Uuid::from_u128(2),
+                false,
+                false,
+                vec![Uuid::from_u128(3), Uuid::from_u128(1)],
+                None
+            ),
+            "终态 = 本槽自己的上游；没借到就不许说 switched"
+        );
+        assert_eq!(
+            clash.calls(),
+            vec![
+                "put:slot-1-pool:resi-3",
+                "put:slot-1-pool:resi-1",
+                "put:slot-1-pool:resi-2"
+            ],
+            "收尾那次 PUT 把 selector 从最后一个死候选上放回本槽"
+        );
+        assert_eq!(
+            p.calls(),
+            vec!["tcp", "tcp"],
+            "两个候选各探一次；本槽自己的上游不补探（哨兵刚探过）"
+        );
+        let r = state::read(&ctx.runtime).await;
+        assert_eq!(
+            r.slots["1"].current_upstream_id,
+            Some(Uuid::from_u128(2)),
+            "runtime 必须和 selector 一致，面板与演练脚本才查得出现在指着谁"
+        );
+        assert_eq!(r.slots["1"].back_rounds, 0);
+        for n in [1u128, 3] {
+            assert!(
+                !r.health[&Uuid::from_u128(n).to_string()].active,
+                "候选 {n}"
+            );
+        }
+    }
+
+    /// 连「放回本槽」的 PUT 都失败：终态是未知（可能仍停在最后一个候选上），
+    /// 结果里必须说出来，不许吞掉。
+    #[tokio::test]
+    async fn a_failed_put_back_to_the_own_ip_is_reported_not_swallowed() {
+        let d = tempfile::tempdir().unwrap();
+        let (ctx, clash) = three_slot_ctx(d.path()).await;
+        seed_health(
+            &ctx,
+            &[
+                (1, Some(true), 300, true),
+                (2, Some(true), 100, true),
+                (3, Some(true), 50, true),
+            ],
+        )
+        .await;
+        clash.with(|i| {
+            i.reject_tags.insert("resi-2".into()); // 本槽自己的上游切不回去
+        });
+        let p = Arc::new(FakeProber::new());
+        let out = borrow_now(
+            &ctx,
+            p,
+            clash.clone(),
+            Uuid::from_u128(2),
+            OffsetDateTime::UNIX_EPOCH,
+            QUICK,
+        )
+        .await;
+        assert_eq!(
+            (out[0].target, out[0].borrowed, out[0].switched),
+            (Uuid::from_u128(1), true, false),
+            "selector 还停在最后一个候选上，如实记"
+        );
+        assert_eq!(out[0].dead, vec![Uuid::from_u128(3), Uuid::from_u128(1)]);
+        let note = out[0].note.clone().unwrap_or_default();
+        assert!(
+            note.starts_with("放回本槽 IP 也失败：切到 resi-2 失败"),
+            "{note}"
+        );
+        assert!(note.contains("当前可能仍停在最后一个候选上"), "{note}");
+        assert_eq!(
+            state::read(&ctx.runtime).await.slots["1"].current_upstream_id,
+            Some(Uuid::from_u128(1))
+        );
+    }
+
+    /// 延迟预算（BORROW_MAX_TRIES）：候选再多也只试两个。
+    #[tokio::test]
+    async fn at_most_two_candidates_are_tried() {
+        let d = tempfile::tempdir().unwrap();
+        let (ctx, clash) = slot_ctx(d.path(), 4).await;
+        seed_health(
+            &ctx,
+            &[
+                (1, Some(true), 300, true),
+                (2, Some(true), 100, true),
+                (3, Some(true), 50, true),
+                (4, Some(true), 10, true),
+            ],
+        )
+        .await;
+        let p = Arc::new(FakeProber::new());
+        let out = borrow_now(
+            &ctx,
+            p.clone(),
+            clash.clone(),
+            Uuid::from_u128(2),
+            OffsetDateTime::UNIX_EPOCH,
+            QUICK,
+        )
+        .await;
+        assert_eq!(
+            out[0].dead,
+            vec![Uuid::from_u128(4), Uuid::from_u128(3)],
+            "按排名试前两个就停，第三个（resi-1）不再试"
+        );
+        assert_eq!(
+            clash.calls(),
+            vec![
+                "put:slot-1-pool:resi-4",
+                "put:slot-1-pool:resi-3",
+                "put:slot-1-pool:resi-2"
+            ]
+        );
+        assert_eq!(p.calls().len(), BORROW_MAX_TRIES, "{:?}", p.calls());
+        assert!(
+            state::read(&ctx.runtime).await.health[&Uuid::from_u128(1).to_string()].active,
+            "没试到的候选不许被记成不健康"
+        );
     }
 }

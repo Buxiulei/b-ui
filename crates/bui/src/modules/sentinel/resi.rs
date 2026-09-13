@@ -29,7 +29,19 @@ pub fn ip_of(up: &Upstream) -> String {
         .unwrap_or_else(|| subject_of(up))
 }
 
-/// `borrow_now` 的结果 → 「槽 1 已临时切到 Y；槽 2：没有可借用的健康 IP，保持现状；槽 3 已手动锁定，未动」
+/// 告警里指称一条上游：优先体检学到的出口 IP（`g` 里已经没有它 = 刚被删，退回 uuid）
+fn name_of(g: &ResidentialGroup, id: Uuid) -> String {
+    g.upstreams
+        .iter()
+        .find(|u| u.id == id)
+        .map(ip_of)
+        .unwrap_or_else(|| id.to_string())
+}
+
+/// `borrow_now` 的结果 → 「槽 1 已临时切到 Y；槽 2：候选 A、B 均不可达，已放回本槽 IP C，
+/// 当前无可用出口；槽 3 已手动锁定，未动」。
+/// `switched` 才允许说「已临时切到」——它在 `borrow_now` 里意味着**当下带外验证过**；
+/// `dead` 非空而没切成 = 候选逐条验证都不通，必须把终态（selector 已放回本槽 IP）说出来
 fn borrow_text(g: &ResidentialGroup, moved: &[SlotOutcome]) -> String {
     if moved.is_empty() {
         return "当前没有槽经它出网".into();
@@ -38,13 +50,13 @@ fn borrow_text(g: &ResidentialGroup, moved: &[SlotOutcome]) -> String {
         .iter()
         .map(|o| {
             if o.switched {
-                let to = g
-                    .upstreams
-                    .iter()
-                    .find(|u| u.id == o.target)
-                    .map(ip_of)
-                    .unwrap_or_else(|| o.target.to_string());
-                format!("槽 {} 已临时切到 {to}", o.index)
+                format!("槽 {} 已临时切到 {}", o.index, name_of(g, o.target))
+            } else if !o.dead.is_empty() {
+                let cands: Vec<String> = o.dead.iter().map(|id| name_of(g, *id)).collect();
+                let tail = o.note.clone().unwrap_or_else(|| {
+                    format!("已放回本槽 IP {}，当前无可用出口", name_of(g, o.own))
+                });
+                format!("槽 {}：候选 {} 均不可达，{tail}", o.index, cands.join("、"))
             } else if o.note.as_deref() == Some(slots::PINNED_UNTOUCHED_NOTE) {
                 format!("槽 {} {}", o.index, slots::PINNED_UNTOUCHED_NOTE)
             } else {
@@ -79,8 +91,9 @@ pub async fn on_upstream_error(
     };
     let u2 = up.clone();
     let tcp_within = std::time::Duration::from_secs(PROBE_TCP_TIMEOUT_SECS);
+    let p2 = prober.clone();
     let probe = match tokio::task::spawn_blocking(move || {
-        health::probe_quick(prober.as_ref(), &u2, tcp_within)
+        health::probe_quick(p2.as_ref(), &u2, tcp_within)
     })
     .await
     {
@@ -109,7 +122,7 @@ pub async fn on_upstream_error(
         state::mark_unhealthy(r.health.entry(id.to_string()).or_default(), now);
     })
     .await;
-    let moved = slots::borrow_now(ctx, clash, id, now).await;
+    let moved = slots::borrow_now(ctx, prober, clash, id, now, tcp_within).await;
     let msg = format!("IP {} {why}，{}", ip_of(&up), borrow_text(&g, &moved));
     let alert = msg.clone();
     state::update(&ctx.runtime, move |r| {
@@ -138,11 +151,11 @@ pub async fn on_google_blocked(
         return gone(id);
     };
     let u2 = up.clone();
-    let verdict =
-        tokio::task::spawn_blocking(move || proxy::google_ok_of(&prober.google_search(&u2)))
-            .await
-            .ok()
-            .flatten();
+    let p2 = prober.clone();
+    let verdict = tokio::task::spawn_blocking(move || proxy::google_ok_of(&p2.google_search(&u2)))
+        .await
+        .ok()
+        .flatten();
     if verdict == Some(true) {
         return Outcome {
             subject: subject_of(&up),
@@ -158,7 +171,15 @@ pub async fn on_google_blocked(
         );
     })
     .await;
-    let moved = slots::borrow_now(ctx, clash, id, now).await;
+    let moved = slots::borrow_now(
+        ctx,
+        prober,
+        clash,
+        id,
+        now,
+        std::time::Duration::from_secs(PROBE_TCP_TIMEOUT_SECS),
+    )
+    .await;
     let msg = format!(
         "IP {} 的 Google 被封（serp 403 / sorry 页），{}",
         ip_of(&up),
@@ -265,6 +286,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let (ctx, _host) = pool_ctx(d.path()).await;
         let (p, c) = fakes(); // FakeProber 缺省：网关连不上
+        p.with_gateways_up(&["isp1.example.net:10007"]); // 借用目标验证得过
         let o = on_upstream_error(&ctx, p.clone(), c.clone(), u(2), t0()).await;
         assert_eq!(
             o.subject, "isp2.example.net:10007",
@@ -275,7 +297,15 @@ mod tests {
             "IP 198.51.100.8 不可达，槽 1 已临时切到 198.51.100.7"
         );
         assert_eq!(o.level, Level::Error);
-        assert_eq!(p.calls(), vec!["tcp"], "快探：网关连不上就不再发 HTTP");
+        assert_eq!(
+            p.calls(),
+            vec![
+                "tcp".to_string(),
+                "tcp".to_string(),
+                format!("timed:{}", crate::modules::residential::LATENCY_PROBE_URL),
+            ],
+            "快探：网关连不上就不再发 HTTP；借到的那条再用同一个快探验证一次"
+        );
         assert_eq!(c.selected("slot-1-pool").as_deref(), Some("resi-1"));
         let r = state::read(&ctx.runtime).await;
         assert!(!r.health[&u(2).to_string()].active, "带外确认 ⇒ 立即不健康");
@@ -284,6 +314,73 @@ mod tests {
             r.upstream_alerts.get(&u(2)),
             Some(&o.result),
             "上游级告警：面板住宅卡看得到，巡检探通即清"
+        );
+    }
+
+    /// 整个网关不可用（候选逐条验证都不通）：事件必须说清终态——放回本槽 IP、当前无可用出口，
+    /// 绝不允许出现「已临时切到」一条我们自己刚验证过是死路的上游
+    #[tokio::test]
+    async fn with_no_candidate_reachable_the_event_says_so_and_the_slot_goes_home() {
+        let d = tempfile::tempdir().unwrap();
+        let (ctx, _host) = pool_ctx(d.path()).await;
+        let (p, c) = fakes(); // 池里每一条的网关都连不上
+        let o = on_upstream_error(&ctx, p.clone(), c.clone(), u(2), t0()).await;
+        assert_eq!(
+            o.result,
+            "IP 198.51.100.8 不可达，槽 1：候选 198.51.100.7、198.51.100.9 均不可达，\
+             已放回本槽 IP 198.51.100.8，当前无可用出口"
+        );
+        assert!(!o.result.contains("已临时切到"), "{}", o.result);
+        assert_eq!(o.level, Level::Error);
+        assert_eq!(
+            c.calls(),
+            vec![
+                "put:slot-1-pool:resi-1",
+                "put:slot-1-pool:resi-3",
+                "put:slot-1-pool:resi-2"
+            ],
+            "两个候选各一次 PUT + 收尾放回本槽"
+        );
+        assert_eq!(p.calls(), vec!["tcp", "tcp", "tcp"], "故障 IP + 两个候选");
+        let r = state::read(&ctx.runtime).await;
+        assert_eq!(
+            r.slots["1"].current_upstream_id,
+            Some(u(2)),
+            "runtime 与 selector 一致：查得出现在指着谁"
+        );
+        for n in [1u128, 3] {
+            assert!(!r.health[&u(n).to_string()].active, "验证不通的候选 {n}");
+        }
+        assert_eq!(r.upstream_alerts.get(&u(2)), Some(&o.result));
+    }
+
+    /// 连「放回本槽」都失败：事件把这一层也说出来（终态未知，可能仍停在最后一个候选上）
+    #[tokio::test]
+    async fn a_failed_put_back_is_spelled_out_in_the_event() {
+        let d = tempfile::tempdir().unwrap();
+        let (ctx, _host) = pool_ctx(d.path()).await;
+        let (p, c) = fakes();
+        c.with(|i| {
+            i.reject_tags.insert("resi-2".into());
+        });
+        let o = on_upstream_error(&ctx, p, c, u(2), t0()).await;
+        assert!(
+            o.result.starts_with(
+                "IP 198.51.100.8 不可达，槽 1：候选 198.51.100.7、198.51.100.9 均不可达，\
+                 放回本槽 IP 也失败：切到 resi-2 失败："
+            ),
+            "{}",
+            o.result
+        );
+        assert!(
+            o.result.ends_with("当前可能仍停在最后一个候选上"),
+            "{}",
+            o.result
+        );
+        assert_eq!(
+            state::read(&ctx.runtime).await.slots["1"].current_upstream_id,
+            Some(u(3)),
+            "selector 还停在最后一个候选上，runtime 如实记"
         );
     }
 
@@ -337,10 +434,14 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let (ctx, _host) = pool_ctx(d.path()).await;
         let (p, c) = fakes();
-        p.with(|i| {
+        p.with_gateways_up(&["isp1.example.net:10007"]).with(|i| {
             i.tcp_ms = Some(20);
+            // 凭据失效的只有故障那一条（按上游限定的一格压过裸 URL 那格）
             i.gets.insert(
-                crate::modules::residential::LATENCY_PROBE_URL.into(),
+                format!(
+                    "isp2.example.net:10007 {}",
+                    crate::modules::residential::LATENCY_PROBE_URL
+                ),
                 Err("__auth_failed__".into()),
             );
         });
@@ -356,7 +457,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let (ctx, _host) = pool_ctx(d.path()).await;
         let (p, c) = fakes();
-        p.with(|i| {
+        p.with_gateways_up(&["isp1.example.net:10007"]).with(|i| {
             i.google = Some(Ok(HttpProbe {
                 status: 200,
                 body: "<a href=\"https://www.google.com/sorry/index?continue=x\">".into(),

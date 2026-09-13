@@ -448,6 +448,8 @@ mod tests {
     #[tokio::test]
     async fn two_timeouts_to_one_upstream_give_one_probe_one_borrow_one_incident() {
         let k = kit().await;
+        // 借用目标（resi-1）探得通：借用后要用同一个快探验证它（spec §5.7）
+        k.prober.with_gateways_up(&["isp1.example.net:10007"]);
         k.host.advance(3);
         feed(
             &k,
@@ -515,7 +517,12 @@ mod tests {
                 .collect(),
         );
         assert!(tick(&k.ctx, &k.deps, &mut s).await.incidents.is_empty());
-        assert_eq!(k.prober.calls(), vec!["tcp"], "整段只探了一次");
+        assert_eq!(
+            k.prober.calls().iter().filter(|c| *c == "tcp").count(),
+            2,
+            "整段只探了两次：故障 IP 一次 + 借用目标的验证一次（{:?}）",
+            k.prober.calls()
+        );
     }
 
     #[tokio::test]
@@ -699,6 +706,8 @@ mod tests {
         );
         let k = kit().await;
         gateway_dropped(&k);
+        // 借用目标还活着（演练只丢弃**一个**端口 = 一个出口 IP），验证它不吃时限
+        k.prober.with_gateways_up(&["isp1.example.net:10007"]);
         // 两条并发连接同时报错（演练就是并发三个请求），刚好落在上一轮之后：一个轮询周期后才读到
         k.host.advance(POLL_SECS as i64);
         let reached = rec("b-ui-relay", 0, &timeout("resi-2"));
@@ -710,8 +719,12 @@ mod tests {
         assert_eq!(k.clash.selected("slot-1-pool").as_deref(), Some("resi-1"));
         assert_eq!(
             k.prober.calls(),
-            vec!["tcp"],
-            "TCP 不通即判不可达，不再跑完整探测"
+            vec![
+                "tcp".to_string(),
+                "tcp".to_string(),
+                format!("timed:{}", crate::modules::residential::LATENCY_PROBE_URL),
+            ],
+            "TCP 不通即判不可达，不再跑完整探测；借用目标再验证一次"
         );
         let budget = POLL_SECS as i64 + super::super::PROBE_TCP_TIMEOUT_SECS as i64 + 1;
         let took = secs_until(ts, &rep.incidents[0].at);
@@ -719,6 +732,45 @@ mod tests {
             took <= budget,
             "达到门槛的错误 → 事件 {took} 秒，预算 {budget} 秒"
         );
+    }
+
+    /// **整个网关不可用**（池里各条都在同一个网关上）时最慢的那条路：原上游快探 3 秒 +
+    /// 两个候选各「PUT + 快探 3 秒」+ 收尾 PUT，事件才落地。演练判据拆成两条正是为此：
+    /// 有可用出口 ≤15 秒，无可用出口 ≤25 秒（`DRILL_NOEXIT_SLA`）
+    #[tokio::test]
+    async fn with_the_whole_gateway_down_the_event_lands_within_the_no_exit_sla() {
+        const DRILL_NOEXIT_SLA: i64 = 25;
+        let k = kit().await;
+        gateway_dropped(&k); // 池里每一条都连不上，各等满 PROBE_TCP_TIMEOUT_SECS
+        k.host.advance(POLL_SECS as i64);
+        let reached = rec("b-ui-relay", 0, &timeout("resi-2"));
+        let ts = reached.ts;
+        feed(&k, vec![rec("b-ui-relay", 0, &timeout("resi-2")), reached]);
+        let rep = tick(&k.ctx, &k.deps, &mut Sentinel::default()).await;
+        assert_eq!(rep.incidents.len(), 1, "{:?}", rep.incidents);
+        let inc = &rep.incidents[0];
+        assert_eq!(
+            inc.result,
+            "IP 198.51.100.8 不可达，槽 1：候选 198.51.100.7、198.51.100.9 均不可达，\
+             已放回本槽 IP 198.51.100.8，当前无可用出口"
+        );
+        assert!(!inc.result.contains("已临时切到"), "{}", inc.result);
+        assert_eq!(
+            k.clash.selected("slot-1-pool").as_deref(),
+            Some("resi-2"),
+            "终态 = 放回本槽自己的上游，不许停在死候选上"
+        );
+        assert_eq!(
+            crate::modules::residential::state::read(&k.ctx.runtime)
+                .await
+                .slots["1"]
+                .current_upstream_id,
+            Some(Uuid::from_u128(2))
+        );
+        let took = secs_until(ts, &inc.at);
+        let budget = POLL_SECS as i64 + 3 * super::super::PROBE_TCP_TIMEOUT_SECS as i64;
+        assert_eq!(took, budget, "原上游 + 两个候选各一次快探");
+        assert!(took <= DRILL_NOEXIT_SLA, "首条错误 → 事件 {took} 秒");
     }
 
     /// 最坏情况（客户端串行、错误一条一条来）：第 2 条错误要等 relay 再拨一次上游、超时才出现。
@@ -730,6 +782,7 @@ mod tests {
         const DRILL_DETECT_SLA: i64 = 15;
         let k = kit().await;
         gateway_dropped(&k);
+        k.prober.with_gateways_up(&["isp1.example.net:10007"]);
         let mut s = Sentinel::default();
         k.host.advance(POLL_SECS as i64);
         let first = rec("b-ui-relay", 0, &timeout("resi-2"));
@@ -760,7 +813,17 @@ mod tests {
     async fn a_reachable_gateway_still_gets_the_full_probe() {
         use crate::modules::residential::{HEALTH_PROBE_HOST, HEALTH_PROBE_URL, LATENCY_PROBE_URL};
         let k = kit().await;
-        k.prober.with(|i| i.tcp_ms = Some(20)); // 网关通；经隧道的请求缺省全失败
+        k.prober.with(|i| {
+            // 网关通；经隧道的请求缺省全失败。借用目标那条经隧道通（按上游限定的一格），验证得过
+            i.tcp_ms = Some(20);
+            i.gets.insert(
+                format!("isp1.example.net:10007 {LATENCY_PROBE_URL}"),
+                Ok(crate::modules::residential::proxy::HttpProbe {
+                    status: 204,
+                    body: String::new(),
+                }),
+            );
+        });
         k.host.advance(2);
         feed(
             &k,
@@ -778,6 +841,9 @@ mod tests {
                 format!("timed:{LATENCY_PROBE_URL}"),
                 format!("get:{HEALTH_PROBE_URL}"),
                 format!("connect:{HEALTH_PROBE_HOST}:443"),
+                // 借用目标的验证：同一个快探，网关通就走一轮可达性
+                "tcp".to_string(),
+                format!("timed:{LATENCY_PROBE_URL}"),
             ]
         );
         assert_eq!(k.clash.selected("slot-1-pool").as_deref(), Some("resi-1"));
@@ -792,6 +858,17 @@ mod tests {
             i.gets.insert(
                 crate::modules::residential::LATENCY_PROBE_URL.into(),
                 Err("__auth_failed__".into()),
+            );
+            // 凭据失效的只有这一条：借用目标（resi-1）验证得过
+            i.gets.insert(
+                format!(
+                    "isp1.example.net:10007 {}",
+                    crate::modules::residential::LATENCY_PROBE_URL
+                ),
+                Ok(crate::modules::residential::proxy::HttpProbe {
+                    status: 204,
+                    body: String::new(),
+                }),
             );
         });
         k.host.advance(3);

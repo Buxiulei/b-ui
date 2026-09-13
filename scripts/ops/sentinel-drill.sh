@@ -1,15 +1,31 @@
 #!/usr/bin/env bash
-# b-ui v4 日志哨兵真机演练（spec §5.7）。在生产机（先 bwg-rick）上以 root 运行：临时丢弃发往
-# **某一个**住宅上游（该上游的 IP:端口，只动 TCP）的流量，验证四条判据：
+# b-ui v4 日志哨兵真机演练（spec §5.7）。在生产机（先 bwg-rick）上以 root 运行，两种模式：
+#
+# 【缺省：单端口】临时丢弃发往**某一个**住宅上游（该上游的 IP:端口，只动 TCP）的流量 —— 生产上最
+# 常见的故障形态（同一网关的兄弟端口还活着，每个端口一个出口 IP），验证四条判据：
 #   ① 哨兵 ≤ DRILL_DETECT_SLA（15）秒记事件——从该上游第一条 relay 连接错误的日志时刻算到事件的
-#     at（哨兵在快探与借用做完后才盖时间戳，所以这段时长已含借用）。构成 = 等第 2 条错误（连接类
-#     门槛 60 秒 2 条；下面的并发请求让几条错误几乎同时出现，串行时最多一次 relay 拨号超时 5 秒）
-#     + 哨兵轮询 ≤2 秒 + 网关 TCP 快探 ≤3 秒（连不上即判不可达）+ 借用的 Clash PUT
+#     at（哨兵在快探与借用做完后才盖时间戳，所以这段时长已含借用与借用后的验证）。构成 = 等第 2 条
+#     错误（连接类门槛 60 秒 2 条；下面的并发请求让几条错误几乎同时出现，串行时最多一次 relay 拨号
+#     超时 5 秒）+ 哨兵轮询 ≤2 秒 + 网关 TCP 快探 ≤3 秒（连不上即判不可达）+ 借用的 Clash PUT
+#     + 借到那条的带外验证（网关通 ⇒ 毫秒级）
 #   ② 该槽借用到其它 IP（`bui residential slots --json` 的 borrowed=true、active ≠ 本槽）
 #   ③ 该槽用户回环出网 IP 改变（经本槽中继入站 127.0.0.1:(2080+i) 请求 DRILL_EGRESS_URL 取出口 IP）
 #   ④ 删掉丢包规则后，巡检在 DRILL_BACK_WAIT（660）秒内切回本槽（恢复后第 4 轮，见计划 D6）
 #
-#   真机：sudo bash scripts/ops/sentinel-drill.sh [--slot N]      # 缺省槽 1
+# 【--all-ports：整网关不可用】把池里**所有**上游的端口一起丢包（同一网关的每个端口 = 每个出口 IP
+# 全挂）。这是修完「借用后带外验证」之后最慢的一条路：哨兵会逐个候选 PUT + 快探，全不通才收尾，
+# 判据改成四条：
+#   ①' 首条 relay 错误 → 事件 ≤ DRILL_NOEXIT_SLA（25）秒。比 15 秒宽是因为这条路上要多等
+#     BORROW_MAX_TRIES（2）个候选各一次「PUT + 网关 TCP 快探 ≤3 秒」：轮询 ≤2 + 原上游快探 ≤3
+#     + 2 ×（PUT ≤2 + 快探 ≤3）+ 收尾 PUT ≤2 ≈ 17 秒，留出等第 2 条错误的余量取 25
+#   ②' 事件文案说「无可用出口」且**指明终态指向本槽 IP**，绝不出现「已临时切到」（选择器不许停在
+#     一条我们自己刚验证过是死路的上游上）
+#   ③' `bui residential slots --json` 里该槽的当前出口（active_upstream_id = runtime 的
+#     current_upstream_id）== 本槽自己的上游、borrowed=false
+#   ④' 删掉丢包规则后，巡检在 DRILL_BACK_WAIT 内让该槽出口恢复正常（回环出网 IP 回到演练前那个）
+#   注意：这一模式会让**全池**住宅出口断流（约半分钟到一分钟），只在低峰做。
+#
+#   真机：sudo bash scripts/ops/sentinel-drill.sh [--slot N] [--all-ports]   # 缺省槽 1、单端口
 #   自测：bash scripts/ops/sentinel-drill.sh --self-test          # 不出网、不碰 iptables、不需要 root
 #
 # 丢包规则都带注释 bui-sentinel-drill；EXIT 的 trap 必定把它们删干净（INT/TERM/HUP 先转成 exit）。
@@ -17,7 +33,7 @@
 # 命中分流关键字的才走，其余 route.final = direct——探测 URL 不命中时请求根本不碰上游，判据①–③
 # 必然误报失败。所以缺省探测 URL 用命中默认关键字 chatgpt 的 Cloudflare trace（取 ip= 行），
 # 开跑前按 `bui residential status --json` 的 mode / domains 自查：split 且不命中 ⇒ FATAL 退 2。
-# 演练期间该槽用户会断流约一分钟（直到哨兵借到别的 IP），请在低峰做。
+# 演练期间该槽用户会断流约一分钟（直到哨兵借到别的 IP；--all-ports 下是全池断流），请在低峰做。
 # 退出码 = FAIL 数（0 = 全过）；前置条件不满足打 FATAL 退 2。凭据一律不经本脚本。
 set -uo pipefail
 LC_ALL=C
@@ -30,6 +46,8 @@ CURL=${CURL:-curl}
 JOURNALCTL=${JOURNALCTL:-journalctl}
 GETENT=${GETENT:-getent}
 DETECT_SLA=${DRILL_DETECT_SLA:-15}
+# 「无可用出口」那条路多等 2 个候选的「PUT + 快探」，算式见文件头 ①'
+NOEXIT_SLA=${DRILL_NOEXIT_SLA:-25}
 DETECT_WAIT=${DRILL_DETECT_WAIT:-90}
 BACK_WAIT=${DRILL_BACK_WAIT:-660}
 POLL=${DRILL_POLL:-2}
@@ -37,13 +55,14 @@ EGRESS_URL=${DRILL_EGRESS_URL:-https://chatgpt.com/cdn-cgi/trace}
 TAG=bui-sentinel-drill
 SLOT=1
 SELF_TEST=0
-DROP_IPS=""
-DROP_PORT=""
+ALL_PORTS=0
+# 要丢包的端点，空格分隔的 "ip,port"
+DROP_SPEC=""
 PASS=0
 FAIL=0
 
 usage() {
-  printf '用法：%s [--slot N] [--base /opt/b-ui] | --self-test\n' "$0" >&2
+  printf '用法：%s [--slot N] [--all-ports] [--base /opt/b-ui] | --self-test\n' "$0" >&2
   exit 2
 }
 pass() { PASS=$((PASS + 1)); printf 'PASS %s\n' "$1"; }
@@ -106,19 +125,43 @@ resolve_v4() {
   "$GETENT" ahostsv4 "$1" | awk '{print $1}' | sort -u
 }
 
+# 池里每条上游的 "host port"（一槽一条上游，$1 = slots JSON）
+all_endpoints() {
+  python3 -c 'import json, sys
+try:
+    rows = (json.loads(sys.argv[1]) or {}).get("slots") or []
+except Exception:
+    rows = []
+for r in rows:
+    h, p = r.get("host"), r.get("port")
+    if h and p:
+        print(h, p)' "$1"
+}
+
+# stdin 的 "host port" 行 → "ip,port ip,port …"（主机解析成各 IPv4）
+spec_of() {
+  local host port ip out=""
+  while read -r host port; do
+    [[ -n "$host" && -n "$port" ]] || continue
+    for ip in $(resolve_v4 "$host"); do
+      out+="$ip,$port "
+    done
+  done
+  printf '%s' "$out"
+}
+
 drop_on() {
-  local ip
-  for ip in $DROP_IPS; do
-    "$IPTABLES" -w -I OUTPUT -p tcp -d "$ip" --dport "$DROP_PORT" -m comment --comment "$TAG" -j DROP || return 1
+  local e
+  for e in $DROP_SPEC; do
+    "$IPTABLES" -w -I OUTPUT -p tcp -d "${e%,*}" --dport "${e#*,}" -m comment --comment "$TAG" -j DROP || return 1
   done
 }
 
 # 删到删不动为止（同一条插了几次就删几次）；没插过时是 no-op
 drop_off() {
-  local ip
-  [[ -n "$DROP_PORT" ]] || return 0
-  for ip in $DROP_IPS; do
-    while "$IPTABLES" -w -D OUTPUT -p tcp -d "$ip" --dport "$DROP_PORT" -m comment --comment "$TAG" -j DROP 2>/dev/null; do :; done
+  local e
+  for e in $DROP_SPEC; do
+    while "$IPTABLES" -w -D OUTPUT -p tcp -d "${e%,*}" --dport "${e#*,}" -m comment --comment "$TAG" -j DROP 2>/dev/null; do :; done
   done
 }
 
@@ -128,10 +171,11 @@ first_error_epoch() {
     sed 's/\x1b\[[0-9;]*m//g' | grep -F "[$1]: " | grep -F 'open connection to' | head -n1 | awk '{print $1}'
 }
 
-# 对象 $1（host:port）在 $2（epoch 秒）之后最早一条 relay_upstream_error 事件的时刻（epoch 秒）
-incident_epoch() {
+# 对象 $1（host:port）在 $2（epoch 秒）之后最早一条 relay_upstream_error 事件的字段 $3：
+# at ⇒ 时刻（epoch 秒），result ⇒ 事件文案；没有这样的事件就打印空
+incident_field() {
   "$BUI" incidents --json -n 50 2>/dev/null | python3 -c 'import datetime, json, sys
-subj, since = sys.argv[1], float(sys.argv[2])
+subj, since, field = sys.argv[1], float(sys.argv[2]), sys.argv[3]
 try:
     rows = (json.load(sys.stdin) or {}).get("incidents") or []
 except Exception:
@@ -141,13 +185,19 @@ for i in rows:
     if i.get("signature") != "relay_upstream_error" or i.get("subject") != subj:
         continue
     t = datetime.datetime.strptime(i["at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc).timestamp()
-    if t >= since and (best is None or t < best):
-        best = t
-print("" if best is None else int(best))' "$1" "$2"
+    if t >= since and (best is None or t < best[0]):
+        best = (t, i)
+if best is None:
+    print("")
+elif field == "at":
+    print(int(best[0]))
+else:
+    print(best[1].get(field) or "")' "$1" "$2" "$3"
 }
 
 run_drill() {
-  local slots status route n own_id tag host port relay ip_before ip_during t0 inc err delta borrowed active waited
+  local slots status route n own_id own_name tag host port relay ip_before ip_during ip_after
+  local t0 inc err delta result sla borrowed active waited
   slots=$("$BUI" residential slots --json 2>/dev/null) || fatal "bui residential slots --json 失败（守护进程在跑吗？）"
   n=$(slot_count "$slots")
   [[ "$n" -ge 2 ]] || fatal "至少要 2 个槽才有别的 IP 可借（实有 $n）"
@@ -162,27 +212,35 @@ run_drill() {
   host=$(slot_field "$slots" "$SLOT" host)
   port=$(slot_field "$slots" "$SLOT" port)
   relay=$(slot_field "$slots" "$SLOT" relay_port)
-  DROP_IPS=$(resolve_v4 "$host" | tr '\n' ' ')
-  [[ -n "${DROP_IPS// /}" ]] || fatal "解析不出 $host 的 IPv4"
-  DROP_PORT=$port
+  # 事件文案里指称本槽 IP 的写法：体检学到的出口 IP，没有就退回 host:port（与 resi::ip_of 同口径）
+  own_name=$(slot_field "$slots" "$SLOT" ip)
+  [[ -n "$own_name" ]] || own_name="$host:$port"
+  if ((ALL_PORTS)); then
+    DROP_SPEC=$(all_endpoints "$slots" | spec_of)
+  else
+    DROP_SPEC=$(printf '%s %s\n' "$host" "$port" | spec_of)
+  fi
+  [[ -n "${DROP_SPEC// /}" ]] || fatal "解析不出要丢弃的 IPv4（$host）"
   ip_before=$(egress_ip "$relay")
   [[ -n "$ip_before" ]] || fatal "演练前经 127.0.0.1:$relay 取不到出口 IP"
-  log "槽 $SLOT（$tag = $host:$port → ${DROP_IPS% }），分流 $route，演练前出口 $ip_before"
+  log "槽 $SLOT（$tag = $host:$port，本槽 IP $own_name），分流 $route，演练前出口 $ip_before"
 
   t0=$(date +%s)
   drop_on || fatal "iptables 插规则失败"
-  log "已丢弃发往 ${DROP_IPS% } 端口 $port 的 TCP（注释 $TAG）"
+  log "已丢弃发往 ${DROP_SPEC% } 的 TCP（ip,port；注释 $TAG）"
   # 造连接错误：三个并发请求经本槽出网，都会卡在 relay 连上游这一步（连接类门槛 60 秒 ≥2 条；
   # 并发让错误同时出现，不用串行等 relay 拨号超时）
   for _ in 1 2 3; do
     egress_ip "$relay" >/dev/null &
   done
 
-  # ① 事件与时延
+  # ① 事件与时延（--all-ports 走「无可用出口」那条更宽的 SLA，算式见文件头 ①'）
+  sla=$DETECT_SLA
+  ((ALL_PORTS)) && sla=$NOEXIT_SLA
   inc=""
   waited=0
   while ((waited < DETECT_WAIT)); do
-    inc=$(incident_epoch "$host:$port" "$t0")
+    inc=$(incident_field "$host:$port" "$t0" at)
     [[ -n "$inc" ]] && break
     sleep "$POLL"
     waited=$((waited + POLL))
@@ -194,51 +252,89 @@ run_drill() {
     fail "判据① 哨兵事件：有事件，但 relay 日志里找不到 [$tag] 的连接错误，无法计时"
   else
     delta=$(python3 -c 'import sys; print(round(float(sys.argv[1]) - float(sys.argv[2]), 1))' "$inc" "$err")
-    if python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) <= float(sys.argv[2]) else 1)' "$delta" "$DETECT_SLA"; then
-      pass "判据① 哨兵事件：首条错误后 ${delta}s 记事件（≤${DETECT_SLA}s）"
+    if python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) <= float(sys.argv[2]) else 1)' "$delta" "$sla"; then
+      pass "判据① 哨兵事件：首条错误后 ${delta}s 记事件（≤${sla}s）"
     else
-      fail "判据① 哨兵事件：首条错误后 ${delta}s 才记事件（>${DETECT_SLA}s）"
+      fail "判据① 哨兵事件：首条错误后 ${delta}s 才记事件（>${sla}s）"
     fi
   fi
 
-  # ② 该槽借用
-  slots=$("$BUI" residential slots --json 2>/dev/null)
-  borrowed=$(slot_field "$slots" "$SLOT" borrowed)
-  active=$(slot_field "$slots" "$SLOT" active_upstream_id)
-  if [[ "$borrowed" == "true" && -n "$active" && "$active" != "$own_id" ]]; then
-    pass "判据② 槽 $SLOT 已借用 $(slot_field "$slots" "$SLOT" active_tag)"
-  else
-    fail "判据② 槽 $SLOT 没有借用（borrowed=${borrowed:-?} active=${active:-?}）"
-  fi
+  if ((ALL_PORTS)); then
+    # ②' 事件文案：说「无可用出口」、指明终态是本槽 IP，且绝不出现「已临时切到」
+    result=$(incident_field "$host:$port" "$t0" result)
+    if [[ "$result" == *"已临时切到"* ]]; then
+      fail "判据② 全池不通却报「已临时切到」：$result"
+    elif [[ "$result" == *"无可用出口"* && "$result" == *"$own_name"* ]]; then
+      pass "判据② 事件如实报无可用出口并指明终态 $own_name"
+    else
+      fail "判据② 事件没说清终态（要有「无可用出口」与本槽 IP $own_name）：${result:-（没有事件）}"
+    fi
 
-  # ③ 回环出网 IP 改变
-  ip_during=$(egress_ip "$relay")
-  if [[ -n "$ip_during" && "$ip_during" != "$ip_before" ]]; then
-    pass "判据③ 回环出网 IP $ip_before → $ip_during"
+    # ③' selector 已放回本槽自己的上游
+    slots=$("$BUI" residential slots --json 2>/dev/null)
+    borrowed=$(slot_field "$slots" "$SLOT" borrowed)
+    active=$(slot_field "$slots" "$SLOT" active_upstream_id)
+    if [[ "$active" == "$own_id" && "$borrowed" == "false" ]]; then
+      pass "判据③ 槽 $SLOT 的当前出口已放回本槽 IP"
+    else
+      fail "判据③ 槽 $SLOT 的当前出口不是本槽 IP（active=${active:-?} borrowed=${borrowed:-?}）"
+    fi
   else
-    fail "判据③ 回环出网 IP 没变（前 $ip_before，后 ${ip_during:-取不到}）"
+    # ② 该槽借用
+    slots=$("$BUI" residential slots --json 2>/dev/null)
+    borrowed=$(slot_field "$slots" "$SLOT" borrowed)
+    active=$(slot_field "$slots" "$SLOT" active_upstream_id)
+    if [[ "$borrowed" == "true" && -n "$active" && "$active" != "$own_id" ]]; then
+      pass "判据② 槽 $SLOT 已借用 $(slot_field "$slots" "$SLOT" active_tag)"
+    else
+      fail "判据② 槽 $SLOT 没有借用（borrowed=${borrowed:-?} active=${active:-?}）"
+    fi
+
+    # ③ 回环出网 IP 改变
+    ip_during=$(egress_ip "$relay")
+    if [[ -n "$ip_during" && "$ip_during" != "$ip_before" ]]; then
+      pass "判据③ 回环出网 IP $ip_before → $ip_during"
+    else
+      fail "判据③ 回环出网 IP 没变（前 $ip_before，后 ${ip_during:-取不到}）"
+    fi
   fi
 
   # 恢复
   drop_off
   wait
-  log "已删除丢包规则，等巡检切回（最多 ${BACK_WAIT}s）"
 
-  # ④ 切回
+  # ④ 单端口：巡检切回本槽；--all-ports：本来就在本槽，等出口恢复正常
   waited=0
-  while ((waited < BACK_WAIT)); do
-    slots=$("$BUI" residential slots --json 2>/dev/null)
-    if [[ "$(slot_field "$slots" "$SLOT" borrowed)" == "false" &&
-      "$(slot_field "$slots" "$SLOT" active_upstream_id)" == "$own_id" ]]; then
-      break
+  if ((ALL_PORTS)); then
+    log "已删除丢包规则，等出口恢复（最多 ${BACK_WAIT}s）"
+    ip_after=""
+    while ((waited < BACK_WAIT)); do
+      ip_after=$(egress_ip "$relay")
+      [[ "$ip_after" == "$ip_before" ]] && break
+      sleep "$POLL"
+      waited=$((waited + POLL))
+    done
+    if ((waited < BACK_WAIT)); then
+      pass "判据④ 恢复后 ${waited}s 出口回到 $ip_before"
+    else
+      fail "判据④ ${BACK_WAIT}s 内出口没恢复（前 $ip_before，后 ${ip_after:-取不到}）"
     fi
-    sleep "$POLL"
-    waited=$((waited + POLL))
-  done
-  if ((waited < BACK_WAIT)); then
-    pass "判据④ 恢复后 ${waited}s 切回本槽 IP"
   else
-    fail "判据④ ${BACK_WAIT}s 内没有切回本槽"
+    log "已删除丢包规则，等巡检切回（最多 ${BACK_WAIT}s）"
+    while ((waited < BACK_WAIT)); do
+      slots=$("$BUI" residential slots --json 2>/dev/null)
+      if [[ "$(slot_field "$slots" "$SLOT" borrowed)" == "false" &&
+        "$(slot_field "$slots" "$SLOT" active_upstream_id)" == "$own_id" ]]; then
+        break
+      fi
+      sleep "$POLL"
+      waited=$((waited + POLL))
+    done
+    if ((waited < BACK_WAIT)); then
+      pass "判据④ 恢复后 ${waited}s 切回本槽 IP"
+    else
+      fail "判据④ ${BACK_WAIT}s 内没有切回本槽"
+    fi
   fi
   printf '%d PASS / %d FAIL\n' "$PASS" "$FAIL"
   return "$FAIL"
@@ -284,11 +380,16 @@ printf '198.51.100.200  STREAM isp2.example.net\n198.51.100.200  DGRAM\n'
 STUB
   cat >"$d/bui" <<'STUB'
 #!/usr/bin/env bash
-# 模拟守护进程：丢包 + 有连接错误 ⇒ 记事件（首条错误后 FAKE_DELAY 秒）并借用；
+# 模拟守护进程：丢包 + 有连接错误 ⇒ 记事件（首条错误后 FAKE_DELAY 秒）；
+# 丢包规则只有 1 条（单端口模式）⇒ 借到另一条 IP；≥2 条（--all-ports 把整网关封了）⇒ 候选逐条
+# 验证都不通、放回本槽 IP、事件报「无可用出口」（FAKE_BORROW_ANYWAY=1 模拟修复前那个缺陷：
+# 全池不通却照样报「已临时切到」）。
 # 规则删掉后第 3 次查询切回（FAKE_NO_BACK=1 永不切回；FAKE_NO_INCIDENT=1 永不记事件）；
-# residential status 按 FAKE_MODE（缺省 split）/ FAKE_DOMAINS（缺省 ["openai","chatgpt"]）作答
+# residential status 按 FAKE_MODE（缺省 split）/ FAKE_DOMAINS（缺省 ["openai","chatgpt"]）作答。
+# 两条上游同一个网关、不同静态端口（生产拓扑），所以 --all-ports 会插 2 条规则
 S="$ST_DIR"
 rules_on() { [[ -s "$S/rules" ]]; }
+all_ports() { [[ "$(grep -c . "$S/rules" 2>/dev/null || echo 0)" -ge 2 && "${FAKE_BORROW_ANYWAY:-0}" != 1 ]]; }
 case "$1 $2" in
   "residential status")
     dflt='["openai","chatgpt"]'
@@ -301,16 +402,21 @@ case "$1 $2" in
       [[ "$n" -ge 3 ]] && rm -f "$S/borrowed"
     fi
     if [[ -f "$S/borrowed" ]]; then b=true; a=3; else b=false; a=2; fi
-    printf '{"slots":[{"index":0,"upstream_id":"00000000-0000-0000-0000-000000000001","upstream_tag":"resi-1","host":"isp1.example.net","port":10007,"relay_port":2080,"borrowed":false,"pinned":false,"active_upstream_id":"00000000-0000-0000-0000-000000000001","active_tag":"resi-1"},{"index":1,"upstream_id":"00000000-0000-0000-0000-000000000002","upstream_tag":"resi-2","host":"isp2.example.net","port":10007,"relay_port":2081,"borrowed":%s,"pinned":false,"active_upstream_id":"00000000-0000-0000-0000-00000000000%s","active_tag":"resi-%s"}]}\n' "$b" "$a" "$a"
+    printf '{"slots":[{"index":0,"upstream_id":"00000000-0000-0000-0000-000000000001","upstream_tag":"resi-1","host":"isp1.example.net","port":10008,"ip":"198.51.100.7","relay_port":2080,"borrowed":false,"pinned":false,"active_upstream_id":"00000000-0000-0000-0000-000000000001","active_tag":"resi-1"},{"index":1,"upstream_id":"00000000-0000-0000-0000-000000000002","upstream_tag":"resi-2","host":"isp2.example.net","port":10007,"ip":"198.51.100.8","relay_port":2081,"borrowed":%s,"pinned":false,"active_upstream_id":"00000000-0000-0000-0000-00000000000%s","active_tag":"resi-%s"}]}\n' "$b" "$a" "$a"
     ;;
   "incidents --json")
     if rules_on && [[ -s "$S/journal" && ! -f "$S/incident" && "${FAKE_NO_INCIDENT:-0}" != 1 ]]; then
       e=$(head -n1 "$S/journal" | awk '{printf "%d", $1}')
       date -u -d "@$((e + ${FAKE_DELAY:-3}))" +%FT%TZ >"$S/incident"
-      touch "$S/borrowed"
+      if all_ports; then
+        printf '%s' 'IP 198.51.100.8 不可达，槽 1：候选 198.51.100.7 均不可达，已放回本槽 IP 198.51.100.8，当前无可用出口' >"$S/result"
+      else
+        printf '%s' 'IP 198.51.100.8 不可达，槽 1 已临时切到 198.51.100.9' >"$S/result"
+        touch "$S/borrowed"
+      fi
     fi
     if [[ -f "$S/incident" ]]; then
-      printf '{"incidents":[{"at":"%s","unit":"b-ui-relay","signature":"relay_upstream_error","subject":"isp2.example.net:10007","action":"probe_and_borrow","result":"stub","level":"error"}],"source":"daemon"}\n' "$(cat "$S/incident")"
+      printf '{"incidents":[{"at":"%s","unit":"b-ui-relay","signature":"relay_upstream_error","subject":"isp2.example.net:10007","action":"probe_and_borrow","result":"%s","level":"error"}],"source":"daemon"}\n' "$(cat "$S/incident")" "$(cat "$S/result")"
     else
       printf '{"incidents":[],"source":"daemon"}\n'
     fi
@@ -337,12 +443,20 @@ self_test() {
       printf 'FAIL 自测 %s\n    缺：%s\n' "$3" "$1"
     fi
   }
+  # $1 起的 KEY=VAL 是 stub 的开关，`--` 之后是传给演练脚本自己的参数
   scenario() {
-    rm -f "$ST_DIR/rules" "$ST_DIR/journal" "$ST_DIR/incident" "$ST_DIR/borrowed" "$ST_DIR/back"
-    env "$@" BUI="$ST_DIR/bin/bui" IPTABLES="$ST_DIR/bin/iptables" CURL="$ST_DIR/bin/curl" \
+    local envs=()
+    while [[ $# -gt 0 && "$1" != "--" ]]; do
+      envs+=("$1")
+      shift
+    done
+    [[ "${1:-}" == "--" ]] && shift
+    rm -f "$ST_DIR/rules" "$ST_DIR/journal" "$ST_DIR/incident" "$ST_DIR/borrowed" \
+      "$ST_DIR/back" "$ST_DIR/result"
+    env "${envs[@]}" BUI="$ST_DIR/bin/bui" IPTABLES="$ST_DIR/bin/iptables" CURL="$ST_DIR/bin/curl" \
       JOURNALCTL="$ST_DIR/bin/journalctl" GETENT="$ST_DIR/bin/getent" DRILL_ALLOW_NONROOT=1 \
       DRILL_DETECT_WAIT="${WAIT_DETECT:-3}" DRILL_BACK_WAIT=6 DRILL_POLL=1 \
-      bash "$SELF" --slot 1 2>&1
+      bash "$SELF" --slot 1 "$@" 2>&1
   }
 
   out=$(scenario)
@@ -380,8 +494,26 @@ self_test() {
   out=$(scenario FAKE_NO_BACK=1)
   check "FAIL 判据④ 6s 内没有切回本槽" "$out" "判据④ 失败分支：不切回"
 
+  # ── --all-ports：整网关不可用（判据②③④ 换成「无可用出口」那一套）──────────
+  out=$(scenario -- --all-ports)
+  rc=$?
+  check "PASS 判据① 哨兵事件：首条错误后 3.0s 记事件（≤25s）" "$out" "判据① 无出口模式通过分支：按 25 秒判"
+  check "PASS 判据② 事件如实报无可用出口并指明终态 198.51.100.8" "$out" \
+    "判据② 无出口模式通过分支：文案说清终态"
+  check "PASS 判据③ 槽 1 的当前出口已放回本槽 IP" "$out" "判据③ 无出口模式通过分支：放回本槽"
+  check "PASS 判据④ 恢复后" "$out" "判据④ 无出口模式通过分支：出口恢复"
+  check "4 PASS / 0 FAIL" "$out" "无出口模式摘要"
+  check "rc=0" "rc=$rc" "无出口模式退出码 0"
+  check "rules=0" "rules=$(grep -c . "$ST_DIR/rules" 2>/dev/null || echo 0)" \
+    "无出口模式：两条丢包规则都删干净"
+
+  # 修复前那个缺陷的回归位：全池不通却报「已临时切到」⇒ 判据② 必须 FAIL
+  out=$(scenario FAKE_BORROW_ANYWAY=1 -- --all-ports)
+  check "FAIL 判据② 全池不通却报「已临时切到」" "$out" "判据② 无出口模式失败分支：谎报借用成功"
+
   # trap 兜底：演练卡在等事件时被 TERM 杀掉，规则也必须删干净
-  rm -f "$ST_DIR/rules" "$ST_DIR/journal" "$ST_DIR/incident" "$ST_DIR/borrowed" "$ST_DIR/back"
+  rm -f "$ST_DIR/rules" "$ST_DIR/journal" "$ST_DIR/incident" "$ST_DIR/borrowed" \
+    "$ST_DIR/back" "$ST_DIR/result"
   env FAKE_NO_INCIDENT=1 BUI="$ST_DIR/bin/bui" IPTABLES="$ST_DIR/bin/iptables" CURL="$ST_DIR/bin/curl" \
     JOURNALCTL="$ST_DIR/bin/journalctl" GETENT="$ST_DIR/bin/getent" DRILL_ALLOW_NONROOT=1 \
     DRILL_DETECT_WAIT=60 DRILL_POLL=1 bash "$SELF" --slot 1 >/dev/null 2>&1 &
@@ -401,6 +533,7 @@ self_test() {
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --slot) SLOT="${2:-}"; shift 2 ;;
+    --all-ports) ALL_PORTS=1; shift ;;
     --base) BASE="${2:-}"; BUI="$BASE/bin/bui"; shift 2 ;;
     --self-test) SELF_TEST=1; shift ;;
     *) usage ;;

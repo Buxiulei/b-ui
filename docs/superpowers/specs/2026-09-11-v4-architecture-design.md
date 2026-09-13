@@ -305,7 +305,7 @@ tonic 客户端，proto 从 Xray-core `v26.3.27` vendor 进仓（以仓库根为
 
 | 签名 id | 判据 | 门槛 | 动作 |
 |---|---|---|---|
-| `relay_upstream_error` | relay `open connection to … using outbound/(http 或 socks)[resi-N]: <原因>`，原因是 connection refused / i/o timeout / deadline exceeded / no route / network unreachable。目标级的其它 4xx/5xx 与 SOCKS5 REP 拒绝归 §5.4 黑名单，哨兵不计 | 同一上游 60 秒 ≥2 条 | 带外快探（先 TCP 连上游网关：解析出的各地址并发拨、整体 3 秒，连不上即判不可达、不再跑完整探测；连得上再走巡检同口径的可达性探测，含 407 补判）；失败 ⇒ 立即判不健康 + 按 §5.6 让**当前出口就是它**的槽立即借用最佳健康 IP（手动 pin 的槽不动）+ 上游级告警「IP X 不可达，槽 i 已临时切到 Y」 |
+| `relay_upstream_error` | relay `open connection to … using outbound/(http 或 socks)[resi-N]: <原因>`，原因是 connection refused / i/o timeout / deadline exceeded / no route / network unreachable。目标级的其它 4xx/5xx 与 SOCKS5 REP 拒绝归 §5.4 黑名单，哨兵不计 | 同一上游 60 秒 ≥2 条 | 带外快探（先 TCP 连上游网关：解析出的各地址并发拨、整体 3 秒，连不上即判不可达、不再跑完整探测；连得上再走巡检同口径的可达性探测，含 407 补判）；失败 ⇒ 立即判不健康 + 按 §5.6 让**当前出口就是它**的槽立即借用最佳健康 IP（手动 pin 的槽不动）+ 上游级告警「IP X 不可达，槽 i 已临时切到 Y」。**借到的那条要当下用同一个快探验证**（候选来自上一轮巡检的 `runtime.health`，最坏情况已过期；不验证就等于可能切到另一条同样不通的上游，而三处界面都说处置成功）：验证**逐条按 `host:port` 探，绝不按网关主机归组**（池里多条上游常常是同一网关的不同静态端口、各自一个出口 IP，「单个出口 IP 挂掉」时借兄弟端口是唯一可行的处置）；探不通 ⇒ 把**这一条**判不健康、试下一个候选，一槽最多 2 个（`BORROW_MAX_TRIES`，延迟预算见下）；候选全不通 ⇒ 把 selector **放回本槽自己的 IP**（不补探它）并如实告警「候选 X、Y 均不可达，已放回本槽 IP Z，当前无可用出口」——绝不允许报「已临时切到」一条刚验证过是死路的上游，也不允许只说「没有可用出口」却不说现在指向谁；连这次 PUT 都失败时告警把这一层也说出来 |
 | `relay_upstream_auth_failed` | 同上形态，原因是 407 / proxy authentication / SOCKS5 认证被拒（凭据失效） | 同一上游 60 秒 ≥3 条 | 同 `relay_upstream_error`（同一个动作，共享冷却；告警写「凭据失效」） |
 | `relay_google_blocked` | 同上形态，`403` 且含 `serp` 或目标是 Google 搜索域名 | 1 条 | 带外 Google 搜索复核：可用 ⇒ 不动作；被封（403 / 429 / sorry 页）或没结论 ⇒ `google_ok=false` + 借用 + 告警 |
 | `hy2_auth_http_failed` | hysteria 连不上 `127.0.0.1:18789/auth`（仅 `hy2_auth=http`） | 60 秒 ≥3 条 | 事件 + 告警（带「守护进程是否在听」）。**不重启 b-ui**（由 systemd 拉起；原表「失败则重启 b-ui」改判）；原 watchdog 每 60 秒翻日志的同名检测迁到这里 |
@@ -318,7 +318,9 @@ tonic 客户端，proto 从 Xray-core `v26.3.27` vendor 进仓（以仓库根为
 
 **事件**：`runtime.incidents`（`runtime.extra["incidents"]`）环形保留最近 200 条，新的在前，字段 `at / unit / signature / subject / action / result / level / sample`（`sample` 是先脱敏后截断的原文；上游只以 `host:port` 或体检学到的出口 IP 指称，绝不带凭据）。`bui status` 末尾显示最近 5 条（`--json` 不变），`bui incidents [--json] [-n N]` 查询（守护进程未运行时读 `runtime.json`），面板 `GET /api/incidents?limit=N`（管理员鉴权，缺省 50）+「事件」卡（20 条）。
 
-**预案边界**：哨兵只做「探测 → 借用 / 重试 / 告警」，不改 state 里的池成员；只挪每槽的 `slot-<i>-pool`，不动全局 `resi-pool`（`dns_resi` 的 detour 用它；故障 IP 恰好是全局选择时由下一轮巡检切走）；按槽借用与巡检的 `drive_slots` 互斥；替换 IP 仍由管理员在面板/CLI 执行，替换后 §5.6 的重分配自动完成。告警渠道：面板 + `bui status` + `bui incidents`；外部通知（Telegram/Webhook）只留 `Notifier` 接口，本期不做。**验收**：`scripts/ops/sentinel-drill.sh` 在生产机用 iptables 只丢弃发往某一上游 IP:端口 的 TCP（trap 兜底恢复），判据：首条 relay 连接错误后 ≤15 秒记事件（事件在借用做完后才盖时间戳；预算 = 等第 2 条错误（并发连接几乎同时报错，串行时最多一次 relay 拨号超时——sing-box 缺省 5 秒，relay 出站不设 `connect_timeout`）+ 轮询 ≤2 秒 + 网关 TCP ≤3 秒 + 借用的 Clash PUT）、该槽借用、该槽回环出网 IP 改变（探测 URL 必须走本槽 selector：split 模式下须命中分流关键字，脚本开跑前自查）、恢复后 ≤660 秒切回。
+**预案边界**：哨兵只做「探测 → 借用 / 重试 / 告警」，不改 state 里的池成员；只挪每槽的 `slot-<i>-pool`，不动全局 `resi-pool`（`dns_resi` 的 detour 用它；故障 IP 恰好是全局选择时由下一轮巡检切走）；按槽借用与巡检的 `drive_slots` 互斥；替换 IP 仍由管理员在面板/CLI 执行，替换后 §5.6 的重分配自动完成。告警渠道：面板 + `bui status` + `bui incidents`；外部通知（Telegram/Webhook）只留 `Notifier` 接口，本期不做。**处置延迟判据分两条**（都从首条 relay 连接错误算到事件的 `at`，事件在预案做完后才盖时间戳）：**有可用出口 ≤15 秒** = 等第 2 条错误（并发连接几乎同时报错，串行时最多一次 relay 拨号超时——sing-box 缺省 5 秒，relay 出站不设 `connect_timeout`）+ 轮询 ≤2 秒 + 原上游网关 TCP ≤3 秒 + 借用的 Clash PUT + 借到那条的验证（网关通 ⇒ 毫秒级）；**无可用出口 ≤25 秒** = 上面那些再加 2 个候选各一次「PUT + 网关 TCP ≤3 秒」与收尾那次 PUT（≈17 秒，留出等第 2 条错误的余量取 25）。
+
+**验收**：`scripts/ops/sentinel-drill.sh`（trap 兜底恢复丢包规则）两种模式。**单端口**（缺省，只丢弃发往某一上游 IP:端口 的 TCP = 生产最常见的「一个出口 IP 挂掉」）判据：事件 ≤15 秒、该槽借用、该槽回环出网 IP 改变（探测 URL 必须走本槽 selector：split 模式下须命中分流关键字，脚本开跑前自查）、恢复后 ≤660 秒切回。**`--all-ports`**（把池里所有上游的端口一起丢包 = 整网关不可用，修完借用后验证之后最慢的那条路）判据：事件 ≤25 秒（`DRILL_NOEXIT_SLA`）、事件文案说「无可用出口」且指明终态指向本槽 IP、不出现「已临时切到」、`bui residential slots --json` 里该槽的当前出口 == 本槽自己的上游、删掉规则后 ≤660 秒出口恢复正常。
 
 ## 6. Linux 客户端 `bui-c`（§⑤）
 
