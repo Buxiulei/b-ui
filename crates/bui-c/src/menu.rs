@@ -242,8 +242,12 @@ pub const NARROW: &str = "✓✗▸";
 /// 截断补的省略号，在 [`AMBIGUOUS`] 里，容量口径按 2 列。
 const ELLIPSIS: char = '…';
 
-/// 一个字符的终端列宽：东亚宽字符（Unicode EastAsianWidth 为 W / F）2 列，其余 1 列。
-/// 收的是外部节点名里常见的：谚文、CJK 与全角、CJK 扩展 B–G、宽 emoji。
+/// 一个字符的终端列宽：东亚宽字符 2 列，其余 1 列。宽字大致按 Unicode EastAsianWidth 的 W / F 收，
+/// 宁多勿少（多算只会让截断偏短，不会折行）；收的是外部节点名里常见的：谚文、CJK 与全角、
+/// CJK 扩展 B–G、宽 emoji。已知没收、按 1 列算的 W（节点名里基本见不到）：谚文字母扩展 A
+/// （U+A960–A97C）、竖排标点（U+FE10–FE19）、U+16FE0–1B2FB 里的西夏文、契丹小字、女书、
+/// 假名补充等，以及 Unicode 16 才改成 W 的八卦与两仪、四象符号（U+2630–2637、U+268A–268F）、
+/// 太玄经符号与算筹（U+1D300–1D376）。
 /// 歧义宽度的 ★☆●○ 与 [`NARROW`] 的 ✓✗▸ 在真机上是 1 列，不在这里。
 fn char_width(c: char) -> usize {
     let wide = matches!(
@@ -420,7 +424,8 @@ fn row(n1: &str, l1: &str, n2: &str, l2: &str) -> String {
 pub const RULE: char = '─';
 
 /// 终端宽度不小于它用标准版式；40 ≤ W < 它用窄版式：状态区的名字单独一行、节点列表缩进
-/// 2 列、不显示 kind（spec §2.2）。50 列时列表名字的可用宽度是 38 列，正好放下真机最长的名字。
+/// 2 列、不显示 kind（spec §2.2）。50 列时带编号的列表里名字的可用宽度：非活动行 38 列，
+/// 正好放下真机最长的名字；活动行 37 列（★ 占 2 列容量），同一个名字当活动节点时要中间截断。
 pub const STANDARD_WIDTH: usize = 50;
 
 fn is_narrow(width: usize) -> bool {
@@ -655,10 +660,10 @@ fn host_in_name(name: &str, host: &str) -> bool {
             .contains(&host.to_ascii_lowercase())
 }
 
-/// 节点列表里不显示 kind 时的一行详情（spec §2.4 第 2 条）：`label  服务器:端口` 放得下就原样；
-/// 放不下时，`keep_label`（窄版式，或名字里已经带着服务器、上一行看得见）保住 label，尾部截断；
+/// 标准版式的节点列表不显示 kind 时的一行详情（spec §2.4 第 2 条）：`label  服务器:端口` 放得下就原样；
+/// 放不下时，`keep_label`（名字里已经带着服务器，上一行看得见）保住 label，尾部截断；
 /// 否则保住服务器:端口，label 尾截、至少留 [`LABEL_MIN`] 列，不够就只剩服务器:端口。
-/// 窄版式保 label 是因为那是家人自己起的备注，v3 迁来的节点只靠它辨认。
+/// 窄版式不走这里，见 [`render_nodes`]。
 fn list_detail(label: &str, hp: &str, keep_label: bool, room: usize) -> String {
     let both = join2(&[label, hp]);
     if budget_width(&both) <= room {
@@ -690,7 +695,8 @@ fn list_detail(label: &str, hp: &str, keep_label: bool, room: usize) -> String {
 ///
 /// 按宽度排（spec §2.2、§2.4）：名字放不下就中间截断；只要有一行放不下完整的
 /// `label  kind  服务器:端口`，整张表都不显示 kind（同一张表的列要一致），仍放不下的行按
-/// [`list_detail`] 降级。窄版式（40–49 列）编号行缩进 2 列，不显示 kind。
+/// [`list_detail`] 降级。窄版式（40–49 列）编号行缩进 2 列，不显示 kind，第二行一律只出 label
+/// （没有 label 才出服务器:端口，放不下尾截；spec §2.5）。
 /// 名字、label、服务器先过 [`sanitize`]。
 ///
 /// `with_back`：菜单里选节点要打编号与 `[0] 返回`；一次性 `bui-c list` 不打编号
@@ -747,9 +753,12 @@ pub fn render_nodes(prof: &Profiles, with_back: bool, width: usize) -> String {
         ));
         let detail = if show_kind {
             full.clone()
+        } else if narrow {
+            // 窄版式每行只出 label：那是家人自己起的备注，v3 迁来的节点只靠它辨认；
+            // 放得下服务器的行也不带，免得有的行带有的行不带。没有 label 才出服务器:端口
+            truncate_end(if label.is_empty() { hp } else { label }, room)
         } else {
-            let keep_label = narrow || host_in_name(&p.name, &p.node.host);
-            list_detail(label, hp, keep_label, room)
+            list_detail(label, hp, host_in_name(&p.name, &p.node.host), room)
         };
         out.push_str(&format!("{indent}{detail}\n"));
     }
@@ -993,6 +1002,9 @@ mod tests {
         );
         // room = 7：头 7×2/5 = 2 列（示），尾 5 列（2住宅），合计 2 + 2 + 5 = 9
         assert_eq!(truncate_middle("示例专用名-HY2住宅", 9), "示…2住宅");
+        // room = 8：头先取 8×2/5 = 3 列（abc）；尾上限 5，「例名」4 列，再加「示」就是 6，停下；
+        // 尾部省下的 1 列让回头部，得 abcd（少了这一步就是 abc…例名）
+        assert_eq!(truncate_middle("abcdefgh示例名", 10), "abcd…例名");
         // 上限连 … 都放不下：只留放得下的前缀，不补 …
         assert_eq!(truncate_middle("abcdef", 1), "a");
         // … 按 2 列刚好占满，前缀一个字都不剩
@@ -1738,6 +1750,14 @@ mod tests {
                 "\n  ── B-UI 客户端 v{v} ──\n\n   节点   ●  运行中\n          rick-node.example-a.net-reality-direct\n          Reality直连  rick-node.example-a.net:10001\n   代理      SOCKS5 :1080   HTTP :8080\n   模式   TUN   ●  运行中\n\n"
             )
         );
+        // 50 列标准版式：名字另起一行；详情去掉 kind 还有 42 列，超过可用的 39 列，
+        // 拆成 label 一行、服务器:端口一行（spec §2.4）
+        assert_eq!(
+            render_status(&long, 50),
+            format!(
+                "\n  ── B-UI 客户端 v{v} ──\n\n   节点   ●  运行中\n          rick-node.example-a.net-reality-direct\n          Reality直连\n          rick-node.example-a.net:10001\n   代理      SOCKS5 :1080   HTTP :8080\n   模式   TUN   ●  运行中\n\n"
+            )
+        );
         // 40 列窄版式：状态词、中间截断的名字、label、服务器各占一行，前缀收紧（spec §3a-40）
         assert_eq!(
             render_status(&long, 40),
@@ -1801,6 +1821,20 @@ mod tests {
         assert_eq!(lines[7], "        Reality直连");
         assert_eq!(lines[8], "  [5]   rick-node.e…a.net-reality-resi");
         assert_eq!(lines[18], "  [0] 返回");
+        // 一次性 `bui-c list` 第二行缩进 4、可用 35 列：[2]、[9] 连服务器也放得下（35、32 列），
+        // 照样只出 label——窄版式每行出同一种东西，不能有的行带服务器、有的不带（spec §2.5）
+        assert_eq!(
+            render_nodes(&p, false, 40),
+            "    HY2\n    示例专用名-HY2住宅\n  ★ hysteria2-1778329470\n    示例专用名\n    reality-Reality\n    示例名-reality-Reality直连\n    rick-node.exa…a.net-reality-direct\n    Reality直连\n    rick-node.exa…e-a.net-reality-resi\n    Reality住宅\n    rick-node.example-a.net-hy2-direct\n    HY2直连\n    rick-node.example-a.net-hy2-resi\n    HY2住宅\n    tizi.example.test-reality-resi\n    Reality住宅\n    tizi.example.test-hy2-resi\n    HY2住宅\n"
+        );
+        // 没有 label 才出服务器:端口；label 放不下照样尾截
+        let mut q = baiyi_like();
+        q.profiles[2].node.label = String::new();
+        q.profiles[3].node.label = "示例专用名-reality-Reality直连备用".into();
+        let out = render_nodes(&q, true, 40);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[5], "        tizi.example.test:10001");
+        assert_eq!(lines[7], "        示例专用名-reality-Reality直…");
     }
 
     #[test]
