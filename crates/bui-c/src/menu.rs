@@ -163,6 +163,14 @@ fn row(n1: &str, l1: &str, n2: &str, l2: &str) -> String {
 
 /// 标题条 + 三行状态 + 两列数字菜单。
 pub fn render(st: &Status) -> String {
+    let mut out = render_status(st);
+    out.push_str(&render_options(st));
+    out
+}
+
+/// 只有标题条与节点 / 代理 / 模式三行：一次性 `bui-c status` 用它，不打菜单块
+/// （命令行里 `[1] 切换节点` 无处可点）。
+pub fn render_status(st: &Status) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "\n  ─────  B-UI 客户端 · v{}  ──────────────────────\n\n",
@@ -194,7 +202,12 @@ pub fn render(st: &Status) -> String {
         Mode::Socks => "SOCKS ●  本地入口",
     };
     out.push_str(&format!("   模式   {mode}\n\n"));
+    out
+}
 
+/// 两列数字菜单块：`[1]`~`[9]` + 分隔线 + `[0] 退出`。
+pub fn render_options(st: &Status) -> String {
+    let mut out = String::new();
     let update = if st.update_available {
         "检查更新 ★ 有新版"
     } else {
@@ -215,9 +228,15 @@ pub fn render(st: &Status) -> String {
 }
 
 /// 编号节点列表，当前节点带 `★`。
-pub fn render_nodes(prof: &Profiles) -> String {
+///
+/// `with_back`：菜单里选节点要能 `[0] 返回`，一次性 `bui-c list` 没有可返回的地方。
+pub fn render_nodes(prof: &Profiles, with_back: bool) -> String {
     if prof.profiles.is_empty() {
-        return "  没有节点，先导入（主菜单 3）\n".to_string();
+        return if with_back {
+            "  没有节点，先导入（主菜单 3）\n".to_string()
+        } else {
+            "  没有节点，先 `bui-c import …`\n".to_string()
+        };
     }
     let mut out = String::new();
     for (i, p) in prof.profiles.iter().enumerate() {
@@ -234,7 +253,9 @@ pub fn render_nodes(prof: &Profiles) -> String {
             mark
         ));
     }
-    out.push_str("  [0] 返回\n");
+    if with_back {
+        out.push_str("  [0] 返回\n");
+    }
     out
 }
 
@@ -386,7 +407,7 @@ mod tests {
             });
         }
         p.active = Some("alice-reality-direct".into());
-        let out = render_nodes(&p);
+        let out = render_nodes(&p, true);
         assert!(out.contains("[1] alice-hy2-direct"));
         assert!(out.contains("[2] alice-reality-direct"));
         assert!(out
@@ -398,7 +419,50 @@ mod tests {
             out.contains("HY2直连") && out.contains("Reality直连"),
             "显示 label 便于辨认"
         );
-        assert!(render_nodes(&Profiles::new_default()).contains("没有节点"));
+        assert!(render_nodes(&Profiles::new_default(), true).contains("没有节点"));
+    }
+
+    #[test]
+    fn render_splits_into_status_and_options() {
+        let s = st();
+        let status = render_status(&s);
+        let options = render_options(&s);
+        assert_eq!(
+            render(&s),
+            format!("{status}{options}"),
+            "render = 两者相接"
+        );
+        assert!(status.contains("alice-hy2-direct"), "状态块留标题条与三行");
+        assert!(status.contains(crate::VERSION));
+        assert!(!status.contains("[1] "), "状态块不带菜单：{status}");
+        assert!(!status.contains("[0] 退出"));
+        assert!(options.contains("[1] 切换节点"));
+        assert!(options.contains("[0] 退出"));
+    }
+
+    #[test]
+    fn node_list_back_row_is_optional() {
+        let mut p = Profiles::new_default();
+        p.upsert(Profile {
+            name: "alice-hy2-direct".into(),
+            node: hy2_direct_node(),
+            split: split_global(),
+            source: Source::ApiNodes,
+            imported_at: "2026-09-11T00:00:00Z".into(),
+        });
+        assert!(
+            render_nodes(&p, true).contains("[0] 返回"),
+            "菜单里要能返回"
+        );
+        assert!(
+            !render_nodes(&p, false).contains("[0] 返回"),
+            "一次性 list 没有可返回的地方"
+        );
+        // 空列表的引导按场景给：菜单里指菜单项，命令行里指命令
+        assert!(render_nodes(&Profiles::new_default(), true).contains("主菜单 3"));
+        let empty = render_nodes(&Profiles::new_default(), false);
+        assert!(empty.contains("bui-c import"), "{empty}");
+        assert!(!empty.contains("主菜单"), "{empty}");
     }
 
     #[test]

@@ -306,7 +306,7 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
                 ctx.out = serde_json::to_string_pretty(&v)
                     .map_err(|e| Error::parse("status", e.to_string()))?;
             } else {
-                let text = menu::render(&st);
+                let text = menu::render_status(&st);
                 ctx.say(text.trim_end());
             }
             Ok(())
@@ -327,7 +327,7 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
                 ctx.out = serde_json::to_string_pretty(&rows)
                     .map_err(|e| Error::parse("list", e.to_string()))?;
             } else {
-                let text = menu::render_nodes(&prof);
+                let text = menu::render_nodes(&prof, false);
                 ctx.say(text.trim_end());
             }
             Ok(())
@@ -664,7 +664,7 @@ pub fn menu_loop<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Resul
         let cmd = match action {
             Action::Quit => return Ok(()),
             Action::SwitchNode => {
-                let list = menu::render_nodes(&prof);
+                let list = menu::render_nodes(&prof, true);
                 ctx.say(list.trim_end());
                 ctx.flush();
                 let pick = ctx.prompt.line("选择节点编号")?;
@@ -923,6 +923,43 @@ mod tests {
         assert_eq!(v["auto_update"], true);
         assert_eq!(v["version"], crate::VERSION);
         // "tun": "down" 靠的是 FakeSys 对未登记 `ip link show bui-tun` 的默认非零
+    }
+
+    #[test]
+    fn status_one_shot_has_no_option_block() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        profiles_socks().save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["status"]), &mut ctx).unwrap();
+        assert!(ctx.out.contains("alice-hy2-direct"), "{}", ctx.out);
+        assert!(
+            !ctx.out.contains("[1] 切换节点"),
+            "一次性 status 不打菜单块：{}",
+            ctx.out
+        );
+        assert!(!ctx.out.contains("[0] 退出"), "{}", ctx.out);
+    }
+
+    #[test]
+    fn list_one_shot_has_no_back_row() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        profiles_socks().save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["list"]), &mut ctx).unwrap();
+        assert!(ctx.out.contains("[1] alice-hy2-direct"), "{}", ctx.out);
+        assert!(
+            !ctx.out.contains("[0] 返回"),
+            "一次性 list 没有可返回的地方：{}",
+            ctx.out
+        );
     }
 
     #[test]
@@ -1272,8 +1309,10 @@ mod tests {
         let mut p = Scripted::from([]);
         let mut ctx = Ctx::new(&s, &n2, &pp, &mut p, false, false);
         dispatch(&parse(&["status"]), &mut ctx).unwrap();
-        assert!(ctx.out.contains("★ 有新版"), "{}", ctx.out);
         assert!(n2.log().is_empty(), "渲染菜单不该联网");
+        // ★ 只在菜单选项块里（一次性 status 不打菜单块），同样只读 runtime.json
+        let prof2 = Profiles::load(&s, &pp).unwrap();
+        assert!(menu::render_options(&engine_status(&ctx, &prof2)).contains("★ 有新版"));
 
         // 再查一次，manifest 与本机同版 → 标记清掉
         n.route(
@@ -1287,7 +1326,8 @@ mod tests {
         let mut p = Scripted::from([]);
         let mut ctx = Ctx::new(&s, &n2, &pp, &mut p, false, false);
         dispatch(&parse(&["status"]), &mut ctx).unwrap();
-        assert!(!ctx.out.contains("★ 有新版"), "{}", ctx.out);
+        let prof3 = Profiles::load(&s, &pp).unwrap();
+        assert!(!menu::render_options(&engine_status(&ctx, &prof3)).contains("★ 有新版"));
     }
 
     #[test]
