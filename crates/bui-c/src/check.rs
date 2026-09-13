@@ -7,7 +7,7 @@
 
 use crate::engine::Engine;
 use crate::net::{Net, Via};
-use crate::paths::{Paths, UNIT_MAIN};
+use crate::paths::{Paths, TUN_IFACE, UNIT_MAIN};
 use crate::profiles::{Mode, Profiles};
 use crate::sys::{systemd, Sys};
 use crate::ufw;
@@ -67,6 +67,21 @@ pub enum Failure {
     Probe { got: Option<u16> },
     TunMissing,
     TunNoDefaultRoute,
+}
+
+/// 巡检日志（journald）与 `bui-c check` 输出里的中文说法；不打 Rust 的 Debug 名。
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 探测目标只写主机与路径：scheme 对读日志的人没有信息量
+        let target = PROBE_URL.trim_start_matches("https://");
+        match self {
+            Failure::UnitDown => write!(f, "{UNIT_MAIN} 没在运行"),
+            Failure::Probe { got: Some(code) } => write!(f, "探测 {target} 返回 HTTP {code}"),
+            Failure::Probe { got: None } => write!(f, "探测 {target} 超时或连不上"),
+            Failure::TunMissing => write!(f, "{TUN_IFACE} 接口不存在"),
+            Failure::TunNoDefaultRoute => write!(f, "默认路由没有指向 {TUN_IFACE}"),
+        }
+    }
 }
 
 /// 一次巡检的结论。
@@ -231,6 +246,24 @@ mod tests {
         s.reply("systemctl is-active --quiet bui-c.service", 0, "");
         n.route(PROBE_URL, FakeReply::Status(204));
         profiles_socks().save(s, &paths()).unwrap();
+    }
+
+    #[test]
+    fn failures_read_as_chinese_sentences() {
+        assert_eq!(Failure::UnitDown.to_string(), "bui-c.service 没在运行");
+        assert_eq!(
+            Failure::Probe { got: Some(403) }.to_string(),
+            "探测 www.gstatic.com/generate_204 返回 HTTP 403"
+        );
+        assert_eq!(
+            Failure::Probe { got: None }.to_string(),
+            "探测 www.gstatic.com/generate_204 超时或连不上"
+        );
+        assert_eq!(Failure::TunMissing.to_string(), "bui-tun 接口不存在");
+        assert_eq!(
+            Failure::TunNoDefaultRoute.to_string(),
+            "默认路由没有指向 bui-tun"
+        );
     }
 
     #[test]

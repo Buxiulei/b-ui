@@ -491,7 +491,7 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
                         failures.len()
                     ));
                     for f in failures {
-                        ctx.say(format!("  - {f:?}"));
+                        ctx.say(format!("  - {f}"));
                     }
                 }
                 Verdict::Waiting {
@@ -502,6 +502,9 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
                         "仍有 {} 项异常，退避中，{remaining_s}s 后再试",
                         failures.len()
                     ));
+                    for f in failures {
+                        ctx.say(format!("  - {f}"));
+                    }
                 }
             }
             // 每日自更新：失败只记日志，不影响巡检结论与退出码
@@ -1398,6 +1401,60 @@ mod tests {
             rt.last_update_attempt_at.is_some(),
             "尝试时间也要落盘，供 1 小时退避用"
         );
+    }
+
+    #[test]
+    fn check_lists_every_failure_in_chinese_when_restarting_and_when_waiting() {
+        // 真机：`systemctl stop bui-c` 后巡检日志里打的是 `- UnitDown` / `- TunMissing`
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        let mut prof = profiles_socks();
+        prof.auto_update = false; // 只看巡检结论，不去碰更新源
+        prof.save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        n.route(crate::check::PROBE_URL, FakeReply::Status(502));
+        let mut p = Scripted::from([]);
+
+        // 第一次：重启
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["check"]), &mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert!(t.contains("已重启 bui-c.service"), "{t}");
+        let items: Vec<&str> = t.lines().filter(|l| l.starts_with("  - ")).collect();
+        assert_eq!(
+            items,
+            vec![
+                "  - bui-c.service 没在运行",
+                "  - 探测 www.gstatic.com/generate_204 返回 HTTP 502"
+            ],
+            "{t}"
+        );
+
+        // 紧接着再巡检（TUN 模式、探测连不上）：退避中，也要逐条列出
+        let mut prof = crate::testutil::profiles_tun();
+        prof.auto_update = false;
+        prof.save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["check"]), &mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert!(t.contains("退避中"), "{t}");
+        let items: Vec<&str> = t.lines().filter(|l| l.starts_with("  - ")).collect();
+        assert_eq!(
+            items,
+            vec![
+                "  - bui-c.service 没在运行",
+                "  - 探测 www.gstatic.com/generate_204 超时或连不上",
+                "  - bui-tun 接口不存在",
+                "  - 默认路由没有指向 bui-tun",
+            ],
+            "{t}"
+        );
+        for debug in ["UnitDown", "Probe", "TunMissing", "TunNoDefaultRoute"] {
+            assert!(!t.contains(debug), "不打 Rust Debug 名 {debug}：{t}");
+        }
     }
 
     #[test]
