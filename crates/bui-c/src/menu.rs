@@ -25,6 +25,10 @@ pub trait Prompt {
     fn lines_until_blank(&mut self, prompt: &str) -> Result<Vec<String>>;
     /// 只有 `y` / `yes`（忽略大小写）算是。
     fn confirm(&mut self, prompt: &str) -> Result<bool>;
+    /// 停下来等一个回车（EOF 也算）：长输出打完别让菜单重画把它顶出屏幕。
+    fn pause(&mut self, prompt: &str) -> Result<()> {
+        self.read(prompt).map(|_| ())
+    }
 }
 
 pub struct Stdin;
@@ -37,6 +41,11 @@ fn prompt_text(prompt: &str) -> String {
     } else {
         format!("  ▸ {prompt}：")
     }
+}
+
+/// [`Prompt::pause`] 的提示：不是在问问题，不挂冒号。
+fn pause_text(prompt: &str) -> String {
+    format!("  ▸ {prompt}")
 }
 
 /// 读一行（去首尾空白）；EOF（0 字节）返回 `None`。
@@ -55,14 +64,25 @@ fn read_line_from<R: std::io::BufRead>(r: &mut R) -> Result<Option<String>> {
     Ok(Some(String::from_utf8_lossy(&buf).trim().to_string()))
 }
 
-impl Prompt for Stdin {
-    fn read(&mut self, prompt: &str) -> Result<Option<String>> {
+impl Stdin {
+    /// 打出提示（不换行）再读一行。
+    fn ask(&mut self, text: &str) -> Result<Option<String>> {
         use std::io::Write as _;
-        print!("{}", prompt_text(prompt));
+        print!("{text}");
         std::io::stdout()
             .flush()
             .map_err(|e| Error::io(std::path::Path::new("<stdout>"), e))?;
         read_line_from(&mut std::io::stdin().lock())
+    }
+}
+
+impl Prompt for Stdin {
+    fn read(&mut self, prompt: &str) -> Result<Option<String>> {
+        self.ask(&prompt_text(prompt))
+    }
+
+    fn pause(&mut self, prompt: &str) -> Result<()> {
+        self.ask(&pause_text(prompt)).map(|_| ())
     }
 
     fn lines_until_blank(&mut self, prompt: &str) -> Result<Vec<String>> {
@@ -392,6 +412,36 @@ pub fn strip_ansi(s: &str) -> String {
         }
     }
     out
+}
+
+/// 把一行 `journalctl -o short-iso` 压成 `<时间> <消息>`：去掉主机名与 `ident[pid]:` 两段。
+///
+/// 80 列的终端里 `baiyi sing-box[4242]: ` 这 22 列全是噪音：单元已经在标题里，主机就是本机。
+/// 解析不了的行（`-- Boot … --`、多行消息的续行）原样保留。
+pub fn compact_journal_line(line: &str) -> String {
+    fn parse(line: &str) -> Option<String> {
+        let (time, rest) = line.split_once(' ')?;
+        let b = time.as_bytes();
+        let iso =
+            b.len() >= 19 && b[..4].iter().all(u8::is_ascii_digit) && b[4] == b'-' && b[10] == b'T';
+        if !iso {
+            return None;
+        }
+        let (_host, rest) = rest.split_once(' ')?;
+        let (ident, msg) = match rest.split_once(": ") {
+            Some(x) => x,
+            None => (rest.strip_suffix(':')?, ""),
+        };
+        if ident.is_empty() || ident.contains(' ') {
+            return None;
+        }
+        Some(if msg.is_empty() {
+            time.to_string()
+        } else {
+            format!("{time} {msg}")
+        })
+    }
+    parse(line).unwrap_or_else(|| line.to_string())
 }
 
 /// 去空白 + 把全角数字（U+FF10..=U+FF19）折成 ASCII。
@@ -956,6 +1006,49 @@ mod tests {
             Some("最后一行没换行")
         );
         assert_eq!(read_line_from(&mut r).unwrap(), None);
+    }
+
+    #[test]
+    fn compact_journal_line_keeps_time_and_message_only() {
+        // systemd ≥ 249 的 short-iso 时区带冒号
+        assert_eq!(
+            compact_journal_line(
+                "2026-09-13T10:15:30+08:00 baiyi sing-box[4242]: INFO[0000] inbound/mixed[mixed-in]: 127.0.0.1:1080"
+            ),
+            "2026-09-13T10:15:30+08:00 INFO[0000] inbound/mixed[mixed-in]: 127.0.0.1:1080",
+            "只切掉第一个「: 」之前的主机名与 ident，消息里的冒号原样保留"
+        );
+        // 老 systemd（Ubuntu 20.04 的 245）时区不带冒号
+        assert_eq!(
+            compact_journal_line(
+                "2026-09-13T10:15:30+0800 baiyi systemd[1]: Started bui-c.service - B-UI client."
+            ),
+            "2026-09-13T10:15:30+0800 Started bui-c.service - B-UI client."
+        );
+        assert_eq!(
+            compact_journal_line("2026-09-13T10:15:30+08:00 baiyi kernel: tun: Universal TUN/TAP"),
+            "2026-09-13T10:15:30+08:00 tun: Universal TUN/TAP",
+            "ident 可以不带 [pid]"
+        );
+        assert_eq!(
+            compact_journal_line("2026-09-13T10:15:30+08:00 baiyi sing-box[4242]:"),
+            "2026-09-13T10:15:30+08:00",
+            "空消息"
+        );
+        for raw in [
+            "-- Boot 0123456789abcdef --",
+            "-- No entries --",
+            "INFO[0000] 没有时间戳（--output cat 的形态）",
+            "2026-09-13T10:15:30+08:00 baiyi",
+            "",
+        ] {
+            assert_eq!(compact_journal_line(raw), raw, "解析不了的行原样保留");
+        }
+    }
+
+    #[test]
+    fn pause_prompt_has_no_trailing_colon() {
+        assert_eq!(pause_text("回车返回菜单"), "  ▸ 回车返回菜单");
     }
 
     #[test]

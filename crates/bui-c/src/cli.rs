@@ -960,10 +960,10 @@ fn service_menu<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>, mode: Mod
                 return Ok(());
             }
             Some(menu::ServiceAction::Logs) => {
-                match journal_tail(ctx.sys, menu::SERVICE_LOG_LINES) {
-                    Ok(text) => ctx.show(text),
-                    Err(why) => ctx.say(why),
-                }
+                show_journal(ctx, menu::SERVICE_LOG_LINES);
+                // 50 行日志加上重画的主菜单超过一屏：停一下，看完再回去
+                ctx.flush();
+                ctx.prompt.pause("回车返回菜单")?;
                 return Ok(());
             }
         }
@@ -986,22 +986,44 @@ fn restart_service<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>, mode: 
         return;
     }
     ctx.say(format!(
-        "已重启 bui-c.service，但 bui-tun 接口 {} 秒内没起来，最近日志：",
+        "已重启 bui-c.service，但 bui-tun 接口 {} 秒内没起来",
         crate::engine::TUN_READY_WAIT_S
     ));
-    match journal_tail(ctx.sys, 10) {
-        Ok(text) => ctx.show(text),
+    show_journal(ctx, 10);
+}
+
+/// 空一行、标题行，再把日志缩进 2 列打出来；取不到就说一句原因。
+fn show_journal<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>, n: u32) {
+    match journal_tail(ctx.sys, n) {
+        Ok(text) => {
+            let mut block = format!("\n  ── {UNIT_MAIN} 最近 {n} 行日志 ──");
+            for l in text.lines() {
+                block.push('\n');
+                if !l.is_empty() {
+                    block.push_str("  ");
+                    block.push_str(l);
+                }
+            }
+            ctx.show(block);
+        }
         Err(why) => ctx.say(why),
     }
 }
 
-/// `journalctl` 取 bui-c.service 最近 `n` 行，去掉 ANSI 颜色；取不到时 `Err` 是一句给用户看的说明。
+/// `journalctl -o short-iso` 取 bui-c.service 最近 `n` 行，每行压成 `<时间> <消息>` 并去掉
+/// ANSI 颜色；取不到时 `Err` 是一句给用户看的说明。
 fn journal_tail<S: Sys>(sys: &S, n: u32) -> std::result::Result<String, String> {
     let n = n.to_string();
-    let args = ["-u", UNIT_MAIN, "-n", &n, "--no-pager", "--output", "cat"];
+    let args = ["-u", UNIT_MAIN, "-n", &n, "--no-pager", "-o", "short-iso"];
     match sys.run("journalctl", &args) {
         Ok(o) if o.ok() => {
-            let text = menu::strip_ansi(o.stdout.trim_end());
+            let text = o
+                .stdout
+                .trim_end()
+                .lines()
+                .map(|l| menu::strip_ansi(&menu::compact_journal_line(l)))
+                .collect::<Vec<_>>()
+                .join("\n");
             if text.trim().is_empty() {
                 Err(format!("journalctl 里还没有 {UNIT_MAIN} 的日志"))
             } else {
@@ -2651,8 +2673,8 @@ mod tests {
         s.put("/etc/systemd/system/bui-c.service", "[Unit]");
     }
 
-    const JOURNAL_50: &str = "journalctl -u bui-c.service -n 50 --no-pager --output cat";
-    const JOURNAL_10: &str = "journalctl -u bui-c.service -n 10 --no-pager --output cat";
+    const JOURNAL_50: &str = "journalctl -u bui-c.service -n 50 --no-pager -o short-iso";
+    const JOURNAL_10: &str = "journalctl -u bui-c.service -n 10 --no-pager -o short-iso";
 
     #[test]
     fn menu_service_control_is_a_numbered_submenu() {
@@ -2802,7 +2824,7 @@ mod tests {
         s.reply(
             JOURNAL_10,
             0,
-            "\u{1b}[31mFATAL\u{1b}[0m[0000] start service: open tun: operation not permitted\n",
+            "2026-09-13T10:15:30+08:00 baiyi sing-box[4242]: \u{1b}[31mFATAL\u{1b}[0m[0000] start service: open tun: operation not permitted\n",
         );
         crate::testutil::profiles_tun().save(&s, &pp).unwrap();
         let n = FakeNet::new();
@@ -2810,15 +2832,19 @@ mod tests {
         let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
         menu_loop(&mut ctx).unwrap();
         let t = ctx.transcript.clone();
-        assert!(
-            t.lines()
-                .any(|l| l == "  已重启 bui-c.service，但 bui-tun 接口 5 秒内没起来，最近日志："),
-            "{t}"
-        );
-        assert!(
-            t.lines()
-                .any(|l| l == "FATAL[0000] start service: open tun: operation not permitted"),
-            "日志原样打出、去掉颜色：\n{t}"
+        let lines: Vec<&str> = t.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| *l == "  已重启 bui-c.service，但 bui-tun 接口 5 秒内没起来")
+            .unwrap_or_else(|| panic!("{t}"));
+        assert_eq!(
+            lines[at + 1..at + 4],
+            [
+                "",
+                "  ── bui-c.service 最近 10 行日志 ──",
+                "  2026-09-13T10:15:30+08:00 FATAL[0000] start service: open tun: operation not permitted",
+            ],
+            "空行 + 标题行，日志缩进 2 列、去掉主机名与 ident、去掉颜色：\n{t}"
         );
         assert!(!t.contains('\u{1b}'), "菜单约定无 ANSI");
         assert_eq!(
@@ -2826,10 +2852,15 @@ mod tests {
             crate::engine::APPLY_POLL_STEPS as usize,
             "与 apply 同一段轮询：10 × 500ms"
         );
+        assert!(
+            !p.asked.iter().any(|q| q == "回车返回菜单"),
+            "只有 [4]→[2] 停下来等回车：{:?}",
+            p.asked
+        );
     }
 
     #[test]
-    fn menu_service_logs_are_printed_without_ansi() {
+    fn menu_service_logs_have_a_title_compact_lines_and_wait_for_enter() {
         let pp = paths();
         let s = FakeSys::new();
         ready(&s);
@@ -2837,27 +2868,43 @@ mod tests {
         s.reply(
             JOURNAL_50,
             0,
-            "\u{1b}[36mINFO\u{1b}[0m[0000] sing-box started (0.12s)\n\u{1b}[33mWARN\u{1b}[0m[0001] inbound/mixed[mixed-in]: 127.0.0.1:1080\n",
+            "2026-09-13T10:15:30+08:00 baiyi sing-box[4242]: \u{1b}[36mINFO\u{1b}[0m[0000] sing-box started (0.12s)\n\
+             2026-09-13T10:15:31+08:00 baiyi sing-box[4242]: \u{1b}[33mWARN\u{1b}[0m[0001] inbound/mixed[mixed-in]: 127.0.0.1:1080\n\
+             -- Boot 0123456789abcdef --\n",
         );
         profiles_socks().save(&s, &pp).unwrap();
         let n = FakeNet::new();
-        let mut p = Scripted::from(["4", "2", "0"]);
+        // 4 → 2 看日志 → 回车 → 0 退出
+        let mut p = Scripted::from(["4", "2", "", "0"]);
         let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
         menu_loop(&mut ctx).unwrap();
         assert!(s.called(JOURNAL_50), "{:?}", s.calls());
         assert!(!s.called("systemctl restart bui-c.service"));
         let t = ctx.transcript.clone();
-        assert!(
-            t.lines()
-                .any(|l| l == "INFO[0000] sing-box started (0.12s)"),
-            "{t}"
+        let lines: Vec<&str> = t.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| *l == "  ── bui-c.service 最近 50 行日志 ──")
+            .unwrap_or_else(|| panic!("缺标题行：\n{t}"));
+        assert_eq!(lines[at - 1], "", "标题前空一行：\n{t}");
+        assert_eq!(
+            lines[at + 1..at + 4],
+            [
+                "  2026-09-13T10:15:30+08:00 INFO[0000] sing-box started (0.12s)",
+                "  2026-09-13T10:15:31+08:00 WARN[0001] inbound/mixed[mixed-in]: 127.0.0.1:1080",
+                "  -- Boot 0123456789abcdef --",
+            ],
+            "每行 <时间> <消息>，缩进 2 列；解析不了的行原样保留：\n{t}"
         );
-        assert!(
-            t.lines()
-                .any(|l| l == "WARN[0001] inbound/mixed[mixed-in]: 127.0.0.1:1080"),
-            "{t}"
-        );
+        assert!(!t.contains("baiyi"), "去掉主机名：{t}");
+        assert!(!t.contains("sing-box[4242]"), "去掉 ident[pid]：{t}");
         assert!(!t.contains('\u{1b}'), "菜单约定无 ANSI：{t:?}");
+        assert_eq!(
+            p.asked,
+            vec!["选择 [0-9]", "选择 [0-2]", "回车返回菜单", "选择 [0-9]"],
+            "打完日志停下来等回车，0 由主菜单读走"
+        );
+        assert_eq!(t.matches("B-UI 客户端").count(), 2, "{t}");
     }
 
     #[test]
@@ -2869,7 +2916,7 @@ mod tests {
         s.reply(JOURNAL_50, 1, "");
         profiles_socks().save(&s, &pp).unwrap();
         let n = FakeNet::new();
-        let mut p = Scripted::from(["4", "2", "0"]);
+        let mut p = Scripted::from(["4", "2", "", "0"]);
         let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
         menu_loop(&mut ctx).unwrap();
         let t = ctx.transcript.clone();
@@ -2879,6 +2926,11 @@ mod tests {
             "{t}"
         );
         assert!(!t.contains("失败："), "不当成菜单操作失败：{t}");
+        assert!(
+            p.asked.iter().any(|q| q == "回车返回菜单"),
+            "读不到也停一下，别让菜单重画把原因顶上去：{:?}",
+            p.asked
+        );
     }
 
     #[test]
