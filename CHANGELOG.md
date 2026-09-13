@@ -36,6 +36,7 @@ v4 是一次完全重写：控制面与 Linux 客户端改为 Rust 单二进制�
 - 内核改为从上游 GitHub Releases 取静态二进制并校验 sha256，落在 `/opt/b-ui/bin/`；不再调用 `get.hy2.sh` / Xray-install / 发行版包，不再安装 Node.js。
 - 定时任务全部收进守护进程：不再有 cron 行，也不再有 `hy2-watchdog` / `b-ui-resi-health` 等独立 timer。
 - 升级到本版本时 `b-ui-relay` 与 `xray` 各重启一次（中继入站改成每槽一个 `slot-<i>`；xray 的住宅出站改名 `relay-slot-<i>`、`api.services` 追加 `RoutingService`），此后稳定；既有安装的槽位与用户分配在守护进程首次启动时按创建时间自动补齐，**非槽 0 的用户住宅 HY2 端口会变，需刷新一次订阅**。
+- 升级提示（运维）：已装 v4.0.0-rc6 / rc7 的 `bui-c` 需要在客户端机器上重跑一次面板下发的安装脚本 `curl -fsSL https://<面板域名>/packages/bui-c-install.sh | sudo bash` 才能换到新构建（旧版 `bui-c update` 只比版本号，看不见同版本重建）；之后同版本重建由 `bui-c update` 自己跟上。
 
 ### 移除
 - v3 的 shell 与 Node 实现：`server/*.sh`（5 个）、`web/server.js`、`web/{package.json,package-lock.json,node_modules/}`、`b-ui-client.sh`、`b-ui-server.sh`、`version.json`、`test-hy2-tun-config.json`。前端三文件 `web/{index.html,app.js,style.css}` 保留，由 `bui` 内嵌。

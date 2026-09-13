@@ -23,6 +23,55 @@ pub fn units(state: &State) -> Vec<String> {
     crate::reconcile::managed_units(state)
 }
 
+/// 最长的签名窗口（今天是 `XrayGrpcUnavailable` 的 150 秒）
+fn longest_window_secs() -> i64 {
+    [
+        Sig::RelayUpstreamError,
+        Sig::RelayGoogleBlocked,
+        Sig::Hy2AuthHttpFailed,
+        Sig::KernelBindInUse,
+        Sig::KernelCrashLoop,
+        Sig::XrayGrpcUnavailable,
+        Sig::CaddyCertFailed,
+    ]
+    .into_iter()
+    .map(|s| s.rule().window_secs)
+    .max()
+    .unwrap_or_default()
+}
+
+/// 重启后第一轮：持久化的读起点（有游标看 `cursor_at`，否则看 `since`）早于最长签名窗口、或年龄不明
+/// ⇒ 丢掉游标、从现在读起。那段积压里的每一条都会被去抖器当陈旧日志丢掉（D12），读它只是把
+/// 停机期间的大量日志一次读进内存。
+fn drop_stale_start(sr: &mut SentinelRuntime, now: OffsetDateTime) {
+    if sr.cursor.is_none() && sr.since.is_none() {
+        return; // 首次启动：下面 ① 自会从现在读起
+    }
+    let at = if sr.cursor.is_some() {
+        sr.cursor_at.as_deref()
+    } else {
+        sr.since.as_deref()
+    };
+    let window = time::Duration::seconds(longest_window_secs());
+    if at
+        .and_then(parse_rfc3339)
+        .is_some_and(|t| now - t <= window)
+    {
+        return;
+    }
+    tracing::info!(from = ?at, "哨兵持久化的读起点早于最长签名窗口：丢掉游标，从现在读起（积压都是陈旧日志）");
+    sr.cursor = None;
+    sr.cursor_at = None;
+    sr.since = Some(fmt_rfc3339(now));
+}
+
+/// 执行了动作（借用 / 告警 / 重试 / 交看门狗）才盖 [`super::ACTION_COOLDOWN_SECS`] 冷却。住宅两类预案
+/// 的 Info 是「带外探测 / 复核通过，或上游刚被删」——什么都没做，只受 60 秒去抖约束：否则一次误报
+/// （HTTP 上游对慢目标报 deadline exceeded）会让哨兵对该上游失明 10 分钟，真故障只能等巡检。
+fn takes_cooldown(sig: Sig, level: Level) -> bool {
+    !(matches!(sig, Sig::RelayUpstreamError | Sig::RelayGoogleBlocked) && level == Level::Info)
+}
+
 /// 常驻在循环里的哨兵状态
 #[derive(Default)]
 pub struct Sentinel {
@@ -51,11 +100,15 @@ pub async fn tick(ctx: &DaemonCtx, deps: &Deps, s: &mut Sentinel) -> TickReport 
     let hy2_http = state.system.hy2_auth == Hy2Auth::Http;
     let g = rstate::group_of(&state);
     drop(state);
-    if s.sr.is_none() {
+    let first = s.sr.is_none();
+    if first {
         s.sr = Some(engine::sentinel_of(&ctx.runtime.read().await));
     }
     let mut sr = s.sr.clone().unwrap_or_default();
     let before = sr.clone();
+    if first {
+        drop_stale_start(&mut sr, now);
+    }
 
     // ① 读：有游标续读；没有就从 `since`（首次 = 现在）读起，不回放历史
     let from = match (&sr.cursor, sr.since.as_deref().and_then(parse_rfc3339)) {
@@ -71,6 +124,12 @@ pub async fn tick(ctx: &DaemonCtx, deps: &Deps, s: &mut Sentinel) -> TickReport 
     let records = match tokio::task::spawn_blocking(move || host.journal_read(&u2, &f2)).await {
         Ok(Ok(v)) => {
             s.last_error = None;
+            if let Some(last) = v.last() {
+                sr.cursor = Some(last.cursor.clone());
+            }
+            if sr.cursor.is_some() {
+                sr.cursor_at = Some(fmt_rfc3339(now));
+            }
             v
         }
         Ok(Err(e)) => {
@@ -80,6 +139,7 @@ pub async fn tick(ctx: &DaemonCtx, deps: &Deps, s: &mut Sentinel) -> TickReport 
             }
             s.last_error = Some(msg);
             sr.cursor = None;
+            sr.cursor_at = None;
             sr.since = Some(fmt_rfc3339(now));
             Vec::new()
         }
@@ -88,9 +148,6 @@ pub async fn tick(ctx: &DaemonCtx, deps: &Deps, s: &mut Sentinel) -> TickReport 
             Vec::new()
         }
     };
-    if let Some(last) = records.last() {
-        sr.cursor = Some(last.cursor.clone());
-    }
 
     // ② 匹配 + 去抖。relay 的对象当场从成员 tag（位置键）换成 uuid，换不出来的丢弃
     let mut fired: Vec<Fired> = Vec::new();
@@ -127,7 +184,9 @@ pub async fn tick(ctx: &DaemonCtx, deps: &Deps, s: &mut Sentinel) -> TickReport 
             continue;
         }
         let o = dispatch(ctx, deps, sig, &key, upstream, &r, now).await;
-        sr.acted.insert(akey, fmt_rfc3339(now));
+        if takes_cooldown(sig, o.level) {
+            sr.acted.insert(akey, fmt_rfc3339(now));
+        }
         out.push(Incident {
             // 预案做完（快探最长 PROBE_TIMEOUT_SECS + 借用的 PUT）之后才盖时间戳：事件时刻 = 该槽
             // 已借用的时刻。演练判据①「首条错误 → 记事件并借用 ≤15 秒」量的是它，不是本轮开头
@@ -155,14 +214,15 @@ pub async fn tick(ctx: &DaemonCtx, deps: &Deps, s: &mut Sentinel) -> TickReport 
         });
     }
 
-    // ⑤ 落盘：有事件 / 冷却表或起点变了 ⇒ 立即；只有游标前进 ⇒ 至少隔 CURSOR_PERSIST_SECS
+    // ⑤ 落盘：有事件 / 冷却表或起点变了 ⇒ 立即；只有游标或它的读取时刻前进 ⇒ 至少隔
+    // CURSOR_PERSIST_SECS。日志安静时游标不动，读取时刻也照样按节流落盘：重启时靠它判断积压是否过旧
     let others_changed = {
         let (mut a, mut b) = (sr.clone(), before.clone());
-        a.cursor = None;
-        b.cursor = None;
+        (a.cursor, a.cursor_at) = (None, None);
+        (b.cursor, b.cursor_at) = (None, None);
         a != b
     };
-    let cursor_due = sr.cursor != before.cursor
+    let cursor_due = (sr.cursor != before.cursor || sr.cursor_at != before.cursor_at)
         && s.last_persist
             .is_none_or(|t| now - t >= time::Duration::seconds(CURSOR_PERSIST_SECS));
     if !out.is_empty() || others_changed || cursor_due {
@@ -423,6 +483,15 @@ mod tests {
             "事件落盘"
         );
         assert_eq!(k.notes.0.lock().unwrap().len(), 1, "外部通知口收到一次");
+        assert!(
+            engine::sentinel_of(&k.ctx.runtime.read().await)
+                .acted
+                .contains_key(&engine::action_key(
+                    Sig::RelayUpstreamError,
+                    &Uuid::from_u128(2).to_string()
+                )),
+            "真借用了 ⇒ 盖 10 分钟冷却"
+        );
 
         // 10 秒后又来 3 条：去抖窗口内，不触发
         k.host.advance(10);
@@ -544,6 +613,130 @@ mod tests {
             ("kernel_bind_in_use", "delegate_watchdog")
         );
         assert!(k.host.ops().iter().all(|o| !o.starts_with("systemd:")));
+    }
+
+    /// 带外探测通过 = 什么都没做：不占 10 分钟动作冷却，只剩 60 秒去抖。否则一次误报（HTTP 上游对慢
+    /// 目标报 deadline exceeded）会让哨兵对这条上游失明 10 分钟，真故障只能等巡检
+    #[tokio::test]
+    async fn a_passing_probe_takes_no_cooldown_so_the_next_burst_is_probed_again() {
+        let k = kit().await;
+        k.prober.with(|i| {
+            i.tcp_ms = Some(20);
+            i.gets.insert(
+                crate::modules::residential::LATENCY_PROBE_URL.into(),
+                Ok(crate::modules::residential::proxy::HttpProbe {
+                    status: 204,
+                    body: String::new(),
+                }),
+            );
+        });
+        k.host.advance(3);
+        feed(
+            &k,
+            (0..3)
+                .map(|s| rec("b-ui-relay", s, &timeout("resi-2")))
+                .collect(),
+        );
+        let mut s = Sentinel::default();
+        let rep = tick(&k.ctx, &k.deps, &mut s).await;
+        assert_eq!(rep.incidents.len(), 1, "{:?}", rep.incidents);
+        assert_eq!(rep.incidents[0].level, Level::Info);
+        assert!(
+            engine::sentinel_of(&k.ctx.runtime.read().await)
+                .acted
+                .is_empty(),
+            "探测通过不占动作冷却"
+        );
+        // 61 秒后同一上游又攒满 3 条：去抖已过 ⇒ 再探一次
+        k.host.advance(61);
+        feed(
+            &k,
+            (61..64)
+                .map(|s| rec("b-ui-relay", s, &timeout("resi-2")))
+                .collect(),
+        );
+        let rep = tick(&k.ctx, &k.deps, &mut s).await;
+        assert_eq!(rep.incidents.len(), 1, "{:?}", rep.incidents);
+        assert_eq!(
+            k.prober.calls().iter().filter(|c| *c == "tcp").count(),
+            2,
+            "{:?}",
+            k.prober.calls()
+        );
+        assert!(k.clash.calls().is_empty(), "两次都探通，一次都不借");
+    }
+
+    /// 守护进程停机太久：持久化的读起点早于最长签名窗口（150 秒）⇒ 丢掉游标、从现在读起。那段积压里的
+    /// 每一条都会被去抖器当陈旧日志丢掉（D12），读它只是把大量日志一次读进内存
+    #[tokio::test]
+    async fn a_persisted_start_older_than_the_longest_window_restarts_from_now() {
+        let now = ":since=2026-09-11T00:00:00Z";
+        for (seed, want, why) in [
+            (
+                serde_json::json!({"cursor": "c-old", "cursor_at": "2026-09-10T23:57:29Z"}),
+                now,
+                "游标读到 151 秒前",
+            ),
+            (
+                serde_json::json!({"cursor": "c-old"}),
+                now,
+                "旧构建落的游标没有读取时刻：年龄不明，按过旧处理",
+            ),
+            (
+                serde_json::json!({"since": "2026-09-10T20:00:00Z"}),
+                now,
+                "没有游标、起点是 4 小时前",
+            ),
+            (
+                serde_json::json!({"cursor": "c-old", "cursor_at": "2026-09-10T23:57:40Z"}),
+                ":cursor=c-old",
+                "停机 140 秒：还在窗口内，照常续读",
+            ),
+        ] {
+            let k = kit().await;
+            k.ctx
+                .runtime
+                .update(move |rt| {
+                    rt.extra.insert(engine::SENTINEL_KEY.into(), seed);
+                })
+                .await;
+            tick(&k.ctx, &k.deps, &mut Sentinel::default()).await;
+            let op = journal_op(&k.host);
+            assert!(op.ends_with(want), "{why}：{op}");
+            if want == now {
+                let rt = k.ctx.runtime.read().await;
+                let sr = &rt.extra[engine::SENTINEL_KEY];
+                assert_eq!(
+                    (sr["cursor"].as_str(), sr["since"].as_str()),
+                    (None, Some("2026-09-11T00:00:00Z")),
+                    "{why}：新起点落盘"
+                );
+            }
+        }
+    }
+
+    /// 日志安静时游标不动，但「读到哪一刻」照样随节流落盘：否则安静 10 分钟后重启一次，
+    /// 游标看着就像 10 分钟前的，会被当成过旧丢掉
+    #[tokio::test]
+    async fn quiet_logs_still_refresh_the_persisted_cursor_time() {
+        let k = kit().await;
+        feed(&k, vec![rec("xray", 0, "Xray 26.3.27 started")]);
+        let mut s = Sentinel::default();
+        tick(&k.ctx, &k.deps, &mut s).await;
+        k.host.advance(61);
+        tick(&k.ctx, &k.deps, &mut s).await; // 没有新日志
+        assert_eq!(
+            k.ctx.runtime.read().await.extra[engine::SENTINEL_KEY]["cursor_at"].as_str(),
+            Some("2026-09-11T00:01:01Z")
+        );
+        // 停机 100 秒后重启：离上次落盘的读取时刻还在窗口内 ⇒ 续读
+        k.host.advance(100);
+        tick(&k.ctx, &k.deps, &mut Sentinel::default()).await;
+        assert!(
+            journal_op(&k.host).ends_with(":cursor=c-xray-0"),
+            "{}",
+            journal_op(&k.host)
+        );
     }
 
     #[tokio::test]
