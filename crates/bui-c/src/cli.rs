@@ -245,10 +245,11 @@ fn engine_status<S: Sys, N: Net, P: Prompt>(ctx: &Ctx<'_, S, N, P>, prof: &Profi
 
 /// 这次检查之后「还有新版没装」吗——菜单 `[6] ★ 有新版` 的口径。
 ///
-/// 刚刚自替换成 manifest 版本时要算「没有新版」：本进程的 `VERSION` 还是旧二进制的，
-/// 光比版本号会让菜单一直挂着 ★，直到下次检查。
+/// 口径与 [`update::self_build_differs`] 相同：版本不同，或同版本但不是同一份构建（rc 通道重建）。
+/// 刚刚自替换成 manifest 那一份时要算「没有新版」：本进程的 `VERSION` 还是旧二进制的，
+/// 不看 `self_updated` 的话菜单会一直挂着 ★，直到下次检查。
 fn new_version_pending(r: &update::Report) -> bool {
-    r.manifest_version != crate::VERSION && !r.self_updated
+    r.self_outdated && !r.self_updated
 }
 
 /// `BUI_C_PANEL=<url>`：本次进程里把面板地址换成它（只在内存里，不落盘），给预发布期
@@ -624,8 +625,10 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
                 r.manifest_version, r.manifest_source
             ));
             if *check_only {
-                ctx.say(if r.manifest_version == crate::VERSION {
+                ctx.say(if !r.self_outdated {
                     "已是最新"
+                } else if r.manifest_version == crate::VERSION {
+                    "有同版本的新构建（rc 通道重建），跑 `bui-c update` 升级"
                 } else {
                     "有新版，跑 `bui-c update` 升级"
                 });
@@ -2025,13 +2028,17 @@ mod tests {
             0,
             "sing-box version 1.14.5\n",
         );
+        // 盘上已装的正是 manifest 里那一份构建：这轮自更新什么都不换，但照样算「更新过」
+        s.put(crate::paths::SELF_BIN, "bui-c-installed");
         let n = FakeNet::new();
         n.route(crate::check::PROBE_URL, FakeReply::Status(204));
         n.route(
             "https://panel.example.com/packages/manifest.json",
             FakeReply::Text(format!(
-                r#"{{"version":"{}","kernels":{{"client_sing_box":"1.14.5"}},"artifacts":{{}}}}"#,
-                crate::VERSION
+                r#"{{"version":"{ver}","kernels":{{"client_sing_box":"1.14.5"}},"artifacts":{{"bui-c-linux-{arch}":{{"url":"https://github.com/x/bui-c","sha256":"{sha}"}}}}}}"#,
+                ver = crate::VERSION,
+                arch = crate::update::arch_suffix(),
+                sha = crate::update::sha256_hex(b"bui-c-installed"),
             )),
         );
         let mut p = Scripted::from([]);
@@ -2359,14 +2366,18 @@ mod tests {
         });
         prof.save(&s, &pp).unwrap();
         let n = FakeNet::new();
-        let manifest = |ver: &str| {
+        // 盘上已装的 bui-c；manifest 里本机架构的 bui-c 资产 sha 与它相同 = 同一份构建
+        s.put(crate::paths::SELF_BIN, "bui-c-installed");
+        let installed = crate::update::sha256_hex(b"bui-c-installed");
+        let manifest = |ver: &str, sha: &str| {
             FakeReply::Text(format!(
-                r#"{{"version":"{ver}","kernels":{{"client_sing_box":"1.14.5"}},"artifacts":{{}}}}"#
+                r#"{{"version":"{ver}","kernels":{{"client_sing_box":"1.14.5"}},"artifacts":{{"bui-c-linux-{arch}":{{"url":"https://github.com/x/bui-c","sha256":"{sha}"}}}}}}"#,
+                arch = crate::update::arch_suffix()
             ))
         };
         n.route(
             "https://panel.example.com/packages/manifest.json",
-            manifest("9.9.9"),
+            manifest("9.9.9", &installed),
         );
 
         let mut p = Scripted::from([]);
@@ -2386,20 +2397,63 @@ mod tests {
         let prof2 = Profiles::load(&s, &pp).unwrap();
         assert!(menu::render_options(&engine_status(&ctx, &prof2)).contains("★ 有新版"));
 
-        // 再查一次，manifest 与本机同版 → 标记清掉
+        // 再查一次，manifest 与本机同版、且盘上就是那一份构建 → 标记清掉
         n.route(
             "https://panel.example.com/packages/manifest.json",
-            manifest(crate::VERSION),
+            manifest(crate::VERSION, &installed),
         );
         let mut p = Scripted::from([]);
         let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
         dispatch(&parse(&["update", "--check-only"]), &mut ctx).unwrap();
+        assert!(ctx.transcript.contains("已是最新"), "{}", ctx.transcript);
         assert!(!Runtime::load(&s, &pp).update_available);
         let mut p = Scripted::from([]);
         let mut ctx = Ctx::new(&s, &n2, &pp, &mut p, false, false);
         dispatch(&parse(&["status"]), &mut ctx).unwrap();
         let prof3 = Profiles::load(&s, &pp).unwrap();
         assert!(!menu::render_options(&engine_status(&ctx, &prof3)).contains("★ 有新版"));
+    }
+
+    /// 与服务端 `kernels::bui_build_differs` 同口径：版本相同、但 manifest 里本机架构的 bui-c
+    /// 不是盘上这一份（rc 通道的同版本重建）也算有新版——菜单挂 ★，`--check-only` 说清是同版本的
+    /// 新构建，而不是说「已是最新」。
+    #[test]
+    fn update_check_only_reports_a_same_version_rebuild() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        let mut prof = profiles_socks();
+        prof.panel = Some(crate::profiles::Panel {
+            base_url: "https://panel.example.com".into(),
+            username: "alice".into(),
+        });
+        prof.save(&s, &pp).unwrap();
+        s.put(crate::paths::SELF_BIN, "bui-c-rc6");
+        let n = FakeNet::new();
+        n.route(
+            "https://panel.example.com/packages/manifest.json",
+            FakeReply::Text(format!(
+                r#"{{"version":"{ver}","kernels":{{"client_sing_box":"1.14.5"}},"artifacts":{{"bui-c-linux-{arch}":{{"url":"https://github.com/x/bui-c","sha256":"{sha}"}}}}}}"#,
+                ver = crate::VERSION,
+                arch = crate::update::arch_suffix(),
+                sha = crate::update::sha256_hex(b"bui-c-rc7"),
+            )),
+        );
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["update", "--check-only"]), &mut ctx).unwrap();
+        assert!(
+            ctx.transcript.contains("同版本的新构建"),
+            "{}",
+            ctx.transcript
+        );
+        assert!(!ctx.transcript.contains("已是最新"), "{}", ctx.transcript);
+        assert!(Runtime::load(&s, &pp).update_available, "菜单要挂 ★");
+        assert_eq!(
+            s.get(crate::paths::SELF_BIN).unwrap(),
+            "bui-c-rc6",
+            "只检查不换"
+        );
     }
 
     #[test]

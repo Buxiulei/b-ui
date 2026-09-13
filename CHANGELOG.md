@@ -26,6 +26,7 @@ v4 是一次完全重写：控制面与 Linux 客户端改为 Rust 单二进制�
 ### 变更
 - `bui-c import-v3`：先备好 sing-box 并用 `sing-box check` 自检，最后才卸 v3 单元（拿不到内核即中止、v3 一字不动）；新增 `--panel` / `--mode` 与 `BUI_C_PANEL` 环境变量；profile 名沿用 v3 目录名；接受 v3 早期 `user%3Apass@` 形式的 hysteria2 链接（此前三个目录会被跳过）；重跑幂等，不再重复导入、不再删掉正在用的 `bui-tun`。
 - `bui-c update` 与 `bui-c-install.sh`：GitHub `releases/latest` 404（仓库里只有预发布）时回退到最新的 `v<x.y.z>-rcN`；面板下发的 `bui-c-install.sh` 默认从该面板的 `/packages` 取制品（`Host` 头只认主机名形状）。
+- `bui-c update` 与服务端 `bui upgrade` 同口径判断要不要换自身：版本号不同，或版本号相同但 manifest 里本机架构 `bui-c-linux-<arch>` 的 sha256 与已装二进制不同（rc 通道的同版本重建）都升级；`update --check-only` 会说明「有同版本的新构建」，菜单 ★ 同步。已装的 rc6 / rc7 自身还只比版本号，要重跑一次面板下发的 `bui-c-install.sh` 换上新构建，之后 `bui-c update` 才能跟上。
 - `bui-c` 导入按连接身份去重：同一连接原地更新（活动节点会重新生效），同名不同账号另起 `-2` 并提示；中文面板用户名导入的节点名为 `<主机名>-<kind>`。
 - `bui-c` 自动更新来源只认 https 且 `/api/nodes` 成功返回的 v4 面板；订阅导入不再改写更新源，换来源时会提示；网络错误不再把完整 URL（含用户名）打到屏幕与日志。
 - `bui-c` 数字菜单经真机逐键测试后修订：服务控制改为「重启 / 最近日志」二级菜单，导入可直接粘贴面板或订阅地址，节点列表两行一组压到 80 列内，输错原地重问，主菜单空行不再退出，非 UTF-8 输入不再崩出，巡检异常改用中文说明。
