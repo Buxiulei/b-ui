@@ -27,6 +27,7 @@ pub fn units(state: &State) -> Vec<String> {
 fn longest_window_secs() -> i64 {
     [
         Sig::RelayUpstreamError,
+        Sig::RelayUpstreamAuthFailed,
         Sig::RelayGoogleBlocked,
         Sig::Hy2AuthHttpFailed,
         Sig::KernelBindInUse,
@@ -69,7 +70,7 @@ fn drop_stale_start(sr: &mut SentinelRuntime, now: OffsetDateTime) {
 /// 的 Info 是「带外探测 / 复核通过，或上游刚被删」——什么都没做，只受 60 秒去抖约束：否则一次误报
 /// （HTTP 上游对慢目标报 deadline exceeded）会让哨兵对该上游失明 10 分钟，真故障只能等巡检。
 fn takes_cooldown(sig: Sig, level: Level) -> bool {
-    !(matches!(sig, Sig::RelayUpstreamError | Sig::RelayGoogleBlocked) && level == Level::Info)
+    !(sig.on_upstream() && level == Level::Info)
 }
 
 /// 常驻在循环里的哨兵状态
@@ -79,7 +80,7 @@ pub struct Sentinel {
     /// 首轮从 runtime 读出，此后**以内存为准**（落盘有节流；每轮都从 runtime 读会重复读同一段日志）
     sr: Option<SentinelRuntime>,
     last_persist: Option<OffsetDateTime>,
-    /// 上一次读 journald 的错误文案：同样的错误只打一次日志（没装 journalctl 时每 5 秒一条是刷屏）
+    /// 上一次读 journald 的错误文案：同样的错误只打一次日志（没装 journalctl 时每轮一条是刷屏）
     last_error: Option<String>,
 }
 
@@ -158,14 +159,13 @@ pub async fn tick(ctx: &DaemonCtx, deps: &Deps, s: &mut Sentinel) -> TickReport 
         if m.sig == Sig::Hy2AuthHttpFailed && !hy2_http {
             continue;
         }
-        let upstream = match m.sig {
-            Sig::RelayUpstreamError | Sig::RelayGoogleBlocked => {
-                match clash::id_of_tag(&g, &m.subject) {
-                    Some(id) => Some(id),
-                    None => continue,
-                }
+        let upstream = if m.sig.on_upstream() {
+            match clash::id_of_tag(&g, &m.subject) {
+                Some(id) => Some(id),
+                None => continue,
             }
-            _ => None,
+        } else {
+            None
         };
         let key = upstream.map_or_else(|| m.subject.clone(), |id| id.to_string());
         if s.engine.observe(m.sig, &key, r.ts, now) {
@@ -188,8 +188,8 @@ pub async fn tick(ctx: &DaemonCtx, deps: &Deps, s: &mut Sentinel) -> TickReport 
             sr.acted.insert(akey, fmt_rfc3339(now));
         }
         out.push(Incident {
-            // 预案做完（快探最长 PROBE_TIMEOUT_SECS + 借用的 PUT）之后才盖时间戳：事件时刻 = 该槽
-            // 已借用的时刻。演练判据①「首条错误 → 记事件并借用 ≤15 秒」量的是它，不是本轮开头
+            // 预案做完（网关不通时快探最长 PROBE_TCP_TIMEOUT_SECS + 借用的 PUT）之后才盖时间戳：
+            // 事件时刻 = 该槽已借用的时刻。演练判据①「首条错误 → 记事件并借用 ≤15 秒」量的是它
             at: fmt_rfc3339(ctx.host.now()),
             unit: r.unit.clone(),
             signature: sig.id().to_string(),
@@ -265,14 +265,17 @@ async fn dispatch(
     now: OffsetDateTime,
 ) -> Outcome {
     match (sig, upstream) {
-        (Sig::RelayUpstreamError, Some(id)) => {
+        (Sig::RelayUpstreamError | Sig::RelayUpstreamAuthFailed, Some(id)) => {
             resi::on_upstream_error(ctx, deps.prober.clone(), deps.clash.clone(), id, now).await
         }
         (Sig::RelayGoogleBlocked, Some(id)) => {
             resi::on_google_blocked(ctx, deps.prober.clone(), deps.clash.clone(), id, now).await
         }
         // relay 签名的对象在匹配那一步就换成了 uuid（换不出来的已丢弃）
-        (Sig::RelayUpstreamError | Sig::RelayGoogleBlocked, None) => {
+        (
+            Sig::RelayUpstreamError | Sig::RelayUpstreamAuthFailed | Sig::RelayGoogleBlocked,
+            None,
+        ) => {
             unreachable!("relay 签名必带上游 uuid")
         }
         (Sig::Hy2AuthHttpFailed, _) => system::on_hy2_auth(ctx, &r.unit).await,
@@ -282,7 +285,8 @@ async fn dispatch(
     }
 }
 
-/// 每 [`POLL_SECS`] 秒一轮；一轮里的预案（带外探测最长 ~5 秒）拖长了就顺延，不补跑
+/// 每 [`POLL_SECS`] 秒一轮；一轮里的预案（网关不通时带外探测 ≤ [`super::PROBE_TCP_TIMEOUT_SECS`]
+/// 秒，网关通时完整探测更久）拖长了就顺延，不补跑
 pub async fn sentinel_loop(ctx: DaemonCtx, deps: Deps) {
     let mut s = Sentinel::default();
     let mut every = tokio::time::interval(std::time::Duration::from_secs(POLL_SECS));
@@ -442,12 +446,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn three_timeouts_to_one_upstream_give_one_probe_one_borrow_one_incident() {
+    async fn two_timeouts_to_one_upstream_give_one_probe_one_borrow_one_incident() {
         let k = kit().await;
         k.host.advance(3);
         feed(
             &k,
-            (0..3)
+            (0..2)
                 .map(|s| rec("b-ui-relay", s, &timeout("resi-2")))
                 .collect(),
         );
@@ -515,22 +519,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn two_timeouts_unknown_tags_and_stale_backlog_do_nothing() {
+    async fn one_timeout_unknown_tags_and_stale_backlog_do_nothing() {
         let k = kit().await;
         let mut s = Sentinel::default();
+        feed(&k, vec![rec("b-ui-relay", 0, &timeout("resi-2"))]);
+        assert!(
+            tick(&k.ctx, &k.deps, &mut s).await.incidents.is_empty(),
+            "1 条不触发（连接类门槛 2 条）"
+        );
         feed(
             &k,
             (0..2)
-                .map(|s| rec("b-ui-relay", s, &timeout("resi-2")))
-                .collect(),
-        );
-        assert!(
-            tick(&k.ctx, &k.deps, &mut s).await.incidents.is_empty(),
-            "不到 3 条"
-        );
-        feed(
-            &k,
-            (0..3)
                 .map(|s| rec("b-ui-relay", s, &timeout("resi-9")))
                 .collect(),
         );
@@ -540,7 +539,7 @@ mod tests {
         );
         feed(
             &k,
-            (-300..-297)
+            (-300..-298)
                 .map(|s| rec("b-ui-relay", s, &timeout("resi-3")))
                 .collect(),
         );
@@ -633,7 +632,7 @@ mod tests {
         k.host.advance(3);
         feed(
             &k,
-            (0..3)
+            (0..2)
                 .map(|s| rec("b-ui-relay", s, &timeout("resi-2")))
                 .collect(),
         );
@@ -647,11 +646,11 @@ mod tests {
                 .is_empty(),
             "探测通过不占动作冷却"
         );
-        // 61 秒后同一上游又攒满 3 条：去抖已过 ⇒ 再探一次
+        // 61 秒后同一上游又攒满 2 条：去抖已过 ⇒ 再探一次
         k.host.advance(61);
         feed(
             &k,
-            (61..64)
+            (61..63)
                 .map(|s| rec("b-ui-relay", s, &timeout("resi-2")))
                 .collect(),
         );
@@ -664,6 +663,170 @@ mod tests {
             k.prober.calls()
         );
         assert!(k.clash.calls().is_empty(), "两次都探通，一次都不借");
+    }
+
+    fn auth_fail(tag: &str) -> String {
+        format!(
+            "ERROR[4007] [2302991393 0.31s] connection: open connection to www.gstatic.com:443 \
+             using outbound/http[{tag}]: unexpected status: 407 Proxy Authentication Required"
+        )
+    }
+
+    /// 丢包时 SYN 没有回音：探网关的 TCP 要等满给它的时限。把这段时间记到假时钟上，
+    /// 事件的 `at`（预案做完才盖）才量得出预案的真实耗时
+    fn gateway_dropped(k: &Kit) {
+        let host = k.host.clone();
+        k.prober.with(|i| {
+            i.on_tcp_fail = Some(Box::new(move |within| {
+                host.advance(within.as_secs() as i64)
+            }))
+        });
+    }
+
+    fn secs_until(from: OffsetDateTime, at: &str) -> i64 {
+        (parse_rfc3339(at).expect("at 是 RFC3339") - from).whole_seconds()
+    }
+
+    /// 演练判据①的延迟预算（2026-09-13 真机 30.3 秒、SLA 15 秒之后）：达到门槛的那条错误最晚在它
+    /// 之后一个轮询周期被读到；带外探测 TCP 不通最多等 PROBE_TCP_TIMEOUT_SECS 就判不可达，不再跑
+    /// 完整探测；借用只是毫秒级的 Clash PUT（留 1 秒）
+    #[tokio::test]
+    async fn a_dropped_gateway_is_borrowed_within_one_poll_plus_the_tcp_timeout() {
+        assert_eq!(
+            (POLL_SECS, super::super::PROBE_TCP_TIMEOUT_SECS),
+            (2, 3),
+            "spec §5.7 的数字"
+        );
+        let k = kit().await;
+        gateway_dropped(&k);
+        // 两条并发连接同时报错（演练就是并发三个请求），刚好落在上一轮之后：一个轮询周期后才读到
+        k.host.advance(POLL_SECS as i64);
+        let reached = rec("b-ui-relay", 0, &timeout("resi-2"));
+        let ts = reached.ts;
+        feed(&k, vec![rec("b-ui-relay", 0, &timeout("resi-2")), reached]);
+        let rep = tick(&k.ctx, &k.deps, &mut Sentinel::default()).await;
+        assert_eq!(rep.incidents.len(), 1, "{:?}", rep.incidents);
+        assert_eq!(rep.incidents[0].level, Level::Error);
+        assert_eq!(k.clash.selected("slot-1-pool").as_deref(), Some("resi-1"));
+        assert_eq!(
+            k.prober.calls(),
+            vec!["tcp"],
+            "TCP 不通即判不可达，不再跑完整探测"
+        );
+        let budget = POLL_SECS as i64 + super::super::PROBE_TCP_TIMEOUT_SECS as i64 + 1;
+        let took = secs_until(ts, &rep.incidents[0].at);
+        assert!(
+            took <= budget,
+            "达到门槛的错误 → 事件 {took} 秒，预算 {budget} 秒"
+        );
+    }
+
+    /// 最坏情况（客户端串行、错误一条一条来）：第 2 条错误要等 relay 再拨一次上游、超时才出现。
+    /// relay 的拨号超时 = sing-box 的 `C.TCPConnectTimeout` 5 秒（constant/timeout.go；relay 出站
+    /// 不设 `connect_timeout`，见 bui-schema `render::relay`）。首条错误 → 事件 = 5 + 2 + 3 = 10 秒
+    #[tokio::test]
+    async fn errors_one_relay_dial_timeout_apart_still_meet_the_drill_sla() {
+        const RELAY_DIAL_SECS: i64 = 5;
+        const DRILL_DETECT_SLA: i64 = 15;
+        let k = kit().await;
+        gateway_dropped(&k);
+        let mut s = Sentinel::default();
+        k.host.advance(POLL_SECS as i64);
+        let first = rec("b-ui-relay", 0, &timeout("resi-2"));
+        let t0 = first.ts;
+        feed(&k, vec![first]);
+        assert!(
+            tick(&k.ctx, &k.deps, &mut s).await.incidents.is_empty(),
+            "1 条不触发"
+        );
+        // 第 2 条在第 5 秒出现，一个轮询周期后读到（此刻 = 7）
+        k.host.advance(RELAY_DIAL_SECS);
+        feed(
+            &k,
+            vec![rec("b-ui-relay", RELAY_DIAL_SECS, &timeout("resi-2"))],
+        );
+        let rep = tick(&k.ctx, &k.deps, &mut s).await;
+        assert_eq!(rep.incidents.len(), 1, "{:?}", rep.incidents);
+        let took = secs_until(t0, &rep.incidents[0].at);
+        assert_eq!(
+            took,
+            RELAY_DIAL_SECS + POLL_SECS as i64 + super::super::PROBE_TCP_TIMEOUT_SECS as i64
+        );
+        assert!(took <= DRILL_DETECT_SLA, "首条错误 → 事件 {took} 秒");
+    }
+
+    /// TCP 连得上 ⇒ 仍走原来的完整探测（经隧道两次请求 + 407 补判），不能因为「网关在」就放过
+    #[tokio::test]
+    async fn a_reachable_gateway_still_gets_the_full_probe() {
+        use crate::modules::residential::{HEALTH_PROBE_HOST, HEALTH_PROBE_URL, LATENCY_PROBE_URL};
+        let k = kit().await;
+        k.prober.with(|i| i.tcp_ms = Some(20)); // 网关通；经隧道的请求缺省全失败
+        k.host.advance(2);
+        feed(
+            &k,
+            (0..2)
+                .map(|s| rec("b-ui-relay", s, &timeout("resi-2")))
+                .collect(),
+        );
+        let rep = tick(&k.ctx, &k.deps, &mut Sentinel::default()).await;
+        assert_eq!(rep.incidents.len(), 1, "{:?}", rep.incidents);
+        assert_eq!(rep.incidents[0].level, Level::Error);
+        assert_eq!(
+            k.prober.calls(),
+            vec![
+                "tcp".to_string(),
+                format!("timed:{LATENCY_PROBE_URL}"),
+                format!("get:{HEALTH_PROBE_URL}"),
+                format!("connect:{HEALTH_PROBE_HOST}:443"),
+            ]
+        );
+        assert_eq!(k.clash.selected("slot-1-pool").as_deref(), Some("resi-1"));
+    }
+
+    /// 凭据类签名门槛不变（60 秒 3 条），与连接类共用同一个预案与动作冷却
+    #[tokio::test]
+    async fn credential_failures_still_need_three() {
+        let k = kit().await;
+        k.prober.with(|i| {
+            i.tcp_ms = Some(20);
+            i.gets.insert(
+                crate::modules::residential::LATENCY_PROBE_URL.into(),
+                Err("__auth_failed__".into()),
+            );
+        });
+        k.host.advance(3);
+        let mut s = Sentinel::default();
+        feed(
+            &k,
+            (0..2)
+                .map(|s| rec("b-ui-relay", s, &auth_fail("resi-2")))
+                .collect(),
+        );
+        assert!(
+            tick(&k.ctx, &k.deps, &mut s).await.incidents.is_empty(),
+            "2 条凭据失效不触发"
+        );
+        feed(&k, vec![rec("b-ui-relay", 2, &auth_fail("resi-2"))]);
+        let rep = tick(&k.ctx, &k.deps, &mut s).await;
+        assert_eq!(rep.incidents.len(), 1, "{:?}", rep.incidents);
+        let inc = &rep.incidents[0];
+        assert_eq!(
+            (inc.signature.as_str(), inc.action.as_str()),
+            ("relay_upstream_auth_failed", "probe_and_borrow")
+        );
+        assert_eq!(
+            inc.result,
+            "IP 198.51.100.8 凭据失效（407 / SOCKS5 认证被拒），槽 1 已临时切到 198.51.100.7"
+        );
+        assert!(
+            engine::sentinel_of(&k.ctx.runtime.read().await)
+                .acted
+                .contains_key(&engine::action_key(
+                    Sig::RelayUpstreamError,
+                    &Uuid::from_u128(2).to_string()
+                )),
+            "与连接类共用一条动作冷却"
+        );
     }
 
     /// 守护进程停机太久：持久化的读起点早于最长签名窗口（150 秒）⇒ 丢掉游标、从现在读起。那段积压里的
