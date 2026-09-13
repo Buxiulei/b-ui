@@ -2059,15 +2059,16 @@ via 的选择复用 `check::probe` 里 `Mode → Via` 那一段（`check.rs:125-
 
 ```rust
 // crates/bui-schema/src/render/client.rs
-/// 节点 → 出站 JSON。客户端主配置用 "proxy-out"，测速用调用方给的 tag。
+/// 节点 → 出站 JSON。客户端主配置用 "proxy-out"，测速用 probe_config 按下标生成的 probe-<i>。
 pub fn node_outbound(node: &Node, tag: &str) -> Value;   // 原私有 outbound() 改成它的一行包装
 
 /// 测速的一个目标：节点 + 本地 socks 入站端口 + 这个入站的随机凭据（D20，来自 d3-lite §4）。
+/// 凭据用 String，由这个结构体独占；不派生 Debug / Clone，凭据不会经 {:?} 进日志。没有 tag 字段。
 pub struct ProbeTarget<'a> {
     pub node: &'a Node,
     pub listen_port: u16,
-    pub username: &'a str,
-    pub password: &'a str,
+    pub user: String,
+    pub pass: String,
 }
 
 /// 多节点测速配置：每个目标一个 127.0.0.1 socks 入站（tag `probe-in-<i>`），按 inbound 分流到
@@ -2077,7 +2078,7 @@ pub struct ProbeTarget<'a> {
 pub fn probe_config(targets: &[ProbeTarget<'_>]) -> Value;
 ```
 
-- tag 由函数内部按下标生成，调用方不用操心唯一性。另外写死 `route.default_domain_resolver = "local-dns"`、`log.level = "error"`、`dns.strategy = "ipv4_only"`，与客户端主配置一致。
+- tag 由函数内部按下标生成，调用方不用操心唯一性（同一节点测两次、两台服务器上同名的节点都不会撞 tag）；各目标的 `listen_port` 互不相同由调用方保证，`sing-box check` 不绑端口，查不出重复。另外写死 `route.default_domain_resolver = "local-dns"`、`log.level = "error"`、`dns.strategy = "ipv4_only"`，与客户端主配置一致。
 - 只测一个节点就是 `targets` 长度为 1 的情况，不再单独提供一个 `probe_config(node, port)`，少一个公开 API。
 - **验证**：`tests/kernel_client.rs` 新增 `probe_config_checks_on_all_kernels`：四种节点，分别 1 个目标和 4 个目标，走 `common::check_singbox_all`（1.12 / 1.13 / 1.14，缺哪一版跳哪一版，`tests/common/mod.rs:54-66`）。拆出 `node_outbound` 之后，`tun_config` / `mixed_config` 现有的测试保证输出字节不变。`lib.rs` 里 C1 契约清单的「客户端配置渲染」一节补两行。
 
