@@ -27,10 +27,20 @@ pub trait Prompt {
 
 pub struct Stdin;
 
+/// 输入提示符。空提示只打 `▸`（粘贴导入逐行读时不能每行挂个孤零零的冒号），
+/// 非空用全角冒号，与其余中文文案一致。
+fn prompt_text(prompt: &str) -> String {
+    if prompt.is_empty() {
+        "  ▸ ".to_string()
+    } else {
+        format!("  ▸ {prompt}：")
+    }
+}
+
 impl Prompt for Stdin {
     fn line(&mut self, prompt: &str) -> Result<String> {
         use std::io::Write as _;
-        print!("  ▸ {prompt}: ");
+        print!("{}", prompt_text(prompt));
         std::io::stdout()
             .flush()
             .map_err(|e| Error::io(std::path::Path::new("<stdout>"), e))?;
@@ -711,6 +721,16 @@ mod tests {
         assert_eq!(pick_index("0", 3), None);
         assert_eq!(pick_index("", 3), None);
         assert_eq!(pick_index("abc", 3), None);
+    }
+
+    #[test]
+    fn stdin_prompt_marker_uses_fullwidth_colon_and_none_when_empty() {
+        assert_eq!(prompt_text(""), "  ▸ ", "粘贴导入时每行不能显示成「▸ :」");
+        assert_eq!(prompt_text("选择 [0-9]"), "  ▸ 选择 [0-9]：");
+        assert!(
+            !prompt_text("选择节点编号").contains(':'),
+            "与其余文案一致用全角冒号"
+        );
     }
 
     #[test]
