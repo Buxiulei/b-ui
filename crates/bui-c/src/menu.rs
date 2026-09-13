@@ -283,9 +283,23 @@ pub fn render_nodes(prof: &Profiles, with_back: bool) -> String {
     out
 }
 
+/// 去空白 + 把全角数字（U+FF10..=U+FF19）折成 ASCII。
+///
+/// 中文输入法下 `１` 是常见误触：真机截屏里就被判成了「无效选项」。
+fn normalize_digits(input: &str) -> String {
+    input
+        .trim()
+        .chars()
+        .map(|c| match u32::from(c) {
+            cp @ 0xFF10..=0xFF19 => char::from_digit(cp - 0xFF10, 10).unwrap_or(c),
+            _ => c,
+        })
+        .collect()
+}
+
 /// 主菜单只认数字，别的一律 `None`（调用方重画菜单）。
 pub fn parse_choice(input: &str) -> Option<Action> {
-    match input.trim() {
+    match normalize_digits(input).as_str() {
         "1" => Some(Action::SwitchNode),
         "2" => Some(Action::ToggleMode),
         "3" => Some(Action::ImportNode),
@@ -302,7 +316,7 @@ pub fn parse_choice(input: &str) -> Option<Action> {
 
 /// `"2"` → `Some(1)`；`0` / 空 / 非数字 / 越界 → `None`（`0` 是「返回」）。
 pub fn pick_index(input: &str, len: usize) -> Option<usize> {
-    let n: usize = input.trim().parse().ok()?;
+    let n: usize = normalize_digits(input).parse().ok()?;
     if n == 0 || n > len {
         return None;
     }
@@ -615,6 +629,19 @@ mod tests {
             None,
             "只认数字（数字菜单，不认字母快捷键）"
         );
+    }
+
+    #[test]
+    fn fullwidth_digits_are_folded_to_ascii() {
+        // 中文输入法下 `１` 是常见误触，别让它掉进「无效选项」
+        assert_eq!(parse_choice("１"), Some(Action::SwitchNode));
+        assert_eq!(parse_choice(" ９ "), Some(Action::AutoUpdate));
+        assert_eq!(parse_choice("０"), Some(Action::Quit));
+        assert_eq!(parse_choice("１０"), None, "折完还是越界");
+        assert_eq!(pick_index("２", 3), Some(1));
+        assert_eq!(pick_index("３", 3), Some(2));
+        assert_eq!(pick_index("４", 3), None);
+        assert_eq!(pick_index("０", 3), None);
     }
 
     #[test]
