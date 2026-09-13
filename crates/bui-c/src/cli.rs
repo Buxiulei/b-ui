@@ -758,18 +758,7 @@ fn menu_body<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()
                 if len == 0 {
                     None // 列表里已经给了「先导入」的引导，没有编号可选
                 } else {
-                    ctx.flush();
-                    let pick = ctx.prompt.line("选择节点编号")?;
-                    if menu::is_back(&pick) {
-                        None
-                    } else if let Some(i) = menu::pick_index(&pick, len) {
-                        Some(Cmd::Switch {
-                            name: prof.profiles[i].name.clone(),
-                        })
-                    } else {
-                        ctx.say(format!("无效编号：{pick}（可选 1-{len}，0 返回）"));
-                        None
-                    }
+                    pick_node(ctx, &prof)?
                 }
             }
             Action::ToggleMode => {
@@ -844,6 +833,27 @@ fn menu_body<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()
             }
         }
         ctx.flush();
+    }
+}
+
+/// 菜单 `[1]` 列表下的选编号：输错只提示、原地重问（不重画列表）；空行、`0`、EOF 返回主菜单。
+fn pick_node<S: Sys, N: Net, P: Prompt>(
+    ctx: &mut Ctx<'_, S, N, P>,
+    prof: &Profiles,
+) -> Result<Option<Cmd>> {
+    let len = prof.profiles.len();
+    loop {
+        ctx.flush();
+        let pick = ctx.prompt.line("选择节点编号")?;
+        if menu::is_back(&pick) {
+            return Ok(None);
+        }
+        if let Some(i) = menu::pick_index(&pick, len) {
+            return Ok(Some(Cmd::Switch {
+                name: prof.profiles[i].name.clone(),
+            }));
+        }
+        ctx.say(format!("无效编号：{pick}（可选 1-{len}，0 返回）"));
     }
 }
 
@@ -936,21 +946,28 @@ fn import_http<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>, url: &str)
 }
 
 /// `[4] 服务控制` 的二级菜单：重启 / 看日志 / 返回（v3 的服务子菜单大半是死代码，
-/// 这里只留两个真实动作）。
+/// 这里只留两个真实动作）。输错只提示、原地重问；空行、`0`、EOF 与做完一个动作都回主菜单。
 fn service_menu<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>, mode: Mode) -> Result<()> {
     ctx.show(menu::render_service_options().trim_end());
-    ctx.flush();
-    let pick = ctx.prompt.line("选择 [0-2]")?;
-    match menu::parse_service_choice(&pick) {
-        Some(menu::ServiceAction::Back) => {}
-        None => ctx.say(format!("无效选项：{pick}")),
-        Some(menu::ServiceAction::Restart) => restart_service(ctx, mode),
-        Some(menu::ServiceAction::Logs) => match journal_tail(ctx.sys, menu::SERVICE_LOG_LINES) {
-            Ok(text) => ctx.show(text),
-            Err(why) => ctx.say(why),
-        },
+    loop {
+        ctx.flush();
+        let pick = ctx.prompt.line("选择 [0-2]")?;
+        match menu::parse_service_choice(&pick) {
+            Some(menu::ServiceAction::Back) => return Ok(()),
+            None => ctx.say(format!("无效选项：{pick}")),
+            Some(menu::ServiceAction::Restart) => {
+                restart_service(ctx, mode);
+                return Ok(());
+            }
+            Some(menu::ServiceAction::Logs) => {
+                match journal_tail(ctx.sys, menu::SERVICE_LOG_LINES) {
+                    Ok(text) => ctx.show(text),
+                    Err(why) => ctx.say(why),
+                }
+                return Ok(());
+            }
+        }
     }
-    Ok(())
 }
 
 /// 菜单里的「重启」：TUN 模式要等接口起来才算数（is-active 在 exec 后立刻为真），
@@ -2104,8 +2121,7 @@ mod tests {
         let mut p = Scripted::from([
             "1", "", // 空行：静默返回
             "1", "０", // 全角 0 也是返回
-            "1", "9", // 越界
-            "1", "abc", // 不是数字
+            "1", "9", "abc", "0", // 越界、不是数字：留在原地重问，0 才返回
             "0",
         ]);
         let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
@@ -2123,7 +2139,48 @@ mod tests {
             Profiles::load(&s, &pp).unwrap().active.as_deref(),
             Some("alice-hy2-direct")
         );
-        assert_eq!(t.matches("B-UI 客户端").count(), 5, "每次都回到主菜单：{t}");
+        assert_eq!(t.matches("B-UI 客户端").count(), 4, "输错不回主菜单：{t}");
+        assert_eq!(
+            t.matches("     [0] 返回").count(),
+            3,
+            "重问不重画节点列表：{t}"
+        );
+        assert_eq!(
+            p.asked.iter().filter(|q| *q == "选择节点编号").count(),
+            5,
+            "{:?}",
+            p.asked
+        );
+    }
+
+    #[test]
+    fn menu_node_pick_asks_again_after_junk_until_a_valid_number_or_eof() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        two_nodes(&s, &pp);
+        let n = FakeNet::new();
+        // 输错一次，接着给对的编号：直接切过去，不必再从主菜单按 1
+        let mut p = Scripted::from(["1", "x", "2", "0"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert!(
+            t.lines().any(|l| l == "  无效编号：x（可选 1-2，0 返回）"),
+            "{t}"
+        );
+        assert_eq!(
+            Profiles::load(&s, &pp).unwrap().active.as_deref(),
+            Some("alice-reality-direct"),
+            "{t}"
+        );
+        assert!(!t.contains("无效选项"), "2 不能漏到主菜单：{t}");
+
+        // 输错后 EOF：回主菜单（主菜单再读到 EOF 退出），不死循环
+        let mut p = Scripted::from(["1", "x"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        assert_eq!(ctx.transcript.matches("B-UI 客户端").count(), 2);
     }
 
     #[test]
@@ -2649,6 +2706,38 @@ mod tests {
         );
         assert!(!s.called("systemctl restart bui-c.service"));
         assert_eq!(t.matches("B-UI 客户端").count(), 3, "{t}");
+    }
+
+    #[test]
+    fn menu_service_submenu_asks_again_after_junk() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        with_unit(&s);
+        profiles_socks().save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        // x 输错 → 留在子菜单 → 1 重启 → 回主菜单 → 0 退出
+        let mut p = Scripted::from(["4", "x", "1", "0"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert!(t.lines().any(|l| l == "  无效选项：x"), "{t}");
+        assert!(
+            s.called("systemctl restart bui-c.service"),
+            "1 是子菜单里的重启：\n{t}"
+        );
+        assert_eq!(
+            p.asked.iter().filter(|q| *q == "选择 [0-2]").count(),
+            2,
+            "{:?}",
+            p.asked
+        );
+        assert_eq!(
+            t.matches("最近 50 行日志").count(),
+            1,
+            "重问不重画子菜单：\n{t}"
+        );
+        assert_eq!(t.matches("B-UI 客户端").count(), 2, "{t}");
     }
 
     #[test]
