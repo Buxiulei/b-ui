@@ -68,9 +68,10 @@
 - **确认块的顺序**改为：①（Switch 形态）`删完切到 [n] 名字` + `想换就输入下面的编号：` + 可换节点 → ② `将删除 N 个节点…` 与被删清单 → ③ 影响说明 → ④ 提问。被删清单永远紧挨着提问。[体验]
 - `Sys::term_width()` 改成 `Sys::term_size() -> Option<(u16, u16)>`（列、行，同一次 `TIOCGWINSZ`），`Ctx::width()` / `Ctx::rows()`；拿不到按 80 列、24 行。确认块总行数超过 `rows − 2` 时，可换节点压成一行 `可换：1 4 5 6 7 8 9（编号同上面列表）`。手机横屏只有约 17 行（r5 §B.3）。[体验]
 - 提问带上第一个名字：`确认删除 {name}？` / `确认删除 {name} 等 N 个节点？`。[体验]
+  **窄屏例外**：连 `  ▸ ` 与冒号放进一行后，名字能用的不到 8 列时（40–44 列删几个长名字的节点），退回 `确认删除这 N 个节点？`。截到 8 列以下的名字只剩「hy…70」这种样子，认不出是哪个，不如不带；被删清单就紧挨在上面几行。删单个节点时 40 列也有 15 列给名字，不受影响。门槛是 `menu::QUESTION_NAME_MIN = 8`。
 - **会断网的两种形态（Switch、Empty）要输入 `yes`（或「是」）才执行**，提示写 `[yes/N]`；只输 `y` 视为取消，并提示 `会断网的删除要输入 yes`。Passive 形态照旧 `[y/N]`。理由：v3 的「6 → 1 → y」（高级设置 → 开机自启管理 → 是）在新菜单里会变成「删除 1 号节点并确认」，而家人用 v3 的时间最长。命令行的 `-y` 不受影响。[体验]
 - 过渡提示：[6] 删除页顶 `（原来的高级设置已取消，检查更新在 [7]）`；[9] 页顶 `（自动更新开关挪到了 [7]）`。每个菜单会话只在第一次进这一页时显示（`Ctx.hints_shown`），文案容量口径 ≤ 39 列。[体验]
-- 默认替换节点排除被删节点所在的服务器（§5.4 已改）；剩下的全在同一台服务器上时，确认块多一行 `剩下的节点都在同一台服务器上`。[体验] [实现] [清单]
+- 默认替换节点排除被删节点所在的服务器（§5.4 已改）。删到当前节点、剩下的节点又都在被删节点所在的服务器上时（host 转小写后比较，与 `default_to` 回落到「剩下的第一个」是同一个条件；说的是剩下的节点本身，替换目标从测速来也照样成立），确认块在 `删完切到 [n] 名字` 下面多一行：剩下的节点只在 1 台服务器上写 `剩下的节点都在同一台服务器上`；分在多台上写 `剩下的节点都在被删节点所在的服务器上`（加缩进 38 列，40 列放得下）。Passive、Empty 不加。[体验] [实现] [清单]
 - 预检失败的停顿页加下一步：`换一个节点再删：确认时输入别的编号`；内核缺失时 `先用 [7] 更新与维护 → [1] 检查更新`。[体验]
 
 ### R2 删除提交：锁、预检、中断
@@ -1766,10 +1767,10 @@ impl std::fmt::Display for SelError { /* 上表文案，`len` 由调用方拼进
 2. **每个节点**：`[编号] ★ 名字` / label / 服务器:端口。与列表是同一种展示，完整不截，放不下就拆行（§2.4）。编号沿用列表里的编号，眼睛能直接对上。
 3. **影响说明**，三选一：
    - 不含当前节点：`删完还剩 M 个，当前节点不变，不会断网`（「还剩」来自 d2）
-   - 含当前节点、还剩节点：`删完还剩 M 个，切到 [n] 名字` + `想换就输入下面的编号：` + 剩下的节点逐行 `[k] 名字  label`（保留原编号；label 放不下就尾截，少于 5 列就不显示；40 列只显示名字，中间截断）+（TUN 模式）`TUN 模式：切换时会断网几秒`。逐行列出是 j-user 的必修项：手机横屏只有约 17 行，列表可能早已滚出屏幕，照着这几行就能打编号（§3c-60-S / §3c-40-S）
+   - 含当前节点、还剩节点：（TUN 模式）`TUN 模式：切换时会断网几秒`。切到哪个、还能换哪个按 R1 挪到被删清单前面：`删完切到 [n] 名字` +（剩下的节点都在被删节点所在的服务器上时）同服务器说明一行（R1）+ `想换就输入下面的编号：` + 剩下的节点逐行 `[k] 名字  label`（保留原编号；label 放不下就尾截，少于 5 列就不显示；40 列只显示名字，中间截断；只剩替换目标一个时不列；整块超过 `rows − 2` 行时压成一行 `可换：…（编号同上面列表）`；命令行版不列，§5.10）。逐行列出是 j-user 的必修项：手机横屏只有约 17 行，列表可能早已滚出屏幕，照着这几行就能打编号（§3c-60-S / §3c-40-S）
    - 删光：`删完就没有节点了，代理会停止` +（TUN 模式）`TUN 撤掉后本机直连，国外网站打不开`
 4. **复活说明**：`以后导入时会先跳过它们，再问你要不要加回`（§5.7，墓碑名单）。
-5. 提示 `确认删除这 N 个节点？[y/N]`（带数量，来自 d2），**默认否**。菜单里这一问不认全局 `-y`（D11）：x-ui 对破坏性操作默认 n（r5 §A.4）；v3 有至少 8 处标签写 `(y/n)`、实际默认否，标签与行为对不上（r2 §1.5），这里标签与行为一致。
+5. 提问带第一个名字：`确认删除 {name}？` / `确认删除 {name} 等 N 个节点？`（R1，窄屏例外见 R1）；Passive 写 `[y/N]`，Switch 与 Empty 会断网、写 `[yes/N]`（R1），**默认否**。菜单里这一问不认全局 `-y`（D11）：x-ui 对破坏性操作默认 n（r5 §A.4）；v3 有至少 8 处标签写 `(y/n)`、实际默认否，标签与行为对不上（r2 §1.5），这里标签与行为一致。
 
 确认提示的输入处理（用 `prompt.line`，不用 `confirm`，因为要认编号）：
 
@@ -2254,7 +2255,7 @@ pub struct Download { pub bytes: u64, pub elapsed: Duration, pub complete: bool 
 
 - 新增：`pub const AMBIGUOUS: &str`、`pub const RULE: char`；`pub fn budget_width(s: &str) -> usize`；`pub fn sanitize(s: &str) -> Cow<str>`；`pub fn line_limit(width: usize) -> usize`；`pub fn truncate_end(s: &str, max: usize) -> String`；`pub fn truncate_middle(s: &str, max: usize) -> String`；`fn detail_line(p: &Profile, budget: usize, show_kind: bool, narrow: bool) -> String`；`fn detail_lines_full(p: &Profile, budget: usize, show_kind: bool) -> Vec<String>`；`pub fn title_bar(text: &str) -> String`；`pub fn rule(width: usize, indent: usize, max: usize) -> String`；`pub const MOVED_HINT_CHECK_UPDATE: &str`、`pub const MOVED_HINT_AUTO_UPDATE: &str`（D2）。
 - 新增：`pub enum Selection`、`pub enum SelError`、`pub fn parse_selection(input: &str, len: usize) -> Result<Selection, SelError>`；`pub enum ConfirmInput { Yes, Pick(usize), Cancel }`、`pub fn parse_confirm(input: &str, len: usize) -> ConfirmInput`。
-- 新增：`pub fn render_delete_picker(prof: &Profiles, width: usize) -> String`（标题 `删除节点（共 N 个，★ 为当前）` + 过渡提示行）；`pub fn render_delete_confirm(prof: &Profiles, picks: &[usize], replacement: Option<usize>, mode: Mode, width: usize) -> String`（带数量、「删完还剩」、Switch 形态逐行列出可换节点，§5.3；**放在 T6**，CLI 的确认块也调它，j-eng 必修）；`pub enum MaintAction { CheckUpdate, ToggleAuto, ImportV3, Back }`、`pub fn render_maint(m: &MaintStatus) -> String`、`pub fn parse_maint_choice(input: &str) -> Option<MaintAction>`；`pub enum NextStep { Recheck, SpeedTest, Journal, Back }`、`pub fn parse_next_step(input: &str, has_speedtest: bool) -> Option<NextStep>`。
+- 新增：`pub fn render_delete_picker(prof: &Profiles, width: usize) -> String`（标题 `删除节点（共 N 个，★ 为当前）` + 过渡提示行）；`pub fn render_delete_confirm(prof: &Profiles, picks: &[usize], replacement: Option<usize>, mode: Mode, width: usize) -> String`（带数量、「删完还剩」、Switch 形态逐行列出可换节点，§5.3；**放在 T6**，j-eng 必修）；命令行不认编号，`bui-c delete` 用同一套实现的 `delete_confirm_cli(prof, picks, to, width) -> DeleteConfirm`：不列可换节点，其余与菜单版逐字相同；`pub enum MaintAction { CheckUpdate, ToggleAuto, ImportV3, Back }`、`pub fn render_maint(m: &MaintStatus) -> String`、`pub fn parse_maint_choice(input: &str) -> Option<MaintAction>`；`pub enum NextStep { Recheck, SpeedTest, Journal, Back }`、`pub fn parse_next_step(input: &str, has_speedtest: bool) -> Option<NextStep>`。
 - 改：`render(st, width, last)`、`render_status(st, width)`、`render_nodes(prof, with_back, width)`、`render_node_picker(prof, width)` 都加宽度参数；`render_options` 换文案（[6] / [7] / [9]）；`Status` 加 `kind: String`、`host_port: String`，P1 再加 `fail_streak: u32`、`restarted_ago_s: Option<i64>`；`display_width` 把 ★/☆ 改成 1 列（`menu.rs:225-226`）。
 - 改：`Action` = `SwitchNode, ToggleMode, ImportNode, Service, Check, DeleteNode, Maintenance, Uninstall, SpeedTest, Quit`（`Update / ImportV3 / AutoUpdate` 挪进 `MaintAction`）；`parse_choice` 跟着改。
 
@@ -2322,9 +2323,9 @@ pub struct Download { pub bytes: u64, pub elapsed: Duration, pub complete: bool 
 | 标题 / 提示 / 提问 | `删除节点（共 {n} 个，★ 为当前）`；过渡提示行（§11.1）；`可多选：1 3 5 或 2-4，空行返回`；`删除哪几个` |
 | 选择出错 | `看不懂「{片段}」：只能写数字、逗号和 -`；`0 是返回，不能和编号写在一起`；`范围写反了：{a}-{b}，要写成 {b}-{a}`；`没有编号 {列表}（可选 1-{len}）` |
 | 确认块标题 | `将删除 {n} 个节点：`；`将删除 {n} 个节点，含当前节点：`；`将删除全部 {n} 个节点：` |
-| 影响说明 | Passive：`删完还剩 {m} 个，当前节点不变，不会断网`；Switch：`删完还剩 {m} 个，切到 [{k}] {name}` + `想换就输入下面的编号：` + 可换节点逐行 `[{k}] {name}  {label}` + （TUN）`TUN 模式：切换时会断网几秒`；Empty：`删完就没有节点了，代理会停止` +（TUN）`TUN 撤掉后本机直连，国外网站打不开` |
-| 复活说明 | `重新导入会把删掉的节点加回来` |
-| 提问 | `确认删除这 {n} 个节点？[y/N]` |
+| 影响说明 | Passive：`删完还剩 {m} 个，当前节点不变，不会断网`（本来就没有活动节点时 `删完还剩 {m} 个，不会断网`）；Switch（按 R1 排在被删清单前面）：`删完切到 [{k}] {name}` +（剩下的节点都在被删节点所在的服务器上时）`剩下的节点都在同一台服务器上` / `剩下的节点都在被删节点所在的服务器上` + `想换就输入下面的编号：` + 可换节点逐行 `[{k}] {name}  {label}`（行数不够时 `可换：{编号 …}（编号同上面列表）`；命令行版不列）；（TUN）`TUN 模式：切换时会断网几秒`；Empty：`删完就没有节点了，代理会停止` +（TUN）`TUN 撤掉后本机直连，国外网站打不开` |
+| 复活说明 | `以后导入时会先跳过它们，再问你要不要加回`（删 1 个时写「它」；§5.3 第 4 条） |
+| 提问 | `确认删除 {name}？[y/N]` / `确认删除 {name} 等 {n} 个节点？[y/N]`；Switch 与 Empty 写 `[yes/N]`；名字能用的不到 8 列时退回 `确认删除这 {n} 个节点？…`（R1 的窄屏例外）；只输 `y` 时 `会断网的删除要输入 yes`（R1） |
 | 确认时输入编号 | 换成功：`删完切到 [{k}] {name}`，再问一次；`[{n}] 也在要删的节点里，换一个`；`没有编号 {n}（可选 1-{len}）`；`这一步只认 y，别的都算取消` |
 | 失败 | `删除没做：切到 {to} 的配置校验不通过`；`删除没做：切到 {to} 失败`；`{原因，尾截}`；`节点都还在`；`已换回原来的配置，节点都还在`；`换回也失败：{原因}`；`用 [4] 服务控制 → 重启，或 [1] 选一个节点`；`已切到 {to}，但写 profiles.json 失败：{原因}`；`节点没删掉`；`删除没做：停止代理失败（{原因}），节点都还在`；`节点列表刚被别处改过，这次什么都没删，请重新选` |
 | v3 导入预览 | `从 v3 导入会新加这 {n} 个节点：` + 逐行名字；`如果里面有你刚删掉的，答 n 就不会回来`；`导入这 {n} 个节点？[y/N]`；没有新节点时 `v3 里的节点都已经在列表里了，不用导入` |
@@ -2408,7 +2409,7 @@ pub struct Download { pub bytes: u64, pub elapsed: Duration, pub complete: bool 
 | T6 | `selection_dedupes_and_sorts` / `selection_back_inputs` | `3 1 1 2-3` → 0、1、2；`""`、`"  "`、`"0"`、`"０"`、`",,"` → `Back` |
 | T6 | `selection_errors_by_priority` | `1 a 5-3` → `Junk("a")`；`0 3` → `ZeroMixed`；`5-3` → `Reversed`；`3 10-12 99` → `OutOfRange(["10-12","99"])`；`0-2`、超长数字 → 越界；`3-`、`1--3` → `Junk` |
 | T6 | `selection_messages_fit_59_columns` / `confirm_input_parses` | 所有 `SelError` 文案 budget ≤ 59；`y`、`YES`、`ｙ` → Yes；`8` → `Pick(7)`；`""`、`n`、`x` → Cancel |
-| T6 | `confirm_block_counts_and_remaining` / `switch_form_lists_alternatives` / `colliding_truncations_fall_back_to_full_names`（menu.rs） | 提问是 `确认删除这 2 个节点？[y/N]`；Passive 有「删完还剩 7 个」；Switch 形态逐行列出剩下的节点、编号与列表一致；两个目标截断后相同则显示全名 |
+| T6 | `confirm_block_counts_and_remaining` / `switch_form_lists_alternatives` / `colliding_truncations_fall_back_to_full_names`（menu.rs） | 提问带第一个名字（`确认删除 {name} 等 2 个节点？[y/N]`，窄屏例外见 R1）；Passive 有「删完还剩 7 个」；Switch 形态逐行列出剩下的节点、编号与列表一致；两个目标截断后相同则显示全名 |
 | T7 | `plan_*`（delete.rs） | Passive / Switch（默认第一个剩余节点，`--to` 生效）/ Empty；有名字找不到 → `NotFound`，名单一个不少；`to` 不存在或在删除之列 → 报错 |
 | T7 | `delete_aborts_when_the_snapshot_changed`（cli.rs） | 确认之后、执行之前改掉 `profiles.json`（多一个节点）：什么都没删，报「节点列表刚被别处改过」 |
 | T7 | `delete_passive_never_touches_the_data_plane` | 没有 restart、`config.json` 字节不变；**没有** `profiles.json.bak` |
