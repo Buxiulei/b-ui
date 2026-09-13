@@ -198,15 +198,25 @@ pub fn render_status(st: &Status) -> String {
         "   代理      SOCKS5 :{}   HTTP :{}\n",
         st.socks_port, st.http_port
     ));
+    // 两种模式的状态平行给：SOCKS 以前恒亮「● 本地入口」，服务停了也照亮，是假绿灯
     let mode = match st.mode {
         Mode::Tun => {
             if st.tun_up {
-                "TUN   ●  运行中"
+                "TUN   ●  运行中".to_string()
             } else {
-                "TUN   ○  未就绪"
+                "TUN   ○  未就绪".to_string()
             }
         }
-        Mode::Socks => "SOCKS ●  本地入口",
+        Mode::Socks => {
+            if st.service_running {
+                format!(
+                    "SOCKS ●  运行中（本地 :{}/:{}）",
+                    st.socks_port, st.http_port
+                )
+            } else {
+                "SOCKS ○  已停止".to_string()
+            }
+        }
     };
     out.push_str(&format!("   模式   {mode}\n\n"));
     out
@@ -444,6 +454,40 @@ mod tests {
         assert!(!tun.contains("切换模式"), "别让用户猜切到哪边：{tun}");
         s.mode = Mode::Socks;
         assert!(render_options(&s).contains("[2] 切到 TUN"));
+    }
+
+    /// 状态块里的「模式」那一行。
+    fn mode_line(st: &Status) -> String {
+        render_status(st)
+            .lines()
+            .find(|l| l.contains("模式"))
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn socks_mode_line_follows_the_service_like_tun_does() {
+        let mut s = st();
+        s.mode = Mode::Socks;
+        s.tun_up = false;
+        s.socks_port = 1081;
+        s.http_port = 8081;
+        s.service_running = true;
+        let up = mode_line(&s);
+        assert!(
+            up.contains("SOCKS ●  运行中（本地 :1081/:8081）"),
+            "端口从 Status 取：{up}"
+        );
+        s.service_running = false;
+        let down = mode_line(&s);
+        assert!(down.contains("SOCKS ○  已停止"), "{down}");
+        assert!(!down.contains('●'), "服务停了不能还亮着：{down}");
+
+        // TUN 分支保持「运行中 / 未就绪」
+        let mut t = st();
+        assert!(mode_line(&t).contains("TUN   ●  运行中"));
+        t.tun_up = false;
+        assert!(mode_line(&t).contains("TUN   ○  未就绪"));
     }
 
     #[test]
