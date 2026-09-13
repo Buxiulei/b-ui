@@ -83,8 +83,12 @@ if [ -z "$GOT" ]; then
         # 逐字段比对键名（$2 == "tag_name"）而不是 /"tag_name"/：release 正文里出现字面
         # \"tag_name\" 时正则会误命中，字段比对不会（tr 后每片形如 {"tag_name":"v4.0.0-rc9"，
         # 以 " 切分 $2 即键名）。只认 vX.Y.Z-rcN 形状的预发布。
+        # awk 命中后**不能** exit：真实响应有 200KB+（7 个 release 带正文），提前退出会让上游
+        # 的 tr 往已关闭的管道继续写而吃到 SIGPIPE（141），set -o pipefail 把整条管道判为非零、
+        # set -e 于是静默杀掉整个脚本（2026-09-13 在 baiyi 真机复现：rc=141，一行都不打印）。
+        # 所以读完整个流，只打印第一个匹配（found 标记）。
         TAG="$(tr ',' '\n' < "$TMP/releases.json" \
-            | awk -F'"' '$2 == "tag_name" && $4 ~ /^v[0-9]+\.[0-9]+\.[0-9]+-rc[0-9]+$/ { print $4; exit }')"
+            | awk -F'"' '!found && $2 == "tag_name" && $4 ~ /^v[0-9]+\.[0-9]+\.[0-9]+-rc[0-9]+$/ { print $4; found = 1 }')"
     fi
     [ -n "$TAG" ] || {
         print_error "取不到 manifest.json：面板源、releases/latest 与 releases 列表都不可达。用 BUI_C_SOURCE=https://<面板域名>/packages 指定源再重试"

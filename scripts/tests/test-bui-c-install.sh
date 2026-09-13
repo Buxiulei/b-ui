@@ -109,13 +109,26 @@ write_manifest "$ghdir/manifest.json" "$ghsha"
 # 仿 GitHub API 的 releases 列表（新→旧）：带空格与换行的 pretty JSON。
 #   第一条 v4.0.1 不是 vX.Y.Z-rcN 形状（且 prerelease=false）→ 必须跳过；它的正文里故意
 #   写了字面的 \"tag_name\": \"v9.9.9\"，用来验证按字段名比对（$2 == "tag_name"）不会误命中；
-#   第二条 nightly 也不是 rc 形状 → 跳过；第三条 v4.0.0-rc9 才是要选的那个。
-cat > "$pkg/gh/releases.json" <<'JSON'
-[
+#   第二条 nightly 也不是 rc 形状 → 跳过；第三条 v4.0.0-rc9 才是要选的那个；
+#   第四条 v4.0.0-rc8 更旧，守住「只取第一个匹配」（选中它下面的 cmp 就过不了）。
+#
+# 夹具必须撑到 300KB 这么大，小了测不出真正的缺陷。脚本里那条 `tr … | awk …` 跑在
+# `set -o pipefail` 下：awk 命中后若提前 exit，tr 会继续往已关闭的管道写而吃到 SIGPIPE
+# （退出码 141），pipefail 把整条管道判为非零，set -e 于是静默杀掉整个脚本（2026-09-13
+# 在 baiyi 真机 `bash -x` 复现，rc=141 且什么都不打印；真实 GitHub 响应 251KB）。
+# 管道缓冲是 64KB，所以两段填充缺一不可：
+#   * 第一条 body 里的 100KB，把命中的 rc tag 顶到 64KB 之后；
+#   * 最后一条 body 里的 200KB，保证 awk 退出时 tr 还剩 ≫64KB 没写完 —— 只填前面的话，
+#     awk 读到命中位置时 tr 早已写完并正常退出，SIGPIPE 根本不会发生（实测 rc=0）。
+# 填充不含逗号，免得被脚本里的 `tr ',' '\n'` 切开。
+{
+  printf '%s' '[
   {
     "tag_name": "v4.0.1",
     "prerelease": false,
-    "body": "正文里故意写了字面量 \"tag_name\": \"v9.9.9\" 用来验证按字段名比对不会误命中"
+    "body": "正文里故意写了字面量 \"tag_name\": \"v9.9.9\" 用来验证按字段名比对不会误命中；后面是填充 '
+  head -c 100000 /dev/zero | tr '\0' 'x'
+  printf '%s' '"
   },
   {
     "tag_name": "nightly",
@@ -126,9 +139,16 @@ cat > "$pkg/gh/releases.json" <<'JSON'
     "tag_name": "v4.0.0-rc9",
     "prerelease": true,
     "body": "预发布 应当选中它"
+  },
+  {
+    "tag_name": "v4.0.0-rc8",
+    "prerelease": true,
+    "body": "更旧的预发布 不该被选中；正文填充把管道撑过 64KB '
+  head -c 200000 /dev/zero | tr '\0' 'y'
+  printf '%s\n' '"
   }
-]
-JSON
+]'
+} > "$pkg/gh/releases.json"
 BUI_C_SOURCE="$base/nope" BUI_C_GITHUB="$base/gh" BUI_C_RELEASES_API="$base/gh/releases.json" \
   BUI_C_PREFIX="$work/bin6" bash "$here/bui-c-install.sh" 2>"$work/err6"
 test -x "$work/bin6/bui-c" || { echo "FAIL: 预发布回退没装上"; cat "$work/err6"; exit 1; }
