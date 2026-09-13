@@ -470,7 +470,7 @@ pub fn apply(input: ApplyInput<'_>, host: &dyn Host) -> ApplyOutcome {
             // 上一版配置也起不来：这一轮对账必须是**失败**（errors 非空 → `/api/health` degraded、
             // `bui status` 显示 degraded 原因），并且把原因抄进去——2026-09-12 bwg-rick 首切时
             // 这里只报「已回滚上一版配置并重启成功」，真相是 start-limit-hit、caddy 处于 failed，
-            // NBDpsy 的生产站点断了几分钟没人看出来。
+            // 同机托管的外部生产站点断了几分钟没人看出来。
             out.errors.push(format!(
                 "回滚后 {} 仍未运行：{}",
                 unit.name,
@@ -969,7 +969,7 @@ mod tests {
     }
 
     /// 2026-09-12 bwg-rick 首切实录：caddy 单元 203/EXEC 之后报告写「已回滚上一版配置并重启成功」，
-    /// 真相是 start-limit-hit、单元处于 failed，NBDpsy 生产站点断了几分钟没人看出来。
+    /// 真相是 start-limit-hit、单元处于 failed，同机托管的外部生产站点断了几分钟没人看出来。
     /// 判据只能是 `is-active`：`systemctl restart` 的退出码退 0 不代表单元活着。
     #[test]
     fn a_restart_that_returns_zero_but_leaves_the_unit_dead_is_reported_as_still_down() {

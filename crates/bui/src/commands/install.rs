@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// 第一个用户的默认名（裁决 2026-09-12）。
-pub const DEFAULT_FIRST_USER: &str = "低空飞行";
+pub const DEFAULT_FIRST_USER: &str = "user1";
 
 /// 装机要问的全部问题（住宅上游归 P3，这里没有那一问）。
 #[derive(Debug, Clone, PartialEq)]
@@ -1210,7 +1210,7 @@ mod tests {
         assert_eq!(a.masquerade, "www.bing.com:443");
         assert_eq!(a.node_name, "node-a");
         assert_eq!(
-            a.first_user, "低空飞行",
+            a.first_user, "user1",
             "第一个用户名的默认值（裁决 2026-09-12）"
         );
     }
@@ -2619,7 +2619,7 @@ mod tests {
         assert_eq!(a.ports.hy2, 10000, "回车用默认端口");
         assert_eq!(a.masquerade, "www.bing.com:443", "回车用默认伪装站");
         assert_eq!(a.first_user, DEFAULT_FIRST_USER, "回车用默认首用户名");
-        assert_eq!(a.first_user, "低空飞行");
+        assert_eq!(a.first_user, "user1");
         assert_eq!(a.node_name, "node-a", "回车用主机名");
         assert_eq!(a.public_ip, "203.0.113.10", "回车用探测到的公网 IP");
         // 随机面板密码**在提示里直接显示**，回车即用它；那一行提示也是它唯一的出口
@@ -2639,7 +2639,7 @@ mod tests {
             p.shown_default("REALITY").as_deref(),
             Some("www.bing.com:443")
         );
-        assert_eq!(p.shown_default("第一个用户名").as_deref(), Some("低空飞行"));
+        assert_eq!(p.shown_default("第一个用户名").as_deref(), Some("user1"));
         assert_eq!(p.shown_default("节点名").as_deref(), Some("node-a"));
         assert_eq!(p.shown_default("公网").as_deref(), Some("203.0.113.10"));
         assert!(
