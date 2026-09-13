@@ -638,6 +638,49 @@ mod tests {
         );
     }
 
+    /// 两条都是 prerelease 的列表，给下面按 tag 对拍的用例用（test-install-sh.sh 的 pick2 同一形状）。
+    fn two_prereleases(a: &str, b: &str) -> String {
+        format!(
+            r#"[{{"tag_name":"{a}","prerelease":true}},{{"tag_name":"{b}","prerelease":true}}]"#
+        )
+    }
+
+    #[test]
+    fn leading_zeros_compare_by_value_not_lexically() {
+        // release.yml 的 tag 正则 `^v[0-9]+\.[0-9]+\.[0-9]+-rc[0-9]+$` 放前导零过，这种 tag 发得出去、
+        // 会被标成 prerelease。每段按数值比：rc010 = 10 > 9，v4.010.0 = v4.10.0 > v4.9.0（字典序
+        // 正好反过来）。两种排列取到同一个，与列表顺序无关。
+        for (a, b, want) in [
+            ("v4.0.0-rc9", "v4.0.0-rc010", "v4.0.0-rc010"),
+            ("v4.0.0-rc010", "v4.0.0-rc9", "v4.0.0-rc010"),
+            ("v4.9.0-rc1", "v4.010.0-rc1", "v4.010.0-rc1"),
+            ("v4.010.0-rc1", "v4.9.0-rc1", "v4.010.0-rc1"),
+        ] {
+            assert_eq!(
+                rc_from(&two_prereleases(a, b)).as_deref(),
+                Some(want),
+                "[{a}, {b}]"
+            );
+        }
+    }
+
+    #[test]
+    fn equal_versions_resolve_to_the_later_listed_tag() {
+        // rc1 与 rc01 数值相同：取列表里后出现的那个。这边靠 max_by_key 并列时返回最后一个，
+        // install.sh / bui-c-install.sh 的 awk 靠 `i > 4 ||` 那一支替换；test-install-sh.sh 与
+        // test-bui-c-install.sh 断言同样的结果，谁改了任一边的比较分支，Rust 与 shell 就在这里分叉。
+        for (a, b, want) in [
+            ("v4.0.0-rc1", "v4.0.0-rc01", "v4.0.0-rc01"),
+            ("v4.0.0-rc01", "v4.0.0-rc1", "v4.0.0-rc1"),
+        ] {
+            assert_eq!(
+                rc_from(&two_prereleases(a, b)).as_deref(),
+                Some(want),
+                "[{a}, {b}]"
+            );
+        }
+    }
+
     #[test]
     fn github_latest_404_without_any_prerelease_stays_a_clear_error() {
         let n = FakeNet::new();

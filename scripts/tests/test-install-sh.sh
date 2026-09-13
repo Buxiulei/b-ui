@@ -149,6 +149,17 @@ assert_eq "v4.0.0-rc10" "$(pick '[{"tag_name":"v4.0.0-rc4294967296","prerelease"
     "畸形与超出 u32 的 tag 跳过（与 Rust 侧同一个上界）"
 assert_eq "v4.0.0-rc4294967295" "$(pick '[{"tag_name":"v4.0.0-rc10","prerelease":true},{"tag_name":"v4.0.0-rc4294967295","prerelease":true}]')" \
     "u32 上界本身还算数"
+# 前导零：release.yml 的 tag 正则 ^v[0-9]+\.[0-9]+\.[0-9]+-rc[0-9]+$ 放它过、会被标成预发布。每段按数值比，
+# 不是字典序（rc010 = 10 > 9，v4.010.0 = v4.10.0 > v4.9.0），两种排列取到同一个；数值相同（rc1 与 rc01）
+# 取列表里后出现的那个。这六条与 bui / bui-c 的 leading_zeros_compare_by_value_not_lexically、
+# equal_versions_resolve_to_the_later_listed_tag 逐条相同：改了 awk 的比较分支或 max_by_key，两边就在这里分叉。
+pick2() { pick "[{\"tag_name\":\"$1\",\"prerelease\":true},{\"tag_name\":\"$2\",\"prerelease\":true}]"; }
+assert_eq "v4.0.0-rc010" "$(pick2 v4.0.0-rc9 v4.0.0-rc010)" "rc010 = 10 > rc9（不是字典序）"
+assert_eq "v4.0.0-rc010" "$(pick2 v4.0.0-rc010 v4.0.0-rc9)" "rc010 > rc9，换个顺序也一样"
+assert_eq "v4.010.0-rc1" "$(pick2 v4.9.0-rc1 v4.010.0-rc1)" "v4.010.0 = v4.10.0 > v4.9.0（不是字典序）"
+assert_eq "v4.010.0-rc1" "$(pick2 v4.010.0-rc1 v4.9.0-rc1)" "v4.010.0 > v4.9.0，换个顺序也一样"
+assert_eq "v4.0.0-rc01" "$(pick2 v4.0.0-rc1 v4.0.0-rc01)" "rc1 与 rc01 平局取后出现的 rc01"
+assert_eq "v4.0.0-rc1" "$(pick2 v4.0.0-rc01 v4.0.0-rc1)" "rc01 与 rc1 平局取后出现的 rc1"
 
 # BUI_MANIFEST_URL 给了就只认它，不去问 releases 列表（M5 演练 / 离线源）
 : > "$DL_LOG"

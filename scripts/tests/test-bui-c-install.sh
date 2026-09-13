@@ -207,6 +207,26 @@ BUI_C_SOURCE="$base/nope" BUI_C_GITHUB="$base/gh2" BUI_C_RELEASES_API="$base/gh2
 grep -q "回退到预发布 v4.0.1-rc1" "$work/err6b" \
   || { echo "FAIL: 跨版本没取到 v4.0.1-rc1"; cat "$work/err6b"; exit 1; }
 
+# 6c) 前导零按数值比、数值相同取后出现的那个（release.yml 的 tag 正则 ^v[0-9]+\.[0-9]+\.[0-9]+-rc[0-9]+$
+#     放前导零过，这种 tag 会被标成预发布）。要选的是排在最后的 v4.10.0-rc10，前面都是干扰项：
+#   v4.9.0-rc9      minor 按字典序比（"9" > "010"）会选中它；
+#   v4.010.0-rc9    rc 按字典序比（"9" > "010"）会选中它；
+#   v4.010.0-rc010  与 v4.10.0-rc10 数值相同 (4, 10, 0, 10)：平局取列表里后出现的那个（与 bui-c 的
+#                   max_by_key 并列返回最后一个、install.sh 的 awk 一致），平局取前者会选中它。
+#   只有 v4.10.0-rc10 下放了产物，选错哪一个都取不到 manifest。
+gh3="$pkg/gh3/releases/download/v4.10.0-rc10"
+mkdir -p "$gh3"
+cp "$ghdir/bui-c-linux-amd64" "$gh3/bui-c-linux-amd64"
+cp "$ghdir/bui-c-linux-amd64" "$gh3/bui-c-linux-arm64"
+write_manifest "$gh3/manifest.json" "$ghsha"
+printf '%s\n' '[{"tag_name":"v4.9.0-rc9","prerelease":true},{"tag_name":"v4.010.0-rc9","prerelease":true},{"tag_name":"v4.010.0-rc010","prerelease":true},{"tag_name":"v4.10.0-rc10","prerelease":true}]' \
+  > "$pkg/gh3/releases.json"
+BUI_C_SOURCE="$base/nope" BUI_C_GITHUB="$base/gh3" BUI_C_RELEASES_API="$base/gh3/releases.json" \
+  BUI_C_PREFIX="$work/bin6c" bash "$here/bui-c-install.sh" 2>"$work/err6c" \
+  || { echo "FAIL: 前导零 / 平局回退失败"; cat "$work/err6c"; exit 1; }
+grep -q "回退到预发布 v4.10.0-rc10" "$work/err6c" \
+  || { echo "FAIL: 前导零 / 平局没取到 v4.10.0-rc10"; cat "$work/err6c"; exit 1; }
+
 # 7) 三条来源都不通 → 报错退出，不写任何文件
 if BUI_C_SOURCE="$base/nope" BUI_C_GITHUB="$gh404" BUI_C_RELEASES_API="$api404" \
      BUI_C_PREFIX="$work/bin7" bash "$here/bui-c-install.sh" 2>"$work/err7"; then
