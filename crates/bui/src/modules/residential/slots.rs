@@ -683,13 +683,17 @@ pub async fn drive_slots(
     out
 }
 
+/// [`borrow_now`] 遇到压在故障 IP 上、但被手动 pin 的槽时记的 note
+pub const PINNED_UNTOUCHED_NOTE: &str = "已手动锁定，未动";
+
 /// 哨兵的立即借用（spec §5.7，设计裁决 D7）：`failed` 已被带外探测确认不可用（不可达 /
 /// Google 被封），把**此刻正压在它身上**的槽立刻挪走，不等下一轮巡检。
 ///
 /// 与 [`drive_slots`] 同一口径、只做「借出」这一半：
 /// - 只动「当前出口 == `failed`」的槽：本槽 IP 就是它（`current_upstream_id = None` 时 selector
 ///   停在配置里的 default = 本槽 IP），或正借用它；
-/// - 手动 pin 的槽不动（管理员的判断压过哨兵，同 [`drive_slots`] 规则 1）；
+/// - 手动 pin 的槽不动（管理员的判断压过哨兵，同 [`drive_slots`] 规则 1），但压在 `failed` 上的
+///   照样出现在结果里，note = [`PINNED_UNTOUCHED_NOTE`]（告警据此如实说明，不说成「没有槽经它出网」）；
 /// - 目标：本槽 IP 不是 `failed` 且健康、Google 未被封 ⇒ 回本槽；否则
 ///   [`health::rank_healthy`] 里排名最高的非 `failed` 健康 IP；一个都没有 ⇒ 保持现状（fail-open）；
 /// - 被挪动的槽 `back_rounds` 归零；**不推进任何槽的 `back_rounds`，切回永远只由巡检的
@@ -738,19 +742,11 @@ pub async fn borrow_now(
             .get(&sl.index.to_string())
             .cloned()
             .unwrap_or_default();
-        if sr.pinned_upstream_id.is_some_and(in_pool) {
-            continue;
-        }
         let own = sl.upstream_id;
         let current = sr.current_upstream_id.unwrap_or(own);
         if current != failed {
             continue;
         }
-        let target = if own != failed && healthy.contains(&own) && google_ok(own) {
-            Some(own)
-        } else {
-            ranked.first().copied()
-        };
         let stay = |note: String| SlotOutcome {
             index: sl.index,
             own,
@@ -758,6 +754,15 @@ pub async fn borrow_now(
             borrowed: current != own,
             switched: false,
             note: Some(note),
+        };
+        if sr.pinned_upstream_id.is_some_and(in_pool) {
+            out.push(stay(PINNED_UNTOUCHED_NOTE.into()));
+            continue;
+        }
+        let target = if own != failed && healthy.contains(&own) && google_ok(own) {
+            Some(own)
+        } else {
+            ranked.first().copied()
         };
         let Some(target) = target else {
             out.push(stay("没有可借用的健康 IP，保持现状".into()));
@@ -1979,6 +1984,10 @@ mod tests {
             let e = r.slots.entry("1".into()).or_default();
             e.pinned_upstream_id = Some(Uuid::from_u128(2));
             e.current_upstream_id = Some(Uuid::from_u128(2));
+            // 另一个 pin 住、但不压在故障 IP 上的槽：与本次无关，不出现在结果里
+            let e = r.slots.entry("0".into()).or_default();
+            e.pinned_upstream_id = Some(Uuid::from_u128(3));
+            e.current_upstream_id = Some(Uuid::from_u128(3));
         })
         .await;
         let out = borrow_now(
@@ -1988,7 +1997,17 @@ mod tests {
             OffsetDateTime::UNIX_EPOCH,
         )
         .await;
-        assert!(out.is_empty(), "管理员的 pin 压过哨兵：{out:?}");
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(
+            (
+                out[0].index,
+                out[0].target,
+                out[0].switched,
+                out[0].note.as_deref()
+            ),
+            (1, Uuid::from_u128(2), false, Some("已手动锁定，未动")),
+            "管理员的 pin 压过哨兵，但结果里要记一笔（告警不能说成没有槽经它出网）"
+        );
         assert!(clash.calls().is_empty());
     }
 

@@ -21,6 +21,9 @@ const PRUNE_AFTER_SECS: i64 = 300;
 pub struct SentinelRuntime {
     /// 上一次落盘时读到的最后一条 `__CURSOR`（内存里的更新，落盘有节流，设计裁决 D1）
     pub cursor: Option<String>,
+    /// 与 `cursor` 成对：读到它时的本轮时刻（到这一刻为止的日志都已读过）。重启时它早于最长签名窗口
+    /// ⇒ 丢掉游标、从现在读起（`run::tick`）
+    pub cursor_at: Option<String>,
     /// 没有游标时从这一刻读起（首次启动 / 游标失效时写成「当时的现在」，不回放历史）
     pub since: Option<String>,
     /// 冷却表：`<动作 id>|<对象>` → 上次执行时刻（RFC3339）

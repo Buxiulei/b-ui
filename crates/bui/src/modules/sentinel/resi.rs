@@ -29,7 +29,7 @@ pub fn ip_of(up: &Upstream) -> String {
         .unwrap_or_else(|| subject_of(up))
 }
 
-/// `borrow_now` 的结果 → 「槽 1 已临时切到 Y；槽 2：没有可借用的健康 IP，保持现状」
+/// `borrow_now` 的结果 → 「槽 1 已临时切到 Y；槽 2：没有可借用的健康 IP，保持现状；槽 3 已手动锁定，未动」
 fn borrow_text(g: &ResidentialGroup, moved: &[SlotOutcome]) -> String {
     if moved.is_empty() {
         return "当前没有槽经它出网".into();
@@ -45,6 +45,8 @@ fn borrow_text(g: &ResidentialGroup, moved: &[SlotOutcome]) -> String {
                     .map(ip_of)
                     .unwrap_or_else(|| o.target.to_string());
                 format!("槽 {} 已临时切到 {to}", o.index)
+            } else if o.note.as_deref() == Some(slots::PINNED_UNTOUCHED_NOTE) {
+                format!("槽 {} {}", o.index, slots::PINNED_UNTOUCHED_NOTE)
             } else {
                 format!("槽 {}：{}", o.index, o.note.clone().unwrap_or_default())
             }
@@ -278,6 +280,27 @@ mod tests {
             r.upstream_alerts.get(&u(2)),
             Some(&o.result),
             "上游级告警：面板住宅卡看得到，巡检探通即清"
+        );
+    }
+
+    /// 唯一经这条 IP 出网的槽被管理员 pin 住：不动它，但告警要如实说，不能说「当前没有槽经它出网」
+    #[tokio::test]
+    async fn a_pinned_slot_on_the_failed_ip_is_left_alone_and_said_so() {
+        let d = tempfile::tempdir().unwrap();
+        let (ctx, _host) = pool_ctx(d.path()).await;
+        state::update(&ctx.runtime, |r| {
+            let e = r.slots.entry("1".into()).or_default();
+            e.pinned_upstream_id = Some(u(2));
+            e.current_upstream_id = Some(u(2));
+        })
+        .await;
+        let (p, c) = fakes(); // 网关连不上
+        let o = on_upstream_error(&ctx, p, c.clone(), u(2), t0()).await;
+        assert_eq!(o.result, "IP 198.51.100.8 不可达，槽 1 已手动锁定，未动");
+        assert!(c.calls().is_empty(), "管理员的 pin 压过哨兵");
+        assert_eq!(
+            state::read(&ctx.runtime).await.slots["1"].current_upstream_id,
+            Some(u(2))
         );
     }
 
