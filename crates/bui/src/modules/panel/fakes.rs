@@ -13,9 +13,13 @@ pub struct FakeXrayInner {
     pub deltas: BTreeMap<String, TxRx>,
     /// 命中就返回 `Err`，用来测退路
     pub fail_on: BTreeSet<String>,
-    /// 指定某次失败的错误串（键同 `fail_on`），不给就用默认串。
-    /// 真实 xray 在「email 已存在」与「email 不存在」时都报错，而这两种错误 Task 6
-    /// 按成功处理——错误串不可配就没法给那条容错写正向测试。
+    /// 只 `add_user` 认：命中就返回 `Err` **一次**（命中即移除），用来模拟
+    /// 「第一次 AddUser 撞上同名 email，摘掉占位的那个再发一次就成」——
+    /// 真 xray 的应答（`users::sync_users` 的「摘掉再加」路径，2026-09-14 裁决）。
+    pub fail_once: BTreeSet<String>,
+    /// 指定某次失败的错误串（键同 `fail_on` / `fail_once`），不给就用默认串。
+    /// 真实 xray 在「email 已存在」与「email 不存在」时都报错，而这两种错误各有各的
+    /// 处理口径（remove 按成功、add 摘掉再加）——错误串不可配就没法给它们写正向测试。
     pub error_text: BTreeMap<String, String>,
     /// 进程里「正在跑」的规则表，按表序：`(ruleTag, outboundTag)`
     pub rules: Vec<(String, String)>,
@@ -57,7 +61,7 @@ impl XrayApi for FakeXray {
         let key = format!("add:{tag}:{user_id}:{vless_uuid}");
         let mut i = self.0.lock().unwrap();
         i.calls.push(key.clone());
-        if i.fail_on.contains(&key) {
+        if i.fail_on.contains(&key) || i.fail_once.remove(&key) {
             let msg = i
                 .error_text
                 .get(&key)

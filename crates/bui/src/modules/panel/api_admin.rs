@@ -238,7 +238,21 @@ async fn update_user(
 ///
 /// 回包直接给出新凭据 —— 与 `create_user` 同口径：这条路由在 `require_admin` 里面，
 /// 面板本来就在显示每个用户的密码与 uuid（`PanelUser`）。
-async fn rotate_user(State(app): State<AppState>, Path(username): Path<String>) -> Response {
+///
+/// 顺手把这个用户**已经建好**的 hysteria2 会话踢下线（审查意见④）：两条鉴权路径都只在
+/// **握手时**过 `auth_hook::decide`，xray 的 RemoveUser/AddUser 同样只影响新握手，
+/// 所以不踢的话拿着泄露凭据的那一方照旧有流量，直到连接自己断 —— 那就不叫轮换了。
+/// 踢是 best-effort（失败只记 warn）：新凭据已经落盘生效，踢不动只是旧会话多活一会儿。
+///
+/// 两个已知边界，都不在本次范围内：
+/// - Reality 那条**已建立**的连接没有对应手段（xray 没有 kick），要等它自己断；
+/// - 踢的是「这一刻的期望态里该有的」全部 hy2 实例（`traffic::stats_ports`），
+///   对内核没起来的实例会记一条 warn。
+async fn rotate_user(
+    State(app): State<AppState>,
+    Path(username): Path<String>,
+    shared: Arc<Shared>,
+) -> Response {
     if let Err(e) = users::validate_username(&username) {
         return fail(StatusCode::BAD_REQUEST, format!("URL 中的 {e}"));
     }
@@ -261,8 +275,16 @@ async fn rotate_user(State(app): State<AppState>, Path(username): Path<String>) 
     let Some(u) = rotated else {
         return fail(StatusCode::NOT_FOUND, "User not found");
     };
-    // 凭据变了 ⇒ 重写鉴权快照 + 把 xray 里的旧 uuid 换掉，都由 `users::sync_loop` 收敛
+    // 凭据变了 ⇒ 重写鉴权快照 + 把 xray 里的旧 uuid 换掉，都由 `users::sync_loop` 收敛。
+    // 事件先发、再踢：两条鉴权路径据此刷新，被踢的客户端拿旧密码重连时已经会被拒。
     app.bus.send(Event::StateChanged("users"));
+    let ports = super::traffic::stats_ports(app.store.read().await.as_ref());
+    let ids = [u.user_id.to_string()];
+    for port in ports {
+        if let Err(e) = shared.hy2().kick(port, &ids).await {
+            tracing::warn!(port, error = %e, "轮换后踢下线失败（旧会话可能还在跑）");
+        }
+    }
     tracing::info!(user = %u.username, "已轮换订阅凭据并停用该用户的用户名链接");
     ok_json(json!({
         "success": true,
@@ -473,6 +495,7 @@ pub fn routes(shared: Arc<Shared>) -> axum::Router<AppState> {
     let s_stats = shared.clone();
     let s_online = shared.clone();
     let s_kick = shared.clone();
+    let s_rotate = shared.clone();
     axum::Router::new()
         .route(
             "/api/users",
@@ -482,7 +505,10 @@ pub fn routes(shared: Arc<Shared>) -> axum::Router<AppState> {
             "/api/users/{username}",
             axum::routing::put(update_user).delete(delete_user),
         )
-        .route("/api/users/{username}/rotate", post(rotate_user))
+        .route(
+            "/api/users/{username}/rotate",
+            post(move |st: State<AppState>, p: Path<String>| rotate_user(st, p, s_rotate.clone())),
+        )
         .route("/api/stats", get(move || get_stats(s_stats.clone())))
         .route("/api/online", get(move || get_online(s_online.clone())))
         .route(
@@ -712,6 +738,16 @@ mod tests {
             rx.try_recv().unwrap(),
             crate::api::Event::StateChanged("users")
         );
+        // 审查意见④：已经建好的 hy2 会话当场踢掉（hy2 只在握手时判凭据），
+        // 踢的是这一刻期望态里的全部实例、只带这一个 user_id
+        assert_eq!(
+            h.hy2.calls(),
+            vec![
+                format!("kick:9999:{}", before.user_id),
+                format!("kick:9998:{}", before.user_id),
+            ],
+            "轮换必须把旧会话踢下线，否则拿着泄露凭据的那一方照旧有流量"
+        );
         // 面板列表跟着给出新 token（前端据此拼订阅链接）
         let (_, list) = send(&r, "GET", "/api/users", Some(&t), None).await;
         assert_eq!(list[0]["subToken"], token_now);
@@ -735,6 +771,7 @@ mod tests {
         let (s2, _) = send(&r, "POST", "/api/users/a%2Fb/rotate", Some(&t), None).await;
         assert_eq!(s2, axum::http::StatusCode::BAD_REQUEST);
         assert_eq!(h.store.read().await.users[0], before, "一个字段都不许动");
+        assert!(h.hy2.calls().is_empty(), "也不许踢任何人下线");
     }
 
     #[tokio::test]

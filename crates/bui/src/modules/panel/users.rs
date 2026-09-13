@@ -529,11 +529,15 @@ pub async fn sync_users(ctx: &DaemonCtx, shared: &Shared, blocked: &BTreeSet<Uui
                 want_removed.insert(*id);
             }
         }
-        // 第三元 = 「这个 email 在 xray 侧挂的是**另一个** uuid」（轮换、或面板给
+        // 第三元 = 「按记账，这个 email 在 xray 侧挂的是**另一个** uuid」（轮换、或面板给
         // 只有 Reality 权益的用户改 UUID）。此时必须先 RemoveUser 再 AddUser：xray 的
         // AddUser 撞同名 email 会报「已存在」，而那条错误本来被
         // `target_already_reached` 记成成功 ⇒ 新 uuid 要等 xray 重启才生效，而
         // `render::xray::structural_hash` 剥掉了 clients，对账也不会重启它（2026-09-14 裁决）。
+        //
+        // 它只是个**加速位**，不是判据：`applied` 只活在进程内，b-ui 一重启就是空的
+        // （审查意见①），xray 从落后的 `xray-config.json` 起来时也一样对不上。所以
+        // 「位置被占」的兜底判据是 xray 自己的应答，见下面 ⑤ 的 [`email_taken`] 那一路。
         let to_add: Vec<(Uuid, Uuid, bool)> = desired
             .iter()
             .filter(|(id, vid)| applied.xray_users.get(id) != Some(vid))
@@ -554,31 +558,49 @@ pub async fn sync_users(ctx: &DaemonCtx, shared: &Shared, blocked: &BTreeSet<Uui
     for (id, vid, replaces_uuid) in to_add {
         let mut ok = true;
         for tag in XRAY_INBOUND_TAGS {
-            // 换 uuid：先把挂着旧 uuid 的同名 email 摘掉，给 AddUser 腾位置
+            // 记账就知道要换 uuid：先摘掉挂着旧 uuid 的同名 email，给 AddUser 腾位置
+            // （省掉一次注定撞「已存在」的 AddUser，也不必依赖内核的错误文案）
             if replaces_uuid {
-                if let Err(e) = shared.xray().remove_user(tag, id).await {
-                    let msg = e.to_string();
-                    if target_already_reached(&msg) {
-                        tracing::debug!(tag, %id, "换 uuid 前 RemoveUser 报不存在，直接 AddUser");
-                    } else {
-                        // 位置没腾出来，AddUser 只会再撞一次「已存在」：这一轮不加，
-                        // 留给 60 秒安全网重试（幂等）
-                        ok = false;
-                        out.errors
-                            .push(format!("换 uuid 前 RemoveUser {tag} 失败：{msg}"));
-                        continue;
-                    }
+                if let Err(e) = free_the_email(ctx, shared, tag, id).await {
+                    // 位置没腾出来，AddUser 只会再撞一次「已存在」：这一轮不加，
+                    // 留给 60 秒安全网重试（幂等）
+                    ok = false;
+                    out.errors
+                        .push(format!("换 uuid 前 RemoveUser {tag} 失败：{e}"));
+                    continue;
                 }
             }
-            if let Err(e) = shared.xray().add_user(tag, id, vid).await {
-                let msg = e.to_string();
-                // 换 uuid 那一路**不**吃「已存在」：吃下去就等于把旧 uuid 记成新 uuid，
-                // 用户手里的新凭据到 xray 重启才生效（2026-09-14 裁决）
-                if !replaces_uuid && target_already_reached(&msg) {
-                    tracing::debug!(tag, %id, "AddUser 报已存在，按成功处理");
-                } else {
+            match shared.xray().add_user(tag, id, vid).await {
+                Ok(()) => {}
+                // xray 说这个 email 已经在 inbound 里：挂的是哪个 uuid **我们无从得知**
+                // （`HandlerService` 没有「查某 email 的 uuid」），所以一律按「位置被占」
+                // 处理 —— 摘掉再加一次，**绝不**把它记成已达目标。
+                //
+                // 这一路就是审查意见①的堵口：轮换推送成功前 b-ui 重启（`applied` 清空、
+                // xray 进程没重启、里面还挂着旧 uuid）时 `replaces_uuid` 是假的，
+                // 吃下这条错误就等于把旧 uuid 记成新 uuid —— 泄露的旧凭据一直有效到
+                // xray 下次重启，而日志、面板与 rotate 回包都声称已经换过了。
+                Err(e) if email_taken(&e.to_string()) => {
+                    match free_the_email(ctx, shared, tag, id).await {
+                        Err(e2) => {
+                            ok = false;
+                            out.errors.push(format!(
+                                "AddUser {tag} 报已存在、腾位置的 RemoveUser 又失败：{e2}"
+                            ));
+                        }
+                        Ok(()) => {
+                            if let Err(e2) = shared.xray().add_user(tag, id, vid).await {
+                                ok = false;
+                                out.errors.push(format!("AddUser {tag} 重试失败：{e2}"));
+                            } else {
+                                tracing::info!(tag, %id, "AddUser 报已存在，摘掉旧的重加一次");
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
                     ok = false;
-                    out.errors.push(format!("AddUser {tag} 失败：{msg}"));
+                    out.errors.push(format!("AddUser {tag} 失败：{e}"));
                 }
             }
         }
@@ -632,18 +654,60 @@ pub async fn sync_users(ctx: &DaemonCtx, shared: &Shared, blocked: &BTreeSet<Uui
     out
 }
 
-/// xray 的 `AddUser` 撞上「email 已存在」、`RemoveUser` 撞上「email 不存在」时都返回错误，
-/// 而这两种情形下目标状态其实已经达成，所以按成功处理。
+/// `RemoveUser` 撞上「email 不存在」时 xray 返回错误，而这时目标状态其实已经达成
+/// （那个 email 本来就不在 inbound 里），所以按成功处理。
 ///
-/// **一个例外**：换 uuid 那一路（`to_add` 的第三元为真）不许吃 AddUser 的「已存在」——
-/// 那时「已存在」的是挂着**旧** uuid 的同名 email，目标根本没达成（2026-09-14 裁决）。
+/// **只给 RemoveUser 这个方向用**：`AddUser` 的「已存在」不代表目标达成 ——
+/// 挂着的可能是旧 uuid，判据见 [`email_taken`]（2026-09-14 裁决）。
 ///
-/// 错误文案本身**没有实机核对过**（调研 X1–X11 只覆盖 proto 与服务端调用链，没记错误串），
-/// 所以这里宽匹配三个子串；M3 真内核联调（bwg-rick）时按 xray 的实际文案核对一次，
-/// 对不上就把子串补齐 —— 匹配失败的后果只是多记一条 error + 多跑一次 CLI 退路（幂等），不会误判成功。
-fn target_already_reached(msg: &str) -> bool {
+/// 文案已在真内核上核对（xray 26.9.9，2026-09-14，见
+/// `super::xray::tests::user_alter_facts_against_a_real_xray`）：`proxy/vless: User <email> not found.`。
+/// 仍宽匹配三个子串以容其它版本的措辞 —— 匹配失败的后果只是多记一条 error +
+/// 多跑一次 CLI 退路（幂等），不会误判成功。
+pub(super) fn target_already_reached(msg: &str) -> bool {
     let m = msg.to_ascii_lowercase();
     m.contains("already") || m.contains("not found") || m.contains("not exist")
+}
+
+/// `AddUser` 失败是不是「这个 email 已经在 inbound 里」= 位置被占。
+///
+/// 真内核文案（xray 26.9.9，2026-09-14 实测）：`proxy/vless: User <email> already exists.`。
+/// **只认 `already`**，不像 [`target_already_reached`] 那样连 `not found` 一起认：
+/// AddUser 打到还没起来的 inbound 报的是 `handler not found: <tag>`，那条也带 `not found`，
+/// 认下去就等于把「内核根本没收到这个用户」记成同步成功（同一个真内核用例钉住这一条）。
+///
+/// 判成占位的后果是「摘掉再加一次」（幂等）；判不出来的后果是记一条 error + 60 秒后重试，
+/// 两边都不会把没换成的 uuid 记成换成了 —— 所以这条匹配错了也不会造成静默失效。
+pub(super) fn email_taken(msg: &str) -> bool {
+    msg.to_ascii_lowercase().contains("already")
+}
+
+/// 把 xray 里占着这个 email 的用户摘掉，好让 `AddUser` 能把新 uuid 挂上去。
+///
+/// 与 `to_remove` 那一路同口径（决策 D12 / 调研 X9）：gRPC 报「不存在」= 位置本来就是空的，
+/// 其余失败走 `xray api rmu` CLI 退路 —— RemoveUser 这个方向不自愈，而位置腾不出来
+/// 这一轮连 AddUser 都发不出去（新 uuid 一直不生效，审查意见③）。
+async fn free_the_email(
+    ctx: &DaemonCtx,
+    shared: &Shared,
+    tag: &str,
+    id: Uuid,
+) -> Result<(), String> {
+    match shared.xray().remove_user(tag, id).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let msg = e.to_string();
+            if target_already_reached(&msg) {
+                tracing::debug!(tag, %id, "腾位置的 RemoveUser 报不存在，直接 AddUser");
+                Ok(())
+            } else if cli_remove(ctx, tag, &id.to_string()).await {
+                tracing::info!(tag, %id, "腾位置的 RemoveUser 走了 CLI 退路");
+                Ok(())
+            } else {
+                Err(msg)
+            }
+        }
+    }
 }
 
 /// `xray api rmu --server=<addr> -tag=<tag> <email>`；找不到可执行文件或非零退出返回 false。
@@ -1632,8 +1696,13 @@ mod tests {
         );
     }
 
+    /// 2026-09-14 裁决：xray 报「已存在」= 位置被占，挂的是哪个 uuid 我们无从得知，
+    /// 所以一律摘掉再加一次 —— 不报 error，但也**不**把它当成「目标已达成」。
+    ///
+    /// （原来这条测的是「已存在按成功处理」。那个口径在轮换面前是静默失效：位置上挂的
+    /// 可能正是要换掉的旧 uuid，见 [`a_rotation_lost_to_a_daemon_restart_still_reaches_xray`]。）
     #[tokio::test]
-    async fn an_add_that_reports_already_exists_is_not_an_error() {
+    async fn an_add_that_reports_already_exists_is_healed_by_removing_the_squatter() {
         let h = harness().await;
         let ctx = ctx_of(&h);
         let id = h.store.read().await.users[0].user_id;
@@ -1641,17 +1710,127 @@ mod tests {
         // 装机后第一轮的真实情形：xray 侧已有同 email（`applied` 只活在进程内）
         let key = format!("add:vless-direct:{id}:{vid}");
         h.xray.with(|i| {
-            i.fail_on.insert(key.clone());
+            i.fail_once.insert(key.clone());
             i.error_text
                 .insert(key, format!("User {id} already exists."));
         });
         let out = sync_users(&ctx, &h.shared, &BTreeSet::new()).await;
         assert!(
             out.errors.is_empty(),
-            "「已存在」按成功处理：{:?}",
+            "摘掉再加成功了就不记 error：{:?}",
             out.errors
         );
         assert_eq!(out.added, vec![id], "记进 applied，第二轮就不再 AddUser");
+        assert_eq!(
+            h.xray.calls(),
+            vec![
+                format!("add:vless-direct:{id}:{vid}"),
+                format!("remove:vless-direct:{id}"),
+                format!("add:vless-direct:{id}:{vid}"),
+                format!("add:vless-residential:{id}:{vid}"),
+            ],
+            "只有报「已存在」的那个 inbound 需要摘掉再加"
+        );
+    }
+
+    /// 审查意见①的回归（【阻断】）：轮换在 gRPC 推送前遇上 b-ui 重启 —— `applied`
+    /// 只活在进程内（`panel/mod.rs` 的 `Applied` 注释自己写了这件事），新进程里是空的，
+    /// 而 xray 进程没重启、里面仍挂着**旧** uuid。
+    ///
+    /// 此时 `replaces_uuid` 是假的，只发 AddUser 会撞 xray 的「已存在」；把那条错误吃成
+    /// 成功就等于把旧 uuid 记成新 uuid —— 泄露的旧凭据一直有效到 xray 下次重启
+    /// （`render::xray::structural_hash` 剥掉了 clients，对账不会重启它），
+    /// journal 里一条错误都没有，而面板与 rotate 回包都声称换过了。
+    #[tokio::test]
+    async fn a_rotation_lost_to_a_daemon_restart_still_reaches_xray() {
+        let h = harness().await;
+        let ctx = ctx_of(&h);
+        let id = h.store.read().await.users[0].user_id;
+        // 第一轮：xray 里挂上旧 uuid
+        sync_users(&ctx, &h.shared, &BTreeSet::new()).await;
+        h.store.update(|s| rotate(&mut s.users[0])).await.unwrap();
+        let new = h.store.read().await.users[0].credentials.vless_uuid;
+
+        // 「b-ui 重启」：换一份全新的 `Shared`（记账清空），xray 与 hysteria 还是同两个假内核
+        let restarted = Arc::new(Shared::new(
+            Box::new(h.xray.clone()),
+            Box::new(h.hy2.clone()),
+        ));
+        restarted.set_paths(&h.paths);
+        // xray 的应答：同名 email 已在 inbound 里（挂的是旧 uuid），摘掉后才加得上
+        h.xray.with(|i| {
+            for tag in XRAY_INBOUND_TAGS {
+                let key = format!("add:{tag}:{id}:{new}");
+                i.fail_once.insert(key.clone());
+                i.error_text
+                    .insert(key, format!("User {id} already exists."));
+            }
+        });
+        h.xray.clear_calls();
+
+        let out = sync_users(&ctx, &restarted, &BTreeSet::new()).await;
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(out.added, vec![id]);
+        assert_eq!(
+            h.xray.calls(),
+            vec![
+                format!("add:vless-direct:{id}:{new}"),
+                format!("remove:vless-direct:{id}"),
+                format!("add:vless-direct:{id}:{new}"),
+                format!("add:vless-residential:{id}:{new}"),
+                format!("remove:vless-residential:{id}"),
+                format!("add:vless-residential:{id}:{new}"),
+            ],
+            "两个 inbound 都要把旧 uuid 摘掉再挂新的"
+        );
+        // 新进程的记账指向新 uuid ⇒ 下一轮零请求（不会每 60 秒 remove+add 抖一次）
+        h.xray.clear_calls();
+        let out2 = sync_users(&ctx, &restarted, &BTreeSet::new()).await;
+        assert!(out2.errors.is_empty(), "{:?}", out2.errors);
+        assert!(h.xray.calls().is_empty(), "{:?}", h.xray.calls());
+    }
+
+    /// 审查意见③：腾位置的 RemoveUser 与 `to_remove` 那一路同口径 —— gRPC 失败要走
+    /// `xray api rmu` CLI 退路（决策 D12 / 调研 X9），退路成功就照常把新 uuid 挂上去。
+    /// 不走退路的后果是这一轮连 AddUser 都发不出去，而那条 error 大概率连 incident
+    /// 都不会变成（`XrayGrpcUnavailable` 签名要求日志里同时出现 `unavailable`）。
+    #[tokio::test]
+    async fn freeing_the_email_falls_back_to_the_xray_cli() {
+        let h = harness().await;
+        let ctx = ctx_of(&h);
+        let id = h.store.read().await.users[0].user_id;
+        sync_users(&ctx, &h.shared, &BTreeSet::new()).await;
+        h.store.update(|s| rotate(&mut s.users[0])).await.unwrap();
+        let new = h.store.read().await.users[0].credentials.vless_uuid;
+        h.host.with(|i| {
+            i.which.insert("xray".into());
+        });
+        h.xray.with(|i| {
+            i.fail_on.insert(format!("remove:vless-direct:{id}"));
+        });
+        h.xray.clear_calls();
+
+        let out = sync_users(&ctx, &h.shared, &BTreeSet::new()).await;
+        assert!(
+            out.errors.is_empty(),
+            "退路成功就不记 error：{:?}",
+            out.errors
+        );
+        assert_eq!(out.added, vec![id]);
+        assert!(
+            h.host.ops().contains(&format!(
+                "run:xray api rmu --server=127.0.0.1:10085 -tag=vless-direct {id}"
+            )),
+            "没走 CLI 退路：{:?}",
+            h.host.ops()
+        );
+        assert!(
+            h.xray
+                .calls()
+                .contains(&format!("add:vless-direct:{id}:{new}")),
+            "位置腾出来了就要把新 uuid 挂上去：{:?}",
+            h.xray.calls()
+        );
     }
 
     /// 2026-09-14 裁决的回归：uuid 变了（轮换、或面板给 Reality 用户改 UUID）就必须
@@ -1695,8 +1874,8 @@ mod tests {
         assert!(h.xray.calls().is_empty(), "{:?}", h.xray.calls());
     }
 
-    /// 换 uuid 时 AddUser 还报「已存在」= 旧 uuid 仍挂着，目标根本没达成：必须记成失败
-    /// 交给 60 秒安全网重试，**不许**像新增那一路那样吃掉这条错误。
+    /// 位置腾过了、AddUser 还是报「已存在」（摘掉再加也没成）= 旧 uuid 仍挂着，
+    /// 目标根本没达成：必须记成失败交给 60 秒安全网重试，**绝不**记账。
     #[tokio::test]
     async fn an_already_exists_while_replacing_a_uuid_is_a_real_error() {
         let h = harness().await;

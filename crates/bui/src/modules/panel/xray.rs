@@ -386,6 +386,107 @@ mod tests {
         );
     }
 
+    /// 真实 xray 的**用户增删**事实。与 [`routing_rules_round_trip_against_a_real_xray`]
+    /// 同一档的有意例外（回环端口 + tempfile + 子进程在 `Drop` 里 kill，不碰 systemd / /opt），
+    /// 只在 `xray` 在 PATH 上时跑。
+    ///
+    /// 四条事实，钉住 `panel::users` 里 add / remove 两个方向的判据
+    /// （本机 xray 26.9.9 实测，2026-09-14）：
+    /// 1. 同名 email 再 `AddUser` ⇒ `proxy/vless: User <email> already exists.`
+    ///    —— `users::email_taken` 认它，于是「摘掉再加」那一路才会被触发；
+    /// 2. 先 `RemoveUser` 再 `AddUser` ⇒ 新 uuid 挂得上（轮换靠这条成立）；
+    /// 3. `RemoveUser` 撞不存在 ⇒ `proxy/vless: User <email> not found.`
+    ///    —— `users::target_already_reached` 认它，删是幂等的；
+    /// 4. `AddUser` 打到**不存在的 inbound tag** ⇒ `handler not found: <tag>`，
+    ///    这条**也带 `not found`**。所以 add 那一路绝不能用
+    ///    `users::target_already_reached` 判「已达成」：xray 还没起那个 inbound 时
+    ///    会被记成同步成功，用户永远进不了内核而日志里一条错都没有。
+    #[tokio::test]
+    async fn user_alter_facts_against_a_real_xray() {
+        use crate::modules::panel::users::{email_taken, target_already_reached};
+        if !have_xray() {
+            eprintln!("skipped: xray not found");
+            return;
+        }
+        let free_port = || {
+            std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port()
+        };
+        let (api_port, vless_port) = (free_port(), free_port());
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("xray.json");
+        let seed = Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
+        let cfg = serde_json::json!({
+            "log": {"loglevel": "warning"},
+            "api": {"tag": "api", "services": ["HandlerService", "RoutingService"]},
+            "inbounds": [
+                {"tag": "api", "port": api_port, "listen": "127.0.0.1",
+                 "protocol": "dokodemo-door", "settings": {"address": "127.0.0.1"}},
+                // 渲染出的两个 REALITY 入站在这里用明文 vless 代替：本用例只问
+                // HandlerService 对 clients 的增删语义，与传输层无关
+                {"tag": "vless-direct", "port": vless_port, "listen": "127.0.0.1",
+                 "protocol": "vless",
+                 "settings": {"clients": [{"id": seed, "email": "seed"}], "decryption": "none"}}
+            ],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+            "routing": {"rules": [{"type": "field", "inboundTag": ["api"], "outboundTag": "api"}]}
+        });
+        std::fs::write(&cfg_path, serde_json::to_vec_pretty(&cfg).unwrap()).unwrap();
+        let _xrayd = Xrayd::spawn(&cfg_path);
+        let c = XrayClient::with_addr(format!("127.0.0.1:{api_port}"));
+        let mut ready = false;
+        for _ in 0..50 {
+            if c.list_rules().await.is_ok() {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(ready, "xray 没在 5 秒内接受 gRPC");
+
+        let new = Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap();
+        c.add_user("vless-direct", uid(), vid()).await.unwrap();
+
+        // 事实①：同名 email 再 AddUser 报「已存在」——**换的 uuid 没生效**
+        let dup = c
+            .add_user("vless-direct", uid(), new)
+            .await
+            .expect_err("同名 email 必须报错")
+            .to_string();
+        assert!(email_taken(&dup), "{dup}");
+
+        // 事实②：摘掉再加，新 uuid 就挂上了（轮换与「b-ui 重启丢了记账」都靠这条）
+        c.remove_user("vless-direct", uid()).await.unwrap();
+        c.add_user("vless-direct", uid(), new).await.unwrap();
+
+        // 事实③：RemoveUser 撞不存在 = 目标已达成
+        c.remove_user("vless-direct", uid()).await.unwrap();
+        let gone = c
+            .remove_user("vless-direct", uid())
+            .await
+            .expect_err("不存在的 email 必须报错")
+            .to_string();
+        assert!(target_already_reached(&gone), "{gone}");
+
+        // 事实④：inbound 不存在时的 AddUser 也带「not found」，但目标根本没达成
+        let no_tag = c
+            .add_user("vless-residential", uid(), new)
+            .await
+            .expect_err("不存在的 inbound tag 必须报错")
+            .to_string();
+        assert!(
+            target_already_reached(&no_tag),
+            "宽匹配会把它当成已达成，所以 add 那一路不许用它：{no_tag}"
+        );
+        assert!(
+            !email_taken(&no_tag),
+            "add 那一路的判据必须把它排除在外：{no_tag}"
+        );
+    }
+
     /// 真实 xray 的 gRPC 往返。这是「两层 `TypedMessage` 的 type 名写对了没」的唯一硬证据 ——
     /// 编码错了服务端反射解码会直接报错，本地 fake 永远发现不了；D7 里那三条内核事实
     /// （重名报错 / 删不存在算成功 / 追加即表尾）也由它守住。
