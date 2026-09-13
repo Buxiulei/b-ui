@@ -148,14 +148,32 @@ mod tests {
     #[test]
     fn three_hits_inside_the_window_fire_exactly_once() {
         let mut e = Engine::default();
-        assert!(!feed(&mut e, Sig::RelayUpstreamError, "u2", 0));
-        assert!(!feed(&mut e, Sig::RelayUpstreamError, "u2", 1));
+        assert!(!feed(&mut e, Sig::RelayUpstreamAuthFailed, "u2", 0));
+        assert!(!feed(&mut e, Sig::RelayUpstreamAuthFailed, "u2", 1));
         assert!(
-            feed(&mut e, Sig::RelayUpstreamError, "u2", 2),
+            feed(&mut e, Sig::RelayUpstreamAuthFailed, "u2", 2),
             "第 3 条触发"
         );
         assert!(
-            !feed(&mut e, Sig::RelayUpstreamError, "u2", 3),
+            !feed(&mut e, Sig::RelayUpstreamAuthFailed, "u2", 3),
+            "触发后计数清零"
+        );
+    }
+
+    /// 连接类门槛 2 条：丢包时每条错误都要等一次 relay 拨号超时，第 3 条是白等的
+    #[test]
+    fn two_connection_errors_fire_where_one_does_not() {
+        let mut e = Engine::default();
+        assert!(
+            !feed(&mut e, Sig::RelayUpstreamError, "u2", 0),
+            "1 条不触发"
+        );
+        assert!(
+            feed(&mut e, Sig::RelayUpstreamError, "u2", 5),
+            "第 2 条触发"
+        );
+        assert!(
+            !feed(&mut e, Sig::RelayUpstreamError, "u2", 6),
             "触发后计数清零"
         );
     }
@@ -163,7 +181,7 @@ mod tests {
     #[test]
     fn hits_spread_wider_than_the_window_never_add_up() {
         let mut e = Engine::default();
-        for s in [0, 40, 80, 120, 160] {
+        for s in [0, 61, 122, 183, 244] {
             assert!(!feed(&mut e, Sig::RelayUpstreamError, "u2", s), "t={s}");
         }
     }
@@ -171,7 +189,7 @@ mod tests {
     #[test]
     fn a_fired_signature_is_debounced_for_sixty_seconds() {
         let mut e = Engine::default();
-        for s in 0..3 {
+        for s in 0..2 {
             feed(&mut e, Sig::RelayUpstreamError, "u2", s);
         }
         for s in 10..13 {
@@ -182,7 +200,7 @@ mod tests {
         }
         assert!(
             feed(&mut e, Sig::RelayUpstreamError, "u2", 63),
-            "距上次触发 ≥ 60 秒、窗口内仍有 ≥3 条 ⇒ 再触发"
+            "距上次触发 ≥ 60 秒、窗口内仍有 ≥2 条 ⇒ 再触发"
         );
     }
 
@@ -204,10 +222,13 @@ mod tests {
     fn subjects_and_signatures_count_separately() {
         let mut e = Engine::default();
         feed(&mut e, Sig::RelayUpstreamError, "u2", 0);
-        feed(&mut e, Sig::RelayUpstreamError, "u2", 1);
         assert!(
-            !feed(&mut e, Sig::RelayUpstreamError, "u3", 2),
+            !feed(&mut e, Sig::RelayUpstreamError, "u3", 1),
             "别的上游不帮 u2 凑数"
+        );
+        assert!(
+            !feed(&mut e, Sig::RelayUpstreamAuthFailed, "u2", 1),
+            "连接类与凭据类各自计数"
         );
         assert!(
             !feed(&mut e, Sig::Hy2AuthHttpFailed, "u2", 2),

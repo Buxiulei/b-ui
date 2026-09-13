@@ -4,7 +4,7 @@
 
 use super::engine::SentinelRuntime;
 use super::incidents::{Level, Outcome};
-use super::LONG_UNREACHABLE_MINS;
+use super::{LONG_UNREACHABLE_MINS, PROBE_TCP_TIMEOUT_SECS};
 use crate::modules::residential::clash::Clash;
 use crate::modules::residential::proxy::{self, Prober};
 use crate::modules::residential::slots::{self, SlotOutcome};
@@ -63,7 +63,8 @@ fn gone(id: Uuid) -> Outcome {
     }
 }
 
-/// relay 日志里同一上游 60 秒 ≥3 条连接错误之后：带外快探（[`health::probe_quick`]）；
+/// relay 日志里同一上游 60 秒 ≥2 条连接错误（凭据失效 ≥3 条）之后：带外快探
+/// （[`health::probe_quick`]：网关 TCP [`PROBE_TCP_TIMEOUT_SECS`] 秒内连不上即判不可达）；
 /// 不可用 ⇒ 立即判不健康 + [`slots::borrow_now`] + 上游级告警「IP X 不可达，槽 i 已临时切到 Y」。
 pub async fn on_upstream_error(
     ctx: &DaemonCtx,
@@ -77,8 +78,11 @@ pub async fn on_upstream_error(
         return gone(id);
     };
     let u2 = up.clone();
-    let probe = match tokio::task::spawn_blocking(move || health::probe_quick(prober.as_ref(), &u2))
-        .await
+    let tcp_within = std::time::Duration::from_secs(PROBE_TCP_TIMEOUT_SECS);
+    let probe = match tokio::task::spawn_blocking(move || {
+        health::probe_quick(prober.as_ref(), &u2, tcp_within)
+    })
+    .await
     {
         Ok(p) => p,
         Err(e) => {

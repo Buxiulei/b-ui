@@ -175,6 +175,13 @@ pub trait Prober: Send + Sync + 'static {
     fn gateway_tcp_ms(&self, _up: &Upstream) -> Option<u64> {
         None
     }
+    /// 哨兵带外快探的第一步（spec §5.7）：到上游网关 `host:port` 能否在 `within` 内建起 TCP，
+    /// 返回建连耗时（毫秒），`None` = 连不上。与 [`Prober::gateway_tcp_ms`] 的区别是**整体**限时：
+    /// 解析出的各地址并发拨、任一连上即通，不是逐个地址各等一遍超时。缺省退回
+    /// `gateway_tcp_ms`（只有真实实现关心时限）
+    fn gateway_tcp_within(&self, up: &Upstream, _within: std::time::Duration) -> Option<u64> {
+        self.gateway_tcp_ms(up)
+    }
     /// 经上游发一次**浏览器 UA** 的 GET 并**计时**，返回 `(完整往返耗时 ms, 结果)`。
     /// `ms` 为 `None` = 请求没成功（失败的耗时只是超时值，记进样本会污染 p50）
     fn timed_get(&self, up: &Upstream, url: &str) -> (Option<u64>, Result<HttpProbe, ProbeError>) {
@@ -622,6 +629,31 @@ impl Prober for ReqwestProber {
         self.dial(up).ok().map(|_| elapsed_ms(t))
     }
 
+    /// `dial` 逐个地址各等满超时：网关域名解析出 6 个地址又整段被丢包时，那是 6 × 5 = 30 秒
+    /// （2026-09-13 演练判据① 30.3 秒的来源）。这里解析与拨号都放后台线程、各地址并发拨，
+    /// 主线程只等 `within`：DNS 卡住也吃同一个时限；全部被拒时发送端全掉线，立刻返回。
+    /// 超时后还没结束的线程各自在 `within` 内收场（`connect_timeout`），不会越积越多
+    fn gateway_tcp_within(&self, up: &Upstream, within: std::time::Duration) -> Option<u64> {
+        use std::net::ToSocketAddrs;
+        let t = std::time::Instant::now();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let target = (up.host.clone(), up.port);
+        std::thread::spawn(move || {
+            let Ok(addrs) = target.to_socket_addrs() else {
+                return;
+            };
+            for a in addrs {
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    if std::net::TcpStream::connect_timeout(&a, within).is_ok() {
+                        let _ = tx.send(());
+                    }
+                });
+            }
+        });
+        rx.recv_timeout(within).ok().map(|()| elapsed_ms(t))
+    }
+
     fn timed_get(&self, up: &Upstream, url: &str) -> (Option<u64>, Result<HttpProbe, ProbeError>) {
         let client = match self.proxied_client(
             up,
@@ -763,8 +795,11 @@ pub struct FakeProberInner {
     pub udp: bool,
     /// 直连可达的 `"<host>:<port>"`；不在集合里即不可达
     pub direct: std::collections::BTreeSet<String>,
-    /// [`Prober::gateway_tcp_ms`] 的返回，缺省 `None`（= 连不上，「未知」不许变成好成绩）
+    /// [`Prober::gateway_tcp_ms`] 与 [`Prober::gateway_tcp_within`] 的返回，缺省 `None`
+    /// （= 连不上，「未知」不许变成好成绩）
     pub tcp_ms: Option<u64>,
+    /// `gateway_tcp_within` 连不上时带着时限调一次：测试用它把「丢包时等满时限」记到假时钟上
+    pub on_tcp_fail: Option<Box<dyn Fn(std::time::Duration) + Send>>,
     /// [`Prober::timed_get`] 的耗时；结果本身仍查 `gets`（同一份 URL 表）
     pub http_ms: Option<u64>,
     /// [`Prober::stun_binding`] 的返回，缺省 `UdpProbe::default()`（不通、没耗时）
@@ -854,6 +889,17 @@ impl Prober for FakeProber {
     fn gateway_tcp_ms(&self, _up: &Upstream) -> Option<u64> {
         let mut i = self.inner.lock().expect("FakeProber 锁被毒化");
         i.calls.push("tcp".into());
+        i.tcp_ms
+    }
+
+    fn gateway_tcp_within(&self, _up: &Upstream, within: std::time::Duration) -> Option<u64> {
+        let mut i = self.inner.lock().expect("FakeProber 锁被毒化");
+        i.calls.push("tcp".into());
+        if i.tcp_ms.is_none() {
+            if let Some(f) = &i.on_tcp_fail {
+                f(within);
+            }
+        }
         i.tcp_ms
     }
 
@@ -1231,6 +1277,27 @@ mod tests {
         // 0 字节 / 0 毫秒都不是速度（除零与「一个字节都没传」都要挡掉）
         assert_eq!(mbps(0, 1_000), None);
         assert_eq!(mbps(1024, 0), None);
+    }
+
+    /// 哨兵快探的 TCP 门槛（spec §5.7）：连上即返回耗时；解析出的地址全被拒 ⇒ 立刻返回 `None`，
+    /// 不等满时限（丢包才会等满，且各地址并发拨、整体不超过时限）
+    #[test]
+    fn gateway_tcp_within_answers_on_connect_and_gives_up_early_when_refused() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut u = up(UpstreamKind::Socks5);
+        u.host = "127.0.0.1".into();
+        u.port = l.local_addr().unwrap().port();
+        let p = ReqwestProber::new();
+        let within = std::time::Duration::from_secs(3);
+        assert!(p.gateway_tcp_within(&u, within).is_some());
+        drop(l);
+        let t = std::time::Instant::now();
+        assert_eq!(p.gateway_tcp_within(&u, within), None);
+        assert!(
+            t.elapsed() < within,
+            "被拒是立刻知道的，不该等满时限：{:?}",
+            t.elapsed()
+        );
     }
 
     #[test]

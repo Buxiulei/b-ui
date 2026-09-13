@@ -2,7 +2,9 @@
 # b-ui v4 日志哨兵真机演练（spec §5.7）。在生产机（先 bwg-rick）上以 root 运行：临时丢弃发往
 # **某一个**住宅上游（该上游的 IP:端口，只动 TCP）的流量，验证四条判据：
 #   ① 哨兵 ≤ DRILL_DETECT_SLA（15）秒记事件——从该上游第一条 relay 连接错误的日志时刻算到事件的
-#     at（哨兵在快探与借用做完后才盖时间戳，所以这段时长已含借用）
+#     at（哨兵在快探与借用做完后才盖时间戳，所以这段时长已含借用）。构成 = 等第 2 条错误（连接类
+#     门槛 60 秒 2 条；下面的并发请求让几条错误几乎同时出现，串行时最多一次 relay 拨号超时 5 秒）
+#     + 哨兵轮询 ≤2 秒 + 网关 TCP 快探 ≤3 秒（连不上即判不可达）+ 借用的 Clash PUT
 #   ② 该槽借用到其它 IP（`bui residential slots --json` 的 borrowed=true、active ≠ 本槽）
 #   ③ 该槽用户回环出网 IP 改变（经本槽中继入站 127.0.0.1:(2080+i) 请求 DRILL_EGRESS_URL 取出口 IP）
 #   ④ 删掉丢包规则后，巡检在 DRILL_BACK_WAIT（660）秒内切回本槽（恢复后第 4 轮，见计划 D6）
@@ -170,7 +172,8 @@ run_drill() {
   t0=$(date +%s)
   drop_on || fatal "iptables 插规则失败"
   log "已丢弃发往 ${DROP_IPS% } 端口 $port 的 TCP（注释 $TAG）"
-  # 造连接错误：三个并发请求经本槽出网，都会卡在 relay 连上游这一步（门槛 60 秒 ≥3 条）
+  # 造连接错误：三个并发请求经本槽出网，都会卡在 relay 连上游这一步（连接类门槛 60 秒 ≥2 条；
+  # 并发让错误同时出现，不用串行等 relay 拨号超时）
   for _ in 1 2 3; do
     egress_ip "$relay" >/dev/null &
   done

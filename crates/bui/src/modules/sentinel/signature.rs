@@ -10,8 +10,12 @@ use crate::modules::residential::MEMBER_PREFIX;
 /// 签名。`id()` 是事件、面板与演练脚本共用的稳定字符串。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Sig {
-    /// relay → 某上游：connection refused / i/o timeout / deadline exceeded / 407 / SOCKS5 认证被拒
+    /// relay → 某上游连不上 / 超时：connection refused / i/o timeout / deadline exceeded /
+    /// no route to host / network is unreachable
     RelayUpstreamError,
+    /// relay → 某上游凭据失效：407 / SOCKS5 认证被拒。与 [`Sig::RelayUpstreamError`] 同一个预案
+    /// （共享动作冷却），只是门槛不同
+    RelayUpstreamAuthFailed,
     /// relay → 某上游：`unexpected status: 403 … serp …`，或对 Google 搜索域名的 403
     RelayGoogleBlocked,
     /// hysteria 连不上 http 鉴权端口（spec §3.2）
@@ -47,6 +51,7 @@ impl Sig {
     pub fn id(self) -> &'static str {
         match self {
             Sig::RelayUpstreamError => "relay_upstream_error",
+            Sig::RelayUpstreamAuthFailed => "relay_upstream_auth_failed",
             Sig::RelayGoogleBlocked => "relay_google_blocked",
             Sig::Hy2AuthHttpFailed => "hy2_auth_http_failed",
             Sig::KernelBindInUse => "kernel_bind_in_use",
@@ -56,9 +61,17 @@ impl Sig {
         }
     }
 
+    /// 对象是住宅上游的 relay 签名：日志里是成员 tag，调用方当场换成 uuid
+    pub fn on_upstream(self) -> bool {
+        matches!(
+            self,
+            Sig::RelayUpstreamError | Sig::RelayUpstreamAuthFailed | Sig::RelayGoogleBlocked
+        )
+    }
+
     pub fn action(self) -> Action {
         match self {
-            Sig::RelayUpstreamError => Action::ProbeAndBorrow,
+            Sig::RelayUpstreamError | Sig::RelayUpstreamAuthFailed => Action::ProbeAndBorrow,
             Sig::RelayGoogleBlocked => Action::VerifyGoogleAndBorrow,
             Sig::Hy2AuthHttpFailed | Sig::CaddyCertFailed => Action::Alert,
             Sig::KernelBindInUse | Sig::KernelCrashLoop => Action::DelegateWatchdog,
@@ -68,7 +81,13 @@ impl Sig {
 
     pub fn rule(self) -> Rule {
         match self {
+            // 丢包时每条连接错误都要等一次 relay 拨号超时（sing-box 5 秒）才出现，第 3 条是白等的；
+            // 2 条就去带外探测，误报由探测兜底（探测通过 = Info，不借用、不占动作冷却）
             Sig::RelayUpstreamError => Rule {
+                threshold: 2,
+                window_secs: 60,
+            },
+            Sig::RelayUpstreamAuthFailed => Rule {
                 threshold: 3,
                 window_secs: 60,
             },
@@ -213,10 +232,10 @@ fn relay(message: &str) -> Option<Match> {
     let (tag, host, _port, reason) = parse_relay(message)?;
     let lower = reason.to_ascii_lowercase();
     let m = |sig: Sig| Some(hit(sig, &tag, message));
-    // ① 凭据失效：整条上游都不能用（调研 §D），与连不上同一个预案
+    // ① 凭据失效：整条上游都不能用（调研 §D），与连不上同一个预案、各自的门槛
     if lower.starts_with("unexpected status: 407") || AUTH_MARKERS.iter().any(|k| lower.contains(k))
     {
-        return m(Sig::RelayUpstreamError);
+        return m(Sig::RelayUpstreamAuthFailed);
     }
     if let Some(s) = lower.strip_prefix("unexpected status: ") {
         // ② Google 搜索被上游整域拒绝（Bright Data 的 `403 Forbidden serp domain`）
@@ -296,28 +315,44 @@ mod tests {
 
     #[test]
     fn upstream_side_failures_are_relay_upstream_errors_keyed_by_member_tag() {
-        for (out, reason) in [
+        for (out, reason, sig) in [
             (
                 "socks[resi-2]",
                 "dial tcp 198.51.100.8:10007: connect: connection refused",
+                Sig::RelayUpstreamError,
             ),
-            ("socks[resi-2]", "dial tcp 198.51.100.8:10007: i/o timeout"),
-            ("http[resi-3]", "context deadline exceeded"),
             (
-                "http[resi-1]",
-                "unexpected status: 407 Proxy Authentication Required",
+                "socks[resi-2]",
+                "dial tcp 198.51.100.8:10007: i/o timeout",
+                Sig::RelayUpstreamError,
             ),
-            ("socks[resi-1]", "socks5: incorrect user name or password"),
+            (
+                "http[resi-3]",
+                "context deadline exceeded",
+                Sig::RelayUpstreamError,
+            ),
             (
                 "http[resi-1]",
                 "dial tcp: lookup isp1.example.net: no route to host",
+                Sig::RelayUpstreamError,
+            ),
+            // 凭据失效：同一个预案，但单独一个签名（门槛不同，见 `rules_and_actions_match_the_spec`）
+            (
+                "http[resi-1]",
+                "unexpected status: 407 Proxy Authentication Required",
+                Sig::RelayUpstreamAuthFailed,
+            ),
+            (
+                "socks[resi-1]",
+                "socks5: incorrect user name or password",
+                Sig::RelayUpstreamAuthFailed,
             ),
         ] {
             let msg = relay("www.gstatic.com:443", out, reason);
             let tag = out.split_once('[').unwrap().1.trim_end_matches(']');
             assert_eq!(
                 sig_of("b-ui-relay", &msg),
-                Some((Sig::RelayUpstreamError, tag.to_string())),
+                Some((sig, tag.to_string())),
                 "{msg}"
             );
         }
@@ -502,12 +537,31 @@ mod tests {
 
     #[test]
     fn rules_and_actions_match_the_spec() {
+        // 连接类 2 条就动：丢包时每条错误都要等一次 relay 拨号超时才出现，第 3 条是白等的；
+        // 误报由带外探测兜底（探测通过 = Info，不借用、不占冷却）
         assert_eq!(
             Sig::RelayUpstreamError.rule(),
             Rule {
-                threshold: 3,
+                threshold: 2,
                 window_secs: 60
             }
+        );
+        assert_eq!(
+            Sig::RelayUpstreamAuthFailed.rule(),
+            Rule {
+                threshold: 3,
+                window_secs: 60
+            },
+            "凭据类门槛不变"
+        );
+        assert_eq!(
+            Sig::RelayUpstreamAuthFailed.action(),
+            Sig::RelayUpstreamError.action(),
+            "同一个预案 ⇒ 共享动作冷却（冷却键按动作 + 对象）"
+        );
+        assert_eq!(
+            Sig::RelayUpstreamAuthFailed.id(),
+            "relay_upstream_auth_failed"
         );
         assert_eq!(
             Sig::Hy2AuthHttpFailed.rule(),

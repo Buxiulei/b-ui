@@ -23,11 +23,15 @@ pub const ACTION_COOLDOWN_SECS: i64 = 600;
 pub const INCIDENTS_MAX: usize = 200;
 /// 住宅 IP 被判不健康连续这么久 ⇒ 告警里建议管理员替换（设计裁决 D15）
 pub const LONG_UNREACHABLE_MINS: i64 = 30;
-/// 每轮增量读 journald 的间隔（设计裁决 D1）
-pub const POLL_SECS: u64 = 5;
+/// 每轮增量读 journald 的间隔（设计裁决 D1）。每轮一个短命的 `journalctl --after-cursor`，
+/// 不常驻进程；2 秒是「首条错误 → 事件」预算里的轮询那一项（演练 SLA 15 秒）
+pub const POLL_SECS: u64 = 2;
 /// 只有游标前进时，至少隔这么久才把游标落盘一次（hysteria 在 info 级每条连接都写日志）
 pub const CURSOR_PERSIST_SECS: i64 = 60;
-/// 带外快探的超时（设计裁决 D5：演练要求 ≤15 秒出事件）
+/// 带外快探第一步：到上游网关的 TCP 建连的**总**时限（解析出的各地址并发拨，设计裁决 D5）。
+/// 连不上 ⇒ 直接判不可达并借用，不再跑完整探测
+pub const PROBE_TCP_TIMEOUT_SECS: u64 = 3;
+/// 网关连得上之后那段完整探测（经隧道 GET、407 补判的 CONNECT）的单次超时
 pub const PROBE_TIMEOUT_SECS: u64 = 5;
 
 use crate::modules::panel::Shared;

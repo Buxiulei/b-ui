@@ -299,13 +299,14 @@ tonic 客户端，proto 从 Xray-core `v26.3.27` vendor 进仓（以仓库根为
 
 落地计划：`docs/superpowers/plans/2026-09-13-v4-log-sentinel.md`（设计裁决 D1–D16，本节按它修订）。
 
-**采集**：守护进程内一个任务（`modules::sentinel`），每 5 秒用 `journalctl -o json --after-cursor <c>` 增量读受管单元全集（`reconcile::managed_units`：`b-ui-relay`、`hysteria-server`、每个住宅槽的 `hysteria-residential[-i]`、`xray`、`caddy`，外加 `b-ui` 自己——xray gRPC 的失败只出现在守护进程自己的日志里）。首次启动或游标失效时用 `--since @<现在>`，**不回放历史**。游标以内存为准，落 `runtime.extra["sentinel"]`（有事件立即落，只是游标前进至少隔 60 秒落一次；重启后续读，早于签名窗口的积压不计数）。读取经 `Host::journal_read`（测试用 `FakeHost` 的队列）；`MESSAGE` 含 ANSI 色码时 journald 编成字节数组，按字节解码后剥色码；tracing-journald 的 `error` 字段在 `F_ERROR`。
+**采集**：守护进程内一个任务（`modules::sentinel`），每 2 秒用 `journalctl -o json --after-cursor <c>` 增量读受管单元全集（`reconcile::managed_units`：`b-ui-relay`、`hysteria-server`、每个住宅槽的 `hysteria-residential[-i]`、`xray`、`caddy`，外加 `b-ui` 自己——xray gRPC 的失败只出现在守护进程自己的日志里）。首次启动或游标失效时用 `--since @<现在>`，**不回放历史**。游标以内存为准，落 `runtime.extra["sentinel"]`（有事件立即落，只是游标前进至少隔 60 秒落一次；重启后续读，早于签名窗口的积压不计数）。读取经 `Host::journal_read`（测试用 `FakeHost` 的队列）；`MESSAGE` 含 ANSI 色码时 journald 编成字节数组，按字节解码后剥色码；tracing-journald 的 `error` 字段在 `F_ERROR`。
 
 **去抖与冷却**：同签名同对象在各自窗口内达门槛才触发，触发后 60 秒内不再触发；同「动作 + 对象」10 分钟内不重复执行（冷却表持久化，重启不失忆），冷却中的触发不记事件。
 
 | 签名 id | 判据 | 门槛 | 动作 |
 |---|---|---|---|
-| `relay_upstream_error` | relay `open connection to … using outbound/(http 或 socks)[resi-N]: <原因>`，原因是 connection refused / i/o timeout / deadline exceeded / no route / network unreachable / 407 / SOCKS5 认证被拒。目标级的其它 4xx/5xx 与 SOCKS5 REP 拒绝归 §5.4 黑名单，哨兵不计 | 同一上游 60 秒 ≥3 条 | 带外快探（先 TCP 连上游网关、5 秒超时，连不上即判不可达；连得上再走巡检同口径的可达性探测，含 407 补判）；失败 ⇒ 立即判不健康 + 按 §5.6 让**当前出口就是它**的槽立即借用最佳健康 IP（手动 pin 的槽不动）+ 上游级告警「IP X 不可达，槽 i 已临时切到 Y」 |
+| `relay_upstream_error` | relay `open connection to … using outbound/(http 或 socks)[resi-N]: <原因>`，原因是 connection refused / i/o timeout / deadline exceeded / no route / network unreachable。目标级的其它 4xx/5xx 与 SOCKS5 REP 拒绝归 §5.4 黑名单，哨兵不计 | 同一上游 60 秒 ≥2 条 | 带外快探（先 TCP 连上游网关：解析出的各地址并发拨、整体 3 秒，连不上即判不可达、不再跑完整探测；连得上再走巡检同口径的可达性探测，含 407 补判）；失败 ⇒ 立即判不健康 + 按 §5.6 让**当前出口就是它**的槽立即借用最佳健康 IP（手动 pin 的槽不动）+ 上游级告警「IP X 不可达，槽 i 已临时切到 Y」 |
+| `relay_upstream_auth_failed` | 同上形态，原因是 407 / proxy authentication / SOCKS5 认证被拒（凭据失效） | 同一上游 60 秒 ≥3 条 | 同 `relay_upstream_error`（同一个动作，共享冷却；告警写「凭据失效」） |
 | `relay_google_blocked` | 同上形态，`403` 且含 `serp` 或目标是 Google 搜索域名 | 1 条 | 带外 Google 搜索复核：可用 ⇒ 不动作；被封（403 / 429 / sorry 页）或没结论 ⇒ `google_ok=false` + 借用 + 告警 |
 | `hy2_auth_http_failed` | hysteria 连不上 `127.0.0.1:18789/auth`（仅 `hy2_auth=http`） | 60 秒 ≥3 条 | 事件 + 告警（带「守护进程是否在听」）。**不重启 b-ui**（由 systemd 拉起；原表「失败则重启 b-ui」改判）；原 watchdog 每 60 秒翻日志的同名检测迁到这里 |
 | `kernel_bind_in_use` / `kernel_crash_loop` | hysteria / xray `bind: address already in use`；systemd `Start request repeated too quickly` / `restart counter is at N`（N ≥ 5） | 1 条 | 交给现有看门狗与 systemd，只记事件 |
@@ -317,7 +318,7 @@ tonic 客户端，proto 从 Xray-core `v26.3.27` vendor 进仓（以仓库根为
 
 **事件**：`runtime.incidents`（`runtime.extra["incidents"]`）环形保留最近 200 条，新的在前，字段 `at / unit / signature / subject / action / result / level / sample`（`sample` 是先脱敏后截断的原文；上游只以 `host:port` 或体检学到的出口 IP 指称，绝不带凭据）。`bui status` 末尾显示最近 5 条（`--json` 不变），`bui incidents [--json] [-n N]` 查询（守护进程未运行时读 `runtime.json`），面板 `GET /api/incidents?limit=N`（管理员鉴权，缺省 50）+「事件」卡（20 条）。
 
-**预案边界**：哨兵只做「探测 → 借用 / 重试 / 告警」，不改 state 里的池成员；只挪每槽的 `slot-<i>-pool`，不动全局 `resi-pool`（`dns_resi` 的 detour 用它；故障 IP 恰好是全局选择时由下一轮巡检切走）；按槽借用与巡检的 `drive_slots` 互斥；替换 IP 仍由管理员在面板/CLI 执行，替换后 §5.6 的重分配自动完成。告警渠道：面板 + `bui status` + `bui incidents`；外部通知（Telegram/Webhook）只留 `Notifier` 接口，本期不做。**验收**：`scripts/ops/sentinel-drill.sh` 在生产机用 iptables 只丢弃发往某一上游 IP:端口 的 TCP（trap 兜底恢复），判据：首条 relay 连接错误后 ≤15 秒记事件（事件在借用做完后才盖时间戳）、该槽借用、该槽回环出网 IP 改变（探测 URL 必须走本槽 selector：split 模式下须命中分流关键字，脚本开跑前自查）、恢复后 ≤660 秒切回。
+**预案边界**：哨兵只做「探测 → 借用 / 重试 / 告警」，不改 state 里的池成员；只挪每槽的 `slot-<i>-pool`，不动全局 `resi-pool`（`dns_resi` 的 detour 用它；故障 IP 恰好是全局选择时由下一轮巡检切走）；按槽借用与巡检的 `drive_slots` 互斥；替换 IP 仍由管理员在面板/CLI 执行，替换后 §5.6 的重分配自动完成。告警渠道：面板 + `bui status` + `bui incidents`；外部通知（Telegram/Webhook）只留 `Notifier` 接口，本期不做。**验收**：`scripts/ops/sentinel-drill.sh` 在生产机用 iptables 只丢弃发往某一上游 IP:端口 的 TCP（trap 兜底恢复），判据：首条 relay 连接错误后 ≤15 秒记事件（事件在借用做完后才盖时间戳；预算 = 等第 2 条错误（并发连接几乎同时报错，串行时最多一次 relay 拨号超时——sing-box 缺省 5 秒，relay 出站不设 `connect_timeout`）+ 轮询 ≤2 秒 + 网关 TCP ≤3 秒 + 借用的 Clash PUT）、该槽借用、该槽回环出网 IP 改变（探测 URL 必须走本槽 selector：split 模式下须命中分流关键字，脚本开跑前自查）、恢复后 ≤660 秒切回。
 
 ## 6. Linux 客户端 `bui-c`（§⑤）
 

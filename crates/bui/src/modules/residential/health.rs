@@ -75,13 +75,14 @@ pub fn probe_member(p: &dyn Prober, up: &Upstream) -> MemberProbe {
     probe
 }
 
-/// 哨兵（spec §5.7，设计裁决 D5）的带外快探：先量到上游网关的 TCP 建连，**连不上直接判不可达**
+/// 哨兵（spec §5.7，设计裁决 D5）的带外快探：先在 `tcp_within` 内对上游网关建 TCP
+/// （[`Prober::gateway_tcp_within`]：解析出的各地址并发拨、整体限时），**连不上直接判不可达**
 /// ——网关都连不上，隧道不可能通，再等一次 HTTP 超时只会拖慢预案（上游被丢包时巡检那套
 /// [`probe_member`] 要走 ~40 秒）；连得上再走一轮与巡检同口径的 [`probe_reachable`]（含 407 补判）。
 /// **不测 Google / UDP / 测速**：那些是巡检的指标，预案只关心「这条上游此刻还能不能用」。
-/// 超时由调用方的 `Prober` 决定（哨兵用 `ReqwestProber::with_timeout(5)`）。
-pub fn probe_quick(p: &dyn Prober, up: &Upstream) -> MemberProbe {
-    let Some(tcp_ms) = p.gateway_tcp_ms(up) else {
+/// 完整探测那段的超时由调用方的 `Prober` 决定（哨兵用 `ReqwestProber::with_timeout(5)`）。
+pub fn probe_quick(p: &dyn Prober, up: &Upstream, tcp_within: Duration) -> MemberProbe {
+    let Some(tcp_ms) = p.gateway_tcp_within(up, tcp_within) else {
         return MemberProbe::default();
     };
     let mut probe = probe_reachable(p, up);
@@ -2757,12 +2758,20 @@ mod tests {
     #[test]
     fn the_quick_probe_gives_up_at_once_when_the_gateway_is_unreachable() {
         let p = crate::modules::residential::proxy::FakeProber::new(); // tcp_ms 缺省 None = 连不上
-        let r = probe_quick(&p, &upstream(2, 10));
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let s2 = seen.clone();
+        p.with(|i| i.on_tcp_fail = Some(Box::new(move |d| *s2.lock().unwrap() = Some(d))));
+        let r = probe_quick(&p, &upstream(2, 10), Duration::from_secs(3));
         assert!(!r.ok && !r.auth_failed);
         assert_eq!(
             p.calls(),
             vec!["tcp"],
             "网关都连不上就不再发 HTTP（丢包时每次都要等满超时）"
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(Duration::from_secs(3)),
+            "TCP 的总时限原样交给 prober"
         );
     }
 
@@ -2779,7 +2788,7 @@ mod tests {
                 }),
             );
         });
-        let r = probe_quick(&p, &upstream(2, 10));
+        let r = probe_quick(&p, &upstream(2, 10), Duration::from_secs(3));
         assert!(r.ok);
         assert_eq!(r.tcp_ms, Some(30));
         assert_eq!(
@@ -2802,7 +2811,7 @@ mod tests {
                 Err("__auth_failed__".into()),
             );
         });
-        let r = probe_quick(&p, &upstream(2, 10));
+        let r = probe_quick(&p, &upstream(2, 10), Duration::from_secs(3));
         assert!(!r.ok && r.auth_failed);
     }
 }
