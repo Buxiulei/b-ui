@@ -7,7 +7,7 @@
 
 use crate::engine::Engine;
 use crate::net::{Net, Via};
-use crate::paths::{Paths, UNIT_MAIN};
+use crate::paths::{Paths, TUN_IFACE, UNIT_MAIN};
 use crate::profiles::{Mode, Profiles};
 use crate::sys::{systemd, Sys};
 use crate::ufw;
@@ -67,6 +67,21 @@ pub enum Failure {
     Probe { got: Option<u16> },
     TunMissing,
     TunNoDefaultRoute,
+}
+
+/// 巡检日志（journald）与 `bui-c check` 输出里的中文说法；不打 Rust 的 Debug 名。
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 探测目标只写主机与路径：scheme 对读日志的人没有信息量
+        let target = PROBE_URL.trim_start_matches("https://");
+        match self {
+            Failure::UnitDown => write!(f, "{UNIT_MAIN} 没在运行"),
+            Failure::Probe { got: Some(code) } => write!(f, "探测 {target} 返回 HTTP {code}"),
+            Failure::Probe { got: None } => write!(f, "探测 {target} 超时或连不上"),
+            Failure::TunMissing => write!(f, "{TUN_IFACE} 接口不存在"),
+            Failure::TunNoDefaultRoute => write!(f, "默认路由没有指向 {TUN_IFACE}"),
+        }
+    }
 }
 
 /// 一次巡检的结论。
@@ -131,8 +146,23 @@ pub fn probe<S: Sys, N: Net>(sys: &S, net: &N, paths: &Paths, prof: &Profiles) -
     out
 }
 
-/// 一次巡检：探测 → 清零或退避重启。
+/// 一次巡检（`bui-c.timer`）：探测 → 清零或退避重启。
 pub fn run<S: Sys, N: Net>(sys: &S, net: &N, paths: &Paths) -> Result<Verdict> {
+    run_with(sys, net, paths, true)
+}
+
+/// 菜单 `[5]` 的手动检查：发现异常就重启，不等退避窗口（人就在跟前，点了就是要修）。
+/// 这次重启照样记进 `runtime.json`，timer 之后的退避从它算起。
+pub fn run_manual<S: Sys, N: Net>(sys: &S, net: &N, paths: &Paths) -> Result<Verdict> {
+    run_with(sys, net, paths, false)
+}
+
+fn run_with<S: Sys, N: Net>(
+    sys: &S,
+    net: &N,
+    paths: &Paths,
+    respect_backoff: bool,
+) -> Result<Verdict> {
     let prof = Profiles::load(sys, paths)?;
     if prof.active_profile().is_none() {
         return Ok(Verdict::NoProfile);
@@ -161,7 +191,7 @@ pub fn run<S: Sys, N: Net>(sys: &S, net: &N, paths: &Paths) -> Result<Verdict> {
     }
 
     let wait_s = wait_seconds(rt.fail_streak);
-    if let Some(last) = rt.last_restart_at {
+    if let Some(last) = rt.last_restart_at.filter(|_| respect_backoff) {
         let elapsed = now - last;
         if elapsed < wait_s {
             return Ok(Verdict::Waiting {
@@ -231,6 +261,24 @@ mod tests {
         s.reply("systemctl is-active --quiet bui-c.service", 0, "");
         n.route(PROBE_URL, FakeReply::Status(204));
         profiles_socks().save(s, &paths()).unwrap();
+    }
+
+    #[test]
+    fn failures_read_as_chinese_sentences() {
+        assert_eq!(Failure::UnitDown.to_string(), "bui-c.service 没在运行");
+        assert_eq!(
+            Failure::Probe { got: Some(403) }.to_string(),
+            "探测 www.gstatic.com/generate_204 返回 HTTP 403"
+        );
+        assert_eq!(
+            Failure::Probe { got: None }.to_string(),
+            "探测 www.gstatic.com/generate_204 超时或连不上"
+        );
+        assert_eq!(Failure::TunMissing.to_string(), "bui-tun 接口不存在");
+        assert_eq!(
+            Failure::TunNoDefaultRoute.to_string(),
+            "默认路由没有指向 bui-tun"
+        );
     }
 
     #[test]
@@ -514,6 +562,48 @@ mod tests {
         );
         assert_eq!(restarts(), 3);
         assert_eq!(Runtime::load(&s, &paths()).fail_streak, 3);
+    }
+
+    /// 菜单 `[5]` 的手动检查：人就在跟前，发现异常就重启，不理 timer 的退避窗口；
+    /// 但照样记下这次重启，timer 接下来仍按连击退避。
+    #[test]
+    fn manual_run_restarts_inside_the_backoff_window_and_still_records_it() {
+        let s = FakeSys::new();
+        let n = FakeNet::new();
+        profiles_socks().save(&s, &paths()).unwrap();
+        s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        n.route(PROBE_URL, FakeReply::Fail("no route".into()));
+        let restarts = || {
+            s.calls()
+                .iter()
+                .filter(|c| *c == "systemctl restart bui-c.service")
+                .count()
+        };
+
+        assert!(matches!(
+            run(&s, &n, &paths()).unwrap(),
+            Verdict::Restarted { .. }
+        ));
+        s.advance(30); // 还在 1 分钟窗口里：timer 会等，手动不等
+        let v = run_manual(&s, &n, &paths()).unwrap();
+        assert!(matches!(v, Verdict::Restarted { .. }), "{v:?}");
+        assert_eq!(restarts(), 2);
+        let rt = Runtime::load(&s, &paths());
+        assert_eq!(rt.fail_streak, 2, "手动重启也算一次连击");
+        assert_eq!(rt.last_restart_at, Some(s.now().unix_timestamp()));
+
+        // 紧接着 timer 巡检：从这次手动重启算退避
+        s.advance(30);
+        assert!(matches!(
+            run(&s, &n, &paths()).unwrap(),
+            Verdict::Waiting { .. }
+        ));
+        assert_eq!(restarts(), 2);
+
+        // 一切正常时手动检查照样是 Ok，没有节点照样跳过
+        let s = FakeSys::new();
+        let n = FakeNet::new();
+        assert_eq!(run_manual(&s, &n, &paths()).unwrap(), Verdict::NoProfile);
     }
 
     #[test]

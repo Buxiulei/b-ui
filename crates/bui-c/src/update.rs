@@ -5,7 +5,7 @@
 
 use crate::net::Net;
 use crate::paths::{Paths, SELF_BIN, UNIT_MAIN};
-use crate::profiles::{Panel, Profiles};
+use crate::profiles::{https_base, Panel, Profiles};
 use crate::sys::{systemd, Sys};
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -15,6 +15,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub const GITHUB_REPO: &str = "Buxiulei/b-ui";
+/// GitHub 的 releases 列表（无凭据，只取最近 10 条）：`releases/latest` 不解析预发布，
+/// 预发布通道靠它找最新的 rc tag。与服务端 `crates/bui/src/kernels/mod.rs::RELEASES_API_URL` 同口径。
+pub const RELEASES_API_URL: &str =
+    "https://api.github.com/repos/Buxiulei/b-ui/releases?per_page=10";
 pub const DL_TIMEOUT: Duration = Duration::from_secs(120);
 const MANIFEST_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -76,11 +80,8 @@ pub fn arch_suffix() -> &'static str {
 pub fn sources(panel: Option<&Panel>, m: &Manifest, file: &str) -> Result<Vec<(String, String)>> {
     let url = m.artifact(file)?.url.clone();
     let mut out = Vec::with_capacity(2 + m.mirrors.len());
-    if let Some(p) = panel {
-        out.push((
-            "面板".to_string(),
-            format!("{}/packages/{file}", p.base_url.trim_end_matches('/')),
-        ));
+    if let Some(base) = trusted_panel(panel) {
+        out.push(("面板".to_string(), format!("{base}/packages/{file}")));
     }
     out.push(("GitHub".to_string(), url.clone()));
     for (i, mirror) in m.mirrors.iter().enumerate() {
@@ -94,16 +95,24 @@ pub fn sources(panel: Option<&Panel>, m: &Manifest, file: &str) -> Result<Vec<(S
 
 /// manifest 自身只有两个源：镜像列表在 manifest 里，拿不到 manifest 就没有镜像可用。
 /// 两个源各 15s 超时，最坏 30s；离线机器由 `check` 的自更新退避（1 小时）兜住。
+/// 自更新只认 https 的 panel。导入时已经只写 https（K1），这里再挡一层：旧版本经 `--sub`
+/// 或明文面板写进 profiles.json 的地址照样会被读出来，而它决定 root 替换哪份二进制。
+fn trusted_panel(panel: Option<&Panel>) -> Option<String> {
+    let p = panel?;
+    let base = https_base(&p.base_url);
+    if base.is_none() {
+        tracing::warn!(
+            panel = %crate::error::redact_url(&p.base_url),
+            "profiles.json 里的面板不是 https，自更新跳过它"
+        );
+    }
+    base
+}
+
 fn manifest_sources(panel: Option<&Panel>) -> Vec<(String, String)> {
     let mut out = Vec::with_capacity(2);
-    if let Some(p) = panel {
-        out.push((
-            "面板".to_string(),
-            format!(
-                "{}/packages/manifest.json",
-                p.base_url.trim_end_matches('/')
-            ),
-        ));
+    if let Some(base) = trusted_panel(panel) {
+        out.push(("面板".to_string(), format!("{base}/packages/manifest.json")));
     }
     out.push((
         "GitHub".to_string(),
@@ -116,6 +125,48 @@ pub fn sha256_hex(data: &[u8]) -> String {
     hex::encode(Sha256::digest(data))
 }
 
+/// tag 是不是 `^v\d+\.\d+\.\d+-rc\d+$`（整串锚定；不引 regex crate，手写，与服务端同一份逻辑）。
+pub fn is_rc_tag(tag: &str) -> bool {
+    fn digits(s: &str) -> bool {
+        !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+    }
+    let Some((core, rc)) = tag.strip_prefix('v').and_then(|r| r.split_once("-rc")) else {
+        return false;
+    };
+    let mut seg = core.split('.');
+    let three = [seg.next(), seg.next(), seg.next()];
+    seg.next().is_none() && three.iter().all(|s| s.is_some_and(digits)) && digits(rc)
+}
+
+/// GitHub releases 列表里的一条（只取用得上的两个字段，其余忽略）。
+#[derive(Debug, Deserialize)]
+struct GhRelease {
+    tag_name: String,
+    #[serde(default)]
+    prerelease: bool,
+}
+
+/// releases 列表里最新的预发布 rc tag：列表按创建时间倒序，取第一个 `prerelease=true`
+/// 且 tag 形如 `v<x.y.z>-rcN` 的。没有就 `None`。
+fn latest_rc_tag<N: Net>(net: &N) -> Result<Option<String>> {
+    let body = net.text(RELEASES_API_URL, MANIFEST_TIMEOUT)?;
+    let list: Vec<GhRelease> = serde_json::from_str(&body)
+        .map_err(|e| Error::parse("GitHub releases 列表", e.to_string()))?;
+    Ok(list
+        .into_iter()
+        .find(|r| r.prerelease && is_rc_tag(&r.tag_name))
+        .map(|r| r.tag_name))
+}
+
+/// `Net::text` 对非 2xx 报 `HTTP <code>`；预发布回退只认 404（「没有正式版」），
+/// 断网 / 502 不是回退的理由。
+fn is_http_404(e: &Error) -> bool {
+    matches!(e, Error::Net { detail, .. } if detail == "HTTP 404")
+}
+
+/// 来源顺序：面板 `/packages/manifest.json` → GitHub `releases/latest` →（latest 404 时）
+/// GitHub releases 列表里最新的预发布。仓库里只有 `v4.0.0-rcN` 时 latest 必然 404
+/// （GitHub 不把预发布算 latest），服务端 `kernels::fetch_manifest_with` 已实现同样的回退。
 pub fn fetch_manifest<N: Net>(net: &N, panel: Option<&Panel>) -> Result<(String, Manifest)> {
     let mut last = String::new();
     for (name, url) in manifest_sources(panel) {
@@ -124,6 +175,25 @@ pub fn fetch_manifest<N: Net>(net: &N, panel: Option<&Panel>) -> Result<(String,
                 Ok(m) => return Ok((name, m)),
                 Err(e) => last = format!("{name}: manifest 解析失败（{e}）"),
             },
+            Err(e) if name == "GitHub" && is_http_404(&e) => {
+                last = match latest_rc_tag(net) {
+                    Ok(Some(tag)) => {
+                        let rc_url = format!(
+                            "https://github.com/{GITHUB_REPO}/releases/download/{tag}/manifest.json"
+                        );
+                        let rc_name = format!("GitHub 预发布 {tag}");
+                        match net.text(&rc_url, MANIFEST_TIMEOUT) {
+                            Ok(body) => match serde_json::from_str::<Manifest>(&body) {
+                                Ok(m) => return Ok((rc_name, m)),
+                                Err(e) => format!("{rc_name}: manifest 解析失败（{e}）"),
+                            },
+                            Err(e) => format!("{rc_name}: {e}"),
+                        }
+                    }
+                    Ok(None) => format!("{name}: {e}（releases 列表里也没有预发布）"),
+                    Err(le) => format!("{name}: {e}；查 GitHub releases 列表也失败：{le}"),
+                };
+            }
             Err(e) => last = format!("{name}: {e}"),
         }
     }
@@ -243,8 +313,11 @@ pub fn run<S: Sys, N: Net>(
     if kernel_version(sys, paths).as_deref() != Some(m.kernels.client_sing_box.as_str()) {
         install_kernel(sys, net, paths, prof.panel.as_ref(), &m)?;
         r.kernel_updated = true;
-        systemd::restart(sys, UNIT_MAIN)?;
-        r.restarted = true;
+        // 新机器还没导入过节点，单元文件都没写：没有可重启的，第一次 apply 会把它拉起来
+        if sys.exists(&paths.unit(UNIT_MAIN)) {
+            systemd::restart(sys, UNIT_MAIN)?;
+            r.restarted = true;
+        }
     }
     Ok(r)
 }
@@ -321,6 +394,37 @@ mod tests {
     }
 
     #[test]
+    fn a_persisted_plain_http_panel_is_never_an_update_source() {
+        // 旧版本（K1 之前）经 `--sub` 或 http 面板导入时会把明文地址写进 profiles.json。
+        // 这是 root 自更新的首选来源：明文就等于把替换 /usr/local/bin/bui-c 的权力交给中间人。
+        let http = Panel {
+            base_url: "http://panel.example.com".into(),
+            username: "alice".into(),
+        };
+        let m = manifest("4.0.1");
+        let names: Vec<String> = sources(Some(&http), &m, "bui-c-linux-amd64")
+            .unwrap()
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert!(!names.iter().any(|n| n == "面板"), "{names:?}");
+        let n = FakeNet::new();
+        n.route(
+            "https://github.com/Buxiulei/b-ui/releases/latest/download/manifest.json",
+            FakeReply::Text(manifest_json("4.0.1", &"a".repeat(64), &"b".repeat(64))),
+        );
+        let (src, _) = fetch_manifest(&n, Some(&http)).unwrap();
+        assert_eq!(src, "GitHub");
+        assert!(
+            !n.log()
+                .iter()
+                .any(|l| l.contains("http://panel.example.com")),
+            "明文面板一个请求都不该发：{:?}",
+            n.log()
+        );
+    }
+
+    #[test]
     fn manifest_falls_back_to_the_next_source() {
         let n = FakeNet::new();
         n.route(
@@ -348,6 +452,101 @@ mod tests {
             "https://github.com/Buxiulei/b-ui/releases/download/v4.0.1/sing-box-linux-amd64"
         );
         assert_eq!(m.mirrors, vec!["https://mirror.example.com".to_string()]);
+    }
+
+    fn releases_list(json: &str) -> FakeReply {
+        FakeReply::Text(json.to_string())
+    }
+
+    #[test]
+    fn github_latest_404_falls_back_to_the_newest_rc_prerelease() {
+        // GitHub 的 releases/latest 不解析预发布：仓库里只有 v4.0.0-rcN 时 latest/download/… 必然 404
+        // （2026-09-12 baiyi 真机：v3 面板没有 /packages/manifest.json，回退 latest 又 404，装不了内核）。
+        // 服务端 crates/bui/src/kernels/mod.rs::fetch_manifest_with 已实现同样的回退，这里照抄口径。
+        let n = FakeNet::new();
+        n.route(
+            "https://panel.example.com/packages/manifest.json",
+            FakeReply::Status(404),
+        );
+        n.route(
+            "https://github.com/Buxiulei/b-ui/releases/latest/download/manifest.json",
+            FakeReply::Status(404),
+        );
+        // 列表按创建时间倒序；第 1 条是 rc 形状但 prerelease=false（跳过），第 2 条 tag 不匹配（跳过）
+        n.route(
+            RELEASES_API_URL,
+            releases_list(
+                r#"[{"tag_name":"v4.0.1-rc1","prerelease":false},
+                    {"tag_name":"nightly","prerelease":true},
+                    {"tag_name":"v4.0.0-rc6","prerelease":true},
+                    {"tag_name":"v4.0.0-rc5","prerelease":true}]"#,
+            ),
+        );
+        n.route(
+            "https://github.com/Buxiulei/b-ui/releases/download/v4.0.0-rc6/manifest.json",
+            FakeReply::Text(manifest_json("4.0.0", &"a".repeat(64), &"b".repeat(64))),
+        );
+        let (src, m) = fetch_manifest(&n, Some(&panel())).unwrap();
+        assert_eq!(src, "GitHub 预发布 v4.0.0-rc6");
+        assert_eq!(m.version, "4.0.0");
+    }
+
+    #[test]
+    fn github_latest_404_without_any_prerelease_stays_a_clear_error() {
+        let n = FakeNet::new();
+        n.route(
+            "https://github.com/Buxiulei/b-ui/releases/latest/download/manifest.json",
+            FakeReply::Status(404),
+        );
+        n.route(
+            RELEASES_API_URL,
+            releases_list(r#"[{"tag_name":"v3.9.9","prerelease":false}]"#),
+        );
+        let e = fetch_manifest(&n, None).unwrap_err();
+        assert!(e.to_string().contains("HTTP 404"), "{e}");
+        assert!(
+            e.to_string().contains("预发布"),
+            "要说清楚列表里也没有预发布：{e}"
+        );
+    }
+
+    #[test]
+    fn github_latest_404_and_releases_list_down_mentions_both() {
+        let n = FakeNet::new();
+        n.route(
+            "https://github.com/Buxiulei/b-ui/releases/latest/download/manifest.json",
+            FakeReply::Status(404),
+        );
+        n.route(RELEASES_API_URL, FakeReply::Fail("timeout".into()));
+        let e = fetch_manifest(&n, None).unwrap_err();
+        assert!(e.to_string().contains("HTTP 404"), "{e}");
+        assert!(e.to_string().contains("timeout"), "{e}");
+    }
+
+    #[test]
+    fn a_non_404_github_failure_does_not_consult_the_releases_list() {
+        // 断网 / 502 不是「没有正式版」，不该去问列表白等
+        let n = FakeNet::new();
+        n.route(
+            "https://github.com/Buxiulei/b-ui/releases/latest/download/manifest.json",
+            FakeReply::Fail("502".into()),
+        );
+        assert!(fetch_manifest(&n, None).is_err());
+        assert!(
+            !n.log().iter().any(|l| l.contains("api.github.com")),
+            "{:?}",
+            n.log()
+        );
+    }
+
+    #[test]
+    fn is_rc_tag_is_anchored() {
+        assert!(is_rc_tag("v4.0.0-rc6"));
+        assert!(!is_rc_tag("v4.0.0"));
+        assert!(!is_rc_tag("4.0.0-rc1"));
+        assert!(!is_rc_tag("v4.0.0-rc"));
+        assert!(!is_rc_tag("v4.0.0-rc1x"));
+        assert!(!is_rc_tag("nightly"));
     }
 
     #[test]
@@ -469,6 +668,8 @@ mod tests {
             0,
             "sing-box version 1.13.19\n",
         );
+        // 单元已经装好的机器（没有单元时不重启，见下一条）
+        s.put("/etc/systemd/system/bui-c.service", "[Unit]");
 
         let r = run(&s, &n, &paths(), &prof, false).unwrap();
         assert!(r.kernel_updated && !r.self_updated);
@@ -480,6 +681,48 @@ mod tests {
         );
         assert!(s.called("systemctl restart bui-c.service"));
         assert!(r.restarted);
+    }
+
+    /// 新机器（还没导入过节点）上跑 `bui-c update`：内核照装，但没有 bui-c.service 可重启——
+    /// 以前在这里以「Unit bui-c.service not found」失败。
+    #[test]
+    fn run_on_a_machine_without_the_unit_installs_the_kernel_but_does_not_restart() {
+        let s = FakeSys::new();
+        let n = FakeNet::new();
+        let mut prof = Profiles::new_default();
+        prof.panel = Some(panel());
+        let bin = b"ELF-new".to_vec();
+        n.route(
+            "https://panel.example.com/packages/manifest.json",
+            FakeReply::Text(manifest_json(
+                crate::VERSION,
+                &"a".repeat(64),
+                &sha256_hex(&bin),
+            )),
+        );
+        n.route(
+            &format!(
+                "https://panel.example.com/packages/sing-box-linux-{}",
+                arch_suffix()
+            ),
+            FakeReply::Bytes(bin),
+        );
+        // 真机上 restart 一个不存在的单元会失败
+        s.reply(
+            "systemctl restart bui-c.service",
+            5,
+            "Failed to restart bui-c.service: Unit bui-c.service not found.",
+        );
+
+        let r = run(&s, &n, &paths(), &prof, false).unwrap();
+        assert!(r.kernel_updated);
+        assert!(!r.restarted);
+        assert_eq!(s.get("/opt/bui-c/bin/sing-box").unwrap(), "ELF-new");
+        assert!(
+            !s.called("systemctl restart bui-c.service"),
+            "{:?}",
+            s.calls()
+        );
     }
 
     #[test]

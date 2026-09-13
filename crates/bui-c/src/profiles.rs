@@ -6,7 +6,7 @@
 use crate::paths::Paths;
 use crate::sys::Sys;
 use crate::{Error, Result};
-use bui_schema::nodes::{Node, NodeKind};
+use bui_schema::nodes::{Node, NodeKind, Transport};
 use bui_schema::render::SplitRules;
 use serde::{Deserialize, Serialize};
 
@@ -35,6 +35,23 @@ pub enum Source {
 pub struct Panel {
     pub base_url: String,
     pub username: String,
+}
+
+/// 能当 [`Panel::base_url`] 的地址：`https://<主机>`，去掉首尾空白与尾斜杠后原样返回；
+/// 别的一律 `None`。
+///
+/// panel 是 root 每日自更新的 manifest 与二进制首选来源，sha256 也出自同一份 manifest、
+/// 没有签名——明文 http 在路上谁都能改，所以只收 https。
+pub fn https_base(url: &str) -> Option<String> {
+    let base = url.trim().trim_end_matches('/');
+    let host = base
+        .get(..8)
+        .filter(|scheme| scheme.eq_ignore_ascii_case("https://"))
+        .map(|_| &base[8..])?;
+    if host.is_empty() || host.starts_with('/') {
+        return None;
+    }
+    Some(base.to_string())
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -89,14 +106,64 @@ pub fn sanitize(raw: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
-/// `<用户名>-<kind slug>`；用户名 sanitize 后为空就只剩 kind slug。
+/// `<用户名>-<kind slug>`；用户名 sanitize 后为空则回落成 `<主机名>-<kind slug>`。
+///
+/// 回落是必须的，不能只剩 kind slug：这套部署的面板用户名全是中文
+/// （`示例用户甲`、`示例专用名-小组` …），[`sanitize`] 只留 ASCII，它们一律为空，
+/// 于是所有服务器的同类节点都会叫 `hy2-direct`。而 profile 名是
+/// [`Profiles::upsert`] 的主键，同名即「同一个节点位」——不同服务器的节点会互相覆盖。
+/// 主机名把它们分开：同一主机的同一 kind 本来就是同一个节点位。
+/// 主机名 sanitize 后也为空（理论上不会，主机名本就是 ASCII）才退到光秃秃的 kind slug。
 pub fn profile_name(user: &str, node: &Node) -> String {
-    let u = sanitize(user);
-    if u.is_empty() {
-        kind_slug(node.kind).to_string()
+    let kind = kind_slug(node.kind);
+    let prefix = match sanitize(user) {
+        u if !u.is_empty() => u,
+        _ => sanitize(&node.host),
+    };
+    if prefix.is_empty() {
+        kind.to_string()
     } else {
-        format!("{u}-{}", kind_slug(node.kind))
+        format!("{prefix}-{kind}")
     }
+}
+
+/// 同一个账号位：同一台服务器（`host`）上 `kind` 相同、凭据主体相同
+/// （Hysteria2 的 `username`、Reality 的 `uuid`）。
+///
+/// 不看 port / 密码：同一台服务器上同一账号换了密码或端口是凭据轮换，该原地替换同名节点。
+/// 必须看 host：ASCII 用户名（`alice`）在两台服务器上各有一个账号时 [`profile_name`] 都是
+/// `alice-<kind>`，那是两个账号，第二台不能把第一台的节点换掉（换了主机名的同一账号
+/// 顶多多出一个 `-2`，不丢东西）。不同账号（家人账号）哪怕撞名也不是同一个账号位。
+pub fn same_account(a: &Node, b: &Node) -> bool {
+    a.kind == b.kind
+        && a.host == b.host
+        && match (&a.transport, &b.transport) {
+            (
+                Transport::Hysteria2 { username: ua, .. },
+                Transport::Hysteria2 { username: ub, .. },
+            ) => ua == ub,
+            (Transport::Reality { uuid: ua, .. }, Transport::Reality { uuid: ub, .. }) => ua == ub,
+            _ => false,
+        }
+}
+
+/// 同一个连接：[`same_account`]，且 `host`、`port` 相同，Hysteria2 的 `password` 也相同
+/// （Reality 的 uuid 已经是凭据全部）。
+///
+/// 故意不比 `label`、`hop`、`sni` / `server_name`、`public_key`、`short_id`、
+/// `obfs_password`：这些是面板能改的展示或参数，改了应原地更新，不是新节点——
+/// 否则 import-v3 带 v3 备注进来的节点，经面板导入一次就在列表里出现两份。
+pub fn same_endpoint(a: &Node, b: &Node) -> bool {
+    same_account(a, b)
+        && a.host == b.host
+        && a.port == b.port
+        && match (&a.transport, &b.transport) {
+            (
+                Transport::Hysteria2 { password: pa, .. },
+                Transport::Hysteria2 { password: pb, .. },
+            ) => pa == pb,
+            _ => true,
+        }
 }
 
 /// 订阅与粘贴来源拿不到服务端的住宅分流信息：按「活动节点承担全部流量」处理。
@@ -174,6 +241,11 @@ impl Profiles {
 
     pub fn find_by_node(&self, node: &Node) -> Option<&Profile> {
         self.profiles.iter().find(|p| &p.node == node)
+    }
+
+    /// 按连接身份（[`same_endpoint`]）找已有 profile：导入去重用它，不用整个 `Node` 相等。
+    pub fn find_same_endpoint(&self, node: &Node) -> Option<&Profile> {
+        self.profiles.iter().find(|p| same_endpoint(&p.node, node))
     }
 
     /// `base` / `base-2` / `base-3` …
@@ -309,6 +381,110 @@ mod tests {
         assert_eq!(p.free_name("fresh"), "fresh");
     }
 
+    /// 连接身份 = kind + 凭据主体 + host/port（+ HY2 密码）。label / hop / sni 与 Reality 的
+    /// public_key / short_id 是面板能改的展示或参数：改了应原地更新，不是新节点。
+    #[test]
+    fn same_endpoint_ignores_label_hop_and_sni_but_not_credentials() {
+        use bui_schema::nodes::Transport;
+        let base = hy2_direct_node();
+        let with_hy2 = |f: &dyn Fn(&mut String, &mut String, &mut String)| {
+            let mut n = hy2_direct_node();
+            if let Transport::Hysteria2 {
+                username,
+                password,
+                sni,
+                ..
+            } = &mut n.transport
+            {
+                f(username, password, sni);
+            }
+            n
+        };
+
+        let cosmetic = Node {
+            label: "示例专用名-小组".into(),
+            hop: None,
+            ..with_hy2(&|_, _, sni| *sni = "other.example.com".into())
+        };
+        assert!(
+            same_endpoint(&base, &cosmetic),
+            "只改 label/hop/sni 仍是同一个连接"
+        );
+        assert!(same_account(&base, &cosmetic));
+
+        let rotated = with_hy2(&|_, pw, _| *pw = "rotated".into());
+        assert!(!same_endpoint(&base, &rotated), "换了密码不是同一个连接");
+        assert!(
+            same_account(&base, &rotated),
+            "但仍是同一个账号（凭据轮换）"
+        );
+
+        let other_user = with_hy2(&|u, _, _| *u = "bob".into());
+        assert!(!same_endpoint(&base, &other_user));
+        assert!(
+            !same_account(&base, &other_user),
+            "username 不同就是另一个账号"
+        );
+
+        let moved_host = Node {
+            host: "b.example.com".into(),
+            ..hy2_direct_node()
+        };
+        let moved_port = Node {
+            port: 10009,
+            ..hy2_direct_node()
+        };
+        assert!(!same_endpoint(&base, &moved_host));
+        assert!(!same_endpoint(&base, &moved_port));
+        assert!(
+            !same_account(&base, &moved_host),
+            "换了主机就当另一个账号：同一个 ASCII 用户名在两台服务器上是两个账号，不能互相覆盖"
+        );
+        assert!(
+            same_account(&base, &moved_port),
+            "同一台服务器换端口仍是同一个账号"
+        );
+
+        assert!(
+            !same_account(&base, &hy2_resi_node()),
+            "kind 不同就不是同一个账号位"
+        );
+        assert!(!same_endpoint(
+            &base,
+            &crate::testutil::reality_direct_node()
+        ));
+
+        let reality = crate::testutil::reality_direct_node();
+        let with_reality = |f: &dyn Fn(&mut uuid::Uuid, &mut String)| {
+            let mut n = crate::testutil::reality_direct_node();
+            if let Transport::Reality { uuid, short_id, .. } = &mut n.transport {
+                f(uuid, short_id);
+            }
+            n
+        };
+        let new_uuid = with_reality(&|u, _| {
+            *u = uuid::Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap()
+        });
+        assert!(
+            !same_endpoint(&reality, &new_uuid),
+            "Reality 的 uuid 就是凭据全部"
+        );
+        assert!(!same_account(&reality, &new_uuid));
+        let new_sid = with_reality(&|_, sid| *sid = "fedcba9876543210".into());
+        assert!(
+            same_endpoint(&reality, &new_sid),
+            "short_id 是服务端参数，不是身份"
+        );
+
+        let mut p = Profiles::new_default();
+        p.upsert(prof("hysteria2-1785892136", cosmetic));
+        assert_eq!(
+            p.find_same_endpoint(&base).map(|x| x.name.as_str()),
+            Some("hysteria2-1785892136")
+        );
+        assert!(p.find_same_endpoint(&rotated).is_none());
+    }
+
     #[test]
     fn heal_active_picks_first_when_dangling() {
         let mut p = Profiles::new_default();
@@ -340,14 +516,60 @@ mod tests {
             "alice-hy2-direct"
         );
         assert_eq!(profile_name("alice", &hy2_resi_node()), "alice-hy2-resi");
+        // 用户名 sanitize 后为空（这套部署的面板用户名全是中文）→ 回落到主机名，
+        // 而不是只剩 kind slug：否则不同服务器的同类节点都叫 `hy2-direct`，
+        // 而 profile 名是 upsert 的主键，它们会互相覆盖。
         assert_eq!(
             profile_name("", &crate::testutil::reality_direct_node()),
-            "reality-direct"
+            "panel.example.com-reality-direct"
         );
-        // 纯中文备注 sanitize 后为空 → 回落到 kind slug，不再像 v3 那样产生时间戳名
-        assert_eq!(profile_name("香港节点", &hy2_direct_node()), "hy2-direct");
+        assert_eq!(
+            profile_name("香港节点", &hy2_direct_node()),
+            "panel.example.com-hy2-direct"
+        );
         assert_eq!(sanitize(" My Node!! v2 "), "My-Node-v2");
         assert_eq!(sanitize("---"), "");
+    }
+
+    #[test]
+    fn chinese_usernames_on_different_hosts_do_not_collide() {
+        let a = Node {
+            host: "a.example.com".into(),
+            ..hy2_direct_node()
+        };
+        let b = Node {
+            host: "b.example.com".into(),
+            ..hy2_direct_node()
+        };
+        assert_eq!(profile_name("示例用户甲", &a), "a.example.com-hy2-direct");
+        assert_eq!(profile_name("示例用户甲", &b), "b.example.com-hy2-direct");
+        assert_ne!(
+            profile_name("示例用户甲", &a),
+            profile_name("示例用户甲", &b),
+            "同 kind 不同主机必须是两个 profile，否则 store_fetched 会互相覆盖"
+        );
+    }
+
+    #[test]
+    fn https_base_only_accepts_https_with_a_host() {
+        assert_eq!(
+            https_base(" https://panel.example.com/ ").as_deref(),
+            Some("https://panel.example.com")
+        );
+        assert_eq!(
+            https_base("HTTPS://panel.example.com:8443").as_deref(),
+            Some("HTTPS://panel.example.com:8443")
+        );
+        for bad in [
+            "http://panel.example.com",
+            "panel.example.com",
+            "https://",
+            "https:///x",
+            "ftp://panel.example.com",
+            "",
+        ] {
+            assert_eq!(https_base(bad), None, "{bad:?}");
+        }
     }
 
     #[test]

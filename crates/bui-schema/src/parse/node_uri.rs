@@ -38,8 +38,16 @@ pub fn node_uri(raw: &str) -> Result<Node, ParseError> {
 
     match u.scheme() {
         "hysteria2" | "hy2" => {
-            let username = decode(u.username())?;
-            let password = decode(u.password().unwrap_or(""))?;
+            // v3 早期（≤3.4）把整段 `user:pass` 当一个 token 做 encodeURIComponent 再放进
+            // userinfo（`alice%3Apw@host`）：url crate 看不到未编码的 `:`，password() 是 None，
+            // 解码后再按第一个 `:` 拆一次——与 hysteria 服务端 userpass 的拆法一致。
+            let (username, password) = match u.password() {
+                Some(p) => (decode(u.username())?, decode(p)?),
+                None => match decode(u.username())?.split_once(':') {
+                    Some((a, b)) => (a.to_string(), b.to_string()),
+                    None => (decode(u.username())?, String::new()),
+                },
+            };
             if username.is_empty() || password.is_empty() {
                 return Err(ParseError::Other("hysteria2 URI 缺少用户名或密码".into()));
             }
@@ -220,6 +228,37 @@ mod tests {
             }
             _ => panic!("应为 hysteria2"),
         }
+    }
+
+    #[test]
+    fn hysteria2_accepts_v3_userinfo_with_a_percent_encoded_colon() {
+        // v3 早期（≤3.4）把整段 `user:pass` 当一个 token 做 encodeURIComponent 再放进 userinfo：
+        // `hysteria2://alice%3Apw-alice@…`。url crate 看不到未编码的 `:`，password() 是 None。
+        // 2026-09-12 baiyi 真机 import-v3 三个 hysteria2-* 目录全被「跳过」就是这个原因。
+        let raw = "hysteria2://alice%3Apw-alice@example.com:10000?sni=example.com&insecure=0&allowInsecure=0&mport=20000-30000#%E7%A4%BA%E4%BE%8B%E4%B8%93%E7%94%A8%E5%90%8D";
+        let n = node_uri(raw).unwrap();
+        assert_eq!(n.label, "示例专用名");
+        assert_eq!(n.kind, NodeKind::Hy2Direct);
+        assert_eq!(n.hop, Some((20000, 30000)));
+        match n.transport {
+            Transport::Hysteria2 {
+                username, password, ..
+            } => {
+                assert_eq!(username, "alice");
+                assert_eq!(password, "pw-alice");
+            }
+            _ => panic!("应为 hysteria2"),
+        }
+        // 密码本身含冒号时只拆第一个：`u:p:x` → ("u", "p:x")，与 hysteria 服务端 userpass 的拆法一致
+        let n2 = node_uri("hysteria2://alice%3Apw%3Ax@example.com:10000").unwrap();
+        match n2.transport {
+            Transport::Hysteria2 {
+                username, password, ..
+            } => assert_eq!((username.as_str(), password.as_str()), ("alice", "pw:x")),
+            _ => panic!("应为 hysteria2"),
+        }
+        // 没有冒号的单段 userinfo 仍然拒绝：拿不出用户名，服务端 userpass 鉴权必然失败
+        assert!(node_uri("hysteria2://onlypassword@example.com:10000").is_err());
     }
 
     #[test]
