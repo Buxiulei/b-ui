@@ -37,6 +37,22 @@ fn prompt_text(prompt: &str) -> String {
     }
 }
 
+/// 读一行（去首尾空白）；EOF（0 字节）返回 `None`。
+///
+/// 按字节读到 `\n` 再有损转码：`read_line` 遇到非 UTF-8 字节（GBK 终端、误触的控制键）
+/// 会整个报错，菜单就带着「stream did not contain valid UTF-8」崩出去了。坏字节换成
+/// U+FFFD 后，主菜单把它当成一次「无效选项」。
+fn read_line_from<R: std::io::BufRead>(r: &mut R) -> Result<Option<String>> {
+    let mut buf = Vec::new();
+    let n = r
+        .read_until(b'\n', &mut buf)
+        .map_err(|e| Error::io(std::path::Path::new("<stdin>"), e))?;
+    if n == 0 {
+        return Ok(None);
+    }
+    Ok(Some(String::from_utf8_lossy(&buf).trim().to_string()))
+}
+
 impl Prompt for Stdin {
     fn line(&mut self, prompt: &str) -> Result<String> {
         use std::io::Write as _;
@@ -44,16 +60,8 @@ impl Prompt for Stdin {
         std::io::stdout()
             .flush()
             .map_err(|e| Error::io(std::path::Path::new("<stdout>"), e))?;
-        let mut buf = String::new();
-        if std::io::stdin()
-            .read_line(&mut buf)
-            .map_err(|e| Error::io(std::path::Path::new("<stdin>"), e))?
-            == 0
-        {
-            // EOF：返回空串，调用方按「取消」处理
-            return Ok(String::new());
-        }
-        Ok(buf.trim().to_string())
+        // EOF：返回空串，调用方按「取消」处理
+        Ok(read_line_from(&mut std::io::stdin().lock())?.unwrap_or_default())
     }
 
     fn lines_until_blank(&mut self, prompt: &str) -> Result<Vec<String>> {
@@ -731,6 +739,48 @@ mod tests {
             !prompt_text("选择节点编号").contains(':'),
             "与其余文案一致用全角冒号"
         );
+    }
+
+    #[test]
+    fn read_line_from_replaces_invalid_utf8_instead_of_failing() {
+        // 真机：`printf '\xff\xfe\n0\n' | sudo bui-c` 以前直接崩出菜单
+        // （「读写 <stdin> 失败：stream did not contain valid UTF-8」）
+        let mut r = std::io::Cursor::new(b"\xff\xfe\n0\n".to_vec());
+        let got = read_line_from(&mut r).unwrap();
+        assert_eq!(
+            got.as_deref(),
+            Some("\u{FFFD}\u{FFFD}"),
+            "坏字节换成 U+FFFD"
+        );
+        assert_eq!(
+            parse_choice(got.as_deref().unwrap()),
+            None,
+            "主菜单按「无效选项」处理，而不是退出"
+        );
+        assert_eq!(
+            read_line_from(&mut r).unwrap().as_deref(),
+            Some("0"),
+            "后面的行照常读"
+        );
+        assert_eq!(read_line_from(&mut r).unwrap(), None, "读完是 EOF");
+    }
+
+    #[test]
+    fn read_line_from_trims_and_reports_eof_as_none() {
+        let mut empty = std::io::Cursor::new(Vec::<u8>::new());
+        assert_eq!(read_line_from(&mut empty).unwrap(), None);
+        let mut r = std::io::Cursor::new("  １ \r\n\n最后一行没换行".as_bytes().to_vec());
+        assert_eq!(read_line_from(&mut r).unwrap().as_deref(), Some("１"));
+        assert_eq!(
+            read_line_from(&mut r).unwrap().as_deref(),
+            Some(""),
+            "空行是 Some(\"\")，不是 EOF"
+        );
+        assert_eq!(
+            read_line_from(&mut r).unwrap().as_deref(),
+            Some("最后一行没换行")
+        );
+        assert_eq!(read_line_from(&mut r).unwrap(), None);
     }
 
     #[test]
