@@ -146,8 +146,23 @@ pub fn probe<S: Sys, N: Net>(sys: &S, net: &N, paths: &Paths, prof: &Profiles) -
     out
 }
 
-/// 一次巡检：探测 → 清零或退避重启。
+/// 一次巡检（`bui-c.timer`）：探测 → 清零或退避重启。
 pub fn run<S: Sys, N: Net>(sys: &S, net: &N, paths: &Paths) -> Result<Verdict> {
+    run_with(sys, net, paths, true)
+}
+
+/// 菜单 `[5]` 的手动检查：发现异常就重启，不等退避窗口（人就在跟前，点了就是要修）。
+/// 这次重启照样记进 `runtime.json`，timer 之后的退避从它算起。
+pub fn run_manual<S: Sys, N: Net>(sys: &S, net: &N, paths: &Paths) -> Result<Verdict> {
+    run_with(sys, net, paths, false)
+}
+
+fn run_with<S: Sys, N: Net>(
+    sys: &S,
+    net: &N,
+    paths: &Paths,
+    respect_backoff: bool,
+) -> Result<Verdict> {
     let prof = Profiles::load(sys, paths)?;
     if prof.active_profile().is_none() {
         return Ok(Verdict::NoProfile);
@@ -176,7 +191,7 @@ pub fn run<S: Sys, N: Net>(sys: &S, net: &N, paths: &Paths) -> Result<Verdict> {
     }
 
     let wait_s = wait_seconds(rt.fail_streak);
-    if let Some(last) = rt.last_restart_at {
+    if let Some(last) = rt.last_restart_at.filter(|_| respect_backoff) {
         let elapsed = now - last;
         if elapsed < wait_s {
             return Ok(Verdict::Waiting {
@@ -547,6 +562,48 @@ mod tests {
         );
         assert_eq!(restarts(), 3);
         assert_eq!(Runtime::load(&s, &paths()).fail_streak, 3);
+    }
+
+    /// 菜单 `[5]` 的手动检查：人就在跟前，发现异常就重启，不理 timer 的退避窗口；
+    /// 但照样记下这次重启，timer 接下来仍按连击退避。
+    #[test]
+    fn manual_run_restarts_inside_the_backoff_window_and_still_records_it() {
+        let s = FakeSys::new();
+        let n = FakeNet::new();
+        profiles_socks().save(&s, &paths()).unwrap();
+        s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        n.route(PROBE_URL, FakeReply::Fail("no route".into()));
+        let restarts = || {
+            s.calls()
+                .iter()
+                .filter(|c| *c == "systemctl restart bui-c.service")
+                .count()
+        };
+
+        assert!(matches!(
+            run(&s, &n, &paths()).unwrap(),
+            Verdict::Restarted { .. }
+        ));
+        s.advance(30); // 还在 1 分钟窗口里：timer 会等，手动不等
+        let v = run_manual(&s, &n, &paths()).unwrap();
+        assert!(matches!(v, Verdict::Restarted { .. }), "{v:?}");
+        assert_eq!(restarts(), 2);
+        let rt = Runtime::load(&s, &paths());
+        assert_eq!(rt.fail_streak, 2, "手动重启也算一次连击");
+        assert_eq!(rt.last_restart_at, Some(s.now().unix_timestamp()));
+
+        // 紧接着 timer 巡检：从这次手动重启算退避
+        s.advance(30);
+        assert!(matches!(
+            run(&s, &n, &paths()).unwrap(),
+            Verdict::Waiting { .. }
+        ));
+        assert_eq!(restarts(), 2);
+
+        // 一切正常时手动检查照样是 Ok，没有节点照样跳过
+        let s = FakeSys::new();
+        let n = FakeNet::new();
+        assert_eq!(run_manual(&s, &n, &paths()).unwrap(), Verdict::NoProfile);
     }
 
     #[test]

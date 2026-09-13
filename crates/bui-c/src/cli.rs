@@ -593,81 +593,7 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
             };
             save_import(ctx, inc, *activate)
         }
-        Cmd::Check => {
-            let v = check::run(ctx.sys, ctx.net, ctx.paths)?;
-            match &v {
-                Verdict::NoProfile => ctx.say("没有激活的节点，巡检跳过"),
-                Verdict::Ok => ctx.say("正常：单元在跑、204 探测通过"),
-                Verdict::Restarted {
-                    failures,
-                    next_backoff_min,
-                } => {
-                    ctx.say(format!(
-                        "发现 {} 项异常，已重启 bui-c.service，下次退避 {next_backoff_min} 分钟",
-                        failures.len()
-                    ));
-                    for f in failures {
-                        ctx.say(format!("  - {f}"));
-                    }
-                    // is-active 在 exec 之后立刻为真，TUN 接口还没起来；timer 巡检也一样等
-                    // （最多 5 秒，只在刚重启过时发生）
-                    if Profiles::load(ctx.sys, ctx.paths)?.mode == Mode::Tun {
-                        if Engine::new(ctx.sys, ctx.paths).wait_tun_ready() {
-                            ctx.say("bui-tun 已就绪");
-                        } else {
-                            ctx.say(format!(
-                                "bui-tun 接口 {} 秒内没起来，查 [4] 服务控制 → 最近日志",
-                                crate::engine::TUN_READY_WAIT_S
-                            ));
-                        }
-                    }
-                }
-                Verdict::Waiting {
-                    failures,
-                    remaining_s,
-                } => {
-                    ctx.say(format!(
-                        "仍有 {} 项异常，退避中，{remaining_s}s 后再试",
-                        failures.len()
-                    ));
-                    for f in failures {
-                        ctx.say(format!("  - {f}"));
-                    }
-                }
-            }
-            // 每日自更新：失败只记日志，不影响巡检结论与退出码
-            let prof = Profiles::load(ctx.sys, ctx.paths)?;
-            let mut rt = Runtime::load(ctx.sys, ctx.paths);
-            if check::update_due(ctx.sys, &rt, &prof) {
-                // 先把「尝试过」落盘再联网：面板与 GitHub 都不可达时按 check::UPDATE_RETRY_S
-                // 退避 1 小时，否则离线机器每分钟白等两个源各 15s
-                rt.last_update_attempt_at = Some(ctx.sys.now().unix_timestamp());
-                rt.save(ctx.sys, ctx.paths)?;
-                match update::run(
-                    ctx.sys,
-                    ctx.net,
-                    ctx.paths,
-                    &with_panel_override(ctx.sys, &prof),
-                    false,
-                ) {
-                    Ok(r) => {
-                        rt.last_update_at = Some(ctx.sys.now().unix_timestamp());
-                        // 自更新也是一次「检查更新」：装完了就把菜单上的 ★ 摘掉
-                        rt.update_available = new_version_pending(&r);
-                        rt.update_checked_at = rt.last_update_at;
-                        rt.save(ctx.sys, ctx.paths)?;
-                        if r.self_updated || r.kernel_updated {
-                            ctx.say(format!(
-                                "自更新：bui-c={} 内核={}",
-                                r.self_updated, r.kernel_updated
-                            ));
-                        }
-                    }
-                    Err(e) => tracing::warn!(error = %e, "自更新失败，下轮再试"),
-                }
-            }
-            Ok(())
-        }
+        Cmd::Check => run_check(ctx, false),
         Cmd::Update { check_only, auto } => {
             let mut prof = Profiles::load(ctx.sys, ctx.paths)?;
             // --auto 只翻开关、不联网：spec §6「每日 timer 自动，可关」的 CLI 入口
@@ -786,6 +712,97 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
             Ok(())
         }
     }
+}
+
+/// 连接检查：`bui-c check`（timer，`manual = false`）与菜单 `[5]`（`manual = true`）共用。
+///
+/// 手动检查不受退避约束（[`check::run_manual`]），结果行只说「已重启」，不提「下次退避」——
+/// 那是 timer 的节奏，对刚点了 [5] 的人没有意义。
+fn run_check<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>, manual: bool) -> Result<()> {
+    let v = if manual {
+        check::run_manual(ctx.sys, ctx.net, ctx.paths)?
+    } else {
+        check::run(ctx.sys, ctx.net, ctx.paths)?
+    };
+    match &v {
+        Verdict::NoProfile => ctx.say("没有激活的节点，巡检跳过"),
+        Verdict::Ok => ctx.say("正常：单元在跑、204 探测通过"),
+        Verdict::Restarted {
+            failures,
+            next_backoff_min,
+        } => {
+            if manual {
+                ctx.say(format!(
+                    "发现 {} 项异常，已重启 bui-c.service",
+                    failures.len()
+                ));
+            } else {
+                ctx.say(format!(
+                    "发现 {} 项异常，已重启 bui-c.service，下次退避 {next_backoff_min} 分钟",
+                    failures.len()
+                ));
+            }
+            for f in failures {
+                ctx.say(format!("  - {f}"));
+            }
+            // is-active 在 exec 之后立刻为真，TUN 接口还没起来；timer 巡检也一样等
+            // （最多 5 秒，只在刚重启过时发生）
+            if Profiles::load(ctx.sys, ctx.paths)?.mode == Mode::Tun {
+                if Engine::new(ctx.sys, ctx.paths).wait_tun_ready() {
+                    ctx.say("bui-tun 已就绪");
+                } else {
+                    ctx.say(format!(
+                        "bui-tun 接口 {} 秒内没起来，查 [4] 服务控制 → 最近日志",
+                        crate::engine::TUN_READY_WAIT_S
+                    ));
+                }
+            }
+        }
+        Verdict::Waiting {
+            failures,
+            remaining_s,
+        } => {
+            ctx.say(format!(
+                "仍有 {} 项异常，退避中，{remaining_s}s 后再试",
+                failures.len()
+            ));
+            for f in failures {
+                ctx.say(format!("  - {f}"));
+            }
+        }
+    }
+    // 每日自更新：失败只记日志，不影响巡检结论与退出码
+    let prof = Profiles::load(ctx.sys, ctx.paths)?;
+    let mut rt = Runtime::load(ctx.sys, ctx.paths);
+    if check::update_due(ctx.sys, &rt, &prof) {
+        // 先把「尝试过」落盘再联网：面板与 GitHub 都不可达时按 check::UPDATE_RETRY_S
+        // 退避 1 小时，否则离线机器每分钟白等两个源各 15s
+        rt.last_update_attempt_at = Some(ctx.sys.now().unix_timestamp());
+        rt.save(ctx.sys, ctx.paths)?;
+        match update::run(
+            ctx.sys,
+            ctx.net,
+            ctx.paths,
+            &with_panel_override(ctx.sys, &prof),
+            false,
+        ) {
+            Ok(r) => {
+                rt.last_update_at = Some(ctx.sys.now().unix_timestamp());
+                // 自更新也是一次「检查更新」：装完了就把菜单上的 ★ 摘掉
+                rt.update_available = new_version_pending(&r);
+                rt.update_checked_at = rt.last_update_at;
+                rt.save(ctx.sys, ctx.paths)?;
+                if r.self_updated || r.kernel_updated {
+                    ctx.say(format!(
+                        "自更新：bui-c={} 内核={}",
+                        r.self_updated, r.kernel_updated
+                    ));
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "自更新失败，下轮再试"),
+        }
+    }
+    Ok(())
 }
 
 /// 决策 10 / spec §6「import-v3：首次运行从 /opt/hysteria-client/ 导入」的接线点：
@@ -914,7 +931,13 @@ fn menu_body<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()
                 }
                 None
             }
-            Action::Check => Some(Cmd::Check),
+            // 手动检查：不走 timer 的退避（`Cmd::Check` 是给 bui-c.timer 的）
+            Action::Check => {
+                if let Err(e) = run_check(ctx, true) {
+                    ctx.say(format!("失败：{e}"));
+                }
+                None
+            }
             Action::Update => Some(Cmd::Update {
                 check_only: false,
                 auto: None,
@@ -2014,7 +2037,11 @@ mod tests {
         let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
         dispatch(&parse(&["check"]), &mut ctx).unwrap();
         let t = ctx.transcript.clone();
-        assert!(t.contains("已重启 bui-c.service"), "{t}");
+        assert!(
+            t.lines()
+                .any(|l| l == "发现 2 项异常，已重启 bui-c.service，下次退避 1 分钟"),
+            "timer 巡检保留退避说法（菜单 [5] 才不提）：{t}"
+        );
         let items: Vec<&str> = t.lines().filter(|l| l.starts_with("  - ")).collect();
         assert_eq!(
             items,
@@ -2048,6 +2075,57 @@ mod tests {
         for debug in ["UnitDown", "Probe", "TunMissing", "TunNoDefaultRoute"] {
             assert!(!t.contains(debug), "不打 Rust Debug 名 {debug}：{t}");
         }
+    }
+
+    /// 菜单 `[5]` 是人手动点的：发现异常就直接重启，不受 timer 的 1/2/4 分钟退避约束，
+    /// 结果行也不提「下次退避」。timer 触发的 `bui-c check` 保持原样。
+    #[test]
+    fn menu_check_restarts_right_away_and_does_not_talk_about_backoff() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        let mut prof = profiles_socks();
+        prof.auto_update = false;
+        prof.save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        n.route(crate::check::PROBE_URL, FakeReply::Status(502));
+        // 连按两次 [5]：第二次还在 timer 的退避窗口里
+        let mut p = Scripted::from(["5", "5", "0"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert_eq!(
+            t.lines()
+                .filter(|l| *l == "  发现 2 项异常，已重启 bui-c.service")
+                .count(),
+            2,
+            "两次都直接重启：\n{t}"
+        );
+        assert_eq!(
+            s.calls()
+                .iter()
+                .filter(|c| *c == "systemctl restart bui-c.service")
+                .count(),
+            2,
+            "{t}"
+        );
+        assert!(!t.contains("退避"), "手动检查不提退避：\n{t}");
+        let items: Vec<&str> = t.lines().filter(|l| l.starts_with("    - ")).collect();
+        assert_eq!(
+            items[..2],
+            [
+                "    - bui-c.service 没在运行",
+                "    - 探测 www.gstatic.com/generate_204 返回 HTTP 502"
+            ],
+            "逐条列异常：\n{t}"
+        );
+
+        // timer 触发的巡检照旧退避
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["check"]), &mut ctx).unwrap();
+        assert!(ctx.transcript.contains("退避中"), "{}", ctx.transcript);
     }
 
     /// `[5] 连接检查` 与 timer 巡检：TUN 模式下重启完 is-active 立刻为真，接口还没起来。
