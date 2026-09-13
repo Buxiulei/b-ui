@@ -56,7 +56,18 @@ pub fn parse_line(line: &str) -> Option<RejectLine> {
             status: Some(code),
         });
     }
-    // SOCKS5 的拒绝形态（REP ≠ 0 的文字化）。超时/EOF 一类不是拒绝，不学。
+    // sing-box 的 SOCKS5 客户端把 REP ≠ 0 写成 `socks5: request rejected, code=<REP>`。
+    // 只有 REP=2（connection not allowed by ruleset）是上游的策略拒绝；1（通用失败）、
+    // 4（主机不可达）等是目标或网络的问题，学进黑名单会把目标自己的故障记到上游头上
+    if let Some(code) = reason.strip_prefix("socks5: request rejected, code=") {
+        return (code.trim() == "2").then(|| RejectLine {
+            tag: tag.to_string(),
+            host: host.to_string(),
+            port,
+            status: None,
+        });
+    }
+    // 其余 SOCKS5 拒绝形态（REP ≠ 0 的文字化）。超时/EOF 一类不是拒绝，不学。
     let lower = reason.to_ascii_lowercase();
     let denied = ["not allowed", "refused", "rejected", "forbidden", "denied"]
         .iter()
@@ -122,6 +133,10 @@ mod tests {
     const HTTP_403: &str = "\x1b[31mERROR\x1b[0m open connection to gateway.icloud.com:443 using outbound/http[resi-1]: unexpected status: 403 Forbidden";
     const HTTP_403_PORT: &str = "open connection to 198.51.100.9:5228 using outbound/http[resi-1]: unexpected status: 403 Forbidden serp domain";
     const SOCKS_DENY: &str = "open connection to x.com:443 using outbound/socks[resi-2]: socks5: connection not allowed by ruleset";
+    // 2026-09-13 真机原文（sing-box 1.14 经 Decodo SOCKS5）：REP 以 `code=<REP>` 写出
+    const SOCKS_CODE2: &str = "connection: open connection to smtp.gmail.com:465 using outbound/socks[resi-1]: socks5: request rejected, code=2";
+    const SOCKS_CODE4: &str = "connection: open connection to gateway.push.apple.com:5223 using outbound/socks[resi-1]: socks5: request rejected, code=4";
+    const SOCKS_CODE1: &str = "connection: open connection to a.example.com:443 using outbound/socks[resi-1]: socks5: request rejected, code=1";
     const UNRELATED: &str = "inbound/socks[socks-in]: inbound connection from 127.0.0.1:41234";
     const TIMEOUT: &str =
         "open connection to a.example.com:443 using outbound/http[resi-1]: context deadline exceeded";
@@ -155,6 +170,16 @@ mod tests {
                 status: None
             })
         );
+        // REP=2（connection not allowed by ruleset）才是策略拒绝
+        assert_eq!(
+            parse_line(SOCKS_CODE2),
+            Some(RejectLine {
+                tag: "resi-1".into(),
+                host: "smtp.gmail.com".into(),
+                port: 465,
+                status: None
+            })
+        );
     }
 
     #[test]
@@ -162,6 +187,9 @@ mod tests {
         assert_eq!(parse_line(UNRELATED), None);
         // 超时不是拒绝：算进候选会把网络抖动学成黑名单
         assert_eq!(parse_line(TIMEOUT), None);
+        // SOCKS5 REP=4（主机不可达）/ 1（通用失败）是目标或网络的问题，不是策略拒绝
+        assert_eq!(parse_line(SOCKS_CODE4), None);
+        assert_eq!(parse_line(SOCKS_CODE1), None);
         // 2xx 不是拒绝
         assert_eq!(
             parse_line(
