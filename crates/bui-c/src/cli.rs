@@ -127,6 +127,9 @@ pub struct Ctx<'a, S: Sys, N: Net, P: Prompt> {
     pub indent: &'static str,
     /// stdout 已经被关掉（`bui-c list | head -1`）：之后的输出直接丢，菜单循环就此收场。
     pub stdout_closed: bool,
+    /// [`clear_screen`](Self::clear_screen) 真正清过几次屏。测试靠它断言「只在交互终端里清、
+    /// 清几次」：清屏序列不进 `transcript`，没别的地方看得出来。
+    pub clears: usize,
 }
 
 impl<'a, S: Sys, N: Net, P: Prompt> Ctx<'a, S, N, P> {
@@ -149,6 +152,7 @@ impl<'a, S: Sys, N: Net, P: Prompt> Ctx<'a, S, N, P> {
             transcript: String::new(),
             indent: "",
             stdout_closed: false,
+            clears: 0,
         }
     }
     /// 终端列数；拿不到按 80。不缓存，每次画屏前重新取（窗口缩放、手机转屏立刻生效）。
@@ -173,6 +177,37 @@ impl<'a, S: Sys, N: Net, P: Prompt> Ctx<'a, S, N, P> {
     /// 管道、重定向、timer 下都为假，清屏序列不会混进输出。
     pub fn screen_ctl(&self) -> bool {
         self.prompt.interactive() && self.sys.term_size().is_some()
+    }
+    /// 清屏序列：光标回左上角、清可见区（`ESC[H ESC[2J`）。**不发 `ESC[3J`**：只清可见区、
+    /// 保留回滚，与 v3 的 `clear` 一致；`ESC[3J` 在 tmux 与手机客户端上行为不一，还会把
+    /// 操作记录抹掉（spec §4.1）。
+    pub const CLEAR_SCREEN: &'static str = "\x1b[H\x1b[2J";
+    /// 清屏：只在 [`screen_ctl`](Self::screen_ctl) 为真（stdin、stdout 都是终端）时清，
+    /// 管道、重定向、测试里的 `FakeSys`（默认拿不到终端尺寸）一律不清。
+    ///
+    /// 先把待打印缓冲冲出去，再把序列**直接**写到 stdout——不经过 `emit`，所以 `out` 与
+    /// `transcript` 永远不含 ESC。测试构建里写进 `sink`，只计数。
+    pub fn clear_screen(&mut self) {
+        #[cfg(not(test))]
+        let mut w = std::io::stdout();
+        #[cfg(test)]
+        let mut w = std::io::sink();
+        self.clear_into(&mut w);
+    }
+    /// [`clear_screen`](Self::clear_screen) 的本体；测试传缓冲进来逐字节核对序列。
+    fn clear_into<W: std::io::Write>(&mut self, w: &mut W) {
+        if !self.screen_ctl() {
+            return;
+        }
+        self.flush();
+        if self.stdout_closed {
+            return;
+        }
+        if menu::write_out(w, Self::CLEAR_SCREEN).is_err() {
+            self.stdout_closed = true;
+            return;
+        }
+        self.clears += 1;
     }
     /// 说一句（可多行）：每个非空行前加 [`indent`](Self::indent)，空行不留尾随空格。
     pub fn say(&mut self, line: impl AsRef<str>) {
@@ -578,7 +613,7 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
             prof.active = Some(name.clone());
             prof.save(ctx.sys, ctx.paths)?;
             apply_with_ufw(ctx, &prof)?;
-            ctx.say(format!("已切换到 {name}"));
+            ctx.say(format!("已切到 {name}"));
             Ok(())
         }
         Cmd::Mode { mode } => {
@@ -880,29 +915,118 @@ fn offer_v3_import<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Res
     Ok(())
 }
 
+/// 菜单里一个动作做完之后怎么回主菜单（spec §4.1–§4.3）：停不停、「上次：」行写什么。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    /// 结果只有一行：直接清屏回主菜单，这一行进「上次：」行。
+    Note(String),
+    /// 失败，或打了不止一行：先停下来等回车（看完再清屏），摘要进「上次：」行。
+    Pause(String),
+    /// 返回、空输入：「上次：」行不变。
+    Nothing,
+    /// 退出菜单。
+    Exit,
+}
+
+impl Outcome {
+    /// 只改摘要，停不停不变。
+    fn map_summary(self, f: impl FnOnce(String) -> String) -> Self {
+        match self {
+            Self::Note(s) => Self::Note(f(s)),
+            Self::Pause(s) => Self::Pause(f(s)),
+            other => other,
+        }
+    }
+}
+
+/// 从 transcript 的 `start` 起新打的内容定 [`Outcome`]，照 spec §4.3 的一条标准：失败，或者
+/// 这个动作自己打了不止一行 → 停；否则不停。有「失败：」行 → 停，摘要就是它；多于一行 → 停，
+/// 摘要取第一行；只有一行 → 不停，它进「上次：」行；什么都没打 → 「上次：」行不变。空行不算。
+fn outcome_since<S: Sys, N: Net, P: Prompt>(ctx: &Ctx<'_, S, N, P>, start: usize) -> Outcome {
+    // transcript 只追加不截断，`start` 一定落在字符边界上
+    let new: Vec<&str> = ctx.transcript[start..]
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if let Some(fail) = new.iter().find(|l| l.starts_with("失败：")) {
+        return Outcome::Pause(fail.to_string());
+    }
+    match new.as_slice() {
+        [] => Outcome::Nothing,
+        [one] => Outcome::Note(one.to_string()),
+        [first, ..] => Outcome::Pause(first.to_string()),
+    }
+}
+
+/// 菜单里转手给 [`dispatch`] 的动作（spec §4.2）：记下 transcript 当前长度再执行，按这次新打的
+/// 内容定 [`Outcome`]，现有命令一行都不用改。出错照常先打「失败：…」。
+///
+/// 子命令一律 `yes: false`（D11）。真正起作用的是 [`menu_loop`] 进门就把 `ctx.yes` 换成假：
+/// `dispatch` 读的是 `ctx.yes`，不是子 `Cli` 的 `yes`（spec §0.2 R2、R11）。
+fn run_sub<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>, cmd: Cmd) -> Outcome {
+    let start = ctx.transcript.len();
+    let sub = Cli {
+        json: false,
+        yes: false,
+        cmd: Some(cmd),
+    };
+    if let Err(e) = dispatch(&sub, ctx) {
+        ctx.say(format!("失败：{e}"));
+    }
+    outcome_since(ctx, start)
+}
+
+/// 菜单自己说的一行结果：照常打出来（管道里、transcript 里都在），同时进「上次：」行——
+/// 交互终端里接着就清屏重画了。
+fn note<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>, text: impl Into<String>) -> Outcome {
+    let text = text.into();
+    ctx.say(&text);
+    Outcome::Note(text)
+}
+
+/// 菜单里切节点（[1] 选编号、[3] 导入后答 y）：经 [`run_sub`] 转手 `Cmd::Switch`。摘要里的
+/// 节点名按当前宽度单独中间截断（spec §0.2 R6）：整行截尾会把 `…-reality-direct` 与
+/// `…-reality-resi` 截成一个样子。
+fn switch_node<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>, name: String) -> Outcome {
+    let width = ctx.width();
+    run_sub(ctx, Cmd::Switch { name: name.clone() })
+        .map_summary(|s| menu::fit_name_in_last(&s, &name, width))
+}
+
 pub fn menu_loop<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()> {
-    // 菜单里的结果行缩进两列跟菜单对齐；任何出口（含 `?` 冒上来的错误）都恢复，
-    // 否则调用方接着 say 的话会沿用菜单缩进
-    let saved = std::mem::replace(&mut ctx.indent, "  ");
+    // 菜单里的结果行缩进两列跟菜单对齐；菜单里的确认只听键盘、不认全局 `-y`——`bui-c -y`
+    // 进菜单按 8 以前会直接卸载（spec §0.2 R11）。任何出口（含 `?` 冒上来的错误）都恢复
+    // 两者，否则调用方接着 say 的话会沿用菜单缩进
+    let saved_indent = std::mem::replace(&mut ctx.indent, "  ");
+    let saved_yes = std::mem::replace(&mut ctx.yes, false);
     let r = menu_body(ctx);
-    ctx.indent = saved;
+    ctx.indent = saved_indent;
+    ctx.yes = saved_yes;
     r
 }
 
+/// 主循环（spec §4.1）：交互终端里每次重画前清屏，永远只有一屏主菜单；上一个动作的一行
+/// 摘要显示在底部的「上次：」行。
 fn menu_body<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()> {
     offer_v3_import(ctx)?;
+    // 只活在这一次菜单会话里，不落盘：明天另一个家人打开菜单，看到别人的「上次」只会困惑
+    let mut last: Option<String> = None;
+    let mut redraw = true;
     loop {
         let prof = Profiles::load(ctx.sys, ctx.paths)?;
-        let st = engine_status(ctx, &prof);
-        // 每次重画都重新取宽度：窗口缩放、手机转屏立刻生效
-        let screen = menu::render(&st, ctx.width(), None);
-        ctx.show(screen.trim_end());
+        if redraw {
+            ctx.clear_screen();
+            let st = engine_status(ctx, &prof);
+            // 每次重画都重新取宽度：窗口缩放、手机转屏立刻生效
+            let screen = menu::render(&st, ctx.width(), last.as_deref());
+            ctx.show(screen.trim_end());
+        }
         ctx.flush();
         if ctx.stdout_closed {
             return Ok(()); // 没人看得到输出，不再接着读选择、执行命令
         }
-        // EOF（Ctrl-D、stdin=/dev/null）→ 退出，不留在死循环里；直接回车只重画，
-        // 不打「无效选项」——手滑多按一下回车不该把人踢出菜单
+        // EOF（Ctrl-D、stdin=/dev/null）→ 退出，不留在死循环里
         let Some(choice) = ctx.prompt.read("选择 [0-9]")? else {
             // Ctrl-D 不回显换行：先换一行，别让 shell 提示符接在「▸ 选择 [0-9]：」后面
             if ctx.prompt.interactive() {
@@ -910,124 +1034,150 @@ fn menu_body<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()
             }
             return Ok(());
         };
+        // 直接回车 = 刷新，「上次：」行保留；不打「无效选项」——手滑多按一下回车不该挨说
         if choice.is_empty() {
+            redraw = true;
             continue;
         }
-        let action = match menu::parse_choice(&choice) {
-            Some(a) => a,
-            None => {
-                ctx.say(format!("无效选项：{choice}"));
-                ctx.flush();
-                continue;
-            }
+        // 输错原地重问：只打一行错误，不清屏、不重画，「上次：」行也不动（spec §3a-60-输错）
+        let Some(action) = menu::parse_choice(&choice) else {
+            ctx.say(menu::invalid_choice(&choice, ctx.width()));
+            redraw = false;
+            continue;
         };
-        let cmd = match action {
-            Action::Quit => return Ok(()),
-            Action::SwitchNode => {
-                let list = menu::render_node_picker(&prof, ctx.width());
-                ctx.show(list.trim_end());
-                let len = prof.profiles.len();
-                if len == 0 {
-                    None // 列表里已经给了「先导入」的引导，没有编号可选
-                } else {
-                    pick_node(ctx, &prof)?
+        match menu_action(ctx, &prof, action)? {
+            Outcome::Note(s) => last = Some(s),
+            Outcome::Pause(s) => {
+                ctx.flush();
+                ctx.prompt.pause("回车返回菜单")?;
+                last = Some(s);
+            }
+            Outcome::Nothing => {}
+            Outcome::Exit => return Ok(()),
+        }
+        redraw = true;
+    }
+}
+
+/// 主菜单的一个选择。做完返回 [`Outcome`]，由 [`menu_body`] 决定停不停、「上次：」行写什么。
+/// 进子页（[1] 节点列表、[3] 粘贴、[4] 服务控制）前清屏，子页只显示自己（spec §4.1）；
+/// 选完编号后的确认、进度与结果接在子页下面，不清。
+fn menu_action<S: Sys, N: Net, P: Prompt>(
+    ctx: &mut Ctx<'_, S, N, P>,
+    prof: &Profiles,
+    action: Action,
+) -> Result<Outcome> {
+    Ok(match action {
+        Action::Quit => Outcome::Exit,
+        Action::SwitchNode => {
+            ctx.clear_screen();
+            let list = menu::render_node_picker(prof, ctx.width());
+            ctx.show(list.trim_end());
+            if prof.profiles.is_empty() {
+                // 列表里已经给了「先导入」的引导，没有编号可选。回主菜单要清屏，
+                // 引导跟着进「上次：」行，不然一闪就没了
+                Outcome::Note(menu::NO_NODES.to_string())
+            } else {
+                match pick_node(ctx, prof)? {
+                    Some(name) => switch_node(ctx, name),
+                    None => Outcome::Nothing,
                 }
             }
-            Action::ToggleMode => {
-                let want = match prof.mode {
-                    Mode::Socks => ModeArg::Tun,
-                    Mode::Tun => ModeArg::Socks,
-                };
-                let q = match want {
-                    ModeArg::Tun => "切换到 TUN 全局模式？",
-                    ModeArg::Socks => "切换到 SOCKS 模式？",
-                };
-                if ctx.prompt.confirm(q)? {
-                    Some(Cmd::Mode { mode: want })
-                } else {
-                    ctx.say("已取消，模式未变");
-                    None
-                }
+        }
+        Action::ToggleMode => {
+            let (want, q) = match prof.mode {
+                Mode::Socks => (ModeArg::Tun, "切换到 TUN 全局模式？"),
+                Mode::Tun => (ModeArg::Socks, "切换到 SOCKS 模式？"),
+            };
+            if ctx.prompt.confirm(q)? {
+                run_sub(ctx, Cmd::Mode { mode: want })
+            } else {
+                note(ctx, "已取消，模式未变")
             }
-            Action::ImportNode => {
-                menu_import(ctx)?;
-                None
-            }
-            Action::Service => {
-                // 单元还没建就别进子菜单——systemd 只会回 `Unit bui-c.service not found`，
-                // 用户看不出该干什么（缺陷 5）。引擎与单元是导入节点时 apply 装上的，
-                // `bui-c update` 在新机器上只装内核、不建单元，不是出路。
-                if ctx.sys.exists(&ctx.paths.unit(UNIT_MAIN)) {
-                    service_menu(ctx, prof.mode)?;
-                } else {
-                    let v3 = import_v3::detect(ctx.sys, std::path::Path::new(import_v3::V3_BASE));
-                    ctx.say(format!(
+        }
+        Action::ImportNode => {
+            ctx.clear_screen();
+            menu_import(ctx)?
+        }
+        Action::Service => {
+            // 单元还没建就别进子菜单——systemd 只会回 `Unit bui-c.service not found`，
+            // 用户看不出该干什么（缺陷 5）。引擎与单元是导入节点时 apply 装上的，
+            // `bui-c update` 在新机器上只装内核、不建单元，不是出路。
+            if ctx.sys.exists(&ctx.paths.unit(UNIT_MAIN)) {
+                service_menu(ctx, prof.mode)?
+            } else {
+                let v3 = import_v3::detect(ctx.sys, std::path::Path::new(import_v3::V3_BASE));
+                note(
+                    ctx,
+                    format!(
                         "还没有安装引擎与单元：先用 [3] 导入节点{}",
                         if v3 {
                             "（v3 客户端用 [7] 从 v3 导入）"
                         } else {
                             ""
                         }
-                    ));
-                }
-                None
+                    ),
+                )
             }
-            // 手动检查：不走 timer 的退避（`Cmd::Check` 是给 bui-c.timer 的）
-            Action::Check => {
-                if let Err(e) = run_check(ctx, true) {
-                    ctx.say(format!("失败：{e}"));
-                }
-                None
+        }
+        // 手动检查：不走 timer 的退避（`Cmd::Check` 是给 bui-c.timer 的）。这一版探测完才打字，
+        // 进页就清屏会让人对着空屏干等；清屏留给边做边打的新报告（spec §6.4）
+        Action::Check => {
+            let start = ctx.transcript.len();
+            if let Err(e) = run_check(ctx, true) {
+                ctx.say(format!("失败：{e}"));
             }
-            Action::Update => Some(Cmd::Update {
+            outcome_since(ctx, start)
+        }
+        Action::Update => run_sub(
+            ctx,
+            Cmd::Update {
                 check_only: false,
                 auto: None,
-            }),
-            Action::AutoUpdate => Some(Cmd::Update {
+            },
+        ),
+        Action::AutoUpdate => run_sub(
+            ctx,
+            Cmd::Update {
                 check_only: false,
                 auto: Some(if prof.auto_update {
                     Switch::Off
                 } else {
                     Switch::On
                 }),
-            }),
-            // 没有 v3 目录不是失败：菜单里如实说一句。命令行 `bui-c import-v3` 照旧报错，
-            // 脚本要靠退出码
-            Action::ImportV3
-                if !import_v3::detect(ctx.sys, std::path::Path::new(import_v3::V3_BASE)) =>
-            {
-                ctx.say(format!(
+            },
+        ),
+        // 没有 v3 目录不是失败：菜单里如实说一句。命令行 `bui-c import-v3` 照旧报错，
+        // 脚本要靠退出码
+        Action::ImportV3
+            if !import_v3::detect(ctx.sys, std::path::Path::new(import_v3::V3_BASE)) =>
+        {
+            note(
+                ctx,
+                format!(
                     "这台机器上没有 v3 客户端（{} 不存在），不需要导入",
                     import_v3::V3_BASE
-                ));
-                None
-            }
-            Action::ImportV3 => Some(Cmd::ImportV3 {
+                ),
+            )
+        }
+        Action::ImportV3 => run_sub(
+            ctx,
+            Cmd::ImportV3 {
                 base: None,
                 panel: None,
                 mode: None,
-            }),
-            Action::Uninstall => Some(Cmd::Uninstall { purge_bin: false }),
-        };
-        if let Some(cmd) = cmd {
-            let sub = Cli {
-                json: false,
-                yes: ctx.yes,
-                cmd: Some(cmd),
-            };
-            if let Err(e) = dispatch(&sub, ctx) {
-                ctx.say(format!("失败：{e}"));
-            }
-        }
-        ctx.flush();
-    }
+            },
+        ),
+        Action::Uninstall => run_sub(ctx, Cmd::Uninstall { purge_bin: false }),
+    })
 }
 
 /// 菜单 `[1]` 列表下的选编号：输错只提示、原地重问（不重画列表）；空行、`0`、EOF 返回主菜单。
+/// 选中返回节点名。
 fn pick_node<S: Sys, N: Net, P: Prompt>(
     ctx: &mut Ctx<'_, S, N, P>,
     prof: &Profiles,
-) -> Result<Option<Cmd>> {
+) -> Result<Option<String>> {
     let len = prof.profiles.len();
     loop {
         ctx.flush();
@@ -1036,11 +1186,13 @@ fn pick_node<S: Sys, N: Net, P: Prompt>(
             return Ok(None);
         }
         if let Some(i) = menu::pick_index(&pick, len) {
-            return Ok(Some(Cmd::Switch {
-                name: prof.profiles[i].name.clone(),
-            }));
+            return Ok(Some(prof.profiles[i].name.clone()));
         }
-        ctx.say(format!("无效编号：{pick}（可选 1-{len}，0 返回）"));
+        // 回显前净化：方向键是 `ESC [ A`，不能原样写回终端、写进 transcript
+        ctx.say(format!(
+            "无效编号：{}（可选 1-{len}，0 返回）",
+            menu::sanitize(&pick)
+        ));
     }
 }
 
@@ -1052,7 +1204,11 @@ const PASTE_PROMPT: &str = "粘贴节点链接或订阅地址";
 ///
 /// 导入失败只打「失败：…」留在菜单里。导入了新节点、而活动节点不在其中时追问一次要不要
 /// 切过去——命令行 `bui-c import` 不问，保持非交互。
-fn menu_import<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()> {
+///
+/// 回主菜单停不停照 [`outcome_since`]：失败、有附加行（面板退回订阅、跳过…）就停。追问过
+/// 「切换到新导入的 X？」的，人已经在提问处看过导入结果：答 y 用切换的结果，答否不再停。
+fn menu_import<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<Outcome> {
+    let start = ctx.transcript.len();
     let lines: Vec<String> = ctx
         .prompt
         .lines_until_blank(PASTE_PROMPT)?
@@ -1061,8 +1217,7 @@ fn menu_import<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<
         .filter(|l| !l.is_empty())
         .collect();
     if lines.is_empty() {
-        ctx.say("已取消，没有导入任何节点");
-        return Ok(());
+        return Ok(note(ctx, "已取消，没有导入任何节点"));
     }
     let before: Vec<String> = Profiles::load(ctx.sys, ctx.paths)?
         .profiles
@@ -1095,11 +1250,11 @@ fn menu_import<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<
             if has_http {
                 ctx.say("订阅地址请单独粘贴一行再回车");
             }
-            return Ok(());
+            return Ok(outcome_since(ctx, start));
         }
         Err(e) => {
             ctx.say(format!("失败：{e}"));
-            return Ok(());
+            return Ok(outcome_since(ctx, start));
         }
     }
     let after = Profiles::load(ctx.sys, ctx.paths)?;
@@ -1110,25 +1265,21 @@ fn menu_import<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<
         .filter(|n| !before.iter().any(|b| b == n))
         .collect();
     let Some(first) = fresh.first() else {
-        return Ok(());
+        return Ok(outcome_since(ctx, start));
     };
     if after.active.as_deref().is_some_and(|a| fresh.contains(&a)) {
-        return Ok(()); // 首次导入已经激活了新节点
+        return Ok(outcome_since(ctx, start)); // 首次导入已经激活了新节点
     }
     ctx.flush();
+    let shown = outcome_since(ctx, start);
     if ctx.prompt.confirm(&format!("切换到新导入的 {first}？"))? {
-        let sub = Cli {
-            json: false,
-            yes: ctx.yes,
-            cmd: Some(Cmd::Switch {
-                name: first.to_string(),
-            }),
-        };
-        if let Err(e) = dispatch(&sub, ctx) {
-            ctx.say(format!("失败：{e}"));
-        }
+        return Ok(switch_node(ctx, first.to_string()));
     }
-    Ok(())
+    // 提问本身就是停顿：导入结果已经在提问处看过了，答否回主菜单不再停
+    Ok(match shown {
+        Outcome::Pause(s) => Outcome::Note(s),
+        other => other,
+    })
 }
 
 /// 单独一行的 http(s) 地址：面板的四种按用户地址走 `/api/nodes`（带分流规则），
@@ -1188,25 +1339,33 @@ fn without_urls(detail: &str) -> String {
 }
 
 /// `[4] 服务控制` 的二级菜单：重启 / 看日志 / 返回（v3 的服务子菜单大半是死代码，
-/// 这里只留两个真实动作）。输错只提示、原地重问；空行、`0`、EOF 与做完一个动作都回主菜单。
-fn service_menu<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>, mode: Mode) -> Result<()> {
+/// 这里只留两个真实动作）。进页清屏；输错只提示、原地重问；空行、`0`、EOF 与做完一个动作
+/// 都回主菜单。重启的结果照 [`outcome_since`] 定停不停（TUN 没起来会带出日志，要停）。
+fn service_menu<S: Sys, N: Net, P: Prompt>(
+    ctx: &mut Ctx<'_, S, N, P>,
+    mode: Mode,
+) -> Result<Outcome> {
+    ctx.clear_screen();
     ctx.show(menu::render_service_options().trim_end());
     loop {
         ctx.flush();
         let pick = ctx.prompt.line("选择 [0-2]")?;
         match menu::parse_service_choice(&pick) {
-            Some(menu::ServiceAction::Back) => return Ok(()),
-            None => ctx.say(format!("无效选项：{pick}")),
+            Some(menu::ServiceAction::Back) => return Ok(Outcome::Nothing),
+            // 回显前净化：方向键是 `ESC [ A`，不能原样写回终端、写进 transcript
+            None => ctx.say(format!("无效选项：{}", menu::sanitize(&pick))),
             Some(menu::ServiceAction::Restart) => {
+                let start = ctx.transcript.len();
                 restart_service(ctx, mode);
-                return Ok(());
+                return Ok(outcome_since(ctx, start));
             }
             Some(menu::ServiceAction::Logs) => {
                 show_journal(ctx, menu::SERVICE_LOG_LINES);
-                // 50 行日志加上重画的主菜单超过一屏：停一下，看完再回去
+                // 50 行日志一屏装不下，回主菜单又要清屏：停一下，看完再回去。
+                // 看日志不算做了什么，「上次：」行不变
                 ctx.flush();
                 ctx.prompt.pause("回车返回菜单")?;
-                return Ok(());
+                return Ok(Outcome::Nothing);
             }
         }
     }
@@ -2163,8 +2322,8 @@ mod tests {
         prof.save(&s, &pp).unwrap();
         let n = FakeNet::new();
         n.route(crate::check::PROBE_URL, FakeReply::Status(502));
-        // 连按两次 [5]：第二次还在 timer 的退避窗口里
-        let mut p = Scripted::from(["5", "5", "0"]);
+        // 连按两次 [5]：第二次还在 timer 的退避窗口里。结果不止一行，每次都先停下来等回车
+        let mut p = Scripted::from(["5", "", "5", "", "0"]);
         let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
         menu_loop(&mut ctx).unwrap();
         let t = ctx.transcript.clone();
@@ -2174,6 +2333,17 @@ mod tests {
                 .count(),
             2,
             "两次都直接重启：\n{t}"
+        );
+        assert_eq!(
+            p.asked.iter().filter(|q| *q == "回车返回菜单").count(),
+            2,
+            "异常逐条列出，看完回车再回主菜单：{:?}",
+            p.asked
+        );
+        assert!(
+            t.lines()
+                .any(|l| l == "  上次：发现 2 项异常，已重启 bui-c.service"),
+            "{t}"
         );
         assert_eq!(
             s.calls()
@@ -2822,7 +2992,7 @@ mod tests {
         menu_loop(&mut ctx).unwrap();
         let t = ctx.transcript.clone();
         assert!(
-            t.lines().any(|l| l == "  无效选项：x"),
+            t.lines().any(|l| l == "  无效选项：x（请输入 0-9 的数字）"),
             "结果行跟菜单一样缩进两列：\n{t}"
         );
         assert!(t.lines().any(|l| l == "  已切到 TUN 模式"), "{t}");
@@ -2831,6 +3001,149 @@ mod tests {
         assert!(t.lines().any(|l| l.starts_with("     [1] ")), "{t}");
         assert!(!t.lines().any(|l| l.starts_with("    ── B-UI")), "{t}");
         assert_eq!(ctx.indent, "", "退出菜单后恢复顶格");
+    }
+
+    #[test]
+    fn clear_screen_sends_exactly_home_and_erase_display() {
+        // 逐字节钉住序列：ESC[H ESC[2J，防止混进会抹掉回滚的 ESC[3J
+        let pp = paths();
+        let s = FakeSys::new();
+        s.set_term_size(Some((60, 20)));
+        let n = FakeNet::new();
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        ctx.say("上一屏的最后一行");
+        let mut w = Vec::new();
+        ctx.clear_into(&mut w);
+        assert_eq!(w, [0x1b_u8, 0x5b, 0x48, 0x1b, 0x5b, 0x32, 0x4a]);
+        assert_eq!(ctx.clears, 1);
+        assert!(ctx.out.is_empty(), "清屏前先把待打印缓冲冲出去");
+        assert!(!ctx.transcript.contains('\u{1b}'), "序列不经过 emit");
+
+        // stdin 是管道：一个字节都不写，也不计数
+        let mut p = Scripted::from([]);
+        p.tty = false;
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        let mut w = Vec::new();
+        ctx.clear_into(&mut w);
+        assert!(w.is_empty());
+        assert_eq!(ctx.clears, 0);
+    }
+
+    #[test]
+    fn menu_does_not_clear_when_stdin_is_not_a_terminal() {
+        // `printf '1\n0\n0\n' | sudo bui-c`：stdout 是终端，stdin 是管道
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        two_nodes(&s, &pp);
+        s.set_term_size(Some((60, 30)));
+        let n = FakeNet::new();
+        let mut p = Scripted::from(["1", "0", "0"]);
+        p.tty = false;
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        assert_eq!(ctx.clears, 0);
+        assert_eq!(
+            ctx.transcript.matches("B-UI 客户端").count(),
+            2,
+            "照样重画，只是不清屏"
+        );
+    }
+
+    #[test]
+    fn the_last_line_keeps_both_ends_of_a_long_node_name_at_40_columns() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        let mut prof = crate::testutil::baiyi_like();
+        prof.mode = Mode::Socks; // 不等 TUN 就绪，切换只打一行
+        prof.save(&s, &pp).unwrap();
+        s.set_term_size(Some((40, 30)));
+        let n = FakeNet::new();
+        // [4] 是 rick-node.example-a.net-reality-direct（38 列），[5] 是同一台服务器的 -reality-resi
+        let mut p = Scripted::from(["1", "4", "0"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert_eq!(
+            Profiles::load(&s, &pp).unwrap().active.as_deref(),
+            Some("rick-node.example-a.net-reality-direct")
+        );
+        let last = t
+            .lines()
+            .find(|l| l.starts_with("  上次："))
+            .unwrap_or_else(|| panic!("{t}"));
+        assert!(last.contains('…'), "{last}");
+        assert!(
+            last.ends_with("direct"),
+            "尾巴要留住 direct / resi 的区别：{last}"
+        );
+        assert!(menu::budget_width(last) <= menu::line_limit(40), "{last}");
+        assert_eq!(last, "  上次：已切到 rick-nod…reality-direct");
+        assert!(
+            !p.asked.iter().any(|q| q == "回车返回菜单"),
+            "切节点只打一行，不停：{:?}",
+            p.asked
+        );
+    }
+
+    #[test]
+    fn a_typo_keeps_the_last_line_and_never_echoes_escape_bytes() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        s.reply("ip link show bui-tun", 0, "5: bui-tun");
+        profiles_socks().save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        // 2 → y 切到 TUN（一行结果，不停）→ 方向键 ↑ 再回车 → 直接回车刷新 → 0
+        let mut p = Scripted::from(["2", "y", "\u{1b}[A", "", "0"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert!(!t.contains('\u{1b}'), "{t:?}");
+        assert!(
+            t.lines()
+                .any(|l| l == "  无效选项：?[A（请输入 0-9 的数字）"),
+            "{t}"
+        );
+        assert_eq!(
+            t.matches("B-UI 客户端").count(),
+            3,
+            "进菜单、切完、回车刷新；输错不重画：\n{t}"
+        );
+        assert_eq!(
+            t.lines()
+                .filter(|l| *l == "  上次：已切到 TUN 模式")
+                .count(),
+            2,
+            "输错不动它，回车刷新也保留：\n{t}"
+        );
+        assert!(
+            !p.asked.iter().any(|q| q == "回车返回菜单"),
+            "一行结果不停：{:?}",
+            p.asked
+        );
+    }
+
+    #[test]
+    fn a_failure_pauses_before_the_redraw_and_stays_in_the_last_line() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        profiles_socks().save(&s, &pp).unwrap();
+        let n = FakeNet::new(); // manifest 的源一个都没登记：检查更新失败
+        let mut p = Scripted::from(["6", "", "0"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert!(t.lines().any(|l| l.starts_with("  失败：")), "{t}");
+        assert!(t.lines().any(|l| l.starts_with("  上次：失败：")), "{t}");
+        assert_eq!(
+            p.asked,
+            vec!["选择 [0-9]", "回车返回菜单", "选择 [0-9]"],
+            "失败先停，看完回车再清屏回主菜单，0 由主菜单读走：\n{t}"
+        );
     }
 
     #[test]
@@ -2899,12 +3212,13 @@ mod tests {
         s.put("/opt/bui-c/profiles.json", "{ 不是 json");
         let n = FakeNet::new();
         let mut p = Scripted::from(["0"]);
-        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, true); // bui-c -y
         assert!(menu_loop(&mut ctx).is_err());
         assert_eq!(
             ctx.indent, "",
             "run() 接着打的「错误：…」要顶格，不能沿用菜单缩进"
         );
+        assert!(ctx.yes, "菜单里换成假的 -y，出错退出也要还原");
     }
 
     #[test]
@@ -3106,6 +3420,72 @@ mod tests {
             imported_at: "2026-09-11T00:00:00Z".into(),
         });
         prof.save(s, pp).unwrap();
+    }
+
+    #[test]
+    fn menu_clears_only_on_a_terminal_and_the_transcript_has_no_escape() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        two_nodes(&s, &pp);
+        let n = FakeNet::new();
+        s.set_term_size(Some((60, 30)));
+        let mut p = Scripted::from(["1", "0", "0"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        assert_eq!(ctx.clears, 3, "进菜单、进列表、回主菜单");
+        assert!(!ctx.transcript.contains('\u{1b}'));
+        let s2 = FakeSys::new();
+        ready(&s2);
+        two_nodes(&s2, &pp);
+        let mut p = Scripted::from(["1", "0", "0"]);
+        let mut ctx = Ctx::new(&s2, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        assert_eq!(ctx.clears, 0, "拿不到终端尺寸就不清屏");
+    }
+
+    #[test]
+    fn a_typo_reasks_without_redrawing_and_the_last_line_reports_the_previous_action() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        two_nodes(&s, &pp);
+        let n = FakeNet::new();
+        let mut p = Scripted::from(["abc", "1", "2", "0"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert!(t.contains("  无效选项：abc（请输入 0-9 的数字）"));
+        assert_eq!(
+            t.matches("B-UI 客户端").count(),
+            2,
+            "输错不重画；切换后重画一次"
+        );
+        assert!(
+            t.lines()
+                .any(|l| l.starts_with("  上次：已切到 alice-reality-direct")),
+            "{t}"
+        );
+    }
+
+    #[test]
+    fn the_menu_ignores_the_global_yes_for_uninstall() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        two_nodes(&s, &pp);
+        let n = FakeNet::new();
+        let mut p = Scripted::from(["8", "", "0"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, true); // bui-c -y
+        menu_loop(&mut ctx).unwrap();
+        // 先看 ctx.yes：ctx 借着 &mut p，用完它才能读 p.asked
+        assert!(ctx.yes, "出了菜单恢复原值");
+        assert!(
+            p.asked.iter().any(|q| q.contains("确认卸载")),
+            "{:?}",
+            p.asked
+        );
+        assert!(s.exists(&pp.profiles()), "答空行就不卸载");
     }
 
     #[test]
@@ -4008,7 +4388,8 @@ mod tests {
         );
         crate::testutil::profiles_tun().save(&s, &pp).unwrap();
         let n = FakeNet::new();
-        let mut p = Scripted::from(["4", "1", "0"]);
+        // 4 → 1 重启 → 接口没起来、带出日志：停下来等回车 → 0 退出
+        let mut p = Scripted::from(["4", "1", "", "0"]);
         let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
         menu_loop(&mut ctx).unwrap();
         let t = ctx.transcript.clone();
@@ -4032,10 +4413,15 @@ mod tests {
             crate::engine::APPLY_POLL_STEPS as usize,
             "与 apply 同一段轮询：10 × 500ms"
         );
+        assert_eq!(
+            p.asked,
+            vec!["选择 [0-9]", "选择 [0-2]", "回车返回菜单", "选择 [0-9]"],
+            "接口没起来、还带出了日志：先停，看完回车再清屏回主菜单"
+        );
         assert!(
-            !p.asked.iter().any(|q| q == "回车返回菜单"),
-            "只有 [4]→[2] 停下来等回车：{:?}",
-            p.asked
+            t.lines()
+                .any(|l| l == "  上次：已重启 bui-c.service，但 bui-tun 接口 5 秒内没起来"),
+            "{t}"
         );
     }
 

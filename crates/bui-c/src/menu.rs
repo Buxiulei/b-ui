@@ -22,12 +22,13 @@ pub trait Prompt {
     fn lines_until_blank(&mut self, prompt: &str) -> Result<Vec<String>>;
     /// 只有 `y` / `yes`（忽略大小写）算是。
     fn confirm(&mut self, prompt: &str) -> Result<bool>;
-    /// 停下来等一个回车（EOF 也算）：长输出打完别让菜单重画把它顶出屏幕。
+    /// 停下来等一个回车（EOF 也算）：长输出打完，别让清屏重画把它抹掉。
+    /// `Stdin` 在 stdin 不是终端时直接返回、不读（spec §4.4）。
     fn pause(&mut self, prompt: &str) -> Result<()> {
         self.read(prompt).map(|_| ())
     }
     /// 有人在终端前看提示吗。`Stdin` 在 stdin 不是终端（管道 / 重定向）时为假：
-    /// 不打「▸」提示，菜单因 EOF 退出时也不必补换行。
+    /// 不打「▸」提示、不清屏、不停顿，菜单因 EOF 退出时也不必补换行。
     fn interactive(&self) -> bool {
         true
     }
@@ -107,6 +108,11 @@ impl Prompt for Stdin {
     }
 
     fn pause(&mut self, prompt: &str) -> Result<()> {
+        // stdin 不是终端时没人会按回车：照读的话，`printf '5\n0\n' | sudo bui-c` 里的 `0`
+        // 会被停顿吃掉，菜单就不照脚本走了（spec §4.4）
+        if !self.interactive() {
+            return Ok(());
+        }
         self.ask(&pause_text(prompt)).map(|_| ())
     }
 
@@ -140,9 +146,13 @@ impl Prompt for Stdin {
 /// `line` 为空串 / 否 / 空列表）。
 pub struct Scripted {
     pub queue: VecDeque<String>,
-    /// 按顺序记下被问过的每条提示（`read` / `line` / `confirm` / `lines_until_blank`），
+    /// 按顺序记下被问过的每条提示（`read` / `line` / `confirm` / `lines_until_blank` / `pause`），
     /// 测试靠它断言提示文案、以及「某一问根本没出现」。
     pub asked: Vec<String>,
+    /// [`Prompt::interactive`] 的回答，默认 `true`（有人在终端前）。设成 `false` 模拟管道：
+    /// 不清屏、EOF 退出不补换行。[`Prompt::pause`] 照样消费一行，测试里写 `""` 代表回车
+    /// （spec §4.4）。
+    pub tty: bool,
 }
 
 impl<'a, const N: usize> From<[&'a str; N]> for Scripted {
@@ -150,11 +160,16 @@ impl<'a, const N: usize> From<[&'a str; N]> for Scripted {
         Self {
             queue: v.iter().map(|s| s.to_string()).collect(),
             asked: Vec::new(),
+            tty: true,
         }
     }
 }
 
 impl Prompt for Scripted {
+    fn interactive(&self) -> bool {
+        self.tty
+    }
+
     fn read(&mut self, prompt: &str) -> Result<Option<String>> {
         self.asked.push(prompt.to_string());
         Ok(self.queue.pop_front())
@@ -455,6 +470,37 @@ fn last_line(text: &str, width: usize) -> String {
     format!("{LAST_HEAD}{}\n", truncate_end(&sanitize(text), room))
 }
 
+/// 「上次：」行的摘要里带节点名时，名字单独中间截断（spec §0.2 R6）：名字的预算是行宽上限
+/// 减去「  上次：」与名字前后的文字，放得下就原样。摘要里找不到名字就原样返回，整行照旧由
+/// [`render`] 尾截。先净化，免得控制字符把宽度算错。
+pub fn fit_name_in_last(summary: &str, name: &str, width: usize) -> String {
+    let summary = sanitize(summary);
+    let name = sanitize(name);
+    let Some(at) = summary.find(name.as_ref()) else {
+        return summary.into_owned();
+    };
+    let (head, rest) = summary.split_at(at);
+    let tail = &rest[name.len()..];
+    let room = line_limit(width)
+        .saturating_sub(budget_width(LAST_HEAD) + budget_width(head) + budget_width(tail));
+    format!("{head}{}{tail}", truncate_middle(&name, room))
+}
+
+/// 菜单里节点列表为空时的引导：[1] 的列表页与回主菜单后的「上次：」行共用。
+pub const NO_NODES: &str = "没有节点，先用 [3] 导入节点";
+
+/// 主菜单输错时的那一行，不含缩进（调用方经 `say` 在菜单里加两列）：
+/// `无效选项：{x}（请输入 0-9 的数字）`。回显的输入先净化（方向键是 `ESC [ A`，不能原样写回
+/// 终端、写进 transcript），再尾截，整行按容量口径不超过行宽上限——误把一整条链接贴进
+/// 主菜单也只占一行。
+pub fn invalid_choice(input: &str, width: usize) -> String {
+    const HEAD: &str = "无效选项：";
+    const TAIL: &str = "（请输入 0-9 的数字）";
+    // 2 = 菜单里 `say` 加的缩进
+    let room = line_limit(width).saturating_sub(2 + budget_width(HEAD) + budget_width(TAIL));
+    format!("{HEAD}{}{TAIL}", truncate_end(&sanitize(input), room))
+}
+
 /// 标题条与状态区（节点 / 代理 / 模式）：一次性 `bui-c status` 用它，不打菜单块
 /// （命令行里 `[1] 切换节点` 无处可点）。
 ///
@@ -652,7 +698,7 @@ fn list_detail(label: &str, hp: &str, keep_label: bool, room: usize) -> String {
 pub fn render_nodes(prof: &Profiles, with_back: bool, width: usize) -> String {
     if prof.profiles.is_empty() {
         return if with_back {
-            "  没有节点，先用 [3] 导入节点\n".to_string()
+            format!("  {NO_NODES}\n")
         } else {
             "  没有节点，先 `bui-c import …`\n".to_string()
         };
@@ -1403,7 +1449,108 @@ mod tests {
             ..st()
         };
         out.push(("socks", render(&socks, width, None)));
+        // T4：「上次：」行（名字单独中间截断的切换摘要、空列表引导、长的失败行）与主菜单输错
+        // 那一行（回显的输入先净化再尾截；菜单里 `say` 加 2 列缩进）
+        for p in &prof.profiles {
+            for summary in [
+                format!("已切到 {}", p.name),
+                format!("已是当前节点：{}", p.name),
+            ] {
+                let last = fit_name_in_last(&summary, &p.name, width);
+                out.push(("last-name", render(&st(), width, Some(&last))));
+            }
+        }
+        out.push(("last-no-nodes", render(&empty, width, Some(NO_NODES))));
+        out.push((
+            "last-fail",
+            render(
+                &st(),
+                width,
+                Some("失败：manifest 两个源都取不到：面板 HTTP 502，GitHub 连接超时（15 秒）"),
+            ),
+        ));
+        let long = "9".repeat(200);
+        for input in [
+            "abc",
+            "\u{1b}[A",
+            "https://panel.example.com/api/sub/示例用户甲",
+            long.as_str(),
+        ] {
+            out.push(("invalid", format!("  {}\n", invalid_choice(input, width))));
+        }
         out
+    }
+
+    #[test]
+    fn the_last_line_middle_truncates_the_node_name_on_its_own() {
+        let name = "rick-node.example-a.net-reality-direct";
+        let summary = format!("已切到 {name}");
+        // 40 列：名字的预算 = 39 −「  上次：」8 −「已切到 」7 = 24，头约 40%、尾拿剩下的
+        let fitted = fit_name_in_last(&summary, name, 40);
+        assert_eq!(fitted, "已切到 rick-nod…reality-direct");
+        let line = last_line(&fitted, 40);
+        assert_eq!(
+            line, "  上次：已切到 rick-nod…reality-direct\n",
+            "名字截过之后整行不再被尾截"
+        );
+        assert!(budget_width(line.trim_end()) <= line_limit(40));
+        // 名字前面的字更长：预算跟着缩，尾巴仍然留住 direct 与 resi 的区别
+        let fitted = fit_name_in_last(&format!("已是当前节点：{name}"), name, 40);
+        assert!(
+            fitted.contains('…') && fitted.ends_with("direct"),
+            "{fitted}"
+        );
+        assert!(
+            budget_width(&format!("{LAST_HEAD}{fitted}")) <= line_limit(40),
+            "{fitted}"
+        );
+        // 放得下就原样；摘要里没有这个名字也原样
+        assert_eq!(fit_name_in_last(&summary, name, 80), summary);
+        assert_eq!(
+            fit_name_in_last("已取消，模式未变", name, 40),
+            "已取消，模式未变"
+        );
+        // 控制字符先换成 `?` 再算宽度
+        assert_eq!(
+            fit_name_in_last("已切到 a\u{1b}b", "a\u{1b}b", 80),
+            "已切到 a?b"
+        );
+    }
+
+    #[test]
+    fn a_typo_line_echoes_sanitized_input_and_fits_the_line() {
+        assert_eq!(
+            invalid_choice("abc", 60),
+            "无效选项：abc（请输入 0-9 的数字）"
+        );
+        assert_eq!(
+            invalid_choice("\u{1b}[A", 60),
+            "无效选项：?[A（请输入 0-9 的数字）",
+            "方向键的 ESC 不能回显"
+        );
+        // 误把整条链接贴进主菜单：只占一行，算上 2 列缩进按容量口径不超过行宽上限
+        let url = "https://panel.example.com/api/sub/示例用户甲";
+        assert_eq!(
+            invalid_choice(url, 40),
+            "无效选项：http…（请输入 0-9 的数字）"
+        );
+        for w in [40, 50, 60, 80, 100] {
+            let l = format!("  {}", invalid_choice(url, w));
+            assert!(budget_width(&l) <= line_limit(w), "@{w}: {l}");
+        }
+    }
+
+    #[test]
+    fn scripted_is_a_terminal_by_default_and_its_pause_still_eats_a_line() {
+        let mut p = Scripted::from(["", "0"]);
+        assert!(p.interactive(), "默认当有人在终端前");
+        p.tty = false;
+        assert!(!p.interactive());
+        // 测试里写 "" 代表回车：管道形态下也照样消费一行（真 Stdin 不读）
+        p.pause("回车返回菜单").unwrap();
+        assert_eq!(p.asked, vec!["回车返回菜单"]);
+        assert_eq!(p.queue.len(), 1);
+        assert_eq!(p.queue[0], "0");
     }
 
     #[test]
