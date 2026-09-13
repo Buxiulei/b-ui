@@ -6,9 +6,10 @@
 ## 1. 现状一句话
 
 - 代码：`crates/bui-c`（约 11k 行 Rust 含测试，19 个文件，244 个单元测试），随 workspace 一起发版；GitHub 上最新预发布 `v4.0.0-rc7`。本手册对应的修复在本地分支 `Baiyi/bui-c-completion-aa7d30`（从 `6318b77` 起 50 个修复 commit + 文档，未 push），等服务端负责人审查合入 `v4` 后随下一个 rc 发布。与 `origin/v4`（多出 Hysteria2 鉴权改 http 的 3 个 commit）合并无冲突，合并树在 baiyi 上跑过全量门禁。
-- **跨 crate 的 3 个 commit 需要服务端负责人单独过目**：`688f88a`（`bui-schema` 的 `node_uri` 接受 `user%3Apass@`；服务端没有调用方，只影响客户端）、`e081438`（`panel/packages.rs` 下发 `bui-c-install.sh` 时替换面板源占位符）、`9fdd263`（`safe_host`：`Host` 头只认 `主机名[:端口]`，否则回落期望态域名，防 `curl | sudo bash` 注入）。后两个还没部署到 rick。
+- **下一步看 [HANDOVER-bui-c-menu-v2.md](HANDOVER-bui-c-menu-v2.md)**：用户 2026-09-13 要求菜单加删除节点、改进显示与操作，设计阶段刚开始，交接在那份手册里。
+- **跨 crate 的 3 个 commit 需要服务端负责人单独过目**：`20758eb`（`bui-schema` 的 `node_uri` 接受 `user%3Apass@`；服务端没有调用方，只影响客户端）、`ef163f1`（`panel/packages.rs` 下发 `bui-c-install.sh` 时替换面板源占位符）、`85e8f9c`（`safe_host`：`Host` 头只认 `主机名[:端口]`，否则回落期望态域名，防 `curl | sudo bash` 注入）。后两个还没部署到 rick。
 - 服务端已能分发客户端：`https://<面板域名>/packages/bui-c-install.sh`、`/packages/bui-c-linux-{amd64,arm64}`、`/packages/manifest.json`（总纲 C4 形状），GitHub Releases 的预发布也带同样的三件。
-- **baiyi 已于 2026-09-13 完成 v4 切换**：`bui-c 4.0.0`（当前是本分支 `ce2e5a6` 构建，sha256 `74555d02…`）跑在 TUN 模式，活动节点仍是 v3 时的 `hysteria2-1778329470`；v3 五个单元已卸，`/opt/hysteria-client/` 与 `/root/bui-c-v3-backup/` 按约定保留作回滚素材（30 秒回滚命令见 §4）。
+- **baiyi 已于 2026-09-13 完成 v4 切换**：`bui-c 4.0.0`（当前是本分支 `56219f9` 的代码构建（历史脱敏重写前的同一份源码，sha256 `74555d02…`））跑在 TUN 模式，活动节点仍是 v3 时的 `hysteria2-1778329470`；v3 五个单元已卸，`/opt/hysteria-client/` 与 `/root/bui-c-v3-backup/` 按约定保留作回滚素材（30 秒回滚命令见 §4）。
 - 数字菜单做过三轮真机逐键测试（§4「菜单真机测试」），发现的问题分四批修完。
 - M4 里程碑（spec §9）**已验收**（2026-09-13，baiyi，结果表见 §4；④ 在最终二进制上用沙箱重跑过）：四节点 SOCKS/TUN 均通；裸 IPv6 回落符合 spec；`kill -9` 6 秒内由 systemd 拉起、`systemctl stop` 后 40 秒内由 `bui-c.timer` 拉起；从 v3 原地升级 5 个节点一个不丢、活动节点保持。
 
