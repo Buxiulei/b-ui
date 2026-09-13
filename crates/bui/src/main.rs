@@ -155,6 +155,15 @@ async fn dispatch(command: Command) -> Result<()> {
             )
             .await
         }
+        Command::Incidents { json, n } => {
+            commands::incidents::run(
+                json,
+                n,
+                bui_schema::paths::Paths::default_server(),
+                PathBuf::from(paths::SOCKET_PATH),
+            )
+            .await
+        }
         Command::ImportV3 { dir, out } => {
             commands::import_v3::run(
                 dir,

@@ -83,6 +83,15 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// 日志哨兵的事件（新的在前）
+    Incidents {
+        /// 输出 JSON（`{"incidents": [...], "source": "daemon" | "runtime.json"}`）
+        #[arg(long)]
+        json: bool,
+        /// 显示最近几条
+        #[arg(short = 'n', long = "count", default_value_t = 20)]
+        n: usize,
+    },
     /// 只从 v3 生成 state.json（不对账、不卸载 v3）
     ImportV3 {
         /// v3 安装目录
@@ -401,5 +410,20 @@ mod tests {
             "以 bui 名字裸跑打印 help"
         );
         assert_eq!(default_command(""), None);
+    }
+
+    #[test]
+    fn parses_incidents_with_a_count_and_json() {
+        assert_eq!(
+            Cli::try_parse_from(["bui", "incidents"]).unwrap().command,
+            Some(Command::Incidents { json: false, n: 20 })
+        );
+        assert_eq!(
+            Cli::try_parse_from(["bui", "incidents", "-n", "5", "--json"])
+                .unwrap()
+                .command,
+            Some(Command::Incidents { json: true, n: 5 })
+        );
+        assert!(Cli::try_parse_from(["bui", "incidents", "-n", "x"]).is_err());
     }
 }

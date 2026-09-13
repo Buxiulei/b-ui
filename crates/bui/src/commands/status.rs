@@ -88,6 +88,24 @@ pub fn format_status(h: &HealthResponse, hy2_auth: Hy2Auth) -> String {
     out.join("\n")
 }
 
+/// `bui status` 末尾显示几条事件（spec §5.7；全量看 `bui incidents`）
+pub const STATUS_INCIDENTS: usize = 5;
+
+/// `bui status` 的「最近事件」段；`--json` 不带它（`/api/health` 的形状是 P2 锁死的回归面）
+pub fn format_recent_incidents(v: &[crate::modules::sentinel::incidents::Incident]) -> String {
+    if v.is_empty() {
+        return "最近事件    无（`bui incidents` 查看全量）".into();
+    }
+    let mut out = vec!["最近事件    （`bui incidents` 查看全量）".to_string()];
+    out.extend(v.iter().map(|i| {
+        format!(
+            "            {}",
+            crate::modules::sentinel::incidents::format_line(i)
+        )
+    }));
+    out.join("\n")
+}
+
 pub async fn run(json: bool, paths: Paths, host: Arc<dyn Host>) -> Result<()> {
     run_with(json, paths, host, PathBuf::from(crate::paths::SOCKET_PATH)).await
 }
@@ -116,6 +134,10 @@ pub async fn run_with(
         println!("{}", serde_json::to_string_pretty(&health)?);
     } else {
         println!("{}", format_status(&health, hy2_auth));
+        let (recent, _) =
+            crate::modules::sentinel::incidents::load_recent(&socket, &paths, STATUS_INCIDENTS)
+                .await;
+        println!("{}", format_recent_incidents(&recent));
     }
     Ok(())
 }
@@ -302,5 +324,32 @@ mod tests {
         assert!(t.contains("无漂移"));
         assert!(!t.contains("重启失败"));
         assert!(!t.contains("4.0.1"));
+    }
+
+    #[test]
+    fn status_ends_with_the_latest_incidents() {
+        use crate::modules::sentinel::incidents::{Incident, Level};
+        assert_eq!(
+            format_recent_incidents(&[]),
+            "最近事件    无（`bui incidents` 查看全量）"
+        );
+        let i = Incident {
+            at: "2026-09-11T00:00:03Z".into(),
+            unit: "b-ui-relay".into(),
+            signature: "relay_upstream_error".into(),
+            subject: "isp2.example.net:10007".into(),
+            action: "probe_and_borrow".into(),
+            result: "IP 198.51.100.8 不可达，槽 1 已临时切到 198.51.100.7".into(),
+            level: Level::Error,
+            sample: None,
+        };
+        let t = format_recent_incidents(&[i.clone(), i]);
+        assert!(
+            t.starts_with("最近事件    （`bui incidents` 查看全量）"),
+            "{t}"
+        );
+        assert_eq!(t.lines().count(), 3);
+        assert!(t.contains("槽 1 已临时切到 198.51.100.7"));
+        assert_eq!(STATUS_INCIDENTS, 5, "spec §5.7：status 只显示最近 5 条");
     }
 }
