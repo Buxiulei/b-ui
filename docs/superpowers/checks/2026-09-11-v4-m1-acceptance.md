@@ -56,7 +56,7 @@ sudo /opt/b-ui/bin/bui status --json | python3 -m json.tool | head -40
 ## 3. 不由本脚本覆盖的两项（写清归属，避免无人认领）
 | 项 | 归属 | 怎么验 |
 |---|---|---|
-| 每个现有用户三种订阅与 v3 逐项相同 | P0 的 golden 测试 + P2 的订阅端点任务 | 本机 `cargo test -p bui-schema --test golden_subscription`；bwg-rick 上 P2 合并后 `curl -s http://127.0.0.1:8080/api/sub/<user> \| base64 -d` 与 v3 抓取的样本逐行 `diff` |
+| 每个现有用户三种订阅与 v3 逐项相同 | P0 的 golden 测试 + P2 的订阅端点任务 | 本机 `cargo test -p bui-schema --test golden_subscription`；bwg-rick 上 P2 合并后 `curl -s http://127.0.0.1:8080/api/sub/<订阅token> \| base64 -d`（token 取 `state.json` 的 `users[].sub_token`）与 v3 抓取的样本逐行 `diff` |
 | v2rayN 四节点可连 | 主理人（M1/M3 验收窗口） | 导入订阅 → 四个节点依次连通性测试 → 记录延迟 |
 
 ## 4. 已知降级（不阻塞 M1，但要记下来）

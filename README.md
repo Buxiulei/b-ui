@@ -173,7 +173,7 @@ curl -fsSL https://raw.githubusercontent.com/Buxiulei/b-ui/v4/install.sh \
   | bash -s -- --domain panel.example.com --yes --admin-password-stdin < /root/panel-password.txt
 ```
 
-没有终端可问（CI、`/dev/tty` 也开不了）时同样全用默认值；不问的这几种情形下域名仍然缺不得——没给就打印用法并以非 0 退出，**不会装一半**。域名之外的事——架构、发行版与包管理器、公网 IP、SELinux、时间同步、关键端口占用、域名解析核对、IPv6 出口、v3 迁移、防火墙——全部自动探测处理，装完打印一张「环境」表、一张自检 PASS/FAIL 表，以及面板地址、一次性管理员密码、第一个用户名与他那三条订阅地址（`/api/sub`、`/api/subscription`、`/api/clash`）。
+没有终端可问（CI、`/dev/tty` 也开不了）时同样全用默认值；不问的这几种情形下域名仍然缺不得——没给就打印用法并以非 0 退出，**不会装一半**。域名之外的事——架构、发行版与包管理器、公网 IP、SELinux、时间同步、关键端口占用、域名解析核对、IPv6 出口、v3 迁移、防火墙——全部自动探测处理，装完打印一张「环境」表、一张自检 PASS/FAIL 表，以及面板地址、一次性管理员密码、第一个用户名与他那三条订阅地址（`/api/sub`、`/api/subscription`、`/api/clash`，末段是他的随机订阅 token，见[订阅链接与 token](#订阅链接与-token)）。
 
 全新服务器上首张证书要等 Caddy 签到，自检会先有界等待（最多 2 分钟）；到点还没签下来时，
 「两个 hysteria 单元 / HY2 的 UDP 端口 / HY2 回环鉴权」这三行报 `SKIP 待证书` 而**不算失败**
@@ -197,6 +197,8 @@ BUI_MIRRORS="https://ghfast.top/" bash <(curl -fsSL https://ghfast.top/https://r
 引导脚本只做四件事：识别架构 → 下载 `manifest.json` 与对应架构的 `bui` 静态二进制 → 校验 sha256 → 交给 `bui install`（检测到 v3 安装时自动加 `--import-v3`，现有用户与订阅原样迁移）。
 
 v3 机器上原地切 v4：检测到 `/opt/b-ui/users.json` 会自动补 `--import-v3`，沿用 v3 的域名与全部用户。
+导入的用户各自拿到一个随机订阅 token，v3 的「用户名链接」还认 7 天，到点只认 token
+（见[订阅链接与 token](#订阅链接与-token)）——这 7 天里要让现有订阅者重拉一次。
 
 升级与回滚：
 
@@ -315,11 +317,31 @@ sing-box 中继 (127.0.0.1:2080)
 |------|------|
 | `/api/users` | 用户增删改查（需登录） |
 | `/api/config` / `/api/stats` / `/api/online` | 服务端配置、流量统计、在线状态（需登录） |
-| `/api/sub/:user` | base64 的 `vless://` / `hysteria2://` 列表（v2rayN） |
-| `/api/subscription/:user` | sing-box 订阅配置 |
-| `/api/clash/:user` | Clash Meta (mihomo) 订阅配置 |
+| `/api/sub/:token` | base64 的 `vless://` / `hysteria2://` 列表（v2rayN） |
+| `/api/subscription/:token` | sing-box 订阅配置 |
+| `/api/clash/:token` | Clash Meta (mihomo) 订阅配置 |
+| `/api/nodes/:token` | 节点集合 + 分流规则 JSON（`bui-c` 用） |
 | `/api/install-command` | 客户端一键安装命令 |
 | `/packages/` | `bui-c` 与内核二进制、`manifest.json`、`bui-c-install.sh` |
+
+### 订阅链接与 token
+
+这四个端点**免鉴权**，而响应体里就是该用户的 HY2 明文密码与 VLESS UUID ——
+所以**路径末段本身就是凭据**，跟面板密码同级，不要贴进聊天群、issue 或截图。
+
+- 末段是每个用户的**随机订阅 token**（32 位小写十六进制，建用户时生成）：
+  `https://panel.example.com/api/sub/0123456789abcdef0123456789abcdef`。
+  面板用户列表里可以复制，装机收尾也会打印第一个用户的三条地址。
+- **旧的「用户名链接」**（v3 的 `/api/sub/<用户名>` 形状）只在全局宽限期内还认：
+  全新装机不设宽限期，一开始就只认 token；从 v3 导入时给 **7 天**，让现有订阅者有时间重拉。
+  `sudo bui status` 有「旧订阅链接」一行（已停用 / 还剩多久 / 已过期）；
+  `sudo bui set legacy-sub off` 立刻停用全部用户名链接，
+  `sudo bui set legacy-sub 2026-09-21T00:00:00Z` 改期。
+- **重置（怀疑链接泄露时）**：面板里对该用户「轮换凭据」（`POST /api/users/<用户名>/rotate`）
+  ——同时换订阅 token、HY2 密码与 VLESS UUID，并立刻停用他的用户名链接。
+  旧链接与旧凭据当即失效，**该用户必须重新导入一次订阅**；
+  已部署 `bui-c` 的机器不会自愈，要人工重新导入（见 [docs/HANDOVER-bui-c.md](docs/HANDOVER-bui-c.md) §6）。
+- 认不出的末段一律 404 `{"error":"User not found"}`，不区分「查无此人」与「链接已过期」。
 
 ---
 

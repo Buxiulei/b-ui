@@ -195,7 +195,7 @@ Hysteria2 的 ACL 不依赖 geosite.dat，使用内置域名通配符匹配，�
   "port": 1080,
   "username": "abc123",
   "password": "xyz789",
-  "lastVerifiedIp": "173.45.12.34",
+  "lastVerifiedIp": "203.0.113.34",
   "lastVerifiedIspInfo": "Comcast Cable Communications, US-CA-Los Angeles",
   "lastVerifiedAt": "2026-05-07T14:32:01Z"
 }
@@ -270,7 +270,7 @@ Hysteria2 的 ACL 不依赖 geosite.dat，使用内置域名通配符匹配，�
 ```
 ================== 配置住宅 IP ==================
 当前状态: 已启用 ✓
-出口 IP: 173.45.12.34 (Comcast, US-CA)
+出口 IP: 203.0.113.34 (Comcast, US-CA)
 最后校验: 2026-05-07 14:32:01
 
   1) 启用 / 修改凭据

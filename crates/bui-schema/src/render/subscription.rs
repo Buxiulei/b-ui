@@ -150,7 +150,7 @@ fn node_uri(node: &Node, username: &str) -> String {
     }
 }
 
-/// base64 的 URI 列表订阅（`/api/sub/<user>`）。
+/// base64 的 URI 列表订阅（`/api/sub/<token>`，末段是 [`crate::sub`] 的随机订阅 token）。
 pub fn uri_list(nodes: &[Node], username: &str) -> String {
     let lines: Vec<String> = nodes.iter().map(|n| node_uri(n, username)).collect();
     STANDARD.encode(lines.join("\n"))
@@ -235,7 +235,7 @@ fn urltest(tag: &str, outbounds: &[&str]) -> Value {
     })
 }
 
-/// 完整的 sing-box 客户端配置（`/api/subscription/<user>`）。
+/// 完整的 sing-box 客户端配置（`/api/subscription/<token>`）。
 ///
 /// `dial_ip` 是服务器域名对应的公网 IPv4（`State.node.public_ip`）：出站按它直连、
 /// DNS 段同时下发 predefined 应答防 GFW 投毒 bootstrap。为空则退回用域名拨号。
@@ -452,7 +452,7 @@ fn clash_group(name: &str, members: &[String]) -> Yaml {
     ])
 }
 
-/// mihomo（Clash Meta / Clash Verge Rev）订阅 YAML（`/api/clash/<user>`）。
+/// mihomo（Clash Meta / Clash Verge Rev）订阅 YAML（`/api/clash/<token>`）。
 ///
 /// 不含 `mixed-port`（由客户端自身管理）。v3 的首部注释带生成时间，这里去掉：
 /// 期望态渲染必须可重复，带时间戳会让每次比对都判"变了"。

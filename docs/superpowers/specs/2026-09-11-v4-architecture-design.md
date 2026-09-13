@@ -192,13 +192,48 @@ tonic 客户端，proto 从 Xray-core `v26.3.27` vendor 进仓（以仓库根为
 
 `POST /api/reconcile` 的 `dry_run` 仅 CLI 本地路径（`bui reconcile --dry-run`）支持，HTTP 端点忽略该字段：请求一律排队真跑一轮对账，返回 200 + 最近一份 `ReconcileReport` 或 202 `{"queued":true}`。
 
-无鉴权（**按每用户随机订阅 token**，2026-09-14 裁决改掉了原先「按用户名，沿用 v3」的口径）：`/api/sub/<token>`、`/api/subscription/<token>`、`/api/clash/<token>`、**新增** `/api/nodes/<token>`（节点 schema JSON，供 `bui-c` 渲染）。`token` = `state.json` 的 `users[].sub_token`，32 位小写十六进制（16 字节随机）；末段是 token 形态就常量时间比对 `sub_token`，否则只在全局宽限期 `system.legacy_sub_until` 未到、且该用户 `legacy_sub_disabled == false` 时才按用户名精确匹配（新装机不开宽限期，v3 导入与老 v4 升级给 7 天）。三种失配一律同一个 404 `{"error":"User not found"}`——不给能区分「没这个用户」与「链接已过期」的回应，那等于白送一个免鉴权的用户名探测器。理由：仓库公开、证书透明日志公开所有子域，域名补不回来，只能让链接不可猜且可轮换（响应体里就是 hy2 明文密码与 vless uuid）。
+无鉴权（**按每用户随机订阅 token**，2026-09-14 裁决改掉了原先「按用户名，沿用 v3」的口径）：`/api/sub/<token>`、`/api/subscription/<token>`、`/api/clash/<token>`、**新增** `/api/nodes/<token>`（节点 schema JSON，供 `bui-c` 渲染）。`token` = `state.json` 的 `users[].sub_token`，32 位小写十六进制（16 字节随机）；末段是 token 形态就常量时间比对 `sub_token`，否则只在全局宽限期 `system.legacy_sub_until` 未到、且该用户 `legacy_sub_disabled == false` 时才按用户名精确匹配（新装机不开宽限期，v3 导入与老 v4 升级给 7 天）。三种失配一律同一个 404 `{"error":"User not found"}`——不给能区分「没这个用户」与「链接已过期」的回应，那等于白送一个免鉴权的用户名探测器。理由：仓库公开、证书透明日志公开所有子域，域名补不回来，只能让链接不可猜且可轮换（响应体里就是 hy2 明文密码与 vless uuid）。模型、宽限期、轮换与日志面见 §4.5。
 
 用户域（预留，**v4 全部返回 501 `{"error":"not_implemented"}`**，请求/响应结构在附录 A 定义）：`POST /api/me/login`、`GET /api/me`、`GET /api/me/subscription-links`、`GET /api/me/entitlements`、`GET /api/me/billing`、`POST /api/me/orders`、`GET /api/me/orders/{id}`。
 
 ### 4.4 订阅
 
 三种订阅与 v3 逐项等价（节点集、端口、UUID、密码、标签、`mport=`、obfs 参数、住宅分流规则），由 `bui-schema` 从同一节点列表渲染；单协议 + 住宅用户与 v3 一样只发住宅版节点（§4.1 映射的 `direct=false`；2026-09-13 裁决撤销了此前「v4 多发一个直连版」的例外，golden 比对不再过滤）；sing-box JSON 保持 1.12–1.14 兼容子集（typed DNS、TUN `address` 数组、rule action、无 `rule_set`）；Clash/mihomo YAML 另有一处有意新增（2026-09-12 裁决）：`ipv6: true` + `dns.ipv6: false` + `tun` 接管参数（`stack: mixed`、`auto-route`/`strict-route`/`auto-detect-interface`、`inet6-address`、`dns-hijack`，不下发 `enable`）+ 三条 `IP-CIDR6` 规则（ULA/link-local 直连、其余 `::/0` REJECT），与 sing-box 侧的 IPv6 接管同构。CI 用 v3 抓取的脱敏样本做 golden 比对（§8）。
+
+### 4.5 订阅链接的随机 token 与旧链接宽限期（2026-09-14 裁决）
+
+四个免鉴权端点（§4.3）的响应体里有 hy2 明文密码与 vless uuid，所以**路径末段本身就是凭据**。
+仓库是公开的、git 历史里有真实域名与真实用户名，而证书透明日志本来就公开所有子域 ——
+域名那一半补不回来，于是把末段换成每用户一个随机 token：不可猜、可轮换。
+
+**模型**（`bui-schema::model`，三个字段一律 `#[serde(default, skip_serializing_if = …)]`，缺省不落盘）：
+- `User.sub_token: Option<String>` —— 32 位小写十六进制（16 字节随机），`bui_schema::sub::new_sub_token`。
+- `User.legacy_sub_disabled: bool` —— 该用户的「用户名链接」是否已停用（轮换时置 true）。
+- `SystemSettings.legacy_sub_until: Option<String>` —— 全局宽限期截止时刻（RFC3339）；`None` = 一概不认用户名链接。
+
+**解析规则**（四个端点同一口径）：路径段是 32 位小写十六进制 ⇒ 按 `sub_token` 找用户，比较**常量时间**；
+否则只有「`legacy_sub_until` 存在且当前时间早于它」时才按 `username` 精确找，且该用户 `legacy_sub_disabled == false`。
+其余一律沿用现有的 **404 `{"error":"User not found"}`** —— 不用 410、不用任何能区分「用户存在但链接过期」的回应，
+那会泄露用户是否存在。下载文件名按查到的 `username` 生成，不是路径段（否则用户下载到的文件名是 token）。
+
+**宽限期**（常量 `sub::LEGACY_SUB_GRACE_DAYS = 7`）：全新装机首用户建号时就有 token，**不设**
+`legacy_sub_until`（用户名链接从来不可用）；v3 导入（`v3::import`）给每人生成 token 并把截止设成「导入时刻 + 7 天」；
+已有 v4 安装升级上来由守护进程启动补齐（`panel::users::backfill_sub_tokens`，形状照 `slots::migrate_on_start`，
+幂等、零变更不写盘、日志只写个数不写 token），补出过 token 且截止为 `None` 时设成「启动时刻 + 7 天」。
+运维提前收口：`bui set legacy-sub off`（置 `None`）或 `bui set legacy-sub <RFC3339>`；`bui status` 有「旧订阅链接」一行。
+
+**轮换**：`POST /api/users/{name}/rotate`（管理员鉴权内，body 空对象）同时换 `sub_token` / `hy2_password` /
+`vless_uuid`，把 `legacy_sub_disabled` 置 true，回包给出新 token 与新凭据（与 `create_user` 同口径）。
+uuid 变化时 `sync_users` 必须**先 RemoveUser 再 AddUser**，且不把 xray 的「already exists」当成已达目标 ——
+否则新 uuid 要等 xray 重启才生效（`render::xray::structural_hash` 剥掉了 clients，对账不会重启 xray），
+轮换对 Reality 用户就是空转。面板投影 `PanelUser` 带 `subToken`，前端据此拼链接。
+
+**日志**：`bui` 的 `redact.rs` 把 `/api/(sub|subscription|clash|nodes)/<段>` 的末段脱敏（客户端侧
+`bui-c::error::redact_url` 早有同类实现）；渲染的 Caddyfile 面板站点块里有 `log { output stderr }`，
+完整 URI 会进 journald ⇒ 这四条路径加 Caddy 的 `log_skip`（path 匹配器），其余请求照旧记日志。
+
+**不做**：不改 `portal_auth.tokens`（面板登录 token 的空壳，与订阅无关）；不重写 git 历史；
+不动 `keywords.rs` 里的第三方域名（住宅分流功能必需）。
 
 ---
 

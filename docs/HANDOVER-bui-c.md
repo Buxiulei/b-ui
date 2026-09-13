@@ -24,7 +24,7 @@
 | UFW | 不再整墙关闭：TUN 期间 `ufw allow in on bui-tun` + `ufw route allow in on bui-tun`，停 TUN/卸载时撤回（`ufw.rs`，裁决记录 P4 第 4 条）。 |
 | 巡检 `check` | 每分钟：探 `https://www.gstatic.com/generate_204`（8s 超时）；失败按连击退避重启 sing-box；每 23h 自更新一次（失败 1h 后重试）；状态写 `runtime.json`。 |
 | 更新 `update` | 读 manifest（顺序：面板 `<base_url>/packages/manifest.json` → GitHub `releases/latest/download/manifest.json`），比 sha256 后替换自身与 sing-box。 |
-| 节点来源 | `import <uri>|-`（stdin 读，凭据不进 argv）、`import --panel <url> --user <名>`（面板 `/api/nodes/<user>`，载荷 `NodesPayload{user,split,nodes}`）、`import --sub <url>`、`import-v3`（读 `/opt/hysteria-client/configs/*`，导入后卸载 v3 五个单元与残留）。 |
+| 节点来源 | `import <uri>|-`（stdin 读，凭据不进 argv）、`import --panel <url> --user <名>`（面板 `/api/nodes/<末段>`，末段 2026-09-14 起是订阅 token，见 §6；载荷 `NodesPayload{user,split,nodes}`）、`import --sub <url>`、`import-v3`（读 `/opt/hysteria-client/configs/*`，导入后卸载 v3 五个单元与残留）。 |
 | 可测性 | 所有系统交互经 `Sys`（命令/文件）与 `Net`（HTTP）两个 trait；单元测试只用 `fake.rs` 的内存实现，不 `systemctl`、不写 `/etc`、不出网。真机行为留给 M4。 |
 | CLI | `status / list / switch / mode / import / check / update / import-v3 / uninstall / menu`；全局 `--json`（status/list）、`-y/--yes`。 |
 
@@ -55,7 +55,7 @@
 - **baiyi 上跑着的其它会话（包括 Claude Code 自己）对 API 的访问依赖这条隧道**。切 TUN 前先确认本地恢复手段：`sudo tar xzf /root/bui-c-v3-backup/hysteria-client-*.tgz -C / && sudo systemctl daemon-reload && sudo systemctl enable --now bui-tun.service` 能在 30 秒内把 v3 拉回来。
 - 先用 `socks` 模式验通四个节点，再切 `tun`。
 - 长命令用 `nohup`/`systemd-run` 脱管，别在会因断网而中断的会话里执行切换。
-- 面板侧已就绪，可直接取制品：`/packages/manifest.json`、`/packages/bui-c-linux-amd64`、`/api/nodes/<用户名>`（需 URL 编码中文）。
+- 面板侧已就绪，可直接取制品：`/packages/manifest.json`、`/packages/bui-c-linux-amd64`、`/api/nodes/<订阅token>`（2026-09-14 前是 `<用户名>`，中文需 URL 编码）。
 
 ### 菜单真机测试（2026-09-13，baiyi）
 
@@ -115,10 +115,12 @@
 
 ## 6. 服务端侧与客户端相关的接口（改动需同步）
 
-- `/api/nodes/<user>`（公开，按用户）：节点集合 + 分流规则，`bui-schema::nodes::nodes_for` 与 `SplitRules` 直接序列化；住宅 HY2 节点端口按用户所在槽位（IP 池，spec §5.6）——`40000 + 槽号`，跳跃区间等分。客户端不需要知道槽位概念，只按载荷连。
+- `/api/nodes/<token>`（公开）：节点集合 + 分流规则，`bui-schema::nodes::nodes_for` 与 `SplitRules` 直接序列化；住宅 HY2 节点端口按用户所在槽位（IP 池，spec §5.6）——`40000 + 槽号`，跳跃区间等分。客户端不需要知道槽位概念，只按载荷连。
+- **路径末段 2026-09-14 起是随机订阅 token，不再是用户名**（spec §4.5）：32 位小写十六进制，面板用户列表里复制，`/api/sub|subscription|clash|nodes` 四条同一口径。旧的用户名链接只在服务端的全局宽限期内还认（全新装机没有宽限期；v3 导入给 7 天），过后一律 404 `{"error":"User not found"}` —— 与「查无此人」同一个回应，客户端**分辨不出**是链接过期还是用户被删，错误文案不要写成「用户不存在」。所以面板给出的导入链接、`import --panel` 记下的 `base_url` + 末段都应按 token 存。
+- **轮换凭据（面板「轮换」/ `POST /api/users/<用户名>/rotate`）会同时换订阅 token、HY2 密码与 VLESS UUID**：已部署的 `bui-c` 手里的节点凭据当场失效，`bui-c.timer` 每分钟一次 `check` 会一直判失败、按退避不停重启 sing-box，而更新源（面板 `/api/nodes/<旧 token>`）也 404 ⇒ **无法自愈，必须人工重新导入一次**（面板复制新链接 → `bui-c import --panel … ` 或菜单 [3]）。运维在轮换某个用户前要先知道他有没有 Linux 客户端。
 - `/packages/*`：由守护进程按 manifest 缓存分发（`client_sing_box` 是客户端目标版本）。
-- 订阅（`/api/subscription/<user>`）与 `bui-c` 渲染共用 `render::client`，改一处两边生效；改 TUN 模板要考虑 sing-box 1.12–1.14 三版兼容（CI 有三版 `sing-box check` 矩阵）。
-- 客户端只把 **https 且 `/api/nodes/<user>` 成功返回合法载荷** 的面板记为自更新来源；v3 面板的 `/api/nodes` 回 401/404 时客户端回退订阅导入，不记面板。改 `/api/nodes` 的鉴权或状态码要考虑这条回退。
+- 订阅（`/api/subscription/<token>`）与 `bui-c` 渲染共用 `render::client`，改一处两边生效；改 TUN 模板要考虑 sing-box 1.12–1.14 三版兼容（CI 有三版 `sing-box check` 矩阵）。
+- 客户端只把 **https 且 `/api/nodes/<末段>` 成功返回合法载荷** 的面板记为自更新来源；v3 面板的 `/api/nodes` 回 401/404 时客户端回退订阅导入，不记面板。改 `/api/nodes` 的鉴权或状态码要考虑这条回退。
 - `/packages/bui-c-install.sh` 下发时把 `PANEL_SOURCE="__BUI_C_PANEL_SOURCE__"` 替换成 `https://<Host>/packages`，`Host` 不合 `主机名[:端口]` 形状时用期望态域名。
 
 ## 7. 文件边界（并行开发时）

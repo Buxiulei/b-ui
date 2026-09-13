@@ -641,7 +641,10 @@ fn first_user(username: &str) -> anyhow::Result<bui_schema::model::User> {
 /// 装机最后一屏（spec §7 第 10 步）：面板地址、一次性管理员密码（只有全新装机才有）、
 /// 第一个用户与他那三条**能直接粘进客户端**的订阅地址、两个入口。
 ///
-/// 没有用户（`state.users` 为空）时退回 `<用户名>` 形状：那时没有任何地址能填得出来。
+/// 没有用户（`state.users` 为空）时退回 `<订阅token>` 形状：那时没有任何地址能填得出来。
+///
+/// 期望态里有宽限期（`system.legacy_sub_until`，只有 v3 导入会设）时多两行：旧的「用户名
+/// 链接」还认到什么时候、怎么提前收口。全新装机没有这一位，也就不提。
 ///
 /// `fresh` = 这一趟是不是全新装机（判据与 [`run`] / [`run_with`] 同一条：`state.json` 在不在）。
 /// 已装机上重跑 `bui install` 只是对账，没有新建任何用户，照打「第一个用户 <名>」+ 他的订阅会
@@ -675,6 +678,16 @@ pub fn summary(state: &State, password_notice: Option<&str>, fresh: bool) -> Str
                 "订阅        https://{d}/api/sub/<订阅token>（v2rayN）· /api/subscription/<订阅token>（sing-box）· /api/clash/<订阅token>（mihomo）"
             )),
         }
+    }
+    // 2026-09-14 裁决：只有**存在宽限期**时才提旧的「用户名链接」——那就是 v3 导入
+    // （`v3::import` 把 `legacy_sub_until` 设成导入时刻 + 7 天）。全新装机这一位是 `None`，
+    // 用户名链接从来不通，照提只会让人以为还能拿它去导入。
+    if let Some(until) = &state.system.legacy_sub_until {
+        out.push(format!(
+            "旧链接      v3 的用户名订阅链接还认到 {until}（默认 {} 天宽限期），之后只认随机 token",
+            bui_schema::sub::LEGACY_SUB_GRACE_DAYS
+        ));
+        out.push("            要提前收口：`bui set legacy-sub off`".into());
     }
     out.push("后续        `b-ui` 进菜单 / `bui status` 看体检 / `bui reconcile` 手动对账".into());
     out.join("\n")
@@ -2498,6 +2511,27 @@ mod tests {
         }
         assert!(s.contains("第一个用户  alice"), "用户名还是要报的：{s}");
         assert!(!s.contains("/api/sub/alice"), "不许再打用户名链接：{s}");
+    }
+
+    /// 旧「用户名链接」那两行**只在存在宽限期时**出现（即 v3 导入）：全新装机
+    /// `legacy_sub_until` 是 `None`，用户名链接从来不通，提它就是误导。
+    #[test]
+    fn the_legacy_link_notice_shows_up_only_with_a_grace_period() {
+        let mut state = crate::testutil::sample_state();
+        state.users[0].sub_token = Some("0123456789abcdef0123456789abcdef".into());
+        let fresh = summary(&state, None, true);
+        assert!(!fresh.contains("旧链接"), "全新装机不许提旧链接：{fresh}");
+
+        state.system.legacy_sub_until = Some("2026-09-21T08:30:00Z".into());
+        let imported = summary(&state, None, true);
+        assert!(
+            imported.contains("旧链接      v3 的用户名订阅链接还认到 2026-09-21T08:30:00Z"),
+            "v3 导入要报截止时刻：{imported}"
+        );
+        assert!(
+            imported.contains("默认 7 天宽限期") && imported.contains("bui set legacy-sub off"),
+            "还要告诉人怎么提前收口：{imported}"
+        );
     }
 
     /// 已装机上重跑 `bui install` 只对账、一个用户都没新建，摘要于是不许再写「第一个用户 <名>」
