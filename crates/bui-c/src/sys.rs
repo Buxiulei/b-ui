@@ -1,5 +1,5 @@
 //! 所有「碰真实系统」的能力都收在 [`Sys`] 一个 trait 后面：执行命令、读写文件、
-//! 取时间、睡眠、读环境变量。生产用 [`RealSys`]，单元测试注入
+//! 取时间、睡眠、读环境变量、取终端尺寸。生产用 [`RealSys`]，单元测试注入
 //! [`FakeSys`](crate::fake::FakeSys)，于是测试既不 `systemctl` 也不写 `/etc`。
 
 use crate::{Error, Result};
@@ -39,6 +39,10 @@ pub trait Sys {
     fn sleep(&self, d: Duration);
     /// 环境变量也从这里出去：测试注入，生产读真实环境（决策 11）。
     fn env(&self, key: &str) -> Option<String>;
+    /// stdout 所在终端的尺寸 `(列, 行)`，同一次查询取出。stdout 不是终端（`| tee`、
+    /// `| head`、timer 写 journald）、查询失败或列数为 0 时为 `None`：菜单据此回落
+    /// 80×24、不发清屏序列。不缓存，每次画屏前重新取，窗口缩放与手机转屏立刻生效。
+    fn term_size(&self) -> Option<(u16, u16)>;
 }
 
 /// 生产实现。
@@ -141,6 +145,25 @@ impl Sys for RealSys {
 
     fn env(&self, key: &str) -> Option<String> {
         std::env::var(key).ok()
+    }
+
+    /// 查 stdout，不查 stdin 或 `/dev/tty`：要知道的是「我们的输出画在多宽的地方」，
+    /// stdout 被重定向时就该回落，清屏序列也不能混进管道。请求号用 libc 的常量，
+    /// 别写字面量：glibc 上 `ioctl` 的请求参数是 `c_ulong`，musl（发布构建）上是 `c_int`。
+    /// 读不到终端是常态（管道、timer），不报错、不打日志。
+    fn term_size(&self) -> Option<(u16, u16)> {
+        use nix::libc;
+        let mut ws = libc::winsize {
+            ws_row: 0,
+            ws_col: 0,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: 本 crate 唯一的 unsafe。`ws` 是本函数的局部可写 POD（四个 u16），
+        // `&mut ws` 在调用期间独占且有效；fd 是本进程自己的 stdout；TIOCGWINSZ 只往
+        // ws 里写一个 winsize，fd 不是终端或已关闭时返回 -1，不碰别的内存。
+        let rc = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) };
+        (rc == 0 && ws.ws_col > 0).then_some((ws.ws_col, ws.ws_row))
     }
 }
 

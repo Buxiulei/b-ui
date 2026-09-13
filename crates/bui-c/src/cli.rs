@@ -150,6 +150,27 @@ impl<'a, S: Sys, N: Net, P: Prompt> Ctx<'a, S, N, P> {
             stdout_closed: false,
         }
     }
+    /// 终端列数；拿不到按 80。不缓存，每次画屏前重新取（窗口缩放、手机转屏立刻生效）。
+    pub fn width(&self) -> usize {
+        self.sys
+            .term_size()
+            .map(|(cols, _)| cols)
+            .filter(|&c| c > 0)
+            .map_or(80, usize::from)
+    }
+    /// 终端行数；拿不到按 24。报 0 行（只设了列数的 pty）也算拿不到。
+    pub fn rows(&self) -> usize {
+        self.sys
+            .term_size()
+            .map(|(_, rows)| rows)
+            .filter(|&r| r > 0)
+            .map_or(24, usize::from)
+    }
+    /// 能不能清屏重画：stdin 有人在看（[`Prompt::interactive`]），且 stdout 是终端。
+    /// 管道、重定向、timer 下都为假，清屏序列不会混进输出。
+    pub fn screen_ctl(&self) -> bool {
+        self.prompt.interactive() && self.sys.term_size().is_some()
+    }
     /// 说一句（可多行）：每个非空行前加 [`indent`](Self::indent)，空行不留尾随空格。
     pub fn say(&mut self, line: impl AsRef<str>) {
         let mut text = String::new();
@@ -2729,6 +2750,47 @@ mod tests {
         ctx.say("一\n\n二");
         assert_eq!(ctx.out, "顶格\n  一\n\n  二\n", "空行不留尾随空格");
         assert_eq!(ctx.transcript, ctx.out, "transcript 也带缩进");
+    }
+
+    #[test]
+    fn ctx_size_falls_back_to_80_by_24_and_follows_the_injected_size() {
+        let pp = paths();
+        let s = FakeSys::new();
+        let n = FakeNet::new();
+        let mut p = Scripted::from([]);
+        let ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        assert_eq!((ctx.width(), ctx.rows()), (80, 24));
+        assert!(!ctx.screen_ctl(), "拿不到尺寸就不清屏");
+        s.set_term_size(Some((47, 17)));
+        assert_eq!((ctx.width(), ctx.rows()), (47, 17));
+        assert!(ctx.screen_ctl());
+    }
+
+    #[test]
+    fn ctx_screen_ctl_also_needs_someone_at_the_keyboard() {
+        // stdout 是终端、stdin 是管道：排版照终端宽度，但不清屏
+        let pp = paths();
+        let s = FakeSys::new();
+        s.set_term_size(Some((60, 20)));
+        let n = FakeNet::new();
+        let mut p = Piped(Scripted::from([]));
+        let ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        assert_eq!((ctx.width(), ctx.rows()), (60, 20));
+        assert!(!ctx.screen_ctl());
+    }
+
+    #[test]
+    fn ctx_size_treats_a_zero_count_as_unknown() {
+        // 有的 pty 只设了列数、行数报 0：按拿不到回落，后面的 `rows − 2` 不会下溢
+        let pp = paths();
+        let s = FakeSys::new();
+        let n = FakeNet::new();
+        let mut p = Scripted::from([]);
+        let ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        s.set_term_size(Some((100, 0)));
+        assert_eq!((ctx.width(), ctx.rows()), (100, 24));
+        s.set_term_size(Some((0, 30)));
+        assert_eq!((ctx.width(), ctx.rows()), (80, 30));
     }
 
     #[test]

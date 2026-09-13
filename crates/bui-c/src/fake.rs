@@ -6,7 +6,7 @@
 use crate::net::{Net, Via};
 use crate::sys::{Output, Sys};
 use crate::{Error, Result};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -22,6 +22,8 @@ pub struct FakeSys {
     envs: RefCell<BTreeMap<String, String>>,
     now: RefCell<time::OffsetDateTime>,
     sleeps: RefCell<Vec<u64>>,
+    /// 终端尺寸 `(列, 行)`；默认 `None`，等于「stdout 不是终端」。
+    term: Cell<Option<(u16, u16)>>,
 }
 
 impl Default for FakeSys {
@@ -33,6 +35,7 @@ impl Default for FakeSys {
             envs: RefCell::default(),
             now: RefCell::new(datetime!(2026-09-11 00:00:00 UTC)),
             sleeps: RefCell::default(),
+            term: Cell::new(None),
         }
     }
 }
@@ -120,6 +123,11 @@ impl FakeSys {
             .borrow_mut()
             .insert(key.to_string(), value.to_string());
     }
+    /// 注入终端尺寸 `(列, 行)`。默认 `None`（不是终端）：没注入的测试按 80×24 排版、
+    /// 不清屏，与加这个能力之前的输出一致。
+    pub fn set_term_size(&self, v: Option<(u16, u16)>) {
+        self.term.set(v);
+    }
 }
 
 impl Sys for FakeSys {
@@ -202,6 +210,9 @@ impl Sys for FakeSys {
     }
     fn env(&self, key: &str) -> Option<String> {
         self.envs.borrow().get(key).cloned()
+    }
+    fn term_size(&self) -> Option<(u16, u16)> {
+        self.term.get()
     }
 }
 
