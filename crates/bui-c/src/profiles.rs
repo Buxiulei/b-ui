@@ -110,12 +110,16 @@ pub fn profile_name(user: &str, node: &Node) -> String {
     }
 }
 
-/// 同一个账号位：`kind` 相同，凭据主体相同（Hysteria2 的 `username`、Reality 的 `uuid`）。
+/// 同一个账号位：同一台服务器（`host`）上 `kind` 相同、凭据主体相同
+/// （Hysteria2 的 `username`、Reality 的 `uuid`）。
 ///
-/// 不看 host / port / 密码：同一账号换了密码或主机是凭据轮换，该原地替换同名节点，
-/// 而不是另起一个。不同账号（家人账号）哪怕 [`profile_name`] 撞名也不是同一个账号位。
+/// 不看 port / 密码：同一台服务器上同一账号换了密码或端口是凭据轮换，该原地替换同名节点。
+/// 必须看 host：ASCII 用户名（`alice`）在两台服务器上各有一个账号时 [`profile_name`] 都是
+/// `alice-<kind>`，那是两个账号，第二台不能把第一台的节点换掉（换了主机名的同一账号
+/// 顶多多出一个 `-2`，不丢东西）。不同账号（家人账号）哪怕撞名也不是同一个账号位。
 pub fn same_account(a: &Node, b: &Node) -> bool {
     a.kind == b.kind
+        && a.host == b.host
         && match (&a.transport, &b.transport) {
             (
                 Transport::Hysteria2 { username: ua, .. },
@@ -415,7 +419,14 @@ mod tests {
         };
         assert!(!same_endpoint(&base, &moved_host));
         assert!(!same_endpoint(&base, &moved_port));
-        assert!(same_account(&base, &moved_host), "换主机仍是同一个账号");
+        assert!(
+            !same_account(&base, &moved_host),
+            "换了主机就当另一个账号：同一个 ASCII 用户名在两台服务器上是两个账号，不能互相覆盖"
+        );
+        assert!(
+            same_account(&base, &moved_port),
+            "同一台服务器换端口仍是同一个账号"
+        );
 
         assert!(
             !same_account(&base, &hy2_resi_node()),

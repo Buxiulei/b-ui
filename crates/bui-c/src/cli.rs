@@ -1471,6 +1471,34 @@ mod tests {
         );
     }
 
+    /// 同一个 ASCII 用户名在两台服务器上各有一个账号（这一家同时跑着 bwg-tizi 与 bwg-rick）：
+    /// `profile_name` 都是 `alice-hy2-direct`，但那是两台机器上的两个账号，第二台不能把第一台换掉。
+    #[test]
+    fn the_same_ascii_username_on_two_servers_keeps_both_nodes() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        import_from_panel(&s, &pp, "alice", vec![hy2_account("alice", "pw-a")]);
+        let t = import_from_panel(
+            &s,
+            &pp,
+            "alice",
+            vec![bui_schema::nodes::Node {
+                host: "other.example.com".into(),
+                ..hy2_account("alice", "pw-b")
+            }],
+        );
+        assert_eq!(
+            names(&s, &pp),
+            vec!["alice-hy2-direct", "alice-hy2-direct-2"],
+            "{t}"
+        );
+        let saved = Profiles::load(&s, &pp).unwrap();
+        assert_eq!(saved.profiles[0].node.host, "panel.example.com");
+        assert_eq!(hy2_credentials(&saved.profiles[0]), ("alice", "pw-a"));
+        assert_eq!(saved.profiles[1].node.host, "other.example.com");
+    }
+
     /// 缺陷：import-v3 导进来的节点 label 是 v3 备注，面板给的是 `HY2直连`，整个 `Node`
     /// 不相等就被当成新节点——同一个连接在列表里出现两份。
     #[test]
