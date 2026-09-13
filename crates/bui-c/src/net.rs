@@ -49,16 +49,23 @@ impl ReqwestNet {
     }
 }
 
+/// 请求与读响应体的错误：先 `without_url()` 再转文本。reqwest 的 Display 会追加
+/// ` for url (<完整 URL>)`，而订阅与 `/api/nodes` 路径的末段是用户名（等价凭据），
+/// 原样放进 detail 就绕过了 [`redact_url`]。
+fn request_error(url: &str, e: reqwest::Error) -> Error {
+    Error::Net {
+        url: redact_url(url),
+        detail: e.without_url().to_string(),
+    }
+}
+
 impl Net for ReqwestNet {
     fn status(&self, url: &str, via: Via, timeout: Duration) -> Result<u16> {
         let r = self
             .client(via, timeout)?
             .get(url)
             .send()
-            .map_err(|e| Error::Net {
-                url: redact_url(url),
-                detail: e.to_string(),
-            })?;
+            .map_err(|e| request_error(url, e))?;
         Ok(r.status().as_u16())
     }
 
@@ -67,10 +74,7 @@ impl Net for ReqwestNet {
             .client(Via::Direct, timeout)?
             .get(url)
             .send()
-            .map_err(|e| Error::Net {
-                url: redact_url(url),
-                detail: e.to_string(),
-            })?;
+            .map_err(|e| request_error(url, e))?;
         let code = r.status().as_u16();
         if !(200..300).contains(&code) {
             return Err(Error::Net {
@@ -78,10 +82,7 @@ impl Net for ReqwestNet {
                 detail: format!("HTTP {code}"),
             });
         }
-        r.text().map_err(|e| Error::Net {
-            url: redact_url(url),
-            detail: e.to_string(),
-        })
+        r.text().map_err(|e| request_error(url, e))
     }
 
     fn bytes(&self, url: &str, timeout: Duration) -> Result<Vec<u8>> {
@@ -89,10 +90,7 @@ impl Net for ReqwestNet {
             .client(Via::Direct, timeout)?
             .get(url)
             .send()
-            .map_err(|e| Error::Net {
-                url: redact_url(url),
-                detail: e.to_string(),
-            })?;
+            .map_err(|e| request_error(url, e))?;
         let code = r.status().as_u16();
         if !(200..300).contains(&code) {
             return Err(Error::Net {
@@ -100,11 +98,25 @@ impl Net for ReqwestNet {
                 detail: format!("HTTP {code}"),
             });
         }
-        Ok(r.bytes()
-            .map_err(|e| Error::Net {
-                url: redact_url(url),
-                detail: e.to_string(),
-            })?
-            .to_vec())
+        Ok(r.bytes().map_err(|e| request_error(url, e))?.to_vec())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_errors_never_carry_the_full_url() {
+        // 订阅与 /api/nodes 路径的最后一段是用户名（等价凭据）。reqwest 的错误文本自带
+        // `for url (<完整 URL>)`，原样塞进 detail 就绕过了 redact_url，「失败：…」里会带出用户名。
+        // 127.0.0.1:1 没人监听，连接立刻被拒：拿到一个真实的 reqwest 错误，不出网。
+        let url = "http://127.0.0.1:1/api/nodes/alice-secret";
+        let e = ReqwestNet
+            .text(url, Duration::from_secs(2))
+            .expect_err("端口 1 不该连得上");
+        let msg = e.to_string();
+        assert!(!msg.contains("alice-secret"), "错误信息带出了用户名：{msg}");
+        assert!(msg.contains("127.0.0.1"), "主机还要留着，排障要看：{msg}");
     }
 }
