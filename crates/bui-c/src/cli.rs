@@ -6327,7 +6327,7 @@ mod tests {
         dispatch(&parse(&args), &mut ctx).unwrap();
         let t = ctx.transcript.clone();
         assert!(
-            t.contains("已删除全部 9 个节点，代理已停止；用 `bui-c import` 重新导入"),
+            t.contains("已删除全部 9 个节点，代理已停止；用 bui-c import 重新导入"),
             "{t}"
         );
         assert!(!t.contains("按 [3] 导入"), "菜单键不进命令行：{t}");

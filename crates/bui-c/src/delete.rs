@@ -214,7 +214,9 @@ pub fn summary(r: &Report, width: usize) -> String {
 pub fn cli_summary(r: &Report) -> String {
     let n = r.deleted.len();
     if r.stopped {
-        return format!("已删除全部 {n} 个节点，代理已停止；用 `bui-c import` 重新导入");
+        // 不给 `bui-c import` 加反引号：整句要容得下三位数的节点数。不带反引号是
+        // 57 列（三位数 59），带上就是 59（三位数 61），越过固定文案 ≤ 59 列那条线
+        return format!("已删除全部 {n} 个节点，代理已停止；用 bui-c import 重新导入");
     }
     match r.active.as_deref().filter(|_| r.switched) {
         Some(to) => format!("当前节点已删除，切到 {}", menu::sanitize(to)),
@@ -231,7 +233,13 @@ pub const SNAPSHOT_CHANGED_SHORT: &str = "节点列表刚被别处改过，没�
 /// 一点没动）共用的第一行与短摘要。删光那一种另有说法，见 [`STOPPED_NOT_SAVED_HEAD`]。
 pub const SAVE_FAILED: &str = "删除没做：写 profiles.json 失败";
 /// 删光时拆数据面失败的短摘要（页上打的是 `删除没做：{engine 的原因}`，40 列放不下）。
-pub const TEARDOWN_FAILED_SHORT: &str = "删除没做：代理停不下来";
+///
+/// 故意不说是哪一步失败：`Engine::teardown_main` 除了「停不下来」，在 is-active 复查通过之后
+/// 还可能因为删单元文件、`daemon-reload`、删 `config.json`、清临时文件而失败。要在这一行里
+/// 分辨就得拿 `engine` 的错误文本去匹配（像 `KERNEL_MISSING` 那样），而那是把两个模块的文案
+/// 绑在一起的写法，不值得为一行摘要再加一处。页上紧接着就是真正的原因，所以这一行只要
+/// **在所有分支下都为真**：「代理停不下来」在删单元文件失败时是假的，「拆数据面失败」不是。
+pub const TEARDOWN_FAILED_SHORT: &str = "删除没做：拆数据面失败";
 /// 删光时数据面拆完了、`profiles.json` 却写不进去：这是唯一一种「代理已经不在、节点条目
 /// 还列着」的状态，所以不能沿用 [`STILL_THERE`]（「节点都还在」在这里是错的）。
 pub const STOPPED_NOT_SAVED_HEAD: &str = "代理已经停了，但写 profiles.json 失败";
@@ -520,9 +528,16 @@ mod tests {
         let empty = cli_summary(&stopped);
         assert_eq!(
             empty,
-            "已删除全部 2 个节点，代理已停止；用 `bui-c import` 重新导入"
+            "已删除全部 2 个节点，代理已停止；用 bui-c import 重新导入"
         );
         assert!(!empty.contains("[3]"), "命令行里没有菜单键：{empty}");
+        // 三位数的节点数也要压在 59 列内（固定文案的上限）
+        let many = Report {
+            deleted: (0..100).map(|i| format!("n{i}")).collect(),
+            ..stopped
+        };
+        let w = menu::budget_width(&cli_summary(&many));
+        assert!(w <= 59, "三位数节点数时占 {w} 列：{}", cli_summary(&many));
         // 名字照 §5.10 末条净化
         let dirty = Report {
             active: Some("a\u{1b}[31mb".into()),
