@@ -25,6 +25,31 @@ pub trait Prompt {
     fn pause(&mut self, prompt: &str) -> Result<()> {
         self.read(prompt).map(|_| ())
     }
+    /// 有人在终端前看提示吗。`Stdin` 在 stdin 不是终端（管道 / 重定向）时为假：
+    /// 不打「▸」提示，菜单因 EOF 退出时也不必补换行。
+    fn interactive(&self) -> bool {
+        true
+    }
+}
+
+/// 把 `s` 整段写进 `w` 并 flush。stdout 的写出都经它：`print!` 遇到被关掉的管道
+/// （`bui-c list | head -1`）会 panic，这里把 `BrokenPipe` 交还给调用方处理。
+pub fn write_out<W: std::io::Write>(w: &mut W, s: &str) -> std::io::Result<()> {
+    w.write_all(s.as_bytes())?;
+    w.flush()
+}
+
+/// 打一段交互提示。stdin 不是终端时一个字都不写（没人在看，管道输出里只该有结果）；
+/// stdout 被关返回 `Ok(false)`，调用方当 EOF 收场。
+fn prompt_out<W: std::io::Write>(interactive: bool, w: &mut W, text: &str) -> Result<bool> {
+    if !interactive {
+        return Ok(true);
+    }
+    match write_out(w, text) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(false),
+        Err(e) => Err(Error::io(std::path::Path::new("<stdout>"), e)),
+    }
 }
 
 pub struct Stdin;
@@ -61,13 +86,11 @@ fn read_line_from<R: std::io::BufRead>(r: &mut R) -> Result<Option<String>> {
 }
 
 impl Stdin {
-    /// 打出提示（不换行）再读一行。
+    /// 打出提示（不换行）再读一行；stdout 已关就当 EOF。
     fn ask(&mut self, text: &str) -> Result<Option<String>> {
-        use std::io::Write as _;
-        print!("{text}");
-        std::io::stdout()
-            .flush()
-            .map_err(|e| Error::io(std::path::Path::new("<stdout>"), e))?;
+        if !prompt_out(self.interactive(), &mut std::io::stdout().lock(), text)? {
+            return Ok(None);
+        }
         read_line_from(&mut std::io::stdin().lock())
     }
 }
@@ -82,7 +105,10 @@ impl Prompt for Stdin {
     }
 
     fn lines_until_blank(&mut self, prompt: &str) -> Result<Vec<String>> {
-        println!("  {prompt}（每行一个，空行结束）");
+        let head = format!("  {prompt}（每行一个，空行结束）\n");
+        if !prompt_out(self.interactive(), &mut std::io::stdout().lock(), &head)? {
+            return Ok(Vec::new());
+        }
         let mut out = Vec::new();
         loop {
             let l = self.line("")?;
@@ -96,6 +122,11 @@ impl Prompt for Stdin {
     fn confirm(&mut self, prompt: &str) -> Result<bool> {
         let a = self.line(&format!("{prompt} [y/N]"))?;
         Ok(matches!(a.to_ascii_lowercase().as_str(), "y" | "yes"))
+    }
+
+    fn interactive(&self) -> bool {
+        use std::io::IsTerminal as _;
+        std::io::stdin().is_terminal()
     }
 }
 
@@ -993,6 +1024,50 @@ mod tests {
         assert!(
             !prompt_text("选择节点编号").contains(':'),
             "与其余文案一致用全角冒号"
+        );
+    }
+
+    /// 已经被关掉的 stdout（`bui-c list | head -1`）：每次写都 BrokenPipe。
+    struct ClosedPipe;
+    impl std::io::Write for ClosedPipe {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn write_out_writes_everything_and_surfaces_broken_pipe() {
+        let mut v = Vec::new();
+        write_out(&mut v, "  ▸ 选择 [0-9]：").unwrap();
+        assert_eq!(String::from_utf8(v).unwrap(), "  ▸ 选择 [0-9]：");
+        assert_eq!(
+            write_out(&mut ClosedPipe, "x").unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+    }
+
+    #[test]
+    fn prompts_are_silent_without_a_terminal_and_a_closed_stdout_reads_as_eof() {
+        let mut v = Vec::new();
+        assert!(prompt_out(true, &mut v, "  ▸ 选择 [0-9]：").unwrap());
+        assert_eq!(String::from_utf8(v).unwrap(), "  ▸ 选择 [0-9]：");
+
+        let mut v = Vec::new();
+        assert!(
+            prompt_out(false, &mut v, "  粘贴节点链接（每行一个，空行结束）\n").unwrap(),
+            "照常读 stdin"
+        );
+        assert!(
+            v.is_empty(),
+            "stdin 不是终端（管道 / 重定向）：不打提示与说明"
+        );
+
+        assert!(
+            !prompt_out(true, &mut ClosedPipe, "  ▸ 选择 [0-9]：").unwrap(),
+            "stdout 被关：当 EOF 收场，不 panic、不报错"
         );
     }
 

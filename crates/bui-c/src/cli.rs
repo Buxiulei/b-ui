@@ -124,6 +124,8 @@ pub struct Ctx<'a, S: Sys, N: Net, P: Prompt> {
     /// [`say`](Self::say) 每行前加的缩进。默认顶格；菜单循环里设成两列，让「无效选项」
     /// 「已切到…」这类结果行跟菜单对齐，而不是顶在最左边。
     pub indent: &'static str,
+    /// stdout 已经被关掉（`bui-c list | head -1`）：之后的输出直接丢，菜单循环就此收场。
+    pub stdout_closed: bool,
 }
 
 impl<'a, S: Sys, N: Net, P: Prompt> Ctx<'a, S, N, P> {
@@ -145,6 +147,7 @@ impl<'a, S: Sys, N: Net, P: Prompt> Ctx<'a, S, N, P> {
             out: String::new(),
             transcript: String::new(),
             indent: "",
+            stdout_closed: false,
         }
     }
     /// 说一句（可多行）：每个非空行前加 [`indent`](Self::indent)，空行不留尾随空格。
@@ -169,10 +172,57 @@ impl<'a, S: Sys, N: Net, P: Prompt> Ctx<'a, S, N, P> {
         self.out.push_str(text);
         self.transcript.push_str(text);
     }
+    /// 打印并清空待打印缓冲。
     pub fn flush(&mut self) {
-        if !self.out.is_empty() {
-            print!("{}", self.out);
-            self.out.clear();
+        #[cfg(not(test))]
+        let mut w = std::io::stdout().lock();
+        #[cfg(test)]
+        let mut w = CapturedStdout;
+        self.flush_into(&mut w);
+    }
+    /// 把待打印缓冲写进 `w` 并清空。写失败（被关掉的管道是 `BrokenPipe`，终端挂断是
+    /// `EIO`）静默丢弃并记下 [`stdout_closed`](Self::stdout_closed)，之后不再尝试——
+    /// 以前的 `print!` 在这里 panic，`bui-c list | head -1` 以退出码 101 收场。
+    pub fn flush_into<W: std::io::Write>(&mut self, w: &mut W) {
+        if self.out.is_empty() {
+            return;
+        }
+        if !self.stdout_closed && menu::write_out(w, &self.out).is_err() {
+            self.stdout_closed = true;
+        }
+        self.out.clear();
+    }
+}
+
+/// 单元测试里 [`Ctx::flush`] 仍经 `print!`：直接写 `stdout().lock()` 会绕过 libtest 的
+/// 输出捕获，`cargo test` 会满屏菜单。
+#[cfg(test)]
+struct CapturedStdout;
+
+#[cfg(test)]
+impl std::io::Write for CapturedStdout {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        print!("{}", String::from_utf8_lossy(buf));
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// 收尾：先把正常输出冲到 stdout，错误单独写 `err`（真机是 stderr）——
+/// `bui-c list --json | jq` 这类管道里 stdout 只该有结果。
+fn finish<S: Sys, N: Net, P: Prompt, W: std::io::Write>(
+    ctx: &mut Ctx<'_, S, N, P>,
+    r: Result<()>,
+    err: &mut W,
+) -> std::process::ExitCode {
+    ctx.flush();
+    match r {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            let _ = writeln!(err, "错误：{e}");
+            std::process::ExitCode::FAILURE
         }
     }
 }
@@ -410,6 +460,7 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
                 });
                 ctx.out = serde_json::to_string_pretty(&v)
                     .map_err(|e| Error::parse("status", e.to_string()))?;
+                ctx.out.push('\n');
             } else {
                 let text = menu::render_status(&st);
                 ctx.show(text.trim_end());
@@ -431,6 +482,7 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
                     .collect();
                 ctx.out = serde_json::to_string_pretty(&rows)
                     .map_err(|e| Error::parse("list", e.to_string()))?;
+                ctx.out.push('\n');
             } else {
                 let text = menu::render_nodes(&prof, false);
                 ctx.show(text.trim_end());
@@ -730,7 +782,7 @@ fn offer_v3_import<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Res
 
 pub fn menu_loop<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()> {
     // 菜单里的结果行缩进两列跟菜单对齐；任何出口（含 `?` 冒上来的错误）都恢复，
-    // 否则 run() 接着打的「错误：…」会沿用菜单缩进
+    // 否则调用方接着 say 的话会沿用菜单缩进
     let saved = std::mem::replace(&mut ctx.indent, "  ");
     let r = menu_body(ctx);
     ctx.indent = saved;
@@ -745,9 +797,16 @@ fn menu_body<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()
         let screen = menu::render(&st);
         ctx.show(screen.trim_end());
         ctx.flush();
+        if ctx.stdout_closed {
+            return Ok(()); // 没人看得到输出，不再接着读选择、执行命令
+        }
         // EOF（Ctrl-D、stdin=/dev/null）→ 退出，不留在死循环里；直接回车只重画，
         // 不打「无效选项」——手滑多按一下回车不该把人踢出菜单
         let Some(choice) = ctx.prompt.read("选择 [0-9]")? else {
+            // Ctrl-D 不回显换行：先换一行，别让 shell 提示符接在「▸ 选择 [0-9]：」后面
+            if ctx.prompt.interactive() {
+                ctx.show("");
+            }
             return Ok(());
         };
         if choice.is_empty() {
@@ -1102,15 +1161,8 @@ pub fn run() -> std::process::ExitCode {
     let paths = Paths::from_env();
     let mut prompt = menu::Stdin;
     let mut ctx = Ctx::new(&sys, &net, &paths, &mut prompt, cli.json, cli.yes);
-    let rc = match dispatch(&cli, &mut ctx) {
-        Ok(()) => std::process::ExitCode::SUCCESS,
-        Err(e) => {
-            ctx.say(format!("错误：{e}"));
-            std::process::ExitCode::FAILURE
-        }
-    };
-    ctx.flush();
-    rc
+    let r = dispatch(&cli, &mut ctx);
+    finish(&mut ctx, r, &mut std::io::stderr())
 }
 
 #[cfg(test)]
@@ -2191,6 +2243,148 @@ mod tests {
             Mode::Socks,
             "什么都没改"
         );
+    }
+
+    #[test]
+    fn json_output_ends_with_a_newline() {
+        // `bui-c status --json` 以前最后一行是 `}`，shell 提示符接在它后面
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        profiles_socks().save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        for (args, tail) in [(["status", "--json"], "}\n"), (["list", "--json"], "]\n")] {
+            let mut p = Scripted::from([]);
+            let mut ctx = Ctx::new(&s, &n, &pp, &mut p, true, false);
+            dispatch(&parse(&args), &mut ctx).unwrap();
+            assert!(ctx.out.ends_with(tail), "{args:?}：{:?}", ctx.out);
+            serde_json::from_str::<serde_json::Value>(&ctx.out).unwrap();
+        }
+    }
+
+    /// 管道喂进来的 stdin：`Stdin` 不打提示（`interactive` 为假），其余照 [`Scripted`]。
+    struct Piped(Scripted);
+    impl Prompt for Piped {
+        fn read(&mut self, prompt: &str) -> Result<Option<String>> {
+            self.0.read(prompt)
+        }
+        fn lines_until_blank(&mut self, prompt: &str) -> Result<Vec<String>> {
+            self.0.lines_until_blank(prompt)
+        }
+        fn confirm(&mut self, prompt: &str) -> Result<bool> {
+            self.0.confirm(prompt)
+        }
+        fn interactive(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn menu_eof_ends_the_prompt_line_before_exiting() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        profiles_socks().save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+
+        // Ctrl-D：终端不回显换行，shell 提示符会接在「▸ 选择 [0-9]：」后面
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        assert!(
+            ctx.transcript.ends_with("     [0] 退出\n\n"),
+            "EOF 退出先补一个换行：{:?}",
+            ctx.transcript
+        );
+
+        // 输入 0 退出：回车已经换过行，不补
+        let mut p = Scripted::from(["0"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        assert!(ctx.transcript.ends_with("     [0] 退出\n"));
+        assert!(!ctx.transcript.ends_with("\n\n"), "{:?}", ctx.transcript);
+
+        // stdin 不是终端：没打过提示，也不补
+        let mut p = Piped(Scripted::from([]));
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        assert!(ctx.transcript.ends_with("     [0] 退出\n"));
+        assert!(!ctx.transcript.ends_with("\n\n"), "{:?}", ctx.transcript);
+    }
+
+    /// 已经被关掉的 stdout（`bui-c list | head -1`）：每次写都 BrokenPipe，记下被写了几次。
+    struct ClosedPipe(usize);
+    impl std::io::Write for ClosedPipe {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            self.0 += 1;
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn flush_swallows_a_broken_pipe_and_stops_writing() {
+        let pp = paths();
+        let s = FakeSys::new();
+        let n = FakeNet::new();
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        let mut w = ClosedPipe(0);
+        ctx.say("第一行");
+        ctx.flush_into(&mut w); // 以前的 print! 在这里 panic（退出码 101）
+        assert!(ctx.stdout_closed, "记下 stdout 已关");
+        assert!(ctx.out.is_empty());
+        ctx.say("第二行");
+        ctx.flush_into(&mut w);
+        assert_eq!(w.0, 1, "关掉之后不再尝试写");
+        assert!(ctx.transcript.contains("第二行"));
+    }
+
+    #[test]
+    fn menu_loop_ends_quietly_once_stdout_is_closed() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        profiles_socks().save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        let mut p = Scripted::from(["2", "y", "0"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        ctx.stdout_closed = true;
+        menu_loop(&mut ctx).unwrap();
+        assert_eq!(
+            Profiles::load(&s, &pp).unwrap().mode,
+            Mode::Socks,
+            "没人看得到输出，不该接着执行菜单命令"
+        );
+        assert!(p.asked.is_empty(), "{:?}", p.asked);
+    }
+
+    #[test]
+    fn errors_go_to_stderr_and_stdout_keeps_only_normal_output() {
+        let pp = paths();
+        let s = FakeSys::new();
+        let n = FakeNet::new();
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        ctx.say("正常输出");
+        let mut err = Vec::new();
+        let rc = finish(&mut ctx, Err(Error::msg("节点 nope 不存在")), &mut err);
+        assert_eq!(String::from_utf8(err).unwrap(), "错误：节点 nope 不存在\n");
+        assert!(
+            !ctx.transcript.contains("错误"),
+            "stdout 只放正常输出：{}",
+            ctx.transcript
+        );
+        assert_eq!(rc, std::process::ExitCode::FAILURE);
+
+        let mut err = Vec::new();
+        assert_eq!(
+            finish(&mut ctx, Ok(()), &mut err),
+            std::process::ExitCode::SUCCESS
+        );
+        assert!(err.is_empty());
     }
 
     #[test]
