@@ -120,11 +120,20 @@ Cargo workspace：
 
 四个内核都是从各自 GitHub Releases 下载的静态二进制（sha256 校验），放 `/opt/b-ui/bin/`；不再调用 `get.hy2.sh` / Xray-install / 发行版包，不再装 Node.js。sing-box 上限 1.14（v2rayN 7.25 封顶）。
 
-### 3.2 Hysteria2 鉴权：`auth.type: command`
+### 3.2 Hysteria2 鉴权：默认 `auth.type: http`，`command` 为退路开关
 
-`config.yaml`：`auth: { type: command, command: /opt/b-ui/bin/bui auth-hook }`。内核对**每条新 QUIC 连接调用一次** `bui auth-hook <addr> <auth> <tx>`（无环境变量、stdin 为空；`auth` 是客户端 `hysteria2://user:pass@` 里的 `user:pass` 原串，钩子按第一个 `:` 拆分用户名与密码；调研 H1–H7）。钩子读 `/opt/b-ui/auth-snapshot.json`（600，守护进程在用户变更时原子重写；内容 = 用户名 → HY2 密码、`user_id`、到期时间、是否超限），常量时间比对，放行则 stdout 打印 `user_id` 并退出 0——**该字符串就是 `/traffic`、`/online`、`/kick` 的键**。不放行：到期、超限、禁用、不存在、快照读取失败或超时（fail-closed）。内核对钩子**不设超时、不限流**（H8/H9）：钩子自设 ≤ 2 秒硬超时；`auth-hook` 子命令走极简路径（不初始化 tokio/tracing/不加载 state，只读快照一个小文件）；stderr 不会进 `hysteria-server` 的 journal（H5），诊断日志由钩子自写 `/opt/b-ui/auth-hook.log`（按大小轮转，只记用户名与结果，不记密码）。
-- 效果：增删用户、到期、超限在建连时生效，内核不重启；无面板 SPOF。
-- 代价：每次建连 fork 一个静态二进制（毫秒级）。M5 压测 200 建连/秒 p99 < 20ms，同时记录 PID/fd 峰值；不达标的退路是改回 `userpass` + 内容比对重启（v3.6.0 行为；Hysteria2 无 SIGHUP/热加载，用户表变更只能重启，H14），此退路必须在 M3 就以配置开关实现好。
+**默认（2026-09-13 主理人裁决）**：`auth: { type: http, http: { url: "http://127.0.0.1:18789/auth", insecure: false } }`。内核对每条新 QUIC 连接 POST 一次 `{"addr": "…", "auth": "user:pass", "tx": 0}`，`bui` 守护进程**进程内**应答 `{"ok": true, "id": "<user_id>"}` / `{"ok": false}`（`id` 就是 `/traffic`、`/online`、`/kick` 的键）。改默认的理由：bwg-rick 压测 200 登录/秒 p99 37ms，判据是 < 20ms，瓶颈是 `command` 每次登录 fork 一个进程（≈15ms 固定开销）。
+
+- **监听面**：`127.0.0.1:18789` 是**独立**的监听（`bui_schema::render::hysteria::AUTH_HTTP_PORT`），不挂在面板端口上 —— 面板经 Caddy 对外，挂上去等于把鉴权面暴露到公网。只有 `POST /auth` 一条路由，服务端自设 1 秒超时。
+- **判定与数据源**：与钩子同一份 `auth_hook::decide`（按第一个 `:` 拆 `user:pass`、常量时间比对密码、`blocked`、`expires_at`；调研 H1–H7）。数据源是守护进程内存里的鉴权快照，与 `auth-snapshot.json` **同源**（都是 `Snapshot::from_state(state, blocked)`），在 `StateChanged` 时刷新、另有 60 秒安全网，请求路径上**不读盘**。
+- **fail-closed**：请求解析不了、快照还没刷过、判定超时、任何内部错误 ⇒ `{"ok": false}`；守护进程没在听 ⇒ 内核侧全员拒绝。日志仍由 `auth-hook.log`（0600，按大小原地截断）承担，格式不变：`<RFC3339> <addr> <用户名> <结果>`，**不记密码**，两条鉴权路径写出来的逐字相同。
+- **哨兵**：watchdog 每轮读两个 hysteria 单元的 journal，同一轮里「鉴权请求 connection refused / 超时」≥ 3 条就检查守护进程是否还在听 18789 并记一条事件到 `runtime.extra.hy2_auth_http`（同单元 10 分钟冷却）。**只报不改**：`b-ui.service` 由 systemd `Restart=always` 拉起，watchdog 再去重启它只会打断正在收敛的那一轮对账。
+
+**退路开关**：`bui set hy2-auth command` 切回 `auth: { type: command, command: /opt/b-ui/bin/bui-auth-hook }`（`bui set hy2-auth http` 切回来）。内核对每条新连接 `exec.Command(a.Cmd, addr, auth, tx)`，不过 shell、不拆空格，所以 `auth.command` 只能是一个不带参数的可执行路径（`bin/bui-auth-hook` 是 `bin/bui` 的符号链接，按 argv[0] 分发；调研 H15）。钩子读 `/opt/b-ui/auth-snapshot.json`（600），自设 ≤ 2 秒硬超时，走极简路径（不初始化 tokio/tracing、不加载 state）；内核对钩子不设超时也不限流（H8/H9），stderr 不进 journal（H5）。
+
+- 开关落在 `state.system.hy2_auth`（`"http" | "command"`，serde default = `http`；**旧 state 缺字段就是 http**）。改它 ⇒ 对账重渲染两份 hysteria 配置 ⇒ 两个实例**各重启一次**，重启窗口内既有连接断开、客户端自动重连（`import-v3` 与既有安装升级到本版时同样吃这一次重启）。`bui status` 打印当前模式。
+- 效果（两种模式相同）：增删用户、到期、超限在建连时生效，内核不重启；无面板 SPOF。
+- 代价：http 模式下守护进程是鉴权的必经之路（它挂了 = 新连接全拒，既有连接不受影响）；command 模式下每次建连 fork 一个静态二进制。M5 压测判据不变：200 建连/秒 p99 < 20ms（`scripts/ops/authhttp-bench.py` 打 http 面，`scripts/ops/authhook-bench.sh` 打钩子面，两者产物同格式，`scripts/ops/authhook-report.sh` 都读得懂）。
 - 密码以明文存 state 与快照（v3 的 `config.yaml` 本来就是明文，订阅也需要明文）；文件 600，日志脱敏。
 
 ### 3.3 Xray 用户与统计走 gRPC
@@ -357,7 +366,7 @@ tonic 客户端，proto 从 Xray-core `v26.3.27` vendor 进仓（以仓库根为
 
 | 项 | 裁决 |
 |---|---|
-| Hysteria2 `auth.type: command` | 可用：`<addr> <auth> <tx>`，stdout id，exit 0；无超时/无限流/无热加载 → 钩子自设超时 + 极简路径 + 自写日志；`userpass` 退路开关 M3 实现 |
+| Hysteria2 `auth.type: command` | 可用：`<addr> <auth> <tx>`，stdout id，exit 0；无超时/无限流/无热加载 → 钩子自设超时 + 极简路径 + 自写日志。**2026-09-13 改判**：因 fork 开销压测不达标（p99 37ms），默认改 `auth.type: http` 由守护进程进程内应答，本条退化为 `bui set hy2-auth command` 的退路开关（见 §3.2） |
 | sing-box `auth_user` / `port_range` 取反 | 1.12–1.14 三版一致可用；`sing-box check` 严格校验可作生成器门槛；`resi-pool` 必须 `interrupt_exist_connections: false` |
 | Xray gRPC proto 与 `QueryStats(reset)` | 可用：10 个 proto vendor；`reset` 单计数器原子；`RemoveUser` 不断既有连接是上游缺口，§4.2 已明写接受该窗口 |
 

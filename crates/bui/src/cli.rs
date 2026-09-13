@@ -110,10 +110,26 @@ pub enum Command {
         #[command(subcommand)]
         cmd: crate::modules::residential::cli::ResidentialCmd,
     },
+    /// 改一项系统开关（`bui set <项> <值>`）
+    Set {
+        #[command(subcommand)]
+        cmd: SetCmd,
+    },
     /// 数字菜单（sudo b-ui 的符号链接目标）
     Menu,
     /// 只做 SSH 硬化
     HardenSsh,
+}
+
+/// `bui set` 的子命令。
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum SetCmd {
+    /// Hysteria2 鉴权方式：`http`（默认，守护进程进程内应答）/ `command`（退路，每条连接 fork 钩子）。
+    /// 改完会重渲染两份 hysteria 配置并各重启一次实例。
+    Hy2Auth {
+        #[arg(value_parser = ["http", "command"])]
+        mode: String,
+    },
 }
 
 /// `/usr/local/bin/b-ui` 这个符号链接裸跑时进菜单（spec §1、§2.4）。
@@ -337,6 +353,25 @@ mod tests {
                 args: vec!["alice".into(), "pw".into()]
             })
         );
+    }
+
+    /// `bui set hy2-auth http|command`（2026-09-13 裁决的退路开关）。别的值必须被 clap 挡掉：
+    /// 写错一个字就意味着两份 hysteria 配置里出现一个内核不认识的 `auth.type`。
+    #[test]
+    fn parses_the_hy2_auth_switch_and_rejects_anything_else() {
+        for mode in ["http", "command"] {
+            assert_eq!(
+                Cli::try_parse_from(["bui", "set", "hy2-auth", mode])
+                    .unwrap()
+                    .command,
+                Some(Command::Set {
+                    cmd: SetCmd::Hy2Auth { mode: mode.into() }
+                })
+            );
+        }
+        assert!(Cli::try_parse_from(["bui", "set", "hy2-auth", "userpass"]).is_err());
+        assert!(Cli::try_parse_from(["bui", "set", "hy2-auth"]).is_err());
+        assert!(Cli::try_parse_from(["bui", "set"]).is_err());
     }
 
     #[test]

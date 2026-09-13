@@ -145,7 +145,7 @@ impl Module for CoreFilesModule {
         out.push(
             Artifact::file(
                 p.base_dir.join("config.yaml"),
-                bui_schema::render::hysteria::direct_yaml(&s.node, p),
+                bui_schema::render::hysteria::direct_yaml(&s.node, p, s.system.hy2_auth),
             )
             .restart(Unit::restart("hysteria-server")),
         );
@@ -156,7 +156,12 @@ impl Module for CoreFilesModule {
             out.push(
                 Artifact::file(
                     resi_config_path(p, i),
-                    bui_schema::render::hysteria::residential_slot_yaml(&s.node, p, &res),
+                    bui_schema::render::hysteria::residential_slot_yaml(
+                        &s.node,
+                        p,
+                        &res,
+                        s.system.hy2_auth,
+                    ),
                 )
                 .restart(Unit::restart(&crate::reconcile::resi_unit(i))),
             );
@@ -350,7 +355,11 @@ mod tests {
     fn hysteria_files_carry_the_schema_output_and_the_right_restart() {
         let s = sample_state();
         let arts = CoreFilesModule::new(None).render(&s, &ctx());
-        let expect = bui_schema::render::hysteria::direct_yaml(&s.node, &Paths::default_server());
+        let expect = bui_schema::render::hysteria::direct_yaml(
+            &s.node,
+            &Paths::default_server(),
+            s.system.hy2_auth,
+        );
         match find_file(&arts, "/opt/b-ui/config.yaml") {
             Artifact::File {
                 content,
@@ -382,12 +391,42 @@ mod tests {
                     String::from_utf8(content).unwrap(),
                     bui_schema::render::hysteria::residential_yaml(
                         &s.node,
-                        &Paths::default_server()
+                        &Paths::default_server(),
+                        s.system.hy2_auth,
                     )
                 );
                 assert_eq!(restart, Some(Unit::restart("hysteria-residential")));
             }
             other => panic!("{other:?}"),
+        }
+    }
+
+    /// `state.system.hy2_auth` 是两份 hysteria 配置里 `auth` 段的唯一来源（2026-09-13 裁决）：
+    /// 默认 http，切成 command 时两份都跟着变，于是对账各重启一次实例。
+    #[test]
+    fn the_auth_mode_from_state_reaches_both_hysteria_configs() {
+        let text = |s: &State, path: &str| match find_file(
+            &CoreFilesModule::new(None).render(s, &ctx()),
+            path,
+        ) {
+            Artifact::File { content, .. } => String::from_utf8(content).unwrap(),
+            other => panic!("{other:?}"),
+        };
+        let mut s = sample_state();
+        assert_eq!(s.system.hy2_auth, bui_schema::model::Hy2Auth::Http);
+        for p in ["/opt/b-ui/config.yaml", "/opt/b-ui/config-residential.yaml"] {
+            let t = text(&s, p);
+            assert!(t.contains("url: http://127.0.0.1:18789/auth"), "{p}:\n{t}");
+            assert!(!t.contains("bui-auth-hook"), "{p}:\n{t}");
+        }
+        s.system.hy2_auth = bui_schema::model::Hy2Auth::Command;
+        for p in ["/opt/b-ui/config.yaml", "/opt/b-ui/config-residential.yaml"] {
+            let t = text(&s, p);
+            assert!(
+                t.contains("command: /opt/b-ui/bin/bui-auth-hook"),
+                "{p}:\n{t}"
+            );
+            assert!(!t.contains("18789"), "{p}:\n{t}");
         }
     }
 
@@ -700,6 +739,7 @@ mod tests {
                 &s.node,
                 &p,
                 &bui_schema::slots::resources_of(&s.node.ports, &s.residential, i),
+                s.system.hy2_auth,
             );
             let path = crate::modules::core_files::resi_config_path(&p, i);
             match find_file(&arts, path.to_str().unwrap()) {

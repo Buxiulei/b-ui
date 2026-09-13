@@ -9,12 +9,16 @@ use crate::state::runtime::Runtime;
 use crate::state::store::Store;
 use crate::sys::Host;
 use anyhow::Result;
+use bui_schema::model::Hy2Auth;
 use bui_schema::paths::Paths;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 /// 把 `/api/health` 渲染成人读文本。
-pub fn format_status(h: &HealthResponse) -> String {
+///
+/// `hy2_auth` 单独传：`/api/health` 里没有这一位（P2 的 `HealthResponse` 是回归锁死的形状），
+/// 而运维在排「谁都登不上」时第一件要看的就是当前走的是 http 还是 command。
+pub fn format_status(h: &HealthResponse, hy2_auth: Hy2Auth) -> String {
     let mut out = vec![format!(
         "b-ui v{} @ {}     状态: {}     运行: {}",
         h.version,
@@ -44,6 +48,13 @@ pub fn format_status(h: &HealthResponse) -> String {
             width = width
         ));
     }
+    out.push(format!(
+        "鉴权模式    Hysteria2 {}",
+        match hy2_auth {
+            Hy2Auth::Http => "auth.type=http（守护进程进程内应答）",
+            Hy2Auth::Command => "auth.type=command（钩子 bin/bui-auth-hook，退路）",
+        }
+    ));
     if let Some(r) = &h.reconcile {
         out.push(format!(
             "上次对账    {}  变更 {} 项{}",
@@ -95,10 +106,16 @@ pub async fn run_with(
             local_health(&paths, host).await?
         }
     };
+    // 鉴权模式读期望态：守护进程在不在跑都读得到，`--json` 那一支不动
+    // （`HealthResponse` 的形状是 P2 锁死的回归面）。
+    let hy2_auth = match Store::open(crate::paths::state_file(&paths)).await {
+        Ok(store) => store.read().await.system.hy2_auth,
+        Err(_) => Hy2Auth::default(),
+    };
     if json {
         println!("{}", serde_json::to_string_pretty(&health)?);
     } else {
-        println!("{}", format_status(&health));
+        println!("{}", format_status(&health, hy2_auth));
     }
     Ok(())
 }
@@ -230,7 +247,7 @@ mod tests {
 
     #[test]
     fn status_text_shows_units_uptime_errors_and_drift() {
-        let t = format_status(&sample());
+        let t = format_status(&sample(), Hy2Auth::Http);
         assert!(t.contains("node-a"));
         assert!(t.contains("4.0.0"));
         assert!(t.contains("1h 2m"), "uptime 要人读得懂：{t}");
@@ -250,13 +267,27 @@ mod tests {
     fn a_same_version_rebuild_is_reported_as_a_new_build() {
         let mut h = sample();
         h.upgrade_available = Some(h.version.clone());
-        let t = format_status(&h);
+        let t = format_status(&h, Hy2Auth::Http);
         assert!(t.contains("同版本的新构建"), "{t}");
         assert!(t.contains("bui upgrade"), "要说清下一步怎么做：{t}");
         assert!(
             !t.contains("4.0.0 可用"),
             "别报成「新版本 4.0.0 可用」：{t}"
         );
+    }
+
+    /// 排「谁都登不上」时第一眼要看的就是这一行（2026-09-13 裁决：默认 http，command 是退路）。
+    #[test]
+    fn status_text_names_the_current_hysteria_auth_mode() {
+        let t = format_status(&sample(), Hy2Auth::Http);
+        assert!(
+            t.contains("鉴权模式") && t.contains("auth.type=http"),
+            "{t}"
+        );
+        assert!(!t.contains("auth.type=command"), "{t}");
+        let t = format_status(&sample(), Hy2Auth::Command);
+        assert!(t.contains("auth.type=command") && t.contains("退路"), "{t}");
+        assert!(!t.contains("auth.type=http"), "{t}");
     }
 
     #[test]
@@ -267,7 +298,7 @@ mod tests {
         h.reconcile = None;
         h.drift.clear();
         h.upgrade_available = None;
-        let t = format_status(&h);
+        let t = format_status(&h, Hy2Auth::Http);
         assert!(t.contains("无漂移"));
         assert!(!t.contains("重启失败"));
         assert!(!t.contains("4.0.1"));

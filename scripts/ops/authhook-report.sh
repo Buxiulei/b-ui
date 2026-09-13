@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # 判读 auth-hook 压测结果：延迟分位、失败数、实际速率、fd/进程峰值。纯 sort + awk。
+# 同样读得懂 authhttp-bench.py（auth.type=http 那条路径）的产物：两者的 lat-*.csv 与 DONE
+# 是同一套格式。http 压测不采 watch.csv，那三个峰值会报 0。
 set -uo pipefail
 LC_ALL=C
 

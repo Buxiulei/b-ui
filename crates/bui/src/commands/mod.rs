@@ -1,4 +1,5 @@
 //! 子命令实现。
+pub mod config;
 pub mod harden_ssh;
 pub mod import_v3;
 pub mod install;

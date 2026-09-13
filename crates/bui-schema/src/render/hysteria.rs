@@ -1,19 +1,31 @@
 //! Hysteria2 两个实例的配置渲染（模板移植自 v3 `server/core.sh:527-580` 直连、`595-660` 住宅）。
 //!
-//! 与 v3 的差别：`auth` 段从 `http` / `userpass` 改为 `command`（钩子 `bin/bui-auth-hook`，见 spec §3.2）；
-//! `masquerade.proxy.url` 由 REALITY 伪装域推导；`obfs` 段只在启用时输出。
-use crate::model::NodeParams;
+//! `auth` 段有两种形态（spec §3.2，2026-09-13 裁决）：默认 [`Hy2Auth::Http`] 指向守护进程
+//! 自己监听的 [`AUTH_HTTP_PORT`]（进程内应答，不 fork）；[`Hy2Auth::Command`] 是退路开关，
+//! 回到钩子 `bin/bui-auth-hook`。`masquerade.proxy.url` 由 REALITY 伪装域推导；
+//! `obfs` 段只在启用时输出。
+use crate::model::{Hy2Auth, NodeParams};
 use crate::paths::Paths;
 use crate::slots::{self, SlotRes};
 use serde_yaml::{Mapping, Value};
 
+/// 守护进程的鉴权端口：**只监听 127.0.0.1**，不挂在面板端口上（面板经 Caddy 对外，
+/// 鉴权面不能跟着暴露）。选 18789 是为了避开已占用的 8080 / 9991–9999 / 10001 /
+/// 10002 / 10085 / 2080+ 与住宅跳跃段 41000–50000。
+pub const AUTH_HTTP_PORT: u16 = 18789;
+
+/// 写进两份配置的 `auth.http.url`。
+pub fn auth_http_url() -> String {
+    format!("http://127.0.0.1:{AUTH_HTTP_PORT}/auth")
+}
+
 /// 直连实例 `config.yaml`。
-pub fn direct_yaml(node: &NodeParams, paths: &Paths) -> String {
+pub fn direct_yaml(node: &NodeParams, paths: &Paths, auth: Hy2Auth) -> String {
     let listen = match node.ports.hy2_hop {
         Some((start, end)) => format!(":{},{}-{}", node.ports.hy2, start, end),
         None => format!(":{}", node.ports.hy2),
     };
-    let mut doc = common_doc(node, paths, &listen, 9999);
+    let mut doc = common_doc(node, paths, &listen, 9999, auth);
     doc.insert(
         key("outbounds"),
         Value::Sequence(vec![Value::Mapping(direct_outbound())]),
@@ -27,9 +39,14 @@ pub fn direct_yaml(node: &NodeParams, paths: &Paths) -> String {
 /// 每个槽一个实例（spec §5.6）：监听 `:{hy2_port},{hop.0}-{hop.1}`，出站
 /// `127.0.0.1:{relay_port}`，`trafficStats` 监听 `127.0.0.1:{stats_port}`。
 /// 端口全部来自 [`SlotRes`]，本函数不自己算任何端口。
-pub fn residential_slot_yaml(node: &NodeParams, paths: &Paths, res: &SlotRes) -> String {
+pub fn residential_slot_yaml(
+    node: &NodeParams,
+    paths: &Paths,
+    res: &SlotRes,
+    auth: Hy2Auth,
+) -> String {
     let listen = format!(":{},{}-{}", res.hy2_port, res.hop.0, res.hop.1);
-    let mut doc = common_doc(node, paths, &listen, res.stats_port);
+    let mut doc = common_doc(node, paths, &listen, res.stats_port, auth);
 
     let mut relay = Mapping::new();
     relay.insert(key("name"), str_val("relay"));
@@ -61,12 +78,18 @@ pub fn residential_slot_yaml(node: &NodeParams, paths: &Paths, res: &SlotRes) ->
 
 /// 单槽（槽 0）的住宅配置。保留这个签名给 golden 与 `import-v3`：
 /// 池空 / 只有一条上游时，输出与 v3 单实例逐字节相同。
-pub fn residential_yaml(node: &NodeParams, paths: &Paths) -> String {
-    residential_slot_yaml(node, paths, &slots::resources(&node.ports, 0, 1))
+pub fn residential_yaml(node: &NodeParams, paths: &Paths, auth: Hy2Auth) -> String {
+    residential_slot_yaml(node, paths, &slots::resources(&node.ports, 0, 1), auth)
 }
 
 /// 两个实例共有的字段（顺序按 v3 模板）。
-fn common_doc(node: &NodeParams, paths: &Paths, listen: &str, traffic_port: u16) -> Mapping {
+fn common_doc(
+    node: &NodeParams,
+    paths: &Paths,
+    listen: &str,
+    traffic_port: u16,
+    auth: Hy2Auth,
+) -> Mapping {
     let certs = paths.certs_dir.display();
     let mut doc = Mapping::new();
     doc.insert(key("listen"), str_val(listen));
@@ -93,16 +116,7 @@ fn common_doc(node: &NodeParams, paths: &Paths, listen: &str, traffic_port: u16)
             ),
         ]),
     );
-    doc.insert(
-        key("auth"),
-        map(vec![
-            ("type", str_val("command")),
-            // 必须是**单个不带参数**的可执行路径：内核 `exec.Command(a.Cmd, addr, auth, tx)`
-            // 不过 shell、不按空格拆参数（调研 H15）。`bin/bui-auth-hook` 是 `bin/bui` 的
-            // 符号链接，`bui` 按 argv[0] 认出这个名字就直接进钩子。
-            ("command", str_val(&paths.auth_hook_bin().to_string_lossy())),
-        ]),
-    );
+    doc.insert(key("auth"), auth_section(paths, auth));
     doc.insert(
         key("trafficStats"),
         map(vec![
@@ -134,6 +148,31 @@ fn common_doc(node: &NodeParams, paths: &Paths, listen: &str, traffic_port: u16)
         ]),
     );
     doc
+}
+
+/// `auth` 段：http 模式指向守护进程的回环端口，command 模式回到钩子。
+///
+/// command 那一支的 `command` 必须是**单个不带参数**的可执行路径：内核
+/// `exec.Command(a.Cmd, addr, auth, tx)` 不过 shell、不按空格拆参数（调研 H15）。
+/// `bin/bui-auth-hook` 是 `bin/bui` 的符号链接，`bui` 按 argv[0] 认出这个名字就直接进钩子。
+fn auth_section(paths: &Paths, auth: Hy2Auth) -> Value {
+    match auth {
+        Hy2Auth::Http => map(vec![
+            ("type", str_val("http")),
+            (
+                "http",
+                map(vec![
+                    ("url", str_val(&auth_http_url())),
+                    // 明文回环，没有证书可校验；写 false 是为了让这一位在配置里显式可见
+                    ("insecure", Value::Bool(false)),
+                ]),
+            ),
+        ]),
+        Hy2Auth::Command => map(vec![
+            ("type", str_val("command")),
+            ("command", str_val(&paths.auth_hook_bin().to_string_lossy())),
+        ]),
+    }
 }
 
 /// 内置 direct 出站，`mode: 4` = 只拨 IPv4（VPS 无 IPv6 出口）。
@@ -205,10 +244,10 @@ mod tests {
         let (n, p) = (node(), Paths::default_server());
         let one = slots::resources(&n.ports, 0, 1);
         assert_eq!(
-            residential_slot_yaml(&n, &p, &one),
-            residential_yaml(&n, &p)
+            residential_slot_yaml(&n, &p, &one, Hy2Auth::Http),
+            residential_yaml(&n, &p, Hy2Auth::Http)
         );
-        let text = residential_yaml(&n, &p);
+        let text = residential_yaml(&n, &p, Hy2Auth::Http);
         // serde_yaml 对 `:40000,…` 这种以冒号开头的标量不加引号，原样输出
         assert!(
             text.lines().any(|l| l == "listen: :40000,41000-50000"),
@@ -222,7 +261,9 @@ mod tests {
     fn each_slot_gets_its_own_listen_relay_and_stats_port() {
         let (n, p) = (node(), Paths::default_server());
         let texts: Vec<String> = (0..3)
-            .map(|i| residential_slot_yaml(&n, &p, &slots::resources(&n.ports, i, 3)))
+            .map(|i| {
+                residential_slot_yaml(&n, &p, &slots::resources(&n.ports, i, 3), Hy2Auth::Command)
+            })
             .collect();
         let listen = |t: &str| -> String {
             t.lines()
@@ -246,5 +287,57 @@ mod tests {
             assert!(t.contains("relay(all)"));
             assert!(t.contains("/opt/b-ui/bin/bui-auth-hook"));
         }
+    }
+
+    /// 两种鉴权模式各自的 `auth` 段（2026-09-13 裁决）。http 是默认，command 是退路：
+    /// 切模式**只能**改这一段，别的字段一个字都不许动（否则切换会顺带重排端口/伪装）。
+    #[test]
+    fn the_auth_section_is_the_only_difference_between_the_two_modes() {
+        let (n, p) = (node(), Paths::default_server());
+        for text in [
+            direct_yaml(&n, &p, Hy2Auth::Http),
+            residential_yaml(&n, &p, Hy2Auth::Http),
+        ] {
+            let y: Value = serde_yaml::from_str(&text).unwrap();
+            assert_eq!(y["auth"]["type"].as_str(), Some("http"));
+            assert_eq!(
+                y["auth"]["http"]["url"].as_str(),
+                Some("http://127.0.0.1:18789/auth")
+            );
+            assert_eq!(y["auth"]["http"]["insecure"].as_bool(), Some(false));
+            assert!(y["auth"].get("command").is_none());
+        }
+        for text in [
+            direct_yaml(&n, &p, Hy2Auth::Command),
+            residential_yaml(&n, &p, Hy2Auth::Command),
+        ] {
+            let y: Value = serde_yaml::from_str(&text).unwrap();
+            assert_eq!(y["auth"]["type"].as_str(), Some("command"));
+            assert_eq!(
+                y["auth"]["command"].as_str(),
+                Some("/opt/b-ui/bin/bui-auth-hook")
+            );
+            assert!(y["auth"].get("http").is_none());
+        }
+        // 除 auth 之外逐键相等
+        let mut a: Mapping = serde_yaml::from_str(&direct_yaml(&n, &p, Hy2Auth::Http)).unwrap();
+        let mut b: Mapping = serde_yaml::from_str(&direct_yaml(&n, &p, Hy2Auth::Command)).unwrap();
+        a.remove(key("auth"));
+        b.remove(key("auth"));
+        assert_eq!(a, b);
+    }
+
+    /// 端口是常量，且必须避开已被占用的那些（改了它就要同步改守护进程的监听与文档）。
+    #[test]
+    fn the_auth_http_port_avoids_every_other_listener() {
+        assert_eq!(AUTH_HTTP_PORT, 18789);
+        assert_eq!(auth_http_url(), "http://127.0.0.1:18789/auth");
+        for taken in [8080u16, 9991, 9998, 9999, 10001, 10002, 10085, 2080, 2087] {
+            assert_ne!(AUTH_HTTP_PORT, taken);
+        }
+        assert!(
+            !(41000..=50000).contains(&AUTH_HTTP_PORT),
+            "不能落进住宅跳跃段"
+        );
     }
 }

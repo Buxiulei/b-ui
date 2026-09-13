@@ -1,5 +1,6 @@
 //! P2 面板与用户域：管理员 API、订阅与节点端点、嵌入前端、`/packages`、
-//! 采样与限额、`auth-snapshot.json`、Xray gRPC、`bui auth-hook`。
+//! 采样与限额、`auth-snapshot.json`、Xray gRPC、两条 Hysteria2 鉴权路径
+//! （默认 `auth_http` 的进程内应答，退路 `auth_hook` 的 `bui auth-hook`）。
 //!
 //! 对 P1 只暴露一个 [`PanelModule`]（`reconcile::Module` 的实现）。
 //!
@@ -12,6 +13,7 @@ pub mod api_me;
 pub mod api_public;
 pub mod assets;
 pub mod auth_hook;
+pub mod auth_http;
 pub mod hy2;
 pub mod packages;
 pub mod snapshot;

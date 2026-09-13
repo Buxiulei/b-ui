@@ -425,6 +425,48 @@ pub struct AutoEntry {
     pub passes: u32,
 }
 
+/// Hysteria2 的鉴权方式（2026-09-13 主理人裁决：默认 `http`，`command` 留作退路开关）。
+///
+/// - [`Hy2Auth::Http`]：内核 POST 到 `http://127.0.0.1:<AUTH_PORT>/auth`，由 `bui` 守护进程
+///   **进程内**应答（`render::hysteria::AUTH_HTTP_PORT`）。
+/// - [`Hy2Auth::Command`]：内核对每条新 QUIC 连接 fork 一次 `bin/bui-auth-hook`（v4 原行为）。
+///
+/// 旧 `state.json` 缺这个字段 ⇒ `http`（`#[serde(default)]` + [`Default`]）。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Hy2Auth {
+    #[default]
+    Http,
+    Command,
+}
+
+impl Hy2Auth {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Hy2Auth::Http => "http",
+            Hy2Auth::Command => "command",
+        }
+    }
+}
+
+impl std::fmt::Display for Hy2Auth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Hy2Auth {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "http" => Ok(Hy2Auth::Http),
+            "command" => Ok(Hy2Auth::Command),
+            other => Err(format!("鉴权方式只能是 http 或 command，收到 {other}")),
+        }
+    }
+}
+
 /// 系统级硬化开关。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SystemSettings {
@@ -436,6 +478,9 @@ pub struct SystemSettings {
     pub sysctl_profile: String,
     #[serde(default = "default_auto")]
     pub firewall: String,
+    /// Hysteria2 鉴权方式（默认 http；旧 state 缺字段就是 http）
+    #[serde(default)]
+    pub hy2_auth: Hy2Auth,
 }
 
 fn default_auto() -> String {
@@ -449,6 +494,7 @@ impl Default for SystemSettings {
             static_dns: true,
             sysctl_profile: "auto".into(),
             firewall: "auto".into(),
+            hy2_auth: Hy2Auth::Http,
         }
     }
 }
@@ -519,7 +565,7 @@ mod tests {
                         "blacklist": { "pins": [ { "rule": { "kind": "domain_suffix", "value": "pay.google.com" }, "note": "", "created_at": "2026-09-11T00:00:00Z" } ],
                                        "auto": [ { "upstream_id": "8d5a1a1e-3b2c-4d1e-9f00-0000000000bb", "rule": { "kind": "port", "value": 5228 },
                                                    "hits": 5, "confirmed_at": "2026-09-11T00:00:00Z", "last_verified_at": "2026-09-11T00:00:00Z", "passes": 0 } ] } } } },
-      "system": { "ssh_hardening": true, "static_dns": true, "sysctl_profile": "auto", "firewall": "auto" },
+      "system": { "ssh_hardening": true, "static_dns": true, "sysctl_profile": "auto", "firewall": "auto", "hy2_auth": "http" },
       "versions": { "bui": "4.0.0", "hysteria": "2.12.2", "xray": "26.3.27", "sing_box": "1.13.19", "caddy": "2.10.2", "client_sing_box": "1.13.19" },
       "catalog": [ { "sku": "resi-ip-us", "title": "美国住宅 IP", "kind": "residential_ip", "region": "US", "price_minor": 1500, "period_days": 30 } ]
     }"#;
@@ -555,6 +601,26 @@ mod tests {
         assert!(s.residential.groups.contains_key("default"));
         assert_eq!(s.residential.groups["default"].mode, ResiMode::Split);
         assert!(s.system.static_dns);
+    }
+
+    /// 2026-09-13 裁决：Hysteria2 鉴权默认 `http`。旧 `state.json`（含只写了另外四个
+    /// 开关的 `system` 段）读出来必须是 `http`，`command` 只有显式写进去才生效。
+    #[test]
+    fn hy2_auth_defaults_to_http_and_parses_both_modes() {
+        assert_eq!(SystemSettings::default().hy2_auth, Hy2Auth::Http);
+        let old: SystemSettings =
+            serde_json::from_str(r#"{"ssh_hardening":true,"static_dns":true}"#).unwrap();
+        assert_eq!(old.hy2_auth, Hy2Auth::Http, "旧 state 缺字段 ⇒ http");
+        let switched: SystemSettings = serde_json::from_str(r#"{"hy2_auth":"command"}"#).unwrap();
+        assert_eq!(switched.hy2_auth, Hy2Auth::Command);
+        assert_eq!(
+            serde_json::to_value(Hy2Auth::Command).unwrap(),
+            serde_json::json!("command")
+        );
+        assert_eq!("http".parse::<Hy2Auth>().unwrap(), Hy2Auth::Http);
+        assert_eq!("command".parse::<Hy2Auth>().unwrap(), Hy2Auth::Command);
+        assert!("userpass".parse::<Hy2Auth>().is_err());
+        assert_eq!(Hy2Auth::Http.to_string(), "http");
     }
 
     #[test]
