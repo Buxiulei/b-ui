@@ -110,12 +110,14 @@ pub fn plan(
         .active_profile()
         .is_some_and(|a| targets.contains(&a.name))
     {
-        // 剩下的节点非空，所以 default_to 一定给得出一个；真给不出就退到剩下的第一个
-        let to = switch_to
-            .map(str::to_string)
-            .or_else(|| default_to(prof, &targets, None).map(|i| prof.profiles[i].name.clone()))
-            .or_else(|| next.profiles.first().map(|p| p.name.clone()))
-            .unwrap_or_default();
+        // 这一支里 next.profiles 非空（空了就是 Empty），所以 default_to 的 remaining 非空、
+        // 它的 `.or_else(remaining.first())` 必然给得出一个下标。以前这里还垫了两级兜底，
+        // 末级 `unwrap_or_default()` 会造出 `Switch { to: "" }` 与 `active = Some("")`，
+        // 之后 preflight 报「没有激活的节点」，排障要绕一圈；不可达就让它明着炸。
+        let to = switch_to.map(str::to_string).unwrap_or_else(|| {
+            let i = default_to(prof, &targets, None).expect("剩下的节点非空时 default_to 必有值");
+            prof.profiles[i].name.clone()
+        });
         next.active = Some(to.clone());
         PlanKind::Switch { to }
     } else {
@@ -202,12 +204,49 @@ pub fn summary(r: &Report, width: usize) -> String {
     }
 }
 
+/// `bui-c delete` 成功时打的那一句（spec §5.4 命令行那一条）。命令行没有「上次：」行、宽度
+/// 也不紧张，所以说全，不用 [`summary`] 的短式（R6 的短式只管菜单那一行），也不把菜单键
+/// 漏进命令行。名字照 §5.10 末条过 [`menu::sanitize`]。
+///
+/// - Switch：`当前节点已删除，切到 X`（§5.4 逐字）
+/// - Passive：`已删除 N 个节点，还剩 M 个`
+/// - Empty：「已删除全部 N 个节点，代理已停止；用 bui-c import 重新导入」
+pub fn cli_summary(r: &Report) -> String {
+    let n = r.deleted.len();
+    if r.stopped {
+        return format!("已删除全部 {n} 个节点，代理已停止；用 `bui-c import` 重新导入");
+    }
+    match r.active.as_deref().filter(|_| r.switched) {
+        Some(to) => format!("当前节点已删除，切到 {}", menu::sanitize(to)),
+        None => format!("已删除 {n} 个节点，还剩 {} 个", r.remaining),
+    }
+}
+
 /// 锁里重读发现节点列表变了（spec §5.5 第 2 步）。
 pub const SNAPSHOT_CHANGED: &str = "节点列表刚被别处改过，这次什么都没删，请重新选";
+/// 同一件事进「上次：」行时的短式：40 列那一行只有 31 列可用，长句会被尾截、正好砍掉
+/// 「请重新选」这半句可操作的话（spec §0.2 R6）。停顿页上仍打 [`SNAPSHOT_CHANGED`]。
+pub const SNAPSHOT_CHANGED_SHORT: &str = "节点列表刚被别处改过，没有删除";
+/// `profiles.json` 写不进去：Switch（数据面已经切过去，紧接着回滚）与 Passive（数据面
+/// 一点没动）共用的第一行与短摘要。删光那一种另有说法，见 [`STOPPED_NOT_SAVED_HEAD`]。
+pub const SAVE_FAILED: &str = "删除没做：写 profiles.json 失败";
+/// 删光时拆数据面失败的短摘要（页上打的是 `删除没做：{engine 的原因}`，40 列放不下）。
+pub const TEARDOWN_FAILED_SHORT: &str = "删除没做：代理停不下来";
+/// 删光时数据面拆完了、`profiles.json` 却写不进去：这是唯一一种「代理已经不在、节点条目
+/// 还列着」的状态，所以不能沿用 [`STILL_THERE`]（「节点都还在」在这里是错的）。
+pub const STOPPED_NOT_SAVED_HEAD: &str = "代理已经停了，但写 profiles.json 失败";
+/// 承接 [`STOPPED_NOT_SAVED_HEAD`] 的下一步：T12c 的收敛条件「有活动节点但主单元文件不在
+/// → apply」「profiles 为空但单元还在 → teardown」正好覆盖这一状态。
+pub const STOPPED_NOT_SAVED: &str = "节点条目还在，下次进菜单或巡检会按节点列表收拾";
+/// 同一件事进「上次：」行时的短式（40 列只有 31 列可用）。
+pub const STOPPED_NOT_SAVED_SHORT: &str = "删除没做完：代理已停，节点还在";
 /// 失败页的安抚行：数据面根本没动。
 pub const STILL_THERE: &str = "节点都还在";
 /// 失败页的安抚行：动过数据面，已经换回去了。
 pub const ROLLED_BACK: &str = "已换回原来的配置，节点都还在";
+/// 回滚写回了旧配置，但 TUN 还是没起来：R10 对 `apply` 的判据（Err 或 `tun_ready == Some(false)`
+/// 都算失败）同样适用于回滚方向。不说「换回也失败」——配置确实换回去了，只是接口没起来。
+pub const ROLLED_BACK_TUN_DOWN: &str = "已换回原来的配置，但 bui-tun 还是没起来";
 /// 回滚本身也失败（spec §5.5 Switch 那一行）。
 pub const ROLLBACK_FAILED: &str = "换回也失败";
 /// 回滚也失败之后的出路。
@@ -224,6 +263,12 @@ pub const CANCELLED: &str = "已取消，没有删除任何节点";
 pub const NEEDS_YES: &str = "会断网的删除要输入 yes";
 /// 一个节点都没有时不进删除页（spec §5.1）。
 pub const NO_NODES: &str = "没有节点可删";
+/// 命令行的确认块里打了编号（spec §5.10「命令行的确认不认编号，换目标用 `--switch-to`」）：
+/// 按取消处理，但要说清命令行换目标的办法——从菜单养成的习惯是打编号。
+pub const CLI_NO_NUMBER: &str = "命令行不认编号，换目标请加 --switch-to <名字>";
+/// Passive 形态（没删到当前节点）下给了 `--switch-to`：校验照做（名字打错要早报），但它没有
+/// 作用对象。不报用法错误——R15 把退出码 2 严格限定在三种，多一种会让脚本分不清。
+pub const SWITCH_TO_UNUSED: &str = "没有删到当前节点，--switch-to 用不上：当前节点不变";
 
 /// 不在「删完切到」形态时打了编号（spec §5.3 输入表）。会断网的形态（Switch、Empty）要
 /// 输入 `yes`，文案跟着换说法（`needs_word`，spec §0.2 R1）。
@@ -442,6 +487,73 @@ mod tests {
             remaining: 0,
         };
         assert_eq!(summary(&stopped, 40), "已删光节点，按 [3] 导入");
+    }
+
+    /// 命令行说全（spec §5.4），不用「上次：」行的短式，也不把菜单键漏进命令行。
+    #[test]
+    fn the_command_line_summary_spells_it_out_in_all_three_forms() {
+        let passive = Report {
+            deleted: names(&["HY2"]),
+            active: Some(ACTIVE.into()),
+            switched: false,
+            stopped: false,
+            remaining: 8,
+        };
+        assert_eq!(cli_summary(&passive), "已删除 1 个节点，还剩 8 个");
+        let switched = Report {
+            active: Some(RICK_REALITY.into()),
+            switched: true,
+            ..passive.clone()
+        };
+        assert_eq!(
+            cli_summary(&switched),
+            format!("当前节点已删除，切到 {RICK_REALITY}"),
+            "§5.4 逐字"
+        );
+        let stopped = Report {
+            deleted: names(&["a", "b"]),
+            active: None,
+            switched: false,
+            stopped: true,
+            remaining: 0,
+        };
+        let empty = cli_summary(&stopped);
+        assert_eq!(
+            empty,
+            "已删除全部 2 个节点，代理已停止；用 `bui-c import` 重新导入"
+        );
+        assert!(!empty.contains("[3]"), "命令行里没有菜单键：{empty}");
+        // 名字照 §5.10 末条净化
+        let dirty = Report {
+            active: Some("a\u{1b}[31mb".into()),
+            switched: true,
+            ..passive
+        };
+        assert!(!cli_summary(&dirty).contains('\u{1b}'));
+    }
+
+    /// 不带节点名的失败摘要要整句放进 40 列的「上次：」行（spec §0.2 R6）：那一行只有
+    /// `line_limit(40) − 「  上次：」` = 31 列，尾截会正好砍掉可操作的那半句。带名字的三条
+    /// 走 `menu::fit_name_in_last` 中间截断，不在这张表里。
+    #[test]
+    fn the_nameless_failure_summaries_fit_the_40_column_last_line() {
+        let room = menu::line_limit(40) - menu::budget_width("  上次：");
+        assert_eq!(room, 31);
+        for s in [
+            SNAPSHOT_CHANGED_SHORT,
+            SAVE_FAILED,
+            TEARDOWN_FAILED_SHORT,
+            STOPPED_NOT_SAVED_SHORT,
+        ] {
+            let w = menu::budget_width(s);
+            assert!(
+                w <= room,
+                "{s:?} 占 {w} 列，40 列的「上次：」行只有 {room} 列"
+            );
+            assert_eq!(menu::truncate_end(s, room), s, "一个字都不该被截掉");
+        }
+        // 长句自己会被砍掉句尾——这就是要另配短式的原因
+        assert!(menu::truncate_end(SNAPSHOT_CHANGED, room).ends_with('…'));
     }
 
     #[test]

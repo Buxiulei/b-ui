@@ -2377,6 +2377,25 @@ mod tests {
                 delete::STILL_THERE.to_string(),
             ],
             vec![delete::SNAPSHOT_CHANGED.to_string()],
+            // 回滚写回了旧配置、接口还是没起来（R10 的判据在回滚方向一样算数）
+            vec![
+                format!("删除没做：切到 {victim} 失败"),
+                "bui-tun 接口 5 秒内没起来".to_string(),
+                delete::ROLLED_BACK_TUN_DOWN.to_string(),
+                delete::ROLLBACK_NEXT.to_string(),
+            ],
+            // 删光：数据面拆完了、profiles 写不进去（代理已停、条目还在）
+            vec![
+                delete::STOPPED_NOT_SAVED_HEAD.to_string(),
+                "读写 /opt/bui-c/profiles.json 失败：permission denied".to_string(),
+                delete::STOPPED_NOT_SAVED.to_string(),
+            ],
+            // Passive：数据面没动过，写盘失败也给页
+            vec![
+                delete::SAVE_FAILED.to_string(),
+                "读写 /opt/bui-c/profiles.json 失败：permission denied".to_string(),
+                delete::STILL_THERE.to_string(),
+            ],
         ];
         for p in &pages {
             out.push(("delete-failed", delete::page(p, width)));
@@ -2396,8 +2415,43 @@ mod tests {
             SelError::Junk("a".to_string()).message(9),
             SelError::Reversed("5-3".to_string()).message(9),
             SelError::ZeroMixed.message(9),
+            delete::CLI_NO_NUMBER.to_string(),
+            delete::SWITCH_TO_UNUSED.to_string(),
+            // `bui-c delete` 成功那一句（三形态）：命令行由终端自己折行，收进这张表只为守住
+            // 字符归类与「折得开」，屏上排版以菜单那几行为准
+            delete::cli_summary(&delete::Report {
+                deleted: vec!["HY2".to_string()],
+                active: Some(victim.to_string()),
+                switched: true,
+                stopped: false,
+                remaining: 7,
+            }),
+            delete::cli_summary(&delete::Report {
+                deleted: vec!["HY2".to_string()],
+                active: Some("hysteria2-1778329470".to_string()),
+                switched: false,
+                stopped: false,
+                remaining: 8,
+            }),
+            delete::cli_summary(&delete::Report {
+                deleted: vec!["HY2".to_string()],
+                active: None,
+                switched: false,
+                stopped: true,
+                remaining: 0,
+            }),
         ] {
             out.push(("delete-line", delete::page(&[line], width)));
+        }
+        // 失败时进「上次：」行的短摘要：不带节点名的几条要整句放下，尾截会砍掉可操作的那
+        // 半句（spec §0.2 R6；`delete::tests` 里另有一条不许被截的断言）
+        for last in [
+            delete::SNAPSHOT_CHANGED_SHORT,
+            delete::SAVE_FAILED,
+            delete::TEARDOWN_FAILED_SHORT,
+            delete::STOPPED_NOT_SAVED_SHORT,
+        ] {
+            out.push(("delete-last-failed", render(&st(), width, Some(last))));
         }
         // 删除后的「上次：」行：三种形态，名字单独中间截断（R6）
         for r in [

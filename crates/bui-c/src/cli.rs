@@ -718,6 +718,10 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
             let prof = Profiles::load(ctx.sys, ctx.paths)?;
             // 名字找不到、--switch-to 无效：什么都不删（退出码 1）
             let plan = delete::plan(&prof, &want, switch_to.as_deref())?;
+            // 校验过了、但没有作用对象：不报用法错误（R15 只认三种退出码 2），说一句就好
+            if switch_to.is_some() && matches!(plan.kind, PlanKind::Passive) {
+                ctx.say(delete::SWITCH_TO_UNUSED);
+            }
             let seen = delete::snapshot(&prof);
             if !ctx.yes {
                 let picks: Vec<usize> = plan
@@ -747,21 +751,37 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
                         ctx.say(delete::CANCELLED);
                         return Ok(());
                     }
+                    // 从菜单养成的习惯是打编号：照 §5.10 算取消，但说清命令行换目标的办法
+                    menu::ConfirmInput::Pick(_) => {
+                        ctx.say(delete::CLI_NO_NUMBER);
+                        ctx.say(delete::CANCELLED);
+                        return Ok(());
+                    }
                     _ => {
                         ctx.say(delete::CANCELLED);
                         return Ok(());
                     }
                 }
             }
-            let r = delete_nodes(ctx, &want, switch_to.as_deref(), &seen)?;
+            let r = match delete_nodes(ctx, &want, switch_to.as_deref(), &seen) {
+                Ok(r) => r,
+                Err(e) => {
+                    // 失败也不许往 stdout 漏字（`apply_with_ufw` 那几句 say 不看 ctx.json）：
+                    // 文案走 stderr + 退出码 1（spec §5.10）
+                    if ctx.json {
+                        ctx.out.clear();
+                    }
+                    return Err(e);
+                }
+            };
             if ctx.json {
                 // stdout 只有一个对象加换行（spec §5.10）
                 ctx.out =
                     serde_json::to_string(&r).map_err(|e| Error::parse("delete", e.to_string()))?;
                 ctx.out.push('\n');
             } else {
-                let line = delete::summary(&r, ctx.width());
-                ctx.say(line);
+                // 命令行按 §5.4 说全：没有「上次：」行，R6 的短式不适用
+                ctx.say(delete::cli_summary(&r));
             }
             Ok(())
         }
@@ -1179,6 +1199,12 @@ fn delete_failed<S: Sys, N: Net, P: Prompt>(
 /// 返回失败页里跟在原因后面的那一两行。
 fn roll_back<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>, old: &Profiles) -> Vec<String> {
     match Engine::new(ctx.sys, ctx.paths).apply(old) {
+        // 旧配置写回去了、接口还是没起来：R10 对 apply 的判据（Err 或 `tun_ready == Some(false)`
+        // 都算失败）在回滚方向一样算数。不能在断网状态下报「节点都还在」了事，出路也要给
+        Ok(a) if a.tun_ready == Some(false) => vec![
+            delete::ROLLED_BACK_TUN_DOWN.to_string(),
+            delete::ROLLBACK_NEXT.to_string(),
+        ],
         Ok(_) => vec![delete::ROLLED_BACK.to_string()],
         Err(e) => {
             tracing::warn!(error = %e, "删除失败后换回原配置也失败");
@@ -1190,20 +1216,28 @@ fn roll_back<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>, old: &Profil
     }
 }
 
-/// 删光节点时拆掉数据面（spec §0.2 R10）：`Engine::teardown_main`（stop 后仍 active 就报错
-/// 中止，调用方据此不写 `profiles.json`），成功之后撤 UFW、把 runtime 的重启记账清零——
-/// 这两件尽力而为，失败只说一句，不把删除判成失败。
+/// 删光节点时拆掉数据面（spec §0.2 R10）：只做 [`Engine::teardown_main`]——stop 后仍 active 就
+/// 报错中止，调用方据此不写 `profiles.json`。撤 UFW、把 runtime 的重启记账清零由
+/// [`release_after_teardown`] 在写完 `profiles.json` **之后**尽力而为（R10 把这两件排在最后）。
+///
+/// **顺序只有这一份**：`teardown_all` -> `save`（如需）-> `release_after_teardown`。T12c 的
+/// `converge` 照同一顺序调这两个函数，别把收尾提到落盘前面去。
 fn teardown_all<S: Sys, N: Net, P: Prompt>(
     ctx: &mut Ctx<'_, S, N, P>,
     _: &LockGuard,
 ) -> Result<()> {
-    Engine::new(ctx.sys, ctx.paths).teardown_main()?;
+    Engine::new(ctx.sys, ctx.paths).teardown_main()
+}
+
+/// 拆完数据面、`profiles.json` 也写好之后的收尾（spec §0.2 R10「撤 UFW、写 runtime 放在最后
+/// 尽力而为」）：撤掉 bui-tun 的 UFW 放行、把重启记账清零。两件都失败也不算删除失败——所以
+/// 不返回 `Result`：规则留着，等下次切 SOCKS 或收敛时再撤。
+fn release_after_teardown<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) {
     let mut rt = Runtime::load(ctx.sys, ctx.paths);
     if rt.ufw_rules {
         match ufw::revoke_tun(ctx.sys) {
             Ok(_) => rt.ufw_rules = false,
             Err(e) => {
-                // 规则留着：等下次切 SOCKS 或收敛时再撤（R10）
                 tracing::warn!(error = %e, "撤 bui-tun 的 UFW 放行失败");
                 tell(ctx, delete::UFW_LEFT);
             }
@@ -1214,7 +1248,6 @@ fn teardown_all<S: Sys, N: Net, P: Prompt>(
     if let Err(e) = rt.save(ctx.sys, ctx.paths) {
         tracing::warn!(error = %e, "写 runtime.json 失败");
     }
-    Ok(())
 }
 
 /// 删除的执行编排（spec §5.5，顺序照 §0.2 R2 / R10 / R11）。三个入口共用：菜单 `[6]`、
@@ -1238,9 +1271,11 @@ fn delete_nodes<S: Sys, N: Net, P: Prompt>(
 ) -> Result<delete::Report> {
     // ① 锁外：只有「删到当前节点、要切过去」且内核缺失时才联网装内核（preflight 不装）
     let outside = Profiles::load(ctx.sys, ctx.paths)?;
+    // 这一步只判「要不要先装内核」，成败一律交给锁内：别的会话刚好把要删的节点删掉时，
+    // 裸 `?` 会先报「没有叫 X 的节点」，把并发说成输错名字，用户拿不到「请重新选」
     if matches!(
-        delete::plan(&outside, names, switch_to)?.kind,
-        PlanKind::Switch { .. }
+        delete::plan(&outside, names, switch_to).map(|p| p.kind),
+        Ok(PlanKind::Switch { .. })
     ) && !ctx.sys.exists(&ctx.paths.singbox())
     {
         match update::ensure_kernel(
@@ -1266,7 +1301,8 @@ fn delete_nodes<S: Sys, N: Net, P: Prompt>(
             ctx,
             delete::SNAPSHOT_CHANGED,
             &[],
-            delete::SNAPSHOT_CHANGED.to_string(),
+            // 「上次：」行只有 31 列（40 列终端）：长句会被砍掉「请重新选」（R6）
+            delete::SNAPSHOT_CHANGED_SHORT.to_string(),
         ));
     }
 
@@ -1281,7 +1317,18 @@ fn delete_nodes<S: Sys, N: Net, P: Prompt>(
     };
     match &plan.kind {
         // 不 apply、不重启：`config.json` 里只有活动节点，删别的对数据面没有影响
-        PlanKind::Passive => plan.next.save(ctx.sys, ctx.paths)?,
+        PlanKind::Passive => {
+            // 数据面没动过（§5.5 Passive「报错、什么都没变」），但也给停顿页：裸 `?` 只抛一句
+            // 原始 IO 错误，还会从 `delete_menu` 冒到 `menu_action` 把人踢回 shell
+            if let Err(e) = plan.next.save(ctx.sys, ctx.paths) {
+                return Err(delete_failed(
+                    ctx,
+                    delete::SAVE_FAILED,
+                    &[e.to_string(), delete::STILL_THERE.to_string()],
+                    delete::SAVE_FAILED.to_string(),
+                ));
+            }
+        }
         PlanKind::Switch { to } => {
             report.switched = true;
             // ⑤ 预检：动数据面之前挡住「内核缺失」「check 不通过」
@@ -1328,23 +1375,39 @@ fn delete_nodes<S: Sys, N: Net, P: Prompt>(
             if let Err(e) = plan.next.save(ctx.sys, ctx.paths) {
                 let mut rest = vec![e.to_string()];
                 rest.extend(roll_back(ctx, &old));
-                let head = "删除没做：写 profiles.json 失败".to_string();
-                return Err(delete_failed(ctx, &head, &rest, head.clone()));
+                return Err(delete_failed(
+                    ctx,
+                    delete::SAVE_FAILED,
+                    &rest,
+                    delete::SAVE_FAILED.to_string(),
+                ));
             }
         }
         PlanKind::Empty => {
             report.stopped = true;
             report.active = None;
             if let Err(e) = teardown_all(ctx, &g) {
-                let head = format!("删除没做：{e}");
                 return Err(delete_failed(
                     ctx,
-                    &head,
+                    &format!("删除没做：{e}"),
                     &[delete::STILL_THERE.to_string()],
-                    head.clone(),
+                    // 「上次：」行放不下完整原因（40 列只有 31 列），页上那一行才是全的
+                    delete::TEARDOWN_FAILED_SHORT.to_string(),
                 ));
             }
-            plan.next.save(ctx.sys, ctx.paths)?;
+            // teardown 成功就走完了不可回头段：这里写盘失败是唯一一种「代理已经不在、节点
+            // 条目还列着」的状态，不能沿用「节点都还在」，要说清现状与下一步（§5.5 Empty
+            // 那一行要求 Pause 报出是哪一步失败）
+            if let Err(e) = plan.next.save(ctx.sys, ctx.paths) {
+                return Err(delete_failed(
+                    ctx,
+                    delete::STOPPED_NOT_SAVED_HEAD,
+                    &[e.to_string(), delete::STOPPED_NOT_SAVED.to_string()],
+                    delete::STOPPED_NOT_SAVED_SHORT.to_string(),
+                ));
+            }
+            // 撤 UFW、写 runtime 排在写 profiles 之后，尽力而为（R10）
+            release_after_teardown(ctx);
             // 被删节点的凭据可能留在写 profiles.json 的临时文件里（R10）
             if let Err(e) = Engine::new(ctx.sys, ctx.paths).clear_profile_leftovers() {
                 tracing::warn!(error = %e, "清 profiles.json 的临时文件失败");
@@ -5543,6 +5606,30 @@ mod tests {
             Profiles::load(&s, &pp).unwrap().active.as_deref(),
             Some(ACTIVE)
         );
+        assert!(
+            !s.exists(std::path::Path::new("/opt/bui-c/profiles.json.bak")),
+            "不写 .bak：盘上不留第二份被删节点的凭据（spec §5.8、§12.1）"
+        );
+    }
+
+    /// Passive 形态写盘失败：数据面没动过，但也要给停顿页与安抚行，不能把一句原始 IO 错误
+    /// 裸抛出去（spec §5.5 Passive 那一行；裸 `?` 还会从 `delete_menu` 冒出去把人踢回 shell）。
+    #[test]
+    fn a_passive_delete_that_cannot_save_gets_a_page_not_a_raw_error() {
+        let pp = paths();
+        let s = FakeSys::new();
+        let n = FakeNet::new();
+        let prof = nine_nodes(&s, &pp, Mode::Socks);
+        let before = restarts(&s);
+        s.fail_write("/opt/bui-c/profiles.json");
+        let seen = delete::snapshot(&prof);
+        let (r, t) = del(&s, &n, &pp, &["HY2"], None, &seen);
+        assert_eq!(r.unwrap_err().to_string(), delete::SAVE_FAILED);
+        assert!(t.contains(delete::SAVE_FAILED), "{t}");
+        assert!(t.contains("permission denied"), "要报出是哪一步失败：{t}");
+        assert!(t.contains(delete::STILL_THERE), "什么都没变：{t}");
+        assert_eq!(restarts(&s), before, "数据面一点都没动");
+        assert_eq!(names(&s, &pp).len(), 9);
     }
 
     #[test]
@@ -5645,7 +5732,14 @@ mod tests {
             format!("删除没做：切到 {RICK_REALITY} 失败")
         );
         assert!(t.contains("bui-tun 接口 5 秒内没起来"), "{t}");
-        assert!(t.contains(delete::ROLLED_BACK), "{t}");
+        // 旧配置的 TUN 也没起来：R10 对 apply 的判据（Err 或 tun_ready == Some(false)）
+        // 在回滚方向一样算数，不能在断网状态下报「节点都还在」了事
+        assert!(t.contains(delete::ROLLED_BACK_TUN_DOWN), "{t}");
+        assert!(
+            !t.contains(delete::ROLLED_BACK),
+            "TUN 没起来就不能说一切正常：{t}"
+        );
+        assert!(t.contains(delete::ROLLBACK_NEXT), "要给出路：{t}");
         assert_eq!(
             s.get("/opt/bui-c/config.json").unwrap(),
             config,
@@ -5685,6 +5779,42 @@ mod tests {
         );
         let saved = Profiles::load(&s, &pp).unwrap();
         assert_eq!(saved.profiles.len(), 9);
+        assert_eq!(saved.active.as_deref(), Some(ACTIVE));
+    }
+
+    /// 最坏那条路：restart 在前向与回滚两次都失败。此前 `ROLLBACK_FAILED` / `ROLLBACK_NEXT`
+    /// 只在宽度守门表里出现过，一条行为测试都没有（§12.1 的 T7 行点名 restart 回 1 这条路）。
+    #[test]
+    fn a_rollback_that_also_fails_says_so_and_offers_a_way_out() {
+        let pp = paths();
+        let s = FakeSys::new();
+        let n = FakeNet::new();
+        let prof = nine_nodes(&s, &pp, Mode::Socks);
+        let config = s.get("/opt/bui-c/config.json").unwrap();
+        let before = restarts(&s);
+        // 写 config 之后才失败：前向 apply 写了新配置、restart 回 1；回滚把旧配置写回去，
+        // restart 又回 1
+        s.reply("systemctl restart bui-c.service", 1, "Job failed");
+        let seen = delete::snapshot(&prof);
+        let (r, t) = del(&s, &n, &pp, &[ACTIVE], None, &seen);
+        assert_eq!(
+            r.unwrap_err().to_string(),
+            format!("删除没做：切到 {RICK_REALITY} 失败")
+        );
+        assert!(t.contains(delete::ROLLBACK_FAILED), "{t}");
+        assert!(t.contains(delete::ROLLBACK_NEXT), "{t}");
+        assert!(
+            !t.contains(delete::ROLLED_BACK),
+            "换回也失败，别说换回好了：{t}"
+        );
+        assert_eq!(
+            s.get("/opt/bui-c/config.json").unwrap(),
+            config,
+            "config.json 还是回到旧配置（§12.1 的 T7 行）"
+        );
+        assert_eq!(restarts(&s) - before, 2, "切过去一次、换回来一次");
+        let saved = Profiles::load(&s, &pp).unwrap();
+        assert_eq!(saved.profiles.len(), 9, "一个都没删");
         assert_eq!(saved.active.as_deref(), Some(ACTIVE));
     }
 
@@ -5749,7 +5879,9 @@ mod tests {
         let seen = delete::snapshot(&prof);
         let (r, t) = del(&s, &n, &pp, &all, None, &seen);
         let e = r.unwrap_err();
-        assert!(e.to_string().contains("停止代理失败"), "{e}");
+        // 「上次：」行 40 列只有 31 列：长句会被砍掉「还在跑」，所以摘要单配短式（R6）
+        assert_eq!(e.to_string(), delete::TEARDOWN_FAILED_SHORT);
+        assert!(t.contains("停止代理失败"), "页上仍是完整的原因：{t}");
         assert!(t.contains(delete::STILL_THERE), "{t}");
         assert_eq!(names(&s, &pp).len(), 9, "profiles.json 一个字都不改");
         assert!(s.exists(&pp.unit(UNIT_MAIN)) && s.exists(&pp.config()));
@@ -5764,6 +5896,45 @@ mod tests {
             "不可回头段一步都没走"
         );
         assert!(!s.called("systemctl disable bui-c.service"));
+    }
+
+    /// 删光时数据面拆完了、`profiles.json` 却写不进去：这时**不能**说「节点都还在」（条目在、
+    /// 代理不在），要说清现状与下一步；并且 R10 把撤 UFW、写 runtime 排在写 profiles **之后**
+    /// 尽力而为，所以这一步失败时这两件根本还没做——UFW 规则与重启记账都得原样留着。
+    #[test]
+    fn deleting_everything_but_failing_to_save_leaves_the_ufw_rule_and_the_runtime_alone() {
+        let pp = paths();
+        let s = FakeSys::new();
+        let n = FakeNet::new();
+        let prof = nine_nodes(&s, &pp, Mode::Tun);
+        let mut rt = Runtime::load(&s, &pp);
+        rt.ufw_rules = true;
+        rt.fail_streak = 3;
+        rt.save(&s, &pp).unwrap();
+        s.reply("ufw status", 0, "Status: active\n");
+        s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        s.fail_write("/opt/bui-c/profiles.json");
+        let all: Vec<&str> = prof.profiles.iter().map(|p| p.name.as_str()).collect();
+        let seen = delete::snapshot(&prof);
+        let (r, t) = del(&s, &n, &pp, &all, None, &seen);
+        assert_eq!(r.unwrap_err().to_string(), delete::STOPPED_NOT_SAVED_SHORT);
+        assert!(t.contains(delete::STOPPED_NOT_SAVED_HEAD), "{t}");
+        assert!(t.contains("permission denied"), "报出是哪一步失败：{t}");
+        assert!(t.contains(delete::STOPPED_NOT_SAVED), "要给下一步：{t}");
+        assert!(
+            !t.contains(delete::STILL_THERE),
+            "条目在、代理不在：「节点都还在」在这里是错的：{t}"
+        );
+        assert!(!s.exists(&pp.unit(UNIT_MAIN)), "不可回头段已经走完");
+        assert_eq!(names(&s, &pp).len(), 9, "profiles 没写成，条目还列着");
+        assert!(
+            !s.called("ufw delete allow in on bui-tun"),
+            "撤 UFW 排在写 profiles 之后（R10），这一步失败时还没轮到：{:?}",
+            s.calls()
+        );
+        let rt = Runtime::load(&s, &pp);
+        assert!(rt.ufw_rules, "规则原样留着");
+        assert_eq!(rt.fail_streak, 3, "重启记账也还没清零（R10 的顺序）");
     }
 
     #[test]
@@ -5803,7 +5974,9 @@ mod tests {
         other.profiles.pop();
         other.save(&s, &pp).unwrap();
         let (r, t) = del(&s, &n, &pp, &["HY2"], None, &seen);
-        assert_eq!(r.unwrap_err().to_string(), delete::SNAPSHOT_CHANGED);
+        // 页上是完整的长句，「上次：」行拿短式（40 列只有 31 列，长句会丢掉「请重新选」）
+        assert_eq!(r.unwrap_err().to_string(), delete::SNAPSHOT_CHANGED_SHORT);
+        assert!(t.contains(delete::SNAPSHOT_CHANGED), "{t}");
         assert!(t.contains("请重新选"), "{t}");
         assert_eq!(names(&s, &pp).len(), 8, "这次什么都没删");
         // 只是活动节点换了也算「被别处改过」
@@ -5811,8 +5984,27 @@ mod tests {
         moved.active = Some("HY2".to_string());
         moved.save(&s, &pp).unwrap();
         let (r, _) = del(&s, &n, &pp, &["reality-Reality"], None, &seen);
-        assert_eq!(r.unwrap_err().to_string(), delete::SNAPSHOT_CHANGED);
+        assert_eq!(r.unwrap_err().to_string(), delete::SNAPSHOT_CHANGED_SHORT);
         assert_eq!(names(&s, &pp).len(), 9);
+    }
+
+    /// 别的会话刚好把要删的那个节点删掉了：锁外那一步只是判要不要装内核，不能让它先以
+    /// 「没有叫 X 的节点」报错——那是把并发说成了输错名字，用户拿不到「请重新选」。
+    #[test]
+    fn a_node_another_session_removed_reports_the_snapshot_not_a_bad_name() {
+        let pp = paths();
+        let s = FakeSys::new();
+        let n = FakeNet::new();
+        let prof = nine_nodes(&s, &pp, Mode::Socks);
+        let seen = delete::snapshot(&prof);
+        let mut other = prof.clone();
+        other.profiles.retain(|p| p.name != "HY2");
+        other.save(&s, &pp).unwrap();
+        let (r, t) = del(&s, &n, &pp, &["HY2"], None, &seen);
+        assert_eq!(r.unwrap_err().to_string(), delete::SNAPSHOT_CHANGED_SHORT);
+        assert!(t.contains("请重新选"), "{t}");
+        assert!(!t.contains("没有叫"), "不是输错名字：{t}");
+        assert_eq!(names(&s, &pp).len(), 8, "这次什么都没删");
     }
 
     /// 预检失败的停顿页要说清下一步（spec §0.2 R1）。
@@ -6086,6 +6278,86 @@ mod tests {
             ctx.transcript
         );
         assert_eq!(names(&s, &pp).len(), 9);
+
+        // 打编号：照旧算取消（§5.10），但要说清命令行换目标的办法
+        let s = FakeSys::new();
+        nine_nodes(&s, &pp, Mode::Socks);
+        let mut p = Scripted::from(["4"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["delete", ACTIVE]), &mut ctx).unwrap();
+        assert!(
+            ctx.transcript.contains(delete::CLI_NO_NUMBER),
+            "{}",
+            ctx.transcript
+        );
+        assert!(
+            ctx.transcript.contains(delete::CANCELLED),
+            "{}",
+            ctx.transcript
+        );
+        assert_eq!(names(&s, &pp).len(), 9, "什么都没删");
+    }
+
+    /// 命令行成功那一句按 §5.4 说全（不是「上次：」行的短式，也不把菜单键漏进命令行）。
+    #[test]
+    fn cli_delete_spells_out_the_result_in_all_three_forms() {
+        let pp = paths();
+        let n = FakeNet::new();
+        // Passive
+        let s = FakeSys::new();
+        nine_nodes(&s, &pp, Mode::Socks);
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, true);
+        dispatch(&parse(&["delete", "HY2", "-y"]), &mut ctx).unwrap();
+        assert!(
+            ctx.transcript.contains("已删除 1 个节点，还剩 8 个"),
+            "{}",
+            ctx.transcript
+        );
+        // Empty：命令行里没有菜单键 [3]
+        let s = FakeSys::new();
+        let prof = nine_nodes(&s, &pp, Mode::Socks);
+        s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        let all: Vec<&str> = prof.profiles.iter().map(|p| p.name.as_str()).collect();
+        let mut args = vec!["delete"];
+        args.extend(all.iter().copied());
+        args.push("-y");
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, true);
+        dispatch(&parse(&args), &mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert!(
+            t.contains("已删除全部 9 个节点，代理已停止；用 `bui-c import` 重新导入"),
+            "{t}"
+        );
+        assert!(!t.contains("按 [3] 导入"), "菜单键不进命令行：{t}");
+    }
+
+    /// Passive 形态给了 `--switch-to`：校验照做（打错名字要早报），但它没有作用对象——
+    /// 不报用法错误（R15 只认三种退出码 2），打一行说清「删了、没切」。
+    #[test]
+    fn cli_delete_says_switch_to_is_unused_when_nothing_active_was_deleted() {
+        let pp = paths();
+        let s = FakeSys::new();
+        let n = FakeNet::new();
+        nine_nodes(&s, &pp, Mode::Socks);
+        let before = restarts(&s);
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, true);
+        dispatch(
+            &parse(&["delete", "HY2", "--switch-to", "reality-Reality", "-y"]),
+            &mut ctx,
+        )
+        .unwrap();
+        assert!(
+            ctx.transcript.contains(delete::SWITCH_TO_UNUSED),
+            "{}",
+            ctx.transcript
+        );
+        let saved = Profiles::load(&s, &pp).unwrap();
+        assert_eq!(saved.active.as_deref(), Some(ACTIVE), "当前节点不变");
+        assert_eq!(saved.profiles.len(), 8);
+        assert_eq!(restarts(&s), before, "Passive 不重启");
     }
 
     #[test]
@@ -6214,9 +6486,50 @@ mod tests {
         );
         assert_eq!(saved.profiles.len(), 8);
         assert!(
-            ctx.transcript.contains("已删 1 个，切到 HY2"),
-            "{}",
+            ctx.transcript.contains("当前节点已删除，切到 HY2"),
+            "命令行按 §5.4 说全，不用「上次：」行的短式：{}",
             ctx.transcript
         );
+    }
+
+    /// Switch 形态的 `--json`：成功时 stdout 只有一个 Report 加换行（`apply_with_ufw` 里
+    /// 「已安装内核」「已放行 UFW」这些话不许漏出去），失败时 stdout 一个字都没有
+    /// （文案走 stderr + 退出码 1，spec §5.10）。
+    #[test]
+    fn cli_delete_json_stays_pure_when_the_active_node_goes() {
+        let pp = paths();
+        let n = FakeNet::new();
+        // 成功：TUN 模式会走 ufw allow，那几句 say 不能进 stdout
+        let s = FakeSys::new();
+        nine_nodes(&s, &pp, Mode::Tun);
+        s.reply("ufw status", 0, "Status: active\n");
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, true, true);
+        dispatch(&parse(&["delete", ACTIVE, "--json", "-y"]), &mut ctx).unwrap();
+        assert!(ctx.out.ends_with('\n'));
+        assert_eq!(ctx.out.lines().count(), 1, "{:?}", ctx.out);
+        let v: serde_json::Value = serde_json::from_str(&ctx.out).unwrap();
+        assert_eq!(v["switched"], true);
+        assert_eq!(v["active"], RICK_REALITY);
+        assert_eq!(v["remaining"], 8);
+        // 失败：stdout 空，话都在 stderr
+        let s = FakeSys::new();
+        nine_nodes(&s, &pp, Mode::Tun);
+        s.reply("ufw status", 0, "Status: active\n");
+        s.reply("ip link show bui-tun", 1, "");
+        let mut p = Scripted::from([]);
+        let (rc, err, out) = {
+            let mut ctx = Ctx::new(&s, &n, &pp, &mut p, true, true);
+            let r = dispatch(&parse(&["delete", ACTIVE, "--json", "-y"]), &mut ctx);
+            // finish 会把 ctx.out 冲到 stdout 再清空：先留一份，那就是 stdout 会收到的字节
+            let out = ctx.out.clone();
+            let mut err = Vec::new();
+            let rc = finish(&mut ctx, r, &mut err);
+            (rc, String::from_utf8(err).unwrap(), out)
+        };
+        assert_eq!(rc, std::process::ExitCode::FAILURE);
+        assert!(err.contains("切到"), "{err}");
+        assert!(out.is_empty(), "stdout 一个字都没有：{out:?}");
+        assert_eq!(names(&s, &pp).len(), 9);
     }
 }
