@@ -261,7 +261,7 @@ struct V3Upstream {
 /// 直连权益（[`Entitlements::direct`]）按 v3 订阅的节点集合取值，导入与面板新建用户共用。
 ///
 /// v3 对单协议用户是二选一（行号指删除提交 fc3e757 的父提交里的 `web/server.js`：
-/// `/api/sub` :1893-1904、Clash 生成器 :915-930）：`hysteria2` / `vless-reality` 开住宅时只发
+/// `/api/sub` :1858-1862 / :1894-1902、Clash 生成器 :915-930）：`hysteria2` / `vless-reality` 开住宅时只发
 /// 住宅版、不开时只发直连版；`fusion` 直连照发、开住宅再加住宅版。所以只有「单协议且开住宅」
 /// 没有直连权益。
 ///
