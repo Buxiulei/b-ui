@@ -7,7 +7,10 @@
 
 pub mod engine;
 pub mod incidents;
+pub mod resi;
 pub mod signature;
+#[cfg(test)]
+pub mod testkit;
 
 /// 同签名同对象 60 秒内只触发一次（spec §5.7）
 pub const DEBOUNCE_SECS: i64 = 60;
@@ -15,3 +18,5 @@ pub const DEBOUNCE_SECS: i64 = 60;
 pub const ACTION_COOLDOWN_SECS: i64 = 600;
 /// `runtime.incidents` 的环形上限（新的在前）
 pub const INCIDENTS_MAX: usize = 200;
+/// 住宅 IP 被判不健康连续这么久 ⇒ 告警里建议管理员替换（设计裁决 D15）
+pub const LONG_UNREACHABLE_MINS: i64 = 30;
