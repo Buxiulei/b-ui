@@ -2,15 +2,12 @@
 //!
 //! 渲染输出不含 ANSI 颜色：颜色会让快照测试变脆，可读性靠对齐与 `●`/`○`/`★` 够用。
 
-use crate::profiles::{kind_slug, Mode, Profile, Profiles};
+use crate::profiles::{kind_slug, Mode, Profiles};
 use crate::{Error, Result};
 use std::collections::VecDeque;
 
 /// 两列菜单左栏的列宽（按 [`display_width`] 计）。
 pub const LEFT_WIDTH: usize = 14;
-
-/// 节点列表里名字列的封顶列宽：再长就破格，不拖着所有行一起变宽。
-pub const NAME_CAP: usize = 40;
 
 /// 选项块分隔线的列宽 = 两列选项的宽度：`[n] ` 4 + 左栏 LEFT_WIDTH + 栏距 2 +
 /// 右栏 `[2] 切到 SOCKS` 14。写死 9 格的短线看着像断了。
@@ -276,9 +273,22 @@ pub fn render_options(st: &Status) -> String {
     out
 }
 
-/// 编号节点列表，当前节点带 `★`。
+/// 节点列表：每个节点两行，当前节点名字前带 `★`。
 ///
-/// `with_back`：菜单里选节点要能 `[0] 返回`，一次性 `bui-c list` 没有可返回的地方。
+/// ```text
+///      [1]   HY2
+///            示例专用名-HY2住宅  hy2-resi  tizi.example.test:40000
+///      [2] ★ hysteria2-1778329470
+///            示例专用名  hy2-direct  tizi.example.test:10000
+/// ```
+///
+/// 以前一个节点一行、四列对齐，真机上每行 113–119 列，100 列终端整屏折行、★ 被折到下一行。
+/// 拆成两行后第二行不做列对齐——对齐就会被最长的 label / host 撑宽。
+/// 编号行与主菜单选项同为 5 列缩进；第二行缩进到名字起始列（`★ ` 按终端里的 2 列算，
+/// 与两个空格同宽）。
+///
+/// `with_back`：菜单里选节点要打编号与 `[0] 返回`；一次性 `bui-c list` 不打编号
+/// （`bui-c switch` 只认名字），第一行形如 `  ★ name` / `    name`。
 pub fn render_nodes(prof: &Profiles, with_back: bool) -> String {
     if prof.profiles.is_empty() {
         return if with_back {
@@ -287,40 +297,32 @@ pub fn render_nodes(prof: &Profiles, with_back: bool) -> String {
             "  没有节点，先 `bui-c import …`\n".to_string()
         };
     }
-    // 列宽跟着本次列表最宽的那个走：真机上名字从 3 列（v3 目录名）到 38 列都有，
-    // 写死 26 会让长名字挤掉后面所有列。超过 NAME_CAP 的名字原样输出（破格），
-    // 后面只留两个空格——宁可一行歪，也不让所有行为它变宽。
-    let width = |f: fn(&Profile) -> &str, cap: usize| {
-        prof.profiles
-            .iter()
-            .map(|p| display_width(f(p)))
-            .max()
-            .unwrap_or(0)
-            .min(cap)
-    };
-    let name_w = width(|p| p.name.as_str(), NAME_CAP);
-    let label_w = width(|p| p.node.label.as_str(), usize::MAX);
-    let kind_w = width(|p| kind_slug(p.node.kind), usize::MAX);
+    // 两位数编号时补齐 `[n]`，名字仍然对齐在同一列
+    let num_w = format!("[{}]", prof.profiles.len()).len();
     let mut out = String::new();
     for (i, p) in prof.profiles.iter().enumerate() {
         let mark = if prof.active.as_deref() == Some(p.name.as_str()) {
-            " ★"
+            "★ "
         } else {
-            ""
+            "  "
         };
+        let lead = if with_back {
+            format!("     {} ", pad(&format!("[{}]", i + 1), num_w))
+        } else {
+            "  ".to_string()
+        };
+        let indent = " ".repeat(lead.len() + 2);
+        out.push_str(&format!("{lead}{mark}{}\n", p.name));
         out.push_str(&format!(
-            "  [{}] {}  {}  {}  {}:{}{}\n",
-            i + 1,
-            pad(&p.name, name_w),
-            pad(&p.node.label, label_w),
-            pad(kind_slug(p.node.kind), kind_w),
+            "{indent}{}  {}  {}:{}\n",
+            p.node.label,
+            kind_slug(p.node.kind),
             p.node.host,
-            p.node.port,
-            mark
+            p.node.port
         ));
     }
     if with_back {
-        out.push_str("  [0] 返回\n");
+        out.push_str("     [0] 返回\n");
     }
     out
 }
@@ -441,7 +443,7 @@ pub fn pick_index(input: &str, len: usize) -> Option<usize> {
 mod tests {
     use super::*;
     use crate::profiles::{Mode, Profile, Profiles, Source};
-    use crate::testutil::{hy2_direct_node, hy2_resi_node, reality_direct_node, split_global};
+    use crate::testutil::{hy2_direct_node, reality_direct_node, split_global};
     use pretty_assertions::assert_eq;
 
     fn st() -> Status {
@@ -632,13 +634,8 @@ mod tests {
         }
         p.active = Some("alice-reality-direct".into());
         let out = render_nodes(&p, true);
-        assert!(out.contains("[1] alice-hy2-direct"));
-        assert!(out.contains("[2] alice-reality-direct"));
-        assert!(out
-            .lines()
-            .find(|l| l.contains("[2]"))
-            .unwrap()
-            .contains('★'));
+        assert!(out.contains("[1]   alice-hy2-direct"), "{out}");
+        assert!(out.contains("[2] ★ alice-reality-direct"), "{out}");
         assert!(
             out.contains("HY2直连") && out.contains("Reality直连"),
             "显示 label 便于辨认"
@@ -689,14 +686,6 @@ mod tests {
         assert!(!empty.contains("主菜单"), "{empty}");
     }
 
-    /// 行里 `label` 之前占了多少列——用来断言各行的 label 起始列一致。
-    fn label_col(line: &str, label: &str) -> usize {
-        let i = line
-            .find(label)
-            .unwrap_or_else(|| panic!("行里没有 {label}：{line}"));
-        display_width(&line[..i])
-    }
-
     fn named(name: &str, node: bui_schema::nodes::Node) -> Profile {
         Profile {
             name: name.into(),
@@ -707,80 +696,164 @@ mod tests {
         }
     }
 
-    fn reality_resi_node() -> bui_schema::nodes::Node {
-        bui_schema::nodes::Node {
-            kind: bui_schema::nodes::NodeKind::RealityResidential,
-            label: "Reality住宅".into(),
-            port: 10002,
-            ..reality_direct_node()
-        }
-    }
-
-    #[test]
-    fn node_list_columns_align_and_show_kind_and_endpoint() {
-        // 真机上的混排：38 列的长名字 + 3 列的 v3 目录名
-        let long = "rick-node.example-a.net-reality-direct";
-        assert_eq!(display_width(long), 38, "样例得是 38 列");
+    /// 真机（baiyi）形态的 9 个节点：名字 3–38 列、label 最长 26 列、host:port 最长 29 列。
+    /// 端点与凭据是合成的，只有各字段的长度照抄真机。
+    fn baiyi_like() -> Profiles {
+        use bui_schema::nodes::{Node, NodeKind};
+        let node = |kind: NodeKind, label: &str, host: &str, port: u16| Node {
+            kind,
+            label: label.into(),
+            host: host.into(),
+            port,
+            ..match kind {
+                NodeKind::RealityDirect | NodeKind::RealityResidential => reality_direct_node(),
+                NodeKind::Hy2Direct | NodeKind::Hy2Residential => hy2_direct_node(),
+            }
+        };
+        let bwg = "tizi.example.test";
+        let cl = "rick-node.example-a.net";
         let mut p = Profiles::new_default();
-        for (n, node) in [
-            (long, reality_direct_node()),
-            ("HY2", hy2_direct_node()),
-            ("reality-Reality", reality_resi_node()),
-            ("hysteria2-1778329470", hy2_resi_node()),
+        for (name, n) in [
+            (
+                "HY2",
+                node(NodeKind::Hy2Residential, "示例专用名-HY2住宅", bwg, 40000),
+            ),
+            (
+                "hysteria2-1778329470",
+                node(NodeKind::Hy2Direct, "示例专用名", bwg, 10000),
+            ),
+            (
+                "reality-Reality",
+                node(
+                    NodeKind::RealityDirect,
+                    "示例名-reality-Reality直连",
+                    bwg,
+                    10001,
+                ),
+            ),
+            (
+                "rick-node.example-a.net-reality-direct",
+                node(NodeKind::RealityDirect, "Reality直连", cl, 10001),
+            ),
+            (
+                "rick-node.example-a.net-reality-resi",
+                node(NodeKind::RealityResidential, "Reality住宅", cl, 10002),
+            ),
+            (
+                "rick-node.example-a.net-hy2-direct",
+                node(NodeKind::Hy2Direct, "HY2直连", cl, 10000),
+            ),
+            (
+                "rick-node.example-a.net-hy2-resi",
+                node(NodeKind::Hy2Residential, "HY2住宅", cl, 40001),
+            ),
+            (
+                "tizi.example.test-reality-resi",
+                node(NodeKind::RealityResidential, "Reality住宅", bwg, 10002),
+            ),
+            (
+                "tizi.example.test-hy2-resi",
+                node(NodeKind::Hy2Residential, "HY2住宅", bwg, 40002),
+            ),
         ] {
-            p.upsert(named(n, node));
+            p.profiles.push(named(name, n));
         }
-        let out = render_nodes(&p, true);
-        let rows: Vec<&str> = out.lines().filter(|l| !l.contains("[0]")).collect();
-        assert_eq!(rows.len(), 4, "{out}");
-
-        // label 列起始列必须一致（截屏里四行各自起始列不同就是这条）
-        let cols: Vec<usize> = rows
-            .iter()
-            .zip(["Reality直连", "HY2直连", "Reality住宅", "HY2住宅"])
-            .map(|(l, lb)| label_col(l, lb))
-            .collect();
-        assert!(
-            cols.windows(2).all(|w| w[0] == w[1]),
-            "label 起始列 {cols:?}\n{out}"
-        );
-
-        // 每行多一列 kind + host:port
-        for (l, kind) in
-            rows.iter()
-                .zip(["reality-direct", "hy2-direct", "reality-resi", "hy2-resi"])
-        {
-            assert!(l.contains(kind), "{l}");
-            assert!(l.contains("panel.example.com:"), "{l}");
-        }
-        assert!(rows[1].contains("panel.example.com:10000"), "{}", rows[1]);
-        assert!(rows[3].contains("panel.example.com:40000"), "{}", rows[3]);
+        p.active = Some("hysteria2-1778329470".into());
+        p
     }
 
     #[test]
-    fn node_name_column_follows_the_widest_name_and_caps_at_40() {
-        let mut narrow = Profiles::new_default();
-        narrow.upsert(named("HY2", hy2_direct_node()));
-        let line = render_nodes(&narrow, false);
-        assert!(
-            line.starts_with("  [1] HY2  HY2直连"),
-            "短名字不再补到写死的 26 列：{line:?}"
+    fn node_list_fits_in_80_columns_with_real_world_names() {
+        let p = baiyi_like();
+        assert_eq!(p.profiles.len(), 9);
+        let widest = |f: fn(&Profile) -> String| {
+            p.profiles
+                .iter()
+                .map(|x| display_width(&f(x)))
+                .max()
+                .unwrap()
+        };
+        assert_eq!(widest(|x| x.name.clone()), 38, "样例名字最长 38 列");
+        assert_eq!(
+            widest(|x| x.node.label.clone()),
+            26,
+            "样例 label 最长 26 列"
+        );
+        assert_eq!(
+            widest(|x| format!("{}:{}", x.node.host, x.node.port)),
+            29,
+            "样例 host:port 最长 29 列"
         );
 
-        // 超过 40 列的名字原样输出，后面只留两个空格
-        let huge = "x".repeat(45);
-        let mut wide = Profiles::new_default();
-        wide.upsert(named(&huge, hy2_direct_node()));
-        wide.upsert(named("HY2", reality_direct_node()));
-        let out = render_nodes(&wide, false);
-        let rows: Vec<&str> = out.lines().collect();
-        assert!(rows[0].contains(&format!("{huge}  HY2直连")), "{}", rows[0]);
+        for with_back in [true, false] {
+            let out = render_nodes(&p, with_back);
+            for l in out.lines() {
+                assert!(
+                    display_width(l) <= 80,
+                    "{} 列超过 80（with_back={with_back}）：{l:?}\n{out}",
+                    display_width(l)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn node_list_is_two_lines_per_node_indented_to_the_name() {
+        let out = render_nodes(&baiyi_like(), true);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 9 * 2 + 1, "每个节点两行 + [0] 返回：\n{out}");
         assert_eq!(
-            label_col(rows[1], "Reality直连"),
-            6 + 40 + 2,
-            "其余名字补到封顶的 40 列：{}",
-            rows[1]
+            lines[..4].join("\n"),
+            "     [1]   HY2\n           示例专用名-HY2住宅  hy2-resi  tizi.example.test:40000\n     [2] ★ hysteria2-1778329470\n           示例专用名  hy2-direct  tizi.example.test:10000",
+            "\n{out}"
         );
+        assert_eq!(
+            lines[6], "     [4]   rick-node.example-a.net-reality-direct",
+            "长名字不影响别的行：\n{out}"
+        );
+        assert_eq!(
+            lines[7], "           Reality直连  reality-direct  rick-node.example-a.net:10001",
+            "不做列对齐：label 不被最长的那个撑宽\n{out}"
+        );
+        assert_eq!(lines[18], "     [0] 返回", "与编号行同为 5 列缩进");
+        // 编号行与主菜单选项同为 5 列缩进
+        let menu_indent = render_options(&st())
+            .lines()
+            .find(|l| l.contains("[1]"))
+            .map(|l| l.len() - l.trim_start().len())
+            .unwrap();
+        assert_eq!(menu_indent, 5);
+        for l in lines.iter().step_by(2).take(9) {
+            assert!(l.starts_with("     ["), "{l:?}");
+        }
+    }
+
+    #[test]
+    fn two_digit_numbers_keep_names_in_one_column() {
+        let mut p = baiyi_like();
+        p.profiles.push(named("n10", hy2_direct_node()));
+        let out = render_nodes(&p, true);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "     [1]    HY2", "{out}");
+        assert_eq!(lines[18], "     [10]   n10", "{out}");
+        assert!(
+            lines[19].starts_with(&format!("{}HY2直连", " ".repeat(12))),
+            "第二行仍缩进到名字起始列：{out}"
+        );
+    }
+
+    #[test]
+    fn one_shot_node_list_has_no_numbers() {
+        // `bui-c switch` 只认名字：一次性 list 不打 [n]
+        let out = render_nodes(&baiyi_like(), false);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 9 * 2, "{out}");
+        assert_eq!(
+            lines[..4].join("\n"),
+            "    HY2\n    示例专用名-HY2住宅  hy2-resi  tizi.example.test:40000\n  ★ hysteria2-1778329470\n    示例专用名  hy2-direct  tizi.example.test:10000",
+            "\n{out}"
+        );
+        assert!(!out.contains('['), "不打编号：{out}");
     }
 
     #[test]

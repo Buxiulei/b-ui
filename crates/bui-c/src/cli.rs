@@ -1219,7 +1219,12 @@ mod tests {
         let mut p = Scripted::from([]);
         let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
         dispatch(&parse(&["list"]), &mut ctx).unwrap();
-        assert!(ctx.out.contains("[1] alice-hy2-direct"), "{}", ctx.out);
+        assert!(ctx.out.starts_with("  ★ alice-hy2-direct\n"), "{}", ctx.out);
+        assert!(
+            !ctx.out.contains("[1]"),
+            "`bui-c switch` 只认名字，一次性 list 不打编号：{}",
+            ctx.out
+        );
         assert!(
             !ctx.out.contains("[0] 返回"),
             "一次性 list 没有可返回的地方：{}",
@@ -2665,8 +2670,9 @@ mod tests {
             "先出子菜单，1 是子菜单里的「重启」：\n{t}"
         );
         assert!(
-            !t.contains("[1] alice-hy2-direct"),
-            "1 不能漏到主菜单去切节点：\n{t}"
+            !p.asked.iter().any(|q| q == "选择节点编号"),
+            "1 不能漏到主菜单去切节点：{:?}\n{t}",
+            p.asked
         );
         assert!(s.sleeps().is_empty(), "SOCKS 模式没有接口可等");
     }
