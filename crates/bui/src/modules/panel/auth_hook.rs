@@ -36,7 +36,9 @@ pub enum Decision {
 }
 
 impl Decision {
-    fn label(&self) -> &'static str {
+    /// 落日志用的结果字段（`allow` 或拒绝原因）。`auth_http` 也用它，两条鉴权路径的
+    /// `auth-hook.log` 因此逐字同格式。
+    pub fn label(&self) -> &'static str {
         match self {
             Decision::Allow { .. } => "allow",
             Decision::Deny { reason } => reason,
@@ -191,7 +193,16 @@ fn read_snapshot(path: &Path, deadline: std::time::Instant) -> Option<Snapshot> 
 
 /// 追加一行 `<RFC3339> <addr> <username> <结果>`。失败一律忽略——钩子不能因为写不了日志
 /// 就拒绝合法用户。
-fn log_line(paths: &Paths, now: time::OffsetDateTime, addr: &str, username: &str, result: &str) {
+///
+/// http 鉴权（[`crate::modules::panel::auth_http`]）调的是同一个函数：m1 step6 与 m3 验收
+/// 都按这行格式断言，两条路径写出来的必须一模一样。
+pub fn log_line(
+    paths: &Paths,
+    now: time::OffsetDateTime,
+    addr: &str,
+    username: &str,
+    result: &str,
+) {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let path = log_path(paths);
     if std::fs::metadata(&path)

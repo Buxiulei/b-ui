@@ -467,6 +467,25 @@ pub async fn run(paths: Paths, host: Arc<dyn Host>) -> anyhow::Result<()> {
     for m in &mods {
         tasks.extend(m.spawn(ctx.clone()));
     }
+    // Hysteria2 的 http 鉴权（spec §3.2）：**独立**监听 127.0.0.1:AUTH_HTTP_PORT，
+    // 绝不挂在下面那个面板监听上 —— 面板经 Caddy 对外，挂上去等于把鉴权面暴露到公网。
+    // 无条件起：`hy2_auth=command` 时它只是没人来敲，换回 http 就不必重启守护进程。
+    {
+        let auth = Arc::new(crate::modules::panel::auth_http::AuthHttp::new(
+            paths.clone(),
+            host.clone(),
+        ));
+        tasks.push(tokio::spawn(
+            crate::modules::panel::auth_http::refresh_loop(
+                ctx.clone(),
+                panel.clone(),
+                auth.clone(),
+            ),
+        ));
+        tasks.push(tokio::spawn(crate::modules::panel::auth_http::serve_loop(
+            auth,
+        )));
+    }
     // 守护进程里**只有这一个** consumer 会调 reconcile_from_ctx（启动那一轮在它之前、串行跑完）：
     // 去抖触发、10 分钟巡检、每日自检（经 bus → 去抖）全部经这条 mpsc 排队，天然互斥。
     // 若让 10 分钟 tick 自己起一个任务直接对账，就会与去抖触发的那一轮并发——两轮同时

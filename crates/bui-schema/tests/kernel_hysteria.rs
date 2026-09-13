@@ -1,13 +1,55 @@
-//! Hysteria2 直连/住宅配置渲染的形状校验（Task 7）。
+//! Hysteria2 直连/住宅配置渲染的形状校验（Task 7）+ 真实内核的配置加载校验。
 mod common;
 
+use bui_schema::model::Hy2Auth;
 use bui_schema::{paths::Paths, render::hysteria};
+
+/// 随便要一个空闲 UDP 端口（真起内核的那条用例要一个没人占的 `listen:`）。
+fn free_udp_port() -> u16 {
+    std::net::UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// 自签一张证书（`hysteria` 在校验 `auth` 之前先 `stat` 证书，缺了就走不到 auth 那一步）。
+/// 没有 `openssl` 就返回 `None`，调用方跳过。
+fn self_signed(dir: &std::path::Path) -> Option<()> {
+    let out = std::process::Command::new("openssl")
+        .args([
+            "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+        ])
+        .arg("-keyout")
+        .arg(dir.join("privkey.pem"))
+        .arg("-out")
+        .arg(dir.join("fullchain.pem"))
+        .args(["-subj", "/CN=test.invalid"])
+        .output()
+        .ok()?;
+    out.status.success().then_some(())
+}
+
+/// golden：`tests/fixtures/hysteria/<模式>/<文件名>`，两种鉴权模式各一份。
+fn golden(mode: &str, file: &str) -> String {
+    let path = std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/hysteria"
+    ))
+    .join(mode)
+    .join(file);
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("读不到 {}：{e}", path.display()))
+}
 
 #[test]
 fn hysteria_direct_shape() {
     let s = common::state("obfs");
-    let y: serde_yaml::Value =
-        serde_yaml::from_str(&hysteria::direct_yaml(&s.node, &Paths::default_server())).unwrap();
+    let y: serde_yaml::Value = serde_yaml::from_str(&hysteria::direct_yaml(
+        &s.node,
+        &Paths::default_server(),
+        Hy2Auth::Command,
+    ))
+    .unwrap();
     assert_eq!(y["listen"].as_str().unwrap(), ":10000,20000-30000");
     assert_eq!(y["auth"]["type"].as_str().unwrap(), "command");
     assert_eq!(
@@ -39,8 +81,12 @@ fn hysteria_direct_shape() {
 fn hysteria_direct_without_obfs_or_hop() {
     let mut s = common::state("global");
     s.node.ports.hy2_hop = None;
-    let y: serde_yaml::Value =
-        serde_yaml::from_str(&hysteria::direct_yaml(&s.node, &Paths::default_server())).unwrap();
+    let y: serde_yaml::Value = serde_yaml::from_str(&hysteria::direct_yaml(
+        &s.node,
+        &Paths::default_server(),
+        Hy2Auth::Http,
+    ))
+    .unwrap();
     assert_eq!(y["listen"].as_str().unwrap(), ":10000");
     assert!(y.get("obfs").is_none());
 }
@@ -51,6 +97,7 @@ fn hysteria_residential_shape() {
     let y: serde_yaml::Value = serde_yaml::from_str(&hysteria::residential_yaml(
         &s.node,
         &Paths::default_server(),
+        Hy2Auth::Command,
     ))
     .unwrap();
     assert_eq!(y["listen"].as_str().unwrap(), ":40000,41000-50000");
@@ -81,10 +128,13 @@ fn hysteria_auth_command_is_a_single_executable_path_without_arguments() {
     let s = common::state("obfs");
     let p = Paths::default_server();
     for (which, yaml) in [
-        ("config.yaml", hysteria::direct_yaml(&s.node, &p)),
+        (
+            "config.yaml",
+            hysteria::direct_yaml(&s.node, &p, Hy2Auth::Command),
+        ),
         (
             "config-residential.yaml",
-            hysteria::residential_yaml(&s.node, &p),
+            hysteria::residential_yaml(&s.node, &p, Hy2Auth::Command),
         ),
     ] {
         let y: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
@@ -112,7 +162,8 @@ fn three_residential_slot_configs_parse_and_do_not_overlap() {
     let mut seen: Vec<(u16, u16)> = vec![];
     for i in 0..3u16 {
         let r = bui_schema::slots::resources(&s.node.ports, i, 3);
-        let text = bui_schema::render::hysteria::residential_slot_yaml(&s.node, &p, &r);
+        let text =
+            bui_schema::render::hysteria::residential_slot_yaml(&s.node, &p, &r, Hy2Auth::Http);
         let v: serde_yaml::Value = serde_yaml::from_str(&text).expect("合法 YAML");
         assert_eq!(
             v["listen"].as_str().unwrap(),
@@ -133,5 +184,86 @@ fn three_residential_slot_configs_parse_and_do_not_overlap() {
             );
         }
         seen.push(r.hop);
+    }
+}
+
+/// 真实内核校验：hysteria **没有** `check` 子命令（spec §2.2），所以只能真起一次
+/// `hysteria server -c`，看它在**配置加载阶段**报不报错。
+///
+/// 这一层不是摆设：`auth.type` 是内核在加载期校验的（写错就是
+/// `invalid config: auth.type: unsupported auth type`，实测 v2.12.2），而 `auth.http`
+/// 这个形状 YAML 层面怎么写都合法 —— 2026-09-12 那次全员鉴权失败正是这类「静态校验看不出」
+/// 的错配。加载走到 auth 之前要先过 `listen` 与 `tls.cert`，所以这里去掉端口跳跃
+/// （nft 建表要 root）并临时自签一张证书。
+///
+/// 内核不在 PATH 上、或本机没有 openssl 就跳过（与 `sing-box` / `xray` 那两条同口径）。
+#[test]
+fn both_auth_modes_load_in_the_real_hysteria_kernel() {
+    if !common::have("hysteria") {
+        eprintln!("skipped: hysteria not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    if self_signed(dir.path()).is_none() {
+        eprintln!("skipped: openssl not usable");
+        return;
+    }
+    let mut s = common::state("obfs");
+    s.node.ports.hy2_hop = None; // 端口跳跃要 root 建 nft 表
+    s.node.ports.hy2 = free_udp_port();
+    let paths = Paths {
+        base_dir: dir.path().to_path_buf(),
+        certs_dir: dir.path().to_path_buf(),
+        bin_dir: dir.path().join("bin"),
+    };
+    for (mode, auth) in [("http", Hy2Auth::Http), ("command", Hy2Auth::Command)] {
+        let cfg = dir.path().join(format!("{mode}.yaml"));
+        std::fs::write(&cfg, hysteria::direct_yaml(&s.node, &paths, auth)).unwrap();
+        let log = std::fs::File::create(dir.path().join(format!("{mode}.log"))).unwrap();
+        let mut child = std::process::Command::new("hysteria")
+            .args(["server", "--disable-update-check", "-c"])
+            .arg(&cfg)
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .spawn()
+            .unwrap();
+        // 加载失败是**立刻**退出；成功就一直跑，等 2 秒足够分辨这两种
+        for _ in 0..40 {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        let out = std::fs::read_to_string(dir.path().join(format!("{mode}.log"))).unwrap();
+        assert!(
+            !out.contains("invalid config"),
+            "{mode} 模式的配置内核不认：{out}"
+        );
+    }
+}
+
+/// 两种鉴权模式各一份 golden（`tests/fixtures/hysteria/<模式>/`）。
+///
+/// 逐字节比对而不是比 YAML 树：`auth` 段是唯一允许随模式变的地方，任何顺带的字段重排
+/// （端口、伪装、sniff）都要在这里当场撞红 —— 切鉴权模式会重启两份 hysteria，
+/// 顺手改别的字段等于把一次开关变成一次不可控的配置迁移。
+#[test]
+fn both_auth_modes_match_their_golden_config() {
+    let s = common::state("obfs");
+    let p = Paths::default_server();
+    let slot0 = bui_schema::slots::resources(&s.node.ports, 0, 1);
+    for (mode, auth) in [("http", Hy2Auth::Http), ("command", Hy2Auth::Command)] {
+        assert_eq!(
+            hysteria::direct_yaml(&s.node, &p, auth),
+            golden(mode, "config.yaml"),
+            "{mode} 模式的 config.yaml 与 golden 不符"
+        );
+        assert_eq!(
+            hysteria::residential_slot_yaml(&s.node, &p, &slot0, auth),
+            golden(mode, "config-residential.yaml"),
+            "{mode} 模式的 config-residential.yaml 与 golden 不符"
+        );
     }
 }

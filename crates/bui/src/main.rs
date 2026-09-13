@@ -171,6 +171,16 @@ async fn dispatch(command: Command) -> Result<()> {
         Command::Residential { cmd } => {
             modules::residential::cli::run(cmd, PathBuf::from(paths::SOCKET_PATH)).await
         }
+        Command::Set { cmd } => match cmd {
+            cli::SetCmd::Hy2Auth { mode } => {
+                commands::config::run_hy2_auth(
+                    &mode,
+                    bui_schema::paths::Paths::default_server(),
+                    std::sync::Arc::new(sys::real::RealHost::new()),
+                )
+                .await
+            }
+        },
         Command::Menu => {
             commands::menu::run(
                 bui_schema::paths::Paths::default_server(),

@@ -23,6 +23,10 @@ pub fn router(state: AppState, modules: &[Arc<dyn Module>]) -> axum::Router {
         .route(
             "/api/services/{unit}/{action}",
             axum::routing::post(system::service_action),
+        )
+        .route(
+            "/api/system/hy2-auth",
+            axum::routing::post(system::set_hy2_auth),
         );
     let protected = modules
         .iter()
@@ -315,6 +319,50 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(json(res).await["at"], "2026-09-11T00:00:00Z");
+    }
+
+    /// `POST /api/system/hy2-auth`（`bui set hy2-auth` 的落点）：只写期望态 + 发一次
+    /// `StateChanged`，重渲染与重启都交给那一轮对账；非法值 400 且什么都不写。
+    #[tokio::test]
+    async fn the_hy2_auth_endpoint_writes_the_state_and_asks_for_a_reconcile() {
+        let (app, d, _h, _rt) = app_with_runtime().await;
+        let token = login(&app).await;
+        let mode = || -> bui_schema::model::Hy2Auth {
+            let bytes = std::fs::read(d.path().join("state.json")).unwrap();
+            serde_json::from_slice::<bui_schema::model::State>(&bytes)
+                .unwrap()
+                .system
+                .hy2_auth
+        };
+        assert_eq!(mode(), bui_schema::model::Hy2Auth::Http, "默认就是 http");
+
+        let res = app
+            .clone()
+            .oneshot(with_token(
+                post(
+                    "/api/system/hy2-auth",
+                    serde_json::json!({"mode": "command"}),
+                ),
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(json(res).await["hy2_auth"], "command");
+        assert_eq!(mode(), bui_schema::model::Hy2Auth::Command);
+
+        let res = app
+            .oneshot(with_token(
+                post(
+                    "/api/system/hy2-auth",
+                    serde_json::json!({"mode": "userpass"}),
+                ),
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(mode(), bui_schema::model::Hy2Auth::Command, "非法值不落盘");
     }
 
     #[tokio::test]

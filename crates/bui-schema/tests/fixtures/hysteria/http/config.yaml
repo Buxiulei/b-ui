@@ -1,0 +1,41 @@
+listen: :10000,20000-30000
+tls:
+  sniGuard: disable
+  cert: /opt/b-ui/certs/fullchain.pem
+  key: /opt/b-ui/certs/privkey.pem
+quic:
+  maxIdleTimeout: 60s
+ignoreClientBandwidth: true
+resolver:
+  type: https
+  https:
+    addr: 1.1.1.1:443
+    sni: cloudflare-dns.com
+auth:
+  type: http
+  http:
+    url: http://127.0.0.1:18789/auth
+    insecure: false
+trafficStats:
+  listen: 127.0.0.1:9999
+  secret: ''
+masquerade:
+  type: proxy
+  proxy:
+    url: https://www.bing.com
+    rewriteHost: true
+sniff:
+  enable: true
+  timeout: 2s
+  rewriteDomain: true
+  tcpPorts: 80,443,8000-9000
+  udpPorts: 443,53
+outbounds:
+- name: direct
+  type: direct
+  direct:
+    mode: 4
+obfs:
+  type: salamander
+  salamander:
+    password: obfs-pw-test

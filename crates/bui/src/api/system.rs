@@ -1,4 +1,5 @@
-//! CLI 通过 unix socket 调的两个系统端点（spec §2.4）：触发一轮对账、动一个受管单元。
+//! CLI 通过 unix socket 调的三个系统端点（spec §2.4）：触发一轮对账、动一个受管单元、
+//! 切 Hysteria2 的鉴权方式。
 //!
 //! 这两个端点是「菜单与 CLI 不自己动手」的唯一出口：`sudo b-ui` 的重启/停止都经过这里，
 //! 于是三条对账路径（启动、去抖、10 分钟巡检）仍只有守护进程里那一个 consumer 在跑（S6）。
@@ -28,6 +29,46 @@ pub async fn reconcile(State(app): State<AppState>, Json(req): Json<ReconcileReq
         None => (
             StatusCode::ACCEPTED,
             Json(serde_json::json!({"queued": true})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Hy2AuthRequest {
+    pub mode: String,
+}
+
+/// `POST /api/system/hy2-auth`：切 Hysteria2 的鉴权方式（`bui set hy2-auth` 的落点）。
+///
+/// 只写期望态 + 发一次 `StateChanged`：重渲染两份配置、重启两个实例都由那一轮对账做，
+/// CLI 进程绝不自己碰 `state.json`（否则会与守护进程的 `Store` 并发写）。
+pub async fn set_hy2_auth(
+    State(app): State<AppState>,
+    Json(req): Json<Hy2AuthRequest>,
+) -> Response {
+    let mode = match req.mode.parse::<bui_schema::model::Hy2Auth>() {
+        Ok(m) => m,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e})),
+            )
+                .into_response()
+        }
+    };
+    match app.store.update(|s| s.system.hy2_auth = mode).await {
+        Ok(_) => {
+            app.bus.send(Event::StateChanged("system"));
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"ok": true, "hy2_auth": mode.as_str()})),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
         )
             .into_response(),
     }

@@ -693,7 +693,11 @@ mod tests {
             target: "bui".into(),
         }));
         // 渲染进配置的那条路径与这条链接必须是同一个（否则内核指向一个不存在的文件）
-        let yaml = bui_schema::render::hysteria::direct_yaml(&sample_state().node, &p);
+        let yaml = bui_schema::render::hysteria::direct_yaml(
+            &sample_state().node,
+            &p,
+            bui_schema::model::Hy2Auth::Command,
+        );
         assert!(
             yaml.contains(&format!("command: {}\n", p.auth_hook_bin().display())),
             "config.yaml 的 auth.command 与链接不一致：\n{yaml}"
