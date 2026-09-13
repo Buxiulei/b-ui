@@ -83,19 +83,20 @@ pub struct AuthHttpAlert {
     pub daemon_listening: bool,
 }
 
-/// 数一段 journal 里「鉴权请求连不上 / 超时」的行数（纯函数，便于单测）。
+/// 一行 journal 是不是「鉴权请求连不上 / 超时」（纯函数）。日志哨兵（`modules::sentinel`）逐行用它。
 ///
 /// 两类标记都要命中才算：只匹配 "connection refused" 会把住宅上游、relay 的连接错误
 /// 一起数进来；只匹配 "/auth" 会把正常的鉴权日志数进来。
-pub fn count_auth_http_failures(log: &str) -> u32 {
+pub fn is_auth_http_failure(line: &str) -> bool {
     let port = format!(":{}", bui_schema::render::hysteria::AUTH_HTTP_PORT);
-    log.lines()
-        .filter(|l| {
-            let lower = l.to_ascii_lowercase();
-            (lower.contains(AUTH_HTTP_PATH_MARKER) || lower.contains(&port))
-                && AUTH_HTTP_FAIL_MARKERS.iter().any(|m| lower.contains(m))
-        })
-        .count() as u32
+    let lower = line.to_ascii_lowercase();
+    (lower.contains(AUTH_HTTP_PATH_MARKER) || lower.contains(&port))
+        && AUTH_HTTP_FAIL_MARKERS.iter().any(|m| lower.contains(m))
+}
+
+/// 数一段 journal 里「鉴权请求连不上 / 超时」的行数（纯函数，便于单测）。
+pub fn count_auth_http_failures(log: &str) -> u32 {
+    log.lines().filter(|l| is_auth_http_failure(l)).count() as u32
 }
 
 /// 一个单元的孤儿链自愈记录（累计次数 + 最近一次的时刻与清掉的链）。

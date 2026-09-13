@@ -22,6 +22,10 @@ use uuid::Uuid;
 
 pub const GIB: u64 = 1_073_741_824;
 pub const SYNC_INTERVAL_SECS: u64 = 60;
+/// 用户同步有失败项时那一行日志的固定文案。日志哨兵（`modules::sentinel::signature`）按它加
+/// tracing-journald 的 `F_ERROR` 字段认「xray gRPC 连续不可用」——改文案会让哨兵失明，
+/// 所以它是常量，哨兵的测试直接引用它。
+pub const USER_SYNC_FAILED_LOG: &str = "用户同步有失败项，下一轮安全网会重试";
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PanelLimits {
@@ -610,7 +614,7 @@ pub async fn sync_loop(ctx: DaemonCtx, shared: Arc<Shared>) {
 
 fn report(out: SyncOutcome) {
     for e in &out.errors {
-        tracing::warn!(error = %e, "用户同步有失败项，下一轮安全网会重试");
+        tracing::warn!(error = %e, "{}", USER_SYNC_FAILED_LOG);
     }
     if out.snapshot_written || !out.added.is_empty() || !out.removed.is_empty() {
         tracing::info!(

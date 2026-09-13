@@ -4,6 +4,7 @@ pub mod core_files;
 pub mod panel;
 pub mod portjump;
 pub mod residential;
+pub mod sentinel;
 pub mod ssh;
 pub mod system;
 pub mod units;
