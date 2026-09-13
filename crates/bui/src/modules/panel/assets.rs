@@ -237,4 +237,31 @@ mod tests {
             "引导脚本要认 BUI_C_SOURCE（P4 决策 9）"
         );
     }
+
+    /// spec §5.7：面板「事件」卡。只加一张卡，接到 `/api/incidents`，文本一律 textContent。
+    #[test]
+    fn the_incidents_card_is_embedded_and_wired_to_the_api() {
+        let html = String::from_utf8(web_file("index.html").unwrap()).unwrap();
+        for id in [
+            "id=\"sys-inc-card\"",
+            "id=\"sys-inc-body\"",
+            "id=\"inc-refresh\"",
+        ] {
+            assert!(html.contains(id), "index.html 缺 {id}");
+        }
+        assert!(html.contains("onclick=\"loadIncidents()\""));
+        let js = String::from_utf8(web_file("app.js").unwrap()).unwrap();
+        assert!(js.contains("function loadIncidents()"));
+        assert!(js.contains("api(\"/incidents?limit=20\")"));
+        assert!(
+            js.contains("if (document.getElementById(\"sys-inc-body\")) loadIncidents();"),
+            "登录后自动加载一次"
+        );
+        let body = js.split("function loadIncidents()").nth(1).unwrap();
+        let body = body.split("\nfunction ").next().unwrap();
+        assert!(
+            !body.contains("innerHTML"),
+            "事件文本来自日志，只许 textContent"
+        );
+    }
 }

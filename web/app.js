@@ -1328,8 +1328,52 @@ function loadWatchdogStatus() {
     });
 }
 
+// 日志哨兵事件（spec §5.7）：最近 20 条，新的在前。文本全部来自日志与预案，一律 textContent
+function loadIncidents() {
+    const body = document.getElementById("sys-inc-body");
+    const btn  = document.getElementById("inc-refresh");
+    if (!body) return;
+    _sysShimmer(body);
+    if (btn) { btn.disabled = true; btn.textContent = "刷新中…"; }
+
+    api("/incidents?limit=20").then(r => {
+        if (btn) { btn.disabled = false; btn.textContent = "刷新"; }
+        if (!r || r.error || !Array.isArray(r.incidents)) {
+            _sysErr(body, "读取失败", loadIncidents);
+            return;
+        }
+        _sysClear(body);
+        if (!r.incidents.length) {
+            const row = document.createElement("div");
+            row.className = "sysstat-row";
+            const lbl = document.createElement("span");
+            lbl.className = "sysstat-label-dim";
+            lbl.textContent = "暂无事件";
+            row.appendChild(lbl);
+            body.appendChild(row);
+            return;
+        }
+        const kinds = { error: "bad", warn: "warn", info: "good" };
+        const names = { error: "告警", warn: "警告", info: "信息" };
+        r.incidents.forEach(i => {
+            const wrap = document.createElement("span");
+            const text = document.createElement("span");
+            text.textContent = _sysFmt(i.subject) + " · " + _sysFmt(i.result);
+            text.title = _sysFmt(i.signature) + " → " + _sysFmt(i.action);
+            wrap.append(_sysTag(names[i.level] || _sysFmt(i.level), kinds[i.level] || ""),
+                        document.createTextNode(" "), text);
+            body.appendChild(_sysKv(_sysFmt(i.at).replace("T", " ").replace("Z", ""), wrap));
+        });
+        body.appendChild(_sysKv("总数", String(r.total)));
+    }).catch(() => {
+        if (btn) { btn.disabled = false; btn.textContent = "刷新"; }
+        _sysErr(body, "读取失败", loadIncidents);
+    });
+}
+
 // 在 dashboard 初始化后自动加载一次
 function initSysStatusOnce() {
     if (document.getElementById("sys-resi-body")) loadResiHealth();
     if (document.getElementById("sys-wd-body"))   loadWatchdogStatus();
+    if (document.getElementById("sys-inc-body")) loadIncidents();
 }
