@@ -4,6 +4,7 @@
 
 use crate::profiles::{kind_slug, Mode, Profiles};
 use crate::{Error, Result};
+use std::borrow::Cow;
 use std::collections::VecDeque;
 
 /// 两列菜单左栏的列宽（按 [`display_width`] 计）。
@@ -209,28 +210,145 @@ pub struct Status {
     pub auto_update: bool,
 }
 
-/// 终端列宽：CJK 与全角标点按 2 列（菜单对齐只需要这个精度，不引 unicode-width）。
+/// 歧义宽度字符：真机（tmux）里是 1 列，手机客户端上可能是 2 列（spec §2.2 容量口径）。
+/// 对齐按 [`display_width`] 的 1 列算，判断一行放不放得下按 [`budget_width`] 的 2 列算，
+/// 两种终端都不折行，最坏只是带这些符号的那一行错开 1 列。
+pub const AMBIGUOUS: &str = "★☆●○─…·—–“”‘’→←";
+
+/// 确定只占 1 列的符号白名单：不进 [`AMBIGUOUS`]，容量口径也按 1 列算。
+/// 守门测试靠这两个常量判断渲染输出里的新符号有没有归类。
+pub const NARROW: &str = "✓✗▸";
+
+/// 截断补的省略号，在 [`AMBIGUOUS`] 里，容量口径按 2 列。
+const ELLIPSIS: char = '…';
+
+/// 一个字符的终端列宽：CJK 与全角 2 列，其余 1 列。
+fn char_width(c: char) -> usize {
+    let cp = u32::from(c);
+    let wide = (0x1100..=0x115F).contains(&cp)
+        || (0x2E80..=0xA4CF).contains(&cp)
+        || (0xAC00..=0xD7A3).contains(&cp)
+        || (0xF900..=0xFAFF).contains(&cp)
+        || (0xFE30..=0xFE6F).contains(&cp)
+        || (0xFF00..=0xFF60).contains(&cp)
+        || (0xFFE0..=0xFFE6).contains(&cp)
+        || (0x1F300..=0x1FAFF).contains(&cp);
+    if wide {
+        2
+    } else {
+        1
+    }
+}
+
+/// 一个字符的容量口径列宽：[`AMBIGUOUS`] 里的多算 1 列。
+fn char_budget(c: char) -> usize {
+    char_width(c) + usize::from(AMBIGUOUS.contains(c))
+}
+
+/// 终端列宽：CJK 与全角标点按 2 列，其余（含 ★☆●○─…·✓✗▸）按 1 列，与真机（tmux）实测一致。
+/// 只用来对齐；判断放不放得下用 [`budget_width`]。菜单只需要这个精度，不引 unicode-width。
 pub fn display_width(s: &str) -> usize {
-    s.chars()
-        .map(|c| {
-            let cp = u32::from(c);
-            let wide = (0x1100..=0x115F).contains(&cp)
-                || (0x2E80..=0xA4CF).contains(&cp)
-                || (0xAC00..=0xD7A3).contains(&cp)
-                || (0xF900..=0xFAFF).contains(&cp)
-                || (0xFE30..=0xFE6F).contains(&cp)
-                || (0xFF00..=0xFF60).contains(&cp)
-                || (0xFFE0..=0xFFE6).contains(&cp)
-                || (0x1F300..=0x1FAFF).contains(&cp)
-                || cp == 0x2605
-                || cp == 0x2606;
-            if wide {
-                2
-            } else {
-                1
-            }
-        })
-        .sum()
+    s.chars().map(char_width).sum()
+}
+
+/// 容量口径列宽：[`display_width`] 加上其中 [`AMBIGUOUS`] 字符的个数。
+/// 每一行都要满足 `budget_width ≤ line_limit(终端宽度)`。
+pub fn budget_width(s: &str) -> usize {
+    s.chars().map(char_budget).sum()
+}
+
+/// 一行容量口径的上限：终端宽度减 1，留出最后一列不写（写满整行在有的终端上会多折一行）。
+/// 窄于 40 列按 40 排：40 是「不能崩」的下限，再窄由终端自己折行（spec §2.2）。
+pub fn line_limit(width: usize) -> usize {
+    width.max(40) - 1
+}
+
+/// 显示时要换成 `?` 的字符：C0 控制符、DEL、C1（含 ESC 与 U+0085），
+/// 双向覆盖符（U+202A–202E、U+2066–2069），零宽字符（U+200B–200F、U+FEFF）。
+fn unsafe_for_display(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0}'..='\u{1f}'
+            | '\u{7f}'..='\u{9f}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{feff}'
+    )
+}
+
+/// 外部来的文字（节点名、label、主机、日志、检测站返回的字段）渲染前先过这里，
+/// 控制字符、双向覆盖符、零宽字符一律换成 `?`：`render_*` 零 ANSI 对订阅来的数据也成立，
+/// 名字也没法伪装成别的节点诱导误删。先净化再截断；`profiles.json` 里的原值不动。
+/// 没有要换的字符时原样借出。
+pub fn sanitize(s: &str) -> Cow<'_, str> {
+    if !s.chars().any(unsafe_for_display) {
+        return Cow::Borrowed(s);
+    }
+    Cow::Owned(
+        s.chars()
+            .map(|c| if unsafe_for_display(c) { '?' } else { c })
+            .collect(),
+    )
+}
+
+/// `s` 最长的、容量口径不超过 `budget` 列的前缀（只在字符边界上切）。
+fn prefix_within(s: &str, budget: usize) -> &str {
+    let mut used = 0;
+    for (i, c) in s.char_indices() {
+        used += char_budget(c);
+        if used > budget {
+            return &s[..i];
+        }
+    }
+    s
+}
+
+/// `s` 最长的、容量口径不超过 `budget` 列的后缀（只在字符边界上切）。
+fn suffix_within(s: &str, budget: usize) -> &str {
+    let mut used = 0;
+    for (i, c) in s.char_indices().rev() {
+        used += char_budget(c);
+        if used > budget {
+            return &s[i + c.len_utf8()..];
+        }
+    }
+    s
+}
+
+/// 尾部截断到容量口径 `max_budget` 列以内（按 [`budget_width`] 量，`…` 算 2 列）。
+///
+/// 放得下就原样返回；放不下就从头逐字累加，给 `…` 留出 2 列，下一个字放不下就停：
+/// 不切半个字，所以结果可能比上限窄 1 列。上限连 `…` 都放不下时只留放得下的前缀，不补 `…`。
+/// 只管宽度，不净化，调用方先过 [`sanitize`]。
+pub fn truncate_end(s: &str, max_budget: usize) -> String {
+    if budget_width(s) <= max_budget {
+        return s.to_string();
+    }
+    match max_budget.checked_sub(char_budget(ELLIPSIS)) {
+        Some(room) => format!("{}{ELLIPSIS}", prefix_within(s, room)),
+        None => prefix_within(s, max_budget).to_string(),
+    }
+}
+
+/// 中间截断到容量口径 `max_budget` 列以内：节点名的区别常在尾部（v3 迁来的名字只差时间戳，
+/// 面板导入的名字开头都是同一个域名），两头都要留住。
+///
+/// 扣掉 `…` 的 2 列后，头部约占 40%，尾部拿剩下的；尾部遇到宽字停早了，省下的列再还给头部。
+/// 放得下就原样返回；上限 < 5 时两头都留不下什么，退回 [`truncate_end`]。
+pub fn truncate_middle(s: &str, max_budget: usize) -> String {
+    if budget_width(s) <= max_budget {
+        return s.to_string();
+    }
+    if max_budget < 5 {
+        return truncate_end(s, max_budget);
+    }
+    let room = max_budget - char_budget(ELLIPSIS);
+    // 头尾两段的容量合计不超过 room < budget_width(s)，所以不会重叠
+    let head = prefix_within(s, room * 2 / 5);
+    let tail = suffix_within(s, room - budget_width(head));
+    let head = prefix_within(s, room - budget_width(tail));
+    format!("{head}{ELLIPSIS}{tail}")
 }
 
 /// 右补空格到 `width` 列；超宽不截断（宁可破格，也不切半个字）。
@@ -570,7 +688,55 @@ mod tests {
         assert_eq!(display_width("切换节点"), 8);
         // "HY2" 三个半角 + "直连" 两个全角 = 3 + 4
         assert_eq!(display_width("HY2直连"), 7);
-        assert_eq!(display_width("★"), 2);
+        // 真机（tmux）里 ★ 是 1 列；手机客户端可能是 2 列，那部分由 budget_width 兜
+        assert_eq!(display_width("★"), 1);
+    }
+
+    #[test]
+    fn star_is_one_column_and_ambiguous_counts_twice_in_the_budget() {
+        assert_eq!(display_width("★"), 1);
+        assert_eq!(display_width("中a★"), 4);
+        assert_eq!(budget_width("中a★"), 5);
+        assert_eq!(budget_width("→ [3]"), 6);
+        assert_eq!(budget_width("✓ 通"), 4); // ✓ 在 NARROW，不加
+    }
+
+    #[test]
+    fn sanitize_replaces_controls_bidi_and_zero_width() {
+        assert_eq!(sanitize("a\u{1b}[31mb"), "a?[31mb");
+        assert_eq!(sanitize("x\u{202e}y\u{200b}z\u{85}"), "x?y?z?");
+        assert!(matches!(
+            sanitize("正常-名字"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn truncation_fits_the_budget_and_never_splits_a_character() {
+        for (s, max) in [
+            ("rick-node.example-a.net-reality-direct", 20),
+            ("示例专用名-HY2住宅", 9),
+            ("abc", 3),
+        ] {
+            let e = truncate_end(s, max);
+            let m = truncate_middle(s, max);
+            assert!(budget_width(&e) <= max, "{e}");
+            assert!(budget_width(&m) <= max, "{m}");
+        }
+        assert_eq!(truncate_end("abc", 3), "abc"); // 放得下就原样
+        let m = truncate_middle("rick-node.example-a.net-reality-direct", 20);
+        assert!(
+            m.starts_with("rick-") && m.ends_with("direct") && m.contains('…'),
+            "{m}"
+        );
+        // 「示」2 列 +「…」按 2 = 4 ≤ 5；再加「例」就是 6 > 5，所以只留一个字
+        assert_eq!(truncate_end("示例专用名", 5), "示…");
+    }
+
+    #[test]
+    fn line_limit_floors_at_forty() {
+        assert_eq!(line_limit(80), 79);
+        assert_eq!(line_limit(30), 39);
     }
 
     #[test]
@@ -615,7 +781,7 @@ mod tests {
 
     #[test]
     fn options_rule_ends_where_the_widest_option_row_ends() {
-        // 写死 34 列：SOCKS 模式（[2] 切到 TUN）比选项长 2 列，有新版时又比 [6] 那行短 8 列
+        // 写死 34 列：SOCKS 模式（[2] 切到 TUN）比选项长 2 列，有新版时又比 [6] 那行短 7 列
         let tun = st();
         let socks = Status {
             mode: Mode::Socks,
