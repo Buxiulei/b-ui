@@ -35,6 +35,14 @@ pub struct Incident {
     pub sample: Option<String>,
 }
 
+/// 一个预案的结论：事件的 `subject` / `result` / `level` 由处理它的那一方决定
+#[derive(Debug, Clone, PartialEq)]
+pub struct Outcome {
+    pub subject: String,
+    pub result: String,
+    pub level: Level,
+}
+
 /// 读全部事件（新的在前）；缺失或解析失败按空
 pub fn from_runtime(rt: &RuntimeData) -> Vec<Incident> {
     rt.extra
