@@ -70,3 +70,19 @@ pub async fn pool_ctx(dir: &std::path::Path) -> (DaemonCtx, Arc<FakeHost>) {
         host,
     )
 }
+
+/// 面板的共享句柄（gRPC / hysteria HTTP 全是内存 fake），快照写进 `ctx.paths` 的临时目录
+pub fn panel_shared(
+    ctx: &DaemonCtx,
+) -> (
+    Arc<crate::modules::panel::Shared>,
+    crate::modules::panel::fakes::FakeXray,
+) {
+    let xray = crate::modules::panel::fakes::FakeXray::new();
+    let shared = Arc::new(crate::modules::panel::Shared::new(
+        Box::new(xray.clone()),
+        Box::new(crate::modules::panel::fakes::FakeHy2::new()),
+    ));
+    shared.set_paths(&ctx.paths);
+    (shared, xray)
+}
