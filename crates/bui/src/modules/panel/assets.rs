@@ -340,6 +340,50 @@ mod tests {
         assert!(html.contains("onclick=\"rotateSub()\""));
     }
 
+    /// 轮换那一下的两条失效面（2026-09-14 二轮审查的两个阻断项），都是「凭据已经换了、
+    /// 弹窗还停在旧值上」的同一个根因，所以锁在一处：
+    ///
+    /// 1. `rotateSub` 成功后清空 `currentShowUser` 等列表刷新。`#cfg-buttons` 里三个
+    ///    复制/下载按钮全程可点（只有 `#cfg-rotate` 被 disable），所以三个出口都必须先
+    ///    确认有选中用户 —— 否则这段空窗里点复制，拿到的是 `#uri` 里剩的**已作废**那条
+    ///    链接 + 一句「已复制」，端点对作废 token 一律回 404。
+    /// 2. 那次刷新失败（网络抖动、`/api/users` 或 `/api/stats` 500）时必须把
+    ///    `currentShowUser` 还原。留着 null 的话 `syncOpenConfig` 第一句直接 return，
+    ///    5 秒一轮的自愈通道被自己关掉，弹窗**永久**停在作废链接上，再点「重置」也只会
+    ///    说「请先选择用户」，而管理员看到的唯一信号是一句「请求失败」。
+    #[test]
+    fn app_js_never_leaves_the_config_modal_on_revoked_credentials() {
+        let js = String::from_utf8(web_file("app.js").unwrap()).unwrap();
+        let body_of = |head: &str| {
+            js.split(head)
+                .nth(1)
+                .unwrap_or_else(|| panic!("app.js 缺 {head}"))
+                .split("\nfunction ")
+                .next()
+                .unwrap()
+                .to_string()
+        };
+        for head in [
+            "function copy()",
+            "function downloadSubscription()",
+            "function copyClash()",
+        ] {
+            assert!(
+                body_of(head).contains("if (!currentShowUser)"),
+                "{head} 缺「有没有选中用户」门禁：轮换后的空窗里它会把作废的那份递出去"
+            );
+        }
+        let rotate = body_of("function rotateSub()");
+        assert!(
+            rotate.contains("currentShowUser = null"),
+            "rotateSub 该先清空 currentShowUser，本会话自己改的不再弹「别人改的」那条"
+        );
+        assert!(
+            rotate.contains("currentShowUser = x;"),
+            "rotateSub 的刷新失败分支没把 currentShowUser 还原，syncOpenConfig 自愈通道会被关掉"
+        );
+    }
+
     /// 跨阶段的字段名契约：前端只认驼峰 `subToken`，而 [`super::super::users::PanelUser`]
     /// 的单词字段走 serde 默认名、多词字段才逐个 `rename`。轮换那一阶段若把
     /// `sub_token` 按默认名落下，投影发出的就是 `sub_token`，`subPath()` 对**每个**用户

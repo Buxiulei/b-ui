@@ -450,12 +450,17 @@ function syncOpenConfig(users) {
     if (!fresh) return;
     if (["subToken", "password", "uuid"].every(k => fresh[k] === old[k])) return;
     showU(fresh.username);
+    // 第二个参数选的是警告样式（橙色三角），这是有意的：管理员屏幕上那条链接刚刚作废，
+    // 已经发给用户的旧链接也一起废了，不是一条可以扫过去的普通告知。
     toast("该用户的订阅链接与凭据已被重置，弹窗已按新值刷新", 1);
 }
 
 // Copy URI
 function copy() {
-    const fusion = currentShowUser && currentShowUser.protocol === "fusion";
+    // 没有选中用户就别把 #uri 里剩的那份文本递出去：轮换后它是已作废的链接，
+    // 端点回 404，而管理员收到的是一句「已复制」。下面两个出口同一门禁。
+    if (!currentShowUser) return toast("请先选择用户", 1);
+    const fusion = currentShowUser.protocol === "fusion";
     if (fusion && !currentShowUser.subToken) return toast(SUB_TOKEN_MISSING, 1);
     navigator.clipboard.writeText($("#uri").innerText);
     if (fusion) {
@@ -494,20 +499,34 @@ function rotateSub() {
         "旧订阅链接、旧 Hysteria2 密码与旧 VLESS UUID 立刻失效：该用户现有的客户端会断连，" +
         "必须把新链接重新导入一次。")) return;
     const btn = document.getElementById("cfg-rotate");
-    const done = () => { if (btn) { btn.disabled = false; btn.textContent = "重置订阅链接与凭据"; } };
+    // 文案原文在 index.html 里，这里捕获一次再还原：硬编码一份的话，改了 HTML 忘了改
+    // 这里，重置一次按钮就悄悄换回旧文案。
+    const label = btn ? btn.textContent : "";
+    const done = () => { if (btn) { btn.disabled = false; btn.textContent = label; } };
     if (btn) { btn.disabled = true; btn.textContent = "重置中…"; }
     api("/users/" + encodeURIComponent(x.username) + "/rotate", { method: "POST", body: JSON.stringify({}) })
         .then(r => {
             if (!r || !r.success) { done(); return toast((r && r.error) || "重置失败", 1); }
             // 链接与二维码都来自 allUsers 里的面板投影，等列表刷新完再按新 token 重画。
             // 先清掉 currentShowUser：本会话自己发起的这次变化不该再被 syncOpenConfig
-            // 当成「别人改的」弹第二条提示；这段空窗里点复制会提示「请先选择用户」，
-            // 比复制出一条已作废的链接好。
+            // 当成「别人改的」弹第二条提示；这段空窗里点复制/下载都只会提示「请先选择
+            // 用户」（三个出口的门禁见上），不会把已作废的那份递出去。
             currentShowUser = null;
             return load().then(() => {
                 done();
                 showU(x.username);
                 toast("已重置，请把新订阅链接重新导入客户端");
+            }, () => {
+                // 轮换已经生效，只是这一轮列表刷新没回来（网络抖动、/api/users 或
+                // /api/stats 500）。必须把 currentShowUser 还原回去：留着 null 的话
+                // syncOpenConfig 第一句就 return，5 秒一轮的自愈通道被自己关掉，弹窗
+                // 会永久停在那条已作废的链接上，再点「重置」也只会说「请先选择用户」。
+                // 还原后下一轮 load() 就能按新值把弹窗拉回来。
+                // 用 then 的第二参而不是链一个 .catch：后者会把 showU / toast 自己抛的
+                // 异常也当成「刷新失败」报出去。
+                currentShowUser = x;
+                done();
+                toast("已重置，但这一轮用户列表没刷新成功：弹窗里的链接稍后自动更新", 1);
             });
         })
         .catch(e => { done(); toast(e.message || "请求失败", 1); });
