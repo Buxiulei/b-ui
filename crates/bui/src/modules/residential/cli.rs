@@ -573,46 +573,105 @@ pub fn format_blacklist(v: &serde_json::Value) -> String {
     }
     let auto = as_arr(v, "auto");
     out.push(format!("自动 {} 条：", auto.len()));
-    for a in auto {
-        out.push(format!(
-            "  - [{}] {} 上游 {} 命中 {} 复核通过 {} 确认于 {}",
-            as_str(a, "kind"),
-            as_str(a, "value"),
-            as_str(a, "upstream_name"),
-            as_u64(a, "hits"),
-            as_u64(a, "passes"),
-            as_str(a, "confirmed_at"),
-        ));
-    }
+    out.extend(upstream_groups(
+        auto,
+        |a| format!("[{}] {}", as_str(a, "kind"), as_str(a, "value")),
+        |a| {
+            format!(
+                "命中 {} 复核通过 {} 确认于 {}",
+                as_u64(a, "hits"),
+                as_u64(a, "passes"),
+                as_str(a, "confirmed_at"),
+            )
+        },
+    ));
     let pending = as_arr(v, "pending");
     out.push(format!(
         "待生效 {} 条（下一个 04:00 窗口批量写入）：",
         pending.len()
     ));
-    for p in pending {
-        out.push(format!(
-            "  - {}:{} 已确认 {} 次，最近 {}",
-            as_str(p, "host"),
-            as_u64(p, "port"),
+    out.extend(upstream_groups(pending, host_port, |p| {
+        format!(
+            "已确认 {} 次，最近 {}",
             as_u64(p, "confirms"),
             as_str(p, "last_confirm_at"),
-        ));
-    }
+        )
+    }));
     let cands = as_arr(v, "candidates");
     out.push(format!("候选 {} 条：", cands.len()));
-    for c in cands {
-        out.push(format!(
-            "  - {}:{} 被拒 {} 次，最近 {}",
-            as_str(c, "host"),
-            as_u64(c, "port"),
+    out.extend(upstream_groups(cands, host_port, |c| {
+        format!(
+            "被拒 {} 次，最近 {}",
             as_u64(c, "hits"),
             as_str(c, "last_seen"),
-        ));
-    }
+        )
+    }));
     for n in as_arr(v, "notes") {
         out.push(format!("说明：{}", n.as_str().unwrap_or_default()));
     }
     out.join("\n")
+}
+
+fn host_port(r: &serde_json::Value) -> String {
+    format!("{}:{}", as_str(r, "host"), as_u64(r, "port"))
+}
+
+/// 黑名单条目按上游分组（按首次出现的顺序）：组标题写上游名、槽位与 host:port，
+/// 组内按 `key` 去重，重复的只列首条并标 `×N`。三个上游学到同一批域名时不再平铺成
+/// 「看着重复三遍」的一长串。
+fn upstream_groups(
+    rows: &[serde_json::Value],
+    key: impl Fn(&serde_json::Value) -> String,
+    detail: impl Fn(&serde_json::Value) -> String,
+) -> Vec<String> {
+    // (upstream_id, 组内首条, [(key, 首条, 次数)])
+    type Group<'a> = (
+        &'a str,
+        &'a serde_json::Value,
+        Vec<(String, &'a serde_json::Value, usize)>,
+    );
+    let mut groups: Vec<Group> = Vec::new();
+    for r in rows {
+        let id = as_str(r, "upstream_id");
+        let gi = match groups.iter().position(|g| g.0 == id) {
+            Some(i) => i,
+            None => {
+                groups.push((id, r, Vec::new()));
+                groups.len() - 1
+            }
+        };
+        let k = key(r);
+        let items = &mut groups[gi].2;
+        match items.iter_mut().find(|it| it.0 == k) {
+            Some(it) => it.2 += 1,
+            None => items.push((k, r, 1)),
+        }
+    }
+    let mut out = Vec::new();
+    for (_, head, items) in groups {
+        let slot = head
+            .get("upstream_slot")
+            .and_then(|x| x.as_u64())
+            .map_or_else(|| "-".to_string(), |i| i.to_string());
+        let addr = match as_str(head, "upstream_addr") {
+            "" => "-",
+            a => a,
+        };
+        out.push(format!(
+            "  上游 {}（槽 {slot}，{addr}）{} 条：",
+            as_str(head, "upstream_name"),
+            items.len(),
+        ));
+        for (k, r, n) in items {
+            let times = if n > 1 {
+                format!(" ×{n}")
+            } else {
+                String::new()
+            };
+            out.push(format!("    - {k}{times} {}", detail(r)));
+        }
+    }
+    out
 }
 
 fn print_or(json: bool, v: &serde_json::Value, f: impl Fn(&serde_json::Value) -> String) {
@@ -1191,6 +1250,69 @@ mod tests {
         assert!(
             out.contains("软封锁"),
             "局限说明要出现在 CLI 输出里（spec §5.4）"
+        );
+    }
+
+    /// 真机：三个 Decodo 上游各自学到同一批支付域名，旧渲染逐条平铺、不写上游，
+    /// 看着像重复三遍。按上游分组：组标题写名字 / 槽位 / host:port，组内按 host:port 去重计数。
+    #[test]
+    fn pending_and_candidates_are_grouped_by_upstream_and_deduped_within_one() {
+        let ups = [
+            (
+                "00000000-0000-0000-0000-00000000000a",
+                "url-1",
+                0,
+                "isp1.example.net:10001",
+            ),
+            (
+                "00000000-0000-0000-0000-00000000000b",
+                "url-2",
+                1,
+                "isp2.example.net:10002",
+            ),
+            (
+                "00000000-0000-0000-0000-00000000000c",
+                "url-3",
+                2,
+                "isp3.example.net:10003",
+            ),
+        ];
+        let row = |u: &(&str, &str, u64, &str), host: &str| {
+            serde_json::json!({"upstream_id": u.0, "upstream_name": u.1, "upstream_slot": u.2,
+                "upstream_addr": u.3, "host": host, "port": 443, "confirms": 2, "hits": 5,
+                "last_confirm_at": "2026-09-12T00:00:00Z", "last_seen": "2026-09-12T00:00:00Z"})
+        };
+        let mut pending = Vec::new();
+        for u in &ups {
+            pending.push(row(u, "api.stripe.com"));
+        }
+        // 同一上游内重复一条 ⇒ 只列一次、带计数
+        pending.push(row(&ups[0], "api.stripe.com"));
+        let cands: Vec<_> = ups.iter().map(|u| row(u, "pay.google.com")).collect();
+        let out = format_blacklist(&serde_json::json!({
+            "pins": [], "auto": [], "pending": pending, "candidates": cands, "notes": []
+        }));
+        for (_, name, slot, addr) in &ups {
+            let title = format!("上游 {name}（槽 {slot}，{addr}）");
+            assert_eq!(
+                out.matches(&title).count(),
+                2,
+                "待生效与候选各一个组标题：{out}"
+            );
+        }
+        assert_eq!(out.matches("api.stripe.com:443").count(), 3, "{out}");
+        assert_eq!(out.matches("pay.google.com:443").count(), 3, "{out}");
+        assert!(out.contains("×2"), "组内重复要计数：{out}");
+        // 段标题仍报原始条数（与 status 摘要同一口径）
+        assert!(out.contains("待生效 4 条"), "{out}");
+        assert!(out.contains("候选 3 条"), "{out}");
+        // status 摘要行不受影响
+        let st = format_status(&serde_json::json!({
+            "blacklist": {"pins": 0, "auto": 0, "pending": 4, "candidates": 3}
+        }));
+        assert!(
+            st.contains("黑名单：钉住 0 / 自动 0 / 待生效 4 / 候选 3"),
+            "{st}"
         );
     }
 
