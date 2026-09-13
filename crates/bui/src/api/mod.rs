@@ -27,6 +27,10 @@ pub fn router(state: AppState, modules: &[Arc<dyn Module>]) -> axum::Router {
         .route(
             "/api/system/hy2-auth",
             axum::routing::post(system::set_hy2_auth),
+        )
+        .route(
+            "/api/system/legacy-sub",
+            axum::routing::post(system::set_legacy_sub),
         );
     let protected = modules
         .iter()
@@ -363,6 +367,65 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
         assert_eq!(mode(), bui_schema::model::Hy2Auth::Command, "非法值不落盘");
+    }
+
+    /// `POST /api/system/legacy-sub`（`bui set legacy-sub` 的落点）：`until: null` 停用、
+    /// RFC3339 改期、垃圾值 400 且什么都不写。
+    #[tokio::test]
+    async fn the_legacy_sub_endpoint_writes_the_deadline_or_clears_it() {
+        let (app, d, _h, _rt) = app_with_runtime().await;
+        let token = login(&app).await;
+        let until = || -> Option<String> {
+            let bytes = std::fs::read(d.path().join("state.json")).unwrap();
+            serde_json::from_slice::<bui_schema::model::State>(&bytes)
+                .unwrap()
+                .system
+                .legacy_sub_until
+        };
+        assert_eq!(until(), None, "sample_state 没有宽限期");
+
+        let res = app
+            .clone()
+            .oneshot(with_token(
+                post(
+                    "/api/system/legacy-sub",
+                    serde_json::json!({"until": "2026-09-21T00:00:00Z"}),
+                ),
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(json(res).await["legacy_sub_until"], "2026-09-21T00:00:00Z");
+        assert_eq!(until().as_deref(), Some("2026-09-21T00:00:00Z"));
+
+        let res = app
+            .clone()
+            .oneshot(with_token(
+                post(
+                    "/api/system/legacy-sub",
+                    serde_json::json!({"until": "下周"}),
+                ),
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            until().as_deref(),
+            Some("2026-09-21T00:00:00Z"),
+            "非法值不落盘"
+        );
+
+        let res = app
+            .oneshot(with_token(
+                post("/api/system/legacy-sub", serde_json::json!({"until": null})),
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(until(), None, "null ⇒ 立刻停用全部用户名链接");
     }
 
     #[tokio::test]

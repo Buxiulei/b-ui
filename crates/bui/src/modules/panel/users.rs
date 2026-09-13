@@ -9,6 +9,7 @@ use super::xray::{rmu_args, xray_program};
 use super::{Shared, TxRx, XRAY_INBOUND_TAGS};
 use crate::api::Event;
 use crate::reconcile::DaemonCtx;
+use crate::state::store::Store;
 use bui_schema::model::{
     Billing, Credentials, Entitlements, NodeParams, PortalAuth, Protocol, Residential,
     ResidentialEntitlement, State, TrafficLimit, Usage, User, DEFAULT_GROUP,
@@ -255,7 +256,47 @@ pub fn new_user(req: &CreateRequest, now: OffsetDateTime) -> Result<User, String
         usage: Usage::default(),
         portal_auth: PortalAuth::default(),
         billing: Billing::default(),
+        // 2026-09-14 裁决：建出来就带随机订阅 token（四个免鉴权端点的路径末段）。
+        // 装机首用户也走这里（`commands::install::first_user`），所以三条建用户路径里
+        // 有两条由这一行负责，第三条是 `bui_schema::v3::user_from_v3`。
+        sub_token: Some(bui_schema::sub::new_sub_token()),
+        legacy_sub_disabled: false,
     })
+}
+
+/// 守护进程启动时把订阅 token 补齐（2026-09-14 裁决），形状照
+/// `residential::slots::migrate_on_start`：**幂等**、零变更不写盘，所以每次启动无条件调。
+///
+/// 三条建用户路径都自带 token，所以这里只管「升级上来的老 `state.json`」：
+/// - 给每个 `sub_token == None` 的用户生成一个；
+/// - **补出过 token** 且全局宽限期还没设过时，把宽限期设成「本次启动 +
+///   `sub::LEGACY_SUB_GRACE_DAYS` 天」—— 那些用户手里拿的是用户名链接，不给宽限期
+///   等于升级那一刻把他们全掐了。全新装机一个都补不出来 ⇒ 不设宽限期 ⇒ 用户名链接
+///   从来不可用；已经设过（v3 导入、或运维自己设的）就不覆盖。
+///
+/// 返回补齐的用户数。日志**只写个数**：token 是凭据，一个字都不许进 journal。
+pub async fn backfill_sub_tokens(store: &Store, now: OffsetDateTime) -> anyhow::Result<usize> {
+    let mut filled = 0usize;
+    let n = &mut filled;
+    store
+        .update(|s| {
+            for u in s.users.iter_mut().filter(|u| u.sub_token.is_none()) {
+                u.sub_token = Some(bui_schema::sub::new_sub_token());
+                *n += 1;
+            }
+            if *n > 0 && s.system.legacy_sub_until.is_none() {
+                s.system.legacy_sub_until = Some(bui_schema::sub::legacy_sub_deadline(now));
+            }
+        })
+        .await?;
+    if filled > 0 {
+        tracing::info!(
+            users = filled,
+            grace_days = bui_schema::sub::LEGACY_SUB_GRACE_DAYS,
+            "已给既有用户补随机订阅 token，旧用户名链接进入宽限期"
+        );
+    }
+    Ok(filled)
 }
 
 pub fn apply_update(u: &mut User, req: &UpdateRequest, now: OffsetDateTime) -> Result<(), String> {
@@ -868,6 +909,126 @@ mod tests {
         let mut u = ignored.clone();
         apply_update(&mut u, &upd, t0()).unwrap();
         assert_eq!(u, ignored, "只传 speed 时用户一个字段都不该变");
+    }
+
+    /// 2026-09-14 裁决：面板建用户（装机首用户走同一个函数）一律带随机订阅 token，
+    /// 且不停用用户名链接（停用只由轮换做）。
+    #[test]
+    fn new_user_carries_a_random_sub_token() {
+        let make = || {
+            new_user(
+                &CreateRequest {
+                    username: "bob".into(),
+                    ..Default::default()
+                },
+                t0(),
+            )
+            .unwrap()
+        };
+        let u = make();
+        let t = u.sub_token.as_deref().expect("建出来就该有 token");
+        assert!(bui_schema::sub::is_sub_token(t), "{t}");
+        assert!(!u.legacy_sub_disabled);
+        assert_ne!(make().sub_token, u.sub_token, "每个用户一个新随机值");
+    }
+
+    /// 升级上来的老 `state.json`（用户都没有 token）：一次补齐所有人 + 开 7 天宽限期，
+    /// 第二次启动零变更（连备份都不该多一份）。
+    #[tokio::test]
+    async fn backfill_fills_missing_tokens_once_and_opens_the_grace_window() {
+        let d = tempfile::tempdir().unwrap();
+        let mut st = sample_state();
+        let proto = st.users[0].clone();
+        st.users = vec![proto.clone(), proto];
+        st.users[1].username = "bob".into();
+        st.users[1].user_id = uuid::Uuid::from_u128(0x2000);
+        let store = Store::create(d.path().join("state.json"), st)
+            .await
+            .unwrap();
+
+        assert_eq!(backfill_sub_tokens(&store, t0()).await.unwrap(), 2);
+        let s = store.read().await;
+        let tokens: Vec<String> = s
+            .users
+            .iter()
+            .map(|u| u.sub_token.clone().unwrap())
+            .collect();
+        assert!(
+            tokens.iter().all(|t| bui_schema::sub::is_sub_token(t)),
+            "{tokens:?}"
+        );
+        assert_ne!(tokens[0], tokens[1], "每人一个独立 token");
+        assert_eq!(
+            s.system.legacy_sub_until.as_deref(),
+            Some("2026-09-18T00:00:00Z"),
+            "补出过 token ⇒ 宽限期 = 启动时刻 + 7 天"
+        );
+        let backups = || {
+            std::fs::read_dir(d.path().join("state.backups"))
+                .map(|it| it.count())
+                .unwrap_or(0)
+        };
+        let after_first = backups();
+
+        // 幂等：第二遍一个字段都不动，Store 的零变更比对因此不写盘
+        assert_eq!(backfill_sub_tokens(&store, t0()).await.unwrap(), 0);
+        let s2 = store.read().await;
+        assert_eq!(
+            s2.users
+                .iter()
+                .map(|u| u.sub_token.clone())
+                .collect::<Vec<_>>(),
+            s.users
+                .iter()
+                .map(|u| u.sub_token.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(s2.system.legacy_sub_until, s.system.legacy_sub_until);
+        assert_eq!(
+            backups(),
+            after_first,
+            "零变更不许再写一次盘（不该多一份备份）"
+        );
+    }
+
+    /// 已经有宽限期（v3 导入设的、或运维自己改的）时不覆盖：补 token 不该把
+    /// 运维刚收紧的截止时刻又推后 7 天。
+    #[tokio::test]
+    async fn backfill_never_overwrites_an_existing_grace_window() {
+        let d = tempfile::tempdir().unwrap();
+        let mut st = sample_state();
+        st.system.legacy_sub_until = Some("2026-09-15T12:00:00Z".into());
+        let store = Store::create(d.path().join("state.json"), st)
+            .await
+            .unwrap();
+
+        assert_eq!(backfill_sub_tokens(&store, t0()).await.unwrap(), 1);
+        assert_eq!(
+            store.read().await.system.legacy_sub_until.as_deref(),
+            Some("2026-09-15T12:00:00Z")
+        );
+    }
+
+    /// 全新装机：首用户建号时就有 token ⇒ 一个都补不出来 ⇒ **不设**宽限期，
+    /// 用户名链接在这台机器上从来不可用。
+    #[tokio::test]
+    async fn a_fresh_install_never_opens_the_grace_window() {
+        let d = tempfile::tempdir().unwrap();
+        let mut st = sample_state();
+        st.users = vec![new_user(
+            &CreateRequest {
+                username: "alice".into(),
+                ..Default::default()
+            },
+            t0(),
+        )
+        .unwrap()];
+        let store = Store::create(d.path().join("state.json"), st)
+            .await
+            .unwrap();
+
+        assert_eq!(backfill_sub_tokens(&store, t0()).await.unwrap(), 0);
+        assert_eq!(store.read().await.system.legacy_sub_until, None);
     }
 
     #[test]

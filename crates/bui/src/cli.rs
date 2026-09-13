@@ -139,6 +139,12 @@ pub enum SetCmd {
         #[arg(value_parser = ["http", "command"])]
         mode: String,
     },
+    /// 旧「用户名订阅链接」的全局宽限期：`off` 立刻停用全部用户名链接（只认随机 token），
+    /// 或给一个 RFC3339 时刻（如 `2026-09-21T00:00:00Z`）改期。
+    LegacySub {
+        /// `off` 或 RFC3339 时刻；取值合法性由 `commands::config::parse_legacy_sub` 判。
+        value: String,
+    },
 }
 
 /// `/usr/local/bin/b-ui` 这个符号链接裸跑时进菜单（spec §1、§2.4）。
@@ -381,6 +387,26 @@ mod tests {
         assert!(Cli::try_parse_from(["bui", "set", "hy2-auth", "userpass"]).is_err());
         assert!(Cli::try_parse_from(["bui", "set", "hy2-auth"]).is_err());
         assert!(Cli::try_parse_from(["bui", "set"]).is_err());
+    }
+
+    /// `bui set legacy-sub off|<RFC3339>`（2026-09-14 裁决的收口开关）。取值形状不由 clap 管
+    /// （RFC3339 写不进 `value_parser`），但**必须收到一个值**：`bui set legacy-sub` 裸跑要报错，
+    /// 不能被当成「off」把所有人的旧链接一把掐掉。
+    #[test]
+    fn parses_the_legacy_sub_switch_and_needs_a_value() {
+        for value in ["off", "2026-09-21T00:00:00Z"] {
+            assert_eq!(
+                Cli::try_parse_from(["bui", "set", "legacy-sub", value])
+                    .unwrap()
+                    .command,
+                Some(Command::Set {
+                    cmd: SetCmd::LegacySub {
+                        value: value.into()
+                    }
+                })
+            );
+        }
+        assert!(Cli::try_parse_from(["bui", "set", "legacy-sub"]).is_err());
     }
 
     #[test]

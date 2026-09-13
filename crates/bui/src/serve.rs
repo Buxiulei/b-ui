@@ -450,6 +450,13 @@ pub async fn run(paths: Paths, host: Arc<dyn Host>) -> anyhow::Result<()> {
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %e, "住宅槽位迁移失败，本次启动按单槽渲染"),
     }
+    // 2026-09-14 裁决：升级上来的老 `state.json` 里的用户没有随机订阅 token，启动时补齐，
+    // 并给他们手里那条「用户名链接」开宽限期。幂等、零变更不写盘，所以无条件跑一次；
+    // 失败只告警、下次启动重试——写盘失败时挡住启动只会让面板与四个订阅端点一起停摆。
+    if let Err(e) = crate::modules::panel::users::backfill_sub_tokens(&ctx.store, host.now()).await
+    {
+        tracing::warn!(error = %e, "补随机订阅 token 失败，下次启动重试");
+    }
     // 启动时先对账一次，再拉起后台任务
     match reconcile_from_ctx(&ctx, &mods, fetcher.clone(), false, false).await {
         Ok(r) => {

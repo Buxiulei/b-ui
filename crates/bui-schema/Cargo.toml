@@ -18,6 +18,8 @@ hex.workspace = true
 thiserror.workspace = true
 argon2.workspace = true
 rand.workspace = true
+# 订阅 token 的宽限期截止时刻（`sub::legacy_sub_deadline`）与 v3 导入都要算日期
+time.workspace = true
 
 [dev-dependencies]
 pretty_assertions.workspace = true

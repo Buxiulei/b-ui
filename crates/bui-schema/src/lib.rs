@@ -34,6 +34,13 @@
 //! - [`slots::sync_slots`] / [`slots::least_loaded`] / [`slots::assign`] /
 //!   [`slots::migrate_unassigned`] / [`slots::rebalance`]：spec §5.6 的分配规则，纯函数。
 //!
+//! ## 订阅 token 与旧链接宽限期 —— [`sub`]
+//!
+//! - [`sub::new_sub_token`] / [`sub::is_sub_token`]：每用户随机订阅 token（32 位小写十六进制）
+//!   的生成与严格判定，四个免鉴权端点按它在「token」与「用户名」之间分流。
+//! - [`sub::LEGACY_SUB_GRACE_DAYS`] / [`sub::legacy_sub_deadline`]：旧「用户名链接」的宽限期。
+//! - [`sub::sub_urls`]：把「域名 + token」拼成四条订阅地址（[`SubUrls`](sub::SubUrls)）。
+//!
 //! ## 解析器 —— [`parse`]
 //!
 //! - [`parse::upstream_url`]：把住宅上游的四种粘贴写法归一成 [`UpstreamInput`](parse::UpstreamInput)。
@@ -95,6 +102,7 @@ pub mod parse;
 pub mod paths;
 pub mod render;
 pub mod slots;
+pub mod sub;
 pub mod v3;
 
 pub use model::State;
