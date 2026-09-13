@@ -533,7 +533,7 @@ fn save_import<S: Sys, N: Net, P: Prompt>(
     if activate || !had_active {
         apply_with_ufw(ctx, &prof)?;
         ctx.say(format!(
-            "当前节点：{}",
+            "{CURRENT_NODE_HEAD}{}",
             prof.active.clone().unwrap_or_default()
         ));
     } else if prof
@@ -766,7 +766,7 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
             }
             apply_with_ufw(ctx, &prof)?;
             ctx.say(format!(
-                "当前节点：{}",
+                "{CURRENT_NODE_HEAD}{}",
                 prof.active.clone().unwrap_or_default()
             ));
             Ok(())
@@ -885,38 +885,45 @@ fn run_check<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>, manual: bool
 /// 进菜单前问一次。已迁移的机器按约定留着 v3 目录当回滚素材，单元文件已卸掉，删光节点后
 /// 不再邀请（spec §5.7）。只问一次；答否就给出手动入口。`check` / `update` 这类非交互路径
 /// **不**走这里——让 timer 悄悄改用户配置是更坏的行为。
-fn offer_v3_import<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()> {
+///
+/// 问了就返回 `Some(Outcome)`，由 [`menu_body`] 照主循环的规矩收尾：进循环的第一件事就是
+/// 清屏，导入失败的原因不停下来就被抹掉了，而这正是迁移那一刻。导入经 [`run_sub`]（`yes: false`）。
+fn offer_v3_import<S: Sys, N: Net, P: Prompt>(
+    ctx: &mut Ctx<'_, S, N, P>,
+) -> Result<Option<Outcome>> {
     let prof = Profiles::load(ctx.sys, ctx.paths)?;
     if !prof.profiles.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let base = PathBuf::from(import_v3::V3_BASE);
+    // 先看 v3 目录：新装机没有它，就不必每次进菜单再去 stat 三个单元文件
+    if !import_v3::detect(ctx.sys, &base) {
+        return Ok(None);
+    }
     let unmigrated = import_v3::V3_UNITS
         .iter()
         .any(|u| ctx.sys.exists(&ctx.paths.unit(u)));
-    if !import_v3::detect(ctx.sys, &base) || !unmigrated {
-        return Ok(());
+    if !unmigrated {
+        return Ok(None);
     }
     ctx.say(format!("发现 v3 客户端目录 {}", base.display()));
     ctx.flush();
-    if ctx.prompt.confirm("现在导入 v3 的节点并卸载旧单元吗？")? {
-        let sub = Cli {
-            json: false,
-            yes: ctx.yes,
-            cmd: Some(Cmd::ImportV3 {
+    let out = if ctx.prompt.confirm("现在导入 v3 的节点并卸载旧单元吗？")? {
+        run_sub(
+            ctx,
+            Cmd::ImportV3 {
                 base: None,
                 panel: None,
                 mode: None,
-            }),
-        };
-        if let Err(e) = dispatch(&sub, ctx) {
-            ctx.say(format!("导入失败：{e}"));
-        }
+            },
+        )
     } else {
-        ctx.say("已跳过。随时可以跑 `bui-c import-v3`，或在菜单里选 [7] 从 v3 导入");
-    }
-    ctx.flush();
-    Ok(())
+        note(
+            ctx,
+            "已跳过。随时可以跑 `bui-c import-v3`，或在菜单里选 [7] 从 v3 导入",
+        )
+    };
+    Ok(Some(out))
 }
 
 /// 菜单里一个动作做完之后怎么回主菜单（spec §4.1–§4.3）：停不停、「上次：」行写什么。
@@ -943,15 +950,20 @@ impl Outcome {
     }
 }
 
+/// 首次导入、从 v3 导入之后打的「当前节点：X」。回主菜单后状态区本来就显示当前节点，
+/// 它不算附加行，不因为它停（审查裁定；[`outcome_since`] 数行时跳过它）。
+const CURRENT_NODE_HEAD: &str = "当前节点：";
+
 /// 从 transcript 的 `start` 起新打的内容定 [`Outcome`]，照 spec §4.3 的一条标准：失败，或者
 /// 这个动作自己打了不止一行 → 停；否则不停。有「失败：」行 → 停，摘要就是它；多于一行 → 停，
-/// 摘要取第一行；只有一行 → 不停，它进「上次：」行；什么都没打 → 「上次：」行不变。空行不算。
+/// 摘要取第一行；只有一行 → 不停，它进「上次：」行；什么都没打 → 「上次：」行不变。空行与
+/// [`CURRENT_NODE_HEAD`] 行不算。
 fn outcome_since<S: Sys, N: Net, P: Prompt>(ctx: &Ctx<'_, S, N, P>, start: usize) -> Outcome {
     // transcript 只追加不截断，`start` 一定落在字符边界上
     let new: Vec<&str> = ctx.transcript[start..]
         .lines()
         .map(str::trim)
-        .filter(|l| !l.is_empty())
+        .filter(|l| !l.is_empty() && !l.starts_with(CURRENT_NODE_HEAD))
         .collect();
     if let Some(fail) = new.iter().find(|l| l.starts_with("失败：")) {
         return Outcome::Pause(fail.to_string());
@@ -989,13 +1001,25 @@ fn note<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>, text: impl Into<S
     Outcome::Note(text)
 }
 
-/// 菜单里切节点（[1] 选编号、[3] 导入后答 y）：经 [`run_sub`] 转手 `Cmd::Switch`。摘要里的
-/// 节点名按当前宽度单独中间截断（spec §0.2 R6）：整行截尾会把 `…-reality-direct` 与
-/// `…-reality-resi` 截成一个样子。
+/// 菜单里切节点（[1] 选编号、[3] 导入后答 y）：经 [`run_sub`] 转手 `Cmd::Switch`，停不停照
+/// [`outcome_since`]。摘要显式写切换的结果（spec §11.2），不取第一行：TUN 下第一次切换时第一行
+/// 是「已为 bui-tun 接口放行 UFW…」。失败照旧用「失败：…」那一行。
+///
+/// 摘要里的节点名按当前宽度单独中间截断（spec §0.2 R6）：整行截尾会把 `…-reality-direct`
+/// 与 `…-reality-resi` 截成一个样子。
 fn switch_node<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>, name: String) -> Outcome {
     let width = ctx.width();
-    run_sub(ctx, Cmd::Switch { name: name.clone() })
-        .map_summary(|s| menu::fit_name_in_last(&s, &name, width))
+    let already = Profiles::load(ctx.sys, ctx.paths)
+        .is_ok_and(|p| p.active.as_deref() == Some(name.as_str()));
+    let done = if already {
+        format!("已是当前节点：{name}")
+    } else {
+        format!("已切到 {name}")
+    };
+    run_sub(ctx, Cmd::Switch { name: name.clone() }).map_summary(|s| {
+        let s = if s.starts_with("失败：") { s } else { done };
+        menu::fit_name_in_last(&s, &name, width)
+    })
 }
 
 pub fn menu_loop<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()> {
@@ -1013,9 +1037,14 @@ pub fn menu_loop<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Resul
 /// 主循环（spec §4.1）：交互终端里每次重画前清屏，永远只有一屏主菜单；上一个动作的一行
 /// 摘要显示在底部的「上次：」行。
 fn menu_body<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()> {
-    offer_v3_import(ctx)?;
     // 只活在这一次菜单会话里，不落盘：明天另一个家人打开菜单，看到别人的「上次」只会困惑
     let mut last: Option<String> = None;
+    // 进菜单前的 v3 导入邀请也照规矩收尾：下面第一件事就是清屏
+    if let Some(out) = offer_v3_import(ctx)? {
+        if settle(ctx, out, &mut last)? {
+            return Ok(());
+        }
+    }
     let mut redraw = true;
     loop {
         let prof = Profiles::load(ctx.sys, ctx.paths)?;
@@ -1049,18 +1078,32 @@ fn menu_body<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()
             redraw = false;
             continue;
         };
-        match menu_action(ctx, &prof, action)? {
-            Outcome::Note(s) => last = Some(s),
-            Outcome::Pause(s) => {
-                ctx.flush();
-                ctx.prompt.pause("回车返回菜单")?;
-                last = Some(s);
-            }
-            Outcome::Nothing => {}
-            Outcome::Exit => return Ok(()),
+        let out = menu_action(ctx, &prof, action)?;
+        if settle(ctx, out, &mut last)? {
+            return Ok(());
         }
         redraw = true;
     }
+}
+
+/// 按 [`Outcome`] 收尾（spec §4.1）：`Pause` 先停下来等回车，`Note` / `Pause` 的摘要进
+/// 「上次：」行，`Nothing` 不动它。返回 `true` 表示退出菜单。
+fn settle<S: Sys, N: Net, P: Prompt>(
+    ctx: &mut Ctx<'_, S, N, P>,
+    out: Outcome,
+    last: &mut Option<String>,
+) -> Result<bool> {
+    match out {
+        Outcome::Note(s) => *last = Some(s),
+        Outcome::Pause(s) => {
+            ctx.flush();
+            ctx.prompt.pause("回车返回菜单")?;
+            *last = Some(s);
+        }
+        Outcome::Nothing => {}
+        Outcome::Exit => return Ok(true),
+    }
+    Ok(false)
 }
 
 /// 主菜单的一个选择。做完返回 [`Outcome`]，由 [`menu_body`] 决定停不停、「上次：」行写什么。
@@ -1192,11 +1235,8 @@ fn pick_node<S: Sys, N: Net, P: Prompt>(
         if let Some(i) = menu::pick_index(&pick, len) {
             return Ok(Some(prof.profiles[i].name.clone()));
         }
-        // 回显前净化：方向键是 `ESC [ A`，不能原样写回终端、写进 transcript
-        ctx.say(format!(
-            "无效编号：{}（可选 1-{len}，0 返回）",
-            menu::sanitize(&pick)
-        ));
+        // 回显先净化再截到行宽：方向键是 `ESC [ A`，误贴的整条链接也只占一行
+        ctx.say(menu::invalid_pick(&pick, len, ctx.width()));
     }
 }
 
@@ -1356,8 +1396,8 @@ fn service_menu<S: Sys, N: Net, P: Prompt>(
         let pick = ctx.prompt.line("选择 [0-2]")?;
         match menu::parse_service_choice(&pick) {
             Some(menu::ServiceAction::Back) => return Ok(Outcome::Nothing),
-            // 回显前净化：方向键是 `ESC [ A`，不能原样写回终端、写进 transcript
-            None => ctx.say(format!("无效选项：{}", menu::sanitize(&pick))),
+            // 回显先净化再截到行宽：方向键是 `ESC [ A`，误贴的整条链接也只占一行
+            None => ctx.say(menu::invalid_service_choice(&pick, ctx.width())),
             Some(menu::ServiceAction::Restart) => {
                 let start = ctx.transcript.len();
                 restart_service(ctx, mode);
@@ -2885,10 +2925,34 @@ mod tests {
         let mut p = Scripted::from(["y", "0"]);
         let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
         menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
         let saved = Profiles::load(&s, &pp).unwrap();
         assert_eq!(saved.profiles.len(), 1);
         assert_eq!(saved.active.as_deref(), Some("hysteria2-1"));
         assert!(s.called("systemctl stop hysteria-client.service"));
+        assert!(
+            !s.exists(&pp.unit("hysteria-client.service")),
+            "迁移把 v3 单元删了"
+        );
+        // 导入成功：「当前节点：…」不算附加行（状态区本来就显示），不停，结果进「上次：」行
+        assert_eq!(pauses(&p.asked), 0, "{:?}", p.asked);
+        assert!(
+            t.lines().any(|l| l.starts_with("  上次：导入 1 个节点")),
+            "{t}"
+        );
+
+        // 迁移 → 删光节点 → 再进菜单：v3 目录按约定留着，单元已卸，不再邀请
+        let mut emptied = Profiles::load(&s, &pp).unwrap();
+        emptied.profiles.clear();
+        emptied.active = None;
+        emptied.save(&s, &pp).unwrap();
+        let r = run_menu(&s, &n, &pp, &["0"], true);
+        assert!(!r.t.contains("发现 v3 客户端目录"), "{}", r.t);
+        assert!(
+            !r.asked.iter().any(|q| q.contains("导入 v3 的节点")),
+            "{:?}",
+            r.asked
+        );
 
         // 答 n：不导入，只提示一次，菜单照常进（ctx.out 会被 flush 清空，断言看 transcript）
         let s2 = FakeSys::new();
@@ -3305,7 +3369,7 @@ mod tests {
         }
     }
 
-    /// 管道喂进来的 stdin：`Stdin` 不打提示（`interactive` 为假），其余照 [`Scripted`]。
+    /// 管道喂进来的 stdin：`Stdin` 不打提示（`interactive` 为假）、停顿不读，其余照 [`Scripted`]。
     struct Piped(Scripted);
     impl Prompt for Piped {
         fn read(&mut self, prompt: &str) -> Result<Option<String>> {
@@ -3316,6 +3380,10 @@ mod tests {
         }
         fn confirm(&mut self, prompt: &str) -> Result<bool> {
             self.0.confirm(prompt)
+        }
+        /// 与真 `Stdin` 在管道里一样：没人会按回车，直接返回、不读（spec §4.4）。
+        fn pause(&mut self, _prompt: &str) -> Result<()> {
+            Ok(())
         }
         fn interactive(&self) -> bool {
             false
@@ -3470,6 +3538,200 @@ mod tests {
             imported_at: "2026-09-11T00:00:00Z".into(),
         });
         prof.save(s, pp).unwrap();
+    }
+
+    /// 跑完一遍菜单留下的东西（spec §12.1 的测试基础设施）。
+    struct Ran {
+        /// 屏上的全部文字（transcript）
+        t: String,
+        /// 按顺序被问过的提示
+        asked: Vec<String>,
+        clears: usize,
+    }
+
+    /// 跑一遍菜单：`tty` 为假按管道形态（不清屏；`Scripted` 的停顿照样消费一行，脚本里写
+    /// `""` 代表回车）。跑完统一断言 transcript 不含 ESC。
+    fn run_menu(s: &FakeSys, n: &FakeNet, pp: &Paths, inputs: &[&str], tty: bool) -> Ran {
+        let mut p = Scripted {
+            queue: inputs.iter().map(|x| x.to_string()).collect(),
+            asked: Vec::new(),
+            tty,
+        };
+        let mut ctx = Ctx::new(s, n, pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        let (t, clears) = (ctx.transcript.clone(), ctx.clears);
+        assert!(!t.contains('\u{1b}'), "transcript 不能含 ESC：{t:?}");
+        Ran {
+            t,
+            asked: p.asked,
+            clears,
+        }
+    }
+
+    /// 停过几次：「回车返回菜单」被问了几次（spec §4.5）。
+    fn pauses(asked: &[String]) -> usize {
+        asked.iter().filter(|q| *q == "回车返回菜单").count()
+    }
+
+    /// 进菜单前的 v3 导入邀请：导入失败要先停下来看原因，摘要进「上次：」行——
+    /// 否则接下来第一次清屏就把它抹掉了，而这正是迁移那一刻。
+    #[test]
+    fn a_failed_v3_import_at_the_invitation_pauses_before_the_first_clear() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        // v3 目录在、单元还在，但节点链接解析不了 → 导入报「…下没有可导入的节点」
+        s.put(
+            "/opt/hysteria-client/configs/hysteria2-1/uri.txt",
+            "not-a-node-uri",
+        );
+        s.put("/etc/systemd/system/hysteria-client.service", "[Unit]");
+        s.set_term_size(Some((60, 30)));
+        let n = FakeNet::new();
+        let r = run_menu(&s, &n, &pp, &["y", "", "0"], true);
+        assert_eq!(pauses(&r.asked), 1, "{:?}", r.asked);
+        let fail = r.t.find("  失败：").unwrap_or_else(|| panic!("{}", r.t));
+        assert!(
+            fail < r.t.find("B-UI 客户端").unwrap(),
+            "先打失败、停下来，再清屏画主菜单：\n{}",
+            r.t
+        );
+        assert!(
+            r.t.lines()
+                .any(|l| l.starts_with("  上次：失败：") && l.contains("没有可导入的节点")),
+            "{}",
+            r.t
+        );
+        assert_eq!(r.clears, 1, "只清过主菜单那一次");
+        assert!(
+            s.exists(&pp.unit("hysteria-client.service")),
+            "失败时 v3 原样保留"
+        );
+
+        // 答否：说一句就进菜单，不停，这句留在「上次：」行
+        let r = run_menu(&s, &n, &pp, &["n", "0"], true);
+        assert_eq!(pauses(&r.asked), 0, "{:?}", r.asked);
+        assert!(
+            r.t.lines().any(|l| l.starts_with("  上次：已跳过。")),
+            "{}",
+            r.t
+        );
+    }
+
+    /// `printf '5\n0\n' | sudo bui-c`：没人按回车，停顿不读，`0` 留给主菜单（spec §4.4）。
+    /// `Piped` 的 `pause` 与真 `Stdin` 在管道里的行为一致：直接返回。
+    #[test]
+    fn a_piped_script_is_not_eaten_by_a_pause() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        let mut prof = profiles_socks();
+        prof.auto_update = false;
+        prof.save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        n.route(crate::check::PROBE_URL, FakeReply::Status(502));
+        let mut p = Piped(Scripted::from(["5", "0"]));
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert!(
+            t.lines()
+                .any(|l| l == "  发现 2 项异常，已重启 bui-c.service"),
+            "多行结果，交互终端里会停：\n{t}"
+        );
+        assert_eq!(
+            p.0.asked,
+            vec!["选择 [0-9]", "选择 [0-9]"],
+            "0 由主菜单读走"
+        );
+        assert_eq!(t.matches("B-UI 客户端").count(), 2, "{t}");
+        assert!(
+            t.lines()
+                .any(|l| l == "  上次：发现 2 项异常，已重启 bui-c.service"),
+            "{t}"
+        );
+    }
+
+    /// [3] 粘贴失败时列出的 scheme 是用户贴的原文：误粘进来的颜色码先换成 `?`，
+    /// ESC 不能写进 transcript 与终端（run_menu 里统一断言）。
+    #[test]
+    fn a_pasted_scheme_with_escape_bytes_is_sanitized_in_the_failure_line() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        profiles_socks().save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        let r = run_menu(
+            &s,
+            &n,
+            &pp,
+            &["3", "\u{1b}[31mss://secret@h:1#x", "", "", "0"],
+            true,
+        );
+        assert!(
+            r.t.lines()
+                .any(|l| l == "  失败：1 行都不是 hysteria2:// 或 vless:// 链接（?[31mss://）"),
+            "{}",
+            r.t
+        );
+        assert!(!r.t.contains("secret"), "{}", r.t);
+    }
+
+    /// [1] 与 [4] 输错时的回显照主菜单的做法：净化再截到行宽，误贴一整条链接也只占一行。
+    #[test]
+    fn junk_in_the_node_list_and_the_service_page_is_echoed_on_one_line() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        with_unit(&s);
+        two_nodes(&s, &pp);
+        s.set_term_size(Some((40, 30)));
+        let n = FakeNet::new();
+        let junk = "https://panel.example.com/api/sub/示例用户甲\u{1b}[A";
+        let r = run_menu(&s, &n, &pp, &["1", junk, "0", "4", junk, "0", "0"], true);
+        let echoes: Vec<&str> = r.t.lines().filter(|l| l.starts_with("  无效")).collect();
+        assert_eq!(echoes.len(), 2, "{}", r.t);
+        for l in &echoes {
+            assert!(menu::budget_width(l) <= menu::line_limit(40), "{l}");
+            assert!(l.contains('…'), "{l}");
+        }
+        assert_eq!(echoes[0], "  无效编号：https…（可选 1-2，0 返回）");
+        assert!(
+            echoes[1].starts_with("  无效选项：https://"),
+            "{}",
+            echoes[1]
+        );
+    }
+
+    /// TUN 下第一次切换：先打「已为 bui-tun 接口放行 UFW…」再打「已切到 X」。两行要停
+    /// （spec §4.3），但「上次：」行写切换的结果，不是第一行。
+    #[test]
+    fn the_switch_summary_says_the_switch_even_when_ufw_speaks_first() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        s.reply("ufw status", 0, "Status: active");
+        s.reply("ip link show bui-tun", 0, "5: bui-tun");
+        two_nodes(&s, &pp);
+        let mut prof = Profiles::load(&s, &pp).unwrap();
+        prof.mode = Mode::Tun;
+        prof.save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        let r = run_menu(&s, &n, &pp, &["1", "2", "", "0"], true);
+        assert!(
+            r.t.lines()
+                .any(|l| l == "  已为 bui-tun 接口放行 UFW（含 route allow）"),
+            "{}",
+            r.t
+        );
+        assert_eq!(pauses(&r.asked), 1, "两行结果照 §4.3 要停：{:?}", r.asked);
+        assert!(
+            r.t.lines()
+                .any(|l| l == "  上次：已切到 alice-reality-direct"),
+            "「上次：」行写切换的结果，不是第一行：\n{}",
+            r.t
+        );
     }
 
     #[test]
@@ -3872,6 +4134,11 @@ mod tests {
         assert!(t.lines().any(|l| l == "  已取消，没有导入任何节点"), "{t}");
         assert!(!t.contains("失败"), "什么都没粘贴不是失败：{t}");
         assert!(
+            t.lines().any(|l| l == "  上次：已取消，没有导入任何节点"),
+            "{t}"
+        );
+        assert_eq!(pauses(&p.asked), 0, "{:?}", p.asked);
+        assert!(
             p.asked.contains(&"粘贴节点链接或订阅地址".to_string()),
             "提示要说清楚两种都能贴：{:?}",
             p.asked
@@ -3895,10 +4162,12 @@ mod tests {
         ready(&s);
         profiles_socks().save(&s, &pp).unwrap();
         let n = FakeNet::new();
+        // 失败要停：粘贴结束的空行之后再给一个回车，0 才轮到主菜单
         let mut p = Scripted::from([
             "3",
             "ss://secret@h:1#x",
             "https://panel.example.com/api/sub/alice",
+            "",
             "",
             "0",
         ]);
@@ -3914,6 +4183,7 @@ mod tests {
             "{} 列：{fail}",
             menu::display_width(fail)
         );
+        assert_eq!(pauses(&p.asked), 1, "{:?}", p.asked);
     }
 
     #[test]
@@ -3923,11 +4193,12 @@ mod tests {
         ready(&s);
         profiles_socks().save(&s, &pp).unwrap();
         let n = FakeNet::new();
-        // 两行一起贴：不支持的 ss:// + 订阅地址（单独一行才会被当成订阅）
+        // 两行一起贴：不支持的 ss:// + 订阅地址（单独一行才会被当成订阅）；失败要停，再给一个回车
         let mut p = Scripted::from([
             "3",
             "ss://secret@h:1#x",
             "https://panel.example.com/api/sub/alice",
+            "",
             "",
             "0",
         ]);
@@ -3951,9 +4222,16 @@ mod tests {
         assert!(!t.contains("菜单 [3]"), "人就在菜单 [3] 里：{t}");
         assert!(!t.contains("节点："), "不出现双冒号：{t}");
         assert!(!t.contains("secret"), "{t}");
+        // 失败先停，摘要进「上次：」行
+        assert_eq!(pauses(&p.asked), 1, "{:?}", p.asked);
+        assert!(
+            t.lines().any(|l| l
+                == "  上次：失败：2 行都不是 hysteria2:// 或 vless:// 链接（ss://、https://）"),
+            "{t}"
+        );
 
         // 没有 http(s) 行：只有第一行
-        let mut p = Scripted::from(["3", "trojan://secret@h:2#y", "", "0"]);
+        let mut p = Scripted::from(["3", "trojan://secret@h:2#y", "", "", "0"]);
         let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
         menu_loop(&mut ctx).unwrap();
         let t = ctx.transcript.clone();
@@ -3963,6 +4241,7 @@ mod tests {
             "{t}"
         );
         assert!(!t.contains("订阅地址"), "{t}");
+        assert_eq!(pauses(&p.asked), 1, "{:?}", p.asked);
     }
 
     #[test]
@@ -4021,6 +4300,13 @@ mod tests {
             "{:?}",
             p.asked
         );
+        // 答 y 用切换的结果：一行，不停
+        assert_eq!(pauses(&p.asked), 0, "{:?}", p.asked);
+        assert!(
+            t.lines()
+                .any(|l| l == "  上次：已切到 alice-reality-direct"),
+            "{t}"
+        );
     }
 
     #[test]
@@ -4057,6 +4343,9 @@ mod tests {
             "答 n 不切"
         );
         assert!(!s.called("systemctl restart bui-c.service"));
+        // 答否：提问处已经看过导入结果，不再停，0 由主菜单读走
+        assert_eq!(pauses(&p.asked), 0, "{:?}", p.asked);
+        assert_eq!(t.matches("B-UI 客户端").count(), 2, "{t}");
     }
 
     #[test]
@@ -4094,6 +4383,14 @@ mod tests {
             !t.lines().any(|l| l.starts_with("  失败：")),
             "退回订阅成功就不算失败（原因里的「请求…失败」除外）：{t}"
         );
+        // 退回订阅的说明 + 导入结果是两行，本该停；追问切换时人已经看过了，答否不再停
+        assert_eq!(pauses(&p.asked), 0, "{:?}", p.asked);
+        assert_eq!(t.matches("B-UI 客户端").count(), 2, "0 由主菜单读走：\n{t}");
+        assert!(
+            t.lines()
+                .any(|l| l == "  上次：这个面板还没有节点接口，改用订阅地址导入"),
+            "{t}"
+        );
     }
 
     /// `/api/sub` 退回订阅时按原因给不同的话：401/404 是「没有节点接口」（v3 面板），
@@ -4101,21 +4398,21 @@ mod tests {
     #[test]
     fn menu_import_api_sub_fallback_wording_depends_on_the_cause() {
         let pp = paths();
-        let run = |reply: FakeReply| {
+        // 退回订阅的三种会追问切换，答 n、不停；面板说节点列表为空是失败，停下来等回车
+        let run = |reply: FakeReply, answer: &str| {
             let s = FakeSys::new();
             ready(&s);
             profiles_socks().save(&s, &pp).unwrap();
             let n = FakeNet::new();
             n.route("https://panel.example.com/api/nodes/alice", reply);
             n.route("https://panel.example.com/api/sub/alice", b64(BOB_REALITY));
-            let mut p =
-                Scripted::from(["3", "https://panel.example.com/api/sub/alice", "", "n", "0"]);
-            let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
-            menu_loop(&mut ctx).unwrap();
-            (ctx.transcript.clone(), n.log(), names(&s, &pp).len())
+            let url = "https://panel.example.com/api/sub/alice";
+            let r = run_menu(&s, &n, &pp, &["3", url, "", answer, "0"], true);
+            (r.t, n.log(), names(&s, &pp).len(), pauses(&r.asked))
         };
 
-        let (t, _, count) = run(FakeReply::Status(401));
+        let (t, _, count, stops) = run(FakeReply::Status(401), "n");
+        assert_eq!(stops, 0, "{t}");
         assert!(
             t.lines()
                 .any(|l| l == "  这个面板还没有节点接口，改用订阅地址导入"),
@@ -4124,9 +4421,13 @@ mod tests {
         assert_eq!(count, 2, "{t}");
 
         // 真机上 reqwest 的错误文字自带完整 URL（末段是用户名，等价凭据）
-        let (t, _, count) = run(FakeReply::Fail(
-            "error sending request for url (https://panel.example.com/api/nodes/alice)".into(),
-        ));
+        let (t, _, count, stops) = run(
+            FakeReply::Fail(
+                "error sending request for url (https://panel.example.com/api/nodes/alice)".into(),
+            ),
+            "n",
+        );
+        assert_eq!(stops, 0, "{t}");
         assert!(
             t.lines()
                 .any(|l| l == "  面板接口取不到（error sending request），改用订阅地址导入"),
@@ -4141,7 +4442,8 @@ mod tests {
         assert_eq!(count, 2, "{t}");
 
         // 200 但不是节点列表（面板把未知路径兜底成网页）：也退回订阅
-        let (t, _, count) = run(FakeReply::Text("<html></html>".into()));
+        let (t, _, count, stops) = run(FakeReply::Text("<html></html>".into()), "n");
+        assert_eq!(stops, 0, "{t}");
         assert!(
             t.lines()
                 .any(|l| l == "  面板接口取不到（返回的不是节点列表），改用订阅地址导入"),
@@ -4150,7 +4452,9 @@ mod tests {
         assert_eq!(count, 2, "{t}");
 
         // 面板接口在、但这个用户没有节点：退回订阅也拿不到正经东西，直接报
-        let (t, log, count) = run(nodes_payload("alice", vec![]));
+        let (t, log, count, stops) = run(nodes_payload("alice", vec![]), "");
+        assert_eq!(stops, 1, "失败先停：{t}");
+        assert!(t.lines().any(|l| l.starts_with("  上次：失败：")), "{t}");
         assert!(
             t.lines()
                 .any(|l| l == "  失败：面板返回的节点列表为空：该用户可能没有任何权益"),
@@ -4169,13 +4473,20 @@ mod tests {
         ready(&s);
         profiles_socks().save(&s, &pp).unwrap();
         let n = FakeNet::new();
-        let mut p = Scripted::from(["3", "https://panel.example.com/api/clash/alice", "", "0"]);
+        let mut p = Scripted::from([
+            "3",
+            "https://panel.example.com/api/clash/alice",
+            "",
+            "",
+            "0",
+        ]);
         let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
         menu_loop(&mut ctx).unwrap();
         let t = ctx.transcript.clone();
         assert!(t.lines().any(|l| l.starts_with("  失败：")), "{t}");
         assert!(!t.contains("改用订阅地址导入"), "{t}");
         assert_eq!(n.log().len(), 1, "只试了面板接口：{:?}", n.log());
+        assert_eq!(pauses(&p.asked), 1, "失败先停：{:?}", p.asked);
     }
 
     #[test]
@@ -4202,6 +4513,7 @@ mod tests {
             "{t}"
         );
         assert_eq!(names(&s, &pp).len(), 2, "{t}");
+        assert_eq!(pauses(&p.asked), 0, "答否不停：{:?}", p.asked);
     }
 
     #[test]
@@ -4223,6 +4535,13 @@ mod tests {
             "{t}"
         );
         assert!(n.log().is_empty(), "粘贴的节点链接不联网");
+        assert_eq!(
+            pauses(&p.asked),
+            0,
+            "答 y：切换只打一行，不停：{:?}",
+            p.asked
+        );
+        assert!(t.lines().any(|l| l.starts_with("  上次：已切到 ")), "{t}");
     }
 
     #[test]
@@ -4231,8 +4550,8 @@ mod tests {
         let s = FakeSys::new();
         ready(&s); // 没有 profiles.json，也没有 v3 目录
         let n = FakeNet::new();
-        // 没有追问：粘贴 → 空行 → 0 直接退出；要是追问了，0 会被当成「否」吞掉，
-        // 队列耗尽后菜单照样退出，所以另外断言 0 是被主菜单读走的（屏数）
+        // 没有追问、也不停：粘贴 → 空行 → 0 直接退出。追问或停顿都会把 0 吞掉，而队列耗尽后
+        // 菜单照样退出、屏数也一样，所以看 p.asked：既没有「切换到新导入的…」，也没有「回车返回菜单」
         let mut p = Scripted::from(["3", BOB_REALITY, "", "0"]);
         let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
         menu_loop(&mut ctx).unwrap();
@@ -4249,6 +4568,12 @@ mod tests {
             !p.asked.iter().any(|q| q.starts_with("切换到新导入的")),
             "新节点已经是活动节点，不必追问：{:?}",
             p.asked
+        );
+        // 首次导入固定多打一行「当前节点：X」：状态区本来就显示当前节点，不算附加行，不停
+        assert_eq!(pauses(&p.asked), 0, "{:?}", p.asked);
+        assert!(
+            t.lines().any(|l| l == "  上次：导入 1 个新节点，共 1 个"),
+            "{t}"
         );
     }
 

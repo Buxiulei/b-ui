@@ -46,9 +46,12 @@ pub struct Fetched {
 
 /// 脱敏：只留到 `://` 为止。`hysteria2://` 的 userinfo 段就是密码，
 /// 留前 24 字符会把 `hysteria2://alice:hy2-pw` 原样打进日志。
+///
+/// 留下的这段是用户贴的原文，菜单 [3] 会原样打在失败行里：先净化（控制字符、双向格式符
+/// 换成 `?`），误粘进来的颜色码里的 ESC 才不会写进 transcript 与终端。
 pub fn scheme_only(line: &str) -> String {
     match line.split_once("://") {
-        Some((scheme, _)) => format!("{scheme}://"),
+        Some((scheme, _)) => format!("{}://", crate::menu::sanitize(scheme)),
         None => NO_SCHEME.to_string(),
     }
 }
@@ -363,6 +366,14 @@ mod tests {
         assert_eq!(f.nodes.len(), 1);
         assert_eq!(f.skipped.len(), 2, "空行忽略不计，ss:// 与注释行计为跳过");
         assert_eq!(f.skipped, vec!["ss://", NO_SCHEME]);
+    }
+
+    #[test]
+    fn a_skipped_scheme_never_carries_control_bytes() {
+        // 误粘进来的颜色码在 `://` 前面：scheme 原样回显会把 ESC 写进 transcript 与终端
+        assert_eq!(scheme_only("\u{1b}[31mss://secret@h:1"), "?[31mss://");
+        assert_eq!(scheme_only("a\u{7f}b\u{202e}c://x"), "a?b?c://");
+        assert_eq!(scheme_only("ss://x"), "ss://", "正常的 scheme 原样");
     }
 
     #[test]

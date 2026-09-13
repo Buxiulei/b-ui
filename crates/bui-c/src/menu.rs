@@ -92,6 +92,16 @@ fn read_line_from<R: std::io::BufRead>(r: &mut R) -> Result<Option<String>> {
     Ok(Some(String::from_utf8_lossy(&buf).trim().to_string()))
 }
 
+/// [`Stdin::pause`] 读的那一段。stdin 不是终端时没人会按回车：直接返回、一个字节都不读——
+/// 照读的话，`printf '5\n0\n' | sudo bui-c` 里的 `0` 会被停顿吃掉，菜单就不照脚本走了
+/// （spec §4.4）。终端里读掉一行，EOF 也算回车。
+fn pause_from<R: std::io::BufRead>(interactive: bool, r: &mut R) -> Result<()> {
+    if !interactive {
+        return Ok(());
+    }
+    read_line_from(r).map(|_| ())
+}
+
 impl Stdin {
     /// 打出提示（不换行）再读一行；stdout 已关就当 EOF。
     fn ask(&mut self, text: &str) -> Result<Option<String>> {
@@ -108,12 +118,16 @@ impl Prompt for Stdin {
     }
 
     fn pause(&mut self, prompt: &str) -> Result<()> {
-        // stdin 不是终端时没人会按回车：照读的话，`printf '5\n0\n' | sudo bui-c` 里的 `0`
-        // 会被停顿吃掉，菜单就不照脚本走了（spec §4.4）
-        if !self.interactive() {
+        let interactive = self.interactive();
+        // stdout 已关（没人看得到提示）就当已经按过回车；非终端时两步都什么也不做
+        if !prompt_out(
+            interactive,
+            &mut std::io::stdout().lock(),
+            &pause_text(prompt),
+        )? {
             return Ok(());
         }
-        self.ask(&pause_text(prompt)).map(|_| ())
+        pause_from(interactive, &mut std::io::stdin().lock())
     }
 
     fn lines_until_blank(&mut self, prompt: &str) -> Result<Vec<String>> {
@@ -494,16 +508,33 @@ pub fn fit_name_in_last(summary: &str, name: &str, width: usize) -> String {
 /// 菜单里节点列表为空时的引导：[1] 的列表页与回主菜单后的「上次：」行共用。
 pub const NO_NODES: &str = "没有节点，先用 [3] 导入节点";
 
-/// 主菜单输错时的那一行，不含缩进（调用方经 `say` 在菜单里加两列）：
-/// `无效选项：{x}（请输入 0-9 的数字）`。回显的输入先净化（方向键是 `ESC [ A`，不能原样写回
-/// 终端、写进 transcript），再尾截，整行按容量口径不超过行宽上限——误把一整条链接贴进
-/// 主菜单也只占一行。
-pub fn invalid_choice(input: &str, width: usize) -> String {
-    const HEAD: &str = "无效选项：";
-    const TAIL: &str = "（请输入 0-9 的数字）";
+/// 输错时回显的那一行，不含缩进（调用方经 `say` 在菜单里加两列）：`{head}{输入}{tail}`。
+/// 回显的输入先净化（方向键是 `ESC [ A`，不能原样写回终端、写进 transcript），再尾截，
+/// 整行按容量口径不超过行宽上限——误把一整条链接贴进来也只占一行。
+fn bad_input_line(head: &str, input: &str, tail: &str, width: usize) -> String {
     // 2 = 菜单里 `say` 加的缩进
-    let room = line_limit(width).saturating_sub(2 + budget_width(HEAD) + budget_width(TAIL));
-    format!("{HEAD}{}{TAIL}", truncate_end(&sanitize(input), room))
+    let room = line_limit(width).saturating_sub(2 + budget_width(head) + budget_width(tail));
+    format!("{head}{}{tail}", truncate_end(&sanitize(input), room))
+}
+
+/// 主菜单输错：`无效选项：{x}（请输入 0-9 的数字）`，回显先净化再截到行宽。
+pub fn invalid_choice(input: &str, width: usize) -> String {
+    bad_input_line("无效选项：", input, "（请输入 0-9 的数字）", width)
+}
+
+/// [1] 节点列表输错：`无效编号：{x}（可选 1-{len}，0 返回）`，回显先净化再截到行宽。
+pub fn invalid_pick(input: &str, len: usize, width: usize) -> String {
+    bad_input_line(
+        "无效编号：",
+        input,
+        &format!("（可选 1-{len}，0 返回）"),
+        width,
+    )
+}
+
+/// [4] 服务控制输错：`无效选项：{x}`，回显先净化再截到行宽。
+pub fn invalid_service_choice(input: &str, width: usize) -> String {
+    bad_input_line("无效选项：", input, "", width)
 }
 
 /// 标题条与状态区（节点 / 代理 / 模式）：一次性 `bui-c status` 用它，不打菜单块
@@ -1489,8 +1520,51 @@ mod tests {
             long.as_str(),
         ] {
             out.push(("invalid", format!("  {}\n", invalid_choice(input, width))));
+            out.push((
+                "invalid-pick",
+                format!("  {}\n", invalid_pick(input, 9, width)),
+            ));
+            out.push((
+                "invalid-service",
+                format!("  {}\n", invalid_service_choice(input, width)),
+            ));
         }
         out
+    }
+
+    #[test]
+    fn stdin_pause_consumes_nothing_without_a_terminal() {
+        // `printf '5\n0\n' | sudo bui-c`：停顿不能把留给主菜单的 0 读走（spec §4.4）
+        let mut r = std::io::Cursor::new(b"0\n".to_vec());
+        pause_from(false, &mut r).unwrap();
+        assert_eq!(r.position(), 0, "没人会按回车：一个字节都不读");
+        pause_from(true, &mut r).unwrap();
+        assert_eq!(r.position(), 2, "终端里读掉一行（回车）");
+        pause_from(true, &mut r).unwrap(); // EOF 也算回车，不报错
+        assert_eq!(r.position(), 2);
+    }
+
+    #[test]
+    fn junk_echoes_in_sub_pages_fit_the_line() {
+        let url = "https://panel.example.com/api/sub/示例用户甲";
+        assert_eq!(invalid_pick("9", 2, 60), "无效编号：9（可选 1-2，0 返回）");
+        assert_eq!(
+            invalid_pick(url, 2, 40),
+            "无效编号：https…（可选 1-2，0 返回）"
+        );
+        assert_eq!(invalid_service_choice("x", 60), "无效选项：x");
+        assert_eq!(
+            invalid_service_choice("\u{1b}[A", 60),
+            "无效选项：?[A",
+            "方向键的 ESC 不能回显"
+        );
+        // 算上菜单里 `say` 加的 2 列缩进，按容量口径都不超过行宽上限
+        for w in [40, 50, 60, 80, 100] {
+            for l in [invalid_pick(url, 9, w), invalid_service_choice(url, w)] {
+                let l = format!("  {l}");
+                assert!(budget_width(&l) <= line_limit(w), "@{w}: {l}");
+            }
+        }
     }
 
     #[test]
