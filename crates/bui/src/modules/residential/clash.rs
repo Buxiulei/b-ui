@@ -17,6 +17,9 @@ use uuid::Uuid;
 /// `selector` 是 selector 出站的 tag：全局池是 [`POOL`]（`resi-pool`），每槽是
 /// `slot-<i>-pool`（[`super::slot_selector`]）。两层 selector 的语义见总纲裁决 D8。
 pub trait Clash: Send + Sync + 'static {
+    /// Clash API 此刻能不能应答（`GET /version` 回 2xx）。relay 刚重启时它还没起监听，
+    /// 重放选择前先探这一下（`health::replay_after_restart`）
+    fn ready(&self) -> bool;
     /// `GET /proxies/<selector>` → `.now`；relay 未运行 / 无此 selector → `None`
     fn selected(&self, selector: &str) -> Option<String>;
     /// `PUT /proxies/<selector>` `{"name":"<tag>"}`；与配置切换走同一条 `SelectOutbound`
@@ -70,6 +73,13 @@ impl Default for HttpClash {
 }
 
 impl Clash for HttpClash {
+    fn ready(&self) -> bool {
+        self.client()
+            .ok()
+            .and_then(|c| c.get(format!("http://{}/version", self.api)).send().ok())
+            .is_some_and(|r| r.status().is_success())
+    }
+
     fn selected(&self, selector: &str) -> Option<String> {
         let v: serde_json::Value = self
             .client()
@@ -131,6 +141,9 @@ pub struct FakeClashInner {
     pub now: std::collections::BTreeMap<String, String>,
     /// 令 `select` 失败（测「切换失败只告警不改 runtime」）
     pub reject: bool,
+    /// 接下来这么多次调用（`ready` / `selected` / `select` 都算）按「连接被拒」处理：
+    /// relay 刚重启、Clash API 还没起监听时的形态
+    pub refuse: u32,
     pub calls: Vec<String>,
 }
 
@@ -158,23 +171,50 @@ impl FakeClash {
         self
     }
 
-    /// `get:<selector>` / `put:<selector>:<tag>`
+    /// `ready` / `get:<selector>` / `put:<selector>:<tag>`
     pub fn calls(&self) -> Vec<String> {
         self.inner.lock().unwrap().calls.clone()
     }
+
+    /// 读某个 selector 的当前选择，**不记调用、不吃 `refuse`**（断言用）
+    pub fn peek(&self, selector: &str) -> Option<String> {
+        self.inner.lock().unwrap().now.get(selector).cloned()
+    }
+}
+
+/// 这一次调用该不该按「连接被拒」处理（顺带把 `refuse` 减一）
+#[cfg(test)]
+fn refused(i: &mut FakeClashInner) -> bool {
+    if i.refuse == 0 {
+        return false;
+    }
+    i.refuse -= 1;
+    true
 }
 
 #[cfg(test)]
 impl Clash for FakeClash {
+    fn ready(&self) -> bool {
+        let mut i = self.inner.lock().unwrap();
+        i.calls.push("ready".into());
+        !refused(&mut i)
+    }
+
     fn selected(&self, selector: &str) -> Option<String> {
         let mut i = self.inner.lock().unwrap();
         i.calls.push(format!("get:{selector}"));
+        if refused(&mut i) {
+            return None;
+        }
         i.now.get(selector).cloned()
     }
 
     fn select(&self, selector: &str, tag: &str) -> Result<(), ClashError> {
         let mut i = self.inner.lock().unwrap();
         i.calls.push(format!("put:{selector}:{tag}"));
+        if refused(&mut i) {
+            return Err(ClashError::Unreachable("connection refused".into()));
+        }
         if i.reject {
             return Err(ClashError::Rejected {
                 tag: tag.to_string(),
@@ -332,6 +372,7 @@ mod tests {
         let api = l.local_addr().unwrap().to_string();
         drop(l);
         let c = HttpClash::with_api(api, 1);
+        assert!(!c.ready(), "没人监听 ⇒ 未就绪");
         assert_eq!(
             c.selected(POOL),
             None,
@@ -341,6 +382,43 @@ mod tests {
             c.select(POOL, "resi-1"),
             Err(ClashError::Unreachable(_))
         ));
+    }
+
+    #[test]
+    fn http_clash_ready_probes_the_version_endpoint() {
+        let (api, h) = fake_clash_api(vec![OK_NOW, NOT_FOUND]);
+        let c = HttpClash::with_api(api, 2);
+        assert!(c.ready(), "2xx ⇒ 就绪");
+        assert!(!c.ready(), "非 2xx ⇒ 未就绪");
+        let reqs = h.join().unwrap();
+        assert!(
+            reqs[0].starts_with("GET /version HTTP/1.1\r\n"),
+            "实际 {:?}",
+            reqs[0]
+        );
+    }
+
+    #[test]
+    fn a_refusing_fake_clash_answers_like_a_relay_that_is_not_listening_yet() {
+        let c = FakeClash::new(Some("resi-1"));
+        c.with(|i| i.refuse = 3);
+        assert!(!c.ready());
+        assert_eq!(c.selected(POOL), None);
+        assert!(matches!(
+            c.select(POOL, "resi-2"),
+            Err(ClashError::Unreachable(_))
+        ));
+        assert!(c.ready(), "拒绝次数用完就恢复");
+        assert_eq!(
+            c.peek(POOL).as_deref(),
+            Some("resi-1"),
+            "被拒的 PUT 不改 now"
+        );
+        assert_eq!(
+            c.calls(),
+            vec!["ready", "get:resi-pool", "put:resi-pool:resi-2", "ready"],
+            "peek 不记调用"
+        );
     }
 
     #[test]
