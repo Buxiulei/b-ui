@@ -13,8 +13,8 @@ pub const LEFT_WIDTH: usize = 14;
 pub const NAME_CAP: usize = 40;
 
 /// 选项块分隔线的列宽 = 两列选项的宽度：`[n] ` 4 + 左栏 LEFT_WIDTH + 栏距 2 +
-/// 右栏 `[n] 四字标签` 12。写死 9 格的短线看着像断了。
-const RULE_WIDTH: usize = 4 + LEFT_WIDTH + 2 + 12;
+/// 右栏 `[2] 切到 SOCKS` 14。写死 9 格的短线看着像断了。
+const RULE_WIDTH: usize = 4 + LEFT_WIDTH + 2 + 14;
 
 /// 交互输入：真实终端用 [`Stdin`]，测试与 `--yes` 路径用 [`Scripted`]。
 pub trait Prompt {
@@ -220,7 +220,12 @@ pub fn render_options(st: &Status) -> String {
     } else {
         "检查更新"
     };
-    out.push_str(&row("1", "切换节点", "2", "切换模式"));
+    // [2] 直接写目标模式：「切换模式」不说切到哪边，用户得自己跟状态行对
+    let to_mode = match st.mode {
+        Mode::Tun => "切到 SOCKS",
+        Mode::Socks => "切到 TUN",
+    };
+    out.push_str(&row("1", "切换节点", "2", to_mode));
     out.push_str(&row("3", "导入节点", "4", "服务控制"));
     out.push_str(&row("5", "连接检查", "6", update));
     out.push_str(&row("7", "从 v3 导入", "8", "卸载"));
@@ -369,7 +374,7 @@ mod tests {
     fn menu_is_two_columns_of_numbers_with_zero_to_quit() {
         let out = render(&st());
         assert!(out.contains("[1] 切换节点"));
-        assert!(out.contains("[2] 切换模式"));
+        assert!(out.contains("[2] 切到 SOCKS"));
         assert!(out.contains("[3] 导入节点"));
         assert!(out.contains("[4] 服务控制"));
         assert!(out.contains("[5] 连接检查"));
@@ -403,7 +408,7 @@ mod tests {
             display_width(row1.trim_start()),
             "分隔线要跟两列选项等宽\n{out}"
         );
-        assert_eq!(display_width(rule.trim_start()), 32, "{rule:?}");
+        assert_eq!(display_width(rule.trim_start()), 34, "{rule:?}");
         assert_eq!(
             rule.len() - rule.trim_start().len(),
             row1.len() - row1.trim_start().len(),
@@ -429,6 +434,16 @@ mod tests {
         assert!(out2.contains("(未设置)"));
         assert!(out2.contains("已停止"));
         assert!(out2.contains("SOCKS"));
+    }
+
+    #[test]
+    fn mode_option_names_the_target_mode() {
+        let mut s = st(); // Tun
+        let tun = render_options(&s);
+        assert!(tun.contains("[2] 切到 SOCKS"), "{tun}");
+        assert!(!tun.contains("切换模式"), "别让用户猜切到哪边：{tun}");
+        s.mode = Mode::Socks;
+        assert!(render_options(&s).contains("[2] 切到 TUN"));
     }
 
     #[test]
