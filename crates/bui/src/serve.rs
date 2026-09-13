@@ -58,6 +58,10 @@ pub fn modules(manifest: Option<Manifest>) -> Registry {
             // P2：面板 API + 采样 + auth 快照 + Xray gRPC
             Arc::new(panel),
             Arc::new(crate::modules::residential::ResidentialModule::new()),
+            // spec §5.7：日志哨兵（xray gRPC 预案要借面板的 Shared 重试用户同步）
+            Arc::new(crate::modules::sentinel::SentinelModule::new(
+                shared.clone(),
+            )),
         ],
         manifest: handle,
         panel: shared,
@@ -1293,6 +1297,7 @@ mod tests {
             "watchdog",
             "panel",
             "residential",
+            "sentinel",
         ] {
             assert!(
                 names.contains(&want),

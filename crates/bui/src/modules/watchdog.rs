@@ -50,14 +50,12 @@ pub const HEAL_KEY: &str = "hy2_chain_heal";
 /// 不能每 60 秒无脑 restart 一次（那就是自己制造崩溃循环）。
 pub const HEAL_COOLDOWN_MINUTES: i64 = 10;
 
-/// http 鉴权连不上的哨兵（spec §3.2，2026-09-13 裁决）：`auth.type: http` 下内核每条
+/// http 鉴权连不上的判据（spec §3.2）：`auth.type: http` 下内核每条
 /// 连接都要打一次 `127.0.0.1:AUTH_HTTP_PORT`，守护进程没在听（或应答超时）就是全员登录失败。
-/// 事件落 `runtime.extra` 的这个键：`{ "<单元>": AuthHttpAlert }`。
-pub const AUTH_HTTP_KEY: &str = "hy2_auth_http";
-/// 一轮日志里出现多少条鉴权连接失败才记事件。
+/// **检测与告警在日志哨兵**（`modules::sentinel`，5 秒增量读 journald）；这里只留判据与门槛，
+/// 哨兵的签名表引用它们。
+/// 多少条鉴权连接失败（60 秒内）才算一次事件。
 pub const AUTH_HTTP_FAIL_THRESHOLD: u32 = 3;
-/// 同一个单元两条事件之间的最短间隔（与自愈同口径，避免每 60 秒刷一条）。
-pub const AUTH_HTTP_COOLDOWN_MINUTES: i64 = 10;
 /// 「这一行说的是鉴权请求」的判据：内核把整个 URL 打进错误里，所以路径或端口任一命中即可。
 pub const AUTH_HTTP_PATH_MARKER: &str = "/auth";
 /// 「这一行说的是连不上 / 超时」的判据。
@@ -67,21 +65,6 @@ pub const AUTH_HTTP_FAIL_MARKERS: [&str; 4] = [
     "timeout",
     "no route to host",
 ];
-
-/// 一个单元的 http 鉴权告警（累计条数 + 最近一次的时刻与当时守护进程是否在听）。
-///
-/// **只报不改**：守护进程自己由 systemd 的 `Restart=always` 拉起，watchdog 再去
-/// `restart b-ui` 只会把正在收敛的那一轮对账拦腰砍断。
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub struct AuthHttpAlert {
-    pub at: String,
-    /// 累计记过几次事件
-    pub count: u32,
-    /// 最近一轮日志里数到的失败条数
-    pub fails: u32,
-    /// 记事件的那一刻，`127.0.0.1:AUTH_HTTP_PORT` 是不是真的没人听
-    pub daemon_listening: bool,
-}
 
 /// 一行 journal 是不是「鉴权请求连不上 / 超时」（纯函数）。日志哨兵（`modules::sentinel`）逐行用它。
 ///
@@ -113,14 +96,6 @@ pub fn should_heal(last: Option<OffsetDateTime>, now: OffsetDateTime) -> bool {
     match last {
         None => true,
         Some(t) => now - t >= time::Duration::minutes(HEAL_COOLDOWN_MINUTES),
-    }
-}
-
-/// http 鉴权告警的冷却判据：`last` 是上次记事件的时刻（`None` = 没报过）。
-pub fn should_alert(last: Option<OffsetDateTime>, now: OffsetDateTime) -> bool {
-    match last {
-        None => true,
-        Some(t) => now - t >= time::Duration::minutes(AUTH_HTTP_COOLDOWN_MINUTES),
     }
 }
 
@@ -276,7 +251,6 @@ pub fn run_stamp(now: OffsetDateTime) -> serde_json::Value {
 pub async fn check_once(ctx: &DaemonCtx) -> anyhow::Result<Vec<(String, Decision)>> {
     let state = ctx.store.read().await;
     let targets = targets(&state);
-    let auth_http = state.system.hy2_auth == bui_schema::model::Hy2Auth::Http;
     let rt = ctx.runtime.read().await;
     let mut heals: std::collections::BTreeMap<String, ChainHeal> = rt
         .extra
@@ -284,16 +258,10 @@ pub async fn check_once(ctx: &DaemonCtx) -> anyhow::Result<Vec<(String, Decision
         .cloned()
         .and_then(|v| serde_json::from_value(v).ok())
         .unwrap_or_default();
-    let mut alerts: std::collections::BTreeMap<String, AuthHttpAlert> = rt
-        .extra
-        .get(AUTH_HTTP_KEY)
-        .cloned()
-        .and_then(|v| serde_json::from_value(v).ok())
-        .unwrap_or_default();
     let mut records = rt.watchdog;
     let host = ctx.host.clone();
     let paths = ctx.paths.clone();
-    let (decisions, records, heals, alerts, now) =
+    let (decisions, records, heals, now) =
         tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             let now = host.now();
             // 孤儿链自愈排在监听探测之前：崩溃循环里的实例根本没进程，按端口判只会得出
@@ -313,42 +281,6 @@ pub async fn check_once(ctx: &DaemonCtx) -> anyhow::Result<Vec<(String, Decision
             }
             let udp = host.listening_ports(Proto::Udp).unwrap_or_default();
             let tcp = host.listening_ports(Proto::Tcp).unwrap_or_default();
-            // http 鉴权哨兵：日志里连续 ≥ AUTH_HTTP_FAIL_THRESHOLD 条「连不上鉴权端口」
-            // ⇒ 看一眼守护进程还在不在听，记一条事件。**不做任何处置**（b-ui 由 systemd 拉起）。
-            if auth_http {
-                let listening = tcp.contains(&bui_schema::render::hysteria::AUTH_HTTP_PORT);
-                for (unit, _) in HY2_CONFIGS {
-                    let last = alerts.get(unit).and_then(|a| parse_rfc3339(&a.at));
-                    if !should_alert(last, now) {
-                        continue;
-                    }
-                    let Some(log) = host
-                        .run(
-                            "journalctl",
-                            &["-u", unit, "-n", JOURNAL_LINES, "--no-pager"],
-                        )
-                        .ok()
-                        .filter(|o| o.ok())
-                    else {
-                        continue;
-                    };
-                    let fails = count_auth_http_failures(&log.stdout);
-                    if fails < AUTH_HTTP_FAIL_THRESHOLD {
-                        continue;
-                    }
-                    tracing::error!(
-                        unit = %unit,
-                        fails,
-                        listening,
-                        "hysteria 连不上 http 鉴权端口，本实例正在全员拒绝登录"
-                    );
-                    let rec = alerts.entry(unit.to_string()).or_default();
-                    rec.at = fmt_rfc3339(now);
-                    rec.count += 1;
-                    rec.fails = fails;
-                    rec.daemon_listening = listening;
-                }
-            }
             let mut out = Vec::with_capacity(targets.len());
             for t in &targets {
                 let rec = records.entry(t.unit.clone()).or_default();
@@ -364,7 +296,7 @@ pub async fn check_once(ctx: &DaemonCtx) -> anyhow::Result<Vec<(String, Decision
                 }
                 out.push((t.unit.clone(), d));
             }
-            Ok((out, records, heals, alerts, now))
+            Ok((out, records, heals, now))
         })
         .await??;
     ctx.runtime
@@ -375,12 +307,6 @@ pub async fn check_once(ctx: &DaemonCtx) -> anyhow::Result<Vec<(String, Decision
             if !heals.is_empty() {
                 if let Ok(v) = serde_json::to_value(&heals) {
                     r.extra.insert(HEAL_KEY.into(), v);
-                }
-            }
-            // 同理：没报过警的机器上不该出现这个键
-            if !alerts.is_empty() {
-                if let Ok(v) = serde_json::to_value(&alerts) {
-                    r.extra.insert(AUTH_HTTP_KEY.into(), v);
                 }
             }
         })
@@ -516,8 +442,7 @@ mod tests {
         assert_eq!(rec.restarts, 4);
     }
 
-    /// 只看「真正动了机器」的操作：`hy2_auth=http` 下鉴权哨兵每轮都要读一次两个 hysteria
-    /// 单元的 journal（它自己有独立的冷却与阈值），这些只读调用不属于任何一条动作断言。
+    /// 只看真正动了机器的操作：孤儿链自愈会先读一次崩溃单元的 journal，这些只读调用不属于任何一条动作断言
     fn acting_ops(host: &FakeHost) -> Vec<String> {
         host.ops()
             .into_iter()
@@ -846,22 +771,12 @@ hysteria[1]: outbound error {\"error\": \"dial tcp 198.51.100.7:10007: connect: 
             0,
             "只有 /auth 没有失败标记 ⇒ 不算"
         );
-        assert!(should_alert(None, t0()));
-        assert!(!should_alert(
-            Some(t0()),
-            t0() + time::Duration::minutes(AUTH_HTTP_COOLDOWN_MINUTES - 1)
-        ));
-        assert!(should_alert(
-            Some(t0()),
-            t0() + time::Duration::minutes(AUTH_HTTP_COOLDOWN_MINUTES)
-        ));
     }
 
-    /// hysteria 连不上鉴权端口 ≥3 条 ⇒ 记一条事件（带「守护进程还在不在听」），
-    /// **不做任何处置**：b-ui 由 systemd 的 `Restart=always` 拉起，watchdog 再去
-    /// restart 只会把正在收敛的那一轮对账拦腰砍断。
+    /// 鉴权日志由哨兵负责（5 秒增量读，设计裁决 D9）：watchdog 不再每 60 秒自己翻 hysteria 的日志，
+    /// 也不再写 `hy2_auth_http` 键——同一故障不许两处各报一次。
     #[tokio::test]
-    async fn repeated_auth_endpoint_failures_are_recorded_without_touching_anything() {
+    async fn the_watchdog_leaves_the_auth_log_to_the_sentinel() {
         let host = Arc::new(FakeHost::new());
         host.with(|i| {
             for u in [
@@ -874,76 +789,16 @@ hysteria[1]: outbound error {\"error\": \"dial tcp 198.51.100.7:10007: connect: 
             }
             i.listening
                 .insert(Proto::Udp, [10000, 40000].into_iter().collect());
-            // 2080 / 10001 在听，鉴权端口 18789 **不在**
             i.listening
                 .insert(Proto::Tcp, [10001, 2080].into_iter().collect());
-            let line = "hysteria[1]: authentication error {\"error\": \"Post \
-                        \\\"http://127.0.0.1:18789/auth\\\": dial tcp 127.0.0.1:18789: \
-                        connect: connection refused\"}\n";
-            i.scripted.push((
-                "journalctl -u hysteria-server".into(),
-                crate::sys::CmdOut::success(&line.repeat(4)),
-            ));
-            i.scripted.push((
-                "journalctl -u hysteria-residential".into(),
-                crate::sys::CmdOut::success(line),
-            ));
         });
         let (c, _d) = ctx(host.clone()).await;
         check_once(&c).await.unwrap();
-
-        let alerts: std::collections::BTreeMap<String, AuthHttpAlert> =
-            serde_json::from_value(c.runtime.read().await.extra[AUTH_HTTP_KEY].clone()).unwrap();
-        assert_eq!(
-            alerts.keys().collect::<Vec<_>>(),
-            vec!["hysteria-server"],
-            "只有 1 条失败的住宅实例没到阈值，不该报"
-        );
-        let a = &alerts["hysteria-server"];
-        assert_eq!((a.count, a.fails), (1, 4));
-        assert_eq!(a.at, "2026-09-11T00:00:00Z");
-        assert!(!a.daemon_listening, "18789 没人听，事件里要看得出来");
-        assert!(
-            acting_ops(&host).is_empty(),
-            "哨兵只报不改，一个动作都不该有：{:?}",
-            host.ops()
-        );
-
-        // 冷却窗口内不再记第二条
-        host.advance(60);
-        check_once(&c).await.unwrap();
-        let alerts: std::collections::BTreeMap<String, AuthHttpAlert> =
-            serde_json::from_value(c.runtime.read().await.extra[AUTH_HTTP_KEY].clone()).unwrap();
-        assert_eq!(alerts["hysteria-server"].count, 1);
-    }
-
-    /// `hy2_auth=command`（退路开关）下根本没有 http 鉴权，哨兵一行日志都不该读。
-    #[tokio::test]
-    async fn the_sentinel_is_silent_in_command_mode() {
-        let host = Arc::new(FakeHost::new());
-        host.with(|i| {
-            i.listening
-                .insert(Proto::Udp, [10000, 40000].into_iter().collect());
-            i.listening
-                .insert(Proto::Tcp, [10001, 2080].into_iter().collect());
-        });
-        let d = tempfile::tempdir().unwrap();
-        let mut s = sample_state();
-        s.system.hy2_auth = bui_schema::model::Hy2Auth::Command;
-        let store = Store::create(d.path().join("state.json"), s).await.unwrap();
-        let c = crate::reconcile::DaemonCtx {
-            store,
-            runtime: Runtime::load(d.path().join("runtime.json")),
-            bus: EventBus::new(),
-            host: host.clone(),
-            paths: Paths::default_server(),
-        };
-        check_once(&c).await.unwrap();
         assert!(
             !host.ops().iter().any(|o| o.contains("journalctl")),
-            "command 模式下没有 http 鉴权可看：{:?}",
+            "{:?}",
             host.ops()
         );
-        assert!(!c.runtime.read().await.extra.contains_key(AUTH_HTTP_KEY));
+        assert!(!c.runtime.read().await.extra.contains_key("hy2_auth_http"));
     }
 }

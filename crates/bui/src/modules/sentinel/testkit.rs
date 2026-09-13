@@ -86,3 +86,13 @@ pub fn panel_shared(
     shared.set_paths(&ctx.paths);
     (shared, xray)
 }
+
+/// 一条日志记录：`secs` = 相对 FakeHost 默认时钟 2026-09-11T00:00:00Z 的秒数，游标 `c-<unit>-<secs>`
+pub fn rec(unit: &str, secs: i64, message: &str) -> crate::sys::JournalRecord {
+    crate::sys::JournalRecord {
+        cursor: format!("c-{unit}-{secs}"),
+        unit: unit.to_string(),
+        ts: time::macros::datetime!(2026-09-11 00:00:00 UTC) + time::Duration::seconds(secs),
+        message: message.to_string(),
+    }
+}

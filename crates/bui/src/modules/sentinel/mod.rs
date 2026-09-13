@@ -8,6 +8,7 @@
 pub mod engine;
 pub mod incidents;
 pub mod resi;
+pub mod run;
 pub mod signature;
 pub mod system;
 #[cfg(test)]
@@ -21,3 +22,75 @@ pub const ACTION_COOLDOWN_SECS: i64 = 600;
 pub const INCIDENTS_MAX: usize = 200;
 /// 住宅 IP 被判不健康连续这么久 ⇒ 告警里建议管理员替换（设计裁决 D15）
 pub const LONG_UNREACHABLE_MINS: i64 = 30;
+/// 每轮增量读 journald 的间隔（设计裁决 D1）
+pub const POLL_SECS: u64 = 5;
+/// 只有游标前进时，至少隔这么久才把游标落盘一次（hysteria 在 info 级每条连接都写日志）
+pub const CURSOR_PERSIST_SECS: i64 = 60;
+/// 带外快探的超时（设计裁决 D5：演练要求 ≤15 秒出事件）
+pub const PROBE_TIMEOUT_SECS: u64 = 5;
+
+use crate::modules::panel::Shared;
+use crate::modules::residential::clash::{Clash, HttpClash};
+use crate::modules::residential::proxy::{Prober, ReqwestProber};
+use crate::reconcile::{Artifact, DaemonCtx, Module, RenderCtx};
+use bui_schema::model::State;
+use std::sync::Arc;
+
+/// 外部通知（Telegram / Webhook）的预留口（spec §5.7：本期不做）。每条事件落盘后调一次。
+pub trait Notifier: Send + Sync + 'static {
+    fn notify(&self, incident: &incidents::Incident);
+}
+
+/// 本期的实现：什么都不做
+pub struct NoopNotifier;
+
+impl Notifier for NoopNotifier {
+    fn notify(&self, _incident: &incidents::Incident) {}
+}
+
+/// 哨兵的外部依赖（测试注入 fake）
+#[derive(Clone)]
+pub struct Deps {
+    /// 带外快探用（生产：`ReqwestProber::with_timeout(PROBE_TIMEOUT_SECS)`）
+    pub prober: Arc<dyn Prober>,
+    /// 按槽借用用（relay 的 Clash API）
+    pub clash: Arc<dyn Clash>,
+    /// 用户同步重试用（面板模块的共享句柄）
+    pub panel: Arc<Shared>,
+    pub notifier: Arc<dyn Notifier>,
+}
+
+pub struct SentinelModule {
+    deps: Deps,
+}
+
+impl SentinelModule {
+    /// 生产构造：`panel` 是 `PanelModule::shared()`（`serve::modules` 里传）
+    pub fn new(panel: Arc<Shared>) -> Self {
+        Self::with(Deps {
+            prober: Arc::new(ReqwestProber::with_timeout(PROBE_TIMEOUT_SECS)),
+            clash: Arc::new(HttpClash::new()),
+            panel,
+            notifier: Arc::new(NoopNotifier),
+        })
+    }
+
+    pub fn with(deps: Deps) -> Self {
+        Self { deps }
+    }
+}
+
+impl Module for SentinelModule {
+    fn name(&self) -> &'static str {
+        "sentinel"
+    }
+
+    /// 没有期望项，只有后台任务（与 watchdog 同）
+    fn render(&self, _s: &State, _ctx: &RenderCtx) -> Vec<Artifact> {
+        Vec::new()
+    }
+
+    fn spawn(&self, ctx: DaemonCtx) -> Vec<tokio::task::JoinHandle<()>> {
+        vec![tokio::spawn(run::sentinel_loop(ctx, self.deps.clone()))]
+    }
+}
