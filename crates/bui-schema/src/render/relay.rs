@@ -149,6 +149,16 @@ pub fn config(g: &ResidentialGroup, slots: &[Slot], opts: &RelayOpts) -> Value {
     if !g.udp_via_pool() {
         route_rules.push(json!({ "network": "udp", "port": 443, "action": "reject" }));
         route_rules.push(json!({ "network": "udp", "outbound": "direct" }));
+    } else {
+        // 全 socks5 池：UDP 目标先在本机解析成 IPv4 再进 socks 出站。Decodo 的 UDP ASSOCIATE
+        // 只收 IPv4 目标（ATYP=3 域名 / ATYP=4 IPv6 都回 code=8，2026-09-13 实测），而 socks
+        // 出站会把 sniff 出的域名原样发出。TCP 不解析，域名照旧交给上游。
+        route_rules.push(json!({
+            "network": "udp",
+            "action": "resolve",
+            "server": "dns_direct",
+            "strategy": "ipv4_only"
+        }));
     }
     let mut ip_cidr: Vec<String> = PRIVATE_CIDRS.iter().map(|c| c.to_string()).collect();
     if let Some(ip) = &opts.server_ip {

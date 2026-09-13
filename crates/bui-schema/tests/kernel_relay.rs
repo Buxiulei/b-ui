@@ -191,6 +191,10 @@ fn relay_mixed_pool_keeps_the_three_udp_rules() {
         .iter()
         .any(|r| r["network"] == "udp" && r["port"] == 443 && r["action"] == "reject"));
     assert!(udp_catch_all_direct(rules));
+    assert!(
+        udp_resolve_pos(rules).is_none(),
+        "混合池的 UDP 不进 socks 出站，不需要先解析：{rules:#?}"
+    );
     common::check_singbox_all(&cfg);
 }
 
@@ -209,7 +213,73 @@ fn relay_all_http_pool_keeps_the_three_udp_rules() {
         .iter()
         .any(|r| r["network"] == "udp" && r["port"] == 443 && r["action"] == "reject"));
     assert!(udp_catch_all_direct(rules));
+    assert!(
+        udp_resolve_pos(rules).is_none(),
+        "全 http 池的 UDP 不进 socks 出站，不需要先解析：{rules:#?}"
+    );
     common::check_singbox_all(&cfg);
+}
+
+/// 全 socks5 池：UDP 目标先在本机解析成 IPv4 再进 socks 出站。
+///
+/// 2026-09-13 实测（经 Decodo SOCKS5）：UDP ASSOCIATE 的请求地址只收 ATYP=1（IPv4），
+/// ATYP=3（域名）与 ATYP=4（IPv6）都回 code=8；而 sing-box 的 socks 出站会把 sniff
+/// 出的域名原样当 UDP 目标发出（relay 日志 24h 823 条 `request rejected, code=8`）。
+/// 这条 resolve 在 sniff 与 UDP/53 直连之后、各槽 inbound 规则之前，全表只一条；
+/// 只作用于 UDP，TCP 的域名照旧原样交给上游。
+#[test]
+fn relay_all_socks5_pool_resolves_udp_targets_to_ipv4_before_the_slot_rules() {
+    for mode in ["global", "split"] {
+        let s = common::state(mode);
+        let mut g = s.residential.default_group().unwrap().clone();
+        for u in &mut g.upstreams {
+            u.kind = UpstreamKind::Socks5;
+        }
+        let slots: Vec<bui_schema::model::Slot> = g
+            .upstreams
+            .iter()
+            .enumerate()
+            .map(|(i, u)| bui_schema::model::Slot {
+                index: i as u16,
+                upstream_id: u.id,
+            })
+            .collect();
+        let cfg = relay::config(&g, &slots, &opts());
+        let rules = cfg["route"]["rules"].as_array().unwrap();
+        let at = udp_resolve_pos(rules)
+            .unwrap_or_else(|| panic!("{mode}：缺 UDP → IPv4 的 resolve：{rules:#?}"));
+        let sniff = rules.iter().position(|r| r["action"] == "sniff").unwrap();
+        let dns53 = rules
+            .iter()
+            .position(|r| r["network"] == "udp" && r["port"] == 53)
+            .unwrap();
+        let first_slot = rules
+            .iter()
+            .position(|r| r.get("inbound").is_some())
+            .unwrap();
+        assert!(sniff < at, "{mode}：resolve 要在 sniff 之后：{rules:#?}");
+        assert!(dns53 < at, "{mode}：UDP/53 直连不必先解析：{rules:#?}");
+        assert!(
+            at < first_slot,
+            "{mode}：resolve 要在各槽 inbound 规则之前：{rules:#?}"
+        );
+        let resolves: Vec<_> = rules.iter().filter(|r| r["action"] == "resolve").collect();
+        assert_eq!(resolves.len(), 1, "{mode}：只一条，不按槽重复：{rules:#?}");
+        assert_eq!(resolves[0]["network"], "udp", "{mode}：TCP 不解析");
+        common::check_singbox_all(&cfg);
+    }
+}
+
+/// 「UDP 目标先在本机解析成 IPv4」那条 resolve 的位置
+fn udp_resolve_pos(rules: &[serde_json::Value]) -> Option<usize> {
+    rules.iter().position(|r| {
+        *r == serde_json::json!({
+            "network": "udp",
+            "action": "resolve",
+            "server": "dns_direct",
+            "strategy": "ipv4_only"
+        })
+    })
 }
 
 fn udp_dns_direct(rules: &[serde_json::Value]) -> bool {
