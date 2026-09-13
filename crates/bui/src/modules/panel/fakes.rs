@@ -19,6 +19,10 @@ pub struct FakeXrayInner {
     pub error_text: BTreeMap<String, String>,
     /// 进程里「正在跑」的规则表，按表序：`(ruleTag, outboundTag)`
     pub rules: Vec<(String, String)>,
+    /// `ListRule` 接下来这么多次返回 **`tonic::Status::unavailable`**（文案仿真机的
+    /// `tcp connect error`），每次减一、用完即恢复：模拟 xray 刚重启、还没起 10085 监听的
+    /// 那一两秒（2026-09-13 bwg-rick）。`u32::MAX` ≈ 一直连不上。
+    pub list_rules_unavailable: u32,
 }
 
 #[derive(Clone, Default)]
@@ -120,6 +124,13 @@ impl XrayApi for FakeXray {
     async fn list_rules(&self) -> anyhow::Result<Vec<(String, String)>> {
         let mut i = self.0.lock().unwrap();
         i.calls.push("list-rules".into());
+        if i.list_rules_unavailable > 0 {
+            i.list_rules_unavailable -= 1;
+            return Err(tonic::Status::unavailable(
+                "tcp connect error: Connection refused (os error 111)",
+            )
+            .into());
+        }
         if i.fail_on.contains("list-rules") {
             anyhow::bail!("fake ListRule 失败");
         }

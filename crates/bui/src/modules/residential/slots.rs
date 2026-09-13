@@ -13,12 +13,16 @@ use crate::modules::residential::{health, SLOT_BACK_ROUNDS};
 use crate::reconcile::DaemonCtx;
 use crate::state::runtime::Runtime;
 use crate::state::store::Store;
+use crate::sys::Host;
+use crate::util::parse_rfc3339;
 use bui_schema::model::{ResidentialGroup, Slot, State, DEFAULT_GROUP};
 use bui_schema::render::xray as xray_render;
 use bui_schema::render::xray::SlotRule;
 use bui_schema::slots;
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -100,9 +104,19 @@ pub enum ConvergeOutcome {
     Applied(usize),
     /// gRPC 失败、新配置已落盘 ⇒ 退回了一次 `systemctl restart xray`
     Restarted,
+    /// xray 本次启动晚于磁盘上那份（已是期望槽规则的）`xray-config.json` 的写入 ⇒
+    /// 进程已从磁盘加载了完整槽规则，直接记账，不调 gRPC、不重启
+    LoadedFromDisk,
     /// 什么都没做，脏标记留着等下一轮
     Deferred,
 }
+
+/// 连接类 gRPC 错误的退避重试总预算（从第一次尝试算起，含每次尝试本身的耗时）
+pub const GRPC_RETRY_BUDGET: Duration = Duration::from_secs(15);
+/// 退避的首个间隔，此后每次翻倍（0.5/1/2/4 秒…），最后一段截到预算用完为止
+const GRPC_RETRY_FIRST: Duration = Duration::from_millis(500);
+/// [`restart_fallback`] 那条告警的固定前缀：收敛成功时按它认领、清掉
+const GRPC_FAIL_ALERT: &str = "Xray 槽路由 gRPC 失败";
 
 /// 标记「渲染出的 Xray 槽路由与 xray 进程里跑的那一份可能已经不一致」（D7）。
 /// 用户增删、改分槽、`rebalance`、删上游后的重分配之后都要置位。
@@ -112,16 +126,22 @@ pub async fn mark_xray_rules_dirty(runtime: &Runtime) {
 
 /// 让 Xray 的住宅槽路由与期望态一致（D7）。**正常路径不重启 xray**。
 ///
-/// 四道门（顺序即语义，别调整）：
+/// 五道门（顺序即语义，别调整）：
 /// 1. `runtime.residential.xray_slot_rules_dirty` 没置位 ⇒ 什么都不做；
 /// 2. 置位但 `xray_slot_rules_hash` 已等于当前渲染的 `slot_rules_hash` ⇒ 清脏、不动 xray
 ///    （这一轮的变化与槽路由无关，例如加了个没有住宅权益的用户）；
-/// 3. 否则 `ListRule()` 读回**进程里正在跑的**那张表，与期望态求差，只对差集调
+/// 3. 磁盘上那份 `xray-config.json` 已是期望槽规则，**且** xray 本次启动晚于它的写入
+///    （[`loaded_from_disk`]）⇒ 进程就是从这份文件起来的：记哈希、清脏，不调 gRPC、
+///    不重启（对账刚为别的原因重启过 xray 的那一轮就是这样）；
+/// 4. 否则 `ListRule()` 读回**进程里正在跑的**那张表，与期望态求差，只对差集调
 ///    `RemoveRule` / `AddRule`（每个用户一条规则，`ruleTag` = `resi-u-<user_id>`），
 ///    最后把兜底规则挪回表尾。差分连**表序**一起比：内容一致但兜底不在表尾也算差异，
-///    所以哈希只在顺序与内容都收敛之后才写；全成功 ⇒ 记哈希、清脏；
-/// 4. 任一步 gRPC 失败 ⇒ [`restart_fallback`]：只有磁盘上那份 `xray-config.json` 已经
-///    是新规则时才重启一次并记事件，否则什么都不做、脏标记留着。
+///    所以哈希只在顺序与内容都收敛之后才写；全成功 ⇒ 记哈希、清脏。连接类错误
+///    （xray 刚重启、还没起监听）先按退避重试（[`apply_with_retry`]）；
+/// 5. 重试用完或非连接类错误 ⇒ [`restart_fallback`]：只有磁盘上那份 `xray-config.json`
+///    已经是新规则时才重启一次并记事件，否则什么都不做、脏标记留着。
+///
+/// 第 3、4 道门成功时顺带清掉第 5 道门以前写下的「gRPC 失败」告警（[`mark_converged`]）。
 ///
 /// 调用点只有对账 consumer 的末尾（`serve.rs` 启动那一轮 + 去抖那一轮）：那时新的
 /// `xray-config.json` 刚落盘，第 4 步的判据才可能成立。干净时是个零成本 no-op，
@@ -148,13 +168,16 @@ pub async fn converge_xray(ctx: &DaemonCtx, xray: &dyn XrayApi) -> ConvergeOutco
         state::update(&ctx.runtime, |r| r.xray_slot_rules_dirty = false).await;
         return ConvergeOutcome::Clean;
     }
-    match apply_slot_rules(xray, &want).await {
+    if loaded_from_disk(ctx, &want_hash).await {
+        mark_converged(ctx, want_hash).await;
+        tracing::info!(
+            "xray 本次启动晚于 xray-config.json 落盘，已从磁盘加载完整槽规则：直接记账（不调 gRPC、不重启）"
+        );
+        return ConvergeOutcome::LoadedFromDisk;
+    }
+    match apply_with_retry(xray, &want).await {
         Ok(calls) => {
-            state::update(&ctx.runtime, move |r| {
-                r.xray_slot_rules_dirty = false;
-                r.xray_slot_rules_hash = Some(want_hash);
-            })
-            .await;
+            mark_converged(ctx, want_hash).await;
             if calls > 0 {
                 tracing::info!(
                     calls,
@@ -168,6 +191,143 @@ pub async fn converge_xray(ctx: &DaemonCtx, xray: &dyn XrayApi) -> ConvergeOutco
             restart_fallback(ctx, &want_hash, &e.to_string()).await
         }
     }
+}
+
+/// 收敛成功（gRPC 增删，或第 3 道门确认进程已从磁盘加载）的记账：记哈希、清脏，并认领
+/// [`restart_fallback`] 以前写下的「gRPC 失败」告警 —— 它描述的是一次已经过去的退回，
+/// 收敛成功后还挂着只会让面板与 `status` 一直报警（2026-09-13 bwg-rick）。
+async fn mark_converged(ctx: &DaemonCtx, hash: String) {
+    let mut cleared = 0usize;
+    let n = &mut cleared;
+    state::update(&ctx.runtime, move |r| {
+        r.xray_slot_rules_dirty = false;
+        r.xray_slot_rules_hash = Some(hash);
+        *n = state::remove_alerts_with_prefix(r, GRPC_FAIL_ALERT);
+    })
+    .await;
+    if cleared > 0 {
+        tracing::info!(cleared, "Xray 槽路由已收敛，清除旧的「gRPC 失败」告警");
+    }
+}
+
+/// 磁盘上那份 `xray-config.json` 的槽路由哈希（读不到 / 解析不了 ⇒ `None`）。
+async fn landed_hash(ctx: &DaemonCtx) -> Option<String> {
+    let path = ctx.paths.base_dir.join("xray-config.json");
+    let host = ctx.host.clone();
+    tokio::task::spawn_blocking(move || host.read_file(&path))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .flatten()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .map(|v| xray_render::slot_rules_hash(&v))
+}
+
+/// 第 3 道门：磁盘上已是期望槽规则，**且** xray 本次启动严格晚于该文件的最后一次写入 ⇒
+/// 进程就是从这份文件起来的，里面已是完整槽规则。改分槽只重写文件、不重启 xray
+/// （`restart_key` 是结构哈希），那时启动早于写入，这道门自然不成立。
+async fn loaded_from_disk(ctx: &DaemonCtx, want_hash: &str) -> bool {
+    if landed_hash(ctx).await.as_deref() != Some(want_hash) {
+        return false;
+    }
+    let path = ctx.paths.base_dir.join("xray-config.json");
+    let host = ctx.host.clone();
+    tokio::task::spawn_blocking(move || xray_started_after(host.as_ref(), &path))
+        .await
+        .unwrap_or(false)
+}
+
+/// xray **本次启动**（`ActiveEnterTimestamp`）是否严格晚于 `path` 的 mtime。任一时间取不到
+/// 或解析不了 ⇒ `false`（不走捷径，照常调 gRPC）。
+///
+/// 不用 [`Host::unit_property`]：它的 `systemctl show --value` 按本机时区输出
+/// （`Sun 2026-09-13 08:05:30 CST`），时区缩写有歧义；这里要 `--timestamp=us+utc` 拿微秒 +
+/// UTC（不认这个选项的老 systemd ⇒ 退出码非 0 ⇒ 不走捷径）。精度要到亚秒：真机实录里
+/// 写配置与重启 xray 就在同一秒。
+fn xray_started_after(host: &dyn Host, path: &Path) -> bool {
+    fn stdout_of(host: &dyn Host, program: &str, args: &[&str]) -> Option<String> {
+        host.run(program, args)
+            .ok()
+            .filter(|o| o.ok())
+            .map(|o| o.stdout)
+    }
+    let started = stdout_of(
+        host,
+        "systemctl",
+        &[
+            "show",
+            "-p",
+            "ActiveEnterTimestamp",
+            "--value",
+            "--timestamp=us+utc",
+            "xray.service",
+        ],
+    )
+    .and_then(|s| parse_systemd_utc(&s));
+    let mtime = stdout_of(host, "stat", &["-c", "%y", &path.to_string_lossy()])
+        .and_then(|s| parse_stat_mtime(&s));
+    matches!((started, mtime), (Some(s), Some(m)) if s > m)
+}
+
+/// `systemctl show --timestamp=us+utc` 的值：`Sun 2026-09-13 00:05:30.512345 UTC`
+/// （星期几随 locale 变，只取后三段）。
+fn parse_systemd_utc(s: &str) -> Option<OffsetDateTime> {
+    match s.split_whitespace().collect::<Vec<_>>().as_slice() {
+        [.., date, time, "UTC"] => parse_rfc3339(&format!("{date}T{time}Z")),
+        _ => None,
+    }
+}
+
+/// `stat -c %y` 的值：`2026-09-13 08:05:30.101234567 +0800`。
+fn parse_stat_mtime(s: &str) -> Option<OffsetDateTime> {
+    match s.split_whitespace().collect::<Vec<_>>().as_slice() {
+        [date, time, off] => {
+            let (h, m) = (off.get(..3)?, off.get(3..)?);
+            parse_rfc3339(&format!("{date}T{time}{h}:{m}"))
+        }
+        _ => None,
+    }
+}
+
+/// [`apply_slot_rules`] 外面包一层退避：**连接类**错误（[`is_connect_error`]；2026-09-13
+/// bwg-rick 实录就是对账重启 xray 的同一秒撞上 10085 Connection refused）按 0.5/1/2/4…
+/// 秒退避重试，总时长不超过 [`GRPC_RETRY_BUDGET`]；预算用完、或非连接类错误（规则非法、
+/// 重名 ruleTag…）立刻把错误交回，由调用方走 [`restart_fallback`]。每次重试都重新
+/// `ListRule`，中途失败留下的半截增删会被下一次差分补齐。
+async fn apply_with_retry(xray: &dyn XrayApi, want: &[SlotRule]) -> anyhow::Result<usize> {
+    let deadline = tokio::time::Instant::now() + GRPC_RETRY_BUDGET;
+    let mut delay = GRPC_RETRY_FIRST;
+    loop {
+        let err = match apply_slot_rules(xray, want).await {
+            Err(e) if is_connect_error(&e) => e,
+            other => return other,
+        };
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return Err(err);
+        }
+        let wait = delay.min(left);
+        tracing::info!(
+            error = %err,
+            wait = ?wait,
+            "xray gRPC 暂时连不上（多半刚重启、还没起监听），退避后重试"
+        );
+        tokio::time::sleep(wait).await;
+        delay *= 2;
+    }
+}
+
+/// 连接类错误：连不上（`Unavailable`，tonic 把 connect error 映射到它）、超时
+/// （`DeadlineExceeded`，或 tonic 客户端超时给的 `Cancelled("Timeout expired")`）。
+/// 其余错误码与非 `tonic::Status` 的错误一律不算。
+fn is_connect_error(e: &anyhow::Error) -> bool {
+    use tonic::Code;
+    e.downcast_ref::<tonic::Status>()
+        .is_some_and(|s| match s.code() {
+            Code::Unavailable | Code::DeadlineExceeded => true,
+            Code::Cancelled => s.message() == tonic::TimeoutExpired(()).to_string(),
+            _ => false,
+        })
 }
 
 /// 用 `ListRule` 读回进程里真正在跑的那张表，只对差集调 `RemoveRule` / `AddRule`。
@@ -242,16 +402,7 @@ async fn apply_slot_rules(xray: &dyn XrayApi, want: &[SlotRule]) -> anyhow::Resu
 /// gRPC 收敛失败时的唯一退路：重启一次 xray，让它把磁盘上那份**完整**规则表读回来。
 /// 只有磁盘哈希已等于期望哈希才动手 —— 否则重启只是把旧规则重新加载一遍。
 async fn restart_fallback(ctx: &DaemonCtx, want_hash: &str, err: &str) -> ConvergeOutcome {
-    let path = ctx.paths.base_dir.join("xray-config.json");
-    let host = ctx.host.clone();
-    let h2 = host.clone();
-    let landed = tokio::task::spawn_blocking(move || h2.read_file(&path))
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .flatten()
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-        .map(|v| xray_render::slot_rules_hash(&v));
+    let landed = landed_hash(ctx).await;
     if landed.as_deref() != Some(want_hash) {
         tracing::debug!(
             landed = ?landed,
@@ -260,6 +411,7 @@ async fn restart_fallback(ctx: &DaemonCtx, want_hash: &str, err: &str) -> Conver
         );
         return ConvergeOutcome::Deferred;
     }
+    let host = ctx.host.clone();
     let out = tokio::task::spawn_blocking(move || host.systemd("restart", "xray.service")).await;
     if !matches!(out, Ok(Ok(ref o)) if o.status == 0) {
         tracing::warn!("重启 xray 失败，槽路由等下一轮对账再收敛");
@@ -269,7 +421,7 @@ async fn restart_fallback(ctx: &DaemonCtx, want_hash: &str, err: &str) -> Conver
     let hash = want_hash.to_string();
     // 错误串是 gRPC 状态文本，不含凭据；仍然只取首行，避免把多行 tonic 报文塞进面板
     let msg = format!(
-        "Xray 槽路由 gRPC 失败（{}），已重启 xray 收敛一次",
+        "{GRPC_FAIL_ALERT}（{}），已重启 xray 收敛一次",
         err.lines().next().unwrap_or("")
     );
     state::update(&ctx.runtime, move |r| {
@@ -945,6 +1097,11 @@ mod tests {
         });
 
         assert_eq!(converge_xray(&ctx, &x).await, ConvergeOutcome::Restarted);
+        assert_eq!(
+            x.calls(),
+            vec!["list-rules".to_string()],
+            "非连接类错误（规则非法等）不重试，直接走退路"
+        );
         assert_eq!(restarts_of_xray(&host), 1, "{:?}", host.ops());
         let r = state::read(&ctx.runtime).await;
         assert!(!r.xray_slot_rules_dirty);
@@ -1030,6 +1187,195 @@ mod tests {
         });
         assert_eq!(converge_xray(&ctx, &x).await, ConvergeOutcome::Restarted);
         assert_eq!(restarts_of_xray(&host), 1);
+    }
+
+    // ── xray 刚重启时 gRPC 连不上（2026-09-13 bwg-rick rc6 升级实录）──────────────
+
+    fn list_rule_calls(x: &FakeXray) -> usize {
+        x.calls().iter().filter(|c| *c == "list-rules").count()
+    }
+
+    /// 脚本化「xray 本次启动时刻」与「xray-config.json 的 mtime」（`FakeHost::scripted`
+    /// 前缀匹配），格式与真机 `systemctl show --timestamp=us+utc` / `stat -c %y` 一致。
+    fn script_xray_times(host: &FakeHost, active_enter: &str, mtime: &str) {
+        use crate::sys::CmdOut;
+        host.with(|i| {
+            i.scripted.push((
+                "systemctl show -p ActiveEnterTimestamp".into(),
+                CmdOut::success(active_enter),
+            ));
+            i.scripted
+                .push(("stat -c %y".into(), CmdOut::success(mtime)));
+        });
+    }
+
+    /// 真机那一秒：对账写完新配置、刚重启了 xray，紧跟着的 `ListRule` 撞上
+    /// Connection refused（10085 还没起监听）。连接类错误先退避重试，**不许**立刻重启，
+    /// 也不许留告警。
+    #[tokio::test(start_paused = true)]
+    async fn connection_refused_twice_then_ok_retries_without_restart_or_alert() {
+        let d = tempfile::tempdir().unwrap();
+        let (store, bus) = store_with(d.path(), 2, 2).await;
+        let (ctx, host) = ctx_of(d.path(), store, bus).await;
+        migrate_on_start(&ctx.store, &ctx.bus).await.unwrap();
+        // 退路的前提成立（新配置已落盘）：真走到退路就会重启，这条测试才有意义
+        land_xray_config(&ctx, &host).await;
+        mark_xray_rules_dirty(&ctx.runtime).await;
+        let x = FakeXray::new();
+        x.with(|i| i.list_rules_unavailable = 2);
+
+        assert!(
+            matches!(converge_xray(&ctx, &x).await, ConvergeOutcome::Applied(_)),
+            "{:?}",
+            x.calls()
+        );
+        assert_eq!(
+            list_rule_calls(&x),
+            3,
+            "两次连不上 + 一次成功：{:?}",
+            x.calls()
+        );
+        assert_same_rules(&x.rules(), &want_rules(&ctx).await);
+        assert_eq!(restarts_of_xray(&host), 0, "{:?}", host.ops());
+        let r = state::read(&ctx.runtime).await;
+        assert!(!r.xray_slot_rules_dirty);
+        assert!(r.alerts.is_empty(), "{:?}", r.alerts);
+    }
+
+    /// 一直连不上：退避总时长封顶 [`GRPC_RETRY_BUDGET`]，之后仍走原来那条「重启一次」退路。
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_that_never_comes_back_still_falls_back_to_one_restart() {
+        let d = tempfile::tempdir().unwrap();
+        let (store, bus) = store_with(d.path(), 2, 2).await;
+        let (ctx, host) = ctx_of(d.path(), store, bus).await;
+        migrate_on_start(&ctx.store, &ctx.bus).await.unwrap();
+        land_xray_config(&ctx, &host).await;
+        mark_xray_rules_dirty(&ctx.runtime).await;
+        let x = FakeXray::new();
+        x.with(|i| i.list_rules_unavailable = u32::MAX);
+
+        let t0 = tokio::time::Instant::now();
+        assert_eq!(converge_xray(&ctx, &x).await, ConvergeOutcome::Restarted);
+        let waited = t0.elapsed();
+        assert!(waited <= GRPC_RETRY_BUDGET, "退避总时长超预算：{waited:?}");
+        assert!(
+            waited > GRPC_RETRY_BUDGET / 2,
+            "预算没用满就放弃了：{waited:?}"
+        );
+        assert!(list_rule_calls(&x) >= 3, "{:?}", x.calls());
+        assert_eq!(restarts_of_xray(&host), 1, "{:?}", host.ops());
+        assert!(state::read(&ctx.runtime)
+            .await
+            .alerts
+            .iter()
+            .any(|a| a.starts_with("Xray 槽路由 gRPC 失败")));
+    }
+
+    /// xray 本次启动晚于配置落盘（且磁盘上就是期望的槽规则）⇒ 进程里已是完整规则：
+    /// 直接记哈希、清脏，**不调 gRPC、不重启**，顺带认领以前的「gRPC 失败」告警。
+    #[tokio::test]
+    async fn xray_started_after_the_config_landed_is_booked_without_grpc() {
+        let d = tempfile::tempdir().unwrap();
+        let (store, bus) = store_with(d.path(), 2, 2).await;
+        let (ctx, host) = ctx_of(d.path(), store, bus).await;
+        migrate_on_start(&ctx.store, &ctx.bus).await.unwrap();
+        land_xray_config(&ctx, &host).await;
+        state::update(&ctx.runtime, |r| {
+            state::push_alert(r, "机器上没有 journalctl，黑名单候选只能靠每日探针集");
+            state::push_alert(
+                r,
+                "Xray 槽路由 gRPC 失败（code: 'The service is currently unavailable'），已重启 xray 收敛一次",
+            );
+        })
+        .await;
+        mark_xray_rules_dirty(&ctx.runtime).await;
+        // 真机形态：mtime 按本地时区（+0800）给、启动时刻按 UTC 给；换算后启动晚 0.4 秒
+        script_xray_times(
+            &host,
+            "Sun 2026-09-13 00:05:30.512345 UTC\n",
+            "2026-09-13 08:05:30.101234567 +0800\n",
+        );
+        let x = FakeXray::new();
+
+        assert_eq!(
+            converge_xray(&ctx, &x).await,
+            ConvergeOutcome::LoadedFromDisk
+        );
+        assert!(x.calls().is_empty(), "不许调 gRPC：{:?}", x.calls());
+        assert_eq!(restarts_of_xray(&host), 0, "{:?}", host.ops());
+        let r = state::read(&ctx.runtime).await;
+        assert!(!r.xray_slot_rules_dirty);
+        assert_eq!(
+            r.alerts,
+            vec!["机器上没有 journalctl，黑名单候选只能靠每日探针集".to_string()],
+            "只清本路径的旧告警"
+        );
+        // 记下的就是期望哈希：再置脏一轮走第 2 道门，什么都不发
+        mark_xray_rules_dirty(&ctx.runtime).await;
+        assert_eq!(converge_xray(&ctx, &x).await, ConvergeOutcome::Clean);
+        assert!(x.calls().is_empty(), "{:?}", x.calls());
+    }
+
+    /// 反方向：配置是在 xray 这次启动**之后**才写的（改分槽只重写文件、不重启 xray），
+    /// 进程里还是旧规则 ⇒ 必须照常走 gRPC，不许偷懒记账。
+    #[tokio::test]
+    async fn xray_started_before_the_config_landed_still_goes_through_grpc() {
+        let d = tempfile::tempdir().unwrap();
+        let (store, bus) = store_with(d.path(), 2, 2).await;
+        let (ctx, host) = ctx_of(d.path(), store, bus).await;
+        migrate_on_start(&ctx.store, &ctx.bus).await.unwrap();
+        land_xray_config(&ctx, &host).await;
+        mark_xray_rules_dirty(&ctx.runtime).await;
+        script_xray_times(
+            &host,
+            "Sun 2026-09-13 00:05:30.000000 UTC\n",
+            "2026-09-13 08:05:30.101234567 +0800\n",
+        );
+        let x = FakeXray::new();
+
+        assert!(matches!(
+            converge_xray(&ctx, &x).await,
+            ConvergeOutcome::Applied(_)
+        ));
+        assert_eq!(x.calls().first().map(String::as_str), Some("list-rules"));
+        assert_same_rules(&x.rules(), &want_rules(&ctx).await);
+        assert_eq!(restarts_of_xray(&host), 0, "{:?}", host.ops());
+    }
+
+    /// 真机的完整经过：一次 gRPC 失败退回重启、写下告警；此后某一轮 gRPC 收敛成功
+    /// ⇒ 那条告警必须消失（以前它会一直挂在面板与 status 上）。
+    #[tokio::test]
+    async fn a_stale_grpc_failure_alert_is_cleared_by_the_next_successful_converge() {
+        let d = tempfile::tempdir().unwrap();
+        let (store, bus) = store_with(d.path(), 2, 2).await;
+        let (ctx, host) = ctx_of(d.path(), store, bus).await;
+        migrate_on_start(&ctx.store, &ctx.bus).await.unwrap();
+        land_xray_config(&ctx, &host).await;
+        state::update(&ctx.runtime, |r| {
+            state::push_alert(r, "机器上没有 journalctl，黑名单候选只能靠每日探针集")
+        })
+        .await;
+        mark_xray_rules_dirty(&ctx.runtime).await;
+        let x = FakeXray::new();
+        x.with(|i| {
+            i.fail_on.insert("list-rules".into());
+        });
+        assert_eq!(converge_xray(&ctx, &x).await, ConvergeOutcome::Restarted);
+        assert_eq!(state::read(&ctx.runtime).await.alerts.len(), 2);
+
+        // gRPC 恢复；改一个人的分槽 ⇒ 下一轮走 gRPC 增删
+        x.with(|i| i.fail_on.clear());
+        let uid = ctx.store.read().await.users[0].user_id;
+        let slot1 = second_slot_id(&ctx).await;
+        assert!(assign_user(&ctx, uid, slot1).await.unwrap());
+        assert!(matches!(
+            converge_xray(&ctx, &x).await,
+            ConvergeOutcome::Applied(_)
+        ));
+        assert_eq!(
+            state::read(&ctx.runtime).await.alerts,
+            vec!["机器上没有 journalctl，黑名单候选只能靠每日探针集".to_string()]
+        );
     }
 
     #[tokio::test]

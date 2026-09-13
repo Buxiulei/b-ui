@@ -34,7 +34,8 @@ pub struct ResiRuntime {
     pub slots: BTreeMap<String, SlotRuntime>,
     /// 渲染出的 Xray 槽路由与 xray 进程里正在跑的那一份**可能**已经不一致（D7）。
     /// 由用户增删 / 改分槽 / `rebalance` / 删上游后的重分配置位，由
-    /// `slots::converge_xray`（T4）收敛成功（gRPC 增删，或退回一次重启）后清掉。
+    /// `slots::converge_xray`（T4）收敛成功（gRPC 增删、确认 xray 已从磁盘加载，
+    /// 或退回一次重启）后清掉。
     pub xray_slot_rules_dirty: bool,
     /// 最近一次**成功收敛**时那份槽路由的 `slot_rules_hash`（D7 第 2–4 步）。
     /// `converge_xray` 拿它做快速判等：脏了但哈希没变 ⇒ 清脏、不动 xray。
@@ -255,6 +256,13 @@ pub fn push_alert(r: &mut ResiRuntime, msg: impl Into<String>) {
     r.alerts.retain(|a| a != &msg);
     r.alerts.insert(0, msg);
     r.alerts.truncate(ALERTS_MAX);
+}
+
+/// 按前缀移除全局告警：某条路径**恢复了**时认领它自己以前写的那类告警。返回移除条数
+pub fn remove_alerts_with_prefix(r: &mut ResiRuntime, prefix: &str) -> usize {
+    let before = r.alerts.len();
+    r.alerts.retain(|a| !a.starts_with(prefix));
+    before - r.alerts.len()
 }
 
 /// 记一条上游级告警（同一 uuid 只留最新一条）。`msg` 里请写 `host:port`，别写 `url-N`
