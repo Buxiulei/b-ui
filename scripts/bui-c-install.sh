@@ -4,12 +4,29 @@
 #   sudo BUI_C_SOURCE=https://<面板域名>/packages bash bui-c-install.sh
 set -euo pipefail
 
-SOURCE="${BUI_C_SOURCE:-https://github.com/Buxiulei/b-ui/releases/latest/download}"
+# 制品源按序试三条，取到 manifest 的那条也用来取二进制：
+#   ① $BUI_C_SOURCE，或面板下发本脚本时写进 PANEL_SOURCE 的那个 /packages
+#   ② GitHub releases/latest
+#   ③ releases 列表里最新的预发布 tag（仓库里只有预发布时 ② 必然 404）
+SOURCE="${BUI_C_SOURCE:-}"
+
+# 面板经 /packages/bui-c-install.sh 下发本脚本时，把下面这行的占位符替换成
+# https://<面板域名>/packages（crates/bui/src/modules/panel/packages.rs::fill_panel_source），
+# 从面板拿到的那份于是默认就从面板自己取制品，不用再设 BUI_C_SOURCE。
+# 仓库里这份没被替换过，值还是占位符本身。
+PANEL_SOURCE="__BUI_C_PANEL_SOURCE__"
+
+# 这两个只为测试（scripts/tests/test-bui-c-install.sh 把它们指到 127.0.0.1）与镜像存在，
+# 正常安装不用设。
+GITHUB="${BUI_C_GITHUB:-https://github.com/Buxiulei/b-ui}"
+RELEASES_API="${BUI_C_RELEASES_API:-https://api.github.com/repos/Buxiulei/b-ui/releases?per_page=20}"
+
 PREFIX="${BUI_C_PREFIX:-/usr/local/bin}"
 TARGET="$PREFIX/bui-c"
 
 print_info()    { printf '  [*] %s\n' "$1"; }
 print_success() { printf '  [+] %s\n' "$1"; }
+print_warning() { printf '  [!] %s\n' "$1" >&2; }
 print_error()   { printf '  [!] %s\n' "$1" >&2; }
 
 need() { command -v "$1" >/dev/null 2>&1 || { print_error "缺少 $1，先装它再重试"; exit 1; }; }
@@ -26,14 +43,62 @@ ART="bui-c-linux-$ARCH"
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+MANIFEST="$TMP/manifest.json"
 
-print_info "读取 $SOURCE/manifest.json"
-curl -fsSL --max-time 30 "$SOURCE/manifest.json" -o "$TMP/manifest.json" \
-    || { print_error "manifest.json 下载失败（检查面板地址或换 GitHub 源）"; exit 1; }
+# 占位符被面板替换过（值成了 http(s) 地址）就默认用面板自己的 /packages。
+# 判的是 URL 形状而不是「值 != 占位符字面量」：面板做的是全文替换，判定里再写一遍
+# 占位符字面量的话那处会被一起换掉，判定就永远成立了。
+if [ -z "$SOURCE" ]; then
+    case "$PANEL_SOURCE" in
+        http://*|https://*) SOURCE="$PANEL_SOURCE" ;;
+    esac
+fi
+
+fetch_manifest() { curl -fsSL --max-time 30 "$1/manifest.json" -o "$MANIFEST"; }
+
+GOT=""
+# ① 面板下发的源，或用户显式指定的源
+if [ -n "$SOURCE" ]; then
+    print_info "读取 $SOURCE/manifest.json"
+    if fetch_manifest "$SOURCE"; then
+        GOT=1
+    else
+        print_warning "$SOURCE/manifest.json 取不到，改试 GitHub Releases"
+    fi
+fi
+
+# ② GitHub releases/latest：仓库里只有预发布时它**必然** 404，所以这条失败不报错，交给 ③
+if [ -z "$GOT" ]; then
+    SOURCE="$GITHUB/releases/latest/download"
+    print_info "读取 $SOURCE/manifest.json"
+    if fetch_manifest "$SOURCE"; then
+        GOT=1
+    fi
+fi
+
+# ③ releases 列表里最新的预发布（照搬服务端 install.sh 的 latest_v4_tag 口径）
+if [ -z "$GOT" ]; then
+    TAG=""
+    if curl -fsSL --max-time 30 "$RELEASES_API" -o "$TMP/releases.json"; then
+        # 逐字段比对键名（$2 == "tag_name"）而不是 /"tag_name"/：release 正文里出现字面
+        # \"tag_name\" 时正则会误命中，字段比对不会（tr 后每片形如 {"tag_name":"v4.0.0-rc9"，
+        # 以 " 切分 $2 即键名）。只认 vX.Y.Z-rcN 形状的预发布。
+        TAG="$(tr ',' '\n' < "$TMP/releases.json" \
+            | awk -F'"' '$2 == "tag_name" && $4 ~ /^v[0-9]+\.[0-9]+\.[0-9]+-rc[0-9]+$/ { print $4; exit }')"
+    fi
+    [ -n "$TAG" ] || {
+        print_error "取不到 manifest.json：面板源、releases/latest 与 releases 列表都不可达。用 BUI_C_SOURCE=https://<面板域名>/packages 指定源再重试"
+        exit 1
+    }
+    print_warning "releases/latest 里没有 manifest.json（仓库里只有预发布），回退到预发布 $TAG"
+    SOURCE="$GITHUB/releases/download/$TAG"
+    print_info "读取 $SOURCE/manifest.json"
+    fetch_manifest "$SOURCE" || { print_error "manifest.json 下载失败（$SOURCE）"; exit 1; }
+fi
 
 # 只用 sed 取两个字段：新机器上不一定有 jq。总纲 C4 的 artifact 是 {"url":…,"sha256":…}，
 # 字段顺序不保证，所以先切出这个对象，再从对象里取 sha256。
-COMPACT="$(tr -d ' \n\t' < "$TMP/manifest.json")"
+COMPACT="$(tr -d ' \n\t' < "$MANIFEST")"
 VERSION="$(printf '%s' "$COMPACT" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')"
 OBJ="$(printf '%s' "$COMPACT" | sed -n "s/.*\"$ART\":{\([^}]*\)}.*/\1/p")"
 SHA="$(printf '%s' "$OBJ" | sed -n 's/.*"sha256":"\([0-9a-f]\{64\}\)".*/\1/p')"
@@ -44,9 +109,9 @@ print_info "下载 $ART（v$VERSION）"
 curl -fsSL --max-time 300 "$SOURCE/$ART" -o "$TMP/$ART" \
     || { print_error "$ART 下载失败"; exit 1; }
 
-GOT="$(sha256sum "$TMP/$ART" | cut -d' ' -f1)"
-if [ "$GOT" != "$SHA" ]; then
-    print_error "sha256 不符（期望 $SHA，实际 $GOT），已丢弃，未写任何文件"
+GOT_SHA="$(sha256sum "$TMP/$ART" | cut -d' ' -f1)"
+if [ "$GOT_SHA" != "$SHA" ]; then
+    print_error "sha256 不符（期望 $SHA，实际 $GOT_SHA），已丢弃，未写任何文件"
     exit 1
 fi
 
