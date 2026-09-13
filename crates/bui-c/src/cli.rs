@@ -1070,12 +1070,15 @@ fn menu_import<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<
 /// 其余当订阅地址。`/api/sub/` 在面板接口取不到时退回订阅——v3 面板（bwg-tizi）
 /// 没有 `/api/nodes`，但 `/api/sub` 在。只在「取」失败时退回：面板节点取到了、
 /// 后面 apply 失败时再按订阅导一遍，会把服务端分流规则换成默认表。
+///
+/// 面板的业务错误（`Error::Msg`，如「节点列表为空」）不退回：接口在、面板说这个用户没东西，
+/// 按订阅再导一遍只会绕开这句话。
 fn import_http<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>, url: &str) -> Result<()> {
     let inc = match source::panel_link(url) {
         Some(link) => match fetch_panel(ctx, &link.base_url, &link.user) {
             Ok(inc) => inc,
-            Err(e) if link.path == source::PanelPath::Sub => {
-                ctx.say(format!("面板接口取不到（{e}），改用订阅地址导入"));
+            Err(e) if link.path == source::PanelPath::Sub && !matches!(e, Error::Msg(_)) => {
+                ctx.say(panel_fallback_notice(&e));
                 ctx.flush();
                 fetch_sub(ctx.net, url)?
             }
@@ -1084,6 +1087,39 @@ fn import_http<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>, url: &str)
         None => fetch_sub(ctx.net, url)?,
     };
     save_import(ctx, inc, false)
+}
+
+/// `/api/sub` 退回订阅时的那句话。401 / 404 是 v3 面板的常态（没有 `/api/nodes`），
+/// 说成「还没有节点接口」，不报状态码；别的原因只留一句去掉 URL 的简短说明。
+fn panel_fallback_notice(e: &Error) -> String {
+    let reason = match e {
+        Error::Net { detail, .. } if detail == "HTTP 401" || detail == "HTTP 404" => {
+            return "这个面板还没有节点接口，改用订阅地址导入".to_string();
+        }
+        Error::Net { detail, .. } => without_urls(detail),
+        Error::Parse { .. } => "返回的不是节点列表".to_string(),
+        other => without_urls(&other.to_string()),
+    };
+    let reason = if reason.is_empty() {
+        "网络错误".to_string()
+    } else {
+        reason
+    };
+    format!("面板接口取不到（{reason}），改用订阅地址导入")
+}
+
+/// 去掉错误文字里的 URL：reqwest 写成 `error sending request for url (https://…/api/nodes/<用户名>)`，
+/// 路径末段的用户名等价凭据。先删 ` for url (…)`，再丢掉其余带 `://` 的词。
+fn without_urls(detail: &str) -> String {
+    let mut s = detail.to_string();
+    while let Some(i) = s.find(" for url (") {
+        let end = s[i..].find(')').map_or(s.len(), |j| i + j + 1);
+        s.replace_range(i..end, "");
+    }
+    s.split_whitespace()
+        .filter(|w| !w.contains("://"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// `[4] 服务控制` 的二级菜单：重启 / 看日志 / 返回（v3 的服务子菜单大半是死代码，
@@ -3230,14 +3266,14 @@ mod tests {
         let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
         menu_loop(&mut ctx).unwrap();
         let t = ctx.transcript.clone();
-        let line = t
-            .lines()
-            .find(|l| l.contains("面板接口取不到"))
-            .unwrap_or_else(|| panic!("要说明为什么改走订阅：\n{t}"));
-        assert!(line.starts_with("  面板接口取不到（"), "{line}");
-        assert!(line.ends_with("），改用订阅地址导入"), "{line}");
-        assert!(line.contains("HTTP 404"), "带上原因：{line}");
-        assert!(!line.contains("alice"), "原因里不带用户名：{line}");
+        // v3 面板没有 /api/nodes 是意料之中的：不报状态码、不带 URL，免得像出了故障
+        assert!(
+            t.lines()
+                .any(|l| l == "  这个面板还没有节点接口，改用订阅地址导入"),
+            "要说明为什么改走订阅：\n{t}"
+        );
+        assert!(!t.contains("HTTP 404"), "{t}");
+        assert!(!t.contains("面板接口取不到"), "{t}");
         let saved = Profiles::load(&s, &pp).unwrap();
         assert_eq!(saved.profiles.len(), 2, "{t}");
         assert_eq!(
@@ -3248,6 +3284,71 @@ mod tests {
             !t.lines().any(|l| l.starts_with("  失败：")),
             "退回订阅成功就不算失败（原因里的「请求…失败」除外）：{t}"
         );
+    }
+
+    /// `/api/sub` 退回订阅时按原因给不同的话：401/404 是「没有节点接口」（v3 面板），
+    /// 别的网络错误带上去掉 URL 的简短原因，面板的业务错误（节点列表为空）不退回、直接报。
+    #[test]
+    fn menu_import_api_sub_fallback_wording_depends_on_the_cause() {
+        let pp = paths();
+        let run = |reply: FakeReply| {
+            let s = FakeSys::new();
+            ready(&s);
+            profiles_socks().save(&s, &pp).unwrap();
+            let n = FakeNet::new();
+            n.route("https://panel.example.com/api/nodes/alice", reply);
+            n.route("https://panel.example.com/api/sub/alice", b64(BOB_REALITY));
+            let mut p =
+                Scripted::from(["3", "https://panel.example.com/api/sub/alice", "", "n", "0"]);
+            let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+            menu_loop(&mut ctx).unwrap();
+            (ctx.transcript.clone(), n.log(), names(&s, &pp).len())
+        };
+
+        let (t, _, count) = run(FakeReply::Status(401));
+        assert!(
+            t.lines()
+                .any(|l| l == "  这个面板还没有节点接口，改用订阅地址导入"),
+            "\n{t}"
+        );
+        assert_eq!(count, 2, "{t}");
+
+        // 真机上 reqwest 的错误文字自带完整 URL（末段是用户名，等价凭据）
+        let (t, _, count) = run(FakeReply::Fail(
+            "error sending request for url (https://panel.example.com/api/nodes/alice)".into(),
+        ));
+        assert!(
+            t.lines()
+                .any(|l| l == "  面板接口取不到（error sending request），改用订阅地址导入"),
+            "\n{t}"
+        );
+        for l in t.lines().filter(|l| l.contains("面板接口取不到")) {
+            assert!(
+                !l.contains("alice") && !l.contains("://"),
+                "简短原因不带 URL：{l}"
+            );
+        }
+        assert_eq!(count, 2, "{t}");
+
+        // 200 但不是节点列表（面板把未知路径兜底成网页）：也退回订阅
+        let (t, _, count) = run(FakeReply::Text("<html></html>".into()));
+        assert!(
+            t.lines()
+                .any(|l| l == "  面板接口取不到（返回的不是节点列表），改用订阅地址导入"),
+            "\n{t}"
+        );
+        assert_eq!(count, 2, "{t}");
+
+        // 面板接口在、但这个用户没有节点：退回订阅也拿不到正经东西，直接报
+        let (t, log, count) = run(nodes_payload("alice", vec![]));
+        assert!(
+            t.lines()
+                .any(|l| l == "  失败：面板返回的节点列表为空：该用户可能没有任何权益"),
+            "\n{t}"
+        );
+        assert!(!t.contains("改用订阅地址导入"), "{t}");
+        assert!(!log.iter().any(|l| l.contains("/api/sub/")), "{log:?}");
+        assert_eq!(count, 1, "{t}");
     }
 
     #[test]
