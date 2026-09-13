@@ -5,7 +5,7 @@
 
 use crate::net::Net;
 use crate::paths::{Paths, SELF_BIN, UNIT_MAIN};
-use crate::profiles::{Panel, Profiles};
+use crate::profiles::{https_base, Panel, Profiles};
 use crate::sys::{systemd, Sys};
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -80,11 +80,8 @@ pub fn arch_suffix() -> &'static str {
 pub fn sources(panel: Option<&Panel>, m: &Manifest, file: &str) -> Result<Vec<(String, String)>> {
     let url = m.artifact(file)?.url.clone();
     let mut out = Vec::with_capacity(2 + m.mirrors.len());
-    if let Some(p) = panel {
-        out.push((
-            "面板".to_string(),
-            format!("{}/packages/{file}", p.base_url.trim_end_matches('/')),
-        ));
+    if let Some(base) = trusted_panel(panel) {
+        out.push(("面板".to_string(), format!("{base}/packages/{file}")));
     }
     out.push(("GitHub".to_string(), url.clone()));
     for (i, mirror) in m.mirrors.iter().enumerate() {
@@ -98,16 +95,24 @@ pub fn sources(panel: Option<&Panel>, m: &Manifest, file: &str) -> Result<Vec<(S
 
 /// manifest 自身只有两个源：镜像列表在 manifest 里，拿不到 manifest 就没有镜像可用。
 /// 两个源各 15s 超时，最坏 30s；离线机器由 `check` 的自更新退避（1 小时）兜住。
+/// 自更新只认 https 的 panel。导入时已经只写 https（K1），这里再挡一层：旧版本经 `--sub`
+/// 或明文面板写进 profiles.json 的地址照样会被读出来，而它决定 root 替换哪份二进制。
+fn trusted_panel(panel: Option<&Panel>) -> Option<String> {
+    let p = panel?;
+    let base = https_base(&p.base_url);
+    if base.is_none() {
+        tracing::warn!(
+            panel = %crate::error::redact_url(&p.base_url),
+            "profiles.json 里的面板不是 https，自更新跳过它"
+        );
+    }
+    base
+}
+
 fn manifest_sources(panel: Option<&Panel>) -> Vec<(String, String)> {
     let mut out = Vec::with_capacity(2);
-    if let Some(p) = panel {
-        out.push((
-            "面板".to_string(),
-            format!(
-                "{}/packages/manifest.json",
-                p.base_url.trim_end_matches('/')
-            ),
-        ));
+    if let Some(base) = trusted_panel(panel) {
+        out.push(("面板".to_string(), format!("{base}/packages/manifest.json")));
     }
     out.push((
         "GitHub".to_string(),
@@ -386,6 +391,37 @@ mod tests {
         );
         // 产物不在 manifest 里 → 报错，不去猜 URL
         assert!(sources(Some(&panel()), &m, "bui-c-linux-riscv64").is_err());
+    }
+
+    #[test]
+    fn a_persisted_plain_http_panel_is_never_an_update_source() {
+        // 旧版本（K1 之前）经 `--sub` 或 http 面板导入时会把明文地址写进 profiles.json。
+        // 这是 root 自更新的首选来源：明文就等于把替换 /usr/local/bin/bui-c 的权力交给中间人。
+        let http = Panel {
+            base_url: "http://panel.example.com".into(),
+            username: "alice".into(),
+        };
+        let m = manifest("4.0.1");
+        let names: Vec<String> = sources(Some(&http), &m, "bui-c-linux-amd64")
+            .unwrap()
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert!(!names.iter().any(|n| n == "面板"), "{names:?}");
+        let n = FakeNet::new();
+        n.route(
+            "https://github.com/Buxiulei/b-ui/releases/latest/download/manifest.json",
+            FakeReply::Text(manifest_json("4.0.1", &"a".repeat(64), &"b".repeat(64))),
+        );
+        let (src, _) = fetch_manifest(&n, Some(&http)).unwrap();
+        assert_eq!(src, "GitHub");
+        assert!(
+            !n.log()
+                .iter()
+                .any(|l| l.contains("http://panel.example.com")),
+            "明文面板一个请求都不该发：{:?}",
+            n.log()
+        );
     }
 
     #[test]
