@@ -43,6 +43,12 @@ pub trait Sys {
     /// `| head`、timer 写 journald）、查询失败或列数为 0 时为 `None`：菜单据此回落
     /// 80×24、不发清屏序列。不缓存，每次画屏前重新取，窗口缩放与手机转屏立刻生效。
     fn term_size(&self) -> Option<(u16, u16)>;
+    /// 本机 `127.0.0.1:port` 有没有人在听：连一下，200ms 为限，连上立刻断开。连接检查的
+    /// 「本地端口」一行用它，不去解析 `ss` 的文本输出（spec §6.1）。
+    fn tcp_listening(&self, port: u16) -> bool;
+    /// 用本机的解析器解析 `host`，返回用时；最多等 `timeout`。只给连接检查 SOCKS 模式的
+    /// 「DNS」一行用，巡检路径不调用（spec §0.2 R3、R13）。
+    fn resolve(&self, host: &str, timeout: Duration) -> Result<Duration>;
 }
 
 /// 生产实现。
@@ -164,6 +170,36 @@ impl Sys for RealSys {
         // ws 里写一个 winsize，fd 不是终端或已关闭时返回 -1，不碰别的内存。
         let rc = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) };
         (rc == 0 && ws.ws_col > 0).then_some((ws.ws_col, ws.ws_row))
+    }
+
+    /// 真连本机回环，所以没有单元测试（单元测试不联网，回环也不行），留给真机验收。
+    fn tcp_listening(&self, port: u16) -> bool {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
+    }
+
+    /// `ToSocketAddrs` 走 getaddrinfo：阻塞，也不认超时。放进一个线程，这边最多等 `timeout`；
+    /// 到点就不等了，线程留在后台等系统解析器自己放弃（每次检查最多一个，进程随后就回菜单）。
+    /// 真解析，所以没有单元测试，留给真机验收。
+    fn resolve(&self, host: &str, timeout: Duration) -> Result<Duration> {
+        use std::net::ToSocketAddrs as _;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let name = host.to_string();
+        let start = std::time::Instant::now();
+        std::thread::spawn(move || {
+            let found = (name.as_str(), 443)
+                .to_socket_addrs()
+                .is_ok_and(|mut addrs| addrs.next().is_some());
+            let _ = tx.send(found);
+        });
+        match rx.recv_timeout(timeout) {
+            Ok(true) => Ok(start.elapsed()),
+            Ok(false) => Err(Error::msg(format!("{host} 解析不到地址"))),
+            Err(_) => Err(Error::msg(format!(
+                "{host} 解析超时（{} 秒）",
+                timeout.as_secs()
+            ))),
+        }
     }
 }
 

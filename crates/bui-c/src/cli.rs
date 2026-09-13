@@ -5,8 +5,9 @@
 
 use crate::check::{self, Runtime, Verdict};
 use crate::engine::{Applied, Engine};
-use crate::menu::{self, Action, Prompt, Status};
+use crate::menu::{self, Action, NextStep, Prompt, Status};
 use crate::net::Net;
+use crate::nettest::{self, Event, Hooks, Painter};
 use crate::paths::{Paths, UNIT_MAIN, UNIT_TIMER};
 use crate::profiles::{
     https_base, kind_slug, profile_name, rfc3339, same_account, Mode, Panel, Profile, Profiles,
@@ -226,6 +227,12 @@ impl<'a, S: Sys, N: Net, P: Prompt> Ctx<'a, S, N, P> {
         let mut text = block.as_ref().to_string();
         text.push('\n');
         self.emit(&text);
+    }
+    /// 原样打一段已经排好版的字（不补换行、不叠缩进），并立刻冲出去：连接检查边做边打，
+    /// 先出标签、等结果（spec §6.4）。transcript 里照样是完整的一行。
+    pub fn part(&mut self, text: impl AsRef<str>) {
+        self.emit(text.as_ref());
+        self.flush();
     }
     fn emit(&mut self, text: &str) {
         self.out.push_str(text);
@@ -666,7 +673,7 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
             };
             save_import(ctx, inc, *activate)
         }
-        Cmd::Check => run_check(ctx, false),
+        Cmd::Check => run_check(ctx),
         Cmd::Update { check_only, auto } => {
             let mut prof = Profiles::load(ctx.sys, ctx.paths)?;
             // --auto 只翻开关、不联网：spec §6「每日 timer 自动，可关」的 CLI 入口
@@ -789,16 +796,12 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
     }
 }
 
-/// 连接检查：`bui-c check`（timer，`manual = false`）与菜单 `[5]`（`manual = true`）共用。
+/// 巡检：`bui-c check`（timer 每分钟一次），只有 204 探测与更新源两类请求。
 ///
-/// 手动检查不受退避约束（[`check::run_manual`]），结果行只说「已重启」，不提「下次退避」——
-/// 那是 timer 的节奏，对刚点了 [5] 的人没有意义。
-fn run_check<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>, manual: bool) -> Result<()> {
-    let v = if manual {
-        check::run_manual(ctx.sys, ctx.net, ctx.paths)?
-    } else {
-        check::run(ctx.sys, ctx.net, ctx.paths)?
-    };
+/// 菜单 `[5]` 不走这里，走 [`check_menu`]：人点的是「连接检查」，不该顺带把二进制换掉
+/// （spec §6.7）。每日自更新只留在这条路径上。
+fn run_check<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()> {
+    let v = check::run(ctx.sys, ctx.net, ctx.paths)?;
     match &v {
         Verdict::NoProfile => ctx.say("没有激活的节点，巡检跳过"),
         Verdict::Ok => ctx.say("正常：单元在跑、204 探测通过"),
@@ -806,17 +809,10 @@ fn run_check<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>, manual: bool
             failures,
             next_backoff_min,
         } => {
-            if manual {
-                ctx.say(format!(
-                    "发现 {} 项异常，已重启 bui-c.service",
-                    failures.len()
-                ));
-            } else {
-                ctx.say(format!(
-                    "发现 {} 项异常，已重启 bui-c.service，下次退避 {next_backoff_min} 分钟",
-                    failures.len()
-                ));
-            }
+            ctx.say(format!(
+                "发现 {} 项异常，已重启 bui-c.service，下次退避 {next_backoff_min} 分钟",
+                failures.len()
+            ));
             for f in failures {
                 ctx.say(format!("  - {f}"));
             }
@@ -1120,14 +1116,16 @@ fn menu_action<S: Sys, N: Net, P: Prompt>(
                 )
             }
         }
-        // 手动检查：不走 timer 的退避（`Cmd::Check` 是给 bui-c.timer 的）。这一版探测完才打字，
-        // 进页就清屏会让人对着空屏干等；清屏留给边做边打的新报告（spec §6.4）
+        // 手动检查：边做边打的 11 行报告（spec §6）。不走 timer 的退避，也不顺带每日自更新
         Action::Check => {
             let start = ctx.transcript.len();
-            if let Err(e) = run_check(ctx, true) {
-                ctx.say(format!("失败：{e}"));
+            match check_menu(ctx) {
+                Ok(o) => o,
+                Err(e) => {
+                    ctx.say(format!("失败：{e}"));
+                    outcome_since(ctx, start)
+                }
             }
-            outcome_since(ctx, start)
         }
         Action::Update => run_sub(
             ctx,
@@ -1170,6 +1168,99 @@ fn menu_action<S: Sys, N: Net, P: Prompt>(
         ),
         Action::Uninstall => run_sub(ctx, Cmd::Uninstall { purge_bin: false }),
     })
+}
+
+/// 菜单 `[5] 连接检查`（spec §6）：清屏后逐行边做边打 11 项，汇总；有计分项失败时给一句人话判断，
+/// 需要时再给固定编号的「下一步」小菜单（§6.5、§0.2 R3）。不受 timer 的退避约束，也**不**顺带
+/// 每日自更新（§6.7）。没有节点时不进报告页，一行 Note 回主菜单。
+fn check_menu<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<Outcome> {
+    let prof = Profiles::load(ctx.sys, ctx.paths)?;
+    if prof.active_profile().is_none() {
+        return Ok(note(ctx, "没有节点可检查：先用 [3] 导入节点"));
+    }
+    'check: loop {
+        // 报告是边做边打的：先清屏，第一行立刻出来（spec §4.1、§6.4）
+        ctx.clear_screen();
+        let width = ctx.width();
+        ctx.part(nettest::header(&prof, width));
+        let (sys, net, paths) = (ctx.sys, ctx.net, ctx.paths);
+        let mut hooks = MenuHooks {
+            ctx: &mut *ctx,
+            painter: Painter::new(width),
+            prof: &prof,
+        };
+        let sum = nettest::run(sys, net, paths, &prof, &mut hooks)?;
+        let saw_info = hooks.painter.saw_info();
+        ctx.part(nettest::render_summary(&sum, saw_info, width));
+        let last = nettest::last_summary(&sum);
+        let Some((sentence, offer)) = nettest::diagnose(&sum) else {
+            return Ok(Outcome::Pause(last));
+        };
+        let sentence = nettest::render_sentence(sentence, width);
+        ctx.part(&sentence);
+        if !offer {
+            return Ok(Outcome::Pause(last));
+        }
+        ctx.part(menu::render_next_step());
+        loop {
+            ctx.flush();
+            let pick = ctx.prompt.line("选择 [0-3]")?;
+            match menu::parse_next_step(&pick) {
+                Some(NextStep::Recheck) => continue 'check,
+                // T16 之前 [2] 是「换个节点」：进 [1] 同一页。返回时「上次：」行仍是检查的结论
+                Some(NextStep::SpeedTest) => {
+                    ctx.clear_screen();
+                    ctx.show(menu::render_node_picker(&prof, ctx.width()).trim_end());
+                    return Ok(match pick_node(ctx, &prof)? {
+                        Some(name) => switch_node(ctx, name),
+                        None => Outcome::Note(last),
+                    });
+                }
+                // 看完日志回到这个小菜单：日志下面再给一遍判断与选项（spec §0.2 R3）
+                Some(NextStep::Journal) => {
+                    show_journal(ctx, menu::SERVICE_LOG_LINES);
+                    ctx.part(&sentence);
+                    ctx.part(menu::render_next_step());
+                }
+                Some(NextStep::Back) => return Ok(Outcome::Note(last)),
+                // 输错原地重问，不重画报告
+                None => ctx.say(menu::invalid_next_step(&pick, ctx.width())),
+            }
+        }
+    }
+}
+
+/// 菜单 `[5]` 的 [`Hooks`]：事件按当前宽度排好就打出来（边做边打）；修复照 spec §0.2 R13。
+struct MenuHooks<'c, 'a, S: Sys, N: Net, P: Prompt> {
+    ctx: &'c mut Ctx<'a, S, N, P>,
+    painter: Painter,
+    prof: &'c Profiles,
+}
+
+impl<S: Sys, N: Net, P: Prompt> Hooks for MenuHooks<'_, '_, S, N, P> {
+    fn event(&mut self, e: Event) {
+        let text = self.painter.paint(&e);
+        self.ctx.part(text);
+    }
+
+    /// 重启一次（[`check::run_manual`]：不受退避约束，照样记进 runtime.json，timer 的退避从它算起）。
+    /// 有活动节点、主单元文件却不在（删光没做完留下的）时改做 apply：restart 一个不存在的单元只会报
+    /// Unit not found（spec §0.2 R13）。T12a 在这里拿锁；T12c 之后 apply 改走收敛。
+    fn repair(&mut self) -> Result<Verdict> {
+        let (sys, net, paths) = (self.ctx.sys, self.ctx.net, self.ctx.paths);
+        if !sys.exists(&paths.unit(UNIT_MAIN)) {
+            let applied = Engine::new(sys, paths).apply(self.prof)?;
+            return Ok(if applied.restarted {
+                Verdict::Restarted {
+                    failures: Vec::new(),
+                    next_backoff_min: 0,
+                }
+            } else {
+                Verdict::Ok
+            });
+        }
+        check::run_manual(sys, net, paths)
+    }
 }
 
 /// 菜单 `[1]` 列表下的选编号：输错只提示、原地重问（不重画列表）；空行、`0`、EOF 返回主菜单。
@@ -1393,58 +1484,15 @@ fn restart_service<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>, mode: 
     show_journal(ctx, 10);
 }
 
-/// 空一行、标题行，再把日志缩进 2 列打出来；取不到就说一句原因。
+/// 空一行、标题行，再把日志缩进 2 列打出来；取不到就说一句原因。按当前宽度排：窄屏放不下单元
+/// 全名时标题用短名，每行先净化再尾截到行宽（[`nettest::journal_block`]）。
 fn show_journal<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>, n: u32) {
-    match journal_tail(ctx.sys, n) {
-        Ok(text) => {
-            let mut block = format!(
-                "\n{}",
-                menu::title_bar(&format!("{UNIT_MAIN} 最近 {n} 行日志"))
-            );
-            for l in text.lines() {
-                block.push('\n');
-                if !l.is_empty() {
-                    block.push_str("  ");
-                    block.push_str(l);
-                }
-            }
-            ctx.show(block);
+    match nettest::journal_tail(ctx.sys, n) {
+        Ok(lines) => {
+            let block = nettest::journal_block(n, &lines, ctx.width());
+            ctx.part(block);
         }
         Err(why) => ctx.say(why),
-    }
-}
-
-/// `journalctl -o short-iso` 取 bui-c.service 最近 `n` 行，每行压成 `<时间> <消息>` 并去掉
-/// ANSI 颜色；取不到时 `Err` 是一句给用户看的说明。
-fn journal_tail<S: Sys>(sys: &S, n: u32) -> std::result::Result<String, String> {
-    let n = n.to_string();
-    let args = ["-u", UNIT_MAIN, "-n", &n, "--no-pager", "-o", "short-iso"];
-    match sys.run("journalctl", &args) {
-        Ok(o) if o.ok() => {
-            let text = o
-                .stdout
-                .trim_end()
-                .lines()
-                .map(|l| menu::strip_ansi(&menu::compact_journal_line(l)))
-                .collect::<Vec<_>>()
-                .join("\n");
-            if text.trim().is_empty() {
-                Err(format!("journalctl 里还没有 {UNIT_MAIN} 的日志"))
-            } else {
-                Ok(text)
-            }
-        }
-        Ok(o) => {
-            let detail = match o.stderr.trim() {
-                "" => String::new(),
-                e => format!("：{e}"),
-            };
-            Err(format!(
-                "读不到 {UNIT_MAIN} 的日志（journalctl 退出码 {}）{detail}",
-                o.code
-            ))
-        }
-        Err(e) => Err(format!("读不到 {UNIT_MAIN} 的日志（{e}）")),
     }
 }
 
@@ -2309,59 +2357,55 @@ mod tests {
         }
     }
 
-    /// 菜单 `[5]` 是人手动点的：发现异常就直接重启，不受 timer 的 1/2/4 分钟退避约束，
-    /// 结果行也不提「下次退避」。timer 触发的 `bui-c check` 保持原样。
+    /// 菜单 `[5]` 是人手动点的：发现异常就直接修，不受 timer 的 1/2/4 分钟退避约束，
+    /// 也不提「下次退避」。timer 触发的 `bui-c check` 保持原样。
     #[test]
     fn menu_check_restarts_right_away_and_does_not_talk_about_backoff() {
         let pp = paths();
-        let s = FakeSys::new();
-        ready(&s);
+        let (s, n) = (FakeSys::new(), FakeNet::new());
+        check_ready(&s, &n, &pp, Mode::Socks);
         s.reply("systemctl is-active --quiet bui-c.service", 3, "");
-        let mut prof = profiles_socks();
-        prof.auto_update = false;
-        prof.save(&s, &pp).unwrap();
-        let n = FakeNet::new();
-        n.route(crate::check::PROBE_URL, FakeReply::Status(502));
-        // 连按两次 [5]：第二次还在 timer 的退避窗口里。结果不止一行，每次都先停下来等回车
-        let mut p = Scripted::from(["5", "", "5", "", "0"]);
+        // 连按两次 [5]：第二次还在 timer 的退避窗口里。服务没起来有小菜单，0 回主菜单
+        let mut p = Scripted::from(["5", "0", "5", "0", "0"]);
         let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
         menu_loop(&mut ctx).unwrap();
         let t = ctx.transcript.clone();
-        assert_eq!(
-            t.lines()
-                .filter(|l| *l == "  发现 2 项异常，已重启 bui-c.service")
-                .count(),
-            2,
-            "两次都直接重启：\n{t}"
-        );
-        assert_eq!(
-            p.asked.iter().filter(|q| *q == "回车返回菜单").count(),
-            2,
-            "异常逐条列出，看完回车再回主菜单：{:?}",
-            p.asked
-        );
-        assert!(
-            t.lines()
-                .any(|l| l == "  上次：发现 2 项异常，已重启 bui-c.service"),
-            "{t}"
-        );
         assert_eq!(
             s.calls()
                 .iter()
                 .filter(|c| *c == "systemctl restart bui-c.service")
                 .count(),
             2,
+            "两次都直接重启：\n{t}"
+        );
+        for want in [
+            "  服务       ✗ bui-c.service 没在运行",
+            "             已重启，3 秒内还是没起来",
+        ] {
+            assert_eq!(
+                t.lines().filter(|l| *l == want).count(),
+                2,
+                "{want:?}：\n{t}"
+            );
+        }
+        assert!(
+            t.lines().any(|l| l == "  其余各项   - 跳过（服务没起）"),
+            "{t}"
+        );
+        assert!(
+            t.lines().any(|l| l == "  服务没起来，网络检查都跳过了。"),
             "{t}"
         );
         assert!(!t.contains("退避"), "手动检查不提退避：\n{t}");
-        let items: Vec<&str> = t.lines().filter(|l| l.starts_with("    - ")).collect();
+        assert!(
+            t.lines()
+                .any(|l| l == "  上次：连接检查：失败 1 项（服务）"),
+            "{t}"
+        );
         assert_eq!(
-            items[..2],
-            [
-                "    - bui-c.service 没在运行",
-                "    - 探测 www.gstatic.com/generate_204 返回 HTTP 502"
-            ],
-            "逐条列异常：\n{t}"
+            Runtime::load(&s, &pp).fail_streak,
+            2,
+            "手动重启照样记进 runtime.json，timer 的退避从它算起"
         );
 
         // timer 触发的巡检照旧退避
@@ -4403,9 +4447,9 @@ mod tests {
             [
                 "",
                 "  ── bui-c.service 最近 10 行日志 ──",
-                "  2026-09-13T10:15:30+08:00 FATAL[0000] start service: open tun: operation not permitted",
+                "  2026-09-13T10:15:30+08:00 FATAL[0000] start service: open tun: operation no…",
             ],
-            "空行 + 标题行，日志缩进 2 列、去掉主机名与 ident、去掉颜色：\n{t}"
+            "空行 + 标题行，日志缩进 2 列、去掉主机名与 ident、去掉颜色，按行宽尾截：\n{t}"
         );
         assert!(!t.contains('\u{1b}'), "菜单约定无 ANSI");
         assert_eq!(
@@ -4538,6 +4582,303 @@ mod tests {
                 .any(|l| l
                     == "  还没有安装引擎与单元：先用 [3] 导入节点（v3 客户端用 [7] 从 v3 导入）"),
             "\n{t}"
+        );
+    }
+
+    // ---- 菜单 [5] 连接检查（spec §6） ----
+
+    #[test]
+    fn the_timer_check_only_touches_the_probe_and_update_urls() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        profiles_socks().save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        n.route(crate::check::PROBE_URL, FakeReply::Status(204));
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["check"]), &mut ctx).unwrap();
+        for l in n.log() {
+            for u in crate::nettest::URLS {
+                assert!(!l.contains(u), "timer 访问了检测站 {u}：{l}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_timer_check_never_resolves_names_even_when_it_restarts() {
+        // 巡检失败、要重启时也一样：只有 204 探测与更新源，不解析域名（spec §6.7、§0.2 R13）
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        profiles_socks().save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        n.route(crate::check::PROBE_URL, FakeReply::Timeout);
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["check"]), &mut ctx).unwrap();
+        assert!(s.called("systemctl restart bui-c.service"));
+        assert!(
+            !s.calls().iter().any(|c| c.starts_with("resolve ")),
+            "{:?}",
+            s.calls()
+        );
+        for l in n.log() {
+            for u in crate::nettest::URLS {
+                assert!(!l.contains(u), "timer 访问了检测站 {u}：{l}");
+            }
+        }
+    }
+
+    /// [5] 用的一台机器：各项都通（`nettest::sample::healthy`），自动更新关着。
+    fn check_ready(s: &FakeSys, n: &FakeNet, pp: &Paths, mode: Mode) {
+        ready(s);
+        crate::nettest::sample::healthy(s, n, mode);
+        let mut prof = match mode {
+            Mode::Tun => crate::testutil::profiles_tun(),
+            Mode::Socks => profiles_socks(),
+        };
+        prof.auto_update = false;
+        prof.save(s, pp).unwrap();
+    }
+
+    #[test]
+    fn menu_check_clears_first_prints_the_report_and_pauses_with_the_summary() {
+        let pp = paths();
+        let (s, n) = (FakeSys::new(), FakeNet::new());
+        check_ready(&s, &n, &pp, Mode::Tun);
+        s.set_term_size(Some((60, 30)));
+        let mut p = Scripted::from(["5", "", "0"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert_eq!(ctx.clears, 3, "进菜单、进报告、回主菜单");
+        assert!(!t.contains('\u{1b}'));
+        for want in [
+            "  ── 连接检查（TUN 模式） ──",
+            "  节点  alice-hy2-direct",
+            "        HY2直连  panel.example.com:10000",
+            "  服务       ✓ bui-c.service 在运行",
+            "  本地端口   ✓ SOCKS5 :1080   ✓ HTTP :8080",
+            "  隧道       ✓ 通  356ms",
+            "  下载       ✓ 1 MB 用时 0.9 秒，约 1.1 MB/s（良好）",
+            "  IPv4 出口  ✓ 203.0.113.7",
+            "             IDC 机房  风险分 22（ippure）",
+            "  IPv6       ✓ 已被隧道拦截，没有泄漏",
+            "  全部通过（7 项），用时 0 秒",
+            "  上次：连接检查：全部通过（7 项）",
+        ] {
+            assert!(t.lines().any(|l| l == want), "缺 {want:?}：\n{t}");
+        }
+        assert!(!t.contains("下一步"), "全通过不给小菜单：\n{t}");
+        assert_eq!(
+            p.asked,
+            vec!["选择 [0-9]", "回车返回菜单", "选择 [0-9]"],
+            "看完报告回车再回主菜单"
+        );
+    }
+
+    #[test]
+    fn menu_check_without_nodes_is_a_note_and_never_touches_the_network() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        s.set_term_size(Some((60, 30)));
+        let n = FakeNet::new();
+        let mut p = Scripted::from(["5", "0"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert_eq!(ctx.clears, 2, "不进报告页：只有进菜单、回主菜单两次");
+        assert!(
+            t.lines()
+                .any(|l| l == "  上次：没有节点可检查：先用 [3] 导入节点"),
+            "{t}"
+        );
+        assert!(!t.contains("连接检查（"), "{t}");
+        assert!(n.log().is_empty());
+        assert!(!p.asked.iter().any(|q| q == "回车返回菜单"));
+    }
+
+    #[test]
+    fn next_step_menu_goes_back_to_itself_after_logs() {
+        let pp = paths();
+        let (s, n) = (FakeSys::new(), FakeNet::new());
+        check_ready(&s, &n, &pp, Mode::Socks);
+        n.route(crate::check::PROBE_URL, FakeReply::Timeout);
+        s.reply(
+            JOURNAL_50,
+            0,
+            "2026-09-13T10:15:30+08:00 baiyi sing-box[4242]: ERROR[0010] connection timeout\n",
+        );
+        // 5 检查 → 3 看日志 → 回到小菜单 → 0 回主菜单 → 0 退出
+        let mut p = Scripted::from(["5", "3", "0", "0"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert!(s.called(JOURNAL_50), "{:?}", s.calls());
+        let lines: Vec<&str> = t.lines().collect();
+        let log = lines
+            .iter()
+            .position(|l| *l == "  ── bui-c.service 最近 50 行日志 ──")
+            .unwrap_or_else(|| panic!("{t}"));
+        assert_eq!(
+            lines[log + 1..log + 8],
+            [
+                "  2026-09-13T10:15:30+08:00 ERROR[0010] connection timeout",
+                "  本机能上网，是当前节点不通。",
+                "  下一步：",
+                "     [1] 再查一次",
+                "     [2] 换个节点",
+                "     [3] 看最近 50 行日志",
+                "     [0] 返回菜单",
+            ],
+            "日志下面再给一遍判断与选项：\n{t}"
+        );
+        assert_eq!(t.matches("  下一步：").count(), 2, "{t}");
+        assert!(
+            t.lines()
+                .any(|l| l == "  上次：连接检查：失败 1 项（隧道）"),
+            "{t}"
+        );
+        assert_eq!(t.matches("B-UI 客户端").count(), 2, "{t}");
+        assert_eq!(
+            p.asked,
+            vec!["选择 [0-9]", "选择 [0-3]", "选择 [0-3]", "选择 [0-9]"],
+            "看完日志回到小菜单，不回主菜单"
+        );
+    }
+
+    #[test]
+    fn next_step_one_rechecks_and_two_goes_to_the_node_list() {
+        let pp = paths();
+        let (s, n) = (FakeSys::new(), FakeNet::new());
+        check_ready(&s, &n, &pp, Mode::Socks);
+        two_nodes(&s, &pp);
+        n.route(crate::check::PROBE_URL, FakeReply::Timeout);
+        s.set_term_size(Some((60, 30)));
+        // 5 → 1 再查一次（清屏重跑）→ x 输错原地重问 → 2 换个节点 → 选 2 → 回主菜单 → 0
+        let mut p = Scripted::from(["5", "1", "x", "2", "2", "0"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert_eq!(ctx.clears, 5, "进菜单、报告、再查一次、节点列表、回主菜单");
+        assert_eq!(
+            t.matches("  ── 连接检查（SOCKS 模式） ──").count(),
+            2,
+            "{t}"
+        );
+        assert!(
+            t.lines().any(|l| l == "  无效选项：x（请输入 0-3 的数字）"),
+            "{t}"
+        );
+        assert!(t.lines().any(|l| l == "  切换节点"), "{t}");
+        assert_eq!(
+            Profiles::load(&s, &pp).unwrap().active.as_deref(),
+            Some("alice-reality-direct")
+        );
+        assert!(
+            t.lines()
+                .any(|l| l == "  上次：已切到 alice-reality-direct"),
+            "{t}"
+        );
+        assert_eq!(
+            p.asked,
+            vec![
+                "选择 [0-9]",
+                "选择 [0-3]",
+                "选择 [0-3]",
+                "选择 [0-3]",
+                "选择节点编号",
+                "选择 [0-9]"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_menu_check_no_longer_runs_the_daily_self_update() {
+        let pp = paths();
+        let (s, n) = (FakeSys::new(), FakeNet::new());
+        check_ready(&s, &n, &pp, Mode::Socks);
+        // 自动更新开着、从没更新过：timer 这一轮会去取 manifest，[5] 不该
+        let mut prof = Profiles::load(&s, &pp).unwrap();
+        prof.auto_update = true;
+        prof.panel = Some(crate::profiles::Panel {
+            base_url: "https://panel.example.com".into(),
+            username: "alice".into(),
+        });
+        prof.save(&s, &pp).unwrap();
+        assert!(crate::check::update_due(&s, &Runtime::load(&s, &pp), &prof));
+        let mut p = Scripted::from(["5", "", "0"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        assert!(
+            ctx.transcript.contains("  全部通过（5 项），用时 0 秒"),
+            "{}",
+            ctx.transcript
+        );
+        assert!(
+            !n.log().iter().any(|l| l.contains("manifest.json")),
+            "{:?}",
+            n.log()
+        );
+        let rt = Runtime::load(&s, &pp);
+        assert_eq!(
+            (rt.last_update_attempt_at, rt.last_update_at),
+            (None, None),
+            "连尝试都没有"
+        );
+    }
+
+    #[test]
+    fn menu_check_applies_instead_of_restarting_when_the_unit_file_is_missing() {
+        // 有活动节点、主单元文件却不在（删光没做完）：restart 只会报 Unit not found，
+        // 要 apply 把单元与配置写回来（spec §0.2 R13）
+        let pp = paths();
+        let (s, n) = (FakeSys::new(), FakeNet::new());
+        check_ready(&s, &n, &pp, Mode::Socks);
+        s.remove_file(&pp.unit(UNIT_MAIN)).unwrap();
+        s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        let mut p = Scripted::from(["5", "0", "0"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        assert!(
+            !s.called("systemctl restart bui-c.service"),
+            "{:?}",
+            s.calls()
+        );
+        assert!(s.exists(&pp.unit(UNIT_MAIN)), "apply 把单元写回来了");
+        assert!(s.called("systemctl start bui-c.service"), "{:?}", s.calls());
+    }
+
+    #[test]
+    fn the_log_page_fits_forty_columns() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        with_unit(&s);
+        s.reply(JOURNAL_50, 0, crate::nettest::sample::LONG_JOURNAL);
+        profiles_socks().save(&s, &pp).unwrap();
+        s.set_term_size(Some((40, 30)));
+        let n = FakeNet::new();
+        let mut p = Scripted::from(["4", "2", "", "0"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        let lines: Vec<&str> = t.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| *l == "  ── bui-c 最近 50 行日志 ──")
+            .unwrap_or_else(|| panic!("40 列要用短标题：\n{t}"));
+        for l in &lines[at..at + 4] {
+            assert!(menu::budget_width(l) <= menu::line_limit(40), "{l:?}");
+        }
+        assert!(
+            lines[at + 1].starts_with("  2026-09-13T10:15:30+08:00 FATAL")
+                && lines[at + 1].ends_with('…'),
+            "长行按行宽尾截：{}",
+            lines[at + 1]
         );
     }
 }

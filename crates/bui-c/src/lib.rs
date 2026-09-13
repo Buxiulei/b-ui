@@ -12,6 +12,7 @@ pub mod fake;
 pub mod import_v3;
 pub mod menu;
 pub mod net;
+pub mod nettest;
 pub mod paths;
 pub mod profiles;
 pub mod source;

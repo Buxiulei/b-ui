@@ -116,20 +116,24 @@ pub fn wait_seconds(fail_streak: u32) -> i64 {
     backoff_minutes(fail_streak.saturating_sub(1)) as i64 * 60
 }
 
+/// 探测走哪条腿：TUN 已接管全局路由，直连探测就是经隧道；SOCKS 模式必须经本地 inbound
+/// 才验证得到隧道。巡检与菜单 `[5]`（[`crate::nettest`]）共用这一处（spec §6.6）。
+pub fn via_for(prof: &Profiles) -> Via {
+    match prof.mode {
+        Mode::Tun => Via::Direct,
+        Mode::Socks => Via::Socks5 {
+            port: prof.socks_port,
+        },
+    }
+}
+
 /// 逐项探测，收集**全部**失败项（不短路：日志里要能一眼看出是单元没起还是路由没接管）。
 pub fn probe<S: Sys, N: Net>(sys: &S, net: &N, paths: &Paths, prof: &Profiles) -> Vec<Failure> {
     let mut out = Vec::new();
     if !systemd::is_active(sys, UNIT_MAIN) {
         out.push(Failure::UnitDown);
     }
-    let via = match prof.mode {
-        // TUN 已接管全局路由，直连探测就是经隧道；socks 模式必须经本地 inbound 才验证得到隧道
-        Mode::Tun => Via::Direct,
-        Mode::Socks => Via::Socks5 {
-            port: prof.socks_port,
-        },
-    };
-    match net.status(PROBE_URL, via, PROBE_TIMEOUT) {
+    match net.status(PROBE_URL, via_for(prof), PROBE_TIMEOUT) {
         Ok(204) => {}
         Ok(code) => out.push(Failure::Probe { got: Some(code) }),
         Err(_) => out.push(Failure::Probe { got: None }),
@@ -279,6 +283,14 @@ mod tests {
             Failure::TunNoDefaultRoute.to_string(),
             "默认路由没有指向 bui-tun"
         );
+    }
+
+    #[test]
+    fn via_for_goes_direct_under_tun_and_through_the_local_socks_port_otherwise() {
+        assert_eq!(via_for(&profiles_tun()), Via::Direct);
+        let mut p = profiles_socks();
+        p.socks_port = 10808;
+        assert_eq!(via_for(&p), Via::Socks5 { port: 10808 });
     }
 
     #[test]

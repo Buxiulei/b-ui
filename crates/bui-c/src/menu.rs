@@ -910,6 +910,45 @@ pub fn pick_index(input: &str, len: usize) -> Option<usize> {
     Some(n - 1)
 }
 
+/// 连接检查失败后「下一步」小菜单里的一次选择（spec §6.5、§0.2 R3）。键固定，不随状态漂移。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NextStep {
+    Recheck,
+    SpeedTest,
+    Journal,
+    Back,
+}
+
+/// 小菜单的「下一步：」与四个选项（不含提示符 `选择 [0-3]`）。[2] 在节点测速（T16）落地之前是
+/// 「换个节点」，进 [1] 的列表；T16 把它换成测速，编号不变（spec §6.5）。
+pub fn render_next_step() -> String {
+    format!(
+        "  下一步：\n     [1] 再查一次\n     [2] 换个节点\n     [3] 看最近 {SERVICE_LOG_LINES} 行日志\n     [0] 返回菜单\n"
+    )
+}
+
+/// `1` 再查一次、`2` 换个节点（T16 起是测速）、`3` 看日志；空行与 `0` 返回菜单（全角数字折半角）。
+/// 别的一律 `None`：调用方打一行错误、原地重问，不重画报告。
+pub fn parse_next_step(input: &str) -> Option<NextStep> {
+    match normalize_digits(input).as_str() {
+        "" | "0" => Some(NextStep::Back),
+        "1" => Some(NextStep::Recheck),
+        "2" => Some(NextStep::SpeedTest),
+        "3" => Some(NextStep::Journal),
+        _ => None,
+    }
+}
+
+/// 小菜单里输错的那一行，不含缩进（调用方经 `say` 在菜单里加两列）：回显的输入先净化再尾截，
+/// 整行按容量口径不超过行宽上限。
+pub fn invalid_next_step(input: &str, width: usize) -> String {
+    const HEAD: &str = "无效选项：";
+    const TAIL: &str = "（请输入 0-3 的数字）";
+    // 2 = 菜单里 `say` 加的缩进
+    let room = line_limit(width).saturating_sub(2 + budget_width(HEAD) + budget_width(TAIL));
+    format!("{HEAD}{}{TAIL}", truncate_end(&sanitize(input), room))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1478,6 +1517,8 @@ mod tests {
         ] {
             out.push(("invalid", format!("  {}\n", invalid_choice(input, width))));
         }
+        // T11：连接检查报告的整屏（真跑一遍 nettest::run，用逐行事件拼出来）与日志页
+        out.extend(crate::nettest::sample::report_screens(width));
         out
     }
 
@@ -2102,5 +2143,51 @@ mod tests {
         assert_eq!(p.read("选择").unwrap().as_deref(), Some("1"));
         assert_eq!(p.read("选择").unwrap(), None, "队列空 = EOF");
         assert_eq!(p.line("选择").unwrap(), "", "line 把 EOF 折成空串");
+    }
+}
+
+#[cfg(test)]
+mod nextstep_tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn next_step_keys_are_fixed() {
+        assert_eq!(parse_next_step("1"), Some(NextStep::Recheck));
+        assert_eq!(parse_next_step("2"), Some(NextStep::SpeedTest));
+        assert_eq!(parse_next_step("3"), Some(NextStep::Journal));
+        assert_eq!(
+            parse_next_step("３"),
+            Some(NextStep::Journal),
+            "全角数字折半角"
+        );
+        for back in ["0", "", "  ", "０"] {
+            assert_eq!(parse_next_step(back), Some(NextStep::Back), "{back:?}");
+        }
+        for junk in ["4", "9", "x", "1 2", "\u{1b}[A"] {
+            assert_eq!(parse_next_step(junk), None, "{junk:?}");
+        }
+    }
+
+    #[test]
+    fn next_step_block_has_four_fixed_rows_and_the_typo_line_fits() {
+        assert_eq!(
+            render_next_step(),
+            "  下一步：\n     [1] 再查一次\n     [2] 换个节点\n     [3] 看最近 50 行日志\n     [0] 返回菜单\n"
+        );
+        assert_eq!(
+            invalid_next_step("x", 60),
+            "无效选项：x（请输入 0-3 的数字）"
+        );
+        assert_eq!(
+            invalid_next_step("\u{1b}[A", 60),
+            "无效选项：?[A（请输入 0-3 的数字）",
+            "方向键的 ESC 不能回显"
+        );
+        for w in [40, 50, 60, 80, 100] {
+            // 2 = 菜单里 `say` 加的缩进
+            let l = format!("  {}", invalid_next_step(&"9".repeat(200), w));
+            assert!(budget_width(&l) <= line_limit(w), "@{w}: {l}");
+        }
     }
 }
