@@ -866,7 +866,7 @@ fn menu_body<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()
         let cmd = match action {
             Action::Quit => return Ok(()),
             Action::SwitchNode => {
-                let list = menu::render_nodes(&prof, true);
+                let list = menu::render_node_picker(&prof);
                 ctx.show(list.trim_end());
                 let len = prof.profiles.len();
                 if len == 0 {
@@ -2849,6 +2849,49 @@ mod tests {
             5,
             "{:?}",
             p.asked
+        );
+    }
+
+    /// 菜单 `[1]` 的节点列表跟服务控制子菜单一个样式：前空一行、两列缩进的标题。
+    /// 以前编号行直接接在「▸ 选择 [0-9]：1」下面，看着像主菜单多出来的几行。
+    #[test]
+    fn menu_node_list_has_a_title_like_the_service_submenu() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        two_nodes(&s, &pp);
+        let n = FakeNet::new();
+        let mut p = Scripted::from(["1", "0", "0"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        let lines: Vec<&str> = t.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| *l == "  切换节点")
+            .unwrap_or_else(|| panic!("缺标题：\n{t}"));
+        assert_eq!(
+            lines[at - 1..at + 2],
+            ["", "  切换节点", "     [1] ★ alice-hy2-direct"],
+            "\n{t}"
+        );
+
+        // 没有节点：同样有标题，下面是引导
+        let s = FakeSys::new();
+        ready(&s);
+        let mut p = Scripted::from(["1", "0"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        let lines: Vec<&str> = t.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| *l == "  切换节点")
+            .unwrap_or_else(|| panic!("缺标题：\n{t}"));
+        assert_eq!(
+            lines[at - 1..at + 2],
+            ["", "  切换节点", "  没有节点，先用 [3] 导入节点"],
+            "\n{t}"
         );
     }
 

@@ -394,6 +394,12 @@ pub fn render_nodes(prof: &Profiles, with_back: bool) -> String {
     out
 }
 
+/// 菜单 `[1] 切换节点` 的一屏：前空一行、两列缩进的标题，再接带编号的 [`render_nodes`]——
+/// 与 [`render_service_options`] 同一个样式。一次性 `bui-c list` 不用它，不加标题。
+pub fn render_node_picker(prof: &Profiles) -> String {
+    format!("\n  切换节点\n{}", render_nodes(prof, true))
+}
+
 /// `[4] 服务控制` 的二级菜单里的一次选择。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceAction {
