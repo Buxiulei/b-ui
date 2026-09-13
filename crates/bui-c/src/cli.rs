@@ -70,6 +70,12 @@ pub enum Cmd {
     ImportV3 {
         #[arg(long)]
         base: Option<PathBuf>,
+        /// 面板地址（取 manifest 与内核；默认用 v3 记录的 server_address，也可用环境变量 BUI_C_PANEL）
+        #[arg(long)]
+        panel: Option<String>,
+        /// 覆盖升级后的模式（默认沿用 v3：bui-tun 曾 enable 则 tun，否则 socks）
+        #[arg(long)]
+        mode: Option<ModeArg>,
     },
     /// 卸载
     Uninstall {
@@ -173,12 +179,40 @@ fn new_version_pending(r: &update::Report) -> bool {
     r.manifest_version != crate::VERSION && !r.self_updated
 }
 
+/// `BUI_C_PANEL=<url>`：本次进程里把面板地址换成它（只在内存里，不落盘），给预发布期
+/// 「v3 推导的面板没有 `/packages`」这类情况一个显式出口。经 `Sys::env` 读（决策 11，
+/// 测试可注入）。只换 `base_url`，`username` 照旧——它是订阅路径，跟 manifest 来源无关。
+fn with_panel_override<S: Sys>(sys: &S, prof: &Profiles) -> Profiles {
+    let Some(url) = sys
+        .env("BUI_C_PANEL")
+        .map(|u| u.trim().trim_end_matches('/').to_string())
+        .filter(|u| !u.is_empty())
+    else {
+        return prof.clone();
+    };
+    let mut out = prof.clone();
+    out.panel = Some(Panel {
+        base_url: url,
+        username: out
+            .panel
+            .as_ref()
+            .map(|p| p.username.clone())
+            .unwrap_or_default(),
+    });
+    out
+}
+
 /// 唯一的「改机器」路径：装内核 → 同步 UFW → apply。
 fn apply_with_ufw<S: Sys, N: Net, P: Prompt>(
     ctx: &mut Ctx<'_, S, N, P>,
     prof: &Profiles,
 ) -> Result<Applied> {
-    if update::ensure_kernel(ctx.sys, ctx.net, ctx.paths, prof)? {
+    if update::ensure_kernel(
+        ctx.sys,
+        ctx.net,
+        ctx.paths,
+        &with_panel_override(ctx.sys, prof),
+    )? {
         ctx.say("已安装 sing-box 内核");
     }
     let mut rt = Runtime::load(ctx.sys, ctx.paths);
@@ -427,7 +461,13 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
                 // 退避 1 小时，否则离线机器每分钟白等两个源各 15s
                 rt.last_update_attempt_at = Some(ctx.sys.now().unix_timestamp());
                 rt.save(ctx.sys, ctx.paths)?;
-                match update::run(ctx.sys, ctx.net, ctx.paths, &prof, false) {
+                match update::run(
+                    ctx.sys,
+                    ctx.net,
+                    ctx.paths,
+                    &with_panel_override(ctx.sys, &prof),
+                    false,
+                ) {
                     Ok(r) => {
                         rt.last_update_at = Some(ctx.sys.now().unix_timestamp());
                         // 自更新也是一次「检查更新」：装完了就把菜单上的 ★ 摘掉
@@ -458,7 +498,13 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
                 ));
                 return Ok(());
             }
-            let r = update::run(ctx.sys, ctx.net, ctx.paths, &prof, *check_only)?;
+            let r = update::run(
+                ctx.sys,
+                ctx.net,
+                ctx.paths,
+                &with_panel_override(ctx.sys, &prof),
+                *check_only,
+            )?;
             ctx.say(format!(
                 "manifest {}（来源 {}）",
                 r.manifest_version, r.manifest_source
@@ -486,12 +532,19 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
             rt.save(ctx.sys, ctx.paths)?;
             Ok(())
         }
-        Cmd::ImportV3 { base } => {
+        Cmd::ImportV3 { base, panel, mode } => {
             let mut prof = Profiles::load(ctx.sys, ctx.paths)?;
             let dir = base
                 .clone()
                 .unwrap_or_else(|| PathBuf::from(import_v3::V3_BASE));
-            let r = import_v3::run(ctx.sys, ctx.paths, &dir, &mut prof)?;
+            let opts = import_v3::RunOpts {
+                panel: panel.clone().or_else(|| ctx.sys.env("BUI_C_PANEL")),
+                mode: mode.map(Into::into),
+            };
+            let r = import_v3::run(ctx.sys, ctx.net, ctx.paths, &dir, &mut prof, &opts)?;
+            if r.kernel_installed {
+                ctx.say("已安装 sing-box 内核");
+            }
             ctx.say(format!(
                 "导入 {} 个节点，卸载 {} 个旧单元",
                 r.imported.len(),
@@ -547,7 +600,11 @@ fn offer_v3_import<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Res
         let sub = Cli {
             json: false,
             yes: ctx.yes,
-            cmd: Some(Cmd::ImportV3 { base: None }),
+            cmd: Some(Cmd::ImportV3 {
+                base: None,
+                panel: None,
+                mode: None,
+            }),
         };
         if let Err(e) = dispatch(&sub, ctx) {
             ctx.say(format!("导入失败：{e}"));
@@ -631,7 +688,11 @@ pub fn menu_loop<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Resul
                     Switch::On
                 }),
             }),
-            Action::ImportV3 => Some(Cmd::ImportV3 { base: None }),
+            Action::ImportV3 => Some(Cmd::ImportV3 {
+                base: None,
+                panel: None,
+                mode: None,
+            }),
             Action::Uninstall => Some(Cmd::Uninstall { purge_bin: false }),
         };
         if let Some(cmd) = cmd {
@@ -787,7 +848,19 @@ mod tests {
         );
         assert_eq!(
             parse(&["import-v3"]).cmd,
-            Some(Cmd::ImportV3 { base: None })
+            Some(Cmd::ImportV3 {
+                base: None,
+                panel: None,
+                mode: None
+            })
+        );
+        assert_eq!(
+            parse(&["import-v3", "--panel", "https://p", "--mode", "socks"]).cmd,
+            Some(Cmd::ImportV3 {
+                base: None,
+                panel: Some("https://p".into()),
+                mode: Some(ModeArg::Socks)
+            })
         );
         assert_eq!(
             parse(&["uninstall", "--purge-bin", "-y"]).cmd,
@@ -1315,6 +1388,94 @@ mod tests {
         assert_eq!(
             Profiles::load(&s, &pp).unwrap().active.as_deref(),
             Some("alice-reality-direct")
+        );
+    }
+
+    #[test]
+    fn import_v3_panel_flag_is_persisted_and_used_for_the_manifest() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        // 把 ready 预置的内核拿掉：这条用例要的就是「内核得现取」那条路
+        s.remove_file(std::path::Path::new("/opt/bui-c/bin/sing-box"))
+            .unwrap();
+        s.put(
+            "/opt/hysteria-client/configs/hysteria2-1/uri.txt",
+            "hysteria2://alice:hy2-pw@panel.example.com:10000/?sni=panel.example.com&mport=20000-30000#alice-HY2%E7%9B%B4%E8%BF%9E",
+        );
+        s.put("/opt/hysteria-client/active", "hysteria2-1");
+        // v3 推导出来的面板是 v3 面板，没有 /packages —— 只登记 --panel 那个源
+        s.put("/opt/hysteria-client/server_address", "v3.example.com");
+        let n = FakeNet::new();
+        let bin = b"ELF-sing-box".to_vec();
+        n.route(
+            "https://other.example.com/packages/manifest.json",
+            FakeReply::Text(format!(
+                r#"{{"version":"{}","kernels":{{"client_sing_box":"1.14.5"}},"artifacts":{{"sing-box-linux-{a}":{{"url":"https://example.com/sing-box-linux-{a}","sha256":"{sha}"}}}}}}"#,
+                crate::VERSION,
+                a = update::arch_suffix(),
+                sha = update::sha256_hex(&bin),
+            )),
+        );
+        n.route(
+            &format!(
+                "https://other.example.com/packages/sing-box-linux-{}",
+                update::arch_suffix()
+            ),
+            FakeReply::Bytes(bin),
+        );
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(
+            &parse(&["import-v3", "--panel", "https://other.example.com"]),
+            &mut ctx,
+        )
+        .unwrap();
+        let saved = Profiles::load(&s, &pp).unwrap();
+        assert_eq!(
+            saved.panel.as_ref().map(|x| x.base_url.as_str()),
+            Some("https://other.example.com"),
+            "--panel 覆盖 v3 推导出的面板并落盘"
+        );
+        assert!(
+            ctx.transcript.contains("已安装 sing-box 内核"),
+            "{}",
+            ctx.transcript
+        );
+    }
+
+    #[test]
+    fn bui_c_panel_env_overrides_the_manifest_source_without_persisting() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        s.set_env("BUI_C_PANEL", "https://env.example.com");
+        let mut prof = profiles_socks();
+        prof.panel = Some(crate::profiles::Panel {
+            base_url: "https://panel.example.com".into(),
+            username: "alice".into(),
+        });
+        prof.save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        // 只有环境变量指向的那个源可达：没生效就会走 panel.example.com 与 GitHub，双双失败
+        n.route(
+            "https://env.example.com/packages/manifest.json",
+            FakeReply::Text(format!(
+                r#"{{"version":"{}","kernels":{{"client_sing_box":"1.14.5"}},"artifacts":{{}}}}"#,
+                crate::VERSION
+            )),
+        );
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["update", "--check-only"]), &mut ctx).unwrap();
+        assert_eq!(
+            Profiles::load(&s, &pp)
+                .unwrap()
+                .panel
+                .as_ref()
+                .map(|x| x.base_url.as_str()),
+            Some("https://panel.example.com"),
+            "只在内存里覆盖，不改 profiles.json"
         );
     }
 }

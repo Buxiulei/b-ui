@@ -5,12 +5,14 @@
 //!
 //! 不删 `<base>` 目录：v3 的 `uri.txt` 是回滚素材，清理交给 `uninstall --purge-v3`。
 
+use crate::engine::Engine;
+use crate::net::Net;
 use crate::paths::{Paths, TUN_IFACE};
 use crate::profiles::{
     default_split, profile_name, rfc3339, Mode, Panel, Profile, Profiles, Source,
 };
 use crate::sys::{systemd, Sys};
-use crate::{Error, Result};
+use crate::{update, Error, Result};
 use std::path::Path;
 
 pub const V3_BASE: &str = "/opt/hysteria-client";
@@ -32,6 +34,18 @@ pub struct Report {
     pub active: Option<String>,
     pub removed_units: Vec<String>,
     pub ufw_restored: bool,
+    /// 这次真下载并落了 `bin/sing-box`（机器上本来就有内核时是 false）
+    pub kernel_installed: bool,
+}
+
+/// [`run`] 的可选覆盖项，都来自 `bui-c import-v3` 的命令行（或 `BUI_C_PANEL`）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunOpts {
+    /// `--panel`：覆盖从 v3 `server_address` 推导的面板地址。v3 面板没有 `/packages`，
+    /// 预发布期得给个显式出口。只换 `base_url`，`username` 仍用推导值。
+    pub panel: Option<String>,
+    /// `--mode`：覆盖「v3 的 bui-tun 是否 enabled」推导出的模式。
+    pub mode: Option<Mode>,
 }
 
 /// `<base>/configs` 存在就认为这机器装过 v3 客户端。
@@ -180,10 +194,20 @@ pub fn teardown<S: Sys>(sys: &S, paths: &Paths, base: &Path) -> Result<Report> {
     Ok(r)
 }
 
-/// `bui-c import-v3` 的整条动作：导入 → 落盘 → 卸载旧单元。
+/// `bui-c import-v3` 的整条动作：导入 → 备引擎并自检 → 落盘 → 最后才卸 v3。
 ///
-/// 先落盘再卸载：卸载途中出错时用户的节点已经在 `profiles.json` 里了。
-pub fn run<S: Sys>(sys: &S, paths: &Paths, base: &Path, prof: &mut Profiles) -> Result<Report> {
+/// 顺序是这个函数的全部要点（缺陷 1，与服务端 `bui install` 的「缺内核即中止」同一原则）：
+/// v3 的单元在最后一步才被停掉，在那之前任何一步失败都 `Err` 返回，**既不落盘也不动 v3**，
+/// 机器仍由 v3 客户端代理着。先落盘再卸载则是第二层保险：卸载途中出错时节点已经在
+/// `profiles.json` 里了。
+pub fn run<S: Sys, N: Net>(
+    sys: &S,
+    net: &N,
+    paths: &Paths,
+    base: &Path,
+    prof: &mut Profiles,
+    opts: &RunOpts,
+) -> Result<Report> {
     if !detect(sys, base) {
         return Err(Error::msg(format!(
             "没找到 v3 客户端目录 {}",
@@ -191,21 +215,112 @@ pub fn run<S: Sys>(sys: &S, paths: &Paths, base: &Path, prof: &mut Profiles) -> 
         )));
     }
     let mut r = import(sys, base, prof)?;
+    if let Some(url) = &opts.panel {
+        prof.panel = Some(Panel {
+            base_url: url.trim().trim_end_matches('/').to_string(),
+            username: prof
+                .panel
+                .as_ref()
+                .map(|p| p.username.clone())
+                .unwrap_or_default(),
+        });
+    }
+    if let Some(m) = opts.mode {
+        prof.mode = m;
+    }
+
+    // ① 引擎：拿不到内核就此中止——此时 profiles.json 还没写、v3 单元一个没动
+    let kernel_installed = update::ensure_kernel(sys, net, paths, prof).map_err(|e| {
+        Error::msg(format!(
+            "拿不到 sing-box 内核，v3 客户端原样保留：{e}。\
+             可用 `bui-c import-v3 --panel <面板地址>` 指定 manifest 来源"
+        ))
+    })?;
+
+    // ② 自检：用刚备好的内核把活动节点的配置渲一遍、`sing-box check` 过一遍
+    let engine = Engine::new(sys, paths);
+    let active = prof
+        .active_profile()
+        .ok_or_else(|| Error::msg("导入后没有可用的活动节点，v3 客户端原样保留".to_string()))?;
+    let cfg = engine
+        .render(prof, active)
+        .map_err(|e| Error::msg(format!("渲染客户端配置失败，v3 客户端原样保留：{e}")))?;
+    engine
+        .verify(&cfg)
+        .map_err(|e| Error::msg(format!("sing-box 自检不通过，v3 客户端原样保留：{e}")))?;
+
+    // ③ 引擎已就绪，这时候落盘、卸 v3 才是安全的
     prof.save(sys, paths)?;
     let t = teardown(sys, paths, base)?;
     r.removed_units = t.removed_units;
     r.ufw_restored = t.ufw_restored;
+    r.kernel_installed = kernel_installed;
     Ok(r)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fake::FakeSys;
+    use crate::fake::{FakeNet, FakeReply, FakeSys};
     use pretty_assertions::assert_eq;
 
     fn paths() -> Paths {
         Paths::new("/opt/bui-c", "/etc/systemd/system")
+    }
+
+    /// C4 形状里客户端用得上的那部分（对齐 `update.rs` 测试里的 `manifest_json`）：
+    /// 版本 + `client_sing_box` + 两个 sing-box 裸二进制。
+    fn manifest_json(sb_sha: &str) -> String {
+        let dl = "https://github.com/Buxiulei/b-ui/releases/download/v4.0.0";
+        format!(
+            r#"{{"version":"{v}","kernels":{{"client_sing_box":"1.14.5"}},
+                 "artifacts":{{
+                 "sing-box-linux-amd64":{{"url":"{dl}/sing-box-linux-amd64","sha256":"{sb_sha}"}},
+                 "sing-box-linux-arm64":{{"url":"{dl}/sing-box-linux-arm64","sha256":"{sb_sha}"}}}}}}"#,
+            v = crate::VERSION
+        )
+    }
+
+    /// 让 `<panel>/packages/` 这一路能拿到 manifest 与内核裸二进制。
+    fn serve_kernel(n: &FakeNet, panel: &str, bin: &[u8]) {
+        n.route(
+            &format!("{panel}/packages/manifest.json"),
+            FakeReply::Text(manifest_json(&crate::update::sha256_hex(bin))),
+        );
+        n.route(
+            &format!(
+                "{panel}/packages/sing-box-linux-{}",
+                crate::update::arch_suffix()
+            ),
+            FakeReply::Bytes(bin.to_vec()),
+        );
+    }
+
+    /// 把 v3 五个单元文件都摆上，好断言「中止时一个都没被动」。
+    fn with_v3_units(s: &FakeSys) {
+        for u in V3_UNITS.iter().chain(V3_AUX_UNITS.iter()) {
+            s.put(&format!("/etc/systemd/system/{u}"), "[Unit]");
+        }
+    }
+
+    /// 中止路径的共同断言：没落盘、没停/禁用任何单元、v3 单元文件都还在。
+    fn assert_v3_untouched(s: &FakeSys) {
+        assert!(
+            !s.exists(Path::new("/opt/bui-c/profiles.json")),
+            "引擎没备好就不该落盘"
+        );
+        for c in s.calls() {
+            assert!(
+                !c.starts_with("systemctl stop") && !c.starts_with("systemctl disable"),
+                "中止路径不该动任何单元，却跑了：{c}"
+            );
+        }
+        for u in V3_UNITS.iter().chain(V3_AUX_UNITS.iter()) {
+            assert!(
+                s.exists(Path::new(&format!("/etc/systemd/system/{u}"))),
+                "{u} 应原样保留"
+            );
+        }
     }
 
     fn v3_machine() -> FakeSys {
@@ -377,10 +492,22 @@ mod tests {
     #[test]
     fn run_imports_then_tears_down_and_persists() {
         let s = v3_machine();
+        // 机器上已有内核 → `ensure_kernel` 是空操作，这条用例仍只看「导入 → 落盘 → 卸载」
+        s.put("/opt/bui-c/bin/sing-box", "ELF");
+        let n = FakeNet::new();
         let mut prof = Profiles::new_default();
         s.put("/etc/systemd/system/hysteria-client.service", "[Unit]");
-        let r = run(&s, &paths(), Path::new(V3_BASE), &mut prof).unwrap();
+        let r = run(
+            &s,
+            &n,
+            &paths(),
+            Path::new(V3_BASE),
+            &mut prof,
+            &RunOpts::default(),
+        )
+        .unwrap();
         assert_eq!(r.imported.len(), 2);
+        assert!(!r.kernel_installed, "内核本来就在，不该再下一次");
         assert_eq!(
             r.removed_units,
             vec!["hysteria-client.service".to_string()],
@@ -391,5 +518,172 @@ mod tests {
         assert_eq!(saved.profiles.len(), 2);
         assert_eq!(saved.active.as_deref(), Some("alice-reality-direct"));
         assert_eq!(s.mode("/opt/bui-c/profiles.json"), Some(0o600));
+    }
+
+    #[test]
+    fn run_aborts_before_touching_v3_when_the_kernel_cannot_be_fetched() {
+        let s = v3_machine();
+        with_v3_units(&s);
+        // 没有内核，且一个 URL 都没登记 = 面板与 GitHub 都不可达
+        let n = FakeNet::new();
+        let mut prof = Profiles::new_default();
+        let e = run(
+            &s,
+            &n,
+            &paths(),
+            Path::new(V3_BASE),
+            &mut prof,
+            &RunOpts::default(),
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("v3 客户端原样保留"), "{e}");
+        assert_v3_untouched(&s);
+    }
+
+    #[test]
+    fn run_aborts_when_sing_box_check_rejects_the_config() {
+        let s = v3_machine();
+        with_v3_units(&s);
+        s.put("/opt/bui-c/bin/sing-box", "ELF");
+        s.reply(
+            "/opt/bui-c/bin/sing-box check -c /opt/bui-c/.config.json.new",
+            1,
+            "",
+        );
+        let n = FakeNet::new();
+        let mut prof = Profiles::new_default();
+        let e = run(
+            &s,
+            &n,
+            &paths(),
+            Path::new(V3_BASE),
+            &mut prof,
+            &RunOpts::default(),
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("v3 客户端原样保留"), "{e}");
+        assert_v3_untouched(&s);
+    }
+
+    #[test]
+    fn run_installs_the_kernel_before_stopping_v3_units() {
+        let s = v3_machine();
+        s.put("/etc/systemd/system/bui-tun.service", "[Unit]");
+        let n = FakeNet::new();
+        let bin = b"ELF-sing-box".to_vec();
+        serve_kernel(&n, "https://panel.example.com", &bin);
+        let mut prof = Profiles::new_default();
+        let r = run(
+            &s,
+            &n,
+            &paths(),
+            Path::new(V3_BASE),
+            &mut prof,
+            &RunOpts::default(),
+        )
+        .unwrap();
+        assert!(r.kernel_installed);
+        assert_eq!(s.get("/opt/bui-c/bin/sing-box").unwrap(), "ELF-sing-box");
+        let calls = s.calls();
+        let checked = calls
+            .iter()
+            .position(|c| c.contains("sing-box check"))
+            .expect("应当跑过 sing-box 自检");
+        let stopped = calls
+            .iter()
+            .position(|c| c == "systemctl stop bui-tun.service")
+            .expect("应当卸过 v3 的 bui-tun");
+        assert!(
+            checked < stopped,
+            "自检必须排在卸 v3 之前（拿不到内核时机器要还有代理）：{calls:?}"
+        );
+        assert!(s.exists(Path::new("/opt/bui-c/profiles.json")));
+        assert_eq!(s.mode("/opt/bui-c/profiles.json"), Some(0o600));
+    }
+
+    #[test]
+    fn run_honours_panel_and_mode_overrides() {
+        let s = v3_machine();
+        // v3 这台机器在用 TUN，`--mode socks` 要压过这个推导
+        s.reply("systemctl is-enabled --quiet bui-tun.service", 0, "");
+        let n = FakeNet::new();
+        let bin = b"ELF-sing-box".to_vec();
+        serve_kernel(&n, "https://other.example.com", &bin);
+        let mut prof = Profiles::new_default();
+        let opts = RunOpts {
+            panel: Some("https://other.example.com/".into()),
+            mode: Some(Mode::Socks),
+        };
+        run(&s, &n, &paths(), Path::new(V3_BASE), &mut prof, &opts).unwrap();
+        let saved = Profiles::load(&s, &paths()).unwrap();
+        assert_eq!(
+            saved.panel.as_ref().map(|p| p.base_url.as_str()),
+            Some("https://other.example.com"),
+            "尾斜杠要去掉"
+        );
+        assert_eq!(
+            saved.panel.as_ref().map(|p| p.username.as_str()),
+            Some("alice"),
+            "用户名仍取 v3 推导出的那个"
+        );
+        assert_eq!(saved.mode, Mode::Socks);
+        assert!(
+            n.log()
+                .iter()
+                .any(|l| l.contains("https://other.example.com/packages/manifest.json")),
+            "manifest 应当去 --panel 指定的面板取：{:?}",
+            n.log()
+        );
+    }
+
+    /// 回归保护（缺陷 3，解析层已由 688f88a 的 `parse::node_uri` 修好，这条只是钉住它）：
+    /// baiyi 真机上的五个 v3 目录——早期 `hysteria2-<ts>` 把 userinfo 写成 `user%3Apass@`，
+    /// fragment 还常常没有 `-<标签>` 后缀——必须一个不落地导进来。
+    #[test]
+    fn import_keeps_early_v3_hysteria2_dirs() {
+        let s = FakeSys::new();
+        s.put(
+            "/opt/hysteria-client/configs/HY2/uri.txt",
+            "hysteria2://alice:pw@h0.example.com:40000?sni=h0.example.com&insecure=0&mport=41000-50000#%E7%A4%BA%E4%BE%8B%E4%B8%93%E7%94%A8%E5%90%8D-HY2%E4%BD%8F%E5%AE%85",
+        );
+        for (dir, host, frag) in [
+            (
+                "hysteria2-1757000001",
+                "h1.example.com",
+                "%E7%A4%BA%E4%BE%8B%E4%B8%93%E7%94%A8%E5%90%8D",
+            ),
+            (
+                "hysteria2-1757000002",
+                "h2.example.com",
+                "%E7%A4%BA%E4%BE%8B%E4%B8%B4%E6%97%B6%E5%90%8D",
+            ),
+            (
+                "hysteria2-1757000003",
+                "h3.example.com",
+                "%E7%A4%BA%E4%BE%8B%E4%B8%93%E7%94%A8%E5%90%8D-%E5%B0%8F%E7%BB%84",
+            ),
+        ] {
+            s.put(
+                &format!("/opt/hysteria-client/configs/{dir}/uri.txt"),
+                &format!(
+                    "hysteria2://alice%3Apw@{host}:10000?sni={host}&insecure=0&allowInsecure=0&mport=20000-30000#{frag}"
+                ),
+            );
+        }
+        s.put(
+            "/opt/hysteria-client/configs/reality-Reality/uri.txt",
+            "vless://11111111-1111-4111-8111-111111111111@h0.example.com:10001?encryption=none&security=reality&sni=www.bing.com&fp=chrome&pbk=PUB&sid=0123456789abcdef&flow=xtls-rprx-vision&type=tcp#alice-Reality%E7%9B%B4%E8%BF%9E",
+        );
+        s.put("/opt/hysteria-client/active", "HY2\n");
+
+        let mut prof = Profiles::new_default();
+        let r = import(&s, Path::new(V3_BASE), &mut prof).unwrap();
+        assert_eq!(r.imported.len(), 5, "五个目录一个都不能丢：{r:?}");
+        assert!(r.skipped.is_empty(), "不该有跳过的目录：{:?}", r.skipped);
+        let mut names = r.imported.clone();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), 5, "同 kind 的重名要自动让位：{:?}", r.imported);
+        assert_eq!(prof.profiles.len(), 5);
     }
 }
