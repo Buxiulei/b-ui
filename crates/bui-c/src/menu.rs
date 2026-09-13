@@ -359,7 +359,7 @@ pub fn render_options(st: &Status) -> String {
 pub fn render_nodes(prof: &Profiles, with_back: bool) -> String {
     if prof.profiles.is_empty() {
         return if with_back {
-            "  没有节点，先导入（主菜单 3）\n".to_string()
+            "  没有节点，先用 [3] 导入节点\n".to_string()
         } else {
             "  没有节点，先 `bui-c import …`\n".to_string()
         };
@@ -795,11 +795,14 @@ mod tests {
             !render_nodes(&p, false).contains("[0] 返回"),
             "一次性 list 没有可返回的地方"
         );
-        // 空列表的引导按场景给：菜单里指菜单项，命令行里指命令
-        assert!(render_nodes(&Profiles::new_default(), true).contains("主菜单 3"));
+        // 空列表的引导按场景给：菜单里指菜单项（统一写「[3] 导入节点」），命令行里指命令
+        assert_eq!(
+            render_nodes(&Profiles::new_default(), true),
+            "  没有节点，先用 [3] 导入节点\n"
+        );
         let empty = render_nodes(&Profiles::new_default(), false);
         assert!(empty.contains("bui-c import"), "{empty}");
-        assert!(!empty.contains("主菜单"), "{empty}");
+        assert!(!empty.contains("[3]"), "{empty}");
     }
 
     fn named(name: &str, node: bui_schema::nodes::Node) -> Profile {

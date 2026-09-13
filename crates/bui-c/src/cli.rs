@@ -817,7 +817,7 @@ fn offer_v3_import<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Res
             ctx.say(format!("导入失败：{e}"));
         }
     } else {
-        ctx.say("已跳过。随时可以跑 `bui-c import-v3`，或在菜单里选 7");
+        ctx.say("已跳过。随时可以跑 `bui-c import-v3`，或在菜单里选 [7] 从 v3 导入");
     }
     ctx.flush();
     Ok(())
@@ -2528,8 +2528,10 @@ mod tests {
         let mut ctx2 = Ctx::new(&s2, &n, &pp, &mut p2, false, false);
         menu_loop(&mut ctx2).unwrap();
         assert!(Profiles::load(&s2, &pp).unwrap().profiles.is_empty());
+        // 还没进菜单：命令与菜单项都给，菜单项按统一叫法写成「[7] 从 v3 导入」
         assert!(
-            ctx2.transcript.contains("bui-c import-v3"),
+            ctx2.transcript.lines().any(|l| l
+                == "  已跳过。随时可以跑 `bui-c import-v3`，或在菜单里选 [7] 从 v3 导入"),
             "{}",
             ctx2.transcript
         );
@@ -2890,7 +2892,10 @@ mod tests {
         let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
         menu_loop(&mut ctx).unwrap();
         let t = ctx.transcript.clone();
-        assert!(t.contains("没有节点，先导入（主菜单 3）"), "{t}");
+        assert!(
+            t.lines().any(|l| l == "  没有节点，先用 [3] 导入节点"),
+            "{t}"
+        );
         assert!(
             !p.asked.iter().any(|q| q == "选择节点编号"),
             "空列表没有编号可选（不能出现「可选 1-0」）：{:?}",
