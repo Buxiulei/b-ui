@@ -215,24 +215,43 @@ pub struct Status {
 /// 两种终端都不折行，最坏只是带这些符号的那一行错开 1 列。
 pub const AMBIGUOUS: &str = "★☆●○─…·—–“”‘’→←";
 
-/// 确定只占 1 列的符号白名单：不进 [`AMBIGUOUS`]，容量口径也按 1 列算。
+/// 确定只占 1 列的符号白名单，与 [`AMBIGUOUS`] 不相交。[`budget_width`] 不查这张表：
+/// 它们不在 AMBIGUOUS 里，容量口径自然按 1 列算。
 /// 守门测试靠这两个常量判断渲染输出里的新符号有没有归类。
 pub const NARROW: &str = "✓✗▸";
 
 /// 截断补的省略号，在 [`AMBIGUOUS`] 里，容量口径按 2 列。
 const ELLIPSIS: char = '…';
 
-/// 一个字符的终端列宽：CJK 与全角 2 列，其余 1 列。
+/// 一个字符的终端列宽：东亚宽字符（Unicode EastAsianWidth 为 W / F）2 列，其余 1 列。
+/// 收的是外部节点名里常见的：谚文、CJK 与全角、CJK 扩展 B–G、宽 emoji。
+/// 歧义宽度的 ★☆●○ 与 [`NARROW`] 的 ✓✗▸ 在真机上是 1 列，不在这里。
 fn char_width(c: char) -> usize {
-    let cp = u32::from(c);
-    let wide = (0x1100..=0x115F).contains(&cp)
-        || (0x2E80..=0xA4CF).contains(&cp)
-        || (0xAC00..=0xD7A3).contains(&cp)
-        || (0xF900..=0xFAFF).contains(&cp)
-        || (0xFE30..=0xFE6F).contains(&cp)
-        || (0xFF00..=0xFF60).contains(&cp)
-        || (0xFFE0..=0xFFE6).contains(&cp)
-        || (0x1F300..=0x1FAFF).contains(&cp);
+    let wide = matches!(
+        u32::from(c),
+        0x1100..=0x115F
+            | 0x2E80..=0xA4CF
+            | 0xAC00..=0xD7A3
+            | 0xF900..=0xFAFF
+            | 0xFE30..=0xFE6F
+            | 0xFF00..=0xFF60
+            | 0xFFE0..=0xFFE6
+            | 0x1F300..=0x1FAFF
+            // CJK 扩展 B–G
+            | 0x20000..=0x3FFFD
+            // BMP 里的宽 emoji（U+231A、U+23F0、U+2615、U+26A1、U+2705、U+274C、U+2B50 等）
+            | 0x231A..=0x231B | 0x2329..=0x232A | 0x23E9..=0x23EC | 0x23F0 | 0x23F3
+            | 0x25FD..=0x25FE | 0x2614..=0x2615 | 0x2648..=0x2653 | 0x267F | 0x2693
+            | 0x26A1 | 0x26AA..=0x26AB | 0x26BD..=0x26BE | 0x26C4..=0x26C5 | 0x26CE
+            | 0x26D4 | 0x26EA | 0x26F2..=0x26F3 | 0x26F5 | 0x26FA | 0x26FD
+            | 0x2705 | 0x270A..=0x270B | 0x2728 | 0x274C | 0x274E | 0x2753..=0x2755
+            | 0x2757 | 0x2795..=0x2797 | 0x27B0 | 0x27BF | 0x2B1B..=0x2B1C | 0x2B50
+            | 0x2B55
+            // U+1F300 以下的宽 emoji（U+1F004、U+1F0CF、U+1F18E、U+1F191–U+1F19A 与带框的汉字）
+            | 0x1F004 | 0x1F0CF | 0x1F18E | 0x1F191..=0x1F19A | 0x1F200..=0x1F202
+            | 0x1F210..=0x1F23B | 0x1F240..=0x1F248 | 0x1F250..=0x1F251
+            | 0x1F260..=0x1F265
+    );
     if wide {
         2
     } else {
@@ -245,7 +264,7 @@ fn char_budget(c: char) -> usize {
     char_width(c) + usize::from(AMBIGUOUS.contains(c))
 }
 
-/// 终端列宽：CJK 与全角标点按 2 列，其余（含 ★☆●○─…·✓✗▸）按 1 列，与真机（tmux）实测一致。
+/// 终端列宽：CJK、全角标点与宽 emoji 按 2 列，其余（含 ★☆●○─…·✓✗▸）按 1 列，与真机（tmux）实测一致。
 /// 只用来对齐；判断放不放得下用 [`budget_width`]。菜单只需要这个精度，不引 unicode-width。
 pub fn display_width(s: &str) -> usize {
     s.chars().map(char_width).sum()
@@ -264,21 +283,26 @@ pub fn line_limit(width: usize) -> usize {
 }
 
 /// 显示时要换成 `?` 的字符：C0 控制符、DEL、C1（含 ESC 与 U+0085），
-/// 双向覆盖符（U+202A–202E、U+2066–2069），零宽字符（U+200B–200F、U+FEFF）。
+/// 双向格式符（U+061C 阿拉伯字母标记、U+202A–202E、U+2066–2069），
+/// 零宽与不可见字符（U+200B–200F、U+2060–2064、U+FEFF），
+/// 行 / 段分隔符（U+2028–2029，有的终端当换行处理）。
 fn unsafe_for_display(c: char) -> bool {
     matches!(
         c,
         '\u{0}'..='\u{1f}'
             | '\u{7f}'..='\u{9f}'
+            | '\u{61c}'
             | '\u{200b}'..='\u{200f}'
+            | '\u{2028}'..='\u{2029}'
             | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}'
             | '\u{2066}'..='\u{2069}'
             | '\u{feff}'
     )
 }
 
 /// 外部来的文字（节点名、label、主机、日志、检测站返回的字段）渲染前先过这里，
-/// 控制字符、双向覆盖符、零宽字符一律换成 `?`：`render_*` 零 ANSI 对订阅来的数据也成立，
+/// 控制字符、双向格式符、零宽与不可见字符、行段分隔符一律换成 `?`：`render_*` 零 ANSI 对订阅来的数据也成立，
 /// 名字也没法伪装成别的节点诱导误删。先净化再截断；`profiles.json` 里的原值不动。
 /// 没有要换的字符时原样借出。
 pub fn sanitize(s: &str) -> Cow<'_, str> {
@@ -318,6 +342,8 @@ fn suffix_within(s: &str, budget: usize) -> &str {
 
 /// 尾部截断到容量口径 `max_budget` 列以内（按 [`budget_width`] 量，`…` 算 2 列）。
 ///
+/// 调用约定：`max_budget` 直接传这一段可用的容量预算（`line_limit` 减去同一行其它部分的 `budget_width`），`…` 的 2 列由函数自己扣。
+///
 /// 放得下就原样返回；放不下就从头逐字累加，给 `…` 留出 2 列，下一个字放不下就停：
 /// 不切半个字，所以结果可能比上限窄 1 列。上限连 `…` 都放不下时只留放得下的前缀，不补 `…`。
 /// 只管宽度，不净化，调用方先过 [`sanitize`]。
@@ -334,8 +360,11 @@ pub fn truncate_end(s: &str, max_budget: usize) -> String {
 /// 中间截断到容量口径 `max_budget` 列以内：节点名的区别常在尾部（v3 迁来的名字只差时间戳，
 /// 面板导入的名字开头都是同一个域名），两头都要留住。
 ///
+/// 调用约定：`max_budget` 直接传这一段可用的容量预算（`line_limit` 减去同一行其它部分的 `budget_width`），`…` 的 2 列由函数自己扣。
+///
 /// 扣掉 `…` 的 2 列后，头部约占 40%，尾部拿剩下的；尾部遇到宽字停早了，省下的列再还给头部。
-/// 放得下就原样返回；上限 < 5 时两头都留不下什么，退回 [`truncate_end`]。
+/// 放得下就原样返回；上限 < 5，或头部连一个字都放不下（开头是宽字、预算又小）时，
+/// 退回 [`truncate_end`]，不输出只剩尾巴的「…名字」。
 pub fn truncate_middle(s: &str, max_budget: usize) -> String {
     if budget_width(s) <= max_budget {
         return s.to_string();
@@ -348,6 +377,9 @@ pub fn truncate_middle(s: &str, max_budget: usize) -> String {
     let head = prefix_within(s, room * 2 / 5);
     let tail = suffix_within(s, room - budget_width(head));
     let head = prefix_within(s, room - budget_width(tail));
+    if head.is_empty() {
+        return truncate_end(s, max_budget);
+    }
     format!("{head}{ELLIPSIS}{tail}")
 }
 
@@ -698,7 +730,7 @@ mod tests {
         assert_eq!(display_width("中a★"), 4);
         assert_eq!(budget_width("中a★"), 5);
         assert_eq!(budget_width("→ [3]"), 6);
-        assert_eq!(budget_width("✓ 通"), 4); // ✓ 在 NARROW，不加
+        assert_eq!(budget_width("✓ 通"), 4); // ✓ 不在 AMBIGUOUS 里，不多算（budget_width 不查 NARROW）
     }
 
     #[test]
@@ -731,6 +763,85 @@ mod tests {
         );
         // 「示」2 列 +「…」按 2 = 4 ≤ 5；再加「例」就是 6 > 5，所以只留一个字
         assert_eq!(truncate_end("示例专用名", 5), "示…");
+    }
+
+    #[test]
+    fn truncation_outputs_are_pinned() {
+        // room = 20 − 2 = 18：头取 18×2/5 = 7 列，尾取 18 − 7 = 11 列
+        assert_eq!(
+            truncate_middle("rick-node.example-a.net-reality-direct", 20),
+            "rick-no…lity-direct"
+        );
+        // room = 7：头 7×2/5 = 2 列（示），尾 5 列（2住宅），合计 2 + 2 + 5 = 9
+        assert_eq!(truncate_middle("示例专用名-HY2住宅", 9), "示…2住宅");
+        // 上限连 … 都放不下：只留放得下的前缀，不补 …
+        assert_eq!(truncate_middle("abcdef", 1), "a");
+        // … 按 2 列刚好占满，前缀一个字都不剩
+        assert_eq!(truncate_end("abc", 2), "…");
+    }
+
+    #[test]
+    fn middle_truncation_falls_back_to_end_when_the_head_is_empty() {
+        // room = 3 / 4 时头部分到 1 列，放不下「示」：退回尾截断，不能输出「…字」「…名字」
+        assert_eq!(
+            truncate_middle("示例专用名字", 5),
+            truncate_end("示例专用名字", 5)
+        );
+        assert_eq!(
+            truncate_middle("示例专用名字", 6),
+            truncate_end("示例专用名字", 6)
+        );
+        assert_eq!(truncate_middle("示例专用名字", 6), "示例…");
+        // 任何预算下：不超上限；以 … 开头（头部丢光）只允许出现在与尾截断同值时
+        for s in [
+            "示例专用名字",
+            "示例专用名-HY2住宅",
+            "rick-node.example-a.net-reality-direct",
+            "★示例专用名★",
+        ] {
+            for max in 0..=24 {
+                let m = truncate_middle(s, max);
+                assert!(budget_width(&m) <= max, "{s} @ {max}: {m}");
+                if m.starts_with('…') {
+                    assert_eq!(m, truncate_end(s, max), "{s} @ {max}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sanitize_also_replaces_isolates_separators_and_invisible_marks() {
+        for c in [
+            '\u{7f}', '\u{61c}', '\u{2028}', '\u{2029}', '\u{2060}', '\u{2064}', '\u{2066}',
+            '\u{2067}', '\u{2068}', '\u{2069}', '\u{feff}',
+        ] {
+            assert_eq!(sanitize(&format!("a{c}b")), "a?b", "U+{:04X}", u32::from(c));
+        }
+        // 反例：不间断空格、连字符、窄不间断空格是正常排版字符，原样借出
+        let keep = "a\u{a0}b\u{2010}c\u{202f}d";
+        assert_eq!(sanitize(keep), keep);
+        assert!(matches!(sanitize(keep), std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn narrow_symbols_are_one_column_and_not_ambiguous() {
+        for c in NARROW.chars() {
+            assert!(!AMBIGUOUS.contains(c), "{c} 两张表都在");
+            assert_eq!(display_width(&c.to_string()), 1, "{c}");
+        }
+        // 歧义字符在真机上是 1 列，容量口径按 2 列：宽字表不能把它们收进去
+        for c in AMBIGUOUS.chars() {
+            assert_eq!(budget_width(&c.to_string()), 2, "{c}");
+        }
+    }
+
+    #[test]
+    fn wide_table_covers_cjk_extensions_and_wide_emoji() {
+        // U+2B50、U+2705 是 BMP 里的宽 emoji，U+20000 是 CJK 扩展 B；源码里只写转义，不写 emoji 字面量
+        assert_eq!(display_width("\u{2B50}\u{2705}\u{20000}"), 6);
+        assert_eq!(display_width("\u{1F004}\u{1F19A}\u{1F201}"), 6);
+        // ★ ✓ 仍按 1 列
+        assert_eq!(display_width("★✓"), 2);
     }
 
     #[test]
