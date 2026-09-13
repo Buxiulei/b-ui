@@ -10,7 +10,7 @@
 
 use crate::engine::Engine;
 use crate::net::Net;
-use crate::paths::{Paths, TUN_IFACE};
+use crate::paths::{Paths, TUN_IFACE, UNIT_MAIN};
 use crate::profiles::{
     default_split, profile_name, rfc3339, sanitize, Mode, Panel, Profile, Profiles, Source,
 };
@@ -34,6 +34,8 @@ pub struct Report {
     pub imported: Vec<String>,
     /// 解析失败的 v3 目录名
     pub skipped: Vec<String>,
+    /// v3 目录里的节点已经在 profiles 里（整个 `Node` 相同），这次原样跳过的 profile 名
+    pub existing: Vec<String>,
     pub active: Option<String>,
     pub removed_units: Vec<String>,
     pub ufw_restored: bool,
@@ -86,6 +88,8 @@ pub fn import<S: Sys>(sys: &S, base: &Path, prof: &mut Profiles) -> Result<Repor
     let mut r = Report::default();
     let v3_active = read_str(sys, &base.join("active")).unwrap_or_default();
     let mut active_ports: Option<(u16, u16)> = None;
+    // 面板候选值先攒着：一个新节点都没导入时连它都不能落（见函数尾部）
+    let mut pending_panel: Option<Panel> = None;
 
     for dir in sys.read_dir(&base.join("configs")).unwrap_or_default() {
         let dir_name = dir
@@ -111,6 +115,27 @@ pub fn import<S: Sys>(sys: &S, base: &Path, prof: &mut Profiles) -> Result<Repor
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or(serde_json::Value::Null);
         let user = user_from_label(&node.label);
+        if prof.panel.is_none() && pending_panel.is_none() {
+            if let Some(host) =
+                read_str(sys, &base.join("server_address")).filter(|h| !h.is_empty())
+            {
+                pending_panel = Some(Panel {
+                    base_url: format!("https://{host}"),
+                    username: user.clone(),
+                });
+            }
+        }
+        // 重跑幂等：同一个 `Node` 已经在 profiles 里就原样跳过——不新建、不改名。
+        // v3 的 `<base>/configs` 按约定保留着（`detect` 恒为真），少了这一步，
+        // 在已迁移的机器上按一次菜单 [7] 就多出一批 `-2` 重复节点。
+        if let Some(existing) = prof.find_by_node(&node) {
+            let name = existing.name.clone();
+            if dir_name == v3_active {
+                r.active = Some(name.clone());
+            }
+            r.existing.push(name);
+            continue;
+        }
         // profile 名沿用 v3 的目录名：用户在 v3 里就是拿它 `switch` 的，原地升级后
         // 名字不变，一眼认得出哪个是哪个。目录名 sanitize 后为空（全非 ASCII）才回落
         // 到 profile_name。free_name 对不冲突的名字原样返回。
@@ -127,16 +152,6 @@ pub fn import<S: Sys>(sys: &S, base: &Path, prof: &mut Profiles) -> Result<Repor
                 meta_u16(&meta, "http_port").unwrap_or(8080),
             ));
         }
-        if prof.panel.is_none() {
-            if let Some(host) =
-                read_str(sys, &base.join("server_address")).filter(|h| !h.is_empty())
-            {
-                prof.panel = Some(Panel {
-                    base_url: format!("https://{host}"),
-                    username: user.clone(),
-                });
-            }
-        }
         prof.upsert(Profile {
             name: name.clone(),
             node,
@@ -148,7 +163,15 @@ pub fn import<S: Sys>(sys: &S, base: &Path, prof: &mut Profiles) -> Result<Repor
     }
 
     if r.imported.is_empty() {
-        return Err(Error::msg(format!("{} 下没有可导入的节点", base.display())));
+        if r.existing.is_empty() {
+            return Err(Error::msg(format!("{} 下没有可导入的节点", base.display())));
+        }
+        // 一个新节点都没有 → `prof` 一个字段都不动（active / mode / 端口 / 面板）：
+        // 用户早就可能在 v4 里换过节点，重跑一次 import 不该把他拽回 v3 的选择。
+        return Ok(r);
+    }
+    if let Some(p) = pending_panel {
+        prof.panel = Some(p);
     }
     if let Some((s_port, h_port)) = active_ports {
         prof.socks_port = s_port;
@@ -186,8 +209,13 @@ pub fn teardown<S: Sys>(sys: &S, paths: &Paths, base: &Path) -> Result<Report> {
     }
     systemd::daemon_reload(sys)?;
     sys.remove_file(Path::new(V3_SYSCTL))?;
-    for iface in [TUN_IFACE, "hystun"] {
-        let _ = sys.run("ip", &["link", "delete", iface]);
+    // bui-tun 在 v4 里就是 `bui-c.service` 自己的接口：它在跑的时候删接口 = 断网，
+    // 而重跑 import 渲出的 config 字节不变不会触发重启，得等 bui-c.timer 一分钟后
+    // 的巡检才把接口救回来。只有 v4 数据面没在跑时，它才确实是 v3 的残留。
+    if !systemd::is_active(sys, UNIT_MAIN) {
+        for iface in [TUN_IFACE, "hystun"] {
+            let _ = sys.run("ip", &["link", "delete", iface]);
+        }
     }
     // v3 的 TUN 流程会 `ufw disable` 整墙；留下这个标记说明墙本来是开的
     let marker = base.join(".ufw_state");
@@ -227,6 +255,16 @@ pub fn run<S: Sys, N: Net>(
         )));
     }
     let mut r = import(sys, base, prof)?;
+    // 重跑幂等：新节点一个没有、v3 单元也一个不剩 → 无事可做，直接回。
+    // 继续往下是有害的：`ensure_kernel` / 自检 / 落盘全是空转，而 `teardown` 会去删
+    // bui-tun——那正是 v4 数据面正在用的接口。
+    let leftovers = V3_UNITS
+        .iter()
+        .chain(V3_AUX_UNITS.iter())
+        .any(|u| sys.exists(&paths.unit(u)));
+    if r.imported.is_empty() && !leftovers {
+        return Ok(r);
+    }
     if let Some(url) = &opts.panel {
         prof.panel = Some(Panel {
             base_url: url.trim().trim_end_matches('/').to_string(),
@@ -719,5 +757,152 @@ mod tests {
         let mut prof = Profiles::new_default();
         let r = import(&s, Path::new(V3_BASE), &mut prof).unwrap();
         assert_eq!(r.imported, vec!["alice-hy2-direct".to_string()]);
+    }
+
+    /// 重跑幂等（缺陷：`/opt/hysteria-client/configs` 按约定保留着，`detect` 恒为真，
+    /// 于是 baiyi 上按一次菜单 [7] 就多出五个 `-2` 重复节点，active 还被拽回 v3 的选择）。
+    #[test]
+    fn import_reports_existing_nodes_without_duplicating() {
+        let s = v3_machine();
+        let mut prof = Profiles::new_default();
+        let first = import(&s, Path::new(V3_BASE), &mut prof).unwrap();
+        assert_eq!(first.imported.len(), 2);
+        assert!(first.existing.is_empty(), "第一次全是新节点");
+
+        // 升级到 v4 之后用户自己换了节点、开了 TUN：重跑 import 不该把他拽回 v3 的选择
+        prof.active = Some("hysteria2-1757000000".to_string());
+        prof.mode = Mode::Tun;
+
+        let r = import(&s, Path::new(V3_BASE), &mut prof).unwrap();
+        assert!(r.imported.is_empty(), "一个新节点都没有：{:?}", r.imported);
+        assert_eq!(
+            r.existing,
+            vec![
+                "hysteria2-1757000000".to_string(),
+                "vless-1757000001".to_string()
+            ],
+            "按 profile 名报告已存在的节点，不改名、不新建"
+        );
+        assert_eq!(prof.profiles.len(), 2, "不该冒出 `-2` 后缀的重复条目");
+        assert_eq!(
+            prof.active.as_deref(),
+            Some("hysteria2-1757000000"),
+            "没导入任何新节点就不动 active"
+        );
+        assert_eq!(prof.mode, Mode::Tun, "没导入任何新节点就不动 mode");
+        assert_eq!(
+            (prof.socks_port, prof.http_port),
+            (11080, 18080),
+            "端口同理保持原样"
+        );
+    }
+
+    #[test]
+    fn run_twice_is_a_no_op_and_keeps_the_live_tun() {
+        let s = v3_machine();
+        s.put("/opt/bui-c/bin/sing-box", "ELF");
+        let n = FakeNet::new();
+        let mut prof = Profiles::new_default();
+        let first = run(
+            &s,
+            &n,
+            &paths(),
+            Path::new(V3_BASE),
+            &mut prof,
+            &RunOpts::default(),
+        )
+        .unwrap();
+        assert_eq!(first.imported.len(), 2);
+        let saved_before = s.get("/opt/bui-c/profiles.json").unwrap();
+
+        // v4 数据面已经起来了：bui-tun 这时是 bui-c.service 自己的接口
+        s.reply("systemctl is-active --quiet bui-c.service", 0, "");
+        let before = s.calls().len();
+
+        let r = run(
+            &s,
+            &n,
+            &paths(),
+            Path::new(V3_BASE),
+            &mut prof,
+            &RunOpts::default(),
+        )
+        .unwrap();
+        assert!(r.imported.is_empty(), "{:?}", r.imported);
+        assert_eq!(r.existing.len(), 2);
+        assert!(r.removed_units.is_empty(), "v3 单元上一轮就删干净了");
+
+        let second: Vec<String> = s.calls().into_iter().skip(before).collect();
+        for c in &second {
+            assert!(
+                !c.starts_with("ip link delete"),
+                "v4 在跑时删 bui-tun 就是断网：{second:?}"
+            );
+            assert!(!c.starts_with("systemctl stop"), "没东西可停：{second:?}");
+            assert!(
+                !c.contains("sing-box check"),
+                "无事可做就别自检：{second:?}"
+            );
+        }
+        assert_eq!(
+            s.get("/opt/bui-c/profiles.json").unwrap(),
+            saved_before,
+            "重跑不该改写 profiles.json"
+        );
+    }
+
+    #[test]
+    fn teardown_leaves_the_interface_alone_while_v4_is_running() {
+        let s = v3_machine();
+        s.reply("systemctl is-active --quiet bui-c.service", 0, "");
+        teardown(&s, &paths(), Path::new(V3_BASE)).unwrap();
+        assert!(
+            !s.called("ip link delete bui-tun"),
+            "bui-tun 这时归 v4 数据面：{:?}",
+            s.calls()
+        );
+        assert!(!s.called("ip link delete hystun"));
+
+        let s2 = v3_machine();
+        s2.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        teardown(&s2, &paths(), Path::new(V3_BASE)).unwrap();
+        assert!(s2.called("ip link delete bui-tun"), "v4 没跑就照旧清残留");
+        assert!(s2.called("ip link delete hystun"));
+    }
+
+    #[test]
+    fn partial_rerun_still_tears_down_leftover_units() {
+        let s = v3_machine();
+        s.put("/opt/bui-c/bin/sing-box", "ELF");
+        let n = FakeNet::new();
+        let mut prof = Profiles::new_default();
+        run(
+            &s,
+            &n,
+            &paths(),
+            Path::new(V3_BASE),
+            &mut prof,
+            &RunOpts::default(),
+        )
+        .unwrap();
+
+        // 模拟上一次卸载中途失败：单元文件又回来了（或压根没删掉）
+        s.put("/etc/systemd/system/bui-tun.service", "[Unit]");
+        let r = run(
+            &s,
+            &n,
+            &paths(),
+            Path::new(V3_BASE),
+            &mut prof,
+            &RunOpts::default(),
+        )
+        .unwrap();
+        assert!(r.imported.is_empty(), "{:?}", r.imported);
+        assert_eq!(r.existing.len(), 2);
+        assert_eq!(
+            r.removed_units,
+            vec!["bui-tun.service".to_string()],
+            "还有 v3 残留就仍旧走 teardown"
+        );
     }
 }

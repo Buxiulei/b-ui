@@ -545,11 +545,36 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
             if r.kernel_installed {
                 ctx.say("已安装 sing-box 内核");
             }
+            // v3 目录是回滚素材、按约定留着，所以这条命令（菜单 [7]）在已迁移的机器上
+            // 随时可能被再按一次。没有新节点就没什么要 apply 的：省掉 ufw/engine 那趟
+            // 往返，也就不会出现「配置字节不变→不重启」的窗口。
+            if r.imported.is_empty() {
+                let tail = if r.removed_units.is_empty() {
+                    "未做任何改动".to_string()
+                } else {
+                    format!("清掉 {} 个残留的 v3 单元", r.removed_units.len())
+                };
+                ctx.say(format!(
+                    "v3 的 {} 个节点都已导入过（{}），{tail}",
+                    r.existing.len(),
+                    r.existing.join("、")
+                ));
+                for s in &r.skipped {
+                    ctx.say(format!("跳过：{s}"));
+                }
+                if r.ufw_restored {
+                    ctx.say("已恢复被 v3 关掉的 UFW");
+                }
+                return Ok(());
+            }
             ctx.say(format!(
                 "导入 {} 个节点，卸载 {} 个旧单元",
                 r.imported.len(),
                 r.removed_units.len()
             ));
+            if !r.existing.is_empty() {
+                ctx.say(format!("{} 个已存在，跳过", r.existing.len()));
+            }
             for s in &r.skipped {
                 ctx.say(format!("跳过：{s}"));
             }
@@ -1168,6 +1193,49 @@ mod tests {
         assert!(s.called("systemctl stop hysteria-client.service"));
         assert!(s.exists(std::path::Path::new("/opt/bui-c/config.json")));
         assert!(ctx.out.contains("导入 1 个节点"));
+    }
+
+    /// 菜单 [7] 在已迁移的机器上被再按一次：v3 目录按约定保留着，`detect` 恒为真。
+    #[test]
+    fn import_v3_second_run_reports_already_imported_and_does_not_apply() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        s.put(
+            "/opt/hysteria-client/configs/hysteria2-1/uri.txt",
+            "hysteria2://alice:hy2-pw@panel.example.com:10000/?sni=panel.example.com&mport=20000-30000#alice-HY2%E7%9B%B4%E8%BF%9E",
+        );
+        s.put(
+            "/opt/hysteria-client/configs/hysteria2-1/meta.json",
+            r#"{"socks_port":1080,"http_port":8080}"#,
+        );
+        s.put("/opt/hysteria-client/active", "hysteria2-1");
+        let n = FakeNet::new();
+
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["import-v3"]), &mut ctx).unwrap();
+        let after_first = Profiles::load(&s, &pp).unwrap();
+        let before = s.calls().len();
+
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["import-v3"]), &mut ctx).unwrap();
+        assert!(ctx.out.contains("已导入过"), "{}", ctx.out);
+        let second: Vec<String> = s.calls().into_iter().skip(before).collect();
+        for c in &second {
+            assert!(
+                !c.starts_with("systemctl restart") && !c.starts_with("systemctl enable"),
+                "无事可做就不该走 apply_with_ufw：{second:?}"
+            );
+        }
+        let after_second = Profiles::load(&s, &pp).unwrap();
+        assert_eq!(
+            after_second.profiles.len(),
+            after_first.profiles.len(),
+            "不该冒出重复节点"
+        );
+        assert_eq!(after_second, after_first, "profiles.json 一个字段都不该动");
     }
 
     #[test]
