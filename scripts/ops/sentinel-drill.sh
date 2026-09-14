@@ -15,11 +15,15 @@
 # 【--all-ports：整网关不可用】把池里**所有**上游的端口一起丢包（同一网关的每个端口 = 每个出口 IP
 # 全挂）。这是修完「借用后带外验证」之后最慢的一条路：哨兵会逐个候选 PUT + 快探，全不通才收尾，
 # 判据改成四条：
-#   ①' 首条 relay 错误 → 事件 ≤ DRILL_NOEXIT_SLA（25）秒。比 15 秒宽是因为这条路上要多等
-#     BORROW_MAX_TRIES（2）个候选各一次「PUT + 网关 TCP 快探 ≤3 秒」：轮询 ≤2 + 原上游快探 ≤3
-#     + 2 ×（PUT ≤2 + 快探 ≤3）+ 收尾 PUT ≤2 ≈ 17 秒，留出等第 2 条错误的余量取 25
+#   ①' 首条 relay 错误 → 事件 ≤ DRILL_NOEXIT_SLA（25）秒。比 15 秒宽是因为这条路上要把验证预算
+#     花完：轮询 ≤2 + 原上游快探 ≤3 + BORROW_PROBES_PER_CALL（3）×（Clash PUT + 单次验证
+#     ≤ BORROW_VERIFY_BUDGET_SECS 4 秒）+ 收尾 PUT ≈ ≤18 秒，留出等第 2 条错误的余量取 25。
+#     验证的 4 秒是**整体**时限：网关连不上 ≤3 秒就返回，网关活着、隧道卡住时由代码里的
+#     timeout 兜住（本脚本的丢包只造得出前一种，量不到后一种）
 #   ②' 事件文案说「无可用出口」且**指明终态指向本槽 IP**，绝不出现「已临时切到」（选择器不许停在
-#     一条我们自己刚验证过是死路的上游上）
+#     一条我们自己刚验证过是死路的上游上）。**前置**：池里的上游条数要 ≤ 验证预算 + 1，否则哨兵
+#     会合法地停在一条没探过的候选上、报「未确认」，判据②'③' 量的不是那条路 —— 脚本按
+#     DRILL_PROBES_PER_CALL 自查，超了就 FATAL（不是缺陷，换单端口模式即可）
 #   ③' `bui residential slots --json` 里该槽的当前出口（active_upstream_id = runtime 的
 #     current_upstream_id）== 本槽自己的上游、borrowed=false
 #   ④' 删掉丢包规则后，巡检在 DRILL_BACK_WAIT 内让该槽出口恢复正常（回环出网 IP 回到演练前那个）
@@ -46,8 +50,11 @@ CURL=${CURL:-curl}
 JOURNALCTL=${JOURNALCTL:-journalctl}
 GETENT=${GETENT:-getent}
 DETECT_SLA=${DRILL_DETECT_SLA:-15}
-# 「无可用出口」那条路多等 2 个候选的「PUT + 快探」，算式见文件头 ①'
+# 「无可用出口」那条路要把验证预算花完，算式见文件头 ①'
 NOEXIT_SLA=${DRILL_NOEXIT_SLA:-25}
+# 哨兵单次借用调用的验证预算（= `slots::BORROW_PROBES_PER_CALL`）：--all-ports 的判据②'③'
+# 只在「候选探得完」时成立，见文件头 ②'
+PROBES_PER_CALL=${DRILL_PROBES_PER_CALL:-3}
 DETECT_WAIT=${DRILL_DETECT_WAIT:-90}
 BACK_WAIT=${DRILL_BACK_WAIT:-660}
 POLL=${DRILL_POLL:-2}
@@ -201,6 +208,9 @@ run_drill() {
   slots=$("$BUI" residential slots --json 2>/dev/null) || fatal "bui residential slots --json 失败（守护进程在跑吗？）"
   n=$(slot_count "$slots")
   [[ "$n" -ge 2 ]] || fatal "至少要 2 个槽才有别的 IP 可借（实有 $n）"
+  if ((ALL_PORTS)) && ((n - 1 > PROBES_PER_CALL)); then
+    fatal "池里 $n 条上游 ⇒ 该槽有 $((n - 1)) 个候选，超过哨兵单次调用的验证预算 $PROBES_PER_CALL（slots::BORROW_PROBES_PER_CALL）：全池不通时哨兵会合法地停在一条没探过的候选上并报「未确认」，判据②'③' 量的不是那条路、会误报 FAIL。改用缺省的单端口模式，或按改过的常量设 DRILL_PROBES_PER_CALL"
+  fi
   own_id=$(slot_field "$slots" "$SLOT" upstream_id)
   [[ -n "$own_id" ]] || fatal "槽 $SLOT 不存在"
   [[ "$(slot_field "$slots" "$SLOT" pinned)" != "true" ]] || fatal "槽 $SLOT 被手动 pin，哨兵按设计不动它；先 bui residential slot-pin $SLOT --auto"
@@ -409,7 +419,7 @@ case "$1 $2" in
       e=$(head -n1 "$S/journal" | awk '{printf "%d", $1}')
       date -u -d "@$((e + ${FAKE_DELAY:-3}))" +%FT%TZ >"$S/incident"
       if all_ports; then
-        printf '%s' 'IP 198.51.100.8 不可达，槽 1：候选 198.51.100.7 均不可达，已放回本槽 IP 198.51.100.8，当前无可用出口' >"$S/result"
+        printf '%s' 'IP 198.51.100.8 不可达，槽 1：候选 198.51.100.7 探不通，当前指向本槽 IP 198.51.100.8，当前无可用出口' >"$S/result"
       else
         printf '%s' 'IP 198.51.100.8 不可达，槽 1 已临时切到 198.51.100.9' >"$S/result"
         touch "$S/borrowed"
@@ -510,6 +520,14 @@ self_test() {
   # 修复前那个缺陷的回归位：全池不通却报「已临时切到」⇒ 判据② 必须 FAIL
   out=$(scenario FAKE_BORROW_ANYWAY=1 -- --all-ports)
   check "FAIL 判据② 全池不通却报「已临时切到」" "$out" "判据② 无出口模式失败分支：谎报借用成功"
+
+  # 候选比验证预算还多：判据②'③' 量不到那条路 ⇒ 开跑前 FATAL，一条规则都不插
+  out=$(scenario DRILL_PROBES_PER_CALL=0 -- --all-ports)
+  rc=$?
+  check "FATAL 池里 2 条上游" "$out" "无出口模式前置：候选多于验证预算 ⇒ FATAL"
+  check "rc=2" "rc=$rc" "候选多于验证预算：退出码 2"
+  check "rules=0" "rules=$(grep -c . "$ST_DIR/rules" 2>/dev/null || echo 0)" \
+    "候选多于验证预算：一条丢包规则都没插"
 
   # trap 兜底：演练卡在等事件时被 TERM 杀掉，规则也必须删干净
   rm -f "$ST_DIR/rules" "$ST_DIR/journal" "$ST_DIR/incident" "$ST_DIR/borrowed" \
