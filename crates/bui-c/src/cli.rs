@@ -1217,9 +1217,10 @@ fn run_check<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()
             }
         }
         // 锁被占着（或拿到锁时节点设置已经变了）：这一轮什么都不做，自更新也等下一轮，
-        // 不写 runtime.json（spec §8.3）
+        // 不写 runtime.json（spec §8.3）。`Verdict::Busy` 不分这两种，这一行两种都要说得对：
+        // 只说「另一个操作进行中」会和 check::run 那条「节点设置被改过」的日志打架
         Verdict::Busy => {
-            ctx.say("另一个 bui-c 操作进行中，本轮巡检跳过");
+            ctx.say("另一个 bui-c 操作进行中或节点设置刚改过，本轮巡检跳过");
             return Ok(());
         }
         Verdict::Waiting {
@@ -1463,13 +1464,20 @@ const LOCK_BUSY: &str = "另一个 bui-c 操作还没结束，这次什么都没
 /// 只在动作的入口拿：拿到的 [`LockGuard`] 按引用递给改机器的函数，它们自己绝不拿锁，
 /// 持锁期间也绝不提问（持着锁等人，timer 就跳过一分钟，另一个会话也卡住）。
 fn take_lock<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<LockGuard> {
+    wait_for_lock(ctx)?.ok_or_else(|| Error::msg(LOCK_BUSY))
+}
+
+/// [`take_lock`] 的底层：15 秒还拿不到返回 `Ok(None)`，由调用方决定怎么说。删除要把「等不到」
+/// 与打开锁文件出错分开报：前者的「上次：」行用 [`delete::LOCK_BUSY_SHORT`]。
+fn wait_for_lock<S: Sys, N: Net, P: Prompt>(
+    ctx: &mut Ctx<'_, S, N, P>,
+) -> Result<Option<LockGuard>> {
     if let Some(g) = lock::acquire(ctx.sys, ctx.paths, lock::How::Once)? {
-        return Ok(g);
+        return Ok(Some(g));
     }
     tell(ctx, LOCK_WAITING);
     ctx.flush();
-    lock::acquire(ctx.sys, ctx.paths, lock::How::Wait(LOCK_WAIT))?
-        .ok_or_else(|| Error::msg(LOCK_BUSY))
+    lock::acquire(ctx.sys, ctx.paths, lock::How::Wait(LOCK_WAIT))
 }
 
 /// 拿锁（[`take_lock`]）、在锁里跑 `f`、`f` 返回就放锁。`f` 里绝不提问。
@@ -1607,8 +1615,28 @@ fn delete_nodes<S: Sys, N: Net, P: Prompt>(
         }
     }
 
-    // ② 拿锁：从这里到放锁之间绝不提问（spec §8.3）
-    let g = take_lock(ctx)?;
+    // ② 拿锁：从这里到放锁之间绝不提问（spec §8.3）。等不到也走停顿页：裸 `?` 冒到
+    // `delete_menu` 只剩「在等」那一句加回车，「上次：」行在 40 列又截掉「稍后再试」
+    let g = match wait_for_lock(ctx) {
+        Ok(Some(g)) => g,
+        Ok(None) => {
+            return Err(delete_failed(
+                ctx,
+                &format!("删除没做：{LOCK_BUSY}"),
+                &[delete::STILL_THERE.to_string()],
+                delete::LOCK_BUSY_SHORT.to_string(),
+            ))
+        }
+        // 打不开锁文件（EACCES、IO）：页上给原因，摘要照旧是原因本身
+        Err(e) => {
+            return Err(delete_failed(
+                ctx,
+                &format!("删除没做：{e}"),
+                &[delete::STILL_THERE.to_string()],
+                e.to_string(),
+            ))
+        }
+    };
 
     // ③ 重读并比对快照：菜单上的编号对应的是屏幕上那一刻的列表
     let old = Profiles::load(ctx.sys, ctx.paths)?;
@@ -9753,7 +9781,8 @@ mod tests {
         let before = restarts(&s);
         let (rc, err) = busy(&s, &["delete", ACTIVE, "-y"], &[]);
         assert_eq!(rc, std::process::ExitCode::FAILURE);
-        assert!(err.contains("什么都没改"), "{err}");
+        // 删除的失败摘要一律是短式（stdout 上另有整句的失败页）：可操作的那半要在
+        assert!(err.contains("稍后再试"), "{err}");
         assert_eq!(names(&s, &pp).len(), 9);
         assert_eq!(restarts(&s), before);
     }
@@ -9778,6 +9807,62 @@ mod tests {
                 .any(|l| l.starts_with("  上次：失败：") && l.contains("稍后再试")),
             "「上次：」行要写明没做成、下一步是什么：\n{}",
             r.t
+        );
+    }
+
+    /// T12a 审查 I1：[6] 确认之后锁等不到。停顿页要写明这次没删、稍后再试（不能只剩「在等」
+    /// 那一句加回车），「上次：」行在 40 列用短式，可操作的那半不被截掉；节点、配置、服务都没动。
+    #[test]
+    fn a_busy_lock_in_the_delete_menu_pauses_with_the_reason_and_deletes_nothing() {
+        let pp = paths();
+        let (s, n) = (FakeSys::new(), FakeNet::new());
+        s.set_term_size(Some((40, 24)));
+        nine_nodes(&s, &pp, Mode::Socks);
+        let config = s.get("/opt/bui-c/config.json").unwrap();
+        let writes = s.writes("/opt/bui-c/profiles.json");
+        let before = restarts(&s);
+        s.lock_busy(u32::MAX);
+        // 删当前节点（Switch 形态），输 yes，锁等满 15 秒 → 停一次 → 回主菜单退出
+        let r = run_menu(&s, &n, &pp, &["6", "2", "yes", "", "0"], true);
+
+        // 终态：9 个节点都在、当前节点与 config.json 不变、没重启、profiles.json 一次都没写
+        assert_eq!(names(&s, &pp).len(), 9, "{}", r.t);
+        assert_eq!(
+            Profiles::load(&s, &pp).unwrap().active.as_deref(),
+            Some(ACTIVE),
+            "{}",
+            r.t
+        );
+        assert_eq!(s.get("/opt/bui-c/config.json").unwrap(), config);
+        assert_eq!(restarts(&s), before, "{}", r.t);
+        assert_eq!(s.writes("/opt/bui-c/profiles.json"), writes);
+        assert!(!s.called("lock"), "一直没拿到锁：{:?}", s.calls());
+        assert_eq!(pauses(&r.asked), 1, "{:?}", r.asked);
+
+        // 停顿页：「在等」那一句之后、回主菜单重画之前，要有一行说「稍后再试」，逐行不超 39 列
+        let wait = r.t.find("等它结束").unwrap_or_else(|| panic!("{}", r.t));
+        let page = &r.t[wait..];
+        let page = &page[..page.find("B-UI 客户端").unwrap_or(page.len())];
+        assert!(
+            page.lines().any(|l| l.contains("稍后再试")),
+            "停顿页没说这次没做成、下一步是什么：\n{page}"
+        );
+        for l in page.lines() {
+            assert!(
+                menu::budget_width(l) <= menu::line_limit(40),
+                "{l:?} = {}",
+                menu::budget_width(l)
+            );
+        }
+        // 「上次：」行：40 列下「稍后再试」完整留着，没有被尾截
+        let last =
+            r.t.lines()
+                .rev()
+                .find(|l| l.starts_with("  上次："))
+                .unwrap_or_else(|| panic!("{}", r.t));
+        assert!(
+            last.contains("稍后再试") && !last.ends_with('\u{2026}'),
+            "{last:?}"
         );
     }
 
@@ -9847,6 +9932,25 @@ mod tests {
             "锁被占着的这一轮不自更新：{:?}",
             n.log()
         );
+
+        // 拿到了锁、但节点设置在探测之后被改过（T12a 审查 M2）：同样跳过，journal 里那一行
+        // 不能只说「另一个 bui-c 操作进行中」——这时根本没有别的操作在跑
+        let s = FakeSys::new();
+        ready(&s);
+        s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        prof.save(&s, &pp).unwrap();
+        let mut moved = prof.clone();
+        moved.http_port += 1;
+        let moved = String::from_utf8(serde_json::to_vec_pretty(&moved).unwrap()).unwrap();
+        s.stage_on_lock("/opt/bui-c/profiles.json", &moved);
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["check"]), &mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert!(s.called("lock"), "{:?}", s.calls());
+        assert!(!s.called("systemctl restart bui-c.service"), "{t}");
+        assert!(t.contains("本轮巡检跳过"), "{t}");
+        assert!(t.contains("节点设置刚改过"), "{t}");
     }
 
     #[test]

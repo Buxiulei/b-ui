@@ -56,7 +56,7 @@
 - **屏幕流程**：交互终端里每次回主菜单、进子页前都清屏（`ESC[H ESC[2J`，保留回滚），清屏序列不进 `ctx.transcript`。一行结果放进主菜单底部的「上次：」行，不停顿；报告、日志、失败要看完回车。主菜单输错原地重问，不再重画。
 - **窄屏**：进程内用 `ioctl(TIOCGWINSZ)` 取 stdout 列数，拿不到回落 80，且不清屏；每次重画前重新取。行宽上限 = `max(W,40) − 1`。节点名中间截断，其余尾部截断，都按显示宽度截、不切半个字、加 `…`。W ≥ 50 用标准版式，40 ≤ W < 50 用窄版式。放不放得下按「容量口径」判断：歧义字符（★●○─…·）按 2 列算，这样在把它们画成 2 列的手机客户端上也不折行（D17）；标题条缩短成 `  ── B-UI 客户端 v4.0.0 ──`。60 列下 baiyi 的 9 个节点、任一节点当活动节点都不折行；40 列下编号、完整或中间截断的名字、能不能操作都清楚。
 - **范围**：P0 = 删除（菜单 + CLI）、连接检查达到 v3.6.2、清屏与「上次」行、宽度自适应、主菜单重排、更新先确认、**进程锁与中断收敛**。P1 本轮做 = 卸载清单、节点测速（跨 crate）、巡检失败行、`bui-c test`；P1 不做 = 切换后自检。
-- **依赖**：不改根 `Cargo.toml`、不改 `Cargo.lock`、不引新依赖。锁用 `nix::fcntl::Flock`，终端宽度用 `nix::libc::ioctl`，两者在现有 `features = ["user"]` 下都能用（r1 §8.4/§8.5）。测速的孤儿进程靠 coreutils 的 `timeout`，不加 unsafe。
+- **依赖**：不改根 `Cargo.toml`、不改 `Cargo.lock`、不引新依赖。锁用 `nix::fcntl::Flock`，它在 nix 的 `fs` 特性后面：只在 `crates/bui-c/Cargo.toml` 给 nix 加 `features = ["fs"]`（T12a 调研：单独构建 bui-c 时不加就是 E0432，整个 workspace 一起构建时靠 `bui` 开的 `fs` 统一才「看起来能编过」）；终端宽度用 `nix::libc::ioctl`，`libc` 是无条件重导出，现有 `features = ["user"]` 就够（r1 §8.4/§8.5）。测速的孤儿进程靠 coreutils 的 `timeout`，不加 unsafe。
 - **任务**：19 个 commit（P0 12 个，P1 6 个，收尾文档 1 个），另有 1 个 P1 本轮不做，留在表末，见 §13。
 
 ## 0.2 审查后定稿修订（优先于正文与屏幕稿）
@@ -79,7 +79,7 @@
 - **顺序**：确认 → `update::ensure_kernel`（**锁外**，只在 Switch 形态且内核缺失时联网）→ 拿锁 → 重读并比对快照 → 锁内重算 plan → `Engine::preflight`（只做三件事：清残留的 `.config.json.new`、render、verify；`Engine` 没有 `Net`，不装内核；进锁后内核仍缺就报 `内核缺失` 并中止）→ 写 pending → 数据面 → 写 `profiles.json`（含墓碑）→ 删 pending → 放锁。[实现] [清单]
 - **pending 挪到单独文件 `/opt/bui-c/pending.json`（0600）**，只在持锁时写和删；不放 `runtime.json`，因为巡检在锁外对 `runtime.json` 读改写，会把它写丢。收敛的触发条件：`pending.json` 存在；或 profiles 为空，但单元文件 / `config.json` 还在（→ teardown）；或有活动节点，但主单元文件 / `config.json` 不在（→ apply）。§9 表里的 `runtime.pending` 作废。[实现]
 - **菜单进程一开头就设 `ctx.yes = false`**：`dispatch` 读的是 `ctx.yes`，不是子 `Cli` 的 `yes`，所以 D11 原来的修法不生效；`run_sub` 构造 `yes: false` 保留，但它不是修复本身。测试：`Cli { yes: true }` 进菜单，按 8 再答空行，断言没有卸载。[实现]
-- **锁的分层**：新文件 `lock.rs` 放 `pub fn acquire<S: Sys>(sys, path, How) -> Result<Option<Lock>>`（`How::Wait(Duration)` / `How::Once`），check、nettest、cli 都用它；`cli::with_lock` 包在外面，负责提示与可重入（`Ctx.locked`）。`check::run_with` 拆成 `assess()`（锁外探测）与 `restart_locked(&Lock)`，等 TUN 就绪在同一把锁里。`nettest::run` 接收 `trait Hooks { fn event(&mut self, Event); fn repair(&mut self) -> Result<Verdict>; }`，由 cli 实现（repair 里拿锁）。`Lock` 持一个 `Box<dyn FnOnce()>`（真机里闭包持有 `Flock<File>`，FakeSys 里记 `unlock`）；`FakeSys.calls` 改成 `Rc<RefCell<Vec<String>>>`。[实现]
+- **锁的分层**：新文件 `lock.rs` 放 `pub fn acquire<S: Sys>(sys, path, How) -> Result<Option<Lock>>`（`How::Wait(Duration)` / `How::Once`），check、nettest、cli 都用它；`cli::with_lock` 包在外面，负责提示（可重入与 `Ctx.locked` 已被 R11 覆盖：改用 `LockGuard`，没有可重入）。`check::run_with` 拆成 probe（锁外探测）/ decide / `restart(&LockGuard)`（名字以 R11 为准），等 TUN 就绪在同一把锁里。`nettest::run` 接收 `trait Hooks { fn event(&mut self, Event); fn repair(&mut self, wait_ready: &mut dyn FnMut()) -> Result<Verdict>; }`，由 cli 实现：repair 里拿锁，真的重启了就在同一把锁里调 `wait_ready` 等就绪再放锁，`run` 自己不再等（T12a 按派发单 D 的第二种做法定下）。`Lock` 持一个 `Box<dyn FnOnce()>`（真机里闭包持有 `Flock<File>`，FakeSys 里记 `unlock`）；`FakeSys.calls` 改成 `Rc<RefCell<Vec<String>>>`。[实现]
 - [7] → [1] 检查更新：fetch（下载与校验）在锁外，install（替换与 restart）在锁内。以 §8.3 为准，§8.1 第 5 步里的「拿锁 → `update::run(false)`」作废。[实现]
 
 ### R3 连接检查 [5]
@@ -2156,7 +2156,7 @@ fn probe(&self, url: &str, via: Via, timeout: Duration) -> std::result::Result<P
 
 d1 原稿把锁放在 P1，还写了「砍掉 T12：删除逻辑本身不受影响」。j-risk 判为致命：没有锁时，teardown 的 stop 与删单元之间如果撞上巡检，巡检读到的仍是旧的活动节点，探测一失败就 `systemctl restart` 把单元拉起来；随后删单元文件、daemon-reload 并不会停掉这个进程，被删的节点会在 TUN 下承载全机流量，直到重启机器。所以锁提到 P0（D7）。
 
-- **实现**：`Sys::try_lock(&self, path: &Path) -> Result<Option<Lock>>`。RealSys 用 `OpenOptions::new().create(true).write(true).mode(0o600).custom_flags(O_NOFOLLOW).open(path)` 打开（保留 std 默认的 `O_CLOEXEC`，免得测速子进程继承锁 fd），再 `nix::fcntl::Flock::lock(file, FlockArg::LockExclusiveNonblock)`；`EWOULDBLOCK` 返回 `Ok(None)`。拿到后比对 fd 与路径的 inode，不一样就重开一次（来自 d3-lite §3）。`Lock` 里持有 `Flock<File>`，`Drop`（关掉 fd）就释放；进程死了由内核释放，不会留下死锁。现有 `features = ["user"]` 就能用，不改任何 Cargo 文件（r1 §8.4）。不是 root 时打开会报 EACCES，报「需要 root：用 sudo bui-c」。
+- **实现**：`Sys::try_lock(&self, path: &Path) -> Result<Option<Lock>>`。RealSys 用 `OpenOptions::new().create(true).write(true).mode(0o600).custom_flags(O_NOFOLLOW).open(path)` 打开（保留 std 默认的 `O_CLOEXEC`，免得测速子进程继承锁 fd），再 `nix::fcntl::Flock::lock(file, FlockArg::LockExclusiveNonblock)`；`EWOULDBLOCK` 返回 `Ok(None)`。拿到后比对 fd 与路径的 inode，不一样就重开一次（来自 d3-lite §3）。`LockGuard`（§0.2 R11）里持有 `Flock<File>`，`Drop` 显式 unlock 就释放；进程死了由内核释放，不会留下死锁。`Flock` 在 nix 的 `fs` 特性后面：`crates/bui-c/Cargo.toml` 给 nix 加 `features = ["fs"]`，根 `Cargo.toml` 与 `Cargo.lock` 不动（T12a 调研更正了 r1 §8.4「现有 `features = ["user"]` 就能用」）。不是 root 时打开会报 EACCES，报「需要 root：用 sudo bui-c」。
 - **锁文件放 `/run/bui-c.lock`**（`Paths::lock()`；`Paths` 加 `run_dir`，默认 `/run`，测试里指向临时目录）。不放 d1 原稿的 `/opt/bui-c/bui-c.lock`：`uninstall::run` 会删掉整个 `/opt/bui-c`（`uninstall.rs:40-43`），这时等锁的进程锁住的是已被删除的 inode，后来的进程又新建一个同名文件，两把锁互不排斥（d3-lite §3）。`/run` 是 tmpfs，重启就清空。
 - **FakeSys**：`lock_busy: Cell<u32>`，前 n 次返回 `None`，`u32::MAX` 表示一直被占；拿到锁往 `calls()` 记 `lock`，`Lock` 的 Drop 记 `unlock`。测试断言顺序 `lock < ip link delete bui-tun < systemctl restart < unlock`；假 `sleep` 让 15 秒的等待瞬间跑完。
 - **谁拿锁、怎么拿**：
@@ -2165,12 +2165,12 @@ d1 原稿把锁放在 P1，还写了「砍掉 T12：删除逻辑本身不受影�
 |---|---|
 | 菜单里所有会写 `profiles.json`、apply、重启或 teardown 的动作：[1] 切换、[2] 切模式、[3] 导入、[4] 重启、[5] 的修复与「再查一次」、[6] 删除、[7] 里的更新 / 自动更新开关 / 从 v3 导入、[8] 卸载、[9] 的两个动作，以及进菜单时的收敛（§5.5） | **等**：每 250ms 试一次，最多 15 秒。第一次没拿到就打一行 `另一个 bui-c 操作正在进行，等它结束（最多 15 秒）…` 并 flush；15 秒还拿不到：`Pause("另一个 bui-c 操作还没结束，这次什么都没改，稍后再试")` |
 | 命令行 `switch / mode / import / delete / update / import-v3 / uninstall` | 同上，等 15 秒，拿不到退出码 1 |
-| timer 的 `bui-c check` | 探测与下载**不持锁**；只有 restart（含等 TUN 就绪）、替换二进制与装内核、收敛这几段持锁。**只试一次**：拿不到返回新的 `Verdict::Busy`，日志记一行 `另一个 bui-c 操作进行中，本轮巡检跳过`，退出码 0，不写 runtime.json、不动 `fail_streak`。拿到锁以后重读 `profiles.json`，活动节点和探测时不一样，或者已经没有节点，就放锁跳过（§5.9） |
+| timer 的 `bui-c check` | 探测与下载**不持锁**；只有 restart（含等 TUN 就绪）、替换二进制与装内核、收敛这几段持锁。**只试一次**：拿不到返回新的 `Verdict::Busy`，日志记一行 `另一个 bui-c 操作进行中或节点设置刚改过，本轮巡检跳过`（下面「拿到锁以后快照变了」也返回 `Busy`，这一行两种都要说得对），退出码 0，不写 runtime.json、不动 `fail_streak`。拿到锁以后重读 `profiles.json`，活动节点和探测时不一样，或者已经没有节点，就放锁跳过（§5.9） |
 | `status`、`list`、菜单画屏、[5] 的只读项、[9] 测速本身、`bui-c test` | 不拿 |
 
 - **update 拆成两段**（j-risk 必修②、d3-lite §3）：`update::fetch(...) -> Staged` 负责取 manifest，并把要换的 bui-c 与内核下载、校验到内存，不持锁；`update::install(staged)` 负责替换自身、写内核，单元文件在**并且**有活动节点时才 restart（D16），这一段持锁。`update::run` = fetch + install，保留 500c786 的比对口径，CLI 与菜单只在 install 那一段拿锁。这样巡检不会拿着锁等最长 120 秒的下载，菜单也就不会等锁超时。
 - **什么时候拿**：用户确认之后、读 `profiles.json` 之前。持锁期间不等人输入：否则人想一分钟，timer 就跳过一分钟，第二个会话也会卡住。
-- **可重入**：`Ctx.locked: bool`，`with_lock(ctx, f)` 发现这个 ctx 已经持锁，就直接执行 `f`。菜单里嵌套调用 `dispatch(sub_cli)` 的地方（比如导入后追问切换）不会把自己锁死：flock 按「打开的文件」计，同一进程再 open 一次再 flock 会被自己挡住。d3-lite 建议改用不可 Clone 的 `LockGuard` 类型参数，在编译期堵住嵌套。不采用：要改所有会改机器的函数签名，j-risk 与 j-eng 都认可可重入的做法。
+- **可重入**（**已被 §0.2 R11 覆盖，不再适用**：改用不可 Clone 的 `LockGuard`，删掉 `Ctx.locked` 与可重入，只有顶层入口拿锁；下面是原稿，留作来由）：`Ctx.locked: bool`，`with_lock(ctx, f)` 发现这个 ctx 已经持锁，就直接执行 `f`。菜单里嵌套调用 `dispatch(sub_cli)` 的地方（比如导入后追问切换）不会把自己锁死：flock 按「打开的文件」计，同一进程再 open 一次再 flock 会被自己挡住。d3-lite 建议改用不可 Clone 的 `LockGuard` 类型参数，在编译期堵住嵌套。不采用：要改所有会改机器的函数签名，j-risk 与 j-eng 都认可可重入的做法。
 - **持锁上界**：删除或切换约 6–8 秒（含 `wait_tun_ready` ≤ 5 秒，`engine.rs:155`）；巡检 restart 段 ≤ 5 秒 + 等 TUN 5 秒；update install 段就是写几十 MB 到磁盘，几秒。15 秒的等待覆盖得住这些正常操作。首次导入要下载内核时会持锁更久，但那是新机器，不会有第二个会话。
 
 ### 8.4 v4 的 [7] 从 v3 导入、[9] 自动更新：不删，挪进 [7] 子页
@@ -2225,12 +2225,12 @@ d1 原稿里的 `/opt/bui-c/profiles.json.bak`（D8）和 `/opt/bui-c/bui-c.lock
 // sys.rs —— Sys
 fn term_width(&self) -> Option<u16>;                          // P0：ioctl(TIOCGWINSZ) 查 stdout
 fn tcp_listening(&self, port: u16) -> bool;                   // P0：连 127.0.0.1:port，200ms
-fn try_lock(&self, path: &Path) -> Result<Option<Lock>>;      // P0（T12）：flock 非阻塞，O_NOFOLLOW，比对 inode
+fn try_lock(&self, path: &Path) -> Result<Option<LockGuard>>; // P0（T12a）：flock 非阻塞，O_NOFOLLOW，比对 inode
 fn spawn(&self, prog: &str, args: &[&str]) -> Result<Proc>;   // P1：后台进程，三路 null
 fn kill(&self, p: &mut Proc);                                 // P1：kill + wait，幂等
 fn free_ports(&self, n: usize) -> Result<Vec<u16>>;           // P1：同时绑 n 个 127.0.0.1:0，拿到端口后一起放掉（来自 d2）
 fn mkdir_private(&self, path: &Path) -> Result<()>;           // P1：DirBuilder mode 0700，已存在即报错
-pub struct Lock { _guard: Box<dyn std::any::Any> }            // 真机里装 Flock<File>
+pub struct LockGuard { release: Option<Box<dyn FnOnce()>> }   // lock.rs；真机里闭包持 Flock<File>（R11）
 pub struct Proc { pub id: u32, child: Option<std::process::Child> }
 
 // net.rs —— Net（D22：Sync 是 supertrait）
@@ -2277,7 +2277,7 @@ pub struct Download { pub bytes: u64, pub elapsed: Duration, pub complete: bool 
 - `profiles.rs`（墓碑，T7b）：`Tombstone`、`Profiles.deleted`、`tombstone_key`、`is_deleted`、`bury`、`forget`（§5.7）；删除本身仍用现成的 `Profiles::remove`。
 - `import_v3.rs`（T7b）：`import` 多一个 `honor_tombstones: bool` 参数，命中墓碑的节点收进报告的 `buried`，不写入；`V3_UNITS` 本来就是 pub，邀请条件（§5.7）直接用它。
 - `cli.rs` 的 `store_fetched` / `save_import`（T7b）：命中墓碑的收进 `Stored.buried`；`Cmd::Import` 与 `Cmd::ImportV3` 加 `--with-deleted`；菜单 [3] 与 [7]→[3] 导入后问一次要不要加回；单条粘贴直接加回并 `forget`。
-- 不改：`ufw.rs`、`units.rs`、`source.rs`。**任何 `Cargo.toml` 与 `Cargo.lock` 都不动**：账号指纹的 sha256 用 bui-c 已有的 `sha2` 依赖。
+- 不改：`ufw.rs`、`units.rs`、`source.rs`。**根 `Cargo.toml` 与 `Cargo.lock` 都不动**：账号指纹的 sha256 用 bui-c 已有的 `sha2` 依赖；唯一的例外是 `crates/bui-c/Cargo.toml` 给 nix 加 `fs` 特性（进程锁的 `Flock` 要它，§8.3）。
 
 ## 11. 文案表
 
@@ -2294,7 +2294,7 @@ pub struct Download { pub bytes: u64, pub elapsed: Duration, pub complete: bool 
 | 停顿 | `回车返回菜单`（现有） |
 | 等锁 | `另一个 bui-c 操作正在进行，等它结束（最多 15 秒）…` |
 | 等锁超时 | `另一个 bui-c 操作还没结束，这次什么都没改，稍后再试` |
-| 巡检遇锁（日志） | `另一个 bui-c 操作进行中，本轮巡检跳过` |
+| 巡检遇锁（日志） | `另一个 bui-c 操作进行中或节点设置刚改过，本轮巡检跳过` |
 | 收敛 | `上次的删除没做完，已按节点列表收拾好` |
 | 非 root | `需要 root：用 sudo bui-c` |
 | 巡检行（P1） | `巡检   ○  连续 {n} 次异常，{m} 分钟前已自动重启` |
@@ -2312,7 +2312,7 @@ pub struct Download { pub bytes: u64, pub elapsed: Duration, pub complete: bool 
 | [3] 导入 | `导入 {a} 个新节点，共 {n} 个`（现有）、`已取消，没有导入任何节点`（现有） |
 | [4] 服务 | `已重启 bui-c.service[，bui-tun 已就绪]`（现有） |
 | [5] 检查 | `连接检查：全部通过（{n} 项）`、`连接检查：失败 {b} 项（{第一个失败项}）`、`没有节点可检查：先用 [3] 导入节点` |
-| [6] 删除 | `已删除 {name}`；`已删除 {n} 个节点（{first} 等）`；`已删除 {name}，已切到 {to}（bui-tun 已就绪）`；`已删除 {n} 个节点，已切到 {to}（bui-tun 已就绪）`；`已删除全部节点，代理已停止；用 [3] 导入节点`；`已取消，没有删除任何节点`；`没有节点可删`；`删除没做：切到 {to} 失败`；`节点列表刚被别处改过，没有删除` |
+| [6] 删除 | `已删除 {name}`；`已删除 {n} 个节点（{first} 等）`；`已删除 {name}，已切到 {to}（bui-tun 已就绪）`；`已删除 {n} 个节点，已切到 {to}（bui-tun 已就绪）`；`已删除全部节点，代理已停止；用 [3] 导入节点`；`已取消，没有删除任何节点`；`没有节点可删`；`删除没做：切到 {to} 失败`；`节点列表刚被别处改过，没有删除`；等锁超时的上次行短式 `别的操作没结束，没删，稍后再试`（停顿页仍打整句「删除没做：另一个 bui-c 操作还没结束，这次什么都没改，稍后再试」+「节点都还在」） |
 | [7] 维护 | `已是最新（{v}，来源 {src}）`、`没有更新（最新 {v}）`、`已更新到 {v}`、`每日自动更新：开` / `每日自动更新：关`、`检查更新失败：{原因}`、`没有从 v3 导入` |
 | [8] 卸载 | `已取消，没有卸载` |
 | [9] 测速 | `测速：通 {a} 个，不通 {b} 个`、`没有节点可测`、`还没有 sing-box 内核：先用 [3] 导入节点` |

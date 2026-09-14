@@ -248,6 +248,11 @@ pub const STOPPED_NOT_SAVED_HEAD: &str = "代理已经停了，但写 profiles.j
 pub const STOPPED_NOT_SAVED: &str = "节点条目还在，下次进菜单或巡检会按节点列表收拾";
 /// 同一件事进「上次：」行时的短式（40 列只有 31 列可用）。
 pub const STOPPED_NOT_SAVED_SHORT: &str = "删除没做完：代理已停，节点还在";
+/// 删除确认之后等了 15 秒还拿不到锁（spec §8.3）进「上次：」行时的短式：40 列只有 31 列，
+/// 整句「另一个 bui-c 操作还没结束，这次什么都没改，稍后再试」会被砍成
+/// 「另一个 bui-c 操作还没结束，这…」，可操作的「稍后再试」整个没了（T12a 审查 I1、
+/// spec §0.2 R6）。停顿页上仍打整句。
+pub const LOCK_BUSY_SHORT: &str = "别的操作没结束，没删，稍后再试";
 /// 失败页的安抚行：数据面根本没动。
 pub const STILL_THERE: &str = "节点都还在";
 /// 失败页的安抚行：动过数据面，已经换回去了。
@@ -559,6 +564,7 @@ mod tests {
             SAVE_FAILED,
             TEARDOWN_FAILED_SHORT,
             STOPPED_NOT_SAVED_SHORT,
+            LOCK_BUSY_SHORT,
         ] {
             let w = menu::budget_width(s);
             assert!(
