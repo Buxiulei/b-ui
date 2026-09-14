@@ -70,7 +70,7 @@ bash scripts/tests/run-all.sh
 bash scripts/release/pin-kernels.sh --check          # 内核 lock 是否还贴着版本轨道
 bash scripts/release/check-version.sh v4.0.0         # tag / workspace version / CHANGELOG 一致
 
-# 用真实内核校验渲染结果（本机 1.13.19；CI 跑 1.12/1.13/1.14）
+# 用真实内核校验渲染结果（本机 1.14.0；CI 跑 1.12/1.13/1.14）
 sing-box check -c <渲染出的 json>
 xray run -test -c <渲染出的 json>
 ```
