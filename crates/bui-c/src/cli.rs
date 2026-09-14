@@ -887,7 +887,8 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
                     panel: None,
                 }
             } else {
-                return Err(Error::msg(IMPORT_NO_SOURCE));
+                // 一个来源都没给是用法错误（spec §0.2 R15：退出码 2）
+                return Err(Error::usage(IMPORT_NO_SOURCE));
             };
             // 取节点（联网）在锁外；锁里读 profiles、落盘、apply（spec §0.2 R11 / R16），
             // 打墓碑那一行在放锁之后
@@ -5980,6 +5981,7 @@ mod tests {
     }
 
     /// 接缝 1 第 3 条：什么来源都没给时，先教粘贴整条链接；`--user` 不再只认用户名。
+    /// 一个来源都没给是用法错误，退出码 2（spec §0.2 R15，与「--json 没加 -y」同类）。
     #[test]
     fn cli_import_without_a_source_teaches_pasting_the_whole_link_first() {
         let pp = paths();
@@ -5988,9 +5990,9 @@ mod tests {
         let n = FakeNet::new();
         let mut p = Scripted::from([]);
         let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
-        let msg = dispatch(&parse(&["import"]), &mut ctx)
-            .unwrap_err()
-            .to_string();
+        let err = dispatch(&parse(&["import"]), &mut ctx).unwrap_err();
+        assert_eq!(err.exit_code(), 2, "用法错误（R15）：{err}");
+        let msg = err.to_string();
         let first = msg.lines().next().unwrap_or_default();
         assert!(
             first.contains("bui-c import --sub -"),
@@ -6190,6 +6192,13 @@ mod tests {
         let saved = no_token(&s, &ctx.transcript);
         assert_eq!(names(&s, &pp), vec!["alice-reality-direct"]);
         assert_eq!(saved.profiles[0].source, crate::profiles::Source::ApiNodes);
+        // 面板认这条链接（/api/nodes 合法载荷 + https）：与菜单 [3]、--panel/--user 同一判据，
+        // 记成 root 自更新来源。只钉 base_url，不打印 username（它就是 token）
+        assert_eq!(
+            saved.panel.as_ref().map(|x| x.base_url.as_str()),
+            Some("https://panel.example.com"),
+            "--sub 经 /api/nodes 取到节点时记 panel"
+        );
 
         // ② 命令行 --sub，面板接口 404、退回订阅：主机 + kind
         let s = FakeSys::new();
@@ -6205,6 +6214,8 @@ mod tests {
             saved.profiles[0].source,
             crate::profiles::Source::Subscription
         );
+        // 退回订阅：订阅主机不成为 root 自更新来源
+        assert!(saved.panel.is_none(), "退回订阅时不记 panel");
 
         // ③ 菜单 [3] 粘贴同一条链接、退回订阅：同样不露 token
         let s = FakeSys::new();
