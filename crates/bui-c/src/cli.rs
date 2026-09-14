@@ -463,6 +463,13 @@ struct Stored {
 ///
 /// `restore` 为假时认墓碑（spec §5.7）：删掉过的节点不写入，名字收进 [`Stored::buried`]；
 /// 为真时照常写入并把墓碑清掉（`--with-deleted`、菜单里答了 y、单独粘贴一条链接）。
+///
+/// 墓碑只挡**新**节点（与 [`import_v3::import`] 同一个顺序：先认已有连接、再认墓碑）。
+/// 已经在列表里的节点不是「回来」：住宅换槽位后新旧两个同 key 的节点并存、删掉旧的之后，
+/// 新的那个照常刷新，与它同 key 的那条过期墓碑顺手清掉——否则它从此收不到凭据轮换，
+/// 每刷新一次还要拿已经删掉的旧名字问一遍。
+///
+/// 一个节点都没存下（全被墓碑挡下）时不动 panel：什么都没导入，不该换自动更新来源。
 fn store_fetched<S: Sys, N: Net, P: Prompt>(
     ctx: &mut Ctx<'_, S, N, P>,
     prof: &mut Profiles,
@@ -479,20 +486,20 @@ fn store_fetched<S: Sys, N: Net, P: Prompt>(
         restored: Vec::new(),
     };
     for node in &f.nodes {
-        // 删过的节点默认不写回来：面板 / 订阅导入是刷新节点的日常操作，不记墓碑的话
-        // 每刷新一次删掉的就全回来（spec §5.7）。名字取墓碑里记的那个——用户删它时
-        // 在列表上看到的就是它，这会儿的 profile 名还没算出来
-        if !restore {
-            if let Some(t) = prof.tombstone_of(node) {
-                out.buried.push(t.name.clone());
-                continue;
-            }
-        }
-        let name = match prof.find_same_endpoint(node) {
-            Some(same) => same.name.clone(),
+        let (name, is_new) = match prof.find_same_endpoint(node) {
+            Some(same) => (same.name.clone(), false),
             None => {
+                // 删过的节点默认不写回来：面板 / 订阅导入是刷新节点的日常操作，不记墓碑的话
+                // 每刷新一次删掉的就全回来（spec §5.7）。名字取墓碑里记的那个——用户删它时
+                // 在列表上看到的就是它，这会儿的 profile 名还没算出来
+                if !restore {
+                    if let Some(t) = prof.tombstone_of(node) {
+                        out.buried.push(t.name.clone());
+                        continue;
+                    }
+                }
                 let wanted = profile_name(&f.user, node);
-                match prof.profiles.iter().find(|p| p.name == wanted) {
+                let name = match prof.profiles.iter().find(|p| p.name == wanted) {
                     Some(taken) if !same_account(&taken.node, node) => {
                         let fresh = prof.free_name(&wanted);
                         ctx.say(format!(
@@ -501,7 +508,8 @@ fn store_fetched<S: Sys, N: Net, P: Prompt>(
                         fresh
                     }
                     _ => wanted,
-                }
+                };
+                (name, true)
             }
         };
         let r = prof.upsert(Profile {
@@ -511,8 +519,9 @@ fn store_fetched<S: Sys, N: Net, P: Prompt>(
             source: src,
             imported_at: rfc3339(ctx.sys),
         });
-        // 明确要它：墓碑清掉，下次导入不再跳过（spec §5.7）
-        if prof.forget(node) {
+        // 新节点走到这里就是明确要它：墓碑清掉，下次导入不再跳过（spec §5.7）。已有节点
+        // 清的是同 key 的过期墓碑，它本来就在列表里，不算「恢复」
+        if prof.forget(node) && is_new {
             out.restored.push(name.clone());
         }
         match r {
@@ -525,8 +534,9 @@ fn store_fetched<S: Sys, N: Net, P: Prompt>(
         }
         out.names.push(name);
     }
-    // panel 是 root 自更新的来源：换掉它必须让人看见。同一个面板只跟着改用户名，不出声
-    if let Some(p) = panel {
+    // panel 是 root 自更新的来源：换掉它必须让人看见。同一个面板只跟着改用户名，不出声。
+    // 一个都没存下（全被墓碑挡下）就不动它：答 y 加回时拿的是同一批，那一趟再记
+    if let Some(p) = panel.filter(|_| !out.names.is_empty()) {
         match prof.panel.as_mut() {
             Some(cur) if cur.base_url == p.base_url => cur.username = p.username,
             _ => {
@@ -589,6 +599,14 @@ fn fetch_sub<N: Net>(net: &N, url: &str) -> Result<Incoming> {
     })
 }
 
+/// 存下了、还没 apply 的一次导入：[`store_import`] 交给 [`apply_import`]。
+struct Imported {
+    stored: Stored,
+    prof: Profiles,
+    /// 这一趟真的选出了活动节点（首次导入或 `activate`，且至少存下了一个节点）
+    activated: bool,
+}
+
 /// 落盘一批节点；首次导入或 `activate` 时激活第一个并 apply，原地更新了活动节点也 apply。
 ///
 /// `with_deleted` 为真（`--with-deleted`、菜单里答了 y）时连删过的节点一起导。单独粘贴
@@ -602,6 +620,24 @@ fn save_import<S: Sys, N: Net, P: Prompt>(
     activate: bool,
     with_deleted: bool,
 ) -> Result<Stored> {
+    let imported = store_import(ctx, inc, activate, with_deleted)?;
+    apply_import(ctx, &imported)?;
+    Ok(imported.stored)
+}
+
+/// [`save_import`] 的前半段：读盘、写入这批节点、落盘、打导入结果行，不 apply。
+///
+/// 分出来是给命令行用的：apply 失败时被墓碑挡下的名字照样要打出来（审查 T7b M1）。
+///
+/// 全部被墓碑挡下时一个节点都没存下：删光之后再从面板 / 订阅导入（spec §5.8 的恢复路、
+/// §9 的 `profiles = []`）就是这样。这时不选活动节点，[`apply_import`] 也就不 apply——
+/// 否则 engine 报「没有激活的节点」，命令行退出码 1、菜单问不到墓碑那一句。
+fn store_import<S: Sys, N: Net, P: Prompt>(
+    ctx: &mut Ctx<'_, S, N, P>,
+    inc: Incoming,
+    activate: bool,
+    with_deleted: bool,
+) -> Result<Imported> {
     let mut prof = Profiles::load(ctx.sys, ctx.paths)?;
     let loaded = prof.clone();
     let had_active = prof.active_profile().is_some();
@@ -615,12 +651,14 @@ fn save_import<S: Sys, N: Net, P: Prompt>(
         inc.panel,
         with_deleted || single,
     );
+    let mut activated = false;
     if activate || !had_active {
         if let Some(name) = stored.names.first() {
             prof.active = Some(name.clone());
+            activated = true;
         }
     }
-    // 什么都没变（重复导入同一个面板）就不重写 profiles.json
+    // 什么都没变（重复导入同一个面板、全被墓碑挡下）就不重写 profiles.json
     if prof != loaded {
         prof.save(ctx.sys, ctx.paths)?;
     }
@@ -633,9 +671,22 @@ fn save_import<S: Sys, N: Net, P: Prompt>(
     if single && !stored.restored.is_empty() {
         ctx.say_result(menu::BURIED_RESTORED);
     }
-    if activate || !had_active {
+    Ok(Imported {
+        stored,
+        prof,
+        activated,
+    })
+}
+
+/// [`save_import`] 的后半段：选出了活动节点、或原地更新了活动节点时拿锁 apply。
+fn apply_import<S: Sys, N: Net, P: Prompt>(
+    ctx: &mut Ctx<'_, S, N, P>,
+    imported: &Imported,
+) -> Result<()> {
+    let prof = &imported.prof;
+    if imported.activated {
         let g = take_lock(ctx)?;
-        apply_with_ufw(ctx, &prof, &g)?;
+        apply_with_ufw(ctx, prof, &g)?;
         ctx.say_aside(format!(
             "{CURRENT_NODE_HEAD}{}",
             prof.active.clone().unwrap_or_default()
@@ -643,14 +694,14 @@ fn save_import<S: Sys, N: Net, P: Prompt>(
     } else if prof
         .active
         .as_ref()
-        .is_some_and(|a| stored.replaced.contains(a))
+        .is_some_and(|a| imported.stored.replaced.contains(a))
     {
         // 活动节点被原地更新（凭据轮换、端口变了）：不 apply 的话还跑着旧配置。
         // 只改了 label 时渲出的配置字节不变，engine 不会重启
         let g = take_lock(ctx)?;
-        apply_with_ufw(ctx, &prof, &g)?;
+        apply_with_ufw(ctx, prof, &g)?;
     }
-    Ok(stored)
+    Ok(())
 }
 
 pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>) -> Result<()> {
@@ -773,12 +824,15 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
                     "给一个节点链接，或用 --panel <地址> --user <用户名>，或 --sub <订阅地址>",
                 ));
             };
-            let stored = save_import(ctx, inc, *activate, *with_deleted)?;
-            // 命令行不提问（脚本里跑它不能卡在一个 [y/N] 上）：说清跳了哪几个、怎么加回来
-            if !stored.buried.is_empty() {
-                ctx.say(menu::buried_skipped(&stored.buried));
+            let imported = store_import(ctx, inc, *activate, *with_deleted)?;
+            let applied = apply_import(ctx, &imported);
+            // 命令行不提问（脚本里跑它不能卡在一个 [y/N] 上）：说清跳了哪几个、怎么加回来。
+            // apply 失败也照样打：节点已经存下了，被跳过的是哪几个、怎么加回来仍然要知道
+            let buried = &imported.stored.buried;
+            if !buried.is_empty() {
+                ctx.say(menu::buried_skipped(buried));
             }
-            Ok(())
+            applied
         }
         // `bui-c delete <名字>... [--switch-to <名字>] [-y] [--json]`（spec §5.10、§0.2 R7 / R15）
         Cmd::Delete { names, switch_to } => {
@@ -7496,6 +7550,322 @@ mod tests {
         assert_eq!(
             outcome_since(&ctx, f),
             Outcome::Note("这一次只打了这一行".to_string())
+        );
+    }
+
+    // ───────────── T7b 审查修复（第 1 轮） ─────────────
+
+    /// 面板导入过两个节点、**全部删掉**的机器（spec §9：`profiles = []`、`deleted` 里有全部节点）。
+    /// 面板还挂着那两个。返回 `(FakeSys, FakeNet)`。
+    fn all_buried(pp: &Paths, url: &str) -> (FakeSys, FakeNet) {
+        let s = FakeSys::new();
+        ready(&s);
+        let n = FakeNet::new();
+        n.route(
+            url,
+            nodes_payload("alice", vec![reality_direct_node(), hy2_direct_node()]),
+        );
+        let mut prof = Profiles::new_default();
+        prof.upsert(crate::testutil::named(
+            "alice-reality-direct",
+            reality_direct_node(),
+        ));
+        prof.upsert(crate::testutil::named(
+            "alice-hy2-direct",
+            hy2_direct_node(),
+        ));
+        prof.active = Some("alice-hy2-direct".into());
+        prof.save(&s, pp).unwrap();
+        Engine::new(&s, pp).apply(&prof).unwrap();
+        // 删光（Empty）：stop 之后复查不再 active 才进不可回头段
+        s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        let seen = delete::snapshot(&prof);
+        let (r, t) = del(
+            &s,
+            &n,
+            pp,
+            &["alice-reality-direct", "alice-hy2-direct"],
+            None,
+            &seen,
+        );
+        let r = r.unwrap_or_else(|e| panic!("删光应当成功：{e}\n{t}"));
+        assert_eq!(r.remaining, 0, "{t}");
+        let saved = Profiles::load(&s, pp).unwrap();
+        assert!(saved.profiles.is_empty() && saved.active.is_none(), "{t}");
+        assert_eq!(saved.deleted.len(), 2, "{t}");
+        assert!(saved.panel.is_none(), "{t}");
+        // 之后 start 了就是在跑
+        s.reply("systemctl is-active --quiet bui-c.service", 0, "");
+        (s, n)
+    }
+
+    /// 审查 C1（命令行）：删光之后从面板重新导入，全部命中墓碑——这是 spec §5.8 的恢复路。
+    /// 默认跳过并说清怎么加回，退出码 0；带 `--with-deleted` 两个都回来、第一个被激活。
+    #[test]
+    fn reimporting_after_deleting_everything_skips_then_restores_from_the_cli() {
+        let pp = paths();
+        let url = "https://panel.example.com/api/nodes/alice";
+        let args = [
+            "import",
+            "--panel",
+            "https://panel.example.com",
+            "--user",
+            "alice",
+        ];
+
+        // ① 默认：成功返回，打出被跳过的名字；什么都没存就不改自动更新来源、不 apply
+        let (s, n) = all_buried(&pp, url);
+        let writes = s.writes("/opt/bui-c/profiles.json");
+        let restarts_before = restarts(&s);
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        let r = dispatch(&parse(&args), &mut ctx);
+        let t = ctx.transcript.clone();
+        assert!(r.is_ok(), "命令行该成功（退出码 0）：{r:?}\n{t}");
+        let skipped = menu::buried_skipped(&[
+            "alice-reality-direct".to_string(),
+            "alice-hy2-direct".to_string(),
+        ]);
+        assert!(skipped.contains("--with-deleted"), "前提：命令行那句带开关");
+        assert!(t.lines().any(|l| l == skipped), "{t}");
+        assert!(p.asked.is_empty(), "命令行不提问：{:?}", p.asked);
+        assert!(!t.contains("自动更新来源改为"), "什么都没存，不换来源：{t}");
+        assert!(!t.contains(CURRENT_NODE_HEAD), "没有活动节点可说：{t}");
+        let saved = Profiles::load(&s, &pp).unwrap();
+        assert!(saved.profiles.is_empty() && saved.active.is_none(), "{t}");
+        assert_eq!(saved.deleted.len(), 2, "墓碑还在：{t}");
+        assert!(saved.panel.is_none(), "什么都没存，不写 panel：{t}");
+        assert_eq!(
+            s.writes("/opt/bui-c/profiles.json"),
+            writes,
+            "什么都没变，不重写 profiles.json：{t}"
+        );
+        assert_eq!(restarts(&s), restarts_before, "不 apply：{t}");
+        assert!(!s.exists(&pp.unit(UNIT_MAIN)), "主单元照旧不在：{t}");
+
+        // ② --with-deleted：两个都回来，第一个被激活并 apply，墓碑清空
+        let (s, n) = all_buried(&pp, url);
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        let mut with = args.to_vec();
+        with.push("--with-deleted");
+        let r = dispatch(&parse(&with), &mut ctx);
+        let t = ctx.transcript.clone();
+        assert!(r.is_ok(), "{r:?}\n{t}");
+        assert!(!t.contains("跳过 "), "{t}");
+        let saved = Profiles::load(&s, &pp).unwrap();
+        assert_eq!(
+            names(&s, &pp),
+            vec![
+                "alice-reality-direct".to_string(),
+                "alice-hy2-direct".to_string()
+            ],
+            "{t}"
+        );
+        assert_eq!(saved.active.as_deref(), Some("alice-reality-direct"), "{t}");
+        assert!(saved.deleted.is_empty(), "{t}");
+        assert_eq!(
+            saved.panel.as_ref().map(|p| p.base_url.as_str()),
+            Some("https://panel.example.com"),
+            "{t}"
+        );
+        assert!(
+            t.lines()
+                .any(|l| l == format!("{CURRENT_NODE_HEAD}alice-reality-direct")),
+            "{t}"
+        );
+        assert!(s.exists(&pp.unit(UNIT_MAIN)), "apply 把主单元建回来：{t}");
+    }
+
+    /// 审查 C1（菜单）：同一状态下菜单 `[3]` 贴面板地址，要问那一句；答 y 两个都回来、
+    /// 一个被激活，「上次：」行是第二趟的导入结果。
+    #[test]
+    fn reimporting_after_deleting_everything_still_asks_in_the_menu() {
+        let pp = paths();
+        let url = "https://panel.example.com/api/nodes/alice";
+        let (s, n) = all_buried(&pp, url);
+        let r = run_menu(&s, &n, &pp, &["3", url, "", "y", "0"], true);
+        assert!(
+            r.asked.iter().any(|q| q == menu::BURIED_ASK),
+            "要问一句：{:?}\n{}",
+            r.asked,
+            r.t
+        );
+        assert!(!r.t.contains("失败："), "{}", r.t);
+        assert!(!r.t.contains("--with-deleted"), "{}", r.t);
+        let saved = Profiles::load(&s, &pp).unwrap();
+        assert_eq!(saved.profiles.len(), 2, "{}", r.t);
+        assert!(
+            saved
+                .active
+                .as_deref()
+                .is_some_and(|a| saved.profiles.iter().any(|p| p.name == a)),
+            "活动节点是加回来的其中一个：{:?}\n{}",
+            saved.active,
+            r.t
+        );
+        assert!(saved.deleted.is_empty(), "{}", r.t);
+        assert!(
+            r.t.lines().any(|l| l == "  上次：导入 2 个新节点，共 2 个"),
+            "{}",
+            r.t
+        );
+    }
+
+    /// 审查 I1：住宅换槽位后旧槽 :40000 与新槽 :40001 并存（同账号、同 host、同 kind，只差端口），
+    /// 删掉旧的之后面板发来新的——它已经在列表里，照常刷新，不算「删过的」，也不问。
+    #[test]
+    fn a_live_profile_sharing_the_key_is_refreshed_not_reported_as_deleted() {
+        let pp = paths();
+        let url = "https://panel.example.com/api/nodes/alice";
+        let new_slot = bui_schema::nodes::Node {
+            port: 40001,
+            ..crate::testutil::hy2_resi_node()
+        };
+        let setup = || {
+            let s = FakeSys::new();
+            ready(&s);
+            let n = FakeNet::new();
+            let relabeled = bui_schema::nodes::Node {
+                label: "HY2住宅-新槽".into(),
+                ..new_slot.clone()
+            };
+            n.route(
+                url,
+                nodes_payload("alice", vec![hy2_direct_node(), relabeled]),
+            );
+            let mut prof = Profiles::new_default();
+            prof.upsert(crate::testutil::named(
+                "alice-hy2-direct",
+                hy2_direct_node(),
+            ));
+            prof.upsert(crate::testutil::named(
+                "alice-hy2-resi",
+                crate::testutil::hy2_resi_node(),
+            ));
+            prof.upsert(crate::testutil::named("alice-hy2-resi-2", new_slot.clone()));
+            prof.active = Some("alice-hy2-direct".into());
+            prof.save(&s, &pp).unwrap();
+            Engine::new(&s, &pp).apply(&prof).unwrap();
+            let seen = delete::snapshot(&prof);
+            let (r, t) = del(&s, &n, &pp, &["alice-hy2-resi"], None, &seen);
+            r.expect(&t);
+            let saved = Profiles::load(&s, &pp).unwrap();
+            assert_eq!(saved.deleted.len(), 1, "{t}");
+            assert!(saved.is_deleted(&new_slot), "前提：新槽与墓碑同 key");
+            (s, n)
+        };
+
+        // 命令行
+        let (s, n) = setup();
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        let r = dispatch(
+            &parse(&[
+                "import",
+                "--panel",
+                "https://panel.example.com",
+                "--user",
+                "alice",
+            ]),
+            &mut ctx,
+        );
+        let t = ctx.transcript.clone();
+        assert!(r.is_ok(), "{r:?}\n{t}");
+        assert!(!t.contains("跳过 "), "活着的节点不许当成删过的：{t}");
+        assert!(
+            t.lines().any(|l| l == "更新节点 alice-hy2-resi-2"),
+            "活着的节点照常刷新：{t}"
+        );
+        let saved = Profiles::load(&s, &pp).unwrap();
+        let live = saved
+            .profiles
+            .iter()
+            .find(|p| p.name == "alice-hy2-resi-2")
+            .unwrap_or_else(|| panic!("{t}"));
+        assert_eq!(live.node.label, "HY2住宅-新槽", "{t}");
+        assert!(
+            !saved.profiles.iter().any(|p| p.name == "alice-hy2-resi"),
+            "删掉的旧槽不回来：{t}"
+        );
+        assert!(
+            !saved.is_deleted(&new_slot),
+            "过期墓碑顺手清掉：{:?}\n{t}",
+            saved.deleted
+        );
+
+        // 菜单：不问那一句，再刷新一次也不问
+        let (s, n) = setup();
+        let r = run_menu(
+            &s,
+            &n,
+            &pp,
+            &["3", url, "", "", "3", url, "", "", "0"],
+            true,
+        );
+        assert_eq!(
+            r.asked.iter().filter(|q| *q == PASTE_PROMPT).count(),
+            2,
+            "前提：真的导入了两趟：{:?}\n{}",
+            r.asked,
+            r.t
+        );
+        assert_eq!(
+            n.log().iter().filter(|l| l.contains("api/nodes")).count(),
+            2,
+            "{:?}",
+            n.log()
+        );
+        assert!(
+            !r.asked.iter().any(|q| q == menu::BURIED_ASK),
+            "活着的节点不问：{:?}\n{}",
+            r.asked,
+            r.t
+        );
+        assert!(!r.t.contains("你删过的节点"), "{}", r.t);
+    }
+
+    /// 审查 M1：节点存下了、apply 才失败时，被跳过的名字与 `--with-deleted` 那句照样要打出来；
+    /// 终态：返回错误，墓碑还在，旧配置不动。
+    #[test]
+    fn cli_import_still_lists_skipped_nodes_when_apply_fails() {
+        let pp = paths();
+        let url = "https://panel.example.com/api/nodes/alice";
+        let (s, n) = one_buried(&pp, url);
+        let config = s.get("/opt/bui-c/config.json").unwrap();
+        s.reply(
+            "/opt/bui-c/bin/sing-box check -c /opt/bui-c/.config.json.new",
+            1,
+            "outbounds[0]: 解析失败",
+        );
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        let r = dispatch(
+            &parse(&[
+                "import",
+                "--panel",
+                "https://panel.example.com",
+                "--user",
+                "alice",
+                "--activate",
+            ]),
+            &mut ctx,
+        );
+        let t = ctx.transcript.clone();
+        assert!(r.is_err(), "apply 失败要报错（退出码非 0）：{t}");
+        let skipped = menu::buried_skipped(&["alice-reality-direct".to_string()]);
+        assert!(
+            t.lines().any(|l| l == skipped),
+            "失败时也要说清跳了哪几个：{t}"
+        );
+        assert!(p.asked.is_empty(), "{:?}", p.asked);
+        let saved = Profiles::load(&s, &pp).unwrap();
+        assert_eq!(names(&s, &pp), vec!["alice-hy2-direct".to_string()], "{t}");
+        assert_eq!(saved.deleted.len(), 1, "墓碑还在：{t}");
+        assert_eq!(
+            s.get("/opt/bui-c/config.json").unwrap(),
+            config,
+            "校验没过，旧配置不动：{t}"
         );
     }
 }
