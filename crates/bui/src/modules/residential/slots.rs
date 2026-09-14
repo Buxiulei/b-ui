@@ -2731,6 +2731,67 @@ mod tests {
         );
     }
 
+    /// 中途 Clash PUT 失败停下来：剩下的候选**压根没探过**，所以这一槽没有资格报
+    /// 「无可用出口」（`no_exit = false`）——但终态照样要收拾干净：selector 从探死的那个
+    /// 候选上放回本槽自己的 IP，note 说清卡在哪一步。
+    #[tokio::test]
+    async fn a_put_failure_midway_stops_the_loop_without_claiming_there_is_no_exit() {
+        let d = tempfile::tempdir().unwrap();
+        let (ctx, clash) = three_slot_ctx(d.path()).await;
+        seed_health(
+            &ctx,
+            &[
+                (1, Some(true), 300, true),
+                (2, Some(true), 100, true),
+                (3, Some(true), 50, true),
+            ],
+        )
+        .await;
+        clash.with(|i| {
+            i.reject_tags.insert("resi-1".into()); // 第二个候选切不过去
+        });
+        let p = Arc::new(FakeProber::new()); // 网关全连不上：第一个候选探死
+        let out = borrow_now(
+            &ctx,
+            p.clone(),
+            clash.clone(),
+            Uuid::from_u128(2),
+            OffsetDateTime::UNIX_EPOCH,
+            QUICK,
+        )
+        .await;
+        assert_eq!(
+            (
+                out[0].target,
+                out[0].switched,
+                out[0].no_exit,
+                out[0].dead.clone()
+            ),
+            (Uuid::from_u128(2), false, false, vec![Uuid::from_u128(3)]),
+            "候选没试完 ⇒ 不许说无可用出口；终态仍要放回本槽"
+        );
+        let note = out[0].note.clone().unwrap_or_default();
+        assert!(note.starts_with("切到 resi-1 失败"), "{note}");
+        assert_eq!(
+            p.calls(),
+            vec!["tcp"],
+            "PUT 失败就停，不再探：{:?}",
+            p.calls()
+        );
+        assert_eq!(
+            clash.calls(),
+            vec![
+                "put:slot-1-pool:resi-3",
+                "put:slot-1-pool:resi-1",
+                "put:slot-1-pool:resi-2"
+            ]
+        );
+        assert!(
+            state::read(&ctx.runtime).await.health[&Uuid::from_u128(1).to_string()].active,
+            "PUT 失败不是「它不通」的证据，不许记不健康"
+        );
+    }
+
     /// 验证撞上**整体**预算（[`BORROW_VERIFY_BUDGET_SECS`]）：网关活着、隧道不响应时
     /// `probe_quick` 会一路走到 HTTP 那一段（真实实现最坏 ≈40 秒），所以上界只能靠
     /// `timeout` 在代码里保证 —— 演练的丢包只造得出「TCP 连不上」那条快路，量不到这一段。
@@ -2830,12 +2891,12 @@ mod tests {
         (ctx, clash)
     }
 
-    /// 四个槽全压在故障 IP 上：验证预算是**单次调用**的、跨槽共享的，不是每槽一份 ——
-    /// 槽级上限会让单次调用最坏做「池大小 − 1」次验证，把两条处置延迟 SLA 全破。
-    /// 顺带把「候选被本次已证死的记录剪空」那一支钉住：这些槽照样放回本槽自己的 IP，
-    /// 绝不留在刚被证死的故障 IP 上，也不再白探一遍。
+    /// 四个槽全压在故障 IP 上：第一个槽把候选逐条探死之后，**后面的槽的候选被「本次已证死」
+    /// 剪空** —— 这一支绝不许退回旧的 fail-open「保持现状」（那会把槽留在刚被证死的故障 IP
+    /// 上、事件也不说终态），而是走同一条「全不通」口径：放回本槽自己的 IP、`no_exit`、
+    /// 不再白探一遍。
     #[tokio::test]
-    async fn the_verify_budget_is_shared_across_slots_not_per_slot() {
+    async fn slots_whose_candidates_were_already_proven_dead_go_home_without_reprobing() {
         let d = tempfile::tempdir().unwrap();
         let (ctx, clash) = all_slots_on_the_failed_ip(d.path(), 4).await;
         let p = Arc::new(FakeProber::new()); // 整个网关都连不上：每次验证都判死
@@ -2908,10 +2969,12 @@ mod tests {
         );
     }
 
-    /// 预算用尽、但这个槽还有**没探过**的候选：仍然 PUT 到它（本槽原来的出口是**已知死的**，
-    /// 未知优于已知死），按「未确认」报，绝不退回「保持现状」把槽留在故障 IP 上。
+    /// 验证预算是**单次调用**的、跨槽共享的，不是每槽一份（槽级上限会让单次调用最坏做
+    /// 「池大小 − 1」= 7 次验证，把两条处置延迟 SLA 全破）：六条上游全不通时，预算只够
+    /// 探三条，剩下**没探过**的候选照样 PUT 过去（本槽原来的出口是**已知死的**，未知优于
+    /// 已知死），按「未确认」报，绝不退回「保持现状」把槽留在故障 IP 上。
     #[tokio::test]
-    async fn with_the_budget_spent_a_slot_still_moves_but_reports_unconfirmed() {
+    async fn the_verify_budget_is_per_call_so_a_spent_budget_reports_unconfirmed() {
         let d = tempfile::tempdir().unwrap();
         let (ctx, clash) = all_slots_on_the_failed_ip(d.path(), 6).await;
         let p = Arc::new(FakeProber::new()); // 网关全连不上
