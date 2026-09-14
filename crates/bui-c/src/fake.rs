@@ -29,6 +29,10 @@ pub struct FakeSys {
     write_fails: RefCell<BTreeSet<PathBuf>>,
     /// 每次 [`Sys::write`] 的目标路径，按顺序（失败的也记）。
     written: RefCell<Vec<PathBuf>>,
+    /// [`Sys::tcp_listening`] 答「在听」的本机端口；默认一个都没有（查询类默认失败）。
+    listening: RefCell<BTreeSet<u16>>,
+    /// [`Sys::resolve`] 的预置结果：`Ok(毫秒)` 是用时，`Err(())` 是解析失败；没登记的域名解析失败。
+    resolves: RefCell<BTreeMap<String, std::result::Result<u64, ()>>>,
 }
 
 impl Default for FakeSys {
@@ -43,6 +47,8 @@ impl Default for FakeSys {
             term: Cell::new(None),
             write_fails: RefCell::default(),
             written: RefCell::default(),
+            listening: RefCell::default(),
+            resolves: RefCell::default(),
         }
     }
 }
@@ -146,6 +152,14 @@ impl FakeSys {
         let want = PathBuf::from(path);
         self.written.borrow().iter().filter(|p| **p == want).count()
     }
+    /// 标记本机 `127.0.0.1:port` 在听（默认不在听）。
+    pub fn listen(&self, port: u16) {
+        self.listening.borrow_mut().insert(port);
+    }
+    /// 预置 `host` 的解析结果：`Ok(毫秒)` 是用时，`Err(())` 是解析失败。
+    pub fn set_resolve(&self, host: &str, r: std::result::Result<u64, ()>) {
+        self.resolves.borrow_mut().insert(host.to_string(), r);
+    }
 }
 
 impl Sys for FakeSys {
@@ -238,6 +252,19 @@ impl Sys for FakeSys {
     }
     fn term_size(&self) -> Option<(u16, u16)> {
         self.term.get()
+    }
+    fn tcp_listening(&self, port: u16) -> bool {
+        self.listening.borrow().contains(&port)
+    }
+    /// 记进调用流水（`resolve <host>`），测试靠它断言巡检路径没解析过域名。
+    /// 预置的用时不短于时限就按超时算：真实实现到点只会报超时。
+    fn resolve(&self, host: &str, timeout: Duration) -> Result<Duration> {
+        self.calls.borrow_mut().push(format!("resolve {host}"));
+        match self.resolves.borrow().get(host) {
+            Some(Ok(ms)) if Duration::from_millis(*ms) < timeout => Ok(Duration::from_millis(*ms)),
+            Some(Ok(_)) => Err(Error::msg(format!("{host} 解析超时"))),
+            _ => Err(Error::msg(format!("{host} 解析不到地址"))),
+        }
     }
 }
 
@@ -524,6 +551,34 @@ mod tests {
         assert_eq!(s.env("BUI_FORCE_IPV6").as_deref(), Some("1"));
         s.set_env("BUI_FORCE_IPV6", "0");
         assert_eq!(s.env("BUI_FORCE_IPV6").as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn fake_ports_and_dns_are_injected_and_default_to_failure() {
+        let s = FakeSys::new();
+        assert!(!s.tcp_listening(1080), "没登记就是没在听");
+        s.listen(1080);
+        assert!(s.tcp_listening(1080));
+        assert!(!s.tcp_listening(8080));
+        let t = Duration::from_secs(3);
+        assert!(s.resolve("www.baidu.com", t).is_err(), "没登记就是解析失败");
+        s.set_resolve("www.baidu.com", Ok(12));
+        assert_eq!(
+            s.resolve("www.baidu.com", t).unwrap(),
+            Duration::from_millis(12)
+        );
+        s.set_resolve("www.baidu.com", Ok(3_000));
+        assert!(s.resolve("www.baidu.com", t).is_err(), "用时到了时限算超时");
+        s.set_resolve("www.baidu.com", Err(()));
+        assert!(s.resolve("www.baidu.com", t).is_err());
+        assert_eq!(
+            s.calls()
+                .iter()
+                .filter(|c| *c == "resolve www.baidu.com")
+                .count(),
+            4,
+            "每次解析都记进流水"
+        );
     }
 
     #[test]
