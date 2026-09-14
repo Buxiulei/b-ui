@@ -3,7 +3,7 @@
 //! 「试一次」还是「每 250ms 试一次，等到时限」。
 //!
 //! 分层：只有顶层入口（菜单的一个动作、一条子命令、巡检的一轮）拿锁，改机器的函数
-//! （`apply_with_ufw`、`cli::delete_nodes` 的数据面段、`teardown_all`、将来的 `converge`、
+//! （`apply_with_ufw`、`cli::delete_nodes` 的数据面段、`teardown_all`、`converge`、
 //! `update::install`）按引用收下 [`LockGuard`]，自己绝不拿锁，也绝不在持锁期间提问。
 
 use crate::paths::Paths;

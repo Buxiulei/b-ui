@@ -54,6 +54,11 @@ impl Paths {
     pub fn runtime(&self) -> PathBuf {
         self.base.join("runtime.json")
     }
+    /// 删除提交的中断标记 `/opt/bui-c/pending.json`（0600，spec §0.2 R2）：只在持锁时写和删。
+    /// 不放进 `runtime.json`：巡检在锁外对 `runtime.json` 读改写，会把它写丢。
+    pub fn pending(&self) -> PathBuf {
+        self.base.join("pending.json")
+    }
     pub fn bin_dir(&self) -> PathBuf {
         self.base.join("bin")
     }
@@ -78,6 +83,7 @@ mod tests {
         assert_eq!(p.profiles(), PathBuf::from("/opt/bui-c/profiles.json"));
         assert_eq!(p.config(), PathBuf::from("/opt/bui-c/config.json"));
         assert_eq!(p.runtime(), PathBuf::from("/opt/bui-c/runtime.json"));
+        assert_eq!(p.pending(), PathBuf::from("/opt/bui-c/pending.json"));
         assert_eq!(p.singbox(), PathBuf::from("/opt/bui-c/bin/sing-box"));
         assert_eq!(
             p.unit(UNIT_TIMER),

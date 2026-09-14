@@ -49,6 +49,27 @@ pub struct Runtime {
     /// 「上次检查   有新版 4.0.1（2 小时前）」读它（spec §8.1）。旧版本写的文件没有这个键。
     #[serde(default)]
     pub update_version: Option<String>,
+    /// 最近一次中断收敛的结果（spec §0.2 R12，持锁写）：菜单进门时在「上次：」行显示一次，
+    /// 然后清掉。巡检只写不清。
+    pub last_converge: Option<LastConverge>,
+    /// 收敛失败时节点设置的样子（`cli::converge_key`）：同一份设置下不再按「单元 / 配置对不上」
+    /// 自动重试，免得每分钟收拾一次（R12）。`pending.json` 触发的收敛不受它限制——那个文件
+    /// 收拾过就删，本来就只有一次。收敛成功、或巡检发现机器已被人修好（不再对不上）时清掉。
+    pub converge_failed: Option<String>,
+}
+
+/// 一次中断收敛的结果（spec §0.2 R12）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct LastConverge {
+    /// 收敛的时间（epoch 秒）。
+    pub at: i64,
+    pub ok: bool,
+    /// 失败原因；成功时为空。
+    pub msg: String,
+    /// 是被 `pending.json`（删除做到一半）触发的：决定说「上次的删除没做完」还是「代理与节点
+    /// 列表对不上」——没有删除时说前一句是错的（例如首次导入时内核没装上）。
+    pub after_delete: bool,
 }
 
 impl Runtime {

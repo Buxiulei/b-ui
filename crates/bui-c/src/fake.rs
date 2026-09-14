@@ -160,6 +160,10 @@ impl FakeSys {
     pub fn fail_write(&self, path: &str) {
         self.write_fails.borrow_mut().insert(PathBuf::from(path));
     }
+    /// 撤掉 [`FakeSys::fail_write`] 注入的写失败：磁盘腾出空间之后，下一次进菜单或巡检就能写了。
+    pub fn allow_write(&self, path: &str) {
+        self.write_fails.borrow_mut().remove(Path::new(path));
+    }
     /// 对这个路径调用过几次 [`Sys::write`]（失败的也算）。用来钉住「profiles 与 active
     /// 同一次 save」这类断言。
     pub fn writes(&self, path: &str) -> usize {

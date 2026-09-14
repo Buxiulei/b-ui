@@ -3,7 +3,7 @@
 //! 所有会改机器的子命令都经 `apply_with_ufw`：装内核 → 按模式同步 UFW → `Engine::apply`。
 //! root 检查只在 [`run`] 里做，`dispatch` 保持纯注入，单元测试直接调它。
 
-use crate::check::{self, Runtime, Verdict};
+use crate::check::{self, LastConverge, Runtime, Verdict};
 use crate::delete::{self, PlanKind};
 use crate::engine::{Applied, Engine};
 use crate::lock::{self, LockGuard};
@@ -19,6 +19,7 @@ use crate::source::{self, Fetched};
 use crate::sys::{systemd, Sys};
 use crate::{import_v3, ufw, uninstall, update, Error, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -1189,6 +1190,29 @@ fn import_v3_cmd<S: Sys, N: Net, P: Prompt>(
 /// 菜单 `[5]` 不走这里，走 [`check_menu`]：人点的是「连接检查」，不该顺带把二进制换掉
 /// （spec §6.7）。每日自更新只留在这条路径上。
 fn run_check<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()> {
+    // 中断收敛（spec §5.5、§0.2 R10 / R12）：锁外判一次，要收敛才**只试一次**锁，拿到后在锁里
+    // 重判。收拾过（不论成败）这一轮就到此为止：刚 apply 起来的服务不该紧接着被探测、再按
+    // 「探测失败」重启一次；自更新也等下一分钟。拿不到锁与 `Verdict::Busy` 同一个说法，不写
+    // runtime.json，`pending.json` 原样留给下一轮
+    let prof = Profiles::load(ctx.sys, ctx.paths)?;
+    let rt = Runtime::load(ctx.sys, ctx.paths);
+    if needs_converge(ctx.sys, ctx.paths, &prof, &rt) {
+        let Some(g) = lock::acquire(ctx.sys, ctx.paths, lock::How::Once)? else {
+            tracing::info!("另一个 bui-c 操作进行中，本轮巡检跳过");
+            ctx.say("另一个 bui-c 操作进行中，本轮巡检跳过");
+            return Ok(());
+        };
+        if let Some(lc) = converge(ctx, &g)? {
+            ctx.say(converge_line(&lc));
+            return Ok(());
+        }
+    } else if rt.converge_failed.is_some() && !out_of_step(ctx.sys, ctx.paths, &prof) {
+        // 收敛失败过、机器后来被人修好了（[5] 修复、[1] 切换）：记录作废，以后再对不上照常收敛一次。
+        // 拿不到锁就下一分钟再清，不耽误这一轮巡检
+        if let Some(g) = lock::acquire(ctx.sys, ctx.paths, lock::How::Once)? {
+            forget_converge_failure(ctx.sys, ctx.paths, &g);
+        }
+    }
     let v = check::run(ctx.sys, ctx.net, ctx.paths)?;
     match &v {
         Verdict::NoProfile => ctx.say("没有激活的节点，巡检跳过"),
@@ -1518,24 +1542,45 @@ fn delete_failed<S: Sys, N: Net, P: Prompt>(
     Error::msg(summary)
 }
 
+/// 写不进 `pending.json` 的停顿页：这时还没动数据面，节点都还在。
+fn pending_failed<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>, e: Error) -> Error {
+    delete_failed(
+        ctx,
+        PENDING_FAILED,
+        &[e.to_string(), delete::STILL_THERE.to_string()],
+        PENDING_FAILED.to_string(),
+    )
+}
+
 /// Switch 失败之后的回滚（spec §0.2 R10）：一律 `Engine::apply(&old)`，**不**经 `ensure_kernel`
 /// 与 UFW 前置——失败发生在写 `config.json` 之前时，这一次逐字节比对下来什么都不改、也不重启。
-/// 返回失败页里跟在原因后面的那一两行。
-fn roll_back<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>, old: &Profiles) -> Vec<String> {
+/// 返回失败页里跟在原因后面的那一两行，以及旧配置换没换回去（没换回去才把 `pending.json`
+/// 留给收敛，spec §0.2 R2）。
+fn roll_back<S: Sys, N: Net, P: Prompt>(
+    ctx: &mut Ctx<'_, S, N, P>,
+    old: &Profiles,
+) -> (Vec<String>, bool) {
     match Engine::new(ctx.sys, ctx.paths).apply(old) {
         // 旧配置写回去了、接口还是没起来：R10 对 apply 的判据（Err 或 `tun_ready == Some(false)`
-        // 都算失败）在回滚方向一样算数。不能在断网状态下报「节点都还在」了事，出路也要给
-        Ok(a) if a.tun_ready == Some(false) => vec![
-            delete::ROLLED_BACK_TUN_DOWN.to_string(),
-            delete::ROLLBACK_NEXT.to_string(),
-        ],
-        Ok(_) => vec![delete::ROLLED_BACK.to_string()],
+        // 都算失败）在回滚方向一样算数。不能在断网状态下报「节点都还在」了事，出路也要给。
+        // 但配置与单元已经和节点列表一致，再收敛一次也只是同一个 apply：pending 不留
+        Ok(a) if a.tun_ready == Some(false) => (
+            vec![
+                delete::ROLLED_BACK_TUN_DOWN.to_string(),
+                delete::ROLLBACK_NEXT.to_string(),
+            ],
+            true,
+        ),
+        Ok(_) => (vec![delete::ROLLED_BACK.to_string()], true),
         Err(e) => {
             tracing::warn!(error = %e, "删除失败后换回原配置也失败");
-            vec![
-                format!("{}：{e}", delete::ROLLBACK_FAILED),
-                delete::ROLLBACK_NEXT.to_string(),
-            ]
+            (
+                vec![
+                    format!("{}：{e}", delete::ROLLBACK_FAILED),
+                    delete::ROLLBACK_NEXT.to_string(),
+                ],
+                false,
+            )
         }
     }
 }
@@ -1544,8 +1589,8 @@ fn roll_back<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>, old: &Profil
 /// 报错中止，调用方据此不写 `profiles.json`。撤 UFW、把 runtime 的重启记账清零由
 /// [`release_after_teardown`] 在写完 `profiles.json` **之后**尽力而为（R10 把这两件排在最后）。
 ///
-/// **顺序只有这一份**：`teardown_all` -> `save`（如需）-> `release_after_teardown`。T12c 的
-/// `converge` 照同一顺序调这两个函数，别把收尾提到落盘前面去。
+/// **顺序只有这一份**：`teardown_all` -> `save`（如需）-> 删 `pending.json` ->
+/// `release_after_teardown`。[`converge`] 照同一顺序调这两个函数，别把收尾提到落盘前面去。
 fn teardown_all<S: Sys, N: Net, P: Prompt>(
     ctx: &mut Ctx<'_, S, N, P>,
     _: &LockGuard,
@@ -1574,6 +1619,242 @@ fn release_after_teardown<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>)
     }
 }
 
+/// 删除提交做到一半的标记（spec §0.2 R2）：`/opt/bui-c/pending.json`，0600，只在持锁时写和删。
+/// 里面只有节点名，没有凭据。收敛只看它在不在；内容给人排查时看。
+#[derive(Debug, Serialize, Deserialize)]
+struct Pending {
+    op: String,
+    targets: Vec<String>,
+    at: i64,
+}
+
+/// 写不进 `pending.json`：不带着没有兜底的删除去动数据面（页上与「上次：」行共用，容量口径 30 列）。
+const PENDING_FAILED: &str = "删除没做：写 pending.json 失败";
+
+/// 动数据面之前写下 `pending.json`（spec §0.2 R2）。
+fn write_pending<S: Sys>(sys: &S, paths: &Paths, targets: &[String], _: &LockGuard) -> Result<()> {
+    let p = Pending {
+        op: "delete".to_string(),
+        targets: targets.to_vec(),
+        at: sys.now().unix_timestamp(),
+    };
+    let mut data =
+        serde_json::to_vec_pretty(&p).map_err(|e| Error::parse("pending.json", e.to_string()))?;
+    data.push(b'\n');
+    sys.mkdir_p(&paths.base)?;
+    sys.write(&paths.pending(), &data, 0o600)
+}
+
+/// 删掉 `pending.json`。删不掉只记日志：留下的标记最多让下一次进菜单或巡检多收敛一次，
+/// 而收敛是幂等的（apply 逐字节比对、teardown 对拆过的机器什么都不改）。
+fn clear_pending<S: Sys>(sys: &S, paths: &Paths, _: &LockGuard) {
+    if let Err(e) = sys.remove_file(&paths.pending()) {
+        tracing::warn!(error = %e, "删 pending.json 失败");
+    }
+}
+
+/// 收敛失败时记下的「节点设置」（[`Runtime::converge_failed`]）：同一份设置下不再按「单元 /
+/// 配置对不上」自动重试。取删除快照那几项（节点名、active、模式、两个端口）——人导入、切换、
+/// 删除之后它就变了，收敛照常再试一次。
+fn converge_key(prof: &Profiles) -> String {
+    format!("{:?}", delete::snapshot(prof))
+}
+
+/// 要不要中断收敛（spec §5.5、§0.2 R2 / R10 / R12）。锁外判一次决定去不去拿锁，拿到锁后
+/// [`converge`] 再判一次。
+///
+/// - `pending.json` 在：删除做到一半断了，按节点列表收拾；
+/// - 没有活动节点，但**主单元**的文件或 `config.json` 还在，或主单元 is-active / is-enabled：
+///   拆掉。只看主单元——删光后 `bui-c.timer` 与 `bui-c-check.service` 故意留着（R10），写成
+///   「任一 bui-c 单元在」就会每分钟 teardown 一次；
+/// - 有活动节点，但主单元文件或 `config.json` 不在：apply。
+///
+/// 后两种按现状判断的，在同一份节点设置下收敛失败过就不再自动重试（R12「只做一次」）：
+/// 否则停不下来的服务每分钟拆一次、每次持锁等 `systemctl stop`，菜单上的动作全都等不到锁。
+/// 失败之后交给正常的退避重启、菜单 [5] 的修复与人手里的 [1] [3]。
+fn needs_converge<S: Sys>(sys: &S, paths: &Paths, prof: &Profiles, rt: &Runtime) -> bool {
+    if sys.exists(&paths.pending()) {
+        return true;
+    }
+    out_of_step(sys, paths, prof)
+        && rt.converge_failed.as_deref() != Some(converge_key(prof).as_str())
+}
+
+/// [`needs_converge`] 按现状判断的那两条：主单元与 `config.json` 跟节点列表对不上。
+fn out_of_step<S: Sys>(sys: &S, paths: &Paths, prof: &Profiles) -> bool {
+    let main_unit = paths.unit(UNIT_MAIN);
+    if prof.active_profile().is_some() {
+        !sys.exists(&main_unit) || !sys.exists(&paths.config())
+    } else {
+        sys.exists(&main_unit)
+            || sys.exists(&paths.config())
+            || systemd::is_active(sys, UNIT_MAIN)
+            || systemd::is_enabled(sys, UNIT_MAIN)
+    }
+}
+
+/// 中断收敛（spec §5.5、§0.2 R12）：持锁调用。锁里重读 `profiles.json` 再判一次，不需要就什么都
+/// 不做、返回 `None`（两个会话同时进菜单时，第二个不误报）。
+///
+/// 有活动节点 → `Engine::apply`（幂等；Err 或 TUN 5 秒没就绪都算失败，与删除的前向、回滚同一
+/// 判据，R10）；没有 → [`teardown_all`]，成功后 [`release_after_teardown`]。**无论成败**都删掉
+/// `pending.json`（只试一次），结果写进 `runtime.last_converge`；失败再记 [`converge_key`]。
+fn converge<S: Sys, N: Net, P: Prompt>(
+    ctx: &mut Ctx<'_, S, N, P>,
+    g: &LockGuard,
+) -> Result<Option<LastConverge>> {
+    let prof = Profiles::load(ctx.sys, ctx.paths)?;
+    if !needs_converge(
+        ctx.sys,
+        ctx.paths,
+        &prof,
+        &Runtime::load(ctx.sys, ctx.paths),
+    ) {
+        return Ok(None);
+    }
+    let after_delete = ctx.sys.exists(&ctx.paths.pending());
+    let apply = prof.active_profile().is_some();
+    let done = if apply {
+        match Engine::new(ctx.sys, ctx.paths).apply(&prof) {
+            Ok(a) if a.tun_ready == Some(false) => Err(Error::msg(format!(
+                "bui-tun 接口 {} 秒内没起来",
+                crate::engine::TUN_READY_WAIT_S
+            ))),
+            Ok(_) => Ok(()),
+            Err(e) => Err(e),
+        }
+    } else {
+        teardown_all(ctx, g)
+    };
+    // 与删除同一顺序：数据面 -> （这里不用写 profiles）-> 删 pending -> 撤 UFW、清重启记账
+    clear_pending(ctx.sys, ctx.paths, g);
+    if done.is_ok() && !apply {
+        release_after_teardown(ctx);
+        if let Err(e) = Engine::new(ctx.sys, ctx.paths).clear_profile_leftovers() {
+            tracing::warn!(error = %e, "清 profiles.json 的临时文件失败");
+        }
+    }
+    let lc = LastConverge {
+        at: ctx.sys.now().unix_timestamp(),
+        ok: done.is_ok(),
+        msg: done
+            .as_ref()
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default(),
+        after_delete,
+    };
+    match &done {
+        Ok(()) => tracing::info!(after_delete, "中断收敛：已按节点列表收拾好"),
+        Err(e) => tracing::warn!(error = %e, after_delete, "中断收敛失败"),
+    }
+    // release_after_teardown 刚写过 runtime.json：重读再改，别把撤掉的 UFW 记账写回去
+    let mut rt = Runtime::load(ctx.sys, ctx.paths);
+    rt.converge_failed = (!lc.ok).then(|| converge_key(&prof));
+    rt.last_converge = Some(lc.clone());
+    if let Err(e) = rt.save(ctx.sys, ctx.paths) {
+        tracing::warn!(error = %e, "写 runtime.json 失败");
+    }
+    Ok(Some(lc))
+}
+
+/// 在锁里重判一次「已经不再对不上」，是就清掉 [`Runtime::converge_failed`]（R12「持锁写」）。
+fn forget_converge_failure<S: Sys>(sys: &S, paths: &Paths, _: &LockGuard) {
+    let Ok(prof) = Profiles::load(sys, paths) else {
+        return;
+    };
+    let mut rt = Runtime::load(sys, paths);
+    if rt.converge_failed.is_none() || out_of_step(sys, paths, &prof) {
+        return;
+    }
+    rt.converge_failed = None;
+    if let Err(e) = rt.save(sys, paths) {
+        tracing::warn!(error = %e, "写 runtime.json 失败");
+    }
+}
+
+/// 收敛结果说全的那一句：巡检日志、菜单里失败时的停顿页（spec §0.2 R12 的两句话）。
+/// 没有 `pending.json` 时不说「删除」——那时并没有删除做到一半（例如首次导入时 apply 没做成）。
+fn converge_line(lc: &LastConverge) -> String {
+    let head = if lc.after_delete {
+        "上次的删除没做完"
+    } else {
+        "代理与节点列表对不上"
+    };
+    if lc.ok {
+        format!("{head}，已按节点列表收拾好")
+    } else {
+        format!("{head}，收拾也失败了：{}", lc.msg)
+    }
+}
+
+/// 同一件事进「上次：」行的短式：40 列那一行只有 31 列（spec §0.2 R6），去掉与「上次：」重复的
+/// 「上次的」，原因留在停顿页上。
+fn converge_short(lc: &LastConverge) -> &'static str {
+    match (lc.after_delete, lc.ok) {
+        (true, true) => "删除没做完，已按节点列表收拾好",
+        (true, false) => "删除没做完，收拾也失败了",
+        (false, true) => "代理已按节点列表收拾好",
+        (false, false) => "按节点列表收拾代理失败",
+    }
+}
+
+/// 进菜单时（spec §5.5 ①、§0.2 R12）：需要收敛才拿锁（等 15 秒）收敛；然后把 `last_converge`
+/// （这次的，或巡检早先留下的）取出来清掉，交给「上次：」行显示一次。清也在锁里（R12「持锁写」）；
+/// 只是取巡检的结果时只试一次锁，拿不到就下次进菜单再说，不为一行字等 15 秒。
+///
+/// 成功一行 `Note`；收尾多打了话（UFW 没撤掉）或失败就 `Pause`，失败先把原因打在页上。
+fn converge_at_menu_start<S: Sys, N: Net, P: Prompt>(
+    ctx: &mut Ctx<'_, S, N, P>,
+) -> Result<Option<Outcome>> {
+    let prof = Profiles::load(ctx.sys, ctx.paths)?;
+    let rt = Runtime::load(ctx.sys, ctx.paths);
+    let need = needs_converge(ctx.sys, ctx.paths, &prof, &rt);
+    if !need && rt.last_converge.is_none() {
+        return Ok(None);
+    }
+    let g = if need {
+        match take_lock(ctx) {
+            Ok(g) => g,
+            // 等不到锁：什么都没改，`pending.json` 留给下一次进菜单或巡检
+            Err(e) => {
+                let line = format!("失败：{e}");
+                tell(ctx, &line);
+                return Ok(Some(Outcome::Pause(line)));
+            }
+        }
+    } else {
+        match lock::acquire(ctx.sys, ctx.paths, lock::How::Once)? {
+            Some(g) => g,
+            None => return Ok(None),
+        }
+    };
+    let start = ctx.transcript.len();
+    if need {
+        converge(ctx, &g)?;
+    }
+    let mut rt = Runtime::load(ctx.sys, ctx.paths);
+    let Some(lc) = rt.last_converge.take() else {
+        return Ok(None);
+    };
+    if let Err(e) = rt.save(ctx.sys, ctx.paths) {
+        tracing::warn!(error = %e, "写 runtime.json 失败");
+    }
+    drop(g);
+    let short = converge_short(&lc).to_string();
+    if !lc.ok {
+        tell(ctx, converge_line(&lc));
+        return Ok(Some(Outcome::Pause(short)));
+    }
+    let extra = ctx.transcript.len() > start;
+    ctx.say(&short);
+    Ok(Some(if extra {
+        Outcome::Pause(short)
+    } else {
+        Outcome::Note(short)
+    }))
+}
+
 /// 删除的执行编排（spec §5.5，顺序照 §0.2 R2 / R10 / R11）。三个入口共用：菜单 `[6]`、
 /// `bui-c delete`、`[9]` 测速结果页的「删除不通的」。调用方负责先在屏幕上确认。
 ///
@@ -1582,9 +1863,12 @@ fn release_after_teardown<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>)
 /// 3. 重读 `profiles.json`，与 `seen` 比快照，不一致就什么都不做；
 /// 4. 锁内按名字重算 `plan`；
 /// 5. Switch 形态做 `Engine::preflight`（清残留 → 渲染 → `sing-box check`，不装内核）；
-/// 6. 数据面：Passive 什么都不做；Switch `apply_with_ufw(next)`，失败或 TUN 5 秒没就绪都回滚；
+/// 6. 要动数据面（Switch、Empty）就先写 `pending.json`，写不进去就此中止；
+/// 7. 数据面：Passive 什么都不做；Switch `apply_with_ufw(next)`，失败或 TUN 5 秒没就绪都回滚；
 ///    Empty `teardown_all`，失败就此中止；
-/// 7. 写 `profiles.json`（`profiles` 与 `active` 同一次原子写）。Switch 写盘失败立刻回滚。
+/// 8. 写 `profiles.json`（`profiles` 与 `active` 同一次原子写）。Switch 写盘失败立刻回滚；
+/// 9. 删 `pending.json`。只有数据面可能与节点列表对不上时才留下它交给 [`converge`]：Switch
+///    回滚也失败、Empty 拆到一半失败、Empty 拆完了却写不进 `profiles.json`。
 ///
 /// 任何失败都是「什么都没删」：停顿页已经打好，返回的 `Err` 是给「上次：」行的短摘要。
 fn delete_nodes<S: Sys, N: Net, P: Prompt>(
@@ -1709,6 +1993,9 @@ fn delete_nodes<S: Sys, N: Net, P: Prompt>(
                     format!("删除没做：切到 {to} 失败"),
                 ));
             }
+            if let Err(e) = write_pending(ctx.sys, ctx.paths, &plan.targets, &g) {
+                return Err(pending_failed(ctx, e));
+            }
             // ⑥ 数据面：TUN 5 秒没就绪也算失败（R10）
             let done = match apply_with_ufw(ctx, &plan.next, &g) {
                 Ok(a) if a.tun_ready == Some(false) => Err(Error::msg(format!(
@@ -1720,14 +2007,22 @@ fn delete_nodes<S: Sys, N: Net, P: Prompt>(
             };
             if let Err(e) = done {
                 let mut rest = vec![e.to_string()];
-                rest.extend(roll_back(ctx, &old));
+                let (lines, restored) = roll_back(ctx, &old);
+                rest.extend(lines);
+                if restored {
+                    clear_pending(ctx.sys, ctx.paths, &g);
+                }
                 let head = format!("删除没做：切到 {to} 失败");
                 return Err(delete_failed(ctx, &head, &rest, head.clone()));
             }
             // ⑦ 落盘：profiles 与 active 同一次原子写
             if let Err(e) = plan.next.save(ctx.sys, ctx.paths) {
                 let mut rest = vec![e.to_string()];
-                rest.extend(roll_back(ctx, &old));
+                let (lines, restored) = roll_back(ctx, &old);
+                rest.extend(lines);
+                if restored {
+                    clear_pending(ctx.sys, ctx.paths, &g);
+                }
                 return Err(delete_failed(
                     ctx,
                     delete::SAVE_FAILED,
@@ -1735,11 +2030,20 @@ fn delete_nodes<S: Sys, N: Net, P: Prompt>(
                     delete::SAVE_FAILED.to_string(),
                 ));
             }
+            clear_pending(ctx.sys, ctx.paths, &g);
         }
         PlanKind::Empty => {
             report.stopped = true;
             report.active = None;
+            if let Err(e) = write_pending(ctx.sys, ctx.paths, &plan.targets, &g) {
+                return Err(pending_failed(ctx, e));
+            }
             if let Err(e) = teardown_all(ctx, &g) {
+                // 服务还在跑 = 停在「复查 is-active」那一步，不可回头段一步没走，数据面原样：
+                // 删掉 pending。已经停了才失败，就是拆到一半（单元已 disable、文件可能已删）：留给收敛
+                if systemd::is_active(ctx.sys, UNIT_MAIN) {
+                    clear_pending(ctx.sys, ctx.paths, &g);
+                }
                 return Err(delete_failed(
                     ctx,
                     &format!("删除没做：{e}"),
@@ -1759,6 +2063,7 @@ fn delete_nodes<S: Sys, N: Net, P: Prompt>(
                     delete::STOPPED_NOT_SAVED_SHORT.to_string(),
                 ));
             }
+            clear_pending(ctx.sys, ctx.paths, &g);
             // 撤 UFW、写 runtime 排在写 profiles 之后，尽力而为（R10）
             release_after_teardown(ctx);
             // 被删节点的凭据可能留在写 profiles.json 的临时文件里（R10）
@@ -1898,6 +2203,12 @@ pub fn menu_loop<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Resul
 fn menu_body<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()> {
     // 只活在这一次菜单会话里，不落盘：明天另一个家人打开菜单，看到别人的「上次」只会困惑
     let mut last: Option<String> = None;
+    // 中断收敛排在最前面（spec §5.5 ①）：v3 邀请看的是「profiles 为空」，得先让数据面与节点列表一致
+    if let Some(out) = converge_at_menu_start(ctx)? {
+        if settle(ctx, out, &mut last)? {
+            return Ok(());
+        }
+    }
     // 进菜单前的 v3 导入邀请也照规矩收尾：下面第一件事就是清屏
     if let Some(out) = offer_v3_import(ctx)? {
         if settle(ctx, out, &mut last)? {
@@ -2300,7 +2611,8 @@ impl<S: Sys, N: Net, P: Prompt> Hooks for MenuHooks<'_, '_, S, N, P> {
     /// - 重启走 [`check::restart`]：不受退避约束，照样记进 runtime.json，timer 的退避从它算起；
     ///   然后在同一把锁里等就绪（`wait_ready`，T11 审查 M5）；
     /// - 有活动节点、主单元文件却不在（删光没做完留下的）时改做 apply：restart 一个不存在的单元只会
-    ///   报 Unit not found（R13）。apply 自己等过 TUN，SOCKS 再等端口。T12c 之后 apply 改走收敛。
+    ///   报 Unit not found（R13）。apply 自己等过 TUN，SOCKS 再等端口。这就是收敛的 apply 那一支，
+    ///   但不经 [`converge`] 的「失败过就不再自动重试」：人点了修复，就是要再试一次。
     fn repair(&mut self, wait_ready: &mut dyn FnMut()) -> Result<Verdict> {
         let seen = delete::snapshot(self.prof);
         with_lock(self.ctx, |ctx, g| {
@@ -3471,6 +3783,7 @@ mod tests {
         let pp = paths();
         let s = FakeSys::new();
         ready(&s);
+        with_unit(&s);
         let mut prof = profiles_socks();
         prof.panel = Some(crate::profiles::Panel {
             base_url: "https://panel.example.com".into(),
@@ -3517,6 +3830,7 @@ mod tests {
         let pp = paths();
         let s = FakeSys::new();
         ready(&s);
+        with_unit(&s);
         s.reply("systemctl is-active --quiet bui-c.service", 3, "");
         let mut prof = profiles_socks();
         prof.auto_update = false; // 只看巡检结论，不去碰更新源
@@ -3634,6 +3948,7 @@ mod tests {
         let pp = paths();
         let s = FakeSys::new();
         ready(&s);
+        with_unit(&s);
         s.reply("ip link show bui-tun", 0, "5: bui-tun");
         let mut prof = crate::testutil::profiles_tun();
         prof.auto_update = false;
@@ -3655,6 +3970,7 @@ mod tests {
         // 接口一直没起来：等满 5 秒，指到 [4] 的日志
         let s = FakeSys::new();
         ready(&s);
+        with_unit(&s);
         s.reply("ip link show bui-tun", 1, "");
         prof.save(&s, &pp).unwrap();
         let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
@@ -3674,6 +3990,7 @@ mod tests {
         // SOCKS 模式没有接口可等
         let s = FakeSys::new();
         ready(&s);
+        with_unit(&s);
         let mut socks = profiles_socks();
         socks.auto_update = false;
         socks.save(&s, &pp).unwrap();
@@ -3689,6 +4006,7 @@ mod tests {
         let pp = paths();
         let s = FakeSys::new();
         ready(&s);
+        with_unit(&s);
         let mut prof = profiles_socks();
         prof.panel = Some(crate::profiles::Panel {
             base_url: "https://panel.example.com".into(),
@@ -3930,6 +4248,7 @@ mod tests {
         let pp = paths();
         let s = FakeSys::new();
         ready(&s);
+        with_unit(&s);
         let mut prof = profiles_socks();
         prof.panel = Some(crate::profiles::Panel {
             base_url: "https://panel.example.com".into(),
@@ -4479,6 +4798,7 @@ mod tests {
         let pp = paths();
         let s = FakeSys::new();
         ready(&s);
+        with_unit(&s);
         let mut prof = profiles_socks();
         prof.panel = Some(crate::profiles::Panel {
             base_url: "https://panel.example.com".into(),
@@ -4507,6 +4827,7 @@ mod tests {
         let pp = paths();
         let s = FakeSys::new();
         ready(&s);
+        no_engine(&s);
         s.put(
             "/opt/hysteria-client/configs/hysteria2-1/uri.txt",
             "hysteria2://alice:hy2-pw@panel.example.com:10000/?sni=panel.example.com&mport=20000-30000#alice-HY2%E7%9B%B4%E8%BF%9E",
@@ -4550,6 +4871,7 @@ mod tests {
         // 答 n：不导入，只提示一次，菜单照常进（ctx.out 会被 flush 清空，断言看 transcript）
         let s2 = FakeSys::new();
         ready(&s2);
+        no_engine(&s2);
         s2.put(
             "/opt/hysteria-client/configs/hysteria2-1/uri.txt",
             "hysteria2://alice:hy2-pw@panel.example.com:10000/?sni=panel.example.com#alice-HY2%E7%9B%B4%E8%BF%9E",
@@ -4791,6 +5113,7 @@ mod tests {
         let pp = paths();
         let s = FakeSys::new();
         ready(&s);
+        with_unit(&s);
         let mut prof = crate::testutil::baiyi_like();
         prof.mode = Mode::Socks; // 不等 TUN 就绪，切换只打一行
         prof.save(&s, &pp).unwrap();
@@ -5019,6 +5342,7 @@ mod tests {
         let pp = paths();
         let s = FakeSys::new();
         ready(&s);
+        with_unit(&s);
         profiles_socks().save(&s, &pp).unwrap();
         let n = FakeNet::new();
 
@@ -5204,6 +5528,7 @@ mod tests {
         let pp = paths();
         let s = FakeSys::new();
         ready(&s);
+        no_engine(&s);
         // v3 目录在、单元还在，但节点链接解析不了 → 导入报「…下没有可导入的节点」
         s.put(
             "/opt/hysteria-client/configs/hysteria2-1/uri.txt",
@@ -5370,6 +5695,7 @@ mod tests {
         let pp = paths();
         let s = FakeSys::new();
         ready(&s);
+        with_unit(&s);
         s.reply("ip link show bui-tun", 1, "");
         two_nodes(&s, &pp);
         let mut prof = Profiles::load(&s, &pp).unwrap();
@@ -5394,6 +5720,7 @@ mod tests {
         let pp = paths();
         let s = FakeSys::new();
         ready(&s);
+        with_unit(&s);
         s.reply("ip link show bui-tun", 1, "");
         let mut prof = crate::testutil::baiyi_like();
         prof.mode = Mode::Tun;
@@ -5561,6 +5888,7 @@ mod tests {
         let pp = paths();
         let s = FakeSys::new();
         ready(&s);
+        with_unit(&s);
         two_nodes(&s, &pp);
         let n = FakeNet::new();
         let mut p = Scripted::from(["1", "0", "0"]);
@@ -5581,6 +5909,7 @@ mod tests {
         // 没有节点：同样有标题，下面是引导
         let s = FakeSys::new();
         ready(&s);
+        no_engine(&s);
         let mut p = Scripted::from(["1", "0"]);
         let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
         menu_loop(&mut ctx).unwrap();
@@ -5632,6 +5961,7 @@ mod tests {
         let pp = paths();
         let s = FakeSys::new();
         ready(&s); // 没有 profiles.json，也没有 v3 目录
+        no_engine(&s);
         let n = FakeNet::new();
         let mut p = Scripted::from(["1", "0"]);
         let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
@@ -5703,6 +6033,7 @@ mod tests {
         let pp = paths();
         let s = FakeSys::new();
         ready(&s);
+        with_unit(&s);
         let mut prof = profiles_socks();
         prof.auto_update = true;
         prof.save(&s, &pp).unwrap();
@@ -5735,6 +6066,7 @@ mod tests {
         let pp = paths();
         let s = FakeSys::new();
         ready(&s);
+        with_unit(&s);
         let mut prof = profiles_socks();
         prof.auto_update = true;
         prof.save(&s, &pp).unwrap();
@@ -6222,6 +6554,7 @@ mod tests {
         let pp = paths();
         let s = FakeSys::new();
         ready(&s);
+        with_unit(&s);
         profiles_socks().save(&s, &pp).unwrap();
         let n = FakeNet::new();
         n.route(
@@ -6739,6 +7072,7 @@ mod tests {
         // ③ 菜单 [3] 粘贴同一条链接、退回订阅：同样不露 token
         let s = FakeSys::new();
         ready(&s);
+        no_engine(&s);
         let n = FakeNet::new();
         n.route(&api_nodes, FakeReply::Status(404));
         n.route(&url, b64(BOB_REALITY));
@@ -6828,6 +7162,7 @@ mod tests {
         let pp = paths();
         let s = FakeSys::new();
         ready(&s); // 没有 profiles.json，也没有 v3 目录
+        no_engine(&s);
         let n = FakeNet::new();
         // 没有追问、也不停：粘贴 → 空行 → 0 直接退出。追问或停顿都会把 0 吞掉，而队列耗尽后
         // 菜单照样退出、屏数也一样，所以看 p.asked：既没有「切换到新导入的…」，也没有「回车返回菜单」
@@ -6873,9 +7208,26 @@ mod tests {
         assert_eq!(p.asked, vec!["粘贴节点链接".to_string()], "只有粘贴那一问");
     }
 
-    /// 单元文件已经在（引擎装好了）的机器。
+    /// 单元文件已经在（引擎装好了）的机器：主单元文件与 `config.json` 都在。T12c 起有活动节点、
+    /// 两者缺一，进菜单或巡检会先按节点列表收敛（spec §0.2 R2），测别的路径时就得是装好的样子。
     fn with_unit(s: &FakeSys) {
         s.put("/etc/systemd/system/bui-c.service", "[Unit]");
+        s.put("/opt/bui-c/config.json", "{}");
+    }
+
+    /// 还没有节点、也没装过引擎的机器：主单元不在跑、没 enable。`ready()` 登记的是装好的机器；
+    /// 没有节点时照它回答，收敛会读成「节点删光了、代理却还在跑」（spec §0.2 R10）。
+    fn no_engine(s: &FakeSys) {
+        s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        s.reply("systemctl is-enabled --quiet bui-c.service", 1, "");
+    }
+
+    /// 这份节点设置下的收敛已经失败过一次（[`Runtime::converge_failed`]）：进菜单不再自动收敛，
+    /// 人才走得到 [4] 的「没有单元」与 [5] 的「apply 代替 restart」（R12、R13）。
+    fn converge_gave_up(s: &FakeSys, pp: &Paths) {
+        let mut rt = Runtime::load(s, pp);
+        rt.converge_failed = Some(converge_key(&Profiles::load(s, pp).unwrap()));
+        rt.save(s, pp).unwrap();
     }
 
     const JOURNAL_50: &str = "journalctl -u bui-c.service -n 50 --no-pager -o short-iso";
@@ -7159,6 +7511,7 @@ mod tests {
         let s = FakeSys::new();
         ready(&s); // ready 只登记 systemctl 回答，不建单元文件
         profiles_socks().save(&s, &pp).unwrap();
+        converge_gave_up(&s, &pp);
         let n = FakeNet::new();
         let mut p = Scripted::from(["4", "0"]); // 4 = 服务控制 → 0 退出
         let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
@@ -8258,6 +8611,7 @@ mod tests {
         let pp = paths();
         let s = FakeSys::new();
         ready(&s);
+        with_unit(&s);
         s.reply("systemctl is-active --quiet bui-c.service", 3, "");
         profiles_socks().save(&s, &pp).unwrap();
         let n = FakeNet::new();
@@ -8282,6 +8636,7 @@ mod tests {
     fn check_ready(s: &FakeSys, n: &FakeNet, pp: &Paths, mode: Mode) {
         ready(s);
         crate::nettest::sample::healthy(s, n, mode);
+        with_unit(s);
         let mut prof = match mode {
             Mode::Tun => crate::testutil::profiles_tun(),
             Mode::Socks => profiles_socks(),
@@ -8331,6 +8686,7 @@ mod tests {
         let pp = paths();
         let s = FakeSys::new();
         ready(&s);
+        no_engine(&s);
         s.set_term_size(Some((60, 30)));
         let n = FakeNet::new();
         let mut p = Scripted::from(["5", "0"]);
@@ -8486,6 +8842,7 @@ mod tests {
         let (s, n) = (FakeSys::new(), FakeNet::new());
         check_ready(&s, &n, &pp, Mode::Socks);
         s.remove_file(&pp.unit(UNIT_MAIN)).unwrap();
+        converge_gave_up(&s, &pp);
         s.reply("systemctl is-active --quiet bui-c.service", 3, "");
         let mut p = Scripted::from(["5", "0", "0"]);
         let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
@@ -8957,8 +9314,8 @@ mod tests {
         assert!(saved.profiles.is_empty() && saved.active.is_none(), "{t}");
         assert_eq!(saved.deleted.len(), 2, "{t}");
         assert!(saved.panel.is_none(), "{t}");
-        // 之后 start 了就是在跑
-        s.reply("systemctl is-active --quiet bui-c.service", 0, "");
+        // 删光之后主单元停了、disable 了：照真机回答，否则进菜单时收敛会读成「删光了代理却还在跑」
+        s.reply("systemctl is-enabled --quiet bui-c.service", 1, "");
         (s, n)
     }
 
@@ -9512,6 +9869,7 @@ mod tests {
         // [1] 切换：选完编号后拿锁、apply、放锁
         let (s, n) = (FakeSys::new(), FakeNet::new());
         ready(&s);
+        with_unit(&s);
         two_nodes(&s, &pp);
         let (t, _) = logged_menu(&s, &n, &pp, &["1", "2", "0"]);
         assert_eq!(no_prompt_under_lock(&s, 0, "[1] 切换"), 1, "{t}");
@@ -9524,6 +9882,7 @@ mod tests {
         // [2] 切模式：答 y 之后才拿锁
         let (s, n) = (FakeSys::new(), FakeNet::new());
         ready(&s);
+        with_unit(&s);
         two_nodes(&s, &pp);
         let (t, _) = logged_menu(&s, &n, &pp, &["2", "y", "", "0"]);
         assert_eq!(no_prompt_under_lock(&s, 0, "[2] 切模式"), 1, "{t}");
@@ -9910,6 +10269,7 @@ mod tests {
         let pp = paths();
         let s = FakeSys::new();
         ready(&s);
+        with_unit(&s);
         s.reply("systemctl is-active --quiet bui-c.service", 3, "");
         let mut prof = profiles_socks();
         prof.panel = Some(crate::profiles::Panel {
@@ -9937,6 +10297,7 @@ mod tests {
         // 不能只说「另一个 bui-c 操作进行中」——这时根本没有别的操作在跑
         let s = FakeSys::new();
         ready(&s);
+        with_unit(&s);
         s.reply("systemctl is-active --quiet bui-c.service", 3, "");
         prof.save(&s, &pp).unwrap();
         let mut moved = prof.clone();
@@ -9958,6 +10319,7 @@ mod tests {
         let pp = paths();
         let s = FakeSys::new();
         ready(&s);
+        with_unit(&s);
         let mut prof = profiles_socks();
         prof.panel = Some(crate::profiles::Panel {
             base_url: "https://panel.example.com".into(),
@@ -10133,6 +10495,7 @@ mod tests {
             let (s, n) = (FakeSys::new(), FakeNet::new());
             check_ready(&s, &n, &pp, Mode::Socks);
             s.remove_file(&pp.unit(UNIT_MAIN)).unwrap();
+            converge_gave_up(&s, &pp);
             s.reply("systemctl is-active --quiet bui-c.service", 3, "");
             s.stage_on_lock("/opt/bui-c/profiles.json", &json(&staged));
             let r = run_menu(&s, &n, &pp, &["5", "0", "0"], true);
@@ -10140,5 +10503,585 @@ mod tests {
             assert!(!s.called("systemctl start bui-c.service"), "{}", r.t);
             assert!(r.t.contains("修复失败："), "{}", r.t);
         }
+    }
+
+    // ───────────── T12c：pending.json 与中断收敛（spec §5.5、§0.2 R2 / R10 / R12） ─────────────
+
+    /// 删除提交写下的中断标记（与 `delete_nodes` 写的同形）。
+    const PENDING: &str = r#"{"op":"delete","targets":["hysteria2-1778329470"],"at":1757548800}"#;
+
+    /// `from` 之后第一次出现 `c` 的位置（找不到就带着流水 panic）。
+    fn call_at(s: &FakeSys, from: usize, c: &str) -> usize {
+        let calls = s.calls();
+        calls[from..]
+            .iter()
+            .position(|x| x == c)
+            .map(|i| i + from)
+            .unwrap_or_else(|| panic!("没有 {c}：{:?}", &calls[from..]))
+    }
+
+    /// 跑一轮巡检（`bui-c check`），返回它说的话。
+    fn timer_check(s: &FakeSys, n: &FakeNet, pp: &Paths) -> String {
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(s, n, pp, &mut p, false, false);
+        dispatch(&parse(&["check"]), &mut ctx).unwrap();
+        ctx.transcript.clone()
+    }
+
+    /// 手机 SSH 断在「删到当前节点、切到替换节点」的半路：`apply(next)` 已经把替换节点的配置
+    /// 写进去并重启了，`profiles.json` 还没写、`pending.json` 还在。下一次进菜单先拿锁按节点
+    /// 列表（删除之前那一份）收拾，然后在「上次：」行说一次，不停。
+    #[test]
+    fn an_interrupted_switch_is_converged_on_the_next_menu_start() {
+        let pp = paths();
+        let (s, n) = (FakeSys::new(), FakeNet::new());
+        let prof = nine_nodes(&s, &pp, Mode::Socks);
+        let config = s.get("/opt/bui-c/config.json").unwrap();
+        let mut next = prof.clone();
+        next.active = Some(RICK_REALITY.to_string());
+        let cfg = Engine::new(&s, &pp)
+            .render(&next, next.active_profile().unwrap())
+            .unwrap();
+        s.put(
+            "/opt/bui-c/config.json",
+            &serde_json::to_string_pretty(&cfg).unwrap(),
+        );
+        s.put("/opt/bui-c/pending.json", PENDING);
+        let before = restarts(&s);
+        let from = s.calls().len();
+        s.set_term_size(Some((40, 24)));
+        let r = run_menu(&s, &n, &pp, &["0"], true);
+
+        assert_eq!(
+            s.get("/opt/bui-c/config.json").unwrap(),
+            config,
+            "按节点列表换回删除之前的配置：\n{}",
+            r.t
+        );
+        assert_eq!(restarts(&s) - before, 1, "{}", r.t);
+        let restart = call_at(&s, from, "systemctl restart bui-c.service");
+        assert!(call_at(&s, from, "lock") < restart, "{:?}", s.calls());
+        assert!(restart < call_at(&s, from, "unlock"), "{:?}", s.calls());
+        assert!(!s.exists(&pp.pending()), "收拾过就删掉：\n{}", r.t);
+        let last = last_line(&r.t);
+        assert!(
+            last.contains("删除没做完") && last.contains("收拾好"),
+            "{last}"
+        );
+        assert_eq!(pauses(&r.asked), 0, "收拾好了不停：{:?}", r.asked);
+        assert_eq!(r.t.matches("B-UI 客户端").count(), 1, "{}", r.t);
+        assert!(
+            r.t.find("B-UI 客户端").unwrap() < r.t.find("  上次：").unwrap(),
+            "{}",
+            r.t
+        );
+        assert_eq!(names(&s, &pp).len(), 9, "节点列表不动");
+        assert_eq!(
+            Profiles::load(&s, &pp).unwrap().active.as_deref(),
+            Some(ACTIVE)
+        );
+        assert_eq!(
+            Runtime::load(&s, &pp).last_converge,
+            None,
+            "显示过一次就清掉"
+        );
+        for l in r.t.lines() {
+            assert!(menu::budget_width(l) <= menu::line_limit(40), "{l:?}");
+        }
+    }
+
+    /// 断线落在删光的收尾段：`profiles.json` 已经写成空的（墓碑也记了），主单元文件、`config.json`
+    /// 与 UFW 放行却还在，`pending.json` 也还在。下一分钟的巡检拿锁把它拆完、撤掉 UFW、把重启
+    /// 记账清零；结果留给下次进菜单显示一次。
+    #[test]
+    fn an_interrupted_teardown_is_finished_by_the_timer_check() {
+        let pp = paths();
+        let (s, n) = (FakeSys::new(), FakeNet::new());
+        let prof = nine_nodes(&s, &pp, Mode::Tun);
+        let mut rt = Runtime::load(&s, &pp);
+        rt.ufw_rules = true;
+        rt.fail_streak = 3;
+        rt.last_restart_at = Some(1_760_000_000);
+        rt.save(&s, &pp).unwrap();
+        s.reply("ufw status", 0, "Status: active\n");
+        let mut gone = prof.clone();
+        for p in &prof.profiles {
+            gone.bury(p, 1_757_548_800);
+        }
+        gone.profiles.clear();
+        gone.active = None;
+        gone.save(&s, &pp).unwrap();
+        s.put("/opt/bui-c/pending.json", PENDING);
+        // stop 之后就不在跑了；disable 之后 is-enabled 也不再为真
+        s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        s.reply("systemctl is-enabled --quiet bui-c.service", 1, "");
+        let from = s.calls().len();
+        let t = timer_check(&s, &n, &pp);
+
+        assert!(!s.exists(&pp.unit(UNIT_MAIN)), "主单元文件删掉：\n{t}");
+        assert!(!s.exists(&pp.config()), "{t}");
+        assert!(s.exists(&pp.unit(UNIT_TIMER)), "timer 留着（R10）");
+        assert!(s.exists(&pp.singbox()), "内核留着");
+        let reload = call_at(&s, from, "systemctl daemon-reload");
+        assert!(call_at(&s, from, "systemctl stop bui-c.service") < reload);
+        assert!(call_at(&s, from, "lock") < reload && reload < call_at(&s, from, "unlock"));
+        assert!(
+            s.called("ufw delete allow in on bui-tun"),
+            "{:?}",
+            s.calls()
+        );
+        assert!(!s.exists(&pp.pending()), "{t}");
+        assert!(
+            Profiles::load(&s, &pp).unwrap().profiles.is_empty(),
+            "不把节点加回来"
+        );
+        let rt = Runtime::load(&s, &pp);
+        assert!(!rt.ufw_rules, "撤掉了就记下来");
+        assert_eq!((rt.fail_streak, rt.last_restart_at), (0, None));
+        let lc = rt.last_converge.clone().expect("巡检把结果留给菜单");
+        assert!(lc.ok && lc.after_delete, "{lc:?}");
+        assert!(t.contains("收拾好"), "巡检日志里也要有一句：\n{t}");
+
+        // 下一次进菜单显示一次，再下一次就不说了；两次都不再拆
+        let reloads = count_calls(&s, "systemctl daemon-reload");
+        let r = run_menu(&s, &n, &pp, &["0"], true);
+        let last = last_line(&r.t);
+        assert!(
+            last.contains("删除没做完") && last.contains("收拾好"),
+            "{last}"
+        );
+        let r = run_menu(&s, &n, &pp, &["0"], true);
+        assert!(!r.t.contains("收拾"), "只显示一次：\n{}", r.t);
+        assert_eq!(count_calls(&s, "systemctl daemon-reload"), reloads);
+    }
+
+    /// R10：删光之后 timer 与 `bui-c-check.service` 都留着，巡检照样每分钟跑。收敛的触发条件只看
+    /// **主单元**（文件、`config.json`、is-active / is-enabled），不看「任一 bui-c 单元在」——
+    /// 否则删光后每分钟都要 teardown 一次。
+    #[test]
+    fn after_deleting_everything_two_timer_checks_do_not_tear_down_again() {
+        let pp = paths();
+        let (s, n) = (FakeSys::new(), FakeNet::new());
+        let prof = nine_nodes(&s, &pp, Mode::Tun);
+        s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        s.reply("systemctl is-enabled --quiet bui-c.service", 1, "");
+        let all: Vec<&str> = prof.profiles.iter().map(|p| p.name.as_str()).collect();
+        let (r, t) = del(&s, &n, &pp, &all, None, &delete::snapshot(&prof));
+        assert!(r.expect(&t).stopped);
+        assert_eq!(
+            s.writes("/opt/bui-c/pending.json"),
+            1,
+            "动数据面之前写下 pending.json"
+        );
+        assert!(!s.exists(&pp.pending()), "落盘之后删掉");
+        // timer 那两个单元还在、还 active / enabled（ready() 登记的）
+        assert!(s.exists(&pp.unit(UNIT_TIMER)) && s.exists(&pp.unit(crate::paths::UNIT_CHECK)));
+
+        let from = s.calls().len();
+        for _ in 0..2 {
+            let t = timer_check(&s, &n, &pp);
+            assert!(t.contains("没有激活的节点"), "{t}");
+        }
+        let calls = s.calls()[from..].to_vec();
+        for c in [
+            "systemctl daemon-reload",
+            "systemctl stop bui-c.service",
+            "systemctl disable bui-c.service",
+        ] {
+            assert!(
+                !calls.iter().any(|x| x == c),
+                "删光后巡检不该 {c}：{calls:?}"
+            );
+        }
+        assert_eq!(Runtime::load(&s, &pp).last_converge, None);
+    }
+
+    /// R12：收敛只试一次。失败也删掉 `pending.json`，结果进「上次：」行（失败先停下来看原因），
+    /// 显示过就清掉；之后进菜单、跑巡检都不再收拾——交给正常的退避重启。
+    #[test]
+    fn converge_runs_once_and_reports_on_the_last_line() {
+        let pp = paths();
+
+        // ① 收拾失败：拆到一半断了（主单元文件没了、节点列表还在），内核也不见了，apply 必然失败
+        let (s, n) = (FakeSys::new(), FakeNet::new());
+        nine_nodes(&s, &pp, Mode::Socks);
+        s.remove_file(&pp.unit(UNIT_MAIN)).unwrap();
+        s.remove_file(&pp.singbox()).unwrap();
+        s.put("/opt/bui-c/pending.json", PENDING);
+        s.set_term_size(Some((40, 24)));
+        let r = run_menu(&s, &n, &pp, &["", "0"], true);
+        assert_eq!(pauses(&r.asked), 1, "失败要停下来看原因：{:?}", r.asked);
+        assert!(r.t.contains("收拾也失败了"), "{}", r.t);
+        assert!(r.t.contains("内核缺失"), "页上要有原因：\n{}", r.t);
+        assert!(
+            r.t.find("内核缺失").unwrap() < r.t.find("B-UI 客户端").unwrap(),
+            "原因打在清屏之前、停下来看：\n{}",
+            r.t
+        );
+        let last = last_line(&r.t);
+        assert!(last.contains("收拾也失败了"), "{last}");
+        for l in r.t.lines() {
+            assert!(menu::budget_width(l) <= menu::line_limit(40), "{l:?}");
+        }
+        assert!(!s.exists(&pp.pending()), "失败也删掉 pending：只试一次");
+        let rt = Runtime::load(&s, &pp);
+        assert_eq!(rt.last_converge, None, "显示过就清掉");
+
+        let from = s.calls().len();
+        let r = run_menu(&s, &n, &pp, &["0"], true);
+        assert!(
+            !s.calls()[from..].iter().any(|c| c == "lock"),
+            "第二次进菜单不再收拾：{:?}",
+            &s.calls()[from..]
+        );
+        assert!(!r.t.contains("收拾"), "{}", r.t);
+        assert_eq!(pauses(&r.asked), 0, "{:?}", r.asked);
+        for _ in 0..2 {
+            let t = timer_check(&s, &n, &pp);
+            assert!(!t.contains("收拾"), "巡检不每分钟重试（R12）：\n{t}");
+        }
+        assert_eq!(Runtime::load(&s, &pp).last_converge, None);
+        assert!(!s.exists(&pp.unit(UNIT_MAIN)), "没有再 apply");
+
+        // ② 收拾成功：说一次，第二次进菜单就不说了，也不再拿锁
+        let (s, n) = (FakeSys::new(), FakeNet::new());
+        nine_nodes(&s, &pp, Mode::Socks);
+        s.remove_file(&pp.config()).unwrap();
+        s.put("/opt/bui-c/pending.json", PENDING);
+        let r = run_menu(&s, &n, &pp, &["0"], true);
+        assert!(last_line(&r.t).contains("收拾好"), "{}", r.t);
+        assert!(s.exists(&pp.config()) && !s.exists(&pp.pending()));
+        let from = s.calls().len();
+        let r = run_menu(&s, &n, &pp, &["0"], true);
+        assert!(!r.t.contains("收拾"), "{}", r.t);
+        assert!(!s.calls()[from..].iter().any(|c| c == "lock"));
+    }
+
+    /// R12：两个会话同时开菜单，进门时都判了「要收敛」；第二个等到锁时，第一个已经收拾好了。
+    /// 拿锁后重判不成立就直接放锁：不再 apply、不误报。
+    #[test]
+    fn a_second_session_rechecks_after_taking_the_lock() {
+        let pp = paths();
+        let (s, n) = (FakeSys::new(), FakeNet::new());
+        nine_nodes(&s, &pp, Mode::Socks);
+        let unit = s.get("/etc/systemd/system/bui-c.service").unwrap();
+        s.remove_file(&pp.unit(UNIT_MAIN)).unwrap();
+        s.stage_on_lock("/etc/systemd/system/bui-c.service", &unit);
+        let (before, reloads) = (restarts(&s), count_calls(&s, "systemctl daemon-reload"));
+        let from = s.calls().len();
+        let r = run_menu(&s, &n, &pp, &["0"], true);
+        assert!(
+            s.calls()[from..].iter().any(|c| c == "lock"),
+            "进门时要收敛，拿了锁：{:?}",
+            &s.calls()[from..]
+        );
+        assert_eq!(restarts(&s), before, "{}", r.t);
+        assert_eq!(count_calls(&s, "systemctl daemon-reload"), reloads);
+        assert!(!s.called("systemctl start bui-c.service"));
+        assert!(
+            !r.t.contains("收拾") && !r.t.contains("  上次："),
+            "{}",
+            r.t
+        );
+        let rt = Runtime::load(&s, &pp);
+        assert_eq!((rt.last_converge, rt.converge_failed), (None, None));
+    }
+
+    /// 要收敛时锁被占着：菜单等满 15 秒，说清没做成、什么都没改；巡检只试一次，跳过本轮、不写
+    /// runtime.json。两边都把 `pending.json` 原样留给下一次。
+    #[test]
+    fn a_busy_lock_leaves_the_pending_for_the_next_menu_or_timer_check() {
+        let pp = paths();
+        let (s, n) = (FakeSys::new(), FakeNet::new());
+        let prof = nine_nodes(&s, &pp, Mode::Socks);
+        s.remove_file(&pp.config()).unwrap();
+        s.put("/opt/bui-c/pending.json", PENDING);
+        s.lock_busy(u32::MAX);
+        let r = run_menu(&s, &n, &pp, &["", "0"], true);
+        assert!(!s.exists(&pp.config()), "{}", r.t);
+        assert!(s.exists(&pp.pending()), "留给下一次：\n{}", r.t);
+        assert!(r.t.contains("稍后再试"), "{}", r.t);
+        assert!(last_line(&r.t).starts_with("  上次：失败："), "{}", r.t);
+        assert_eq!(pauses(&r.asked), 1, "{:?}", r.asked);
+
+        let writes = s.writes("/opt/bui-c/runtime.json");
+        let t = timer_check(&s, &n, &pp);
+        assert!(t.contains("本轮巡检跳过"), "{t}");
+        assert_eq!(s.writes("/opt/bui-c/runtime.json"), writes, "{t}");
+        assert!(s.exists(&pp.pending()) && !s.exists(&pp.config()));
+
+        // 锁放了：下一分钟的巡检收拾掉
+        s.lock_busy(0);
+        let t = timer_check(&s, &n, &pp);
+        assert!(t.contains("收拾好"), "{t}");
+        assert!(s.exists(&pp.config()) && !s.exists(&pp.pending()));
+        assert_eq!(names(&s, &pp).len(), prof.profiles.len());
+    }
+
+    /// T7 修复轮里删光时写盘失败的停顿页说「下次进菜单或巡检会按节点列表收拾」：这里把两条路都
+    /// 走一遍，钉住这句话是真的——代理按还列着的节点重新起来，`pending.json` 删掉。
+    #[test]
+    fn a_delete_everything_that_could_not_save_is_tidied_up_by_the_next_menu_or_timer_check() {
+        let pp = paths();
+        for via_timer in [false, true] {
+            let (s, n) = (FakeSys::new(), FakeNet::new());
+            let prof = nine_nodes(&s, &pp, Mode::Tun);
+            let config = s.get("/opt/bui-c/config.json").unwrap();
+            s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+            s.fail_write("/opt/bui-c/profiles.json");
+            let all: Vec<&str> = prof.profiles.iter().map(|p| p.name.as_str()).collect();
+            let (r, t) = del(&s, &n, &pp, &all, None, &delete::snapshot(&prof));
+            assert_eq!(r.unwrap_err().to_string(), delete::STOPPED_NOT_SAVED_SHORT);
+            assert!(t.contains(delete::STOPPED_NOT_SAVED), "{t}");
+            assert!(!s.exists(&pp.unit(UNIT_MAIN)) && !s.exists(&pp.config()));
+            assert!(s.exists(&pp.pending()), "不可回头段走过了，留给收敛");
+            assert_eq!(s.mode("/opt/bui-c/pending.json"), Some(0o600));
+
+            // 磁盘腾出来了，服务也起得来
+            s.allow_write("/opt/bui-c/profiles.json");
+            s.reply("systemctl is-active --quiet bui-c.service", 0, "");
+            let said = if via_timer {
+                timer_check(&s, &n, &pp)
+            } else {
+                last_line(&run_menu(&s, &n, &pp, &["0"], true).t).to_string()
+            };
+            assert!(said.contains("收拾好"), "via_timer={via_timer}：{said}");
+            assert!(s.exists(&pp.unit(UNIT_MAIN)), "via_timer={via_timer}");
+            assert_eq!(
+                s.get("/opt/bui-c/config.json").unwrap(),
+                config,
+                "按还列着的节点重新起来（via_timer={via_timer}）"
+            );
+            assert!(!s.exists(&pp.pending()), "via_timer={via_timer}");
+            assert_eq!(names(&s, &pp).len(), 9);
+            assert_eq!(
+                Profiles::load(&s, &pp).unwrap().active.as_deref(),
+                Some(ACTIVE)
+            );
+        }
+    }
+
+    /// `pending.json` 只在「数据面可能与节点列表对不上」时留下（spec §0.2 R2、R10）：数据面没动过
+    /// 或已经换回去就删；回滚也失败才留给收敛。Passive 形态不动数据面，不写。
+    #[test]
+    fn pending_json_is_left_only_when_the_data_plane_may_be_out_of_step() {
+        let pp = paths();
+        let pending = std::path::Path::new("/opt/bui-c/pending.json");
+        let run = |mode: Mode, setup: &dyn Fn(&FakeSys), targets: &[&str]| {
+            let (s, n) = (FakeSys::new(), FakeNet::new());
+            let prof = nine_nodes(&s, &pp, mode);
+            setup(&s);
+            let all: Vec<&str> = prof.profiles.iter().map(|p| p.name.as_str()).collect();
+            let names: &[&str] = if targets.is_empty() { &all } else { targets };
+            let (r, t) = del(&s, &n, &pp, names, None, &delete::snapshot(&prof));
+            (s, r, t)
+        };
+
+        // Passive：不写
+        let (s, r, t) = run(Mode::Socks, &|_| {}, &["HY2"]);
+        r.expect(&t);
+        assert_eq!(s.writes("/opt/bui-c/pending.json"), 0);
+
+        // Switch 成功：写过、删掉
+        let (s, r, t) = run(Mode::Socks, &|_| {}, &[ACTIVE]);
+        r.expect(&t);
+        assert_eq!(s.writes("/opt/bui-c/pending.json"), 1);
+        assert!(!s.exists(pending));
+
+        // Switch 失败、换回去了：删掉
+        let (s, r, t) = run(
+            Mode::Socks,
+            &|s| s.fail_write("/opt/bui-c/config.json"),
+            &[ACTIVE],
+        );
+        assert!(r.is_err() && t.contains(delete::ROLLED_BACK), "{t}");
+        assert_eq!(s.writes("/opt/bui-c/pending.json"), 1);
+        assert!(!s.exists(pending), "{t}");
+
+        // Switch 写盘失败、换回去了：删掉
+        let (s, r, t) = run(
+            Mode::Socks,
+            &|s| s.fail_write("/opt/bui-c/profiles.json"),
+            &[ACTIVE],
+        );
+        assert!(r.is_err() && t.contains(delete::ROLLED_BACK), "{t}");
+        assert_eq!(s.writes("/opt/bui-c/pending.json"), 1);
+        assert!(!s.exists(pending), "{t}");
+
+        // 回滚也失败：留下，0600，写的是这次删除
+        let (s, r, t) = run(
+            Mode::Socks,
+            &|s| s.reply("systemctl restart bui-c.service", 1, "Job failed"),
+            &[ACTIVE],
+        );
+        assert!(r.is_err() && t.contains(delete::ROLLBACK_FAILED), "{t}");
+        let left = s
+            .get("/opt/bui-c/pending.json")
+            .unwrap_or_else(|| panic!("{t}"));
+        assert_eq!(s.mode("/opt/bui-c/pending.json"), Some(0o600));
+        let v: serde_json::Value = serde_json::from_str(&left).unwrap();
+        assert_eq!(v["op"], "delete");
+        assert_eq!(v["targets"], serde_json::json!([ACTIVE]));
+
+        // 删光时停不下来：不可回头段一步没走，数据面没动，删掉
+        let (s, r, t) = run(Mode::Socks, &|_| {}, &[]);
+        assert_eq!(r.unwrap_err().to_string(), delete::TEARDOWN_FAILED_SHORT);
+        assert_eq!(s.writes("/opt/bui-c/pending.json"), 1);
+        assert!(!s.exists(pending), "{t}");
+
+        // 删光时拆到一半失败（daemon-reload 报错）：主单元文件已经删了，留下
+        let (s, r, t) = run(
+            Mode::Socks,
+            &|s| {
+                s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+                s.reply("systemctl daemon-reload", 1, "Access denied");
+            },
+            &[],
+        );
+        assert_eq!(r.unwrap_err().to_string(), delete::TEARDOWN_FAILED_SHORT);
+        assert!(s.exists(pending), "{t}");
+    }
+
+    /// 写不进 `pending.json`（磁盘满）：不带着没有兜底的删除去动数据面。什么都没改，停顿页说清。
+    #[test]
+    fn a_pending_json_that_cannot_be_written_aborts_before_the_data_plane() {
+        let pp = paths();
+        for all in [false, true] {
+            let (s, n) = (FakeSys::new(), FakeNet::new());
+            let prof = nine_nodes(&s, &pp, Mode::Tun);
+            let config = s.get("/opt/bui-c/config.json").unwrap();
+            let before = restarts(&s);
+            s.fail_write("/opt/bui-c/pending.json");
+            let every: Vec<&str> = prof.profiles.iter().map(|p| p.name.as_str()).collect();
+            let targets: &[&str] = if all { &every } else { &[ACTIVE] };
+            let (r, t) = del(&s, &n, &pp, targets, None, &delete::snapshot(&prof));
+            let e = r.unwrap_err().to_string();
+            assert!(e.contains("pending.json"), "{e}");
+            assert!(t.contains(delete::STILL_THERE), "{t}");
+            assert_eq!(restarts(&s), before, "{t}");
+            assert!(!s.called("systemctl stop bui-c.service"), "{t}");
+            assert!(s.exists(&pp.unit(UNIT_MAIN)), "{t}");
+            assert_eq!(s.get("/opt/bui-c/config.json").unwrap(), config);
+            assert_eq!(names(&s, &pp).len(), 9);
+            let room = menu::line_limit(40) - menu::budget_width("  上次：");
+            assert!(menu::budget_width(&e) <= room, "{e}");
+        }
+    }
+
+    /// 没有删除做到一半（没有 `pending.json`），只是节点列表与数据面对不上——例如首次导入时 apply
+    /// 没做成、单元文件从没写过：照样收拾，但不能说「删除没做完」。
+    #[test]
+    fn converging_without_a_pending_delete_does_not_blame_a_delete() {
+        let pp = paths();
+        let (s, n) = (FakeSys::new(), FakeNet::new());
+        nine_nodes(&s, &pp, Mode::Socks);
+        s.remove_file(&pp.unit(UNIT_MAIN)).unwrap();
+        s.set_term_size(Some((40, 24)));
+        let r = run_menu(&s, &n, &pp, &["0"], true);
+        let last = last_line(&r.t);
+        assert!(last.contains("收拾好"), "{last}");
+        assert!(!last.contains("删除"), "{last}");
+        assert!(s.exists(&pp.unit(UNIT_MAIN)));
+
+        // 失败时同理，原因照样打在页上
+        let (s, n) = (FakeSys::new(), FakeNet::new());
+        nine_nodes(&s, &pp, Mode::Socks);
+        s.remove_file(&pp.unit(UNIT_MAIN)).unwrap();
+        s.remove_file(&pp.singbox()).unwrap();
+        s.set_term_size(Some((40, 24)));
+        let r = run_menu(&s, &n, &pp, &["", "0"], true);
+        // 主菜单本身有「[6] 删除节点」：只看说收拾的那几行
+        let tidy: Vec<&str> =
+            r.t.lines()
+                .filter(|l| l.contains("收拾") || l.contains("上次："))
+                .collect();
+        assert!(!tidy.is_empty(), "{}", r.t);
+        assert!(tidy.iter().all(|l| !l.contains("删除")), "{tidy:?}");
+        assert!(r.t.contains("内核缺失"), "{}", r.t);
+        assert!(last_line(&r.t).contains("失败"), "{}", r.t);
+        for l in r.t.lines() {
+            assert!(menu::budget_width(l) <= menu::line_limit(40), "{l:?}");
+        }
+        // 同一份节点设置下不再自动重试（R12）
+        let from = s.calls().len();
+        let _ = timer_check(&s, &n, &pp);
+        let r = run_menu(&s, &n, &pp, &["0"], true);
+        assert!(!r.t.contains("收拾"), "{}", r.t);
+        assert!(
+            !s.calls()[from..]
+                .iter()
+                .any(|c| c.starts_with("systemctl enable")),
+            "{:?}",
+            &s.calls()[from..]
+        );
+    }
+
+    /// 收敛失败的记录只挡「同一个没收拾好的状态」：人用 [5] 修复或 [1] 切换把机器修好之后，下一轮
+    /// 巡检把它忘掉；以后再对不上（哪怕节点设置一样）照常收敛一次。
+    #[test]
+    fn a_machine_fixed_by_hand_forgets_the_failed_converge() {
+        let pp = paths();
+        let (s, n) = (FakeSys::new(), FakeNet::new());
+        let prof = nine_nodes(&s, &pp, Mode::Socks);
+        s.remove_file(&pp.unit(UNIT_MAIN)).unwrap();
+        s.remove_file(&pp.singbox()).unwrap();
+        let t = timer_check(&s, &n, &pp);
+        assert!(t.contains("收拾也失败了"), "{t}");
+        assert!(Runtime::load(&s, &pp).converge_failed.is_some());
+
+        // 内核装回来了、人在 [5] 里修好了：下一轮巡检把失败记录清掉
+        s.put("/opt/bui-c/bin/sing-box", "ELF");
+        Engine::new(&s, &pp).apply(&prof).unwrap();
+        let t = timer_check(&s, &n, &pp);
+        assert!(!t.contains("收拾"), "{t}");
+        assert_eq!(Runtime::load(&s, &pp).converge_failed, None, "{t}");
+
+        // 以后又对不上：照常收敛
+        s.remove_file(&pp.config()).unwrap();
+        let t = timer_check(&s, &n, &pp);
+        assert!(t.contains("收拾好"), "{t}");
+        assert!(s.exists(&pp.config()));
+    }
+
+    /// 收敛与 pending 的新文案（spec §0.2 R6、R12）：固定文案 ≤ 59 列；「上次：」行的短式整句放进
+    /// 40 列那一行的 31 列；失败页按宽度折行之后每行都放得下，原因（可操作的那半）不被截掉。
+    #[test]
+    fn the_converge_copy_fits_by_budget() {
+        let room = menu::line_limit(40) - menu::budget_width("  上次：");
+        for (after_delete, ok) in [(true, true), (true, false), (false, true), (false, false)] {
+            let lc = LastConverge {
+                at: 0,
+                ok,
+                msg: if ok {
+                    String::new()
+                } else {
+                    "内核缺失：/opt/bui-c/bin/sing-box，先跑 `bui-c update` 安装 sing-box".into()
+                },
+                after_delete,
+            };
+            let short = converge_short(&lc);
+            assert!(menu::budget_width(short) <= room, "{short}");
+            assert_eq!(menu::truncate_end(short, room), short);
+            let fixed = converge_line(&LastConverge {
+                msg: String::new(),
+                ..lc.clone()
+            });
+            assert!(menu::budget_width(&fixed) <= 59, "{fixed}");
+            for width in [40, 50, 60, 80, 100] {
+                let page = delete::page(&[converge_line(&lc)], width);
+                for l in page.lines() {
+                    assert!(menu::budget_width(l) <= menu::line_limit(width), "{l:?}");
+                }
+                if !ok {
+                    // 折行只断在空格处或宽字符之间：用空格拼回去，原因一个字不少
+                    let joined = page.lines().map(str::trim).collect::<Vec<_>>().join(" ");
+                    assert!(joined.contains("`bui-c update` 安装 sing-box"), "{page}");
+                }
+            }
+        }
+        assert!(
+            menu::budget_width(PENDING_FAILED) <= room,
+            "{PENDING_FAILED}"
+        );
     }
 }
