@@ -209,7 +209,7 @@ impl Prompt for Scripted {
     }
 }
 
-/// 主菜单的一次选择。
+/// 主菜单的一次选择（键位见 spec §1.1、§1.2）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     SwitchNode,
@@ -217,10 +217,13 @@ pub enum Action {
     ImportNode,
     Service,
     Check,
-    Update,
-    ImportV3,
+    /// `[6] 删除节点`（v4 的 [6] 检查更新挪进了 [7] 子页）。
+    DeleteNode,
+    /// `[7] 更新与维护`：检查更新、自动更新开关、从 v3 导入的子页。
+    Maintenance,
     Uninstall,
-    AutoUpdate,
+    /// `[9] 节点测速`。T16 之前主菜单不显示这一行，按 9 只给一句 [`AUTO_UPDATE_MOVED`]。
+    SpeedTest,
     Quit,
 }
 
@@ -238,9 +241,106 @@ pub struct Status {
     pub tun_up: bool,
     pub socks_port: u16,
     pub http_port: u16,
+    /// 上一次检查更新的结论：有新版时主菜单在 `[7] 更新与维护` 后面挂 ★（spec §0.2 R6）。
     pub update_available: bool,
-    /// `[9]` 每日自动更新的开关状态（spec §6「可关」）。
+}
+
+// ───────────── [7] 更新与维护子页与旧键过渡（spec §1.2、§8.4、§0.2 R1 / R6 / R15） ─────────────
+
+/// `[7] 更新与维护` 子页里的一次选择。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaintAction {
+    CheckUpdate,
+    ToggleAuto,
+    ImportV3,
+    Back,
+}
+
+/// `[7]` 子页顶部三行只读的本地事实（spec §8.1 第一条）：不为画这一页去联网。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaintStatus {
+    /// 本机 bui-c 的版本。
+    pub version: String,
+    /// 「上次检查」那一行的内容：`有新版（2 小时前）`、`已是最新（…）`、`还没检查过`。
+    pub update_line: String,
+    /// `profiles.auto_update`。
     pub auto_update: bool,
+}
+
+/// [6] 删除页顶的旧键过渡提示（spec §0.2 R1，D2）：给按 v3 的「6 高级设置」、v4 的「6 检查更新」
+/// 进来的人。常量本身 ≤ 37 列（加 2 列缩进 ≤ 39），40 列终端一行放得下。下一个次版本删掉。
+pub const MOVED_HINT_DELETE: &str = "（高级设置已取消，检查更新在 [7]）";
+/// [9] 测速页顶的旧键过渡提示（spec §0.2 R1，T16 用）：给按 v4 的「9 自动更新」进来的人。
+/// 口径同 [`MOVED_HINT_DELETE`]。
+pub const MOVED_HINT_SPEEDTEST: &str = "（自动更新开关挪到了 [7]）";
+/// [`Ctx`](crate::cli::Ctx) 的 `hints_shown` 按位记：[6] 删除页的过渡提示显示过。
+pub const HINT_DELETE: u8 = 1 << 0;
+/// 同上：[9] 测速页的过渡提示显示过（T16）。
+pub const HINT_SPEEDTEST: u8 = 1 << 1;
+/// T9 到 T16 之间按 9 给的那句 Note（spec §0.2 R15 逐字）。
+pub const AUTO_UPDATE_MOVED: &str = "自动更新开关在 [7] 更新与维护 → [2]";
+/// 进菜单前的 v3 导入邀请答了否（spec §11.1）。交互终端里它接着就被清屏抹掉、只活在「上次：」行
+/// 里，所以菜单走法写在前头：40 列那一行只有 31 列，尾截之后 `[7] 更新与维护 → [3]` 还在；
+/// 命令放后面，宽屏才看得到。命令不加反引号，60 列整句放得下。
+pub const V3_SKIPPED: &str = "已跳过：[7] 更新与维护 → [3]，或跑 bui-c import-v3";
+/// [4] 服务控制时还没有主单元（新机器）：装引擎与单元的路是导入节点。整句 31 列，40 列的
+/// 「上次：」行正好放下（以前「还没有安装引擎与单元：…」39 列，尾截会砍掉「[3] 导入节点」）。
+pub const NO_UNITS: &str = "还没装好引擎：先用 [3] 导入节点";
+/// 同上、机器上还有 v3 客户端时另起一行（spec §11.1：拼成一句超 59 列）。停顿页上按宽度折行：
+/// 60 列一行；40 列折在「→」后面，`[7] 更新与维护` 与 `[3] 从 v3 导入` 各自不被拆开。
+pub const NO_UNITS_V3: &str = "有 v3 客户端：用 [7] 更新与维护 → [3] 从 v3 导入";
+
+/// 「上次检查」后面的「多久以前」：不到 1 分钟（含时钟往回拨）写「刚刚」，其余只到分钟、小时、天。
+pub fn ago(secs: i64) -> String {
+    match secs {
+        i64::MIN..=59 => "刚刚".to_string(),
+        60..=3_599 => format!("{} 分钟前", secs / 60),
+        3_600..=86_399 => format!("{} 小时前", secs / 3_600),
+        _ => format!("{} 天前", secs / 86_400),
+    }
+}
+
+/// `[7] 更新与维护` 子页（spec §3e-60-5、§8.4）：样式与 [4] 服务控制一致——前空一行、两列缩进的
+/// 标题、5 列缩进的内容。顶部三行是本地事实，下面三个动作与返回；「上次检查」那一行放不下就尾截
+/// （T10 会写成带版本号、来源的长句），编号与动作名都是固定短文案，40 列放得下。提示符
+/// `选择 [0-3]` 由调用方问。
+pub fn render_maint(m: &MaintStatus, width: usize) -> String {
+    const FACT: &str = "     ";
+    let fact = |head: &str, value: &str| {
+        let lead = format!("{FACT}{head}   ");
+        let room = line_limit(width).saturating_sub(budget_width(&lead));
+        format!("{lead}{}\n", truncate_end(&sanitize(value), room))
+    };
+    let (auto, toggle) = if m.auto_update {
+        ("开，每天一次", "关闭自动更新")
+    } else {
+        ("关", "开启自动更新")
+    };
+    let mut out = String::from("\n  更新与维护\n");
+    out.push_str(&fact("当前版本", &m.version));
+    out.push_str(&fact("上次检查", &m.update_line));
+    out.push_str(&fact("自动更新", auto));
+    out.push_str(&format!(
+        "     [1] 检查更新\n     [2] {toggle}\n     [3] 从 v3 导入\n     [0] 返回\n"
+    ));
+    out
+}
+
+/// `[7]` 子页：空行与 `0` 返回，`1`–`3` 是动作（全角数字折半角），别的一律 `None`（调用方打一行
+/// 错误、原地重问）。
+pub fn parse_maint_choice(input: &str) -> Option<MaintAction> {
+    match normalize_digits(input).as_str() {
+        "" | "0" => Some(MaintAction::Back),
+        "1" => Some(MaintAction::CheckUpdate),
+        "2" => Some(MaintAction::ToggleAuto),
+        "3" => Some(MaintAction::ImportV3),
+        _ => None,
+    }
+}
+
+/// `[7]` 子页输错：`无效选项：{x}（请输入 0-3 的数字）`，回显先净化再截到行宽。
+pub fn invalid_maint_choice(input: &str, width: usize) -> String {
+    bad_input_line("无效选项：", input, "（请输入 0-3 的数字）", width)
 }
 
 /// 歧义宽度字符：真机（tmux）里是 1 列，手机客户端上可能是 2 列（spec §2.2 容量口径）。
@@ -690,14 +790,16 @@ fn status_detail(st: &Status, narrow: bool, room: usize) -> Vec<String> {
     }
 }
 
-/// 两列数字菜单块：`[1]`~`[9]` + 分隔线 + `[0] 退出`。两列排布任何宽度都不转单列（spec §2.2），
-/// 跟着宽度变的只有分隔线。
+/// 两列数字菜单块：`[1]`~`[8]` + 分隔线 + `[0] 退出`。两列排布任何宽度都不转单列（spec §2.2），
+/// 跟着宽度变的只有分隔线。`[9] 节点测速` 这一行 T16 才加（spec §0.2 R15）。
 pub fn render_options(st: &Status, width: usize) -> String {
     let mut out = String::new();
-    let update = if st.update_available {
-        "检查更新 ★ 有新版"
+    // 有新版时 ★ 挂在左栏名字后面、不改名（R6）：「更新与维护 ★」显示 12 列、容量 13 列，
+    // 放得进 14 列的左栏，右栏 [8] 不错位，40 列也放得下
+    let maint = if st.update_available {
+        "更新与维护 ★"
     } else {
-        "检查更新"
+        "更新与维护"
     };
     // [2] 直接写目标模式：「切换模式」不说切到哪边，用户得自己跟状态行对
     let to_mode = match st.mode {
@@ -707,16 +809,11 @@ pub fn render_options(st: &Status, width: usize) -> String {
     let rows = [
         row("1", "切换节点", "2", to_mode),
         row("3", "导入节点", "4", "服务控制"),
-        row("5", "连接检查", "6", update),
-        row("7", "从 v3 导入", "8", "卸载"),
-        // 第 9 项单独一行：spec §6 的「每日自动更新，可关」需要一个用户能点的开关
-        format!(
-            "     [9] 自动更新 {}\n",
-            if st.auto_update { "开" } else { "关" }
-        ),
+        row("5", "连接检查", "6", "删除节点"),
+        row("7", maint, "8", "卸载"),
     ];
-    // 分隔线跟实际最宽的那行选项等宽：[2] 的目标模式与 [6] 的「★ 有新版」都会改变行宽，
-    // 写死的线要么比选项长、要么短一截。再按容量口径封顶：`─` 在有的手机客户端上画成 2 列
+    // 分隔线跟实际最宽的那行选项等宽：[2] 的目标模式会改变行宽，写死的线要么比选项长、
+    // 要么短一截。再按容量口径封顶：`─` 在有的手机客户端上画成 2 列
     let widest = rows
         .iter()
         .map(|r| display_width(r.trim_end()))
@@ -992,10 +1089,10 @@ pub fn parse_choice(input: &str) -> Option<Action> {
         "3" => Some(Action::ImportNode),
         "4" => Some(Action::Service),
         "5" => Some(Action::Check),
-        "6" => Some(Action::Update),
-        "7" => Some(Action::ImportV3),
+        "6" => Some(Action::DeleteNode),
+        "7" => Some(Action::Maintenance),
         "8" => Some(Action::Uninstall),
-        "9" => Some(Action::AutoUpdate),
+        "9" => Some(Action::SpeedTest),
         "0" => Some(Action::Quit),
         _ => None,
     }
@@ -1784,7 +1881,6 @@ mod tests {
             socks_port: 1080,
             http_port: 8080,
             update_available: false,
-            auto_update: true,
         }
     }
 
@@ -1949,10 +2045,9 @@ mod tests {
             assert!(out.contains("[3] 导入节点"));
             assert!(out.contains("[4] 服务控制"));
             assert!(out.contains("[5] 连接检查"));
-            assert!(out.contains("[6] 检查更新"));
-            assert!(out.contains("[7] 从 v3 导入"));
+            assert!(out.contains("[6] 删除节点"));
+            assert!(out.contains("[7] 更新与维护"));
             assert!(out.contains("[8] 卸载"));
-            assert!(out.contains("[9] 自动更新"));
             assert!(out.contains("[0] 退出"));
             // 每个选项行恰好两栏
             let rows: Vec<&str> = out
@@ -1972,7 +2067,8 @@ mod tests {
 
     #[test]
     fn options_rule_ends_where_the_widest_option_row_ends() {
-        // 写死 34 列：SOCKS 模式（[2] 切到 TUN）比选项长 2 列，有新版时又比 [6] 那行短 7 列
+        // 写死 34 列：SOCKS 模式（[2] 切到 TUN）比选项长 2 列；有新版的 ★ 挂在左栏 [7] 后面，
+        // 不改最宽行，这一形态照样核对一遍
         let tun = st();
         let socks = Status {
             mode: Mode::Socks,
@@ -2139,20 +2235,155 @@ mod tests {
         assert!(mode_line(&t).contains("TUN   ○  未就绪"));
     }
 
+    /// 主菜单重排（spec §1.1、§1.2、§0.2 R6、R15）：[6] 删除节点、[7] 更新与维护；T16 之前
+    /// 不显示 [9] 行，按 9 由调用方给一句 Note。v4 挪走的三件（检查更新、从 v3 导入、自动更新
+    /// 开关）不再出现在主菜单上。
     #[test]
-    fn auto_update_row_reflects_the_switch() {
-        assert!(render(&st(), 80, None).contains("[9] 自动更新 开"));
-        let mut s = st();
-        s.auto_update = false;
-        assert!(render(&s, 80, None).contains("[9] 自动更新 关"));
+    fn menu_numbers_follow_the_new_layout() {
+        assert_eq!(parse_choice("6"), Some(Action::DeleteNode));
+        assert_eq!(parse_choice("7"), Some(Action::Maintenance));
+        assert_eq!(parse_choice("9"), Some(Action::SpeedTest));
+        assert_eq!(parse_choice("８"), Some(Action::Uninstall));
+        for w in [40, 50, 59, 80] {
+            let out = render(&st(), w, None);
+            assert!(out.contains("[6] 删除节点"), "@{w}\n{out}");
+            assert!(out.contains("[7] 更新与维护"), "@{w}\n{out}");
+            assert!(!out.contains("[9]"), "T16 之前不显示 [9] 行 @{w}\n{out}");
+            for gone in ["检查更新", "从 v3 导入", "自动更新"] {
+                assert!(!out.contains(gone), "{gone} 挪进了 [7] 子页 @{w}\n{out}");
+            }
+        }
+    }
+
+    /// 有新版时 ★ 挂在左栏 `[7] 更新与维护` 后面（R6，不改名）：40 列放得下，右栏 [8] 不错位。
+    #[test]
+    fn update_marker_hangs_on_maintenance_and_fits_40_columns() {
+        assert!(!render(&st(), 80, None).contains('★'));
+        let up = Status {
+            update_available: true,
+            ..st()
+        };
+        for w in [40, 50, 59, 80] {
+            let out = render(&up, w, None);
+            let row = out.lines().find(|l| l.contains("[7]")).unwrap();
+            assert!(row.contains("[7] 更新与维护 ★"), "@{w}：{row}");
+            assert!(row.contains("[8] 卸载"), "@{w}：{row}");
+            assert!(budget_width(row) <= line_limit(w), "@{w}：{row}");
+            assert!(!out.contains("有新版"), "主菜单只挂 ★ @{w}\n{out}");
+            // 右栏起点按显示列宽对齐（★ 真机上 1 列）
+            let col = |l: &str, key: &str| display_width(&l[..l.find(key).unwrap()]);
+            let six = out.lines().find(|l| l.contains("[6]")).unwrap();
+            assert_eq!(col(row, "[8]"), col(six, "[6]"), "@{w}\n{out}");
+        }
+    }
+
+    /// [7] 子页（spec §3e-60-5、§8.4）：顶部三行只读本地事实，下面三个动作 + 返回；[2] 的文案跟着
+    /// 开关变。
+    #[test]
+    fn maint_page_shows_facts_then_three_actions() {
+        let on = MaintStatus {
+            version: "4.0.0".into(),
+            update_line: "有新版（2 小时前）".into(),
+            auto_update: true,
+        };
+        assert_eq!(
+            render_maint(&on, 60),
+            "\n  更新与维护\n     当前版本   4.0.0\n     上次检查   有新版（2 小时前）\n     自动更新   开，每天一次\n     [1] 检查更新\n     [2] 关闭自动更新\n     [3] 从 v3 导入\n     [0] 返回\n"
+        );
+        let off = MaintStatus {
+            auto_update: false,
+            ..on.clone()
+        };
+        let out = render_maint(&off, 60);
+        assert!(out.contains("     自动更新   关\n"), "{out}");
+        assert!(out.contains("     [2] 开启自动更新\n"), "{out}");
+        // 40 列：上次检查那一行尾截，编号与动作名一个不少
+        let long = MaintStatus {
+            update_line: "有新版 4.0.1-rc12（来源 面板，365 天前）".into(),
+            ..on
+        };
+        let out = render_maint(&long, 40);
+        for l in out.lines() {
+            assert!(budget_width(l) <= line_limit(40), "{l:?}\n{out}");
+        }
+        for key in [
+            "[1] 检查更新",
+            "[2] 关闭自动更新",
+            "[3] 从 v3 导入",
+            "[0] 返回",
+        ] {
+            assert!(out.contains(key), "{key}\n{out}");
+        }
     }
 
     #[test]
-    fn update_marker_shows_only_when_available() {
-        assert!(!render(&st(), 80, None).contains("★ 有新版"));
-        let mut s = st();
-        s.update_available = true;
-        assert!(render(&s, 80, None).contains("★ 有新版"));
+    fn maint_choice_parses_numbers_and_back() {
+        assert_eq!(parse_maint_choice("1"), Some(MaintAction::CheckUpdate));
+        assert_eq!(parse_maint_choice(" ２ "), Some(MaintAction::ToggleAuto));
+        assert_eq!(parse_maint_choice("3"), Some(MaintAction::ImportV3));
+        assert_eq!(parse_maint_choice("0"), Some(MaintAction::Back));
+        assert_eq!(parse_maint_choice(""), Some(MaintAction::Back));
+        assert_eq!(parse_maint_choice("4"), None);
+        assert_eq!(parse_maint_choice("x"), None);
+        let bad = invalid_maint_choice("x", 80);
+        assert!(bad.contains("0-3"), "{bad}");
+    }
+
+    /// 「上次检查」后面的「多久以前」：只到分钟、小时、天，时钟往回拨算刚刚。
+    #[test]
+    fn ago_is_coarse_and_never_negative() {
+        assert_eq!(ago(-5), "刚刚");
+        assert_eq!(ago(59), "刚刚");
+        assert_eq!(ago(60), "1 分钟前");
+        assert_eq!(ago(3599), "59 分钟前");
+        assert_eq!(ago(3600), "1 小时前");
+        assert_eq!(ago(86_399), "23 小时前");
+        assert_eq!(ago(86_400), "1 天前");
+    }
+
+    /// 旧键过渡提示（spec §0.2 R1）：常量本身 ≤ 37 列，加 2 列缩进 ≤ 39，40 列终端一行放得下。
+    #[test]
+    fn moved_hints_fit_one_line_at_40_columns() {
+        for hint in [MOVED_HINT_DELETE, MOVED_HINT_SPEEDTEST] {
+            assert!(budget_width(hint) <= 37, "{hint} = {}", budget_width(hint));
+            assert_eq!(wrap(hint, 2, 40), format!("  {hint}\n"), "不折行");
+            assert!(hint.contains("[7]"), "{hint}");
+        }
+    }
+
+    /// 挪了位置的入口只活在「上次：」行里（跳过 v3 导入、按 9、没有单元）：固定文案 ≤ 59 列，
+    /// 菜单走法写在前头，40 列尾截之后可操作的那半还在。
+    #[test]
+    fn moved_entries_keep_the_menu_path_in_the_last_line_at_40_columns() {
+        for text in [V3_SKIPPED, AUTO_UPDATE_MOVED, NO_UNITS, NO_UNITS_V3] {
+            assert!(budget_width(text) <= 59, "{text} = {}", budget_width(text));
+        }
+        let last = |text: &str, w: usize| {
+            render(&st(), w, Some(text))
+                .lines()
+                .find(|l| l.starts_with("  上次："))
+                .unwrap()
+                .to_string()
+        };
+        assert!(
+            V3_SKIPPED.find("[7]") < V3_SKIPPED.find("bui-c import-v3"),
+            "先说菜单怎么走，再说命令：{V3_SKIPPED}"
+        );
+        assert!(last(V3_SKIPPED, 40).contains("[7] 更新与维护 → [3]"));
+        assert!(last(NO_UNITS, 40).contains("[3] 导入节点"));
+        assert!(last(AUTO_UPDATE_MOVED, 40).contains("[7] 更新与维护"));
+        assert!(last(AUTO_UPDATE_MOVED, 50).contains("[7] 更新与维护 → [2]"));
+        // NO_UNITS_V3 在停顿页上按宽度折行打：60 列一行；40 列折开时编号与名字不拆开
+        let page = wrap(NO_UNITS_V3, 2, 60);
+        assert!(
+            page.lines()
+                .any(|l| l.contains("[7] 更新与维护 → [3] 从 v3 导入")),
+            "{page}"
+        );
+        let page = wrap(NO_UNITS_V3, 2, 40);
+        for key in ["[7] 更新与维护", "[3] 从 v3 导入"] {
+            assert!(page.lines().any(|l| l.contains(key)), "{key}\n{page}");
+        }
     }
 
     #[test]
@@ -2263,8 +2494,8 @@ mod tests {
         out.push(("service", render_service_options()));
         // 下面是另补的形态：状态区带上各节点真实的 kind 与服务器:端口（上面只换了名字与 label，
         // 服务器:端口一直是 st() 的 23 列）、每个节点轮流当活动节点时的菜单列表与一次性 list、
-        // 没有节点、SOCKS 模式服务停了且端口是 5 位数。有新版时 [6] 右栏的「检查更新 ★ 有新版」
-        // 在 40–47 列放不下；主菜单重排把 ★ 挪到左栏之后，把 update_available 也加进来
+        // 没有节点、SOCKS 模式服务停了且端口是 5 位数。T9 起还有「有新版」形态：★ 挂在左栏
+        // `[7] 更新与维护` 后面（以前右栏的「检查更新 ★ 有新版」在 40–47 列放不下）
         for p in &prof.profiles {
             let s = Status {
                 node: p.name.clone(),
@@ -2307,6 +2538,46 @@ mod tests {
             ..st()
         };
         out.push(("socks", render(&socks, width, None)));
+        let update = Status {
+            update_available: true,
+            ..st()
+        };
+        out.push(("update", render(&update, width, None)));
+        out.push((
+            "update-socks",
+            render(
+                &Status {
+                    update_available: true,
+                    ..socks.clone()
+                },
+                width,
+                Some(V3_SKIPPED),
+            ),
+        ));
+        // T9：[7] 更新与维护子页（开关两种、上次检查的几种说法，含 T10 会写成的带版本号的长句）、
+        // 子页输错、旧键过渡提示、只活在「上次：」行里的几句挪了位置的引导
+        for auto_update in [true, false] {
+            for update_line in [
+                "还没检查过".to_string(),
+                format!("已是最新（{}）", ago(59 * 60)),
+                format!("有新版（{}）", ago(23 * 3600)),
+                "有新版 4.0.1-rc12（来源 面板，365 天前）".to_string(),
+            ] {
+                let m = MaintStatus {
+                    version: "4.0.0-rc12".into(),
+                    update_line,
+                    auto_update,
+                };
+                out.push(("maint", render_maint(&m, width)));
+            }
+        }
+        for hint in [MOVED_HINT_DELETE, MOVED_HINT_SPEEDTEST] {
+            out.push(("moved-hint", format!("  {hint}\n")));
+        }
+        for text in [V3_SKIPPED, AUTO_UPDATE_MOVED, NO_UNITS] {
+            out.push(("moved-last", render(&st(), width, Some(text))));
+        }
+        out.push(("no-units-v3", wrap(NO_UNITS_V3, 2, width)));
         // T4：「上次：」行（名字单独中间截断的切换摘要、空列表引导、长的失败行）与主菜单输错
         // 那一行（回显的输入先净化再尾截；菜单里 `say` 加 2 列缩进）
         for p in &prof.profiles {
@@ -2344,17 +2615,17 @@ mod tests {
                 "invalid-service",
                 format!("  {}\n", invalid_service_choice(input, width)),
             ));
+            out.push((
+                "invalid-maint",
+                format!("  {}\n", invalid_maint_choice(input, width)),
+            ));
         }
         // T6：删除页（有无过渡提示）与确认块（Passive / Switch / Empty，SOCKS 与 TUN，行数够与不够）
         let del = baiyi_like();
         out.push(("delete-picker", render_delete_picker(&del, width, None)));
         out.push((
             "delete-picker-hint",
-            render_delete_picker(
-                &del,
-                width,
-                Some("（原来的高级设置已取消，检查更新在 [7]）"),
-            ),
+            render_delete_picker(&del, width, Some(MOVED_HINT_DELETE)),
         ));
         let all: Vec<usize> = (0..del.profiles.len()).collect();
         for mode in [Mode::Socks, Mode::Tun] {
@@ -2749,7 +3020,9 @@ mod tests {
 
     #[test]
     fn every_line_fits_by_budget() {
-        for w in [40, 50, 60, 80, 100] {
+        // 59：行宽上限 58。60 列刚好放满的行（例如 V3_SKIPPED 那一条「上次：」行）少一列时
+        // 也得截得开、折得开，守住差一列的边界
+        for w in [40, 50, 59, 60, 80, 100] {
             for (name, text) in screens(w) {
                 for l in text.lines() {
                     assert!(
@@ -3062,8 +3335,9 @@ mod tests {
     fn choices_map_to_actions() {
         assert_eq!(parse_choice("1"), Some(Action::SwitchNode));
         assert_eq!(parse_choice(" 2 "), Some(Action::ToggleMode));
-        assert_eq!(parse_choice("7"), Some(Action::ImportV3));
-        assert_eq!(parse_choice("9"), Some(Action::AutoUpdate));
+        assert_eq!(parse_choice("6"), Some(Action::DeleteNode));
+        assert_eq!(parse_choice("7"), Some(Action::Maintenance));
+        assert_eq!(parse_choice("9"), Some(Action::SpeedTest));
         assert_eq!(parse_choice("0"), Some(Action::Quit));
         assert_eq!(parse_choice("10"), None);
         assert_eq!(parse_choice(""), None);
@@ -3078,7 +3352,7 @@ mod tests {
     fn fullwidth_digits_are_folded_to_ascii() {
         // 中文输入法下 `１` 是常见误触，别让它掉进「无效选项」
         assert_eq!(parse_choice("１"), Some(Action::SwitchNode));
-        assert_eq!(parse_choice(" ９ "), Some(Action::AutoUpdate));
+        assert_eq!(parse_choice(" ９ "), Some(Action::SpeedTest));
         assert_eq!(parse_choice("０"), Some(Action::Quit));
         assert_eq!(parse_choice("１０"), None, "折完还是越界");
         assert_eq!(pick_index("２", 3), Some(1));
@@ -3877,7 +4151,7 @@ mod delete_tests {
     #[test]
     fn the_delete_picker_shows_the_title_hint_list_and_syntax() {
         let prof = baiyi_like();
-        let hint = "（原来的高级设置已取消，检查更新在 [7]）";
+        let hint = MOVED_HINT_DELETE;
         assert_eq!(
             render_delete_picker(&prof, 60, None),
             format!(
@@ -3893,13 +4167,22 @@ mod delete_tests {
             )),
             "{hinted}"
         );
-        // 40 列放不下就折行：断在最后一个放得下的折点，这里是「[7]」前面的空格（后面是 ASCII）
+        // 40 列也是一行（常量 ≤ 37 列 + 缩进 2，spec §0.2 R1），「[7]）」不会单占一行
         let narrow = render_delete_picker(&prof, 40, Some(hint));
         assert!(
-            narrow.starts_with(
+            narrow.starts_with(&format!(
+                "\n  删除节点（共 9 个，★ 为当前）\n  {hint}\n  [1]   HY2\n"
+            )),
+            "{narrow}"
+        );
+        // 更长的提示照旧折行：断在最后一个放得下的折点，这里是「[7]」前面的空格（后面是 ASCII）
+        let long =
+            render_delete_picker(&prof, 40, Some("（原来的高级设置已取消，检查更新在 [7]）"));
+        assert!(
+            long.starts_with(
                 "\n  删除节点（共 9 个，★ 为当前）\n  （原来的高级设置已取消，检查更新在\n  [7]）\n  [1]   HY2\n"
             ),
-            "{narrow}"
+            "{long}"
         );
     }
 

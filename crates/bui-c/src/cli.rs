@@ -7,7 +7,7 @@ use crate::check::{self, Runtime, Verdict};
 use crate::delete::{self, PlanKind};
 use crate::engine::{Applied, Engine};
 use crate::lock::{self, LockGuard};
-use crate::menu::{self, Action, NextStep, Prompt, Status};
+use crate::menu::{self, Action, MaintAction, MaintStatus, NextStep, Prompt, Status};
 use crate::net::Net;
 use crate::nettest::{self, Event, Hooks, Painter};
 use crate::paths::{Paths, UNIT_MAIN, UNIT_TIMER};
@@ -153,6 +153,9 @@ pub struct Ctx<'a, S: Sys, N: Net, P: Prompt> {
     pub asides: Vec<usize>,
     /// [`say_result`](Self::say_result) 打过的结果行：起始位置 + 原文（不含缩进）。
     pub results: Vec<(usize, String)>,
+    /// 本菜单会话里哪几条旧键过渡提示已经显示过（按位记，[`menu::HINT_DELETE`] 等；spec §0.2 R1）。
+    /// 记的是「第一次进这一页」，不是「每次画这一页」：清屏重画、回主菜单再进来都不再显示。
+    pub hints_shown: u8,
 }
 
 impl<'a, S: Sys, N: Net, P: Prompt> Ctx<'a, S, N, P> {
@@ -178,7 +181,14 @@ impl<'a, S: Sys, N: Net, P: Prompt> Ctx<'a, S, N, P> {
             clears: 0,
             asides: Vec::new(),
             results: Vec::new(),
+            hints_shown: 0,
         }
+    }
+    /// 这条过渡提示本会话还没显示过：返回 `true` 并记下（调用方接着就把它打出来）。
+    pub fn first_time_hint(&mut self, bit: u8) -> bool {
+        let first = self.hints_shown & bit == 0;
+        self.hints_shown |= bit;
+        first
     }
     /// 终端列数；拿不到按 80。不缓存，每次画屏前重新取（窗口缩放、手机转屏立刻生效）。
     pub fn width(&self) -> usize {
@@ -353,11 +363,10 @@ fn engine_status<S: Sys, N: Net, P: Prompt>(ctx: &Ctx<'_, S, N, P>, prof: &Profi
         http_port: prof.http_port,
         // 上一次检查更新的结论，不为渲染一屏菜单去联网（写在 `update` / 巡检自更新里）
         update_available: Runtime::load(ctx.sys, ctx.paths).update_available,
-        auto_update: prof.auto_update,
     }
 }
 
-/// 这次检查之后「还有新版没装」吗——菜单 `[6] ★ 有新版` 的口径。
+/// 这次检查之后「还有新版没装」吗——主菜单 `[7] 更新与维护 ★` 的口径。
 ///
 /// 口径与 [`update::self_build_differs`] 相同：版本不同，或同版本但不是同一份构建（rc 通道重建）。
 /// 刚刚自替换成 manifest 那一份时要算「没有新版」：本进程的 `VERSION` 还是旧二进制的，
@@ -1037,7 +1046,7 @@ fn import_v3_cmd<S: Sys, N: Net, P: Prompt>(
     if r.kernel_installed {
         ctx.say("已安装 sing-box 内核");
     }
-    // v3 目录是回滚素材、按约定留着，所以这条命令（菜单 [7]）在已迁移的机器上
+    // v3 目录是回滚素材、按约定留着，所以这条命令（菜单 [7] → [3]）在已迁移的机器上
     // 随时可能被再按一次。没有新节点就没什么要 apply 的：省掉 ufw/engine 那趟
     // 往返，也就不会出现「配置字节不变→不重启」的窗口。
     if r.imported.is_empty() {
@@ -1205,10 +1214,8 @@ fn offer_v3_import<S: Sys, N: Net, P: Prompt>(
             },
         )
     } else {
-        note(
-            ctx,
-            "已跳过。随时可以跑 `bui-c import-v3`，或在菜单里选 [7] 从 v3 导入",
-        )
+        // 交互终端里这一句接着就被清屏抹掉、只活在「上次：」行里：菜单走法写在前头
+        note(ctx, menu::V3_SKIPPED)
     };
     Ok(Some(out))
 }
@@ -1622,8 +1629,8 @@ fn delete_nodes<S: Sys, N: Net, P: Prompt>(
 /// 菜单 `[6] 删除节点`（spec §5.1–§5.3）：清屏 → 列表 + 写法 → 选编号（整行作废、原地重问）
 /// → 确认块（认 y/yes、认编号改替换目标）→ 执行。确认之后才拿锁。
 ///
-/// 本任务不接进主菜单（T9 接），测试直接调它。
-#[allow(dead_code)]
+/// 页顶的旧键过渡提示（[`menu::MOVED_HINT_DELETE`]）每个菜单会话只在第一次进这一页时显示
+/// （spec §0.2 R1）；没有节点、不进这一页时不算显示过。
 fn delete_menu<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<Outcome> {
     let prof = Profiles::load(ctx.sys, ctx.paths)?;
     if prof.profiles.is_empty() {
@@ -1632,8 +1639,10 @@ fn delete_menu<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<
     let len = prof.profiles.len();
     let width = ctx.width();
     ctx.clear_screen();
-    // 过渡提示（`（检查更新挪到了 [7] 更新与维护）`）与「每个会话只显示一次」留给 T9
-    ctx.show(menu::render_delete_picker(&prof, width, None).trim_end());
+    let hint = ctx
+        .first_time_hint(menu::HINT_DELETE)
+        .then_some(menu::MOVED_HINT_DELETE);
+    ctx.show(menu::render_delete_picker(&prof, width, hint).trim_end());
 
     // ① 选编号：空行、`0`、EOF 返回主菜单
     let picks = loop {
@@ -1858,19 +1867,14 @@ fn menu_action<S: Sys, N: Net, P: Prompt>(
             // `bui-c update` 在新机器上只装内核、不建单元，不是出路。
             if ctx.sys.exists(&ctx.paths.unit(UNIT_MAIN)) {
                 service_menu(ctx, prof.mode)?
+            } else if import_v3::detect(ctx.sys, std::path::Path::new(import_v3::V3_BASE)) {
+                // 有 v3 客户端：另起一行说 [7] 更新与维护 → [3]（拼成一句超 59 列）。两行要看完，
+                // 停一下再回主菜单，「上次：」行记第一句
+                tell(ctx, menu::NO_UNITS);
+                tell(ctx, menu::NO_UNITS_V3);
+                Outcome::Pause(menu::NO_UNITS.to_string())
             } else {
-                let v3 = import_v3::detect(ctx.sys, std::path::Path::new(import_v3::V3_BASE));
-                note(
-                    ctx,
-                    format!(
-                        "还没有安装引擎与单元：先用 [3] 导入节点{}",
-                        if v3 {
-                            "（v3 客户端用 [7] 从 v3 导入）"
-                        } else {
-                            ""
-                        }
-                    ),
-                )
+                note(ctx, menu::NO_UNITS)
             }
         }
         // 手动检查：边做边打的 11 行报告（spec §6）。不走 timer 的退避，也不顺带每日自更新
@@ -1884,14 +1888,47 @@ fn menu_action<S: Sys, N: Net, P: Prompt>(
                 }
             }
         }
-        Action::Update => run_sub(
+        // 用户最初要的「数字菜单能删除节点」（spec §5）：清屏、列表、确认都在 delete_menu 里
+        Action::DeleteNode => delete_menu(ctx)?,
+        Action::Maintenance => maint_menu(ctx, prof)?,
+        // T16 之前没有测速：按 9 的多半是 v4 的「自动更新 开/关」老习惯。不翻开关、不联网，
+        // 一句话指到新位置（spec §0.2 R15）
+        Action::SpeedTest => note(ctx, menu::AUTO_UPDATE_MOVED),
+        Action::Uninstall => run_sub(ctx, Cmd::Uninstall { purge_bin: false }),
+    })
+}
+
+/// 菜单 `[7] 更新与维护`（spec §1.1、§8.4）：清屏 → 三行本地事实 + 三个动作 → 选编号（输错原地
+/// 重问，不重画）。空行、`0`、EOF 返回主菜单，「上次：」行不动。
+///
+/// - [1] 检查更新：本任务仍直接转手 `bui-c update`（T10 改成先显示版本再确认）。
+/// - [2] 自动更新开关：按下即执行——不动数据面、不联网，再按一次就撤回（R14）；一行 Note 回主菜单。
+/// - [3] 从 v3 导入：原主菜单 [7]，逻辑不变。
+fn maint_menu<S: Sys, N: Net, P: Prompt>(
+    ctx: &mut Ctx<'_, S, N, P>,
+    prof: &Profiles,
+) -> Result<Outcome> {
+    ctx.clear_screen();
+    let page = menu::render_maint(&maint_status(ctx, prof), ctx.width());
+    ctx.show(page.trim_end());
+    let action = loop {
+        ctx.flush();
+        let pick = ctx.prompt.line("选择 [0-3]")?;
+        match menu::parse_maint_choice(&pick) {
+            Some(a) => break a,
+            None => ctx.say(menu::invalid_maint_choice(&pick, ctx.width())),
+        }
+    };
+    Ok(match action {
+        MaintAction::Back => Outcome::Nothing,
+        MaintAction::CheckUpdate => run_sub(
             ctx,
             Cmd::Update {
                 check_only: false,
                 auto: None,
             },
         ),
-        Action::AutoUpdate => run_sub(
+        MaintAction::ToggleAuto => run_sub(
             ctx,
             Cmd::Update {
                 check_only: false,
@@ -1904,7 +1941,7 @@ fn menu_action<S: Sys, N: Net, P: Prompt>(
         ),
         // 没有 v3 目录不是失败：菜单里如实说一句。命令行 `bui-c import-v3` 照旧报错，
         // 脚本要靠退出码
-        Action::ImportV3
+        MaintAction::ImportV3
             if !import_v3::detect(ctx.sys, std::path::Path::new(import_v3::V3_BASE)) =>
         {
             note(
@@ -1915,9 +1952,32 @@ fn menu_action<S: Sys, N: Net, P: Prompt>(
                 ),
             )
         }
-        Action::ImportV3 => menu_import_v3(ctx)?,
-        Action::Uninstall => run_sub(ctx, Cmd::Uninstall { purge_bin: false }),
+        MaintAction::ImportV3 => menu_import_v3(ctx)?,
     })
+}
+
+/// `[7]` 子页顶部三行（spec §8.1 第一条）：只读 `runtime.json` 与 `profiles.json`，不联网。
+/// 「上次检查」与主菜单的 ★ 同一个来源（`runtime.update_available`）；T10 再补上最新版本号。
+fn maint_status<S: Sys, N: Net, P: Prompt>(ctx: &Ctx<'_, S, N, P>, prof: &Profiles) -> MaintStatus {
+    let rt = Runtime::load(ctx.sys, ctx.paths);
+    let verdict = if rt.update_available {
+        "有新版"
+    } else {
+        "已是最新"
+    };
+    let update_line = match rt.update_checked_at {
+        Some(at) => {
+            let secs = ctx.sys.now().unix_timestamp() - at;
+            format!("{verdict}（{}）", menu::ago(secs))
+        }
+        None if rt.update_available => verdict.to_string(),
+        None => "还没检查过".to_string(),
+    };
+    MaintStatus {
+        version: crate::VERSION.to_string(),
+        update_line,
+        auto_update: prof.auto_update,
+    }
 }
 
 /// 菜单 `[5] 连接检查`（spec §6）：清屏后逐行边做边打 11 项，汇总；有计分项失败时给一句人话判断，
@@ -3405,7 +3465,7 @@ mod tests {
         assert!(ctx.out.contains("导入 1 个节点"));
     }
 
-    /// 菜单 [7] 在已迁移的机器上被再按一次：v3 目录按约定保留着，`detect` 恒为真。
+    /// 菜单 [7] → [3] 在已迁移的机器上被再按一次：v3 目录按约定保留着，`detect` 恒为真。
     #[test]
     fn import_v3_second_run_reports_already_imported_and_does_not_apply() {
         let pp = paths();
@@ -3504,7 +3564,7 @@ mod tests {
         assert!(n2.log().is_empty(), "渲染菜单不该联网");
         // ★ 只在菜单选项块里（一次性 status 不打菜单块），同样只读 runtime.json
         let prof2 = Profiles::load(&s, &pp).unwrap();
-        assert!(menu::render_options(&engine_status(&ctx, &prof2), 80).contains("★ 有新版"));
+        assert!(menu::render_options(&engine_status(&ctx, &prof2), 80).contains("[7] 更新与维护 ★"));
 
         // 再查一次，manifest 与本机同版、且盘上就是那一份构建 → 标记清掉
         n.route(
@@ -3520,7 +3580,7 @@ mod tests {
         let mut ctx = Ctx::new(&s, &n2, &pp, &mut p, false, false);
         dispatch(&parse(&["status"]), &mut ctx).unwrap();
         let prof3 = Profiles::load(&s, &pp).unwrap();
-        assert!(!menu::render_options(&engine_status(&ctx, &prof3), 80).contains("★ 有新版"));
+        assert!(!menu::render_options(&engine_status(&ctx, &prof3), 80).contains('★'));
     }
 
     /// 与服务端 `kernels::bui_build_differs` 同口径：版本相同、但 manifest 里本机架构的 bui-c
@@ -3826,14 +3886,42 @@ mod tests {
         let mut ctx2 = Ctx::new(&s2, &n, &pp, &mut p2, false, false);
         menu_loop(&mut ctx2).unwrap();
         assert!(Profiles::load(&s2, &pp).unwrap().profiles.is_empty());
-        // 还没进菜单：命令与菜单项都给，菜单项按统一叫法写成「[7] 从 v3 导入」
-        assert!(
-            ctx2.transcript.lines().any(|l| l
-                == "  已跳过。随时可以跑 `bui-c import-v3`，或在菜单里选 [7] 从 v3 导入"),
-            "{}",
-            ctx2.transcript
+        // 还没进菜单：菜单走法在前（[7] 更新与维护 → [3]），命令在后
+        let t2 = ctx2.transcript.clone();
+        let said = t2
+            .lines()
+            .find(|l| l.starts_with("  已跳过"))
+            .unwrap_or_else(|| panic!("{t2}"));
+        let (menu_at, cmd_at) = (
+            said.find("[7] 更新与维护 → [3]"),
+            said.find("bui-c import-v3"),
         );
+        assert!(
+            menu_at.is_some() && cmd_at.is_some() && menu_at < cmd_at,
+            "{said}"
+        );
+        assert!(!t2.contains("[7] 从 v3 导入"), "[7] 现在是更新与维护：{t2}");
         assert!(!s2.called("systemctl stop hysteria-client.service"));
+
+        // 交互终端里这句接着就被清屏抹掉，只活在「上次：」行里：40 列尾截之后走法还在
+        let s3 = FakeSys::new();
+        ready(&s3);
+        s3.put(
+            "/opt/hysteria-client/configs/hysteria2-1/uri.txt",
+            "hysteria2://alice:hy2-pw@panel.example.com:10000/?sni=panel.example.com#alice-HY2%E7%9B%B4%E8%BF%9E",
+        );
+        s3.put("/etc/systemd/system/hysteria-client.service", "[Unit]");
+        s3.set_term_size(Some((40, 24)));
+        let r = run_menu(&s3, &n, &pp, &["n", "0"], true);
+        let last =
+            r.t.lines()
+                .find(|l| l.starts_with("  上次："))
+                .unwrap_or_else(|| panic!("{}", r.t));
+        assert!(
+            last.contains("已跳过") && last.contains("[7] 更新与维护 → [3]"),
+            "{last}"
+        );
+        assert!(menu::budget_width(last) <= menu::line_limit(40), "{last}");
     }
 
     /// 已迁移的机器：v3 目录按约定留着当回滚素材，v3 单元已被卸掉。删光节点后再进菜单，
@@ -4107,7 +4195,7 @@ mod tests {
         ready(&s);
         profiles_socks().save(&s, &pp).unwrap();
         let n = FakeNet::new(); // manifest 的源一个都没登记：检查更新失败
-        let mut p = Scripted::from(["6", "", "0"]);
+        let mut p = Scripted::from(["7", "1", "", "0"]); // [7] 更新与维护 → [1] 检查更新
         let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
         menu_loop(&mut ctx).unwrap();
         let t = ctx.transcript.clone();
@@ -4115,7 +4203,7 @@ mod tests {
         assert!(t.lines().any(|l| l.starts_with("  上次：失败：")), "{t}");
         assert_eq!(
             p.asked,
-            vec!["选择 [0-9]", "回车返回菜单", "选择 [0-9]"],
+            vec!["选择 [0-9]", "选择 [0-3]", "回车返回菜单", "选择 [0-9]"],
             "失败先停，看完回车再清屏回主菜单，0 由主菜单读走：\n{t}"
         );
     }
@@ -4472,7 +4560,7 @@ mod tests {
         let r = run_menu(&s, &n, &pp, &["n", "0"], true);
         assert_eq!(pauses(&r.asked), 0, "{:?}", r.asked);
         assert!(
-            r.t.lines().any(|l| l.starts_with("  上次：已跳过。")),
+            r.t.lines().any(|l| l.starts_with("  上次：已跳过")),
             "{}",
             r.t
         );
@@ -4723,6 +4811,31 @@ mod tests {
         assert!(s.exists(&pp.profiles()), "答空行就不卸载");
     }
 
+    /// spec §0.2 R11：[6] 接进主菜单之后，`bui-c -y` 进菜单删节点也照样要问，答空行不删。
+    #[test]
+    fn the_menu_ignores_the_global_yes_for_delete() {
+        let pp = paths();
+        let s = FakeSys::new();
+        let n = FakeNet::new();
+        nine_nodes(&s, &pp, Mode::Socks);
+        let mut p = Scripted::from(["6", "1", "", "0"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, true); // bui-c -y
+        menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert!(ctx.yes, "出了菜单恢复原值");
+        assert!(
+            p.asked.iter().any(|q| q.starts_with("确认删除")),
+            "{:?}",
+            p.asked
+        );
+        assert_eq!(names(&s, &pp).len(), 9, "答空行就不删：{t}");
+        assert!(
+            t.lines()
+                .any(|l| l == format!("  上次：{}", delete::CANCELLED)),
+            "{t}"
+        );
+    }
+
     #[test]
     fn menu_node_pick_blank_or_zero_returns_silently_and_junk_is_reported() {
         let pp = paths();
@@ -4886,7 +4999,8 @@ mod tests {
         ready(&s);
         profiles_socks().save(&s, &pp).unwrap();
         let n = FakeNet::new();
-        let mut p = Scripted::from(["7", "0"]);
+        // 7 = 更新与维护 → 3 = 从 v3 导入
+        let mut p = Scripted::from(["7", "3", "0"]);
         let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
         menu_loop(&mut ctx).unwrap();
         let t = ctx.transcript.clone();
@@ -4902,6 +5016,201 @@ mod tests {
         let mut p = Scripted::from([]);
         let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
         assert!(dispatch(&parse(&["import-v3"]), &mut ctx).is_err());
+    }
+
+    // ───────────── T9：主菜单重排（[6] 删除节点、[7] 更新与维护、按 9 的 Note） ─────────────
+
+    /// spec §0.2 R15：T16 之前主菜单没有 [9] 行；按 9（v4 的「自动更新 开/关」）不翻开关、
+    /// 不联网，一句 Note 指到 [7] 更新与维护 → [2]。
+    #[test]
+    fn pressing_9_before_speedtest_points_to_maintenance() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        let mut prof = profiles_socks();
+        prof.auto_update = true;
+        prof.save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        let r = run_menu(&s, &n, &pp, &["9", "0"], true);
+        assert!(
+            Profiles::load(&s, &pp).unwrap().auto_update,
+            "按 9 不再翻开关：{}",
+            r.t
+        );
+        assert!(n.log().is_empty(), "不联网：{:?}", n.log());
+        let last =
+            r.t.lines()
+                .find(|l| l.starts_with("  上次："))
+                .unwrap_or_else(|| panic!("{}", r.t));
+        assert!(last.contains("[7] 更新与维护 → [2]"), "{last}");
+        assert_eq!(
+            r.asked,
+            vec!["选择 [0-9]", "选择 [0-9]"],
+            "一行 Note，不停、不进子页"
+        );
+        assert!(!r.t.contains("[9]"), "主菜单不显示 [9] 行：{}", r.t);
+    }
+
+    /// [7] 更新与维护子页（spec §8.4、§0.2 R14）：[2] 按下即翻开关（不联网、不问），一行 Note 回
+    /// 主菜单；再进子页文案跟着变，再按一次就撤回。空行、0 返回主菜单，「上次：」行不动；
+    /// 输错原地重问，不重画子页。
+    #[test]
+    fn maint_page_toggles_auto_update_and_goes_back() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        let mut prof = profiles_socks();
+        prof.auto_update = true;
+        prof.save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        let r = run_menu(&s, &n, &pp, &["7", "x", "2", "7", "0", "7", "", "0"], true);
+        assert!(!Profiles::load(&s, &pp).unwrap().auto_update, "{}", r.t);
+        assert!(n.log().is_empty(), "开关不联网：{:?}", n.log());
+        assert_eq!(
+            r.asked,
+            vec![
+                "选择 [0-9]",
+                "选择 [0-3]",
+                "选择 [0-3]",
+                "选择 [0-9]",
+                "选择 [0-3]",
+                "选择 [0-9]",
+                "选择 [0-3]",
+                "选择 [0-9]"
+            ],
+            "{}",
+            r.t
+        );
+        assert_eq!(pauses(&r.asked), 0, "{:?}", r.asked);
+        // 进了三次子页，每次一屏；输错那一下没有重画
+        let pages: Vec<&str> = r.t.split("\n  更新与维护\n").skip(1).collect();
+        assert_eq!(pages.len(), 3, "{}", r.t);
+        assert!(pages[0].contains("[2] 关闭自动更新"), "{}", pages[0]);
+        assert!(pages[0].contains("无效选项：x"), "{}", pages[0]);
+        assert!(pages[1].contains("[2] 开启自动更新"), "{}", pages[1]);
+        assert!(pages[1].contains("自动更新   关"), "{}", pages[1]);
+        // 「上次：」行：翻完是结果；之后两次返回都不动它
+        let lasts: Vec<&str> = r.t.lines().filter(|l| l.starts_with("  上次：")).collect();
+        assert_eq!(lasts, vec!["  上次：每日自动更新：关"; 3], "{}", r.t);
+
+        // 再按一次就撤回
+        let r = run_menu(&s, &n, &pp, &["7", "2", "0"], true);
+        assert!(Profiles::load(&s, &pp).unwrap().auto_update, "{}", r.t);
+        assert!(
+            r.t.lines().any(|l| l == "  上次：每日自动更新：开"),
+            "{}",
+            r.t
+        );
+    }
+
+    /// 用户最初那句需求：数字菜单要能删除节点。主菜单按 6 → 选编号 → 确认 → 删掉，「上次：」行
+    /// 是删除的结果；失败时停下来，节点都还在，「上次：」行写没删成。
+    #[test]
+    fn the_main_menu_deletes_a_node_with_6() {
+        let pp = paths();
+        let n = FakeNet::new();
+
+        // Passive：删一个非活动节点，一行结果，不停
+        let s = FakeSys::new();
+        nine_nodes(&s, &pp, Mode::Socks);
+        let r = run_menu(&s, &n, &pp, &["6", "1", "y", "0"], true);
+        let left = names(&s, &pp);
+        assert_eq!(left.len(), 8, "{}", r.t);
+        assert!(!left.contains(&"HY2".to_string()), "{}", r.t);
+        assert!(r.t.contains("删除节点（共 9 个"), "{}", r.t);
+        assert!(
+            r.asked
+                .iter()
+                .any(|q| q.starts_with("确认删除") && q.ends_with("[y/N]")),
+            "{:?}",
+            r.asked
+        );
+        assert!(r.t.lines().any(|l| l == "  上次：已删 1 个"), "{}", r.t);
+        assert_eq!(pauses(&r.asked), 0, "{:?}", r.asked);
+
+        // Switch：删当前节点，输 yes，切到替换节点；「上次：」行写切到了谁
+        let s = FakeSys::new();
+        nine_nodes(&s, &pp, Mode::Socks);
+        let r = run_menu(&s, &n, &pp, &["6", "2", "yes", "", "0"], true);
+        let saved = Profiles::load(&s, &pp).unwrap();
+        assert_eq!(saved.profiles.len(), 8, "{}", r.t);
+        assert_eq!(saved.active.as_deref(), Some(RICK_REALITY), "{}", r.t);
+        assert!(
+            r.t.lines()
+                .any(|l| l == format!("  上次：已删 1 个，切到 {RICK_REALITY}")),
+            "{}",
+            r.t
+        );
+
+        // 切换失败：已换回，节点都在，当前节点与配置都不变；停下来，「上次：」行写删除没做
+        let s = FakeSys::new();
+        nine_nodes(&s, &pp, Mode::Socks);
+        let config = s.get("/opt/bui-c/config.json").unwrap();
+        s.fail_write("/opt/bui-c/config.json");
+        let r = run_menu(&s, &n, &pp, &["6", "2", "yes", "", "0"], true);
+        let saved = Profiles::load(&s, &pp).unwrap();
+        assert_eq!(saved.profiles.len(), 9, "{}", r.t);
+        assert_eq!(saved.active.as_deref(), Some(ACTIVE), "{}", r.t);
+        assert_eq!(s.get("/opt/bui-c/config.json").unwrap(), config, "{}", r.t);
+        assert!(r.t.contains(delete::ROLLED_BACK), "{}", r.t);
+        assert_eq!(pauses(&r.asked), 1, "{:?}", r.t);
+        assert!(
+            r.t.lines().any(|l| l.starts_with("  上次：删除没做")),
+            "{}",
+            r.t
+        );
+    }
+
+    /// spec §0.2 R1：[6] 删除页顶的过渡提示每个菜单会话只在第一次进这一页时显示
+    /// （`Ctx.hints_shown`）；回主菜单清屏重画、再进 [6] 不再出现，新开一个会话又会显示。
+    #[test]
+    fn delete_page_shows_the_moved_hint_once_per_session() {
+        let pp = paths();
+        let s = FakeSys::new();
+        let n = FakeNet::new();
+        nine_nodes(&s, &pp, Mode::Socks);
+        s.set_term_size(Some((40, 24)));
+        let r = run_menu(&s, &n, &pp, &["6", "", "6", "0", "0"], true);
+        assert_eq!(
+            r.asked.iter().filter(|q| *q == "删除哪几个").count(),
+            2,
+            "{:?}",
+            r.asked
+        );
+        assert!(r.clears >= 4, "两次进删除页之间清屏重画过：{}", r.clears);
+        assert_eq!(r.t.matches(menu::MOVED_HINT_DELETE).count(), 1, "{}", r.t);
+        // 第一次：紧跟标题，40 列一行放下
+        assert!(
+            r.t.contains(&format!(
+                "删除节点（共 9 个，★ 为当前）\n  {}\n",
+                menu::MOVED_HINT_DELETE
+            )),
+            "{}",
+            r.t
+        );
+        assert_eq!(names(&s, &pp).len(), 9);
+
+        // 新会话：又显示一次
+        let r = run_menu(&s, &n, &pp, &["6", "", "0"], true);
+        assert_eq!(r.t.matches(menu::MOVED_HINT_DELETE).count(), 1, "{}", r.t);
+
+        // 没有节点时不进这一页，提示没显示过，不算数
+        let s = FakeSys::new();
+        ready(&s);
+        let mut p = Scripted::from(["", ""]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        assert_eq!(
+            delete_menu(&mut ctx).unwrap(),
+            Outcome::Note(delete::NO_NODES.to_string())
+        );
+        nine_nodes(&s, &pp, Mode::Socks);
+        assert_eq!(delete_menu(&mut ctx).unwrap(), Outcome::Nothing);
+        assert_eq!(
+            ctx.transcript.matches(menu::MOVED_HINT_DELETE).count(),
+            1,
+            "{}",
+            ctx.transcript
+        );
     }
 
     #[test]
@@ -5810,33 +6119,41 @@ mod tests {
         menu_loop(&mut ctx).unwrap();
         let t = ctx.transcript.clone();
         // 新机器上 `bui-c update` 走不通（没单元可重启），装引擎与单元的路是导入节点
+        let said = |t: &str, key: &str| t.lines().any(|l| l.contains(key));
         assert!(
-            t.lines()
-                .any(|l| l == "  还没有安装引擎与单元：先用 [3] 导入节点"),
+            said(&t, "  上次：") && said(&t, "先用 [3] 导入节点"),
             "单元不存在时应引导先导入节点：\n{t}"
         );
         assert!(!t.contains("bui-c update"), "{t}");
         assert!(
-            !t.contains("v3 客户端用 [7]"),
-            "没有 v3 目录就不提 [7]：\n{t}"
+            !said(&t, "v3 客户端") && !said(&t, "→ [3]"),
+            "没有 v3 目录就不提 [7] → [3]：\n{t}"
         );
         assert!(!t.contains("最近 50 行日志"), "没有单元就不进子菜单：\n{t}");
         assert!(!s.called("systemctl restart bui-c.service"));
+        assert!(p.asked.iter().all(|q| q != "回车返回菜单"), "一行不停");
+        // 40 列：这句只活在「上次：」行里，尾截之后可操作的那半还在
+        s.set_term_size(Some((40, 24)));
+        let r = run_menu(&s, &n, &pp, &["4", "0"], true);
+        let last = r.t.lines().find(|l| l.starts_with("  上次：")).unwrap();
+        assert!(last.contains("[3] 导入节点"), "{last}");
 
-        // 机器上有 v3 客户端：补一句 [7]
+        // 机器上有 v3 客户端：另起一行说 [7] 更新与维护 → [3]，两行要看完，停一下
+        s.set_term_size(None);
         s.put(
             "/opt/hysteria-client/configs/hysteria2-1/uri.txt",
             "hysteria2://alice:hy2-pw@panel.example.com:10000/?sni=panel.example.com#a",
         );
-        let mut p = Scripted::from(["4", "0"]);
-        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
-        menu_loop(&mut ctx).unwrap();
-        let t = ctx.transcript.clone();
+        let r = run_menu(&s, &n, &pp, &["4", "", "0"], true);
+        assert!(said(&r.t, "先用 [3] 导入节点"), "{}", r.t);
+        assert!(said(&r.t, "[7] 更新与维护 → [3] 从 v3 导入"), "\n{}", r.t);
+        assert!(!r.t.contains("[7] 从 v3 导入"), "{}", r.t);
+        assert_eq!(pauses(&r.asked), 1, "{:?}", r.asked);
         assert!(
-            t.lines()
-                .any(|l| l
-                    == "  还没有安装引擎与单元：先用 [3] 导入节点（v3 客户端用 [7] 从 v3 导入）"),
-            "\n{t}"
+            r.t.lines()
+                .any(|l| l == format!("  上次：{}", menu::NO_UNITS)),
+            "{}",
+            r.t
         );
     }
 
@@ -7454,9 +7771,9 @@ mod tests {
         assert_eq!(names(&s, &pp).len(), 2, "{t}");
         assert!(Profiles::load(&s, &pp).unwrap().deleted.is_empty(), "{t}");
 
-        // ③ 菜单 [7]：问一句，答 y 才加回来
+        // ③ 菜单 [7] → [3]：问一句，答 y 才加回来
         let (s, n, target) = v3_with_one_buried(&pp);
-        let r = run_menu(&s, &n, &pp, &["7", "y", "", "0"], true);
+        let r = run_menu(&s, &n, &pp, &["7", "3", "y", "", "0"], true);
         assert!(
             r.asked.iter().any(|q| q == menu::BURIED_ASK),
             "{:?}",
@@ -7480,9 +7797,9 @@ mod tests {
             r.t
         );
 
-        // ④ 菜单 [7] 答 n：不加回来
+        // ④ 菜单 [7] → [3] 答 n：不加回来
         let (s, n, _) = v3_with_one_buried(&pp);
-        let r = run_menu(&s, &n, &pp, &["7", "n", "0"], true);
+        let r = run_menu(&s, &n, &pp, &["7", "3", "n", "0"], true);
         assert_eq!(names(&s, &pp).len(), 1, "{}", r.t);
         assert_eq!(Profiles::load(&s, &pp).unwrap().deleted.len(), 1, "{}", r.t);
     }
