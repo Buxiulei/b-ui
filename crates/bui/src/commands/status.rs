@@ -96,19 +96,46 @@ pub fn format_status(
     out.join("\n")
 }
 
+/// 旧「用户名链接」宽限期（`system.legacy_sub_until`）的三种态（2026-09-14 裁决）。
+///
+/// `bui status` 的那一行与装机摘要（[`crate::commands::install::summary`]）都按这一处判定：
+/// 两边各写一遍「过没过期」，迟早会一处说「还认」另一处说「已过期」。
+///
+/// `None`、以及解析不出来的时刻都是 [`LegacySub::Off`] —— 端点侧要的是「当前时间早于它」，
+/// 判不出来就一律不认（fail-closed），所以这两种情况的实际效果就是停用。
+pub enum LegacySub<'a> {
+    /// 没有宽限期（全新装机、或运维 `bui set legacy-sub off`）⇒ 只认随机 token 链接
+    Off,
+    /// 宽限期内：`raw` 是期望态里那个时刻的原文，`secs_left` 是到它还剩多少秒
+    Active { raw: &'a str, secs_left: u64 },
+    /// 宽限期已过：用户名链接已经不通了，`raw` 同上
+    Expired { raw: &'a str },
+}
+
+/// 判定 [`LegacySub`]（口径见它的文档）。
+pub fn legacy_sub(until: Option<&str>, now: OffsetDateTime) -> LegacySub<'_> {
+    match until.and_then(|t| crate::util::parse_rfc3339(t).map(|d| (t, d))) {
+        None => LegacySub::Off,
+        Some((raw, deadline)) if deadline > now => LegacySub::Active {
+            raw,
+            secs_left: (deadline - now).whole_seconds().max(0) as u64,
+        },
+        Some((raw, _)) => LegacySub::Expired { raw },
+    }
+}
+
 /// `bui status` 的「旧订阅链接」一行（2026-09-14 裁决）：四个免鉴权订阅端点按每用户随机
 /// token 取，旧的「用户名链接」只在全局宽限期（`system.legacy_sub_until`）内还认。
-///
-/// `None`、以及解析不出来的时刻，都报「已停用」——端点侧要的是「当前时间早于它」，
-/// 判不出来就一律不认（fail-closed），所以这两种情况的实际效果就是停用。
 pub fn format_legacy_sub(until: Option<&str>, now: OffsetDateTime) -> String {
-    match until.and_then(|t| crate::util::parse_rfc3339(t).map(|d| (t, d))) {
-        None => "旧订阅链接  已停用（只认随机 token 链接）".to_string(),
-        Some((raw, deadline)) if deadline > now => format!(
+    match legacy_sub(until, now) {
+        LegacySub::Off => "旧订阅链接  已停用（只认随机 token 链接）".to_string(),
+        LegacySub::Active { raw, secs_left } => format!(
             "旧订阅链接  用户名链接还剩 {} 到期（{raw}）",
-            crate::util::human_duration((deadline - now).whole_seconds().max(0) as u64)
+            crate::util::human_duration(secs_left)
         ),
-        Some((raw, _)) => format!("旧订阅链接  已过期（{raw}），只认随机 token 链接"),
+        LegacySub::Expired { raw } => {
+            format!("旧订阅链接  已过期（{raw}），只认随机 token 链接")
+        }
     }
 }
 
