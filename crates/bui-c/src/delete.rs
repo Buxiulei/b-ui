@@ -232,7 +232,8 @@ pub const SNAPSHOT_CHANGED_SHORT: &str = "节点列表刚被别处改过，没�
 /// `profiles.json` 写不进去：Switch（数据面已经切过去，紧接着回滚）与 Passive（数据面
 /// 一点没动）共用的第一行与短摘要。删光那一种另有说法，见 [`STOPPED_NOT_SAVED_HEAD`]。
 pub const SAVE_FAILED: &str = "删除没做：写 profiles.json 失败";
-/// 删光时拆数据面失败的短摘要（页上打的是 `删除没做：{engine 的原因}`，40 列放不下）。
+/// 删光时拆数据面失败、服务**仍在跑**的短摘要（页上打的是 `删除没做：{engine 的原因}`，40 列
+/// 放不下）。已经停了才失败的那一支终态不同，用 [`STOPPED_NOT_SAVED_SHORT`]。
 ///
 /// 故意不说是哪一步失败：`Engine::teardown_main` 除了「停不下来」，在 is-active 复查通过之后
 /// 还可能因为删单元文件、`daemon-reload`、删 `config.json`、清临时文件而失败。要在这一行里
@@ -246,8 +247,13 @@ pub const STOPPED_NOT_SAVED_HEAD: &str = "代理已经停了，但写 profiles.j
 /// 承接 [`STOPPED_NOT_SAVED_HEAD`] 的下一步：T12c 的收敛条件「有活动节点但主单元文件不在
 /// → apply」「profiles 为空但单元还在 → teardown」正好覆盖这一状态。
 pub const STOPPED_NOT_SAVED: &str = "节点条目还在，下次进菜单或巡检会按节点列表收拾";
-/// 同一件事进「上次：」行时的短式（40 列只有 31 列可用）。
+/// 同一件事进「上次：」行时的短式（40 列只有 31 列可用）。删光时拆到一半失败
+/// （[`TEARDOWN_HALFWAY`]）也用它：两者终态一样，代理已停、条目还列着。
 pub const STOPPED_NOT_SAVED_SHORT: &str = "删除没做完：代理已停，节点还在";
+/// 删光时 is-active 复查已过、之后的一步（删单元文件、`daemon-reload`、删 `config.json`）失败：
+/// 主单元已经 stop + disable，节点条目还列着。页上第一行是 `删除没做完：{原因}`，这一行说清
+/// 现状与下一步（`pending.json` 留着，收敛按节点列表 apply 回来）。
+pub const TEARDOWN_HALFWAY: &str = "代理已停，节点条目还在，下次进菜单或巡检会按节点列表收拾";
 /// 删除确认之后等了 15 秒还拿不到锁（spec §8.3）进「上次：」行时的短式：40 列只有 31 列，
 /// 整句「另一个 bui-c 操作还没结束，这次什么都没改，稍后再试」会被砍成
 /// 「另一个 bui-c 操作还没结束，这…」，可操作的「稍后再试」整个没了（T12a 审查 I1、

@@ -46,15 +46,17 @@ pub struct Runtime {
     /// 上一次检查更新的时间（epoch 秒），与 `update_available` 同时写。
     pub update_checked_at: Option<i64>,
     /// 上一次检查更新时 manifest 的版本号，与 `update_available` 同时写；[7] 子页的
-    /// 「上次检查   有新版 4.0.1（2 小时前）」读它（spec §8.1）。旧版本写的文件没有这个键。
-    #[serde(default)]
+    /// 「上次检查   有新版 4.0.1（2 小时前）」读它（spec §8.1）。旧版本写的文件没有这个键
+    /// （结构体级 `#[serde(default)]` 兜住，与下面两个 T12c 字段同一写法）。
     pub update_version: Option<String>,
     /// 最近一次中断收敛的结果（spec §0.2 R12，持锁写）：菜单进门时在「上次：」行显示一次，
     /// 然后清掉。巡检只写不清。
     pub last_converge: Option<LastConverge>,
-    /// 收敛失败时节点设置的样子（`cli::converge_key`）：同一份设置下不再按「单元 / 配置对不上」
-    /// 自动重试，免得每分钟收拾一次（R12）。`pending.json` 触发的收敛不受它限制——那个文件
-    /// 收拾过就删，本来就只有一次。收敛成功、或巡检发现机器已被人修好（不再对不上）时清掉。
+    /// 收敛失败时节点设置与机器现状的样子（`cli::converge_key`：节点快照 + 内核、主单元在跑、
+    /// 主单元文件、`config.json` 在不在）：样子不变就不再按「单元 / 配置对不上」自动重试，免得
+    /// 每分钟收拾一次（R12）；原因变了（内核装回来、服务被停掉）再试一次。`pending.json` 触发的
+    /// 收敛不受它限制——那个文件收拾过就删，本来就只有一次。收敛成功、或巡检发现机器已被人修好
+    /// （不再对不上）时清掉。
     pub converge_failed: Option<String>,
 }
 

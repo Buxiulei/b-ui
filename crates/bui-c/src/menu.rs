@@ -3137,6 +3137,11 @@ mod tests {
                 "读写 /opt/bui-c/profiles.json 失败：permission denied".to_string(),
                 delete::STOPPED_NOT_SAVED.to_string(),
             ],
+            // 删光：复查已过、daemon-reload 失败（代理已停、条目还在，留给收敛）
+            vec![
+                "删除没做完：命令 systemctl daemon-reload 执行失败（退出码 1）".to_string(),
+                delete::TEARDOWN_HALFWAY.to_string(),
+            ],
             // Passive：数据面没动过，写盘失败也给页
             vec![
                 delete::SAVE_FAILED.to_string(),
