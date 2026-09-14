@@ -80,7 +80,12 @@ pub fn probe_member(p: &dyn Prober, up: &Upstream) -> MemberProbe {
 /// ——网关都连不上，隧道不可能通，再等一次 HTTP 超时只会拖慢预案（上游被丢包时巡检那套
 /// [`probe_member`] 要走 ~40 秒）；连得上再走一轮与巡检同口径的 [`probe_reachable`]（含 407 补判）。
 /// **不测 Google / UDP / 测速**：那些是巡检的指标，预案只关心「这条上游此刻还能不能用」。
-/// 完整探测那段的超时由调用方的 `Prober` 决定（哨兵用 `ReqwestProber::with_timeout(5)`）。
+///
+/// **它本身没有上界**：网关连得上之后那段完整探测的超时是各请求自己的
+/// （`timed_get` 吃 [`super::LATENCY_PROBE_TIMEOUT_SECS`] = 8 秒 —— **不是**调用方
+/// `Prober` 的那个超时；`get` 与 407 补判的 CONNECT 各吃 `Prober` 的超时，`ReqwestProber::dial`
+/// 还按解析出的地址逐个串行各等一次），叠起来远超预案的延迟预算。**哨兵一侧一律经
+/// [`probe_quick_within`] 调它**，别直接调。
 pub fn probe_quick(p: &dyn Prober, up: &Upstream, tcp_within: Duration) -> MemberProbe {
     let Some(tcp_ms) = p.gateway_tcp_within(up, tcp_within) else {
         return MemberProbe::default();
@@ -88,6 +93,70 @@ pub fn probe_quick(p: &dyn Prober, up: &Upstream, tcp_within: Duration) -> Membe
     let mut probe = probe_reachable(p, up);
     probe.tcp_ms = Some(tcp_ms);
     probe
+}
+
+/// 一次带预算的快探（[`probe_quick_within`]）的**整体**时限：整个 [`probe_quick`] 被
+/// `tokio::time::timeout` 包住，超时即结论「未确认」（不是「不可用」）。
+///
+/// **为什么非得有这个上界**：`probe_quick` 只在网关 TCP 连不上时才是「≤ `tcp_within` 返回」；
+/// 一旦 TCP 通过，它会继续走 [`probe_reachable`]（`timed_get` 8 秒 + `get` 5 秒 + 407 补判的
+/// CONNECT 5 秒，多地址网关还要按 `dial` 逐地址串行各 5 秒），而「网关活着、某个静态端口背后
+/// 的出口 IP 死了」恰恰是住宅预案主打的故障形态。用生产参数
+/// （`ReqwestProber::with_timeout(PROBE_TIMEOUT_SECS = 5)`、`tcp_within = 3`）对着一个
+/// 「accept 后永不应答」的本地监听实测单次 `probe_quick` = **28.4 秒**（2026-09-14 审查实测），
+/// 多地址网关更高。没有这个上界，spec §5.7 的两条处置延迟 SLA（15 / 25 秒）在生产最常见的
+/// 故障形态上必然破。
+///
+/// 4 秒的来历：① 网关 TCP 连不上那条路 ≤ `tcp_within`（哨兵传
+/// `sentinel::PROBE_TCP_TIMEOUT_SECS` = 3 秒）就返回；② 网关活着、隧道正常那条路经隧道一次
+/// GET 远小于 1 秒。**必须 > `tcp_within`**，否则 TCP 一步就把预算吃光，每条「网关连不上」的
+/// 上游都从「确认不可用」退化成「未确认」⇒ 哨兵判原上游那侧不动作、借用侧在第一个候选上就停，
+/// 整套预案静默变成空操作（`sentinel::run` 里有一条用例钉住这个不等式）。
+///
+/// **已知取舍（2026-09-14 审查）**：4 秒对真实住宅出口偏紧 —— 经隧道的首包 1–3 秒并不罕见，
+/// 加上最坏 3 秒的网关 TCP 就可能越过 4 秒，于是**健康**的候选也会常态报「未确认」。两处都是
+/// fail-safe（借用侧保留候选、不记不健康；判原上游那侧不动作、交给巡检），代价只是告警文案从
+/// 「槽 i 已临时切到 Y」退化成「已切到 Y，未能在 4 秒内确认可用」。要不要放宽，等 bwg-tizi 上
+/// 实测一次真实借用验证的耗时再定（计划 D18 记了这一项）。
+pub const QUICK_PROBE_BUDGET_SECS: u64 = 4;
+
+/// 一次带预算的快探的三种结论。「确认不可用」与「没能确认」**必须分开**：前者是证据
+/// （可以判不健康、可以换下一个候选），后者只是超时 —— 拿它当证据就是另一种误判
+/// （把好上游判死、把槽白挪走）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// 预算内确认可用
+    Alive,
+    /// 预算内拿到明确的失败：网关 TCP 不通，或经隧道的 HTTP 明确失败 / 凭据被拒
+    /// （`auth_failed` = 407 / SOCKS5 认证被拒，告警要据此说「凭据失效」而不是「不可达」）
+    Dead { auth_failed: bool },
+    /// 预算内没能确认（超时、或探测任务本身异常）⇒ 结论未知
+    Unconfirmed,
+}
+
+/// [`probe_quick`] 加 [`QUICK_PROBE_BUDGET_SECS`] 的整体预算，结论三值（[`Verdict`]）。
+///
+/// 哨兵判「原上游坏了」（`sentinel::resi::on_upstream_error`）与借用后验证刚切过去那条
+/// （`slots::borrow_now`）**共用这一份**：同一个探测、同一个上界、同一套三值口径。两处必须
+/// 对称 —— 只给其中一处加时限，处置延迟算式里的上界就只对那一处成立（2026-09-14 审查第 1 条）。
+///
+/// `Prober` 是同步的（`reqwest::blocking`），照例进 `spawn_blocking`；超时后那个任务会自己
+/// 跑完（`reqwest::blocking` 没有取消点），结果丢弃，不阻塞调用方。
+pub async fn probe_quick_within(
+    prober: &Arc<dyn Prober>,
+    up: Upstream,
+    tcp_within: Duration,
+) -> Verdict {
+    let p = prober.clone();
+    let probe = tokio::task::spawn_blocking(move || probe_quick(p.as_ref(), &up, tcp_within));
+    let budget = Duration::from_secs(QUICK_PROBE_BUDGET_SECS);
+    match tokio::time::timeout(budget, probe).await {
+        Ok(Ok(probe)) if probe.ok => Verdict::Alive,
+        Ok(Ok(probe)) => Verdict::Dead {
+            auth_failed: probe.auth_failed,
+        },
+        Ok(Err(_)) | Err(_) => Verdict::Unconfirmed,
+    }
 }
 
 /// 可达性那一半：最多 [`HEALTH_TRIES`] 次，任一成功即本轮健康。

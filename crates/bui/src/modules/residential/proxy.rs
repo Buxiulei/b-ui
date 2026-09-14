@@ -806,8 +806,8 @@ pub struct FakeProberInner {
     pub on_tcp_fail: Option<Box<dyn Fn(std::time::Duration) + Send>>,
     /// 非空时**经隧道的 GET**（`get` / `timed_get`）停在这道闸门上，直到测试
     /// [`Gate::open`]：模拟「网关活着、隧道不响应」—— `probe_quick` 那条路上真正的耗时大头
-    /// （`timed_get` + `get` + 407 补判，最坏 ≈40 秒），测 `slots::borrow_now` 的验证撞上
-    /// `BORROW_VERIFY_BUDGET_SECS` 整体时限用
+    /// （`timed_get` 8 秒 + `get` 5 秒 + 407 补判 5 秒，实测 ≈28 秒），测哨兵判原上游与
+    /// `slots::borrow_now` 的验证撞上 `health::QUICK_PROBE_BUDGET_SECS` 整体时限用
     pub gate: Option<std::sync::Arc<Gate>>,
     /// [`Prober::timed_get`] 的耗时；结果本身仍查 `gets`（同一份 URL 表）
     pub http_ms: Option<u64>,
@@ -908,6 +908,17 @@ impl Gate {
     pub fn open(&self) {
         *self.open.lock().expect("Gate 锁被毒化") = true;
         self.passable.notify_all();
+    }
+
+    /// 兜底放行：`d` 之后自动开闸。**测「探测撞上整体预算」的用例必须挂一个** —— 万一被测
+    /// 代码丢掉了那个 `timeout`（`health::probe_quick_within`），用例就该**红**在耗时断言上，
+    /// 而不是永远挂住（`spawn_blocking` 在飞时 runtime 关不掉，整个测试二进制跟着卡死）。
+    pub fn open_after(self: &std::sync::Arc<Self>, d: std::time::Duration) {
+        let g = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(d).await;
+            g.open();
+        });
     }
 }
 

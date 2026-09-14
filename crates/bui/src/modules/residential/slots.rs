@@ -498,7 +498,7 @@ pub struct SlotOutcome {
     /// 切成了：`target` 已生效（[`borrow_now`] 里还要求它当下带外验证**没被证死**，
     /// 是否确认可用看 `unconfirmed`）
     pub switched: bool,
-    /// [`borrow_now`]：切过去了，但**没能在预算内确认它可用**（[`BORROW_VERIFY_BUDGET_SECS`]
+    /// [`borrow_now`]：切过去了，但**没能在预算内确认它可用**（[`health::QUICK_PROBE_BUDGET_SECS`]
     /// 超时 / 探测任务异常 / 本次调用的验证预算已用尽）。此时仍然保留这个候选 ——
     /// 本槽原来的出口是**已知死的**，未知优于已知死 —— 但告警绝不许说「已临时切到」。
     /// [`drive_slots`] 永远 false
@@ -521,8 +521,8 @@ pub struct SlotOutcome {
 /// selector 已经切走，runtime 还记着旧值）。两者各自整段持锁。
 ///
 /// **锁内不只有毫秒级的 Clash PUT**：[`borrow_now`] 在锁内最多做 [`BORROW_PROBES_PER_CALL`] 次
-/// 带外验证，每次上限 [`BORROW_VERIFY_BUDGET_SECS`] 秒，所以一次持锁最坏是「几次 PUT +
-/// 3 × 4 秒」。算预算时按这个上界算，别按「毫秒级」算。这段时间里巡检那一轮只是排队等
+/// 带外验证，每次上限 [`health::QUICK_PROBE_BUDGET_SECS`] 秒，所以一次持锁最坏是「每个受影响的
+/// 槽几次 PUT + 3 × 4 秒」。算预算时按这个上界算，别按「毫秒级」算。这段时间里巡检那一轮只是排队等
 /// （`sentinel_loop` 与巡检都用 `MissedTickBehavior::Delay`，不补跑），单一互斥、无嵌套，
 /// store 的读锁在探测前已经 drop。
 ///
@@ -724,31 +724,22 @@ pub async fn drive_slots(
 /// [`borrow_now`] 遇到压在故障 IP 上、但被手动 pin 的槽时记的 note
 pub const PINNED_UNTOUCHED_NOTE: &str = "已手动锁定，未动";
 
-/// [`borrow_now`] 借用后那一次带外验证的**整体**预算：整个 [`health::probe_quick`] 被
-/// `tokio::time::timeout` 包住，超时即结论「未确认」（不是「不可用」）。
-///
-/// 4 秒的来历：① 网关 TCP 连不上那条路 ≤ `tcp_within`（生产 `PROBE_TCP_TIMEOUT_SECS` = 3 秒）
-/// 就返回；② 网关活着那条路正常情况下经隧道一次 GET 远小于 1 秒。4 秒覆盖两者且留余量，
-/// 且必须 > `tcp_within`，否则 TCP 一步就把预算吃光。
-///
-/// **为什么非得有这个整体时限**：`probe_quick` 只有在网关 TCP 连不上时才是「≤3 秒返回」；
-/// 一旦 TCP 通过，它会继续走 `probe_reachable`（`timed_get` ≤5 秒 + `get` ≤5 秒 + 407 补判
-/// `confirm_auth_failure` 逐个解析地址各等满 5 秒、不并发），而「网关活着、某个静态端口背后
-/// 的出口 IP 死了」恰恰是本函数主打的故障形态 —— 生产网关域名解析出 6 个 IPv4 时单次最坏
-/// 5 + 5 + 6 × 5 ≈ 40 秒，两条处置延迟 SLA 全破。超时后那个 `spawn_blocking` 任务会自己跑完
-/// （结果丢弃），不阻塞预案。
-pub const BORROW_VERIFY_BUDGET_SECS: u64 = 4;
-
 /// [`borrow_now`] **单次调用**（跨槽共享，不是每槽）最多做几次带外验证。
 ///
 /// 必须是调用级的：本函数按槽循环，每个「当前出口 == 故障 IP」的槽都会挨个试自己的候选，
 /// 槽级上限 N 会让单次调用最坏做「池大小 − 1」次验证（`bui_schema::slots::MAX_SLOTS` = 8）。
 ///
-/// 3 是「无可用出口 ≤25 秒」那条算式里的项（首条 relay 错误 → 事件）：等第 2 条错误，加哨兵
-/// 轮询 ≤2 秒，加原上游快探 ≤3 秒，加 3 ×（Clash PUT 加验证 ≤ [`BORROW_VERIFY_BUDGET_SECS`]），
-/// 加收尾那次 PUT，合计 **≤18 秒**（PUT 是本机 Clash API，正常毫秒级、上限
-/// `CLASH_TIMEOUT_SECS` = 2）；有可用出口那条快路只验证一次（第一候选健康时 < 1 秒）⇒ ≈7 秒，
-/// 仍在「有可用出口 ≤15 秒」之内。
+/// 3 是「无可用出口 ≤25 秒」那条算式里的项（首条 relay 错误 → 事件，spec §5.7）：
+/// 等第 2 条错误（串行最坏一次 relay 拨号超时 5 秒）+ 哨兵轮询 ≤2 秒 + **原上游快探
+/// ≤ [`health::QUICK_PROBE_BUDGET_SECS`]**（哨兵那次快探与这里的验证共用同一个整体预算，
+/// 见 `health::probe_quick_within`）+ 3 × 验证 ≤ [`health::QUICK_PROBE_BUDGET_SECS`]
+/// ⇒ **≤23 秒**；有可用出口那条快路只验证一次（第一候选健康时 < 1 秒）⇒ ≈11 秒，最坏
+/// （两次快探都撞满各自的 4 秒预算）正好 15 秒，压在「有可用出口 ≤15 秒」上。
+///
+/// **Clash PUT 不在这两条算式里**：它是本机 Clash API、正常毫秒级（单次上限
+/// `CLASH_TIMEOUT_SECS` = 2 秒，Clash 自己挂起时这条算式不成立）。次数也不是常数，它按
+/// **受影响的槽数**累加：8 个槽全压在故障 IP 上时，槽 0 最坏 4 次（3 次探死 + 预算耗尽那次）
+/// 加 1 次放回，其余 7 槽各 1 次 ⇒ 约 12 次（2026-09-14 审查第 2 条）。
 ///
 /// 预算用尽之后**不退回「保持现状」**（那会把槽留在已证死的上游上）：剩下的槽照样 PUT 到
 /// 各自的最优候选，只是按 `unconfirmed` 口径报，由下一轮巡检用完整预算复核。
@@ -764,9 +755,10 @@ pub const BORROW_PROBES_PER_CALL: usize = 3;
 ///   照样出现在结果里，note = [`PINNED_UNTOUCHED_NOTE`]（告警据此如实说明，不说成「没有槽经它出网」）；
 /// - 候选顺序：本槽 IP 不是 `failed` 且健康、Google 未被封 ⇒ 先回本槽；其余按
 ///   [`health::rank_healthy`] 的排名；一个候选都没有 ⇒ 保持现状（fail-open）；
-/// - **每切一条都当下验证**：`put_slot` 成功后对刚切过去的那条跑一次 [`health::probe_quick`]
-///   （同一个函数、同一个 `prober`、同一个网关 TCP 时限 `tcp_within`），整体限时
-///   [`BORROW_VERIFY_BUDGET_SECS`] 秒。结论**三值**（[`Verdict`]）：
+/// - **每切一条都当下验证**：`put_slot` 成功后对刚切过去的那条跑一次
+///   [`health::probe_quick_within`]（与哨兵判「原上游坏了」**同一个**函数、同一个 `prober`、
+///   同一个网关 TCP 时限 `tcp_within`、同一个整体预算
+///   [`health::QUICK_PROBE_BUDGET_SECS`] 秒）。结论**三值**（[`health::Verdict`]）：
 ///   **确认可用** ⇒ 借到了（`switched`，行为与没有这次验证时逐字一致）；
 ///   **确认不可用** ⇒ 把**这一条**记 `mark_unhealthy` 并试下一个候选；
 ///   **预算内未能确认**（超时 / 探测任务异常）⇒ **保留这个候选**、不记不健康，`unconfirmed = true`
@@ -919,22 +911,25 @@ pub async fn borrow_now(
                         break;
                     }
                     probes_left -= 1;
-                    match verify_target(&prober, up.clone(), tcp_within).await {
-                        Verdict::Alive => {
+                    match health::probe_quick_within(&prober, up.clone(), tcp_within).await {
+                        health::Verdict::Alive => {
                             tracing::warn!(slot = sl.index, to = %tag, "哨兵：本槽当前出口不可用，立即借用");
                             proven_alive.insert(up.id);
                             borrowed_to = Some((up.id, None));
                             break;
                         }
-                        Verdict::Unconfirmed => {
+                        health::Verdict::Unconfirmed => {
                             tracing::warn!(slot = sl.index, to = %tag, "哨兵：借到的这条没能在预算内确认，保留它并如实报告");
                             borrowed_to = Some((
                                 up.id,
-                                Some(format!("未能在 {BORROW_VERIFY_BUDGET_SECS} 秒内确认可用")),
+                                Some(format!(
+                                    "未能在 {} 秒内确认可用",
+                                    health::QUICK_PROBE_BUDGET_SECS
+                                )),
                             ));
                             break;
                         }
-                        Verdict::Dead => {
+                        health::Verdict::Dead { .. } => {
                             tracing::warn!(slot = sl.index, cand = %tag, "哨兵：候选切过去也探不通，记不健康后试下一个");
                             dead.push(up.id);
                             proven_dead.insert(up.id);
@@ -1016,38 +1011,6 @@ pub async fn borrow_now(
         .await;
     }
     out
-}
-
-/// [`verify_target`] 的三种结论。「确认不可用」与「没能确认」必须分开：前者是证据
-/// （记不健康、换下一个候选），后者只是超时（保留候选、不记不健康）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Verdict {
-    /// 预算内确认可用
-    Alive,
-    /// 预算内拿到明确的失败：网关 TCP 不通，或经隧道的 HTTP 明确失败 / 凭据被拒
-    Dead,
-    /// 预算内没能确认（超时、或探测任务本身异常）⇒ 结论未知
-    Unconfirmed,
-}
-
-/// 借用后的带外验证：与哨兵判「原上游坏了」用的是**同一个** [`health::probe_quick`]
-/// ——同一个 `prober` 抽象、同一个网关 TCP 时限，逐条按 `host:port` 探。
-/// `Prober` 是同步的（`reqwest::blocking`），照例进 `spawn_blocking`。
-///
-/// 整个探测被 [`BORROW_VERIFY_BUDGET_SECS`] 秒的 `timeout` 包住（那个常量的文档写了为什么
-/// 非得有这个上界）。超时或任务异常 ⇒ [`Verdict::Unconfirmed`]：拿不到证据既不许报
-/// 「已临时切到」，也不许把这条判成不健康。超时后 `spawn_blocking` 那个任务会自己跑完
-/// （`reqwest::blocking` 没有取消点），结果丢弃，不阻塞预案。
-async fn verify_target(prober: &Arc<dyn Prober>, up: Upstream, tcp_within: Duration) -> Verdict {
-    let p = prober.clone();
-    let probe =
-        tokio::task::spawn_blocking(move || health::probe_quick(p.as_ref(), &up, tcp_within));
-    let budget = Duration::from_secs(BORROW_VERIFY_BUDGET_SECS);
-    match tokio::time::timeout(budget, probe).await {
-        Ok(Ok(probe)) if probe.ok => Verdict::Alive,
-        Ok(Ok(_)) => Verdict::Dead,
-        Ok(Err(_)) | Err(_) => Verdict::Unconfirmed,
-    }
 }
 
 /// 手动把一槽钉在某条上游上（`target = None` 解除）。钉住后立刻生效一次，
@@ -2792,15 +2755,16 @@ mod tests {
         );
     }
 
-    /// 验证撞上**整体**预算（[`BORROW_VERIFY_BUDGET_SECS`]）：网关活着、隧道不响应时
-    /// `probe_quick` 会一路走到 HTTP 那一段（真实实现最坏 ≈40 秒），所以上界只能靠
+    /// 验证撞上**整体**预算（[`health::QUICK_PROBE_BUDGET_SECS`]）：网关活着、隧道不响应时
+    /// `probe_quick` 会一路走到 HTTP 那一段（真实实现实测 ≈28 秒），所以上界只能靠
     /// `timeout` 在代码里保证 —— 演练的丢包只造得出「TCP 连不上」那条快路，量不到这一段。
     /// 结论必须落在「未确认」：保留这个候选（本槽原来那条是已知死的）、不记不健康、不再试下一个。
     ///
-    /// **这条用例真的要等满 4 秒**（进程里唯一一条）：假时钟在这里用不了 —— 只要有
-    /// `spawn_blocking` 任务在飞，tokio 就会抑制 `start_paused` 的自动推进
-    /// （`runtime/blocking/schedule.rs` 调 `Clock::inhibit_auto_advance`），而这次验证正是
-    /// 一个 `spawn_blocking`。闸门在断言之前放行，阻塞线程不会拖住 runtime 关闭。
+    /// **这条用例真的要等满 4 秒**（另一条是 `sentinel::resi` 里判原上游那侧的同形态用例）：
+    /// 假时钟在这里用不了 —— 只要有 `spawn_blocking` 任务在飞，tokio 就会抑制 `start_paused`
+    /// 的自动推进（`runtime/blocking/schedule.rs` 调 `Clock::inhibit_auto_advance`），而这次
+    /// 验证正是一个 `spawn_blocking`。闸门在断言之前放行，阻塞线程不会拖住 runtime 关闭；
+    /// `open_after` 是兜底，让「timeout 被删掉」这个变异红在耗时断言上而不是挂死。
     #[tokio::test]
     async fn a_verification_that_outruns_its_budget_keeps_the_candidate_and_says_so() {
         let d = tempfile::tempdir().unwrap();
@@ -2822,6 +2786,7 @@ mod tests {
                 .insert("isp3.example.net:10007".into(), Some(20));
             i.gate = Some(gate.clone());
         });
+        gate.open_after(Duration::from_secs(15));
         let t0 = std::time::Instant::now();
         let out = borrow_now(
             &ctx,
@@ -2834,7 +2799,7 @@ mod tests {
         .await;
         let took = t0.elapsed();
         gate.open(); // 先放行，再断言（失败也不许把阻塞线程留给 runtime 关闭）
-        let budget = Duration::from_secs(BORROW_VERIFY_BUDGET_SECS);
+        let budget = Duration::from_secs(health::QUICK_PROBE_BUDGET_SECS);
         assert!(
             took >= budget && took < budget + Duration::from_secs(2),
             "整体耗时被预算截断：{took:?}"

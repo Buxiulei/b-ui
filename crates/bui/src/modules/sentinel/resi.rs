@@ -109,8 +109,13 @@ fn gone(id: Uuid) -> Outcome {
 }
 
 /// relay 日志里同一上游 60 秒 ≥2 条连接错误（凭据失效 ≥3 条）之后：带外快探
-/// （[`health::probe_quick`]：网关 TCP [`PROBE_TCP_TIMEOUT_SECS`] 秒内连不上即判不可达）；
-/// 不可用 ⇒ 立即判不健康 + [`slots::borrow_now`] + 上游级告警「IP X 不可达，槽 i 已临时切到 Y」。
+/// （[`health::probe_quick_within`]：网关 TCP [`PROBE_TCP_TIMEOUT_SECS`] 秒内连不上即判不可达，
+/// 整个快探限时 [`health::QUICK_PROBE_BUDGET_SECS`] 秒、结论三值）；
+/// **确认**不可用 ⇒ 立即判不健康 + [`slots::borrow_now`] + 上游级告警「IP X 不可达，槽 i 已临时
+/// 切到 Y」；**没能确认** ⇒ 什么都不做（见函数体里那条 `Unconfirmed` 分支的理由）。
+///
+/// 这次快探与 [`slots::borrow_now`] 里借用后那次**共用同一个整体预算**：只给其中一处加时限，
+/// spec §5.7 两条处置延迟 SLA 的上界就只对那一处成立（2026-09-14 审查第 1 条）。
 pub async fn on_upstream_error(
     ctx: &DaemonCtx,
     prober: Arc<dyn Prober>,
@@ -122,34 +127,35 @@ pub async fn on_upstream_error(
     let Some(up) = g.upstreams.iter().find(|u| u.id == id).cloned() else {
         return gone(id);
     };
-    let u2 = up.clone();
     let tcp_within = std::time::Duration::from_secs(PROBE_TCP_TIMEOUT_SECS);
-    let p2 = prober.clone();
-    let probe = match tokio::task::spawn_blocking(move || {
-        health::probe_quick(p2.as_ref(), &u2, tcp_within)
-    })
-    .await
-    {
-        Ok(p) => p,
-        Err(e) => {
+    let why = match health::probe_quick_within(&prober, up.clone(), tcp_within).await {
+        health::Verdict::Alive => {
             return Outcome {
                 subject: subject_of(&up),
-                result: format!("带外探测任务异常（{e}），本次不动作"),
-                level: Level::Warn,
+                result: "带外探测通过（日志里的错误来自目标侧或已自愈），不动作".into(),
+                level: Level::Info,
             }
         }
-    };
-    if probe.ok {
-        return Outcome {
-            subject: subject_of(&up),
-            result: "带外探测通过（日志里的错误来自目标侧或已自愈），不动作".into(),
-            level: Level::Info,
-        };
-    }
-    let why = if probe.auth_failed {
-        "凭据失效（407 / SOCKS5 认证被拒）"
-    } else {
-        "不可达"
+        // 预算内没能确认（网关活着、隧道不响应，或探测任务异常）⇒ **不动作**。超时不是
+        // 「它坏了」的证据：拿它去 `mark_unhealthy` + 借用，就是把一条可能健康的上游判死、
+        // 把槽白挪走（另一种误判）。这条形态留给 2 分钟一轮的巡检 —— `health::probe_member`
+        // 不受这个预算约束，能等满完整探测再下结论。
+        // **级别取 Info 是为了不盖 10 分钟冷却**（`run::takes_cooldown`：住宅两类预案的 Info =
+        // 什么都没做）：什么都没做的结论不许让哨兵对这条上游失明 10 分钟，下一波错误
+        // （≥ `DEBOUNCE_SECS` 60 秒）还要再探一次。
+        health::Verdict::Unconfirmed => {
+            return Outcome {
+                subject: subject_of(&up),
+                result: format!(
+                    "带外探测没能在 {} 秒内给出结论（网关通但隧道无响应，或探测任务异常），\
+                     本次不动作，交下一轮巡检用完整预算复核",
+                    health::QUICK_PROBE_BUDGET_SECS
+                ),
+                level: Level::Info,
+            }
+        }
+        health::Verdict::Dead { auth_failed: true } => "凭据失效（407 / SOCKS5 认证被拒）",
+        health::Verdict::Dead { auth_failed: false } => "不可达",
     };
     state::update(&ctx.runtime, move |r| {
         state::mark_unhealthy(r.health.entry(id.to_string()).or_default(), now);
@@ -514,6 +520,55 @@ mod tests {
         let r = state::read(&ctx.runtime).await;
         assert!(r.health.get(&u(2).to_string()).is_none_or(|h| h.active));
         assert!(r.upstream_alerts.is_empty());
+    }
+
+    /// 判「原上游坏了」的那次快探撞上整体预算（[`health::QUICK_PROBE_BUDGET_SECS`]）：
+    /// 网关活着、隧道不响应 —— 这正是本预案主打的故障形态，而 `probe_quick` 在这条路上
+    /// 没有自己的上界（实测 ≈28 秒），所以它必须被 `timeout` 截断，否则两条处置延迟 SLA
+    /// （15 / 25 秒）在最常见的形态上必然破。
+    ///
+    /// 截断之后**什么都不做**：超时不是「它坏了」的证据，拿它去判不健康 + 借用是另一种误判。
+    /// 级别必须是 Info，否则 `run::takes_cooldown` 会给这次「什么都没做」盖 10 分钟冷却，
+    /// 让哨兵对这条上游失明。
+    ///
+    /// 这条用例真的要等满 4 秒（同 `slots` 那条：`spawn_blocking` 在飞时 tokio 抑制
+    /// `start_paused` 的自动推进）；`open_after` 是兜底，让「timeout 被删掉」这个变异红在
+    /// 耗时断言上而不是挂死整个测试二进制。
+    #[tokio::test]
+    async fn a_judging_probe_that_outruns_its_budget_does_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        let (ctx, _host) = pool_ctx(d.path()).await;
+        let (p, c) = fakes();
+        let gate = Arc::new(crate::modules::residential::proxy::Gate::default());
+        p.with(|i| {
+            // 故障那条的网关连得上，但经它的 GET 卡住
+            i.tcp_by_endpoint
+                .insert("isp2.example.net:10007".into(), Some(20));
+            i.gate = Some(gate.clone());
+        });
+        gate.open_after(std::time::Duration::from_secs(15));
+        let t = std::time::Instant::now();
+        let o = on_upstream_error(&ctx, p.clone(), c.clone(), u(2), t0()).await;
+        let took = t.elapsed();
+        gate.open(); // 先放行，再断言
+        let budget = std::time::Duration::from_secs(health::QUICK_PROBE_BUDGET_SECS);
+        assert!(
+            took >= budget && took < budget + std::time::Duration::from_secs(2),
+            "快探被整体预算截断：{took:?}"
+        );
+        assert_eq!(o.level, Level::Info, "什么都没做，不许盖 10 分钟冷却");
+        assert!(
+            o.result.contains("没能在 4 秒内给出结论") && o.result.contains("本次不动作"),
+            "{}",
+            o.result
+        );
+        assert!(c.calls().is_empty(), "没拿到证据 ⇒ 一次都不切");
+        let r = state::read(&ctx.runtime).await;
+        assert!(
+            r.health.get(&u(2).to_string()).is_none_or(|h| h.active),
+            "超时不是「它坏了」的证据 ⇒ 不许记不健康"
+        );
+        assert!(r.upstream_alerts.is_empty(), "也不许发告警");
     }
 
     #[tokio::test]

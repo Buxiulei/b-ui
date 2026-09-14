@@ -67,8 +67,10 @@ fn drop_stale_start(sr: &mut SentinelRuntime, now: OffsetDateTime) {
 }
 
 /// 执行了动作（借用 / 告警 / 重试 / 交看门狗）才盖 [`super::ACTION_COOLDOWN_SECS`] 冷却。住宅两类预案
-/// 的 Info 是「带外探测 / 复核通过，或上游刚被删」——什么都没做，只受 60 秒去抖约束：否则一次误报
-/// （HTTP 上游对慢目标报 deadline exceeded）会让哨兵对该上游失明 10 分钟，真故障只能等巡检。
+/// 的 Info 是「带外探测 / 复核通过、探测没能在预算内给出结论，或上游刚被删」——什么都没做，只受
+/// 60 秒去抖约束：否则一次误报（HTTP 上游对慢目标报 deadline exceeded）会让哨兵对该上游失明
+/// 10 分钟，真故障只能等巡检。「没能确认」同理算 Info（`resi::on_upstream_error`）：它一次都没动
+/// 过手，不许因此失明。
 fn takes_cooldown(sig: Sig, level: Level) -> bool {
     !(sig.on_upstream() && level == Level::Info)
 }
@@ -694,12 +696,32 @@ mod tests {
         (parse_rfc3339(at).expect("at 是 RFC3339") - from).whole_seconds()
     }
 
+    /// `health::probe_quick` 那条「网关活着、隧道卡住」的慢路上没有自己的上界（实测 ≈28 秒），
+    /// 上界只由 `health::QUICK_PROBE_BUDGET_SECS` 的 `timeout` 给。这个预算**必须 > 网关 TCP
+    /// 那一步的时限**，否则每条「网关连不上」的上游都会在 TCP 那一步把预算吃光、结论从
+    /// 「确认不可用」退化成「未确认」：哨兵判原上游那侧不动作、借用侧在第一个候选上就停
+    /// （既不记不健康也不试下一个），整套预案静默变成空操作 —— 而两处既有用例的假件 TCP 是
+    /// 瞬时的，一条都不会红（2026-09-14 审查第 3 条）。
+    #[test]
+    fn the_quick_probe_budget_must_outlast_the_gateway_tcp_timeout() {
+        let (budget, tcp) = (
+            crate::modules::residential::health::QUICK_PROBE_BUDGET_SECS,
+            super::super::PROBE_TCP_TIMEOUT_SECS,
+        );
+        assert!(
+            budget > tcp,
+            "快探整体预算 {budget} 秒 ≤ 网关 TCP 时限 {tcp} 秒：每条网关连不上的上游都会变成「未确认」"
+        );
+    }
+
     /// 演练判据①的延迟预算（2026-09-13 真机 30.3 秒、SLA 15 秒之后）：达到门槛的那条错误最晚在它
     /// 之后一个轮询周期被读到；带外探测 TCP 不通最多等 PROBE_TCP_TIMEOUT_SECS 就判不可达，不再跑
     /// 完整探测；借用 = 一次 Clash PUT 加借到那条的带外验证 —— 这条快路上验证的目标网关是通的
-    /// （只丢了一个端口），一次经隧道的 GET 远小于 1 秒，所以留 1 秒。**验证走不通的那条慢路**
-    /// （网关活着、出口 IP 死了）由 `slots::BORROW_VERIFY_BUDGET_SECS` 的整体时限兜住，见
-    /// `with_the_whole_gateway_down_the_event_lands_within_the_no_exit_sla` 与
+    /// （只丢了一个端口），一次经隧道的 GET 远小于 1 秒，所以留 1 秒。**两次快探各自走不通的那条
+    /// 慢路**（网关活着、出口 IP 死了）都由 `health::QUICK_PROBE_BUDGET_SECS` 的整体时限兜住
+    /// （判原上游与借用后验证共用它），见
+    /// `with_the_whole_gateway_down_the_event_lands_within_the_no_exit_sla`、
+    /// `resi::tests::a_judging_probe_that_outruns_its_budget_does_nothing` 与
     /// `slots::tests::a_verification_that_outruns_its_budget_keeps_the_candidate_and_says_so`
     #[tokio::test]
     async fn a_dropped_gateway_is_borrowed_within_one_poll_plus_the_tcp_timeout() {
@@ -742,8 +764,8 @@ mod tests {
     /// 每个候选「PUT + 快探」+ 收尾 PUT，事件才落地。演练判据拆成两条正是为此：
     /// 有可用出口 ≤15 秒，无可用出口 ≤25 秒（`DRILL_NOEXIT_SLA`）。
     /// 这里的假时钟只推得动「网关 TCP 连不上」那一段（`on_tcp_fail`），与真机丢包一样 ——
-    /// 网关活着、HTTP 卡住那一段的上界靠 `slots::BORROW_VERIFY_BUDGET_SECS` 的 `timeout`，
-    /// 在 `slots` 那边用假件单独测（丢包量不到它）。
+    /// 网关活着、HTTP 卡住那一段的上界靠 `health::QUICK_PROBE_BUDGET_SECS` 的 `timeout`，
+    /// 判原上游那次与借用后那次各用假件单独测（丢包量不到它）。
     /// 候选数上限是**单次调用**的 `slots::BORROW_PROBES_PER_CALL`，所以这里的算式
     /// `POLL + (1 + 候选数) × PROBE_TCP_TIMEOUT_SECS` 在 8 条上游的生产池上同样成立
     #[tokio::test]
