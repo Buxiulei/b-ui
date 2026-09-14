@@ -2141,6 +2141,7 @@ fn probe(&self, url: &str, via: Via, timeout: Duration) -> std::result::Result<P
   4. 没有新版：`Note("已是最新（{v}，来源 {src}）")`；
   5. 有新版，按 `self_reason` 与 `kernel_outdated` 先打一行：`NewVersion` → `最新 {X}（来源 {src}），本机 {Y}`；`Rebuild` → `有新构建：版本同为 {X}，但文件不同（重新打包过）`；`Unreadable` → `读不到本机的 bui-c 二进制，更新会重新装一份 {X}`；只有内核要换 → `sing-box 内核有新版 {k}（本机 {k0}）`。然后打 `更新会替换 bui-c 与 sing-box，代理重启几秒`（按实际要换的裁剪），再问 `现在更新到 {X}？[y/N]`（默认否）。答是：拿锁 → `update::run(check_only = false)` → 结果行（真换了自身时加 `新版菜单下次打开生效`）→ `Pause`。答否：`Note("没有更新（最新 {X}）")`。`MissingAsset` → `manifest 里没有 bui-c-linux-{arch}，这次没法更新 bui-c`：不问 y/N（内核也要换时只问内核），`Pause`；
   6. 取不到 manifest：`Pause("检查更新失败：…")`，错误里不带 URL（沿用 3840f58 的 `request_error`）。
+- 下载期间别处装上的不是 manifest 那一份（install 进锁跳过、还有要换的，T12b r3 I1）：[7] → [1] 不说「没有需要更新的」，按 `UPDATE_CHANGED` 重新显示再问；`bui-c update` 两行输出之后报 `下载期间已被别的操作换过，这次没装，再跑一次 bui-c update`、退出 1。别处装的正是那一份时照旧「没有需要更新的」、退出 0。
 - 命令行 `bui-c update`：输出不变（脚本在用，非交互，不问）。`update --check-only`：结论那一行按 `self_reason` 分开说（`已是最新` / `有新版，跑 bui-c update 升级` / `有同版本的新构建（rc 通道重建），跑 bui-c update 升级` / `读不到本机的 bui-c 二进制，跑 bui-c update 会重新装一份` / `manifest 里没有 bui-c-linux-{arch}，没法更新`），第一行 `manifest {v}（来源 {src}）` 不变。
 - d1 原稿说「rc 的 manifest `version` 都是 `4.0.0`，版本相同就不会提示有新版，不在本轮范围」，这条已被 500c786 解决，§14 里对应的那一条删掉了。
 

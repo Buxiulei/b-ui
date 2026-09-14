@@ -1070,6 +1070,14 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
                     r.self_updated, r.kernel_updated, r.restarted
                 ));
             }
+            // 下载期间别处装上的不是 manifest 那一份（两边拿到的 manifest 不同）：这次没装、★ 照挂，
+            // 上面两行却与「本来就是最新」逐字相同，脚本要从退出码看到（R15，与下面缺产物同一写法）。
+            // 别处装的正是这一份时是真的最新，照旧退出 0
+            if !*check_only && r.superseded && new_version_pending(&r) {
+                return Err(Error::msg(
+                    "下载期间已被别的操作换过，这次没装，再跑一次 bui-c update",
+                ));
+            }
             // manifest 缺本机架构的 bui-c：内核照换了，但 bui-c 没换成，脚本要从退出码看到失败
             // （以前在下载那一步就报「manifest 里没有 … 这个产物」退出）
             if !*check_only && r.self_reason == update::SelfReason::MissingAsset {
@@ -2526,7 +2534,8 @@ fn maint_menu<S: Sys, N: Net, P: Prompt>(
 /// 提问本身就是停顿，所以答否不再停。检查、下载与提问都在锁外，只有安装持锁（R2 末条、R11）。
 ///
 /// 答是之后才下载；下到的与刚才显示的不一样（人看提示的这几秒里又发了版、或别处刚装过），
-/// 不装，按新的结论重新显示再问（[`UPDATE_CHANGED`]）。
+/// 不装，按新的结论重新显示再问（[`UPDATE_CHANGED`]）。进锁才发现下载期间别处装上了别的东西
+/// （还有要换的、这次没装）也一样重新显示再问，不说「没有需要更新的」。
 fn maint_check_update<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<Outcome> {
     tell(ctx, menu::UPDATE_CHECKING);
     ctx.flush();
@@ -2603,7 +2612,8 @@ fn update_offer_now<S: Sys, N: Net, P: Prompt>(
 enum Installed {
     /// 装了（或失败了）：停顿页已经打出来，按这个结果回主循环。
     Done(Outcome),
-    /// 这次下到的与显示的不一样，什么都没装：按这份新结论重新显示再问。
+    /// 这次下到的与显示的不一样，什么都没装；或进锁发现下载期间别处装上了别的东西、还有要换的：
+    /// 按这份新结论重新显示再问。
     Changed(update::Report),
 }
 
@@ -2614,6 +2624,10 @@ enum Installed {
 ///
 /// 失败（下载、等锁、安装）：停下来，「上次：」行是「失败：…」；runtime 不动（★ 照挂，也不算更新过）。
 /// 装好之后 runtime.json 写不进：照样说装好了（二进制已换），只记 warn，★ 挂到下次检查。
+///
+/// 进锁发现下载期间别处装上的不是 manifest 那一份（`superseded` 且还有要换的）：结果行不能说
+/// 「没有需要更新的」——★ 挂着「有新版」（spec §8.1 D15 显示与行为一致）。返回 [`Installed::Changed`]
+/// 重新显示再问；再答 y 重新下载、重新取样，就能装上（审查 T12b r3 I1）。
 fn maint_install_update<S: Sys, N: Net, P: Prompt>(
     ctx: &mut Ctx<'_, S, N, P>,
     shown: &menu::UpdateOffer,
@@ -2650,20 +2664,22 @@ fn maint_install_update<S: Sys, N: Net, P: Prompt>(
         }),
         Err(e) => Err(e),
     };
-    Ok(Installed::Done(match done {
-        Ok(r) => {
-            let lines = menu::update_done(&r);
-            for l in &lines {
-                tell(ctx, l);
-            }
-            Outcome::Pause(lines[0].clone())
-        }
+    let r = match done {
+        Ok(r) => r,
         Err(e) => {
             let line = format!("失败：{e}");
             tell(ctx, &line);
-            Outcome::Pause(line)
+            return Ok(Installed::Done(Outcome::Pause(line)));
         }
-    }))
+    };
+    if r.superseded && new_version_pending(&r) {
+        return Ok(Installed::Changed(r));
+    }
+    let lines = menu::update_done(&r);
+    for l in &lines {
+        tell(ctx, l);
+    }
+    Ok(Installed::Done(Outcome::Pause(lines[0].clone())))
 }
 
 /// `[7]` 子页顶部三行（spec §8.1 第一条）：只读 `runtime.json` 与 `profiles.json`，不联网。
@@ -5036,7 +5052,10 @@ mod tests {
 
     /// 审查 T12b r2 I1（命令行出口）：`bui-c update` 下载期间别处已经装好了同一份，进锁后两道闸都跳过。
     /// 本机已是最新：输出「自身更新=false …」、退出 0；runtime 不能再点亮 ★，也不能记成「刚更新过」
-    /// ——那是别处那次的事，这次什么都没装。别处装的是别的东西时 ★ 照挂，同样不算更新过。
+    /// ——那是别处那次的事，这次什么都没装。
+    ///
+    /// 审查 T12b r3 I1：别处装的是别的东西时 ★ 照挂、同样不算更新过，而且**退出 1**、错误里叫人再跑一次
+    /// ——输出那两行与「本来就是最新」逐字相同，脚本只能从退出码看出这次没装（R15）。
     #[test]
     fn the_update_command_leaves_a_concurrent_install_alone_and_clears_the_star() {
         let pp = paths();
@@ -5051,7 +5070,16 @@ mod tests {
             let race = crate::fake::LandsDuringDownload::new(&s, &n, "/sing-box-linux-", land);
             let mut p = Scripted::from([]);
             let mut ctx = Ctx::new(&race, &n, &pp, &mut p, false, false);
-            dispatch(&parse(&["update"]), &mut ctx).unwrap();
+            let res = dispatch(&parse(&["update"]), &mut ctx);
+            if star {
+                let e = res.unwrap_err();
+                assert_eq!(e.exit_code(), 1, "{case}：{e}");
+                let msg = e.to_string();
+                assert!(msg.contains("再跑一次 bui-c update"), "{case}：{msg}");
+                assert!(menu::budget_width(&msg) <= 59, "{case}：{msg}");
+            } else {
+                res.unwrap();
+            }
             let t = ctx.transcript.clone();
             assert!(race.landed(), "{case}：别处的安装没落下来");
             assert_eq!(
@@ -5122,6 +5150,56 @@ mod tests {
         let rt = Runtime::load(&s, &pp);
         assert!(!rt.update_available, "{rt:?}");
         assert_eq!(rt.last_update_at, None, "{rt:?}");
+    }
+
+    /// 审查 T12b r3 I1（菜单出口）：答 y 之后下载期间别处装上的**不是** manifest 那一份（两个会话拿到的
+    /// manifest 不同）。这次没装、★ 该挂，结果行就不能说「没有需要更新的」——按盘上现在的样子说「再确认」、
+    /// 重新显示再问；再答 y 重新下载，装上的是 manifest 那一份，回主菜单不挂 ★。两次提问都不持锁。
+    #[test]
+    fn maint_update_after_a_concurrent_install_of_something_else_reconfirms() {
+        let pp = paths();
+        let (s, n) = update_machine("9.9.9", Some("bui-c-newer"), Some("1.13.19"));
+        with_unit(&s);
+        let race = crate::fake::LandsDuringDownload::new(
+            &s,
+            &n,
+            "/sing-box-linux-",
+            &concurrent_install_of_something_else,
+        );
+        let mut p = LoggingPrompt::new(&s, &["7", "1", "y", "y", "", "0"]);
+        let mut ctx = Ctx::new(&race, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        let asked = p.inner.asked.clone();
+        assert!(race.landed(), "别处的安装没落下来：{t}");
+        assert!(t.contains("再确认"), "{t}");
+        assert!(!t.contains("没有需要更新的"), "{t}");
+        let qs = asked.iter().filter(|q| q.starts_with("现在更新到")).count();
+        assert_eq!(qs, 2, "重新显示要再问一次：{asked:?}");
+        assert_eq!(pauses(&asked), 1, "{asked:?}");
+        assert_eq!(s.get(crate::paths::SELF_BIN).unwrap(), "bui-c-newer", "{t}");
+        assert_eq!(s.get("/opt/bui-c/bin/sing-box").unwrap(), NEW_KERNEL, "{t}");
+        assert_eq!(lock_counts(&s), (2, 2), "{:?}", s.calls());
+        assert_eq!(no_prompt_under_lock(&s, 0, "别处装了别的再问"), 2, "{t}");
+        let calls = s.calls();
+        let second_ask = calls
+            .iter()
+            .rposition(|c| c.starts_with("ask 现在更新到"))
+            .unwrap();
+        let first_unlock = calls.iter().position(|c| c == "unlock").unwrap();
+        assert!(
+            first_unlock < second_ask,
+            "第一次进锁没装上才再问：{calls:?}"
+        );
+        assert!(last_line(&t).contains("已更新"), "{t}");
+        let result = t.find("已更新").unwrap();
+        let after = &t[result..];
+        assert!(after.contains("更新与维护"), "回到了主菜单：{after}");
+        assert!(!after.contains('★'), "回主菜单不挂 ★：{after}");
+        let rt = Runtime::load(&s, &pp);
+        assert!(!rt.update_available, "{rt:?}");
+        assert_eq!(rt.update_version.as_deref(), Some("9.9.9"), "{rt:?}");
+        assert!(rt.last_update_at.is_some(), "{rt:?}");
     }
 
     /// 同一场景在巡检的每日自更新上的出口：这轮什么都不盖、不打「自更新：」、★ 不挂。也不记成「更新过」
