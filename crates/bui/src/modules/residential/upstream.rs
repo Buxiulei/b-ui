@@ -6,13 +6,20 @@
 
 use super::proxy::{ProbeError, Prober};
 use super::{check, proxy, state, EXIT_IP_HOST, EXIT_IP_URL, MAX_UPSTREAMS, MEMBER_PREFIX};
+use crate::modules::sentinel::incidents::{self, Incident, Level};
 use crate::reconcile::DaemonCtx;
 use crate::util::fmt_rfc3339;
 use bui_schema::model::{ResiMode, ResidentialGroup, Upstream, UpstreamKind};
 use bui_schema::parse::{upstream_url, ParseError, UpstreamInput};
+use bui_schema::slots::PortChangeImpact;
 use serde::Serialize;
 use std::sync::Arc;
 use uuid::Uuid;
+
+/// 删上游导致 HY2 住宅端口变化的事件签名（`bui incidents` / 面板事件卡按它认领）
+const PORT_CHANGED_SIG: &str = "resi_slot_port_changed";
+/// 该事件的动作：提示操作者让受影响用户重新获取订阅（没有自动处置手段）
+const NOTIFY_RESUBSCRIBE_ACTION: &str = "notify_resubscribe";
 
 /// 一次「加上游」的结果（面板与 CLI 直接回显）。**不含凭据**。
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -304,18 +311,27 @@ pub async fn add(
     })
 }
 
-/// 删一条上游；删掉最后一条时顺带 `enabled = false`（v3 `enable --remove` 同语义）
-pub async fn remove(ctx: &DaemonCtx, sel: &UpstreamSel) -> Result<(), UpstreamError> {
-    let g = state::group_of(&*ctx.store.read().await);
-    let target = g
-        .upstreams
-        .iter()
-        .find(|u| match sel {
-            UpstreamSel::Id(id) => u.id == *id,
-            UpstreamSel::HostPort { host, port } => u.host == *host && u.port == *port,
-        })
-        .cloned()
-        .ok_or(UpstreamError::NotFound)?;
+/// 删一条上游；删掉最后一条时顺带 `enabled = false`（v3 `enable --remove` 同语义）。
+///
+/// 返回**HY2 住宅端口会变**的用户名（[`PortChangeImpact`]，删之前算、只有用户名）：
+/// 那个端口写死在用户已下发的订阅里，客户端永远自愈不了，所以 CLI 与面板都得把名单
+/// 打给操作者；非空时还落一条哨兵事件（`bui incidents` / 面板事件卡）。
+pub async fn remove(ctx: &DaemonCtx, sel: &UpstreamSel) -> Result<PortChangeImpact, UpstreamError> {
+    let (target, impact) = {
+        let s = ctx.store.read().await;
+        let target = state::group_of(&s)
+            .upstreams
+            .iter()
+            .find(|u| match sel {
+                UpstreamSel::Id(id) => u.id == *id,
+                UpstreamSel::HostPort { host, port } => u.host == *host && u.port == *port,
+            })
+            .cloned()
+            .ok_or(UpstreamError::NotFound)?;
+        // 受影响名单只能在删之前算：删完槽位表里就没有这个槽、也不知道谁被搬到了 0
+        let impact = bui_schema::slots::port_change_impact(&s, target.id);
+        (target, impact)
+    };
     let id = target.id;
     // R3 ①：删上游是**唯一**允许缩短池子的路径，所以它自己必须留下日志——真机上
     // 那两条上游「无任何日志地消失」时，这里一个字都没记，事后连「是谁删的」都无从判断。
@@ -375,7 +391,42 @@ pub async fn remove(ctx: &DaemonCtx, sel: &UpstreamSel) -> Result<(), UpstreamEr
         r.xray_slot_rules_dirty = true;
     })
     .await;
-    Ok(())
+    if !impact.is_empty() {
+        let result = port_change_result(&impact);
+        tracing::warn!(
+            endpoint = %format!("{}:{}", target.host, target.port),
+            "{result}"
+        );
+        let inc = Incident {
+            at: fmt_rfc3339(ctx.host.now()),
+            // 动作是守护进程自己做的，不是从某个内核单元的日志里读出来的
+            unit: "b-ui".into(),
+            signature: PORT_CHANGED_SIG.into(),
+            subject: format!("{}:{}", target.host, target.port),
+            action: NOTIFY_RESUBSCRIBE_ACTION.into(),
+            result,
+            level: Level::Warn,
+            sample: None,
+        };
+        ctx.runtime.update(move |rt| incidents::push(rt, inc)).await;
+    }
+    Ok(impact)
+}
+
+/// 事件 `result` 的一行文案：**只有用户名**，按成因分组（删 0 号槽时两组都有）
+fn port_change_result(impact: &PortChangeImpact) -> String {
+    let mut parts = Vec::new();
+    if !impact.removed_slot.is_empty() {
+        parts.push(format!("被删槽 {}", impact.removed_slot.join("、")));
+    }
+    if !impact.moved_to_zero.is_empty() {
+        parts.push(format!("被搬到 0 号槽 {}", impact.moved_to_zero.join("、")));
+    }
+    format!(
+        "{} 个用户的 HY2 住宅节点端口已变化，需重新获取订阅：{}",
+        impact.removed_slot.len() + impact.moved_to_zero.len(),
+        parts.join("；")
+    )
 }
 
 /// 总开关。开启要求池非空（v3 `POST /api/residential/enable` 的 400 分支）
@@ -465,6 +516,64 @@ mod tests {
             host: std::sync::Arc::new(FakeHost::new()),
             paths: bui_schema::paths::Paths::default_server(),
         }
+    }
+
+    /// 一个装了 `n` 条上游（槽 `0..n`）与若干住宅用户的 ctx：用户按给定顺序递增
+    /// `created_at`，`migrate_on_start` 于是把第 i 个人分到槽 `i % n`（spec §5.6 规则 4）。
+    async fn ctx_with_slots(d: &tempfile::TempDir, n: u16, users: &[&str]) -> DaemonCtx {
+        let mut s = sample_state();
+        s.node.public_ip = "203.0.113.10".into();
+        let proto = s.users[0].clone();
+        s.users = users
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let mut u = proto.clone();
+                u.user_id = Uuid::from_u128(0x1000 + i as u128);
+                u.username = (*name).to_string();
+                u.created_at = format!("2026-09-11T00:0{i}:00Z");
+                u
+            })
+            .collect();
+        let g = s
+            .residential
+            .groups
+            .get_mut(super::super::GROUP_DEFAULT)
+            .expect("sample_state 带 default 分组");
+        g.enabled = true;
+        g.upstreams = (0..n)
+            .map(|i| Upstream {
+                id: Uuid::from_u128(u128::from(i) + 1),
+                name: format!("url-{}", i + 1),
+                kind: UpstreamKind::Http,
+                host: format!("isp{}.example.net", i + 1),
+                port: 10007,
+                username: "user1".into(),
+                password: "pw1".into(),
+                priority: 100,
+                provider: None,
+                region: None,
+                ports_allowed: None,
+                verified: None,
+            })
+            .collect();
+        g.selected_upstream_id = g.upstreams.first().map(|u| u.id);
+        let c = DaemonCtx {
+            store: Store::create(d.path().join("state.json"), s).await.unwrap(),
+            runtime: Runtime::load(d.path().join("runtime.json")),
+            bus: EventBus::new(),
+            host: std::sync::Arc::new(FakeHost::new()),
+            paths: bui_schema::paths::Paths::default_server(),
+        };
+        crate::modules::residential::slots::migrate_on_start(&c.store, &c.bus)
+            .await
+            .unwrap();
+        c
+    }
+
+    /// 落盘的事件（新的在前）
+    async fn incidents_of(c: &DaemonCtx) -> Vec<Incident> {
+        incidents::from_runtime(&c.runtime.read().await)
     }
 
     fn prober_ok(exit: &str) -> std::sync::Arc<FakeProber> {
@@ -804,6 +913,98 @@ mod tests {
             "别让 replay_loop 去重放一条已删的上游"
         );
         assert!(!r.selected_pending_persist);
+    }
+
+    /// 删非 0 号槽：只列那个槽上的用户，并落一条事件。
+    #[tokio::test]
+    async fn remove_reports_the_users_of_the_removed_slot() {
+        let d = tempfile::tempdir().unwrap();
+        let c = ctx_with_slots(&d, 3, &["alice", "bob", "carol"]).await;
+        // 槽 1（上游 uuid=2）上只有 bob
+        let impact = remove(&c, &UpstreamSel::Id(Uuid::from_u128(2)))
+            .await
+            .unwrap();
+        assert_eq!(impact.removed_slot, vec!["bob".to_string()]);
+        assert!(
+            impact.moved_to_zero.is_empty(),
+            "删非 0 号槽不触发不变量 3，没有第二批人"
+        );
+        let incs = incidents_of(&c).await;
+        assert_eq!(incs.len(), 1, "事件落盘一条");
+        assert_eq!(
+            (
+                incs[0].signature.as_str(),
+                incs[0].action.as_str(),
+                incs[0].level,
+                incs[0].subject.as_str()
+            ),
+            (
+                PORT_CHANGED_SIG,
+                NOTIFY_RESUBSCRIBE_ACTION,
+                Level::Warn,
+                "isp2.example.net:10007"
+            )
+        );
+        assert_eq!(
+            incs[0].result,
+            "1 个用户的 HY2 住宅节点端口已变化，需重新获取订阅：被删槽 bob"
+        );
+        assert!(
+            !incs[0].result.contains("pw1") && !incs[0].result.contains("user1"),
+            "名单只写用户名：{}",
+            incs[0].result
+        );
+    }
+
+    /// 删 0 号槽同时打到两批人：被删槽的用户，以及被不变量 3 搬到 0 的那一槽的用户。
+    #[tokio::test]
+    async fn removing_slot_zero_reports_both_groups_separately() {
+        let d = tempfile::tempdir().unwrap();
+        let c = ctx_with_slots(&d, 3, &["alice", "bob", "carol"]).await;
+        let impact = remove(&c, &UpstreamSel::Id(Uuid::from_u128(1)))
+            .await
+            .unwrap();
+        assert_eq!(impact.removed_slot, vec!["alice".to_string()]);
+        assert_eq!(
+            impact.moved_to_zero,
+            vec!["bob".to_string()],
+            "槽 1（bob）是现存序号最小的槽，它被搬到 0，端口跟着下移"
+        );
+        // 预测与 sync_slots 的实际结果一致
+        assert_eq!(
+            bui_schema::slots::sorted(&c.store.read().await.residential)[0].upstream_id,
+            Uuid::from_u128(2)
+        );
+        let incs = incidents_of(&c).await;
+        assert_eq!(incs.len(), 1);
+        assert_eq!(
+            incs[0].result,
+            "2 个用户的 HY2 住宅节点端口已变化，需重新获取订阅：被删槽 alice；被搬到 0 号槽 bob"
+        );
+    }
+
+    /// 槽上没有用户：不打名单、不记事件。
+    #[tokio::test]
+    async fn removing_a_slot_with_no_users_reports_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        // 两个人落在槽 0 / 槽 1，槽 2（uuid=3）空着
+        let c = ctx_with_slots(&d, 3, &["alice", "bob"]).await;
+        let impact = remove(&c, &UpstreamSel::Id(Uuid::from_u128(3)))
+            .await
+            .unwrap();
+        assert!(impact.is_empty());
+        assert!(
+            incidents_of(&c).await.is_empty(),
+            "空名单不记事件（事件卡只该有真事）"
+        );
+        // 池里只剩一条时删掉它也不换端口：槽位表清空后渲染退回单槽，hy2_resi 照旧有人听
+        let d2 = tempfile::tempdir().unwrap();
+        let c2 = ctx_with_slots(&d2, 1, &["alice"]).await;
+        assert!(remove(&c2, &UpstreamSel::Id(Uuid::from_u128(1)))
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(incidents_of(&c2).await.is_empty());
     }
 
     #[tokio::test]

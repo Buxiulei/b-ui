@@ -674,6 +674,51 @@ fn upstream_groups(
     out
 }
 
+/// `remove` 的人读渲染：把「HY2 住宅端口已变化」的用户名打给操作者，让他通知这些人
+/// 重新获取订阅（端口写死在已下发的订阅里，客户端自己永远好不了）。
+///
+/// 删 0 号槽会同时打到两批人（被删槽的用户 + 被搬到 0 的那一槽的用户），成因不同，
+/// 所以两组都在时分组说明。**没有人受影响时不打空名单。**
+pub fn format_remove(v: &serde_json::Value) -> String {
+    let names = |k: &str| -> Vec<String> {
+        v.get("port_changed")
+            .and_then(|p| p.get(k))
+            .and_then(|x| x.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str())
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let (removed, moved) = (names("removed_slot"), names("moved_to_zero"));
+    let head = |n: usize| {
+        format!("上游已移除。以下 {n} 个用户的 HY2 住宅节点端口已变化，需要重新获取订阅")
+    };
+    match (removed.is_empty(), moved.is_empty()) {
+        (true, true) => "上游已移除（没有用户的 HY2 住宅端口受影响）".into(),
+        (false, true) => format!(
+            "{}（被删槽的端口已无人监听）：{}",
+            head(removed.len()),
+            removed.join("、")
+        ),
+        (true, false) => format!(
+            "{}（他们的槽被搬到 0 号槽，端口随之下移）：{}",
+            head(moved.len()),
+            moved.join("、")
+        ),
+        (false, false) => format!(
+            "{}：\n  被删槽上的 {} 个用户（端口已无人监听）：{}\n  被搬到 0 号槽的 {} 个用户（0 号槽不许悬空，端口随之下移）：{}",
+            head(removed.len() + moved.len()),
+            removed.len(),
+            removed.join("、"),
+            moved.len(),
+            moved.join("、"),
+        ),
+    }
+}
+
 fn print_or(json: bool, v: &serde_json::Value, f: impl Fn(&serde_json::Value) -> String) {
     if json {
         println!("{v}");
@@ -717,6 +762,7 @@ pub async fn run(cmd: ResidentialCmd, socket: PathBuf) -> anyhow::Result<()> {
             cmd: BlacklistCmd::List { json },
         } => print_or(*json, &v, format_blacklist),
         ResidentialCmd::Slots { json } => print_or(*json, &v, format_slots),
+        ResidentialCmd::Remove { .. } => println!("{}", format_remove(&v)),
         ResidentialCmd::SlotPin { index, auto, .. } => println!(
             "槽 {index} {}",
             if *auto {
@@ -1175,6 +1221,43 @@ mod tests {
             .unwrap()
             .1,
             "/api/residential/blacklist/apply"
+        );
+    }
+
+    /// `remove` 的四种回包形态。措辞必须给出可执行的下一步（重新获取订阅），
+    /// 名单为空时一个名字都不打。
+    #[test]
+    fn format_remove_tells_the_operator_who_must_refetch_the_subscription() {
+        let v = |removed: &[&str], moved: &[&str]| {
+            serde_json::json!({"success": true,
+                "port_changed": {"removed_slot": removed, "moved_to_zero": moved}})
+        };
+        assert_eq!(
+            format_remove(&v(&[], &[])),
+            "上游已移除（没有用户的 HY2 住宅端口受影响）"
+        );
+        assert_eq!(
+            format_remove(&v(&["alice", "bob"], &[])),
+            "上游已移除。以下 2 个用户的 HY2 住宅节点端口已变化，需要重新获取订阅\
+             （被删槽的端口已无人监听）：alice、bob"
+        );
+        // 被删的 0 号槽上没有用户，但被搬到 0 的那一槽有 ⇒ 只打那一组，成因照旧要说
+        assert_eq!(
+            format_remove(&v(&[], &["carol"])),
+            "上游已移除。以下 1 个用户的 HY2 住宅节点端口已变化，需要重新获取订阅\
+             （他们的槽被搬到 0 号槽，端口随之下移）：carol"
+        );
+        // 删 0 号槽：两组都列，分别说明原因
+        assert_eq!(
+            format_remove(&v(&["alice"], &["bob", "carol"])),
+            "上游已移除。以下 3 个用户的 HY2 住宅节点端口已变化，需要重新获取订阅：\n  \
+             被删槽上的 1 个用户（端口已无人监听）：alice\n  \
+             被搬到 0 号槽的 2 个用户（0 号槽不许悬空，端口随之下移）：bob、carol"
+        );
+        // 旧回包（没有 port_changed 字段）不该 panic
+        assert_eq!(
+            format_remove(&serde_json::json!({"success": true})),
+            "上游已移除（没有用户的 HY2 住宅端口受影响）"
         );
     }
 

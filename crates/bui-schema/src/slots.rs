@@ -9,6 +9,7 @@
 //! 3. **池非空 ⇒ 序号 0 的槽存在**（`40000` / `2080` / `9998` /
 //!    `hysteria-residential.service` 是 v3 兼容面，不许悬空）。
 use crate::model::{Ports, Residential, Slot, State, User, DEFAULT_GROUP};
+use serde::Serialize;
 use uuid::Uuid;
 
 /// relay 每槽一个 socks 入站的基准端口：槽 i 监听 `127.0.0.1:(2080 + i)`。
@@ -171,6 +172,74 @@ pub fn users_of_slot(s: &State, slot_upstream_id: Uuid) -> Vec<&User> {
         .iter()
         .filter(|u| slot_id_of_user(u) == Some(slot_upstream_id))
         .collect()
+}
+
+/// 删一条上游会让哪些用户的 HY2 住宅端口变化（按成因分两组，**只有用户名**）。
+///
+/// 线上形态就是 derive 出来的两个数组（面板回包的 `port_changed`）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct PortChangeImpact {
+    /// 被删槽上的用户：那个 `hy2_resi + 序号` 删完没人监听，他们会被重分配到别的槽
+    pub removed_slot: Vec<String>,
+    /// 只在**删 0 号槽**时非空：被不变量 3 搬到序号 0 的那一槽的用户，端口随之下移
+    pub moved_to_zero: Vec<String>,
+}
+
+impl PortChangeImpact {
+    pub fn is_empty(&self) -> bool {
+        self.removed_slot.is_empty() && self.moved_to_zero.is_empty()
+    }
+}
+
+/// 删上游**之前**算出 [`PortChangeImpact`]，`upstream_id` 是要删的那条。
+///
+/// HY2 住宅节点的端口 = `hy2_resi + 槽序号`，已经写进用户手里的订阅（客户端快照），
+/// 客户端没有任何自愈手段（连「订阅过期」都检测不到）；缩池只有显式删上游这一条路，
+/// 所以受影响名单在这里算、由调用方打给操作者。
+///
+/// 两组的成因不同，文案要分开说：
+/// - [`PortChangeImpact::removed_slot`]：被删槽上的用户，端口删完没人听；
+/// - [`PortChangeImpact::moved_to_zero`]：删 0 号槽时，[`sync_slots`] 的不变量 3 会把现存
+///   序号最小的槽搬到 0（保住 `hy2_resi` 与 `hysteria-residential.service` 不悬空），
+///   那一槽的用户端口跟着下移 —— 所以删 0 号槽会同时打到两批人。
+///
+/// 槽位表只剩这一个槽时返回空：清空后渲染退回单槽（[`indices`] 给 `[0]`），`hy2_resi`
+/// 照旧有人监听，谁的端口都不变（出口回落 fail-open 直连，是另一回事）。
+pub fn port_change_impact(s: &State, upstream_id: Uuid) -> PortChangeImpact {
+    let empty = PortChangeImpact::default();
+    if s.residential.slots.len() <= 1 {
+        return empty;
+    }
+    let Some(removed) = s
+        .residential
+        .slots
+        .iter()
+        .find(|x| x.upstream_id == upstream_id)
+    else {
+        return empty;
+    };
+    PortChangeImpact {
+        removed_slot: usernames_of_slot(s, upstream_id),
+        moved_to_zero: if removed.index == 0 {
+            sorted(&s.residential)
+                .into_iter()
+                .find(|x| x.upstream_id != upstream_id)
+                .map(|next| usernames_of_slot(s, next.upstream_id))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        },
+    }
+}
+
+/// 某个槽上的用户名，字典序（输出要确定性）。**不含凭据、不含订阅 token。**
+fn usernames_of_slot(s: &State, slot_upstream_id: Uuid) -> Vec<String> {
+    let mut v: Vec<String> = users_of_slot(s, slot_upstream_id)
+        .iter()
+        .map(|u| u.username.clone())
+        .collect();
+    v.sort_unstable();
+    v
 }
 
 /// 用户数最少的槽（平手取序号最小，序号也平手取 uuid —— 完全确定性）。
@@ -598,6 +667,60 @@ mod tests {
             }
         }
         assert_eq!(load(&s), vec![3, 2]);
+    }
+
+    /// 删非 0 号槽：只有那个槽上的用户端口会变。
+    #[test]
+    fn port_change_impact_lists_only_the_removed_slots_users() {
+        let mut s = state(3, 3);
+        migrate_unassigned(&mut s);
+        let i = port_change_impact(&s, Uuid::from_u128(2)); // 槽 1，上面是 u2
+        assert_eq!(i.removed_slot, vec!["u2".to_string()]);
+        assert!(
+            i.moved_to_zero.is_empty(),
+            "删非 0 号槽不触发不变量 3，没人被搬"
+        );
+        assert!(!i.is_empty());
+    }
+
+    /// 删 0 号槽同时打到两批人：被删槽的用户，以及被不变量 3 搬到 0 的那一槽的用户。
+    #[test]
+    fn removing_slot_zero_also_hits_the_slot_that_gets_moved_to_zero() {
+        let mut s = state(3, 3);
+        migrate_unassigned(&mut s);
+        let gone = Uuid::from_u128(1); // 槽 0，上面是 u1
+        let i = port_change_impact(&s, gone);
+        assert_eq!(i.removed_slot, vec!["u1".to_string()]);
+        assert_eq!(
+            i.moved_to_zero,
+            vec!["u2".to_string()],
+            "槽 1（u2）是现存序号最小的那个，它会被搬到 0"
+        );
+        // 预测必须与 sync_slots 的实际行为一致：真删一次，看谁落在了序号 0
+        let g = s.residential.groups.get_mut(DEFAULT_GROUP).unwrap();
+        g.upstreams.retain(|u| u.id != gone);
+        sync_slots(&mut s.residential);
+        assert_eq!(sorted(&s.residential)[0].upstream_id, Uuid::from_u128(2));
+    }
+
+    /// 空名单的三种来源：槽上没有用户、槽位表只剩一个、uuid 不在槽位表里。
+    #[test]
+    fn port_change_impact_is_empty_when_nobody_moves() {
+        let mut s = state(3, 2);
+        migrate_unassigned(&mut s); // u1 → 槽 0，u2 → 槽 1；槽 2 空着
+        assert!(
+            port_change_impact(&s, Uuid::from_u128(3)).is_empty(),
+            "槽上没有用户 ⇒ 不打名单"
+        );
+        assert!(
+            port_change_impact(&s, Uuid::from_u128(99)).is_empty(),
+            "不在槽位表里的 uuid ⇒ 空"
+        );
+        // 池里只剩一条：删完槽位表清空，渲染退回单槽，hy2_resi 照旧有人听 ⇒ 端口不变
+        let mut one = state(1, 2);
+        migrate_unassigned(&mut one);
+        assert_eq!(one.residential.slots.len(), 1);
+        assert!(port_change_impact(&one, Uuid::from_u128(1)).is_empty());
     }
 
     /// 规则 3：rebalance 均匀重排，且**幂等**（连调两次第二次零改动）。

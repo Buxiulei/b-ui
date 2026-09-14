@@ -1102,6 +1102,20 @@ async fn post_add(
     .into_response())
 }
 
+/// 删上游两个端点共用的回包：v3 的 `success` + v4 追加的 `port_changed`（spec §5.6）。
+///
+/// `port_changed.removed_slot` / `port_changed.moved_to_zero` 各是一组**用户名**
+/// （不含凭据、不含订阅 token）：前者是被删槽上的用户，他们的 HY2 住宅端口
+/// （`hy2_resi + 槽序号`）删完没人监听；后者只在**删 0 号槽**时非空 —— 槽位不变量 3 会把
+/// 现存序号最小的槽搬到 0，那一槽的用户端口跟着下移。两组人都必须重新获取订阅，否则
+/// 已下发的 HY2 住宅节点连不上（客户端侧没有任何自愈手段）。无人受影响时两个数组都为空。
+///
+/// 同一份名单也落一条 `runtime.json` 的 `incidents`（签名 `resi_slot_port_changed`），
+/// 面板事件卡与 `bui incidents` 都看得到。
+fn remove_response(impact: &bui_schema::slots::PortChangeImpact) -> axum::response::Response {
+    Json(serde_json::json!({ "success": true, "port_changed": impact })).into_response()
+}
+
 async fn post_remove(
     State(app): State<AppState>,
     Extension(d): Extension<Deps>,
@@ -1118,10 +1132,10 @@ async fn post_remove(
         (None, None) => return Err(err(StatusCode::BAD_REQUEST, "id 或 host_port 字段必填")),
     };
     let ctx = ctx_of(&app, &d.paths);
-    upstream::remove(&ctx, &sel)
+    let impact = upstream::remove(&ctx, &sel)
         .await
         .map_err(map_upstream_err)?;
-    Ok(Json(serde_json::json!({ "success": true })).into_response())
+    Ok(remove_response(&impact))
 }
 
 /// v3 别名 `DELETE /api/residential/urls/<host:port>`（路径段是 URL 编码的 `host:port`）
@@ -1133,10 +1147,10 @@ async fn delete_url(
     let sel = upstream::UpstreamSel::parse_host_port(&host_port)
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "路径必须是 host:port"))?;
     let ctx = ctx_of(&app, &d.paths);
-    upstream::remove(&ctx, &sel)
+    let impact = upstream::remove(&ctx, &sel)
         .await
         .map_err(map_upstream_err)?;
-    Ok(Json(serde_json::json!({ "success": true })).into_response())
+    Ok(remove_response(&impact))
 }
 
 /// v3 的空体启用请求（`web/app.js:37-50` 不带 `Content-Type`）：提取器必须是
@@ -2017,6 +2031,82 @@ mod tests {
             rstate::group_of(&*h.ctx.store.read().await).upstreams.len(),
             1
         );
+    }
+
+    /// 删上游的回包必须带 `port_changed` 的两组用户名（面板与 CLI 的唯一提示来源），
+    /// 删 0 号槽时两组都有；同一份名单落一条事件。名单里只有用户名。
+    #[tokio::test]
+    async fn removing_an_upstream_reports_who_must_refetch_the_subscription() {
+        let d = tempfile::tempdir().unwrap();
+        let h = harness(&d).await;
+        // 再加一条 ⇒ 槽 0 = isp.example.net（夹具那条），槽 1 = isp2.example.net
+        let (st, _) = call(
+            &h.app,
+            "POST",
+            "/api/residential/add",
+            Some(serde_json::json!({"url": "http://user1:pw1@isp2.example.net:10007"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let ups = rstate::group_of(&*h.ctx.store.read().await).upstreams;
+        let slot_of = |host: &str| ups.iter().find(|u| u.host == host).unwrap().id;
+        let (slot0, slot1) = (slot_of("isp.example.net"), slot_of("isp2.example.net"));
+        // alice 在槽 0、bob 在槽 1
+        h.ctx
+            .store
+            .update(|s| {
+                let mut bob = s.users[0].clone();
+                bob.user_id = Uuid::from_u128(0x2000);
+                bob.username = "bob".into();
+                bob.created_at = "2026-09-11T00:01:00Z".into();
+                bob.entitlements.residential.as_mut().unwrap().slot_id = Some(slot1);
+                s.users[0]
+                    .entitlements
+                    .residential
+                    .as_mut()
+                    .unwrap()
+                    .slot_id = Some(slot0);
+                s.users.push(bob);
+            })
+            .await
+            .unwrap();
+
+        // 删 0 号槽（v3 的 DELETE 别名，面板走的就是它）
+        let (st, v) = call(
+            &h.app,
+            "DELETE",
+            "/api/residential/urls/isp.example.net%3A10007",
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["success"], true);
+        assert_eq!(
+            v["port_changed"]["removed_slot"],
+            serde_json::json!(["alice"])
+        );
+        assert_eq!(
+            v["port_changed"]["moved_to_zero"],
+            serde_json::json!(["bob"]),
+            "槽 1 被搬到 0，那一槽的用户端口跟着下移"
+        );
+        let body = v.to_string();
+        assert!(
+            !body.contains("pw-alice-01") && !body.contains("sub_token"),
+            "名单只写用户名，不带凭据 / 订阅 token：{body}"
+        );
+        // CLI 打印的就是这份回包
+        let text = crate::modules::residential::cli::format_remove(&v);
+        assert!(
+            text.contains("被删槽上的 1 个用户（端口已无人监听）：alice")
+                && text.contains("被搬到 0 号槽的 1 个用户"),
+            "{text}"
+        );
+        // 事件落盘一条：bui incidents 与面板事件卡都看得到
+        let incs = crate::modules::sentinel::incidents::from_runtime(&h.ctx.runtime.read().await);
+        assert_eq!(incs.len(), 1);
+        assert_eq!(incs[0].signature, "resi_slot_port_changed");
+        assert!(incs[0].result.contains("alice") && incs[0].result.contains("bob"));
     }
 
     #[tokio::test]
