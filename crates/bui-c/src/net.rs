@@ -280,15 +280,19 @@ const TLS_MARKS: &[&str] = &[
     "corrupt message",
 ];
 
-/// 解析失败：直连时 hyper-util 报 `dns error`；SOCKS 下 sing-box 解析不到目标域名回应答 0x01，
-/// hyper-util 写成 `general server failure`（spec §7.5 按 tokio-socks 的措辞写作
-/// general SOCKS server failure，reqwest 0.12.28 已换成 hyper-util 的 SOCKS 实现）。
+/// 解析失败：只认直连时 hyper-util 报的 `dns error`。
+///
+/// SOCKS 应答 0x01（hyper-util 写成 `general server failure`）**不算**解析失败：sing-box 的
+/// SOCKS 入站只把 ENETUNREACH / EHOSTUNREACH / ECONNREFUSED / EPERM 四个 errno 映射成具体应答码，
+/// 其余错误一律回 0x01。于是「节点地址解析失败」和「拨节点服务器超时」（vless 的 5 秒拨号超时，
+/// 比隧道 8 秒、网站 6 秒的时限都短，它先到）回的是同一个字节、同一段文本，客户端无从区分。
+/// 宁可笼统说「连不上」，也不说一个可能是假的「域名解析失败」把人带去查 DNS。
 /// builder 用的是 socks5h，本地解析那一路的报错碰不到，不收。
-const DNS_MARKS: &[&str] = &["dns", "general server failure"];
+const DNS_MARKS: &[&str] = &["dns"];
 
 /// 连接阶段的失败按错误链文本分（spec §7.5）：TLS → `Other("tls")`；有 refused → `Refused`；
-/// 解析 → `Dns`；其余（不可达、本地测速端口没人听、SOCKS 握手或认证失败、连接被重置等）
-/// → `Other("connect")`，不能报成「服务器拒绝连接」。
+/// 直连的解析失败 → `Dns`；其余（SOCKS 应答 0x01、不可达、本地测速端口没人听、SOCKS 握手或
+/// 认证失败、连接被重置等）→ `Other("connect")`，不能报成「服务器拒绝连接」。
 fn connect_failure(chain: &str) -> ProbeError {
     let c = chain.to_ascii_lowercase();
     let has = |marks: &[&str]| marks.iter().any(|m| c.contains(m));
@@ -372,8 +376,8 @@ mod tests {
     #[test]
     fn connect_failures_are_classified_from_the_error_chain() {
         // 链文本照 hyper-util 0.1.20（直连的 dns / tcp 错误、SOCKS 应答与握手）与 rustls 0.23 的原文写。
-        // 规则照 spec §7.5：有 refused 才算拒绝；SOCKS 应答 0x01（general server failure，sing-box
-        // 解析不到目标域名时回的）与直连的 dns error 算解析失败；其余连接错误一律 Other("connect")。
+        // 规则照 spec §7.5：有 refused 才算拒绝；只有直连的 dns error 算解析失败；SOCKS 应答 0x01
+        // （general server failure）与其余连接错误一律 Other("connect")，理由见 DNS_MARKS 的注释。
         let tls = ProbeError::Other("tls".into());
         let connect = ProbeError::Other("connect".into());
         let cases = [
@@ -385,7 +389,7 @@ mod tests {
             (
                 "client error (Connect)\nerror connecting to socks proxy\n\
                  SOCKS error: general server failure",
-                ProbeError::Dns,
+                connect.clone(),
             ),
             (
                 "client error (Connect)\nerror connecting to socks proxy\n\
@@ -435,6 +439,36 @@ mod tests {
         ];
         for (chain, want) in cases {
             assert_eq!(connect_failure(chain), want, "{chain}");
+        }
+    }
+
+    #[test]
+    fn socks_general_failure_is_a_connect_failure_not_a_dns_failure() {
+        // sing-box 的 SOCKS 入站对「节点地址解析失败」和「拨节点服务器超时」回同一个字节 0x01，
+        // hyper-util 0.1.20 都写成 general server failure：客户端分不出是哪一种，只能算连不上。
+        // 链文本照 hyper-util 的 SocksError / Status 原文（外层 error connecting to socks proxy）。
+        let socks_0x01 = [
+            "client error (Connect)\nerror connecting to socks proxy\n\
+             SOCKS error: general server failure",
+            // 大小写与外层措辞变了也一样：判据是 0x01 那半句，不是整句
+            "client error (Connect)\nSOCKS error: General Server Failure",
+        ];
+        for chain in socks_0x01 {
+            assert_eq!(
+                connect_failure(chain),
+                ProbeError::Other("connect".into()),
+                "{chain}"
+            );
+        }
+        // 直连（TUN 模式、百度直连）的本机解析失败仍是 Dns：hyper-util 报 dns error
+        let direct_dns = [
+            "client error (Connect)\ndns error\n\
+             failed to lookup address information: Name or service not known",
+            "client error (Connect)\ndns error\n\
+             failed to lookup address information: nodename nor servname provided, or not known",
+        ];
+        for chain in direct_dns {
+            assert_eq!(connect_failure(chain), ProbeError::Dns, "{chain}");
         }
     }
 

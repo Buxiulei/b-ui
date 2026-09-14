@@ -290,8 +290,8 @@ struct Runner<'a, 'h, S: Sys, N: Net> {
     /// 计分项的结论：`Some(true)` 通过、`Some(false)` 失败、`None` 跳过；按 [`Item`] 的顺序排。
     scored: BTreeMap<Item, Option<bool>>,
     info_failed: Vec<Item>,
-    /// 百度直连的结果：R13 下隧道不通时会提前测，行还是打在原位，不测第二次。
-    baidu: Option<ProbeResult>,
+    /// 百度直连的结果与用时：R13 下隧道不通时会提前测，行还是打在原位，不测第二次。
+    baidu: Option<(ProbeResult, Duration)>,
     dns_failed: bool,
 }
 
@@ -423,7 +423,7 @@ impl<S: Sys, N: Net> Runner<'_, '_, S, N> {
     /// 不修（spec §0.2 R13）。
     fn worth_repairing(&mut self, core: &Core) -> bool {
         let only_tunnel = core.ports_ok() && core.tun_ok() && !core.tunnel_ok();
-        if only_tunnel && self.baidu_probe().is_err() {
+        if only_tunnel && self.baidu_probe().0.is_err() {
             self.cont("本机也连不上百度，先不重启");
             return false;
         }
@@ -477,8 +477,15 @@ impl<S: Sys, N: Net> Runner<'_, '_, S, N> {
         }
     }
 
-    fn check_tunnel(&self) -> ProbeResult {
-        self.net.probe(PROBE_URL, self.via, PROBE_TIMEOUT)
+    fn check_tunnel(&self) -> (ProbeResult, Duration) {
+        self.timed_probe(PROBE_URL, self.via, PROBE_TIMEOUT)
+    }
+
+    /// 探测一次，连同实际用时（[`took`]）一起带回；只用来写失败文案，不参与判断。
+    fn timed_probe(&self, url: &str, via: Via, timeout: Duration) -> (ProbeResult, Duration) {
+        let start = self.sys.now();
+        let r = self.net.probe(url, via, timeout);
+        (r, took(start, self.sys.now(), timeout))
     }
 
     /// 第 2–4 项，不出声（修复之后重查用）。
@@ -487,7 +494,8 @@ impl<S: Sys, N: Net> Runner<'_, '_, S, N> {
             socks: self.sys.tcp_listening(self.prof.socks_port),
             http: self.sys.tcp_listening(self.prof.http_port),
             tun: self.tun.then(|| self.check_tun()),
-            tunnel: self.check_tunnel(),
+            // 重查只报通没通（「还是不通」），用不上用时
+            tunnel: self.check_tunnel().0,
         }
     }
 
@@ -506,10 +514,10 @@ impl<S: Sys, N: Net> Runner<'_, '_, S, N> {
             None
         };
         self.begin(Item::Tunnel.name());
-        let tunnel = self.check_tunnel();
+        let (tunnel, spent) = self.check_tunnel();
         self.line(
             pass_or(tunnel_passed(&tunnel), Mark::Fail),
-            self.tunnel_text(&tunnel),
+            self.tunnel_text(&tunnel, spent),
         );
         Core {
             socks,
@@ -529,12 +537,12 @@ impl<S: Sys, N: Net> Runner<'_, '_, S, N> {
         )
     }
 
-    fn tunnel_text(&self, r: &ProbeResult) -> String {
+    fn tunnel_text(&self, r: &ProbeResult, spent: Duration) -> String {
         match r {
             Ok(p) if p.code == 204 => format!("通  {}", latency(p.elapsed)),
             Ok(p) => format!("返回 HTTP {}", p.code),
             Err(e) => {
-                let why = failure_text(e, PROBE_TIMEOUT);
+                let why = failure_text(e, PROBE_TIMEOUT, spent);
                 match self.via {
                     Via::Socks5 { port } => format!("经 SOCKS5 :{port} {why}"),
                     Via::Direct => why,
@@ -575,11 +583,11 @@ impl<S: Sys, N: Net> Runner<'_, '_, S, N> {
     /// Google（计分）/ YouTube / GitHub（不计分）：拿到 4xx 以下的响应就算通，不跟重定向。
     fn site(&mut self, item: Item, url: &str, scored: bool) {
         self.begin(item.name());
-        let r = self.net.probe(url, self.via, SITE_TIMEOUT);
+        let (r, spent) = self.timed_probe(url, self.via, SITE_TIMEOUT);
         let (ok, text) = match &r {
             Ok(p) if p.code < 400 => (true, latency(p.elapsed)),
             Ok(p) => (false, format!("返回 HTTP {}", p.code)),
-            Err(e) => (false, failure_text(e, SITE_TIMEOUT)),
+            Err(e) => (false, failure_text(e, SITE_TIMEOUT, spent)),
         };
         let mark = match (ok, scored) {
             (true, _) => Mark::Pass,
@@ -608,11 +616,11 @@ impl<S: Sys, N: Net> Runner<'_, '_, S, N> {
         }
     }
 
-    fn baidu_probe(&mut self) -> ProbeResult {
+    fn baidu_probe(&mut self) -> (ProbeResult, Duration) {
         if let Some(r) = &self.baidu {
             return r.clone();
         }
-        let r = self.net.probe(BAIDU_URL, Via::Direct, BAIDU_TIMEOUT);
+        let r = self.timed_probe(BAIDU_URL, Via::Direct, BAIDU_TIMEOUT);
         self.baidu = Some(r.clone());
         r
     }
@@ -620,7 +628,8 @@ impl<S: Sys, N: Net> Runner<'_, '_, S, N> {
     /// 百度直连（不计分）：解析失败时写「本机 DNS 解析失败」，TUN 模式下判断就看它。
     fn baidu_row(&mut self) {
         self.begin(Item::Baidu.name());
-        let text = match self.baidu_probe() {
+        let (r, spent) = self.baidu_probe();
+        let text = match r {
             Ok(p) if p.code < 400 => {
                 self.line(Mark::Pass, latency(p.elapsed));
                 return;
@@ -632,7 +641,7 @@ impl<S: Sys, N: Net> Runner<'_, '_, S, N> {
                 }
                 "本机 DNS 解析失败".to_string()
             }
-            Err(e) => failure_text(&e, BAIDU_TIMEOUT),
+            Err(e) => failure_text(&e, BAIDU_TIMEOUT, spent),
         };
         self.line(Mark::Info, text);
         self.info_failed.push(Item::Baidu);
@@ -763,7 +772,7 @@ impl<S: Sys, N: Net> Runner<'_, '_, S, N> {
     fn summary(self) -> Summary {
         let mut s = Summary {
             info_failed: self.info_failed,
-            baidu_ok: matches!(self.baidu, Some(Ok(_))),
+            baidu_ok: matches!(self.baidu, Some((Ok(_), _))),
             dns_failed: self.dns_failed,
             ..Summary::default()
         };
@@ -798,12 +807,28 @@ fn tun_text(t: TunState) -> String {
 }
 
 /// 探测失败的说法（spec §11.5）。拒绝与其它连接错误都叫「连不上」：人分不清，也不必分。
-fn failure_text(e: &ProbeError, timeout: Duration) -> String {
+/// 超时写时限；其余写实际用时 `spent`：SOCKS 应答 0x01 分不出「解析失败」与「拨号超时」
+/// （net.rs 的 `DNS_MARKS`），「连不上（5 秒）」至少让人看出是等满了 sing-box 的拨号超时。
+fn failure_text(e: &ProbeError, timeout: Duration, spent: Duration) -> String {
     match e {
         ProbeError::Timeout => format!("超时（{} 秒）", timeout.as_secs()),
-        ProbeError::Dns => "域名解析失败".to_string(),
-        ProbeError::Refused | ProbeError::Other(_) => "连不上".to_string(),
+        ProbeError::Dns => format!("域名解析失败（{}）", seconds_text(spent)),
+        ProbeError::Refused | ProbeError::Other(_) => format!("连不上（{}）", seconds_text(spent)),
     }
+}
+
+/// 整秒，向下取整；不到 1 秒不写成「0 秒」。
+fn seconds_text(d: Duration) -> String {
+    match d.as_secs() {
+        0 => "不到 1 秒".to_string(),
+        s => format!("{s} 秒"),
+    }
+}
+
+/// 一次探测的用时：`Sys::now` 前后相减。时钟回拨（差为负）算 0；封顶在时限，
+/// 探测本身不会比时限还久，超出的只能是时钟往前跳了。
+fn took(start: time::OffsetDateTime, end: time::OffsetDateTime, cap: Duration) -> Duration {
+    Duration::try_from(end - start).unwrap_or_default().min(cap)
 }
 
 /// 整数毫秒；不短于 1 秒的加「（慢）」（不上色，零 ANSI）。
@@ -1881,7 +1906,7 @@ mod tests {
         let sum = check(&s, &n, &profiles_tun(), &mut rec);
         assert_eq!(
             rec.lines()[4..7],
-            ["✓ 1234ms（慢）", "○ 超时（6 秒）", "○ 连不上"]
+            ["✓ 1234ms（慢）", "○ 超时（6 秒）", "○ 连不上（不到 1 秒）"]
         );
         assert_eq!((sum.passed, sum.failed), (7, 0), "YouTube、GitHub 不计分");
         assert_eq!(sum.info_failed, vec![Item::YouTube, Item::GitHub]);
@@ -2166,7 +2191,8 @@ mod tests {
         let sum = check(&s, &n, &profiles_socks(), &mut rec);
         assert_eq!(rec.repairs, 1);
         assert_eq!(rec.lines()[1], "✗ SOCKS5 :1080   ✗ HTTP :8080");
-        assert_eq!(rec.lines()[2], "✗ 经 SOCKS5 :1080 连不上");
+        // 失败文案带实际用时：假网络立刻失败、假时钟不走，所以是「不到 1 秒」
+        assert_eq!(rec.lines()[2], "✗ 经 SOCKS5 :1080 连不上（不到 1 秒）");
         assert_eq!(
             rec.conts(),
             vec![
@@ -2302,6 +2328,83 @@ mod tests {
             render_sentence("本机能上网，是当前节点不通。", 60),
             "  本机能上网，是当前节点不通。\n"
         );
+    }
+
+    #[test]
+    fn failure_text_carries_how_long_the_probe_took() {
+        let ms = Duration::from_millis;
+        let connect = ProbeError::Other("connect".into());
+        // sing-box 拨节点服务器 5 秒超时后回 0x01，归「连不上」（net.rs）；带上实际用时，
+        // 真机上才看得出是「立刻失败」还是「等满了 sing-box 的拨号超时」
+        let cases = [
+            (&connect, PROBE_TIMEOUT, ms(5_020), "连不上", "（5 秒）"),
+            (
+                &ProbeError::Refused,
+                SITE_TIMEOUT,
+                ms(30),
+                "连不上",
+                "（不到 1 秒）",
+            ),
+            (&connect, SITE_TIMEOUT, ms(999), "连不上", "（不到 1 秒）"),
+            (
+                &ProbeError::Dns,
+                SITE_TIMEOUT,
+                ms(1_999),
+                "域名解析失败",
+                "（1 秒）",
+            ),
+            // 超时说的是时限，不看用时
+            (
+                &ProbeError::Timeout,
+                PROBE_TIMEOUT,
+                ms(0),
+                "超时",
+                "（8 秒）",
+            ),
+        ];
+        for (e, limit, spent, kind, secs) in cases {
+            let t = failure_text(e, limit, spent);
+            assert!(
+                t.starts_with(kind) && t.ends_with(secs),
+                "{e:?} {spent:?}：{t}"
+            );
+        }
+        // 用时来自 Sys::now 前后相减：时钟回拨算 0，封顶在时限（超时以外的失败不会比时限还久）
+        let t0 = time::macros::datetime!(2026-09-14 10:00 UTC);
+        let later = |m: i64| t0 + time::Duration::milliseconds(m);
+        assert_eq!(took(t0, later(5_020), PROBE_TIMEOUT), ms(5_020));
+        assert_eq!(took(t0, later(-3_000), PROBE_TIMEOUT), Duration::ZERO);
+        assert_eq!(took(t0, later(90_000), SITE_TIMEOUT), SITE_TIMEOUT);
+
+        // 容量：用时取最宽的「不到 1 秒」。SOCKS 行带「经 SOCKS5 :端口」（5 位端口），经 SOCKS 的
+        // 失败现在只会是「连不上」或超时；「域名解析失败」只出在直连（TUN 的网站行、百度直连）。
+        // 固定文案 ≤ 59 列；40 列下失败的类别与用时都得完整可见（在「（」前折行，不尾截）。
+        let forms = [
+            (Item::Tunnel, "经 SOCKS5 :65535 ", &connect),
+            (Item::Tunnel, "", &connect),
+            (Item::Google, "", &ProbeError::Dns),
+            (Item::GitHub, "", &ProbeError::Refused),
+        ];
+        for (item, via, e) in forms {
+            let why = failure_text(e, PROBE_TIMEOUT, ms(10));
+            let text = format!("{via}{why}");
+            assert!(budget_width(&text) <= 59, "{text}：{}", budget_width(&text));
+            let kind = why.split('（').next().unwrap();
+            for w in [40, 50, 60, 80] {
+                let mut p = Painter::new(w);
+                let row = p.paint(&Event::Begin(item.name()))
+                    + &p.paint(&Event::Line(Mark::Fail, text.clone()));
+                for l in row.lines() {
+                    assert!(budget_width(l) <= line_limit(w), "@{w}: {l:?}");
+                }
+                let first = row.lines().next().unwrap();
+                assert!(first.contains(kind), "@{w} 第一行要有失败类别：{row}");
+                assert!(
+                    row.contains("（不到 1 秒）") && !row.contains('…'),
+                    "@{w}: {row}"
+                );
+            }
+        }
     }
 
     #[test]

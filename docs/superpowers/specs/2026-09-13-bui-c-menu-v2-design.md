@@ -2103,7 +2103,7 @@ fn probe(&self, url: &str, via: Via, timeout: Duration) -> std::result::Result<P
 
 - **FakeSys**：`spawn` / `kill` 记进 `calls()`（`"spawn /opt/bui-c/bin/sing-box run -c …"`、`"kill 1"`）；`free_port` 从 20001 起递增；`listen(port)` 注入「这个端口在监听」；`mkdir_private` 把目录记成 0o700。
 - **FakeNet**：内部的 `RefCell` 改成 `Mutex`，变成 `Sync`，才能交给 `thread::scope`；这一步在 P0 的 T5 就做，因为 `Net: Sync` 成了 supertrait（D22），`speedtest::run` 不用再写 `N: Net + Sync`。新增 `route_via(url, via, reply)`：同一个 URL 按 via 端口给不同的结果，否则 9 个节点只能拿到同一个结果。新增 `delay(url, ms)`，决定 `probe` 返回的 `elapsed`。现有按日志顺序断言的用例都是单线程的，顺序不变；r6 §4.5 担心的「顺序不确定」只出现在并发用例里，测速用例一律按集合断言。
-- **`ProbeError` 怎么分类**（ReqwestNet）：`is_timeout()` → `Timeout`；错误链文本里有 `refused` 或 `(5)` → `Refused`；有 `general SOCKS server failure`、`(1)` 或 `dns` → `Dns`（r4 §2：坏端口回 (5)，坏域名回 (1)，静默丢包就是超时）；其它 → `Other`。这些文本来自 reqwest 依赖的 socks 库，不是 sing-box 的自由文本，但具体措辞仍要在真机上核对一次（§14）。
+- **`ProbeError` 怎么分类**（ReqwestNet）：`is_timeout()` → `Timeout`；错误链文本里有 `refused`（SOCKS 应答 0x05 或直连 ECONNREFUSED）→ `Refused`；只有直连的 `dns error` → `Dns`；其它（含 SOCKS 应答 0x01 `general server failure`）→ `Other("connect")`，显示「连不上（{用时}）」。0x01 不算解析失败（T5fix）：sing-box 的 SOCKS 入站只把四个 errno 映射成具体应答码，其余一律回 0x01，节点地址解析失败与拨节点服务器超时（vless 默认 5 秒，短于 bui-c 的 8/6 秒时限）同码同文本，客户端分不出，宁可说「连不上」也不报可能是假的「解析失败」；失败文案带实际用时，真机上看得出是不是等满了 5 秒。这些文本来自 reqwest 依赖的 hyper-util SOCKS 实现，不是 sing-box 的自由文本，但具体措辞仍要在真机上核对一次（§14）。
 
 ### 7.6 并发策略
 
