@@ -42,7 +42,7 @@
 | `a66d2ec` + `dadf300` | T1 宽度工具（`display_width` / `budget_width` / `sanitize` / 截断） | 通过 |
 | `1bca2a9` | T2 `term_size`，非终端回落 80×24 | 通过 |
 | `e079950` | T3 按宽度排版，宽度守门表 `screens()` | 通过 |
-| `c84f5a6` | T14 测速探测配置 `node_outbound` / `probe_config`（**跨 crate**，标签按下标生成） | 通过 |
+| `c84f5a6` | T14 测速探测配置 `node_outbound` / `probe_config`（**跨 crate**，标签按下标生成；`0b85284` 已把 `node_outbound` 收回私有，C1 只剩 `probe_config` / `ProbeTarget`） | 通过 |
 | `3067043` + `e4ab2f0` | T4 清屏重画、「上次」行、输错原地重问、菜单不认 `-y`；修复：v3 邀请结果不被清屏抹掉等 | 通过 |
 | `4f3a854` | T5 `Net` 的 `text_via` / `probe` / `download_via`，`Net: Sync` | 通过 |
 | `e561f50` | T1/T3 审查遗留：窄屏列表只出 label 等 | **未单独审**，最终审查点名看 |
@@ -153,7 +153,7 @@ T7 在额度用尽前刚派出就停了，没有留下任何代码改动。
 
 ## 9. 需要用户或服务端负责人决定的
 
-- 跨 crate 提交 `4c7be25`（`node_uri`）与 `c84f5a6`（`probe_config` / `node_outbound` / `ProbeTarget`，C1 契约新增）要服务端负责人审查。
+- 跨 crate 提交 `4c7be25`（`node_uri`）与 `c84f5a6`（`probe_config` / `node_outbound` / `ProbeTarget`，C1 契约新增）要服务端负责人审查。`0b85284` 已把 `node_outbound` 收回私有，C1 只剩 `probe_config` / `ProbeTarget`。
 - 公开仓库历史里曾出现过真实值：凭据轮换和历史重写，要服务端负责人与用户一起定。
 - 本地分流规则功能没做。
 - T11 的 GitHub 探测地址改为 `robots.txt`，建议接受。

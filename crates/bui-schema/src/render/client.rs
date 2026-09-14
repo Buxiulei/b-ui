@@ -47,8 +47,9 @@ pub fn mixed_config(node: &Node, opts: &ClientOpts) -> Value {
 /// 测速的一个目标：节点 + 本地 socks 入站端口 + 这个入站的凭据（调用方随机生成）。
 ///
 /// 没有 tag 字段：标签由 [`probe_config`] 按下标生成，调用方按 `listen_port` 认目标。
-/// `Debug` 是手写的脱敏版：只打 `node.label` 与 `listen_port`，`user` / `pass` 一律 `***`
-/// （节点自己的服务器口令也不经这里露出来）。
+/// `Debug` 是手写的脱敏版：只打 `label`（取自 `node.label`）与 `listen_port`，
+/// `user` / `pass` 一律 `***`（节点自己的服务器口令也不经这里露出来）。脱敏只管这个结构体本身：
+/// 单独 `{:?}` 它的 `node` 照样带出口令，见 [`probe_config`] 文档里的凭据说明。
 pub struct ProbeTarget<'a> {
     /// 要测的节点（同一个节点、同名节点都可以出现多次）
     pub node: &'a Node,
@@ -66,7 +67,7 @@ pub struct ProbeTarget<'a> {
 impl std::fmt::Debug for ProbeTarget<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProbeTarget")
-            .field("node", &self.node.label)
+            .field("label", &self.node.label)
             .field("listen_port", &self.listen_port)
             .field("user", &"***")
             .field("pass", &"***")
@@ -89,6 +90,11 @@ impl std::fmt::Debug for ProbeTarget<'_> {
 /// - `targets` 为空时产出没有入站的配置，调用方不要这样调。
 /// - `listen_port` 撞上本机已占用的端口时，sing-box 在入站 bind 阶段就整体起不来（一个都不测），
 ///   与「节点不通」是两回事：调用方要把这种失败单独报，别算成网络问题。
+/// - 返回的 `Value` 里是明文凭据：每个入站的 `username` / `password`，以及各节点出站的服务器口令
+///   （HY2 的 `password` 与 obfs 密码、Reality 的 `uuid`）。不要整份打日志、不要塞进错误文本；
+///   [`ProbeTarget`] 的 `Debug` 打 `***` 只管那个结构体，容易给人「整条链已脱敏」的错觉。
+///   同样，`Node` 自己仍 derive `Debug`，`{:?}` 一个 `&Node` 照样带出口令——这是仓库
+///   「类型照常 derive、脱敏交给日志与错误边界」纪律下的已知形态，守边界的是调用方。
 pub fn probe_config(targets: &[ProbeTarget<'_>]) -> Value {
     let mut inbounds = Vec::with_capacity(targets.len());
     let mut outbounds = Vec::with_capacity(targets.len() + 1);
@@ -462,9 +468,12 @@ mod tests {
             .collect()
     }
 
-    /// 测速出站与主配置出站同源：同一个 `outbound`，只有 tag 不同。
-    /// 这条断言原先在 `tests/kernel_client.rs`，为了写它才把 `outbound` 公开成 `node_outbound`；
-    /// 搬进同文件测试之后私有函数照样可见，公开项不必留。
+    /// 测速出站与主配置出站同源：主配置的 `outbounds[0]` 把 tag 换成 `probe-<i>` 之后，
+    /// 与 [`probe_config`] 里对应的出站逐字段相等。
+    ///
+    /// 期望值只从主配置取，不经私有 `outbound`：两边都调它只能证明调用了同一个函数，证明不了
+    /// 渲染出来的内容（`outbound` 忽略 tag、恒写 `proxy-out` 的变异体下，旧写法照样全绿）。
+    /// 主配置出站的字节由 `tests/kernel_client.rs` 的 golden 钉住，这里把测速出站挂到它上面。
     #[test]
     fn probe_and_main_outbounds_come_from_one_renderer() {
         let nodes = [hy2_node(), reality_node()];
@@ -472,14 +481,33 @@ mod tests {
         let cfg = probe_config(&targets);
         let outbounds = cfg["outbounds"].as_array().unwrap();
         assert_eq!(outbounds.len(), nodes.len() + 1);
-        for (i, t) in targets.iter().enumerate() {
-            assert_eq!(outbounds[i], outbound(t.node, &format!("probe-{i}")));
-        }
-        for n in &nodes {
-            let tun = tun_config(n, &opts(ClientMode::Tun));
-            assert_eq!(tun["outbounds"][0], outbound(n, "proxy-out"));
-            let mixed = mixed_config(n, &opts(ClientMode::Mixed));
-            assert_eq!(mixed["outbounds"][0], outbound(n, "proxy-out"));
+        for (i, n) in nodes.iter().enumerate() {
+            let probe_tag = format!("probe-{i}");
+            let probe = outbounds[i].as_object().unwrap();
+            let mains = [
+                ("tun", tun_config(n, &opts(ClientMode::Tun))),
+                ("mixed", mixed_config(n, &opts(ClientMode::Mixed))),
+            ];
+            for (mode, main) in mains {
+                let mut expected = main["outbounds"][0].clone();
+                assert_eq!(expected["tag"], "proxy-out", "{mode} {}", n.label);
+                expected["tag"] = json!(probe_tag);
+                let expected = expected.as_object().unwrap();
+                // 两边键的并集逐个比：多一个、少一个、值不同都会指名是哪个字段
+                let keys: std::collections::BTreeSet<&String> =
+                    expected.keys().chain(probe.keys()).collect();
+                assert!(keys.len() > 1, "{mode} {} 出站不该只有 tag", n.label);
+                for k in keys {
+                    assert_eq!(
+                        probe.get(k),
+                        expected.get(k),
+                        "{} 的测速出站 `{k}` 与 {mode} 主配置不一致",
+                        n.label
+                    );
+                }
+            }
+            // tag 也钉字面值：上面的比对是相对主配置的，这一行确保 probe 那边真的换了名
+            assert_eq!(probe["tag"], probe_tag.as_str(), "{}", n.label);
         }
     }
 
@@ -506,8 +534,10 @@ mod tests {
         let nodes = [hy2_node()];
         let targets = probe_targets(&nodes);
         let s = format!("{:?}", targets[0]);
-        assert!(s.contains("HY2直连"), "{s}");
-        assert!(s.contains("20800"), "{s}");
+        // 值是标签字符串，字段名就得叫 label：叫 node 会让读日志的人以为打的是整个节点
+        assert!(s.contains("label: \"HY2直连\""), "{s}");
+        assert!(!s.contains("node:"), "{s}");
+        assert!(s.contains("listen_port: 20800"), "{s}");
         // host 也不能露：真机上 label 带面板用户名，域名 + 用户名就等于订阅凭据
         for secret in [
             "probe-user-0",
