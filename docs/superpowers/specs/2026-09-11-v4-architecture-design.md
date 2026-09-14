@@ -68,7 +68,8 @@ Cargo workspace：
   "admin": { "password_hash": "<argon2id>", "jwt_secret": "<hex>" },
   "users": [ /* §4.1 */ ],
   "residential": { "groups": { "default": { /* §5 */ } } },
-  "system": { "ssh_hardening": true, "static_dns": true, "sysctl_profile": "auto", "firewall": "auto" },
+  "system": { "ssh_hardening": true, "static_dns": true, "sysctl_profile": "auto", "firewall": "auto",
+              "legacy_sub_until": null },   // §4.5 旧用户名订阅链接的全局宽限期；缺省不落盘
   "versions": { "bui": "4.0.0", "hysteria": "…", "xray": "…", "sing_box": "1.14.x", "caddy": "…", "client_sing_box": "1.14.x" },
   "catalog": [ /* §4.4 SKU 桩 */ ]
 }
@@ -161,6 +162,7 @@ tonic 客户端，proto 从 Xray-core `v26.3.27` vendor 进仓（以仓库根为
 {
   "user_id": "<uuid>", "username": "alice", "note": "", "created_at": "…", "disabled": false,
   "credentials": { "hy2_password": "…", "vless_uuid": "…" },
+  "sub_token": "<32 位小写 hex>", "legacy_sub_disabled": false,   // §4.5，缺省不落盘
   "entitlements": { "protocols": ["hysteria2", "reality"], "direct": true,
                     "residential": { "group_id": "default" },        // 或 null
                     "expires_at": null, "traffic_limit": { "total_bytes": null, "monthly_bytes": null } },
@@ -201,6 +203,9 @@ tonic 客户端，proto 从 Xray-core `v26.3.27` vendor 进仓（以仓库根为
 三种订阅与 v3 逐项等价（节点集、端口、UUID、密码、标签、`mport=`、obfs 参数、住宅分流规则），由 `bui-schema` 从同一节点列表渲染；单协议 + 住宅用户与 v3 一样只发住宅版节点（§4.1 映射的 `direct=false`；2026-09-13 裁决撤销了此前「v4 多发一个直连版」的例外，golden 比对不再过滤）；sing-box JSON 保持 1.12–1.14 兼容子集（typed DNS、TUN `address` 数组、rule action、无 `rule_set`）；Clash/mihomo YAML 另有一处有意新增（2026-09-12 裁决）：`ipv6: true` + `dns.ipv6: false` + `tun` 接管参数（`stack: mixed`、`auto-route`/`strict-route`/`auto-detect-interface`、`inet6-address`、`dns-hijack`，不下发 `enable`）+ 三条 `IP-CIDR6` 规则（ULA/link-local 直连、其余 `::/0` REJECT），与 sing-box 侧的 IPv6 接管同构。CI 用 v3 抓取的脱敏样本做 golden 比对（§8）。
 
 ### 4.5 订阅链接的随机 token 与旧链接宽限期（2026-09-14 裁决）
+
+设计原文（背景、解析三步、轮换、日志面、已知限制）在 `docs/superpowers/specs/2026-09-14-subscription-token-design.md`，
+本节是它的契约摘要。
 
 四个免鉴权端点（§4.3）的响应体里有 hy2 明文密码与 vless uuid，所以**路径末段本身就是凭据**。
 仓库是公开的、git 历史里有真实域名与真实用户名，而证书透明日志本来就公开所有子域 ——
@@ -362,7 +367,7 @@ uuid 变化时 `sync_users` 必须**先 RemoveUser 再 AddUser**，且不把 xra
 - 静态二进制（x86_64 / aarch64），`/opt/bui-c/{bin/sing-box, profiles.json, config.json}`，三个单元：`bui-c.service`（`sing-box run -c /opt/bui-c/config.json`，`Restart=always`，唯一数据面进程）、`bui-c-check.service`（`Type=oneshot`，`ExecStart=bui-c check`）、`bui-c.timer`（每分钟触发 `bui-c-check.service`；timer 不能直接指向 sing-box 单元，否则每分钟重新激活引擎）。
 - 引擎只有 sing-box（≤ 1.14）；Hysteria2 与 VLESS-REALITY 均为 sing-box 出站（uTLS chrome）。
 - 模式：`socks`（`mixed` inbound 127.0.0.1:1080 与 127.0.0.1:8080）/ `tun`（`tun` inbound，`interface_name: bui-tun`，`stack: mixed`，`auto_route`，IPv6 接管与裸 v6 拒绝按 `2026-09-10-ipv6-takeover-design.md`，CN 域名直连 DNS，`sniff` + `hijack-dns`，cloudflared QUIC 例外，住宅节点的分流关键字）。切模式 = 重渲染 + 重启单元。DNS 用 typed server，**凡需经代理解析的 server 必须显式 `detour`**（typed server 不设 `detour` 时是空 direct dialer，不是默认出站，S5）；生成器禁止出现 `rule_set`、`download_detour`、legacy 字符串式 DNS server、`inet4_address/inet6_address`（S8/S9）。
-- 节点来源：`/api/nodes/<user>`（首选，schema 同源）；`/api/sub` base64；粘贴 `hysteria2://`、`vless://`。多 profile，`switch` 切换。
+- 节点来源：`/api/nodes/<token>`（首选，schema 同源）；`/api/sub/<token>` base64；粘贴 `hysteria2://`、`vless://`。多 profile，`switch` 切换。末段是该用户的随机订阅 token（§4.5），`profiles.json` 的 `panel.username` 存的就是它 ⇒ 那份文件是凭据文件（600）；轮换会让已部署的客户端失效且无法自愈，必须人工重新导入（`docs/HANDOVER-bui-c.md` §6）。
 - `check`：经本地 inbound 请求 gstatic 204；TUN 下核对接口与默认路由；失败退避重启（1/2/4 分钟）。
 - `update`：来源顺序 面板 `/packages/` → GitHub Releases → 镜像；每日 timer 自动，可关。服务端内核缓存继续维护 sing-box 与 `bui-c` 的 Linux 二进制。
 - `import-v3`：首次运行从 `/opt/hysteria-client/` 导入 profile，停用并删除 `hysteria-client / xray-client / bui-tun` 单元与 `hysteria-health.timer`。
