@@ -303,7 +303,13 @@ pub fn run<S: Sys, N: Net>(
         .iter()
         .chain(V3_AUX_UNITS.iter())
         .any(|u| sys.exists(&paths.unit(u)));
-    if r.imported.is_empty() && !leftovers {
+    // 新节点一个没有、v3 的节点又全被墓碑挡下、手上也没有活动节点（删光之后，spec §9）：
+    // 同样无事可做，残留单元在也一样。继续往下只会在「没有可用的活动节点」上报错，命令行的
+    // 跳过行与菜单那一问都到不了（审查 T7b r2 I1）。残留单元留给答 y / `--with-deleted`
+    // 那一趟清——那一趟 `imported` 非空，照常 teardown。`existing` 非空而没有活动节点在 v4
+    // 里到不了，不在这里吞掉：留给下面那句错误当断言
+    let nothing_to_apply = r.existing.is_empty() && prof.active_profile().is_none();
+    if r.imported.is_empty() && (!leftovers || nothing_to_apply) {
         return Ok(r);
     }
     if let Some(base_url) = panel_override {

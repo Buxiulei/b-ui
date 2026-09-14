@@ -676,8 +676,10 @@ fn store_import<S: Sys, N: Net, P: Prompt>(
         stored.added,
         prof.profiles.len()
     ));
-    // 粘的这一条之前被删过：说一句，让人知道墓碑起过作用、现在已经清了
-    if single && !stored.restored.is_empty() {
+    // 粘的这一条之前被删过：说一句，让人知道墓碑起过作用、现在已经清了。菜单里答 y 的第二趟
+    // （`with_deleted`）往往也只剩一条，但那是多条粘贴里被挡下的那几个，结果照计数说
+    // （spec §5.7 表第 1 行；审查 T7b r2 M6）
+    if single && !with_deleted && !stored.restored.is_empty() {
         ctx.say_result(menu::BURIED_RESTORED);
     }
     Ok(Imported {
@@ -1181,7 +1183,8 @@ fn run_check<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()
 /// **不**走这里——让 timer 悄悄改用户配置是更坏的行为。
 ///
 /// 问了就返回 `Some(Outcome)`，由 [`menu_body`] 照主循环的规矩收尾：进循环的第一件事就是
-/// 清屏，导入失败的原因不停下来就被抹掉了，而这正是迁移那一刻。导入经 [`run_sub`]（`yes: false`）。
+/// 清屏，导入失败的原因不停下来就被抹掉了，而这正是迁移那一刻。导入经 [`menu_import_v3`]，与菜单
+/// `[7]` → `[3]` 同一趟（失败打「失败：…」、被墓碑挡下的放锁之后问一句）。
 fn offer_v3_import<S: Sys, N: Net, P: Prompt>(
     ctx: &mut Ctx<'_, S, N, P>,
 ) -> Result<Option<Outcome>> {
@@ -1203,16 +1206,10 @@ fn offer_v3_import<S: Sys, N: Net, P: Prompt>(
     ctx.say(format!("发现 v3 客户端目录 {}", base.display()));
     ctx.flush();
     let out = if ctx.prompt.confirm("现在导入 v3 的节点并卸载旧单元吗？")? {
-        run_sub(
-            ctx,
-            Cmd::ImportV3 {
-                base: None,
-                panel: None,
-                mode: None,
-                // 首次运行才邀请（profiles 为空），墓碑一定也是空的：不必带 --with-deleted
-                with_deleted: false,
-            },
-        )
+        // 与菜单 [7] → [3] 同一条路：profiles 为空不等于墓碑为空——拒过邀请、改从面板导入、后来删光的
+        // 机器上，v3 的节点会全部命中墓碑（审查 T7b r2 I1）。走 [`menu_import_v3`] 才会问那一句，
+        // 也不会在菜单里打出带 `--with-deleted` 的命令行文案
+        menu_import_v3(ctx)?
     } else {
         // 交互终端里这一句接着就被清屏抹掉、只活在「上次：」行里：菜单走法写在前头
         note(ctx, menu::V3_SKIPPED)
@@ -8183,6 +8180,205 @@ mod tests {
             s.get("/opt/bui-c/config.json").unwrap(),
             config,
             "校验没过，旧配置不动：{t}"
+        );
+    }
+
+    // ───────────── T7b 审查修复（第 2 轮） ─────────────
+
+    /// 没迁移的 v3 客户端、所有 v3 单元文件的完整路径（三个主单元 + 两个 health 残留）。
+    fn v3_unit_files(pp: &Paths) -> Vec<PathBuf> {
+        import_v3::V3_UNITS
+            .iter()
+            .chain(import_v3::V3_AUX_UNITS.iter())
+            .map(|u| pp.unit(u))
+            .collect()
+    }
+
+    /// 审查 r2 I1 的机器：[`all_buried`]（面板导入过两个节点、全部删掉），外加一个**没迁移**的
+    /// v3 客户端——目录里是同一个账号的两个节点（与两条墓碑同 key），五个 v3 单元文件都在。
+    /// 到这个状态只要：首次邀请答 n、改走面板导入、后来删光（spec §9）。
+    fn all_buried_with_v3(pp: &Paths, url: &str) -> (FakeSys, FakeNet) {
+        let (s, n) = all_buried(pp, url);
+        s.put(
+            "/opt/hysteria-client/configs/hysteria2-1/uri.txt",
+            "hysteria2://alice:hy2-pw@panel.example.com:10000/?sni=panel.example.com#alice-HY2%E7%9B%B4%E8%BF%9E",
+        );
+        s.put(
+            "/opt/hysteria-client/configs/reality-1/uri.txt",
+            BOB_REALITY,
+        );
+        s.put("/opt/hysteria-client/active", "hysteria2-1");
+        for f in v3_unit_files(pp) {
+            s.put(f.to_str().unwrap(), "[Unit]");
+        }
+        // 前提：v3 的两个节点都与墓碑同 key（面板节点与 v3 节点同账号、同 host、同 kind）
+        let prof = Profiles::load(&s, pp).unwrap();
+        for dir in ["hysteria2-1", "reality-1"] {
+            let uri = s
+                .get(&format!("/opt/hysteria-client/configs/{dir}/uri.txt"))
+                .unwrap();
+            let node = bui_schema::parse::node_uri(&uri).unwrap();
+            assert!(prof.is_deleted(&node), "前提：v3 的 {dir} 命中墓碑");
+        }
+        (s, n)
+    }
+
+    /// 墓碑里记的名字，按 v3 目录名排序后的顺序（`hysteria2-1` 在 `reality-1` 前）。
+    fn v3_buried_names() -> Vec<String> {
+        vec![
+            "alice-hy2-direct".to_string(),
+            "alice-reality-direct".to_string(),
+        ]
+    }
+
+    /// 最后一条「上次：」行（主菜单每重画一次打一条）。
+    fn last_summary(t: &str) -> Option<&str> {
+        t.lines().rev().find(|l| l.starts_with("  上次："))
+    }
+
+    /// 审查 r2 I1（命令行）：删光之后 v3 的节点全部命中墓碑、v3 单元还在——默认成功返回并打出
+    /// 跳过行，v3 一字不动；`--with-deleted` 两个都回来、第一个被激活、墓碑清空、v3 单元卸掉。
+    #[test]
+    fn import_v3_after_deleting_everything_with_v3_units_left_skips_then_restores() {
+        let pp = paths();
+        let url = "https://panel.example.com/api/nodes/alice";
+
+        // ① 默认：退出码 0，说清跳了哪几个、怎么加回；什么都不存、不 apply、不动 v3
+        let (s, n) = all_buried_with_v3(&pp, url);
+        let writes = s.writes("/opt/bui-c/profiles.json");
+        let restarts_before = restarts(&s);
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        let r = dispatch(&parse(&["import-v3"]), &mut ctx);
+        let t = ctx.transcript.clone();
+        assert!(r.is_ok(), "命令行该成功（退出码 0）：{r:?}\n{t}");
+        let skipped = menu::buried_skipped(&v3_buried_names());
+        assert!(skipped.contains("--with-deleted"), "前提：命令行那句带开关");
+        assert!(t.lines().any(|l| l == skipped), "{t}");
+        assert!(p.asked.is_empty(), "命令行不提问：{:?}", p.asked);
+        assert!(!t.contains(CURRENT_NODE_HEAD), "没有活动节点可说：{t}");
+        let saved = Profiles::load(&s, &pp).unwrap();
+        assert!(saved.profiles.is_empty() && saved.active.is_none(), "{t}");
+        assert_eq!(saved.deleted.len(), 2, "墓碑还在：{t}");
+        assert_eq!(
+            s.writes("/opt/bui-c/profiles.json"),
+            writes,
+            "什么都没存，不重写 profiles.json：{t}"
+        );
+        assert_eq!(restarts(&s), restarts_before, "不 apply：{t}");
+        for f in v3_unit_files(&pp) {
+            assert!(s.exists(&f), "v3 单元原样保留：{}\n{t}", f.display());
+        }
+        assert!(
+            !s.called("systemctl stop hysteria-client.service"),
+            "不卸 v3：{t}"
+        );
+
+        // ② --with-deleted：两个都回来，v3 的活动节点被激活并 apply，墓碑清空，v3 单元卸掉
+        let (s, n) = all_buried_with_v3(&pp, url);
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        let r = dispatch(&parse(&["import-v3", "--with-deleted"]), &mut ctx);
+        let t = ctx.transcript.clone();
+        assert!(r.is_ok(), "{r:?}\n{t}");
+        assert!(!t.contains("--with-deleted"), "{t}");
+        assert!(p.asked.is_empty(), "{:?}", p.asked);
+        let saved = Profiles::load(&s, &pp).unwrap();
+        assert_eq!(
+            names(&s, &pp),
+            vec!["hysteria2-1".to_string(), "reality-1".to_string()],
+            "{t}"
+        );
+        assert_eq!(saved.active.as_deref(), Some("hysteria2-1"), "{t}");
+        assert!(saved.deleted.is_empty(), "{t}");
+        assert!(
+            t.lines()
+                .any(|l| l == format!("{CURRENT_NODE_HEAD}hysteria2-1")),
+            "{t}"
+        );
+        for f in v3_unit_files(&pp) {
+            assert!(!s.exists(&f), "v3 单元该卸掉：{}\n{t}", f.display());
+        }
+        assert!(s.exists(&pp.unit(UNIT_MAIN)), "apply 把主单元建回来：{t}");
+    }
+
+    /// 审查 r2 I1（菜单）：同一状态下，先拒邀请再按 `[7] 更新与维护 → [3]`、或邀请直接答 y，
+    /// 都要问墓碑那一句；答 y 两个都回来、不报失败、不提命令行开关，「上次：」行是导入结果。
+    #[test]
+    fn the_menu_asks_about_buried_v3_nodes_after_deleting_everything() {
+        let pp = paths();
+        let url = "https://panel.example.com/api/nodes/alice";
+        for inputs in [&["n", "7", "3", "y", "", "0"][..], &["y", "y", "", "0"][..]] {
+            let (s, n) = all_buried_with_v3(&pp, url);
+            let r = run_menu(&s, &n, &pp, inputs, true);
+            let ctx_msg = format!("{inputs:?}\n{:?}\n{}", r.asked, r.t);
+            assert!(
+                r.asked.iter().any(|q| q.contains("导入 v3 的节点")),
+                "前提：进菜单前邀请过：{ctx_msg}"
+            );
+            assert!(
+                r.asked.iter().any(|q| q == menu::BURIED_ASK),
+                "要问一句：{ctx_msg}"
+            );
+            assert!(
+                r.t.lines()
+                    .any(|l| l.trim() == menu::buried_head(&v3_buried_names())),
+                "{ctx_msg}"
+            );
+            assert!(!r.t.contains("失败："), "{ctx_msg}");
+            assert!(
+                !r.t.contains("--with-deleted"),
+                "菜单里不提命令行开关：{ctx_msg}"
+            );
+            let saved = Profiles::load(&s, &pp).unwrap();
+            assert_eq!(
+                names(&s, &pp),
+                vec!["hysteria2-1".to_string(), "reality-1".to_string()],
+                "{ctx_msg}"
+            );
+            assert_eq!(saved.active.as_deref(), Some("hysteria2-1"), "{ctx_msg}");
+            assert!(saved.deleted.is_empty(), "{ctx_msg}");
+            for f in v3_unit_files(&pp) {
+                assert!(!s.exists(&f), "v3 单元该卸掉：{}\n{ctx_msg}", f.display());
+            }
+            assert!(
+                last_summary(&r.t).is_some_and(|l| l.starts_with("  上次：导入 2 个节点")),
+                "「上次：」行是导入结果：{:?}\n{ctx_msg}",
+                last_summary(&r.t)
+            );
+        }
+    }
+
+    /// 审查 r2 M6：菜单 `[3]` 一次粘多条、其中一条删过，答 y 之后第二趟只剩那一条——它不是
+    /// 「单独粘贴一条」（spec §5.7 表第 1 行），「上次：」行是导入计数。
+    #[test]
+    fn restoring_one_of_several_pasted_links_summarizes_with_the_count() {
+        let pp = paths();
+        let (s, n) = one_buried(&pp, "https://panel.example.com/api/nodes/alice");
+        // BOB_REALITY 与被删的那个同一个账号位；bob 的 HY2 是全新的
+        let bob_hy2 =
+            "hysteria2://bob:bob-pw@panel.example.com:10000/?sni=panel.example.com#bob-HY2";
+        let r = run_menu(
+            &s,
+            &n,
+            &pp,
+            &["3", BOB_REALITY, bob_hy2, "", "y", "n", "0"],
+            true,
+        );
+        assert!(
+            r.asked.iter().any(|q| q == menu::BURIED_ASK),
+            "前提：多条粘贴要问：{:?}\n{}",
+            r.asked,
+            r.t
+        );
+        let saved = Profiles::load(&s, &pp).unwrap();
+        assert_eq!(saved.profiles.len(), 3, "{}", r.t);
+        assert!(saved.deleted.is_empty(), "加回来了就清墓碑：{}", r.t);
+        assert_eq!(
+            last_summary(&r.t),
+            Some("  上次：导入 1 个新节点，共 3 个"),
+            "{}",
+            r.t
         );
     }
 }
