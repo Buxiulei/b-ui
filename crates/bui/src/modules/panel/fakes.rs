@@ -7,15 +7,28 @@ use uuid::Uuid;
 
 #[derive(Default)]
 pub struct FakeXrayInner {
-    /// `"add:<tag>:<user_id>:<uuid>"` / `"remove:<tag>:<user_id>"` / `"query"`
+    /// **写**与统计的调用：`"add:<tag>:<user_id>:<uuid>"` / `"remove:<tag>:<user_id>"` /
+    /// `"query"` / `"add-rule:…"` / `"remove-rule:…"` / `"list-rules"`。
+    /// `inbound_user_uuid` 那种纯读调用记在 [`FakeXrayInner::gets`]，不混进来 ——
+    /// 断言「这一轮没动内核」看的就是本列表。
     pub calls: Vec<String>,
+    /// `inbound_user_uuid` 的调用：`"get:<tag>:<user_id>"`
+    pub gets: Vec<String>,
+    /// 内核里「现在挂着」的用户：`(tag, user_id)` → vless uuid。`add_user` / `remove_user`
+    /// 成功时跟着变，`inbound_user_uuid` 从这里读 —— 测试要模拟「内核里挂着旧 uuid」
+    /// 直接往这里塞（`sync_users` 先读后写，光靠 `error_text` 已经描述不了内核状态）。
+    pub users: BTreeMap<(String, Uuid), Uuid>,
     /// `query_user_deltas` 的下一次返回值（返回后清空，对应 `reset=true` 语义）
     pub deltas: BTreeMap<String, TxRx>,
     /// 命中就返回 `Err`，用来测退路
     pub fail_on: BTreeSet<String>,
-    /// 指定某次失败的错误串（键同 `fail_on`），不给就用默认串。
-    /// 真实 xray 在「email 已存在」与「email 不存在」时都报错，而这两种错误 Task 6
-    /// 按成功处理——错误串不可配就没法给那条容错写正向测试。
+    /// 只 `add_user` 认：命中就返回 `Err` **一次**（命中即移除），用来模拟
+    /// 「第一次 AddUser 撞上同名 email，摘掉占位的那个再发一次就成」——
+    /// 真 xray 的应答（`users::sync_users` 的「摘掉再加」路径，2026-09-14 裁决）。
+    pub fail_once: BTreeSet<String>,
+    /// 指定某次失败的错误串（键同 `fail_on` / `fail_once`），不给就用默认串。
+    /// 真实 xray 在「email 已存在」与「email 不存在」时都报错，而这两种错误各有各的
+    /// 处理口径（remove 按成功、add 摘掉再加）——错误串不可配就没法给它们写正向测试。
     pub error_text: BTreeMap<String, String>,
     /// 进程里「正在跑」的规则表，按表序：`(ruleTag, outboundTag)`
     pub rules: Vec<(String, String)>,
@@ -43,7 +56,13 @@ impl FakeXray {
     }
 
     pub fn clear_calls(&self) {
-        self.0.lock().unwrap().calls.clear();
+        let mut i = self.0.lock().unwrap();
+        i.calls.clear();
+        i.gets.clear();
+    }
+
+    pub fn gets(&self) -> Vec<String> {
+        self.0.lock().unwrap().gets.clone()
     }
 
     pub fn rules(&self) -> Vec<(String, String)> {
@@ -57,7 +76,7 @@ impl XrayApi for FakeXray {
         let key = format!("add:{tag}:{user_id}:{vless_uuid}");
         let mut i = self.0.lock().unwrap();
         i.calls.push(key.clone());
-        if i.fail_on.contains(&key) {
+        if i.fail_on.contains(&key) || i.fail_once.remove(&key) {
             let msg = i
                 .error_text
                 .get(&key)
@@ -65,6 +84,7 @@ impl XrayApi for FakeXray {
                 .unwrap_or_else(|| format!("fake AddUser 失败：{key}"));
             anyhow::bail!("{msg}");
         }
+        i.users.insert((tag.to_string(), user_id), vless_uuid);
         Ok(())
     }
 
@@ -80,7 +100,23 @@ impl XrayApi for FakeXray {
                 .unwrap_or_else(|| format!("fake RemoveUser 失败：{key}"));
             anyhow::bail!("{msg}");
         }
+        i.users.remove(&(tag.to_string(), user_id));
         Ok(())
+    }
+
+    async fn inbound_user_uuid(&self, tag: &str, user_id: Uuid) -> anyhow::Result<Option<Uuid>> {
+        let key = format!("get:{tag}:{user_id}");
+        let mut i = self.0.lock().unwrap();
+        i.gets.push(key.clone());
+        if i.fail_on.contains(&key) {
+            let msg = i
+                .error_text
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| format!("fake GetInboundUsers 失败：{key}"));
+            anyhow::bail!("{msg}");
+        }
+        Ok(i.users.get(&(tag.to_string(), user_id)).copied())
     }
 
     async fn query_user_deltas(&self) -> anyhow::Result<BTreeMap<String, TxRx>> {

@@ -3,6 +3,10 @@
 //! - 增删用户：`HandlerService.AlterInbound{tag, operation}`，`operation` 是**两层** `TypedMessage`
 //!   （外层 `AddUserOperation` 包 `User`，`User.account` 再包 `vless.Account`）；对两个 inbound 各调一次。
 //! - `email` 是 gRPC 侧唯一键，取 `user_id`（`bui_schema::render::xray::clients` 里也是它）。
+//! - 读回用户：`HandlerService.GetInboundUsers{tag, email}` 会把这个 email 挂的 `vless.Account`
+//!   一起回来，所以「内核里现在挂的是哪个 uuid」是**读得到**的（26.3.27 / 26.9.9 实测，
+//!   见 [`tests::user_alter_facts_against_a_real_xray`] 事实⑤）。`panel::users` 的换 uuid
+//!   靠它先读后写，不再靠错误文案或进程内记账猜。
 //! - 统计：`StatsService.QueryStats(pattern="user>>>", reset=true)` 一次拉全量增量；
 //!   `reset` 对每个计数器原子交换清零，不丢不重（X7）。
 //! - `RemoveUser` **只阻止新握手**，已建立的 REALITY 连接会活到客户端自己断开（X10，spec §4.2 已接受该窗口）。
@@ -31,7 +35,7 @@ use uuid::Uuid;
 
 use pb::xray::app::proxyman::command::{
     handler_service_client::HandlerServiceClient, AddUserOperation, AlterInboundRequest,
-    RemoveUserOperation,
+    GetInboundUserRequest, RemoveUserOperation,
 };
 use pb::xray::app::router::command::{
     routing_service_client::RoutingServiceClient, AddRuleRequest, ListRuleItem, ListRuleRequest,
@@ -86,6 +90,31 @@ pub fn add_user_request(tag: &str, user_id: Uuid, vless_uuid: Uuid) -> AlterInbo
         tag: tag.to_string(),
         operation: Some(typed(TYPE_ADD_USER, &op)),
     }
+}
+
+/// 组装 `GetInboundUsers` 请求：tag + email（不填 email 是「列出这个 inbound 的全部用户」，
+/// 我们从不那么用 —— 一次只问一个 email）。
+pub fn get_inbound_user_request(tag: &str, user_id: Uuid) -> GetInboundUserRequest {
+    GetInboundUserRequest {
+        tag: tag.to_string(),
+        email: user_id.to_string(),
+    }
+}
+
+/// `GetInboundUserResponse.users` → 这个 email 在内核里挂着的 vless uuid；位置空着返回 `None`。
+///
+/// 内核事实（26.3.27 / 26.9.9 实测，2026-09-14）：**查不到的 email 回的是一个空 `User`**
+/// （`{"users":[{}]}`），不是空表 —— 所以判据是「有一行的 email 对得上」，绝不能用
+/// `users.is_empty()`。email 对上但 account 解不出 vless uuid 的行也返回 `None`：
+/// 我们只往这两个 tag 挂 vless 账号，真出现也由 `panel::users` 里 AddUser 撞「已存在」
+/// 那条退路兜住（摘掉再加），端状态一样。
+pub fn vless_uuid_of(users: &[PbUser], user_id: Uuid) -> Option<Uuid> {
+    let email = user_id.to_string();
+    let account = users.iter().find(|u| u.email == email)?.account.as_ref()?;
+    if account.r#type != TYPE_VLESS_ACCOUNT {
+        return None;
+    }
+    Uuid::parse_str(&Account::decode(account.value.as_slice()).ok()?.id).ok()
 }
 
 /// 组装 `AlterInbound` 的 RemoveUser 请求：只带 email。
@@ -258,6 +287,14 @@ impl XrayApi for XrayClient {
         Ok(())
     }
 
+    async fn inbound_user_uuid(&self, tag: &str, user_id: Uuid) -> anyhow::Result<Option<Uuid>> {
+        let mut c = HandlerServiceClient::new(self.channel()?);
+        let resp = c
+            .get_inbound_users(get_inbound_user_request(tag, user_id))
+            .await?;
+        Ok(vless_uuid_of(&resp.into_inner().users, user_id))
+    }
+
     async fn query_user_deltas(&self) -> anyhow::Result<BTreeMap<String, TxRx>> {
         let mut c = StatsServiceClient::new(self.channel()?);
         let resp = c
@@ -383,6 +420,208 @@ mod tests {
                 ("resi-fallback".to_string(), "relay-slot-0".to_string())
             ],
             "没有 ruleTag 的规则（渲染里的 api / 直连两条）既不认也不删，顺序保持表序"
+        );
+    }
+
+    /// 真实 xray 的**用户增删**事实。与 [`routing_rules_round_trip_against_a_real_xray`]
+    /// 同一档的有意例外（回环端口 + tempfile + 子进程在 `Drop` 里 kill，不碰 systemd / /opt），
+    /// 只在 `xray` 在 PATH 上时跑。
+    ///
+    /// 五条事实，钉住 `panel::users` 里 add / remove 两个方向的判据
+    /// （xray 26.9.9 与生产钉的 26.3.27 都实测过，2026-09-14）：
+    /// 1. 同名 email 再 `AddUser` ⇒ `proxy/vless: User <email> already exists.`
+    ///    —— `users::email_taken` 认它，于是「摘掉再加」那一路才会被触发；
+    /// 2. 先 `RemoveUser` 再 `AddUser` ⇒ 新 uuid 挂得上（轮换靠这条成立）；
+    /// 3. `RemoveUser` 撞不存在 ⇒ `proxy/vless: User <email> not found.`
+    ///    —— `users::target_already_reached` 认它，删是幂等的；
+    /// 4. `AddUser` 打到**不存在的 inbound tag** ⇒ `handler not found: <tag>`，
+    ///    这条**也带 `not found`**。所以 add 那一路绝不能用
+    ///    `users::target_already_reached` 判「已达成」：xray 还没起那个 inbound 时
+    ///    会被记成同步成功，用户永远进不了内核而日志里一条错都没有。
+    /// 5. `GetInboundUsers{tag, email}` **读得回**这个 email 挂着的 uuid
+    ///    （`xray api inbounduser` 就是它）—— 所以「内核里现在是哪个 uuid」不必猜：
+    ///    `users::sync_users` 先读后写，uuid 没变就一个写请求都不发。
+    ///    附带一条反直觉的事实：**查不到的 email 回的是一个空 `User`，不是空表**
+    ///    （`{"users":[{}]}`），所以 [`vless_uuid_of`] 的判据是「有一行 email 对得上」。
+    #[tokio::test]
+    async fn user_alter_facts_against_a_real_xray() {
+        use crate::modules::panel::users::{email_taken, target_already_reached};
+        if !have_xray() {
+            eprintln!("skipped: xray not found");
+            return;
+        }
+        let free_port = || {
+            std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port()
+        };
+        let (api_port, vless_port) = (free_port(), free_port());
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("xray.json");
+        let seed = Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
+        let cfg = serde_json::json!({
+            "log": {"loglevel": "warning"},
+            "api": {"tag": "api", "services": ["HandlerService", "RoutingService"]},
+            "inbounds": [
+                {"tag": "api", "port": api_port, "listen": "127.0.0.1",
+                 "protocol": "dokodemo-door", "settings": {"address": "127.0.0.1"}},
+                // 渲染出的两个 REALITY 入站在这里用明文 vless 代替：本用例只问
+                // HandlerService 对 clients 的增删语义，与传输层无关
+                {"tag": "vless-direct", "port": vless_port, "listen": "127.0.0.1",
+                 "protocol": "vless",
+                 "settings": {"clients": [{"id": seed, "email": "seed"}], "decryption": "none"}}
+            ],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+            "routing": {"rules": [{"type": "field", "inboundTag": ["api"], "outboundTag": "api"}]}
+        });
+        std::fs::write(&cfg_path, serde_json::to_vec_pretty(&cfg).unwrap()).unwrap();
+        let _xrayd = Xrayd::spawn(&cfg_path);
+        let c = XrayClient::with_addr(format!("127.0.0.1:{api_port}"));
+        let mut ready = false;
+        for _ in 0..50 {
+            if c.list_rules().await.is_ok() {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(ready, "xray 没在 5 秒内接受 gRPC");
+
+        let new = Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap();
+
+        // 事实⑤（其一）：还没挂上去时 `GetInboundUsers` 说这个位置是空的
+        assert_eq!(
+            c.inbound_user_uuid("vless-direct", uid()).await.unwrap(),
+            None,
+            "查不到的 email 回的是一个空 User（不是空表），必须读成「位置空着」"
+        );
+        c.add_user("vless-direct", uid(), vid()).await.unwrap();
+        // 事实⑤（其二）：挂上之后读回来的就是那个 uuid —— 换 uuid 不必靠猜
+        assert_eq!(
+            c.inbound_user_uuid("vless-direct", uid()).await.unwrap(),
+            Some(vid()),
+            "GetInboundUsers 读得回 email 上挂的 uuid"
+        );
+
+        // 事实①：同名 email 再 AddUser 报「已存在」——**换的 uuid 没生效**
+        let dup = c
+            .add_user("vless-direct", uid(), new)
+            .await
+            .expect_err("同名 email 必须报错")
+            .to_string();
+        assert!(email_taken(&dup), "{dup}");
+        assert_eq!(
+            c.inbound_user_uuid("vless-direct", uid()).await.unwrap(),
+            Some(vid()),
+            "撞「已存在」之后挂的还是旧 uuid —— 这就是不许把它记成已达目标的原因"
+        );
+
+        // 事实②：摘掉再加，新 uuid 就挂上了（轮换与「b-ui 重启丢了记账」都靠这条）
+        c.remove_user("vless-direct", uid()).await.unwrap();
+        c.add_user("vless-direct", uid(), new).await.unwrap();
+        assert_eq!(
+            c.inbound_user_uuid("vless-direct", uid()).await.unwrap(),
+            Some(new)
+        );
+
+        // 事实③：RemoveUser 撞不存在 = 目标已达成
+        c.remove_user("vless-direct", uid()).await.unwrap();
+        let gone = c
+            .remove_user("vless-direct", uid())
+            .await
+            .expect_err("不存在的 email 必须报错")
+            .to_string();
+        assert!(target_already_reached(&gone), "{gone}");
+
+        // 事实④：inbound 不存在时的 AddUser 也带「not found」，但目标根本没达成
+        let no_tag = c
+            .add_user("vless-residential", uid(), new)
+            .await
+            .expect_err("不存在的 inbound tag 必须报错")
+            .to_string();
+        assert!(
+            target_already_reached(&no_tag),
+            "宽匹配会把它当成已达成，所以 add 那一路不许用它：{no_tag}"
+        );
+        assert!(
+            !email_taken(&no_tag),
+            "add 那一路的判据必须把它排除在外：{no_tag}"
+        );
+        // 同一个 tag 上 `GetInboundUsers` 也报错（不是「位置空着」）⇒ `sync_users` 退回
+        // 错误串那一路，而那一路对 `handler not found` 记 error、不做任何摘挂
+        assert!(
+            c.inbound_user_uuid("vless-residential", uid())
+                .await
+                .is_err(),
+            "inbound 不存在时读不到，必须是 Err 而不是 Ok(None)"
+        );
+    }
+
+    #[test]
+    fn get_inbound_user_request_carries_the_tag_and_the_email() {
+        let req = get_inbound_user_request("vless-direct", uid());
+        assert_eq!(req.tag, "vless-direct");
+        assert_eq!(req.email, uid().to_string(), "email 就是 user_id");
+    }
+
+    #[test]
+    fn vless_uuid_of_reads_the_account_and_ignores_the_empty_placeholder() {
+        let mounted = PbUser {
+            level: 0,
+            email: uid().to_string(),
+            account: Some(typed(
+                TYPE_VLESS_ACCOUNT,
+                &Account {
+                    id: vid().to_string(),
+                    flow: crate::modules::panel::VLESS_FLOW.to_string(),
+                    ..Default::default()
+                },
+            )),
+        };
+        assert_eq!(
+            vless_uuid_of(std::slice::from_ref(&mounted), uid()),
+            Some(vid())
+        );
+        // 内核对查不到的 email 回的是**一个空 User**（26.3.27 / 26.9.9 实测），
+        // 用 `is_empty()` 判会把它读成「位置被占」，于是每一轮都白摘挂一次
+        assert_eq!(
+            vless_uuid_of(&[PbUser::default()], uid()),
+            None,
+            "空 User 占位 = 位置空着"
+        );
+        assert_eq!(vless_uuid_of(&[], uid()), None);
+        // 别人的 email 不作数
+        assert_eq!(vless_uuid_of(&[mounted], Uuid::nil()), None);
+        // account 缺失 / 不是 vless 账号 / uuid 解不出来 ⇒ 当成位置空着，
+        // 后面 AddUser 撞「已存在」那条退路兜住
+        assert_eq!(
+            vless_uuid_of(
+                &[PbUser {
+                    email: uid().to_string(),
+                    ..Default::default()
+                }],
+                uid()
+            ),
+            None
+        );
+        assert_eq!(
+            vless_uuid_of(
+                &[PbUser {
+                    email: uid().to_string(),
+                    account: Some(typed(
+                        "xray.proxy.vmess.Account",
+                        &Account {
+                            id: vid().to_string(),
+                            ..Default::default()
+                        }
+                    )),
+                    ..Default::default()
+                }],
+                uid()
+            ),
+            None
         );
     }
 

@@ -108,6 +108,10 @@ pub struct Applied {
 pub trait XrayApi: Send + Sync {
     async fn add_user(&self, tag: &str, user_id: Uuid, vless_uuid: Uuid) -> anyhow::Result<()>;
     async fn remove_user(&self, tag: &str, user_id: Uuid) -> anyhow::Result<()>;
+    /// 读回这个 email 在 `tag` 里挂着的 vless uuid（`HandlerService.GetInboundUsers`）；
+    /// 位置空着返回 `Ok(None)`。`users::sync_users` 换 uuid 时先读后写，靠它避免
+    /// 「uuid 没变也摘挂一遍」（2026-09-14 审查意见①②）。
+    async fn inbound_user_uuid(&self, tag: &str, user_id: Uuid) -> anyhow::Result<Option<Uuid>>;
     /// `QueryStats(pattern="user>>>", reset=true)`：email（= `user_id` 的字符串）→ 本轮增量
     async fn query_user_deltas(&self) -> anyhow::Result<BTreeMap<String, TxRx>>;
     /// 追加一条住宅槽路由规则（`RoutingService.AddRule`，`shouldAppend=true` ⇒ 落在表尾）。

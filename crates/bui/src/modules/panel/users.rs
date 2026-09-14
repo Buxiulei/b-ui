@@ -54,6 +54,11 @@ pub struct PanelUser {
     pub usage: PanelUsage,
     pub password: String,
     pub uuid: Uuid,
+    /// 该用户四个免鉴权订阅端点的路径末段（`User::sub_token`，2026-09-14 裁决）：
+    /// 前端据此拼订阅链接，不再拿用户名拼。老 `state.json` 还没补齐 token 时不出现
+    /// （补齐由守护进程启动时的 [`backfill_sub_tokens`] 做，所以这一档只在那之前可见）。
+    #[serde(rename = "subToken", skip_serializing_if = "Option::is_none")]
+    pub sub_token: Option<String>,
     pub sni: String,
     pub residential: bool,
     /// 该用户所在的 IP 槽位序号（spec §5.6；没有住宅权益 ⇒ `None`）
@@ -135,6 +140,7 @@ pub fn project(
         },
         password: u.credentials.hy2_password.clone(),
         uuid: u.credentials.vless_uuid,
+        sub_token: u.sub_token.clone(),
         // v4 没有 per-user sni：面板与订阅都用全局 REALITY 伪装域（v3.5.13 的修复口径）
         sni: node.reality.sni().to_string(),
         residential: u.entitlements.residential.is_some(),
@@ -297,6 +303,22 @@ pub async fn backfill_sub_tokens(store: &Store, now: OffsetDateTime) -> anyhow::
         );
     }
     Ok(filled)
+}
+
+/// 轮换一个用户的订阅凭据（2026-09-14 裁决，`POST /api/users/{name}/rotate`）：
+/// 订阅 token、hy2 密码、vless uuid **同时**换掉，并停用他的「用户名链接」。
+///
+/// 三样一起换是这个接口的全部意义：泄露的链接里同时有 token（路径）、hy2 明文密码与
+/// vless uuid（响应体），只换其中一样等于没换。停用用户名链接则是为了让轮换在全局宽限期
+/// （`system.legacy_sub_until`）还没到期时也立刻生效 —— 否则旧链接照样能取到新凭据。
+///
+/// hy2 密码沿用 [`random_hy2_password`]（16 个 hex 字符，v3 同形），因此鉴权快照一重写
+/// 旧密码当场被拒；uuid 的生效靠 [`sync_users`] 的换 uuid 路径（先 RemoveUser 再 AddUser）。
+pub fn rotate(u: &mut User) {
+    u.sub_token = Some(bui_schema::sub::new_sub_token());
+    u.credentials.hy2_password = random_hy2_password();
+    u.credentials.vless_uuid = Uuid::new_v4();
+    u.legacy_sub_disabled = true;
 }
 
 pub fn apply_update(u: &mut User, req: &UpdateRequest, now: OffsetDateTime) -> Result<(), String> {
@@ -507,6 +529,10 @@ pub async fn sync_users(ctx: &DaemonCtx, shared: &Shared, blocked: &BTreeSet<Uui
                 want_removed.insert(*id);
             }
         }
+        // `applied.xray_users` 在这里只当**跳过位**：记账说已经挂上这个 uuid 了就整个跳过，
+        // 省掉一次 gRPC 读。它不是判据 —— 记账只活在进程内，b-ui 一重启就是空的，
+        // xray 从落后的 `xray-config.json` 起来时也一样对不上；真判据是下面 ⑤ 的
+        // `GetInboundUsers`（读回这个 email 当前挂的 uuid）。
         let to_add: Vec<(Uuid, Uuid)> = desired
             .iter()
             .filter(|(id, vid)| applied.xray_users.get(id) != Some(vid))
@@ -527,13 +553,66 @@ pub async fn sync_users(ctx: &DaemonCtx, shared: &Shared, blocked: &BTreeSet<Uui
     for (id, vid) in to_add {
         let mut ok = true;
         for tag in XRAY_INBOUND_TAGS {
-            if let Err(e) = shared.xray().add_user(tag, id, vid).await {
-                let msg = e.to_string();
-                if target_already_reached(&msg) {
-                    tracing::debug!(tag, %id, "AddUser 报已存在，按成功处理");
-                } else {
+            // 先读后写（2026-09-14 审查意见①②）：`GetInboundUsers` 读回这个 email 当前挂的
+            // uuid，所以「换 uuid 要先摘再加」这件事不必靠进程内记账、也不必靠错误文案猜。
+            // 关键收益是 uuid 没变时**一个写请求都不发**：b-ui 或 xray 一重启 `applied`
+            // 就清空，全部健康用户都会重新走一遍这里，盲目「摘掉再加」等于给每个人开一个
+            // 「已摘出、还没加回」的窗口 —— 那一步失败（inbound 正在重载）就把好用户摘掉，
+            // 要等 60 秒安全网才补回来。
+            match shared.xray().inbound_user_uuid(tag, id).await {
+                // 挂的就是期望的 uuid ⇒ 目标已达成，不写
+                Ok(Some(cur)) if cur == vid => continue,
+                // 挂着别的 uuid（轮换、或面板给只有 Reality 权益的用户改 UUID）⇒ 摘掉腾位置：
+                // AddUser 撞同名 email 只会报「已存在」，新 uuid 挂不上
+                Ok(Some(_)) => {
+                    if let Err(e) = free_the_email(ctx, shared, tag, id).await {
+                        // 位置没腾出来，AddUser 只会再撞一次「已存在」：这一轮不加，
+                        // 留给 60 秒安全网重试（幂等）
+                        ok = false;
+                        out.errors
+                            .push(format!("换 uuid 前 RemoveUser {tag} 失败：{e}"));
+                        continue;
+                    }
+                }
+                // 位置空着 ⇒ 直接加
+                Ok(None) => {}
+                // 读不到（xray 掉线、inbound 还没起、或内核老到没这个 RPC）⇒ 退回下面那条
+                // 只靠错误文案的老路：AddUser 撞「已存在」就摘掉再加
+                Err(e) => {
+                    tracing::debug!(tag, %id, error = %e, "GetInboundUsers 读不到，退回 AddUser 那一路")
+                }
+            }
+            match shared.xray().add_user(tag, id, vid).await {
+                Ok(()) => {}
+                // xray 说这个 email 已经在 inbound 里 = 位置被占。**绝不**把它记成已达目标：
+                // 上面的读失败了才走到这儿，挂着的可能正是要换掉的旧 uuid（吃下这条错误就等于
+                // 把旧 uuid 记成新 uuid —— 泄露的旧凭据一直有效到 xray 下次重启，而
+                // `render::xray::structural_hash` 剥掉了 clients，对账也不会重启它）。
+                Err(e) if email_taken(&e.to_string()) => {
+                    match free_the_email(ctx, shared, tag, id).await {
+                        Err(e2) => {
+                            ok = false;
+                            out.errors.push(format!(
+                                "AddUser {tag} 报已存在、腾位置的 RemoveUser 又失败：{e2}"
+                            ));
+                        }
+                        Ok(()) => {
+                            if let Err(e2) = shared.xray().add_user(tag, id, vid).await {
+                                // 已经摘出去了、又没加回来 ⇒ 这个用户此刻**在 `tag` 上握不了新手**，
+                                // 要等 60 秒安全网补回。单独写清楚，别让运维以为只是加不上。
+                                ok = false;
+                                out.errors.push(format!(
+                                    "AddUser {tag} 重试失败，该用户已被摘出 {tag}、等下一轮补回：{e2}"
+                                ));
+                            } else {
+                                tracing::info!(tag, %id, "AddUser 报已存在，摘掉旧的重加一次");
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
                     ok = false;
-                    out.errors.push(format!("AddUser {tag} 失败：{msg}"));
+                    out.errors.push(format!("AddUser {tag} 失败：{e}"));
                 }
             }
         }
@@ -587,15 +666,63 @@ pub async fn sync_users(ctx: &DaemonCtx, shared: &Shared, blocked: &BTreeSet<Uui
     out
 }
 
-/// xray 的 `AddUser` 撞上「email 已存在」、`RemoveUser` 撞上「email 不存在」时都返回错误，
-/// 而这两种情形下目标状态其实已经达成，所以按成功处理。
+/// `RemoveUser` 撞上「email 不存在」时 xray 返回错误，而这时目标状态其实已经达成
+/// （那个 email 本来就不在 inbound 里），所以按成功处理。
 ///
-/// 错误文案本身**没有实机核对过**（调研 X1–X11 只覆盖 proto 与服务端调用链，没记错误串），
-/// 所以这里宽匹配三个子串；M3 真内核联调（bwg-rick）时按 xray 的实际文案核对一次，
-/// 对不上就把子串补齐 —— 匹配失败的后果只是多记一条 error + 多跑一次 CLI 退路（幂等），不会误判成功。
-fn target_already_reached(msg: &str) -> bool {
+/// **只给 RemoveUser 这个方向用**：`AddUser` 的「已存在」不代表目标达成 ——
+/// 挂着的可能是旧 uuid，判据见 [`email_taken`]（2026-09-14 裁决）。
+///
+/// 文案已在真内核上核对（xray 26.3.27 与 26.9.9，2026-09-14，见
+/// `super::xray::tests::user_alter_facts_against_a_real_xray`）：`proxy/vless: User <email> not found.`。
+/// 仍宽匹配三个子串以容其它版本的措辞 —— 匹配失败的后果只是多记一条 error +
+/// 多跑一次 CLI 退路（幂等），不会误判成功。
+pub(super) fn target_already_reached(msg: &str) -> bool {
     let m = msg.to_ascii_lowercase();
     m.contains("already") || m.contains("not found") || m.contains("not exist")
+}
+
+/// `AddUser` 失败是不是「这个 email 已经在 inbound 里」= 位置被占。
+///
+/// 真内核文案（xray 26.3.27 与 26.9.9，2026-09-14 实测）：
+/// `proxy/vless: User <email> already exists.`。
+/// **只认 `already`**，不像 [`target_already_reached`] 那样连 `not found` 一起认：
+/// AddUser 打到还没起来的 inbound 报的是 `handler not found: <tag>`，那条也带 `not found`，
+/// 认下去就等于把「内核根本没收到这个用户」记成同步成功（同一个真内核用例钉住这一条）。
+///
+/// **只是退路**：`sync_users` 正常走 `XrayApi::inbound_user_uuid`
+/// （`GetInboundUsers` 读回当前挂的 uuid），这条文案判据只在那次读失败时才用得上，
+/// 所以内核换措辞也不会让轮换静默失效。判成占位的后果是「摘掉再加一次」（幂等）；
+/// 判不出来的后果是记一条 error + 60 秒后重试 —— 两边都不会把没换成的 uuid 记成换成了。
+pub(super) fn email_taken(msg: &str) -> bool {
+    msg.to_ascii_lowercase().contains("already")
+}
+
+/// 把 xray 里占着这个 email 的用户摘掉，好让 `AddUser` 能把新 uuid 挂上去。
+///
+/// 与 `to_remove` 那一路同口径（决策 D12 / 调研 X9）：gRPC 报「不存在」= 位置本来就是空的，
+/// 其余失败走 `xray api rmu` CLI 退路 —— RemoveUser 这个方向不自愈，而位置腾不出来
+/// 这一轮连 AddUser 都发不出去（新 uuid 一直不生效，审查意见③）。
+async fn free_the_email(
+    ctx: &DaemonCtx,
+    shared: &Shared,
+    tag: &str,
+    id: Uuid,
+) -> Result<(), String> {
+    match shared.xray().remove_user(tag, id).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let msg = e.to_string();
+            if target_already_reached(&msg) {
+                tracing::debug!(tag, %id, "腾位置的 RemoveUser 报不存在，直接 AddUser");
+                Ok(())
+            } else if cli_remove(ctx, tag, &id.to_string()).await {
+                tracing::info!(tag, %id, "腾位置的 RemoveUser 走了 CLI 退路");
+                Ok(())
+            } else {
+                Err(msg)
+            }
+        }
+    }
 }
 
 /// `xray api rmu --server=<addr> -tag=<tag> <email>`；找不到可执行文件或非零退出返回 false。
@@ -1029,6 +1156,72 @@ mod tests {
 
         assert_eq!(backfill_sub_tokens(&store, t0()).await.unwrap(), 0);
         assert_eq!(store.read().await.system.legacy_sub_until, None);
+    }
+
+    /// 2026-09-14 裁决：轮换把订阅 token、hy2 密码、vless uuid **一起**换掉
+    /// （只换一样等于没换：泄露的链接里三样都有），并停用这个用户的「用户名链接」。
+    #[test]
+    fn rotate_swaps_all_three_credentials_and_disables_the_username_link() {
+        let mut s = sample_state();
+        let before = s.users[0].clone();
+        rotate(&mut s.users[0]);
+        let after = s.users[0].clone();
+
+        let token = after.sub_token.as_deref().expect("轮换后必须有 token");
+        assert!(bui_schema::sub::is_sub_token(token), "{token}");
+        assert_ne!(after.sub_token, before.sub_token);
+        assert_ne!(
+            after.credentials.hy2_password,
+            before.credentials.hy2_password
+        );
+        assert_eq!(
+            after.credentials.hy2_password.len(),
+            16,
+            "与 v3 同形的 16 个 hex 字符"
+        );
+        assert_ne!(after.credentials.vless_uuid, before.credentials.vless_uuid);
+        assert!(after.legacy_sub_disabled, "旧用户名链接必须立刻失效");
+
+        // 别的字段一个都不许动（权益、用量、账务、槽位都在里面）
+        let mut restored = after.clone();
+        restored.sub_token = before.sub_token.clone();
+        restored.credentials = before.credentials.clone();
+        restored.legacy_sub_disabled = before.legacy_sub_disabled;
+        assert_eq!(restored, before);
+
+        // 每次轮换都是新随机值
+        rotate(&mut s.users[0]);
+        assert_ne!(s.users[0].sub_token, after.sub_token);
+        assert_ne!(
+            s.users[0].credentials.vless_uuid,
+            after.credentials.vless_uuid
+        );
+    }
+
+    /// 前端要拿 `subToken` 拼订阅链接（用户名链接只在宽限期内可用），所以投影必须带它。
+    #[test]
+    fn the_panel_user_carries_the_sub_token() {
+        let mut s = sample_state();
+        let v = serde_json::to_value(project(
+            alice(&s),
+            &s.node,
+            &s.residential,
+            &BTreeSet::new(),
+        ))
+        .unwrap();
+        assert!(
+            v.get("subToken").is_none(),
+            "老 state 还没补齐 token ⇒ 字段不出现"
+        );
+        s.users[0].sub_token = Some("0123456789abcdef0123456789abcdef".into());
+        let v2 = serde_json::to_value(project(
+            alice(&s),
+            &s.node,
+            &s.residential,
+            &BTreeSet::new(),
+        ))
+        .unwrap();
+        assert_eq!(v2["subToken"], "0123456789abcdef0123456789abcdef");
     }
 
     #[test]
@@ -1518,26 +1711,341 @@ mod tests {
         );
     }
 
+    /// **`GetInboundUsers` 读不到时**才走的那条退路：xray 报「已存在」= 位置被占，
+    /// 一律摘掉再加一次 —— 不报 error，但也**不**把它当成「目标已达成」
+    /// （位置上挂的可能正是要换掉的旧 uuid）。
     #[tokio::test]
-    async fn an_add_that_reports_already_exists_is_not_an_error() {
+    async fn an_add_that_reports_already_exists_is_healed_by_removing_the_squatter() {
         let h = harness().await;
         let ctx = ctx_of(&h);
         let id = h.store.read().await.users[0].user_id;
         let vid = h.store.read().await.users[0].credentials.vless_uuid;
-        // 装机后第一轮的真实情形：xray 侧已有同 email（`applied` 只活在进程内）
+        // 读不到内核状态（xray 掉线 / 老内核没这个 RPC）⇒ 退回错误串那一路；
+        // 而 xray 侧其实已有同 email（`applied` 只活在进程内）
         let key = format!("add:vless-direct:{id}:{vid}");
         h.xray.with(|i| {
-            i.fail_on.insert(key.clone());
+            i.fail_on.insert(format!("get:vless-direct:{id}"));
+            i.fail_once.insert(key.clone());
             i.error_text
                 .insert(key, format!("User {id} already exists."));
         });
         let out = sync_users(&ctx, &h.shared, &BTreeSet::new()).await;
         assert!(
             out.errors.is_empty(),
-            "「已存在」按成功处理：{:?}",
+            "摘掉再加成功了就不记 error：{:?}",
             out.errors
         );
         assert_eq!(out.added, vec![id], "记进 applied，第二轮就不再 AddUser");
+        assert_eq!(
+            h.xray.calls(),
+            vec![
+                format!("add:vless-direct:{id}:{vid}"),
+                format!("remove:vless-direct:{id}"),
+                format!("add:vless-direct:{id}:{vid}"),
+                format!("add:vless-residential:{id}:{vid}"),
+            ],
+            "只有报「已存在」的那个 inbound 需要摘掉再加"
+        );
+    }
+
+    /// 回归：轮换在 gRPC 推送前遇上 b-ui 重启 —— `applied` 只活在进程内
+    /// （`panel/mod.rs` 的 `Applied` 注释自己写了这件事），新进程里是空的，
+    /// 而 xray 进程没重启、里面仍挂着**旧** uuid。
+    ///
+    /// 判据是内核自己（`GetInboundUsers`），不是记账：读回来是旧 uuid 就照样先摘再加。
+    /// 一旦哪天又靠记账判，这一轮只会发 AddUser、撞「已存在」；把那条错误吃成成功
+    /// 就等于把旧 uuid 记成新 uuid —— 泄露的旧凭据一直有效到 xray 下次重启
+    /// （`render::xray::structural_hash` 剥掉了 clients，对账不会重启它），
+    /// journal 里一条错误都没有，而面板与 rotate 回包都声称换过了。
+    #[tokio::test]
+    async fn a_rotation_lost_to_a_daemon_restart_still_reaches_xray() {
+        let h = harness().await;
+        let ctx = ctx_of(&h);
+        let id = h.store.read().await.users[0].user_id;
+        // 第一轮：xray 里挂上旧 uuid
+        sync_users(&ctx, &h.shared, &BTreeSet::new()).await;
+        h.store.update(|s| rotate(&mut s.users[0])).await.unwrap();
+        let new = h.store.read().await.users[0].credentials.vless_uuid;
+
+        // 「b-ui 重启」：换一份全新的 `Shared`（记账清空），xray 与 hysteria 还是同两个假内核
+        // （假内核里仍挂着旧 uuid —— 它就是这一步唯一的事实来源）
+        let restarted = Arc::new(Shared::new(
+            Box::new(h.xray.clone()),
+            Box::new(h.hy2.clone()),
+        ));
+        restarted.set_paths(&h.paths);
+        h.xray.clear_calls();
+
+        let out = sync_users(&ctx, &restarted, &BTreeSet::new()).await;
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(out.added, vec![id]);
+        assert_eq!(
+            h.xray.calls(),
+            vec![
+                format!("remove:vless-direct:{id}"),
+                format!("add:vless-direct:{id}:{new}"),
+                format!("remove:vless-residential:{id}"),
+                format!("add:vless-residential:{id}:{new}"),
+            ],
+            "两个 inbound 都要把旧 uuid 摘掉再挂新的"
+        );
+        // 新进程的记账指向新 uuid ⇒ 下一轮零请求（不会每 60 秒 remove+add 抖一次）
+        h.xray.clear_calls();
+        let out2 = sync_users(&ctx, &restarted, &BTreeSet::new()).await;
+        assert!(out2.errors.is_empty(), "{:?}", out2.errors);
+        assert!(h.xray.calls().is_empty(), "{:?}", h.xray.calls());
+    }
+
+    /// 审查意见③：腾位置的 RemoveUser 与 `to_remove` 那一路同口径 —— gRPC 失败要走
+    /// `xray api rmu` CLI 退路（决策 D12 / 调研 X9），退路成功就照常把新 uuid 挂上去。
+    /// 不走退路的后果是这一轮连 AddUser 都发不出去，而那条 error 大概率连 incident
+    /// 都不会变成（`XrayGrpcUnavailable` 签名要求日志里同时出现 `unavailable`）。
+    #[tokio::test]
+    async fn freeing_the_email_falls_back_to_the_xray_cli() {
+        let h = harness().await;
+        let ctx = ctx_of(&h);
+        let id = h.store.read().await.users[0].user_id;
+        sync_users(&ctx, &h.shared, &BTreeSet::new()).await;
+        h.store.update(|s| rotate(&mut s.users[0])).await.unwrap();
+        let new = h.store.read().await.users[0].credentials.vless_uuid;
+        h.host.with(|i| {
+            i.which.insert("xray".into());
+        });
+        h.xray.with(|i| {
+            i.fail_on.insert(format!("remove:vless-direct:{id}"));
+        });
+        h.xray.clear_calls();
+
+        let out = sync_users(&ctx, &h.shared, &BTreeSet::new()).await;
+        assert!(
+            out.errors.is_empty(),
+            "退路成功就不记 error：{:?}",
+            out.errors
+        );
+        assert_eq!(out.added, vec![id]);
+        assert!(
+            h.host.ops().contains(&format!(
+                "run:xray api rmu --server=127.0.0.1:10085 -tag=vless-direct {id}"
+            )),
+            "没走 CLI 退路：{:?}",
+            h.host.ops()
+        );
+        assert!(
+            h.xray
+                .calls()
+                .contains(&format!("add:vless-direct:{id}:{new}")),
+            "位置腾出来了就要把新 uuid 挂上去：{:?}",
+            h.xray.calls()
+        );
+    }
+
+    /// 2026-09-14 裁决的回归：uuid 变了（轮换、或面板给 Reality 用户改 UUID）就必须
+    /// **先 RemoveUser 再 AddUser**。原来只发 AddUser，xray 报「已存在」又被
+    /// `target_already_reached` 记成成功 ⇒ 新 uuid 要等 xray 重启才生效，而
+    /// `render::xray::structural_hash` 剥掉了 clients，对账也不会重启它。
+    #[tokio::test]
+    async fn rotating_a_uuid_removes_the_old_one_before_adding_the_new_one() {
+        let h = harness().await;
+        let ctx = ctx_of(&h);
+        let id = h.store.read().await.users[0].user_id;
+        let old = h.store.read().await.users[0].credentials.vless_uuid;
+        sync_users(&ctx, &h.shared, &BTreeSet::new()).await;
+
+        // uuid 没变 ⇒ 一个 gRPC 请求都不发
+        h.xray.clear_calls();
+        sync_users(&ctx, &h.shared, &BTreeSet::new()).await;
+        assert!(h.xray.calls().is_empty(), "{:?}", h.xray.calls());
+
+        h.store.update(|s| rotate(&mut s.users[0])).await.unwrap();
+        let new = h.store.read().await.users[0].credentials.vless_uuid;
+        assert_ne!(new, old);
+        let out = sync_users(&ctx, &h.shared, &BTreeSet::new()).await;
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(out.added, vec![id]);
+        assert!(out.removed.is_empty(), "换 uuid 不是「删用户」");
+        assert_eq!(
+            h.xray.calls(),
+            vec![
+                format!("remove:vless-direct:{id}"),
+                format!("add:vless-direct:{id}:{new}"),
+                format!("remove:vless-residential:{id}"),
+                format!("add:vless-residential:{id}:{new}"),
+            ],
+            "每个 inbound 都要先 remove 再 add"
+        );
+
+        // 记账已经指向新 uuid ⇒ 再同步一轮零请求
+        h.xray.clear_calls();
+        sync_users(&ctx, &h.shared, &BTreeSet::new()).await;
+        assert!(h.xray.calls().is_empty(), "{:?}", h.xray.calls());
+    }
+
+    /// 位置腾过了、AddUser 还是报「已存在」（摘掉再加也没成）= 目标根本没达成：
+    /// 必须记成失败交给 60 秒安全网重试，**绝不**记账。
+    ///
+    /// 审查意见②的另一半：这一刻这个用户已经被摘出 `vless-direct`、还没加回去，
+    /// 60 秒内他在这个 inbound 上握不了新手 —— 错误串要把这件事说出来，
+    /// 否则运维只看到「加不上」，不知道人已经掉了。
+    #[tokio::test]
+    async fn an_already_exists_while_replacing_a_uuid_is_a_real_error() {
+        let h = harness().await;
+        let ctx = ctx_of(&h);
+        let id = h.store.read().await.users[0].user_id;
+        sync_users(&ctx, &h.shared, &BTreeSet::new()).await;
+        h.store.update(|s| rotate(&mut s.users[0])).await.unwrap();
+        let new = h.store.read().await.users[0].credentials.vless_uuid;
+
+        let add_key = format!("add:vless-direct:{id}:{new}");
+        h.xray.with(|i| {
+            i.fail_on.insert(add_key.clone());
+            i.error_text
+                .insert(add_key, format!("User {id} already exists."));
+        });
+        let out = sync_users(&ctx, &h.shared, &BTreeSet::new()).await;
+        assert!(
+            out.errors
+                .iter()
+                .any(|e| e.contains("AddUser vless-direct") && e.contains("已被摘出 vless-direct")),
+            "错误串要点明用户已被摘出内核、等下一轮补回：{:?}",
+            out.errors
+        );
+        assert!(out.added.is_empty(), "没换成就不许记账，等安全网重试");
+    }
+
+    /// 腾位置的那次 RemoveUser 自己失败（gRPC 失败 + CLI 退路也不可用）：
+    /// 这一轮连 AddUser 都不发（发了也只会再撞一次「已存在」），另一个 inbound 照旧推进。
+    #[tokio::test]
+    async fn a_failed_remove_while_replacing_a_uuid_skips_the_add() {
+        let h = harness().await;
+        let ctx = ctx_of(&h);
+        let id = h.store.read().await.users[0].user_id;
+        sync_users(&ctx, &h.shared, &BTreeSet::new()).await;
+        h.store.update(|s| rotate(&mut s.users[0])).await.unwrap();
+        let new = h.store.read().await.users[0].credentials.vless_uuid;
+        h.xray.with(|i| {
+            i.fail_on.insert(format!("remove:vless-direct:{id}"));
+        });
+        h.xray.clear_calls();
+
+        let out = sync_users(&ctx, &h.shared, &BTreeSet::new()).await;
+        assert!(
+            out.errors
+                .iter()
+                .any(|e| e.contains("换 uuid 前 RemoveUser vless-direct")),
+            "{:?}",
+            out.errors
+        );
+        assert!(out.added.is_empty(), "没换成就不许记账");
+        assert!(
+            !h.xray
+                .calls()
+                .contains(&format!("add:vless-direct:{id}:{new}")),
+            "{:?}",
+            h.xray.calls()
+        );
+        assert!(
+            h.xray
+                .calls()
+                .contains(&format!("add:vless-residential:{id}:{new}")),
+            "另一个 inbound 照旧推进：{:?}",
+            h.xray.calls()
+        );
+    }
+
+    /// 审查意见②【必改】的回归：b-ui 或 xray 一重启 `applied` 就清空，全部健康 Reality
+    /// 用户都会重新走一遍 add 那一路。uuid 一个字节没变时必须**零写** —— 盲目「摘掉再加」
+    /// 会给每个人开一个「已摘出、还没加回」的窗口，那一步失败（inbound 正在重载、
+    /// 或事实④的 `handler not found`）就把一个本来好着的用户摘下线，
+    /// 要等 60 秒安全网才补回来，而旧实现在这个方向上零风险。
+    #[tokio::test]
+    async fn a_restart_does_not_touch_a_user_whose_uuid_has_not_changed() {
+        let h = harness().await;
+        let ctx = ctx_of(&h);
+        let (id, vid) = {
+            let s = h.store.read().await;
+            (s.users[0].user_id, s.users[0].credentials.vless_uuid)
+        };
+        // 第一轮：假内核里挂上这个用户
+        sync_users(&ctx, &h.shared, &BTreeSet::new()).await;
+
+        // 「b-ui 重启」：记账清空，内核状态不变
+        let restarted = Arc::new(Shared::new(
+            Box::new(h.xray.clone()),
+            Box::new(h.hy2.clone()),
+        ));
+        restarted.set_paths(&h.paths);
+        h.xray.clear_calls();
+        // 审查者那条序列的下半截，当陷阱布在这里：万一真发了 AddUser，它会撞「已存在」
+        // （真应答），于是走「摘掉再加」，而重加那次同样失败（inbound 正在重载）——
+        // 旧实现就是在这里把一个本来好着的用户摘出内核的。先读后写根本不发这次 AddUser，
+        // 所以这个陷阱必须一次都踩不到。
+        let add_key = format!("add:vless-direct:{id}:{vid}");
+        h.xray.with(|i| {
+            i.fail_on.insert(add_key.clone());
+            i.error_text
+                .insert(add_key, format!("User {id} already exists."));
+        });
+
+        let out = sync_users(&ctx, &restarted, &BTreeSet::new()).await;
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(out.added, vec![id], "读到内核里已经是对的 ⇒ 照样补上记账");
+        assert!(
+            h.xray.calls().is_empty(),
+            "uuid 没变就一个写请求都不许发：{:?}",
+            h.xray.calls()
+        );
+        assert_eq!(
+            h.xray.gets(),
+            vec![
+                format!("get:vless-direct:{id}"),
+                format!("get:vless-residential:{id}"),
+            ],
+            "只读，每个 inbound 各一次"
+        );
+        // 最要紧的一条断言：这个健康用户此刻还挂在内核上。旧实现走到这里时他已经被
+        // RemoveUser 摘出去、重加又失败，要等 60 秒安全网才补回来。
+        let mut mounted = None;
+        h.xray
+            .with(|i| mounted = i.users.get(&("vless-direct".to_string(), id)).copied());
+        assert_eq!(mounted, Some(vid), "uuid 没变的健康用户绝不许被摘出内核");
+    }
+
+    /// 轮换后鉴权快照重写：新 hy2 密码通过、旧密码被拒。判定走的是钩子与 http 鉴权
+    /// 共用的那一份 `auth_hook::decide`，所以这条就是真机上「旧密码还能连吗」的答案。
+    #[tokio::test]
+    async fn a_rotated_hy2_password_is_the_only_one_the_auth_snapshot_accepts() {
+        use crate::modules::panel::auth_hook::{decide, Decision};
+        let h = harness().await;
+        let ctx = ctx_of(&h);
+        let old_pw = h.store.read().await.users[0]
+            .credentials
+            .hy2_password
+            .clone();
+        sync_users(&ctx, &h.shared, &BTreeSet::new()).await;
+
+        h.store.update(|s| rotate(&mut s.users[0])).await.unwrap();
+        let user = h.store.read().await.users[0].clone();
+        let out = sync_users(&ctx, &h.shared, &BTreeSet::new()).await;
+        assert!(out.snapshot_written, "凭据变了必须重写鉴权快照");
+
+        let snap = crate::modules::panel::snapshot::read(&h.shared.snapshot_path());
+        assert_eq!(
+            decide(
+                &snap,
+                &format!("alice:{}", user.credentials.hy2_password),
+                t0()
+            ),
+            Decision::Allow {
+                user_id: user.user_id.to_string()
+            }
+        );
+        assert_eq!(
+            decide(&snap, &format!("alice:{old_pw}"), t0()),
+            Decision::Deny {
+                reason: "bad-password"
+            },
+            "旧密码必须当场被拒"
+        );
     }
 
     #[tokio::test]
@@ -1562,24 +2070,54 @@ mod tests {
         );
     }
 
+    /// 决策 D6：xray 重启会从 `xray-config.json` 把全部 clients（含被封的）读回来，
+    /// 所以记账要清空、差分要重放。重放的是**读**：配置里已经是对的 uuid 就零写
+    /// （审查意见②），落后的 uuid 才摘掉换新。
     #[tokio::test]
     async fn an_xray_restart_replays_the_whole_add_set() {
         let h = harness().await;
         let ctx = ctx_of(&h);
+        let id = h.store.read().await.users[0].user_id;
+        let vid = h.store.read().await.users[0].credentials.vless_uuid;
         h.host.with(|i| {
             i.unit_props
                 .insert(("xray.service".into(), "NRestarts".into()), "0".into());
         });
         sync_users(&ctx, &h.shared, &BTreeSet::new()).await;
         h.xray.clear_calls();
-        // 决策 D6：xray 重启会从 xray-config.json 把全部 clients（含被封的）读回来
         h.host.with(|i| {
             i.unit_props
                 .insert(("xray.service".into(), "NRestarts".into()), "1".into());
         });
         let out = sync_users(&ctx, &h.shared, &BTreeSet::new()).await;
         assert_eq!(out.added.len(), 1, "重启后必须重放一遍");
-        assert_eq!(h.xray.calls().len(), 2);
+        assert_eq!(h.xray.gets().len(), 2, "两个 inbound 各读一次");
+        assert!(
+            h.xray.calls().is_empty(),
+            "配置里的 uuid 已经是对的 ⇒ 不许摘挂一遍：{:?}",
+            h.xray.calls()
+        );
+
+        // 配置落后（`xray-config.json` 还是轮换前那份）⇒ 重放时把旧 uuid 换掉
+        h.xray.with(|i| {
+            i.users
+                .insert(("vless-direct".into(), id), Uuid::from_u128(1));
+        });
+        h.host.with(|i| {
+            i.unit_props
+                .insert(("xray.service".into(), "NRestarts".into()), "2".into());
+        });
+        h.xray.clear_calls();
+        let out2 = sync_users(&ctx, &h.shared, &BTreeSet::new()).await;
+        assert_eq!(out2.added, vec![id]);
+        assert_eq!(
+            h.xray.calls(),
+            vec![
+                format!("remove:vless-direct:{id}"),
+                format!("add:vless-direct:{id}:{vid}"),
+            ],
+            "只有落后的那个 inbound 要动"
+        );
     }
 
     #[tokio::test]
