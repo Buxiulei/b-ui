@@ -33,11 +33,11 @@ pub struct SlotSync {
     pub released: Vec<Slot>,
     /// 因此被重新分配的用户数
     pub reassigned: usize,
-    /// 手里那份订阅已经不能用、**必须重新获取订阅**的用户名（升序，见
+    /// 手里那份订阅已经不能用、**必须重新获取订阅**的用户，按后果分三组（见
     /// [`slots::resubscribe_impact`]）：HY2 住宅节点的端口或跳跃区间被这次写入改了。
     /// 在同一个临界区里按写入前后两份期望态算出 —— 调用方自己先 `store.read()` 再算
     /// 会拿到过期名单（两步之间可能插进另一次 add / assign / rebalance / remove）。
-    pub resubscribe: Vec<String>,
+    pub impact: slots::ResubscribeImpact,
 }
 
 /// **改住宅池并同步槽位的唯一入口**：在同一次 `Store::update_as` 里改组、同步槽位表、
@@ -48,8 +48,8 @@ pub struct SlotSync {
 /// 只改模式 / 关键字 / 优先级这类**不动池成员**的写入继续用
 /// `state::update_group`，不必经过这里。
 ///
-/// 返回的 [`SlotSync::resubscribe`] 是这次写入之后必须重新获取订阅的用户名，执行路径
-/// （目前只有 `upstream::remove`）要把它打给操作者。
+/// 返回的 [`SlotSync::impact`] 是这次写入之后必须重新获取订阅的用户（按后果分三组），
+/// 执行路径（目前只有 `upstream::remove`）要把它逐组打给操作者。
 pub async fn update_group_slots_as(
     store: &Store,
     bus: &EventBus,
@@ -69,7 +69,7 @@ pub async fn update_group_slots_as(
             f(g);
             out.released = slots::sync_slots(&mut s.residential);
             out.reassigned = slots::migrate_unassigned(s);
-            out.resubscribe = slots::resubscribe_impact(&before, s);
+            out.impact = slots::resubscribe_impact(&before, s);
         })
         .await?;
     bus.send(Event::StateChanged("residential"));
@@ -986,10 +986,15 @@ mod tests {
         );
         assert_eq!(sync.reassigned, 1, "只有那个槽的用户被重分配");
         assert_eq!(
-            sync.resubscribe,
-            vec!["u2".to_string(), "u3".to_string(), "u5".to_string()],
-            "名单与这次写入出自同一个临界区：u3 的槽被删（40002 → 40000），u2 / u5 的跳跃区间\
-             被重切（44000-46999 → 45500-50000）；槽 0 的 u1 / u4 旧区间仍是新区间的前缀"
+            sync.impact,
+            slots::ResubscribeImpact {
+                slot_removed: vec!["u3".to_string()],
+                slot_moved: vec![],
+                hop_resliced: vec!["u2".to_string(), "u5".to_string()],
+            },
+            "名单与这次写入出自同一个临界区，而且按后果分组：u3 的槽被删（40002 → 40000）\
+             = 组一，u2 / u5 的跳跃区间被重切（44000-46999 → 45500-50000）= 组三；\
+             槽 0 的 u1 / u4 旧区间仍是新区间的前缀，一组都不进"
         );
         let s = store.read().await;
         assert_eq!(slots::indices(&s.residential), vec![0, 1]);

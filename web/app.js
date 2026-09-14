@@ -812,19 +812,47 @@ function addResidentialUrl() {
     }).catch(e => { restore(); _resiErr(e.message || "请求失败"); });
 }
 
+// 删上游回包 port_changed 的三组：组名与后果是
+// crates/bui/src/modules/residential/upstream.rs 的 IMPACT_GROUPS 的逐字副本
+// （CLI / 面板 / 哨兵事件三处同一份口径），顺序也必须一致。
+const _RESI_IMPACT_GROUPS = [
+    ["slot_removed", "原槽位已删除、已换槽",
+        "旧端口不再通向他的槽：没人监听就连不上，被搬到 0 号的那个槽顶替了就从别人的出口 IP 出去"],
+    ["slot_moved", "槽位序号被搬到 0 号",
+        "端口下移，旧端口无人监听，连不上"],
+    ["hop_resliced", "端口跳跃区间被重切",
+        "端口没变、连得上，但旧区间里划给别的槽的那一段会从错误的出口 IP 出去"],
+];
+
+// 把回包的 port_changed 渲染成 `{ total, text }`。text 与哨兵事件那一行同构
+// （标题 + 逐组一句后果 + 用户名），三组都空时 total = 0、text = ""。
+function _resiImpact(pc) {
+    const obj = pc && typeof pc === "object" ? pc : {};
+    let total = 0;
+    const parts = [];
+    _RESI_IMPACT_GROUPS.forEach(([key, name, effect]) => {
+        const who = Array.isArray(obj[key]) ? obj[key] : [];
+        if (!who.length) return;
+        total += who.length;
+        parts.push(name + "（" + who.length + " 人，" + effect + "）：" + who.join("、"));
+    });
+    if (!total) return { total: 0, text: "" };
+    return {
+        total,
+        text: total + " 个用户手里那份订阅已不能照旧用，需要重新获取订阅：" + parts.join("；"),
+    };
+}
+
 function removeResidentialUrl(hostPort) {
     _resiClearErr();
     api("/residential/urls/" + hostPort, { method: "DELETE" }).then(r => {
         if (!r.success) { _resiErr(r.error || "移除失败"); return; }
-        // 回包的 resubscribe 是必须重新获取订阅的用户名（HY2 住宅端口 / 跳跃区间变了）。
         // 用户名只经 textContent 的 _resiErr 输出：toast 走 innerHTML，不喂用户数据
-        const who = Array.isArray(r.resubscribe) ? r.resubscribe : [];
+        const imp = _resiImpact(r.port_changed);
         _resiReload();
-        if (!who.length) { toast("节点已移除"); return; }
-        toast("节点已移除，" + who.length + " 个用户需重新获取订阅", true);
-        _resiErr("上游已移除。以下 " + who.length
-            + " 个用户的 HY2 住宅节点端口 / 跳跃区间已变化，必须重新获取订阅（否则该节点连不上）："
-            + who.join("、"));
+        if (!imp.total) { toast("节点已移除"); return; }
+        toast("节点已移除，" + imp.total + " 个用户需重新获取订阅", true);
+        _resiErr("上游已移除。" + imp.text + "（同一份名单也记在「系统状态」的「事件」卡里）");
     }).catch(e => _resiErr(e.message || "请求失败"));
 }
 
