@@ -116,7 +116,7 @@ URL 里的用户名**只用来查**，不跑 `validate_username`（与 `delete_u
 
 ## 8. 运维面与验收
 
-三条共同的底线：token 一律从 `state.json` 的 `users[].sub_token` 取（`python3` 解 JSON）；URL 经 `curl -K -` 的 **stdin** 传，绝不进 argv（末段是凭据，`ps` 会泄露，同一条规矩（凭据不进 argv））；取不到 token、`curl -f` 失败（≥400）或取回空 body 都直接判失败，不 SKIP、不拿空串的 sha 充数。
+三条共同的底线：token 一律从 `state.json` 的 `users[].sub_token` 取（`python3` 解 JSON）；URL 经 `curl -K -` 的 **stdin** 传，绝不进 argv（末段是凭据，`ps` 会泄露；凭据不进 argv 是同一条规矩）；取不到 token、`curl -f` 失败（≥400）或取回空 body 都直接判失败，不 SKIP、不拿空串的 sha 充数。
 
 - `scripts/m1-acceptance.sh` step7：取不到 token **报红**（`no "step7 <用户> 没有订阅 token"`）而不是 SKIP——建用户三条路径都自带 token、守护进程启动还会补齐，正常机器上取不到就是补齐坏了；订阅取不回来时解析出的住宅端口为空，与槽位端口比对不上，同样报红。
 - `scripts/ops/upgrade-drill.sh`：三个相位的订阅指纹按 token 取（用户名链接在任何没有活动宽限期的机器上都是 404，拿它取指纹会让三个相位记下同一个空串的 sha ⇒ 「订阅无漂移」假绿）。适用范围是升级前后两端都在 rc12 及以上：**每个相位**先把所有目标用户的 token 查一遍，任一用户没 token 就 `FATAL` 退 2，DONE 写 `verdict=FATAL reason=sub-token-missing:<相位>:<用户>`（after-upgrade 相位的日志还注明「升级已执行、回滚未执行」），这一相位一条订阅都不取、一条 `sub:` 指纹都不记——rc11 及更早的 state 没有 `sub_token`，缺 token 是前置条件不满足，不报成订阅漂移或取订阅失败，所以 rc11→rc12 这一跳不能用它演练。token 齐了之后，取回失败或空 body 当场记 `sub-fetch:<相位>:<用户>:<种类>`，并且**不记**那条 `sub:` 指纹（不给 `compare_keys` 留两个相同的值比出「无漂移」）。开头有 `command -v python3` 守卫（退 2）——没有 python3 时 `sub_token` 会一律空串，报出来的原因与真因不符。`scripts/tests/test-upgrade-drill.sh` 的 curl 桩只从 `-K -` 的 stdin 读 URL，并断言 argv 里没有 `/api/`。
