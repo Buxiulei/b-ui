@@ -2912,4 +2912,66 @@ mod tests {
         let r = probe_quick(&p, &upstream(2, 10), Duration::from_secs(3));
         assert!(!r.ok && r.auth_failed);
     }
+
+    /// 抓 `tracing` 输出的极小写入器：[`probe_quick_within`] 对 `JoinError` 只落日志
+    /// （结论、级别都不动），所以「原因有没有被丢掉」只能从日志里断言
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl LogCapture {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("日志缓冲锁")).into_owned()
+        }
+    }
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("日志缓冲锁").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// 探测任务本身异常（`spawn_blocking` 的 `JoinError`：探测器 panic / runtime 正在关）：
+    /// 结论只能是 [`Verdict::Unconfirmed`]（确实不知道），但**原因必须落日志**——两侧调用方的
+    /// 事件文案都只说「网关通但隧道无响应，或探测任务异常」，而 panic 会每
+    /// `sentinel::DEBOUNCE_SECS` 秒复发一次，日志里不留原因就无从下手（2026-09-14 审查第 4 条）。
+    /// 日志里指称上游只许用 `host:port`，不许带凭据。
+    #[tokio::test]
+    async fn a_panicking_probe_task_is_unconfirmed_and_logs_the_reason() {
+        let p = crate::modules::residential::proxy::FakeProber::new();
+        // 网关连不上那一步会调 on_tcp_fail：借它让阻塞任务炸在里面
+        p.with(|i| i.on_tcp_fail = Some(Box::new(|_| panic!("探测器炸了"))));
+        let prober: Arc<dyn Prober> = Arc::new(p);
+        let log = LogCapture::default();
+        let verdict = {
+            let _g = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(log.clone())
+                    .with_ansi(false)
+                    .finish(),
+            );
+            probe_quick_within(&prober, upstream(2, 10), Duration::from_secs(1)).await
+        };
+        assert_eq!(verdict, Verdict::Unconfirmed, "不知道就是不知道");
+        let text = log.text();
+        assert!(text.contains("带外快探的探测任务异常"), "{text}");
+        assert!(text.contains("探测器炸了"), "原因被丢掉了：{text}");
+        assert!(
+            text.contains("isp2.example.net:10007"),
+            "要点名上游：{text}"
+        );
+        assert!(!text.contains("pw1"), "日志不许带凭据：{text}");
+    }
 }
