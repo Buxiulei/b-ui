@@ -40,7 +40,7 @@
 | `legacy_sub_disabled: bool` | `User` | 这个用户的「用户名链接」是否已停用（轮换时置 `true`，此后即便宽限期还在也不认） |
 | `legacy_sub_until: Option<String>` | `SystemSettings` | 全局宽限期截止时刻（RFC3339）。`None` = 一概不认用户名链接 |
 
-`crates/bui-schema/src/sub.rs` 是唯一知道 token 形状的地方：`new_sub_token()`（生成）、`is_sub_token()`（严格判据：长度 32 且只含 `0-9a-f`）、`legacy_sub_deadline(now)`（`now + 7 天`，秒级 RFC3339）、`sub_urls(domain, token)`（四条地址，装机摘要与面板共用，免得两边各拼一遍）、`LEGACY_SUB_GRACE_DAYS`。
+`crates/bui-schema/src/sub.rs` 是唯一知道 token 形状的地方：`new_sub_token()`（生成）、`is_sub_token()`（严格判据：长度 32 且只含 `0-9a-f`）、`legacy_sub_deadline(now)`（`now + 7 天`，秒级 RFC3339）、`sub_urls(domain, token)`（四条地址；今天只有装机收尾摘要在用——`commands::install` 一处，面板那边是前端 `web/app.js` 的 `subPath(x, kind)` 按 `PanelUser.subToken` 自己拼的——服务端以后要给链接就走这一处，别再拼第二遍）、`LEGACY_SUB_GRACE_DAYS`。
 
 token 不是密码，不做 hash：它必须能原样发给用户，也必须能在响应体里给出（面板要显示可复制的链接）。它的保密性靠 128 bit 随机 + 文件 600 + 不进日志。
 
@@ -81,19 +81,23 @@ token 不是密码，不做 hash：它必须能原样发给用户，也必须能
 
 ## 6. 轮换
 
-`POST /api/users/{username}/rotate`（管理员鉴权内，请求体是空对象，面板「轮换」按钮）。四件事必须一起做，少一件就不叫轮换：
+`POST /api/users/{username}/rotate`（管理员鉴权内，请求体是空对象；面板配置弹窗里的「重置订阅链接与凭据」按钮，`rotateSub()` 先二次确认再发）。四件事必须一起做，少一件就不叫轮换：
 
 1. **换 token**（`sub_token = new_sub_token()`）——旧链接的路径段作废；
 2. **换 hy2 密码与 vless uuid**（`credentials`）——泄露的链接里同时有这两样，只换 token 等于没换；
 3. **停用这个用户的用户名链接**（`legacy_sub_disabled = true`）——否则全局宽限期没到时，旧的用户名链接照样能取到**新**凭据；
-4. **踢掉他已经建立的 hy2 会话**：两条鉴权路径都只在**握手时**过 `auth_hook::decide`，xray 的 RemoveUser/AddUser 也只影响新握手，所以不踢的话拿着旧凭据的那一方照旧有流量，直到连接自己断。先发 `StateChanged("users")`（两条鉴权路径据此刷新、鉴权快照重写）再踢，被踢的客户端拿旧密码重连时已经会被拒；踢是 best-effort，失败只记 warn（新凭据已经生效，踢不动只是旧会话多活一会儿）。
+4. **踢掉他已经建立的 hy2 会话**：两条鉴权路径都只在**握手时**过 `auth_hook::decide`，xray 的 RemoveUser/AddUser 也只影响新握手，所以不踢的话拿着旧凭据的那一方照旧有流量，直到连接自己断。先发 `StateChanged("users")`（两条鉴权路径据此刷新、鉴权快照重写）再按 `traffic::stats_ports` 对这一刻期望态里的每个 hy2 实例踢一次，被踢的客户端拿旧密码重连时已经会被拒；踢是 best-effort，失败只记 warn（新凭据已经生效，踢不动只是旧会话多活一会儿）。
 
 回包直接给出新的 `subToken` / `password` / `uuid`（与 `create_user` 同口径：这条路由在 `require_admin` 里面，面板本来就在显示每个用户的密码与 uuid）。
 
 两个边界：
 
-- **uuid 换了必须让 xray 当场生效**：`sync_users` 走「先 RemoveUser 再 AddUser」，且不把 xray 的 `already exists` 当成已达目标——`render::xray::structural_hash` 剥掉了 clients，对账**不会**因为换 uuid 重启 xray，靠重启兜底等于轮换对 Reality 用户空转（实现细节见 `panel::xray`）；
+- **uuid 换了必须让 xray 当场生效**：`render::xray::structural_hash` 剥掉了 clients，对账**不会**因为换 uuid 重启 xray，靠重启兜底等于轮换对 Reality 用户空转。判据是**读内核**（`panel::users::sync_users` 先 `XrayApi::inbound_user_uuid`，即 `GetInboundUsers`，读回这个 email 当前挂的 uuid）：挂的就是期望值 ⇒ 一个写请求都不发；挂着别的 uuid ⇒ 先 RemoveUser 腾位置再 AddUser；读不到（xray 掉线 / inbound 没起 / 内核老到没这个 RPC）才退回只看错误文案的老路——`AddUser` 报 `already exists` 一律按「位置被占」处理（`email_taken`），**绝不**当成已达目标（吃下那条错误就等于把旧 uuid 记成新 uuid）。`panel::xray` 只提供 gRPC 的那一面；
 - **Reality 那条已建立的连接没有踢的手段**（xray 没有 kick），只能等它自己断。
+
+面板侧（`web/app.js` 的 `rotateSub()`，回归锁在 `panel::assets` 的测试里）：成功后先清空 `currentShowUser` 再刷新用户列表、按新 token 重画弹窗，这段空窗里复制 / 下载只会提示「请先选择用户」，不会递出作废的链接；列表刷新失败时把 `currentShowUser` 还原，交给 5 秒一轮的 `syncOpenConfig` 按新值把弹窗拉回来，并提示「弹窗里的链接稍后自动更新」。
+
+**本次上线不轮换暴露账号**（主理人 2026-09-14 裁决）：用户名出现在公开 git 历史里的存量账号，这次不对它们调用轮换；轮换端点与踢会话照常上线，功能保留，只是这次不用。收口靠 token 化 + 宽限期：宽限期到期（或 `bui set legacy-sub off`）之后「域名 + 用户名」不再能取到订阅。接受的风险要写清：这些账号的 hy2 密码与 vless uuid 保持不变，宽限期内用户名链接仍能取到它们的**现行**凭据，历史上若已被人取走，在对该用户做一次「重置订阅链接与凭据」之前一直有效。
 
 URL 里的用户名**只用来查**，不跑 `validate_username`（与 `delete_user` 同口径）：v3 导入原样照抄 v3 的用户名，存量里可能有不合今天规则的名字——卡在校验上会让这种用户能改、能删、能取订阅却永远轮换不了，而他恰恰是最该轮换的那个。
 
@@ -108,13 +112,16 @@ URL 里的用户名**只用来查**，不跑 `validate_username`（与 `delete_u
 | Caddy 的另外两条路 | `log_skip` 只挡站点路由树里的**访问**日志，挡不住：(a) `reverse_proxy` 连不上上游时的**错误**日志（`http.log.error.*`）落到 **default** logger——面板的上游就是本机 `:admin_port`，`b-ui` 每次重启/升级/watchdog 拉起的窗口里客户端拉订阅都会 502，一条一个 token；(b) `:80` 的 HTTP→HTTPS 跳转服务器不走站点路由树，它的访问日志与 308 的 `Location` 头各带一份末段。所以 **default 与站点两个 logger 都挂 `format filter`**，`request>uri` 与 `resp_headers>Location` 两个字段都过同一条 `regexp`（`(?i)(/api/(?:sub\|subscription\|clash\|nodes)/)[^/?]+` → `${1}***`）。default logger 的 `wrap` 必须留 **json**：哨兵按 JSON 解 Caddy 的证书失败行，换成 console 那条告警会静默失效 |
 | `backfill` / 轮换 | 只写个数、用户名与动作，不写 token 与密码 |
 
-面板与客户端侧：`PanelUser` 投影带 `subToken`，前端据此拼四条链接（页面上本来就显示密码与 uuid）；`bui-c` 的 `error::redact_url` 早有同类实现，错误文案里的 URL 不带末段。
+面板与客户端侧：`PanelUser` 投影带 `subToken`，前端 `subPath(x, kind)` 据此拼链接（页面上本来就显示密码与 uuid）；`bui-c` 的 `error::redact_url` 早有同类实现，错误文案里的 URL 不带末段。
 
 ## 8. 运维面与验收
 
-- `scripts/m1-acceptance.sh` step7：先从 `state.json` 取该用户的 `sub_token` 再拼 `/api/sub/<token>`，URL 经 `curl -K -` 的 **stdin** 传（末段是凭据，`ps` 会泄露 argv）；取不到 token 就 SKIP 而不是报红。
-- `scripts/ops/upgrade-drill.sh`：三个相位的订阅指纹同样按 token 取（用户名链接在任何没有活动宽限期的机器上都是 404，拿它取指纹会让三个相位记下同一个空串的 sha ⇒ 「订阅无漂移」假绿）；取不到一律记 `missing` 而不是空串的 sha，基线相位一有 `missing` 就判失败。
+三条共同的底线：token 一律从 `state.json` 的 `users[].sub_token` 取（`python3` 解 JSON）；URL 经 `curl -K -` 的 **stdin** 传，绝不进 argv（末段是凭据，`ps` 会泄露，与 m1 step6、m3 同一写法）；取不到 token、`curl -f` 失败（非 2xx）或取回空 body 都直接判失败，不 SKIP、不拿空串的 sha 充数。
+
+- `scripts/m1-acceptance.sh` step7：取不到 token **报红**（`no "step7 <用户> 没有订阅 token"`）而不是 SKIP——建用户三条路径都自带 token、守护进程启动还会补齐，正常机器上取不到就是补齐坏了；订阅取不回来时解析出的住宅端口为空，与槽位端口比对不上，同样报红。
+- `scripts/ops/upgrade-drill.sh`：三个相位的订阅指纹按 token 取（用户名链接在任何没有活动宽限期的机器上都是 404，拿它取指纹会让三个相位记下同一个空串的 sha ⇒ 「订阅无漂移」假绿）。**每个相位**当场判失败：没 token 记 `sub-token:<相位>:<用户>`，取回失败或空 body 记 `sub-fetch:<相位>:<用户>:<种类>`，这两种情况都**不记**那条 `sub:` 指纹（不给 `compare_keys` 留两个相同的值比出「无漂移」）。开头有 `command -v python3` 守卫（退 2）——没有 python3 时 `sub_token` 会一律空串，报出来的原因与真因不符。`scripts/tests/test-upgrade-drill.sh` 的 curl 桩只从 `-K -` 的 stdin 读 URL，并断言 argv 里没有 `/api/`。
 - 文档：`README.md`「订阅链接与 token」、`CLAUDE.md` 的 Subscriptions 小节、`docs/HANDOVER-bui-c.md` §6（客户端侧的口径与「轮换后必须人工重新导入」）。
+- **客户端侧的文档注释按交接约定不改**：`crates/bui-c/src/source.rs`（模块头、`/api/nodes` 载荷与来源枚举的注释）、`crates/bui-c/src/cli.rs`（面板来源的注释写 `/api/nodes/<user>`，URL 脱敏那条注释写 `<用户名>`），以及 `crates/bui/src/modules/panel/api_public.rs` 里 `NodesPayload` 的文档注释（`/api/nodes/<user>`），都是 token 化之前的口径；那一段的真实语义是「末段 = 该用户的订阅 token（宽限期内也可以是用户名）」，以本文与 HANDOVER §6 为准。`bui-c` 归客户端会话，改注释随它下一次改动一起走。
 
 ## 9. 已知限制
 

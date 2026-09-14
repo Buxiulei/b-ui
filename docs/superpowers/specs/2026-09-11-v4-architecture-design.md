@@ -227,15 +227,32 @@ tonic 客户端，proto 从 Xray-core `v26.3.27` vendor 进仓（以仓库根为
 幂等、零变更不写盘、日志只写个数不写 token），补出过 token 且截止为 `None` 时设成「启动时刻 + 7 天」。
 运维提前收口：`bui set legacy-sub off`（置 `None`）或 `bui set legacy-sub <RFC3339>`；`bui status` 有「旧订阅链接」一行。
 
-**轮换**：`POST /api/users/{name}/rotate`（管理员鉴权内，body 空对象）同时换 `sub_token` / `hy2_password` /
-`vless_uuid`，把 `legacy_sub_disabled` 置 true，回包给出新 token 与新凭据（与 `create_user` 同口径）。
-uuid 变化时 `sync_users` 必须**先 RemoveUser 再 AddUser**，且不把 xray 的「already exists」当成已达目标 ——
-否则新 uuid 要等 xray 重启才生效（`render::xray::structural_hash` 剥掉了 clients，对账不会重启 xray），
-轮换对 Reality 用户就是空转。面板投影 `PanelUser` 带 `subToken`，前端据此拼链接。
+**轮换**：`POST /api/users/{name}/rotate`（管理员鉴权内，body 空对象；面板配置弹窗里的「重置订阅链接与凭据」，
+二次确认）四件事一起做：换 `sub_token`、换 `hy2_password` / `vless_uuid`、把 `legacy_sub_disabled` 置 true
+（全局宽限期没到也立刻停用他的用户名链接）、踢掉他已建立的 hy2 会话（两条鉴权路径都只在握手时鉴权；
+先发 `StateChanged("users")` 再按 `traffic::stats_ports` 逐个 hy2 实例 kick，best-effort，失败只记 warn）。
+回包给出新 token 与新凭据（与 `create_user` 同口径）。uuid 变化必须让 xray 当场生效
+（`render::xray::structural_hash` 剥掉了 clients，对账不会因此重启 xray）：`panel::users::sync_users`
+先经 `GetInboundUsers`（`XrayApi::inbound_user_uuid`）**读内核**当前挂的 uuid——等于期望值就不发写请求，
+挂着别的就先 RemoveUser 再 AddUser；读不到才退回看错误文案，AddUser 的「already exists」一律按位置被占处理，
+**绝不**当成已达目标。Reality 已建立的连接没有踢的手段（xray 无 kick），只能等它自己断。
+面板投影 `PanelUser` 带 `subToken`，四条链接由前端 `web/app.js` 的 `subPath(x, kind)` 拼；
+服务端侧拼链接的只有 `bui_schema::sub::sub_urls`（今天只有装机收尾摘要调它）。
 
-**日志**：`bui` 的 `redact.rs` 把 `/api/(sub|subscription|clash|nodes)/<段>` 的末段脱敏（客户端侧
-`bui-c::error::redact_url` 早有同类实现）；渲染的 Caddyfile 面板站点块里有 `log { output stderr }`，
-完整 URI 会进 journald ⇒ 这四条路径加 Caddy 的 `log_skip`（path 匹配器），其余请求照旧记日志。
+**日志**（末段一个字都不进日志）：
+- `bui` 自己：`redact::sub_path` 把 `/api/(sub|subscription|clash|nodes)/<段>` 的末段换成 `***`（前缀不分大小写，
+  一行多条全换），`redact::line` 先过它；`api::router` 的 `TraceLayer` 不用 `DefaultMakeSpan`（它把整条 URI
+  记进 span，`--log debug` 一开就进 journald），改成自造 `debug_span!("request", method, uri = %redact::sub_path(..), version)`；
+  哨兵事件的 `sample` 也经 `redact::line`（匹配之后再脱敏）。客户端侧 `bui-c::error::redact_url` 早有同类实现。
+- Caddy（`modules::core_files::caddyfile_text`）：**default 与站点两个 logger 都挂 `format filter`**，
+  `request>uri` 与 `resp_headers>Location` 两个字段都过同一条 `regexp`
+  （`(?i)(/api/(?:sub|subscription|clash|nodes)/)[^/?]+` → `${1}***`）；站点块里另有
+  `@sub path /api/sub/* /api/subscription/* /api/clash/* /api/nodes/*` + `log_skip @sub`，**叠加**在掩码之上，
+  让这四条路径的访问日志整条不记，其余请求照旧。只加 `log_skip` 不够：它只挡站点路由树里的访问日志，
+  挡不住 (a) `reverse_proxy` 连不上上游（`b-ui` 重启 / 升级 / watchdog 拉起的窗口）时落进 **default** logger 的
+  错误日志 `http.log.error.*`，(b) `:80` HTTP→HTTPS 跳转服务器（不走站点路由树）的访问日志与 308 的 `Location`。
+  default logger 的 `wrap` 必须留 **json**（哨兵按 JSON 解 Caddy 的证书失败行，换成 console 那条告警会静默失效），
+  站点 logger 照旧 console。
 
 **不做**：不改 `portal_auth.tokens`（面板登录 token 的空壳，与订阅无关）；不重写 git 历史；
 不动 `keywords.rs` 里的第三方域名（住宅分流功能必需）。

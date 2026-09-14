@@ -29,7 +29,7 @@
 - 🔍 **根因**：伪装值在 4 处不一致——`masquerade.json` / xray `vless-direct` / xray `vless-residential` / 订阅下发
 - 🔧 **Bug A**：`server.js` 伪装 handler 用 `.find()` 只改第一个 reality inbound，v3.5 双 inbound 架构下 `vless-residential` 永远停在旧伪装域名 → 改 `.filter()` 遍历全部 reality inbound
 - 🔧 **Bug B**：三个订阅生成器 `user.sni || cfg.sni` 优先级反了，`user.sni` 是建用户时固化的旧拷贝、改伪装从不回写 → 翻转为 `cfg.sni || user.sni`，sni 以服务端实时 xray 配置为唯一可信源
-- ✅ 本地沙箱 + bwg-temp 端到端实测：四节点全通（Reality 180/167ms、HY2 隧道 200/204），改伪装即时对所有用户订阅生效
+- ✅ 本地沙箱 + 临时测试机端到端实测：四节点全通（Reality 180/167ms、HY2 隧道 200/204），改伪装即时对所有用户订阅生效
 - ⚠️ 改伪装后该机用户需重拉一次订阅（Reality sni 变更；HY2 sni=证书域不受影响）
 
 ### v3.5.12 — Web 面板苹果设计风格重做
@@ -331,13 +331,13 @@ sing-box 中继 (127.0.0.1:2080)
 
 - 末段是每个用户的**随机订阅 token**（32 位小写十六进制，建用户时生成）：
   `https://panel.example.com/api/sub/0123456789abcdef0123456789abcdef`。
-  面板用户列表里可以复制，装机收尾也会打印第一个用户的三条地址。
+  面板里点开该用户的配置弹窗可以复制，装机收尾也会打印第一个用户的三条地址。
 - **旧的「用户名链接」**（v3 的 `/api/sub/<用户名>` 形状）只在全局宽限期内还认：
   全新装机不设宽限期，一开始就只认 token；从 v3 导入时给 **7 天**，让现有订阅者有时间重拉。
   `sudo bui status` 有「旧订阅链接」一行（已停用 / 还剩多久 / 已过期）；
   `sudo bui set legacy-sub off` 立刻停用全部用户名链接，
   `sudo bui set legacy-sub 2026-09-21T00:00:00Z` 改期。
-- **重置（怀疑链接泄露时）**：面板里对该用户「轮换凭据」（`POST /api/users/<用户名>/rotate`）
+- **重置（怀疑链接泄露时）**：面板配置弹窗里的「重置订阅链接与凭据」（`POST /api/users/<用户名>/rotate`）
   ——同时换订阅 token、HY2 密码与 VLESS UUID，并立刻停用他的用户名链接。
   旧链接与旧凭据当即失效，**该用户必须重新导入一次订阅**；
   已部署 `bui-c` 的机器不会自愈，要人工重新导入（见 [docs/HANDOVER-bui-c.md](docs/HANDOVER-bui-c.md) §6）。

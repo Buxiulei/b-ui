@@ -116,8 +116,8 @@
 ## 6. 服务端侧与客户端相关的接口（改动需同步）
 
 - `/api/nodes/<token>`（公开）：节点集合 + 分流规则，`bui-schema::nodes::nodes_for` 与 `SplitRules` 直接序列化；住宅 HY2 节点端口按用户所在槽位（IP 池，spec §5.6）——`40000 + 槽号`，跳跃区间等分。客户端不需要知道槽位概念，只按载荷连。
-- **路径末段 2026-09-14 起是随机订阅 token，不再是用户名**（spec §4.5）：32 位小写十六进制，面板用户列表里复制，`/api/sub|subscription|clash|nodes` 四条同一口径。旧的用户名链接只在服务端的全局宽限期内还认（全新装机没有宽限期；v3 导入给 7 天），过后一律 404 `{"error":"User not found"}` —— 与「查无此人」同一个回应，客户端**分辨不出**是链接过期还是用户被删，错误文案不要写成「用户不存在」。所以面板给出的导入链接、`import --panel` 记下的 `base_url` + 末段都应按 token 存。
-- **轮换凭据（面板「轮换」/ `POST /api/users/<用户名>/rotate`）会同时换订阅 token、HY2 密码与 VLESS UUID**：已部署的 `bui-c` 手里的节点凭据当场失效，`bui-c.timer` 每分钟一次 `check` 会一直判失败、按退避不停重启 sing-box，而更新源（面板 `/api/nodes/<旧 token>`）也 404 ⇒ **无法自愈，必须人工重新导入一次**（面板复制新链接 → `bui-c import --panel … ` 或菜单 [3]）。运维在轮换某个用户前要先知道他有没有 Linux 客户端。
+- **路径末段 2026-09-14 起是随机订阅 token，不再是用户名**（spec §4.5）：32 位小写十六进制，面板里点开该用户的配置弹窗复制，`/api/sub|subscription|clash|nodes` 四条同一口径。旧的用户名链接只在服务端的全局宽限期内还认（全新装机没有宽限期；v3 导入给 7 天），过后一律 404 `{"error":"User not found"}` —— 与「查无此人」同一个回应，客户端**分辨不出**是链接过期还是用户被删，错误文案不要写成「用户不存在」。所以面板给出的导入链接、`import --panel` 记下的 `base_url` + 末段都应按 token 存。
+- **轮换凭据（面板「重置订阅链接与凭据」/ `POST /api/users/<用户名>/rotate`）会同时换订阅 token、HY2 密码与 VLESS UUID**：已部署的 `bui-c` 手里的节点凭据当场失效，`bui-c.timer` 每分钟一次 `check` 会一直判失败、按退避不停重启 sing-box，而更新源（面板 `/api/nodes/<旧 token>`）也 404 ⇒ **无法自愈，必须人工重新导入一次**（面板复制新链接 → `bui-c import --panel … ` 或菜单 [3]）。运维在轮换某个用户前要先知道他有没有 Linux 客户端。
 - `/packages/*`：由守护进程按 manifest 缓存分发（`client_sing_box` 是客户端目标版本）。
 - 订阅（`/api/subscription/<token>`）与 `bui-c` 渲染共用 `render::client`，改一处两边生效；改 TUN 模板要考虑 sing-box 1.12–1.14 三版兼容（CI 有三版 `sing-box check` 矩阵）。
 - 客户端只把 **https 且 `/api/nodes/<末段>` 成功返回合法载荷** 的面板记为自更新来源；v3 面板的 `/api/nodes` 回 401/404 时客户端回退订阅导入，不记面板。改 `/api/nodes` 的鉴权或状态码要考虑这条回退。
