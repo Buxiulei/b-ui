@@ -3,12 +3,14 @@
 //!
 //! 它不是 `#[cfg(test)]`——未来的集成测试（`tests/`）也要能拿到同一套 fake。
 
+use crate::lock::LockGuard;
 use crate::net::{Download, Net, Probe, ProbeError, Via};
 use crate::sys::{Output, Sys};
 use crate::{Error, Result};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 use time::macros::datetime;
@@ -18,7 +20,9 @@ use time::macros::datetime;
 #[derive(Debug)]
 pub struct FakeSys {
     files: RefCell<BTreeMap<PathBuf, (Vec<u8>, u32)>>,
-    calls: RefCell<Vec<String>>,
+    /// 调用流水。`Rc`：拿到的 [`LockGuard`](crate::lock::LockGuard) 在 Drop 时要往这里记
+    /// `unlock`，而它活得可以比这次借用更久（spec §0.2 R2）。
+    calls: Rc<RefCell<Vec<String>>>,
     replies: RefCell<BTreeMap<String, Output>>,
     envs: RefCell<BTreeMap<String, String>>,
     now: RefCell<time::OffsetDateTime>,
@@ -33,13 +37,20 @@ pub struct FakeSys {
     listening: RefCell<BTreeSet<u16>>,
     /// [`Sys::resolve`] 的预置结果：`Ok(毫秒)` 是用时，`Err(())` 是解析失败；没登记的域名解析失败。
     resolves: RefCell<BTreeMap<String, std::result::Result<u64, ()>>>,
+    /// 还要有几次拿锁拿不到（[`FakeSys::lock_busy`]）；`u32::MAX` 表示一直被占。
+    lock_busy: Cell<u32>,
+    /// 本进程已经持着锁：真 flock 按「打开的文件」计，同一进程再开一次再锁也拿不到，
+    /// fake 照做，嵌套拿锁的写法在测试里就会等满 15 秒然后失败。
+    lock_held: Rc<Cell<bool>>,
+    /// 下一次拿到锁之前落盘的文件（[`FakeSys::stage_on_lock`]）。
+    on_lock: RefCell<Vec<(PathBuf, Vec<u8>)>>,
 }
 
 impl Default for FakeSys {
     fn default() -> Self {
         Self {
             files: RefCell::default(),
-            calls: RefCell::default(),
+            calls: Rc::default(),
             replies: RefCell::default(),
             envs: RefCell::default(),
             now: RefCell::new(datetime!(2026-09-11 00:00:00 UTC)),
@@ -49,6 +60,9 @@ impl Default for FakeSys {
             written: RefCell::default(),
             listening: RefCell::default(),
             resolves: RefCell::default(),
+            lock_busy: Cell::new(0),
+            lock_held: Rc::default(),
+            on_lock: RefCell::default(),
         }
     }
 }
@@ -160,6 +174,20 @@ impl FakeSys {
     pub fn set_resolve(&self, host: &str, r: std::result::Result<u64, ()>) {
         self.resolves.borrow_mut().insert(host.to_string(), r);
     }
+    /// 接下来 `n` 次拿锁都拿不到（别的 bui-c 正持着）；`u32::MAX` 表示一直被占。
+    pub fn lock_busy(&self, n: u32) {
+        self.lock_busy.set(n);
+    }
+    /// 往调用流水里记一笔非命令的事件（测试用的提示器记「ask …」，好和 lock / unlock 排先后）。
+    pub fn mark(&self, s: String) {
+        self.calls.borrow_mut().push(s);
+    }
+    /// 下一次拿到锁之前把这份文件写进去：模拟另一个会话在我们探测之后、拿锁之前改过它。
+    pub fn stage_on_lock(&self, path: &str, data: &str) {
+        self.on_lock
+            .borrow_mut()
+            .push((PathBuf::from(path), data.as_bytes().to_vec()));
+    }
 }
 
 impl Sys for FakeSys {
@@ -265,6 +293,30 @@ impl Sys for FakeSys {
             Some(Ok(_)) => Err(Error::msg(format!("{host} 解析超时"))),
             _ => Err(Error::msg(format!("{host} 解析不到地址"))),
         }
+    }
+    /// 前 `lock_busy` 次拿不到；本进程已经持着锁时也拿不到（与真 flock 一样）。拿到记 `lock`，
+    /// 放锁记 `unlock`；拿到之前先落下 [`FakeSys::stage_on_lock`] 登记的文件。
+    fn try_lock(&self, _path: &Path) -> Result<Option<LockGuard>> {
+        let busy = self.lock_busy.get();
+        if busy > 0 {
+            if busy != u32::MAX {
+                self.lock_busy.set(busy - 1);
+            }
+            return Ok(None);
+        }
+        if self.lock_held.get() {
+            return Ok(None);
+        }
+        for (path, data) in self.on_lock.borrow_mut().drain(..) {
+            self.files.borrow_mut().insert(path, (data, 0o600));
+        }
+        self.lock_held.set(true);
+        self.calls.borrow_mut().push("lock".to_string());
+        let (calls, held) = (Rc::clone(&self.calls), Rc::clone(&self.lock_held));
+        Ok(Some(LockGuard::new(Box::new(move || {
+            calls.borrow_mut().push("unlock".to_string());
+            held.set(false);
+        }))))
     }
 }
 
@@ -578,6 +630,38 @@ mod tests {
                 .count(),
             4,
             "每次解析都记进流水"
+        );
+    }
+
+    #[test]
+    fn fake_lock_records_lock_and_unlock_and_lands_staged_files_first() {
+        let s = FakeSys::new();
+        let lock = Path::new("/run/bui-c.lock");
+        s.put("/opt/bui-c/profiles.json", "mine");
+        s.stage_on_lock("/opt/bui-c/profiles.json", "theirs");
+        assert_eq!(
+            s.get("/opt/bui-c/profiles.json").unwrap(),
+            "mine",
+            "拿锁前不落"
+        );
+        s.lock_busy(1);
+        assert!(s.try_lock(lock).unwrap().is_none());
+        assert_eq!(
+            s.get("/opt/bui-c/profiles.json").unwrap(),
+            "mine",
+            "没拿到也不落"
+        );
+        let g = s.try_lock(lock).unwrap().expect("第二次拿得到");
+        assert_eq!(s.get("/opt/bui-c/profiles.json").unwrap(), "theirs");
+        assert!(s.try_lock(lock).unwrap().is_none(), "持着锁再拿就拿不到");
+        s.mark("inside".to_string());
+        drop(g);
+        assert_eq!(s.calls(), vec!["lock", "inside", "unlock"]);
+        drop(s.try_lock(lock).unwrap().expect("放了就又拿得到"));
+        assert_eq!(
+            s.get("/opt/bui-c/profiles.json").unwrap(),
+            "theirs",
+            "只落一次"
         );
     }
 

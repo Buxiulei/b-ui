@@ -166,7 +166,9 @@ pub struct Summary {
 /// （spec §0.2 R2、R13）。
 pub trait Hooks {
     fn event(&mut self, e: Event);
-    fn repair(&mut self) -> Result<Verdict>;
+    /// 修一次。真的重启了（返回 [`Verdict::Restarted`]）就要在**同一把锁里**调 `wait_ready`
+    /// 等就绪（TUN 等接口、SOCKS 等本地端口），再放锁（spec §0.2 R2、R11）；`run` 自己不再等。
+    fn repair(&mut self, wait_ready: &mut dyn FnMut()) -> Result<Verdict>;
 }
 
 /// 出口类型（spec §6.2）。
@@ -200,6 +202,21 @@ pub struct Egress {
     /// 只有 ippure 给风险分（0–100）。
     pub score: Option<u8>,
     pub source: &'static str,
+}
+
+/// 重启后等就绪，先睡再查：TUN 等接口（最多 5 秒），SOCKS 等本地端口（最多 3 秒）。
+/// [`Hooks::repair`] 在修复的锁里调它（经 `run` 递过去的闭包）。
+pub fn wait_ready<S: Sys>(sys: &S, paths: &Paths, prof: &Profiles) {
+    if prof.mode == Mode::Tun {
+        Engine::new(sys, paths).wait_tun_ready();
+        return;
+    }
+    for _ in 0..SOCKS_WAIT_STEPS {
+        sys.sleep(SOCKS_WAIT_STEP);
+        if systemd::is_active(sys, UNIT_MAIN) && sys.tcp_listening(prof.socks_port) {
+            return;
+        }
+    }
 }
 
 /// ip-api 按地址查（IPv6 出口的归属），字段与 [`IPAPI_URL`] 相同。
@@ -332,9 +349,6 @@ impl<S: Sys, N: Net> Runner<'_, '_, S, N> {
             self.line(Mark::Fail, format!("{UNIT_MAIN} 没在运行"));
             repaired = true;
             let restarted = self.repair();
-            if restarted == Some(true) {
-                self.wait_ready();
-            }
             let up = systemd::is_active(self.sys, UNIT_MAIN);
             match (restarted, up) {
                 (Some(true), true) => self.cont("已重启，现在在运行"),
@@ -359,7 +373,6 @@ impl<S: Sys, N: Net> Runner<'_, '_, S, N> {
             if let Some(restarted) = self.repair() {
                 if restarted {
                     self.cont(format!("已重启 {UNIT_MAIN}，再试一次…"));
-                    self.wait_ready();
                 } else {
                     self.cont("再试一次…");
                 }
@@ -406,10 +419,12 @@ impl<S: Sys, N: Net> Runner<'_, '_, S, N> {
         self.v6_row();
     }
 
-    /// 修一次：`Some(true)` 重启过，`Some(false)` 没重启（再探测时已经好了），`None` 修复失败
-    /// （原因打成续行，不重查）。
+    /// 修一次：`Some(true)` 重启过（就绪已经在修复的锁里等过了），`Some(false)` 没重启，`None`
+    /// 修复失败（原因打成续行，不重查）。
     fn repair(&mut self) -> Option<bool> {
-        match self.hooks.repair() {
+        let (sys, paths, prof) = (self.sys, self.paths, self.prof);
+        let mut wait = || wait_ready(sys, paths, prof);
+        match self.hooks.repair(&mut wait) {
             Ok(Verdict::Restarted { .. }) => Some(true),
             Ok(_) => Some(false),
             Err(e) => {
@@ -428,22 +443,6 @@ impl<S: Sys, N: Net> Runner<'_, '_, S, N> {
             return false;
         }
         true
-    }
-
-    /// 重启后等就绪，先睡再查：TUN 等接口（最多 5 秒），SOCKS 等本地端口（最多 3 秒）。
-    fn wait_ready(&self) {
-        if self.tun {
-            Engine::new(self.sys, self.paths).wait_tun_ready();
-            return;
-        }
-        for _ in 0..SOCKS_WAIT_STEPS {
-            self.sys.sleep(SOCKS_WAIT_STEP);
-            if systemd::is_active(self.sys, UNIT_MAIN)
-                && self.sys.tcp_listening(self.prof.socks_port)
-            {
-                return;
-            }
-        }
     }
 
     fn wait_s(&self) -> u64 {
@@ -1293,6 +1292,7 @@ pub(crate) mod sample {
         Verdict::Restarted {
             failures: Vec::new(),
             next_backoff_min: 1,
+            tun_ready: None,
         }
     }
 
@@ -1332,7 +1332,8 @@ pub(crate) mod sample {
         s.listen(8080);
     }
 
-    /// 事件录音机：记下全部事件与修复次数。修复默认报「已重启」但什么都不改。
+    /// 事件录音机：记下全部事件与修复次数。修复默认报「已重启」但什么都不改；报了已重启就照
+    /// 约定等一次就绪（与 `cli::MenuHooks` 一样）。
     pub struct Recorder<'a> {
         pub events: Vec<Event>,
         pub repairs: u32,
@@ -1390,9 +1391,13 @@ pub(crate) mod sample {
         fn event(&mut self, e: Event) {
             self.events.push(e);
         }
-        fn repair(&mut self) -> Result<Verdict> {
+        fn repair(&mut self, wait_ready: &mut dyn FnMut()) -> Result<Verdict> {
             self.repairs += 1;
-            (self.on_repair)()
+            let v = (self.on_repair)();
+            if matches!(v, Ok(Verdict::Restarted { .. })) {
+                wait_ready();
+            }
+            v
         }
     }
 
@@ -2509,6 +2514,9 @@ mod tests {
         }
         fn resolve(&self, host: &str, timeout: Duration) -> Result<Duration> {
             self.sys.resolve(host, timeout)
+        }
+        fn try_lock(&self, path: &std::path::Path) -> Result<Option<crate::lock::LockGuard>> {
+            self.sys.try_lock(path)
         }
     }
 

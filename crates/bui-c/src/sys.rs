@@ -49,6 +49,21 @@ pub trait Sys {
     /// 用本机的解析器解析 `host`，返回用时；最多等 `timeout`。只给连接检查 SOCKS 模式的
     /// 「DNS」一行用，巡检路径不调用（spec §0.2 R3、R13）。
     fn resolve(&self, host: &str, timeout: Duration) -> Result<Duration>;
+    /// 试一次进程锁（不等）。`Ok(None)` = 别人正持着；拿到的 [`LockGuard`] 扔掉就放锁。
+    /// 要等就经 [`crate::lock::acquire`]，别直接循环调它（spec §8.3）。
+    fn try_lock(&self, path: &Path) -> Result<Option<crate::lock::LockGuard>>;
+}
+
+/// [`RealSys::write`] 的临时文件名：`<目录>/.<文件名>.<pid>.tmp`。带 pid，两个进程同时写同一个
+/// 文件（菜单与巡检都会写 `runtime.json`）时不会共用一个临时文件（spec §0.2 R10）；
+/// `Engine` 清残留时按 `.<文件名>.*.tmp` 认它。
+pub fn tmp_path(target: &Path, pid: u32) -> PathBuf {
+    let name = target.file_name().and_then(|s| s.to_str()).unwrap_or("f");
+    let file = format!(".{name}.{pid}.tmp");
+    match target.parent() {
+        Some(dir) => dir.join(file),
+        None => PathBuf::from(file),
+    }
 }
 
 /// 生产实现。
@@ -85,8 +100,7 @@ impl Sys for RealSys {
             .parent()
             .ok_or_else(|| Error::msg(format!("{} 没有父目录", path.display())))?;
         std::fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
-        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("f");
-        let tmp = dir.join(format!(".{name}.tmp"));
+        let tmp = tmp_path(path, std::process::id());
         {
             let mut f = std::fs::OpenOptions::new()
                 .write(true)
@@ -98,7 +112,7 @@ impl Sys for RealSys {
             f.write_all(data).map_err(|e| Error::io(&tmp, e))?;
             f.sync_all().map_err(|e| Error::io(&tmp, e))?;
         }
-        // `.mode()` 只在「这次创建了文件」时生效；上一轮崩溃留下的 tmp 要补一刀
+        // `.mode()` 只在「这次创建了文件」时生效；pid 复用时撞上崩溃留下的同名 tmp 要补一刀
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))
             .map_err(|e| Error::io(&tmp, e))?;
         std::fs::rename(&tmp, path).map_err(|e| Error::io(path, e))
@@ -200,6 +214,88 @@ impl Sys for RealSys {
                 timeout.as_secs()
             ))),
         }
+    }
+
+    /// `flock(LOCK_EX | LOCK_NB)`（spec §8.3）。打开时 `O_NOFOLLOW`（锁文件被换成符号链接就报错，
+    /// 不跟过去）、`0600`，std 默认带 `O_CLOEXEC`：测速拉起的子进程不会继承锁 fd。
+    ///
+    /// 拿到后比对 fd 与路径的 inode：拿锁的间隙文件被删掉重建过，这把锁锁住的就是孤儿 inode，
+    /// 与后来的进程互不排斥，放掉重开一次。进程死了由内核放锁，不会留下死锁。
+    /// 真开文件、真加锁，所以没有单元测试，留给真机验收。
+    fn try_lock(&self, path: &Path) -> Result<Option<crate::lock::LockGuard>> {
+        use nix::errno::Errno;
+        use nix::fcntl::{Flock, FlockArg};
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+        for _ in 0..2 {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .mode(0o600)
+                .custom_flags(nix::libc::O_NOFOLLOW)
+                .open(path)
+                .map_err(|e| match e.kind() {
+                    std::io::ErrorKind::PermissionDenied => Error::msg("需要 root：用 sudo bui-c"),
+                    _ => Error::io(path, e),
+                })?;
+            let lock = match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+                Ok(l) => l,
+                Err((_, e)) if e == Errno::EWOULDBLOCK => return Ok(None),
+                Err((_, e)) => return Err(Error::io(path, std::io::Error::from(e))),
+            };
+            let same = match (lock.metadata(), std::fs::symlink_metadata(path)) {
+                (Ok(held), Ok(now)) => held.dev() == now.dev() && held.ino() == now.ino(),
+                _ => false,
+            };
+            if same {
+                return Ok(Some(crate::lock::LockGuard::new(Box::new(move || {
+                    release(lock)
+                }))));
+            }
+            drop(lock);
+        }
+        // 连着两次都被换掉：当作别人正在折腾它，等下一拍再试
+        Ok(None)
+    }
+}
+
+/// 放锁。不靠 `Flock` 的 Drop：它在 `LOCK_UN` 失败时会 panic，把菜单连同终端状态一起带走。
+/// 失败只记日志，然后直接关掉 fd——flock 跟着打开的文件走，关掉就释放了。
+fn release(lock: nix::fcntl::Flock<std::fs::File>) {
+    use std::os::fd::AsRawFd as _;
+    if let Err((lock, e)) = lock.unlock() {
+        tracing::warn!(error = %e, "放进程锁失败，直接关闭锁文件");
+        let fd = lock.as_raw_fd();
+        // 不 forget 的话 Flock 的 Drop 会再解一次锁并 panic；forget 之后 File 不会自己关，手动关
+        std::mem::forget(lock);
+        let _ = nix::unistd::close(fd);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn temp_names_carry_the_pid() {
+        let t = Path::new("/opt/bui-c/runtime.json");
+        assert_eq!(
+            tmp_path(t, 4242),
+            PathBuf::from("/opt/bui-c/.runtime.json.4242.tmp")
+        );
+        assert_ne!(
+            tmp_path(t, 4242),
+            tmp_path(t, 4243),
+            "两个进程同时写同一个文件，临时文件不能撞名"
+        );
+        // 与 Engine 清残留的认法一致：`.<文件名>.` 开头、`.tmp` 结尾，且和目标在同一目录（rename 不跨盘）
+        let tmp = tmp_path(Path::new("/opt/bui-c/config.json"), 7);
+        let name = tmp.file_name().and_then(|s| s.to_str()).unwrap();
+        assert!(
+            name.starts_with(".config.json.") && name.ends_with(".tmp"),
+            "{name}"
+        );
+        assert_eq!(tmp.parent(), Some(Path::new("/opt/bui-c")));
     }
 }
 

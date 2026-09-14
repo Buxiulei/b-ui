@@ -623,18 +623,23 @@ struct Imported {
 ///
 /// 返回 [`Stored`]：被墓碑挡下的名字在 `buried` 里——命令行据此打一行、菜单**放锁之后**
 /// 据此问一句（spec §0.2 R11），所以这个函数自己既不打那一行也不问那一句。
+///
+/// 这是导入这个动作的入口：一进来就拿锁，锁里读 `profiles.json`、落盘、apply，返回时放锁
+/// （R11「锁内 save_import + apply」、R16「与持锁重读的 profiles 合并」）。取节点（联网）在锁外。
 fn save_import<S: Sys, N: Net, P: Prompt>(
     ctx: &mut Ctx<'_, S, N, P>,
     inc: Incoming,
     activate: bool,
     with_deleted: bool,
 ) -> Result<Stored> {
-    let imported = store_import(ctx, inc, activate, with_deleted)?;
-    apply_import(ctx, &imported)?;
+    let g = take_lock(ctx)?;
+    let imported = store_import(ctx, inc, activate, with_deleted, &g)?;
+    apply_import(ctx, &imported, &g)?;
     Ok(imported.stored)
 }
 
-/// [`save_import`] 的前半段：读盘、写入这批节点、落盘、打导入结果行，不 apply。
+/// [`save_import`] 的前半段：读盘、写入这批节点、落盘、打导入结果行，不 apply。持锁才能调用
+/// （锁里读 `profiles.json`，spec §0.2 R16），自己绝不拿锁。
 ///
 /// 分出来是给命令行用的：apply 失败时被墓碑挡下的名字照样要打出来（审查 T7b M1）。
 ///
@@ -646,6 +651,7 @@ fn store_import<S: Sys, N: Net, P: Prompt>(
     inc: Incoming,
     activate: bool,
     with_deleted: bool,
+    _: &LockGuard,
 ) -> Result<Imported> {
     let mut prof = Profiles::load(ctx.sys, ctx.paths)?;
     let loaded = prof.clone();
@@ -689,15 +695,16 @@ fn store_import<S: Sys, N: Net, P: Prompt>(
     })
 }
 
-/// [`save_import`] 的后半段：选出了活动节点、或原地更新了活动节点时拿锁 apply。
+/// [`save_import`] 的后半段：选出了活动节点、或原地更新了活动节点时 apply。持锁才能调用，
+/// 与 [`store_import`] 同一把锁（spec §0.2 R11「锁内 save_import + apply」），自己绝不拿锁。
 fn apply_import<S: Sys, N: Net, P: Prompt>(
     ctx: &mut Ctx<'_, S, N, P>,
     imported: &Imported,
+    g: &LockGuard,
 ) -> Result<()> {
     let prof = &imported.prof;
     if imported.activated {
-        let g = take_lock(ctx)?;
-        apply_with_ufw(ctx, prof, &g)?;
+        apply_with_ufw(ctx, prof, g)?;
         ctx.say_aside(format!(
             "{CURRENT_NODE_HEAD}{}",
             prof.active.clone().unwrap_or_default()
@@ -709,8 +716,7 @@ fn apply_import<S: Sys, N: Net, P: Prompt>(
     {
         // 活动节点被原地更新（凭据轮换、端口变了）：不 apply 的话还跑着旧配置。
         // 只改了 label 时渲出的配置字节不变，engine 不会重启
-        let g = take_lock(ctx)?;
-        apply_with_ufw(ctx, prof, &g)?;
+        apply_with_ufw(ctx, prof, g)?;
     }
     Ok(())
 }
@@ -765,6 +771,8 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
             Ok(())
         }
         Cmd::Switch { name } => {
+            // 读 profiles.json 之前拿锁（spec §8.3）：锁外读的那份可能已经被别的会话改过
+            let g = take_lock(ctx)?;
             let mut prof = Profiles::load(ctx.sys, ctx.paths)?;
             if !prof.profiles.iter().any(|p| &p.name == name) {
                 return Err(Error::msg(format!(
@@ -773,19 +781,18 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
             }
             if prof.active.as_deref() == Some(name.as_str()) {
                 // 兜底 apply 一次：配置丢了、单元没建时这是唯一不绕路的补救；配置没变就不重启
-                let g = take_lock(ctx)?;
                 apply_with_ufw(ctx, &prof, &g)?;
                 ctx.say(format!("已是当前节点：{name}"));
                 return Ok(());
             }
             prof.active = Some(name.clone());
             prof.save(ctx.sys, ctx.paths)?;
-            let g = take_lock(ctx)?;
             apply_with_ufw(ctx, &prof, &g)?;
             ctx.say(format!("已切到 {name}"));
             Ok(())
         }
         Cmd::Mode { mode } => {
+            let g = take_lock(ctx)?;
             let mut prof = Profiles::load(ctx.sys, ctx.paths)?;
             let want: Mode = (*mode).into();
             prof.mode = want;
@@ -799,7 +806,6 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
                 ctx.say(format!("已记下 {label} 模式，导入节点后生效"));
                 return Ok(());
             }
-            let g = take_lock(ctx)?;
             apply_with_ufw(ctx, &prof, &g)?;
             ctx.say(format!("已切到 {label} 模式"));
             Ok(())
@@ -835,8 +841,12 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
                     "给一个节点链接，或用 --panel <地址> --user <用户名>，或 --sub <订阅地址>",
                 ));
             };
-            let imported = store_import(ctx, inc, *activate, *with_deleted)?;
-            let applied = apply_import(ctx, &imported);
+            // 取节点（联网）在锁外；锁里读 profiles、落盘、apply（spec §0.2 R11 / R16），
+            // 打墓碑那一行在放锁之后
+            let g = take_lock(ctx)?;
+            let imported = store_import(ctx, inc, *activate, *with_deleted, &g)?;
+            let applied = apply_import(ctx, &imported, &g);
+            drop(g);
             // 命令行不提问（脚本里跑它不能卡在一个 [y/N] 上）：说清跳了哪几个、怎么加回来。
             // apply 失败也照样打：节点已经存下了，被跳过的是哪几个、怎么加回来仍然要知道
             let buried = &imported.stored.buried;
@@ -941,6 +951,13 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
         }
         Cmd::Check => run_check(ctx),
         Cmd::Update { check_only, auto } => {
+            // 开关写 profiles.json、安装会替换二进制并重启：都在锁里。只查不装不拿锁。
+            // T12b 把下载挪到锁外之后，这里只剩安装那一段持锁
+            let _g = if auto.is_some() || !*check_only {
+                Some(take_lock(ctx)?)
+            } else {
+                None
+            };
             let mut prof = Profiles::load(ctx.sys, ctx.paths)?;
             // --auto 只翻开关、不联网：spec §6「每日 timer 自动，可关」的 CLI 入口
             if let Some(sw) = auto {
@@ -1013,7 +1030,10 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
                 ctx.say("已取消");
                 return Ok(());
             }
+            // 清单与确认在上面做完，只在 uninstall::run 外面拿锁（spec §0.2 R11）
+            let g = take_lock(ctx)?;
             let r = uninstall::run(ctx.sys, ctx.paths, *purge_bin)?;
+            drop(g);
             ctx.say(format!(
                 "已删除 {} 个单元，配置目录={} 二进制={}",
                 r.removed_units.len(),
@@ -1037,6 +1057,8 @@ fn import_v3_cmd<S: Sys, N: Net, P: Prompt>(
     mode: Option<Mode>,
     with_deleted: bool,
 ) -> Result<import_v3::Report> {
+    // 从 v3 导入这个动作的入口：锁里读 profiles、导入、卸旧单元、apply（spec §0.2 R11「[7]→[3] 同 [3]」）
+    let g = take_lock(ctx)?;
     let mut prof = Profiles::load(ctx.sys, ctx.paths)?;
     let dir = base.unwrap_or_else(|| PathBuf::from(import_v3::V3_BASE));
     let opts = import_v3::RunOpts {
@@ -1087,7 +1109,6 @@ fn import_v3_cmd<S: Sys, N: Net, P: Prompt>(
     if r.ufw_restored {
         ctx.say("已恢复被 v3 关掉的 UFW");
     }
-    let g = take_lock(ctx)?;
     apply_with_ufw(ctx, &prof, &g)?;
     ctx.say_aside(format!(
         "{CURRENT_NODE_HEAD}{}",
@@ -1108,6 +1129,7 @@ fn run_check<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()
         Verdict::Restarted {
             failures,
             next_backoff_min,
+            tun_ready,
         } => {
             ctx.say(format!(
                 "发现 {} 项异常，已重启 bui-c.service，下次退避 {next_backoff_min} 分钟",
@@ -1116,18 +1138,22 @@ fn run_check<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()
             for f in failures {
                 ctx.say(format!("  - {f}"));
             }
-            // is-active 在 exec 之后立刻为真，TUN 接口还没起来；timer 巡检也一样等
-            // （最多 5 秒，只在刚重启过时发生）
-            if Profiles::load(ctx.sys, ctx.paths)?.mode == Mode::Tun {
-                if Engine::new(ctx.sys, ctx.paths).wait_tun_ready() {
-                    ctx.say("bui-tun 已就绪");
-                } else {
-                    ctx.say(format!(
-                        "bui-tun 接口 {} 秒内没起来，查 [4] 服务控制 → 最近日志",
-                        crate::engine::TUN_READY_WAIT_S
-                    ));
-                }
+            // is-active 在 exec 之后立刻为真，TUN 接口还没起来：check::run 在重启的那把锁里
+            // 等过了（最多 5 秒，只在刚重启过时发生），这里只报结果
+            match tun_ready {
+                Some(true) => ctx.say("bui-tun 已就绪"),
+                Some(false) => ctx.say(format!(
+                    "bui-tun 接口 {} 秒内没起来，查 [4] 服务控制 → 最近日志",
+                    crate::engine::TUN_READY_WAIT_S
+                )),
+                None => {}
             }
+        }
+        // 锁被占着（或拿到锁时节点设置已经变了）：这一轮什么都不做，自更新也等下一轮，
+        // 不写 runtime.json（spec §8.3）
+        Verdict::Busy => {
+            ctx.say("另一个 bui-c 操作进行中，本轮巡检跳过");
+            return Ok(());
         }
         Verdict::Waiting {
             failures,
@@ -1146,6 +1172,12 @@ fn run_check<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()
     let prof = Profiles::load(ctx.sys, ctx.paths)?;
     let mut rt = Runtime::load(ctx.sys, ctx.paths);
     if check::update_due(ctx.sys, &rt, &prof) {
+        // 装新版会替换二进制并重启：只试一次锁，拿不到就等下一分钟，也不记「尝试过」——
+        // 没真的去试，不该落进 1 小时的失败退避。T12b 把下载挪到锁外
+        let Some(_g) = lock::acquire(ctx.sys, ctx.paths, lock::How::Once)? else {
+            tracing::info!("另一个 bui-c 操作进行中，本轮自更新跳过");
+            return Ok(());
+        };
         // 先把「尝试过」落盘再联网：面板与 GitHub 都不可达时按 check::UPDATE_RETRY_S
         // 退避 1 小时，否则离线机器每分钟白等两个源各 15s
         rt.last_update_attempt_at = Some(ctx.sys.now().unix_timestamp());
@@ -1352,14 +1384,34 @@ fn switch_node<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>, name: Stri
 
 /// 拿锁最多等多久（spec §8.3）。菜单与命令行都用 `Wait`，timer 的巡检用 `Once`。
 const LOCK_WAIT: Duration = Duration::from_secs(15);
-/// 等不到锁：别的 bui-c 正在改东西（退出码 1，spec §0.2 R15）。
-const LOCK_BUSY: &str = "另一个 bui-c 正在改配置，等了 15 秒还没轮到，稍后再试";
+/// 第一次没拿到锁时说一句（然后才开始等）。容量口径 51 列。
+const LOCK_WAITING: &str = "另一个 bui-c 操作正在进行，等它结束（最多 15 秒）…";
+/// 等不到锁：别的 bui-c 正在改东西（退出码 1，spec §0.2 R15）。锁在动手之前拿，所以
+/// 「什么都没改」在每个入口都成立。容量口径 51 列。
+const LOCK_BUSY: &str = "另一个 bui-c 操作还没结束，这次什么都没改，稍后再试";
 
-/// 顶层入口拿锁（spec §0.2 R11）。本任务是桩（[`lock::acquire`] 永远给得到），调用点与顺序
-/// 现在就排好；T12a 换成真的 flock 之后这里会真的等，也会真的等不到。
-fn take_lock<S: Sys, N: Net, P: Prompt>(ctx: &Ctx<'_, S, N, P>) -> Result<LockGuard> {
+/// 顶层入口拿锁（spec §8.3、§0.2 R11）：先试一次；没拿到就说一句「在等」并冲出去（人看得到
+/// 为什么卡住），再每 250ms 试一次，最多 15 秒，还拿不到报 [`LOCK_BUSY`]。`--json` 下那一句不打。
+///
+/// 只在动作的入口拿：拿到的 [`LockGuard`] 按引用递给改机器的函数，它们自己绝不拿锁，
+/// 持锁期间也绝不提问（持着锁等人，timer 就跳过一分钟，另一个会话也卡住）。
+fn take_lock<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<LockGuard> {
+    if let Some(g) = lock::acquire(ctx.sys, ctx.paths, lock::How::Once)? {
+        return Ok(g);
+    }
+    tell(ctx, LOCK_WAITING);
+    ctx.flush();
     lock::acquire(ctx.sys, ctx.paths, lock::How::Wait(LOCK_WAIT))?
         .ok_or_else(|| Error::msg(LOCK_BUSY))
+}
+
+/// 拿锁（[`take_lock`]）、在锁里跑 `f`、`f` 返回就放锁。`f` 里绝不提问。
+fn with_lock<'a, S: Sys, N: Net, P: Prompt, T>(
+    ctx: &mut Ctx<'a, S, N, P>,
+    f: impl FnOnce(&mut Ctx<'a, S, N, P>, &LockGuard) -> Result<T>,
+) -> Result<T> {
+    let g = take_lock(ctx)?;
+    f(ctx, &g)
 }
 
 /// 删除与导入流程里说一句：按当前宽度折行、缩进两列（`SelError::message` 那种 59 列的句子、
@@ -2037,6 +2089,10 @@ fn check_menu<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<O
     }
 }
 
+/// [`MenuHooks::repair`] 拿到锁后发现节点设置已经变了：不动手。容量口径 34 列，接在「修复失败：」
+/// 后面 44 列。
+const REPAIR_STALE: &str = "节点设置刚被别处改过，这次没有重启";
+
 /// 菜单 `[5]` 的 [`Hooks`]：事件按当前宽度排好就打出来（边做边打）；修复照 spec §0.2 R13。
 struct MenuHooks<'c, 'a, S: Sys, N: Net, P: Prompt> {
     ctx: &'c mut Ctx<'a, S, N, P>,
@@ -2050,23 +2106,42 @@ impl<S: Sys, N: Net, P: Prompt> Hooks for MenuHooks<'_, '_, S, N, P> {
         self.ctx.part(text);
     }
 
-    /// 重启一次（[`check::run_manual`]：不受退避约束，照样记进 runtime.json，timer 的退避从它算起）。
-    /// 有活动节点、主单元文件却不在（删光没做完留下的）时改做 apply：restart 一个不存在的单元只会报
-    /// Unit not found（spec §0.2 R13）。T12a 在这里拿锁；T12c 之后 apply 改走收敛。
-    fn repair(&mut self) -> Result<Verdict> {
-        let (sys, net, paths) = (self.ctx.sys, self.ctx.net, self.ctx.paths);
-        if !sys.exists(&paths.unit(UNIT_MAIN)) {
-            let applied = Engine::new(sys, paths).apply(self.prof)?;
-            return Ok(if applied.restarted {
-                Verdict::Restarted {
+    /// 修一次，整段持锁（spec §0.2 R11「[5] 只在 repair（重启、等就绪）那一段拿锁」）：
+    ///
+    /// - 要不要修由 `nettest` 查出来的 1–4 项决定，这里**不再探测**（T11 审查 I2：以前走巡检的
+    ///   `run_manual` 会再打一次 8 秒的隧道探测，还看不见本地端口，端口没在听时一次都不重启）；
+    /// - 锁里重读 `profiles.json`，与检查开始时的快照比，变了就不动手：删光节点的会话刚拆完数据面，
+    ///   按旧设置 apply 会把删掉的节点拉起来；
+    /// - 重启走 [`check::restart`]：不受退避约束，照样记进 runtime.json，timer 的退避从它算起；
+    ///   然后在同一把锁里等就绪（`wait_ready`，T11 审查 M5）；
+    /// - 有活动节点、主单元文件却不在（删光没做完留下的）时改做 apply：restart 一个不存在的单元只会
+    ///   报 Unit not found（R13）。apply 自己等过 TUN，SOCKS 再等端口。T12c 之后 apply 改走收敛。
+    fn repair(&mut self, wait_ready: &mut dyn FnMut()) -> Result<Verdict> {
+        let seen = delete::snapshot(self.prof);
+        with_lock(self.ctx, |ctx, g| {
+            let (sys, paths) = (ctx.sys, ctx.paths);
+            let now = Profiles::load(sys, paths)?;
+            if delete::snapshot(&now) != seen || now.active_profile().is_none() {
+                return Err(Error::msg(REPAIR_STALE));
+            }
+            if !sys.exists(&paths.unit(UNIT_MAIN)) {
+                let applied = Engine::new(sys, paths).apply(&now)?;
+                if !applied.restarted {
+                    return Ok(Verdict::Ok);
+                }
+                if now.mode == Mode::Socks {
+                    wait_ready();
+                }
+                return Ok(Verdict::Restarted {
                     failures: Vec::new(),
                     next_backoff_min: 0,
-                }
-            } else {
-                Verdict::Ok
-            });
-        }
-        check::run_manual(sys, net, paths)
+                    tun_ready: applied.tun_ready,
+                });
+            }
+            let v = check::restart(sys, paths, Vec::new(), g)?;
+            wait_ready();
+            Ok(v)
+        })
     }
 }
 
@@ -2325,24 +2400,25 @@ fn service_menu<S: Sys, N: Net, P: Prompt>(
 
 /// 菜单里的「重启」：TUN 模式要等接口起来才算数（is-active 在 exec 后立刻为真），
 /// 没起来就把最近几行日志带出来，省得用户再去翻 journalctl。
+///
+/// 重启与等接口在锁里（spec §8.3「[4] 重启」），看日志在放锁之后。
 fn restart_service<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>, mode: Mode) {
-    if let Err(e) = systemd::restart(ctx.sys, UNIT_MAIN) {
-        ctx.say(format!("失败：{e}"));
-        return;
+    let ready = with_lock(ctx, |ctx, _| {
+        systemd::restart(ctx.sys, UNIT_MAIN)?;
+        Ok((mode == Mode::Tun).then(|| Engine::new(ctx.sys, ctx.paths).wait_tun_ready()))
+    });
+    match ready {
+        Err(e) => ctx.say(format!("失败：{e}")),
+        Ok(None) => ctx.say("已重启 bui-c.service"),
+        Ok(Some(true)) => ctx.say("已重启 bui-c.service，bui-tun 已就绪"),
+        Ok(Some(false)) => {
+            ctx.say(format!(
+                "已重启 bui-c.service，但 bui-tun 接口 {} 秒内没起来",
+                crate::engine::TUN_READY_WAIT_S
+            ));
+            show_journal(ctx, 10);
+        }
     }
-    if mode == Mode::Socks {
-        ctx.say("已重启 bui-c.service");
-        return;
-    }
-    if Engine::new(ctx.sys, ctx.paths).wait_tun_ready() {
-        ctx.say("已重启 bui-c.service，bui-tun 已就绪");
-        return;
-    }
-    ctx.say(format!(
-        "已重启 bui-c.service，但 bui-tun 接口 {} 秒内没起来",
-        crate::engine::TUN_READY_WAIT_S
-    ));
-    show_journal(ctx, 10);
 }
 
 /// 空一行、标题行，再把日志缩进 2 列打出来；取不到就说一句原因。按当前宽度排：窄屏放不下单元
@@ -8380,5 +8456,630 @@ mod tests {
             "{}",
             r.t
         );
+    }
+
+    // ───────────── T12a：进程锁（spec §8.3、§5.9、§0.2 R11） ─────────────
+
+    /// 把每次提问也记进 FakeSys 的调用流水（`ask <提示>`），好和 lock / unlock 排先后。
+    struct LoggingPrompt<'a> {
+        inner: Scripted,
+        sys: &'a FakeSys,
+    }
+
+    impl<'a> LoggingPrompt<'a> {
+        fn new(sys: &'a FakeSys, inputs: &[&str]) -> Self {
+            Self {
+                inner: Scripted {
+                    queue: inputs.iter().map(|x| x.to_string()).collect(),
+                    asked: Vec::new(),
+                    tty: true,
+                },
+                sys,
+            }
+        }
+    }
+
+    impl Prompt for LoggingPrompt<'_> {
+        fn interactive(&self) -> bool {
+            self.inner.interactive()
+        }
+        fn read(&mut self, prompt: &str) -> Result<Option<String>> {
+            self.sys.mark(format!("ask {prompt}"));
+            self.inner.read(prompt)
+        }
+        fn lines_until_blank(&mut self, prompt: &str) -> Result<Vec<String>> {
+            self.sys.mark(format!("ask {prompt}"));
+            self.inner.lines_until_blank(prompt)
+        }
+        fn confirm(&mut self, prompt: &str) -> Result<bool> {
+            self.sys.mark(format!("ask {prompt}"));
+            self.inner.confirm(prompt)
+        }
+    }
+
+    /// 核对调用流水：lock 与 unlock 一一配对、不嵌套、最后放掉，两者之间没有任何提问。
+    /// 返回 `from` 之后拿过几次锁。
+    fn no_prompt_under_lock(s: &FakeSys, from: usize, what: &str) -> usize {
+        let calls = s.calls();
+        let mut held = false;
+        let mut taken = 0;
+        for c in &calls[from..] {
+            match c.as_str() {
+                "lock" => {
+                    assert!(!held, "{what}：嵌套拿锁：{calls:?}");
+                    held = true;
+                    taken += 1;
+                }
+                "unlock" => {
+                    assert!(held, "{what}：没拿锁就放锁：{calls:?}");
+                    held = false;
+                }
+                ask if ask.starts_with("ask ") => {
+                    assert!(!held, "{what}：持锁期间提问了「{ask}」：{calls:?}")
+                }
+                _ => {}
+            }
+        }
+        assert!(!held, "{what}：锁没放：{calls:?}");
+        taken
+    }
+
+    fn logged_menu(s: &FakeSys, n: &FakeNet, pp: &Paths, inputs: &[&str]) -> (String, Vec<String>) {
+        let mut p = LoggingPrompt::new(s, inputs);
+        let mut ctx = Ctx::new(s, n, pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        (t, p.inner.asked)
+    }
+
+    #[test]
+    fn no_prompt_is_ever_asked_while_holding_the_lock() {
+        let pp = paths();
+
+        // [1] 切换：选完编号后拿锁、apply、放锁
+        let (s, n) = (FakeSys::new(), FakeNet::new());
+        ready(&s);
+        two_nodes(&s, &pp);
+        let (t, _) = logged_menu(&s, &n, &pp, &["1", "2", "0"]);
+        assert_eq!(no_prompt_under_lock(&s, 0, "[1] 切换"), 1, "{t}");
+        assert_eq!(
+            Profiles::load(&s, &pp).unwrap().active.as_deref(),
+            Some("alice-reality-direct"),
+            "{t}"
+        );
+
+        // [2] 切模式：答 y 之后才拿锁
+        let (s, n) = (FakeSys::new(), FakeNet::new());
+        ready(&s);
+        two_nodes(&s, &pp);
+        let (t, _) = logged_menu(&s, &n, &pp, &["2", "y", "", "0"]);
+        assert_eq!(no_prompt_under_lock(&s, 0, "[2] 切模式"), 1, "{t}");
+        assert_eq!(Profiles::load(&s, &pp).unwrap().mode, Mode::Tun, "{t}");
+
+        // [3] 导入：锁内 save_import + apply；放锁之后才问墓碑那一问与「切换到新导入的 X？」，
+        // 答 y 另拿一次锁
+        let url = "https://panel.example.com/api/nodes/alice";
+        let (s, n) = one_buried(&pp, url);
+        let from = s.calls().len();
+        let (t, asked) = logged_menu(&s, &n, &pp, &["3", url, "", "y", "n", "0"]);
+        assert!(asked.iter().any(|q| q == menu::BURIED_ASK), "{asked:?}");
+        assert!(
+            asked.iter().any(|q| q.starts_with("切换到新导入的")),
+            "{asked:?}"
+        );
+        assert_eq!(no_prompt_under_lock(&s, from, "[3] 导入"), 2, "{t}");
+        assert_eq!(names(&s, &pp).len(), 2, "{t}");
+
+        // [4] 重启
+        let (s, n) = (FakeSys::new(), FakeNet::new());
+        ready(&s);
+        with_unit(&s);
+        two_nodes(&s, &pp);
+        let (t, _) = logged_menu(&s, &n, &pp, &["4", "1", "0"]);
+        assert_eq!(no_prompt_under_lock(&s, 0, "[4] 重启"), 1, "{t}");
+        assert!(s.called("systemctl restart bui-c.service"), "{t}");
+
+        // [5] 只在修复（重启、等就绪）那一段拿锁，小菜单的提问在锁外
+        let (s, n) = (FakeSys::new(), FakeNet::new());
+        check_ready(&s, &n, &pp, Mode::Socks);
+        s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        let (t, asked) = logged_menu(&s, &n, &pp, &["5", "0", "0"]);
+        assert!(asked.iter().any(|q| q == "选择 [0-3]"), "{asked:?}");
+        assert_eq!(no_prompt_under_lock(&s, 0, "[5] 修复"), 1, "{t}");
+
+        // [6] 删除：确认之后才拿锁（Switch 形态，要输入 yes）
+        let (s, n) = (FakeSys::new(), FakeNet::new());
+        let prof = nine_nodes(&s, &pp, Mode::Socks);
+        let idx = prof.profiles.iter().position(|p| p.name == ACTIVE).unwrap() + 1;
+        let idx = idx.to_string();
+        let from = s.calls().len();
+        let mut p = LoggingPrompt::new(&s, &[idx.as_str(), "yes"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        delete_menu(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert_eq!(no_prompt_under_lock(&s, from, "[6] 删除"), 1, "{t}");
+        assert_eq!(names(&s, &pp).len(), 8, "{t}");
+
+        // 命令行 delete：终端里的确认也在拿锁之前
+        let (s, n) = (FakeSys::new(), FakeNet::new());
+        nine_nodes(&s, &pp, Mode::Socks);
+        let from = s.calls().len();
+        let mut p = LoggingPrompt::new(&s, &["yes"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["delete", ACTIVE]), &mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert_eq!(no_prompt_under_lock(&s, from, "bui-c delete"), 1, "{t}");
+        assert_eq!(names(&s, &pp).len(), 8, "{t}");
+
+        // [8] 卸载：确认在菜单层做完，只在 uninstall::run 外面拿锁
+        let (s, n) = (FakeSys::new(), FakeNet::new());
+        ready(&s);
+        with_unit(&s);
+        two_nodes(&s, &pp);
+        let (t, _) = logged_menu(&s, &n, &pp, &["8", "y", "0"]);
+        assert_eq!(no_prompt_under_lock(&s, 0, "[8] 卸载"), 1, "{t}");
+        assert!(!s.exists(&pp.profiles()), "{t}");
+    }
+
+    #[test]
+    fn with_lock_waits_then_gives_up_after_15_seconds() {
+        let pp = paths();
+        let n = FakeNet::new();
+
+        // 一直被占：打一行「在等」并冲出去，等满 15 秒，什么都不做
+        let s = FakeSys::new();
+        s.lock_busy(u32::MAX);
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        let mut ran = false;
+        let e = with_lock(&mut ctx, |_, _| {
+            ran = true;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(!ran, "没拿到锁就不能动手");
+        let msg = e.to_string();
+        assert!(
+            msg.contains("什么都没改") && msg.contains("稍后再试"),
+            "{msg}"
+        );
+        assert_eq!(e.exit_code(), 1, "锁等不到是执行失败（R15）");
+        let t = ctx.transcript.clone();
+        assert_eq!(
+            t.lines().filter(|l| l.contains("等它结束")).count(),
+            1,
+            "只在第一次没拿到时说一次：\n{t}"
+        );
+        assert!(ctx.out.is_empty(), "等之前就冲出去了，人看得到");
+        let sleeps = s.sleeps();
+        assert!(sleeps.iter().all(|&ms| ms == 250), "{sleeps:?}");
+        assert_eq!(sleeps.iter().sum::<u64>(), 15_000);
+        assert!(!s.called("lock"));
+
+        // 等了两拍拿到：还是只说一次，`f` 在 lock 与 unlock 之间跑
+        let s = FakeSys::new();
+        s.lock_busy(2);
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        with_lock(&mut ctx, |ctx, _| {
+            ctx.sys.mark("inside".to_string());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(s.calls(), vec!["lock", "inside", "unlock"]);
+        assert_eq!(
+            ctx.transcript
+                .lines()
+                .filter(|l| l.contains("等它结束"))
+                .count(),
+            1
+        );
+
+        // 一上来就拿到：一个字都不打
+        let s = FakeSys::new();
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        with_lock(&mut ctx, |_, _| Ok(())).unwrap();
+        assert!(ctx.transcript.is_empty(), "{}", ctx.transcript);
+        assert!(s.sleeps().is_empty());
+    }
+
+    #[test]
+    fn the_lock_lines_fit_forty_columns() {
+        let pp = paths();
+        let n = FakeNet::new();
+        let s = FakeSys::new();
+        s.set_term_size(Some((40, 24)));
+        s.lock_busy(u32::MAX);
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        let e = with_lock(&mut ctx, |_, _| Ok(())).unwrap_err();
+        assert!(ctx.transcript.contains("等它结束"), "{}", ctx.transcript);
+        for l in ctx.transcript.lines() {
+            assert!(menu::budget_width(l) <= menu::line_limit(40), "{l:?}");
+        }
+        assert!(menu::budget_width(&e.to_string()) <= 59, "{e}");
+        // `--json` 下 stdout 只放一个对象：在等的那一行不打
+        let s = FakeSys::new();
+        s.lock_busy(1);
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, true, true);
+        with_lock(&mut ctx, |_, _| Ok(())).unwrap();
+        assert!(ctx.transcript.is_empty(), "{}", ctx.transcript);
+    }
+
+    #[test]
+    fn delete_holds_the_lock_around_the_restart() {
+        let pp = paths();
+        let (s, n) = (FakeSys::new(), FakeNet::new());
+        let prof = nine_nodes(&s, &pp, Mode::Tun);
+        let from = s.calls().len();
+        let seen = delete::snapshot(&prof);
+        let (r, t) = del(&s, &n, &pp, &[ACTIVE], None, &seen);
+        r.expect(&t);
+        let calls = s.calls()[from..].to_vec();
+        let at = |c: &str| {
+            calls
+                .iter()
+                .position(|x| x == c)
+                .unwrap_or_else(|| panic!("没有 {c}：{calls:?}"))
+        };
+        assert!(at("lock") < at("ip link delete bui-tun"), "{calls:?}");
+        assert!(
+            at("ip link delete bui-tun") < at("systemctl restart bui-c.service"),
+            "{calls:?}"
+        );
+        assert!(
+            at("systemctl restart bui-c.service") < at("unlock"),
+            "{calls:?}"
+        );
+        assert_eq!(no_prompt_under_lock(&s, from, "删除"), 1);
+    }
+
+    #[test]
+    fn a_busy_lock_leaves_every_changing_command_untouched_and_exits_1() {
+        let pp = paths();
+        let n = FakeNet::new();
+        let busy = |s: &FakeSys, args: &[&str], answers: &[&str]| {
+            s.lock_busy(u32::MAX);
+            let mut p = Scripted {
+                queue: answers.iter().map(|x| x.to_string()).collect(),
+                asked: Vec::new(),
+                tty: true,
+            };
+            let mut ctx = Ctx::new(s, &n, &pp, &mut p, false, args.contains(&"-y"));
+            let r = dispatch(&parse(args), &mut ctx);
+            let mut err = Vec::new();
+            let rc = finish(&mut ctx, r, &mut err);
+            s.lock_busy(0);
+            (rc, String::from_utf8(err).unwrap())
+        };
+
+        // switch：active 不变、没重启、profiles.json 一次都没写
+        let s = FakeSys::new();
+        ready(&s);
+        two_nodes(&s, &pp);
+        let writes = s.writes("/opt/bui-c/profiles.json");
+        let (rc, err) = busy(&s, &["switch", "alice-reality-direct"], &[]);
+        assert_eq!(rc, std::process::ExitCode::FAILURE);
+        assert!(err.contains("稍后再试"), "{err}");
+        assert_eq!(s.writes("/opt/bui-c/profiles.json"), writes);
+        assert_eq!(
+            Profiles::load(&s, &pp).unwrap().active.as_deref(),
+            Some("alice-hy2-direct")
+        );
+        assert!(!s.called("systemctl restart bui-c.service"));
+
+        // mode：模式不变
+        let (rc, err) = busy(&s, &["mode", "tun"], &[]);
+        assert_eq!(rc, std::process::ExitCode::FAILURE, "{err}");
+        assert_eq!(Profiles::load(&s, &pp).unwrap().mode, Mode::Socks);
+        assert_eq!(s.writes("/opt/bui-c/profiles.json"), writes);
+
+        // import：节点一个没多
+        let (rc, err) = busy(&s, &["import", "-"], &[BOB_REALITY, ""]);
+        assert_eq!(rc, std::process::ExitCode::FAILURE, "{err}");
+        assert_eq!(names(&s, &pp).len(), 2);
+
+        // update --auto：开关不变
+        let (rc, err) = busy(&s, &["update", "--auto", "off"], &[]);
+        assert_eq!(rc, std::process::ExitCode::FAILURE, "{err}");
+        assert!(Profiles::load(&s, &pp).unwrap().auto_update);
+
+        // uninstall -y：什么都没删
+        with_unit(&s);
+        let (rc, err) = busy(&s, &["uninstall", "-y"], &[]);
+        assert_eq!(rc, std::process::ExitCode::FAILURE, "{err}");
+        assert!(s.exists(&pp.profiles()) && s.exists(&pp.unit(UNIT_MAIN)));
+
+        // delete -y：9 个节点都还在，数据面没动
+        let s = FakeSys::new();
+        nine_nodes(&s, &pp, Mode::Socks);
+        let before = restarts(&s);
+        let (rc, err) = busy(&s, &["delete", ACTIVE, "-y"], &[]);
+        assert_eq!(rc, std::process::ExitCode::FAILURE);
+        assert!(err.contains("什么都没改"), "{err}");
+        assert_eq!(names(&s, &pp).len(), 9);
+        assert_eq!(restarts(&s), before);
+    }
+
+    #[test]
+    fn a_busy_lock_in_the_menu_reports_on_the_last_line_and_changes_nothing() {
+        let pp = paths();
+        let (s, n) = (FakeSys::new(), FakeNet::new());
+        ready(&s);
+        two_nodes(&s, &pp);
+        s.lock_busy(u32::MAX);
+        let r = run_menu(&s, &n, &pp, &["1", "2", "", "0"], true);
+        assert_eq!(
+            Profiles::load(&s, &pp).unwrap().active.as_deref(),
+            Some("alice-hy2-direct"),
+            "{}",
+            r.t
+        );
+        assert!(!s.called("systemctl restart bui-c.service"));
+        assert!(
+            r.t.lines()
+                .any(|l| l.starts_with("  上次：失败：") && l.contains("稍后再试")),
+            "「上次：」行要写明没做成、下一步是什么：\n{}",
+            r.t
+        );
+    }
+
+    #[test]
+    fn changing_commands_read_profiles_inside_the_lock() {
+        // 另一个会话在我们拿锁之前刚加了一个节点：锁内重读才不会把它写丢（spec §8.3「用户确认之后、
+        // 读 profiles.json 之前」、R16）
+        let pp = paths();
+        let n = FakeNet::new();
+        let mut theirs = profiles_socks();
+        theirs.upsert(crate::testutil::named(
+            "alice-reality-direct",
+            reality_direct_node(),
+        ));
+        let theirs = String::from_utf8(serde_json::to_vec_pretty(&theirs).unwrap()).unwrap();
+
+        for (args, answers) in [
+            (vec!["import", "-"], vec![BOB_REALITY, ""]),
+            (vec!["mode", "tun"], vec![]),
+            // 切到的正是别人刚加的那个：锁外读的那份里根本没有它
+            (vec!["switch", "alice-reality-direct"], vec![]),
+            (vec!["update", "--auto", "off"], vec![]),
+        ] {
+            let s = FakeSys::new();
+            ready(&s);
+            profiles_socks().save(&s, &pp).unwrap();
+            s.stage_on_lock("/opt/bui-c/profiles.json", &theirs);
+            let mut p = Scripted {
+                queue: answers.iter().map(|x| x.to_string()).collect(),
+                asked: Vec::new(),
+                tty: true,
+            };
+            let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+            dispatch(&parse(&args), &mut ctx).unwrap();
+            let t = ctx.transcript.clone();
+            assert!(
+                names(&s, &pp).contains(&"alice-reality-direct".to_string()),
+                "{args:?} 把拿锁前别人加的节点写丢了：\n{t}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_timer_check_busy_skips_the_round_and_the_self_update_and_writes_nothing() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        let mut prof = profiles_socks();
+        prof.panel = Some(crate::profiles::Panel {
+            base_url: "https://panel.example.com".into(),
+            username: "alice".into(),
+        });
+        prof.save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        n.route(crate::check::PROBE_URL, FakeReply::Timeout);
+        s.lock_busy(u32::MAX);
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["check"]), &mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert!(t.contains("本轮巡检跳过"), "{t}");
+        assert!(!s.called("systemctl restart bui-c.service"), "{t}");
+        assert_eq!(s.writes("/opt/bui-c/runtime.json"), 0, "{t}");
+        assert!(
+            !n.log().iter().any(|l| l.contains("manifest.json")),
+            "锁被占着的这一轮不自更新：{:?}",
+            n.log()
+        );
+    }
+
+    #[test]
+    fn a_busy_lock_skips_the_daily_self_update_without_recording_an_attempt() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        let mut prof = profiles_socks();
+        prof.panel = Some(crate::profiles::Panel {
+            base_url: "https://panel.example.com".into(),
+            username: "alice".into(),
+        });
+        prof.save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        n.route(crate::check::PROBE_URL, FakeReply::Status(204));
+        s.lock_busy(u32::MAX);
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["check"]), &mut ctx).unwrap();
+        assert!(ctx.transcript.contains("正常"), "{}", ctx.transcript);
+        assert!(!n.log().iter().any(|l| l.contains("manifest.json")));
+        let rt = Runtime::load(&s, &pp);
+        assert_eq!(
+            rt.last_update_attempt_at, None,
+            "没真的去试：下一分钟还要能试，不能落进 1 小时的失败退避"
+        );
+    }
+
+    /// [5] 的修复不再重复探测（T11 审查 I2）：隧道那一次 8 秒的探测只在首查与重查各做一次。
+    #[test]
+    fn menu_repair_restarts_without_probing_the_tunnel_a_second_time() {
+        let pp = paths();
+        let (s, n) = (FakeSys::new(), FakeNet::new());
+        check_ready(&s, &n, &pp, Mode::Tun);
+        n.route(crate::check::PROBE_URL, FakeReply::Timeout);
+        let r = run_menu(&s, &n, &pp, &["5", "0", "0"], true);
+        assert!(s.called("systemctl restart bui-c.service"), "{}", r.t);
+        let probes = n
+            .log()
+            .iter()
+            .filter(|l| l.contains(crate::check::PROBE_URL))
+            .count();
+        assert_eq!(probes, 2, "首查一次、重查一次：{:?}", n.log());
+    }
+
+    /// 只有本地端口没在听（服务在跑、TUN 在、隧道通）：nettest 判了端口失败，修复就要真的重启，
+    /// 不能再让巡检那套只看服务与隧道的探测把它否掉（T11 审查 I2 的同源洞）。
+    #[test]
+    fn a_local_port_failure_really_restarts_even_with_the_tunnel_up() {
+        let pp = paths();
+        let (s, n) = (FakeSys::new(), FakeNet::new());
+        ready(&s);
+        crate::nettest::sample::machine(&s, &n, Mode::Tun); // 端口没登记在听
+        let mut prof = crate::testutil::profiles_tun();
+        prof.auto_update = false;
+        prof.save(&s, &pp).unwrap();
+        let r = run_menu(&s, &n, &pp, &["5", "0", "0"], true);
+        assert!(
+            s.called("systemctl restart bui-c.service"),
+            "报告说了「再试一次」就得真的重启：\n{}",
+            r.t
+        );
+        assert!(r.t.contains("已重启 bui-c.service"), "{}", r.t);
+        assert_eq!(
+            Runtime::load(&s, &pp).fail_streak,
+            1,
+            "照样记进 runtime.json"
+        );
+    }
+
+    /// 重启与等就绪在同一把锁里（T11 审查 M5），而且只等一次。
+    #[test]
+    fn menu_repair_waits_for_readiness_inside_the_lock_and_only_once() {
+        let pp = paths();
+
+        // TUN：接口马上就在，只睡一拍；等接口的查询落在 restart 与 unlock 之间
+        let (s, n) = (FakeSys::new(), FakeNet::new());
+        check_ready(&s, &n, &pp, Mode::Tun);
+        n.route(crate::check::PROBE_URL, FakeReply::Timeout);
+        let r = run_menu(&s, &n, &pp, &["5", "0", "0"], true);
+        let calls = s.calls();
+        let restart = calls
+            .iter()
+            .position(|c| c == "systemctl restart bui-c.service")
+            .unwrap_or_else(|| panic!("{}", r.t));
+        let unlock = calls.iter().position(|c| c == "unlock").expect("放了锁");
+        assert!(calls[..restart].iter().any(|c| c == "lock"), "{calls:?}");
+        assert!(
+            calls[restart..unlock]
+                .iter()
+                .any(|c| c == "ip link show bui-tun"),
+            "等 TUN 就绪在锁里：{calls:?}"
+        );
+        assert_eq!(s.sleeps(), vec![500], "只等一次：{}", r.t);
+
+        // SOCKS：服务一直起不来，等满 3 秒（12 拍）就停，不再在锁外重等一遍
+        let (s, n) = (FakeSys::new(), FakeNet::new());
+        check_ready(&s, &n, &pp, Mode::Socks);
+        s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        let r = run_menu(&s, &n, &pp, &["5", "0", "0"], true);
+        assert_eq!(s.sleeps(), vec![250; 12], "{}", r.t);
+        let calls = s.calls();
+        let restart = calls
+            .iter()
+            .position(|c| c == "systemctl restart bui-c.service")
+            .unwrap_or_else(|| panic!("{}", r.t));
+        let unlock = calls.iter().position(|c| c == "unlock").expect("放了锁");
+        assert!(restart < unlock, "{calls:?}");
+        assert!(
+            r.t.lines().any(|l| l.trim() == "已重启，3 秒内还是没起来"),
+            "{}",
+            r.t
+        );
+    }
+
+    #[test]
+    fn menu_repair_with_the_lock_busy_restarts_nothing_and_says_so() {
+        let pp = paths();
+        let (s, n) = (FakeSys::new(), FakeNet::new());
+        check_ready(&s, &n, &pp, Mode::Socks);
+        s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        s.lock_busy(u32::MAX);
+        let r = run_menu(&s, &n, &pp, &["5", "0", "0"], true);
+        assert!(!s.called("systemctl restart bui-c.service"), "{}", r.t);
+        assert_eq!(Runtime::load(&s, &pp).fail_streak, 0, "没重启就不记");
+        assert!(
+            r.t.lines()
+                .any(|l| l.contains("修复失败：") && l.contains("稍后再试")),
+            "{}",
+            r.t
+        );
+        assert!(
+            r.t.lines()
+                .any(|l| l == "  上次：连接检查：失败 1 项（服务）"),
+            "{}",
+            r.t
+        );
+
+        // 40 列：「在等」那一句与「修复失败：…稍后再试」（61 列）都折得下，「稍后再试」不被截掉
+        let (s, n) = (FakeSys::new(), FakeNet::new());
+        check_ready(&s, &n, &pp, Mode::Socks);
+        s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        s.set_term_size(Some((40, 24)));
+        s.lock_busy(u32::MAX);
+        let r = run_menu(&s, &n, &pp, &["5", "0", "0"], true);
+        for l in r.t.lines() {
+            assert!(
+                menu::budget_width(l) <= menu::line_limit(40),
+                "{l:?}\n{}",
+                r.t
+            );
+        }
+        assert!(r.t.contains("稍后再试"), "{}", r.t);
+        assert!(!s.called("systemctl restart bui-c.service"));
+    }
+
+    /// [5] 探测之后、修复拿到锁之前，节点设置被别处改了：不按旧设置重启或 apply（spec §8.3
+    /// j-risk 那一条：删光节点的会话刚拆完数据面，按旧设置 apply 会把删掉的节点拉起来）。
+    #[test]
+    fn menu_repair_does_not_act_on_settings_that_changed_under_it() {
+        let pp = paths();
+        let json = |p: &Profiles| String::from_utf8(serde_json::to_vec_pretty(p).unwrap()).unwrap();
+        // 另一个会话刚切到了 TUN：apply 得起来的设置，没有快照比对就会被照做
+        let mut theirs = profiles_socks();
+        theirs.auto_update = false;
+        theirs.mode = Mode::Tun;
+
+        // ① 单元文件在：不重启、不记连击，报告里说清修复没做
+        let (s, n) = (FakeSys::new(), FakeNet::new());
+        check_ready(&s, &n, &pp, Mode::Socks);
+        s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        s.stage_on_lock("/opt/bui-c/profiles.json", &json(&theirs));
+        let r = run_menu(&s, &n, &pp, &["5", "0", "0"], true);
+        assert!(!s.called("systemctl restart bui-c.service"), "{}", r.t);
+        assert_eq!(Runtime::load(&s, &pp).fail_streak, 0, "{}", r.t);
+        assert!(r.t.lines().any(|l| l.contains("修复失败：")), "{}", r.t);
+
+        // ② 单元文件不在（删光没做完）：不按变了的设置 apply，也不按删光之后的空列表 apply
+        for staged in [theirs, Profiles::new_default()] {
+            let (s, n) = (FakeSys::new(), FakeNet::new());
+            check_ready(&s, &n, &pp, Mode::Socks);
+            s.remove_file(&pp.unit(UNIT_MAIN)).unwrap();
+            s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+            s.stage_on_lock("/opt/bui-c/profiles.json", &json(&staged));
+            let r = run_menu(&s, &n, &pp, &["5", "0", "0"], true);
+            assert!(!s.exists(&pp.unit(UNIT_MAIN)), "没按旧设置 apply：{}", r.t);
+            assert!(!s.called("systemctl start bui-c.service"), "{}", r.t);
+            assert!(r.t.contains("修复失败："), "{}", r.t);
+        }
     }
 }

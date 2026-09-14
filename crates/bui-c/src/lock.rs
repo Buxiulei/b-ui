@@ -1,5 +1,6 @@
-//! 进程锁（spec §8.3、§0.2 R11）。**本任务是桩**：[`acquire`] 永远给得到一把
-//! [`LockGuard`]，什么都不锁；T12a 换成真的 `flock`（`/run/bui-c.lock`），签名不再变。
+//! 进程锁 `/run/bui-c.lock`（spec §8.3、§0.2 R11）：改配置的路径互斥，巡检遇锁跳过。
+//! 真正加锁的是 [`Sys::try_lock`]（真机是 `flock`，测试是 `FakeSys` 的记账），这里只管
+//! 「试一次」还是「每 250ms 试一次，等到时限」。
 //!
 //! 分层：只有顶层入口（菜单的一个动作、一条子命令、巡检的一轮）拿锁，改机器的函数
 //! （`apply_with_ufw`、`cli::delete_nodes` 的数据面段、`teardown_all`、将来的 `converge`、
@@ -17,12 +18,13 @@ pub struct LockGuard {
 }
 
 impl LockGuard {
-    /// 本任务的桩：不持有任何东西，Drop 时什么都不做。
+    /// 不持有任何锁、Drop 时什么都不做。只给单元测试直接调用「收下凭证」的函数时用；
+    /// 产品代码一律经 [`acquire`] 拿。
     pub fn stub() -> Self {
         Self { release: None }
     }
 
-    /// T12a 用：`release` 里持有真正的锁（或 FakeSys 的记账）。
+    /// `release` 里持有真正的锁（真机是 `Flock<File>`，FakeSys 是记 `unlock` 的闭包）。
     pub fn new(release: Box<dyn FnOnce()>) -> Self {
         Self {
             release: Some(release),
@@ -52,11 +54,32 @@ pub enum How {
     Once,
 }
 
-/// 拿锁。`Ok(None)` = 没拿到（等不到 / 别人正持着）；`Err` = 锁文件本身出了问题。
+/// [`How::Wait`] 两次尝试之间隔多久。
+pub const RETRY: Duration = Duration::from_millis(250);
+
+/// 拿锁。`Ok(None)` = 没拿到（等不到 / 别人正持着）；`Err` = 锁文件本身出了问题（不是 root、
+/// 锁文件被换成了符号链接）。
 ///
-/// 桩实现永远 `Ok(Some(..))`，且一个系统调用都不发：调用点与顺序现在就排好，T12a 只换本体。
-pub fn acquire<S: Sys>(_sys: &S, _paths: &Paths, _how: How) -> Result<Option<LockGuard>> {
-    Ok(Some(LockGuard::stub()))
+/// [`How::Once`] 只试一次、不睡；[`How::Wait`] 先试一次，之后每 [`RETRY`] 试一次，睡够时限
+/// 还拿不到就放弃。等待走 [`Sys::sleep`]，测试里是虚拟时间。
+pub fn acquire<S: Sys>(sys: &S, paths: &Paths, how: How) -> Result<Option<LockGuard>> {
+    let path = paths.lock();
+    if let Some(g) = sys.try_lock(&path)? {
+        return Ok(Some(g));
+    }
+    let How::Wait(limit) = how else {
+        return Ok(None);
+    };
+    let mut waited = Duration::ZERO;
+    while waited < limit {
+        let step = RETRY.min(limit - waited);
+        sys.sleep(step);
+        waited += step;
+        if let Some(g) = sys.try_lock(&path)? {
+            return Ok(Some(g));
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -66,20 +89,64 @@ mod tests {
     use std::cell::Cell;
     use std::rc::Rc;
 
+    fn paths() -> Paths {
+        Paths::new("/opt/bui-c", "/etc/systemd/system")
+    }
+
     #[test]
-    fn the_stub_lock_is_handed_out_and_released_on_drop() {
-        let s = FakeSys::new();
-        let p = Paths::new("/opt/bui-c", "/etc/systemd/system");
-        for how in [How::Wait(Duration::from_secs(15)), How::Once] {
-            assert!(acquire(&s, &p, how).unwrap().is_some(), "桩永远拿得到");
-        }
-        assert!(s.calls().is_empty(), "桩不碰系统：{:?}", s.calls());
-        // 放锁 = 把 guard 扔掉；T12a 的真锁靠这条路释放 flock
+    fn the_guard_releases_on_drop_and_only_then() {
         let hits = Rc::new(Cell::new(0));
         let h = hits.clone();
         let g = LockGuard::new(Box::new(move || h.set(h.get() + 1)));
         assert_eq!(hits.get(), 0, "还持着就不能放");
         drop(g);
         assert_eq!(hits.get(), 1);
+    }
+
+    #[test]
+    fn wait_retries_every_250ms_until_the_deadline_then_gives_up() {
+        let s = FakeSys::new();
+        s.lock_busy(u32::MAX);
+        let got = acquire(&s, &paths(), How::Wait(Duration::from_secs(15))).unwrap();
+        assert!(got.is_none(), "一直被占就等不到");
+        let sleeps = s.sleeps();
+        assert!(sleeps.iter().all(|&ms| ms == 250), "{sleeps:?}");
+        assert_eq!(sleeps.iter().sum::<u64>(), 15_000, "正好等满 15 秒");
+        assert!(!s.called("lock"), "{:?}", s.calls());
+    }
+
+    #[test]
+    fn wait_takes_the_lock_as_soon_as_it_is_free() {
+        let s = FakeSys::new();
+        s.lock_busy(3);
+        let g = acquire(&s, &paths(), How::Wait(Duration::from_secs(15))).unwrap();
+        assert!(g.is_some());
+        assert_eq!(s.sleeps(), vec![250, 250, 250], "第 4 次就拿到了");
+        assert_eq!(s.calls(), vec!["lock".to_string()]);
+        drop(g);
+        assert_eq!(s.calls(), vec!["lock".to_string(), "unlock".to_string()]);
+    }
+
+    #[test]
+    fn once_tries_exactly_once_and_never_sleeps() {
+        let s = FakeSys::new();
+        s.lock_busy(1);
+        assert!(acquire(&s, &paths(), How::Once).unwrap().is_none());
+        assert!(s.sleeps().is_empty(), "巡检只试一次，不等");
+        assert!(acquire(&s, &paths(), How::Once).unwrap().is_some());
+        assert!(s.sleeps().is_empty());
+    }
+
+    #[test]
+    fn the_same_process_cannot_take_the_lock_twice() {
+        // 真 flock 按「打开的文件」计：持着锁再开一次再锁，自己挡住自己。fake 照做，
+        // 嵌套拿锁的写法在测试里就露馅
+        let s = FakeSys::new();
+        let first = acquire(&s, &paths(), How::Once)
+            .unwrap()
+            .expect("第一次拿得到");
+        assert!(acquire(&s, &paths(), How::Once).unwrap().is_none());
+        drop(first);
+        assert!(acquire(&s, &paths(), How::Once).unwrap().is_some());
     }
 }

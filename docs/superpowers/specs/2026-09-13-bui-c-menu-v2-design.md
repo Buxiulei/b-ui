@@ -1942,7 +1942,7 @@ bui-c delete <名字>... [--to <名字>] [-y] [--json]
 | 2 | 本地端口 | 连 `127.0.0.1:{socks}` 与 `:{http}` | 各 200ms | 是 | `Sys::tcp_listening` |
 | 3 | TUN（只在 TUN 模式） | `bui-tun` 存在，且默认路由指向它 | — | 是 | `Engine::tun_up` / `tun_default_route` |
 | 4 | 隧道 | `GET https://www.gstatic.com/generate_204`；TUN 直连，SOCKS 经 `socks5h://127.0.0.1:{socks}` | 8s（`PROBE_TIMEOUT`） | 是 | `Net::probe`（带耗时） |
-| ↳ | 修复 | 1–4 里有失败：`check::run_manual`（重启，记进 runtime.json，不受退避；**持锁**，§8.3）→ TUN 等就绪最多 5 秒，SOCKS 等端口最多 3 秒 → 1–4 重做一遍 | ≤ 5s + 8s | — | 现有函数 |
+| ↳ | 修复 | 1–4 里有失败：`check::restart`（重启，记进 runtime.json，不受退避；要不要修只看 1–4 的结论，不再探测一次）→ TUN 等就绪最多 5 秒，SOCKS 等端口最多 3 秒（重启与等就绪**持同一把锁**，§8.3）→ 1–4 重做一遍 | ≤ 5s + 8s | — | 现有函数 |
 | 5 | Google | `https://www.google.com/generate_204`（同 via） | 6s | **是** | `Net::probe` |
 | 6 | YouTube | `https://www.youtube.com/`（同 via，2xx/3xx 算通） | 6s | 否 | `Net::probe` |
 | 7 | GitHub | `https://github.com/robots.txt`（同 via）。不用根路径：每日自更新也在 github.com 上，守门测试按地址比对会把它算进来 | 6s | 否 | `Net::probe` |
@@ -1967,7 +1967,7 @@ bui-c delete <名字>... [--to <名字>] [-y] [--json]
 ### 6.3 总时长预算（顺序执行）
 
 - **一般情况**：每项几百毫秒，下载 1 MB 一般 1–2 秒，合计 3–8 秒（§3d-60-1 那一屏标的是 5 秒）。
-- **最坏情况**：隧道不通时走代理的项都跳过，所以最慢的是「服务在跑、隧道通、检测站全挂」：隧道 8 + 网站 6+6+6 + 百度 5 + 下载 5 + IPv4 8+6 + IPv6 5+5+6 = **66 秒**；再加上修复那一轮（5 + 8）是 79 秒，**当前实现约 87 秒**——`MenuHooks::repair` 走 `check::run_manual`，它内部先自己打一次 `PROBE_URL`（8 秒封顶）才决定要不要重启，这一次探测是多余的；T12a 把 `check::run_with` 拆成 `assess` / `restart_locked` 之后，repair 直接调 `restart_locked`，这次探测消失，预算改回 79 秒。v3 同类情形要 85–100 秒（r6 §1.11）。每项都边做边打，人看得到进度，所以开头**不写**「约 N 秒」之类的承诺（d2 写「约 10 秒内」，与它自己的预算对不上，j-user 指出过）。
+- **最坏情况**：隧道不通时走代理的项都跳过，所以最慢的是「服务在跑、隧道通、检测站全挂」：隧道 8 + 网站 6+6+6 + 百度 5 + 下载 5 + IPv4 8+6 + IPv6 5+5+6 = **66 秒**；再加上修复那一轮（5 + 8）是 **79 秒**。v3 同类情形要 85–100 秒（r6 §1.11）。每项都边做边打，人看得到进度，所以开头**不写**「约 N 秒」之类的承诺（d2 写「约 10 秒内」，与它自己的预算对不上，j-user 指出过）。
 - **为什么不并发**：边做边打比把总时长压到几秒更要紧；并发只在测速（§7）里用。`Net: Sync`（D22）之后，并发在技术上已经可行，留作以后的优化。
 
 ### 6.4 边做边打
@@ -2015,7 +2015,7 @@ via 的选择复用 `check::probe` 里 `Mode → Via` 那一段（`check.rs:125-
 
 - 新模块 `nettest.rs` 只被菜单 [5] 和 `bui-c test` 调用。`Cmd::Check`（timer）仍然走 `check::run`，请求量不变：每分钟打一次 gstatic（brief §2）。
 - **[5] 不再顺带做每日自更新**：现在菜单 [5] 调的是 `run_check(ctx, true)`，它在检查之后还会走 `update_due`，可能触发一次自更新（`cli.rs:786-815`）。人点的是「连接检查」，结果却换了二进制，这是意外的副作用。自更新只留在 timer 路径上。
-- [5] 的修复照旧记进 `runtime.json`（`check::run_manual`），timer 的退避从这次算起（现状）；修复这一步持锁（§8.3）。
+- [5] 的修复照旧记进 `runtime.json`（`check::restart`），timer 的退避从这次算起（现状）；修复这一步持锁（§8.3）。
 - **守门测试**（来自 d2）：`timer_check_requests_only_the_probe_and_update_sources` 跑一次 `Cmd::Check`，断言 `FakeNet::log()` 里只有 gstatic 204 与 manifest / release 地址，并逐个列出禁止访问的主机：ippure、ip-api、ipify、icanhazip、google、youtube、github、baidu、cloudflare。以后谁往 timer 路径里加检测站，这条测试就会失败。
 
 ### 6.8 命令行入口
