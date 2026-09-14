@@ -116,11 +116,21 @@ jobs:
         run: |
           set -euo pipefail
           cargo test --workspace -- --nocapture 2>&1 | tee "$RUNNER_TEMP/test.log"
-          # 只判「内核校验漏跑」这一种 skip：sing-box / xray / hysteria 没在 PATH 上，
-          # 或 caddy 不在三个绝对路径上。测试里另有两种设计内的 skip（缺 P0 的 v3
-          # fixture、P5 删掉 server/core.sh 后的 v3 sysctl 对照），不能算漏跑判红。
-          if grep -Eq 'skipped: ((sing-box|xray|hysteria) not found|本机没有 caddy 二进制)' "$RUNNER_TEMP/test.log"; then
+          # 只判「内核校验漏跑」这一种 skip：内核二进制没在 PATH 上（含带版本后缀的形态，
+          # 如 `skipped: sing-box-1.12 not found`），或 caddy 不在三个绝对路径上。
+          # 白名单——这三条 skip 在 CI 里必然出现、也本该出现，放行：
+          #   skipped: sing-box-1.12 not found / -1.13 / -1.14
+          # 它们是 crates/bui-schema/tests/common/mod.rs 的 check_singbox_all 除默认名外额外
+          # 找的多版本二进制。本 job 每格只装默认名 sing-box 的矩阵版本，并由上一步
+          # `sing-box version` 守门钉死大版本，1.12/1.13/1.14 三版覆盖由三格矩阵提供，
+          # 带后缀的二进制在 CI 里根本不存在。给 check_singbox_all 加新版本时要同时加进
+          # matrix.singbox 与这条白名单，否则新版本漏跑会判红——这正是要的。
+          # 测试里另有几种设计内的 skip（缺 P0 的 v3 fixture、P5 删掉 server/core.sh 后的
+          # v3 sysctl 对照、openssl 不可用、开发机设了域名环境变量），不是内核校验，天然不匹配。
+          kernel_skips=$(grep -E 'skipped: ((sing-box|xray|hysteria)(-[0-9.]+)? not found|本机没有 caddy 二进制)' "$RUNNER_TEMP/test.log" || true)
+          missed=$(printf '%s\n' "$kernel_skips" | grep -Ev 'skipped: sing-box-1\.(12|13|14) not found' || true)
+          if [[ -n "$missed" ]]; then
             echo "内核校验被跳过，说明没找到内核二进制：CI 不接受 skip"
-            grep -E 'skipped: ' "$RUNNER_TEMP/test.log"
+            printf '%s\n' "$missed"
             exit 1
           fi
