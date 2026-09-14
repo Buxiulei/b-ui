@@ -58,7 +58,8 @@ pub struct SubUrls {
     pub nodes: String,
 }
 
-/// 把「域名 + token」拼成那四条订阅地址（装机收尾输出与面板共用，免得两边各拼一遍）。
+/// 把「域名 + token」拼成那四条订阅地址。今天只有装机收尾摘要（`bui` 的 `commands::install`）
+/// 调用；面板的链接是前端 `web/app.js` 的 `subPath` 自己拼的。服务端以后要给链接就走这一处。
 pub fn sub_urls(domain: &str, token: &str) -> SubUrls {
     let at = |path: &str| format!("https://{domain}/api/{path}/{token}");
     SubUrls {
