@@ -1044,7 +1044,9 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
                 let mut rt = Runtime::load(ctx.sys, ctx.paths);
                 let now = ctx.sys.now().unix_timestamp();
                 record_update_check(&mut rt, &r, now);
-                rt.last_update_at = Some(now);
+                if r.counts_as_update() {
+                    rt.last_update_at = Some(now);
+                }
                 rt.last_update_attempt_at = Some(now);
                 rt.save(ctx.sys, ctx.paths)?;
                 r
@@ -1280,6 +1282,8 @@ fn run_check<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()
 ///   否则离线机器每分钟白等两个源各 15 秒。下载或安装失败都留着它。
 /// - 锁被占：这份下载扔掉，「尝试过」还原成原来的值——没装成，下一分钟再试，不落进 1 小时退避。
 /// - 拿到锁后重读 profiles：下载期间关掉了自动更新就不装；重不重启按现在有没有活动节点（D16）。
+/// - 进锁发现下载期间已被别处换过、一样都没装（[`update::Report::counts_as_update`] 为假）：★ 按盘上
+///   现在的样子落，`last_update_at` 不动——没装成不推迟 23 小时，按「尝试过」的 1 小时退避再查。
 fn daily_self_update<S: Sys, N: Net, P: Prompt>(
     ctx: &mut Ctx<'_, S, N, P>,
     prof: &Profiles,
@@ -1316,7 +1320,10 @@ fn daily_self_update<S: Sys, N: Net, P: Prompt>(
         Ok(r) => {
             let mut rt = Runtime::load(ctx.sys, ctx.paths);
             let now = ctx.sys.now().unix_timestamp();
-            rt.last_update_at = Some(now);
+            // 下载期间别处已经换过、这次什么都没装：不算更新过，「尝试过」留着按 1 小时退避再查
+            if r.counts_as_update() {
+                rt.last_update_at = Some(now);
+            }
             // 自更新也是一次「检查更新」：装完了就把菜单上的 ★ 摘掉
             record_update_check(&mut rt, &r, now);
             rt.save(ctx.sys, ctx.paths)?;
@@ -2630,7 +2637,9 @@ fn maint_install_update<S: Sys, N: Net, P: Prompt>(
             let mut rt = Runtime::load(ctx.sys, ctx.paths);
             let now = ctx.sys.now().unix_timestamp();
             record_update_check(&mut rt, &r, now);
-            rt.last_update_at = Some(now);
+            if r.counts_as_update() {
+                rt.last_update_at = Some(now);
+            }
             rt.last_update_attempt_at = Some(now);
             // 二进制已经换了、服务已经重启：写不进 runtime 不能说成「失败」。尽力而为、记一笔，
             // ★ 挂到下次检查才摘（同 `release_after_teardown`）
@@ -5000,6 +5009,149 @@ mod tests {
         assert_eq!(s.get("/opt/bui-c/bin/sing-box").unwrap(), "ELF");
         assert!(!s.called("systemctl restart bui-c.service"));
         assert_eq!(s.writes("/opt/bui-c/runtime.json"), 0);
+    }
+
+    /// 下载期间别处（菜单、另一个会话）装好了 [`update_machine`] 发的 9.9.9：盘上是 `bui-c-newer`、
+    /// 内核 1.14.5。
+    fn concurrent_install_of_9_9_9(s: &FakeSys) {
+        s.put(crate::paths::SELF_BIN, "bui-c-newer");
+        s.put("/opt/bui-c/bin/sing-box", NEW_KERNEL);
+        s.reply(
+            "/opt/bui-c/bin/sing-box version",
+            0,
+            "sing-box version 1.14.5\n",
+        );
+    }
+
+    /// 下载期间别处装上的不是 manifest 要的那一份。
+    fn concurrent_install_of_something_else(s: &FakeSys) {
+        s.put(crate::paths::SELF_BIN, "bui-c-other");
+        s.put("/opt/bui-c/bin/sing-box", "ELF-other");
+        s.reply(
+            "/opt/bui-c/bin/sing-box version",
+            0,
+            "sing-box version 1.14.9\n",
+        );
+    }
+
+    /// 审查 T12b r2 I1（命令行出口）：`bui-c update` 下载期间别处已经装好了同一份，进锁后两道闸都跳过。
+    /// 本机已是最新：输出「自身更新=false …」、退出 0；runtime 不能再点亮 ★，也不能记成「刚更新过」
+    /// ——那是别处那次的事，这次什么都没装。别处装的是别的东西时 ★ 照挂，同样不算更新过。
+    #[test]
+    fn the_update_command_leaves_a_concurrent_install_alone_and_clears_the_star() {
+        let pp = paths();
+        for (case, star) in [("别处装的是同一份", false), ("别处装的是别的", true)] {
+            let land: &dyn Fn(&FakeSys) = if star {
+                &concurrent_install_of_something_else
+            } else {
+                &concurrent_install_of_9_9_9
+            };
+            let (s, n) = update_machine("9.9.9", Some("bui-c-newer"), Some("1.13.19"));
+            with_unit(&s);
+            let race = crate::fake::LandsDuringDownload::new(&s, &n, "/sing-box-linux-", land);
+            let mut p = Scripted::from([]);
+            let mut ctx = Ctx::new(&race, &n, &pp, &mut p, false, false);
+            dispatch(&parse(&["update"]), &mut ctx).unwrap();
+            let t = ctx.transcript.clone();
+            assert!(race.landed(), "{case}：别处的安装没落下来");
+            assert_eq!(
+                t.lines().collect::<Vec<_>>(),
+                vec![
+                    "manifest 9.9.9（来源 面板）",
+                    "自身更新=false 内核更新=false 已重启=false"
+                ],
+                "{case}"
+            );
+            assert_eq!(s.writes("/usr/local/bin/.bui-c.tmp"), 0, "{case}");
+            assert_eq!(s.writes("/opt/bui-c/bin/sing-box"), 0, "{case}");
+            assert!(!s.called("systemctl restart bui-c.service"), "{case}");
+            let rt = Runtime::load(&s, &pp);
+            assert_eq!(rt.update_available, star, "{case}：{rt:?}");
+            assert_eq!(rt.update_version.as_deref(), Some("9.9.9"), "{case}");
+            assert_eq!(rt.last_update_at, None, "{case}：{rt:?}");
+            let prof = Profiles::load(&s, &pp).unwrap();
+            let mut p = Scripted::from([]);
+            let ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+            assert_eq!(
+                menu::render_options(&engine_status(&ctx, &prof), 80).contains('★'),
+                star,
+                "{case}"
+            );
+        }
+    }
+
+    /// 同一场景在菜单 [7] → [1] 的出口：答 y 之后下载期间别处装好了同一份。结果行说「没有需要更新的」，
+    /// 回主菜单不挂 ★，再进 [7] 子页「上次检查」不说「有新版」。
+    #[test]
+    fn maint_update_after_a_concurrent_install_says_nothing_to_update_and_drops_the_star() {
+        let pp = paths();
+        let (s, n) = update_machine("9.9.9", Some("bui-c-newer"), Some("1.13.19"));
+        with_unit(&s);
+        let race = crate::fake::LandsDuringDownload::new(
+            &s,
+            &n,
+            "/sing-box-linux-",
+            &concurrent_install_of_9_9_9,
+        );
+        let mut p = Scripted {
+            queue: ["7", "1", "y", "", "7", "0", "0"]
+                .iter()
+                .map(|x| x.to_string())
+                .collect(),
+            asked: Vec::new(),
+            tty: true,
+        };
+        let mut ctx = Ctx::new(&race, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert!(race.landed(), "别处的安装没落下来：{t}");
+        assert_eq!(pauses(&p.asked), 1, "{:?}", p.asked);
+        assert_eq!(s.writes("/usr/local/bin/.bui-c.tmp"), 0, "{t}");
+        assert_eq!(s.writes("/opt/bui-c/bin/sing-box"), 0, "{t}");
+        assert!(!s.called("systemctl restart bui-c.service"), "{t}");
+        assert!(last_line(&t).contains("没有需要更新的"), "{t}");
+        let result = t.find("没有需要更新的").unwrap();
+        let after = &t[result..];
+        assert!(after.contains("更新与维护"), "回到了主菜单：{after}");
+        assert!(!after.contains('★'), "回主菜单不挂 ★：{after}");
+        let again = t.split("\n  更新与维护\n").last().unwrap();
+        assert!(
+            again.contains("已是最新") && !again.contains("有新版"),
+            "{again}"
+        );
+        let rt = Runtime::load(&s, &pp);
+        assert!(!rt.update_available, "{rt:?}");
+        assert_eq!(rt.last_update_at, None, "{rt:?}");
+    }
+
+    /// 同一场景在巡检的每日自更新上的出口：这轮什么都不盖、不打「自更新：」、★ 不挂。也不记成「更新过」
+    /// ——这次没装，不能因此推迟 23 小时；「尝试过」留着，按 1 小时退避再查。
+    #[test]
+    fn the_daily_self_update_leaves_a_concurrent_install_alone_and_clears_the_star() {
+        let pp = paths();
+        let (s, n) = update_machine("9.9.9", Some("bui-c-newer"), Some("1.13.19"));
+        with_unit(&s);
+        n.route(crate::check::PROBE_URL, FakeReply::Status(204));
+        let race = crate::fake::LandsDuringDownload::new(
+            &s,
+            &n,
+            "/sing-box-linux-",
+            &concurrent_install_of_9_9_9,
+        );
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&race, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["check"]), &mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert!(race.landed(), "别处的安装没落下来：{t}");
+        assert!(t.contains("正常") && !t.contains("自更新："), "{t}");
+        assert_eq!(s.writes("/usr/local/bin/.bui-c.tmp"), 0, "{t}");
+        assert_eq!(s.writes("/opt/bui-c/bin/sing-box"), 0, "{t}");
+        assert!(!s.called("systemctl restart bui-c.service"), "{t}");
+        assert_eq!(lock_counts(&s), (1, 1), "{:?}", s.calls());
+        let rt = Runtime::load(&s, &pp);
+        assert!(!rt.update_available, "{rt:?}");
+        assert_eq!(rt.last_update_at, None, "{rt:?}");
+        assert!(rt.last_update_attempt_at.is_some(), "{rt:?}");
     }
 
     /// 查到了、但 runtime.json 写不进去（审查 #1）：菜单不能整个退出——停下来说「失败：…」，

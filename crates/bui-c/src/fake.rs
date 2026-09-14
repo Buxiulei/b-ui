@@ -464,6 +464,97 @@ impl Net for FakeNet {
     }
 }
 
+/// 下载期间另一个会话装好了更新：`net` 一旦请求过 `url_part`，下一次经这里碰盘之前先跑一次 `land`
+/// ——等价于「这份下载进行到一半，别处已经把盘上换掉」。FakeSys 不是 `Sync`（`RefCell`），塞不进
+/// `Net: Sync` 的实现里，所以由 Sys 这一侧看 FakeNet 的请求流水来落。`update::fetch` 在下载之后
+/// 不再碰盘，落下的改动就只有之后的步骤（拿锁、`update::install`）看得到。
+pub struct LandsDuringDownload<'a> {
+    sys: &'a FakeSys,
+    net: &'a FakeNet,
+    url_part: &'a str,
+    land: &'a dyn Fn(&FakeSys),
+    landed: Cell<bool>,
+}
+
+impl<'a> LandsDuringDownload<'a> {
+    pub fn new(
+        sys: &'a FakeSys,
+        net: &'a FakeNet,
+        url_part: &'a str,
+        land: &'a dyn Fn(&FakeSys),
+    ) -> Self {
+        Self {
+            sys,
+            net,
+            url_part,
+            land,
+            landed: Cell::new(false),
+        }
+    }
+    /// `land` 跑过没有：用例据此断言确实测到了「下载期间被换过」，不是空测。
+    pub fn landed(&self) -> bool {
+        self.landed.get()
+    }
+    fn tick(&self) -> &FakeSys {
+        if !self.landed.get() && self.net.log().iter().any(|l| l.contains(self.url_part)) {
+            self.landed.set(true);
+            (self.land)(self.sys);
+        }
+        self.sys
+    }
+}
+
+impl Sys for LandsDuringDownload<'_> {
+    fn run(&self, prog: &str, args: &[&str]) -> Result<Output> {
+        self.tick().run(prog, args)
+    }
+    fn read(&self, path: &Path) -> Result<Vec<u8>> {
+        self.tick().read(path)
+    }
+    fn write(&self, path: &Path, data: &[u8], mode: u32) -> Result<()> {
+        self.tick().write(path, data, mode)
+    }
+    fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+        self.tick().rename(from, to)
+    }
+    fn remove_file(&self, path: &Path) -> Result<()> {
+        self.tick().remove_file(path)
+    }
+    fn remove_dir_all(&self, path: &Path) -> Result<()> {
+        self.tick().remove_dir_all(path)
+    }
+    fn mkdir_p(&self, path: &Path) -> Result<()> {
+        self.tick().mkdir_p(path)
+    }
+    fn exists(&self, path: &Path) -> bool {
+        self.tick().exists(path)
+    }
+    fn read_dir(&self, path: &Path) -> Result<Vec<PathBuf>> {
+        self.tick().read_dir(path)
+    }
+    fn now(&self) -> time::OffsetDateTime {
+        self.tick().now()
+    }
+    fn sleep(&self, d: Duration) {
+        self.tick().sleep(d)
+    }
+    fn env(&self, key: &str) -> Option<String> {
+        self.tick().env(key)
+    }
+    fn term_size(&self) -> Option<(u16, u16)> {
+        self.tick().term_size()
+    }
+    fn tcp_listening(&self, port: u16) -> bool {
+        self.tick().tcp_listening(port)
+    }
+    fn resolve(&self, host: &str, timeout: Duration) -> Result<Duration> {
+        self.tick().resolve(host, timeout)
+    }
+    fn try_lock(&self, path: &Path) -> Result<Option<LockGuard>> {
+        self.tick().try_lock(path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

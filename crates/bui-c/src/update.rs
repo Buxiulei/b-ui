@@ -75,8 +75,21 @@ pub struct Report {
     pub kernel_outdated: bool,
     /// manifest 要的客户端内核版本（`kernels.client_sing_box`）
     pub kernel_wanted: String,
-    /// 本机 `bin/sing-box version` 报的版本；没装或跑不通是 `None`
+    /// 本机 `bin/sing-box version` 报的版本；没装或跑不通是 `None`。[`install`] 进锁发现内核已被
+    /// 别处换过时改成那时读到的
     pub kernel_local: Option<String>,
+    /// [`install`] 进锁时发现下载期间盘上已被别的操作换过，至少有一项没盖。这时 `self_reason` 与
+    /// `kernel_outdated` 已按盘上现在的样子改过：别处装的正是 manifest 那一份就是「已是最新」
+    pub superseded: bool,
+}
+
+impl Report {
+    /// 这次要不要记成「更新过」（`runtime.last_update_at`，每日自更新据此隔 23 小时再查）：换上了东西，
+    /// 或本来就没有要换的。进锁发现下载期间已被别处换过、这次一样都没换上的不算——那是别处那次
+    /// 更新，它自己会记；别处装的不是 manifest 那一份时也不该推迟 23 小时（审查 T12b r2 I1）。
+    pub fn counts_as_update(&self) -> bool {
+        self.self_updated || self.kernel_updated || !self.superseded
+    }
 }
 
 /// manifest 里的 bui-c 与本机的比出来是什么情况（spec §8.1）。菜单与 `--check-only` 按它分开说：
@@ -410,6 +423,9 @@ pub struct Staged {
     pub report: Report,
     /// 要换上的 bui-c（manifest 缺本机架构、或已是那一份构建时为 `None`）
     self_bin: Option<Vec<u8>>,
+    /// manifest 里本机架构 bui-c 的 sha256（`self_bin` 为 `None` 时也是 `None`）：install 跳过自身时
+    /// 拿它看别处装上的是不是同一份
+    self_want: Option<String>,
     /// 要换上的 sing-box（内核已是 manifest 要的版本时为 `None`）
     kernel_bin: Option<Vec<u8>>,
     /// 这份下载出自哪个 manifest 版本（install 记日志用）
@@ -425,6 +441,7 @@ impl std::fmt::Debug for Staged {
         f.debug_struct("Staged")
             .field("report", &self.report)
             .field("self_bin", &self.self_bin.as_ref().map(Vec::len))
+            .field("self_want", &self.self_want)
             .field("kernel_bin", &self.kernel_bin.as_ref().map(Vec::len))
             .field("manifest_version", &self.manifest_version)
             .field("self_sha", &self.self_sha)
@@ -445,19 +462,20 @@ pub fn fetch<S: Sys, N: Net>(sys: &S, net: &N, paths: &Paths, prof: &Profiles) -
     let (m, report) = assess(sys, net, paths, prof)?;
     let panel = prof.panel.as_ref();
     let self_file = format!("bui-c-linux-{}", arch_suffix());
-    let self_bin = match report.self_reason {
-        SelfReason::Current => None,
+    let (self_bin, self_want) = match report.self_reason {
+        SelfReason::Current => (None, None),
         // 没有可下载的：不在这里报错，内核照换。命令行 `bui-c update` 事后仍以失败退出（cli.rs）
         SelfReason::MissingAsset => {
             tracing::warn!(
                 file = %self_file,
                 "manifest 里没有本机架构的 bui-c，这次跳过 bui-c、只看内核"
             );
-            None
+            (None, None)
         }
         SelfReason::NewVersion | SelfReason::Rebuild | SelfReason::Unreadable => {
             let srcs = sources(panel, &m, &self_file)?;
-            Some(fetch_verified(net, &srcs, &m.artifact(&self_file)?.sha256)?.1)
+            let want = m.artifact(&self_file)?.sha256.clone();
+            (Some(fetch_verified(net, &srcs, &want)?.1), Some(want))
         }
     };
     let kernel_bin = if report.kernel_outdated {
@@ -470,6 +488,7 @@ pub fn fetch<S: Sys, N: Net>(sys: &S, net: &N, paths: &Paths, prof: &Profiles) -
     Ok(Staged {
         report,
         self_bin,
+        self_want,
         kernel_bin,
         manifest_version: m.version,
         self_sha,
@@ -492,6 +511,8 @@ pub fn restarts_on_kernel_swap<S: Sys>(sys: &S, paths: &Paths, prof: &Profiles) 
 ///
 /// 下载在锁外，从 fetch 开始到拿到锁之间别的 bui-c 可能已经换过（菜单里刚装完一版、巡检的自更新）：
 /// 盘上的 bui-c 已不是 fetch 开始下载前那一份、内核版本已不是那时读到的，就不拿这份旧下载去盖。
+/// 跳过时结论按盘上现在的样子改（`superseded`）：别处装上的正是 manifest 那一份，就是「已是最新」，
+/// 否则照旧算要换——调用方拿这份结论落 runtime，★ 与结果行才对得上。
 ///
 /// 失败即返回：先换自身、再写内核，写内核失败时自身已经换上了，不重启（下次检查只剩内核要换）。
 pub fn install<S: Sys>(
@@ -504,21 +525,34 @@ pub fn install<S: Sys>(
     let Staged {
         mut report,
         self_bin,
+        self_want,
         kernel_bin,
         manifest_version,
         self_sha,
     } = staged;
     tracing::info!(manifest = %manifest_version, "安装更新");
     if let Some(data) = self_bin {
-        if disk_sha(sys, Path::new(SELF_BIN)) == self_sha {
+        let on_disk = disk_sha(sys, Path::new(SELF_BIN));
+        if on_disk == self_sha {
             replace_self(sys, &data)?;
             report.self_updated = true;
         } else {
-            tracing::warn!("下载期间 bui-c 已被别的操作换过，这次不替换");
+            report.superseded = true;
+            let same =
+                matches!((&on_disk, &self_want), (Some(d), Some(w)) if d.eq_ignore_ascii_case(w));
+            if same {
+                report.self_reason = SelfReason::Current;
+                report.self_outdated = false;
+            }
+            tracing::warn!(
+                same_as_manifest = same,
+                "下载期间 bui-c 已被别的操作换过，这次不替换"
+            );
         }
     }
     if let Some(data) = kernel_bin {
-        if kernel_version(sys, paths) == report.kernel_local {
+        let on_disk = kernel_version(sys, paths);
+        if on_disk == report.kernel_local {
             sys.mkdir_p(&paths.bin_dir())?;
             sys.write(&paths.singbox(), &data, 0o755)?;
             report.kernel_updated = true;
@@ -527,7 +561,13 @@ pub fn install<S: Sys>(
                 report.restarted = true;
             }
         } else {
-            tracing::warn!("下载期间 sing-box 内核已被别的操作换过，这次不替换");
+            report.superseded = true;
+            report.kernel_outdated = on_disk.as_deref() != Some(report.kernel_wanted.as_str());
+            tracing::warn!(
+                local = ?on_disk,
+                "下载期间 sing-box 内核已被别的操作换过，这次不替换"
+            );
+            report.kernel_local = on_disk;
         }
     }
     Ok(report)
@@ -536,7 +576,7 @@ pub fn install<S: Sys>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fake::{FakeNet, FakeReply, FakeSys};
+    use crate::fake::{FakeNet, FakeReply, FakeSys, LandsDuringDownload};
     use crate::paths::Paths;
     use crate::profiles::Panel;
     use crate::testutil::profiles_socks;
@@ -1445,79 +1485,6 @@ mod tests {
         assert_eq!(s.writes(SELF_TMP), 0);
     }
 
-    /// 下载期间另一个会话装好了更新：`net` 一旦请求过 `url_part`，下一次经这里碰盘之前先跑 `land`
-    /// ——等价于「这份下载进行到一半，别处已经把盘上换掉」。FakeSys 不是 `Sync`（`RefCell`），塞不进
-    /// `Net: Sync` 的实现里，所以由 Sys 这一侧看 FakeNet 的请求流水来落；fetch 在下载之后不再碰盘，
-    /// 落下的改动就只有 install 看得到。
-    struct LandsDuringDownload<'a> {
-        sys: &'a FakeSys,
-        net: &'a FakeNet,
-        url_part: &'a str,
-        land: &'a dyn Fn(&FakeSys),
-        landed: std::cell::Cell<bool>,
-    }
-
-    impl LandsDuringDownload<'_> {
-        fn tick(&self) -> &FakeSys {
-            if !self.landed.get() && self.net.log().iter().any(|l| l.contains(self.url_part)) {
-                self.landed.set(true);
-                (self.land)(self.sys);
-            }
-            self.sys
-        }
-    }
-
-    impl Sys for LandsDuringDownload<'_> {
-        fn run(&self, prog: &str, args: &[&str]) -> Result<crate::sys::Output> {
-            self.tick().run(prog, args)
-        }
-        fn read(&self, path: &Path) -> Result<Vec<u8>> {
-            self.tick().read(path)
-        }
-        fn write(&self, path: &Path, data: &[u8], mode: u32) -> Result<()> {
-            self.tick().write(path, data, mode)
-        }
-        fn rename(&self, from: &Path, to: &Path) -> Result<()> {
-            self.tick().rename(from, to)
-        }
-        fn remove_file(&self, path: &Path) -> Result<()> {
-            self.tick().remove_file(path)
-        }
-        fn remove_dir_all(&self, path: &Path) -> Result<()> {
-            self.tick().remove_dir_all(path)
-        }
-        fn mkdir_p(&self, path: &Path) -> Result<()> {
-            self.tick().mkdir_p(path)
-        }
-        fn exists(&self, path: &Path) -> bool {
-            self.tick().exists(path)
-        }
-        fn read_dir(&self, path: &Path) -> Result<Vec<std::path::PathBuf>> {
-            self.tick().read_dir(path)
-        }
-        fn now(&self) -> time::OffsetDateTime {
-            self.tick().now()
-        }
-        fn sleep(&self, d: Duration) {
-            self.tick().sleep(d)
-        }
-        fn env(&self, key: &str) -> Option<String> {
-            self.tick().env(key)
-        }
-        fn term_size(&self) -> Option<(u16, u16)> {
-            self.tick().term_size()
-        }
-        fn tcp_listening(&self, port: u16) -> bool {
-            self.tick().tcp_listening(port)
-        }
-        fn resolve(&self, host: &str, timeout: Duration) -> Result<Duration> {
-            self.tick().resolve(host, timeout)
-        }
-        fn try_lock(&self, path: &Path) -> Result<Option<LockGuard>> {
-            self.tick().try_lock(path)
-        }
-    }
-
     /// 审查 T12b I1：「盘上已被别处换过就不盖」的两道闸都要覆盖**整个下载窗口**。timer 在 T0 看过、
     /// 开始下载 → 人在菜单里 T1 装好更新的一版 → timer 下完进锁：盘上的 bui-c 与内核都已不是它开始
     /// 下载时的那一份，手里这份旧下载一样都不能盖上去。以前自身那道闸在下载**之后**才取样，取到的
@@ -1530,13 +1497,7 @@ mod tests {
             s.put(KERNEL, "ELF-newer");
             s.reply(&format!("{KERNEL} version"), 0, "sing-box version 1.14.9\n");
         };
-        let race = LandsDuringDownload {
-            sys: &s,
-            net: &n,
-            url_part: "/sing-box-linux-",
-            land: &land,
-            landed: std::cell::Cell::new(false),
-        };
+        let race = LandsDuringDownload::new(&s, &n, "/sing-box-linux-", &land);
         let staged = fetch(&race, &n, &paths(), &prof).unwrap();
         assert!(
             staged.self_bin.is_some() && staged.kernel_bin.is_some(),
@@ -1550,7 +1511,7 @@ mod tests {
             &crate::lock::LockGuard::stub(),
         )
         .unwrap();
-        assert!(race.landed.get(), "别处的安装没落下来，用例没测到东西");
+        assert!(race.landed(), "别处的安装没落下来，用例没测到东西");
         assert_eq!(s.get(SELF_BIN).unwrap(), "bui-c-newer", "{r:?}");
         assert_eq!(s.get(KERNEL).unwrap(), "ELF-newer", "{r:?}");
         assert_eq!(
@@ -1561,6 +1522,95 @@ mod tests {
         assert_eq!(s.writes(SELF_TMP), 0);
         assert_eq!(s.writes(KERNEL), 0);
         assert!(!s.called("systemctl restart bui-c.service"));
+        // 别处装上的不是 manifest 要的那一份：结论照旧是「要换」，★ 该挂；内核按现在盘上的版本说
+        assert_eq!(
+            (r.self_reason, r.self_outdated, r.kernel_outdated),
+            (SelfReason::NewVersion, true, true),
+            "{r:?}"
+        );
+        assert_eq!(r.kernel_local.as_deref(), Some("1.14.9"), "{r:?}");
+    }
+
+    /// 审查 T12b r2 I1：下载期间别处装上的**正是**这次要装的那一份（菜单里刚装完同一版）。两道闸照样
+    /// 不盖，但结论要跟着改成「已是最新」——还说 NewVersion / 内核过期的话，三个入口拿它落 runtime，
+    /// 会把 ★ 重新点亮，与结果行「没有需要更新的」自相矛盾。
+    #[test]
+    fn install_skipping_the_same_update_reports_nothing_pending() {
+        let (s, n, prof) = staged_machine();
+        let land = |s: &FakeSys| {
+            s.put(SELF_BIN, "bui-c-new");
+            s.put(KERNEL, "ELF-new");
+            s.reply(&format!("{KERNEL} version"), 0, "sing-box version 1.14.5\n");
+        };
+        let race = LandsDuringDownload::new(&s, &n, "/sing-box-linux-", &land);
+        let staged = fetch(&race, &n, &paths(), &prof).unwrap();
+        let r = install(
+            &race,
+            &paths(),
+            &prof,
+            staged,
+            &crate::lock::LockGuard::stub(),
+        )
+        .unwrap();
+        assert!(race.landed(), "别处的安装没落下来，用例没测到东西");
+        assert_eq!(s.writes(SELF_TMP), 0, "{r:?}");
+        assert_eq!(s.writes(KERNEL), 0, "{r:?}");
+        assert!(!s.called("systemctl restart bui-c.service"));
+        assert_eq!(
+            (r.self_updated, r.kernel_updated, r.restarted),
+            (false, false, false),
+            "{r:?}"
+        );
+        assert_eq!(
+            (r.self_reason, r.self_outdated, r.kernel_outdated),
+            (SelfReason::Current, false, false),
+            "{r:?}"
+        );
+        assert_eq!(r.kernel_local.as_deref(), Some("1.14.5"), "{r:?}");
+        assert!(r.superseded && !r.counts_as_update(), "{r:?}");
+
+        // manifest 里的 sha256 是大写：与 `build_differs` 同一口径，大小写不敏感
+        let (s, _, prof) = staged_machine();
+        s.put(SELF_BIN, "bui-c-new");
+        let staged = Staged {
+            report: Report {
+                self_reason: SelfReason::NewVersion,
+                self_outdated: true,
+                ..Report::default()
+            },
+            self_bin: Some(b"bui-c-new".to_vec()),
+            self_want: Some(sha256_hex(b"bui-c-new").to_ascii_uppercase()),
+            kernel_bin: None,
+            manifest_version: "9.9.9".into(),
+            self_sha: Some(sha256_hex(b"bui-c-old")),
+        };
+        let r = install(&s, &paths(), &prof, staged, &crate::lock::LockGuard::stub()).unwrap();
+        assert_eq!(s.writes(SELF_TMP), 0, "{r:?}");
+        assert_eq!(
+            (r.self_reason, r.self_outdated, r.superseded),
+            (SelfReason::Current, false, true),
+            "{r:?}"
+        );
+
+        // 什么都没跳过：换上了、或本来就没什么要换，都算更新过
+        let (s, n, prof) = staged_machine();
+        let staged = fetch(&s, &n, &paths(), &prof).unwrap();
+        let r = install(&s, &paths(), &prof, staged, &crate::lock::LockGuard::stub()).unwrap();
+        assert!(
+            r.self_updated && !r.superseded && r.counts_as_update(),
+            "{r:?}"
+        );
+        let idle = Report::default();
+        assert!(idle.counts_as_update(), "{idle:?}");
+        let half = Report {
+            kernel_updated: true,
+            superseded: true,
+            ..Report::default()
+        };
+        assert!(
+            half.counts_as_update(),
+            "自身被别处换过、内核换上了：{half:?}"
+        );
     }
 
     /// 审查 T12b M5：排查「为什么没盖」时要看 fetch 那一刻盘上 bui-c 的 sha；两份二进制只打长度。
