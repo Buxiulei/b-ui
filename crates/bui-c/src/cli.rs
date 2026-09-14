@@ -56,8 +56,10 @@ pub enum Cmd {
         uri: Option<String>,
         #[arg(long)]
         panel: Option<String>,
+        /// 面板用户名或 token。写 - 从标准输入读，避免 token 留在 shell 历史
         #[arg(long)]
         user: Option<String>,
+        /// 订阅地址（从面板复制的整条链接）。写 - 从标准输入读，避免 token 留在 shell 历史
         #[arg(long)]
         sub: Option<String>,
         #[arg(long)]
@@ -721,6 +723,36 @@ fn apply_import<S: Sys, N: Net, P: Prompt>(
     Ok(())
 }
 
+/// `--user` / `--sub` 的值：写 `-` 从标准输入读一行（去首尾空白），token 不进 argv 与 shell
+/// 历史。读到 EOF 或空行就报错，不拿空值去联网。
+fn arg_or_stdin<S: Sys, N: Net, P: Prompt>(
+    ctx: &mut Ctx<'_, S, N, P>,
+    flag: &str,
+    raw: &str,
+    ask: &str,
+) -> Result<String> {
+    if raw != "-" {
+        return Ok(raw.to_string());
+    }
+    let line = ctx.prompt.read(ask)?.unwrap_or_default();
+    match line.trim() {
+        "" => Err(Error::msg(stdin_empty(flag))),
+        v => Ok(v.to_string()),
+    }
+}
+
+/// 命令行从面板取节点失败：面板不认这个地址（401 / 404）时补一句出路，再把错误交出去。
+fn relink_if_rejected<S: Sys, N: Net, P: Prompt>(
+    ctx: &mut Ctx<'_, S, N, P>,
+    fetched: Result<Incoming>,
+) -> Result<Incoming> {
+    fetched.inspect_err(|e| {
+        if link_rejected(e) {
+            ctx.say(RELINK_CLI);
+        }
+    })
+}
+
 pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>) -> Result<()> {
     match cli.cmd.as_ref().unwrap_or(&Cmd::Menu) {
         Cmd::Menu => menu_loop(ctx),
@@ -818,10 +850,28 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
             activate,
             with_deleted,
         } => {
+            // 标准输入只有一份：`-` 写在两处是用法错误，先判，一行都不读
+            let dashes = [uri, user, sub]
+                .iter()
+                .filter(|v| v.as_deref() == Some("-"))
+                .count();
+            if dashes > 1 {
+                return Err(Error::usage(STDIN_ONCE));
+            }
             let inc = if let (Some(base), Some(u)) = (panel.as_ref(), user.as_ref()) {
-                fetch_panel(ctx, base, u)?
+                let u = arg_or_stdin(ctx, "--user", u, "面板用户名或 token")?;
+                let fetched = fetch_panel(ctx, base, &u);
+                relink_if_rejected(ctx, fetched)?
             } else if let Some(url) = sub.as_ref() {
-                fetch_sub(ctx.net, url)?
+                let url = arg_or_stdin(ctx, "--sub", url, "订阅地址")?;
+                // 面板链接与菜单 [3] 同一条路：先试 `/api/nodes`（带分流规则，载荷里有人名，
+                // token 链接也拿得到名字），`/api/sub/` 取不到再退回订阅
+                let fetched = fetch_http(ctx, &url);
+                if source::panel_link(&url).is_some() {
+                    relink_if_rejected(ctx, fetched)?
+                } else {
+                    fetched?
+                }
             } else if let Some(raw) = uri.as_ref() {
                 if raw != "-" {
                     ctx.say("提示：位置参数会把 HY2 密码留在 shell 历史与 ps 里，下次用 `bui-c import -` 从标准输入粘贴");
@@ -837,9 +887,7 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
                     panel: None,
                 }
             } else {
-                return Err(Error::msg(
-                    "给一个节点链接，或用 --panel <地址> --user <用户名>，或 --sub <订阅地址>",
-                ));
+                return Err(Error::msg(IMPORT_NO_SOURCE));
             };
             // 取节点（联网）在锁外；锁里读 profiles、落盘、apply（spec §0.2 R11 / R16），
             // 打墓碑那一行在放锁之后
@@ -2230,6 +2278,11 @@ fn menu_import<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<
         }
         Err(e) => {
             ctx.say(format!("失败：{e}"));
+            // 面板链接被拒（两边都 404，或不退回订阅的面板路径 404）：链接可能停用了，给出路
+            let panel = matches!(lines.as_slice(), [url] if source::panel_link(url).is_some());
+            if panel && link_rejected(&e) {
+                ctx.say(RELINK_MENU);
+            }
             return Ok(outcome_since(ctx, start));
         }
     };
@@ -2304,9 +2357,9 @@ fn menu_import_v3<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Resu
     Ok(outcome_since(ctx, start))
 }
 
-/// 单独一行的 http(s) 地址：面板的四种按用户地址走 `/api/nodes`（带分流规则），
-/// 其余当订阅地址。`/api/sub/` 在面板接口取不到时退回订阅——v3 面板（bwg-tizi）
-/// 没有 `/api/nodes`，但 `/api/sub` 在。只在「取」失败时退回：面板节点取到了、
+/// 单独一行的 http(s) 地址（菜单 `[3]`、命令行 `--sub`）：面板的四种按用户地址走
+/// `/api/nodes`（带分流规则），其余当订阅地址。`/api/sub/` 在面板接口取不到时退回
+/// 订阅——v3 面板（bwg-tizi）没有 `/api/nodes`，但 `/api/sub` 在。只在「取」失败时退回：面板节点取到了、
 /// 后面 apply 失败时再按订阅导一遍，会把服务端分流规则换成默认表。
 ///
 /// 面板的业务错误（`Error::Msg`，如「节点列表为空」）不退回：接口在、面板说这个用户没东西，
@@ -2332,13 +2385,42 @@ fn fetch_http<S: Sys, N: Net, P: Prompt>(
     }
 }
 
-/// `/api/sub` 退回订阅时的那句话。401 / 404 是 v3 面板的常态（没有 `/api/nodes`），
-/// 说成「还没有节点接口」，不报状态码；别的原因只留一句去掉 URL 的简短说明。
+/// `/api/nodes` 回 401 / 404、改走订阅地址时的那句话。v3 面板没有这个接口，rc12 面板停用了
+/// 用户名链接、不认的 token 也是 404，四种 404 逐字节一致：客户端分不出是哪一种，只说接下来
+/// 做什么。菜单里经 `say` 原样打，2 列缩进后 40 列也要一行放下。
+pub(crate) const PANEL_REJECTED: &str = "面板接口不认这个地址，改用订阅地址";
+
+/// 面板链接两边都 401 / 404 之后的出路（菜单 `[3]`）：链接可能已经停用，重新复制整条。
+/// 同样经 `say` 原样打，40 列一行放下。
+pub(crate) const RELINK_MENU: &str = "从面板重新复制整条订阅链接，再贴进来";
+
+/// 同上，命令行版：指到能从标准输入读的 `--sub -`，token 不进 shell 历史。
+pub(crate) const RELINK_CLI: &str = "从面板重新复制整条订阅链接，用 bui-c import --sub - 粘贴";
+
+/// `bui-c import` 一个来源都没给：先教粘贴整条链接，`--user` 不再只认用户名。
+pub(crate) const IMPORT_NO_SOURCE: &str = "从面板复制整条订阅链接，用 bui-c import --sub - 粘贴\n\
+                                           也可以 --panel <地址> --user <用户名或 token>\n\
+                                           或粘贴节点链接：bui-c import -";
+
+/// `-` 在一条命令里出现了不止一处：标准输入只有一份（用法错误，退出码 2）。
+pub(crate) const STDIN_ONCE: &str = "只能有一处写 -：标准输入只有一份";
+
+/// `--user -` / `--sub -` 从标准输入没读到东西。
+pub(crate) fn stdin_empty(flag: &str) -> String {
+    format!("{flag} - 没读到内容：粘贴后回车，或从管道传入")
+}
+
+/// 面板不认这个地址：401 / 404。v3 面板没有 `/api/nodes`、rc12 面板停用了用户名链接、token
+/// 不对，都是它，客户端分不出来。
+fn link_rejected(e: &Error) -> bool {
+    matches!(e, Error::Net { detail, .. } if detail == "HTTP 401" || detail == "HTTP 404")
+}
+
+/// `/api/sub` 退回订阅时的那句话。401 / 404 只说改用订阅地址（[`PANEL_REJECTED`]），不报
+/// 状态码、不猜原因；别的原因只留一句去掉 URL 的简短说明。
 fn panel_fallback_notice(e: &Error) -> String {
     let reason = match e {
-        Error::Net { detail, .. } if detail == "HTTP 401" || detail == "HTTP 404" => {
-            return "这个面板还没有节点接口，改用订阅地址导入".to_string();
-        }
+        e if link_rejected(e) => return PANEL_REJECTED.to_string(),
         Error::Net { detail, .. } => without_urls(detail),
         Error::Parse { .. } => "返回的不是节点列表".to_string(),
         other => without_urls(&other.to_string()),
@@ -3722,7 +3804,8 @@ mod tests {
     /// `Profiles.panel` 是 root 每日自更新的 manifest 与二进制首选来源，sha256 也出自同一份
     /// manifest（没有签名）：谁被记成 panel，谁就能在这台机器上以 root 跑代码。订阅地址可以是
     /// 任意第三方主机（机场、转换服务），光凭「能返回 base64 节点列表」证明不了它是 v4 面板，
-    /// 所以 `--sub` 只导节点、不记 panel。
+    /// 所以 `--sub` 退回订阅（或本来就不是面板链接）时只导节点、不记 panel。`/api/nodes` 返回了
+    /// 合法载荷才算 v4 面板，与 `--panel` 和菜单 `[3]` 同一个判据。
     #[test]
     fn import_sub_does_not_record_the_panel_as_an_update_source() {
         let pp = paths();
@@ -5670,10 +5753,10 @@ mod tests {
         let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
         menu_loop(&mut ctx).unwrap();
         let t = ctx.transcript.clone();
-        // v3 面板没有 /api/nodes 是意料之中的：不报状态码、不带 URL，免得像出了故障
+        // v3 面板没有 /api/nodes 是意料之中的：不报状态码、不带 URL，免得像出了故障。
+        // 这句也不说「面板没有节点接口」：rc12 面板停用的链接同样是 404，分不出来
         assert!(
-            t.lines()
-                .any(|l| l == "  这个面板还没有节点接口，改用订阅地址导入"),
+            t.lines().any(|l| l == format!("  {PANEL_REJECTED}")),
             "要说明为什么改走订阅：\n{t}"
         );
         assert!(!t.contains("HTTP 404"), "{t}");
@@ -5699,7 +5782,7 @@ mod tests {
         );
     }
 
-    /// `/api/sub` 退回订阅时按原因给不同的话：401/404 是「没有节点接口」（v3 面板），
+    /// `/api/sub` 退回订阅时按原因给不同的话：401/404 只说改用订阅地址（不猜是哪种面板），
     /// 别的网络错误带上去掉 URL 的简短原因，面板的业务错误（节点列表为空）不退回、直接报。
     #[test]
     fn menu_import_api_sub_fallback_wording_depends_on_the_cause() {
@@ -5720,8 +5803,7 @@ mod tests {
         let (t, _, count, stops) = run(FakeReply::Status(401), "n");
         assert_eq!(stops, 0, "{t}");
         assert!(
-            t.lines()
-                .any(|l| l == "  这个面板还没有节点接口，改用订阅地址导入"),
+            t.lines().any(|l| l == format!("  {PANEL_REJECTED}")),
             "\n{t}"
         );
         assert_eq!(count, 2, "{t}");
@@ -5793,6 +5875,367 @@ mod tests {
         assert!(!t.contains("改用订阅地址导入"), "{t}");
         assert_eq!(n.log().len(), 1, "只试了面板接口：{:?}", n.log());
         assert_eq!(pauses(&p.asked), 1, "失败先停：{:?}", p.asked);
+    }
+
+    /// 示例订阅 token：明显是假的。rc12 面板的订阅链接末段是它，不再是用户名。
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+    /// Ttoken 接缝 1：`/api/nodes` 的 404 分不出「v3 面板没有这个接口」与「这个链接停用了 /
+    /// token 不对」（服务端四种 404 逐字节一致），所以不说原因、只说接下来做什么；两边都 404
+    /// 之后给出路：从面板重新复制整条链接。
+    #[test]
+    fn menu_import_a_rejected_panel_link_only_says_what_to_do_next() {
+        let pp = paths();
+        let run = |url: &str, rejected: &[&str]| {
+            let s = FakeSys::new();
+            ready(&s);
+            profiles_socks().save(&s, &pp).unwrap();
+            let n = FakeNet::new();
+            for r in rejected {
+                n.route(r, FakeReply::Status(404));
+            }
+            let r = run_menu(&s, &n, &pp, &["3", url, "", "", "0"], true);
+            (r, names(&s, &pp).len())
+        };
+        let relink = format!("  {RELINK_MENU}");
+
+        // 旧的用户名链接：/api/nodes 与 /api/sub 都 404
+        let (r, count) = run(
+            "https://panel.example.com/api/sub/alice",
+            &[
+                "https://panel.example.com/api/nodes/alice",
+                "https://panel.example.com/api/sub/alice",
+            ],
+        );
+        assert!(
+            r.t.lines().any(|l| l == format!("  {PANEL_REJECTED}")),
+            "\n{}",
+            r.t
+        );
+        assert!(r.t.lines().any(|l| l == relink), "要给出路：\n{}", r.t);
+        assert!(
+            !r.t.contains("节点接口"),
+            "404 分不出面板有没有接口：\n{}",
+            r.t
+        );
+        assert!(r.t.lines().any(|l| l.starts_with("  失败：")), "{}", r.t);
+        assert_eq!(count, 1, "{}", r.t);
+        assert_eq!(pauses(&r.asked), 1, "失败先停：{:?}", r.asked);
+
+        // 不退回订阅的面板路径（这里是 /api/nodes/<token>）404：同样给出路
+        let url = format!("https://panel.example.com/api/nodes/{TOKEN}");
+        let (r, _) = run(&url, &[url.as_str()]);
+        assert!(r.t.lines().any(|l| l == relink), "\n{}", r.t);
+        assert!(!r.t.contains(PANEL_REJECTED), "没有退回订阅：\n{}", r.t);
+
+        // 第三方订阅地址 404：不是面板链接，不叫人去面板复制
+        let url = "https://sub.example.com/link/abc";
+        let (r, _) = run(url, &[url]);
+        assert!(r.t.lines().any(|l| l.starts_with("  失败：")), "{}", r.t);
+        assert!(!r.t.contains(RELINK_MENU), "\n{}", r.t);
+    }
+
+    /// 接缝 1 命令行版：`--sub <面板链接>` 两边都 404、`--panel … --user …` 404，都指到
+    /// 重新复制整条链接、用 `--sub -` 粘贴。
+    #[test]
+    fn cli_import_a_rejected_panel_link_points_to_copying_the_whole_link() {
+        let pp = paths();
+        let run = |args: &[&str], rejected: &[&str]| {
+            let s = FakeSys::new();
+            ready(&s);
+            let n = FakeNet::new();
+            for r in rejected {
+                n.route(r, FakeReply::Status(404));
+            }
+            let mut p = Scripted::from([]);
+            let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+            let r = dispatch(&parse(args), &mut ctx);
+            (r, ctx.transcript.clone(), names(&s, &pp).len())
+        };
+
+        let (r, t, count) = run(
+            &["import", "--sub", "https://panel.example.com/api/sub/alice"],
+            &[
+                "https://panel.example.com/api/nodes/alice",
+                "https://panel.example.com/api/sub/alice",
+            ],
+        );
+        assert!(r.is_err(), "{t}");
+        assert!(t.lines().any(|l| l == RELINK_CLI), "要给出路：\n{t}");
+        assert!(!t.contains("节点接口"), "\n{t}");
+        assert_eq!(count, 0, "{t}");
+
+        let (r, t, _) = run(
+            &[
+                "import",
+                "--panel",
+                "https://panel.example.com",
+                "--user",
+                "alice",
+            ],
+            &["https://panel.example.com/api/nodes/alice"],
+        );
+        assert!(r.is_err(), "{t}");
+        assert!(t.lines().any(|l| l == RELINK_CLI), "\n{t}");
+    }
+
+    /// 接缝 1 第 3 条：什么来源都没给时，先教粘贴整条链接；`--user` 不再只认用户名。
+    #[test]
+    fn cli_import_without_a_source_teaches_pasting_the_whole_link_first() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        let n = FakeNet::new();
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        let msg = dispatch(&parse(&["import"]), &mut ctx)
+            .unwrap_err()
+            .to_string();
+        let first = msg.lines().next().unwrap_or_default();
+        assert!(
+            first.contains("bui-c import --sub -"),
+            "先教整条链接：{msg}"
+        );
+        assert!(msg.contains("--user <用户名或 token>"), "{msg}");
+        assert!(!msg.contains("<用户名>"), "{msg}");
+        assert!(n.log().is_empty(), "{:?}", n.log());
+    }
+
+    /// Ttoken 接缝 2：`--user -` 从标准输入读 token，走面板路径；token 只惰性存进
+    /// `Panel.username`，不打出来。
+    #[test]
+    fn cli_import_user_dash_reads_the_token_from_standard_input() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        let n = FakeNet::new();
+        n.route(
+            &format!("https://panel.example.com/api/nodes/{TOKEN}"),
+            nodes_payload("alice", vec![reality_direct_node(), hy2_direct_node()]),
+        );
+        let padded = format!("  {TOKEN}  ");
+        let mut p = Scripted::from([padded.as_str()]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(
+            &parse(&[
+                "import",
+                "--panel",
+                "https://panel.example.com",
+                "--user",
+                "-",
+            ]),
+            &mut ctx,
+        )
+        .unwrap();
+        let t = ctx.transcript.clone();
+        assert_eq!(p.asked.len(), 1, "读一行：{:?}", p.asked);
+        let saved = Profiles::load(&s, &pp).unwrap();
+        assert_eq!(
+            names(&s, &pp),
+            vec!["alice-reality-direct", "alice-hy2-direct"],
+            "{t}"
+        );
+        assert_eq!(saved.profiles[0].source, crate::profiles::Source::ApiNodes);
+        assert_eq!(
+            saved.panel.as_ref().map(|x| x.username.as_str()),
+            Some(TOKEN),
+            "去掉首尾空白后照原样存下"
+        );
+        assert!(!t.contains(TOKEN), "token 不打出来：\n{t}");
+    }
+
+    /// 接缝 2：`--sub -` 从标准输入读链接，走订阅路径。
+    #[test]
+    fn cli_import_sub_dash_reads_the_link_from_standard_input() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        let n = FakeNet::new();
+        let url = format!("https://sub.example.com/link/{TOKEN}");
+        n.route(&url, b64(BOB_REALITY));
+        let mut p = Scripted::from([url.as_str()]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["import", "--sub", "-"]), &mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert_eq!(p.asked.len(), 1, "{:?}", p.asked);
+        let saved = Profiles::load(&s, &pp).unwrap();
+        assert_eq!(saved.profiles.len(), 1, "{t}");
+        assert_eq!(
+            saved.profiles[0].source,
+            crate::profiles::Source::Subscription
+        );
+        assert_eq!(saved.panel, None, "{t}");
+        assert!(!t.contains(TOKEN), "\n{t}");
+    }
+
+    /// 接缝 2：标准输入只有一份，`-` 写在两处是用法错误（退出码 2），先判、一行都不读。
+    #[test]
+    fn cli_import_reads_standard_input_in_one_place_only() {
+        let pp = paths();
+        for args in [
+            vec![
+                "import",
+                "-",
+                "--panel",
+                "https://panel.example.com",
+                "--user",
+                "-",
+            ],
+            vec!["import", "-", "--sub", "-"],
+            vec![
+                "import",
+                "--panel",
+                "https://panel.example.com",
+                "--user",
+                "-",
+                "--sub",
+                "-",
+            ],
+        ] {
+            let s = FakeSys::new();
+            ready(&s);
+            let n = FakeNet::new();
+            let mut p = Scripted::from([TOKEN, TOKEN]);
+            let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+            let e = dispatch(&parse(&args), &mut ctx).unwrap_err();
+            assert_eq!(e.exit_code(), 2, "{args:?}: {e}");
+            assert!(e.to_string().contains("只能有一处写 -"), "{args:?}: {e}");
+            assert!(p.asked.is_empty(), "{args:?}: {:?}", p.asked);
+            assert!(n.log().is_empty(), "{args:?}: {:?}", n.log());
+        }
+    }
+
+    /// 接缝 2：`--user -` / `--sub -` 读到 EOF 或空行就报错，不拿空值去联网。
+    #[test]
+    fn cli_import_dash_with_nothing_on_standard_input_is_an_error() {
+        let pp = paths();
+        let panel = [
+            "import",
+            "--panel",
+            "https://panel.example.com",
+            "--user",
+            "-",
+        ];
+        let sub = ["import", "--sub", "-"];
+        let cases: [(&[&str], Vec<&str>); 4] = [
+            (&panel, vec![]),
+            (&panel, vec![""]),
+            (&sub, vec!["   "]),
+            (&sub, vec![]),
+        ];
+        for (args, input) in cases {
+            let s = FakeSys::new();
+            ready(&s);
+            let n = FakeNet::new();
+            let mut p = Scripted {
+                queue: input.iter().map(|x| x.to_string()).collect(),
+                asked: Vec::new(),
+                tty: false,
+            };
+            let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+            let e = dispatch(&parse(args), &mut ctx).unwrap_err();
+            assert!(e.to_string().contains("粘贴后回车"), "{args:?}: {e}");
+            assert!(n.log().is_empty(), "{args:?}: {:?}", n.log());
+            assert!(names(&s, &pp).is_empty());
+        }
+    }
+
+    /// 接缝 2：`bui-c import --help` 写明 `--user` / `--sub` 可以写 `-`。
+    #[test]
+    fn import_help_says_user_and_sub_can_read_standard_input() {
+        use clap::CommandFactory as _;
+        let cmd = Cli::command();
+        let import = cmd.find_subcommand("import").unwrap();
+        for id in ["user", "sub"] {
+            let help = import
+                .get_arguments()
+                .find(|a| a.get_id() == id)
+                .and_then(|a| a.get_help())
+                .map(|h| h.to_string())
+                .unwrap_or_default();
+            assert!(help.contains("写 - 从标准输入读"), "--{id}：{help}");
+            assert!(help.contains("shell 历史"), "--{id}：{help}");
+        }
+    }
+
+    /// Ttoken 接缝 3：订阅地址末段是 token 时，profile 名里不能有它（列表截图就把订阅凭据
+    /// 带出去了）。面板认这条链接就用载荷里的人名；拿不到人名退回「主机 + kind」。
+    #[test]
+    fn importing_a_token_subscription_never_puts_the_token_in_a_profile_name() {
+        let pp = paths();
+        let url = format!("https://panel.example.com/api/sub/{TOKEN}");
+        let api_nodes = format!("https://panel.example.com/api/nodes/{TOKEN}");
+        let no_token = |s: &FakeSys, t: &str| {
+            let saved = Profiles::load(s, &pp).unwrap();
+            assert!(!saved.profiles.is_empty(), "{t}");
+            for p in &saved.profiles {
+                assert!(!p.name.contains(TOKEN), "{}：\n{t}", p.name);
+            }
+            assert!(!t.contains(TOKEN), "\n{t}");
+            saved
+        };
+
+        // ① 命令行 --sub，面板认 token：名字用载荷里的人名
+        let s = FakeSys::new();
+        ready(&s);
+        let n = FakeNet::new();
+        n.route(
+            &api_nodes,
+            nodes_payload("alice", vec![reality_direct_node()]),
+        );
+        n.route(&url, b64(BOB_REALITY));
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["import", "--sub", &url]), &mut ctx).unwrap();
+        let saved = no_token(&s, &ctx.transcript);
+        assert_eq!(names(&s, &pp), vec!["alice-reality-direct"]);
+        assert_eq!(saved.profiles[0].source, crate::profiles::Source::ApiNodes);
+
+        // ② 命令行 --sub，面板接口 404、退回订阅：主机 + kind
+        let s = FakeSys::new();
+        ready(&s);
+        let n = FakeNet::new();
+        n.route(&api_nodes, FakeReply::Status(404));
+        n.route(&url, b64(BOB_REALITY));
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["import", "--sub", &url]), &mut ctx).unwrap();
+        let saved = no_token(&s, &ctx.transcript);
+        assert_eq!(names(&s, &pp), vec!["panel.example.com-reality-direct"]);
+        assert_eq!(
+            saved.profiles[0].source,
+            crate::profiles::Source::Subscription
+        );
+
+        // ③ 菜单 [3] 粘贴同一条链接、退回订阅：同样不露 token
+        let s = FakeSys::new();
+        ready(&s);
+        let n = FakeNet::new();
+        n.route(&api_nodes, FakeReply::Status(404));
+        n.route(&url, b64(BOB_REALITY));
+        let r = run_menu(&s, &n, &pp, &["3", &url, "", "", "0"], true);
+        no_token(&s, &r.t);
+        assert_eq!(names(&s, &pp), vec!["panel.example.com-reality-direct"]);
+    }
+
+    /// Ttoken 新文案：固定文案按容量口径 ≤ 59 列；菜单里经 `say` 原样打的两句加 2 列缩进
+    /// 在 40 列也放得下（宽度守门表 `menu::tests::screens` 另按 40–100 列量一遍）。
+    #[test]
+    fn token_import_wording_fits_the_column_budget() {
+        let fixed: Vec<String> = [RELINK_CLI, STDIN_ONCE, PANEL_REJECTED, RELINK_MENU]
+            .iter()
+            .map(|x| x.to_string())
+            .chain([stdin_empty("--user"), stdin_empty("--sub")])
+            .chain(IMPORT_NO_SOURCE.lines().map(String::from))
+            .collect();
+        for l in &fixed {
+            let w = menu::budget_width(l);
+            assert!(w <= 59, "{l} = {w}");
+        }
+        for l in [PANEL_REJECTED, RELINK_MENU] {
+            let said = format!("  {l}");
+            let w = menu::budget_width(&said);
+            assert!(w <= menu::line_limit(40), "{said} = {w}");
+        }
     }
 
     #[test]

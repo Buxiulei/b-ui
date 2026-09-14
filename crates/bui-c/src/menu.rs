@@ -2861,6 +2861,24 @@ mod tests {
         for line in [BURIED_ASK.to_string(), BURIED_RESTORED.to_string()] {
             out.push(("buried-line", delete::page(&[line], width)));
         }
+        // Ttoken：面板订阅 token 化之后导入的几句。菜单 [3] 里的两句经 `say` 原样打（不折行），
+        // 40 列也要一行放下；命令行那几句由终端自己折行，收进这张表只为守住字符归类与「折得开」
+        use crate::cli;
+        for line in [cli::PANEL_REJECTED, cli::RELINK_MENU] {
+            out.push(("token-menu", format!("  {line}\n")));
+        }
+        let token_cli = [
+            cli::RELINK_CLI.to_string(),
+            cli::STDIN_ONCE.to_string(),
+            cli::stdin_empty("--user"),
+            cli::stdin_empty("--sub"),
+        ];
+        for line in token_cli
+            .into_iter()
+            .chain(cli::IMPORT_NO_SOURCE.lines().map(String::from))
+        {
+            out.push(("token-cli", delete::page(&[line], width)));
+        }
         // T11：连接检查报告的整屏（真跑一遍 nettest::run，用逐行事件拼出来）与日志页
         out.extend(crate::nettest::sample::report_screens(width));
         out
