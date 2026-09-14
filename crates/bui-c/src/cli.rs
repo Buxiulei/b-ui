@@ -2376,7 +2376,15 @@ fn maint_menu<S: Sys, N: Net, P: Prompt>(
     };
     Ok(match action {
         MaintAction::Back => Outcome::Nothing,
-        MaintAction::CheckUpdate => maint_check_update(ctx)?,
+        // 检查本身出的错（写不进 runtime.json 之类）不能冲出菜单：停下来说一句（spec §4.3）
+        MaintAction::CheckUpdate => match maint_check_update(ctx) {
+            Ok(o) => o,
+            Err(e) => {
+                let line = format!("失败：{e}");
+                tell(ctx, &line);
+                Outcome::Pause(line)
+            }
+        },
         MaintAction::ToggleAuto => run_sub(
             ctx,
             Cmd::Update {
@@ -2466,6 +2474,7 @@ fn maint_check_update<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> 
 /// 那一行 `自身更新=true …` 是给脚本看的，进「上次：」行没人看得懂。
 ///
 /// 失败：停下来，「上次：」行是「失败：…」；runtime 不动（★ 照挂，也不算更新过）。
+/// 装好之后 runtime.json 写不进：照样说装好了（二进制已换），只记 warn，★ 挂到下次检查。
 /// T12b 把下载挪到锁外，这里只剩安装那一段持锁。
 fn maint_install_update<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Outcome {
     let done = with_lock(ctx, |ctx, _g| {
@@ -2482,7 +2491,11 @@ fn maint_install_update<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -
         record_update_check(&mut rt, &r, now);
         rt.last_update_at = Some(now);
         rt.last_update_attempt_at = Some(now);
-        rt.save(ctx.sys, ctx.paths)?;
+        // 二进制已经换了、服务已经重启：写不进 runtime 不能说成「失败」。尽力而为、记一笔，
+        // ★ 挂到下次检查才摘（同 `release_after_teardown`）
+        if let Err(e) = rt.save(ctx.sys, ctx.paths) {
+            tracing::warn!(error = %e, "写 runtime.json 失败");
+        }
         Ok(r)
     });
     match done {
@@ -4604,6 +4617,87 @@ mod tests {
         assert_eq!(s.get(crate::paths::SELF_BIN).unwrap(), INSTALLED);
         let rt = Runtime::load(&s, &pp);
         assert!(rt.update_available, "没装成，★ 照挂：{rt:?}");
+        assert!(rt.last_update_at.is_none(), "{rt:?}");
+        let calls = s.calls();
+        assert_eq!(
+            (
+                calls.iter().filter(|c| *c == "lock").count(),
+                calls.iter().filter(|c| *c == "unlock").count()
+            ),
+            (1, 1),
+            "{calls:?}"
+        );
+    }
+
+    /// 查到了、但 runtime.json 写不进去（审查 #1）：菜单不能整个退出——停下来说「失败：…」，
+    /// 「上次：」行记同一句，回主菜单还能接着选。什么都没换、没拿锁，runtime 原样（★ 不挂）。
+    #[test]
+    fn maint_check_update_runtime_write_failure_pauses_and_stays_in_the_menu() {
+        let pp = paths();
+        let (s, n) = update_machine("9.9.9", Some("bui-c-new"), Some("1.14.5"));
+        s.fail_write("/opt/bui-c/runtime.json");
+        let r = run_menu(&s, &n, &pp, &["7", "1", "", "0"], true);
+        assert_eq!(
+            r.asked,
+            vec!["选择 [0-9]", "选择 [0-3]", "回车返回菜单", "选择 [0-9]"],
+            "停一下、回主菜单、0 照样被读到：{}",
+            r.t
+        );
+        assert_eq!(pauses(&r.asked), 1, "{:?}", r.asked);
+        let last = last_line(&r.t);
+        assert!(last.starts_with("  上次：失败："), "{}", r.t);
+        assert!(last.contains("runtime.json"), "{}", r.t);
+        assert_eq!(s.get(crate::paths::SELF_BIN).unwrap(), INSTALLED);
+        assert!(!s.calls().iter().any(|c| c == "lock"), "{:?}", s.calls());
+        assert!(!s.exists(&pp.runtime()), "runtime 原样（本来就没有）");
+        let prof = Profiles::load(&s, &pp).unwrap();
+        let mut p = Scripted::from([]);
+        let ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        assert!(!menu::render_options(&engine_status(&ctx, &prof), 80).contains('★'));
+    }
+
+    /// 答 y 时才让 runtime.json 写不进去：检查那一次写得进，装好之后那一次写不进。
+    struct FailRuntimeOnYes<'a> {
+        inner: Scripted,
+        sys: &'a FakeSys,
+    }
+    impl Prompt for FailRuntimeOnYes<'_> {
+        fn read(&mut self, prompt: &str) -> Result<Option<String>> {
+            self.inner.read(prompt)
+        }
+        fn lines_until_blank(&mut self, prompt: &str) -> Result<Vec<String>> {
+            self.inner.lines_until_blank(prompt)
+        }
+        fn confirm(&mut self, prompt: &str) -> Result<bool> {
+            self.sys.fail_write("/opt/bui-c/runtime.json");
+            self.inner.confirm(prompt)
+        }
+    }
+
+    /// 装好、重启了，只是 runtime.json 没写成（审查 #3）：照实说「已更新」，不说「失败」——二进制
+    /// 已经换了。runtime 停在检查那一次（★ 挂到下次检查才摘），锁拿了也放了。
+    #[test]
+    fn maint_install_update_runtime_write_failure_still_says_updated() {
+        let pp = paths();
+        let (s, n) = update_machine("9.9.9", Some("bui-c-new"), Some("1.13.19"));
+        with_unit(&s);
+        let mut p = FailRuntimeOnYes {
+            inner: Scripted::from(["7", "1", "y", "", "0"]),
+            sys: &s,
+        };
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert_eq!(s.get(crate::paths::SELF_BIN).unwrap(), "bui-c-new", "{t}");
+        assert_eq!(s.get("/opt/bui-c/bin/sing-box").unwrap(), NEW_KERNEL, "{t}");
+        assert!(s.called("systemctl restart bui-c.service"), "{t}");
+        assert_eq!(pauses(&p.inner.asked), 1, "{:?}", p.inner.asked);
+        assert_eq!(p.inner.asked.last().unwrap(), "选择 [0-9]", "{t}");
+        let last = last_line(&t);
+        assert!(last.contains("已更新") && !last.contains("失败"), "{t}");
+        assert!(t.contains("新版菜单下次打开生效"), "{t}");
+        let rt = Runtime::load(&s, &pp);
+        assert!(rt.update_available, "没写成，★ 停在检查那一次：{rt:?}");
         assert!(rt.last_update_at.is_none(), "{rt:?}");
         let calls = s.calls();
         assert_eq!(
