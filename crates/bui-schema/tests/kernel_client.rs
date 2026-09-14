@@ -351,7 +351,7 @@ fn probe_config_routes_each_inbound_to_its_node_with_auth_and_auto_detect() {
         .collect();
     assert_eq!(keys, ["dns", "inbounds", "log", "outbounds", "route"]);
     assert_eq!(cfg["log"]["level"], "error");
-    // DNS 只有 local-dns：node_outbound 的 domain_resolver 写死引用它
+    // DNS 只有 local-dns：出站的 domain_resolver 写死引用它
     assert_eq!(
         cfg["dns"]["servers"],
         serde_json::json!([{ "tag": "local-dns", "type": "udp", "server": "223.5.5.5" }])
@@ -380,8 +380,9 @@ fn probe_config_routes_each_inbound_to_its_node_with_auth_and_auto_detect() {
             serde_json::json!([{ "username": t.user, "password": t.pass }])
         );
         // 这个入站的规则指向 probe-<i>（assert_probe_tags 已核对），它就是这个节点的出站
+        // （「出站与主配置同源」那条断言在 render/client.rs 的 mod tests 里，用的是私有 outbound）
         let out = &outbounds[i];
-        assert_eq!(out, &client::node_outbound(t.node, &format!("probe-{i}")));
+        assert_eq!(out["server"], t.node.host);
         assert_eq!(out["server_port"], t.node.port);
         assert_eq!(out["domain_resolver"], "local-dns");
     }
@@ -403,12 +404,6 @@ fn probe_config_routes_each_inbound_to_its_node_with_auth_and_auto_detect() {
     ] {
         assert!(!s.contains(banned), "测速配置里不该有 {banned}");
     }
-
-    // 主配置的出站就是 node_outbound(node, "proxy-out")
-    for n in &nodes {
-        let main = client::tun_config(n, &copts(ClientMode::Tun, false, split(false)));
-        assert_eq!(main["outbounds"][0], client::node_outbound(n, "proxy-out"));
-    }
 }
 
 #[test]
@@ -429,8 +424,9 @@ fn probe_config_tags_stay_unique_for_same_named_nodes() {
     let cfg = client::probe_config(&targets);
     assert_probe_tags(&cfg, targets.len());
     let outbounds = cfg["outbounds"].as_array().unwrap();
-    for (i, (t, out)) in targets.iter().zip(outbounds).enumerate() {
-        assert_eq!(out, &client::node_outbound(t.node, &format!("probe-{i}")));
+    for (t, out) in targets.iter().zip(outbounds) {
+        assert_eq!(out["server"], t.node.host);
+        assert_eq!(out["server_port"], t.node.port);
     }
     assert_eq!(outbounds[2]["server"], "b.example.com");
 }

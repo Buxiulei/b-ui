@@ -4,7 +4,7 @@
 //! `interface_name: bui-tun`、`address` 数组、`stack: mixed`、CN 域名直连 DNS、
 //! `sniff` + `hijack-dns`、cloudflared QUIC 例外、裸 IPv6 就地 reject。
 //! mixed 形态用同一套出站与路由，只把 TUN inbound 换成两个 `mixed` 监听、去掉 DNS 劫持。
-//! 另有 [`probe_config`]：`bui-c` 节点测速用的多入站配置，出站与主配置同源（[`node_outbound`]）。
+//! 另有 [`probe_config`]：`bui-c` 节点测速用的多入站配置，出站与主配置同源（同一个私有 `outbound`）。
 
 use crate::nodes::{Node, NodeKind, Transport};
 use crate::render::SplitRules;
@@ -47,7 +47,8 @@ pub fn mixed_config(node: &Node, opts: &ClientOpts) -> Value {
 /// 测速的一个目标：节点 + 本地 socks 入站端口 + 这个入站的凭据（调用方随机生成）。
 ///
 /// 没有 tag 字段：标签由 [`probe_config`] 按下标生成，调用方按 `listen_port` 认目标。
-/// 不派生 `Debug`：`user` / `pass` 是凭据，不该经 `{:?}` 进日志。
+/// `Debug` 是手写的脱敏版：只打 `node.label` 与 `listen_port`，`user` / `pass` 一律 `***`
+/// （节点自己的服务器口令也不经这里露出来）。
 pub struct ProbeTarget<'a> {
     /// 要测的节点（同一个节点、同名节点都可以出现多次）
     pub node: &'a Node,
@@ -59,6 +60,20 @@ pub struct ProbeTarget<'a> {
     pub pass: String,
 }
 
+/// 脱敏的 `Debug`：凭据打 `***`，节点只打标签（`Node` 自己 derive 了 `Debug`，
+/// 整个打出来会带上服务器口令）。手写而不是干脆不实现，是为了让调用方带
+/// `#[derive(Debug)]` 的结构体装得下它。
+impl std::fmt::Debug for ProbeTarget<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProbeTarget")
+            .field("node", &self.node.label)
+            .field("listen_port", &self.listen_port)
+            .field("user", &"***")
+            .field("pass", &"***")
+            .finish()
+    }
+}
+
 /// 多节点测速配置（`bui-c` 菜单的 `[9]`）：每个目标一个带认证的 `127.0.0.1` socks 入站，
 /// 按入站分流到各自节点的出站，其余流量 `final: direct-out`。
 ///
@@ -66,11 +81,14 @@ pub struct ProbeTarget<'a> {
 ///   路由规则 `probe-in-<i>` → `probe-<i>`。标签与节点名无关：同一个节点测两次、两台服务器上的
 ///   同名节点都不会撞 tag，也碰不到 `direct-out`。
 /// - `route.auto_detect_interface = true` 必需：不设的话出站连接会被本机正在跑的 TUN 截走。
-/// - DNS 只有 `local-dns`（udp 223.5.5.5），[`node_outbound`] 的 `domain_resolver` 写死引用它；
-///   `default_domain_resolver` 与 `strategy: ipv4_only` 同主配置。
+/// - DNS 只有 `local-dns`（udp 223.5.5.5），出站的 `domain_resolver` 写死引用它；
+///   `default_domain_resolver` 与 `strategy: ipv4_only` 同主配置（服务端没有 IPv6 出口，
+///   测速也必须只查 A 记录，否则整轮全判不通）。
 /// - 没有 tun、hijack-dns、sniff、rule_set、download_detour、cache_file；
 ///   `log.level = error`（sing-box 的日志可能带出服务器地址，调用方也不读）。
 /// - `targets` 为空时产出没有入站的配置，调用方不要这样调。
+/// - `listen_port` 撞上本机已占用的端口时，sing-box 在入站 bind 阶段就整体起不来（一个都不测），
+///   与「节点不通」是两回事：调用方要把这种失败单独报，别算成网络问题。
 pub fn probe_config(targets: &[ProbeTarget<'_>]) -> Value {
     let mut inbounds = Vec::with_capacity(targets.len());
     let mut outbounds = Vec::with_capacity(targets.len() + 1);
@@ -85,7 +103,7 @@ pub fn probe_config(targets: &[ProbeTarget<'_>]) -> Value {
             "listen_port": t.listen_port,
             "users": [{ "username": t.user, "password": t.pass }],
         }));
-        outbounds.push(node_outbound(t.node, &out_tag));
+        outbounds.push(outbound(t.node, &out_tag));
         rules.push(json!({ "inbound": [in_tag], "outbound": out_tag }));
     }
     outbounds.push(json!({ "type": "direct", "tag": "direct-out" }));
@@ -276,7 +294,7 @@ fn config(node: &Node, opts: &ClientOpts, tun: bool) -> Value {
             "strategy": "ipv4_only",
         },
         "inbounds": inbounds,
-        "outbounds": [ outbound(node), { "type": "direct", "tag": "direct-out" } ],
+        "outbounds": [ outbound(node, "proxy-out"), { "type": "direct", "tag": "direct-out" } ],
         "route": {
             "rules": route_rules(node, opts, tun),
             "final": "proxy-out",
@@ -286,16 +304,12 @@ fn config(node: &Node, opts: &ClientOpts, tun: bool) -> Value {
     })
 }
 
-/// 节点 → `proxy-out` 出站（客户端主配置用）。
-fn outbound(node: &Node) -> Value {
-    node_outbound(node, "proxy-out")
-}
-
 /// 节点 → sing-box 出站 JSON。客户端主配置用 `proxy-out`，[`probe_config`] 用 `probe-<i>`。
 ///
-/// `domain_resolver` 写死引用 tag 为 `local-dns` 的 DNS 服务器：放进哪份配置，
-/// 那份配置里就得有它（主配置与 [`probe_config`] 都有）。
-pub fn node_outbound(node: &Node, tag: &str) -> Value {
+/// 私有：`domain_resolver` 写死引用 tag 为 `local-dns` 的 DNS 服务器，
+/// 放进哪份配置那份就得自带它（主配置与 [`probe_config`] 都有）——这个前置条件签名里看不出来，
+/// 所以片段只在本模块内部拼。
+fn outbound(node: &Node, tag: &str) -> Value {
     match &node.transport {
         Transport::Hysteria2 {
             username,
@@ -379,4 +393,123 @@ fn route_rules(node: &Node, opts: &ClientOpts, tun: bool) -> Vec<Value> {
     rules.push(json!({ "domain_keyword": PROXY_KEYWORDS, "outbound": "proxy-out" }));
     rules.push(json!({ "domain_suffix": PROXY_SUFFIXES, "outbound": "proxy-out" }));
     rules
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 出站分支最全的示例节点：HY2 带端口跳跃与 obfs。
+    fn hy2_node() -> Node {
+        Node {
+            kind: NodeKind::Hy2Direct,
+            label: "HY2直连".into(),
+            host: "panel.example.com".into(),
+            port: 10000,
+            hop: Some((20000, 30000)),
+            transport: Transport::Hysteria2 {
+                username: "alice".into(),
+                password: "hy2-pw".into(),
+                sni: "panel.example.com".into(),
+                obfs_password: Some("obfs-pw".into()),
+            },
+        }
+    }
+
+    fn reality_node() -> Node {
+        Node {
+            kind: NodeKind::RealityResidential,
+            label: "Reality住宅".into(),
+            host: "panel.example.com".into(),
+            port: 10002,
+            hop: None,
+            transport: Transport::Reality {
+                uuid: "11111111-1111-4111-8111-111111111111".parse().unwrap(),
+                public_key: "PUB".into(),
+                short_id: "0123456789abcdef".into(),
+                server_name: "www.bing.com".into(),
+                fingerprint: "chrome".into(),
+                flow: "xtls-rprx-vision".into(),
+            },
+        }
+    }
+
+    fn opts(mode: ClientMode) -> ClientOpts {
+        ClientOpts {
+            mode,
+            socks_port: 1080,
+            http_port: 8080,
+            host_has_ipv6: false,
+            split: SplitRules {
+                enabled: true,
+                global: false,
+                keywords: vec!["openai.com".into()],
+            },
+        }
+    }
+
+    /// 每个节点一个目标；端口与凭据都是示例值，这里不真的监听。
+    fn probe_targets(nodes: &[Node]) -> Vec<ProbeTarget<'_>> {
+        nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| ProbeTarget {
+                node: n,
+                listen_port: 20800 + i as u16,
+                user: format!("probe-user-{i}"),
+                pass: format!("probe-pass-{i}"),
+            })
+            .collect()
+    }
+
+    /// 测速出站与主配置出站同源：同一个 `outbound`，只有 tag 不同。
+    /// 这条断言原先在 `tests/kernel_client.rs`，为了写它才把 `outbound` 公开成 `node_outbound`；
+    /// 搬进同文件测试之后私有函数照样可见，公开项不必留。
+    #[test]
+    fn probe_and_main_outbounds_come_from_one_renderer() {
+        let nodes = [hy2_node(), reality_node()];
+        let targets = probe_targets(&nodes);
+        let cfg = probe_config(&targets);
+        let outbounds = cfg["outbounds"].as_array().unwrap();
+        assert_eq!(outbounds.len(), nodes.len() + 1);
+        for (i, t) in targets.iter().enumerate() {
+            assert_eq!(outbounds[i], outbound(t.node, &format!("probe-{i}")));
+        }
+        for n in &nodes {
+            let tun = tun_config(n, &opts(ClientMode::Tun));
+            assert_eq!(tun["outbounds"][0], outbound(n, "proxy-out"));
+            let mixed = mixed_config(n, &opts(ClientMode::Mixed));
+            assert_eq!(mixed["outbounds"][0], outbound(n, "proxy-out"));
+        }
+    }
+
+    /// IPv6 接管是项目级不变量（服务端没有 IPv6 出口）：测速配置一旦回退成默认 DNS 策略，
+    /// 现象是测速走 AAAA、所有节点被判不通，而主配置照常可用——静默错测，最难查。
+    #[test]
+    fn probe_config_pins_ipv4_only_dns() {
+        let nodes = [hy2_node(), reality_node()];
+        let cfg = probe_config(&probe_targets(&nodes));
+        assert_eq!(cfg["dns"]["strategy"], "ipv4_only");
+        // domain_resolver 指名 local-dns：解析器与这份配置里唯一的 DNS 服务器必须对得上
+        assert_eq!(cfg["route"]["default_domain_resolver"], "local-dns");
+        assert_eq!(cfg["dns"]["servers"][0]["tag"], "local-dns");
+        for out in cfg["outbounds"].as_array().unwrap() {
+            if out["type"] != "direct" {
+                assert_eq!(out["domain_resolver"], "local-dns");
+            }
+        }
+    }
+
+    /// 手写的脱敏 `Debug`：只打标签与端口，入站凭据与节点里的服务器口令都不露。
+    #[test]
+    fn probe_target_debug_redacts_credentials() {
+        let nodes = [hy2_node()];
+        let targets = probe_targets(&nodes);
+        let s = format!("{:?}", targets[0]);
+        assert!(s.contains("HY2直连"), "{s}");
+        assert!(s.contains("20800"), "{s}");
+        for secret in ["probe-user-0", "probe-pass-0", "hy2-pw", "obfs-pw"] {
+            assert!(!s.contains(secret), "{secret} 不该出现在 {s}");
+        }
+    }
 }

@@ -262,6 +262,10 @@ mod tests {
         }
         // 没有冒号的单段 userinfo 仍然拒绝：拿不出用户名，服务端 userpass 鉴权必然失败
         assert!(node_uri("hysteria2://onlypassword@example.com:10000").is_err());
+        // 无冒号分支只解码一次：%253A 解一次是字面 `%3A`（不是冒号），拆不出密码所以报错。
+        // 解两次就会变成 `alice:pw` 而被接受，这条断言就是守这件事的——
+        // 上面几条锁不住它（那一臂的 password 恒为空、必然报错，whole 的值观测不到）。
+        assert!(node_uri("hysteria2://alice%253Apw@example.com:10000").is_err());
     }
 
     #[test]
