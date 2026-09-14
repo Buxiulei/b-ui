@@ -414,7 +414,8 @@ pub struct Staged {
     kernel_bin: Option<Vec<u8>>,
     /// 这份下载出自哪个 manifest 版本（install 记日志用）
     manifest_version: String,
-    /// fetch 时盘上 bui-c 的 sha256（读不到为 `None`）：install 进锁后比一次，变了就不盖
+    /// 开始 fetch 时（取 manifest、下载之前）盘上 bui-c 的 sha256（读不到为 `None`）：install 进锁后
+    /// 比一次，变了就不盖
     self_sha: Option<String>,
 }
 
@@ -426,6 +427,7 @@ impl std::fmt::Debug for Staged {
             .field("self_bin", &self.self_bin.as_ref().map(Vec::len))
             .field("kernel_bin", &self.kernel_bin.as_ref().map(Vec::len))
             .field("manifest_version", &self.manifest_version)
+            .field("self_sha", &self.self_sha)
             .finish()
     }
 }
@@ -436,6 +438,10 @@ impl std::fmt::Debug for Staged {
 ///
 /// 两份都下载校验通过才返回：内核那份失败时自身也不换（以前是先换上自身、再报内核失败）。
 pub fn fetch<S: Sys, N: Net>(sys: &S, net: &N, paths: &Paths, prof: &Profiles) -> Result<Staged> {
+    // 取样在取 manifest 与下载**之前**：install 进锁后比的是「开始这次更新时」与「进锁时」，
+    // 下载那几分钟里别处装上的也算换过（内核那道闸的 `kernel_local` 同样在下载之前读）。
+    // 放到下载之后取样，取到的就是别处刚装上的那份，比对相等，旧下载照盖（审查 T12b I1）。
+    let self_sha = disk_sha(sys, Path::new(SELF_BIN));
     let (m, report) = assess(sys, net, paths, prof)?;
     let panel = prof.panel.as_ref();
     let self_file = format!("bui-c-linux-{}", arch_suffix());
@@ -466,7 +472,7 @@ pub fn fetch<S: Sys, N: Net>(sys: &S, net: &N, paths: &Paths, prof: &Profiles) -
         self_bin,
         kernel_bin,
         manifest_version: m.version,
-        self_sha: disk_sha(sys, Path::new(SELF_BIN)),
+        self_sha,
     })
 }
 
@@ -484,8 +490,8 @@ pub fn restarts_on_kernel_swap<S: Sys>(sys: &S, paths: &Paths, prof: &Profiles) 
 /// 更新的第二段：替换自身、写内核，换了内核且 [`restarts_on_kernel_swap`] 才重启。持锁调用：
 /// `LockGuard` 由顶层入口拿，这里只收下凭证（spec §0.2 R11）；`prof` 要是拿锁之后重读的那份。
 ///
-/// 下载在锁外，下载与拿到锁之间别的 bui-c 可能已经换过（菜单里刚装完一版、巡检的自更新）：
-/// 盘上的 bui-c 已不是 fetch 时那一份、内核版本已不是 fetch 时读到的，就不拿这份旧下载去盖。
+/// 下载在锁外，从 fetch 开始到拿到锁之间别的 bui-c 可能已经换过（菜单里刚装完一版、巡检的自更新）：
+/// 盘上的 bui-c 已不是 fetch 开始下载前那一份、内核版本已不是那时读到的，就不拿这份旧下载去盖。
 ///
 /// 失败即返回：先换自身、再写内核，写内核失败时自身已经换上了，不重启（下次检查只剩内核要换）。
 pub fn install<S: Sys>(
@@ -1437,6 +1443,135 @@ mod tests {
         );
         assert!(!s.called("systemctl restart bui-c.service"));
         assert_eq!(s.writes(SELF_TMP), 0);
+    }
+
+    /// 下载期间另一个会话装好了更新：`net` 一旦请求过 `url_part`，下一次经这里碰盘之前先跑 `land`
+    /// ——等价于「这份下载进行到一半，别处已经把盘上换掉」。FakeSys 不是 `Sync`（`RefCell`），塞不进
+    /// `Net: Sync` 的实现里，所以由 Sys 这一侧看 FakeNet 的请求流水来落；fetch 在下载之后不再碰盘，
+    /// 落下的改动就只有 install 看得到。
+    struct LandsDuringDownload<'a> {
+        sys: &'a FakeSys,
+        net: &'a FakeNet,
+        url_part: &'a str,
+        land: &'a dyn Fn(&FakeSys),
+        landed: std::cell::Cell<bool>,
+    }
+
+    impl LandsDuringDownload<'_> {
+        fn tick(&self) -> &FakeSys {
+            if !self.landed.get() && self.net.log().iter().any(|l| l.contains(self.url_part)) {
+                self.landed.set(true);
+                (self.land)(self.sys);
+            }
+            self.sys
+        }
+    }
+
+    impl Sys for LandsDuringDownload<'_> {
+        fn run(&self, prog: &str, args: &[&str]) -> Result<crate::sys::Output> {
+            self.tick().run(prog, args)
+        }
+        fn read(&self, path: &Path) -> Result<Vec<u8>> {
+            self.tick().read(path)
+        }
+        fn write(&self, path: &Path, data: &[u8], mode: u32) -> Result<()> {
+            self.tick().write(path, data, mode)
+        }
+        fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+            self.tick().rename(from, to)
+        }
+        fn remove_file(&self, path: &Path) -> Result<()> {
+            self.tick().remove_file(path)
+        }
+        fn remove_dir_all(&self, path: &Path) -> Result<()> {
+            self.tick().remove_dir_all(path)
+        }
+        fn mkdir_p(&self, path: &Path) -> Result<()> {
+            self.tick().mkdir_p(path)
+        }
+        fn exists(&self, path: &Path) -> bool {
+            self.tick().exists(path)
+        }
+        fn read_dir(&self, path: &Path) -> Result<Vec<std::path::PathBuf>> {
+            self.tick().read_dir(path)
+        }
+        fn now(&self) -> time::OffsetDateTime {
+            self.tick().now()
+        }
+        fn sleep(&self, d: Duration) {
+            self.tick().sleep(d)
+        }
+        fn env(&self, key: &str) -> Option<String> {
+            self.tick().env(key)
+        }
+        fn term_size(&self) -> Option<(u16, u16)> {
+            self.tick().term_size()
+        }
+        fn tcp_listening(&self, port: u16) -> bool {
+            self.tick().tcp_listening(port)
+        }
+        fn resolve(&self, host: &str, timeout: Duration) -> Result<Duration> {
+            self.tick().resolve(host, timeout)
+        }
+        fn try_lock(&self, path: &Path) -> Result<Option<LockGuard>> {
+            self.tick().try_lock(path)
+        }
+    }
+
+    /// 审查 T12b I1：「盘上已被别处换过就不盖」的两道闸都要覆盖**整个下载窗口**。timer 在 T0 看过、
+    /// 开始下载 → 人在菜单里 T1 装好更新的一版 → timer 下完进锁：盘上的 bui-c 与内核都已不是它开始
+    /// 下载时的那一份，手里这份旧下载一样都不能盖上去。以前自身那道闸在下载**之后**才取样，取到的
+    /// 就是 T1 装上的那份，比对相等，照盖。
+    #[test]
+    fn install_leaves_alone_what_another_install_put_on_disk_during_the_download() {
+        let (s, n, prof) = staged_machine();
+        let land = |s: &FakeSys| {
+            s.put(SELF_BIN, "bui-c-newer");
+            s.put(KERNEL, "ELF-newer");
+            s.reply(&format!("{KERNEL} version"), 0, "sing-box version 1.14.9\n");
+        };
+        let race = LandsDuringDownload {
+            sys: &s,
+            net: &n,
+            url_part: "/sing-box-linux-",
+            land: &land,
+            landed: std::cell::Cell::new(false),
+        };
+        let staged = fetch(&race, &n, &paths(), &prof).unwrap();
+        assert!(
+            staged.self_bin.is_some() && staged.kernel_bin.is_some(),
+            "两份都下载了：{staged:?}"
+        );
+        let r = install(
+            &race,
+            &paths(),
+            &prof,
+            staged,
+            &crate::lock::LockGuard::stub(),
+        )
+        .unwrap();
+        assert!(race.landed.get(), "别处的安装没落下来，用例没测到东西");
+        assert_eq!(s.get(SELF_BIN).unwrap(), "bui-c-newer", "{r:?}");
+        assert_eq!(s.get(KERNEL).unwrap(), "ELF-newer", "{r:?}");
+        assert_eq!(
+            (r.self_updated, r.kernel_updated, r.restarted),
+            (false, false, false),
+            "{r:?}"
+        );
+        assert_eq!(s.writes(SELF_TMP), 0);
+        assert_eq!(s.writes(KERNEL), 0);
+        assert!(!s.called("systemctl restart bui-c.service"));
+    }
+
+    /// 审查 T12b M5：排查「为什么没盖」时要看 fetch 那一刻盘上 bui-c 的 sha；两份二进制只打长度。
+    #[test]
+    fn staged_debug_shows_the_sampled_self_sha_but_not_the_bytes() {
+        let (s, n, prof) = staged_machine();
+        let staged = fetch(&s, &n, &paths(), &prof).unwrap();
+        let dbg = format!("{staged:?}");
+        let old = sha256_hex(b"bui-c-old");
+        assert!(dbg.contains("self_sha") && dbg.contains(&old), "{dbg}");
+        assert!(!dbg.contains("98, 117, 105"), "二进制按字节打出来了：{dbg}");
     }
 
     /// `run(check_only = false)` = fetch + 拿锁（等 15 秒）+ install：下载在拿锁之前，重启在锁里。
