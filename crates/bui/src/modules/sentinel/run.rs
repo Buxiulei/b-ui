@@ -721,7 +721,7 @@ mod tests {
     /// 慢路**（网关活着、出口 IP 死了）都由 `health::QUICK_PROBE_BUDGET_SECS` 的整体时限兜住
     /// （判原上游与借用后验证共用它），见
     /// `with_the_whole_gateway_down_the_event_lands_within_the_no_exit_sla`、
-    /// `resi::tests::a_judging_probe_that_outruns_its_budget_does_nothing` 与
+    /// `resi::tests::a_judging_probe_that_outruns_its_budget_is_treated_as_unavailable` 与
     /// `slots::tests::a_verification_that_outruns_its_budget_keeps_the_candidate_and_says_so`
     #[tokio::test]
     async fn a_dropped_gateway_is_borrowed_within_one_poll_plus_the_tcp_timeout() {
