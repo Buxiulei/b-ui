@@ -1961,7 +1961,10 @@ mod tests {
     async fn a_restart_does_not_touch_a_user_whose_uuid_has_not_changed() {
         let h = harness().await;
         let ctx = ctx_of(&h);
-        let id = h.store.read().await.users[0].user_id;
+        let (id, vid) = {
+            let s = h.store.read().await;
+            (s.users[0].user_id, s.users[0].credentials.vless_uuid)
+        };
         // 第一轮：假内核里挂上这个用户
         sync_users(&ctx, &h.shared, &BTreeSet::new()).await;
 
@@ -1972,6 +1975,16 @@ mod tests {
         ));
         restarted.set_paths(&h.paths);
         h.xray.clear_calls();
+        // 审查者那条序列的下半截，当陷阱布在这里：万一真发了 AddUser，它会撞「已存在」
+        // （真应答），于是走「摘掉再加」，而重加那次同样失败（inbound 正在重载）——
+        // 旧实现就是在这里把一个本来好着的用户摘出内核的。先读后写根本不发这次 AddUser，
+        // 所以这个陷阱必须一次都踩不到。
+        let add_key = format!("add:vless-direct:{id}:{vid}");
+        h.xray.with(|i| {
+            i.fail_on.insert(add_key.clone());
+            i.error_text
+                .insert(add_key, format!("User {id} already exists."));
+        });
 
         let out = sync_users(&ctx, &restarted, &BTreeSet::new()).await;
         assert!(out.errors.is_empty(), "{:?}", out.errors);
@@ -1989,6 +2002,12 @@ mod tests {
             ],
             "只读，每个 inbound 各一次"
         );
+        // 最要紧的一条断言：这个健康用户此刻还挂在内核上。旧实现走到这里时他已经被
+        // RemoveUser 摘出去、重加又失败，要等 60 秒安全网才补回来。
+        let mut mounted = None;
+        h.xray
+            .with(|i| mounted = i.users.get(&("vless-direct".to_string(), id)).copied());
+        assert_eq!(mounted, Some(vid), "uuid 没变的健康用户绝不许被摘出内核");
     }
 
     /// 轮换后鉴权快照重写：新 hy2 密码通过、旧密码被拒。判定走的是钩子与 http 鉴权
