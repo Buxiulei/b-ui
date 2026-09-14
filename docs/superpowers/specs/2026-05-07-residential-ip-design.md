@@ -195,7 +195,7 @@ Hysteria2 的 ACL 不依赖 geosite.dat，使用内置域名通配符匹配，�
   "port": 1080,
   "username": "abc123",
   "password": "xyz789",
-  "lastVerifiedIp": "173.45.12.34",
+  "lastVerifiedIp": "203.0.113.34",
   "lastVerifiedIspInfo": "Comcast Cable Communications, US-CA-Los Angeles",
   "lastVerifiedAt": "2026-05-07T14:32:01Z"
 }
@@ -250,7 +250,7 @@ Hysteria2 的 ACL 不依赖 geosite.dat，使用内置域名通配符匹配，�
 请粘贴住宅 IP 凭据 (支持 socks5://user:pass@host:port 等格式):
 > socks5://abc:xyz@us.proxy.com:1080
 正在校验连通性...
-✓ 连通成功，出口 IP: 173.45.xx.xx
+✓ 连通成功，出口 IP: 203.0.113.xx
 ✓ ISP: Comcast Cable Communications, US-CA-Los Angeles
 ✓ 已应用到 Xray 和 Hysteria2，服务已重载
 ```
@@ -270,7 +270,7 @@ Hysteria2 的 ACL 不依赖 geosite.dat，使用内置域名通配符匹配，�
 ```
 ================== 配置住宅 IP ==================
 当前状态: 已启用 ✓
-出口 IP: 173.45.12.34 (Comcast, US-CA)
+出口 IP: 203.0.113.34 (Comcast, US-CA)
 最后校验: 2026-05-07 14:32:01
 
   1) 启用 / 修改凭据
@@ -296,7 +296,7 @@ Hysteria2 的 ACL 不依赖 geosite.dat，使用内置域名通配符匹配，�
 `web/app.js` + `web/index.html` 新增"住宅 IP 出站"卡片，仿现有 `m-masq` 弹窗风格：
 - 启用开关 + 凭据输入框（`<input type="password">` 显示脱敏值）
 - "保存"按钮（保存 = 校验 + 应用 + reload，失败显示 toast 错误）
-- 状态行：`当前出口 IP: 173.45.xx.xx · ISP: Comcast · 最后校验: 5 分钟前`
+- 状态行：`当前出口 IP: 203.0.113.xx · ISP: Comcast · 最后校验: 5 分钟前`
 
 ---
 

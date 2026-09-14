@@ -426,7 +426,10 @@ EOF
       no "step7 $user 没有订阅 token" "state.json 的 users[] 里取不到 sub_token（守护进程启动时应已补齐）"
       continue
     fi
-    port=$(curl -fsS --max-time 10 "http://127.0.0.1:$aport/api/sub/$tok" 2>/dev/null |
+    # token 就是凭据（响应体里有 hy2 明文密码与 vless uuid），经 `-K -` 的 stdin 传，
+    # 绝不进 argv（ps 会泄露，跟 step6 的 HY2 密码同一条规矩）
+    port=$(printf 'url = "http://127.0.0.1:%s/api/sub/%s"\n' "$aport" "$tok" |
+      curl -fsS --max-time 10 -K - 2>/dev/null |
       base64 -d 2>/dev/null | grep -F 'HY2%E4%BD%8F%E5%AE%85' |
       sed -n 's#.*@[^:]*:\([0-9]*\)?.*#\1#p' | head -1)
     if [ "$want" = "$port" ]; then

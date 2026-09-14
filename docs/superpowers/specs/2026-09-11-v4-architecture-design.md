@@ -68,7 +68,8 @@ Cargo workspace：
   "admin": { "password_hash": "<argon2id>", "jwt_secret": "<hex>" },
   "users": [ /* §4.1 */ ],
   "residential": { "groups": { "default": { /* §5 */ } } },
-  "system": { "ssh_hardening": true, "static_dns": true, "sysctl_profile": "auto", "firewall": "auto" },
+  "system": { "ssh_hardening": true, "static_dns": true, "sysctl_profile": "auto", "firewall": "auto",
+              "legacy_sub_until": null },   // §4.5 旧用户名订阅链接的全局宽限期；缺省不落盘
   "versions": { "bui": "4.0.0", "hysteria": "…", "xray": "…", "sing_box": "1.14.x", "caddy": "…", "client_sing_box": "1.14.x" },
   "catalog": [ /* §4.4 SKU 桩 */ ]
 }
@@ -161,6 +162,7 @@ tonic 客户端，proto 从 Xray-core `v26.3.27` vendor 进仓（以仓库根为
 {
   "user_id": "<uuid>", "username": "alice", "note": "", "created_at": "…", "disabled": false,
   "credentials": { "hy2_password": "…", "vless_uuid": "…" },
+  "sub_token": "<32 位小写 hex>", "legacy_sub_disabled": false,   // §4.5，缺省不落盘
   "entitlements": { "protocols": ["hysteria2", "reality"], "direct": true,
                     "residential": { "group_id": "default" },        // 或 null
                     "expires_at": null, "traffic_limit": { "total_bytes": null, "monthly_bytes": null } },
@@ -192,13 +194,68 @@ tonic 客户端，proto 从 Xray-core `v26.3.27` vendor 进仓（以仓库根为
 
 `POST /api/reconcile` 的 `dry_run` 仅 CLI 本地路径（`bui reconcile --dry-run`）支持，HTTP 端点忽略该字段：请求一律排队真跑一轮对账，返回 200 + 最近一份 `ReconcileReport` 或 202 `{"queued":true}`。
 
-无鉴权（**按每用户随机订阅 token**，2026-09-14 裁决改掉了原先「按用户名，沿用 v3」的口径）：`/api/sub/<token>`、`/api/subscription/<token>`、`/api/clash/<token>`、**新增** `/api/nodes/<token>`（节点 schema JSON，供 `bui-c` 渲染）。`token` = `state.json` 的 `users[].sub_token`，32 位小写十六进制（16 字节随机）；末段是 token 形态就常量时间比对 `sub_token`，否则只在全局宽限期 `system.legacy_sub_until` 未到、且该用户 `legacy_sub_disabled == false` 时才按用户名精确匹配（新装机不开宽限期，v3 导入与老 v4 升级给 7 天）。三种失配一律同一个 404 `{"error":"User not found"}`——不给能区分「没这个用户」与「链接已过期」的回应，那等于白送一个免鉴权的用户名探测器。理由：仓库公开、证书透明日志公开所有子域，域名补不回来，只能让链接不可猜且可轮换（响应体里就是 hy2 明文密码与 vless uuid）。
+无鉴权（**按每用户随机订阅 token**，2026-09-14 裁决改掉了原先「按用户名，沿用 v3」的口径）：`/api/sub/<token>`、`/api/subscription/<token>`、`/api/clash/<token>`、**新增** `/api/nodes/<token>`（节点 schema JSON，供 `bui-c` 渲染）。`token` = `state.json` 的 `users[].sub_token`，32 位小写十六进制（16 字节随机）；末段是 token 形态就常量时间比对 `sub_token`，否则只在全局宽限期 `system.legacy_sub_until` 未到、且该用户 `legacy_sub_disabled == false` 时才按用户名精确匹配（新装机不开宽限期，v3 导入与老 v4 升级给 7 天）。三种失配一律同一个 404 `{"error":"User not found"}`——不给能区分「没这个用户」与「链接已过期」的回应，那等于白送一个免鉴权的用户名探测器。理由：仓库公开、证书透明日志公开所有子域，域名补不回来，只能让链接不可猜且可轮换（响应体里就是 hy2 明文密码与 vless uuid）。模型、宽限期、轮换与日志面见 §4.5。
 
 用户域（预留，**v4 全部返回 501 `{"error":"not_implemented"}`**，请求/响应结构在附录 A 定义）：`POST /api/me/login`、`GET /api/me`、`GET /api/me/subscription-links`、`GET /api/me/entitlements`、`GET /api/me/billing`、`POST /api/me/orders`、`GET /api/me/orders/{id}`。
 
 ### 4.4 订阅
 
 三种订阅与 v3 逐项等价（节点集、端口、UUID、密码、标签、`mport=`、obfs 参数、住宅分流规则），由 `bui-schema` 从同一节点列表渲染；单协议 + 住宅用户与 v3 一样只发住宅版节点（§4.1 映射的 `direct=false`；2026-09-13 裁决撤销了此前「v4 多发一个直连版」的例外，golden 比对不再过滤）；sing-box JSON 保持 1.12–1.14 兼容子集（typed DNS、TUN `address` 数组、rule action、无 `rule_set`）；Clash/mihomo YAML 另有一处有意新增（2026-09-12 裁决）：`ipv6: true` + `dns.ipv6: false` + `tun` 接管参数（`stack: mixed`、`auto-route`/`strict-route`/`auto-detect-interface`、`inet6-address`、`dns-hijack`，不下发 `enable`）+ 三条 `IP-CIDR6` 规则（ULA/link-local 直连、其余 `::/0` REJECT），与 sing-box 侧的 IPv6 接管同构。CI 用 v3 抓取的脱敏样本做 golden 比对（§8）。
+
+### 4.5 订阅链接的随机 token 与旧链接宽限期（2026-09-14 裁决）
+
+设计原文（背景、解析三步、轮换、日志面、已知限制）在 `docs/superpowers/specs/2026-09-14-subscription-token-design.md`，
+本节是它的契约摘要。
+
+四个免鉴权端点（§4.3）的响应体里有 hy2 明文密码与 vless uuid，所以**路径末段本身就是凭据**。
+仓库是公开的、git 历史里有真实域名与真实用户名，而证书透明日志本来就公开所有子域 ——
+域名那一半补不回来，于是把末段换成每用户一个随机 token：不可猜、可轮换。
+
+**模型**（`bui-schema::model`，三个字段一律 `#[serde(default, skip_serializing_if = …)]`，缺省不落盘）：
+- `User.sub_token: Option<String>` —— 32 位小写十六进制（16 字节随机），`bui_schema::sub::new_sub_token`。
+- `User.legacy_sub_disabled: bool` —— 该用户的「用户名链接」是否已停用（轮换时置 true）。
+- `SystemSettings.legacy_sub_until: Option<String>` —— 全局宽限期截止时刻（RFC3339）；`None` = 一概不认用户名链接。
+
+**解析规则**（四个端点同一口径）：路径段是 32 位小写十六进制 ⇒ 按 `sub_token` 找用户，比较**常量时间**；
+否则只有「`legacy_sub_until` 存在且当前时间早于它」时才按 `username` 精确找，且该用户 `legacy_sub_disabled == false`。
+其余一律沿用现有的 **404 `{"error":"User not found"}`** —— 不用 410、不用任何能区分「用户存在但链接过期」的回应，
+那会泄露用户是否存在。下载文件名按查到的 `username` 生成，不是路径段（否则用户下载到的文件名是 token）。
+
+**宽限期**（常量 `sub::LEGACY_SUB_GRACE_DAYS = 7`）：全新装机首用户建号时就有 token，**不设**
+`legacy_sub_until`（用户名链接从来不可用）；v3 导入（`v3::import`）给每人生成 token 并把截止设成「导入时刻 + 7 天」；
+已有 v4 安装升级上来由守护进程启动补齐（`panel::users::backfill_sub_tokens`，形状照 `slots::migrate_on_start`，
+幂等、零变更不写盘、日志只写个数不写 token），补出过 token 且截止为 `None` 时设成「启动时刻 + 7 天」。
+运维提前收口：`bui set legacy-sub off`（置 `None`）或 `bui set legacy-sub <RFC3339>`；`bui status` 有「旧订阅链接」一行。
+
+**轮换**：`POST /api/users/{name}/rotate`（管理员鉴权内，body 空对象；面板配置弹窗里的「重置订阅链接与凭据」，
+二次确认）四件事一起做：换 `sub_token`、换 `hy2_password` / `vless_uuid`、把 `legacy_sub_disabled` 置 true
+（全局宽限期没到也立刻停用他的用户名链接）、踢掉他已建立的 hy2 会话（两条鉴权路径都只在握手时鉴权；
+先发 `StateChanged("users")` 再按 `traffic::stats_ports` 逐个 hy2 实例 kick，best-effort，失败只记 warn）。
+回包给出新 token 与新凭据（与 `create_user` 同口径）。uuid 变化必须让 xray 当场生效
+（`render::xray::structural_hash` 剥掉了 clients，对账不会因此重启 xray）：`panel::users::sync_users`
+先经 `GetInboundUsers`（`XrayApi::inbound_user_uuid`）**读内核**当前挂的 uuid——等于期望值就不发写请求，
+挂着别的就先 RemoveUser 再 AddUser；读不到才退回看错误文案，AddUser 的「already exists」一律按位置被占处理，
+**绝不**当成已达目标。Reality 已建立的连接没有踢的手段（xray 无 kick），只能等它自己断。
+面板投影 `PanelUser` 带 `subToken`，四条链接由前端 `web/app.js` 的 `subPath(x, kind)` 拼；
+服务端侧拼链接的只有 `bui_schema::sub::sub_urls`（今天只有装机收尾摘要调它）。
+
+**日志**（末段一个字都不进日志）：
+- `bui` 自己：`redact::sub_path` 把 `/api/(sub|subscription|clash|nodes)/<段>` 的末段换成 `***`（前缀不分大小写，
+  一行多条全换），`redact::line` 先过它；`api::router` 的 `TraceLayer` 不用 `DefaultMakeSpan`（它把整条 URI
+  记进 span，`--log debug` 一开就进 journald），改成自造 `debug_span!("request", method, uri = %redact::sub_path(..), version)`；
+  哨兵事件的 `sample` 也经 `redact::line`（匹配之后再脱敏）。客户端侧 `bui-c::error::redact_url` 早有同类实现。
+- Caddy（`modules::core_files::caddyfile_text`）：**default 与站点两个 logger 都挂 `format filter`**，
+  `request>uri` 与 `resp_headers>Location` 两个字段都过同一条 `regexp`
+  （`(?i)(/api/(?:sub|subscription|clash|nodes)/)[^/?]+` → `${1}***`）；站点块里另有
+  `@sub path /api/sub/* /api/subscription/* /api/clash/* /api/nodes/*` + `log_skip @sub`，**叠加**在掩码之上，
+  让这四条路径的访问日志整条不记，其余请求照旧。只加 `log_skip` 不够：它只挡站点路由树里的访问日志，
+  挡不住 (a) `reverse_proxy` 连不上上游（`b-ui` 重启 / 升级 / watchdog 拉起的窗口）时落进 **default** logger 的
+  错误日志 `http.log.error.*`，(b) `:80` HTTP→HTTPS 跳转服务器（不走站点路由树）的访问日志与 308 的 `Location`。
+  default logger 的 `wrap` 必须留 **json**（哨兵按 JSON 解 Caddy 的证书失败行，换成 console 那条告警会静默失效），
+  站点 logger 照旧 console。
+
+**不做**：不改 `portal_auth.tokens`（面板登录 token 的空壳，与订阅无关）；不重写 git 历史；
+不动 `keywords.rs` 里的第三方域名（住宅分流功能必需）。
 
 ---
 
@@ -327,7 +384,7 @@ tonic 客户端，proto 从 Xray-core `v26.3.27` vendor 进仓（以仓库根为
 - 静态二进制（x86_64 / aarch64），`/opt/bui-c/{bin/sing-box, profiles.json, config.json}`，三个单元：`bui-c.service`（`sing-box run -c /opt/bui-c/config.json`，`Restart=always`，唯一数据面进程）、`bui-c-check.service`（`Type=oneshot`，`ExecStart=bui-c check`）、`bui-c.timer`（每分钟触发 `bui-c-check.service`；timer 不能直接指向 sing-box 单元，否则每分钟重新激活引擎）。
 - 引擎只有 sing-box（≤ 1.14）；Hysteria2 与 VLESS-REALITY 均为 sing-box 出站（uTLS chrome）。
 - 模式：`socks`（`mixed` inbound 127.0.0.1:1080 与 127.0.0.1:8080）/ `tun`（`tun` inbound，`interface_name: bui-tun`，`stack: mixed`，`auto_route`，IPv6 接管与裸 v6 拒绝按 `2026-09-10-ipv6-takeover-design.md`，CN 域名直连 DNS，`sniff` + `hijack-dns`，cloudflared QUIC 例外，住宅节点的分流关键字）。切模式 = 重渲染 + 重启单元。DNS 用 typed server，**凡需经代理解析的 server 必须显式 `detour`**（typed server 不设 `detour` 时是空 direct dialer，不是默认出站，S5）；生成器禁止出现 `rule_set`、`download_detour`、legacy 字符串式 DNS server、`inet4_address/inet6_address`（S8/S9）。
-- 节点来源：`/api/nodes/<user>`（首选，schema 同源）；`/api/sub` base64；粘贴 `hysteria2://`、`vless://`。多 profile，`switch` 切换。
+- 节点来源：`/api/nodes/<token>`（首选，schema 同源）；`/api/sub/<token>` base64；粘贴 `hysteria2://`、`vless://`。多 profile，`switch` 切换。末段是该用户的随机订阅 token（§4.5），`profiles.json` 的 `panel.username` 存的就是它 ⇒ 那份文件是凭据文件（600）；轮换会让已部署的客户端失效且无法自愈，必须人工重新导入（`docs/HANDOVER-bui-c.md` §6）。
 - `check`：经本地 inbound 请求 gstatic 204；TUN 下核对接口与默认路由；失败退避重启（1/2/4 分钟）。
 - `update`：来源顺序 面板 `/packages/` → GitHub Releases → 镜像；每日 timer 自动，可关。服务端内核缓存继续维护 sing-box 与 `bui-c` 的 Linux 二进制。
 - `import-v3`：首次运行从 `/opt/hysteria-client/` 导入 profile，停用并删除 `hysteria-client / xray-client / bui-tun` 单元与 `hysteria-health.timer`。

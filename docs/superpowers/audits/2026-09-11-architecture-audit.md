@@ -208,7 +208,7 @@ loopback 一跳的实测量级是微秒级（调研报告 §1.9），**不是延
 | 住宅池 | Bright Data HTTP 44445 ×1，global=true | 同 |
 | relay 日志 | ~31.8k 行/24h，几乎全是上游 403/rejected（Apple、Google、FCM:5228） | ~31.6k 行/24h，同 |
 | hysteria-residential 日志 | 3.8k 行/24h | **72k 行/24h**：手工 drop-in `99-debug.conf`（2026-05-14）开了 `--log-level debug`（prod-C6） |
-| 静态 DNS | **未锁**，机房 DNS 142.0.42.x（块 D 守卫不触发） | 已锁，内容 = update.sh 块 D heredoc |
+| 静态 DNS | **未锁**，机房 DNS 203.0.113.x（块 D 守卫不触发） | 已锁，内容 = update.sh 块 D heredoc |
 | 防火墙 | 无 ufw，firewalld 未激活 → 端口全靠云侧 | 同 |
 | hy2-watchdog.sh | v3.5.14+ 版本 | **v3.5.14 之前的版本**（写 `/tmp/hy2-watchdog-fail-count`），面板 fail_count 恰好在此机是活的 |
 | cert-check.sh cron | 文件存在 | **文件从未存在过**，每 12h 报 not found（241/241 次） |

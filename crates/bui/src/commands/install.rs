@@ -8,6 +8,7 @@
 //! 下载）在 async 上下文里会 panic，[`Host`] 的接口本身也全是同步的。
 
 use crate::api::EventBus;
+use crate::commands::status::LegacySub;
 use crate::kernels::{Fetcher, HttpFetcher, KernelInstaller, Manifest};
 use crate::reconcile::apply::BinaryInstaller;
 use crate::reconcile::DaemonCtx;
@@ -641,12 +642,22 @@ fn first_user(username: &str) -> anyhow::Result<bui_schema::model::User> {
 /// 装机最后一屏（spec §7 第 10 步）：面板地址、一次性管理员密码（只有全新装机才有）、
 /// 第一个用户与他那三条**能直接粘进客户端**的订阅地址、两个入口。
 ///
-/// 没有用户（`state.users` 为空）时退回 `<用户名>` 形状：那时没有任何地址能填得出来。
+/// 没有用户（`state.users` 为空）时退回 `<订阅token>` 形状：那时没有任何地址能填得出来。
+///
+/// 期望态里有宽限期（`system.legacy_sub_until`，只有 v3 导入会设）时多报旧的「用户名链接」
+/// 现在还认不认：三种态与 `bui status` 那一行同一处判定（[`crate::commands::status::legacy_sub`]）
+/// ——本函数在**已装机的对账**路径上也会跑，`until` 完全可能已经是过去时刻（v3 导入机 8 天后
+/// 重跑 `bui install`）。`now` 由调用方传入（[`final_summary`] 取 `now_utc`），测试于是可控。
 ///
 /// `fresh` = 这一趟是不是全新装机（判据与 [`run`] / [`run_with`] 同一条：`state.json` 在不在）。
 /// 已装机上重跑 `bui install` 只是对账，没有新建任何用户，照打「第一个用户 <名>」+ 他的订阅会
 /// 让人以为刚给他建了号（2026-09-13 bwg-rick 真机误读）——那条路径只报一行用户数。
-pub fn summary(state: &State, password_notice: Option<&str>, fresh: bool) -> String {
+pub fn summary(
+    state: &State,
+    password_notice: Option<&str>,
+    fresh: bool,
+    now: time::OffsetDateTime,
+) -> String {
     let d = &state.node.domain;
     let mut out = vec![format!("面板        https://{d}/")];
     if let Some(line) = password_notice {
@@ -675,6 +686,25 @@ pub fn summary(state: &State, password_notice: Option<&str>, fresh: bool) -> Str
                 "订阅        https://{d}/api/sub/<订阅token>（v2rayN）· /api/subscription/<订阅token>（sing-box）· /api/clash/<订阅token>（mihomo）"
             )),
         }
+    }
+    // 2026-09-14 裁决：只有**宽限期还在**时才说旧的「用户名链接」还能用——设宽限期的只有
+    // v3 导入（`v3::import` 把 `legacy_sub_until` 设成导入时刻 + 7 天）。三种态分清：
+    // 全新装机（`None`）与垃圾值一个字不提（用户名链接从来不通，提它就是给人死链）；
+    // 还在宽限期内报「还剩多久」+ 怎么提前收口；已过期只报「已过期」——这一行在已装机的
+    // 对账路径上也会跑，v3 导入机 8 天后重跑 `bui install` 时说「还认到」就是错话。
+    // 截止时刻一律给原文，不再写「默认 7 天」：运维可以 `bui set legacy-sub <时刻>` 改过它。
+    match crate::commands::status::legacy_sub(state.system.legacy_sub_until.as_deref(), now) {
+        LegacySub::Off => {}
+        LegacySub::Active { raw, secs_left } => {
+            out.push(format!(
+                "旧链接      v3 的用户名订阅链接还剩 {} 到期（{raw}）",
+                crate::util::human_duration(secs_left)
+            ));
+            out.push("            要提前收口：`bui set legacy-sub off`".into());
+        }
+        LegacySub::Expired { raw } => out.push(format!(
+            "旧链接      用户名订阅链接已过期（{raw}），只认随机 token 链接"
+        )),
     }
     out.push("后续        `b-ui` 进菜单 / `bui status` 看体检 / `bui reconcile` 手动对账".into());
     out.join("\n")
@@ -835,7 +865,12 @@ async fn collect_answers(
 /// ——REALITY 密钥等全部重生成——这一条路。
 async fn final_summary(state_path: &Path, notice: Option<&str>, fresh: bool) -> Option<String> {
     let store = Store::open(state_path).await.ok()?;
-    Some(summary(store.read().await.as_ref(), notice, fresh))
+    Some(summary(
+        store.read().await.as_ref(),
+        notice,
+        fresh,
+        time::OffsetDateTime::now_utc(),
+    ))
 }
 
 /// 面向真实终端的入口：读已装机的期望态 → 收集 `Answers` → 交给 [`run_with`]。
@@ -1125,6 +1160,12 @@ mod tests {
     use crate::sys::{fake::FakeHost, CmdOut, Host};
     use pretty_assertions::assert_eq;
     use std::sync::{Arc, Mutex};
+
+    /// 摘要里的宽限期一行要按时钟分三种态，所以测试给一个固定的「现在」
+    /// （与 `commands::status` 的用例同一个时刻，方便对读）。
+    fn t0() -> time::OffsetDateTime {
+        time::macros::datetime!(2026-09-14 00:00:00 UTC)
+    }
 
     // 本机实测：xray 26.3.27 的输出
     const X25519: &str = "PrivateKey: CBuMG2F9fOCyzMKCniVKSS6lmXyKRmD9stuXyXeKSF4\nPassword (PublicKey): cTpW46LZoWSn3XlHahzkRh3CMpu-pEQUOk7-seT7W1c\nHash32: 3Vnzmd-rq4njP5IfMf_wYgFrGEuMBpJqgOh-UAdLOUY\n";
@@ -2453,6 +2494,7 @@ mod tests {
             &state,
             Some("已生成随机管理员密码：hunter2（只显示这一次，请立刻存好）"),
             true,
+            t0(),
         );
         assert!(s.contains("https://example.com/"), "{s}");
         assert!(s.contains("hunter2"), "一次性密码只在摘要里出现这一次：{s}");
@@ -2467,11 +2509,11 @@ mod tests {
         }
         assert!(s.contains("`b-ui`") && s.contains("bui status"), "{s}");
         // 已装机重跑（没有一次性密码）时不出现「管理员」那一行
-        assert!(!summary(&state, None, true).contains("管理员"));
+        assert!(!summary(&state, None, true, t0()).contains("管理员"));
         // 没有用户（v3 导入前的空盘、或用户被删光）时退回 `<订阅token>` 形状
         let mut empty = crate::testutil::sample_state();
         empty.users.clear();
-        let s = summary(&empty, None, true);
+        let s = summary(&empty, None, true, t0());
         for shape in [
             "/api/sub/<订阅token>",
             "/api/subscription/<订阅token>",
@@ -2488,7 +2530,7 @@ mod tests {
         let mut state = crate::testutil::sample_state();
         let token = "0123456789abcdef0123456789abcdef";
         state.users[0].sub_token = Some(token.into());
-        let s = summary(&state, None, true);
+        let s = summary(&state, None, true, t0());
         for url in [
             format!("https://example.com/api/sub/{token}"),
             format!("https://example.com/api/subscription/{token}"),
@@ -2500,14 +2542,64 @@ mod tests {
         assert!(!s.contains("/api/sub/alice"), "不许再打用户名链接：{s}");
     }
 
+    /// 旧「用户名链接」那几行分三种态（与 `bui status` 同一处判定）：没有宽限期一个字不提
+    /// （全新装机 `legacy_sub_until` 是 `None`，用户名链接从来不通，提它就是误导）；
+    /// 宽限期内报还剩多久 + 怎么提前收口；已过期只报「已过期」——这一行在**对账**路径上
+    /// 也会跑，v3 导入机 8 天后重跑 `bui install` 时说「还认到」就是错话。
+    #[test]
+    fn the_legacy_link_notice_tells_the_three_grace_period_states_apart() {
+        let mut state = crate::testutil::sample_state();
+        state.users[0].sub_token = Some("0123456789abcdef0123456789abcdef".into());
+        let fresh = summary(&state, None, true, t0());
+        assert!(!fresh.contains("旧链接"), "全新装机不许提旧链接：{fresh}");
+
+        // 宽限期内（t0 = 2026-09-14T00:00:00Z，截止 7d 8h 30m 后）
+        state.system.legacy_sub_until = Some("2026-09-21T08:30:00Z".into());
+        let imported = summary(&state, None, true, t0());
+        assert!(
+            imported
+                .contains("旧链接      v3 的用户名订阅链接还剩 7d 8h 到期（2026-09-21T08:30:00Z）"),
+            "宽限期内要报还剩多久：{imported}"
+        );
+        assert!(
+            imported.contains("bui set legacy-sub off"),
+            "还要告诉人怎么提前收口：{imported}"
+        );
+        assert!(
+            !imported.contains("默认 7 天"),
+            "截止时刻可能是运维自己改的，不许说成「默认 7 天」：{imported}"
+        );
+
+        // 已过期：fresh 与对账两条路径都只许说「已过期」
+        state.system.legacy_sub_until = Some("2026-09-01T00:00:00Z".into());
+        for s in [
+            summary(&state, None, true, t0()),
+            summary(&state, None, false, t0()),
+        ] {
+            assert!(
+                s.contains("旧链接      用户名订阅链接已过期（2026-09-01T00:00:00Z）"),
+                "过期就报过期：{s}"
+            );
+            assert!(
+                !s.contains("还剩") && !s.contains("legacy-sub off"),
+                "已经不通了就别再教人收口、更不许说还剩多久：{s}"
+            );
+        }
+
+        // 解析不出来的时刻按「不认」处理（端点侧判不出「早于」就一律不认）：一个字不提
+        state.system.legacy_sub_until = Some("下周".into());
+        let junk = summary(&state, None, true, t0());
+        assert!(!junk.contains("旧链接"), "垃圾值不许提旧链接：{junk}");
+    }
+
     /// 已装机上重跑 `bui install` 只对账、一个用户都没新建，摘要于是不许再写「第一个用户 <名>」
     /// 与他的订阅——真机上那行被读成「又给他建了一个号」（2026-09-13 bwg-rick）。
     /// 那条路径只报一行用户数；全新装机那条照旧给三条能直接粘的地址。
     #[test]
     fn the_summary_only_names_the_first_user_on_a_fresh_install() {
         let state = crate::testutil::sample_state();
-        let fresh = summary(&state, None, true);
-        let again = summary(&state, None, false);
+        let fresh = summary(&state, None, true, t0());
+        let again = summary(&state, None, false, t0());
         assert!(fresh.contains("第一个用户  alice"), "{fresh}");
         assert!(
             !again.contains("第一个用户"),
@@ -2526,13 +2618,13 @@ mod tests {
             assert!(fresh.contains(both) && again.contains(both), "{again}");
         }
         assert!(
-            summary(&state, Some("已生成随机管理员密码：hunter2"), false).contains("hunter2"),
+            summary(&state, Some("已生成随机管理员密码：hunter2"), false, t0()).contains("hunter2"),
             "已装机路径有密码行时照打"
         );
         // 用户被删光的已装机机器：还是那一行，不退回 `<用户名>` 形状
         let mut empty = crate::testutil::sample_state();
         empty.users.clear();
-        let none = summary(&empty, None, false);
+        let none = summary(&empty, None, false, t0());
         assert!(none.contains("用户        0 个（订阅见面板）"), "{none}");
         assert!(!none.contains("<用户名>"), "{none}");
     }

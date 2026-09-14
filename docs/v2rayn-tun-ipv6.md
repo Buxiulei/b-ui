@@ -36,7 +36,7 @@ B-UI 服务器没有 IPv6 出口。TUN 模式下若本机 IPv6 没被接管，�
 
 ## 方案 B：导入完整 sing-box 配置
 
-把 `https://<你的域名>/api/subscription/<用户名>` 作为 sing-box 自定义配置订阅导入 v2rayN。
+把 `https://<你的域名>/api/subscription/<订阅token>`（末段是面板上该用户的随机订阅 token，不是用户名）作为 sing-box 自定义配置订阅导入 v2rayN。
 
 这份配置已内置 TUN（v4+v6 地址）、`ipv4_only`、IPv6 reject、国内直连规则，也可以直接给独立 sing-box 使用。
 

@@ -41,10 +41,18 @@ VPS 没有 IPv6 出口：服务端每条出口都钉在 IPv4，客户端配置�
 
 ### Subscriptions (`crates/bui-schema/src/render/subscription.rs`)
 
-三个免鉴权端点，节点集合都来自 `nodes::nodes_for`（fusion = Reality直连 :10001 / Reality住宅 :10002 / HY2直连 / HY2住宅 `:(40000+用户槽位)`）：
-- `/api/sub/<user>` — base64 `vless://`/`hysteria2://` URIs (what v2rayN uses)。端口跳跃（`mport=`）来自期望态的 `ports.hy2_hop` / `hy2_resi_hop`。
-- `/api/subscription/<user>` — a complete sing-box config (TUN + DNS + route). Must stay valid for **sing-box 1.12 through 1.14**: typed DNS servers, TUN `address` array, rule actions (`sniff`/`hijack-dns`/`reject`), `route.default_domain_resolver`, no `rule_set`/`download_detour` (1.13 and 1.15 disagree on those fields).
-- `/api/clash/<user>` — mihomo YAML.
+四个免鉴权端点（下列三种订阅 + 面板/客户端取节点表的 `/api/nodes/<token>`），节点集合都来自 `nodes::nodes_for`（fusion = Reality直连 :10001 / Reality住宅 :10002 / HY2直连 / HY2住宅 `:(40000+用户槽位)`）：
+- `/api/sub/<token>` — base64 `vless://`/`hysteria2://` URIs (what v2rayN uses)。端口跳跃（`mport=`）来自期望态的 `ports.hy2_hop` / `hy2_resi_hop`。
+- `/api/subscription/<token>` — a complete sing-box config (TUN + DNS + route). Must stay valid for **sing-box 1.12 through 1.14**: typed DNS servers, TUN `address` array, rule actions (`sniff`/`hijack-dns`/`reject`), `route.default_domain_resolver`, no `rule_set`/`download_detour` (1.13 and 1.15 disagree on those fields).
+- `/api/clash/<token>` — mihomo YAML.
+
+`<token>` 是每用户一个随机订阅 token（`User.sub_token`，32 位小写十六进制，`bui_schema::sub`），
+四个端点同一口径。响应体里有 hy2 明文密码与 vless uuid，**路径末段本身就是凭据**：
+公开仓库 + 证书透明日志让「域名 + 用户名」不再是秘密，所以末段改成不可猜、可轮换的随机值
+（2026-09-14 裁决）。旧的「用户名链接」只在全局宽限期 `system.legacy_sub_until` 内还认，且该用户
+没被轮换过（`User.legacy_sub_disabled`）；全新装机不设宽限期，v3 导入给 7 天
+（`sub::LEGACY_SUB_GRACE_DAYS`），`bui set legacy-sub off` 立刻收口。任何认不出的末段一律
+404 `{"error":"User not found"}`，不区分「查无此人」与「链接过期」。
 
 节点集合只有 `nodes::nodes_for` 一处实现，三种订阅与客户端渲染都从它取；改端口/标签/obfs 只需改 `bui-schema`。
 
@@ -83,6 +91,6 @@ xray run -test -c <渲染出的 json>
 - Rust 输出与错误：面板/CLI 的用户可见文字是中文；`bui` 的日志经 `logging.rs`，凭据一律经 `redact.rs` 脱敏后才落日志。Shell 脚本的输出 helper 是 `print_info`/`print_success`/`print_warning`/`print_error`；`scripts/` 下的脚本都带 `#!/usr/bin/env bash` + `LC_ALL=C`，采样/压测循环用 `set -uo pipefail`（不用 `set -e`），其余用 `set -euo pipefail`。
 - 服务器上的文件：`state.json`（期望态，600）、`runtime.json` / `auth-snapshot.json`（运行期，600）、`manifest.json`（升级缓存）、渲染产物 `config.yaml` / `config-residential.yaml` / `xray-config.json` / `singbox-relay.json` / `Caddyfile`，二进制在 `bin/`，备份在 `state.backups/`；CLI ↔ 守护进程走 `/run/b-ui.sock`。Systemd 单元见 `reconcile::MANAGED_UNITS`。
 - Never put credentials on a command line (`ps` leaks them): 面板密码走 `--admin-password-stdin`，住宅上游走 `bui residential add -`（stdin），curl 代理凭据用 `-K -`。
-- 公开仓库不写真实域名 / IP / 用户名 / 供应商账号（`/api/sub/<用户名>` 免鉴权，域名 + 用户名就等于订阅凭据）：示例一律用 `example.com`、`203.0.113.0/24`、`alice` / `bob`，供应商账号写 `<decodo-user>` 这类占位符；生产主机只用 SSH 别名（`bwg-tizi` / `bwg-rick`）指代。
+- 公开仓库不写真实域名 / IP / 用户名 / 供应商账号 / 订阅 token（四个订阅端点免鉴权，路径末段就是凭据——2026-09-14 起是随机 `sub_token`，宽限期内也仍认用户名）：示例一律用 `example.com`、`203.0.113.0/24`、`alice` / `bob`，token 用 `0123456789abcdef0123456789abcdef` 这类合成值，供应商账号写 `<decodo-user>` 这类占位符；生产主机只用 SSH 别名（`bwg-tizi` / `bwg-rick`）指代。
 - `scripts/tests/` 里的测试禁止访问网络：需要 curl / systemctl / bui 的地方一律用 PATH 前置的 stub。
 - Design docs live in `docs/superpowers/specs/YYYY-MM-DD-<slug>-design.md` with matching plans in `docs/superpowers/plans/`；v4 的总纲是 `docs/superpowers/plans/2026-09-11-v4-master.md`（C1–C5 契约），架构与验收在 `docs/superpowers/specs/2026-09-11-v4-architecture-design.md`，删除 v3 的依据在 `docs/superpowers/audits/2026-09-11-architecture-audit.md` §7.1。2026-09-10 那一套记录 v3 末期的 IPv6、住宅与重启硬化决定，读它们时注意描述的是 v3 实现。
