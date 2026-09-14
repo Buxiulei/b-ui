@@ -41,13 +41,13 @@ VPS 没有 IPv6 出口：服务端每条出口都钉在 IPv4，客户端配置�
 
 ### Subscriptions (`crates/bui-schema/src/render/subscription.rs`)
 
-三个免鉴权端点，节点集合都来自 `nodes::nodes_for`（fusion = Reality直连 :10001 / Reality住宅 :10002 / HY2直连 / HY2住宅 `:(40000+用户槽位)`）：
+四个免鉴权端点（下列三种订阅 + 面板/客户端取节点表的 `/api/nodes/<token>`），节点集合都来自 `nodes::nodes_for`（fusion = Reality直连 :10001 / Reality住宅 :10002 / HY2直连 / HY2住宅 `:(40000+用户槽位)`）：
 - `/api/sub/<token>` — base64 `vless://`/`hysteria2://` URIs (what v2rayN uses)。端口跳跃（`mport=`）来自期望态的 `ports.hy2_hop` / `hy2_resi_hop`。
 - `/api/subscription/<token>` — a complete sing-box config (TUN + DNS + route). Must stay valid for **sing-box 1.12 through 1.14**: typed DNS servers, TUN `address` array, rule actions (`sniff`/`hijack-dns`/`reject`), `route.default_domain_resolver`, no `rule_set`/`download_detour` (1.13 and 1.15 disagree on those fields).
 - `/api/clash/<token>` — mihomo YAML.
 
 `<token>` 是每用户一个随机订阅 token（`User.sub_token`，32 位小写十六进制，`bui_schema::sub`），
-`/api/nodes/<token>` 同一口径。响应体里有 hy2 明文密码与 vless uuid，**路径末段本身就是凭据**：
+四个端点同一口径。响应体里有 hy2 明文密码与 vless uuid，**路径末段本身就是凭据**：
 公开仓库 + 证书透明日志让「域名 + 用户名」不再是秘密，所以末段改成不可猜、可轮换的随机值
 （2026-09-14 裁决）。旧的「用户名链接」只在全局宽限期 `system.legacy_sub_until` 内还认，且该用户
 没被轮换过（`User.legacy_sub_disabled`）；全新装机不设宽限期，v3 导入给 7 天

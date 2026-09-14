@@ -100,8 +100,10 @@ snapshot() {
                 subscription) url="$API/api/subscription/$tok" ;;
                 clash) url="$API/api/clash/$tok" ;;
             esac
-            # 空 body 也算失败：不记这个 key，`compare_keys` 才不会拿两个空串比出「无漂移」
-            body=$(curl -fsS --max-time 15 "$url" 2>/dev/null)
+            # 空 body 也算失败：不记这个 key，`compare_keys` 才不会拿两个空串比出「无漂移」。
+            # 末段就是凭据（响应体里有 hy2 明文密码与 vless uuid），URL 经 `-K -` 的 stdin 传，
+            # 绝不进 argv（ps 会泄露）
+            body=$(printf 'url = "%s"\n' "$url" | curl -fsS --max-time 15 -K - 2>/dev/null)
             if [[ -z "$body" ]]; then
                 log "FAIL $phase：取 $u 的 $kind 订阅失败或返回空（$API/api/$kind/<token>）"
                 note_fail "sub-fetch:$phase:$u:$kind"

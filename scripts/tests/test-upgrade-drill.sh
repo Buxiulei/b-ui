@@ -66,10 +66,18 @@ case "${1:-}" in
 esac
 STUB
 # curl stub：订阅内容 = URL 末段（订阅 token）+ 升级后是否漂移；请求过的 URL 记账，
-# 用来验「拼的是 token 不是用户名」。FAKE_404=1 模拟按用户名取时的 404：curl -f 退 22、body 空
+# 用来验「拼的是 token 不是用户名」。FAKE_404=1 模拟按用户名取时的 404：curl -f 退 22、body 空。
+# URL 只从 `-K -` 的 stdin 配置里读（token 进了 argv 就取不到内容 ⇒ 判失败），argv 另记一份
+# 进 $CURL_ARGV_LOG，断言凭据没进命令行
 cat > "$WORK/bin/curl" <<'STUB'
 #!/usr/bin/env bash
-url=""; for a in "$@"; do case "$a" in http*) url="$a" ;; esac; done
+printf '%s\n' "$*" >> "$CURL_ARGV_LOG"
+url=""
+if [[ "$*" == *"-K -"* ]]; then
+  while IFS= read -r line; do
+    case "$line" in url\ =\ *) url=${line#url = }; url=${url//\"/} ;; esac
+  done
+fi
 printf '%s\n' "$url" >> "$CURL_LOG"
 if [[ "${FAKE_404:-0}" == "1" ]]; then exit 22; fi
 body="sub:${url##*/}"
@@ -84,10 +92,11 @@ for a in "$@"; do case "$a" in *.tar.gz) : > "$a" ;; esac; done
 STUB
 chmod +x "$WORK/bin"/*
 export PATH="$WORK/bin:$PATH" VERFILE="$WORK/version" TAR_LOG="$WORK/tar.log" \
-       BUI_LOG="$WORK/bui.log" BASEDIR="$WORK/base" CURL_LOG="$WORK/curl.log"
+       BUI_LOG="$WORK/bui.log" BASEDIR="$WORK/base" CURL_LOG="$WORK/curl.log" \
+       CURL_ARGV_LOG="$WORK/curl.argv.log"
 
 reset_env() {
-    rm -f "$WORK/version.prev" "$WORK/bui.log" "$WORK/curl.log"
+    rm -f "$WORK/version.prev" "$WORK/bui.log" "$WORK/curl.log" "$WORK/curl.argv.log"
     printf '4.0.0\n' > "$WORK/version"
     write_state "$BOB_TOK"
     for b in bui hysteria xray sing-box caddy; do
@@ -127,6 +136,9 @@ assert_eq "$(awk -F, '$1 == "before" && $2 == "sha:bin/sing-box" {print $3}' "$W
 assert_contains "/api/sub/$ALICE_TOK" "$(cat "$WORK/curl.log")" "订阅 URL 拼的是 sub_token"
 assert_contains "/api/clash/$BOB_TOK" "$(cat "$WORK/curl.log")" "三种订阅都按 token 取"
 assert_not_contains "/api/sub/alice" "$(cat "$WORK/curl.log")" "不再按用户名取订阅"
+# 末段是凭据，只许经 `-K -` 的 stdin 传：进了 argv 就会被 ps 看见（CLAUDE.md 的硬规矩）
+assert_not_contains "/api/" "$(cat "$WORK/curl.argv.log")" "订阅 URL 不进 curl 的 argv"
+assert_contains "-K -" "$(cat "$WORK/curl.argv.log")" "URL 经 stdin 的 curl 配置传"
 assert_contains "backup-" "$(cat "$WORK/tar.log")" "演练前打了快照"
 assert_contains "etc/systemd/system/hysteria-residential.service" "$(cat "$WORK/tar.log")" "快照含六个单元文件（不只 b-ui.service）"
 assert_contains "--ignore-failed-read" "$(cat "$WORK/tar.log")" "缺失单元不让 tar 整体失败"

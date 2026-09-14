@@ -644,7 +644,8 @@ fn first_user(username: &str) -> anyhow::Result<bui_schema::model::User> {
 /// 没有用户（`state.users` 为空）时退回 `<订阅token>` 形状：那时没有任何地址能填得出来。
 ///
 /// 期望态里有宽限期（`system.legacy_sub_until`，只有 v3 导入会设）时多两行：旧的「用户名
-/// 链接」还认到什么时候、怎么提前收口。全新装机没有这一位，也就不提。
+/// 链接」宽限期的截止时刻、怎么提前收口。全新装机没有这一位，也就不提。这里只报时刻、
+/// 不判「过没过期」——本函数是纯函数、拿不到时钟，倒计时归 [`crate::commands::status`]。
 ///
 /// `fresh` = 这一趟是不是全新装机（判据与 [`run`] / [`run_with`] 同一条：`state.json` 在不在）。
 /// 已装机上重跑 `bui install` 只是对账，没有新建任何用户，照打「第一个用户 <名>」+ 他的订阅会
@@ -683,8 +684,12 @@ pub fn summary(state: &State, password_notice: Option<&str>, fresh: bool) -> Str
     // （`v3::import` 把 `legacy_sub_until` 设成导入时刻 + 7 天）。全新装机这一位是 `None`，
     // 用户名链接从来不通，照提只会让人以为还能拿它去导入。
     if let Some(until) = &state.system.legacy_sub_until {
+        // 措辞必须中性：`summary` 是纯函数、拿不到时钟，而这条路径在**已装机的对账**上也会跑
+        // （`final_summary` 对 fresh 与非 fresh 一视同仁），`until` 完全可能已经是过去时刻
+        //（v3 导入机 8 天后重跑 `bui install`），也可能是运维用 `bui set legacy-sub <时刻>`
+        // 自己改过的值 —— 所以只报截止时刻，不说「还认到」、不替它算倒计时（那归 `bui status`）。
         out.push(format!(
-            "旧链接      v3 的用户名订阅链接还认到 {until}（默认 {} 天宽限期），之后只认随机 token",
+            "旧链接      用户名订阅链接的宽限期截止 {until}（v3 导入默认 {} 天），倒计时看 `bui status`",
             bui_schema::sub::LEGACY_SUB_GRACE_DAYS
         ));
         out.push("            要提前收口：`bui set legacy-sub off`".into());
@@ -2525,13 +2530,25 @@ mod tests {
         state.system.legacy_sub_until = Some("2026-09-21T08:30:00Z".into());
         let imported = summary(&state, None, true);
         assert!(
-            imported.contains("旧链接      v3 的用户名订阅链接还认到 2026-09-21T08:30:00Z"),
+            imported.contains("旧链接      用户名订阅链接的宽限期截止 2026-09-21T08:30:00Z"),
             "v3 导入要报截止时刻：{imported}"
         );
         assert!(
-            imported.contains("默认 7 天宽限期") && imported.contains("bui set legacy-sub off"),
-            "还要告诉人怎么提前收口：{imported}"
+            imported.contains("v3 导入默认 7 天") && imported.contains("bui set legacy-sub off"),
+            "还要告诉人默认多久、怎么提前收口：{imported}"
         );
+
+        // 已过期的宽限期：这一行在**对账**路径也会跑，而 `summary` 拿不到时钟 ——
+        // 所以措辞只许是中性的「截止 <时刻>」，不许写成「还认到 <时刻>」（那是错话，
+        // 运维会以为旧链接还能用）；倒计时归 `bui status`。
+        state.system.legacy_sub_until = Some("2026-09-01T00:00:00Z".into());
+        for s in [summary(&state, None, true), summary(&state, None, false)] {
+            assert!(
+                s.contains("宽限期截止 2026-09-01T00:00:00Z") && s.contains("bui status"),
+                "过期的宽限期也只报截止时刻 + 指向 status：{s}"
+            );
+            assert!(!s.contains("还认到"), "不许断言旧链接还能用：{s}");
+        }
     }
 
     /// 已装机上重跑 `bui install` 只对账、一个用户都没新建，摘要于是不许再写「第一个用户 <名>」
