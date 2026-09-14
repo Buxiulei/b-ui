@@ -141,6 +141,8 @@ pub struct FakeClashInner {
     pub now: std::collections::BTreeMap<String, String>,
     /// 令 `select` 失败（测「切换失败只告警不改 runtime」）
     pub reject: bool,
+    /// 只拒绝切到这些 tag（`reject` 是全拒）：测「候选都不通、连放回本槽 IP 都失败」
+    pub reject_tags: std::collections::BTreeSet<String>,
     /// 接下来这么多次调用（`ready` / `selected` / `select` 都算）按「连接被拒」处理：
     /// relay 刚重启、Clash API 还没起监听时的形态
     pub refuse: u32,
@@ -215,7 +217,7 @@ impl Clash for FakeClash {
         if refused(&mut i) {
             return Err(ClashError::Unreachable("connection refused".into()));
         }
-        if i.reject {
+        if i.reject || i.reject_tags.contains(tag) {
             return Err(ClashError::Rejected {
                 tag: tag.to_string(),
                 status: 404,

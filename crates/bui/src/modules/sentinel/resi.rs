@@ -29,30 +29,75 @@ pub fn ip_of(up: &Upstream) -> String {
         .unwrap_or_else(|| subject_of(up))
 }
 
-/// `borrow_now` 的结果 → 「槽 1 已临时切到 Y；槽 2：没有可借用的健康 IP，保持现状；槽 3 已手动锁定，未动」
+/// 告警里指称一条上游：优先体检学到的出口 IP（`g` 里已经没有它 = 刚被删，退回 uuid）
+fn name_of(g: &ResidentialGroup, id: Uuid) -> String {
+    g.upstreams
+        .iter()
+        .find(|u| u.id == id)
+        .map(ip_of)
+        .unwrap_or_else(|| id.to_string())
+}
+
+/// `borrow_now` 的结果 → 「槽 1 已临时切到 Y；槽 2：候选 A、B 都探不通，当前指向本槽 IP C，
+/// 当前无可用出口；槽 3 已手动锁定，未动」。
+///
+/// 每一槽都按「**谁失败、失败在哪一步、现在指向谁**」写：
+/// - `switched && !unconfirmed` ⇒ 「已临时切到 Y」。**只有这一种**能这么说 —— 它在 `borrow_now`
+///   里意味着「刚切过去的那条当下带外验证确认可用」，而事件 / `bui status` / 面板三处都把这句
+///   读作「处置成功」；
+/// - `switched && unconfirmed` ⇒ 「已切到 Y，<没能确认的原因>」：切是切了，但没拿到「它能用」
+///   的证据（保留它是因为本槽原来的出口是已知死的），绝不用「已临时切到」那句话；
+/// - 没切成 ⇒ 先说哪几个候选**探不通**（一条就不说「都」），再说卡在哪一步（PUT 失败 / 连放回
+///   本槽都失败），最后一定说清**现在指向谁**；
+/// - 「当前无可用出口」这句话只跟着 `no_exit` 出现（候选试完了、逐条被证死）。中途 PUT 失败停
+///   下来的那条路不说这句 —— 剩下的候选压根没探过。演练 `--all-ports` 的判据②' 认这个关键词。
 fn borrow_text(g: &ResidentialGroup, moved: &[SlotOutcome]) -> String {
     if moved.is_empty() {
         return "当前没有槽经它出网".into();
     }
     moved
         .iter()
-        .map(|o| {
-            if o.switched {
-                let to = g
-                    .upstreams
-                    .iter()
-                    .find(|u| u.id == o.target)
-                    .map(ip_of)
-                    .unwrap_or_else(|| o.target.to_string());
-                format!("槽 {} 已临时切到 {to}", o.index)
-            } else if o.note.as_deref() == Some(slots::PINNED_UNTOUCHED_NOTE) {
-                format!("槽 {} {}", o.index, slots::PINNED_UNTOUCHED_NOTE)
-            } else {
-                format!("槽 {}：{}", o.index, o.note.clone().unwrap_or_default())
-            }
-        })
+        .map(|o| slot_text(g, o))
         .collect::<Vec<_>>()
         .join("；")
+}
+
+fn slot_text(g: &ResidentialGroup, o: &SlotOutcome) -> String {
+    if o.switched && !o.unconfirmed {
+        return format!("槽 {} 已临时切到 {}", o.index, name_of(g, o.target));
+    }
+    if o.switched {
+        return format!(
+            "槽 {} 已切到 {}，{}",
+            o.index,
+            name_of(g, o.target),
+            o.note.as_deref().unwrap_or("未确认可用")
+        );
+    }
+    if o.note.as_deref() == Some(slots::PINNED_UNTOUCHED_NOTE) {
+        return format!("槽 {} {}", o.index, slots::PINNED_UNTOUCHED_NOTE);
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if !o.dead.is_empty() {
+        let cands: Vec<String> = o.dead.iter().map(|id| name_of(g, *id)).collect();
+        parts.push(if cands.len() == 1 {
+            format!("候选 {} 探不通", cands[0])
+        } else {
+            format!("候选 {} 都探不通", cands.join("、"))
+        });
+    }
+    if let Some(n) = &o.note {
+        parts.push(n.clone());
+    }
+    parts.push(if o.target == o.own {
+        format!("当前指向本槽 IP {}", name_of(g, o.own))
+    } else {
+        format!("当前指向 {}", name_of(g, o.target))
+    });
+    if o.no_exit {
+        parts.push("当前无可用出口".into());
+    }
+    format!("槽 {}：{}", o.index, parts.join("，"))
 }
 
 fn gone(id: Uuid) -> Outcome {
@@ -64,8 +109,14 @@ fn gone(id: Uuid) -> Outcome {
 }
 
 /// relay 日志里同一上游 60 秒 ≥2 条连接错误（凭据失效 ≥3 条）之后：带外快探
-/// （[`health::probe_quick`]：网关 TCP [`PROBE_TCP_TIMEOUT_SECS`] 秒内连不上即判不可达）；
-/// 不可用 ⇒ 立即判不健康 + [`slots::borrow_now`] + 上游级告警「IP X 不可达，槽 i 已临时切到 Y」。
+/// （[`health::probe_quick_within`]：网关 TCP [`PROBE_TCP_TIMEOUT_SECS`] 秒内连不上即判不可达，
+/// 整个快探限时 [`health::QUICK_PROBE_BUDGET_SECS`] 秒、结论三值）；
+/// **确认可用** ⇒ 什么都不做；**确认不可用**与**预算内没能确认**都按不可用处置 ⇒ 立即判不健康 +
+/// [`slots::borrow_now`] + 上游级告警（文案里如实区分这两种，见函数体里那条 `Unconfirmed` 分支）。
+///
+/// 这次快探与 [`slots::borrow_now`] 里借用后那次**共用同一个整体预算**：只给其中一处加时限，
+/// spec §5.7 两条处置延迟 SLA 的上界就只对那一处成立（2026-09-14 审查第 1 条）。
+/// 两处对 `Unconfirmed` 的**处置**故意不同，理由见那条分支的注释。
 pub async fn on_upstream_error(
     ctx: &DaemonCtx,
     prober: Arc<dyn Prober>,
@@ -77,39 +128,43 @@ pub async fn on_upstream_error(
     let Some(up) = g.upstreams.iter().find(|u| u.id == id).cloned() else {
         return gone(id);
     };
-    let u2 = up.clone();
     let tcp_within = std::time::Duration::from_secs(PROBE_TCP_TIMEOUT_SECS);
-    let probe = match tokio::task::spawn_blocking(move || {
-        health::probe_quick(prober.as_ref(), &u2, tcp_within)
-    })
-    .await
-    {
-        Ok(p) => p,
-        Err(e) => {
+    let why: String = match health::probe_quick_within(&prober, up.clone(), tcp_within).await {
+        health::Verdict::Alive => {
             return Outcome {
                 subject: subject_of(&up),
-                result: format!("带外探测任务异常（{e}），本次不动作"),
-                level: Level::Warn,
+                result: "带外探测通过（日志里的错误来自目标侧或已自愈），不动作".into(),
+                level: Level::Info,
             }
         }
-    };
-    if probe.ok {
-        return Outcome {
-            subject: subject_of(&up),
-            result: "带外探测通过（日志里的错误来自目标侧或已自愈），不动作".into(),
-            level: Level::Info,
-        };
-    }
-    let why = if probe.auth_failed {
-        "凭据失效（407 / SOCKS5 认证被拒）"
-    } else {
-        "不可达"
+        // 预算内没能确认（网关活着、隧道不响应，或探测任务异常）⇒ **照不可用处置**
+        // （2026-09-14 审查第 2 条的裁决）。三条理由：
+        // ① 这里不是「没有证据」：relay 刚在 60 秒内独立报了 ≥2 条连接错误，带外也过不去 ——
+        //    两者互为佐证。**借用后验证那一侧没有这层佐证**（那条候选没人报过错），所以那边
+        //    `Unconfirmed` 仍是「保留候选、不记不健康」，两处处置故意不同；
+        // ② 「网关活着、隧道挂死」这条形态在这个预算下**拿不到 Dead**：`probe_quick` 的第一次
+        //    请求是 `timed_get`，超时 `LATENCY_PROBE_TIMEOUT_SECS` = 8 秒 > 预算 4 秒，隧道不
+        //    应答就必然先吃光预算。而触发本预案的签名恰恰是 relay 的 `i/o timeout` /
+        //    `deadline exceeded` —— 就是「隧道挂死」本身。当它不动作，哨兵在**主打的故障形态**
+        //    上就是永久空操作，只能等巡检（`HEALTH_INTERVAL_SECS` 120 秒 × `FAIL_TO_UNHEALTHY`
+        //    2 轮迟滞，且挂死时每轮 `probe_member` 自己要 ~40 秒）≈4–5 分钟才挪槽；
+        // ③ 判错的代价不对称：误判死 = 多借一次兄弟 IP（吵闹、巡检连续 3 轮就切回），不动作 =
+        //    用户静默断网几分钟。同一份 `probe_member` 的超时在巡检那边本来也算失败证据
+        //    （`apply_hysteresis(ok = false)`），这里不再自相矛盾。
+        // 文案如实说「没能确认」而不是「不可达」——我们只知道它在预算内没应答。
+        health::Verdict::Unconfirmed => format!(
+            "没能在 {} 秒内确认可用（网关通但隧道无响应，或探测任务异常），\
+             加上 relay 刚连报错误，按不可用处置",
+            health::QUICK_PROBE_BUDGET_SECS
+        ),
+        health::Verdict::Dead { auth_failed: true } => "凭据失效（407 / SOCKS5 认证被拒）".into(),
+        health::Verdict::Dead { auth_failed: false } => "不可达".into(),
     };
     state::update(&ctx.runtime, move |r| {
         state::mark_unhealthy(r.health.entry(id.to_string()).or_default(), now);
     })
     .await;
-    let moved = slots::borrow_now(ctx, clash, id, now).await;
+    let moved = slots::borrow_now(ctx, prober, clash, id, now, tcp_within).await;
     let msg = format!("IP {} {why}，{}", ip_of(&up), borrow_text(&g, &moved));
     let alert = msg.clone();
     state::update(&ctx.runtime, move |r| {
@@ -138,11 +193,11 @@ pub async fn on_google_blocked(
         return gone(id);
     };
     let u2 = up.clone();
-    let verdict =
-        tokio::task::spawn_blocking(move || proxy::google_ok_of(&prober.google_search(&u2)))
-            .await
-            .ok()
-            .flatten();
+    let p2 = prober.clone();
+    let verdict = tokio::task::spawn_blocking(move || proxy::google_ok_of(&p2.google_search(&u2)))
+        .await
+        .ok()
+        .flatten();
     if verdict == Some(true) {
         return Outcome {
             subject: subject_of(&up),
@@ -158,7 +213,15 @@ pub async fn on_google_blocked(
         );
     })
     .await;
-    let moved = slots::borrow_now(ctx, clash, id, now).await;
+    let moved = slots::borrow_now(
+        ctx,
+        prober,
+        clash,
+        id,
+        now,
+        std::time::Duration::from_secs(PROBE_TCP_TIMEOUT_SECS),
+    )
+    .await;
     let msg = format!(
         "IP {} 的 Google 被封（serp 403 / sorry 页），{}",
         ip_of(&up),
@@ -265,6 +328,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let (ctx, _host) = pool_ctx(d.path()).await;
         let (p, c) = fakes(); // FakeProber 缺省：网关连不上
+        p.with_gateways_up(&["isp1.example.net:10007"]); // 借用目标验证得过
         let o = on_upstream_error(&ctx, p.clone(), c.clone(), u(2), t0()).await;
         assert_eq!(
             o.subject, "isp2.example.net:10007",
@@ -275,7 +339,15 @@ mod tests {
             "IP 198.51.100.8 不可达，槽 1 已临时切到 198.51.100.7"
         );
         assert_eq!(o.level, Level::Error);
-        assert_eq!(p.calls(), vec!["tcp"], "快探：网关连不上就不再发 HTTP");
+        assert_eq!(
+            p.calls(),
+            vec![
+                "tcp".to_string(),
+                "tcp".to_string(),
+                format!("timed:{}", crate::modules::residential::LATENCY_PROBE_URL),
+            ],
+            "快探：网关连不上就不再发 HTTP；借到的那条再用同一个快探验证一次"
+        );
         assert_eq!(c.selected("slot-1-pool").as_deref(), Some("resi-1"));
         let r = state::read(&ctx.runtime).await;
         assert!(!r.health[&u(2).to_string()].active, "带外确认 ⇒ 立即不健康");
@@ -285,6 +357,127 @@ mod tests {
             Some(&o.result),
             "上游级告警：面板住宅卡看得到，巡检探通即清"
         );
+    }
+
+    /// 整个网关不可用（候选逐条验证都不通）：事件必须说清终态——放回本槽 IP、当前无可用出口，
+    /// 绝不允许出现「已临时切到」一条我们自己刚验证过是死路的上游
+    #[tokio::test]
+    async fn with_no_candidate_reachable_the_event_says_so_and_the_slot_goes_home() {
+        let d = tempfile::tempdir().unwrap();
+        let (ctx, _host) = pool_ctx(d.path()).await;
+        let (p, c) = fakes(); // 池里每一条的网关都连不上
+        let o = on_upstream_error(&ctx, p.clone(), c.clone(), u(2), t0()).await;
+        assert_eq!(
+            o.result,
+            "IP 198.51.100.8 不可达，槽 1：候选 198.51.100.7、198.51.100.9 都探不通，\
+             当前指向本槽 IP 198.51.100.8，当前无可用出口"
+        );
+        assert!(!o.result.contains("已临时切到"), "{}", o.result);
+        assert_eq!(o.level, Level::Error);
+        assert_eq!(
+            c.calls(),
+            vec![
+                "put:slot-1-pool:resi-1",
+                "put:slot-1-pool:resi-3",
+                "put:slot-1-pool:resi-2"
+            ],
+            "两个候选各一次 PUT + 收尾放回本槽"
+        );
+        assert_eq!(p.calls(), vec!["tcp", "tcp", "tcp"], "故障 IP + 两个候选");
+        let r = state::read(&ctx.runtime).await;
+        assert_eq!(
+            r.slots["1"].current_upstream_id,
+            Some(u(2)),
+            "runtime 与 selector 一致：查得出现在指着谁"
+        );
+        for n in [1u128, 3] {
+            assert!(!r.health[&u(n).to_string()].active, "验证不通的候选 {n}");
+        }
+        assert_eq!(r.upstream_alerts.get(&u(2)), Some(&o.result));
+    }
+
+    /// 连「放回本槽」都失败：事件把这一层也说出来（哪一步失败 + 现在指向谁）
+    #[tokio::test]
+    async fn a_failed_put_back_is_spelled_out_in_the_event() {
+        let d = tempfile::tempdir().unwrap();
+        let (ctx, _host) = pool_ctx(d.path()).await;
+        let (p, c) = fakes();
+        c.with(|i| {
+            i.reject_tags.insert("resi-2".into());
+        });
+        let o = on_upstream_error(&ctx, p, c, u(2), t0()).await;
+        assert!(
+            o.result.starts_with(
+                "IP 198.51.100.8 不可达，槽 1：候选 198.51.100.7、198.51.100.9 都探不通，\
+                 放回本槽 IP 也失败：切到 resi-2 失败："
+            ),
+            "{}",
+            o.result
+        );
+        assert!(
+            o.result.ends_with("当前指向 198.51.100.9，当前无可用出口"),
+            "终态指向谁必须写出来：{}",
+            o.result
+        );
+        assert_eq!(
+            state::read(&ctx.runtime).await.slots["1"].current_upstream_id,
+            Some(u(3)),
+            "selector 还停在最后一个候选上，runtime 如实记"
+        );
+    }
+
+    /// 文案口径（裁决 D18）：**只有「当下确认可用」那一种**能说「已临时切到」；没能确认要如实说
+    /// 未确认；没切成要说清哪几个候选探不通、卡在哪一步、**现在指向谁**；「无可用出口」这个关键词
+    /// 只跟着 `no_exit` 出现（演练 `--all-ports` 判据②' 认它）。
+    #[tokio::test]
+    async fn each_borrow_shape_says_who_failed_where_and_where_it_points_now() {
+        let d = tempfile::tempdir().unwrap();
+        let (ctx, _host) = pool_ctx(d.path()).await;
+        let g = state::group_of(&*ctx.store.read().await);
+        let borrowed = SlotOutcome {
+            index: 1,
+            own: u(2),
+            target: u(1),
+            borrowed: true,
+            switched: true,
+            unconfirmed: false,
+            no_exit: false,
+            note: None,
+            dead: Vec::new(),
+        };
+        assert_eq!(
+            borrow_text(&g, std::slice::from_ref(&borrowed)),
+            "槽 1 已临时切到 198.51.100.7"
+        );
+
+        let unconfirmed = SlotOutcome {
+            unconfirmed: true,
+            note: Some("未能在 4 秒内确认可用".into()),
+            ..borrowed.clone()
+        };
+        let t = borrow_text(&g, &[unconfirmed]);
+        assert_eq!(t, "槽 1 已切到 198.51.100.7，未能在 4 秒内确认可用");
+        assert!(
+            !t.contains("已临时切到") && !t.contains("无可用出口"),
+            "{t}"
+        );
+
+        // 试到第二个候选时 PUT 失败：候选没试完 ⇒ 不许说「无可用出口」
+        let put_failed = SlotOutcome {
+            target: u(2),
+            borrowed: false,
+            switched: false,
+            dead: vec![u(3)],
+            note: Some("切到 resi-1 失败：404".into()),
+            ..borrowed.clone()
+        };
+        let t = borrow_text(&g, &[put_failed]);
+        assert_eq!(
+            t,
+            "槽 1：候选 198.51.100.9 探不通，切到 resi-1 失败：404，当前指向本槽 IP 198.51.100.8",
+            "一条候选就不说「都」"
+        );
+        assert!(!t.contains("无可用出口"), "{t}");
     }
 
     /// 唯一经这条 IP 出网的槽被管理员 pin 住：不动它，但告警要如实说，不能说「当前没有槽经它出网」
@@ -332,15 +525,72 @@ mod tests {
         assert!(r.upstream_alerts.is_empty());
     }
 
+    /// 判「原上游坏了」的那次快探撞上整体预算（[`health::QUICK_PROBE_BUDGET_SECS`]）：
+    /// 网关活着、隧道不响应 —— 这正是本预案主打的故障形态，而 `probe_quick` 在这条路上
+    /// 没有自己的上界（实测 ≈28 秒），所以它必须被 `timeout` 截断，否则两条处置延迟 SLA
+    /// （15 / 25 秒）在最常见的形态上必然破。
+    ///
+    /// 截断之后**照不可用处置**（2026-09-14 审查第 2 条）：`timed_get` 的 8 秒超时大于这个
+    /// 4 秒预算，「隧道挂死」这条路上 `Dead` 算术上不可达，若这里不动作，哨兵在主打形态上
+    /// 就是永久空操作（只能等巡检 ≈4–5 分钟）。relay 已在 60 秒内独立报了 ≥2 条错误，带外
+    /// 也过不去是**佐证**。级别必须是 Error：真动了手，就该占 10 分钟冷却。
+    ///
+    /// 这条路上借到的那条也卡在同一道闸门上，所以借用后验证也被预算截断一次、合计 8 秒，事件
+    /// 说「已切到 Y，未能在 4 秒内确认可用」。它**不在** spec §5.7「有可用出口 ≤15 秒」那条算式
+    /// （≈ ≤12 秒：首候选健康、验证 < 1 秒）里 —— 首候选没能确认可用，算不上「有可用出口」；
+    /// 加上等第 2 条错误与轮询，落地是 15 秒整（见 `slots::BORROW_PROBES_PER_CALL` 的算式）。
+    ///
+    /// 这条用例真的要等满 8 秒（同 `slots` 那条：`spawn_blocking` 在飞时 tokio 抑制
+    /// `start_paused` 的自动推进）；`open_after` 是兜底，让「timeout 被删掉」这个变异红在
+    /// 耗时断言上而不是挂死整个测试二进制。
+    #[tokio::test]
+    async fn a_judging_probe_that_outruns_its_budget_is_treated_as_unavailable() {
+        let d = tempfile::tempdir().unwrap();
+        let (ctx, _host) = pool_ctx(d.path()).await;
+        let (p, c) = fakes();
+        let gate = Arc::new(crate::modules::residential::proxy::Gate::default());
+        // 故障那条与第一候选的网关都连得上，但经它们的 GET 都卡住
+        p.with_gateways_up(&["isp1.example.net:10007", "isp2.example.net:10007"])
+            .with(|i| i.gate = Some(gate.clone()));
+        gate.open_after(std::time::Duration::from_secs(30));
+        let t = std::time::Instant::now();
+        let o = on_upstream_error(&ctx, p.clone(), c.clone(), u(2), t0()).await;
+        let took = t.elapsed();
+        gate.open(); // 先放行，再断言
+        let budget = std::time::Duration::from_secs(health::QUICK_PROBE_BUDGET_SECS);
+        assert!(
+            took >= 2 * budget && took < 2 * budget + std::time::Duration::from_secs(3),
+            "两次快探各被整体预算截断一次：{took:?}"
+        );
+        assert_eq!(o.level, Level::Error, "真动了手，该占 10 分钟冷却");
+        assert_eq!(
+            o.result,
+            "IP 198.51.100.8 没能在 4 秒内确认可用（网关通但隧道无响应，或探测任务异常），\
+             加上 relay 刚连报错误，按不可用处置，槽 1 已切到 198.51.100.7，未能在 4 秒内确认可用"
+        );
+        assert!(!o.result.contains("已临时切到"), "{}", o.result);
+        assert!(!c.calls().is_empty(), "有佐证 ⇒ 照样借用");
+        let r = state::read(&ctx.runtime).await;
+        assert!(
+            !r.health[&u(2).to_string()].active,
+            "按不可用处置 ⇒ 记不健康"
+        );
+        assert!(!r.upstream_alerts.is_empty(), "告警要发");
+    }
+
     #[tokio::test]
     async fn an_auth_failure_is_reported_as_credentials_not_reachability() {
         let d = tempfile::tempdir().unwrap();
         let (ctx, _host) = pool_ctx(d.path()).await;
         let (p, c) = fakes();
-        p.with(|i| {
+        p.with_gateways_up(&["isp1.example.net:10007"]).with(|i| {
             i.tcp_ms = Some(20);
+            // 凭据失效的只有故障那一条（按上游限定的一格压过裸 URL 那格）
             i.gets.insert(
-                crate::modules::residential::LATENCY_PROBE_URL.into(),
+                format!(
+                    "isp2.example.net:10007 {}",
+                    crate::modules::residential::LATENCY_PROBE_URL
+                ),
                 Err("__auth_failed__".into()),
             );
         });
@@ -356,7 +606,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let (ctx, _host) = pool_ctx(d.path()).await;
         let (p, c) = fakes();
-        p.with(|i| {
+        p.with_gateways_up(&["isp1.example.net:10007"]).with(|i| {
             i.google = Some(Ok(HttpProbe {
                 status: 200,
                 body: "<a href=\"https://www.google.com/sorry/index?continue=x\">".into(),

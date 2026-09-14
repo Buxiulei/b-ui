@@ -67,8 +67,10 @@ fn drop_stale_start(sr: &mut SentinelRuntime, now: OffsetDateTime) {
 }
 
 /// 执行了动作（借用 / 告警 / 重试 / 交看门狗）才盖 [`super::ACTION_COOLDOWN_SECS`] 冷却。住宅两类预案
-/// 的 Info 是「带外探测 / 复核通过，或上游刚被删」——什么都没做，只受 60 秒去抖约束：否则一次误报
-/// （HTTP 上游对慢目标报 deadline exceeded）会让哨兵对该上游失明 10 分钟，真故障只能等巡检。
+/// 的 Info 是「带外探测 / 复核确认可用，或上游刚被删」——什么都没做，只受 60 秒去抖约束：否则一次
+/// 误报（HTTP 上游对慢目标报 deadline exceeded）会让哨兵对该上游失明 10 分钟，真故障只能等巡检。
+/// 判原上游那次快探「没能在预算内确认」**不是** Info：它按不可用处置、真借用了，照常占冷却
+/// （`resi::on_upstream_error`，2026-09-14 主会话裁决）。
 fn takes_cooldown(sig: Sig, level: Level) -> bool {
     !(sig.on_upstream() && level == Level::Info)
 }
@@ -448,6 +450,8 @@ mod tests {
     #[tokio::test]
     async fn two_timeouts_to_one_upstream_give_one_probe_one_borrow_one_incident() {
         let k = kit().await;
+        // 借用目标（resi-1）探得通：借用后要用同一个快探验证它（spec §5.7）
+        k.prober.with_gateways_up(&["isp1.example.net:10007"]);
         k.host.advance(3);
         feed(
             &k,
@@ -515,7 +519,12 @@ mod tests {
                 .collect(),
         );
         assert!(tick(&k.ctx, &k.deps, &mut s).await.incidents.is_empty());
-        assert_eq!(k.prober.calls(), vec!["tcp"], "整段只探了一次");
+        assert_eq!(
+            k.prober.calls().iter().filter(|c| *c == "tcp").count(),
+            2,
+            "整段只探了两次：故障 IP 一次 + 借用目标的验证一次（{:?}）",
+            k.prober.calls()
+        );
     }
 
     #[tokio::test]
@@ -687,9 +696,35 @@ mod tests {
         (parse_rfc3339(at).expect("at 是 RFC3339") - from).whole_seconds()
     }
 
-    /// 演练判据①的延迟预算（2026-09-13 真机 30.3 秒、SLA 15 秒之后）：达到门槛的那条错误最晚在它
-    /// 之后一个轮询周期被读到；带外探测 TCP 不通最多等 PROBE_TCP_TIMEOUT_SECS 就判不可达，不再跑
-    /// 完整探测；借用只是毫秒级的 Clash PUT（留 1 秒）
+    /// `health::probe_quick` 那条「网关活着、隧道卡住」的慢路上没有自己的上界（实测 ≈28 秒），
+    /// 上界只由 `health::QUICK_PROBE_BUDGET_SECS` 的 `timeout` 给。这个预算**必须 > 网关 TCP
+    /// 那一步的时限**，否则每条「网关连不上」的上游都会在 TCP 那一步把预算吃光、结论从
+    /// 「确认不可用」退化成「未确认」：借用侧在第一个候选上就停（既不记不健康也不试下一个），
+    /// 候选轮换静默失效；判原上游那侧虽然仍按不可用处置，也丢掉「凭据失效 / 不可达」的区分
+    /// —— 而两处既有用例的假件 TCP 是瞬时的，一条都不会红（2026-09-14 审查第 3 条）。
+    #[test]
+    fn the_quick_probe_budget_must_outlast_the_gateway_tcp_timeout() {
+        let (budget, tcp) = (
+            crate::modules::residential::health::QUICK_PROBE_BUDGET_SECS,
+            super::super::PROBE_TCP_TIMEOUT_SECS,
+        );
+        assert!(
+            budget > tcp,
+            "快探整体预算 {budget} 秒 ≤ 网关 TCP 时限 {tcp} 秒：每条网关连不上的上游都会变成「未确认」"
+        );
+    }
+
+    /// 演练判据①的延迟预算（2026-09-13 真机 30.3 秒、SLA 15 秒之后）。spec §5.7「有可用出口 ≤15 秒」
+    /// 的算式 = 等第 2 条错误 ≤5 + 轮询 ≤2 + 判原上游快探 ≤4（预算）+ PUT + 首候选验证 < 1
+    /// ≈ ≤12 秒；这条用例量的是其中丢包那条快路（错误并发、判原上游 ≤3 秒）。达到门槛的那条错误
+    /// 最晚在它之后一个轮询周期被读到；带外探测 TCP 不通最多等 PROBE_TCP_TIMEOUT_SECS 就判不可达，不再跑
+    /// 完整探测；借用 = 一次 Clash PUT 加借到那条的带外验证 —— 这条快路上验证的目标网关是通的
+    /// （只丢了一个端口），一次经隧道的 GET 远小于 1 秒，所以留 1 秒。**两次快探各自走不通的那条
+    /// 慢路**（网关活着、出口 IP 死了）都由 `health::QUICK_PROBE_BUDGET_SECS` 的整体时限兜住
+    /// （判原上游与借用后验证共用它），见
+    /// `with_the_whole_gateway_down_the_event_lands_within_the_no_exit_sla`、
+    /// `resi::tests::a_judging_probe_that_outruns_its_budget_is_treated_as_unavailable` 与
+    /// `slots::tests::a_verification_that_outruns_its_budget_keeps_the_candidate_and_says_so`
     #[tokio::test]
     async fn a_dropped_gateway_is_borrowed_within_one_poll_plus_the_tcp_timeout() {
         assert_eq!(
@@ -699,6 +734,8 @@ mod tests {
         );
         let k = kit().await;
         gateway_dropped(&k);
+        // 借用目标还活着（演练只丢弃**一个**端口 = 一个出口 IP），验证它不吃时限
+        k.prober.with_gateways_up(&["isp1.example.net:10007"]);
         // 两条并发连接同时报错（演练就是并发三个请求），刚好落在上一轮之后：一个轮询周期后才读到
         k.host.advance(POLL_SECS as i64);
         let reached = rec("b-ui-relay", 0, &timeout("resi-2"));
@@ -710,8 +747,12 @@ mod tests {
         assert_eq!(k.clash.selected("slot-1-pool").as_deref(), Some("resi-1"));
         assert_eq!(
             k.prober.calls(),
-            vec!["tcp"],
-            "TCP 不通即判不可达，不再跑完整探测"
+            vec![
+                "tcp".to_string(),
+                "tcp".to_string(),
+                format!("timed:{}", crate::modules::residential::LATENCY_PROBE_URL),
+            ],
+            "TCP 不通即判不可达，不再跑完整探测；借用目标再验证一次"
         );
         let budget = POLL_SECS as i64 + super::super::PROBE_TCP_TIMEOUT_SECS as i64 + 1;
         let took = secs_until(ts, &rep.incidents[0].at);
@@ -719,6 +760,52 @@ mod tests {
             took <= budget,
             "达到门槛的错误 → 事件 {took} 秒，预算 {budget} 秒"
         );
+    }
+
+    /// **整个网关不可用**（池里各条都在同一个网关上）时最慢的那条路：原上游快探 3 秒 +
+    /// 每个候选「PUT + 快探」+ 收尾 PUT，事件才落地。演练判据拆成两条正是为此：
+    /// 有可用出口 ≤15 秒，无可用出口 ≤25 秒（`DRILL_NOEXIT_SLA`；算式 = 等第 2 条错误 ≤5 + 轮询
+    /// ≤2 + 判原上游快探 ≤4 + 3 ×（PUT + 验证 ≤4）+ 收尾 PUT ≈ ≤24 秒，PUT 按正常毫秒级计、
+    /// Clash 挂起不在预算内）。
+    /// 这里的假时钟只推得动「网关 TCP 连不上」那一段（`on_tcp_fail`），与真机丢包一样 ——
+    /// 网关活着、HTTP 卡住那一段的上界靠 `health::QUICK_PROBE_BUDGET_SECS` 的 `timeout`，
+    /// 判原上游那次与借用后那次各用假件单独测（丢包量不到它）。
+    /// 候选数上限是**单次调用**的 `slots::BORROW_PROBES_PER_CALL`，所以这里的算式
+    /// `POLL + (1 + 候选数) × PROBE_TCP_TIMEOUT_SECS` 在 8 条上游的生产池上同样成立
+    #[tokio::test]
+    async fn with_the_whole_gateway_down_the_event_lands_within_the_no_exit_sla() {
+        const DRILL_NOEXIT_SLA: i64 = 25;
+        let k = kit().await;
+        gateway_dropped(&k); // 池里每一条都连不上，各等满 PROBE_TCP_TIMEOUT_SECS
+        k.host.advance(POLL_SECS as i64);
+        let reached = rec("b-ui-relay", 0, &timeout("resi-2"));
+        let ts = reached.ts;
+        feed(&k, vec![rec("b-ui-relay", 0, &timeout("resi-2")), reached]);
+        let rep = tick(&k.ctx, &k.deps, &mut Sentinel::default()).await;
+        assert_eq!(rep.incidents.len(), 1, "{:?}", rep.incidents);
+        let inc = &rep.incidents[0];
+        assert_eq!(
+            inc.result,
+            "IP 198.51.100.8 不可达，槽 1：候选 198.51.100.7、198.51.100.9 都探不通，\
+             当前指向本槽 IP 198.51.100.8，当前无可用出口"
+        );
+        assert!(!inc.result.contains("已临时切到"), "{}", inc.result);
+        assert_eq!(
+            k.clash.selected("slot-1-pool").as_deref(),
+            Some("resi-2"),
+            "终态 = 放回本槽自己的上游，不许停在死候选上"
+        );
+        assert_eq!(
+            crate::modules::residential::state::read(&k.ctx.runtime)
+                .await
+                .slots["1"]
+                .current_upstream_id,
+            Some(Uuid::from_u128(2))
+        );
+        let took = secs_until(ts, &inc.at);
+        let budget = POLL_SECS as i64 + 3 * super::super::PROBE_TCP_TIMEOUT_SECS as i64;
+        assert_eq!(took, budget, "原上游 + 两个候选各一次快探");
+        assert!(took <= DRILL_NOEXIT_SLA, "首条错误 → 事件 {took} 秒");
     }
 
     /// 最坏情况（客户端串行、错误一条一条来）：第 2 条错误要等 relay 再拨一次上游、超时才出现。
@@ -730,6 +817,7 @@ mod tests {
         const DRILL_DETECT_SLA: i64 = 15;
         let k = kit().await;
         gateway_dropped(&k);
+        k.prober.with_gateways_up(&["isp1.example.net:10007"]);
         let mut s = Sentinel::default();
         k.host.advance(POLL_SECS as i64);
         let first = rec("b-ui-relay", 0, &timeout("resi-2"));
@@ -760,7 +848,17 @@ mod tests {
     async fn a_reachable_gateway_still_gets_the_full_probe() {
         use crate::modules::residential::{HEALTH_PROBE_HOST, HEALTH_PROBE_URL, LATENCY_PROBE_URL};
         let k = kit().await;
-        k.prober.with(|i| i.tcp_ms = Some(20)); // 网关通；经隧道的请求缺省全失败
+        k.prober.with(|i| {
+            // 网关通；经隧道的请求缺省全失败。借用目标那条经隧道通（按上游限定的一格），验证得过
+            i.tcp_ms = Some(20);
+            i.gets.insert(
+                format!("isp1.example.net:10007 {LATENCY_PROBE_URL}"),
+                Ok(crate::modules::residential::proxy::HttpProbe {
+                    status: 204,
+                    body: String::new(),
+                }),
+            );
+        });
         k.host.advance(2);
         feed(
             &k,
@@ -778,6 +876,9 @@ mod tests {
                 format!("timed:{LATENCY_PROBE_URL}"),
                 format!("get:{HEALTH_PROBE_URL}"),
                 format!("connect:{HEALTH_PROBE_HOST}:443"),
+                // 借用目标的验证：同一个快探，网关通就走一轮可达性
+                "tcp".to_string(),
+                format!("timed:{LATENCY_PROBE_URL}"),
             ]
         );
         assert_eq!(k.clash.selected("slot-1-pool").as_deref(), Some("resi-1"));
@@ -792,6 +893,17 @@ mod tests {
             i.gets.insert(
                 crate::modules::residential::LATENCY_PROBE_URL.into(),
                 Err("__auth_failed__".into()),
+            );
+            // 凭据失效的只有这一条：借用目标（resi-1）验证得过
+            i.gets.insert(
+                format!(
+                    "isp1.example.net:10007 {}",
+                    crate::modules::residential::LATENCY_PROBE_URL
+                ),
+                Ok(crate::modules::residential::proxy::HttpProbe {
+                    status: 204,
+                    body: String::new(),
+                }),
             );
         });
         k.host.advance(3);

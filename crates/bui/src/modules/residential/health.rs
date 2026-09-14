@@ -80,14 +80,112 @@ pub fn probe_member(p: &dyn Prober, up: &Upstream) -> MemberProbe {
 /// ——网关都连不上，隧道不可能通，再等一次 HTTP 超时只会拖慢预案（上游被丢包时巡检那套
 /// [`probe_member`] 要走 ~40 秒）；连得上再走一轮与巡检同口径的 [`probe_reachable`]（含 407 补判）。
 /// **不测 Google / UDP / 测速**：那些是巡检的指标，预案只关心「这条上游此刻还能不能用」。
-/// 完整探测那段的超时由调用方的 `Prober` 决定（哨兵用 `ReqwestProber::with_timeout(5)`）。
-pub fn probe_quick(p: &dyn Prober, up: &Upstream, tcp_within: Duration) -> MemberProbe {
+///
+/// **它本身没有上界**：网关连得上之后那段完整探测的超时是各请求自己的
+/// （`timed_get` 吃 [`super::LATENCY_PROBE_TIMEOUT_SECS`] = 8 秒 —— **不是**调用方
+/// `Prober` 的那个超时；`get` 与 407 补判的 CONNECT 各吃 `Prober` 的超时，`ReqwestProber::dial`
+/// 还按解析出的地址逐个串行各等一次），叠起来远超预案的延迟预算。所以它**私有**：唯一的出口是
+/// [`probe_quick_within`]（带预算、结论三值），这个不变式交给编译器而不是注释 —— 上一轮的教训
+/// 正是「注释挡不住后来人按旧口径算预算」（2026-09-14 审查第 5 条）。
+fn probe_quick(p: &dyn Prober, up: &Upstream, tcp_within: Duration) -> MemberProbe {
     let Some(tcp_ms) = p.gateway_tcp_within(up, tcp_within) else {
         return MemberProbe::default();
     };
     let mut probe = probe_reachable(p, up);
     probe.tcp_ms = Some(tcp_ms);
     probe
+}
+
+/// 一次带预算的快探（[`probe_quick_within`]）的**整体**时限：整个 `probe_quick` 被
+/// `tokio::time::timeout` 包住，超时即结论「未确认」（不是「不可用」）。
+///
+/// **为什么非得有这个上界**：`probe_quick` 只在网关 TCP 连不上时才是「≤ `tcp_within` 返回」；
+/// 一旦 TCP 通过，它会继续走 [`probe_reachable`]（`timed_get` 8 秒 + `get` 5 秒 + 407 补判的
+/// CONNECT 5 秒，多地址网关还要按 `dial` 逐地址串行各 5 秒），而「网关活着、某个静态端口背后
+/// 的出口 IP 死了」恰恰是住宅预案主打的故障形态。用生产参数
+/// （`ReqwestProber::with_timeout(PROBE_TIMEOUT_SECS = 5)`、`tcp_within = 3`）对着一个
+/// 「accept 后永不应答」的本地监听实测单次 `probe_quick` = **28.4 秒**（2026-09-14 审查实测），
+/// 多地址网关更高。没有这个上界，spec §5.7 的两条处置延迟 SLA（15 / 25 秒）在生产最常见的
+/// 故障形态上必然破。
+///
+/// 4 秒的来历：① 网关 TCP 连不上那条路 ≤ `tcp_within`（哨兵传
+/// `sentinel::PROBE_TCP_TIMEOUT_SECS` = 3 秒）就返回；② 网关活着、隧道正常那条路经隧道一次
+/// GET 远小于 1 秒。**必须 > `tcp_within`**，否则 TCP 一步就把预算吃光，每条「网关连不上」的
+/// 上游都从「确认不可用」退化成「未确认」⇒ 借用侧在第一个候选上就停（既不记不健康也不试下一
+/// 个），候选轮换静默失效，判原上游那侧也丢掉「凭据失效」与「不可达」的区分
+/// （`sentinel::run` 里有一条用例钉住这个不等式）。
+///
+/// **这个预算之内「隧道挂死」拿不到 [`Verdict::Dead`]**：`probe_reachable` 的第一次请求是
+/// `timed_get`，超时 [`super::LATENCY_PROBE_TIMEOUT_SECS`] = 8 秒 > 4 秒，隧道不应答就必然先
+/// 吃光预算 ⇒ 结论只能是「未确认」。所以判原上游那一侧把「未确认」按不可用处置（那边有 relay
+/// 的连报错误作佐证），否则哨兵在**主打的故障形态**上就是永久空操作 —— 见 [`Verdict`] 的文档
+/// 与 `sentinel::resi::on_upstream_error`（2026-09-14 审查第 2 条）。
+///
+/// **已知取舍（2026-09-14 审查）**：4 秒对真实住宅出口偏紧 —— 经隧道的首包 1–3 秒并不罕见，
+/// 加上最坏 3 秒的网关 TCP 就可能越过 4 秒，于是**健康**的上游也会常态报「未确认」。代价按侧
+/// 不同：借用侧 fail-safe（保留候选、不记不健康），文案从「槽 i 已临时切到 Y」退化成「已切到
+/// Y，未能在 4 秒内确认可用」；判原上游那侧会多借一次兄弟 IP（吵闹、巡检连续 3 轮自己切回），
+/// 换来「隧道挂死」这条路上仍然 15 秒自愈。要不要放宽，等 bwg-tizi 上实测一次真实借用验证的
+/// 耗时再定（计划 D18 记了这一项）。
+pub const QUICK_PROBE_BUDGET_SECS: u64 = 4;
+
+/// 一次带预算的快探的三种结论。「确认不可用」与「没能确认」**必须分开**：前者是这条上游
+/// 自己给出的明确失败，后者只是「预算内没应答」—— 两者该怎么处置，由调用方按**手上还有没有
+/// 别的佐证**决定，本枚举只如实报观测：
+/// - `sentinel::resi::on_upstream_error`（判原上游）：relay 刚在 60 秒内独立报了 ≥2 条连接
+///   错误，带外也过不去是**佐证** ⇒ `Unconfirmed` 与 `Dead` 同样按不可用处置（文案区分）；
+/// - `slots::borrow_now`（借用后验证）：那条候选没人报过错，没有这层佐证 ⇒ `Unconfirmed`
+///   只能**保留候选**、不记不健康。
+///
+/// 两处处置不同不是含糊，是证据量不同（2026-09-14 审查第 2 条的裁决）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// 预算内确认可用
+    Alive,
+    /// 预算内拿到明确的失败：网关 TCP 不通，或经隧道的 HTTP 明确失败 / 凭据被拒
+    /// （`auth_failed` = 407 / SOCKS5 认证被拒，告警要据此说「凭据失效」而不是「不可达」）
+    Dead { auth_failed: bool },
+    /// 预算内没能确认（超时、或探测任务本身异常）⇒ 结论未知
+    Unconfirmed,
+}
+
+/// 私有的 `probe_quick` 加 [`QUICK_PROBE_BUDGET_SECS`] 的整体预算，结论三值（[`Verdict`]）。
+/// **哨兵两侧都只能经这里**（`probe_quick` 不对外）。
+///
+/// 哨兵判「原上游坏了」（`sentinel::resi::on_upstream_error`）与借用后验证刚切过去那条
+/// （`slots::borrow_now`）**共用这一份**：同一个探测、同一个上界、同一套三值口径。**观测**
+/// 必须对称 —— 只给其中一处加时限，处置延迟算式里的上界就只对那一处成立（2026-09-14 审查
+/// 第 1 条）。**处置**不对称：两处对 [`Verdict::Unconfirmed`] 的处理按各自手上的佐证分道，
+/// 见 [`Verdict`] 的文档（2026-09-14 审查第 2 条）。
+///
+/// `Prober` 是同步的（`reqwest::blocking`），照例进 `spawn_blocking`；超时后那个任务会自己
+/// 跑完（`reqwest::blocking` 没有取消点），结果丢弃，不阻塞调用方。
+///
+/// 探测任务本身异常（`JoinError`：探测器 panic / runtime 正在关）也并进 [`Verdict::Unconfirmed`]
+/// —— 结论一样是「不知道」。但**原因必须落日志**：调用方的事件文案只说「网关通但隧道无响应，
+/// 或探测任务异常」，探测器 panic 会每 60 秒（`sentinel::DEBOUNCE_SECS`）静静复发一次，
+/// 日志里不留原因就无从下手（2026-09-14 审查第 4 条）。
+pub async fn probe_quick_within(
+    prober: &Arc<dyn Prober>,
+    up: Upstream,
+    tcp_within: Duration,
+) -> Verdict {
+    let p = prober.clone();
+    // 日志里指称这条上游只用 `host:port`（同 `sentinel::resi::subject_of`），绝不带凭据
+    let subject = format!("{}:{}", up.host, up.port);
+    let probe = tokio::task::spawn_blocking(move || probe_quick(p.as_ref(), &up, tcp_within));
+    let budget = Duration::from_secs(QUICK_PROBE_BUDGET_SECS);
+    match tokio::time::timeout(budget, probe).await {
+        Ok(Ok(probe)) if probe.ok => Verdict::Alive,
+        Ok(Ok(probe)) => Verdict::Dead {
+            auth_failed: probe.auth_failed,
+        },
+        Ok(Err(e)) => {
+            tracing::warn!(upstream = %subject, error = %e, "带外快探的探测任务异常，结论按「未确认」");
+            Verdict::Unconfirmed
+        }
+        Err(_) => Verdict::Unconfirmed,
+    }
 }
 
 /// 可达性那一半：最多 [`HEALTH_TRIES`] 次，任一成功即本轮健康。
@@ -2813,5 +2911,67 @@ mod tests {
         });
         let r = probe_quick(&p, &upstream(2, 10), Duration::from_secs(3));
         assert!(!r.ok && r.auth_failed);
+    }
+
+    /// 抓 `tracing` 输出的极小写入器：[`probe_quick_within`] 对 `JoinError` 只落日志
+    /// （结论、级别都不动），所以「原因有没有被丢掉」只能从日志里断言
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl LogCapture {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("日志缓冲锁")).into_owned()
+        }
+    }
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("日志缓冲锁").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// 探测任务本身异常（`spawn_blocking` 的 `JoinError`：探测器 panic / runtime 正在关）：
+    /// 结论只能是 [`Verdict::Unconfirmed`]（确实不知道），但**原因必须落日志**——两侧调用方的
+    /// 事件文案都只说「网关通但隧道无响应，或探测任务异常」，而 panic 会每
+    /// `sentinel::DEBOUNCE_SECS` 秒复发一次，日志里不留原因就无从下手（2026-09-14 审查第 4 条）。
+    /// 日志里指称上游只许用 `host:port`，不许带凭据。
+    #[tokio::test]
+    async fn a_panicking_probe_task_is_unconfirmed_and_logs_the_reason() {
+        let p = crate::modules::residential::proxy::FakeProber::new();
+        // 网关连不上那一步会调 on_tcp_fail：借它让阻塞任务炸在里面
+        p.with(|i| i.on_tcp_fail = Some(Box::new(|_| panic!("探测器炸了"))));
+        let prober: Arc<dyn Prober> = Arc::new(p);
+        let log = LogCapture::default();
+        let verdict = {
+            let _g = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(log.clone())
+                    .with_ansi(false)
+                    .finish(),
+            );
+            probe_quick_within(&prober, upstream(2, 10), Duration::from_secs(1)).await
+        };
+        assert_eq!(verdict, Verdict::Unconfirmed, "不知道就是不知道");
+        let text = log.text();
+        assert!(text.contains("带外快探的探测任务异常"), "{text}");
+        assert!(text.contains("探测器炸了"), "原因被丢掉了：{text}");
+        assert!(
+            text.contains("isp2.example.net:10007"),
+            "要点名上游：{text}"
+        );
+        assert!(!text.contains("pw1"), "日志不许带凭据：{text}");
     }
 }
