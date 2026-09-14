@@ -109,8 +109,9 @@ function init() {
 }
 
 // Load data
+// 返回 Promise：轮换凭据后要等用户列表刷新完再按新 token 重画配置弹窗（见 rotateSub）
 function load() {
-    Promise.all([api("/users"), api("/online"), api("/stats")]).then(([u, o, s]) => {
+    return Promise.all([api("/users"), api("/online"), api("/stats")]).then(([u, o, s]) => {
         $("#st-u").innerText = u.length;
         // 在线设备：累加所有用户的连接数
         let totalOnline = 0;
@@ -139,6 +140,7 @@ function load() {
 
         const m = new Date().toISOString().slice(0, 7);
         allUsers = u;
+        syncOpenConfig(u);
 
         // 二维码现在本地生成（见 renderQR），无需预取外部图片
 
@@ -302,13 +304,27 @@ function saveUser() {
     });
 }
 
+// 2026-09-14：四个免鉴权订阅端点的路径末段是每用户的随机订阅 token，不再是用户名
+// （响应体里有 hy2 明文密码与 vless uuid，「域名 + 用户名」在旧口径下就等于订阅凭据）。
+// 投影里取不到 token 时 subPath 返回 null，调用方只给一行提示，不拼出坏链接。
+//
+// 这一档在正常安装里不可达：三条建用户路径都自带 token，守护进程每次启动还会无条件补齐。
+// 它真出现就只有一种成因 —— 面板与服务端版本不匹配（投影没发 subToken），而那时
+// 「重启」和「点重置」都救不回来，所以文案不承诺任何自救动作（审查 6）。
+const SUB_TOKEN_MISSING = "取不到该用户的订阅 token，请联系运维核对面板与服务端版本是否匹配";
+
+function subPath(x, kind) {
+    return x && x.subToken ? "/api/" + kind + "/" + encodeURIComponent(x.subToken) : null;
+}
+
 // Generate URI - 根据协议类型生成不同的链接
 function genUri(x) {
     // 融合订阅用户: 返回 v2rayN 原生订阅 URL (带备注)
     if (x.protocol === "fusion") {
-        const host = location.host;
+        const path = subPath(x, "sub");
+        if (!path) return "";
         // URL 末尾的 #备注 会被 v2rayNG 识别为订阅名称（不编码）
-        return "https://" + host + "/api/sub/" + x.username + "#" + x.username;
+        return "https://" + location.host + path + "#" + x.username;
     }
     // v3.6.0: 单协议用户按 residential 选直连版/住宅版端口与备注，
     // 判定与 server.js /api/sub 的 includeResi 完全一致（未设 residential 视为开）
@@ -369,6 +385,7 @@ function renderQR(uri) {
     const el = $("#qrcode");
     if (!el) return;
     el.innerHTML = "";
+    if (!uri) return;
     if (typeof QRCode === "undefined") { el.innerText = "二维码库未加载"; return; }
     new QRCode(el, { text: uri, width: 200, height: 200, correctLevel: QRCode.CorrectLevel.M });
     const img = el.querySelector("canvas, img");
@@ -381,7 +398,7 @@ function showU(uname) {
     if (!x) return;
     currentShowUser = x;
     const uri = genUri(x);
-    $("#uri").innerText = uri;
+    $("#uri").innerText = uri || SUB_TOKEN_MISSING;
 
     // 融合订阅用户显示订阅链接
     if (x.protocol === "fusion") {
@@ -421,11 +438,32 @@ function showU(uname) {
     openM("m-cfg");
 }
 
+// 弹窗打开期间凭据被轮换（另一个管理员会话、或服务器上的 CLI）时按新值重画（审查 5）：
+// 订阅链接末段的 token、hy2 密码与 vless uuid 三样都是可轮换的凭据，旧值复制或下载出去
+// 拿到的是 404（端点对作废 token 一律回「User not found」的不可区分口径），管理员不会
+// 收到任何提示。以前末段是用户名、永不变，所以「弹窗打开期间不刷新」是安全的。
+// 用户被删或改名不在这里处理：弹窗留着，下次手动打开即可。
+function syncOpenConfig(users) {
+    const old = currentShowUser;
+    if (!old || !$("#m-cfg").classList.contains("on")) return;
+    const fresh = users.find(u => u.username === old.username);
+    if (!fresh) return;
+    if (["subToken", "password", "uuid"].every(k => fresh[k] === old[k])) return;
+    showU(fresh.username);
+    // 第二个参数选的是警告样式（橙色三角），这是有意的：管理员屏幕上那条链接刚刚作废，
+    // 已经发给用户的旧链接也一起废了，不是一条可以扫过去的普通告知。
+    toast("该用户的订阅链接与凭据已被重置，弹窗已按新值刷新", 1);
+}
+
 // Copy URI
 function copy() {
-    const uri = $("#uri").innerText;
-    navigator.clipboard.writeText(uri);
-    if (currentShowUser && currentShowUser.protocol === "fusion") {
+    // 没有选中用户就别把 #uri 里剩的那份文本递出去：轮换后它是已作废的链接，
+    // 端点回 404，而管理员收到的是一句「已复制」。下面两个出口同一门禁。
+    if (!currentShowUser) return toast("请先选择用户", 1);
+    const fusion = currentShowUser.protocol === "fusion";
+    if (fusion && !currentShowUser.subToken) return toast(SUB_TOKEN_MISSING, 1);
+    navigator.clipboard.writeText($("#uri").innerText);
+    if (fusion) {
         toast("订阅链接已复制，可粘贴到 v2rayN / Shadowrocket");
     } else {
         toast("链接已复制到剪贴板");
@@ -435,21 +473,64 @@ function copy() {
 // 下载 sing-box 融合订阅配置
 function downloadSubscription() {
     if (!currentShowUser) return toast("请先选择用户", 1);
-    const url = "/api/subscription/" + encodeURIComponent(currentShowUser.username);
-    window.open(url, "_blank");
+    const path = subPath(currentShowUser, "subscription");
+    if (!path) return toast(SUB_TOKEN_MISSING, 1);
+    window.open(path, "_blank");
     toast("正在下载 sing-box 配置...");
 }
 
 // 复制 Clash Verge Rev 订阅链接
 function copyClash() {
     if (!currentShowUser) return toast("请先选择用户", 1);
-    const clashUrl = "https://" + location.host + "/api/clash/" + encodeURIComponent(currentShowUser.username);
-    navigator.clipboard.writeText(clashUrl)
+    const path = subPath(currentShowUser, "clash");
+    if (!path) return toast(SUB_TOKEN_MISSING, 1);
+    navigator.clipboard.writeText("https://" + location.host + path)
         .then(() => toast("Clash 订阅链接已复制，可导入 Clash Verge Rev"))
         .catch(() => toast("复制失败", 1));
 }
 
-
+// 重置订阅链接与凭据（2026-09-14）：POST /api/users/{name}/rotate 同时换随机订阅 token、
+// hy2 密码与 vless uuid，并停用该用户的旧「用户名链接」。旧订阅与旧客户端立刻失效，
+// 所以要二次确认；成功后刷新用户列表，再按新 token 重画这个弹窗。
+function rotateSub() {
+    const x = currentShowUser;
+    if (!x) return toast("请先选择用户", 1);
+    if (!confirm("重置用户 " + x.username + " 的订阅链接与凭据？\n\n" +
+        "旧订阅链接、旧 Hysteria2 密码与旧 VLESS UUID 立刻失效：该用户现有的客户端会断连，" +
+        "必须把新链接重新导入一次。")) return;
+    const btn = document.getElementById("cfg-rotate");
+    // 文案原文在 index.html 里，这里捕获一次再还原：硬编码一份的话，改了 HTML 忘了改
+    // 这里，重置一次按钮就悄悄换回旧文案。
+    const label = btn ? btn.textContent : "";
+    const done = () => { if (btn) { btn.disabled = false; btn.textContent = label; } };
+    if (btn) { btn.disabled = true; btn.textContent = "重置中…"; }
+    api("/users/" + encodeURIComponent(x.username) + "/rotate", { method: "POST", body: JSON.stringify({}) })
+        .then(r => {
+            if (!r || !r.success) { done(); return toast((r && r.error) || "重置失败", 1); }
+            // 链接与二维码都来自 allUsers 里的面板投影，等列表刷新完再按新 token 重画。
+            // 先清掉 currentShowUser：本会话自己发起的这次变化不该再被 syncOpenConfig
+            // 当成「别人改的」弹第二条提示；这段空窗里点复制/下载都只会提示「请先选择
+            // 用户」（三个出口的门禁见上），不会把已作废的那份递出去。
+            currentShowUser = null;
+            return load().then(() => {
+                done();
+                showU(x.username);
+                toast("已重置，请把新订阅链接重新导入客户端");
+            }, () => {
+                // 轮换已经生效，只是这一轮列表刷新没回来（网络抖动、/api/users 或
+                // /api/stats 500）。必须把 currentShowUser 还原回去：留着 null 的话
+                // syncOpenConfig 第一句就 return，5 秒一轮的自愈通道被自己关掉，弹窗
+                // 会永久停在那条已作废的链接上，再点「重置」也只会说「请先选择用户」。
+                // 还原后下一轮 load() 就能按新值把弹窗拉回来。
+                // 用 then 的第二参而不是链一个 .catch：后者会把 showU / toast 自己抛的
+                // 异常也当成「刷新失败」报出去。
+                currentShowUser = x;
+                done();
+                toast("已重置，但这一轮用户列表没刷新成功：弹窗里的链接稍后自动更新", 1);
+            });
+        })
+        .catch(e => { done(); toast(e.message || "请求失败", 1); });
+}
 
 // Change password
 function changePwd() {
