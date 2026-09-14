@@ -739,6 +739,10 @@ pub const PINNED_UNTOUCHED_NOTE: &str = "已手动锁定，未动";
 /// 把它按不可用处置（`health::Verdict` 的文档）、照样借用，借到的那条再撞满一次
 /// ——`sentinel::resi::tests::a_judging_probe_that_outruns_its_budget_is_treated_as_unavailable`
 /// 实测这条路 8.0 秒（两个 4 秒预算），加上等第 2 条错误与轮询就是 15 秒。
+/// 而「3 × 验证 ≤4」那一项要取到三个**满额**预算，必须落在**三个不同的槽**上：同一个槽只要有
+/// 一次撞满预算（⇒ `Unconfirmed`）就 `break` 保留那个候选，往下试候选的 `Dead` 必然在 4 秒内
+/// 返回，所以单槽只能逼近、取不到 3 × 4。方向是安全的（高估），这里写明以免后来人按它反推单槽
+/// 行为（2026-09-14 审查第 3 条）。
 ///
 /// **Clash PUT 不在这两条算式里**：它是本机 Clash API、正常毫秒级（单次上限
 /// `CLASH_TIMEOUT_SECS` = 2 秒，Clash 自己挂起时这条算式不成立）。次数也不是常数，它按
