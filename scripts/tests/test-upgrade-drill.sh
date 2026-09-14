@@ -50,6 +50,10 @@ case "${1:-}" in
       # --version <x.y.z> 在 $2 $3；后面可能还跟 --manifest-url <url>
       printf '%s\n' "${3:-4.0.1}" > "$VERFILE"
       for b in $(kernels); do printf 'bin-%s-v2\n' "$b" > "$BASEDIR/bin/$b"; done
+      # FAKE_UPGRADE_DROPS_TOKEN=1：模拟目标版本写出的 state 不带 sub_token（rc11 形状）
+      if [[ "${FAKE_UPGRADE_DROPS_TOKEN:-0}" == "1" ]]; then
+        printf '{"users":[{"username":"alice"},{"username":"bob"}]}\n' > "$BASEDIR/state.json"
+      fi
     fi
     printf 'upgrade ok\n'
     ;;
@@ -166,14 +170,28 @@ assert_contains "first_failure=sub-fetch:before:alice:sub" "$(cat "$WORK/notfoun
 assert_eq "0" "$(awk -F, '$2 ~ /^sub:/ {c++} END {print c + 0}' "$WORK/notfound/drill.csv")" \
     "取不到就不记 sub: 指纹（不留两个空串给 compare_subs 比出假绿）"
 
-# state.json 里没有 sub_token（启动补齐没跑到）也必须 FAIL，不能静默跳过这个用户
+# state.json 里没有 sub_token（rc11 及更早的 state 没有这个字段）⇒ 前置条件不满足：FATAL 退 2，
+# 不能报成订阅漂移或取订阅失败（在 rc11 上跑 before 相位看起来会像升级坏了），也不能静默跳过这个用户
 reset_env
 write_state ""
 out=$(run "$WORK/notok" 2>&1); rc=$?
-assert_eq "1" "$rc" "缺 sub_token 退 1"
-assert_contains "FAIL before：state.json 里取不到 bob 的 sub_token" "$out" "点名是谁没有 token"
-assert_contains "first_failure=sub-token:before:bob" "$(cat "$WORK/notok/DONE")" "DONE 记 sub-token"
-assert_contains "/api/sub/$ALICE_TOK" "$(cat "$WORK/curl.log")" "有 token 的用户照旧取"
+assert_eq "2" "$rc" "缺 sub_token 退 2"
+assert_contains "FATAL before：state.json 里 bob 没有 sub_token" "$out" "点名哪个相位、谁没有 token"
+assert_contains "本演练要求升级前后两端都是 rc12 及以上（该相位的 state.json 没有订阅 token）" "$out" "说清适用范围"
+assert_not_contains "订阅漂移" "$out" "不报成订阅漂移"
+assert_not_contains "订阅失败" "$out" "不报成取订阅失败"
+assert_contains "verdict=FATAL reason=sub-token-missing:before:bob" "$(cat "$WORK/notok/DONE")" "DONE 记 FATAL 与原因"
+assert_eq "0" "$([[ -s "$WORK/curl.log" ]] && echo 1 || echo 0)" "一条订阅都没取"
+assert_not_contains "upgrade" "$(cat "$WORK/bui.log")" "没去升级"
+
+# 升级之后的相位没有 sub_token（目标版本的 state 不带这个字段）同样 FATAL，并说明回滚没做
+reset_env
+out=$(FAKE_UPGRADE_DROPS_TOKEN=1 run "$WORK/droptok" 2>&1); rc=$?
+assert_eq "2" "$rc" "升级后缺 sub_token 退 2"
+assert_contains "FATAL after-upgrade：state.json 里 alice 没有 sub_token" "$out" "点名 after-upgrade 相位"
+assert_contains "（该相位的 state.json 没有订阅 token）；升级已执行、回滚未执行" "$out" "提示回滚没做"
+assert_not_contains "订阅漂移" "$out" "升级后缺 token 也不报成订阅漂移"
+assert_contains "verdict=FATAL reason=sub-token-missing:after-upgrade:alice" "$(cat "$WORK/droptok/DONE")" "DONE 记 after-upgrade 的 FATAL"
 
 # 缺 --users 直接退 2（别在生产上跑出一份没有订阅指纹的空演练）
 out=$(bash "$ROOT/scripts/ops/upgrade-drill.sh" --to 4.0.1 --out "$WORK/nouser" 2>&1); rc=$?

@@ -148,9 +148,10 @@ pub async fn on_upstream_error(
         //    `deadline exceeded` —— 就是「隧道挂死」本身。当它不动作，哨兵在**主打的故障形态**
         //    上就是永久空操作，只能等巡检（`HEALTH_INTERVAL_SECS` 120 秒 × `FAIL_TO_UNHEALTHY`
         //    2 轮迟滞，且挂死时每轮 `probe_member` 自己要 ~40 秒）≈4–5 分钟才挪槽；
-        // ③ 判错的代价不对称：误判死 = 多借一次兄弟 IP（吵闹、巡检连续 3 轮就切回），不动作 =
-        //    用户静默断网几分钟。同一份 `probe_member` 的超时在巡检那边本来也算失败证据
-        //    （`apply_hysteresis(ok = false)`），这里不再自相矛盾。
+        // ③ 判错的代价不对称：误判死 = 多借一次兄弟 IP（吵闹；`mark_unhealthy` 之后巡检要先连续
+        //    `OK_TO_HEALTHY` = 2 轮探通重新判健康、再攒满 `SLOT_BACK_ROUNDS` = 3 轮，恢复后第 4 轮
+        //    才切回，约 8 分钟），不动作 = 用户静默断网几分钟。同一份 `probe_member` 的超时在
+        //    巡检那边本来也算失败证据（`apply_hysteresis(ok = false)`），这里不再自相矛盾。
         // 文案如实说「没能确认」而不是「不可达」——我们只知道它在预算内没应答。
         health::Verdict::Unconfirmed => format!(
             "没能在 {} 秒内确认可用（网关通但隧道无响应，或探测任务异常），\
