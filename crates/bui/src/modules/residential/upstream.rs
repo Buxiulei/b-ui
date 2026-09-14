@@ -6,13 +6,20 @@
 
 use super::proxy::{ProbeError, Prober};
 use super::{check, proxy, state, EXIT_IP_HOST, EXIT_IP_URL, MAX_UPSTREAMS, MEMBER_PREFIX};
+use crate::modules::sentinel::incidents::{self, Incident, Level};
 use crate::reconcile::DaemonCtx;
 use crate::util::fmt_rfc3339;
 use bui_schema::model::{ResiMode, ResidentialGroup, Upstream, UpstreamKind};
 use bui_schema::parse::{upstream_url, ParseError, UpstreamInput};
+use bui_schema::slots::ResubscribeImpact;
 use serde::Serialize;
 use std::sync::Arc;
 use uuid::Uuid;
+
+/// 删上游让已下发的订阅失效的事件签名（`bui incidents` / 面板事件卡按它认领）
+const PORT_CHANGED_SIG: &str = "resi_slot_port_changed";
+/// 该事件的动作：提示操作者让受影响用户重新获取订阅（没有自动处置手段）
+const NOTIFY_RESUBSCRIBE_ACTION: &str = "notify_resubscribe";
 
 /// 一次「加上游」的结果（面板与 CLI 直接回显）。**不含凭据**。
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -304,10 +311,22 @@ pub async fn add(
     })
 }
 
-/// 删一条上游；删掉最后一条时顺带 `enabled = false`（v3 `enable --remove` 同语义）
-pub async fn remove(ctx: &DaemonCtx, sel: &UpstreamSel) -> Result<(), UpstreamError> {
-    let g = state::group_of(&*ctx.store.read().await);
-    let target = g
+/// 删一条上游；删掉最后一条时顺带 `enabled = false`（v3 `enable --remove` 同语义）。
+///
+/// 返回**必须重新获取订阅**的用户，按后果分三组（[`ResubscribeImpact`]）：他们的 HY2
+/// 住宅节点端口或跳跃区间被这次删除改了，而那两样都写死在已下发的订阅里，客户端不会主动
+/// 发现（要等下一次订阅更新：`bui-c` 的每日 timer、v2rayN 的定时更新，或人工重新获取），
+/// 所以 CLI 与面板都得逐组打给操作者；非空时还落一条哨兵事件（`bui incidents` / 面板
+/// 事件卡），三处共用 [`impact_title`] / [`impact_groups`] 这一份口径。
+///
+/// 名单由 `update_group_slots_as` 在**真删的那一个临界区里**按写入前后两份期望态算出
+/// （[`bui_schema::slots::resubscribe_impact`]），所以不存在「算完名单又被别人改了池」
+/// 的过期窗口。
+pub async fn remove(
+    ctx: &DaemonCtx,
+    sel: &UpstreamSel,
+) -> Result<ResubscribeImpact, UpstreamError> {
+    let target = state::group_of(&*ctx.store.read().await)
         .upstreams
         .iter()
         .find(|u| match sel {
@@ -375,7 +394,73 @@ pub async fn remove(ctx: &DaemonCtx, sel: &UpstreamSel) -> Result<(), UpstreamEr
         r.xray_slot_rules_dirty = true;
     })
     .await;
-    Ok(())
+    let impact = sync.impact;
+    if !impact.is_empty() {
+        let result = format_impact_line(&impact);
+        tracing::warn!(
+            endpoint = %format!("{}:{}", target.host, target.port),
+            "{result}"
+        );
+        let inc = Incident {
+            at: fmt_rfc3339(ctx.host.now()),
+            // 动作是守护进程自己做的，不是从某个内核单元的日志里读出来的
+            unit: "b-ui".into(),
+            signature: PORT_CHANGED_SIG.into(),
+            subject: format!("{}:{}", target.host, target.port),
+            action: NOTIFY_RESUBSCRIBE_ACTION.into(),
+            result,
+            level: Level::Warn,
+            sample: None,
+        };
+        ctx.runtime.update(move |rt| incidents::push(rt, inc)).await;
+    }
+    Ok(impact)
+}
+
+/// [`ResubscribeImpact`] 三组的组名与后果，**CLI / 面板 / 哨兵事件三处共用这一份口径**
+/// （主会话裁决 2026-09-14）。顺序与 [`impact_groups`] 一致，`web/app.js` 的
+/// `_RESI_IMPACT_GROUPS` 是它的逐字副本（面板拿的是 JSON，渲染在浏览器里）。
+const IMPACT_GROUPS: [(&str, &str); 3] = [
+    (
+        "原槽位已删除、已换槽",
+        "旧端口不再通向他的槽：没人监听就连不上，被搬到 0 号的那个槽顶替了就从别人的出口 IP 出去",
+    ),
+    ("槽位序号被搬到 0 号", "端口下移，旧端口无人监听，连不上"),
+    (
+        "端口跳跃区间被重切",
+        "端口没变、连得上，但旧区间里划给别的槽的那一段会从错误的出口 IP 出去",
+    ),
+];
+
+/// 名单的标题。**只说这些人手里那份订阅不能照旧用了**，不暗示它是别的什么
+/// （不是「全部住宅用户」，也不是「全部要改的东西」）。
+pub fn impact_title(i: &ResubscribeImpact) -> String {
+    format!(
+        "{} 个用户手里那份订阅已不能照旧用，需要重新获取订阅",
+        i.total()
+    )
+}
+
+/// 逐组一行：`<组名>（<人数> 人，<后果>）：<用户名、用户名>`。空组不出现。
+/// **只有用户名**，不含凭据、不含订阅 token。
+pub fn impact_groups(i: &ResubscribeImpact) -> Vec<String> {
+    [&i.slot_removed, &i.slot_moved, &i.hop_resliced]
+        .into_iter()
+        .zip(IMPACT_GROUPS)
+        .filter(|(users, _)| !users.is_empty())
+        .map(|(users, (name, effect))| {
+            format!(
+                "{name}（{} 人，{effect}）：{}",
+                users.len(),
+                users.join("、")
+            )
+        })
+        .collect()
+}
+
+/// 哨兵事件 `result` 的一行文案（`bui incidents` 与面板事件卡都按行显示，不能换行）。
+fn format_impact_line(i: &ResubscribeImpact) -> String {
+    format!("{}：{}", impact_title(i), impact_groups(i).join("；"))
 }
 
 /// 总开关。开启要求池非空（v3 `POST /api/residential/enable` 的 400 分支）
@@ -465,6 +550,64 @@ mod tests {
             host: std::sync::Arc::new(FakeHost::new()),
             paths: bui_schema::paths::Paths::default_server(),
         }
+    }
+
+    /// 一个装了 `n` 条上游（槽 `0..n`）与若干住宅用户的 ctx：用户按给定顺序递增
+    /// `created_at`，`migrate_on_start` 于是把第 i 个人分到槽 `i % n`（spec §5.6 规则 4）。
+    async fn ctx_with_slots(d: &tempfile::TempDir, n: u16, users: &[&str]) -> DaemonCtx {
+        let mut s = sample_state();
+        s.node.public_ip = "203.0.113.10".into();
+        let proto = s.users[0].clone();
+        s.users = users
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let mut u = proto.clone();
+                u.user_id = Uuid::from_u128(0x1000 + i as u128);
+                u.username = (*name).to_string();
+                u.created_at = format!("2026-09-11T00:0{i}:00Z");
+                u
+            })
+            .collect();
+        let g = s
+            .residential
+            .groups
+            .get_mut(super::super::GROUP_DEFAULT)
+            .expect("sample_state 带 default 分组");
+        g.enabled = true;
+        g.upstreams = (0..n)
+            .map(|i| Upstream {
+                id: Uuid::from_u128(u128::from(i) + 1),
+                name: format!("url-{}", i + 1),
+                kind: UpstreamKind::Http,
+                host: format!("isp{}.example.net", i + 1),
+                port: 10007,
+                username: "user1".into(),
+                password: "pw1".into(),
+                priority: 100,
+                provider: None,
+                region: None,
+                ports_allowed: None,
+                verified: None,
+            })
+            .collect();
+        g.selected_upstream_id = g.upstreams.first().map(|u| u.id);
+        let c = DaemonCtx {
+            store: Store::create(d.path().join("state.json"), s).await.unwrap(),
+            runtime: Runtime::load(d.path().join("runtime.json")),
+            bus: EventBus::new(),
+            host: std::sync::Arc::new(FakeHost::new()),
+            paths: bui_schema::paths::Paths::default_server(),
+        };
+        crate::modules::residential::slots::migrate_on_start(&c.store, &c.bus)
+            .await
+            .unwrap();
+        c
+    }
+
+    /// 落盘的事件（新的在前）
+    async fn incidents_of(c: &DaemonCtx) -> Vec<Incident> {
+        incidents::from_runtime(&c.runtime.read().await)
     }
 
     fn prober_ok(exit: &str) -> std::sync::Arc<FakeProber> {
@@ -804,6 +947,139 @@ mod tests {
             "别让 replay_loop 去重放一条已删的上游"
         );
         assert!(!r.selected_pending_persist);
+    }
+
+    /// 某用户订阅里 HY2 住宅节点的 `(端口, 跳跃区间)`。
+    async fn node_of(c: &DaemonCtx, name: &str) -> (u16, Option<(u16, u16)>) {
+        let s = c.store.read().await;
+        let u = s.users.iter().find(|u| u.username == name).unwrap();
+        let n = bui_schema::nodes::nodes_for(u, &s.node, &s.residential)
+            .into_iter()
+            .find(|n| n.kind == bui_schema::nodes::NodeKind::Hy2Residential)
+            .unwrap();
+        (n.port, n.hop)
+    }
+
+    /// 名单要覆盖**所有**手里那份订阅不能用了的人，不只是被删槽上的那个，而且两种后果
+    /// 分开报：carol 的槽被删（`40002` 已无人监听 ⇒ 连不上）= 组一；删掉序号最高的槽让
+    /// 槽位空间 3 → 2、存活槽的跳跃区间重切，bob 的 `mport=44000-46999` 有一半挪给了槽 0
+    /// 那个独立进程（鉴权 URL 全实例共用 ⇒ 连得上但走错出口 IP）= 组三。
+    /// alice 的旧区间是新区间的前缀子集，无害，一组都不进。
+    #[tokio::test]
+    async fn remove_reports_everyone_whose_subscription_stops_working() {
+        let d = tempfile::tempdir().unwrap();
+        let c = ctx_with_slots(&d, 3, &["alice", "bob", "carol"]).await;
+        assert_eq!(node_of(&c, "alice").await, (40000, Some((41000, 43999))));
+        assert_eq!(node_of(&c, "bob").await, (40001, Some((44000, 46999))));
+        // 槽 2（上游 uuid=3）上只有 carol
+        let impact = remove(&c, &UpstreamSel::Id(Uuid::from_u128(3)))
+            .await
+            .unwrap();
+        assert_eq!(
+            impact,
+            ResubscribeImpact {
+                slot_removed: vec!["carol".to_string()],
+                slot_moved: vec![],
+                hop_resliced: vec!["bob".to_string()],
+            }
+        );
+        assert_eq!(
+            node_of(&c, "alice").await,
+            (40000, Some((41000, 45499))),
+            "alice 的区间只是变宽，旧区间整段还落在本槽 ⇒ 不进名单"
+        );
+        assert_eq!(node_of(&c, "bob").await, (40001, Some((45500, 50000))));
+        let incs = incidents_of(&c).await;
+        assert_eq!(incs.len(), 1, "事件落盘一条");
+        assert_eq!(
+            (
+                incs[0].signature.as_str(),
+                incs[0].action.as_str(),
+                incs[0].level,
+                incs[0].subject.as_str()
+            ),
+            (
+                PORT_CHANGED_SIG,
+                NOTIFY_RESUBSCRIBE_ACTION,
+                Level::Warn,
+                "isp3.example.net:10007"
+            )
+        );
+        assert_eq!(
+            incs[0].result,
+            "2 个用户手里那份订阅已不能照旧用，需要重新获取订阅：\
+             原槽位已删除、已换槽（1 人，旧端口不再通向他的槽：没人监听就连不上，被搬到 0 \
+             号的那个槽顶替了就从别人的出口 IP 出去）：carol；\
+             端口跳跃区间被重切（1 人，端口没变、连得上，但旧区间里划给别的槽的那一段会从\
+             错误的出口 IP 出去）：bob"
+        );
+        assert!(
+            !incs[0].result.contains("pw1") && !incs[0].result.contains("user1"),
+            "名单只写用户名：{}",
+            incs[0].result
+        );
+    }
+
+    /// 删 0 号槽：被重新分配到别的槽的（组一）、以及槽序号被搬到 0 的（组二）都要重取
+    /// 订阅，而重新分配后又落回序号 0 的人（端口与区间都没动）一个都不能进名单。
+    #[tokio::test]
+    async fn removing_slot_zero_reports_the_moved_and_the_reassigned() {
+        let d = tempfile::tempdir().unwrap();
+        // 槽 0：alice、dave；槽 1：bob、erin；槽 2：carol
+        let c = ctx_with_slots(&d, 3, &["alice", "bob", "carol", "dave", "erin"]).await;
+        let before_dave = node_of(&c, "dave").await;
+        let impact = remove(&c, &UpstreamSel::Id(Uuid::from_u128(1)))
+            .await
+            .unwrap();
+        assert_eq!(
+            impact,
+            ResubscribeImpact {
+                slot_removed: vec!["alice".to_string()],
+                slot_moved: vec!["bob".to_string(), "erin".to_string()],
+                hop_resliced: vec![],
+            },
+            "alice 被重新分配到槽 2（40000 → 40002）= 组一；bob 与 erin 随槽 1 被搬到 0 = 组二"
+        );
+        // 名单与真删后的槽位表一致：原槽 1（uuid=2）现在占着序号 0
+        assert_eq!(
+            bui_schema::slots::sorted(&c.store.read().await.residential)[0].upstream_id,
+            Uuid::from_u128(2)
+        );
+        assert_eq!(node_of(&c, "alice").await.0, 40002);
+        assert_eq!(node_of(&c, "bob").await.0, 40000);
+        assert_eq!(
+            node_of(&c, "dave").await,
+            before_dave,
+            "dave 落回序号 0，端口与区间都没动 ⇒ 不该被要求重取订阅"
+        );
+        let incs = incidents_of(&c).await;
+        assert_eq!(incs.len(), 1);
+        assert_eq!(
+            incs[0].result,
+            "3 个用户手里那份订阅已不能照旧用，需要重新获取订阅：\
+             原槽位已删除、已换槽（1 人，旧端口不再通向他的槽：没人监听就连不上，被搬到 0 \
+             号的那个槽顶替了就从别人的出口 IP 出去）：alice；\
+             槽位序号被搬到 0 号（2 人，端口下移，旧端口无人监听，连不上）：bob、erin"
+        );
+    }
+
+    /// 没有人受影响：不打名单、不记事件（事件卡只该有真事）。
+    /// 池里只剩一条时删掉它也不换端口：槽位表清空后渲染退回单槽，`40000` + 完整跳跃区间
+    /// 照旧有人听。
+    #[tokio::test]
+    async fn removing_the_last_upstream_leaves_every_subscription_working() {
+        let d = tempfile::tempdir().unwrap();
+        let c = ctx_with_slots(&d, 1, &["alice"]).await;
+        let before = node_of(&c, "alice").await;
+        assert!(remove(&c, &UpstreamSel::Id(Uuid::from_u128(1)))
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(node_of(&c, "alice").await, before);
+        assert!(
+            incidents_of(&c).await.is_empty(),
+            "空名单不记事件（事件卡只该有真事）"
+        );
     }
 
     #[tokio::test]

@@ -33,6 +33,9 @@
 //!   由 [`slots::resources_of`] 从 [`Ports`](model::Ports) 与槽序号纯函数算出。
 //! - [`slots::sync_slots`] / [`slots::least_loaded`] / [`slots::assign`] /
 //!   [`slots::migrate_unassigned`] / [`slots::rebalance`]：spec §5.6 的分配规则，纯函数。
+//! - [`slots::resubscribe_impact`]：比对改池前后两份期望态，算出手里那份订阅已经不能用的
+//!   用户名，按后果分成 [`slots::ResubscribeImpact`] 三组（槽位被删 / 槽位序号被搬到 0 /
+//!   跳跃区间被重切）；改池的执行路径据此逐组提示操作者哪些人要重新获取订阅。
 //!
 //! ## 订阅 token 与旧链接宽限期 —— [`sub`]
 //!

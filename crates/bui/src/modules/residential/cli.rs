@@ -8,6 +8,7 @@
 //! 全部路由与载荷都能在不起守护进程的情况下单测。
 
 use crate::commands::menu::{MenuAction, MenuItem};
+use crate::modules::residential::upstream;
 use std::path::PathBuf;
 
 /// `bui residential` 的子命令。
@@ -674,6 +675,29 @@ fn upstream_groups(
     out
 }
 
+/// `remove` 的人读渲染：把「必须重新获取订阅」的用户**按后果逐组**打给操作者。
+///
+/// 名单来自回包的 `port_changed`（服务端已按「手里那份订阅还能不能用」算过，并分成三组）：
+/// HY2 住宅节点的端口或端口跳跃区间写死在已下发的订阅里，客户端要等下一次订阅更新才会知道
+/// 它变了。组名与后果文案直接取 [`upstream::impact_title`] / [`upstream::impact_groups`]，
+/// 与哨兵事件、面板同一份口径。**没有人受影响时不打空名单。**
+pub fn format_remove(v: &serde_json::Value) -> String {
+    let impact: bui_schema::slots::ResubscribeImpact = v
+        .get("port_changed")
+        .cloned()
+        .and_then(|x| serde_json::from_value(x).ok())
+        .unwrap_or_default();
+    if impact.is_empty() {
+        return "上游已移除（没有用户需要重新获取订阅）".into();
+    }
+    let mut out = format!("上游已移除。{}：", upstream::impact_title(&impact));
+    for line in upstream::impact_groups(&impact) {
+        out.push_str("\n  ");
+        out.push_str(&line);
+    }
+    out
+}
+
 fn print_or(json: bool, v: &serde_json::Value, f: impl Fn(&serde_json::Value) -> String) {
     if json {
         println!("{v}");
@@ -717,6 +741,7 @@ pub async fn run(cmd: ResidentialCmd, socket: PathBuf) -> anyhow::Result<()> {
             cmd: BlacklistCmd::List { json },
         } => print_or(*json, &v, format_blacklist),
         ResidentialCmd::Slots { json } => print_or(*json, &v, format_slots),
+        ResidentialCmd::Remove { .. } => println!("{}", format_remove(&v)),
         ResidentialCmd::SlotPin { index, auto, .. } => println!(
             "槽 {index} {}",
             if *auto {
@@ -1175,6 +1200,43 @@ mod tests {
             .unwrap()
             .1,
             "/api/residential/blacklist/apply"
+        );
+    }
+
+    /// `remove` 的回包渲染：三组各一行，每行一句后果，末了同一个下一步（重新获取订阅）。
+    /// 空组不出现；三组全空时一个名字都不打。
+    #[test]
+    fn format_remove_tells_the_operator_who_must_refetch_the_subscription() {
+        let v = |removed: &[&str], moved: &[&str], resliced: &[&str]| {
+            serde_json::json!({"success": true, "port_changed": {
+                "slot_removed": removed, "slot_moved": moved, "hop_resliced": resliced,
+            }})
+        };
+        assert_eq!(
+            format_remove(&v(&[], &[], &[])),
+            "上游已移除（没有用户需要重新获取订阅）"
+        );
+        // 只有一组时也是「N 个用户……」+ 那一组一行
+        assert_eq!(
+            format_remove(&v(&[], &[], &["alice"])),
+            "上游已移除。1 个用户手里那份订阅已不能照旧用，需要重新获取订阅：\n  \
+             端口跳跃区间被重切（1 人，端口没变、连得上，但旧区间里划给别的槽的那一段会从\
+             错误的出口 IP 出去）：alice"
+        );
+        // 三组齐全：顺序固定（组一 → 组二 → 组三），每组的后果都不一样
+        assert_eq!(
+            format_remove(&v(&["alice"], &["bob", "carol"], &["dave"])),
+            "上游已移除。4 个用户手里那份订阅已不能照旧用，需要重新获取订阅：\n  \
+             原槽位已删除、已换槽（1 人，旧端口不再通向他的槽：没人监听就连不上，被搬到 0 \
+             号的那个槽顶替了就从别人的出口 IP 出去）：alice\n  \
+             槽位序号被搬到 0 号（2 人，端口下移，旧端口无人监听，连不上）：bob、carol\n  \
+             端口跳跃区间被重切（1 人，端口没变、连得上，但旧区间里划给别的槽的那一段会从\
+             错误的出口 IP 出去）：dave"
+        );
+        // 没有 port_changed 字段的回包不该 panic
+        assert_eq!(
+            format_remove(&serde_json::json!({"success": true})),
+            "上游已移除（没有用户需要重新获取订阅）"
         );
     }
 
