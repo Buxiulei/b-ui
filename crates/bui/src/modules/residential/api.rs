@@ -1105,10 +1105,12 @@ async fn post_add(
 /// 删上游两个端点共用的回包：v3 的 `success` + v4 追加的 `port_changed`（spec §5.6）。
 ///
 /// `port_changed.removed_slot` / `port_changed.moved_to_zero` 各是一组**用户名**
-/// （不含凭据、不含订阅 token）：前者是被删槽上的用户，他们的 HY2 住宅端口
-/// （`hy2_resi + 槽序号`）删完没人监听；后者只在**删 0 号槽**时非空 —— 槽位不变量 3 会把
-/// 现存序号最小的槽搬到 0，那一槽的用户端口跟着下移。两组人都必须重新获取订阅，否则
-/// 已下发的 HY2 住宅节点连不上（客户端侧没有任何自愈手段）。无人受影响时两个数组都为空。
+/// （不含凭据、不含订阅 token），只列 HY2 住宅端口（`hy2_resi + 槽序号`）**真的**变了的
+/// 人：前者的槽位随上游一起消失、他们被重新分配到了别的槽；后者只在**删 0 号槽**时非空
+/// —— 槽位不变量 3 会把现存序号最小的槽搬到 0，那一槽的用户端口跟着下移。两组人都必须
+/// 重新获取订阅，否则已下发的 HY2 住宅节点连不上（客户端不会主动发现端口变了，要等下
+/// 一次订阅更新）。被删槽上的用户常常被重新分配回序号 0，端口没变就不进名单；无人受
+/// 影响时两个数组都为空。
 ///
 /// 同一份名单也落一条 `runtime.json` 的 `incidents`（签名 `resi_slot_port_changed`），
 /// 面板事件卡与 `bui incidents` 都看得到。
@@ -2034,7 +2036,8 @@ mod tests {
     }
 
     /// 删上游的回包必须带 `port_changed` 的两组用户名（面板与 CLI 的唯一提示来源），
-    /// 删 0 号槽时两组都有；同一份名单落一条事件。名单里只有用户名。
+    /// 同一份名单落一条事件。名单里只有用户名，且只有端口**真的**变了的人 —— 删 0 号槽
+    /// 时被删槽上的 alice 被重新分配回序号 0（40000 → 40000），她不该被要求重取订阅。
     #[tokio::test]
     async fn removing_an_upstream_reports_who_must_refetch_the_subscription() {
         let d = tempfile::tempdir().unwrap();
@@ -2082,13 +2085,14 @@ mod tests {
         assert_eq!(st, StatusCode::OK);
         assert_eq!(v["success"], true);
         assert_eq!(
-            v["port_changed"]["removed_slot"],
-            serde_json::json!(["alice"])
-        );
-        assert_eq!(
             v["port_changed"]["moved_to_zero"],
             serde_json::json!(["bob"]),
             "槽 1 被搬到 0，那一槽的用户端口跟着下移"
+        );
+        assert_eq!(
+            v["port_changed"]["removed_slot"],
+            serde_json::json!([]),
+            "alice 被重新分配到了现在占着序号 0 的槽，端口还是 40000"
         );
         let body = v.to_string();
         assert!(
@@ -2098,15 +2102,19 @@ mod tests {
         // CLI 打印的就是这份回包
         let text = crate::modules::residential::cli::format_remove(&v);
         assert!(
-            text.contains("被删槽上的 1 个用户（端口已无人监听）：alice")
-                && text.contains("被搬到 0 号槽的 1 个用户"),
+            text.contains("以下 1 个用户的 HY2 住宅节点端口已变化")
+                && text.contains("（他们的槽被搬到 0 号槽，端口随之下移）：bob")
+                && !text.contains("alice"),
             "{text}"
         );
         // 事件落盘一条：bui incidents 与面板事件卡都看得到
         let incs = crate::modules::sentinel::incidents::from_runtime(&h.ctx.runtime.read().await);
         assert_eq!(incs.len(), 1);
         assert_eq!(incs[0].signature, "resi_slot_port_changed");
-        assert!(incs[0].result.contains("alice") && incs[0].result.contains("bob"));
+        assert_eq!(
+            incs[0].result,
+            "1 个用户的 HY2 住宅节点端口已变化，需重新获取订阅：被搬到 0 号槽 bob"
+        );
     }
 
     #[tokio::test]

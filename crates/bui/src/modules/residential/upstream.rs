@@ -314,8 +314,9 @@ pub async fn add(
 /// 删一条上游；删掉最后一条时顺带 `enabled = false`（v3 `enable --remove` 同语义）。
 ///
 /// 返回**HY2 住宅端口会变**的用户名（[`PortChangeImpact`]，删之前算、只有用户名）：
-/// 那个端口写死在用户已下发的订阅里，客户端永远自愈不了，所以 CLI 与面板都得把名单
-/// 打给操作者；非空时还落一条哨兵事件（`bui incidents` / 面板事件卡）。
+/// 那个端口写死在用户已下发的订阅里，客户端不会主动发现它变了，要等下一次订阅更新
+/// （`bui-c` 的每日 timer、v2rayN 的定时更新，或人工重新获取），所以 CLI 与面板都得把
+/// 名单打给操作者；非空时还落一条哨兵事件（`bui incidents` / 面板事件卡）。
 pub async fn remove(ctx: &DaemonCtx, sel: &UpstreamSel) -> Result<PortChangeImpact, UpstreamError> {
     let (target, impact) = {
         let s = ctx.store.read().await;
@@ -956,30 +957,51 @@ mod tests {
         );
     }
 
-    /// 删 0 号槽同时打到两批人：被删槽的用户，以及被不变量 3 搬到 0 的那一槽的用户。
+    /// 删 0 号槽可以同时打到两批人：被重新分配到别的槽的，以及槽序号被搬到 0 的。
+    /// 端口没变的人（重新分配后又落回序号 0）一个都不能进名单。
     #[tokio::test]
     async fn removing_slot_zero_reports_both_groups_separately() {
         let d = tempfile::tempdir().unwrap();
-        let c = ctx_with_slots(&d, 3, &["alice", "bob", "carol"]).await;
+        // 槽 0：alice、dave；槽 1：bob、erin；槽 2：carol
+        let c = ctx_with_slots(&d, 3, &["alice", "bob", "carol", "dave", "erin"]).await;
         let impact = remove(&c, &UpstreamSel::Id(Uuid::from_u128(1)))
             .await
             .unwrap();
-        assert_eq!(impact.removed_slot, vec!["alice".to_string()]);
+        assert_eq!(
+            impact.removed_slot,
+            vec!["alice".to_string()],
+            "alice 被重新分配到槽 2（40000 → 40002）；dave 落回序号 0，端口没变"
+        );
         assert_eq!(
             impact.moved_to_zero,
-            vec!["bob".to_string()],
-            "槽 1（bob）是现存序号最小的槽，它被搬到 0，端口跟着下移"
+            vec!["bob".to_string(), "erin".to_string()],
+            "槽 1 被搬到 0，上面两个人的端口一起下移"
         );
-        // 预测与 sync_slots 的实际结果一致
+        // 名单与真删后的槽位表一致：原槽 1（uuid=2）现在占着序号 0
+        let s = c.store.read().await;
         assert_eq!(
-            bui_schema::slots::sorted(&c.store.read().await.residential)[0].upstream_id,
+            bui_schema::slots::sorted(&s.residential)[0].upstream_id,
             Uuid::from_u128(2)
         );
+        let port = |name: &str| {
+            let u = s.users.iter().find(|u| u.username == name).unwrap();
+            bui_schema::slots::resources_of(
+                &s.node.ports,
+                &s.residential,
+                bui_schema::slots::index_of_user(u, &s.residential),
+            )
+            .hy2_port
+        };
+        assert_eq!(
+            (port("alice"), port("dave"), port("bob")),
+            (40002, 40000, 40000)
+        );
+        drop(s);
         let incs = incidents_of(&c).await;
         assert_eq!(incs.len(), 1);
         assert_eq!(
             incs[0].result,
-            "2 个用户的 HY2 住宅节点端口已变化，需重新获取订阅：被删槽 alice；被搬到 0 号槽 bob"
+            "3 个用户的 HY2 住宅节点端口已变化，需重新获取订阅：被删槽 alice；被搬到 0 号槽 bob、erin"
         );
     }
 

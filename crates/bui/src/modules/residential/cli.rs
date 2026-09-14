@@ -675,9 +675,9 @@ fn upstream_groups(
 }
 
 /// `remove` 的人读渲染：把「HY2 住宅端口已变化」的用户名打给操作者，让他通知这些人
-/// 重新获取订阅（端口写死在已下发的订阅里，客户端自己永远好不了）。
+/// 重新获取订阅（端口写死在已下发的订阅里，客户端要等下一次订阅更新才会知道）。
 ///
-/// 删 0 号槽会同时打到两批人（被删槽的用户 + 被搬到 0 的那一槽的用户），成因不同，
+/// 删 0 号槽可能同时打到两批人（被重新分配到别的槽的 + 槽序号被搬到 0 的），成因不同，
 /// 所以两组都在时分组说明。**没有人受影响时不打空名单。**
 pub fn format_remove(v: &serde_json::Value) -> String {
     let names = |k: &str| -> Vec<String> {
@@ -699,7 +699,7 @@ pub fn format_remove(v: &serde_json::Value) -> String {
     match (removed.is_empty(), moved.is_empty()) {
         (true, true) => "上游已移除（没有用户的 HY2 住宅端口受影响）".into(),
         (false, true) => format!(
-            "{}（被删槽的端口已无人监听）：{}",
+            "{}（他们原在被删的槽上，已重新分配到别的槽）：{}",
             head(removed.len()),
             removed.join("、")
         ),
@@ -709,7 +709,7 @@ pub fn format_remove(v: &serde_json::Value) -> String {
             moved.join("、")
         ),
         (false, false) => format!(
-            "{}：\n  被删槽上的 {} 个用户（端口已无人监听）：{}\n  被搬到 0 号槽的 {} 个用户（0 号槽不许悬空，端口随之下移）：{}",
+            "{}：\n  原在被删槽的 {} 个用户（已重新分配到别的槽）：{}\n  被搬到 0 号槽的 {} 个用户（0 号槽不许悬空，端口随之下移）：{}",
             head(removed.len() + moved.len()),
             removed.len(),
             removed.join("、"),
@@ -1239,7 +1239,7 @@ mod tests {
         assert_eq!(
             format_remove(&v(&["alice", "bob"], &[])),
             "上游已移除。以下 2 个用户的 HY2 住宅节点端口已变化，需要重新获取订阅\
-             （被删槽的端口已无人监听）：alice、bob"
+             （他们原在被删的槽上，已重新分配到别的槽）：alice、bob"
         );
         // 被删的 0 号槽上没有用户，但被搬到 0 的那一槽有 ⇒ 只打那一组，成因照旧要说
         assert_eq!(
@@ -1251,7 +1251,7 @@ mod tests {
         assert_eq!(
             format_remove(&v(&["alice"], &["bob", "carol"])),
             "上游已移除。以下 3 个用户的 HY2 住宅节点端口已变化，需要重新获取订阅：\n  \
-             被删槽上的 1 个用户（端口已无人监听）：alice\n  \
+             原在被删槽的 1 个用户（已重新分配到别的槽）：alice\n  \
              被搬到 0 号槽的 2 个用户（0 号槽不许悬空，端口随之下移）：bob、carol"
         );
         // 旧回包（没有 port_changed 字段）不该 panic
