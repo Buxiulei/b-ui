@@ -2103,7 +2103,7 @@ fn probe(&self, url: &str, via: Via, timeout: Duration) -> std::result::Result<P
 
 - **FakeSys**：`spawn` / `kill` 记进 `calls()`（`"spawn /opt/bui-c/bin/sing-box run -c …"`、`"kill 1"`）；`free_port` 从 20001 起递增；`listen(port)` 注入「这个端口在监听」；`mkdir_private` 把目录记成 0o700。
 - **FakeNet**：内部的 `RefCell` 改成 `Mutex`，变成 `Sync`，才能交给 `thread::scope`；这一步在 P0 的 T5 就做，因为 `Net: Sync` 成了 supertrait（D22），`speedtest::run` 不用再写 `N: Net + Sync`。新增 `route_via(url, via, reply)`：同一个 URL 按 via 端口给不同的结果，否则 9 个节点只能拿到同一个结果。新增 `delay(url, ms)`，决定 `probe` 返回的 `elapsed`。现有按日志顺序断言的用例都是单线程的，顺序不变；r6 §4.5 担心的「顺序不确定」只出现在并发用例里，测速用例一律按集合断言。
-- **`ProbeError` 怎么分类**（ReqwestNet）：`is_timeout()` → `Timeout`；错误链文本里有 `refused`（SOCKS 应答 0x05 或直连 ECONNREFUSED）→ `Refused`；只有直连的 `dns error` → `Dns`；其它（含 SOCKS 应答 0x01 `general server failure`）→ `Other("connect")`，显示「连不上（{用时}）」。0x01 不算解析失败（T5fix）：sing-box 的 SOCKS 入站只把四个 errno 映射成具体应答码，其余一律回 0x01，节点地址解析失败与拨节点服务器超时（vless 默认 5 秒，短于 bui-c 的 8/6 秒时限）同码同文本，客户端分不出，宁可说「连不上」也不报可能是假的「解析失败」；失败文案带实际用时，真机上看得出是不是等满了 5 秒。这些文本来自 reqwest 依赖的 hyper-util SOCKS 实现，不是 sing-box 的自由文本，但具体措辞仍要在真机上核对一次（§14）。
+- **`ProbeError` 怎么分类**（ReqwestNet）：`is_timeout()` → `Timeout`；错误链文本里有 `refused`（SOCKS 应答 0x05 或直连 ECONNREFUSED）→ `Refused`；只有直连的 `dns error` → `Dns`；其它（含 SOCKS 应答 0x01 `general server failure`）→ `Other("connect")`。`Refused` 与 `Other` 都显示「连不上（{用时}）」；`Dns` 显示「域名解析失败（{用时}）」，只在直连（TUN）路径出现；`Timeout` 写时限「超时（{n} 秒）」（§11.5）。0x01 不算解析失败（T5fix）：sing-box 的 SOCKS 入站只把四个 errno 映射成具体应答码，其余一律回 0x01，节点地址解析失败与拨节点服务器超时（vless 默认 5 秒，短于 bui-c 的 8/6 秒时限）同码同文本，客户端分不出，宁可说「连不上」也不报可能是假的「解析失败」；失败文案带实际用时，真机上看得出是不是等满了 5 秒。这些文本来自 reqwest 依赖的 hyper-util SOCKS 实现，不是 sing-box 的自由文本，但具体措辞仍要在真机上核对一次（§14）。
 
 ### 7.6 并发策略
 
@@ -2352,9 +2352,9 @@ pub struct Download { pub bytes: u64, pub elapsed: Duration, pub complete: bool 
 | 服务 | `✓ bui-c.service 在运行`、`✗ bui-c.service 没在运行`、`已重启，5 秒内还是没起来` |
 | 本地端口 | `✓ SOCKS5 :{p}   ✓ HTTP :{p}`（40 列分两行；没在监听的换成 `✗`） |
 | TUN | `✓ bui-tun 已建立，默认路由已接管`、`✗ bui-tun 接口不存在`、`✗ 默认路由没有指向 bui-tun` |
-| 隧道 | `✓ 通  {ms}ms`、`✗ 返回 HTTP {code}`、`✗ 经 SOCKS5 :{p} 超时（8 秒）`、`✗ 超时（8 秒）`、`已重启 bui-c.service，再试一次…`、`✗ 还是不通` |
-| Google / YouTube / GitHub | `✓ {ms}ms`；Google 失败 `✗ 超时（6 秒）` / `✗ 连不上`；YouTube、GitHub 失败 `○ 超时（6 秒）` / `○ 连不上`；`（慢）` 后缀 |
-| 百度直连 | `✓ {ms}ms`、`○ 超时（5 秒）`、`○ 本机 DNS 解析失败` |
+| 隧道 | `✓ 通  {ms}ms`、`✗ 返回 HTTP {code}`、`✗ 经 SOCKS5 :{p} 超时（8 秒）`、`✗ 经 SOCKS5 :{p} 连不上（{用时}）`、`✗ 超时（8 秒）`、`✗ 连不上（{用时}）`、`✗ 域名解析失败（{用时}）`（TUN 直连才出）、`已重启 bui-c.service，再试一次…`、`✗ 还是不通` |
+| Google / YouTube / GitHub | `✓ {ms}ms`；Google 失败 `✗ 超时（6 秒）` / `✗ 连不上（{用时}）` / `✗ 域名解析失败（{用时}）`（TUN 直连才出）；YouTube、GitHub 失败同形态用 `○`：`○ 超时（6 秒）` / `○ 连不上（{用时}）` / `○ 域名解析失败（{用时}）`；`（慢）` 后缀 |
+| 百度直连 | `✓ {ms}ms`、`○ 超时（5 秒）`、`○ 连不上（{用时}）`、`○ 本机 DNS 解析失败` |
 | 下载 | `✓ 1 MB 用时 {t} 秒，约 {x} MB/s`；`○ 5 秒没下完，按已下载的 {m} MB 估算约 {x} MB/s`；`○ 下载失败` |
 | IPv4 出口 | `✓ {ip}` / `{country}  {city}` / `{org}` / `{类型}  风险分 {n}（{来源}）`；类型：`住宅宽带`、`IDC 机房`、`代理 IP`、`移动网络`；失败 `✗ 查不到（ippure 与 ip-api 都不可达）` |
 | IPv6 | `✓ 已被隧道拦截，没有泄漏`、`✗ IPv6 泄漏（没进隧道）：{addr}`、`○ 本机 IPv6 {addr}（SOCKS 模式下没走代理的流量用它）`、`○ 本机没有 IPv6（SOCKS 模式只作提示）` |
@@ -2363,6 +2363,8 @@ pub struct Download { pub bytes: u64, pub elapsed: Duration, pub complete: bool 
 | 汇总 | `全部通过（{n} 项），用时 {t} 秒`；`通过 {a} 项，失败 {b} 项[，跳过 {c} 项]，用时 {t} 秒` |
 | 人话判断 | 见 §6.5 的表 |
 | 下一步 | `下一步：`；`[1] 再查一次`、`[2] 节点测速，找能用的节点`（没有测速时 `[2] 换个节点`）、`[3] 看最近 50 行日志`；提示符 `选择，回车返回菜单` |
+
+{用时} = 这一次探测的实际用时，写成 `{N} 秒`（整秒向下取整），不到 1 秒写 `不到 1 秒`；超时仍写时限（`超时（8 秒）` / `超时（6 秒）` / `超时（5 秒）`），不写用时。经 SOCKS 的连接失败只会是「连不上」或超时（SOCKS 应答 0x01 不算解析失败，§7.5）。
 
 ### 11.6 节点测速
 

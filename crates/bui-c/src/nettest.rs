@@ -2407,6 +2407,181 @@ mod tests {
         }
     }
 
+    /// 探测花掉的虚拟时间：[`SlowNet`] 每探一次往里加，[`ClockSys`] 的 `now` 把它叠在 FakeSys 的钟上。
+    /// FakeSys 不是 `Sync`（`RefCell`），塞不进 `Net: Sync` 的实现里，所以钟另放一只原子计数。
+    #[derive(Default)]
+    struct ProbeClock(std::sync::atomic::AtomicI64);
+
+    /// 按 URL 让一次 `probe` 花掉若干秒虚拟时间，回答照 [`FakeNet`]。FakeSys 的钟在一次探测里
+    /// 不走，失败行上的用时在别的用例里永远是「不到 1 秒」，看不出用时有没有接到那一行上。
+    struct SlowNet<'a> {
+        net: &'a FakeNet,
+        clock: &'a ProbeClock,
+        secs: &'a [(&'a str, i64)],
+    }
+
+    impl Net for SlowNet<'_> {
+        fn status(&self, url: &str, via: Via, t: Duration) -> Result<u16> {
+            self.net.status(url, via, t)
+        }
+        fn text(&self, url: &str, t: Duration) -> Result<String> {
+            self.net.text(url, t)
+        }
+        fn bytes(&self, url: &str, t: Duration) -> Result<Vec<u8>> {
+            self.net.bytes(url, t)
+        }
+        fn text_via(&self, url: &str, via: Via, t: Duration) -> Result<String> {
+            self.net.text_via(url, via, t)
+        }
+        fn probe(
+            &self,
+            url: &str,
+            via: Via,
+            t: Duration,
+        ) -> std::result::Result<Probe, ProbeError> {
+            if let Some((_, s)) = self.secs.iter().find(|(u, _)| *u == url) {
+                self.clock
+                    .0
+                    .fetch_add(*s, std::sync::atomic::Ordering::SeqCst);
+            }
+            self.net.probe(url, via, t)
+        }
+        fn download_via(
+            &self,
+            url: &str,
+            via: Via,
+            max_bytes: u64,
+            cap: Duration,
+        ) -> Result<crate::net::Download> {
+            self.net.download_via(url, via, max_bytes, cap)
+        }
+    }
+
+    /// FakeSys 原样转发，只有 `now` 叠上 [`ProbeClock`]。
+    struct ClockSys<'a> {
+        sys: &'a FakeSys,
+        clock: &'a ProbeClock,
+    }
+
+    impl Sys for ClockSys<'_> {
+        fn run(&self, prog: &str, args: &[&str]) -> Result<crate::sys::Output> {
+            self.sys.run(prog, args)
+        }
+        fn read(&self, path: &std::path::Path) -> Result<Vec<u8>> {
+            self.sys.read(path)
+        }
+        fn write(&self, path: &std::path::Path, data: &[u8], mode: u32) -> Result<()> {
+            self.sys.write(path, data, mode)
+        }
+        fn rename(&self, from: &std::path::Path, to: &std::path::Path) -> Result<()> {
+            self.sys.rename(from, to)
+        }
+        fn remove_file(&self, path: &std::path::Path) -> Result<()> {
+            self.sys.remove_file(path)
+        }
+        fn remove_dir_all(&self, path: &std::path::Path) -> Result<()> {
+            self.sys.remove_dir_all(path)
+        }
+        fn mkdir_p(&self, path: &std::path::Path) -> Result<()> {
+            self.sys.mkdir_p(path)
+        }
+        fn exists(&self, path: &std::path::Path) -> bool {
+            self.sys.exists(path)
+        }
+        fn read_dir(&self, path: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
+            self.sys.read_dir(path)
+        }
+        fn now(&self) -> time::OffsetDateTime {
+            let secs = self.clock.0.load(std::sync::atomic::Ordering::SeqCst);
+            self.sys.now() + time::Duration::seconds(secs)
+        }
+        fn sleep(&self, d: Duration) {
+            self.sys.sleep(d)
+        }
+        fn env(&self, key: &str) -> Option<String> {
+            self.sys.env(key)
+        }
+        fn term_size(&self) -> Option<(u16, u16)> {
+            self.sys.term_size()
+        }
+        fn tcp_listening(&self, port: u16) -> bool {
+            self.sys.tcp_listening(port)
+        }
+        fn resolve(&self, host: &str, timeout: Duration) -> Result<Duration> {
+            self.sys.resolve(host, timeout)
+        }
+    }
+
+    #[test]
+    fn failure_rows_show_the_time_each_probe_actually_took() {
+        // SOCKS 模式、sing-box 拨节点服务器等满 5 秒回 0x01（归 Other("connect")）：
+        // 隧道行要写「连不上（5 秒）」，真机上靠它看出是等满了拨号超时（spec §7.5、§11.5）
+        let (s, n) = (FakeSys::new(), FakeNet::new());
+        sample::healthy(&s, &n, Mode::Socks);
+        n.route(PROBE_URL, FakeReply::Fail("connect".into()));
+        let clock = ProbeClock::default();
+        let secs = [(PROBE_URL, 5)];
+        let net = SlowNet {
+            net: &n,
+            clock: &clock,
+            secs: &secs,
+        };
+        let sys = ClockSys {
+            sys: &s,
+            clock: &clock,
+        };
+        let mut rec = Recorder::default();
+        let sum = run(&sys, &net, &paths(), &profiles_socks(), &mut rec).unwrap();
+        assert_eq!(rec.lines()[2], "✗ 经 SOCKS5 :1080 连不上（5 秒）");
+        assert_eq!(
+            rec.conts(),
+            vec!["已重启 bui-c.service，再试一次…", "✗ 还是不通"]
+        );
+        // 汇总的用时与各行同一只钟：探测、重查各 5 秒，其余不花时间
+        assert_eq!(hits(&n, PROBE_URL), 2);
+        assert_eq!(sum.elapsed_s, 10);
+        assert!(render_summary(&sum, true, 60).contains("用时 10 秒"));
+
+        // TUN 模式隧道通：Google / YouTube / GitHub / 百度直连各花不同的秒数，
+        // 每一行报的是自己那一次的用时，不串行、不拿时限顶替
+        let (s, n) = (FakeSys::new(), FakeNet::new());
+        sample::healthy(&s, &n, Mode::Tun);
+        n.route(GOOGLE_URL, FakeReply::Fail("connect".into()));
+        n.route(YOUTUBE_URL, FakeReply::Dns);
+        n.route(GITHUB_URL, FakeReply::Refused);
+        n.route(BAIDU_URL, FakeReply::Fail("connect".into()));
+        let clock = ProbeClock::default();
+        let secs = [
+            (GOOGLE_URL, 5),
+            (YOUTUBE_URL, 3),
+            (GITHUB_URL, 2),
+            (BAIDU_URL, 4),
+        ];
+        let net = SlowNet {
+            net: &n,
+            clock: &clock,
+            secs: &secs,
+        };
+        let sys = ClockSys {
+            sys: &s,
+            clock: &clock,
+        };
+        let mut rec = Recorder::default();
+        let sum = run(&sys, &net, &paths(), &profiles_tun(), &mut rec).unwrap();
+        assert_eq!(
+            rec.lines()[4..8],
+            [
+                "✗ 连不上（5 秒）",
+                "○ 域名解析失败（3 秒）",
+                "○ 连不上（2 秒）",
+                "○ 连不上（4 秒）",
+            ]
+        );
+        assert_eq!(rec.repairs, 0, "隧道通，网站失败不修");
+        assert_eq!(sum.first_failure, Some(Item::Google));
+        assert_eq!(sum.elapsed_s, 14);
+    }
+
     #[test]
     fn narrow_rows_wrap_at_chinese_punctuation_and_align_to_the_content_column() {
         // 60 列：左栏 11 列，内容从第 13 列起；放得下就一行
