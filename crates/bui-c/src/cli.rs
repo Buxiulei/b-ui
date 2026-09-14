@@ -62,6 +62,9 @@ pub enum Cmd {
         sub: Option<String>,
         #[arg(long)]
         activate: bool,
+        /// 连删过的节点一起导（默认先跳过它们，spec §5.7）
+        #[arg(long)]
+        with_deleted: bool,
     },
     /// 删除节点（可以给多个名字）；删到当前节点时用 --switch-to 指定换到哪个
     Delete {
@@ -92,6 +95,9 @@ pub enum Cmd {
         /// 覆盖升级后的模式（默认沿用 v3：bui-tun 曾 enable 则 tun，否则 socks）
         #[arg(long)]
         mode: Option<ModeArg>,
+        /// 连删过的节点一起导（默认先跳过它们，spec §5.7）
+        #[arg(long)]
+        with_deleted: bool,
     },
     /// 卸载
     Uninstall {
@@ -143,6 +149,10 @@ pub struct Ctx<'a, S: Sys, N: Net, P: Prompt> {
     /// [`clear_screen`](Self::clear_screen) 真正清过几次屏。测试靠它断言「只在交互终端里清、
     /// 清几次」：清屏序列不进 `transcript`，没别的地方看得出来。
     pub clears: usize,
+    /// [`say_aside`](Self::say_aside) 打过的行在 `transcript` 里的起始位置。
+    pub asides: Vec<usize>,
+    /// [`say_result`](Self::say_result) 打过的结果行：起始位置 + 原文（不含缩进）。
+    pub results: Vec<(usize, String)>,
 }
 
 impl<'a, S: Sys, N: Net, P: Prompt> Ctx<'a, S, N, P> {
@@ -166,6 +176,8 @@ impl<'a, S: Sys, N: Net, P: Prompt> Ctx<'a, S, N, P> {
             indent: "",
             stdout_closed: false,
             clears: 0,
+            asides: Vec::new(),
+            results: Vec::new(),
         }
     }
     /// 终端列数；拿不到按 80。不缓存，每次画屏前重新取（窗口缩放、手机转屏立刻生效）。
@@ -233,6 +245,23 @@ impl<'a, S: Sys, N: Net, P: Prompt> Ctx<'a, S, N, P> {
             text.push('\n');
         }
         self.emit(&text);
+    }
+    /// 说一句**不算「附加行」**的话：[`outcome_since`] 数行时跳过它，所以只因为它不会停下来
+    /// 等回车。给「当前节点：X」这类回主菜单后状态区本来就显示的内容用。
+    ///
+    /// 由打印方标出来，不在 [`outcome_since`] 里按文案前缀猜（T7b 审查裁定）。只收单行。
+    pub fn say_aside(&mut self, line: impl AsRef<str>) {
+        self.asides.push(self.transcript.len());
+        self.say(line);
+    }
+    /// 说一句**「这次动作的结果」**：[`outcome_since`] 拿它当「上次：」行的摘要，而不是取第一行。
+    ///
+    /// 导入的结果行前面可能先打别的话（面板接口退回订阅、跳过无法解析的行、墓碑那一问之后的
+    /// 第二趟导入），取第一行会把结果挤掉。标了不止一句就以最后一句为准。只收单行。
+    pub fn say_result(&mut self, line: impl AsRef<str>) {
+        let line = line.as_ref().to_string();
+        self.results.push((self.transcript.len(), line.clone()));
+        self.say(line);
     }
     /// 原样打一块已经排好版的文字（菜单、节点列表、状态块），不叠 `indent`。
     pub fn show(&mut self, block: impl AsRef<str>) {
@@ -415,6 +444,11 @@ struct Stored {
     names: Vec<String>,
     /// upsert 结果为 [`Upsert::Replaced`] 的 profile 名：原地更新了活动节点就得 apply
     replaced: Vec<String>,
+    /// 命中墓碑、这次没写入的节点名（墓碑里记的那个名字，spec §5.7）：菜单据此问一句，
+    /// 命令行据此打 [`menu::buried_skipped`]
+    buried: Vec<String>,
+    /// 命中墓碑但按明确意愿加回来的 profile 名（墓碑已清）
+    restored: Vec<String>,
 }
 
 /// profile 名是 upsert 的主键，名字按连接身份定：
@@ -426,19 +460,34 @@ struct Stored {
 ///    全是中文时名字回落成 `<主机名>-<kind>`，同一台服务器上的家人账号必然撞名。
 ///
 /// upsert 逐个做，同一批里后一个节点看到的「已有同名」就包括前一个，规则一样成立。
+///
+/// `restore` 为假时认墓碑（spec §5.7）：删掉过的节点不写入，名字收进 [`Stored::buried`]；
+/// 为真时照常写入并把墓碑清掉（`--with-deleted`、菜单里答了 y、单独粘贴一条链接）。
 fn store_fetched<S: Sys, N: Net, P: Prompt>(
     ctx: &mut Ctx<'_, S, N, P>,
     prof: &mut Profiles,
     f: &Fetched,
     src: Source,
     panel: Option<Panel>,
+    restore: bool,
 ) -> Stored {
     let mut out = Stored {
         added: 0,
         names: Vec::with_capacity(f.nodes.len()),
         replaced: Vec::new(),
+        buried: Vec::new(),
+        restored: Vec::new(),
     };
     for node in &f.nodes {
+        // 删过的节点默认不写回来：面板 / 订阅导入是刷新节点的日常操作，不记墓碑的话
+        // 每刷新一次删掉的就全回来（spec §5.7）。名字取墓碑里记的那个——用户删它时
+        // 在列表上看到的就是它，这会儿的 profile 名还没算出来
+        if !restore {
+            if let Some(t) = prof.tombstone_of(node) {
+                out.buried.push(t.name.clone());
+                continue;
+            }
+        }
         let name = match prof.find_same_endpoint(node) {
             Some(same) => same.name.clone(),
             None => {
@@ -462,6 +511,10 @@ fn store_fetched<S: Sys, N: Net, P: Prompt>(
             source: src,
             imported_at: rfc3339(ctx.sys),
         });
+        // 明确要它：墓碑清掉，下次导入不再跳过（spec §5.7）
+        if prof.forget(node) {
+            out.restored.push(name.clone());
+        }
         match r {
             Upsert::Added => out.added += 1,
             Upsert::Replaced => {
@@ -489,6 +542,9 @@ fn store_fetched<S: Sys, N: Net, P: Prompt>(
 }
 
 /// 取到手、还没落盘的一批节点：来源与要记下的面板。
+///
+/// `Clone` 是给墓碑那一问用的：答 y 之后要拿**同一批**节点再导一次，不能再联网一趟。
+#[derive(Clone)]
 struct Incoming {
     fetched: Fetched,
     src: Source,
@@ -534,15 +590,31 @@ fn fetch_sub<N: Net>(net: &N, url: &str) -> Result<Incoming> {
 }
 
 /// 落盘一批节点；首次导入或 `activate` 时激活第一个并 apply，原地更新了活动节点也 apply。
+///
+/// `with_deleted` 为真（`--with-deleted`、菜单里答了 y）时连删过的节点一起导。单独粘贴
+/// **一条**节点链接也算「明确要它」，不用这个参数也直接加回（spec §5.7 表第 2 行）。
+///
+/// 返回 [`Stored`]：被墓碑挡下的名字在 `buried` 里——命令行据此打一行、菜单**放锁之后**
+/// 据此问一句（spec §0.2 R11），所以这个函数自己既不打那一行也不问那一句。
 fn save_import<S: Sys, N: Net, P: Prompt>(
     ctx: &mut Ctx<'_, S, N, P>,
     inc: Incoming,
     activate: bool,
-) -> Result<()> {
+    with_deleted: bool,
+) -> Result<Stored> {
     let mut prof = Profiles::load(ctx.sys, ctx.paths)?;
     let loaded = prof.clone();
     let had_active = prof.active_profile().is_some();
-    let stored = store_fetched(ctx, &mut prof, &inc.fetched, inc.src, inc.panel);
+    // 粘一条就是明确要这一个：直接加回并清墓碑，不必再问（spec §5.7）
+    let single = inc.src == Source::Paste && inc.fetched.nodes.len() == 1;
+    let stored = store_fetched(
+        ctx,
+        &mut prof,
+        &inc.fetched,
+        inc.src,
+        inc.panel,
+        with_deleted || single,
+    );
     if activate || !had_active {
         if let Some(name) = stored.names.first() {
             prof.active = Some(name.clone());
@@ -552,15 +624,19 @@ fn save_import<S: Sys, N: Net, P: Prompt>(
     if prof != loaded {
         prof.save(ctx.sys, ctx.paths)?;
     }
-    ctx.say(format!(
+    ctx.say_result(format!(
         "导入 {} 个新节点，共 {} 个",
         stored.added,
         prof.profiles.len()
     ));
+    // 粘的这一条之前被删过：说一句，让人知道墓碑起过作用、现在已经清了
+    if single && !stored.restored.is_empty() {
+        ctx.say_result(menu::BURIED_RESTORED);
+    }
     if activate || !had_active {
         let g = take_lock(ctx)?;
         apply_with_ufw(ctx, &prof, &g)?;
-        ctx.say(format!(
+        ctx.say_aside(format!(
             "{CURRENT_NODE_HEAD}{}",
             prof.active.clone().unwrap_or_default()
         ));
@@ -574,7 +650,7 @@ fn save_import<S: Sys, N: Net, P: Prompt>(
         let g = take_lock(ctx)?;
         apply_with_ufw(ctx, &prof, &g)?;
     }
-    Ok(())
+    Ok(stored)
 }
 
 pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>) -> Result<()> {
@@ -672,6 +748,7 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
             user,
             sub,
             activate,
+            with_deleted,
         } => {
             let inc = if let (Some(base), Some(u)) = (panel.as_ref(), user.as_ref()) {
                 fetch_panel(ctx, base, u)?
@@ -696,7 +773,12 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
                     "给一个节点链接，或用 --panel <地址> --user <用户名>，或 --sub <订阅地址>",
                 ));
             };
-            save_import(ctx, inc, *activate)
+            let stored = save_import(ctx, inc, *activate, *with_deleted)?;
+            // 命令行不提问（脚本里跑它不能卡在一个 [y/N] 上）：说清跳了哪几个、怎么加回来
+            if !stored.buried.is_empty() {
+                ctx.say(menu::buried_skipped(&stored.buried));
+            }
+            Ok(())
         }
         // `bui-c delete <名字>... [--switch-to <名字>] [-y] [--json]`（spec §5.10、§0.2 R7 / R15）
         Cmd::Delete { names, switch_to } => {
@@ -841,61 +923,23 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
             rt.save(ctx.sys, ctx.paths)?;
             Ok(())
         }
-        Cmd::ImportV3 { base, panel, mode } => {
-            let mut prof = Profiles::load(ctx.sys, ctx.paths)?;
-            let dir = base
-                .clone()
-                .unwrap_or_else(|| PathBuf::from(import_v3::V3_BASE));
-            let opts = import_v3::RunOpts {
-                panel: panel.clone().or_else(|| ctx.sys.env("BUI_C_PANEL")),
-                mode: mode.map(Into::into),
-            };
-            let r = import_v3::run(ctx.sys, ctx.net, ctx.paths, &dir, &mut prof, &opts)?;
-            if r.kernel_installed {
-                ctx.say("已安装 sing-box 内核");
+        Cmd::ImportV3 {
+            base,
+            panel,
+            mode,
+            with_deleted,
+        } => {
+            let r = import_v3_cmd(
+                ctx,
+                base.clone(),
+                panel.clone(),
+                mode.map(Into::into),
+                *with_deleted,
+            )?;
+            // 命令行不提问（脚本里跑它不能卡在一个 [y/N] 上）：说清跳了哪几个、怎么加回来
+            if !r.buried.is_empty() {
+                ctx.say(menu::buried_skipped(&r.buried));
             }
-            // v3 目录是回滚素材、按约定留着，所以这条命令（菜单 [7]）在已迁移的机器上
-            // 随时可能被再按一次。没有新节点就没什么要 apply 的：省掉 ufw/engine 那趟
-            // 往返，也就不会出现「配置字节不变→不重启」的窗口。
-            if r.imported.is_empty() {
-                let tail = if r.removed_units.is_empty() {
-                    "未做任何改动".to_string()
-                } else {
-                    format!("清掉 {} 个残留的 v3 单元", r.removed_units.len())
-                };
-                // 不串名字：真机 9 个节点 join 起来一行两百多列，名字 `bui-c list` 里都看得到
-                ctx.say(format!(
-                    "v3 的 {} 个节点都已导入过，{tail}",
-                    r.existing.len()
-                ));
-                for s in &r.skipped {
-                    ctx.say(format!("跳过：{s}"));
-                }
-                if r.ufw_restored {
-                    ctx.say("已恢复被 v3 关掉的 UFW");
-                }
-                return Ok(());
-            }
-            ctx.say(format!(
-                "导入 {} 个节点，卸载 {} 个旧单元",
-                r.imported.len(),
-                r.removed_units.len()
-            ));
-            if !r.existing.is_empty() {
-                ctx.say(format!("{} 个已存在，跳过", r.existing.len()));
-            }
-            for s in &r.skipped {
-                ctx.say(format!("跳过：{s}"));
-            }
-            if r.ufw_restored {
-                ctx.say("已恢复被 v3 关掉的 UFW");
-            }
-            let g = take_lock(ctx)?;
-            apply_with_ufw(ctx, &prof, &g)?;
-            ctx.say(format!(
-                "{CURRENT_NODE_HEAD}{}",
-                prof.active.clone().unwrap_or_default()
-            ));
             Ok(())
         }
         Cmd::Uninstall { purge_bin } => {
@@ -914,6 +958,77 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
             Ok(())
         }
     }
+}
+
+/// `bui-c import-v3` 与菜单 `[7]` → `[3]` 共用的那一趟：导入 → 说结果 → apply。
+///
+/// 墓碑那一问**不在这里**（spec §5.7 表第 3 行、§0.2 R11「放锁之后再问」）：命令行打
+/// [`menu::buried_skipped`]、菜单经 [`menu_import_v3`] 问一句，两边都从返回的
+/// [`import_v3::Report::buried`] 拿名字。
+fn import_v3_cmd<S: Sys, N: Net, P: Prompt>(
+    ctx: &mut Ctx<'_, S, N, P>,
+    base: Option<PathBuf>,
+    panel: Option<String>,
+    mode: Option<Mode>,
+    with_deleted: bool,
+) -> Result<import_v3::Report> {
+    let mut prof = Profiles::load(ctx.sys, ctx.paths)?;
+    let dir = base.unwrap_or_else(|| PathBuf::from(import_v3::V3_BASE));
+    let opts = import_v3::RunOpts {
+        panel: panel.or_else(|| ctx.sys.env("BUI_C_PANEL")),
+        mode,
+        with_deleted,
+    };
+    let r = import_v3::run(ctx.sys, ctx.net, ctx.paths, &dir, &mut prof, &opts)?;
+    if r.kernel_installed {
+        ctx.say("已安装 sing-box 内核");
+    }
+    // v3 目录是回滚素材、按约定留着，所以这条命令（菜单 [7]）在已迁移的机器上
+    // 随时可能被再按一次。没有新节点就没什么要 apply 的：省掉 ufw/engine 那趟
+    // 往返，也就不会出现「配置字节不变→不重启」的窗口。
+    if r.imported.is_empty() {
+        let tail = if r.removed_units.is_empty() {
+            "未做任何改动".to_string()
+        } else {
+            format!("清掉 {} 个残留的 v3 单元", r.removed_units.len())
+        };
+        // 不串名字：真机 9 个节点 join 起来一行两百多列，名字 `bui-c list` 里都看得到
+        ctx.say_result(if r.existing.is_empty() {
+            // 走到这里而 existing 为空，只能是「v3 的节点全被删过」（都没导过又都没得导
+            // 的话 import 已经报错了）：别说成「0 个节点都已导入过」
+            format!("v3 的节点都被删过，{tail}")
+        } else {
+            format!("v3 的 {} 个节点都已导入过，{tail}", r.existing.len())
+        });
+        for s in &r.skipped {
+            ctx.say(format!("跳过：{s}"));
+        }
+        if r.ufw_restored {
+            ctx.say("已恢复被 v3 关掉的 UFW");
+        }
+        return Ok(r);
+    }
+    ctx.say_result(format!(
+        "导入 {} 个节点，卸载 {} 个旧单元",
+        r.imported.len(),
+        r.removed_units.len()
+    ));
+    if !r.existing.is_empty() {
+        ctx.say(format!("{} 个已存在，跳过", r.existing.len()));
+    }
+    for s in &r.skipped {
+        ctx.say(format!("跳过：{s}"));
+    }
+    if r.ufw_restored {
+        ctx.say("已恢复被 v3 关掉的 UFW");
+    }
+    let g = take_lock(ctx)?;
+    apply_with_ufw(ctx, &prof, &g)?;
+    ctx.say_aside(format!(
+        "{CURRENT_NODE_HEAD}{}",
+        prof.active.clone().unwrap_or_default()
+    ));
+    Ok(r)
 }
 
 /// 巡检：`bui-c check`（timer 每分钟一次），只有 204 探测与更新源两类请求。
@@ -1031,6 +1146,8 @@ fn offer_v3_import<S: Sys, N: Net, P: Prompt>(
                 base: None,
                 panel: None,
                 mode: None,
+                // 首次运行才邀请（profiles 为空），墓碑一定也是空的：不必带 --with-deleted
+                with_deleted: false,
             },
         )
     } else {
@@ -1067,27 +1184,52 @@ impl Outcome {
 }
 
 /// 首次导入、从 v3 导入之后打的「当前节点：X」。回主菜单后状态区本来就显示当前节点，
-/// 它不算附加行，不因为它停（审查裁定；[`outcome_since`] 数行时跳过它）。
+/// 它不算附加行，不因为它停（审查裁定）——所以这几处一律经
+/// [`Ctx::say_aside`] 打，而不是让 [`outcome_since`] 按这个前缀去猜。
 const CURRENT_NODE_HEAD: &str = "当前节点：";
 
 /// 从 transcript 的 `start` 起新打的内容定 [`Outcome`]，照 spec §4.3 的一条标准：失败，或者
-/// 这个动作自己打了不止一行 → 停；否则不停。有「失败：」行 → 停，摘要就是它；多于一行 → 停，
-/// 摘要取第一行；只有一行 → 不停，它进「上次：」行；什么都没打 → 「上次：」行不变。空行与
-/// [`CURRENT_NODE_HEAD`] 行不算。
+/// 这个动作自己打了不止一行 → 停；否则不停。
+///
+/// 摘要的来源：有「失败：」行 → 停，摘要就是它；动作自己标过结果行（[`Ctx::say_result`]）→
+/// 摘要用最后那一条（导入的「上次：」行必须是导入结果本身，不能被它前面的附加提示占掉）；
+/// 没标过就取第一行。停不停只看附加行的条数：多于一行 → 停；只有一行 → 不停；什么都没打 →
+/// 「上次：」行不变。空行与 [`Ctx::say_aside`] 标过的行都不算行。
 fn outcome_since<S: Sys, N: Net, P: Prompt>(ctx: &Ctx<'_, S, N, P>, start: usize) -> Outcome {
-    // transcript 只追加不截断，`start` 一定落在字符边界上
-    let new: Vec<&str> = ctx.transcript[start..]
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with(CURRENT_NODE_HEAD))
-        .collect();
+    // transcript 只追加不截断，`start` 一定落在字符边界上；`split_inclusive` 留着换行，
+    // 一路加出来的 `at` 就是每一行在 transcript 里的起始位置，正好对上 `asides` 记的那个
+    let mut new: Vec<&str> = Vec::new();
+    let mut at = start;
+    for raw in ctx.transcript[start..].split_inclusive('\n') {
+        let line = raw.trim();
+        if !line.is_empty() && !ctx.asides.contains(&at) {
+            new.push(line);
+        }
+        at += raw.len();
+    }
     if let Some(fail) = new.iter().find(|l| l.starts_with("失败：")) {
         return Outcome::Pause(fail.to_string());
     }
-    match new.as_slice() {
-        [] => Outcome::Nothing,
-        [one] => Outcome::Note(one.to_string()),
-        [first, ..] => Outcome::Pause(first.to_string()),
+    let marked = ctx
+        .results
+        .iter()
+        .rev()
+        .find(|(at, _)| *at >= start)
+        .map(|(_, line)| line.clone());
+    match (new.as_slice(), marked) {
+        ([], _) => Outcome::Nothing,
+        ([_], Some(m)) => Outcome::Note(m),
+        ([one], None) => Outcome::Note(one.to_string()),
+        (_, Some(m)) => Outcome::Pause(m),
+        ([first, ..], None) => Outcome::Pause(first.to_string()),
+    }
+}
+
+/// 提问本身就是停顿：结果已经在提问处看过了，回主菜单不再停（摘要照旧，spec §4.3）。
+fn asked_is_a_pause(out: Outcome) -> Outcome {
+    match out {
+        Outcome::Pause(s) => Outcome::Note(s),
+        other => other,
     }
 }
 
@@ -1162,8 +1304,9 @@ fn take_lock<S: Sys, N: Net, P: Prompt>(ctx: &Ctx<'_, S, N, P>) -> Result<LockGu
         .ok_or_else(|| Error::msg(LOCK_BUSY))
 }
 
-/// 删除流程里说一句：按当前宽度折行、缩进两列（`SelError::message` 那种 59 列的句子在 40 列
-/// 终端上要折，spec §0.2 R1）。`--json` 下一个字都不打——那时 stdout 只放一个 Report。
+/// 删除与导入流程里说一句：按当前宽度折行、缩进两列（`SelError::message` 那种 59 列的句子、
+/// 墓碑那一句里的一串节点名，在 40 列终端上都要折，spec §0.2 R1）。`--json` 下一个字都不打——
+/// 那时 stdout 只放一个 Report。
 fn tell<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>, text: impl AsRef<str>) {
     if ctx.json {
         return;
@@ -1303,7 +1446,16 @@ fn delete_nodes<S: Sys, N: Net, P: Prompt>(
     }
 
     // ④ 锁内重算（纯函数，算出来必然一样，只是不拿锁外的结果去执行）
-    let plan = delete::plan(&old, names, switch_to)?;
+    let mut plan = delete::plan(&old, names, switch_to)?;
+    // 每个被删节点记一条墓碑，**和 profiles、active 同一次原子写**（spec §5.7、§0.2 R10 第 7 步）：
+    // 下次从面板 / 订阅 / v3 导入时先跳过它们，再问一句要不要加回。不记的话，面板导入是刷新
+    // 节点的日常操作，每刷新一次删掉的就全回来，删除等于没做
+    let at = ctx.sys.now().unix_timestamp();
+    for name in &plan.targets {
+        if let Some(p) = old.profiles.iter().find(|p| &p.name == name) {
+            plan.next.bury(p, at);
+        }
+    }
     let mut report = delete::Report {
         deleted: plan.targets.clone(),
         active: plan.next.active.clone(),
@@ -1709,14 +1861,7 @@ fn menu_action<S: Sys, N: Net, P: Prompt>(
                 ),
             )
         }
-        Action::ImportV3 => run_sub(
-            ctx,
-            Cmd::ImportV3 {
-                base: None,
-                panel: None,
-                mode: None,
-            },
-        ),
+        Action::ImportV3 => menu_import_v3(ctx)?,
         Action::Uninstall => run_sub(ctx, Cmd::Uninstall { purge_bin: false }),
     })
 }
@@ -1844,8 +1989,12 @@ const PASTE_PROMPT: &str = "粘贴节点链接或订阅地址";
 /// 导入失败只打「失败：…」留在菜单里。导入了新节点、而活动节点不在其中时追问一次要不要
 /// 切过去——命令行 `bui-c import` 不问，保持非交互。
 ///
-/// 回主菜单停不停照 [`outcome_since`]：失败、有附加行（面板退回订阅、跳过…）就停。追问过
-/// 「切换到新导入的 X？」的，人已经在提问处看过导入结果：答 y 用切换的结果，答否不再停。
+/// 回主菜单停不停照 [`outcome_since`]：失败、有附加行（面板退回订阅、跳过…）就停；「上次：」行
+/// 一律是导入结果本身（[`Ctx::say_result`] 标的那一行），不会被它前面的附加提示占掉。追问过
+/// 「切换到新导入的 X？」或墓碑那一问的，人已经在提问处看过导入结果：答 y 用切换的结果，答否不再停。
+///
+/// 墓碑（spec §5.7）：命中的节点先不写入，导入之后、**放锁之后**（`save_import` 里的锁已经放了，
+/// spec §0.2 R11）问一句要不要加回，答 y 拿同一批节点再导一次（只导这几个，不再联网）。
 fn menu_import<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<Outcome> {
     let start = ctx.transcript.len();
     let lines: Vec<String> = ctx
@@ -1863,19 +2012,21 @@ fn menu_import<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<
         .into_iter()
         .map(|p| p.name)
         .collect();
+    // 取节点与落盘分两步：墓碑那一问答 y 时要拿同一批节点再导一次，不能再去联网
     let imported = match lines.as_slice() {
-        [url] if source::is_http_url(url) => import_http(ctx, url),
-        _ => source::from_uris(&lines).and_then(|fetched| {
-            let inc = Incoming {
-                fetched,
-                src: Source::Paste,
-                panel: None,
-            };
-            save_import(ctx, inc, false)
+        [url] if source::is_http_url(url) => fetch_http(ctx, url),
+        _ => source::from_uris(&lines).map(|fetched| Incoming {
+            fetched,
+            src: Source::Paste,
+            panel: None,
         }),
-    };
-    match imported {
-        Ok(()) => {}
+    }
+    .and_then(|inc| {
+        let again = inc.clone();
+        save_import(ctx, inc, false, false).map(|stored| (stored, again))
+    });
+    let (stored, again) = match imported {
+        Ok(v) => v,
         // 人就在菜单 [3] 里：不提命令行、不提「菜单 [3]」
         Err(Error::NoNodes {
             skipped,
@@ -1895,6 +2046,22 @@ fn menu_import<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<
             ctx.say(format!("失败：{e}"));
             return Ok(outcome_since(ctx, start));
         }
+    };
+    // 墓碑那一问：答 y 另拿一次锁，只把这几个导回来（spec §5.7、§0.2 R11）
+    let mut asked = false;
+    if !stored.buried.is_empty() {
+        asked = true;
+        tell(ctx, menu::buried_head(&stored.buried));
+        ctx.flush();
+        if ctx.prompt.confirm(menu::BURIED_ASK)? {
+            let live = Profiles::load(ctx.sys, ctx.paths)?;
+            let mut only = again;
+            only.fetched.nodes.retain(|n| live.is_deleted(n));
+            if let Err(e) = save_import(ctx, only, false, true) {
+                ctx.say(format!("失败：{e}"));
+                return Ok(outcome_since(ctx, start));
+            }
+        }
     }
     let after = Profiles::load(ctx.sys, ctx.paths)?;
     let fresh: Vec<&str> = after
@@ -1903,22 +2070,52 @@ fn menu_import<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<
         .map(|p| p.name.as_str())
         .filter(|n| !before.iter().any(|b| b == n))
         .collect();
+    let mut shown = outcome_since(ctx, start);
+    if asked {
+        // 墓碑那一问本身就是停顿：导入结果已经在提问处看过了
+        shown = asked_is_a_pause(shown);
+    }
     let Some(first) = fresh.first() else {
-        return Ok(outcome_since(ctx, start));
+        return Ok(shown);
     };
     if after.active.as_deref().is_some_and(|a| fresh.contains(&a)) {
-        return Ok(outcome_since(ctx, start)); // 首次导入已经激活了新节点
+        return Ok(shown); // 首次导入已经激活了新节点
     }
     ctx.flush();
-    let shown = outcome_since(ctx, start);
     if ctx.prompt.confirm(&format!("切换到新导入的 {first}？"))? {
         return Ok(switch_node(ctx, first.to_string()));
     }
     // 提问本身就是停顿：导入结果已经在提问处看过了，答否回主菜单不再停
-    Ok(match shown {
-        Outcome::Pause(s) => Outcome::Note(s),
-        other => other,
-    })
+    Ok(asked_is_a_pause(shown))
+}
+
+/// 菜单 `[7]` → `[3]` 从 v3 导入（spec §5.7 表第 3 行、§0.2 R11）：先照常导一趟，被墓碑挡下的
+/// 节点在**放锁之后**问一句，答 y 再导一次——v3 里已经导过的那些照旧按连接身份跳过，所以
+/// 第二趟只会把这几个加回来。
+///
+/// 不走 [`run_sub`]：那条路把 [`import_v3::Report`] 丢掉了，拿不到 `buried`。失败的处理与它一样
+/// （打一行「失败：…」，停不停照 [`outcome_since`]）。
+fn menu_import_v3<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<Outcome> {
+    let start = ctx.transcript.len();
+    let buried = match import_v3_cmd(ctx, None, None, None, false) {
+        Ok(r) => r.buried,
+        Err(e) => {
+            ctx.say(format!("失败：{e}"));
+            return Ok(outcome_since(ctx, start));
+        }
+    };
+    if buried.is_empty() {
+        return Ok(outcome_since(ctx, start));
+    }
+    tell(ctx, menu::buried_head(&buried));
+    ctx.flush();
+    if !ctx.prompt.confirm(menu::BURIED_ASK)? {
+        return Ok(asked_is_a_pause(outcome_since(ctx, start)));
+    }
+    if let Err(e) = import_v3_cmd(ctx, None, None, None, true) {
+        ctx.say(format!("失败：{e}"));
+    }
+    Ok(outcome_since(ctx, start))
 }
 
 /// 单独一行的 http(s) 地址：面板的四种按用户地址走 `/api/nodes`（带分流规则），
@@ -1928,20 +2125,25 @@ fn menu_import<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<
 ///
 /// 面板的业务错误（`Error::Msg`，如「节点列表为空」）不退回：接口在、面板说这个用户没东西，
 /// 按订阅再导一遍只会绕开这句话。
-fn import_http<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>, url: &str) -> Result<()> {
-    let inc = match source::panel_link(url) {
+///
+/// 只取、不落盘：墓碑那一问答 y 时 [`menu_import`] 要拿同一批节点再导一次，不能再联网一趟
+/// （面板这会儿可能已经换了端口，第二趟会导进另一批节点）。
+fn fetch_http<S: Sys, N: Net, P: Prompt>(
+    ctx: &mut Ctx<'_, S, N, P>,
+    url: &str,
+) -> Result<Incoming> {
+    match source::panel_link(url) {
         Some(link) => match fetch_panel(ctx, &link.base_url, &link.user) {
-            Ok(inc) => inc,
+            Ok(inc) => Ok(inc),
             Err(e) if link.path == source::PanelPath::Sub && !matches!(e, Error::Msg(_)) => {
                 ctx.say(panel_fallback_notice(&e));
                 ctx.flush();
-                fetch_sub(ctx.net, url)?
+                fetch_sub(ctx.net, url)
             }
-            Err(e) => return Err(e),
+            Err(e) => Err(e),
         },
-        None => fetch_sub(ctx.net, url)?,
-    };
-    save_import(ctx, inc, false)
+        None => fetch_sub(ctx.net, url),
+    }
 }
 
 /// `/api/sub` 退回订阅时的那句话。401 / 404 是 v3 面板的常态（没有 `/api/nodes`），
@@ -2139,7 +2341,8 @@ mod tests {
                 panel: Some("https://panel.example.com".into()),
                 user: Some("alice".into()),
                 sub: None,
-                activate: true
+                activate: true,
+                with_deleted: false
             })
         );
         assert_eq!(
@@ -2149,7 +2352,34 @@ mod tests {
                 panel: None,
                 user: None,
                 sub: None,
-                activate: false
+                activate: false,
+                with_deleted: false
+            })
+        );
+        assert_eq!(
+            parse(&[
+                "import",
+                "--sub",
+                "https://s.example.test/x",
+                "--with-deleted"
+            ])
+            .cmd,
+            Some(Cmd::Import {
+                uri: None,
+                panel: None,
+                user: None,
+                sub: Some("https://s.example.test/x".into()),
+                activate: false,
+                with_deleted: true
+            })
+        );
+        assert_eq!(
+            parse(&["import-v3", "--with-deleted"]).cmd,
+            Some(Cmd::ImportV3 {
+                base: None,
+                panel: None,
+                mode: None,
+                with_deleted: true
             })
         );
         assert_eq!(parse(&["check"]).cmd, Some(Cmd::Check));
@@ -2205,7 +2435,8 @@ mod tests {
             Some(Cmd::ImportV3 {
                 base: None,
                 panel: None,
-                mode: None
+                mode: None,
+                with_deleted: false
             })
         );
         assert_eq!(
@@ -2213,7 +2444,8 @@ mod tests {
             Some(Cmd::ImportV3 {
                 base: None,
                 panel: Some("https://p".into()),
-                mode: Some(ModeArg::Socks)
+                mode: Some(ModeArg::Socks),
+                with_deleted: false
             })
         );
         assert_eq!(
@@ -5023,9 +5255,10 @@ mod tests {
         // 退回订阅的说明 + 导入结果是两行，本该停；追问切换时人已经看过了，答否不再停
         assert_eq!(pauses(&p.asked), 0, "{:?}", p.asked);
         assert_eq!(t.matches("B-UI 客户端").count(), 2, "0 由主菜单读走：\n{t}");
+        // 「上次：」行是导入结果本身，不是结果前面那句退回订阅的说明（T7b 审查第 1 条：
+        // 结果行由 `Ctx::say_result` 标出来，`outcome_since` 不再取第一行）
         assert!(
-            t.lines()
-                .any(|l| l == "  上次：这个面板还没有节点接口，改用订阅地址导入"),
+            t.lines().any(|l| l == "  上次：导入 1 个新节点，共 2 个"),
             "{t}"
         );
     }
@@ -6875,6 +7108,394 @@ mod tests {
             lines[at + 1].starts_with("  10:15:30 FATAL") && lines[at + 1].ends_with('…'),
             "40 列压时间戳 + 长行尾截：{}",
             lines[at + 1]
+        );
+    }
+
+    // ───────────── T7b：墓碑名单（spec §5.7） ─────────────
+
+    /// 面板导入过两个节点、删掉其中一个的机器：返回 `(FakeSys, FakeNet)`，面板还挂着那两个。
+    fn one_buried(pp: &Paths, url: &str) -> (FakeSys, FakeNet) {
+        let s = FakeSys::new();
+        ready(&s);
+        let n = FakeNet::new();
+        n.route(
+            url,
+            nodes_payload("alice", vec![reality_direct_node(), hy2_direct_node()]),
+        );
+        let mut prof = Profiles::new_default();
+        prof.upsert(crate::testutil::named(
+            "alice-reality-direct",
+            reality_direct_node(),
+        ));
+        prof.upsert(crate::testutil::named(
+            "alice-hy2-direct",
+            hy2_direct_node(),
+        ));
+        prof.active = Some("alice-hy2-direct".into());
+        prof.save(&s, pp).unwrap();
+        Engine::new(&s, pp).apply(&prof).unwrap();
+        // 删掉 Reality 那个（活动节点是 hy2，所以是 Passive：不动数据面）
+        let seen = delete::snapshot(&prof);
+        let (r, t) = del(&s, &n, pp, &["alice-reality-direct"], None, &seen);
+        r.expect(&t);
+        assert_eq!(names(&s, pp), vec!["alice-hy2-direct".to_string()], "{t}");
+        assert_eq!(Profiles::load(&s, pp).unwrap().deleted.len(), 1, "{t}");
+        (s, n)
+    }
+
+    /// 删除成功落盘时每个被删节点记一条墓碑，**和 profiles、active 同一次 save**。
+    #[test]
+    fn deleting_buries_the_nodes_in_the_same_save() {
+        let pp = paths();
+        let s = FakeSys::new();
+        let n = FakeNet::new();
+        let prof = nine_nodes(&s, &pp, Mode::Socks);
+        let seen = delete::snapshot(&prof);
+        let writes = s.writes("/opt/bui-c/profiles.json");
+        let (r, t) = del(&s, &n, &pp, &["HY2", "reality-Reality"], None, &seen);
+        r.expect(&t);
+        assert_eq!(
+            s.writes("/opt/bui-c/profiles.json") - writes,
+            1,
+            "墓碑与 profiles、active 是同一次原子写：{t}"
+        );
+        let saved = Profiles::load(&s, &pp).unwrap();
+        assert_eq!(saved.profiles.len(), 7);
+        let names: Vec<&str> = saved.deleted.iter().map(|x| x.name.as_str()).collect();
+        assert_eq!(names, vec!["HY2", "reality-Reality"], "{t}");
+        let node_of = |name: &str| {
+            prof.profiles
+                .iter()
+                .find(|p| p.name == name)
+                .map(|p| p.node.clone())
+                .unwrap()
+        };
+        for name in ["HY2", "reality-Reality"] {
+            assert!(saved.is_deleted(&node_of(name)), "{name} 该被认出来");
+            let t = saved.tombstone_of(&node_of(name)).unwrap();
+            assert!(t.key.contains('|') && t.at > 0, "{t:?}");
+        }
+        assert!(
+            !saved.is_deleted(&node_of("hysteria2-1778329470")),
+            "没删的那些不许留墓碑（同账号、同主机，只有 kind 不同）"
+        );
+        // 落盘的字节里没有明文凭据、没有端口
+        let raw = s.get("/opt/bui-c/profiles.json").unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let block = doc["deleted"].to_string();
+        assert!(
+            !block.contains("hy2-pw") && !block.contains("40000") && !block.contains("10001"),
+            "墓碑里不存明文凭据、不存端口：{block}"
+        );
+    }
+
+    /// 面板重新导入（刷新节点的日常操作）：删过的先跳过，菜单在**放锁之后**问一句，
+    /// 答 y 只把这几个加回来、墓碑清掉（spec §5.7、§0.2 R11）。
+    #[test]
+    fn a_panel_reimport_skips_buried_nodes_and_the_menu_asks_to_restore() {
+        let pp = paths();
+        let url = "https://panel.example.com/api/nodes/alice";
+
+        // ① 答 n：说清跳过的是哪个，节点不回来，墓碑还在
+        let (s, n) = one_buried(&pp, url);
+        let r = run_menu(&s, &n, &pp, &["3", url, "", "n", "0"], true);
+        assert!(
+            r.asked.iter().any(|q| q == menu::BURIED_ASK),
+            "要问一句：{:?}",
+            r.asked
+        );
+        assert!(
+            r.t.lines()
+                .any(|l| l.trim() == "这次导入里有 1 个你删过的节点：alice-reality-direct"),
+            "{}",
+            r.t
+        );
+        assert!(
+            !r.t.contains("--with-deleted"),
+            "菜单里不提命令行开关：{}",
+            r.t
+        );
+        assert_eq!(
+            names(&s, &pp),
+            vec!["alice-hy2-direct".to_string()],
+            "{}",
+            r.t
+        );
+        assert_eq!(Profiles::load(&s, &pp).unwrap().deleted.len(), 1);
+        // 「上次：」行是导入结果本身，不是它前面那几句附加提示（审查第 1 条）
+        assert!(
+            r.t.lines().any(|l| l == "  上次：导入 0 个新节点，共 1 个"),
+            "{}",
+            r.t
+        );
+
+        // ② 答 y：只把这一个加回来、墓碑清掉，而且不再联网取第二趟
+        let (s, n) = one_buried(&pp, url);
+        let before = n.log().len();
+        let r = run_menu(&s, &n, &pp, &["3", url, "", "y", "n", "0"], true);
+        let mut got = names(&s, &pp);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                "alice-hy2-direct".to_string(),
+                "alice-reality-direct".to_string()
+            ],
+            "{}",
+            r.t
+        );
+        assert!(
+            Profiles::load(&s, &pp).unwrap().deleted.is_empty(),
+            "加回来了就清墓碑：{}",
+            r.t
+        );
+        assert_eq!(
+            n.log().len() - before,
+            1,
+            "第二趟拿的是同一批节点，不再联网：{:?}",
+            n.log()
+        );
+        assert!(
+            r.t.lines().any(|l| l == "  上次：导入 1 个新节点，共 2 个"),
+            "{}",
+            r.t
+        );
+    }
+
+    /// 命令行不提问：打一行说跳了哪几个、怎么加回来；`--with-deleted` 照常导入并清墓碑。
+    #[test]
+    fn cli_import_prints_the_skipped_nodes_and_with_deleted_restores_them() {
+        let pp = paths();
+        let url = "https://panel.example.com/api/nodes/alice";
+        let args = [
+            "import",
+            "--panel",
+            "https://panel.example.com",
+            "--user",
+            "alice",
+        ];
+
+        // ① 默认：跳过并说清楚，一句提问都没有
+        let (s, n) = one_buried(&pp, url);
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&args), &mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert!(
+            t.lines().any(
+                |l| l == "跳过 1 个删过的节点：alice-reality-direct（要加回用 --with-deleted）"
+            ),
+            "{t}"
+        );
+        assert!(p.asked.is_empty(), "命令行不提问：{:?}", p.asked);
+        assert_eq!(names(&s, &pp), vec!["alice-hy2-direct".to_string()], "{t}");
+
+        // ② --with-deleted：照常导入并清墓碑
+        let (s, n) = one_buried(&pp, url);
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        let mut with = args.to_vec();
+        with.push("--with-deleted");
+        dispatch(&parse(&with), &mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert!(!t.contains("跳过 1 个删过的节点"), "{t}");
+        let mut got = names(&s, &pp);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                "alice-hy2-direct".to_string(),
+                "alice-reality-direct".to_string()
+            ],
+            "{t}"
+        );
+        assert!(Profiles::load(&s, &pp).unwrap().deleted.is_empty(), "{t}");
+    }
+
+    /// 单独粘贴**一条**节点链接就是明确要它：直接加回并清墓碑，不问（spec §5.7 表第 2 行）。
+    #[test]
+    fn pasting_a_single_uri_restores_a_buried_node() {
+        let pp = paths();
+        let (s, n) = one_buried(&pp, "https://panel.example.com/api/nodes/alice");
+        // BOB_REALITY 与被删的那个是同一个账号位（同 uuid、同 host、同 kind）
+        let r = run_menu(&s, &n, &pp, &["3", BOB_REALITY, "", "n", "0"], true);
+        assert!(
+            !r.asked.iter().any(|q| q == menu::BURIED_ASK),
+            "粘一条不问：{:?}",
+            r.asked
+        );
+        assert!(
+            r.t.lines().any(|l| l.trim() == menu::BURIED_RESTORED),
+            "{}",
+            r.t
+        );
+        assert_eq!(names(&s, &pp).len(), 2, "{}", r.t);
+        assert!(
+            Profiles::load(&s, &pp).unwrap().deleted.is_empty(),
+            "加回来了就清墓碑：{}",
+            r.t
+        );
+        assert!(!n.log().iter().any(|l| l.contains("api/nodes")), "没联网");
+    }
+
+    /// 迁移过、又删掉一个节点的机器：v3 目录按约定留着（回滚素材），`[7]` 随时会被再按一次。
+    /// 返回 `(FakeSys, FakeNet, 被删节点名)`。
+    fn v3_with_one_buried(pp: &Paths) -> (FakeSys, FakeNet, String) {
+        let s = FakeSys::new();
+        ready(&s);
+        s.put(
+            "/opt/hysteria-client/configs/hysteria2-1/uri.txt",
+            "hysteria2://alice:hy2-pw@panel.example.com:10000/?sni=panel.example.com#alice-HY2%E7%9B%B4%E8%BF%9E",
+        );
+        s.put(
+            "/opt/hysteria-client/configs/HY2/uri.txt",
+            "hysteria2://alice:hy2-pw@panel.example.com:40000/?sni=panel.example.com#alice-HY2%E4%BD%8F%E5%AE%85",
+        );
+        let n = FakeNet::new();
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, pp, &mut p, false, false);
+        dispatch(&parse(&["import-v3"]), &mut ctx).unwrap();
+        let mut got = names(&s, pp);
+        got.sort();
+        assert_eq!(got, vec!["HY2".to_string(), "hysteria2-1".to_string()]);
+        // 删掉非活动的那个（Passive：不动数据面）
+        let prof = Profiles::load(&s, pp).unwrap();
+        let target = if prof.active.as_deref() == Some("HY2") {
+            "hysteria2-1"
+        } else {
+            "HY2"
+        };
+        let seen = delete::snapshot(&prof);
+        let (r, t) = del(&s, &n, pp, &[target], None, &seen);
+        r.expect(&t);
+        assert_eq!(Profiles::load(&s, pp).unwrap().deleted.len(), 1, "{t}");
+        (s, n, target.to_string())
+    }
+
+    /// `[7]` 从 v3 导入也认墓碑：默认跳过、菜单问一句，命令行 `--with-deleted` 照常导入。
+    #[test]
+    fn import_v3_honors_tombstones_unless_with_deleted() {
+        let pp = paths();
+
+        // ① 命令行默认：不导回来，打一行说怎么加回
+        let (s, n, target) = v3_with_one_buried(&pp);
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["import-v3"]), &mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert_eq!(names(&s, &pp).len(), 1, "{t}");
+        assert!(
+            t.lines()
+                .any(|l| l == format!("跳过 1 个删过的节点：{target}（要加回用 --with-deleted）")),
+            "{t}"
+        );
+        assert!(p.asked.is_empty(), "命令行不提问：{:?}", p.asked);
+
+        // ② 命令行 --with-deleted：导回来，墓碑清掉
+        let (s, n, _) = v3_with_one_buried(&pp);
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["import-v3", "--with-deleted"]), &mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert_eq!(names(&s, &pp).len(), 2, "{t}");
+        assert!(Profiles::load(&s, &pp).unwrap().deleted.is_empty(), "{t}");
+
+        // ③ 菜单 [7]：问一句，答 y 才加回来
+        let (s, n, target) = v3_with_one_buried(&pp);
+        let r = run_menu(&s, &n, &pp, &["7", "y", "", "0"], true);
+        assert!(
+            r.asked.iter().any(|q| q == menu::BURIED_ASK),
+            "{:?}",
+            r.asked
+        );
+        assert!(
+            r.t.lines()
+                .any(|l| l.trim() == format!("这次导入里有 1 个你删过的节点：{target}")),
+            "{}",
+            r.t
+        );
+        assert!(
+            !r.t.contains("--with-deleted"),
+            "菜单里不提命令行开关：{}",
+            r.t
+        );
+        assert_eq!(names(&s, &pp).len(), 2, "{}", r.t);
+        assert!(
+            Profiles::load(&s, &pp).unwrap().deleted.is_empty(),
+            "{}",
+            r.t
+        );
+
+        // ④ 菜单 [7] 答 n：不加回来
+        let (s, n, _) = v3_with_one_buried(&pp);
+        let r = run_menu(&s, &n, &pp, &["7", "n", "0"], true);
+        assert_eq!(names(&s, &pp).len(), 1, "{}", r.t);
+        assert_eq!(Profiles::load(&s, &pp).unwrap().deleted.len(), 1, "{}", r.t);
+    }
+
+    /// 审查第 2 条：附加行算不算、摘要取哪一句，都由打印方标出来，不在 [`outcome_since`] 里
+    /// 按文案前缀猜——「当前节点：」这五个字本身不再有特权。
+    #[test]
+    fn outcome_since_counts_lines_by_mark_not_by_wording() {
+        let pp = paths();
+        let s = FakeSys::new();
+        let n = FakeNet::new();
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+
+        // ① 普通 say 打的「当前节点：X」照样算一行：两行 → 停
+        let a = ctx.transcript.len();
+        ctx.say(format!("{CURRENT_NODE_HEAD}alice-hy2-direct"));
+        ctx.say("另一行");
+        assert_eq!(
+            outcome_since(&ctx, a),
+            Outcome::Pause("当前节点：alice-hy2-direct".to_string())
+        );
+
+        // ② say_aside 标过的不算行：只剩一行 → 不停
+        let b = ctx.transcript.len();
+        ctx.say_aside(format!("{CURRENT_NODE_HEAD}alice-hy2-direct"));
+        ctx.say("另一行");
+        assert_eq!(outcome_since(&ctx, b), Outcome::Note("另一行".to_string()));
+
+        // ③ say_result 标过的当摘要，哪怕它不是第一行
+        let c = ctx.transcript.len();
+        ctx.say("先打的附加提示");
+        ctx.say_result("导入 2 个新节点，共 5 个");
+        assert_eq!(
+            outcome_since(&ctx, c),
+            Outcome::Pause("导入 2 个新节点，共 5 个".to_string())
+        );
+
+        // ④ 标了不止一句结果就以最后一句为准；只剩它一行时不停
+        let d = ctx.transcript.len();
+        ctx.say_result("第一趟的结果");
+        ctx.say_aside(format!("{CURRENT_NODE_HEAD}x"));
+        assert_eq!(
+            outcome_since(&ctx, d),
+            Outcome::Note("第一趟的结果".to_string())
+        );
+        ctx.say_result("第二趟的结果");
+        assert_eq!(
+            outcome_since(&ctx, d),
+            Outcome::Pause("第二趟的结果".to_string())
+        );
+
+        // ⑤ 「失败：」仍然最优先，哪怕标过结果行
+        let e = ctx.transcript.len();
+        ctx.say_result("导入 1 个新节点，共 6 个");
+        ctx.say("失败：切换没做成");
+        assert_eq!(
+            outcome_since(&ctx, e),
+            Outcome::Pause("失败：切换没做成".to_string())
+        );
+
+        // ⑥ 上一次动作标过的结果行不许漏进这一次
+        let f = ctx.transcript.len();
+        ctx.say("这一次只打了这一行");
+        assert_eq!(
+            outcome_since(&ctx, f),
+            Outcome::Note("这一次只打了这一行".to_string())
         );
     }
 }

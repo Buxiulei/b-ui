@@ -22,6 +22,20 @@ pub fn hy2_direct_node() -> Node {
     }
 }
 
+/// 同一台服务器上的**另一个**账号（家人账号）：与 [`hy2_direct_node`] 同形状，
+/// 只换 username 与密码。墓碑的账号指纹要把它与 `alice` 分开。
+pub fn hy2_account_node(username: &str) -> Node {
+    Node {
+        transport: Transport::Hysteria2 {
+            username: username.into(),
+            password: format!("{username}-pw"),
+            sni: "panel.example.com".into(),
+            obfs_password: None,
+        },
+        ..hy2_direct_node()
+    }
+}
+
 pub fn hy2_resi_node() -> Node {
     Node {
         kind: NodeKind::Hy2Residential,

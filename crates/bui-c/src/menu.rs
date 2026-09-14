@@ -508,6 +508,59 @@ pub fn fit_name_in_last(summary: &str, name: &str, width: usize) -> String {
 /// 菜单里节点列表为空时的引导：[1] 的列表页与回主菜单后的「上次：」行共用。
 pub const NO_NODES: &str = "没有节点，先用 [3] 导入节点";
 
+// ───────────── 墓碑（spec §5.7）：导入时被挡下的节点怎么说 ─────────────
+
+/// 墓碑那一句里最多列几个名字（spec §5.7）：多出来的写成「等 N 个」。
+pub const BURIED_LIST_MAX: usize = 3;
+
+/// 被墓碑挡下的节点名列成一串：`a、b、c`；多于 [`BURIED_LIST_MAX`] 个时
+/// `a、b、c 等 N 个`。名字先过 [`sanitize`]，不截断——折行交给调用方（菜单经
+/// [`wrap`]，命令行交给终端）。
+pub fn buried_list(names: &[String]) -> String {
+    let head: Vec<String> = names
+        .iter()
+        .take(BURIED_LIST_MAX)
+        .map(|n| sanitize(n).into_owned())
+        .collect();
+    let listed = head.join("、");
+    if names.len() > BURIED_LIST_MAX {
+        format!("{listed} 等 {} 个", names.len())
+    } else {
+        listed
+    }
+}
+
+/// 导入之后、墓碑那一问上面的那一句（spec §5.7）：
+/// `这次导入里有 N 个你删过的节点：a、b`。
+///
+/// 名字与问句分两行：连在一句里问，`  ▸ `、冒号与 `[y/N]` 加起来在 60 列只剩两列给名字，
+/// 名字就永远露不出来了。这一句按当前宽度折行打，紧接着问 [`BURIED_ASK`]。
+pub fn buried_head(names: &[String]) -> String {
+    format!(
+        "这次导入里有 {} 个你删过的节点：{}",
+        names.len(),
+        buried_list(names)
+    )
+}
+
+/// 紧跟 [`buried_head`] 的那一问（spec §5.7；`[y/N]` 由 `Prompt::confirm` 自己补）。
+/// 菜单在**放锁之后**问它（spec §0.2 R11），答 y 才另拿一次锁把这几个导回来。
+pub const BURIED_ASK: &str = "要加回来吗？";
+
+/// 命令行 `bui-c import` / `bui-c import-v3` 跳过墓碑时打的那一行（spec §5.7）：命令行不提问，
+/// 说清跳了几个、是哪几个、怎么加回来。由终端自己折行，不截断。
+pub fn buried_skipped(names: &[String]) -> String {
+    format!(
+        "跳过 {} 个删过的节点：{}（要加回用 --with-deleted）",
+        names.len(),
+        buried_list(names)
+    )
+}
+
+/// 单独粘贴**一条**节点链接、而它之前被删过时的结果行（spec §5.7 表第 2 行）：
+/// 粘一条就是明确要它，直接加回并清掉墓碑，不再问。
+pub const BURIED_RESTORED: &str = "它之前被删过，已恢复";
+
 /// 输错时回显的那一行，不含缩进（调用方经 `say` 在菜单里加两列）：`{head}{输入}{tail}`。
 /// 回显的输入先净化（方向键是 `ESC [ A`，不能原样写回终端、写进 transcript），再尾截，
 /// 整行按容量口径不超过行宽上限——误把一整条链接贴进来也只占一行。
@@ -2523,9 +2576,68 @@ mod tests {
         for k in [0, 3, 8] {
             out.push(("delete-switch-to", render_switch_to(&del, k, width)));
         }
+        // T7b：墓碑。菜单把名字那一句经 `delete::page` 折行打出来，再问 BURIED_ASK；
+        // 命令行打 buried_skipped（终端自己折行，收进这张表只为守住字符归类与「折得开」）
+        let buried: Vec<String> = prof.profiles.iter().map(|p| p.name.clone()).collect();
+        for n in [1usize, 2, 3, 4, 9] {
+            let names = &buried[..n];
+            out.push(("buried-head", delete::page(&[buried_head(names)], width)));
+            out.push((
+                "buried-skipped",
+                delete::page(&[buried_skipped(names)], width),
+            ));
+        }
+        for line in [BURIED_ASK.to_string(), BURIED_RESTORED.to_string()] {
+            out.push(("buried-line", delete::page(&[line], width)));
+        }
         // T11：连接检查报告的整屏（真跑一遍 nettest::run，用逐行事件拼出来）与日志页
         out.extend(crate::nettest::sample::report_screens(width));
         out
+    }
+
+    /// 墓碑那几句（spec §5.7）：最多列 3 个名字、多的写成「等 N 个」；固定文案按容量口径
+    /// 都在 59 列以内，名字那一句交给折行，问句短到 40 列也不折。
+    #[test]
+    fn the_buried_lines_list_at_most_three_names() {
+        let n: Vec<String> = ["a", "b", "c", "d", "e"]
+            .iter()
+            .map(|x| x.to_string())
+            .collect();
+        assert_eq!(buried_list(&n[..1]), "a");
+        assert_eq!(buried_list(&n[..3]), "a、b、c");
+        assert_eq!(buried_list(&n[..4]), "a、b、c 等 4 个");
+        assert_eq!(buried_list(&n), "a、b、c 等 5 个");
+        assert_eq!(buried_head(&n[..2]), "这次导入里有 2 个你删过的节点：a、b");
+        assert_eq!(
+            buried_skipped(&n[..2]),
+            "跳过 2 个删过的节点：a、b（要加回用 --with-deleted）"
+        );
+        // 名字先净化：方向键、颜色码里的 ESC 不能原样写回终端
+        assert_eq!(
+            buried_list(&["\u{1b}[A".to_string()]),
+            "?[A",
+            "外来名字先过 sanitize"
+        );
+        // 固定文案（不含名字）≤ 59 列
+        for fixed in [
+            BURIED_ASK.to_string(),
+            BURIED_RESTORED.to_string(),
+            buried_head(&[]),
+            buried_skipped(&[]),
+        ] {
+            assert!(
+                budget_width(&fixed) <= 59,
+                "{}：{fixed}",
+                budget_width(&fixed)
+            );
+        }
+        // 问句连 `  ▸ `、冒号与 `[y/N]` 在 40 列里也放得下：不折、不截
+        let asked = prompt_text(&format!("{BURIED_ASK} [y/N]"));
+        assert!(
+            budget_width(&asked) <= line_limit(40),
+            "{}：{asked}",
+            budget_width(&asked)
+        );
     }
 
     #[test]
