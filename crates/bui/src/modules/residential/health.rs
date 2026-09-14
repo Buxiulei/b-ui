@@ -84,9 +84,10 @@ pub fn probe_member(p: &dyn Prober, up: &Upstream) -> MemberProbe {
 /// **它本身没有上界**：网关连得上之后那段完整探测的超时是各请求自己的
 /// （`timed_get` 吃 [`super::LATENCY_PROBE_TIMEOUT_SECS`] = 8 秒 —— **不是**调用方
 /// `Prober` 的那个超时；`get` 与 407 补判的 CONNECT 各吃 `Prober` 的超时，`ReqwestProber::dial`
-/// 还按解析出的地址逐个串行各等一次），叠起来远超预案的延迟预算。**哨兵一侧一律经
-/// [`probe_quick_within`] 调它**，别直接调。
-pub fn probe_quick(p: &dyn Prober, up: &Upstream, tcp_within: Duration) -> MemberProbe {
+/// 还按解析出的地址逐个串行各等一次），叠起来远超预案的延迟预算。所以它**私有**：唯一的出口是
+/// [`probe_quick_within`]（带预算、结论三值），这个不变式交给编译器而不是注释 —— 上一轮的教训
+/// 正是「注释挡不住后来人按旧口径算预算」（2026-09-14 审查第 5 条）。
+fn probe_quick(p: &dyn Prober, up: &Upstream, tcp_within: Duration) -> MemberProbe {
     let Some(tcp_ms) = p.gateway_tcp_within(up, tcp_within) else {
         return MemberProbe::default();
     };
@@ -95,7 +96,7 @@ pub fn probe_quick(p: &dyn Prober, up: &Upstream, tcp_within: Duration) -> Membe
     probe
 }
 
-/// 一次带预算的快探（[`probe_quick_within`]）的**整体**时限：整个 [`probe_quick`] 被
+/// 一次带预算的快探（[`probe_quick_within`]）的**整体**时限：整个 `probe_quick` 被
 /// `tokio::time::timeout` 包住，超时即结论「未确认」（不是「不可用」）。
 ///
 /// **为什么非得有这个上界**：`probe_quick` 只在网关 TCP 连不上时才是「≤ `tcp_within` 返回」；
@@ -148,7 +149,8 @@ pub enum Verdict {
     Unconfirmed,
 }
 
-/// [`probe_quick`] 加 [`QUICK_PROBE_BUDGET_SECS`] 的整体预算，结论三值（[`Verdict`]）。
+/// 私有的 `probe_quick` 加 [`QUICK_PROBE_BUDGET_SECS`] 的整体预算，结论三值（[`Verdict`]）。
+/// **哨兵两侧都只能经这里**（`probe_quick` 不对外）。
 ///
 /// 哨兵判「原上游坏了」（`sentinel::resi::on_upstream_error`）与借用后验证刚切过去那条
 /// （`slots::borrow_now`）**共用这一份**：同一个探测、同一个上界、同一套三值口径。**观测**

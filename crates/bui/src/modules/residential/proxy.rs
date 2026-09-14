@@ -840,7 +840,7 @@ impl FakeProber {
     }
 
     /// 让这些 `"<host>:<port>"` 的网关连得通、经它的 [`super::LATENCY_PROBE_URL`] 回 204
-    /// （= [`super::health::probe_quick`] 判 `ok`）；没列到的上游仍走缺省「网关连不上」。
+    /// （= `super::health` 的带外快探判 `ok`）；没列到的上游仍走缺省「网关连不上」。
     /// 哨兵借用后按上游逐条验证，一次调用里要对不同上游给出不同结论
     pub fn with_gateways_up(&self, endpoints: &[&str]) -> &Self {
         self.with(|i| {
