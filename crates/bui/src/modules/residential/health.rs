@@ -158,12 +158,19 @@ pub enum Verdict {
 ///
 /// `Prober` 是同步的（`reqwest::blocking`），照例进 `spawn_blocking`；超时后那个任务会自己
 /// 跑完（`reqwest::blocking` 没有取消点），结果丢弃，不阻塞调用方。
+///
+/// 探测任务本身异常（`JoinError`：探测器 panic / runtime 正在关）也并进 [`Verdict::Unconfirmed`]
+/// —— 结论一样是「不知道」。但**原因必须落日志**：调用方的事件文案只说「网关通但隧道无响应，
+/// 或探测任务异常」，探测器 panic 会每 60 秒（`sentinel::DEBOUNCE_SECS`）静静复发一次，
+/// 日志里不留原因就无从下手（2026-09-14 审查第 4 条）。
 pub async fn probe_quick_within(
     prober: &Arc<dyn Prober>,
     up: Upstream,
     tcp_within: Duration,
 ) -> Verdict {
     let p = prober.clone();
+    // 日志里指称这条上游只用 `host:port`（同 `sentinel::resi::subject_of`），绝不带凭据
+    let subject = format!("{}:{}", up.host, up.port);
     let probe = tokio::task::spawn_blocking(move || probe_quick(p.as_ref(), &up, tcp_within));
     let budget = Duration::from_secs(QUICK_PROBE_BUDGET_SECS);
     match tokio::time::timeout(budget, probe).await {
@@ -171,7 +178,11 @@ pub async fn probe_quick_within(
         Ok(Ok(probe)) => Verdict::Dead {
             auth_failed: probe.auth_failed,
         },
-        Ok(Err(_)) | Err(_) => Verdict::Unconfirmed,
+        Ok(Err(e)) => {
+            tracing::warn!(upstream = %subject, error = %e, "带外快探的探测任务异常，结论按「未确认」");
+            Verdict::Unconfirmed
+        }
+        Err(_) => Verdict::Unconfirmed,
     }
 }
 
