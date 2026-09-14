@@ -405,7 +405,7 @@ fn route_rules(node: &Node, opts: &ClientOpts, tun: bool) -> Vec<Value> {
 mod tests {
     use super::*;
 
-    /// 出站分支最全的示例节点：HY2 带端口跳跃与 obfs。
+    /// 出站分支最全的示例节点：HY2 带端口跳跃与 obfs。与 golden `tun_hy2_obfs_v6` 场景同值。
     fn hy2_node() -> Node {
         Node {
             kind: NodeKind::Hy2Direct,
@@ -422,12 +422,13 @@ mod tests {
         }
     }
 
+    /// 与 `tests/kernel_client.rs` 的 `reality_direct_node()`（golden `mixed_reality` 场景）同值。
     fn reality_node() -> Node {
         Node {
-            kind: NodeKind::RealityResidential,
-            label: "Reality住宅".into(),
+            kind: NodeKind::RealityDirect,
+            label: "Reality直连".into(),
             host: "panel.example.com".into(),
-            port: 10002,
+            port: 10001,
             hop: None,
             transport: Transport::Reality {
                 uuid: "11111111-1111-4111-8111-111111111111".parse().unwrap(),
@@ -439,6 +440,9 @@ mod tests {
             },
         }
     }
+
+    /// golden 常量所在的文件；keywords.rs 读 tests/fixtures 用的是同一种做法。
+    const KERNEL_CLIENT_SRC: &str = include_str!("../../tests/kernel_client.rs");
 
     fn opts(mode: ClientMode) -> ClientOpts {
         ClientOpts {
@@ -474,6 +478,7 @@ mod tests {
     /// 期望值只从主配置取，不经私有 `outbound`：两边都调它只能证明调用了同一个函数，证明不了
     /// 渲染出来的内容（`outbound` 忽略 tag、恒写 `proxy-out` 的变异体下，旧写法照样全绿）。
     /// 主配置出站的字节由 `tests/kernel_client.rs` 的 golden 钉住，这里把测速出站挂到它上面。
+    /// 挂是逐字节的：两个 fixture 与 golden 场景同值，主配置出站的序列化必须原样出现在 golden 常量里。
     #[test]
     fn probe_and_main_outbounds_come_from_one_renderer() {
         let nodes = [hy2_node(), reality_node()];
@@ -489,6 +494,13 @@ mod tests {
                 ("mixed", mixed_config(n, &opts(ClientMode::Mixed))),
             ];
             for (mode, main) in mains {
+                // fixture 与 golden 差一个字段，上面那句「挂到 golden 上」就退化成只是同一段渲染分支
+                let bytes = serde_json::to_string(&main["outbounds"][0]).unwrap();
+                assert!(
+                    KERNEL_CLIENT_SRC.contains(&bytes),
+                    "{mode} {} 的主配置出站不在 golden 常量里：{bytes}",
+                    n.label
+                );
                 let mut expected = main["outbounds"][0].clone();
                 assert_eq!(expected["tag"], "proxy-out", "{mode} {}", n.label);
                 expected["tag"] = json!(probe_tag);
