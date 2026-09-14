@@ -39,11 +39,16 @@ pub struct Runtime {
     pub last_update_attempt_at: Option<i64>,
     /// 已加过 bui-tun 放行规则（T12 写，本模块只读写字段）。
     pub ufw_rules: bool,
-    /// 上一次检查更新的结论：manifest 版本与本机不同。主菜单 `[7] 更新与维护 ★` 读它，
-    /// 不为了渲染一屏菜单去联网。由 `update` 子命令与巡检里的自更新写。
+    /// 上一次检查更新的结论：有能装的新东西（`cli::new_version_pending`：自身有新版或同版本新构建，
+    /// 或内核要换）。主菜单 `[7] 更新与维护 ★` 读它，不为了渲染一屏菜单去联网。由 `update` 子命令、
+    /// 菜单 [7] → [1] 与巡检里的自更新写。
     pub update_available: bool,
     /// 上一次检查更新的时间（epoch 秒），与 `update_available` 同时写。
     pub update_checked_at: Option<i64>,
+    /// 上一次检查更新时 manifest 的版本号，与 `update_available` 同时写；[7] 子页的
+    /// 「上次检查   有新版 4.0.1（2 小时前）」读它（spec §8.1）。旧版本写的文件没有这个键。
+    #[serde(default)]
+    pub update_version: Option<String>,
 }
 
 impl Runtime {

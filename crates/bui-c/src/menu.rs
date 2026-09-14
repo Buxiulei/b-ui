@@ -3,6 +3,7 @@
 //! 渲染输出不含 ANSI 颜色：颜色会让快照测试变脆，可读性靠对齐与 `●`/`○`/`★` 够用。
 
 use crate::profiles::{kind_slug, Mode, Profiles};
+use crate::update::{Report, SelfReason};
 use crate::{Error, Result};
 use std::borrow::Cow;
 use std::collections::VecDeque;
@@ -261,7 +262,7 @@ pub enum MaintAction {
 pub struct MaintStatus {
     /// 本机 bui-c 的版本。
     pub version: String,
-    /// 「上次检查」那一行的内容：`有新版（2 小时前）`、`已是最新（…）`、`还没检查过`。
+    /// 「上次检查」那一行的内容：`有新版 4.0.1（2 小时前）`、`已是最新（…）`、`还没检查过`。
     pub update_line: String,
     /// `profiles.auto_update`。
     pub auto_update: bool,
@@ -302,8 +303,8 @@ pub fn ago(secs: i64) -> String {
 
 /// `[7] 更新与维护` 子页（spec §3e-60-5、§8.4）：样式与 [4] 服务控制一致——前空一行、两列缩进的
 /// 标题、5 列缩进的内容。顶部三行是本地事实，下面三个动作与返回；「上次检查」那一行放不下就尾截
-/// （T10 会写成带版本号、来源的长句），编号与动作名都是固定短文案，40 列放得下。提示符
-/// `选择 [0-3]` 由调用方问。
+/// （有新版时带 manifest 的版本号，rc 预发布的可以很长），编号与动作名都是固定短文案，40 列放得下。
+/// 提示符 `选择 [0-3]` 由调用方问。
 pub fn render_maint(m: &MaintStatus, width: usize) -> String {
     const FACT: &str = "     ";
     let fact = |head: &str, value: &str| {
@@ -341,6 +342,164 @@ pub fn parse_maint_choice(input: &str) -> Option<MaintAction> {
 /// `[7]` 子页输错：`无效选项：{x}（请输入 0-3 的数字）`，回显先净化再截到行宽。
 pub fn invalid_maint_choice(input: &str, width: usize) -> String {
     bad_input_line("无效选项：", input, "（请输入 0-3 的数字）", width)
+}
+
+// ───────────── [7] → [1] 检查更新：先显示版本，再确认（spec §8.1、§0.2 R4） ─────────────
+
+/// 联网之前先打的一行（打完 flush，两个源最坏各 15 秒）。容量口径 44 列。
+pub const UPDATE_CHECKING: &str = "正在检查更新（面板 → GitHub，最多 30 秒）…";
+/// 换了自身之后：跑着的还是旧二进制，新菜单要重新打开才是新版。容量口径 20 列。
+pub const UPDATE_NEXT_OPEN: &str = "新版菜单下次打开生效";
+
+/// 查到之后怎么跟人说（spec §8.1 第 4、5 步）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateOffer {
+    /// 没有要换的：一行 Note。
+    Current(String),
+    /// 有话要说、但没有能装的（manifest 缺本机架构的 bui-c，内核也不用换）：打出来，停下，不问。
+    Blocked(String),
+    /// 先逐行打 `lines`（为什么要换、会替换什么），再问 `question`（`[y/N]` 由提示补），
+    /// 答否用 `declined` 当一行 Note。
+    Ask {
+        lines: Vec<String>,
+        question: String,
+        declined: String,
+    },
+}
+
+/// manifest 缺本机架构的 bui-c 时的那句话（菜单与命令行 `bui-c update` 的报错共用）。结论写在前头：
+/// 它会进「上次：」行，40 列尾截之后「没法更新 bui-c」还在。容量口径 53 列（arm64）。
+pub fn update_missing_asset(arch: &str) -> String {
+    format!("这次没法更新 bui-c：manifest 里没有 bui-c-linux-{arch}")
+}
+
+/// 这次检查换得了自身吗：[`SelfReason::MissingAsset`] 换不了，[`SelfReason::Current`] 不用换。
+fn replaces_self(reason: SelfReason) -> bool {
+    matches!(
+        reason,
+        SelfReason::NewVersion | SelfReason::Rebuild | SelfReason::Unreadable
+    )
+}
+
+/// 本机内核版本那半句：读得到写 `本机 1.13.19`，没装或跑不通写 `本机读不到`。
+fn kernel_local(r: &Report) -> String {
+    match &r.kernel_local {
+        Some(v) => format!("本机 {}", sanitize(v)),
+        None => "本机读不到".to_string(),
+    }
+}
+
+/// `check_only` 的 [`Report`] → 菜单怎么说（spec §8.1 第 4、5 步）。`local` 是本机版本，`arch` 是
+/// 本机架构，`restart` = 主单元文件在（换内核会重启代理；新机器没有单元，换了也不重启）。
+///
+/// 版本号、来源、内核版本来自网络，一律先 [`sanitize`]。说明行不折行，由调用方按宽度折。
+pub fn update_offer(r: &Report, local: &str, arch: &str, restart: bool) -> UpdateOffer {
+    let x = sanitize(&r.manifest_version);
+    let src = sanitize(&r.manifest_source);
+    let k = sanitize(&r.kernel_wanted);
+    let own = replaces_self(r.self_reason);
+    if !own && !r.kernel_outdated {
+        return match r.self_reason {
+            SelfReason::MissingAsset => UpdateOffer::Blocked(update_missing_asset(arch)),
+            _ => UpdateOffer::Current(format!("已是最新（{x}，来源 {src}）")),
+        };
+    }
+    let mut lines = Vec::new();
+    match r.self_reason {
+        SelfReason::NewVersion => {
+            lines.push(format!("最新 {x}（来源 {src}），本机 {}", sanitize(local)))
+        }
+        SelfReason::Rebuild => {
+            lines.push(format!("有新构建：版本同为 {x}，但文件不同（重新打包过）"))
+        }
+        SelfReason::Unreadable => {
+            lines.push(format!("读不到本机的 bui-c 二进制，更新会重新装一份 {x}"))
+        }
+        SelfReason::MissingAsset => lines.push(update_missing_asset(arch)),
+        SelfReason::Current => {}
+    }
+    // 自身要换时第一行已经说了版本，内核跟着换只在「会替换」那一行带上；只换内核才单说一行
+    if r.kernel_outdated && !own {
+        lines.push(format!("sing-box 内核有新版 {k}（{}）", kernel_local(r)));
+    }
+    let what = match (own, r.kernel_outdated) {
+        (true, true) => "bui-c 与 sing-box",
+        (true, false) => "bui-c",
+        _ => "sing-box",
+    };
+    let tail = if r.kernel_outdated && restart {
+        "，代理重启几秒"
+    } else {
+        ""
+    };
+    lines.push(format!("更新会替换 {what}{tail}"));
+    // 提问连 `  ▸ ` 与 ` [y/N]：` 在 40 列一行放下：只换内核时不再重复「sing-box」（上一行刚说过）
+    let (question, declined) = if own {
+        (format!("现在更新到 {x}？"), format!("没有更新（最新 {x}）"))
+    } else {
+        (
+            format!("现在更新内核到 {k}？"),
+            format!("没有更新（sing-box 最新 {k}）"),
+        )
+    };
+    UpdateOffer::Ask {
+        lines,
+        question,
+        declined,
+    }
+}
+
+/// 装完的结果（spec §3e-60-5）：第一行说换了什么、重没重启（进「上次：」行），换了自身再加一句
+/// [`UPDATE_NEXT_OPEN`]。什么都没换（确认之前 manifest 又变了）如实说。
+pub fn update_done(r: &Report) -> Vec<String> {
+    let restarted = if r.restarted {
+        "，bui-c.service 已重启"
+    } else {
+        ""
+    };
+    let head = match (r.self_updated, r.kernel_updated) {
+        (true, true) => format!("已更新 bui-c 与 sing-box 内核{restarted}"),
+        (true, false) => format!("已更新 bui-c 到 {}", sanitize(&r.manifest_version)),
+        (false, true) => format!(
+            "已更新 sing-box 内核到 {}{restarted}",
+            sanitize(&r.kernel_wanted)
+        ),
+        (false, false) => format!("没有需要更新的（最新 {}）", sanitize(&r.manifest_version)),
+    };
+    let mut out = vec![head];
+    if r.self_updated {
+        out.push(UPDATE_NEXT_OPEN.to_string());
+    }
+    out
+}
+
+/// `bui-c update --check-only` 第一行 `manifest …（来源 …）` 之后的结论（spec §8.1 末条）：按
+/// [`SelfReason`] 分开说；要升级的给出命令，没法升级的不给。内核要换另起一行（只换内核时就只有它）。
+pub fn check_only_verdict(r: &Report, arch: &str) -> Vec<String> {
+    let k = sanitize(&r.kernel_wanted);
+    let mut out = Vec::new();
+    match r.self_reason {
+        SelfReason::Current if r.kernel_outdated => {}
+        SelfReason::Current => out.push("已是最新".to_string()),
+        SelfReason::NewVersion => out.push("有新版，跑 `bui-c update` 升级".to_string()),
+        SelfReason::Rebuild => {
+            out.push("有同版本的新构建（rc 通道重建），跑 `bui-c update` 升级".to_string())
+        }
+        SelfReason::Unreadable => {
+            out.push("读不到本机的 bui-c 二进制，跑 `bui-c update` 会重新装一份".to_string())
+        }
+        SelfReason::MissingAsset => out.push(format!(
+            "没法更新 bui-c：manifest 里没有 bui-c-linux-{arch}"
+        )),
+    }
+    if r.kernel_outdated {
+        out.push(if replaces_self(r.self_reason) {
+            format!("sing-box 内核也有新版 {k}（{}）", kernel_local(r))
+        } else {
+            format!("sing-box 内核有新版 {k}，跑 `bui-c update` 升级")
+        });
+    }
+    out
 }
 
 /// 歧义宽度字符：真机（tmux）里是 1 列，手机客户端上可能是 2 列（spec §2.2 容量口径）。
@@ -2329,6 +2488,188 @@ mod tests {
         assert!(bad.contains("0-3"), "{bad}");
     }
 
+    /// 检查更新的一份结论：来源与版本取最长的 rc 预发布写法；内核要换时本机是 1.13.19。
+    fn update_report(reason: SelfReason, kernel: bool) -> Report {
+        Report {
+            manifest_source: "GitHub 预发布 v4.0.1-rc12".into(),
+            manifest_version: "4.0.1-rc12".into(),
+            self_outdated: reason != SelfReason::Current,
+            self_reason: reason,
+            kernel_outdated: kernel,
+            kernel_wanted: "1.14.5".into(),
+            kernel_local: Some(if kernel { "1.13.19" } else { "1.14.5" }.into()),
+            ..Report::default()
+        }
+    }
+
+    /// [7] → [1] 查到之后怎么说（spec §8.1 第 4、5 步、§0.2 R4）：没东西可换是一行 Note；缺本机
+    /// 架构的 bui-c、内核也不用换，说清没法更新、不问；其余先说为什么、要替换什么，再问换到哪个版本。
+    /// 只换内核（含缺 bui-c 产物时）问的是内核。
+    #[test]
+    fn update_offer_only_asks_when_something_can_be_installed() {
+        use SelfReason::*;
+        match update_offer(&update_report(Current, false), "4.0.0", "arm64", true) {
+            UpdateOffer::Current(l) => assert!(l.contains("4.0.1-rc12"), "{l}"),
+            o => panic!("{o:?}"),
+        }
+        match update_offer(&update_report(MissingAsset, false), "4.0.0", "arm64", true) {
+            UpdateOffer::Blocked(l) => assert!(l.contains("bui-c-linux-arm64"), "{l}"),
+            o => panic!("{o:?}"),
+        }
+        for (reason, kernel, first, target) in [
+            (NewVersion, false, "本机 4.0.0", "4.0.1-rc12"),
+            (NewVersion, true, "本机 4.0.0", "4.0.1-rc12"),
+            (Rebuild, false, "有新构建", "4.0.1-rc12"),
+            (Unreadable, false, "读不到本机的 bui-c", "4.0.1-rc12"),
+            (Current, true, "1.13.19", "内核到 1.14.5"),
+            (MissingAsset, true, "bui-c-linux-arm64", "内核到 1.14.5"),
+        ] {
+            for unit in [true, false] {
+                let UpdateOffer::Ask {
+                    lines,
+                    question,
+                    declined,
+                } = update_offer(&update_report(reason, kernel), "4.0.0", "arm64", unit)
+                else {
+                    panic!("{reason:?} {kernel}");
+                };
+                assert!(lines[0].contains(first), "{reason:?}：{lines:?}");
+                assert!(question.contains(target), "{reason:?}：{question}");
+                let version = target.trim_start_matches("内核到 ");
+                assert!(declined.contains(version), "{reason:?}：{declined}");
+                // 最后一行说要替换什么：换自身才提 bui-c，换内核才提 sing-box；内核要换、
+                // 单元也在（有代理在跑）才说会重启
+                let replace = lines.last().unwrap();
+                let self_too = matches!(reason, NewVersion | Rebuild | Unreadable);
+                assert_eq!(replace.contains("bui-c"), self_too, "{replace}");
+                assert_eq!(replace.contains("sing-box"), kernel, "{replace}");
+                assert_eq!(replace.contains("重启"), kernel && unit, "{replace}");
+            }
+        }
+    }
+
+    /// 装完的结果行（spec §3e-60-5）：说换了什么、重没重启，换了自身再说一句新菜单下次打开生效；
+    /// 不是命令行的 `自身更新=true` 那种写法。
+    #[test]
+    fn update_done_says_what_was_replaced_in_plain_words() {
+        let done = |s: bool, k: bool, restarted: bool| {
+            update_done(&Report {
+                self_updated: s,
+                kernel_updated: k,
+                restarted,
+                ..update_report(SelfReason::NewVersion, k)
+            })
+        };
+        let both = done(true, true, true);
+        assert!(
+            both[0].contains("bui-c") && both[0].contains("sing-box") && both[0].contains("重启"),
+            "{both:?}"
+        );
+        assert!(both.iter().any(|l| l == UPDATE_NEXT_OPEN), "{both:?}");
+        let kernel = done(false, true, false);
+        assert!(
+            kernel[0].contains("sing-box") && !kernel[0].contains("重启"),
+            "{kernel:?}"
+        );
+        assert!(!kernel.iter().any(|l| l == UPDATE_NEXT_OPEN), "{kernel:?}");
+        let own = done(true, false, false);
+        assert!(own[0].contains("4.0.1-rc12"), "{own:?}");
+        for lines in [both, kernel, own, done(false, false, false)] {
+            assert!(!lines.is_empty());
+            for l in &lines {
+                assert!(!l.contains('=') && !l.starts_with("manifest"), "{l}");
+            }
+        }
+    }
+
+    /// 检查更新的固定文案按容量口径 ≤ 59 列（版本号取常见的 4.0.1、来源取「面板」）；
+    /// `--check-only` 的结论行同样口径。
+    #[test]
+    fn update_texts_fit_59_columns() {
+        use SelfReason::*;
+        let short = |reason, kernel| Report {
+            manifest_source: "面板".into(),
+            manifest_version: "4.0.1".into(),
+            ..update_report(reason, kernel)
+        };
+        let mut lines = vec![UPDATE_CHECKING.to_string(), UPDATE_NEXT_OPEN.to_string()];
+        for reason in [Current, NewVersion, Rebuild, Unreadable, MissingAsset] {
+            for kernel in [false, true] {
+                let r = short(reason, kernel);
+                match update_offer(&r, "4.0.0", "arm64", true) {
+                    UpdateOffer::Current(l) | UpdateOffer::Blocked(l) => lines.push(l),
+                    UpdateOffer::Ask {
+                        lines: ls,
+                        question,
+                        declined,
+                    } => {
+                        lines.extend(ls);
+                        lines.push(question);
+                        lines.push(declined);
+                    }
+                }
+                lines.extend(check_only_verdict(&r, "arm64"));
+                lines.extend(update_done(&Report {
+                    self_updated: true,
+                    kernel_updated: kernel,
+                    restarted: kernel,
+                    ..r
+                }));
+            }
+        }
+        for l in &lines {
+            assert!(budget_width(l) <= 59, "{l} = {}", budget_width(l));
+        }
+    }
+
+    /// 检查更新的几种结果进「上次：」行（spec §4.2）：40 列尾截之后，结论那半（换没换成、为什么没换）
+    /// 还认得出来。
+    #[test]
+    fn update_last_lines_keep_the_verdict_at_40_columns() {
+        use SelfReason::*;
+        let last = |text: &str| {
+            render(&st(), 40, Some(text))
+                .lines()
+                .find(|l| l.starts_with("  上次："))
+                .unwrap()
+                .to_string()
+        };
+        let offer = |reason, kernel| match update_offer(
+            &update_report(reason, kernel),
+            "4.0.0",
+            "arm64",
+            true,
+        ) {
+            UpdateOffer::Current(l) | UpdateOffer::Blocked(l) => l,
+            UpdateOffer::Ask { declined, .. } => declined,
+        };
+        let done = |s: bool, k: bool| {
+            update_done(&Report {
+                self_updated: s,
+                kernel_updated: k,
+                restarted: k,
+                ..update_report(NewVersion, k)
+            })[0]
+                .clone()
+        };
+        for (text, keep) in [
+            (offer(Current, false), "已是最新"),
+            (offer(MissingAsset, false), "没法更新 bui-c"),
+            (offer(NewVersion, false), "没有更新"),
+            (offer(Current, true), "没有更新"),
+            (done(true, true), "已更新 bui-c 与 sing-box"),
+            (done(true, false), "已更新 bui-c 到 4.0.1-rc12"),
+            (done(false, true), "已更新 sing-box 内核"),
+            (
+                "检查更新失败：manifest.json 所有来源都失败".to_string(),
+                "检查更新失败",
+            ),
+        ] {
+            let l = last(&text);
+            assert!(l.contains(keep), "{keep}：{l}");
+        }
+    }
+
     /// 「上次检查」后面的「多久以前」：只到分钟、小时、天，时钟往回拨算刚刚。
     #[test]
     fn ago_is_coarse_and_never_negative() {
@@ -2554,7 +2895,7 @@ mod tests {
                 Some(V3_SKIPPED),
             ),
         ));
-        // T9：[7] 更新与维护子页（开关两种、上次检查的几种说法，含 T10 会写成的带版本号的长句）、
+        // T9：[7] 更新与维护子页（开关两种、上次检查的几种说法，含带版本号的长句）、
         // 子页输错、旧键过渡提示、只活在「上次：」行里的几句挪了位置的引导
         for auto_update in [true, false] {
             for update_line in [
@@ -2578,6 +2919,48 @@ mod tests {
             out.push(("moved-last", render(&st(), width, Some(text))));
         }
         out.push(("no-units-v3", wrap(NO_UNITS_V3, 2, width)));
+        // T10：[7] → [1] 检查更新的整页——进度、各原因的说明与替换行、提问（`Stdin::confirm` 的样子）、
+        // 装完的结果——按页上的折法排，以及它们进「上次：」行的样子；版本号与来源取最长的 rc 预发布写法
+        let mut update_lines = vec![
+            UPDATE_CHECKING.to_string(),
+            "检查更新失败：manifest.json 所有来源都失败（最后一个错误：GitHub: HTTP 404）"
+                .to_string(),
+        ];
+        for reason in [
+            SelfReason::Current,
+            SelfReason::NewVersion,
+            SelfReason::Rebuild,
+            SelfReason::Unreadable,
+            SelfReason::MissingAsset,
+        ] {
+            for kernel in [false, true] {
+                let r = update_report(reason, kernel);
+                match update_offer(&r, "4.0.0-rc12", "arm64", kernel) {
+                    UpdateOffer::Current(l) | UpdateOffer::Blocked(l) => update_lines.push(l),
+                    UpdateOffer::Ask {
+                        lines,
+                        question,
+                        declined,
+                    } => {
+                        update_lines.extend(lines);
+                        out.push(("update-ask", format!("  ▸ {question} [y/N]：\n")));
+                        update_lines.push(declined);
+                    }
+                }
+                for restarted in [false, true] {
+                    update_lines.extend(update_done(&Report {
+                        self_updated: reason != SelfReason::MissingAsset,
+                        kernel_updated: kernel,
+                        restarted,
+                        ..r.clone()
+                    }));
+                }
+            }
+        }
+        for l in &update_lines {
+            out.push(("update-page", wrap(l, 2, width)));
+            out.push(("update-last", render(&st(), width, Some(l))));
+        }
         // T4：「上次：」行（名字单独中间截断的切换摘要、空列表引导、长的失败行）与主菜单输错
         // 那一行（回显的输入先净化再尾截；菜单里 `say` 加 2 列缩进）
         for p in &prof.profiles {

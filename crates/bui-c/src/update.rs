@@ -60,13 +60,39 @@ impl Manifest {
 pub struct Report {
     pub manifest_source: String,
     pub manifest_version: String,
-    /// manifest 里的 bui-c 与已装的不是同一份构建（[`self_build_differs`]）；`check_only` 也会填
+    /// manifest 里的 bui-c 与已装的不是同一份构建（[`self_build_differs`]）；`check_only` 也会填。
+    /// 恒等于 `self_reason != SelfReason::Current`
     pub self_outdated: bool,
     /// `/usr/local/bin/bui-c` 被替换
     pub self_updated: bool,
     /// `bin/sing-box` 被替换
     pub kernel_updated: bool,
     pub restarted: bool,
+    /// 自身为什么要换（或为什么换不了），[`build_differs`] 的结论；`check_only` 也会填
+    pub self_reason: SelfReason,
+    /// 本机内核不是 manifest 要的版本（含读不到版本）；`check_only` 也会填
+    pub kernel_outdated: bool,
+    /// manifest 要的客户端内核版本（`kernels.client_sing_box`）
+    pub kernel_wanted: String,
+    /// 本机 `bin/sing-box version` 报的版本；没装或跑不通是 `None`
+    pub kernel_local: Option<String>,
+}
+
+/// manifest 里的 bui-c 与本机的比出来是什么情况（spec §8.1）。菜单与 `--check-only` 按它分开说：
+/// 以前一个布尔把「读不到本机二进制」「manifest 缺本机架构」也说成「有同版本的新构建」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SelfReason {
+    /// 版本相同、sha256 也相同：就是 manifest 里那一份构建。
+    #[default]
+    Current,
+    /// 版本号不同。
+    NewVersion,
+    /// 版本号相同、sha256 不同：rc 通道的同版本重建。
+    Rebuild,
+    /// 版本号相同，但盘上的 bui-c 读不到：更新会重新装一份。
+    Unreadable,
+    /// manifest 里没有本机架构的 `bui-c-linux-<arch>`：没有可下载的，这次换不了自身。
+    MissingAsset,
 }
 
 pub fn arch_suffix() -> &'static str {
@@ -285,29 +311,44 @@ pub fn ensure_kernel<S: Sys, N: Net>(
     install_kernel(sys, net, paths, prof.panel.as_ref(), &m)
 }
 
-/// manifest 里的 bui-c 与盘上 `/usr/local/bin/bui-c` 是不是**两个不同的构建**（与服务端
-/// `kernels::bui_build_differs` 同一口径，2026-09-13 服务端裁决）。
+/// manifest 里的 bui-c 与盘上 `bin` 是不是**两个不同的构建**，是的话为什么（与服务端
+/// `kernels::bui_build_differs` 同一口径，2026-09-13 服务端裁决；版本、架构、路径都由参数给，
+/// 与服务端一样参数化）。
 ///
 /// 版本号不是充分判据：rc 通道下 `v4.0.0-rc1` / `rc2` / 正式版的 Cargo 版本号都是同一个
 /// `4.0.0`，只按版本号判断的话，已装的 rc6 / rc7 永远收不到同版本的新构建。所以版本相同时
 /// 再比一次 sha256：manifest 里 `bui-c-linux-<arch>` 的 vs 盘上二进制的（大小写不敏感）。
 ///
-/// 盘上二进制读不到按「要升级」处理——本来就该给它装一份；manifest 缺本机架构的资产同样按
-/// 要升级返回，真正的报错留给下载那一步（[`sources`] 会说清缺哪个产物）。
-pub fn self_build_differs<S: Sys>(sys: &S, m: &Manifest) -> bool {
-    if m.version != crate::VERSION {
-        return true;
-    }
-    let Ok(want) = m.artifact(&format!("bui-c-linux-{}", arch_suffix())) else {
-        return true;
+/// 先看 manifest 有没有本机架构的产物：没有就是 [`SelfReason::MissingAsset`]，版本号再新也换不了。
+/// 盘上二进制读不到是 [`SelfReason::Unreadable`]——本来就该给它装一份。
+pub fn build_differs<S: Sys>(
+    sys: &S,
+    m: &Manifest,
+    version: &str,
+    arch: &str,
+    bin: &Path,
+) -> SelfReason {
+    let Ok(want) = m.artifact(&format!("bui-c-linux-{arch}")) else {
+        return SelfReason::MissingAsset;
     };
-    match sys.read(Path::new(SELF_BIN)) {
-        Ok(bytes) => !sha256_hex(&bytes).eq_ignore_ascii_case(&want.sha256),
-        Err(_) => true,
+    if m.version != version {
+        return SelfReason::NewVersion;
+    }
+    match sys.read(bin) {
+        Ok(bytes) if sha256_hex(&bytes).eq_ignore_ascii_case(&want.sha256) => SelfReason::Current,
+        Ok(_) => SelfReason::Rebuild,
+        Err(_) => SelfReason::Unreadable,
     }
 }
 
-/// 自身按 [`self_build_differs`]（版本不同，或同版本不同构建）决定换不换；内核维持只按版本比对。
+/// [`build_differs`] 取本机版本、本机架构、`/usr/local/bin/bui-c`，不是 [`SelfReason::Current`]
+/// 就算要换。口径与 500c786 相同：读不到本机二进制、manifest 缺本机架构的资产都返回真。
+pub fn self_build_differs<S: Sys>(sys: &S, m: &Manifest) -> bool {
+    build_differs(sys, m, crate::VERSION, arch_suffix(), Path::new(SELF_BIN)) != SelfReason::Current
+}
+
+/// 自身按 [`build_differs`]（版本不同，或同版本不同构建，或读不到本机二进制）决定换不换；manifest
+/// 缺本机架构的 bui-c 时跳过自身、内核照换（spec §8.1）。内核维持只按版本比对。
 /// 版本不做 semver 排序：manifest 是唯一权威，降级也由主理人改 manifest 完成
 /// （`bui upgrade --rollback` 是服务端能力，见 C5）。
 pub fn run<S: Sys, N: Net>(
@@ -318,25 +359,39 @@ pub fn run<S: Sys, N: Net>(
     check_only: bool,
 ) -> Result<Report> {
     let (src, m) = fetch_manifest(net, prof.panel.as_ref())?;
+    let self_reason = build_differs(sys, &m, crate::VERSION, arch_suffix(), Path::new(SELF_BIN));
+    let kernel_local = kernel_version(sys, paths);
     let mut r = Report {
         manifest_source: src,
         manifest_version: m.version.clone(),
-        self_outdated: self_build_differs(sys, &m),
+        self_outdated: self_reason != SelfReason::Current,
+        self_reason,
+        kernel_outdated: kernel_local.as_deref() != Some(m.kernels.client_sing_box.as_str()),
+        kernel_wanted: m.kernels.client_sing_box.clone(),
+        kernel_local,
         ..Report::default()
     };
     if check_only {
         return Ok(r);
     }
 
-    if r.self_outdated {
-        let file = format!("bui-c-linux-{}", arch_suffix());
-        let srcs = sources(prof.panel.as_ref(), &m, &file)?;
-        let (_s, data) = fetch_verified(net, &srcs, &m.artifact(&file)?.sha256)?;
-        replace_self(sys, &data)?;
-        r.self_updated = true;
+    match r.self_reason {
+        SelfReason::Current => {}
+        // 没有可下载的：不在这里报错，内核照换。命令行 `bui-c update` 事后仍以失败退出（cli.rs）
+        SelfReason::MissingAsset => tracing::warn!(
+            file = %format!("bui-c-linux-{}", arch_suffix()),
+            "manifest 里没有本机架构的 bui-c，这次跳过 bui-c、只看内核"
+        ),
+        SelfReason::NewVersion | SelfReason::Rebuild | SelfReason::Unreadable => {
+            let file = format!("bui-c-linux-{}", arch_suffix());
+            let srcs = sources(prof.panel.as_ref(), &m, &file)?;
+            let (_s, data) = fetch_verified(net, &srcs, &m.artifact(&file)?.sha256)?;
+            replace_self(sys, &data)?;
+            r.self_updated = true;
+        }
     }
 
-    if kernel_version(sys, paths).as_deref() != Some(m.kernels.client_sing_box.as_str()) {
+    if r.kernel_outdated {
         install_kernel(sys, net, paths, prof.panel.as_ref(), &m)?;
         r.kernel_updated = true;
         // 新机器还没导入过节点，单元文件都没写：没有可重启的，第一次 apply 会把它拉起来
@@ -928,5 +983,144 @@ mod tests {
         assert!(r.self_outdated && !r.self_updated, "{r:?}");
         assert_eq!(s.get(SELF_BIN).unwrap(), "bui-c-rc6", "只检查不换");
         assert!(s.calls().is_empty(), "check_only 不该跑任何命令");
+    }
+
+    /// `self_build_differs` 的布尔扩成原因（spec §8.1，服务端跟进 a / b）：版本、架构、盘上路径都由
+    /// 参数给，arm64 与 amd64 同一套判定。manifest 缺本机架构的资产优先报 `MissingAsset`——
+    /// 说成「有新版」再问 y/N，下载那一步必然失败。
+    #[test]
+    fn build_differs_names_the_reason_and_covers_arm64() {
+        let s = FakeSys::new();
+        let bin = Path::new(SELF_BIN);
+        s.put(SELF_BIN, "BUI-C-rc6");
+        let m: Manifest = serde_json::from_str(&manifest_json(
+            "4.0.0",
+            &sha256_hex(b"BUI-C-rc7"),
+            &"b".repeat(64),
+        ))
+        .unwrap();
+        assert_eq!(
+            build_differs(&s, &m, "3.9.9", "amd64", bin),
+            SelfReason::NewVersion
+        );
+        assert_eq!(
+            build_differs(&s, &m, "4.0.0", "amd64", bin),
+            SelfReason::Rebuild
+        );
+        assert_eq!(
+            build_differs(&s, &m, "4.0.0", "arm64", bin),
+            SelfReason::Rebuild
+        );
+        s.put(SELF_BIN, "BUI-C-rc7");
+        assert_eq!(
+            build_differs(&s, &m, "4.0.0", "arm64", bin),
+            SelfReason::Current
+        );
+        assert_eq!(
+            build_differs(&FakeSys::new(), &m, "4.0.0", "amd64", bin),
+            SelfReason::Unreadable
+        );
+        let mut no = m.clone();
+        no.artifacts.retain(|k, _| k != "bui-c-linux-arm64");
+        assert_eq!(
+            build_differs(&s, &no, "4.0.0", "arm64", bin),
+            SelfReason::MissingAsset
+        );
+        assert_eq!(
+            build_differs(&s, &no, "3.9.9", "arm64", bin),
+            SelfReason::MissingAsset,
+            "版本不同也先看有没有产物：没有就没法换"
+        );
+        assert_eq!(
+            build_differs(&s, &no, "4.0.0", "amd64", bin),
+            SelfReason::Current,
+            "只缺别的架构不影响本机"
+        );
+        // 布尔封装的口径不变：不是 Current 就算要换
+        assert!(self_build_differs(&FakeSys::new(), &m));
+    }
+
+    /// `check_only` 也把原因与「内核要不要换」填上（spec §8.1）：菜单要按它们分开说，
+    /// 只换内核的 manifest 也要挂 ★。只读：不写盘。
+    #[test]
+    fn check_only_fills_the_reason_and_whether_the_kernel_is_outdated() {
+        let s = FakeSys::new();
+        let n = FakeNet::new();
+        let mut prof = profiles_socks();
+        prof.panel = Some(panel());
+        let self_sha = installed_self(&s, "bui-c-current");
+        n.route(
+            "https://panel.example.com/packages/manifest.json",
+            FakeReply::Text(manifest_json(crate::VERSION, &self_sha, &"b".repeat(64))),
+        );
+        s.put("/opt/bui-c/bin/sing-box", "ELF-old");
+        s.reply(
+            "/opt/bui-c/bin/sing-box version",
+            0,
+            "sing-box version 1.13.19\n",
+        );
+        let r = run(&s, &n, &paths(), &prof, true).unwrap();
+        assert_eq!(r.self_reason, SelfReason::Current, "{r:?}");
+        assert!(!r.self_outdated, "{r:?}");
+        assert!(r.kernel_outdated, "{r:?}");
+        assert_eq!(r.kernel_wanted, "1.14.5");
+        assert_eq!(r.kernel_local.as_deref(), Some("1.13.19"));
+        assert_eq!((r.self_updated, r.kernel_updated), (false, false));
+        assert_eq!(s.writes("/opt/bui-c/bin/sing-box"), 0, "只检查不装");
+
+        // 盘上没有内核：本机版本读不到，照样算要换
+        let s = FakeSys::new();
+        installed_self(&s, "bui-c-current");
+        let r = run(&s, &n, &paths(), &prof, true).unwrap();
+        assert!(r.kernel_outdated && r.kernel_local.is_none(), "{r:?}");
+    }
+
+    /// manifest 缺本机架构的 bui-c：没有可下载的，自身跳过；内核照换（spec §8.1：内核也要换时
+    /// 只换内核）。以前在自身那一步就报错退出，内核也跟着永远换不了。
+    #[test]
+    fn run_skips_a_missing_self_asset_but_still_replaces_the_kernel() {
+        let s = FakeSys::new();
+        let n = FakeNet::new();
+        let mut prof = profiles_socks();
+        prof.panel = Some(panel());
+        installed_self(&s, "bui-c-old");
+        let kernel = b"ELF-new".to_vec();
+        let mut m: Manifest = serde_json::from_str(&manifest_json(
+            "9.9.9",
+            &"a".repeat(64),
+            &sha256_hex(&kernel),
+        ))
+        .unwrap();
+        m.artifacts.retain(|k, _| !k.starts_with("bui-c-"));
+        n.route(
+            "https://panel.example.com/packages/manifest.json",
+            FakeReply::Text(serde_json::to_string(&m).unwrap()),
+        );
+        n.route(
+            &format!(
+                "https://panel.example.com/packages/sing-box-linux-{}",
+                arch_suffix()
+            ),
+            FakeReply::Bytes(kernel),
+        );
+        s.put("/opt/bui-c/bin/sing-box", "ELF-old");
+        s.reply(
+            "/opt/bui-c/bin/sing-box version",
+            0,
+            "sing-box version 1.13.19\n",
+        );
+        s.put("/etc/systemd/system/bui-c.service", "[Unit]");
+
+        let r = run(&s, &n, &paths(), &prof, false).unwrap();
+        assert_eq!(r.self_reason, SelfReason::MissingAsset, "{r:?}");
+        assert!(!r.self_updated, "{r:?}");
+        assert_eq!(s.get(SELF_BIN).unwrap(), "bui-c-old", "自身原样");
+        assert!(r.kernel_updated && r.restarted, "{r:?}");
+        assert_eq!(s.get("/opt/bui-c/bin/sing-box").unwrap(), "ELF-new");
+        assert!(
+            !n.log().iter().any(|l| l.contains("bui-c-linux-")),
+            "没有产物就不去下载：{:?}",
+            n.log()
+        );
     }
 }

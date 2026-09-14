@@ -368,13 +368,27 @@ fn engine_status<S: Sys, N: Net, P: Prompt>(ctx: &Ctx<'_, S, N, P>, prof: &Profi
     }
 }
 
-/// 这次检查之后「还有新版没装」吗——主菜单 `[7] 更新与维护 ★` 的口径。
+/// 这次检查之后「还有能装的新东西没装」吗——主菜单 `[7] 更新与维护 ★` 的口径（spec §8.1、§0.2 R4）。
 ///
-/// 口径与 [`update::self_build_differs`] 相同：版本不同，或同版本但不是同一份构建（rc 通道重建）。
+/// 自身：版本不同，或同版本但不是同一份构建（rc 通道重建）。读不到本机二进制、manifest 缺本机
+/// 架构的产物**不**点亮 ★——前者说不清是不是新版，后者进去也装不了。内核：本机版本不是 manifest
+/// 要的（只换内核的 manifest 也挂 ★）。
 /// 刚刚自替换成 manifest 那一份时要算「没有新版」：本进程的 `VERSION` 还是旧二进制的，
 /// 不看 `self_updated` 的话菜单会一直挂着 ★，直到下次检查。
 fn new_version_pending(r: &update::Report) -> bool {
-    r.self_outdated && !r.self_updated
+    let own = matches!(
+        r.self_reason,
+        update::SelfReason::NewVersion | update::SelfReason::Rebuild
+    );
+    (own && !r.self_updated) || (r.kernel_outdated && !r.kernel_updated)
+}
+
+/// 一次检查更新（命令行、菜单 [7] → [1]、巡检里的自更新）落进 runtime.json 的三项：★、检查时间、
+/// manifest 版本号。主菜单与 [7] 子页只读它们，不联网。
+fn record_update_check(rt: &mut Runtime, r: &update::Report, at: i64) {
+    rt.update_available = new_version_pending(r);
+    rt.update_checked_at = Some(at);
+    rt.update_version = Some(r.manifest_version.clone());
 }
 
 /// `BUI_C_PANEL=<url>`：本次进程里把面板地址换成它（只在内存里，不落盘），给预发布期
@@ -1030,13 +1044,11 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
                 r.manifest_version, r.manifest_source
             ));
             if *check_only {
-                ctx.say(if !r.self_outdated {
-                    "已是最新"
-                } else if r.manifest_version == crate::VERSION {
-                    "有同版本的新构建（rc 通道重建），跑 `bui-c update` 升级"
-                } else {
-                    "有新版，跑 `bui-c update` 升级"
-                });
+                // 结论按原因分开说（spec §8.1 末条）：读不到本机二进制、缺本机架构的产物不再
+                // 被说成「有同版本的新构建」
+                for l in menu::check_only_verdict(&r, update::arch_suffix()) {
+                    ctx.say(l);
+                }
             } else {
                 ctx.say(format!(
                     "自身更新={} 内核更新={} 已重启={}",
@@ -1045,13 +1057,19 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
             }
             let mut rt = Runtime::load(ctx.sys, ctx.paths);
             let now = ctx.sys.now().unix_timestamp();
-            rt.update_available = new_version_pending(&r);
-            rt.update_checked_at = Some(now);
+            record_update_check(&mut rt, &r, now);
             if !*check_only {
                 rt.last_update_at = Some(now);
                 rt.last_update_attempt_at = Some(now);
             }
             rt.save(ctx.sys, ctx.paths)?;
+            // manifest 缺本机架构的 bui-c：内核照换了，但 bui-c 没换成，脚本要从退出码看到失败
+            // （以前在下载那一步就报「manifest 里没有 … 这个产物」退出）
+            if !*check_only && r.self_reason == update::SelfReason::MissingAsset {
+                return Err(Error::msg(
+                    menu::update_missing_asset(update::arch_suffix()),
+                ));
+            }
             Ok(())
         }
         Cmd::ImportV3 {
@@ -1239,10 +1257,10 @@ fn run_check<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()
             false,
         ) {
             Ok(r) => {
-                rt.last_update_at = Some(ctx.sys.now().unix_timestamp());
+                let now = ctx.sys.now().unix_timestamp();
+                rt.last_update_at = Some(now);
                 // 自更新也是一次「检查更新」：装完了就把菜单上的 ★ 摘掉
-                rt.update_available = new_version_pending(&r);
-                rt.update_checked_at = rt.last_update_at;
+                record_update_check(&mut rt, &r, now);
                 rt.save(ctx.sys, ctx.paths)?;
                 if r.self_updated || r.kernel_updated {
                     ctx.say(format!(
@@ -1999,7 +2017,7 @@ fn menu_action<S: Sys, N: Net, P: Prompt>(
 /// 菜单 `[7] 更新与维护`（spec §1.1、§8.4）：清屏 → 三行本地事实 + 三个动作 → 选编号（输错原地
 /// 重问，不重画）。空行、`0`、EOF 返回主菜单，「上次：」行不动。
 ///
-/// - [1] 检查更新：本任务仍直接转手 `bui-c update`（T10 改成先显示版本再确认）。
+/// - [1] 检查更新：先显示查到的版本、说清为什么要换，有能装的才问 y/N（[`maint_check_update`]）。
 /// - [2] 自动更新开关：按下即执行——不动数据面、不联网，再按一次就撤回（R14）；一行 Note 回主菜单。
 /// - [3] 从 v3 导入：原主菜单 [7]，逻辑不变。
 fn maint_menu<S: Sys, N: Net, P: Prompt>(
@@ -2019,13 +2037,7 @@ fn maint_menu<S: Sys, N: Net, P: Prompt>(
     };
     Ok(match action {
         MaintAction::Back => Outcome::Nothing,
-        MaintAction::CheckUpdate => run_sub(
-            ctx,
-            Cmd::Update {
-                check_only: false,
-                auto: None,
-            },
-        ),
+        MaintAction::CheckUpdate => maint_check_update(ctx)?,
         MaintAction::ToggleAuto => run_sub(
             ctx,
             Cmd::Update {
@@ -2054,21 +2066,117 @@ fn maint_menu<S: Sys, N: Net, P: Prompt>(
     })
 }
 
+/// `[7]` → `[1]` 检查更新（spec §8.1）：打「正在检查更新…」→ 只读地查一次（不拿锁）→ 结论落盘
+/// （★ 与子页的「上次检查」立刻跟上）→ 按原因说清楚 → 有能装的才问 `[y/N]`，默认否。
+///
+/// - 取不到 manifest：`检查更新失败：…`，停下来。
+/// - 已是最新：一行 Note。
+/// - manifest 缺本机架构的 bui-c、内核也不用换：说完停下，不问（问了也装不了）。
+/// - 答否：一行 Note「没有更新（最新 X）」；答是：[`maint_install_update`]。
+///
+/// 提问本身就是停顿，所以答否不再停。检查与提问都在锁外（R11）。
+fn maint_check_update<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<Outcome> {
+    tell(ctx, menu::UPDATE_CHECKING);
+    ctx.flush();
+    let prof = Profiles::load(ctx.sys, ctx.paths)?;
+    let r = match update::run(
+        ctx.sys,
+        ctx.net,
+        ctx.paths,
+        &with_panel_override(ctx.sys, &prof),
+        true,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            // 错误里不带 URL（`request_error`）；折行打，「上次：」行记同一句
+            let line = format!("检查更新失败：{e}");
+            tell(ctx, &line);
+            return Ok(Outcome::Pause(line));
+        }
+    };
+    let mut rt = Runtime::load(ctx.sys, ctx.paths);
+    record_update_check(&mut rt, &r, ctx.sys.now().unix_timestamp());
+    rt.save(ctx.sys, ctx.paths)?;
+    let restart = ctx.sys.exists(&ctx.paths.unit(UNIT_MAIN));
+    match menu::update_offer(&r, crate::VERSION, update::arch_suffix(), restart) {
+        menu::UpdateOffer::Current(line) => Ok(note(ctx, line)),
+        menu::UpdateOffer::Blocked(line) => {
+            tell(ctx, &line);
+            Ok(Outcome::Pause(line))
+        }
+        menu::UpdateOffer::Ask {
+            lines,
+            question,
+            declined,
+        } => {
+            for l in &lines {
+                tell(ctx, l);
+            }
+            ctx.flush();
+            if ctx.prompt.confirm(&question)? {
+                Ok(maint_install_update(ctx))
+            } else {
+                Ok(note(ctx, declined))
+            }
+        }
+    }
+}
+
+/// [7] → [1] 答是之后：拿锁 → `update::run(check_only = false)` → 落盘 → 放锁，再把结果打出来停下
+/// （spec §8.1 第 5 步、§3e-60-5）。结果说人话（换了什么、重没重启），不转手命令行 `bui-c update`——
+/// 那一行 `自身更新=true …` 是给脚本看的，进「上次：」行没人看得懂。
+///
+/// 失败：停下来，「上次：」行是「失败：…」；runtime 不动（★ 照挂，也不算更新过）。
+/// T12b 把下载挪到锁外，这里只剩安装那一段持锁。
+fn maint_install_update<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Outcome {
+    let done = with_lock(ctx, |ctx, _g| {
+        let prof = Profiles::load(ctx.sys, ctx.paths)?;
+        let r = update::run(
+            ctx.sys,
+            ctx.net,
+            ctx.paths,
+            &with_panel_override(ctx.sys, &prof),
+            false,
+        )?;
+        let mut rt = Runtime::load(ctx.sys, ctx.paths);
+        let now = ctx.sys.now().unix_timestamp();
+        record_update_check(&mut rt, &r, now);
+        rt.last_update_at = Some(now);
+        rt.last_update_attempt_at = Some(now);
+        rt.save(ctx.sys, ctx.paths)?;
+        Ok(r)
+    });
+    match done {
+        Ok(r) => {
+            let lines = menu::update_done(&r);
+            for l in &lines {
+                tell(ctx, l);
+            }
+            Outcome::Pause(lines[0].clone())
+        }
+        Err(e) => {
+            let line = format!("失败：{e}");
+            tell(ctx, &line);
+            Outcome::Pause(line)
+        }
+    }
+}
+
 /// `[7]` 子页顶部三行（spec §8.1 第一条）：只读 `runtime.json` 与 `profiles.json`，不联网。
-/// 「上次检查」与主菜单的 ★ 同一个来源（`runtime.update_available`）；T10 再补上最新版本号。
+/// 「上次检查」与主菜单的 ★ 同一个来源（`runtime.update_available`），有新版时带上那次查到的版本号。
 fn maint_status<S: Sys, N: Net, P: Prompt>(ctx: &Ctx<'_, S, N, P>, prof: &Profiles) -> MaintStatus {
     let rt = Runtime::load(ctx.sys, ctx.paths);
-    let verdict = if rt.update_available {
-        "有新版"
-    } else {
-        "已是最新"
+    let verdict = match (rt.update_available, rt.update_version.as_deref()) {
+        (true, Some(v)) => format!("有新版 {v}"),
+        (true, None) => "有新版".to_string(),
+        (false, _) => "已是最新".to_string(),
     };
     let update_line = match rt.update_checked_at {
         Some(at) => {
             let secs = ctx.sys.now().unix_timestamp() - at;
             format!("{verdict}（{}）", menu::ago(secs))
         }
-        None if rt.update_available => verdict.to_string(),
+        None if rt.update_available => verdict,
         None => "还没检查过".to_string(),
     };
     MaintStatus {
@@ -3693,6 +3801,12 @@ mod tests {
         let n = FakeNet::new();
         // 盘上已装的 bui-c；manifest 里本机架构的 bui-c 资产 sha 与它相同 = 同一份构建
         s.put(crate::paths::SELF_BIN, "bui-c-installed");
+        // 内核也正是 manifest 要的版本：只换内核的 manifest 也算有东西可更新（spec §8.1）
+        s.reply(
+            "/opt/bui-c/bin/sing-box version",
+            0,
+            "sing-box version 1.14.5\n",
+        );
         let installed = crate::update::sha256_hex(b"bui-c-installed");
         let manifest = |ver: &str, sha: &str| {
             FakeReply::Text(format!(
@@ -3778,6 +3892,380 @@ mod tests {
             s.get(crate::paths::SELF_BIN).unwrap(),
             "bui-c-rc6",
             "只检查不换"
+        );
+    }
+
+    /// [7] → [1] 与 `update --check-only` 用例共用的机器：面板 profile（SOCKS）、盘上 bui-c 是
+    /// [`INSTALLED`]；manifest 版本 `ver`，本机架构 bui-c 的内容 `bui_c`（`None` = manifest 里没有
+    /// 这个产物），内核要 1.14.5、本机是 `kernel`（`None` = 没装内核）。两个产物都能从面板下载。
+    fn update_machine(ver: &str, bui_c: Option<&str>, kernel: Option<&str>) -> (FakeSys, FakeNet) {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        let mut prof = profiles_socks();
+        prof.panel = Some(crate::profiles::Panel {
+            base_url: "https://panel.example.com".into(),
+            username: "alice".into(),
+        });
+        prof.save(&s, &pp).unwrap();
+        s.put(crate::paths::SELF_BIN, INSTALLED);
+        match kernel {
+            Some(v) => s.reply(
+                "/opt/bui-c/bin/sing-box version",
+                0,
+                &format!("sing-box version {v}\n"),
+            ),
+            None => s
+                .remove_file(std::path::Path::new("/opt/bui-c/bin/sing-box"))
+                .unwrap(),
+        }
+        let arch = update::arch_suffix();
+        let n = FakeNet::new();
+        let mut artifacts = vec![format!(
+            r#""sing-box-linux-{arch}":{{"url":"https://github.com/x/sing-box","sha256":"{}"}}"#,
+            update::sha256_hex(NEW_KERNEL.as_bytes())
+        )];
+        n.route(
+            &format!("https://panel.example.com/packages/sing-box-linux-{arch}"),
+            FakeReply::Bytes(NEW_KERNEL.as_bytes().to_vec()),
+        );
+        if let Some(b) = bui_c {
+            artifacts.push(format!(
+                r#""bui-c-linux-{arch}":{{"url":"https://github.com/x/bui-c","sha256":"{}"}}"#,
+                update::sha256_hex(b.as_bytes())
+            ));
+            n.route(
+                &format!("https://panel.example.com/packages/bui-c-linux-{arch}"),
+                FakeReply::Bytes(b.as_bytes().to_vec()),
+            );
+        }
+        n.route(
+            "https://panel.example.com/packages/manifest.json",
+            FakeReply::Text(format!(
+                r#"{{"version":"{ver}","kernels":{{"client_sing_box":"1.14.5"}},"artifacts":{{{}}}}}"#,
+                artifacts.join(",")
+            )),
+        );
+        (s, n)
+    }
+    const INSTALLED: &str = "bui-c-installed";
+    const NEW_KERNEL: &str = "ELF-sing-box-1.14.5";
+
+    fn last_line(t: &str) -> &str {
+        t.lines()
+            .rev()
+            .find(|l| l.starts_with("  上次："))
+            .unwrap_or_else(|| panic!("没有「上次：」行：\n{t}"))
+    }
+
+    /// `update --check-only` 的结论行按原因分开说（spec §8.1 末条）：第一行 `manifest …（来源 …）`
+    /// 不变；要升级的给出命令，没法升级的不给；内核要换单独说。
+    #[test]
+    fn check_only_cli_line_follows_the_reason() {
+        let pp = paths();
+        let arch = update::arch_suffix();
+        let v = crate::VERSION;
+        let run = |s: &FakeSys, n: &FakeNet| {
+            let mut p = Scripted::from([]);
+            let mut ctx = Ctx::new(s, n, &pp, &mut p, false, false);
+            dispatch(&parse(&["update", "--check-only"]), &mut ctx).unwrap();
+            ctx.transcript
+                .lines()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        // (manifest 版本, manifest 里的 bui-c, 本机内核, 盘上有没有 bui-c, 结论要含, 给不给命令)
+        let cases = [
+            (
+                v,
+                Some(INSTALLED),
+                "1.14.5",
+                true,
+                "已是最新".to_string(),
+                false,
+            ),
+            (
+                "9.9.9",
+                Some("bui-c-new"),
+                "1.14.5",
+                true,
+                "有新版".into(),
+                true,
+            ),
+            (
+                v,
+                Some("bui-c-rc7"),
+                "1.14.5",
+                true,
+                "同版本的新构建".into(),
+                true,
+            ),
+            (
+                v,
+                Some("bui-c-new"),
+                "1.14.5",
+                false,
+                "读不到本机的 bui-c".into(),
+                true,
+            ),
+            (
+                "9.9.9",
+                None,
+                "1.14.5",
+                true,
+                format!("bui-c-linux-{arch}"),
+                false,
+            ),
+            (v, Some(INSTALLED), "1.13.19", true, "sing-box".into(), true),
+        ];
+        for (ver, bui_c, kernel, on_disk, want, cmd) in cases {
+            let (s, n) = update_machine(ver, bui_c, Some(kernel));
+            if !on_disk {
+                s.remove_file(std::path::Path::new(crate::paths::SELF_BIN))
+                    .unwrap();
+            }
+            let lines = run(&s, &n);
+            assert_eq!(
+                lines[0],
+                format!("manifest {ver}（来源 面板）"),
+                "{lines:?}"
+            );
+            let verdict = lines[1..].join("\n");
+            assert!(verdict.contains(&want), "{want}：{lines:?}");
+            assert_eq!(verdict.contains("bui-c update"), cmd, "{want}：{lines:?}");
+            if want != "已是最新" {
+                assert!(!verdict.contains("已是最新"), "{want}：{lines:?}");
+            }
+        }
+        // 内核要换：说出要换成的版本
+        let (s, n) = update_machine(v, Some(INSTALLED), Some("1.13.19"));
+        assert!(run(&s, &n).join("\n").contains("1.14.5"));
+    }
+
+    /// manifest 里没有本机架构的 bui-c（spec §0.2 R4）：如实说没法更新，不挂 ★——挂了 ★ 进去也
+    /// 什么都装不了。
+    #[test]
+    fn check_only_reports_missing_asset_without_star() {
+        let pp = paths();
+        let (s, n) = update_machine("9.9.9", None, Some("1.14.5"));
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["update", "--check-only"]), &mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert!(
+            t.contains(&format!("bui-c-linux-{}", update::arch_suffix())),
+            "{t}"
+        );
+        assert!(!t.contains("有新版"), "{t}");
+        let rt = Runtime::load(&s, &pp);
+        assert!(!rt.update_available, "缺产物不挂 ★：{rt:?}");
+        assert_eq!(rt.update_version.as_deref(), Some("9.9.9"));
+        let prof = Profiles::load(&s, &pp).unwrap();
+        assert!(!menu::render_options(&engine_status(&ctx, &prof), 80).contains('★'));
+
+        // 内核要换时照样挂 ★：只换内核的 manifest 也是「有东西可更新」
+        let (s, n) = update_machine("9.9.9", None, Some("1.13.19"));
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["update", "--check-only"]), &mut ctx).unwrap();
+        assert!(Runtime::load(&s, &pp).update_available);
+    }
+
+    /// 命令行 `bui-c update` 遇到缺本机架构的 bui-c：内核照换（已经下载得到），但退出码仍是失败——
+    /// 脚本要知道 bui-c 这次没换成。runtime 照实落盘。
+    #[test]
+    fn update_with_a_missing_asset_replaces_the_kernel_and_still_fails() {
+        let pp = paths();
+        let (s, n) = update_machine("9.9.9", None, Some("1.13.19"));
+        with_unit(&s);
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        let e = dispatch(&parse(&["update"]), &mut ctx).unwrap_err();
+        let arch = update::arch_suffix();
+        assert!(
+            e.to_string().contains(&format!("bui-c-linux-{arch}")),
+            "{e}"
+        );
+        assert_eq!(s.get(crate::paths::SELF_BIN).unwrap(), INSTALLED);
+        assert_eq!(s.get("/opt/bui-c/bin/sing-box").unwrap(), NEW_KERNEL);
+        assert!(s.called("systemctl restart bui-c.service"));
+        let rt = Runtime::load(&s, &pp);
+        assert!(!rt.update_available, "{rt:?}");
+        assert!(rt.last_update_at.is_some(), "{rt:?}");
+    }
+
+    /// [7] → [1]（spec §8.1）：先打「正在检查更新」、再说查到了什么，有东西可更新才问 y/N；答否什么都
+    /// 不换、不拿锁、不下载，「上次：」行说没有更新。子页的「上次检查」带上这次查到的版本号。
+    #[test]
+    fn maint_check_update_asks_before_updating_and_no_means_nothing_changes() {
+        let pp = paths();
+        let (s, n) = update_machine("9.9.9", Some("bui-c-new"), Some("1.14.5"));
+        let r = run_menu(&s, &n, &pp, &["7", "1", "n", "7", "0", "0"], true);
+        let t = &r.t;
+        let at = |needle: &str| t.find(needle).unwrap_or_else(|| panic!("{needle}\n{t}"));
+        assert!(at("正在检查更新") < at("9.9.9（来源 面板）"), "{t}");
+        assert!(at("9.9.9（来源 面板）") < at("更新会替换 bui-c"), "{t}");
+        assert_eq!(r.asked.len(), 6, "{:?}", r.asked);
+        assert!(
+            r.asked[2].starts_with("现在更新到") && r.asked[2].contains("9.9.9"),
+            "{:?}",
+            r.asked
+        );
+        assert_eq!(pauses(&r.asked), 0, "问过就不再停：{:?}", r.asked);
+        assert_eq!(s.get(crate::paths::SELF_BIN).unwrap(), INSTALLED, "{t}");
+        assert!(!s.calls().iter().any(|c| c == "lock"), "{:?}", s.calls());
+        assert!(
+            n.log().iter().all(|l| l.contains("manifest.json")),
+            "答否不下载：{:?}",
+            n.log()
+        );
+        let last = last_line(t);
+        assert!(last.contains("没有更新") && last.contains("9.9.9"), "{t}");
+        let rt = Runtime::load(&s, &pp);
+        assert!(rt.update_available, "★ 照挂：{rt:?}");
+        assert_eq!(rt.update_version.as_deref(), Some("9.9.9"));
+        assert!(rt.last_update_at.is_none(), "{rt:?}");
+        let second = t.split("\n  更新与维护\n").nth(2).unwrap();
+        assert!(second.contains("有新版 9.9.9"), "{second}");
+    }
+
+    /// 同版本、sha256 不同（rc 通道重建）：说「有新构建」，不说「已是最新」，照样挂 ★、照样问。
+    #[test]
+    fn maint_check_update_says_rebuild_for_same_version_new_sha() {
+        let pp = paths();
+        let (s, n) = update_machine(crate::VERSION, Some("bui-c-rc7"), Some("1.14.5"));
+        let r = run_menu(&s, &n, &pp, &["7", "1", "n", "0"], true);
+        assert!(r.t.contains("有新构建"), "{}", r.t);
+        assert!(!r.t.contains("已是最新"), "{}", r.t);
+        assert!(
+            r.asked
+                .iter()
+                .any(|q| q.starts_with("现在更新到") && q.contains(crate::VERSION)),
+            "{:?}",
+            r.asked
+        );
+        assert!(Runtime::load(&s, &pp).update_available);
+        assert_eq!(s.get(crate::paths::SELF_BIN).unwrap(), INSTALLED);
+    }
+
+    /// 已是最新：一行 Note，不问、不停，「上次：」行写版本与来源。
+    #[test]
+    fn maint_check_update_up_to_date_is_a_one_line_note() {
+        let pp = paths();
+        let (s, n) = update_machine(crate::VERSION, Some(INSTALLED), Some("1.14.5"));
+        let r = run_menu(&s, &n, &pp, &["7", "1", "0"], true);
+        assert_eq!(
+            r.asked,
+            vec!["选择 [0-9]", "选择 [0-3]", "选择 [0-9]"],
+            "{}",
+            r.t
+        );
+        let last = last_line(&r.t);
+        assert!(
+            last.contains("已是最新") && last.contains(crate::VERSION),
+            "{}",
+            r.t
+        );
+        assert!(!Runtime::load(&s, &pp).update_available);
+    }
+
+    /// 答 y：拿锁装，结果停下来给人看；「上次：」行说人话（换了什么、重没重启），不是 `manifest …`
+    /// 或 `自身更新=true` 这种命令行输出。换了自身要说新菜单下次打开生效。
+    #[test]
+    fn maint_check_update_yes_installs_and_the_last_line_is_plain_words() {
+        let pp = paths();
+        let (s, n) = update_machine("9.9.9", Some("bui-c-new"), Some("1.13.19"));
+        with_unit(&s);
+        let r = run_menu(&s, &n, &pp, &["7", "1", "y", "", "0"], true);
+        let t = &r.t;
+        assert_eq!(s.get(crate::paths::SELF_BIN).unwrap(), "bui-c-new", "{t}");
+        assert_eq!(s.get("/opt/bui-c/bin/sing-box").unwrap(), NEW_KERNEL, "{t}");
+        assert!(s.called("systemctl restart bui-c.service"), "{t}");
+        assert_eq!(pauses(&r.asked), 1, "结果停下来：{:?}", r.asked);
+        let last = last_line(t);
+        assert!(last.contains("已更新"), "{t}");
+        assert!(
+            !last.contains("manifest") && !last.contains('='),
+            "上次行要说人话：{last}"
+        );
+        assert!(t.contains("新版菜单下次打开生效"), "{t}");
+        assert!(!t.contains("自身更新="), "菜单不打命令行那一行：{t}");
+        let rt = Runtime::load(&s, &pp);
+        assert!(!rt.update_available, "装完摘 ★：{rt:?}");
+        assert!(rt.last_update_at.is_some(), "{rt:?}");
+    }
+
+    /// manifest 缺本机架构的 bui-c：不问 bui-c（问了也装不了）；内核也不用换就说完停下，
+    /// 内核要换就只问内核、答 y 只换内核（spec §8.1 第 5 步）。
+    #[test]
+    fn maint_check_update_missing_asset_only_offers_the_kernel() {
+        let pp = paths();
+        let arch = update::arch_suffix();
+
+        let (s, n) = update_machine("9.9.9", None, Some("1.14.5"));
+        let r = run_menu(&s, &n, &pp, &["7", "1", "", "0"], true);
+        assert_eq!(
+            r.asked,
+            vec!["选择 [0-9]", "选择 [0-3]", "回车返回菜单", "选择 [0-9]"],
+            "{}",
+            r.t
+        );
+        assert!(
+            last_line(&r.t).contains(&format!("bui-c-linux-{arch}")),
+            "{}",
+            r.t
+        );
+        assert!(!Runtime::load(&s, &pp).update_available);
+
+        let (s, n) = update_machine("9.9.9", None, Some("1.13.19"));
+        with_unit(&s);
+        let r = run_menu(&s, &n, &pp, &["7", "1", "y", "", "0"], true);
+        let q = r
+            .asked
+            .iter()
+            .find(|q| q.starts_with("现在更新"))
+            .unwrap_or_else(|| panic!("{:?}", r.asked));
+        assert!(q.contains("内核") && q.contains("1.14.5"), "{q}");
+        assert!(r.t.contains(&format!("bui-c-linux-{arch}")), "{}", r.t);
+        assert_eq!(s.get("/opt/bui-c/bin/sing-box").unwrap(), NEW_KERNEL);
+        assert_eq!(s.get(crate::paths::SELF_BIN).unwrap(), INSTALLED);
+        let last = last_line(&r.t);
+        assert!(
+            last.contains("sing-box") && !last.contains("失败"),
+            "{}",
+            r.t
+        );
+        assert!(!Runtime::load(&s, &pp).update_available);
+    }
+
+    /// 答 y 但下载失败：停下来说失败，「上次：」行是失败；盘上 bui-c 原样、★ 照挂、不算更新过，
+    /// 锁拿了也放了。
+    #[test]
+    fn maint_check_update_install_failure_pauses_and_keeps_the_star() {
+        let pp = paths();
+        let (s, n) = update_machine("9.9.9", Some("bui-c-new"), Some("1.14.5"));
+        n.route(
+            &format!(
+                "https://panel.example.com/packages/bui-c-linux-{}",
+                update::arch_suffix()
+            ),
+            FakeReply::Status(404),
+        );
+        let r = run_menu(&s, &n, &pp, &["7", "1", "y", "", "0"], true);
+        assert_eq!(pauses(&r.asked), 1, "{:?}", r.asked);
+        assert!(last_line(&r.t).starts_with("  上次：失败："), "{}", r.t);
+        assert_eq!(s.get(crate::paths::SELF_BIN).unwrap(), INSTALLED);
+        let rt = Runtime::load(&s, &pp);
+        assert!(rt.update_available, "没装成，★ 照挂：{rt:?}");
+        assert!(rt.last_update_at.is_none(), "{rt:?}");
+        let calls = s.calls();
+        assert_eq!(
+            (
+                calls.iter().filter(|c| *c == "lock").count(),
+                calls.iter().filter(|c| *c == "unlock").count()
+            ),
+            (1, 1),
+            "{calls:?}"
         );
     }
 
@@ -4356,8 +4844,11 @@ mod tests {
         let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
         menu_loop(&mut ctx).unwrap();
         let t = ctx.transcript.clone();
-        assert!(t.lines().any(|l| l.starts_with("  失败：")), "{t}");
-        assert!(t.lines().any(|l| l.starts_with("  上次：失败：")), "{t}");
+        assert!(t.lines().any(|l| l.starts_with("  检查更新失败：")), "{t}");
+        assert!(
+            t.lines().any(|l| l.starts_with("  上次：检查更新失败：")),
+            "{t}"
+        );
         assert_eq!(
             p.asked,
             vec!["选择 [0-9]", "选择 [0-3]", "回车返回菜单", "选择 [0-9]"],
@@ -9064,6 +9555,16 @@ mod tests {
         let t = ctx.transcript.clone();
         assert_eq!(no_prompt_under_lock(&s, from, "bui-c delete"), 1, "{t}");
         assert_eq!(names(&s, &pp).len(), 8, "{t}");
+
+        // [7] → [1] 检查更新：检查与提问在锁外，答 y 之后才拿锁装；结果的停顿在放锁之后
+        let (s, n) = update_machine("9.9.9", Some("bui-c-new"), Some("1.14.5"));
+        let (t, asked) = logged_menu(&s, &n, &pp, &["7", "1", "y", "", "0"]);
+        assert!(
+            asked.iter().any(|q| q.starts_with("现在更新到")),
+            "{asked:?}"
+        );
+        assert_eq!(no_prompt_under_lock(&s, 0, "[7] → [1] 检查更新"), 1, "{t}");
+        assert_eq!(s.get(crate::paths::SELF_BIN).unwrap(), "bui-c-new", "{t}");
 
         // [8] 卸载：确认在菜单层做完，只在 uninstall::run 外面拿锁
         let (s, n) = (FakeSys::new(), FakeNet::new());
