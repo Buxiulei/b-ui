@@ -815,8 +815,16 @@ function addResidentialUrl() {
 function removeResidentialUrl(hostPort) {
     _resiClearErr();
     api("/residential/urls/" + hostPort, { method: "DELETE" }).then(r => {
-        if (r.success) { toast("节点已移除"); _resiReload(); }
-        else _resiErr(r.error || "移除失败");
+        if (!r.success) { _resiErr(r.error || "移除失败"); return; }
+        // 回包的 resubscribe 是必须重新获取订阅的用户名（HY2 住宅端口 / 跳跃区间变了）。
+        // 用户名只经 textContent 的 _resiErr 输出：toast 走 innerHTML，不喂用户数据
+        const who = Array.isArray(r.resubscribe) ? r.resubscribe : [];
+        _resiReload();
+        if (!who.length) { toast("节点已移除"); return; }
+        toast("节点已移除，" + who.length + " 个用户需重新获取订阅", true);
+        _resiErr("上游已移除。以下 " + who.length
+            + " 个用户的 HY2 住宅节点端口 / 跳跃区间已变化，必须重新获取订阅（否则该节点连不上）："
+            + who.join("、"));
     }).catch(e => _resiErr(e.message || "请求失败"));
 }
 

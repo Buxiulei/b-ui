@@ -10,7 +10,6 @@
 //!    `hysteria-residential.service` 是 v3 兼容面，不许悬空）。
 use crate::model::{NodeParams, Ports, Residential, Slot, State, User, DEFAULT_GROUP};
 use crate::nodes::{self, NodeKind};
-use serde::Serialize;
 use uuid::Uuid;
 
 /// relay 每槽一个 socks 入站的基准端口：槽 i 监听 `127.0.0.1:(2080 + i)`。
@@ -175,98 +174,66 @@ pub fn users_of_slot(s: &State, slot_upstream_id: Uuid) -> Vec<&User> {
         .collect()
 }
 
-/// 删一条上游会让哪些用户的 HY2 住宅端口变化（按成因分两组，**只有用户名**）。
+/// 两份期望态之间，**必须重新获取订阅**的用户名（升序、只有用户名）。
 ///
-/// 线上形态就是 derive 出来的两个数组（面板回包的 `port_changed`）。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-pub struct PortChangeImpact {
-    /// 槽位随上游一起消失、被重新分配到别的槽的用户（原本落在被删槽上，或压根没分过槽）
-    pub removed_slot: Vec<String>,
-    /// 只在**删 0 号槽**时非空：槽位还是原来那条上游，但序号被不变量 3 搬到了 0，端口随之下移
-    pub moved_to_zero: Vec<String>,
-}
-
-impl PortChangeImpact {
-    pub fn is_empty(&self) -> bool {
-        self.removed_slot.is_empty() && self.moved_to_zero.is_empty()
-    }
-}
-
-/// 删上游**之前**算出 [`PortChangeImpact`]，`upstream_id` 是要删的那条。
+/// HY2 住宅节点的端口（`hy2_resi + 槽序号`）与端口跳跃区间（`mport=`，把 `hy2_resi_hop`
+/// 按 [`slot_span`] 等分给各槽）都写死在用户手里那份订阅里。客户端不会主动发现它们变了，
+/// 要等下一次订阅更新（`bui-c` 的每日 timer、v2rayN 的定时更新，或人工重新获取）；在那
+/// 之前这个节点连不上。区间被重切时更隐蔽：挪给了别的槽的那一段会打到**另一个 hysteria
+/// 进程**，它不认这条 QUIC 连接（鉴权 URL 全实例共用，重握手后就从别的槽的 IP 出去）。
+/// 所以池成员一变就得把名单打给操作者。
 ///
-/// HY2 住宅节点的端口 = `hy2_resi + 槽序号`，已经写进用户手里的订阅。客户端不会主动
-/// 发现端口变了，要等下一次订阅更新（`bui-c` 的每日 timer、v2rayN 的定时更新，或人工
-/// 重新获取）；在那之前这个节点连不上。缩池只有显式删上游这一条路，所以受影响名单在
-/// 这里算、由调用方打给操作者。
+/// 判据是「手里那份订阅还能不能用」，不是「有没有变」：端口必须一样，且旧的跳跃区间整段
+/// 仍落在本槽的新区间里 —— 区间被切成前缀时（`41000-43999` ⊆ `41000-45499`）每个端口照旧
+/// 打到本槽实例，这种人不上名单。节点取自 [`nodes::nodes_for`]（订阅内容的唯一真源），
+/// 所以没开 hysteria2 协议、没有住宅权益、权益指向的分组不存在的用户自动不在名单里。
 ///
-/// 实现是**模拟**而不是预测：克隆一份期望态，照 `upstream::remove` 的同一条路径走一遍
-/// （从池里摘掉 → [`sync_slots`] → [`migrate_unassigned`]），再逐用户比对订阅里 HY2 住宅
-/// 节点的端口 —— 端口真的变了才上名单。预测式算法在这里必错：删 0 号槽时被删槽的用户
-/// 常常被重新分配回序号 0（`40000` → `40000`，端口没变），照「被删槽上的人」列名单就是
-/// 误报。端口取自 [`nodes::nodes_for`]（订阅内容的唯一真源），所以没开 hysteria2 协议、
-/// 没有住宅权益、权益指向的分组不存在的用户自动不在名单里。
-///
-/// 分组按成因，文案要分开说：
-/// - [`PortChangeImpact::removed_slot`]：槽位随上游消失，他们被重新分配到了别的槽；
-/// - [`PortChangeImpact::moved_to_zero`]：槽位还是原来那条上游，但 [`sync_slots`] 的不变量 3
-///   把现存序号最小的槽搬到了 0（保住 `hy2_resi` 与 `hysteria-residential.service` 不悬空），
-///   端口跟着下移 —— 所以删 0 号槽可能同时打到两批人。
-///
-/// **不计入**端口跳跃区间（`mport=`）的变化：删掉序号最高的槽会让 [`slot_span`] 缩小、
-/// 存活槽的区间重切，这一条的口径待定（要纳入就把下面比对的端口换成 [`resources_of`]）。
-pub fn port_change_impact(s: &State, upstream_id: Uuid) -> PortChangeImpact {
-    let mut impact = PortChangeImpact::default();
-    if !s
-        .residential
-        .slots
-        .iter()
-        .any(|x| x.upstream_id == upstream_id)
-    {
-        return impact;
-    }
-    // 只模拟影响端口的那部分：摘上游 + 槽位同步 + 重新分配（重编号、黑名单、总开关
-    // 都动不到 `nodes_for` 的输出）
-    let mut after = s.clone();
-    if let Some(g) = after.residential.groups.get_mut(DEFAULT_GROUP) {
-        g.upstreams.retain(|u| u.id != upstream_id);
-    }
-    sync_slots(&mut after.residential);
-    migrate_unassigned(&mut after);
-    for u in &s.users {
-        let Some(a) = after.users.iter().find(|x| x.user_id == u.user_id) else {
+/// `before` / `after` 必须是**同一次写入**的前后两份期望态（`after` 是 [`sync_slots`] 与
+/// [`migrate_unassigned`] 跑完之后的），否则名单是过期的。
+pub fn resubscribe_impact(before: &State, after: &State) -> Vec<String> {
+    let mut out = Vec::new();
+    for u in &before.users {
+        let Some(old) = hy2_resi_node(u, &before.node, &before.residential) else {
             continue;
         };
-        if hy2_resi_port(u, &s.node, &s.residential)
-            == hy2_resi_port(a, &s.node, &after.residential)
-        {
+        let Some(new) = after
+            .users
+            .iter()
+            .find(|x| x.user_id == u.user_id)
+            .and_then(|a| hy2_resi_node(a, &after.node, &after.residential))
+        else {
             continue;
-        }
-        // 分组判据与 [`migrate_unassigned`] 的「stale」判据同一个：槽位键删完还在池里
-        // ⇒ 没被重新分配，端口变的原因只能是序号被搬到了 0
-        let reassigned = slot_id_of_user(u)
-            .is_none_or(|id| !after.residential.slots.iter().any(|x| x.upstream_id == id));
-        if reassigned {
-            impact.removed_slot.push(u.username.clone());
-        } else {
-            impact.moved_to_zero.push(u.username.clone());
+        };
+        if !still_usable(&old, &new) {
+            out.push(u.username.clone());
         }
     }
     // 输出要确定性。**不含凭据、不含订阅 token。**
-    impact.removed_slot.sort_unstable();
-    impact.moved_to_zero.sort_unstable();
-    impact
+    out.sort_unstable();
+    out
 }
 
-/// 用户订阅里 HY2 住宅节点的端口；没有这个节点 ⇒ `None`。
+/// 用户订阅里的 HY2 住宅节点；没有这个节点 ⇒ `None`。
 ///
 /// 真源是 [`nodes::nodes_for`]：只开了 vless-reality 的住宅用户订阅里压根没有 HY2 住宅
 /// 节点（Reality 住宅固定 `:10002`，换槽在服务端的 xray 路由里完成，订阅内容不变），
-/// 删上游动不到他们。
-fn hy2_resi_port(u: &User, node: &NodeParams, r: &Residential) -> Option<u16> {
+/// 改池动不到他们。
+fn hy2_resi_node(u: &User, node: &NodeParams, r: &Residential) -> Option<nodes::Node> {
     nodes::nodes_for(u, node, r)
         .into_iter()
         .find(|n| n.kind == NodeKind::Hy2Residential)
-        .map(|n| n.port)
+}
+
+/// 手里那份 `old` 节点在新期望态下还连得上吗。
+fn still_usable(old: &nodes::Node, new: &nodes::Node) -> bool {
+    old.port == new.port
+        && match (old.hop, new.hop) {
+            // 旧订阅没有 mport ⇒ 只用基础端口，端口相同就还能用
+            (None, _) => true,
+            (Some(_), None) => false,
+            // 旧区间 ⊆ 新区间：每个端口照旧落在本槽实例上
+            (Some((a, b)), Some((c, d))) => c <= a && b <= d,
+        }
 }
 
 /// 用户数最少的槽（平手取序号最小，序号也平手取 uuid —— 完全确定性）。
@@ -696,76 +663,98 @@ mod tests {
         assert_eq!(load(&s), vec![3, 2]);
     }
 
-    /// 删非 0 号槽：只有那个槽上的用户端口会变。
-    #[test]
-    fn port_change_impact_lists_only_the_removed_slots_users() {
-        let mut s = state(3, 3);
-        migrate_unassigned(&mut s);
-        let i = port_change_impact(&s, Uuid::from_u128(2)); // 槽 1，上面是 u2
-        assert_eq!(i.removed_slot, vec!["u2".to_string()]);
-        assert!(
-            i.moved_to_zero.is_empty(),
-            "删非 0 号槽不触发不变量 3，没人被搬"
-        );
-        assert!(!i.is_empty());
+    /// 照 `upstream::remove` 的同一条路径删一条上游（摘成员 → [`sync_slots`] →
+    /// [`migrate_unassigned`]），返回删后的期望态。
+    fn after_remove(s: &State, upstream_id: Uuid) -> State {
+        let mut after = s.clone();
+        after
+            .residential
+            .groups
+            .get_mut(DEFAULT_GROUP)
+            .unwrap()
+            .upstreams
+            .retain(|u| u.id != upstream_id);
+        sync_slots(&mut after.residential);
+        migrate_unassigned(&mut after);
+        after
     }
 
-    /// 删 0 号槽：只列端口**真的**变了的人。被删槽上的用户常常被重新分配回序号 0
-    /// （`40000` → `40000`），「被删槽上的人都受影响」这种预测式算法必然误报。
+    /// 某用户订阅里 HY2 住宅节点的 `(端口, 跳跃区间)`。
+    fn node_of(s: &State, name: &str) -> (u16, Option<(u16, u16)>) {
+        let u = s.users.iter().find(|u| u.username == name).unwrap();
+        let n = hy2_resi_node(u, &s.node, &s.residential).unwrap();
+        (n.port, n.hop)
+    }
+
+    /// 删掉序号最高的槽：那个槽上的人端口变了，**存活槽里区间被重切的人也一样要重取订阅**。
+    /// 槽位空间 3 → 2 让槽 1 的区间从 `44000-46999` 挪成 `45500-50000`，u2 手里那份订阅
+    /// 会把 44000-45499 的包打到槽 0 那个**独立进程**上（它不认 u2 的连接）；槽 0 的 u1
+    /// 反而无害 —— 他的旧区间是新区间的前缀子集，每个端口照旧落在本槽实例。
     #[test]
-    fn removing_slot_zero_lists_only_the_users_whose_port_really_moves() {
+    fn removing_the_top_slot_also_lists_whoever_had_his_hop_range_resliced() {
         let mut s = state(3, 3);
         migrate_unassigned(&mut s); // u1 → 槽 0，u2 → 槽 1，u3 → 槽 2
-        let gone = Uuid::from_u128(1);
-        let i = port_change_impact(&s, gone);
+        let after = after_remove(&s, Uuid::from_u128(3));
         assert_eq!(
-            i.moved_to_zero,
+            resubscribe_impact(&s, &after),
+            vec!["u2".to_string(), "u3".to_string()]
+        );
+        // 三个人各自变了什么：只有 u1 那份订阅还能照旧用
+        assert_eq!(node_of(&s, "u1"), (40000, Some((41000, 43999))));
+        assert_eq!(node_of(&after, "u1"), (40000, Some((41000, 45499))));
+        assert_eq!(node_of(&s, "u2"), (40001, Some((44000, 46999))));
+        assert_eq!(node_of(&after, "u2"), (40001, Some((45500, 50000))));
+        assert_eq!(node_of(&s, "u3"), (40002, Some((47000, 50000))));
+        assert_eq!(node_of(&after, "u3"), (40000, Some((41000, 45499))));
+    }
+
+    /// 被删的槽上**一个用户都没有**也要打名单：槽位空间一缩，存活槽的区间就被重切。
+    /// 这条是「只算端口」那版实现的漏报 —— 它会回一句「没有用户受影响」。
+    #[test]
+    fn removing_an_empty_top_slot_still_lists_the_survivors_whose_range_moved() {
+        let mut s = state(3, 2);
+        migrate_unassigned(&mut s); // u1 → 槽 0，u2 → 槽 1；槽 2 空着
+        let after = after_remove(&s, Uuid::from_u128(3));
+        assert_eq!(
+            resubscribe_impact(&s, &after),
+            vec!["u2".to_string()],
+            "u2 的区间 44000-46999 → 45500-50000（不是子集）；u1 的 41000-43999 是新区间前缀"
+        );
+    }
+
+    /// 删 0 号槽：只列手里那份订阅**真的**不能用了的人。不变量 3 把槽 1 搬到 0（端口下移
+    /// ⇒ 上名单），而被删槽上的 u1 常常被重新分配回序号 0（`40000` → `40000`，区间也没动
+    /// ⇒ 不上名单）—— 照「被删槽上的人」列名单就是误报。
+    #[test]
+    fn removing_slot_zero_lists_only_the_users_whose_node_really_moves() {
+        let mut s = state(3, 3);
+        migrate_unassigned(&mut s); // u1 → 槽 0，u2 → 槽 1，u3 → 槽 2
+        let after = after_remove(&s, Uuid::from_u128(1));
+        assert_eq!(
+            resubscribe_impact(&s, &after),
             vec!["u2".to_string()],
             "槽 1（u2）被搬到 0：40001 → 40000"
         );
-        assert!(
-            i.removed_slot.is_empty(),
-            "u1 被重新分配回了序号 0，端口没变就不该要他重取订阅：{:?}",
-            i.removed_slot
-        );
-        // 真删一次，逐用户核对端口 —— 名单必须与它逐字一致
-        let g = s.residential.groups.get_mut(DEFAULT_GROUP).unwrap();
-        g.upstreams.retain(|u| u.id != gone);
-        sync_slots(&mut s.residential);
-        migrate_unassigned(&mut s);
-        let port = |name: &str| {
-            let u = s.users.iter().find(|u| u.username == name).unwrap();
-            resources_of(
-                &s.node.ports,
-                &s.residential,
-                index_of_user(u, &s.residential),
-            )
-            .hy2_port
-        };
-        assert_eq!(
-            (port("u1"), port("u2"), port("u3")),
-            (40000, 40000, 40002),
-            "变的只有 u2"
-        );
+        // 名单与删后逐用户核对的结果逐字一致
+        assert_eq!(node_of(&after, "u1"), node_of(&s, "u1"));
+        assert_eq!(node_of(&after, "u2"), (40000, Some((41000, 43999))));
+        assert_eq!(node_of(&after, "u3"), node_of(&s, "u3"));
     }
 
     /// 删 0 号槽可以同时打到两批人：被重新分配到别的槽的，以及槽序号被搬到 0 的。
     #[test]
-    fn removing_slot_zero_can_hit_both_groups() {
+    fn removing_slot_zero_can_hit_both_the_reassigned_and_the_moved() {
         let mut s = state(3, 5);
         migrate_unassigned(&mut s); // 槽 0：u1、u4；槽 1：u2、u5；槽 2：u3
         assert_eq!(load(&s), vec![2, 2, 1]);
-        let i = port_change_impact(&s, Uuid::from_u128(1));
+        let after = after_remove(&s, Uuid::from_u128(1));
         assert_eq!(
-            i.removed_slot,
-            vec!["u1".to_string()],
-            "u1 被重新分配到槽 2：40000 → 40002；u4 落回序号 0，端口没变"
+            resubscribe_impact(&s, &after),
+            vec!["u1".to_string(), "u2".to_string(), "u5".to_string()],
+            "u1 被重新分配到槽 2（40000 → 40002）、u2 与 u5 随槽 1 被搬到 0；\
+             u4 落回序号 0，端口与区间都没动"
         );
-        assert_eq!(
-            i.moved_to_zero,
-            vec!["u2".to_string(), "u5".to_string()],
-            "槽 1 被搬到 0，上面两个人的端口一起下移"
-        );
+        assert_eq!(node_of(&after, "u4"), node_of(&s, "u4"));
     }
 
     /// 只开 vless-reality 的住宅用户永不进名单：他的订阅里压根没有 HY2 住宅节点
@@ -775,30 +764,23 @@ mod tests {
         let mut s = state(3, 3);
         migrate_unassigned(&mut s);
         s.users[1].entitlements.protocols = vec![crate::model::Protocol::Reality];
-        assert!(
-            port_change_impact(&s, Uuid::from_u128(2)).is_empty(),
-            "槽 1 上只有 u2，而 u2 没有 HY2 住宅节点"
-        );
+        // 删槽 1（上面只有 u2）：槽 0 / 槽 2 的序号与区间都不动，u2 自己没有 HY2 住宅节点
+        assert!(resubscribe_impact(&s, &after_remove(&s, Uuid::from_u128(2))).is_empty());
     }
 
-    /// 空名单的三种来源：槽上没有用户、槽位表只剩一个、uuid 不在槽位表里。
+    /// 空名单：期望态没变，以及池里只剩一条时删掉它（槽位表清空 ⇒ 渲染退回单槽，
+    /// `40000` + 完整区间照旧有人听）。
     #[test]
-    fn port_change_impact_is_empty_when_nobody_moves() {
-        let mut s = state(3, 2);
-        migrate_unassigned(&mut s); // u1 → 槽 0，u2 → 槽 1；槽 2 空着
-        assert!(
-            port_change_impact(&s, Uuid::from_u128(3)).is_empty(),
-            "槽上没有用户 ⇒ 不打名单"
-        );
-        assert!(
-            port_change_impact(&s, Uuid::from_u128(99)).is_empty(),
-            "不在槽位表里的 uuid ⇒ 空"
-        );
-        // 池里只剩一条：删完槽位表清空，渲染退回单槽，hy2_resi 照旧有人听 ⇒ 端口不变
+    fn nobody_is_listed_when_the_subscription_still_works() {
+        let mut s = state(3, 3);
+        migrate_unassigned(&mut s);
+        assert!(resubscribe_impact(&s, &s).is_empty(), "同一份期望态 ⇒ 空");
         let mut one = state(1, 2);
         migrate_unassigned(&mut one);
-        assert_eq!(one.residential.slots.len(), 1);
-        assert!(port_change_impact(&one, Uuid::from_u128(1)).is_empty());
+        let after = after_remove(&one, Uuid::from_u128(1));
+        assert!(after.residential.slots.is_empty());
+        assert_eq!(node_of(&after, "u1"), (40000, Some((41000, 50000))));
+        assert!(resubscribe_impact(&one, &after).is_empty());
     }
 
     /// 规则 3：rebalance 均匀重排，且**幂等**（连调两次第二次零改动）。

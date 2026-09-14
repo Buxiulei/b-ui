@@ -674,49 +674,25 @@ fn upstream_groups(
     out
 }
 
-/// `remove` 的人读渲染：把「HY2 住宅端口已变化」的用户名打给操作者，让他通知这些人
-/// 重新获取订阅（端口写死在已下发的订阅里，客户端要等下一次订阅更新才会知道）。
+/// `remove` 的人读渲染：把「必须重新获取订阅」的用户名打给操作者。
 ///
-/// 删 0 号槽可能同时打到两批人（被重新分配到别的槽的 + 槽序号被搬到 0 的），成因不同，
-/// 所以两组都在时分组说明。**没有人受影响时不打空名单。**
+/// 名单来自回包的 `resubscribe`（服务端已按「手里那份订阅还能不能用」算过）：HY2 住宅
+/// 节点的端口或端口跳跃区间写死在已下发的订阅里，客户端要等下一次订阅更新才会知道它变了。
+/// **没有人受影响时不打空名单。**
 pub fn format_remove(v: &serde_json::Value) -> String {
-    let names = |k: &str| -> Vec<String> {
-        v.get("port_changed")
-            .and_then(|p| p.get(k))
-            .and_then(|x| x.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|x| x.as_str())
-                    .map(String::from)
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    let (removed, moved) = (names("removed_slot"), names("moved_to_zero"));
-    let head = |n: usize| {
-        format!("上游已移除。以下 {n} 个用户的 HY2 住宅节点端口已变化，需要重新获取订阅")
-    };
-    match (removed.is_empty(), moved.is_empty()) {
-        (true, true) => "上游已移除（没有用户的 HY2 住宅端口受影响）".into(),
-        (false, true) => format!(
-            "{}（他们原在被删的槽上，已重新分配到别的槽）：{}",
-            head(removed.len()),
-            removed.join("、")
-        ),
-        (true, false) => format!(
-            "{}（他们的槽被搬到 0 号槽，端口随之下移）：{}",
-            head(moved.len()),
-            moved.join("、")
-        ),
-        (false, false) => format!(
-            "{}：\n  原在被删槽的 {} 个用户（已重新分配到别的槽）：{}\n  被搬到 0 号槽的 {} 个用户（0 号槽不许悬空，端口随之下移）：{}",
-            head(removed.len() + moved.len()),
-            removed.len(),
-            removed.join("、"),
-            moved.len(),
-            moved.join("、"),
-        ),
+    let users: Vec<&str> = v
+        .get("resubscribe")
+        .and_then(|x| x.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+        .unwrap_or_default();
+    if users.is_empty() {
+        return "上游已移除（没有用户需要重新获取订阅）".into();
     }
+    format!(
+        "上游已移除。以下 {} 个用户的 HY2 住宅节点端口 / 跳跃区间已变化，必须重新获取订阅：{}",
+        users.len(),
+        users.join("、")
+    )
 }
 
 fn print_or(json: bool, v: &serde_json::Value, f: impl Fn(&serde_json::Value) -> String) {
@@ -1224,40 +1200,28 @@ mod tests {
         );
     }
 
-    /// `remove` 的四种回包形态。措辞必须给出可执行的下一步（重新获取订阅），
+    /// `remove` 的三种回包形态。措辞必须给出可执行的下一步（重新获取订阅），
     /// 名单为空时一个名字都不打。
     #[test]
     fn format_remove_tells_the_operator_who_must_refetch_the_subscription() {
-        let v = |removed: &[&str], moved: &[&str]| {
-            serde_json::json!({"success": true,
-                "port_changed": {"removed_slot": removed, "moved_to_zero": moved}})
-        };
+        let v = |users: &[&str]| serde_json::json!({"success": true, "resubscribe": users});
         assert_eq!(
-            format_remove(&v(&[], &[])),
-            "上游已移除（没有用户的 HY2 住宅端口受影响）"
+            format_remove(&v(&[])),
+            "上游已移除（没有用户需要重新获取订阅）"
         );
         assert_eq!(
-            format_remove(&v(&["alice", "bob"], &[])),
-            "上游已移除。以下 2 个用户的 HY2 住宅节点端口已变化，需要重新获取订阅\
-             （他们原在被删的槽上，已重新分配到别的槽）：alice、bob"
+            format_remove(&v(&["alice"])),
+            "上游已移除。以下 1 个用户的 HY2 住宅节点端口 / 跳跃区间已变化，必须重新获取订阅：alice"
         );
-        // 被删的 0 号槽上没有用户，但被搬到 0 的那一槽有 ⇒ 只打那一组，成因照旧要说
         assert_eq!(
-            format_remove(&v(&[], &["carol"])),
-            "上游已移除。以下 1 个用户的 HY2 住宅节点端口已变化，需要重新获取订阅\
-             （他们的槽被搬到 0 号槽，端口随之下移）：carol"
+            format_remove(&v(&["alice", "bob", "carol"])),
+            "上游已移除。以下 3 个用户的 HY2 住宅节点端口 / 跳跃区间已变化，必须重新获取订阅：\
+             alice、bob、carol"
         );
-        // 删 0 号槽：两组都列，分别说明原因
-        assert_eq!(
-            format_remove(&v(&["alice"], &["bob", "carol"])),
-            "上游已移除。以下 3 个用户的 HY2 住宅节点端口已变化，需要重新获取订阅：\n  \
-             原在被删槽的 1 个用户（已重新分配到别的槽）：alice\n  \
-             被搬到 0 号槽的 2 个用户（0 号槽不许悬空，端口随之下移）：bob、carol"
-        );
-        // 旧回包（没有 port_changed 字段）不该 panic
+        // 旧回包（没有 resubscribe 字段）不该 panic
         assert_eq!(
             format_remove(&serde_json::json!({"success": true})),
-            "上游已移除（没有用户的 HY2 住宅端口受影响）"
+            "上游已移除（没有用户需要重新获取订阅）"
         );
     }
 

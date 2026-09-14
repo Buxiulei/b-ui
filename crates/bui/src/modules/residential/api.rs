@@ -1102,20 +1102,19 @@ async fn post_add(
     .into_response())
 }
 
-/// 删上游两个端点共用的回包：v3 的 `success` + v4 追加的 `port_changed`（spec §5.6）。
+/// 删上游两个端点共用的回包：v3 的 `success` + v4 追加的 `resubscribe`（spec §5.6）。
 ///
-/// `port_changed.removed_slot` / `port_changed.moved_to_zero` 各是一组**用户名**
-/// （不含凭据、不含订阅 token），只列 HY2 住宅端口（`hy2_resi + 槽序号`）**真的**变了的
-/// 人：前者的槽位随上游一起消失、他们被重新分配到了别的槽；后者只在**删 0 号槽**时非空
-/// —— 槽位不变量 3 会把现存序号最小的槽搬到 0，那一槽的用户端口跟着下移。两组人都必须
-/// 重新获取订阅，否则已下发的 HY2 住宅节点连不上（客户端不会主动发现端口变了，要等下
-/// 一次订阅更新）。被删槽上的用户常常被重新分配回序号 0，端口没变就不进名单；无人受
-/// 影响时两个数组都为空。
+/// `resubscribe` 是一组**用户名**（升序，不含凭据、不含订阅 token）：他们的 HY2 住宅节点
+/// 端口（`hy2_resi + 槽序号`）或端口跳跃区间（`hy2_resi_hop` 按槽位空间等分）被这次删除
+/// 改了，必须重新获取订阅，否则已下发的那个节点连不上 —— 客户端不会主动发现，要等下一次
+/// 订阅更新。只列手里那份订阅**真的**不能用了的人：被删槽上的用户常常被重新分配回序号 0
+/// （端口没变），旧跳跃区间仍整段落在本槽新区间内的也不算（区间被切成前缀时每个端口照旧
+/// 打到本槽实例）；无人受影响时是空数组。
 ///
 /// 同一份名单也落一条 `runtime.json` 的 `incidents`（签名 `resi_slot_port_changed`），
 /// 面板事件卡与 `bui incidents` 都看得到。
-fn remove_response(impact: &bui_schema::slots::PortChangeImpact) -> axum::response::Response {
-    Json(serde_json::json!({ "success": true, "port_changed": impact })).into_response()
+fn remove_response(resubscribe: &[String]) -> axum::response::Response {
+    Json(serde_json::json!({ "success": true, "resubscribe": resubscribe })).into_response()
 }
 
 async fn post_remove(
@@ -1134,10 +1133,10 @@ async fn post_remove(
         (None, None) => return Err(err(StatusCode::BAD_REQUEST, "id 或 host_port 字段必填")),
     };
     let ctx = ctx_of(&app, &d.paths);
-    let impact = upstream::remove(&ctx, &sel)
+    let resubscribe = upstream::remove(&ctx, &sel)
         .await
         .map_err(map_upstream_err)?;
-    Ok(remove_response(&impact))
+    Ok(remove_response(&resubscribe))
 }
 
 /// v3 别名 `DELETE /api/residential/urls/<host:port>`（路径段是 URL 编码的 `host:port`）
@@ -1149,10 +1148,10 @@ async fn delete_url(
     let sel = upstream::UpstreamSel::parse_host_port(&host_port)
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "路径必须是 host:port"))?;
     let ctx = ctx_of(&app, &d.paths);
-    let impact = upstream::remove(&ctx, &sel)
+    let resubscribe = upstream::remove(&ctx, &sel)
         .await
         .map_err(map_upstream_err)?;
-    Ok(remove_response(&impact))
+    Ok(remove_response(&resubscribe))
 }
 
 /// v3 的空体启用请求（`web/app.js:37-50` 不带 `Content-Type`）：提取器必须是
@@ -2035,9 +2034,10 @@ mod tests {
         );
     }
 
-    /// 删上游的回包必须带 `port_changed` 的两组用户名（面板与 CLI 的唯一提示来源），
-    /// 同一份名单落一条事件。名单里只有用户名，且只有端口**真的**变了的人 —— 删 0 号槽
-    /// 时被删槽上的 alice 被重新分配回序号 0（40000 → 40000），她不该被要求重取订阅。
+    /// 删上游的回包必须带 `resubscribe` 名单（面板与 CLI 的唯一提示来源），同一份名单
+    /// 落一条事件。名单里只有用户名，且只有手里那份订阅**真的**不能用了的人 —— 删 0 号槽
+    /// 时被删槽上的 alice 被重新分配回序号 0（端口还是 40000、旧跳跃区间仍整段落在新区间
+    /// 内），她不该被要求重取订阅。
     #[tokio::test]
     async fn removing_an_upstream_reports_who_must_refetch_the_subscription() {
         let d = tempfile::tempdir().unwrap();
@@ -2085,14 +2085,9 @@ mod tests {
         assert_eq!(st, StatusCode::OK);
         assert_eq!(v["success"], true);
         assert_eq!(
-            v["port_changed"]["moved_to_zero"],
+            v["resubscribe"],
             serde_json::json!(["bob"]),
-            "槽 1 被搬到 0，那一槽的用户端口跟着下移"
-        );
-        assert_eq!(
-            v["port_changed"]["removed_slot"],
-            serde_json::json!([]),
-            "alice 被重新分配到了现在占着序号 0 的槽，端口还是 40000"
+            "bob 随槽 1 被搬到 0（40001 → 40000）；alice 落回序号 0，端口与区间都还能用"
         );
         let body = v.to_string();
         assert!(
@@ -2102,8 +2097,8 @@ mod tests {
         // CLI 打印的就是这份回包
         let text = crate::modules::residential::cli::format_remove(&v);
         assert!(
-            text.contains("以下 1 个用户的 HY2 住宅节点端口已变化")
-                && text.contains("（他们的槽被搬到 0 号槽，端口随之下移）：bob")
+            text.contains("以下 1 个用户的 HY2 住宅节点端口 / 跳跃区间已变化")
+                && text.ends_with("必须重新获取订阅：bob")
                 && !text.contains("alice"),
             "{text}"
         );
@@ -2113,7 +2108,7 @@ mod tests {
         assert_eq!(incs[0].signature, "resi_slot_port_changed");
         assert_eq!(
             incs[0].result,
-            "1 个用户的 HY2 住宅节点端口已变化，需重新获取订阅：被搬到 0 号槽 bob"
+            "1 个用户的 HY2 住宅节点端口 / 跳跃区间已变化，需重新获取订阅：bob"
         );
     }
 

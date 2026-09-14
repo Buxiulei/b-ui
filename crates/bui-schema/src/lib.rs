@@ -33,9 +33,9 @@
 //!   由 [`slots::resources_of`] 从 [`Ports`](model::Ports) 与槽序号纯函数算出。
 //! - [`slots::sync_slots`] / [`slots::least_loaded`] / [`slots::assign`] /
 //!   [`slots::migrate_unassigned`] / [`slots::rebalance`]：spec §5.6 的分配规则，纯函数。
-//! - [`slots::port_change_impact`]：删一条上游前算出 HY2 住宅端口会变的用户
-//!   （[`PortChangeImpact`](slots::PortChangeImpact)，只有用户名），删上游的执行路径据此
-//!   提示操作者哪些人要重新获取订阅。
+//! - [`slots::resubscribe_impact`]：比对改池前后两份期望态，算出手里那份订阅已经不能用
+//!   （HY2 住宅端口或跳跃区间变了）的用户名，改池的执行路径据此提示操作者哪些人要重新
+//!   获取订阅。
 //!
 //! ## 订阅 token 与旧链接宽限期 —— [`sub`]
 //!
