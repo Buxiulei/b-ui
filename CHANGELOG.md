@@ -39,7 +39,7 @@ v4 是一次完全重写：控制面与 Linux 客户端改为 Rust 单二进制�
 - 定时任务全部收进守护进程：不再有 cron 行，也不再有 `hy2-watchdog` / `b-ui-resi-health` 等独立 timer。
 - 升级到本版本时 `b-ui-relay` 与 `xray` 各重启一次（中继入站改成每槽一个 `slot-<i>`；xray 的住宅出站改名 `relay-slot-<i>`、`api.services` 追加 `RoutingService`），此后稳定；既有安装的槽位与用户分配在守护进程首次启动时按创建时间自动补齐，**非槽 0 的用户住宅 HY2 端口会变，需刷新一次订阅**。
 - 升级提示（运维）：已装 v4.0.0-rc6 / rc7 的 `bui-c` 需要在客户端机器上重跑一次面板下发的安装脚本 `curl -fsSL https://<面板域名>/packages/bui-c-install.sh | sudo bash` 才能换到新构建（旧版 `bui-c update` 只比版本号，看不见同版本重建）；之后同版本重建由 `bui-c update` 自己跟上。
-- 回滚注意（运维）：rc12 回滚到 rc11 再升回 rc12 会**重新生成全部订阅 token**——rc11 写 `state.json` 时会丢掉它不认识的新字段，`bui upgrade --rollback` 也会恢复升级前的旧 state 备份——已发出的 token 链接全部失效、需要重发；轮换过的用户其「用户名链接已停用」标记也会被清零，在重新开出的 7 天宽限期里复活。客户端已导入的节点凭据不受影响、不会断连。建议全员换成 token 链接后执行 `bui set legacy-sub off`。
+- 回滚注意（运维）：rc12 回滚到 rc11 再升回 rc12 会**重新生成全部订阅 token**——rc11 写 `state.json` 时会丢掉它不认识的新字段，`bui upgrade --rollback` 恢复的又是 `state.backups/` 里最近的一份（最后一次写 `state.json` 之前的那一版；升级后守护进程补 token 就是一次写盘，此后没再写过的话恢复的就是升级前、没有 token 的那一版）——已发出的 token 链接全部失效、需要重发；轮换过的用户其「用户名链接已停用」标记也会被清零，在重新开出的 7 天宽限期里复活。`--rollback` 等于撤销 rc12 上最后一次写 `state.json` 的改动：没在那次改动里换过凭据的用户，节点凭据（hy2 密码、vless uuid）不受影响、不会断连；若那次改动正好是轮换某个用户（之后再没有别的写盘），回滚恢复的是轮换之前的备份，该用户的 hy2 密码与 vless uuid 会退回旧值，轮换后重新导入的客户端会连不上，需要再轮换一次并重发。建议全员换成 token 链接后执行 `bui set legacy-sub off`。
 
 ### 移除
 - v3 的 shell 与 Node 实现：`server/*.sh`（5 个）、`web/server.js`、`web/{package.json,package-lock.json,node_modules/}`、`b-ui-client.sh`、`b-ui-server.sh`、`version.json`、`test-hy2-tun-config.json`。前端三文件 `web/{index.html,app.js,style.css}` 保留，由 `bui` 内嵌。
