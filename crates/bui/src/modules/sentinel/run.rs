@@ -696,7 +696,11 @@ mod tests {
 
     /// 演练判据①的延迟预算（2026-09-13 真机 30.3 秒、SLA 15 秒之后）：达到门槛的那条错误最晚在它
     /// 之后一个轮询周期被读到；带外探测 TCP 不通最多等 PROBE_TCP_TIMEOUT_SECS 就判不可达，不再跑
-    /// 完整探测；借用只是毫秒级的 Clash PUT（留 1 秒）
+    /// 完整探测；借用 = 一次 Clash PUT 加借到那条的带外验证 —— 这条快路上验证的目标网关是通的
+    /// （只丢了一个端口），一次经隧道的 GET 远小于 1 秒，所以留 1 秒。**验证走不通的那条慢路**
+    /// （网关活着、出口 IP 死了）由 `slots::BORROW_VERIFY_BUDGET_SECS` 的整体时限兜住，见
+    /// `with_the_whole_gateway_down_the_event_lands_within_the_no_exit_sla` 与
+    /// `slots::tests::a_verification_that_outruns_its_budget_keeps_the_candidate_and_says_so`
     #[tokio::test]
     async fn a_dropped_gateway_is_borrowed_within_one_poll_plus_the_tcp_timeout() {
         assert_eq!(
@@ -735,8 +739,13 @@ mod tests {
     }
 
     /// **整个网关不可用**（池里各条都在同一个网关上）时最慢的那条路：原上游快探 3 秒 +
-    /// 两个候选各「PUT + 快探 3 秒」+ 收尾 PUT，事件才落地。演练判据拆成两条正是为此：
-    /// 有可用出口 ≤15 秒，无可用出口 ≤25 秒（`DRILL_NOEXIT_SLA`）
+    /// 每个候选「PUT + 快探」+ 收尾 PUT，事件才落地。演练判据拆成两条正是为此：
+    /// 有可用出口 ≤15 秒，无可用出口 ≤25 秒（`DRILL_NOEXIT_SLA`）。
+    /// 这里的假时钟只推得动「网关 TCP 连不上」那一段（`on_tcp_fail`），与真机丢包一样 ——
+    /// 网关活着、HTTP 卡住那一段的上界靠 `slots::BORROW_VERIFY_BUDGET_SECS` 的 `timeout`，
+    /// 在 `slots` 那边用假件单独测（丢包量不到它）。
+    /// 候选数上限是**单次调用**的 `slots::BORROW_PROBES_PER_CALL`，所以这里的算式
+    /// `POLL + (1 + 候选数) × PROBE_TCP_TIMEOUT_SECS` 在 8 条上游的生产池上同样成立
     #[tokio::test]
     async fn with_the_whole_gateway_down_the_event_lands_within_the_no_exit_sla() {
         const DRILL_NOEXIT_SLA: i64 = 25;
@@ -751,8 +760,8 @@ mod tests {
         let inc = &rep.incidents[0];
         assert_eq!(
             inc.result,
-            "IP 198.51.100.8 不可达，槽 1：候选 198.51.100.7、198.51.100.9 均不可达，\
-             已放回本槽 IP 198.51.100.8，当前无可用出口"
+            "IP 198.51.100.8 不可达，槽 1：候选 198.51.100.7、198.51.100.9 都探不通，\
+             当前指向本槽 IP 198.51.100.8，当前无可用出口"
         );
         assert!(!inc.result.contains("已临时切到"), "{}", inc.result);
         assert_eq!(

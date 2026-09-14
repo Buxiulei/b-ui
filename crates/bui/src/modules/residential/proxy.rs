@@ -804,6 +804,11 @@ pub struct FakeProberInner {
     pub tcp_by_endpoint: std::collections::BTreeMap<String, Option<u64>>,
     /// `gateway_tcp_within` 连不上时带着时限调一次：测试用它把「丢包时等满时限」记到假时钟上
     pub on_tcp_fail: Option<Box<dyn Fn(std::time::Duration) + Send>>,
+    /// 非空时**经隧道的 GET**（`get` / `timed_get`）停在这道闸门上，直到测试
+    /// [`Gate::open`]：模拟「网关活着、隧道不响应」—— `probe_quick` 那条路上真正的耗时大头
+    /// （`timed_get` + `get` + 407 补判，最坏 ≈40 秒），测 `slots::borrow_now` 的验证撞上
+    /// `BORROW_VERIFY_BUDGET_SECS` 整体时限用
+    pub gate: Option<std::sync::Arc<Gate>>,
     /// [`Prober::timed_get`] 的耗时；结果本身仍查 `gets`（同一份 URL 表）
     pub http_ms: Option<u64>,
     /// [`Prober::stun_binding`] 的返回，缺省 `UdpProbe::default()`（不通、没耗时）
@@ -881,6 +886,38 @@ fn fake_get(i: &FakeProberInner, up: &Upstream, url: &str) -> Result<HttpProbe, 
     fake_result(i.gets.get(&keyed).or_else(|| i.gets.get(url)))
 }
 
+/// 测试用的闸门（[`FakeProberInner::gate`]）：让假探测器在经隧道的 GET 上停住，直到测试放行。
+/// 等待发生在 `FakeProber` 那把锁**外面**，不然测试连 `calls()` 都读不出来
+#[cfg(test)]
+#[derive(Default)]
+pub struct Gate {
+    open: std::sync::Mutex<bool>,
+    passable: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl Gate {
+    fn wait(&self) {
+        let mut open = self.open.lock().expect("Gate 锁被毒化");
+        while !*open {
+            open = self.passable.wait(open).expect("Gate 锁被毒化");
+        }
+    }
+
+    /// 放行（测试在断言之前调用，别把阻塞线程拖到 runtime 关闭）
+    pub fn open(&self) {
+        *self.open.lock().expect("Gate 锁被毒化") = true;
+        self.passable.notify_all();
+    }
+}
+
+#[cfg(test)]
+fn wait_at_gate(gate: Option<std::sync::Arc<Gate>>) {
+    if let Some(g) = gate {
+        g.wait();
+    }
+}
+
 /// 假件的 `host:port` → 网关 TCP 建连耗时：按端点覆盖优先，未命中落回 `tcp_ms`
 #[cfg(test)]
 fn fake_tcp_ms(i: &FakeProberInner, up: &Upstream) -> Option<u64> {
@@ -902,9 +939,13 @@ impl Prober for FakeProber {
     }
 
     fn get(&self, up: &Upstream, url: &str) -> Result<HttpProbe, ProbeError> {
-        let mut i = self.inner.lock().expect("FakeProber 锁被毒化");
-        i.calls.push(format!("get:{url}"));
-        fake_get(&i, up, url)
+        let (r, gate) = {
+            let mut i = self.inner.lock().expect("FakeProber 锁被毒化");
+            i.calls.push(format!("get:{url}"));
+            (fake_get(&i, up, url), i.gate.clone())
+        };
+        wait_at_gate(gate);
+        r
     }
 
     fn google_search(&self, _up: &Upstream) -> Result<HttpProbe, ProbeError> {
@@ -944,14 +985,17 @@ impl Prober for FakeProber {
     }
 
     fn timed_get(&self, up: &Upstream, url: &str) -> (Option<u64>, Result<HttpProbe, ProbeError>) {
-        let mut i = self.inner.lock().expect("FakeProber 锁被毒化");
-        // 只记一条 `timed:`：真实实现就是**一次**请求，记两条会让按 calls() 数请求数的
-        // 测试把它当成两次
-        i.calls.push(format!("timed:{url}"));
-        // 结果查同一份 `gets` 表（真实实现也是一次普通 GET，只是带 UA 并计时）；
-        // 失败时不给耗时，与 `ReqwestProber::timed_get` 同口径
-        let r = fake_get(&i, up, url);
-        (r.is_ok().then_some(i.http_ms).flatten(), r)
+        let (r, http_ms, gate) = {
+            let mut i = self.inner.lock().expect("FakeProber 锁被毒化");
+            // 只记一条 `timed:`：真实实现就是**一次**请求，记两条会让按 calls() 数请求数的
+            // 测试把它当成两次
+            i.calls.push(format!("timed:{url}"));
+            // 结果查同一份 `gets` 表（真实实现也是一次普通 GET，只是带 UA 并计时）；
+            // 失败时不给耗时，与 `ReqwestProber::timed_get` 同口径
+            (fake_get(&i, up, url), i.http_ms, i.gate.clone())
+        };
+        wait_at_gate(gate);
+        (r.is_ok().then_some(http_ms).flatten(), r)
     }
 
     fn stun_binding(&self, up: &Upstream) -> UdpProbe {

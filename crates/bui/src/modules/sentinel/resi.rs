@@ -38,33 +38,66 @@ fn name_of(g: &ResidentialGroup, id: Uuid) -> String {
         .unwrap_or_else(|| id.to_string())
 }
 
-/// `borrow_now` 的结果 → 「槽 1 已临时切到 Y；槽 2：候选 A、B 均不可达，已放回本槽 IP C，
+/// `borrow_now` 的结果 → 「槽 1 已临时切到 Y；槽 2：候选 A、B 都探不通，当前指向本槽 IP C，
 /// 当前无可用出口；槽 3 已手动锁定，未动」。
-/// `switched` 才允许说「已临时切到」——它在 `borrow_now` 里意味着**当下带外验证过**；
-/// `dead` 非空而没切成 = 候选逐条验证都不通，必须把终态（selector 已放回本槽 IP）说出来
+///
+/// 每一槽都按「**谁失败、失败在哪一步、现在指向谁**」写：
+/// - `switched && !unconfirmed` ⇒ 「已临时切到 Y」。**只有这一种**能这么说 —— 它在 `borrow_now`
+///   里意味着「刚切过去的那条当下带外验证确认可用」，而事件 / `bui status` / 面板三处都把这句
+///   读作「处置成功」；
+/// - `switched && unconfirmed` ⇒ 「已切到 Y，<没能确认的原因>」：切是切了，但没拿到「它能用」
+///   的证据（保留它是因为本槽原来的出口是已知死的），绝不用「已临时切到」那句话；
+/// - 没切成 ⇒ 先说哪几个候选**探不通**（一条就不说「都」），再说卡在哪一步（PUT 失败 / 连放回
+///   本槽都失败），最后一定说清**现在指向谁**；
+/// - 「当前无可用出口」这句话只跟着 `no_exit` 出现（候选试完了、逐条被证死）。中途 PUT 失败停
+///   下来的那条路不说这句 —— 剩下的候选压根没探过。演练 `--all-ports` 的判据②' 认这个关键词。
 fn borrow_text(g: &ResidentialGroup, moved: &[SlotOutcome]) -> String {
     if moved.is_empty() {
         return "当前没有槽经它出网".into();
     }
     moved
         .iter()
-        .map(|o| {
-            if o.switched {
-                format!("槽 {} 已临时切到 {}", o.index, name_of(g, o.target))
-            } else if !o.dead.is_empty() {
-                let cands: Vec<String> = o.dead.iter().map(|id| name_of(g, *id)).collect();
-                let tail = o.note.clone().unwrap_or_else(|| {
-                    format!("已放回本槽 IP {}，当前无可用出口", name_of(g, o.own))
-                });
-                format!("槽 {}：候选 {} 均不可达，{tail}", o.index, cands.join("、"))
-            } else if o.note.as_deref() == Some(slots::PINNED_UNTOUCHED_NOTE) {
-                format!("槽 {} {}", o.index, slots::PINNED_UNTOUCHED_NOTE)
-            } else {
-                format!("槽 {}：{}", o.index, o.note.clone().unwrap_or_default())
-            }
-        })
+        .map(|o| slot_text(g, o))
         .collect::<Vec<_>>()
         .join("；")
+}
+
+fn slot_text(g: &ResidentialGroup, o: &SlotOutcome) -> String {
+    if o.switched && !o.unconfirmed {
+        return format!("槽 {} 已临时切到 {}", o.index, name_of(g, o.target));
+    }
+    if o.switched {
+        return format!(
+            "槽 {} 已切到 {}，{}",
+            o.index,
+            name_of(g, o.target),
+            o.note.as_deref().unwrap_or("未确认可用")
+        );
+    }
+    if o.note.as_deref() == Some(slots::PINNED_UNTOUCHED_NOTE) {
+        return format!("槽 {} {}", o.index, slots::PINNED_UNTOUCHED_NOTE);
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if !o.dead.is_empty() {
+        let cands: Vec<String> = o.dead.iter().map(|id| name_of(g, *id)).collect();
+        parts.push(if cands.len() == 1 {
+            format!("候选 {} 探不通", cands[0])
+        } else {
+            format!("候选 {} 都探不通", cands.join("、"))
+        });
+    }
+    if let Some(n) = &o.note {
+        parts.push(n.clone());
+    }
+    parts.push(if o.target == o.own {
+        format!("当前指向本槽 IP {}", name_of(g, o.own))
+    } else {
+        format!("当前指向 {}", name_of(g, o.target))
+    });
+    if o.no_exit {
+        parts.push("当前无可用出口".into());
+    }
+    format!("槽 {}：{}", o.index, parts.join("，"))
 }
 
 fn gone(id: Uuid) -> Outcome {
@@ -327,8 +360,8 @@ mod tests {
         let o = on_upstream_error(&ctx, p.clone(), c.clone(), u(2), t0()).await;
         assert_eq!(
             o.result,
-            "IP 198.51.100.8 不可达，槽 1：候选 198.51.100.7、198.51.100.9 均不可达，\
-             已放回本槽 IP 198.51.100.8，当前无可用出口"
+            "IP 198.51.100.8 不可达，槽 1：候选 198.51.100.7、198.51.100.9 都探不通，\
+             当前指向本槽 IP 198.51.100.8，当前无可用出口"
         );
         assert!(!o.result.contains("已临时切到"), "{}", o.result);
         assert_eq!(o.level, Level::Error);
@@ -354,7 +387,7 @@ mod tests {
         assert_eq!(r.upstream_alerts.get(&u(2)), Some(&o.result));
     }
 
-    /// 连「放回本槽」都失败：事件把这一层也说出来（终态未知，可能仍停在最后一个候选上）
+    /// 连「放回本槽」都失败：事件把这一层也说出来（哪一步失败 + 现在指向谁）
     #[tokio::test]
     async fn a_failed_put_back_is_spelled_out_in_the_event() {
         let d = tempfile::tempdir().unwrap();
@@ -366,15 +399,15 @@ mod tests {
         let o = on_upstream_error(&ctx, p, c, u(2), t0()).await;
         assert!(
             o.result.starts_with(
-                "IP 198.51.100.8 不可达，槽 1：候选 198.51.100.7、198.51.100.9 均不可达，\
+                "IP 198.51.100.8 不可达，槽 1：候选 198.51.100.7、198.51.100.9 都探不通，\
                  放回本槽 IP 也失败：切到 resi-2 失败："
             ),
             "{}",
             o.result
         );
         assert!(
-            o.result.ends_with("当前可能仍停在最后一个候选上"),
-            "{}",
+            o.result.ends_with("当前指向 198.51.100.9，当前无可用出口"),
+            "终态指向谁必须写出来：{}",
             o.result
         );
         assert_eq!(
@@ -382,6 +415,60 @@ mod tests {
             Some(u(3)),
             "selector 还停在最后一个候选上，runtime 如实记"
         );
+    }
+
+    /// 文案口径（裁决 D18）：**只有「当下确认可用」那一种**能说「已临时切到」；没能确认要如实说
+    /// 未确认；没切成要说清哪几个候选探不通、卡在哪一步、**现在指向谁**；「无可用出口」这个关键词
+    /// 只跟着 `no_exit` 出现（演练 `--all-ports` 判据②' 认它）。
+    #[tokio::test]
+    async fn each_borrow_shape_says_who_failed_where_and_where_it_points_now() {
+        let d = tempfile::tempdir().unwrap();
+        let (ctx, _host) = pool_ctx(d.path()).await;
+        let g = state::group_of(&*ctx.store.read().await);
+        let borrowed = SlotOutcome {
+            index: 1,
+            own: u(2),
+            target: u(1),
+            borrowed: true,
+            switched: true,
+            unconfirmed: false,
+            no_exit: false,
+            note: None,
+            dead: Vec::new(),
+        };
+        assert_eq!(
+            borrow_text(&g, std::slice::from_ref(&borrowed)),
+            "槽 1 已临时切到 198.51.100.7"
+        );
+
+        let unconfirmed = SlotOutcome {
+            unconfirmed: true,
+            note: Some("未能在 4 秒内确认可用".into()),
+            ..borrowed.clone()
+        };
+        let t = borrow_text(&g, &[unconfirmed]);
+        assert_eq!(t, "槽 1 已切到 198.51.100.7，未能在 4 秒内确认可用");
+        assert!(
+            !t.contains("已临时切到") && !t.contains("无可用出口"),
+            "{t}"
+        );
+
+        // 试到第二个候选时 PUT 失败：候选没试完 ⇒ 不许说「无可用出口」
+        let put_failed = SlotOutcome {
+            target: u(2),
+            borrowed: false,
+            switched: false,
+            dead: vec![u(3)],
+            note: Some("切到 resi-1 失败：404".into()),
+            ..borrowed.clone()
+        };
+        let t = borrow_text(&g, &[put_failed]);
+        assert_eq!(
+            t,
+            "槽 1：候选 198.51.100.9 探不通，切到 resi-1 失败：404，当前指向本槽 IP 198.51.100.8",
+            "一条候选就不说「都」"
+        );
+        assert!(!t.contains("无可用出口"), "{t}");
     }
 
     /// 唯一经这条 IP 出网的槽被管理员 pin 住：不动它，但告警要如实说，不能说「当前没有槽经它出网」
