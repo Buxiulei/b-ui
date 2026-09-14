@@ -6,6 +6,10 @@
 #   nohup bash /opt/b-ui/ops/upgrade-drill.sh --to 4.0.1 \
 #     --manifest-url http://127.0.0.1:8000/v4.0.1/manifest.json \
 #     --users alice,bob --out /var/log/bui-drill >/dev/null 2>&1 &
+# 适用范围：升级前后两端都得是 v4.0.0-rc12 及以上。订阅指纹按 state.json 的 users[].sub_token
+# 取（2026-09-14 订阅 token），rc11 及更早的 state 没有这个字段——任一相位的 state.json 里任一
+# 目标用户没有 sub_token 就 FATAL 退 2（前置条件不满足，不报成订阅漂移或取订阅失败），所以
+# rc11→rc12 这一跳不能用本脚本演练。
 set -uo pipefail
 LC_ALL=C
 
@@ -87,13 +91,17 @@ snapshot() {
     for f in bui hysteria xray sing-box caddy; do
         rec "$phase" "sha:bin/$f" "$(sha_file "$BASE/bin/$f")"
     done
+    # 适用范围守卫（见文件头）：先把这一相位所有目标用户的 token 查一遍，缺一个就 FATAL，
+    # 一条订阅都不取、一条 sub: 指纹都不记
+    for u in ${USERS//,/ }; do
+        [[ -n "$(sub_token "$u")" ]] && continue
+        local hint=""
+        [[ "$phase" == after-upgrade ]] && hint="；升级已执行、回滚未执行"
+        fatal "$phase：state.json 里 $u 没有 sub_token——本演练要求升级前后两端都是 rc12 及以上（该相位的 state.json 没有订阅 token）$hint" \
+            "sub-token-missing:$phase:$u"
+    done
     for u in ${USERS//,/ }; do
         tok=$(sub_token "$u")
-        if [[ -z "$tok" ]]; then
-            log "FAIL $phase：state.json 里取不到 $u 的 sub_token，订阅取不了"
-            note_fail "sub-token:$phase:$u"
-            continue
-        fi
         for kind in sub subscription clash; do
             case "$kind" in
                 sub) url="$API/api/sub/$tok" ;;
@@ -145,6 +153,14 @@ all_active() {
 
 FAILED=""
 note_fail() { [[ -n "$FAILED" ]] || FAILED="$1"; }
+# 前置条件不满足：$1 = 文案，$2 = 原因标签。退 2（口径同开头的参数与 python3 守卫），并照样写
+# DONE —— nohup 跑的时候盯的是 DONE，不写就一直等不到结论
+fatal() {
+    log "FATAL $1"
+    printf 'verdict=FATAL reason=%s finished=%s manifest=%s backup=%s\n' \
+        "$2" "$(date -u +%FT%TZ)" "${MANIFEST_URL:-默认}" "$BK" > "$DONE"
+    exit 2
+}
 
 log "演练开始：base=$BASE bui=$BUI to=${TO:-manifest 里的版本} manifest=${MANIFEST_URL:-默认（GitHub Releases latest）} users=$USERS"
 BK="$OUT/backup-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
