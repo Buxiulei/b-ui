@@ -508,7 +508,14 @@ mod tests {
         let s = format!("{:?}", targets[0]);
         assert!(s.contains("HY2直连"), "{s}");
         assert!(s.contains("20800"), "{s}");
-        for secret in ["probe-user-0", "probe-pass-0", "hy2-pw", "obfs-pw"] {
+        // host 也不能露：真机上 label 带面板用户名，域名 + 用户名就等于订阅凭据
+        for secret in [
+            "probe-user-0",
+            "probe-pass-0",
+            "hy2-pw",
+            "obfs-pw",
+            "panel.example.com",
+        ] {
             assert!(!s.contains(secret), "{secret} 不该出现在 {s}");
         }
     }

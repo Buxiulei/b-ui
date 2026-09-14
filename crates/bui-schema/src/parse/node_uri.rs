@@ -265,7 +265,11 @@ mod tests {
         // 无冒号分支只解码一次：%253A 解一次是字面 `%3A`（不是冒号），拆不出密码所以报错。
         // 解两次就会变成 `alice:pw` 而被接受，这条断言就是守这件事的——
         // 上面几条锁不住它（那一臂的 password 恒为空、必然报错，whole 的值观测不到）。
-        assert!(node_uri("hysteria2://alice%253Apw@example.com:10000").is_err());
+        // 报错原因也钉住：换成别处先拒（用户名含 % 一律拒、host 校验变严）这条就不守事了
+        assert!(matches!(
+            node_uri("hysteria2://alice%253Apw@example.com:10000"),
+            Err(ParseError::Other(m)) if m.contains("缺少用户名或密码")
+        ));
     }
 
     #[test]
