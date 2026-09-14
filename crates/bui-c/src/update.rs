@@ -3,6 +3,7 @@
 //! `bin/sing-box`。manifest 形状 = 总纲 C4：`artifacts` 是扁平表，每个 `url` 指向
 //! **裸二进制**（上游 tar.gz 由 P5 的 Actions 解包后重新上传），所以客户端不解包、不调 `tar`。
 
+use crate::lock::{self, How, LockGuard};
 use crate::net::Net;
 use crate::paths::{Paths, SELF_BIN, UNIT_MAIN};
 use crate::profiles::{https_base, Panel, Profiles};
@@ -347,6 +348,35 @@ pub fn self_build_differs<S: Sys>(sys: &S, m: &Manifest) -> bool {
     build_differs(sys, m, crate::VERSION, arch_suffix(), Path::new(SELF_BIN)) != SelfReason::Current
 }
 
+/// 拿 manifest，与本机比出这次要换什么（只读：不下载产物、不写盘、不拿锁）。
+fn assess<S: Sys, N: Net>(
+    sys: &S,
+    net: &N,
+    paths: &Paths,
+    prof: &Profiles,
+) -> Result<(Manifest, Report)> {
+    let (src, m) = fetch_manifest(net, prof.panel.as_ref())?;
+    let self_reason = build_differs(sys, &m, crate::VERSION, arch_suffix(), Path::new(SELF_BIN));
+    let kernel_local = kernel_version(sys, paths);
+    let r = Report {
+        manifest_source: src,
+        manifest_version: m.version.clone(),
+        self_outdated: self_reason != SelfReason::Current,
+        self_reason,
+        kernel_outdated: kernel_local.as_deref() != Some(m.kernels.client_sing_box.as_str()),
+        kernel_wanted: m.kernels.client_sing_box.clone(),
+        kernel_local,
+        ..Report::default()
+    };
+    Ok((m, r))
+}
+
+/// `check_only = true`：只取 manifest 与本机比，不下载、不写盘、不拿锁。
+///
+/// `check_only = false`：[`fetch`]（锁外下载校验）→ 拿锁（最多等 [`INSTALL_LOCK_WAIT`]）→ [`install`]。
+/// 等不到锁时什么都没换。菜单与命令行的安装不走这一支：它们要在等锁时先说一句，所以自己
+/// fetch → `cli::take_lock` → install；每日自更新只试一次锁（spec §8.3）。
+///
 /// 自身按 [`build_differs`]（版本不同，或同版本不同构建，或读不到本机二进制）决定换不换；manifest
 /// 缺本机架构的 bui-c 时跳过自身、内核照换（spec §8.1）。内核维持只按版本比对。
 /// 版本不做 semver 排序：manifest 是唯一权威，降级也由主理人改 manifest 完成
@@ -358,49 +388,143 @@ pub fn run<S: Sys, N: Net>(
     prof: &Profiles,
     check_only: bool,
 ) -> Result<Report> {
-    let (src, m) = fetch_manifest(net, prof.panel.as_ref())?;
-    let self_reason = build_differs(sys, &m, crate::VERSION, arch_suffix(), Path::new(SELF_BIN));
-    let kernel_local = kernel_version(sys, paths);
-    let mut r = Report {
-        manifest_source: src,
-        manifest_version: m.version.clone(),
-        self_outdated: self_reason != SelfReason::Current,
-        self_reason,
-        kernel_outdated: kernel_local.as_deref() != Some(m.kernels.client_sing_box.as_str()),
-        kernel_wanted: m.kernels.client_sing_box.clone(),
-        kernel_local,
-        ..Report::default()
-    };
     if check_only {
-        return Ok(r);
+        return assess(sys, net, paths, prof).map(|(_, r)| r);
     }
+    let staged = fetch(sys, net, paths, prof)?;
+    let Some(g) = lock::acquire(sys, paths, How::Wait(INSTALL_LOCK_WAIT))? else {
+        return Err(Error::msg(
+            "另一个 bui-c 操作还没结束，这次什么都没改，稍后再试",
+        ));
+    };
+    install(sys, paths, prof, staged, &g)
+}
 
-    match r.self_reason {
-        SelfReason::Current => {}
+/// [`run`] 拿锁最多等多久：与菜单、命令行同一个 15 秒（spec §8.3）。
+pub const INSTALL_LOCK_WAIT: Duration = Duration::from_secs(15);
+
+/// [`fetch`] 下载并校验好、还没装的这次更新。二进制只在内存里；`report` 的 `*_updated` 与
+/// `restarted` 都还是假，由 [`install`] 填。
+pub struct Staged {
+    /// 与 `check_only` 同一份结论（原因、内核要不要换、版本）
+    pub report: Report,
+    /// 要换上的 bui-c（manifest 缺本机架构、或已是那一份构建时为 `None`）
+    self_bin: Option<Vec<u8>>,
+    /// 要换上的 sing-box（内核已是 manifest 要的版本时为 `None`）
+    kernel_bin: Option<Vec<u8>>,
+    /// 这份下载出自哪个 manifest 版本（install 记日志用）
+    manifest_version: String,
+    /// fetch 时盘上 bui-c 的 sha256（读不到为 `None`）：install 进锁后比一次，变了就不盖
+    self_sha: Option<String>,
+}
+
+/// 手写：两份二进制几十 MB，派生的 Debug 会把字节全打出来。
+impl std::fmt::Debug for Staged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Staged")
+            .field("report", &self.report)
+            .field("self_bin", &self.self_bin.as_ref().map(Vec::len))
+            .field("kernel_bin", &self.kernel_bin.as_ref().map(Vec::len))
+            .field("manifest_version", &self.manifest_version)
+            .finish()
+    }
+}
+
+/// 更新的第一段（spec §8.3「update 拆成两段」）：取 manifest，把要换的 bui-c 与 sing-box 下载、
+/// 校验到内存。**不写盘、不持锁、不碰 systemd**——这一段最长要等几分钟（每个来源 120 秒），
+/// 巡检或菜单拿着锁等它，另一个会话就要等锁超时。
+///
+/// 两份都下载校验通过才返回：内核那份失败时自身也不换（以前是先换上自身、再报内核失败）。
+pub fn fetch<S: Sys, N: Net>(sys: &S, net: &N, paths: &Paths, prof: &Profiles) -> Result<Staged> {
+    let (m, report) = assess(sys, net, paths, prof)?;
+    let panel = prof.panel.as_ref();
+    let self_file = format!("bui-c-linux-{}", arch_suffix());
+    let self_bin = match report.self_reason {
+        SelfReason::Current => None,
         // 没有可下载的：不在这里报错，内核照换。命令行 `bui-c update` 事后仍以失败退出（cli.rs）
-        SelfReason::MissingAsset => tracing::warn!(
-            file = %format!("bui-c-linux-{}", arch_suffix()),
-            "manifest 里没有本机架构的 bui-c，这次跳过 bui-c、只看内核"
-        ),
+        SelfReason::MissingAsset => {
+            tracing::warn!(
+                file = %self_file,
+                "manifest 里没有本机架构的 bui-c，这次跳过 bui-c、只看内核"
+            );
+            None
+        }
         SelfReason::NewVersion | SelfReason::Rebuild | SelfReason::Unreadable => {
-            let file = format!("bui-c-linux-{}", arch_suffix());
-            let srcs = sources(prof.panel.as_ref(), &m, &file)?;
-            let (_s, data) = fetch_verified(net, &srcs, &m.artifact(&file)?.sha256)?;
-            replace_self(sys, &data)?;
-            r.self_updated = true;
+            let srcs = sources(panel, &m, &self_file)?;
+            Some(fetch_verified(net, &srcs, &m.artifact(&self_file)?.sha256)?.1)
         }
-    }
+    };
+    let kernel_bin = if report.kernel_outdated {
+        let file = format!("sing-box-linux-{}", arch_suffix());
+        let srcs = sources(panel, &m, &file)?;
+        Some(fetch_verified(net, &srcs, &m.artifact(&file)?.sha256)?.1)
+    } else {
+        None
+    };
+    Ok(Staged {
+        report,
+        self_bin,
+        kernel_bin,
+        manifest_version: m.version,
+        self_sha: disk_sha(sys, Path::new(SELF_BIN)),
+    })
+}
 
-    if r.kernel_outdated {
-        install_kernel(sys, net, paths, prof.panel.as_ref(), &m)?;
-        r.kernel_updated = true;
-        // 新机器还没导入过节点，单元文件都没写：没有可重启的，第一次 apply 会把它拉起来
-        if sys.exists(&paths.unit(UNIT_MAIN)) {
-            systemd::restart(sys, UNIT_MAIN)?;
-            r.restarted = true;
+fn disk_sha<S: Sys>(sys: &S, path: &Path) -> Option<String> {
+    sys.read(path).ok().map(|b| sha256_hex(&b))
+}
+
+/// 换了内核之后要不要重启代理（D16）：主单元文件在，**并且**有活动节点。只看单元文件的话，删光节点
+/// 时单元文件没删干净，就会用旧的 `config.json` 把删掉的节点拉起来；新机器还没导入过节点，单元文件
+/// 都没写，第一次 apply 会把它拉起来。菜单提示「代理重启几秒」与 [`install`] 共用这一个判断。
+pub fn restarts_on_kernel_swap<S: Sys>(sys: &S, paths: &Paths, prof: &Profiles) -> bool {
+    sys.exists(&paths.unit(UNIT_MAIN)) && prof.active_profile().is_some()
+}
+
+/// 更新的第二段：替换自身、写内核，换了内核且 [`restarts_on_kernel_swap`] 才重启。持锁调用：
+/// `LockGuard` 由顶层入口拿，这里只收下凭证（spec §0.2 R11）；`prof` 要是拿锁之后重读的那份。
+///
+/// 下载在锁外，下载与拿到锁之间别的 bui-c 可能已经换过（菜单里刚装完一版、巡检的自更新）：
+/// 盘上的 bui-c 已不是 fetch 时那一份、内核版本已不是 fetch 时读到的，就不拿这份旧下载去盖。
+///
+/// 失败即返回：先换自身、再写内核，写内核失败时自身已经换上了，不重启（下次检查只剩内核要换）。
+pub fn install<S: Sys>(
+    sys: &S,
+    paths: &Paths,
+    prof: &Profiles,
+    staged: Staged,
+    _: &LockGuard,
+) -> Result<Report> {
+    let Staged {
+        mut report,
+        self_bin,
+        kernel_bin,
+        manifest_version,
+        self_sha,
+    } = staged;
+    tracing::info!(manifest = %manifest_version, "安装更新");
+    if let Some(data) = self_bin {
+        if disk_sha(sys, Path::new(SELF_BIN)) == self_sha {
+            replace_self(sys, &data)?;
+            report.self_updated = true;
+        } else {
+            tracing::warn!("下载期间 bui-c 已被别的操作换过，这次不替换");
         }
     }
-    Ok(r)
+    if let Some(data) = kernel_bin {
+        if kernel_version(sys, paths) == report.kernel_local {
+            sys.mkdir_p(&paths.bin_dir())?;
+            sys.write(&paths.singbox(), &data, 0o755)?;
+            report.kernel_updated = true;
+            if restarts_on_kernel_swap(sys, paths, prof) {
+                systemd::restart(sys, UNIT_MAIN)?;
+                report.restarted = true;
+            }
+        } else {
+            tracing::warn!("下载期间 sing-box 内核已被别的操作换过，这次不替换");
+        }
+    }
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -1122,5 +1246,235 @@ mod tests {
             "没有产物就不去下载：{:?}",
             n.log()
         );
+    }
+
+    const KERNEL: &str = "/opt/bui-c/bin/sing-box";
+    const UNIT: &str = "/etc/systemd/system/bui-c.service";
+    const SELF_TMP: &str = "/usr/local/bin/.bui-c.tmp";
+
+    /// fetch / install 用例共用的机器：面板 profile（SOCKS，有活动节点）、盘上 bui-c 是 `bui-c-old`、
+    /// 内核 1.13.19、主单元文件在；manifest 9.9.9 自身与内核都要换（`bui-c-new` / `ELF-new`），
+    /// 两个产物都能从面板下载。
+    fn staged_machine() -> (FakeSys, FakeNet, Profiles) {
+        let s = FakeSys::new();
+        let n = FakeNet::new();
+        let mut prof = profiles_socks();
+        prof.panel = Some(panel());
+        installed_self(&s, "bui-c-old");
+        let (me, kernel) = (b"bui-c-new".to_vec(), b"ELF-new".to_vec());
+        n.route(
+            "https://panel.example.com/packages/manifest.json",
+            FakeReply::Text(manifest_json(
+                "9.9.9",
+                &sha256_hex(&me),
+                &sha256_hex(&kernel),
+            )),
+        );
+        let arch = arch_suffix();
+        n.route(
+            &format!("https://panel.example.com/packages/bui-c-linux-{arch}"),
+            FakeReply::Bytes(me),
+        );
+        n.route(
+            &format!("https://panel.example.com/packages/sing-box-linux-{arch}"),
+            FakeReply::Bytes(kernel),
+        );
+        s.put(KERNEL, "ELF-old");
+        s.reply(
+            &format!("{KERNEL} version"),
+            0,
+            "sing-box version 1.13.19\n",
+        );
+        s.put(UNIT, "[Unit]");
+        (s, n, prof)
+    }
+
+    /// 自身、临时文件、内核三处一次都没写过（失败的写也算写过）。
+    fn assert_untouched(s: &FakeSys, case: &str) {
+        for p in [SELF_BIN, SELF_TMP, KERNEL] {
+            assert_eq!(s.writes(p), 0, "{case}：{p} 被写过");
+        }
+        assert_eq!(s.get(SELF_BIN).unwrap(), "bui-c-old", "{case}");
+        assert_eq!(s.get(KERNEL).unwrap(), "ELF-old", "{case}");
+    }
+
+    /// spec §8.3「update 拆成两段」：`fetch` 取 manifest、把要换的两份下载校验到内存，**不写盘、不拿锁、
+    /// 不碰 systemd**——巡检拿着锁等最长 120 秒的下载，菜单等锁 15 秒就会超时。
+    #[test]
+    fn fetch_writes_nothing() {
+        let (s, n, prof) = staged_machine();
+        let staged = fetch(&s, &n, &paths(), &prof).unwrap();
+        let r = &staged.report;
+        assert_eq!(
+            (r.self_reason, r.kernel_outdated),
+            (SelfReason::NewVersion, true),
+            "{r:?}"
+        );
+        assert_eq!(
+            (r.self_updated, r.kernel_updated, r.restarted),
+            (false, false, false),
+            "还没装：{r:?}"
+        );
+        assert_eq!(r.manifest_version, "9.9.9");
+        assert_eq!(staged.self_bin.as_deref(), Some(&b"bui-c-new"[..]));
+        assert_eq!(staged.kernel_bin.as_deref(), Some(&b"ELF-new"[..]));
+        assert_untouched(&s, "下载成功");
+        assert_eq!(
+            s.calls(),
+            vec![format!("{KERNEL} version")],
+            "只读了一次内核版本：不拿锁、不动 systemd"
+        );
+        let log = n.log();
+        assert!(log.iter().any(|l| l.contains("bui-c-linux-")), "{log:?}");
+        assert!(log.iter().any(|l| l.contains("sing-box-linux-")), "{log:?}");
+
+        // 内核校验不过（自身那份已经校验通过）：整个 fetch 失败，自身也不能先换上
+        let (s, n, prof) = staged_machine();
+        n.route(
+            &format!(
+                "https://panel.example.com/packages/sing-box-linux-{}",
+                arch_suffix()
+            ),
+            FakeReply::Bytes(b"tampered".to_vec()),
+        );
+        let e = fetch(&s, &n, &paths(), &prof).unwrap_err();
+        assert!(matches!(e, Error::Verify(_)), "{e}");
+        assert_untouched(&s, "内核校验失败");
+        assert!(!s.called("lock"), "{:?}", s.calls());
+
+        // 都是最新：什么都不下载
+        let s = FakeSys::new();
+        let n = FakeNet::new();
+        let mut prof = profiles_socks();
+        prof.panel = Some(panel());
+        let self_sha = installed_self(&s, "bui-c-current");
+        n.route(
+            "https://panel.example.com/packages/manifest.json",
+            FakeReply::Text(manifest_json(crate::VERSION, &self_sha, &"b".repeat(64))),
+        );
+        s.put(KERNEL, "ELF");
+        s.reply(&format!("{KERNEL} version"), 0, "sing-box version 1.14.5\n");
+        let staged = fetch(&s, &n, &paths(), &prof).unwrap();
+        assert!(staged.self_bin.is_none() && staged.kernel_bin.is_none());
+        assert_eq!(n.log().len(), 1, "只取了 manifest：{:?}", n.log());
+    }
+
+    /// D16：换了内核之后，**主单元文件在、并且有活动节点**才重启。只看单元文件的话，删光节点时
+    /// 单元文件没删干净（或并发的删除刚删完 profiles）就会把删掉的节点拉起来。替换本身不受影响。
+    #[test]
+    fn install_restarts_only_with_a_unit_and_an_active_node() {
+        for (unit, active, want) in [
+            (true, true, true),
+            (true, false, false),
+            (false, true, false),
+            (false, false, false),
+        ] {
+            let case = format!("单元文件在={unit} 有活动节点={active}");
+            let (s, n, mut prof) = staged_machine();
+            if !unit {
+                s.remove_file(Path::new(UNIT)).unwrap();
+            }
+            if !active {
+                prof.active = None;
+            }
+            assert_eq!(restarts_on_kernel_swap(&s, &paths(), &prof), want, "{case}");
+            let staged = fetch(&s, &n, &paths(), &prof).unwrap();
+            let r = install(&s, &paths(), &prof, staged, &crate::lock::LockGuard::stub()).unwrap();
+            assert!(r.self_updated && r.kernel_updated, "{case}：{r:?}");
+            assert_eq!(s.get(SELF_BIN).unwrap(), "bui-c-new", "{case}");
+            assert_eq!(s.mode(SELF_BIN), Some(0o755), "{case}");
+            assert_eq!(s.get(KERNEL).unwrap(), "ELF-new", "{case}");
+            assert_eq!(r.restarted, want, "{case}：{r:?}");
+            assert_eq!(
+                s.called("systemctl restart bui-c.service"),
+                want,
+                "{case}：{:?}",
+                s.calls()
+            );
+        }
+
+        // 删光之后的 profiles（一个节点都没有）：单元文件还在也不重启
+        let (s, n, _) = staged_machine();
+        let mut empty = Profiles::new_default();
+        empty.panel = Some(panel());
+        let staged = fetch(&s, &n, &paths(), &empty).unwrap();
+        let r = install(
+            &s,
+            &paths(),
+            &empty,
+            staged,
+            &crate::lock::LockGuard::stub(),
+        )
+        .unwrap();
+        assert!(r.kernel_updated && !r.restarted, "{r:?}");
+        assert!(!s.called("systemctl restart bui-c.service"));
+
+        // 只换自身、内核不动：跑着的 sing-box 没变，有单元有节点也不重启
+        let (s, n, prof) = staged_machine();
+        s.reply(&format!("{KERNEL} version"), 0, "sing-box version 1.14.5\n");
+        let staged = fetch(&s, &n, &paths(), &prof).unwrap();
+        let r = install(&s, &paths(), &prof, staged, &crate::lock::LockGuard::stub()).unwrap();
+        assert!(r.self_updated && !r.kernel_updated && !r.restarted, "{r:?}");
+        assert!(!s.called("systemctl restart bui-c.service"));
+    }
+
+    /// 下载在锁外，下载与拿到锁之间别的 bui-c 可能已经换过（菜单里刚装完一版、巡检的自更新）。
+    /// install 进锁后重看一眼：盘上已经不是 fetch 时那一份，就不拿手里这份旧下载去盖。
+    #[test]
+    fn install_leaves_alone_what_changed_on_disk_after_the_fetch() {
+        let (s, n, prof) = staged_machine();
+        let staged = fetch(&s, &n, &paths(), &prof).unwrap();
+        s.put(SELF_BIN, "bui-c-newer");
+        s.put(KERNEL, "ELF-newer");
+        s.reply(&format!("{KERNEL} version"), 0, "sing-box version 1.14.9\n");
+        let r = install(&s, &paths(), &prof, staged, &crate::lock::LockGuard::stub()).unwrap();
+        assert_eq!(s.get(SELF_BIN).unwrap(), "bui-c-newer", "{r:?}");
+        assert_eq!(s.get(KERNEL).unwrap(), "ELF-newer", "{r:?}");
+        assert_eq!(
+            (r.self_updated, r.kernel_updated, r.restarted),
+            (false, false, false),
+            "{r:?}"
+        );
+        assert!(!s.called("systemctl restart bui-c.service"));
+        assert_eq!(s.writes(SELF_TMP), 0);
+    }
+
+    /// `run(check_only = false)` = fetch + 拿锁（等 15 秒）+ install：下载在拿锁之前，重启在锁里。
+    /// 锁一直被占：下载照做，等满 15 秒放弃，盘上什么都没换。
+    #[test]
+    fn run_downloads_before_the_lock_and_restarts_inside_it() {
+        let (s, n, prof) = staged_machine();
+        let r = run(&s, &n, &paths(), &prof, false).unwrap();
+        assert!(r.self_updated && r.kernel_updated && r.restarted, "{r:?}");
+        let calls = s.calls();
+        let at = |c: &str| {
+            calls
+                .iter()
+                .position(|x| x == c)
+                .unwrap_or_else(|| panic!("没有 {c}：{calls:?}"))
+        };
+        assert!(at(&format!("{KERNEL} version")) < at("lock"), "{calls:?}");
+        assert!(
+            at("lock") < at("systemctl restart bui-c.service"),
+            "{calls:?}"
+        );
+        assert!(
+            at("systemctl restart bui-c.service") < at("unlock"),
+            "{calls:?}"
+        );
+        assert!(s.sleeps().is_empty(), "{:?}", s.sleeps());
+
+        let (s, n, prof) = staged_machine();
+        s.lock_busy(u32::MAX);
+        let e = run(&s, &n, &paths(), &prof, false).unwrap_err();
+        assert!(e.to_string().contains("稍后再试"), "{e}");
+        assert!(
+            n.log().iter().any(|l| l.contains("sing-box-linux-")),
+            "下载在锁外：{:?}",
+            n.log()
+        );
+        assert_untouched(&s, "锁一直被占");
+        assert!(!s.called("systemctl restart bui-c.service"));
+        assert_eq!(s.sleeps().iter().sum::<u64>(), 15_000);
     }
 }

@@ -390,7 +390,8 @@ fn kernel_local(r: &Report) -> String {
 }
 
 /// `check_only` 的 [`Report`] → 菜单怎么说（spec §8.1 第 4、5 步）。`local` 是本机版本，`arch` 是
-/// 本机架构，`restart` = 主单元文件在（换内核会重启代理；新机器没有单元，换了也不重启）。
+/// 本机架构，`restart` = 换了内核会不会重启代理（`update::restarts_on_kernel_swap`：主单元文件在、
+/// 并且有活动节点，D16）。
 ///
 /// 版本号、来源、内核版本来自网络，一律先 [`sanitize`]。说明行不折行，由调用方按宽度折。
 pub fn update_offer(r: &Report, local: &str, arch: &str, restart: bool) -> UpdateOffer {

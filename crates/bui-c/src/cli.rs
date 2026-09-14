@@ -1015,16 +1015,11 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
         }
         Cmd::Check => run_check(ctx),
         Cmd::Update { check_only, auto } => {
-            // 开关写 profiles.json、安装会替换二进制并重启：都在锁里。只查不装不拿锁。
-            // T12b 把下载挪到锁外之后，这里只剩安装那一段持锁
-            let _g = if auto.is_some() || !*check_only {
-                Some(take_lock(ctx)?)
-            } else {
-                None
-            };
-            let mut prof = Profiles::load(ctx.sys, ctx.paths)?;
-            // --auto 只翻开关、不联网：spec §6「每日 timer 自动，可关」的 CLI 入口
+            // --auto 只翻开关、不联网：spec §6「每日 timer 自动，可关」的 CLI 入口。写 profiles.json，
+            // 拿锁之后再读
             if let Some(sw) = auto {
+                let _g = take_lock(ctx)?;
+                let mut prof = Profiles::load(ctx.sys, ctx.paths)?;
                 prof.auto_update = matches!(sw, Switch::On);
                 prof.save(ctx.sys, ctx.paths)?;
                 ctx.say(format!(
@@ -1033,13 +1028,27 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
                 ));
                 return Ok(());
             }
-            let r = update::run(
-                ctx.sys,
-                ctx.net,
-                ctx.paths,
-                &with_panel_override(ctx.sys, &prof),
-                *check_only,
-            )?;
+            // 锁外读的这份只用来找面板（manifest 与产物的来源）
+            let prof = Profiles::load(ctx.sys, ctx.paths)?;
+            let src = with_panel_override(ctx.sys, &prof);
+            let r = if *check_only {
+                // 只查不装：不下载、不拿锁
+                update::run(ctx.sys, ctx.net, ctx.paths, &src, true)?
+            } else {
+                // 下载校验在锁外（spec §8.3），只有替换与重启持锁；等不到锁什么都没换。
+                // 持锁期间把结论落进 runtime.json，与菜单 [7] → [1] 一样
+                let staged = update::fetch(ctx.sys, ctx.net, ctx.paths, &src)?;
+                let g = take_lock(ctx)?;
+                let prof = Profiles::load(ctx.sys, ctx.paths)?;
+                let r = update::install(ctx.sys, ctx.paths, &prof, staged, &g)?;
+                let mut rt = Runtime::load(ctx.sys, ctx.paths);
+                let now = ctx.sys.now().unix_timestamp();
+                record_update_check(&mut rt, &r, now);
+                rt.last_update_at = Some(now);
+                rt.last_update_attempt_at = Some(now);
+                rt.save(ctx.sys, ctx.paths)?;
+                r
+            };
             ctx.say(format!(
                 "manifest {}（来源 {}）",
                 r.manifest_version, r.manifest_source
@@ -1050,20 +1059,15 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
                 for l in menu::check_only_verdict(&r, update::arch_suffix()) {
                     ctx.say(l);
                 }
+                let mut rt = Runtime::load(ctx.sys, ctx.paths);
+                record_update_check(&mut rt, &r, ctx.sys.now().unix_timestamp());
+                rt.save(ctx.sys, ctx.paths)?;
             } else {
                 ctx.say(format!(
                     "自身更新={} 内核更新={} 已重启={}",
                     r.self_updated, r.kernel_updated, r.restarted
                 ));
             }
-            let mut rt = Runtime::load(ctx.sys, ctx.paths);
-            let now = ctx.sys.now().unix_timestamp();
-            record_update_check(&mut rt, &r, now);
-            if !*check_only {
-                rt.last_update_at = Some(now);
-                rt.last_update_attempt_at = Some(now);
-            }
-            rt.save(ctx.sys, ctx.paths)?;
             // manifest 缺本机架构的 bui-c：内核照换了，但 bui-c 没换成，脚本要从退出码看到失败
             // （以前在下载那一步就报「manifest 里没有 … 这个产物」退出）
             if !*check_only && r.self_reason == update::SelfReason::MissingAsset {
@@ -1264,38 +1268,67 @@ fn run_check<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()
     let prof = Profiles::load(ctx.sys, ctx.paths)?;
     let mut rt = Runtime::load(ctx.sys, ctx.paths);
     if check::update_due(ctx.sys, &rt, &prof) {
-        // 装新版会替换二进制并重启：只试一次锁，拿不到就等下一分钟，也不记「尝试过」——
-        // 没真的去试，不该落进 1 小时的失败退避。T12b 把下载挪到锁外
-        let Some(_g) = lock::acquire(ctx.sys, ctx.paths, lock::How::Once)? else {
-            tracing::info!("另一个 bui-c 操作进行中，本轮自更新跳过");
+        daily_self_update(ctx, &prof, &mut rt)?;
+    }
+    Ok(())
+}
+
+/// 巡检里的每日自更新（spec §8.3）：下载在锁外（[`update::fetch`]），替换与重启持锁（[`update::install`]），
+/// 锁**只试一次**。失败只记日志，不影响巡检结论与退出码。
+///
+/// - 先把「尝试过」落盘再联网：面板与 GitHub 都不可达时按 `check::UPDATE_RETRY_S` 退避 1 小时，
+///   否则离线机器每分钟白等两个源各 15 秒。下载或安装失败都留着它。
+/// - 锁被占：这份下载扔掉，「尝试过」还原成原来的值——没装成，下一分钟再试，不落进 1 小时退避。
+/// - 拿到锁后重读 profiles：下载期间关掉了自动更新就不装；重不重启按现在有没有活动节点（D16）。
+fn daily_self_update<S: Sys, N: Net, P: Prompt>(
+    ctx: &mut Ctx<'_, S, N, P>,
+    prof: &Profiles,
+    rt: &mut Runtime,
+) -> Result<()> {
+    let tried_before = rt.last_update_attempt_at;
+    rt.last_update_attempt_at = Some(ctx.sys.now().unix_timestamp());
+    rt.save(ctx.sys, ctx.paths)?;
+    let staged = match update::fetch(
+        ctx.sys,
+        ctx.net,
+        ctx.paths,
+        &with_panel_override(ctx.sys, prof),
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "自更新失败，下轮再试");
             return Ok(());
-        };
-        // 先把「尝试过」落盘再联网：面板与 GitHub 都不可达时按 check::UPDATE_RETRY_S
-        // 退避 1 小时，否则离线机器每分钟白等两个源各 15s
-        rt.last_update_attempt_at = Some(ctx.sys.now().unix_timestamp());
-        rt.save(ctx.sys, ctx.paths)?;
-        match update::run(
-            ctx.sys,
-            ctx.net,
-            ctx.paths,
-            &with_panel_override(ctx.sys, &prof),
-            false,
-        ) {
-            Ok(r) => {
-                let now = ctx.sys.now().unix_timestamp();
-                rt.last_update_at = Some(now);
-                // 自更新也是一次「检查更新」：装完了就把菜单上的 ★ 摘掉
-                record_update_check(&mut rt, &r, now);
-                rt.save(ctx.sys, ctx.paths)?;
-                if r.self_updated || r.kernel_updated {
-                    ctx.say(format!(
-                        "自更新：bui-c={} 内核={}",
-                        r.self_updated, r.kernel_updated
-                    ));
-                }
-            }
-            Err(e) => tracing::warn!(error = %e, "自更新失败，下轮再试"),
         }
+    };
+    let Some(g) = lock::acquire(ctx.sys, ctx.paths, lock::How::Once)? else {
+        tracing::info!("另一个 bui-c 操作进行中，本轮自更新跳过，下一分钟再试");
+        // 重读再改：下载的这几分钟里别的会话可能写过 runtime.json
+        let mut rt = Runtime::load(ctx.sys, ctx.paths);
+        rt.last_update_attempt_at = tried_before;
+        return rt.save(ctx.sys, ctx.paths);
+    };
+    let prof = Profiles::load(ctx.sys, ctx.paths)?;
+    if !prof.auto_update {
+        tracing::info!("下载期间自动更新被关掉了，这次不装");
+        return Ok(());
+    }
+    match update::install(ctx.sys, ctx.paths, &prof, staged, &g) {
+        Ok(r) => {
+            let mut rt = Runtime::load(ctx.sys, ctx.paths);
+            let now = ctx.sys.now().unix_timestamp();
+            rt.last_update_at = Some(now);
+            // 自更新也是一次「检查更新」：装完了就把菜单上的 ★ 摘掉
+            record_update_check(&mut rt, &r, now);
+            rt.save(ctx.sys, ctx.paths)?;
+            drop(g);
+            if r.self_updated || r.kernel_updated {
+                ctx.say(format!(
+                    "自更新：bui-c={} 内核={}",
+                    r.self_updated, r.kernel_updated
+                ));
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "自更新失败，下轮再试"),
     }
     Ok(())
 }
@@ -2421,12 +2454,15 @@ fn maint_menu<S: Sys, N: Net, P: Prompt>(
 /// - manifest 缺本机架构的 bui-c、内核也不用换：说完停下，不问（问了也装不了）。
 /// - 答否：一行 Note「没有更新（最新 X）」；答是：[`maint_install_update`]。
 ///
-/// 提问本身就是停顿，所以答否不再停。检查与提问都在锁外（R11）。
+/// 提问本身就是停顿，所以答否不再停。检查、下载与提问都在锁外，只有安装持锁（R2 末条、R11）。
+///
+/// 答是之后才下载；下到的与刚才显示的不一样（人看提示的这几秒里又发了版、或别处刚装过），
+/// 不装，按新的结论重新显示再问（[`UPDATE_CHANGED`]）。
 fn maint_check_update<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<Outcome> {
     tell(ctx, menu::UPDATE_CHECKING);
     ctx.flush();
     let prof = Profiles::load(ctx.sys, ctx.paths)?;
-    let r = match update::run(
+    let mut r = match update::run(
         ctx.sys,
         ctx.net,
         ctx.paths,
@@ -2441,64 +2477,109 @@ fn maint_check_update<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> 
             return Ok(Outcome::Pause(line));
         }
     };
-    let mut rt = Runtime::load(ctx.sys, ctx.paths);
-    record_update_check(&mut rt, &r, ctx.sys.now().unix_timestamp());
-    rt.save(ctx.sys, ctx.paths)?;
-    let restart = ctx.sys.exists(&ctx.paths.unit(UNIT_MAIN));
-    match menu::update_offer(&r, crate::VERSION, update::arch_suffix(), restart) {
-        menu::UpdateOffer::Current(line) => Ok(note(ctx, line)),
-        menu::UpdateOffer::Blocked(line) => {
-            tell(ctx, &line);
-            Ok(Outcome::Pause(line))
-        }
-        menu::UpdateOffer::Ask {
-            lines,
-            question,
-            declined,
-        } => {
-            for l in &lines {
-                tell(ctx, l);
+    loop {
+        let mut rt = Runtime::load(ctx.sys, ctx.paths);
+        record_update_check(&mut rt, &r, ctx.sys.now().unix_timestamp());
+        rt.save(ctx.sys, ctx.paths)?;
+        let shown = update_offer_now(ctx, &r)?;
+        let (lines, question, declined) = match &shown {
+            menu::UpdateOffer::Current(line) => return Ok(note(ctx, line.clone())),
+            menu::UpdateOffer::Blocked(line) => {
+                tell(ctx, line);
+                return Ok(Outcome::Pause(line.clone()));
             }
-            ctx.flush();
-            if ctx.prompt.confirm(&question)? {
-                Ok(maint_install_update(ctx))
-            } else {
-                Ok(note(ctx, declined))
+            menu::UpdateOffer::Ask {
+                lines,
+                question,
+                declined,
+            } => (lines, question, declined),
+        };
+        for l in lines {
+            tell(ctx, l);
+        }
+        ctx.flush();
+        if !ctx.prompt.confirm(question)? {
+            return Ok(note(ctx, declined.clone()));
+        }
+        match maint_install_update(ctx, &shown)? {
+            Installed::Done(outcome) => return Ok(outcome),
+            Installed::Changed(newer) => {
+                tell(ctx, UPDATE_CHANGED);
+                r = newer;
             }
         }
     }
 }
 
-/// [7] → [1] 答是之后：拿锁 → `update::run(check_only = false)` → 落盘 → 放锁，再把结果打出来停下
-/// （spec §8.1 第 5 步、§3e-60-5）。结果说人话（换了什么、重没重启），不转手命令行 `bui-c update`——
-/// 那一行 `自身更新=true …` 是给脚本看的，进「上次：」行没人看得懂。
+/// 下载到的与刚才显示的不一样，重新显示再问之前说的一句。容量口径 36 列。
+const UPDATE_CHANGED: &str = "更新内容刚刚变了，按下面的再确认一次";
+
+/// 按这份结论跟人怎么说。「代理重启几秒」只在装完真的会重启时说：主单元文件在、并且有活动节点（D16，
+/// 与 [`update::install`] 同一个判断）。
+fn update_offer_now<S: Sys, N: Net, P: Prompt>(
+    ctx: &Ctx<'_, S, N, P>,
+    r: &update::Report,
+) -> Result<menu::UpdateOffer> {
+    let prof = Profiles::load(ctx.sys, ctx.paths)?;
+    let restart = update::restarts_on_kernel_swap(ctx.sys, ctx.paths, &prof);
+    Ok(menu::update_offer(
+        r,
+        crate::VERSION,
+        update::arch_suffix(),
+        restart,
+    ))
+}
+
+/// [`maint_install_update`] 的两种结局。
+enum Installed {
+    /// 装了（或失败了）：停顿页已经打出来，按这个结果回主循环。
+    Done(Outcome),
+    /// 这次下到的与显示的不一样，什么都没装：按这份新结论重新显示再问。
+    Changed(update::Report),
+}
+
+/// [7] → [1] 答是之后：锁外下载校验（[`update::fetch`]）→ 与刚才显示的比 → 一样才拿锁 → 锁里重读
+/// profiles、[`update::install`]、落盘 → 放锁，再把结果打出来停下（spec §8.1 第 5 步、§8.3、§3e-60-5）。
+/// 结果说人话（换了什么、重没重启），不转手命令行 `bui-c update`——那一行 `自身更新=true …` 是给脚本
+/// 看的，进「上次：」行没人看得懂。
 ///
-/// 失败：停下来，「上次：」行是「失败：…」；runtime 不动（★ 照挂，也不算更新过）。
+/// 失败（下载、等锁、安装）：停下来，「上次：」行是「失败：…」；runtime 不动（★ 照挂，也不算更新过）。
 /// 装好之后 runtime.json 写不进：照样说装好了（二进制已换），只记 warn，★ 挂到下次检查。
-/// T12b 把下载挪到锁外，这里只剩安装那一段持锁。
-fn maint_install_update<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Outcome {
-    let done = with_lock(ctx, |ctx, _g| {
-        let prof = Profiles::load(ctx.sys, ctx.paths)?;
-        let r = update::run(
-            ctx.sys,
-            ctx.net,
-            ctx.paths,
-            &with_panel_override(ctx.sys, &prof),
-            false,
-        )?;
-        let mut rt = Runtime::load(ctx.sys, ctx.paths);
-        let now = ctx.sys.now().unix_timestamp();
-        record_update_check(&mut rt, &r, now);
-        rt.last_update_at = Some(now);
-        rt.last_update_attempt_at = Some(now);
-        // 二进制已经换了、服务已经重启：写不进 runtime 不能说成「失败」。尽力而为、记一笔，
-        // ★ 挂到下次检查才摘（同 `release_after_teardown`）
-        if let Err(e) = rt.save(ctx.sys, ctx.paths) {
-            tracing::warn!(error = %e, "写 runtime.json 失败");
+fn maint_install_update<S: Sys, N: Net, P: Prompt>(
+    ctx: &mut Ctx<'_, S, N, P>,
+    shown: &menu::UpdateOffer,
+) -> Result<Installed> {
+    let prof = Profiles::load(ctx.sys, ctx.paths)?;
+    let fetched = update::fetch(
+        ctx.sys,
+        ctx.net,
+        ctx.paths,
+        &with_panel_override(ctx.sys, &prof),
+    );
+    if let Ok(staged) = &fetched {
+        if update_offer_now(ctx, &staged.report)? != *shown {
+            return Ok(Installed::Changed(staged.report.clone()));
         }
-        Ok(r)
-    });
-    match done {
+    }
+    let done = match fetched {
+        Ok(staged) => with_lock(ctx, |ctx, g| {
+            let prof = Profiles::load(ctx.sys, ctx.paths)?;
+            let r = update::install(ctx.sys, ctx.paths, &prof, staged, g)?;
+            let mut rt = Runtime::load(ctx.sys, ctx.paths);
+            let now = ctx.sys.now().unix_timestamp();
+            record_update_check(&mut rt, &r, now);
+            rt.last_update_at = Some(now);
+            rt.last_update_attempt_at = Some(now);
+            // 二进制已经换了、服务已经重启：写不进 runtime 不能说成「失败」。尽力而为、记一笔，
+            // ★ 挂到下次检查才摘（同 `release_after_teardown`）
+            if let Err(e) = rt.save(ctx.sys, ctx.paths) {
+                tracing::warn!(error = %e, "写 runtime.json 失败");
+            }
+            Ok(r)
+        }),
+        Err(e) => Err(e),
+    };
+    Ok(Installed::Done(match done {
         Ok(r) => {
             let lines = menu::update_done(&r);
             for l in &lines {
@@ -2511,7 +2592,7 @@ fn maint_install_update<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -
             tell(ctx, &line);
             Outcome::Pause(line)
         }
-    }
+    }))
 }
 
 /// `[7]` 子页顶部三行（spec §8.1 第一条）：只读 `runtime.json` 与 `profiles.json`，不联网。
@@ -4279,8 +4360,15 @@ mod tests {
                 .remove_file(std::path::Path::new("/opt/bui-c/bin/sing-box"))
                 .unwrap(),
         }
-        let arch = update::arch_suffix();
         let n = FakeNet::new();
+        publish(&n, ver, bui_c);
+        (s, n)
+    }
+
+    /// 面板上发一份 manifest：版本 `ver`、本机架构 bui-c 的内容 `bui_c`（`None` = 没有这个产物）、
+    /// 内核要 1.14.5（[`NEW_KERNEL`]），产物都能从面板下载。再发一次就盖掉上一份。
+    fn publish(n: &FakeNet, ver: &str, bui_c: Option<&str>) {
+        let arch = update::arch_suffix();
         let mut artifacts = vec![format!(
             r#""sing-box-linux-{arch}":{{"url":"https://github.com/x/sing-box","sha256":"{}"}}"#,
             update::sha256_hex(NEW_KERNEL.as_bytes())
@@ -4306,7 +4394,6 @@ mod tests {
                 artifacts.join(",")
             )),
         );
-        (s, n)
     }
     const INSTALLED: &str = "bui-c-installed";
     const NEW_KERNEL: &str = "ELF-sing-box-1.14.5";
@@ -4618,15 +4705,239 @@ mod tests {
         let rt = Runtime::load(&s, &pp);
         assert!(rt.update_available, "没装成，★ 照挂：{rt:?}");
         assert!(rt.last_update_at.is_none(), "{rt:?}");
+        // 下载在锁外（spec §8.3）：下载失败根本不拿锁
+        assert_eq!(lock_counts(&s), (0, 0), "{:?}", s.calls());
+
+        // 装的那一步失败（锁里写临时文件失败，比如磁盘满）：同样停下来说失败；锁拿了也放了，
+        // 盘上两份都原样、不重启、★ 照挂、不算更新过
+        let (s, n) = update_machine("9.9.9", Some("bui-c-new"), Some("1.13.19"));
+        with_unit(&s);
+        s.fail_write("/usr/local/bin/.bui-c.tmp");
+        let r = run_menu(&s, &n, &pp, &["7", "1", "y", "", "0"], true);
+        assert_eq!(pauses(&r.asked), 1, "{:?}", r.asked);
+        assert!(last_line(&r.t).starts_with("  上次：失败："), "{}", r.t);
+        assert_eq!(s.get(crate::paths::SELF_BIN).unwrap(), INSTALLED);
+        assert_eq!(s.get("/opt/bui-c/bin/sing-box").unwrap(), "ELF");
+        assert!(!s.called("systemctl restart bui-c.service"), "{}", r.t);
+        let rt = Runtime::load(&s, &pp);
+        assert!(rt.update_available && rt.last_update_at.is_none(), "{rt:?}");
+        assert_eq!(lock_counts(&s), (1, 1), "{:?}", s.calls());
+
+        // 自身换上了、写内核失败：停下来说失败，不重启；★ 照挂——内核确实还没换（下次检查自身已是最新，
+        // 只剩内核）
+        let (s, n) = update_machine("9.9.9", Some("bui-c-new"), Some("1.13.19"));
+        with_unit(&s);
+        s.fail_write("/opt/bui-c/bin/sing-box");
+        let r = run_menu(&s, &n, &pp, &["7", "1", "y", "", "0"], true);
+        assert!(last_line(&r.t).starts_with("  上次：失败："), "{}", r.t);
+        assert_eq!(s.get(crate::paths::SELF_BIN).unwrap(), "bui-c-new");
+        assert_eq!(s.get("/opt/bui-c/bin/sing-box").unwrap(), "ELF");
+        assert!(!s.called("systemctl restart bui-c.service"), "{}", r.t);
+        assert!(Runtime::load(&s, &pp).update_available);
+        assert_eq!(lock_counts(&s), (1, 1), "{:?}", s.calls());
+    }
+
+    /// 拿过几次锁、放过几次锁。
+    fn lock_counts(s: &FakeSys) -> (usize, usize) {
         let calls = s.calls();
+        (
+            calls.iter().filter(|c| *c == "lock").count(),
+            calls.iter().filter(|c| *c == "unlock").count(),
+        )
+    }
+
+    /// 提问时顺手在面板上发一份新 manifest：模拟人看提示的这几秒里又发了版。每次提问也记进
+    /// 调用流水（`ask …`），好和 lock / unlock 排先后。
+    struct ReleaseWhileAsking<'a> {
+        inner: Scripted,
+        sys: &'a FakeSys,
+        net: &'a FakeNet,
+        /// 第一次 `confirm` 时发出去的版本；发过就清掉
+        release: Option<&'static str>,
+    }
+
+    impl Prompt for ReleaseWhileAsking<'_> {
+        fn interactive(&self) -> bool {
+            self.inner.interactive()
+        }
+        fn read(&mut self, prompt: &str) -> Result<Option<String>> {
+            self.sys.mark(format!("ask {prompt}"));
+            self.inner.read(prompt)
+        }
+        fn lines_until_blank(&mut self, prompt: &str) -> Result<Vec<String>> {
+            self.sys.mark(format!("ask {prompt}"));
+            self.inner.lines_until_blank(prompt)
+        }
+        fn confirm(&mut self, prompt: &str) -> Result<bool> {
+            self.sys.mark(format!("ask {prompt}"));
+            if let Some(ver) = self.release.take() {
+                publish(self.net, ver, Some(&format!("bui-c-{ver}")));
+            }
+            self.inner.confirm(prompt)
+        }
+    }
+
+    /// [7] → [1]（spec §0.2 R2 末条、§8.3）：确认之后才在锁外下载；这次下到的与刚才显示给人看的
+    /// 不一样（人看提示的时候又发了版），就不装，重新显示再问。再答 y 装的是新显示的那一版。
+    #[test]
+    fn maint_update_rechecks_when_the_manifest_changed_between_show_and_confirm() {
+        let pp = paths();
+        let run = |inputs: &[&str]| {
+            let (s, n) = update_machine("9.9.9", Some("bui-c-9.9.9"), Some("1.14.5"));
+            let mut p = ReleaseWhileAsking {
+                inner: Scripted {
+                    queue: inputs.iter().map(|x| x.to_string()).collect(),
+                    asked: Vec::new(),
+                    tty: true,
+                },
+                sys: &s,
+                net: &n,
+                release: Some("9.9.10"),
+            };
+            let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+            menu_loop(&mut ctx).unwrap();
+            let t = ctx.transcript.clone();
+            let asked = p.inner.asked;
+            (s, t, asked)
+        };
+
+        let (s, t, asked) = run(&["7", "1", "y", "y", "", "0"]);
+        let qs: Vec<&String> = asked
+            .iter()
+            .filter(|q| q.starts_with("现在更新到"))
+            .collect();
+        assert_eq!(qs.len(), 2, "变了要再问一次：{asked:?}");
+        assert!(
+            qs[0].contains("9.9.9") && !qs[0].contains("9.9.10"),
+            "{qs:?}"
+        );
+        assert!(qs[1].contains("9.9.10"), "{qs:?}");
+        let at = |needle: &str| t.find(needle).unwrap_or_else(|| panic!("{needle}\n{t}"));
+        assert!(at("再确认") < at("9.9.10（来源 面板）"), "{t}");
+        // 这一句连 2 列缩进在 40 列终端一行放得下（容量口径）
+        assert!(
+            menu::budget_width(UPDATE_CHANGED) + 2 <= menu::line_limit(40),
+            "{}",
+            menu::budget_width(UPDATE_CHANGED)
+        );
         assert_eq!(
-            (
-                calls.iter().filter(|c| *c == "lock").count(),
-                calls.iter().filter(|c| *c == "unlock").count()
-            ),
-            (1, 1),
+            s.get(crate::paths::SELF_BIN).unwrap(),
+            "bui-c-9.9.10",
+            "{t}"
+        );
+        assert_eq!(no_prompt_under_lock(&s, 0, "[7] → [1] 变了再问"), 1, "{t}");
+        let calls = s.calls();
+        let second_ask = calls
+            .iter()
+            .rposition(|c| c.starts_with("ask 现在更新到"))
+            .unwrap();
+        let lock = calls.iter().position(|c| c == "lock").unwrap();
+        assert!(second_ask < lock, "第一次答 y 之后什么都没装：{calls:?}");
+        assert!(last_line(&t).contains("已更新"), "{t}");
+        let rt = Runtime::load(&s, &pp);
+        assert_eq!(rt.update_version.as_deref(), Some("9.9.10"), "{rt:?}");
+        assert!(!rt.update_available, "{rt:?}");
+
+        // 重新显示之后答否：什么都不装、不拿锁，★ 挂的是新看到的版本
+        let (s, t, _) = run(&["7", "1", "y", "n", "0"]);
+        assert_eq!(s.get(crate::paths::SELF_BIN).unwrap(), INSTALLED, "{t}");
+        assert_eq!(lock_counts(&s), (0, 0), "{:?}", s.calls());
+        let last = last_line(&t);
+        assert!(last.contains("没有更新") && last.contains("9.9.10"), "{t}");
+        let rt = Runtime::load(&s, &pp);
+        assert!(rt.update_available, "{rt:?}");
+        assert_eq!(rt.update_version.as_deref(), Some("9.9.10"), "{rt:?}");
+    }
+
+    /// D16 在菜单上的出口：有主单元文件、但一个节点都没有时，换内核不重启，提示里也不许说「代理重启」，
+    /// 结果行不说「已重启」。
+    #[test]
+    fn maint_update_without_an_active_node_neither_restarts_nor_says_so() {
+        let pp = paths();
+        let (s, n) = update_machine(crate::VERSION, Some(INSTALLED), Some("1.13.19"));
+        with_unit(&s);
+        let mut prof = Profiles::load(&s, &pp).unwrap();
+        prof.profiles.clear();
+        prof.active = None;
+        prof.save(&s, &pp).unwrap();
+        // 没有节点而主单元文件还在，进菜单会先收敛拆掉（R12）；只有收敛失败过、不再自动收敛时，
+        // 人才会带着这个状态走到 [7] -> [1]
+        converge_gave_up(&s, &pp);
+        let r = run_menu(&s, &n, &pp, &["7", "1", "y", "", "0"], true);
+        assert!(r.t.contains("更新会替换 sing-box"), "{}", r.t);
+        assert!(!r.t.contains("代理重启"), "{}", r.t);
+        assert_eq!(s.get("/opt/bui-c/bin/sing-box").unwrap(), NEW_KERNEL);
+        assert!(
+            !s.called("systemctl restart bui-c.service"),
+            "{:?}",
+            s.calls()
+        );
+        let last = last_line(&r.t);
+        assert!(
+            last.contains("sing-box") && !last.contains("重启"),
+            "{}",
+            r.t
+        );
+    }
+
+    /// 命令行 `bui-c update`：下载在锁外，只在安装那一段拿**一次**锁（T12a 在入口包的那层锁删掉了——
+    /// 真 flock 下同一进程再拿一次会被自己挡住，等满 15 秒报失败）。输出两行不变（脚本在用）。
+    #[test]
+    fn the_update_command_downloads_outside_the_lock_and_takes_it_once() {
+        let pp = paths();
+        let (s, n) = update_machine("9.9.9", Some("bui-c-new"), Some("1.13.19"));
+        with_unit(&s);
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["update"]), &mut ctx).unwrap();
+        assert_eq!(
+            ctx.transcript.lines().collect::<Vec<_>>(),
+            vec![
+                "manifest 9.9.9（来源 面板）",
+                "自身更新=true 内核更新=true 已重启=true"
+            ]
+        );
+        assert!(
+            s.sleeps().is_empty(),
+            "嵌套拿锁会等满 15 秒：{:?}",
+            s.sleeps()
+        );
+        assert_eq!(lock_counts(&s), (1, 1), "{:?}", s.calls());
+        let calls = s.calls();
+        let at = |c: &str| calls.iter().position(|x| x == c).unwrap();
+        assert!(
+            at("lock") < at("systemctl restart bui-c.service"),
             "{calls:?}"
         );
+        assert!(
+            at("systemctl restart bui-c.service") < at("unlock"),
+            "{calls:?}"
+        );
+        assert_eq!(s.get(crate::paths::SELF_BIN).unwrap(), "bui-c-new");
+        let rt = Runtime::load(&s, &pp);
+        assert!(
+            rt.last_update_at.is_some() && !rt.update_available,
+            "{rt:?}"
+        );
+
+        // 锁一直被占：下载照做（锁外），等满 15 秒报「稍后再试」、退出码 1；盘上、runtime 都没动
+        let (s, n) = update_machine("9.9.9", Some("bui-c-new"), Some("1.13.19"));
+        with_unit(&s);
+        s.lock_busy(u32::MAX);
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        let e = dispatch(&parse(&["update"]), &mut ctx).unwrap_err();
+        assert!(e.to_string().contains("稍后再试"), "{e}");
+        assert_eq!(e.exit_code(), 1);
+        assert!(
+            n.log().iter().any(|l| l.contains("bui-c-linux-")),
+            "{:?}",
+            n.log()
+        );
+        assert_eq!(s.get(crate::paths::SELF_BIN).unwrap(), INSTALLED);
+        assert_eq!(s.get("/opt/bui-c/bin/sing-box").unwrap(), "ELF");
+        assert!(!s.called("systemctl restart bui-c.service"));
+        assert_eq!(s.writes("/opt/bui-c/runtime.json"), 0);
     }
 
     /// 查到了、但 runtime.json 写不进去（审查 #1）：菜单不能整个退出——停下来说「失败：…」，
@@ -10408,31 +10719,150 @@ mod tests {
         assert!(t.contains("节点设置刚改过"), "{t}");
     }
 
+    /// 每日自更新（spec §8.3）：下载在锁外，安装只试一次锁。锁被占：下载白做了，但什么都不换、
+    /// 不重启、不等；「尝试过」还原成原来的值——没装成，下一分钟还要能试，不能落进 1 小时的失败退避。
+    /// 下一分钟锁空了就装上，重启在锁里。
     #[test]
-    fn a_busy_lock_skips_the_daily_self_update_without_recording_an_attempt() {
+    fn the_daily_self_update_skips_install_when_the_lock_is_busy() {
         let pp = paths();
-        let s = FakeSys::new();
-        ready(&s);
+        let arch = update::arch_suffix();
+        let (s, n) = update_machine("9.9.9", Some("bui-c-new"), Some("1.13.19"));
         with_unit(&s);
-        let mut prof = profiles_socks();
-        prof.panel = Some(crate::profiles::Panel {
-            base_url: "https://panel.example.com".into(),
-            username: "alice".into(),
-        });
-        prof.save(&s, &pp).unwrap();
-        let n = FakeNet::new();
         n.route(crate::check::PROBE_URL, FakeReply::Status(204));
         s.lock_busy(u32::MAX);
         let mut p = Scripted::from([]);
         let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
         dispatch(&parse(&["check"]), &mut ctx).unwrap();
         assert!(ctx.transcript.contains("正常"), "{}", ctx.transcript);
-        assert!(!n.log().iter().any(|l| l.contains("manifest.json")));
+        assert!(
+            n.log()
+                .iter()
+                .any(|l| l.contains(&format!("bui-c-linux-{arch}"))),
+            "下载在锁外，锁被占也照样下完：{:?}",
+            n.log()
+        );
+        assert_eq!(s.get(crate::paths::SELF_BIN).unwrap(), INSTALLED);
+        assert_eq!(s.get("/opt/bui-c/bin/sing-box").unwrap(), "ELF");
+        assert!(!s.called("systemctl restart bui-c.service"));
+        assert_eq!(lock_counts(&s), (0, 0), "{:?}", s.calls());
+        assert!(s.sleeps().is_empty(), "巡检只试一次锁：{:?}", s.sleeps());
         let rt = Runtime::load(&s, &pp);
         assert_eq!(
             rt.last_update_attempt_at, None,
-            "没真的去试：下一分钟还要能试，不能落进 1 小时的失败退避"
+            "没装成：下一分钟还要能试，不能落进 1 小时的失败退避"
         );
+        assert_eq!(rt.last_update_at, None);
+
+        // 下一分钟锁空了：装上，重启在锁里，只拿一次锁
+        s.lock_busy(0);
+        s.advance(60);
+        let from = s.calls().len();
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["check"]), &mut ctx).unwrap();
+        assert_eq!(s.get(crate::paths::SELF_BIN).unwrap(), "bui-c-new");
+        assert_eq!(s.get("/opt/bui-c/bin/sing-box").unwrap(), NEW_KERNEL);
+        assert_eq!(no_prompt_under_lock(&s, from, "每日自更新"), 1);
+        let calls = s.calls()[from..].to_vec();
+        let at = |c: &str| calls.iter().position(|x| x == c).unwrap();
+        assert!(
+            at("lock") < at("systemctl restart bui-c.service"),
+            "{calls:?}"
+        );
+        assert!(
+            at("systemctl restart bui-c.service") < at("unlock"),
+            "{calls:?}"
+        );
+        let rt = Runtime::load(&s, &pp);
+        assert!(rt.last_update_at.is_some(), "{rt:?}");
+        assert!(!rt.update_available, "装完摘 ★：{rt:?}");
+    }
+
+    /// 每日自更新失败的终态：下载失败不拿锁；安装失败（锁里写盘失败）锁拿了也放了。两种都什么都没换、
+    /// 不重启，巡检照报「正常」，「尝试过」留着——按 1 小时退避，不每分钟重下。
+    #[test]
+    fn a_failed_daily_self_update_backs_off_and_changes_nothing() {
+        let pp = paths();
+        for (case, locks) in [("下载失败", (0, 0)), ("安装失败", (1, 1))] {
+            let (s, n) = update_machine("9.9.9", Some("bui-c-new"), Some("1.13.19"));
+            with_unit(&s);
+            n.route(crate::check::PROBE_URL, FakeReply::Status(204));
+            if locks.0 == 0 {
+                n.route(
+                    &format!(
+                        "https://panel.example.com/packages/sing-box-linux-{}",
+                        update::arch_suffix()
+                    ),
+                    FakeReply::Status(502),
+                );
+            } else {
+                s.fail_write("/usr/local/bin/.bui-c.tmp");
+            }
+            let mut p = Scripted::from([]);
+            let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+            dispatch(&parse(&["check"]), &mut ctx).unwrap();
+            let t = ctx.transcript.clone();
+            assert!(t.contains("正常") && !t.contains("自更新："), "{case}：{t}");
+            assert_eq!(s.get(crate::paths::SELF_BIN).unwrap(), INSTALLED, "{case}");
+            assert_eq!(s.get("/opt/bui-c/bin/sing-box").unwrap(), "ELF", "{case}");
+            assert!(!s.called("systemctl restart bui-c.service"), "{case}");
+            assert_eq!(lock_counts(&s), locks, "{case}：{:?}", s.calls());
+            let rt = Runtime::load(&s, &pp);
+            assert!(rt.last_update_attempt_at.is_some(), "{case}：{rt:?}");
+            assert_eq!(rt.last_update_at, None, "{case}：{rt:?}");
+            let mut again = Profiles::load(&s, &pp).unwrap();
+            again.auto_update = true;
+            assert!(
+                !check::update_due(&s, &rt, &again),
+                "{case}：下一分钟不再重试"
+            );
+        }
+    }
+
+    /// 每日自更新拿到锁之后重读 profiles（R11），按**现在**的设置决定：下载期间节点被删光了，
+    /// 内核照换但不重启（D16）；下载期间关掉了自动更新，就不装。
+    #[test]
+    fn the_daily_self_update_decides_on_the_profiles_read_inside_the_lock() {
+        let pp = paths();
+        let machine = || {
+            let (s, n) = update_machine("9.9.9", Some("bui-c-new"), Some("1.13.19"));
+            with_unit(&s);
+            n.route(crate::check::PROBE_URL, FakeReply::Status(204));
+            (s, n)
+        };
+        let check = |s: &FakeSys, n: &FakeNet| {
+            let mut p = Scripted::from([]);
+            let mut ctx = Ctx::new(s, n, &pp, &mut p, false, false);
+            dispatch(&parse(&["check"]), &mut ctx).unwrap();
+            ctx.transcript.clone()
+        };
+
+        let (s, n) = machine();
+        let mut gone = Profiles::load(&s, &pp).unwrap();
+        gone.profiles.clear();
+        gone.active = None;
+        s.stage_on_lock(
+            "/opt/bui-c/profiles.json",
+            &serde_json::to_string(&gone).unwrap(),
+        );
+        let t = check(&s, &n);
+        assert_eq!(s.get("/opt/bui-c/bin/sing-box").unwrap(), NEW_KERNEL, "{t}");
+        assert!(!s.called("systemctl restart bui-c.service"), "{t}");
+        assert_eq!(lock_counts(&s), (1, 1), "{:?}", s.calls());
+
+        let (s, n) = machine();
+        let mut off = Profiles::load(&s, &pp).unwrap();
+        off.auto_update = false;
+        s.stage_on_lock(
+            "/opt/bui-c/profiles.json",
+            &serde_json::to_string(&off).unwrap(),
+        );
+        let t = check(&s, &n);
+        assert_eq!(s.get(crate::paths::SELF_BIN).unwrap(), INSTALLED, "{t}");
+        assert_eq!(s.get("/opt/bui-c/bin/sing-box").unwrap(), "ELF", "{t}");
+        assert!(!s.called("systemctl restart bui-c.service"), "{t}");
+        assert_eq!(lock_counts(&s), (1, 1), "{:?}", s.calls());
+        assert_eq!(Runtime::load(&s, &pp).last_update_at, None);
     }
 
     /// [5] 的修复不再重复探测（T11 审查 I2）：隧道那一次 8 秒的探测只在首查与重查各做一次。
