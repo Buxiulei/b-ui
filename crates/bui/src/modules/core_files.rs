@@ -94,7 +94,37 @@ pub fn sites_glob(paths: &Paths) -> String {
         .to_string()
 }
 
+/// 四个免鉴权订阅端点的 path 匹配器（`log_skip` 用）。末段是订阅 token 或宽限期内的
+/// 用户名，两者都是凭据（2026-09-14 裁决）。Caddy 的 `path` 匹配器**不分大小写**，
+/// 所以 `/API/SUB/<token>` 这种请求也一并跳过。
+const SUB_PATHS_MATCHER: &str = "/api/sub/* /api/subscription/* /api/clash/* /api/nodes/*";
+
+/// `format filter` 的 `regexp` 参数：把订阅路径的末段换成 `***`（口径同 [`crate::redact::sub_path`]）。
+///
+/// `log_skip` 只挡站点路由树里的**访问**日志，挡不住这两条真会漏的路（2026-09-14 用本机
+/// caddy 2.10.2 复现）：
+/// - `reverse_proxy` 连不上上游时的错误日志（`http.log.error.log0`）落到 **default** logger，
+///   `"uri":"/api/sub/<token>?x=1"` 原样进 journald。面板的上游就是本机 `:admin_port`，
+///   `b-ui` 每次重启 / 升级 / watchdog 拉起的窗口里客户端拉订阅都会 502，一条一个 token；
+/// - `:80` 的 HTTP→HTTPS 跳转服务器不走站点路由树（`log_skip` 挂在那棵树上），它的访问日志
+///   与 308 的 `Location` 头各带一份末段；Host 跟站点不匹配时这条还会落到 default logger。
+///
+/// 所以 default 与站点两个 logger 都得挂，`request>uri` 与 `resp_headers>Location` 两个字段
+/// 都得过（`regexp` 过滤器对数组字段逐项生效，实测 `Location` 那一项被换掉）。`(?i)` 是因为
+/// Caddy 的 `path` 匹配器不分大小写，`/API/SUB/<token>` 也照样被服务到。
+const SUB_SEG_REGEXP: &str = "\"(?i)(/api/(?:sub|subscription|clash|nodes)/)[^/?]+\" \"${1}***\"";
+
 /// Caddyfile：只反代面板端口，日志进 stderr（journald 收），不再写 `/var/log/caddy`。
+///
+/// 面板块的访问日志会把完整 URI 写进 journald，而四个免鉴权订阅端点的路径末段本身就是
+/// 凭据 ⇒ 给它们加一条 `log_skip`（[`SUB_PATHS_MATCHER`]，2026-09-14 裁决），其余请求
+/// 照旧记日志；`log_skip` 挡不到的那两条路由由 [`SUB_SEG_REGEXP`] 兜住。守护进程自己那一侧
+/// 的脱敏在 `crate::redact::sub_path`。
+///
+/// default logger 的 `wrap` 必须是 **json**：哨兵按 JSON 解 caddy 的证书失败行
+/// （`crate::modules::sentinel` 的 `signature::caddy` 先认 `"level":"error"` 再 `serde_json`
+/// 解 `identifier`），换成 console 那条告警就静默失效（2026-09-14 实测：`wrap console` 之后
+/// 整份 stderr 里 `"level":"error"` 出现 0 次）。站点 logger 照旧 console（访问日志给人看）。
 ///
 /// `sites_glob` 是外部站点通道的 import 通配（2026-09-13 裁决），由 [`crate::paths`] 派生传进来，
 /// **必须排在面板站点块之后**：写进块里就变成站点内指令了。glob 一个文件都没匹配到时
@@ -103,11 +133,35 @@ pub fn caddyfile_text(domain: &str, admin_port: u16, sites_glob: &str) -> String
     format!(
         "\
 # B-UI v4 —— 由 bui 对账器生成，手改会被覆盖
+{{
+\t# caddy 自己的日志（含 reverse_proxy 的错误日志与 :80 跳转）里也有订阅链接的末段；
+\t# wrap 必须留 json，哨兵按 JSON 解证书失败行
+\tlog default {{
+\t\toutput stderr
+\t\tformat filter {{
+\t\t\twrap json
+\t\t\tfields {{
+\t\t\t\trequest>uri regexp {SUB_SEG_REGEXP}
+\t\t\t\tresp_headers>Location regexp {SUB_SEG_REGEXP}
+\t\t\t}}
+\t\t}}
+\t}}
+}}
+
 {domain} {{
+\t# 订阅链接的末段就是凭据，不进访问日志
+\t@sub path {SUB_PATHS_MATCHER}
+\tlog_skip @sub
 \treverse_proxy 127.0.0.1:{admin_port}
 \tlog {{
 \t\toutput stderr
-\t\tformat console
+\t\tformat filter {{
+\t\t\twrap console
+\t\t\tfields {{
+\t\t\t\trequest>uri regexp {SUB_SEG_REGEXP}
+\t\t\t\tresp_headers>Location regexp {SUB_SEG_REGEXP}
+\t\t\t}}
+\t\t}}
 \t}}
 }}
 
@@ -546,6 +600,69 @@ mod tests {
         assert_eq!(
             caddyfile_text("example.com", 8080, "/opt/b-ui/caddy/sites/*.caddy"),
             caddyfile_text("example.com", 8080, "/opt/b-ui/caddy/sites/*.caddy")
+        );
+    }
+
+    /// 2026-09-14 裁决「每用户随机订阅 token」：四个免鉴权订阅端点的末段是凭据，
+    /// 面板块的访问日志（`output stderr` → journald）不许收它们；其余请求照旧记。
+    #[test]
+    fn caddyfile_skips_the_access_log_for_the_four_subscription_paths() {
+        let arts = CoreFilesModule::new(None).render(&sample_state(), &ctx());
+        let text = match find_file(&arts, "/opt/b-ui/Caddyfile") {
+            Artifact::File { content, .. } => String::from_utf8(content).unwrap(),
+            other => panic!("{other:?}"),
+        };
+        assert!(
+            text.contains("\t@sub path /api/sub/* /api/subscription/* /api/clash/* /api/nodes/*\n"),
+            "四条路径一条都不能少：\n{text}"
+        );
+        assert!(text.contains("\tlog_skip @sub\n"), "\n{text}");
+        // 必须在面板站点块**里面**（块外的 log_skip 不是合法的顶层指令）。
+        // 顶格的 `\n}\n` 现在第一处是全局选项块的，所以从站点块开头往后找
+        let block_start = text.find("\nexample.com {\n").expect("面板站点块的开头");
+        let block_end = block_start
+            + 1
+            + text[block_start + 1..]
+                .find("\n}\n")
+                .expect("面板块顶格的右花括号");
+        let at = text.find("log_skip @sub").expect("log_skip 行");
+        assert!(
+            at > block_start && at < block_end,
+            "log_skip 得落在面板站点块里：\n{text}"
+        );
+        // 只跳这四条，别把整个面板的访问日志一起关掉
+        assert!(text.contains("output stderr"), "\n{text}");
+    }
+
+    /// 2026-09-14 审查意见 1/2：`log_skip` 只挡站点路由树里的访问日志，`reverse_proxy` 的
+    /// 错误日志（落 default logger）与 `:80` 跳转服务器的访问日志 + 308 的 `Location` 头
+    /// 照旧把末段写进 journald ⇒ 两个 logger、两个字段都得挂 `format filter` 的 `regexp`。
+    /// default 的 `wrap` 必须留 json：哨兵按 JSON 解 caddy 的证书失败行。
+    #[test]
+    fn caddyfile_masks_the_subscription_segment_in_both_loggers() {
+        let text = caddyfile_text("example.com", 8080, "/opt/b-ui/caddy/sites/*.caddy");
+        let field = |f: &str| format!("\t\t\t\t{f} regexp {SUB_SEG_REGEXP}\n");
+        assert_eq!(
+            text.matches(&field("request>uri")).count(),
+            2,
+            "uri 过滤要挂在 default 与站点两个 logger 上：\n{text}"
+        );
+        assert_eq!(
+            text.matches(&field("resp_headers>Location")).count(),
+            2,
+            "308 跳转的 Location 头里也有一份末段：\n{text}"
+        );
+        // 全局选项块（default logger）在最前，站点块在后
+        let global = text.find("\n{\n").expect("全局选项块");
+        let site = text.find("\nexample.com {\n").expect("面板站点块");
+        assert!(global < site, "全局选项块必须是第一个块：\n{text}");
+        assert!(
+            text[global..site].contains("\t\t\twrap json\n"),
+            "default logger 换成 console 会让哨兵的 caddy 证书告警静默失效：\n{text}"
+        );
+        assert!(
+            text[site..].contains("\t\t\twrap console\n"),
+            "站点的访问日志照旧 console：\n{text}"
         );
     }
 

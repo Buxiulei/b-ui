@@ -455,6 +455,13 @@ mod tests {
     #[tokio::test]
     async fn routes_cover_every_admin_endpoint_and_nothing_public() {
         let h = testsupport::harness().await;
+        // 给 alice 一个订阅 token：下面探「订阅不在 routes() 里」时必须用**能取到东西**的
+        // 末段，否则 handler 自己也会回 404，真挂错了也看不出来
+        let tok = "0123456789abcdef0123456789abcdef";
+        h.store
+            .update(|s| s.users[0].sub_token = Some(tok.into()))
+            .await
+            .unwrap();
         let router =
             testsupport::mount(&h.app, PanelModule::with_shared(h.shared.clone()).routes());
         // 受保护路由在这里是裸挂的（没套 require_admin），只验「路由存在」
@@ -474,8 +481,8 @@ mod tests {
         }
         // 公开端点不该出现在 routes() 里
         for p in [
-            "/api/sub/alice",
-            "/api/nodes/alice",
+            &format!("/api/sub/{tok}"),
+            &format!("/api/nodes/{tok}"),
             "/",
             "/packages/manifest.json",
             "/api/me",
@@ -492,6 +499,13 @@ mod tests {
     #[tokio::test]
     async fn public_routes_cover_subscriptions_front_end_packages_and_the_user_domain() {
         let h = testsupport::harness().await;
+        // 订阅末段自 2026-09-14 裁决起是随机 token；用户名链接只在宽限期内还认，
+        // 而 `sample_state` 不开宽限期 ⇒ 这里必须拿 token 去探路由挂没挂上
+        let tok = "0123456789abcdef0123456789abcdef";
+        h.store
+            .update(|s| s.users[0].sub_token = Some(tok.into()))
+            .await
+            .unwrap();
         let router = testsupport::mount(
             &h.app,
             PanelModule::with_shared(h.shared.clone()).public_routes(),
@@ -503,10 +517,10 @@ mod tests {
             "/style.css",
             "/qrcode.min.js",
             "/logo.jpg",
-            "/api/sub/alice",
-            "/api/subscription/alice",
-            "/api/clash/alice",
-            "/api/nodes/alice",
+            &format!("/api/sub/{tok}"),
+            &format!("/api/subscription/{tok}"),
+            &format!("/api/clash/{tok}"),
+            &format!("/api/nodes/{tok}"),
             "/api/install-command",
             "/api/me",
             "/api/me/billing",
@@ -641,8 +655,13 @@ mod tests {
         // 前端无鉴权
         let (s_index, _) = testsupport::text(&router, "/").await;
         assert_eq!(s_index, axum::http::StatusCode::OK);
-        // 订阅无鉴权
-        let (s_sub, _) = testsupport::text(&router, "/api/sub/alice").await;
+        // 订阅无鉴权（末段是随机 token，见 `api_public::resolve`）
+        let tok = "0123456789abcdef0123456789abcdef";
+        h.store
+            .update(|s| s.users[0].sub_token = Some(tok.into()))
+            .await
+            .unwrap();
+        let (s_sub, _) = testsupport::text(&router, &format!("/api/sub/{tok}")).await;
         assert_eq!(s_sub, axum::http::StatusCode::OK);
         // 管理员端点要 token
         let (s_401, _) = testsupport::send(&router, "GET", "/api/users", None, None).await;

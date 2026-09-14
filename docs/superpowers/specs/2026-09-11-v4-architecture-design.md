@@ -192,7 +192,7 @@ tonic 客户端，proto 从 Xray-core `v26.3.27` vendor 进仓（以仓库根为
 
 `POST /api/reconcile` 的 `dry_run` 仅 CLI 本地路径（`bui reconcile --dry-run`）支持，HTTP 端点忽略该字段：请求一律排队真跑一轮对账，返回 200 + 最近一份 `ReconcileReport` 或 202 `{"queued":true}`。
 
-无鉴权（按用户名，沿用 v3）：`/api/sub/<user>`、`/api/subscription/<user>`、`/api/clash/<user>`、**新增** `/api/nodes/<user>`（节点 schema JSON，供 `bui-c` 渲染）。
+无鉴权（**按每用户随机订阅 token**，2026-09-14 裁决改掉了原先「按用户名，沿用 v3」的口径）：`/api/sub/<token>`、`/api/subscription/<token>`、`/api/clash/<token>`、**新增** `/api/nodes/<token>`（节点 schema JSON，供 `bui-c` 渲染）。`token` = `state.json` 的 `users[].sub_token`，32 位小写十六进制（16 字节随机）；末段是 token 形态就常量时间比对 `sub_token`，否则只在全局宽限期 `system.legacy_sub_until` 未到、且该用户 `legacy_sub_disabled == false` 时才按用户名精确匹配（新装机不开宽限期，v3 导入与老 v4 升级给 7 天）。三种失配一律同一个 404 `{"error":"User not found"}`——不给能区分「没这个用户」与「链接已过期」的回应，那等于白送一个免鉴权的用户名探测器。理由：仓库公开、证书透明日志公开所有子域，域名补不回来，只能让链接不可猜且可轮换（响应体里就是 hy2 明文密码与 vless uuid）。
 
 用户域（预留，**v4 全部返回 501 `{"error":"not_implemented"}`**，请求/响应结构在附录 A 定义）：`POST /api/me/login`、`GET /api/me`、`GET /api/me/subscription-links`、`GET /api/me/entitlements`、`GET /api/me/billing`、`POST /api/me/orders`、`GET /api/me/orders/{id}`。
 

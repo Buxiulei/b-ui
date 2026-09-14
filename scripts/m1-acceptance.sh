@@ -366,10 +366,27 @@ print(((d.get("node") or {}).get("ports") or {}).get("admin") or 8080)
 PY
 }
 
+# $1 = state.json，$2 = 用户名 → 该用户的订阅 token（users[].sub_token），取不到就空串。
+# 2026-09-14 裁决：四个免鉴权端点认随机 token，用户名链接只在全局宽限期内还认（全新装机
+# 从来不开宽限期）⇒ 验收一律按 token 取订阅，不然新装机上必然 404。
+sub_token() {
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    raise SystemExit(0)
+for u in d.get("users") or []:
+    if u.get("username") == sys.argv[2]:
+        print(u.get("sub_token") or "")
+        break
+PY
+}
+
 # 核对「槽位表自洽」、每槽的实例在跑且端口在听、每个住宅用户的订阅里的 HY2 住宅端口
 # == 他槽位的端口。
 check_slots() {
-  local slots out port i user unit aport want
+  local slots out port i user unit aport want tok
   slots=$("$BUI" residential slots --json 2>/dev/null)
   if [ -z "$slots" ]; then
     skip "step7 槽位（bui residential slots 无输出，可能住宅未启用）"
@@ -404,7 +421,12 @@ EOF
   aport=$(admin_port "$BASE/state.json")
   while read -r want user; do
     [ -n "$user" ] || continue
-    port=$(curl -fsS --max-time 10 "http://127.0.0.1:$aport/api/sub/$user" 2>/dev/null |
+    tok=$(sub_token "$BASE/state.json" "$user")
+    if [ -z "$tok" ]; then
+      no "step7 $user 没有订阅 token" "state.json 的 users[] 里取不到 sub_token（守护进程启动时应已补齐）"
+      continue
+    fi
+    port=$(curl -fsS --max-time 10 "http://127.0.0.1:$aport/api/sub/$tok" 2>/dev/null |
       base64 -d 2>/dev/null | grep -F 'HY2%E4%BD%8F%E5%AE%85' |
       sed -n 's#.*@[^:]*:\([0-9]*\)?.*#\1#p' | head -1)
     if [ "$want" = "$port" ]; then
@@ -589,6 +611,28 @@ self_test_slots() {
   out=$(slots_users "$good")
   if [ "$out" = "40000 a
 40002 b" ]; then ok "自测：slots_users 给出端口与用户名"; else no "自测：slots_users 结果不对" "$out"; fi
+  self_test_sub_token
+}
+
+# step 7 的自测（续）：订阅 URL 的末段取自 state.json 的 users[].sub_token，不再是用户名
+self_test_sub_token() {
+  local f out
+  f=$(mktemp) || { no "自测：建不出临时文件"; return; }
+  printf '%s\n' '{"users":[{"username":"alice","sub_token":"0123456789abcdef0123456789abcdef"},
+                            {"username":"bob"}]}' > "$f"
+  out=$(sub_token "$f" alice)
+  if [ "$out" = "0123456789abcdef0123456789abcdef" ]; then
+    ok "自测：sub_token 取到用户的订阅 token"
+  else
+    no "自测：sub_token 没取到 token" "$out"
+  fi
+  out=$(sub_token "$f" bob)
+  if [ -z "$out" ]; then ok "自测：没有 sub_token 的用户返回空串"; else no "自测：sub_token 凭空造了个 token" "$out"; fi
+  out=$(sub_token "$f" carol)
+  if [ -z "$out" ]; then ok "自测：不存在的用户返回空串"; else no "自测：sub_token 认了不存在的用户" "$out"; fi
+  out=$(sub_token "$f/nope" alice)
+  if [ -z "$out" ]; then ok "自测：state.json 读不到时返回空串"; else no "自测：读不到 state.json 却有输出" "$out"; fi
+  rm -f "$f"
 }
 
 # step 2 的自测：只验「已安装」这一行的判定，重点是**输出很长也不能漏**（旧版 tail -n 20 就漏了）

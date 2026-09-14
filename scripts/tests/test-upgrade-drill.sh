@@ -10,7 +10,20 @@ ROOT=$(cd "$HERE/../.." && pwd)
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/bin" "$WORK/base/bin"
-printf 'state\n' > "$WORK/base/state.json"
+# 演练按 state.json 里的 users[].sub_token 拼订阅 URL（2026-09-14 裁决：四个免鉴权端点
+# 不再认用户名），所以 stub 的 state.json 得是真 JSON 且带 token
+ALICE_TOK=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+BOB_TOK=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+write_state() {  # $1 = bob 的 sub_token（空串 = bob 还没补齐 token）
+    if [[ -n "${1:-}" ]]; then
+        printf '{"users":[{"username":"alice","sub_token":"%s"},{"username":"bob","sub_token":"%s"}]}\n' \
+            "$ALICE_TOK" "$1" > "$WORK/base/state.json"
+    else
+        printf '{"users":[{"username":"alice","sub_token":"%s"},{"username":"bob"}]}\n' \
+            "$ALICE_TOK" > "$WORK/base/state.json"
+    fi
+}
+write_state "$BOB_TOK"
 printf 'listen: :10000,20000-30000\n' > "$WORK/base/config.yaml"
 printf '{}\n' > "$WORK/base/xray-config.json"
 printf '4.0.0\n' > "$WORK/version"
@@ -52,10 +65,13 @@ case "${1:-}" in
   *) printf '\n' ;;
 esac
 STUB
-# curl stub：订阅内容 = 用户名 + 升级后是否漂移
+# curl stub：订阅内容 = URL 末段（订阅 token）+ 升级后是否漂移；请求过的 URL 记账，
+# 用来验「拼的是 token 不是用户名」。FAKE_404=1 模拟按用户名取时的 404：curl -f 退 22、body 空
 cat > "$WORK/bin/curl" <<'STUB'
 #!/usr/bin/env bash
 url=""; for a in "$@"; do case "$a" in http*) url="$a" ;; esac; done
+printf '%s\n' "$url" >> "$CURL_LOG"
+if [[ "${FAKE_404:-0}" == "1" ]]; then exit 22; fi
 body="sub:${url##*/}"
 if [[ "${FAKE_DRIFT:-0}" == "1" && -f "$VERFILE.prev" ]]; then body="$body-drifted"; fi
 printf '%s\n' "$body"
@@ -68,11 +84,12 @@ for a in "$@"; do case "$a" in *.tar.gz) : > "$a" ;; esac; done
 STUB
 chmod +x "$WORK/bin"/*
 export PATH="$WORK/bin:$PATH" VERFILE="$WORK/version" TAR_LOG="$WORK/tar.log" \
-       BUI_LOG="$WORK/bui.log" BASEDIR="$WORK/base"
+       BUI_LOG="$WORK/bui.log" BASEDIR="$WORK/base" CURL_LOG="$WORK/curl.log"
 
 reset_env() {
-    rm -f "$WORK/version.prev" "$WORK/bui.log"
+    rm -f "$WORK/version.prev" "$WORK/bui.log" "$WORK/curl.log"
     printf '4.0.0\n' > "$WORK/version"
+    write_state "$BOB_TOK"
     for b in bui hysteria xray sing-box caddy; do
         printf 'bin-%s-v1\n' "$b" > "$WORK/base/bin/$b"
     done
@@ -106,6 +123,10 @@ assert_eq "1" "$([[ "$(awk -F, '$1 == "before" && $2 == "sha:bin/sing-box" {prin
 assert_eq "$(awk -F, '$1 == "before" && $2 == "sha:bin/sing-box" {print $3}' "$WORK/ok/drill.csv")" \
     "$(awk -F, '$1 == "after-rollback" && $2 == "sha:bin/sing-box" {print $3}' "$WORK/ok/drill.csv")" \
     "回滚后内核 sha 复原"
+# 2026-09-14 裁决：订阅 URL 的末段是 sub_token，按用户名取会 404 ⇒ 演练必须拼 token
+assert_contains "/api/sub/$ALICE_TOK" "$(cat "$WORK/curl.log")" "订阅 URL 拼的是 sub_token"
+assert_contains "/api/clash/$BOB_TOK" "$(cat "$WORK/curl.log")" "三种订阅都按 token 取"
+assert_not_contains "/api/sub/alice" "$(cat "$WORK/curl.log")" "不再按用户名取订阅"
 assert_contains "backup-" "$(cat "$WORK/tar.log")" "演练前打了快照"
 assert_contains "etc/systemd/system/hysteria-residential.service" "$(cat "$WORK/tar.log")" "快照含六个单元文件（不只 b-ui.service）"
 assert_contains "--ignore-failed-read" "$(cat "$WORK/tar.log")" "缺失单元不让 tar 整体失败"
@@ -122,6 +143,25 @@ out=$(FAKE_KERNEL_STUCK=1 run "$WORK/stuck" 2>&1); rc=$?
 assert_eq "1" "$rc" "回滚没复原内核退 1"
 assert_contains "FAIL 二进制未复原 sha:bin/sing-box" "$out" "点名哪个二进制没复原"
 assert_contains "first_failure=rollback-kernels" "$(cat "$WORK/stuck/DONE")" "DONE 记 rollback-kernels"
+
+# 订阅取不到（按用户名取的 404、面板没起来……）必须 FAIL：旧写法两个相位都拿空 body，
+# `sha_str ""` 两两相等，`compare_subs` 就判「订阅无漂移」——假绿比失败更坏
+reset_env
+out=$(FAKE_404=1 run "$WORK/notfound" 2>&1); rc=$?
+assert_eq "1" "$rc" "订阅取不到退 1"
+assert_contains "FAIL before：取 alice 的 sub 订阅失败或返回空" "$out" "点名哪个用户哪种订阅取不到"
+assert_contains "first_failure=sub-fetch:before:alice:sub" "$(cat "$WORK/notfound/DONE")" "DONE 记 sub-fetch"
+assert_eq "0" "$(awk -F, '$2 ~ /^sub:/ {c++} END {print c + 0}' "$WORK/notfound/drill.csv")" \
+    "取不到就不记 sub: 指纹（不留两个空串给 compare_subs 比出假绿）"
+
+# state.json 里没有 sub_token（启动补齐没跑到）也必须 FAIL，不能静默跳过这个用户
+reset_env
+write_state ""
+out=$(run "$WORK/notok" 2>&1); rc=$?
+assert_eq "1" "$rc" "缺 sub_token 退 1"
+assert_contains "FAIL before：state.json 里取不到 bob 的 sub_token" "$out" "点名是谁没有 token"
+assert_contains "first_failure=sub-token:before:bob" "$(cat "$WORK/notok/DONE")" "DONE 记 sub-token"
+assert_contains "/api/sub/$ALICE_TOK" "$(cat "$WORK/curl.log")" "有 token 的用户照旧取"
 
 # 缺 --users 直接退 2（别在生产上跑出一份没有订阅指纹的空演练）
 out=$(bash "$ROOT/scripts/ops/upgrade-drill.sh" --to 4.0.1 --out "$WORK/nouser" 2>&1); rc=$?

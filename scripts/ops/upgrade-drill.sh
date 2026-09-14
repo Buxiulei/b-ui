@@ -37,6 +37,8 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 [[ -n "$USERS" ]] || usage
+# state.json 里的订阅 token 要用 python3 解（口径同 scripts/ops/sentinel-drill.sh）
+command -v python3 >/dev/null 2>&1 || { printf '需要 python3 来解析 state.json\n' >&2; exit 2; }
 
 mkdir -p "$OUT" || exit 2
 CSV="$OUT/drill.csv"
@@ -51,9 +53,27 @@ rec() { printf '%s,%s,%s\n' "$1" "$2" "$3" >> "$CSV"; }
 sha_str() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
 sha_file() { [[ -f "$1" ]] && sha256sum "$1" | cut -d' ' -f1 || printf 'missing\n'; }
 
+# $1 = 用户名 → 该用户的订阅 token（state.json 的 users[].sub_token），取不到就空串。
+# 2026-09-14 裁决：四个免鉴权端点认随机 token，用户名链接只在全局宽限期内还认 ⇒ 演练必须
+# 按 token 取订阅。按用户名取会拿到 404 + 空 body，而 `sha_str ""` 前后两相位相同，
+# `compare_subs` 就此判「订阅无漂移」——比直接失败更坏的假绿。
+sub_token() {
+    python3 - "$BASE/state.json" "$1" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    raise SystemExit(0)
+for u in d.get("users") or []:
+    if u.get("username") == sys.argv[2]:
+        print(u.get("sub_token") or "")
+        break
+PY
+}
+
 snapshot() {
     # $1 = phase
-    local phase="$1" u kind url body unit f
+    local phase="$1" u kind url body unit f tok
     rec "$phase" version "$("$BUI" --version 2>/dev/null | tr -d '[:space:]')"
     for unit in $UNITS; do
         rec "$phase" "unit:$unit" "$(systemctl is-active "$unit" 2>/dev/null)"
@@ -68,13 +88,25 @@ snapshot() {
         rec "$phase" "sha:bin/$f" "$(sha_file "$BASE/bin/$f")"
     done
     for u in ${USERS//,/ }; do
+        tok=$(sub_token "$u")
+        if [[ -z "$tok" ]]; then
+            log "FAIL $phase：state.json 里取不到 $u 的 sub_token，订阅取不了"
+            note_fail "sub-token:$phase:$u"
+            continue
+        fi
         for kind in sub subscription clash; do
             case "$kind" in
-                sub) url="$API/api/sub/$u" ;;
-                subscription) url="$API/api/subscription/$u" ;;
-                clash) url="$API/api/clash/$u" ;;
+                sub) url="$API/api/sub/$tok" ;;
+                subscription) url="$API/api/subscription/$tok" ;;
+                clash) url="$API/api/clash/$tok" ;;
             esac
+            # 空 body 也算失败：不记这个 key，`compare_keys` 才不会拿两个空串比出「无漂移」
             body=$(curl -fsS --max-time 15 "$url" 2>/dev/null)
+            if [[ -z "$body" ]]; then
+                log "FAIL $phase：取 $u 的 $kind 订阅失败或返回空（$API/api/$kind/<token>）"
+                note_fail "sub-fetch:$phase:$u:$kind"
+                continue
+            fi
             rec "$phase" "sub:$u:$kind" "$(sha_str "$body")"
         done
     done
