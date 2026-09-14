@@ -285,7 +285,9 @@ P1 一轮（T18 之后）照计划：[9] 测速（结果、切到最快的确认
 - **合并时机（服务端，主理人已授权）**：这批进 **4.0.1**，等 `v4.0.0` 打 tag 之后再合进 `v4`。rc12 在 `bwg-rick` 上 72 小时浸泡（09-17 判定），通过就直接打 `v4.0.0`，`v4.0.0` 必须是浸泡过的那份代码；本分支含 `bui-schema` 改动，按冻结规矩不在浸泡中途改共享 crate。之后开 PR 或给 SHA，服务端对跨 crate 部分再审一次；合并前以那一刻的 `origin/v4` 再试合（`632b475` 对 `f5571a9` 干净）。版本号与 CHANGELOG 日期由主理人发版时定。
 - **T12b 收口**：r3 I1 由 lead 裁定「接受，再修最后一次，范围钉死」并落地为 `632b475`，r4 Approved。M1–M8 与 r4 的 3 条 Minor 全部记账（§5）。「半换」情形（别处只换 bui-c、这次换了内核并重启，或反过来）文案对一半不准、菜单多一轮再确认，不会装错；要不要处理由 lead 定。
 - **nix `fs`**：`crates/bui-c/Cargo.toml` 与 spec 都已改；台账的全局约束里那句「现有 features 可用」还要改。「CI 对每个发布 crate 单独 check」服务端记进 4.0.1（`release.yml` 一次编 `-p bui -p bui-c`，resolver 2 下 feature 统一替这类缺口打了掩护）。
-- **跨 crate 提交**：`4c7be25`、`c84f5a6`、`0b85284` 服务端已审通过；`7665f19` / `594c0c3`（T14fu2）是按服务端五条意见做的，SHA 发给会话 `bui` 备案即可。C1 契约现在只多 `probe_config` / `ProbeTarget`。
+- **跨 crate 提交**：`4c7be25`、`c84f5a6`、`0b85284` 服务端已审通过；`7665f19` / `594c0c3`（T14fu2）是按服务端五条意见做的。**服务端在浸泡空档对 `c1bbae1` 的跨 crate 部分做了预审，通过**（变异验证上次 5 条都修好、`594c0c3` 只加严不放宽、`crates/bui` 零改动且四个 golden 逐字节不变、合并干跑干净连 CHANGELOG 也合上）。v4.0.0 打完即可合，前提是 `bui-schema` 之后不再改，改了服务端只审增量。C1 契约现在只多 `probe_config` / `ProbeTarget`。
+- **`probe_config` / `ProbeTarget` 在 4.0.1 暂时没有调用方**：它们是 [9] 节点测速（P1 的 T16）要用的 C1 公开项，4.0.1 先随 bui-schema 发出去。**不是死代码，不要删**；T16 落地后才有调用方。
+- **发 4.0.1 前要 bump 根 `Cargo.toml` 的 workspace version**（现在是 4.0.0，`check-version.sh v4.0.1` 会失败）。本分支不提前 bump（v4.0.0 还没发），由服务端在打 4.0.1 tag 前做。
 - **Ttoken 记账**：`looks_like_token` 只认 32 位十六进制，服务端改 token 格式要同步；rc12 → rc11 → rc12 往返会重新生成全部 token（节点凭据不断连，存下的 token 链接失效，要重新导入）；`--sub` 经 `/api/nodes` 成功时会记 `Profiles.panel`（root 自更新来源），与菜单 [3] 同判据，已有断言钉住。
 - **发版顺序**：T7 不能单独发版，必须与 T7b 一起（确认块文案已承诺墓碑行为）。
 - **服务端侧（不在我们分支）**：HY2 住宅端口与槽号解耦记成 v4.1 设计题；`bui residential remove` 当场列出受影响用户（删 0 号槽时含被搬动那一槽）；被 rebalance 移动、尚未刷新订阅的用户是否单独提醒；CI skip 守门正则与 CLAUDE.md「本机 1.13.19」由服务端改。

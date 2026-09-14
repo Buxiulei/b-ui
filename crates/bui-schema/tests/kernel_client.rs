@@ -380,7 +380,8 @@ fn probe_config_routes_each_inbound_to_its_node_with_auth_and_auto_detect() {
             serde_json::json!([{ "username": t.user, "password": t.pass }])
         );
         // 这个入站的规则指向 probe-<i>（assert_probe_tags 已核对），它就是这个节点的出站
-        // （「出站与主配置同源」那条断言在 render/client.rs 的 mod tests 里，用的是私有 outbound）
+        // （「出站与主配置同源」那条断言在 render/client.rs 的 mod tests 里：取 tun / mixed 主配置的出站，
+        // 核对它逐字节在 golden 常量里，换成 probe-<i> 的 tag 后与测速配置的出站逐字段比）
         let out = &outbounds[i];
         assert_eq!(out["server"], t.node.host);
         assert_eq!(out["server_port"], t.node.port);
