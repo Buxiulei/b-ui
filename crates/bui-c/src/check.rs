@@ -39,7 +39,7 @@ pub struct Runtime {
     pub last_update_attempt_at: Option<i64>,
     /// 已加过 bui-tun 放行规则（T12 写，本模块只读写字段）。
     pub ufw_rules: bool,
-    /// 上一次检查更新的结论：manifest 版本与本机不同。菜单 `[6] ★ 有新版` 读它，
+    /// 上一次检查更新的结论：manifest 版本与本机不同。主菜单 `[7] 更新与维护 ★` 读它，
     /// 不为了渲染一屏菜单去联网。由 `update` 子命令与巡检里的自更新写。
     pub update_available: bool,
     /// 上一次检查更新的时间（epoch 秒），与 `update_available` 同时写。
