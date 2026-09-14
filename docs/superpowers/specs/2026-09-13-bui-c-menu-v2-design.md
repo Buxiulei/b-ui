@@ -84,11 +84,11 @@
 
 ### R3 连接检查 [5]
 
-- **SOCKS 模式在「百度直连」前加一行 `DNS`**：经新的 `Sys::resolve(host) -> Result<Duration>`（真机用 `ToSocketAddrs`，测试可注入）解析 `www.baidu.com`，`✓ 本机解析正常 {ms}ms` / `✗ 本机 DNS 解析失败`，不计分。TUN 模式维持并进百度那一行（`hijack-dns` 下单独测没有意义）。[体验] [清单]
-- 汇总：有不计分项没通时写 `全部通过（N 项）；YouTube 超时，不计分`；出现过 ○ 时，汇总下面加一行图例 `○ 仅供参考，不计入通过/失败`。[体验]
+- **SOCKS 模式在「百度直连」前加一行 `DNS`**：经新的 `Sys::resolve(host) -> Result<Duration>`（真机用 `ToSocketAddrs`，测试可注入）解析 `www.baidu.com`，`✓ 本机解析正常 {ms}ms` / `○ 本机 DNS 解析失败`，不计分。TUN 模式维持并进百度那一行（`hijack-dns` 下单独测没有意义）。不通用 `○` 而不是 `✗`：不计分项没通一律打 `○`（§6.2 的通用口径），屏幕上出现没人解释的红叉、汇总却说「全部通过」更难懂。[体验] [清单]
+- 汇总：有不计分项没通时写 `全部通过（N 项）；YouTube 没通，不计分`；出现过 ○ 时，汇总下面加一行图例 `○ 仅供参考，不计入通过/失败`。汇总只点名，具体原因（`超时（6 秒）`、`本机 DNS 解析失败`）写在该项那一行上，不在汇总里重复。[体验]
 - 下载那一行末尾加评语：≥ 1.25 MB/s「优秀」，≥ 0.625 MB/s「良好」，其余「较慢」（沿用 v3 阈值，r6 §1.6）。[体验]
 - 「下一步」小菜单加 `[0] 返回菜单`，提示符 `选择 [0-3]`；[3] 看完日志回到这个小菜单，不回主菜单。[体验]
-- timer 守门测试按 URL 断言：允许 `PROBE_URL` 与 update 模块生成的 manifest / 产物地址；禁止 `nettest::URLS` 里那几个具体地址（google / youtube 的检测地址、github.com 根路径、baidu、cloudflare、ippure、ip-api、ipify、icanhazip），不按主机名判断，因为每日自更新本来就会访问 github.com。[实现]
+- timer 守门测试按 URL 断言：允许 `PROBE_URL` 与 update 模块生成的 manifest / 产物地址；禁止 `nettest::URLS` 里那几个具体地址（google / youtube 的检测地址、github.com 上的检测地址（当前是 `github.com/robots.txt`）、baidu、cloudflare、ippure、ip-api、ipify、icanhazip），不按主机名判断，因为每日自更新本来就会访问 github.com。[实现]
 
 ### R4 检查更新
 
@@ -1711,6 +1711,7 @@ loop {
 ### 4.4 非交互（管道、脚本、测试）
 
 - `Stdin::pause` 在 stdin 不是终端时直接返回、不读一行。没人会按回车；如果照读，`printf '5\n0\n' | sudo bui-c` 里的 `0` 会被停顿吃掉，行为就跟现在不一样了。`Scripted` 仍然消费一行，测试里写 `""` 代表回车，与现有日志用例的写法相同（cli.rs 里现有的日志用例）。
+- [5] 失败后的「下一步」小菜单与其它子提问一样，会消费管道里的一行（`printf '5\n0\n' | bui-c` 里的 `0` 被解释成「返回菜单」，末尾 EOF 再退出主菜单）。全部通过时走 `pause`，非终端不读。
 - 不清屏、按 80 列排、不打提示符（现状，`menu.rs:44`）。
 - 一次性命令（`status / list / delete / test`）永远不清屏。
 
@@ -1926,7 +1927,7 @@ bui-c delete <名字>... [--to <名字>] [-y] [--json]
 | 测试 1 端口监听（`ss -tlnp`） | **保留，改做法**：`Sys::tcp_listening(port)` 在进程里连 `127.0.0.1:port`（200ms）。SOCKS、HTTP 两个端口都计分 | 不去解析 `ss` 的文本输出（与 r6 §5 P2-11 同类教训）。v4 的两个 mixed 入站都是渲染时写死的（`client.rs:186-197`），哪个不在都说明出了问题；v3 把 HTTP 当可选，是因为 v3 是多引擎 |
 | 测试 2 Google 连通 + 百度直连 | **保留**，拆成「Google」「百度直连」两行，都带延迟 | v3 的测试 2 和测试 4 各打了一次 Google，重复 |
 | 测试 3 DNS（`dig`） | **改做法，并进「百度直连」这一行**（来自 d2）：百度直连失败、而且错误是域名解析失败时，这一行写 `○ 本机 DNS 解析失败`，「下一步」的判断也按它来 | TUN 下 `dig` 会被 `hijack-dns` 截走，测到的是 sing-box 自己（r6 §5 P1-6）；SOCKS 下是 socks5h 在远端解析。并进百度那一行，不多一个外部依赖，信息没丢 |
-| 测试 4 延迟（Google / YouTube / GitHub） | **全部保留**（合成时改了：d1 原稿去掉了 YouTube）。Google 计分，YouTube、GitHub 不计分，与 v3 一致（r6 §1.5） | 硬约束「功能不少于 v3.6.2」（D12）；用户对「快不快」的直觉就来自这几个数 |
+| 测试 4 延迟（Google / YouTube / GitHub） | **全部保留**（合成时改了：d1 原稿去掉了 YouTube）。Google 计分，YouTube、GitHub 不计分，与 v3 一致（r6 §1.5）。GitHub 的探测地址是 `github.com/robots.txt`，不是根路径，理由见 §6.2 | 硬约束「功能不少于 v3.6.2」（D12）；用户对「快不快」的直觉就来自这几个数 |
 | 测试 5 Cloudflare 下载测速 | **保留并修正**（合成时改了：d1 原稿删掉了它）：经同一个出口下载 1 MB，5 秒封顶；5 秒还没下完就写「5 秒没下完，按已下载的 0.6 MB 估算」，不再把截断的量当成完整速度（r2 §5-7，来自 d2）。不计分 | 用户点名比较过 v3.6.2（brief §1 第 4 条），报告里少了「测速 x MB/s」那一行，家人一眼就能看出来（j-user 判为违约）。多花的时间一般不到 2 秒，最多 5 秒 |
 | 测试 6 出口 IPv4（ippure → ip-api）+ IPv6 | **保留**（P0 的核心）；IPv4 成功时占 4 行：IP / 国家 城市 / 运营商 / 类型与风险分（来源），类型与风险分单独一行（来自 d2），窄屏折行也不会把「住宅 / 机房」和风险分截掉 | 用户点名「之前有、现在没有」；两个检测站 2026-09-13 仍然健在、字段不变（r6 §3） |
 | （v4 本来就有）服务、TUN 接口/默认路由、隧道 204 | **保留**，把 `check::probe` 的三项结果都显示出来 | 骨架已经在 `check.rs:120-147` |
@@ -1944,7 +1945,7 @@ bui-c delete <名字>... [--to <名字>] [-y] [--json]
 | ↳ | 修复 | 1–4 里有失败：`check::run_manual`（重启，记进 runtime.json，不受退避；**持锁**，§8.3）→ TUN 等就绪最多 5 秒，SOCKS 等端口最多 3 秒 → 1–4 重做一遍 | ≤ 5s + 8s | — | 现有函数 |
 | 5 | Google | `https://www.google.com/generate_204`（同 via） | 6s | **是** | `Net::probe` |
 | 6 | YouTube | `https://www.youtube.com/`（同 via，2xx/3xx 算通） | 6s | 否 | `Net::probe` |
-| 7 | GitHub | `https://github.com/`（同 via） | 6s | 否 | `Net::probe` |
+| 7 | GitHub | `https://github.com/robots.txt`（同 via）。不用根路径：每日自更新也在 github.com 上，守门测试按地址比对会把它算进来 | 6s | 否 | `Net::probe` |
 | 8 | 百度直连 | `https://www.baidu.com/`（**永远直连**）；错误是 `ProbeError::Dns` 时写「本机 DNS 解析失败」 | 5s | 否 | `Net::probe` |
 | 9 | 下载 | `https://speed.cloudflare.com/__down?bytes=1000000`（同 via），读满 1 MB 或 5 秒到点就停，按实际字节 ÷ 实际用时算 MB/s | 5s | 否 | `Net::download_via`（新，§7.5） |
 | 10 | IPv4 出口 | ippure `https://my.ippure.com/v1/info`（同 via，8s）；`ip` 或 `isResidential` 缺一个就回退 ip-api `http://ip-api.com/json/?fields=status,country,regionName,city,isp,org,as,mobile,proxy,hosting,query`（同 via，6s） | 8s + 6s | 是 | `Net::text_via` + `serde_json` |
@@ -1966,7 +1967,7 @@ bui-c delete <名字>... [--to <名字>] [-y] [--json]
 ### 6.3 总时长预算（顺序执行）
 
 - **一般情况**：每项几百毫秒，下载 1 MB 一般 1–2 秒，合计 3–8 秒（§3d-60-1 那一屏标的是 5 秒）。
-- **最坏情况**：隧道不通时走代理的项都跳过，所以最慢的是「服务在跑、隧道通、检测站全挂」：隧道 8 + 网站 6+6+6 + 百度 5 + 下载 5 + IPv4 8+6 + IPv6 5+5+6 = **66 秒**；再加上修复那一轮（5 + 8）是 79 秒。v3 同类情形要 85–100 秒（r6 §1.11）。每项都边做边打，人看得到进度，所以开头**不写**「约 N 秒」之类的承诺（d2 写「约 10 秒内」，与它自己的预算对不上，j-user 指出过）。
+- **最坏情况**：隧道不通时走代理的项都跳过，所以最慢的是「服务在跑、隧道通、检测站全挂」：隧道 8 + 网站 6+6+6 + 百度 5 + 下载 5 + IPv4 8+6 + IPv6 5+5+6 = **66 秒**；再加上修复那一轮（5 + 8）是 79 秒，**当前实现约 87 秒**——`MenuHooks::repair` 走 `check::run_manual`，它内部先自己打一次 `PROBE_URL`（8 秒封顶）才决定要不要重启，这一次探测是多余的；T12a 把 `check::run_with` 拆成 `assess` / `restart_locked` 之后，repair 直接调 `restart_locked`，这次探测消失，预算改回 79 秒。v3 同类情形要 85–100 秒（r6 §1.11）。每项都边做边打，人看得到进度，所以开头**不写**「约 N 秒」之类的承诺（d2 写「约 10 秒内」，与它自己的预算对不上，j-user 指出过）。
 - **为什么不并发**：边做边打比把总时长压到几秒更要紧；并发只在测速（§7）里用。`Net: Sync`（D22）之后，并发在技术上已经可行，留作以后的优化。
 
 ### 6.4 边做边打
@@ -1986,7 +1987,7 @@ bui-c delete <名字>... [--to <名字>] [-y] [--json]
 | TUN | `bui-tun 没接管路由；还不行就先切到 SOCKS 用。` | 有 |
 | 隧道，且百度直连通 | `本机能上网，是当前节点不通。` | 有 |
 | 隧道，百度直连也不通 | `这台机器自己也上不了网：先检查网线 / Wi-Fi。`（百度那一行是 DNS 解析失败时，改成 `本机 DNS 解析失败：先检查网络设置。`） | 有 |
-| Google（隧道通） | `隧道通但 Google 打不开：多半是节点出口受限，换个节点试试。` | 有 |
+| Google（隧道通） | `隧道通但 Google 打不开：多半是出口受限，换个节点试试。` | 有 |
 | IPv4 出口 | `出口检测站暂时连不上，网站能打开就不影响上网。` | 无，回车返回 |
 | IPv6（TUN 下泄漏） | `IPv6 没进隧道：把这一屏截图发给管理员。` | 无，回车返回 |
 

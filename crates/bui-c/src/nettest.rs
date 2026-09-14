@@ -944,7 +944,7 @@ pub fn diagnose(s: &Summary) -> Option<(&'static str, bool)> {
         Item::Tunnel if s.dns_failed => ("本机 DNS 解析失败：先检查网络设置。", true),
         Item::Tunnel => ("这台机器自己也上不了网：先检查网线 / Wi-Fi。", true),
         Item::Google => (
-            "隧道通但 Google 打不开：多半是节点出口受限，换个节点试试。",
+            "隧道通但 Google 打不开：多半是出口受限，换个节点试试。",
             true,
         ),
         Item::V4 => ("出口检测站暂时连不上，网站能打开就不影响上网。", false),
@@ -1085,8 +1085,26 @@ pub fn journal_tail<S: Sys>(sys: &S, n: u32) -> std::result::Result<Vec<String>,
     }
 }
 
+/// 窄屏把行首的 ISO 时间戳压成 `HH:MM:SS`：`2026-09-13T10:15:30+08:00` 占 25 列，
+/// 40 列下留给消息的只剩 11 列。形状判定与 [`crate::menu::compact_journal_line`] 同源；
+/// 认不出时间戳的行（`-- Boot … --`、多行消息的续行）原样保留。
+fn compact_timestamp(line: &str) -> String {
+    let Some((time, msg)) = line.split_once(' ') else {
+        return line.to_string();
+    };
+    let b = time.as_bytes();
+    let iso =
+        b.len() >= 19 && b[..4].iter().all(u8::is_ascii_digit) && b[4] == b'-' && b[10] == b'T';
+    // `get` 而不是索引：认不出形状、或切点不在字符边界上就原样留着，不 panic。
+    match (iso, time.get(11..19)) {
+        (true, Some(hms)) => format!("{hms} {msg}"),
+        _ => line.to_string(),
+    }
+}
+
 /// 日志块：空一行、标题条、每行缩进 2 列。先净化再尾截到行宽，一行日志不折成两行。
-/// 窄屏放不下单元全名时标题改叫 `bui-c`：40 列下 `── bui-c.service 最近 50 行日志 ──` 超 1 列。
+/// 窄屏放不下单元全名时标题改叫 `bui-c`：40 列下 `── bui-c.service 最近 50 行日志 ──` 超 1 列；
+/// 窄屏还把行首时间戳压成 `HH:MM:SS`（省 17 列），否则 40 列下只看得到时间戳。
 pub fn journal_block(n: u32, lines: &[String], width: usize) -> String {
     let limit = line_limit(width);
     let full = title_bar(&format!("{UNIT_MAIN} 最近 {n} 行日志"));
@@ -1098,8 +1116,13 @@ pub fn journal_block(n: u32, lines: &[String], width: usize) -> String {
     let mut out = format!("\n{title}\n");
     for l in lines {
         if !l.is_empty() {
+            let l = if width < STANDARD_WIDTH {
+                compact_timestamp(l)
+            } else {
+                l.clone()
+            };
             out.push_str("  ");
-            out.push_str(&truncate_end(&sanitize(l), limit - 2));
+            out.push_str(&truncate_end(&sanitize(&l), limit - 2));
         }
         out.push('\n');
     }
@@ -1387,13 +1410,13 @@ pub(crate) mod sample {
         prof.mode = Mode::Tun;
         let (s, n) = (FakeSys::new(), FakeNet::new());
         healthy(&s, &n, Mode::Tun);
-        n.route(
-            IPPURE_URL,
-            FakeReply::Text(
-                r#"{"ip":"203.0.113.8","asOrganization":"Example Very Long Residential Broadband Provider Incorporated[31m","country":"美利坚合众国示例联邦共和国","city":"旧金山湾区示例市某某区某某街道","fraudScore":100,"isResidential":true}"#
-                    .into(),
-            ),
+        // 出口字段故意很长，还夹着一个 ANSI 颜色序列（净化要把它换成 `?`）；
+        // ESC 写成转义，免得裸 0x1B 过编辑器与 diff 工具时丢掉
+        let esc = "\u{1b}";
+        let resi_long = format!(
+            r#"{{"ip":"203.0.113.8","asOrganization":"Example Very Long Residential Broadband Provider Incorporated{esc}[31m","country":"美利坚合众国示例联邦共和国","city":"旧金山湾区示例市某某区某某街道","fraudScore":100,"isResidential":true}}"#
         );
+        n.route(IPPURE_URL, FakeReply::Text(resi_long));
         n.delay(GOOGLE_URL, 1_234);
         n.delay(YOUTUBE_URL, 6_000);
         out.push(("check-tun-pass", shot(&prof, &s, &n, width)));
@@ -2233,7 +2256,7 @@ mod tests {
             (
                 failed(Item::Google, true, false),
                 (
-                    "隧道通但 Google 打不开：多半是节点出口受限，换个节点试试。",
+                    "隧道通但 Google 打不开：多半是出口受限，换个节点试试。",
                     true,
                 ),
             ),
@@ -2247,7 +2270,19 @@ mod tests {
             ),
         ];
         for (s, want) in cases {
-            assert_eq!(diagnose(&s), Some(want), "{:?}", s.first_failure);
+            let got = diagnose(&s).expect("有失败项就该有判断");
+            // 折行之前就得放得下：判断是固定文案，带 2 列缩进按容量口径要 ≤ line_limit(60)。
+            // 整屏宽度守门只看折行后的结果，超宽的句子靠 indented() 折成两行就能一直绿着混过去，
+            // 所以这里直接钉折行前的宽度（spec §0.2 R3 的固定文案口径）。
+            assert!(
+                budget_width(got.0) + 2 <= line_limit(60),
+                "{:?} 的判断 {} 列，超过 {} 列：{}",
+                s.first_failure,
+                budget_width(got.0) + 2,
+                line_limit(60),
+                got.0
+            );
+            assert_eq!(got, want, "{:?}", s.first_failure);
         }
         let all = Summary {
             passed: 7,
@@ -2258,13 +2293,10 @@ mod tests {
             last_summary(&failed(Item::V4, true, false)),
             "连接检查：失败 1 项（IPv4 出口）"
         );
-        // 固定文案带上 2 列缩进放不下时在中文标点处折行（Google 那句 60 列要折）
+        // 固定文案带上 2 列缩进放不下时在中文标点处折行（Google 那句 40 列要折）
         assert_eq!(
-            render_sentence(
-                "隧道通但 Google 打不开：多半是节点出口受限，换个节点试试。",
-                60
-            ),
-            "  隧道通但 Google 打不开：多半是节点出口受限，\n  换个节点试试。\n"
+            render_sentence("隧道通但 Google 打不开：多半是出口受限，换个节点试试。", 40),
+            "  隧道通但 Google 打不开：\n  多半是出口受限，换个节点试试。\n"
         );
         assert_eq!(
             render_sentence("本机能上网，是当前节点不通。", 60),
@@ -2371,6 +2403,17 @@ mod tests {
             journal_block(50, &lines, 40).lines().nth(1),
             Some("  ── bui-c 最近 50 行日志 ──"),
             "40 列放不下单元全名"
+        );
+        // 40 列下完整 ISO 时间戳占掉 26 列、消息只剩 11 列，所以压成 HH:MM:SS
+        let narrow = journal_block(50, &lines, 40);
+        let first = narrow.lines().nth(2).unwrap();
+        assert!(
+            first.starts_with("  10:15:30 ?[31mFATAL") && first.ends_with('…'),
+            "40 列把时间戳压成 HH:MM:SS：{first}"
+        );
+        assert!(
+            narrow.lines().nth(4).unwrap().starts_with("  -- Boot "),
+            "认不出时间戳的行原样保留"
         );
         assert_eq!(
             journal_block(JOURNAL_LINES, &lines, 40).lines().nth(1),

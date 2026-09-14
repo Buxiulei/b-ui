@@ -6872,9 +6872,8 @@ mod tests {
             assert!(menu::budget_width(l) <= menu::line_limit(40), "{l:?}");
         }
         assert!(
-            lines[at + 1].starts_with("  2026-09-13T10:15:30+08:00 FATAL")
-                && lines[at + 1].ends_with('…'),
-            "长行按行宽尾截：{}",
+            lines[at + 1].starts_with("  10:15:30 FATAL") && lines[at + 1].ends_with('…'),
+            "40 列压时间戳 + 长行尾截：{}",
             lines[at + 1]
         );
     }
