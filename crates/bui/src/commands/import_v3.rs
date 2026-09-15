@@ -462,70 +462,17 @@ pub fn sweep_v3_leftovers(host: &dyn Host, paths: &Paths) -> Vec<String> {
     done
 }
 
-/// v3 早期版本用 iptables/nft 的 REDIRECT 链做端口跳跃（`hy2-portjump-cleanup.sh` 负责清理，
-/// v4 把这个脚本删了，spec §3.1 也要求 v4「不再有任何 iptables/nft 规则」由 b-ui 自己写）。
-/// 只删两类**孤儿**：`iptables`/`ip6tables` 的 `nat` 表里 `HYSTERIA-PR-*` 链（移植
-/// `server/core.sh:159-178`：跳转规则先 `-D`，再 `-F` + `-X`），以及 `nft` 里
-/// `hysteria_*` 表（`server/core.sh:180-186`）。命令不存在 / 删不掉 → 只记一行说明，不算错误。
-///
-/// **注意**：hysteria 2.12 自己会为内置端口跳跃创建同名链并在 shutdown 时清理，所以
-/// ① 这一步必须排在 [`uninstall_v3`] 的**最后**（紧接着的对账会重写两个 hysteria 单元并重启，
-/// 启动时 hysteria 自建所需的链）；② 漂移扫描**不**看这些链——v4 运行中的 hysteria 正当持有它们。
-pub fn flush_v3_portjump_rules(host: &dyn Host) -> Vec<String> {
-    let mut done = Vec::new();
-    for ipt in ["iptables", "ip6tables"] {
-        if !host.which(ipt) {
-            continue;
-        }
-        let Ok(out) = host.run(ipt, &["-t", "nat", "-S"]) else {
-            continue;
-        };
-        if !out.ok() {
-            continue;
-        }
-        let chains: std::collections::BTreeSet<String> = out
-            .stdout
-            .lines()
-            .filter_map(|l| l.split_whitespace().find(|w| w.starts_with("HYSTERIA-PR-")))
-            .map(str::to_string)
-            .collect();
-        for ch in chains {
-            // 先删所有跳转到该链的规则（`-A … -j <ch>` → `-D … -j <ch>`），再清空并删链
-            for line in out
-                .stdout
-                .lines()
-                .filter(|l| l.starts_with("-A ") && l.ends_with(&format!("-j {ch}")))
-            {
-                let rule = line.replacen("-A ", "-D ", 1);
-                let mut args = vec!["-t", "nat"];
-                args.extend(rule.split_whitespace());
-                let _ = host.run(ipt, &args);
-            }
-            let _ = host.run(ipt, &["-t", "nat", "-F", &ch]);
-            let _ = host.run(ipt, &["-t", "nat", "-X", &ch]);
-            done.push(format!("已清理 {ipt} nat 链 {ch}（v3 端口跳跃遗留）"));
-        }
-    }
-    if host.which("nft") {
-        if let Ok(out) = host.run("nft", &["list", "tables"]) {
-            for (family, table) in out.stdout.lines().filter_map(|l| {
-                let mut w = l.split_whitespace();
-                let (_, f, t) = (w.next()?, w.next()?, w.next()?);
-                t.starts_with("hysteria_")
-                    .then(|| (f.to_string(), t.to_string()))
-            }) {
-                let _ = host.run("nft", &["delete", "table", &family, &table]);
-                done.push(format!("已删除 nft 表 {family} {table}（v3 端口跳跃遗留）"));
-            }
-        }
-    }
-    done
-}
-
 /// 顺序：[`migrate_external_caddy_sites`]（外部站点块 + caddy validate 闸门）→
 /// [`migrate_caddy_data`] → 停 v3 单元 → 删 v3 shell/Node 文件 → 归档 v3 状态文件 →
 /// [`sweep_v3_leftovers`]（`*.bak.*` 归档、`*.tmp` 删） → 删 v3 `admin/` → 删
-/// `/tmp/hy2-watchdog-*` → 清 cron 行 → [`flush_v3_portjump_rules`]；保留 `certs/` 与 `packages/`。
+/// `/tmp/hy2-watchdog-*` → 清 cron 行；保留 `certs/` 与 `packages/`。
+///
+/// **端口跳跃的孤儿规则不在这里清**（4.0.1 起）：v3 留下的只有直连与住宅两种形状，两个
+/// base 端口由 `bui_schema::v3::import` 从 v3 自己的 `listen:` 行原样搬进期望态，所以对账
+/// 起两个 hysteria 单元时，各自的 `ExecStartPre=- bui hy2-prestart <配置>`
+/// （[`crate::modules::portjump`]）就会按 base 端口把它们连链带表一并认领——两种后端、两族
+/// 都覆盖，而且每次启动都跑，不只在导入时跑一次。这里原先那一份按 `HYSTERIA-PR-` /
+/// `hysteria_` **前缀整表删**，会把同机别的 hysteria 实例一起清掉（v3.5.1 的老反例）。
 ///
 /// 返回 `Err` 只有一种情况：第一步的 `caddy validate` 没过。那时**什么破坏性动作都还没做**
 /// （发行版 caddy 还在跑、v3 单元一个没停），调用方按「中止 import」处理。
@@ -607,10 +554,6 @@ pub fn uninstall_v3(
     if touched_units {
         let _ = host.systemd_daemon_reload();
     }
-    // 最后一步：清掉 v3 早期版本留下的端口跳跃 NAT 孤儿链（spec §2.3、§3.1）。
-    // 必须最后做：紧接着 install 第 9 步的对账会重写两个 hysteria 单元并重启，
-    // hysteria 2.12 启动时自建它需要的链。
-    done.extend(flush_v3_portjump_rules(host));
     Ok(done)
 }
 
@@ -1008,14 +951,19 @@ blog.example.com {
         }
     }
 
+    /// 4.0.1：卸载不再碰任何 NAT 规则。端口跳跃孤儿改由两个 hysteria 单元各自的
+    /// `ExecStartPre=- bui hy2-prestart <配置>` 按 base 端口清（覆盖证明在
+    /// `modules::portjump` 的 `every_v3_leftover_shape_is_claimed_by_the_matching_instance_prestart`）。
+    /// 这里只守「卸载不越界」：机器上 iptables / nft 齐全、孤儿也在，卸载照样一条规则都不动。
     #[test]
-    fn orphan_port_hopping_nat_rules_are_flushed() {
-        // spec §2.3 + §3.1：v3 早期版本留下的 iptables/nft REDIRECT 规则没人清（v4 把
-        // hy2-portjump-cleanup.sh 删了），这里在卸载的最后一步清掉孤儿链。
+    fn uninstall_never_touches_nat_rules() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = scratch(&d);
         let h = FakeHost::new();
         h.with(|i| {
-            i.which.insert("iptables".into());
-            i.which.insert("nft".into());
+            for c in ["iptables", "ip6tables", "nft"] {
+                i.which.insert(c.into());
+            }
             i.scripted.push((
                 "iptables -t nat -S".into(),
                 CmdOut::success(concat!(
@@ -1026,28 +974,17 @@ blog.example.com {
             ));
             i.scripted.push((
                 "nft list tables".into(),
-                CmdOut::success("table inet hysteria_abc123\n"),
+                CmdOut::success("table ip hysteria_abc123\n"),
             ));
         });
-        let done = flush_v3_portjump_rules(&h);
-        let ops = h.ops();
+        uninstall_v3(&h, &paths, "example.com", 8080).unwrap();
         assert!(
-            ops.iter()
-                .any(|o| o.contains("iptables") && o.contains("-D PREROUTING")),
-            "先删跳转规则：{ops:?}"
+            h.ops()
+                .iter()
+                .all(|o| !o.contains("HYSTERIA-PR-") && !o.contains("nft")),
+            "{:?}",
+            h.ops()
         );
-        assert!(ops.iter().any(|o| o.contains("-F HYSTERIA-PR-abc123")));
-        assert!(ops.iter().any(|o| o.contains("-X HYSTERIA-PR-abc123")));
-        assert!(ops
-            .iter()
-            .any(|o| o.contains("nft delete table inet hysteria_abc123")));
-        assert!(done.iter().any(|l| l.contains("HYSTERIA-PR-abc123")));
-    }
-
-    #[test]
-    fn flushing_nat_rules_on_a_clean_machine_reports_nothing() {
-        let h = FakeHost::new(); // iptables / nft 都不存在
-        assert_eq!(flush_v3_portjump_rules(&h), Vec::<String>::new());
     }
 
     #[test]
