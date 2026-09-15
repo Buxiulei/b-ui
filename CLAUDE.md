@@ -33,7 +33,7 @@ Cargo workspace，三个 crate + 保留的前端三文件：
 
 `127.0.0.1:2080` 是常驻的本地 sing-box 中继（`b-ui-relay.service`，配置 `/opt/b-ui/singbox-relay.json`，由 `render::relay::config` 渲染）：住宅上游池非空时把 AI 域名关键字（global 模式则全部）送进 `resi-pool`，池空则全部直连（fail-open）。目标域名不在本机解析，原样交给上游。上游可以是 `socks5` 或 `http`（`model::UpstreamKind`，粘贴 `socks5://u:p@h:port`、`http://…`、`h:port:u:p`、`u:p@h:port` 四种写法都由 `parse::upstream_url` 归一）；Bright Data 用 HTTP 端口（44445），它的 SOCKS5 端口拒绝明文 HTTP 目标（2026-09-10 实测）。池状态、凭据、黑名单与选中的上游都在 `state.json` 的 `residential` 里（600），没有独立的 `residential-proxy.json`；体检与自动黑名单是守护进程里的任务，切换上游经中继的 Clash API 而不重启内核。
 
-池里每个 IP 是一个槽位（`state.residential.slots`，spec §5.6）：每槽一个中继入站 `2080+i`、一个 `hysteria-residential[-<i>]` 实例 `40000+i`，Xray 住宅入站按用户 email 路由到槽；用户经 `entitlements.residential.slot_id` 粘在一个 IP 上（多个用户可以共用一个 IP），端口换算只在 `bui_schema::slots` 一处。新建用户分到负载最少的槽，`bui residential rebalance` / `assign` 手动调整，`bui residential slots` 与面板按槽展示。
+池里每个 IP 是一个槽位（`state.residential.slots`，spec §5.6）：每槽一个中继入站 `2080+i`、一个 `hysteria-residential[-<i>]` 实例 `40000+i`，Xray 住宅入站按用户 email 路由到槽；用户经 `entitlements.residential.slot_id` 粘在一个 IP 上（多个用户可以共用一个 IP），端口换算只在 `bui_schema::slots` 一处。跳跃段 `41000-50000` 按 `slots::slot_span`（最高槽序号 + 1）等分给各槽（`slots::hop_slice`），所以**增删槽会重切全员的跳跃段，受影响的用户必须刷新订阅**，否则客户端每 30 秒换端口时会跳进别的实例、丢包、反复断联——四条改槽路径（add / remove / assign / rebalance）都会点名这些用户，**4.1 之前请避免增删上游与 rebalance**（4.1 改成 sing-box 单进程共享一段跳跃段，切片作废）。新建用户分到负载最少的槽，`bui residential rebalance` / `assign` 手动调整，`bui residential slots` 与面板按槽展示。
 
 受管单元 = `reconcile::MANAGED_UNITS` 六个固定名字（`b-ui`、`hysteria-server`、`hysteria-residential`、`xray`、`b-ui-relay`、`caddy`）+ 每个住宅槽位一个 `hysteria-residential-<i>`；枚举一律经 `reconcile::managed_units(&state)`，词法判定用 `reconcile::is_managed_unit`。v3 的九个遗留单元与定时器列在 `reconcile::LEGACY_UNITS`，对账器只负责把它们停掉、删掉。
 
