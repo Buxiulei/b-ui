@@ -367,8 +367,8 @@ function genUri(x) {
     let queryParams = "sni=" + cfg.domain + "&insecure=0";
     // 端口跳跃使用 mport 参数（v2rayN 格式）
     if (hopRange) queryParams += "&mport=" + hopRange;
-    // salamander obfs 只有直连实例有（cmd_obfs on 只改 config.yaml，hysteria-residential 没有）
-    if (!includeResi && cfg.obfs && cfg.obfs.enabled && cfg.obfs.type === "salamander" && cfg.obfs.password) {
+    // salamander obfs 覆盖直连与全部住宅 HY2 实例（与 /api/sub 的两种 HY2 节点一致）
+    if (cfg.obfs && cfg.obfs.enabled && cfg.obfs.type === "salamander" && cfg.obfs.password) {
         queryParams += "&obfs=salamander&obfs-password=" + encodeURIComponent(cfg.obfs.password);
     }
 

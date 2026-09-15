@@ -149,7 +149,8 @@ check_external_sites() {
 # 凭据只写进 0600 的临时配置文件，**绝不进 argv**（ps 会泄露）；无论成败都杀进程、删临时目录。
 # ---------------------------------------------------------------------------
 
-# state.json → 三行：用户名 / HY2 密码 / 面板域名（缺任何一样就什么都不打印 ⇒ 上层 SKIP）
+# state.json → 五行：用户名 / HY2 密码 / 面板域名 / obfs 开关（1/0）/ obfs 密码
+# （前三样缺任何一样就什么都不打印 ⇒ 上层 SKIP）。混淆覆盖直连与全部住宅实例，两条探测都要带。
 hy2_probe_creds() {
   python3 - "$1" <<'PY'
 import json, sys
@@ -158,6 +159,8 @@ try:
 except Exception:
     raise SystemExit(0)
 domain = (d.get("node") or {}).get("domain") or ""
+obfs = (d.get("node") or {}).get("obfs") or {}
+obfs_pw = obfs.get("password") or ""
 for u in d.get("users") or []:
     if u.get("disabled"):
         continue
@@ -166,6 +169,8 @@ for u in d.get("users") or []:
         print(u["username"])
         print(pw)
         print(domain)
+        print("1" if obfs.get("enabled") and obfs_pw else "0")
+        print(obfs_pw)
         break
 PY
 }
@@ -210,10 +215,10 @@ auth_log_tail() {
   tail -n 1 "$BASE/auth-hook.log" 2>/dev/null
 }
 
-# 对一个 Hysteria2 监听端口跑一次真实鉴权 + 出网
+# 对一个 Hysteria2 监听端口跑一次真实鉴权 + 出网；$6 / $7 = obfs 开关（1/0）/ obfs 密码
 hy2_auth_probe() {
-  local label=$1 port=$2 sni=$3 user=$4 upass=$5
-  local dir cfg log socks pid code line auth i
+  local label=$1 port=$2 sni=$3 user=$4 upass=$5 obfs_on=${6:-0} obfs_pw=${7:-}
+  local dir cfg log socks pid code line auth obfs_q i
   dir=$(mktemp -d) || { no "step6 $label：建不出临时目录"; return; }
   chmod 700 "$dir"
   cfg="$dir/client.yaml"
@@ -228,6 +233,8 @@ hy2_auth_probe() {
   auth="$user:$upass"
   auth=${auth//\\/\\\\}
   auth=${auth//\"/\\\"}
+  obfs_q=${obfs_pw//\\/\\\\}
+  obfs_q=${obfs_q//\"/\\\"}
   (
     umask 077
     cat > "$cfg" <<EOF
@@ -239,6 +246,9 @@ tls:
 socks5:
   listen: 127.0.0.1:$socks
 EOF
+    if [ "$obfs_on" = "1" ]; then
+      printf 'obfs:\n  type: salamander\n  salamander:\n    password: "%s"\n' "$obfs_q" >>"$cfg"
+    fi
   )
   pid=$(start_hy2_client "$cfg" "$log" "$socks")
   code=$(probe_socks_code "$socks")
@@ -266,7 +276,7 @@ EOF
 }
 
 check_hy2_auth() {
-  local creds user upass sni direct resi
+  local creds user upass sni obfs_on obfs_pw direct resi
   if [ ! -x "$BASE/bin/hysteria" ]; then
     skip "step6 Hysteria2 端到端鉴权（$BASE/bin/hysteria 不可执行）"
     return 0
@@ -279,6 +289,8 @@ check_hy2_auth() {
   user=$(printf '%s\n' "$creds" | sed -n 1p)
   upass=$(printf '%s\n' "$creds" | sed -n 2p)
   sni=$(printf '%s\n' "$creds" | sed -n 3p)
+  obfs_on=$(printf '%s\n' "$creds" | sed -n 4p)
+  obfs_pw=$(printf '%s\n' "$creds" | sed -n 5p)
   if [ -z "$user" ] || [ -z "$upass" ] || [ -z "$sni" ]; then
     skip "step6 Hysteria2 端到端鉴权（state.json 里没有可用的未禁用用户）"
     return 0
@@ -289,8 +301,8 @@ check_hy2_auth() {
     no "step6 取不到 Hysteria2 监听端口" "config.yaml / config-residential.yaml 里没有 listen 行"
     return 0
   fi
-  [ -n "$direct" ] && hy2_auth_probe "直连 :$direct" "$direct" "$sni" "$user" "$upass"
-  [ -n "$resi" ] && hy2_auth_probe "住宅 :$resi" "$resi" "$sni" "$user" "$upass"
+  [ -n "$direct" ] && hy2_auth_probe "直连 :$direct" "$direct" "$sni" "$user" "$upass" "$obfs_on" "$obfs_pw"
+  [ -n "$resi" ] && hy2_auth_probe "住宅 :$resi" "$resi" "$sni" "$user" "$upass" "$obfs_on" "$obfs_pw"
   return 0
 }
 
@@ -676,7 +688,8 @@ self_test_hy2_auth() {
   out=$(hy2_probe_creds "$d/state.json")
   if [ "$out" = "alice
 pw:with:colons
-panel.example.com" ]; then
+panel.example.com
+0" ]; then
     ok "自测：跳过禁用用户，取第一个可用用户的凭据与域名"
   else
     no "自测：凭据解析不对" "$out"
@@ -689,21 +702,47 @@ panel.example.com" ]; then
       "$(listen_port "$d/config.yaml") / $(listen_port "$d/config-residential.yaml")"
   fi
 
-  # ① 通过：两条通路各一条 PASS
+  # ① 通过：两条通路各一条 PASS（没开混淆 ⇒ 探测配置里没有 obfs 段）
   # shellcheck disable=SC2317  # 在 $( ) 子 shell 里覆盖真客户端与真 curl，下面那次调用会用到
   out=$(
     BASE=$d
     start_hy2_client() {
+      cat "$1" >>"$d/seen.yaml"
       sleep 5 &
       echo $!
     }
     probe_socks_code() { echo 200; }
     check_hy2_auth
   )
-  if [ "$(printf '%s\n' "$out" | grep -c '^PASS')" = "2" ] && [[ "$out" == *allow* ]]; then
+  if [ "$(printf '%s\n' "$out" | grep -c '^PASS')" = "2" ] && [[ "$out" == *allow* ]] &&
+    ! grep -q obfs "$d/seen.yaml"; then
     ok "自测：两条通路都鉴权通过 → 两条 PASS"
   else
     no "自测：鉴权通了却没判通过" "$out"
+  fi
+
+  # ①b 开了混淆：直连与住宅两条探测的客户端配置都带同一段 salamander（混淆覆盖全部 HY2 实例）
+  rm -f "$d/seen.yaml"
+  printf '%s\n' '{"node":{"domain":"panel.example.com","obfs":{"enabled":true,"password":"obfs-pw"}},' \
+    ' "users":[{"username":"alice","disabled":false,"credentials":{"hy2_password":"pw:with:colons"}}]}' \
+    > "$d/state.json"
+  # shellcheck disable=SC2317
+  out=$(
+    BASE=$d
+    start_hy2_client() {
+      cat "$1" >>"$d/seen.yaml"
+      sleep 5 &
+      echo $!
+    }
+    probe_socks_code() { echo 200; }
+    check_hy2_auth
+  )
+  if [ "$(printf '%s\n' "$out" | grep -c '^PASS')" = "2" ] &&
+    [ "$(grep -c '^  type: salamander$' "$d/seen.yaml")" = "2" ] &&
+    [ "$(grep -c '^    password: "obfs-pw"$' "$d/seen.yaml")" = "2" ]; then
+    ok "自测：开了混淆 → 直连与住宅两条探测都带 obfs"
+  else
+    no "自测：开了混淆，探测配置没带齐 obfs" "$out"
   fi
 
   # ② 失败：出不了网（事故当天的形态——钩子没被调用，客户端 404）

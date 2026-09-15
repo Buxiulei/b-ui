@@ -184,6 +184,10 @@
                 "41000:50000"
             ],
             "hop_interval": "30s",
+            "obfs": {
+                "type": "salamander",
+                "password": "obfs-pw-test"
+            },
             "password": "alice:pw-alice-01",
             "tls": {
                 "enabled": true,

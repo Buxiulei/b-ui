@@ -178,6 +178,63 @@ fn clash_declares_ipv6_takeover() {
     }
 }
 
+/// 混淆开启时三种订阅里**住宅** HY2 也带 obfs 参数（2026-09-15 裁决：混淆覆盖全部 HY2 实例），
+/// 形状与直连逐项相同；关闭时三种订阅里一个 obfs 字都没有。
+#[test]
+fn obfs_reaches_residential_hy2_in_all_three_subscriptions() {
+    let s = common::state("obfs");
+    let split = split_of(&s);
+    let nodes = nodes_of(&s, "alice");
+
+    let uris = b64(&subscription::uri_list(&nodes, "alice"));
+    let resi_line = uris
+        .lines()
+        .find(|l| l.ends_with("#alice-HY2%E4%BD%8F%E5%AE%85"))
+        .expect("alice 的 HY2 住宅 URI");
+    assert!(
+        resi_line.contains("&mport=41000-50000&obfs=salamander&obfs-password=obfs-pw-test#"),
+        "{resi_line}"
+    );
+
+    let sb = subscription::singbox(&nodes, &split, &s.node.public_ip);
+    let out = |tag: &str| {
+        sb["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["tag"] == tag)
+            .unwrap()
+            .clone()
+    };
+    let want = serde_json::json!({"type": "salamander", "password": "obfs-pw-test"});
+    assert_eq!(out("hy2-residential")["obfs"], want);
+    assert_eq!(out("hy2-direct")["obfs"], want);
+    common::check_singbox_all(&sb);
+
+    let clash: serde_yaml::Value =
+        serde_yaml::from_str(&subscription::clash(&nodes, "alice", &split)).unwrap();
+    let resi = clash["proxies"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "alice-HY2住宅")
+        .unwrap();
+    assert_eq!(resi["obfs"], serde_yaml::Value::from("salamander"));
+    assert_eq!(
+        resi["obfs-password"],
+        serde_yaml::Value::from("obfs-pw-test")
+    );
+
+    let off = common::state("global");
+    let nodes = nodes_of(&off, "alice");
+    let split = split_of(&off);
+    assert!(!b64(&subscription::uri_list(&nodes, "alice")).contains("obfs"));
+    assert!(!subscription::singbox(&nodes, &split, &off.node.public_ip)
+        .to_string()
+        .contains("obfs"));
+    assert!(!subscription::clash(&nodes, "alice", &split).contains("obfs"));
+}
+
 /// golden 里每一行 URI 都能被 `parse::node_uri` 解回同一个节点（label 带 `{user}-` 前缀）。
 #[test]
 fn uri_list_round_trips_through_node_uri_parser() {

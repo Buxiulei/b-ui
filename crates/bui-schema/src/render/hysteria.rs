@@ -72,7 +72,8 @@ pub fn residential_slot_yaml(
             Value::Sequence(vec![str_val("relay(all)")]),
         )]),
     );
-    // 住宅实例不带 obfs：v3 的订阅只给直连节点 obfs 参数，两边必须一致。
+    // 混淆覆盖全部 HY2 实例（2026-09-15 裁决）：订阅给住宅 HY2 节点同样带 obfs 参数，两边必须一致。
+    push_obfs(&mut doc, node);
     to_yaml(doc)
 }
 
@@ -281,11 +282,43 @@ mod tests {
         assert!(texts[1].contains("127.0.0.1:9997"), "trafficStats 按槽递减");
         assert!(texts[2].contains("127.0.0.1:2082"));
         assert!(texts[2].contains("127.0.0.1:9996"));
-        // 住宅实例一律不带 obfs（v3 语义：订阅只给直连节点 obfs 参数）
+        // node() 的 obfs 是关闭的：住宅实例不输出 obfs 段
         for t in &texts {
             assert!(!t.contains("salamander"));
             assert!(t.contains("relay(all)"));
             assert!(t.contains("/opt/b-ui/bin/bui-auth-hook"));
+        }
+    }
+
+    /// 混淆覆盖全部 HY2 实例（2026-09-15 裁决）：开启时直连与每个住宅槽都带同一段 salamander，
+    /// 关闭时一律不带 —— 订阅给直连与住宅 HY2 节点都带 obfs 参数，服务端必须一致。
+    #[test]
+    fn obfs_follows_the_switch_on_direct_and_every_residential_slot() {
+        let (mut n, p) = (node(), Paths::default_server());
+        let render_all = |n: &NodeParams| -> Vec<String> {
+            let mut v = vec![direct_yaml(n, &p, Hy2Auth::Http)];
+            v.extend((0..3).map(|i| {
+                residential_slot_yaml(n, &p, &slots::resources(&n.ports, i, 3), Hy2Auth::Http)
+            }));
+            v
+        };
+        n.obfs = crate::model::Obfs {
+            enabled: true,
+            password: "obfs-pw".into(),
+        };
+        for t in render_all(&n) {
+            let y: Value = serde_yaml::from_str(&t).unwrap();
+            assert_eq!(y["obfs"]["type"].as_str(), Some("salamander"), "{t}");
+            assert_eq!(
+                y["obfs"]["salamander"]["password"].as_str(),
+                Some("obfs-pw"),
+                "{t}"
+            );
+        }
+        n.obfs.enabled = false;
+        for t in render_all(&n) {
+            let y: Value = serde_yaml::from_str(&t).unwrap();
+            assert!(y.get("obfs").is_none(), "{t}");
         }
     }
 

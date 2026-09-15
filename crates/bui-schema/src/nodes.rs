@@ -60,7 +60,7 @@ impl Node {
 /// Reality直连、Reality住宅、HY2直连、HY2住宅。
 ///
 /// 住宅节点只在用户有住宅权益、且权益指向的分组真实存在时才给出；
-/// obfs 按 v3 语义只加在 HY2 直连节点上。
+/// obfs 加在直连与住宅两种 HY2 节点上（混淆覆盖全部 HY2 实例，2026-09-15 裁决）。
 pub fn nodes_for(user: &User, node: &NodeParams, resi: &Residential) -> Vec<Node> {
     let e = &user.entitlements;
     let has = |p: Protocol| e.protocols.contains(&p);
@@ -131,7 +131,7 @@ pub fn nodes_for(user: &User, node: &NodeParams, resi: &Residential) -> Vec<Node
                 node.ports.hy2_hop,
                 NodeKind::Hy2Direct,
                 "HY2直连",
-                obfs,
+                obfs.clone(),
             ));
         }
         if resi_ok {
@@ -143,7 +143,7 @@ pub fn nodes_for(user: &User, node: &NodeParams, resi: &Residential) -> Vec<Node
                 Some(res.hop),
                 NodeKind::Hy2Residential,
                 "HY2住宅",
-                None,
+                obfs,
             ));
         }
     }
@@ -214,9 +214,11 @@ mod tests {
             }
             _ => panic!(),
         }
-        // v3: 住宅 HY2 不带 obfs
+        // 混淆覆盖全部 HY2 实例：住宅 HY2 与直连带同一个 obfs 密码
         match &ns[3].transport {
-            Transport::Hysteria2 { obfs_password, .. } => assert_eq!(obfs_password, &None),
+            Transport::Hysteria2 { obfs_password, .. } => {
+                assert_eq!(obfs_password.as_deref(), Some("obfs-pw"))
+            }
             _ => panic!(),
         }
         match &ns[0].transport {

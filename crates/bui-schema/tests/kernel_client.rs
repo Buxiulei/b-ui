@@ -95,13 +95,28 @@ fn tun_outbound_follows_node_transport() {
     assert_eq!(o["tls"]["insecure"], false);
     common::check_singbox(&cfg);
 
-    // HY2 住宅：v3 语义不带 obfs
-    let cfg = client::tun_config(&nodes[3], &copts(ClientMode::Tun, false, split));
-    assert!(cfg["outbounds"][0].get("obfs").is_none());
+    // HY2 住宅：混淆覆盖全部 HY2 实例（2026-09-15 裁决），与直连带同一段 salamander
+    let cfg = client::tun_config(&nodes[3], &copts(ClientMode::Tun, false, split.clone()));
+    assert_eq!(cfg["outbounds"][0]["obfs"]["type"], "salamander");
+    assert_eq!(cfg["outbounds"][0]["obfs"]["password"], "obfs-pw-test");
     assert_eq!(
         cfg["outbounds"][0]["server_ports"],
         serde_json::json!(["41000:50000"])
     );
+    common::check_singbox(&cfg);
+
+    // mixed 模式同一个出站
+    let cfg = client::mixed_config(&nodes[3], &copts(ClientMode::Mixed, false, split));
+    let o = cfg["outbounds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["type"] == "hysteria2")
+        .expect("mixed 配置里的 HY2 出站")
+        .clone();
+    assert_eq!(o["server_port"], 40000);
+    assert_eq!(o["obfs"]["type"], "salamander");
+    assert_eq!(o["obfs"]["password"], "obfs-pw-test");
     common::check_singbox(&cfg);
 }
 

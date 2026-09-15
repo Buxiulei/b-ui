@@ -42,3 +42,7 @@ outbounds:
 acl:
   inline:
   - relay(all)
+obfs:
+  type: salamander
+  salamander:
+    password: obfs-pw-test

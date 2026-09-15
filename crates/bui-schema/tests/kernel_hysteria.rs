@@ -89,6 +89,13 @@ fn hysteria_direct_without_obfs_or_hop() {
     .unwrap();
     assert_eq!(y["listen"].as_str().unwrap(), ":10000");
     assert!(y.get("obfs").is_none());
+    let y: serde_yaml::Value = serde_yaml::from_str(&hysteria::residential_yaml(
+        &s.node,
+        &Paths::default_server(),
+        Hy2Auth::Http,
+    ))
+    .unwrap();
+    assert!(y.get("obfs").is_none(), "混淆关闭时住宅实例也不带 obfs");
 }
 
 #[test]
@@ -111,7 +118,12 @@ fn hysteria_residential_shape() {
         "127.0.0.1:2080"
     );
     assert_eq!(y["acl"]["inline"][0].as_str().unwrap(), "relay(all)");
-    assert!(y.get("obfs").is_none(), "v3 住宅实例不带 obfs，与订阅一致");
+    // 混淆覆盖全部 HY2 实例（2026-09-15 裁决），与订阅里住宅 HY2 节点的 obfs 参数一致
+    assert_eq!(y["obfs"]["type"].as_str().unwrap(), "salamander");
+    assert_eq!(
+        y["obfs"]["salamander"]["password"].as_str().unwrap(),
+        "obfs-pw-test"
+    );
 }
 
 /// 事故回归（2026-09-12 bwg-rick，约 1 小时全员鉴权失败）：Hysteria2 的 `auth.command`
@@ -216,30 +228,255 @@ fn both_auth_modes_load_in_the_real_hysteria_kernel() {
         certs_dir: dir.path().to_path_buf(),
         bin_dir: dir.path().join("bin"),
     };
+    let slot0 = bui_schema::slots::resources(&s.node.ports, 0, 1);
     for (mode, auth) in [("http", Hy2Auth::Http), ("command", Hy2Auth::Command)] {
-        let cfg = dir.path().join(format!("{mode}.yaml"));
-        std::fs::write(&cfg, hysteria::direct_yaml(&s.node, &paths, auth)).unwrap();
-        let log = std::fs::File::create(dir.path().join(format!("{mode}.log"))).unwrap();
-        let mut child = std::process::Command::new("hysteria")
+        for (which, text) in [
+            ("direct", hysteria::direct_yaml(&s.node, &paths, auth)),
+            // 住宅实例同样带 obfs（2026-09-15 裁决）；跳跃区间同样要 root，换成单端口
+            (
+                "residential",
+                with_listen(
+                    &hysteria::residential_slot_yaml(&s.node, &paths, &slot0, auth),
+                    &format!(":{}", free_udp_port()),
+                ),
+            ),
+        ] {
+            let mode = format!("{mode}-{which}");
+            assert!(text.contains("salamander"), "{mode} 应带 obfs：{text}");
+            let cfg = dir.path().join(format!("{mode}.yaml"));
+            std::fs::write(&cfg, text).unwrap();
+            let log = std::fs::File::create(dir.path().join(format!("{mode}.log"))).unwrap();
+            let mut child = std::process::Command::new("hysteria")
+                .args(["server", "--disable-update-check", "-c"])
+                .arg(&cfg)
+                .stdout(log.try_clone().unwrap())
+                .stderr(log)
+                .spawn()
+                .unwrap();
+            // 加载失败是**立刻**退出；成功就一直跑，等 2 秒足够分辨这两种
+            for _ in 0..40 {
+                if child.try_wait().unwrap().is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            let out = std::fs::read_to_string(dir.path().join(format!("{mode}.log"))).unwrap();
+            assert!(
+                !out.contains("invalid config"),
+                "{mode} 模式的配置内核不认：{out}"
+            );
+        }
+    }
+}
+
+/// 把渲染出的 hysteria 配置里的一个顶层键换掉（真起内核时去掉要 root 或会撞端口的部分）。
+fn with_key(yaml: &str, key: &str, value: serde_yaml::Value) -> String {
+    let mut doc: serde_yaml::Mapping = serde_yaml::from_str(yaml).unwrap();
+    doc.insert(serde_yaml::Value::from(key), value);
+    serde_yaml::to_string(&doc).unwrap()
+}
+
+fn with_listen(yaml: &str, listen: &str) -> String {
+    with_key(yaml, "listen", serde_yaml::Value::from(listen))
+}
+
+/// 随便要一个空闲 TCP 端口（客户端的 socks5 入站、服务端的 trafficStats）。
+fn free_tcp_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// 在 `deadline` 之内等 `path` 里出现 `needle`；子进程提前退出也算等完。
+fn wait_for_log(
+    path: &std::path::Path,
+    needle: &str,
+    child: &mut std::process::Child,
+    deadline: std::time::Duration,
+) -> bool {
+    let start = std::time::Instant::now();
+    while start.elapsed() < deadline {
+        if std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .contains(needle)
+        {
+            return true;
+        }
+        if child.try_wait().unwrap().is_some() {
+            return std::fs::read_to_string(path)
+                .unwrap_or_default()
+                .contains(needle);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    false
+}
+
+/// 端到端（本机回环，不出网）：obfs 开启时渲染出的直连与住宅服务端配置，真起 `hysteria server`，
+/// 同密码的 `hysteria client` 必须鉴权通过；**不带 obfs** 的客户端必须连不上，且在限时内以
+/// 「failed to initialize client」退出（终态断言，不靠超时挂起判失败）。
+///
+/// 只换掉起内核必须换的几项：`listen`（跳跃区间要 root）、`trafficStats.listen`（别的用例
+/// 并行时会撞 9999/9998）、`auth`（渲染出的 http 模式指向守护进程的 18789，测试里没有它，
+/// 换成同形状的 `userpass`）。obfs / tls / 出站等其余字段原样用渲染结果。
+#[test]
+fn obfs_server_admits_a_matching_client_and_refuses_one_without_obfs() {
+    if !common::have("hysteria") {
+        eprintln!("skipped: hysteria not found");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    if self_signed(dir.path()).is_none() {
+        eprintln!("skipped: openssl not usable");
+        return;
+    }
+    let s = common::state("obfs");
+    let paths = Paths {
+        base_dir: dir.path().to_path_buf(),
+        certs_dir: dir.path().to_path_buf(),
+        bin_dir: dir.path().join("bin"),
+    };
+    let slot0 = bui_schema::slots::resources(&s.node.ports, 0, 1);
+    let obfs_pw = s.node.obfs.password.clone();
+    for (which, rendered) in [
+        (
+            "direct",
+            hysteria::direct_yaml(&s.node, &paths, Hy2Auth::Http),
+        ),
+        (
+            "residential",
+            hysteria::residential_slot_yaml(&s.node, &paths, &slot0, Hy2Auth::Http),
+        ),
+    ] {
+        let port = free_udp_port();
+        let mut text = with_listen(&rendered, &format!("127.0.0.1:{port}"));
+        text = with_key(
+            &text,
+            "trafficStats",
+            serde_yaml::from_str(&format!("listen: 127.0.0.1:{}", free_tcp_port())).unwrap(),
+        );
+        text = with_key(
+            &text,
+            "auth",
+            serde_yaml::from_str("type: userpass\nuserpass:\n  alice: pw-e2e").unwrap(),
+        );
+        let y: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+        assert_eq!(y["obfs"]["type"].as_str(), Some("salamander"), "{which}");
+
+        let server_cfg = dir.path().join(format!("server-{which}.yaml"));
+        let server_log = dir.path().join(format!("server-{which}.log"));
+        std::fs::write(&server_cfg, text).unwrap();
+        let log = std::fs::File::create(&server_log).unwrap();
+        let mut server = std::process::Command::new("hysteria")
             .args(["server", "--disable-update-check", "-c"])
-            .arg(&cfg)
+            .arg(&server_cfg)
             .stdout(log.try_clone().unwrap())
             .stderr(log)
             .spawn()
             .unwrap();
-        // 加载失败是**立刻**退出；成功就一直跑，等 2 秒足够分辨这两种
-        for _ in 0..40 {
-            if child.try_wait().unwrap().is_some() {
+        let up = wait_for_log(
+            &server_log,
+            "server up and running",
+            &mut server,
+            std::time::Duration::from_secs(5),
+        );
+        let client = |name: &str, obfs: Option<&str>| -> (std::path::PathBuf, std::path::PathBuf) {
+            let mut c = format!(
+                "server: 127.0.0.1:{port}\nauth: alice:pw-e2e\ntls:\n  sni: test.invalid\n  insecure: true\nsocks5:\n  listen: 127.0.0.1:{}\n",
+                free_tcp_port()
+            );
+            if let Some(pw) = obfs {
+                c.push_str(&format!(
+                    "obfs:\n  type: salamander\n  salamander:\n    password: {pw}\n"
+                ));
+            }
+            let cfg = dir.path().join(format!("client-{which}-{name}.yaml"));
+            std::fs::write(&cfg, c).unwrap();
+            (cfg, dir.path().join(format!("client-{which}-{name}.log")))
+        };
+        let spawn = |cfg: &std::path::Path, log: &std::path::Path| {
+            let f = std::fs::File::create(log).unwrap();
+            std::process::Command::new("hysteria")
+                .args(["client", "--disable-update-check", "-c"])
+                .arg(cfg)
+                .stdout(f.try_clone().unwrap())
+                .stderr(f)
+                .spawn()
+                .unwrap()
+        };
+
+        // ① 不带 obfs：握手包服务端不认，客户端在 quic 握手超时（约 5 秒）后自己退出
+        let (cfg, bad_log) = client("plain", None);
+        let mut bad = spawn(&cfg, &bad_log);
+        let start = std::time::Instant::now();
+        let mut exited = None;
+        while start.elapsed() < std::time::Duration::from_secs(20) {
+            if let Some(st) = bad.try_wait().unwrap() {
+                exited = Some(st);
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        let _ = child.kill();
-        let _ = child.wait();
-        let out = std::fs::read_to_string(dir.path().join(format!("{mode}.log"))).unwrap();
+        if exited.is_none() {
+            let _ = bad.kill();
+        }
+        let _ = bad.wait();
+        let bad_out = std::fs::read_to_string(&bad_log).unwrap_or_default();
+        let server_after_bad = std::fs::read_to_string(&server_log).unwrap_or_default();
+
+        // ② 同密码 obfs：鉴权通过（客户端「connected to server」+ 服务端记下 alice）
+        let (cfg, good_log) = client("obfs", Some(&obfs_pw));
+        let mut good = spawn(&cfg, &good_log);
+        let connected = wait_for_log(
+            &good_log,
+            "connected to server",
+            &mut good,
+            std::time::Duration::from_secs(10),
+        );
+        let admitted = wait_for_log(
+            &server_log,
+            "client connected",
+            &mut server,
+            std::time::Duration::from_secs(3),
+        );
+        for mut c in [good, server] {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        let good_out = std::fs::read_to_string(&good_log).unwrap_or_default();
+        let server_out = std::fs::read_to_string(&server_log).unwrap_or_default();
+
+        assert!(up, "{which}：服务端没起来：{server_out}");
+        let st = exited.unwrap_or_else(|| {
+            panic!("{which}：不带 obfs 的客户端 20 秒内没有退出（挂起）：{bad_out}")
+        });
         assert!(
-            !out.contains("invalid config"),
-            "{mode} 模式的配置内核不认：{out}"
+            !st.success(),
+            "{which}：不带 obfs 的客户端不该正常退出：{bad_out}"
+        );
+        assert!(
+            bad_out.contains("failed to initialize client"),
+            "{which}：不带 obfs 的客户端应以连不上退出：{bad_out}"
+        );
+        assert!(
+            !bad_out.contains("connected to server"),
+            "{which}：不带 obfs 竟然连上了：{bad_out}"
+        );
+        assert!(
+            !server_after_bad.contains("client connected"),
+            "{which}：服务端放进了不带 obfs 的客户端：{server_after_bad}"
+        );
+        assert!(
+            connected,
+            "{which}：同密码 obfs 客户端没连上：{good_out}\n{server_out}"
+        );
+        assert!(
+            admitted && server_out.contains("\"id\": \"alice\""),
+            "{which}：服务端没记下 alice 的会话：{server_out}"
         );
     }
 }
