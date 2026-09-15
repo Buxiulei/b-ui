@@ -616,6 +616,59 @@ mod tests {
         );
     }
 
+    /// 自愈分支与 `bui hy2-prestart` 是同一个 [`crate::modules::portjump::cleanup`]：
+    /// nft 后端的机器（tizi）上，崩溃循环的自愈同样要把本实例的 `hysteria_*` 表删掉，
+    /// 而不是只清 iptables 链。
+    #[tokio::test]
+    async fn the_heal_branch_drops_this_instances_nft_table_too() {
+        let host = crash_looping_host();
+        host.with(|i| {
+            i.which.insert("nft".into());
+            i.scripted.push((
+                "nft list tables".into(),
+                crate::sys::CmdOut::success(
+                    "table ip6 hysteria_390d4d8b\ntable ip hysteria_7c1e0f2a\n",
+                ),
+            ));
+            i.scripted.push((
+                "nft list table ip6 hysteria_390d4d8b".into(),
+                crate::sys::CmdOut::success(
+                    "table ip6 hysteria_390d4d8b {\n\tchain output {\n\t\tudp dport 41000-50000 \
+                     redirect to :40000\n\t}\n}\n",
+                ),
+            ));
+            i.scripted.push((
+                "nft list table ip hysteria_7c1e0f2a".into(),
+                crate::sys::CmdOut::success(
+                    "table ip hysteria_7c1e0f2a {\n\tchain output {\n\t\tudp dport 45500-50000 \
+                     redirect to :40001\n\t}\n}\n",
+                ),
+            ));
+        });
+        let (c, _d) = ctx(host.clone()).await;
+        check_once(&c).await.unwrap();
+        let ops = acting_ops(&host);
+        assert!(
+            ops.iter()
+                .any(|o| o == "run:nft delete table ip6 hysteria_390d4d8b"),
+            "{ops:?}"
+        );
+        assert!(
+            !ops.iter()
+                .any(|o| o.contains("delete table ip hysteria_7c1e0f2a")),
+            "别的槽（base 40001）的表不许碰：{ops:?}"
+        );
+        let heals: std::collections::BTreeMap<String, ChainHeal> =
+            serde_json::from_value(c.runtime.read().await.extra[HEAL_KEY].clone()).unwrap();
+        assert_eq!(
+            heals["hysteria-residential"].done,
+            vec![
+                "已清理 ip6tables nat 链 HYSTERIA-PR-c66a02d9（本实例端口跳跃孤儿）",
+                "已删除 nft 表 ip6 hysteria_390d4d8b（本实例端口跳跃孤儿）",
+            ]
+        );
+    }
+
     /// 冷却窗口内不再治第二次（清完链还起不来说明另有原因，每 60 秒 restart 一次就是
     /// 自己造崩溃循环）；过了窗口再治，计数累加。
     #[tokio::test]

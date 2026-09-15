@@ -1008,17 +1008,20 @@ async fn post_pin_slot(
 /// `POST /api/residential/rebalance`（spec §5.6 规则 3）：把住宅用户在各槽间均匀重排。
 async fn post_rebalance(State(app): State<AppState>, Extension(d): Extension<Deps>) -> ApiResult {
     let ctx = ctx_of(&app, &d.paths);
-    let moved = crate::modules::residential::slots::rebalance_users(&ctx)
+    let (moved, impact) = crate::modules::residential::slots::rebalance_users(&ctx)
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     // `xray_rules_pending` 提醒前端：槽路由要等下一轮对账（≈1 秒）走 gRPC 收口才生效（D7），
     // 那一下不重启 xray、不掐连接
-    Ok(Json(serde_json::json!({
+    let mut body = serde_json::json!({
         "success": true,
         "moved": moved,
         "xray_rules_pending": moved > 0
-    }))
-    .into_response())
+    });
+    if let Some(pc) = upstream::impact_field(&impact) {
+        body["port_changed"] = pc;
+    }
+    Ok(Json(body).into_response())
 }
 
 /// `POST /api/residential/assign`（spec §5.6 规则 3）：把某个用户钉到某一槽。
@@ -1048,10 +1051,10 @@ async fn post_assign(
     };
     drop(s);
     let ctx = ctx_of(&app, &d.paths);
-    if !crate::modules::residential::slots::assign_user(&ctx, user_id, slot_id)
+    let (ok, impact) = crate::modules::residential::slots::assign_user(&ctx, user_id, slot_id)
         .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    {
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !ok {
         return Err(err(
             StatusCode::BAD_REQUEST,
             "该用户没有住宅权益，无法分配槽位",
@@ -1060,7 +1063,11 @@ async fn post_assign(
     // **不在这里调 converge_xray**：守护进程里只许对账 consumer 那一处调它（D7）。
     // `assign_user` 已经发了 `StateChanged("residential")`，约 1 秒后对账末尾那次调用
     // 会走 gRPC 把这个用户的规则改掉，xray 不重启。
-    Ok(Json(serde_json::json!({ "success": true, "xray_rules_pending": true })).into_response())
+    let mut body = serde_json::json!({ "success": true, "xray_rules_pending": true });
+    if let Some(pc) = upstream::impact_field(&impact) {
+        body["port_changed"] = pc;
+    }
+    Ok(Json(body).into_response())
 }
 
 async fn post_add(
@@ -1090,7 +1097,7 @@ async fn post_add(
         });
     }
     // 响应字段照 v3 的 add：success / exitIp / ispInfo / type
-    Ok(Json(serde_json::json!({
+    let mut body = serde_json::json!({
         "success": true,
         "exitIp": out.exit_ip,
         "ispInfo": out.isp,
@@ -1098,21 +1105,27 @@ async fn post_add(
         "id": out.id,
         "name": out.name,
         "class": out.class_label,
-    }))
-    .into_response())
+    });
+    if let Some(pc) = upstream::impact_field(&out.impact) {
+        body["port_changed"] = pc;
+    }
+    Ok(Json(body).into_response())
 }
 
 /// 删上游两个端点共用的回包：v3 的 `success` + v4 追加的 `port_changed`（spec §5.6）。
 ///
-/// `port_changed` 是必须重新获取订阅的用户，按后果分三组（`slot_removed` /
+/// `port_changed` 是必须重新拉订阅的用户，按**原因**分三组（`slot_removed` /
 /// `slot_moved` / `hop_resliced`，见 [`bui_schema::slots::ResubscribeImpact`]），每组
 /// 是一列升序的**用户名**，不含凭据、不含订阅 token。三组都空 ⇒ 无人受影响。
 ///
-/// 他们的 HY2 住宅节点端口（`hy2_resi + 槽序号`）或端口跳跃区间（`hy2_resi_hop` 按槽位
+/// **这两个端点无条件带这个键**（v3 起就有，`web/app.js` 按它渲染）；另外三条改槽路径
+/// （add / assign / rebalance）用同名字段，但空名单时不带（`upstream::impact_field`）。
+///
+/// 他们的 HY2 住宅节点端口（`hy2_resi + 槽序号`）或端口跳跃段（`hy2_resi_hop` 按槽位
 /// 空间等分）被这次删除改了，而那两样都写死在已下发的订阅里、客户端不会主动发现（要等下
-/// 一次订阅更新）。只列手里那份订阅**真的**不能用了的人：被删槽上的用户常常被重新分配回
-/// 序号 0（端口没变），旧跳跃区间仍整段落在本槽新区间内的也不算（区间被切成前缀时每个
-/// 端口照旧打到本槽实例）。
+/// 一次订阅更新），在那之前**反复断联**。只列手里那份订阅**真的**不能用了的人：被删槽上
+/// 的用户常常被重新分配回序号 0（端口没变），旧跳跃段仍整段落在本槽新段内的也不算（段被
+/// 切成前缀时每个端口照旧打到本槽实例）。
 ///
 /// 同一份名单也落一条 `runtime.json` 的 `incidents`（签名 `resi_slot_port_changed`），
 /// 面板事件卡与 `bui incidents` 都看得到；三处的组名与后果文案同出一处
@@ -2103,8 +2116,8 @@ mod tests {
         // CLI 打印的就是这份回包
         assert_eq!(
             crate::modules::residential::cli::format_remove(&v),
-            "上游已移除。1 个用户手里那份订阅已不能照旧用，需要重新获取订阅：\n  \
-             槽位序号被搬到 0 号（1 人，端口下移，旧端口无人监听，连不上）：bob"
+            "上游已移除。1 个用户的 HY2 住宅节点会反复断联，需重新拉订阅：\n  \
+             槽位序号变了（1 人，端口与跳跃段一起变）：bob"
         );
         // 事件落盘一条：bui incidents 与面板事件卡都看得到，口径与 CLI 同出一处
         let incs = crate::modules::sentinel::incidents::from_runtime(&h.ctx.runtime.read().await);
@@ -2112,8 +2125,8 @@ mod tests {
         assert_eq!(incs[0].signature, "resi_slot_port_changed");
         assert_eq!(
             incs[0].result,
-            "1 个用户手里那份订阅已不能照旧用，需要重新获取订阅：\
-             槽位序号被搬到 0 号（1 人，端口下移，旧端口无人监听，连不上）：bob"
+            "1 个用户的 HY2 住宅节点会反复断联，需重新拉订阅：\
+             槽位序号变了（1 人，端口与跳跃段一起变）：bob"
         );
     }
 
@@ -2717,6 +2730,7 @@ mod tests {
             crate::modules::residential::slots::assign_user(&h.ctx, uid, slot1)
                 .await
                 .unwrap()
+                .0
         );
 
         let (code, v) = call(&h.app, "GET", "/api/residential/slots", None).await;
@@ -2838,6 +2852,96 @@ mod tests {
         assert_eq!(code, StatusCode::OK);
         let (_, v) = call(&h.app, "GET", "/api/residential/slots", None).await;
         assert_eq!(v["slots"][0]["users"], serde_json::json!(["alice"]));
+    }
+
+    /// 改槽的四条路径（add / remove / assign / rebalance）都用**同一个**回包字段
+    /// `port_changed` 上报「手里那份订阅已经不能照旧用」的人，CLI 也照同一份口径打给操作者。
+    /// 空名单不出现这个键（也就什么都不打）。
+    #[tokio::test]
+    async fn assign_and_rebalance_report_who_must_refetch_the_subscription() {
+        let d = tempfile::tempdir().unwrap();
+        let h = harness(&d).await;
+        grow_pool(&h, 2).await;
+
+        // ① assign：alice 槽 0 → 槽 1，端口 40000 → 40001，跳跃段一起变
+        let (code, v) = call(
+            &h.app,
+            "POST",
+            "/api/residential/assign",
+            Some(serde_json::json!({"user": "alice", "target": "resi-2"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(
+            v["port_changed"],
+            serde_json::json!({
+                "slot_removed": [], "slot_moved": ["alice"], "hop_resliced": [],
+            })
+        );
+        assert_eq!(
+            crate::modules::residential::cli::format_assign("alice", "resi-2", &v),
+            "已把用户 alice 分到 resi-2，约 1 秒后槽路由生效（不重启 xray）。\
+             1 个用户的 HY2 住宅节点会反复断联，需重新拉订阅：\n  \
+             槽位序号变了（1 人，端口与跳跃段一起变）：alice"
+        );
+
+        // ② rebalance：把她挪回槽 0，同样上报
+        let (code, v) = call(&h.app, "POST", "/api/residential/rebalance", None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v["moved"], 1);
+        assert_eq!(
+            v["port_changed"],
+            serde_json::json!({
+                "slot_removed": [], "slot_moved": ["alice"], "hop_resliced": [],
+            })
+        );
+        assert!(
+            crate::modules::residential::cli::format_rebalance(&v)
+                .contains("槽位序号变了（1 人，端口与跳跃段一起变）：alice"),
+            "{}",
+            crate::modules::residential::cli::format_rebalance(&v)
+        );
+
+        // ③ 没人被挪动 ⇒ 键不出现、CLI 一个名字都不打
+        let (_, v) = call(&h.app, "POST", "/api/residential/rebalance", None).await;
+        assert_eq!(v["moved"], 0);
+        assert!(v.get("port_changed").is_none(), "空名单不进回包：{v}");
+        assert_eq!(
+            crate::modules::residential::cli::format_rebalance(&v),
+            "已重排 0 个用户"
+        );
+    }
+
+    /// 加一条上游会把**存活槽的跳跃段全部重切**（按当下槽数等分），所以池里的住宅用户
+    /// 一个不落都要重新拉订阅 —— 4.0.0 把这份名单算出来又丢掉了，操作者只看到「加成功了」，
+    /// 用户那头开始反复断联。名单落在组三：端口一个没动，只有段变了。
+    #[tokio::test]
+    async fn adding_an_upstream_reports_the_users_whose_hop_range_is_resliced() {
+        let d = tempfile::tempdir().unwrap();
+        let h = harness(&d).await;
+        let (code, v) = call(
+            &h.app,
+            "POST",
+            "/api/residential/urls",
+            Some(serde_json::json!({"url": "socks5://u:p@isp9.example.net:10007"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v["success"], true);
+        assert_eq!(
+            v["port_changed"],
+            serde_json::json!({
+                "slot_removed": [], "slot_moved": [], "hop_resliced": ["alice"],
+            }),
+            "槽 0 的段从整段砍成前半段 ⇒ alice 手里那份订阅的 mport= 有一半跳进槽 1"
+        );
+        assert!(
+            crate::modules::residential::cli::format_add(&v).contains(
+                "端口跳跃区间被重切（1 人，端口没变，但旧段里的端口会跳进别的实例）：alice"
+            ),
+            "{}",
+            crate::modules::residential::cli::format_add(&v)
+        );
     }
 
     #[tokio::test]
