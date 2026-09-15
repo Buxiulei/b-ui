@@ -43,7 +43,8 @@ assert_contains "找不到版本" "$out" "有中文错误"
 
 # 真实仓库：版本号三处一致
 ver=$(awk '/^\[workspace\.package\]/ {f = 1; next} f && /^\[/ {f = 0} f && /^version[[:space:]]*=/ {gsub(/[^0-9.]/, ""); print; exit}' "$ROOT/Cargo.toml")
-assert_eq "4.0.0" "$ver" "workspace version = 4.0.0"
+# 只核格式：具体数字与 CHANGELOG / tag 的一致性由下面的 check-version 用例对真实仓库核对，写死数字只会每次发版都红
+assert_eq "1" "$([[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && echo 1 || echo 0)" "workspace version 是 x.y.z 格式（实测 $ver）"
 for c in bui bui-c bui-schema; do
     assert_contains "version.workspace = true" "$(cat "$ROOT/crates/$c/Cargo.toml")" "$c 继承 workspace 版本"
 done
