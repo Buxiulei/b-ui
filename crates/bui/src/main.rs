@@ -121,14 +121,24 @@ async fn dispatch(command: Command) -> Result<()> {
             version,
             manifest_url,
         } => {
-            commands::upgrade::run(
+            let r = commands::upgrade::run(
                 rollback,
                 version,
                 manifest_url,
                 bui_schema::paths::Paths::default_server(),
                 std::sync::Arc::new(sys::real::RealHost::new()),
             )
-            .await
+            .await;
+            // 事故 2026-09-15：无参 `bui upgrade` 解析到更旧的 manifest（`releases/latest` 不含
+            // 预发布）是降级，打印一行中文并以退出码 2 结束、什么都不装
+            // （`commands::upgrade::refuse_downgrade`，与 install 自检 FAIL 同一口径）。
+            match r {
+                Err(e) if e.is::<commands::upgrade::DowngradeRefused>() => {
+                    eprintln!("{e}");
+                    std::process::exit(2);
+                }
+                r => r,
+            }
         }
         Command::Serve => {
             serve::run(

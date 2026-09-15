@@ -269,14 +269,20 @@ pub async fn debounce_loop(bus: EventBus, tx: tokio::sync::mpsc::Sender<bool>) {
     }
 }
 
-/// 每日自检：延 [`jitter_secs`] 秒后每 24h 拉一次 manifest → 写 `<base>/manifest.json`
-/// → 刷新共享 manifest 句柄 → 记录可升级版本 → 请求一次对账（内核随 manifest 升级）。
+/// 每日自检：延 [`jitter_secs`] 秒后每 24h 挑一份 manifest
+/// （[`crate::kernels::pick_selfcheck_manifest`]）→ 写 `<base>/manifest.json` → 刷新共享
+/// manifest 句柄 → 记录可升级版本 → 请求一次对账（内核随 manifest 升级）。
 ///
 /// 只刷内核、**不自动换 bui 自己**：`bui upgrade` 仍由面板 / CLI 手动触发。
 ///
 /// `url_override` = `$BUI_MANIFEST_URL`（守护进程没有命令行开关）。没覆盖就跟 `latest`，
 /// 404 时无条件回退到 releases 列表里最新的预发布——与 `bui upgrade` 用的是
 /// [`crate::kernels::fetch_manifest_with`] 这同一套解析；两边都拿不到就只 info 一行。
+///
+/// **绝不自动降级**（事故 2026-09-15，两台 rc1 服务器，复盘在 `kernels` 模块头）：候选必须比
+/// 本机当前 rank（manifest 缓存，缺失时取运行中的 bui 版本 + 稳定版）**严格更高**，否则本轮
+/// 一个字节都不写 —— 不换缓存、不请求对账、不提示新版。`releases/latest` 不含预发布，所以
+/// 预发布机器的候选里多一份 rc 通道的 manifest（[`crate::kernels::pick_selfcheck_manifest`]）。
 pub async fn selfcheck_loop(
     ctx: DaemonCtx,
     manifest: Arc<RwLock<Option<Manifest>>>,
@@ -287,14 +293,26 @@ pub async fn selfcheck_loop(
     // 按节点 id 定死的抖动，避免所有机器同一秒打 GitHub（spec §7）
     tokio::time::sleep(std::time::Duration::from_secs(jitter_secs(node_id))).await;
     loop {
+        // 「本机停在哪一版」以 manifest 缓存为准（对账正照它装内核），每轮重读一次：中途的
+        // 显式 `bui upgrade` 写下的那一份也算得上（事故 2026-09-15）
+        let (h, p) = (ctx.host.clone(), ctx.paths.clone());
+        let cached = tokio::task::spawn_blocking(move || load_cached_manifest(h.as_ref(), &p))
+            .await
+            .ok()
+            .flatten();
         let f = fetcher.clone();
         let u = url_override.clone();
         match tokio::task::spawn_blocking(move || {
-            crate::kernels::fetch_manifest_with(f.as_ref(), None, None, u.as_deref())
+            crate::kernels::pick_selfcheck_manifest(
+                f.as_ref(),
+                u.as_deref(),
+                cached.as_ref(),
+                env!("CARGO_PKG_VERSION"),
+            )
         })
         .await
         {
-            Ok(Ok((_url, m))) => {
+            Ok(Ok(Some((_url, m)))) => {
                 // 写缓存：下次启动直接用，拉不到网也能装内核
                 let path = crate::paths::manifest_file(&ctx.paths);
                 match serde_json::to_vec_pretty(&m) {
@@ -323,7 +341,13 @@ pub async fn selfcheck_loop(
                 .await
                 .unwrap_or(false);
                 let rebuild = differs && m.version == env!("CARGO_PKG_VERSION");
-                let newer = differs.then(|| m.version.clone());
+                // 比运行中的版本更**低**的候选一律不算「可升级」：事故 2026-09-15 里 latest 的
+                // 4.0.0 就是这么被 4.0.1 的机器当成「有新版 bui」报出来的（守卫在
+                // `pick_selfcheck_manifest`，这里再钉一道，别让提示与 runtime 说反话）
+                let newer = differs.then(|| m.version.clone()).filter(|v| {
+                    v.as_str() == env!("CARGO_PKG_VERSION")
+                        || crate::kernels::version_is_newer(v, env!("CARGO_PKG_VERSION"))
+                });
                 if let Ok(mut guard) = manifest.write() {
                     *guard = Some(m);
                 }
@@ -341,6 +365,11 @@ pub async fn selfcheck_loop(
                 }
                 // 内核版本随 manifest 走：请求一次对账（不 force）
                 ctx.bus.send(Event::ReconcileRequested { force: false });
+            }
+            // 候选不比本机当前版本新（`pick_selfcheck_manifest` 已记一行）：缓存、内核、提示
+            // 全不动，顺带把可能留下的假「可升级」清掉（事故里它被写成了更旧的 4.0.0）
+            Ok(Ok(None)) => {
+                ctx.runtime.update(|r| r.upgrade_available = None).await;
             }
             // rc 阶段（或正式版还没发）latest 就是 404，而且没有可回退的预发布通道：
             // 这是预期状态，只记一行 info，不用 warn/error 每天刷一条（裁决记录
@@ -1067,6 +1096,16 @@ mod tests {
         assert_eq!(rx.try_recv().ok(), Some(true), "force 要透传");
     }
 
+    /// 比本机（`CARGO_PKG_VERSION`）严格高一档的版本号（`x.(y+1).0`）。每日自检的降级守卫只
+    /// 放 rank 更高的候选过，所以「有新版」这类用例不能把版本号写死 —— workspace 版本一升就
+    /// 会失效。
+    fn newer_version() -> String {
+        let mut seg = env!("CARGO_PKG_VERSION").split('.');
+        let x: u32 = seg.next().unwrap().parse().unwrap();
+        let y: u32 = seg.next().unwrap().parse().unwrap();
+        format!("{x}.{}.0", y + 1)
+    }
+
     async fn ctx_for(host: Arc<FakeHost>, d: &tempfile::TempDir) -> DaemonCtx {
         let store = Store::create(d.path().join("state.json"), crate::testutil::sample_state())
             .await
@@ -1092,8 +1131,10 @@ mod tests {
         let ctx = ctx_for(host.clone(), &d).await;
         let node_id = ctx.store.read().await.node.id;
         let jitter = jitter_secs(node_id);
+        // 版本必须严格高于本机：自检只接受 rank 更高的候选（`pick_selfcheck_manifest`）
+        let newer = newer_version();
         let manifest_json = serde_json::json!({
-            "version": "4.0.1",
+            "version": newer.clone(),
             "kernels": { "sing_box": "1.14.2" },
             "artifacts": { "sing-box-linux-amd64": { "url": "https://x/sb", "sha256": "00" } }
         })
@@ -1122,7 +1163,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         assert_eq!(
             handle.read().unwrap().as_ref().map(|m| m.version.clone()),
-            Some("4.0.1".to_string()),
+            Some(newer.clone()),
             "共享句柄要被刷新，否则内核永远跟不上 manifest"
         );
         assert!(
@@ -1132,7 +1173,7 @@ mod tests {
         );
         assert_eq!(
             ctx.runtime.read().await.upgrade_available.as_deref(),
-            Some("4.0.1")
+            Some(newer.as_str())
         );
         assert_eq!(
             events.recv().await.unwrap(),
@@ -1144,6 +1185,9 @@ mod tests {
     /// rc 通道（2026-09-12 bwg-rick）：rc1 / rc2 / 正式版的 Cargo 版本号都是同一个，所以每日
     /// 自检只比版本号就会一直报「已是最新」。同版本但 manifest 里 bui 资产的 sha256 与盘上
     /// `bin/bui` 不同时必须报成「有新构建」；sha 一致才是真的没东西可升。
+    ///
+    /// 2026-09-15 起「同一版的另一份构建」由 rank 的 rc 位分辨（缓存 `tag` = rc1，候选 = rc2）：
+    /// 降级守卫只放 rank 更高的候选过，光换 sha256 已经不足以让自检去动缓存。
     #[tokio::test(start_paused = true)]
     async fn selfcheck_reports_a_same_version_rebuild_as_upgradable() {
         let host = Arc::new(FakeHost::new());
@@ -1152,9 +1196,22 @@ mod tests {
         let jitter = jitter_secs(ctx.store.read().await.node.id);
         let bui = ctx.paths.bin_dir.join("bui");
         host.write_file(&bui, b"BUI-rc1", 0o755).unwrap();
-        // 版本号与本进程一致，只有 bui 资产换成了另一份构建
+        let ver = env!("CARGO_PKG_VERSION");
+        // 缓存 = 这一版的 rc1（一次显式 `bui upgrade` 写下的那一份）
+        host.write_file(
+            &crate::paths::manifest_file(&ctx.paths),
+            serde_json::json!({
+                "version": ver, "tag": format!("v{ver}-rc1"), "kernels": {}, "artifacts": {}
+            })
+            .to_string()
+            .as_bytes(),
+            0o644,
+        )
+        .unwrap();
+        // 版本号与本进程一致，只有 tag 进了一档、bui 资产换成了另一份构建
         let manifest_json = serde_json::json!({
-            "version": env!("CARGO_PKG_VERSION"),
+            "version": ver,
+            "tag": format!("v{ver}-rc2"),
             "kernels": {},
             "artifacts": { "bui-linux-amd64": {
                 "url": "https://x/bui",
@@ -1178,7 +1235,8 @@ mod tests {
             Some(env!("CARGO_PKG_VERSION")),
             "同版本的新构建也要报可升级"
         );
-        // 换上那一份之后（sha 一致）下一轮就该回到「没东西可升」
+        // 换上那一份之后（sha 一致、且缓存已经是 rc2 ⇒ 候选 rank 不再更高）下一轮就该回到
+        // 「没东西可升」
         host.write_file(&bui, b"BUI-rc2", 0o755).unwrap();
         tokio::time::sleep(std::time::Duration::from_secs(SELFCHECK_INTERVAL_SECS + 3)).await;
         assert_eq!(
@@ -1199,8 +1257,9 @@ mod tests {
         let ctx = ctx_for(host.clone(), &d).await;
         let jitter = jitter_secs(ctx.store.read().await.node.id);
         let rc_url = crate::kernels::manifest_url_for_tag("v4.0.0-rc2");
+        let newer = newer_version();
         let rc_manifest = serde_json::json!({
-            "version": "4.0.2",
+            "version": newer.clone(),
             "kernels": { "sing_box": "1.14.2" },
             "artifacts": { "sing-box-linux-amd64": { "url": "https://x/sb", "sha256": "00" } }
         })
@@ -1218,7 +1277,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_secs(jitter + 3)).await;
         assert_eq!(
             handle.read().unwrap().as_ref().map(|m| m.version.clone()),
-            Some("4.0.2".to_string()),
+            Some(newer),
             "latest 404 之后应当跟上预发布通道里最新的 rc"
         );
         task.abort();
@@ -1243,6 +1302,204 @@ mod tests {
             "拉不到就不该写缓存"
         );
         assert!(!task.is_finished(), "404 不许让自检循环退出");
+        task.abort();
+    }
+
+    /// 事故回归（2026-09-15，两台 rc1 服务器）：`releases/latest` 不含预发布，所以 rc1 机器的
+    /// 每日自检从 latest 拿回来的是**更旧**的稳定版 manifest（4.0.0）。照它刷缓存就把 relay 的
+    /// sing-box 从 1.14.1 降回 1.14.0，还打出「每日自检：有新版 bui」。缓存 rank 更高时这一轮
+    /// 必须一动不动：缓存不变、共享句柄不变、不请求对账、不报可升级。
+    #[tokio::test(start_paused = true)]
+    async fn selfcheck_never_walks_a_prerelease_machine_back_to_stable() {
+        let host = Arc::new(FakeHost::new());
+        let d = tempfile::tempdir().unwrap();
+        let ctx = ctx_for(host.clone(), &d).await;
+        let jitter = jitter_secs(ctx.store.read().await.node.id);
+        let ver = env!("CARGO_PKG_VERSION");
+        let rc1_tag = format!("v{ver}-rc1");
+        // 缓存 = rc1（升级时写下的那一份，sing-box 1.14.1）
+        let cached = serde_json::json!({
+            "version": ver,
+            "tag": rc1_tag.clone(),
+            "kernels": { "sing_box": "1.14.1" },
+            "artifacts": {}
+        })
+        .to_string();
+        let cache_file = crate::paths::manifest_file(&ctx.paths);
+        host.write_file(&cache_file, cached.as_bytes(), 0o644)
+            .unwrap();
+        // latest 是更旧的稳定版 4.0.0（sing-box 1.14.0），rc 列表里仍只有 rc1
+        let latest = serde_json::json!({
+            "version": "4.0.0",
+            "tag": "v4.0.0",
+            "kernels": { "sing_box": "1.14.0" },
+            "artifacts": {}
+        })
+        .to_string();
+        let fetcher: Arc<dyn Fetcher> = Arc::new(FakeFetcher(Mutex::new(vec![
+            (crate::kernels::MANIFEST_URL.into(), latest.into_bytes()),
+            (
+                crate::kernels::RELEASES_API_URL.into(),
+                format!(r#"[{{"tag_name":"{rc1_tag}","prerelease":true}}]"#).into_bytes(),
+            ),
+            (
+                crate::kernels::manifest_url_for_tag(&rc1_tag),
+                cached.clone().into_bytes(),
+            ),
+        ])));
+        let handle = Arc::new(std::sync::RwLock::new(None));
+        let mut events = ctx.bus.subscribe();
+        let task = tokio::spawn(selfcheck_loop(ctx.clone(), handle.clone(), fetcher, None));
+        tokio::time::sleep(std::time::Duration::from_secs(jitter + 3)).await;
+        assert_eq!(
+            host.text(cache_file.to_str().unwrap()).as_deref(),
+            Some(cached.as_str()),
+            "缓存必须一个字节都不变：对账照它决定内核版本"
+        );
+        assert!(
+            handle.read().unwrap().is_none(),
+            "共享句柄不许被更旧的 manifest 覆盖"
+        );
+        assert_eq!(
+            ctx.runtime.read().await.upgrade_available,
+            None,
+            "更旧的版本不是「新版」"
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "不许因此请求对账：那一步会把内核降回去"
+        );
+        assert!(!task.is_finished(), "跳过一轮不许让自检循环退出");
+        task.abort();
+    }
+
+    /// 被降过的机器要能自己爬回来：缓存已经是稳定版 4.0.0（事故留下的现状），而运行中的 bui
+    /// 比它新 ⇒ 这一轮去问 rc 通道，把缓存恢复成本版的 rc1（内核也随之回到 1.14.1）。
+    #[tokio::test(start_paused = true)]
+    async fn selfcheck_heals_a_cache_that_was_already_walked_back() {
+        let host = Arc::new(FakeHost::new());
+        let d = tempfile::tempdir().unwrap();
+        let ctx = ctx_for(host.clone(), &d).await;
+        let jitter = jitter_secs(ctx.store.read().await.node.id);
+        let ver = env!("CARGO_PKG_VERSION");
+        let rc1_tag = format!("v{ver}-rc1");
+        let bui = ctx.paths.bin_dir.join("bui");
+        host.write_file(&bui, b"BUI-rc1", 0o755).unwrap();
+        let cache_file = crate::paths::manifest_file(&ctx.paths);
+        let stale = serde_json::json!({
+            "version": "4.0.0",
+            "tag": "v4.0.0",
+            "kernels": { "sing_box": "1.14.0" },
+            "artifacts": {}
+        })
+        .to_string();
+        host.write_file(&cache_file, stale.as_bytes(), 0o644)
+            .unwrap();
+        // rc1 的 manifest：bui 资产就是盘上这一份（所以不该顺带报「可升级」）
+        let rc1 = serde_json::json!({
+            "version": ver,
+            "tag": rc1_tag.clone(),
+            "kernels": { "sing_box": "1.14.1" },
+            "artifacts": { "bui-linux-amd64": {
+                "url": "https://x/bui",
+                "sha256": crate::kernels::sha256_hex(b"BUI-rc1"),
+            } }
+        })
+        .to_string();
+        let fetcher: Arc<dyn Fetcher> = Arc::new(FakeFetcher(Mutex::new(vec![
+            (
+                crate::kernels::MANIFEST_URL.into(),
+                stale.clone().into_bytes(),
+            ),
+            (
+                crate::kernels::RELEASES_API_URL.into(),
+                format!(r#"[{{"tag_name":"{rc1_tag}","prerelease":true}}]"#).into_bytes(),
+            ),
+            (
+                crate::kernels::manifest_url_for_tag(&rc1_tag),
+                rc1.clone().into_bytes(),
+            ),
+        ])));
+        let handle = Arc::new(std::sync::RwLock::new(None));
+        let mut events = ctx.bus.subscribe();
+        let task = tokio::spawn(selfcheck_loop(ctx.clone(), handle.clone(), fetcher, None));
+        tokio::time::sleep(std::time::Duration::from_secs(jitter + 3)).await;
+        // 缓存是 `to_vec_pretty` 重新序列化后落盘的，所以比语义不比字节
+        let on_disk: Manifest = serde_json::from_str(
+            &host
+                .text(cache_file.to_str().unwrap())
+                .expect("缓存必须被重写"),
+        )
+        .unwrap();
+        assert_eq!(
+            on_disk,
+            serde_json::from_str::<Manifest>(&rc1).unwrap(),
+            "缓存要被恢复成 rc 那一份，否则对账继续按 4.0.0 装内核"
+        );
+        assert_eq!(
+            handle.read().unwrap().as_ref().and_then(|m| m.tag.clone()),
+            Some(rc1_tag),
+        );
+        assert_eq!(
+            ctx.runtime.read().await.upgrade_available,
+            None,
+            "盘上的 bui 就是 rc1 那一份：自愈不该顺带报「可升级」"
+        );
+        assert_eq!(
+            events.try_recv().ok(),
+            Some(Event::ReconcileRequested { force: false }),
+            "换了缓存就要对账一次，把内核拉回 1.14.1"
+        );
+        task.abort();
+    }
+
+    /// 稳定版机器绝不被自动移到预发布：缓存与 latest 都是本机这一版，releases 列表里有个更高
+    /// 版本的 rc 也不许跟过去（跟了就等于把正式版机器推上预发布通道）。
+    #[tokio::test(start_paused = true)]
+    async fn selfcheck_keeps_a_stable_machine_off_the_prerelease_channel() {
+        let host = Arc::new(FakeHost::new());
+        let d = tempfile::tempdir().unwrap();
+        let ctx = ctx_for(host.clone(), &d).await;
+        let jitter = jitter_secs(ctx.store.read().await.node.id);
+        let ver = env!("CARGO_PKG_VERSION");
+        let stable = serde_json::json!({
+            "version": ver, "tag": format!("v{ver}"),
+            "kernels": { "sing_box": "1.14.1" }, "artifacts": {}
+        })
+        .to_string();
+        let cache_file = crate::paths::manifest_file(&ctx.paths);
+        host.write_file(&cache_file, stable.as_bytes(), 0o644)
+            .unwrap();
+        let next = newer_version();
+        let rc_tag = format!("v{next}-rc1");
+        let rc = serde_json::json!({
+            "version": next, "tag": rc_tag.clone(),
+            "kernels": { "sing_box": "1.15.0" }, "artifacts": {}
+        })
+        .to_string();
+        let fetcher: Arc<dyn Fetcher> = Arc::new(FakeFetcher(Mutex::new(vec![
+            (
+                crate::kernels::MANIFEST_URL.into(),
+                stable.clone().into_bytes(),
+            ),
+            (
+                crate::kernels::RELEASES_API_URL.into(),
+                format!(r#"[{{"tag_name":"{rc_tag}","prerelease":true}}]"#).into_bytes(),
+            ),
+            (
+                crate::kernels::manifest_url_for_tag(&rc_tag),
+                rc.into_bytes(),
+            ),
+        ])));
+        let handle = Arc::new(std::sync::RwLock::new(None));
+        let task = tokio::spawn(selfcheck_loop(ctx.clone(), handle.clone(), fetcher, None));
+        tokio::time::sleep(std::time::Duration::from_secs(jitter + 3)).await;
+        assert_eq!(
+            host.text(cache_file.to_str().unwrap()).as_deref(),
+            Some(stable.as_str()),
+            "缓存不变：正式版机器不跟 rc"
+        );
+        assert_eq!(ctx.runtime.read().await.upgrade_available, None);
         task.abort();
     }
 

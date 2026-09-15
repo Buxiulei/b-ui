@@ -54,6 +54,50 @@ pub fn version_lt(a: &str, b: &str) -> bool {
     false
 }
 
+/// 无参 `bui upgrade` 撞上降级时的专属错误：`main` 据它打印一行并以**退出码 2** 结束
+/// （`install` 的自检 FAIL 同一口径）；`bui menu` 的「检查升级」只当普通错误打印一行，
+/// 不会被 `exit` 带走。
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct DowngradeRefused(pub String);
+
+/// 降级守卫（事故 2026-09-15，复盘在 [`crate::kernels`] 模块头）：`releases/latest` 不含预发布，
+/// 所以预发布机器上**无参** `bui upgrade` 解析到的就是一份更旧的稳定版 manifest。那是降级，
+/// 必须由操作者显式点名（`--version` / `--manifest-url`），不许当成「升级」默默执行。
+///
+/// 判据与每日自检同一套 rank：目标 rank 严格低于本机当前 rank
+/// （[`crate::kernels::installed_rank`]：manifest 缓存，缺失时取运行中的 bui 版本 + 稳定版）
+/// 就拒绝。任一边的 rank 认不出来就放行 —— 不知道不拦。
+pub fn refuse_downgrade(
+    cached: Option<&Manifest>,
+    target: &Manifest,
+    running_bui: &str,
+) -> anyhow::Result<()> {
+    let (Some(to), Some(from)) = (
+        crate::kernels::manifest_rank(target),
+        crate::kernels::installed_rank(cached, running_bui),
+    ) else {
+        return Ok(()); // 有一边的 rank 认不出来：不知道不拦
+    };
+    if to >= from {
+        return Ok(());
+    }
+    // 人读的标签优先用 tag（`v4.0.1-rc1` 才看得出是预发布），没有 tag 就给版本号补个 v
+    let label = |version: &str, tag: Option<&str>| {
+        tag.filter(|t| !t.is_empty())
+            .map_or_else(|| format!("v{version}"), str::to_string)
+    };
+    let now = cached.map_or_else(
+        || label(running_bui, None),
+        |m| label(&m.version, m.tag.as_deref()),
+    );
+    Err(DowngradeRefused(format!(
+        "目标版本低于当前（{now} → {}），这是降级；确认请加 --version 或 --manifest-url 显式指定",
+        label(&target.version, target.tag.as_deref())
+    ))
+    .into())
+}
+
 /// 比对 manifest 与现装版本，产出升级计划。
 ///
 /// `bui` 自己的判据不止版本号：版本相同但 manifest 里 `bui-linux-<arch>` 的 sha256 与盘上
@@ -290,7 +334,13 @@ pub async fn run_with(
         // 总纲 C4 的解析顺序在 kernels 里一处实现：--manifest-url > --version（模板）
         // > $BUI_MANIFEST_URL > latest；什么都没指定且 latest 404 时无条件改跟 releases
         // 列表里最新的 rc（仓库里还没有正式版）
-        let (_, m) = crate::kernels::fetch_manifest(f.as_ref(), cli.as_deref(), want.as_deref())?;
+        let env = std::env::var(crate::kernels::MANIFEST_URL_ENV).ok();
+        let (_, m) = crate::kernels::fetch_manifest_with(
+            f.as_ref(),
+            cli.as_deref(),
+            want.as_deref(),
+            env.as_deref(),
+        )?;
         if let Some(v) = want.as_deref() {
             // 指定了版本就必须拿到那一版（本地文件或 $BUI_MANIFEST_URL 里可能是别的版本）
             anyhow::ensure!(
@@ -298,6 +348,15 @@ pub async fn run_with(
                 "manifest 里是 {}，不是请求的 {v}",
                 m.version
             );
+        }
+        // 三个覆盖都没给（= 跟着 latest 走）时才守降级：显式点名的目标是操作者意图
+        // （含 M5 演练故意装旧版），照办不拦
+        if crate::kernels::nothing_specified(cli.as_deref(), want.as_deref(), env.as_deref()) {
+            refuse_downgrade(
+                crate::serve::load_cached_manifest(h.as_ref(), &p).as_ref(),
+                &m,
+                env!("CARGO_PKG_VERSION"),
+            )?;
         }
         let arch = h.arch()?;
         // 计划先算、快照与新缓存只在真要换东西时才写（见 `prepare` 的说明）
@@ -422,6 +481,73 @@ mod tests {
             .is_err(),
             "缺资产不许出计划"
         );
+    }
+
+    /// 事故回归（2026-09-15）：rc1 机器上无参 `bui upgrade` 从 `releases/latest`（不含预发布）
+    /// 拿到的是更旧的稳定版 4.0.0。那是降级，必须当场拒绝并说清「这是降级」。
+    #[test]
+    fn a_no_argument_upgrade_refuses_a_downgrade_and_says_so() {
+        let ranked = |v: &str, tag: &str| Manifest {
+            version: v.into(),
+            tag: Some(tag.into()),
+            ..Default::default()
+        };
+        let rc1 = ranked("4.0.1", "v4.0.1-rc1");
+        let stable400 = ranked("4.0.0", "v4.0.0");
+        let err = refuse_downgrade(Some(&rc1), &stable400, "4.0.1").unwrap_err();
+        assert!(err.is::<DowngradeRefused>(), "main 靠这个类型给退出码 2");
+        let msg = err.to_string();
+        assert!(msg.contains("这是降级"), "{msg}");
+        assert!(msg.contains("v4.0.1-rc1 → v4.0.0"), "{msg}");
+        assert!(msg.contains("--manifest-url"), "{msg}");
+        // 同一版、下一个 rc、同版本的正式版都放行
+        assert!(refuse_downgrade(Some(&rc1), &rc1, "4.0.1").is_ok());
+        assert!(refuse_downgrade(Some(&rc1), &ranked("4.0.1", "v4.0.1-rc2"), "4.0.1").is_ok());
+        assert!(refuse_downgrade(Some(&rc1), &ranked("4.0.1", "v4.0.1"), "4.0.1").is_ok());
+        // 没有缓存时按运行中的 bui 版本比
+        assert!(refuse_downgrade(None, &stable400, "4.0.1").is_err());
+        assert!(refuse_downgrade(None, &stable400, "4.0.0").is_ok());
+        // rank 认不出来就不拦
+        assert!(refuse_downgrade(Some(&rc1), &ranked("4.0", "v4.0"), "4.0.1").is_ok());
+    }
+
+    /// 同一条路走整遍：无参 `bui upgrade` 解析到更旧的 manifest ⇒ 返回 [`DowngradeRefused`]
+    /// （`main` 据此给退出码 2），而且**一个字都不落盘** —— 不许留下「新缓存 + 旧内核」，
+    /// 也不许覆盖 `.prev`。
+    ///
+    /// 用例假定进程环境里没有 `$BUI_MANIFEST_URL`（设了就等于操作者显式指定了源，守卫放行）。
+    #[tokio::test]
+    async fn run_with_refuses_to_walk_back_and_writes_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = scratch(&d);
+        let h = Arc::new(FakeHost::new());
+        // 缓存 = 4.0.1-rc1（一次显式 `bui upgrade --manifest-url` 写下的那一份）
+        let cached = r#"{"version":"4.0.1","tag":"v4.0.1-rc1","kernels":{},"artifacts":{}}"#;
+        h.write_file(
+            &crate::paths::manifest_file(&paths),
+            cached.as_bytes(),
+            0o644,
+        )
+        .unwrap();
+        h.clear_ops();
+        let latest = manifest_json("4.0.0", OLD_KERNELS, "BUI-4.0.0");
+        let f: Arc<dyn Fetcher> = Arc::new(F(Mutex::new(vec![(
+            crate::kernels::MANIFEST_URL.to_string(),
+            latest.into_bytes(),
+        )])));
+        let host: Arc<dyn Host> = h.clone();
+        let err = run_with(false, None, None, paths.clone(), host, f)
+            .await
+            .unwrap_err();
+        assert!(err.is::<DowngradeRefused>(), "{err:#}");
+        assert!(err.to_string().contains("这是降级"), "{err}");
+        assert_eq!(writes(&h), Vec::<String>::new(), "拒绝之后一个字都不写");
+        assert_eq!(
+            text(&h, &crate::paths::manifest_file(&paths)).as_deref(),
+            Some(cached),
+            "缓存必须还是 rc1 那一份"
+        );
+        assert!(text(&h, &crate::paths::manifest_prev_file(&paths)).is_none());
     }
 
     #[test]

@@ -8,7 +8,7 @@
 //! 执行，否则 block 的时候直接 panic。因此 [`Fetcher`] 是**同步** trait，[`HttpFetcher`] 只允许
 //! 在 `tokio::task::spawn_blocking` 的闭包里或纯同步的 CLI 路径里调用。
 //!
-//! manifest 地址只在 [`resolve_manifest_url`] / [`fetch_manifest`] 决定一次（总纲 C4「manifest
+//! manifest 地址只在 [`resolve_manifest_url`] / [`fetch_manifest_with`] 决定一次（总纲 C4「manifest
 //! 来源与覆盖」）：`--manifest-url` > `--version`（套模板）> `$BUI_MANIFEST_URL` > 内置 latest。
 //! 「什么都没指定」这一支还有一步回退：GitHub 的 `releases/latest` 不解析预发布，所以仓库里
 //! 只有 rc 时 `latest/download/manifest.json` 必然 404 —— [`fetch_manifest_with`] 这时**无条件**
@@ -19,6 +19,26 @@
 //! 预发布」在运行期根本没有可靠信号，拿它当回退前提只会让 rc 机器永远停在 404 上
 //! （2026-09-12 真机：bwg-rick 上 `bui upgrade` 就是这么直接退出的）。
 //! 反过来 latest **存在**（仓库已有正式版）时绝不回退到 rc：正式版机器不跟 rc。
+//!
+//! **事故复盘（2026-09-15，两台 rc1 服务器 bwg-tizi / bwg-rick）**：03:33Z / 03:34Z 两台都用
+//! `bui upgrade --manifest-url …/v4.0.1-rc1/manifest.json` 升到 rc1（缓存 manifest 的 `tag` =
+//! `v4.0.1-rc1`，sing-box 1.14.1）。04:00:31Z 守护进程的每日自检照 [`MANIFEST_URL`]
+//! （`releases/latest`，GitHub **不把预发布算 latest**）拿回 v4.0.0 的 manifest，**无条件**
+//! 覆盖了缓存 `/opt/b-ui/manifest.json`（version 4.0.0 / tag v4.0.0 / client_sing_box 1.14.0），
+//! 于是同一分钟里：日志打出「每日自检：有新版 bui」（4.0.0 比在跑的 4.0.1 还旧）、对账照新缓存
+//! 把 relay 的 sing-box 从 1.14.1 **降回** 1.14.0（`bin/sing-box` 的 sha 变回 `.prev` 那一份）并
+//! 重启 `b-ui-relay`、面板 `/packages/manifest.json`（客户端自更新的来源）跟着宣告 4.0.0。
+//! `bui` 二进制本身没被换掉（自检从不换 bui），但任何 rc 上线一天之内内核就被拉回稳定版集合，
+//! 而且此时谁跑一次无参 `bui upgrade` 就会真的装上 4.0.0。
+//!
+//! 修法：给「一份发布」定义可比大小的 rank [`release_rank`]（`(x, y, z, rc)`，稳定版 rc 位取
+//! `u32::MAX`，所以同一个 x.y.z 下 stable > 任何 rcN），每日自检
+//! （[`pick_selfcheck_manifest`]）只接受 rank **严格高于**本机当前 rank（[`installed_rank`]：
+//! manifest 缓存，缺失时取运行中的 bui 版本 + 稳定版）的候选；rc 机器另把 [`latest_rc_tag`]
+//! 那一份也纳入候选，稳定版机器绝不自动移到预发布。显式路径（`--version` / `--manifest-url` /
+//! `$BUI_MANIFEST_URL` / `--rollback` / `install`）是操作者意图，不受守卫影响；只有无参
+//! `bui upgrade` 会在解析到更旧的 manifest 时拒绝执行（`commands::upgrade::refuse_downgrade`，
+//! 退出码 2）。
 
 use crate::reconcile::apply::BinaryInstaller;
 use crate::sys::Host;
@@ -286,6 +306,58 @@ pub fn latest_rc_tag(fetcher: &dyn Fetcher) -> anyhow::Result<Option<String>> {
         .map(|(_, tag)| tag))
 }
 
+/// 一次发布的可比大小的序号：`(x, y, z, rc)`，rc 位稳定版取 `u32::MAX`。
+pub type ReleaseRank = (u32, u32, u32, u32);
+
+/// 一份发布（manifest 的 `version` + `tag`）的 rank ——「谁更新」只由它回答。
+///
+/// `version` 按 C4 必须是纯 semver（`4.0.1`），预发布只写在 `tag` 上（`v4.0.1-rc1`），所以
+/// x.y.z 一律取自 `version`、rc 位只取自 `tag`：
+/// - `tag` 形如 `v<x.y.z>-rcN`（[`is_rc_tag`]）⇒ rc 位 = N，rcN 之间按数值排；
+/// - 其余（正式版 tag、老 manifest 没有 tag、认不出的 tag）⇒ rc 位 = `u32::MAX`，于是同一个
+///   x.y.z 下 **稳定版 > 任何 rcN**；
+/// - `version` 不是三段纯数字（空串、`4.0`、`4.0.1-rc1`、溢出 `u32`）⇒ `None`：调用方一律按
+///   「不知道」处理，**不许**当成 `0.0.0` 去比。
+///
+/// 事故 2026-09-15 的那一对：`(4,0,1,1)`（4.0.1-rc1）> `(4,0,0,MAX)`（稳定版 4.0.0）。
+pub fn release_rank(version: &str, tag: &str) -> Option<ReleaseRank> {
+    let mut seg = version.trim().trim_start_matches('v').split('.');
+    let (x, y, z) = (seg.next()?, seg.next()?, seg.next()?);
+    if seg.next().is_some() {
+        return None; // 四段以上不是 C4 的纯 semver
+    }
+    // 稳定版（含没有 tag 的老 manifest、认不出的 tag）rc 位取 u32::MAX ⇒ 同版本下 stable > rcN
+    let rc = rc_version(tag).map_or(u32::MAX, |(_, _, _, n)| n);
+    Some((x.parse().ok()?, y.parse().ok()?, z.parse().ok()?, rc))
+}
+
+/// 一份 manifest 的 [`release_rank`]（没有 `tag` 的老 manifest 按稳定版算）。
+pub fn manifest_rank(m: &Manifest) -> Option<ReleaseRank> {
+    release_rank(&m.version, m.tag.as_deref().unwrap_or_default())
+}
+
+/// 本机「现在停在哪一版」的 rank：优先取 **manifest 缓存**（install / upgrade / 每日自检写下的
+/// 那一份，对账正照它装内核），缓存缺失或版本号认不出时退回「运行中的 bui 版本 + 稳定版」。
+pub fn installed_rank(cached: Option<&Manifest>, running_bui: &str) -> Option<ReleaseRank> {
+    cached
+        .and_then(manifest_rank)
+        .or_else(|| release_rank(running_bui, ""))
+}
+
+/// 版本号 `candidate` 是否**严格高于** `current`（只比 x.y.z，不看 rc）：两边都按稳定版算 rank，
+/// 元组比较就等价于按数值比 x.y.z。任一边认不出就返回 false —— 不知道不算更高。
+pub fn version_is_newer(candidate: &str, current: &str) -> bool {
+    match (release_rank(candidate, ""), release_rank(current, "")) {
+        (Some(a), Some(b)) => a > b,
+        _ => false,
+    }
+}
+
+/// 这份 manifest 是不是一份预发布（`tag` = `v<x.y.z>-rcN`）。
+pub fn is_rc_manifest(m: &Manifest) -> bool {
+    m.tag.as_deref().is_some_and(is_rc_tag)
+}
+
 /// **唯一**一处决定 manifest 地址（纯函数，便于测试）：
 /// `cli_override` > `version`（套模板）> `env`（`$BUI_MANIFEST_URL`）> [`MANIFEST_URL`]。
 pub fn resolve_manifest_url(
@@ -302,8 +374,13 @@ pub fn resolve_manifest_url(
 }
 
 /// C4 那三个覆盖是否**都没给**（空串按没给算，与 [`resolve_manifest_url`] 同一口径）。
-/// 预发布回退只在这种「跟着 latest 走」的情况下才允许发生。
-fn nothing_specified(cli_override: Option<&str>, version: Option<&str>, env: Option<&str>) -> bool {
+/// 预发布回退只在这种「跟着 latest 走」的情况下才允许发生；无参 `bui upgrade` 的降级守卫
+/// （`commands::upgrade::refuse_downgrade`）用的也是这个判据。
+pub fn nothing_specified(
+    cli_override: Option<&str>,
+    version: Option<&str>,
+    env: Option<&str>,
+) -> bool {
     [cli_override, version, env]
         .iter()
         .all(|o| !o.is_some_and(|s| !s.is_empty()))
@@ -351,14 +428,66 @@ pub fn fetch_manifest_with(
     }
 }
 
-/// 读进程环境后调 [`fetch_manifest_with`]。
-pub fn fetch_manifest(
+/// 每日自检（`serve::selfcheck_loop`）这一轮要不要换 manifest：只有返回 `Some((url, manifest))`
+/// 才允许刷缓存 / 换内核 / 提示新版，`None` = 本轮一个字节都不动。
+///
+/// 事故 2026-09-15（见模块头）：候选**必须**比本机当前 rank（[`installed_rank`]）严格更高，
+/// 否则装上 rc 的机器一天之内就被 `releases/latest`（不含预发布）拽回稳定版内核。
+///
+/// 候选最多两份：
+/// 1. latest（或 `$BUI_MANIFEST_URL` 指定的那一个）—— 沿用 [`fetch_manifest_with`]，含
+///    「latest 404 就无条件跟最新 rc」那一支；
+/// 2. rc 通道那一份 —— 只在「跟着 latest 走」（[`nothing_specified`]）且本机确实在预发布上
+///    （缓存是 rc，或运行中的 bui 比 latest 的版本还新 ⇒ 缓存刚被降过，自愈）时才多问一次
+///    [`latest_rc_tag`]。稳定版机器（bui 版本 = latest 版本、缓存是稳定版）绝不自动移到预发布。
+///
+/// 两份里取 rank 大的那一份再与本机比。rank 是 `Option`（`None` < `Some`）：候选认不出而本机
+/// 认得出 ⇒ 不动；本机认不出（缓存坏了）⇒ 跟候选走。
+pub fn pick_selfcheck_manifest(
     fetcher: &dyn Fetcher,
-    cli_override: Option<&str>,
-    version: Option<&str>,
-) -> anyhow::Result<(String, Manifest)> {
-    let env = std::env::var(MANIFEST_URL_ENV).ok();
-    fetch_manifest_with(fetcher, cli_override, version, env.as_deref())
+    env: Option<&str>,
+    cached: Option<&Manifest>,
+    running_bui: &str,
+) -> anyhow::Result<Option<(String, Manifest)>> {
+    let current = installed_rank(cached, running_bui);
+    let (mut url, mut best) = fetch_manifest_with(fetcher, None, None, env)?;
+    // latest 自己 404 回退到 rc 的那一支已经取过最新的 rc，不必再问一遍（`is_rc_manifest`）
+    let follow_rc = nothing_specified(None, None, env)
+        && !is_rc_manifest(&best)
+        && (cached.is_some_and(is_rc_manifest) || version_is_newer(running_bui, &best.version));
+    if follow_rc {
+        match latest_rc_tag(fetcher) {
+            Ok(Some(tag)) => {
+                let rc_url = manifest_url_for_tag(&tag);
+                match Manifest::from_url(fetcher, &rc_url) {
+                    Ok(rc) if manifest_rank(&rc) > manifest_rank(&best) => {
+                        (url, best) = (rc_url, rc);
+                    }
+                    Ok(_) => {}
+                    // rc 那一份拉不动不影响 latest 那一份：记一行，接着比
+                    Err(e) => tracing::info!(
+                        tag = %tag,
+                        error = %format!("{e:#}"),
+                        "每日自检：预发布 manifest 拉不到，本轮只看 latest"
+                    ),
+                }
+            }
+            Ok(None) => {}
+            Err(e) => tracing::info!(
+                error = %format!("{e:#}"),
+                "每日自检：查 GitHub releases 列表失败，本轮只看 latest"
+            ),
+        }
+    }
+    if manifest_rank(&best) > current {
+        return Ok(Some((url, best)));
+    }
+    tracing::info!(
+        candidate = %best.tag.as_deref().unwrap_or(&best.version),
+        current = ?current,
+        "每日自检：候选不比本机当前版本新，本轮不动缓存与内核（不许自动降级）"
+    );
+    Ok(None)
 }
 
 /// 从内核的 `version` 输出里反解版本号（每个内核的格式都不一样，注释里是本机实测的第一行）。
@@ -1006,6 +1135,199 @@ mod tests {
         let e = fetch_manifest_with(&f, None, None, Some(MANIFEST_URL)).unwrap_err();
         assert!(is_not_found(&e), "{e:#}");
         assert_eq!(f.seen(), vec![MANIFEST_URL], "指定了就只认那一个");
+    }
+
+    /// [`pick_selfcheck_manifest`] 用的 manifest：`tag` 决定 rank 的 rc 位（C4 要求
+    /// `version` 是纯 semver，预发布只写在 `tag` 上）。
+    fn ranked(version: &str, tag: &str) -> String {
+        format!(r#"{{"version":"{version}","tag":"{tag}","kernels":{{}},"artifacts":{{}}}}"#)
+    }
+
+    /// GitHub releases 列表：给的 tag 全按 `prerelease=true` 列出。
+    fn prereleases(tags: &[&str]) -> String {
+        let items: Vec<String> = tags
+            .iter()
+            .map(|t| format!(r#"{{"tag_name":"{t}","prerelease":true}}"#))
+            .collect();
+        format!("[{}]", items.join(","))
+    }
+
+    #[test]
+    fn release_rank_ranks_stable_above_every_rc_of_the_same_version() {
+        let r = |v: &str, t: &str| release_rank(v, t).expect("应当解析得出");
+        assert_eq!(release_rank("4.0.1", "v4.0.1-rc3"), Some((4, 0, 1, 3)));
+        assert_eq!(release_rank("4.0.0", "v4.0.0"), Some((4, 0, 0, u32::MAX)));
+        assert!(
+            r("4.0.1", "v4.0.1") > r("4.0.1", "v4.0.1-rc9"),
+            "同一个版本：稳定版高于任何 rc"
+        );
+        assert!(
+            r("4.0.1", "") > r("4.0.1", "v4.0.1-rc1"),
+            "老 manifest 没有 tag：按稳定版算"
+        );
+        assert!(
+            r("4.0.1", "nightly") > r("4.0.1", "v4.0.1-rc1"),
+            "认不出的 tag 同样按稳定版算"
+        );
+        assert!(
+            r("4.0.1", "v4.0.1-rc2") > r("4.0.1", "v4.0.1-rc1"),
+            "rc 按数值排"
+        );
+        assert!(
+            r("4.0.1", "v4.0.1-rc10") > r("4.0.1", "v4.0.1-rc9"),
+            "rc10 > rc9，不是字典序"
+        );
+        // 事故 2026-09-15 的那一对：4.0.1-rc1 的机器比稳定版 4.0.0 新
+        assert!(r("4.0.1", "v4.0.1-rc1") > r("4.0.0", "v4.0.0"));
+        // 坏输入一律 None：调用方按「不知道」处理，不许当成 0.0.0 去比
+        for bad in [
+            "",
+            "4.0",
+            "4.0.0.1",
+            "4.0.x",
+            "4.0.1-rc1",
+            "99999999999999999999.0.0",
+        ] {
+            assert_eq!(release_rank(bad, ""), None, "{bad}");
+        }
+        // 版本号只比 x.y.z，不看 rc
+        assert!(version_is_newer("4.0.1", "4.0.0"));
+        assert!(version_is_newer("4.1.0", "4.0.9"));
+        assert!(!version_is_newer("4.0.0", "4.0.1"));
+        assert!(!version_is_newer("4.0.1", "4.0.1"));
+        assert!(!version_is_newer("4.0.1", "坏版本号"), "认不出就不算更高");
+    }
+
+    #[test]
+    fn installed_rank_prefers_the_cached_manifest_then_the_running_binary() {
+        let rc1: Manifest = serde_json::from_str(&ranked("4.0.1", "v4.0.1-rc1")).unwrap();
+        assert_eq!(installed_rank(Some(&rc1), "4.0.1"), Some((4, 0, 1, 1)));
+        assert!(is_rc_manifest(&rc1));
+        // 没有缓存（全新装机 / 缓存被删）：按运行中的 bui 版本 + 稳定版算
+        assert_eq!(installed_rank(None, "4.0.1"), Some((4, 0, 1, u32::MAX)));
+        // 缓存的版本号坏了也退回运行中的版本
+        let bad: Manifest = serde_json::from_str(&ranked("4.0", "v4.0-rc1")).unwrap();
+        assert!(!is_rc_manifest(&bad), "v4.0-rc1 少一段，不是 rc tag");
+        assert_eq!(
+            installed_rank(Some(&bad), "4.0.0"),
+            Some((4, 0, 0, u32::MAX))
+        );
+    }
+
+    /// 事故回归（2026-09-15，两台 rc1 服务器）：缓存是 4.0.1-rc1，而 `releases/latest` 不含
+    /// 预发布、给回来的是更旧的稳定版 4.0.0 —— 本轮一个字节都不许动。
+    #[test]
+    fn the_daily_selfcheck_never_walks_back_from_a_prerelease_to_stable() {
+        let rc1 = ranked("4.0.1", "v4.0.1-rc1");
+        let stable = ranked("4.0.0", "v4.0.0");
+        let rc_url = manifest_url_for_tag("v4.0.1-rc1");
+        let f = FakeFetcher::new(vec![
+            (MANIFEST_URL, &stable),
+            (RELEASES_API_URL, &prereleases(&["v4.0.1-rc1"])),
+            (&rc_url, &rc1),
+        ]);
+        let cached: Manifest = serde_json::from_str(&rc1).unwrap();
+        assert_eq!(
+            pick_selfcheck_manifest(&f, None, Some(&cached), "4.0.1").unwrap(),
+            None,
+            "两个候选（稳定版 4.0.0、同一份 rc1）都不比本机新：不换缓存、不动内核、不提示"
+        );
+    }
+
+    /// 自愈：缓存已被稳定版 4.0.0 覆盖（事故留下的现状），但运行中的 bui 是 4.0.1 ⇒ 去问 rc
+    /// 通道，把缓存恢复成 4.0.1-rc1。
+    #[test]
+    fn the_daily_selfcheck_heals_a_cache_that_was_already_walked_back() {
+        let rc1 = ranked("4.0.1", "v4.0.1-rc1");
+        let stable = ranked("4.0.0", "v4.0.0");
+        let rc_url = manifest_url_for_tag("v4.0.1-rc1");
+        let f = FakeFetcher::new(vec![
+            (MANIFEST_URL, &stable),
+            (RELEASES_API_URL, &prereleases(&["v4.0.1-rc1"])),
+            (&rc_url, &rc1),
+        ]);
+        let cached: Manifest = serde_json::from_str(&stable).unwrap();
+        let (url, m) = pick_selfcheck_manifest(&f, None, Some(&cached), "4.0.1")
+            .unwrap()
+            .expect("运行中的 bui 比 latest 新 ⇒ 必须回到 rc 通道");
+        assert_eq!(url, rc_url);
+        assert_eq!(m.tag.as_deref(), Some("v4.0.1-rc1"));
+        assert_eq!(
+            f.seen(),
+            vec![
+                MANIFEST_URL.to_string(),
+                RELEASES_API_URL.to_string(),
+                rc_url
+            ],
+            "顺序必须是 latest → releases 列表 → rc 的 manifest"
+        );
+    }
+
+    /// 稳定版机器（bui 版本 = latest 版本、缓存是稳定版）绝不自动移到预发布：连 releases
+    /// 列表都不该去问。
+    #[test]
+    fn a_stable_machine_is_never_moved_onto_the_prerelease_channel() {
+        let stable = ranked("4.0.0", "v4.0.0");
+        let rc = ranked("4.0.1", "v4.0.1-rc1");
+        let rc_url = manifest_url_for_tag("v4.0.1-rc1");
+        let f = FakeFetcher::new(vec![
+            (MANIFEST_URL, &stable),
+            (RELEASES_API_URL, &prereleases(&["v4.0.1-rc1"])),
+            (&rc_url, &rc),
+        ]);
+        let cached: Manifest = serde_json::from_str(&stable).unwrap();
+        assert_eq!(
+            pick_selfcheck_manifest(&f, None, Some(&cached), "4.0.0").unwrap(),
+            None,
+            "latest 就是本机这一版：没有更新的候选"
+        );
+        assert_eq!(
+            f.seen(),
+            vec![MANIFEST_URL],
+            "一次都不许问 releases 列表：正式版机器不跟 rc"
+        );
+    }
+
+    /// rc 机器等的就是同版本的正式版：rank 规则里 4.0.1 > 4.0.1-rc1，换过去。
+    #[test]
+    fn a_prerelease_machine_moves_up_to_the_stable_release_of_the_same_version() {
+        let rc1 = ranked("4.0.1", "v4.0.1-rc1");
+        let stable = ranked("4.0.1", "v4.0.1");
+        let rc_url = manifest_url_for_tag("v4.0.1-rc1");
+        let f = FakeFetcher::new(vec![
+            (MANIFEST_URL, &stable),
+            (RELEASES_API_URL, &prereleases(&["v4.0.1-rc1"])),
+            (&rc_url, &rc1),
+        ]);
+        let cached: Manifest = serde_json::from_str(&rc1).unwrap();
+        let (url, m) = pick_selfcheck_manifest(&f, None, Some(&cached), "4.0.1")
+            .unwrap()
+            .expect("同版本的正式版是升级");
+        assert_eq!(url, MANIFEST_URL);
+        assert_eq!(m.tag.as_deref(), Some("v4.0.1"));
+    }
+
+    /// rc 机器继续跟 rc：列表里出现 rc2 就换过去（latest 仍是更旧的稳定版 4.0.0）。
+    #[test]
+    fn a_prerelease_machine_follows_the_next_rc() {
+        let rc1 = ranked("4.0.1", "v4.0.1-rc1");
+        let rc2 = ranked("4.0.1", "v4.0.1-rc2");
+        let stable = ranked("4.0.0", "v4.0.0");
+        let rc2_url = manifest_url_for_tag("v4.0.1-rc2");
+        let f = FakeFetcher::new(vec![
+            (MANIFEST_URL, &stable),
+            (
+                RELEASES_API_URL,
+                &prereleases(&["v4.0.1-rc1", "v4.0.1-rc2"]),
+            ),
+            (&rc2_url, &rc2),
+        ]);
+        let cached: Manifest = serde_json::from_str(&rc1).unwrap();
+        let (url, m) = pick_selfcheck_manifest(&f, None, Some(&cached), "4.0.1")
+            .unwrap()
+            .expect("rc2 比 rc1 新");
+        assert_eq!(url, rc2_url);
+        assert_eq!(m.tag.as_deref(), Some("v4.0.1-rc2"));
     }
 
     #[test]
