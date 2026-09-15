@@ -8,7 +8,7 @@
 `version` 的唯一来源是根 `Cargo.toml` 的 `[workspace.package] version`；改版本必须同时在本文件加一段，`scripts/release/check-version.sh` 会在 CI 里卡住不一致（它只认 `## [<version>]` 这个标题，日期不参与校验）。
 未发布的版本日期写「未发布」，由主理人打 tag 发版时替换成当天日期（UTC）。
 
-## [4.0.0] - 未发布
+## [4.0.0] - 2026-09-15
 
 v4 是一次完全重写：控制面与 Linux 客户端改为 Rust 单二进制，协议内核（Xray / hysteria / sing-box / Caddy）保持不变。
 节点凭据（端口、标签、UUID、密码）与 v3 一致，客户端已导入的节点照常可用；但订阅链接改为每用户一个随机 token，旧的用户名链接只在升级或 v3 导入后的宽限期内可用，**订阅者要在宽限期内换成面板里复制的 token 链接**。

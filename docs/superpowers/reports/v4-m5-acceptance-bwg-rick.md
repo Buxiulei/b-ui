@@ -1,7 +1,7 @@
 # v4 M5 硬化验收报告（bwg-rick）——初稿
 
 撰写：Opus（P5 Task 12 初稿）　裁决人：Fable　成稿日：2026-09-13（实测日期 2026-09-12 / 09-13）
-被测版本：`bui 4.0.0-rc1` → `rc11`（GitHub 预发布通道，按总纲裁决记录「发布：预发布与首推（2026-09-12）」放开；rc 由主会话打 tag、Actions 发 Release）
+被测版本：`bui 4.0.0-rc1` → `rc12`（= v4.0.0，同一份代码 f5571a9）（GitHub 预发布通道，按总纲裁决记录「发布：预发布与首推（2026-09-12）」放开；rc 由主会话打 tag、Actions 发 Release）
 内核：rc2 起 sing-box 1.14.0（由 1.13.19 随 manifest 升级），其余三个内核以 rc8 的 `manifest.json` 为准（本稿未逐项抄录）
 脚本：`scripts/ops/{soak-sample,soak-report,authhook-bench,authhook-report,authhttp-bench.py,upgrade-drill,v3-cutover}`、`scripts/{m1,m3}-acceptance.sh`（以 `v4` @ `7f723b1` 为准）
 
@@ -11,8 +11,8 @@
 
 | 判据（出处） | 实测（摘要） | 结论 |
 |---|---|---|
-| 72h soak：Xray RSS 无单调增长（spec §9 M5） | 首轮窗口被多次升级打断，作废 | **待测** |
-| 72h soak：`bui` RSS < 50MB（spec §9 M5） | 同上；另见 §2，压测时守护进程 RSS 15.3 MB（不代替 soak） | **待测** |
+| 72h soak：Xray RSS 无单调增长（spec §9 M5） | rc12 浸泡 2026-09-14T16:18:39Z 起在 bwg-rick 进行中；主理人 2026-09-15 裁决先发布 v4.0.0，浸泡跑满 72 小时后补判，问题进 4.0.1 | **发布后补测** |
+| 72h soak：`bui` RSS < 50MB（spec §9 M5） | 同上；发布时已跑约 9 小时，bui RSS 约 16.7 MB、全部单元零重启（非判定结论） | **发布后补测** |
 | 鉴权 200 建连/秒 p99 < 20ms（spec §9 M5） | rc7 http 模式：p99 12.38 ms，0 失败 | **PASS** |
 | `upgrade` 演练成功（spec §9 M5） | rc1→rc8 全部经 `bui upgrade` 完成 | **PASS** |
 | `--rollback` 演练成功（spec §9 M5） | 流程本身正确（bui 与四内核往返 .prev、版本指纹一致）；暴露孤儿链事故，rc5 修复并复验 | **PASS**（附事故，见 §5） |
@@ -25,6 +25,7 @@ M1–M4 与 IP 池的回顾见 §6，均已通过（IP 池有两项待测）。
 
 - **结论：待测。**
 - rc11 浸泡：2026-09-13T15:25:36Z 起（bwg-rick，8 个单元 = 6 个固定单元 + hysteria-residential-1/-2，`--interval 60`），预计 09-16 15:25Z 采满。rc10 那轮只采了 6 个固定单元，随 rc11 升级作废。
+- rc12 浸泡：2026-09-14T16:18:39Z 起（bwg-rick，8 个单元，先等旧采样器退出再挪目录，无残留 DONE）。**发布时浸泡进行中**：主理人 2026-09-15 裁决先发布 v4.0.0（与 rc12 同一份代码 f5571a9），浸泡继续跑满 72 小时并后台监控，发现的问题进 4.0.1。rick 保持 rc12 构建、不手动升级到 v4.0.0 构建，以免重启打断浸泡；对账器按**版本号**比对二进制（`reconcile/diff.rs` 的 `Artifact::Binary`），v4.0.0 清单与 rc12 同为 4.0.0、内核版本一致，所以发布后守护进程每日自检拉到新清单也不会自动重装。
 - 采样器重启的坑：kill 旧采样器后，bash 要等当前的 `sleep 60` 结束才跑 EXIT trap；这时旧目录已被挪走、新目录同名，旧采样器把 `DONE`（reason=signal）写进了新目录。已改名为 `DONE.stray-from-rc10-sampler`。以后先等旧进程退出（按 pid 轮询 `kill -0`）再挪目录。
 - 首轮：2026-09-12 14:57 UTC 起采样。窗口内 rick 被连续升级（rc 迭代），`b-ui` 出现 11 个 pid、`xray` 出现 3 个。RSS 曲线在每次重启时归零，斜率与「首末 1/4 均值」都失去意义，所以整轮**作废**，不出判读表。
 - 重跑计划：日志哨兵合并后，在打出的那个 rc 上，从升级完成算起采满 72h，**窗口内不再升级、不重启受管单元**。
@@ -192,8 +193,7 @@ M1–M4 与 IP 池的回顾见 §6，均已通过（IP 池有两项待测）。
 
 ## 8. 发版建议（初稿）
 
-- **v4.0.0 当前不可发**（不打 `v4.0.0` tag）。阻塞项：
-  1. 72h soak 待测（§1）。
+- **v4.0.0 已于 2026-09-15 发布**（主理人裁决「先发布、后浸泡」）：发布前 `pin-kernels.sh --check` 与 `check-version.sh v4.0.0` 均通过；72h soak 在发布后补测，结论与问题进 4.0.1。
 - 裁决（2026-09-13）：在最终 rc 上再跑一遍完整的 `upgrade` → `--rollback` → `upgrade`。rick 在浸泡不能动，放在 bwg-tizi 上跑。
 - 发布命令只由主理人执行，照计划 Task 12 Step 8 §5：
   - 先跑 `pin-kernels.sh --check`。
