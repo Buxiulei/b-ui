@@ -31,7 +31,8 @@ pub fn router(state: AppState, modules: &[Arc<dyn Module>]) -> axum::Router {
         .route(
             "/api/system/legacy-sub",
             axum::routing::post(system::set_legacy_sub),
-        );
+        )
+        .route("/api/system/obfs", axum::routing::post(system::set_obfs));
     let protected = modules
         .iter()
         .fold(protected, |acc, m| acc.merge(m.routes()));
@@ -81,6 +82,18 @@ mod tests {
 
     /// 一台「六个单元都在跑」的假机器 + 一个独立 AppState（限速器随之独立）
     async fn app_with_runtime() -> (axum::Router, tempfile::TempDir, Arc<FakeHost>, Runtime) {
+        let (app, d, host, runtime, _bus) = app_with_bus().await;
+        (app, d, host, runtime)
+    }
+
+    /// 同 [`app_with_runtime`]，另外交出事件总线（断言 `StateChanged` 发没发）。
+    async fn app_with_bus() -> (
+        axum::Router,
+        tempfile::TempDir,
+        Arc<FakeHost>,
+        Runtime,
+        EventBus,
+    ) {
         let d = tempfile::tempdir().unwrap();
         let mut state = crate::testutil::sample_state();
         state.admin.password_hash = crate::api::auth::hash_password("test123").unwrap();
@@ -102,16 +115,17 @@ mod tests {
                 "3".into(),
             );
         });
+        let bus = EventBus::new();
         let app_state = AppState {
             store,
-            bus: EventBus::new(),
+            bus: bus.clone(),
             runtime: runtime.clone(),
             host: host.clone(),
             started_at: host.now(),
             version: "4.0.0",
             login: crate::api::auth::LoginLimiter::default(),
         };
-        (router(app_state, &[]), d, host, runtime)
+        (router(app_state, &[]), d, host, runtime, bus)
     }
 
     async fn app() -> (axum::Router, tempfile::TempDir, Arc<FakeHost>) {
@@ -440,6 +454,105 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(until(), None, "null ⇒ 立刻停用全部用户名链接");
+    }
+
+    /// `POST /api/system/obfs`（`bui set obfs` 的落点，2026-09-15 裁决）：未登录 401；非法 JSON
+    /// 与非法取值 400 且什么都不写；on 首次生成 32 位十六进制密码并发 `StateChanged`；重复 on
+    /// 密码不变、不写盘、不发事件；off 保留密码。回包不带 obfs 密码。
+    #[tokio::test]
+    async fn the_obfs_endpoint_switches_the_state_and_asks_for_a_reconcile() {
+        let (app, d, _h, _rt, bus) = app_with_bus().await;
+        let token = login(&app).await;
+        let mut rx = bus.subscribe();
+        let read = || -> (bui_schema::model::Obfs, Vec<u8>) {
+            let bytes = std::fs::read(d.path().join("state.json")).unwrap();
+            let s: bui_schema::model::State = serde_json::from_slice(&bytes).unwrap();
+            (s.node.obfs, bytes)
+        };
+        let (initial, _) = read();
+        assert!(!initial.enabled, "sample_state 默认关闭");
+        let send = |req: Request<Body>| app.clone().oneshot(req);
+
+        let res = send(post("/api/system/obfs", serde_json::json!({"value": "on"})))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "未登录");
+        let res = send(with_token(
+            Request::builder()
+                .method("POST")
+                .uri("/api/system/obfs")
+                .header("content-type", "application/json")
+                .body(Body::from("{not json"))
+                .unwrap(),
+            &token,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "非法 JSON");
+        let res = send(with_token(
+            post("/api/system/obfs", serde_json::json!({"value": "maybe"})),
+            &token,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "非法取值");
+        assert_eq!(read().0, initial, "未登录 / 非法请求不落盘");
+        assert!(rx.try_recv().is_err(), "也不发事件");
+
+        let on_req = || {
+            with_token(
+                post("/api/system/obfs", serde_json::json!({"value": "on"})),
+                &token,
+            )
+        };
+        let res = send(on_req()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = json(res).await;
+        assert_eq!(body["enabled"], true);
+        assert_eq!(body["changed"], true);
+        let (on, bytes) = read();
+        assert!(on.enabled);
+        assert!(
+            on.password.len() == 32
+                && on
+                    .password
+                    .chars()
+                    .all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+            "密码形状不对"
+        );
+        assert!(
+            !body.to_string().contains(&on.password),
+            "回包不带 obfs 密码"
+        );
+        assert_eq!(rx.try_recv().unwrap(), Event::StateChanged("obfs"));
+
+        let res = send(on_req()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(json(res).await["changed"], false);
+        assert_eq!(read(), (on.clone(), bytes), "重复 on 密码不变、不写盘");
+        assert!(rx.try_recv().is_err(), "没变化不发 StateChanged");
+
+        let res = send(with_token(
+            post("/api/system/obfs", serde_json::json!({"value": "off"})),
+            &token,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = json(res).await;
+        assert_eq!(
+            (body["enabled"].clone(), body["changed"].clone()),
+            (false.into(), true.into())
+        );
+        assert_eq!(
+            read().0,
+            bui_schema::model::Obfs {
+                enabled: false,
+                password: on.password.clone()
+            },
+            "off 保留密码"
+        );
+        assert_eq!(rx.try_recv().unwrap(), Event::StateChanged("obfs"));
     }
 
     #[tokio::test]

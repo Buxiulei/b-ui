@@ -145,6 +145,12 @@ pub enum SetCmd {
         /// `off` 或 RFC3339 时刻；取值合法性由 `commands::config::parse_legacy_sub` 判。
         value: String,
     },
+    /// HY2 混淆（salamander）开关：`on` / `off`，覆盖直连与全部住宅 HY2 实例。
+    /// 开启或关闭后，所有用户的 HY2 节点要更新一次订阅才能连上；Reality 节点不受影响。
+    Obfs {
+        /// `on` 或 `off`；取值合法性由 `commands::config::parse_obfs` 判。
+        value: String,
+    },
 }
 
 /// `/usr/local/bin/b-ui` 这个符号链接裸跑时进菜单（spec §1、§2.4）。
@@ -407,6 +413,29 @@ mod tests {
             );
         }
         assert!(Cli::try_parse_from(["bui", "set", "legacy-sub"]).is_err());
+    }
+
+    /// `bui set obfs on|off`（2026-09-15 裁决）。取值由 `commands::config::parse_obfs` 一处判，
+    /// clap 只管**必须收到一个值**；`bui set --help` 里看得到这一项。
+    #[test]
+    fn parses_the_obfs_switch_and_needs_a_value() {
+        for value in ["on", "off"] {
+            assert_eq!(
+                Cli::try_parse_from(["bui", "set", "obfs", value])
+                    .unwrap()
+                    .command,
+                Some(Command::Set {
+                    cmd: SetCmd::Obfs {
+                        value: value.into()
+                    }
+                })
+            );
+        }
+        assert!(Cli::try_parse_from(["bui", "set", "obfs"]).is_err());
+        let help = Cli::try_parse_from(["bui", "set", "--help"])
+            .unwrap_err()
+            .to_string();
+        assert!(help.contains("obfs"), "{help}");
     }
 
     #[test]

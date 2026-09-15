@@ -1,5 +1,5 @@
-//! CLI 通过 unix socket 调的四个系统端点（spec §2.4）：触发一轮对账、动一个受管单元、
-//! 切 Hysteria2 的鉴权方式、改旧订阅链接的宽限期。
+//! CLI 通过 unix socket 调的五个系统端点（spec §2.4）：触发一轮对账、动一个受管单元、
+//! 切 Hysteria2 的鉴权方式、改旧订阅链接的宽限期、开关 HY2 混淆。
 //!
 //! 这两个端点是「菜单与 CLI 不自己动手」的唯一出口：`sudo b-ui` 的重启/停止都经过这里，
 //! 于是三条对账路径（启动、去抖、10 分钟巡检）仍只有守护进程里那一个 consumer 在跑（S6）。
@@ -115,6 +115,58 @@ pub async fn set_legacy_sub(
             Json(serde_json::json!({"ok": true, "legacy_sub_until": until})),
         )
             .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ObfsRequest {
+    /// `on` / `off`；合法性由 `commands::config::parse_obfs` 判。
+    pub value: String,
+}
+
+/// `POST /api/system/obfs`：HY2 混淆（salamander）开关（`bui set obfs` 的落点，2026-09-15 裁决）。
+///
+/// 覆盖直连与全部住宅 HY2 实例。状态真变化时写期望态 + 发一次 `StateChanged`：重渲染与重启
+/// 受影响的 HY2 实例都由那一轮对账做；已经是这个状态就什么都不写、不发事件（不让在线客户端
+/// 白断一次）。判定与密码生成都在 `commands::config::obfs_switched`，且在 `Store` 的写锁里做。
+/// 回包只有开关与是否变化，**不带 obfs 密码**。
+pub async fn set_obfs(State(app): State<AppState>, Json(req): Json<ObfsRequest>) -> Response {
+    let on = match crate::commands::config::parse_obfs(&req.value) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    };
+    let mut changed = false;
+    let res = app
+        .store
+        .update(|s| {
+            if let Some(next) = crate::commands::config::obfs_switched(&s.node.obfs, on) {
+                s.node.obfs = next;
+                changed = true;
+            }
+        })
+        .await;
+    match res {
+        Ok(_) => {
+            if changed {
+                app.bus.send(Event::StateChanged("obfs"));
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"ok": true, "enabled": on, "changed": changed})),
+            )
+                .into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
