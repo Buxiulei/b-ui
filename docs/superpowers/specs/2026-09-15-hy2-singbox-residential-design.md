@@ -427,7 +427,7 @@ Clash API 客户端复用 `modules/residential/clash.rs` 的 `Clash` trait（`re
 ### 7.5 旧订阅兼容不变量（4.1 的硬约束，逐条可核对）
 
 **客户端不会自动刷新节点。** `bui-c` 取节点只有两处、都在用户显式导入的路径上
-（`crates/bui-c/src/cli.rs:878` 的 `import --panel` / `--sub`，与 `:3005` 的 `fetch_http`）；
+（`crates/bui-c/src/cli.rs:878` 的 `import --panel` / `--sub`，与 `:3005` 的 `fetch_http`）；（**点位更精确的说法**：`fetch_panel` / `fetch_sub` 的调用点实为 6 处 —— `cli.rs:878`、`:884`、`:2881`、`:3005`、`:3010`、`:3014` —— 但**全部只可达自显式 `bui-c import` 命令与菜单 [3]**；`check.rs` 与 `update.rs` 一处不取。实施时按「入口」而非「行号」核，别只 grep 两个点位。）
 每分钟的 `bui-c check` 与每日自动更新**都不取节点**，v2rayN 也只在用户点「更新订阅」时才拉。
 所以**从不重新导入的机器会一直用手里那份旧参数**——§7.3 的 REDIRECT 只兜住「目的端口」这一项，
 其余参数错一个，那批机器就是断网。下面四条是 4.1 的硬约束：
