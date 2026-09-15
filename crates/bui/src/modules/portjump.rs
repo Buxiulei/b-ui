@@ -1,5 +1,6 @@
-//! 「本实例」的端口跳跃孤儿 NAT 链清理：`bui hy2-prestart <config>` 的全部逻辑，
-//! 同时被两个 hysteria 单元的 `ExecStartPre=-` 与 watchdog 的自愈分支调用。
+//! 「本实例」的端口跳跃孤儿 NAT 规则清理（iptables 的链 + nft 的表）：
+//! `bui hy2-prestart <config>` 的全部逻辑，同时被每个 hysteria 单元的 `ExecStartPre=-`
+//! 与 watchdog 的自愈分支调用。
 //!
 //! ## 为什么需要它
 //!
@@ -14,9 +15,25 @@
 //! 真机事故（bwg-rick，2026-09-12 20:33 UTC，M5 回滚演练 `bui upgrade --rollback` 之后）：
 //! `hysteria-residential` 连续崩 52 次，日志正是
 //! 「invalid config: listen: ip6tables [-w -t nat -N HYSTERIA-PR-c66a02d9]: exit status 1:
-//! ip6tables: Chain already exists」。这是 v3.5.14 那个老坑在 v4 复活——v4 只在 `import-v3`
-//! 的卸载末尾清过一次（[`crate::commands::import_v3::flush_v3_portjump_rules`]），
-//! 之后每次非正常终止都会再踩一遍。
+//! ip6tables: Chain already exists」。这是 v3.5.14 那个老坑在 v4 复活，之后每次非正常终止
+//! 都会再踩一遍。
+//!
+//! ## 两种后端
+//!
+//! hysteria 2.12 的后端选择在 `app/internal/firewall/firewall_linux.go`
+//! （`setupUDPPortRedirectWithRunner`）：`HYSTERIA_FIREWALL_BACKEND` 认
+//! `nftables`/`nft` 与 `iptables`/`ipt`，其余一律自动探测——**PATH 上有 `nft` 就走 nft**。
+//! nft 后端建的是表而不是链：`hysteria_<sha256 前 8 位>`，ip 与 ip6 两族各一张
+//! （`listen:` 钉了 IP 时只有对应那一族），表内两条链 `prerouting` / `output`，规则形如
+//! `udp dport 41000-43999 redirect to :40000`（`listen:` 钉了 IPv6 地址时是
+//! `dnat to [<ip>]:40000`）。
+//!
+//! 4.0.1 之前这里只清 iptables 两族，nft 一族不管（v3 的 `hy2-portjump-cleanup.sh` 两种
+//! 后端都清，这是 v3→v4 回归）：tizi 走 nft 后端，实测残留一张 2 槽时期的
+//! `ip6 hysteria_<hash> { udp dport 45500-50000 redirect to :40001 }`。nft 的 `add table`
+//! 幂等，残留表不会像 iptables 的 `-N` 那样直接把内核打进崩溃循环，但 `add rule` 不幂等：
+//! 崩溃重启会往老表里一轮一轮堆重复规则，槽位重切之后老规则还把新区间送去旧 base 端口。
+//! 两种后端都清不冲突（各自幂等），所以 iptables 那两族照旧无条件清，nft 按后端探测加清。
 //!
 //! 实录的两条关键细节，决定了这里的判定方式：
 //! ① **孤儿链本身可能是空的**，只剩 OUTPUT 里一条跳转规则（进程崩在 `-N` 之后、加 REDIRECT
@@ -25,19 +42,27 @@
 //!
 //! ## 怎么判定「这条链是本实例的」
 //!
-//! 上游 `apernet/hysteria` 的源码在本机与本任务的离线环境里都取不到（Go 项目，不在 cargo
-//! registry），`HYSTERIA-PR-<hash>` 里 hash 的算法因此**未经证实**（事故现场的
-//! `c66a02d9` 是 8 个 hex 字符，形态上像 listen 字符串的截断哈希）。所以判定**不依赖**
-//! hash，照 v3 `hy2-portjump-cleanup.sh`（`server/core.sh:139-190`，v3.5.14 引入、v3.5.16
-//! 补上空链）的行为学判据，双重定位、按实例唯一：
+//! hash 是 `sha256(<后端标识>|<listen IP>|<base 端口>|<跳跃区间>)` 的前 8 个 hex 字符
+//! （上游 `shortHash`/`hashInput`，2026-09-15 对着 2.12.2 源码核实）：**同一份 listen 配置
+//! 才得到同一个 hash**，槽位重切、端口改动都会换一个名字，所以孤儿的名字无从预测。判定因此
+//! **不依赖** hash，照 v3 `hy2-portjump-cleanup.sh`（`server/core.sh:139-190`，v3.5.14 引入、
+//! v3.5.16 补上空链）的行为学判据，双重定位、按实例唯一：
 //!
 //! - **完整孤儿**：链内规则 `-A HYSTERIA-PR-x … -j REDIRECT --to-ports <base>`，base 端口按实例唯一；
 //! - **空链**：任意链（实录是 OUTPUT，PREROUTING 同理）上 `-A … --dport <start>:<end> -j
 //!   HYSTERIA-PR-x`，跳跃区间按实例唯一（直连 20000-30000 / 住宅 41000-50000）。
 //!
-//! 两条判据都只认本实例的端口，**绝不碰另一实例的链**（v3.5.1 的「共享 cleanup 跨实例误删」
-//! 就是反例）。找不到 `iptables`/`ip6tables` 命令则跳过；任何一步失败只记一行说明，
+//! nft 一族同理、只是判据只剩第一条：表名里的 hash 不参与判定，`nft list table <族> <表名>`
+//! 的正文里有 `redirect to :<base>` 或 `dnat to [<ip>]:<base>` 才算本实例的
+//! （[`nft_redirects_to`]）。**绝不按 `hysteria_` 前缀整表删**——那会连同机别的 hysteria
+//! 实例一起清掉。
+//!
+//! 判据都只认本实例的端口，**绝不碰另一实例的链 / 表**（v3.5.1 的「共享 cleanup 跨实例误删」
+//! 就是反例）。找不到 `iptables`/`ip6tables`/`nft` 命令则跳过；任何一步失败只记一行说明，
 //! 绝不阻塞启动（单元里的 `ExecStartPre=-` 前缀同样保证这一点）。
+//!
+//! 启动前本实例的链 / 表本来就不该存在（上一次正常退出时 hysteria 自己清掉了），所以
+//! **命中即孤儿**，不必再问「这是不是我这次要建的那一张」。
 
 use crate::sys::Host;
 use std::collections::BTreeSet;
@@ -48,6 +73,18 @@ pub const CHAIN_PREFIX: &str = "HYSTERIA-PR-";
 
 /// 两张表分别处理：链名与残留情况互不相干（事故实录）。
 pub const TABLES: [&str; 2] = ["iptables", "ip6tables"];
+
+/// hysteria 选防火墙后端的环境变量（上游 `firewallBackendEnv`）。单元里的
+/// `ExecStartPre=` 与内核本体同一份 `Environment=`，所以 `bui hy2-prestart` 读到的就是
+/// 内核会用的那个后端。
+pub const FIREWALL_BACKEND_ENV: &str = "HYSTERIA_FIREWALL_BACKEND";
+
+/// nft 后端的表名前缀（上游 `"hysteria_" + shortHash(...)`）。
+pub const NFT_TABLE_PREFIX: &str = "hysteria_";
+
+/// hysteria 只在这两族建表（上游 `nftFamiliesForAddr`）：`inet` / `arp` / `bridge` 里
+/// 同名的表不是它建的，一律不碰。
+pub const NFT_FAMILIES: [&str; 2] = ["ip", "ip6"];
 
 /// 一份 `listen:` 行解析出的本实例端口。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,9 +209,99 @@ fn cleanup_table(host: &dyn Host, ipt: &str, listen: &Listen) -> Vec<String> {
     done
 }
 
-/// 按一份 hysteria 配置清掉**该实例**残留的端口跳跃孤儿链，两张表分别处理。
-/// 返回做过的事（每行一条，进日志 / 自愈事件）；正常退出过的实例上是空 `Vec`（no-op）。
+/// 该不该清 nft 表：照 hysteria 自己的后端选择（上游 `setupUDPPortRedirectWithRunner`）。
+/// `HYSTERIA_FIREWALL_BACKEND` 钉死 iptables 时不碰 nft，其余（`nftables`/`nft`、认不出的值、
+/// 没设）都落到「PATH 上有 `nft` 就走 nft」——机器上没有 `nft` 自然也没有表可清。
+pub fn wants_nft(backend: Option<&str>, has_nft: bool) -> bool {
+    match backend.unwrap_or_default().to_ascii_lowercase().as_str() {
+        "iptables" | "ipt" => false,
+        _ => has_nft,
+    }
+}
+
+/// 从 `nft list tables` 的输出里挑出 hysteria 的表：每行 `table <族> <表名>`，
+/// 只认 [`NFT_FAMILIES`] 两族里 [`NFT_TABLE_PREFIX`] 开头的表名，保持输出顺序。
+pub fn nft_hysteria_tables(dump: &str) -> Vec<(String, String)> {
+    dump.lines()
+        .filter_map(|line| {
+            let w: Vec<&str> = line.split_whitespace().collect();
+            let ["table", family, name, ..] = w[..] else {
+                return None;
+            };
+            (NFT_FAMILIES.contains(&family) && name.starts_with(NFT_TABLE_PREFIX))
+                .then(|| (family.to_string(), name.to_string()))
+        })
+        .collect()
+}
+
+/// `nft list table <族> <表名>` 的正文里有没有「重定向到本实例 base 端口」的规则。
+///
+/// 两种形态（上游 `setupNFTablesRedirect`）：`udp dport <区间> redirect to :<base>`，
+/// 以及 `listen:` 钉了 IPv6 地址时的 `… dnat to [<ip>]:<base>`。按**词**比对而不是子串：
+/// `:4000` 是 `:40000` 的子串，子串匹配会把别的实例的表也删掉。
+pub fn nft_redirects_to(dump: &str, base: u16) -> bool {
+    let dest = format!(":{base}");
+    let w: Vec<&str> = dump.split_whitespace().collect();
+    w.windows(3).any(|t| match t {
+        ["redirect", "to", d] => *d == dest,
+        ["dnat", "to", d] => d.ends_with(&dest),
+        _ => false,
+    })
+}
+
+/// 清 nft 里属于本实例的孤儿表：`nft list tables` 枚举 → 逐张读正文按 base 端口认领 →
+/// 整表 `nft delete table`。`nft` 不在则什么都不做；任何一步失败只记一行说明。
+fn cleanup_nft(host: &dyn Host, listen: &Listen) -> Vec<String> {
+    let mut done = Vec::new();
+    if !host.which("nft") {
+        return done;
+    }
+    let Ok(list) = host.run("nft", &["list", "tables"]) else {
+        return done;
+    };
+    if !list.ok() {
+        done.push(format!(
+            "nft list tables 失败（跳过）：{}",
+            list.stderr.trim()
+        ));
+        return done;
+    }
+    for (family, name) in nft_hysteria_tables(&list.stdout) {
+        let Ok(table) = host.run("nft", &["list", "table", &family, &name]) else {
+            continue;
+        };
+        if !table.ok() || !nft_redirects_to(&table.stdout, listen.base) {
+            continue;
+        }
+        match host.run("nft", &["delete", "table", &family, &name]) {
+            Ok(out) if out.ok() => {
+                done.push(format!(
+                    "已删除 nft 表 {family} {name}（本实例端口跳跃孤儿）"
+                ));
+            }
+            Ok(out) => done.push(format!(
+                "nft delete table {family} {name} 失败（跳过）：{}",
+                out.stderr.trim()
+            )),
+            Err(e) => done.push(format!(
+                "nft delete table {family} {name} 失败（跳过）：{e}"
+            )),
+        }
+    }
+    done
+}
+
+/// 按一份 hysteria 配置清掉**该实例**残留的端口跳跃孤儿：iptables 两族的链 + nft 两族的表，
+/// 各自独立处理。返回做过的事（每行一条，进日志 / 自愈事件）；正常退出过的实例上是空
+/// `Vec`（no-op）。
 pub fn cleanup(host: &dyn Host, config: &Path) -> Vec<String> {
+    let backend = std::env::var(FIREWALL_BACKEND_ENV).ok();
+    cleanup_with(host, config, backend.as_deref())
+}
+
+/// [`cleanup`] 的本体；`backend` 是 [`FIREWALL_BACKEND_ENV`] 的值（`None` = 没设）。
+/// 单测走这里，不动进程环境（`set_var` 会影响并行跑的其它用例）。
+fn cleanup_with(host: &dyn Host, config: &Path, backend: Option<&str>) -> Vec<String> {
     let Ok(Some(bytes)) = host.read_file(config) else {
         return vec![format!("读不到 {}，跳过孤儿链清理", config.display())];
     };
@@ -184,10 +311,14 @@ pub fn cleanup(host: &dyn Host, config: &Path) -> Vec<String> {
             config.display()
         )];
     };
-    TABLES
+    let mut done: Vec<String> = TABLES
         .iter()
         .flat_map(|ipt| cleanup_table(host, ipt, &listen))
-        .collect()
+        .collect();
+    if wants_nft(backend, host.which("nft")) {
+        done.extend(cleanup_nft(host, &listen));
+    }
+    done
 }
 
 /// `bui hy2-prestart <config>`：两个 hysteria 单元的 `ExecStartPre=-`。
@@ -459,5 +590,320 @@ mod tests {
             "{done:?}"
         );
         assert_eq!(h.ops(), vec!["run:iptables -t nat -S"]);
+    }
+
+    // ── nft 后端（tizi 走的就是它）────────────────────────────────────────────
+
+    /// `nft list tables` 的真机形态：本实例（base 40000）两族各一张、另一个实例
+    /// （base 40001）一张，外加与端口跳跃无关的族与表名。
+    const NFT_TABLES: &str = "\
+table ip filter
+table inet firewalld
+table ip hysteria_390d4d8b
+table ip6 hysteria_390d4d8b
+table ip hysteria_7c1e0f2a
+table inet hysteria_deadbeef
+";
+
+    /// 本实例（住宅槽 0，base 40000）在 ip 族的表正文：`listen:` 没钉 IP ⇒ `redirect to`。
+    const NFT_RESI_V4: &str = "\
+table ip hysteria_390d4d8b {
+	chain prerouting {
+		type nat hook prerouting priority -100; policy accept;
+		udp dport 41000-45499 redirect to :40000
+	}
+	chain output {
+		type nat hook output priority -100; policy accept;
+		udp dport 41000-45499 redirect to :40000
+	}
+}
+";
+
+    /// 同一个实例在 ip6 族的表正文：`listen:` 钉了 IPv6 地址时 hysteria 改用
+    /// `dnat to [ip]:base`（上游 `setupNFTablesRedirect`）。
+    const NFT_RESI_V6: &str = "\
+table ip6 hysteria_390d4d8b {
+	chain prerouting {
+		type nat hook prerouting priority -100; policy accept;
+		ip6 daddr 2001:db8::1 udp dport 41000-45499 dnat to [2001:db8::1]:40000
+	}
+}
+";
+
+    /// 另一个住宅实例（槽 1，base 40001）的表：一个删除命令都不许收到。
+    const NFT_OTHER: &str = "\
+table ip hysteria_7c1e0f2a {
+	chain prerouting {
+		type nat hook prerouting priority -100; policy accept;
+		udp dport 45500-50000 redirect to :40001
+	}
+}
+";
+
+    fn host_with_nft() -> FakeHost {
+        let h = FakeHost::new();
+        h.with(|i| {
+            i.which.insert("nft".into());
+            i.scripted.push((
+                "nft list tables".into(),
+                crate::sys::CmdOut::success(NFT_TABLES),
+            ));
+            i.scripted.push((
+                "nft list table ip hysteria_390d4d8b".into(),
+                crate::sys::CmdOut::success(NFT_RESI_V4),
+            ));
+            i.scripted.push((
+                "nft list table ip6 hysteria_390d4d8b".into(),
+                crate::sys::CmdOut::success(NFT_RESI_V6),
+            ));
+            i.scripted.push((
+                "nft list table ip hysteria_7c1e0f2a".into(),
+                crate::sys::CmdOut::success(NFT_OTHER),
+            ));
+            i.files.insert(
+                "/opt/b-ui/config-residential.yaml".into(),
+                (resi_config().as_bytes().to_vec(), 0o600),
+            );
+        });
+        h
+    }
+
+    /// 后端探测照 hysteria 自己那一份（`setupUDPPortRedirectWithRunner`）：环境变量优先，
+    /// 认不出的值与没设一律自动探测——PATH 上有 `nft` 就是 nft 后端。
+    #[test]
+    fn the_backend_probe_matches_hysterias_own() {
+        assert!(wants_nft(None, true), "没设环境变量 + 有 nft ⇒ nft 后端");
+        assert!(!wants_nft(None, false));
+        assert!(wants_nft(Some("nftables"), true));
+        assert!(wants_nft(Some("NFT"), true), "hysteria 自己也大小写不敏感");
+        assert!(
+            !wants_nft(Some("iptables"), true),
+            "钉死 iptables 就不碰 nft"
+        );
+        assert!(!wants_nft(Some("ipt"), true));
+        assert!(wants_nft(Some("好家伙"), true), "认不出的值走自动探测");
+        assert!(
+            !wants_nft(Some("nft"), false),
+            "机器上没有 nft 就没有表可清"
+        );
+    }
+
+    /// `nft list tables` 每行是 `table <族> <表名>`：只认 hysteria 会建表的两族
+    /// （`nftFamiliesForAddr` 只返回 ip / ip6），`inet` 里同名的表不是它建的。
+    #[test]
+    fn the_table_listing_keeps_only_hysteria_tables_in_ip_and_ip6() {
+        assert_eq!(
+            nft_hysteria_tables(NFT_TABLES),
+            vec![
+                ("ip".to_string(), "hysteria_390d4d8b".to_string()),
+                ("ip6".to_string(), "hysteria_390d4d8b".to_string()),
+                ("ip".to_string(), "hysteria_7c1e0f2a".to_string()),
+            ]
+        );
+        assert_eq!(nft_hysteria_tables(""), Vec::new());
+        assert_eq!(
+            nft_hysteria_tables("garbage\ntable\ntable ip\n"),
+            Vec::new()
+        );
+    }
+
+    /// 表名里的 hash 不参与判定，按**表正文里的 base 端口**认领；比对按词而不是子串。
+    #[test]
+    fn a_table_is_claimed_by_this_instances_base_port_only() {
+        assert!(nft_redirects_to(NFT_RESI_V4, 40000));
+        assert!(
+            nft_redirects_to(NFT_RESI_V6, 40000),
+            "listen 钉了 IPv6 地址时是 dnat 形态"
+        );
+        assert!(nft_redirects_to(NFT_OTHER, 40001));
+        assert!(!nft_redirects_to(NFT_OTHER, 40000), "别的实例的表不许命中");
+        // `:4000` 是 `:40000` 的子串：子串匹配会把别人的表一起删掉
+        assert!(!nft_redirects_to(NFT_RESI_V4, 4000));
+        // 建完表就崩了的空表：没有规则可认，不动它（nft 的 `add table` 幂等，空表不致崩溃循环）
+        assert!(!nft_redirects_to(
+            "table ip hysteria_390d4d8b {\n}\n",
+            40000
+        ));
+    }
+
+    /// tizi 的真机残留形态：两族各自处理，孤儿表按 base 端口认领后整表删；
+    /// 另一个实例（base 40001）的表只被读了一次、一个删除命令都没收到。
+    #[test]
+    fn cleanup_deletes_this_instances_nft_tables_in_both_families() {
+        let h = host_with_nft();
+        let done = cleanup_with(&h, Path::new("/opt/b-ui/config-residential.yaml"), None);
+        assert_eq!(
+            done,
+            vec![
+                "已删除 nft 表 ip hysteria_390d4d8b（本实例端口跳跃孤儿）",
+                "已删除 nft 表 ip6 hysteria_390d4d8b（本实例端口跳跃孤儿）",
+            ]
+        );
+        assert_eq!(
+            h.ops(),
+            vec![
+                "run:nft list tables",
+                "run:nft list table ip hysteria_390d4d8b",
+                "run:nft delete table ip hysteria_390d4d8b",
+                "run:nft list table ip6 hysteria_390d4d8b",
+                "run:nft delete table ip6 hysteria_390d4d8b",
+                "run:nft list table ip hysteria_7c1e0f2a",
+            ]
+        );
+    }
+
+    /// 机器上没有 `nft`（只有 iptables 的老内核）→ 一个 nft 命令都不发；
+    /// 被 `HYSTERIA_FIREWALL_BACKEND=iptables` 钉在 iptables 后端时同样不碰 nft。
+    #[test]
+    fn a_machine_without_nft_never_runs_it() {
+        let h = host_with_both_tables();
+        let done = cleanup_with(&h, Path::new("/opt/b-ui/config-residential.yaml"), None);
+        assert!(h.ops().iter().all(|o| !o.contains("nft")), "{:?}", h.ops());
+        assert!(done.iter().all(|l| !l.contains("nft")), "{done:?}");
+
+        let h2 = host_with_nft();
+        assert_eq!(
+            cleanup_with(
+                &h2,
+                Path::new("/opt/b-ui/config-residential.yaml"),
+                Some("iptables")
+            ),
+            Vec::<String>::new()
+        );
+        assert_eq!(h2.ops(), Vec::<String>::new());
+    }
+
+    /// `nft list tables` 失败（没权限 / 内核没 nftables）：记一行说明就收手，不再发命令。
+    #[test]
+    fn a_failing_table_listing_is_reported_and_skipped() {
+        let h = host_with_nft();
+        h.with(|i| {
+            i.scripted.insert(
+                0,
+                (
+                    "nft list tables".into(),
+                    crate::sys::CmdOut::failure(1, "Error: Operation not permitted"),
+                ),
+            );
+        });
+        let done = cleanup_with(&h, Path::new("/opt/b-ui/config-residential.yaml"), None);
+        assert_eq!(done.len(), 1, "{done:?}");
+        assert!(
+            done[0].starts_with("nft list tables 失败（跳过）"),
+            "{done:?}"
+        );
+        assert_eq!(h.ops(), vec!["run:nft list tables"]);
+    }
+
+    /// `nft delete table` 失败（表刚被别的进程删掉 / 没权限）：记一行说明，下一张照样处理，
+    /// 绝不 panic、绝不阻塞启动。
+    #[test]
+    fn a_failing_nft_delete_is_reported_and_the_next_table_still_runs() {
+        let h = host_with_nft();
+        h.with(|i| {
+            i.scripted.insert(
+                0,
+                (
+                    "nft delete table ip hysteria_390d4d8b".into(),
+                    crate::sys::CmdOut::failure(1, "Error: No such file or directory"),
+                ),
+            );
+        });
+        let done = cleanup_with(&h, Path::new("/opt/b-ui/config-residential.yaml"), None);
+        assert_eq!(
+            done,
+            vec![
+                "nft delete table ip hysteria_390d4d8b 失败（跳过）：Error: No such file or directory",
+                "已删除 nft 表 ip6 hysteria_390d4d8b（本实例端口跳跃孤儿）",
+            ]
+        );
+        // `bui hy2-prestart` 永远退 0
+        assert!(run(&h, Path::new("/opt/b-ui/config-residential.yaml")).is_ok());
+    }
+
+    /// v3 的直连实例（`listen: :10000,20000-30000`）与住宅实例（`:40000,41000-50000`）
+    /// 留下的 iptables 孤儿链，两族同形。
+    const V3_IPT: &str = "\
+-P PREROUTING ACCEPT
+-N HYSTERIA-PR-d1d1d1d1
+-N HYSTERIA-PR-40404040
+-A PREROUTING -p udp -m udp --dport 20000:30000 -j HYSTERIA-PR-d1d1d1d1
+-A HYSTERIA-PR-d1d1d1d1 -p udp -j REDIRECT --to-ports 10000
+-A PREROUTING -p udp -m udp --dport 41000:50000 -j HYSTERIA-PR-40404040
+-A HYSTERIA-PR-40404040 -p udp -j REDIRECT --to-ports 40000
+";
+
+    const V3_NFT_TABLES: &str = "\
+table ip hysteria_1a1a1a1a
+table ip6 hysteria_2b2b2b2b
+table ip hysteria_3c3c3c3c
+table ip6 hysteria_4d4d4d4d
+";
+
+    /// v3 留下的端口跳跃孤儿只有两种形状：直连 `20000-30000 → :10000`、住宅
+    /// `41000-50000 → :40000`，两族、两种后端。`bui_schema::v3::import` 读的就是 v3 自己那两行
+    /// `listen:`，两个 base 端口原样进期望态（直连 = `ports.hy2`，住宅槽 0 = `ports.hy2_resi`），
+    /// 所以两个 v4 实例各自的 prestart 按 base 判定就能全部认领。
+    ///
+    /// 这是 4.0.1 删掉 `import_v3::flush_v3_portjump_rules` 的依据：那一份按 `HYSTERIA-PR-` /
+    /// `hysteria_` **前缀整表删**，会连同机别的 hysteria 实例一起清（v3.5.1 的老反例），
+    /// 而本实例 prestart 的按 base 清理不但覆盖同样的形状，还每次启动都跑。
+    #[test]
+    fn every_v3_leftover_shape_is_claimed_by_the_matching_instance_prestart() {
+        let h = FakeHost::new();
+        h.with(|i| {
+            for c in ["iptables", "ip6tables", "nft"] {
+                i.which.insert(c.into());
+            }
+            for c in ["iptables", "ip6tables"] {
+                i.scripted.push((
+                    format!("{c} -t nat -S"),
+                    crate::sys::CmdOut::success(V3_IPT),
+                ));
+            }
+            i.scripted.push((
+                "nft list tables".into(),
+                crate::sys::CmdOut::success(V3_NFT_TABLES),
+            ));
+            for (family, table, hop, base) in [
+                ("ip", "hysteria_1a1a1a1a", "20000-30000", 10000),
+                ("ip6", "hysteria_2b2b2b2b", "20000-30000", 10000),
+                ("ip", "hysteria_3c3c3c3c", "41000-50000", 40000),
+                ("ip6", "hysteria_4d4d4d4d", "41000-50000", 40000),
+            ] {
+                i.scripted.push((
+                    format!("nft list table {family} {table}"),
+                    crate::sys::CmdOut::success(&format!(
+                        "table {family} {table} {{\n\tchain prerouting {{\n\t\tudp dport {hop} \
+                         redirect to :{base}\n\t}}\n}}\n"
+                    )),
+                ));
+            }
+            i.files.insert(
+                "/opt/b-ui/config.yaml".into(),
+                (b"listen: :10000,20000-30000\n".to_vec(), 0o600),
+            );
+            i.files.insert(
+                "/opt/b-ui/config-residential.yaml".into(),
+                (b"listen: :40000,41000-50000\n".to_vec(), 0o600),
+            );
+        });
+        // 两个 v4 实例各自的 ExecStartPre
+        for cfg in ["/opt/b-ui/config.yaml", "/opt/b-ui/config-residential.yaml"] {
+            cleanup_with(&h, Path::new(cfg), None);
+        }
+        let ops = h.ops();
+        for gone in [
+            "run:iptables -t nat -X HYSTERIA-PR-d1d1d1d1",
+            "run:iptables -t nat -X HYSTERIA-PR-40404040",
+            "run:ip6tables -t nat -X HYSTERIA-PR-d1d1d1d1",
+            "run:ip6tables -t nat -X HYSTERIA-PR-40404040",
+            "run:nft delete table ip hysteria_1a1a1a1a",
+            "run:nft delete table ip6 hysteria_2b2b2b2b",
+            "run:nft delete table ip hysteria_3c3c3c3c",
+            "run:nft delete table ip6 hysteria_4d4d4d4d",
+        ] {
+            assert!(ops.iter().any(|o| o == gone), "没清掉 {gone}：{ops:?}");
+        }
     }
 }
