@@ -184,8 +184,17 @@ async fn dispatch(command: Command) -> Result<()> {
             .await
         }
         Command::AuthHook { .. } => unreachable!("auth-hook 已在 main 里提前返回"),
-        Command::Hy2Prestart { config } => {
-            modules::portjump::run(&sys::real::RealHost::new(), &config)
+        Command::Hy2Prestart { config, force } => {
+            // 护栏（4.0.1）：该实例正在运行时清理会删掉它**现役**的端口跳跃规则，所以打印
+            // 一行中文并以退出码 2 结束、什么都不清（`bui upgrade` 的降级守卫同一口径）。
+            // systemd 跑 `ExecStartPre=` 时单元是 `activating`，走不到这一支。
+            match modules::portjump::run(&sys::real::RealHost::new(), &config, force) {
+                Err(e) if e.is::<modules::portjump::InstanceRunning>() => {
+                    eprintln!("{e}");
+                    std::process::exit(2);
+                }
+                r => r,
+            }
         }
         Command::Residential { cmd } => {
             modules::residential::cli::run(cmd, PathBuf::from(paths::SOCKET_PATH)).await
