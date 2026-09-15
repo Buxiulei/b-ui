@@ -196,6 +196,9 @@ fn read_snapshot(path: &Path, deadline: std::time::Instant) -> Option<Snapshot> 
 ///
 /// http 鉴权（[`crate::modules::panel::auth_http`]）调的是同一个函数：m1 step6 与 m3 验收
 /// 都按这行格式断言，两条路径写出来的必须一模一样。
+///
+/// 已知：[`truncate_in_place`] 的读→截断→重写与并发追加之间仍有竞态，截断瞬间的并发追加
+/// 可能丢行；行本身不会再交错。
 pub fn log_line(
     paths: &Paths,
     now: time::OffsetDateTime,
@@ -220,7 +223,11 @@ pub fn log_line(
         return;
     };
     let ts = crate::util::fmt_rfc3339(now);
-    let _ = writeln!(f, "{ts} {addr} {username} {result}");
+    // 整行先 format 出来再**一次** write_all：O_APPEND 下单次 write 的偏移由内核原子定位，
+    // 且单次 write 的数据不与另一次 write 的数据交错。`writeln!` 走的 `write_fmt` 会把格式串
+    // 的字面片段与每个参数拆成多次 write(2)，守护进程内并发鉴权时两行就在字段级互穿
+    // （2026-09-13 与 09-15 生产实测：`<ts><ts>  <addr><addr>  <user><user>  allowallow`）。
+    let _ = f.write_all(format!("{ts} {addr} {username} {result}\n").as_bytes());
     let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
 }
 
@@ -519,6 +526,67 @@ mod tests {
                 .mode()
                 & 0o777,
             0o600
+        );
+    }
+
+    /// `^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$`（不引 regex，手写这一处判据）。
+    fn is_rfc3339_z(s: &str) -> bool {
+        let b = s.as_bytes();
+        b.len() == 20
+            && b[4] == b'-'
+            && b[7] == b'-'
+            && b[10] == b'T'
+            && b[13] == b':'
+            && b[16] == b':'
+            && b[19] == b'Z'
+            && [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18]
+                .iter()
+                .all(|&i| b[i].is_ascii_digit())
+    }
+
+    /// 一行必须正好是四个非空、不含空格的字段，第一个是 RFC3339。
+    fn is_well_formed(line: &str) -> bool {
+        let f: Vec<&str> = line.split(' ').collect();
+        f.len() == 4 && f.iter().all(|x| !x.is_empty()) && is_rfc3339_z(f[0])
+    }
+
+    /// 守护进程内并发鉴权（多个连接同时到达）时，两条行不许在字段级交错。
+    ///
+    /// 2026-09-13 与 09-15 生产实测的坏行形如
+    /// `<ts><ts>  <addr><addr>  <user><user>  allowallow`，或 addr 字段为空：
+    /// `writeln!` 的 `write_fmt` 把字面片段与每个参数分成多次 `write(2)`，O_APPEND 只保证
+    /// **单次** write 原子，分段写就会两行互相穿插。m1/m3 验收脚本与运维排查都按「一行四字段」读它。
+    #[test]
+    fn concurrent_log_lines_never_interleave() {
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 300;
+        let d = tempfile::tempdir().unwrap();
+        let p = paths(&d);
+        std::thread::scope(|s| {
+            for t in 0..THREADS {
+                let p = &p;
+                s.spawn(move || {
+                    // 字段长度刻意不等长，交错的坏行才好认
+                    let username = format!("{}{t}", "u".repeat(t + 1));
+                    for i in 0..PER_THREAD {
+                        let addr = format!("203.0.113.{}:{}", t + 1, 1000 + i * (t + 1));
+                        log_line(p, t0(), &addr, &username, "allow");
+                    }
+                });
+            }
+        });
+
+        let log = std::fs::read_to_string(log_path(&p)).unwrap();
+        let bad: Vec<&str> = log.lines().filter(|l| !is_well_formed(l)).take(5).collect();
+        assert!(
+            bad.is_empty(),
+            "并发追加写出了字段级交错的坏行（前 {} 条样例）：{bad:#?}",
+            bad.len()
+        );
+        assert_eq!(
+            log.lines().count(),
+            THREADS * PER_THREAD,
+            "每次调用恰好一行，不许丢也不许多"
         );
     }
 }
