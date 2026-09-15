@@ -46,9 +46,12 @@ pub struct Fetched {
 
 /// 脱敏：只留到 `://` 为止。`hysteria2://` 的 userinfo 段就是密码，
 /// 留前 24 字符会把 `hysteria2://alice:hy2-pw` 原样打进日志。
+///
+/// 留下的这段是用户贴的原文，菜单 [3] 会原样打在失败行里：先净化（控制字符、双向格式符
+/// 换成 `?`），误粘进来的颜色码里的 ESC 才不会写进 transcript 与终端。
 pub fn scheme_only(line: &str) -> String {
     match line.split_once("://") {
-        Some((scheme, _)) => format!("{scheme}://"),
+        Some((scheme, _)) => format!("{}://", crate::menu::sanitize(scheme)),
         None => NO_SCHEME.to_string(),
     }
 }
@@ -82,6 +85,24 @@ pub fn username_from_url(url: &str) -> String {
                 .unwrap_or(""),
         ),
         None => String::new(),
+    }
+}
+
+/// 疑似订阅 token：恰好 32 位十六进制（不分大小写）。
+///
+/// 面板订阅 token 化之后，链接末段是 token 而不是用户名。它等价订阅凭据，不能拿来当
+/// profile 名（名字会出现在列表、菜单、确认块与「上次：」行里，截图就带出去了）。
+pub fn looks_like_token(seg: &str) -> bool {
+    seg.len() == 32 && seg.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// 取来的用户名只用于给 profile 命名：疑似 token 的一律丢掉，交给
+/// [`crate::profiles::profile_name`] 回落成「主机 + kind」。
+fn display_user(user: String) -> String {
+    if looks_like_token(&user) {
+        String::new()
+    } else {
+        user
     }
 }
 
@@ -172,7 +193,8 @@ pub fn from_panel<N: Net>(net: &N, base_url: &str, user: &str) -> Result<Fetched
         return Err(Error::msg("面板返回的节点列表为空：该用户可能没有任何权益"));
     }
     Ok(Fetched {
-        user: p.user,
+        // 服务端承诺回填人名；万一给的是 token 也不拿它命名
+        user: display_user(p.user),
         split: p.split,
         nodes: p.nodes,
         skipped: Vec::new(),
@@ -180,6 +202,8 @@ pub fn from_panel<N: Net>(net: &N, base_url: &str, user: &str) -> Result<Fetched
 }
 
 /// 订阅来源：base64 的 URI 列表，拿不到分流信息，回落 [`default_split`]。
+///
+/// 用户名取 URL 末段；末段疑似 token（[`looks_like_token`]）时留空，名字不露 token。
 pub fn from_subscription<N: Net>(net: &N, url: &str) -> Result<Fetched> {
     let body = net.text(url, FETCH_TIMEOUT)?;
     let text = decode_base64_body(&body)?;
@@ -191,7 +215,7 @@ pub fn from_subscription<N: Net>(net: &N, url: &str) -> Result<Fetched> {
             f.skipped.len()
         )));
     }
-    f.user = username_from_url(url);
+    f.user = display_user(username_from_url(url));
     Ok(f)
 }
 
@@ -276,6 +300,9 @@ mod tests {
     use base64::Engine as _;
     use pretty_assertions::assert_eq;
 
+    /// 示例 token：明显是假的。
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
     fn payload() -> NodesPayload {
         NodesPayload {
             user: "alice".into(),
@@ -348,6 +375,57 @@ mod tests {
         assert!(f.skipped.is_empty());
     }
 
+    /// 面板订阅 token 化之后末段是 32 位十六进制 token：拿它当用户名，profile 名就成了
+    /// `<token>-<kind>`，列表截图就把订阅凭据带出去了。认不出人名就留空，交给
+    /// `profile_name` 回落成「主机 + kind」。
+    #[test]
+    fn from_subscription_never_takes_a_token_as_the_username() {
+        let uri = "hysteria2://alice:hy2-pw@panel.example.com:10000/?sni=panel.example.com#a";
+        for url in [
+            format!("https://panel.example.com/api/sub/{TOKEN}"),
+            format!("https://panel.example.com/api/sub/{TOKEN}/#alice"),
+            format!(
+                "https://sub.example.com/link/{}",
+                TOKEN.to_ascii_uppercase()
+            ),
+        ] {
+            let n = FakeNet::new();
+            n.route(&url, FakeReply::Text(uri.into()));
+            let f = from_subscription(&n, &url).unwrap();
+            assert_eq!(f.user, "", "{url}");
+        }
+        // 不是 32 位十六进制的末段照旧当用户名
+        for (seg, user) in [("alice", "alice"), (&TOKEN[..31], &TOKEN[..31])] {
+            let url = format!("https://panel.example.com/api/sub/{seg}");
+            let n = FakeNet::new();
+            n.route(&url, FakeReply::Text(uri.into()));
+            assert_eq!(from_subscription(&n, &url).unwrap().user, user, "{url}");
+        }
+    }
+
+    #[test]
+    fn from_panel_never_takes_a_token_as_the_username() {
+        // 服务端承诺回填人名；万一载荷里是 token，也不能拿它命名
+        let n = FakeNet::new();
+        let url = format!("https://panel.example.com/api/nodes/{TOKEN}");
+        let mut p = payload();
+        p.user = TOKEN.into();
+        n.route(&url, FakeReply::Text(serde_json::to_string(&p).unwrap()));
+        let f = from_panel(&n, "https://panel.example.com", TOKEN).unwrap();
+        assert_eq!(f.user, "");
+    }
+
+    #[test]
+    fn looks_like_token_is_exactly_32_hex_digits() {
+        assert!(looks_like_token(TOKEN));
+        assert!(looks_like_token(&TOKEN.to_ascii_uppercase()));
+        assert!(!looks_like_token(&TOKEN[..31]));
+        assert!(!looks_like_token(&format!("{TOKEN}0")));
+        assert!(!looks_like_token("0123456789abcdef0123456789abcdeg"));
+        assert!(!looks_like_token("alice"));
+        assert!(!looks_like_token(""));
+    }
+
     #[test]
     fn from_subscription_skips_unparsable_lines_and_keeps_the_rest() {
         let body = "hysteria2://alice:hy2-pw@panel.example.com:10000/?sni=panel.example.com#a\n\
@@ -363,6 +441,14 @@ mod tests {
         assert_eq!(f.nodes.len(), 1);
         assert_eq!(f.skipped.len(), 2, "空行忽略不计，ss:// 与注释行计为跳过");
         assert_eq!(f.skipped, vec!["ss://", NO_SCHEME]);
+    }
+
+    #[test]
+    fn a_skipped_scheme_never_carries_control_bytes() {
+        // 误粘进来的颜色码在 `://` 前面：scheme 原样回显会把 ESC 写进 transcript 与终端
+        assert_eq!(scheme_only("\u{1b}[31mss://secret@h:1"), "?[31mss://");
+        assert_eq!(scheme_only("a\u{7f}b\u{202e}c://x"), "a?b?c://");
+        assert_eq!(scheme_only("ss://x"), "ss://", "正常的 scheme 原样");
     }
 
     #[test]

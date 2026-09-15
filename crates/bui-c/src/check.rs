@@ -1,11 +1,14 @@
 //! `bui-c check`：每分钟由 `bui-c.timer` 拉起的一次性巡检。
 //!
 //! 三件事：204 探测（socks 模式经本地 inbound，TUN 模式直连）+ TUN 接口与默认路由核对、
-//! 失败时按 1/2/4 分钟退避重启数据面单元、判定「今天该不该自更新」；
+//! 失败时按 1/2/4 分钟退避重启数据面单元（只有重启这一段持进程锁，拿不到就跳过本轮）、
+//! 判定「今天该不该自更新」；
 //! 外加 TUN 模式下幂等重放 `bui-tun` 的两条 UFW 规则（`ufw reset` 会把它们清掉）。
 //! 状态落在 `/opt/bui-c/runtime.json`（0600），丢了能从零重建。
 
+use crate::delete;
 use crate::engine::Engine;
+use crate::lock::{self, How, LockGuard};
 use crate::net::{Net, Via};
 use crate::paths::{Paths, TUN_IFACE, UNIT_MAIN};
 use crate::profiles::{Mode, Profiles};
@@ -36,11 +39,39 @@ pub struct Runtime {
     pub last_update_attempt_at: Option<i64>,
     /// 已加过 bui-tun 放行规则（T12 写，本模块只读写字段）。
     pub ufw_rules: bool,
-    /// 上一次检查更新的结论：manifest 版本与本机不同。菜单 `[6] ★ 有新版` 读它，
-    /// 不为了渲染一屏菜单去联网。由 `update` 子命令与巡检里的自更新写。
+    /// 上一次检查更新的结论：有能装的新东西（`cli::new_version_pending`：自身有新版或同版本新构建，
+    /// 或内核要换）。主菜单 `[7] 更新与维护 ★` 读它，不为了渲染一屏菜单去联网。由 `update` 子命令、
+    /// 菜单 [7] → [1] 与巡检里的自更新写。
     pub update_available: bool,
     /// 上一次检查更新的时间（epoch 秒），与 `update_available` 同时写。
     pub update_checked_at: Option<i64>,
+    /// 上一次检查更新时 manifest 的版本号，与 `update_available` 同时写；[7] 子页的
+    /// 「上次检查   有新版 4.0.1（2 小时前）」读它（spec §8.1）。旧版本写的文件没有这个键
+    /// （结构体级 `#[serde(default)]` 兜住，与下面两个 T12c 字段同一写法）。
+    pub update_version: Option<String>,
+    /// 最近一次中断收敛的结果（spec §0.2 R12，持锁写）：菜单进门时在「上次：」行显示一次，
+    /// 然后清掉。巡检只写不清。
+    pub last_converge: Option<LastConverge>,
+    /// 收敛失败时节点设置与机器现状的样子（`cli::converge_key`：节点快照 + 内核、主单元在跑、
+    /// 主单元文件、`config.json` 在不在）：样子不变就不再按「单元 / 配置对不上」自动重试，免得
+    /// 每分钟收拾一次（R12）；原因变了（内核装回来、服务被停掉）再试一次。`pending.json` 触发的
+    /// 收敛不受它限制——那个文件收拾过就删，本来就只有一次。收敛成功、或巡检发现机器已被人修好
+    /// （不再对不上）时清掉。
+    pub converge_failed: Option<String>,
+}
+
+/// 一次中断收敛的结果（spec §0.2 R12）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct LastConverge {
+    /// 收敛的时间（epoch 秒）。
+    pub at: i64,
+    pub ok: bool,
+    /// 失败原因；成功时为空。
+    pub msg: String,
+    /// 是被 `pending.json`（删除做到一半）触发的：决定说「上次的删除没做完」还是「代理与节点
+    /// 列表对不上」——没有删除时说前一句是错的（例如首次导入时内核没装上）。
+    pub after_delete: bool,
 }
 
 impl Runtime {
@@ -92,11 +123,16 @@ pub enum Verdict {
     Restarted {
         failures: Vec<Failure>,
         next_backoff_min: u64,
+        /// TUN 模式下重启后等接口的结果（同一把锁里等的）；SOCKS 模式没有接口可等，为 `None`。
+        tun_ready: Option<bool>,
     },
     Waiting {
         failures: Vec<Failure>,
         remaining_s: i64,
     },
+    /// 要重启时锁被别的 bui-c 占着，或拿到锁后发现节点设置已经被改过：本轮跳过，
+    /// 不重启、不写 `runtime.json`（spec §8.3、§5.9）。
+    Busy,
 }
 
 /// 退避档位（分钟）：第 0/1/≥2 档分别 1/2/4。
@@ -116,20 +152,24 @@ pub fn wait_seconds(fail_streak: u32) -> i64 {
     backoff_minutes(fail_streak.saturating_sub(1)) as i64 * 60
 }
 
+/// 探测走哪条腿：TUN 已接管全局路由，直连探测就是经隧道；SOCKS 模式必须经本地 inbound
+/// 才验证得到隧道。巡检与菜单 `[5]`（[`crate::nettest`]）共用这一处（spec §6.6）。
+pub fn via_for(prof: &Profiles) -> Via {
+    match prof.mode {
+        Mode::Tun => Via::Direct,
+        Mode::Socks => Via::Socks5 {
+            port: prof.socks_port,
+        },
+    }
+}
+
 /// 逐项探测，收集**全部**失败项（不短路：日志里要能一眼看出是单元没起还是路由没接管）。
 pub fn probe<S: Sys, N: Net>(sys: &S, net: &N, paths: &Paths, prof: &Profiles) -> Vec<Failure> {
     let mut out = Vec::new();
     if !systemd::is_active(sys, UNIT_MAIN) {
         out.push(Failure::UnitDown);
     }
-    let via = match prof.mode {
-        // TUN 已接管全局路由，直连探测就是经隧道；socks 模式必须经本地 inbound 才验证得到隧道
-        Mode::Tun => Via::Direct,
-        Mode::Socks => Via::Socks5 {
-            port: prof.socks_port,
-        },
-    };
-    match net.status(PROBE_URL, via, PROBE_TIMEOUT) {
+    match net.status(PROBE_URL, via_for(prof), PROBE_TIMEOUT) {
         Ok(204) => {}
         Ok(code) => out.push(Failure::Probe { got: Some(code) }),
         Err(_) => out.push(Failure::Probe { got: None }),
@@ -146,27 +186,48 @@ pub fn probe<S: Sys, N: Net>(sys: &S, net: &N, paths: &Paths, prof: &Profiles) -
     out
 }
 
-/// 一次巡检（`bui-c.timer`）：探测 → 清零或退避重启。
+/// 探测之后怎么办（[`decide`] 的结论）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Decision {
+    /// 各项都好：清零连击（有的话），不拿锁。
+    Healthy,
+    /// 还在退避窗口里：等，不拿锁。
+    Wait {
+        failures: Vec<Failure>,
+        remaining_s: i64,
+    },
+    /// 该重启了：只试一次锁，拿到了才重启。
+    Restart { failures: Vec<Failure> },
+}
+
+/// 纯函数：探测结果 + 运行时记账 → 这一轮做什么。退避窗口按 [`wait_seconds`] 算，从上次重启起。
+pub fn decide(rt: &Runtime, now: i64, failures: Vec<Failure>) -> Decision {
+    if failures.is_empty() {
+        return Decision::Healthy;
+    }
+    if let Some(last) = rt.last_restart_at {
+        let (elapsed, wait_s) = (now - last, wait_seconds(rt.fail_streak));
+        if elapsed < wait_s {
+            return Decision::Wait {
+                failures,
+                remaining_s: wait_s - elapsed,
+            };
+        }
+    }
+    Decision::Restart { failures }
+}
+
+/// 一次巡检（`bui-c.timer`，spec §8.3、§5.9）：探测（锁外）→ [`decide`] → 要重启时**只试一次锁**。
+///
+/// 拿不到锁返回 [`Verdict::Busy`]，不重启、不写 `runtime.json`。拿到锁后重读 `profiles.json`，
+/// 与探测时的完整快照（节点名、active、mode、两个端口）比，任何一项变了也是 `Busy`：别人刚 apply
+/// 好的服务，不能拿旧设置的探测结果再重启一次（§0.2 R11）。重启与等 TUN 就绪都在这把锁里。
 pub fn run<S: Sys, N: Net>(sys: &S, net: &N, paths: &Paths) -> Result<Verdict> {
-    run_with(sys, net, paths, true)
-}
-
-/// 菜单 `[5]` 的手动检查：发现异常就重启，不等退避窗口（人就在跟前，点了就是要修）。
-/// 这次重启照样记进 `runtime.json`，timer 之后的退避从它算起。
-pub fn run_manual<S: Sys, N: Net>(sys: &S, net: &N, paths: &Paths) -> Result<Verdict> {
-    run_with(sys, net, paths, false)
-}
-
-fn run_with<S: Sys, N: Net>(
-    sys: &S,
-    net: &N,
-    paths: &Paths,
-    respect_backoff: bool,
-) -> Result<Verdict> {
     let prof = Profiles::load(sys, paths)?;
     if prof.active_profile().is_none() {
         return Ok(Verdict::NoProfile);
     }
+    let seen = delete::snapshot(&prof);
     let mut rt = Runtime::load(sys, paths);
     let now = sys.now().unix_timestamp();
 
@@ -181,33 +242,67 @@ fn run_with<S: Sys, N: Net>(
         }
     }
 
-    let failures = probe(sys, net, paths, &prof);
-    if failures.is_empty() {
-        if rt.fail_streak != 0 {
-            rt.fail_streak = 0;
-            rt.save(sys, paths)?;
+    let failures = match decide(&rt, now, probe(sys, net, paths, &prof)) {
+        Decision::Healthy => {
+            if rt.fail_streak != 0 {
+                rt.fail_streak = 0;
+                rt.save(sys, paths)?;
+            }
+            return Ok(Verdict::Ok);
         }
-        return Ok(Verdict::Ok);
-    }
-
-    let wait_s = wait_seconds(rt.fail_streak);
-    if let Some(last) = rt.last_restart_at.filter(|_| respect_backoff) {
-        let elapsed = now - last;
-        if elapsed < wait_s {
+        Decision::Wait {
+            failures,
+            remaining_s,
+        } => {
             return Ok(Verdict::Waiting {
                 failures,
-                remaining_s: wait_s - elapsed,
-            });
+                remaining_s,
+            })
+        }
+        Decision::Restart { failures } => failures,
+    };
+
+    let Some(g) = lock::acquire(sys, paths, How::Once)? else {
+        tracing::info!("另一个 bui-c 操作进行中，本轮巡检跳过");
+        return Ok(Verdict::Busy);
+    };
+    let fresh = Profiles::load(sys, paths)?;
+    if delete::snapshot(&fresh) != seen {
+        tracing::info!("节点设置在探测之后被改过，本轮巡检跳过");
+        return Ok(Verdict::Busy);
+    }
+    let mut v = restart(sys, paths, failures, &g)?;
+    if fresh.mode == Mode::Tun {
+        // is-active 在 exec 之后立刻为真，接口还没起来：在同一把锁里等（最多 5 秒）
+        let ready = Engine::new(sys, paths).wait_tun_ready();
+        if let Verdict::Restarted { tun_ready, .. } = &mut v {
+            *tun_ready = Some(ready);
         }
     }
+    Ok(v)
+}
+
+/// 巡检的 restart 段（持锁，spec §0.2 R11）：重启主单元，记一次连击与重启时间。不管退避——
+/// 退避由调用方判（巡检经 [`decide`]；菜单 `[5]` 人就在跟前，点了就是要修）。`runtime.json`
+/// 在锁里重读：刚才别的会话记下的重启也要算进连击，timer 之后的退避从这次算起。
+///
+/// 只重启、不等就绪：巡检在 [`run`] 里等 TUN，菜单 `[5]` 按模式等（SOCKS 等端口）。
+pub fn restart<S: Sys>(
+    sys: &S,
+    paths: &Paths,
+    failures: Vec<Failure>,
+    _: &LockGuard,
+) -> Result<Verdict> {
     systemd::restart(sys, UNIT_MAIN)?;
+    let mut rt = Runtime::load(sys, paths);
     rt.fail_streak = rt.fail_streak.saturating_add(1);
-    rt.last_restart_at = Some(now);
+    rt.last_restart_at = Some(sys.now().unix_timestamp());
     rt.save(sys, paths)?;
     // 报的就是「这次重启之后要等几分钟」，与 wait_seconds 同一个数
     Ok(Verdict::Restarted {
         failures,
         next_backoff_min: (wait_seconds(rt.fail_streak) / 60) as u64,
+        tun_ready: None,
     })
 }
 
@@ -279,6 +374,14 @@ mod tests {
             Failure::TunNoDefaultRoute.to_string(),
             "默认路由没有指向 bui-tun"
         );
+    }
+
+    #[test]
+    fn via_for_goes_direct_under_tun_and_through_the_local_socks_port_otherwise() {
+        assert_eq!(via_for(&profiles_tun()), Via::Direct);
+        let mut p = profiles_socks();
+        p.socks_port = 10808;
+        assert_eq!(via_for(&p), Via::Socks5 { port: 10808 });
     }
 
     #[test]
@@ -564,10 +667,10 @@ mod tests {
         assert_eq!(Runtime::load(&s, &paths()).fail_streak, 3);
     }
 
-    /// 菜单 `[5]` 的手动检查：人就在跟前，发现异常就重启，不理 timer 的退避窗口；
+    /// 菜单 `[5]` 的修复直接调 [`restart`]：人就在跟前，发现异常就重启，不理 timer 的退避窗口；
     /// 但照样记下这次重启，timer 接下来仍按连击退避。
     #[test]
-    fn manual_run_restarts_inside_the_backoff_window_and_still_records_it() {
+    fn a_locked_restart_ignores_the_backoff_window_and_still_records_it() {
         let s = FakeSys::new();
         let n = FakeNet::new();
         profiles_socks().save(&s, &paths()).unwrap();
@@ -585,8 +688,19 @@ mod tests {
             Verdict::Restarted { .. }
         ));
         s.advance(30); // 还在 1 分钟窗口里：timer 会等，手动不等
-        let v = run_manual(&s, &n, &paths()).unwrap();
-        assert!(matches!(v, Verdict::Restarted { .. }), "{v:?}");
+        let g = lock::acquire(&s, &paths(), How::Once).unwrap().unwrap();
+        let v = restart(&s, &paths(), Vec::new(), &g).unwrap();
+        drop(g);
+        assert!(
+            matches!(
+                v,
+                Verdict::Restarted {
+                    next_backoff_min: 2,
+                    ..
+                }
+            ),
+            "{v:?}"
+        );
         assert_eq!(restarts(), 2);
         let rt = Runtime::load(&s, &paths());
         assert_eq!(rt.fail_streak, 2, "手动重启也算一次连击");
@@ -600,10 +714,140 @@ mod tests {
         ));
         assert_eq!(restarts(), 2);
 
-        // 一切正常时手动检查照样是 Ok，没有节点照样跳过
+        // 重启本身失败：什么都不记，错误原样交回
+        let s = FakeSys::new();
+        s.reply("systemctl restart bui-c.service", 1, "");
+        let g = lock::acquire(&s, &paths(), How::Once).unwrap().unwrap();
+        assert!(restart(&s, &paths(), Vec::new(), &g).is_err());
+        assert_eq!(Runtime::load(&s, &paths()), Runtime::default());
+        assert_eq!(s.writes("/opt/bui-c/runtime.json"), 0);
+    }
+
+    #[test]
+    fn decide_is_healthy_waits_inside_the_window_and_restarts_after_it() {
+        let rt = Runtime {
+            fail_streak: 1,
+            last_restart_at: Some(1_000),
+            ..Runtime::default()
+        };
+        let f = || vec![Failure::UnitDown];
+        assert_eq!(decide(&rt, 1_030, Vec::new()), Decision::Healthy);
+        assert_eq!(
+            decide(&rt, 1_030, f()),
+            Decision::Wait {
+                failures: f(),
+                remaining_s: 30
+            }
+        );
+        assert_eq!(decide(&rt, 1_060, f()), Decision::Restart { failures: f() });
+        assert_eq!(
+            decide(&Runtime::default(), 0, f()),
+            Decision::Restart { failures: f() },
+            "从没重启过：第一次失败立刻重启"
+        );
+    }
+
+    /// 一台要重启的 SOCKS 机器：单元没在跑、探测不通。
+    fn broken_socks(s: &FakeSys, n: &FakeNet) {
+        s.put("/opt/bui-c/bin/sing-box", "ELF");
+        s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        n.route(PROBE_URL, FakeReply::Fail("no route".into()));
+        profiles_socks().save(s, &paths()).unwrap();
+    }
+
+    #[test]
+    fn the_timer_check_returns_busy_and_writes_nothing_when_locked() {
         let s = FakeSys::new();
         let n = FakeNet::new();
-        assert_eq!(run_manual(&s, &n, &paths()).unwrap(), Verdict::NoProfile);
+        broken_socks(&s, &n);
+        s.lock_busy(u32::MAX);
+        let before = s.writes("/opt/bui-c/runtime.json");
+        assert_eq!(run(&s, &n, &paths()).unwrap(), Verdict::Busy);
+        assert!(
+            !s.called("systemctl restart bui-c.service"),
+            "锁被占着就不重启：{:?}",
+            s.calls()
+        );
+        assert_eq!(
+            s.writes("/opt/bui-c/runtime.json"),
+            before,
+            "不写 runtime.json、不动 fail_streak"
+        );
+        assert!(s.sleeps().is_empty(), "巡检只试一次，不等锁");
+        // 锁放开之后的下一轮照常重启：Busy 没有留下任何会挡住它的记账
+        s.lock_busy(0);
+        assert!(matches!(
+            run(&s, &n, &paths()).unwrap(),
+            Verdict::Restarted { .. }
+        ));
+    }
+
+    #[test]
+    fn the_timer_check_skips_when_the_snapshot_changed_under_it() {
+        // 探测时是 SOCKS；拿到锁之前另一个会话把它切成了 TUN（刚 apply 好）。拿旧模式的探测结果
+        // 再重启一次，只会把刚切好的服务打断（spec §0.2 R11）
+        let s = FakeSys::new();
+        let n = FakeNet::new();
+        broken_socks(&s, &n);
+        let tun = String::from_utf8(serde_json::to_vec_pretty(&profiles_tun()).unwrap()).unwrap();
+        s.stage_on_lock("/opt/bui-c/profiles.json", &tun);
+        let before = s.writes("/opt/bui-c/runtime.json");
+        assert_eq!(run(&s, &n, &paths()).unwrap(), Verdict::Busy);
+        assert!(
+            !s.called("systemctl restart bui-c.service"),
+            "{:?}",
+            s.calls()
+        );
+        assert_eq!(s.writes("/opt/bui-c/runtime.json"), before);
+        let calls = s.calls();
+        let lock = calls.iter().position(|c| c == "lock").expect("拿过锁");
+        let unlock = calls.iter().position(|c| c == "unlock").expect("放了锁");
+        assert!(lock < unlock, "{calls:?}");
+
+        // 只改了端口也算变了：快照是完整的（节点名、active、mode、socks_port、http_port）
+        let s = FakeSys::new();
+        let n = FakeNet::new();
+        broken_socks(&s, &n);
+        let mut moved = profiles_socks();
+        moved.http_port += 1;
+        let moved = String::from_utf8(serde_json::to_vec_pretty(&moved).unwrap()).unwrap();
+        s.stage_on_lock("/opt/bui-c/profiles.json", &moved);
+        assert_eq!(run(&s, &n, &paths()).unwrap(), Verdict::Busy);
+        assert!(!s.called("systemctl restart bui-c.service"));
+    }
+
+    #[test]
+    fn the_timer_restart_and_the_tun_wait_happen_inside_the_lock() {
+        let s = FakeSys::new();
+        let n = FakeNet::new();
+        s.put("/opt/bui-c/bin/sing-box", "ELF");
+        s.reply("systemctl is-active --quiet bui-c.service", 0, "");
+        s.reply("ip link show bui-tun", 0, "5: bui-tun");
+        n.route(PROBE_URL, FakeReply::Status(502));
+        profiles_tun().save(&s, &paths()).unwrap();
+        let v = run(&s, &n, &paths()).unwrap();
+        assert!(
+            matches!(
+                v,
+                Verdict::Restarted {
+                    tun_ready: Some(true),
+                    ..
+                }
+            ),
+            "{v:?}"
+        );
+        let calls = s.calls();
+        let at = |c: &str| calls.iter().rposition(|x| x == c).unwrap_or(usize::MAX);
+        let lock = calls.iter().position(|c| c == "lock").expect("拿过锁");
+        let restart = at("systemctl restart bui-c.service");
+        let waited = at("ip link show bui-tun");
+        let unlock = at("unlock");
+        assert!(lock < restart, "{calls:?}");
+        assert!(
+            restart < waited && waited < unlock,
+            "等 TUN 就绪也在锁里：{calls:?}"
+        );
+        assert_eq!(Runtime::load(&s, &paths()).fail_streak, 1);
     }
 
     #[test]

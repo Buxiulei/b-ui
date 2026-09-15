@@ -3,12 +3,15 @@
 //!
 //! 它不是 `#[cfg(test)]`——未来的集成测试（`tests/`）也要能拿到同一套 fake。
 
-use crate::net::{Net, Via};
+use crate::lock::LockGuard;
+use crate::net::{Download, Net, Probe, ProbeError, Via};
 use crate::sys::{Output, Sys};
 use crate::{Error, Result};
-use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 use time::macros::datetime;
 
@@ -17,22 +20,49 @@ use time::macros::datetime;
 #[derive(Debug)]
 pub struct FakeSys {
     files: RefCell<BTreeMap<PathBuf, (Vec<u8>, u32)>>,
-    calls: RefCell<Vec<String>>,
+    /// 调用流水。`Rc`：拿到的 [`LockGuard`](crate::lock::LockGuard) 在 Drop 时要往这里记
+    /// `unlock`，而它活得可以比这次借用更久（spec §0.2 R2）。
+    calls: Rc<RefCell<Vec<String>>>,
     replies: RefCell<BTreeMap<String, Output>>,
     envs: RefCell<BTreeMap<String, String>>,
     now: RefCell<time::OffsetDateTime>,
     sleeps: RefCell<Vec<u64>>,
+    /// 终端尺寸 `(列, 行)`；默认 `None`，等于「stdout 不是终端」。
+    term: Cell<Option<(u16, u16)>>,
+    /// 注入写失败的路径（[`FakeSys::fail_write`]）。
+    write_fails: RefCell<BTreeSet<PathBuf>>,
+    /// 每次 [`Sys::write`] 的目标路径，按顺序（失败的也记）。
+    written: RefCell<Vec<PathBuf>>,
+    /// [`Sys::tcp_listening`] 答「在听」的本机端口；默认一个都没有（查询类默认失败）。
+    listening: RefCell<BTreeSet<u16>>,
+    /// [`Sys::resolve`] 的预置结果：`Ok(毫秒)` 是用时，`Err(())` 是解析失败；没登记的域名解析失败。
+    resolves: RefCell<BTreeMap<String, std::result::Result<u64, ()>>>,
+    /// 还要有几次拿锁拿不到（[`FakeSys::lock_busy`]）；`u32::MAX` 表示一直被占。
+    lock_busy: Cell<u32>,
+    /// 本进程已经持着锁：真 flock 按「打开的文件」计，同一进程再开一次再锁也拿不到，
+    /// fake 照做，嵌套拿锁的写法在测试里就会等满 15 秒然后失败。
+    lock_held: Rc<Cell<bool>>,
+    /// 下一次拿到锁之前落盘的文件（[`FakeSys::stage_on_lock`]）。
+    on_lock: RefCell<Vec<(PathBuf, Vec<u8>)>>,
 }
 
 impl Default for FakeSys {
     fn default() -> Self {
         Self {
             files: RefCell::default(),
-            calls: RefCell::default(),
+            calls: Rc::default(),
             replies: RefCell::default(),
             envs: RefCell::default(),
             now: RefCell::new(datetime!(2026-09-11 00:00:00 UTC)),
             sleeps: RefCell::default(),
+            term: Cell::new(None),
+            write_fails: RefCell::default(),
+            written: RefCell::default(),
+            listening: RefCell::default(),
+            resolves: RefCell::default(),
+            lock_busy: Cell::new(0),
+            lock_held: Rc::default(),
+            on_lock: RefCell::default(),
         }
     }
 }
@@ -120,6 +150,48 @@ impl FakeSys {
             .borrow_mut()
             .insert(key.to_string(), value.to_string());
     }
+    /// 注入终端尺寸 `(列, 行)`。默认 `None`（不是终端）：没注入的测试按 80×24 排版、
+    /// 不清屏，与加这个能力之前的输出一致。
+    pub fn set_term_size(&self, v: Option<(u16, u16)>) {
+        self.term.set(v);
+    }
+    /// 注入写失败：之后对这个路径的 [`Sys::write`] 一律返回 `Err`（磁盘满、只读文件系统）。
+    /// 删除流程的回滚分支靠它测：写 `config.json` 或 `profiles.json` 失败时要换回原配置。
+    pub fn fail_write(&self, path: &str) {
+        self.write_fails.borrow_mut().insert(PathBuf::from(path));
+    }
+    /// 撤掉 [`FakeSys::fail_write`] 注入的写失败：磁盘腾出空间之后，下一次进菜单或巡检就能写了。
+    pub fn allow_write(&self, path: &str) {
+        self.write_fails.borrow_mut().remove(Path::new(path));
+    }
+    /// 对这个路径调用过几次 [`Sys::write`]（失败的也算）。用来钉住「profiles 与 active
+    /// 同一次 save」这类断言。
+    pub fn writes(&self, path: &str) -> usize {
+        let want = PathBuf::from(path);
+        self.written.borrow().iter().filter(|p| **p == want).count()
+    }
+    /// 标记本机 `127.0.0.1:port` 在听（默认不在听）。
+    pub fn listen(&self, port: u16) {
+        self.listening.borrow_mut().insert(port);
+    }
+    /// 预置 `host` 的解析结果：`Ok(毫秒)` 是用时，`Err(())` 是解析失败。
+    pub fn set_resolve(&self, host: &str, r: std::result::Result<u64, ()>) {
+        self.resolves.borrow_mut().insert(host.to_string(), r);
+    }
+    /// 接下来 `n` 次拿锁都拿不到（别的 bui-c 正持着）；`u32::MAX` 表示一直被占。
+    pub fn lock_busy(&self, n: u32) {
+        self.lock_busy.set(n);
+    }
+    /// 往调用流水里记一笔非命令的事件（测试用的提示器记「ask …」，好和 lock / unlock 排先后）。
+    pub fn mark(&self, s: String) {
+        self.calls.borrow_mut().push(s);
+    }
+    /// 下一次拿到锁之前把这份文件写进去：模拟另一个会话在我们探测之后、拿锁之前改过它。
+    pub fn stage_on_lock(&self, path: &str, data: &str) {
+        self.on_lock
+            .borrow_mut()
+            .push((PathBuf::from(path), data.as_bytes().to_vec()));
+    }
 }
 
 impl Sys for FakeSys {
@@ -145,6 +217,13 @@ impl Sys for FakeSys {
             .ok_or_else(|| Error::io(path, std::io::Error::from(std::io::ErrorKind::NotFound)))
     }
     fn write(&self, path: &Path, data: &[u8], mode: u32) -> Result<()> {
+        self.written.borrow_mut().push(path.to_path_buf());
+        if self.write_fails.borrow().contains(path) {
+            return Err(Error::io(
+                path,
+                std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            ));
+        }
         self.files
             .borrow_mut()
             .insert(path.to_path_buf(), (data.to_vec(), mode));
@@ -203,22 +282,89 @@ impl Sys for FakeSys {
     fn env(&self, key: &str) -> Option<String> {
         self.envs.borrow().get(key).cloned()
     }
+    fn term_size(&self) -> Option<(u16, u16)> {
+        self.term.get()
+    }
+    fn tcp_listening(&self, port: u16) -> bool {
+        self.listening.borrow().contains(&port)
+    }
+    /// 记进调用流水（`resolve <host>`），测试靠它断言巡检路径没解析过域名。
+    /// 预置的用时不短于时限就按超时算：真实实现到点只会报超时。
+    fn resolve(&self, host: &str, timeout: Duration) -> Result<Duration> {
+        self.calls.borrow_mut().push(format!("resolve {host}"));
+        match self.resolves.borrow().get(host) {
+            Some(Ok(ms)) if Duration::from_millis(*ms) < timeout => Ok(Duration::from_millis(*ms)),
+            Some(Ok(_)) => Err(Error::msg(format!("{host} 解析超时"))),
+            _ => Err(Error::msg(format!("{host} 解析不到地址"))),
+        }
+    }
+    /// 前 `lock_busy` 次拿不到；本进程已经持着锁时也拿不到（与真 flock 一样）。拿到记 `lock`，
+    /// 放锁记 `unlock`；拿到之前先落下 [`FakeSys::stage_on_lock`] 登记的文件。
+    fn try_lock(&self, _path: &Path) -> Result<Option<LockGuard>> {
+        let busy = self.lock_busy.get();
+        if busy > 0 {
+            if busy != u32::MAX {
+                self.lock_busy.set(busy - 1);
+            }
+            return Ok(None);
+        }
+        if self.lock_held.get() {
+            return Ok(None);
+        }
+        for (path, data) in self.on_lock.borrow_mut().drain(..) {
+            self.files.borrow_mut().insert(path, (data, 0o600));
+        }
+        self.lock_held.set(true);
+        self.calls.borrow_mut().push("lock".to_string());
+        let (calls, held) = (Rc::clone(&self.calls), Rc::clone(&self.lock_held));
+        Ok(Some(LockGuard::new(Box::new(move || {
+            calls.borrow_mut().push("unlock".to_string());
+            held.set(false);
+        }))))
+    }
 }
 
-/// 一个 URL 的预置响应。
+/// 一个 URL 的预置响应。`Timeout` / `Refused` / `Dns` 模拟三种网络失败：
+/// [`Net::probe`] 给出对应的 [`ProbeError`]，其余方法一律报错。
 #[derive(Debug, Clone)]
 pub enum FakeReply {
     Status(u16),
     Text(String),
     Bytes(Vec<u8>),
     Fail(String),
+    Timeout,
+    Refused,
+    Dns,
 }
 
 /// 内存 HTTP 客户端：按 URL 精确匹配，未登记的 URL 报错（等价「不可达」）。
+/// 内部用 `Mutex` 不用 `RefCell`：`Net: Sync`，测速会在 `std::thread::scope` 里并发调用。
 #[derive(Debug, Default)]
 pub struct FakeNet {
-    routes: RefCell<BTreeMap<String, FakeReply>>,
-    log: RefCell<Vec<String>>,
+    routes: Mutex<BTreeMap<String, FakeReply>>,
+    delays: Mutex<BTreeMap<String, u64>>,
+    log: Mutex<Vec<String>>,
+}
+
+/// 拿锁；别的测试线程 panic 过也照样拿（里面只是登记表与流水，不怕半截状态）。
+fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// 非正文的响应在要正文的方法里报的错，URL 照真实实现脱敏。
+fn failure(url: &str, reply: FakeReply) -> Error {
+    let detail = match reply {
+        FakeReply::Status(c) => format!("HTTP {c}"),
+        FakeReply::Fail(m) => m,
+        FakeReply::Timeout => "超时".into(),
+        FakeReply::Refused => "连接被拒绝".into(),
+        FakeReply::Dns => "域名解析失败".into(),
+        FakeReply::Text(_) | FakeReply::Bytes(_) => unreachable!("有正文的响应不算失败"),
+    };
+    Error::Net {
+        url: crate::error::redact_url(url),
+        detail,
+    }
 }
 
 impl FakeNet {
@@ -226,26 +372,33 @@ impl FakeNet {
         Self::default()
     }
     pub fn route(&self, url: &str, reply: FakeReply) {
-        self.routes.borrow_mut().insert(url.to_string(), reply);
+        locked(&self.routes).insert(url.to_string(), reply);
+    }
+    /// 登记这个 URL 的用时（毫秒），决定 `probe` / `download_via` 带回的 `elapsed`，
+    /// 不登记就是 0。只报这个数，不真的睡。
+    pub fn delay(&self, url: &str, ms: u64) {
+        locked(&self.delays).insert(url.to_string(), ms);
     }
     /// 请求流水：`"GET <url> via <Direct|socks5:1080>"`。
     pub fn log(&self) -> Vec<String> {
-        self.log.borrow().clone()
+        locked(&self.log).clone()
     }
     fn hit(&self, url: &str, via: Via) -> Result<FakeReply> {
         let v = match via {
             Via::Direct => "Direct".to_string(),
             Via::Socks5 { port } => format!("socks5:{port}"),
         };
-        self.log.borrow_mut().push(format!("GET {url} via {v}"));
-        self.routes
-            .borrow()
+        locked(&self.log).push(format!("GET {url} via {v}"));
+        locked(&self.routes)
             .get(url)
             .cloned()
             .ok_or_else(|| Error::Net {
                 url: crate::error::redact_url(url),
                 detail: "fake 未登记该 URL".into(),
             })
+    }
+    fn elapsed(&self, url: &str) -> Duration {
+        Duration::from_millis(locked(&self.delays).get(url).copied().unwrap_or(0))
     }
 }
 
@@ -254,46 +407,158 @@ impl Net for FakeNet {
         match self.hit(url, via)? {
             FakeReply::Status(c) => Ok(c),
             FakeReply::Text(_) | FakeReply::Bytes(_) => Ok(200),
-            FakeReply::Fail(m) => Err(Error::Net {
-                url: crate::error::redact_url(url),
-                detail: m,
-            }),
+            other => Err(failure(url, other)),
         }
     }
-    fn text(&self, url: &str, _t: Duration) -> Result<String> {
-        match self.hit(url, Via::Direct)? {
-            FakeReply::Text(s) => Ok(s),
-            FakeReply::Bytes(b) => Ok(String::from_utf8_lossy(&b).into_owned()),
-            FakeReply::Status(c) => Err(Error::Net {
-                url: crate::error::redact_url(url),
-                detail: format!("HTTP {c}"),
-            }),
-            FakeReply::Fail(m) => Err(Error::Net {
-                url: crate::error::redact_url(url),
-                detail: m,
-            }),
-        }
+    fn text(&self, url: &str, t: Duration) -> Result<String> {
+        self.text_via(url, Via::Direct, t)
     }
     fn bytes(&self, url: &str, _t: Duration) -> Result<Vec<u8>> {
         match self.hit(url, Via::Direct)? {
             FakeReply::Bytes(b) => Ok(b),
             FakeReply::Text(s) => Ok(s.into_bytes()),
-            FakeReply::Status(c) => Err(Error::Net {
-                url: crate::error::redact_url(url),
-                detail: format!("HTTP {c}"),
-            }),
-            FakeReply::Fail(m) => Err(Error::Net {
-                url: crate::error::redact_url(url),
-                detail: m,
-            }),
+            other => Err(failure(url, other)),
         }
+    }
+    fn text_via(&self, url: &str, via: Via, _t: Duration) -> Result<String> {
+        match self.hit(url, via)? {
+            FakeReply::Text(s) => Ok(s),
+            FakeReply::Bytes(b) => Ok(String::from_utf8_lossy(&b).into_owned()),
+            other => Err(failure(url, other)),
+        }
+    }
+    /// `Status(n)` 给 `code = n`，有正文的给 200；`Fail(m)` 给 `Other(m)`，
+    /// 未登记的 URL 给 `Other("other")`。`delay` 不短于时限时一律超时：真实实现到了
+    /// 时限只会报超时，不会带回那么长的 elapsed。
+    fn probe(&self, url: &str, via: Via, t: Duration) -> std::result::Result<Probe, ProbeError> {
+        let reply = self
+            .hit(url, via)
+            .map_err(|_| ProbeError::Other("other".into()))?;
+        let elapsed = self.elapsed(url);
+        if elapsed >= t {
+            return Err(ProbeError::Timeout);
+        }
+        match reply {
+            FakeReply::Status(code) => Ok(Probe { code, elapsed }),
+            FakeReply::Text(_) | FakeReply::Bytes(_) => Ok(Probe { code: 200, elapsed }),
+            FakeReply::Timeout => Err(ProbeError::Timeout),
+            FakeReply::Refused => Err(ProbeError::Refused),
+            FakeReply::Dns => Err(ProbeError::Dns),
+            FakeReply::Fail(m) => Err(ProbeError::Other(m)),
+        }
+    }
+    /// 读到的字节 = min(正文长度, `max_bytes`)，读满才算 `complete`；
+    /// `elapsed` 截到 `cap` 为止（真实实现 cap 到点就停）。
+    fn download_via(&self, url: &str, via: Via, max_bytes: u64, cap: Duration) -> Result<Download> {
+        let len = match self.hit(url, via)? {
+            FakeReply::Bytes(b) => b.len() as u64,
+            FakeReply::Text(s) => s.len() as u64,
+            other => return Err(failure(url, other)),
+        };
+        let bytes = len.min(max_bytes);
+        Ok(Download {
+            bytes,
+            elapsed: self.elapsed(url).min(cap),
+            complete: bytes >= max_bytes,
+        })
+    }
+}
+
+/// 下载期间另一个会话装好了更新：`net` 一旦请求过 `url_part`，下一次经这里碰盘之前先跑一次 `land`
+/// ——等价于「这份下载进行到一半，别处已经把盘上换掉」。FakeSys 不是 `Sync`（`RefCell`），塞不进
+/// `Net: Sync` 的实现里，所以由 Sys 这一侧看 FakeNet 的请求流水来落。`update::fetch` 在下载之后
+/// 不再碰盘，落下的改动就只有之后的步骤（拿锁、`update::install`）看得到。
+pub struct LandsDuringDownload<'a> {
+    sys: &'a FakeSys,
+    net: &'a FakeNet,
+    url_part: &'a str,
+    land: &'a dyn Fn(&FakeSys),
+    landed: Cell<bool>,
+}
+
+impl<'a> LandsDuringDownload<'a> {
+    pub fn new(
+        sys: &'a FakeSys,
+        net: &'a FakeNet,
+        url_part: &'a str,
+        land: &'a dyn Fn(&FakeSys),
+    ) -> Self {
+        Self {
+            sys,
+            net,
+            url_part,
+            land,
+            landed: Cell::new(false),
+        }
+    }
+    /// `land` 跑过没有：用例据此断言确实测到了「下载期间被换过」，不是空测。
+    pub fn landed(&self) -> bool {
+        self.landed.get()
+    }
+    fn tick(&self) -> &FakeSys {
+        if !self.landed.get() && self.net.log().iter().any(|l| l.contains(self.url_part)) {
+            self.landed.set(true);
+            (self.land)(self.sys);
+        }
+        self.sys
+    }
+}
+
+impl Sys for LandsDuringDownload<'_> {
+    fn run(&self, prog: &str, args: &[&str]) -> Result<Output> {
+        self.tick().run(prog, args)
+    }
+    fn read(&self, path: &Path) -> Result<Vec<u8>> {
+        self.tick().read(path)
+    }
+    fn write(&self, path: &Path, data: &[u8], mode: u32) -> Result<()> {
+        self.tick().write(path, data, mode)
+    }
+    fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+        self.tick().rename(from, to)
+    }
+    fn remove_file(&self, path: &Path) -> Result<()> {
+        self.tick().remove_file(path)
+    }
+    fn remove_dir_all(&self, path: &Path) -> Result<()> {
+        self.tick().remove_dir_all(path)
+    }
+    fn mkdir_p(&self, path: &Path) -> Result<()> {
+        self.tick().mkdir_p(path)
+    }
+    fn exists(&self, path: &Path) -> bool {
+        self.tick().exists(path)
+    }
+    fn read_dir(&self, path: &Path) -> Result<Vec<PathBuf>> {
+        self.tick().read_dir(path)
+    }
+    fn now(&self) -> time::OffsetDateTime {
+        self.tick().now()
+    }
+    fn sleep(&self, d: Duration) {
+        self.tick().sleep(d)
+    }
+    fn env(&self, key: &str) -> Option<String> {
+        self.tick().env(key)
+    }
+    fn term_size(&self) -> Option<(u16, u16)> {
+        self.tick().term_size()
+    }
+    fn tcp_listening(&self, port: u16) -> bool {
+        self.tick().tcp_listening(port)
+    }
+    fn resolve(&self, host: &str, timeout: Duration) -> Result<Duration> {
+        self.tick().resolve(host, timeout)
+    }
+    fn try_lock(&self, path: &Path) -> Result<Option<LockGuard>> {
+        self.tick().try_lock(path)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::net::{Net, Via};
+    use crate::net::{Net, ProbeError, Via};
     use crate::sys::{systemd, Sys};
     use std::path::Path;
     use std::time::Duration;
@@ -309,6 +574,22 @@ mod tests {
         assert!(s.run("systemctl", &["daemon-reload"]).unwrap().ok());
         assert!(s.called("systemctl daemon-reload"));
         assert_eq!(s.calls().len(), 3);
+    }
+
+    #[test]
+    fn injected_write_failures_keep_the_old_bytes_and_still_count() {
+        let s = FakeSys::new();
+        let p = Path::new("/opt/bui-c/profiles.json");
+        s.write(p, b"old", 0o600).unwrap();
+        s.fail_write("/opt/bui-c/profiles.json");
+        let e = s.write(p, b"new", 0o600).unwrap_err();
+        assert!(e.to_string().contains("profiles.json"), "{e}");
+        assert_eq!(s.read(p).unwrap(), b"old", "写失败不能改动原文件");
+        assert_eq!(s.writes("/opt/bui-c/profiles.json"), 2, "失败的也算一次");
+        assert_eq!(s.writes("/opt/bui-c/config.json"), 0);
+        // 只影响登记过的那个路径
+        s.write(Path::new("/opt/bui-c/config.json"), b"{}", 0o600)
+            .unwrap();
     }
 
     #[test]
@@ -420,6 +701,66 @@ mod tests {
     }
 
     #[test]
+    fn fake_ports_and_dns_are_injected_and_default_to_failure() {
+        let s = FakeSys::new();
+        assert!(!s.tcp_listening(1080), "没登记就是没在听");
+        s.listen(1080);
+        assert!(s.tcp_listening(1080));
+        assert!(!s.tcp_listening(8080));
+        let t = Duration::from_secs(3);
+        assert!(s.resolve("www.baidu.com", t).is_err(), "没登记就是解析失败");
+        s.set_resolve("www.baidu.com", Ok(12));
+        assert_eq!(
+            s.resolve("www.baidu.com", t).unwrap(),
+            Duration::from_millis(12)
+        );
+        s.set_resolve("www.baidu.com", Ok(3_000));
+        assert!(s.resolve("www.baidu.com", t).is_err(), "用时到了时限算超时");
+        s.set_resolve("www.baidu.com", Err(()));
+        assert!(s.resolve("www.baidu.com", t).is_err());
+        assert_eq!(
+            s.calls()
+                .iter()
+                .filter(|c| *c == "resolve www.baidu.com")
+                .count(),
+            4,
+            "每次解析都记进流水"
+        );
+    }
+
+    #[test]
+    fn fake_lock_records_lock_and_unlock_and_lands_staged_files_first() {
+        let s = FakeSys::new();
+        let lock = Path::new("/run/bui-c.lock");
+        s.put("/opt/bui-c/profiles.json", "mine");
+        s.stage_on_lock("/opt/bui-c/profiles.json", "theirs");
+        assert_eq!(
+            s.get("/opt/bui-c/profiles.json").unwrap(),
+            "mine",
+            "拿锁前不落"
+        );
+        s.lock_busy(1);
+        assert!(s.try_lock(lock).unwrap().is_none());
+        assert_eq!(
+            s.get("/opt/bui-c/profiles.json").unwrap(),
+            "mine",
+            "没拿到也不落"
+        );
+        let g = s.try_lock(lock).unwrap().expect("第二次拿得到");
+        assert_eq!(s.get("/opt/bui-c/profiles.json").unwrap(), "theirs");
+        assert!(s.try_lock(lock).unwrap().is_none(), "持着锁再拿就拿不到");
+        s.mark("inside".to_string());
+        drop(g);
+        assert_eq!(s.calls(), vec!["lock", "inside", "unlock"]);
+        drop(s.try_lock(lock).unwrap().expect("放了就又拿得到"));
+        assert_eq!(
+            s.get("/opt/bui-c/profiles.json").unwrap(),
+            "theirs",
+            "只落一次"
+        );
+    }
+
+    #[test]
     fn fake_net_routes_and_logs() {
         let n = FakeNet::new();
         n.route(
@@ -466,5 +807,129 @@ mod tests {
             n.log()[0],
             "GET https://www.gstatic.com/generate_204 via socks5:1080"
         );
+    }
+
+    #[test]
+    fn fake_probe_reports_code_elapsed_and_failure_kinds() {
+        let n = FakeNet::new();
+        n.route("https://a.example.com/", FakeReply::Status(204));
+        n.delay("https://a.example.com/", 312);
+        let p = n
+            .probe(
+                "https://a.example.com/",
+                Via::Direct,
+                Duration::from_secs(8),
+            )
+            .unwrap();
+        assert_eq!((p.code, p.elapsed.as_millis()), (204, 312));
+        n.route("https://b.example.com/", FakeReply::Dns);
+        assert_eq!(
+            n.probe(
+                "https://b.example.com/",
+                Via::Direct,
+                Duration::from_secs(1)
+            ),
+            Err(ProbeError::Dns)
+        );
+        n.route("https://c.example.com/", FakeReply::Bytes(vec![0; 600_000]));
+        let d = n
+            .download_via(
+                "https://c.example.com/",
+                Via::Socks5 { port: 1080 },
+                1_000_000,
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        assert_eq!((d.bytes, d.complete), (600_000, false));
+        assert!(n
+            .log()
+            .iter()
+            .any(|l| l == "GET https://c.example.com/ via socks5:1080"));
+    }
+
+    #[test]
+    fn fake_net_is_sync() {
+        fn assert_sync<T: Sync>() {}
+        assert_sync::<FakeNet>();
+    }
+
+    #[test]
+    fn fake_probe_times_out_once_the_delay_reaches_the_timeout() {
+        // 真实实现里，用时到了时限只会报超时，不会带回一个不短于时限的 elapsed
+        let n = FakeNet::new();
+        let url = "https://slow.example.com/";
+        n.route(url, FakeReply::Status(204));
+        n.delay(url, 6_000);
+        assert_eq!(
+            n.probe(url, Via::Direct, Duration::from_secs(6)),
+            Err(ProbeError::Timeout)
+        );
+        let p = n
+            .probe(url, Via::Direct, Duration::from_millis(6_001))
+            .unwrap();
+        assert_eq!((p.code, p.elapsed.as_millis()), (204, 6_000));
+    }
+
+    #[test]
+    fn fake_download_elapsed_stops_at_the_cap() {
+        // 真实实现 cap 到点就停，elapsed 不会超过 cap
+        let n = FakeNet::new();
+        let url = "https://speed.example.com/";
+        n.route(url, FakeReply::Bytes(vec![0; 400_000]));
+        n.delay(url, 9_000);
+        let d = n
+            .download_via(url, Via::Direct, 1_000_000, Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(
+            (d.bytes, d.complete, d.elapsed),
+            (400_000, false, Duration::from_secs(5))
+        );
+    }
+
+    #[test]
+    fn fake_new_methods_follow_the_canned_reply() {
+        let n = FakeNet::new();
+        let t = Duration::from_secs(5);
+        // text_via 记下走的哪条腿；没设 delay 的 elapsed 是 0
+        n.route(
+            "https://ip.example.com/",
+            FakeReply::Text("203.0.113.7".into()),
+        );
+        assert_eq!(
+            n.text_via("https://ip.example.com/", Via::Socks5 { port: 1080 }, t)
+                .unwrap(),
+            "203.0.113.7"
+        );
+        assert_eq!(
+            n.log().last().unwrap(),
+            "GET https://ip.example.com/ via socks5:1080"
+        );
+        let p = n.probe("https://ip.example.com/", Via::Direct, t).unwrap();
+        assert_eq!((p.code, p.elapsed), (200, Duration::ZERO));
+        // 正文超过上限：只算到上限，算读满
+        n.route("https://d.example.com/", FakeReply::Bytes(vec![0; 2_000]));
+        n.delay("https://d.example.com/", 900);
+        let d = n
+            .download_via("https://d.example.com/", Via::Direct, 1_000, t)
+            .unwrap();
+        assert_eq!(
+            (d.bytes, d.complete, d.elapsed.as_millis()),
+            (1_000, true, 900)
+        );
+        // 三种网络失败：probe 给对应类别，其余方法报错，错误里没有路径末段
+        n.route("https://e.example.com/api/nodes/alice", FakeReply::Timeout);
+        n.route("https://f.example.com/api/nodes/alice", FakeReply::Refused);
+        let e = "https://e.example.com/api/nodes/alice";
+        let f = "https://f.example.com/api/nodes/alice";
+        assert_eq!(n.probe(e, Via::Direct, t), Err(ProbeError::Timeout));
+        assert_eq!(n.probe(f, Via::Direct, t), Err(ProbeError::Refused));
+        for msg in [
+            n.download_via(f, Via::Direct, 1_000, t)
+                .unwrap_err()
+                .to_string(),
+            n.text_via(e, Via::Direct, t).unwrap_err().to_string(),
+        ] {
+            assert!(!msg.contains("alice"), "错误里带出了用户名：{msg}");
+        }
     }
 }

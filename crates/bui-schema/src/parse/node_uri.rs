@@ -43,10 +43,13 @@ pub fn node_uri(raw: &str) -> Result<Node, ParseError> {
             // 解码后再按第一个 `:` 拆一次——与 hysteria 服务端 userpass 的拆法一致。
             let (username, password) = match u.password() {
                 Some(p) => (decode(u.username())?, decode(p)?),
-                None => match decode(u.username())?.split_once(':') {
-                    Some((a, b)) => (a.to_string(), b.to_string()),
-                    None => (decode(u.username())?, String::new()),
-                },
+                None => {
+                    let whole = decode(u.username())?;
+                    match whole.split_once(':') {
+                        Some((a, b)) => (a.to_string(), b.to_string()),
+                        None => (whole, String::new()),
+                    }
+                }
             };
             if username.is_empty() || password.is_empty() {
                 return Err(ParseError::Other("hysteria2 URI 缺少用户名或密码".into()));
@@ -259,6 +262,14 @@ mod tests {
         }
         // 没有冒号的单段 userinfo 仍然拒绝：拿不出用户名，服务端 userpass 鉴权必然失败
         assert!(node_uri("hysteria2://onlypassword@example.com:10000").is_err());
+        // 无冒号分支只解码一次：%253A 解一次是字面 `%3A`（不是冒号），拆不出密码所以报错。
+        // 解两次就会变成 `alice:pw` 而被接受，这条断言就是守这件事的——
+        // 上面几条锁不住它（那一臂的 password 恒为空、必然报错，whole 的值观测不到）。
+        // 报错原因也钉住：换成别处先拒（用户名含 % 一律拒、host 校验变严）这条就不守事了
+        assert!(matches!(
+            node_uri("hysteria2://alice%253Apw@example.com:10000"),
+            Err(ParseError::Other(m)) if m.contains("缺少用户名或密码")
+        ));
     }
 
     #[test]

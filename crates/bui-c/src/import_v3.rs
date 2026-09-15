@@ -38,6 +38,9 @@ pub struct Report {
     /// v3 目录里的节点已经在 profiles 里（同一个连接，见
     /// [`same_endpoint`](crate::profiles::same_endpoint)），这次原样跳过的 profile 名
     pub existing: Vec<String>,
+    /// 命中墓碑、这次没导入的节点名（墓碑里记的那个名字，spec §5.7）。菜单据此问一句、
+    /// 命令行据此打一行；[`RunOpts::with_deleted`] 为真时永远是空的
+    pub buried: Vec<String>,
     pub active: Option<String>,
     pub removed_units: Vec<String>,
     pub ufw_restored: bool,
@@ -54,6 +57,9 @@ pub struct RunOpts {
     pub panel: Option<String>,
     /// `--mode`：覆盖「v3 的 bui-tun 是否 enabled」推导出的模式。
     pub mode: Option<Mode>,
+    /// `--with-deleted`：连删过的节点一起导（spec §5.7）。默认假：命中墓碑的先跳过、
+    /// 收进 [`Report::buried`]，菜单问一句、命令行打一行。
+    pub with_deleted: bool,
 }
 
 /// `<base>/configs` 存在就认为这机器装过 v3 客户端。
@@ -87,7 +93,15 @@ fn user_from_label(label: &str) -> String {
 ///
 /// profile 名取 v3 的目录名（见模块文档），目录名 sanitize 后为空时才回落到
 /// [`profile_name`]。[`user_from_label`] 仍用来推导 [`Panel::username`]。
-pub fn import<S: Sys>(sys: &S, base: &Path, prof: &mut Profiles) -> Result<Report> {
+///
+/// `with_deleted` 为假时认墓碑（spec §5.7）：删掉过的节点不导入，名字收进
+/// [`Report::buried`]；为真时照常导入并把墓碑清掉。
+pub fn import<S: Sys>(
+    sys: &S,
+    base: &Path,
+    prof: &mut Profiles,
+    with_deleted: bool,
+) -> Result<Report> {
     let mut r = Report::default();
     let v3_active = read_str(sys, &base.join("active")).unwrap_or_default();
     let mut active_ports: Option<(u16, u16)> = None;
@@ -140,6 +154,16 @@ pub fn import<S: Sys>(sys: &S, base: &Path, prof: &mut Profiles) -> Result<Repor
             r.existing.push(name);
             continue;
         }
+        // 删过的节点默认不带回来（spec §5.7）：v3 目录按约定留着，不记墓碑的话按一次
+        // [7]→[3] 就把删掉的又导回来了。名字取墓碑里记的那个
+        if !with_deleted {
+            if let Some(t) = prof.tombstone_of(&node) {
+                r.buried.push(t.name.clone());
+                continue;
+            }
+        }
+        // 明确要它：墓碑清掉，下次导入不再跳过
+        prof.forget(&node);
         // profile 名沿用 v3 的目录名：用户在 v3 里就是拿它 `switch` 的，原地升级后
         // 名字不变，一眼认得出哪个是哪个。目录名 sanitize 后为空（全非 ASCII）才回落
         // 到 profile_name。free_name 对不冲突的名字原样返回。
@@ -167,7 +191,8 @@ pub fn import<S: Sys>(sys: &S, base: &Path, prof: &mut Profiles) -> Result<Repor
     }
 
     if r.imported.is_empty() {
-        if r.existing.is_empty() {
+        // 全被墓碑挡下也是「有东西可导」：调用方要打那一行 / 问那一句，不能报成「没有节点」
+        if r.existing.is_empty() && r.buried.is_empty() {
             return Err(Error::msg(format!("{} 下没有可导入的节点", base.display())));
         }
         // 一个新节点都没有 → `prof` 一个字段都不动（active / mode / 端口 / 面板）：
@@ -270,7 +295,7 @@ pub fn run<S: Sys, N: Net>(
             ))
         })?),
     };
-    let mut r = import(sys, base, prof)?;
+    let mut r = import(sys, base, prof, opts.with_deleted)?;
     // 重跑幂等：新节点一个没有、v3 单元也一个不剩 → 无事可做，直接回。
     // 继续往下是有害的：`ensure_kernel` / 自检 / 落盘全是空转，而 `teardown` 会去删
     // bui-tun——那正是 v4 数据面正在用的接口。
@@ -278,7 +303,13 @@ pub fn run<S: Sys, N: Net>(
         .iter()
         .chain(V3_AUX_UNITS.iter())
         .any(|u| sys.exists(&paths.unit(u)));
-    if r.imported.is_empty() && !leftovers {
+    // 新节点一个没有、v3 的节点又全被墓碑挡下、手上也没有活动节点（删光之后，spec §9）：
+    // 同样无事可做，残留单元在也一样。继续往下只会在「没有可用的活动节点」上报错，命令行的
+    // 跳过行与菜单那一问都到不了（审查 T7b r2 I1）。残留单元留给答 y / `--with-deleted`
+    // 那一趟清——那一趟 `imported` 非空，照常 teardown。`existing` 非空而没有活动节点在 v4
+    // 里到不了，不在这里吞掉：留给下面那句错误当断言
+    let nothing_to_apply = r.existing.is_empty() && prof.active_profile().is_none();
+    if r.imported.is_empty() && (!leftovers || nothing_to_apply) {
         return Ok(r);
     }
     if let Some(base_url) = panel_override {
@@ -423,7 +454,7 @@ mod tests {
     fn import_maps_nodes_ports_panel_and_active() {
         let s = v3_machine();
         let mut prof = Profiles::new_default();
-        let r = import(&s, Path::new(V3_BASE), &mut prof).unwrap();
+        let r = import(&s, Path::new(V3_BASE), &mut prof, false).unwrap();
         assert_eq!(
             r.imported,
             vec![
@@ -459,13 +490,13 @@ mod tests {
         let s = v3_machine();
         s.reply("systemctl is-enabled --quiet bui-tun.service", 0, "");
         let mut prof = Profiles::new_default();
-        import(&s, Path::new(V3_BASE), &mut prof).unwrap();
+        import(&s, Path::new(V3_BASE), &mut prof, false).unwrap();
         assert_eq!(prof.mode, Mode::Tun, "v3 用 TUN 的机器升级后仍是 TUN");
 
         let s2 = v3_machine();
         s2.reply("systemctl is-enabled --quiet bui-tun.service", 1, "");
         let mut prof2 = Profiles::new_default();
-        import(&s2, Path::new(V3_BASE), &mut prof2).unwrap();
+        import(&s2, Path::new(V3_BASE), &mut prof2, false).unwrap();
         assert_eq!(prof2.mode, Mode::Socks);
     }
 
@@ -478,7 +509,7 @@ mod tests {
         );
         s.put("/opt/hysteria-client/configs/no-uri/meta.json", "{}");
         let mut prof = Profiles::new_default();
-        let r = import(&s, Path::new(V3_BASE), &mut prof).unwrap();
+        let r = import(&s, Path::new(V3_BASE), &mut prof, false).unwrap();
         assert_eq!(r.imported.len(), 2);
         assert_eq!(r.skipped, vec!["broken".to_string(), "no-uri".to_string()]);
     }
@@ -488,8 +519,37 @@ mod tests {
         let s = FakeSys::new();
         s.put("/opt/hysteria-client/configs/x/meta.json", "{}");
         let mut prof = Profiles::new_default();
-        let e = import(&s, Path::new(V3_BASE), &mut prof).unwrap_err();
+        let e = import(&s, Path::new(V3_BASE), &mut prof, false).unwrap_err();
         assert!(e.to_string().contains("没有可导入的节点"), "{e}");
+    }
+
+    /// v3 的节点全被删过（spec §5.7）：不是「没有可导入的节点」，要如实报成 `buried`，
+    /// 调用方才能打那一行 / 问那一句；`with_deleted` 则照常导入并清墓碑。
+    #[test]
+    fn import_reports_buried_nodes_instead_of_failing() {
+        let s = v3_machine();
+        let mut prof = Profiles::new_default();
+        let first = import(&s, Path::new(V3_BASE), &mut prof, false).unwrap();
+        assert_eq!(first.imported.len(), 2);
+        // 两个都删掉（只记墓碑，节点从列表里拿走）
+        let mut buried = Profiles::new_default();
+        for name in &first.imported {
+            let p = prof.profiles.iter().find(|p| &p.name == name).unwrap();
+            buried.bury(p, 7);
+        }
+
+        let mut prof = buried.clone();
+        let r = import(&s, Path::new(V3_BASE), &mut prof, false).unwrap();
+        assert!(r.imported.is_empty() && r.existing.is_empty(), "{r:?}");
+        assert_eq!(r.buried, first.imported, "{r:?}");
+        assert!(prof.profiles.is_empty(), "一个都不该导回来");
+        assert_eq!(prof.deleted.len(), 2, "墓碑原样留着");
+
+        let mut prof = buried;
+        let r = import(&s, Path::new(V3_BASE), &mut prof, true).unwrap();
+        assert_eq!(r.imported, first.imported);
+        assert!(r.buried.is_empty(), "{r:?}");
+        assert!(prof.deleted.is_empty(), "加回来了就清墓碑");
     }
 
     #[test]
@@ -680,6 +740,7 @@ mod tests {
         let opts = RunOpts {
             panel: Some("https://other.example.com/".into()),
             mode: Some(Mode::Socks),
+            with_deleted: false,
         };
         run(&s, &n, &paths(), Path::new(V3_BASE), &mut prof, &opts).unwrap();
         let saved = Profiles::load(&s, &paths()).unwrap();
@@ -716,6 +777,7 @@ mod tests {
         let opts = RunOpts {
             panel: Some("http://other.example.com".into()),
             mode: None,
+            with_deleted: false,
         };
         let e = run(&s, &n, &paths(), Path::new(V3_BASE), &mut prof, &opts).unwrap_err();
         let msg = e.to_string();
@@ -771,7 +833,7 @@ mod tests {
         s.put("/opt/hysteria-client/active", "HY2\n");
 
         let mut prof = Profiles::new_default();
-        let r = import(&s, Path::new(V3_BASE), &mut prof).unwrap();
+        let r = import(&s, Path::new(V3_BASE), &mut prof, false).unwrap();
         assert!(r.skipped.is_empty(), "不该有跳过的目录：{:?}", r.skipped);
         // 名字精确等于 v3 目录名（read_dir 已排序），不再是 `hy2-direct` / `-2` / `-3`：
         // 五个节点的用户名都是中文，旧规则 sanitize 后全塌成同一个 kind slug。
@@ -798,7 +860,7 @@ mod tests {
             "hysteria2://alice:hy2-pw@h9.example.com:10000/?sni=h9.example.com&mport=20000-30000#alice-HY2%E7%9B%B4%E8%BF%9E",
         );
         let mut prof = Profiles::new_default();
-        let r = import(&s, Path::new(V3_BASE), &mut prof).unwrap();
+        let r = import(&s, Path::new(V3_BASE), &mut prof, false).unwrap();
         assert_eq!(r.imported, vec!["alice-hy2-direct".to_string()]);
     }
 
@@ -808,7 +870,7 @@ mod tests {
     fn import_reports_existing_nodes_without_duplicating() {
         let s = v3_machine();
         let mut prof = Profiles::new_default();
-        let first = import(&s, Path::new(V3_BASE), &mut prof).unwrap();
+        let first = import(&s, Path::new(V3_BASE), &mut prof, false).unwrap();
         assert_eq!(first.imported.len(), 2);
         assert!(first.existing.is_empty(), "第一次全是新节点");
 
@@ -816,7 +878,7 @@ mod tests {
         prof.active = Some("hysteria2-1757000000".to_string());
         prof.mode = Mode::Tun;
 
-        let r = import(&s, Path::new(V3_BASE), &mut prof).unwrap();
+        let r = import(&s, Path::new(V3_BASE), &mut prof, false).unwrap();
         assert!(r.imported.is_empty(), "一个新节点都没有：{:?}", r.imported);
         assert_eq!(
             r.existing,
@@ -846,7 +908,7 @@ mod tests {
     fn rerun_recognises_nodes_whose_label_was_updated_by_the_panel() {
         let s = v3_machine();
         let mut prof = Profiles::new_default();
-        import(&s, Path::new(V3_BASE), &mut prof).unwrap();
+        import(&s, Path::new(V3_BASE), &mut prof, false).unwrap();
         let hy2 = prof
             .profiles
             .iter_mut()
@@ -855,7 +917,7 @@ mod tests {
         hy2.node.label = "HY2直连".into();
         hy2.source = Source::ApiNodes;
 
-        let r = import(&s, Path::new(V3_BASE), &mut prof).unwrap();
+        let r = import(&s, Path::new(V3_BASE), &mut prof, false).unwrap();
         assert!(r.imported.is_empty(), "{:?}", r.imported);
         assert_eq!(
             r.existing,

@@ -18,7 +18,8 @@ bui-schema = { path = "../bui-schema" }
 base64.workspace = true
 clap.workspace = true
 hex.workspace = true
-nix.workspace = true
+# 进程锁用 nix::fcntl::Flock，它在 fs 特性后面；只在这里加，根 Cargo.toml 与 Cargo.lock 不动
+nix = { workspace = true, features = ["fs"] }
 percent-encoding.workspace = true
 reqwest.workspace = true
 serde.workspace = true

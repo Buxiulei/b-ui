@@ -9,6 +9,7 @@ use crate::{Error, Result};
 use bui_schema::nodes::{Node, NodeKind, Transport};
 use bui_schema::render::SplitRules;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -64,6 +65,20 @@ pub struct Profile {
     pub imported_at: String,
 }
 
+/// 一条墓碑：删掉过的节点，重新导入时先跳过、再问一句要不要加回（spec §5.7）。
+///
+/// `key` 是账号级指纹（[`tombstone_key`]，不含明文凭据、不含端口），`name` 只用在那一问里
+/// 显示——就是用户删它时在列表上看到的名字，`at` 是 unix 秒。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Tombstone {
+    pub key: String,
+    pub name: String,
+    pub at: i64,
+}
+
+/// 墓碑最多留几条（spec §5.7）：满了丢最旧的。
+pub const TOMBSTONE_CAP: usize = 64;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Profiles {
     pub schema_version: u32,
@@ -74,6 +89,11 @@ pub struct Profiles {
     pub auto_update: bool,
     pub panel: Option<Panel>,
     pub profiles: Vec<Profile>,
+    /// 删掉过的节点（spec §5.7）。**放在最后、且没有墓碑时不写进文件**：这样
+    /// `SCHEMA_VERSION` 不必动，没墓碑的机器上 `profiles.json` 与改动前逐字节相同。
+    /// [`Profiles`] 永远不加 `deny_unknown_fields`，旧版本读到它直接忽略。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deleted: Vec<Tombstone>,
 }
 
 /// [`Profiles::upsert`] 的结果，菜单据此决定提示语。
@@ -147,6 +167,33 @@ pub fn same_account(a: &Node, b: &Node) -> bool {
         }
 }
 
+/// 墓碑的 key：`"{kind_slug}|{host 小写}|{账号指纹}"`，账号指纹 = 凭据主体
+/// （Hysteria2 的 `username`、Reality 的 `uuid`）的 sha256 取前 16 个十六进制字符。
+///
+/// 与 [`same_account`] 同一层级，但**不存明文凭据、也不存端口**（spec §5.7）：HY2 换密码、
+/// 住宅换槽位（端口变）之后仍认得出是那个被删的节点；同一台服务器上家人的账号指纹不同，
+/// 不会被误伤。
+///
+/// 区分度来自 `kind` 而不是端口：真机上面板导入的 Reality 直连（:10001）与 Reality 住宅
+/// （:10002）共用同一个 uuid、同一个 host，两个 HY2（:10000 与 :40000）也共用同一个账号，
+/// 只有 kind 不同——所以 key 里必须有 kind，也正因为如此才敢把端口留在外面。
+///
+/// 已知限制（spec §0.2 R16 第三条）：Reality 轮换 uuid 之后指纹跟着变，墓碑失效，删掉过的
+/// 节点会被当成全新节点加回来（不误删、不出错，只是「又回来了」）。
+pub fn tombstone_key(node: &Node) -> String {
+    let subject = match &node.transport {
+        Transport::Hysteria2 { username, .. } => username.clone(),
+        Transport::Reality { uuid, .. } => uuid.to_string(),
+    };
+    let fingerprint = hex::encode(Sha256::digest(subject.as_bytes()));
+    format!(
+        "{}|{}|{}",
+        kind_slug(node.kind),
+        node.host.to_lowercase(),
+        &fingerprint[..16]
+    )
+}
+
 /// 同一个连接：[`same_account`]，且 `host`、`port` 相同，Hysteria2 的 `password` 也相同
 /// （Reality 的 uuid 已经是凭据全部）。
 ///
@@ -199,6 +246,7 @@ impl Profiles {
             auto_update: true,
             panel: None,
             profiles: Vec::new(),
+            deleted: Vec::new(),
         }
     }
 
@@ -276,6 +324,42 @@ impl Profiles {
         }
     }
 
+    /// 这个节点的墓碑（[`tombstone_key`] 命中的那一条）。名字要用墓碑里记的那个：
+    /// 用户删它时在列表上看到的就是它。
+    pub fn tombstone_of(&self, node: &Node) -> Option<&Tombstone> {
+        let key = tombstone_key(node);
+        self.deleted.iter().find(|t| t.key == key)
+    }
+
+    /// 这个节点删过吗（spec §5.7）。
+    pub fn is_deleted(&self, node: &Node) -> bool {
+        self.tombstone_of(node).is_some()
+    }
+
+    /// 记一条墓碑：同 key 先去重（名字与时间跟着这次更新），超过 [`TOMBSTONE_CAP`] 丢最旧的。
+    ///
+    /// 调用点只有删除成功落盘那一处，**和 `profiles` 同一次 `save`**（spec §5.7、§0.2 R10）。
+    pub fn bury(&mut self, p: &Profile, at: i64) {
+        let key = tombstone_key(&p.node);
+        self.deleted.retain(|t| t.key != key);
+        self.deleted.push(Tombstone {
+            key,
+            name: p.name.clone(),
+            at,
+        });
+        // 先去重再压上限：一批删除里同一个账号位只会占一条
+        let over = self.deleted.len().saturating_sub(TOMBSTONE_CAP);
+        self.deleted.drain(..over);
+    }
+
+    /// 把这个节点的墓碑清掉（加回来了）：清掉过返回 `true`。
+    pub fn forget(&mut self, node: &Node) -> bool {
+        let key = tombstone_key(node);
+        let before = self.deleted.len();
+        self.deleted.retain(|t| t.key != key);
+        self.deleted.len() != before
+    }
+
     pub fn remove(&mut self, name: &str) -> bool {
         let before = self.profiles.len();
         self.profiles.retain(|p| p.name != name);
@@ -293,7 +377,7 @@ impl Profiles {
 mod tests {
     use super::*;
     use crate::fake::FakeSys;
-    use crate::testutil::{hy2_direct_node, hy2_resi_node, split_global};
+    use crate::testutil::{hy2_account_node, hy2_direct_node, hy2_resi_node, split_global};
     use pretty_assertions::assert_eq;
 
     fn paths() -> Paths {
@@ -576,6 +660,204 @@ mod tests {
     fn rfc3339_uses_injected_clock() {
         let s = FakeSys::new();
         assert_eq!(rfc3339(&s), "2026-09-11T00:00:00Z");
+    }
+
+    // ───────────── 墓碑（spec §5.7） ─────────────
+
+    /// 墓碑的 key 是账号级的：凭据轮换（换密码）、住宅换槽位（换端口）之后仍认得出，
+    /// 但 key 里既没有明文账号也没有端口；同一台服务器上另一个账号指纹不同。
+    #[test]
+    fn the_tombstone_key_is_account_level_and_holds_no_credentials() {
+        let a = hy2_direct_node();
+        let mut rotated = a.clone(); // 换密码、换端口：同一个账号
+        if let bui_schema::nodes::Transport::Hysteria2 { password, .. } = &mut rotated.transport {
+            *password = "rotated".into();
+        }
+        rotated.port = 10009;
+        assert_eq!(tombstone_key(&a), tombstone_key(&rotated));
+        let k = tombstone_key(&a);
+        assert!(k.starts_with("hy2-direct|panel.example.com|"), "{k}");
+        assert!(
+            !k.contains("alice") && !k.contains("10000"),
+            "不存明文账号、不存端口：{k}"
+        );
+        // 指纹是 sha256 的前 16 个十六进制字符
+        let fp = k.rsplit('|').next().unwrap();
+        assert_eq!(fp.len(), 16, "{k}");
+        assert!(fp.chars().all(|c| c.is_ascii_hexdigit()), "{k}");
+        let other = hy2_account_node("bob"); // 同服务器另一个账号（家人账号）
+        assert_ne!(tombstone_key(&a), tombstone_key(&other));
+        // host 大小写不影响
+        let upper = Node {
+            host: "PANEL.EXAMPLE.COM".into(),
+            ..a.clone()
+        };
+        assert_eq!(tombstone_key(&a), tombstone_key(&upper));
+    }
+
+    /// 区分度来自 kind：真机（baiyi 的 9 个 profile）上面板导入的 Reality 直连 :10001 与
+    /// Reality 住宅 :10002 共用同一个 uuid 与 host，两个 HY2（:10000 / :40000）也共用同一个
+    /// 账号——key 里不含端口，全靠 kind 把它们分开，否则删一个会连坐另一个。
+    #[test]
+    fn the_tombstone_key_separates_kinds_on_one_account() {
+        let reality_direct = crate::testutil::reality_direct_node();
+        let reality_resi = Node {
+            kind: NodeKind::RealityResidential,
+            port: 10002,
+            ..reality_direct.clone()
+        };
+        assert!(
+            same_account(&reality_direct, &reality_direct)
+                && !same_account(&reality_direct, &reality_resi),
+            "样例前提：同 uuid、同 host，只有 kind 不同"
+        );
+        assert_ne!(
+            tombstone_key(&reality_direct),
+            tombstone_key(&reality_resi),
+            "同账号同主机、只有 kind 不同的两个节点，墓碑 key 必须不同"
+        );
+        assert_ne!(
+            tombstone_key(&hy2_direct_node()),
+            tombstone_key(&hy2_resi_node()),
+        );
+        // 指纹这一段反而相同：凭据主体是同一个
+        let fp = |n: &Node| tombstone_key(n).rsplit('|').next().unwrap().to_string();
+        assert_eq!(fp(&reality_direct), fp(&reality_resi));
+        assert_eq!(fp(&hy2_direct_node()), fp(&hy2_resi_node()));
+    }
+
+    #[test]
+    fn bury_dedups_and_caps_at_64() {
+        let mut p = Profiles::new_default();
+        p.bury(&prof("a", hy2_direct_node()), 1);
+        p.bury(&prof("a-again", hy2_direct_node()), 2);
+        assert_eq!(p.deleted.len(), 1, "同 key 只留一条：{:?}", p.deleted);
+        assert_eq!(
+            (p.deleted[0].name.as_str(), p.deleted[0].at),
+            ("a-again", 2),
+            "名字与时间跟着这次更新"
+        );
+        assert!(p.is_deleted(&hy2_direct_node()));
+
+        // 再埋 72 个别的账号位：满 64 条丢最旧的（先进先出）
+        for i in 0..TOMBSTONE_CAP + 8 {
+            let n = Node {
+                host: format!("h{i}.example.com"),
+                ..hy2_direct_node()
+            };
+            p.bury(&prof(&format!("n{i}"), n), 100 + i as i64);
+        }
+        assert_eq!(p.deleted.len(), TOMBSTONE_CAP);
+        let kept: Vec<&str> = p.deleted.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(kept.first(), Some(&"n8"), "最旧的 9 条（含 a-again）被丢掉");
+        assert_eq!(kept.last(), Some(&"n71"));
+        assert!(!p.is_deleted(&hy2_direct_node()), "挤出去的那条不再挡导入");
+    }
+
+    /// HY2 换密码之后墓碑仍认得出（指纹是 username，不随密码变）；加回来时 `forget` 清掉它。
+    #[test]
+    fn a_rotated_password_is_still_recognized_and_forget_clears_it() {
+        let mut p = Profiles::new_default();
+        p.bury(&prof("alice-hy2-direct", hy2_direct_node()), 7);
+        let mut rotated = hy2_direct_node();
+        if let Transport::Hysteria2 { password, .. } = &mut rotated.transport {
+            *password = "rotated".into();
+        }
+        assert!(p.is_deleted(&rotated), "换了密码还是那个被删的节点");
+        assert_eq!(
+            p.tombstone_of(&rotated).map(|t| t.name.as_str()),
+            Some("alice-hy2-direct"),
+            "问那一句时用墓碑里记的名字"
+        );
+        assert!(!p.is_deleted(&hy2_resi_node()), "另一个 kind 不受影响");
+        assert!(p.forget(&rotated));
+        assert!(!p.forget(&rotated), "已经清过就不再报改动");
+        assert!(p.deleted.is_empty());
+    }
+
+    /// 没有墓碑时 `deleted` 不写进文件，字节与改动前逐字相同（spec §5.7、§9）。
+    /// 「改动前」这一份是按 v1 的字段表当场序列化出来的，不是抄下来的字面量。
+    #[test]
+    fn a_file_without_deleted_loads_and_saving_without_tombstones_is_byte_identical() {
+        #[derive(Serialize)]
+        struct V1<'a> {
+            schema_version: u32,
+            active: Option<&'a str>,
+            mode: Mode,
+            socks_port: u16,
+            http_port: u16,
+            auto_update: bool,
+            panel: Option<&'a Panel>,
+            profiles: &'a [Profile],
+        }
+        let panel = Panel {
+            base_url: "https://panel.example.com".into(),
+            username: "alice".into(),
+        };
+        let profiles = vec![prof("alice-hy2-direct", hy2_direct_node())];
+        let mut want = serde_json::to_vec_pretty(&V1 {
+            schema_version: SCHEMA_VERSION,
+            active: Some("alice-hy2-direct"),
+            mode: Mode::Socks,
+            socks_port: 1080,
+            http_port: 8080,
+            auto_update: true,
+            panel: Some(&panel),
+            profiles: &profiles,
+        })
+        .unwrap();
+        want.push(b'\n');
+
+        let s = FakeSys::new();
+        s.put(
+            "/opt/bui-c/profiles.json",
+            std::str::from_utf8(&want).unwrap(),
+        );
+        // 旧文件没有 `deleted` 键：读得出来，墓碑为空
+        let loaded = Profiles::load(&s, &paths()).unwrap();
+        assert!(loaded.deleted.is_empty());
+        // 写回去逐字节相同
+        loaded.save(&s, &paths()).unwrap();
+        assert_eq!(
+            s.get("/opt/bui-c/profiles.json").unwrap().as_bytes(),
+            want.as_slice(),
+            "没有墓碑时文件与改动前逐字节相同"
+        );
+        assert!(!s
+            .get("/opt/bui-c/profiles.json")
+            .unwrap()
+            .contains("deleted"));
+        // 有墓碑才写出来，并且照样读得回去
+        let mut with = loaded.clone();
+        with.bury(&prof("gone", hy2_resi_node()), 11);
+        with.save(&s, &paths()).unwrap();
+        assert!(s
+            .get("/opt/bui-c/profiles.json")
+            .unwrap()
+            .contains("deleted"));
+        assert_eq!(Profiles::load(&s, &paths()).unwrap(), with);
+    }
+
+    /// 永不加 `deny_unknown_fields`：降级回旧版本时它必须还能读出这份文件（spec §5.7「兼容」）。
+    #[test]
+    fn an_old_v1_reader_still_parses_a_file_with_tombstones() {
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        struct V1 {
+            schema_version: u32,
+            active: Option<String>,
+            mode: Mode,
+            socks_port: u16,
+            http_port: u16,
+            auto_update: bool,
+            panel: Option<Panel>,
+            profiles: Vec<Profile>,
+        }
+        let mut p = Profiles::new_default();
+        p.bury(&prof("x", hy2_direct_node()), 1);
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(json.contains("\"deleted\""));
+        let _: V1 = serde_json::from_str(&json).expect("旧版本忽略未知字段");
     }
 
     #[test]
