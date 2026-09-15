@@ -30,6 +30,10 @@ pub struct AddOutcome {
     pub exit_ip: Option<String>,
     pub isp: Option<String>,
     pub class_label: String,
+    /// 必须重新拉订阅的用户（[`ResubscribeImpact`]）。**加上游也会命中**：跳跃段按当下
+    /// 槽数等分，多一个槽就把每个存活槽的段重切一遍，池里的住宅用户于是全员上名单
+    /// （4.0.0 把这份名单直接丢掉了 —— 这是本版要修的缺口）。
+    pub impact: ResubscribeImpact,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -278,7 +282,7 @@ pub async fn add(
         .collect::<Vec<_>>()
         .join(" ");
     let up2 = up.clone();
-    let _sync = crate::modules::residential::slots::update_group_slots_as(
+    let sync = crate::modules::residential::slots::update_group_slots_as(
         &ctx.store,
         &ctx.bus,
         crate::state::store::CALLER_UNLABELED,
@@ -308,16 +312,18 @@ pub async fn add(
         exit_ip: Some(exit_ip),
         isp: (!isp.is_empty()).then_some(isp),
         class_label: class.label().to_string(),
+        impact: sync.impact,
     })
 }
 
 /// 删一条上游；删掉最后一条时顺带 `enabled = false`（v3 `enable --remove` 同语义）。
 ///
-/// 返回**必须重新获取订阅**的用户，按后果分三组（[`ResubscribeImpact`]）：他们的 HY2
-/// 住宅节点端口或跳跃区间被这次删除改了，而那两样都写死在已下发的订阅里，客户端不会主动
+/// 返回**必须重新拉订阅**的用户，按原因分三组（[`ResubscribeImpact`]）：他们的 HY2
+/// 住宅节点端口或跳跃段被这次删除改了，而那两样都写死在已下发的订阅里，客户端不会主动
 /// 发现（要等下一次订阅更新：`bui-c` 的每日 timer、v2rayN 的定时更新，或人工重新获取），
-/// 所以 CLI 与面板都得逐组打给操作者；非空时还落一条哨兵事件（`bui incidents` / 面板
-/// 事件卡），三处共用 [`impact_title`] / [`impact_groups`] 这一份口径。
+/// 在那之前**反复断联**，所以 CLI 与面板都得逐组打给操作者；非空时还落一条哨兵事件
+/// （`bui incidents` / 面板事件卡），三处共用 [`impact_title`] / [`impact_groups`] 这一
+/// 份口径。
 ///
 /// 名单由 `update_group_slots_as` 在**真删的那一个临界区里**按写入前后两份期望态算出
 /// （[`bui_schema::slots::resubscribe_impact`]），所以不存在「算完名单又被别人改了池」
@@ -417,26 +423,31 @@ pub async fn remove(
     Ok(impact)
 }
 
-/// [`ResubscribeImpact`] 三组的组名与后果，**CLI / 面板 / 哨兵事件三处共用这一份口径**
-/// （主会话裁决 2026-09-14）。顺序与 [`impact_groups`] 一致，`web/app.js` 的
+/// [`ResubscribeImpact`] 三组的组名与**原因**，**CLI / 面板 / 哨兵事件三处共用这一份
+/// 口径**（主会话裁决 2026-09-14）。顺序与 [`impact_groups`] 一致，`web/app.js` 的
 /// `_RESI_IMPACT_GROUPS` 是它的逐字副本（面板拿的是 JSON，渲染在浏览器里）。
+///
+/// **三组的后果是同一个**：HY2 住宅节点反复断联，需重新拉订阅。每个
+/// `hysteria-residential[-<i>]` 只把自己那一片跳跃段 REDIRECT 到自己的监听端口，客户端
+/// 每 30 秒在手里那份订阅写着的段里随机换一个目的端口，换到已不属于本槽的端口时包被
+/// 丢掉（别的实例没有这条连接的状态），30 秒 idle 超时后重连。组名只说明**为什么**变了。
 const IMPACT_GROUPS: [(&str, &str); 3] = [
     (
         "原槽位已删除、已换槽",
-        "旧端口不再通向他的槽：没人监听就连不上，被搬到 0 号的那个槽顶替了就从别人的出口 IP 出去",
+        "旧端口与旧跳跃段都不再属于他那一槽的实例",
     ),
-    ("槽位序号被搬到 0 号", "端口下移，旧端口无人监听，连不上"),
+    ("槽位序号变了", "端口与跳跃段一起变"),
     (
         "端口跳跃区间被重切",
-        "端口没变、连得上，但旧区间里划给别的槽的那一段会从错误的出口 IP 出去",
+        "端口没变，但旧段里的端口会跳进别的实例",
     ),
 ];
 
-/// 名单的标题。**只说这些人手里那份订阅不能照旧用了**，不暗示它是别的什么
-/// （不是「全部住宅用户」，也不是「全部要改的东西」）。
+/// 名单的标题。**只说这些人的 HY2 住宅节点会反复断联、要重新拉订阅**，不暗示它是别的
+/// 什么（不是「全部住宅用户」，也不是「全部要改的东西」）。
 pub fn impact_title(i: &ResubscribeImpact) -> String {
     format!(
-        "{} 个用户手里那份订阅已不能照旧用，需要重新获取订阅",
+        "{} 个用户的 HY2 住宅节点会反复断联，需重新拉订阅",
         i.total()
     )
 }
@@ -461,6 +472,13 @@ pub fn impact_groups(i: &ResubscribeImpact) -> Vec<String> {
 /// 哨兵事件 `result` 的一行文案（`bui incidents` 与面板事件卡都按行显示，不能换行）。
 fn format_impact_line(i: &ResubscribeImpact) -> String {
     format!("{}：{}", impact_title(i), impact_groups(i).join("；"))
+}
+
+/// 四条改槽路径（add / remove / assign / rebalance）的回包共用的 `port_changed` 字段。
+/// **空名单返回 `None`** ⇒ 那个键压根不出现在回包里（`remove` 的两个端点例外：它们从 v3
+/// 起就无条件带这个键，`web/app.js` 按它渲染，不动）。
+pub fn impact_field(i: &ResubscribeImpact) -> Option<serde_json::Value> {
+    (!i.is_empty()).then(|| serde_json::json!(i))
 }
 
 /// 总开关。开启要求池非空（v3 `POST /api/residential/enable` 的 400 分支）
@@ -960,11 +978,11 @@ mod tests {
         (n.port, n.hop)
     }
 
-    /// 名单要覆盖**所有**手里那份订阅不能用了的人，不只是被删槽上的那个，而且两种后果
-    /// 分开报：carol 的槽被删（`40002` 已无人监听 ⇒ 连不上）= 组一；删掉序号最高的槽让
-    /// 槽位空间 3 → 2、存活槽的跳跃区间重切，bob 的 `mport=44000-46999` 有一半挪给了槽 0
-    /// 那个独立进程（鉴权 URL 全实例共用 ⇒ 连得上但走错出口 IP）= 组三。
-    /// alice 的旧区间是新区间的前缀子集，无害，一组都不进。
+    /// 名单要覆盖**所有**手里那份订阅不能用了的人，不只是被删槽上的那个，而且两种原因
+    /// 分开报：carol 的槽被删（`40002` 已无人监听）= 组一；删掉序号最高的槽让槽位空间
+    /// 3 → 2、存活槽的跳跃区间重切，bob 的 `mport=44000-46999` 有一半挪给了槽 0 那个独立
+    /// 进程（他每 30 秒跳一次端口、跳到那一半里就丢包）= 组三。两组的后果一样：反复断联、
+    /// 要重新拉订阅。alice 的旧区间是新区间的前缀子集，无害，一组都不进。
     #[tokio::test]
     async fn remove_reports_everyone_whose_subscription_stops_working() {
         let d = tempfile::tempdir().unwrap();
@@ -1007,11 +1025,9 @@ mod tests {
         );
         assert_eq!(
             incs[0].result,
-            "2 个用户手里那份订阅已不能照旧用，需要重新获取订阅：\
-             原槽位已删除、已换槽（1 人，旧端口不再通向他的槽：没人监听就连不上，被搬到 0 \
-             号的那个槽顶替了就从别人的出口 IP 出去）：carol；\
-             端口跳跃区间被重切（1 人，端口没变、连得上，但旧区间里划给别的槽的那一段会从\
-             错误的出口 IP 出去）：bob"
+            "2 个用户的 HY2 住宅节点会反复断联，需重新拉订阅：\
+             原槽位已删除、已换槽（1 人，旧端口与旧跳跃段都不再属于他那一槽的实例）：carol；\
+             端口跳跃区间被重切（1 人，端口没变，但旧段里的端口会跳进别的实例）：bob"
         );
         assert!(
             !incs[0].result.contains("pw1") && !incs[0].result.contains("user1"),
@@ -1056,10 +1072,9 @@ mod tests {
         assert_eq!(incs.len(), 1);
         assert_eq!(
             incs[0].result,
-            "3 个用户手里那份订阅已不能照旧用，需要重新获取订阅：\
-             原槽位已删除、已换槽（1 人，旧端口不再通向他的槽：没人监听就连不上，被搬到 0 \
-             号的那个槽顶替了就从别人的出口 IP 出去）：alice；\
-             槽位序号被搬到 0 号（2 人，端口下移，旧端口无人监听，连不上）：bob、erin"
+            "3 个用户的 HY2 住宅节点会反复断联，需重新拉订阅：\
+             原槽位已删除、已换槽（1 人，旧端口与旧跳跃段都不再属于他那一槽的实例）：alice；\
+             槽位序号变了（2 人，端口与跳跃段一起变）：bob、erin"
         );
     }
 

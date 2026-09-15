@@ -893,16 +893,17 @@ function addResidentialUrl() {
     }).catch(e => { restore(); _resiErr(e.message || "请求失败"); });
 }
 
-// 删上游回包 port_changed 的三组：组名与后果是
+// 改槽回包 port_changed 的三组：组名与原因是
 // crates/bui/src/modules/residential/upstream.rs 的 IMPACT_GROUPS 的逐字副本
 // （CLI / 面板 / 哨兵事件三处同一份口径），顺序也必须一致。
+// 三组的后果是同一个：这些用户的 HY2 住宅节点会反复断联，需重新拉订阅。
 const _RESI_IMPACT_GROUPS = [
     ["slot_removed", "原槽位已删除、已换槽",
-        "旧端口不再通向他的槽：没人监听就连不上，被搬到 0 号的那个槽顶替了就从别人的出口 IP 出去"],
-    ["slot_moved", "槽位序号被搬到 0 号",
-        "端口下移，旧端口无人监听，连不上"],
+        "旧端口与旧跳跃段都不再属于他那一槽的实例"],
+    ["slot_moved", "槽位序号变了",
+        "端口与跳跃段一起变"],
     ["hop_resliced", "端口跳跃区间被重切",
-        "端口没变、连得上，但旧区间里划给别的槽的那一段会从错误的出口 IP 出去"],
+        "端口没变，但旧段里的端口会跳进别的实例"],
 ];
 
 // 把回包的 port_changed 渲染成 `{ total, text }`。text 与哨兵事件那一行同构
@@ -920,7 +921,7 @@ function _resiImpact(pc) {
     if (!total) return { total: 0, text: "" };
     return {
         total,
-        text: total + " 个用户手里那份订阅已不能照旧用，需要重新获取订阅：" + parts.join("；"),
+        text: total + " 个用户的 HY2 住宅节点会反复断联，需重新拉订阅：" + parts.join("；"),
     };
 }
 
@@ -1382,8 +1383,12 @@ function rebalanceSlots() {
     api("/residential/rebalance", { method: "POST" }).then(r => {
         if (btn) { btn.disabled = false; btn.textContent = "按槽重排"; }
         if (r && r.success) {
+            // 用户名只经 textContent 的 _resiErr 输出：toast 走 innerHTML，不喂用户数据
+            const imp = _resiImpact(r.port_changed);
             toast("已重排 " + (r.moved || 0) + " 个用户" +
-                (r.xray_rules_pending ? "，约 1 秒后槽路由生效（不重启 xray）" : ""));
+                (r.xray_rules_pending ? "，约 1 秒后槽路由生效（不重启 xray）" : "") +
+                (imp.total ? "，" + imp.total + " 个用户需重新拉订阅" : ""), imp.total > 0);
+            if (imp.total) _resiErr(imp.text);
             loadResiHealth();
             load();   // 用户列表的槽位列跟着刷新
         } else {
