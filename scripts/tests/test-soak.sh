@@ -30,14 +30,17 @@ sleep 30 &
 FAKE_PID=$!
 export FAKE_PID
 OUT="$WORK/soak"
-bash "$ROOT/scripts/ops/soak-sample.sh" --seconds 2 --interval 1 --out "$OUT" --units "xray b-ui" > "$WORK/sample.log" 2>&1
+# 采样窗口按整秒截断（END = 起跑那一秒 + 2），间隔 1 秒时第二轮要求「起跑秒内小数 + 一轮耗时 < 1」，
+# 起跑落在秒尾或负载拖慢一轮就只剩一轮（CI 实测过）。间隔 0.2 秒：只要第一轮耗时 < 0.8 秒就必有第二轮，总时长不变。
+bash "$ROOT/scripts/ops/soak-sample.sh" --seconds 2 --interval 0.2 --out "$OUT" --units "xray b-ui" > "$WORK/sample.log" 2>&1
 assert_eq "0" "$?" "采样脚本正常退出"
 assert_eq "1" "$([[ -f "$OUT/DONE" ]] && echo 1 || echo 0)" "写了 DONE 标记"
 assert_contains "rows=" "$(cat "$OUT/DONE")" "DONE 里有行数统计"
 assert_eq "ts,elapsed_s,unit,pid,rss_kb,fd,nrestarts,tcp_estab,udp_alloc,load1,mem_avail_kb" \
     "$(head -1 "$OUT/soak.csv")" "CSV 表头固定"
-rows=$(tail -n +2 "$OUT/soak.csv" | wc -l)
-assert_eq "1" "$([[ "$rows" -ge 4 ]] && echo 1 || echo 0)" "2 秒 × 1 秒 × 2 单元 ≥ 4 行（实测 $rows）"
+# 每轮给每个单元写一行：按单元计行数，取最少的那个，就是完整采到的轮数
+rounds=$(tail -n +2 "$OUT/soak.csv" | awk -F, '{c[$3]++} END {m = 0; for (u in c) if (m == 0 || c[u] < m) m = c[u]; print m}')
+assert_eq "1" "$([[ "$rounds" -ge 2 ]] && echo 1 || echo 0)" "每个单元至少采两轮（实测最少 $rounds 轮）"
 assert_eq "1" "$(awk -F, 'NR == 2 {print ($5 + 0 > 0) ? 1 : 0}' "$OUT/soak.csv")" "RSS 取到真实值"
 assert_eq "2" "$(tail -n +2 "$OUT/soak.csv" | awk -F, '{print $3}' | sort -u | wc -l)" "两个单元都被采到"
 kill "$FAKE_PID" 2>/dev/null
