@@ -1,7 +1,7 @@
-# 由 scripts/release/pin-kernels.sh --write 生成，勿手工编辑（生成时间 2026-09-12T08:35:47Z）
+# 由 scripts/release/pin-kernels.sh --write 生成，勿手工编辑（生成时间 2026-09-15T01:50:34Z）
 # kernel role version arch sha256 url
-sing-box target 1.14.0 amd64 2375de6999f4f56ab46b4fc5ddf26a6aba1d3e61a0f4e7ddec2f4690457d5f63 https://github.com/SagerNet/sing-box/releases/download/v1.14.0/sing-box-1.14.0-linux-amd64.tar.gz
-sing-box target 1.14.0 arm64 04d9b40bc98dc55b6f509ce3292145c65478f65866bea64826ebb2f382385088 https://github.com/SagerNet/sing-box/releases/download/v1.14.0/sing-box-1.14.0-linux-arm64.tar.gz
+sing-box target 1.14.1 amd64 12cb2816b52febb356f6a885b740cc8758c3f30b8ae0ca8edba80f0d2d35343f https://github.com/SagerNet/sing-box/releases/download/v1.14.1/sing-box-1.14.1-linux-amd64.tar.gz
+sing-box target 1.14.1 arm64 6060b42fa84c5dcaeae1799af7f61b0f1ae4855d9d5ddc9e02baba17154b3ae2 https://github.com/SagerNet/sing-box/releases/download/v1.14.1/sing-box-1.14.1-linux-arm64.tar.gz
 xray target 26.3.27 amd64 23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-linux-64.zip
 xray target 26.3.27 arm64 4d30283ae614e3057f730f67cd088a42be6fdf91f8639d82cb69e48cde80413c https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-linux-arm64-v8a.zip
 hysteria target 2.12.2 amd64 6493dfffd55b5883f64c76c63880ecc32988f0c568c9ca9014907877b4d55f94 https://github.com/apernet/hysteria/releases/download/app/v2.12.2/hysteria-linux-amd64
