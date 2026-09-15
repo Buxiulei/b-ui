@@ -63,6 +63,41 @@
 //!
 //! 启动前本实例的链 / 表本来就不该存在（上一次正常退出时 hysteria 自己清掉了），所以
 //! **命中即孤儿**，不必再问「这是不是我这次要建的那一张」。
+//!
+//! ## 运行中的实例：CLI 层的护栏（4.0.1）
+//!
+//! 「命中即孤儿」只在**启动前**成立。对一个**正在服役**的实例跑清理，判据照样命中——命中的
+//! 却是它现役的那张表 / 那条链：清掉之后端口跳跃当即失效，且要等该实例下次重启才恢复
+//! （hysteria 只在启动时建规则）。2026-09-15 主会话本想「手跑一次 prestart」做零影响验证，
+//! 查过实现才发现这一点，改用重启实例。
+//!
+//! 所以 [`run`]（**只有** `bui hy2-prestart` 这一个 CLI 入口）在**手动**调用时先按配置路径
+//! 推出单元名（[`unit_for_config`]），`ActiveState` 恰为 [`ACTIVE_STATE`] 就什么都不做、报
+//! [`InstanceRunning`]（`main` 打印一行并退 2）；`--force` 照原样执行。
+//!
+//! ## 为什么要短路（这段不是多余代码，别删）
+//!
+//! 护栏防的是「人或 agent 手动在活实例上跑」，**不是**拦 systemd 自己的启动。而
+//! `ExecStartPre=` 跑在 HY2 单元的**启动关键路径**上，在那里多问 systemd 一句是要付代价的：
+//! [`crate::sys::real::RealHost::run`] 用的是 `Command::output()`、**没有超时**；单元里
+//! `ExecStartPre=-` 那个 `-` 只忽略退出码、**救不了挂起**（真卡住的上界是 systemd 的
+//! `DefaultTimeoutStartSec`，本机 90s）。护栏之前这里只碰 iptables / nft、从不与 systemd
+//! 通信，加一次 `systemctl show` 等于给每次 HY2 启动新增一个依赖。
+//!
+//! 所以 [`run`] 收一个 `spawned_by_systemd`：为真（被 systemd 拉起）时**直接清理，一次
+//! [`Host::unit_property`] 都不发**，只有手动调用才查 `ActiveState`。判据是环境里有没有
+//! [`SYSTEMD_INVOCATION_ENV`]——2026-09-15 在 systemd 259 上实测 `ExecStartPre=` 进程确实有它
+//! ——由 `main` 读出来**按参数传进来**（[`Host`] 没有环境变量入口、[`crate::sys::fake::FakeHost`]
+//! 也注入不了 env，就地 `std::env::var` 会让这段逻辑不可测）。
+//!
+//! 两条**不受**护栏影响的路径（改动的全部风险都在这里，各有用例守住）：
+//! - **systemd 的 `ExecStartPre=`**：`INVOCATION_ID` 把整个护栏短路掉，正常启动路径一步不变、
+//!   也不多一次 systemd 往返。万一短路没生效（环境被清过），判定也只认**字面** `active`——
+//!   systemd 跑 `ExecStartPre=` 时单元是 `activating`，于是 `activating` / `inactive` /
+//!   `failed` / 查不到 / 查询失败一律放行（把 `activating` 也算进去就等于每次启动都清不了
+//!   孤儿链，护栏自己制造出它要防的那个崩溃循环）；推不出单元名同样放行。这道第二保险照旧留着。
+//! - **watchdog 自愈与对账**：它们直接调 [`cleanup`]，护栏只在 [`run`] 里，所以进程内调用点
+//!   行为一字不变（崩溃循环中的实例在 systemd 眼里可能正是 `active`，自愈要的就是先清再重启）。
 
 use crate::sys::Host;
 use std::collections::BTreeSet;
@@ -78,6 +113,12 @@ pub const TABLES: [&str; 2] = ["iptables", "ip6tables"];
 /// `ExecStartPre=` 与内核本体同一份 `Environment=`，所以 `bui hy2-prestart` 读到的就是
 /// 内核会用的那个后端。
 pub const FIREWALL_BACKEND_ENV: &str = "HYSTERIA_FIREWALL_BACKEND";
+
+/// systemd 给一次单元启动里的**每个**进程设的调用 ID（`ExecStartPre=` 进程与同一次启动的
+/// `ExecStart` 进程同值）。2026-09-15 在两台生产机（systemd 259）上用 `systemd-run --wait
+/// --collect` 起瞬态单元实测：`ExecStartPre=` 进程的环境里确实有它，值长 32。
+/// `main` 读它、按参数传进 [`run`]（见模块文档「为什么要短路」）。
+pub const SYSTEMD_INVOCATION_ENV: &str = "INVOCATION_ID";
 
 /// nft 后端的表名前缀（上游 `"hysteria_" + shortHash(...)`）。
 pub const NFT_TABLE_PREFIX: &str = "hysteria_";
@@ -321,9 +362,70 @@ fn cleanup_with(host: &dyn Host, config: &Path, backend: Option<&str>) -> Vec<St
     done
 }
 
-/// `bui hy2-prestart <config>`：两个 hysteria 单元的 `ExecStartPre=-`。
-/// **永远退 0**——清理失败绝不能阻塞内核启动（单元里的 `-` 前缀是第二道保险）。
-pub fn run(host: &dyn Host, config: &Path) -> anyhow::Result<()> {
+/// 「这份配置的实例正在服役」——`bui hy2-prestart` 据此拒绝清理时的专属错误：
+/// `main` 打印一行并以**退出码 2** 结束（与 `bui upgrade` 的降级守卫同一口径）。
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct InstanceRunning(pub String);
+
+/// systemd 里「正在服役」的那**一个**字面值。只有它拒绝：`ExecStartPre=` 跑在
+/// `activating` 上，多认一个状态就会拦下正常启动（见模块文档）。
+pub const ACTIVE_STATE: &str = "active";
+
+/// 配置路径 → 它那个受管单元名。直连与槽 0 复用 [`crate::modules::watchdog::HY2_CONFIGS`]
+/// 那份 (单元, 配置) 表；槽 1.. 的序号合法性（十进制规范写法 + 范围）一律交给
+/// [`crate::reconcile::is_managed_unit`] 判，不另造一套解析。
+///
+/// 认不出来 → `None`，调用方**放行**：推导失败绝不能成为拒绝启动的理由。
+pub fn unit_for_config(config: &Path) -> Option<String> {
+    let file = config.file_name()?.to_str()?;
+    if let Some((unit, _)) = crate::modules::watchdog::HY2_CONFIGS
+        .iter()
+        .find(|(_, cfg)| *cfg == file)
+    {
+        return Some((*unit).to_string());
+    }
+    let index = file
+        .strip_prefix("config-residential-")?
+        .strip_suffix(".yaml")?;
+    let unit = format!("hysteria-residential-{index}");
+    crate::reconcile::is_managed_unit(&unit).then_some(unit)
+}
+
+/// 这份配置的实例此刻是不是 [`ACTIVE_STATE`]：是则返回单元名（调用方据此拒绝）。
+/// 推不出单元名、`ActiveState` 查不到或查询失败 → `None`（放行，不知道不拦）。
+fn active_unit(host: &dyn Host, config: &Path) -> Option<String> {
+    let unit = unit_for_config(config)?;
+    let state = host.unit_property(&unit, "ActiveState").ok().flatten()?;
+    (state.trim() == ACTIVE_STATE).then_some(unit)
+}
+
+/// `bui hy2-prestart <config> [--force]`：两个 hysteria 单元的 `ExecStartPre=-`。
+/// 清理本身**永远退 0**——失败绝不能阻塞内核启动（单元里的 `-` 前缀是第二道保险）。
+///
+/// 唯一的例外是护栏（模块文档「运行中的实例」）：该实例的 `ActiveState` 恰为
+/// [`ACTIVE_STATE`] 而 `force` 为假时**一步清理都不做**，报 [`InstanceRunning`]。
+///
+/// `spawned_by_systemd`（`main` 按 [`SYSTEMD_INVOCATION_ENV`] 算出）为真时**整个护栏短路、
+/// 一次 systemd 查询都不发**：启动关键路径上不加这个依赖（模块文档「为什么要短路」）。
+pub fn run(
+    host: &dyn Host,
+    config: &Path,
+    force: bool,
+    spawned_by_systemd: bool,
+) -> anyhow::Result<()> {
+    // 被 systemd 拉起（`ExecStartPre=`）就直接清理，一次 systemd 查询都不发。
+    if !force && !spawned_by_systemd {
+        if let Some(unit) = active_unit(host, config) {
+            return Err(InstanceRunning(format!(
+                "{unit} 正在运行（active），此时清理会删掉它现役的端口跳跃规则：\
+                 端口跳跃当即失效，且要等该实例下次重启才恢复。本命令是给单元启动前的 \
+                 ExecStartPre 用的；只想让规则恢复请 systemctl restart {unit}，\
+                 明知后果、确实要现在清，请加 --force"
+            ))
+            .into());
+        }
+    }
     for line in cleanup(host, config) {
         tracing::info!("{line}");
     }
@@ -531,7 +633,13 @@ mod tests {
             Vec::<String>::new()
         );
         assert_eq!(h.ops(), Vec::<String>::new());
-        assert!(run(&h, Path::new("/opt/b-ui/config-residential.yaml")).is_ok());
+        assert!(run(
+            &h,
+            Path::new("/opt/b-ui/config-residential.yaml"),
+            false,
+            false
+        )
+        .is_ok());
 
         // 配置读不到 / 没有 listen 行：只记一行，不跑任何命令，退 0
         let h2 = FakeHost::new();
@@ -542,7 +650,7 @@ mod tests {
         assert_eq!(done.len(), 1);
         assert!(done[0].contains("读不到"));
         assert_eq!(h2.ops(), Vec::<String>::new());
-        assert!(run(&h2, Path::new("/opt/b-ui/config.yaml")).is_ok());
+        assert!(run(&h2, Path::new("/opt/b-ui/config.yaml"), false, false).is_ok());
     }
 
     /// 没有孤儿的常态（正常 SIGTERM 退出后 hysteria 自己清干净了）：只读一次 dump，
@@ -818,7 +926,13 @@ table ip hysteria_7c1e0f2a {
             ]
         );
         // `bui hy2-prestart` 永远退 0
-        assert!(run(&h, Path::new("/opt/b-ui/config-residential.yaml")).is_ok());
+        assert!(run(
+            &h,
+            Path::new("/opt/b-ui/config-residential.yaml"),
+            false,
+            false
+        )
+        .is_ok());
     }
 
     /// v3 的直连实例（`listen: :10000,20000-30000`）与住宅实例（`:40000,41000-50000`）
@@ -904,6 +1018,240 @@ table ip6 hysteria_4d4d4d4d
             "run:nft delete table ip6 hysteria_4d4d4d4d",
         ] {
             assert!(ops.iter().any(|o| o == gone), "没清掉 {gone}：{ops:?}");
+        }
+    }
+
+    // ── 运行中的实例：CLI 层的护栏（只在 `run` 里）────────────────────────────────
+
+    /// 播种「这个单元此刻的 `ActiveState`」。`unit_props` 只认单元**全名**。
+    fn set_state(h: &FakeHost, unit: &str, state: &str) {
+        h.with(|i| {
+            i.unit_props.insert(
+                (format!("{unit}.service"), "ActiveState".into()),
+                state.into(),
+            );
+        });
+    }
+
+    /// 已清掉住宅实例那条链的标志（本实例 base 40000）。
+    const RESI_CLEANED: &str = "run:iptables -t nat -X HYSTERIA-PR-1111aaaa";
+
+    /// 配置路径 → 受管单元名：直连与槽 0 复用 watchdog 那份 (单元, 配置) 表，
+    /// 槽 1.. 的序号交给 `is_managed_unit` 判。认不出来一律 `None` = 放行。
+    #[test]
+    fn the_unit_name_is_derived_from_the_config_file_name() {
+        for (cfg, unit) in [
+            ("/opt/b-ui/config.yaml", "hysteria-server"),
+            ("/opt/b-ui/config-residential.yaml", "hysteria-residential"),
+            (
+                "/opt/b-ui/config-residential-3.yaml",
+                "hysteria-residential-3",
+            ),
+        ] {
+            assert_eq!(
+                unit_for_config(Path::new(cfg)).as_deref(),
+                Some(unit),
+                "{cfg}"
+            );
+        }
+        // 推不出来 → None（放行）：不是 hysteria 的配置、槽 0 只认不带序号的写法、
+        // 非规范序号与越界序号（槽位上限 MAX_RESI_SLOTS = 8）都不认
+        for cfg in [
+            "/opt/b-ui/xray-config.json",
+            "/opt/b-ui/singbox-relay.json",
+            "/opt/b-ui/config-residential-0.yaml",
+            "/opt/b-ui/config-residential-01.yaml",
+            "/opt/b-ui/config-residential-8.yaml",
+            "/opt/b-ui/config-residential-x.yaml",
+            "/opt/b-ui/config.yml",
+            "/opt/b-ui",
+        ] {
+            assert_eq!(unit_for_config(Path::new(cfg)), None, "{cfg}");
+        }
+    }
+
+    /// 护栏：实例正在服役时**一步清理都不做**（一个命令都没发出去），报的是 `main` 用来
+    /// 给退出码 2 的那个类型，文案里有可操作的那半句。
+    ///
+    /// 这就是 2026-09-15 差点发生的事：手跑一次 prestart 会把它现役的那张表 / 那条链删掉，
+    /// 端口跳跃当即失效、直到该实例下次重启才恢复。
+    #[test]
+    fn a_running_instance_is_refused_and_nothing_is_cleaned() {
+        let h = host_with_both_tables();
+        set_state(&h, "hysteria-residential", "active");
+        let err = run(
+            &h,
+            Path::new("/opt/b-ui/config-residential.yaml"),
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.is::<InstanceRunning>(), "main 靠这个类型给退出码 2");
+        let msg = err.to_string();
+        assert!(msg.contains("正在运行"), "{msg}");
+        assert!(msg.contains("请加 --force"), "{msg}");
+        assert_eq!(
+            h.ops(),
+            Vec::<String>::new(),
+            "拒绝时一个 iptables / nft 命令都不许发"
+        );
+    }
+
+    /// `--force`：运维明知后果（实例卡在 failed 又想立刻清）时照原样执行。
+    #[test]
+    fn force_cleans_even_while_the_instance_is_running() {
+        let h = host_with_both_tables();
+        set_state(&h, "hysteria-residential", "active");
+        assert!(run(
+            &h,
+            Path::new("/opt/b-ui/config-residential.yaml"),
+            true,
+            false
+        )
+        .is_ok());
+        assert!(h.ops().iter().any(|o| o == RESI_CLEANED), "{:?}", h.ops());
+    }
+
+    /// **正常启动路径一步不变**（本改动最大的风险）：systemd 执行 `ExecStartPre=` 时单元是
+    /// `activating`，不是 `active`。所以除了字面 `active` 之外的每一种状态——含查不到与
+    /// 查询失败——都必须照常清理。护栏一旦把 `activating` 也算进去，每次启动都清不了孤儿链，
+    /// 就又变回它要防的那个崩溃循环（事故实录见模块文档）。
+    ///
+    /// systemd 那条路现在还多一层短路（`spawned_by_systemd`），这里守的是短路没生效时的
+    /// **第二道保险**，所以照旧按手动调用（`spawned_by_systemd = false`）逐个状态跑。
+    #[test]
+    fn every_state_other_than_active_still_cleans() {
+        for state in [
+            Some("activating"), // systemd 跑 ExecStartPre 时就是这个
+            Some("deactivating"),
+            Some("inactive"),
+            Some("failed"),
+            Some("unknown"),
+            Some(""), // `systemctl show` 给空值
+            None,     // 查不到这个单元 / 查询失败
+        ] {
+            let h = host_with_both_tables();
+            if let Some(s) = state {
+                set_state(&h, "hysteria-residential", s);
+            }
+            assert!(
+                run(
+                    &h,
+                    Path::new("/opt/b-ui/config-residential.yaml"),
+                    false,
+                    false
+                )
+                .is_ok(),
+                "{state:?}"
+            );
+            assert!(
+                h.ops().iter().any(|o| o == RESI_CLEANED),
+                "{state:?} 被护栏拦下了，正常启动路径会清不了孤儿链：{:?}",
+                h.ops()
+            );
+        }
+    }
+
+    /// 推不出单元名（陌生的配置文件名）⇒ 放行，哪怕住宅单元此刻正是 `active`：
+    /// 推导失败绝不能成为拒绝启动的理由。
+    #[test]
+    fn a_config_whose_unit_cannot_be_derived_is_let_through() {
+        let h = host_with_both_tables();
+        set_state(&h, "hysteria-residential", "active");
+        h.with(|i| {
+            i.files.insert(
+                "/opt/b-ui/hy2-extra.yaml".into(),
+                (resi_config().as_bytes().to_vec(), 0o600),
+            );
+        });
+        assert!(run(&h, Path::new("/opt/b-ui/hy2-extra.yaml"), false, false).is_ok());
+        assert!(h.ops().iter().any(|o| o == RESI_CLEANED), "{:?}", h.ops());
+    }
+
+    /// 护栏只在 CLI 入口层：watchdog 的自愈与对账直接调 [`cleanup`]，单元状态一概不看。
+    /// 崩溃循环里的实例在 systemd 眼里可能正是 `active`（`Restart=always` 刚把它拉起来），
+    /// 自愈要的就是「清掉本实例的表 / 链再重启」——这条路径行为一字不变。
+    #[test]
+    fn the_in_process_cleanup_ignores_the_unit_state() {
+        let h = host_with_both_tables();
+        set_state(&h, "hysteria-residential", "active");
+        assert_eq!(
+            cleanup(&h, Path::new("/opt/b-ui/config-residential.yaml")),
+            vec![
+                "已清理 iptables nat 链 HYSTERIA-PR-1111aaaa（本实例端口跳跃孤儿）",
+                "已清理 ip6tables nat 链 HYSTERIA-PR-c66a02d9（本实例端口跳跃孤儿）",
+            ]
+        );
+        assert!(h.ops().iter().any(|o| o == RESI_CLEANED), "{:?}", h.ops());
+    }
+
+    /// **被 systemd 拉起时一次 systemd 查询都不发**：`ExecStartPre=` 在 HY2 单元的启动关键
+    /// 路径上，而 `RealHost::run` 用的 `Command::output()` 没有超时、单元里 `ExecStartPre=-`
+    /// 的 `-` 只忽略退出码、救不了挂起（模块文档「为什么要短路」）。
+    ///
+    /// 怎么证明「没查」：单元播成 `active`——**查了就必定拒绝**，所以「照样清理」本身就是一层
+    /// 证据；再直接断言 `unit_prop_reads()` 是空的（`unit_property` 是纯查询，不进 `ops`）。
+    /// 后半段用同一份播种手动跑一次作**阳性对照**：证明这份流水确实会记账、该状态确实会拒绝，
+    /// 否则「空流水」可能只是假机器不记账、断言恒绿。
+    #[test]
+    fn a_systemd_spawned_run_cleans_without_asking_systemd() {
+        let h = host_with_both_tables();
+        set_state(&h, "hysteria-residential", "active");
+        assert!(run(
+            &h,
+            Path::new("/opt/b-ui/config-residential.yaml"),
+            false,
+            true
+        )
+        .is_ok());
+        assert!(h.ops().iter().any(|o| o == RESI_CLEANED), "{:?}", h.ops());
+        assert_eq!(
+            h.unit_prop_reads(),
+            Vec::new(),
+            "启动关键路径上一次 systemd 查询都不许发"
+        );
+
+        // 阳性对照：同一份播种，手动调用（环境里没有 INVOCATION_ID）
+        let m = host_with_both_tables();
+        set_state(&m, "hysteria-residential", "active");
+        assert!(run(
+            &m,
+            Path::new("/opt/b-ui/config-residential.yaml"),
+            false,
+            false
+        )
+        .is_err());
+        assert_eq!(
+            m.unit_prop_reads(),
+            vec![(
+                "hysteria-residential.service".to_string(),
+                "ActiveState".to_string()
+            )],
+            "手动调用恰好查一次 ActiveState"
+        );
+    }
+
+    /// `--force` 无条件清理，与是不是 systemd 拉起的无关。
+    #[test]
+    fn force_cleans_under_both_spawn_paths() {
+        for spawned in [false, true] {
+            let h = host_with_both_tables();
+            set_state(&h, "hysteria-residential", "active");
+            assert!(
+                run(
+                    &h,
+                    Path::new("/opt/b-ui/config-residential.yaml"),
+                    true,
+                    spawned
+                )
+                .is_ok(),
+                "{spawned}"
+            );
+            assert!(
+                h.ops().iter().any(|o| o == RESI_CLEANED),
+                "{spawned}: {:?}",
+                h.ops()
+            );
         }
     }
 }

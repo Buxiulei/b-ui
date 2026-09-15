@@ -108,11 +108,16 @@ pub enum Command {
         args: Vec<String>,
     },
     /// Hysteria2 启动前清理**本实例**残留的端口跳跃 nat 链（两个 hysteria 单元的
-    /// `ExecStartPre=-`，也被 watchdog 的自愈分支复用）。永远退 0。
+    /// `ExecStartPre=-`，也被 watchdog 的自愈分支复用）。清理永远退 0；该实例**正在运行**时
+    /// 拒绝执行并退 2（此时清理会删掉它现役的端口跳跃规则），除非加 `--force`。
     Hy2Prestart {
         /// 该实例的配置路径（`/opt/b-ui/config.yaml` 或 `config-residential.yaml`），
         /// 从它的 `listen:` 行取本实例的 base 端口与跳跃区间
         config: PathBuf,
+        /// 该实例正在运行时也照样清（默认拒绝：会删掉它现役的端口跳跃规则，
+        /// 端口跳跃当即失效、要等下次重启才恢复）
+        #[arg(long)]
+        force: bool,
     },
     /// 住宅出口（上游池 / 体检 / 切换 / 黑名单）
     Residential {
@@ -356,12 +361,23 @@ mod tests {
                 .unwrap()
                 .command,
             Some(Command::Hy2Prestart {
-                config: PathBuf::from("/opt/b-ui/config-residential.yaml")
+                config: PathBuf::from("/opt/b-ui/config-residential.yaml"),
+                force: false
             })
         );
         assert!(
             Cli::try_parse_from(["bui", "hy2-prestart"]).is_err(),
             "配置路径是必填：不给就不知道清哪个实例的链"
+        );
+        // 护栏的逃生门：单元里渲染的那一行**不带** --force，只有运维手跑时才加
+        assert_eq!(
+            Cli::try_parse_from(["bui", "hy2-prestart", "/opt/b-ui/config.yaml", "--force"])
+                .unwrap()
+                .command,
+            Some(Command::Hy2Prestart {
+                config: PathBuf::from("/opt/b-ui/config.yaml"),
+                force: true
+            })
         );
     }
 

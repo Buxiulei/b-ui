@@ -184,8 +184,27 @@ async fn dispatch(command: Command) -> Result<()> {
             .await
         }
         Command::AuthHook { .. } => unreachable!("auth-hook 已在 main 里提前返回"),
-        Command::Hy2Prestart { config } => {
-            modules::portjump::run(&sys::real::RealHost::new(), &config)
+        Command::Hy2Prestart { config, force } => {
+            // 护栏（4.0.1）：该实例正在运行时清理会删掉它**现役**的端口跳跃规则，所以打印
+            // 一行中文并以退出码 2 结束、什么都不清（`bui upgrade` 的降级守卫同一口径）。
+            // 护栏只管**手动**调用：systemd 自己拉起（`ExecStartPre=`）时环境里有
+            // `INVOCATION_ID`，`run` 据此直接清理、一次 systemd 查询都不发（理由见
+            // `portjump` 模块文档「为什么要短路」）。环境变量在这里读、按参数传下去，
+            // 好让 `portjump::run` 保持纯函数可测（`kernels::resolve_manifest_url` 同一惯例）。
+            let spawned_by_systemd =
+                std::env::var(modules::portjump::SYSTEMD_INVOCATION_ENV).is_ok();
+            match modules::portjump::run(
+                &sys::real::RealHost::new(),
+                &config,
+                force,
+                spawned_by_systemd,
+            ) {
+                Err(e) if e.is::<modules::portjump::InstanceRunning>() => {
+                    eprintln!("{e}");
+                    std::process::exit(2);
+                }
+                r => r,
+            }
         }
         Command::Residential { cmd } => {
             modules::residential::cli::run(cmd, PathBuf::from(paths::SOCKET_PATH)).await

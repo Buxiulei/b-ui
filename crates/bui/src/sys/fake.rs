@@ -46,6 +46,9 @@ pub struct FakeInner {
     /// `journal_read` 的脚本化返回，按调用顺序逐个弹出；弹空后返回 `Ok(vec![])`。
     /// `Err(文案)` 模拟 journalctl 失败（游标失效 / 没装）。
     pub journal: std::collections::VecDeque<Result<Vec<JournalRecord>, String>>,
+    /// `unit_property` 的查询流水（单元全名, 属性名）：纯查询不进 `ops`，
+    /// 「一次 systemd 都没查」这类断言靠它证明（`bui hy2-prestart` 的启动关键路径）。
+    pub unit_prop_reads: Vec<(String, String)>,
     /// 操作流水（顺序可断言）
     pub ops: Vec<String>,
 }
@@ -76,6 +79,7 @@ impl Default for FakeInner {
             hostname: "node-a".into(),
             now: time::macros::datetime!(2026-09-11 00:00:00 UTC),
             journal: std::collections::VecDeque::new(),
+            unit_prop_reads: Vec::new(),
             ops: Vec::new(),
         }
     }
@@ -104,6 +108,11 @@ impl FakeHost {
 
     pub fn clear_ops(&self) {
         self.lock().ops.clear();
+    }
+
+    /// 读回 `unit_property` 被查过的 (单元全名, 属性名)：断言「一次都没查」用。
+    pub fn unit_prop_reads(&self) -> Vec<(String, String)> {
+        self.lock().unit_prop_reads.clone()
     }
 
     /// 读回写入的文件内容。
@@ -303,11 +312,10 @@ impl Host for FakeHost {
 
     fn unit_property(&self, unit: &str, prop: &str) -> Result<Option<String>> {
         // unit_props **只认全名**：播成裸名查不到、返回 None（`fail_units` 的宽容不适用于它）。
-        Ok(self
-            .lock()
-            .unit_props
-            .get(&(unit_full(unit), prop.to_string()))
-            .cloned())
+        let key = (unit_full(unit), prop.to_string());
+        let mut i = self.lock();
+        i.unit_prop_reads.push(key.clone());
+        Ok(i.unit_props.get(&key).cloned())
     }
 
     fn sysctl_get(&self, key: &str) -> Result<Option<String>> {
