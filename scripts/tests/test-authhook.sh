@@ -33,7 +33,11 @@ assert_eq "1" "$([[ "$calls" -ge 70 && "$calls" -le 130 ]] && echo 1 || echo 0)"
 assert_eq "1" "$([[ -s "$OUT/watch.csv" ]] && echo 1 || echo 0)" "watch.csv 有内容"
 assert_eq "1" "$(awk -F, 'NR == 1 {print ($3 + 0 > 0) ? 1 : 0}' "$(find "$OUT" -name 'lat-*.csv' | head -1)")" "延迟记到微秒"
 
-out=$(bash "$ROOT/scripts/ops/authhook-report.sh" "$OUT" --rate 50 2>&1); rc=$?
+# PASS 这一支不拿挂钟延迟当门禁：本测试只跑 50/s × 2s ≈ 100 次调用，
+# 所谓 p99 就是最慢的那一个样本，共享 CI runner 上一次调度尖刺就能让它翻十几倍
+# （2026-09-15 实测 p50 2.20ms / p95 2.50ms 而 p99 45.92ms，lint 因此变红）。
+# 阈值判定本身由下面 --p99-ms 0 那条覆盖，这里给一个不可能被抖动触发的上限。
+out=$(bash "$ROOT/scripts/ops/authhook-report.sh" "$OUT" --rate 50 --p99-ms 2000 2>&1); rc=$?
 assert_eq "0" "$rc" "全成功 → PASS"
 assert_contains "p99" "$out" "打印 p99"
 assert_contains "PASS" "$out" "结论 PASS"
