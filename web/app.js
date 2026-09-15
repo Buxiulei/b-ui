@@ -887,7 +887,11 @@ function addResidentialUrl() {
         restore();
         if (r.success) {
             cancelAddResiUrl();
-            toast("节点已添加（" + _resiTypeLabel(r.type || "socks5") + "）");
+            // 用户名只经 textContent 的 _resiErr 输出：toast 走 innerHTML，不喂用户数据
+            const imp = _resiImpact(r.port_changed);
+            toast("节点已添加（" + _resiTypeLabel(r.type || "socks5") + "）" +
+                (imp.total ? "，" + imp.total + " 个用户需重新拉订阅" : ""), imp.total > 0);
+            if (imp.total) _resiErr(imp.text);
             _resiReload();
         } else _resiErr(r.error || "添加失败");
     }).catch(e => { restore(); _resiErr(e.message || "请求失败"); });
