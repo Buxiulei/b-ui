@@ -336,6 +336,27 @@ pub fn movable(p: &Profile, is_active: bool, node: &Node, src: Source) -> bool {
     gate_ok(p, node, src) && (!protected(p, is_active, src) || same_params(&p.node, node))
 }
 
+/// 来件、留存者、组内面板成员三者里等级最高的来源；同级时留条目原来的（spec §5.4、§5.5）。
+///
+/// `keep` 是留存者当前的来源（账号组为空、新建节点时 `None`），`has_panel_member` 为真表示
+/// 合并前的账号组里有 `ApiNodes` 成员——等价于候选里多一个 `Source::ApiNodes`。
+/// 同级留 `keep`，所以 `Paste` 与 `V3` 互遇谁都不动（spec §4 来源等级）。
+///
+/// 定稿把它写在 `cli.rs` 的伪代码之后，实现放在这里：§11.1 测试 17a 要它与
+/// [`Profiles::raise_source`] 在同一张表上断言，`cli.rs` 引用即可。
+pub fn best_source(src: Source, keep: Option<Source>, has_panel_member: bool) -> Source {
+    let mut best = keep.unwrap_or(src);
+    for cand in [src]
+        .into_iter()
+        .chain(has_panel_member.then_some(Source::ApiNodes))
+    {
+        if cand.rank() > best.rank() {
+            best = cand;
+        }
+    }
+    best
+}
+
 /// 订阅与粘贴来源拿不到服务端的住宅分流信息：按「活动节点承担全部流量」处理。
 /// 放在 profiles.rs 而不是 source.rs——T6 与 T9 同波并行，两边都要用它。
 pub fn default_split() -> SplitRules {
@@ -393,6 +414,11 @@ impl Profiles {
         sys.write(&paths.profiles(), &data, 0o600)
     }
 
+    /// 这条 profile 是不是当前活动节点（[`movable`] 等一族纯函数的 `is_active` 参数）。
+    fn is_active(&self, p: &Profile) -> bool {
+        self.active.as_deref() == Some(p.name.as_str())
+    }
+
     pub fn active_profile(&self) -> Option<&Profile> {
         let name = self.active.as_deref()?;
         self.profiles.iter().find(|p| p.name == name)
@@ -418,6 +444,96 @@ impl Profiles {
     /// 按连接身份（[`same_endpoint`]）找已有 profile：导入去重用它，不用整个 `Node` 相等。
     pub fn find_same_endpoint(&self, node: &Node) -> Option<&Profile> {
         self.profiles.iter().find(|p| same_endpoint(&p.node, node))
+    }
+
+    /// 账号组（spec §5.1）：[`movable`] 命中的 profile 下标，按列表顺序。
+    ///
+    /// 扫全部 profile，**不看名字**——rc 靠「名字恰好等于 `profile_name`」才认得出同一个节点位，
+    /// 名字对不上（v3 目录名、token 名、`-2` 后缀）就另起一条。同一批里先写入的节点也在其中。
+    pub fn account_group(&self, node: &Node, src: Source) -> Vec<usize> {
+        self.profiles
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| movable(p, self.is_active(p), node, src))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// 没进账号组的同账号条目（spec §5.1、§5.3）：返回下标与原因，按
+    /// `PanelEntry` > `ActiveEntry` > `KindUnsure` 取，同级取列表最前，取舍与 `kind_unsure` 无关。
+    ///
+    /// 每条的原因**先判是否受保护，门槛次之，两条都报**（A1）：[`protected`] 且不
+    /// [`same_params`] 的，不论门槛内外都报 `PanelEntry`（条目来源 `ApiNodes`）或
+    /// `ActiveEntry`，同时在门槛外时 `kind_unsure` 为真；其余（必然门槛外、且不受保护）
+    /// 才是 `KindUnsure`。
+    pub fn blocked_same_account(&self, node: &Node, src: Source) -> Option<(usize, Blocked)> {
+        /// 报哪一条：`PanelEntry` 0 > `ActiveEntry` 1 > `KindUnsure` 2。
+        fn order(why: &Blocked) -> u8 {
+            match why {
+                Blocked::PanelEntry { .. } => 0,
+                Blocked::ActiveEntry { .. } => 1,
+                Blocked::KindUnsure => 2,
+            }
+        }
+        self.profiles
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| same_account(&p.node, node))
+            .filter(|(_, p)| !movable(p, self.is_active(p), node, src))
+            .map(|(i, p)| {
+                // 保护优先、门槛次之、两条都报（A1）：受保护且不同参数的，门槛内外都报
+                // PanelEntry / ActiveEntry，门槛外只是让 kind_unsure 为真
+                let why = if protected(p, self.is_active(p), src) && !same_params(&p.node, node) {
+                    let kind_unsure = !gate_ok(p, node, src);
+                    match p.source {
+                        Source::ApiNodes => Blocked::PanelEntry { kind_unsure },
+                        _ => Blocked::ActiveEntry { kind_unsure },
+                    }
+                } else {
+                    // 剩下的必然在门槛外：same_params 蕴含 same_endpoint、进而蕴含 gate_ok，
+                    // 「受保护且同参数」根本到不了这里（它 movable，已经进了账号组）
+                    Blocked::KindUnsure
+                };
+                (i, why)
+            })
+            .min_by_key(|(i, why)| (order(why), *i))
+    }
+
+    /// 账号组里留哪一条接收新数据（spec §5.1，`group` 非空）。
+    pub fn pick_keeper(&self, group: &[usize], node: &Node, wanted: &str, known: usize) -> usize {
+        group
+            .iter()
+            .copied()
+            .min_by_key(|&i| {
+                let p = &self.profiles[i];
+                (
+                    !self.is_active(p),            // 1. 正在用的那一条不动
+                    i >= known,                    // 2. 导入前已存在的老名字不被本批顶掉
+                    !same_endpoint(&p.node, node), // 3. 与来件同一连接
+                    p.name != wanted,              // 4. 名字就是这次要起的那个
+                    i,                             // 5. 列表位置靠前
+                )
+            })
+            .expect("account_group 非空时才调 pick_keeper（spec §5.4 ①）")
+    }
+
+    /// `import-v3` 用（spec §5.1、§5.9）：只在 `self.profiles[..known]` 里找门槛内的同账号条目。
+    pub fn find_account_before(&self, known: usize, node: &Node, src: Source) -> Option<&Profile> {
+        let head = &self.profiles[..known.min(self.profiles.len())];
+        let hits = || head.iter().filter(|p| gate_ok(p, node, src));
+        hits().find(|p| self.is_active(p)).or_else(|| hits().next())
+    }
+
+    /// 把名为 `name` 的条目的来源升到 `src`（spec §5.5）：等级不高于现有来源时什么都不动。
+    pub fn raise_source(&mut self, name: &str, src: Source) -> bool {
+        match self.profiles.iter_mut().find(|p| p.name == name) {
+            // `imported_at` 有意不动：来源升级不是内容变化（spec §14.2 T7）
+            Some(p) if src.rank() > p.source.rank() => {
+                p.source = src;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// `base` / `base-2` / `base-3` …
@@ -848,6 +964,116 @@ mod tests {
         }
     }
 
+    /// §5.1、§5.2：账号组按列表顺序收下标；端口相同一律进组，端口不同要**两边** kind 都可信。
+    #[test]
+    fn account_group_crosses_ports_only_when_both_kinds_are_trusted() {
+        // 条目一律非活动、V3 来源：不受保护，挡得住它的只剩门槛（§11 门槛用例的夹具）
+        let entry = |label: &str, port: u16| {
+            let mut p = prof(
+                "alice-hy2-direct",
+                Node {
+                    label: label.into(),
+                    port,
+                    ..hy2_direct_node()
+                },
+            );
+            p.source = Source::V3;
+            p
+        };
+        for (entry_label, entry_trusted) in [("HY2直连", true), ("示例备注", false)] {
+            for (in_label, in_trusted) in [("alice-HY2直连", true), ("custom", false)] {
+                for port in [10000_u16, 40003] {
+                    let mut prs = Profiles::new_default();
+                    prs.profiles.push(entry(entry_label, 10000));
+                    let node = Node {
+                        label: in_label.into(),
+                        port,
+                        ..hy2_direct_node()
+                    };
+                    let want: Vec<usize> = if port == 10000 || (entry_trusted && in_trusted) {
+                        vec![0]
+                    } else {
+                        vec![]
+                    };
+                    assert_eq!(
+                        prs.account_group(&node, Source::Paste),
+                        want,
+                        "条目备注 {entry_label} × 来件备注 {in_label} × 端口 {port}"
+                    );
+                }
+            }
+        }
+
+        // 扫的是全部 profile、不看名字：同账号的两条都在组里，按列表顺序
+        let mut prs = Profiles::new_default();
+        prs.profiles.push(entry("HY2直连", 10000));
+        let mut second = entry("HY2直连", 40003);
+        second.name = "hysteria2-1785892136".into();
+        prs.profiles.push(second);
+        let node = Node {
+            label: "alice-HY2直连".into(),
+            port: 40007,
+            ..hy2_direct_node()
+        };
+        assert_eq!(
+            prs.account_group(&node, Source::Paste),
+            vec![0, 1],
+            "名字对不上也认得出同一个账号位"
+        );
+    }
+
+    /// §5.1、§4：账号组不跨 kind、不跨 host、不跨凭据主体——共用 uuid / username 的两种 kind
+    /// 只靠 kind 分开。
+    #[test]
+    fn account_group_never_crosses_kind_host_or_subject() {
+        let mut prs = Profiles::new_default();
+        prs.profiles.push(prof(
+            "alice-reality-direct",
+            crate::testutil::reality_direct_node(),
+        ));
+        prs.profiles
+            .push(prof("alice-hy2-direct", hy2_direct_node()));
+
+        // Reality 住宅与直连共用同一个 uuid、同一台 host，只有 kind 不同
+        let reality_resi = Node {
+            kind: NodeKind::RealityResidential,
+            label: "Reality住宅".into(),
+            port: 10002,
+            ..crate::testutil::reality_direct_node()
+        };
+        assert!(
+            prs.account_group(&reality_resi, Source::ApiNodes)
+                .is_empty(),
+            "Reality 住宅与直连共用 uuid，只有 kind 把它们分开"
+        );
+        // HY2 住宅与直连共用同一个 username
+        assert!(
+            prs.account_group(&hy2_resi_node(), Source::ApiNodes)
+                .is_empty(),
+            "HY2 住宅与直连共用 username"
+        );
+        // 另一台服务器上的同一个 ASCII 用户名是另一个账号
+        let other_host = Node {
+            host: "tizi.example.test".into(),
+            ..hy2_direct_node()
+        };
+        assert!(
+            prs.account_group(&other_host, Source::ApiNodes).is_empty(),
+            "换了主机就是另一个账号"
+        );
+        // 同一台服务器上的家人账号：凭据主体不同
+        assert!(
+            prs.account_group(&hy2_account_node("bob"), Source::ApiNodes)
+                .is_empty(),
+            "撞名也不是同一个账号位"
+        );
+        // 前提：同 kind、同 host、同凭据主体的来件确实进得了组
+        assert_eq!(
+            prs.account_group(&hy2_direct_node(), Source::ApiNodes),
+            vec![1]
+        );
+    }
+
     /// D6：`same_account` / `same_endpoint` 的 host 与 `tombstone_key` 同口径，不区分大小写。
     #[test]
     fn same_account_and_same_endpoint_ignore_host_case_like_the_tombstone_key() {
@@ -1122,6 +1348,313 @@ mod tests {
                 }
             ),
             "Reality 也只放过 label 与 hop"
+        );
+    }
+
+    /// §5.1、§9（A1）：被挡下的同账号条目，原因**先判是否受保护、门槛次之、两条都报**；
+    /// 多条之间 `PanelEntry` > `ActiveEntry` > `KindUnsure`，同级取列表最前，取舍与
+    /// `kind_unsure` 无关。
+    ///
+    /// 纯函数用例：`Node` 由 `testutil` 直接构造，两侧 kind 恒为 `Hy2Direct`
+    /// （§11 通则在这里体现为「构造的 kind 相同」），label 只决定 `kind_trusted`。
+    #[test]
+    fn blocked_same_account_reports_panel_entries_before_active_ones_before_kind_unsure() {
+        let entry = |name: &str, label: &str, src: Source| {
+            let mut p = prof(
+                name,
+                Node {
+                    label: label.into(),
+                    ..hy2_direct_node()
+                },
+            );
+            p.source = src;
+            p
+        };
+        // 同端口、同 HY2 密码，只多了 obfs 密码：同一个连接但不同参数（§5.3，C2）
+        let obfs = hy2_with(None, None, None, Some("obfs-pw"));
+        // 跨端口来件：备注点名「直连」的可信，改成 custom 的是猜的
+        let moved = |label: &str| Node {
+            label: label.into(),
+            port: 40003,
+            ..hy2_direct_node()
+        };
+        // 每一格同时断言「不在账号组里」与「blocked_same_account 报的那一条」，挡住静默空过
+        let case = |entries: Vec<Profile>, active: Option<&str>, node: &Node| {
+            let mut prs = Profiles::new_default();
+            prs.profiles = entries;
+            prs.active = active.map(str::to_string);
+            (
+                prs.account_group(node, Source::Paste),
+                prs.blocked_same_account(node, Source::Paste),
+            )
+        };
+
+        // ① 不受保护、门槛外 → KindUnsure
+        assert_eq!(
+            case(
+                vec![entry("v3-name", "示例备注", Source::V3)],
+                None,
+                &moved("alice-HY2直连"),
+            ),
+            (vec![], Some((0, Blocked::KindUnsure))),
+            "非活动的 v3 条目不受保护，挡下它的只有门槛"
+        );
+        // ② 面板来源条目、门槛内、不同参数 → PanelEntry { kind_unsure: false }
+        assert_eq!(
+            case(
+                vec![entry("alice-hy2-direct", "HY2直连", Source::ApiNodes)],
+                None,
+                &obfs,
+            ),
+            (
+                vec![],
+                Some((0, Blocked::PanelEntry { kind_unsure: false }))
+            ),
+            "面板开了混淆之前的旧链接：同一个连接，但参数不同"
+        );
+        // ③ 非面板来源的活动节点、门槛内、不同参数 → ActiveEntry { kind_unsure: false }
+        assert_eq!(
+            case(
+                vec![entry("alice-hy2-direct", "HY2直连", Source::V3)],
+                Some("alice-hy2-direct"),
+                &obfs,
+            ),
+            (
+                vec![],
+                Some((0, Blocked::ActiveEntry { kind_unsure: false }))
+            ),
+        );
+        // ④ 面板来源条目 + 猜 kind 的跨端口粘贴：受保护且门槛外 → PanelEntry { kind_unsure: true }
+        assert_eq!(
+            case(
+                vec![entry("alice-hy2-direct", "HY2直连", Source::ApiNodes)],
+                None,
+                &moved("custom"),
+            ),
+            (vec![], Some((0, Blocked::PanelEntry { kind_unsure: true }))),
+            "A1：保护优先、门槛次之，两条都报，不退化成 KindUnsure"
+        );
+        // ⑤ 猜 kind 的活动 V3 条目 + 备注可信的跨端口粘贴 → ActiveEntry { kind_unsure: true }
+        assert_eq!(
+            case(
+                vec![entry("v3-name", "示例备注", Source::V3)],
+                Some("v3-name"),
+                &moved("alice-HY2直连"),
+            ),
+            (
+                vec![],
+                Some((0, Blocked::ActiveEntry { kind_unsure: true }))
+            ),
+            "A1：活动节点同时在门槛外，报的仍是 ActiveEntry"
+        );
+        // ⑥ 门槛内、受保护、同参数 → 它 movable、在账号组里，一个字都不报
+        let same = Node {
+            label: "面板改过的备注".into(),
+            hop: None,
+            ..hy2_direct_node()
+        };
+        assert_eq!(
+            case(
+                vec![entry("alice-hy2-direct", "HY2直连", Source::ApiNodes)],
+                None,
+                &same,
+            ),
+            (vec![0], None),
+            "同参数的来件进得了组，组成员不算被挡下"
+        );
+        // ⑦ 面板条目与活动节点同时被挡下：只报 PanelEntry（面板条目排在后面也一样，R18）
+        assert_eq!(
+            case(
+                vec![
+                    entry("v3-name", "示例备注", Source::V3),
+                    entry("alice-hy2-direct", "HY2直连", Source::ApiNodes),
+                ],
+                Some("v3-name"),
+                &moved("alice-HY2直连"),
+            ),
+            (
+                vec![],
+                Some((1, Blocked::PanelEntry { kind_unsure: false }))
+            ),
+            "PanelEntry 排最前，面板条目排在列表后面也一样"
+        );
+        // ⑧ 同级取列表最前
+        assert_eq!(
+            case(
+                vec![
+                    entry("alice-hy2-direct", "HY2直连", Source::ApiNodes),
+                    entry("alice-hy2-direct-2", "HY2直连", Source::ApiNodes),
+                ],
+                None,
+                &obfs,
+            ),
+            (
+                vec![],
+                Some((0, Blocked::PanelEntry { kind_unsure: false }))
+            ),
+            "同级取列表最前"
+        );
+        // ⑨ 反向组合：活动条目在门槛内（kind_unsure 假）、面板条目在门槛外（kind_unsure 真），
+        //    报的仍是 PanelEntry——⑦ 那格两者同向，钉不住「取舍与 kind_unsure 无关」
+        let mut v3_active = prof(
+            "v3-name",
+            Node {
+                label: "示例备注".into(),
+                port: 40003,
+                ..hy2_with(None, Some("hy2-pw-2"), None, None)
+            },
+        );
+        v3_active.source = Source::V3;
+        assert_eq!(
+            case(
+                vec![
+                    v3_active,
+                    entry("alice-hy2-direct", "HY2直连", Source::ApiNodes),
+                ],
+                Some("v3-name"),
+                &moved("custom"),
+            ),
+            (vec![], Some((1, Blocked::PanelEntry { kind_unsure: true }))),
+            "活动条目同端口（门槛内）、面板条目跨端口且来件不可信（门槛外），报的仍是 PanelEntry"
+        );
+    }
+
+    /// §5.1：留存者的五级优先级，逐级各一组。
+    #[test]
+    fn pick_keeper_prefers_active_then_preexisting_then_same_endpoint_then_wanted_then_list_order()
+    {
+        let wanted = "alice-hy2-direct";
+        let node = hy2_direct_node(); // :10000
+        let moved = || Node {
+            port: 40003,
+            ..hy2_direct_node()
+        };
+
+        // 第 1 级：活动节点赢——它在后面、是本批刚写入的、不是同一连接、名字也不是
+        // wanted（其余四级上全劣势，所以这一格钉的确实是第 1 级压过第 2 级）
+        let mut prs = Profiles::new_default();
+        prs.profiles = vec![prof(wanted, node.clone()), prof("v3-name", moved())];
+        prs.active = Some("v3-name".into());
+        assert_eq!(
+            prs.pick_keeper(&[0, 1], &node, wanted, 1),
+            1,
+            "不打扰正在用的那一条：哪怕它是本批刚写入的"
+        );
+
+        // 第 2 级：导入前已存在的老名字压过本批刚写入的同端口条目
+        let mut prs = Profiles::new_default();
+        prs.profiles = vec![
+            prof("hysteria2-1785892136", moved()),
+            prof(wanted, node.clone()),
+        ];
+        assert_eq!(
+            prs.pick_keeper(&[0, 1], &node, wanted, 1),
+            0,
+            "本批新条目（同一连接、名字还等于 wanted）顶不掉老名字"
+        );
+
+        // 第 3 级：同一连接
+        let mut prs = Profiles::new_default();
+        prs.profiles = vec![
+            prof(wanted, moved()),
+            prof("hysteria2-1785892136", node.clone()),
+        ];
+        assert_eq!(
+            prs.pick_keeper(&[0, 1], &node, wanted, 2),
+            1,
+            "都是存量、都不是活动节点时，同一连接的那条接新数据"
+        );
+
+        // 第 4 级：名字等于 wanted
+        let mut prs = Profiles::new_default();
+        prs.profiles = vec![prof("hysteria2-1785892136", moved()), prof(wanted, moved())];
+        assert_eq!(prs.pick_keeper(&[0, 1], &node, wanted, 2), 1);
+
+        // 第 5 级：全部打平时取列表位置最前的（group 的给定顺序不算数）
+        let mut prs = Profiles::new_default();
+        prs.profiles = vec![
+            prof("hysteria2-1785892136", moved()),
+            prof("bob-hy2-direct-2", moved()),
+        ];
+        assert_eq!(prs.pick_keeper(&[1, 0], &node, wanted, 2), 0);
+    }
+
+    /// §5.1、§5.9：`find_account_before` 只看导入前已存在的那一段，且**不看** protected
+    /// （import-v3 只跳过、不写，挡住冻结快照的回写正是要的）。
+    #[test]
+    fn find_account_before_ignores_profiles_added_in_this_run() {
+        let mut prs = Profiles::new_default();
+        // 0：面板来源、非活动——对 v3 来件受保护，但这里照样认得出它
+        prs.profiles
+            .push(prof("alice-hy2-direct", hy2_direct_node()));
+        // 1：同账号的活动节点
+        let mut act = prof("hysteria2-1785892136", hy2_direct_node());
+        act.source = Source::V3;
+        prs.profiles.push(act);
+        // 2：本批刚写入的同账号条目
+        prs.profiles
+            .push(prof("alice-hy2-direct-2", hy2_direct_node()));
+        prs.active = Some("hysteria2-1785892136".into());
+
+        // 同账号、同端口、换了密码的来件：门槛内，但对 0 号条目不可替换
+        let node = hy2_with(None, Some("rotated-pw"), None, None);
+        assert!(
+            protected(&prs.profiles[0], false, Source::V3)
+                && !movable(&prs.profiles[0], false, &node, Source::V3),
+            "前提：0 号条目对 v3 来件受保护、不可替换"
+        );
+        assert_eq!(
+            prs.find_account_before(3, &node, Source::V3)
+                .map(|p| p.name.as_str()),
+            Some("hysteria2-1785892136"),
+            "优先活动节点"
+        );
+        prs.active = None;
+        assert_eq!(
+            prs.find_account_before(3, &node, Source::V3)
+                .map(|p| p.name.as_str()),
+            Some("alice-hy2-direct"),
+            "没有活动节点时取列表最前——受保护的条目照样算数"
+        );
+        assert_eq!(
+            prs.find_account_before(0, &node, Source::V3)
+                .map(|p| p.name.as_str()),
+            None,
+            "本批刚写入的一段不算"
+        );
+        prs.active = Some("alice-hy2-direct-2".into());
+        assert_eq!(
+            prs.find_account_before(1, &node, Source::V3)
+                .map(|p| p.name.as_str()),
+            Some("alice-hy2-direct"),
+            "活动节点被 known 切在外面时只在前一段里找"
+        );
+
+        // 门槛照样管用：跨端口 + 猜 kind 的条目不算同一个账号位
+        let mut guessed = Profiles::new_default();
+        let mut g = prof(
+            "v3-name",
+            Node {
+                label: "示例备注".into(),
+                ..hy2_direct_node()
+            },
+        );
+        g.source = Source::V3;
+        guessed.profiles.push(g);
+        assert_eq!(
+            guessed
+                .find_account_before(
+                    1,
+                    &Node {
+                        label: "custom".into(),
+                        port: 40003,
+                        ..hy2_direct_node()
+                    },
+                    Source::V3,
+                )
+                .map(|p| p.name.as_str()),
+            None,
+            "门槛外不算"
         );
     }
 
@@ -1520,6 +2053,151 @@ mod tests {
         );
         assert_eq!(v["deleted"][0]["future_tomb"], serde_json::json!("t"));
         assert!(!raw.contains("extra"), "未知键是平铺的，不套一层 extra");
+    }
+
+    /// §5.5、§14.2 T7：来源只升不降、同级不动，`imported_at` 不跟着变；
+    /// `best_source` 与它同一张表。
+    #[test]
+    fn raise_source_only_goes_up_and_keeps_ties() {
+        let all = [
+            Source::ApiNodes,
+            Source::Subscription,
+            Source::Paste,
+            Source::V3,
+        ];
+        for have in all {
+            for want in all {
+                let mut prs = Profiles::new_default();
+                let mut p = prof("alice-hy2-direct", hy2_direct_node());
+                p.source = have;
+                prs.profiles.push(p);
+                let up = want.rank() > have.rank();
+                assert_eq!(
+                    prs.raise_source("alice-hy2-direct", want),
+                    up,
+                    "条目 {have:?} 遇来源 {want:?}"
+                );
+                assert_eq!(
+                    prs.profiles[0].source,
+                    if up { want } else { have },
+                    "只升不降，同级不动（Paste 与 V3 互遇也不动）"
+                );
+                assert_eq!(
+                    prs.profiles[0].imported_at, "2026-09-11T00:00:00Z",
+                    "来源升级不是内容变化，imported_at 不动（T7）"
+                );
+                // 同一张表：best_source 三者取等级最高，同级留条目原来的
+                assert_eq!(
+                    best_source(want, Some(have), false),
+                    if up { want } else { have },
+                    "best_source：条目 {have:?} 遇来件 {want:?}"
+                );
+                assert_eq!(
+                    best_source(want, Some(have), true),
+                    Source::ApiNodes,
+                    "组里有面板成员，至少是 ApiNodes"
+                );
+            }
+        }
+
+        // 逐级升：V3 → Subscription → ApiNodes，升到顶就不再动
+        let mut prs = Profiles::new_default();
+        let mut p = prof("alice-hy2-direct", hy2_direct_node());
+        p.source = Source::V3;
+        prs.profiles.push(p);
+        assert!(prs.raise_source("alice-hy2-direct", Source::Subscription));
+        assert!(prs.raise_source("alice-hy2-direct", Source::ApiNodes));
+        assert!(!prs.raise_source("alice-hy2-direct", Source::Subscription));
+        assert_eq!(prs.profiles[0].source, Source::ApiNodes);
+        assert!(
+            !prs.raise_source("没有这个节点", Source::ApiNodes),
+            "名字不存在：什么都不动"
+        );
+
+        // 账号组为空（新建节点）时没有留存者，来源就是来件的
+        assert_eq!(best_source(Source::Paste, None, false), Source::Paste);
+        assert_eq!(best_source(Source::Paste, None, true), Source::ApiNodes);
+    }
+
+    /// C2、§6.5：4.0.0 读一遍再写回去（墓碑与未知字段一起丢掉）之后，本版仍按账号
+    /// 认得出同一条 profile——端口变了也是原地替换，不会另起一条。
+    ///
+    /// `Profile400` 五个字段、`Profiles400` 八个字段（不含 `deleted`），字段名逐字抄自
+    /// `git show v4.0.0:crates/bui-c/src/profiles.rs`：`Profile` 在 57-65 行（五个字段在
+    /// 59-64 行），`Profiles` 在 67-77 行（八个字段在 69-76 行）。
+    #[test]
+    fn a_4_0_0_shaped_rewrite_still_matches_the_same_node() {
+        #[derive(Debug, Serialize, Deserialize)]
+        struct Profile400 {
+            name: String,
+            node: Node,
+            split: SplitRules,
+            source: Source,
+            imported_at: String,
+        }
+        #[derive(Debug, Serialize, Deserialize)]
+        struct Profiles400 {
+            schema_version: u32,
+            active: Option<String>,
+            mode: Mode,
+            socks_port: u16,
+            http_port: u16,
+            auto_update: bool,
+            panel: Option<Panel>,
+            profiles: Vec<Profile400>,
+        }
+
+        // 第 1 步：本版写一份——token 名已经改成 `<主机>-<kind>`（§5.6），有墓碑，三层都有未知字段
+        let s = FakeSys::new();
+        let mut p = Profiles::new_default();
+        let mut live = prof("panel.example.com-hy2-resi", hy2_resi_node());
+        live.extra
+            .insert("future_profile".into(), serde_json::json!("p"));
+        p.profiles.push(live);
+        p.active = Some("panel.example.com-hy2-resi".into());
+        p.bury(&prof("gone", hy2_direct_node()), 11);
+        p.deleted[0]
+            .extra
+            .insert("future_tomb".into(), serde_json::json!(true));
+        p.extra.insert("future_top".into(), serde_json::json!(7));
+        p.save(&s, &paths()).unwrap();
+
+        // 第 2 步：以 4.0.0 的字段表读进来再写回去
+        let raw = s.get("/opt/bui-c/profiles.json").unwrap();
+        let old: Profiles400 = serde_json::from_str(&raw).unwrap();
+        assert_eq!(old.profiles[0].name, "panel.example.com-hy2-resi");
+        let mut back = serde_json::to_vec_pretty(&old).unwrap();
+        back.push(b'\n');
+        let back = String::from_utf8(back).unwrap();
+        assert!(
+            !back.contains("deleted"),
+            "4.0.0 写回去必然丢掉墓碑，否则这个模拟不算数"
+        );
+        assert!(
+            !back.contains("future_top")
+                && !back.contains("future_profile")
+                && !back.contains("future_tomb"),
+            "三层（顶层 / profile / 墓碑）的未知字段也一起丢了"
+        );
+        s.put("/opt/bui-c/profiles.json", &back);
+
+        // 第 3 步：本版再读——墓碑没了，但账号还认得出
+        let after = Profiles::load(&s, &paths()).unwrap();
+        assert!(after.deleted.is_empty());
+        let moved = Node {
+            port: 40009,
+            hop: Some((41000, 50000)),
+            ..hy2_resi_node()
+        };
+        assert_eq!(
+            after.account_group(&moved, Source::ApiNodes),
+            vec![0],
+            "端口变了仍是同一个账号位"
+        );
+        assert_eq!(
+            after.profiles[0].name, "panel.example.com-hy2-resi",
+            "名字不变，原地替换"
+        );
     }
 
     #[test]
