@@ -35,8 +35,10 @@ pub struct Report {
     pub imported: Vec<String>,
     /// 解析失败的 v3 目录名
     pub skipped: Vec<String>,
-    /// v3 目录里的节点已经在 profiles 里（同一个连接，见
-    /// [`same_endpoint`](crate::profiles::same_endpoint)），这次原样跳过的 profile 名
+    /// v3 目录里的节点已经在 profiles 里——同一个连接（见
+    /// [`same_endpoint`](crate::profiles::same_endpoint)），或导入前就在列表里的同一账号
+    /// （见 [`find_account_before`](crate::profiles::Profiles::find_account_before)，
+    /// spec §5.9）——这次原样跳过的 profile 名
     pub existing: Vec<String>,
     /// 命中墓碑、这次没导入的节点名（墓碑里记的那个名字，spec §5.7）。菜单据此问一句、
     /// 命令行据此打一行；[`RunOpts::with_deleted`] 为真时永远是空的
@@ -103,6 +105,9 @@ pub fn import<S: Sys>(
     with_deleted: bool,
 ) -> Result<Report> {
     let mut r = Report::default();
+    // 循环之前拍下条数：同账号只在这一段里找（spec §5.9）。要是改成循环里现算，v3 目录里
+    // 同一账号的第二个端口会命中本批刚写入的那条、被当成已有吞掉。
+    let known = prof.profiles.len();
     let v3_active = read_str(sys, &base.join("active")).unwrap_or_default();
     let mut active_ports: Option<(u16, u16)> = None;
     // 面板候选值先攒着：一个新节点都没导入时连它都不能落（见函数尾部）
@@ -147,6 +152,18 @@ pub fn import<S: Sys>(
         // 在已迁移的机器上按一次菜单 [7] 就多出一批 `-2` 重复节点。按连接身份认而不是
         // 整个 `Node` 相等：面板导入过一次后 label 已是 `HY2直连`，不再是 v3 的备注。
         if let Some(existing) = prof.find_same_endpoint(&node) {
+            let name = existing.name.clone();
+            if dir_name == v3_active {
+                r.active = Some(name.clone());
+            }
+            r.existing.push(name);
+            continue;
+        }
+        // 面板换过端口（4.1 的住宅槽位）或轮换过密码：`<base>/configs` 是 v3 时代冻结下来
+        // 的快照，列表里同一账号的那条只可能比它新（spec §5.9）——认作已有、原样跳过，
+        // 绝不拿旧数据回写；V3 是最低一级来源，也没有可升的。只在导入前的 `[..known]` 里
+        // 找，本批刚写入的不算；有意不看 protected——挡住冻结快照回写正是要的。
+        if let Some(existing) = prof.find_account_before(known, &node, Source::V3) {
             let name = existing.name.clone();
             if dir_name == v3_active {
                 r.active = Some(name.clone());
@@ -360,6 +377,7 @@ pub fn run<S: Sys, N: Net>(
 mod tests {
     use super::*;
     use crate::fake::{FakeNet, FakeReply, FakeSys};
+    use crate::testutil::{hy2_direct_node, hy2_resi_node};
     use pretty_assertions::assert_eq;
 
     fn paths() -> Paths {
@@ -931,6 +949,431 @@ mod tests {
         assert_eq!(
             prof.profiles[0].node.label, "HY2直连",
             "面板刷新过的节点不被回写"
+        );
+    }
+
+    /// 本组用例的 v3 目录：只写 `uri.txt`（`meta.json` 与本组无关），返回那条 URI 好让用例
+    /// 自查解析结果。备注按 §11 通则与被比条目的 kind 同向——含「住宅」才解析成住宅，
+    /// 「直连」二字只影响 kind 可不可信。
+    fn v3_hy2_dir(
+        s: &FakeSys,
+        dir: &str,
+        host: &str,
+        port: u16,
+        password: &str,
+        label: &str,
+    ) -> String {
+        let uri = format!(
+            "hysteria2://alice:{password}@{host}:{port}/?sni=panel.example.com&mport=41000-50000#alice-{label}"
+        );
+        s.put(&format!("/opt/hysteria-client/configs/{dir}/uri.txt"), &uri);
+        uri
+    }
+
+    /// 备注片段（percent-encoded，与 v3 写法一致）：`HY2住宅` / `HY2直连` / 没点名通路的猜 kind
+    const LBL_RESI: &str = "HY2%E4%BD%8F%E5%AE%85";
+    const LBL_GUESS: &str = "custom";
+
+    /// 来源是 v3 导入、备注没点名通路（kind 是猜的）的存量条目
+    fn guessed_v3_profile(name: &str, node: bui_schema::nodes::Node) -> Profile {
+        Profile {
+            name: name.into(),
+            node,
+            split: default_split(),
+            source: Source::V3,
+            imported_at: "2026-09-11T00:00:00Z".into(),
+            extra: Default::default(),
+        }
+    }
+
+    /// 每个 v3 目录恰好落进 imported / existing / buried / skipped 之一
+    fn tally(r: &Report) -> usize {
+        r.imported.len() + r.existing.len() + r.buried.len() + r.skipped.len()
+    }
+
+    /// 68（§5.9、§9「import-v3 重跑，列表里同账号已被面板换过端口 / 密码」）：面板把住宅 HY2
+    /// 从 40003 挪到 40000，v3 目录里还是冻结的 40003 快照 → 按账号认出是同一条，计入
+    /// `existing`，端口不回写、来源不降级、不冒 `-2`。
+    #[test]
+    fn rerun_after_a_panel_port_move_skips_the_account() {
+        let s = FakeSys::new();
+        v3_hy2_dir(
+            &s,
+            "hysteria2-1757000002",
+            "panel.example.com",
+            40003,
+            "hy2-pw",
+            LBL_RESI,
+        );
+        let mut prof = Profiles::new_default();
+        // 面板导入过一次，槽位换了：同一条现在在 40000（hy2_resi_node 的端口）
+        prof.profiles.push(crate::testutil::named(
+            "hysteria2-1757000002",
+            hy2_resi_node(),
+        ));
+        prof.active = Some("hysteria2-1757000002".to_string());
+
+        let r = import(&s, Path::new(V3_BASE), &mut prof, false).unwrap();
+
+        assert!(r.imported.is_empty(), "{:?}", r.imported);
+        assert_eq!(r.existing, vec!["hysteria2-1757000002".to_string()]);
+        assert_eq!(tally(&r), 1, "一个 v3 目录只落一处：{r:?}");
+        assert_eq!(prof.profiles.len(), 1, "不该冒出 `-2` 后缀的重复条目");
+        assert_eq!(prof.profiles[0].node.port, 40000, "v3 的冻结端口不回写");
+        assert_eq!(
+            prof.profiles[0].source,
+            Source::ApiNodes,
+            "跳过就是跳过：来源不被 V3 降级"
+        );
+    }
+
+    /// 69（§5.9）：同端口换过密码——`same_endpoint` 认不出（密码不同），按账号认得出，
+    /// 旧密码绝不回写。
+    #[test]
+    fn rerun_after_password_rotation_never_writes_back_the_old_password() {
+        let s = FakeSys::new();
+        v3_hy2_dir(
+            &s,
+            "hysteria2-1757000002",
+            "panel.example.com",
+            40000,
+            "hy2-pw",
+            LBL_RESI,
+        );
+        let mut prof = Profiles::new_default();
+        let mut node = hy2_resi_node();
+        if let bui_schema::nodes::Transport::Hysteria2 { password, .. } = &mut node.transport {
+            *password = "rotated-pw".to_string();
+        }
+        prof.profiles
+            .push(crate::testutil::named("hysteria2-1757000002", node));
+
+        let r = import(&s, Path::new(V3_BASE), &mut prof, false).unwrap();
+
+        assert!(r.imported.is_empty(), "{:?}", r.imported);
+        assert_eq!(r.existing, vec!["hysteria2-1757000002".to_string()]);
+        assert_eq!(tally(&r), 1, "一个 v3 目录只落一处：{r:?}");
+        assert_eq!(prof.profiles.len(), 1, "不该冒出 `-2` 后缀的重复条目");
+        let bui_schema::nodes::Transport::Hysteria2 { password, .. } =
+            &prof.profiles[0].node.transport
+        else {
+            unreachable!("住宅 HY2")
+        };
+        assert_eq!(password, "rotated-pw", "v3 的过期密码不回写");
+    }
+
+    /// 70（§5.9）：v3 的 active 目录换算成列表里那条活着的同账号 profile（名字早被面板改过），
+    /// 同账号有两条时取活动的那条；没有新节点 → `prof` 一个字段都不动。
+    #[test]
+    fn rerun_maps_the_v3_active_dir_to_the_live_profile_of_that_account() {
+        let s = FakeSys::new();
+        v3_hy2_dir(
+            &s,
+            "hysteria2-1757000003",
+            "panel.example.com",
+            40003,
+            "hy2-pw",
+            LBL_RESI,
+        );
+        s.put("/opt/hysteria-client/active", "hysteria2-1757000003\n");
+        let mut prof = Profiles::new_default();
+        // rc 留下的副本排在前面，活动的那条排在后面：认活动节点而不是列表第一条
+        let mut copy = hy2_resi_node();
+        copy.port = 40009;
+        prof.profiles
+            .push(crate::testutil::named("panel.example.com-hy2-resi-2", copy));
+        prof.profiles.push(crate::testutil::named(
+            "panel.example.com-hy2-resi",
+            hy2_resi_node(),
+        ));
+        prof.active = Some("panel.example.com-hy2-resi".to_string());
+        prof.mode = Mode::Tun;
+
+        let r = import(&s, Path::new(V3_BASE), &mut prof, false).unwrap();
+
+        assert!(r.imported.is_empty(), "{:?}", r.imported);
+        assert_eq!(
+            r.existing,
+            vec!["panel.example.com-hy2-resi".to_string()],
+            "同账号两条时报活动的那条"
+        );
+        assert_eq!(
+            r.active.as_deref(),
+            Some("panel.example.com-hy2-resi"),
+            "v3 的 active 目录指向的是它"
+        );
+        assert_eq!(tally(&r), 1, "一个 v3 目录只落一处：{r:?}");
+        assert_eq!(prof.profiles.len(), 2, "不该冒出第三条");
+        assert_eq!(
+            prof.active.as_deref(),
+            Some("panel.example.com-hy2-resi"),
+            "没导入任何新节点就不动 active"
+        );
+        assert_eq!(prof.mode, Mode::Tun, "mode 同理不动");
+    }
+
+    /// 71（§5.9「只匹配 `[..known]`」）：第一次跑，v3 目录里同一账号的两个端口都要导进来——
+    /// `known` 是循环之前拍的快照，后读到的目录不该命中本批刚写入的那条。
+    #[test]
+    fn first_run_imports_both_ports_of_one_account_from_v3_dirs() {
+        let s = FakeSys::new();
+        v3_hy2_dir(
+            &s,
+            "hysteria2-1757000004",
+            "panel.example.com",
+            40003,
+            "hy2-pw",
+            LBL_RESI,
+        );
+        v3_hy2_dir(
+            &s,
+            "hysteria2-1757000005",
+            "panel.example.com",
+            40007,
+            "hy2-pw",
+            LBL_RESI,
+        );
+        let mut prof = Profiles::new_default();
+
+        let r = import(&s, Path::new(V3_BASE), &mut prof, false).unwrap();
+
+        assert_eq!(
+            r.imported,
+            vec![
+                "hysteria2-1757000004".to_string(),
+                "hysteria2-1757000005".to_string()
+            ],
+            "两个端口都是新节点"
+        );
+        assert!(
+            r.existing.is_empty(),
+            "known 拍在循环之前：第二个目录不该命中本批刚写入的那条，却报了 {:?}",
+            r.existing
+        );
+        assert_eq!(tally(&r), 2, "两个 v3 目录各落一处：{r:?}");
+        assert_eq!(prof.profiles.len(), 2);
+    }
+
+    /// 72（§5.2 门槛、§9「粘贴一条备注被改过的住宅 HY2」的 import-v3 版）：两边 kind 都是按
+    /// 备注猜的、端口又不同 → 门槛挡下，按新节点导入，老条目原样留着。
+    #[test]
+    fn a_guessed_kind_v3_dir_on_another_port_is_imported_as_new() {
+        let s = FakeSys::new();
+        let uri = v3_hy2_dir(
+            &s,
+            "hysteria2-1757000006",
+            "panel.example.com",
+            10005,
+            "hy2-pw",
+            LBL_GUESS,
+        );
+        let mut prof = Profiles::new_default();
+        let mut node = hy2_direct_node(); // :10000，直连
+        node.label = "alice-custom".to_string(); // 备注没点名通路 → kind 是猜的
+        prof.profiles
+            .push(guessed_v3_profile("hysteria2-1757000000", node));
+        // 反空过（§11 通则的同类）：两条确实是同一个账号，挡下它的是门槛而不是 kind 配错
+        let incoming = bui_schema::parse::node_uri(&uri).unwrap();
+        assert!(
+            crate::profiles::same_account(&prof.profiles[0].node, &incoming),
+            "kind 配错的话这条用例会静默空过"
+        );
+        assert!(
+            !crate::profiles::gate_ok(&prof.profiles[0], &incoming, Source::V3),
+            "两边 kind 都是猜的、端口不同 → 门槛该挡下"
+        );
+
+        let r = import(&s, Path::new(V3_BASE), &mut prof, false).unwrap();
+
+        assert_eq!(r.imported, vec!["hysteria2-1757000006".to_string()]);
+        assert!(
+            r.existing.is_empty(),
+            "两边 kind 都是猜的、端口不同 → 门槛挡下，不认作同一账号：{:?}",
+            r.existing
+        );
+        assert_eq!(tally(&r), 1, "一个 v3 目录只落一处：{r:?}");
+        assert_eq!(prof.profiles.len(), 2);
+        assert_eq!(prof.profiles[0].node.port, 10000, "老条目原样不动");
+    }
+
+    /// 72a（§5.2 门槛的另一半，钉住调用点传的来源）：列表那条来自面板、kind 可信，v3 目录
+    /// 的备注没点名通路 → 跨端口时来件这一半不可信，门槛照样挡下、另起一条。把调用点的
+    /// `Source::V3` 改成 `Source::ApiNodes` 门槛就开了，「备注不含住宅的 v3 住宅节点」
+    /// （§1.3）会被报成已有、静默不导入——下面第三条断言就是钉这个变异的。
+    #[test]
+    fn a_guessed_kind_v3_dir_is_not_matched_against_a_trusted_panel_entry() {
+        let s = FakeSys::new();
+        let uri = v3_hy2_dir(
+            &s,
+            "hysteria2-1757000009",
+            "panel.example.com",
+            40003,
+            "hy2-pw",
+            LBL_GUESS,
+        );
+        let mut prof = Profiles::new_default();
+        // 面板来的直连 :10000，备注点名「直连」，两重意义上 kind 都可信
+        prof.profiles.push(crate::testutil::named(
+            "alice-hy2-direct",
+            hy2_direct_node(),
+        ));
+        // 反空过（§11 通则）：备注不含「住宅」→ 来件也解析成直连，两条确实是同一个账号；
+        // 挡下它的是来件那一半不可信，而不是 kind 配错
+        let incoming = bui_schema::parse::node_uri(&uri).unwrap();
+        assert!(
+            crate::profiles::same_account(&prof.profiles[0].node, &incoming),
+            "kind 配错的话这条用例会静默空过"
+        );
+        assert!(
+            !crate::profiles::gate_ok(&prof.profiles[0], &incoming, Source::V3),
+            "来件备注没点名通路、端口又不同 → 门槛该挡下"
+        );
+        assert!(
+            crate::profiles::gate_ok(&prof.profiles[0], &incoming, Source::ApiNodes),
+            "来源传成 ApiNodes 门槛就开了：调用点必须传 Source::V3"
+        );
+
+        let r = import(&s, Path::new(V3_BASE), &mut prof, false).unwrap();
+
+        assert_eq!(r.imported, vec!["hysteria2-1757000009".to_string()]);
+        assert!(
+            r.existing.is_empty(),
+            "列表那条可信、v3 来件不可信 → 门槛挡下，不认作同一账号：{:?}",
+            r.existing
+        );
+        assert_eq!(tally(&r), 1, "一个 v3 目录只落一处：{r:?}");
+        assert_eq!(prof.profiles.len(), 2, "另起一条，老条目原样留着");
+    }
+
+    /// 73（D6，§5.2）：v3 目录的 host 只差大小写、端口又已被面板挪过（40003 → 40000）→
+    /// 走同账号 `[..known]` 那一步认作 `existing`，列表里的 host 不被改写。同端口、
+    /// 走「同一个连接」那一格的见 73a。
+    #[test]
+    fn a_v3_dir_whose_host_differs_only_in_case_is_existing() {
+        let s = FakeSys::new();
+        let uri = v3_hy2_dir(
+            &s,
+            "hysteria2-1757000007",
+            "Panel.Example.com",
+            40003,
+            "hy2-pw",
+            LBL_RESI,
+        );
+        assert_eq!(
+            bui_schema::parse::node_uri(&uri).unwrap().host,
+            "Panel.Example.com",
+            "URI 解析得留住大小写，否则这条用例白测"
+        );
+        let mut prof = Profiles::new_default();
+        prof.profiles.push(crate::testutil::named(
+            "panel.example.com-hy2-resi",
+            hy2_resi_node(),
+        ));
+        // 反空过：端口不同，这条走的是同账号分支而不是同连接分支
+        assert!(
+            prof.find_same_endpoint(&bui_schema::parse::node_uri(&uri).unwrap())
+                .is_none(),
+            "端口已被面板挪过，不该命中同一个连接"
+        );
+
+        let r = import(&s, Path::new(V3_BASE), &mut prof, false).unwrap();
+
+        assert!(r.imported.is_empty(), "{:?}", r.imported);
+        assert_eq!(r.existing, vec!["panel.example.com-hy2-resi".to_string()]);
+        assert_eq!(tally(&r), 1, "一个 v3 目录只落一处：{r:?}");
+        assert_eq!(prof.profiles.len(), 1, "不该冒出 `-2` 后缀的重复条目");
+        assert_eq!(
+            prof.profiles[0].node.host, "panel.example.com",
+            "列表里的 host 不被 v3 快照改写"
+        );
+    }
+
+    /// 73a（D6，§5.2 表里 `find_same_endpoint` → `import_v3::import` 那一格）：host 只差
+    /// 大小写、端口没变 → 在「同一个连接」那一步就认作已有，不冒 `-2`。这一格 T4 就绿，
+    /// 与 73 的同账号分支各钉一个分支。
+    #[test]
+    fn a_v3_dir_whose_host_differs_only_in_case_on_the_same_port_is_existing() {
+        let s = FakeSys::new();
+        let uri = v3_hy2_dir(
+            &s,
+            "hysteria2-1757000010",
+            "Panel.Example.com",
+            40000,
+            "hy2-pw",
+            LBL_RESI,
+        );
+        let mut prof = Profiles::new_default();
+        prof.profiles.push(crate::testutil::named(
+            "panel.example.com-hy2-resi",
+            hy2_resi_node(),
+        ));
+        // 反空过：端口、密码都一样，走的确实是同连接分支（D6 的 host 小写口径）
+        assert!(
+            crate::profiles::same_endpoint(
+                &prof.profiles[0].node,
+                &bui_schema::parse::node_uri(&uri).unwrap()
+            ),
+            "host 只差大小写、端口与密码相同 → 同一个连接"
+        );
+
+        let r = import(&s, Path::new(V3_BASE), &mut prof, false).unwrap();
+
+        assert!(r.imported.is_empty(), "{:?}", r.imported);
+        assert_eq!(r.existing, vec!["panel.example.com-hy2-resi".to_string()]);
+        assert_eq!(tally(&r), 1, "一个 v3 目录只落一处：{r:?}");
+        assert_eq!(prof.profiles.len(), 1, "不该冒出 `-2` 后缀的重复条目");
+        assert_eq!(
+            prof.profiles[0].node.host, "panel.example.com",
+            "列表里的 host 不被 v3 快照改写"
+        );
+    }
+
+    /// 分支顺序（§5.9 伪代码：同连接 → 同账号 `[..known]` → 墓碑 → 新建）：同账号的旧副本
+    /// 被删过——墓碑是账号维度的、不记端口，挡得住这个 v3 目录——但列表里那条还活着 →
+    /// 报 `existing`，不报 `buried`。只是分类上活着的赢：§7 的「刷新并清墓碑」说的是面板
+    /// 那条路径，import-v3 按 §5.9 只读，既不回写那条也不清墓碑。
+    #[test]
+    fn a_live_profile_of_the_account_wins_over_its_tombstone() {
+        let s = FakeSys::new();
+        v3_hy2_dir(
+            &s,
+            "hysteria2-1757000008",
+            "panel.example.com",
+            40003,
+            "hy2-pw",
+            LBL_RESI,
+        );
+        let mut prof = Profiles::new_default();
+        // 换过端口之后用户把剩下的旧副本删了
+        let mut old_copy = hy2_resi_node();
+        old_copy.port = 40009;
+        prof.bury(
+            &crate::testutil::named("panel.example.com-hy2-resi-2", old_copy),
+            0,
+        );
+        prof.profiles.push(crate::testutil::named(
+            "panel.example.com-hy2-resi",
+            hy2_resi_node(),
+        ));
+
+        let r = import(&s, Path::new(V3_BASE), &mut prof, false).unwrap();
+
+        assert_eq!(
+            r.existing,
+            vec!["panel.example.com-hy2-resi".to_string()],
+            "活着的同账号条目先认出来"
+        );
+        assert!(
+            r.buried.is_empty(),
+            "墓碑分支排在同账号之后，不该报成删过的：{:?}",
+            r.buried
+        );
+        assert_eq!(tally(&r), 1, "一个 v3 目录只落一处：{r:?}");
+        assert_eq!(prof.profiles.len(), 1, "不该冒出 `-2` 后缀的重复条目");
+        assert_eq!(
+            prof.deleted.len(),
+            1,
+            "import-v3 只读：墓碑原样留着，不 forget"
         );
     }
 
