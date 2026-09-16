@@ -393,3 +393,14 @@ fn every_imported_user_gets_a_sub_token_and_a_seven_day_grace_window() {
         "宽限期要是「导入时刻 + 7 天」，拿到的是 {raw}"
     );
 }
+
+/// v3 → 4.1 直装：迁移用户的凭据是 `用户名:hy2_password` ⇒ 订阅逐字不变
+#[test]
+fn import_mints_a_residential_cred_per_user() {
+    let s = bui_schema::v3::import(fixture()).unwrap().state;
+    let alice = s.users.iter().find(|u| u.username == "alice").unwrap();
+    let c = bui_schema::hy2pool::cred_of(alice, &s.residential).expect("导入即分配");
+    assert_eq!(c.name, "alice");
+    assert_eq!(c.secret, alice.credentials.hy2_password);
+    assert!(s.residential.hy2_pool.creds.len() >= bui_schema::hy2pool::POOL_MIN);
+}
