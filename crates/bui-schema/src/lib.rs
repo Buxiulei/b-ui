@@ -16,6 +16,7 @@
 //! [`TrafficLimit`](model::TrafficLimit)、[`Usage`](model::Usage)、[`PortalAuth`](model::PortalAuth)、
 //! [`Billing`](model::Billing)、[`Order`](model::Order)、[`OrderStatus`](model::OrderStatus)、
 //! [`Residential`](model::Residential)、[`ResidentialGroup`](model::ResidentialGroup)、
+//! [`Hy2Pool`](model::Hy2Pool)、[`ReservedCred`](model::ReservedCred)、
 //! [`ResiMode`](model::ResiMode)、[`Upstream`](model::Upstream)、[`UpstreamKind`](model::UpstreamKind)、
 //! [`Verified`](model::Verified)、[`Blacklist`](model::Blacklist)、[`Rule`](model::Rule)、
 //! [`Pin`](model::Pin)、[`AutoEntry`](model::AutoEntry)、
@@ -36,6 +37,25 @@
 //! - [`slots::resubscribe_impact`]：比对改池前后两份期望态，算出手里那份订阅已经不能用的
 //!   用户名，按后果分成 [`slots::ResubscribeImpact`] 三组（槽位被删 / 槽位序号被搬到 0 /
 //!   跳跃区间被重切）；改池的执行路径据此逐组提示操作者哪些人要重新获取订阅。
+//!
+//! ## 住宅 HY2 凭据池 —— [`hy2pool`]
+//!
+//! 住宅 HY2 是**一个** sing-box hysteria2 入站 + 一池静态凭据
+//! （[`Hy2Pool`](model::Hy2Pool) / [`ReservedCred`](model::ReservedCred)，spec §3.1）：
+//! 每条凭据一个门（selector `gate-<id>`），用户生命周期动作只切门、不改配置、不重启内核。
+//!
+//! - [`hy2pool::POOL_MIN`] / [`hy2pool::POOL_MAX`] / [`hy2pool::size_for`]：池容量 =
+//!   `clamp(ceil16(2 × 住宅 hysteria2 用户数), 32, 256)`；基数由
+//!   [`hy2pool::resi_hy2_users`] 数出。
+//! - [`hy2pool::grow`]：补到目标条数（`id` = 最小空闲 `r%03d`，`name = id`）。
+//! - [`hy2pool::assign`] / [`hy2pool::release`] / [`hy2pool::cred_of`]：分配（先「从未用过」、
+//!   再「`released_at` 最早且 ≥ 24 小时」；**幂等**，已持凭据的用户原样拿回那一条，换凭据
+//!   必须显式 `release` + `assign`）、释放（记 `released_at`）与按用户取凭据。
+//! - [`hy2pool::regenerate_idle_secrets`]：重写配置时顺带重随机全部空闲凭据的 `secret`。
+//! - [`hy2pool::free_count`] / [`hy2pool::LOW_FREE_RATIO`]：空闲率与 20% 告警门槛。
+//! - [`hy2pool::migrate`]：v4 → 4.1 一次性分配（迁移用户 `name = 用户名`、
+//!   `secret = hy2_password` 的副本 ⇒ 订阅逐字不变），幂等；返回
+//!   [`hy2pool::MigrateReport`]（`changed` / `unassigned`，后者非零时调用方打 Error 事件）。
 //!
 //! ## 订阅 token 与旧链接宽限期 —— [`sub`]
 //!
@@ -101,6 +121,7 @@
 //! fn render_everything(_state: &State) { /* ... */ }
 //! ```
 
+pub mod hy2pool;
 pub mod keywords;
 pub mod model;
 pub mod nodes;

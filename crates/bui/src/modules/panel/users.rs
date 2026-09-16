@@ -243,6 +243,8 @@ pub fn new_user(req: &CreateRequest, now: OffsetDateTime) -> Result<User, String
         credentials: Credentials {
             hy2_password: req.password.clone().unwrap_or_else(random_hy2_password),
             vless_uuid: Uuid::new_v4(),
+            // 住宅凭据由建用户路径在分槽之后分配（spec §3.3）
+            hy2_resi_cred: None,
         },
         entitlements: Entitlements {
             protocols,

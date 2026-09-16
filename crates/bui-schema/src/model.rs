@@ -132,6 +132,17 @@ pub struct User {
 pub struct Credentials {
     pub hy2_password: String,
     pub vless_uuid: Uuid,
+    /// 该用户占用的住宅 HY2 凭据 id（[`ReservedCred::id`]，spec §3.1）。一个凭据最多属于
+    /// 一个用户；`None` = 还没分配（迁移前的老 state、或没有住宅权益）。
+    ///
+    /// **`hy2_password` 留给直连**：迁移时把它复制一份进 `hy2_pool`，此后两者各走各的
+    /// （rotate 换直连密码不会顺带改住宅凭据，反之亦然，spec §4.3 第 3 条）。
+    ///
+    /// `skip_serializing_if`（D10）：缺省一个字节都不进 `state.json` —— 理由同
+    /// [`User::sub_token`]，也让 `tests::state_round_trips` 的 `to_value(&s) == SAMPLE`
+    /// 继续成立（**不许改 SAMPLE**）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hy2_resi_cred: Option<String>,
 }
 
 /// 可开通的协议。
@@ -163,6 +174,11 @@ fn default_true() -> bool {
 /// `skip_serializing_if` 用：默认 false 的 bool 缺省不落盘（`Not::not` 收 `bool` 不收 `&bool`）。
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+/// `skip_serializing_if` 用：默认 true 的 bool 缺省不落盘（配 `default = "default_true"`）。
+fn is_true(b: &bool) -> bool {
+    *b
 }
 
 /// 住宅权益：指向某个住宅分组，以及该用户粘住的 IP 槽位。
@@ -254,6 +270,48 @@ pub enum OrderStatus {
     Cancelled,
 }
 
+/// 住宅 HY2 入站的一条静态凭据（spec §3.1）。写进 sing-box 的 `users[].password`
+/// 是 `"{name}:{secret}"` —— 那就是客户端发送的整个 auth 串，所以
+/// `hysteria2://name:secret@host:40000?…` 的 URI 形态一个字都不用改。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReservedCred {
+    /// `r` + 三位十进制（`r000`…`r255`）。ASCII、稳定、只在本机内部用：门的 tag
+    /// `gate-<id>`、Clash API 路径、日志匹配都按它（生产用户名是中文，不能进 URL）。
+    pub id: String,
+    /// sing-box `users[].name`，也是 `auth_user` 匹配值与 `stats.users` 的计数键。
+    /// **迁移用户 = 用户名**（保住订阅逐字不变），**新发凭据 = `id`**。
+    pub name: String,
+    /// 迁移用户 = 当时 `credentials.hy2_password` 的副本；新发 = 16 字节随机
+    /// base64url 无填充（22 字符，**不含 `:`**，否则 auth 串会被切错）。
+    pub secret: String,
+    /// 释放时刻（RFC3339）。`None` = 从未用过。再分配时优先「从未用过」的，其次
+    /// `released_at` 最早且 ≥ 24 小时的（[`crate::hy2pool::assign`]）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub released_at: Option<String>,
+}
+
+/// 住宅 HY2 的静态凭据池（spec §4.1）。纯函数在 [`crate::hy2pool`]。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Hy2Pool {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub creds: Vec<ReservedCred>,
+    /// 每次重写 `hy2-residential.json` 递增，日志 / 事件用它指称「第几代池」。
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub generation: u64,
+}
+
+impl Hy2Pool {
+    /// 「一个字节都不用落盘」的判据（`Residential::hy2_pool` 的 `skip_serializing_if`）。
+    pub fn is_empty(&self) -> bool {
+        self.creds.is_empty() && self.generation == 0
+    }
+}
+
+/// `skip_serializing_if` 用：`generation` 还没涨过就不落盘。
+fn is_zero_u64(n: &u64) -> bool {
+    *n == 0
+}
+
 /// 全部住宅分组。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Residential {
@@ -277,6 +335,12 @@ pub struct Residential {
     pub speedtest_up_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speedtest_interval_mins: Option<i64>,
+    /// 住宅 HY2 入站的静态凭据池（spec §4.1）。**跨版本可缺**：旧 `state.json` 没有这个
+    /// 字段时 default 成空池，由 `bui` 启动时的一次迁移补齐（[`crate::hy2pool::migrate`]）。
+    ///
+    /// `skip_serializing_if`（D10）：空池不落盘 —— 理由同上面的 `slots`。
+    #[serde(default, skip_serializing_if = "Hy2Pool::is_empty")]
+    pub hy2_pool: Hy2Pool,
 }
 
 impl Default for Residential {
@@ -289,6 +353,7 @@ impl Default for Residential {
             speedtest_down_bytes: None,
             speedtest_up_bytes: None,
             speedtest_interval_mins: None,
+            hy2_pool: Hy2Pool::default(),
         }
     }
 }
@@ -510,6 +575,16 @@ pub struct SystemSettings {
     /// `skip_serializing_if`（D10）：缺省不落盘，理由同 [`User::sub_token`]。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub legacy_sub_until: Option<String>,
+    /// 住宅 HY2 的 4.0 兼容段 `40001 .. 40000 + MAX_SLOTS - 1`（= `40001-40007`）是否
+    /// REDIRECT 到 `:40000` + 放行（spec §2.4）。**缺省 true**：旧 `state.json` 缺字段就是
+    /// 开着 —— 4.0.x 的订阅里有按槽算出来的 `4000x`，那些客户端不会自动刷新。
+    /// 连续 30 天零命中（`bui status` 的 `counter`）才 `bui set hy2-resi-compat off`。
+    ///
+    /// `skip_serializing_if = "is_true"`（口径同 [`User::legacy_sub_disabled`]）：缺省不落盘，
+    /// 于是 `tests::state_round_trips` 的 `to_value(&s) == SAMPLE` 继续成立（**不许改
+    /// SAMPLE**），单槽机器升级后 `state.json` 也一个字节不变。
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub hy2_resi_compat_ports: bool,
 }
 
 fn default_auto() -> String {
@@ -525,6 +600,7 @@ impl Default for SystemSettings {
             firewall: "auto".into(),
             hy2_auth: Hy2Auth::Http,
             legacy_sub_until: None,
+            hy2_resi_compat_ports: true,
         }
     }
 }
@@ -678,6 +754,50 @@ mod tests {
         );
         assert_eq!(json["users"][0]["legacy_sub_disabled"], true);
         assert_eq!(json["system"]["legacy_sub_until"], "2026-09-21T00:00:00Z");
+        let back: State = serde_json::from_value(json).unwrap();
+        assert_eq!(back, s2, "写出去再读回来要一模一样");
+    }
+
+    /// 4.1 住宅凭据池（spec §4.1）：三个新字段都不进默认序列化，`state_round_trips` 的
+    /// `to_value(&s) == SAMPLE` 继续成立；**旧 `state.json` 缺字段必须读得进来且取到默认值**
+    /// —— `hy2_resi_compat_ports` 缺省 = true（兼容段 40001-40007 开着，spec §2.4）。
+    #[test]
+    fn the_new_hy2_pool_fields_stay_out_of_the_default_serialization() {
+        let s: State = serde_json::from_str(SAMPLE).expect("parse");
+        assert!(s.residential.hy2_pool.is_empty(), "旧 state 没有这个字段");
+        assert_eq!(s.users[0].credentials.hy2_resi_cred, None);
+        assert!(
+            s.system.hy2_resi_compat_ports,
+            "旧 state 缺字段就是开着（spec §2.4）"
+        );
+        let v = serde_json::to_value(&s).unwrap();
+        assert!(v["residential"].get("hy2_pool").is_none());
+        assert!(v["users"][0]["credentials"].get("hy2_resi_cred").is_none());
+        // 兼容段开关也 `skip_serializing_if = "is_true"`（口径同 `legacy_sub_disabled`）：
+        // `SAMPLE` 一个字节都不用改，单槽机器升级后 `state.json` 也一个字节不变。
+        assert!(v["system"].get("hy2_resi_compat_ports").is_none());
+
+        let mut s2 = s.clone();
+        s2.residential.hy2_pool = Hy2Pool {
+            creds: vec![ReservedCred {
+                id: "r000".into(),
+                name: "alice".into(),
+                secret: "pw-alice".into(),
+                released_at: Some("2026-09-20T00:00:00Z".into()),
+            }],
+            generation: 3,
+        };
+        s2.users[0].credentials.hy2_resi_cred = Some("r000".into());
+        s2.system.hy2_resi_compat_ports = false;
+        let json = serde_json::to_value(&s2).unwrap();
+        assert_eq!(json["residential"]["hy2_pool"]["creds"][0]["id"], "r000");
+        assert_eq!(
+            json["residential"]["hy2_pool"]["creds"][0]["released_at"],
+            "2026-09-20T00:00:00Z"
+        );
+        assert_eq!(json["residential"]["hy2_pool"]["generation"], 3);
+        assert_eq!(json["users"][0]["credentials"]["hy2_resi_cred"], "r000");
+        assert_eq!(json["system"]["hy2_resi_compat_ports"], false);
         let back: State = serde_json::from_value(json).unwrap();
         assert_eq!(back, s2, "写出去再读回来要一模一样");
     }
