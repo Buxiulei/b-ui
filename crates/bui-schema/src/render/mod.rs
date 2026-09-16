@@ -2,6 +2,7 @@
 pub mod client;
 pub mod hy2_singbox;
 pub mod hysteria;
+pub mod nft;
 pub mod relay;
 pub mod subscription;
 pub mod xray;
