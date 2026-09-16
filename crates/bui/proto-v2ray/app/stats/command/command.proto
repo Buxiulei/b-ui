@@ -1,0 +1,67 @@
+// 住宅 HY2（自建 sing-box）的 v2ray_api `StatsService`。
+//
+// 来源：github.com/SagerNet/sing-box，tag v1.14.1
+// （commit 1ac1a339cb1223e9c70eae14c44411c75033c02d）的
+// `experimental/v2rayapi/stats.proto`，逐字转写，**只改 package 行**。
+//
+// 为什么要改 package：上游 proto 声明的是 `package experimental.v2rayapi`，
+// 但 `experimental/v2rayapi/stats.go:22` 的 `init()` 把注册名覆盖成
+// `StatsService_ServiceDesc.ServiceName = "v2ray.core.app.stats.command.StatsService"`
+// —— grpc-go 用 ServiceDesc.ServiceName 拼方法路径，所以**线上真实路径**是
+// `/v2ray.core.app.stats.command.StatsService/QueryStats`，而不是生成代码里那个
+// `/experimental.v2rayapi.StatsService/…`。tonic 从 proto 的 package 推路径，
+// 于是这里必须写成 `v2ray.core.app.stats.command` 才连得上。
+// 上游原文按字节存在 `proto-v2ray/experimental/v2rayapi/stats.proto`（不编译，只当漂移哨兵），
+// 两份的消息与字段定义由 `panel::hy2resi` 的守门测试逐行比对。
+syntax = "proto3";
+
+package v2ray.core.app.stats.command;
+
+message GetStatsRequest {
+  // Name of the stat counter.
+  string name = 1;
+  // Whether or not to reset the counter to fetching its value.
+  bool reset = 2;
+}
+
+message Stat {
+  string name = 1;
+  int64 value = 2;
+}
+
+message GetStatsResponse {
+  Stat stat = 1;
+}
+
+message QueryStatsRequest {
+  // Deprecated, use Patterns instead
+  string pattern = 1;
+  bool reset = 2;
+  repeated string patterns = 3;
+  bool regexp = 4;
+}
+
+message QueryStatsResponse {
+  repeated Stat stat = 1;
+}
+
+message SysStatsRequest {}
+
+message SysStatsResponse {
+  uint32 NumGoroutine = 1;
+  uint32 NumGC = 2;
+  uint64 Alloc = 3;
+  uint64 TotalAlloc = 4;
+  uint64 Sys = 5;
+  uint64 Mallocs = 6;
+  uint64 Frees = 7;
+  uint64 LiveObjects = 8;
+  uint64 PauseTotalNs = 9;
+  uint32 Uptime = 10;
+}
+
+service StatsService {
+  rpc GetStats(GetStatsRequest) returns (GetStatsResponse) {}
+  rpc QueryStats(QueryStatsRequest) returns (QueryStatsResponse) {}
+  rpc GetSysStats(SysStatsRequest) returns (SysStatsResponse) {}
+}

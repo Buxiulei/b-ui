@@ -15,6 +15,7 @@ pub mod assets;
 pub mod auth_hook;
 pub mod auth_http;
 pub mod hy2;
+pub mod hy2resi;
 pub mod packages;
 pub mod snapshot;
 pub mod traffic;
@@ -43,6 +44,15 @@ pub const HY2_STATS_PORT_DIRECT: u16 = 9999;
 /// 住宅实例的 `trafficStats` 端口基准（槽 i = `9998 - i`，见 `bui_schema::slots`）。
 /// 单槽时就是今天的 9998。
 pub const HY2_STATS_PORT_RESI: u16 = bui_schema::slots::HY2_STATS_RESI_BASE;
+/// 住宅 HY2（sing-box）的两个回环控制面（spec §2.3）：`HY2_RESI_CLASH_API` 上跑在线数、
+/// 踢连接与门位（selector），`HY2_RESI_V2RAY_API` 上跑 `StatsService.QueryStats` 的计量。
+/// 两个面都**只监听回环、不设 secret** ⇒ 这条路从不发 Authorization 头。
+///
+/// **端口只有一处来源：写出 `hy2-residential.json` 的那个渲染器。** 这里必须是 `pub use`
+/// 而不是另定字面量——一旦两边分叉，客户端会去打没人听的端口，而计量（v2ray_api）与
+/// 门位（Clash API）双双打空、测试却全绿，属静默生产故障。守门断言见
+/// `panel::hy2resi::tests::the_endpoints_come_from_the_renderer`。
+pub use bui_schema::render::hy2_singbox::{HY2_RESI_CLASH_API, HY2_RESI_V2RAY_API};
 /// `bui_schema::render::hysteria` 渲染的 `trafficStats.secret` 是空串 ⇒ 不发 Authorization 头。
 /// 若将来改成非空，`hy2::Hy2Client` 按调研 H13 发 `Authorization: <secret>`（**无** `Bearer ` 前缀）。
 pub const HY2_STATS_SECRET: &str = "";
@@ -133,6 +143,26 @@ pub trait Hy2Api: Send + Sync {
     async fn kick(&self, port: u16, ids: &[String]) -> anyhow::Result<()>;
 }
 
+/// 住宅 HY2（sing-box）的控制面：计量走 v2ray_api 的 gRPC，在线 / 踢人 / 门位走 Clash API
+/// （spec §5.1、§5.2）。生产实现是 [`hy2resi::Hy2ResiClient`]，测试注入
+/// `fakes::FakeHy2Resi`（见 [`Shared::with_hy2resi`]）。
+#[async_trait::async_trait]
+pub trait Hy2ResiApi: Send + Sync {
+    /// `QueryStats(patterns=["user>>>"], reset=true)`：凭据 name → 本轮增量
+    async fn query_user_deltas(&self) -> anyhow::Result<BTreeMap<String, TxRx>>;
+    /// `GET /connections` → 每条的 (id, rule)；在线数按 rule 里的 `auth_user=<name>` 归组
+    /// （`metadata` 里**没有** user 字段）
+    async fn connections(&self) -> anyhow::Result<Vec<hy2resi::Hy2ResiConn>>;
+    /// `DELETE /connections/{id}`：踢用户时「门切 `deny`」之后的逐条兜底
+    async fn close_connection(&self, id: &str) -> anyhow::Result<()>;
+    /// `GET /proxies` 一次读全部门位：selector tag → 当前成员
+    async fn selected_all(&self) -> anyhow::Result<BTreeMap<String, String>>;
+    /// `PUT /proxies/<selector>` `{"name":"<tag>"}`
+    async fn select(&self, selector: &str, tag: &str) -> anyhow::Result<()>;
+    /// `GET /version` 是否 2xx（住宅 sing-box 刚重启时还没起监听，重放门位前先探这一下）
+    async fn ready(&self) -> bool;
+}
+
 pub struct Shared {
     paths: OnceLock<Paths>,
     cache: tokio::sync::RwLock<SampleCache>,
@@ -143,6 +173,7 @@ pub struct Shared {
     xray_seen: tokio::sync::Mutex<BTreeMap<Uuid, OffsetDateTime>>,
     xray: Box<dyn XrayApi>,
     hy2: Box<dyn Hy2Api>,
+    hy2resi: Box<dyn Hy2ResiApi>,
 }
 
 impl Shared {
@@ -156,7 +187,25 @@ impl Shared {
             xray_seen: tokio::sync::Mutex::new(BTreeMap::new()),
             xray,
             hy2,
+            // 「测试不碰真实系统」在这里是**结构保证**，不是「每个人记得注入」：
+            // `Shared::new` 的八个调用点里七个是测试专用，所以测试构型下默认就给 fake。
+            // 真按调用点数少数派（生产只有 `PanelModule::new` 一处）去改签名，代价是
+            // 动 `users.rs` / `sentinel/*` 五处（T15 的签名收缩才碰它们）。
+            #[cfg(test)]
+            hy2resi: Box::new(fakes::FakeHy2Resi::new()),
+            #[cfg(not(test))]
+            hy2resi: Box::new(hy2resi::Hy2ResiClient::new()),
         }
+    }
+
+    /// 换掉住宅 HY2 的控制面客户端。
+    ///
+    /// 默认值按构型分流（见 [`Shared::new`]）：生产是 [`hy2resi::Hy2ResiClient`]，测试是
+    /// `fakes::FakeHy2Resi`。所以**这个 builder 只在测试要拿句柄记账 / 注入失败时才用**
+    /// （T11 的 fail-closed 用例），漏用它也不会让测试去打 `127.0.0.1` 的两个回环面。
+    pub fn with_hy2resi(mut self, hy2resi: Box<dyn Hy2ResiApi>) -> Self {
+        self.hy2resi = hy2resi;
+        self
     }
 
     /// `AppState` 里没有 `paths`，而 `/packages/*` 与快照重写都要它；`render()` 与 `spawn()`
@@ -187,6 +236,10 @@ impl Shared {
 
     pub fn hy2(&self) -> &dyn Hy2Api {
         self.hy2.as_ref()
+    }
+
+    pub fn hy2resi(&self) -> &dyn Hy2ResiApi {
+        self.hy2resi.as_ref()
     }
 
     pub async fn cache(&self) -> tokio::sync::RwLockReadGuard<'_, SampleCache> {
@@ -410,6 +463,49 @@ mod tests {
         // OnceLock：第二次 set 不生效，也不 panic
         s.set_paths(&Paths::default_server());
         assert_eq!(s.paths().base_dir, PathBuf::from("/tmp/x"));
+    }
+
+    /// `with_hy2resi` 是给「要拿句柄记账 / 注入失败」的用例用的通路
+    /// （T10 的采样、T11 的门位收敛都靠它）。
+    #[tokio::test]
+    async fn the_hy2resi_client_is_injectable_so_tests_can_account_for_its_calls() {
+        let fake = super::fakes::FakeHy2Resi::new();
+        let s = Shared::new(
+            Box::new(super::fakes::FakeXray::new()),
+            Box::new(super::fakes::FakeHy2::new()),
+        )
+        .with_hy2resi(Box::new(fake.clone()));
+        assert!(s.hy2resi().ready().await, "注入的 fake 默认可用");
+        assert_eq!(fake.calls(), vec!["ready".to_string()]);
+        fake.clear_calls();
+        fake.set_selected(BTreeMap::from([(
+            "gate-r000".to_string(),
+            "deny".to_string(),
+        )]));
+        assert_eq!(
+            s.hy2resi().selected_all().await.unwrap()["gate-r000"],
+            "deny"
+        );
+        assert_eq!(fake.calls(), vec!["selected_all".to_string()]);
+    }
+
+    /// **漏注入也不许碰真实系统**：测试构型下 `Shared::new` 的默认住宅控制面客户端是
+    /// fake，不是只连 `127.0.0.1:9092` / `:10086` 的生产客户端（`new` 的八个调用点里
+    /// 七个是测试专用，所以这件事必须由构型兜住，不能靠「每个人记得 `with_hy2resi`」）。
+    ///
+    /// 判据就是「不出网也能成」：fake 立刻回 `ready = true` 且 `Ok(空表)`；换成生产客户端，
+    /// 本机没人听那两个回环端口 ⇒ `ready()` 为假、`query_user_deltas()` 是 `Err`。
+    #[tokio::test]
+    async fn the_default_hy2resi_client_in_test_builds_is_the_fake() {
+        let s = Shared::new(
+            Box::new(super::fakes::FakeXray::new()),
+            Box::new(super::fakes::FakeHy2::new()),
+        );
+        assert!(s.hy2resi().ready().await, "默认客户端必须是 fake");
+        assert_eq!(
+            s.hy2resi().query_user_deltas().await.unwrap(),
+            BTreeMap::new()
+        );
     }
 
     #[test]

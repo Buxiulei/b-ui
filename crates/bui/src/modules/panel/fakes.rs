@@ -1,6 +1,7 @@
 //! 测试用的内存 fake（`#[cfg(test)]`）：把 gRPC 与 hysteria HTTP 全挡在进程内。
 
-use super::{Hy2Api, TxRx, XrayApi};
+use super::hy2resi::Hy2ResiConn;
+use super::{Hy2Api, Hy2ResiApi, TxRx, XrayApi};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
@@ -236,10 +237,160 @@ impl Hy2Api for FakeHy2 {
     }
 }
 
+pub struct FakeHy2ResiInner {
+    /// `"query"` / `"connections"` / `"close:<id>"` / `"selected_all"` /
+    /// `"select:<selector>:<tag>"` / `"ready"`
+    /// （记法是契约：T11 的用例按这些字面量数调用次数）
+    pub calls: Vec<String>,
+    /// `query_user_deltas` 的下一次返回值（返回后清空，对应 `reset=true` 语义）
+    pub deltas: BTreeMap<String, TxRx>,
+    /// `GET /connections` 的返回值
+    pub conns: Vec<Hy2ResiConn>,
+    /// 门位现状：selector tag → 当前成员。`select` 成功会改这里，`selected_all` 从这里读
+    /// —— T11 的门位收敛要靠「写完能读回来」才测得出幂等。
+    pub selected: BTreeMap<String, String>,
+    /// `ready()` 的返回值（默认 true；置 false 模拟 sing-box 刚重启还没起监听）
+    pub ready: bool,
+    /// 命中就返回 `Err`（键同 `calls` 的记法），用来测某一条调用长期失败
+    pub fail_on: BTreeSet<String>,
+    /// 下一次**任何**调用失败一次（命中即清空），错误串取这里 ——
+    /// T11 的 fail-closed 测试要的就是「这一次切门没成」。
+    pub fail_next: Option<String>,
+}
+
+impl Default for FakeHy2ResiInner {
+    fn default() -> Self {
+        Self {
+            calls: Vec::new(),
+            deltas: BTreeMap::new(),
+            conns: Vec::new(),
+            selected: BTreeMap::new(),
+            ready: true,
+            fail_on: BTreeSet::new(),
+            fail_next: None,
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct FakeHy2Resi(Arc<Mutex<FakeHy2ResiInner>>);
+
+impl FakeHy2Resi {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with(&self, f: impl FnOnce(&mut FakeHy2ResiInner)) -> &Self {
+        f(&mut self.0.lock().unwrap());
+        self
+    }
+
+    pub fn calls(&self) -> Vec<String> {
+        self.0.lock().unwrap().calls.clone()
+    }
+
+    pub fn clear_calls(&self) {
+        self.0.lock().unwrap().calls.clear();
+    }
+
+    pub fn set_deltas(&self, deltas: BTreeMap<String, TxRx>) {
+        self.0.lock().unwrap().deltas = deltas;
+    }
+
+    /// `(id, rule)` 对 → 连接表；`rule` 就是 sing-box 那个
+    /// `auth_user=<name> => route(gate-<id>)` 字符串。
+    pub fn set_conns(&self, conns: Vec<(&str, &str)>) {
+        self.0.lock().unwrap().conns = conns
+            .into_iter()
+            .map(|(id, rule)| Hy2ResiConn {
+                id: id.to_string(),
+                rule: rule.to_string(),
+                chains: Vec::new(),
+            })
+            .collect();
+    }
+
+    pub fn set_selected(&self, selected: BTreeMap<String, String>) {
+        self.0.lock().unwrap().selected = selected;
+    }
+
+    pub fn selected(&self) -> BTreeMap<String, String> {
+        self.0.lock().unwrap().selected.clone()
+    }
+
+    pub fn set_ready(&self, ready: bool) {
+        self.0.lock().unwrap().ready = ready;
+    }
+
+    /// `ready()` 永远为假：住宅 sing-box 的 Clash API 一直起不来，重放只能停在 `deny`
+    /// （T11 的「重放预算用完」用例）。
+    pub fn set_never_ready(&self) {
+        self.set_ready(false);
+    }
+
+    /// 下一次任何调用失败一次（错误串是 `msg`）
+    pub fn fail_next(&self, msg: &str) {
+        self.0.lock().unwrap().fail_next = Some(msg.to_string());
+    }
+
+    /// 记一次调用；该失败就返回 `Err`。
+    fn record(&self, key: String) -> anyhow::Result<()> {
+        let mut i = self.0.lock().unwrap();
+        i.calls.push(key.clone());
+        if let Some(msg) = i.fail_next.take() {
+            anyhow::bail!("{msg}");
+        }
+        if i.fail_on.contains(&key) {
+            anyhow::bail!("fake Hy2ResiApi 失败：{key}");
+        }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl Hy2ResiApi for FakeHy2Resi {
+    async fn query_user_deltas(&self) -> anyhow::Result<BTreeMap<String, TxRx>> {
+        self.record("query".into())?;
+        Ok(std::mem::take(&mut self.0.lock().unwrap().deltas))
+    }
+
+    async fn connections(&self) -> anyhow::Result<Vec<Hy2ResiConn>> {
+        self.record("connections".into())?;
+        Ok(self.0.lock().unwrap().conns.clone())
+    }
+
+    async fn close_connection(&self, id: &str) -> anyhow::Result<()> {
+        self.record(format!("close:{id}"))?;
+        self.0.lock().unwrap().conns.retain(|c| c.id != id);
+        Ok(())
+    }
+
+    async fn selected_all(&self) -> anyhow::Result<BTreeMap<String, String>> {
+        self.record("selected_all".into())?;
+        Ok(self.0.lock().unwrap().selected.clone())
+    }
+
+    async fn select(&self, selector: &str, tag: &str) -> anyhow::Result<()> {
+        self.record(format!("select:{selector}:{tag}"))?;
+        self.0
+            .lock()
+            .unwrap()
+            .selected
+            .insert(selector.to_string(), tag.to_string());
+        Ok(())
+    }
+
+    async fn ready(&self) -> bool {
+        let mut i = self.0.lock().unwrap();
+        i.calls.push("ready".into());
+        i.ready
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::modules::panel::{Hy2Api, TxRx, XrayApi};
+    use crate::modules::panel::{Hy2Api, Hy2ResiApi, TxRx, XrayApi};
     use pretty_assertions::assert_eq;
     use uuid::Uuid;
 
@@ -369,5 +520,82 @@ mod tests {
             .await
             .unwrap();
         assert!(k.calls().contains(&"kick:9999:u-1,u-2".to_string()));
+    }
+
+    /// 住宅这条路的 fake 必须记账 + 可注入失败：T10 的采样与 T11 的门位收敛
+    /// 全靠「调用序列」与「下一次失败」这两件事写测试。
+    #[tokio::test]
+    async fn fake_hy2resi_records_calls_replays_selections_and_can_fail_once() {
+        let r = FakeHy2Resi::new();
+        assert!(r.ready().await, "默认可用");
+        r.set_never_ready();
+        assert!(!r.ready().await);
+        r.set_ready(true);
+        assert!(r.ready().await);
+
+        r.set_deltas(BTreeMap::from([(
+            "r000".to_string(),
+            TxRx { tx: 1, rx: 2 },
+        )]));
+        assert_eq!(r.query_user_deltas().await.unwrap().len(), 1);
+        assert!(
+            r.query_user_deltas().await.unwrap().is_empty(),
+            "增量取走即清空（reset=true 语义）"
+        );
+
+        r.set_conns(vec![
+            ("c1", "auth_user=r000 => route(gate-r000)"),
+            ("c2", "final"),
+        ]);
+        assert_eq!(r.connections().await.unwrap().len(), 2);
+        r.close_connection("c1").await.unwrap();
+        assert_eq!(
+            r.connections().await.unwrap()[0].id,
+            "c2",
+            "关掉的连接不再出现在 /connections 里"
+        );
+
+        // 切门写完能读回来（门位收敛的幂等判据）
+        r.select("gate-r000", "slot-0-out").await.unwrap();
+        assert_eq!(
+            r.selected_all().await.unwrap(),
+            BTreeMap::from([("gate-r000".to_string(), "slot-0-out".to_string())])
+        );
+
+        assert_eq!(
+            r.calls(),
+            vec![
+                "ready",
+                "ready",
+                "ready",
+                "query",
+                "query",
+                "connections",
+                "close:c1",
+                "connections",
+                "select:gate-r000:slot-0-out",
+                "selected_all",
+            ]
+        );
+
+        // 下一次调用失败一次，之后自愈
+        r.fail_next("v2ray_api 不可达");
+        assert_eq!(
+            r.query_user_deltas().await.unwrap_err().to_string(),
+            "v2ray_api 不可达"
+        );
+        assert!(r.query_user_deltas().await.is_ok());
+
+        // 指定某一条调用长期失败
+        r.with(|i| {
+            i.fail_on.insert("select:gate-r001:deny".into());
+        });
+        assert!(r.select("gate-r001", "deny").await.is_err());
+        assert!(r.select("gate-r000", "deny").await.is_ok());
+        assert_eq!(
+            r.selected().get("gate-r001"),
+            None,
+            "失败的切门不许留下痕迹"
+        );
     }
 }
