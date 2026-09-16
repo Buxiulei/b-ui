@@ -42,9 +42,10 @@ pub enum PlanError {
 }
 
 impl std::fmt::Display for PlanError {
-    /// 节点名一律先过 [`menu::sanitize`]（spec §5.10 末条）。
+    /// 节点名一律先过 [`menu::display_name`]（净化 + token 打码，spec §5.10 末条、§8.3）：
+    /// 这几句会连同名字一起进日志与截图。变体里存的仍是原名，报错之外没人拿它去查节点。
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let clean = |n: &String| menu::sanitize(n).into_owned();
+        let clean = |n: &String| menu::display_name(n).into_owned();
         match self {
             PlanError::NotFound(v) => write!(
                 f,
@@ -193,20 +194,28 @@ pub struct Report {
 /// 「上次：」行的短摘要（spec §0.2 R6）：`已删 N 个` / `已删 N 个，切到 {名字}` /
 /// `已删光节点，按 [3] 导入`。名字按 R6 单独中间截断，与 `menu::fit_name_in_last`
 /// （切换摘要）同一规则。
+///
+/// 拼句子时用的就是显示名（[`menu::display_name`]，净化 + token 打码，spec §8.3）：
+/// `fit_name_in_last` 是拿显示名去摘要里找名字那一段的，这里拼原名它就找不到，
+/// 整句原样返回、token 漏在「上次：」行上。传给它的第二个参数给原名给显示名都行——
+/// 打码幂等。
 pub fn summary(r: &Report, width: usize) -> String {
     if r.stopped {
         return "已删光节点，按 [3] 导入".to_string();
     }
     let n = r.deleted.len();
     match r.active.as_deref().filter(|_| r.switched) {
-        Some(name) => menu::fit_name_in_last(&format!("已删 {n} 个，切到 {name}"), name, width),
+        Some(name) => {
+            let shown = menu::display_name(name);
+            menu::fit_name_in_last(&format!("已删 {n} 个，切到 {shown}"), name, width)
+        }
         None => format!("已删 {n} 个"),
     }
 }
 
 /// `bui-c delete` 成功时打的那一句（spec §5.4 命令行那一条）。命令行没有「上次：」行、宽度
 /// 也不紧张，所以说全，不用 [`summary`] 的短式（R6 的短式只管菜单那一行），也不把菜单键
-/// 漏进命令行。名字照 §5.10 末条过 [`menu::sanitize`]。
+/// 漏进命令行。名字照 §5.10 末条、§8.3 过 [`menu::display_name`]（净化 + token 打码）。
 ///
 /// - Switch：`当前节点已删除，切到 X`（§5.4 逐字）
 /// - Passive：`已删除 N 个节点，还剩 M 个`
@@ -219,7 +228,7 @@ pub fn cli_summary(r: &Report) -> String {
         return format!("已删除全部 {n} 个节点，代理已停止；用 bui-c import 重新导入");
     }
     match r.active.as_deref().filter(|_| r.switched) {
-        Some(to) => format!("当前节点已删除，切到 {}", menu::sanitize(to)),
+        Some(to) => format!("当前节点已删除，切到 {}", menu::display_name(to)),
         None => format!("已删除 {n} 个节点，还剩 {} 个", r.remaining),
     }
 }
@@ -556,6 +565,119 @@ mod tests {
             ..passive
         };
         assert!(!cli_summary(&dirty).contains('\u{1b}'));
+    }
+
+    /// 合成 token：32 位十六进制，与 `menu.rs` / `source.rs` 的测试同一串（spec §11 门禁段）。
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+    /// 测试 78（spec §8.3「删除的错误与摘要」行）：三种 `PlanError` 与命令行摘要里的节点名
+    /// 都过 [`menu::display_name`]，token 段只剩前 4 位加 `…`；错误结构里存的仍是原名
+    /// （打码后的字符串回头查 `profiles.json` 是查不到的），没有 token 段的名字逐字不变。
+    #[test]
+    fn plan_errors_and_cli_summary_mask_token_names() {
+        let token_name = format!("{TOKEN}-hy2-resi");
+        let prof = baiyi_like();
+        // NotFound：名字是用户敲进来的，一起打码；没有 token 段的那个逐字
+        let e = plan(&prof, &names(&[token_name.as_str(), "nope"]), None).unwrap_err();
+        assert_eq!(
+            e,
+            PlanError::NotFound(names(&[token_name.as_str(), "nope"])),
+            "错误里存的是原名"
+        );
+        assert_eq!(
+            e.to_string(),
+            "没有叫 0123…-hy2-resi、nope 的节点，用 `bui-c list` 看名字；什么都没删"
+        );
+        assert!(!e.to_string().contains(TOKEN), "{e}");
+        // BadSwitchTo：`--switch-to` 指了个不存在的 token 名
+        let e = plan(&prof, &names(&["HY2"]), Some(&token_name)).unwrap_err();
+        assert_eq!(e, PlanError::BadSwitchTo(token_name.clone()));
+        assert_eq!(
+            e.to_string(),
+            "--switch-to 0123…-hy2-resi 不存在，用 `bui-c list` 看名字；什么都没删"
+        );
+        // SwitchToIsTarget：这一条要名字真在列表里
+        let mut with_token = baiyi_like();
+        with_token.profiles.push(crate::testutil::named(
+            &token_name,
+            crate::testutil::hy2_resi_node(),
+        ));
+        let e = plan(
+            &with_token,
+            &names(&[token_name.as_str()]),
+            Some(&token_name),
+        )
+        .unwrap_err();
+        assert_eq!(e, PlanError::SwitchToIsTarget(token_name.clone()));
+        assert_eq!(
+            e.to_string(),
+            "--switch-to 0123…-hy2-resi 也在要删的节点里；什么都没删"
+        );
+        // cli_summary 的 Switch 分支
+        let switched = Report {
+            deleted: names(&["HY2"]),
+            active: Some(token_name.clone()),
+            switched: true,
+            stopped: false,
+            remaining: 8,
+        };
+        assert_eq!(
+            cli_summary(&switched),
+            "当前节点已删除，切到 0123…-hy2-resi"
+        );
+        assert!(!cli_summary(&switched).contains(TOKEN));
+        // 没有 token 段的名字逐字，与第 9 条的断言同一口径
+        let plain = Report {
+            active: Some(RICK_REALITY.into()),
+            ..switched
+        };
+        assert_eq!(
+            cli_summary(&plain),
+            format!("当前节点已删除，切到 {RICK_REALITY}")
+        );
+    }
+
+    /// 测试 78 续（spec §8.3「上次：」行）：`summary` 的短式里也只出现打码后的名字。拼摘要时
+    /// 就得用显示名——[`menu::fit_name_in_last`] 是拿显示名去摘要里找的，拼原名它找不到、
+    /// 整句原样返回，token 就漏在「上次：」行上了。
+    #[test]
+    fn summary_masks_the_token_name_before_fitting_the_last_line() {
+        let token_name = format!("{TOKEN}-hy2-resi");
+        let r = Report {
+            deleted: names(&["HY2"]),
+            active: Some(token_name.clone()),
+            switched: true,
+            stopped: false,
+            remaining: 8,
+        };
+        assert_eq!(summary(&r, 80), "已删 1 个，切到 0123…-hy2-resi");
+        let at40 = summary(&r, 40);
+        assert!(
+            !at40.contains(&TOKEN[..8]),
+            "token 不进「上次：」行：{at40}"
+        );
+        assert_eq!(
+            at40,
+            menu::fit_name_in_last(
+                &format!("已删 1 个，切到 {}", menu::display_name(&token_name)),
+                &token_name,
+                40
+            ),
+            "打码在截断之前，截的只是打码后的名字那一段"
+        );
+        assert!(
+            menu::budget_width(&format!("  上次：{at40}")) <= menu::line_limit(40),
+            "{at40}"
+        );
+        // 没有 token 段的名字逐字，与第 8 条的断言同一口径
+        let plain = Report {
+            active: Some(RICK_REALITY.into()),
+            ..r
+        };
+        assert_eq!(
+            summary(&plain, 80),
+            format!("已删 1 个，切到 {RICK_REALITY}")
+        );
     }
 
     /// 不带节点名的失败摘要要整句放进 40 列的「上次：」行（spec §0.2 R6）：那一行只有
