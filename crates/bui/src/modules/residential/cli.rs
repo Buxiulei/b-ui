@@ -1053,6 +1053,44 @@ pub async fn menu(socket: PathBuf) -> anyhow::Result<()> {
                 }
                 ResidentialCmd::Assign { user, target }
             }
+            "12" => {
+                // 先看池，再问要不要扩：扩容会重写 hy2-residential.json + 重启住宅内核
+                // （全体住宅 HY2 会话重连一次），不该一按就动
+                if let Err(e) = run(
+                    ResidentialCmd::Pool {
+                        cmd: PoolCmd::Status { json: false },
+                    },
+                    socket.clone(),
+                )
+                .await
+                {
+                    println!("执行失败：{e:#}");
+                    continue;
+                }
+                let to = prompt("扩容到几条（直接回车 = 不扩，按用户数自动补则填 auto）: ")?;
+                if to.is_empty() {
+                    continue;
+                }
+                let to = if to == "auto" {
+                    None
+                } else {
+                    match to.parse::<usize>() {
+                        Ok(n) => Some(n),
+                        Err(_) => {
+                            println!("只能填条数或 auto，实际 {to}");
+                            continue;
+                        }
+                    }
+                };
+                println!("扩容会重写 hy2-residential.json 并重启 hysteria-residential，全体住宅 HY2 会话重连一次。");
+                if prompt("确认？(yes): ")? != "yes" {
+                    println!("已取消");
+                    continue;
+                }
+                ResidentialCmd::Pool {
+                    cmd: PoolCmd::Grow { to },
+                }
+            }
             "0" => return Ok(()),
             other => {
                 println!("无效选择：{other}");
@@ -1592,6 +1630,23 @@ mod tests {
         assert!(items.iter().any(|i| i.title.contains("住宅 HY2 凭据池")));
         assert_eq!(items.last().unwrap().action, MenuAction::Quit);
         assert!(items.iter().any(|i| i.title.contains("黑名单")));
+        // **菜单里有的 key，`menu()` 里必须有分支**：只往 `menu_items()` 加一项、忘了加
+        // dispatch 的后果是「菜单显示 [12]，选了打「无效选择」」，而全套用例照旧全绿。
+        let dispatch = include_str!("cli.rs")
+            .split_once("pub async fn menu(")
+            .expect("menu() 没了")
+            .1;
+        let dispatch = dispatch
+            .split_once("\n#[cfg(test)]")
+            .map_or(dispatch, |x| x.0);
+        for i in &items {
+            assert!(
+                dispatch.contains(&format!("\"{}\" =>", i.key)),
+                "菜单项 [{}]「{}」在 menu() 里没有 dispatch 分支",
+                i.key,
+                i.title
+            );
+        }
         // 两处「钉住」的文案必须能区分开：一个钉域名，一个钉槽位的出口 IP（spec §5.6）
         assert!(items.iter().any(|i| i.title.contains("按槽查看住宅出口")));
         assert!(items.iter().any(|i| i.title == "钉住某一槽的出口 IP"));
