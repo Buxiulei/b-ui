@@ -63,6 +63,11 @@ pub struct Profile {
     pub source: Source,
     /// RFC3339（秒精度）
     pub imported_at: String,
+    /// 以后的版本写进来、本版不认识的字段（spec §6.3）：原样读进来、原样写回去。
+    /// 空时 flatten 不产生任何 JSON 键。`node` 有意不加——它由服务端下发、每次导入整条覆盖，
+    /// 未知字段下次导入就回来了，加了反而削弱 `bui-schema` 的 C1 契约。
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// 一条墓碑：删掉过的节点，重新导入时先跳过、再问一句要不要加回（spec §5.7）。
@@ -74,6 +79,9 @@ pub struct Tombstone {
     pub key: String,
     pub name: String,
     pub at: i64,
+    /// 同 [`Profile::extra`]：以后的版本写进来、本版不认识的字段（spec §6.3）。
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// 墓碑最多留几条（spec §5.7）：满了丢最旧的。
@@ -94,6 +102,9 @@ pub struct Profiles {
     /// [`Profiles`] 永远不加 `deny_unknown_fields`，旧版本读到它直接忽略。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deleted: Vec<Tombstone>,
+    /// 同 [`Profile::extra`]：以后的版本写进来、本版不认识的字段（spec §6.3）。
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// [`Profiles::upsert`] 的结果，菜单据此决定提示语。
@@ -247,6 +258,7 @@ impl Profiles {
             panel: None,
             profiles: Vec::new(),
             deleted: Vec::new(),
+            extra: Default::default(),
         }
     }
 
@@ -308,12 +320,14 @@ impl Profiles {
     }
 
     /// 按 name 覆盖；节点与分流都没变就不动（保住原 `imported_at`，菜单也少一句噪音）。
-    pub fn upsert(&mut self, p: Profile) -> Upsert {
+    pub fn upsert(&mut self, mut p: Profile) -> Upsert {
         match self.profiles.iter_mut().find(|x| x.name == p.name) {
             Some(existing) if existing.node == p.node && existing.split == p.split => {
                 Upsert::Unchanged
             }
             Some(existing) => {
+                // 整条替换会丢掉这条 profile 上以后版本写进来的未知字段，先搬过去（spec §6.3）
+                p.extra = std::mem::take(&mut existing.extra);
                 *existing = p;
                 Upsert::Replaced
             }
@@ -336,16 +350,24 @@ impl Profiles {
         self.tombstone_of(node).is_some()
     }
 
-    /// 记一条墓碑：同 key 先去重（名字与时间跟着这次更新），超过 [`TOMBSTONE_CAP`] 丢最旧的。
+    /// 记一条墓碑：同 key 先去重（名字与时间跟着这次更新，未知字段从旧墓碑搬过来），
+    /// 超过 [`TOMBSTONE_CAP`] 丢最旧的。
     ///
     /// 调用点只有删除成功落盘那一处，**和 `profiles` 同一次 `save`**（spec §5.7、§0.2 R10）。
     pub fn bury(&mut self, p: &Profile, at: i64) {
         let key = tombstone_key(&p.node);
-        self.deleted.retain(|t| t.key != key);
+        // 同 key 的旧墓碑整条取出来，把它上面的未知字段搬到新墓碑（spec §6.3）
+        let extra = self
+            .deleted
+            .iter()
+            .position(|t| t.key == key)
+            .map(|i| self.deleted.remove(i).extra)
+            .unwrap_or_default();
         self.deleted.push(Tombstone {
             key,
             name: p.name.clone(),
             at,
+            extra,
         });
         // 先去重再压上限：一批删除里同一个账号位只会占一条
         let over = self.deleted.len().saturating_sub(TOMBSTONE_CAP);
@@ -391,6 +413,7 @@ mod tests {
             split: split_global(),
             source: Source::ApiNodes,
             imported_at: "2026-09-11T00:00:00Z".into(),
+            extra: Default::default(),
         }
     }
 
@@ -448,6 +471,26 @@ mod tests {
         assert_eq!(p.upsert(prof("n", hy2_resi_node())), Upsert::Replaced);
         assert_eq!(p.profiles.len(), 1);
         assert_eq!(p.profiles[0].node, hy2_resi_node());
+    }
+
+    /// 整条替换要把旧条目上的未知字段搬过去（spec §6.3）：以后的版本给 `Profile` 加了字段，
+    /// 降回本版再导入一次不该把它抹掉。
+    #[test]
+    fn upsert_replace_keeps_unknown_profile_fields() {
+        let mut p = Profiles::new_default();
+        let mut old = prof("n", hy2_direct_node());
+        old.extra
+            .insert("future_field".into(), serde_json::json!({"a": 1}));
+        p.profiles.push(old);
+
+        assert_eq!(p.upsert(prof("n", hy2_resi_node())), Upsert::Replaced);
+        assert_eq!(p.profiles.len(), 1);
+        assert_eq!(p.profiles[0].node, hy2_resi_node(), "节点换成来件的");
+        assert_eq!(
+            p.profiles[0].extra.get("future_field"),
+            Some(&serde_json::json!({"a": 1})),
+            "旧条目上的未知字段跟着留下"
+        );
     }
 
     #[test]
@@ -754,6 +797,39 @@ mod tests {
         assert!(!p.is_deleted(&hy2_direct_node()), "挤出去的那条不再挡导入");
     }
 
+    /// 同一个账号位再埋一次墓碑：旧墓碑上的未知字段要搬到新墓碑（spec §6.3、§5.1 `bury`）。
+    #[test]
+    fn burying_the_same_account_twice_keeps_unknown_tombstone_fields() {
+        let mut p = Profiles::new_default();
+        p.bury(&prof("a", hy2_direct_node()), 1);
+        p.deleted[0]
+            .extra
+            .insert("future_field".into(), serde_json::json!("keep"));
+        // 另一个账号位垫在后面，才看得出新墓碑仍排末尾
+        p.bury(&prof("other", hy2_resi_node()), 2);
+
+        p.bury(&prof("a-again", hy2_direct_node()), 3);
+
+        let key = tombstone_key(&hy2_direct_node());
+        let hits: Vec<&Tombstone> = p.deleted.iter().filter(|t| t.key == key).collect();
+        assert_eq!(hits.len(), 1, "同 key 只留一条：{:?}", p.deleted);
+        assert_eq!(
+            (hits[0].name.as_str(), hits[0].at),
+            ("a-again", 3),
+            "名字与时间跟着这次更新"
+        );
+        assert_eq!(
+            hits[0].extra.get("future_field"),
+            Some(&serde_json::json!("keep")),
+            "旧墓碑上的未知字段搬到新墓碑"
+        );
+        assert_eq!(
+            p.deleted.last().map(|t| t.key.as_str()),
+            Some(key.as_str()),
+            "新墓碑仍然移到末尾"
+        );
+    }
+
     /// HY2 换密码之后墓碑仍认得出（指纹是 username，不随密码变）；加回来时 `forget` 清掉它。
     #[test]
     fn a_rotated_password_is_still_recognized_and_forget_clears_it() {
@@ -858,6 +934,39 @@ mod tests {
         let json = serde_json::to_string(&p).unwrap();
         assert!(json.contains("\"deleted\""));
         let _: V1 = serde_json::from_str(&json).expect("旧版本忽略未知字段");
+    }
+
+    /// `Profiles` / `Profile` / `Tombstone` 三层的未知键读进来、写回去都逐字保留
+    /// （spec §6.3 catch-all、§6.5）：以后的版本加了字段，降回本版不丢。
+    #[test]
+    fn unknown_fields_survive_a_round_trip_on_profiles_profile_and_tombstone() {
+        let s = FakeSys::new();
+        let mut p = Profiles::new_default();
+        p.profiles.push(prof("alice-hy2-direct", hy2_direct_node()));
+        p.active = Some("alice-hy2-direct".into());
+        p.bury(&prof("gone", hy2_resi_node()), 11);
+        p.extra.insert("future_top".into(), serde_json::json!(7));
+        p.profiles[0]
+            .extra
+            .insert("future_profile".into(), serde_json::json!({"x": [1, 2]}));
+        p.deleted[0]
+            .extra
+            .insert("future_tomb".into(), serde_json::json!("t"));
+        p.save(&s, &paths()).unwrap();
+
+        let loaded = Profiles::load(&s, &paths()).unwrap();
+        assert_eq!(loaded, p, "读回来与写出去同构，未知键进了 extra");
+        loaded.save(&s, &paths()).unwrap();
+
+        let raw = s.get("/opt/bui-c/profiles.json").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["future_top"], serde_json::json!(7));
+        assert_eq!(
+            v["profiles"][0]["future_profile"],
+            serde_json::json!({"x": [1, 2]})
+        );
+        assert_eq!(v["deleted"][0]["future_tomb"], serde_json::json!("t"));
+        assert!(!raw.contains("extra"), "未知键是平铺的，不套一层 extra");
     }
 
     #[test]

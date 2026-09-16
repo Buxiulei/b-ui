@@ -2741,6 +2741,7 @@ mod tests {
                 split: split_global(),
                 source: Source::ApiNodes,
                 imported_at: "2026-09-11T00:00:00Z".into(),
+                extra: Default::default(),
             });
         }
         p.active = Some("alice-reality-direct".into());
@@ -2794,6 +2795,7 @@ mod tests {
             split: split_global(),
             source: Source::ApiNodes,
             imported_at: "2026-09-11T00:00:00Z".into(),
+            extra: Default::default(),
         });
         assert!(
             render_nodes(&p, true, 80).contains("[0] 返回"),

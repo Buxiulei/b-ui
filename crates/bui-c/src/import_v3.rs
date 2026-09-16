@@ -186,6 +186,7 @@ pub fn import<S: Sys>(
             split: default_split(),
             source: Source::V3,
             imported_at: rfc3339(sys),
+            extra: Default::default(),
         });
         r.imported.push(name);
     }

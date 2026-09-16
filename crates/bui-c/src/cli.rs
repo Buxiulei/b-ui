@@ -544,6 +544,7 @@ fn store_fetched<S: Sys, N: Net, P: Prompt>(
             split: f.split.clone(),
             source: src,
             imported_at: rfc3339(ctx.sys),
+            extra: Default::default(),
         });
         // 新节点走到这里就是明确要它：墓碑清掉，下次导入不再跳过（spec §5.7）。已有节点
         // 清的是同 key 的过期墓碑，它本来就在列表里，不算「恢复」
@@ -3433,6 +3434,7 @@ mod tests {
             split: split_keywords(),
             source: crate::profiles::Source::ApiNodes,
             imported_at: "2026-09-11T00:00:00Z".into(),
+            extra: Default::default(),
         });
         prof.save(&s, &pp).unwrap();
         let n = FakeNet::new();
@@ -3735,6 +3737,7 @@ mod tests {
             split: crate::profiles::default_split(),
             source: crate::profiles::Source::V3,
             imported_at: "2026-09-11T00:00:00Z".into(),
+            extra: Default::default(),
         });
         prof.active = Some("hysteria2-1785892136".into());
         prof.save(&s, &pp).unwrap();
@@ -6181,6 +6184,7 @@ mod tests {
             split: split_keywords(),
             source: crate::profiles::Source::ApiNodes,
             imported_at: "2026-09-11T00:00:00Z".into(),
+            extra: Default::default(),
         });
         prof.save(s, pp).unwrap();
     }
@@ -6930,6 +6934,7 @@ mod tests {
             split: split_keywords(),
             source: crate::profiles::Source::ApiNodes,
             imported_at: "2026-09-11T00:00:00Z".into(),
+            extra: Default::default(),
         });
         prof.save(&s, &pp).unwrap();
         let n = FakeNet::new();
