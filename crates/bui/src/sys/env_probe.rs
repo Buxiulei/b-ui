@@ -8,7 +8,8 @@
 //! 也不联网。两处**顺手修好**（不是只报告）：SELinux Enforcing 时给 `bin/*` 打标签、时钟没同步时
 //! 开 `systemd-timesyncd`——两者失败都只警告，不阻塞装机。
 //!
-//! 唯一会**中止装机**的一项是关键端口被非本栈进程占用（见 [`EnvReport::blocking`]）。
+//! 会**中止装机**的有两项（见 [`EnvReport::blocking`]）：关键端口被非本栈进程占用，
+//! 以及 4.1 起的 `nft` 硬前置（缺 `nft`，或内核低于 `inet` 族 `type nat` 要求的 5.2）。
 //! 中止的时机在**写任何配置/单元与 `uninstall_v3` 之前**，但**在内核下载之后**（`run_with`
 //! 第 3/4 步先拉 manifest 装内核，4.2 才探测）：所以文案说的是「配置与 v3 一字未动」，
 //! 而不是「一个字节都没改」——`bin/` 里那 ~100MB 内核确实已经落盘了（2026-09-12 审查 nit）。
@@ -34,6 +35,90 @@ pub struct PortHolder {
     pub process: String,
 }
 
+/// `inet` 族的 `type nat` 链要求的最低内核（`man nft` NAT STATEMENTS：「When used in the
+/// inet family (available with kernel 5.2)…」）。4.1 把这道下限钉死、不出 `ip` + `ip6` 双表
+/// （2026-09-16 裁决，理由见 `bui_schema::render::nft` 的模块文档第 1 条）。
+pub const MIN_KERNEL_FOR_INET_NAT: (u32, u32) = (5, 2);
+
+/// 环境闸门拒绝这次装机 / 升级时的专属错误：调用方打印一行并以**退出码 2** 结束
+/// （`bui upgrade` 的降级守卫同一口径）。**一个字都不落盘**。
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct EnvBlocked(pub String);
+
+/// `uname -r` → 支持不支持 `table inet` 的 `type nat` 链。
+/// 认不出来返回 `None` = **不拦**（不知道不拦；`bui nft apply` 的 `nft -c -f` 预检还会兜一次）。
+pub fn kernel_supports_inet_nat(release: &str) -> Option<bool> {
+    let mut nums = release
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|x| !x.is_empty());
+    let major: u32 = nums.next()?.parse().ok()?;
+    let minor: u32 = nums.next().unwrap_or("0").parse().unwrap_or(0);
+    Some((major, minor) >= MIN_KERNEL_FOR_INET_NAT)
+}
+
+/// 按包管理器给出装 nftables 的命令。**`bui` 全程不装系统包**，这只是提示
+/// （Global Constraints）。
+pub fn install_nft_command(pkg_manager: &str) -> String {
+    match pkg_manager {
+        "apt" => "apt-get install -y nftables".into(),
+        "dnf" => "dnf install -y nftables".into(),
+        "zypper" => "zypper -n install nftables".into(),
+        "pacman" => "pacman -S --noconfirm nftables".into(),
+        "apk" => "apk add nftables".into(),
+        _ => "请安装 nftables 包".into(),
+    }
+}
+
+/// 4.1 的 `nft` 硬前置：拒绝理由（`None` = 满足）。
+///
+/// 量级按真实的来报：住宅 HY2 的客户端拿的是带 `mport` 的订阅，**每 30 秒换一次端口、
+/// 从不发那个单端口**，所以缺了这张表不是「跳跃失效」而是住宅 HY2 对全体现役订阅全断。
+pub fn nft_blocking(has_nft: bool, kernel: &str, pkg_manager: &str) -> Option<String> {
+    // 续行的 `\` 不能漏：这两段是运维在装机 / 升级被拒的那一刻看到的原话，
+    // 漏了就把源码缩进原样带进字符串（句子中间十几二十个空格）。终端也不认 markdown，
+    // 所以不写 `**粗体**`。
+    const WHY: &str = "4.1 的住宅 HY2 只监听一个端口，整段跳跃与 4.0 兼容段都靠 b-ui 自管的 \
+                       nft 表（inet bui）REDIRECT 过来：缺了它，住宅 HY2 对全体带 mport 的\
+                       现役订阅全断（客户端每 30 秒换一次端口，从不发那个单端口）";
+    if !has_nft {
+        return Some(format!(
+            "缺少 nft：{WHY}。请先执行 `{}`（bui 不装系统包）再重跑；已中止：期望态、配置与单元一字未动。",
+            install_nft_command(pkg_manager)
+        ));
+    }
+    if kernel_supports_inet_nat(kernel) == Some(false) {
+        return Some(format!(
+            "内核 {kernel} 低于 {}.{}：`table inet` 的 `type nat` 链是 5.2 才有的，\
+             整份规则集会被 nft 整事务拒掉 —— {WHY}。请先升内核再重跑；\
+             已中止：期望态、配置与单元一字未动。",
+            MIN_KERNEL_FOR_INET_NAT.0, MIN_KERNEL_FOR_INET_NAT.1
+        ));
+    }
+    None
+}
+
+/// `bui upgrade` 用的那一版闸门：自己探 `nft` / 内核 / 包管理器（升级路径上没有
+/// [`EnvReport`]）。`bui install` 走 [`EnvReport::blocking`]，两条路同一段文案。
+pub fn nft_blocking_for(host: &dyn Host) -> Option<String> {
+    let pkg = host
+        .read_file(Path::new("/etc/os-release"))
+        .ok()
+        .flatten()
+        .map(|b| parse_os_release(&String::from_utf8_lossy(&b)).1)
+        .unwrap_or_else(|| "未知".into());
+    nft_blocking(host.which("nft"), &kernel_release(host), &pkg)
+}
+
+/// `uname -r`；拿不到就是空串（= 不拦）。
+fn kernel_release(host: &dyn Host) -> String {
+    host.run("uname", &["-r"])
+        .ok()
+        .filter(|o| o.ok())
+        .map(|o| o.stdout.trim().to_string())
+        .unwrap_or_default()
+}
+
 /// 一次环境探测的结果；[`table`] 负责渲染。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EnvReport {
@@ -50,12 +135,29 @@ pub struct EnvReport {
     pub domain_ips: Vec<String>,
     /// 被非本栈进程占着的关键端口。
     pub conflicts: Vec<PortHolder>,
+    /// PATH 上有没有 `nft`（4.1 的硬前置，见 [`nft_blocking`]）。
+    pub nft: bool,
+    /// `uname -r`；空串 = 探不到（那就不拿内核版本拦装机）。
+    pub kernel: String,
     pub warnings: Vec<String>,
 }
 
 impl EnvReport {
-    /// 阻塞装机的理由（`None` = 可以继续）。端口冲突是唯一一条：其余全是警告。
+    /// 阻塞装机的理由（`None` = 可以继续）：关键端口被占，以及 4.1 的 `nft` 硬前置。
+    /// 其余全是警告。两条都不满足时一次全报出来，免得腾完端口才发现还缺包。
     pub fn blocking(&self) -> Option<String> {
+        let mut reasons: Vec<String> = Vec::new();
+        if let Some(p) = self.blocking_ports() {
+            reasons.push(p);
+        }
+        if let Some(n) = nft_blocking(self.nft, &self.kernel, &self.pkg_manager) {
+            reasons.push(n);
+        }
+        (!reasons.is_empty()).then(|| reasons.join("\n"))
+    }
+
+    /// 关键端口被非本栈进程占用时的理由（`None` = 没被占）。
+    fn blocking_ports(&self) -> Option<String> {
         if self.conflicts.is_empty() {
             return None;
         }
@@ -202,6 +304,10 @@ pub fn probe(
             .push("读不到 /etc/os-release，无法识别发行版（v4 自带全部内核，通常不影响）".into());
     }
 
+    // 4.1 的硬前置：`nft` + 内核 ≥ 5.2（判定与文案在 `nft_blocking` 一处）
+    r.nft = host.which("nft");
+    r.kernel = kernel_release(host);
+
     r.systemd = host.which("systemctl");
     if !r.systemd {
         r.warnings
@@ -329,6 +435,27 @@ pub fn table(r: &EnvReport, ports: &Ports) -> String {
     ));
     out.push(row("systemd", if r.systemd { "在位" } else { "缺失" }));
     out.push(row(
+        "nft",
+        &match (r.nft, kernel_supports_inet_nat(&r.kernel)) {
+            (false, _) => format!(
+                "缺失（4.1 硬前置：{}）",
+                install_nft_command(&r.pkg_manager)
+            ),
+            (true, Some(false)) => format!(
+                "在位，但内核 {} 低于 {}.{}（inet nat 不可用）",
+                r.kernel, MIN_KERNEL_FOR_INET_NAT.0, MIN_KERNEL_FOR_INET_NAT.1
+            ),
+            (true, _) => format!(
+                "在位（内核 {}）",
+                if r.kernel.is_empty() {
+                    "未知"
+                } else {
+                    &r.kernel
+                }
+            ),
+        },
+    ));
+    out.push(row(
         "SELinux",
         if r.selinux.is_empty() {
             "未启用"
@@ -391,6 +518,10 @@ mod tests {
         let h = FakeHost::new();
         h.with(|i| {
             i.which.insert("systemctl".into());
+            // 4.1 的硬前置：`nft` 在位、内核 ≥ 5.2（缺任一都会让 `blocking()` 拦装机）
+            i.which.insert("nft".into());
+            i.scripted
+                .push(("uname -r".into(), CmdOut::success("6.1.0-21-amd64\n")));
             i.files.insert(
                 "/etc/os-release".into(),
                 (b"ID=debian\nVERSION_ID=\"12\"\n".to_vec(), 0o644),
@@ -450,6 +581,10 @@ nonsense
     fn foreign_process_on_a_key_port_blocks_the_install() {
         let h = FakeHost::new();
         h.with(|i| {
+            // 4.1 的 nft 硬前置满足：这条用例只测端口那一支
+            i.which.insert("nft".into());
+            i.scripted
+                .push(("uname -r".into(), CmdOut::success("6.1.0-21-amd64\n")));
             i.scripted.push((
                 "ss -lntupH".into(),
                 CmdOut::success(
@@ -481,6 +616,113 @@ nonsense
         let r = probe(&h, "", "", &ports(), Path::new("/opt/b-ui/bin"), true);
         assert_eq!(r.conflicts, vec![]);
         assert_eq!(r.blocking(), None);
+    }
+
+    /// 4.1 的硬前置（2026-09-16 裁决）：缺 `nft` 或内核 < 5.2 就中止，
+    /// 消息里带**按包管理器选出的**安装命令；`bui` 自己绝不装包。
+    #[test]
+    fn a_missing_nft_blocks_with_the_right_install_command() {
+        for (pkg, cmd) in [
+            ("apt", "apt-get install -y nftables"),
+            ("dnf", "dnf install -y nftables"),
+            ("zypper", "zypper -n install nftables"),
+            ("pacman", "pacman -S --noconfirm nftables"),
+            ("apk", "apk add nftables"),
+            ("未知", "请安装 nftables 包"),
+        ] {
+            let msg = nft_blocking(false, "6.1.0", pkg).expect("缺 nft 必须中止");
+            assert!(msg.contains(cmd), "{pkg}：{msg}");
+            // 量级必须按真实的报：不是「跳跃失效」而是住宅 HY2 对全体现役订阅全断
+            assert!(msg.contains("现役订阅"), "{msg}");
+            assert!(msg.contains("一字未动"), "{msg}");
+            assert_eq!(install_nft_command(pkg), cmd);
+        }
+        // 装了 nft、内核够新 ⇒ 放行
+        assert_eq!(nft_blocking(true, "5.15.0-91-generic", "apt"), None);
+        assert_eq!(nft_blocking(true, "6.1.0", "apt"), None);
+        assert_eq!(nft_blocking(true, "5.2.0", "apt"), None);
+    }
+
+    /// 这两条是运维在装机 / 升级被拒的那一刻原样看到的话：不能带源码缩进（漏了字面量的
+    /// 续行符就会出现句子中间十几二十个空格），也不能带 markdown 标记（终端只显示星号）。
+    #[test]
+    fn the_blocking_messages_read_as_plain_chinese_sentences() {
+        for msg in [
+            nft_blocking(false, "6.1.0", "apt").expect("缺 nft 必须中止"),
+            nft_blocking(true, "4.19.0-21-amd64", "apt").expect("内核过低必须中止"),
+        ] {
+            assert!(!msg.contains("  "), "文案里有连续空格：{msg:?}");
+            assert!(!msg.contains('*'), "文案里有 markdown 星号：{msg:?}");
+            assert!(!msg.contains('\n'), "文案是一句话，不换行：{msg:?}");
+        }
+    }
+
+    /// `inet` 族的 `type nat` 要内核 ≥ 5.2；认不出来的写法**不拦**（不知道不拦，
+    /// `bui nft apply` 的 `nft -c -f` 预检还会兜一次）。
+    #[test]
+    fn the_kernel_floor_for_inet_nat_is_five_two() {
+        assert_eq!(kernel_supports_inet_nat("5.15.0-91-generic"), Some(true));
+        assert_eq!(kernel_supports_inet_nat("6.8.0-45-generic"), Some(true));
+        assert_eq!(kernel_supports_inet_nat("5.2.0"), Some(true));
+        assert_eq!(kernel_supports_inet_nat("5.1.21-v7+"), Some(false));
+        assert_eq!(kernel_supports_inet_nat("4.19.0-21-amd64"), Some(false));
+        assert_eq!(
+            kernel_supports_inet_nat("3.10.0-1160.el7.x86_64"),
+            Some(false)
+        );
+        assert_eq!(kernel_supports_inet_nat(""), None, "探不到就不拦");
+        assert_eq!(kernel_supports_inet_nat("unknown"), None);
+        // 低于下限的内核照样中止，消息里要有本机版本与下限
+        let msg = nft_blocking(true, "4.19.0-21-amd64", "apt").expect("内核过低必须中止");
+        assert!(
+            msg.contains("4.19.0-21-amd64") && msg.contains("5.2"),
+            "{msg}"
+        );
+        assert!(msg.contains("现役订阅"), "{msg}");
+        // 探不到内核版本时不拿它拦
+        assert_eq!(nft_blocking(true, "", "apt"), None);
+    }
+
+    /// `bui upgrade` 那一版闸门自己探：`nft` / `uname -r` / 包管理器。
+    #[test]
+    fn the_upgrade_side_gate_probes_the_host_itself() {
+        let h = sane();
+        assert_eq!(nft_blocking_for(&h), None, "sane() 是一台满足前置的机器");
+        let h = FakeHost::new();
+        h.with(|i| {
+            i.files.insert(
+                "/etc/os-release".into(),
+                (b"ID=ubuntu\nVERSION_ID=\"24.04\"\n".to_vec(), 0o644),
+            );
+        });
+        let msg = nft_blocking_for(&h).expect("缺 nft 必须中止");
+        assert!(msg.contains("apt-get install -y nftables"), "{msg}");
+        // `/etc/os-release` 都读不到时也得给一句能照做的话
+        let msg = nft_blocking_for(&FakeHost::new()).expect("缺 nft 必须中止");
+        assert!(msg.contains("请安装 nftables 包"), "{msg}");
+    }
+
+    /// 两条闸门一次全报：腾完端口才发现还缺包会让运维白跑一趟。
+    #[test]
+    fn both_blocking_reasons_are_reported_together() {
+        let h = FakeHost::new();
+        h.with(|i| {
+            i.scripted.push((
+                "ss -lntupH".into(),
+                CmdOut::success(
+                    "tcp LISTEN 0 511 0.0.0.0:443 0.0.0.0:* users:((\"nginx\",pid=7,fd=6))\n",
+                ),
+            ));
+        });
+        let r = probe(&h, "", "", &ports(), Path::new("/opt/b-ui/bin"), false);
+        assert!(!r.nft);
+        let msg = r.blocking().expect("两条都不满足");
+        assert!(msg.contains("443/tcp 被 nginx 占用"), "{msg}");
+        assert!(msg.contains("缺少 nft"), "{msg}");
+        // 环境表里也要有这一行
+        let t = table(&r, &ports());
+        assert!(t.contains("nft"), "{t}");
+        assert!(t.contains("4.1 硬前置"), "{t}");
     }
 
     #[test]

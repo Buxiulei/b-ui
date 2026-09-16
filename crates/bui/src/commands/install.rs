@@ -907,6 +907,16 @@ pub async fn run(opts: InstallOpts, paths: Paths, host: Arc<dyn Host>) -> anyhow
         Arc::new(HttpFetcher::new()),
     )
     .await;
+    // 环境闸门（端口被占 / 缺 nft / 内核过低）：一个破坏性动作都还没做，所以**不打**装机摘要，
+    // 直接一行中文 + 退出码 2（4.1 裁决：缺 nft 硬性拒绝、一个字不落盘、bui 不装系统包）。
+    if let Some(b) = outcome
+        .as_ref()
+        .err()
+        .and_then(|e| e.downcast_ref::<crate::sys::env_probe::EnvBlocked>())
+    {
+        eprintln!("{b}");
+        std::process::exit(2);
+    }
     // 摘要压在最后一屏（一次性管理员密码只在这里出现这一次）：自检有 FAIL 也要给出面板地址，
     // 不然运维连去哪儿看都不知道。
     let failed = match &outcome {
@@ -1010,7 +1020,9 @@ pub async fn run_with_wait(
         };
         println!("{}", crate::sys::env_probe::table(&env, &answers.ports));
         if let Some(msg) = env.blocking() {
-            anyhow::bail!(msg);
+            // 专属错误类型：`run` 据它打印一行并以**退出码 2** 结束（与 `bui upgrade` 的
+            // 降级守卫、自检 FAIL 同一口径）。此时期望态、配置、单元与 v3 都一字未动。
+            return Err(crate::sys::env_probe::EnvBlocked(msg).into());
         }
         let missing = {
             // 探测走 spawn_blocking：`installed_versions` 会 run 四次 `<bin>/<kernel> version`
@@ -1382,6 +1394,11 @@ mod tests {
                 (b"ssh-ed25519 AAAA me\n".to_vec(), 0o600),
             );
             i.which.insert("systemctl".into());
+            // 4.1 的硬前置：缺 `nft` 时 `env.blocking()` 会把装机拦在写任何东西之前
+            // （`a_fresh_install_without_nft_is_refused_before_anything_is_written` 覆盖）
+            i.which.insert("nft".into());
+            i.scripted
+                .push(("uname -r".into(), CmdOut::success("6.1.0-21-amd64\n")));
             i.files.insert(
                 "/etc/os-release".into(),
                 (b"ID=debian\nVERSION_ID=\"12\"\n".to_vec(), 0o644),
@@ -1722,7 +1739,12 @@ mod tests {
         // 这一支必须给出点名 BUI_MANIFEST_URL 的可操作错误，而不是静默写出没有密钥的 state。
         let d = tempfile::tempdir().unwrap();
         let paths = scratch(&d);
-        let host = Arc::new(FakeHost::new()); // 没有 bin/xray，PATH 上也没有 xray
+        // 没有 bin/xray，PATH 上也没有 xray；4.1 的 nft 闸门排在内核闸门**之前**，
+        // 这里要测的是后者，所以 nft 要在位
+        let host = Arc::new(FakeHost::new());
+        host.with(|i| {
+            i.which.insert("nft".into());
+        });
         let empty: Arc<dyn Fetcher> = Arc::new(FakeFetcher(Mutex::new(vec![])));
         let err = run_with_wait(
             opts(&d),
@@ -1783,6 +1805,71 @@ mod tests {
         assert_eq!(writes, Vec::<String>::new(), "幂等：第二次 install 零写入");
     }
 
+    /// 4.1 的 nft 硬前置（2026-09-16 裁决）：全新装机缺 `nft` ⇒ 专属错误
+    /// （`run` 据它给退出码 2）、**一个字都不落盘**、消息含按包管理器选出的安装命令。
+    /// `bui` 不装系统包。
+    #[tokio::test]
+    async fn a_fresh_install_without_nft_is_refused_before_anything_is_written() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = scratch(&d);
+        let host = host_for_install(&paths);
+        host.with(|i| {
+            i.which.remove("nft");
+        });
+        host.clear_ops();
+        let err = run_with_wait(
+            opts(&d),
+            answers(),
+            murl(),
+            paths.clone(),
+            host.clone(),
+            fetcher_with_manifest(),
+            crate::commands::selfcheck::Wait::NONE,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.is::<crate::sys::env_probe::EnvBlocked>(),
+            "main 靠这个类型给退出码 2：{err:#}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("apt-get install -y nftables"), "{msg}");
+        assert!(msg.contains("现役订阅"), "要报真实量级：{msg}");
+        // 配置、单元与期望态一字未动。闸门排在第 3/4 步（拉 manifest + 装内核）**之后**，
+        // 所以 `bin/` 里的内核与 `manifest.json` 缓存确实已经落盘了 —— 这是 4.1 之前就有的
+        // 时序（见 `env_probe` 模块文档），文案说的也是「配置、单元与 v3 一字未动」。
+        let stale: Vec<String> = host
+            .ops()
+            .into_iter()
+            .filter(|o| {
+                o.starts_with("write:") && !o.contains("/bin/") && !o.contains("manifest.json")
+            })
+            .collect();
+        assert_eq!(stale, Vec::<String>::new(), "{stale:?}");
+        assert!(
+            !host.ops().iter().any(|o| o.contains("/etc/systemd/system")),
+            "{:?}",
+            host.ops()
+        );
+        assert!(!crate::paths::state_file(&paths).exists());
+        // 装了包就一切照旧（同一台机器、同一份参数）
+        host.with(|i| {
+            i.which.insert("nft".into());
+        });
+        run_with_wait(
+            opts(&d),
+            answers(),
+            murl(),
+            paths.clone(),
+            host.clone(),
+            fetcher_with_manifest(),
+            crate::commands::selfcheck::Wait::NONE,
+        )
+        .await
+        .unwrap();
+        assert!(crate::paths::state_file(&paths).exists());
+    }
+
     /// v3 fixture 的路径（缺则跳过：P0 的 fixture 不在时不该红）。
     fn v3_fixture() -> Option<&'static Path> {
         let src = std::path::Path::new(concat!(
@@ -1809,6 +1896,8 @@ mod tests {
         // `bin/` 里只有 bui（真机形态）；manifest 拉不到 → 一个内核都装不上
         let host = Arc::new(FakeHost::new());
         host.with(|i| {
+            // 4.1 的 nft 闸门排在内核闸门**之前**，这里要测的是后者
+            i.which.insert("nft".into());
             i.files
                 .insert(paths.bin_dir.join("bui"), (b"ELF".to_vec(), 0o755));
             for u in crate::commands::import_v3::V3_UNITS {

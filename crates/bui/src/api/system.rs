@@ -41,8 +41,9 @@ pub struct Hy2AuthRequest {
 
 /// `POST /api/system/hy2-auth`：切 Hysteria2 的鉴权方式（`bui set hy2-auth` 的落点）。
 ///
-/// 只写期望态 + 发一次 `StateChanged`：重渲染两份配置、重启两个实例都由那一轮对账做，
-/// CLI 进程绝不自己碰 `state.json`（否则会与守护进程的 `Store` 并发写）。
+/// 只写期望态 + 发一次 `StateChanged`：重渲染 `config.yaml`、重启 `hysteria-server`
+/// 都由那一轮对账做（4.1 起只作用于直连），CLI 进程绝不自己碰 `state.json`
+/// （否则会与守护进程的 `Store` 并发写）。
 pub async fn set_hy2_auth(
     State(app): State<AppState>,
     Json(req): Json<Hy2AuthRequest>,
@@ -176,7 +177,7 @@ pub async fn set_obfs(State(app): State<AppState>, Json(req): Json<ObfsRequest>)
 }
 
 /// `POST /api/services/{unit}/{action}`；`unit` 只接受 `reconcile::is_managed_unit` 认的名字
-/// （六个固定 + `hysteria-residential-<1..7>`），其余 400。
+/// （4.1 起就是那六个固定名字：带序号的住宅实例已退役进 `LEGACY_UNITS`），其余 400。
 pub async fn service_action(
     State(app): State<AppState>,
     Path((unit, action)): Path<(String, String)>,

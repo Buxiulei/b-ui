@@ -69,6 +69,11 @@ pub trait Host: Send + Sync {
     fn set_immutable(&self, path: &Path, on: bool) -> Result<()>;
     fn is_immutable(&self, path: &Path) -> Result<bool>;
     fn run(&self, program: &str, args: &[&str]) -> Result<CmdOut>;
+    /// 同 [`Host::run`]，但把 `stdin` 喂给子进程的标准输入。
+    ///
+    /// 载荷不进 argv（`ps` 会泄露）也不进日志：`nft -f -` 的规则集、`curl -K -` 的代理凭据
+    /// 都走这一条。`ops` 里记的仍是 `run:<program> <args>`，stdin 单独记账。
+    fn run_stdin(&self, program: &str, args: &[&str], stdin: &str) -> Result<CmdOut>;
     fn which(&self, program: &str) -> bool;
     fn systemd_daemon_reload(&self) -> Result<()>;
     fn systemd(&self, verb: &str, unit: &str) -> Result<CmdOut>;

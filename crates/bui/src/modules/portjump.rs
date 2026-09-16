@@ -100,6 +100,7 @@
 //!   行为一字不变（崩溃循环中的实例在 systemd 眼里可能正是 `active`，自愈要的就是先清再重启）。
 
 use crate::sys::Host;
+use bui_schema::paths::Paths;
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -358,6 +359,34 @@ fn cleanup_with(host: &dyn Host, config: &Path, backend: Option<&str>) -> Vec<St
         .collect();
     if wants_nft(backend, host.which("nft")) {
         done.extend(cleanup_nft(host, &listen));
+    }
+    done
+}
+
+/// 4.0 的按槽住宅实例（`hysteria-residential[-<i>]`，apernet）留下的端口跳跃 NAT 规则：
+/// 对**每份仍在盘上**的 `config-residential[-<i>].yaml` 各调一次 [`cleanup`]。
+///
+/// 4.1 之后**没有任何别的路径再清它们**（住宅 prestart 换成 `bui nft apply`、T12 的
+/// `HY2_CONFIGS` 只留直连、`import_v3` 的前缀清理已在 `6dc2f90` 删掉），而残留的
+/// `4xxxx-4yyyy → :4000i`（rick 是 iptables 链、tizi 是 nft 表）与我们的 `inet bui`
+/// 同挂 nat priority **-100**：先注册者先做 NAT ⇒ 那一片跳跃端口被送到**已经没人监听**的
+/// `:4000i`，正是 spec §1.1 里「每 30 秒一次的周期性静默丢包」的形状。
+///
+/// 调用点只有一个：[`crate::reconcile::apply`] 的第 7.5 步，**排在 `nft -f` 之前**
+/// （也在停旧槽实例与删那些配置文件之前，所以 `listen:` 行还读得到），且**每轮无条件跑**、
+/// 不挂在 `Change::ApplyNftTable` 上 —— 「4.1 落过表 → `--rollback` 回 4.0（不删表）→
+/// 再升 4.1」这条路上哈希与表都没变、不产变更，挂在变更上就一次清理都不跑。
+/// 配置已经不在盘上 = 上一轮已经清过 = 什么都不做，于是它对「二次对账零变更」无影响。
+pub fn cleanup_legacy_residential(host: &dyn Host, paths: &Paths) -> Vec<String> {
+    let mut done = Vec::new();
+    for i in 0..crate::reconcile::MAX_RESI_SLOTS {
+        let cfg = crate::modules::core_files::resi_config_path(paths, i);
+        if host.read_file(&cfg).unwrap_or_default().is_none() {
+            continue;
+        }
+        for line in cleanup(host, &cfg) {
+            done.push(format!("{}：{line}", cfg.display()));
+        }
     }
     done
 }
@@ -1036,17 +1065,15 @@ table ip6 hysteria_4d4d4d4d
     /// 已清掉住宅实例那条链的标志（本实例 base 40000）。
     const RESI_CLEANED: &str = "run:iptables -t nat -X HYSTERIA-PR-1111aaaa";
 
-    /// 配置路径 → 受管单元名：直连与槽 0 复用 watchdog 那份 (单元, 配置) 表，
-    /// 槽 1.. 的序号交给 `is_managed_unit` 判。认不出来一律 `None` = 放行。
+    /// 配置路径 → **受管**单元名：只认 watchdog 那份 (单元, 配置) 表里的名字。
+    /// 4.1 起带序号的住宅实例进了 `LEGACY_UNITS`，`is_managed_unit` 对它们返回 false ⇒
+    /// `config-residential-<i>.yaml` 推不出单元名、一律 `None` = 放行 —— 正是想要的：
+    /// 那些实例已经停了，它们的孤儿规则由 `cleanup_legacy_residential` 直接清。
     #[test]
     fn the_unit_name_is_derived_from_the_config_file_name() {
         for (cfg, unit) in [
             ("/opt/b-ui/config.yaml", "hysteria-server"),
             ("/opt/b-ui/config-residential.yaml", "hysteria-residential"),
-            (
-                "/opt/b-ui/config-residential-3.yaml",
-                "hysteria-residential-3",
-            ),
         ] {
             assert_eq!(
                 unit_for_config(Path::new(cfg)).as_deref(),
@@ -1054,11 +1081,12 @@ table ip6 hysteria_4d4d4d4d
                 "{cfg}"
             );
         }
-        // 推不出来 → None（放行）：不是 hysteria 的配置、槽 0 只认不带序号的写法、
-        // 非规范序号与越界序号（槽位上限 MAX_RESI_SLOTS = 8）都不认
+        // 推不出来 → None（放行）：不是 hysteria 的配置、4.0 的按槽配置（单元已退役）、
+        // 槽 0 只认不带序号的写法、非规范序号与越界序号都不认
         for cfg in [
             "/opt/b-ui/xray-config.json",
             "/opt/b-ui/singbox-relay.json",
+            "/opt/b-ui/config-residential-3.yaml",
             "/opt/b-ui/config-residential-0.yaml",
             "/opt/b-ui/config-residential-01.yaml",
             "/opt/b-ui/config-residential-8.yaml",
@@ -1228,6 +1256,72 @@ table ip6 hysteria_4d4d4d4d
                 "ActiveState".to_string()
             )],
             "手动调用恰好查一次 ActiveState"
+        );
+    }
+
+    /// 4.0 两个槽（槽 0 = `config-residential.yaml`，槽 2 = `config-residential-2.yaml`）
+    /// 各留下一条孤儿链。
+    const TWO_SLOT_DUMP: &str = "\
+-P PREROUTING ACCEPT
+-N HYSTERIA-PR-5e0b13c4
+-N HYSTERIA-PR-7c1e0f2a
+-A PREROUTING -p udp -m udp --dport 41000:50000 -j HYSTERIA-PR-5e0b13c4
+-A HYSTERIA-PR-5e0b13c4 -p udp -j REDIRECT --to-ports 40000
+-A PREROUTING -p udp -m udp --dport 45500:50000 -j HYSTERIA-PR-7c1e0f2a
+-A HYSTERIA-PR-7c1e0f2a -p udp -j REDIRECT --to-ports 40002
+";
+
+    /// 枚举**从槽 0 开始**：`config-residential.yaml`（单槽 4.0 机器唯一有的那份）
+    /// 与 `config-residential-<i>.yaml` 一视同仁，盘上没有的那几格一个命令都不发。
+    #[test]
+    fn the_legacy_cleanup_covers_slot_zero_as_well_as_the_numbered_slots() {
+        let h = FakeHost::new();
+        h.with(|i| {
+            i.which.insert("iptables".into());
+            i.files.insert(
+                "/opt/b-ui/config-residential.yaml".into(),
+                (b"listen: :40000,41000-50000\n".to_vec(), 0o600),
+            );
+            i.files.insert(
+                "/opt/b-ui/config-residential-2.yaml".into(),
+                (b"listen: :40002,45500-50000\n".to_vec(), 0o600),
+            );
+            i.scripted.push((
+                "iptables -t nat -S".into(),
+                crate::sys::CmdOut::success(TWO_SLOT_DUMP),
+            ));
+        });
+        let done = cleanup_legacy_residential(&h, &Paths::default_server());
+        assert!(
+            done.iter()
+                .any(|l| l.starts_with("/opt/b-ui/config-residential.yaml：")
+                    && l.contains("HYSTERIA-PR-5e0b13c4")),
+            "槽 0 那份必须也清：{done:?}"
+        );
+        assert!(
+            done.iter()
+                .any(|l| l.starts_with("/opt/b-ui/config-residential-2.yaml：")
+                    && l.contains("HYSTERIA-PR-7c1e0f2a")),
+            "槽 2 那份必须也清：{done:?}"
+        );
+        let ops = h.ops();
+        assert!(
+            ops.iter()
+                .any(|o| o == "run:iptables -t nat -X HYSTERIA-PR-5e0b13c4"),
+            "{ops:?}"
+        );
+        assert!(
+            ops.iter()
+                .any(|o| o == "run:iptables -t nat -X HYSTERIA-PR-7c1e0f2a"),
+            "{ops:?}"
+        );
+        // 盘上只有两份配置 ⇒ 只跑两次 dump，其余六格一个命令都不发
+        assert_eq!(
+            ops.iter()
+                .filter(|o| *o == "run:iptables -t nat -S")
+                .count(),
+            2,
+            "{ops:?}"
         );
     }
 

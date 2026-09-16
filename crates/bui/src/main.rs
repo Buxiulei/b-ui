@@ -133,7 +133,12 @@ async fn dispatch(command: Command) -> Result<()> {
             // 预发布）是降级，打印一行中文并以退出码 2 结束、什么都不装
             // （`commands::upgrade::refuse_downgrade`，与 install 自检 FAIL 同一口径）。
             match r {
-                Err(e) if e.is::<commands::upgrade::DowngradeRefused>() => {
+                // 降级守卫（2026-09-15）与 4.1 的 nft 硬前置（2026-09-16）同一口径：
+                // 打印一行中文、退出码 2、一个字不落盘
+                Err(e)
+                    if e.is::<commands::upgrade::DowngradeRefused>()
+                        || e.is::<sys::env_probe::EnvBlocked>() =>
+                {
                     eprintln!("{e}");
                     std::process::exit(2);
                 }
@@ -205,6 +210,19 @@ async fn dispatch(command: Command) -> Result<()> {
                 }
                 r => r,
             }
+        }
+        Command::Nft { cmd } => {
+            // 直接读 state.json + 自己跑 nft：`bui nft apply` 是住宅单元的 ExecStartPre，
+            // 那时 `b-ui.service` 可能还没起来（`commands::nft` 模块文档）。
+            let host = sys::real::RealHost::new();
+            let paths = bui_schema::paths::Paths::default_server();
+            let out = match cmd {
+                cli::NftCmd::Apply => commands::nft::apply(&host, &paths),
+                cli::NftCmd::Status => commands::nft::status(&host, &paths),
+                cli::NftCmd::Delete => commands::nft::delete(&host, &paths),
+            }?;
+            println!("{out}");
+            Ok(())
         }
         Command::Residential { cmd } => {
             modules::residential::cli::run(cmd, PathBuf::from(paths::SOCKET_PATH)).await

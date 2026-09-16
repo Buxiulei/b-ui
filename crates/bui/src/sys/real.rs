@@ -174,6 +174,33 @@ impl Host for RealHost {
         })
     }
 
+    fn run_stdin(&self, program: &str, args: &[&str], stdin: &str) -> Result<CmdOut> {
+        use std::io::Write;
+        // 同样不把 args 与 stdin 写进日志：stdin 里可能是凭据（规则集不是，但口径统一）。
+        let mut child = std::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .with_context(|| format!("执行 {program} 失败"))?;
+        // 先关掉管道再等：不关的话子进程读不到 EOF，双方互等即死锁。
+        child
+            .stdin
+            .take()
+            .context("拿不到子进程的 stdin")?
+            .write_all(stdin.as_bytes())
+            .with_context(|| format!("{program} 的 stdin 写入失败"))?;
+        let out = child
+            .wait_with_output()
+            .with_context(|| format!("等待 {program} 失败"))?;
+        Ok(CmdOut {
+            status: out.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        })
+    }
+
     fn which(&self, program: &str) -> bool {
         if program.contains('/') {
             return std::fs::metadata(program).is_ok_and(|m| m.is_file());

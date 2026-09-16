@@ -518,6 +518,7 @@ mod tests {
                 ssh_unit: "sshd".into(),
                 ssh_pubkeys: 0,
                 systemd_resolved: false,
+                nft_tables: Default::default(),
             },
         };
         assert_eq!(

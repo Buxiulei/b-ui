@@ -35,10 +35,14 @@ pub fn conntrack_max(mem_mb: u64) -> u32 {
 }
 
 /// `ip_local_reserved_ports` 的值（v3 core.sh:1485 的硬编码在 v4 从 state 推导）：
-/// 监听端口里连续的合成段（10000-10002）+ 直连跳跃段 + **住宅基础端口段**（每槽一个）+
-/// 住宅跳跃段。`slots` 是槽位空间宽度（[`bui_schema::slots::slot_span`]），单槽时输出与
-/// v3 逐字相同。
-pub fn reserved_ports(p: &Ports, slots: u16) -> String {
+/// 监听端口里连续的合成段（10000-10002）+ 直连跳跃段 + 住宅单端口 + （`compat` 为真时）
+/// 4.0 兼容段 + 住宅跳跃整段。
+///
+/// 4.1 起住宅 HY2 只有**一个**监听端口（`hy2_resi`），跳跃与兼容段都由 nft 表 REDIRECT
+/// 过来，所以第二个参数从「槽位空间宽度」换成 `compat`（= `system.hy2_resi_compat_ports`）。
+/// 兼容段仍要排除出临时端口池：出向连接抢了 `40001-40007` 里的端口，4.0 的旧订阅就会
+/// 有一片端口被本机自己占着（spec §2.4）。
+pub fn reserved_ports(p: &Ports, compat: bool) -> String {
     let mut parts: Vec<String> = Vec::new();
     let mut singles = vec![p.hy2, p.reality_direct, p.reality_resi];
     singles.sort_unstable();
@@ -61,28 +65,24 @@ pub fn reserved_ports(p: &Ports, slots: u16) -> String {
     if let Some((a, b)) = p.hy2_hop {
         parts.push(format!("{a}-{b}"));
     }
-    let slots = slots.max(1);
-    parts.push(if slots == 1 {
-        p.hy2_resi.to_string()
-    } else {
-        format!("{}-{}", p.hy2_resi, p.hy2_resi + slots - 1)
-    });
+    parts.push(p.hy2_resi.to_string());
+    if compat {
+        let (a, b) = bui_schema::render::nft::compat_range(p);
+        parts.push(format!("{a}-{b}"));
+    }
     parts.push(format!("{}-{}", p.hy2_resi_hop.0, p.hy2_resi_hop.1));
     parts.join(",")
 }
 
-/// 防火墙要放行的端口集（v3 core.sh:1237-1283 + update.sh 块 E，外加 spec §5.6 的槽位）。
+/// 防火墙要放行的端口集（v3 core.sh:1237-1283 + update.sh 块 E，外加 spec §2.4 的两段）。
 /// `render` 只在机器上确实有活防火墙时把它包成 [`Artifact::FirewallPorts`]；
 /// `serve::reconcile_once` 在没有防火墙时也调它，用来拼「请在云厂商安全组放行」的提示，
 /// 所以它是 `pub`。
 ///
-/// `slots` 是槽位空间宽度（[`bui_schema::slots::slot_span`]，= 最高序号 + 1 而不是槽位
-/// **个数**）：住宅基础端口放行 `hy2_resi .. hy2_resi + slots - 1`（每槽一个实例），跳跃
-/// 区间**整段**放行（各槽只用其中一片，多放的那些没人监听）。序号有空洞时会多放一个空
-/// 端口，可接受（D3 的连带效果）。单槽时 `from == to`，`ufw()` / `firewalld()` 打出来就是
-/// 单端口，与 v3 逐字相同。
-pub fn firewall_ports(p: &Ports, slots: u16) -> Vec<PortSpec> {
-    let slots = slots.max(1);
+/// 4.1：住宅 HY2 只有一个监听端口，跳跃段与 4.0 兼容段都靠 nft 表 REDIRECT 到它 ——
+/// 但**放行仍要按客户端实际发往的端口算**（包先过 filter 再过我们的 nat 链，
+/// 只放行 `:40000` 会让整段跳跃在 ufw 机器上被丢掉）。`compat` = `system.hy2_resi_compat_ports`。
+pub fn firewall_ports(p: &Ports, compat: bool) -> Vec<PortSpec> {
     let mut v = vec![
         PortSpec::one(Proto::Tcp, 22),
         PortSpec::one(Proto::Tcp, 80),
@@ -94,17 +94,29 @@ pub fn firewall_ports(p: &Ports, slots: u16) -> Vec<PortSpec> {
     if let Some((a, b)) = p.hy2_hop {
         v.push(PortSpec::range(Proto::Udp, a, b));
     }
-    v.push(PortSpec::range(
-        Proto::Udp,
-        p.hy2_resi,
-        p.hy2_resi + slots - 1,
-    ));
+    v.push(PortSpec::one(Proto::Udp, p.hy2_resi));
+    if compat {
+        let (a, b) = bui_schema::render::nft::compat_range(p);
+        v.push(PortSpec::range(Proto::Udp, a, b));
+    }
     v.push(PortSpec::range(
         Proto::Udp,
         p.hy2_resi_hop.0,
         p.hy2_resi_hop.1,
     ));
     v
+}
+
+/// 住宅 HY2 端口跳跃那张 nft 表的期望项（4.1）。规则集只有
+/// [`bui_schema::render::nft::ruleset`] 一处实现；`bui nft apply` 复用这个函数，
+/// watchdog 每 60 秒那处自愈 **T12 起**才有（现在还没有那段代码），落地时一并复用它，
+/// 免得三处各拼一遍。
+pub fn nft_artifact(s: &State) -> Artifact {
+    Artifact::NftTable {
+        family: bui_schema::render::nft::FAMILY.to_string(),
+        name: bui_schema::render::nft::NAME.to_string(),
+        ruleset: bui_schema::render::nft::ruleset(&s.node.ports, s.system.hy2_resi_compat_ports),
+    }
 }
 
 impl Module for SystemModule {
@@ -116,7 +128,7 @@ impl Module for SystemModule {
         let mut out = Vec::new();
         if s.system.sysctl_profile != "off" {
             let ct = conntrack_max(ctx.facts.mem_mb);
-            let network = network_conf(&s.node.ports, bui_schema::slots::slot_span(&s.residential));
+            let network = network_conf(&s.node.ports, s.system.hy2_resi_compat_ports);
             let conntrack = conntrack_conf(ct);
             out.push(
                 Artifact::file("/etc/sysctl.d/99-b-ui-network.conf", network.clone()).mode(0o644),
@@ -183,9 +195,12 @@ impl Module for SystemModule {
         // `/api/health` 的 degraded 判定，所以它是「每轮提醒」而不是「每轮改动」）。
         if s.system.firewall != "off" && (ctx.facts.ufw_active || ctx.facts.firewalld_active) {
             out.push(Artifact::FirewallPorts {
-                ports: firewall_ports(&s.node.ports, bui_schema::slots::slot_span(&s.residential)),
+                ports: firewall_ports(&s.node.ports, s.system.hy2_resi_compat_ports),
             });
         }
+        // 住宅 HY2 的端口跳跃表：**每轮都产**，与 `system.firewall` 无关（它不是防火墙，
+        // 而是数据面的一部分 —— 关掉它等于住宅 HY2 对全体带 mport 的现役订阅全断）。
+        out.push(nft_artifact(s));
         out
     }
 }
@@ -218,7 +233,7 @@ nameserver 8.8.8.8
 options edns0 timeout:2 attempts:2 single-request
 ";
 
-fn network_conf(p: &Ports, slots: u16) -> String {
+fn network_conf(p: &Ports, compat: bool) -> String {
     format!(
         "\
 # B-UI v4 网络栈调优（移植 v3 core.sh:1447-1494，合并原 99-hysteria-perf.conf）
@@ -245,7 +260,7 @@ net.ipv4.tcp_max_syn_backlog=8192
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 ",
-        reserved = reserved_ports(p, slots)
+        reserved = reserved_ports(p, compat)
     )
 }
 
@@ -264,8 +279,8 @@ net.netfilter.nf_conntrack_udp_timeout_stream=60
 mod tests {
     use super::*;
     use crate::reconcile::{Artifact, Facts, Module, RenderCtx};
-    use crate::sys::Proto;
     use crate::testutil::sample_state;
+    use bui_schema::model::State;
     use bui_schema::paths::Paths;
     use pretty_assertions::assert_eq;
 
@@ -283,6 +298,7 @@ mod tests {
                 ssh_unit: "sshd".into(),
                 ssh_pubkeys: 1,
                 systemd_resolved: resolved,
+                nft_tables: Default::default(),
             },
         }
     }
@@ -316,41 +332,14 @@ mod tests {
         assert_eq!(conntrack_max(8192), 524288);
     }
 
+    /// 4.1（spec §2.4）：住宅只有一个监听端口 40000 + 整段 41000-50000 +（兼容段开着时）
+    /// 4.0 的 40001-40007。兼容段关掉之后那三个数就该整条消失。
     #[test]
-    fn reserved_ports_are_derived_from_state() {
-        let s = sample_state();
-        assert_eq!(
-            reserved_ports(&s.node.ports, 1),
-            "10000-10002,20000-30000,40000,41000-50000"
-        );
-        let mut p = s.node.ports.clone();
-        p.hy2_hop = None;
-        assert_eq!(reserved_ports(&p, 1), "10000-10002,40000,41000-50000");
-    }
-
-    #[test]
-    fn firewall_ports_cover_every_listener_and_hop_range() {
-        let s = sample_state();
-        let want = vec![
-            PortSpec::one(Proto::Tcp, 22),
-            PortSpec::one(Proto::Tcp, 80),
-            PortSpec::one(Proto::Tcp, 443),
-            PortSpec::one(Proto::Tcp, 10001),
-            PortSpec::one(Proto::Tcp, 10002),
-            PortSpec::one(Proto::Udp, 10000),
-            PortSpec::range(Proto::Udp, 20000, 30000),
-            PortSpec::one(Proto::Udp, 40000),
-            PortSpec::range(Proto::Udp, 41000, 50000),
-        ];
-        assert_eq!(firewall_ports(&s.node.ports, 1), want);
-    }
-
-    #[test]
-    fn a_single_slot_opens_exactly_the_v3_port_set() {
+    fn the_port_set_is_one_listener_plus_the_whole_hop_range() {
         let p = crate::testutil::sample_state().node.ports;
-        let specs: Vec<String> = firewall_ports(&p, 1).iter().map(PortSpec::ufw).collect();
+        let on: Vec<String> = firewall_ports(&p, true).iter().map(PortSpec::ufw).collect();
         assert_eq!(
-            specs,
+            on,
             vec![
                 "22/tcp",
                 "80/tcp",
@@ -360,41 +349,40 @@ mod tests {
                 "10000/udp",
                 "20000:30000/udp",
                 "40000/udp",
+                "40001:40007/udp",
                 "41000:50000/udp",
-            ],
-            "单槽的端口集必须与 v3 逐字相同"
+            ]
         );
-        assert_eq!(
-            reserved_ports(&p, 1),
-            "10000-10002,20000-30000,40000,41000-50000"
-        );
-    }
-
-    #[test]
-    fn three_slots_open_the_whole_residential_base_range() {
-        let p = crate::testutil::sample_state().node.ports;
-        let specs: Vec<String> = firewall_ports(&p, 3).iter().map(PortSpec::ufw).collect();
-        assert!(
-            specs.contains(&"40000:40002/udp".to_string()),
-            "spec §5.6：放行 40000..40000+N-1/udp，实际 {specs:?}"
-        );
-        assert!(
-            specs.contains(&"41000:50000/udp".to_string()),
-            "跳跃区间整段放行（各槽只用其中一片，多放不会有人监听）"
-        );
-        let fw: Vec<String> = firewall_ports(&p, 3)
+        let off: Vec<String> = firewall_ports(&p, false)
+            .iter()
+            .map(PortSpec::ufw)
+            .collect();
+        assert!(!off.iter().any(|x| x.contains("40001:40007")));
+        assert_eq!(off.len(), on.len() - 1);
+        assert!(firewall_ports(&p, true)
             .iter()
             .map(PortSpec::firewalld)
-            .collect();
-        assert!(fw.contains(&"40000-40002/udp".to_string()));
+            .any(|x| x == "40001-40007/udp"));
         assert_eq!(
-            reserved_ports(&p, 3),
-            "10000-10002,20000-30000,40000-40002,41000-50000"
+            reserved_ports(&p, true),
+            "10000-10002,20000-30000,40000,40001-40007,41000-50000"
+        );
+        assert_eq!(
+            reserved_ports(&p, false),
+            "10000-10002,20000-30000,40000,41000-50000"
+        );
+        // 直连跳跃段缺失时其余各段照旧
+        let mut q = p.clone();
+        q.hy2_hop = None;
+        assert_eq!(
+            reserved_ports(&q, true),
+            "10000-10002,40000,40001-40007,41000-50000"
         );
     }
 
+    /// 端口集只跟 `system.hy2_resi_compat_ports` 有关，跟槽位表无关（4.1 目标 1）。
     #[test]
-    fn render_opens_the_slot_range_when_the_pool_has_slots() {
+    fn render_opens_the_same_ports_whatever_the_slot_table_says() {
         let mut s = crate::testutil::sample_state();
         s.residential.slots = (0..2)
             .map(|i| bui_schema::model::Slot {
@@ -404,19 +392,71 @@ mod tests {
             .collect();
         // `ctx(mem_mb, ufw, firewalld, resolved)`：`has_ufw` 与 `ufw_active` 由第二个参数
         // 一起给，所以「有活防火墙」就是 `ctx(1024, true, false, true)`
-        let arts = SystemModule.render(&s, &ctx(1024, true, false, true));
-        let ports = arts
-            .iter()
-            .find_map(|a| match a {
-                Artifact::FirewallPorts { ports } => Some(ports.clone()),
-                _ => None,
-            })
-            .expect("有活防火墙就该产出 FirewallPorts");
-        assert!(
-            ports.iter().any(|p| p.ufw() == "40000:40001/udp"),
-            "实际 {:?}",
-            ports.iter().map(PortSpec::ufw).collect::<Vec<_>>()
+        let ports_of = |s: &State| {
+            SystemModule
+                .render(s, &ctx(1024, true, false, true))
+                .iter()
+                .find_map(|a| match a {
+                    Artifact::FirewallPorts { ports } => Some(ports.clone()),
+                    _ => None,
+                })
+                .expect("有活防火墙就该产出 FirewallPorts")
+        };
+        let two = ports_of(&s);
+        assert_eq!(two, ports_of(&crate::testutil::sample_state()));
+        let ufw: Vec<String> = two.iter().map(PortSpec::ufw).collect();
+        assert!(ufw.contains(&"40000/udp".to_string()), "{ufw:?}");
+        assert!(ufw.contains(&"40001:40007/udp".to_string()), "{ufw:?}");
+        assert!(ufw.contains(&"41000:50000/udp".to_string()), "{ufw:?}");
+        // 关掉兼容段之后端口集跟着缩
+        s.system.hy2_resi_compat_ports = false;
+        assert!(!ports_of(&s).iter().any(|p| p.ufw() == "40001:40007/udp"));
+    }
+
+    /// nft 表是每轮都产的 artifact，规则集只有 `bui-schema` 一处实现，key 固定。
+    #[test]
+    fn the_nft_table_is_an_artifact_keyed_by_its_ruleset() {
+        let mut s = crate::testutil::sample_state();
+        let find = |s: &State, c: &RenderCtx| {
+            SystemModule
+                .render(s, c)
+                .iter()
+                .find_map(|a| match a {
+                    Artifact::NftTable {
+                        family,
+                        name,
+                        ruleset,
+                    } => Some((family.clone(), name.clone(), ruleset.clone())),
+                    _ => None,
+                })
+                .expect("每轮对账都产 nft 表")
+        };
+        let t = find(&s, &ctx(2048, true, false, false));
+        assert_eq!((t.0.as_str(), t.1.as_str()), ("inet", "bui"));
+        assert_eq!(
+            t.2,
+            bui_schema::render::nft::ruleset(&s.node.ports, true),
+            "规则集必须原样来自 bui-schema（总纲 C1）"
         );
+        assert_eq!(
+            crate::reconcile::Artifact::NftTable {
+                family: t.0,
+                name: t.1,
+                ruleset: t.2
+            }
+            .id(),
+            "nft:inet:bui"
+        );
+        // 没有防火墙、甚至 sysctl 关掉了，这张表照样要产：它是数据面，不是加固项
+        s.system.firewall = "off".into();
+        s.system.sysctl_profile = "off".into();
+        let t = find(&s, &ctx(2048, false, false, false));
+        assert_eq!(t.1, "bui");
+        // 兼容段关掉之后规则从 4 条变 2 条
+        s.system.hy2_resi_compat_ports = false;
+        let t = find(&s, &ctx(2048, false, false, false));
+        assert_eq!(t.2, bui_schema::render::nft::ruleset(&s.node.ports, false));
+        assert_eq!(t.2.matches("counter redirect").count(), 2);
     }
 
     #[test]
@@ -438,7 +478,7 @@ mod tests {
         assert!(net.contains("net.ipv4.tcp_congestion_control=bbr"));
         assert!(net.contains("net.core.default_qdisc=fq"));
         assert!(net.contains(
-            "net.ipv4.ip_local_reserved_ports=10000-10002,20000-30000,40000,41000-50000"
+            "net.ipv4.ip_local_reserved_ports=10000-10002,20000-30000,40000,40001-40007,41000-50000"
         ));
         assert!(net.contains("net.core.rmem_max=16777216"));
         assert!(net.contains("net.ipv4.tcp_retries2=8"));
@@ -592,6 +632,8 @@ mod tests {
         assert_eq!(files(&arts), vec!["/etc/resolv.conf"]);
         // `99-b-ui-memory.conf` 的两支都在 `sysctl_profile != "off"` 里面：关了就连 Absent 也不产出
         assert!(!arts.iter().any(|a| matches!(a, Artifact::Absent { .. })));
+        // nft 表不在 sysctl 那一支里（它是数据面）
+        assert!(arts.iter().any(|a| matches!(a, Artifact::NftTable { .. })));
     }
 
     #[test]
@@ -634,7 +676,7 @@ mod tests {
             "没有活防火墙时不许产出 FirewallPorts"
         );
         // 但端口集本身照样可算——提示文案要用它
-        assert_eq!(firewall_ports(&s.node.ports, 1).len(), 9);
+        assert_eq!(firewall_ports(&s.node.ports, true).len(), 10);
     }
 
     #[test]
@@ -665,7 +707,7 @@ mod tests {
         );
         let s = sample_state();
         let v4: std::collections::BTreeMap<String, String> =
-            parse_conf(&network_conf(&s.node.ports, 1))
+            parse_conf(&network_conf(&s.node.ports, true))
                 .into_iter()
                 .chain(parse_conf(&conntrack_conf(conntrack_max(2048))))
                 .collect();

@@ -10,6 +10,10 @@ pub mod diff;
 pub mod drift;
 
 /// v4 受管的六个单元；health 端点、`/api/services` 白名单、漂移的 drop-in 扫描都用这一份。
+///
+/// 4.1 起 `hysteria-residential` 是**唯一**的住宅实例（一个 sing-box hysteria2 入站
+/// `:40000`，整段跳跃由 [`Artifact::NftTable`] 的 `inet bui` 表 REDIRECT 过来），
+/// 所以这份名单就是全部受管单元：`hysteria-residential-1..7` 进了 [`LEGACY_UNITS`]。
 pub const MANAGED_UNITS: [&str; 6] = [
     "b-ui",
     "hysteria-server",
@@ -19,9 +23,15 @@ pub const MANAGED_UNITS: [&str; 6] = [
     "caddy",
 ];
 
-/// v3 遗留的单元与定时器（v4 一概不生成）：units 模块产出 `UnitState{false,false}` + `Absent`，
-/// 漂移扫描对「删不掉还在的」再报一次。**唯一一份**，Task 5 与 Task 8 都引用它。
-pub const LEGACY_UNITS: [&str; 9] = [
+/// v3 遗留的单元与定时器 + 4.0 的按槽住宅实例（v4.1 一概不生成）：units 模块产出
+/// `UnitState{false,false}` + `Absent`，漂移扫描对「删不掉还在的」再报一次。
+/// **唯一一份**，Task 5 与 Task 8 都引用它。
+///
+/// `hysteria-residential-1..7` 是 4.0 的「每住宅槽位一个 apernet hysteria 实例」
+/// （spec §2.5）：4.1 只剩 `hysteria-residential` 这一个 sing-box 实例，带后缀的七个
+/// 因此从受管变成遗留 —— 停掉、禁掉、删单元文件。它们留下的端口跳跃 NAT 规则由
+/// [`crate::modules::portjump::cleanup_legacy_residential`] 在落 nft 表之前清掉。
+pub const LEGACY_UNITS: [&str; 16] = [
     "hy2-watchdog.timer",
     "hy2-watchdog.service",
     "b-ui-cert-sync.timer",
@@ -31,53 +41,37 @@ pub const LEGACY_UNITS: [&str; 9] = [
     "b-ui-admin.service",
     "hysteria-server@.service",
     "xray@.service",
+    "hysteria-residential-1.service",
+    "hysteria-residential-2.service",
+    "hysteria-residential-3.service",
+    "hysteria-residential-4.service",
+    "hysteria-residential-5.service",
+    "hysteria-residential-6.service",
+    "hysteria-residential-7.service",
 ];
 
-/// 住宅槽位上限（= `bui_schema::slots::MAX_SLOTS`）：受管单元、配置文件与清理项都按它枚举。
+/// 住宅槽位上限（= `bui_schema::slots::MAX_SLOTS`）：4.1 只用它枚举**遗留**项
+/// （`hysteria-residential-<i>` 与 `config-residential-<i>.yaml`），受管单元不再按它展开。
 pub const MAX_RESI_SLOTS: u16 = bui_schema::slots::MAX_SLOTS;
 
-/// 槽 `index` 的住宅 hysteria 单元名。**槽 0 保持 v3 的名字**（spec §5.6「槽 0 保持今天的
-/// 40000 与 `hysteria-residential.service` 名字兼容」）：M1 验收、`watchdog::targets`、
-/// 面板与运维脚本都按它写死。
-pub fn resi_unit(index: u16) -> String {
-    if index == 0 {
-        "hysteria-residential".to_string()
-    } else {
-        format!("hysteria-residential-{index}")
-    }
-}
-
-/// 这个名字是不是 v4 的受管单元。**词法判定**（不读期望态）：六个固定名字，
-/// 外加 `hysteria-residential-<1..MAX_RESI_SLOTS-1>`。
+/// 这个名字是不是 v4 的受管单元。**词法判定**（不读期望态）：就是那六个固定名字。
+///
+/// 4.1 起带后缀的 `hysteria-residential-<i>` 一律返回 false（它们在 [`LEGACY_UNITS`] 里，
+/// spec §2.5）：`POST /api/services/{unit}/{action}` 的白名单不该再放行一个不存在的实例，
+/// 而 `apply::is_managed_dropin_dir` 也不该把它的 drop-in 目录当成自己的地盘 ——
+/// 那个目录里的残留由遗留清理整条删掉。
 ///
 /// 给「我能不能动这个单元 / 这个 drop-in 目录是不是我的地盘」这类判断用
-/// （`apply::is_managed_dropin_dir`、`POST /api/services/{unit}/{action}` 的白名单、
-/// 漂移扫描）。这些调用点手上没有期望态，也不该因为某个槽此刻不存在就把它的残留
-/// 当成别人的东西不敢清。
+/// （`apply::is_managed_dropin_dir`、`/api/services` 白名单、漂移扫描）。
 pub fn is_managed_unit(name: &str) -> bool {
-    if MANAGED_UNITS.contains(&name) {
-        return true;
-    }
-    match name.strip_prefix("hysteria-residential-") {
-        // 只认十进制规范写法：`-01` 不是我们会生成的名字，放过去等于允许伪造
-        Some(n) if !n.is_empty() && !n.starts_with('0') => n
-            .parse::<u16>()
-            .is_ok_and(|i| (1..MAX_RESI_SLOTS).contains(&i)),
-        _ => false,
-    }
+    MANAGED_UNITS.contains(&name)
 }
 
-/// 按期望态枚举**此刻**该跑的受管单元：六个固定名字 + 槽 1.. 的住宅实例
-/// （槽 0 就是 [`MANAGED_UNITS`] 里的 `hysteria-residential`）。
-/// 体检的 services 表、`/api/services` 枚举、`bui status`、自检、假机器播种都用它。
-pub fn managed_units(s: &State) -> Vec<String> {
-    let mut v: Vec<String> = MANAGED_UNITS.iter().map(|x| x.to_string()).collect();
-    for i in bui_schema::slots::indices(&s.residential) {
-        if i != 0 {
-            v.push(resi_unit(i));
-        }
-    }
-    v
+/// 按期望态枚举**此刻**该跑的受管单元。4.1 起住宅只有一个实例，所以它退化成
+/// [`MANAGED_UNITS`] 的那六个；**签名保留**（体检的 services 表、`/api/services` 枚举、
+/// `bui status`、自检、假机器播种都按它调）。
+pub fn managed_units(_s: &State) -> Vec<String> {
+    MANAGED_UNITS.iter().map(|x| x.to_string()).collect()
 }
 
 use crate::state::runtime::Runtime;
@@ -268,6 +262,19 @@ pub enum Artifact {
     FirewallPorts {
         ports: Vec<PortSpec>,
     },
+    /// 一张由 b-ui 自管的 nft 表（C2 的第 10 个变体，4.1）。`ruleset` 是
+    /// [`bui_schema::render::nft::ruleset`] 的整份产出：`table` 声明 + `flush table` +
+    /// 完整定义，一个 `nft -f -` 事务原子替换，重放幂等。
+    ///
+    /// 目前只有住宅 HY2 端口跳跃那一张 `inet bui`：整段 `41000-50000`（+ 4.0 兼容段
+    /// `40001-40007`）REDIRECT 到 `:40000`。**缺 `nft` 不是「跳跃失效」而是住宅 HY2 对
+    /// 全体带 `mport` 的现役订阅全断**（客户端只往跳跃段发、从不发 `:40000`），所以
+    /// `bui install` / `bui upgrade` 把 `nft` 当硬前置（退出码 2、一个字不落盘）。
+    NftTable {
+        family: String,
+        name: String,
+        ruleset: String,
+    },
     Absent {
         path: PathBuf,
     },
@@ -336,6 +343,8 @@ impl Artifact {
             Artifact::Binary { name, .. } => format!("binary:{name}"),
             Artifact::Symlink { path, .. } => format!("symlink:{}", path.display()),
             Artifact::FirewallPorts { .. } => "firewall".to_string(),
+            // 也是 `runtime.restart_keys` 里那条记账的键：`nft:inet:bui`
+            Artifact::NftTable { family, name, .. } => format!("nft:{family}:{name}"),
             Artifact::Absent { path } => format!("absent:{}", path.display()),
         }
     }
@@ -368,6 +377,12 @@ pub struct Facts {
     pub ssh_unit: String,
     pub ssh_pubkeys: u32,
     pub systemd_resolved: bool,
+    /// `nft list tables` 探到的表标识符（`"inet bui"` 这种「族 + 空格 + 表名」，与
+    /// [`bui_schema::render::nft::TABLE`] 同一写法）。[`diff::plan`] 是纯函数、不许跑命令，
+    /// 所以「`inet bui` 这张表还在不在」这一问由这里一次性探好带进去 ——
+    /// 有人 `nft flush ruleset`（或 `nftables.service` 重启）把表刷掉时，
+    /// 规则集哈希没变但表没了，只有这份事实能让下一轮重放它。
+    pub nft_tables: std::collections::BTreeSet<String>,
 }
 
 impl Facts {
@@ -403,8 +418,31 @@ impl Facts {
                 || host
                     .unit_exists("systemd-resolved.service")
                     .unwrap_or(false),
+            nft_tables: nft_tables(host),
         })
     }
+}
+
+/// `nft list tables` 的输出 → 表标识符集合（`table inet bui` → `"inet bui"`）。
+/// 没有 `nft`、命令失败或输出认不出来都返回空集（那就等于「表不在」，下一轮重放一次，
+/// 幂等无副作用；反过来误判成「在」会让被刷掉的表永远补不回来）。
+fn nft_tables(host: &dyn Host) -> std::collections::BTreeSet<String> {
+    if !host.which("nft") {
+        return Default::default();
+    }
+    match host.run("nft", &["list", "tables"]) {
+        Ok(o) if o.ok() => o.stdout.lines().filter_map(parse_nft_table_line).collect(),
+        _ => Default::default(),
+    }
+}
+
+/// `table inet bui` → `Some("inet bui")`（多余的空白归一，别的行返回 `None`）。
+pub fn parse_nft_table_line(line: &str) -> Option<String> {
+    let mut w = line.split_whitespace();
+    (w.next()? == "table").then_some(())?;
+    let family = w.next()?;
+    let name = w.next()?;
+    w.next().is_none().then(|| format!("{family} {name}"))
 }
 
 /// 非注释行且以 ssh-rsa/ssh-ed25519/ssh-dss/ecdsa-sha2- 开头（移植 `core.sh:1871`）。
@@ -524,6 +562,11 @@ mod tests {
     #[test]
     fn managed_and_legacy_unit_lists_are_the_single_source_of_truth() {
         assert_eq!(MANAGED_UNITS.len(), 6);
+        assert_eq!(
+            LEGACY_UNITS.len(),
+            16,
+            "9 个 v3 遗留 + 7 个 4.0 的按槽住宅实例"
+        );
         assert!(
             MANAGED_UNITS.contains(&"b-ui-relay"),
             "v4 自己的 relay 单元必须在受管列表里"
@@ -540,27 +583,25 @@ mod tests {
         assert!(LEGACY_UNITS.contains(&"b-ui-admin.service"));
     }
 
+    /// 4.1（spec §2.5）：带后缀的住宅实例从受管变成遗留，`is_managed_unit` 对它们一律 false。
+    /// 词法判定不许再放行一个不存在的实例 —— `/api/services` 的白名单与
+    /// `apply::is_managed_dropin_dir` 都按它，放行等于允许动一个已退役的单元。
     #[test]
-    fn resi_unit_keeps_slot_zero_on_the_v3_name() {
-        assert_eq!(resi_unit(0), "hysteria-residential");
-        assert_eq!(resi_unit(1), "hysteria-residential-1");
-        assert_eq!(resi_unit(7), "hysteria-residential-7");
-    }
-
-    #[test]
-    fn is_managed_unit_accepts_the_six_plus_every_possible_slot() {
+    fn is_managed_unit_accepts_exactly_the_six() {
         for m in MANAGED_UNITS {
             assert!(is_managed_unit(m), "{m}");
         }
         for i in 1..MAX_RESI_SLOTS {
-            assert!(is_managed_unit(&resi_unit(i)));
+            let n = format!("hysteria-residential-{i}");
+            assert!(!is_managed_unit(&n), "{n} 是遗留单元，不再受管");
+            assert!(
+                LEGACY_UNITS.contains(&format!("{n}.service").as_str()),
+                "{n} 不在遗留清单里"
+            );
         }
-        assert!(!is_managed_unit("hysteria-residential-8"), "超出槽位上限");
+        assert!(!is_managed_unit("hysteria-residential-8"));
         assert!(!is_managed_unit("hysteria-residential-x"));
-        assert!(
-            !is_managed_unit("hysteria-residential-01"),
-            "只认十进制规范写法"
-        );
+        assert!(!is_managed_unit("hysteria-residential-01"));
         assert!(!is_managed_unit("ssh"));
         for l in LEGACY_UNITS {
             assert!(!is_managed_unit(
@@ -570,27 +611,75 @@ mod tests {
     }
 
     #[test]
-    fn managed_units_follows_the_slot_table() {
+    fn managed_units_is_always_the_six_fixed_names() {
         let mut s = crate::testutil::sample_state();
-        assert_eq!(
-            managed_units(&s),
-            MANAGED_UNITS
-                .iter()
-                .map(|x| x.to_string())
-                .collect::<Vec<_>>(),
-            "单槽（含空池）时就是今天那六个"
-        );
+        let six: Vec<String> = MANAGED_UNITS.iter().map(|x| x.to_string()).collect();
+        assert_eq!(managed_units(&s), six);
+        // 4.1：槽位表不再影响受管单元数（住宅只有一个 sing-box 实例）
         s.residential.slots = (0..3)
             .map(|i| bui_schema::model::Slot {
                 index: i,
                 upstream_id: uuid::Uuid::from_u128(u128::from(i) + 1),
             })
             .collect();
-        let u = managed_units(&s);
-        assert_eq!(u.len(), 8);
-        assert!(u.contains(&"hysteria-residential".to_string()));
-        assert!(u.contains(&"hysteria-residential-1".to_string()));
-        assert!(u.contains(&"hysteria-residential-2".to_string()));
-        assert!(u.iter().all(|n| is_managed_unit(n)));
+        assert_eq!(managed_units(&s), six, "增槽不再多出受管单元");
+        assert!(managed_units(&s).iter().all(|n| is_managed_unit(n)));
+    }
+
+    /// `diff` 是纯函数，「表还在不在」只能靠这份事实（本轮探一次）。
+    #[test]
+    fn probes_the_nft_table_list_when_nft_is_present() {
+        let h = FakeHost::new();
+        let f = Facts::probe(&h).unwrap();
+        assert!(f.nft_tables.is_empty(), "PATH 上没有 nft 就是空集");
+        let h = FakeHost::new();
+        h.with(|i| {
+            i.which.insert("nft".into());
+            i.scripted.push((
+                "nft list tables".into(),
+                crate::sys::CmdOut::success(
+                    "table inet bui
+table ip hysteria_c66a02d9
+table ip6 nat
+",
+                ),
+            ));
+        });
+        let f = Facts::probe(&h).unwrap();
+        assert!(f.nft_tables.contains(bui_schema::render::nft::TABLE));
+        assert!(f.nft_tables.contains("ip hysteria_c66a02d9"));
+        assert_eq!(f.nft_tables.len(), 3);
+    }
+
+    #[test]
+    fn nft_table_lines_are_parsed_conservatively() {
+        assert_eq!(
+            parse_nft_table_line("table inet bui").as_deref(),
+            Some("inet bui")
+        );
+        assert_eq!(
+            parse_nft_table_line("  table   ip   hysteria_x  ").as_deref(),
+            Some("ip hysteria_x")
+        );
+        // 多一列（`table inet bui { … }` 这种一行式）与缺列都不认
+        assert_eq!(parse_nft_table_line("table inet bui {"), None);
+        assert_eq!(parse_nft_table_line("table inet"), None);
+        assert_eq!(parse_nft_table_line(""), None);
+        assert_eq!(parse_nft_table_line("chain inet bui"), None);
+    }
+
+    #[test]
+    fn the_nft_table_artifact_is_keyed_by_family_and_name() {
+        assert_eq!(
+            Artifact::NftTable {
+                family: "inet".into(),
+                name: "bui".into(),
+                ruleset: "table inet bui
+"
+                .into(),
+            }
+            .id(),
+            "nft:inet:bui"
+        );
     }
 }

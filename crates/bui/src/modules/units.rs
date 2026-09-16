@@ -56,19 +56,18 @@ impl Module for UnitsModule {
         "units"
     }
 
-    fn render(&self, s: &State, ctx: &RenderCtx) -> Vec<Artifact> {
+    fn render(&self, _s: &State, ctx: &RenderCtx) -> Vec<Artifact> {
         let mut out = Vec::new();
 
         // 六个单元文件。`name` 一律 `Unit::restart`，caddy 也不例外：单元文件本身变了必须
         // `systemctl restart`，`reload` 不会让新的 ExecStart / Environment / MemoryMax 生效。
         // （`Unit::reload` 只用在两个 `Artifact::File` 上：`<base>/Caddyfile` 与
         // `/etc/ssh/sshd_config.d/00-b-ui-hardening.conf`。）
-        // `hysteria-residential` 是槽 0，正文由 `resi_unit_text` 出（与槽 1.. 同一模板）；
-        // 它必须留在 MANAGED_UNITS 的原位，`renders_exactly_six_units_and_no_timers`
-        // 按这个顺序断言。
+        // `hysteria-residential` 4.1 起跑 sing-box，正文由 `resi_unit_text` 出；它必须留在
+        // MANAGED_UNITS 的原位，`renders_exactly_six_units_and_no_timers` 按这个顺序断言。
         for name in MANAGED_UNITS {
             let content = if name == "hysteria-residential" {
-                resi_unit_text(0, ctx)
+                resi_unit_text(ctx)
             } else {
                 unit_text(name, ctx)
             };
@@ -76,16 +75,6 @@ impl Module for UnitsModule {
                 name: Unit::restart(name),
                 dropin: None,
                 content,
-            });
-        }
-        // 槽 1.. 的住宅实例（槽 0 已在上面那轮里）
-        let live = bui_schema::slots::indices(&s.residential);
-        for i in live.iter().copied().filter(|i| *i != 0) {
-            let name = crate::reconcile::resi_unit(i);
-            out.push(Artifact::Unit {
-                name: Unit::restart(&name),
-                dropin: None,
-                content: resi_unit_text(i, ctx),
             });
         }
 
@@ -121,30 +110,10 @@ impl Module for UnitsModule {
                 active: true,
             });
         }
-        for i in live.iter().copied().filter(|i| *i != 0) {
-            out.push(Artifact::UnitState {
-                name: crate::reconcile::resi_unit(i),
-                enabled: true,
-                active: true,
-            });
-        }
-        // 池缩小之后多出来的实例：先停用再删单元文件（与 LEGACY_UNITS 同一套手法）
-        for i in 1..crate::reconcile::MAX_RESI_SLOTS {
-            if live.contains(&i) {
-                continue;
-            }
-            let name = crate::reconcile::resi_unit(i);
-            out.push(Artifact::UnitState {
-                name: name.clone(),
-                enabled: false,
-                active: false,
-            });
-            out.push(Artifact::Absent {
-                path: format!("/etc/systemd/system/{name}.service").into(),
-            });
-        }
+        // 4.0 的按槽住宅实例（`hysteria-residential-1..7`）已经并进 LEGACY_UNITS，
+        // 下面那两轮遗留清理会把它们停掉、禁掉、删单元文件（spec §2.5）。
 
-        // v3 遗留单元：先全部停用，再删单元文件。
+        // v3 遗留单元 + 4.0 的按槽住宅实例：先全部停用，再删单元文件。
         for legacy in LEGACY_UNITS {
             out.push(Artifact::UnitState {
                 name: legacy.to_string(),
@@ -298,46 +267,48 @@ WantedBy=multi-user.target
     }
 }
 
-/// 槽 `index` 的住宅 hysteria 单元正文。与直连实例的差别只有 `--config` 指向的文件
-/// 与 Description；资源限制沿用 v3 的住宅档（`GOMEMLIMIT=200MiB` / `MemoryHigh=300M` /
-/// `MemoryMax=500M` / `LimitNPROC=512`）。
+/// 唯一的住宅 HY2 单元正文（4.1）：**sing-box**，一份 `hy2-residential.json`，
+/// 一个 hysteria2 入站 `:40000`（spec §2.5）。
 ///
-/// **每槽独立的资源上限而不是共享一份**：一条上游抖起来只该影响它自己那个实例。
-/// `ExecStartPre` 同样按槽传**自己**那份配置——端口跳跃的 nat 链按实例的
-/// base 端口 + 跳跃区间定位，跨实例清理正是 v3.5.1 翻车的写法。
-pub fn resi_unit_text(index: u16, ctx: &RenderCtx) -> String {
+/// 与 4.0 的 apernet 版差三处，每一处都是有意的：
+/// - `ExecStartPre=-{bin}/bui nft apply`：跳跃不再由内核自己建 NAT 规则，而是 b-ui 自管的
+///   `inet bui` 表。今天有两处幂等重放：这里与每轮对账；第三处（watchdog 每 60 秒自愈）
+///   **T12 起**才有，现在还没有那段代码。
+///   `-` 前缀保证重放失败不阻塞内核启动。孤儿链清理的 `bui hy2-prestart` 随之退役 ——
+///   sing-box 不建 NAT 规则，也就没有孤儿链。
+/// - **不设 `GOMEMLIMIT`**（与 `b-ui-relay` 今天一致，spec §14 裁决 5：sidecar 实测 RSS 65 MB，
+///   `MemoryHigh=300M` / `MemoryMax=500M` 已经兜底）；`HYSTERIA_LOG_LEVEL` 是 apernet 专属
+///   环境变量、sing-box 不认；`LimitNPROC=512` 一并去掉。
+/// - `LogRateLimit*`：sing-box 一条流一行日志，不限速会在异常时把 journald 撑爆（relay 同款）。
+///
+/// `After=` 仍带 `b-ui-relay.service`：住宅出站是 relay 的 `slot-<i>` socks 入站。
+pub fn resi_unit_text(ctx: &RenderCtx) -> String {
     let bin = ctx.paths.bin_dir.display();
-    let cfg = crate::modules::core_files::resi_config_path(&ctx.paths, index);
+    let cfg = crate::modules::core_files::hy2_resi_config_path(&ctx.paths);
     let cfg = cfg.display();
-    let slot = if index == 0 {
-        String::new()
-    } else {
-        format!(" slot {index}")
-    };
     format!(
         "[Unit]
-Description=Hysteria Server (Residential{slot})
-Documentation=https://v2.hysteria.network/
+Description=B-UI Residential Hysteria2 (sing-box)
+Documentation=https://sing-box.sagernet.org/
 After=network-online.target b-ui-relay.service
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStartPre=-{bin}/bui hy2-prestart {cfg}
-ExecStart={bin}/hysteria server --config {cfg}
+ExecStartPre=-{bin}/bui nft apply
+ExecStart={bin}/sing-box run -c {cfg}
 User=root
 Group=root
 Restart=always
 RestartSec=3
 TimeoutStopSec=15
 LimitNOFILE=1048576
-LimitNPROC=512
 CPUSchedulingPolicy=other
 Nice=-5
-Environment=GOMEMLIMIT=200MiB
-Environment=HYSTERIA_LOG_LEVEL=warn
 MemoryHigh=300M
 MemoryMax=500M
+LogRateLimitIntervalSec=10s
+LogRateLimitBurst=200
 
 [Install]
 WantedBy=multi-user.target
@@ -373,6 +344,7 @@ mod tests {
                 ssh_unit: "sshd".into(),
                 ssh_pubkeys: 1,
                 systemd_resolved: false,
+                nft_tables: Default::default(),
             },
         }
     }
@@ -437,8 +409,9 @@ mod tests {
         }
     }
 
+    /// 直连那一条**一个字不动**（spec §1.3 非目标第一条）。
     #[test]
-    fn hysteria_units_keep_v3_memory_tuning() {
+    fn the_direct_hysteria_unit_keeps_v3_memory_tuning() {
         let arts = UnitsModule.render(&sample_state(), &ctx());
         let direct = unit_of(&arts, "hysteria-server");
         assert!(direct
@@ -448,15 +421,116 @@ mod tests {
         assert!(direct.contains("MemoryHigh=500M"));
         assert!(direct.contains("MemoryMax=700M"));
         assert!(direct.contains("TimeoutStopSec=15"));
+    }
+
+    /// 4.1（spec §2.5）：住宅单元只剩一个、正文是 sing-box、启动前重放 nft 表，
+    /// apernet 专属的三项（`GOMEMLIMIT` / `HYSTERIA_LOG_LEVEL` / `LimitNPROC`）与
+    /// 孤儿链清理钩子一起删掉。
+    #[test]
+    fn the_residential_unit_now_runs_singbox() {
+        let arts = UnitsModule.render(&state_with_slots(3), &ctx());
+        let names: Vec<String> = arts
+            .iter()
+            .filter_map(|a| match a {
+                Artifact::Unit { name, .. } => Some(name.name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            names
+                .iter()
+                .filter(|n| n.starts_with("hysteria-residential"))
+                .count(),
+            1,
+            "增槽不再多出住宅单元：{names:?}"
+        );
         let resi = unit_of(&arts, "hysteria-residential");
-        assert!(resi.contains(
-            "ExecStart=/opt/b-ui/bin/hysteria server --config /opt/b-ui/config-residential.yaml"
-        ));
-        assert!(resi.contains("Environment=GOMEMLIMIT=200MiB"));
-        assert!(resi.contains("MemoryHigh=300M"));
-        assert!(resi.contains("MemoryMax=500M"));
-        assert!(resi.contains("LimitNPROC=512"));
+        assert!(
+            resi.contains("ExecStart=/opt/b-ui/bin/sing-box run -c /opt/b-ui/hy2-residential.json"),
+            "{resi}"
+        );
+        assert!(
+            resi.contains("ExecStartPre=-/opt/b-ui/bin/bui nft apply\n"),
+            "{resi}"
+        );
         assert!(resi.contains("After=network-online.target b-ui-relay.service"));
+        assert!(resi.contains("Restart=always") && resi.contains("RestartSec=3"));
+        assert!(resi.contains("LimitNOFILE=1048576") && resi.contains("Nice=-5"));
+        assert!(
+            resi.contains("LogRateLimitIntervalSec=10s") && resi.contains("LogRateLimitBurst=200")
+        );
+        assert!(resi.contains("MemoryHigh=300M") && resi.contains("MemoryMax=500M"));
+        for gone in [
+            "GOMEMLIMIT",
+            "HYSTERIA_LOG_LEVEL",
+            "LimitNPROC",
+            "bui hy2-prestart",
+            "hysteria server",
+        ] {
+            assert!(
+                !resi.contains(gone),
+                "apernet 专属项 {gone} 必须删掉：{resi}"
+            );
+        }
+        // 直连那一条一个字不动
+        let direct = unit_of(&arts, "hysteria-server");
+        assert!(direct.contains("bui hy2-prestart /opt/b-ui/config.yaml"));
+        assert!(direct.contains("Environment=GOMEMLIMIT=400MiB"));
+    }
+
+    /// 槽 1..7 的住宅单元进遗留清单：停 + 禁 + 删单元文件（spec §2.5）。
+    #[test]
+    fn the_per_slot_residential_units_are_now_legacy() {
+        assert_eq!(crate::reconcile::LEGACY_UNITS.len(), 16);
+        for i in 1..bui_schema::slots::MAX_SLOTS {
+            let n = format!("hysteria-residential-{i}.service");
+            assert!(
+                crate::reconcile::LEGACY_UNITS.contains(&n.as_str()),
+                "{n} 不在遗留清单里"
+            );
+            assert!(!crate::reconcile::is_managed_unit(&format!(
+                "hysteria-residential-{i}"
+            )));
+        }
+        // 连三槽在位的机器也一样：4.1 不看槽位表
+        let arts = UnitsModule.render(&state_with_slots(3), &ctx());
+        let stopped: Vec<String> = arts
+            .iter()
+            .filter_map(|a| match a {
+                Artifact::UnitState {
+                    name,
+                    enabled: false,
+                    active: false,
+                } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        for i in 1..bui_schema::slots::MAX_SLOTS {
+            let n = format!("hysteria-residential-{i}.service");
+            assert!(stopped.contains(&n), "{n} 没被停用：{stopped:?}");
+            assert!(
+                arts.contains(&Artifact::Absent {
+                    path: format!("/etc/systemd/system/{n}").into()
+                }),
+                "{n} 的单元文件要删"
+            );
+        }
+        assert!(
+            !stopped.contains(&"hysteria-residential".to_string()),
+            "槽 0 的名字是受管单元，绝不能被当成遗留停掉"
+        );
+    }
+
+    /// 造一份 n 槽的期望态（与 core_files 的同名夹具同规则）。
+    fn state_with_slots(n: u16) -> State {
+        let mut s = sample_state();
+        s.residential.slots = (0..n)
+            .map(|i| bui_schema::model::Slot {
+                index: i,
+                upstream_id: uuid::Uuid::from_u128(u128::from(i) + 1),
+            })
+            .collect();
+        s
     }
 
     /// 事故回归（2026-09-12 20:33 UTC bwg-rick，M5 回滚演练之后）：`hysteria-residential`
@@ -470,40 +544,32 @@ mod tests {
     /// 这正是 v3.5.1 共享 cleanup 翻车的修法）；③ 钩子是 `bui` 自己的子命令，不是 shell 脚本、
     /// 单元里也不出现 `iptables`（v3 的 `hy2-portjump-cleanup.sh` 仍在 `LEGACY_FILES` 里被删）。
     #[test]
-    fn both_hysteria_units_clean_their_own_portjump_chains_before_start() {
+    fn the_direct_hysteria_unit_cleans_its_own_portjump_chains_before_start() {
         let arts = UnitsModule.render(&sample_state(), &ctx());
         let direct = unit_of(&arts, "hysteria-server");
         assert!(
             direct.contains("ExecStartPre=-/opt/b-ui/bin/bui hy2-prestart /opt/b-ui/config.yaml\n"),
             "{direct}"
         );
-        let resi = unit_of(&arts, "hysteria-residential");
-        assert!(
-            resi.contains(
-                "ExecStartPre=-/opt/b-ui/bin/bui hy2-prestart /opt/b-ui/config-residential.yaml\n"
-            ),
-            "{resi}"
+        assert_eq!(
+            direct.matches("ExecStartPre").count(),
+            1,
+            "只该有一条启动前钩子"
         );
-        for (name, t) in [
-            ("hysteria-server", &direct),
-            ("hysteria-residential", &resi),
-        ] {
-            assert_eq!(
-                t.matches("ExecStartPre").count(),
-                1,
-                "{name} 只该有一条启动前钩子"
-            );
-            let low = t.to_lowercase();
-            assert!(
-                !low.contains("iptables") && !low.contains("nft") && !low.contains(".sh"),
-                "{name} 的钩子必须是 bui 子命令，不是脚本：{t}"
-            );
-        }
+        let low = direct.to_lowercase();
+        assert!(
+            !low.contains("iptables") && !low.contains("nft") && !low.contains(".sh"),
+            "钩子必须是 bui 子命令，不是脚本：{direct}"
+        );
+        // 4.1：住宅那条换成 `bui nft apply`（sing-box 不建 NAT 规则，没有孤儿链要清）。
+        let resi = unit_of(&arts, "hysteria-residential");
+        assert_eq!(resi.matches("ExecStartPre").count(), 1, "{resi}");
+        assert!(!resi.contains("hy2-prestart"), "{resi}");
         // 另外四个单元不该有任何启动前钩子
         for name in ["b-ui", "xray", "b-ui-relay", "caddy"] {
             assert!(
                 !unit_of(&arts, name).contains("ExecStartPre"),
-                "{name} 不需要端口跳跃清理"
+                "{name} 不需要启动前钩子"
             );
         }
         assert!(LEGACY_FILES.contains(&"/opt/b-ui/hy2-portjump-cleanup.sh"));
@@ -728,6 +794,7 @@ mod tests {
                 paths: &ctx.paths,
                 keys: &BTreeMap::new(),
                 installed_versions: &BTreeMap::new(),
+                facts: &ctx.facts,
             },
             h,
         )
@@ -813,10 +880,14 @@ mod tests {
         );
     }
 
+    /// 受管单元数固定回 6（spec §1.2 目标 4）：增删住宅槽位不再改单元集合，
+    /// 所以 `render` 对任意槽位表都产出同一份 artifact。
     #[test]
-    fn a_single_slot_renders_the_v3_named_residential_unit_only() {
-        let arts = UnitsModule.render(&sample_state(), &ctx());
-        let names: Vec<String> = arts
+    fn the_unit_set_no_longer_depends_on_the_slot_table() {
+        let one = UnitsModule.render(&sample_state(), &ctx());
+        let three = UnitsModule.render(&state_with_slots(3), &ctx());
+        assert_eq!(one, three, "槽位表不许影响单元模块的产出");
+        let names: Vec<String> = one
             .iter()
             .filter_map(|a| match a {
                 Artifact::Unit { name, .. } => Some(name.name.clone()),
@@ -830,57 +901,12 @@ mod tests {
                 .map(|s| s.to_string())
                 .collect::<Vec<_>>()
         );
-        // 1..MAX 的实例：停用 + 删单元文件
-        for i in 1..crate::reconcile::MAX_RESI_SLOTS {
-            let u = crate::reconcile::resi_unit(i);
-            assert!(arts.iter().any(
-                |a| matches!(a, Artifact::UnitState { name, enabled: false, active: false } if *name == u)
-            ));
-            assert!(arts.iter().any(|a| matches!(a, Artifact::Absent { path }
-                if path.to_str() == Some(&format!("/etc/systemd/system/{u}.service")))));
+        for name in MANAGED_UNITS {
+            assert!(one.contains(&Artifact::UnitState {
+                name: name.into(),
+                enabled: true,
+                active: true
+            }));
         }
-    }
-
-    #[test]
-    fn three_slots_render_three_residential_units_each_with_its_own_config() {
-        let mut s = sample_state();
-        s.residential.slots = (0..3)
-            .map(|i| bui_schema::model::Slot {
-                index: i,
-                upstream_id: uuid::Uuid::from_u128(u128::from(i) + 1),
-            })
-            .collect();
-        let arts = UnitsModule.render(&s, &ctx());
-        for i in 0..3u16 {
-            let name = crate::reconcile::resi_unit(i);
-            let t = unit_of(&arts, &name);
-            let cfg = if i == 0 {
-                "/opt/b-ui/config-residential.yaml".to_string()
-            } else {
-                format!("/opt/b-ui/config-residential-{i}.yaml")
-            };
-            assert!(
-                t.contains(&format!(
-                    "ExecStart=/opt/b-ui/bin/hysteria server --config {cfg}"
-                )),
-                "{name} 的 ExecStart 不对：\n{t}"
-            );
-            assert!(t.contains("Environment=GOMEMLIMIT=200MiB"));
-            assert!(t.contains("LimitNOFILE=1048576"));
-            assert!(t.contains("Nice=-5"));
-            assert!(t.contains("After=network-online.target b-ui-relay.service"));
-            assert!(arts.iter().any(
-                |a| matches!(a, Artifact::UnitState { name: n, enabled: true, active: true } if *n == name)
-            ));
-        }
-        // 3..MAX 才是清理项
-        assert!(arts.iter().any(
-            |a| matches!(a, Artifact::UnitState { name, enabled: false, active: false }
-            if name == "hysteria-residential-3")
-        ));
-        assert!(!arts.iter().any(
-            |a| matches!(a, Artifact::UnitState { name, enabled: false, active: false }
-            if name == "hysteria-residential-2")
-        ));
     }
 }
