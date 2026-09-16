@@ -111,11 +111,13 @@ pub fn sync_once(
                 continue;
             };
             let dest = dir.join(&key);
+            // 跳过判断走流式 sha 而不是 `read_file`：这一步每轮缓存巡检对四个客户端二进制各跑
+            // 一次（sing-box 单个几十 MB），而 `b-ui.service` 的 `MemoryMax=200M` 是硬上限。
             if host
-                .read_file(&dest)
+                .file_sha256(&dest)
                 .ok()
                 .flatten()
-                .map(|b| sha256_hex(&b) == asset.sha256)
+                .map(|sum| sum == asset.sha256)
                 .unwrap_or(false)
             {
                 rep.skipped.push(key);

@@ -419,7 +419,15 @@ fn fetch_and_install_kernels(
                 continue;
             }
         };
-        if installed.get(name).map(String::as_str) == Some(version) {
+        // 同版本异 sha 也要装：自建 sing-box 与官方归档同版本号（`kernel_build_differs`）
+        if !crate::kernels::kernel_build_differs(
+            host,
+            &paths.bin_dir,
+            &installed,
+            name,
+            version,
+            &asset.sha256,
+        ) {
             continue;
         }
         if let Err(e) = installer.install(
@@ -1765,6 +1773,46 @@ mod tests {
         assert!(
             !crate::paths::state_file(&paths).exists(),
             "失败就不该留下半成品 state.json"
+        );
+    }
+
+    /// P-A（2026-09-16 裁决）：装内核那一步，同版本异 sha 的二进制也要换 —— 自建 sing-box
+    /// 与官方归档打同一个版本号（`sing-box version` 都是 1.13.19 这种），只比版本号的话它
+    /// 永远装不上去，而依赖 `with_v2ray_api` 的配置每轮 `check` 必然 FATAL。
+    #[test]
+    fn the_kernel_step_replaces_a_same_version_binary_whose_bytes_differ() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = scratch(&d);
+        let h = host_for_install(&paths);
+        // 四个内核的版本号都与 manifest 一致（`host_for_install` 脚本化了 version 输出）；
+        // 三个的字节就是 manifest 资产那一份，sing-box 那个是「同版本的另一份构建」。
+        let sb = paths.bin_dir.join("sing-box");
+        h.write_file(&sb, b"SB-official", 0o755).unwrap();
+        for n in ["hysteria", "xray", "caddy"] {
+            h.write_file(&paths.bin_dir.join(n), b"ELF", 0o755).unwrap();
+        }
+        h.clear_ops();
+        let (_, m) = fetch_and_install_kernels(
+            h.as_ref(),
+            fetcher_with_manifest().as_ref(),
+            &paths,
+            &murl(),
+        );
+        assert!(m.is_some(), "manifest 要拉得到");
+        assert_eq!(
+            h.text(&sb.display().to_string()).as_deref(),
+            Some("ELF"),
+            "同版本异 sha 要换成 manifest 资产那一份"
+        );
+        let writes: Vec<String> = h
+            .ops()
+            .into_iter()
+            .filter(|o| o.starts_with("write:") && o.contains("/bin/"))
+            .collect();
+        assert_eq!(
+            writes,
+            vec![format!("write:{}:755", sb.display())],
+            "版本与 sha 都对得上的那三个一个都不许重下"
         );
     }
 

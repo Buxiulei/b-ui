@@ -3,6 +3,7 @@
 //!
 //! 四条不变量：
 //! 1. **校验再写盘**：`verify` 为 `Some` 时先把候选内容写进 `.verify/` 跑内核校验，失败不写目标文件（spec §2.2）。
+//!    校验必须用**将要运行该配置的那个二进制**，所以内核二进制排在写文件之前（第 0 步）。
 //! 2. **配置没落地就搁置该单元**：带 `restart` 的 `WriteFile` 校验失败或写失败 ⇒ 该单元本轮的
 //!    单元文件与重启一并搁置（held，第 1 / 3 / 12 步），绝不让「单元已换、配置未落」同时发生
 //!    （2026-09-16 裁决 P-C）。
@@ -99,6 +100,32 @@ pub fn apply(input: ApplyInput<'_>, host: &dyn Host) -> ApplyOutcome {
     let mut need_daemon_reload = false;
     // 「配置这轮没落地」的单元 → 原因。第 1 步记，第 3 步与第 12 步据此搁置单元文件与重启。
     let mut held: BTreeMap<String, &'static str> = BTreeMap::new();
+
+    // ---- 第 0 步：内核二进制。**必须在写文件之前**：带 `verify` 的文件要用**将要运行它的那个
+    // 二进制**去校验。反过来（先校验后装）就是拿旧内核校验新内核才认得的配置：xray 大版本
+    // 改字段时「校验过、上线崩」，而 4.1 是反向的同一题——自建 sing-box 还没装上去，
+    // 依赖 `with_v2ray_api` 的配置一律 FATAL、永不落盘（2026-09-16 裁决 P-B）。
+    for c in &changes {
+        let Change::InstallBinary {
+            name,
+            version,
+            sha256,
+            url,
+            path,
+        } = c
+        else {
+            continue;
+        };
+        match installer.install(name, version, sha256, url, path) {
+            Ok(()) => {
+                out.changed.push(format!("{name} {version}"));
+                for u in units_for_binary(name) {
+                    restart.insert(u);
+                }
+            }
+            Err(e) => out.errors.push(format!("{name} {version} 安装失败：{e}")),
+        }
+    }
 
     // ---- 第 1 步：写文件（校验 → 去 immutable → 写 → 记 key / 重启 / 回滚点）
     for c in &changes {
@@ -295,29 +322,6 @@ pub fn apply(input: ApplyInput<'_>, host: &dyn Host) -> ApplyOutcome {
                 }
             }
             Err(e) => out.errors.push(format!("sysctl {key}={value} 失败：{e}")),
-        }
-    }
-
-    // ---- 第 7 步：内核二进制
-    for c in &changes {
-        let Change::InstallBinary {
-            name,
-            version,
-            sha256,
-            url,
-            path,
-        } = c
-        else {
-            continue;
-        };
-        match installer.install(name, version, sha256, url, path) {
-            Ok(()) => {
-                out.changed.push(format!("{name} {version}"));
-                for u in units_for_binary(name) {
-                    restart.insert(u);
-                }
-            }
-            Err(e) => out.errors.push(format!("{name} {version} 安装失败：{e}")),
         }
     }
 
@@ -1145,6 +1149,98 @@ mod tests {
         );
     }
 
+    /// 2026-09-16 裁决 P-B：内核二进制先于带 `Verify` 的文件 —— 校验必须用**将要运行该配置的
+    /// 那个二进制**。
+    ///
+    /// 这个假机器复刻 4.1 首轮对账：盘上是官方 sing-box（`check` 拒掉带 `v2ray_api` 的配置），
+    /// 装上自建那一份之后同一条命令才通过。顺序反了的话（写文件在前）校验必然 FATAL，
+    /// 配置永不落盘、住宅单元被 P-C 搁置 —— 加上「同轮已删旧配置」就是永久崩溃循环。
+    #[test]
+    fn kernel_binaries_are_installed_before_the_configs_they_verify() {
+        /// 真写 FakeHost 的 installer：装完才让 `sing-box check` 成功。
+        struct SeedingInstaller<'a>(&'a FakeHost);
+        impl BinaryInstaller for SeedingInstaller<'_> {
+            fn install(
+                &self,
+                _n: &str,
+                _v: &str,
+                _s: &str,
+                _u: &str,
+                dest: &Path,
+            ) -> anyhow::Result<()> {
+                self.0.write_file(dest, b"SB-with_v2ray_api", 0o755)?;
+                // 自建那份认得 `v2ray_api`：把「一律 FATAL」的脚本撤掉
+                self.0.with(|i| i.scripted.clear());
+                Ok(())
+            }
+        }
+        let h = FakeHost::new();
+        h.with(|i| {
+            i.files.insert(
+                "/opt/b-ui/bin/sing-box".into(),
+                (b"SB-official".to_vec(), 0o755),
+            );
+            i.scripted.push((
+                "/opt/b-ui/bin/sing-box check".into(),
+                CmdOut::failure(1, "FATAL v2ray api is not included in this build"),
+            ));
+        });
+        let unit_path = "/etc/systemd/system/hysteria-residential.service";
+        let plan = Plan {
+            changes: vec![
+                Change::WriteFile {
+                    path: "/opt/b-ui/hy2-residential.json".into(),
+                    content: b"{}".to_vec(),
+                    mode: 0o600,
+                    verify: Some(Verify::SingBox),
+                    restart: Some(Unit::restart("hysteria-residential")),
+                },
+                Change::WriteUnit {
+                    path: unit_path.into(),
+                    content: "[Service]\nExecStart=/opt/b-ui/bin/sing-box run\n".into(),
+                    unit: Unit::restart("hysteria-residential"),
+                },
+                Change::InstallBinary {
+                    name: "sing-box".into(),
+                    version: "1.14.1".into(),
+                    sha256: "aa".into(),
+                    url: "https://example.com/sing-box".into(),
+                    path: "/opt/b-ui/bin/sing-box".into(),
+                },
+            ],
+            keys: Default::default(),
+            unchanged: 0,
+        };
+        let out = run(plan, &h, &SeedingInstaller(&h));
+        let ops = h.ops();
+        let pos = |needle: &str| {
+            ops.iter()
+                .position(|o| o.starts_with(needle))
+                .unwrap_or_else(|| panic!("{needle} 没出现在 {ops:?}"))
+        };
+        assert!(
+            pos("write:/opt/b-ui/bin/sing-box") < pos("run:/opt/b-ui/bin/sing-box check"),
+            "先装二进制，再拿它校验：{ops:?}"
+        );
+        assert!(out.verify_failures.is_empty(), "{:?}", out.verify_failures);
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(
+            h.text("/opt/b-ui/hy2-residential.json").as_deref(),
+            Some("{}"),
+            "校验过了就该落盘"
+        );
+        assert!(h.text(unit_path).is_some(), "配置落了盘，单元文件照换");
+        assert_eq!(
+            out.restarted
+                .iter()
+                .filter(|u| *u == "hysteria-residential")
+                .count(),
+            1,
+            "住宅单元恰重启一次：{:?}",
+            out.restarted
+        );
+    }
+
     #[test]
     fn writes_file_then_reloads_and_restarts_in_fixed_order() {
         let h = FakeHost::new();
@@ -1954,18 +2050,46 @@ mod tests {
         );
     }
 
+    /// `--dry-run` 只描述、不改机器。
+    ///
+    /// 这条早返回自 P-B 起离「下载并替换生产内核二进制」只隔一行（`InstallBinary` 现在是
+    /// 第 0 步），所以计划里必须放一条 `InstallBinary`、installer 必须是**真写盘**的那种：
+    /// 用 `NoopInstaller` 的话把早返回挪到第 0 步之后也照样全绿，等于没钉住。
     #[test]
     fn dry_run_touches_nothing() {
+        /// 真写 FakeHost 的 installer：早返回一旦失守，盘上就会多出这个二进制。
+        struct WritingInstaller<'a>(&'a FakeHost);
+        impl BinaryInstaller for WritingInstaller<'_> {
+            fn install(
+                &self,
+                _n: &str,
+                _v: &str,
+                _s: &str,
+                _u: &str,
+                dest: &Path,
+            ) -> anyhow::Result<()> {
+                self.0.write_file(dest, b"SB-new", 0o755)
+            }
+        }
         let h = FakeHost::new();
         let paths = Paths::default_server();
         let plan = Plan {
-            changes: vec![Change::WriteFile {
-                path: "/opt/b-ui/config.yaml".into(),
-                content: b"x".to_vec(),
-                mode: 0o600,
-                verify: None,
-                restart: None,
-            }],
+            changes: vec![
+                Change::WriteFile {
+                    path: "/opt/b-ui/config.yaml".into(),
+                    content: b"x".to_vec(),
+                    mode: 0o600,
+                    verify: None,
+                    restart: None,
+                },
+                Change::InstallBinary {
+                    name: "sing-box".into(),
+                    version: "1.14.1".into(),
+                    sha256: "aa".into(),
+                    url: "https://x/sb".into(),
+                    path: "/opt/b-ui/bin/sing-box".into(),
+                },
+            ],
             keys: Default::default(),
             unchanged: 0,
         };
@@ -1974,12 +2098,23 @@ mod tests {
                 plan,
                 paths: &paths,
                 facts: &facts(),
-                installer: &NoopInstaller,
+                installer: &WritingInstaller(&h),
                 dry_run: true,
             },
             &h,
         );
-        assert!(h.ops().is_empty());
-        assert_eq!(out.changed, vec!["/opt/b-ui/config.yaml".to_string()]);
+        assert!(h.ops().is_empty(), "{:?}", h.ops());
+        assert!(
+            h.text("/opt/b-ui/bin/sing-box").is_none(),
+            "dry-run 不许换内核二进制"
+        );
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(
+            out.changed,
+            vec![
+                "/opt/b-ui/config.yaml".to_string(),
+                "sing-box 1.14.1".to_string()
+            ]
+        );
     }
 }

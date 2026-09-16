@@ -56,6 +56,9 @@ pub struct FakeInner {
     pub unit_prop_reads: Vec<(String, String)>,
     /// `run_stdin` 的载荷流水（命令行, stdin）：`nft -f -` 喂进去的规则集按它断言。
     pub stdins: Vec<(String, String)>,
+    /// `file_sha256` 的查询流水：纯查询不进 `ops`，「二进制身份是流式算的、没被整文件读进
+    /// 内存」这类断言靠它证明（`b-ui.service` 的 `MemoryMax=200M` 是硬上限）。
+    pub sha_reads: Vec<PathBuf>,
     /// 操作流水（顺序可断言）
     pub ops: Vec<String>,
 }
@@ -89,6 +92,7 @@ impl Default for FakeInner {
             journal: std::collections::VecDeque::new(),
             unit_prop_reads: Vec::new(),
             stdins: Vec::new(),
+            sha_reads: Vec::new(),
             ops: Vec::new(),
         }
     }
@@ -129,6 +133,11 @@ impl FakeHost {
         self.lock().stdins.clone()
     }
 
+    /// 读回 [`Host::file_sha256`] 查过的路径：断言「二进制的 sha 是流式算的」用。
+    pub fn sha_reads(&self) -> Vec<PathBuf> {
+        self.lock().sha_reads.clone()
+    }
+
     /// 读回写入的文件内容。
     pub fn text(&self, path: &str) -> Option<String> {
         self.lock()
@@ -165,6 +174,15 @@ impl Default for FakeHost {
 impl Host for FakeHost {
     fn read_file(&self, path: &Path) -> Result<Option<Vec<u8>>> {
         Ok(self.lock().files.get(path).map(|(c, _)| c.clone()))
+    }
+
+    fn file_sha256(&self, path: &Path) -> Result<Option<String>> {
+        use sha2::{Digest as _, Sha256};
+        let mut i = self.lock();
+        i.sha_reads.push(path.to_path_buf());
+        Ok(i.files
+            .get(path)
+            .map(|(c, _)| hex::encode(Sha256::digest(c))))
     }
 
     fn write_file(&self, path: &Path, content: &[u8], mode: u32) -> Result<()> {
