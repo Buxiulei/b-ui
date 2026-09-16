@@ -1388,6 +1388,17 @@ mod tests {
         }
     }
 
+    /// `nft list table inet bui` 的回显：装机落的就是渲染器那份规则集（`bui nft apply`），
+    /// 这里按真机的打印方式给每条规则插一段 counter。
+    fn nft_listing() -> String {
+        let s = crate::testutil::sample_state();
+        bui_schema::render::nft::ruleset(&s.node.ports, s.system.hy2_resi_compat_ports)
+            .lines()
+            .skip(2)
+            .map(|l| l.replace("counter redirect", "counter packets 0 bytes 0 redirect") + "\n")
+            .collect()
+    }
+
     /// 装机用的假机器：公钥在位；`bin/` 下的 xray 被脚本化（脚本键按 tempdir 拼）。
     ///
     /// 环境探测与装完自检也要有得可探，否则每个 install 测试都会被「systemd 缺失」
@@ -1417,12 +1428,20 @@ mod tests {
             ));
             i.listening.insert(
                 crate::sys::Proto::Tcp,
-                std::collections::BTreeSet::from([443, 10001, 10002, 8080]),
+                // 9092 / 10086 是住宅 sing-box 的两个回环面（Clash API + v2ray_api，
+                // 自检的「住宅管理面端口」那一行查它们）
+                std::collections::BTreeSet::from([443, 10001, 10002, 8080, 9092, 10086]),
             );
             i.listening.insert(
                 crate::sys::Proto::Udp,
                 std::collections::BTreeSet::from([10000, 40000]),
             );
+            // 住宅 HY2 的端口跳跃表（自检的「nft 表 inet bui」那一行查它；真机上由
+            // 单元的 `ExecStartPre=-bui nft apply` 与每轮对账落地）
+            i.scripted.push((
+                "nft list table inet bui".into(),
+                CmdOut::success(&nft_listing()),
+            ));
             // 证书已同步（两个 hysteria 的 tls.cert）；缺它时自检等一等再判 SKIP，
             // 见 a_fresh_install_without_a_certificate_yet_still_exits_zero
             i.files.insert(

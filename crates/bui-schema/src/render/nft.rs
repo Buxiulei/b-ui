@@ -23,7 +23,7 @@
 //!    （2026-09-16 裁决）。
 //! 2. **每条规则都带 `counter`，但它是瞬时流计数，不是兼容段的下线判据本体。**
 //!    `flush table` 连具名 counter 对象一起清零，所以开机、`bui nft apply`、每轮对账、
-//!    改端口——每次重放都让计数从 0 重新开始（watchdog 每 60 秒那处自愈重放 **T12 起**才有）；
+//!    watchdog 每 60 秒那处自愈重放、改端口——每次重放都让计数从 0 重新开始；
 //!    nat 链的 counter 又只计每条 conntrack 流的首包
 //!    （`man nft`：「Only the first packet of a connection …」），量纲是流数而非包数。判据因此
 //!    归持久层：守护进程在每次重放**之前**先读一次活计数、增量累加进 `runtime.json`

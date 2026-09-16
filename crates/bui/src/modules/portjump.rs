@@ -1,6 +1,7 @@
 //! 「本实例」的端口跳跃孤儿 NAT 规则清理（iptables 的链 + nft 的表）：
-//! `bui hy2-prestart <config>` 的全部逻辑，同时被每个 hysteria 单元的 `ExecStartPre=-`
-//! 与 watchdog 的自愈分支调用。
+//! `bui hy2-prestart <config>` 的全部逻辑，同时被**直连** hysteria 单元
+//! （`hysteria-server`）的 `ExecStartPre=-` 与 watchdog 的自愈分支调用（4.1 起住宅换成
+//! sing-box，它不建任何 NAT 规则、也就没有孤儿链可清，那一侧改挂 `bui nft apply`）。
 //!
 //! ## 为什么需要它
 //!
@@ -366,8 +367,9 @@ fn cleanup_with(host: &dyn Host, config: &Path, backend: Option<&str>) -> Vec<St
 /// 4.0 的按槽住宅实例（`hysteria-residential[-<i>]`，apernet）留下的端口跳跃 NAT 规则：
 /// 对**每份仍在盘上**的 `config-residential[-<i>].yaml` 各调一次 [`cleanup`]。
 ///
-/// 4.1 之后**没有任何别的路径再清它们**（住宅 prestart 换成 `bui nft apply`、T12 的
-/// `HY2_CONFIGS` 只留直连、`import_v3` 的前缀清理已在 `6dc2f90` 删掉），而残留的
+/// 4.1 之后**没有任何别的路径再清它们**（住宅 prestart 换成 `bui nft apply`、
+/// `crate::modules::watchdog::HY2_CONFIGS` 只留直连、`import_v3` 的前缀清理已在
+/// `6dc2f90` 删掉），而残留的
 /// `4xxxx-4yyyy → :4000i`（rick 是 iptables 链、tizi 是 nft 表）与我们的 `inet bui`
 /// 同挂 nat priority **-100**：先注册者先做 NAT ⇒ 那一片跳跃端口被送到**已经没人监听**的
 /// `:4000i`，正是 spec §1.1 里「每 30 秒一次的周期性静默丢包」的形状。
@@ -401,24 +403,22 @@ pub struct InstanceRunning(pub String);
 /// `activating` 上，多认一个状态就会拦下正常启动（见模块文档）。
 pub const ACTIVE_STATE: &str = "active";
 
-/// 配置路径 → 它那个受管单元名。直连与槽 0 复用 [`crate::modules::watchdog::HY2_CONFIGS`]
-/// 那份 (单元, 配置) 表；槽 1.. 的序号合法性（十进制规范写法 + 范围）一律交给
-/// [`crate::reconcile::is_managed_unit`] 判，不另造一套解析。
+/// 配置路径 → 它那个受管单元名，来源只有 [`crate::modules::watchdog::HY2_CONFIGS`]
+/// 那份 (单元, 配置) 表。
+///
+/// **4.1 起那张表只剩直连一项**，于是全部 `config-residential*.yaml` 都推不出单元名：
+/// 带序号的实例进了 `LEGACY_UNITS`（`is_managed_unit` 对它们恒为 false），不带序号的那份
+/// 配置随住宅换 sing-box 一起被对账删掉。所以原先那条「`config-residential-<i>.yaml` →
+/// `hysteria-residential-<i>`」的分支已经不可达，一并收掉 —— 那些实例都停了，
+/// 它们的孤儿规则由 [`cleanup_legacy_residential`] 在对账里直接清，护栏不必再认它们。
 ///
 /// 认不出来 → `None`，调用方**放行**：推导失败绝不能成为拒绝启动的理由。
 pub fn unit_for_config(config: &Path) -> Option<String> {
     let file = config.file_name()?.to_str()?;
-    if let Some((unit, _)) = crate::modules::watchdog::HY2_CONFIGS
+    crate::modules::watchdog::HY2_CONFIGS
         .iter()
         .find(|(_, cfg)| *cfg == file)
-    {
-        return Some((*unit).to_string());
-    }
-    let index = file
-        .strip_prefix("config-residential-")?
-        .strip_suffix(".yaml")?;
-    let unit = format!("hysteria-residential-{index}");
-    crate::reconcile::is_managed_unit(&unit).then_some(unit)
+        .map(|(unit, _)| (*unit).to_string())
 }
 
 /// 这份配置的实例此刻是不是 [`ACTIVE_STATE`]：是则返回单元名（调用方据此拒绝）。
@@ -429,7 +429,8 @@ fn active_unit(host: &dyn Host, config: &Path) -> Option<String> {
     (state.trim() == ACTIVE_STATE).then_some(unit)
 }
 
-/// `bui hy2-prestart <config> [--force]`：两个 hysteria 单元的 `ExecStartPre=-`。
+/// `bui hy2-prestart <config> [--force]`：直连 hysteria 单元（`hysteria-server`）的
+/// `ExecStartPre=-`。
 /// 清理本身**永远退 0**——失败绝不能阻塞内核启动（单元里的 `-` 前缀是第二道保险）。
 ///
 /// 唯一的例外是护栏（模块文档「运行中的实例」）：该实例的 `ActiveState` 恰为
@@ -1062,30 +1063,41 @@ table ip6 hysteria_4d4d4d4d
         });
     }
 
-    /// 已清掉住宅实例那条链的标志（本实例 base 40000）。
+    /// 已清掉这份 `listen:` 那条链的标志（本实例 base 40000）。
     const RESI_CLEANED: &str = "run:iptables -t nat -X HYSTERIA-PR-1111aaaa";
 
-    /// 配置路径 → **受管**单元名：只认 watchdog 那份 (单元, 配置) 表里的名字。
-    /// 4.1 起带序号的住宅实例进了 `LEGACY_UNITS`，`is_managed_unit` 对它们返回 false ⇒
-    /// `config-residential-<i>.yaml` 推不出单元名、一律 `None` = 放行 —— 正是想要的：
-    /// 那些实例已经停了，它们的孤儿规则由 `cleanup_legacy_residential` 直接清。
+    /// 同 [`host_with_both_tables`]，但那份 `listen:` 行落在**直连**的 `config.yaml` 上：
+    /// 4.1 起护栏（[`run`]）只认得出直连这一份配置的单元名（[`unit_for_config`]），
+    /// 住宅那份已随 sing-box 化退役。端口值沿用同一份夹具 —— 护栏与端口值无关。
+    fn host_for_the_guardrail() -> FakeHost {
+        let h = host_with_both_tables();
+        h.with(|i| {
+            i.files.insert(
+                "/opt/b-ui/config.yaml".into(),
+                (resi_config().as_bytes().to_vec(), 0o600),
+            );
+        });
+        h
+    }
+
+    /// 配置路径 → **受管**单元名：只认 watchdog 那份 (单元, 配置) 表里的名字，4.1 起
+    /// 那张表只剩直连一项。于是**全部** `config-residential*.yaml` 都推不出单元名、
+    /// 一律 `None` = 放行 —— 正是想要的：带序号的实例进了 `LEGACY_UNITS`、不带序号那份
+    /// 配置已被对账删掉，它们的孤儿规则由 `cleanup_legacy_residential` 直接清，
+    /// 而 4.1 的住宅单元（sing-box）根本不建 NAT 规则，没有可保护的现役规则。
     #[test]
     fn the_unit_name_is_derived_from_the_config_file_name() {
-        for (cfg, unit) in [
-            ("/opt/b-ui/config.yaml", "hysteria-server"),
-            ("/opt/b-ui/config-residential.yaml", "hysteria-residential"),
-        ] {
-            assert_eq!(
-                unit_for_config(Path::new(cfg)).as_deref(),
-                Some(unit),
-                "{cfg}"
-            );
-        }
-        // 推不出来 → None（放行）：不是 hysteria 的配置、4.0 的按槽配置（单元已退役）、
-        // 槽 0 只认不带序号的写法、非规范序号与越界序号都不认
+        assert_eq!(
+            unit_for_config(Path::new("/opt/b-ui/config.yaml")).as_deref(),
+            Some("hysteria-server")
+        );
+        // 推不出来 → None（放行）：不是 hysteria 的配置、4.0 的住宅配置（单元已退役或换内核）、
+        // 非规范序号与越界序号都不认
         for cfg in [
             "/opt/b-ui/xray-config.json",
             "/opt/b-ui/singbox-relay.json",
+            "/opt/b-ui/hy2-residential.json",
+            "/opt/b-ui/config-residential.yaml",
             "/opt/b-ui/config-residential-3.yaml",
             "/opt/b-ui/config-residential-0.yaml",
             "/opt/b-ui/config-residential-01.yaml",
@@ -1105,15 +1117,9 @@ table ip6 hysteria_4d4d4d4d
     /// 端口跳跃当即失效、直到该实例下次重启才恢复。
     #[test]
     fn a_running_instance_is_refused_and_nothing_is_cleaned() {
-        let h = host_with_both_tables();
-        set_state(&h, "hysteria-residential", "active");
-        let err = run(
-            &h,
-            Path::new("/opt/b-ui/config-residential.yaml"),
-            false,
-            false,
-        )
-        .unwrap_err();
+        let h = host_for_the_guardrail();
+        set_state(&h, "hysteria-server", "active");
+        let err = run(&h, Path::new("/opt/b-ui/config.yaml"), false, false).unwrap_err();
         assert!(err.is::<InstanceRunning>(), "main 靠这个类型给退出码 2");
         let msg = err.to_string();
         assert!(msg.contains("正在运行"), "{msg}");
@@ -1128,15 +1134,9 @@ table ip6 hysteria_4d4d4d4d
     /// `--force`：运维明知后果（实例卡在 failed 又想立刻清）时照原样执行。
     #[test]
     fn force_cleans_even_while_the_instance_is_running() {
-        let h = host_with_both_tables();
-        set_state(&h, "hysteria-residential", "active");
-        assert!(run(
-            &h,
-            Path::new("/opt/b-ui/config-residential.yaml"),
-            true,
-            false
-        )
-        .is_ok());
+        let h = host_for_the_guardrail();
+        set_state(&h, "hysteria-server", "active");
+        assert!(run(&h, Path::new("/opt/b-ui/config.yaml"), true, false).is_ok());
         assert!(h.ops().iter().any(|o| o == RESI_CLEANED), "{:?}", h.ops());
     }
 
@@ -1158,18 +1158,12 @@ table ip6 hysteria_4d4d4d4d
             Some(""), // `systemctl show` 给空值
             None,     // 查不到这个单元 / 查询失败
         ] {
-            let h = host_with_both_tables();
+            let h = host_for_the_guardrail();
             if let Some(s) = state {
-                set_state(&h, "hysteria-residential", s);
+                set_state(&h, "hysteria-server", s);
             }
             assert!(
-                run(
-                    &h,
-                    Path::new("/opt/b-ui/config-residential.yaml"),
-                    false,
-                    false
-                )
-                .is_ok(),
+                run(&h, Path::new("/opt/b-ui/config.yaml"), false, false).is_ok(),
                 "{state:?}"
             );
             assert!(
@@ -1180,12 +1174,12 @@ table ip6 hysteria_4d4d4d4d
         }
     }
 
-    /// 推不出单元名（陌生的配置文件名）⇒ 放行，哪怕住宅单元此刻正是 `active`：
+    /// 推不出单元名（陌生的配置文件名）⇒ 放行，哪怕直连单元此刻正是 `active`：
     /// 推导失败绝不能成为拒绝启动的理由。
     #[test]
     fn a_config_whose_unit_cannot_be_derived_is_let_through() {
-        let h = host_with_both_tables();
-        set_state(&h, "hysteria-residential", "active");
+        let h = host_for_the_guardrail();
+        set_state(&h, "hysteria-server", "active");
         h.with(|i| {
             i.files.insert(
                 "/opt/b-ui/hy2-extra.yaml".into(),
@@ -1223,15 +1217,9 @@ table ip6 hysteria_4d4d4d4d
     /// 否则「空流水」可能只是假机器不记账、断言恒绿。
     #[test]
     fn a_systemd_spawned_run_cleans_without_asking_systemd() {
-        let h = host_with_both_tables();
-        set_state(&h, "hysteria-residential", "active");
-        assert!(run(
-            &h,
-            Path::new("/opt/b-ui/config-residential.yaml"),
-            false,
-            true
-        )
-        .is_ok());
+        let h = host_for_the_guardrail();
+        set_state(&h, "hysteria-server", "active");
+        assert!(run(&h, Path::new("/opt/b-ui/config.yaml"), false, true).is_ok());
         assert!(h.ops().iter().any(|o| o == RESI_CLEANED), "{:?}", h.ops());
         assert_eq!(
             h.unit_prop_reads(),
@@ -1240,19 +1228,13 @@ table ip6 hysteria_4d4d4d4d
         );
 
         // 阳性对照：同一份播种，手动调用（环境里没有 INVOCATION_ID）
-        let m = host_with_both_tables();
-        set_state(&m, "hysteria-residential", "active");
-        assert!(run(
-            &m,
-            Path::new("/opt/b-ui/config-residential.yaml"),
-            false,
-            false
-        )
-        .is_err());
+        let m = host_for_the_guardrail();
+        set_state(&m, "hysteria-server", "active");
+        assert!(run(&m, Path::new("/opt/b-ui/config.yaml"), false, false).is_err());
         assert_eq!(
             m.unit_prop_reads(),
             vec![(
-                "hysteria-residential.service".to_string(),
+                "hysteria-server.service".to_string(),
                 "ActiveState".to_string()
             )],
             "手动调用恰好查一次 ActiveState"
@@ -1329,16 +1311,10 @@ table ip6 hysteria_4d4d4d4d
     #[test]
     fn force_cleans_under_both_spawn_paths() {
         for spawned in [false, true] {
-            let h = host_with_both_tables();
-            set_state(&h, "hysteria-residential", "active");
+            let h = host_for_the_guardrail();
+            set_state(&h, "hysteria-server", "active");
             assert!(
-                run(
-                    &h,
-                    Path::new("/opt/b-ui/config-residential.yaml"),
-                    true,
-                    spawned
-                )
-                .is_ok(),
+                run(&h, Path::new("/opt/b-ui/config.yaml"), true, spawned).is_ok(),
                 "{spawned}"
             );
             assert!(

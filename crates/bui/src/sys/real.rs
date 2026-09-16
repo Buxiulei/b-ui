@@ -184,8 +184,7 @@ impl Host for RealHost {
 
     fn run(&self, program: &str, args: &[&str]) -> Result<CmdOut> {
         // 不把 args 写进日志：域名无妨，但凭据绝不能进 journal（凭据只经 stdin）。
-        let out = std::process::Command::new(program)
-            .args(args)
+        let out = command(program, args)
             .output()
             .with_context(|| format!("执行 {program} 失败"))?;
         Ok(CmdOut {
@@ -198,8 +197,7 @@ impl Host for RealHost {
     fn run_stdin(&self, program: &str, args: &[&str], stdin: &str) -> Result<CmdOut> {
         use std::io::Write;
         // 同样不把 args 与 stdin 写进日志：stdin 里可能是凭据（规则集不是，但口径统一）。
-        let mut child = std::process::Command::new(program)
-            .args(args)
+        let mut child = command(program, args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -360,6 +358,18 @@ impl Host for RealHost {
     }
 }
 
+/// 外部命令一律经这里构造，好把 **locale 钉死**：错误文案既是判据
+/// （`nft list table` 这次非零是「表不在」还是「读不到」——
+/// [`crate::modules::watchdog::check_nft`]）又是事件正文里给人看的原文，而 glibc 的
+/// strerror 会跟着 systemd manager 继承来的 `LANG` 翻译（中文 VPS 上
+/// `localectl set-locale LANG=zh_CN.UTF-8` 很常见）。`LANGUAGE` 也要钉：它优先于 `LC_ALL`
+/// 决定消息目录。
+fn command(program: &str, args: &[&str]) -> std::process::Command {
+    let mut c = std::process::Command::new(program);
+    c.args(args).env("LC_ALL", "C").env("LANGUAGE", "C");
+    c
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,6 +422,28 @@ mod tests {
             );
         }
         assert_eq!(h.file_sha256(&d.path().join("nope")).unwrap(), None);
+    }
+
+    /// 子进程的 locale 被钉死成 `C`（`run` 与 `run_stdin` 两条路都要）：外部命令的错误
+    /// 文案既是判据（`nft list table` 这次非零是「表不在」还是「读不到」）又是事件正文里
+    /// 的原文，跟着主机的 `LANG` 翻译就会被认错——中文 VPS 上 ENOENT 是「没有那个文件
+    /// 或目录」，一个英文串都不含。
+    #[test]
+    fn external_commands_run_under_a_pinned_c_locale() {
+        let h = RealHost::new();
+        let out = h
+            .run("sh", &["-c", r#"printf '%s|%s' "$LC_ALL" "$LANGUAGE""#])
+            .unwrap();
+        assert_eq!(out.stdout, "C|C", "run 没把 locale 钉住");
+        // stdin 那条路同样钉住，且载荷照旧送达
+        let out = h
+            .run_stdin(
+                "sh",
+                &["-c", r#"printf '%s|%s|' "$LC_ALL" "$LANGUAGE"; cat"#],
+                "规则集",
+            )
+            .unwrap();
+        assert_eq!(out.stdout, "C|C|规则集", "run_stdin 没把 locale 钉住");
     }
 
     #[test]

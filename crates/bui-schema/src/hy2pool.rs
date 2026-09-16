@@ -197,8 +197,9 @@ fn assign_pending(s: &mut State, pending: &mut Vec<Uuid>, now: OffsetDateTime) -
     before - pending.len()
 }
 
-/// 「有住宅权益且开 hysteria2」—— 池容量、迁移与门位收敛共用的判据。
-fn is_resi_hy2(u: &User) -> bool {
+/// 「有住宅权益且开 hysteria2」—— 池容量、迁移、门位收敛与装完自检共用的判据。
+/// 权益被撤掉的持凭据用户**不**满足它：他的门本来就该停在 `deny`。
+pub fn is_resi_hy2(u: &User) -> bool {
     u.entitlements.residential.is_some() && u.entitlements.protocols.contains(&Protocol::Hysteria2)
 }
 

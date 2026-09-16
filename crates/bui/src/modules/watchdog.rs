@@ -1,6 +1,11 @@
 //! 进程内 watchdog：60 秒一轮，探四个内核的「单元存活 + 监听端口」，只治「进程还在、
 //! 端口却不 listen」这一类僵死，重启带 1/2/4 分钟退避（spec §3.4）。
 //!
+//! 4.1 起同一轮里还做两件与住宅 HY2 跳跃有关的事（[`check_nft`]）：**校验并重放
+//! `table inet bui`**（三处幂等重放的第三处），以及在每次重放**之前**把兼容段的活 counter
+//! 增量累加进 `runtime.json`（[`CompatHits`]，spec §2.4 的裁决——活 counter 会被
+//! `flush table` 清零，下线判据只能读持久值）。
+//!
 //! 移植参照 `server/core.sh:1050-1130`（`setup_hy2_watchdog`）。v4 的变化（审计 §3.1/§3.2
 //! 与 web-C12）：不再生成脚本、不再建 timer、不再用 `/tmp/hy2-watchdog-*` 计数文件（面板还
 //! 在读那个文件），改成守护进程里的内存状态机 + `runtime.json` 持久化；覆盖面从两个
@@ -28,13 +33,16 @@ pub const BACKOFF_MINUTES: [i64; 3] = [1, 2, 4];
 /// 面板 `GET /api/hy2/watchdog/status` 原样透出这两个字段。
 pub const RUN_KEY: &str = "watchdog_run";
 
-/// 两个 hysteria 实例与各自的配置文件名。端口跳跃的 nat 链按**实例**定位（base 端口 +
+/// 会自己建端口跳跃 nat 链的 hysteria 实例与它的配置文件名。链按**实例**定位（base 端口 +
 /// 跳跃区间都在这份配置的 `listen:` 行里），所以自愈时要把对应的那一份传给
 /// [`crate::modules::portjump::cleanup`]。
-pub const HY2_CONFIGS: [(&str, &str); 2] = [
-    ("hysteria-server", "config.yaml"),
-    ("hysteria-residential", "config-residential.yaml"),
-];
+///
+/// **4.1 起只剩直连一项**：住宅换成 sing-box（一个 `:40000` 入站 + `inet bui` 表 REDIRECT
+/// 整段跳跃），它不建任何 NAT 规则、也就没有孤儿链可清，而 4.0 那份
+/// `config-residential.yaml` 已被对账删掉。住宅那一侧的等价自愈是 [`check_nft`]
+/// （表被人删了 / 规则不符就整表重放）。4.0 遗留的按槽孤儿规则由
+/// [`crate::modules::portjump::cleanup_legacy_residential`] 在对账里清。
+pub const HY2_CONFIGS: [(&str, &str); 1] = [("hysteria-server", "config.yaml")];
 
 /// 崩溃循环的判据：日志里的这句话（真机实录「ip6tables: Chain already exists」）。
 pub const CHAIN_MARKER: &str = "Chain already exists";
@@ -49,6 +57,454 @@ pub const HEAL_KEY: &str = "hy2_chain_heal";
 /// 同一个单元两次自愈之间的最短间隔：清完链还起不来说明另有原因，
 /// 不能每 60 秒无脑 restart 一次（那就是自己制造崩溃循环）。
 pub const HEAL_COOLDOWN_MINUTES: i64 = 10;
+
+/// nft 表校验的结果落 `runtime.extra` 的键：`{ "<桶>": ChainHeal }`（与 [`HEAL_KEY`] 同款的
+/// 累计次数 + 最近一次的时刻与做过的事）。住宅 HY2 的跳跃只有**一张**表，但冷却按
+/// [裁决分桶][nft_bucket] —— 否则「已重放」那条 Warn 会把紧接着的「重放失败」Error 吞掉
+/// 10 分钟。
+pub const NFT_HEAL_KEY: &str = "nft_table_heal";
+
+/// 表不在 / 规则不符（已重放，或重放失败）的事件签名。
+pub const NFT_TABLE_MISSING_SIG: &str = "nft_table_missing";
+
+/// PATH 上没有 `nft` 的事件签名（**Error 级**）。
+pub const NFT_MISSING_SIG: &str = "nft_missing";
+
+/// `nft list table` 失败、但失败原因**不是**「表不在」（权限、并发事务、包装脚本）的事件签名。
+/// 这一轮既不重放也不采样：表很可能好着，冒充「表被删了」只会每 60 秒无谓重放一次，
+/// 还会把兼容段的活计数按 `None` 吞掉、把 30 天门禁推向「零命中」的误判。
+pub const NFT_UNREADABLE_SIG: &str = "nft_list_failed";
+
+/// 整表重放这个动作的 id（事件的 `action` 字段）。
+const NFT_REPLAY_ACTION: &str = "replay_nft_table";
+
+/// 只能告警、无法处置时的动作 id（与哨兵的 `Action::Alert` 同字面）。
+const NFT_ALERT_ACTION: &str = "alert";
+
+/// 兼容段累计命中数落 `runtime.extra` 的键（[`CompatHits`]）。
+pub const COMPAT_HITS_KEY: &str = "hy2_resi_compat_hits";
+
+/// 一轮 nft 表校验的裁决。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NftVerdict {
+    /// 表在位、规则与期望等价 —— 什么都不做
+    Ok,
+    /// 表不在或规则不符 ⇒ 已整表重放（一个 `nft -f -` 事务）
+    Replayed,
+    /// 该重放却重放失败（`nft -f` 非零，例如内核 < 5.2）：跳跃仍然不通
+    Missing,
+    /// PATH 上没有 `nft`：一步都做不了，只能告 Error
+    NoBinary,
+    /// `nft list table` 失败，但原因**不是**「表不在」（权限 / 并发事务 / 包装脚本）：
+    /// 表可能好着，这一轮既不重放也不采样，只照抄原文告 Warn
+    Unreadable,
+}
+
+/// 一轮 nft 表校验：裁决 + **重放之前**采到的兼容段活计数 + 重放失败时的原文。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NftRound {
+    pub verdict: NftVerdict,
+    /// 兼容段两条规则的 `counter packets` 之和。表不在、兼容段关着、或回显里没有 counter
+    /// ⇒ `None`（这一轮不动累计值）。**必须在重放之前采**：`nft -f` 的第一句是
+    /// `flush table`，counter 随之归零（spec §2.4，2026-09-16 裁决）。
+    pub compat_live: Option<u64>,
+    /// 重放失败时 `nft` 的第一行错误（进事件正文，运维照它查内核版本）
+    pub error: Option<String>,
+    /// 回显里数出来的 redirect 条数（表不在 ⇒ 0）。进事件正文：判成「规则不符」却又
+    /// 恰好是期望条数时，故障就不是「表被删了」而是回显解析对不上
+    /// ——那会每 60 秒重放一次，得让 `bui incidents` 一眼看出来。
+    pub seen_rules: usize,
+}
+
+/// `nft list table` 的回显（或渲染器的规则集）里每条 redirect 的 `(链, dport, 目标端口)`。
+///
+/// **不逐字比 `nft` 的回显**：`nft list` 会重排空白、把 `priority -100` 打成
+/// `priority dstnat`、给每条规则插一段 `counter packets N bytes N`，逐字比必然假 FAIL。
+/// 链名进 key 是为了守住「prerouting + output 双 hook」那条硬要求（少一条链时条数就不对，
+/// 而只挂 prerouting 时本机发往自身公网 IP 的包不过 prerouting、跳跃对本机自测直接失效）。
+pub fn redirect_rules(text: &str) -> Vec<(String, String, String)> {
+    let mut chain = String::new();
+    let mut out = Vec::new();
+    for line in text.lines().map(str::trim) {
+        if let Some(rest) = line.strip_prefix("chain ") {
+            chain = rest.trim_end_matches('{').trim().to_string();
+            continue;
+        }
+        let Some((head, tail)) = line.split_once("redirect to :") else {
+            continue;
+        };
+        let w: Vec<&str> = head.split_whitespace().collect();
+        if w.first() != Some(&"udp") {
+            continue;
+        }
+        let Some(dport) = w
+            .iter()
+            .position(|x| *x == "dport")
+            .and_then(|i| w.get(i + 1))
+        else {
+            continue;
+        };
+        let Some(target) = tail.split_whitespace().next() else {
+            continue;
+        };
+        out.push((chain.clone(), (*dport).to_string(), target.to_string()));
+    }
+    out.sort();
+    out
+}
+
+/// 兼容段那两条规则的 `counter packets N` 之和（`nft list table` 的回显）。
+/// 兼容段关着、表不在、或回显里找不到那两条 ⇒ `None`。
+///
+/// 量纲是**流数**而不是包数：nat 链的 counter 只计每条 conntrack 流的首包
+/// （`man nft`：「Only the first packet of a connection …」）。
+pub fn compat_counter(text: &str, p: &bui_schema::model::Ports) -> Option<u64> {
+    let (a, b) = bui_schema::render::nft::compat_range(p);
+    let want = format!("{a}-{b}");
+    let mut total: Option<u64> = None;
+    for line in text.lines().map(str::trim) {
+        let w: Vec<&str> = line.split_whitespace().collect();
+        if w.first() != Some(&"udp") || !line.contains("redirect to :") {
+            continue;
+        }
+        let dport = w
+            .iter()
+            .position(|x| *x == "dport")
+            .and_then(|i| w.get(i + 1))
+            .copied();
+        if dport != Some(want.as_str()) {
+            continue;
+        }
+        let n = w
+            .iter()
+            .position(|x| *x == "packets")
+            .and_then(|i| w.get(i + 1))
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        total = Some(total.unwrap_or(0) + n);
+    }
+    total
+}
+
+/// 住宅 HY2 端口跳跃那张 `inet bui` 表的每轮（60 秒）校验与重放（spec §2.4）。
+///
+/// 三处幂等重放之一（另两处：住宅单元的 `ExecStartPre=-{bin}/bui nft apply` 与每轮对账）。
+/// 判据是[规范化后的规则集][redirect_rules]，**不是** `nft` 的回显文本。
+///
+/// 重放**不带冷却**（整表替换是幂等的、不重启任何单元），冷却只管事件与记录
+/// ——表被人删掉时每 60 秒补回来，比「10 分钟内不再管」正确得多：这张表不在就等于
+/// 住宅 HY2 的整段跳跃不通。
+pub fn check_nft(host: &dyn Host, s: &State) -> NftRound {
+    use bui_schema::render::nft;
+    if !host.which("nft") {
+        return NftRound {
+            verdict: NftVerdict::NoBinary,
+            compat_live: None,
+            error: None,
+            seen_rules: 0,
+        };
+    }
+    let want = nft::ruleset(&s.node.ports, s.system.hy2_resi_compat_ports);
+    // `nft list table` 失败分两种：**表不在**（重放它）与**读不到**（权限 / 并发事务 /
+    // 包装脚本 —— 表可能好着，这一轮什么都不做）。后者冒充前者会每 60 秒无谓重放一次，
+    // 还会让 `compat_live` 恒为 `None` ⇒ 累计命中永不涨 ⇒ 30 天门禁误判成「零命中」；
+    // 前者冒充后者更贵（整表自愈永久失效），所以 [`table_missing`] 的默认方向是「表不在」。
+    let listed = match host.run("nft", &["list", "table", nft::FAMILY, nft::NAME]) {
+        Ok(o) if o.ok() => Some(o.stdout),
+        Ok(o) if table_missing(&o) => None,
+        Ok(o) => {
+            return NftRound {
+                verdict: NftVerdict::Unreadable,
+                compat_live: None,
+                error: Some(first_line(&o)),
+                seen_rules: 0,
+            }
+        }
+        Err(e) => {
+            return NftRound {
+                verdict: NftVerdict::Unreadable,
+                compat_live: None,
+                error: Some(e.to_string()),
+                seen_rules: 0,
+            }
+        }
+    };
+    // 采样排在重放之前（`nft -f` 先 flush table，counter 归零）
+    let compat_live = listed
+        .as_deref()
+        .and_then(|t| compat_counter(t, &s.node.ports));
+    let got = listed.as_deref().map(redirect_rules).unwrap_or_default();
+    let seen_rules = got.len();
+    // `want` 恒有 2 或 4 条 redirect，所以「表不在」（`got` 为空）永远落不进这一支
+    if got == redirect_rules(&want) {
+        return NftRound {
+            verdict: NftVerdict::Ok,
+            compat_live,
+            error: None,
+            seen_rules,
+        };
+    }
+    let (verdict, error) = match host.run_stdin("nft", &["-f", "-"], &want) {
+        Ok(o) if o.ok() => (NftVerdict::Replayed, None),
+        Ok(o) => (NftVerdict::Missing, Some(first_line(&o))),
+        Err(e) => (NftVerdict::Missing, Some(e.to_string())),
+    };
+    NftRound {
+        verdict,
+        compat_live,
+        error,
+        seen_rules,
+    }
+}
+
+/// `nft list table inet bui` 这次非零到底是不是「表不在」（⇒ 重放）。
+///
+/// **判据不许拿 glibc 的 strerror 文案当唯一凭据**：真机原文是 nft 自己的英文
+/// `Error: ` 加 strerror(errno)，后半句跟着 locale 翻译（`LANG=zh_CN.UTF-8` 的机器上
+/// ENOENT 是「没有那个文件或目录」），而守护进程的 locale 不由我们定——systemd manager
+/// 继承 `/etc/locale.conf`，`b-ui.service` 只设 `RUST_LOG`。
+/// 所以默认方向是**当表不在**：认错了只多重放一次（整表替换幂等、不重启任何单元），
+/// 认反了则整表自愈永久失效 —— 住宅 HY2 的整段跳跃一直不通，只剩每 10 分钟一条 Warn。
+/// 只把 [`UNREADABLE_MARKERS`] 认得出的「表可能好着、只是这一轮读不到」挑走；真机上那些
+/// 文案也是英文，因为 [`crate::sys::real`] 给每个子进程钉了 `LC_ALL=C`。
+fn table_missing(out: &crate::sys::CmdOut) -> bool {
+    let text = if out.stderr.trim().is_empty() {
+        out.stdout.trim()
+    } else {
+        out.stderr.trim()
+    };
+    !UNREADABLE_MARKERS.iter().any(|m| text.contains(m))
+}
+
+/// 「表可能好着，只是这一轮读不到」的回显标记：权限不足、内核对象被别的事务占着、
+/// nft 自己的缓存初始化失败。认不出来的一律走 [`table_missing`] 的默认方向。
+const UNREADABLE_MARKERS: [&str; 4] = [
+    "Operation not permitted",
+    "Permission denied",
+    "Device or resource busy",
+    "cache initialization failed",
+];
+
+/// 命令输出的第一行（stderr 优先）：进事件正文的那一句。
+fn first_line(out: &crate::sys::CmdOut) -> String {
+    let s = if out.stderr.trim().is_empty() {
+        &out.stdout
+    } else {
+        &out.stderr
+    };
+    s.trim()
+        .lines()
+        .next()
+        .unwrap_or("（没有输出）")
+        .to_string()
+}
+
+/// 一种裁决一个冷却桶（[`NFT_HEAL_KEY`] 里的键，与 [`HEAL_KEY`] 按单元分桶同款）。
+/// [`NftVerdict::Ok`] 没有桶。
+///
+/// **必须分桶**：四种裁决共用一条记录时，10 分钟窗口内的等级升级会被吞掉 —— 先记了一条
+/// 「已整表重放」（Warn），紧接着 `nft -f` 开始失败（Error，正文是「跳跃段不通」）时那条
+/// Error 会被冷却挡掉，`bui incidents` 在这 10 分钟里只看得到那句让人放心的 Warn。
+pub fn nft_bucket(v: NftVerdict) -> Option<&'static str> {
+    match v {
+        NftVerdict::Ok => None,
+        NftVerdict::Replayed => Some("replayed"),
+        NftVerdict::Missing => Some("replay_failed"),
+        NftVerdict::NoBinary => Some("no_binary"),
+        NftVerdict::Unreadable => Some("unreadable"),
+    }
+}
+
+/// nft 校验要记的记录与事件（纯函数）：[`NftVerdict::Ok`] 什么都不记，其余四种各记一条，
+/// 各按自己那个[桶][nft_bucket]吃 [`HEAL_COOLDOWN_MINUTES`] 的冷却（同一件事 10 分钟内
+/// 不重复刷，换一件事立刻出）。返回值第一项就是桶名（调用方据它写回 [`NFT_HEAL_KEY`]）。
+///
+/// 量级按真实后果写：`nft` 不在 ⇒ 带 `mport` 的客户端**只往跳跃段发、从不发 `:40000`**，
+/// 所以那不是「跳跃失效」而是住宅全断。
+pub fn nft_event(
+    round: &NftRound,
+    s: &State,
+    heals: &std::collections::BTreeMap<String, ChainHeal>,
+    now: OffsetDateTime,
+) -> Option<(
+    &'static str,
+    ChainHeal,
+    crate::modules::sentinel::incidents::Incident,
+)> {
+    use crate::modules::sentinel::incidents::{Incident, Level};
+    let table = bui_schema::render::nft::TABLE;
+    let p = &s.node.ports;
+    let (hop_a, hop_b) = p.hy2_resi_hop;
+    let want_rules = bui_schema::render::nft::rule_count(s.system.hy2_resi_compat_ports);
+    let (signature, action, level, result) = match round.verdict {
+        NftVerdict::Ok => return None,
+        NftVerdict::NoBinary => (
+            NFT_MISSING_SIG,
+            NFT_ALERT_ACTION,
+            Level::Error,
+            format!(
+                "PATH 上没有 nft：住宅 HY2 跳跃段全部失效 —— 带 mport 的客户端只往 \
+                 {hop_a}-{hop_b} 发、从不发 :{}，等于住宅全断。请装 nftables 包（bui 不装系统包）",
+                p.hy2_resi
+            ),
+        ),
+        NftVerdict::Replayed => (
+            NFT_TABLE_MISSING_SIG,
+            NFT_REPLAY_ACTION,
+            Level::Warn,
+            format!(
+                "table {table} 不在或规则不符（期望 {want_rules} 条 redirect，实到 {}），\
+                 已整表重放（{hop_a}-{hop_b} → :{}）",
+                round.seen_rules, p.hy2_resi
+            ),
+        ),
+        NftVerdict::Missing => (
+            NFT_TABLE_MISSING_SIG,
+            NFT_REPLAY_ACTION,
+            Level::Error,
+            format!(
+                "table {table} 重放失败：{} —— 住宅 HY2 跳跃段不通（{hop_a}-{hop_b} 没人接，\
+                 盘上实到 {} 条 redirect）",
+                round.error.as_deref().unwrap_or("（没有输出）"),
+                round.seen_rules
+            ),
+        ),
+        NftVerdict::Unreadable => (
+            NFT_UNREADABLE_SIG,
+            NFT_ALERT_ACTION,
+            Level::Warn,
+            format!(
+                "读不到 table {table}：{} —— 这一轮不重放也不采样（表可能好着，\
+                 照原文查权限 / 并发事务；真是表不在的话下一轮就会重放）",
+                round.error.as_deref().unwrap_or("（没有输出）")
+            ),
+        ),
+    };
+    let bucket = nft_bucket(round.verdict)?;
+    let last = heals.get(bucket);
+    if !should_heal(last.and_then(|h| parse_rfc3339(&h.at)), now) {
+        return None;
+    }
+    let rec = ChainHeal {
+        at: fmt_rfc3339(now),
+        count: last.map(|h| h.count).unwrap_or(0) + 1,
+        done: vec![result.clone()],
+    };
+    let inc = Incident {
+        at: fmt_rfc3339(now),
+        // 这是守护进程自己做的事，不是从某个内核单元的日志里读出来的
+        unit: "b-ui".into(),
+        signature: signature.into(),
+        subject: table.into(),
+        action: action.into(),
+        result,
+        level,
+        sample: None,
+    };
+    Some((bucket, rec, inc))
+}
+
+/// 兼容段（`40001-40007`）的**累计**命中数，落 `runtime.json` 的 [`COMPAT_HITS_KEY`]。
+///
+/// 存在的理由（spec §2.4，2026-09-16 裁决）：nft 的 `counter` 是瞬时流计数，
+/// `render::nft` 每次重放都先 `flush table`，开机 / `bui nft apply` / watchdog 自愈 /
+/// 改端口都把它清回 0。所以守护进程在每次重放**之前**采一次活计数、把增量累加到这里；
+/// `bui status` 的「最近命中 N 次」与 `bui set hy2-resi-compat off` 的下线门禁
+/// （[`CompatHits::idle_for_takedown`]）一律读这份持久值，**绝不读活 counter**。
+/// 误判方向是危险的那一侧：把仍在用的兼容段判成闲置并关掉，全部还没刷订阅的 4.0 住宅
+/// 用户当场断联。
+///
+/// **已知误差（2026-09-17 裁决：接受，不加跨进程协调）**：采样点只有 watchdog 自己这一处
+/// （60 秒一轮，自己重放过的那一轮把比较基准归零，见 [`accumulate`]）。另两处幂等重放
+/// ——住宅单元的 `ExecStartPre=-{bin}/bui nft apply` 与每轮对账的 `ApplyNftTable`——
+/// 没有采样点（`bui nft apply` 连守护进程都不经，读不到 `runtime.json`），它们在两次采样
+/// 之间 flush 过表时那一段增量（最多 60 秒的流数）会丢。有了
+/// [`idle_for_takedown`](CompatHits::idle_for_takedown) 的「`total > 0` 永不自动判闲置」
+/// 之后，漏计不再能把在用的兼容段判成闲置，所以不为它加协调。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompatHits {
+    /// 累计命中（量纲是 conntrack 流数，见 [`compat_counter`]）
+    pub total: u64,
+    /// 上一轮采到的活计数：算增量用。表被 flush 过 ⇒ 活计数变小 ⇒ 按「从 0 重新计」处理
+    pub seen: u64,
+    /// 最近一次 `total` 涨过的时刻（`None` = 从没命中过）
+    pub last_hit_at: Option<String>,
+    /// 开始统计的时刻（第一次采样）——「连续 30 天为 0」的起点
+    pub since: String,
+}
+
+impl CompatHits {
+    /// 「从这一刻起没再命中过」：有过命中就是最近那一次，否则是开始统计的时刻。
+    /// 30 天门禁从它算起（读取侧在 `bui status` / `bui set hy2-resi-compat off`）。
+    pub fn quiet_since(&self) -> &str {
+        self.last_hit_at.as_deref().unwrap_or(&self.since)
+    }
+
+    /// **兼容段可以自动判闲置了吗**（2026-09-17 裁决，T14 的 30 天门禁与
+    /// `bui set hy2-resi-compat off` 的 `--force` 判据都读它）。
+    ///
+    /// 判据是「**一次都没命中过** 且静默满 [`COMPAT_IDLE_DAYS`] 天」——
+    /// `total > 0` 就**永不**自动判闲置。
+    ///
+    /// 为什么不能只看 [`quiet_since`](Self::quiet_since)：兼容段的 counter 是 **nat 链**
+    /// 计数，只计每条 conntrack 流的**首包**（`man nft`：「Only the first packet of a
+    /// connection …」）。一个 24×7 不断线的 4.0 客户端（订阅里是裸 `40000+i`、没有
+    /// `mport`）只在建连那一刻记 1 次，之后几十天一动不动 ⇒ `last_hit_at` 一路变旧 ⇒
+    /// 只看静默时长就会把**正在用**的兼容段判成闲置并关掉，那批还没刷订阅的 4.0 住宅
+    /// 用户当场断联。所以取安全方向：命中过就只能人工 `--force` 下线（T14 打印
+    /// `total` / [`last_hit_at`](Self::last_hit_at) / [`since`](Self::since) 三个值，
+    /// 由人判断）。
+    pub fn idle_for_takedown(&self, now: OffsetDateTime) -> bool {
+        if self.total > 0 {
+            return false;
+        }
+        match parse_rfc3339(self.quiet_since()) {
+            // 起算时刻读不出来（字段被人改坏）⇒ 不判闲置：误判方向是危险的那一侧
+            None => false,
+            Some(t) => now - t >= time::Duration::days(COMPAT_IDLE_DAYS),
+        }
+    }
+}
+
+/// 兼容段自动判闲置要静默多少天（spec §2.4：「连续 30 天为 0」）。
+/// 与 [`CompatHits::idle_for_takedown`] 一起被 T14 的门禁消费。
+pub const COMPAT_IDLE_DAYS: i64 = 30;
+
+/// 取持久化的兼容段命中数（`None` = 还没采过一轮，或字段坏了）。
+pub fn compat_hits(rt: &crate::state::runtime::RuntimeData) -> Option<CompatHits> {
+    rt.extra
+        .get(COMPAT_HITS_KEY)
+        .cloned()
+        .and_then(|v| serde_json::from_value(v).ok())
+}
+
+/// 把这一轮采到的活计数并进累计值（纯函数）。
+///
+/// 活计数比上一轮**小**就是「中间被 flush 过」（别的路径重放、改端口、开机），此时增量按活
+/// 计数本身算——把它当成「从 0 重新计到 live」，既不重复计也不漏计那一段。
+///
+/// `flushed_after` = **这一轮自己重放过**（采样之后 `nft -f` 的第一句 `flush table` 把
+/// counter 清回 0）：此时把 `seen` 记成 0，下一轮的增量就是精确值。少了这一项，
+/// 「flush 之后的新计数在一轮内恰好越过旧值」会漏计（正好等于旧值时连 `last_hit_at`
+/// 都不动），方向正是危险那一侧。
+pub fn accumulate(
+    prev: Option<CompatHits>,
+    live: u64,
+    now: OffsetDateTime,
+    flushed_after: bool,
+) -> CompatHits {
+    let mut h = prev.unwrap_or_else(|| CompatHits {
+        since: fmt_rfc3339(now),
+        ..Default::default()
+    });
+    let delta = if live >= h.seen { live - h.seen } else { live };
+    h.seen = if flushed_after { 0 } else { live };
+    if delta > 0 {
+        h.total += delta;
+        h.last_hit_at = Some(fmt_rfc3339(now));
+    }
+    h
+}
 
 /// http 鉴权连不上的判据（spec §3.2）：`auth.type: http` 下内核每条
 /// 连接都要打一次 `127.0.0.1:AUTH_HTTP_PORT`，守护进程没在听（或应答超时）就是全员登录失败。
@@ -244,8 +700,9 @@ pub fn run_stamp(now: OffsetDateTime) -> serde_json::Value {
     })
 }
 
-/// 跑一轮：先治 hysteria 的端口跳跃孤儿链崩溃循环（[`heal_chain_conflict`]），再读单元状态与
-/// 监听端口（都经 `Host`，时钟也取 `host.now()`），按裁决重启，落 `runtime.json`。
+/// 跑一轮：先治 hysteria 的端口跳跃孤儿链崩溃循环（[`heal_chain_conflict`]），再校验住宅
+/// 跳跃那张 nft 表（[`check_nft`]，顺带采一次兼容段命中数），再读单元状态与监听端口
+/// （都经 `Host`，时钟也取 `host.now()`），按裁决重启，落 `runtime.json`。
 pub async fn check_once(ctx: &DaemonCtx) -> anyhow::Result<Vec<(String, Decision)>> {
     let state = ctx.store.read().await;
     let targets = targets(&state);
@@ -256,10 +713,18 @@ pub async fn check_once(ctx: &DaemonCtx) -> anyhow::Result<Vec<(String, Decision
         .cloned()
         .and_then(|v| serde_json::from_value(v).ok())
         .unwrap_or_default();
+    let mut nft_heals: std::collections::BTreeMap<String, ChainHeal> = rt
+        .extra
+        .get(NFT_HEAL_KEY)
+        .cloned()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
+    let hits_last = compat_hits(&rt);
     let mut records = rt.watchdog;
     let host = ctx.host.clone();
     let paths = ctx.paths.clone();
-    let (decisions, records, heals, now) =
+    let st = state.clone();
+    let (decisions, records, heals, nft, now) =
         tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             let now = host.now();
             // 孤儿链自愈排在监听探测之前：崩溃循环里的实例根本没进程，按端口判只会得出
@@ -277,6 +742,8 @@ pub async fn check_once(ctx: &DaemonCtx) -> anyhow::Result<Vec<(String, Decision
                     rec.done = done;
                 }
             }
+            // 住宅那一侧的自愈：表被人删了 / 规则不符就整表重放（采样在重放之前）
+            let nft = check_nft(&*host, &st);
             let udp = host.listening_ports(Proto::Udp).unwrap_or_default();
             let tcp = host.listening_ports(Proto::Tcp).unwrap_or_default();
             let mut out = Vec::with_capacity(targets.len());
@@ -294,9 +761,21 @@ pub async fn check_once(ctx: &DaemonCtx) -> anyhow::Result<Vec<(String, Decision
                 }
                 out.push((t.unit.clone(), d));
             }
-            Ok((out, records, heals, now))
+            Ok((out, records, heals, nft, now))
         })
         .await??;
+    let nft_record = nft_event(&nft, &state, &nft_heals, now);
+    // 命中数每轮都并一次（不只在重放那一轮）：采样点就是重放之前的那一刻，
+    // 这一轮自己重放过就把 `seen` 归零（`nft -f` 先 flush table），中途被别的路径
+    // flush 过时按「从 0 重新计」处理，见 [`accumulate`]。
+    let hits = nft.compat_live.map(|live| {
+        accumulate(
+            hits_last,
+            live,
+            now,
+            nft.verdict == NftVerdict::Replayed, // 重放失败是原子回滚，表没被 flush
+        )
+    });
     ctx.runtime
         .update(|r| {
             r.watchdog = records;
@@ -305,6 +784,18 @@ pub async fn check_once(ctx: &DaemonCtx) -> anyhow::Result<Vec<(String, Decision
             if !heals.is_empty() {
                 if let Ok(v) = serde_json::to_value(&heals) {
                     r.extra.insert(HEAL_KEY.into(), v);
+                }
+            }
+            if let Some((bucket, rec, inc)) = nft_record {
+                nft_heals.insert(bucket.to_string(), rec);
+                if let Ok(v) = serde_json::to_value(&nft_heals) {
+                    r.extra.insert(NFT_HEAL_KEY.into(), v);
+                }
+                crate::modules::sentinel::incidents::push(r, inc);
+            }
+            if let Some(h) = hits {
+                if let Ok(v) = serde_json::to_value(&h) {
+                    r.extra.insert(COMPAT_HITS_KEY.into(), v);
                 }
             }
         })
@@ -530,25 +1021,29 @@ mod tests {
         ));
     }
 
-    /// 播种真机事故现场（bwg-rick 2026-09-12 20:33 UTC）：`hysteria-residential` 在崩溃循环，
+    /// 播种真机事故现场（bwg-rick 2026-09-12 20:33 UTC）：一个 hysteria 实例在崩溃循环，
     /// journal 里是「ip6tables: Chain already exists」，`ip6tables` 的 nat 表里只剩 OUTPUT
     /// 一条跳转（链本身是空的）。
+    ///
+    /// **4.1 把现场换到直连实例**（`hysteria-server` + `config.yaml`）：住宅换成 sing-box 之后
+    /// 不再自建 NAT 规则、也就没有孤儿链，[`HY2_CONFIGS`] 只剩直连这一项。事故的形状一字不变，
+    /// 只是主角换了 —— 直连的 base 端口是 10000、跳跃段 20000-30000。
     fn crash_looping_host() -> Arc<FakeHost> {
         let host = Arc::new(FakeHost::new());
         host.with(|i| {
-            i.units_active.insert("hysteria-server.service".into());
+            i.units_active.insert("hysteria-residential.service".into());
             i.units_active.insert("xray.service".into());
             i.units_active.insert("b-ui-relay.service".into());
             i.unit_props.insert(
-                ("hysteria-server.service".into(), "ActiveState".into()),
+                ("hysteria-residential.service".into(), "ActiveState".into()),
                 "active".into(),
             );
             i.unit_props.insert(
-                ("hysteria-residential.service".into(), "ActiveState".into()),
+                ("hysteria-server.service".into(), "ActiveState".into()),
                 "failed".into(),
             );
             i.scripted.push((
-                "journalctl -u hysteria-residential".into(),
+                "journalctl -u hysteria-server".into(),
                 crate::sys::CmdOut::success(
                     "hysteria[1234]: invalid config: listen: ip6tables [-w -t nat -N \
                      HYSTERIA-PR-c66a02d9]: exit status 1: ip6tables: Chain already exists\n",
@@ -558,16 +1053,16 @@ mod tests {
             i.scripted.push((
                 "ip6tables -t nat -S".into(),
                 crate::sys::CmdOut::success(
-                    "-N HYSTERIA-PR-c66a02d9\n-A OUTPUT -p udp -m udp --dport 41000:50000 \
+                    "-N HYSTERIA-PR-c66a02d9\n-A OUTPUT -p udp -m udp --dport 20000:30000 \
                      -j HYSTERIA-PR-c66a02d9\n",
                 ),
             ));
             i.files.insert(
-                "/opt/b-ui/config-residential.yaml".into(),
-                (b"listen: :40000,41000-50000\n".to_vec(), 0o600),
+                "/opt/b-ui/config.yaml".into(),
+                (b"listen: :10000,20000-30000\n".to_vec(), 0o600),
             );
             i.listening
-                .insert(Proto::Udp, [10000].into_iter().collect());
+                .insert(Proto::Udp, [40000].into_iter().collect());
             i.listening
                 .insert(Proto::Tcp, [10001, 2080].into_iter().collect());
         });
@@ -576,7 +1071,8 @@ mod tests {
 
     /// 事故回归：崩溃循环 + 日志含「Chain already exists」→ 先清本实例的孤儿链，
     /// 再 `reset-failed`（52 次重启早撞上 start limit，不清计数 restart 会被挡）+ `restart`，
-    /// 并把事件记进 `runtime.json`。直连实例（active）一个命令都不许收到。
+    /// 并把事件记进 `runtime.json`。住宅实例（active，且 4.1 根本不建 NAT 规则）
+    /// 一个命令都不许收到。
     #[tokio::test]
     async fn a_chain_conflict_crash_loop_is_healed_before_the_port_probe() {
         let host = crash_looping_host();
@@ -590,22 +1086,21 @@ mod tests {
         };
         assert!(i("-D OUTPUT") < i("-X HYSTERIA-PR-c66a02d9"), "{ops:?}");
         assert!(
-            i("-X HYSTERIA-PR-c66a02d9") < i("systemd:reset-failed:hysteria-residential"),
+            i("-X HYSTERIA-PR-c66a02d9") < i("systemd:reset-failed:hysteria-server"),
             "清链必须在重启之前，否则起来照样撞同名链：{ops:?}"
         );
         assert!(
-            i("systemd:reset-failed:hysteria-residential")
-                < i("systemd:restart:hysteria-residential"),
+            i("systemd:reset-failed:hysteria-server") < i("systemd:restart:hysteria-server"),
             "{ops:?}"
         );
         assert!(
-            !ops.iter().any(|o| o.contains("hysteria-server")),
-            "直连实例是 active，不该被碰：{ops:?}"
+            !ops.iter().any(|o| o.contains("hysteria-residential")),
+            "住宅实例是 active（4.1 也不建 NAT 规则），不该被碰：{ops:?}"
         );
         // 事件落盘
         let heals: std::collections::BTreeMap<String, ChainHeal> =
             serde_json::from_value(c.runtime.read().await.extra[HEAL_KEY].clone()).unwrap();
-        let rec = &heals["hysteria-residential"];
+        let rec = &heals["hysteria-server"];
         assert_eq!(rec.count, 1);
         assert_eq!(rec.at, "2026-09-11T00:00:00Z");
         assert_eq!(
@@ -631,8 +1126,8 @@ mod tests {
             i.scripted.push((
                 "nft list table ip6 hysteria_390d4d8b".into(),
                 crate::sys::CmdOut::success(
-                    "table ip6 hysteria_390d4d8b {\n\tchain output {\n\t\tudp dport 41000-50000 \
-                     redirect to :40000\n\t}\n}\n",
+                    "table ip6 hysteria_390d4d8b {\n\tchain output {\n\t\tudp dport 20000-30000 \
+                     redirect to :10000\n\t}\n}\n",
                 ),
             ));
             i.scripted.push((
@@ -654,12 +1149,12 @@ mod tests {
         assert!(
             !ops.iter()
                 .any(|o| o.contains("delete table ip hysteria_7c1e0f2a")),
-            "别的槽（base 40001）的表不许碰：{ops:?}"
+            "别的实例（4.0 遗留的 base 40001）的表不许碰：{ops:?}"
         );
         let heals: std::collections::BTreeMap<String, ChainHeal> =
             serde_json::from_value(c.runtime.read().await.extra[HEAL_KEY].clone()).unwrap();
         assert_eq!(
-            heals["hysteria-residential"].done,
+            heals["hysteria-server"].done,
             vec![
                 "已清理 ip6tables nat 链 HYSTERIA-PR-c66a02d9（本实例端口跳跃孤儿）",
                 "已删除 nft 表 ip6 hysteria_390d4d8b（本实例端口跳跃孤儿）",
@@ -691,10 +1186,10 @@ mod tests {
         assert!(host
             .ops()
             .iter()
-            .any(|o| o == "systemd:restart:hysteria-residential"));
+            .any(|o| o == "systemd:restart:hysteria-server"));
         let heals: std::collections::BTreeMap<String, ChainHeal> =
             serde_json::from_value(c.runtime.read().await.extra[HEAL_KEY].clone()).unwrap();
-        assert_eq!(heals["hysteria-residential"].count, 2);
+        assert_eq!(heals["hysteria-server"].count, 2);
     }
 
     /// 崩溃循环但日志里**不是**这个错误（证书过期、端口被占…）→ 不清链、不重启：
@@ -705,7 +1200,7 @@ mod tests {
         host.with(|i| {
             i.scripted.clear();
             i.scripted.push((
-                "journalctl -u hysteria-residential".into(),
+                "journalctl -u hysteria-server".into(),
                 crate::sys::CmdOut::success("hysteria: failed to load cert: no such file\n"),
             ));
         });
@@ -728,7 +1223,7 @@ mod tests {
         let host = crash_looping_host();
         host.with(|i| {
             i.unit_props.insert(
-                ("hysteria-residential.service".into(), "ActiveState".into()),
+                ("hysteria-server.service".into(), "ActiveState".into()),
                 "inactive".into(),
             );
         });
@@ -737,7 +1232,7 @@ mod tests {
         assert!(
             acting_ops(&host)
                 .iter()
-                .all(|o| !o.contains("hysteria-residential")),
+                .all(|o| !o.contains("hysteria-server")),
             "{:?}",
             host.ops()
         );
@@ -802,6 +1297,561 @@ mod tests {
             "xray" | "b-ui-relay" => x.proto == Proto::Tcp,
             _ => x.proto == Proto::Udp,
         }));
+    }
+
+    /// 4.1：住宅只剩一个探测目标，孤儿链自愈只对 apernet 直连那一支有意义
+    /// （sing-box 不建 NAT 规则、没有孤儿链；住宅那侧的等价自愈是 `check_nft`）。
+    #[test]
+    fn the_watchdog_probes_one_residential_listener() {
+        let s = sample_state();
+        let t = targets(&s);
+        let resi: Vec<&Target> = t
+            .iter()
+            .filter(|x| x.unit.starts_with("hysteria-residential"))
+            .collect();
+        assert_eq!(resi.len(), 1);
+        assert_eq!(
+            (resi[0].unit.as_str(), resi[0].port, resi[0].proto),
+            ("hysteria-residential", 40000, Proto::Udp)
+        );
+        assert!(!t.iter().any(|x| x.unit.contains("hysteria-residential-")));
+        assert_eq!(HY2_CONFIGS.len(), 1);
+        assert_eq!(HY2_CONFIGS[0], ("hysteria-server", "config.yaml"));
+    }
+
+    /// 真机的 `nft list table` 回显与渲染器的规则集**等价但不逐字相同**：空白被重排、
+    /// `priority -100` 打成 `priority dstnat`、每条规则多一段 `counter packets N bytes N`。
+    /// 逐字比会每 60 秒重放一次（顺带把兼容段的 counter 清零），所以判据是规范化后的规则。
+    #[test]
+    fn the_listed_table_is_compared_normalized_not_verbatim() {
+        let s = sample_state();
+        let want = bui_schema::render::nft::ruleset(&s.node.ports, true);
+        assert_eq!(
+            redirect_rules(LISTED),
+            redirect_rules(&want),
+            "回显格式不同不算不符"
+        );
+        assert_eq!(redirect_rules(&want).len(), 4);
+        // 只挂 prerouting（output 链被人删了）⇒ 必须判不符：本机发往自身公网 IP 的包
+        // 不过 prerouting，跳跃对本机自测直接失效
+        let half = LISTED.split("\tchain output {").next().unwrap().to_string() + "}\n";
+        assert_ne!(redirect_rules(&half), redirect_rules(&want));
+        // 兼容段关掉时规则从 4 条变 2 条，同样判不符
+        assert_ne!(
+            redirect_rules(LISTED),
+            redirect_rules(&bui_schema::render::nft::ruleset(&s.node.ports, false))
+        );
+        // **四条都挂在 prerouting 上**（有人把 output 那两条粘错了链）：条数对、端口对、
+        // 目标对，只有链不对 —— 双 hook 这条硬要求只有链名进 key 才守得住
+        let both_in_prerouting = LISTED.replace("chain output {", "chain prerouting {");
+        assert_eq!(redirect_rules(&both_in_prerouting).len(), 4);
+        assert_ne!(
+            redirect_rules(&both_in_prerouting),
+            redirect_rules(&want),
+            "跳跃对本机自测失效（output 链没了），不许判成等价"
+        );
+    }
+
+    /// 一台装着 nft、表也在位的真机回显（`priority dstnat` + counter + 制表符缩进）。
+    const LISTED: &str = "\
+table inet bui {
+\tchain prerouting {
+\t\ttype nat hook prerouting priority dstnat; policy accept;
+\t\tudp dport 41000-50000 counter packets 12 bytes 480 redirect to :40000 comment \"hy2 residential hop\"
+\t\tudp dport 40001-40007 counter packets 3 bytes 120 redirect to :40000 comment \"hy2 residential 4.0 compat\"
+\t}
+\tchain output {
+\t\ttype nat hook output priority dstnat; policy accept;
+\t\tudp dport 41000-50000 counter packets 0 bytes 0 redirect to :40000 comment \"hy2 residential hop (local)\"
+\t\tudp dport 40001-40007 counter packets 1 bytes 40 redirect to :40000 comment \"hy2 residential 4.0 compat (local)\"
+\t}
+}
+";
+
+    /// 表被人删掉 ⇒ 整表重放；`nft` 不存在 ⇒ 只告警、一条命令都不发；规则一致 ⇒ 什么都不做。
+    #[test]
+    fn a_missing_nft_table_is_replayed_and_a_missing_nft_binary_only_alerts() {
+        let s = sample_state();
+        let want = bui_schema::render::nft::ruleset(&s.node.ports, true);
+
+        let h = FakeHost::new();
+        h.with(|i| {
+            i.which.insert("nft".into());
+            i.scripted.push((
+                "nft list table inet bui".into(),
+                crate::sys::CmdOut::failure(1, "Error: No such file or directory\n"),
+            ));
+        });
+        assert_eq!(check_nft(&h, &s).verdict, NftVerdict::Replayed);
+        assert!(
+            h.ops().contains(&"run:nft -f -".to_string()),
+            "{:?}",
+            h.ops()
+        );
+        assert_eq!(h.stdins(), vec![("nft -f -".to_string(), want.clone())]);
+
+        // 缺 nft：一步都做不了，只能告 Error（不许把它当成「重放失败」去跑 nft）
+        let h2 = FakeHost::new();
+        assert_eq!(check_nft(&h2, &s).verdict, NftVerdict::NoBinary);
+        assert!(h2.ops().is_empty(), "{:?}", h2.ops());
+
+        // 规则集一致（真机回显格式）⇒ 什么都不做，一次 `nft -f` 都没有
+        let h3 = FakeHost::new();
+        h3.with(|i| {
+            i.which.insert("nft".into());
+            i.scripted.push((
+                "nft list table inet bui".into(),
+                crate::sys::CmdOut::success(LISTED),
+            ));
+        });
+        let r = check_nft(&h3, &s);
+        assert_eq!(r.verdict, NftVerdict::Ok);
+        assert_eq!(r.compat_live, Some(4), "兼容段两条规则的 packets 之和");
+        assert!(
+            !h3.ops().iter().any(|o| o.starts_with("run:nft -f")),
+            "{:?}",
+            h3.ops()
+        );
+
+        // 重放本身失败（内核 < 5.2 的形态）⇒ Missing，原文进事件
+        let h4 = FakeHost::new();
+        h4.with(|i| {
+            i.which.insert("nft".into());
+            i.scripted.push((
+                "nft -f -".into(),
+                crate::sys::CmdOut::failure(
+                    1,
+                    "Error: Chain of type \"nat\" is not supported, perhaps kernel support is missing?\n",
+                ),
+            ));
+        });
+        let r = check_nft(&h4, &s);
+        assert_eq!(r.verdict, NftVerdict::Missing);
+        assert!(r.error.unwrap().contains("Chain of type"));
+    }
+
+    /// 缺 `nft` 的事件是 **Error 级**，正文按真实量级写（带 mport 的客户端只往跳跃段发，
+    /// 所以那不是「只是跳跃失效」，而是住宅全断）；同一件事 10 分钟内不重复刷。
+    #[test]
+    fn the_missing_nft_binary_alert_states_the_real_blast_radius() {
+        let s = sample_state();
+        let round = NftRound {
+            verdict: NftVerdict::NoBinary,
+            compat_live: None,
+            error: None,
+            seen_rules: 0,
+        };
+        let none = std::collections::BTreeMap::new();
+        let (bucket, rec, inc) = nft_event(&round, &s, &none, t0()).unwrap();
+        assert_eq!(inc.signature, NFT_MISSING_SIG);
+        assert_eq!(inc.level, crate::modules::sentinel::incidents::Level::Error);
+        assert_eq!(inc.subject, "inet bui");
+        assert!(inc.result.contains("41000-50000"), "{}", inc.result);
+        assert!(inc.result.contains("住宅全断"), "{}", inc.result);
+        assert_eq!(rec.count, 1);
+        // 冷却：同一个桶 10 分钟内不再记第二条
+        let mut heals = std::collections::BTreeMap::new();
+        heals.insert(bucket.to_string(), rec);
+        assert!(nft_event(&round, &s, &heals, t0() + time::Duration::minutes(9)).is_none());
+        let (_, rec2, _) = nft_event(
+            &round,
+            &s,
+            &heals,
+            t0() + time::Duration::minutes(HEAL_COOLDOWN_MINUTES),
+        )
+        .unwrap();
+        assert_eq!(rec2.count, 2, "累计次数接着涨");
+        // 表不在（已重放）是 Warn；重放失败是 Error
+        let replayed = NftRound {
+            verdict: NftVerdict::Replayed,
+            compat_live: None,
+            error: None,
+            seen_rules: 2,
+        };
+        let (_, _, inc) = nft_event(&replayed, &s, &none, t0()).unwrap();
+        assert_eq!(inc.signature, NFT_TABLE_MISSING_SIG);
+        assert_eq!(inc.level, crate::modules::sentinel::incidents::Level::Warn);
+        assert!(
+            inc.result.contains("期望 4 条 redirect，实到 2"),
+            "条数进正文：判成不符却恰好是期望条数时，故障是回显解析对不上而不是表被删了：{}",
+            inc.result
+        );
+        let failed = NftRound {
+            verdict: NftVerdict::Missing,
+            compat_live: None,
+            error: Some("Error: Chain of type \"nat\" is not supported".into()),
+            seen_rules: 0,
+        };
+        let (_, _, inc) = nft_event(&failed, &s, &none, t0()).unwrap();
+        assert_eq!(inc.level, crate::modules::sentinel::incidents::Level::Error);
+        assert!(inc.result.contains("Chain of type"), "{}", inc.result);
+        // 一切正常时什么都不记
+        assert!(nft_event(
+            &NftRound {
+                verdict: NftVerdict::Ok,
+                compat_live: Some(0),
+                error: None,
+                seen_rules: 4,
+            },
+            &s,
+            &none,
+            t0()
+        )
+        .is_none());
+    }
+
+    /// 冷却**按裁决分桶**：刚记过一条「已整表重放」（Warn）之后 `nft -f` 开始失败
+    /// （Error，正文是「跳跃段不通」），这条 Error 必须立刻出 —— 四种裁决共用一条记录时
+    /// 它会被那句让人放心的 Warn 吞掉 10 分钟，而现场是每 60 秒重放失败一次。
+    #[test]
+    fn an_escalation_is_never_swallowed_by_the_previous_verdicts_cooldown() {
+        let s = sample_state();
+        let replayed = NftRound {
+            verdict: NftVerdict::Replayed,
+            compat_live: Some(0),
+            error: None,
+            seen_rules: 0,
+        };
+        let (bucket, rec, inc) = nft_event(&replayed, &s, &Default::default(), t0()).unwrap();
+        assert_eq!(bucket, "replayed");
+        assert_eq!(inc.level, crate::modules::sentinel::incidents::Level::Warn);
+        let mut heals = std::collections::BTreeMap::new();
+        heals.insert(bucket.to_string(), rec);
+
+        // 1 分钟后重放开始失败：另一个桶 ⇒ 立刻出一条 Error
+        let failed = NftRound {
+            verdict: NftVerdict::Missing,
+            compat_live: Some(0),
+            error: Some("Error: Chain of type \"nat\" is not supported".into()),
+            seen_rules: 0,
+        };
+        let (bucket2, rec2, inc2) =
+            nft_event(&failed, &s, &heals, t0() + time::Duration::minutes(1)).unwrap();
+        assert_eq!(bucket2, "replay_failed");
+        assert_ne!(bucket2, bucket, "两种裁决不许共用一个冷却桶");
+        assert_eq!(
+            inc2.level,
+            crate::modules::sentinel::incidents::Level::Error
+        );
+        assert!(inc2.result.contains("跳跃段不通"), "{}", inc2.result);
+        heals.insert(bucket2.to_string(), rec2);
+        // 同一个桶接着吃冷却（每 60 秒失败一次不许刷屏）
+        assert!(nft_event(&failed, &s, &heals, t0() + time::Duration::minutes(9)).is_none());
+        // 「已重放」那个桶也还在冷却里（它的 10 分钟从 t0 算）
+        assert!(nft_event(&replayed, &s, &heals, t0() + time::Duration::minutes(9)).is_none());
+    }
+
+    /// `nft list table` 非零但**不是**「表不在」（权限 / 并发事务）：不许冒充表被删了
+    /// —— 那会每 60 秒无谓重放一次，还让 `compat_live` 恒为 `None` ⇒ 累计命中永不涨
+    /// ⇒ 30 天门禁被推向「零命中」的误判。
+    #[test]
+    fn a_list_failure_that_is_not_a_missing_table_neither_replays_nor_samples() {
+        let s = sample_state();
+        let h = FakeHost::new();
+        h.with(|i| {
+            i.which.insert("nft".into());
+            i.scripted.push((
+                "nft list table inet bui".into(),
+                crate::sys::CmdOut::failure(1, "Error: Operation not permitted\n"),
+            ));
+        });
+        let r = check_nft(&h, &s);
+        assert_eq!(r.verdict, NftVerdict::Unreadable);
+        assert_eq!(r.compat_live, None, "读不到就不采样（也就不写累计值）");
+        assert!(
+            !h.ops().iter().any(|o| o.starts_with("run:nft -f")),
+            "表可能好着，不许重放：{:?}",
+            h.ops()
+        );
+        let (bucket, _, inc) = nft_event(&r, &s, &Default::default(), t0()).unwrap();
+        assert_eq!(bucket, "unreadable");
+        assert_eq!(inc.signature, NFT_UNREADABLE_SIG);
+        assert_eq!(inc.level, crate::modules::sentinel::incidents::Level::Warn);
+        assert!(
+            inc.result.contains("Operation not permitted"),
+            "原文照抄进正文：{}",
+            inc.result
+        );
+
+        // 另外三种「读不到」的标记同样不重放（少一个标记就掉回默认方向）
+        for stderr in [
+            "Error: Permission denied\n",
+            "Error: Could not process rule: Device or resource busy\n",
+            "Error: cache initialization failed\n",
+        ] {
+            let h = FakeHost::new();
+            h.with(|i| {
+                i.which.insert("nft".into());
+                i.scripted.push((
+                    "nft list table inet bui".into(),
+                    crate::sys::CmdOut::failure(1, stderr),
+                ));
+            });
+            let r = check_nft(&h, &s);
+            assert_eq!(r.verdict, NftVerdict::Unreadable, "{stderr}");
+            assert!(
+                !h.ops().iter().any(|o| o.starts_with("run:nft -f")),
+                "{stderr} ⇒ {:?}",
+                h.ops()
+            );
+        }
+
+        // 真是「表不在」的那几种回显仍然判重放（收窄不许把它一起收掉）。第三种是
+        // **locale 翻译过**的 ENOENT：守护进程的 locale 不由我们定（中文 VPS 上
+        // `localectl set-locale LANG=zh_CN.UTF-8` 很常见），判据一旦沾上 glibc 的
+        // strerror 文案，表被人删掉后就永远自愈不回来了。
+        for out in [
+            crate::sys::CmdOut::failure(1, "Error: No such file or directory\n"),
+            crate::sys::CmdOut::failure(1, ""),
+            crate::sys::CmdOut::failure(1, "Error: 没有那个文件或目录\n"),
+        ] {
+            let h = FakeHost::new();
+            h.with(|i| {
+                i.which.insert("nft".into());
+                i.scripted
+                    .push(("nft list table inet bui".into(), out.clone()));
+            });
+            assert_eq!(
+                check_nft(&h, &s).verdict,
+                NftVerdict::Replayed,
+                "{:?}",
+                out.stderr
+            );
+        }
+    }
+
+    /// 兼容段关掉之后（`system.hy2_resi_compat_ports = false`）盘上还是 4 条：判不符，
+    /// 重放的 stdin 必须是**2 条**那份规则集 —— 期望态写死成 `true` 就会每 60 秒把兼容段
+    /// 重放回来，与收紧后的 `firewall_ports(p, false)` 长期打架。
+    #[test]
+    fn the_expected_ruleset_follows_the_compat_switch() {
+        let mut s = sample_state();
+        s.system.hy2_resi_compat_ports = false;
+        let h = FakeHost::new();
+        h.with(|i| {
+            i.which.insert("nft".into());
+            i.scripted.push((
+                "nft list table inet bui".into(),
+                crate::sys::CmdOut::success(LISTED),
+            ));
+        });
+        let r = check_nft(&h, &s);
+        assert_eq!(r.verdict, NftVerdict::Replayed);
+        assert_eq!(r.seen_rules, 4, "盘上实到 4 条");
+        let two = bui_schema::render::nft::ruleset(&s.node.ports, false);
+        assert_eq!(h.stdins(), vec![("nft -f -".to_string(), two)]);
+        assert_eq!(bui_schema::render::nft::rule_count(false), 2);
+        // 事件正文报的是「期望 2 条」，不是恒 4 条
+        let (_, _, inc) = nft_event(&r, &s, &Default::default(), t0()).unwrap();
+        assert!(
+            inc.result.contains("期望 2 条 redirect，实到 4"),
+            "{}",
+            inc.result
+        );
+    }
+
+    /// 30 天门禁的判据（2026-09-17 裁决）：**命中过就永不自动判闲置**。
+    /// 兼容段的 counter 是 nat 链计数、只计每条流的首包，24×7 不断线的 4.0 客户端
+    /// 只在建连那一刻记 1 次 ⇒ 只看静默时长会把在用的兼容段判成闲置并关掉。
+    #[test]
+    fn a_compat_segment_that_was_ever_hit_is_never_auto_idle() {
+        let hit = CompatHits {
+            total: 1,
+            seen: 1,
+            last_hit_at: Some(fmt_rfc3339(t0())),
+            since: fmt_rfc3339(t0()),
+        };
+        assert!(
+            !hit.idle_for_takedown(t0() + time::Duration::days(365)),
+            "命中过一次就只能人工 --force 下线"
+        );
+        // 一次都没命中过：静默满 30 天才判闲置
+        let quiet = CompatHits {
+            total: 0,
+            seen: 0,
+            last_hit_at: None,
+            since: fmt_rfc3339(t0()),
+        };
+        assert_eq!(COMPAT_IDLE_DAYS, 30);
+        assert!(!quiet.idle_for_takedown(t0() + time::Duration::days(29)));
+        assert!(quiet.idle_for_takedown(t0() + time::Duration::days(30)));
+        assert_eq!(quiet.quiet_since(), fmt_rfc3339(t0()));
+        // 起算时刻被改坏 ⇒ 不判闲置（误判方向是危险那一侧）
+        let broken = CompatHits {
+            since: "不是时刻".into(),
+            ..quiet
+        };
+        assert!(!broken.idle_for_takedown(t0() + time::Duration::days(365)));
+    }
+
+    /// 兼容段命中数的累加（纯函数）：活 counter 会被 `flush table` 清零，所以判据是这份
+    /// 持久值。变小 ⇒ 中途被 flush 过 ⇒ 增量按活计数本身算，既不重复也不漏。
+    #[test]
+    fn compat_hits_accumulate_across_every_flush() {
+        let h = accumulate(None, 0, t0(), false);
+        assert_eq!((h.total, h.seen), (0, 0));
+        assert_eq!(h.last_hit_at, None);
+        assert_eq!(h.since, "2026-09-11T00:00:00Z");
+        assert_eq!(
+            h.quiet_since(),
+            "2026-09-11T00:00:00Z",
+            "没命中过就从起点算"
+        );
+
+        // 涨了 5 ⇒ 累计 5，记下命中时刻
+        let h = accumulate(Some(h), 5, t0() + time::Duration::minutes(1), false);
+        assert_eq!((h.total, h.seen), (5, 5));
+        assert_eq!(h.last_hit_at.as_deref(), Some("2026-09-11T00:01:00Z"));
+        assert_eq!(h.quiet_since(), "2026-09-11T00:01:00Z");
+
+        // 重放（或开机）把 counter 清零：活计数变小 ⇒ 当成从 0 重新计，累计不许倒退、也不许翻倍
+        let h = accumulate(Some(h), 2, t0() + time::Duration::minutes(2), false);
+        assert_eq!((h.total, h.seen), (7, 2));
+        // 一轮没有新流量：累计不动、命中时刻不动（30 天门禁靠它）
+        let h = accumulate(Some(h), 2, t0() + time::Duration::minutes(3), false);
+        assert_eq!((h.total, h.seen), (7, 2));
+        assert_eq!(h.last_hit_at.as_deref(), Some("2026-09-11T00:02:00Z"));
+    }
+
+    /// 自己重放过那一轮要把 `seen` 归零：flush 之后的新计数在一轮内**恰好越过旧值**时
+    /// 不许漏计（正好等于旧值时连 `last_hit_at` 都不动 —— 方向正是危险那一侧：
+    /// 在用的兼容段被判成闲置）。
+    #[test]
+    fn a_round_that_replayed_the_table_restarts_the_counter_from_zero() {
+        // 采到 9 之后这一轮自己重放（`nft -f` 先 flush table ⇒ counter 归零）
+        let h = accumulate(None, 9, t0(), true);
+        assert_eq!((h.total, h.seen), (9, 0), "重放过 ⇒ 下一轮从 0 比");
+        // 下一轮又来了 9 条流：这 9 条必须计进去
+        let h = accumulate(Some(h), 9, t0() + time::Duration::minutes(1), false);
+        assert_eq!((h.total, h.seen), (18, 9));
+        assert_eq!(
+            h.last_hit_at.as_deref(),
+            Some("2026-09-11T00:01:00Z"),
+            "命中时刻要前移"
+        );
+    }
+
+    /// 一整轮：表不在 ⇒ 重放 + 记录 + 事件；兼容段的活计数在重放**之前**被采走并累加。
+    #[tokio::test]
+    async fn check_once_replays_the_table_and_persists_the_compat_hits() {
+        let host = Arc::new(FakeHost::new());
+        host.with(|i| {
+            i.which.insert("nft".into());
+            // 表在位但兼容段少了一条（有人手工删过）⇒ 判不符、重放
+            i.scripted.push((
+                "nft list table inet bui".into(),
+                crate::sys::CmdOut::success(
+                    "table inet bui {\n\tchain prerouting {\n\t\tudp dport 41000-50000 counter \
+                     packets 1 bytes 40 redirect to :40000\n\t\tudp dport 40001-40007 counter \
+                     packets 9 bytes 360 redirect to :40000\n\t}\n}\n",
+                ),
+            ));
+        });
+        let (c, _d) = ctx(host.clone()).await;
+        check_once(&c).await.unwrap();
+        // **采样必须排在重放之前**（spec §2.4 的裁决）：`nft -f` 的第一句是 `flush table`，
+        // counter 随之归零，采在后面就等于漏计 ⇒ 兼容段被判闲置 ⇒ 关掉它让全部没刷订阅的
+        // 4.0 住宅用户当场断联。假机器的回显是无状态的（flush 表达不出来），所以这条裁决
+        // 只能按**顺序**钉：这一轮 `nft list` 恰好一次，且在 `nft -f -` 之前。
+        let ops = host.ops();
+        let list = ops
+            .iter()
+            .position(|o| o == "run:nft list table inet bui")
+            .unwrap_or_else(|| panic!("这一轮没列过表：{ops:?}"));
+        assert_eq!(
+            ops.iter()
+                .filter(|o| *o == "run:nft list table inet bui")
+                .count(),
+            1,
+            "只许列一次（列第二次就说明采样可能挪到了重放之后）：{ops:?}"
+        );
+        let replay = ops
+            .iter()
+            .position(|o| o == "run:nft -f -")
+            .unwrap_or_else(|| panic!("表不符却没重放：{ops:?}"));
+        assert!(list < replay, "采样必须在重放之前：{ops:?}");
+        let rt = c.runtime.read().await;
+        let heals: std::collections::BTreeMap<String, ChainHeal> =
+            serde_json::from_value(rt.extra[NFT_HEAL_KEY].clone()).unwrap();
+        let rec = &heals["replayed"];
+        assert_eq!(rec.count, 1);
+        assert_eq!(rec.at, "2026-09-11T00:00:00Z");
+        let incs = crate::modules::sentinel::incidents::from_runtime(&rt);
+        assert_eq!(incs.len(), 1);
+        assert_eq!(incs[0].signature, NFT_TABLE_MISSING_SIG);
+        assert!(
+            incs[0].result.contains("期望 4 条 redirect，实到 2"),
+            "盘上到底有几条要如实报（夹具那张表只剩 prerouting 的两条）：{}",
+            incs[0].result
+        );
+        let hits = compat_hits(&rt).unwrap();
+        assert_eq!(hits.total, 9, "重放前采到的 9 条流要进累计值");
+        assert_eq!(hits.last_hit_at.as_deref(), Some("2026-09-11T00:00:00Z"));
+        assert_eq!(
+            hits.seen, 0,
+            "这一轮自己重放过（`nft -f` 先 flush table）⇒ 下一轮的增量从 0 比，否则 \
+             flush 后的新计数恰好越过旧值时会漏计"
+        );
+        drop(rt);
+
+        // 下一轮：表已经对了（重放之后 counter 归零）⇒ 不再重放、不再刷事件，累计值不动
+        host.with(|i| {
+            i.scripted.clear();
+            i.scripted.push((
+                "nft list table inet bui".into(),
+                crate::sys::CmdOut::success(&bui_schema::render::nft::ruleset(
+                    &sample_state().node.ports,
+                    true,
+                )),
+            ));
+        });
+        host.clear_ops();
+        host.advance(60);
+        check_once(&c).await.unwrap();
+        assert!(
+            !host.ops().iter().any(|o| o == "run:nft -f -"),
+            "{:?}",
+            host.ops()
+        );
+        let rt = c.runtime.read().await;
+        assert_eq!(
+            crate::modules::sentinel::incidents::from_runtime(&rt).len(),
+            1,
+            "冷却期内不重复刷事件"
+        );
+        let hits = compat_hits(&rt).unwrap();
+        assert_eq!((hits.total, hits.seen), (9, 0), "flush 过之后从 0 重新计");
+    }
+
+    /// 没装 nft 的机器：每轮都告 Error（住宅全断），但**不许**去跑 `nft`，也不许把它
+    /// 误记成「表不在」那条签名。
+    #[tokio::test]
+    async fn a_machine_without_nft_gets_an_error_level_incident_each_cooldown() {
+        let host = Arc::new(FakeHost::new());
+        let (c, _d) = ctx(host.clone()).await;
+        check_once(&c).await.unwrap();
+        assert!(
+            !host.ops().iter().any(|o| o.starts_with("run:nft")),
+            "{:?}",
+            host.ops()
+        );
+        let rt = c.runtime.read().await;
+        let incs = crate::modules::sentinel::incidents::from_runtime(&rt);
+        assert_eq!(incs.len(), 1);
+        assert_eq!(incs[0].signature, NFT_MISSING_SIG);
+        assert_eq!(
+            incs[0].level,
+            crate::modules::sentinel::incidents::Level::Error
+        );
+        assert!(compat_hits(&rt).is_none(), "没表可采就不写这个键");
+        drop(rt);
+        host.advance(60);
+        check_once(&c).await.unwrap();
+        assert_eq!(
+            crate::modules::sentinel::incidents::from_runtime(&c.runtime.read().await).len(),
+            1,
+            "10 分钟冷却内只有一条"
+        );
     }
 
     /// 只数「鉴权请求 + 连不上/超时」两类标记同时命中的行。住宅上游、relay 的连接错误

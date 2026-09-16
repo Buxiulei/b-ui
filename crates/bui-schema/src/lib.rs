@@ -47,6 +47,8 @@
 //! - [`hy2pool::POOL_MIN`] / [`hy2pool::POOL_MAX`] / [`hy2pool::size_for`]：池容量 =
 //!   `clamp(ceil16(2 × 住宅 hysteria2 用户数), 32, 256)`；基数由
 //!   [`hy2pool::resi_hy2_users`] 数出。
+//! - [`hy2pool::is_resi_hy2`]：「有住宅权益且开 hysteria2」——池容量、迁移、门位收敛与
+//!   装完自检挑探测用户共用的那条判据（权益被撤掉的持凭据用户不满足它）。
 //! - [`hy2pool::grow`]：补到目标条数（`id` = 最小空闲 `r%03d`，`name = id`）。
 //! - [`hy2pool::assign`] / [`hy2pool::release`] / [`hy2pool::cred_of`]：分配（先「从未用过」、
 //!   再「`released_at` 最早且 ≥ 24 小时」；**幂等**，已持凭据的用户原样拿回那一条，换凭据
