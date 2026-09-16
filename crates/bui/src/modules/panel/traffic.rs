@@ -401,9 +401,13 @@ pub async fn tick(ctx: &DaemonCtx, shared: &Shared) -> anyhow::Result<()> {
     }
     // **归一成每人 0 / 1**（见模块文档「在线数的量纲」）：上面三个来源分别是直连会话数、
     // 住宅连接条数、Xray 的常数 1，相加等于任何东西。收成布尔就一个量纲，面板那个卡是
-    // 「在线用户数」。**这两行是唯一的归一点** —— 删了它就回到 4.0.x 那个混量纲的和。
-    online.retain(|_, n| *n > 0);
+    // 「在线用户数」。**这一行是唯一的归一点** —— 删了它就回到 4.0.x 那个混量纲的和。
+    //
+    // 不必再 `retain` 掉 0：三个来源都不产 0 —— `hy2::parse_online` 明确「`n <= 0` 视为
+    // 不在线、不进表」，`hy2resi::online_of` 是按连接条数累加（没连接就没这个键），
+    // Xray 那一档写的是常数 1。不在线的人压根不进这张表。
     online.values_mut().for_each(|n| *n = 1);
+
     let mut cache = shared.cache_mut().await;
     for (id, d) in &deltas {
         if let Some(name) = state
