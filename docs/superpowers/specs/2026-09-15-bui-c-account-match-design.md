@@ -529,7 +529,7 @@ fn best_source(src: Source, keep: Option<Source>, has_panel_member: bool) -> Sou
 - **同一批里同一账号出现两次（门槛内）：后一条生效。** 第二条命中第一条刚写入（或刚替换）的留存者，走 ①。**留存者由 `batch_keepers` 定住**（收尾 M1）：组里已经当过本批留存者的存量条目优先于 `pick_keeper`。不定住的话，第 3 级「与来件 `same_endpoint`」会让两条来件各自挑中端口**恰好相同**的那一条——列表里本来就有同账号两条（例如 `:10005` 与 `:10007`）、这次粘贴又把这两个端口都带上时可达——于是两条来件互相把对方报成存量重复，打出「…：p2（本次已更新 p1）」紧接着「…：p1（本次已更新 p2）」两句自相矛盾的提示，而最后生效的还是**前**一条。原来那句论证只在组里只有一条存量成员时成立。
   **组里有活动节点时不沿用**：一律交给 `pick_keeper`（第 1 级就是活动节点）。§5.8 的「合并不碰活动节点」建立在「active 只要在组里就是留存者」上，沿用把它挤下去的话，活动节点会被点名成存量重复，而 `merge_into` 又拒绝并掉活动节点，菜单答 y 只会打 `节点列表已经变了，没有合并`（`a_batch_keeper_never_displaces_the_active_node`）。
   **只记存量留存者**（下标 < `known`）：本批刚写入的副本当上留存者，只发生在组里没有存量成员的时候（有的话 `pick_keeper` 第 2 级必选存量那条），这时没有可矛盾的第二条；记下来反而会让后一条来件跟着本批副本走，抢掉下面「本批副本当场并掉、老名字保住」那一条（§9 同名行、`a_merged_batch_copy_is_cleared_from_every_name_list`）。面板来源不会出现这种批次（`nodes_for` 每种 kind 最多一个节点，`nodes.rs:110-150`）。
-  **沿用压过第 3 级「与来件 `same_endpoint`」，面板成员也不例外**（M1 的已知后果，本轮不改）：一次粘贴同时带旧链接与现链接，组里又有一条 `ApiNodes` 成员恰好停在**后**一条来件的参数上时，留存者仍是前一条来件定住的那条（例如粘贴来的 `alice-hy2-direct`），面板那条被点名成存量重复、菜单答 y 会把它并掉，合并后留的是留存者的名字（不是 `c-<n>` 形式时 D9 取回规范名不触发）——M1 之前这一格的留存者是面板那条。功能上等价：来源与分流经 `best_source` / `panel_split` 从合并前的整个组里继承，提示也不自相矛盾，只是名字换了一个。要收口的话，在沿用前多一道「组里有 `ApiNodes` 且与来件 `same_endpoint` 的存量成员就交回 `pick_keeper`」即可，留到 4.1。
+  **沿用不压过面板成员**：一次粘贴同时带旧链接与现链接，组里又有一条 `ApiNodes` 成员恰好停在**后**一条来件的参数上时，沿用会把面板那条挤成存量重复、菜单答 y 就用粘贴那条的名字并掉它——与 §5.3「面板来源条目不被非面板来件动」相抵。所以沿用之前先看一眼：组里有 `ApiNodes` 且与来件 `same_endpoint` 的存量成员时，交回 `pick_keeper`（它的第 3 级本来就会选中面板那条）。被点名成存量重复的于是是粘贴那条，面板那条原地收下新参数、名字不变。测试 48c 钉住这一格（去掉这道守卫它就红）。组里有活动节点时同理不沿用（见上一段）：这两道守卫合起来保证沿用只在「组里全是非活动、非面板的存量条目」时生效。
 - **同一批里同一账号出现两次（kind 是猜的、端口不同）：两条都保留。** 第二条不在门槛内，走 ③，打 `kind_unsure_new`。rc 在这里会覆盖成一条、丢掉一个端口，新行为更安全。
 - **本批副本当场并掉的可达场景**：列表里有存量可信条目 X（跨端口，且**非活动、非面板来源**，所以不受保护——第一条猜 kind 的来件对它报的是 `KindUnsure`，A1），同一次粘贴先来一条猜 kind 的（③ 新建 Y），再来一条同端口可信的 → 组 = [X, Y] → 留存者 X（导入前已存在）→ Y 被当场并掉。Y 那条 `kind_unsure_new` 说明已经打出去了，留在输出里（第三方批次才会这样，接受）。
 - **① 的 upsert 结果**：端口或密码变了必然 `Replaced`；已经一致则 `Unchanged`，但来源照样经 `raise_source` 升级（`profiles.json` 因此可能重写一次，`prof != loaded`，`cli.rs:694`）。结果行「导入 N 个新节点」只数 `added`，端口变化不算新节点。
@@ -989,6 +989,7 @@ pub fn display_name(name: &str) -> Cow<'_, str>;
 48. `the_same_account_twice_in_a_trusted_batch_keeps_the_later_one`
 48a. `the_same_account_twice_in_a_trusted_batch_keeps_one_keeper`（收尾 M1）：列表里已有同账号两条可信条目 `alice-hy2-direct`（:10005，Paste，非活动）与 `alice-hy2-direct-2`（:10007，同上），一次粘贴同时带这两个端口的可信链接 → 留存者只有一个、后一条生效（`alice-hy2-direct` 停在 :10007）、`同一账号还有` 只打一行（不许两句互相点名）、两条存量都还在。
 48b. `a_batch_keeper_never_displaces_the_active_node`（收尾 M1 的守卫）：活动节点 `alice-hy2-direct`（:10000，Paste）+ 副本 `-2`（:10005），粘贴 `:10005`、`:10000` 两条可信链接 → 第一条够不着受保护的活动节点、只选中副本；第二条与活动节点同参数、把它带进组，留存者仍是活动节点：活动节点端口不动、`dups_head` 的留存者是它、被点名的是副本、不 apply。
+48c. `a_batch_keeper_never_displaces_a_panel_entry_on_the_same_endpoint`（收尾复核）：列表里同账号有一条粘贴来源与一条**非活动的面板来源**，一次粘贴同时带这两个端口 → 后一条来件交回 `pick_keeper`、留存者是面板那条（它原地收下新参数、名字不变），被点名成存量重复的是粘贴那条。钉住 §5.4 的「沿用不压过面板成员」那道守卫。
 49. `the_same_account_twice_in_a_guessed_paste_keeps_both`
 50. `direct_and_residential_sharing_credentials_never_merge_on_port_move`：Reality 与 HY2 各一组。
 51. `family_accounts_on_one_host_never_merge_on_port_move`：`hy2_account_node("bob")`（`testutil.rs:25-37`）。

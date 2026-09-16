@@ -12,8 +12,8 @@ use crate::net::Net;
 use crate::nettest::{self, Event, Hooks, Painter};
 use crate::paths::{Paths, UNIT_MAIN, UNIT_TIMER};
 use crate::profiles::{
-    best_source, https_base, kind_slug, profile_name, rfc3339, Blocked, Mode, Panel, Profile,
-    Profiles, Source, Upsert,
+    best_source, https_base, kind_slug, profile_name, rfc3339, same_endpoint, Blocked, Mode, Panel,
+    Profile, Profiles, Source, Upsert,
 };
 use crate::source::{self, Fetched};
 use crate::sys::{systemd, Sys};
@@ -569,11 +569,19 @@ fn store_fetched<S: Sys, N: Net, P: Prompt>(
             let has_active = group
                 .iter()
                 .any(|&i| prof.active.as_deref() == Some(prof.profiles[i].name.as_str()));
+            // 组里有面板来源、且与来件同一连接的存量成员时也不沿用，交回 `pick_keeper`（第 3 级
+            // 本来就会选中它）：沿用会把面板那条挤成存量重复，菜单答 y 就用粘贴那条的名字并掉
+            // 了它，与 §5.3「面板来源条目不被非面板来件动」相抵
+            let has_panel_endpoint = group.iter().any(|&i| {
+                i < known
+                    && prof.profiles[i].source == Source::ApiNodes
+                    && same_endpoint(&prof.profiles[i].node, node)
+            });
             let k = group
                 .iter()
                 .copied()
                 .find(|&i| batch_keepers.contains(&prof.profiles[i].name))
-                .filter(|_| !has_active)
+                .filter(|_| !has_active && !has_panel_endpoint)
                 .unwrap_or_else(|| prof.pick_keeper(&group, node, &wanted, known));
             let keep = prof.profiles[k].name.clone();
             if k < known && !batch_keepers.contains(&keep) {
@@ -14017,6 +14025,7 @@ mod tests {
     /// 第一条来件够不着受保护的活动节点、只选中了副本；第二条与活动节点同参数、把它带进组，
     /// 这时留存者必须仍按 `pick_keeper` 第 1 级选活动节点——否则活动节点会被点名成存量重复，
     /// 而 `merge_into` 又拒绝并掉活动节点，菜单答 y 只会打「节点列表已经变了，没有合并」。
+
     #[test]
     fn a_batch_keeper_never_displaces_the_active_node() {
         let pp = paths();
@@ -14059,6 +14068,67 @@ mod tests {
             "留存者是活动节点，被点名的是副本：{t}"
         );
         assert_not_applied(&s, before, "活动节点内容没变", &t);
+    }
+
+    /// 48c（收尾复核）：本批沿用留存者不许挤掉面板来源的那一条。列表里同账号有一条粘贴来源
+    /// 与一条非活动的面板来源，一次粘贴同时带这两个端口时，后一条来件交回 `pick_keeper`
+    /// 第 3 级选中面板那条，而不是沿用前一条选的粘贴条目——否则面板那条会被报成存量重复，
+    /// 菜单答 y 就用粘贴的名字把它并掉了，与 §5.3「面板来源条目不被非面板来件动」相抵。
+    #[test]
+    fn a_batch_keeper_never_displaces_a_panel_entry_on_the_same_endpoint() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let first = hy2_uri("alice", "hy2-pw", 10005, "alice-HY2直连");
+        let second = hy2_uri("alice", "hy2-pw", 10007, "alice-HY2直连");
+        listed(
+            &s,
+            &pp,
+            vec![
+                entry(
+                    "bob-hy2-direct",
+                    crate::testutil::hy2_account_node("bob"),
+                    Source::ApiNodes,
+                    split_keywords(),
+                ),
+                entry(
+                    "alice-hy2-direct",
+                    uri_node(&first),
+                    Source::Paste,
+                    crate::profiles::default_split(),
+                ),
+                // 面板来源、非活动，端口正是第二条来件的端口
+                entry(
+                    "panel.example.com-hy2-direct",
+                    uri_node(&second),
+                    Source::ApiNodes,
+                    split_keywords(),
+                ),
+            ],
+            "bob-hy2-direct",
+        );
+        let t = import_paste(&s, &pp, &[&first, &second]);
+        assert_eq!(
+            got(&s, &pp, "panel.example.com-hy2-direct").node.port,
+            10007,
+            "面板那条仍在原处、原地收下第二条来件：{t}"
+        );
+        assert_eq!(
+            got(&s, &pp, "alice-hy2-direct").node.port,
+            10005,
+            "粘贴那条只收第一条来件，没有被第二条挤着改端口：{t}"
+        );
+        assert!(
+            said_line(
+                &t,
+                &menu::dups_head(
+                    "panel.example.com-hy2-direct",
+                    &["alice-hy2-direct".to_string()]
+                )
+            ),
+            "留存者是面板那条、被点名的是粘贴那条，不是反过来：{t}"
+        );
     }
 
     /// 49：同一批里同一账号出现两次、kind 是猜的且端口不同 → 两条都保留（rc 会覆盖成一条）。
