@@ -2,15 +2,27 @@
 //!
 //! 与 v3 的差别（审计 eff-C1~C4、web-C2~C5）：
 //! - 一次 `QueryStats(pattern="user>>>", reset=true)` 拉全量，不再每用户两次 `execSync`（O(N) 阻塞）。
-//! - 住宅实例的 `:9998` 也读（v3 的常量从没被用过）。
 //! - `clear=1` / `reset=true` 让每轮拿到的就是增量，重启守护进程不会把累计值当增量重复计。
 //! - 限额真的执行（v3 的 `checkUserLimits` 哪里都没被调用）。
 //! - `/api/stats`、`/api/online` 读同一份缓存，面板开着不增加采样。
+//!
+//! 4.1 起**直连与住宅走两条不同的控制面**（spec §5.1、§5.2）：
+//! - **直连一个字不变**：`hysteria-server` 的 trafficStats `:9999` 上打 `/traffic?clear=1`
+//!   + `/online`，踢人打 `/kick`（[`stats_ports`] 因此只剩这一个端口）。
+//! - **住宅**（自建 sing-box）计量走 v2ray_api 的 `QueryStats`、在线走 Clash API 的
+//!   `/connections`，踢人 = 门切 `deny` + 逐条 `DELETE /connections/{id}`，未封用户再把门
+//!   切回他自己的槽出站（[`super::Hy2ResiApi`]、[`kick_residential`]）。这两条的返回键是
+//!   **凭据 name** 而不是 `user_id`，要经 [`resi_name_to_user`] 换键才能入账。
+//!
+//! 住宅的计数器同样不跨 sing-box 重启存活（与 apernet 那个内存 trafficStats 计数器
+//! 是同一种丢失窗口：重启丢掉「上次采样到重启」这一段），**这里不做任何补偿或降级**。
 
+use super::hy2resi::online_of;
 use super::users::{self, month_key};
 use super::{Shared, TxRx, HY2_STATS_PORT_DIRECT};
 use crate::reconcile::DaemonCtx;
 use bui_schema::model::State;
+use bui_schema::render::hy2_singbox::{gate_tag, slot_out_tag, DENY_TAG};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,27 +46,143 @@ pub struct Sample {
     pub errors: Vec<String>,
 }
 
-/// 每个住宅实例的 `trafficStats` 端口，按槽序号升序（单槽 = `[9998]`）。
-pub fn resi_stats_ports(s: &State) -> Vec<u16> {
-    bui_schema::slots::indices(&s.residential)
-        .into_iter()
-        .map(|i| bui_schema::slots::resources_of(&s.node.ports, &s.residential, i).stats_port)
+/// 要采样 / kick 的 hysteria trafficStats 端口：**只有直连实例那一个**。
+///
+/// 4.1 起住宅是一个 sing-box 入站（计量走 v2ray_api、踢人走 Clash API），apernet 的
+/// `trafficStats` 端口连带槽位换算一起消失；签名保留 `&State` 是为了让调用点不动。
+pub fn stats_ports(_s: &State) -> Vec<u16> {
+    vec![HY2_STATS_PORT_DIRECT]
+}
+
+/// 凭据 `name` → `user_id`：住宅两条控制面（`QueryStats` 的计数器名、`/connections` 的
+/// `auth_user=`）都以凭据 name 为键，采样与在线共用这张表换键。
+///
+/// 空闲凭据与已删用户的凭据不在表里 ⇒ 它们的增量与连接一律丢弃（口径同
+/// [`to_uuid_map`]：认不出的键不入账，绝不猜）。
+pub fn resi_name_to_user(s: &State) -> BTreeMap<String, Uuid> {
+    s.users
+        .iter()
+        .filter_map(|u| {
+            bui_schema::hy2pool::cred_of(u, &s.residential).map(|c| (c.name.clone(), u.user_id))
+        })
         .collect()
 }
 
-/// 要采样 / kick 的全部 hysteria trafficStats 端口：直连实例 + 每个住宅实例。
-/// **住宅实例一个都不能漏**：漏一个就是那部分流量不计费（审计 web-C3 的 v3 老账）。
-pub fn stats_ports(s: &State) -> Vec<u16> {
-    let mut v = vec![HY2_STATS_PORT_DIRECT];
-    v.extend(resi_stats_ports(s));
-    v
+/// 住宅侧踢一个人要的东西：门的 tag 由凭据 `id` 算、连接归组按凭据 `name`。
+/// **不带 `secret`** —— 踢人这条路一个凭据字节都不需要，也就不会被日志带出去。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResiKickTarget {
+    pub cred_id: String,
+    pub name: String,
+    /// 踢完把门 PUT 回这里：`Some("slot-<i>-out")` = 未封用户（spec §5.2 的
+    /// 「未封者下一请求即通」）；`None` = 他本来就该停在 `deny`（限额封禁 / 到期 /
+    /// 禁用 / 没有住宅 hysteria2 权益）。
+    pub restore_to: Option<String>,
 }
 
-/// 打每个 hysteria 实例的 `/traffic?clear=1` 与 `/online`，再打一次 `QueryStats(reset=true)`。
-/// 单个来源失败只记 error，不影响其余来源（spec §4.2；审计 web-C3：住宅那几个口也要读）。
-pub async fn sample_once(shared: &Shared, ports: &[u16]) -> Sample {
+/// 「有住宅权益且开 hysteria2」—— 门只对这些人开（同 `hy2pool` 里那条池容量判据）。
+fn has_resi_hy2(u: &bui_schema::model::User) -> bool {
+    u.entitlements.residential.is_some()
+        && u.entitlements
+            .protocols
+            .contains(&bui_schema::model::Protocol::Hysteria2)
+}
+
+/// 这些用户在住宅侧的踢人目标；没有凭据的用户（没住宅权益、或池还没分过）不在表里。
+///
+/// `open` = 这些人里「踢完还该放行」的那些（手动踢人时 = 没被 `users::blocked_set` 判拒
+/// 的），他们的 [`ResiKickTarget::restore_to`] 是自己槽的出站 tag；限额封禁那条路传空集
+/// ⇒ 全部停在 `deny`。撤掉了住宅 hysteria2 权益的用户即使在 `open` 里也不回切 —— 他的门
+/// 本来就该是 `deny`，踢一下不许把它开回去。
+pub fn resi_kick_targets(s: &State, ids: &[Uuid], open: &BTreeSet<Uuid>) -> Vec<ResiKickTarget> {
+    ids.iter()
+        .filter_map(|id| {
+            let u = s.users.iter().find(|u| u.user_id == *id)?;
+            let c = bui_schema::hy2pool::cred_of(u, &s.residential)?;
+            let restore_to = (open.contains(id) && has_resi_hy2(u))
+                .then(|| slot_out_tag(bui_schema::slots::index_of_user(u, &s.residential)));
+            Some(ResiKickTarget {
+                cred_id: c.id.clone(),
+                name: c.name.clone(),
+                restore_to,
+            })
+        })
+        .collect()
+}
+
+/// 住宅侧的「踢下线」（spec §5.2）：门切 `deny` —— 门是 `interrupt_exist_connections`
+/// 的 selector，切过去存量流当场断 —— 再逐条 `DELETE /connections/{id}` 兜底，最后把
+/// [`ResiKickTarget::restore_to`] 非空的（未封）用户的门 PUT 回他自己的槽出站。返回关掉
+/// 的连接条数。
+///
+/// 三步都是 best-effort（失败只记 warn）：快照拒绝与门位收敛是主保障，踢不动只是旧会话
+/// 多活一会儿。门位在这里切成 `deny` 与后续的门位收敛同向，重复切是幂等的。
+///
+/// **回切不能省**：限额封禁那条路的人本来就该停在 `deny`，但面板「断开」按钮踢的多数是
+/// 正常用户 —— 少了这一次 PUT，他会一直断到下一次门位收敛（最长 60 秒的安全网），而
+/// spec §5.2 的判据是「未封者下一请求即通」。
+pub async fn kick_residential(shared: &Shared, targets: &[ResiKickTarget]) -> usize {
+    if targets.is_empty() {
+        return 0;
+    }
+    for t in targets {
+        let gate = gate_tag(&t.cred_id);
+        if let Err(e) = shared.hy2resi().select(&gate, DENY_TAG).await {
+            tracing::warn!(gate = %gate, error = %e, "住宅 HY2 门切 deny 失败；快照拒绝仍然生效");
+        }
+    }
+    let closed = close_conns_of(shared, targets).await;
+    for t in targets {
+        let Some(slot) = t.restore_to.as_deref() else {
+            continue;
+        };
+        let gate = gate_tag(&t.cred_id);
+        if let Err(e) = shared.hy2resi().select(&gate, slot).await {
+            tracing::warn!(gate = %gate, error = %e, "住宅 HY2 门切回槽出站失败；门位收敛会补上");
+        }
+    }
+    closed
+}
+
+/// `kick_residential` 的逐条 DELETE 兜底：只关归到这些凭据 `name` 的连接。
+async fn close_conns_of(shared: &Shared, targets: &[ResiKickTarget]) -> usize {
+    let wanted: BTreeSet<&str> = targets.iter().map(|t| t.name.as_str()).collect();
+    let conns = match shared.hy2resi().connections().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "住宅 HY2 /connections 读不到；跳过逐条 DELETE");
+            return 0;
+        }
+    };
+    let mut closed = 0;
+    for c in conns {
+        let Some(name) = super::hy2resi::user_of_rule(&c.rule) else {
+            continue;
+        };
+        if !wanted.contains(name) {
+            continue;
+        }
+        match shared.hy2resi().close_connection(&c.id).await {
+            Ok(()) => closed += 1,
+            Err(e) => tracing::warn!(error = %e, "住宅 HY2 关连接失败"),
+        }
+    }
+    closed
+}
+
+/// 打直连 hysteria 的 `/traffic?clear=1` 与 `/online`，再打住宅 sing-box 的
+/// `QueryStats(reset=true)` 与 `/connections`，最后打一次 Xray 的 `QueryStats(reset=true)`。
+///
+/// 单个来源失败只记 error，不影响其余来源（spec §4.2）。`resi_names` 是
+/// [`resi_name_to_user`] 的结果：住宅那两条返回的是凭据 name，认不出的键丢弃。
+pub async fn sample_once(
+    shared: &Shared,
+    ports: &[u16],
+    resi_names: &BTreeMap<String, Uuid>,
+) -> Sample {
     let mut s = Sample::default();
-    // 顺序固定（traffic 按 ports 升序 → online 同序 → Xray），测试按这个顺序断言 calls()
+    // 顺序固定（直连 traffic 按 ports 升序 → 直连 online 同序 → 住宅 QueryStats →
+    // 住宅 /connections → Xray），测试按这个顺序断言 calls()
     for port in ports.iter().copied() {
         match shared.hy2().traffic_clear(port).await {
             Ok(m) => {
@@ -76,6 +204,28 @@ pub async fn sample_once(shared: &Shared, ports: &[u16]) -> Sample {
             }
             Err(e) => s.errors.push(format!("hysteria :{port} /online 失败：{e}")),
         }
+    }
+    // 住宅：v2ray_api 的 `QueryStats`（`reset=true` ⇒ 拿到的就是增量）+ Clash API 的
+    // `/connections`（在线数 = 按 `auth_user=` 归组的连接条数）。两条的键都是凭据 name。
+    match shared.hy2resi().query_user_deltas().await {
+        Ok(m) => {
+            for (name, d) in m {
+                if let Some(uid) = resi_names.get(&name) {
+                    s.deltas.entry(uid.to_string()).or_default().add(d);
+                }
+            }
+        }
+        Err(e) => s.errors.push(format!("住宅 HY2 QueryStats 失败：{e}")),
+    }
+    match shared.hy2resi().connections().await {
+        Ok(conns) => {
+            for (name, n) in online_of(&conns) {
+                if let Some(uid) = resi_names.get(&name) {
+                    *s.online.entry(uid.to_string()).or_insert(0) += n;
+                }
+            }
+        }
+        Err(e) => s.errors.push(format!("住宅 HY2 /connections 失败：{e}")),
     }
     match shared.xray().query_user_deltas().await {
         Ok(m) => {
@@ -150,9 +300,15 @@ pub fn apply_sample(
 /// （`SampleCache` 与 `Applied` 同样要下一轮重建，两者都是幂等的）。
 pub async fn tick(ctx: &DaemonCtx, shared: &Shared) -> anyhow::Result<()> {
     let now = ctx.host.now();
-    // 采样与 kick 的端口集按槽位表来：住宅实例漏一个就是那部分流量不计费
-    let ports = stats_ports(ctx.store.read().await.as_ref());
-    let sample = sample_once(shared, &ports).await;
+    // 一次读出这一轮要用的两张表：直连的端口集（只有 `:9999`）与住宅的「凭据 name → user_id」
+    let (ports, resi_names) = {
+        let state = ctx.store.read().await;
+        (
+            stats_ports(state.as_ref()),
+            resi_name_to_user(state.as_ref()),
+        )
+    };
+    let sample = sample_once(shared, &ports, &resi_names).await;
     let deltas = to_uuid_map(&sample.deltas);
 
     // ① 内存累加
@@ -210,6 +366,14 @@ pub async fn tick(ctx: &DaemonCtx, shared: &Shared) -> anyhow::Result<()> {
                 tracing::warn!(port, error = %e, "kick 失败；快照拒绝仍然生效");
             }
         }
+        // 住宅那条路没有 `/kick`：门切 `deny` + 逐条 DELETE（spec §5.2）。
+        // 回切集合是**空的**：这一路踢的全是刚被判拒的人，他们就该停在 `deny`。
+        let targets = resi_kick_targets(
+            ctx.store.read().await.as_ref(),
+            &out.newly_blocked,
+            &BTreeSet::new(),
+        );
+        kick_residential(shared, &targets).await;
     }
 
     // ⑤ 刷新面板缓存
@@ -310,6 +474,23 @@ mod tests {
         }
     }
 
+    /// 给 state 建住宅凭据池（迁移口径：alice 拿 `r000`，凭据 `name` = 用户名）。
+    /// 住宅那两条控制面返回的键就是这个 `name`，采样要能换回 `user_id`。
+    async fn with_pool(h: &Harness) {
+        h.store
+            .update(|s| {
+                bui_schema::hy2pool::migrate(s, t0());
+            })
+            .await
+            .unwrap();
+    }
+
+    /// 当前期望态里的「采样端口 + 凭据 name → user_id」——`tick` 里那一读的测试版。
+    async fn sample_args(h: &Harness) -> (Vec<u16>, BTreeMap<String, Uuid>) {
+        let st = h.store.read().await;
+        (stats_ports(st.as_ref()), resi_name_to_user(st.as_ref()))
+    }
+
     #[test]
     fn apply_sample_accumulates_total_and_monthly_and_sets_last_seen() {
         let mut s = sample_state();
@@ -379,72 +560,189 @@ mod tests {
         assert!(by_username(&s, &ghost).is_empty());
     }
 
+    /// 直连**一个字不变**（仍是 `/traffic?clear=1` + `/online`，只剩 `:9999` 一个端口）；
+    /// 住宅改走自建 sing-box 的两个回环面：计量 v2ray_api 的 `QueryStats`、在线
+    /// Clash API 的 `/connections`。住宅那两条的返回键是**凭据 name**，必须经凭据池
+    /// 换成 `user_id` 才能入账（spec §5.1、§5.2）。
     #[tokio::test]
-    async fn sample_once_reads_both_hysteria_ports_and_xray() {
+    async fn sampling_reads_the_direct_instance_over_http_and_the_residential_one_over_grpc() {
         let h = harness().await;
+        with_pool(&h).await;
         let id = h.store.read().await.users[0].user_id.to_string();
         h.hy2.with(|i| {
             i.traffic
                 .insert(9999, BTreeMap::from([(id.clone(), TxRx { tx: 10, rx: 0 })]));
-            i.traffic
-                .insert(9998, BTreeMap::from([(id.clone(), TxRx { tx: 1, rx: 2 })]));
             i.online.insert(9999, BTreeMap::from([(id.clone(), 1u32)]));
-            i.online.insert(9998, BTreeMap::from([(id.clone(), 2u32)]));
         });
+        h.hy2resi.set_deltas(BTreeMap::from([(
+            "alice".to_string(),
+            TxRx { tx: 0, rx: 7 },
+        )]));
+        h.hy2resi.set_conns(vec![
+            ("c1", "auth_user=alice => route(gate-r000)"),
+            ("c2", "auth_user=alice => route(gate-r000)"),
+            // 空闲凭据上的连接（生产上不该有）归不到任何用户 ⇒ 不入账、也不报错
+            ("c9", "auth_user=r001 => route(gate-r001)"),
+        ]);
         h.xray.with(|i| {
             i.deltas.insert(id.clone(), TxRx { tx: 0, rx: 100 });
         });
-        let s = sample_once(
-            &h.shared,
-            &[
-                HY2_STATS_PORT_DIRECT,
-                crate::modules::panel::HY2_STATS_PORT_RESI,
-            ],
-        )
-        .await;
-        assert_eq!(s.deltas[&id], TxRx { tx: 11, rx: 102 }, "三个来源相加");
-        assert_eq!(s.online[&id], 3, "两个 /online 的值相加");
+
+        let (ports, names) = sample_args(&h).await;
+        assert_eq!(ports, vec![9999], "住宅实例不再有 trafficStats 端口");
+        assert_eq!(names["alice"].to_string(), id, "凭据 name → user_id");
+        let s = sample_once(&h.shared, &ports, &names).await;
+        assert_eq!(s.deltas[&id], TxRx { tx: 10, rx: 107 }, "三个来源相加");
+        assert_eq!(
+            s.online[&id], 3,
+            "直连 1 条 + 住宅 /connections 归到他的 2 条"
+        );
         assert!(s.xray_ids.contains(&id));
-        assert!(s.errors.is_empty());
+        assert!(s.errors.is_empty(), "{:?}", s.errors);
         assert_eq!(
             h.hy2.calls(),
-            vec![
-                "traffic:9999".to_string(),
-                "traffic:9998".to_string(),
-                "online:9999".to_string(),
-                "online:9998".to_string(),
-            ]
+            vec!["traffic:9999".to_string(), "online:9999".to_string()],
+            "直连仍是那两个调用，且只打 :9999"
         );
+        assert_eq!(
+            h.hy2resi.calls(),
+            vec!["query".to_string(), "connections".to_string()],
+            "住宅只有 QueryStats 与 /connections 两次调用"
+        );
+    }
+
+    /// 住宅那条 gRPC 挂了只记一条 error，**它前后两边的采样都不能丢一个字节**
+    /// （spec §4.2 既有口径）：前面是直连的 `/traffic`，后面是同一轮的住宅
+    /// `/connections` 与 Xray 的 `QueryStats`。
+    ///
+    /// 「后面」这半是本用例的守门点：把住宅 `QueryStats` 的 `Err` 分支改成整轮
+    /// 提前返回（`?` 化重构最容易写成这样），Reality 的流量与住宅在线数会连带丢掉，
+    /// 而 T8 落地前住宅那个面在每台机上都是不可达的 ⇒ 每一轮都丢。
+    #[tokio::test]
+    async fn a_grpc_failure_does_not_lose_the_samples_before_or_after_it() {
+        let h = harness().await;
+        with_pool(&h).await;
+        let id = h.store.read().await.users[0].user_id.to_string();
+        h.hy2.with(|i| {
+            i.traffic
+                .insert(9999, BTreeMap::from([(id.clone(), TxRx { tx: 5, rx: 0 })]));
+        });
+        // 住宅的 QueryStats（住宅那两条里的第一条）失败一次；它之后的 `/connections`
+        // 与 Xray 照常应答
+        h.hy2resi.fail_next("v2ray_api 不可达");
+        h.hy2resi
+            .set_conns(vec![("c1", "auth_user=alice => route(gate-r000)")]);
+        h.xray.with(|i| {
+            i.deltas.insert(id.clone(), TxRx { tx: 0, rx: 9 });
+        });
+        let (_, names) = sample_args(&h).await;
+        let s = sample_once(&h.shared, &[9999], &names).await;
+        assert_eq!(s.deltas.len(), 1);
+        assert_eq!(
+            s.deltas[&id],
+            TxRx { tx: 5, rx: 9 },
+            "它之前的直连 5 字节 + 它之后的 Xray 9 字节都要在"
+        );
+        assert!(s.xray_ids.contains(&id), "Xray 的在线窗口也不能丢");
+        assert_eq!(s.online[&id], 1, "它之后的住宅 /connections 照样归组");
+        assert_eq!(s.errors.len(), 1, "{:?}", s.errors);
+        assert!(s.errors[0].contains("住宅 HY2"), "{:?}", s.errors);
+        assert!(
+            h.hy2resi.calls().contains(&"connections".to_string()),
+            "住宅计量挂了不许跳过同轮的 /connections：{:?}",
+            h.hy2resi.calls()
+        );
+    }
+
+    /// 住宅的字节与在线数要真的落进**生产路径**：`tick` 自己那一次
+    /// `resi_name_to_user` 读出的换键表。
+    ///
+    /// 三条 `sample_once` 用例都自带换键表（`sample_args` 是 `tick` 那一读的复制品），
+    /// 所以 `tick` 里那一段是零覆盖：把它换成空表，住宅流量与在线会被整条丢掉（用户
+    /// 跑住宅永不计费、超限永不触发），而全套用例照旧全绿。本用例就是钉这一段。
+    #[tokio::test]
+    async fn tick_books_the_residential_bytes_and_connections_with_its_own_name_table() {
+        let h = harness().await;
+        with_pool(&h).await;
+        let ctx = ctx_of(&h);
+        // 住宅是**唯一**的来源：直连与 Xray 一个字节都不给，落盘的数只可能来自住宅
+        h.hy2resi.set_deltas(BTreeMap::from([(
+            "alice".to_string(),
+            TxRx { tx: 3, rx: 4 },
+        )]));
+        h.hy2resi.set_conns(vec![
+            ("c1", "auth_user=alice => route(gate-r000)"),
+            ("c2", "auth_user=alice => route(gate-r000)"),
+        ]);
+        tick(&ctx, &h.shared).await.unwrap();
+        let id = h.store.read().await.users[0].user_id;
+        assert_eq!(
+            h.shared.pending().await.get(&id).copied(),
+            Some(TxRx { tx: 3, rx: 4 }),
+            "住宅增量经 tick 的换键表进了内存账"
+        );
+        assert_eq!(
+            h.shared.cache().await.stats.get("alice").copied(),
+            Some(TxRx { tx: 3, rx: 4 }),
+            "面板缓存里也是这笔"
+        );
+        assert_eq!(
+            h.shared.cache().await.online.get("alice").copied(),
+            Some(2),
+            "在线数 = /connections 里归到他的条数"
+        );
+        assert!(h.shared.cache().await.errors.is_empty());
+
+        // 第二轮到点落盘：两轮的住宅字节一起进 `usage`
+        h.hy2resi.set_deltas(BTreeMap::from([(
+            "alice".to_string(),
+            TxRx { tx: 0, rx: 5 },
+        )]));
+        h.host.advance(31);
+        tick(&ctx, &h.shared).await.unwrap();
+        assert_eq!(
+            h.store.read().await.users[0].usage.total_bytes,
+            12,
+            "3 + 4 + 5 全部落进期望态（住宅计量的唯一生产路径）"
+        );
+        assert!(h.shared.pending().await.is_empty());
     }
 
     #[tokio::test]
     async fn one_dead_source_does_not_lose_the_others() {
         let h = harness().await;
+        with_pool(&h).await;
         let id = h.store.read().await.users[0].user_id.to_string();
+        // 直连的 /traffic 与 /online 双双失败、住宅的 /connections 失败、Xray 失败，
+        // 只剩住宅的 QueryStats 活着 —— 它那 7 字节必须照旧入账。
         h.hy2.with(|i| {
-            i.fail_ports.insert(9998);
-            i.traffic
-                .insert(9999, BTreeMap::from([(id.clone(), TxRx { tx: 7, rx: 0 })]));
+            i.fail_ports.insert(9999);
+        });
+        h.hy2resi.set_deltas(BTreeMap::from([(
+            "alice".to_string(),
+            TxRx { tx: 0, rx: 7 },
+        )]));
+        h.hy2resi.with(|i| {
+            i.fail_on.insert("connections".into());
         });
         h.xray.with(|i| {
             i.fail_on.insert("query".into());
         });
-        let s = sample_once(
-            &h.shared,
-            &[
-                HY2_STATS_PORT_DIRECT,
-                crate::modules::panel::HY2_STATS_PORT_RESI,
-            ],
-        )
-        .await;
-        assert_eq!(s.deltas[&id], TxRx { tx: 7, rx: 0 });
+        let (_, names) = sample_args(&h).await;
+        let s = sample_once(&h.shared, &[9999], &names).await;
+        assert_eq!(s.deltas[&id], TxRx { tx: 0, rx: 7 });
         assert_eq!(
             s.errors.len(),
-            3,
-            "住宅的 traffic 与 online 各一条 + Xray 一条：{:?}",
+            4,
+            "直连 traffic / online + 住宅 /connections + Xray 各一条：{:?}",
             s.errors
         );
-        assert!(s.errors.iter().any(|e| e.contains("9998")));
+        assert_eq!(
+            s.errors.iter().filter(|e| e.contains("住宅 HY2")).count(),
+            1,
+            "住宅那条错误要认得出是住宅的：{:?}",
+            s.errors
+        );
     }
 
     #[tokio::test]
@@ -568,9 +866,13 @@ mod tests {
         assert!(!h.shared.cache().await.online.contains_key("alice"));
     }
 
+    /// 限额触发的踢人：直连仍打 `:9999` 的 `/kick`；住宅没有这个接口，改成
+    /// **门切 `deny`**（`interrupt_exist_connections` 当场断掉存量流）+ 逐条
+    /// `DELETE /connections/{id}` 兜底（spec §5.2）。
     #[tokio::test]
-    async fn exceeding_the_quota_kicks_both_instances_and_blocks_the_snapshot() {
+    async fn exceeding_the_quota_kicks_the_direct_port_and_denies_the_residential_gate() {
         let h = harness().await;
+        with_pool(&h).await;
         let ctx = ctx_of(&h);
         let id = h.store.read().await.users[0].user_id;
         h.store
@@ -585,24 +887,44 @@ mod tests {
                 BTreeMap::from([(id.to_string(), TxRx { tx: 20, rx: 0 })]),
             );
         });
+        h.hy2resi.set_conns(vec![
+            ("c1", "auth_user=alice => route(gate-r000)"),
+            ("c9", "auth_user=r001 => route(gate-r001)"),
+        ]);
         tick(&ctx, &h.shared).await.unwrap();
         let snap = crate::modules::panel::snapshot::read(&h.shared.snapshot_path());
         assert!(snap.users["alice"].blocked, "快照拒绝是主保障（spec §4.2）");
         assert!(
-            h.hy2.calls().contains(&format!("kick:9999:{id}"))
-                && h.hy2.calls().contains(&format!("kick:9998:{id}")),
-            "两个实例都要 kick：{:?}",
+            h.hy2.calls().contains(&format!("kick:9999:{id}")),
+            "{:?}",
             h.hy2.calls()
         );
-        assert!(h
-            .xray
-            .calls()
-            .iter()
-            .any(|c| c.starts_with(&format!("remove:vless-direct:{id}"))));
-        // 第二轮不重复 kick
+        assert!(
+            !h.hy2.calls().iter().any(|c| c.starts_with("kick:9998")),
+            "住宅不再有 trafficStats 端口：{:?}",
+            h.hy2.calls()
+        );
+        let calls = h.hy2resi.calls();
+        assert!(
+            calls.contains(&"select:gate-r000:deny".to_string()),
+            "{calls:?}"
+        );
+        assert!(
+            calls.contains(&"close:c1".to_string()),
+            "逐条 DELETE 兜底：{calls:?}"
+        );
+        assert!(
+            !calls.contains(&"close:c9".to_string()),
+            "别人的连接一条都不许动：{calls:?}"
+        );
+        // 第二轮不重复 kick（`newly_blocked` 是差分）
         h.hy2.clear_calls();
+        h.hy2resi.clear_calls();
         tick(&ctx, &h.shared).await.unwrap();
         assert!(!h.hy2.calls().iter().any(|c| c.starts_with("kick:")));
+        let calls = h.hy2resi.calls();
+        assert!(!calls.iter().any(|c| c.starts_with("select:")), "{calls:?}");
+        assert!(!calls.iter().any(|c| c.starts_with("close:")), "{calls:?}");
     }
 
     #[tokio::test]
@@ -647,9 +969,7 @@ mod tests {
     async fn the_health_summary_lands_in_runtime_extra() {
         let h = harness().await;
         let ctx = ctx_of(&h);
-        h.hy2.with(|i| {
-            i.fail_ports.insert(9998);
-        });
+        h.hy2resi.fail_next("v2ray_api 不可达");
         tick(&ctx, &h.shared).await.unwrap();
         write_health_summary(&ctx, &h.shared).await;
         let v = h.runtime.read().await.extra["users"].clone();
@@ -663,23 +983,182 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|e| e.as_str().unwrap().contains("9998")),
+                .any(|e| e.as_str().unwrap().contains("住宅 HY2")),
             "采样错误要能在 `/api/users/health` 里看见：{v}"
         );
     }
 
+    /// 住宅的计量从 trafficStats 搬走之后，采样端口表就只剩直连那一个 ——
+    /// **增删槽位不再影响它**（spec §5.1）。
     #[test]
-    fn stats_ports_follow_the_slot_table() {
+    fn stats_ports_is_only_the_direct_instance() {
         let mut s = crate::testutil::sample_state();
-        assert_eq!(stats_ports(&s), vec![9999, 9998], "单槽 = 今天的两个端口");
+        assert_eq!(stats_ports(&s), vec![9999]);
         s.residential.slots = (0..3)
             .map(|i| bui_schema::model::Slot {
                 index: i,
                 upstream_id: uuid::Uuid::from_u128(u128::from(i) + 1),
             })
             .collect();
-        assert_eq!(stats_ports(&s), vec![9999, 9998, 9997, 9996]);
-        assert_eq!(resi_stats_ports(&s), vec![9998, 9997, 9996]);
-        assert!(!stats_ports(&s).contains(&9995), "只枚举真实存在的槽");
+        assert_eq!(
+            stats_ports(&s),
+            vec![9999],
+            "住宅槽位不再带 trafficStats 端口"
+        );
+    }
+
+    /// 住宅两条控制面的返回键是**凭据 name**（迁移用户 = 用户名、新发 = 凭据 id），
+    /// 采样与在线都得经这张表换成 `user_id`；空闲凭据不属于任何人。
+    #[test]
+    fn residential_keys_are_credential_names_and_map_back_to_user_ids() {
+        let mut s = crate::testutil::sample_state();
+        assert!(
+            resi_name_to_user(&s).is_empty(),
+            "还没分过凭据 ⇒ 表是空的（住宅那条路的键一个都认不出）"
+        );
+        bui_schema::hy2pool::migrate(&mut s, t0());
+        let id = s.users[0].user_id;
+        let m = resi_name_to_user(&s);
+        assert_eq!(
+            m.get("alice").copied(),
+            Some(id),
+            "迁移用户的 name = 用户名"
+        );
+        assert_eq!(m.len(), 1, "空闲凭据不属于任何用户：{m:?}");
+        assert!(!m.contains_key("r001"));
+        // 新发凭据的 name = 凭据 id：键必须跟着凭据走，不是跟着用户名走
+        let cred = s.residential.hy2_pool.creds[1].clone();
+        assert_eq!(cred.name, cred.id);
+        s.users[0].credentials.hy2_resi_cred = Some(cred.id.clone());
+        let m = resi_name_to_user(&s);
+        assert_eq!(m.get(cred.name.as_str()).copied(), Some(id));
+        assert!(!m.contains_key("alice"));
+    }
+
+    #[test]
+    fn a_user_without_a_credential_has_no_gate_to_deny() {
+        let mut s = crate::testutil::sample_state();
+        let id = s.users[0].user_id;
+        let none = BTreeSet::new();
+        assert!(
+            resi_kick_targets(&s, &[id], &none).is_empty(),
+            "没分过凭据 ⇒ 没有门、也没有连接要关"
+        );
+        bui_schema::hy2pool::migrate(&mut s, t0());
+        assert_eq!(
+            resi_kick_targets(&s, &[id], &none),
+            vec![ResiKickTarget {
+                cred_id: "r000".to_string(),
+                name: "alice".to_string(),
+                restore_to: None,
+            }],
+            "不在回切集合里 ⇒ 踢完停在 deny（限额封禁那条路）"
+        );
+        assert!(
+            resi_kick_targets(&s, &[uuid::Uuid::nil()], &none).is_empty(),
+            "认不出的 user_id 不许拼出门 tag"
+        );
+    }
+
+    /// 手动踢人的后半截（spec §5.2）：未封用户的目标要带回切 tag = 他自己那个槽的出站。
+    #[test]
+    fn an_unblocked_kick_target_carries_its_slot_outbound_to_restore() {
+        let mut s = crate::testutil::sample_state();
+        bui_schema::hy2pool::migrate(&mut s, t0());
+        let id = s.users[0].user_id;
+        let open = BTreeSet::from([id]);
+        assert_eq!(
+            resi_kick_targets(&s, &[id], &open)[0].restore_to.as_deref(),
+            Some("slot-0-out"),
+            "未封用户踢完要回到自己的槽出站"
+        );
+        // 槽 3 上的用户回切到 slot-3-out（回切 tag 跟着他粘的那个 IP 走）
+        let up = uuid::Uuid::from_u128(7);
+        s.residential.slots = vec![bui_schema::model::Slot {
+            index: 3,
+            upstream_id: up,
+        }];
+        s.users[0]
+            .entitlements
+            .residential
+            .as_mut()
+            .unwrap()
+            .slot_id = Some(up);
+        assert_eq!(
+            resi_kick_targets(&s, &[id], &open)[0].restore_to.as_deref(),
+            Some("slot-3-out")
+        );
+        // 住宅权益被撤掉（凭据还没被回收）⇒ 门本来就该是 deny，踢一下不许把它开回去
+        s.users[0].entitlements.residential = None;
+        assert_eq!(
+            resi_kick_targets(&s, &[id], &open)[0].restore_to,
+            None,
+            "没有住宅 hysteria2 权益的人不回切"
+        );
+    }
+
+    /// 没有连接的被封用户也要把门切 `deny`（新握手仍会成功、流必须被拒，spec §6）。
+    #[tokio::test]
+    async fn denying_a_gate_happens_even_with_no_live_connection() {
+        let h = harness().await;
+        with_pool(&h).await;
+        let targets = {
+            let st = h.store.read().await;
+            let id = st.users[0].user_id;
+            resi_kick_targets(st.as_ref(), &[id], &BTreeSet::new())
+        };
+        let closed = kick_residential(&h.shared, &targets).await;
+        assert_eq!(closed, 0, "一条连接都没有");
+        assert_eq!(
+            h.hy2resi.selected().get("gate-r000").map(String::as_str),
+            Some("deny"),
+            "门位必须落在 deny"
+        );
+    }
+
+    /// 未封用户被踢：`deny` 掐断存量流 → 逐条 DELETE → **再切回他的槽出站**
+    /// （spec §5.2 的判据是「未封者下一请求即通」，不能等下一次门位收敛）。
+    /// `/connections` 读不到时回切也不许被跳过 —— 否则他会一直断着。
+    #[tokio::test]
+    async fn kicking_an_unblocked_user_puts_his_gate_back_on_his_slot() {
+        let h = harness().await;
+        with_pool(&h).await;
+        let targets = {
+            let st = h.store.read().await;
+            let id = st.users[0].user_id;
+            resi_kick_targets(st.as_ref(), &[id], &BTreeSet::from([id]))
+        };
+        h.hy2resi
+            .set_conns(vec![("c1", "auth_user=alice => route(gate-r000)")]);
+        assert_eq!(kick_residential(&h.shared, &targets).await, 1);
+        assert_eq!(
+            h.hy2resi.calls(),
+            vec![
+                "select:gate-r000:deny".to_string(),
+                "connections".to_string(),
+                "close:c1".to_string(),
+                "select:gate-r000:slot-0-out".to_string(),
+            ],
+            "顺序是「切 deny → 关连接 → 回切」"
+        );
+        assert_eq!(
+            h.hy2resi.selected().get("gate-r000").map(String::as_str),
+            Some("slot-0-out"),
+            "门位最终停在他自己的槽出站"
+        );
+
+        // `/connections` 挂了也要回切（早返回会让被踢的正常用户一直断到门位收敛）
+        h.hy2resi.clear_calls();
+        h.hy2resi.set_selected(BTreeMap::new());
+        h.hy2resi.with(|i| {
+            i.fail_on.insert("connections".into());
+        });
+        assert_eq!(kick_residential(&h.shared, &targets).await, 0);
+        assert_eq!(
+            h.hy2resi.selected().get("gate-r000").map(String::as_str),
+            Some("slot-0-out"),
+            "{:?}",
+            h.hy2resi.calls()
+        );
     }
 }

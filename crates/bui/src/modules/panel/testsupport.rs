@@ -1,6 +1,6 @@
 //! P2 各任务共用的测试支架（`#[cfg(test)]`）：tempdir 上的一台假机器 + 一个 `AppState`。
 
-use super::fakes::{FakeHy2, FakeXray};
+use super::fakes::{FakeHy2, FakeHy2Resi, FakeXray};
 use super::{PanelModule, Shared};
 use crate::api::{AppState, EventBus};
 use crate::reconcile::Module;
@@ -21,6 +21,8 @@ pub struct Harness {
     pub shared: Arc<Shared>,
     pub xray: FakeXray,
     pub hy2: FakeHy2,
+    /// 住宅 HY2 控制面的 fake（计量 / 在线 / 门位都经它；默认就是它，见 `Shared::new`）
+    pub hy2resi: FakeHy2Resi,
 }
 
 impl Harness {
@@ -52,8 +54,11 @@ pub async fn harness() -> Harness {
     .await
     .unwrap();
     let runtime = Runtime::load(crate::paths::runtime_file(&paths));
-    let (xray, hy2) = (FakeXray::new(), FakeHy2::new());
-    let shared = Arc::new(Shared::new(Box::new(xray.clone()), Box::new(hy2.clone())));
+    let (xray, hy2, hy2resi) = (FakeXray::new(), FakeHy2::new(), FakeHy2Resi::new());
+    let shared = Arc::new(
+        Shared::new(Box::new(xray.clone()), Box::new(hy2.clone()))
+            .with_hy2resi(Box::new(hy2resi.clone())),
+    );
     shared.set_paths(&paths);
     let app = AppState {
         store: store.clone(),
@@ -74,6 +79,7 @@ pub async fn harness() -> Harness {
         shared,
         xray,
         hy2,
+        hy2resi,
     }
 }
 

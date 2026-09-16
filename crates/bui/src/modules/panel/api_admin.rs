@@ -4,7 +4,7 @@
 //! `users::sync_loop` 统一做（幂等 + 60 秒安全网），内核配置重渲染与重启映射由 P1 的对账做。
 
 use super::users;
-use super::{Shared, HY2_STATS_PORT_DIRECT, HY2_STATS_PORT_RESI};
+use super::Shared;
 use crate::api::{AppState, Event};
 use axum::body::Bytes;
 use axum::extract::{Path, State};
@@ -333,26 +333,46 @@ async fn get_online(shared: Arc<Shared>) -> Response {
     ok_json(shared.cache().await.online.clone())
 }
 
+/// 面板的「断开」按钮（`web/app.js` 的 `kickUsers`）。
+///
+/// 直连仍是 `POST /kick` 打 `traffic::stats_ports`（4.1 起只有 `:9999`，住宅那个
+/// `trafficStats` 端口没人监听了）；住宅走门 + `/connections`：切 `deny` 掐断存量流、
+/// 逐条 DELETE 兜底，**未被判拒的人再把门切回他自己的槽**（spec §5.2「未封者下一请求
+/// 即通」）。`success` 只报直连那半的结果 —— 住宅那条是 best-effort，主保障是快照拒绝
+/// 与门位收敛。
 async fn kick(State(app): State<AppState>, shared: Arc<Shared>, body: Bytes) -> Response {
     let Some(names) = parse_json::<Vec<String>>(&body) else {
         return bad_json();
     };
-    let ids: Vec<String> = {
+    let blocked = blocked_now(&app, &shared).await;
+    let (ports, ids, targets) = {
         let state = app.store.read().await;
-        state
+        let picked: Vec<uuid::Uuid> = state
             .users
             .iter()
             .filter(|u| names.contains(&u.username))
-            .map(|u| u.user_id.to_string())
-            .collect()
+            .map(|u| u.user_id)
+            .collect();
+        let open = picked
+            .iter()
+            .copied()
+            .filter(|id| !blocked.contains(id))
+            .collect();
+        let targets = super::traffic::resi_kick_targets(state.as_ref(), &picked, &open);
+        (
+            super::traffic::stats_ports(state.as_ref()),
+            picked.iter().map(uuid::Uuid::to_string).collect::<Vec<_>>(),
+            targets,
+        )
     };
     let mut all_ok = true;
-    for port in [HY2_STATS_PORT_DIRECT, HY2_STATS_PORT_RESI] {
+    for port in ports {
         if let Err(e) = shared.hy2().kick(port, &ids).await {
             tracing::warn!(port, error = %e, "kick 失败");
             all_ok = false;
         }
     }
+    super::traffic::kick_residential(&shared, &targets).await;
     ok_json(json!({"success": all_ok, "kicked": ids.len()}))
 }
 
@@ -543,6 +563,18 @@ mod tests {
 
     async fn app(h: &Harness) -> (axum::Router, String) {
         (mount(&h.app, routes(h.shared.clone())), token(h).await)
+    }
+
+    /// 给 state 建住宅凭据池（迁移口径：alice 拿 `r000`，凭据 `name` = 用户名），
+    /// 住宅那条踢人路径要靠它才有门 tag 可算。
+    async fn with_pool(h: &Harness) {
+        let now = crate::sys::Host::now(h.host.as_ref());
+        h.store
+            .update(|s| {
+                bui_schema::hy2pool::migrate(s, now);
+            })
+            .await
+            .unwrap();
     }
 
     #[test]
@@ -752,13 +784,12 @@ mod tests {
             crate::api::Event::StateChanged("users")
         );
         // 审查意见④：已经建好的 hy2 会话当场踢掉（hy2 只在握手时判凭据），
-        // 踢的是这一刻期望态里的全部实例、只带这一个 user_id
+        // 踢的是这一刻期望态里的全部 trafficStats 实例、只带这一个 user_id ——
+        // 4.1 起住宅不再是 apernet 实例（计量与踢人都在 sing-box 的两个回环面上，
+        // `traffic::stats_ports` 只剩直连那一个端口），住宅侧的轮换是 T11 的事。
         assert_eq!(
             h.hy2.calls(),
-            vec![
-                format!("kick:9999:{}", before.user_id),
-                format!("kick:9998:{}", before.user_id),
-            ],
+            vec![format!("kick:9999:{}", before.user_id)],
             "轮换必须把旧会话踢下线，否则拿着泄露凭据的那一方照旧有流量"
         );
         // 面板列表跟着给出新 token（前端据此拼订阅链接）
@@ -869,11 +900,20 @@ mod tests {
         assert_eq!(o, serde_json::json!({"alice": 2}));
     }
 
+    /// 面板「断开」按钮（`POST /api/kick`）：用户名换成 `user_id`；直连打
+    /// `traffic::stats_ports`（**只剩 `:9999`** —— 4.1 的住宅是 sing-box，`:9998`
+    /// 没人监听，再打它只会让接口恒回 `success: false`）；住宅走门 + `/connections`，
+    /// **未封用户踢完门要回到他自己的槽**（spec §5.2「未封者下一请求即通」）。
     #[tokio::test]
-    async fn kick_translates_usernames_into_user_ids_for_both_instances() {
+    async fn kicking_an_unblocked_user_hits_the_direct_port_and_cycles_his_residential_gate() {
         let h = harness().await;
+        with_pool(&h).await;
         let (r, t) = app(&h).await;
         let id = h.store.read().await.users[0].user_id;
+        h.hy2resi.set_conns(vec![
+            ("c1", "auth_user=alice => route(gate-r000)"),
+            ("c9", "auth_user=r001 => route(gate-r001)"),
+        ]);
         let (s, v) = send(
             &r,
             "POST",
@@ -886,7 +926,57 @@ mod tests {
         assert_eq!(v, serde_json::json!({"success": true, "kicked": 1}));
         assert_eq!(
             h.hy2.calls(),
-            vec![format!("kick:9999:{id}"), format!("kick:9998:{id}")]
+            vec![format!("kick:9999:{id}")],
+            "住宅那个 trafficStats 端口不再被打"
+        );
+        assert_eq!(
+            h.hy2resi.calls(),
+            vec![
+                "select:gate-r000:deny".to_string(),
+                "connections".to_string(),
+                "close:c1".to_string(),
+                "select:gate-r000:slot-0-out".to_string(),
+            ],
+            "切 deny → 只关他自己那条连接 → 回切到他的槽"
+        );
+        assert_eq!(
+            h.hy2resi.selected().get("gate-r000").map(String::as_str),
+            Some("slot-0-out"),
+            "未封用户被踢后门位必须回到 slot-<i>-out"
+        );
+    }
+
+    /// 已被判拒的用户手动踢完**停在 `deny`**（spec §3.3 那一格：「已封者已在 deny」）——
+    /// 踢一下不许把他的门开回去。
+    #[tokio::test]
+    async fn kicking_a_blocked_user_leaves_his_residential_gate_denied() {
+        let h = harness().await;
+        with_pool(&h).await;
+        h.store
+            .update(|s| s.users[0].disabled = true)
+            .await
+            .unwrap();
+        let (r, t) = app(&h).await;
+        let (s, _) = send(
+            &r,
+            "POST",
+            "/api/kick",
+            Some(&t),
+            Some(serde_json::json!(["alice"])),
+        )
+        .await;
+        assert_eq!(s, axum::http::StatusCode::OK);
+        assert!(
+            !h.hy2resi
+                .calls()
+                .iter()
+                .any(|c| c.starts_with("select:gate-r000:slot-")),
+            "被封用户不许回切：{:?}",
+            h.hy2resi.calls()
+        );
+        assert_eq!(
+            h.hy2resi.selected().get("gate-r000").map(String::as_str),
+            Some("deny")
         );
     }
 
