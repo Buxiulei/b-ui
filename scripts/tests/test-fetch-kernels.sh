@@ -122,4 +122,86 @@ assert_eq "0" "$rc" "lock 回退后重新获取成功"
 assert_not_contains "cached" "$out" "lock 回退时不得按旧 sha 假命中缓存"
 assert_eq "$HY_OLD" "$(sha_of "$WORK/out2/bin/hysteria")" "磁盘二进制与回退后的 lock 一致"
 assert_eq "1" "$(grep -c '^bin/hysteria ' "$WORK/out2/.fetched")" "清单每个路径只有一行"
+
+# —— 4.1：build: 行走构建分支（stub build-singbox.sh，零网络零 go）——
+BLOCK="$WORK/kernels-build.lock"
+cat > "$BLOCK" <<EOF
+# kernel role version arch sha256 url
+sing-box target 1.14.1 amd64 SHA_PLACEHOLDER build:SagerNet/sing-box@v1.14.1;go=go1.25.4;tags=with_quic,with_v2ray_api
+EOF
+# 假构建器：argv 先落盘（否则 build: URI 的解析回归只会以 sha 不符出现，与工具链漂移没法区分），
+# 再把固定内容写到 --out，并打印锁需要的三项
+mkdir -p "$WORK/stub-release"
+export ARGV_LOG="$WORK/argv.log"
+cat > "$WORK/stub-release/build-singbox.sh" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$ARGV_LOG"
+out=""; while [[ $# -gt 0 ]]; do case "$1" in --out) out="$2"; shift 2 ;; *) shift ;; esac; done
+printf '#!/bin/sh\necho "sing-box version 1.14.1"\n' > "$out"; chmod 755 "$out"
+printf 'go=go1.25.4 tags=with_quic,with_v2ray_api sha256=%s\n' "$(sha256sum "$out" | cut -d' ' -f1)"
+STUB
+chmod 755 "$WORK/stub-release/build-singbox.sh"
+: > "$ARGV_LOG"
+built_sha=$(printf '#!/bin/sh\necho "sing-box version 1.14.1"\n' | sha256sum | cut -d' ' -f1)
+sed -i "s/SHA_PLACEHOLDER/$built_sha/" "$BLOCK"
+
+out=$(BUI_SINGBOX_BUILDER="$WORK/stub-release/build-singbox.sh" \
+  bash "$ROOT/scripts/ci/fetch-kernels.sh" --out "$WORK/out-build" --lock "$BLOCK" --role target 2>&1)
+rc=$?
+assert_eq "0" "$rc" "build: 行构建成功退 0"
+assert_contains "built sing-box" "$out" "打印了构建分支的日志行"
+assert_eq "$built_sha" "$(sha256sum "$WORK/out-build/bin/sing-box" | cut -d' ' -f1)" "落地的是构建产物"
+
+# build: URI 的每一项都必须原样落到构建器的 argv（只断言 sha 的话，参数拼错也全绿）
+argv=$(cat "$ARGV_LOG")
+assert_eq "1" "$(grep -c . "$ARGV_LOG")" "只调了一次构建器"
+assert_contains "--repo SagerNet/sing-box" "$argv" "透传 build: URI 里的 repo"
+assert_contains "--version 1.14.1" "$argv" "透传版本且去掉 v 前缀"
+assert_contains "--arch amd64" "$argv" "透传 --arch"
+assert_contains "--tags with_quic,with_v2ray_api" "$argv" "透传锁里的 tags="
+assert_contains "--go go1.25.4" "$argv" "透传锁里的 go=（工具链被钉死，sha 才与宿主 Go 解耦）"
+
+# 第二次跑：缓存命中，不再调构建器（构建器换成会失败的版本也必须退 0）
+out=$(BUI_SINGBOX_BUILDER=/bin/false \
+  bash "$ROOT/scripts/ci/fetch-kernels.sh" --out "$WORK/out-build" --lock "$BLOCK" --role target 2>&1)
+assert_eq "0" "$?" "缓存命中不再构建"
+assert_contains "cached" "$out" "命中打印 cached"
+
+# sha 与锁不符 ⇒ 退 4（与下载 sha 不符同码）
+sed -i "s/$built_sha/0000000000000000000000000000000000000000000000000000000000000000/" "$BLOCK"
+rm -rf "$WORK/out-build"
+BUI_SINGBOX_BUILDER="$WORK/stub-release/build-singbox.sh" \
+  bash "$ROOT/scripts/ci/fetch-kernels.sh" --out "$WORK/out-build" --lock "$BLOCK" --role target >/dev/null 2>&1
+assert_eq "4" "$?" "构建产物 sha 与锁不符退 4"
+assert_eq "0" "$([[ -f "$WORK/out-build/bin/sing-box" ]] && echo 1 || echo 0)" "sha 不符时不留下二进制"
+
+# 锁里少了 go= ⇒ 当场判不合规（退 3），不许静默回落到宿主工具链：
+# 那样 sha 只在宿主 Go 恰好等于当初 pin 那版的机器上可重现。
+NOGO="$WORK/kernels-nogo.lock"
+{ printf '# kernel role version arch sha256 url\n'
+  printf 'sing-box target 1.14.1 amd64 %s build:SagerNet/sing-box@v1.14.1;tags=with_quic\n' "$built_sha"
+} > "$NOGO"
+: > "$ARGV_LOG"
+rm -rf "$WORK/out-nogo"
+out=$(BUI_SINGBOX_BUILDER="$WORK/stub-release/build-singbox.sh" \
+  bash "$ROOT/scripts/ci/fetch-kernels.sh" --out "$WORK/out-nogo" --lock "$NOGO" --role target 2>&1); rc=$?
+assert_eq "3" "$rc" "build: URI 缺 go= 退 3"
+assert_contains "build: URI 不合规" "$out" "点名 URI 不合规"
+assert_eq "0" "$(grep -c . "$ARGV_LOG")" "缺 go= 时根本不调构建器"
+
+# 落地（install）失败必须与下载分支同语义：退 3、不写清单、不谎报 built
+BLOCK2="$WORK/kernels-build-ok.lock"
+{ printf '# kernel role version arch sha256 url\n'
+  printf 'sing-box target 1.14.1 amd64 %s build:SagerNet/sing-box@v1.14.1;go=go1.25.4;tags=with_quic,with_v2ray_api\n' "$built_sha"
+} > "$BLOCK2"
+rm -rf "$WORK/out-noperm"
+mkdir -p "$WORK/out-noperm/bin"
+chmod 500 "$WORK/out-noperm/bin"
+out=$(BUI_SINGBOX_BUILDER="$WORK/stub-release/build-singbox.sh" \
+  bash "$ROOT/scripts/ci/fetch-kernels.sh" --out "$WORK/out-noperm" --lock "$BLOCK2" --role target 2>&1); rc=$?
+chmod 755 "$WORK/out-noperm/bin"
+assert_eq "3" "$rc" "build: 行落地失败退 3"
+assert_contains "落地失败" "$out" "有中文错误"
+assert_not_contains "built sing-box" "$out" "落地失败不许打印 built"
+assert_eq "0" "$(grep -c '^bin/sing-box ' "$WORK/out-noperm/.fetched")" "落地失败不写清单"
 finish

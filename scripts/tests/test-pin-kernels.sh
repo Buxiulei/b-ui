@@ -54,8 +54,11 @@ assert_eq "https://github.com/caddyserver/caddy/releases/download/v2.11.4/caddy_
 # lock 已提交且格式合法
 lock="$ROOT/scripts/release/kernels.lock"
 assert_eq "0" "$([[ -f "$lock" ]] && echo 0 || echo 1)" "kernels.lock 已提交"
-bad=$(grep -vE '^#|^$' "$lock" | awk 'NF != 6 || $5 !~ /^[0-9a-f]{64}$/ || $6 !~ /^https:\/\/github\.com\// {print}' | head -1)
-assert_eq "" "$bad" "kernels.lock 每行 6 字段、sha256 合法、URL 是 github 资产"
+bad=$(grep -vE '^#|^$' "$lock" | awk 'NF != 6 || $5 !~ /^[0-9a-f]{64}$/ || $6 !~ /^(https:\/\/github\.com\/|build:)/ {print}' | head -1)
+assert_eq "" "$bad" "kernels.lock 每行 6 字段、sha256 合法、URL 是 github 资产或 build: URI"
+# 随发布分发的 sing-box 必须是自建（spec §5.3：官方归档不带 with_v2ray_api，住宅计量要它）
+nbuild=$(awk '$1 == "sing-box" && $2 == "target" && $6 ~ /^build:.*;tags=.*with_v2ray_api/ {c++} END {print c + 0}' "$lock")
+assert_eq "2" "$nbuild" "sing-box target 两行是 build: URI 且标签含 with_v2ray_api"
 badarch=$(grep -vE '^#|^$' "$lock" | awk '$4 != "amd64" && $4 != "arm64" {print}' | head -1)
 assert_eq "" "$badarch" "arch 列只有 amd64 / arm64（与 manifest 的 artifacts 键同口径）"
 for k in sing-box xray hysteria caddy; do
@@ -81,4 +84,73 @@ out=$(check_lock 2>&1); rc=$?
 assert_eq "1" "$rc" "check minor 漂移（lock 1.12.9 / 轨道 1.12.25）也要退 1"
 assert_contains "sing-box(check 1.12)" "$out" "漂移信息点名到 check minor"
 assert_not_contains "sing-box(check 1.13)" "$(printf '%s\n' "$out" | grep 漂移)" "1.13 没漂移就不报"
+
+# —— 4.1：--write 的自建模式写出 build: URI（stub 构建器）——
+# curl stub：remote_sha256 只用 curl 的 stdout 算 sha，给 URL 本身当内容即可（零网络）
+cat > "$WORK/bin/curl" <<'STUB'
+#!/usr/bin/env bash
+url=""
+for a in "$@"; do case "$a" in https://*) url="$a" ;; esac; done
+[[ -n "$url" ]] || exit 22
+printf '%s\n' "$url"
+STUB
+chmod 755 "$WORK/bin/curl"
+export ARGV_LOG="$WORK/argv.log"
+cat > "$WORK/bin/build-singbox.sh" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$ARGV_LOG"
+out=""; while [[ $# -gt 0 ]]; do case "$1" in --out) out="$2"; shift 2 ;; *) shift ;; esac; done
+printf 'fake\n' > "$out"
+printf 'go=go1.25.4 tags=with_quic,with_v2ray_api sha256=%s\n' "$(sha256sum "$out" | cut -d' ' -f1)"
+STUB
+chmod 755 "$WORK/bin/build-singbox.sh"
+: > "$ARGV_LOG"
+LOCK_OUT="$WORK/out.lock"
+# --lock 没被认出来时 --write 会去覆盖仓库里的真 lock（造过一次），所以前后对一次指纹
+lock_before=$(sha256sum "$lock" | cut -d' ' -f1)
+PATH="$WORK/bin:$PATH" BUI_SINGBOX_BUILDER="$WORK/bin/build-singbox.sh" \
+  bash "$ROOT/scripts/release/pin-kernels.sh" --write --lock "$LOCK_OUT" >/dev/null 2>&1
+assert_eq "0" "$?" "--write 自建模式退 0"
+assert_eq "$lock_before" "$(sha256sum "$lock" | cut -d' ' -f1)" "--write --lock 不许碰仓库里的 kernels.lock"
+line=$(grep '^sing-box target 1.14.5 amd64' "$LOCK_OUT")
+assert_contains "build:SagerNet/sing-box@v1.14.5;go=go1.25.4;tags=with_quic,with_v2ray_api" "$line" \
+  "target 行写成 build: URI（版本来自轨道 minor:1.14 的最高 patch）"
+assert_contains "https://github.com/SagerNet/sing-box/releases/download/v1.12.25/" \
+  "$(grep '^sing-box check 1.12' "$LOCK_OUT")" "check 行仍是上游归档 URL"
+# 构建器的 argv 也要钉：只看锁里那一行的话，把 --arch 丢了、两轮都传 amd64 也照样绿
+assert_eq "1" "$(grep -c -- '--arch amd64' "$ARGV_LOG")" "amd64 被构建一次"
+assert_eq "1" "$(grep -c -- '--arch arm64' "$ARGV_LOG")" "arm64 被构建一次"
+assert_eq "2" "$(grep -c -- '--repo SagerNet/sing-box --version 1.14.5' "$ARGV_LOG")" "两次都用轨道解析出的版本"
+assert_eq "0" "$(grep -c -- '--go' "$ARGV_LOG")" "pin 时不钉工具链（GOTOOLCHAIN=auto 发现版本，写进锁的 go=）"
+
+# --check 也要盯自建行的 tags=：只比版本号的话，改了 env 的 SINGBOX_TAGS 而忘了 --write
+# 是静默 no-op（取件读锁里的 tags=），env 里「Tags 必须 ⊇ 官方」那条纪律就没人兜着。
+LOCK="$WORK/tags.lock"
+tags_lock() { # $1 = 锁里 sing-box target 两行的 tags=
+  { printf '# kernel role version arch sha256 url\n'
+    for a in amd64 arm64; do
+      printf 'sing-box target 1.14.5 %s 9999999999999999999999999999999999999999999999999999999999999999 build:SagerNet/sing-box@v1.14.5;go=go1.25.4;tags=%s\n' "$a" "$1"
+    done
+    printf 'xray target 26.3.27 amd64 7777777777777777777777777777777777777777777777777777777777777777 https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-linux-64.zip\n'
+    printf 'hysteria target 2.12.2 amd64 5555555555555555555555555555555555555555555555555555555555555555 https://github.com/apernet/hysteria/releases/download/app/v2.12.2/hysteria-linux-amd64\n'
+    printf 'caddy target 2.11.4 amd64 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb https://github.com/caddyserver/caddy/releases/download/v2.11.4/caddy_2.11.4_linux_amd64.tar.gz\n'
+    printf 'sing-box check 1.12.25 amd64 dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd https://github.com/SagerNet/sing-box/releases/download/v1.12.25/sing-box-1.12.25-linux-amd64.tar.gz\n'
+    printf 'sing-box check 1.13.21 amd64 eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee https://github.com/SagerNet/sing-box/releases/download/v1.13.21/sing-box-1.13.21-linux-amd64.tar.gz\n'
+  } > "$LOCK"
+}
+
+tags_lock "$SINGBOX_TAGS"
+out=$(check_lock 2>&1); rc=$?
+assert_eq "0" "$rc" "版本与 tags 都贴着 env 时 --check 退 0"
+assert_contains "一致：sing-box tags" "$out" "报告 tags 一致"
+
+tags_lock "${SINGBOX_TAGS%,with_v2ray_api}"
+out=$(check_lock 2>&1); rc=$?
+assert_eq "1" "$rc" "锁里 tags= 与 env 的 SINGBOX_TAGS 不符退 1"
+assert_contains "漂移：sing-box tags" "$out" "漂移信息点名 tags"
+
+tags_lock "$SINGBOX_TAGS"
+sed -i '2s/;tags=.*/;tags=only-one-row-changed/' "$LOCK"
+out=$(check_lock 2>&1); rc=$?
+assert_eq "1" "$rc" "两行 tags= 不一致也算漂移"
 finish

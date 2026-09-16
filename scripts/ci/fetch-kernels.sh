@@ -46,6 +46,32 @@ download() {
     return 1
 }
 
+build_kernel() {
+    # $1 = build:<repo>@v<ver>;go=<go>;tags=<tags>, $2 = 落地路径（裸二进制）
+    local spec repo rest ver go tags builder args
+    spec="${1#build:}"
+    repo="${spec%%@*}"
+    rest="${spec#*@}"
+    ver="${rest%%;*}"; ver="${ver#v}"
+    case "$rest" in *';go='*) go="${rest#*;go=}"; go="${go%%;*}" ;; *) go="" ;; esac
+    case "$rest" in *';tags='*) tags="${rest##*;tags=}" ;; *) tags="" ;; esac
+    # go= 是必填：少了它构建器会回落 GOTOOLCHAIN=auto，sha 就只在宿主 Go 恰好等于
+    # 当初 pin 那版的机器上可重现（宿主一升级就全网 sha 不符，报错还像被投毒）。
+    if [[ -z "$repo" || -z "$ver" || -z "$go" ]]; then
+        printf 'build: URI 不合规（要 build:<repo>@v<ver>;go=<go1.x.y>;tags=<...>）：%s\n' "$1" >&2
+        return 1
+    fi
+    builder="${BUI_SINGBOX_BUILDER:-$HERE/../release/build-singbox.sh}"
+    args=(--repo "$repo" --version "$ver" --arch "$ARCH" --out "$2" --go "$go")
+    [[ -n "$tags" ]] && args+=(--tags "$tags")
+    # 构建器的 stdout（go= tags= sha256=）在这里只是日志，锁已经带了这三项
+    if ! "$builder" "${args[@]}" >&2; then
+        printf '构建失败：%s\n' "$1" >&2
+        return 1
+    fi
+    return 0
+}
+
 extract() {
     # $1 = 归档路径, $2 = kernel, $3 = version, $4 = 目标二进制路径
     local tmp rc
@@ -95,23 +121,50 @@ while read -r kernel role version arch sha url; do
     fi
 
     tmp=$(mktemp)
-    if ! download "$url" "$tmp"; then
-        rm -f "$tmp"
-        rc_final=3
-        continue
-    fi
-    got=$(sha256sum "$tmp" | cut -d' ' -f1)
-    if [[ "$got" != "$sha" ]]; then
-        printf 'sha256 不匹配 %s：期望 %s 实际 %s\n' "$url" "$sha" "$got" >&2
-        rm -f "$tmp" "$dst"
-        rc_final=4
-        continue
-    fi
-    if ! extract "$tmp" "$kernel" "$version" "$dst"; then
-        printf '解包失败：%s\n' "$url" >&2
-        rm -f "$tmp"
-        rc_final=3
-        continue
+    if [[ "$url" == build:* ]]; then
+        # 自建来源（今天只有 sing-box target 两行，spec §5.3）：build:<repo>@v<ver>;go=<go>;tags=<tags>
+        # 锁里的 go= 是**被强制的构建输入**（透传 --go，构建器钉死 GOTOOLCHAIN 并断言），不是记账：
+        # 不钉的话 sha 只在宿主 Go 恰好等于当初 pin 那版的机器上可重现。
+        if ! build_kernel "$url" "$tmp"; then
+            rm -f "$tmp"
+            rc_final=3
+            continue
+        fi
+        got=$(sha256sum "$tmp" | cut -d' ' -f1)
+        if [[ "$got" != "$sha" ]]; then
+            printf 'sha256 不匹配 %s：期望 %s 实际 %s\n' "$url" "$sha" "$got" >&2
+            rm -f "$tmp" "$dst"
+            rc_final=4
+            continue
+        fi
+        # build: 行的产物已经是裸二进制，不走 extract；落地失败与下载分支同码（3）
+        if ! install -m 755 "$tmp" "$dst"; then
+            printf '落地失败：%s\n' "$dst" >&2
+            rm -f "$tmp"
+            rc_final=3
+            continue
+        fi
+        line="built $kernel $version ($rel)"
+    else
+        if ! download "$url" "$tmp"; then
+            rm -f "$tmp"
+            rc_final=3
+            continue
+        fi
+        got=$(sha256sum "$tmp" | cut -d' ' -f1)
+        if [[ "$got" != "$sha" ]]; then
+            printf 'sha256 不匹配 %s：期望 %s 实际 %s\n' "$url" "$sha" "$got" >&2
+            rm -f "$tmp" "$dst"
+            rc_final=4
+            continue
+        fi
+        if ! extract "$tmp" "$kernel" "$version" "$dst"; then
+            printf '解包失败：%s\n' "$url" >&2
+            rm -f "$tmp"
+            rc_final=3
+            continue
+        fi
+        line="fetched $rel ($kernel $version)"
     fi
     rm -f "$tmp"
     # 按路径去重（不带 sha）：lock 升级后旧的 `<rel> <旧sha>` 行必须被顶掉，
@@ -120,7 +173,7 @@ while read -r kernel role version arch sha url; do
     awk -v r="$rel" '$1 != r' "$MANIFEST" > "$MANIFEST.new" 2>/dev/null || true
     mv -f "$MANIFEST.new" "$MANIFEST"
     printf '%s %s\n' "$rel" "$sha" >> "$MANIFEST"
-    printf 'fetched %s (%s %s)\n' "$rel" "$kernel" "$version"
+    printf '%s\n' "$line"
 done < "$LOCK"
 
 exit "$rc_final"
