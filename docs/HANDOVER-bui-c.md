@@ -127,6 +127,8 @@
 
 客户端负责人可改：`crates/bui-c/**`、`scripts/bui-c-install.sh`、`scripts/tests/test-bui-c-install.sh`、`crates/bui/src/modules/panel/` 中**分发 `/packages/bui-c-install.sh` 的处理器**（做占位符替换）、本手册、spec §6 与 P4 计划。其它服务端文件先与原会话确认。
 
+账号匹配（4.0.2）那一批判定函数**全在 `crates/bui-c/src/profiles.rs`，服务端没有调用方**：`same_account` / `same_endpoint` / `same_params` / `kind_trusted` / `gate_ok` / `protected` / `movable` / `best_source` / `tombstone_key` 这些自由函数，以及 `Profiles` 上的 `account_group` / `blocked_same_account` / `pick_keeper` / `find_account_before` / `raise_source` / `rename` / `heal_token_names` / `merge_into`；输出文案在 `menu.rs`（`protected_new` / `protected_kept` / `kind_unsure_new` / `dups_head` / `display_name`），编排在 `cli.rs` 的 `store_fetched` / `store_import` / `apply_import` / `menu_import` 与 `import_v3.rs::import`。判定的输入是 `bui_schema::nodes::Node` 的字段（`kind`、`host`、HY2 `username`、Reality `uuid`、端口、`obfs_password`、`sni`、`public_key`、`short_id`）——**改 `Node` 的字段或 kind 口径是服务端的事，会同时改变客户端的账号判定**，两边要一起看。住宅 HY2 的 label「HY2住宅」被这套判定依赖（`profile_name` 与 kind 判定都从它来），服务端 4.1 spec §7.4 已写死不改。
+
 ## 8. 相关记忆与记录
 
 - 会话记忆 `project-baiyi-bui-c-handover`（主理人 2026-09-12 指定客户端由另一 agent 负责；baiyi 现场状态）。
@@ -148,3 +150,28 @@
 - **显示**：交互终端清屏重画并加「上次」行；按终端宽度排版，60 列状态行不再折行、40 列手机 SSH 可用（上文 §4 遗留「60 列折行」已解决）；菜单不认全局 `-y`；v3 导入邀请只在还没迁移时出现。
 - **上文 §4 遗留更正**：「已装客户端收不到这些修复」已由同版本比 sha256 解决（见 CHANGELOG 4.0.0）。
 - **仍未做**：卸载前先列清单（T13）、[9] 节点测速、巡检连续失败行、`bui-c test`；第一轮真机验收里侵入性的几项（SOCKS 黑洞验应答码、删活动节点、真 flock 并发）。
+
+## 4.0.2 按账号匹配（2026-09-17）
+
+定稿 `docs/superpowers/specs/2026-09-15-bui-c-account-match-design.md`（T1–T12）。**为服务端 4.1 把住宅 HY2 从「每槽一个端口」改成共享端口做准备**：4.0.x 的客户端遇上端口变化会另起一条新节点，旧节点还连得上、但从另一个住宅 IP 出去（定稿 F5），4.1 上线后每台客户端都会多出副本、当前节点可能一直停在旧端口。这里只列与上文 §2–§4、「菜单 v2 现状」不同的地方；用户可见文案逐条见 CHANGELOG 4.0.2 段与定稿 §10。
+
+- **导入按账号匹配**：账号 = `kind` + `host`（**不区分大小写**，与墓碑 key 同口径）+ 凭据主体（HY2 `username`、Reality `uuid`），从 `node` 现算、**不持久化**。同一账号端口变了就沿用留存者的名字原地替换，打 `更新节点 X：端口 A → B`；留存者次序：活动节点 > 导入前已存在 > 同一连接 > 名字等于 `profile_name` > 列表位置。
+- **当前节点会被挪到服务端这次给的端口**：当前节点若还停在旧槽端口，面板导入后换到服务端为该用户分配的端口，**出口住宅 IP 随之换成服务端分配的那个**。这是有意的——旧端口的副本在兼容转发下线前还能连，但它走的是另一个住宅 IP。
+- **只升不降扩到节点本身**：非面板来件（粘贴 / v3 / 订阅）遇上「面板来源的条目」或「活动节点」时，只有除 `label`、`hop` 以外 `node` 全等才原地替换；否则不覆盖，按挡下的原因打一行说明并给出路（面板那条 → 从面板重新导入；活动节点那条 → 确认新节点能用后切换过去）。挡下时账号组为空就另起新名，组非空就只替换留存者。理由：一条凭据轮换前留下的旧链接粘进来会把活动节点改成旧密码并立即 apply，TUN 下整机断网。现拉的订阅不算过期副本，Subscription 条目之间照旧互相替换。
+- **kind 门槛**：两边 kind 都可信（面板 `/api/nodes` 来源，或备注含「直连」「住宅」）才允许端口不同也算同一账号；任一边是猜的就只认同端口。只可能拦下备注里没有「直连」的 `Direct`；直连端口在 4.1 不变，所以 4.1 的住宅换端口不受影响。受保护条目同时落在门槛外时，说明句在「…不变」之后补「同时认不准是直连还是住宅」。
+- **来源命中即升级**：`ApiNodes > Subscription > Paste = V3`，条目被命中就升到「本次来件 / 条目自身 / 账号组内面板成员」三者中最高的那一级，`Replaced` 与 `Unchanged` 都升，从不降。分流规则同理：非面板来件命中账号时沿用组内面板成员的 `split`。
+- **存量重复不自动合并**：命令行只打 `同一账号还有 N 个节点…（本次已更新 X）` + `要合并请在菜单 [3] 里导入并答 y`；菜单 [3] 在放锁之后、墓碑那一问之后多问 `要合并吗？[y/N]`（默认 N），答 y 另拿一次锁、重读文件、`merge_into` 一次写盘。合并永不碰活动节点（活动节点只要在组里就是留存者），所以不需要 apply。
+- **token 名改名**：导入时把 4.0.0 留下的 token 名改成 `profile_name("", node)`（`<主机>-<kind>`，被占则 `-2`），端口没变、命中同一连接时也改；每条打 `节点 <旧名（打码）> 已改名为 <新名>`。改名与 `active`、墓碑显示名在同一把锁内一次写盘，按内容比较所以不 apply、不重启。**按旧 token 名写的脚本（`bui-c switch <旧名>` 等）会失效**，这一条要写进发版说明。
+- **人读输出打码**：`display_name` 把名字里的 token 段打成前 4 位加省略号，覆盖 `list`、`status`、菜单列表、删除确认块、墓碑名单、「上次：」行、导入与切换输出；`--json`（status / list / delete）与 `profiles.json` **不打码**（机器接口，能跑它们的人本来就能读文件）。后果：打码后的名字不能直接敲进 `switch` / `delete`，出路是菜单按编号选、`list --json` 取原名、或导入一次让它改名——同样写进发版说明。
+- **`import-v3`**：v3 目录里的节点在**本次运行开始前**的列表里已有同一账号时记进 `existing` 跳过，不再多出 `-2`；只跳过、不替换、不合并、不升来源（`<base>/configs` 是 v3 时代的冻结快照）。结果行文案不变。
+- **apply 判定**改成比较导入前后活动节点的内容，不再看名字；菜单「切换到新导入的 X？」改用 `Stored.added`，改名与合并都不再触发，活动节点被挡下时改问 `切换到 {keep}？`。
+- **兼容**：`Profiles` / `Profile` / `Tombstone` 加 `#[serde(flatten)]` catch-all 保住未知字段（`node` 不加，它由服务端下发、每次导入整条覆盖，加了会削弱总纲 C1）；`SCHEMA_VERSION` 不动，没有新增持久化字段。catch-all **只保护降到 4.0.2 及以后的版本**；降到 4.0.0 照旧丢墓碑、token 名复发。定稿 §6.4 判定本改动**不触发** C5：不必因为降级丢字段的风险去关 baiyi 的自动更新。（下一条里验收期间的 `--auto off` 是另一回事，为的是别被面板那一版盖掉待验的构建。）
+- **上线闸门**：客户端拿到哪个 bui-c 由**打了哪个 tag** 决定，与服务端升没升无关。baiyi 必须在打任何 4.0.2 tag **之前**验收本地构建（定稿 §11.6 测试 79），打 `v4.0.2-rc1` 之后再用 CI 的发布件验一遍，验收期间 `bui-c update --auto off`。合入后把「不自动合并同账号重复节点」的实现提交 SHA 交服务端填进 `scripts/release/required-commits.env` 的 `GATE_v4_1`。完整时序见定稿 §12.7。
+
+### 兼容段下线前的操作（给公告和运维照抄）
+
+服务端 4.1 的兼容段 `40001-40007` REDIRECT **不永久保留**：counter 连续 30 天为 0 才 `bui set hy2-resi-compat off`，有命中就顺延，公告与下线之间不少于 30 天，公告里要**单列一段**点名 bui-c。客户端不会自己刷新节点，光说「重新导入」不够——活动节点来源是 V3 / Paste、或被上面「只升不降」挡下的机器，重新导入后当前节点可能仍停在旧端口。所以第 ③ 步以第 ② 步**看到的结果**为准，不以导入时打了哪句提示为准：
+
+> Linux 客户端（bui-c）请在兼容段下线前操作一次：① 从面板复制链接重新导入（`sudo bui-c import --sub -` 粘贴，或菜单 [3]）；面板导入会更新同一账号的旧条目。② 用 `sudo bui-c status` 看当前节点，再用 `sudo bui-c list` 看它的端口是不是新端口（住宅 HY2 为 40000）。③ 如果第 ② 步看到当前节点仍是旧端口：在 `sudo bui-c list` 里找同类型（直连或住宅）、端口是新端口的那一条，确认它能用后 `sudo bui-c switch <它的名字>`（或在菜单里切换）。
+
+30 天零命中的判据兜不住下线前一直关机或离线的机器；这类机器开机后若断网，按上面三步处理。
