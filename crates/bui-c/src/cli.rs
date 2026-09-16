@@ -550,13 +550,35 @@ fn store_fetched<S: Sys, N: Net, P: Prompt>(
     };
     // 存量与本批副本的分界（spec §4）：下标 < known 的是这次导入之前就在的
     let known = prof.profiles.len();
+    // 这一批里已经当过留存者的**存量**条目名（spec §5.4「同一批里同一账号出现两次：
+    // 后一条生效」）：同账号的第二条来件沿用第一条选出的留存者。不定住的话 `pick_keeper`
+    // 第 3 级「与来件同一连接」会让两条来件各自挑中端口相同的那一条，互相把对方报成存量
+    // 重复（两句提示自相矛盾），生效的还是前一条。
+    // 只记下标 < `known` 的：本批刚写入的副本当上留存者，只可能是组里没有存量成员的时候
+    // （有存量成员时 `pick_keeper` 第 2 级必选它），这时没有可矛盾的第二条；记下来反而会
+    // 让后一条来件跟着本批副本走，抢掉 §9「本批条目当场并掉、老名字保住」那一行
+    let mut batch_keepers: Vec<String> = Vec::new();
     for node in &f.nodes {
         let wanted = profile_name(&f.user, node);
         let group = prof.account_group(node, src);
         let (name, is_new, old_port, keep_src, panel_split) = if !group.is_empty() {
-            // ① 账号已在列表里：原地替换
-            let k = prof.pick_keeper(&group, node, &wanted, known);
+            // ① 账号已在列表里：原地替换。本批早先的来件已经为这个账号选过留存者，
+            // 而且它还在组里，就沿用它（上面 `batch_keepers` 的理由）。
+            // 组里有活动节点时不沿用，一律交给 `pick_keeper`（第 1 级就是它）：§5.8 的
+            // 「合并不碰活动节点」依赖「active 只要在组里就是留存者」，沿用不能把它挤掉
+            let has_active = group
+                .iter()
+                .any(|&i| prof.active.as_deref() == Some(prof.profiles[i].name.as_str()));
+            let k = group
+                .iter()
+                .copied()
+                .find(|&i| batch_keepers.contains(&prof.profiles[i].name))
+                .filter(|_| !has_active)
+                .unwrap_or_else(|| prof.pick_keeper(&group, node, &wanted, known));
             let keep = prof.profiles[k].name.clone();
+            if k < known && !batch_keepers.contains(&keep) {
+                batch_keepers.push(keep.clone());
+            }
             let old_port = prof.profiles[k].node.port;
             let keep_src = prof.profiles[k].source;
             // D7：**在 remove 之前**、从合并前的整个账号组里取面板成员的分流（spec §5.5）
@@ -13678,6 +13700,12 @@ mod tests {
                 .is_some_and(|c| c.contains("40000")),
             "活动节点挪过去就要重渲配置：{t}"
         );
+        // 收尾 M2：这条副本恰好已经与来件全等，所以 `dups_head` 只报事实、不许断言
+        // 「与服务端这次给的端口或凭据不一致」——那句话在这一格是假的
+        assert!(
+            crate::profiles::same_params(&got(&s, &pp, "alice-hy2-resi-2").node, &at(40000)),
+            "{t}"
+        );
         assert!(
             said_line(
                 &t,
@@ -13920,6 +13948,117 @@ mod tests {
             10007,
             "{t}"
         );
+    }
+
+    /// 48a（§5.4「后一条生效」）：同一批里同账号的两条可信来件必须认同一个留存者。
+    /// 不定住的话 `pick_keeper` 第 3 级「与来件同一连接」会让两条来件各自挑中端口相同的
+    /// 那一条，互相把对方报成存量重复（两句提示自相矛盾），最后生效的还是前一条。
+    #[test]
+    fn the_same_account_twice_in_a_trusted_batch_keeps_one_keeper() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let first = hy2_uri("alice", "hy2-pw", 10005, "alice-HY2直连");
+        let second = hy2_uri("alice", "hy2-pw", 10007, "alice-HY2直连");
+        listed(
+            &s,
+            &pp,
+            vec![
+                entry(
+                    "bob-hy2-direct",
+                    crate::testutil::hy2_account_node("bob"),
+                    Source::ApiNodes,
+                    split_keywords(),
+                ),
+                entry(
+                    "alice-hy2-direct",
+                    uri_node(&first),
+                    Source::Paste,
+                    crate::profiles::default_split(),
+                ),
+                entry(
+                    "alice-hy2-direct-2",
+                    uri_node(&second),
+                    Source::Paste,
+                    crate::profiles::default_split(),
+                ),
+            ],
+            "bob-hy2-direct",
+        );
+        let t = import_paste(&s, &pp, &[&first, &second]);
+        assert_eq!(
+            names(&s, &pp),
+            vec!["bob-hy2-direct", "alice-hy2-direct", "alice-hy2-direct-2"],
+            "两条存量都还在（合并要菜单答 y）：{t}"
+        );
+        assert_eq!(
+            got(&s, &pp, "alice-hy2-direct").node.port,
+            10007,
+            "两条来件认同一个留存者，后一条生效：{t}"
+        );
+        assert_eq!(
+            t.lines()
+                .filter(|l| l.trim().starts_with("同一账号还有"))
+                .count(),
+            1,
+            "只报一次存量重复，不许两句互相点名：{t}"
+        );
+        assert!(
+            said_line(
+                &t,
+                &menu::dups_head("alice-hy2-direct", &["alice-hy2-direct-2".to_string()])
+            ),
+            "{t}"
+        );
+    }
+
+    /// 48b（§5.8「合并不碰活动节点」）：沿用本批留存者不能把活动节点从留存者位上挤掉。
+    /// 第一条来件够不着受保护的活动节点、只选中了副本；第二条与活动节点同参数、把它带进组，
+    /// 这时留存者必须仍按 `pick_keeper` 第 1 级选活动节点——否则活动节点会被点名成存量重复，
+    /// 而 `merge_into` 又拒绝并掉活动节点，菜单答 y 只会打「节点列表已经变了，没有合并」。
+    #[test]
+    fn a_batch_keeper_never_displaces_the_active_node() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let active = hy2_uri("alice", "hy2-pw", 10000, "alice-HY2直连");
+        let other = hy2_uri("alice", "hy2-pw", 10005, "alice-HY2直连");
+        listed(
+            &s,
+            &pp,
+            vec![
+                entry(
+                    "alice-hy2-direct",
+                    uri_node(&active),
+                    Source::Paste,
+                    crate::profiles::default_split(),
+                ),
+                entry(
+                    "alice-hy2-direct-2",
+                    uri_node(&other),
+                    Source::Paste,
+                    crate::profiles::default_split(),
+                ),
+            ],
+            "alice-hy2-direct",
+        );
+        let before = marks(&s);
+        let t = import_paste(&s, &pp, &[&other, &active]);
+        assert_eq!(
+            got(&s, &pp, "alice-hy2-direct").node.port,
+            10000,
+            "活动节点原地不动：{t}"
+        );
+        assert!(
+            said_line(
+                &t,
+                &menu::dups_head("alice-hy2-direct", &["alice-hy2-direct-2".to_string()])
+            ),
+            "留存者是活动节点，被点名的是副本：{t}"
+        );
+        assert_not_applied(&s, before, "活动节点内容没变", &t);
     }
 
     /// 49：同一批里同一账号出现两次、kind 是猜的且端口不同 → 两条都保留（rc 会覆盖成一条）。
@@ -14535,14 +14674,18 @@ mod tests {
     }
 
     /// 27（§5.6、§8.2、§8.3）：token 名的活动节点遇上换端口——先改名、再按账号原地替换；
-    /// 屏上只有打码后的旧名，改名 / active / 节点一次写盘，配置因端口变 apply 一次。
+    /// 屏上只有打码后的旧名，改名 / active / **墓碑显示名**一次写盘，配置因端口变 apply 一次。
+    ///
+    /// 墓碑那半句要夹具里真有一条 token 名墓碑才钉得住（收尾 M5）：它是**另一个账号**的
+    /// （直连口），不会被这一趟的 `forget` 清掉，也不参与匹配，只被 `heal_token_names`
+    /// 顺手改掉显示名。
     #[test]
     fn token_named_profiles_are_renamed_on_import_and_the_full_token_is_never_printed() {
         let pp = paths();
         let s = FakeSys::new();
         ready(&s);
         wide(&s);
-        listed(
+        let mut prof = listed(
             &s,
             &pp,
             vec![entry(
@@ -14557,6 +14700,15 @@ mod tests {
             )],
             &token_name(),
         );
+        // 删过的直连节点，墓碑名是 4.0.0 留下的 token 名（`bury` 自己不会写出这种名字，
+        // 只有旧文件里才有，所以直接造一条）
+        prof.deleted.push(crate::profiles::Tombstone {
+            key: crate::profiles::tombstone_key(&hy2_direct_node()),
+            name: format!("{TOKEN}-hy2-direct"),
+            at: 7,
+            extra: Default::default(),
+        });
+        prof.save(&s, &pp).unwrap();
         let (before, writes) = (s.calls().len(), s.writes("/opt/bui-c/profiles.json"));
         let t = import_from_panel(&s, &pp, "alice", vec![crate::testutil::hy2_resi_node()]);
         assert_eq!(names(&s, &pp), vec![HEALED_NAME], "{t}");
@@ -14579,10 +14731,28 @@ mod tests {
         );
         assert!(!t.contains(TOKEN), "{t}");
         assert!(!t.contains(&TOKEN[..8]), "半截 token 也不该露出来：{t}");
+        let saved = Profiles::load(&s, &pp).unwrap();
+        assert_eq!(
+            saved
+                .deleted
+                .iter()
+                .map(|x| x.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["panel.example.com-hy2-direct"],
+            "墓碑显示名也在这一次写盘里改掉：{t}"
+        );
+        assert_eq!(
+            (saved.deleted[0].key.as_str(), saved.deleted[0].at),
+            (
+                crate::profiles::tombstone_key(&hy2_direct_node()).as_str(),
+                7
+            ),
+            "墓碑只改显示名：{t}"
+        );
         assert_eq!(
             s.writes("/opt/bui-c/profiles.json") - writes,
             1,
-            "改名、active、节点同一次写盘（C7）：{t}"
+            "改名、active、墓碑显示名、节点同一次写盘（C7）：{t}"
         );
         assert_eq!(restarts_since(&s, before), 1, "端口变了要 apply：{t}");
     }
@@ -15150,6 +15320,73 @@ mod tests {
             !r.asked.iter().any(|q| q.starts_with("切换到")),
             "换端口的是同一条老节点，不该问切换：{:?}",
             r.asked
+        );
+    }
+
+    /// 60a（§11.2 测试 41 的菜单那一半）：本批副本被当场并掉不是新节点，菜单不问切换。
+    /// 夹具与 `a_batch_written_copy_is_merged_on_the_spot_and_not_counted_as_new` 同一份，
+    /// 只把命令行换成菜单 `[3]` 粘贴。
+    ///
+    /// **钉的是菜单接线，不是 `added` 名单的守卫**：切换候选还要过一道「导入之后列表里还在
+    /// 不在」的过滤（`menu_import` 里的 `cands.retain`），所以「当场并掉」与「after 过滤」
+    /// 两层都失效这一问才会冒出来。`added` 里不留并掉的名字这一层由测试 41 在命令行钉住。
+    #[test]
+    fn menu_import_batch_written_copy_does_not_offer_to_switch() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        listed(
+            &s,
+            &pp,
+            vec![
+                entry(
+                    "bob-hy2-direct",
+                    crate::testutil::hy2_account_node("bob"),
+                    Source::ApiNodes,
+                    split_keywords(),
+                ),
+                entry(
+                    "hysteria2-1785892136",
+                    bui_schema::nodes::Node {
+                        label: "alice-HY2直连".into(),
+                        ..hy2_account("alice", "hy2-pw")
+                    },
+                    Source::V3,
+                    crate::testutil::split_global(),
+                ),
+            ],
+            "bob-hy2-direct",
+        );
+        let guessed = hy2_uri("alice", "hy2-pw", 10005, "custom");
+        let trusted = hy2_uri("alice", "hy2-pw", 10005, "alice-HY2直连");
+        let inputs = import_inputs(&[&guessed, &trusted], &[]);
+        let refs: Vec<&str> = inputs.iter().map(String::as_str).collect();
+        let n = FakeNet::new();
+        let r = run_menu(&s, &n, &pp, &refs, true);
+        assert_eq!(
+            names(&s, &pp),
+            vec!["bob-hy2-direct", "hysteria2-1785892136"],
+            "本批副本当场并掉：{}",
+            r.t
+        );
+        assert_eq!(
+            got(&s, &pp, "hysteria2-1785892136").node.port,
+            10005,
+            "{}",
+            r.t
+        );
+        assert!(
+            !r.asked.iter().any(|q| q.starts_with("切换到")),
+            "并掉的不是新导入的节点，不该问切换：{:?}\n{}",
+            r.asked,
+            r.t
+        );
+        assert!(
+            !r.asked.iter().any(|q| q == menu::MERGE_ASK),
+            "本批副本不作存量重复，不该问合并：{:?}\n{}",
+            r.asked,
+            r.t
         );
     }
 

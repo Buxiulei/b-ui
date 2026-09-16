@@ -397,6 +397,7 @@ fn store_fetched<S: Sys, N: Net, P: Prompt>(
 ) -> Stored {
     let mut out = Stored::default();
     let known = prof.profiles.len();
+    let mut batch_keepers: Vec<String> = Vec::new();   // 本批已当过留存者的**存量**条目名
     for node in &f.nodes {
         let wanted = profile_name(&f.user, node);
         let group = prof.account_group(node, src);
@@ -404,8 +405,17 @@ fn store_fetched<S: Sys, N: Net, P: Prompt>(
         let (name, is_new, old_port, keep_src, panel_split) = if !group.is_empty() {
             // ① 账号已在列表里：原地替换。不看名字，也不看墓碑（它本来就在，不算「回来」，
             //    与 rc cli.rs:493-496 的立场一致，从「同一连接」扩大到「账号组」）
-            let k = prof.pick_keeper(&group, node, &wanted, known);
+            // 本批早先的来件已经为这个账号选过留存者、它还在组里，就沿用它（见下面「后一条生效」）；
+            // 组里有活动节点时不沿用，交给 pick_keeper 第 1 级——§5.8 依赖「active 在组里就是留存者」
+            // `Profiles::is_active` 不是公共 API，实现里比 `prof.active`
+            let has_active = group.iter()
+                .any(|&i| prof.active.as_deref() == Some(prof.profiles[i].name.as_str()));
+            let k = group.iter().copied()
+                .find(|&i| batch_keepers.contains(&prof.profiles[i].name))
+                .filter(|_| !has_active)
+                .unwrap_or_else(|| prof.pick_keeper(&group, node, &wanted, known));
             let keep = prof.profiles[k].name.clone();
+            if k < known && !batch_keepers.contains(&keep) { batch_keepers.push(keep.clone()); }
             let old_port = prof.profiles[k].node.port;
             let keep_src = prof.profiles[k].source;
             // D7：合并前的整个账号组里找面板来源成员，取它的分流
@@ -516,7 +526,10 @@ fn best_source(src: Source, keep: Option<Source>, has_panel_member: bool) -> Sou
 逐条说明：
 
 - **范围只限这批节点涉及的账号。** 这批没带到的账号，列表里有重复也不动、不提示。
-- **同一批里同一账号出现两次（门槛内）：后一条生效。** 第二条命中第一条刚写入（或刚替换）的留存者，走 ①。面板来源不会出现这种批次（`nodes_for` 每种 kind 最多一个节点，`nodes.rs:110-150`）。
+- **同一批里同一账号出现两次（门槛内）：后一条生效。** 第二条命中第一条刚写入（或刚替换）的留存者，走 ①。**留存者由 `batch_keepers` 定住**（收尾 M1）：组里已经当过本批留存者的存量条目优先于 `pick_keeper`。不定住的话，第 3 级「与来件 `same_endpoint`」会让两条来件各自挑中端口**恰好相同**的那一条——列表里本来就有同账号两条（例如 `:10005` 与 `:10007`）、这次粘贴又把这两个端口都带上时可达——于是两条来件互相把对方报成存量重复，打出「…：p2（本次已更新 p1）」紧接着「…：p1（本次已更新 p2）」两句自相矛盾的提示，而最后生效的还是**前**一条。原来那句论证只在组里只有一条存量成员时成立。
+  **组里有活动节点时不沿用**：一律交给 `pick_keeper`（第 1 级就是活动节点）。§5.8 的「合并不碰活动节点」建立在「active 只要在组里就是留存者」上，沿用把它挤下去的话，活动节点会被点名成存量重复，而 `merge_into` 又拒绝并掉活动节点，菜单答 y 只会打 `节点列表已经变了，没有合并`（`a_batch_keeper_never_displaces_the_active_node`）。
+  **只记存量留存者**（下标 < `known`）：本批刚写入的副本当上留存者，只发生在组里没有存量成员的时候（有的话 `pick_keeper` 第 2 级必选存量那条），这时没有可矛盾的第二条；记下来反而会让后一条来件跟着本批副本走，抢掉下面「本批副本当场并掉、老名字保住」那一条（§9 同名行、`a_merged_batch_copy_is_cleared_from_every_name_list`）。面板来源不会出现这种批次（`nodes_for` 每种 kind 最多一个节点，`nodes.rs:110-150`）。
+  **沿用压过第 3 级「与来件 `same_endpoint`」，面板成员也不例外**（M1 的已知后果，本轮不改）：一次粘贴同时带旧链接与现链接，组里又有一条 `ApiNodes` 成员恰好停在**后**一条来件的参数上时，留存者仍是前一条来件定住的那条（例如粘贴来的 `alice-hy2-direct`），面板那条被点名成存量重复、菜单答 y 会把它并掉，合并后留的是留存者的名字（不是 `c-<n>` 形式时 D9 取回规范名不触发）——M1 之前这一格的留存者是面板那条。功能上等价：来源与分流经 `best_source` / `panel_split` 从合并前的整个组里继承，提示也不自相矛盾，只是名字换了一个。要收口的话，在沿用前多一道「组里有 `ApiNodes` 且与来件 `same_endpoint` 的存量成员就交回 `pick_keeper`」即可，留到 4.1。
 - **同一批里同一账号出现两次（kind 是猜的、端口不同）：两条都保留。** 第二条不在门槛内，走 ③，打 `kind_unsure_new`。rc 在这里会覆盖成一条、丢掉一个端口，新行为更安全。
 - **本批副本当场并掉的可达场景**：列表里有存量可信条目 X（跨端口，且**非活动、非面板来源**，所以不受保护——第一条猜 kind 的来件对它报的是 `KindUnsure`，A1），同一次粘贴先来一条猜 kind 的（③ 新建 Y），再来一条同端口可信的 → 组 = [X, Y] → 留存者 X（导入前已存在）→ Y 被当场并掉。Y 那条 `kind_unsure_new` 说明已经打出去了，留在输出里（第三方批次才会这样，接受）。
 - **① 的 upsert 结果**：端口或密码变了必然 `Replaced`；已经一致则 `Unchanged`，但来源照样经 `raise_source` 升级（`profiles.json` 因此可能重写一次，`prof != loaded`，`cli.rs:694`）。结果行「导入 N 个新节点」只数 `added`，端口变化不算新节点。
@@ -598,7 +611,8 @@ fn store_import(...) -> Result<Imported> {
 事实（F5）：4.1 之前旧槽端口的副本能用、从另一个住宅 IP 出去。所以不自动合并，文案也不暗示「死节点」。
 
 - **提示句**（命令行与菜单同一句，`menu::dups_head`，经 `tell` 折行；名单复用 `buried_list` 的个数上限 `BURIED_LIST_MAX`（`menu.rs:774`）与净化，并过 `display_name`，不截断）：
-  `同一账号还有 {N} 个节点与服务端这次给的端口或凭据不一致：{a、b}（本次已更新 {X}）`
+  `同一账号还有 {N} 个节点：{a、b}（本次已更新 {X}）`
+  **这句只报事实、不断言原因**（收尾 M2）：组里的非留存者副本可能恰好**已经**与来件全等——rc 留下的 `-2` 正停在新端口上（测试 42），或者它占着留存者要取回的规范名（测试 65，D9）——原来那句「与服务端这次给的端口或凭据不一致」在这两格里与事实相反。改文案而不是把已全等的副本从名单里滤掉：滤掉会连这两条合并出路一起消掉，而它们正是本版要收拢的主场景（rc 迁移遗留的 `-2`、D9 取回规范名）。
 - **命令行**：只打这一句，外加 `要合并请在菜单 [3] 里导入并答 y`；不问、不改，退出码不变。
 - **菜单 `[3]`**：导入之后、**放锁之后**（与墓碑那一问同一位置，spec §0.2 R11），墓碑那一问（含答 y 的第二趟）结束之后问 `要合并吗？`（名单已在 `dups_head` 里，问句本身短，40 列放得下；`[y/N]` 由 `Prompt::confirm` 补，默认 N，EOF 按 N）。答 y：另拿一次锁、重读 `profiles.json`，对每个 `DupGroup` 调 `merge_into`，一次写盘；经 `tell` 打 `已把 {a、b} 并入 {X}`——这里的 `{X}` 是**合并那一刻留存者的名字**（`Merged::renamed_from` 有值时就是那个旧名），取回规范名由紧随其后的 `节点 {旧名} 已改名为 {新名}` 单说；拿改完的新名字去拼，D9 场景会打出「已把 c 并入 c」。
 - **合并那次锁拿不到**：上一条说的「另拿一次锁」是因为第一趟导入那把锁在问「要合并吗？」之前就放了（spec §0.2 R11），人看提示的这段时间里别的会话可能改过列表。照 `wait_for_lock` 先打一句 `另一个 bui-c 操作正在进行，等它结束（最多 15 秒）…`、最多等 15 秒，还拿不到这把锁时打 `失败：另一个 bui-c 操作还没结束，没有合并，稍后再试` 后回菜单，两条重复节点都留着。**这里不能用通用的 `LOCK_BUSY`**（「另一个 bui-c 操作还没结束，这次什么都没改，稍后再试」）：第一趟导入早就写过盘了，「这次什么都没改」在这里是假话，没做的只有合并。
@@ -811,6 +825,7 @@ pub fn display_name(name: &str) -> Cow<'_, str>;
 | 订阅刷新遇上 Subscription 来源的活动节点，端口变了 | 允许替换（面板取失败、退回订阅路径的机器上的 4.1 换端口） | §5.3 |
 | V3 / Paste 活动节点先被同参数的订阅刷新过一次（`Unchanged`），之后订阅换端口 | 第一次命中已把来源升成 Subscription → 第二次原地替换，不打 `protected_new` | §5.5 |
 | V3 / Paste 活动节点从未被订阅或面板命中过，订阅刷新时端口已变 | 仅同参数才替换 → 另起一条（组为空时），打「当前节点不变；确认新节点能用后可以切换过去」；组里另有可替换的副本时按 §5.4 ① 替换那一条并说明 | §5.3、§13 R11 |
+| **面板取失败、退回订阅路径的机器上，被挡下的那条来源已是 `ApiNodes`** | 报 `PanelEntry`，出路句说「要更新它请从面板重新导入」——而这台机器恰恰是面板接口取不到才退回订阅的，这条出路对它**暂时不可行**：要么等面板恢复，要么按提示切换到新起的那一条。**已知取舍，不改代码**（与 R11 同性质：宁可挡下也不让过期副本覆盖面板数据；订阅来件对 `ApiNodes` 条目恒受保护，§5.3 的例外只给「订阅来件遇订阅条目」） | §5.3、§13 R11 |
 | V3 条目被同参数的面板导入命中过，之后粘贴过期链接 | 已升成 ApiNodes → 受保护，粘贴另起一条 | §5.5 |
 | Reality uuid 轮换 | 不在范围：新 uuid 就是新账号 → ③ 起 `-2`，旧的留下 | §2 非目标 |
 | host 变了（换域名 / IP） | 不算同一账号，另起新节点（`profiles.rs:153-156` 的理由） | 不改 |
@@ -821,7 +836,7 @@ pub fn display_name(name: &str) -> Cow<'_, str>;
 | 猜错 kind 的活动 profile 遇上面板直连节点 | 门槛挡下，活动节点原样不动 | §5.2 |
 | 猜 kind 的 V3 / Paste profile 与面板节点同端口 | 同端口放行（面板来件不受 §5.3 限制），原地替换，名字保留，来源升成 ApiNodes | §5.2、§5.5 |
 | 备注不含「住宅」的 v3 住宅节点，4.1 后导入 | kind 不同，永不同账号 → 另起 `*-hy2-resi`，旧的留下（兼容段下线前可用） | §1.3 |
-| 同一批同账号两次，门槛内 | 后一条生效，只留一条 | §5.4 |
+| 同一批同账号两次，门槛内 | 后一条生效；账号原本不在列表时只留一条（48），列表里已经有同账号存量副本时本批只更新留存者一条、副本按 §5.8 只提示 / 菜单问（48a） | §5.4 |
 | 同一批同账号两次，kind 是猜的、端口不同 | 两条都保留（rc 会覆盖成一条） | §5.4 |
 | 本批刚写入的副本落进后一条的账号组 | 当场并掉，不提示、不 bury，不算新节点 | §5.4 |
 | 墓碑与活着的同账号 profile 并存 | 活着的赢，刷新并清墓碑（含「删新端口留旧端口」这一有意变化） | §7 |
@@ -858,7 +873,7 @@ pub fn display_name(name: &str) -> Cow<'_, str>;
 | 端口变了 | `更新节点 alice-hy2-resi：端口 40003 → 40000`（经 `tell`，两列缩进、按宽度折行；rc 是「导入 1 个新节点」加一条多余条目） |
 | 只换密码或参数 | `更新节点 alice-hy2-resi`（rc 原文，`say`） |
 | 参数全同 | `节点 alice-hy2-resi 无变化`（rc 原文；来源可能在背后升了一级，不另打一行） |
-| 存量重复 | `同一账号还有 1 个节点与服务端这次给的端口或凭据不一致：alice-hy2-resi-2（本次已更新 alice-hy2-resi）` + `要合并请在菜单 [3] 里导入并答 y` |
+| 存量重复 | `同一账号还有 1 个节点：alice-hy2-resi-2（本次已更新 alice-hy2-resi）` + `要合并请在菜单 [3] 里导入并答 y` |
 | token 改名 | 每条一行 `节点 0123…-hy2-resi 已改名为 panel.example.com-hy2-resi` |
 | 过期链接被面板来源条目挡下（组为空） | `与 alice-hy2-direct 同一账号但连接参数不同，已按新节点导入为 panel.example.com-hy2-direct，alice-hy2-direct 不变；要更新它请从面板重新导入` |
 | 过期链接或订阅被非面板来源的活动节点挡下（组为空） | `与当前节点 hysteria2-1785892136 同一账号但连接参数不同，已按新节点导入为 panel.example.com-hy2-resi，当前节点不变；确认新节点能用后可以切换过去` |
@@ -937,7 +952,7 @@ pub fn display_name(name: &str) -> Cow<'_, str>;
 24. `port_move_keeps_the_suffix_on_the_second_server`：照 `the_same_ascii_username_on_two_servers_keeps_both_nodes`（`cli.rs:3696`）的骨架，第二台的 `-2` 换端口仍是 `-2`、不出现 `-3`。
 25. `port_move_keeps_a_host_kind_name_after_a_panel_import`：先粘贴得到 `panel.example.com-hy2-resi`（40003，非 active），再从面板导入 `alice`（40000）→ 只剩一条，名字不变。
 26. `a_token_named_profile_is_renamed_even_when_the_endpoint_is_unchanged`（C6）
-27. `token_named_profiles_are_renamed_on_import_and_the_full_token_is_never_printed`：存量 `<token>-hy2-resi` 为 active、端口变 → 名字 `panel.example.com-hy2-resi`、active 跟着改；transcript 有 `节点 0123…-hy2-resi 已改名为 panel.example.com-hy2-resi`、不含完整 token；配置因端口变 apply 一次；改名、active、墓碑显示名一次写盘（写 `profiles.json` 恰好一次）。
+27. `token_named_profiles_are_renamed_on_import_and_the_full_token_is_never_printed`：存量 `<token>-hy2-resi` 为 active、端口变 → 名字 `panel.example.com-hy2-resi`、active 跟着改；transcript 有 `节点 0123…-hy2-resi 已改名为 panel.example.com-hy2-resi`、不含完整 token；配置因端口变 apply 一次；改名、active、墓碑显示名一次写盘（写 `profiles.json` 恰好一次）。**夹具里要真有一条 token 名墓碑**（收尾 M5）：它是**另一个账号**的（例如直连口），才不会被这一趟的 `forget` 清掉、也不参与匹配，只被 `heal_token_names` 顺手改掉显示名；`bury` 自己不写 token 名，所以直接造一条 `Tombstone` 塞进 `deleted` 再落盘。断言墓碑显示名已是规范名、`key` 与 `at` 不动。
 28. `renaming_a_token_active_profile_alone_does_not_restart`
 29. `an_unrelated_import_still_renames_leftover_token_names`：粘贴另一台服务器的一条链接，token 名照样改掉。
 30. `a_token_in_a_tombstone_name_is_masked_on_import`：命令行「跳过…」与菜单 `buried_head` 不含完整 token。
@@ -964,7 +979,7 @@ pub fn display_name(name: &str) -> Cow<'_, str>;
   - (b) 该账号里除 P 之外还有一条自身 kind 可信的活动节点 A（备注与 P 同向）→ 两条都进组，留存者按 `pick_keeper` 第 1 级是 A、被原地替换，P 落进 `stale` 转成存量重复（`Stored.dups` 里有它、条目仍在、`deleted` 为空），菜单答 y 才并掉。**A 与 P 都要停在旧参数**（例如都在 :40003、面板推 :40000）：A 若已经是面板新参数，`upsert` 返回 `Unchanged`（`profiles.rs:313-315`）、只升来源，断言的端口变化行与 `Replaced` 都不成立。
 39. `cli_import_reports_duplicates_without_merging`（D2）：`alice-hy2-resi`（40003，active）+ `alice-hy2-resi-2`（40007），面板推 40009 → active 那条 40009、`-2` 原样、有提示两行、`deleted` 为空、apply 新端口。
 40. `duplicates_of_accounts_outside_the_batch_are_left_alone`：不替换、不提示。
-41. `a_batch_written_copy_is_merged_on_the_spot_and_not_counted_as_new`：列表 `hysteria2-1785892136`（V3，备注 `alice-HY2直连`，:10000，非 active；另有 active 节点）；一次粘贴两行 `…@panel.example.com:10005#custom`、`…@panel.example.com:10005#alice-HY2直连` → 留下的是 `hysteria2-1785892136`（端口 10005），`panel.example.com-hy2-direct` 不在列表，结果行 `导入 0 个新节点`，菜单不问切换，没有存量重复提示。
+41. `a_batch_written_copy_is_merged_on_the_spot_and_not_counted_as_new`：列表 `hysteria2-1785892136`（V3，备注 `alice-HY2直连`，:10000，非 active；另有 active 节点）；一次粘贴两行 `…@panel.example.com:10005#custom`、`…@panel.example.com:10005#alice-HY2直连` → 留下的是 `hysteria2-1785892136`（端口 10005），`panel.example.com-hy2-direct` 不在列表，结果行 `导入 0 个新节点`，没有存量重复提示。**菜单那一半单列一格**（收尾 M4）`menu_import_batch_written_copy_does_not_offer_to_switch`：同一份夹具改走菜单 `[3]` 粘贴，断言 `asked` 里没有以「切换到」开头的问句，也没有 `MERGE_ASK`。
 42. `a_stale_active_with_an_up_to_date_duplicate_moves_the_active`：active 是旧端口 40003，`-2` 已是新端口 40000，面板推 40000 → 留存者是 active、被替换成 40000、`config.json` 里是 40000、`-2` 作为存量重复提示。
 43. `an_unchanged_active_with_a_stale_duplicate_does_not_restart`：active 已是新端口，旧端口那条非 active → `Unchanged` + 提示，引擎不重启。
 44. `a_guessed_kind_paste_is_explained_as_a_protected_panel_entry`（A1 改判，原名 `a_guessed_kind_paste_never_moves_across_ports`；断言随之反转）：已有 `alice-hy2-direct:10000`，**来源 `ApiNodes`、是活动节点**（既受保护又落在门槛外），粘贴 `hysteria2://alice:pw@panel.example.com:40003#custom` → 直连不动、active 不变、新增一条；有 `protected_new` 的 `PanelEntry` 那一句、且句中「…不变」之后补了「同时认不准是直连还是住宅」，**没有** `kind_unsure_new` 那一行（A1：保护优先，门槛次之，两条都报）。「不跨端口替换」这条不变量仍由「直连不动、active 不变」钉住。
@@ -972,6 +987,8 @@ pub fn display_name(name: &str) -> Cow<'_, str>;
 46. `a_guessed_kind_profile_on_the_same_port_is_updated_in_place`：**自建** `Source::V3`、备注 `示例备注`（不含直连 / 住宅）的 `hysteria2-1778329470`（:10000）遇上面板 `HY2直连 :10000` → 原地替换、名字保留。
 47. `a_blocked_same_account_entry_with_another_name_is_explained`（D9 ③）：门槛外的同账号条目名字 ≠ wanted 时也打说明行。该条目取**非活动、非 `ApiNodes`**（即不受保护），报的是 `KindUnsure`；「受保护 + 名字不同」的组合在 5a 与 44 里覆盖，不与本条混用。
 48. `the_same_account_twice_in_a_trusted_batch_keeps_the_later_one`
+48a. `the_same_account_twice_in_a_trusted_batch_keeps_one_keeper`（收尾 M1）：列表里已有同账号两条可信条目 `alice-hy2-direct`（:10005，Paste，非活动）与 `alice-hy2-direct-2`（:10007，同上），一次粘贴同时带这两个端口的可信链接 → 留存者只有一个、后一条生效（`alice-hy2-direct` 停在 :10007）、`同一账号还有` 只打一行（不许两句互相点名）、两条存量都还在。
+48b. `a_batch_keeper_never_displaces_the_active_node`（收尾 M1 的守卫）：活动节点 `alice-hy2-direct`（:10000，Paste）+ 副本 `-2`（:10005），粘贴 `:10005`、`:10000` 两条可信链接 → 第一条够不着受保护的活动节点、只选中副本；第二条与活动节点同参数、把它带进组，留存者仍是活动节点：活动节点端口不动、`dups_head` 的留存者是它、被点名的是副本、不 apply。
 49. `the_same_account_twice_in_a_guessed_paste_keeps_both`
 50. `direct_and_residential_sharing_credentials_never_merge_on_port_move`：Reality 与 HY2 各一组。
 51. `family_accounts_on_one_host_never_merge_on_port_move`：`hy2_account_node("bob")`（`testutil.rs:25-37`）。
@@ -990,6 +1007,7 @@ pub fn display_name(name: &str) -> Cow<'_, str>;
 ### 11.3 `cli.rs`：菜单
 
 60. `menu_import_port_move_does_not_offer_to_switch`
+60a. `menu_import_batch_written_copy_does_not_offer_to_switch`（测试 41 的菜单那一半，收尾 M4）。
 61. `menu_import_token_rename_does_not_offer_to_switch`：混入一条真正新增的仍然会问，且问的是那一条（显示名）。
 62. `menu_import_second_pass_new_nodes_are_still_offered`：墓碑答 y 加回的节点仍会追问。
 63. `menu_import_duplicates_answer_no_keeps_both`（D2）：默认 N / EOF → 两条都在，`profiles.json` 在提问之后没有再被写。

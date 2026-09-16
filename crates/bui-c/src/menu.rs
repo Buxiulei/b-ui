@@ -855,14 +855,19 @@ pub const BURIED_RESTORED: &str = "它之前被删过，已恢复";
 // ───────────── 存量重复、改名与切换（spec §5.4、§5.6、§5.8、§5.10） ─────────────
 
 /// 导入之后、存量重复那一问上面的那一句（spec §5.8）：
-/// `同一账号还有 N 个节点与服务端这次给的端口或凭据不一致：a、b（本次已更新 X）`。
+/// `同一账号还有 N 个节点：a、b（本次已更新 X）`。
 ///
 /// 名单的个数上限与净化复用 [`buried_list`]（多于 [`BURIED_LIST_MAX`] 个写成「等 N 个」），
 /// 名字与留存者 `keeper` 都过 [`display_name`]，不截断——折行交给调用方（经 `tell`）。
 /// 4.1 之前旧槽端口的副本还能连、只是从另一个住宅 IP 出去，所以文案不写「死节点」。
+///
+/// **只报事实、不断言原因**（收尾 M2）：组里的非留存者副本可能恰好已经与来件全等——rc 留下
+/// 的 `-2` 正停在新端口上（测试 42），或者它占着留存者要取回的规范名（测试 65，D9）——这时
+/// 「与服务端这次给的端口或凭据不一致」与事实相反。改的是文案不是名单：把已全等的副本滤掉
+/// 会连这两条合并出路一起消掉，而它们正是本版要收拢的场景。
 pub fn dups_head(keeper: &str, others: &[String]) -> String {
     format!(
-        "同一账号还有 {} 个节点与服务端这次给的端口或凭据不一致：{}（本次已更新 {}）",
+        "同一账号还有 {} 个节点：{}（本次已更新 {}）",
         others.len(),
         buried_list(others),
         display_name(keeper)
@@ -3745,17 +3750,17 @@ mod tests {
             .collect();
         assert_eq!(
             dups_head("alice-hy2-resi", &n[..1]),
-            "同一账号还有 1 个节点与服务端这次给的端口或凭据不一致：a（本次已更新 alice-hy2-resi）"
+            "同一账号还有 1 个节点：a（本次已更新 alice-hy2-resi）"
         );
         assert_eq!(
             dups_head("alice-hy2-resi", &n[..3]),
-            "同一账号还有 3 个节点与服务端这次给的端口或凭据不一致：a、b、c（本次已更新 alice-hy2-resi）"
+            "同一账号还有 3 个节点：a、b、c（本次已更新 alice-hy2-resi）"
         );
         // 名单的个数上限与墓碑同一个常量：多出来的写成「等 N 个」，N 是总数
         assert_eq!(BURIED_LIST_MAX, 3);
         assert_eq!(
             dups_head("alice-hy2-resi", &n[..4]),
-            "同一账号还有 4 个节点与服务端这次给的端口或凭据不一致：a、b、c 等 4 个（本次已更新 alice-hy2-resi）"
+            "同一账号还有 4 个节点：a、b、c 等 4 个（本次已更新 alice-hy2-resi）"
         );
         // 名单与留存者都过 display_name；不截断，折行交给调用方（经 `tell`）
         assert_eq!(
@@ -3763,12 +3768,12 @@ mod tests {
                 &format!("{TOKEN}-hy2-resi"),
                 &[format!("{TOKEN}-hy2-resi-2")]
             ),
-            "同一账号还有 1 个节点与服务端这次给的端口或凭据不一致：0123…-hy2-resi-2（本次已更新 0123…-hy2-resi）"
+            "同一账号还有 1 个节点：0123…-hy2-resi-2（本次已更新 0123…-hy2-resi）"
         );
         // 名字先净化：方向键、颜色码里的 ESC 不能原样写回终端
         assert_eq!(
             dups_head("alice-hy2-resi", &["\u{1b}[A".to_string()]),
-            "同一账号还有 1 个节点与服务端这次给的端口或凭据不一致：?[A（本次已更新 alice-hy2-resi）"
+            "同一账号还有 1 个节点：?[A（本次已更新 alice-hy2-resi）"
         );
         // 合并结果行不设上限（它报的是实际并掉了哪几条），名字照样打码
         assert_eq!(
