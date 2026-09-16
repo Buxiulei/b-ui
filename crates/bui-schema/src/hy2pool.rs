@@ -577,6 +577,31 @@ mod tests {
         );
     }
 
+    /// 不变量：池里的凭据 `name` 永远互不相同（走公共 API 造得再满也不许重名）。
+    /// 重名会渲染出两条一模一样的 `auth_user` 规则，sing-box 静默只认第一条 ⇒ 后一条
+    /// 凭据的门永久失效（谁拿到它就走前一个人的门）、两人流量并进一个计数器，
+    /// 而 `sing-box check` 退 0、渲染器也抓不到。
+    #[test]
+    fn cred_names_stay_unique_even_when_a_username_looks_like_an_id() {
+        let mut s = state(5);
+        s.users[2].username = "r005".into(); // 用户名恰好长成凭据 id 的样子
+        migrate(&mut s, datetime!(2026-09-15 00:00 UTC));
+        let taken = taken_names(&s);
+        grow(&mut s.residential.hy2_pool, POOL_MAX, &taken);
+
+        let creds = &s.residential.hy2_pool.creds;
+        assert_eq!(
+            creds.len(),
+            POOL_MAX - 1,
+            "r005 归用户名 ⇒ id 域少一格，grow 到此为止"
+        );
+        let names: BTreeSet<&str> = creds.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names.len(), creds.len(), "凭据 name 互不相同");
+        let ids: BTreeSet<&str> = creds.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids.len(), creds.len(), "凭据 id 互不相同");
+        assert!(!ids.contains("r005"), "被用户名占掉的 id 永不启用");
+    }
+
     /// 把全部空闲凭据标成「刚释放」：24 小时内一条都不许发出去
     fn cool_down_idle(s: &mut State, now: OffsetDateTime) {
         let used = used_ids(s);

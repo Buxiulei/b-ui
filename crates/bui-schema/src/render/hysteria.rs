@@ -373,4 +373,40 @@ mod tests {
             "不能落进住宅跳跃段"
         );
     }
+
+    /// `"127.0.0.1:9092"` 这种监听地址里的端口号。
+    fn port_of(addr: &str) -> u16 {
+        addr.rsplit(':').next().unwrap().parse().unwrap()
+    }
+
+    /// 全部回环管理面与监听端口互不相撞。加新面时**必须**加进这张表，且**端口要从那一面
+    /// 自己的常量取**（写字面量的话，改坏常量这张表照样全绿 —— 它就只是在自证）。
+    #[test]
+    fn every_loopback_management_port_is_distinct() {
+        let ports: Vec<(u16, &str)> = vec![
+            (AUTH_HTTP_PORT, "hy2 直连的 http 鉴权"),
+            (9999, "hy2 直连 trafficStats"),
+            (9091, "relay Clash API"),
+            (
+                port_of(crate::render::hy2_singbox::HY2_RESI_CLASH_API),
+                "住宅 HY2 Clash API",
+            ),
+            (10085, "Xray api"),
+            (
+                port_of(crate::render::hy2_singbox::HY2_RESI_V2RAY_API),
+                "住宅 HY2 v2ray_api",
+            ),
+            (10000, "hy2 直连"),
+            (10001, "reality 直连"),
+            (10002, "reality 住宅"),
+            (40000, "住宅 HY2"),
+            (8080, "面板"),
+        ];
+        let mut seen = std::collections::BTreeMap::new();
+        for (p, who) in ports {
+            if let Some(prev) = seen.insert(p, who) {
+                panic!("端口 {p} 被 {prev} 与 {who} 同时占用");
+            }
+        }
+    }
 }

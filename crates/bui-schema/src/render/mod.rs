@@ -1,5 +1,6 @@
 //! 内核配置、订阅与客户端配置的渲染器。
 pub mod client;
+pub mod hy2_singbox;
 pub mod hysteria;
 pub mod relay;
 pub mod subscription;
