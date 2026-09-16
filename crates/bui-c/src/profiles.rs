@@ -150,6 +150,25 @@ pub enum Blocked {
     KindUnsure,
 }
 
+/// [`Profiles::heal_token_names`] 的结果（spec §5.1、§5.6）。
+#[derive(Debug, Default, PartialEq)]
+pub struct Healed {
+    /// `(旧名, 新名)`。旧名带着订阅 token，只能经 `menu::display_name` 打码后输出（C7）。
+    pub renamed: Vec<(String, String)>,
+    /// 改了显示名的墓碑条数（调用方不读，留着让「改没改」在结构上说得清）。
+    pub tombstones: usize,
+}
+
+/// [`Profiles::merge_into`] 的结果（spec §5.1、§5.8）。
+#[derive(Debug, Default, PartialEq)]
+pub struct Merged {
+    /// 合并之后留存者的名字（可能已按 D9 取回规范名）；留存者不在了就是空串。
+    pub keeper: String,
+    pub removed: Vec<String>,
+    /// 取回规范名时的旧名字，没改名就是 `None`。
+    pub renamed_from: Option<String>,
+}
+
 pub fn kind_slug(kind: NodeKind) -> &'static str {
     match kind {
         NodeKind::RealityDirect => "reality-direct",
@@ -254,9 +273,8 @@ pub fn tombstone_key(node: &Node) -> String {
 /// 墓碑记的名字可能带订阅 token（4.0.0 起过的名字），打码之前先用账号维度的 key 换一个
 /// 干净名字——key 里本来就没有凭据（C7）。
 ///
-/// 定稿 §5.1 写的就是私有函数：只给本文件的 `bury` / `heal_token_names` 用，不进 crate 的
-/// 公共 API。T6 把这两处生产调用点接上之后，删掉下面这行 `allow`。
-#[cfg_attr(not(test), allow(dead_code))]
+/// 定稿 §5.1 写的就是私有函数：只给本文件的 [`Profiles::bury`] 与
+/// [`Profiles::heal_token_names`] 用，不进 crate 的公共 API。
 fn key_display(key: &str) -> String {
     let mut parts = key.split('|');
     let kind = parts.next().unwrap_or_default();
@@ -266,6 +284,17 @@ fn key_display(key: &str) -> String {
     } else {
         format!("{host}-{kind}")
     }
+}
+
+/// `name` 是不是 `<canonical>-<纯数字>`（定稿 D9 的字面判定，spec §5.8）。
+///
+/// 按字面判，不限于 [`free_name`](Profiles::free_name) 实际会起的序号：它从 `-2` 起，
+/// 永远不会起 `-0` / `-1` / `-02`，而这些照样算。后缀必须整段是数字：
+/// `panel.example.com-hy2-resi-2x` 是用户自己起的名字，不回收。
+fn numbered_after(name: &str, canonical: &str) -> bool {
+    name.strip_prefix(canonical)
+        .and_then(|rest| rest.strip_prefix('-'))
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// 同一个连接：[`same_account`]（host 已在那里按小写比过，D6），且 `port` 相同，
@@ -536,6 +565,108 @@ impl Profiles {
         }
     }
 
+    /// 改名，并在同一个结构里同步 `active`（spec §5.1、§8.2）：`new` 已被占用（改成自己
+    /// 也算）或 `old` 不存在时返回 `false`、什么都不动。
+    ///
+    /// 只改名字，`node` / `split` / `source` / `imported_at` 都不动——改名不是内容变化，
+    /// 调用方按 §5.7 的内容比较决定要不要 apply。
+    pub fn rename(&mut self, old: &str, new: &str) -> bool {
+        if self.profiles.iter().any(|p| p.name == new) {
+            return false;
+        }
+        let Some(p) = self.profiles.iter_mut().find(|p| p.name == old) else {
+            return false;
+        };
+        p.name = new.to_string();
+        if self.active.as_deref() == Some(old) {
+            self.active = Some(new.to_string());
+        }
+        true
+    }
+
+    /// 洗掉名字里的订阅 token（spec §5.6、§8.1）：
+    ///   - profile：新名 = `free_name(profile_name("", &node))`，即 `<主机>-<kind>`（被占则
+    ///     `-2`、`-3`），经 [`rename`](Self::rename) 同步 `active`；
+    ///   - 墓碑：只改显示名 = [`key_display`]，`key` 与 `at` 不动（墓碑 key 本来就是账号维度，C7）。
+    ///
+    /// 没有 token 名时**一个字段都不动**：`store_import` 靠 `prof == loaded` 判断要不要重写
+    /// 文件，多动一下就会凭空写盘。
+    ///
+    /// 先收集再改：`free_name` 借的是 `&self`，边遍历边改名借用检查过不去；逐条改也正好让
+    /// 第二条躲开第一条刚占下的名字。
+    pub fn heal_token_names(&mut self) -> Healed {
+        let mut healed = Healed::default();
+        let wanted: Vec<(String, String)> = self
+            .profiles
+            .iter()
+            .filter(|p| name_has_token(&p.name))
+            .map(|p| (p.name.clone(), profile_name("", &p.node)))
+            .collect();
+        for (old, base) in wanted {
+            let new = self.free_name(&base);
+            if self.rename(&old, &new) {
+                healed.renamed.push((old, new));
+            }
+        }
+        for t in &mut self.deleted {
+            if name_has_token(&t.name) {
+                t.name = key_display(&t.key);
+                healed.tombstones += 1;
+            }
+        }
+        healed
+    }
+
+    /// 把 `others` 并入 `keeper`（spec §5.8）：逐条核对「还在、与 `keeper` 同账号、不是
+    /// `active`」才 [`remove`](Self::remove)，**不 [`bury`](Self::bury)**——墓碑是账号级的，
+    /// 记了等于把留存者也判了删除。
+    ///
+    /// 菜单答 y 之后是重读文件再合并的，所以别的会话删过、改过的条目在这里逐条落空、跳过。
+    ///
+    /// 另有一条定稿之外的防御性守卫：`others` 里出现留存者自己时跳过（见下面的注释）。
+    ///
+    /// 规范名（D9）：`c = profile_name("", &keeper.node)`；被并掉的条目里有一条恰好叫 `c`、
+    /// 且留存者叫 `c-<数字>` 时，留存者经 `rename` 取回 `c`（`active` 跟着改）。
+    /// `keeper` 不在了就什么都不做，返回空 [`Merged`]。
+    pub fn merge_into(&mut self, keeper: &str, others: &[String]) -> Merged {
+        // 先把留存者的名字与节点 clone 出来脱离借用：下面要 &mut self
+        let Some((name, node)) = self
+            .profiles
+            .iter()
+            .find(|p| p.name == keeper)
+            .map(|p| (p.name.clone(), p.node.clone()))
+        else {
+            return Merged::default();
+        };
+        let mut merged = Merged {
+            keeper: name.clone(),
+            ..Default::default()
+        };
+        for other in others {
+            // `*other != name` 是定稿三条核对（还在、同账号、不是 active）之外的防御性守卫：
+            // 合规调用（`others` 按 `DupGroup` 构造，本就不含留存者）结果完全一样，
+            // 只挡住误把留存者传进 `others` 的调用——否则留存者会被自己并掉。
+            let mergeable = *other != name
+                && self.active.as_deref() != Some(other.as_str())
+                && self
+                    .profiles
+                    .iter()
+                    .any(|p| p.name == *other && same_account(&p.node, &node));
+            if mergeable && self.remove(other) {
+                merged.removed.push(other.clone());
+            }
+        }
+        let canonical = profile_name("", &node);
+        if merged.removed.contains(&canonical)
+            && numbered_after(&name, &canonical)
+            && self.rename(&name, &canonical)
+        {
+            merged.keeper = canonical;
+            merged.renamed_from = Some(name);
+        }
+        merged
+    }
+
     /// `base` / `base-2` / `base-3` …
     pub fn free_name(&self, base: &str) -> String {
         if !self.profiles.iter().any(|p| p.name == base) {
@@ -581,6 +712,9 @@ impl Profiles {
     /// 记一条墓碑：同 key 先去重（名字与时间跟着这次更新，未知字段从旧墓碑搬过来），
     /// 超过 [`TOMBSTONE_CAP`] 丢最旧的。
     ///
+    /// 名字带订阅 token 时改用 [`key_display`] 现推（spec §7 表末、§8.1）：墓碑名会出现在
+    /// 「要加回来吗」那一问里，token 等价订阅凭据，不留进文件。
+    ///
     /// 调用点只有删除成功落盘那一处，**和 `profiles` 同一次 `save`**（spec §5.7、§0.2 R10）。
     pub fn bury(&mut self, p: &Profile, at: i64) {
         let key = tombstone_key(&p.node);
@@ -591,9 +725,15 @@ impl Profiles {
             .position(|t| t.key == key)
             .map(|i| self.deleted.remove(i).extra)
             .unwrap_or_default();
+        // 名字里带订阅 token 的，用账号维度的 key 现推一个干净名字（C7，spec §7 表末）
+        let name = if name_has_token(&p.name) {
+            key_display(&key)
+        } else {
+            p.name.clone()
+        };
         self.deleted.push(Tombstone {
             key,
-            name: p.name.clone(),
+            name,
             at,
             extra,
         });
@@ -1698,6 +1838,300 @@ mod tests {
         );
     }
 
+    /// 改名同步 active；新名被占或旧名不存在时什么都不动（spec §5.1、§8.2）。
+    #[test]
+    fn rename_moves_active_and_refuses_a_taken_name() {
+        let mut p = Profiles::new_default();
+        p.upsert(prof("a", hy2_direct_node()));
+        p.upsert(prof("b", hy2_resi_node()));
+        p.active = Some("a".into());
+
+        assert!(p.rename("a", "c"));
+        assert_eq!(p.profiles[0].name, "c");
+        assert_eq!(p.active.as_deref(), Some("c"), "active 跟着改名走");
+
+        let before = p.clone();
+        assert!(!p.rename("c", "b"), "新名被别的条目占着");
+        assert!(!p.rename("nope", "d"), "旧名不存在");
+        assert!(!p.rename("c", "c"), "改成自己也算被占");
+        assert_eq!(p, before, "拒绝时一个字段都不动");
+
+        assert!(p.rename("b", "e"));
+        assert_eq!(
+            p.active.as_deref(),
+            Some("c"),
+            "改的不是活动节点，active 不动"
+        );
+    }
+
+    /// token 名改成 `<主机>-<kind>`，active 跟着走（spec §5.6、§8.1）。
+    #[test]
+    fn heal_token_names_renames_to_host_kind_and_moves_active() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let mut p = Profiles::new_default();
+        p.upsert(prof(&format!("{token}-hy2-resi"), hy2_resi_node()));
+        p.upsert(prof("hysteria2-1785892136", hy2_direct_node()));
+        p.active = Some(format!("{token}-hy2-resi"));
+
+        assert_eq!(
+            p.heal_token_names(),
+            Healed {
+                renamed: vec![(
+                    format!("{token}-hy2-resi"),
+                    "panel.example.com-hy2-resi".into()
+                )],
+                tombstones: 0,
+            },
+            "新名只由主机与 kind 拼出来，不用这一趟的用户名"
+        );
+        assert_eq!(p.profiles[0].name, "panel.example.com-hy2-resi");
+        assert_eq!(
+            p.active.as_deref(),
+            Some("panel.example.com-hy2-resi"),
+            "active 跟着改名走"
+        );
+        assert_eq!(p.profiles[1].name, "hysteria2-1785892136", "v3 目录名沿用");
+    }
+
+    /// `<主机>-<kind>` 被占就退到 `-2`、`-3`：同一趟里逐条改、每条重算 [`Profiles::free_name`]。
+    #[test]
+    fn heal_token_names_suffixes_when_host_kind_is_taken() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let other = "fedcba9876543210fedcba9876543210";
+        let moved = |port| Node {
+            port,
+            ..hy2_resi_node()
+        };
+        let mut p = Profiles::new_default();
+        p.upsert(prof("panel.example.com-hy2-resi", hy2_resi_node()));
+        p.upsert(prof(&format!("{token}-hy2-resi"), moved(40003)));
+        p.upsert(prof(&format!("{other}-hy2-resi"), moved(40005)));
+
+        let healed = p.heal_token_names();
+        assert_eq!(
+            healed.renamed,
+            vec![
+                (
+                    format!("{token}-hy2-resi"),
+                    "panel.example.com-hy2-resi-2".into()
+                ),
+                (
+                    format!("{other}-hy2-resi"),
+                    "panel.example.com-hy2-resi-3".into()
+                ),
+            ],
+            "第二条要躲开刚改出来的 -2"
+        );
+        assert_eq!(
+            p.profiles[0].name, "panel.example.com-hy2-resi",
+            "老名字不动"
+        );
+        assert_eq!(p.profiles[1].name, "panel.example.com-hy2-resi-2");
+        assert_eq!(p.profiles[2].name, "panel.example.com-hy2-resi-3");
+    }
+
+    /// 墓碑只改显示名，key 与 `at` 不动（spec §7 表末两行、§5.1）。
+    #[test]
+    fn heal_token_names_rewrites_tombstone_display_names_from_the_key() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let key = tombstone_key(&hy2_resi_node());
+        let mut p = Profiles::new_default();
+        let mut t = Tombstone {
+            key: key.clone(),
+            name: format!("{token}-hy2-resi"),
+            at: 7,
+            extra: Default::default(),
+        };
+        t.extra
+            .insert("future_field".into(), serde_json::json!("keep"));
+        p.deleted.push(t);
+        p.deleted.push(Tombstone {
+            key: tombstone_key(&hy2_direct_node()),
+            name: "hysteria2-1785892136".into(),
+            at: 8,
+            extra: Default::default(),
+        });
+
+        assert_eq!(
+            p.heal_token_names(),
+            Healed {
+                renamed: vec![],
+                tombstones: 1,
+            }
+        );
+        assert_eq!(p.deleted[0].name, "panel.example.com-hy2-resi");
+        assert_eq!(
+            (p.deleted[0].key.as_str(), p.deleted[0].at),
+            (key.as_str(), 7),
+            "key 与 at 不变"
+        );
+        assert_eq!(
+            p.deleted[0].extra.get("future_field"),
+            Some(&serde_json::json!("keep")),
+            "未知字段不受改名影响"
+        );
+        assert_eq!(p.deleted[1].name, "hysteria2-1785892136", "非 token 名不动");
+    }
+
+    /// 没有 token 名时一个字段都不动：`store_import` 靠 `prof == loaded` 决定要不要重写文件
+    /// （spec §5.6）。
+    #[test]
+    fn heal_token_names_is_a_noop_without_token_names() {
+        let s = FakeSys::new();
+        let mut p = Profiles::new_default();
+        p.upsert(prof("alice-hy2-direct", hy2_direct_node()));
+        p.upsert(prof("hysteria2-1785892136", hy2_resi_node()));
+        p.active = Some("alice-hy2-direct".into());
+        p.bury(
+            &prof(
+                "panel.example.com-reality-direct",
+                crate::testutil::reality_direct_node(),
+            ),
+            7,
+        );
+        p.save(&s, &paths()).unwrap();
+        let before = p.clone();
+        let raw = s.get("/opt/bui-c/profiles.json").unwrap();
+
+        assert_eq!(p.heal_token_names(), Healed::default(), "什么都没改");
+        assert_eq!(p, before, "结构前后相等");
+        p.save(&s, &paths()).unwrap();
+        assert_eq!(
+            s.get("/opt/bui-c/profiles.json").unwrap(),
+            raw,
+            "落盘逐字节相同"
+        );
+    }
+
+    /// 合并：留存者名字不动、被并掉的不记墓碑，活动节点与已经变了的条目跳过（spec §5.8）。
+    #[test]
+    fn merge_into_keeps_the_keeper_name_and_never_buries() {
+        let moved = |port| Node {
+            port,
+            ..hy2_resi_node()
+        };
+        let mut p = Profiles::new_default();
+        p.upsert(prof("hysteria2-1785892136", hy2_resi_node()));
+        p.upsert(prof("dup-1", moved(40003)));
+        p.upsert(prof("act", moved(40005)));
+        // 与留存者同 kind、同主机，只差 username：这一格钉的是「username 不同就挡下」，
+        // kind 也不同的话分不清是谁挡住的（§11 通则）
+        let bob = Node {
+            transport: hy2_account_node("bob").transport,
+            ..hy2_resi_node()
+        };
+        p.upsert(prof("stranger", bob));
+        p.active = Some("act".into());
+
+        let merged = p.merge_into(
+            "hysteria2-1785892136",
+            &[
+                "dup-1".into(),
+                "act".into(),
+                "stranger".into(),
+                "ghost".into(),
+                // 留存者自己：合规调用不会传，传了也不能把它并掉（定稿之外的防御性守卫）
+                "hysteria2-1785892136".into(),
+            ],
+        );
+        assert_eq!(
+            merged,
+            Merged {
+                keeper: "hysteria2-1785892136".into(),
+                removed: vec!["dup-1".into()],
+                renamed_from: None,
+            },
+            "活动节点、别的账号、已经没了的、留存者自己都跳过"
+        );
+        let names: Vec<&str> = p.profiles.iter().map(|x| x.name.as_str()).collect();
+        assert_eq!(names, ["hysteria2-1785892136", "act", "stranger"]);
+        assert_eq!(p.active.as_deref(), Some("act"), "活动节点没被碰");
+        assert!(p.deleted.is_empty(), "合并不记墓碑");
+
+        let gone = p.merge_into("nobody", &["act".into()]);
+        assert_eq!(gone, Merged::default(), "留存者不在了就什么都不做");
+        assert_eq!(p.profiles.len(), 3);
+    }
+
+    /// 留存者是 `<规范名>-<数字>`、被并掉的恰好占着规范名时取回它（D9，spec §5.8）。
+    #[test]
+    fn merge_into_gives_the_canonical_name_to_a_suffixed_keeper() {
+        let c = "panel.example.com-hy2-resi";
+        let moved = |port| Node {
+            port,
+            ..hy2_resi_node()
+        };
+        let three = |keeper: &str| {
+            let mut p = Profiles::new_default();
+            p.upsert(prof(keeper, moved(40003)));
+            p.upsert(prof(c, hy2_resi_node()));
+            p.active = Some(keeper.into());
+            p
+        };
+
+        let mut p = three(&format!("{c}-2"));
+        let merged = p.merge_into(&format!("{c}-2"), &[c.into()]);
+        assert_eq!(
+            merged,
+            Merged {
+                keeper: c.into(),
+                removed: vec![c.into()],
+                renamed_from: Some(format!("{c}-2")),
+            }
+        );
+        assert_eq!(p.profiles[0].name, c);
+        assert_eq!(p.active.as_deref(), Some(c), "active 跟着取回规范名");
+
+        let mut p = three("alice-hy2-resi-2");
+        let merged = p.merge_into("alice-hy2-resi-2", &[c.into()]);
+        assert_eq!(
+            merged,
+            Merged {
+                keeper: "alice-hy2-resi-2".into(),
+                removed: vec![c.into()],
+                renamed_from: None,
+            },
+            "留存者不是 `<规范名>-<数字>`，名字沿用（§8.1）"
+        );
+        assert_eq!(p.active.as_deref(), Some("alice-hy2-resi-2"));
+
+        let mut p = three(&format!("{c}-2x"));
+        assert_eq!(
+            p.merge_into(&format!("{c}-2x"), &[c.into()]).renamed_from,
+            None,
+            "后缀不是纯数字就不是自动起的名字"
+        );
+
+        let mut p = three(&format!("{c}-2"));
+        p.upsert(prof("dup-1", moved(40005)));
+        assert_eq!(
+            p.merge_into(&format!("{c}-2"), &["dup-1".into()])
+                .renamed_from,
+            None,
+            "规范名还被别人占着，不改名"
+        );
+
+        // 没有条目叫规范名（用户早先删了、改了）：后缀沿用、不回收（§8.1）。
+        // 这一格钉的是「被并掉的里面有一条恰好叫 c」，与上一格的重名查重是两回事。
+        let mut p = Profiles::new_default();
+        p.upsert(prof(&format!("{c}-2"), moved(40003)));
+        p.upsert(prof("dup-1", moved(40005)));
+        p.active = Some(format!("{c}-2"));
+        let merged = p.merge_into(&format!("{c}-2"), &["dup-1".into()]);
+        assert_eq!(
+            merged,
+            Merged {
+                keeper: format!("{c}-2"),
+                removed: vec!["dup-1".into()],
+                renamed_from: None,
+            },
+            "被并掉的里面没有叫规范名的，不回收后缀（§8.1）"
+        );
+        let names: Vec<&str> = p.profiles.iter().map(|x| x.name.as_str()).collect();
+        assert_eq!(names, [format!("{c}-2")]);
+        assert_eq!(p.active.as_deref(), Some(format!("{c}-2").as_str()));
+    }
+
     #[test]
     fn heal_active_picks_first_when_dangling() {
         let mut p = Profiles::new_default();
@@ -1913,6 +2347,24 @@ mod tests {
             p.deleted.last().map(|t| t.key.as_str()),
             Some(key.as_str()),
             "新墓碑仍然移到末尾"
+        );
+    }
+
+    /// 墓碑不记 token 名（spec §7 表末、§8.1）：记名前先用账号 key 换一个干净名字。
+    #[test]
+    fn bury_never_records_a_token_name() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let mut p = Profiles::new_default();
+        p.bury(&prof(&format!("{token}-hy2-resi"), hy2_resi_node()), 5);
+        assert_eq!(
+            (p.deleted[0].name.as_str(), p.deleted[0].at),
+            ("panel.example.com-hy2-resi", 5),
+            "名字由账号 key 现推，时间照记"
+        );
+        p.bury(&prof("hysteria2-1785892136", hy2_direct_node()), 6);
+        assert_eq!(
+            p.deleted[1].name, "hysteria2-1785892136",
+            "非 token 名原样记：墓碑记的是删它时看到的名字"
         );
     }
 
