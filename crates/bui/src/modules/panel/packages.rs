@@ -6,7 +6,7 @@
 
 use super::{assets, Shared};
 use crate::api::AppState;
-use crate::kernels::{sha256_hex, Fetcher, Manifest};
+use crate::kernels::{Fetcher, Manifest};
 use crate::reconcile::DaemonCtx;
 use crate::sys::Host;
 use axum::extract::{Path as AxPath, State};
@@ -44,9 +44,20 @@ pub struct CacheReport {
     pub errors: Vec<String>,
 }
 
-/// 文件名白名单校验（无 `/`、无 `\`、无 `..`、非空）
+/// 文件名白名单校验（无 `/`、无 `\`、无 `..`、不以 `.` 开头、非空）。
+///
+/// 前导点是**安全**条件而不只是卫生条件：`/packages/{name}` 免鉴权，而
+/// [`Host::stage_file`](crate::sys::Host::stage_file) 的下载槽就落在同一个目录里
+/// （`.<key>.download`）⇒ 不拒前导点的话，每天那一轮缓存期间
+/// `GET /packages/.sing-box-linux-amd64.download` 会 200 返回一份**未经 sha 校验**的
+/// 半截二进制（守护进程被 SIGKILL 后这份残骸还会一直留着）。现有包名与
+/// `bui-c-install.sh` 都不以点开头，不受影响。
 pub fn safe_name(name: &str) -> bool {
-    !name.is_empty() && !name.contains('/') && !name.contains('\\') && !name.contains("..")
+    !name.is_empty()
+        && !name.starts_with('.')
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains("..")
 }
 
 /// 面板域名只接受裸主机名（RFC 3986 的 reg-name 子集）加可选端口：`[A-Za-z0-9.-]+(:[0-9]{1,5})?`，
@@ -123,17 +134,34 @@ pub fn sync_once(
                 rep.skipped.push(key);
                 continue;
             }
-            let bytes = match fetcher.get_bytes(&asset.url) {
-                Ok(b) => b,
+            // 下载一律边下边写临时文件、校验过才 rename（`Fetcher::download_to` +
+            // `Host::stage_file`）：客户端 sing-box 单笔几十 MB，而 `b-ui.service` 的
+            // `MemoryMax=200M` 是硬上限 —— 整个响应体读进 `Vec<u8>` 再 `write_file` 就是
+            // 「常驻一份 + 写盘一份」的 OOM 面。**别改回 `get_bytes`。**
+            // sha 不符或下载失败 ⇒ `slot` drop 掉，临时文件删掉、`dest` 不动。
+            let mut slot = match host.stage_file(&dest, 0o644) {
+                Ok(s) => s,
                 Err(e) => {
-                    rep.errors.push(format!(
-                        "{key} 下载失败：{}",
-                        crate::redact::url_credentials(&e.to_string())
-                    ));
+                    rep.errors.push(format!("{key} 写盘失败：{e}"));
                     continue;
                 }
             };
-            let got = sha256_hex(&bytes);
+            let got = match fetcher.download_to(&asset.url, &mut slot) {
+                Ok(sum) => sum,
+                Err(e) => {
+                    // 流式之后写盘错误是从 `download_to` 里冒出来的：磁盘满 / 只读文件系统
+                    // 仍归「写盘失败」，不然就把操作者指向网络了（装机/升级要连写四个内核
+                    // 加四个客户端包，磁盘满是最现实的失败）
+                    rep.errors.push(match crate::kernels::sink_failure(&e) {
+                        Some(io) => format!("{key} 写盘失败：{io}"),
+                        None => format!(
+                            "{key} 下载失败：{}",
+                            crate::redact::url_credentials(&e.to_string())
+                        ),
+                    });
+                    continue;
+                }
+            };
             if got != asset.sha256 {
                 rep.errors.push(format!(
                     "{key} sha256 不符：期望 {} 实得 {got}",
@@ -141,7 +169,7 @@ pub fn sync_once(
                 ));
                 continue;
             }
-            match host.write_file(&dest, &bytes, 0o644) {
+            match slot.commit() {
                 Ok(()) => rep.downloaded.push(key),
                 Err(e) => rep.errors.push(format!("{key} 写盘失败：{e}")),
             }
@@ -324,15 +352,41 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Mutex;
 
-    struct FakeFetcher(Mutex<BTreeMap<String, Vec<u8>>>);
-    impl crate::kernels::Fetcher for FakeFetcher {
-        fn get_bytes(&self, url: &str) -> anyhow::Result<Vec<u8>> {
+    /// 第二个字段是走**流式**那条口子的流水（url, 喂进 sink 的字节数）：`sync_once` 改回
+    /// `get_bytes` + 一次性 digest 时它会是空的（见 `the_cache_streams_…` 用例）。
+    struct FakeFetcher(
+        Mutex<BTreeMap<String, Vec<u8>>>,
+        Mutex<Vec<(String, usize)>>,
+    );
+    impl FakeFetcher {
+        fn new(files: BTreeMap<String, Vec<u8>>) -> Self {
+            Self(Mutex::new(files), Mutex::new(Vec::new()))
+        }
+
+        fn take(&self, url: &str) -> anyhow::Result<Vec<u8>> {
             self.0
                 .lock()
                 .unwrap()
                 .get(url)
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("404 {url}"))
+        }
+
+        fn streamed(&self) -> Vec<(String, usize)> {
+            self.1.lock().unwrap().clone()
+        }
+    }
+    impl crate::kernels::Fetcher for FakeFetcher {
+        fn get_bytes(&self, url: &str) -> anyhow::Result<Vec<u8>> {
+            self.take(url)
+        }
+
+        fn download_to(&self, url: &str, sink: &mut dyn std::io::Write) -> anyhow::Result<String> {
+            let bytes = self.take(url)?;
+            sink.write_all(&bytes)?;
+            sink.flush()?;
+            self.1.lock().unwrap().push((url.to_string(), bytes.len()));
+            Ok(crate::kernels::sha256_hex(&bytes))
         }
     }
 
@@ -363,12 +417,12 @@ mod tests {
     }
 
     fn fetcher_for(m: &Manifest, bytes: &[u8]) -> FakeFetcher {
-        FakeFetcher(Mutex::new(
+        FakeFetcher::new(
             m.artifacts
                 .values()
                 .map(|a| (a.url.clone(), bytes.to_vec()))
                 .collect(),
-        ))
+        )
     }
 
     #[test]
@@ -379,6 +433,10 @@ mod tests {
         assert!(!safe_name("../state.json"));
         assert!(!safe_name("a/b"));
         assert!(!safe_name("a\\b"));
+        // 下载槽就落在这个免鉴权目录里：未经 sha 校验的半截二进制不许被取走
+        assert!(!safe_name(".sing-box-linux-amd64.download"));
+        assert!(!safe_name(".bui-c-linux-amd64.tmp"));
+        assert!(!safe_name("."));
     }
 
     #[test]
@@ -454,6 +512,98 @@ mod tests {
         assert_eq!(rep.errors.len(), 4, "{:?}", rep.errors);
         assert!(rep.errors[0].contains("sha256"), "{:?}", rep.errors);
         assert_eq!(h.text("/opt/b-ui/packages/bui-c-linux-amd64"), None);
+        assert_eq!(
+            h.staged().len(),
+            4,
+            "四个临时写入槽都开过、但一个都没 commit"
+        );
+        assert!(h.ops().is_empty(), "校验不过一个字不落盘");
+    }
+
+    /// 流式之后写盘错误是从 `download_to` 里冒出来的（旧代码里写盘是 `host.write_file`
+    /// 独立一步，必然落进「写盘失败」）：磁盘满 / 只读文件系统必须仍归 `{key} 写盘失败：`。
+    /// 这一步每天对四个客户端二进制各跑一次、装机还要连写四个内核，磁盘满是最现实的失败，
+    /// 报成「下载失败」就是把操作者指向网络。
+    #[test]
+    fn a_full_disk_during_download_is_still_reported_as_a_write_failure() {
+        struct FullDisk;
+        impl crate::kernels::Fetcher for FullDisk {
+            fn get_bytes(&self, _url: &str) -> anyhow::Result<Vec<u8>> {
+                unreachable!("二进制不许走 get_bytes")
+            }
+
+            fn download_to(
+                &self,
+                _url: &str,
+                _sink: &mut dyn std::io::Write,
+            ) -> anyhow::Result<String> {
+                Err(crate::kernels::SinkFailed(std::io::Error::from_raw_os_error(28)).into())
+            }
+        }
+        let h = FakeHost::new();
+        let m = manifest_with(b"ELF-bytes");
+        let rep = sync_once(
+            &h,
+            &FullDisk,
+            &m,
+            std::path::Path::new("/opt/b-ui/packages"),
+        );
+        assert_eq!(rep.downloaded, Vec::<String>::new());
+        assert_eq!(rep.errors.len(), 4, "{:?}", rep.errors);
+        for e in &rep.errors {
+            assert!(e.contains("写盘失败"), "{e}");
+            assert!(e.contains("No space left"), "{e}");
+            assert!(!e.contains("下载失败"), "{e}");
+        }
+        assert!(h.ops().is_empty(), "写盘失败当然也不该有落盘");
+    }
+
+    /// 钉住「客户端包缓存也不再把二进制整段读进内存」（2026-09-17 裁决）。
+    ///
+    /// 这一步每天对四个客户端二进制各跑一次，sing-box 单个几十 MB，而 `b-ui.service` 的
+    /// `MemoryMax=200M` 是**硬上限**：`get_bytes` + `sha256_hex(&bytes)` + `write_file(&bytes)`
+    /// 是「常驻一份 + 写盘一份」的 OOM 面。峰值在单测里钉不住，所以钉**用了哪条接口**：
+    /// 走 `Fetcher::download_to` + `Host::stage_file`。改回一次性读入这条就转红。
+    #[test]
+    fn the_cache_streams_each_artifact_instead_of_reading_it_whole() {
+        let h = FakeHost::new();
+        let m = manifest_with(b"ELF-bytes");
+        let f = fetcher_for(&m, b"ELF-bytes");
+        let dir = std::path::Path::new("/opt/b-ui/packages");
+        let rep = sync_once(&h, &f, &m, dir);
+        assert_eq!(rep.errors, Vec::<String>::new());
+        assert_eq!(rep.downloaded.len(), 4);
+        let mut urls: Vec<String> = f
+            .streamed()
+            .into_iter()
+            .map(|(u, n)| {
+                assert_eq!(n, b"ELF-bytes".len(), "{u} 的字节数不对");
+                u
+            })
+            .collect();
+        urls.sort();
+        assert_eq!(
+            urls,
+            vec![
+                "https://x/bui-c-amd64".to_string(),
+                "https://x/bui-c-arm64".to_string(),
+                "https://x/sing-box-amd64".to_string(),
+                "https://x/sing-box-arm64".to_string(),
+            ],
+            "四个二进制都必须走 download_to"
+        );
+        let mut staged = h.staged();
+        staged.sort();
+        assert_eq!(
+            staged,
+            vec![
+                dir.join("bui-c-linux-amd64"),
+                dir.join("bui-c-linux-arm64"),
+                dir.join("sing-box-linux-amd64"),
+                dir.join("sing-box-linux-arm64"),
+            ],
+            "每个目标路径都先开临时写入槽"
+        );
     }
 
     #[test]

@@ -125,17 +125,156 @@ pub fn is_not_found(err: &anyhow::Error) -> bool {
 /// 于是升级/回滚演练既能用本机 `python3 -m http.server`，也能直接给一个文件路径
 /// （裁决：M5 前不创建任何 Release/tag，演练不得依赖公开 Release）。
 pub trait Fetcher: Send + Sync + 'static {
+    /// 整个响应体读进内存。**只许用于小文件**（`manifest.json`、GitHub 的 releases 列表）。
     fn get_bytes(&self, url: &str) -> anyhow::Result<Vec<u8>>;
+
+    /// 边下边算：响应体按 64 KiB 一块同时喂 sha256 与 `sink`，返回算出的 sha256（小写十六
+    /// 进制）。**二进制一律走这一条**，`sink` 用 [`crate::sys::Host::stage_file`] 开的写入槽，
+    /// 于是「校验过再 rename」，sha 不匹配时目标路径一个字节不动。
+    ///
+    /// **为什么存在**：内核二进制单笔约 81 MB（sing-box，自建带 `with_v2ray_api` 的更大）、
+    /// 四个合计约 190 MB，而 `b-ui.service` 的 `MemoryMax=200M` 是**硬上限**
+    /// （`modules/units.rs`）。`get_bytes` + `sha256_hex(&bytes)` + `write_file(&bytes)` 在一次
+    /// 安装/升级里就有约 81 MB 常驻加一份写盘副本 ⇒ systemd 把守护进程杀在下载半路，形状是
+    /// 「升级时 OOM、装到一半停下」。**别改回一次性读入**（判据：`FakeFetcher` 记的流式流水
+    /// 与 `FakeHost::staged`；真实现每次 `write` 的长度由 `HttpFetcher` 那两条用例钉住）。
+    ///
+    /// **失败必须有终态**：实现自己兜「整个响应体」的总预算与字节上限（[`DOWNLOAD_BUDGET`]
+    /// / [`DOWNLOAD_MAX_BYTES`]）——`reqwest::blocking` 的请求 timeout 在流式循环里退化成
+    /// 「每块一次 read 的预算」，涓流镜像会把守护进程里唯一那条对账消费者永久卡住。写
+    /// `sink` 失败（磁盘满）与读响应体失败在类型上分开，见 [`SinkFailed`]。
+    fn download_to(&self, url: &str, sink: &mut dyn std::io::Write) -> anyhow::Result<String>;
+}
+
+/// 流式 sha256 + 落盘的那口缓冲：与 [`crate::sys::Host::file_sha256`] 同一大小，峰值内存就是
+/// 它，与文件多大无关。
+const STREAM_BUF: usize = 64 * 1024;
+
+/// **整个响应体**的总预算，值就是 `get_bytes` 时代的 300 秒（语义保持，不引入新的失败面）。
+///
+/// `Client::builder().timeout(300s)` 在一次性 `bytes()` 上就是「整个请求 300 秒」，但
+/// `reqwest::blocking` 的 `impl Read for Response` 每次 read 都重新 `Instant::now() + timeout`
+/// （`blocking::wait::timeout`）⇒ 一进流式循环，300 秒就从「整个响应体的总预算」退化成
+/// 「每 64 KiB 一次 read 的预算」，涓流/半死的镜像再也不会报错。`read_timeout` 只有 async
+/// builder 有，blocking 拿不到，所以这条总预算只能自己兜。
+///
+/// **为什么是硬要求**：守护进程里只有**一条**对账消费者（`serve.rs` 的 reconcile mpsc，跑在
+/// `spawn_blocking` 里、外面没有任何 `tokio::time::timeout`）。它一次卡死之后，去抖触发
+/// （面板改动）、10 分钟漂移巡检、每日自检就全在那条队列里排队，再不会有下一轮对账：配置
+/// 不写、单元不重启、漂移不报、也不产 incident。失败路径必须有终态。
+const DOWNLOAD_BUDGET: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// 响应体字节上限：镜像坏掉或被替换后回一个无限/超大 body 时，别一路写到 ENOSPC（盘撑满
+/// 期间 `state.json` 写入、证书续签、journald 会一起失败）。sha 校验只在下载**之后**才有
+/// 机会拒绝，所以上限必须在循环里。最大的真资产约 81 MB（sing-box，自建带 `with_v2ray_api`
+/// 的更大），512 MiB 是六倍余量；客户端那侧的同形上限是 `bui-c::net::download_via` 的
+/// `max_bytes`。
+const DOWNLOAD_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
+/// [`stream_sha256`] 的三种失败：首层文案与归类各不相同，所以在类型上就分开——读来源归
+/// 「下载失败」、写落盘槽归「写盘失败」（[`SinkFailed`]）、主动中断是预算/上限。
+enum StreamErr {
+    /// 读来源（HTTP 响应体或本地文件）失败。
+    Read(std::io::Error),
+    /// 写落盘槽失败（ENOSPC / EIO / 只读文件系统）。
+    Write(std::io::Error),
+    /// 自己中断：总预算到点或超过字节上限。串里**绝不含 URL**（调用方补脱敏地址）。
+    Aborted(String),
+}
+
+/// 下载期的**写盘**失败。装机/升级要连写四个内核（约 190 MB），磁盘满是最现实的失败，把
+/// 操作者指向网络是误导，所以与「下载失败」分开归类，判断靠 `anyhow` 的 downcast
+/// （[`sink_failure`]），不靠匹配错误串。文案里只有 io 错误，没有下载地址。
+#[derive(Debug, thiserror::Error)]
+#[error("写临时文件失败：{0}")]
+pub struct SinkFailed(pub std::io::Error);
+
+/// 错误链里的 [`SinkFailed`]：有就是写盘炸的，不是下载炸的。
+pub fn sink_failure(err: &anyhow::Error) -> Option<&std::io::Error> {
+    err.chain()
+        .find_map(|c| c.downcast_ref::<SinkFailed>())
+        .map(|w| &w.0)
+}
+
+/// `reader` → `sink`，边搬边算 sha256（小写十六进制）。峰值 = [`STREAM_BUF`]。
+///
+/// `budget` 是整个搬运的总时长预算、`max_bytes` 是字节上限，两条都在循环里查（理由见
+/// [`DOWNLOAD_BUDGET`] 与 [`DOWNLOAD_MAX_BYTES`]）：**没有终态的失败路径比慢的失败更坏**。
+fn stream_sha256(
+    reader: &mut dyn std::io::Read,
+    sink: &mut dyn std::io::Write,
+    budget: std::time::Duration,
+    max_bytes: u64,
+) -> Result<String, StreamErr> {
+    use sha2::{Digest as _, Sha256};
+    let start = std::time::Instant::now();
+    let mut buf = vec![0u8; STREAM_BUF];
+    let mut h = Sha256::new();
+    let mut total = 0u64;
+    loop {
+        let n = reader.read(&mut buf).map_err(StreamErr::Read)?;
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+        if total > max_bytes {
+            return Err(StreamErr::Aborted(format!(
+                "超过字节上限（{max_bytes} 字节）"
+            )));
+        }
+        h.update(&buf[..n]);
+        sink.write_all(&buf[..n]).map_err(StreamErr::Write)?;
+        if start.elapsed() > budget {
+            return Err(StreamErr::Aborted(format!(
+                "总预算 {budget:?} 到点还没搬完"
+            )));
+        }
+    }
+    sink.flush().map_err(StreamErr::Write)?;
+    Ok(hex::encode(h.finalize()))
+}
+
+/// 读响应体时的 io 错误：里面包着 reqwest 的错误就照样先 `without_url()` 剥掉 URL（模块头
+/// 的铁律：**不许**把「reqwest 0.12 会把 userinfo 挪进 Authorization 头」当成「凭据不进
+/// 日志」的唯一依靠——`blocking::Response` 是 `.map_err(Error::into_io)` 把 `reqwest::Error`
+/// 包进 `io::Error` 的，anyhow 的 `{:#?}` 会把它连 source 一起摊开）；不是 reqwest 的错误
+/// 就只留错误种类（`ErrorKind` 的描述里没有 URL）。口径与 `bui-c::net::read_error` 一致。
+fn body_error(url: &str, e: std::io::Error) -> anyhow::Error {
+    let kind = e.kind();
+    let inner = match e.into_inner().map(|i| i.downcast::<reqwest::Error>()) {
+        Some(Ok(re)) => anyhow::Error::new(re.without_url()),
+        _ => anyhow::anyhow!("{kind}"),
+    };
+    inner.context(format!(
+        "读取 {} 的响应体失败",
+        crate::redact::url_credentials(url)
+    ))
 }
 
 pub struct HttpFetcher {
     client: std::sync::OnceLock<reqwest::blocking::Client>,
+    /// 整个响应体的总预算与字节上限，默认 [`DOWNLOAD_BUDGET`] / [`DOWNLOAD_MAX_BYTES`]；
+    /// 只有用例会调小（涓流服务器不能等 300 秒，单测也不该灌 512 MiB）。
+    budget: std::time::Duration,
+    max_bytes: u64,
 }
 
 impl HttpFetcher {
     pub fn new() -> Self {
         Self {
             client: std::sync::OnceLock::new(),
+            budget: DOWNLOAD_BUDGET,
+            max_bytes: DOWNLOAD_MAX_BYTES,
+        }
+    }
+
+    /// 只给用例：把两条限额调小，好在秒级内跑出「涓流」与「超大 body」两种终态。
+    #[cfg(test)]
+    fn with_limits(budget: std::time::Duration, max_bytes: u64) -> Self {
+        Self {
+            budget,
+            max_bytes,
+            ..Self::new()
         }
     }
 }
@@ -146,17 +285,17 @@ impl Default for HttpFetcher {
     }
 }
 
-impl Fetcher for HttpFetcher {
-    /// 只能在 `spawn_blocking` 线程或同步 CLI 路径里调用（见模块头的铁律）。
-    fn get_bytes(&self, url: &str) -> anyhow::Result<Vec<u8>> {
-        // `file://…` 或不含 `://` 的入参按本地文件读（总纲 C4 的覆盖方式之一；M5 演练不依赖
-        // 公开 Release）。这一步必须在建 client 之前。
-        if let Some(path) = url
-            .strip_prefix("file://")
+impl HttpFetcher {
+    /// `file://…` 或不含 `://` 的入参按本地文件读（总纲 C4 的覆盖方式之一；M5 演练不依赖
+    /// 公开 Release）。这一步必须在建 client 之前。
+    fn local_path(url: &str) -> Option<&str> {
+        url.strip_prefix("file://")
             .or_else(|| (!url.contains("://")).then_some(url))
-        {
-            return std::fs::read(path).map_err(|e| anyhow::anyhow!("读取 {path} 失败：{e}"));
-        }
+    }
+
+    /// GET 到「状态码已确认成功」的响应（响应体还没读）：两个取法共用，于是 404 成型、
+    /// 非 2xx 文案与凭据脱敏只有一处实现。
+    fn send_get(&self, url: &str) -> anyhow::Result<reqwest::blocking::Response> {
         // 客户端用 `OnceLock` 复用，避免每次下载都重建连接池。
         let client = self.client.get_or_init(|| {
             reqwest::blocking::Client::builder()
@@ -191,11 +330,46 @@ impl Fetcher for HttpFetcher {
                 resp.status().as_u16()
             );
         }
-        Ok(resp
+        Ok(resp)
+    }
+}
+
+impl Fetcher for HttpFetcher {
+    /// 只能在 `spawn_blocking` 线程或同步 CLI 路径里调用（见模块头的铁律）。
+    fn get_bytes(&self, url: &str) -> anyhow::Result<Vec<u8>> {
+        if let Some(path) = Self::local_path(url) {
+            return std::fs::read(path).map_err(|e| anyhow::anyhow!("读取 {path} 失败：{e}"));
+        }
+        Ok(self
+            .send_get(url)?
             .bytes()
             .map_err(|e| e.without_url())
             .with_context(|| format!("读取 {} 的响应体失败", crate::redact::url_credentials(url)))?
             .to_vec())
+    }
+
+    /// 只能在 `spawn_blocking` 线程或同步 CLI 路径里调用（见模块头的铁律）。
+    /// 响应体**不进内存**：按 64 KiB 一块同时喂 sha256 与 `sink`（理由见 trait 上的注释）。
+    fn download_to(&self, url: &str, sink: &mut dyn std::io::Write) -> anyhow::Result<String> {
+        if let Some(path) = Self::local_path(url) {
+            let mut f =
+                std::fs::File::open(path).map_err(|e| anyhow::anyhow!("读取 {path} 失败：{e}"))?;
+            return stream_sha256(&mut f, sink, self.budget, self.max_bytes).map_err(|e| match e {
+                StreamErr::Read(e) => anyhow::anyhow!("读取 {path} 失败：{e}"),
+                StreamErr::Write(e) => SinkFailed(e).into(),
+                StreamErr::Aborted(why) => anyhow::anyhow!("读取 {path} 失败：{why}"),
+            });
+        }
+        let mut resp = self.send_get(url)?;
+        stream_sha256(&mut resp, sink, self.budget, self.max_bytes).map_err(|e| match e {
+            // 读响应体的 io 错误里包着 reqwest 的错误 ⇒ 先剥 URL（见 [`body_error`]）
+            StreamErr::Read(e) => body_error(url, e),
+            // 磁盘满不是「下载失败」：文案与归类都不许指向网络
+            StreamErr::Write(e) => SinkFailed(e).into(),
+            StreamErr::Aborted(why) => {
+                anyhow::anyhow!("下载 {} 失败：{why}", crate::redact::url_credentials(url))
+            }
+        })
     }
 }
 
@@ -626,7 +800,12 @@ pub fn kernel_build_differs(
     }
 }
 
-/// 下载 → sha256 → `host.write_file(dest, bytes, 0o755)`。
+/// 边下边 hash 边写临时文件 → sha256 校验 → `commit`（0755 rename 到 `dest`）。
+///
+/// **不许改回 `get_bytes` + `write_file`**：内核二进制单笔约 81 MB（sing-box，自建更大），
+/// 而 `b-ui.service` 的 `MemoryMax=200M` 是硬上限 ⇒ 一次性读入就是升级期的 OOM 面
+/// （systemd 把守护进程杀在下载半路）。详见 [`Fetcher::download_to`] 与
+/// [`crate::sys::StagedWrite`]。
 pub struct KernelInstaller<'a> {
     pub fetcher: &'a dyn Fetcher,
     pub host: &'a dyn Host,
@@ -641,12 +820,14 @@ impl BinaryInstaller for KernelInstaller<'_> {
         url: &str,
         dest: &Path,
     ) -> anyhow::Result<()> {
-        let bytes = self.fetcher.get_bytes(url)?;
-        let got = sha256_hex(&bytes);
+        // 校验不过或下载失败 ⇒ `slot` 就这么 drop 掉：临时文件删掉、`dest` 上的现装二进制
+        // 一个字节不动（语义与一次性读入那版逐字一致）。
+        let mut slot = self.host.stage_file(dest, 0o755)?;
+        let got = self.fetcher.download_to(url, &mut slot)?;
         if !got.eq_ignore_ascii_case(sha256) {
             anyhow::bail!("{name} {version} 的 sha256 不匹配：期望 {sha256}，实际 {got}");
         }
-        self.host.write_file(dest, &bytes, 0o755)?;
+        slot.commit()?;
         tracing::info!(kernel = name, version, "内核二进制已更新");
         Ok(())
     }
@@ -721,9 +902,80 @@ mod tests {
         );
     }
 
+    /// 记下每次 `write` 的长度（外加全部字节）的 sink。峰值 RSS 在单测里钉不住，但
+    /// **分块搬运**钉得住：一次性读入（`bytes()` / `fs::read` 之后一次 `write_all`）会写出
+    /// 一整块 150 KiB，而流式实现每块都 ≤ [`STREAM_BUF`]。复核（2026-09-17）实测：sink 只是
+    /// `Vec<u8>` 时，把 `download_to` 整段改回一次性读入，全量门禁照样全绿。
+    #[derive(Default)]
+    struct CountingSink {
+        writes: Vec<usize>,
+        bytes: Vec<u8>,
+    }
+
+    impl std::io::Write for CountingSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.writes.push(buf.len());
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl CountingSink {
+        /// 「字节一位不少 + 每块 ≤ 缓冲 + 至少切成 ⌈len/缓冲⌉ 块」：一条断言同时杀掉
+        /// 「HTTP 分支改回 `bytes()`」「本地分支改回 `fs::read`」「两条都换成 `get_bytes`」。
+        fn assert_streamed(&self, body: &[u8], what: &str) {
+            assert_eq!(self.bytes, body, "{what} 的字节流不完整");
+            assert!(
+                self.writes.iter().all(|n| *n <= STREAM_BUF),
+                "{what} 有一次写了 {:?} 字节（> {STREAM_BUF}）：这就是一次性读入，\
+                 峰值内存跟文件大小成正比",
+                self.writes.iter().max()
+            );
+            assert!(
+                self.writes.len() >= body.len().div_ceil(STREAM_BUF),
+                "{what} 只写了 {} 次，{} 字节至少该切成 {} 块",
+                self.writes.len(),
+                body.len(),
+                body.len().div_ceil(STREAM_BUF)
+            );
+        }
+    }
+
+    /// 回环上的一次性 HTTP 服务器（**不出网**）：接一条连接，把 `head` 与 `chunks` 依次写
+    /// 出去、每块之间停 `gap`，写完就关。线程里所有失败都忽略——客户端先走一步（预算到点、
+    /// 超限）是有些用例的预期，那时写 socket 会 EPIPE。
+    fn serve_once(head: &str, chunks: Vec<Vec<u8>>, gap: std::time::Duration) -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("回环监听");
+        let port = l.local_addr().expect("本地地址").port();
+        let head = head.to_string();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let Ok((mut s, _)) = l.accept() else { return };
+            // 请求头先读掉：不读就关连接会发 RST，客户端看到的就不是「半截 body」了
+            let _ = s.read(&mut [0u8; 2048]);
+            if s.write_all(head.as_bytes()).is_err() {
+                return;
+            }
+            for c in chunks {
+                if s.write_all(&c).is_err() || s.flush().is_err() {
+                    return;
+                }
+                std::thread::sleep(gap);
+            }
+        });
+        port
+    }
+
     struct FakeFetcher {
         files: Mutex<Vec<(String, Vec<u8>)>>,
         seen: Mutex<Vec<String>>,
+        /// 走**流式**那条口子的流水（url, 喂进 sink 的字节数）：`install` 改回
+        /// `get_bytes` + 一次性 digest 时它会是空的（见 `install_streams_…` 用例）。
+        streamed: Mutex<Vec<(String, usize)>>,
     }
 
     impl FakeFetcher {
@@ -736,17 +988,19 @@ mod tests {
                         .collect(),
                 ),
                 seen: Mutex::new(Vec::new()),
+                streamed: Mutex::new(Vec::new()),
             }
         }
 
         fn seen(&self) -> Vec<String> {
             self.seen.lock().unwrap().clone()
         }
-    }
 
-    impl Fetcher for FakeFetcher {
-        fn get_bytes(&self, url: &str) -> anyhow::Result<Vec<u8>> {
-            self.seen.lock().unwrap().push(url.to_string());
+        fn streamed(&self) -> Vec<(String, usize)> {
+            self.streamed.lock().unwrap().clone()
+        }
+
+        fn take(&self, url: &str) -> anyhow::Result<Vec<u8>> {
             self.files
                 .lock()
                 .unwrap()
@@ -755,6 +1009,24 @@ mod tests {
                 .map(|(_, b)| b.clone())
                 // 真 HttpFetcher 的 404 是 `NotFound`，预发布回退靠它判断：假的必须一致
                 .ok_or_else(|| NotFound(url.to_string()).into())
+        }
+    }
+
+    impl Fetcher for FakeFetcher {
+        fn get_bytes(&self, url: &str) -> anyhow::Result<Vec<u8>> {
+            self.seen.lock().unwrap().push(url.to_string());
+            self.take(url)
+        }
+
+        fn download_to(&self, url: &str, sink: &mut dyn std::io::Write) -> anyhow::Result<String> {
+            let bytes = self.take(url)?;
+            sink.write_all(&bytes)?;
+            sink.flush()?;
+            self.streamed
+                .lock()
+                .unwrap()
+                .push((url.to_string(), bytes.len()));
+            Ok(sha256_hex(&bytes))
         }
     }
 
@@ -777,6 +1049,7 @@ mod tests {
         let m: Manifest = serde_json::from_str(&json).unwrap();
         let f = FakeFetcher {
             seen: Mutex::new(Vec::new()),
+            streamed: Mutex::new(Vec::new()),
             files: Mutex::new(vec![
                 ("https://x/manifest.json".into(), json.into_bytes()),
                 ("https://x/hysteria".into(), payload.to_vec()),
@@ -1466,6 +1739,295 @@ mod tests {
         assert_eq!(h.ops(), vec!["write:/opt/b-ui/bin/hysteria:755"]);
     }
 
+    /// 钉住「安装写那一半也不再把二进制整段读进内存」（2026-09-17 裁决）。
+    ///
+    /// 上一轮只改了「稳态对账算内核 sha」那一半；下载写盘这一半仍是
+    /// `get_bytes` → `sha256_hex(&bytes)` → `write_file(dest, &bytes)`，一次安装/升级里单笔
+    /// 就有约 81 MB 常驻（sing-box，自建带 `with_v2ray_api` 的更大）加一份写盘副本，而
+    /// `b-ui.service` 的 `MemoryMax=200M` 是**硬上限**（`modules/units.rs`）⇒ 升级期 OOM、
+    /// 被 systemd 杀在下载半路。峰值 RSS 在单测里钉不住，所以这里钉**用了哪条接口**：
+    /// `Fetcher::download_to` + `Host::stage_file`，`get_bytes` 一次都没碰。改回一次性读入
+    /// 这条就转红。真实现是不是真流式，由 `download_to_streams_in_chunks_…` 按跨块非整数倍
+    /// 的长度对照一次性 digest 钉住。
+    #[test]
+    fn install_streams_the_body_instead_of_reading_it_whole() {
+        let payload = b"binary-bytes";
+        let (m, f) = fixture(payload);
+        let h = FakeHost::new();
+        let dest = std::path::Path::new("/opt/b-ui/bin/hysteria");
+        let (ver, asset) = m.kernel_asset("hysteria", "x86_64").unwrap();
+        KernelInstaller {
+            fetcher: &f,
+            host: &h,
+        }
+        .install("hysteria", ver, &asset.sha256, &asset.url, dest)
+        .unwrap();
+        assert_eq!(
+            f.streamed(),
+            vec![(asset.url.clone(), payload.len())],
+            "二进制必须走 download_to（边下边 hash 边写临时文件）"
+        );
+        assert!(
+            f.seen().is_empty(),
+            "二进制不许经 get_bytes 整段读进内存（get_bytes 只给 manifest 这类小文件）"
+        );
+        assert_eq!(
+            h.staged(),
+            vec![dest.to_path_buf()],
+            "先开临时写入槽，校验过才 commit"
+        );
+        assert_eq!(
+            h.ops(),
+            vec!["write:/opt/b-ui/bin/hysteria:755"],
+            "落盘仍是一次 0755 写入，ops 契约不变"
+        );
+    }
+
+    /// 真实文件系统上的语义（假机器钉不住 rename 与临时文件）：sha 不匹配 ⇒ 现装二进制
+    /// 一个字节不动、`bin/` 里不留 `.sing-box.download` 残骸；匹配 ⇒ 0755 就位。
+    /// 「下载源」用本地路径（`HttpFetcher` 的 file 分支与 HTTP 分支共用同一条流式循环），
+    /// 于是这条用例不出网。
+    #[test]
+    fn install_on_a_real_filesystem_never_touches_the_installed_binary_until_the_sha_matches() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let d = tempfile::tempdir().unwrap();
+        let host = crate::sys::real::RealHost::new();
+        let bin = d.path().join("bin");
+        let dest = bin.join("sing-box");
+        host.write_file(&dest, b"SB-1.14.1-official", 0o755)
+            .unwrap();
+        // 跨块且非整数倍：把流式循环写错就会算出另一个 sha
+        let body: Vec<u8> = (0..(150 * 1024 + 123)).map(|i| (i % 251) as u8).collect();
+        let src = d.path().join("payload");
+        std::fs::write(&src, &body).unwrap();
+        let f = HttpFetcher::new();
+        let inst = KernelInstaller {
+            fetcher: &f,
+            host: &host,
+        };
+        let err = inst
+            .install(
+                "sing-box",
+                "1.14.1",
+                &sha256_hex(b"another-build"),
+                src.to_str().unwrap(),
+                &dest,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sha256 不匹配"), "{err}");
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"SB-1.14.1-official",
+            "校验不过绝不动现装二进制"
+        );
+        assert_eq!(
+            host.list_dir(&bin).unwrap(),
+            vec![dest.clone()],
+            "临时文件必须删掉（每次校验失败留一个 81 MB 残骸会把盘撑爆）"
+        );
+        inst.install(
+            "sing-box",
+            "1.14.1",
+            &sha256_hex(&body),
+            src.to_str().unwrap(),
+            &dest,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            body,
+            "校验过才 rename 到目标"
+        );
+        assert_eq!(
+            std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(host.list_dir(&bin).unwrap(), vec![dest]);
+    }
+
+    /// 真流式的正确性判据：分块搬运的结果与一次性 digest 逐位相同（0 / 单块内 / 正好一块 /
+    /// 跨两块且非整数倍，本地路径与 `file://` 两种写法各来一遍），**而且真的是分块的**
+    /// ——sink 记下每次 write 的长度，一次性读入会写出一整块（见 [`CountingSink`]）。
+    #[test]
+    fn download_to_streams_in_chunks_and_matches_the_one_shot_digest() {
+        let d = tempfile::tempdir().unwrap();
+        let f = HttpFetcher::new();
+        for len in [0usize, 7, 64 * 1024, 64 * 1024 + 1, 150 * 1024 + 123] {
+            let body: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let p = d.path().join(format!("payload-{len}"));
+            std::fs::write(&p, &body).unwrap();
+            for url in [p.display().to_string(), format!("file://{}", p.display())] {
+                let mut sink = CountingSink::default();
+                let got = f.download_to(&url, &mut sink).unwrap();
+                assert_eq!(
+                    got,
+                    sha256_hex(&body),
+                    "长度 {len} 的流式 sha 与一次性 digest 不符（{url}）"
+                );
+                sink.assert_streamed(&body, &format!("长度 {len} 的本地源（{url}）"));
+            }
+        }
+        assert!(
+            f.download_to(
+                &d.path().join("nope").display().to_string(),
+                &mut Vec::new()
+            )
+            .is_err(),
+            "源不存在必须报错，不能静默产出空文件的 sha"
+        );
+    }
+
+    /// HTTP 分支自己的分块判据 + 状态码成型。上一条只覆盖本地路径 / `file://`，所以复核
+    /// （2026-09-17）实测「只把 HTTP 分支改回 `send_get().bytes()`」是全绿的，`send_get` 里
+    /// 404 成型那三行删掉也全绿。回环 `TcpListener` 手写响应，不出网。
+    #[test]
+    fn download_to_over_http_streams_in_chunks_and_shapes_status_errors() {
+        let f = HttpFetcher::new();
+        // 跨块且非整数倍；服务器按 11 KiB 一片发，客户端怎么攒都不该出现 > 64 KiB 的写入
+        let body: Vec<u8> = (0..(150 * 1024 + 123)).map(|i| (i % 251) as u8).collect();
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let chunks: Vec<Vec<u8>> = body.chunks(11 * 1024).map(|c| c.to_vec()).collect();
+        let port = serve_once(&head, chunks, std::time::Duration::ZERO);
+        let mut sink = CountingSink::default();
+        let got = f
+            .download_to(&format!("http://127.0.0.1:{port}/sing-box"), &mut sink)
+            .expect("200 必须收完");
+        assert_eq!(
+            got,
+            sha256_hex(&body),
+            "HTTP 分支的流式 sha 与一次性 digest 不符"
+        );
+        sink.assert_streamed(&body, "HTTP 200 的响应体");
+
+        // 404 单独成型：预发布通道回退靠它判断（见 `fetch_manifest_with`）
+        let port = serve_once(
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
+            vec![],
+            std::time::Duration::ZERO,
+        );
+        let e = f
+            .download_to(&format!("http://127.0.0.1:{port}/nope"), &mut Vec::new())
+            .unwrap_err();
+        assert!(is_not_found(&e), "{e:#}");
+
+        // 其余非 2xx 带状态码
+        let port = serve_once(
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n",
+            vec![],
+            std::time::Duration::ZERO,
+        );
+        let e = format!(
+            "{:#}",
+            f.download_to(&format!("http://127.0.0.1:{port}/boom"), &mut Vec::new())
+                .unwrap_err()
+        );
+        assert!(e.contains("HTTP 500"), "{e}");
+    }
+
+    /// 复核 2026-09-17 的 blocking 项：`Client::builder().timeout(300s)` 在
+    /// `reqwest::blocking` 的流式 `Read` 上是**每次 read** 重新计时的
+    /// （`blocking::wait::timeout` 每次都 `Instant::now() + d`），于是「整个请求 300 秒」
+    /// 退化成「每 64 KiB 一次 read 的预算」——涓流/半死的镜像不再报错。而守护进程里只有
+    /// **一条**对账消费者（`serve.rs` 的 reconcile mpsc，外面没有 `tokio::time::timeout`），
+    /// 一次卡死之后去抖触发、10 分钟漂移巡检、每日自检就全在队列里排队：配置不写、单元
+    /// 不重启、漂移不报、也不产 incident。这条用例钉「涓流有终态」。
+    #[test]
+    fn a_trickling_mirror_ends_on_the_total_budget_instead_of_blocking_forever() {
+        assert_eq!(
+            DOWNLOAD_BUDGET,
+            std::time::Duration::from_secs(300),
+            "预算就是 `get_bytes` 时代的语义（整个请求 300 秒），不许放大"
+        );
+        assert_eq!(
+            HttpFetcher::new().budget,
+            DOWNLOAD_BUDGET,
+            "默认实现必须带着预算，不是只有用例才有"
+        );
+        // Content-Length 报 1 MB，实际每 5 ms 挤一个字节（400 个之后撒手）。预算调成 100 ms：
+        // 不看总预算的实现要等服务器撒手才报错，那时错误串里是「响应体失败」而不是「总预算」。
+        let port = serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\n\r\n",
+            vec![vec![b'x'; 1]; 400],
+            std::time::Duration::from_millis(5),
+        );
+        let f = HttpFetcher::with_limits(std::time::Duration::from_millis(100), DOWNLOAD_MAX_BYTES);
+        let url = format!("http://user:s3cr3t-token@127.0.0.1:{port}/sing-box");
+        let start = std::time::Instant::now();
+        let e = format!("{:#}", f.download_to(&url, &mut Vec::new()).unwrap_err());
+        let took = start.elapsed();
+        assert!(
+            took < std::time::Duration::from_secs(10),
+            "{took:?} 才退出：失败路径没有终态"
+        );
+        assert!(e.contains("总预算"), "错误要说清是预算到点：{e}");
+        assert!(!e.contains("s3cr3t-token"), "{e}");
+        assert!(e.contains("***:***@127.0.0.1"), "{e}");
+    }
+
+    /// 字节上限：镜像坏掉或被替换后回一个无限/超大 body 时别一路写到 ENOSPC（盘撑满期间
+    /// `state.json` 写入、证书续签、journald 会一起失败）。sha 校验只在下载**之后**才有机会
+    /// 拒绝，所以上限必须在循环里。
+    #[test]
+    fn an_oversized_body_is_refused_before_it_fills_the_disk() {
+        assert_eq!(
+            DOWNLOAD_MAX_BYTES,
+            512 * 1024 * 1024,
+            "上限不许放大到实际等于没有（最大的真资产约 81 MB）"
+        );
+        assert_eq!(HttpFetcher::new().max_bytes, DOWNLOAD_MAX_BYTES);
+        let body = vec![b'y'; 40 * 1024];
+        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+        let port = serve_once(&head, vec![body.clone()], std::time::Duration::ZERO);
+        let f = HttpFetcher::with_limits(DOWNLOAD_BUDGET, 8 * 1024);
+        let mut sink = CountingSink::default();
+        let e = format!(
+            "{:#}",
+            f.download_to(&format!("http://127.0.0.1:{port}/huge"), &mut sink)
+                .unwrap_err()
+        );
+        assert!(e.contains("上限"), "{e}");
+        assert!(
+            sink.bytes.len() < body.len(),
+            "超限之后不许继续往盘上写：已写 {} 字节",
+            sink.bytes.len()
+        );
+    }
+
+    /// 磁盘满不是「下载失败」：写 sink 的 io 错误在类型上与读来源分开（[`SinkFailed`]），
+    /// 首层文案里也不许出现下载地址——装机/升级要连写约 190 MB，磁盘满是最现实的失败，
+    /// 把操作者指向网络就是误导（`panel::packages::sync_once` 的 `{key} 写盘失败：` 靠它）。
+    #[test]
+    fn a_full_disk_is_reported_as_a_write_failure_not_a_download_failure() {
+        struct FullDisk;
+        impl std::io::Write for FullDisk {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from_raw_os_error(28))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("payload");
+        std::fs::write(&p, b"binary-bytes").unwrap();
+        let e = HttpFetcher::new()
+            .download_to(p.to_str().unwrap(), &mut FullDisk)
+            .unwrap_err();
+        let io = sink_failure(&e).unwrap_or_else(|| panic!("写盘失败必须认得出来：{e:#}"));
+        assert_eq!(io.raw_os_error(), Some(28));
+        let msg = format!("{e:#}");
+        assert!(msg.contains("写临时文件失败"), "{msg}");
+        assert!(
+            !msg.contains(&p.display().to_string()),
+            "写盘失败的文案不许点名下载来源：{msg}"
+        );
+    }
+
     #[test]
     fn install_refuses_on_sha256_mismatch_and_writes_nothing() {
         let (m, f) = fixture(b"binary-bytes");
@@ -1487,6 +2049,11 @@ mod tests {
         .to_string();
         assert!(err.contains("sha256"), "{err}");
         assert!(h.ops().is_empty(), "校验不过不写盘");
+        assert_eq!(
+            h.staged(),
+            vec![std::path::PathBuf::from("/opt/b-ui/bin/xray")],
+            "临时写入槽开过、但没 commit：目标路径上的现装二进制不动"
+        );
     }
 
     #[test]
@@ -1520,6 +2087,50 @@ mod tests {
         assert!(!chain.contains("s3cr3t-token"), "{chain}");
         assert!(!chain.contains("user:"), "{chain}");
         assert!(chain.contains("***:***@127.0.0.1:1"), "{chain}");
+
+        // 流式那条口子同一条铁律（二进制的下载地址也可能带 basic auth）。注意这一段
+        // 与上一段一样只走到 `send_get`（1 端口必定拒连），读正文那条口子在下面单独试。
+        let chain = format!("{:#?}", f.download_to(URL, &mut Vec::new()).unwrap_err());
+        assert!(!chain.contains("s3cr3t-token"), "{chain}");
+        assert!(!chain.contains("user:"), "{chain}");
+        assert!(chain.contains("***:***@127.0.0.1:1"), "{chain}");
+
+        // 「响应头 200、读正文中途断」那一支（复核 2026-09-17：原来的断言一次都没走到这里）：
+        // 回环监听报 Content-Length: 1000 只发 5 字节就关，错误来自 `stream_sha256` 的 Read。
+        let port = serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n",
+            vec![b"short".to_vec()],
+            std::time::Duration::ZERO,
+        );
+        let url = format!("http://user:s3cr3t-token@127.0.0.1:{port}/sing-box");
+        let chain = format!("{:#?}", f.download_to(&url, &mut Vec::new()).unwrap_err());
+        assert!(!chain.contains("s3cr3t-token"), "{chain}");
+        assert!(!chain.contains("user:"), "{chain}");
+        assert!(chain.contains("***:***@127.0.0.1"), "{chain}");
+
+        // 上面那条今天**挡不住** `without_url()` 被删掉：这一版 reqwest（0.12.28）的 body
+        // 错误恰好不带 url。而模块头的铁律明写不许依赖这种内部实现细节（换一版、换一种
+        // body 错误就漏），所以直接拿一条**确实带 url** 的 reqwest 错误（`send()` 拒连那种）
+        // 包进 `io::Error` 喂给 `body_error`，钉住「URL 有没有被剥掉」本身：URL 里那段路径
+        // 只有 reqwest 的错误知道，脱敏上下文里不会出现它。userinfo 这一版已被 reqwest 挪进
+        // Authorization 头（实测 `e.url()` 的 username 是空的），所以只能这么钉。
+        let with_url = reqwest::blocking::Client::new()
+            .get("http://127.0.0.1:1/only-reqwest-knows-this-path")
+            .send()
+            .unwrap_err();
+        assert!(
+            format!("{with_url}").contains("only-reqwest-knows-this-path"),
+            "夹具前提：这条 reqwest 错误本来就带 url，否则这段断言什么都没验"
+        );
+        let e = body_error(URL, std::io::Error::other(with_url));
+        // `{:#?}` 把 url 字段摊出来，`{:#}` 带 ` for url (…)`：两种都不许留下
+        for chain in [format!("{e:#?}"), format!("{e:#}")] {
+            assert!(
+                !chain.contains("only-reqwest-knows-this-path"),
+                "reqwest 的错误必须先剥掉 URL：{chain}"
+            );
+            assert!(chain.contains("***:***@127.0.0.1:1"), "{chain}");
+        }
 
         // manifest 解析失败的错误串同样要带脱敏来源（Task 15「拉不到只 warn」靠它定位）。
         let d = tempfile::tempdir().unwrap();

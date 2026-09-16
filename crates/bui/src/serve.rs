@@ -667,8 +667,8 @@ mod tests {
     }
 
     struct FakeFetcher(Mutex<Vec<(String, Vec<u8>)>>);
-    impl Fetcher for FakeFetcher {
-        fn get_bytes(&self, url: &str) -> anyhow::Result<Vec<u8>> {
+    impl FakeFetcher {
+        fn take(&self, url: &str) -> anyhow::Result<Vec<u8>> {
             self.0
                 .lock()
                 .unwrap()
@@ -676,6 +676,18 @@ mod tests {
                 .find(|(u, _)| u == url)
                 .map(|(_, b)| b.clone())
                 .ok_or_else(|| crate::kernels::NotFound(url.to_string()).into())
+        }
+    }
+    impl Fetcher for FakeFetcher {
+        fn get_bytes(&self, url: &str) -> anyhow::Result<Vec<u8>> {
+            self.take(url)
+        }
+
+        fn download_to(&self, url: &str, sink: &mut dyn std::io::Write) -> anyhow::Result<String> {
+            let bytes = self.take(url)?;
+            sink.write_all(&bytes)?;
+            sink.flush()?;
+            Ok(crate::kernels::sha256_hex(&bytes))
         }
     }
 

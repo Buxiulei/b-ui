@@ -46,8 +46,11 @@ pub const MANAGED_CONF_DIRS: [&str; 4] = [
 /// 受管配置的文件名前缀（`99-b-ui-network.conf` 一类）；别人的 `60-cloudimg.conf` 不看。
 const CONF_PREFIXES: [&str; 3] = ["b-ui", "00-b-ui", "99-b-ui"];
 
-/// 写盘期间可能瞬时存在的中间文件后缀，不算漂移。
-const TRANSIENT_SUFFIXES: [&str; 2] = [".tmp", ".new"];
+/// 写盘期间可能瞬时存在的中间文件后缀，不算漂移。`.download` 是
+/// [`Host::stage_file`](crate::sys::Host::stage_file) 的下载槽（`.<名字>.download`）：它的
+/// 残留窗口不是「一次内存到盘的拷贝」而是**整段下载时长**，被 SIGKILL / 重启打断就会留在
+/// 盘上，所以必须和另外两个一样不算漂移。
+const TRANSIENT_SUFFIXES: [&str; 3] = [".tmp", ".new", ".download"];
 
 const SYSTEMD_DIR: &str = "/etc/systemd/system";
 
@@ -314,6 +317,38 @@ mod tests {
             h.ops().iter().all(|o| o.starts_with("run:")),
             "scan 只读，不改任何东西"
         );
+    }
+
+    /// 三个瞬时后缀（`.tmp` / `.new` / `.download`）在 `<base>` 顶层都不算漂移：写盘与
+    /// 下载被打断留下的中间文件不该每 10 分钟报一条 degraded（`.download` 的残留窗口是
+    /// 整段下载时长，被 SIGKILL 打断就会留在盘上）。
+    #[test]
+    fn transient_write_and_download_slots_are_not_drift() {
+        for name in [".config.yaml.tmp", ".config.yaml.new", ".sing-box.download"] {
+            let h = FakeHost::new();
+            h.with(|i| {
+                i.files
+                    .insert("/opt/b-ui/config.yaml".into(), (b"a".to_vec(), 0o600));
+                i.files
+                    .insert("/etc/resolv.conf".into(), (b"b".to_vec(), 0o644));
+                i.immutable.insert("/etc/resolv.conf".into());
+                i.files.insert(
+                    "/etc/systemd/system/xray.service".into(),
+                    (b"x".to_vec(), 0o644),
+                );
+                i.files
+                    .insert(format!("/opt/b-ui/{name}").into(), (b"?".to_vec(), 0o600));
+                i.scripted.push((
+                    "crontab -l".into(),
+                    CmdOut::failure(1, "no crontab for root"),
+                ));
+            });
+            assert_eq!(
+                scan(&h, &managed(), &Paths::default_server()),
+                vec![],
+                "{name} 是中间文件，不算漂移"
+            );
+        }
     }
 
     #[test]
