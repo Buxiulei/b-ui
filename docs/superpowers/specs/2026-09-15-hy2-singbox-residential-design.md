@@ -368,7 +368,7 @@ Clash API 客户端复用 `modules/residential/clash.rs` 的 `Clash` trait（`re
 7. **自动跟进** 新工作流 `.github/workflows/kernels-bump.yml`（每周 cron + `workflow_dispatch`）：`pin-kernels.sh --write` → 锁有变化才继续 → 用新内核跑 `cargo test`（含渲染结果的 `sing-box check` 矩阵）→ 开 PR `chore(kernels): sing-box 1.14.1 → 1.14.2`。
 8. **失败语义（硬要求）**：上游 clone 失败、构建失败、`Tags` 不达标、sha 不可重现、`check` 不过——**任何一步失败 ⇒ 工作流红、锁不动、不开 PR**；`release.yml` 永远只用锁里的版本，所以**发布保持上一版**，GitHub 的失败通知就是告警。**绝不因上游改动阻塞发版**。正式发版仍由主理人打 tag。
 9. **`release.yml` / `ci.yml` 改动点**：两个 job 的 `setup-kernels` 自动走 `build:`；`release` job 里「把上游内核以裸二进制归集进 dist」那步对 sing-box 改取构建产物（12 个资产的清点不变，`release.yml:211-217`）；加断言 `dist/sing-box-linux-amd64 version` 的 `Tags` 含 `with_v2ray_api`（arm64 不能在 x86 runner 执行，靠锁 sha）。`ci.yml` 的 `test (1.12/1.13/1.14)` 三格保留（订阅 / relay / 客户端的兼容门槛）；`hy2-residential.json` 的 `check` 只在自建 1.14 上跑，二进制不带 `with_v2ray_api` 时该用例 `skip`，并把这种 skip 加进 `ci.yml:130-131` 的白名单（「内核校验漏跑判红」的口径不变）。
-10. **manifest（C4）形状不变**，`kernels.sing_box` 仍是纯版本号；可选附加字段 `builds: { "sing-box": { "source": …, "go": …, "tags": … } }`（消费方忽略未知字段）。`scripts/tests/test-pin-kernels.sh` / `test-fetch-kernels.sh` / `test-manifest.sh` 按 `build:` 行更新，**测试禁网**：`build-singbox.sh` 用 PATH 前置 stub。
+10. **manifest（C4）形状不变**，`kernels.sing_box` 仍是纯版本号；可选附加字段 `builds: { "sing-box": { "source": …, "go": …, "tags": … } }`（消费方忽略未知字段；**2026-09-16 裁决：本期不做这个字段**，没有消费方）。**同版本不同构建靠 `artifacts.sing-box-linux-<arch>.sha256` 识别**：对账、`bui upgrade`、`bui install` 三处按「版本不同**或** sha 不同即重装」判定，否则自建二进制在已装官方同版本的机器上永远装不上，住宅 HY2 会陷入永久崩溃循环（每个内核 × 每个架构的 sha 都在 manifest 里，`Manifest::kernel_asset` 按 `<name>-linux-<arch>` 查得到）。`scripts/tests/test-pin-kernels.sh` / `test-fetch-kernels.sh` / `test-manifest.sh` 按 `build:` 行更新，**测试禁网**：`build-singbox.sh` 用 PATH 前置 stub。
 
 ---
 
