@@ -43,6 +43,11 @@ pub const MODULE_NAME: &str = "panel";
 pub const HY2_STATS_PORT_DIRECT: u16 = 9999;
 /// 住宅实例的 `trafficStats` 端口基准（槽 i = `9998 - i`，见 `bui_schema::slots`）。
 /// 单槽时就是今天的 9998。
+///
+/// **4.1 起没有任何生产调用点**：住宅是一个 sing-box 入站，计量走 v2ray_api、在线与踢人
+/// 走 Clash API（[`traffic::stats_ports`] 因此只剩直连那一个端口）。符号本身留给 T15
+/// 的「删旧 API」一起清，`allow` 就是它已经是死代码的记号 —— 别再给它加调用点。
+#[allow(dead_code)]
 pub const HY2_STATS_PORT_RESI: u16 = bui_schema::slots::HY2_STATS_RESI_BASE;
 /// 住宅 HY2（sing-box）的两个回环控制面（spec §2.3）：`HY2_RESI_CLASH_API` 上跑在线数、
 /// 踢连接与门位（selector），`HY2_RESI_V2RAY_API` 上跑 `StatsService.QueryStats` 的计量。
