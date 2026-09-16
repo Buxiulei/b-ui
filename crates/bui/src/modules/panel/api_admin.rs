@@ -42,6 +42,45 @@ fn bad_json() -> Response {
     fail(StatusCode::BAD_REQUEST, "请求格式错误（JSON 解析失败）")
 }
 
+/// 这个用户该有住宅 HY2 凭据却没拿到（池的 id 域 256 条用尽）⇒ 记一条 Error 级事件。
+///
+/// spec §3.1：空闲耗尽时建用户 / 轮换**不拒绝**，当场扩容；扩到上限还分不出来就只能如实
+/// 告警 —— 静默下去的表现是「有住宅权益但订阅里没有住宅 HY2 节点」，从面板上看不出原因。
+async fn report_pool_exhausted_for(app: &AppState, user_id: uuid::Uuid) {
+    let missing = {
+        let s = app.store.read().await;
+        s.users
+            .iter()
+            .find(|u| u.user_id == user_id)
+            .filter(|u| super::gates::has_resi_hy2(u))
+            .filter(|u| bui_schema::hy2pool::cred_of(u, &s.residential).is_none())
+            .map(|u| u.username.clone())
+    };
+    let Some(username) = missing else {
+        return;
+    };
+    tracing::error!(
+        user = %username,
+        "住宅 HY2 凭据池分不出凭据，该用户渲染不出住宅 HY2 节点"
+    );
+    let inc = crate::modules::sentinel::incidents::Incident {
+        at: crate::util::fmt_rfc3339(app.host.now()),
+        unit: "b-ui".into(),
+        signature: crate::modules::residential::slots::POOL_EXHAUSTED_SIG.into(),
+        subject: username,
+        action: "分配住宅 HY2 凭据".into(),
+        result: format!(
+            "凭据池上限 {} 条已用尽，该用户暂无住宅 HY2 节点",
+            bui_schema::hy2pool::POOL_MAX
+        ),
+        level: crate::modules::sentinel::incidents::Level::Error,
+        sample: None,
+    };
+    app.runtime
+        .update(move |rt| crate::modules::sentinel::incidents::push(rt, inc))
+        .await;
+}
+
 /// `GET /api/config` 的响应（形状逐字段照 v3 `getConfig`，`web/server.js:392-489`）
 pub fn config_payload(s: &BuiState) -> serde_json::Value {
     let ph = match s.node.ports.hy2_hop {
@@ -163,6 +202,9 @@ async fn create_user(State(app): State<AppState>, body: Bytes) -> Response {
     if dup {
         return fail(StatusCode::BAD_REQUEST, "用户名已存在");
     }
+    // spec §3.1：池的 id 域用尽（256 条）时**不拒绝建用户**，但要记一条 Error 级事件 ——
+    // 没有凭据就渲染不出他的住宅 HY2 节点，运维必须看得见。
+    report_pool_exhausted_for(&app, uid).await;
     // 新用户要有自己那条 `resi-u-<user_id>` 槽规则（D7），置脏交给对账末尾收敛
     crate::modules::residential::slots::mark_xray_rules_dirty(&app.runtime).await;
     app.bus.send(Event::StateChanged("users"));
@@ -261,14 +303,27 @@ async fn rotate_user(
     Path(username): Path<String>,
     shared: Arc<Shared>,
 ) -> Response {
+    let now = app.host.now();
     let mut rotated: Option<bui_schema::model::User> = None;
+    // 住宅 HY2 的旧 / 新凭据 id：换凭据必须显式「先 release 再 assign」（`hy2pool::assign`
+    // 是幂等的，不 release 就会原样拿回旧凭据 ⇒ 轮换等于没换）
+    let mut old_cred: Option<String> = None;
+    let mut new_cred: Option<String> = None;
     if let Err(e) = app
         .store
         .update(|s| {
-            if let Some(u) = s.users.iter_mut().find(|u| u.username == username) {
-                users::rotate(u);
-                rotated = Some(u.clone());
+            let Some(idx) = s.users.iter().position(|u| u.username == username) else {
+                return;
+            };
+            users::rotate(&mut s.users[idx]);
+            let uid = s.users[idx].user_id;
+            let resi = super::gates::has_resi_hy2(&s.users[idx]);
+            // 释放记 `released_at` ⇒ 24 小时冷却期，旧凭据不会立刻发给下一个人
+            old_cred = bui_schema::hy2pool::release(s, uid, now);
+            if resi {
+                new_cred = crate::modules::residential::slots::assign_hy2_cred(s, uid);
             }
+            rotated = Some(s.users[idx].clone());
         })
         .await
     {
@@ -280,6 +335,24 @@ async fn rotate_user(
     let Some(u) = rotated else {
         return fail(StatusCode::NOT_FOUND, "User not found");
     };
+    // 两次 PUT（spec §3.3）：旧凭据的门当场切 `deny`（`interrupt_exist_connections` ⇒ 拿着
+    // 旧订阅的那一方存量流立刻断），新凭据的门开到他自己那一槽。只靠 60 秒收敛不行 ——
+    // 轮换的整个理由就是「现在就让旧凭据失效」。
+    if let Some(old) = old_cred.as_deref() {
+        super::gates::put_gate(&shared, old, bui_schema::render::hy2_singbox::DENY_TAG).await;
+    }
+    if let Some(new) = new_cred.as_deref() {
+        let tag = {
+            let s = app.store.read().await;
+            bui_schema::render::hy2_singbox::slot_out_tag(bui_schema::slots::index_of_user(
+                &u,
+                &s.residential,
+            ))
+        };
+        super::gates::put_gate(&shared, new, &tag).await;
+    }
+    // 该有凭据却没拿到（id 域用尽）⇒ Error 级事件（spec §3.1）
+    report_pool_exhausted_for(&app, u.user_id).await;
     // 凭据变了 ⇒ 重写鉴权快照 + 把 xray 里的旧 uuid 换掉，都由 `users::sync_loop` 收敛。
     // 事件先发、再踢：两条鉴权路径据此刷新，被踢的客户端拿旧密码重连时已经会被拒。
     app.bus.send(Event::StateChanged("users"));
@@ -661,6 +734,82 @@ mod tests {
         );
     }
 
+    /// 面板新建用户当场拿一条住宅 HY2 凭据（spec §3.3 建用户那一行）：少了它，
+    /// 他刷出来的订阅里压根没有住宅 HY2 节点，而且没有任何提示。
+    #[tokio::test]
+    async fn creating_a_user_mints_his_residential_cred_right_away() {
+        let h = harness().await;
+        with_pool(&h).await;
+        let (r, t) = app(&h).await;
+        let (s, _) = send(
+            &r,
+            "POST",
+            "/api/users",
+            Some(&t),
+            Some(serde_json::json!({
+                "username": "bob", "days": 30, "protocol": "fusion", "residential": true
+            })),
+        )
+        .await;
+        assert_eq!(s, axum::http::StatusCode::OK);
+        let st = h.store.read().await;
+        let bob = st.users.iter().find(|u| u.username == "bob").unwrap();
+        let c = bui_schema::hy2pool::cred_of(bob, &st.residential).expect("建号即分凭据");
+        assert_eq!(c.name, c.id, "新发凭据的 name = id（spec §3.1）");
+        assert!(
+            bui_schema::nodes::nodes_for(bob, &st.node, &st.residential)
+                .iter()
+                .any(|n| n.kind == bui_schema::nodes::NodeKind::Hy2Residential),
+            "新用户的订阅里要有住宅 HY2 节点"
+        );
+        // 门位由下一轮 `sync_users` 收敛（`hy2-residential.json` 一个字节都不动）
+        assert!(
+            h.hy2resi.calls().is_empty(),
+            "建用户不该在 handler 里直接动内核：{:?}",
+            h.hy2resi.calls()
+        );
+    }
+
+    /// 池的 id 域用尽时**不拒绝建用户**，但要留一条 Error 级事件（spec §3.1）
+    #[tokio::test]
+    async fn creating_a_user_when_the_pool_is_exhausted_still_succeeds_but_alerts() {
+        let h = harness().await;
+        h.store
+            .update(|s| {
+                // 256 条全被占满：id 域用尽 ⇒ `grow` 一条都补不出来
+                s.residential.hy2_pool.creds = (0..bui_schema::hy2pool::POOL_MAX)
+                    .map(|i| bui_schema::model::ReservedCred {
+                        id: format!("r{i:03}"),
+                        name: format!("r{i:03}"),
+                        secret: "x".repeat(22),
+                        released_at: Some("2099-01-01T00:00:00Z".into()),
+                    })
+                    .collect();
+            })
+            .await
+            .unwrap();
+        let (r, t) = app(&h).await;
+        let (s, v) = send(
+            &r,
+            "POST",
+            "/api/users",
+            Some(&t),
+            Some(serde_json::json!({
+                "username": "bob", "days": 30, "protocol": "fusion", "residential": true
+            })),
+        )
+        .await;
+        assert_eq!(s, axum::http::StatusCode::OK, "建用户不许因为池满被拒");
+        assert_eq!(v["success"], true);
+        let inc = crate::modules::sentinel::incidents::from_runtime(&h.runtime.read().await);
+        let err = inc
+            .iter()
+            .find(|i| i.signature == crate::modules::residential::slots::POOL_EXHAUSTED_SIG)
+            .expect("池耗尽必须留一条 Error 级事件");
+        assert_eq!(err.level, crate::modules::sentinel::incidents::Level::Error);
+        assert_eq!(err.subject, "bob");
+    }
+
     #[tokio::test]
     async fn create_rejects_duplicates_bad_names_bad_protocols_and_broken_json() {
         let h = harness().await;
@@ -795,6 +944,95 @@ mod tests {
         // 面板列表跟着给出新 token（前端据此拼订阅链接）
         let (_, list) = send(&r, "GET", "/api/users", Some(&t), None).await;
         assert_eq!(list[0]["subToken"], token_now);
+    }
+
+    /// 轮换的住宅那半（spec §3.3）：释放旧凭据（记 `released_at` ⇒ 24 小时冷却期）、
+    /// 分一条新的，并当场两次 PUT —— 旧门切 `deny`、新门开到他自己那一槽。
+    /// 只靠 60 秒门位收敛不行：轮换的整个理由就是「现在就让旧凭据失效」。
+    #[tokio::test]
+    async fn rotate_releases_the_old_cred_and_assigns_a_new_one() {
+        let h = harness().await;
+        with_pool(&h).await;
+        let (r, t) = app(&h).await;
+        let before = {
+            let s = h.store.read().await;
+            s.users[0].credentials.hy2_resi_cred.clone().unwrap()
+        };
+        let (s, _) = send(
+            &r,
+            "POST",
+            "/api/users/alice/rotate",
+            Some(&t),
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(s, axum::http::StatusCode::OK);
+        let st = h.store.read().await;
+        let alice = &st.users[0];
+        let after = alice.credentials.hy2_resi_cred.clone().unwrap();
+        assert_ne!(
+            before, after,
+            "凭据必须真的换掉（assign 是幂等的，不 release 就白换）"
+        );
+        let calls = h.hy2resi.calls();
+        assert!(
+            calls.contains(&format!("select:gate-{before}:deny")),
+            "{calls:?}"
+        );
+        assert!(
+            calls.contains(&format!("select:gate-{after}:slot-0-out")),
+            "{calls:?}"
+        );
+        // 旧凭据进了冷却期，不会立刻发给下一个人
+        let old = st
+            .residential
+            .hy2_pool
+            .creds
+            .iter()
+            .find(|c| c.id == before)
+            .unwrap();
+        assert!(old.released_at.is_some(), "释放必记 released_at");
+        let c = bui_schema::hy2pool::cred_of(alice, &st.residential).unwrap();
+        assert_eq!(c.name, c.id, "新发凭据的 name = id");
+        assert_ne!(
+            c.secret, alice.credentials.hy2_password,
+            "住宅凭据与直连密码此后各走各的"
+        );
+        // 有凭据 ⇒ 订阅里仍有住宅 HY2 节点（换的是凭据，不是节点）
+        assert!(
+            bui_schema::nodes::nodes_for(alice, &st.node, &st.residential)
+                .iter()
+                .any(|n| n.kind == bui_schema::nodes::NodeKind::Hy2Residential)
+        );
+    }
+
+    /// 没有住宅 hysteria2 权益的用户轮换时不许白拿一条凭据（池是有限的）
+    #[tokio::test]
+    async fn rotating_a_direct_only_user_mints_no_residential_cred() {
+        let h = harness().await;
+        h.store
+            .update(|s| {
+                s.users[0].entitlements.residential = None;
+            })
+            .await
+            .unwrap();
+        with_pool(&h).await;
+        let (r, t) = app(&h).await;
+        send(
+            &r,
+            "POST",
+            "/api/users/alice/rotate",
+            Some(&t),
+            Some(serde_json::json!({})),
+        )
+        .await;
+        let st = h.store.read().await;
+        assert_eq!(st.users[0].credentials.hy2_resi_cred, None);
+        assert!(
+            !h.hy2resi.calls().iter().any(|c| c.contains("slot-")),
+            "{:?}",
+            h.hy2resi.calls()
+        );
     }
 
     #[tokio::test]

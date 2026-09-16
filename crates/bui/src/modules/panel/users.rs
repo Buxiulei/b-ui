@@ -661,6 +661,14 @@ pub async fn sync_users(ctx: &DaemonCtx, shared: &Shared, blocked: &BTreeSet<Uui
         let known: BTreeSet<Uuid> = state.users.iter().map(|u| u.user_id).collect();
         applied.xray_removed.retain(|id| known.contains(id));
     }
+    // ⑦ 住宅 HY2 的门位收敛（spec §3.3）：与上面那段 xray 收敛同构 —— 读一次内核真源
+    //    （`GET /proxies`）、求差集、只 PUT 不一致的那几个。用户的到期 / 封禁 / 解禁 /
+    //    换槽全部在这里落地，`hy2-residential.json` 一个字节都不动（spec §3.5）。
+    //    失败项进 `out.errors` ⇒ `report()` 打 `USER_SYNC_FAILED_LOG` ⇒ 哨兵认
+    //    `hy2_resi_gate_sync_failed`，60 秒安全网下一轮重试（幂等）。
+    let gates = super::gates::converge(ctx, shared, blocked).await;
+    out.errors.extend(gates.errors);
+
     // 用户集合变了 ⇒ Xray 的槽规则表要跟着增删（D7），置脏交给对账末尾收敛
     if !out.added.is_empty() || !out.removed.is_empty() {
         crate::modules::residential::slots::mark_xray_rules_dirty(&ctx.runtime).await;

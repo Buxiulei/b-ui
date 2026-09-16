@@ -80,14 +80,6 @@ pub struct ResiKickTarget {
     pub restore_to: Option<String>,
 }
 
-/// 「有住宅权益且开 hysteria2」—— 门只对这些人开（同 `hy2pool` 里那条池容量判据）。
-fn has_resi_hy2(u: &bui_schema::model::User) -> bool {
-    u.entitlements.residential.is_some()
-        && u.entitlements
-            .protocols
-            .contains(&bui_schema::model::Protocol::Hysteria2)
-}
-
 /// 这些用户在住宅侧的踢人目标；没有凭据的用户（没住宅权益、或池还没分过）不在表里。
 ///
 /// `open` = 这些人里「踢完还该放行」的那些（手动踢人时 = 没被 `users::blocked_set` 判拒
@@ -99,7 +91,7 @@ pub fn resi_kick_targets(s: &State, ids: &[Uuid], open: &BTreeSet<Uuid>) -> Vec<
         .filter_map(|id| {
             let u = s.users.iter().find(|u| u.user_id == *id)?;
             let c = bui_schema::hy2pool::cred_of(u, &s.residential)?;
-            let restore_to = (open.contains(id) && has_resi_hy2(u))
+            let restore_to = (open.contains(id) && super::gates::has_resi_hy2(u))
                 .then(|| slot_out_tag(bui_schema::slots::index_of_user(u, &s.residential)));
             Some(ResiKickTarget {
                 cred_id: c.id.clone(),

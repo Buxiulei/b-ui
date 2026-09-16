@@ -215,6 +215,11 @@ pub async fn reconcile_from_ctx(
     if report.restarted.iter().any(|u| u == "b-ui-relay") {
         ctx.bus.send(Event::RelayRestarted);
     }
+    // spec §3.4：住宅入站重启后每个门回到 default = deny（不开 `cache_file`），
+    // 订阅者立刻重放真实门位；不重放的话全体住宅 HY2 用户一直被拒到 60 秒安全网那一轮。
+    if report.restarted.iter().any(|u| u == "hysteria-residential") {
+        ctx.bus.send(Event::Hy2ResiRestarted);
+    }
     Ok(report)
 }
 
@@ -249,7 +254,10 @@ pub async fn debounce_loop(bus: EventBus, tx: tokio::sync::mpsc::Sender<bool>) {
         let force = match rx.recv().await {
             Ok(Event::StateChanged(_)) => false,
             Ok(Event::ReconcileRequested { force }) => force,
-            Ok(Event::RelayRestarted) => continue,
+            // 两条「内核刚重启」的事件都不该触发对账：它们自有重放订阅者
+            // （`health::replay_loop` / `gates::replay_loop`），这里白跑一轮只会多一次
+            // 全量对账
+            Ok(Event::RelayRestarted) | Ok(Event::Hy2ResiRestarted) => continue,
             Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => false,
         };
@@ -479,6 +487,13 @@ pub async fn run(paths: Paths, host: Arc<dyn Host>) -> anyhow::Result<()> {
         }
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %e, "住宅槽位迁移失败，本次启动按单槽渲染"),
+    }
+    // spec §4.3 + §3.1：把住宅 HY2 凭据池拉到期望态（先治悬空指针、再给没有凭据的人补发）。
+    // **必须在下面那轮启动对账之前**：`hy2-residential.json` 的凭据、门与 `auth_user` 规则
+    // 全从池里渲染，池空就等于全体住宅 HY2 用户没有节点、没有门。
+    // 幂等、零变更不写盘；失败只告警（下次启动重试，本轮按现有池渲染）。
+    if let Err(e) = crate::modules::residential::slots::migrate_hy2_pool_on_start(&ctx).await {
+        tracing::warn!(error = %e, "住宅 HY2 凭据池迁移失败，下次启动重试");
     }
     // 2026-09-14 裁决：升级上来的老 `state.json` 里的用户没有随机订阅 token，启动时补齐，
     // 并给他们手里那条「用户名链接」开宽限期。幂等、零变更不写盘，所以无条件跑一次；
@@ -1252,6 +1267,24 @@ mod tests {
         assert_eq!(rx.try_recv().ok(), Some(true), "force 要透传");
     }
 
+    /// 两条「内核刚重启」的事件都不许触发对账：它们各有自己的重放订阅者
+    /// （`health::replay_loop` / `gates::replay_loop`），在这里白跑一轮只会多一次全量对账。
+    #[tokio::test(start_paused = true)]
+    async fn a_kernel_restart_event_does_not_trigger_a_reconcile() {
+        let bus = EventBus::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(debounce_loop(bus.clone(), tx));
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        bus.send(Event::RelayRestarted);
+        bus.send(Event::Hy2ResiRestarted);
+        tokio::time::sleep(std::time::Duration::from_millis(DEBOUNCE_MS + 50)).await;
+        assert!(rx.try_recv().is_err(), "重启事件不该投触发");
+        // 同一个循环还活着：随后的 StateChanged 照旧要触发
+        bus.send(Event::StateChanged("test"));
+        tokio::time::sleep(std::time::Duration::from_millis(DEBOUNCE_MS + 50)).await;
+        assert_eq!(rx.try_recv().ok(), Some(false));
+    }
+
     /// 比本机（`CARGO_PKG_VERSION`）严格高一档的版本号（`x.(y+1).0`）。每日自检的降级守卫只
     /// 放 rank 更高的候选过，所以「有新版」这类用例不能把版本号写死 —— workspace 版本一升就
     /// 会失效。
@@ -1657,6 +1690,35 @@ mod tests {
         );
         assert_eq!(ctx.runtime.read().await.upgrade_available, None);
         task.abort();
+    }
+
+    /// spec §3.4：对账重启住宅入站之后必须发 `Event::Hy2ResiRestarted` —— 不开 `cache_file`，
+    /// 重启会把每个门打回 `default = deny`，不重放就是全体住宅 HY2 用户被拒到 60 秒安全网
+    /// 那一轮。
+    #[tokio::test]
+    async fn restarting_the_residential_inbound_announces_it_on_the_bus() {
+        let host = ready_host();
+        let d = tempfile::tempdir().unwrap();
+        let ctx = ctx_for(host.clone(), &d).await;
+        let reg = modules(None);
+        let fetcher: Arc<dyn Fetcher> = Arc::new(FakeFetcher(Mutex::new(vec![])));
+        let mut rx = ctx.bus.subscribe();
+        let report = reconcile_from_ctx(&ctx, &reg.modules, fetcher, false, false)
+            .await
+            .unwrap();
+        assert!(
+            report.restarted.iter().any(|u| u == "hysteria-residential"),
+            "前提：首轮对账会重启住宅入站：{:?}",
+            report.restarted
+        );
+        let mut seen = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            seen.push(e);
+        }
+        assert!(
+            seen.contains(&Event::Hy2ResiRestarted),
+            "住宅入站重启没有广播出去：{seen:?}"
+        );
     }
 
     #[tokio::test]

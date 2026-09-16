@@ -1075,6 +1075,12 @@ pub async fn run_with_wait(
                 if !answers.first_user.is_empty() {
                     state.users.push(first_user(&answers.first_user)?);
                 }
+                // spec §3.1：建住宅 HY2 凭据池并给首用户分一条 —— 全新装机的第一个用户
+                // **不走** `residential::slots::assign_new_user`（他是在这里 push 进去的），
+                // 少了这一步他从一开始就没有住宅 HY2 凭据 ⇒ `nodes_for` 不发那个节点、
+                // `hy2-residential.json` 渲染出空池（一个门都没有）。口径与
+                // `v3::import` / `slots::migrate_hy2_pool_on_start` 同一处函数。
+                bui_schema::hy2pool::migrate(&mut state, host.now());
                 state
             }
         };
@@ -3219,6 +3225,27 @@ mod tests {
         assert_eq!(
             snap["users"][DEFAULT_FIRST_USER]["hy2_password"],
             serde_json::json!(u.credentials.hy2_password)
+        );
+        // spec §3.1：首用户装机时就该拿到住宅 HY2 凭据。少了它 `nodes_for` 不发住宅 HY2
+        // 节点（T7），而 `hy2-residential.json` 会渲染出空池 —— 一个门都没有。
+        assert!(
+            u.credentials.hy2_resi_cred.is_some(),
+            "首用户没拿到住宅 HY2 凭据 ⇒ 他的订阅里永远没有住宅 HY2 节点"
+        );
+        let cred = bui_schema::hy2pool::cred_of(u, &state.residential)
+            .expect("指针必须指向池里真实存在的凭据");
+        assert_eq!(cred.name, u.username, "装机即迁移口径：name = 用户名");
+        assert_eq!(cred.secret, u.credentials.hy2_password);
+        assert_eq!(
+            state.residential.hy2_pool.creds.len(),
+            bui_schema::hy2pool::POOL_MIN,
+            "池要补到下限，空闲凭据就是预留的门位"
+        );
+        assert!(
+            bui_schema::nodes::nodes_for(u, &state.node, &state.residential)
+                .iter()
+                .any(|n| n.kind == bui_schema::nodes::NodeKind::Hy2Residential),
+            "首用户的节点表里要有住宅 HY2"
         );
         // 装完那一屏打出去的三条订阅地址必须真的渲染得出东西来（2026-09-12 审查 blocking：
         // 只断言 state 里有这个用户，渲染不出来照样是「面板空的、订阅无处可填」）。

@@ -14,6 +14,7 @@ pub mod api_public;
 pub mod assets;
 pub mod auth_hook;
 pub mod auth_http;
+pub mod gates;
 pub mod hy2;
 pub mod hy2resi;
 pub mod packages;
@@ -343,9 +344,15 @@ impl Module for PanelModule {
     /// 三个后台任务，顺序固定：①10 秒采样 ②用户同步反应器（事件驱动 + 60 秒）③每日包缓存。
     fn spawn(&self, ctx: DaemonCtx) -> Vec<tokio::task::JoinHandle<()>> {
         self.shared.set_paths(&ctx.paths);
+        // **先 subscribe 再 spawn**：broadcast 丢弃「发送时还没有订阅者」的事件，
+        // 若让 `gates::replay_loop` 自己 subscribe，紧随 spawn 的第一次对账重启就可能漏掉
+        // （口径同 `residential::mod` 里那条 relay 重放）。
+        let rx = ctx.bus.subscribe();
         vec![
             tokio::spawn(traffic::sampling_loop(ctx.clone(), self.shared.clone())),
             tokio::spawn(users::sync_loop(ctx.clone(), self.shared.clone())),
+            // spec §3.4：住宅入站任何重启之后立刻重放门位（不开 `cache_file` ⇒ 重启即全拒）
+            tokio::spawn(gates::replay_loop(ctx.clone(), self.shared.clone(), rx)),
             tokio::spawn(packages::cache_loop(
                 ctx,
                 self.shared.clone(),
@@ -651,7 +658,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_starts_three_tasks_and_hands_the_paths_to_shared() {
+    async fn spawn_starts_four_tasks_and_hands_the_paths_to_shared() {
         let h = testsupport::harness().await;
         let s = Shared::new(
             Box::new(super::fakes::FakeXray::new()),
@@ -690,7 +697,7 @@ mod tests {
             paths: h.paths.clone(),
         };
         let handles = m.spawn(ctx);
-        assert_eq!(handles.len(), 3, "采样 / 用户同步 / 包缓存");
+        assert_eq!(handles.len(), 4, "采样 / 用户同步 / 门位重放 / 包缓存");
         assert_eq!(m.shared().paths().base_dir, h.paths.base_dir);
         // 让第一轮跑完再收摊，确认三个任务都没有立刻 panic
         for _ in 0..200 {
