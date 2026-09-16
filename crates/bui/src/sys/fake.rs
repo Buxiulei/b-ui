@@ -9,7 +9,7 @@
 //! `journal:<units 以逗号连接>:cursor=<c>` /
 //! `journal:<units>:since=<RFC3339>`。
 
-use super::{cmd_line, unit_full, CmdOut, Host, JournalFrom, JournalRecord, Proto};
+use super::{cmd_line, unit_full, CmdOut, Host, JournalFrom, JournalRecord, Proto, StagedWrite};
 use anyhow::Result;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -59,6 +59,9 @@ pub struct FakeInner {
     /// `file_sha256` 的查询流水：纯查询不进 `ops`，「二进制身份是流式算的、没被整文件读进
     /// 内存」这类断言靠它证明（`b-ui.service` 的 `MemoryMax=200M` 是硬上限）。
     pub sha_reads: Vec<PathBuf>,
+    /// `stage_file` 开过的目标路径流水：开槽本身不改文件系统、不进 `ops`（`commit` 才记一条
+    /// 与 `write_file` 同形的 `write:`），「大文件是流式下载的、没整段读进内存」靠它证明。
+    pub staged: Vec<PathBuf>,
     /// 操作流水（顺序可断言）
     pub ops: Vec<String>,
 }
@@ -93,6 +96,7 @@ impl Default for FakeInner {
             unit_prop_reads: Vec::new(),
             stdins: Vec::new(),
             sha_reads: Vec::new(),
+            staged: Vec::new(),
             ops: Vec::new(),
         }
     }
@@ -138,6 +142,11 @@ impl FakeHost {
         self.lock().sha_reads.clone()
     }
 
+    /// 读回 [`Host::stage_file`] 开过的目标路径：断言「大文件是边下边写的」用。
+    pub fn staged(&self) -> Vec<PathBuf> {
+        self.lock().staged.clone()
+    }
+
     /// 读回写入的文件内容。
     pub fn text(&self, path: &str) -> Option<String> {
         self.lock()
@@ -171,6 +180,33 @@ impl Default for FakeHost {
     }
 }
 
+/// [`FakeHost::stage_file`] 开出来的写入槽：内容攒在自己的 `buf` 里（假机器的「临时文件」），
+/// `commit` 才写进内存文件系统并记一条与 `write_file` 同形的 `write:` 流水。没 `commit` 就
+/// `drop` ⇒ 文件系统与 `ops` 都一个字不变，正是真实实现「校验不过不动目标路径」的等价形态。
+struct FakeStaged<'a> {
+    host: &'a FakeHost,
+    dest: PathBuf,
+    mode: u32,
+    buf: Vec<u8>,
+}
+
+impl std::io::Write for FakeStaged<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl StagedWrite for FakeStaged<'_> {
+    fn commit(self: Box<Self>) -> Result<()> {
+        self.host.write_file(&self.dest, &self.buf, self.mode)
+    }
+}
+
 impl Host for FakeHost {
     fn read_file(&self, path: &Path) -> Result<Option<Vec<u8>>> {
         Ok(self.lock().files.get(path).map(|(c, _)| c.clone()))
@@ -193,6 +229,16 @@ impl Host for FakeHost {
         i.files.insert(path.to_path_buf(), (content.to_vec(), mode));
         i.ops.push(format!("write:{}:{:03o}", path.display(), mode));
         Ok(())
+    }
+
+    fn stage_file<'a>(&'a self, dest: &Path, mode: u32) -> Result<Box<dyn StagedWrite + 'a>> {
+        self.lock().staged.push(dest.to_path_buf());
+        Ok(Box::new(FakeStaged {
+            host: self,
+            dest: dest.to_path_buf(),
+            mode,
+            buf: Vec::new(),
+        }))
     }
 
     fn remove_file(&self, path: &Path) -> Result<()> {

@@ -1,7 +1,7 @@
 //! 生产实现：`std::fs` + `std::process::Command` + `/proc`。每个方法都只是薄封装，
 //! 不含任何业务判断——判断全在对账器里，这样 [`super::fake::FakeHost`] 才能等价替换。
 
-use super::{parse_proc_net, unit_full, CmdOut, Host, Proto};
+use super::{parse_proc_net, unit_full, CmdOut, Host, Proto, StagedWrite};
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeSet;
 use std::io::Write as _;
@@ -20,6 +20,49 @@ impl RealHost {
 impl Default for RealHost {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// [`RealHost::stage_file`] 开出来的写入槽：写进 `<父目录>/.<名字>.download`，`commit` 时
+/// `fsync` + `chmod` + `rename`。没 `commit` 就 `drop`（下载失败 / sha 不匹配）⇒ 临时文件删掉、
+/// 目标路径不动；`commit` 成功后 rename 已经把临时名带走，`Drop` 里那次删除是 ENOENT 空转。
+struct RealStaged {
+    file: std::fs::File,
+    tmp: PathBuf,
+    dest: PathBuf,
+    mode: u32,
+}
+
+impl std::io::Write for RealStaged {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.file.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl StagedWrite for RealStaged {
+    fn commit(mut self: Box<Self>) -> Result<()> {
+        self.file
+            .flush()
+            .with_context(|| format!("写 {} 失败", self.tmp.display()))?;
+        self.file
+            .sync_all()
+            .with_context(|| format!("落盘 {} 失败", self.tmp.display()))?;
+        std::fs::set_permissions(&self.tmp, std::fs::Permissions::from_mode(self.mode))
+            .with_context(|| format!("设 {} 权限失败", self.tmp.display()))?;
+        std::fs::rename(&self.tmp, &self.dest)
+            .with_context(|| format!("重命名到 {} 失败", self.dest.display()))?;
+        Ok(())
+    }
+}
+
+impl Drop for RealStaged {
+    fn drop(&mut self) {
+        // 只清自己的临时文件，失败无处可报（目标路径本来就没动过）
+        let _ = std::fs::remove_file(&self.tmp);
     }
 }
 
@@ -87,6 +130,30 @@ impl Host for RealHost {
         }
         std::fs::rename(&tmp, path).with_context(|| format!("重命名到 {} 失败", path.display()))?;
         Ok(())
+    }
+
+    fn stage_file<'a>(&'a self, dest: &Path, mode: u32) -> Result<Box<dyn StagedWrite + 'a>> {
+        let parent = dest
+            .parent()
+            .with_context(|| format!("{} 没有父目录", dest.display()))?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("建目录 {} 失败", parent.display()))?;
+        let name = dest
+            .file_name()
+            .with_context(|| format!("{} 没有文件名", dest.display()))?
+            .to_string_lossy()
+            .into_owned();
+        // 与 `write_file` 的 `.{name}.tmp` 刻意不同名：同一个目标路径上「流式下载」与「整段
+        // 写入」可能并存（对账写配置 / 升级换二进制），共用一个临时名会互相截断。
+        let tmp = parent.join(format!(".{name}.download"));
+        let file = std::fs::File::create(&tmp)
+            .with_context(|| format!("建临时文件 {} 失败", tmp.display()))?;
+        Ok(Box::new(RealStaged {
+            file,
+            tmp,
+            dest: dest.to_path_buf(),
+            mode,
+        }))
     }
 
     fn remove_file(&self, path: &Path) -> Result<()> {
@@ -390,6 +457,48 @@ mod tests {
         assert!(!h.is_dir(&f).unwrap());
         assert_eq!(h.read_file(&d.path().join("nope")).unwrap(), None);
         h.remove_file(&d.path().join("nope")).unwrap();
+    }
+
+    /// `stage_file` 的两条语义（下载 81 MB 的内核靠它才不用整段进内存，见 `StagedWrite`）：
+    /// 弃用（没 `commit`：下载失败 / sha 不匹配）⇒ 目标路径不出现、临时文件不留；`commit`
+    /// ⇒ 内容与 mode 一次到位。漏掉 `Drop` 里那次删除，`bin/` 里就会攒下一堆
+    /// `.sing-box.download` 残骸（每次校验失败一个，单个约 81 MB）。
+    #[test]
+    fn stage_file_commits_with_the_mode_and_drops_the_temp_file_when_abandoned() {
+        let d = tempfile::tempdir().unwrap();
+        let h = RealHost::new();
+        let bin = d.path().join("bin");
+        let dest = bin.join("sing-box");
+        h.write_file(&dest, b"OLD-SB", 0o755).unwrap();
+        {
+            let mut slot = h.stage_file(&dest, 0o755).unwrap();
+            slot.write_all(b"half-downloaded").unwrap();
+            // 不 commit：这里 drop
+        }
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"OLD-SB",
+            "没 commit 不许动目标路径"
+        );
+        assert_eq!(
+            h.list_dir(&bin).unwrap(),
+            vec![dest.clone()],
+            "临时文件必须被 Drop 删掉"
+        );
+        let mut slot = h.stage_file(&dest, 0o755).unwrap();
+        slot.write_all(b"ELF-").unwrap();
+        slot.write_all(b"NEW").unwrap();
+        slot.commit().unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"ELF-NEW");
+        assert_eq!(
+            std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            h.list_dir(&bin).unwrap(),
+            vec![dest],
+            "commit 后也不留临时文件"
+        );
     }
 
     /// 流式 sha 的正确性：分块循环一旦写错（喂 `&buf` 而不是 `&buf[..n]`、少读最后一块），

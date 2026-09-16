@@ -1325,8 +1325,8 @@ mod tests {
     /// 表里没有的地址回 [`crate::kernels::NotFound`]，与 `HttpFetcher` 的 404 同形：
     /// 「latest 404 ⇒ 回退预发布」认的就是这个错误类型。
     struct FakeFetcher(Mutex<Vec<(String, Vec<u8>)>>);
-    impl Fetcher for FakeFetcher {
-        fn get_bytes(&self, url: &str) -> anyhow::Result<Vec<u8>> {
+    impl FakeFetcher {
+        fn take(&self, url: &str) -> anyhow::Result<Vec<u8>> {
             self.0
                 .lock()
                 .unwrap()
@@ -1334,6 +1334,19 @@ mod tests {
                 .find(|(u, _)| u == url)
                 .map(|(_, b)| b.clone())
                 .ok_or_else(|| crate::kernels::NotFound(url.to_string()).into())
+        }
+    }
+    impl Fetcher for FakeFetcher {
+        fn get_bytes(&self, url: &str) -> anyhow::Result<Vec<u8>> {
+            self.take(url)
+        }
+
+        /// 内核二进制走的是这一条（`KernelInstaller::install` 边下边写）。
+        fn download_to(&self, url: &str, sink: &mut dyn std::io::Write) -> anyhow::Result<String> {
+            let bytes = self.take(url)?;
+            sink.write_all(&bytes)?;
+            sink.flush()?;
+            Ok(crate::kernels::sha256_hex(&bytes))
         }
     }
 

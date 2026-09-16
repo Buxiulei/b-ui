@@ -648,6 +648,12 @@ mod tests {
             self.0.lock().unwrap().push(url.to_string());
             anyhow::bail!("fake fetcher 不出网")
         }
+
+        /// 包缓存走的是这一条（流式）：同样只记 URL、一律失败。
+        fn download_to(&self, url: &str, _sink: &mut dyn std::io::Write) -> anyhow::Result<String> {
+            self.0.lock().unwrap().push(url.to_string());
+            anyhow::bail!("fake fetcher 不出网")
+        }
     }
 
     #[tokio::test]

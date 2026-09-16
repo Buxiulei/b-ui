@@ -52,6 +52,23 @@ pub enum Proto {
     Udp,
 }
 
+/// 一次「先写临时文件、校验过再原子提升为目标路径」的写入（由 [`Host::stage_file`] 开出来，
+/// 内容用 [`std::io::Write`] 边算边喂）。
+///
+/// **为什么存在**：下载一个内核二进制是**单笔约 81 MB**（sing-box，自建带 `with_v2ray_api`
+/// 的更大），四个内核合计约 190 MB，而 `b-ui.service` 的 `MemoryMax=200M` 是**硬上限**
+/// （`modules/units.rs`）—— 把整个响应体读成 `Vec<u8>` 再 `write_file` 就是「常驻一份 +
+/// 写盘一份」，安装/升级期间 systemd 会把守护进程杀在下载半路。所以下载路径一律
+/// [`crate::kernels::Fetcher::download_to`] + 本 trait：峰值只有 64 KiB 缓冲。
+/// **别改回一次性读入。**
+///
+/// 语义：没 [`StagedWrite::commit`] 就 `drop`（下载失败、sha 不匹配、提前 `return`）⇒ 临时
+/// 文件删掉、**目标路径一个字节都不动**；`commit` 才按开时给的 mode 落到目标路径。
+pub trait StagedWrite: std::io::Write {
+    /// 校验通过：按 [`Host::stage_file`] 给的 mode 把临时文件原子提升为目标路径。
+    fn commit(self: Box<Self>) -> Result<()>;
+}
+
 /// 所有碰真实系统的操作都走这里；同步接口，对账在 `spawn_blocking` 里跑。
 pub trait Host: Send + Sync {
     fn read_file(&self, path: &Path) -> Result<Option<Vec<u8>>>;
@@ -63,6 +80,11 @@ pub trait Host: Send + Sync {
     /// 600 秒一轮 —— 用 `read_file` 算 sha 就是每 10 分钟复现一次的 OOM/重启循环面。
     fn file_sha256(&self, path: &Path) -> Result<Option<String>>;
     fn write_file(&self, path: &Path, content: &[u8], mode: u32) -> Result<()>;
+    /// 开一个写入槽：内容边到边写临时文件，[`StagedWrite::commit`] 才按 `mode` 原子提升成
+    /// `dest`。**大文件（内核 / 客户端二进制，单笔约 81 MB）只许走这一条**，理由与语义见
+    /// [`StagedWrite`]。返回值借着 `&self`（[`fake::FakeHost`] 的槽要写回它那份内存文件系统），
+    /// 所以调用方把它放在局部变量里用完即弃。
+    fn stage_file<'a>(&'a self, dest: &Path, mode: u32) -> Result<Box<dyn StagedWrite + 'a>>;
     fn remove_file(&self, path: &Path) -> Result<()>;
     /// **只返回直接子项**（文件与目录都返回，绝对路径，按路径名升序）；目录不存在 → `Ok(vec![])`，不是错误。
     fn list_dir(&self, path: &Path) -> Result<Vec<PathBuf>>;
