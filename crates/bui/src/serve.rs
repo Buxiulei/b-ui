@@ -177,6 +177,12 @@ pub async fn reconcile_from_ctx(
     force: bool,
     dry_run: bool,
 ) -> anyhow::Result<ReconcileReport> {
+    // spec §3.1 第三道防线：这一轮本来就要重写 `hy2-residential.json`（§3.5 四件事之一）
+    // ⇒ 落盘前先把空闲凭据的 secret 重随机。放在读期望态之前：它自己也改期望态。
+    // `--dry-run` 一个字节都不许写。
+    if !dry_run {
+        crate::modules::residential::slots::reroll_idle_hy2_secrets(ctx).await;
+    }
     let state = ctx.store.read().await;
     let keys = ctx.runtime.read().await.restart_keys;
     let host = ctx.host.clone();
@@ -217,10 +223,20 @@ pub async fn reconcile_from_ctx(
     }
     // spec §3.4：住宅入站重启后每个门回到 default = deny（不开 `cache_file`），
     // 订阅者立刻重放真实门位；不重放的话全体住宅 HY2 用户一直被拒到 60 秒安全网那一轮。
-    if report.restarted.iter().any(|u| u == "hysteria-residential") {
+    if hy2_resi_restarted(&report) {
         ctx.bus.send(Event::Hy2ResiRestarted);
     }
     Ok(report)
+}
+
+/// 这一轮对账重启过住宅 HY2 入站吗（判据只有这一处）。
+///
+/// 启动那一轮的结论不能只靠 [`Event::Hy2ResiRestarted`]：`EventBus` 是裸
+/// `broadcast::Sender`，`send` 在「还没有订阅者」时静默丢弃，而 `gates::replay_loop`
+/// 要到 `Module::spawn` 才订阅 —— 启动对账早于它。所以 [`run`] 拿这个判据在启动路径上
+/// 自己补一次重放（见那里的注释）。
+pub fn hy2_resi_restarted(report: &ReconcileReport) -> bool {
+    report.restarted.iter().any(|u| u == "hysteria-residential")
 }
 
 /// 报告与 `restart_keys` 已落盘之后才重启守护进程自己：`in_daemon = true` 用
@@ -503,6 +519,7 @@ pub async fn run(paths: Paths, host: Arc<dyn Host>) -> anyhow::Result<()> {
         tracing::warn!(error = %e, "补随机订阅 token 失败，下次启动重试");
     }
     // 启动时先对账一次，再拉起后台任务
+    let mut startup_restarted_hy2_resi = false;
     match reconcile_from_ctx(&ctx, &mods, fetcher.clone(), false, false).await {
         Ok(r) => {
             tracing::info!(
@@ -510,6 +527,7 @@ pub async fn run(paths: Paths, host: Arc<dyn Host>) -> anyhow::Result<()> {
                 restarted = r.restarted.len(),
                 "启动对账完成"
             );
+            startup_restarted_hy2_resi = hy2_resi_restarted(&r);
             // 报告已落盘，这时才允许重启自己（B5）
             finish_self_restart(&ctx, &r, true).await;
         }
@@ -522,6 +540,20 @@ pub async fn run(paths: Paths, host: Arc<dyn Host>) -> anyhow::Result<()> {
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     for m in &mods {
         tasks.extend(m.spawn(ctx.clone()));
+    }
+    // spec §3.4：启动那一轮对账重启了住宅入站 ⇒ 启动路径**自己**补一次门位重放。
+    // 上面那一轮发的 `Event::Hy2ResiRestarted` 必然被丢弃：那一刻总线上一个订阅者都没有
+    // （`EventBus` 是裸 `broadcast::Sender`，`send` 吞 Err），`gates::replay_loop` 要到上面
+    // 那行 `m.spawn(..)` 才订阅。少了这一次重放，「重启后按 `ready()` 探测 + 15 秒退避重放」
+    // 这条路在**最常发生的场景**（升级 / 首装 / 任何改了住宅配置的重启）根本不走，兜底只剩
+    // `sync_loop` 起来时那一次 `sync_now` —— 它没有 `ready()` 探测，sing-box 刚重启时
+    // `GET /proxies` 大概率还连不上 ⇒ 全体住宅 HY2 用户停在 `deny`（握手成功、每个请求被拒）。
+    // 不走总线而直接调：这样它不依赖「补发必须晚于 spawn」这个顺序，挪到哪里都成立。
+    if startup_restarted_hy2_resi {
+        let (c, sh) = (ctx.clone(), panel.clone());
+        tasks.push(tokio::spawn(async move {
+            crate::modules::panel::gates::replay_after_restart(&c, &sh).await;
+        }));
     }
     // Hysteria2 的 http 鉴权（spec §3.2）：**独立**监听 127.0.0.1:AUTH_HTTP_PORT，
     // 绝不挂在下面那个面板监听上 —— 面板经 Caddy 对外，挂上去等于把鉴权面暴露到公网。
@@ -1718,6 +1750,158 @@ mod tests {
         assert!(
             seen.contains(&Event::Hy2ResiRestarted),
             "住宅入站重启没有广播出去：{seen:?}"
+        );
+    }
+
+    /// 守门（第七波复核 important）：启动那一轮对账广播的 `Event::Hy2ResiRestarted`
+    /// **必然被丢弃** —— `EventBus` 是裸 `broadcast::Sender`（`send` 吞 Err），而唯一的
+    /// 订阅者 `gates::replay_loop` 要到 `Module::spawn` 才起、`spawn` 又晚于启动对账。
+    /// 所以 [`run`] 不能只靠广播：它拿 [`hy2_resi_restarted`] 的判据在 spawn 之后自己调一次
+    /// `gates::replay_after_restart`。少了那一次，升级 / 首装 / 任何改了住宅配置的重启之后
+    /// 全体住宅 HY2 用户都停在 `deny`，只能等 `sync_loop` 那一次没有 `ready()` 探测的
+    /// `sync_now` 去碰运气。
+    #[tokio::test]
+    async fn the_startup_reconciles_restart_event_is_dropped_before_anyone_subscribes() {
+        let host = ready_host();
+        let d = tempfile::tempdir().unwrap();
+        let ctx = ctx_for(host.clone(), &d).await;
+        let reg = modules(None);
+        let fetcher: Arc<dyn Fetcher> = Arc::new(FakeFetcher(Mutex::new(vec![])));
+        // 生产顺序：启动对账在前，后台任务（唯一的订阅者）在后
+        let report = reconcile_from_ctx(&ctx, &reg.modules, fetcher, false, false)
+            .await
+            .unwrap();
+        let mut rx = ctx.bus.subscribe();
+        assert!(
+            hy2_resi_restarted(&report),
+            "前提：首轮对账会重启住宅入站：{:?}",
+            report.restarted
+        );
+        let mut only_direct = report.clone();
+        only_direct.restarted = vec!["hysteria-server".into(), "xray".into()];
+        assert!(
+            !hy2_resi_restarted(&only_direct),
+            "判据只认住宅入站：别的内核重启不该触发门位重放"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "spawn 之前广播的那一条一定收不到 ⇒ 启动路径必须自己补一次门位重放"
+        );
+    }
+
+    /// 守门（第七波复核 important）：`reconcile_from_ctx` 必须在落盘前把**空闲**凭据的
+    /// secret 重随机（spec §3.1 第三道防线，`hy2pool::regenerate_idle_secrets`）。
+    /// 接不上的话被 `release` 掉的凭据 secret 终生不变：24 小时冷却期一过，同 id 同 secret
+    /// 原样发给下一个人，前任持有人手里的旧订阅直接连上新人的门。
+    ///
+    /// 三面一起钉：①文件不变的那一轮一个字节都不许动（否则每轮对账都重写 + 重启住宅内核）；
+    /// ②`--dry-run` 不许改期望态；③池扩容那一轮空闲全换、**在用的一条不动**。
+    #[tokio::test]
+    async fn a_reconcile_that_rewrites_the_residential_config_rerolls_idle_secrets() {
+        let host = ready_host();
+        let d = tempfile::tempdir().unwrap();
+        let ctx = ctx_for(host.clone(), &d).await;
+        let reg = modules(None);
+        let f: Arc<dyn Fetcher> = Arc::new(FakeFetcher(Mutex::new(vec![])));
+        let run = |dry: bool| {
+            let (c, mods, f) = (ctx.clone(), reg.modules.clone(), f.clone());
+            async move {
+                reconcile_from_ctx(&c, &mods, f, false, dry).await.unwrap();
+            }
+        };
+        crate::modules::residential::slots::migrate_hy2_pool_on_start(&ctx)
+            .await
+            .unwrap();
+        run(false).await; // 池落盘：此后文件与期望态一致
+        let snapshot = || {
+            let c = ctx.clone();
+            async move {
+                let s = c.store.read().await;
+                s.residential
+                    .hy2_pool
+                    .creds
+                    .iter()
+                    .map(|c| (c.id.clone(), c.secret.clone()))
+                    .collect::<Vec<_>>()
+            }
+        };
+        let used = ctx.store.read().await.users[0]
+            .credentials
+            .hy2_resi_cred
+            .clone()
+            .expect("前提：存量住宅用户占着一条");
+        let stable = snapshot().await;
+        run(false).await;
+        assert_eq!(
+            snapshot().await,
+            stable,
+            "文件不变的那一轮不许换 secret —— 换了就是每轮对账都重启一次住宅内核"
+        );
+
+        // 池扩容（spec §3.5 四件事之一）⇒ 这一轮本来就要重写 `hy2-residential.json`
+        ctx.store
+            .update(|s| {
+                s.residential
+                    .hy2_pool
+                    .creds
+                    .push(bui_schema::model::ReservedCred {
+                        id: "r099".into(),
+                        name: "r099".into(),
+                        secret: "x".repeat(22),
+                        released_at: None,
+                    });
+            })
+            .await
+            .unwrap();
+        let grown = snapshot().await;
+        run(true).await;
+        assert_eq!(snapshot().await, grown, "`--dry-run` 一个字节都不许写");
+        run(false).await;
+        let after = snapshot().await;
+        for (id, secret) in &grown {
+            let now = &after.iter().find(|(i, _)| i == id).expect("凭据不会消失").1;
+            if *id == used {
+                assert_eq!(now, secret, "在用的凭据 secret 一个字节都不许动");
+            } else {
+                assert_ne!(now, secret, "空闲凭据 {id} 的 secret 没换");
+            }
+        }
+    }
+
+    /// 守门（第七波复核 minor）：`slots::migrate_hy2_pool_on_start` **必须早于启动那一轮
+    /// 对账**。顺序破了的后果是 4.0.x 升上来的机器第一轮拿空池渲染 `hy2-residential.json`
+    /// （`users: []`，一条 `auth_user` 规则、一个门都没有）并重启内核，全体住宅 HY2 用户掉线，
+    /// 直到池迁移触发第二轮对账才恢复。这一条钉住「两个顺序渲染出来的东西真的不一样」。
+    #[tokio::test]
+    async fn the_credential_pool_must_be_migrated_before_the_first_reconcile() {
+        let host = ready_host();
+        let d = tempfile::tempdir().unwrap();
+        let ctx = ctx_for(host.clone(), &d).await;
+        let reg = modules(None);
+        let fetcher: Arc<dyn Fetcher> = Arc::new(FakeFetcher(Mutex::new(vec![])));
+        let auth_users = || -> usize {
+            let path = crate::modules::core_files::hy2_resi_config_path(&ctx.paths);
+            let text = host
+                .text(path.to_str().unwrap())
+                .expect("对账必须落下住宅 HY2 配置");
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            v["inbounds"][0]["users"].as_array().map_or(0, Vec::len)
+        };
+        // 反面（顺序破了）：池还没迁移就对账
+        reconcile_from_ctx(&ctx, &reg.modules, fetcher.clone(), false, false)
+            .await
+            .unwrap();
+        assert_eq!(auth_users(), 0, "空池 ⇒ 谁都通不过住宅入站的鉴权");
+        // 生产顺序：先迁移池，再对账
+        crate::modules::residential::slots::migrate_hy2_pool_on_start(&ctx)
+            .await
+            .unwrap();
+        reconcile_from_ctx(&ctx, &reg.modules, fetcher, false, false)
+            .await
+            .unwrap();
+        assert!(
+            auth_users() > 0,
+            "迁移之后这一轮必须把存量住宅用户的凭据写进配置"
         );
     }
 

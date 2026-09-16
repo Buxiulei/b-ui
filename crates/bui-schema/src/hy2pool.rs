@@ -70,8 +70,10 @@ pub fn assign(s: &mut State, user_id: Uuid) -> Option<String> {
     assign_at(s, user_id, OffsetDateTime::now_utc())
 }
 
-/// [`assign`] 的可注入时钟版本（冷却期判定要可测）。
-fn assign_at(s: &mut State, user_id: Uuid, now: OffsetDateTime) -> Option<String> {
+/// [`assign`] 的可注入时钟版本。**生产一律走这个**：24 小时冷却期是安全判据，
+/// 判定时钟必须与 [`release`] 盖 `released_at` 的那个时钟同源（`bui` 侧的 `Host::now()`），
+/// 否则一个偏移 / 冻结的时钟就能把冷却期静默作废，而且测不到。
+pub fn assign_at(s: &mut State, user_id: Uuid, now: OffsetDateTime) -> Option<String> {
     let idx = s.users.iter().position(|u| u.user_id == user_id)?;
     if let Some(held) = s.users[idx].credentials.hy2_resi_cred.clone() {
         return Some(held); // 幂等：不许静默孤立仍然有效的凭据

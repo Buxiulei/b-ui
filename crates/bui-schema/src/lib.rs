@@ -48,9 +48,12 @@
 //!   `clamp(ceil16(2 × 住宅 hysteria2 用户数), 32, 256)`；基数由
 //!   [`hy2pool::resi_hy2_users`] 数出。
 //! - [`hy2pool::grow`]：补到目标条数（`id` = 最小空闲 `r%03d`，`name = id`）。
-//! - [`hy2pool::assign`] / [`hy2pool::release`] / [`hy2pool::cred_of`]：分配（先「从未用过」、
-//!   再「`released_at` 最早且 ≥ 24 小时」；**幂等**，已持凭据的用户原样拿回那一条，换凭据
-//!   必须显式 `release` + `assign`）、释放（记 `released_at`）与按用户取凭据。
+//! - [`hy2pool::assign_at`] / [`hy2pool::assign`] / [`hy2pool::release`] /
+//!   [`hy2pool::cred_of`]：分配（先「从未用过」、再「`released_at` 最早且 ≥ 24 小时」；
+//!   **幂等**，已持凭据的用户原样拿回那一条，换凭据必须显式 `release` + `assign`）、
+//!   释放（记 `released_at`）与按用户取凭据。**生产一律走 `assign_at`**：24 小时冷却期是
+//!   安全判据，判定时钟必须与盖 `released_at` 的那个同源（`bui` 侧的 `Host::now()`）；
+//!   `assign` 是墙钟便利版，只给 bui-schema 自己的用例用。
 //! - [`hy2pool::regenerate_idle_secrets`]：重写配置时顺带重随机全部空闲凭据的 `secret`。
 //! - [`hy2pool::free_count`] / [`hy2pool::LOW_FREE_RATIO`]：空闲率与 20% 告警门槛。
 //! - [`hy2pool::migrate`]：v4 → 4.1 一次性分配（迁移用户 `name = 用户名`、

@@ -28,7 +28,7 @@ use crate::modules::residential::health::REPLAY_RETRY_BUDGET;
 use crate::modules::residential::state as resi_state;
 use crate::modules::sentinel::incidents::{self, Incident, Level};
 use crate::reconcile::DaemonCtx;
-use bui_schema::model::{Protocol, State, User};
+use bui_schema::model::{Protocol, Residential, State, User};
 use bui_schema::render::hy2_singbox::{gate_tag, slot_out_tag, DENY_TAG};
 use bui_schema::slots::index_of_user;
 use std::collections::{BTreeMap, BTreeSet};
@@ -57,13 +57,22 @@ pub struct GateOutcome {
     pub errors: Vec<String>,
 }
 
-/// 「有住宅权益且开 hysteria2」—— 门只对这些人开。
+/// 「有住宅权益、权益指向的分组真实存在、且开了 hysteria2」—— 门只对这些人开。
 ///
-/// 与 `hy2pool` 里那条池容量判据同义：一份口径给门位收敛、面板投影与踢人三处用
-/// （[`super::traffic::resi_kick_targets`] 也读它），分头写两遍就会漂移成
+/// 一份口径给门位收敛、建号 / 轮换分凭据（[`slots::assign_hy2_cred`](crate::modules::residential::slots::assign_hy2_cred)）、
+/// 面板投影与踢人（[`super::traffic::resi_kick_targets`]）用，分头写两遍就会漂移成
 /// 「门开着但没凭据」或「有凭据但门不开」。
-pub(super) fn has_resi_hy2(u: &User) -> bool {
-    u.entitlements.residential.is_some() && u.entitlements.protocols.contains(&Protocol::Hysteria2)
+///
+/// **分组存在性不能省**：`nodes_for` 的 `resi_ok` 也要求
+/// `resi.groups.contains_key(&r.group_id)`（`bui-schema/src/nodes.rs`），`group_id` 悬空时
+/// （人工改 `state.json`、分组被删）订阅里已经不发住宅 HY2 节点了。门是授权落点，
+/// 取两者里更严的那个 —— 少了这一条，拿着旧订阅的人会继续从住宅 IP 出海。
+pub(crate) fn has_resi_hy2(u: &User, r: &Residential) -> bool {
+    u.entitlements
+        .residential
+        .as_ref()
+        .is_some_and(|e| r.groups.contains_key(&e.group_id))
+        && u.entitlements.protocols.contains(&Protocol::Hysteria2)
 }
 
 /// 期望门位：凭据 `id` → 出站 tag（spec §3.3）。
@@ -93,7 +102,9 @@ pub fn expected(s: &State, blocked: &BTreeSet<Uuid>) -> BTreeMap<String, String>
         .map(|c| {
             let tag = holder
                 .get(c.id.as_str())
-                .filter(|u| !u.disabled && !blocked.contains(&u.user_id) && has_resi_hy2(u))
+                .filter(|u| {
+                    !u.disabled && !blocked.contains(&u.user_id) && has_resi_hy2(u, &s.residential)
+                })
                 .map(|u| slot_out_tag(index_of_user(u, &s.residential)))
                 .unwrap_or_else(|| DENY_TAG.to_string());
             (c.id.clone(), tag)
@@ -106,10 +117,11 @@ pub fn expected(s: &State, blocked: &BTreeSet<Uuid>) -> BTreeMap<String, String>
 /// 遍历的是**内核报回来的**门位表（见模块文档末段）；期望态里没有的门一律按 `deny`
 /// 收 —— 凭据被人工从池里删掉时，它的门不许留在某个槽上。
 pub async fn converge(ctx: &DaemonCtx, shared: &Shared, blocked: &BTreeSet<Uuid>) -> GateOutcome {
-    let want = {
-        let s = ctx.store.read().await;
-        expected(&s, blocked)
-    };
+    // **先读内核、后算期望**：两次读之间可能落进一次 rotate / kick（它们写盘之后自己
+    // 当场 PUT 两下）。这个顺序下陈旧的那半只会是 `live`，配上更新的 `want` 得出的是
+    // 「按新期望再收一次」= fail-closed；反过来（先算 want）会拿旧持有人的期望覆盖掉
+    // rotate 刚切成 `deny` 的那扇门，泄露的旧凭据多活一轮（≤60 秒）——
+    // 而 rotate 当场两次 PUT 的全部理由就是「不许多活一分钟」。
     let live = match shared.hy2resi().selected_all().await {
         Ok(m) => m,
         Err(e) => {
@@ -118,6 +130,10 @@ pub async fn converge(ctx: &DaemonCtx, shared: &Shared, blocked: &BTreeSet<Uuid>
                 errors: vec![format!("住宅 HY2 门位读不到（GET /proxies）：{e}")],
             }
         }
+    };
+    let want = {
+        let s = ctx.store.read().await;
+        expected(&s, blocked)
     };
     let mut out = GateOutcome::default();
     for (gate, now) in &live {
@@ -391,6 +407,78 @@ mod tests {
         s.users[0].entitlements.protocols = vec![Protocol::Hysteria2];
         s.users[0].disabled = true;
         assert_eq!(expected(&s, &Default::default())[&alice], "deny");
+    }
+
+    /// `group_id` 悬空（人工改 `state.json`、分组被删）⇒ 门必须 `deny`。
+    /// `nodes_for` 的 `resi_ok` 多一条 `resi.groups.contains_key(&r.group_id)`，这时订阅里
+    /// 已经不发住宅 HY2 节点了；门是授权落点，少了这条判据就会留在某一槽上，
+    /// 拿着旧订阅的人继续从住宅 IP 出海。
+    #[test]
+    fn a_dangling_group_id_closes_the_gate() {
+        let mut s = three_slot_state_with_pool();
+        let alice = cred_id_of(&s, "alice");
+        assert_eq!(
+            expected(&s, &Default::default())[&alice],
+            "slot-1-out",
+            "前提：分组存在时门开在他自己那一槽"
+        );
+        s.users[0]
+            .entitlements
+            .residential
+            .as_mut()
+            .unwrap()
+            .group_id = "gone".into();
+        assert_eq!(
+            expected(&s, &Default::default())[&alice],
+            "deny",
+            "分组不存在 ⇒ 门必须关"
+        );
+        assert!(
+            !bui_schema::nodes::nodes_for(&s.users[0], &s.node, &s.residential)
+                .iter()
+                .any(|n| n.kind == bui_schema::nodes::NodeKind::Hy2Residential),
+            "口径必须与 nodes_for 的 resi_ok 一致（取两者里更严的那个）"
+        );
+    }
+
+    /// 启动那一轮对账广播的 `Event::Hy2ResiRestarted` **必然被丢弃**：`EventBus` 是裸
+    /// `broadcast::Sender`（`send` 吞 Err），而 `gates::replay_loop` 要到 `Module::spawn`
+    /// 才订阅、`spawn` 又晚于启动对账。所以 `serve::run` 在启动路径上自己调一次
+    /// [`replay_after_restart`]（判据是 `serve::hy2_resi_restarted`）—— 少了它，升级 / 首装 /
+    /// 任何改了住宅配置的重启之后，全体住宅 HY2 用户都停在 `deny`（握手成功、每个请求被拒），
+    /// 只能等 `sync_loop` 起来时那一次没有 `ready()` 探测的 `sync_now` 去碰运气。
+    #[tokio::test]
+    async fn the_restart_event_is_lost_before_anyone_subscribes_so_startup_replays_directly() {
+        let h = harness_with_pool().await;
+        h.hy2resi.set_selected(BTreeMap::from([(
+            "gate-r000".to_string(),
+            "deny".to_string(),
+        )]));
+        let ctx = ctx_of(&h);
+        // ① 启动对账重启住宅入站后广播 —— 此刻总线上一个订阅者都没有
+        ctx.bus.send(crate::api::Event::Hy2ResiRestarted);
+        // ② 后台任务这时才起来（口径同 `PanelModule::spawn`：先 subscribe 再 spawn）
+        let rx = ctx.bus.subscribe();
+        let task = tokio::spawn(replay_loop(ctx.clone(), h.shared.clone(), rx));
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            !h.hy2resi.calls().iter().any(|c| c.starts_with("select:")),
+            "前提：spawn 之前发出的那一条已经丢了，没有任何重放：{:?}",
+            h.hy2resi.calls()
+        );
+        // ③ 所以启动路径必须自己补一次
+        let out = replay_after_restart(&ctx, &h.shared).await;
+        task.abort();
+        assert_eq!(out.switched, 1);
+        assert!(
+            h.hy2resi
+                .calls()
+                .contains(&"select:gate-r000:slot-1-out".to_string()),
+            "{:?}",
+            h.hy2resi.calls()
+        );
     }
 
     /// 收敛只对差集下手：读一次 /proxies，然后只 PUT 不一致的那几个
