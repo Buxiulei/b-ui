@@ -1,12 +1,15 @@
 //! 把 [`Plan`] 落到机器上。[`apply`] 是**唯一真正改机器**的函数，步骤顺序写死（见下），
 //! 测试按 [`crate::sys::fake::FakeHost`] 的 `ops` 流水逐条断言。
 //!
-//! 三条不变量：
+//! 四条不变量：
 //! 1. **校验再写盘**：`verify` 为 `Some` 时先把候选内容写进 `.verify/` 跑内核校验，失败不写目标文件（spec §2.2）。
-//! 2. **重启失败回滚**：重启失败就把该单元相关文件恢复成上一版内容再启一次，仍失败才记 `errors`。
+//! 2. **配置没落地就搁置该单元**：带 `restart` 的 `WriteFile` 校验失败或写失败 ⇒ 该单元本轮的
+//!    单元文件与重启一并搁置（held，第 1 / 3 / 12 步），绝不让「单元已换、配置未落」同时发生
+//!    （2026-09-16 裁决 P-C）。
+//! 3. **重启失败回滚**：重启失败就把该单元相关文件恢复成上一版内容再启一次，仍失败才记 `errors`。
 //!    「起来了没有」一律以 `is-active` 为准而不是 `systemctl restart` 的退出码，且每次 restart
 //!    之前先 `reset-failed` 清 start-limit（见 [`activate`]）。
-//! 3. **绝不同步重启 `b-ui` 自己**：apply 跑在守护进程自己的进程里，只置
+//! 4. **绝不同步重启 `b-ui` 自己**：apply 跑在守护进程自己的进程里，只置
 //!    [`ApplyOutcome::self_restart_required`]，由调用方在报告落盘之后处理（第 12 步）。
 
 use super::diff::{Change, Plan};
@@ -94,6 +97,8 @@ pub fn apply(input: ApplyInput<'_>, host: &dyn Host) -> ApplyOutcome {
     // 单元名 → 本轮为它写过的文件（重启失败时按这份回滚）
     let mut restores: BTreeMap<String, Vec<Restore>> = BTreeMap::new();
     let mut need_daemon_reload = false;
+    // 「配置这轮没落地」的单元 → 原因。第 1 步记，第 3 步与第 12 步据此搁置单元文件与重启。
+    let mut held: BTreeMap<String, &'static str> = BTreeMap::new();
 
     // ---- 第 1 步：写文件（校验 → 去 immutable → 写 → 记 key / 重启 / 回滚点）
     for c in &changes {
@@ -114,16 +119,19 @@ pub fn apply(input: ApplyInput<'_>, host: &dyn Host) -> ApplyOutcome {
             // 先写目标文件再 `sshd -t`，失败就恢复原样。
             Some(Verify::Sshd) => {
                 if !clear_immutable(host, path, &mut out) {
+                    hold(&mut held, unit, "写入失败");
                     continue;
                 }
                 if let Err(e) = host.write_file(path, content, *mode) {
                     out.errors.push(format!("{} 写入失败：{e}", path.display()));
+                    hold(&mut held, unit, "写入失败");
                     continue;
                 }
                 if let Err(detail) = sshd_test(host) {
                     restore_one(host, path, old.as_deref(), *mode);
                     out.verify_failures
                         .push(format!("{} 校验失败：{detail}", path.display()));
+                    hold(&mut held, unit, "未通过校验");
                     continue;
                 }
                 already_written = true;
@@ -133,6 +141,7 @@ pub fn apply(input: ApplyInput<'_>, host: &dyn Host) -> ApplyOutcome {
                 Ok(Some(note)) => out.notes.push(note),
                 Err(msg) => {
                     out.verify_failures.push(msg);
+                    hold(&mut held, unit, "未通过校验");
                     continue;
                 }
             },
@@ -140,10 +149,12 @@ pub fn apply(input: ApplyInput<'_>, host: &dyn Host) -> ApplyOutcome {
         }
         if !already_written {
             if !clear_immutable(host, path, &mut out) {
+                hold(&mut held, unit, "写入失败");
                 continue;
             }
             if let Err(e) = host.write_file(path, content, *mode) {
                 out.errors.push(format!("{} 写入失败：{e}", path.display()));
+                hold(&mut held, unit, "写入失败");
                 continue;
             }
         }
@@ -201,6 +212,15 @@ pub fn apply(input: ApplyInput<'_>, host: &dyn Host) -> ApplyOutcome {
         else {
             continue;
         };
+        // 该单元的配置本轮没落地 ⇒ 单元文件也不换：换了就是「ExecStart 指向一份不存在/旧版的
+        // 配置」，内核起不来、旧配置又已被别的 Change 删掉时就是永久崩溃循环。
+        if let Some(reason) = held.get(unit.name.as_str()) {
+            out.notes.push(format!(
+                "{} 的配置{reason}，单元文件本轮一并搁置",
+                unit.name
+            ));
+            continue;
+        }
         let old = host.read_file(path).unwrap_or_default();
         if let Err(e) = host.write_file(path, content.as_bytes(), UNIT_MODE) {
             out.errors.push(format!("{} 写入失败：{e}", path.display()));
@@ -494,6 +514,12 @@ pub fn apply(input: ApplyInput<'_>, host: &dyn Host) -> ApplyOutcome {
     // ---- 第 12 步：重启/重载。`b-ui` 不在这个循环里（排序后它排第一，restart 自己会把后面的
     // 重启、报告与 restart_keys 全丢掉），只置 `self_restart_required` 交给调用方。
     for unit in restart {
+        // 配置没落地就别重启：内核照旧跑着盘上那份仍然合法的旧配置，等下一轮校验过了再换。
+        if let Some(reason) = held.get(unit.name.as_str()) {
+            out.notes
+                .push(format!("{} 的配置{reason}，重启本轮一并搁置", unit.name));
+            continue;
+        }
         if unit.name == SELF_UNIT {
             out.self_restart_required = true;
             continue;
@@ -641,6 +667,14 @@ fn describe(c: &Change) -> String {
                 .join(", ")
         ),
         Change::ApplyNftTable { family, name, .. } => format!("nft table {family} {name}"),
+    }
+}
+
+/// 记一笔「这个单元的配置本轮没落地」（第 1 步的每条失败出口都要调）。没有 `restart` 的文件
+/// 不影响任何单元，不记。
+fn hold(held: &mut BTreeMap<String, &'static str>, unit: &Option<Unit>, reason: &'static str) {
+    if let Some(u) = unit {
+        held.insert(u.name.clone(), reason);
     }
 }
 
@@ -1275,6 +1309,175 @@ mod tests {
             .ops()
             .iter()
             .any(|o| o.starts_with("write:/opt/b-ui/.verify/xray-config.json")));
+    }
+
+    /// 2026-09-16 裁决 P-C：配置校验失败时，**同一单元**的单元文件与重启一并搁置。
+    ///
+    /// 没有这道门控时一次对账会同时做成「单元 ExecStart 已指向新配置」+「新配置因校验
+    /// FATAL 从未落盘」，而同轮别的 Change 已把旧配置删掉 ⇒ 内核每次启动都找不到配置文件、
+    /// `Restart=always` 变成永久崩溃循环，没有自愈点（4.1 住宅 HY2 换 sing-box 就是这个形状）。
+    #[test]
+    fn a_failed_config_verification_holds_the_unit_file_and_the_restart() {
+        let h = FakeHost::new();
+        h.with(|i| {
+            i.files
+                .insert("/opt/b-ui/bin/sing-box".into(), (b"ELF".to_vec(), 0o755));
+            i.scripted.push((
+                "/opt/b-ui/bin/sing-box check".into(),
+                CmdOut::failure(1, "FATAL v2ray api is not included in this build"),
+            ));
+        });
+        let unit_path = "/etc/systemd/system/hysteria-residential.service";
+        let plan = Plan {
+            changes: vec![
+                Change::WriteFile {
+                    path: "/opt/b-ui/hy2-residential.json".into(),
+                    content: b"{}".to_vec(),
+                    mode: 0o600,
+                    verify: Some(Verify::SingBox),
+                    restart: Some(Unit::restart("hysteria-residential")),
+                },
+                Change::WriteUnit {
+                    path: unit_path.into(),
+                    content: "[Service]\nExecStart=/opt/b-ui/bin/sing-box run\n".into(),
+                    unit: Unit::restart("hysteria-residential"),
+                },
+            ],
+            keys: Default::default(),
+            unchanged: 0,
+        };
+        let out = run(plan, &h, &NoopInstaller);
+        assert!(
+            h.text("/opt/b-ui/hy2-residential.json").is_none(),
+            "校验失败不写盘"
+        );
+        assert!(h.text(unit_path).is_none(), "配置没落地，单元文件一并搁置");
+        assert_eq!(out.verify_failures.len(), 1, "{:?}", out.verify_failures);
+        assert_eq!(out.restarted, Vec::<String>::new());
+        assert_eq!(out.changed, Vec::<String>::new());
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        // 校验失败的文件本来就没进 `restart`（第 1 步只有写盘落地才收），所以这一轮只有
+        // 单元文件那一条搁置 note；重启那一条由下一个用例（`InstallBinary` 塞进来的重启）覆盖。
+        assert_eq!(
+            out.notes,
+            vec!["hysteria-residential 的配置未通过校验，单元文件本轮一并搁置".to_string()]
+        );
+        assert!(
+            !h.ops()
+                .iter()
+                .any(|o| o.contains("hysteria-residential") || o == "daemon-reload"),
+            "{:?}",
+            h.ops()
+        );
+    }
+
+    /// 同一单元的另一个文件写成功也不解除搁置：**部分落地**正是要防的那半个状态。
+    /// 内核二进制换新（`InstallBinary` 把住宅单元塞进 restart）同样被搁置挡住。
+    #[test]
+    fn one_landed_file_does_not_release_a_held_unit() {
+        let h = FakeHost::new();
+        h.with(|i| {
+            i.files
+                .insert("/opt/b-ui/bin/sing-box".into(), (b"ELF".to_vec(), 0o755));
+            i.scripted.push((
+                "/opt/b-ui/bin/sing-box check".into(),
+                CmdOut::failure(1, "FATAL bad inbound"),
+            ));
+        });
+        let plan = Plan {
+            changes: vec![
+                Change::WriteFile {
+                    path: "/opt/b-ui/hy2-residential.json".into(),
+                    content: b"{}".to_vec(),
+                    mode: 0o600,
+                    verify: Some(Verify::SingBox),
+                    restart: Some(Unit::restart("hysteria-residential")),
+                },
+                Change::WriteFile {
+                    path: "/opt/b-ui/other.json".into(),
+                    content: b"{}".to_vec(),
+                    mode: 0o600,
+                    verify: None,
+                    restart: Some(Unit::restart("hysteria-residential")),
+                },
+                Change::InstallBinary {
+                    name: "sing-box".into(),
+                    version: "1.14.1".into(),
+                    sha256: "aa".into(),
+                    url: "https://x/sb".into(),
+                    path: "/opt/b-ui/bin/sing-box".into(),
+                },
+            ],
+            keys: Default::default(),
+            unchanged: 0,
+        };
+        let out = run(plan, &h, &NoopInstaller);
+        assert_eq!(
+            h.text("/opt/b-ui/other.json").as_deref(),
+            Some("{}"),
+            "校验通过的那个文件照写"
+        );
+        assert_eq!(
+            out.restarted,
+            vec!["b-ui-relay".to_string()],
+            "换了 sing-box 该重启的中继照重启，住宅单元被搁置"
+        );
+        assert!(out
+            .notes
+            .iter()
+            .any(|n| n == "hysteria-residential 的配置未通过校验，重启本轮一并搁置"));
+    }
+
+    /// 搁置的另一半理由：**写盘失败**（盘满 / 只读挂载）。校验失败那一半有上面两个用例钉着，
+    /// 写失败这一半在假机器造不出写失败之前是裸的 —— 把四处 `hold(.., "写入失败")` 全删掉，
+    /// 整套用例仍会全绿。所以 `FakeHost` 有了 `fail_writes`，这个用例专钉这一半：
+    /// 配置写不进去时，同一单元的单元文件绝不能换（换了就是「ExecStart 指向一份不存在的
+    /// 配置」+ `Restart=always` = 永久崩溃循环）。
+    #[test]
+    fn a_failed_config_write_also_holds_the_unit_file_and_the_restart() {
+        let cfg = "/opt/b-ui/hy2-residential.json";
+        let unit_path = "/etc/systemd/system/hysteria-residential.service";
+        let h = FakeHost::new();
+        h.with(|i| {
+            i.fail_writes.insert(cfg.into());
+        });
+        let plan = Plan {
+            changes: vec![
+                Change::WriteFile {
+                    path: cfg.into(),
+                    content: b"{}".to_vec(),
+                    mode: 0o600,
+                    // 校验不是这条路径的前提：`verify: None` 也照样会写失败
+                    verify: None,
+                    restart: Some(Unit::restart("hysteria-residential")),
+                },
+                Change::WriteUnit {
+                    path: unit_path.into(),
+                    content: "[Service]\nExecStart=/opt/b-ui/bin/sing-box run\n".into(),
+                    unit: Unit::restart("hysteria-residential"),
+                },
+            ],
+            keys: Default::default(),
+            unchanged: 0,
+        };
+        let out = run(plan, &h, &NoopInstaller);
+        assert!(h.text(cfg).is_none(), "写失败就是没落盘");
+        assert!(h.text(unit_path).is_none(), "配置没落地，单元文件一并搁置");
+        assert_eq!(out.errors.len(), 1, "{:?}", out.errors);
+        assert!(out.errors[0].contains("写入失败"), "{:?}", out.errors);
+        assert_eq!(out.restarted, Vec::<String>::new());
+        assert_eq!(out.changed, Vec::<String>::new());
+        assert_eq!(
+            out.notes,
+            vec!["hysteria-residential 的配置写入失败，单元文件本轮一并搁置".to_string()]
+        );
+        assert!(
+            !h.ops()
+                .iter()
+                .any(|o| o.contains("hysteria-residential") || o == "daemon-reload"),
+            "{:?}",
+            h.ops()
+        );
     }
 
     #[test]

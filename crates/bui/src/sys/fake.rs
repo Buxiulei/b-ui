@@ -36,6 +36,10 @@ pub struct FakeInner {
     pub scripted: Vec<(String, CmdOut)>,
     /// 令某单元的 systemd 动作失败（测回滚）
     pub fail_units: BTreeSet<String>,
+    /// 令某个路径的 `write_file` 失败（盘满 / 只读挂载 / 目录建不出来）：真实机器上写盘是会
+    /// 失败的，而对账把「带 restart 的 WriteFile 写失败」也算作搁置该单元的理由
+    /// （`reconcile::apply` 第 1 步），不给假机器造出写失败就没法钉住那一半。
+    pub fail_writes: BTreeSet<PathBuf>,
     /// 令某单元**永远不 active**：`systemctl start/restart` 照样退 0，单元却起不来
     /// （203/EXEC、start-limit-hit 的真实形态）。裸名与全名两种键各查一次。
     pub never_active: BTreeSet<String>,
@@ -75,6 +79,7 @@ impl Default for FakeInner {
             modules: BTreeSet::new(),
             scripted: Vec::new(),
             fail_units: BTreeSet::new(),
+            fail_writes: BTreeSet::new(),
             never_active: BTreeSet::new(),
             listening: BTreeMap::new(),
             mem_mb: 2048,
@@ -164,6 +169,9 @@ impl Host for FakeHost {
 
     fn write_file(&self, path: &Path, content: &[u8], mode: u32) -> Result<()> {
         let mut i = self.lock();
+        if i.fail_writes.contains(path) {
+            anyhow::bail!("写 {} 失败：假机器播了 fail_writes", path.display());
+        }
         i.files.insert(path.to_path_buf(), (content.to_vec(), mode));
         i.ops.push(format!("write:{}:{:03o}", path.display(), mode));
         Ok(())
