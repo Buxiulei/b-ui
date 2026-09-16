@@ -282,10 +282,10 @@ fn disabled_pool_emits_no_keyword_rules() {
     assert!(!yaml.contains("DOMAIN-KEYWORD"));
 }
 
-/// 多槽时三种订阅里的 HY2 住宅端口/跳跃区间都跟着用户的槽位走，
-/// 其余节点与 golden 逐字相同。
+/// 4.1：多槽也不再动三种订阅里的 HY2 住宅端点 —— 每个用户都是期望态里那一对
+/// `hy2_resi` / `hy2_resi_hop`（整段），其余节点与 golden 逐字相同。
 #[test]
-fn multi_slot_moves_only_the_residential_hy2_endpoint() {
+fn multi_slot_does_not_move_the_residential_hy2_endpoint() {
     let mut s = common::state("global");
     // fixture 自带 2 条上游，补到 3 条并按创建时间轮流落槽
     let g = s.residential.groups.get_mut("default").unwrap();
@@ -293,28 +293,30 @@ fn multi_slot_moves_only_the_residential_hy2_endpoint() {
     third.id = uuid::Uuid::from_u128(0xdead);
     third.host = "isp3.example.net".into();
     g.upstreams.push(third);
+    // 4.1：住宅 HY2 不再含槽位信息 —— 三条上游、三个槽，**每个用户端口与区间都一样**
     bui_schema::slots::sync_slots(&mut s.residential);
     bui_schema::slots::migrate_unassigned(&mut s);
-    assert_eq!(bui_schema::slots::slot_span(&s.residential), 3);
+    bui_schema::hy2pool::migrate(&mut s, time::OffsetDateTime::now_utc());
 
+    let (port, hop) = (s.node.ports.hy2_resi, s.node.ports.hy2_resi_hop);
     let split = split_of(&s);
+    let mut seen = std::collections::BTreeSet::new();
     for u in USERS {
-        let Some(user) = s.users.iter().find(|x| x.username == u) else {
+        if !s.users.iter().any(|x| x.username == u) {
             continue;
-        };
-        let idx = bui_schema::slots::index_of_user(user, &s.residential);
-        let res = bui_schema::slots::resources_of(&s.node.ports, &s.residential, idx);
+        }
         let nodes = nodes_of(&s, u);
         let Some(resi) = nodes
             .iter()
             .find(|n| n.kind == bui_schema::nodes::NodeKind::Hy2Residential)
         else {
-            continue; // 没有住宅权益的用户
+            continue; // 没有住宅权益（或没开 hysteria2）的用户
         };
-        assert_eq!(resi.port, res.hy2_port, "user={u}");
-        assert_eq!(resi.hop, Some(res.hop), "user={u}");
+        assert_eq!(resi.port, port, "user={u}");
+        assert_eq!(resi.hop, Some(hop), "user={u}");
+        seen.insert((resi.port, resi.hop));
 
-        // URI 列表里出现的就是这一槽的端口与 mport
+        // URI 列表里出现的就是这一对固定值
         let text = String::from_utf8(
             base64::engine::general_purpose::STANDARD
                 .decode(subscription::uri_list(&nodes, u).trim())
@@ -322,12 +324,11 @@ fn multi_slot_moves_only_the_residential_hy2_endpoint() {
         )
         .unwrap();
         assert!(
-            text.contains(&format!(":{}?", res.hy2_port)),
-            "user={u} 的 URI 里没有槽位端口 {}：\n{text}",
-            res.hy2_port
+            text.contains(&format!(":{port}?")),
+            "user={u} 的 URI 里没有住宅端口 {port}：\n{text}"
         );
         assert!(
-            text.contains(&format!("mport={}-{}", res.hop.0, res.hop.1)),
+            text.contains(&format!("mport={}-{}", hop.0, hop.1)),
             "user={u}"
         );
 
@@ -340,12 +341,13 @@ fn multi_slot_moves_only_the_residential_hy2_endpoint() {
             .find(|o| o["tag"] == "hy2-residential")
             .unwrap()
             .clone();
-        assert_eq!(out["server_port"], res.hy2_port, "user={u}");
+        assert_eq!(out["server_port"], port, "user={u}");
         common::check_singbox_all(&sb);
         let yaml = subscription::clash(&nodes, u, &split);
         assert!(
-            yaml.contains(&format!("port: {}", res.hy2_port)),
-            "user={u} 的 clash YAML 里没有槽位端口"
+            yaml.contains(&format!("port: {port}")),
+            "user={u} 的 clash YAML 里没有住宅端口"
         );
     }
+    assert_eq!(seen.len(), 1, "多槽下的端口/区间必须是同一对，不该有第二种");
 }
