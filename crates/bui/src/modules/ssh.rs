@@ -71,6 +71,7 @@ mod tests {
                 ssh_unit: ssh_unit.into(),
                 ssh_pubkeys: pubkeys,
                 systemd_resolved: false,
+                nft_tables: Default::default(),
             },
         }
     }

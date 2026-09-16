@@ -1,6 +1,12 @@
-//! 四个内核二进制 + 它们的五份配置（`config.yaml` / `config-residential.yaml` /
+//! 四个内核二进制 + 它们的五份配置（`config.yaml` / `hy2-residential.json` /
 //! `xray-config.json` / `singbox-relay.json` / `Caddyfile`），外加外部站点目录的占位
 //! `caddy/sites/README.txt`（2026-09-13 裁决：目录由对账器建，里面的 `*.caddy` 归用户管）。
+//!
+//! 4.1：住宅 HY2 从「每槽一个 apernet hysteria 实例 + 一份 `config-residential[-<i>].yaml`」
+//! 换成**一份** sing-box 配置 `hy2-residential.json`（`render::hy2_singbox`），全部
+//! `config-residential*.yaml` 产 `Absent`。那份 JSON 的内容与用户无关（凭据池 + 门 + 槽出站），
+//! 所以**不用 `restart_key`**：它只会因池扩容 / obfs / 证书 / 端口这四件事变化（spec §3.5），
+//! 用户的生命周期动作一律走 Clash API 切门、一个字节都不许改它。
 //!
 //! 除 Caddyfile 之外的每份配置都**原样**落 `bui-schema` 的渲染结果（总纲 C1）：P1 绝不自己
 //! 拼内核配置，订阅与配置的一致性由 P0 的 golden 测试兜底。
@@ -20,8 +26,13 @@ pub const RELAY_LISTEN_PORT: u16 = 2080;
 /// 本地 relay 的 Clash API（巡检热切换上游用，不重启进程）。
 pub const RELAY_CLASH_API: &str = "127.0.0.1:9091";
 
-/// 槽 `index` 的住宅配置路径：槽 0 是 v3 的 `config-residential.yaml`（兼容面），
-/// 其余是 `config-residential-<i>.yaml`。
+/// 4.1 起住宅 HY2 的唯一配置：一份 sing-box JSON（`render::hy2_singbox::config`）。
+pub fn hy2_resi_config_path(p: &Paths) -> std::path::PathBuf {
+    p.base_dir.join("hy2-residential.json")
+}
+
+/// 4.0 的按槽住宅配置路径（槽 0 是 `config-residential.yaml`，其余带序号）。
+/// 4.1 只用它产 `Absent` 与「删之前先清孤儿 NAT 规则」的枚举。
 pub fn resi_config_path(p: &Paths, index: u16) -> std::path::PathBuf {
     if index == 0 {
         p.base_dir.join("config-residential.yaml")
@@ -203,31 +214,28 @@ impl Module for CoreFilesModule {
             )
             .restart(Unit::restart("hysteria-server")),
         );
-        // 每槽一个住宅实例的配置（spec §5.6）；改了哪一槽只重启那一槽的单元
-        let live = bui_schema::slots::indices(&s.residential);
-        for i in live.iter().copied() {
-            let res = bui_schema::slots::resources_of(&s.node.ports, &s.residential, i);
-            out.push(
-                Artifact::file(
-                    resi_config_path(p, i),
-                    bui_schema::render::hysteria::residential_slot_yaml(
-                        &s.node,
-                        p,
-                        &res,
-                        s.system.hy2_auth,
-                    ),
-                )
-                .restart(Unit::restart(&crate::reconcile::resi_unit(i))),
-            );
-        }
-        // 池缩小之后留下的配置文件要删掉：留着不会被加载，但会被漂移扫描
-        // 报成「受管目录里的陌生文件」，体检永久 degraded
-        for i in 1..crate::reconcile::MAX_RESI_SLOTS {
-            if !live.contains(&i) {
-                out.push(Artifact::Absent {
-                    path: resi_config_path(p, i),
-                });
-            }
+        // 住宅 HY2：一份 sing-box 配置（spec §2.3）。**没有 `restart_key`** —— 文件内容与
+        // 用户无关，改了就是那四件事之一，该重启（spec §3.5）。
+        out.push(
+            Artifact::file(
+                hy2_resi_config_path(p),
+                serde_json::to_vec_pretty(&bui_schema::render::hy2_singbox::config(
+                    &s.node,
+                    p,
+                    &s.residential.hy2_pool,
+                ))
+                .expect("住宅 HY2 配置必须可序列化"),
+            )
+            .verify(Verify::SingBox)
+            .restart(Unit::restart("hysteria-residential")),
+        );
+        // 4.0 的按槽 apernet 配置一份不留：留着不会被加载，但会被漂移扫描报成
+        // 「受管目录里的陌生文件」，体检永久 degraded。它们留下的端口跳跃 NAT 规则由
+        // apply 在落 nft 表之前清掉（`portjump::cleanup_legacy_residential`）。
+        for i in 0..crate::reconcile::MAX_RESI_SLOTS {
+            out.push(Artifact::Absent {
+                path: resi_config_path(p, i),
+            });
         }
         let xray = bui_schema::render::xray::config(&s.node, &s.users, &s.residential, p);
         let hash = bui_schema::render::xray::structural_hash(&xray);
@@ -294,6 +302,7 @@ mod tests {
                 ssh_unit: "sshd".into(),
                 ssh_pubkeys: 1,
                 systemd_resolved: false,
+                nft_tables: Default::default(),
             },
         }
     }
@@ -379,7 +388,7 @@ mod tests {
             files,
             vec![
                 "/opt/b-ui/config.yaml",
-                "/opt/b-ui/config-residential.yaml",
+                "/opt/b-ui/hy2-residential.json",
                 "/opt/b-ui/xray-config.json",
                 "/opt/b-ui/singbox-relay.json",
                 "/opt/b-ui/caddy/sites/README.txt",
@@ -392,7 +401,7 @@ mod tests {
     fn without_a_manifest_only_the_files_are_rendered() {
         let arts = CoreFilesModule::new(None).render(&sample_state(), &ctx());
         assert!(!arts.iter().any(|a| matches!(a, Artifact::Binary { .. })));
-        // 六份配置文件 + 空槽位（1..MAX）的配置清理项
+        // 六份配置文件 + 4.0 全部按槽配置（0..MAX）的清理项
         assert_eq!(
             arts.iter()
                 .filter(|a| matches!(a, Artifact::File { .. }))
@@ -401,7 +410,7 @@ mod tests {
         );
         assert_eq!(
             arts.len(),
-            6 + usize::from(crate::reconcile::MAX_RESI_SLOTS - 1)
+            6 + usize::from(crate::reconcile::MAX_RESI_SLOTS)
         );
     }
 
@@ -437,28 +446,13 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        match find_file(&arts, "/opt/b-ui/config-residential.yaml") {
-            Artifact::File {
-                content, restart, ..
-            } => {
-                assert_eq!(
-                    String::from_utf8(content).unwrap(),
-                    bui_schema::render::hysteria::residential_yaml(
-                        &s.node,
-                        &Paths::default_server(),
-                        s.system.hy2_auth,
-                    )
-                );
-                assert_eq!(restart, Some(Unit::restart("hysteria-residential")));
-            }
-            other => panic!("{other:?}"),
-        }
     }
 
-    /// `state.system.hy2_auth` 是两份 hysteria 配置里 `auth` 段的唯一来源（2026-09-13 裁决）：
-    /// 默认 http，切成 command 时两份都跟着变，于是对账各重启一次实例。
+    /// `state.system.hy2_auth` 是 hysteria `auth` 段的唯一来源（2026-09-13 裁决）。
+    /// 4.1 起它的作用域**只剩直连**（spec §6）：住宅那份换成 sing-box 的静态凭据池，
+    /// 配置里连 `auth` 这个字段都不存在，所以切换只重渲染 `config.yaml`。
     #[test]
-    fn the_auth_mode_from_state_reaches_both_hysteria_configs() {
+    fn the_auth_mode_from_state_only_reaches_the_direct_hysteria_config() {
         let text = |s: &State, path: &str| match find_file(
             &CoreFilesModule::new(None).render(s, &ctx()),
             path,
@@ -468,20 +462,20 @@ mod tests {
         };
         let mut s = sample_state();
         assert_eq!(s.system.hy2_auth, bui_schema::model::Hy2Auth::Http);
-        for p in ["/opt/b-ui/config.yaml", "/opt/b-ui/config-residential.yaml"] {
-            let t = text(&s, p);
-            assert!(t.contains("url: http://127.0.0.1:18789/auth"), "{p}:\n{t}");
-            assert!(!t.contains("bui-auth-hook"), "{p}:\n{t}");
-        }
+        let t = text(&s, "/opt/b-ui/config.yaml");
+        assert!(t.contains("url: http://127.0.0.1:18789/auth"), "{t}");
+        assert!(!t.contains("bui-auth-hook"), "{t}");
+        let resi_http = text(&s, "/opt/b-ui/hy2-residential.json");
         s.system.hy2_auth = bui_schema::model::Hy2Auth::Command;
-        for p in ["/opt/b-ui/config.yaml", "/opt/b-ui/config-residential.yaml"] {
-            let t = text(&s, p);
-            assert!(
-                t.contains("command: /opt/b-ui/bin/bui-auth-hook"),
-                "{p}:\n{t}"
-            );
-            assert!(!t.contains("18789"), "{p}:\n{t}");
-        }
+        let t = text(&s, "/opt/b-ui/config.yaml");
+        assert!(t.contains("command: /opt/b-ui/bin/bui-auth-hook"), "{t}");
+        assert!(!t.contains("18789"), "{t}");
+        let resi_cmd = text(&s, "/opt/b-ui/hy2-residential.json");
+        assert_eq!(resi_http, resi_cmd, "切鉴权方式不许动住宅那份配置");
+        assert!(
+            !resi_cmd.contains("18789") && !resi_cmd.contains("bui-auth-hook"),
+            "{resi_cmd}"
+        );
     }
 
     #[test]
@@ -824,59 +818,170 @@ mod tests {
         s
     }
 
+    /// 3 槽 + 一个两条凭据的池（一条是迁移用户的 `name = username`，一条是新发的 `name = id`），
+    /// 用户 alice 粘在第一条上。守门测试必须有非空的池：空池渲染出的 `users: []` 对
+    /// 「用户动作改没改这个文件」这件事什么都证明不了。
+    fn state_with_pool() -> bui_schema::model::State {
+        let mut s = state_with_slots(3);
+        s.residential.hy2_pool.creds = vec![
+            bui_schema::model::ReservedCred {
+                id: "r000".into(),
+                name: "alice".into(),
+                secret: "pw-alice-01".into(),
+                released_at: None,
+            },
+            bui_schema::model::ReservedCred {
+                id: "r001".into(),
+                name: "r001".into(),
+                secret: "c2VjcmV0LXBsYWNlaG9sZGVy".into(),
+                released_at: None,
+            },
+        ];
+        s.residential.hy2_pool.generation = 1;
+        s.users[0].credentials.hy2_resi_cred = Some("r000".into());
+        s
+    }
+
+    /// 4.1：一份 `hy2-residential.json`（`Verify::SingBox` + 重启住宅单元，**无 restart_key**），
+    /// 全部 `config-residential*.yaml` 一律产 `Absent`（spec §2.3 / §2.5）。
     #[test]
-    fn a_single_slot_renders_exactly_one_residential_config_named_like_v3() {
-        let arts = CoreFilesModule::new(None).render(&sample_state(), &ctx());
-        let files: Vec<String> = arts
+    fn residential_renders_one_singbox_config_and_removes_every_apernet_one() {
+        let s = state_with_pool();
+        let p = Paths::default_server();
+        let arts = CoreFilesModule::new(None).render(&s, &ctx());
+        match find_file(&arts, "/opt/b-ui/hy2-residential.json") {
+            Artifact::File {
+                content,
+                mode,
+                restart,
+                restart_key,
+                verify,
+                immutable,
+                ..
+            } => {
+                let want = serde_json::to_vec_pretty(&bui_schema::render::hy2_singbox::config(
+                    &s.node,
+                    &p,
+                    &s.residential.hy2_pool,
+                ))
+                .unwrap();
+                assert_eq!(content, want, "原样落 bui-schema 的渲染结果（总纲 C1）");
+                assert_eq!(mode, 0o600);
+                assert_eq!(restart, Some(Unit::restart("hysteria-residential")));
+                assert_eq!(
+                    restart_key, None,
+                    "文件内容与用户无关，不需要 restart_key（spec §3.5）"
+                );
+                assert_eq!(verify, Some(Verify::SingBox));
+                assert!(!immutable);
+            }
+            other => panic!("{other:?}"),
+        }
+        let absents: Vec<String> = arts
             .iter()
             .filter_map(|a| match a {
-                Artifact::File { path, .. } => Some(path.display().to_string()),
+                Artifact::Absent { path } => Some(path.display().to_string()),
                 _ => None,
             })
             .collect();
-        assert!(files.contains(&"/opt/b-ui/config-residential.yaml".to_string()));
-        assert!(!files.iter().any(|f| f.contains("config-residential-")));
-        // 空槽位的清理项覆盖 1..MAX
+        assert!(absents.contains(&"/opt/b-ui/config-residential.yaml".to_string()));
         for i in 1..crate::reconcile::MAX_RESI_SLOTS {
             assert!(
-                arts.iter().any(|a| matches!(a, Artifact::Absent { path }
-                    if path.to_str() == Some(&format!("/opt/b-ui/config-residential-{i}.yaml")))),
-                "槽 {i} 的配置没有清理项"
+                absents.contains(&format!("/opt/b-ui/config-residential-{i}.yaml")),
+                "槽 {i} 的 4.0 配置没有清理项：{absents:?}"
             );
         }
+        // 住宅只剩一份配置：按槽的那些一个都不许再渲染出来
+        assert!(!arts.iter().any(|a| matches!(a, Artifact::File { path, .. }
+            if path.to_str().is_some_and(|x| x.contains("config-residential")))));
     }
 
+    /// 守门（spec §3.5）：对同一 state 增删用户 / 换槽 / 置到期，`hy2-residential.json`
+    /// 的字节**逐字相等** —— 只有池扩容 / obfs / 证书 / 端口这四件事能改它。
+    /// 破了这条就等于用户每次到期都要重启一次住宅内核，全体在线连接一起断。
     #[test]
-    fn three_slots_render_three_residential_configs_with_their_own_restart_targets() {
-        let s = state_with_slots(3);
-        let arts = CoreFilesModule::new(None).render(&s, &ctx());
-        let p = Paths::default_server();
-        for i in 0..3u16 {
-            let want = bui_schema::render::hysteria::residential_slot_yaml(
-                &s.node,
-                &p,
-                &bui_schema::slots::resources_of(&s.node.ports, &s.residential, i),
-                s.system.hy2_auth,
-            );
-            let path = crate::modules::core_files::resi_config_path(&p, i);
-            match find_file(&arts, path.to_str().unwrap()) {
-                Artifact::File {
-                    content, restart, ..
-                } => {
-                    assert_eq!(String::from_utf8(content).unwrap(), want, "槽 {i} 内容");
-                    assert_eq!(
-                        restart,
-                        Some(Unit::restart(&crate::reconcile::resi_unit(i))),
-                        "槽 {i} 只重启自己那个实例"
-                    );
-                }
-                other => panic!("{other:?}"),
-            }
+    fn user_lifecycle_never_touches_the_residential_config() {
+        let base = state_with_pool();
+        let bytes = |s: &State| match find_file(
+            &CoreFilesModule::new(None).render(s, &ctx()),
+            "/opt/b-ui/hy2-residential.json",
+        ) {
+            Artifact::File { content, .. } => content,
+            other => panic!("{other:?}"),
+        };
+        let want = bytes(&base);
+
+        let mut added = base.clone();
+        let mut zoe = base.users[0].clone();
+        zoe.username = "zoe".into();
+        zoe.user_id = uuid::Uuid::from_u128(999);
+        added.users.push(zoe);
+        assert_eq!(bytes(&added), want, "加用户不改这个文件");
+
+        let mut expired = base.clone();
+        expired.users[0].entitlements.residential = None;
+        expired.users[0].disabled = true;
+        assert_eq!(bytes(&expired), want, "置到期 / 撤权益不改这个文件");
+
+        let mut moved = base.clone();
+        let other = moved.residential.slots[1].upstream_id;
+        if let Some(r) = moved.users[0].entitlements.residential.as_mut() {
+            r.slot_id = Some(other);
         }
-        // 只剩 3..MAX 需要清理
-        assert!(arts.iter().any(|a| matches!(a, Artifact::Absent { path }
-            if path.to_str() == Some("/opt/b-ui/config-residential-3.yaml"))));
-        assert!(!arts.iter().any(|a| matches!(a, Artifact::Absent { path }
-            if path.to_str() == Some("/opt/b-ui/config-residential-2.yaml"))));
+        assert_eq!(bytes(&moved), want, "换槽不改这个文件");
+
+        // 反面：池扩容确实要改它（否则新凭据永远进不了 users[]）
+        let mut grown = base.clone();
+        grown
+            .residential
+            .hy2_pool
+            .creds
+            .push(bui_schema::model::ReservedCred {
+                id: "r099".into(),
+                name: "r099".into(),
+                secret: "s".into(),
+                released_at: None,
+            });
+        assert_ne!(bytes(&grown), want, "只有池扩容 / obfs / 证书 / 端口能改它");
+        let mut obfs = base.clone();
+        obfs.node.obfs.enabled = true;
+        obfs.node.obfs.password = "pw".into();
+        assert_ne!(bytes(&obfs), want, "obfs 开关要改它");
+        let mut ports = base.clone();
+        ports.node.ports.hy2_resi = 45000;
+        assert_ne!(bytes(&ports), want, "改端口要改它");
+    }
+
+    /// 全新装机（`hy2pool::migrate` 之前）池是空的：此时也必须渲染出合法配置
+    /// （`users: []` + 9 个出站 + 1 条 sniff 规则），且能过真实 `sing-box check`。
+    /// 没有这一格的话「首装当轮住宅内核起不来」只能等真机才发现（2026-09-16 第二波复核）。
+    #[test]
+    fn an_empty_pool_still_renders_a_valid_residential_config() {
+        let mut s = sample_state();
+        s.residential.hy2_pool = Default::default();
+        assert!(s.residential.hy2_pool.creds.is_empty());
+        let arts = CoreFilesModule::new(None).render(&s, &ctx());
+        let content = match find_file(&arts, "/opt/b-ui/hy2-residential.json") {
+            Artifact::File { content, .. } => content,
+            other => panic!("{other:?}"),
+        };
+        let v: serde_json::Value = serde_json::from_slice(&content).unwrap();
+        assert_eq!(v["inbounds"][0]["users"], serde_json::json!([]));
+        assert_eq!(
+            v["outbounds"].as_array().unwrap().len(),
+            1 + usize::from(bui_schema::slots::MAX_SLOTS),
+            "deny + 8 个槽出站，一个门都没有"
+        );
+        assert_eq!(
+            v["route"]["rules"].as_array().unwrap().len(),
+            1,
+            "只剩 sniff"
+        );
+        assert_eq!(
+            v["experimental"]["v2ray_api"]["stats"]["users"],
+            serde_json::json!([])
+        );
+        // 真实内核校验那一格在 `bui-schema` 的 `tests/kernel_hy2_singbox.rs`
+        // （那里有自签证书与 with_v2ray_api 的 skip 逻辑）。
     }
 }

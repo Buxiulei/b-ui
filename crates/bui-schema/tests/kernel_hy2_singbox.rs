@@ -60,3 +60,32 @@ fn residential_inbound_config_passes_check_on_the_self_built_singbox() {
     );
     common::check_singbox(&cfg);
 }
+
+/// 全新装机那一格：`hy2pool::migrate` 之前池是空的，此时渲染出的 `users: []`、9 个出站、
+/// 1 条 sniff 规则**也必须过 check**（2026-09-16 第二波复核：T5 只手工验过，没有自动化
+/// 测试守着）。空 `users` 数组被 sing-box 判非法的话，首装当轮住宅内核就起不来。
+#[test]
+fn an_empty_credential_pool_also_passes_check() {
+    if !singbox_has_v2ray_api() {
+        eprintln!("skipped: 自建 sing-box（with_v2ray_api）不可用");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    if self_signed(dir.path()).is_none() {
+        eprintln!("skipped: openssl not usable");
+        return;
+    }
+    let s = common::state("obfs");
+    let pool = bui_schema::model::Hy2Pool::default();
+    assert!(pool.creds.is_empty());
+    let cfg = bui_schema::render::hy2_singbox::config(
+        &s.node,
+        &bui_schema::paths::Paths {
+            base_dir: dir.path().to_path_buf(),
+            certs_dir: dir.path().to_path_buf(),
+            bin_dir: dir.path().join("bin"),
+        },
+        &pool,
+    );
+    common::check_singbox(&cfg);
+}

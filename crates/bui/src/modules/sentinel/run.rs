@@ -392,11 +392,11 @@ mod tests {
             "caddy",
             "hysteria-server",
             "hysteria-residential",
-            "hysteria-residential-1",
-            "hysteria-residential-2",
         ] {
             assert!(units.contains(&u), "{u} 不在 {units:?}");
         }
+        // 4.1：受管单元固定六个，带序号的住宅实例已退役（进了 LEGACY_UNITS）
+        assert_eq!(units.len(), 6, "{units:?}");
         assert_eq!(
             engine::sentinel_of(&k.ctx.runtime.read().await)
                 .since

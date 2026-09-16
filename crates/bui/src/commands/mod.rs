@@ -5,6 +5,7 @@ pub mod import_v3;
 pub mod incidents;
 pub mod install;
 pub mod menu;
+pub mod nft;
 pub mod selfcheck;
 pub mod status;
 pub mod upgrade;

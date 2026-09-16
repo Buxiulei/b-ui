@@ -364,6 +364,7 @@ mod tests {
                 ssh_unit: "sshd".into(),
                 ssh_pubkeys: 1,
                 systemd_resolved: false,
+                nft_tables: Default::default(),
             },
         }
     }

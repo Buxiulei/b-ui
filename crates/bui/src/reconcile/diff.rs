@@ -1,6 +1,6 @@
 //! 期望态 → 变更集：按内容/状态逐项比对，只产出有差异的项（spec §2.2「按内容哈希比对，
 //! 只写有差异的」）。这里只读机器、不改机器；落地在 [`super::apply`]。
-use super::{Artifact, PortSpec, Unit, Verify};
+use super::{Artifact, Facts, PortSpec, Unit, Verify};
 use crate::sys::Host;
 use anyhow::Result;
 use bui_schema::paths::Paths;
@@ -55,6 +55,14 @@ pub enum Change {
     OpenPorts {
         ports: Vec<PortSpec>,
     },
+    /// 一个 `nft -f -` 事务，整表原子替换（4.1 的住宅 HY2 端口跳跃）。
+    /// `key` 是规则集的哈希，apply 落地成功后才搬进 `runtime.restart_keys[<artifact id>]`。
+    ApplyNftTable {
+        family: String,
+        name: String,
+        ruleset: String,
+        key: String,
+    },
 }
 
 /// 一轮比对的结果。`keys` 只是**候选** `restart_key`：真正落盘由 apply 在写盘成功后
@@ -72,6 +80,9 @@ pub struct PlanInput<'a> {
     /// `runtime.restart_keys`
     pub keys: &'a BTreeMap<String, String>,
     pub installed_versions: &'a BTreeMap<String, String>,
+    /// 本轮探到的系统事实。`plan` **只读它**、绝不自己跑命令（纯函数铁律）：
+    /// 目前只用到 [`Facts::nft_tables`]（「`inet bui` 这张表还在不在」）。
+    pub facts: &'a Facts,
 }
 
 pub fn plan(input: PlanInput<'_>, host: &dyn Host) -> Result<Plan> {
@@ -234,6 +245,32 @@ pub fn plan(input: PlanInput<'_>, host: &dyn Host) -> Result<Plan> {
                     out.unchanged += 1;
                 }
             }
+            Artifact::NftTable {
+                family,
+                name,
+                ruleset,
+            } => {
+                // 两个条件都满足才算「已落地」：① 规则集哈希与上次落地的一致
+                // ② 表此刻真的在 —— 有人 `nft flush ruleset`（或 `nftables.service`
+                // restart，tizi 的 /etc/nftables.conf 第 3 行就是它）把表刷掉时哈希照旧相同，
+                // 只有 `facts.nft_tables` 看得出来，而住宅 HY2 的跳跃全靠这张表。
+                let id = art.id();
+                let key = ruleset_key(ruleset);
+                let table = format!("{family} {name}");
+                let landed = input.keys.get(&id).map(String::as_str) == Some(key.as_str())
+                    && input.facts.nft_tables.contains(&table);
+                if landed {
+                    out.unchanged += 1;
+                } else {
+                    out.changes.push(Change::ApplyNftTable {
+                        family: family.clone(),
+                        name: name.clone(),
+                        ruleset: ruleset.clone(),
+                        key: key.clone(),
+                    });
+                    out.keys.insert(id, key);
+                }
+            }
             Artifact::Absent { path } => {
                 if host.read_file(path)?.is_some() {
                     out.changes.push(Change::RemoveFile { path: path.clone() });
@@ -244,6 +281,14 @@ pub fn plan(input: PlanInput<'_>, host: &dyn Host) -> Result<Plan> {
         }
     }
     Ok(out)
+}
+
+/// 规则集的指纹：落地过同一份就不再重放 `nft -f`（配合 `facts.nft_tables` 一起判）。
+pub fn ruleset_key(ruleset: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(ruleset.as_bytes());
+    hex::encode(h.finalize())[..16].to_string()
 }
 
 /// 端口集的指纹：放行过一次就不再重复 `ufw allow`。
@@ -266,17 +311,46 @@ mod tests {
     use pretty_assertions::assert_eq;
     use std::collections::BTreeMap;
 
+    /// 本文件的用例默认「机器上一张 nft 表都没有」；要「表在」的那条自己造一份 facts。
+    fn facts() -> &'static Facts {
+        static F: std::sync::OnceLock<Facts> = std::sync::OnceLock::new();
+        F.get_or_init(|| Facts {
+            mem_mb: 2048,
+            arch: "x86_64".into(),
+            hostname: "node-a".into(),
+            has_ufw: false,
+            ufw_active: false,
+            has_firewalld: false,
+            firewalld_active: false,
+            ssh_unit: "sshd".into(),
+            ssh_pubkeys: 1,
+            systemd_resolved: false,
+            nft_tables: Default::default(),
+        })
+    }
+
     fn input<'a>(
         artifacts: &'a [Artifact],
         paths: &'a Paths,
         keys: &'a BTreeMap<String, String>,
         versions: &'a BTreeMap<String, String>,
     ) -> PlanInput<'a> {
+        input_with(artifacts, paths, keys, versions, facts())
+    }
+
+    fn input_with<'a>(
+        artifacts: &'a [Artifact],
+        paths: &'a Paths,
+        keys: &'a BTreeMap<String, String>,
+        versions: &'a BTreeMap<String, String>,
+        facts: &'a Facts,
+    ) -> PlanInput<'a> {
         PlanInput {
             artifacts,
             paths,
             keys,
             installed_versions: versions,
+            facts,
         }
     }
 
@@ -641,6 +715,58 @@ mod tests {
         keys.insert("firewall".to_string(), key);
         let second = plan(input(&arts, &paths, &keys, &versions), &h).unwrap();
         assert!(second.changes.is_empty(), "端口集没变就不重复放行");
+    }
+
+    /// 4.1：规则集哈希相同**且**表在 ⇒ 零变更；任一条不成立就重放一次
+    /// （`nft -f` 是整表原子替换，重放幂等）。
+    #[test]
+    fn the_nft_table_is_planned_when_the_hash_differs_or_the_table_is_gone() {
+        let h = FakeHost::new();
+        let paths = Paths::default_server();
+        let versions = BTreeMap::new();
+        let ruleset = "table inet bui\nflush table inet bui\ntable inet bui {}\n";
+        let arts = vec![Artifact::NftTable {
+            family: "inet".into(),
+            name: "bui".into(),
+            ruleset: ruleset.into(),
+        }];
+        // ① 表不在、也没有记账 → 重放
+        let first = plan(input(&arts, &paths, &BTreeMap::new(), &versions), &h).unwrap();
+        assert_eq!(
+            first.changes,
+            vec![Change::ApplyNftTable {
+                family: "inet".into(),
+                name: "bui".into(),
+                ruleset: ruleset.into(),
+                key: ruleset_key(ruleset),
+            }]
+        );
+        assert_eq!(
+            first.keys.get("nft:inet:bui").map(String::as_str),
+            Some(ruleset_key(ruleset).as_str()),
+            "候选 key 进 plan.keys，由 apply 在落地成功后才搬"
+        );
+        // ② 记账在、表也在 → 零变更
+        let mut keys = BTreeMap::new();
+        keys.insert("nft:inet:bui".to_string(), ruleset_key(ruleset));
+        let mut present = facts().clone();
+        present.nft_tables.insert("inet bui".into());
+        let second = plan(input_with(&arts, &paths, &keys, &versions, &present), &h).unwrap();
+        assert!(second.changes.is_empty(), "{:?}", second.changes);
+        assert_eq!(second.unchanged, 1);
+        // ③ 记账在、表被人刷掉了 → 还得重放（哈希看不出这件事）
+        let third = plan(input(&arts, &paths, &keys, &versions), &h).unwrap();
+        assert_eq!(third.changes.len(), 1, "表没了就必须重放");
+        // ④ 表在、但规则集变了（比如关掉兼容段）→ 重放
+        let other = vec![Artifact::NftTable {
+            family: "inet".into(),
+            name: "bui".into(),
+            ruleset: "table inet bui\nflush table inet bui\ntable inet bui { }\n".into(),
+        }];
+        let fourth = plan(input_with(&other, &paths, &keys, &versions, &present), &h).unwrap();
+        assert_eq!(fourth.changes.len(), 1, "规则集变了就必须重放");
+        // 规则集哈希只跟正文有关，与端口集那把指纹互不干扰
+        assert_ne!(ruleset_key(ruleset), ruleset_key("table inet bui\n"));
     }
 
     #[test]

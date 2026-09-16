@@ -5,7 +5,8 @@
 //! `write:<path>:<mode 八进制三位>`、`remove:<path>`、`rmdir:<path>`、
 //! `symlink:<link>-><target>`、`chattr:+i:<path>` / `chattr:-i:<path>`、`daemon-reload`、
 //! `systemd:<verb>:<unit>`、`sysctl:<key>=<value>`、`modprobe:<module>`、
-//! `run:<program> <args 以空格连接>`、`journal:<units 以逗号连接>:cursor=<c>` /
+//! `run:<program> <args 以空格连接>`（`run_stdin` 同格式，stdin 另记在 `stdins` 里）、
+//! `journal:<units 以逗号连接>:cursor=<c>` /
 //! `journal:<units>:since=<RFC3339>`。
 
 use super::{cmd_line, unit_full, CmdOut, Host, JournalFrom, JournalRecord, Proto};
@@ -49,6 +50,8 @@ pub struct FakeInner {
     /// `unit_property` 的查询流水（单元全名, 属性名）：纯查询不进 `ops`，
     /// 「一次 systemd 都没查」这类断言靠它证明（`bui hy2-prestart` 的启动关键路径）。
     pub unit_prop_reads: Vec<(String, String)>,
+    /// `run_stdin` 的载荷流水（命令行, stdin）：`nft -f -` 喂进去的规则集按它断言。
+    pub stdins: Vec<(String, String)>,
     /// 操作流水（顺序可断言）
     pub ops: Vec<String>,
 }
@@ -80,6 +83,7 @@ impl Default for FakeInner {
             now: time::macros::datetime!(2026-09-11 00:00:00 UTC),
             journal: std::collections::VecDeque::new(),
             unit_prop_reads: Vec::new(),
+            stdins: Vec::new(),
             ops: Vec::new(),
         }
     }
@@ -113,6 +117,11 @@ impl FakeHost {
     /// 读回 `unit_property` 被查过的 (单元全名, 属性名)：断言「一次都没查」用。
     pub fn unit_prop_reads(&self) -> Vec<(String, String)> {
         self.lock().unit_prop_reads.clone()
+    }
+
+    /// 读回 [`Host::run_stdin`] 的载荷（命令行, stdin）。
+    pub fn stdins(&self) -> Vec<(String, String)> {
+        self.lock().stdins.clone()
     }
 
     /// 读回写入的文件内容。
@@ -250,6 +259,19 @@ impl Host for FakeHost {
         let line = cmd_line(program, args);
         self.push_op(format!("run:{line}"));
         let i = self.lock();
+        for (prefix, out) in &i.scripted {
+            if line.starts_with(prefix.as_str()) {
+                return Ok(out.clone());
+            }
+        }
+        Ok(CmdOut::success(""))
+    }
+
+    fn run_stdin(&self, program: &str, args: &[&str], stdin: &str) -> Result<CmdOut> {
+        let line = cmd_line(program, args);
+        self.push_op(format!("run:{line}"));
+        let mut i = self.lock();
+        i.stdins.push((line.clone(), stdin.to_string()));
         for (prefix, out) in &i.scripted {
             if line.starts_with(prefix.as_str()) {
                 return Ok(out.clone());

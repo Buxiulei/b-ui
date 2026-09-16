@@ -183,14 +183,12 @@ pub fn targets(state: &State) -> Vec<Target> {
         proto: Proto::Udp,
         port: state.node.ports.hy2,
     }];
-    for i in bui_schema::slots::indices(&state.residential) {
-        v.push(Target {
-            unit: crate::reconcile::resi_unit(i),
-            proto: Proto::Udp,
-            port: bui_schema::slots::resources_of(&state.node.ports, &state.residential, i)
-                .hy2_port,
-        });
-    }
+    // 4.1：住宅只有一个实例，监听期望态里那个单端口（整段跳跃由 nft 表 REDIRECT 过来）
+    v.push(Target {
+        unit: "hysteria-residential".into(),
+        proto: Proto::Udp,
+        port: state.node.ports.hy2_resi,
+    });
     v.push(Target {
         unit: "xray".into(),
         proto: Proto::Tcp,
@@ -786,6 +784,8 @@ mod tests {
                 ("b-ui-relay".to_string(), 2080),
             ]
         );
+        // 4.1：增槽不再多出监控目标（住宅只有一个 sing-box 实例，只听 ports.hy2_resi）
+        let one = targets(&s);
         s.residential.slots = (0..3)
             .map(|i| bui_schema::model::Slot {
                 index: i,
@@ -793,13 +793,11 @@ mod tests {
             })
             .collect();
         let t = targets(&s);
-        assert_eq!(t.len(), 6);
-        assert!(t
+        assert_eq!(t, one, "槽位表不许影响监控目标");
+        assert_eq!(t.len(), 4);
+        assert!(!t
             .iter()
-            .any(|x| x.unit == "hysteria-residential-1" && x.port == 40001));
-        assert!(t
-            .iter()
-            .any(|x| x.unit == "hysteria-residential-2" && x.port == 40002));
+            .any(|x| x.unit.starts_with("hysteria-residential-")));
         assert!(t.iter().all(|x| match x.unit.as_str() {
             "xray" | "b-ui-relay" => x.proto == Proto::Tcp,
             _ => x.proto == Proto::Udp,

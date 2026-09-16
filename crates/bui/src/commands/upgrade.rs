@@ -358,6 +358,16 @@ pub async fn run_with(
                 env!("CARGO_PKG_VERSION"),
             )?;
         }
+        // 4.1 的硬前置（2026-09-16 裁决）：缺 `nft`（或内核低于 inet nat 要求的 5.2）
+        // 就**硬性拒绝**升级 —— 退出码 2、一个字不落盘、不装系统包。判据与文案同
+        // `bui install` 的 `env.blocking()` 共用 `env_probe::nft_blocking`。
+        // 位置在 `prepare` 之前：那之后就会写 `.prev` 快照与新 manifest 缓存。
+        //
+        // **注意这道闸门拦不住 4.0.1 → 4.1 那一跳**：`bui upgrade` 由**旧**二进制执行，
+        // 旧的那版没有这段代码。那一跳由 T18 的演练 preflight 与 T19 闸门 5 守。
+        if let Some(msg) = crate::sys::env_probe::nft_blocking_for(h.as_ref()) {
+            return Err(crate::sys::env_probe::EnvBlocked(msg).into());
+        }
         let arch = h.arch()?;
         // 计划先算、快照与新缓存只在真要换东西时才写（见 `prepare` 的说明）
         prepare(h.as_ref(), &p, &m, env!("CARGO_PKG_VERSION"), &arch)
@@ -547,6 +557,43 @@ mod tests {
             Some(cached),
             "缓存必须还是 rc1 那一份"
         );
+        assert!(text(&h, &crate::paths::manifest_prev_file(&paths)).is_none());
+    }
+
+    /// 4.1 的 nft 硬前置（2026-09-16 裁决）：缺 `nft` ⇒ 专属错误（`main` 据它给退出码 2）、
+    /// **一个字都不落盘**（不许留下「新缓存 + 旧内核」，也不许覆盖 `.prev`）。
+    ///
+    /// 位置在降级守卫**之后**、`prepare` 之前：降级那条是「目标不对」，这条是「机器不够」。
+    #[tokio::test]
+    async fn run_with_refuses_to_upgrade_without_nft_and_writes_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = scratch(&d);
+        let h = Arc::new(FakeHost::new());
+        h.with(|i| {
+            i.files.insert(
+                "/etc/os-release".into(),
+                (b"ID=debian\nVERSION_ID=\"12\"\n".to_vec(), 0o644),
+            );
+        });
+        h.clear_ops();
+        let latest = manifest_json("9.9.9", OLD_KERNELS, "BUI-9.9.9");
+        let f: Arc<dyn Fetcher> = Arc::new(F(Mutex::new(vec![(
+            crate::kernels::MANIFEST_URL.to_string(),
+            latest.into_bytes(),
+        )])));
+        let host: Arc<dyn Host> = h.clone();
+        let err = run_with(false, None, None, paths.clone(), host, f)
+            .await
+            .unwrap_err();
+        assert!(
+            err.is::<crate::sys::env_probe::EnvBlocked>(),
+            "main 靠这个类型给退出码 2：{err:#}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("apt-get install -y nftables"), "{msg}");
+        assert!(msg.contains("现役订阅"), "{msg}");
+        assert_eq!(writes(&h), Vec::<String>::new(), "拒绝之后一个字都不写");
+        assert!(text(&h, &crate::paths::manifest_file(&paths)).is_none());
         assert!(text(&h, &crate::paths::manifest_prev_file(&paths)).is_none());
     }
 
@@ -1132,6 +1179,7 @@ mod tests {
                 paths: &paths,
                 keys: &BTreeMap::new(),
                 installed_versions: &installed,
+                facts: &crate::reconcile::Facts::probe(&h).unwrap(),
             },
             &h,
         )

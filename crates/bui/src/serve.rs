@@ -99,6 +99,7 @@ pub fn reconcile_once(
             paths: input.paths,
             keys: input.keys,
             installed_versions: &installed,
+            facts: &ctx.facts,
         },
         host,
     )?;
@@ -133,7 +134,7 @@ pub fn reconcile_once(
     {
         let specs: Vec<String> = crate::modules::system::firewall_ports(
             &input.state.node.ports,
-            bui_schema::slots::slot_span(&input.state.residential),
+            input.state.system.hy2_resi_compat_ports,
         )
         .iter()
         .map(|p| p.ufw())
@@ -811,6 +812,161 @@ mod tests {
             "只允许剩下只读探测与校验落地：{:?}",
             host.ops()
         );
+    }
+
+    /// T8 的机器化验收（4.1）：一台从 4.0 升上来的假机器跑一轮对账之后 ——
+    /// ① 槽 1..7 的住宅实例被停用、禁用、单元文件删掉；② `nft -f` 发了**一次**；
+    /// ③ `hysteria-residential` 的单元正文换成 sing-box；④ 第二轮零变更。
+    ///
+    /// ④ 要成立，假机器必须让 `nft list tables` 答得出 `table inet bui`：规则集哈希相同
+    /// **且**表在才算已落地（表被人刷掉时哈希看不出来，只能靠这份事实）。
+    #[test]
+    fn a_host_upgraded_from_four_zero_retires_the_slot_units_and_lands_the_nft_table() {
+        let host = ready_host();
+        host.with(|i| {
+            i.which.insert("nft".into());
+            i.scripted.push((
+                "nft list tables".into(),
+                CmdOut::success("table inet bui\n"),
+            ));
+            // 4.0 的槽 1 还在跑、配置与单元文件都在盘上
+            i.units_active
+                .insert("hysteria-residential-1.service".into());
+            i.units_enabled
+                .insert("hysteria-residential-1.service".into());
+            i.files.insert(
+                "/etc/systemd/system/hysteria-residential-1.service".into(),
+                (
+                    b"[Service]\nExecStart=/opt/b-ui/bin/hysteria server\n".to_vec(),
+                    0o644,
+                ),
+            );
+            i.files.insert(
+                "/opt/b-ui/config-residential-1.yaml".into(),
+                (b"listen: :40001,45500-50000\n".to_vec(), 0o600),
+            );
+            i.files.insert(
+                "/opt/b-ui/config-residential.yaml".into(),
+                (b"listen: :40000,41000-45499\n".to_vec(), 0o600),
+            );
+        });
+        let state = crate::testutil::sample_state();
+        let paths = bui_schema::paths::Paths::default_server();
+        let reg = modules(None);
+        let (first, keys) = reconcile_once(
+            input(
+                &state,
+                &reg.modules,
+                &paths,
+                &BTreeMap::new(),
+                &NoopInstaller,
+            ),
+            host.as_ref(),
+        )
+        .unwrap();
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+        assert!(
+            first.verify_failures.is_empty(),
+            "{:?}",
+            first.verify_failures
+        );
+        let ops = host.ops();
+        // ①
+        for op in [
+            "systemd:stop:hysteria-residential-1.service",
+            "systemd:disable:hysteria-residential-1.service",
+            "remove:/etc/systemd/system/hysteria-residential-1.service",
+            "remove:/opt/b-ui/config-residential-1.yaml",
+            "remove:/opt/b-ui/config-residential.yaml",
+        ] {
+            assert!(ops.iter().any(|o| o == op), "缺 {op}：{ops:?}");
+        }
+        // ②
+        assert_eq!(
+            ops.iter().filter(|o| o.as_str() == "run:nft -f -").count(),
+            1,
+            "{ops:?}"
+        );
+        assert_eq!(
+            host.stdins()
+                .iter()
+                .filter(|(cmd, _)| cmd == "nft -f -")
+                .map(|(_, body)| body.clone())
+                .collect::<Vec<_>>(),
+            vec![bui_schema::render::nft::ruleset(&state.node.ports, true)],
+            "喂进去的必须是 bui-schema 渲染的那一份"
+        );
+        assert_eq!(
+            keys.get("nft:inet:bui").map(String::as_str),
+            Some(crate::reconcile::diff::ruleset_key(
+                &bui_schema::render::nft::ruleset(&state.node.ports, true)
+            ))
+            .as_deref(),
+            "{keys:?}"
+        );
+        // ③
+        assert_eq!(
+            host.text("/etc/systemd/system/hysteria-residential.service")
+                .map(|t| t.contains("sing-box run -c /opt/b-ui/hy2-residential.json")),
+            Some(true)
+        );
+        assert!(host.text("/opt/b-ui/hy2-residential.json").is_some());
+        // ④
+        host.clear_ops();
+        let (second, _) = reconcile_once(
+            input(&state, &reg.modules, &paths, &keys, &NoopInstaller),
+            host.as_ref(),
+        )
+        .unwrap();
+        assert!(
+            second.is_clean(),
+            "二次对账必须零变更（M1 验收项）：{second:?}"
+        );
+        assert!(
+            second.drift.is_empty(),
+            "二次对账也不能报漂移：{:?}",
+            second.drift
+        );
+        assert!(
+            !host.ops().iter().any(|o| o == "run:nft -f -"),
+            "表在且哈希相同就不该重放：{:?}",
+            host.ops()
+        );
+    }
+
+    /// 没有 `nft` 的机器：**不算 apply 失败**（装包不是对账能决定的），但每轮都留一条按
+    /// 真实量级写的提示，而且二次对账仍然零变更（notes 不进 `changed`，与「没有防火墙」同款）。
+    #[test]
+    fn a_host_without_nft_still_reconciles_clean_but_keeps_warning() {
+        let host = ready_host();
+        let state = crate::testutil::sample_state();
+        let paths = bui_schema::paths::Paths::default_server();
+        let reg = modules(None);
+        let (first, keys) = reconcile_once(
+            input(
+                &state,
+                &reg.modules,
+                &paths,
+                &BTreeMap::new(),
+                &NoopInstaller,
+            ),
+            host.as_ref(),
+        )
+        .unwrap();
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+        assert!(
+            first.notes.iter().any(|n| n.contains("现役订阅")),
+            "{:?}",
+            first.notes
+        );
+        assert!(!keys.contains_key("nft:inet:bui"), "没落地就不许记账");
+        let (second, _) = reconcile_once(
+            input(&state, &reg.modules, &paths, &keys, &NoopInstaller),
+            host.as_ref(),
+        )
+        .unwrap();
+        assert!(second.is_clean(), "{second:?}");
+        assert!(second.notes.iter().any(|n| n.contains("现役订阅")));
     }
 
     #[test]

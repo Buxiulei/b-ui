@@ -119,6 +119,11 @@ pub enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// nft 端口跳跃表（`inet bui`）：幂等重放 / 查看命中 / 删除
+    Nft {
+        #[command(subcommand)]
+        cmd: NftCmd,
+    },
     /// 住宅出口（上游池 / 体检 / 切换 / 黑名单）
     Residential {
         #[command(subcommand)]
@@ -135,11 +140,23 @@ pub enum Command {
     HardenSsh,
 }
 
+/// `bui nft` 的子命令（4.1，spec §2.4）。
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum NftCmd {
+    /// 幂等重放 `inet bui`（住宅单元的 `ExecStartPre=-` 与运维手动都走它）
+    Apply,
+    /// 表在不在、四条规则的瞬时流计数
+    Status,
+    /// 删表（回滚用；表不存在只记一行，不算失败）
+    Delete,
+}
+
 /// `bui set` 的子命令。
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum SetCmd {
     /// Hysteria2 鉴权方式：`http`（默认，守护进程进程内应答）/ `command`（退路，每条连接 fork 钩子）。
-    /// 改完会重渲染两份 hysteria 配置并各重启一次实例。
+    /// **只作用于直连**（4.1：住宅换成 sing-box 的静态凭据池 + 门，配置里没有 `auth` 段）：
+    /// 改完只重渲染 `config.yaml`、只重启 `hysteria-server`。
     Hy2Auth {
         #[arg(value_parser = ["http", "command"])]
         mode: String,
@@ -174,6 +191,24 @@ mod tests {
     use super::*;
     use clap::Parser;
     use pretty_assertions::assert_eq;
+
+    /// 4.1：`bui nft apply|status|delete`（住宅单元的 `ExecStartPre=-` 走 apply）。
+    #[test]
+    fn parses_the_three_nft_subcommands() {
+        for (arg, want) in [
+            ("apply", NftCmd::Apply),
+            ("status", NftCmd::Status),
+            ("delete", NftCmd::Delete),
+        ] {
+            assert_eq!(
+                Cli::try_parse_from(["bui", "nft", arg]).unwrap().command,
+                Some(Command::Nft { cmd: want })
+            );
+        }
+        // 没有子命令、或不认的子命令都得拒
+        assert!(Cli::try_parse_from(["bui", "nft"]).is_err());
+        assert!(Cli::try_parse_from(["bui", "nft", "flush"]).is_err());
+    }
 
     #[test]
     fn parses_install_with_bare_import_flag() {

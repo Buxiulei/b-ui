@@ -63,13 +63,11 @@ pub fn scan(host: &dyn Host, artifacts: &[Artifact], paths: &Paths) -> Vec<Drift
     let mut out = Vec::new();
     let managed_paths = artifact_paths(artifacts);
 
-    // 1) 受管单元下的陌生 drop-in。**按「所有可能的槽」枚举而不是按期望态**：
-    // 某个槽此刻不存在，它留下的 drop-in 照样是我们该报出来的东西。
-    let units: Vec<String> = MANAGED_UNITS
-        .iter()
-        .map(|u| u.to_string())
-        .chain((1..super::MAX_RESI_SLOTS).map(super::resi_unit))
-        .collect();
+    // 1) 受管单元下的陌生 drop-in。4.1 起住宅只有一个实例，所以这就是那六个受管单元；
+    // `hysteria-residential-<i>.service.d/` 里的残留不在这里报 —— 那七个单元进了
+    // `LEGACY_UNITS`，由规则 2 报出单元文件本身、`clean` 停用并删掉**那个文件**；
+    // `.service.d/` 目录本身既不报也不删（没有主单元文件的 drop-in 目录在 systemd 里是惰性的）。
+    let units: Vec<String> = MANAGED_UNITS.iter().map(|u| u.to_string()).collect();
     for unit in &units {
         let dir = PathBuf::from(SYSTEMD_DIR).join(format!("{unit}.service.d"));
         for entry in host.list_dir(&dir).unwrap_or_default() {

@@ -301,6 +301,65 @@ pub fn apply(input: ApplyInput<'_>, host: &dyn Host) -> ApplyOutcome {
         }
     }
 
+    // ---- 第 7.5 步：nft 表（4.1 的住宅 HY2 端口跳跃）。
+    // 排在二进制之后、单元状态（第 9 步停旧槽实例）与删除项（第 11 步删
+    // `config-residential-<i>.yaml`）之前，所以「先清旧槽实例的孤儿 NAT 规则、再落自己这张表」
+    // 天然成立（裁决 2026-09-16）。
+    // 4.0 每槽一个 apernet 实例留下的 `4xxxx→:4000i` 与本表同挂 nat priority -100，
+    // 先注册者先做 NAT ⇒ 那一片跳跃端口会被送到已经没人监听的端口。4.1 之后没有任何
+    // 别的路径再清它们（住宅 prestart 换成 `bui nft apply`），所以在这里清一次。
+    // **无条件跑**，不挂在 `Change::ApplyNftTable` 上：4.1 落过表 → `--rollback` 回 4.0
+    // （不删表）→ 再升 4.1 时哈希与表都没变 ⇒ 不产变更，挂在变更上就一次清理都不跑，
+    // 被 SIGKILL 的 4.0 槽实例的孤儿规则会带进 4.1。配置不在盘上时它是 no-op，
+    // 所以对「二次对账零变更」没有影响。
+    out.notes
+        .extend(crate::modules::portjump::cleanup_legacy_residential(
+            host, paths,
+        ));
+    for c in &changes {
+        let Change::ApplyNftTable {
+            family,
+            name,
+            ruleset,
+            key,
+        } = c
+        else {
+            continue;
+        };
+        if !host.which("nft") {
+            // **不算 apply 失败**（机器上装不装包不是对账能决定的），但要按真实量级报：
+            // 带 `mport` 的客户端只往跳跃段发、从不发 `:40000`，所以缺 nft 等于住宅 HY2
+            // 对全体现役订阅**全断**，不是「只是跳跃失效」。装机与升级的硬闸门在
+            // `env_probe::nft_blocking`；这里是活机器上被人卸了包的兜底提示。
+            out.notes.push(format!(
+                "PATH 上没有 nft，{family} {name} 表无法落地：住宅 HY2 的端口跳跃整段不通，\
+                 带 mport 的现役订阅全部连不上（客户端只往跳跃段发，从不发单端口）。\
+                 请安装 nftables 包后执行 `bui nft apply`"
+            ));
+            continue;
+        }
+        match host.run_stdin("nft", &["-f", "-"], ruleset) {
+            Ok(o) if o.ok() => {
+                out.changed.push(format!("nft table {family} {name}"));
+                out.keys.insert(format!("nft:{family}:{name}"), key.clone());
+            }
+            Ok(o) => out.errors.push(format!(
+                "nft -f 落地 {family} {name} 失败：{}",
+                trim_detail(
+                    if o.stderr.is_empty() {
+                        &o.stdout
+                    } else {
+                        &o.stderr
+                    }
+                    .trim()
+                )
+            )),
+            Err(e) => out
+                .errors
+                .push(format!("nft -f 落地 {family} {name} 无法执行：{e}")),
+        }
+    }
+
     // ---- 第 8 步：符号链接
     for c in &changes {
         let Change::WriteSymlink { path, target } = c else {
@@ -581,6 +640,7 @@ fn describe(c: &Change) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        Change::ApplyNftTable { family, name, .. } => format!("nft table {family} {name}"),
     }
 }
 
@@ -691,12 +751,15 @@ fn verify_candidate(
 /// 换了内核二进制要重启哪些单元。`bui upgrade --rollback` 把内核换回上一版后也用它。
 pub(crate) fn units_for_binary(name: &str) -> Vec<Unit> {
     match name {
-        "hysteria" => vec![
-            Unit::restart("hysteria-server"),
+        // 4.1 起住宅 HY2 跑的是 sing-box（`hy2-residential.json`），不再是 apernet hysteria：
+        // 换 `hysteria` 只影响直连，换 `sing-box` 同时影响中继与住宅。漏了住宅那一条就会让
+        // 升级 / `--rollback` 换完 sing-box 不重启住宅单元（它继续跑被原子替换掉的旧 inode）。
+        "hysteria" => vec![Unit::restart("hysteria-server")],
+        "xray" => vec![Unit::restart("xray")],
+        "sing-box" => vec![
+            Unit::restart("b-ui-relay"),
             Unit::restart("hysteria-residential"),
         ],
-        "xray" => vec![Unit::restart("xray")],
-        "sing-box" => vec![Unit::restart("b-ui-relay")],
         "caddy" => vec![Unit::restart("caddy")],
         _ => vec![],
     }
@@ -739,6 +802,7 @@ mod tests {
             ssh_unit: "sshd".into(),
             ssh_pubkeys: 1,
             systemd_resolved: false,
+            nft_tables: Default::default(),
         }
     }
 
@@ -754,6 +818,297 @@ mod tests {
             },
             host,
         )
+    }
+
+    /// 4.1：一个 `nft -f -` 事务把整份规则集喂进去（**不进 argv**），成功后才搬
+    /// `nft:inet:bui` 这条记账 —— 不搬就等于每轮都重放，搬早了等于表没落地还骗下一轮说落地了。
+    #[test]
+    fn the_nft_table_is_landed_in_one_transaction_and_only_then_records_its_key() {
+        let h = FakeHost::new();
+        h.with(|i| {
+            i.which.insert("nft".into());
+        });
+        let ruleset = "table inet bui\nflush table inet bui\ntable inet bui {}\n";
+        let mut keys = std::collections::BTreeMap::new();
+        keys.insert("nft:inet:bui".to_string(), "abc123".to_string());
+        let out = run(
+            Plan {
+                changes: vec![Change::ApplyNftTable {
+                    family: "inet".into(),
+                    name: "bui".into(),
+                    ruleset: ruleset.into(),
+                    key: "abc123".into(),
+                }],
+                keys,
+                unchanged: 0,
+            },
+            &h,
+            &NoopInstaller,
+        );
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(out.changed, vec!["nft table inet bui".to_string()]);
+        assert_eq!(
+            out.keys.get("nft:inet:bui").map(String::as_str),
+            Some("abc123")
+        );
+        assert_eq!(
+            h.stdins(),
+            vec![("nft -f -".to_string(), ruleset.to_string())],
+            "规则集经 stdin 喂进去，一个事务一次调用"
+        );
+        assert!(
+            h.ops()
+                .iter()
+                .filter(|o| o.starts_with("run:nft -f"))
+                .count()
+                == 1,
+            "{:?}",
+            h.ops()
+        );
+    }
+
+    /// `nft -f` 被内核拒掉（内核 < 5.2 的 `Chain of type "nat" is not supported`）⇒
+    /// 记 `errors`（体检 degraded）且**不搬** key：下一轮还要重放。
+    #[test]
+    fn a_rejected_nft_transaction_is_an_error_and_records_nothing() {
+        let h = FakeHost::new();
+        h.with(|i| {
+            i.which.insert("nft".into());
+            i.scripted.push((
+                "nft -f -".into(),
+                CmdOut::failure(1, "Error: Chain of type \"nat\" is not supported\n"),
+            ));
+        });
+        let mut keys = std::collections::BTreeMap::new();
+        keys.insert("nft:inet:bui".to_string(), "abc123".to_string());
+        let out = run(
+            Plan {
+                changes: vec![Change::ApplyNftTable {
+                    family: "inet".into(),
+                    name: "bui".into(),
+                    ruleset: "table inet bui\n".into(),
+                    key: "abc123".into(),
+                }],
+                keys,
+                unchanged: 0,
+            },
+            &h,
+            &NoopInstaller,
+        );
+        assert_eq!(out.changed, Vec::<String>::new());
+        assert!(out.keys.is_empty(), "{:?}", out.keys);
+        assert_eq!(out.errors.len(), 1, "{:?}", out.errors);
+        assert!(out.errors[0].contains("Chain of type"), "{:?}", out.errors);
+    }
+
+    /// 缺 `nft`：**不算 apply 失败**（装包不是对账能决定的），但提示必须报出真实量级 ——
+    /// 带 `mport` 的客户端只往跳跃段发、从不发单端口，所以这不是「跳跃失效」而是住宅 HY2
+    /// 对全体现役订阅全断。key 同样不搬。
+    #[test]
+    fn a_host_without_nft_gets_a_note_sized_to_the_real_blast_radius() {
+        let h = FakeHost::new();
+        let out = run(
+            Plan {
+                changes: vec![Change::ApplyNftTable {
+                    family: "inet".into(),
+                    name: "bui".into(),
+                    ruleset: "table inet bui\n".into(),
+                    key: "abc123".into(),
+                }],
+                keys: Default::default(),
+                unchanged: 0,
+            },
+            &h,
+            &NoopInstaller,
+        );
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(out.changed, Vec::<String>::new());
+        assert!(out.keys.is_empty());
+        assert_eq!(out.notes.len(), 1, "{:?}", out.notes);
+        assert!(out.notes[0].contains("现役订阅"), "{:?}", out.notes);
+        assert!(out.notes[0].contains("nftables"), "{:?}", out.notes);
+        assert!(
+            !h.ops().iter().any(|o| o.starts_with("run:nft")),
+            "{:?}",
+            h.ops()
+        );
+    }
+
+    /// 槽 1 的 4.0 实例（base 40001、跳跃切片 45500-50000）被 SIGKILL 之后留下的孤儿：
+    /// 一条完整链 + PREROUTING 上的跳转（形态照 `portjump` 的真机实录夹具）。
+    const OLD_SLOT_DUMP: &str = "\
+-P PREROUTING ACCEPT
+-N HYSTERIA-PR-7c1e0f2a
+-A PREROUTING -p udp -m udp --dport 45500:50000 -j HYSTERIA-PR-7c1e0f2a
+-A HYSTERIA-PR-7c1e0f2a -p udp -j REDIRECT --to-ports 40001
+";
+
+    /// 裁决 2026-09-16（相邻缺口）：落自己这张表**之前**，先把 4.0 每槽实例留下的孤儿
+    /// NAT 规则清掉 —— 它们与 `inet bui` 同挂 nat priority -100，先注册者先做 NAT，
+    /// 残留就会把一片跳跃端口送到已经没人监听的 `:4000i`。
+    #[test]
+    fn the_orphan_rules_of_the_old_slot_instances_are_cleaned_before_the_table_lands() {
+        let h = FakeHost::new();
+        h.with(|i| {
+            i.which.insert("nft".into());
+            i.which.insert("iptables".into());
+            // 槽 1 的 4.0 配置还在盘上（本轮第 11 步才删），它的孤儿链也还在
+            i.files.insert(
+                "/opt/b-ui/config-residential-1.yaml".into(),
+                (b"listen: :40001,45500-50000\n".to_vec(), 0o600),
+            );
+            i.scripted
+                .push(("iptables -t nat -S".into(), CmdOut::success(OLD_SLOT_DUMP)));
+            i.scripted.push((
+                "nft list tables".into(),
+                CmdOut::success("table inet bui\n"),
+            ));
+        });
+        let out = run(
+            Plan {
+                changes: vec![Change::ApplyNftTable {
+                    family: "inet".into(),
+                    name: "bui".into(),
+                    ruleset: "table inet bui\n".into(),
+                    key: "abc123".into(),
+                }],
+                keys: Default::default(),
+                unchanged: 0,
+            },
+            &h,
+            &NoopInstaller,
+        );
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        let ops = h.ops();
+        let x = ops
+            .iter()
+            .position(|o| o == "run:iptables -t nat -X HYSTERIA-PR-7c1e0f2a")
+            .unwrap_or_else(|| panic!("没清掉槽 1 的孤儿链：{ops:?}"));
+        let land = ops
+            .iter()
+            .position(|o| o == "run:nft -f -")
+            .unwrap_or_else(|| panic!("没落地 nft 表：{ops:?}"));
+        assert!(x < land, "清理必须发生在 nft -f 之前：{ops:?}");
+        assert!(
+            out.notes
+                .iter()
+                .any(|n| n.contains("config-residential-1.yaml")
+                    && n.contains("HYSTERIA-PR-7c1e0f2a")),
+            "清理要留一行可追溯的说明：{:?}",
+            out.notes
+        );
+        // 盘上没有的那些配置一个命令都不发（上一轮已经清过 ⇒ 二次对账零多余动作）
+        assert!(
+            !ops.iter().any(|o| o.contains("HYSTERIA-PR-1111aaaa")),
+            "{ops:?}"
+        );
+    }
+
+    /// 槽 0 的 4.0 实例（`config-residential.yaml`，base 40000 + 整段 41000-50000，
+    /// 单槽机器唯一有的那份）被 SIGKILL 之后留下的孤儿。
+    const SLOT0_DUMP: &str = "\
+-P PREROUTING ACCEPT
+-N HYSTERIA-PR-5e0b13c4
+-A PREROUTING -p udp -m udp --dport 41000:50000 -j HYSTERIA-PR-5e0b13c4
+-A OUTPUT -p udp -m udp --dport 41000:50000 -j HYSTERIA-PR-5e0b13c4
+-A HYSTERIA-PR-5e0b13c4 -p udp -j REDIRECT --to-ports 40000
+";
+
+    /// 清理**不许**挂在 `Change::ApplyNftTable` 上：4.1 落过表 → `bui upgrade --rollback`
+    /// 回 4.0（不删表）→ 再升 4.1 时哈希与表都没变 ⇒ 本轮零 nft 变更；挂在变更上就
+    /// 一次清理都不跑，被 SIGKILL 的 4.0 槽实例的孤儿规则会带进 4.1。
+    #[test]
+    fn the_legacy_slot_cleanup_runs_even_when_the_table_needs_no_change() {
+        let h = FakeHost::new();
+        h.with(|i| {
+            i.which.insert("nft".into());
+            i.which.insert("iptables".into());
+            i.files.insert(
+                "/opt/b-ui/config-residential.yaml".into(),
+                (b"listen: :40000,41000-50000\n".to_vec(), 0o600),
+            );
+            i.scripted
+                .push(("iptables -t nat -S".into(), CmdOut::success(SLOT0_DUMP)));
+        });
+        // 一条变更都没有的计划（= 表在、哈希没变的那一轮）
+        let out = run(
+            Plan {
+                changes: vec![],
+                keys: Default::default(),
+                unchanged: 12,
+            },
+            &h,
+            &NoopInstaller,
+        );
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        let ops = h.ops();
+        assert!(
+            ops.iter()
+                .any(|o| o == "run:iptables -t nat -X HYSTERIA-PR-5e0b13c4"),
+            "零 nft 变更的那一轮也必须清槽 0 的孤儿链：{ops:?}"
+        );
+        assert!(
+            out.notes.iter().any(
+                |n| n.contains("config-residential.yaml") && n.contains("HYSTERIA-PR-5e0b13c4")
+            ),
+            "清理要留一行可追溯的说明：{:?}",
+            out.notes
+        );
+        assert!(out.changed.is_empty(), "清理不产变更：{:?}", out.changed);
+    }
+
+    /// 4.1 起住宅 HY2 跑的是 sing-box：换 `sing-box` 必须连住宅单元一起重启，
+    /// 换 `hysteria` 只影响直连。漏了住宅那一条 = `bui upgrade` 与 `--rollback` 换完
+    /// sing-box 不重启它，住宅数据面永远停在换之前那一版内核（`bui status` 却报已升级）。
+    #[test]
+    fn swapping_singbox_restarts_both_the_relay_and_the_residential_unit() {
+        assert_eq!(
+            units_for_binary("sing-box"),
+            vec![
+                Unit::restart("b-ui-relay"),
+                Unit::restart("hysteria-residential"),
+            ]
+        );
+        assert_eq!(
+            units_for_binary("hysteria"),
+            vec![Unit::restart("hysteria-server")],
+            "住宅已不用 apernet，换它不该白断一次住宅的在线连接"
+        );
+        assert_eq!(units_for_binary("xray"), vec![Unit::restart("xray")]);
+        assert_eq!(units_for_binary("caddy"), vec![Unit::restart("caddy")]);
+        assert!(units_for_binary("bui").is_empty());
+    }
+
+    /// 同一映射的端到端形态：一轮对账里换了 sing-box，住宅单元要真的被重启。
+    #[test]
+    fn installing_singbox_restarts_the_residential_unit_in_the_same_round() {
+        let h = FakeHost::new();
+        let out = run(
+            Plan {
+                changes: vec![Change::InstallBinary {
+                    name: "sing-box".into(),
+                    version: "1.14.0".into(),
+                    sha256: "aa".into(),
+                    url: "https://example.com/sing-box".into(),
+                    path: "/opt/b-ui/bin/sing-box".into(),
+                }],
+                keys: Default::default(),
+                unchanged: 0,
+            },
+            &h,
+            &NoopInstaller,
+        );
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        let ops = h.ops();
+        assert!(
+            ops.iter()
+                .any(|o| o == "systemd:restart:hysteria-residential"),
+            "{ops:?}"
+        );
+        assert!(
+            ops.iter().any(|o| o == "systemd:restart:b-ui-relay"),
+            "{ops:?}"
+        );
     }
 
     #[test]

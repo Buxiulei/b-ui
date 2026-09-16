@@ -37,7 +37,7 @@ pub async fn run_hy2_auth_with(
         if !(200..300).contains(&status) {
             anyhow::bail!("守护进程拒绝了这次修改（HTTP {status}）：{body}");
         }
-        println!("Hysteria2 鉴权已切到 {mode}；对账会重渲染两份配置并各重启一次实例。");
+        println!("Hysteria2 鉴权已切到 {mode}；对账会重渲染 config.yaml 并重启 hysteria-server（4.1 起只作用于直连）。");
         return Ok(());
     }
     let store = Store::open(crate::paths::state_file(&paths)).await?;

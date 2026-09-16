@@ -41,6 +41,7 @@ pub async fn run_with(store: Store, paths: Paths, host: Arc<dyn Host>) -> Result
                 paths: &paths,
                 keys: &keys,
                 installed_versions: &versions,
+                facts: &ctx.facts,
             },
             h.as_ref(),
         )?;
