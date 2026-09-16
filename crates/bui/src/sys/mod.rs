@@ -55,6 +55,13 @@ pub enum Proto {
 /// 所有碰真实系统的操作都走这里；同步接口，对账在 `spawn_blocking` 里跑。
 pub trait Host: Send + Sync {
     fn read_file(&self, path: &Path) -> Result<Option<Vec<u8>>>;
+    /// `path` 的 sha256（小写十六进制）；文件不存在 → `None`。**流式**算，不把文件读进内存。
+    ///
+    /// 二进制身份比对（`kernels::kernel_build_differs` / `bui_build_differs`、客户端包缓存）
+    /// 一律走这一条而不是 `read_file`：四个 stripped 内核合计约 190 MB、单个最大约 81 MB
+    /// （sing-box，自建更大），而 `b-ui.service` 的 `MemoryMax=200M` 是**硬上限**、稳态对账
+    /// 600 秒一轮 —— 用 `read_file` 算 sha 就是每 10 分钟复现一次的 OOM/重启循环面。
+    fn file_sha256(&self, path: &Path) -> Result<Option<String>>;
     fn write_file(&self, path: &Path, content: &[u8], mode: u32) -> Result<()>;
     fn remove_file(&self, path: &Path) -> Result<()>;
     /// **只返回直接子项**（文件与目录都返回，绝对路径，按路径名升序）；目录不存在 → `Ok(vec![])`，不是错误。

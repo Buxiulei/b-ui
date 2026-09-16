@@ -102,7 +102,9 @@ pub fn refuse_downgrade(
 ///
 /// `bui` 自己的判据不止版本号：版本相同但 manifest 里 `bui-linux-<arch>` 的 sha256 与盘上
 /// `bin/bui` 的不同（rc 通道的同版本重建）也要换，详见
-/// [`crate::kernels::bui_build_differs`]。四个内核维持只按版本比对。
+/// [`crate::kernels::bui_build_differs`]。四个内核同一判法
+/// （[`crate::kernels::kernel_build_differs`]）：自建 sing-box 与官方归档同版本号，
+/// 只比版本号的话它永远装不上去。
 ///
 /// 顺带消费总纲 C4 的可选字段 `min_upgrade_from`：当前版本低于它就直接报错，
 /// 提示先升到那个中间版本（消费方规则在 P1，不在 P5）。
@@ -128,12 +130,15 @@ pub fn plan_upgrade(
         .then(|| m.version.clone());
     let mut kernels = Vec::new();
     for name in crate::kernels::KERNELS {
-        // manifest 的 kernels 表用下划线键（sing_box），装在盘上的二进制名用连字符
-        if let Some(want) = m.kernels.get(&crate::kernels::kernels_key(name)) {
+        // `kernel_asset` 同时给出 `kernels` 表里的版本（键是下划线的 `sing_box`）与本架构的
+        // `artifacts` 条目；缺哪一样都没法装，跳过（对账侧同样只 warn 跳过）。
+        let Ok((want, asset)) = m.kernel_asset(name, arch) else {
+            continue;
+        };
+        if crate::kernels::kernel_build_differs(host, bin_dir, installed, name, want, &asset.sha256)
+        {
             let from = installed.get(name).cloned().unwrap_or_default();
-            if &from != want {
-                kernels.push((name.to_string(), from, want.clone()));
-            }
+            kernels.push((name.to_string(), from, want.to_string()));
         }
     }
     Ok(UpgradePlan {
@@ -247,8 +252,8 @@ pub fn rollback(host: &dyn Host, paths: &Paths) -> anyhow::Result<Vec<String>> {
                 host.write_file(&paths.bin_dir.join(name), &bytes, 0o755)?;
                 done.push(format!("已恢复上一版 {name}（{}）", prev.display()));
                 // 盘上换回旧字节 ≠ 回滚生效：单元还在内存里跑新版二进制，而恢复后的 manifest
-                // 与盘上版本一致 ⇒ 对账零变更 ⇒ apply 第 7 步（只在 InstallBinary 成功时才收单元）
-                // 不会替我们重启。所以这里自己重启；跳过的内核不碰它的单元。
+                // 与盘上的版本、sha 都一致 ⇒ 对账零变更 ⇒ apply 第 0 步（只在 InstallBinary
+                // 成功时才收单元）不会替我们重启。所以这里自己重启；跳过的内核不碰它的单元。
                 for unit in crate::reconcile::apply::units_for_binary(name) {
                     let _ = host.systemd("restart", &unit.name);
                     done.push(format!("已重启 {}", unit.name));
@@ -406,6 +411,12 @@ pub fn format_plan(p: &UpgradePlan) -> String {
         None => out.push(format!("bui          {}（已最新）", p.self_from)),
     }
     for (name, from, to) in &p.kernels {
+        // 内核也有「同版本的另一份构建」：自建 sing-box 与官方归档打同一个版本号，判据是
+        // 资产 sha256（`kernel_build_differs`）。不特判就会打印「1.14.1 → 1.14.1」。
+        if from == to {
+            out.push(format!("{name:<12} {to}（同版本的新构建）"));
+            continue;
+        }
         let from = if from.is_empty() {
             "（未装）"
         } else {
@@ -631,6 +642,10 @@ mod tests {
         let m = manifest("4.0.0", "1.13.19", &crate::kernels::sha256_hex(b"BUI"));
         let installed = BTreeMap::from([("sing-box".to_string(), "1.13.19".to_string())]);
         let h = host_with_bui(b"BUI");
+        // 内核同一判法：版本相同还要 sha 相同才算「已最新」。本 fixture 里 bui 与 sing-box
+        // 两个资产共用一个 sum，所以盘上那份 sing-box 的字节也写成同一份。
+        h.write_file(&Path::new(BIN).join("sing-box"), b"BUI", 0o755)
+            .unwrap();
         let p = plan_upgrade(&h, Path::new(BIN), &m, "4.0.0", &installed, "x86_64").unwrap();
         assert_eq!(
             p,
@@ -639,6 +654,37 @@ mod tests {
                 self_to: None,
                 kernels: vec![]
             }
+        );
+    }
+
+    /// 发布阻断级回归（2026-09-16）：自建 sing-box 与官方归档同版本号，`bui upgrade` 只比
+    /// 版本号就会打印「sing-box 1.14.1（已最新）」而永远不换那份二进制。
+    #[test]
+    fn plan_lists_a_kernel_whose_version_matches_but_whose_asset_sha_differs() {
+        // 本 fixture 里 bui 与 sing-box 两个资产共用一个 sum，所以盘上那份 bui 的字节也写成
+        // 同一份（本用例要说的只是内核那一半）
+        let ours = b"SB-ours";
+        let m = manifest("4.0.0", "1.14.1", &crate::kernels::sha256_hex(ours));
+        let installed = BTreeMap::from([("sing-box".to_string(), "1.14.1".to_string())]);
+        let h = host_with_bui(ours);
+        // 盘上是官方那一份：版本号相同、字节不同
+        h.write_file(&Path::new(BIN).join("sing-box"), b"SB-official", 0o755)
+            .unwrap();
+        let p = plan_upgrade(&h, Path::new(BIN), &m, "4.0.0", &installed, "x86_64").unwrap();
+        assert_eq!(p.self_to, None, "bui 自己没变");
+        assert_eq!(
+            p.kernels,
+            vec![(
+                "sing-box".to_string(),
+                "1.14.1".to_string(),
+                "1.14.1".to_string()
+            )],
+            "同版本异 sha 也要列进升级计划"
+        );
+        assert!(
+            format_plan(&p).contains("sing-box     1.14.1（同版本的新构建）"),
+            "别打印「1.14.1 → 1.14.1」：{}",
+            format_plan(&p)
         );
     }
 
@@ -829,21 +875,36 @@ mod tests {
     /// 升级演练用的 manifest 缓存（总纲 C4 形状；只放 amd64 资产）。
     ///
     /// `bui_body` 是这份 manifest 所指的 bui 二进制内容（资产 sha256 由它算出）：传盘上现有那
-    /// 一份就是「bui 已最新」，传别的就是「同版本的新构建」。
+    /// 一份就是「bui 已最新」，传别的就是「同版本的新构建」。四个内核的资产 sha256 同样从
+    /// [`kernel_body`] 算——内核判据是「版本 + sha256」，写死的假 sha 会让每个内核恒判「要装」。
     fn manifest_json(bui: &str, kernels: [&str; 4], bui_body: &str) -> String {
         let [hy, xray, sb, caddy] = kernels;
         let bui_sum = crate::kernels::sha256_hex(bui_body.as_bytes());
+        let sum = |name: &str, v: &str| crate::kernels::sha256_hex(kernel_body(name, v).as_bytes());
+        let (hy_sum, xray_sum) = (sum("hysteria", hy), sum("xray", xray));
+        let (sb_sum, caddy_sum) = (sum("sing-box", sb), sum("caddy", caddy));
         format!(
             r#"{{"version":"{bui}",
   "kernels":{{"hysteria":"{hy}","xray":"{xray}","sing_box":"{sb}","caddy":"{caddy}"}},
   "artifacts":{{
     "bui-linux-amd64":      {{"url":"https://x/bui","sha256":"{bui_sum}"}},
-    "hysteria-linux-amd64": {{"url":"https://x/hy","sha256":"01"}},
-    "xray-linux-amd64":     {{"url":"https://x/xray","sha256":"02"}},
-    "sing-box-linux-amd64": {{"url":"https://x/sb","sha256":"03"}},
-    "caddy-linux-amd64":    {{"url":"https://x/caddy","sha256":"04"}}
+    "hysteria-linux-amd64": {{"url":"https://x/hy","sha256":"{hy_sum}"}},
+    "xray-linux-amd64":     {{"url":"https://x/xray","sha256":"{xray_sum}"}},
+    "sing-box-linux-amd64": {{"url":"https://x/sb","sha256":"{sb_sum}"}},
+    "caddy-linux-amd64":    {{"url":"https://x/caddy","sha256":"{caddy_sum}"}}
   }}}}"#
         )
+    }
+
+    /// 「`bin/<name>` 装的是这一版」时它的字节（内容当版本指纹用）：`OLD_BINS` / `NEW_BINS`
+    /// 与 [`manifest_json`] 的资产 sha256 都按这一份口径生成，两边才对得上。
+    fn kernel_body(name: &str, v: &str) -> String {
+        match name {
+            "hysteria" => format!("HY-{v}"),
+            "xray" => format!("XRAY-{v}"),
+            "sing-box" => format!("SB-{v}"),
+            _ => format!("CADDY-{v}"),
+        }
     }
 
     const OLD_KERNELS: [&str; 4] = ["2.12.2", "26.3.27", "1.13.19", "2.10.2"];
@@ -986,8 +1047,12 @@ mod tests {
 
     /// 回归（2026-09-12 bwg-rick）：rc 通道下 `v4.0.0-rc1` / `rc2` / 正式版的 Cargo 版本号都是
     /// 同一个 `4.0.0`，光比版本号 ⇒ 同版本重建永远升不上去。同版本但 manifest 里 bui 资产的
-    /// sha256 与盘上 `bin/bui` 不同时必须照常走完整流程（快照 → 新缓存 → 换二进制），
-    /// 而四个内核仍旧只按版本比对。
+    /// sha256 与盘上 `bin/bui` 不同时必须照常走完整流程（快照 → 新缓存 → 换二进制）。
+    ///
+    /// 四个内核是**同一判法**（`kernel_build_differs`：版本不同、或盘上 sha 与 manifest 不符
+    /// 即重装），这一轮它们不动是因为两项判据都不成立——版本没变，盘上字节又正是 manifest
+    /// 那一份。别把它读成「内核只按版本比对」：那正是 2026-09-16 P-A 修掉的发布阻断级缺陷
+    /// （自建 sing-box 与官方归档同版本号，只比版本号就永远装不上去）。
     #[test]
     fn a_same_version_rebuild_still_upgrades_bui_but_leaves_the_kernels_alone() {
         let d = tempfile::tempdir().unwrap();
@@ -998,7 +1063,11 @@ mod tests {
             serde_json::from_str(&manifest_json("4.0.0", OLD_KERNELS, "BUI-4.0.0-rc2")).unwrap();
         let (plan, asset) = prepare(&h, &paths, &m, "4.0.0", "x86_64").unwrap();
         assert_eq!(plan.self_to.as_deref(), Some("4.0.0"), "同版本新构建也要升");
-        assert_eq!(plan.kernels, vec![], "内核维持按版本比对：版本没变就不动");
+        assert_eq!(
+            plan.kernels,
+            vec![],
+            "内核同一判法：版本没变、盘上 sha 又与 manifest 一致 ⇒ 这一轮确实不动"
+        );
         assert!(
             format_plan(&plan).contains("同版本"),
             "计划文本要说清这是同版本重建：{}",
@@ -1132,7 +1201,7 @@ mod tests {
         );
         assert!(h.ops().contains(&"systemd:restart:b-ui".to_string()));
         // 光把字节写回盘上不算回滚：五个内核单元还在内存里跑新版二进制，而恢复后的
-        // manifest 与盘上版本一致 ⇒ 对账零变更 ⇒ apply 第 7 步不会替我们重启任何一个。
+        // manifest 与盘上版本一致 ⇒ 对账零变更 ⇒ apply 第 0 步不会替我们重启任何一个。
         for unit in [
             "hysteria-server",
             "hysteria-residential",

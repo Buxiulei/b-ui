@@ -36,6 +36,10 @@ pub struct FakeInner {
     pub scripted: Vec<(String, CmdOut)>,
     /// 令某单元的 systemd 动作失败（测回滚）
     pub fail_units: BTreeSet<String>,
+    /// 令某个路径的 `write_file` 失败（盘满 / 只读挂载 / 目录建不出来）：真实机器上写盘是会
+    /// 失败的，而对账把「带 restart 的 WriteFile 写失败」也算作搁置该单元的理由
+    /// （`reconcile::apply` 第 1 步），不给假机器造出写失败就没法钉住那一半。
+    pub fail_writes: BTreeSet<PathBuf>,
     /// 令某单元**永远不 active**：`systemctl start/restart` 照样退 0，单元却起不来
     /// （203/EXEC、start-limit-hit 的真实形态）。裸名与全名两种键各查一次。
     pub never_active: BTreeSet<String>,
@@ -52,6 +56,9 @@ pub struct FakeInner {
     pub unit_prop_reads: Vec<(String, String)>,
     /// `run_stdin` 的载荷流水（命令行, stdin）：`nft -f -` 喂进去的规则集按它断言。
     pub stdins: Vec<(String, String)>,
+    /// `file_sha256` 的查询流水：纯查询不进 `ops`，「二进制身份是流式算的、没被整文件读进
+    /// 内存」这类断言靠它证明（`b-ui.service` 的 `MemoryMax=200M` 是硬上限）。
+    pub sha_reads: Vec<PathBuf>,
     /// 操作流水（顺序可断言）
     pub ops: Vec<String>,
 }
@@ -75,6 +82,7 @@ impl Default for FakeInner {
             modules: BTreeSet::new(),
             scripted: Vec::new(),
             fail_units: BTreeSet::new(),
+            fail_writes: BTreeSet::new(),
             never_active: BTreeSet::new(),
             listening: BTreeMap::new(),
             mem_mb: 2048,
@@ -84,6 +92,7 @@ impl Default for FakeInner {
             journal: std::collections::VecDeque::new(),
             unit_prop_reads: Vec::new(),
             stdins: Vec::new(),
+            sha_reads: Vec::new(),
             ops: Vec::new(),
         }
     }
@@ -124,6 +133,11 @@ impl FakeHost {
         self.lock().stdins.clone()
     }
 
+    /// 读回 [`Host::file_sha256`] 查过的路径：断言「二进制的 sha 是流式算的」用。
+    pub fn sha_reads(&self) -> Vec<PathBuf> {
+        self.lock().sha_reads.clone()
+    }
+
     /// 读回写入的文件内容。
     pub fn text(&self, path: &str) -> Option<String> {
         self.lock()
@@ -162,8 +176,20 @@ impl Host for FakeHost {
         Ok(self.lock().files.get(path).map(|(c, _)| c.clone()))
     }
 
+    fn file_sha256(&self, path: &Path) -> Result<Option<String>> {
+        use sha2::{Digest as _, Sha256};
+        let mut i = self.lock();
+        i.sha_reads.push(path.to_path_buf());
+        Ok(i.files
+            .get(path)
+            .map(|(c, _)| hex::encode(Sha256::digest(c))))
+    }
+
     fn write_file(&self, path: &Path, content: &[u8], mode: u32) -> Result<()> {
         let mut i = self.lock();
+        if i.fail_writes.contains(path) {
+            anyhow::bail!("写 {} 失败：假机器播了 fail_writes", path.display());
+        }
         i.files.insert(path.to_path_buf(), (content.to_vec(), mode));
         i.ops.push(format!("write:{}:{:03o}", path.display(), mode));
         Ok(())

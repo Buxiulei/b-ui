@@ -32,6 +32,27 @@ impl Host for RealHost {
         }
     }
 
+    fn file_sha256(&self, path: &Path) -> Result<Option<String>> {
+        use sha2::{Digest as _, Sha256};
+        let mut f = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("打开 {} 失败", path.display())),
+        };
+        // 64 KiB 一块喂 hasher：峰值就是这个缓冲区，与文件多大无关（见 trait 上的注释）。
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut h = Sha256::new();
+        loop {
+            let n = std::io::Read::read(&mut f, &mut buf)
+                .with_context(|| format!("读 {} 失败", path.display()))?;
+            if n == 0 {
+                break;
+            }
+            h.update(&buf[..n]);
+        }
+        Ok(Some(hex::encode(h.finalize())))
+    }
+
     fn write_file(&self, path: &Path, content: &[u8], mode: u32) -> Result<()> {
         let parent = path
             .parent()
@@ -369,6 +390,28 @@ mod tests {
         assert!(!h.is_dir(&f).unwrap());
         assert_eq!(h.read_file(&d.path().join("nope")).unwrap(), None);
         h.remove_file(&d.path().join("nope")).unwrap();
+    }
+
+    /// 流式 sha 的正确性：分块循环一旦写错（喂 `&buf` 而不是 `&buf[..n]`、少读最后一块），
+    /// 算出来的就是另一个 sha ⇒ 对账每轮都判「内核不是这一份」、无穷重装。所以专挑
+    /// **跨块且非整数倍**的长度对照一次性 `Sha256::digest` 的结果。
+    #[test]
+    fn file_sha256_streams_and_matches_the_one_shot_digest() {
+        use sha2::{Digest as _, Sha256};
+        let d = tempfile::tempdir().unwrap();
+        let h = RealHost::new();
+        // 0 / 单块内 / 正好一块 / 跨两块且非整数倍（64 KiB 是实现里的缓冲区大小）
+        for len in [0usize, 7, 64 * 1024, 64 * 1024 + 1, 150 * 1024 + 123] {
+            let body: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let f = d.path().join(format!("bin-{len}"));
+            std::fs::write(&f, &body).unwrap();
+            assert_eq!(
+                h.file_sha256(&f).unwrap().unwrap(),
+                hex::encode(Sha256::digest(&body)),
+                "长度 {len} 的流式 sha 与一次性 digest 不符"
+            );
+        }
+        assert_eq!(h.file_sha256(&d.path().join("nope")).unwrap(), None);
     }
 
     #[test]

@@ -570,6 +570,9 @@ pub fn asset_arch(arch: &str) -> anyhow::Result<&'static str> {
 ///
 /// 盘上二进制读不到（还没装 / 读失败）按「要升级」处理——本来就该给它装一份；manifest 缺该
 /// 架构资产同样按要升级返回，真正的报错留给 `plan_upgrade`（它在出计划前就会 bail）。
+///
+/// 盘上那份的 sha 走 [`Host::file_sha256`]（流式）而不是 `read_file`：这个判断在守护进程的
+/// 升级巡检里周期性跑，而 `b-ui.service` 的 `MemoryMax=200M` 是硬上限。
 pub fn bui_build_differs(
     host: &dyn Host,
     bin_dir: &Path,
@@ -583,8 +586,42 @@ pub fn bui_build_differs(
     let Ok(asset) = m.bui_asset(arch) else {
         return true;
     };
-    match host.read_file(&bin_dir.join("bui")).ok().flatten() {
-        Some(bytes) => !sha256_hex(&bytes).eq_ignore_ascii_case(&asset.sha256),
+    match host.file_sha256(&bin_dir.join("bui")).ok().flatten() {
+        Some(sum) => !sum.eq_ignore_ascii_case(&asset.sha256),
+        None => true,
+    }
+}
+
+/// 期望的那个内核构建与盘上 `bin/<name>` 是不是**两个不同的构建**。判法与
+/// [`bui_build_differs`] 一致：先比版本号，版本号相同再比 sha256。
+///
+/// **版本号不是充分判据**（2026-09-16 裁决，发布阻断级）：自建的 sing-box 与官方同版本归档
+/// 打的是同一个版本号（ldflags 里就写着 `constant.Version=1.14.1`），差别只在构建标签
+/// （自建带 `with_v2ray_api`）。只比版本号的话，已装官方 1.14.1 的机器上 `InstallBinary`
+/// 永远不会被计划、自建二进制装不上去，`bui upgrade` 还会打印「已最新」；于是依赖
+/// `v2ray_api` 的那份配置每轮 `sing-box check` 必然 FATAL、永不落盘 —— 我们给自家二进制
+/// 做对了这件事，给内核漏了。
+///
+/// `want_sha256` 取 manifest 的 `artifacts.<name>-linux-<arch>.sha256`（见
+/// [`Manifest::kernel_asset`]）。盘上二进制读不到（还没装 / 读失败）按「要装」处理。
+///
+/// 盘上那份的 sha 必须走 [`Host::file_sha256`]（流式）而不是 `read_file`：这个判断在**每轮
+/// 稳态对账**里对四个内核各跑一次，合计约 190 MB、单个最大约 81 MB，而 `b-ui.service` 的
+/// `MemoryMax=200M` 是硬上限、对账 600 秒一轮 —— 整文件读进内存就是每 10 分钟复现一次的
+/// OOM/重启循环。判据不变，只是「读 190 MB」换成「流 190 MB」。
+pub fn kernel_build_differs(
+    host: &dyn Host,
+    bin_dir: &Path,
+    installed: &BTreeMap<String, String>,
+    name: &str,
+    want_version: &str,
+    want_sha256: &str,
+) -> bool {
+    if installed.get(name).map(String::as_str) != Some(want_version) {
+        return true;
+    }
+    match host.file_sha256(&bin_dir.join(name)).ok().flatten() {
+        Some(sum) => !sum.eq_ignore_ascii_case(want_sha256),
         None => true,
     }
 }
@@ -810,6 +847,75 @@ mod tests {
             bui_build_differs(&h, bin, &m, "4.0.1", "aarch64"),
             "manifest 没有该架构的 bui 资产：交给 plan_upgrade 去报错，这里按要升级算"
         );
+    }
+
+    /// 发布阻断级回归（2026-09-16）：自建 sing-box 与官方归档**同版本号**（都打 1.14.1），
+    /// 只比版本号的话自建那份永远装不上去 ⇒ 依赖 `with_v2ray_api` 的配置每轮 `check` 必然
+    /// FATAL、永不落盘。内核与 `bui` 同一判法：版本号相同再比盘上二进制的 sha256。
+    #[test]
+    fn kernel_build_differs_falls_back_to_sha_when_the_version_is_unchanged() {
+        let bin = Path::new("/opt/b-ui/bin");
+        let official = b"SB-1.14.1-official";
+        let ours = b"SB-1.14.1-with_v2ray_api";
+        let installed = BTreeMap::from([("sing-box".to_string(), "1.14.1".to_string())]);
+        let h = FakeHost::new();
+        h.write_file(&bin.join("sing-box"), official, 0o755)
+            .unwrap();
+        let want = sha256_hex(ours);
+        assert!(
+            kernel_build_differs(&h, bin, &installed, "sing-box", "1.14.2", &want),
+            "版本不同：一眼就要装"
+        );
+        assert!(
+            kernel_build_differs(&h, bin, &installed, "sing-box", "1.14.1", &want),
+            "同版本号但盘上是官方那一份：也要装"
+        );
+        h.write_file(&bin.join("sing-box"), ours, 0o755).unwrap();
+        assert!(
+            !kernel_build_differs(&h, bin, &installed, "sing-box", "1.14.1", &want),
+            "同版本同 sha 才是已最新"
+        );
+        assert!(
+            kernel_build_differs(
+                &FakeHost::new(),
+                bin,
+                &installed,
+                "sing-box",
+                "1.14.1",
+                &want
+            ),
+            "盘上读不到 bin/sing-box：按要装处理"
+        );
+        assert!(
+            kernel_build_differs(&h, bin, &BTreeMap::new(), "sing-box", "1.14.1", &want),
+            "探不出已装版本：按要装处理"
+        );
+    }
+
+    /// 钉住「内核身份不再把二进制整文件读进内存」。
+    ///
+    /// 这个判断在**每轮稳态对账**里对四个内核各跑一次：实测四个 stripped 内核合计 190 MB、
+    /// 单笔最大约 81 MB（sing-box，自建更大），等价进程峰值 RSS 132 MB；而 `b-ui.service`
+    /// 的 `MemoryMax=200M` 是**硬上限**、对账 600 秒一轮 —— 用 `read_file` 算 sha 就是每
+    /// 10 分钟复现一次的 OOM/重启循环面。判据不变，只把「读 190 MB」换成「流 190 MB」，
+    /// 所以这里断言的是**用了哪条接口**：`Host::file_sha256`（流式，峰值几 KiB）被查过。
+    /// 改回 `read_file` 这条就转红（`sha_reads` 会是空的）。真实实现是不是真流式，由
+    /// `sys::real` 那边的 `file_sha256` 用例按跨块非整数倍的文件钉住。
+    #[test]
+    fn kernel_identity_streams_the_binary_instead_of_reading_it_whole() {
+        let bin = Path::new("/opt/b-ui/bin");
+        let sb = bin.join("sing-box");
+        let installed = BTreeMap::from([("sing-box".to_string(), "1.14.1".to_string())]);
+        let h = FakeHost::new();
+        h.write_file(&sb, b"SB-1.14.1-with_v2ray_api", 0o755)
+            .unwrap();
+        let want = sha256_hex(b"SB-1.14.1-with_v2ray_api");
+        h.with(|i| i.sha_reads.clear());
+        assert!(
+            !kernel_build_differs(&h, bin, &installed, "sing-box", "1.14.1", &want),
+            "同版本同 sha：判据不因为换了接口而变"
+        );
+        assert_eq!(h.sha_reads(), vec![sb], "sha 必须流式算");
     }
 
     #[test]
