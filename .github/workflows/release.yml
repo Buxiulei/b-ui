@@ -90,7 +90,11 @@ jobs:
           # 只判「内核校验漏跑」这一种 skip（与 ci.yml 同一口径）：测试里另有两种设计内的
           # skip（缺 P0 的 v3 fixture、Task 13 删掉 server/core.sh 后的 v3 sysctl 对照），
           # 不能算漏跑判红——否则 Task 13 之后每次发版都会无故红。
-          if grep -Eq 'skipped: ((sing-box|xray|hysteria) not found|本机没有 caddy 二进制)' "$RUNNER_TEMP/test.log"; then
+          # 「自建 sing-box（with_v2ray_api）不可用」这种 skip 在 ci.yml 是白名单（1.12/1.13
+          # 两格本来就是上游归档），在**发布路径上恰恰相反**：PATH 上的 sing-box 就是 bin/
+          # 里那份自建的，住宅那份配置必须真跑 check ⇒ 这条 skip 一出现就判红。下面是单条
+          # 「出现即判红」的 grep（不是 ci.yml 的「收集 + 放行」两段式），所以它要写进 grep 里。
+          if grep -Eq 'skipped: ((sing-box|xray|hysteria) not found|本机没有 caddy 二进制|自建 sing-box（with_v2ray_api）不可用)' "$RUNNER_TEMP/test.log"; then
             echo "内核校验被跳过，说明没找到内核二进制：发版不接受 skip"
             grep -E 'skipped: ' "$RUNNER_TEMP/test.log"
             exit 1
@@ -211,13 +215,24 @@ jobs:
       - name: 把上游内核以裸二进制归集进 dist（C4：artifacts 全是裸二进制）
         run: |
           set -euo pipefail
-          # setup-kernels 已经把上游 tar.gz / zip 就地解包成 <dir>/bin/<kernel>（scripts/ci/fetch-kernels.sh），
-          # 这里只是改名归集；Release 因此不含任何归档，install.sh 与 bui upgrade 拿到的都是裸二进制。
+          # setup-kernels 已经把每个内核放成 <dir>/bin/<kernel>（scripts/ci/fetch-kernels.sh）：
+          # xray / hysteria / caddy 是上游归档解包出来的，sing-box 是锁里 build: 行现场自建的产物
+          # （唯一动机 with_v2ray_api，spec §5.3）。这里只是改名归集；Release 因此不含任何归档，
+          # install.sh 与 bui upgrade 拿到的都是裸二进制。
           for a in amd64 arm64; do
             for k in hysteria xray sing-box caddy; do
               install -m 755 "$RUNNER_TEMP/kernels-$a/bin/$k" "dist/$k-linux-$a"
             done
           done
+      - name: dist 里的 sing-box 必须是自建的那一份（含 with_v2ray_api）
+        run: |
+          set -euo pipefail
+          # arm64 不能在 x86 runner 上执行，只靠锁里的 sha256 校验（spec §5.4 第 9 条）；
+          # amd64 这一份真跑一次，确认归集没把上游归档的二进制混进来。
+          v=$(dist/sing-box-linux-amd64 version)
+          printf '%s\n' "$v"
+          printf '%s\n' "$v" | grep -q 'with_v2ray_api' \
+            || { echo "dist 里的 sing-box 缺 with_v2ray_api"; exit 1; }
       - name: 清点产物（4 个自家二进制 + 8 个内核 = 12）
         run: |
           set -euo pipefail

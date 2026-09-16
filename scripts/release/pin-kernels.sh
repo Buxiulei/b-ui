@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # 解析 kernel-versions.env 的版本轨道 → 下载（sing-box 是自建）每个内核资产 → 算 sha256 → 写 kernels.lock。
 #   --write         解析 + 下载 / 构建 + 覆盖 kernels.lock（会下载约 200MB 并构建两次 sing-box，十几分钟）
+#                   整文件重生成，但**保留锁里已有的手写注记行**，只重写自己那两行锁头
 #   --check         解析版本号 + 比自建行的 tags= 与 env 是否一致，有漂移退出 1（CI 用，不下载、不构建）
 #   --lock <path>   改写/比对别处的 lock（测试用；默认 scripts/release/kernels.lock）
 # sha256 一律「自己下载自己算」：上游 checksums 文件的命名各家不同且会变。
@@ -115,10 +116,22 @@ build_singbox_row() {
 }
 
 write_lock() {
-    local tmp row kernel role ver arch url sha minor built
+    local tmp row kernel role ver arch url sha minor built notes
     tmp=$(mktemp)
+    # 锁里已有的**手写**注记行（哪两行是回填的、某个内核为什么顶了版本之类）要留住：
+    # --write 是整文件重生成，不留的话每次重写都静默删掉它们，而周更 bot 的 PR 正文
+    # 又只列内核行 ⇒ 评审者看不见注记被删。本函数只重写自己那两行锁头（生成时间 + 列名）。
+    notes=""
+    if [[ -f "$LOCK" ]]; then
+        notes=$(grep '^#' "$LOCK" \
+            | grep -v '^# 由 scripts/release/pin-kernels\.sh --write 生成' \
+            | grep -v '^# kernel role version arch sha256 url' || true)
+    fi
     {
         printf '# 由 scripts/release/pin-kernels.sh --write 生成，勿手工编辑（生成时间 %s）\n' "$(date -u +%FT%TZ)"
+        if [[ -n "$notes" ]]; then
+            printf '%s\n' "$notes"
+        fi
         printf '# kernel role version arch sha256 url\n'
     } > "$tmp"
     for row in "sing-box target $(resolve_track "$SINGBOX_REPO" "$SINGBOX_TRACK")" \

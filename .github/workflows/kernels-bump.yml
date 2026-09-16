@@ -1,0 +1,225 @@
+name: kernels-bump
+
+# 内核版本轨道的周更 bot：按 kernel-versions.env 的轨道重解析 → 重写 kernels.lock →
+# 锁正文真的变了才继续 → 复算自建 sha（amd64 + arm64）→ 自建 Tags ⊇ 官方同版本归档 →
+# 用新内核跑全量测试 → 开 PR 交给人看。
+# 任何一步失败 ⇒ 工作流红、**锁不动**、**不开 PR**（pin-kernels.sh --write 是先写临时文件
+# 最后才 mv，失败时磁盘上的锁没被碰过）。release.yml 永远只用锁里的版本，所以上游怎么改
+# 都不会阻塞发版，发布保持上一版（spec §5.4 第 8 条）。
+#
+# 三条注意：
+#   1. GitHub 的平台限制：`schedule` **只按默认分支上的工作流定义**排程，`workflow_dispatch`
+#      也要求该工作流文件存在于**默认分支**才会出现这个事件（之后才能在 UI/API 里选任意 ref）。
+#      本文件现在只在 v4 上、默认分支是 main ⇒ **合进默认分支之前，cron 与 dispatch 都不可用**；
+#      要在 fork 上试跑就先把它推到那个 fork 的默认分支。
+#   2. checkout 显式 `ref: v4`：schedule 触发时默认拿到的是**默认分支**，而 `--write` 是按
+#      checkout 出来的 kernel-versions.env 整文件重生成锁、PR 又是 `--base v4`；不钉 ref 的话
+#      main 与 v4 的 env 一有差异（比如 v4 改了 SINGBOX_TAGS），bot 就会把 main 的标签集写进
+#      v4 的锁，合掉之后 v4 的 CI 会在 `pin-kernels.sh --check` 上判红。
+#   3. 用 GITHUB_TOKEN 推出来的分支不会触发 ci.yml（GitHub 的防循环规则），所以本工作流
+#      自己跑一遍 cargo test 当闸门；PR 上想看 CI 就在 PR 里手动 re-run。
+on:
+  schedule:
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+# 一次 dispatch 撞上 cron 会白烧两轮完整构建（还会开两个 PR），排队而不是取消：
+# 跑到一半被取消的那一轮对锁没有副作用，但也没必要把已经建完的构建扔掉。
+concurrency:
+  group: kernels-bump
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bump:
+    name: 轨道重解析并开 PR
+    runs-on: ubuntu-24.04
+    # 最坏情形：--write 建两次 sing-box（amd64 + arm64）+ setup-kernels 再各建一次 + 冷缓存
+    # 跑一遍 cargo test --workspace
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 见文件头注意 2：schedule 默认给的是默认分支，而 PR 的 base 是 v4
+          ref: v4
+      # 与 .github/actions/setup-kernels/action.yml 的同名步骤**逐字相同**：锁里没有 build:
+      # 行时优雅降级（不装 Go，下一步靠 `if` 跳过），有 build: 行但取不到 go= 才硬失败。
+      - name: '锁里有 build: 行就取出 go=（自建 sing-box 要 Go 工具链）'
+        id: needgo
+        run: |
+          set -euo pipefail
+          if grep -q ' build:' scripts/release/kernels.lock; then
+            # 锁的 go= 是**被强制的构建输入**：fetch-kernels.sh 透传 --go，build-singbox.sh 用
+            # GOTOOLCHAIN 钉死并断言实际版本相符。所以这里装哪一版都不决定产物 sha256——
+            # 但装成与锁同一版最省事：GOTOOLCHAIN 不必再额外下载一份工具链，也不会出现
+            # 「runner 上是 A、锁要求 B」的互相打脸。actions/setup-go 的 go-version 不吃 `go`
+            # 前缀（锁里写的是 go1.25.5），剥掉再传。
+            # sed 限定在 ` build:` 行上：锁头注记里哪天出现 `;go=` 就会被 head -1 抢走。
+            go=$(grep ' build:' scripts/release/kernels.lock \
+              | sed -n 's/.*;go=\([^;[:space:]]*\).*/\1/p' | head -1)
+            if [[ -z "$go" ]]; then
+              echo "锁里有 build: 行但取不到 go=（build: URI 要带 ;go=go1.x.y）"
+              grep ' build:' scripts/release/kernels.lock
+              exit 1
+            fi
+            printf 'go=%s\n' "${go#go}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: '装 Go（仅当锁里有 build: 行）'
+        if: ${{ steps.needgo.outputs.go != '' }}
+        uses: actions/setup-go@v5
+        with:
+          # 装锁里那一版而不是 stable：pin-kernels.sh --write 故意不传 --go，让
+          # GOTOOLCHAIN=auto 去**发现**上游 go.mod 要求的版本再写进锁的 go=。auto 的语义是
+          # 「宿主够新就用宿主」，宿主装 stable 的话 Go 每出一个新版都会写出一个新的 go=、
+          # 自建产物的 sha 跟着变，于是每周开一个「只有 Go 版本变了」的空 PR。装成锁里那版
+          # 就没有这种漂移；上游真要求更新的 Go 时 auto 照样自己下载并如实写进锁。
+          go-version: ${{ steps.needgo.outputs.go }}
+          check-latest: false
+          # 纯 Rust 仓库没有 go.sum，setup-go 的模块缓存找不到依赖文件会直接报错退出
+          cache: false
+      - name: 解析轨道并重写锁
+        id: bump
+        run: |
+          set -euo pipefail
+          L=scripts/release/kernels.lock
+          before=$(grep -v '^#' "$L")
+          old=$(awk '$1 == "sing-box" && $2 == "target" {print $3; exit}' "$L")
+          bash scripts/release/pin-kernels.sh --write
+          after=$(grep -v '^#' "$L")
+          new=$(awk '$1 == "sing-box" && $2 == "target" {print $3; exit}' "$L")
+          # 判据只看正文行：锁头带「生成时间」时间戳，每次 --write 都会变，拿
+          # `git diff --quiet` 当判据的话每周都会开一个只改一行时间戳的空 PR。
+          if [[ "$before" == "$after" ]]; then
+            git checkout -- "$L"
+            echo "锁正文没变（还贴着轨道），不开 PR"
+            printf 'changed=0\n' >> "$GITHUB_OUTPUT"
+          else
+            printf 'changed=1\n' >> "$GITHUB_OUTPUT"
+          fi
+          { printf 'old=%s\n' "$old"; printf 'new=%s\n' "$new"; } >> "$GITHUB_OUTPUT"
+      - name: 按新锁准备内核 amd64（复算自建 sha、断言 Tags ⊇ 锁的 tags=）
+        if: steps.bump.outputs.changed == '1'
+        uses: ./.github/actions/setup-kernels
+        with:
+          dir: ${{ runner.temp }}/kernels-amd64
+          role: all
+          arch: amd64
+      - name: 按新锁准备内核 arm64（只为复算交叉编译那一份的 sha）
+        if: steps.bump.outputs.changed == '1'
+        # arm64 的 sha 若只由 --write 那一次构建产出，就从未被第二次构建验证过：交叉编译
+        # 不可重现的话第一次红会红在**打 tag 之后**的 release.yml「准备内核（arm64）」上。
+        # 周更 bot 慢十分钟换掉这个风险（release.yml:207-212 本来就是两个架构各来一次）。
+        uses: ./.github/actions/setup-kernels
+        with:
+          dir: ${{ runner.temp }}/kernels-arm64
+          role: target
+          arch: arm64
+      - name: 自建 Tags ⊇ 官方同版本归档的 Tags
+        if: steps.bump.outputs.changed == '1'
+        # spec §5.4 第 4 条那条腿在别处没有机器校验：setup-kernels 只断言「二进制 Tags ⊇ 锁的
+        # tags=」，`pin-kernels.sh --check` 只断言「锁的 tags= == env 的 SINGBOX_TAGS」，而
+        # SINGBOX_TAGS 是人工从官方归档抄下来的常量 —— 链条到 env 就断了。上游在 patch 里加
+        # 一个默认标签（bot 顶的正是 patch）就会让自建产物静默少一个功能而全链路皆绿。
+        # 这一步（有网络的落点只有 bot）把「⊇ 官方」真的比一次：不满足即红、不开 PR。
+        run: |
+          set -euo pipefail
+          ver=$(awk '$1 == "sing-box" && $2 == "target" {print $3; exit}' scripts/release/kernels.lock)
+          [[ -n "$ver" ]] || { echo "锁里没有 sing-box target 行"; exit 1; }
+          d="$RUNNER_TEMP/official"
+          mkdir -p "$d"
+          url="https://github.com/SagerNet/sing-box/releases/download/v$ver/sing-box-$ver-linux-amd64.tar.gz"
+          curl -fsSL --connect-timeout 15 --max-time 600 --retry 3 -o "$d/sb.tar.gz" "$url"
+          tar -xzf "$d/sb.tar.gz" -C "$d" "sing-box-$ver-linux-amd64/sing-box"
+          official=$("$d/sing-box-$ver-linux-amd64/sing-box" version | sed -n 's/^Tags:[[:space:]]*//p')
+          mine=$("$RUNNER_TEMP/kernels-amd64/bin/sing-box" version | sed -n 's/^Tags:[[:space:]]*//p')
+          [[ -n "$official" && -n "$mine" ]] || { echo "取不到 Tags（官方=$official 自建=$mine）"; exit 1; }
+          missing=$(comm -13 \
+            <(printf '%s' "$mine"     | tr ',' '\n' | sed '/^$/d' | sort -u) \
+            <(printf '%s' "$official" | tr ',' '\n' | sed '/^$/d' | sort -u))
+          printf '官方：%s\n自建：%s\n' "$official" "$mine"
+          if [[ -n "$missing" ]]; then
+            printf '自建 sing-box 比官方同版本归档缺标签：%s\n' "$(printf '%s' "$missing" | tr '\n' ' ')"
+            echo "把它们逐 token 加进 scripts/release/kernel-versions.env 的 SINGBOX_TAGS 再重跑"
+            exit 1
+          fi
+      - name: 用新内核跑全量测试
+        if: steps.bump.outputs.changed == '1'
+        run: |
+          set -euo pipefail
+          BIN="$RUNNER_TEMP/pathbin"
+          mkdir -p "$BIN"
+          # 默认名 sing-box = bin/ 里那份**自建**的 target（1.14，带 with_v2ray_api）
+          ln -sf "$RUNNER_TEMP/kernels-amd64/bin/sing-box" "$BIN/sing-box"
+          ln -sf "$RUNNER_TEMP/kernels-amd64/bin/xray" "$BIN/xray"
+          ln -sf "$RUNNER_TEMP/kernels-amd64/bin/hysteria" "$BIN/hysteria"
+          # ci.yml 靠三格矩阵拿到 1.12 / 1.13 的订阅兼容覆盖，本作业只有一格：不建这两个
+          # 软链的话 check_singbox_all（crates/bui-schema/tests/common/mod.rs）直接静默 skip，
+          # 而 bot 改的**恰恰是内核版本**——多版本兼容正是它唯一能抓的东西。
+          # shellcheck disable=SC1091
+          . scripts/release/kernel-versions.env
+          for m in $SINGBOX_CHECK_MINORS; do
+            ln -sf "$RUNNER_TEMP/kernels-amd64/singbox/$m/sing-box" "$BIN/sing-box-$m"
+          done
+          export PATH="$BIN:$PATH"
+          # 软链真的可执行、且真的是那个 minor：断在这里而不是靠下面的 skip 口径，
+          # 否则哪天落点变了只会表现成一条被白名单放行的 skip。
+          for m in $SINGBOX_CHECK_MINORS; do
+            got=$("sing-box-$m" version | awk '/^sing-box version/ {print $3; exit}')
+            echo "sing-box-$m = $got"
+            case "$got" in "$m".*) ;; *) echo "sing-box-$m 版本不符：期望 $m.x"; exit 1 ;; esac
+          done
+          # caddy 的 validate 用例只认三个绝对路径、不查 PATH（同 ci.yml / release.yml）
+          sudo ln -sf "$RUNNER_TEMP/kernels-amd64/bin/caddy" /usr/local/bin/caddy
+          cargo test --workspace -- --nocapture 2>&1 | tee "$RUNNER_TEMP/test.log"
+          # 「内核校验漏跑判红」，口径同 ci.yml。白名单两条：
+          #   sing-box-1.14 not found —— 1.14 的覆盖由默认名 sing-box（自建 target）提供，
+          #     带 -1.14 后缀的二进制在这里不存在；1.12 / 1.13 的 not found **不**放行
+          #     （上面刚建了软链并断言过版本），漏了就该红。
+          #   自建 sing-box（with_v2ray_api）不可用 —— 这条 skip 的真闸门在 setup-kernels 的
+          #     Tags 硬断言（更早一步、已经判过红），这里再判一次只会因 1.12/1.13 不带该标签
+          #     而每周误红。
+          kernel_skips=$(grep -E 'skipped: ((sing-box|xray|hysteria)(-[0-9.]+)? not found|本机没有 caddy 二进制|自建 sing-box（with_v2ray_api）不可用)' "$RUNNER_TEMP/test.log" || true)
+          missed=$(printf '%s\n' "$kernel_skips" | grep -Ev 'skipped: (sing-box-1\.14 not found|自建 sing-box（with_v2ray_api）不可用)' || true)
+          if [[ -n "$missed" ]]; then
+            echo "内核校验被跳过，说明没找到内核二进制：不接受 skip"
+            printf '%s\n' "$missed"
+            exit 1
+          fi
+      - name: 开 PR
+        if: steps.bump.outputs.changed == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OLD: ${{ steps.bump.outputs.old }}
+          NEW: ${{ steps.bump.outputs.new }}
+        run: |
+          set -euo pipefail
+          if [[ "$OLD" == "$NEW" ]]; then
+            # --write 把四条轨道一起重解析，所以锁变了不一定是 sing-box 变了
+            subj="chore(kernels): 内核锁跟随版本轨道更新"
+          else
+            subj="chore(kernels): sing-box $OLD → $NEW"
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          # 分支名带 run id：同一 sing-box 版本在两周内二次变更（上游重打 tag、或只有别的
+          # 内核动了）时不会撞上已存在的分支与 PR，省掉一次与内容无关的红。
+          git switch -c "kernels/bump-$GITHUB_RUN_ID"
+          git add scripts/release/kernels.lock
+          {
+            printf '%s\n\n' "$subj"
+            printf 'pin-kernels.sh --write 按 scripts/release/kernel-versions.env 的轨道重解析。锁的变化（含注记行，只滤掉每次都变的「生成时间」那行）：\n\n'
+            printf '```\n'
+            git diff --cached -U0 -- scripts/release/kernels.lock \
+              | grep -E '^[-+][^-+]' | grep -v '生成时间' || true
+            printf '```\n\n'
+            printf '本工作流已用新内核（含 sing-box-1.12 / 1.13 两版兼容用例）跑过 cargo test --workspace，并核过自建 Tags ⊇ 官方同版本归档。GITHUB_TOKEN 推的分支不触发 ci.yml，PR 上要看 CI 请手动 re-run。\n'
+          } > "$RUNNER_TEMP/pr-msg.txt"
+          git commit -F "$RUNNER_TEMP/pr-msg.txt"
+          git push -u origin HEAD
+          gh pr create --fill --base v4

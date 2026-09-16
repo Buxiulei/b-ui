@@ -9,6 +9,14 @@
 # 失败：任一步（clone / 工具链 / go build / 落地）失败即退非 0 且**不产出 --out**——
 #       调用方（pin-kernels.sh --write、fetch-kernels.sh）据此保持锁不动、发布保持上一版（spec §5.4 第 8 条）。
 # 交叉编译靠 Go 原生（CGO_ENABLED=0），arm64 不需要容器。
+#
+# 网络面（发布链上因自建而多出来的那一段，对 Global Constraints「绝不因上游改动阻塞发版」）：
+# 本脚本要 clone 上游源码，比从前「下载一个归档」多一个网络依赖，所以 clone 也按仓库既有口径
+# 走 `$BUI_MIRRORS` 的镜像前缀回退（形如 `<prefix>https://github.com/...`，同
+# scripts/ci/fetch-kernels.sh 的 download()），并重试 3 轮、指数退避。
+# 即便如此：**actions/cache 冷缓存 + 上游与全部镜像同时不可达时，这一次发布会红**——
+# 重跑即可；锁不动、Release 保持上一版、已发布版本与线上机器都不受影响（spec §5.4 第 8 条）。
+# Go 模块图（proxy.golang.org）同理：不可达就红，不会污染锁。
 set -euo pipefail
 LC_ALL=C
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -17,6 +25,10 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 print_info()  { printf '  [*] %s\n' "$1" >&2; }
 print_error() { printf '  [!] %s\n' "$1" >&2; }
+
+# ${VAR-默认} 而非 ${VAR:-默认}：BUI_MIRRORS="" 表示「只用直连」（同 fetch-kernels.sh，
+# 测试与离网环境都要这个语义）
+MIRRORS="${BUI_MIRRORS-https://ghfast.top/ https://gh-proxy.com/}"
 
 VERSION=""
 ARCH=""
@@ -60,9 +72,31 @@ trap cleanup EXIT
 command -v go >/dev/null 2>&1 || { print_error '找不到 go（CI 用 actions/setup-go）'; exit 2; }
 command -v git >/dev/null 2>&1 || { print_error '找不到 git'; exit 2; }
 
+clone_src() {
+    # 直连 → 镜像前缀逐个试，整轮都不成再退避重试（共 3 轮）。每次都先清空目标目录：
+    # 上一次留下的半成品会让 git clone 以「目标非空」失败，重试就永远成不了。
+    local prefix attempt delay=5
+    for attempt in 1 2 3; do
+        # shellcheck disable=SC2086
+        for prefix in "" $MIRRORS; do
+            rm -rf "$SRC"
+            if git clone --quiet --depth 1 -b "v$VERSION" "${prefix}https://github.com/$REPO" "$SRC"; then
+                return 0
+            fi
+        done
+        if [[ "$attempt" != 3 ]]; then
+            print_info "clone 失败，${delay}s 后重试（第 $((attempt + 1))/3 轮）"
+            sleep "$delay"
+            delay=$((delay * 3))
+        fi
+    done
+    print_error "clone 失败（GitHub 与全部镜像均不可达）：$REPO v$VERSION"
+    return 1
+}
+
 SRC=$(mktemp -d)
 print_info "clone $REPO v$VERSION"
-git clone --quiet --depth 1 -b "v$VERSION" "https://github.com/$REPO" "$SRC"
+clone_src
 
 # 工具链：--go 给了就钉死在这一版（sha 与宿主 Go 解耦），没给才 auto（让 go 按上游 go.mod 自取，
 # 供 pin-kernels.sh --write 发现版本并写进锁的 go=）。探到的版本与 --go 不符即退非 0。
