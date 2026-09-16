@@ -363,6 +363,8 @@ fn user_from_v3(u: V3User, warnings: &mut Vec<String>) -> Result<User, ImportErr
         credentials: Credentials {
             hy2_password,
             vless_uuid,
+            // 住宅凭据由 `hy2pool::migrate` 在导入完成后一次性分配（spec §4.3 第 4 条）
+            hy2_resi_cred: None,
         },
         entitlements: Entitlements {
             protocols,
