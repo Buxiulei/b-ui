@@ -919,28 +919,36 @@ mod tests {
         assert!(c.remove_user("vless-direct", uid()).await.is_err());
     }
 
+    /// 两棵 vendor 树各自的 checksum 守门：`proto/` 是 Xray-core 的，`proto-v2ray/` 是
+    /// sing-box 那条 v2ray_api 的（包名不同、`build.rs` 各编一次，互不影响；
+    /// 见 `panel::hy2resi`）。换 pinned 版本时必须同步更新 SHA256SUMS，
+    /// 否则这条测试会告诉你 proto 变了。
     #[test]
     fn vendored_protos_match_the_recorded_checksums() {
-        // 换 pinned 版本时必须同步更新 SHA256SUMS，否则这条测试会告诉你 proto 变了
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("proto");
-        let sums =
-            std::fs::read_to_string(root.join("SHA256SUMS")).expect("proto/SHA256SUMS 必须存在");
-        let mut n = 0;
-        for line in sums.lines().filter(|l| !l.trim().is_empty()) {
-            let (want, rel) = line
-                .split_once("  ")
-                .expect("格式是 `<sha256>  <相对路径>`");
-            let bytes = std::fs::read(root.join(rel)).unwrap_or_else(|_| panic!("缺少 {rel}"));
+        // 条目数各自钉死：`proto` = 10 个用户/统计面的 + RoutingService 闭包的 3 个（T0）；
+        // `proto-v2ray` = 编译用的 app/stats/command/command.proto + 上游原文
+        // experimental/v2rayapi/stats.proto（T9）
+        for (dir, want_n) in [("proto", 13usize), ("proto-v2ray", 2usize)] {
+            let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(dir);
+            let sums = std::fs::read_to_string(root.join("SHA256SUMS"))
+                .unwrap_or_else(|_| panic!("{dir}/SHA256SUMS 必须存在"));
+            let mut n = 0;
+            for line in sums.lines().filter(|l| !l.trim().is_empty()) {
+                let (want, rel) = line
+                    .split_once("  ")
+                    .expect("格式是 `<sha256>  <相对路径>`");
+                let bytes = std::fs::read(root.join(rel)).unwrap_or_else(|_| panic!("缺少 {rel}"));
+                assert_eq!(
+                    crate::kernels::sha256_hex(&bytes),
+                    want,
+                    "{dir}/{rel} 的内容与记录不符"
+                );
+                n += 1;
+            }
             assert_eq!(
-                crate::kernels::sha256_hex(&bytes),
-                want,
-                "{rel} 的内容与记录不符"
+                n, want_n,
+                "{dir}/SHA256SUMS 的条目数变了：vendor 了新 proto 就同步这里"
             );
-            n += 1;
         }
-        assert_eq!(
-            n, 13,
-            "10 个用户/统计面的 proto + RoutingService 闭包的 3 个（T0）"
-        );
     }
 }
