@@ -866,7 +866,8 @@ pub async fn run(cmd: ResidentialCmd, socket: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 住宅子菜单的 12 项（两列渲染沿用 P1 的 [`crate::commands::menu::render_with`]）。
+/// 住宅子菜单的 13 项（两列渲染沿用 P1 的 [`crate::commands::menu::render_with`]）。
+/// 每一项的 key 都必须在 [`menu`] 里有 dispatch 分支（用例钉着）。
 pub fn menu_items() -> Vec<MenuItem> {
     vec![
         MenuItem {
