@@ -73,6 +73,15 @@ pub struct PanelUser {
     /// 该用户订阅里 HY2 住宅节点的跳跃区间（闭区间）
     #[serde(rename = "slotHop", skip_serializing_if = "Option::is_none")]
     pub slot_hop: Option<(u16, u16)>,
+    /// 该用户住宅 HY2 的**门位**：`slot-<i>-out`（能出网、走第 i 槽的住宅 IP）/ `deny`
+    /// （握手照旧成功、**每个请求被拒**，spec §6 的到期 / 封禁语义）/ `未分配`（还没拿到
+    /// 凭据 ⇒ 压根没有门，订阅里也没有住宅 HY2 节点）。
+    ///
+    /// 没有住宅 hysteria2 权益的用户不出现这个字段（`None`）。值与门位收敛**同一份口径**
+    /// （[`gates::expected`](super::gates::expected)）—— 面板与 CLI 各算一遍必然漂移成
+    /// 「面板说放行、内核里是 deny」。
+    #[serde(rename = "hy2ResiGate", skip_serializing_if = "Option::is_none")]
+    pub hy2_resi_gate: Option<String>,
     pub disabled: bool,
     pub blocked: bool,
 }
@@ -89,17 +98,24 @@ pub fn protocol_label(e: &Entitlements) -> &'static str {
     }
 }
 
+/// 面板投影。`gates` 是 [`gates::expected`](super::gates::expected) 的结果
+/// （凭据 `id` → 出站 tag）：**住宅 HY2 的门位只有那一处口径**，面板照它显示，不自己重算
+/// 「谁该放行」。传空表 ⇒ 有凭据的人显示 `未分配`（等下一轮收敛把门位算出来）。
 pub fn project(
     u: &User,
     node: &NodeParams,
     resi: &Residential,
     blocked: &BTreeSet<Uuid>,
+    gates: &BTreeMap<String, String>,
 ) -> PanelUser {
-    // spec §5.6：面板要显示每个用户的槽位与 IP。端口口径与 `nodes_for` 完全一致
-    // （同一个 `slots::resources_of`），所以面板显示的端口就是订阅里的端口。
+    // spec §5.6：面板要显示每个用户的槽位与 IP。
+    //
+    // **端口与跳跃区间不再跟槽序号挂钩**（4.1，spec §1.2 目标 1）：住宅 HY2 只有一个
+    // 监听端口 `ports.hy2_resi`，整段 `ports.hy2_resi_hop` 由 `table inet bui` 的 REDIRECT
+    // 送进去，所以每个用户显示的端口 / 区间都一样，且与 `nodes_for` 逐字一致（那里也是直接
+    // 取这两个字段）。槽位与 IP 的投影不变 —— 它们仍由 `slots::index_of_user` 给。
     let slot = u.entitlements.residential.as_ref().map(|_| {
         let idx = bui_schema::slots::index_of_user(u, resi);
-        let res = bui_schema::slots::resources_of(&node.ports, resi, idx);
         // 槽位表为空（旧 state 首次启动、`reconcile` CLI 这条没跑过迁移的路径）时退回
         // **池首上游**，与 `render::relay::slot_view` / `slots::fallback_index` 的 fail-open
         // 同一口径（Fable 2026-09-13 裁决）：那时槽 0 事实上就是池里第一条，
@@ -119,7 +135,17 @@ pub fn project(
                 })
                 .and_then(|x| x.verified.as_ref().map(|v| v.ip.clone()))
         });
-        (idx, ip, res)
+        (idx, ip)
+    });
+    // 门位：有住宅 hysteria2 权益才有这一档（口径同 `gates::expected` 的 `has_resi_hy2`）。
+    // 持有的凭据 id 不在 `gates` 里（悬空指针、或池刚扩容还没收敛）一律按「未分配」显示，
+    // 不猜一个放行值。
+    let hy2_resi_gate = super::gates::has_resi_hy2(u, resi).then(|| {
+        u.credentials
+            .hy2_resi_cred
+            .as_deref()
+            .and_then(|id| gates.get(id).cloned())
+            .unwrap_or_else(|| "未分配".to_string())
     });
     PanelUser {
         username: u.username.clone(),
@@ -144,20 +170,23 @@ pub fn project(
         // v4 没有 per-user sni：面板与订阅都用全局 REALITY 伪装域（v3.5.13 的修复口径）
         sni: node.reality.sni().to_string(),
         residential: u.entitlements.residential.is_some(),
-        slot: slot.as_ref().map(|(i, _, _)| *i),
-        slot_ip: slot.as_ref().and_then(|(_, ip, _)| ip.clone()),
-        slot_port: slot.as_ref().map(|(_, _, r)| r.hy2_port),
-        slot_hop: slot.as_ref().map(|(_, _, r)| r.hop),
+        slot: slot.as_ref().map(|(i, _)| *i),
+        slot_ip: slot.as_ref().and_then(|(_, ip)| ip.clone()),
+        slot_port: slot.as_ref().map(|_| node.ports.hy2_resi),
+        slot_hop: slot.as_ref().map(|_| node.ports.hy2_resi_hop),
+        hy2_resi_gate,
         disabled: u.disabled,
         blocked: u.disabled || blocked.contains(&u.user_id),
     }
 }
 
 pub fn project_all(state: &State, blocked: &BTreeSet<Uuid>) -> Vec<PanelUser> {
+    // 门位算一次给全表用（`expected` 遍历整池，逐用户调会是 O(用户 × 凭据)）
+    let gates = super::gates::expected(state, blocked);
     state
         .users
         .iter()
-        .map(|u| project(u, &state.node, &state.residential, blocked))
+        .map(|u| project(u, &state.node, &state.residential, blocked, &gates))
         .collect()
 }
 
@@ -850,6 +879,7 @@ mod tests {
             &s.node,
             &s.residential,
             &BTreeSet::new(),
+            &Default::default(),
         ))
         .unwrap();
         assert_eq!(v["username"], "alice");
@@ -909,10 +939,12 @@ mod tests {
         let rows = project_all(&s, &BTreeSet::new());
         assert_eq!(rows.len(), 1);
         let v = serde_json::to_value(&rows[0]).unwrap();
+        // 槽位与 IP 的投影不变：换槽换的就是这个出口 IP
         assert_eq!(v["slot"], 1);
         assert_eq!(v["slotIp"], "198.51.100.8");
-        assert_eq!(v["slotPort"], 40001);
-        assert_eq!(v["slotHop"], serde_json::json!([45500, 50000]));
+        // 4.1：端口与跳跃区间与槽序号无关（4.0.x 这里是 40001 + 45500-50000）
+        assert_eq!(v["slotPort"], 40000);
+        assert_eq!(v["slotHop"], serde_json::json!([41000, 50000]));
         // v3 字段一个都不许动（前端按它们渲染）
         assert_eq!(v["username"], "alice");
         assert_eq!(v["protocol"], "fusion");
@@ -987,11 +1019,89 @@ mod tests {
         assert_eq!(v["slotIp"], "198.51.100.7");
     }
 
+    /// 面板投影（T14）：**端口与槽位解耦** + 门位那一档。
+    ///
+    /// 4.0.x 的面板显示 `40000 + 槽序号` 与那一槽的跳跃切片；4.1 起两样都固定
+    /// （`ports.hy2_resi` / `ports.hy2_resi_hop`），与 `nodes_for` 逐字一致。门位是
+    /// spec §6 的到期 / 封禁语义的**唯一**可见解释：`deny` = 客户端仍会显示已连接，
+    /// 但每个请求都被拒。
+    #[test]
+    fn the_panel_shows_a_slot_independent_port_and_the_gate() {
+        let mut s = sample_state();
+        bui_schema::hy2pool::migrate(&mut s, t0());
+        let gates = super::super::gates::expected(&s, &BTreeSet::new());
+        let p = project(alice(&s), &s.node, &s.residential, &BTreeSet::new(), &gates);
+        assert_eq!(p.slot, Some(0));
+        assert_eq!(p.slot_port, Some(40000));
+        assert_eq!(p.slot_hop, Some((41000, 50000)));
+        assert_eq!(p.hy2_resi_gate.as_deref(), Some("slot-0-out"));
+
+        // 到期 / 封禁：门位是 deny —— UI 据此解释「显示已连接但请求全被拒」
+        let mut expired = s.clone();
+        expired.users[0].disabled = true;
+        let b2 = blocked_set(&expired, &BTreeMap::new(), t0());
+        let g2 = super::super::gates::expected(&expired, &b2);
+        assert_eq!(
+            project(
+                alice(&expired),
+                &expired.node,
+                &expired.residential,
+                &b2,
+                &g2
+            )
+            .hy2_resi_gate
+            .as_deref(),
+            Some("deny")
+        );
+
+        // 还没拿到凭据 ⇒ 压根没有门（订阅里也没有住宅 HY2 节点）
+        let mut fresh = sample_state();
+        fresh.users[0].credentials.hy2_resi_cred = None;
+        assert_eq!(
+            project(
+                alice(&fresh),
+                &fresh.node,
+                &fresh.residential,
+                &BTreeSet::new(),
+                &Default::default()
+            )
+            .hy2_resi_gate
+            .as_deref(),
+            Some("未分配")
+        );
+
+        // 没有住宅 hysteria2 权益 ⇒ 这一档整个不出现
+        let mut direct = sample_state();
+        direct.users[0].entitlements.residential = None;
+        let v = serde_json::to_value(project(
+            alice(&direct),
+            &direct.node,
+            &direct.residential,
+            &BTreeSet::new(),
+            &Default::default(),
+        ))
+        .unwrap();
+        assert!(v.get("hy2ResiGate").is_none(), "{v}");
+
+        // 面板显示的端口就是订阅里的端口（两处必须同源）
+        let n = bui_schema::nodes::nodes_for(alice(&s), &s.node, &s.residential)
+            .into_iter()
+            .find(|n| n.kind == bui_schema::nodes::NodeKind::Hy2Residential)
+            .expect("有凭据 ⇒ 有住宅 HY2 节点");
+        assert_eq!((Some(n.port), n.hop), (p.slot_port, p.slot_hop));
+    }
+
     #[test]
     fn projection_marks_blocked_users() {
         let s = sample_state();
         let id = alice(&s).user_id;
-        let p = project(alice(&s), &s.node, &s.residential, &BTreeSet::from([id]));
+        let p = project(
+            alice(&s),
+            &s.node,
+            &s.residential,
+            &BTreeSet::from([id]),
+            &Default::default(),
+        );
         assert!(p.blocked);
         assert_eq!(project_all(&s, &BTreeSet::from([id])).len(), 1);
     }
@@ -1217,6 +1327,7 @@ mod tests {
             &s.node,
             &s.residential,
             &BTreeSet::new(),
+            &Default::default(),
         ))
         .unwrap();
         assert!(
@@ -1229,6 +1340,7 @@ mod tests {
             &s.node,
             &s.residential,
             &BTreeSet::new(),
+            &Default::default(),
         ))
         .unwrap();
         assert_eq!(v2["subToken"], "0123456789abcdef0123456789abcdef");
@@ -1358,8 +1470,14 @@ mod tests {
         // 面板回显不看 direct：protocol 仍按协议集合回显 v3 名字，住宅与槽位字段照旧
         let s = sample_state();
         for (u, label) in [(&hy2, "hysteria2"), (&reality, "vless-reality")] {
-            let v = serde_json::to_value(project(u, &s.node, &s.residential, &BTreeSet::new()))
-                .unwrap();
+            let v = serde_json::to_value(project(
+                u,
+                &s.node,
+                &s.residential,
+                &BTreeSet::new(),
+                &Default::default(),
+            ))
+            .unwrap();
             assert_eq!(v["protocol"], label);
             assert_eq!(v["residential"], true);
             assert_eq!(v["slot"], 0);

@@ -15,15 +15,32 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use time::OffsetDateTime;
 
+/// `bui status` 那几行 `/api/health` 里没有的东西（P2 的 `HealthResponse` 是回归锁死的
+/// 形状，不许往里加字段），全部从期望态 + `runtime.json` 读出来。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StatusExtra<'a> {
+    /// 住宅 HY2 凭据池（spec §3.1）：`(已用, 容量, 第几代)`
+    pub pool: (usize, usize, u64),
+    /// nft 端口跳跃表期望的规则条数（`render::nft::rule_count`）
+    pub nft_rules: usize,
+    /// 兼容段的闭区间；`None` = `bui set hy2-resi-compat off` 之后已收口
+    pub compat_range: Option<(u16, u16)>,
+    /// 兼容段的**累计**命中（T12 落在 `runtime.json` 的那份，**绝不是活 counter**）；
+    /// `None` = 守护进程还没采过一轮
+    pub compat_hits: Option<&'a crate::commands::nft::CompatHits>,
+}
+
 /// 把 `/api/health` 渲染成人读文本。
 ///
-/// `hy2_auth` 与 `legacy_sub_until` 单独传：`/api/health` 里没有这两位（P2 的
+/// `hy2_auth` / `legacy_sub_until` / `extra` 单独传：`/api/health` 里没有它们（P2 的
 /// `HealthResponse` 是回归锁死的形状），而运维在排「谁都登不上」时第一件要看的就是当前
-/// 走的是 http 还是 command，排「订阅取不到」时要看旧用户名链接还认不认。
+/// 走的是 http 还是 command，排「订阅取不到」时要看旧用户名链接还认不认，排「住宅 HY2
+/// 全员被拒」时要看凭据池、nft 表与门位重放这三行（4.1，spec §2.4 / §3.1 / §3.4）。
 pub fn format_status(
     h: &HealthResponse,
     hy2_auth: Hy2Auth,
     legacy_sub_until: Option<&str>,
+    extra: &StatusExtra<'_>,
     now: OffsetDateTime,
 ) -> String {
     let mut out = vec![format!(
@@ -63,6 +80,13 @@ pub fn format_status(
         }
     ));
     out.push(format_legacy_sub(legacy_sub_until, now));
+    out.push(format_hy2_pool(extra.pool));
+    out.push(format_nft_table(
+        extra.nft_rules,
+        extra.compat_range,
+        extra.compat_hits,
+    ));
+    out.push(format_gate_replay(h.residential.as_ref()));
     if let Some(r) = &h.reconcile {
         out.push(format!(
             "上次对账    {}  变更 {} 项{}",
@@ -139,6 +163,81 @@ pub fn format_legacy_sub(until: Option<&str>, now: OffsetDateTime) -> String {
     }
 }
 
+/// `bui status` 的「住宅 HY2 凭据池」一行（4.1，spec §3.1）。
+///
+/// 空闲耗尽会把建用户 / 轮换推到「当场扩容 ⇒ 重写 `hy2-residential.json` ⇒ 重启
+/// `hysteria-residential`」那条路上（全体住宅 HY2 会话重连一次），所以已用 / 容量是运维
+/// 要盯的第一个数。「第 N 代」= 池被重写过几次，日志与事件按它指称。
+pub fn format_hy2_pool((used, size, generation): (usize, usize, u64)) -> String {
+    let low =
+        size > 0 && (used as f64) > (1.0 - bui_schema::hy2pool::LOW_FREE_RATIO) * (size as f64);
+    format!(
+        "住宅 HY2 凭据池：已用 {used} / {size}，第 {generation} 代{}",
+        if low {
+            format!(
+                "（空闲不足 {}%，下次建用户会触发扩容 + 住宅内核重启）",
+                (bui_schema::hy2pool::LOW_FREE_RATIO * 100.0) as u32
+            )
+        } else {
+            String::new()
+        }
+    )
+}
+
+/// `bui status` 的「nft 表」一行（4.1，spec §2.4）。
+///
+/// 这张 `inet bui` 表就是住宅 HY2 的端口跳跃：整段 `41000-50000` REDIRECT 到单一监听
+/// 端口。表没了 ⇒ 带 `mport` 的现役订阅全部连不上，所以规则条数要能一眼对上
+/// [`rule_count`](bui_schema::render::nft::rule_count)。
+///
+/// **兼容段那一句读的是持久化的累计命中，绝不是活 counter**（2026-09-16 裁决）：
+/// `ruleset` 每次重放都先 `flush table`，活计数被清回 0；拿它当下线判据会把仍在用的
+/// 兼容段判成闲置并关掉，全部还没刷订阅的 4.0 住宅用户当场断联。累计值由守护进程在每次
+/// 重放**之前**采样累加（`modules::watchdog`，T12），`None` = 还没采过一轮。
+pub fn format_nft_table(
+    rules: usize,
+    compat: Option<(u16, u16)>,
+    hits: Option<&crate::commands::nft::CompatHits>,
+) -> String {
+    let table = bui_schema::render::nft::TABLE;
+    let Some((a, b)) = compat else {
+        return format!("nft 表 {table}：{rules} 条规则；兼容段已下线");
+    };
+    let tail = match hits {
+        Some(hits) => format!("最近命中 {} 次（自 {}）", hits.total, hits.quiet_since()),
+        // T12 的采样还没落地（守护进程刚起、或那段代码还没合进来）：**明说不知道**，
+        // 别打一个 0 出来让人当成「30 天没人用了，可以关」
+        None => "命中统计未就绪（守护进程还没采过一轮）".to_string(),
+    };
+    format!("nft 表 {table}：{rules} 条规则；兼容段 {a}-{b} {tail}")
+}
+
+/// `bui status` 的「门位重放」一行（4.1，spec §3.4）。
+///
+/// 不开 `cache_file`（spec §14 裁决 1）⇒ 住宅 sing-box 每次重启都把每个 `gate-<id>`
+/// selector 打回 `default = deny`、住宅 HY2 全员 fail-closed，由 b-ui 按退避重放真实门位。
+/// 重放最终失败时那条告警留在住宅告警表里（`gates::GATE_REPLAY_FAIL_ALERT` 前缀），
+/// 下一次全部成功时被认领清掉 —— 所以「有没有那条告警」就是这一行的判据。
+///
+/// 读的是 `/api/health` 里的住宅摘要（`residential.alerts`）：守护进程没跑时本地探测
+/// 那份摘要是 `None`，此时如实说「未知」而不是「正常」。
+pub fn format_gate_replay(residential: Option<&serde_json::Value>) -> String {
+    let Some(v) = residential else {
+        return "门位重放：未知（守护进程未运行）".to_string();
+    };
+    let fail = v
+        .get("alerts")
+        .and_then(|a| a.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|x| x.as_str())
+        .find(|s| s.starts_with(crate::modules::panel::gates::GATE_REPLAY_FAIL_ALERT));
+    match fail {
+        None => "门位重放：正常".to_string(),
+        Some(why) => format!("门位重放：失败（{why}）"),
+    }
+}
+
 /// `bui status` 末尾显示几条事件（spec §5.7；全量看 `bui incidents`）
 pub const STATUS_INCIDENTS: usize = 5;
 
@@ -176,21 +275,51 @@ pub async fn run_with(
             local_health(&paths, host).await?
         }
     };
-    // 鉴权模式与旧链接宽限期读期望态：守护进程在不在跑都读得到，`--json` 那一支不动
-    // （`HealthResponse` 的形状是 P2 锁死的回归面）。
-    let (hy2_auth, legacy_sub_until) = match Store::open(crate::paths::state_file(&paths)).await {
-        Ok(store) => {
-            let s = store.read().await;
-            (s.system.hy2_auth, s.system.legacy_sub_until.clone())
-        }
-        Err(_) => (Hy2Auth::default(), None),
+    // 鉴权模式、旧链接宽限期、凭据池与 nft 表都读期望态：守护进程在不在跑都读得到，
+    // `--json` 那一支不动（`HealthResponse` 的形状是 P2 锁死的回归面）。
+    let (hy2_auth, legacy_sub_until, pool, nft_rules, compat_range) =
+        match Store::open(crate::paths::state_file(&paths)).await {
+            Ok(store) => {
+                let s = store.read().await;
+                let used = s
+                    .users
+                    .iter()
+                    .filter_map(|u| u.credentials.hy2_resi_cred.as_deref())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len();
+                let compat = s.system.hy2_resi_compat_ports;
+                (
+                    s.system.hy2_auth,
+                    s.system.legacy_sub_until.clone(),
+                    (
+                        used,
+                        s.residential.hy2_pool.creds.len(),
+                        s.residential.hy2_pool.generation,
+                    ),
+                    bui_schema::render::nft::rule_count(compat),
+                    compat.then(|| bui_schema::render::nft::compat_range(&s.node.ports)),
+                )
+            }
+            Err(_) => (Hy2Auth::default(), None, (0, 0, 0), 0, None),
+        };
+    // **兼容段的累计命中读 `runtime.json` 的持久值，绝不读活 counter**（2026-09-16 裁决）。
+    let hits = crate::commands::nft::compat_hits(
+        &crate::state::runtime::Runtime::load(crate::paths::runtime_file(&paths))
+            .read()
+            .await,
+    );
+    let extra = StatusExtra {
+        pool,
+        nft_rules,
+        compat_range,
+        compat_hits: hits.as_ref(),
     };
     if json {
         println!("{}", serde_json::to_string_pretty(&health)?);
     } else {
         println!(
             "{}",
-            format_status(&health, hy2_auth, legacy_sub_until.as_deref(), now)
+            format_status(&health, hy2_auth, legacy_sub_until.as_deref(), &extra, now)
         );
         let (recent, _) =
             crate::modules::sentinel::incidents::load_recent(&socket, &paths, STATUS_INCIDENTS)
@@ -326,13 +455,129 @@ mod tests {
             }],
             watchdog: Default::default(),
             upgrade_available: Some("4.0.1".into()),
-            residential: None,
+            // 住宅摘要（`modules::residential::state::health_summary` 的形状）：
+            // 告警表为空 ⇒ 门位重放这一行报「正常」
+            residential: Some(serde_json::json!({ "alerts": [] })),
         }
+    }
+
+    /// 「住宅 HY2 凭据池 / nft 表 / 门位重放」这三行的输入（4.1）
+    fn extra_with_pool() -> StatusExtra<'static> {
+        StatusExtra {
+            pool: (1, 32, 3),
+            nft_rules: 4,
+            compat_range: Some((40001, 40007)),
+            compat_hits: None,
+        }
+    }
+
+    fn hits(total: u64, last: Option<&str>, since: &str) -> crate::commands::nft::CompatHits {
+        crate::commands::nft::CompatHits {
+            total,
+            last_hit_at: last.map(str::to_string),
+            since: since.to_string(),
+        }
+    }
+
+    /// T14 的三行新输出（纯函数，不碰机器）。
+    #[test]
+    fn status_reports_the_pool_the_nft_table_and_the_replay() {
+        let h = hits(0, None, "2026-09-15T00:00:00Z");
+        let extra = StatusExtra {
+            compat_hits: Some(&h),
+            ..extra_with_pool()
+        };
+        let text = format_status(&sample(), Hy2Auth::Http, None, &extra, t0());
+        assert!(
+            text.contains("住宅 HY2 凭据池：已用 1 / 32，第 3 代"),
+            "{text}"
+        );
+        assert!(text.contains("nft 表 inet bui：4 条规则"), "{text}");
+        assert!(
+            text.contains("兼容段 40001-40007 最近命中 0 次（自 2026-09-15T00:00:00Z）"),
+            "{text}"
+        );
+        assert!(text.contains("门位重放：正常"), "{text}");
+    }
+
+    /// 兼容段的「最近命中」**读持久值，绝不读活 counter**（2026-09-16 裁决）：
+    /// 命中过 ⇒ 起算时刻是最近那一次；还没采过一轮 ⇒ 明说「未就绪」而不是打个 0
+    /// （打 0 会被当成「30 天没人用了，可以关」，关掉就是未刷订阅的 4.0 用户当场断联）。
+    #[test]
+    fn the_compat_line_never_pretends_an_unsampled_counter_is_zero() {
+        let none = format_nft_table(4, Some((40001, 40007)), None);
+        assert_eq!(
+            none,
+            "nft 表 inet bui：4 条规则；兼容段 40001-40007 命中统计未就绪（守护进程还没采过一轮）"
+        );
+        assert!(!none.contains("0 次"), "不许打成 0 次：{none}");
+        // 命中过：起算时刻用 last_hit_at，不是 since
+        let h = hits(7, Some("2026-09-16T12:00:00Z"), "2026-09-01T00:00:00Z");
+        assert_eq!(
+            format_nft_table(4, Some((40001, 40007)), Some(&h)),
+            "nft 表 inet bui：4 条规则；兼容段 40001-40007 最近命中 7 次（自 2026-09-16T12:00:00Z）"
+        );
+        // 关掉之后只剩两条规则，兼容段那一句换成「已下线」
+        assert_eq!(
+            format_nft_table(2, None, None),
+            "nft 表 inet bui：2 条规则；兼容段已下线"
+        );
+    }
+
+    /// 门位重放失败要在 `bui status` 里说出原因（spec §3.4）：没重放到的门**留在 deny**，
+    /// 那批住宅 HY2 用户握手成功但每个请求被拒，运维只有这一行能看出来为什么。
+    #[test]
+    fn a_failed_gate_replay_shows_up_with_its_reason() {
+        let why = format!(
+            "{}（Clash API 未就绪），门留在 deny，60 秒安全网继续收敛",
+            crate::modules::panel::gates::GATE_REPLAY_FAIL_ALERT
+        );
+        let mut h = sample();
+        h.residential = Some(serde_json::json!({ "alerts": [why.clone()] }));
+        let t = format_status(&h, Hy2Auth::Http, None, &extra_with_pool(), t0());
+        assert!(t.contains(&format!("门位重放：失败（{why}）")), "{t}");
+        assert!(!t.contains("门位重放：正常"), "{t}");
+        // 别的住宅告警不算门位重放失败
+        h.residential = Some(serde_json::json!({ "alerts": ["上游 407 凭据失效"] }));
+        assert!(
+            format_status(&h, Hy2Auth::Http, None, &extra_with_pool(), t0())
+                .contains("门位重放：正常")
+        );
+        // 守护进程没跑（本地探测那条路）⇒ 如实说未知，不许报「正常」
+        h.residential = None;
+        let t = format_status(&h, Hy2Auth::Http, None, &extra_with_pool(), t0());
+        assert!(t.contains("门位重放：未知（守护进程未运行）"), "{t}");
+    }
+
+    /// 空闲率跌破 20%（`hy2pool::LOW_FREE_RATIO`）要在这一行点名：下一次建用户 / 轮换
+    /// 会触发当场扩容 ⇒ 重写 `hy2-residential.json` ⇒ 重启住宅内核 ⇒ 全体会话重连一次。
+    #[test]
+    fn a_nearly_full_pool_says_the_next_new_user_restarts_the_kernel() {
+        assert!(format_hy2_pool((26, 32, 1)).contains("空闲不足 20%"));
+        assert!(
+            !format_hy2_pool((25, 32, 1)).contains("空闲不足"),
+            "20% 空闲不算低"
+        );
+        assert_eq!(
+            format_hy2_pool((3, 32, 3)),
+            "住宅 HY2 凭据池：已用 3 / 32，第 3 代"
+        );
+        // 池还没建（旧 state 首次启动）不许除零
+        assert_eq!(
+            format_hy2_pool((0, 0, 0)),
+            "住宅 HY2 凭据池：已用 0 / 0，第 0 代"
+        );
     }
 
     #[test]
     fn status_text_shows_units_uptime_errors_and_drift() {
-        let t = format_status(&sample(), Hy2Auth::Http, None, t0());
+        let t = format_status(
+            &sample(),
+            Hy2Auth::Http,
+            None,
+            &StatusExtra::default(),
+            t0(),
+        );
         assert!(t.contains("node-a"));
         assert!(t.contains("4.0.0"));
         assert!(t.contains("1h 2m"), "uptime 要人读得懂：{t}");
@@ -352,7 +597,7 @@ mod tests {
     fn a_same_version_rebuild_is_reported_as_a_new_build() {
         let mut h = sample();
         h.upgrade_available = Some(h.version.clone());
-        let t = format_status(&h, Hy2Auth::Http, None, t0());
+        let t = format_status(&h, Hy2Auth::Http, None, &StatusExtra::default(), t0());
         assert!(t.contains("同版本的新构建"), "{t}");
         assert!(t.contains("bui upgrade"), "要说清下一步怎么做：{t}");
         assert!(
@@ -364,13 +609,25 @@ mod tests {
     /// 排「谁都登不上」时第一眼要看的就是这一行（2026-09-13 裁决：默认 http，command 是退路）。
     #[test]
     fn status_text_names_the_current_hysteria_auth_mode() {
-        let t = format_status(&sample(), Hy2Auth::Http, None, t0());
+        let t = format_status(
+            &sample(),
+            Hy2Auth::Http,
+            None,
+            &StatusExtra::default(),
+            t0(),
+        );
         assert!(
             t.contains("鉴权模式") && t.contains("auth.type=http"),
             "{t}"
         );
         assert!(!t.contains("auth.type=command"), "{t}");
-        let t = format_status(&sample(), Hy2Auth::Command, None, t0());
+        let t = format_status(
+            &sample(),
+            Hy2Auth::Command,
+            None,
+            &StatusExtra::default(),
+            t0(),
+        );
         assert!(t.contains("auth.type=command") && t.contains("退路"), "{t}");
         assert!(!t.contains("auth.type=http"), "{t}");
     }
@@ -380,16 +637,34 @@ mod tests {
     #[test]
     fn status_text_says_whether_the_username_links_still_work() {
         // 没设宽限期（全新装机、或运维 `bui set legacy-sub off`）⇒ 已停用
-        let t = format_status(&sample(), Hy2Auth::Http, None, t0());
+        let t = format_status(
+            &sample(),
+            Hy2Auth::Http,
+            None,
+            &StatusExtra::default(),
+            t0(),
+        );
         assert!(t.contains("旧订阅链接  已停用"), "{t}");
         // 宽限期内 ⇒ 报还剩多久
-        let t = format_status(&sample(), Hy2Auth::Http, Some("2026-09-21T00:00:00Z"), t0());
+        let t = format_status(
+            &sample(),
+            Hy2Auth::Http,
+            Some("2026-09-21T00:00:00Z"),
+            &StatusExtra::default(),
+            t0(),
+        );
         assert!(
             t.contains("旧订阅链接  用户名链接还剩 7d 0h 到期（2026-09-21T00:00:00Z）"),
             "{t}"
         );
         // 到期 ⇒ 已过期
-        let t = format_status(&sample(), Hy2Auth::Http, Some("2026-09-13T23:59:59Z"), t0());
+        let t = format_status(
+            &sample(),
+            Hy2Auth::Http,
+            Some("2026-09-13T23:59:59Z"),
+            &StatusExtra::default(),
+            t0(),
+        );
         assert!(
             t.contains("旧订阅链接  已过期（2026-09-13T23:59:59Z）"),
             "{t}"
@@ -409,7 +684,7 @@ mod tests {
         h.reconcile = None;
         h.drift.clear();
         h.upgrade_available = None;
-        let t = format_status(&h, Hy2Auth::Http, None, t0());
+        let t = format_status(&h, Hy2Auth::Http, None, &StatusExtra::default(), t0());
         assert!(t.contains("无漂移"));
         assert!(!t.contains("重启失败"));
         assert!(!t.contains("4.0.1"));

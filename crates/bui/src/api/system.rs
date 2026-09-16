@@ -176,6 +176,54 @@ pub async fn set_obfs(State(app): State<AppState>, Json(req): Json<ObfsRequest>)
     }
 }
 
+/// `POST /api/system/hy2-resi-compat`（4.1，spec §2.4）：住宅 HY2 的 4.0 兼容段开关。
+///
+/// **下线门禁不在这里**，在 CLI 那一侧（`commands::config::switch_hy2_resi_compat`）：判据
+/// 是 `runtime.json` 里持久化的累计命中，本地就读得到，而且要在改任何东西之前就拒掉。
+/// 这个端点只负责写期望态 + 发事件，让对账重放 `inet bui` 并同步防火墙端口。
+pub async fn set_hy2_resi_compat(
+    State(app): State<AppState>,
+    Json(req): Json<ObfsRequest>,
+) -> Response {
+    let on = match crate::commands::config::parse_obfs(&req.value) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    };
+    let mut changed = false;
+    let res = app
+        .store
+        .update(|s| {
+            if s.system.hy2_resi_compat_ports != on {
+                s.system.hy2_resi_compat_ports = on;
+                changed = true;
+            }
+        })
+        .await;
+    match res {
+        Ok(_) => {
+            if changed {
+                app.bus.send(Event::StateChanged("hy2-resi-compat"));
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"ok": true, "enabled": on, "changed": changed})),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 /// `POST /api/services/{unit}/{action}`；`unit` 只接受 `reconcile::is_managed_unit` 认的名字
 /// （4.1 起就是那六个固定名字：带序号的住宅实例已退役进 `LEGACY_UNITS`），其余 400。
 pub async fn service_action(

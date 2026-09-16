@@ -32,7 +32,11 @@ pub fn router(state: AppState, modules: &[Arc<dyn Module>]) -> axum::Router {
             "/api/system/legacy-sub",
             axum::routing::post(system::set_legacy_sub),
         )
-        .route("/api/system/obfs", axum::routing::post(system::set_obfs));
+        .route("/api/system/obfs", axum::routing::post(system::set_obfs))
+        .route(
+            "/api/system/hy2-resi-compat",
+            axum::routing::post(system::set_hy2_resi_compat),
+        );
     let protected = modules
         .iter()
         .fold(protected, |acc, m| acc.merge(m.routes()));

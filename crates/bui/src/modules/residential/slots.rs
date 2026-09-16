@@ -35,11 +35,6 @@ pub struct SlotSync {
     pub released: Vec<Slot>,
     /// 因此被重新分配的用户数
     pub reassigned: usize,
-    /// 手里那份订阅已经不能用、**必须重新拉订阅**的用户，按原因分三组（见
-    /// [`slots::resubscribe_impact`]）：HY2 住宅节点的端口或跳跃段被这次写入改了。
-    /// 在同一个临界区里按写入前后两份期望态算出 —— 调用方自己先 `store.read()` 再算
-    /// 会拿到过期名单（两步之间可能插进另一次 add / assign / rebalance / remove）。
-    pub impact: slots::ResubscribeImpact,
 }
 
 /// **改住宅池并同步槽位的唯一入口**：在同一次 `Store::update_as` 里改组、同步槽位表、
@@ -50,9 +45,9 @@ pub struct SlotSync {
 /// 只改模式 / 关键字 / 优先级这类**不动池成员**的写入继续用
 /// `state::update_group`，不必经过这里。
 ///
-/// 返回的 [`SlotSync::impact`] 是这次写入之后必须重新拉订阅的用户（按原因分三组），
-/// 执行路径（`upstream::add` 与 `upstream::remove`）都要把它逐组打给操作者 ——
-/// **加上游也要**：跳跃段按当下槽数等分，多一个槽就把每个存活槽的段重切一遍。
+/// **改槽不再影响任何人手里那份订阅**（4.1，spec §1.2 目标 1）：住宅 HY2 只有一个监听
+/// 端口、整段跳跃由 `table inet bui` 送进去，端口与区间与槽位无关，所以这里没有
+/// 「必须重新获取订阅」的名单可报（4.0.x 的 `resubscribe_impact` 已随之删除）。
 pub async fn update_group_slots_as(
     store: &Store,
     bus: &EventBus,
@@ -63,7 +58,6 @@ pub async fn update_group_slots_as(
     let out = &mut sync;
     store
         .update_as(caller, |s| {
-            let before = s.clone();
             let g = s
                 .residential
                 .groups
@@ -72,7 +66,6 @@ pub async fn update_group_slots_as(
             f(g);
             out.released = slots::sync_slots(&mut s.residential);
             out.reassigned = slots::migrate_unassigned(s);
-            out.impact = slots::resubscribe_impact(&before, s);
         })
         .await?;
     bus.send(Event::StateChanged("residential"));
@@ -671,54 +664,49 @@ async fn restart_fallback(ctx: &DaemonCtx, want_hash: &str, err: &str) -> Conver
 /// 成功返回 `true`、发 `StateChanged("residential")` 并置脏标记 —— 收尾（gRPC 增删）由
 /// 那次 `StateChanged` 触发的对账末尾的 [`converge_xray`] 负责，**调用方不要自己去调 gRPC**。
 ///
-/// 第二个返回值是**必须重新拉订阅**的用户（[`slots::resubscribe_impact`]）：换槽把他的
-/// HY2 住宅端口与跳跃段一起改了，而那两样写死在已下发的订阅里。名单在**这次写入的临界区
-/// 里**算出，调用方自己前后 `read()` 会拿到过期名单。
+/// **换槽不动订阅**（4.1）：住宅 HY2 的端口与跳跃区间与槽位无关，换槽只改 Xray 的住宅
+/// 路由与门位指向的出站，客户端手里那份订阅照旧可用 —— 所以这里不返回任何「要重新获取
+/// 订阅」的名单。
 pub async fn assign_user(
     ctx: &DaemonCtx,
     user_id: Uuid,
     slot_upstream_id: Uuid,
-) -> anyhow::Result<(bool, slots::ResubscribeImpact)> {
-    let mut out = (false, slots::ResubscribeImpact::default());
-    let o = &mut out;
+) -> anyhow::Result<bool> {
+    let mut ok = false;
+    let o = &mut ok;
     ctx.store
         .update(|s| {
-            let before = s.clone();
-            o.0 = slots::assign(s, user_id, slot_upstream_id);
-            o.1 = slots::resubscribe_impact(&before, s);
+            *o = slots::assign(s, user_id, slot_upstream_id);
         })
         .await?;
-    if out.0 {
+    if ok {
         ctx.bus.send(Event::StateChanged("residential"));
         mark_xray_rules_dirty(&ctx.runtime).await;
     }
-    Ok(out)
+    Ok(ok)
 }
 
-/// spec §5.6 规则 3：把住宅用户在各槽间均匀重排。返回被改动的用户数，以及**必须重新拉
-/// 订阅**的用户（口径同 [`assign_user`]）。
+/// spec §5.6 规则 3：把住宅用户在各槽间均匀重排。返回被改动的用户数（**不动任何人的
+/// 订阅**，口径同 [`assign_user`]）。
 ///
 /// **只写 state + 置脏 + 发事件，不自己碰 xray**（D7）：让那次 `StateChanged` 触发的对账
 /// 把新的 `xray-config.json` 写下去（给下次启动用），对账末尾的 [`converge_xray`] 再走
 /// `RoutingService` gRPC 把**被挪动的那些用户**的规则增删掉 —— 从按下按钮到槽路由生效
 /// 约 1 秒（500ms 去抖 + 一轮对账），**xray 不重启、在线连接不断**。
-pub async fn rebalance_users(ctx: &DaemonCtx) -> anyhow::Result<(usize, slots::ResubscribeImpact)> {
-    let mut out = (0usize, slots::ResubscribeImpact::default());
-    let o = &mut out;
+pub async fn rebalance_users(ctx: &DaemonCtx) -> anyhow::Result<usize> {
+    let mut moved = 0usize;
+    let o = &mut moved;
     ctx.store
         .update(|s| {
-            let before = s.clone();
-            o.0 = slots::rebalance(s);
-            o.1 = slots::resubscribe_impact(&before, s);
+            *o = slots::rebalance(s);
         })
         .await?;
-    let moved = out.0;
     if moved > 0 {
         ctx.bus.send(Event::StateChanged("residential"));
         mark_xray_rules_dirty(&ctx.runtime).await;
         tracing::info!(moved, "住宅用户按槽重排（spec §5.6 规则 3），等对账后收口");
     }
-    Ok(out)
+    Ok(moved)
 }
 
 // ── 按槽驱动 selector（spec §5.6，裁决 D8）────────────────────────────────────
@@ -1368,40 +1356,51 @@ mod tests {
         )
     }
 
-    /// `assign_user` / `rebalance_users` 都要在**自己那次写入的临界区里**算出必须重新拉
-    /// 订阅的人（换槽 = 端口与跳跃段一起变），否则面板与 CLI 只会说「已重排 N 个用户」，
-    /// 那 N 个人的住宅 HY2 会一直反复断联到他们各自刷新订阅为止。
+    /// 4.1 的退役判据（spec §1.2 目标 1）：`assign_user` / `rebalance_users` 只报「动了
+    /// 几个人」，**不再报「谁要重新获取订阅」** —— 换槽只改 Xray 的住宅路由与门位指向的
+    /// 出站，住宅 HY2 的端口（`40000`）与跳跃区间（整段 `41000-50000`）与槽位无关。
     #[tokio::test]
-    async fn assign_and_rebalance_report_who_must_refetch_the_subscription() {
+    async fn assign_and_rebalance_move_slots_without_touching_subscriptions() {
         let d = tempfile::tempdir().unwrap();
         let (store, bus) = store_with(d.path(), 2, 2).await;
         let (ctx, _host) = ctx_of(d.path(), store.clone(), bus.clone()).await;
         migrate_on_start(&store, &bus).await.unwrap(); // u1 → 槽 0，u2 → 槽 1
+                                                       // 有凭据才渲染得出住宅 HY2 节点（spec §3.1）
+        migrate_hy2_pool_on_start(&ctx).await.unwrap();
         let slot0 = slots::sorted(&store.read().await.residential)[0].upstream_id;
         let u2 = store.read().await.users[1].user_id;
-
-        // assign：u2 槽 1 → 槽 0（40001 → 40000，跳跃段一起下移）
-        let (ok, impact) = assign_user(&ctx, u2, slot0).await.unwrap();
-        assert!(ok);
-        assert_eq!(
-            impact,
-            slots::ResubscribeImpact {
-                slot_removed: vec![],
-                slot_moved: vec!["u2".to_string()],
-                hop_resliced: vec![],
+        let node_of = |name: &'static str| {
+            let store = store.clone();
+            async move {
+                let s = store.read().await;
+                let u = s.users.iter().find(|u| u.username == name).unwrap();
+                bui_schema::nodes::nodes_for(u, &s.node, &s.residential)
+                    .into_iter()
+                    .find(|n| n.kind == bui_schema::nodes::NodeKind::Hy2Residential)
+                    .map(|n| (n.port, n.hop))
             }
-        );
+        };
+        let before = node_of("u2").await;
+        assert_eq!(before, Some((40000, Some((41000, 50000)))));
 
-        // rebalance：把 u2 摊回槽 1，同一份口径
-        let (moved, impact) = rebalance_users(&ctx).await.unwrap();
-        assert_eq!(moved, 1);
-        assert_eq!(impact.slot_moved, vec!["u2".to_string()]);
-        assert_eq!(impact.total(), 1);
+        // assign：u2 槽 1 → 槽 0（4.0.x 下端口 40001 → 40000、跳跃段一起下移）
+        assert!(assign_user(&ctx, u2, slot0).await.unwrap());
+        {
+            let s = store.read().await;
+            let u = s.users.iter().find(|u| u.username == "u2").unwrap();
+            assert_eq!(
+                slots::index_of_user(u, &s.residential),
+                0,
+                "他确实换了槽 —— 否则这条用例什么都没验"
+            );
+        }
+        assert_eq!(node_of("u2").await, before, "换槽不许动订阅");
 
-        // 零改动 ⇒ 空名单
-        let (moved, impact) = rebalance_users(&ctx).await.unwrap();
-        assert_eq!(moved, 0);
-        assert!(impact.is_empty());
+        // rebalance：把 u2 摊回槽 1
+        assert_eq!(rebalance_users(&ctx).await.unwrap(), 1);
+        assert_eq!(node_of("u2").await, before, "重排不许动订阅");
+        // 零改动仍是零
+        assert_eq!(rebalance_users(&ctx).await.unwrap(), 0);
     }
 
     #[tokio::test]
@@ -1858,17 +1857,6 @@ mod tests {
             vec![2]
         );
         assert_eq!(sync.reassigned, 1, "只有那个槽的用户被重分配");
-        assert_eq!(
-            sync.impact,
-            slots::ResubscribeImpact {
-                slot_removed: vec!["u3".to_string()],
-                slot_moved: vec![],
-                hop_resliced: vec!["u2".to_string(), "u5".to_string()],
-            },
-            "名单与这次写入出自同一个临界区，而且按原因分组：u3 的槽被删（40002 → 40000）\
-             = 组一，u2 / u5 的跳跃区间被重切（44000-46999 → 45500-50000）= 组三；\
-             槽 0 的 u1 / u4 旧区间仍是新区间的前缀，一组都不进"
-        );
         let s = store.read().await;
         assert_eq!(slots::indices(&s.residential), vec![0, 1]);
         assert!(
@@ -2044,7 +2032,7 @@ mod tests {
             (s.users[0].user_id, s.users[1].user_id)
         };
         let slot1 = second_slot_id(&ctx).await;
-        assert!(assign_user(&ctx, moved, slot1).await.unwrap().0);
+        assert!(assign_user(&ctx, moved, slot1).await.unwrap());
         x.clear_calls();
         assert!(matches!(
             converge_xray(&ctx, &x).await,
@@ -2191,7 +2179,7 @@ mod tests {
         land_xray_config(&ctx, &host).await;
         let uid = ctx.store.read().await.users[0].user_id;
         let slot1 = second_slot_id(&ctx).await;
-        assert!(assign_user(&ctx, uid, slot1).await.unwrap().0);
+        assert!(assign_user(&ctx, uid, slot1).await.unwrap());
         let x = FakeXray::new();
         x.with(|i| {
             i.fail_on.insert("list-rules".into());
@@ -2429,7 +2417,7 @@ mod tests {
         x.with(|i| i.fail_on.clear());
         let uid = ctx.store.read().await.users[0].user_id;
         let slot1 = second_slot_id(&ctx).await;
-        assert!(assign_user(&ctx, uid, slot1).await.unwrap().0);
+        assert!(assign_user(&ctx, uid, slot1).await.unwrap());
         assert!(matches!(
             converge_xray(&ctx, &x).await,
             ConvergeOutcome::Applied(_)
@@ -2449,7 +2437,7 @@ mod tests {
         state::update(&ctx.runtime, |r| r.xray_slot_rules_dirty = false).await;
         let uid = ctx.store.read().await.users[0].user_id;
         let target = second_slot_id(&ctx).await;
-        assert!(assign_user(&ctx, uid, target).await.unwrap().0);
+        assert!(assign_user(&ctx, uid, target).await.unwrap());
         assert!(state::read(&ctx.runtime).await.xray_slot_rules_dirty);
     }
 
@@ -2778,7 +2766,7 @@ mod tests {
             .unwrap();
         state::update(&ctx.runtime, |r| r.xray_slot_rules_dirty = false).await;
 
-        assert_eq!(rebalance_users(&ctx).await.unwrap().0, 3);
+        assert_eq!(rebalance_users(&ctx).await.unwrap(), 3);
         let s = ctx.store.read().await;
         let mut load = vec![0usize; 3];
         for u in &s.users {
@@ -2793,7 +2781,7 @@ mod tests {
             "rebalance 自己不碰 xray：收口交给对账末尾的 converge_xray（走 gRPC 增删，D7）"
         );
         // 幂等
-        assert_eq!(rebalance_users(&ctx).await.unwrap().0, 0);
+        assert_eq!(rebalance_users(&ctx).await.unwrap(), 0);
     }
 
     #[tokio::test]

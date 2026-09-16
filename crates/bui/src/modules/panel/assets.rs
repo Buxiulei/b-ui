@@ -410,4 +410,53 @@ mod tests {
             "app.js 读的 key 变了，投影那一侧要一起改"
         );
     }
+
+    /// 同一条契约给 T14 的 `hy2ResiGate`：`PanelUser` 声明 `hy2_resi_gate` **当且仅当**
+    /// 写了 `rename = "hy2ResiGate"`，而 app.js 读的就是那个驼峰名。
+    ///
+    /// 漏了 rename 的后果与 `subToken` 那条同款且更隐蔽：投影发出 `hy2_resi_gate`，
+    /// 前端 `x.hy2ResiGate` 对每个用户都是 `undefined` ⇒ 到期 / 封禁用户的「拒绝」标记
+    /// 整个消失（看上去人人正常），而 fmt / clippy / 全量测试照样全绿。
+    #[test]
+    fn the_panel_user_gate_key_is_exactly_what_app_js_reads() {
+        let users_rs = include_str!("users.rs");
+        assert_eq!(
+            users_rs.contains("pub hy2_resi_gate:"),
+            users_rs.contains("rename = \"hy2ResiGate\""),
+            "PanelUser 的 hy2_resi_gate 必须带 #[serde(rename = \"hy2ResiGate\")]"
+        );
+        let js = String::from_utf8(web_file("app.js").unwrap()).unwrap();
+        assert!(
+            js.contains("x.hy2ResiGate"),
+            "app.js 读的 key 变了，投影那一侧要一起改"
+        );
+    }
+
+    /// T14 的前端验收（没有前端测试框架，判据钉在这里）：
+    ///
+    /// 1. 「必须重新获取订阅」那一圈渲染**全部删掉** —— 留着就是在教运维去做一件 4.1 里
+    ///    毫无意义的事（住宅 HY2 单端口 + 整段跳跃由 `table inet bui` 送进去，改槽不动订阅）；
+    /// 2. spec §6 的到期 / 封禁语义**必须在页面上说出来**：住宅 HY2 那条路握手照旧成功、
+    ///    每个请求被拒，不写它运维会把「用户说还连着但打不开」当成面板数据不对。
+    #[test]
+    fn app_js_retired_the_resubscribe_machinery_and_states_the_deny_semantics() {
+        let js = String::from_utf8(web_file("app.js").unwrap()).unwrap();
+        for gone in [
+            "_RESI_IMPACT_GROUPS",
+            "_resiImpact",
+            "port_changed",
+            "slot_removed",
+            "hop_resliced",
+        ] {
+            assert!(!js.contains(gone), "app.js 里还留着「{gone}」");
+        }
+        assert!(js.contains("_DENY_SEMANTICS"), "spec §6 的文案没了");
+        for must in [
+            "住宅 HY2 客户端仍会显示已连接",
+            "所有请求会被拒绝",
+            "直连节点在连接时即被拒",
+        ] {
+            assert!(js.contains(must), "spec §6 的文案缺「{must}」");
+        }
+    }
 }

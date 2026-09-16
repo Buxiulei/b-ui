@@ -211,6 +211,158 @@ async fn switch_obfs(value: &str, paths: &Paths, socket: &Path) -> Result<String
     Ok(obfs_notice(on, true, false))
 }
 
+// ── `bui set hy2-resi-compat on|off`（4.1，spec §2.4）─────────────────────────
+
+/// 兼容段下线的**门禁判据**（2026-09-17 裁决）：满足它才允许不带 `--force` 关掉。
+///
+/// 判据是「**一次都没命中过** 且静默满 30 天」。为什么不能只看静默时长：兼容段的 counter
+/// 是 **nat 链**计数，只计每条 conntrack 流的首包（`man nft`），一个 24×7 不断线的 4.0
+/// 客户端只在建连那一刻记 1 次，之后几十天一动不动 ⇒ 只看静默就会把**正在用**的兼容段
+/// 判成闲置并关掉，那批还没刷订阅的 4.0 住宅用户当场断联。所以命中过就只能人工 `--force`。
+///
+/// `None`（统计还没就绪）一律返回 `false` —— **fail-closed**，误判方向是危险的那一侧。
+///
+/// **T12 依赖**：这三个值由 `modules::watchdog` 每轮采样写进 `runtime.json`
+/// （`CompatHits`），T12 合并之前这里恒为 `None` ⇒ `off` 一律要 `--force`。T12 合并后把
+/// 本函数体换成 `hits.is_some_and(|h| h.idle_for_takedown(now))` 即可（判据一处、两边同源）。
+pub fn compat_idle_for_takedown(
+    hits: Option<&crate::commands::nft::CompatHits>,
+    now: time::OffsetDateTime,
+) -> bool {
+    let Some(h) = hits else { return false };
+    if h.total > 0 {
+        return false;
+    }
+    match crate::util::parse_rfc3339(h.quiet_since()) {
+        // 起算时刻读不出来（字段被人改坏）⇒ 不判闲置
+        None => false,
+        Some(t) => now - t >= time::Duration::days(COMPAT_IDLE_DAYS),
+    }
+}
+
+/// 兼容段自动判闲置要静默多少天（spec §2.4：「连续 30 天为 0」）。
+pub const COMPAT_IDLE_DAYS: i64 = 30;
+
+/// 拒绝下线时那段话：把人判断需要的三个值**全部**打出来（spec §2.4）。
+fn compat_refusal(hits: Option<&crate::commands::nft::CompatHits>) -> String {
+    let detail = match hits {
+        Some(h) => format!(
+            "累计命中 {} 次；最近一次 {}；起算时刻 {}",
+            h.total,
+            h.last_hit_at.as_deref().unwrap_or("从未"),
+            h.since
+        ),
+        None => "命中统计未就绪（守护进程还没采过一轮）".to_string(),
+    };
+    format!(
+        "拒绝关闭住宅 HY2 的 4.0 兼容段：{detail}。\n         关掉它 = `inet bui` 删掉 {} 那两条 REDIRECT 规则 + 防火墙收口，\n         **全部还没刷订阅的 4.0 住宅用户当场断联**（他们的订阅里是裸 `40000+槽序号`）。\n         判据是连续 {COMPAT_IDLE_DAYS} 天累计命中为 0；确认无人在用请加 --force。",
+        "40001-40007"
+    )
+}
+
+/// 改完之后的那段说明（状态 + 下一步）。
+fn compat_notice(on: bool, changed: bool, daemon: bool, forced: bool) -> String {
+    if !changed {
+        return if on {
+            "住宅 HY2 的 4.0 兼容段已经是开启状态，无需改动。".into()
+        } else {
+            "住宅 HY2 的 4.0 兼容段已经是关闭状态，无需改动。".into()
+        };
+    }
+    let head = if on {
+        "住宅 HY2 的 4.0 兼容段已开启（40001-40007 一并 REDIRECT 到单一监听端口）。"
+    } else {
+        "住宅 HY2 的 4.0 兼容段已关闭（`inet bui` 只剩两条规则，防火墙同步收口）。"
+    };
+    let warn = if !on && forced {
+        "\n**这是 --force 下线**：还在用裸 `40000+槽序号` 订阅的 4.0 用户会立刻断联，让他们重新获取一次订阅。"
+    } else {
+        ""
+    };
+    let apply = if daemon {
+        "对账会重放 `inet bui` 并同步防火墙端口。"
+    } else {
+        "守护进程没在跑，请执行 `bui reconcile`（或 `bui nft apply`）让它生效。"
+    };
+    format!("{head}{warn}\n{apply}")
+}
+
+pub async fn run_hy2_resi_compat(
+    value: &str,
+    force: bool,
+    paths: Paths,
+    host: Arc<dyn Host>,
+) -> Result<()> {
+    run_hy2_resi_compat_with(
+        value,
+        force,
+        paths,
+        host,
+        PathBuf::from(crate::paths::SOCKET_PATH),
+    )
+    .await
+}
+
+/// 口径与 [`run_obfs_with`] 完全一致：socket 通就交给守护进程写，没跑才自己写。
+pub async fn run_hy2_resi_compat_with(
+    value: &str,
+    force: bool,
+    paths: Paths,
+    host: Arc<dyn Host>,
+    socket: PathBuf,
+) -> Result<()> {
+    println!(
+        "{}",
+        switch_hy2_resi_compat(value, force, &paths, &socket, host.now()).await?
+    );
+    Ok(())
+}
+
+/// [`run_hy2_resi_compat_with`] 的本体：返回要打印的那段话（单元测试直接断言它）。
+///
+/// 门禁在**这一处**（不在守护进程那一侧）：`runtime.json` 本地就读得到，而且要在改任何
+/// 东西之前就拒掉。
+async fn switch_hy2_resi_compat(
+    value: &str,
+    force: bool,
+    paths: &Paths,
+    socket: &Path,
+    now: time::OffsetDateTime,
+) -> Result<String> {
+    let on = parse_obfs(value)?; // 同一套 on/off 判据
+    let hits = crate::commands::nft::compat_hits(
+        &crate::state::runtime::Runtime::load(crate::paths::runtime_file(paths))
+            .read()
+            .await,
+    );
+    if !on && !force && !compat_idle_for_takedown(hits.as_ref(), now) {
+        anyhow::bail!("{}", compat_refusal(hits.as_ref()));
+    }
+    let client = crate::ipc::Client::new(socket);
+    if client.available().await {
+        let (status, body) = client
+            .request(
+                "POST",
+                "/api/system/hy2-resi-compat",
+                Some(serde_json::json!({"value": if on { "on" } else { "off" }})),
+            )
+            .await?;
+        if !(200..300).contains(&status) {
+            anyhow::bail!("守护进程拒绝了这次修改（HTTP {status}）：{body}");
+        }
+        let changed = body["changed"].as_bool().unwrap_or(true);
+        return Ok(compat_notice(on, changed, true, force));
+    }
+    let store = Store::open(crate::paths::state_file(paths)).await?;
+    if store.read().await.system.hy2_resi_compat_ports == on {
+        return Ok(compat_notice(on, false, false, force));
+    }
+    store
+        .update(|s| s.system.hy2_resi_compat_ports = on)
+        .await?;
+    Ok(compat_notice(on, true, false, force))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,6 +381,149 @@ mod tests {
             .await
             .unwrap();
         (d, paths)
+    }
+
+    fn t0() -> time::OffsetDateTime {
+        time::macros::datetime!(2026-10-20 00:00:00 UTC)
+    }
+
+    fn hits(total: u64, last: Option<&str>, since: &str) -> crate::commands::nft::CompatHits {
+        crate::commands::nft::CompatHits {
+            total,
+            last_hit_at: last.map(str::to_string),
+            since: since.to_string(),
+        }
+    }
+
+    /// 兼容段下线门禁（spec §2.4 / 2026-09-17 裁决）：**只有「一次都没命中过 + 静默满 30
+    /// 天」才允许不带 `--force`**，其余一律拒。
+    ///
+    /// 误判方向是危险的那一侧：兼容段的 counter 是 nat 链计数，只计每条 conntrack 流的
+    /// 首包，一个 24×7 不断线的 4.0 客户端只在建连那一刻记 1 次 —— 只看静默时长就会把
+    /// **正在用**的兼容段判成闲置并关掉，那批还没刷订阅的 4.0 住宅用户当场断联。
+    #[test]
+    fn the_takedown_gate_fails_closed_on_everything_but_a_provably_idle_range() {
+        // 统计未就绪（T12 的采样还没落地 / 守护进程刚起）⇒ 不判闲置
+        assert!(!compat_idle_for_takedown(None, t0()));
+        // 一次都没命中 + 静默 30 天 ⇒ 放行
+        let idle = hits(0, None, "2026-09-15T00:00:00Z");
+        assert!(compat_idle_for_takedown(Some(&idle), t0()));
+        // 差一天都不行
+        assert!(!compat_idle_for_takedown(
+            Some(&idle),
+            time::macros::datetime!(2026-10-14 23:59:59 UTC)
+        ));
+        // **命中过就永不自动判闲置**，哪怕最近那一次已经过了一年
+        let hit_long_ago = hits(1, Some("2025-01-01T00:00:00Z"), "2024-01-01T00:00:00Z");
+        assert!(
+            !compat_idle_for_takedown(Some(&hit_long_ago), t0()),
+            "nat 链只计首包：一个常连的 4.0 客户端几十天只记 1 次"
+        );
+        // 起算时刻被人改坏 ⇒ 不判闲置
+        assert!(!compat_idle_for_takedown(
+            Some(&hits(0, None, "下周")),
+            t0()
+        ));
+        assert_eq!(COMPAT_IDLE_DAYS, 30, "spec §2.4：连续 30 天为 0");
+    }
+
+    /// `bui set hy2-resi-compat off` 在门禁不放行时**必须拒绝并打出三个值**（total /
+    /// 最近一次 / 起算时刻），由人判断；`--force` 才放过，且警告那批人会断联。
+    #[tokio::test]
+    async fn turning_the_compat_range_off_needs_force_until_it_is_provably_idle() {
+        let (d, paths) = scratch().await;
+        let sock = d.path().join("nope.sock");
+        // 统计未就绪 ⇒ 拒绝，state 一个字节不动
+        let e = switch_hy2_resi_compat("off", false, &paths, &sock, t0())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("拒绝关闭"), "{e}");
+        assert!(e.contains("命中统计未就绪"), "{e}");
+        assert!(e.contains("--force"), "要说清下一步怎么做：{e}");
+        assert!(e.contains("当场断联"), "要说清代价：{e}");
+        let store = Store::open(crate::paths::state_file(&paths)).await.unwrap();
+        assert!(
+            store.read().await.system.hy2_resi_compat_ports,
+            "被拒的那次不许改期望态"
+        );
+
+        // 命中过 ⇒ 拒绝，且三个值都要打出来给人判断
+        let rt = crate::state::runtime::Runtime::load(crate::paths::runtime_file(&paths));
+        rt.update(|r| {
+            r.extra.insert(
+                crate::commands::nft::COMPAT_HITS_KEY.into(),
+                serde_json::json!({
+                    "total": 12, "seen": 12,
+                    "last_hit_at": "2026-10-19T10:00:00Z",
+                    "since": "2026-09-01T00:00:00Z",
+                }),
+            );
+        })
+        .await;
+        let e = switch_hy2_resi_compat("off", false, &paths, &sock, t0())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("累计命中 12 次"), "{e}");
+        assert!(e.contains("最近一次 2026-10-19T10:00:00Z"), "{e}");
+        assert!(e.contains("起算时刻 2026-09-01T00:00:00Z"), "{e}");
+
+        // `--force` 放过，并警告那批人会断联
+        let out = switch_hy2_resi_compat("off", true, &paths, &sock, t0())
+            .await
+            .unwrap();
+        assert!(out.contains("4.0 兼容段已关闭"), "{out}");
+        assert!(out.contains("--force 下线"), "{out}");
+        assert!(out.contains("会立刻断联"), "{out}");
+        // 每次都重开：`Store` 缓存自己那份内存副本，写盘的是 switch 里另开的那个句柄
+        let reopen = || async {
+            Store::open(crate::paths::state_file(&paths))
+                .await
+                .unwrap()
+                .read()
+                .await
+                .system
+                .hy2_resi_compat_ports
+        };
+        assert!(!reopen().await);
+
+        // 再 off 一次：已经是这个状态 ⇒ 零改动（门禁照旧先过，所以还得带 --force）
+        assert!(switch_hy2_resi_compat("off", true, &paths, &sock, t0())
+            .await
+            .unwrap()
+            .contains("已经是关闭状态"));
+        // 开回来不需要 --force（开兼容段没有风险）
+        let out = switch_hy2_resi_compat("on", false, &paths, &sock, t0())
+            .await
+            .unwrap();
+        assert!(out.contains("4.0 兼容段已开启"), "{out}");
+        assert!(reopen().await);
+    }
+
+    /// 真正闲置（一次都没命中 + 静默 30 天）⇒ 不用 `--force` 也能关。
+    #[tokio::test]
+    async fn a_provably_idle_compat_range_comes_down_without_force() {
+        let (d, paths) = scratch().await;
+        let sock = d.path().join("nope.sock");
+        crate::state::runtime::Runtime::load(crate::paths::runtime_file(&paths))
+            .update(|r| {
+                r.extra.insert(
+                    crate::commands::nft::COMPAT_HITS_KEY.into(),
+                    serde_json::json!({
+                        "total": 0, "seen": 0, "since": "2026-09-15T00:00:00Z",
+                    }),
+                );
+            })
+            .await;
+        let out = switch_hy2_resi_compat("off", false, &paths, &sock, t0())
+            .await
+            .unwrap();
+        assert!(out.contains("4.0 兼容段已关闭"), "{out}");
+        assert!(!out.contains("--force 下线"), "不是强制下线：{out}");
+        let store = Store::open(crate::paths::state_file(&paths)).await.unwrap();
+        assert!(!store.read().await.system.hy2_resi_compat_ports);
+        drop(store);
     }
 
     /// 守护进程没跑时（socket 指向一个不存在的路径）就地改 `state.json`。

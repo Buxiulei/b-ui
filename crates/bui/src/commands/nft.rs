@@ -64,6 +64,51 @@ pub fn apply(host: &dyn Host, paths: &Paths) -> Result<String> {
     ))
 }
 
+/// 兼容段累计命中的**只读投影**：T12 的 watchdog 每轮采样之前读一次活 counter、把增量
+/// 累加进 `runtime.json` 的 `hy2_resi_compat_hits` 键（`modules::watchdog::CompatHits`），
+/// 字段名与这里逐字相同。
+///
+/// **`bui status` 与下线门禁一律读这份持久值，绝不读活 counter**（2026-09-16 裁决）：
+/// `render::nft::ruleset` 每次重放都先 `flush table`，开机 / `bui nft apply` / watchdog
+/// 自愈 / 改端口都把活计数清回 0，拿它当判据就会把**仍在用**的兼容段判成闲置并关掉，
+/// 全部还没刷订阅的 4.0 住宅用户当场断联 —— 而兼容段存在的唯一理由就是防这件事。
+///
+/// 这里只做**显示**：`total > 0` / `total == 0` 的判闲置策略在 T12 的
+/// `CompatHits::idle_for_takedown`（`total == 0` 且静默 ≥ 30 天），不在本文件重写一遍。
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+pub struct CompatHits {
+    /// 累计命中（量纲是 conntrack 流数：nat 链的 counter 只计每条流的首包）
+    #[serde(default)]
+    pub total: u64,
+    /// 最近一次涨过的时刻（`None` = 从没命中过）
+    #[serde(default)]
+    pub last_hit_at: Option<String>,
+    /// 开始统计的时刻（第一次采样）
+    #[serde(default)]
+    pub since: String,
+}
+
+/// T12 把 [`CompatHits`] 落在 `runtime.extra` 的这个键上。
+pub const COMPAT_HITS_KEY: &str = "hy2_resi_compat_hits";
+
+impl CompatHits {
+    /// 「从这一刻起没再命中过」：有过命中就是最近那一次，否则是开始统计的时刻。
+    pub fn quiet_since(&self) -> &str {
+        self.last_hit_at.as_deref().unwrap_or(&self.since)
+    }
+}
+
+/// 取持久化的兼容段命中数（`None` = 守护进程还没采过一轮，或字段坏了）。
+///
+/// **T12 依赖**：那份值由 `modules::watchdog` 的每轮 nft 校验写入；T12 合并之前这个键
+/// 永远不存在，于是 `bui status` 那一行报「命中统计未就绪」、下线门禁一律要 `--force`。
+pub fn compat_hits(rt: &crate::state::runtime::RuntimeData) -> Option<CompatHits> {
+    rt.extra
+        .get(COMPAT_HITS_KEY)
+        .cloned()
+        .and_then(|v| serde_json::from_value(v).ok())
+}
+
 /// 表在不在 + 四条规则的**瞬时**流计数。
 ///
 /// 这里打出来的 counter **不是**兼容段的下线判据（2026-09-16 裁决）：`flush table` 每次

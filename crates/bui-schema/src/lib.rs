@@ -34,9 +34,10 @@
 //!   由 [`slots::resources_of`] 从 [`Ports`](model::Ports) 与槽序号纯函数算出。
 //! - [`slots::sync_slots`] / [`slots::least_loaded`] / [`slots::assign`] /
 //!   [`slots::migrate_unassigned`] / [`slots::rebalance`]：spec §5.6 的分配规则，纯函数。
-//! - [`slots::resubscribe_impact`]：比对改池前后两份期望态，算出手里那份订阅已经不能用的
-//!   用户名，按后果分成 [`slots::ResubscribeImpact`] 三组（槽位被删 / 槽位序号被搬到 0 /
-//!   跳跃区间被重切）；改池的执行路径据此逐组提示操作者哪些人要重新获取订阅。
+//! - **没有「必须重新获取订阅」这回事了**（4.1，spec §1.2 目标 1）：住宅 HY2 只有一个
+//!   监听端口、整段跳跃由 `table inet bui` 送进去，每个用户的端口与区间完全相同、与槽位
+//!   无关，所以增删上游 / `assign` / `rebalance` 都不动已下发的订阅。4.0.x 那套按原因分
+//!   三组的 `resubscribe_impact` / `ResubscribeImpact` 随之删除。
 //!
 //! ## 住宅 HY2 凭据池 —— [`hy2pool`]
 //!
