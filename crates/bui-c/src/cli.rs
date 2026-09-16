@@ -489,9 +489,10 @@ struct Stored {
     /// 存量重复（spec §5.8）：命令行只提示，菜单问一句要不要合并
     dups: Vec<DupGroup>,
     /// ① 里活动节点被挡下（[`Blocked::ActiveEntry`]）时的留存者名：菜单据此追问
-    /// 「切换到 {keep}？」（spec §5.4 ①、§5.10）。本版只写不读，等 T11 接进菜单；接的时候
-    /// 按 §5.10 用 `after` 过滤候选——本批当场并掉的名字只从 `added` / `names` / `replaced` /
-    /// `restored` 四个名单里清，这里不清，所以这里的名字不保证还在列表里（审查 T9 r1 M7）
+    /// 「切换到 {keep}？」（spec §5.4 ①、§5.10），排在 `added` 前面——它关系到当前节点
+    /// 正停在旧参数上。本批当场并掉的名字只从 `added` / `names` / `replaced` / `restored`
+    /// 四个名单里清，这里不清，所以这里的名字不保证还在列表里（审查 T9 r1 M7）：
+    /// [`menu_import`] 用导完之后的列表过滤一遍再问
     switch_to: Vec<String>,
 }
 
@@ -1695,9 +1696,16 @@ fn switch_node<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>, name: Stri
 const LOCK_WAIT: Duration = Duration::from_secs(15);
 /// 第一次没拿到锁时说一句（然后才开始等）。容量口径 51 列。
 const LOCK_WAITING: &str = "另一个 bui-c 操作正在进行，等它结束（最多 15 秒）…";
-/// 等不到锁：别的 bui-c 正在改东西（退出码 1，spec §0.2 R15）。锁在动手之前拿，所以
-/// 「什么都没改」在每个入口都成立。容量口径 51 列。
+/// 等不到锁：别的 bui-c 正在改东西（退出码 1，spec §0.2 R15）。**顶层入口**都在动手之前拿锁，
+/// 「这次什么都没改」才成立；菜单 `[3]` 与 `[7]`→`[3]` 墓碑答 y 的第二趟（[`menu_import`] /
+/// [`menu_import_v3`]）是**已知例外**——第一趟（`save_import` / `import_v3_cmd`）早写过盘了，
+/// 这一趟自己再拿一次锁，拿不到报的仍是这一句（account-match spec §9，rc 既有行为，留待后续）。
+/// 合并那一次另用 [`menu::MERGE_LOCK_BUSY`]。容量口径 51 列。
 const LOCK_BUSY: &str = "另一个 bui-c 操作还没结束，这次什么都没改，稍后再试";
+// 菜单 `[3]` 合并那一次拿不到锁时打的那一句是 [`menu::MERGE_LOCK_BUSY`]：用户可见文案一律
+// 收在 `menu`，宽度才盖得到——卡它的是 `menu::tests::dups_head_caps_the_list_and_masks_names`
+// 里的两条断言（裸文案 ≤ 59 列、带「失败：」前缀进「上次：」行不被 60 列尾截），
+// `every_line_fits_by_budget` 里那两格只守字符归类与「折得开」。
 
 /// 顶层入口拿锁（spec §8.3、§0.2 R11）：先试一次；没拿到就说一句「在等」并冲出去（人看得到
 /// 为什么卡住），再每 250ms 试一次，最多 15 秒，还拿不到报 [`LOCK_BUSY`]。`--json` 下那一句不打。
@@ -3026,15 +3034,24 @@ const PASTE_PROMPT: &str = "粘贴节点链接或订阅地址";
 
 /// 菜单 `[3] 导入节点`：节点链接与面板 / 订阅地址都从这一个口子进。
 ///
-/// 导入失败只打「失败：…」留在菜单里。导入了新节点、而活动节点不在其中时追问一次要不要
-/// 切过去——命令行 `bui-c import` 不问，保持非交互。
+/// 导入失败只打「失败：…」留在菜单里。导入完最多追问三句，固定顺序是
+/// **墓碑 → 存量重复 → 切换**（spec §5.10），三句都在 [`save_import`] 放锁之后问
+/// （§0.2 R11）——命令行 `bui-c import` 一句也不问，保持非交互：
 ///
-/// 回主菜单停不停照 [`outcome_since`]：失败、有附加行（面板退回订阅、跳过…）就停；「上次：」行
-/// 一律是导入结果本身（[`Ctx::say_result`] 标的那一行），不会被它前面的附加提示占掉。追问过
-/// 「切换到新导入的 X？」或墓碑那一问的，人已经在提问处看过导入结果：答 y 用切换的结果，答否不再停。
+/// 1. **墓碑**（§7）：命中的节点先不写入，问一句要不要加回，答 y 拿同一批节点另拿一次锁
+///    再导一次（只导这几个，不再联网）；
+/// 2. **存量重复**（§5.8 D2）：同一账号还有几条停在旧端口或旧凭据上，问一句要不要合并，
+///    答 y 走 [`menu_merge_dups`]（再拿一次锁、重读、一次写盘）；
+/// 3. **切换**（§5.10）：候选按 `switch_to` → 本趟 `added` → 墓碑第二趟 `added` 排，先把按 D9
+///    改过名的留存者换成新名字，再拿导完之后的列表过滤掉已经不存在的名字（合并掉的自然
+///    出局）；只问第一个候选，活动节点已是候选就不问。换端口、改名、合并都不是新节点，
+///    都不弹这一问。
 ///
-/// 墓碑（spec §5.7）：命中的节点先不写入，导入之后、**放锁之后**（`save_import` 里的锁已经放了，
-/// spec §0.2 R11）问一句要不要加回，答 y 拿同一批节点再导一次（只导这几个，不再联网）。
+/// 回主菜单停不停照 [`outcome_since`]：失败、有附加行（面板退回订阅、跳过、端口变化…）就停；
+/// 「上次：」行一律是导入结果本身（[`Ctx::say_result`] 标的那一行），不会被它前面的附加提示占掉。
+/// 问过一句就不再多停一次，但只算提问**之前**打的行——那些人已经在提问处看过了。答完之后
+/// 才打的行（第二趟导入的结果、合并与改名那几句）没人看过，后面又没有别的问句时照旧停一次
+/// （§10 F7）。
 fn menu_import<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<Outcome> {
     let start = ctx.transcript.len();
     let lines: Vec<String> = ctx
@@ -3047,11 +3064,6 @@ fn menu_import<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<
     if lines.is_empty() {
         return Ok(note(ctx, "已取消，没有导入任何节点"));
     }
-    let before: Vec<String> = Profiles::load(ctx.sys, ctx.paths)?
-        .profiles
-        .into_iter()
-        .map(|p| p.name)
-        .collect();
     // 取节点与落盘分两步：墓碑那一问答 y 时要拿同一批节点再导一次，不能再去联网
     let imported = match lines.as_slice() {
         [url] if source::is_http_url(url) => fetch_http(ctx, url),
@@ -3092,46 +3104,137 @@ fn menu_import<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<
             return Ok(outcome_since(ctx, start));
         }
     };
-    // 墓碑那一问：答 y 另拿一次锁，只把这几个导回来（spec §5.7、§0.2 R11）
-    let mut asked = false;
+    // 切换候选（spec §5.10）：`switch_to` 排最前——它关系到当前节点正停在旧参数上；
+    // `bool` 是问句的措辞（真正新增的才是「新导入的」）。不再拿导入前后的名字求差集：
+    // 改名（token 名被洗掉）与合并会让差集里冒出「新名字」，误问「切换到新导入的 X？」
+    let mut cands: Vec<(String, bool)> = stored
+        .switch_to
+        .iter()
+        .map(|n| (n.clone(), false))
+        .chain(stored.added.iter().map(|n| (n.clone(), true)))
+        .collect();
+    // 三问的顺序：墓碑 → 存量重复 → 切换；每一问只兜住它之前打的行（spec §5.10、§13 R19）。
+    // `asked_at` 记最后一问时 transcript 的长度：提问之前的行人已经在提问处看过了，答完之后
+    // 才打的行没人看过，其后没有别的问句时照旧停一次
+    let mut asked_at: Option<usize> = None;
+    // 墓碑那一问：答 y 另拿一次锁，只把这几个导回来（spec §7、§0.2 R11）
     if !stored.buried.is_empty() {
-        asked = true;
         tell(ctx, menu::buried_head(&stored.buried));
         ctx.flush();
+        asked_at = Some(ctx.transcript.len());
         if ctx.prompt.confirm(menu::BURIED_ASK)? {
             let live = Profiles::load(ctx.sys, ctx.paths)?;
             let mut only = again;
             only.fetched.nodes.retain(|n| live.is_deleted(n));
-            if let Err(e) = save_import(ctx, only, false, true) {
-                ctx.say(format!("失败：{e}"));
-                return Ok(outcome_since(ctx, start));
+            match save_import(ctx, only, false, true) {
+                // 第二趟加回来的也是新节点，照样要问切换
+                Ok(second) => cands.extend(second.added.into_iter().map(|n| (n, true))),
+                Err(e) => {
+                    ctx.say(format!("失败：{e}"));
+                    return Ok(outcome_since(ctx, start));
+                }
             }
         }
     }
+    // 存量重复那一问（spec §5.8 D2）：名单已经在 `dups_head` 里打过了，这里只问一句。
+    // 同样在放锁之后：答 y 才另拿一次锁重读、合并
+    let mut merged: Vec<crate::profiles::Merged> = Vec::new();
+    if !stored.dups.is_empty() {
+        ctx.flush();
+        asked_at = Some(ctx.transcript.len());
+        if ctx.prompt.confirm(menu::MERGE_ASK)? {
+            match menu_merge_dups(ctx, &stored.dups) {
+                // 重读之后一组都没并成：别的会话删了、改了
+                Ok(done) if done.is_empty() => tell(ctx, menu::MERGE_NOTHING),
+                Ok(done) => merged = done,
+                Err(e) => {
+                    ctx.say(format!("失败：{e}"));
+                    return Ok(outcome_since(ctx, start));
+                }
+            }
+        }
+    }
+    // 留存者按 D9 取回规范名时（`c-2` → `c`）候选记的还是合并前那个名字：不换过来，下面那句
+    // 过滤就把它当成「已经不在了」，活动节点被挡下时该问的「切换到 {keep}？」会静默丢掉。
+    // 定稿 §5.10「过 after 过滤之前先按 `Merged::renamed_from` → `keeper` 换名」那一条
+    // （实现期补准，裁决二）
+    for (n, _) in &mut cands {
+        for m in &merged {
+            if m.renamed_from.as_deref() == Some(n.as_str()) {
+                n.clone_from(&m.keeper);
+            }
+        }
+    }
+    // 合并掉的、被别的会话删掉的那几个名字自然出局
     let after = Profiles::load(ctx.sys, ctx.paths)?;
-    let fresh: Vec<&str> = after
-        .profiles
-        .iter()
-        .map(|p| p.name.as_str())
-        .filter(|n| !before.iter().any(|b| b == n))
-        .collect();
+    cands.retain(|(n, _)| after.profiles.iter().any(|p| p.name == *n));
     let mut shown = outcome_since(ctx, start);
-    if asked {
-        // 墓碑那一问本身就是停顿：导入结果已经在提问处看过了
+    // 提问本身就是停顿，但只管提问之前打的行；答完之后才打的行（第二趟导入、合并与改名
+    // 那几句）没人看过，这一趟照旧停一次让人看到（§10 F7）
+    if asked_at.is_some_and(|at| matches!(outcome_since(ctx, at), Outcome::Nothing)) {
         shown = asked_is_a_pause(shown);
     }
-    let Some(first) = fresh.first() else {
+    let Some((first, fresh)) = cands.first() else {
         return Ok(shown);
     };
-    if after.active.as_deref().is_some_and(|a| fresh.contains(&a)) {
+    if after
+        .active
+        .as_deref()
+        .is_some_and(|a| cands.iter().any(|(n, _)| n == a))
+    {
         return Ok(shown); // 首次导入已经激活了新节点
     }
     ctx.flush();
-    if ctx.prompt.confirm(&format!("切换到新导入的 {first}？"))? {
-        return Ok(switch_node(ctx, first.to_string()));
+    if ctx.prompt.confirm(&menu::switch_ask(first, *fresh))? {
+        return Ok(switch_node(ctx, first.clone()));
     }
     // 提问本身就是停顿：导入结果已经在提问处看过了，答否回主菜单不再停
     Ok(asked_is_a_pause(shown))
+}
+
+/// 菜单 `[3]` 存量重复那一问答 y（spec §5.8 D2、§0.2 R11）：**另拿一次锁**、重读
+/// `profiles.json`、逐组 [`Profiles::merge_into`]、一次写盘、放锁，再把结果打出来。
+///
+/// 锁不能沿用 [`save_import`] 那一把：那把在问「要合并吗？」之前就放了，人看提示的这段时间里
+/// 别的会话可能已经改过节点列表——所以这里重读，[`Profiles::merge_into`] 自己再逐条核对
+/// （还在、同账号、不是活动节点），不满足的跳过。
+///
+/// 拿不到锁时报 [`menu::MERGE_LOCK_BUSY`]，不是 [`LOCK_BUSY`]：第一趟导入早就写过盘了，
+/// 「这次什么都没改」在这里不成立，没做的只有合并。
+///
+/// 返回并成的那几组（按 `dups` 的顺序）：一组都没并成时是空的，调用方打
+/// [`menu::MERGE_NOTHING`]；`renamed_from` 还要回填切换候选（D9，`menu_import`）。
+///
+/// 不 apply：留存者第 1 级就是活动节点，`others` 里永远没有它，合并只删别的条目、
+/// 顶多给留存者取回规范名（D9）——改名不是内容变化（§5.7）。
+fn menu_merge_dups<S: Sys, N: Net, P: Prompt>(
+    ctx: &mut Ctx<'_, S, N, P>,
+    dups: &[DupGroup],
+) -> Result<Vec<crate::profiles::Merged>> {
+    let Some(g) = wait_for_lock(ctx)? else {
+        return Err(Error::msg(menu::MERGE_LOCK_BUSY));
+    };
+    let mut prof = Profiles::load(ctx.sys, ctx.paths)?;
+    let done: Vec<crate::profiles::Merged> = dups
+        .iter()
+        .map(|d| prof.merge_into(&d.keeper, &d.others))
+        .filter(|m| !m.removed.is_empty())
+        .collect();
+    if done.is_empty() {
+        return Ok(done); // 一组都没并成：不写盘
+    }
+    prof.save(ctx.sys, ctx.paths)?;
+    drop(g);
+    for m in &done {
+        // 「已把 a、b 并入 X」里的 X 是合并那一刻人在列表上看到的名字：取回规范名时
+        // 它还叫 `-2`，改名由下一句单说——拿改完的新名字去拼会打出「已把 X 并入 X」
+        let shown = m.renamed_from.as_deref().unwrap_or(&m.keeper);
+        tell(ctx, menu::merged_line(&m.removed, shown));
+        if let Some(old) = &m.renamed_from {
+            tell(ctx, menu::renamed_line(old, &m.keeper));
+        }
+    }
+    Ok(done)
 }
 
 /// 菜单 `[7]` → `[3]` 从 v3 导入（spec §5.7 表第 3 行、§0.2 R11）：先照常导一趟，被墓碑挡下的
@@ -10282,7 +10385,8 @@ mod tests {
         let pp = paths();
         let url = "https://panel.example.com/api/nodes/alice";
         let (s, n) = all_buried(&pp, url);
-        let r = run_menu(&s, &n, &pp, &["3", url, "", "y", "0"], true);
+        // 末尾多一个空串：第二趟的结果是答完才打的，这一趟要停一次（R19），由它吃掉
+        let r = run_menu(&s, &n, &pp, &["3", url, "", "y", "", "0"], true);
         assert!(
             r.asked.iter().any(|q| q == menu::BURIED_ASK),
             "要问一句：{:?}\n{}",
@@ -10306,6 +10410,13 @@ mod tests {
         assert!(
             r.t.lines().any(|l| l == "  上次：导入 2 个新节点，共 2 个"),
             "{}",
+            r.t
+        );
+        assert_eq!(
+            pauses(&r.asked),
+            1,
+            "第二趟的结果是答完才打的，要停一次（§13 R19）：{:?}\n{}",
+            r.asked,
             r.t
         );
     }
@@ -10783,6 +10894,23 @@ mod tests {
         );
         assert_eq!(no_prompt_under_lock(&s, from, "[3] 导入"), 2, "{t}");
         assert_eq!(names(&s, &pp).len(), 2, "{t}");
+
+        // [3] 存量重复（T11，spec §5.8）：「要合并吗？」同样在放锁之后问，
+        // 答 y 另拿一次锁——不能沿用 save_import 那一把（它已经放了）
+        let (s, n) = (FakeSys::new(), FakeNet::new());
+        ready(&s);
+        // 进菜单那一下的收敛不该再占一把锁：夹具先 apply 一次，让数据面与节点列表一致
+        let prof = dup_machine(&s, &pp);
+        Engine::new(&s, &pp).apply(&prof).unwrap();
+        n.route(
+            &crate::source::nodes_url(PANEL_BASE, "alice"),
+            nodes_payload("alice", vec![resi_at(40009)]),
+        );
+        let from = s.calls().len();
+        let (t, asked) = logged_menu(&s, &n, &pp, &["3", url, "", "y", "", "0"]);
+        assert!(asked.iter().any(|q| q == menu::MERGE_ASK), "{asked:?}");
+        assert_eq!(no_prompt_under_lock(&s, from, "[3] 合并"), 2, "{t}");
+        assert_eq!(names(&s, &pp), vec!["alice-hy2-resi".to_string()], "{t}");
 
         // [4] 重启
         let (s, n) = (FakeSys::new(), FakeNet::new());
@@ -14794,5 +14922,1212 @@ mod tests {
         );
         assert!(!r.t.contains(TOKEN), "{}", r.t);
         assert!(!r.t.contains(&TOKEN[..8]), "{}", r.t);
+    }
+
+    // ───────────── T11：菜单 [3] 的三问（spec §5.8、§5.10、§11.3） ─────────────
+
+    const PROFILES_JSON: &str = "/opt/bui-c/profiles.json";
+    const PANEL_BASE: &str = "https://panel.example.com";
+
+    /// 菜单 `[3]` 的一串输入：菜单键 → 粘贴的每一行 → 空行结束粘贴 → `answers` → 回车 → `0`。
+    ///
+    /// 末尾那个空串两用：这一趟停了就被「回车返回菜单」吃掉，没停就是一次「直接回车重画」，
+    /// 两种走法后面都接得上 `0` 退出——用例因此不必先算准这一趟到底停不停。
+    fn import_inputs(paste: &[&str], answers: &[&str]) -> Vec<String> {
+        let mut v = vec!["3".to_string()];
+        v.extend(paste.iter().map(|x| x.to_string()));
+        v.push(String::new());
+        v.extend(answers.iter().map(|x| x.to_string()));
+        v.push(String::new());
+        v.push("0".to_string());
+        v
+    }
+
+    /// 面板节点表的路由，外加菜单里要粘的那条地址。
+    fn panel_net(user: &str, nodes: Vec<bui_schema::nodes::Node>) -> (FakeNet, String) {
+        let n = FakeNet::new();
+        n.route(
+            &crate::source::nodes_url(PANEL_BASE, user),
+            nodes_payload(user, nodes),
+        );
+        (n, format!("{PANEL_BASE}/api/nodes/{user}"))
+    }
+
+    /// 落盘一份列表，顺手把面板来源记上：不记的话每次面板导入都多打一行「自动更新来源改为 …」，
+    /// 数附加行的用例（66）会被它带偏。
+    fn listed_from_panel(
+        s: &FakeSys,
+        pp: &Paths,
+        entries: Vec<Profile>,
+        active: &str,
+        user: &str,
+    ) -> Profiles {
+        let mut prof = Profiles::new_default();
+        prof.profiles = entries;
+        prof.active = Some(active.into());
+        prof.panel = Some(crate::profiles::Panel {
+            base_url: PANEL_BASE.into(),
+            username: user.into(),
+        });
+        prof.save(s, pp).unwrap();
+        prof
+    }
+
+    /// 菜单 `[3]` 从面板导入一趟：`answers` 是粘完地址之后的那几个回答。
+    fn menu_panel(
+        s: &FakeSys,
+        pp: &Paths,
+        user: &str,
+        nodes: Vec<bui_schema::nodes::Node>,
+        answers: &[&str],
+    ) -> Ran {
+        let (n, url) = panel_net(user, nodes);
+        let inputs = import_inputs(&[&url], answers);
+        let refs: Vec<&str> = inputs.iter().map(String::as_str).collect();
+        run_menu(s, &n, pp, &refs, true)
+    }
+
+    /// 菜单 `[3]` 粘一个第三方订阅地址（不是面板路径 → [`Source::Subscription`]）。
+    fn menu_sub(s: &FakeSys, pp: &Paths, user: &str, uris: &[&str], answers: &[&str]) -> Ran {
+        let n = FakeNet::new();
+        let url = format!("https://sub.example.com/link/{user}");
+        n.route(&url, b64(&uris.join("\n")));
+        let inputs = import_inputs(&[&url], answers);
+        let refs: Vec<&str> = inputs.iter().map(String::as_str).collect();
+        run_menu(s, &n, pp, &refs, true)
+    }
+
+    /// [`WatchAsk`] 的钩子：问到那一句时替「别的会话」动手。
+    type AtAsk<'a> = Box<dyn Fn(&FakeSys) + 'a>;
+
+    /// 问到某一句时取一次样：那时 `profiles.json` 被写过几次、[`marks`] 是多少。用来钉住
+    /// 这一问**之后**发生了什么（用例 63、64）；`run_menu` 的 [`Scripted`] 插不进取样点。
+    ///
+    /// 每一问也照 [`LoggingPrompt`] 记一条 `ask …` 流水，[`no_prompt_under_lock`] 才查得到
+    /// 「持锁期间提问了」（审查 T11 r2 第 7 条）。
+    struct WatchAsk<'a> {
+        inner: Scripted,
+        sys: &'a FakeSys,
+        watch: &'static str,
+        seen: Option<(usize, (usize, usize))>,
+        /// 问到那一句时替「别的会话」动一下手（[`FakeSys::stage_on_lock`] 改盘、
+        /// [`FakeSys::lock_busy`] 占锁）：答 y 之后的那次拿锁就撞上它
+        hook: Option<AtAsk<'a>>,
+    }
+
+    impl<'a> WatchAsk<'a> {
+        fn new(sys: &'a FakeSys, watch: &'static str, inputs: &[String]) -> Self {
+            Self {
+                inner: Scripted {
+                    queue: inputs.iter().cloned().collect(),
+                    asked: Vec::new(),
+                    tty: true,
+                },
+                sys,
+                watch,
+                seen: None,
+                hook: None,
+            }
+        }
+
+        /// 问到那一句时跑一下 `f`。
+        fn at_ask(mut self, f: impl Fn(&FakeSys) + 'a) -> Self {
+            self.hook = Some(Box::new(f));
+            self
+        }
+
+        /// 取样点：问到那一句时才有值，没问到就是 `None`（用例据此确认这一问真的出现过）。
+        fn sampled(&self) -> (usize, (usize, usize)) {
+            self.seen.expect("这一趟根本没问到那一句")
+        }
+    }
+
+    impl Prompt for WatchAsk<'_> {
+        fn interactive(&self) -> bool {
+            self.inner.interactive()
+        }
+        fn read(&mut self, prompt: &str) -> Result<Option<String>> {
+            self.sys.mark(format!("ask {prompt}"));
+            self.inner.read(prompt)
+        }
+        fn lines_until_blank(&mut self, prompt: &str) -> Result<Vec<String>> {
+            self.sys.mark(format!("ask {prompt}"));
+            self.inner.lines_until_blank(prompt)
+        }
+        fn confirm(&mut self, prompt: &str) -> Result<bool> {
+            self.sys.mark(format!("ask {prompt}"));
+            // 取样在记完这一条流水之后：`marks` 存的是「问过这一句之后」的位置，
+            // `assert_not_applied` 从这里往后数重启才不会把提问本身算进去
+            if prompt == self.watch && self.seen.is_none() {
+                self.seen = Some((self.sys.writes(PROFILES_JSON), marks(self.sys)));
+                if let Some(f) = &self.hook {
+                    f(self.sys);
+                }
+            }
+            self.inner.confirm(prompt)
+        }
+    }
+
+    fn run_menu_with<P: Prompt>(s: &FakeSys, n: &FakeNet, pp: &Paths, p: &mut P) -> String {
+        let mut ctx = Ctx::new(s, n, pp, p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        ctx.transcript.clone()
+    }
+
+    fn resi_at(port: u16) -> bui_schema::nodes::Node {
+        bui_schema::nodes::Node {
+            port,
+            ..crate::testutil::hy2_resi_node()
+        }
+    }
+
+    /// 存量重复的夹具（用例 63、64）：active 停在 40003，另一条副本停在 40007。
+    fn dup_machine(s: &FakeSys, pp: &Paths) -> Profiles {
+        listed_from_panel(
+            s,
+            pp,
+            vec![
+                entry(
+                    "alice-hy2-resi",
+                    resi_at(40003),
+                    Source::ApiNodes,
+                    split_keywords(),
+                ),
+                entry(
+                    "alice-hy2-resi-2",
+                    resi_at(40007),
+                    Source::ApiNodes,
+                    split_keywords(),
+                ),
+            ],
+            "alice-hy2-resi",
+            "alice",
+        )
+    }
+
+    /// 60（§5.10）：端口原地挪了不是新节点，菜单不问切换。
+    #[test]
+    fn menu_import_port_move_does_not_offer_to_switch() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        listed_from_panel(
+            &s,
+            &pp,
+            vec![entry(
+                "alice-hy2-resi",
+                bui_schema::nodes::Node {
+                    hop: Some((44000, 45000)),
+                    ..resi_at(40003)
+                },
+                Source::ApiNodes,
+                split_keywords(),
+            )],
+            "alice-hy2-resi",
+            "alice",
+        );
+        let r = menu_panel(
+            &s,
+            &pp,
+            "alice",
+            vec![crate::testutil::hy2_resi_node()],
+            &[],
+        );
+        assert_eq!(
+            names(&s, &pp),
+            vec!["alice-hy2-resi".to_string()],
+            "{}",
+            r.t
+        );
+        assert_eq!(got(&s, &pp, "alice-hy2-resi").node.port, 40000, "{}", r.t);
+        assert!(
+            said_line(&r.t, &menu::port_moved_line("alice-hy2-resi", 40003, 40000)),
+            "{}",
+            r.t
+        );
+        assert!(
+            !r.asked.iter().any(|q| q.starts_with("切换到")),
+            "换端口的是同一条老节点，不该问切换：{:?}",
+            r.asked
+        );
+    }
+
+    /// 61（§5.10）：token 名被洗掉也不是新节点——问的是这一趟真正新增的那一条。
+    #[test]
+    fn menu_import_token_rename_does_not_offer_to_switch() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        listed_from_panel(
+            &s,
+            &pp,
+            vec![entry(
+                &token_name(),
+                resi_at(40003),
+                Source::ApiNodes,
+                split_keywords(),
+            )],
+            &token_name(),
+            "alice",
+        );
+        // 住宅那一条命中 token 名条目（改名 + 换端口），直连那一条是真正的新节点
+        let r = menu_panel(
+            &s,
+            &pp,
+            "alice",
+            vec![crate::testutil::hy2_resi_node(), hy2_direct_node()],
+            &["n"],
+        );
+        assert_eq!(
+            names(&s, &pp),
+            vec![HEALED_NAME.to_string(), "alice-hy2-direct".to_string()],
+            "{}",
+            r.t
+        );
+        assert!(
+            said_line(&r.t, &menu::renamed_line(&token_name(), HEALED_NAME)),
+            "{}",
+            r.t
+        );
+        assert_eq!(
+            r.asked
+                .iter()
+                .filter(|q| q.starts_with("切换到"))
+                .collect::<Vec<_>>(),
+            vec![&menu::switch_ask("alice-hy2-direct", true)],
+            "只问真正新增的那一条：{}",
+            r.t
+        );
+        assert!(!r.t.contains(TOKEN), "{}", r.t);
+    }
+
+    /// 62（§5.10）：墓碑答 y 第二趟加回来的节点仍然要问切换——第二趟的 `added` 不能丢。
+    #[test]
+    fn menu_import_second_pass_new_nodes_are_still_offered() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let mut prof = Profiles::new_default();
+        prof.profiles.push(entry(
+            "bob-hy2-direct",
+            crate::testutil::hy2_account_node("bob"),
+            Source::ApiNodes,
+            split_keywords(),
+        ));
+        prof.active = Some("bob-hy2-direct".into());
+        prof.panel = Some(crate::profiles::Panel {
+            base_url: PANEL_BASE.into(),
+            username: "alice".into(),
+        });
+        prof.bury(
+            &entry(
+                "alice-hy2-resi",
+                crate::testutil::hy2_resi_node(),
+                Source::ApiNodes,
+                split_keywords(),
+            ),
+            0,
+        );
+        prof.save(&s, &pp).unwrap();
+        // 墓碑答 y 加回来 → 随后仍要问切换，答 y 切过去
+        let r = menu_panel(
+            &s,
+            &pp,
+            "alice",
+            vec![crate::testutil::hy2_resi_node()],
+            &["y", "y"],
+        );
+        assert!(
+            r.asked.iter().any(|q| q == menu::BURIED_ASK),
+            "前提：先问墓碑：{:?}\n{}",
+            r.asked,
+            r.t
+        );
+        assert!(
+            r.asked.contains(&menu::switch_ask("alice-hy2-resi", true)),
+            "第二趟加回来的也是新节点：{:?}\n{}",
+            r.asked,
+            r.t
+        );
+        assert_eq!(
+            Profiles::load(&s, &pp).unwrap().active.as_deref(),
+            Some("alice-hy2-resi"),
+            "{}",
+            r.t
+        );
+    }
+
+    /// 62 的另一半（§5.10、§10 F7）：墓碑答 y 之后第二趟打了导入结果行，而加回来的这条一落盘
+    /// 就成了活动节点（这台机器本来没有活动节点）→ 后面一句都不问，那几行没人看过，得停一次。
+    #[test]
+    fn menu_import_second_pass_result_pauses_when_nothing_else_is_asked() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        // 节点还列着但没有活动节点：进菜单那一下不收敛（`tidy_for` → None），
+        // 第二趟加回来的那条因此自己就当上活动节点，切换一句都不用问
+        let mut prof = Profiles::new_default();
+        prof.profiles.push(entry(
+            "bob-hy2-direct",
+            crate::testutil::hy2_account_node("bob"),
+            Source::ApiNodes,
+            split_keywords(),
+        ));
+        prof.panel = Some(crate::profiles::Panel {
+            base_url: PANEL_BASE.into(),
+            username: "alice".into(),
+        });
+        prof.bury(
+            &entry(
+                "alice-hy2-resi",
+                crate::testutil::hy2_resi_node(),
+                Source::ApiNodes,
+                split_keywords(),
+            ),
+            0,
+        );
+        prof.save(&s, &pp).unwrap();
+        let r = menu_panel(
+            &s,
+            &pp,
+            "alice",
+            vec![crate::testutil::hy2_resi_node()],
+            &["y"],
+        );
+        assert!(
+            r.asked.iter().any(|q| q == menu::BURIED_ASK),
+            "前提：先问墓碑：{:?}\n{}",
+            r.asked,
+            r.t
+        );
+        assert_eq!(
+            Profiles::load(&s, &pp).unwrap().active.as_deref(),
+            Some("alice-hy2-resi"),
+            "前提：加回来的这条自己就是活动节点：{}",
+            r.t
+        );
+        assert_eq!(
+            r.asked
+                .iter()
+                .filter(|q| q.starts_with("切换到") || *q == menu::MERGE_ASK)
+                .count(),
+            0,
+            "前提：墓碑之后一句都不问：{:?}\n{}",
+            r.asked,
+            r.t
+        );
+        assert_eq!(
+            pauses(&r.asked),
+            1,
+            "第二趟的导入结果是答完之后才打的，没人看过：{:?}\n{}",
+            r.asked,
+            r.t
+        );
+    }
+
+    /// 63（§5.8 D2）：存量重复那一问默认 N（空行；EOF 经 [`Prompt::line`] 的 `unwrap_or_default`
+    /// 与空行同路，末尾再单跑一趟钉住）→ 两条都留着，提问之后不再写盘，也不再多停一次。
+    #[test]
+    fn menu_import_duplicates_answer_no_keeps_both() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        dup_machine(&s, &pp);
+        let (n, url) = panel_net("alice", vec![resi_at(40009)]);
+        let inputs = import_inputs(&[&url], &[]);
+        let mut p = WatchAsk::new(&s, menu::MERGE_ASK, &inputs);
+        let t = run_menu_with(&s, &n, &pp, &mut p);
+        assert!(
+            said_line(
+                &t,
+                &menu::dups_head("alice-hy2-resi", &["alice-hy2-resi-2".to_string()])
+            ),
+            "{t}"
+        );
+        assert_eq!(
+            names(&s, &pp),
+            vec!["alice-hy2-resi".to_string(), "alice-hy2-resi-2".to_string()],
+            "{t}"
+        );
+        assert_eq!(got(&s, &pp, "alice-hy2-resi").node.port, 40009, "{t}");
+        assert_eq!(
+            got(&s, &pp, "alice-hy2-resi-2").node.port,
+            40007,
+            "答 N 一条都不动：{t}"
+        );
+        assert!(
+            Profiles::load(&s, &pp).unwrap().deleted.is_empty(),
+            "合并不记墓碑：{t}"
+        );
+        assert!(
+            !t.contains(menu::DUPS_HINT_CLI),
+            "菜单里不提命令行的那句出路：{t}"
+        );
+        let (writes, _) = p.sampled();
+        assert_eq!(
+            s.writes(PROFILES_JSON),
+            writes,
+            "答 N 之后一个字节都不许再写：{t}"
+        );
+        assert_eq!(
+            pauses(&p.inner.asked),
+            0,
+            "存量重复那一问本身就是停顿，答完之后一行都没打：{t}"
+        );
+
+        // 真 EOF：队列在这一问处耗尽，走的是 `Prompt::line` 的 `unwrap_or_default`
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        dup_machine(&s, &pp);
+        let (n, url) = panel_net("alice", vec![resi_at(40009)]);
+        let mut p = Scripted::from(["3", url.as_str(), ""]);
+        let t = run_menu_with(&s, &n, &pp, &mut p);
+        assert!(p.asked.iter().any(|q| q == menu::MERGE_ASK), "{t}");
+        assert_eq!(
+            names(&s, &pp),
+            vec!["alice-hy2-resi".to_string(), "alice-hy2-resi-2".to_string()],
+            "EOF 也按 N：{t}"
+        );
+    }
+
+    /// 64（§5.8 D2）：答 y → 只剩 `pick_keeper` 选中的那条，名字不变、不记墓碑、不 apply。
+    #[test]
+    fn menu_import_duplicates_answer_yes_merges_and_keeps_the_keeper_name() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        dup_machine(&s, &pp);
+        let (n, url) = panel_net("alice", vec![resi_at(40009)]);
+        let inputs = import_inputs(&[&url], &["y"]);
+        let mut p = WatchAsk::new(&s, menu::MERGE_ASK, &inputs);
+        let t = run_menu_with(&s, &n, &pp, &mut p);
+        assert_eq!(names(&s, &pp), vec!["alice-hy2-resi".to_string()], "{t}");
+        assert_eq!(
+            got(&s, &pp, "alice-hy2-resi").node.port,
+            40009,
+            "留存者的名字与数据都不变：{t}"
+        );
+        assert_eq!(
+            Profiles::load(&s, &pp).unwrap().active.as_deref(),
+            Some("alice-hy2-resi"),
+            "{t}"
+        );
+        assert!(
+            Profiles::load(&s, &pp).unwrap().deleted.is_empty(),
+            "合并不记墓碑：{t}"
+        );
+        assert!(
+            said_line(
+                &t,
+                &menu::merged_line(&["alice-hy2-resi-2".to_string()], "alice-hy2-resi")
+            ),
+            "{t}"
+        );
+        let (writes, before) = p.sampled();
+        assert_eq!(s.writes(PROFILES_JSON), writes + 1, "合并只写一次盘：{t}");
+        assert_not_applied(&s, before, "合并不碰活动节点", &t);
+        assert_eq!(
+            p.inner
+                .asked
+                .iter()
+                .filter(|q| q.starts_with("切换到"))
+                .count(),
+            0,
+            "原地合并不是新节点：{:?}",
+            p.inner.asked
+        );
+        assert_eq!(
+            pauses(&p.inner.asked),
+            1,
+            "合并那几句是答完之后才打的，没人在提问处看过，得停一次：{t}"
+        );
+    }
+
+    /// 64 的另一半（§5.10、§10 F7）：合并答 y 之后还有「切换到 …？」那一问——合并结果行在
+    /// 那一问处就看到了，答 N 回主菜单不再多停一次（`asked_at` 只管提问之前打的行）。
+    #[test]
+    fn menu_import_merge_then_a_switch_question_does_not_pause_again() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        dup_machine(&s, &pp);
+        // 同一趟还来一个新账号：合并答 y 之后仍有一句切换可问，把结果行兜在它前面
+        let r = menu_panel(
+            &s,
+            &pp,
+            "alice",
+            vec![resi_at(40009), crate::testutil::hy2_account_node("bob")],
+            &["y", "n"],
+        );
+        assert!(
+            r.asked.iter().any(|q| q == menu::MERGE_ASK),
+            "前提：先问合并：{:?}\n{}",
+            r.asked,
+            r.t
+        );
+        assert!(
+            said_line(
+                &r.t,
+                &menu::merged_line(&["alice-hy2-resi-2".to_string()], "alice-hy2-resi")
+            ),
+            "前提：合并结果行是答完之后才打的：{}",
+            r.t
+        );
+        assert_eq!(
+            r.asked
+                .iter()
+                .filter(|q| q.starts_with("切换到"))
+                .collect::<Vec<_>>(),
+            vec![&menu::switch_ask("alice-hy2-direct", true)],
+            "前提：随后还有切换那一问：{:?}\n{}",
+            r.asked,
+            r.t
+        );
+        assert_eq!(
+            Profiles::load(&s, &pp).unwrap().active.as_deref(),
+            Some("alice-hy2-resi"),
+            "切换答 N 不切：{}",
+            r.t
+        );
+        assert_eq!(
+            pauses(&r.asked),
+            0,
+            "合并结果行在切换那一问处已经看过了：{:?}\n{}",
+            r.asked,
+            r.t
+        );
+    }
+
+    /// 65（§5.8 D9）：token 名的留存者先只能叫 `-2`，合并掉占着规范名的那条之后取回规范名。
+    #[test]
+    fn menu_import_merge_gives_a_token_keeper_the_canonical_name() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        listed_from_panel(
+            &s,
+            &pp,
+            vec![
+                entry(
+                    &token_name(),
+                    resi_at(40003),
+                    Source::ApiNodes,
+                    split_keywords(),
+                ),
+                entry(
+                    HEALED_NAME,
+                    crate::testutil::hy2_resi_node(),
+                    Source::ApiNodes,
+                    split_keywords(),
+                ),
+            ],
+            &token_name(),
+            "alice",
+        );
+        let numbered = format!("{HEALED_NAME}-2");
+        let r = menu_panel(
+            &s,
+            &pp,
+            "alice",
+            vec![crate::testutil::hy2_resi_node()],
+            &["y"],
+        );
+        assert!(
+            said_line(&r.t, &menu::renamed_line(&token_name(), &numbered)),
+            "规范名被同账号占着，先只能叫 -2：{}",
+            r.t
+        );
+        assert_eq!(names(&s, &pp), vec![HEALED_NAME.to_string()], "{}", r.t);
+        assert_eq!(
+            Profiles::load(&s, &pp).unwrap().active.as_deref(),
+            Some(HEALED_NAME),
+            "{}",
+            r.t
+        );
+        assert_eq!(got(&s, &pp, HEALED_NAME).node.port, 40000, "{}", r.t);
+        assert!(
+            said_line(
+                &r.t,
+                &menu::merged_line(&[HEALED_NAME.to_string()], &numbered)
+            ),
+            "并入的是那一刻还叫 -2 的留存者：{}",
+            r.t
+        );
+        assert!(
+            said_line(&r.t, &menu::renamed_line(&numbered, HEALED_NAME)),
+            "取回规范名要再说一句：{}",
+            r.t
+        );
+        assert!(!r.t.contains(TOKEN), "{}", r.t);
+    }
+
+    /// §5.8、§5.10：答 y 之后另拿一次锁重读，别的会话已经把该并的那条删了 → 一组都没并成，
+    /// 打「节点列表已经变了，没有合并」、一个字节都不写；那一份列表里连本趟新增的节点也没了
+    /// → `after` 过滤把候选清空，切换一句都不问。
+    #[test]
+    fn menu_import_merge_after_the_list_changed_says_so_and_asks_nothing() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        // 进菜单那一下的收敛不该再占一把锁：夹具先 apply 一次，让数据面与节点列表一致
+        let prof = dup_machine(&s, &pp);
+        Engine::new(&s, &pp).apply(&prof).unwrap();
+        // 别的会话把 -2 那条副本与本趟新增的 bob 都删了：合并那把锁一拿到就读到这份
+        let mut theirs = Profiles::new_default();
+        theirs.profiles = vec![entry(
+            "alice-hy2-resi",
+            resi_at(40009),
+            Source::ApiNodes,
+            split_keywords(),
+        )];
+        theirs.active = Some("alice-hy2-resi".into());
+        theirs.panel = Some(crate::profiles::Panel {
+            base_url: PANEL_BASE.into(),
+            username: "alice".into(),
+        });
+        let theirs = String::from_utf8(serde_json::to_vec_pretty(&theirs).unwrap()).unwrap();
+        let (n, url) = panel_net(
+            "alice",
+            vec![resi_at(40009), crate::testutil::hy2_account_node("bob")],
+        );
+        let inputs = import_inputs(&[&url], &["y"]);
+        let mut p = WatchAsk::new(&s, menu::MERGE_ASK, &inputs)
+            .at_ask(move |s| s.stage_on_lock(PROFILES_JSON, &theirs));
+        let from = s.calls().len();
+        let t = run_menu_with(&s, &n, &pp, &mut p);
+        // 前提：第一趟真把 bob 加进来了（不然下面「别问切换到它」那条断言静默空过——
+        // 它要查的是「加过、又被别的会话删掉、所以不问」，不是「压根没加过」）
+        assert!(
+            t.contains("导入 1 个新节点，共 3 个"),
+            "前提：第一趟把 bob 加进了列表：{t}"
+        );
+        assert!(said_line(&t, menu::MERGE_NOTHING), "{t}");
+        assert!(!t.contains("已把"), "一组都没并成，不许打合并结果行：{t}");
+        let (writes, _) = p.sampled();
+        assert_eq!(s.writes(PROFILES_JSON), writes, "一组都没并成就不写盘：{t}");
+        assert_eq!(names(&s, &pp), vec!["alice-hy2-resi".to_string()], "{t}");
+        assert_eq!(
+            p.inner
+                .asked
+                .iter()
+                .filter(|q| q.starts_with("切换到"))
+                .count(),
+            0,
+            "本趟新增的那条已经不在列表里了，别问切换到它：{:?}\n{t}",
+            p.inner.asked
+        );
+        // [`WatchAsk`] 也记 `ask …` 流水，下面那句「持锁期间没提问」才真的在查提问，
+        // MERGE_NOTHING 这条路的 R11 也就有了覆盖（审查 T11 r2 第 7 条）
+        assert!(
+            s.calls()[from..]
+                .iter()
+                .any(|c| *c == format!("ask {}", menu::MERGE_ASK)),
+            "前提：提问进了调用流水：{:?}",
+            s.calls()
+        );
+        assert_eq!(no_prompt_under_lock(&s, from, "[3] 合并"), 2, "{t}");
+        assert_eq!(
+            pauses(&p.inner.asked),
+            1,
+            "「没有合并」是答完之后才打的，没人看过：{t}"
+        );
+    }
+
+    /// §5.8、§0.2 R15：合并那次拿不到锁 → 打一句「失败：…」就回菜单，两条都留着、菜单停一次。
+    /// 文案不能沿用导入那句「这次什么都没改」：第一趟 `save_import` 早写过盘了，没做的只有合并。
+    #[test]
+    fn menu_import_merge_with_the_lock_busy_merges_nothing_and_says_so() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        dup_machine(&s, &pp);
+        let (n, url) = panel_net("alice", vec![resi_at(40009)]);
+        let inputs = import_inputs(&[&url], &["y"]);
+        // 第一趟那把锁早放了，问到「要合并吗？」这一刻才被别人占住
+        let mut p = WatchAsk::new(&s, menu::MERGE_ASK, &inputs).at_ask(|s| s.lock_busy(u32::MAX));
+        let t = run_menu_with(&s, &n, &pp, &mut p);
+        assert!(
+            said_line(&t, &format!("失败：{}", menu::MERGE_LOCK_BUSY)),
+            "{t}"
+        );
+        assert!(t.contains("等它结束"), "先说一句在等：{t}");
+        assert!(
+            !t.contains("这次什么都没改"),
+            "导入已经写过盘了，没做的只有合并：{t}"
+        );
+        assert_eq!(
+            names(&s, &pp),
+            vec!["alice-hy2-resi".to_string(), "alice-hy2-resi-2".to_string()],
+            "{t}"
+        );
+        assert_eq!(
+            got(&s, &pp, "alice-hy2-resi").node.port,
+            40009,
+            "导入本身照旧：{t}"
+        );
+        let (writes, _) = p.sampled();
+        assert_eq!(s.writes(PROFILES_JSON), writes, "合并没做，不写盘：{t}");
+        assert_eq!(pauses(&p.inner.asked), 1, "失败要停一次：{t}");
+    }
+
+    /// 66（§10）：端口变化行经 `tell` 单独出现时也算附加行，菜单停一次。
+    #[test]
+    fn menu_import_extra_lines_pause_before_returning() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        listed_from_panel(
+            &s,
+            &pp,
+            vec![entry(
+                "alice-hy2-resi",
+                resi_at(40003),
+                Source::ApiNodes,
+                split_keywords(),
+            )],
+            "alice-hy2-resi",
+            "alice",
+        );
+        let r = menu_panel(
+            &s,
+            &pp,
+            "alice",
+            vec![crate::testutil::hy2_resi_node()],
+            &[],
+        );
+        assert!(
+            said_line(&r.t, &menu::port_moved_line("alice-hy2-resi", 40003, 40000)),
+            "{}",
+            r.t
+        );
+        assert_eq!(
+            r.asked.iter().filter(|q| q.starts_with("切换到")).count(),
+            0,
+            "{:?}",
+            r.asked
+        );
+        assert_eq!(pauses(&r.asked), 1, "一问都没问，就得停一次：{:?}", r.asked);
+    }
+
+    /// 38b 菜单版的夹具（§5.3、§5.10）：活动节点是 V3 条目、停在旧端口 → 被 §5.3 挡下，
+    /// `switch_to` 由它而来；同账号的 `HEALED_NAME` 是留存者，跟着来件更新到新端口。
+    /// 返回落盘的那份列表与来件的两条 URI（留存者那条 + 另一个账号真正新增的那条）。
+    fn blocked_active_machine(s: &FakeSys, pp: &Paths) -> (Profiles, String, String) {
+        let stale = uri_node(&hy2_uri("alice", "hy2-pw", 40003, "alice-HY2住宅"));
+        let pre = listed(
+            s,
+            pp,
+            vec![
+                entry(
+                    "hysteria2-1785892136",
+                    bui_schema::nodes::Node {
+                        label: "alice-HY2住宅".into(),
+                        ..stale.clone()
+                    },
+                    Source::V3,
+                    crate::profiles::default_split(),
+                ),
+                entry(
+                    HEALED_NAME,
+                    stale,
+                    Source::Subscription,
+                    crate::profiles::default_split(),
+                ),
+            ],
+            "hysteria2-1785892136",
+        );
+        let fresh = hy2_uri("alice", "hy2-pw", 40000, "alice-HY2住宅");
+        assert!(
+            matches!(
+                pre.blocked_same_account(&uri_node(&fresh), Source::Subscription),
+                Some((_, Blocked::ActiveEntry { .. }))
+            ),
+            "前提：活动节点被 §5.3 挡下，才会有「切换到 {{keep}}？」这一问"
+        );
+        // 同一趟还粘一条真正新增的节点：`switch_to` 排在 `added` 前面（§5.10），顺序反了
+        // 「切换到 {留存者}？」就永远轮不上——只问第一个候选
+        let brand_new = hy2_uri("bob", "hy2-pw", 10000, "bob-HY2直连");
+        (pre, fresh, brand_new)
+    }
+
+    /// 38b 菜单版（A2、§5.10）：组非空、活动节点被挡下 → 问「切换到 {留存者}？」，答 y 切过去。
+    /// 它不是新导入的，所以问句不带「新导入的」。
+    #[test]
+    fn menu_import_offers_the_keeper_when_the_active_node_is_blocked() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let (_, fresh, brand_new) = blocked_active_machine(&s, &pp);
+        let r = menu_sub(&s, &pp, "alice", &[&fresh, &brand_new], &["y"]);
+        assert_eq!(
+            r.asked
+                .iter()
+                .filter(|q| q.starts_with("切换到"))
+                .collect::<Vec<_>>(),
+            vec![&menu::switch_ask(HEALED_NAME, false)],
+            "问句不带「新导入的」，而且排在新节点前面：{:?}\n{}",
+            r.asked,
+            r.t
+        );
+        let saved = Profiles::load(&s, &pp).unwrap();
+        assert_eq!(saved.active.as_deref(), Some(HEALED_NAME), "{}", r.t);
+        assert_eq!(got(&s, &pp, HEALED_NAME).node.port, 40000, "{}", r.t);
+        assert_eq!(
+            got(&s, &pp, "hysteria2-1785892136").node.port,
+            40003,
+            "被挡下的那条一个字段都不动：{}",
+            r.t
+        );
+    }
+
+    /// 38b 菜单版答 n（A2、§5.10、§5.7）：同一夹具答 n → 一个字都不切，活动节点还停在被挡下的
+    /// 那条旧节点上；留存者该更新的照旧更新（那是导入干的，与这一问无关）；数据面一个字节没动；
+    /// 提问本身就是停顿，答否回主菜单不再停一次。
+    #[test]
+    fn menu_import_keeps_the_blocked_active_node_when_the_offer_is_declined() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let (pre, fresh, brand_new) = blocked_active_machine(&s, &pp);
+        // 夹具先 apply 一次，让数据面与节点列表一致：进菜单那一下的收敛就不写 `config.json`、
+        // 不重启，`assert_not_applied` 数的才是这一趟导入自己有没有动数据面
+        Engine::new(&s, &pp).apply(&pre).unwrap();
+        let before = marks(&s);
+        let r = menu_sub(&s, &pp, "alice", &[&fresh, &brand_new], &["n"]);
+        assert_eq!(
+            r.asked
+                .iter()
+                .filter(|q| q.starts_with("切换到"))
+                .collect::<Vec<_>>(),
+            vec![&menu::switch_ask(HEALED_NAME, false)],
+            "问的仍是留存者那一句，只问一次：{:?}\n{}",
+            r.asked,
+            r.t
+        );
+        let saved = Profiles::load(&s, &pp).unwrap();
+        assert_eq!(
+            saved.active.as_deref(),
+            Some("hysteria2-1785892136"),
+            "答 n 不切：活动节点还是被挡下的那条旧节点：{}",
+            r.t
+        );
+        assert_eq!(
+            got(&s, &pp, HEALED_NAME).node.port,
+            40000,
+            "留存者的端口照旧更新，不因为答 n 而回退：{}",
+            r.t
+        );
+        assert_eq!(
+            got(&s, &pp, "hysteria2-1785892136").node.port,
+            40003,
+            "被挡下的那条一个字段都不动：{}",
+            r.t
+        );
+        assert_not_applied(&s, before, "答 n 没换活动节点，数据面不动", &r.t);
+        assert_eq!(
+            pauses(&r.asked),
+            0,
+            "问过了就不再停一次：{:?}\n{}",
+            r.asked,
+            r.t
+        );
+    }
+
+    /// 38b + D9：留存者答 y 合并时按 D9 从 `-2` 取回规范名，切换候选记的还是合并**前**那个名字
+    /// ——不跟着换，下面那句 `after` 过滤就把它当成「已经不在了」，活动节点被挡下时该问的
+    /// 「切换到 {keep}？」会静默丢掉。钉住定稿 §5.10「过 after 过滤之前先按
+    /// `Merged::renamed_from` → `keeper` 换名」那一条（实现期补准，裁决二）。
+    #[test]
+    fn menu_import_offers_the_keeper_by_the_name_it_took_back_in_the_merge() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let fresh = hy2_uri("alice", "hy2-pw", 40000, "alice-HY2住宅");
+        let stale = |port| uri_node(&hy2_uri("alice", "hy2-pw", port, "alice-HY2住宅"));
+        let pre = listed(
+            &s,
+            &pp,
+            vec![
+                // 活动节点：V3 条目、与来件不同参数 → §5.3 挡下，`switch_to` 由它而来
+                entry(
+                    "hysteria2-1785892136",
+                    stale(40003),
+                    Source::V3,
+                    crate::profiles::default_split(),
+                ),
+                // token 名那条与来件同一连接 → 留存者；规范名被下面那条占着，洗名只能叫 -2
+                entry(
+                    &token_name(),
+                    uri_node(&fresh),
+                    Source::Subscription,
+                    crate::profiles::default_split(),
+                ),
+                // 占着规范名的存量副本：停在另一个端口，答 y 时被并掉，规范名腾出来
+                entry(
+                    HEALED_NAME,
+                    stale(40007),
+                    Source::Subscription,
+                    crate::profiles::default_split(),
+                ),
+            ],
+            "hysteria2-1785892136",
+        );
+        assert!(
+            matches!(
+                pre.blocked_same_account(&uri_node(&fresh), Source::Subscription),
+                Some((_, Blocked::ActiveEntry { .. }))
+            ),
+            "前提：活动节点被 §5.3 挡下，才会有「切换到 {{keep}}？」这一问"
+        );
+        let numbered = format!("{HEALED_NAME}-2");
+        let r = menu_sub(&s, &pp, "alice", &[&fresh], &["y", "y"]);
+        assert!(
+            said_line(
+                &r.t,
+                &menu::merged_line(&[HEALED_NAME.to_string()], &numbered)
+            ),
+            "{}",
+            r.t
+        );
+        assert!(
+            said_line(&r.t, &menu::renamed_line(&numbered, HEALED_NAME)),
+            "取回规范名要单说一句：{}",
+            r.t
+        );
+        assert_eq!(
+            r.asked
+                .iter()
+                .filter(|q| q.starts_with("切换到"))
+                .collect::<Vec<_>>(),
+            vec![&menu::switch_ask(HEALED_NAME, false)],
+            "问的是留存者合并之后的新名字：{:?}\n{}",
+            r.asked,
+            r.t
+        );
+        assert_eq!(
+            Profiles::load(&s, &pp).unwrap().active.as_deref(),
+            Some(HEALED_NAME),
+            "{}",
+            r.t
+        );
+        assert_eq!(got(&s, &pp, HEALED_NAME).node.port, 40000, "{}", r.t);
+        assert!(!r.t.contains(TOKEN), "{}", r.t);
+    }
+
+    /// 57 菜单版（D7）：答 y 合并掉那条面板副本之后，留存者仍是关键字分流、来源仍是 `ApiNodes`。
+    #[test]
+    fn menu_import_merging_the_panel_copy_keeps_the_keyword_split() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let fresh = hy2_uri("alice", "hy2-pw", 40000, "alice-HY2住宅");
+        listed(
+            &s,
+            &pp,
+            vec![
+                entry(
+                    HEALED_NAME,
+                    uri_node(&hy2_uri("alice", "hy2-pw", 40003, "alice-HY2住宅")),
+                    Source::Subscription,
+                    crate::profiles::default_split(),
+                ),
+                entry(
+                    "alice-hy2-resi",
+                    uri_node(&fresh),
+                    Source::ApiNodes,
+                    split_keywords(),
+                ),
+            ],
+            HEALED_NAME,
+        );
+        let r = menu_sub(&s, &pp, "alice", &[&fresh], &["y"]);
+        assert_eq!(names(&s, &pp), vec![HEALED_NAME.to_string()], "{}", r.t);
+        let keeper = got(&s, &pp, HEALED_NAME);
+        assert_eq!(keeper.node.port, 40000, "{}", r.t);
+        assert_eq!(keeper.split, split_keywords(), "面板分流不许丢：{}", r.t);
+        assert_eq!(keeper.source, Source::ApiNodes, "来源只升不降：{}", r.t);
+        assert!(
+            said_line(
+                &r.t,
+                &menu::merged_line(&["alice-hy2-resi".to_string()], HEALED_NAME)
+            ),
+            "{}",
+            r.t
+        );
+    }
+
+    /// 53 菜单版（§7）：墓碑只问一句，答 N 之后不再问别的。
+    #[test]
+    fn menu_import_a_buried_account_asks_exactly_once() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let mut prof = Profiles::new_default();
+        prof.profiles.push(entry(
+            "bob-hy2-direct",
+            crate::testutil::hy2_account_node("bob"),
+            Source::ApiNodes,
+            split_keywords(),
+        ));
+        prof.active = Some("bob-hy2-direct".into());
+        prof.panel = Some(crate::profiles::Panel {
+            base_url: PANEL_BASE.into(),
+            username: "alice".into(),
+        });
+        prof.bury(
+            &entry(
+                "alice-hy2-resi",
+                resi_at(40003),
+                Source::ApiNodes,
+                split_keywords(),
+            ),
+            0,
+        );
+        prof.save(&s, &pp).unwrap();
+        let r = menu_panel(
+            &s,
+            &pp,
+            "alice",
+            vec![crate::testutil::hy2_resi_node()],
+            &["n"],
+        );
+        assert_eq!(
+            r.asked.iter().filter(|q| *q == menu::BURIED_ASK).count(),
+            1,
+            "{:?}\n{}",
+            r.asked,
+            r.t
+        );
+        assert!(
+            said_line(&r.t, &menu::buried_head(&["alice-hy2-resi".to_string()])),
+            "{}",
+            r.t
+        );
+        assert_eq!(
+            names(&s, &pp),
+            vec!["bob-hy2-direct".to_string()],
+            "{}",
+            r.t
+        );
+        assert_eq!(
+            r.asked
+                .iter()
+                .filter(|q| *q == menu::MERGE_ASK || q.starts_with("切换到"))
+                .count(),
+            0,
+            "答 N 之后没别的可问：{:?}",
+            r.asked
+        );
+    }
+
+    /// §5.10：三问的顺序是墓碑 → 存量重复 → 切换；三个 n 各自生效——墓碑挡下的没被加回来、
+    /// 存量重复那条还在、活动节点没换。
+    ///
+    /// 末尾那句 `pauses == 0` 查的是另一回事（§10 F7）：**最后**一问答完之后一行都没打，
+    /// 提问本身就是停顿（`asked_is_a_pause`），与前面三问的顺序无关。
+    #[test]
+    fn menu_import_asks_in_order_buried_then_merge_then_switch() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let mut prof = Profiles::new_default();
+        prof.profiles = vec![
+            entry(
+                "alice-hy2-resi",
+                resi_at(40003),
+                Source::ApiNodes,
+                split_keywords(),
+            ),
+            entry(
+                "alice-hy2-resi-2",
+                resi_at(40007),
+                Source::ApiNodes,
+                split_keywords(),
+            ),
+        ];
+        prof.active = Some("alice-hy2-resi".into());
+        prof.panel = Some(crate::profiles::Panel {
+            base_url: PANEL_BASE.into(),
+            username: "alice".into(),
+        });
+        prof.bury(
+            &entry(
+                "carol-hy2-direct",
+                crate::testutil::hy2_account_node("carol"),
+                Source::ApiNodes,
+                split_keywords(),
+            ),
+            0,
+        );
+        prof.save(&s, &pp).unwrap();
+        // 住宅那一条换端口（带出存量重复）、bob 是新账号、carol 被墓碑挡下
+        let r = menu_panel(
+            &s,
+            &pp,
+            "alice",
+            vec![
+                resi_at(40009),
+                crate::testutil::hy2_account_node("bob"),
+                crate::testutil::hy2_account_node("carol"),
+            ],
+            &["n", "n", "n"],
+        );
+        let switch = menu::switch_ask("alice-hy2-direct", true);
+        let at = |q: &str| {
+            r.asked
+                .iter()
+                .position(|x| x == q)
+                .unwrap_or_else(|| panic!("没问「{q}」：{:?}\n{}", r.asked, r.t))
+        };
+        let (buried, merge, switch) = (at(menu::BURIED_ASK), at(menu::MERGE_ASK), at(&switch));
+        assert!(
+            buried < merge && merge < switch,
+            "顺序该是墓碑 → 存量重复 → 切换：{:?}",
+            r.asked
+        );
+        // 三个 n 各自生效：墓碑挡下的 carol 没被加回来（列表里没有 carol 那条）、存量重复
+        // 那条没被并掉（`-2` 还在）、切换那一问没换活动节点
+        assert_eq!(
+            names(&s, &pp),
+            vec![
+                "alice-hy2-resi".to_string(),
+                "alice-hy2-resi-2".to_string(),
+                "alice-hy2-direct".to_string(),
+            ],
+            "墓碑答 n 就不加回来、合并答 n 就不并掉：{:?}\n{}",
+            r.asked,
+            r.t
+        );
+        assert_eq!(
+            Profiles::load(&s, &pp).unwrap().active.as_deref(),
+            Some("alice-hy2-resi"),
+            "切换答 n 就不换活动节点：{:?}\n{}",
+            r.asked,
+            r.t
+        );
+        assert_eq!(
+            pauses(&r.asked),
+            0,
+            "最后一问答完之后一行都没打：提问本身就是停顿，不再停一次（与三问的顺序无关）：{:?}",
+            r.asked
+        );
     }
 }

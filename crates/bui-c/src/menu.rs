@@ -882,6 +882,14 @@ pub const MERGE_NOTHING: &str = "节点列表已经变了，没有合并";
 /// 退出码不变。
 pub const DUPS_HINT_CLI: &str = "要合并请在菜单 [3] 里导入并答 y";
 
+/// 菜单 `[3]` 答 y 之后、合并那一次拿不到锁时打的那一行（spec §5.8、§0.2 R15）：导入已经
+/// 写过盘了，只有合并没做——这里不能说 `cli::LOCK_BUSY` 的「这次什么都没改」。
+/// 由 `cli` 拼成「失败：…」经 `say` 原样打。裸文案容量口径 45 列，连「失败：」前缀 51 列，
+/// 60 列终端的「上次：」行（`LAST_HEAD` 占 8 列，`line_limit(60)` = 59）刚好放满。
+/// （[`crate::cli`] 的 `LOCK_BUSY` 裸文案也是 51 列，但它上屏同样带「失败：」= 57 列、进
+/// 「上次：」行是 65 列，60 列下会被 `render` 尾截——只有本句这个长度放得下。）
+pub const MERGE_LOCK_BUSY: &str = "另一个 bui-c 操作还没结束，没有合并，稍后再试";
+
 /// 合并成功那一行（spec §5.8）：`已把 a、b 并入 X`。名字逐个过 [`display_name`]，
 /// 不截断、不设个数上限——它报的是实际并掉了哪几条，折行交给调用方（经 `tell`）。
 pub fn merged_line(others: &[String], keeper: &str) -> String {
@@ -3480,6 +3488,17 @@ mod tests {
         ] {
             out.push(("account-match-line", delete::page(&[line], width)));
         }
+        // T11：合并那一次拿不到锁的那一句。`cli` 把它拼成「失败：…」经 `say` 原样打（不折行）：
+        // 上屏 51 列，40 列终端里由终端自己折，与 `cli` 的 `LOCK_BUSY` 同款——所以下面这两格
+        // 只守字符归类与「折得开」：`page` 自己折行、`render` 按 room 尾截，文案加长一个字它们
+        // 照样绿。真正卡宽度的是 `dups_head_caps_the_list_and_masks_names` 里的两条断言：
+        // 裸文案 ≤ 59 列，以及带「失败：」前缀进「上次：」行不被 60 列尾截
+        let merge_busy = format!("失败：{MERGE_LOCK_BUSY}");
+        out.push((
+            "merge-busy",
+            delete::page(std::slice::from_ref(&merge_busy), width),
+        ));
+        out.push(("merge-busy-last", render(&st(), width, Some(&merge_busy))));
         // T5：八种受保护说明句（③ 的 `protected_new` 与 ① 的 `protected_kept`，各配
         // `PanelEntry` / `ActiveEntry` 与 `kind_unsure` 真假）与 `kind_unsure_new`。
         // 它们也经 `tell`，折法就是 `delete::page`；名字仍取最长的 38 列那个，
@@ -3782,13 +3801,24 @@ mod tests {
             "切换到 0123…-hy2-resi？"
         );
         // 固定文案（不含名字）≤ 59 列
-        for fixed in [MERGE_ASK, MERGE_NOTHING, DUPS_HINT_CLI] {
+        for fixed in [MERGE_ASK, MERGE_NOTHING, DUPS_HINT_CLI, MERGE_LOCK_BUSY] {
             assert!(
                 budget_width(fixed) <= 59,
                 "{}：{fixed}",
                 budget_width(fixed)
             );
         }
+        // `MERGE_LOCK_BUSY` 挑这个长度的理由（60 列终端的「上次：」行刚好放满）在这里钉住：
+        // `cli` 把它拼成「失败：…」，这一整句还要进主菜单的「上次：」行。`every_line_fits_by_budget`
+        // 的两格样本盖不住——`delete::page` 自己折行、`render` 按 room 尾截，文案加长一个字两格
+        // 照样绿，而「上次：」行其实已经被静默尾截
+        let merge_busy = format!("失败：{MERGE_LOCK_BUSY}");
+        assert!(
+            budget_width(&merge_busy) <= line_limit(60) - budget_width(LAST_HEAD),
+            "{} 列，「上次：」行只剩 {} 列：{merge_busy}",
+            budget_width(&merge_busy),
+            line_limit(60) - budget_width(LAST_HEAD)
+        );
         // 问句连 `  ▸ `、冒号与 `[y/N]` 在 40 列里也放得下：不折、不截（名字在上一句里）
         let asked = prompt_text(&format!("{MERGE_ASK} [y/N]"));
         assert!(
