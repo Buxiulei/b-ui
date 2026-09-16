@@ -1,8 +1,8 @@
 # bui-c 导入按账号匹配：端口变了也原地替换（4.0.2（暂定），先于服务端 4.1）
 
 - 日期：2026-09-15
-- 状态：定稿修订第 3 轮（r3），另有核查后手工追加的三轮：第一轮三项（A1 定序改判、M1、M2），第二轮按对抗核查清单修的六项（I1-I6，只换论证与夹具，不动结论），第三轮收尾三项（J1-J3，测试夹具的可达性与逐字节基准）；见文末修订记录最后一节「r3 → 定稿（核查后手工追加）」。方案层面的结论都已由主理人与服务端定下（§14.1），剩余问题只有 §14.2 的几项纯技术细节，不阻塞开工
-- 基线：`crates/bui-c` 在 `v4.0.1-rc1`、`v4.0.1-rc2` 与 `origin/v4`（`5b22bdf`）之间零改动（`git diff --stat v4.0.1-rc1 v4.0.1-rc2 -- crates/bui-c`、`git diff --stat v4.0.1-rc2 origin/v4 -- crates/bui-c` 都为空）。下文客户端行号取自 `git show v4.0.1-rc2:<路径>`（与 rc1、origin/v4 相同），`crates/bui-c/src/` 前缀省略；服务端自检、包缓存、发版流程以 rc2 为准，路径写全；服务端 4.1 的设计与计划以 origin/v4 上的 `docs/superpowers/specs/2026-09-15-hy2-singbox-residential-design.md`（下称「服务端 4.1 spec」）与 `docs/superpowers/plans/2026-09-15-v41-hy2-singbox.md`（下称「服务端 4.1 plan」）为准
+- 状态：定稿修订第 3 轮（r3），另有核查后手工追加的三轮：第一轮三项（A1 定序改判、M1、M2），第二轮按对抗核查清单修的六项（I1-I6，只换论证与夹具，不动结论），第三轮收尾三项（J1-J3，测试夹具的可达性与逐字节基准）；见文末修订记录的「r3 → 定稿（核查后手工追加）」；定稿之后另有实现期（T11）按主会话裁决补准的五条，以及其后两轮复审的修订表（第二次复审的 A-F 动了测试断言与 `cli.rs` 的 doc），都在最后一节「实现期补准（2026-09-16）」。方案层面的结论都已由主理人与服务端定下（§14.1），剩余问题只有 §14.2 的几项纯技术细节，不阻塞开工
+- 基线：`crates/bui-c` 在 `v4.0.1-rc1`、`v4.0.1-rc2` 与 `origin/v4`（`5b22bdf`）之间零改动（`git diff --stat v4.0.1-rc1 v4.0.1-rc2 -- crates/bui-c`、`git diff --stat v4.0.1-rc2 origin/v4 -- crates/bui-c` 都为空）。下文客户端行号取自 `git show v4.0.1-rc2:<路径>`（与 rc1、origin/v4 相同），`crates/bui-c/src/` 前缀省略；**本次改动新增的代码一律不写行号**——rc2 里根本没有那几行，照行号去查只会查到别的东西——改用函数名加位置描述指代（例如「`menu_import` 末尾切换那一问答 n 之后的 `asked_is_a_pause`」「`menu_import` 墓碑分支只接 `second.added` 那一句」）；rc2 里本来就有的照旧写 rc2 行号；服务端自检、包缓存、发版流程以 rc2 为准，路径写全；服务端 4.1 的设计与计划以 origin/v4 上的 `docs/superpowers/specs/2026-09-15-hy2-singbox-residential-design.md`（下称「服务端 4.1 spec」）与 `docs/superpowers/plans/2026-09-15-v41-hy2-singbox.md`（下称「服务端 4.1 plan」）为准
 - 落点：**4.0.2（暂定）**。4.0.1 在浸泡，正式版等 09-18 判定，4.0.1 不再加代码；`v4.0.1-rc2` 已打在 `ad1abb5`，不含本改动。本改动必须先于服务端 4.1 改端口上线（§12）
 - 文件：改 `crates/bui-c/src/{profiles.rs,cli.rs,import_v3.rs,menu.rs,delete.rs}`、根 `Cargo.toml` 的 workspace version（4.0.2）、`CHANGELOG.md`（新开 4.0.2 段）、`docs/HANDOVER-bui-c.md`；不改 `bui-schema`；`profiles.json` 不加任何持久化字段，只在代码里给三个结构加 catch-all（§6.3）。发版门禁以服务端 4.1 plan 的 T20 为准、由服务端实现；本线交付的是填进门禁清单的提交 SHA（§12.4）
 - 来源：研究员 A/B、三份候选设计、两位评审、合成稿 v1、两份对抗审查（correctness、migration-rollout）、主理人与服务端对审查意见的裁定、对 r1 与 r2 的各两份核查，以及已合并进 origin/v4 的服务端 4.1 spec 与 plan。各版之间的变化见文末「修订记录」
@@ -600,14 +600,15 @@ fn store_import(...) -> Result<Imported> {
 - **提示句**（命令行与菜单同一句，`menu::dups_head`，经 `tell` 折行；名单复用 `buried_list` 的个数上限 `BURIED_LIST_MAX`（`menu.rs:774`）与净化，并过 `display_name`，不截断）：
   `同一账号还有 {N} 个节点与服务端这次给的端口或凭据不一致：{a、b}（本次已更新 {X}）`
 - **命令行**：只打这一句，外加 `要合并请在菜单 [3] 里导入并答 y`；不问、不改，退出码不变。
-- **菜单 `[3]`**：导入之后、**放锁之后**（与墓碑那一问同一位置，spec §0.2 R11），墓碑那一问（含答 y 的第二趟）结束之后问 `要合并吗？`（名单已在 `dups_head` 里，问句本身短，40 列放得下；`[y/N]` 由 `Prompt::confirm` 补，默认 N，EOF 按 N）。答 y：另拿一次锁、重读 `profiles.json`，对每个 `DupGroup` 调 `merge_into`，一次写盘；经 `tell` 打 `已把 {a、b} 并入 {X}`，取回规范名时再打 `节点 {旧名} 已改名为 {新名}`。
+- **菜单 `[3]`**：导入之后、**放锁之后**（与墓碑那一问同一位置，spec §0.2 R11），墓碑那一问（含答 y 的第二趟）结束之后问 `要合并吗？`（名单已在 `dups_head` 里，问句本身短，40 列放得下；`[y/N]` 由 `Prompt::confirm` 补，默认 N，EOF 按 N）。答 y：另拿一次锁、重读 `profiles.json`，对每个 `DupGroup` 调 `merge_into`，一次写盘；经 `tell` 打 `已把 {a、b} 并入 {X}`——这里的 `{X}` 是**合并那一刻留存者的名字**（`Merged::renamed_from` 有值时就是那个旧名），取回规范名由紧随其后的 `节点 {旧名} 已改名为 {新名}` 单说；拿改完的新名字去拼，D9 场景会打出「已把 c 并入 c」。
+- **合并那次锁拿不到**：上一条说的「另拿一次锁」是因为第一趟导入那把锁在问「要合并吗？」之前就放了（spec §0.2 R11），人看提示的这段时间里别的会话可能改过列表。照 `wait_for_lock` 先打一句 `另一个 bui-c 操作正在进行，等它结束（最多 15 秒）…`、最多等 15 秒，还拿不到这把锁时打 `失败：另一个 bui-c 操作还没结束，没有合并，稍后再试` 后回菜单，两条重复节点都留着。**这里不能用通用的 `LOCK_BUSY`**（「另一个 bui-c 操作还没结束，这次什么都没改，稍后再试」）：第一趟导入早就写过盘了，「这次什么都没改」在这里是假话，没做的只有合并。
 - **合并不碰活动节点**：留存者第 1 级是 active，active 只要在组里就是留存者；不在组里（§5.3 挡下）就也不在 `others` 里。`merge_into` 再核对一次 `others` 不含 active，所以合并永不需要 apply（仍按 §5.7 的内容比较兜底）。
 - **重读后状态变了**（别的会话删了、改了）：`merge_into` 逐条核对，不满足的跳过；一个都没并成就打 `节点列表已经变了，没有合并`。
 - **合并不记墓碑**：墓碑是账号级的，记了等于把留存者也判了删除。
 - 被并掉的名字从菜单「切换到新导入的 X？」的候选里去掉（§5.10 的 `after` 过滤自然覆盖）。
 - **规范名**（D9）：token 名活动节点改名时 `<主机>-<kind>` 已被同账号占着，它只能先叫 `<主机>-<kind>-2`；答 y 合并掉占着规范名的那条之后，留存者取回规范名。
 
-代价：用户不答 y，每次导入涉及该账号都会提示一次、菜单停一次（§13 R1）。
+代价：用户不答 y，每次导入涉及该账号都会提示一次、在「要合并吗？」那里停一次（答 n 之后不再按回车，§13 R1）。
 
 ### 5.9 `import_v3::import`（`import_v3.rs:99-222`）
 
@@ -639,10 +640,13 @@ rc 用「导入前后名字求差集」判断新节点（`cli.rs:2874-2878`、`2
 
 - 删掉 `before`；
 - 候选 = 第一趟 `save_import` 的 `stored.switch_to`（① 里活动节点被挡下时的留存者，A2），接着是 `stored.added`，再加上墓碑第二趟的 `stored.added`（`cli.rs:2929` 目前把第二趟的返回值丢了，要接住）；`switch_to` 排最前，因为它关系到当前节点正停在旧参数上；
+- **过 `after` 过滤之前先按合并结果换名**：留存者按 D9 取回规范名之后（`c-2` → `c`），候选里记的还是合并那一刻的旧名 `c-2`，直接过滤会把它当成「已经不在了」，活动节点被挡下时该问的 `切换到 {keep}？` 会静默丢掉；所以先按 `Merged::renamed_from` → `Merged::keeper` 把候选里的旧名换成新名，再过滤；
 - 过滤掉 `after` 里已经不存在的名字（合并掉的自然出局），其余判断（活动节点已是候选就不问，`cli.rs:2950-2952`）原样；仍然只问第一个候选，与 rc 相同；
 - 问句：候选来自 `switch_to` 时是 `切换到 {keep}？`（它不是新导入的），来自 `added` 时是 rc 原文 `切换到新导入的 {X}？`；
-- 提问顺序：墓碑 → 存量重复 → 切换；每一问都算停顿（`asked_is_a_pause`，`cli.rs:1459`）；
+- 提问顺序：墓碑 → 存量重复 → 切换；每一问兜住它之前打的行（提问时人必然在看屏幕），答完之后才打的行——第二趟导入的结果、合并结果行与取回规范名的改名行——若其后没有别的问句，这一趟照旧停一次让人看到（§10 F7）；
 - 追问句里的名字过 `display_name`（`cli.rs:2954`）。
+
+**为什么不是「每一问都算停顿」。** 按字面口径（问过就一律不停），用户答 y 同意合并之后，`已把 X 并入 Y` 与取回规范名的改名行都是**答完才打的**，菜单随即重画，用户看不到自己刚授权的合并结果；而 §10 又明写合并与改名不进结果行（「上次：」），没有第二次机会——字面口径会把 §10 F7 那条承诺（改名行、说明行、端口变化行、存量重复提示「会停下来让人看到一次」）自己打掉。一次提问只能替用户「看过」提问那一刻已经在屏幕上的内容。实现：记 `asked_at` = **墓碑 / 存量重复里最后一问**打进 transcript 的位置，只有 `outcome_since(ctx, asked_at)` 为 `Nothing`（问完之后一行都没打）时才把这一趟算成「已看过」（`asked_is_a_pause`，`cli.rs:1459`）。切换那一问不记 `asked_at`：它排在最后、其后不再打任何行，答 n 一律按「已看过」处理（`menu_import` 末尾切换那一问答 n 之后无条件 `asked_is_a_pause`）——所以「合并打了行、随后切换答 n」的那一趟不停。这条口径对 rc 既有路径也有影响，见 §13 R19。
 
 ## 6. 数据模型与兼容
 
@@ -827,6 +831,9 @@ pub fn display_name(name: &str) -> Cow<'_, str>;
 | 被替换的是活动节点 | 内容比较 → apply；TUN 短暂重连是既有代价 | §5.7 |
 | 替换后 apply 失败 | 不回滚；`profiles.json` 已是新端口、跑着旧配置；兼容段 REDIRECT 在时旧端口仍可用，下一次 apply 用上新数据 | F4 |
 | 菜单问合并期间别的会话改了列表 | `merge_into` 重读后逐条核对，不满足的跳过 | §5.8 |
+| 合并那次重读或写盘失败 | 打一行 `失败：…` 直接回菜单，跳过切换那一问，两条重复节点都留着（写盘是原子 rename，不会留半份） | §5.8 |
+| 墓碑第二趟 `save_import` 失败 | 打一行 `失败：…` 直接回菜单，跳过存量重复那一问（第一趟已经打过名单，要合并得再导一次）；与 rc 对墓碑失败的处理一致。**已知不一致**：这一趟拿不到锁时报的仍是通用 `LOCK_BUSY`（「这次什么都没改」），而第一趟早已写过盘——与裁决四给合并那次定的口径（`menu::MERGE_LOCK_BUSY`）矛盾。`[7]`→`[3]` 的 `menu_import_v3` 第二趟**同款**：第一趟 `import_v3_cmd` 已经落盘（前提是第一趟真落过盘：导入了别的 v3 目录，或带残留单元且有活动节点；全被挡且无残留单元时 `run` 提前返回、什么都没写，测试 31 第一格，那时这一句反而是准的），第二趟 `import_v3_cmd(…, true)` 自己再 `take_lock`，拿不到报的仍是这一句。rc 既有行为，不在 T11 范围，留待后续 | §5.8、§7 |
+| 墓碑第二趟带出存量重复（两趟之间别的会话往列表里塞了同账号条目） | 第二趟只经 `tell` 打一遍名单、菜单不再问「要合并吗？」（`menu_import` 墓碑分支只接 `second.added`，`second.dups` / `second.switch_to` 丢掉）；要合并得再导一次。第一趟被墓碑挡下意味着当时账号组为空，只有并发才可达，概率很低 | §5.8、§7 |
 | import-v3 重跑，列表里同账号已被面板换过端口 / 密码 | 认作 `existing`，不回写 | §5.9 |
 | import-v3 首次跑，v3 目录里同账号两个端口 | 两条都导入（只匹配 `[..known]`） | §5.9 |
 | import-v3 命中墓碑，墓碑名是 token 名 | 名单打码 | §8.3 |
@@ -865,7 +872,7 @@ pub fn display_name(name: &str) -> Cow<'_, str>;
 
 ### 菜单 `[3]`
 
-- 改名行、说明行、端口变化行、存量重复提示都经 `tell`，按 `outcome_since`（`cli.rs:1428`）算附加行，会停下来让人看到一次（F7）。
+- 改名行、说明行、端口变化行、存量重复提示都经 `tell`，按 `outcome_since`（`cli.rs:1428`）算附加行，会让人看到一次：紧随其后有问句时在提问处看到——**第一趟**的存量重复提示后面跟「要合并吗？」（墓碑第二趟 `save_import` 失败直接回菜单时除外，§9：那一趟的名单在墓碑提问处已经看过，随后的 `失败：…` 行又让这一趟停一次）；其后没有问句时停一次——**墓碑第二趟带出的名单**后面不再有「要合并吗？」（第二趟的 `save_import` 同样经 `tell` 打 `dups_head`，但第二趟的 `dups` 被丢掉、菜单不再问，§9），其后再有问句（第一趟另一个账号的「要合并吗？」，或切换那一问）就在那里看到（答 n 走 `asked_is_a_pause`，不再单独停）；一句都没有时才停一次——例如活动节点已经在候选里（第二趟加回来的那条自己当上活动节点，测试 66a），或候选被 `after` 过滤清空（§5.10、§13 R19）（F7）。
 - 存量重复时多一问 `要合并吗？[y/N]`，默认 N。
 - 端口变化、改名、合并都不再弹「切换到新导入的 X？」；只有真正新增的节点才问（活动节点被挡下另起的那一条也算新增，会问，与说明句的「切换过去」对得上）。组非空而活动节点被挡下时问 `切换到 {keep}？`（§5.10）。
 - 活动节点被替换时静默重新 apply，与 rc 相同；过期粘贴被挡时不 apply。
@@ -951,7 +958,7 @@ pub fn display_name(name: &str) -> Cow<'_, str>;
 37. `a_subscription_refresh_never_replaces_an_active_v3_node_across_ports`（D1）：从未被订阅命中过的 V3 活动节点 → 另起一条，说明句是「切换过去」那一句，不含「订阅」二字。
 38. `a_panel_import_replaces_protected_members`（D1）：面板来件替换活动的 V3 条目与 ApiNodes 条目。
 38a. `a_stale_paste_without_obfs_never_replaces_the_active_node`（C2）：活动节点为 ApiNodes 来源、**住宅口 :40000**、带 `obfs_password`（面板开了 obfs 后导入的）；粘贴开混淆前的旧链接（同端口、同密码、无 obfs，**备注含「住宅」以保证同账号**——同端口本就过门槛，备注可信与否不参与 `gate_ok`，这里只要求 kind 同向，§11 开头的通则）→ active 与节点数据不变（`obfs_password` 仍在）、另起一条、打「要更新它请从面板重新导入」、引擎不 apply。再加一格活动节点为 V3 来源 → 说明句是「切换过去」那一句。
-38b. `a_subscription_refresh_explains_a_blocked_active_node_when_another_copy_moves`（A2）：`hysteria2-1785892136`（V3，备注 `alice-HY2住宅`，40003，active，从未被订阅命中）+ `panel.example.com-hy2-resi`（Subscription，40003，非 active）；订阅导入 40000 → 组 = [后者]，它被换到 40000；transcript 有一行 `trim()` 后等于 `当前节点 hysteria2-1785892136 与 panel.example.com-hy2-resi 同一账号但连接参数不同，当前节点不变；确认 panel.example.com-hy2-resi 能用后可以切换过去`；active 与活动节点数据不变、引擎不 apply；`Stored.switch_to == ["panel.example.com-hy2-resi"]`。菜单版：随后问 `切换到 panel.example.com-hy2-resi？`，答 y 切过去。
+38b. `a_subscription_refresh_explains_a_blocked_active_node_when_another_copy_moves`（A2）：`hysteria2-1785892136`（V3，备注 `alice-HY2住宅`，40003，active，从未被订阅命中）+ `panel.example.com-hy2-resi`（Subscription，40003，非 active）；订阅导入 40000 → 组 = [后者]，它被换到 40000；transcript 有一行 `trim()` 后等于 `当前节点 hysteria2-1785892136 与 panel.example.com-hy2-resi 同一账号但连接参数不同，当前节点不变；确认 panel.example.com-hy2-resi 能用后可以切换过去`；active 与活动节点数据不变、引擎不 apply；`Stored.switch_to == ["panel.example.com-hy2-resi"]`。菜单版：随后问 `切换到 panel.example.com-hy2-resi？`，答 y 切过去；**答 n 那一格**（`menu_import_keeps_the_blocked_active_node_when_the_offer_is_declined`）：`active` 仍是被挡下的旧节点 `hysteria2-1785892136`、它的端口仍是 40003 一个字段都不动，留存者已是新端口 40000（那是导入干的，与这一问无关），引擎不 apply，`pauses == 0`（提问本身就是停顿，答否回主菜单不再停）。
 38c. `a_panel_import_with_a_blocked_panel_copy_is_explained`（A2）：组非空、另有一条住宅口的 ApiNodes 条目被过期粘贴挡下，**粘贴的备注含「住宅」（可信，与该条目 kind 同向，§11 开头的通则）**——被挡那条是 `ApiNodes`、kind 恒可信，两边都可信所以 `gate_ok` 过、`kind_unsure` 为假（不写明就会落进默认夹具、报成追加版，断言不命中）→ 打基础版「{旧名} 与 {keep} 同一账号但连接参数不同，{旧名} 不变；要更新它请从面板重新导入」，不进 `switch_to`。再补两格，钉住这句出路的两种落法都真的把账号更新到了面板参数（§9 表后说明、R18）。两格**各自另起夹具，不接着上面那一步**：上一步里被粘贴原地替换的那条组成员，备注已换成粘贴的「住宅」、kind 可信，面板来件对它 `gate_ok` 且 `protected` 恒假，所以它必然也进组，「组里只有被挡过那条」在延续的夹具上不成立。
   - (a) 该账号在列表里只有被挡过的那条 `ApiNodes` 条目 P（同账号没有别的条目）→ 从面板导入该账号的新参数，组 = [P]，P 就是 `pick_keeper` 的留存者，被原地替换成面板参数。
   - (b) 该账号里除 P 之外还有一条自身 kind 可信的活动节点 A（备注与 P 同向）→ 两条都进组，留存者按 `pick_keeper` 第 1 级是 A、被原地替换，P 落进 `stale` 转成存量重复（`Stored.dups` 里有它、条目仍在、`deleted` 为空），菜单答 y 才并掉。**A 与 P 都要停在旧参数**（例如都在 :40003、面板推 :40000）：A 若已经是面板新参数，`upsert` 返回 `Unchanged`（`profiles.rs:313-315`）、只升来源，断言的端口变化行与 `Replaced` 都不成立。
@@ -987,8 +994,12 @@ pub fn display_name(name: &str) -> Cow<'_, str>;
 62. `menu_import_second_pass_new_nodes_are_still_offered`：墓碑答 y 加回的节点仍会追问。
 63. `menu_import_duplicates_answer_no_keeps_both`（D2）：默认 N / EOF → 两条都在，`profiles.json` 在提问之后没有再被写。
 64. `menu_import_duplicates_answer_yes_merges_and_keeps_the_keeper_name`（D2）：答 y → 只剩 `pick_keeper` 选中的那条、名字不变、`deleted` 为空、引擎不 apply。
+64a. `menu_import_merge_after_the_list_changed_says_so_and_asks_nothing`（§5.8 `MERGE_NOTHING`）：答 y 之后另拿的那把锁一拿到就读到别的会话改过的列表，该并的那条已经不在 → 一组都没并成，打 `节点列表已经变了，没有合并`、一个字节都不写；那份列表里本趟新增的节点也没了 → `after` 过滤把候选清空，切换一句都不问；这一行是答完才打的，菜单停一次。
+64b. `menu_import_merge_with_the_lock_busy_merges_nothing_and_says_so`（裁决四）：问到「要合并吗？」那一刻锁被别人占住 → 打 `失败：另一个 bui-c 操作还没结束，没有合并，稍后再试` 回菜单，transcript 里**不出现**通用 `LOCK_BUSY` 的「这次什么都没改」（第一趟 `save_import` 早写过盘了）；两条重复节点都在、导入本身的端口照旧更新、合并这一步不写盘；停一次。
 65. `menu_import_merge_gives_a_token_keeper_the_canonical_name`（D9）：token 名 active（40003）+ `panel.example.com-hy2-resi`（ApiNodes，40000）；面板推 40000 → 改名为 `-2`、被替换到 40000；答 y → 只剩 `panel.example.com-hy2-resi`、active 是它、有改名行。
+65a. `menu_import_offers_the_keeper_by_the_name_it_took_back_in_the_merge`（裁决二）：38b + D9 的组合——活动节点是被 §5.3 挡下的 V3 条目（`switch_to` 由它而来），留存者是 token 名那条（规范名被另一条存量副本占着，洗名只能叫 `panel.example.com-hy2-resi-2`），答 y 合并把规范名腾出来。钉住「候选在过 `after` 过滤**之前**先按 `Merged::renamed_from` → `Merged::keeper` 换名」：问的是 `切换到 panel.example.com-hy2-resi？`（合并之后的新名），而不是把这一问静默丢掉；答 y 之后 `active` 是它、端口 40000、transcript 里不出现 token。
 66. `menu_import_extra_lines_pause_before_returning`：端口变化行（经 `tell`）单独出现时也算附加行、菜单停一次。
+66a. `menu_import_second_pass_result_pauses_when_nothing_else_is_asked`（R19）：墓碑答 y 之后第二趟打了导入结果行，而加回来的这条一落盘就当上活动节点（这台机器本来没有活动节点）→ 墓碑之后一句都不问，那几行是答完才打的、没人看过 → `pauses == 1`。它与 `reimporting_after_deleting_everything_still_asks_in_the_menu` 的 `pauses == 1` 一起钉住 R19 这条口径变化。
 67. 回归：`menu_import_pasted_uris_offer_to_switch_to_the_first_new_node`（`cli.rs:7830`）。
 
 ### 11.4 `import_v3.rs`
@@ -1005,7 +1016,7 @@ pub fn display_name(name: &str) -> Cow<'_, str>;
 
 75. `every_line_fits_by_budget`（`menu.rs:3429`）加入 `protected_new` **四种**说法、`protected_kept` **四种**说法（`PanelEntry` / `ActiveEntry` 各配 `kind_unsure` 真 / 假两个长度；带「同时认不准是直连还是住宅」那半句的是最长的样本，最可能撞上限，必须进表，A1）、`切换到 {keep}？`、`kind_unsure_new`、`dups_head`、`要合并吗？`、合并结果行、改名行、**端口变化行**（全部按 `tell` 的折法，即 `delete::page`），以及打码后的 token 名节点列表与确认块；样本名字用 `baiyi_like` 里最长的 38 列名字；宽度与现有表一致：`{40, 50, 59, 60, 80, 100}`（`menu.rs:3432`）。
 76. `display_name_masks_each_token_segment_to_four_chars_and_sanitizes_first`：`…` 已在宽度表的字符归类里。
-77. `dups_head_caps_the_list_and_masks_names`：个数上限同 `BURIED_LIST_MAX`（`menu.rs:774`），名字经 `display_name`，不截断、折行交给 `tell`。
+77. `dups_head_caps_the_list_and_masks_names`：个数上限同 `BURIED_LIST_MAX`（`menu.rs:774`），名字经 `display_name`，不截断、折行交给 `tell`；`MERGE_LOCK_BUSY` 的两条宽度断言也在这里：裸文案连同 `MERGE_ASK` / `MERGE_NOTHING` / `DUPS_HINT_CLI` 一起 ≤ 59 列，**以及**带「失败：」前缀的预算宽度 ≤ `line_limit(60) − budget_width(LAST_HEAD)`——60 列终端的「上次：」行刚好放满，这正是它挑这个长度的理由，而 `every_line_fits_by_budget` 的两格样本盖不住它（`delete::page` 自己折行、`render` 按 room 尾截，文案加长一个字两格照样绿）。
 78. `plan_errors_and_cli_summary_mask_token_names`（`delete.rs:44-64`、`214-222`）。
 
 ### 11.6 真机（baiyi）
@@ -1147,7 +1158,7 @@ pub fn display_name(name: &str) -> Cow<'_, str>;
 
 ## 13. 风险
 
-- **R1 存量重复不自动合并。** 用户不答 y，每次导入涉及该账号都提示一次、菜单停一次。换来的是不删一条能用、出口 IP 不同的节点（F5）。用户故意为同一账号保留端口变体（自建转发）也不受影响。
+- **R1 存量重复不自动合并。** 用户不答 y，每次导入涉及该账号都提示一次、在「要合并吗？」那里停一次（答 n 之后不再按回车）。换来的是不删一条能用、出口 IP 不同的节点（F5）。用户故意为同一账号保留端口变体（自建转发）也不受影响。
 - **R2 kind 门槛依赖备注。** 用户把住宅链接的备注改成含「直连」，门槛会信它。概率低，且 rc 解析时就已按这个备注判 kind。
 - **R3 零手动依赖兼容段 REDIRECT（F1）。** 从不重新导入的机器用旧端口，兼容段下线前必须重新导入；靠公告里单列的 bui-c 一段与 counter 有命中就顺延（§12.10，服务端 4.1 spec §2.4）。下线前 30 天一直离线的机器兜不住。
 - **R4 导入后 apply 失败不回滚（F4）。** 候选做法：落盘前活动节点内容变了先调 `Engine::preflight`（`engine.rs:185`），另立项。
@@ -1165,6 +1176,7 @@ pub fn display_name(name: &str) -> Cow<'_, str>;
 - **R16 「无变化」也可能重写一次文件。** 来源升级发生在 `Unchanged` 时，`profiles.json` 会重写一次、输出仍是「节点 X 无变化」；每条最多升两级，之后恢复逐字节不变。
 - **R17 门禁依赖清单里的 SHA，且只管 `v4.1` 前缀。** `GATE_v4_1` 填的若不是实现提交（例如只填了文档提交），门禁会放过不含实现的分支；留 `pending` 或填了仓库里没有的提交只会关着失败。交 SHA 时附 `git show --stat`，服务端核对后再填。`v4.1` 以外的 tag 不受门禁（§12.4），靠流程与 §14.2 T4 的可选扩展。
 - **R18 面板条目与活动节点同时被挡下时只报 `PanelEntry`。** 被压下去的那条活动节点，若它自身的 kind 也是按备注猜的、且面板当时的端口与它现在的端口不同，之后任何一次面板重新导入它都进不了账号组（门槛是双向的），于是既不被原地替换、也不会作为存量重复被点名，更新不了；而**组非空、走 §5.4 ① 的这一轮**又只打 `PanelEntry` 那一句、不再单独提示指向它——用户不会知道还有一条活动节点卡在旧参数上（组为空走 ③ 时另起了新节点，菜单会按 `added` 问「切换到新导入的 X？」，不落进本缺口）。可达面窄（要同一账号里同时有一条受保护的面板条目、一条 kind 不可信的活动节点，再加一条能进组的条目），缓解：无，本设计不解决（论证见 §9 表后说明，定义见 §5.1 A1）。
+- **R19 停顿口径是「一问只兜住它之前打的行」。** 提问之后才打的行（墓碑答 y 的第二趟结果、合并结果行、取回规范名的改名行）其后没有别的问句时，这一趟仍停一次（§5.10）。代价是**rc 既有路径的行为也跟着变**：墓碑答 y 的第二趟在 rc 下问过就不停、本版会停一次。既有用例 `reimporting_after_deleting_everything_still_asks_in_the_menu` 已补上停顿断言（`pauses == 1`），把这一行为变化钉住。取舍见 §5.10 的论证：不这么改，用户看不到自己刚授权的合并结果。
 
 ## 14. 已定事项与剩余问题
 
@@ -1322,3 +1334,38 @@ pub fn display_name(name: &str) -> Cow<'_, str>;
 | 测试 38c 新补的 (a)(b) 两格改成**各自另起夹具，不接着上一步**，并写明为什么：上一步里被粘贴原地替换的那条组成员，备注已换成粘贴的「住宅」、kind 可信，面板来件对它 `gate_ok` 且 `protected` 恒假，必然也进组，所以「组里只有被挡过那条」在延续的夹具上不成立。(a) 改为「该账号在列表里只有 P 一条 → 组 = [P]，P 是留存者、被原地替换」；(b) 改为「该账号里除 P 外还有一条自身 kind 可信、备注与 P 同向的活动节点 A → 两条都进组，A 按第 1 级作留存者被替换，P 落进 `stale` 转存量重复」 | J2（Minor，两名复核员一致） |
 | 测试 31 第二格补第四条硬前提：**盘上夹具要由 `Profiles::save` 自己写出来**。`save` 是 `to_vec_pretty` 加末尾换行（`profiles.rs:263-270`），手写 JSON 只要键序、缩进、末尾换行有一处不同，`import_v3.rs:350` 原样重写后字节就变了，断言会因格式而非内容失败。做法照 `profiles.rs:780` 那条逐字节用例：内存构造 `Profiles` → `save` 一次 → 读回字节作基准 → 再调 `run`。第三轮复核又补一条：**夹具里每个 v3 目录都要落进 `buried` 或 `existing`**，`v3_machine()`（`import_v3.rs:423-443`）有两个目录，只要有一个走了新建，`r.imported` 非空、写出的就不是原样，逐字节断言与「原样 save」的前提一起失效；断言 `r.imported` 为空 | J3（Minor，两名复核员一致） |
 | 第三轮复核查出的五处（一并修，无新编号）：36b 因 J1 改坏（住宅条目的追加版格不可达）改回直连；§11 通则里 `node_uri` 的判据措辞按 `node_uri.rs:25` 更正（只看「住宅」）；38a 补 kind 与端口、去掉与 `gate_ok` 无关的「备注可信」；38c (b) 写明 A 与 P 都停在旧参数（A 已是新参数会走 `Unchanged`，`profiles.rs:313-315`）；文首状态行与本节引言的轮次由两轮改成三轮；另有「每个 v3 目录都要落进 `buried` 或 `existing`、断言 `r.imported` 为空」一条记在上面 J3 行里 | 第三轮复核 |
+
+### 实现期补准（2026-09-16）
+
+T11（菜单 `[3]` 切换候选改口径 + 存量重复确认合并）实现期发现定稿与代码口径不一致五处，由主会话逐条裁决后**补准定稿，行为一行未改**（本轮代码只动了非行为项：把 `MERGE_LOCK_BUSY` 文案常量从 `cli.rs` 挪进 `menu.rs` 以进宽度表、加固几条测试的断言——其中 `reimporting_after_deleting_everything_still_asks_in_the_menu` 按 R19 补了停顿断言——以及把几处注释与测试 doc 指向补准后的定稿）：一条是定稿写错、按实现改（裁决一），其余四条是「代码对、定稿没写」，补进定稿。
+
+| 变化 | 对应 |
+|---|---|
+| §5.10 的「每一问都算停顿」改成「每一问兜住它之前打的行；答完之后才打的行——第二趟导入的结果、合并结果行与取回规范名的改名行——其后没有别的问句时照旧停一次」，理由写进 §5.10：按字面口径，用户答 y 同意合并之后打的合并结果行与改名行没人看得到，而 §10 明写合并与改名不进「上次：」行、没有第二次机会，等于把 §10 F7 自己的承诺打掉；一次提问只能替用户看过提问那一刻已经在屏幕上的内容。新增 §13 R19 记这一改**同时改变了 rc 既有路径**（墓碑答 y 的第二趟在 rc 下不停、本版停一次），既有用例 `reimporting_after_deleting_everything_still_asks_in_the_menu` 补上 `pauses == 1` 的断言钉住它。**裁决一原话说该用例「没数停顿所以照旧绿」**，而实现期实际给它补上了 `pauses == 1`——把行为变化钉住比记一笔「没钉住」强——所以定稿按实际记为「已钉住」，而不是按裁决当时的措辞记 | 裁决一（定稿按实现改） |
+| §5.10 补：切换候选在按 `after` 过滤**之前**，先按 `Merged::renamed_from` → `Merged::keeper` 把旧名换成新名——留存者按 D9 从 `c-2` 取回 `c` 之后，候选里还记着旧名 `c-2`，直接过滤会把「切换到 {keep}？」这一问静默丢掉 | 裁决二（代码对、定稿没写） |
+| §5.8 补：合并结果行「已把 {a、b} 并入 {X}」里的 `{X}` 是**合并那一刻留存者的名字**，取回规范名由紧随其后的改名行单说——否则 D9 场景会打出「已把 c 并入 c」 | 裁决三（代码对、定稿没写） |
+| §5.8 补：菜单里答 y 合并时另拿一次锁，拿不到锁时打「失败：另一个 bui-c 操作还没结束，没有合并，稍后再试」后回菜单，两条重复节点都留着；这一步不能用通用的 `LOCK_BUSY`（那句说「这次什么都没改」，而第一趟导入已经写过盘，是假话） | 裁决四（代码对、定稿没写） |
+| §9 边界表补一行：墓碑第二趟 `save_import` 失败时直接回菜单，跳过存量重复那一问（第一趟已经打过名单，要合并得再导一次），与 rc 对墓碑失败的处理一致 | 裁决五（代码对、定稿没写） |
+
+补准之后的**第一次复审**又查出几处措辞不准与漏项，一并修（**只有这一轮是纯文档**：行为、逻辑与测试断言一行未改，代码侧只重写了 `menu.rs` 里 `MERGE_LOCK_BUSY` 的一段 doc。这一轮之后还有一轮，见本节末尾的「第二次复审」表——那一轮动了测试断言与 `cli.rs` 的 doc）：
+
+| 变化 | 对应 |
+|---|---|
+| §5.8 末与 §13 R1 的「菜单停一次」改成「在『要合并吗？』那里停一次（答 n 之后不再按回车）」：这一问答 n 之后一行都没打，按新旧两种口径都不会再为它单独停一次，原措辞与本文档别处「停一次 = 按回车返回菜单」的用法撞车 | 复审（用例 63 `menu_import_duplicates_answer_no_keeps_both` 断言 `pauses == 0`） |
+| §5.10 论证段的 `asked_at` 描述补全：它只记**墓碑 / 存量重复**里最后一问，切换那一问不记（排在最后、其后不打行，答 n 一律按已看过）。原文写「最后一问」，字面上会推出「合并打了行、随后切换答 n 要停一次」，而代码不停 | 复审（`menu_import` 末尾切换那一问答 n 之后无条件 `asked_is_a_pause`；用例 `menu_import_merge_then_a_switch_question_does_not_pause_again`） |
+| 本节引言不再写死代码改动的条数，改为「只动了非行为项：常量挪位、测试加固与注释指向」——原文「只有两处非行为项」漏算了同轮改掉的几处注释与测试 doc | 复审 |
+| §10 菜单 `[3]` 第一条（F7）的无条件「会停下来让人看到一次」改成「紧随其后有问句时在提问处看到，没有问句时停一次」：`dups_head` 是在「要合并吗？」之前打的，答 n 时它由提问本身兜住、不另停。这是 rc 就有的松散措辞，但裁决一拿它当论证依据，顺手补准 | 复审（用例 `menu_import_asks_in_order_buried_then_merge_then_switch` 断言 `pauses == 0`） |
+| §9 墓碑第二趟那一行补一句**已知不一致**：第二趟 `save_import` 拿不到锁时报的仍是通用 `LOCK_BUSY`（「这次什么都没改」），而第一趟早已写过盘——与裁决四给合并那次定的口径矛盾；`[7]`→`[3]` 的 `menu_import_v3` 第二趟同款（第一趟 `import_v3_cmd` 已落盘，第二趟自己再 `take_lock`）。rc 既有行为，不在 T11 范围，留待后续 | 复审（`menu_import_v3` 那半句是本轮 D 补的，见下一节） |
+| §9 边界表补两行：① 合并那次 `Profiles::load` / `save` 出错与拿不到锁走同一条 `Err` 分支（打「失败：…」回菜单、跳过切换那一问）；② 墓碑第二趟带出的存量重复只打名单、不再问（`menu_import` 墓碑分支只接 `second.added`，`second.dups` / `second.switch_to` 丢掉），要合并得再导一次 | 复审 |
+| `menu.rs` 里 `MERGE_LOCK_BUSY` 的 doc 去掉「与 `cli` 的 `LOCK_BUSY` 同宽」：那是拿带「失败：」前缀的 51 列去比 `LOCK_BUSY` 的裸文案 51 列，形态不对等（`LOCK_BUSY` 带前缀 57 列、进「上次：」行 65 列，60 列终端会被 `render` 尾截）。改成只摆 45 / 51 / 「上次：」行 59 三个数，并写明与 `LOCK_BUSY` 的差别 | 复审 |
+
+**第二次复审**（本轮）又查出六条（A-F），一并修。**这一轮不是纯文档**：F 给 `menu.rs` 的 `dups_head_caps_the_list_and_masks_names` 新增了一条宽度断言，D 重写了 `cli.rs` 里 `LOCK_BUSY` 的 doc 与其后那段行注释；行为、逻辑与用户可见文案仍一行未改。修完这六条之后又过了一次复核，它在 C、D 两条新写的文字里挑出三句过头话（§9 说 import-v3 第二趟「全被挡时也原样重写」，而全被挡且无残留单元时 `run` 提前返回、什么都没写；§10 说墓碑第二趟的名单「其后只可能跟切换那一问」，而同一次导入里另一个账号的「要合并吗？」也可能跟在后面；以及把「活动节点已在候选里」窄写成只有第二趟那一条），由主会话直接改准，一并记在下表的对应行里。
+
+| 变化 | 对应 |
+|---|---|
+| **A 行号口径**：文首「基线」补一条规矩——**本次改动新增的代码一律不写行号**（rc2 里根本没有那几行，照行号去查只会查到别的东西），改用「函数名 + 位置描述」指代，并给两个例子；文中四处按它换写：§5.10 论证段的 `asked_is_a_pause`、§9 边界表「墓碑第二趟带出存量重复」那一行，以及上一张复审表里的两行 | 复审二（新写的代码没有 rc2 行号可引，写了就是假引用） |
+| **B §13 R19 半句**：R19 里描述既有用例的那半句按实现改口——`reimporting_after_deleting_everything_still_asks_in_the_menu` **已补上** `pauses == 1`，与新增的 66a 一起钉住「墓碑答 y 的第二趟在 rc 下不停、本版停一次」这条 rc 既有路径的变化（裁决一当时的措辞是「没数停顿、照旧绿」） | 复审二（定稿要记实现的实际状态） |
+| **C §10 菜单 `[3]` 第一条去掉「必然」**：原文「**第一趟**的存量重复提示后面**必然**跟『要合并吗？』」是过头话——同一次导入可以同时带一个被墓碑挡下的账号与一个有存量重复的账号（`same_account` = kind + host + 凭据，一份订阅本就最多四个账号），墓碑答 y 后第二趟 `save_import` 出错（含拿不到锁）时 `menu_import` 直接打 `失败：…` 回菜单，`MERGE_ASK` 根本不问（§9 那一行自己写着「跳过存量重复那一问」）。改成「后面跟『要合并吗？』（墓碑第二趟失败直接回菜单时除外，§9：那一趟的名单在墓碑提问处已经看过，随后的失败行又让这一趟停一次）」。后半句同样收紧：**墓碑第二趟带出的名单**后面不再有「要合并吗？」，但**可以跟切换那一问**（`menu_import` 把 `second.added` 接进候选，活动节点不在候选里就会问「切换到新导入的 X？」，答 n 走 `asked_is_a_pause` 不停）——有那一问就在那里看到，没有（第二趟加回的那条自己当上活动节点，测试 66a；或候选被 `after` 过滤清空）才停一次 | 复审二与其后那次复核（两次都点这一条：先去掉「必然」，再收紧「没有问句」的说法） |
+| **D `cli.rs` 的 `LOCK_BUSY` doc 改口**：写明「**顶层入口**都在动手之前拿锁，『这次什么都没改』才成立」，并点名**已知例外**是菜单 `[3]` 与 `[7]`→`[3]` 墓碑答 y 的第二趟（`menu_import` / `menu_import_v3`：第一趟 `save_import` / `import_v3_cmd` 已经写过盘，第二趟自己再 `take_lock`，拿不到报的仍是这一句）；其后补一段行注释，说明合并那一句为什么收在 `menu`、卡它宽度的是哪条测试。§9 墓碑第二趟那一行与上一张复审表的对应行同步补上 `menu_import_v3` 那半句 | 复审二与其后那次复核（例外只写菜单 `[3]` 一处，按它去查的人会以为 `[7]`→`[3]` 没有这个问题） |
+| **E §11 测试清单补齐本轮新写的用例**：64a（`MERGE_NOTHING`）、64b（裁决四，合并那次锁被占）、65a（裁决二，留存者取回规范名之后再问切换）、66a（R19，第二趟结果没人看过、要停一次）四条新格；38b 补「答 n 那一格」（`menu_import_keeps_the_blocked_active_node_when_the_offer_is_declined`：活动节点一个字段不动、引擎不 apply、`pauses == 0`）；77 写明 `MERGE_LOCK_BUSY` 的两条宽度断言就在它里面 | 复审二（代码里已有的用例，定稿清单里没有对应格） |
+| **F 宽度断言 + 两处注释改指对**（本轮**唯一动测试断言**的一条；D 只改了 doc 与注释）：`dups_head_caps_the_list_and_masks_names` 新增一条断言——带「失败：」前缀的 `MERGE_LOCK_BUSY` 预算宽度 ≤ `line_limit(60) − budget_width(LAST_HEAD)`，把它挑这个长度的理由（60 列终端的「上次：」行刚好放满）钉住；变异验证：文案改成「请稍后再试」时这条断言变红（`53 列，「上次：」行只剩 51 列`）而 `every_line_fits_by_budget` 仍绿，已还原。同时把 `menu.rs` 那两格样本的注释与 `cli.rs` `LOCK_BUSY` 之后的行注释从「卡宽度的是 `every_line_fits_by_budget`」改成指向这条新断言（`page` 自己折行、`render` 按 room 尾截，那两格文案加长一个字照样绿） | 复审二（注释把守宽度的责任指错了测试，「上次：」行会被静默尾截而没人发现） |
