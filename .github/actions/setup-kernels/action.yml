@@ -1,5 +1,5 @@
 name: setup-kernels
-description: 按 scripts/release/kernels.lock 准备内核裸二进制（带 actions/cache 与镜像回退；上游归档就地解包）
+description: '按 scripts/release/kernels.lock 准备内核裸二进制（带 actions/cache 与镜像回退；上游归档就地解包，锁里 build: 行的 sing-box 现场自建）'
 inputs:
   dir:
     description: 落地目录
@@ -26,6 +26,38 @@ runs:
         key: kernels-${{ runner.os }}-${{ inputs.arch }}-${{ hashFiles('scripts/release/kernels.lock') }}
         restore-keys: |
           kernels-${{ runner.os }}-${{ inputs.arch }}-
+    # 步骤名里的「build:」后面跟空格会被 YAML 当成 key: value，所以这两个名字要加引号
+    # 与 .github/workflows/kernels-bump.yml 的同名步骤**逐字相同**（改一处要同时改另一处）
+    - name: '锁里有 build: 行就取出 go=（自建 sing-box 要 Go 工具链）'
+      id: needgo
+      shell: bash
+      run: |
+        set -euo pipefail
+        if grep -q ' build:' scripts/release/kernels.lock; then
+          # 锁的 go= 是**被强制的构建输入**：fetch-kernels.sh 透传 --go，build-singbox.sh 用
+          # GOTOOLCHAIN 钉死并断言实际版本相符。所以这里装哪一版都不决定产物 sha256——
+          # 但装成与锁同一版最省事：GOTOOLCHAIN 不必再额外下载一份工具链，也不会出现
+          # 「runner 上是 A、锁要求 B」的互相打脸。actions/setup-go 的 go-version 不吃 `go`
+          # 前缀（锁里写的是 go1.25.5），剥掉再传。
+          # sed 限定在 ` build:` 行上：锁头注记里哪天出现 `;go=` 就会被 head -1 抢走。
+          go=$(grep ' build:' scripts/release/kernels.lock \
+            | sed -n 's/.*;go=\([^;[:space:]]*\).*/\1/p' | head -1)
+          if [[ -z "$go" ]]; then
+            echo "锁里有 build: 行但取不到 go=（build: URI 要带 ;go=go1.x.y）"
+            grep ' build:' scripts/release/kernels.lock
+            exit 1
+          fi
+          printf 'go=%s\n' "${go#go}" >> "$GITHUB_OUTPUT"
+        fi
+    - name: '装 Go（仅当锁里有 build: 行）'
+      if: ${{ steps.needgo.outputs.go != '' }}
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ steps.needgo.outputs.go }}
+        check-latest: false
+        # 本仓库是纯 Rust，没有 go.sum；setup-go 的模块缓存默认开着、找不到依赖文件会直接
+        # 报错退出（Dependencies file is not found），必须显式关掉。
+        cache: false
     - name: 获取内核（缓存命中则零下载）
       shell: bash
       run: |
@@ -37,10 +69,32 @@ runs:
       if: ${{ inputs.arch == 'amd64' }}
       shell: bash
       run: |
-        "${{ inputs.dir }}/bin/sing-box" version
+        "${{ inputs.dir }}/bin/sing-box" version | tee "$RUNNER_TEMP/sing-box-version.txt"
         "${{ inputs.dir }}/bin/xray" version | head -1
         "${{ inputs.dir }}/bin/hysteria" version | head -3
         ls -1 "${{ inputs.dir }}/singbox" 2>/dev/null || true
+        # 随发布分发的那一个 sing-box 是自建的，唯一动机就是 with_v2ray_api（住宅计量要它，
+        # spec §5.3）：缺了就当场判红，别等装到机器上才发现 QueryStats 那一面没编进去。
+        grep -q 'with_v2ray_api' "$RUNNER_TEMP/sing-box-version.txt" \
+          || { echo "自建 sing-box 缺 with_v2ray_api"; exit 1; }
+        # 再钉 Tags ⊇ 锁里的 tags=（锁的 tags= 就是 kernel-versions.env 的 SINGBOX_TAGS，
+        # 逐 token 照抄官方同版本归档的 Tags 再加 with_v2ray_api，两者漂移由
+        # pin-kernels.sh --check 盯住）⇒ 传递出「⊇ 官方 Tags」。这一条不是重复劳动：
+        # `go build -tags` 对不存在的标签静默接受，把 with_quic 拼错只会在这里现形
+        # （spec §5.4 第 4 条「不满足即红」）。
+        want=$(sed -n 's/^sing-box[[:space:]]\+target[[:space:]].*;tags=\([^[:space:]]*\).*/\1/p' \
+          scripts/release/kernels.lock | head -1)
+        if [[ -n "$want" ]]; then
+          got=$(sed -n 's/^Tags:[[:space:]]*//p' "$RUNNER_TEMP/sing-box-version.txt")
+          missing=$(comm -13 \
+            <(printf '%s' "$got"  | tr ',' '\n' | sed '/^$/d' | sort -u) \
+            <(printf '%s' "$want" | tr ',' '\n' | sed '/^$/d' | sort -u))
+          if [[ -n "$missing" ]]; then
+            printf '自建 sing-box 的 Tags 缺：%s\n' "$(printf '%s' "$missing" | tr '\n' ' ')"
+            printf '锁要求：%s\n实际：  %s\n' "$want" "$got"
+            exit 1
+          fi
+        fi
     - name: 清点文件（arm64 不能在 x86 runner 上执行，只看落点）
       if: ${{ inputs.arch != 'amd64' }}
       shell: bash
