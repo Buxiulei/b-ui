@@ -2,7 +2,7 @@
 //!
 //! 渲染输出不含 ANSI 颜色：颜色会让快照测试变脆，可读性靠对齐与 `●`/`○`/`★` 够用。
 
-use crate::profiles::{kind_slug, Mode, Profiles};
+use crate::profiles::{kind_slug, Blocked, Mode, Profiles};
 use crate::update::{Report, SelfReason};
 use crate::{Error, Result};
 use std::borrow::Cow;
@@ -918,6 +918,88 @@ pub fn switch_ask(name: &str, fresh: bool) -> String {
     } else {
         format!("切换到 {shown}？")
     }
+}
+
+/// 受保护条目同时在门槛外时，四句说明句都补的那半句（spec §5.3 A1）：插在「…不变」之后、
+/// 分号之前，四句插入点一致，其余逐字不变，所以一共八种输出。
+const KIND_UNSURE_HALF: &str = "，同时认不准是直连还是住宅";
+
+/// §5.4 ③：同账号的条目受保护、挡下了原地替换，于是另起了一条新节点时的说明（spec §5.3、§10）。
+///
+/// `old` 是被挡下的那条、`new` 是刚起的新名，两者都先过 [`display_name`]（调用点传原名即可）。
+/// `why` 整枚传进来：[`Blocked::PanelEntry`] 与 [`Blocked::ActiveEntry`] 的出路不同，
+/// `kind_unsure` 为真时在「…不变」之后补 [`KIND_UNSURE_HALF`]——追加半句只补原因、不改出路
+/// （面板重新导入门槛必过，切换与门槛无关，§5.3）。
+///
+/// 只处理这两种原因；[`Blocked::KindUnsure`] 是调用方写错了（③ 那一格该打 [`kind_unsure_new`]），
+/// `debug_assert!` 挡住，release 下回落成 [`kind_unsure_new`] 的措辞、不 panic。
+pub fn protected_new(old: &str, new: &str, why: Blocked) -> String {
+    let (o, n) = (display_name(old), display_name(new));
+    let (head, kind_unsure, way) = match why {
+        Blocked::PanelEntry { kind_unsure } => (
+            format!("与 {o} 同一账号但连接参数不同，已按新节点导入为 {n}，{o} 不变"),
+            kind_unsure,
+            "要更新它请从面板重新导入",
+        ),
+        Blocked::ActiveEntry { kind_unsure } => (
+            format!("与当前节点 {o} 同一账号但连接参数不同，已按新节点导入为 {n}，当前节点不变"),
+            kind_unsure,
+            "确认新节点能用后可以切换过去",
+        ),
+        Blocked::KindUnsure => {
+            debug_assert!(
+                false,
+                "protected_new 只处理受保护条目，KindUnsure 走 kind_unsure_new"
+            );
+            return kind_unsure_new(old, new);
+        }
+    };
+    let half = if kind_unsure { KIND_UNSURE_HALF } else { "" };
+    format!("{head}{half}；{way}")
+}
+
+/// §5.4 ①：账号组非空、留存者 `keep` 已经更新到新参数，而组外还有一条同账号的条目被挡下
+/// （A2）时的说明（spec §5.3、§10）。
+///
+/// `old` 是被挡下的那条、`keep` 是刚更新的留存者，两者都先过 [`display_name`]。
+/// `why`、`kind_unsure` 与回落规则同 [`protected_new`]；[`Blocked::ActiveEntry`] 时调用方
+/// 还要把 `keep` 记进 `switch_to`（菜单据此追问切换，§5.10）。
+pub fn protected_kept(old: &str, keep: &str, why: Blocked) -> String {
+    let (o, k) = (display_name(old), display_name(keep));
+    let (head, kind_unsure, way) = match why {
+        Blocked::PanelEntry { kind_unsure } => (
+            format!("{o} 与 {k} 同一账号但连接参数不同，{o} 不变"),
+            kind_unsure,
+            "要更新它请从面板重新导入".to_string(),
+        ),
+        Blocked::ActiveEntry { kind_unsure } => (
+            format!("当前节点 {o} 与 {k} 同一账号但连接参数不同，当前节点不变"),
+            kind_unsure,
+            format!("确认 {k} 能用后可以切换过去"),
+        ),
+        Blocked::KindUnsure => {
+            debug_assert!(
+                false,
+                "protected_kept 只处理受保护条目，KindUnsure 在 ① 里什么都不打"
+            );
+            return kind_unsure_new(old, keep);
+        }
+    };
+    let half = if kind_unsure { KIND_UNSURE_HALF } else { "" };
+    format!("{head}{half}；{way}")
+}
+
+/// §5.4 ③：同账号的条目不受保护、只是卡在 kind 门槛外（端口不同、kind 是按备注猜的）时的
+/// 说明（spec §5.3、§10）。措辞与 [`protected_new`] 刻意不同：这里说的是「端口不同」，
+/// 原因写在句中，也不给出路——两条都保留本来就是更安全的结果。
+///
+/// 没有 `kind_unsure` 之分（这一格按定义就在门槛外），名字同样先过 [`display_name`]。
+pub fn kind_unsure_new(old: &str, new: &str) -> String {
+    format!(
+        "与 {} 同一账号但端口不同，认不准是直连还是住宅，按新节点导入为 {}",
+        display_name(old),
+        display_name(new)
+    )
 }
 
 /// 输错时回显的那一行，不含缩进（调用方经 `say` 在菜单里加两列）：`{head}{输入}{tail}`。
@@ -3398,6 +3480,29 @@ mod tests {
         ] {
             out.push(("account-match-line", delete::page(&[line], width)));
         }
+        // T5：八种受保护说明句（③ 的 `protected_new` 与 ① 的 `protected_kept`，各配
+        // `PanelEntry` / `ActiveEntry` 与 `kind_unsure` 真假）与 `kind_unsure_new`。
+        // 它们也经 `tell`，折法就是 `delete::page`；名字仍取最长的 38 列那个，
+        // 带「同时认不准是直连还是住宅」那半句的是最长的样本（A1）
+        for why in [
+            Blocked::PanelEntry { kind_unsure: false },
+            Blocked::PanelEntry { kind_unsure: true },
+            Blocked::ActiveEntry { kind_unsure: false },
+            Blocked::ActiveEntry { kind_unsure: true },
+        ] {
+            out.push((
+                "protected-new",
+                delete::page(&[protected_new(keeper, keeper, why)], width),
+            ));
+            out.push((
+                "protected-kept",
+                delete::page(&[protected_kept(keeper, keeper, why)], width),
+            ));
+        }
+        out.push((
+            "kind-unsure-new",
+            delete::page(&[kind_unsure_new(keeper, keeper)], width),
+        ));
         // T3：打码样本——把样例里最后一条换成 4.0.0 的 token 名，喂给列表、状态与确认块
         let mut tokened = baiyi_like();
         let tname = format!("{TOKEN}-hy2-resi");
@@ -3690,6 +3795,180 @@ mod tests {
             budget_width(&asked) <= line_limit(40),
             "{}：{asked}",
             budget_width(&asked)
+        );
+    }
+
+    /// 测试 75 的字面部分（spec §5.3、§10）：四句基础文案各配一个 A1 追加版 = 八种输出，
+    /// 逐字对着定稿写；追加半句只插在「…不变」之后、分号之前，四句插入点一致。
+    /// `kind_unsure_new` 的措辞刻意与这八句不同（「端口不同」、不带出路），一起钉在这里。
+    #[test]
+    fn protected_texts_match_spec_word_for_word() {
+        let panel = |kind_unsure| Blocked::PanelEntry { kind_unsure };
+        let active = |kind_unsure| Blocked::ActiveEntry { kind_unsure };
+        // ③ 组为空、另起了新节点：面板来源条目挡下
+        assert_eq!(
+            protected_new(
+                "alice-hy2-direct",
+                "panel.example.com-hy2-direct",
+                panel(false)
+            ),
+            "与 alice-hy2-direct 同一账号但连接参数不同，已按新节点导入为 panel.example.com-hy2-direct，alice-hy2-direct 不变；要更新它请从面板重新导入"
+        );
+        assert_eq!(
+            protected_new(
+                "alice-hy2-direct",
+                "panel.example.com-hy2-direct",
+                panel(true)
+            ),
+            "与 alice-hy2-direct 同一账号但连接参数不同，已按新节点导入为 panel.example.com-hy2-direct，alice-hy2-direct 不变，同时认不准是直连还是住宅；要更新它请从面板重新导入"
+        );
+        // ③：非面板来源的活动节点挡下
+        assert_eq!(
+            protected_new(
+                "hysteria2-1785892136",
+                "panel.example.com-hy2-resi",
+                active(false)
+            ),
+            "与当前节点 hysteria2-1785892136 同一账号但连接参数不同，已按新节点导入为 panel.example.com-hy2-resi，当前节点不变；确认新节点能用后可以切换过去"
+        );
+        assert_eq!(
+            protected_new(
+                "hysteria2-1785892136",
+                "panel.example.com-hy2-resi",
+                active(true)
+            ),
+            "与当前节点 hysteria2-1785892136 同一账号但连接参数不同，已按新节点导入为 panel.example.com-hy2-resi，当前节点不变，同时认不准是直连还是住宅；确认新节点能用后可以切换过去"
+        );
+        // ① 组非空、留存者已更新：面板来源条目挡下
+        assert_eq!(
+            protected_kept("alice-hy2-resi", "panel.example.com-hy2-resi", panel(false)),
+            "alice-hy2-resi 与 panel.example.com-hy2-resi 同一账号但连接参数不同，alice-hy2-resi 不变；要更新它请从面板重新导入"
+        );
+        assert_eq!(
+            protected_kept("alice-hy2-resi", "panel.example.com-hy2-resi", panel(true)),
+            "alice-hy2-resi 与 panel.example.com-hy2-resi 同一账号但连接参数不同，alice-hy2-resi 不变，同时认不准是直连还是住宅；要更新它请从面板重新导入"
+        );
+        // ①：活动节点挡下，出路是切到留存者
+        assert_eq!(
+            protected_kept(
+                "hysteria2-1785892136",
+                "panel.example.com-hy2-resi",
+                active(false)
+            ),
+            "当前节点 hysteria2-1785892136 与 panel.example.com-hy2-resi 同一账号但连接参数不同，当前节点不变；确认 panel.example.com-hy2-resi 能用后可以切换过去"
+        );
+        assert_eq!(
+            protected_kept(
+                "hysteria2-1785892136",
+                "panel.example.com-hy2-resi",
+                active(true)
+            ),
+            "当前节点 hysteria2-1785892136 与 panel.example.com-hy2-resi 同一账号但连接参数不同，当前节点不变，同时认不准是直连还是住宅；确认 panel.example.com-hy2-resi 能用后可以切换过去"
+        );
+        // 门槛挡下、不受保护：措辞是「端口不同」，没有 kind_unsure 之分、也不给出路
+        assert_eq!(
+            kind_unsure_new("hysteria2-1785892136", "panel.example.com-hy2-direct"),
+            "与 hysteria2-1785892136 同一账号但端口不同，认不准是直连还是住宅，按新节点导入为 panel.example.com-hy2-direct"
+        );
+        // 四句的追加半句逐字相同、插入点一致：去掉它就退回基础文案
+        for (long, short) in [
+            (
+                protected_new(
+                    "alice-hy2-direct",
+                    "panel.example.com-hy2-direct",
+                    panel(true),
+                ),
+                protected_new(
+                    "alice-hy2-direct",
+                    "panel.example.com-hy2-direct",
+                    panel(false),
+                ),
+            ),
+            (
+                protected_new(
+                    "hysteria2-1785892136",
+                    "panel.example.com-hy2-resi",
+                    active(true),
+                ),
+                protected_new(
+                    "hysteria2-1785892136",
+                    "panel.example.com-hy2-resi",
+                    active(false),
+                ),
+            ),
+            (
+                protected_kept("alice-hy2-resi", "panel.example.com-hy2-resi", panel(true)),
+                protected_kept("alice-hy2-resi", "panel.example.com-hy2-resi", panel(false)),
+            ),
+            (
+                protected_kept(
+                    "hysteria2-1785892136",
+                    "panel.example.com-hy2-resi",
+                    active(true),
+                ),
+                protected_kept(
+                    "hysteria2-1785892136",
+                    "panel.example.com-hy2-resi",
+                    active(false),
+                ),
+            ),
+        ] {
+            assert_eq!(
+                long.replace("，同时认不准是直连还是住宅", ""),
+                short,
+                "{long}"
+            );
+            assert_eq!(
+                long.matches("不变，同时认不准是直连还是住宅；").count(),
+                1,
+                "{long}"
+            );
+        }
+        // 三个函数的名字入参都先过 display_name：token 段打码、外来名字先净化
+        assert_eq!(
+            protected_new(
+                &format!("{TOKEN}-hy2-resi"),
+                &format!("{TOKEN}-hy2-resi-2"),
+                active(false)
+            ),
+            "与当前节点 0123…-hy2-resi 同一账号但连接参数不同，已按新节点导入为 0123…-hy2-resi-2，当前节点不变；确认新节点能用后可以切换过去"
+        );
+        assert_eq!(
+            protected_kept(
+                &format!("{TOKEN}-hy2-resi"),
+                "panel.example.com-hy2-resi",
+                panel(false)
+            ),
+            "0123…-hy2-resi 与 panel.example.com-hy2-resi 同一账号但连接参数不同，0123…-hy2-resi 不变；要更新它请从面板重新导入"
+        );
+        assert_eq!(
+            kind_unsure_new("\u{1b}[A", &format!("{TOKEN}-hy2-direct")),
+            "与 ?[A 同一账号但端口不同，认不准是直连还是住宅，按新节点导入为 0123…-hy2-direct"
+        );
+    }
+
+    /// `KindUnsure` 到不了 `protected_new`（调用方按 §5.4 ③ 分派），debug 下 `debug_assert!` 挡住。
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "protected_new")]
+    fn protected_new_rejects_kind_unsure_in_debug() {
+        let _ = protected_new(
+            "alice-hy2-direct",
+            "panel.example.com-hy2-direct",
+            Blocked::KindUnsure,
+        );
+    }
+
+    /// 同上：`protected_kept` 只处理 `PanelEntry` / `ActiveEntry`（§5.4 ① 的三分支里
+    /// `KindUnsure` 什么都不打）。
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "protected_kept")]
+    fn protected_kept_rejects_kind_unsure_in_debug() {
+        let _ = protected_kept(
+            "alice-hy2-resi",
+            "panel.example.com-hy2-resi",
+            Blocked::KindUnsure,
         );
     }
 
