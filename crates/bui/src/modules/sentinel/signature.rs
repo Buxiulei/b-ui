@@ -18,8 +18,20 @@ pub enum Sig {
     RelayUpstreamAuthFailed,
     /// relay → 某上游：`unexpected status: 403 … serp …`，或对 Google 搜索域名的 403
     RelayGoogleBlocked,
-    /// hysteria 连不上 http 鉴权端口（spec §3.2）
+    /// hysteria 连不上 http 鉴权端口（spec §3.2）。**只认直连单元** `hysteria-server`：
+    /// 4.1 起住宅那一路是 sing-box 的静态凭据池，没有 auth 段、鉴权失败也不打日志
+    /// （auth 不命中走 masquerade），签名在它上面失去对象（spec §6、§8.1）
     Hy2AuthHttpFailed,
+    /// 住宅 HY2 入站拨不通 relay 的槽入站（`outbound/socks[slot-<i>-out]` 连不上 /
+    /// 超时）⇒ `b-ui-relay` 或它的 `slot-<i>` 入站不在（spec §8.1）
+    Hy2ResiRelayUnreachable,
+    /// 守护进程自己的日志：用户同步里切门（住宅 HY2 的 Clash API）失败
+    Hy2ResiGateSyncFailed,
+    /// **非日志签名**：sing-box 重启后的门位重放用完预算仍有差集（spec §3.4），
+    /// 由重放那一方直接记事件
+    Hy2ResiGateReplayFailed,
+    /// **非日志签名**：空闲凭据 < 20%（spec §3.1），由池巡查直接记事件
+    Hy2ResiPoolLow,
     /// hysteria / xray：`bind: address already in use`
     KernelBindInUse,
     /// systemd：`Start request repeated too quickly` / `restart counter is at N`（N ≥ [`CRASH_LOOP_RESTARTS`]）
@@ -29,6 +41,23 @@ pub enum Sig {
     /// caddy：签证书失败
     CaddyCertFailed,
 }
+
+/// 全部签名。**唯一一份名单**：`id()` 的重名不变量、最长签名窗口（`run::longest_window_secs`）
+/// 都按它枚举，新增签名只改这里。
+pub const ALL_SIGS: [Sig; 12] = [
+    Sig::RelayUpstreamError,
+    Sig::RelayUpstreamAuthFailed,
+    Sig::RelayGoogleBlocked,
+    Sig::Hy2AuthHttpFailed,
+    Sig::KernelBindInUse,
+    Sig::KernelCrashLoop,
+    Sig::XrayGrpcUnavailable,
+    Sig::CaddyCertFailed,
+    Sig::Hy2ResiRelayUnreachable,
+    Sig::Hy2ResiGateSyncFailed,
+    Sig::Hy2ResiGateReplayFailed,
+    Sig::Hy2ResiPoolLow,
+];
 
 /// 签名对应的预案（冷却按「动作 + 对象」计，设计裁决 D12）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +87,10 @@ impl Sig {
             Sig::KernelCrashLoop => "kernel_crash_loop",
             Sig::XrayGrpcUnavailable => "xray_grpc_unavailable",
             Sig::CaddyCertFailed => "caddy_cert_failed",
+            Sig::Hy2ResiRelayUnreachable => "hy2_resi_relay_unreachable",
+            Sig::Hy2ResiGateSyncFailed => "hy2_resi_gate_sync_failed",
+            Sig::Hy2ResiGateReplayFailed => "hy2_resi_gate_replay_failed",
+            Sig::Hy2ResiPoolLow => "hy2_resi_pool_low",
         }
     }
 
@@ -73,9 +106,14 @@ impl Sig {
         match self {
             Sig::RelayUpstreamError | Sig::RelayUpstreamAuthFailed => Action::ProbeAndBorrow,
             Sig::RelayGoogleBlocked => Action::VerifyGoogleAndBorrow,
-            Sig::Hy2AuthHttpFailed | Sig::CaddyCertFailed => Action::Alert,
-            Sig::KernelBindInUse | Sig::KernelCrashLoop => Action::DelegateWatchdog,
-            Sig::XrayGrpcUnavailable => Action::RetryUserSync,
+            Sig::Hy2AuthHttpFailed
+            | Sig::CaddyCertFailed
+            | Sig::Hy2ResiGateReplayFailed
+            | Sig::Hy2ResiPoolLow => Action::Alert,
+            Sig::KernelBindInUse | Sig::KernelCrashLoop | Sig::Hy2ResiRelayUnreachable => {
+                Action::DelegateWatchdog
+            }
+            Sig::XrayGrpcUnavailable | Sig::Hy2ResiGateSyncFailed => Action::RetryUserSync,
         }
     }
 
@@ -95,16 +133,26 @@ impl Sig {
                 threshold: crate::modules::watchdog::AUTH_HTTP_FAIL_THRESHOLD as usize,
                 window_secs: 60,
             },
-            // 用户同步的安全网 60 秒一轮：「连续两轮失败」落在 150 秒窗口里（设计裁决 D10）
-            Sig::XrayGrpcUnavailable => Rule {
+            // 用户同步的安全网 60 秒一轮：「连续两轮失败」落在 150 秒窗口里（设计裁决 D10）。
+            // 门位收敛挂在同一轮同步里（spec §3.3），所以门的失败用同一个门槛
+            Sig::XrayGrpcUnavailable | Sig::Hy2ResiGateSyncFailed => Rule {
                 threshold: 2,
                 window_secs: 150,
             },
-            // 一条就说明问题：403 serp 是明确的上游策略，bind / 崩溃循环 / 证书失败都不会「偶发」
+            // 一次拨号失败可能只是瞬时的（relay 正在重启）：60 秒 3 条才算 relay 或它的
+            // 槽入站不在了（spec §8.1）
+            Sig::Hy2ResiRelayUnreachable => Rule {
+                threshold: 3,
+                window_secs: 60,
+            },
+            // 一条就说明问题：403 serp 是明确的上游策略，bind / 崩溃循环 / 证书失败都不会
+            //「偶发」；后两个是非日志签名，由重放与池巡查各自记一条
             Sig::RelayGoogleBlocked
             | Sig::KernelBindInUse
             | Sig::KernelCrashLoop
-            | Sig::CaddyCertFailed => Rule {
+            | Sig::CaddyCertFailed
+            | Sig::Hy2ResiGateReplayFailed
+            | Sig::Hy2ResiPoolLow => Rule {
                 threshold: 1,
                 window_secs: 60,
             },
@@ -146,6 +194,9 @@ const AUTH_MARKERS: [&str; 3] = [
     "incorrect user name or password",
     "username/password authentication failed",
 ];
+/// 「这条用户同步的失败项说的是切门」的判据：[`crate::modules::residential::clash::ClashError`]
+/// 两种文案各取不带占位符的那一截（`Unreachable` / `Rejected`）
+const CLASH_MARKERS: [&str; 2] = ["Clash API 不可达", "Clash API 拒绝切换到"];
 /// 「到上游本身连不上 / 超时」（reason 小写）
 const UNREACHABLE_MARKERS: [&str; 5] = [
     "connection refused",
@@ -166,10 +217,16 @@ pub fn classify(unit: &str, message: &str) -> Option<Match> {
         "caddy" => caddy(message),
         "b-ui" => xray_grpc(message),
         _ if kernel => {
-            if unit.starts_with("hysteria-")
-                && crate::modules::watchdog::is_auth_http_failure(message)
+            // 鉴权回调只有直连那一路有（`watchdog::is_auth_http_failure` 的门槛与判据仍在，
+            // 只喂 `hysteria-server` 的日志）
+            if unit == "hysteria-server" && crate::modules::watchdog::is_auth_http_failure(message)
             {
                 return Some(hit(Sig::Hy2AuthHttpFailed, unit, message));
+            }
+            if unit == "hysteria-residential" {
+                if let Some(m) = hy2_resi(unit, message) {
+                    return Some(m);
+                }
             }
             message
                 .contains(BIND_IN_USE)
@@ -221,6 +278,30 @@ pub fn parse_relay(message: &str) -> Option<(String, String, u16, String)> {
         return None;
     }
     Some((tag.to_string(), host.to_string(), port, reason.to_string()))
+}
+
+/// 住宅 HY2 入站（sing-box）那一路：拨不通 relay 的槽入站 ⇒ 签名；`deny` 的拒绝行 ⇒ 噪音。
+///
+/// 判据只认「出站 tag + 不可达原因」，**不认正文前半句**：sing-box 对 TCP 打
+/// `open connection to <目标> using outbound/socks[<tag>]: <原因>`，对 UDP 打
+/// `listen packet connection using  using outbound/socks[<tag>]: <原因>`
+/// （`route/conn.go`，两种形态都在 `fixtures_hy2_resi` 里），只认前者会漏掉 UDP 那一半。
+/// 两个 tag 的形状由 [`bui_schema::render::hy2_singbox`] 的 `slot_out_tag` / `DENY_TAG` 决定。
+fn hy2_resi(unit: &str, message: &str) -> Option<Match> {
+    // 被封 / 到期用户持续请求时每条流都打一条 `socks[deny]` 的拒绝行（`dial tcp 127.0.0.1:1:
+    // connect: connection refused`）——那是门在正常工作的证据，spec §8.1 要求一律忽略。
+    // 下面的 `slot-` 前缀今天已经把它排除在外，这条 guard 是**判据被放宽时的保险**：
+    // 谁把 tag 判据放宽成 `outbound/socks[`，噪音也不会变成 60 秒 20 条的告警风暴
+    if message.contains("outbound/socks[deny]") {
+        return None;
+    }
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("outbound/socks[slot-")
+        && UNREACHABLE_MARKERS.iter().any(|k| lower.contains(k))
+    {
+        return Some(hit(Sig::Hy2ResiRelayUnreachable, unit, message));
+    }
+    None
 }
 
 fn is_google_search_host(host: &str) -> bool {
@@ -289,6 +370,11 @@ fn xray_grpc(message: &str) -> Option<Match> {
     if !message.contains(crate::modules::panel::users::USER_SYNC_FAILED_LOG) {
         return None;
     }
+    // 同一轮用户同步既切 xray 的路由规则也切住宅 HY2 的门（spec §3.3），失败项的文案决定
+    // 是哪一边：`ClashError` 的两种（`residential::clash::ClashError`）⇒ 门位收敛失败
+    if CLASH_MARKERS.iter().any(|k| message.contains(k)) {
+        return Some(hit(Sig::Hy2ResiGateSyncFailed, "b-ui", message));
+    }
     // tonic 0.14：`code: 'The service is currently unavailable'`；旧格式是 `status: Unavailable`
     message
         .to_ascii_lowercase()
@@ -299,6 +385,7 @@ fn xray_grpc(message: &str) -> Option<Match> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::modules::sentinel::fixtures_hy2_resi as fx;
     use pretty_assertions::assert_eq;
 
     /// relay 行的真实前缀（R13 §6.2 夹具，bwg-tizi `journalctl -u b-ui-relay -o cat`，色码已剥）
@@ -441,8 +528,10 @@ mod tests {
         assert_eq!(sig_of("b-ui-relay", &gateway), None, "5xx 不是封 Google");
     }
 
+    /// 鉴权签名的作用域缩成**仅直连**：住宅那一路 4.1 起是 sing-box 的静态凭据池、
+    /// 没有 auth 段，鉴权失败也不打任何日志（auth 不命中走 masquerade）⇒ 签名失去对象
     #[test]
-    fn hysteria_auth_endpoint_failures_are_their_own_signature() {
+    fn the_auth_endpoint_signature_is_now_direct_only() {
         let line = "hysteria[1]: authentication error {\"error\": \"Post \\\"http://127.0.0.1:18789/auth\\\": \
                     dial tcp 127.0.0.1:18789: connect: connection refused\"}";
         assert_eq!(
@@ -450,13 +539,176 @@ mod tests {
             Some((Sig::Hy2AuthHttpFailed, "hysteria-server".into()))
         );
         assert_eq!(
-            sig_of("hysteria-residential-2", line),
-            Some((Sig::Hy2AuthHttpFailed, "hysteria-residential-2".into()))
+            sig_of("hysteria-residential", line),
+            None,
+            "住宅单元不该再命中这个签名"
         );
-        // hysteria 自己的出站错误（住宅实例连 relay）不是鉴权失败
+        assert_eq!(
+            sig_of("hysteria-residential-2", line),
+            None,
+            "带后缀的槽位实例已退役（进了 LEGACY_UNITS）"
+        );
+        // hysteria 自己的出站错误（4.0 的住宅实例连 relay）不是鉴权失败
         let outbound = "hysteria[1]: TCP error {\"error\": \"dial tcp 127.0.0.1:2081: connect: connection refused\"}";
-        assert_eq!(sig_of("hysteria-residential-1", outbound), None);
-        assert_eq!(sig_of("xray", line), None, "鉴权签名只认 hysteria 单元");
+        assert_eq!(sig_of("hysteria-server", outbound), None);
+        assert_eq!(sig_of("xray", line), None, "鉴权签名只认直连 hysteria 单元");
+    }
+
+    /// 内核判定（崩溃循环 / bind 冲突）因为单元名沿用而继续覆盖住宅单元
+    #[test]
+    fn crash_loops_and_bind_conflicts_still_cover_the_residential_unit() {
+        assert_eq!(
+            sig_of("hysteria-residential", fx::BIND_IN_USE),
+            Some((Sig::KernelBindInUse, "hysteria-residential".into()))
+        );
+        for l in [fx::CRASH_LOOP_A, fx::CRASH_LOOP_B] {
+            assert_eq!(
+                sig_of("hysteria-residential", l),
+                Some((Sig::KernelCrashLoop, "hysteria-residential".into())),
+                "{l}"
+            );
+        }
+    }
+
+    /// 新签名：拨不通 relay 的槽入站 ⇒ 60 秒 3 条 → DelegateWatchdog；
+    /// `outbound/socks[deny]` 的拒绝行是被封用户的正常噪音，**一律忽略**
+    #[test]
+    fn dialing_the_relay_slot_is_a_signature_but_the_deny_noise_is_not() {
+        for l in [fx::RELAY_DIAL_FAIL, fx::RELAY_DIAL_FAIL_UDP] {
+            assert_eq!(
+                sig_of("hysteria-residential", l),
+                Some((Sig::Hy2ResiRelayUnreachable, "hysteria-residential".into())),
+                "TCP 与 UDP 两种形态都要认（UDP 那条的正文是 `listen packet connection`）：{l}"
+            );
+        }
+        for l in [fx::DENY_NOISE, fx::DENY_NOISE_CONN] {
+            assert_eq!(
+                sig_of("hysteria-residential", l),
+                None,
+                "deny 噪音不许进事件"
+            );
+        }
+        assert_eq!(
+            Sig::Hy2ResiRelayUnreachable.rule(),
+            Rule {
+                threshold: 3,
+                window_secs: 60
+            }
+        );
+        assert_eq!(
+            Sig::Hy2ResiRelayUnreachable.action(),
+            Action::DelegateWatchdog
+        );
+        // 直连单元不跑 sing-box，也就没有槽出站；relay 自己的行归 relay 那张表
+        assert_eq!(sig_of("hysteria-server", fx::RELAY_DIAL_FAIL), None);
+        assert_eq!(sig_of("b-ui-relay", fx::RELAY_DIAL_FAIL), None);
+    }
+
+    /// 判据里的两个出站 tag 就是渲染器产出的那两个：改了 `slot_out_tag` / `DENY_TAG`
+    /// 而忘了改这里，本用例转红（哨兵对住宅那一路会整体失明）
+    #[test]
+    fn the_markers_track_the_tags_the_renderer_emits() {
+        use bui_schema::render::hy2_singbox::{slot_out_tag, DENY_TAG};
+        let line = |tag: &str| {
+            format!(
+                "+0800 2026-09-17 03:48:11 ERROR [3493080625 1ms] connection: open connection to \
+                 www.example.com:443 using outbound/socks[{tag}]: dial tcp 127.0.0.1:2087: \
+                 connect: connection refused"
+            )
+        };
+        for i in 0..bui_schema::slots::MAX_SLOTS {
+            assert_eq!(
+                sig_of("hysteria-residential", &line(&slot_out_tag(i))),
+                Some((Sig::Hy2ResiRelayUnreachable, "hysteria-residential".into())),
+                "槽 {i}"
+            );
+        }
+        assert_eq!(sig_of("hysteria-residential", &line(DENY_TAG)), None);
+    }
+
+    /// 门位收敛失败：b-ui 自己的日志行 + ClashError 两种文案
+    #[test]
+    fn a_failing_gate_sync_retries_the_user_sync() {
+        for err in [
+            "Clash API 不可达：connection refused",
+            "Clash API 拒绝切换到 slot-1-out（HTTP 404）",
+        ] {
+            let line = format!(
+                "{} {err}",
+                crate::modules::panel::users::USER_SYNC_FAILED_LOG
+            );
+            assert_eq!(
+                sig_of("b-ui", &line),
+                Some((Sig::Hy2ResiGateSyncFailed, "b-ui".into())),
+                "{err}"
+            );
+        }
+        assert_eq!(
+            Sig::Hy2ResiGateSyncFailed.rule(),
+            Rule {
+                threshold: 2,
+                window_secs: 150
+            }
+        );
+        assert_eq!(Sig::Hy2ResiGateSyncFailed.action(), Action::RetryUserSync);
+        // 不带同步失败前缀的 Clash 文案不算（住宅体检自己也会打「Clash API 不可达」）
+        assert_eq!(sig_of("b-ui", "Clash API 不可达：connection refused"), None);
+    }
+
+    /// 正常日志不许误报（启动行、成功连接三行、槽出站的正常拨号、两个管理面的监听行）
+    #[test]
+    fn healthy_residential_log_lines_classify_to_none() {
+        for l in [
+            fx::START_LINE,
+            fx::CONN_FROM,
+            fx::CONN_TO_USER,
+            fx::CONN_TO_USER_UDP,
+            fx::SLOT_OUT_CONN,
+            fx::CLASH_API_LISTEN,
+            fx::V2RAY_API_LISTEN,
+        ] {
+            assert_eq!(sig_of("hysteria-residential", l), None, "误报：{l}");
+        }
+    }
+
+    /// 签名表与遗留清单的不变量：四个新 id 都稳定、且没有重名
+    #[test]
+    fn the_new_signature_ids_are_stable_and_unique() {
+        let ids: Vec<&str> = [
+            Sig::Hy2ResiRelayUnreachable,
+            Sig::Hy2ResiGateSyncFailed,
+            Sig::Hy2ResiGateReplayFailed,
+            Sig::Hy2ResiPoolLow,
+        ]
+        .iter()
+        .map(|s| s.id())
+        .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "hy2_resi_relay_unreachable",
+                "hy2_resi_gate_sync_failed",
+                "hy2_resi_gate_replay_failed",
+                "hy2_resi_pool_low"
+            ]
+        );
+        let mut all: Vec<&str> = ALL_SIGS.iter().map(|s| s.id()).collect();
+        all.sort_unstable();
+        let n = all.len();
+        all.dedup();
+        assert_eq!(
+            all.len(),
+            n,
+            "签名 id 不许重名（事件、面板、演练脚本都按它认领）"
+        );
+        for s in [
+            Sig::Hy2ResiRelayUnreachable,
+            Sig::Hy2ResiGateSyncFailed,
+            Sig::Hy2ResiGateReplayFailed,
+            Sig::Hy2ResiPoolLow,
+        ] {
+            assert!(ALL_SIGS.contains(&s), "{s:?} 不在 ALL_SIGS 里");
+        }
     }
 
     #[test]
@@ -577,14 +829,43 @@ mod tests {
                 window_secs: 150
             }
         );
+        // 拨不通 relay 的槽入站：单条可能只是一次瞬时拨号失败，60 秒 3 条才是「relay 或它的
+        // 槽入站不在了」；预案与 bind / 崩溃循环同款（交看门狗）
+        assert_eq!(
+            Sig::Hy2ResiRelayUnreachable.rule(),
+            Rule {
+                threshold: 3,
+                window_secs: 60
+            }
+        );
+        // 门位收敛与 xray 用户同步同一条安全网（60 秒一轮）⇒ 窗口同为 150 秒
+        assert_eq!(
+            Sig::Hy2ResiGateSyncFailed.rule(),
+            Sig::XrayGrpcUnavailable.rule(),
+        );
+        assert_eq!(
+            Sig::Hy2ResiGateSyncFailed.action(),
+            Sig::XrayGrpcUnavailable.action(),
+            "同预案：9092 在听就立刻重跑一轮收敛"
+        );
         for s in [
             Sig::RelayGoogleBlocked,
             Sig::KernelBindInUse,
             Sig::KernelCrashLoop,
             Sig::CaddyCertFailed,
+            // 非日志签名：重放（spec §3.4）与池巡查（§3.1）各自一条就告警
+            Sig::Hy2ResiGateReplayFailed,
+            Sig::Hy2ResiPoolLow,
         ] {
             assert_eq!(s.rule().threshold, 1, "{s:?}");
         }
+        assert_eq!(
+            Sig::Hy2ResiRelayUnreachable.action().id(),
+            "delegate_watchdog"
+        );
+        assert_eq!(Sig::Hy2ResiGateSyncFailed.action().id(), "retry_user_sync");
+        assert_eq!(Sig::Hy2ResiGateReplayFailed.action().id(), "alert");
+        assert_eq!(Sig::Hy2ResiPoolLow.action().id(), "alert");
         assert_eq!(Sig::RelayUpstreamError.action().id(), "probe_and_borrow");
         assert_eq!(
             Sig::RelayGoogleBlocked.action().id(),

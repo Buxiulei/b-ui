@@ -54,6 +54,10 @@ pub const HEAL_COOLDOWN_MINUTES: i64 = 10;
 /// 连接都要打一次 `127.0.0.1:AUTH_HTTP_PORT`，守护进程没在听（或应答超时）就是全员登录失败。
 /// **检测与告警在日志哨兵**（`modules::sentinel`，5 秒增量读 journald）；这里只留判据与门槛，
 /// 哨兵的签名表引用它们。
+///
+/// **4.1 起只喂直连**（`hysteria-server`）：住宅那一路是 sing-box 的静态凭据池，没有 auth 段，
+/// 鉴权失败也不打任何日志（auth 不命中走 masquerade）⇒ 判据在它上面失去对象
+/// （spec §6、§8.1；作用域在 `sentinel::signature::classify` 里收）。
 /// 多少条鉴权连接失败（60 秒内）才算一次事件。
 pub const AUTH_HTTP_FAIL_THRESHOLD: u32 = 3;
 /// 「这一行说的是鉴权请求」的判据：内核把整个 URL 打进错误里，所以路径或端口任一命中即可。

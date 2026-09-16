@@ -193,6 +193,17 @@ mod tests {
         }
     }
 
+    /// `log` 段是哨兵判据的前提（spec §2.2 / §6、§8.1）：级别降到 `warn` 就吃掉
+    /// `[<用户名>] inbound connection to <目标>` 那条排查线索，也吃掉哨兵认
+    /// `outbound/socks[slot-<i>-out]` 拨号失败所需的上下文；`timestamp` 决定日志行的前缀形态，
+    /// 而哨兵的夹具（`bui` 的 `sentinel::fixtures_hy2_resi`）就是按 `true` 采的。
+    /// 谁把它改了，这条转红。
+    #[test]
+    fn the_log_section_stays_at_info_with_timestamps() {
+        let v = config(&node(), &Paths::default_server(), &pool());
+        assert_eq!(v["log"], json!({ "level": "info", "timestamp": true }));
+    }
+
     /// 入站形状 = spec §2.3 里在 1.14.0 真机上过 check 的那一份
     #[test]
     fn the_inbound_is_the_shape_verified_on_the_tizi_sidecar() {

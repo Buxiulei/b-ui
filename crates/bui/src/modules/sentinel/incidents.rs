@@ -197,6 +197,47 @@ mod tests {
         assert_eq!(format_list(&[inc(1), inc(2)]).lines().count(), 2);
     }
 
+    /// 4.1 的四个住宅签名经 `runtime.json` 走一圈仍能被 `bui incidents` 列出来
+    /// （守护进程没跑时 CLI 走的就是这条路）：id 与动作原样落盘、原样读回
+    #[tokio::test]
+    async fn the_four_new_residential_signatures_show_up_in_bui_incidents() {
+        use crate::modules::sentinel::signature::Sig;
+        let d = tempfile::tempdir().unwrap();
+        let paths = bui_schema::paths::Paths {
+            base_dir: d.path().to_path_buf(),
+            certs_dir: d.path().join("certs"),
+            bin_dir: d.path().join("bin"),
+        };
+        let sigs = [
+            Sig::Hy2ResiRelayUnreachable,
+            Sig::Hy2ResiGateSyncFailed,
+            Sig::Hy2ResiGateReplayFailed,
+            Sig::Hy2ResiPoolLow,
+        ];
+        let rt = crate::state::runtime::Runtime::load(crate::paths::runtime_file(&paths));
+        rt.update(|r| {
+            for s in sigs {
+                let mut i = inc(0);
+                i.unit = "hysteria-residential".into();
+                i.signature = s.id().into();
+                i.action = s.action().id().into();
+                push(r, i);
+            }
+        })
+        .await;
+        let (v, live) = load_recent(&d.path().join("no.sock"), &paths, 10).await;
+        assert!(!live);
+        let ids: Vec<&str> = v.iter().map(|i| i.signature.as_str()).collect();
+        for s in sigs {
+            assert!(ids.contains(&s.id()), "{} 不在 {ids:?}", s.id());
+        }
+        let text = format_list(&v);
+        for s in sigs {
+            assert!(text.contains(s.id()), "人读输出缺 {}", s.id());
+            assert!(text.contains(s.action().id()), "人读输出缺动作 {}", s.id());
+        }
+    }
+
     /// 守护进程没跑（socket 连不上）⇒ 直接读 runtime.json，并如实报告来源
     #[tokio::test]
     async fn load_recent_falls_back_to_runtime_json_when_the_daemon_is_down() {

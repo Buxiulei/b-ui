@@ -23,22 +23,13 @@ pub fn units(state: &State) -> Vec<String> {
     crate::reconcile::managed_units(state)
 }
 
-/// 最长的签名窗口（今天是 `XrayGrpcUnavailable` 的 150 秒）
+/// 最长的签名窗口（今天是 `XrayGrpcUnavailable` / `Hy2ResiGateSyncFailed` 的 150 秒）
 fn longest_window_secs() -> i64 {
-    [
-        Sig::RelayUpstreamError,
-        Sig::RelayUpstreamAuthFailed,
-        Sig::RelayGoogleBlocked,
-        Sig::Hy2AuthHttpFailed,
-        Sig::KernelBindInUse,
-        Sig::KernelCrashLoop,
-        Sig::XrayGrpcUnavailable,
-        Sig::CaddyCertFailed,
-    ]
-    .into_iter()
-    .map(|s| s.rule().window_secs)
-    .max()
-    .unwrap_or_default()
+    signature::ALL_SIGS
+        .into_iter()
+        .map(|s| s.rule().window_secs)
+        .max()
+        .unwrap_or_default()
 }
 
 /// 重启后第一轮：持久化的读起点（有游标看 `cursor_at`，否则看 `since`）早于最长签名窗口、或年龄不明
@@ -284,6 +275,10 @@ async fn dispatch(
         (Sig::KernelBindInUse | Sig::KernelCrashLoop, _) => system::on_kernel(&r.unit, sig),
         (Sig::XrayGrpcUnavailable, _) => system::on_xray_grpc(ctx, &deps.panel).await,
         (Sig::CaddyCertFailed, _) => system::on_caddy_cert(key),
+        (Sig::Hy2ResiRelayUnreachable, _) => system::on_hy2_resi_relay(&r.unit),
+        (Sig::Hy2ResiGateSyncFailed, _) => system::on_gate_sync(ctx, &deps.panel).await,
+        // 非日志签名：`classify` 不产出它们（重放与池巡查直接记事件，spec §3.4 / §3.1）
+        (Sig::Hy2ResiGateReplayFailed | Sig::Hy2ResiPoolLow, _) => system::on_resi_alert(sig),
     }
 }
 
@@ -396,6 +391,10 @@ mod tests {
             assert!(units.contains(&u), "{u} 不在 {units:?}");
         }
         // 4.1：受管单元固定六个，带序号的住宅实例已退役（进了 LEGACY_UNITS）
+        assert!(
+            !units.iter().any(|u| u.starts_with("hysteria-residential-")),
+            "槽位单元已退役：{units:?}"
+        );
         assert_eq!(units.len(), 6, "{units:?}");
         assert_eq!(
             engine::sentinel_of(&k.ctx.runtime.read().await)
@@ -562,21 +561,78 @@ mod tests {
     const AUTH_FAIL: &str = "hysteria[1]: authentication error {\"error\": \"Post \
         \\\"http://127.0.0.1:18789/auth\\\": dial tcp 127.0.0.1:18789: connect: connection refused\"}";
 
+    /// 4.1：鉴权签名只认直连单元（住宅那一路没有 auth 段，spec §6 / §8.1）
     #[tokio::test]
     async fn hysteria_auth_failures_alert_in_http_mode() {
         let k = kit().await;
         feed(
             &k,
             (0..3)
-                .map(|s| rec("hysteria-residential-1", s, AUTH_FAIL))
+                .map(|s| rec("hysteria-server", s, AUTH_FAIL))
                 .collect(),
         );
         let rep = tick(&k.ctx, &k.deps, &mut Sentinel::default()).await;
         assert_eq!(rep.incidents.len(), 1);
         assert_eq!(rep.incidents[0].signature, "hy2_auth_http_failed");
-        assert_eq!(rep.incidents[0].subject, "hysteria-residential-1");
+        assert_eq!(rep.incidents[0].subject, "hysteria-server");
         assert_eq!(rep.incidents[0].action, "alert");
         assert!(k.host.ops().iter().all(|o| !o.starts_with("systemd:")));
+    }
+
+    /// 同样三条，喂住宅单元 ⇒ 一条事件都不许有
+    #[tokio::test]
+    async fn the_same_auth_lines_on_the_residential_unit_are_ignored() {
+        let k = kit().await;
+        feed(
+            &k,
+            (0..3)
+                .map(|s| rec("hysteria-residential", s, AUTH_FAIL))
+                .collect(),
+        );
+        assert!(tick(&k.ctx, &k.deps, &mut Sentinel::default())
+            .await
+            .incidents
+            .is_empty());
+    }
+
+    /// 住宅入站拨不通 relay 的槽入站：60 秒 3 条 → 一条告警级事件 + 交看门狗，哨兵不重启任何单元；
+    /// `deny` 噪音（被封用户持续请求）同样三条 ⇒ 零事件
+    #[tokio::test]
+    async fn three_relay_dial_failures_delegate_to_the_watchdog_but_deny_noise_does_not() {
+        use crate::modules::sentinel::fixtures_hy2_resi as fx;
+        let k = kit().await;
+        feed(
+            &k,
+            (0..3)
+                .map(|s| rec("hysteria-residential", s, fx::RELAY_DIAL_FAIL))
+                .collect(),
+        );
+        let rep = tick(&k.ctx, &k.deps, &mut Sentinel::default()).await;
+        assert_eq!(rep.incidents.len(), 1, "{:?}", rep.incidents);
+        assert_eq!(rep.incidents[0].signature, "hy2_resi_relay_unreachable");
+        assert_eq!(rep.incidents[0].subject, "hysteria-residential");
+        assert_eq!(rep.incidents[0].action, "delegate_watchdog");
+        assert_eq!(rep.incidents[0].level, Level::Error);
+        assert!(
+            k.host.ops().iter().all(|o| !o.starts_with("systemd:")),
+            "{:?}",
+            k.host.ops()
+        );
+
+        let k = kit().await;
+        feed(
+            &k,
+            (0..3)
+                .map(|s| rec("hysteria-residential", s, fx::DENY_NOISE))
+                .collect(),
+        );
+        assert!(
+            tick(&k.ctx, &k.deps, &mut Sentinel::default())
+                .await
+                .incidents
+                .is_empty(),
+            "deny 噪音不许进事件"
+        );
     }
 
     #[tokio::test]
