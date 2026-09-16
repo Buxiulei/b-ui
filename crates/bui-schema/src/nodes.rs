@@ -1,7 +1,6 @@
 //! 权益 → 节点集合：把一个用户的 [`Entitlements`](crate::model::Entitlements) 展开成他订阅里该出现的节点。
 
 use crate::model::{NodeParams, Protocol, Residential, User};
-use crate::slots;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -60,6 +59,8 @@ impl Node {
 /// Reality直连、Reality住宅、HY2直连、HY2住宅。
 ///
 /// 住宅节点只在用户有住宅权益、且权益指向的分组真实存在时才给出；
+/// HY2 住宅还要求他在凭据池里占着一条（[`hy2pool::cred_of`](crate::hy2pool::cred_of)），
+/// 端口与跳跃区间恒为期望态里的 `hy2_resi` / `hy2_resi_hop`（**与槽位无关**）。
 /// obfs 加在直连与住宅两种 HY2 节点上（混淆覆盖全部 HY2 实例，2026-09-15 裁决）。
 pub fn nodes_for(user: &User, node: &NodeParams, resi: &Residential) -> Vec<Node> {
     let e = &user.entitlements;
@@ -90,10 +91,13 @@ pub fn nodes_for(user: &User, node: &NodeParams, resi: &Residential) -> Vec<Node
             flow: "xtls-rprx-vision".into(),
         },
     };
+    // `auth` = 写进 `hysteria2://name:secret@…` 的那一对：直连是用户名 + `hy2_password`，
+    // 住宅是凭据池里那条（`hy2pool::cred_of`，spec §3.1）。
     let hy2 = |port: u16,
                hop: Option<(u16, u16)>,
                kind: NodeKind,
                label: &str,
+               auth: (&str, &str),
                obfs_password: Option<String>| Node {
         kind,
         label: label.into(),
@@ -101,8 +105,8 @@ pub fn nodes_for(user: &User, node: &NodeParams, resi: &Residential) -> Vec<Node
         port,
         hop,
         transport: Transport::Hysteria2 {
-            username: user.username.clone(),
-            password: user.credentials.hy2_password.clone(),
+            username: auth.0.to_string(),
+            password: auth.1.to_string(),
             sni: sni.clone(),
             obfs_password,
         },
@@ -131,20 +135,25 @@ pub fn nodes_for(user: &User, node: &NodeParams, resi: &Residential) -> Vec<Node
                 node.ports.hy2_hop,
                 NodeKind::Hy2Direct,
                 "HY2直连",
+                (&user.username, &user.credentials.hy2_password),
                 obfs.clone(),
             ));
         }
+        // 4.1：住宅 HY2 只剩一个监听端口，整段 `41000-50000` 由 `table inet bui` 的
+        // REDIRECT 送到它，于是**每个用户的端口与区间完全相同**、改槽不再动订阅
+        // （spec §1.2 目标 1）。认证用凭据池里那条；还没分到凭据的用户不发这个节点
+        // （门位未就绪，发出去也连不上）。
         if resi_ok {
-            // spec §5.6：住宅 HY2 节点用**该用户槽位**的端口与跳跃区间。
-            // 单槽（含空池、旧 state）时它就是 40000 + 41000-50000，与 v3 逐字相同。
-            let res = slots::resources_of(&node.ports, resi, slots::index_of_user(user, resi));
-            out.push(hy2(
-                res.hy2_port,
-                Some(res.hop),
-                NodeKind::Hy2Residential,
-                "HY2住宅",
-                obfs,
-            ));
+            if let Some(c) = crate::hy2pool::cred_of(user, resi) {
+                out.push(hy2(
+                    node.ports.hy2_resi,
+                    Some(node.ports.hy2_resi_hop),
+                    NodeKind::Hy2Residential,
+                    "HY2住宅",
+                    (&c.name, &c.secret),
+                    obfs,
+                ));
+            }
         }
     }
     out
@@ -182,11 +191,11 @@ mod tests {
 
     #[test]
     fn fusion_gives_four_in_v3_order() {
-        let ns = nodes_for(
-            &user(vec![Protocol::Hysteria2, Protocol::Reality], true),
-            &node(),
-            &Residential::default(),
+        let (u, r) = minted(
+            user(vec![Protocol::Hysteria2, Protocol::Reality], true),
+            Residential::default(),
         );
+        let ns = nodes_for(&u, &node(), &r);
         let kinds: Vec<_> = ns.iter().map(|n| n.kind).collect();
         assert_eq!(
             kinds,
@@ -241,11 +250,11 @@ mod tests {
 
     #[test]
     fn hysteria2_only_with_residential_gives_two() {
-        let ns = nodes_for(
-            &user(vec![Protocol::Hysteria2], true),
-            &node(),
-            &Residential::default(),
+        let (u, r) = minted(
+            user(vec![Protocol::Hysteria2], true),
+            Residential::default(),
         );
+        let ns = nodes_for(&u, &node(), &r);
         assert_eq!(
             ns.iter().map(|n| n.kind).collect::<Vec<_>>(),
             vec![NodeKind::Hy2Direct, NodeKind::Hy2Residential]
@@ -306,14 +315,165 @@ mod tests {
         r
     }
 
+    /// 造一份「8 槽、每槽一个住宅 hysteria2 用户」的期望态（凭据池还是空的）。
+    fn eight_slot_state() -> State {
+        let users = (0..crate::slots::MAX_SLOTS)
+            .map(|i| {
+                let mut u = user(vec![Protocol::Hysteria2, Protocol::Reality], true);
+                u.user_id = Uuid::from_u128(0x1000 + u128::from(i));
+                u.username = format!("u{i}");
+                u.created_at = format!("2026-09-11T00:0{i}:00Z");
+                u.credentials.hy2_password = format!("pw-u{i}");
+                u.entitlements.residential.as_mut().unwrap().slot_id =
+                    Some(Uuid::from_u128(u128::from(i) + 1));
+                u
+            })
+            .collect();
+        State {
+            schema_version: SCHEMA_VERSION,
+            node: node(),
+            admin: Admin {
+                password_hash: "h".into(),
+                jwt_secret: "s".into(),
+            },
+            users,
+            residential: resi_with_slots(crate::slots::MAX_SLOTS),
+            system: SystemSettings::default(),
+            versions: Versions::default(),
+            catalog: Vec::new(),
+        }
+    }
+
+    /// 用 `hy2pool::migrate` 给一个用户发凭据（迁移口径：`name` = 用户名、
+    /// `secret` = 当时的 `hy2_password`）。凭据口径只有 `migrate` 一处，测试不手抄。
+    fn minted(u: User, r: Residential) -> (User, Residential) {
+        let mut s = eight_slot_state();
+        s.users = vec![u];
+        s.residential = r;
+        crate::hy2pool::migrate(&mut s, time::OffsetDateTime::now_utc());
+        (s.users.remove(0), s.residential)
+    }
+
+    /// 住宅 HY2 节点不再含任何槽位信息：8 个槽、不同槽的用户，端口与区间**完全相同**
+    #[test]
+    fn residential_hy2_is_slot_independent() {
+        let mut s = eight_slot_state();
+        crate::hy2pool::migrate(&mut s, time::OffsetDateTime::now_utc());
+        let mut seen = std::collections::BTreeSet::new();
+        for u in &s.users {
+            let Some(n) = nodes_for(u, &s.node, &s.residential)
+                .into_iter()
+                .find(|n| n.kind == NodeKind::Hy2Residential)
+            else {
+                continue;
+            };
+            assert_eq!(n.port, 40000);
+            assert_eq!(n.hop, Some((41000, 50000)));
+            assert_eq!(
+                n.label, "HY2住宅",
+                "label 是 bui-c 的 profile 名算子，一个字都不许改"
+            );
+            let Transport::Hysteria2 {
+                username, password, ..
+            } = &n.transport
+            else {
+                panic!()
+            };
+            let c = crate::hy2pool::cred_of(u, &s.residential).unwrap();
+            assert_eq!(
+                (username.as_str(), password.as_str()),
+                (c.name.as_str(), c.secret.as_str())
+            );
+            seen.insert((n.port, n.hop));
+        }
+        assert_eq!(seen.len(), 1, "8 个槽的端口/区间必须是同一对，不该有第二种");
+    }
+
+    /// 住宅 HY2 的 auth 必须是**凭据池里那条**，不是用户自己的 `username` /
+    /// `hy2_password`。上面那条用例里的用户都是 `migrate` 造的迁移用户，凭据恰好等于
+    /// `{name: 用户名, secret: 当时的 hy2_password}`，断言是恒真式；这里换一条**新发**
+    /// 凭据（`name = id` = `r%03d`、`secret` 随机，spec §3.1），auth 若退回用户那一对
+    /// 就红 —— T11 之后每个新建用户与每次 rotate 拿到的都是这一种。
+    #[test]
+    fn a_freshly_minted_cred_is_what_goes_into_the_residential_hy2_auth() {
+        let mut s = eight_slot_state();
+        let t0 = time::macros::datetime!(2026-09-15 00:00 UTC);
+        crate::hy2pool::migrate(&mut s, t0);
+        // 迁移凭据换成新发的：先 release 再 assign（rotate 的口径，spec §3.3）
+        let uid = s.users[0].user_id;
+        crate::hy2pool::release(&mut s, uid, t0);
+        assert!(crate::hy2pool::assign(&mut s, uid).is_some());
+        let u = &s.users[0];
+        let c = crate::hy2pool::cred_of(u, &s.residential).unwrap();
+        assert_eq!(c.name, c.id, "新发凭据 name = id（spec §3.1）");
+        assert_ne!(c.name, u.username, "新发凭据不该是用户名");
+        assert_ne!(
+            c.secret, u.credentials.hy2_password,
+            "新发凭据不该是直连的 hy2_password"
+        );
+        let n = nodes_for(u, &s.node, &s.residential)
+            .into_iter()
+            .find(|n| n.kind == NodeKind::Hy2Residential)
+            .expect("有凭据就该有住宅 HY2 节点");
+        let Transport::Hysteria2 {
+            username, password, ..
+        } = &n.transport
+        else {
+            panic!("住宅 HY2 节点的传输层必须是 Hysteria2")
+        };
+        assert_eq!(
+            (username.as_str(), password.as_str()),
+            (c.name.as_str(), c.secret.as_str()),
+            "auth 必须取凭据池里那条，不是用户的 username / hy2_password"
+        );
+    }
+
+    /// 迁移前的一瞬（池是空的）不发住宅 HY2 节点，其余三个节点照给
+    #[test]
+    fn a_user_without_a_cred_gets_no_residential_hy2_node() {
+        let s = eight_slot_state();
+        let u = s
+            .users
+            .iter()
+            .find(|u| u.entitlements.residential.is_some())
+            .unwrap();
+        let kinds: Vec<_> = nodes_for(u, &s.node, &s.residential)
+            .iter()
+            .map(|n| n.kind)
+            .collect();
+        assert!(!kinds.contains(&NodeKind::Hy2Residential));
+        assert!(
+            kinds.contains(&NodeKind::Hy2Direct) && kinds.contains(&NodeKind::RealityResidential)
+        );
+    }
+
+    /// 四个 label 的字面量钉死（spec §7.4 约束 1：改了会让 bui-c 新增节点、旧节点变死节点）
+    #[test]
+    fn the_four_labels_are_frozen() {
+        let mut s = eight_slot_state();
+        crate::hy2pool::migrate(&mut s, time::OffsetDateTime::now_utc());
+        let u = s
+            .users
+            .iter()
+            .find(|u| u.entitlements.residential.is_some())
+            .unwrap();
+        let ns = nodes_for(u, &s.node, &s.residential);
+        let mut labels: Vec<&str> = ns.iter().map(|n| n.label.as_str()).collect();
+        labels.sort_unstable();
+        assert_eq!(
+            labels,
+            vec!["HY2住宅", "HY2直连", "Reality住宅", "Reality直连"]
+        );
+    }
+
     /// 单槽（含空池）时 HY2 住宅节点必须还是 40000 + 41000-50000 —— golden 的生命线。
     #[test]
     fn a_single_slot_keeps_the_v3_residential_hy2_port() {
-        let ns = nodes_for(
-            &user(vec![Protocol::Hysteria2], true),
-            &node(),
-            &Residential::default(),
+        let (u, r) = minted(
+            user(vec![Protocol::Hysteria2], true),
+            Residential::default(),
         );
+        let ns = nodes_for(&u, &node(), &r);
         let r = ns
             .iter()
             .find(|n| n.kind == NodeKind::Hy2Residential)
@@ -322,45 +482,12 @@ mod tests {
         assert_eq!(r.hop, Some((41000, 50000)));
     }
 
-    #[test]
-    fn the_residential_hy2_node_follows_the_users_slot() {
-        let resi = resi_with_slots(3);
-        let mut u = user(vec![Protocol::Hysteria2, Protocol::Reality], true);
-        // 槽 1
-        u.entitlements.residential.as_mut().unwrap().slot_id = Some(Uuid::from_u128(2));
-        let ns = nodes_for(&u, &node(), &resi);
-        let r = ns
-            .iter()
-            .find(|n| n.kind == NodeKind::Hy2Residential)
-            .unwrap();
-        assert_eq!(r.port, 40001);
-        assert_eq!(r.hop, Some((44000, 46999)));
-        // 槽 2
-        u.entitlements.residential.as_mut().unwrap().slot_id = Some(Uuid::from_u128(3));
-        let ns = nodes_for(&u, &node(), &resi);
-        let r = ns
-            .iter()
-            .find(|n| n.kind == NodeKind::Hy2Residential)
-            .unwrap();
-        assert_eq!(r.port, 40002);
-        assert_eq!(r.hop, Some((47000, 50000)));
-        // 未分配 ⇒ 兜底槽（槽 0）
-        u.entitlements.residential.as_mut().unwrap().slot_id = None;
-        let ns = nodes_for(&u, &node(), &resi);
-        let r = ns
-            .iter()
-            .find(|n| n.kind == NodeKind::Hy2Residential)
-            .unwrap();
-        assert_eq!(r.port, 40000);
-        assert_eq!(r.hop, Some((41000, 43999)));
-    }
-
-    /// 槽位只动 HY2 住宅那一个节点：直连两条与 Reality 住宅（:10002）都不许变。
+    /// 槽位不动任何节点：直连两条、Reality 住宅（:10002）与 HY2 住宅都不许随槽位变。
     #[test]
     fn slots_do_not_touch_any_other_node() {
-        let resi = resi_with_slots(3);
         let mut u = user(vec![Protocol::Hysteria2, Protocol::Reality], true);
         u.entitlements.residential.as_mut().unwrap().slot_id = Some(Uuid::from_u128(3));
+        let (u, resi) = minted(u, resi_with_slots(3));
         let ns = nodes_for(&u, &node(), &resi);
         let by = |k: NodeKind| ns.iter().find(|n| n.kind == k).unwrap().clone();
         assert_eq!(by(NodeKind::RealityDirect).port, 10001);

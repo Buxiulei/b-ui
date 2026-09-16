@@ -143,7 +143,8 @@ pub fn import(dir: &Path) -> Result<ImportReport, ImportError> {
         .map(|u| user_from_v3(u, &mut warnings))
         .collect::<Result<Vec<_>, _>>()?;
 
-    let state = State {
+    let now = time::OffsetDateTime::now_utc();
+    let mut state = State {
         schema_version: SCHEMA_VERSION,
         node: NodeParams {
             id: Uuid::new_v4(),
@@ -172,13 +173,17 @@ pub fn import(dir: &Path) -> Result<ImportReport, ImportError> {
         // `sub::LEGACY_SUB_GRACE_DAYS` 天宽限期，期间两种链接都认；到期（或运维提前
         // `bui set legacy-sub off`）之后只认随机 token。
         system: SystemSettings {
-            legacy_sub_until: Some(legacy_sub_deadline(time::OffsetDateTime::now_utc())),
+            legacy_sub_until: Some(legacy_sub_deadline(now)),
             ..SystemSettings::default()
         },
         // 内核版本由 P1 装机阶段现场探测后填入
         versions: Versions::default(),
         catalog: Vec::new(),
     };
+
+    // v3 → 4.1 直装也要拿到住宅 HY2 凭据（spec §4.3）：迁移用户的凭据是
+    // `{ name: 用户名, secret: 当时的 hy2_password }`，所以三种订阅逐字不变。
+    crate::hy2pool::migrate(&mut state, now);
 
     Ok(ImportReport { state, warnings })
 }
