@@ -1,6 +1,7 @@
 //! 内核配置、订阅与客户端配置的渲染器。
 pub mod client;
 pub mod hysteria;
+pub mod nft;
 pub mod relay;
 pub mod subscription;
 pub mod xray;
