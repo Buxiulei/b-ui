@@ -389,20 +389,21 @@ pub async fn tick(ctx: &DaemonCtx, shared: &Shared) -> anyhow::Result<()> {
 
     // ⑤ 刷新面板缓存
     let state = ctx.store.read().await;
-    // **每人 0 / 1**（见模块文档「在线数的量纲」）：直连报的是会话数、住宅报的是连接条数、
-    // Xray 只有「有没有增量」，三者相加等于任何东西。任一来源 > 0 ⇒ 这个人记 1。
     let mut online: BTreeMap<Uuid, u32> = BTreeMap::new();
     for (id, n) in &sample.online {
-        if *n > 0 {
-            if let Ok(uid) = Uuid::parse_str(id) {
-                online.insert(uid, 1);
-            }
+        if let Ok(uid) = Uuid::parse_str(id) {
+            *online.entry(uid).or_insert(0) += *n;
         }
     }
     // Xray 没有连接数接口：最近 30 秒有增量就算在线（spec §4.2 的并集）
     for uid in shared.xray_seen().await.keys() {
-        online.insert(*uid, 1);
+        online.entry(*uid).or_insert(1);
     }
+    // **归一成每人 0 / 1**（见模块文档「在线数的量纲」）：上面三个来源分别是直连会话数、
+    // 住宅连接条数、Xray 的常数 1，相加等于任何东西。收成布尔就一个量纲，面板那个卡是
+    // 「在线用户数」。**这两行是唯一的归一点** —— 删了它就回到 4.0.x 那个混量纲的和。
+    online.retain(|_, n| *n > 0);
+    online.values_mut().for_each(|n| *n = 1);
     let mut cache = shared.cache_mut().await;
     for (id, d) in &deltas {
         if let Some(name) = state
@@ -700,7 +701,15 @@ mod tests {
                 .map(|(a, b)| (a.as_str(), b.as_str()))
                 .collect(),
         );
-        // Xray：有增量
+        // **先不给 Xray 流量**：Xray 那一档写的是常数 1，有它在就会把「直连会话数 + 住宅
+        // 连接条数」这个混量纲的和掩盖掉（第一版用例就是被它掩盖的，变异验证抓出来的）
+        tick(&ctx, &h.shared).await.unwrap();
+        assert_eq!(
+            h.shared.cache().await.online.get("alice").copied(),
+            Some(1),
+            "3 个会话 + 30 条连接 = 1 个在线用户（4.0.x 这里是 33）"
+        );
+        // 再加上 Xray 的那一档，还是 1
         h.xray.with(|i| {
             i.deltas.insert(id.clone(), TxRx { tx: 1, rx: 1 });
         });

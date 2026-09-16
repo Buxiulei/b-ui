@@ -450,13 +450,23 @@ mod tests {
         ] {
             assert!(!js.contains(gone), "app.js 里还留着「{gone}」");
         }
-        assert!(js.contains("_DENY_SEMANTICS"), "spec §6 的文案没了");
+        // **断言钉在那个常量的值上**，不是「文件里某处出现过」：同样的字眼也写在旁边的
+        // 注释里，按整份文件断言时把注释删不掉的假绿（第一版就是这样，变异验证抓出来的）。
+        let decl = js
+            .split_once("const _DENY_SEMANTICS =")
+            .expect("spec §6 的文案常量没了")
+            .1;
+        let value = decl.split_once(";\n").expect("_DENY_SEMANTICS 没收尾").0;
+        assert!(
+            js.contains("_DENY_SEMANTICS)") || js.contains("_DENY_SEMANTICS +"),
+            "文案定义了却没人用"
+        );
         for must in [
             "住宅 HY2 客户端仍会显示已连接",
             "所有请求会被拒绝",
             "直连节点在连接时即被拒",
         ] {
-            assert!(js.contains(must), "spec §6 的文案缺「{must}」");
+            assert!(value.contains(must), "spec §6 的文案缺「{must}」：{value}");
         }
     }
 }

@@ -1027,14 +1027,32 @@ mod tests {
     /// 但每个请求都被拒。
     #[test]
     fn the_panel_shows_a_slot_independent_port_and_the_gate() {
-        let mut s = sample_state();
+        // **必须是非 0 槽**：4.0.x 的 `40000 + 槽序号` 在槽 0 上恰好等于 4.1 的固定端口，
+        // 拿槽 0 的用户断言等于什么都没验（第一版就是这个洞，变异验证抓出来的）。
+        let mut s = crate::modules::residential::sample_state_with_pool();
+        let g = s
+            .residential
+            .groups
+            .get_mut(bui_schema::model::DEFAULT_GROUP)
+            .unwrap();
+        let mut second = g.upstreams[0].clone();
+        second.id = Uuid::from_u128(0xb001);
+        second.host = "isp2.example.net".into();
+        g.upstreams.push(second);
+        bui_schema::slots::sync_slots(&mut s.residential);
+        let uid = s.users[0].user_id;
+        assert!(bui_schema::slots::assign(
+            &mut s,
+            uid,
+            Uuid::from_u128(0xb001)
+        ));
         bui_schema::hy2pool::migrate(&mut s, t0());
         let gates = super::super::gates::expected(&s, &BTreeSet::new());
         let p = project(alice(&s), &s.node, &s.residential, &BTreeSet::new(), &gates);
-        assert_eq!(p.slot, Some(0));
-        assert_eq!(p.slot_port, Some(40000));
-        assert_eq!(p.slot_hop, Some((41000, 50000)));
-        assert_eq!(p.hy2_resi_gate.as_deref(), Some("slot-0-out"));
+        assert_eq!(p.slot, Some(1), "槽位投影仍跟着槽走");
+        assert_eq!(p.slot_port, Some(40000), "4.0.x 这里是 40001");
+        assert_eq!(p.slot_hop, Some((41000, 50000)), "4.0.x 这里是那一槽的切片");
+        assert_eq!(p.hy2_resi_gate.as_deref(), Some("slot-1-out"));
 
         // 到期 / 封禁：门位是 deny —— UI 据此解释「显示已连接但请求全被拒」
         let mut expired = s.clone();
@@ -1055,7 +1073,7 @@ mod tests {
         );
 
         // 还没拿到凭据 ⇒ 压根没有门（订阅里也没有住宅 HY2 节点）
-        let mut fresh = sample_state();
+        let mut fresh = crate::modules::residential::sample_state_with_pool();
         fresh.users[0].credentials.hy2_resi_cred = None;
         assert_eq!(
             project(
@@ -1071,7 +1089,7 @@ mod tests {
         );
 
         // 没有住宅 hysteria2 权益 ⇒ 这一档整个不出现
-        let mut direct = sample_state();
+        let mut direct = crate::modules::residential::sample_state_with_pool();
         direct.users[0].entitlements.residential = None;
         let v = serde_json::to_value(project(
             alice(&direct),
