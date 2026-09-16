@@ -917,6 +917,9 @@ mod tests {
         );
         let mut one = state(1, 2);
         migrate_unassigned(&mut one);
+        // 有凭据才渲染得出住宅 HY2 节点（spec §3.1）；4.1 起它与槽位无关 ⇒ 删掉最后一条
+        // 上游也不该有人被要求重取订阅
+        crate::hy2pool::migrate(&mut one, time::OffsetDateTime::now_utc());
         let after = after_remove(&one, Uuid::from_u128(1));
         assert!(after.residential.slots.is_empty());
         assert_eq!(node_of(&after, "u1"), (40000, Some((41000, 50000))));

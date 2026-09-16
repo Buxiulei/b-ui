@@ -620,6 +620,11 @@ mod tests {
         crate::modules::residential::slots::migrate_on_start(&c.store, &c.bus)
             .await
             .unwrap();
+        // 与生产启动顺序一致（`serve::run`）：槽位迁移之后建住宅 HY2 凭据池 —— 没有凭据
+        // `nodes_for` 压根不发住宅 HY2 节点（spec §3.1），下面那几条断言就无从谈起。
+        crate::modules::residential::slots::migrate_hy2_pool_on_start(&c)
+            .await
+            .unwrap();
         c
     }
 

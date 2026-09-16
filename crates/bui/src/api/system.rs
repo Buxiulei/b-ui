@@ -197,13 +197,23 @@ pub async fn service_action(
             .into_response();
     }
     let host = app.host.clone();
+    // 住宅入站被这个端点拉起来 / 重启之后，每个 `gate-<id>` selector 都回到
+    // `default = deny`（不开 `cache_file`，spec §14 裁决 1）⇒ 必须广播，让
+    // `gates::replay_loop` 立刻重放真实门位；少了它就是全体住宅 HY2 用户被拒到下一轮
+    // 60 秒安全网，且没有任何告警说明原因。`stop` 不发（门跟着内核一起没了）。
+    let announce = unit == "hysteria-residential" && matches!(action.as_str(), "restart" | "start");
     let out = tokio::task::spawn_blocking(move || host.systemd(&action, &unit)).await;
     match out {
-        Ok(Ok(o)) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"ok": o.ok(), "detail": o.stderr})),
-        )
-            .into_response(),
+        Ok(Ok(o)) => {
+            if announce && o.ok() {
+                app.bus.send(Event::Hy2ResiRestarted);
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"ok": o.ok(), "detail": o.stderr})),
+            )
+                .into_response()
+        }
         _ => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": "systemctl 调用失败"})),

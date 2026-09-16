@@ -590,6 +590,58 @@ mod tests {
         );
     }
 
+    /// 面板 / CLI 手动重启住宅入站之后必须广播 `Event::Hy2ResiRestarted`（第七波复核）：
+    /// 不开 `cache_file`（spec §14 裁决 1）⇒ 重启把每个 `gate-<id>` selector 打回
+    /// `default = deny`，没人重放就是全体住宅 HY2 用户被拒到下一轮 60 秒安全网。
+    /// 别的单元、以及 `stop`（门跟着内核一起没了）都不广播 —— 白重放一轮是多余的 HTTP。
+    #[tokio::test]
+    async fn restarting_the_residential_inbound_announces_it_for_the_gate_replay() {
+        let (app, _d, _h, _rt, bus) = app_with_bus().await;
+        let token = login(&app).await;
+        let mut rx = bus.subscribe();
+        let call = |unit: &str, action: &str| {
+            let token = token.clone();
+            let app = app.clone();
+            let uri = format!("/api/services/{unit}/{action}");
+            async move {
+                app.oneshot(with_token(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                    &token,
+                ))
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(
+            call("hysteria-residential", "restart").await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(rx.try_recv().ok(), Some(Event::Hy2ResiRestarted));
+        assert_eq!(
+            call("hysteria-residential", "start").await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(Event::Hy2ResiRestarted),
+            "`start` 之后门同样是 default = deny"
+        );
+        assert_eq!(
+            call("hysteria-residential", "stop").await.status(),
+            StatusCode::OK
+        );
+        assert!(rx.try_recv().is_err(), "stop 不广播：门跟着内核一起没了");
+        assert_eq!(
+            call("hysteria-server", "restart").await.status(),
+            StatusCode::OK
+        );
+        assert!(rx.try_recv().is_err(), "直连实例与住宅门位无关");
+    }
+
     /// 一个只为「公开路由不过鉴权、受保护路由仍要 Bearer」而存在的模块（裁决 D1 的回归锁）
     struct ProbeModule;
     impl Module for ProbeModule {

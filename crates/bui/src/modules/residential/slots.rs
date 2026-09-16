@@ -11,11 +11,12 @@ use crate::modules::residential::clash::{self, Clash};
 use crate::modules::residential::proxy::Prober;
 use crate::modules::residential::state;
 use crate::modules::residential::{health, SLOT_BACK_ROUNDS};
+use crate::modules::sentinel::incidents::{self, Incident, Level};
 use crate::reconcile::DaemonCtx;
 use crate::state::runtime::Runtime;
 use crate::state::store::Store;
 use crate::sys::Host;
-use crate::util::parse_rfc3339;
+use crate::util::{fmt_rfc3339, parse_rfc3339};
 use bui_schema::model::{ResidentialGroup, Slot, State, Upstream, DEFAULT_GROUP};
 use bui_schema::render::xray as xray_render;
 use bui_schema::render::xray::SlotRule;
@@ -78,11 +79,54 @@ pub async fn update_group_slots_as(
     Ok(sync)
 }
 
-/// 新建用户时分槽（spec §5.6 规则 1）。**在 `Store::update` 的闭包里调**，
-/// 与 `users.push(...)` 同一次写盘 —— 否则会出现「用户已存在但没有槽位」的中间态，
-/// 那一瞬间他的 Reality 住宅会落到兜底槽。
-pub fn assign_new_user(s: &mut State, user_id: Uuid) -> bool {
-    slots::assign_least_loaded(s, user_id)
+/// 新建用户时分槽（spec §5.6 规则 1）**并给他一条住宅 HY2 凭据**（spec §3.1）。
+/// **在 `Store::update` 的闭包里调**，与 `users.push(...)` 同一次写盘 —— 否则会出现
+/// 「用户已存在但没有槽位」的中间态，那一瞬间他的 Reality 住宅会落到兜底槽；
+/// 凭据同理：没有凭据 ⇒ `nodes_for` 压根不发住宅 HY2 节点，他刷出来的订阅里少一个节点。
+///
+/// 返回值仍只报**分槽**结果（调用方据此判要不要重算 Xray 槽规则）；凭据分没分到由调用方
+/// 事后读 `hy2pool::cred_of` 判，池的 id 域用尽时要打 Error 级事件（spec §3.1：建用户
+/// 不拒绝）。
+pub fn assign_new_user(s: &mut State, user_id: Uuid, now: OffsetDateTime) -> bool {
+    let slotted = slots::assign_least_loaded(s, user_id);
+    assign_hy2_cred(s, user_id, now);
+    slotted
+}
+
+/// 给用户分一条住宅 HY2 凭据（spec §3.1）。返回凭据 `id`；`None` = 没有住宅 hysteria2
+/// 权益（不该占凭据），或池的 id 域（[`POOL_MAX`](bui_schema::hy2pool::POOL_MAX) = 256 条）
+/// 用尽 —— 后者调用方要记 Error 级事件。
+///
+/// **权益判据不能省**（口径只有 [`gates::has_resi_hy2`](crate::modules::panel::gates) 一处）：
+/// 纯直连用户白占一条凭据会把空闲吃掉，进而触发「当场扩容」= 重写 `hy2-residential.json`
+/// + 重启 `hysteria-residential` ⇒ 全体住宅 HY2 会话重连一次。
+///
+/// **幂等**：已持凭据的用户原样拿回那一条（换凭据必须先 `hy2pool::release`）。
+///
+/// `now` 由调用方从 `Host::now()` 取：24 小时冷却期是安全判据，判定时钟必须与盖
+/// `released_at` 的那个时钟同源（墙钟会让它测不到、也会被任何时钟偏移静默作废）。
+///
+/// 正常路径：池里恒有空闲（容量 = 2 × 用户数，下限 32）⇒ 一次 `assign_at` 就够，
+/// `hy2-residential.json` 一个字节不动、内核不重启（spec §3.5）。分不出来（空闲全在
+/// 24 小时冷却期内、或池还没建）才落到 `migrate`：它先补到 `size_for`、必要时当场应急
+/// 扩容 16 条再分一轮 —— **建用户不因为池满被拒**。
+pub fn assign_hy2_cred(s: &mut State, user_id: Uuid, now: OffsetDateTime) -> Option<String> {
+    let entitled = s
+        .users
+        .iter()
+        .find(|u| u.user_id == user_id)
+        .is_some_and(|u| crate::modules::panel::gates::has_resi_hy2(u, &s.residential));
+    if !entitled {
+        return None;
+    }
+    if let Some(id) = bui_schema::hy2pool::assign_at(s, user_id, now) {
+        return Some(id);
+    }
+    bui_schema::hy2pool::migrate(s, now);
+    s.users
+        .iter()
+        .find(|u| u.user_id == user_id)
+        .and_then(|u| u.credentials.hy2_resi_cred.clone())
 }
 
 /// 守护进程启动时跑一次槽位迁移（spec §5.6 规则 4）：
@@ -105,6 +149,183 @@ pub async fn migrate_on_start(store: &Store, bus: &EventBus) -> anyhow::Result<u
         bus.send(Event::StateChanged("residential"));
     }
     Ok(assigned)
+}
+
+/// 悬空凭据指针事件的签名（非日志签名，由本模块直接记事件）。
+pub const CRED_DANGLING_SIG: &str = "hy2_resi_cred_dangling";
+/// 凭据 id 域用尽事件的签名（spec §3.1：建用户不拒绝、当场扩容并记 Error 级事件）。
+pub const POOL_EXHAUSTED_SIG: &str = "hy2_resi_pool_exhausted";
+
+/// [`migrate_hy2_pool_on_start`] 这一轮做了什么。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PoolMigration {
+    /// 指针悬空、被清成 `None` 的用户数（他们随后由 `migrate` 补发）
+    pub healed: usize,
+    /// 这一轮拿到（或新建）凭据的用户数
+    pub changed: usize,
+    /// 扩到 `POOL_MAX` 仍分不到凭据的住宅 hysteria2 用户数
+    pub unassigned: usize,
+}
+
+/// 守护进程启动时把住宅 HY2 凭据池拉到期望态（spec §4.3 / §3.1）。**幂等**，零变更不写盘，
+/// 所以每次启动无条件调一次；**必须在启动那一轮对账之前**跑完 —— `hy2-residential.json`
+/// 的凭据、门与 `auth_user` 规则都从池里渲染。
+///
+/// 两步，顺序即语义：
+///
+/// 1. **先治「凭据指针悬空」**：`credentials.hy2_resi_cred` 指向池里**已不存在**的 id 时
+///    （人工编辑 `state.json`、回滚到 4.0.x 再升上来、池被缩过），`hy2pool::assign` 会把那个
+///    id 原样还给你、`cred_of` 却是 `None`，而 `migrate` 判 pending 用的是
+///    `hy2_resi_cred.is_none()` ⇒ 这类用户**既不会被治愈、也不进 `unassigned`**，表现为
+///    「有住宅权益但订阅里渲染不出住宅 HY2 节点」，而且零告警。所以先把这些指针清成
+///    `None`（记一条 Warn 级事件，只写用户名与个数、**不写凭据**），让第 2 步正常补发。
+/// 2. `hy2pool::migrate`：池空则按 `created_at` 升序给存量用户建
+///    `{ name: 用户名, secret: 当时的 hy2_password }` 的凭据（于是升级**零刷新订阅**），
+///    再补到 `size_for`、给没有凭据的人分配。`unassigned > 0` ⇒ 记一条 Error 级事件。
+pub async fn migrate_hy2_pool_on_start(ctx: &DaemonCtx) -> anyhow::Result<PoolMigration> {
+    let mut out = PoolMigration::default();
+    let mut healed_names: Vec<String> = Vec::new();
+    let (o, names) = (&mut out, &mut healed_names);
+    // 冷却期判定与 `released_at` 的盖章走同一个注入时钟（墙钟会让这条安全判据测不到）
+    let clock = ctx.host.now();
+    ctx.store
+        .update(|s| {
+            let live: BTreeSet<String> = s
+                .residential
+                .hy2_pool
+                .creds
+                .iter()
+                .map(|c| c.id.clone())
+                .collect();
+            for u in s.users.iter_mut() {
+                let dangling = u
+                    .credentials
+                    .hy2_resi_cred
+                    .as_deref()
+                    .is_some_and(|id| !live.contains(id));
+                if dangling {
+                    u.credentials.hy2_resi_cred = None;
+                    names.push(u.username.clone());
+                }
+            }
+            let r = bui_schema::hy2pool::migrate(s, clock);
+            *o = PoolMigration {
+                healed: names.len(),
+                changed: r.changed,
+                unassigned: r.unassigned,
+            };
+        })
+        .await?;
+    let now = fmt_rfc3339(ctx.host.now());
+    if out.healed > 0 {
+        // 用户名可以进日志与事件（面板本来就在列它们），凭据一个字节都不许。
+        tracing::warn!(
+            users = out.healed,
+            "住宅 HY2 凭据指针悬空，已清空并重新分配"
+        );
+        let inc = Incident {
+            at: now.clone(),
+            unit: "b-ui".into(),
+            signature: CRED_DANGLING_SIG.into(),
+            subject: healed_names.join("、"),
+            action: "清空悬空指针并重新分配".into(),
+            result: format!("{} 个用户的住宅 HY2 凭据指向池外，已重新分配", out.healed),
+            level: Level::Warn,
+            sample: None,
+        };
+        ctx.runtime.update(move |rt| incidents::push(rt, inc)).await;
+    }
+    if out.unassigned > 0 {
+        tracing::error!(
+            users = out.unassigned,
+            "住宅 HY2 凭据池 id 域用尽，这些用户渲染不出住宅 HY2 节点"
+        );
+        let inc = Incident {
+            at: now,
+            unit: "b-ui".into(),
+            signature: POOL_EXHAUSTED_SIG.into(),
+            subject: "hy2_pool".into(),
+            action: "扩容凭据池".into(),
+            result: format!(
+                "扩到上限 {} 条仍有 {} 个用户分不到凭据",
+                bui_schema::hy2pool::POOL_MAX,
+                out.unassigned
+            ),
+            level: Level::Error,
+            sample: None,
+        };
+        ctx.runtime.update(move |rt| incidents::push(rt, inc)).await;
+    }
+    if out.changed > 0 || out.healed > 0 {
+        tracing::info!(
+            changed = out.changed,
+            healed = out.healed,
+            "住宅 HY2 凭据池已迁移（spec §4.3）"
+        );
+        ctx.bus.send(Event::StateChanged("residential"));
+    }
+    Ok(out)
+}
+
+/// 对账前的期望态整备（spec §3.1 第三道防线）：`hy2-residential.json` 这一轮**本来就要
+/// 重写**（§3.5 的四件事之一 ⇒ 住宅内核要重启）时，顺带把**空闲**凭据的 `secret` 重随机。
+/// 返回换掉的条数。
+///
+/// 为什么非做不可：被 `release` 掉的凭据只有 24 小时冷却期这一道屏障，冷却期一过它就
+/// 原样（同 id、同 secret）发给下一个人，前任持有人手里的旧订阅直接连上新人的门。
+/// 空闲凭据的旧密码只有前任知道，而它写在内核配置里 —— **重启是唯一能换掉它的时机**。
+///
+/// 判据是「不算这次轮换、这一轮也会重写」：按当前期望态渲染一次，与盘上的字节比
+/// （`reconcile::diff` 也是逐字节比）。一致 ⇒ 一个字节都不动 —— 否则每轮对账都会因为
+/// 自己刚换的 secret 重写文件 + 重启住宅内核，全体在线连接跟着断。
+pub async fn reroll_idle_hy2_secrets(ctx: &DaemonCtx) -> usize {
+    let path = crate::modules::core_files::hy2_resi_config_path(&ctx.paths);
+    let want = {
+        let s = ctx.store.read().await;
+        if s.residential.hy2_pool.creds.is_empty() {
+            return 0; // 池还没建（首装、迁移之前）：没有空闲凭据可换
+        }
+        serde_json::to_vec_pretty(&bui_schema::render::hy2_singbox::config(
+            &s.node,
+            &ctx.paths,
+            &s.residential.hy2_pool,
+        ))
+        .ok()
+    };
+    let host = ctx.host.clone();
+    let landed = tokio::task::spawn_blocking(move || host.read_file(&path))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .flatten();
+    if want.is_none() || landed == want {
+        return 0; // 这一轮不会重写它 ⇒ 不许趁机换 secret（换了就是白重启一次内核）
+    }
+    let mut rerolled = 0usize;
+    let n = &mut rerolled;
+    let r = ctx
+        .store
+        .update(|s| {
+            let used: BTreeSet<String> = s
+                .users
+                .iter()
+                .filter_map(|u| u.credentials.hy2_resi_cred.clone())
+                .collect();
+            *n = bui_schema::hy2pool::regenerate_idle_secrets(&mut s.residential.hy2_pool, &used);
+        })
+        .await;
+    if let Err(e) = r {
+        tracing::warn!(error = %e, "重随机空闲住宅 HY2 凭据写盘失败，下一轮对账重试");
+        return 0;
+    }
+    if rerolled > 0 {
+        // 只写条数，凭据一个字节都不许进日志
+        tracing::info!(
+            creds = rerolled,
+            "住宅 HY2 配置这一轮要重写，顺带换掉空闲凭据的 secret（spec §3.1）"
+        );
+    }
+    rerolled
 }
 
 /// [`converge_xray`] 这一轮做了什么。
@@ -1201,6 +1422,390 @@ mod tests {
 
         // 幂等：第二次启动不再改动任何东西（也就不会多写一次 state.json）
         assert_eq!(migrate_on_start(&store, &bus).await.unwrap(), 0);
+    }
+
+    /// 启动迁移给每个住宅 hysteria2 用户发凭据（迁移口径：`name = 用户名`、
+    /// `secret = 当时的 hy2_password` ⇒ 升级零刷新订阅），并把池补到 `size_for`；幂等
+    #[tokio::test]
+    async fn the_pool_migration_mints_a_cred_per_residential_user_and_is_idempotent() {
+        let d = tempfile::tempdir().unwrap();
+        let (store, bus) = store_with(d.path(), 1, 3).await;
+        let (ctx, _host) = ctx_of(d.path(), store.clone(), bus.clone()).await;
+        let r = migrate_hy2_pool_on_start(&ctx).await.unwrap();
+        assert_eq!(
+            r,
+            PoolMigration {
+                healed: 0,
+                changed: 3,
+                unassigned: 0
+            }
+        );
+        let s = store.read().await;
+        assert_eq!(
+            s.residential.hy2_pool.creds.len(),
+            bui_schema::hy2pool::POOL_MIN
+        );
+        for u in &s.users {
+            let c = bui_schema::hy2pool::cred_of(u, &s.residential)
+                .unwrap_or_else(|| panic!("{} 没拿到凭据", u.username));
+            assert_eq!(c.name, u.username, "迁移用户的 name 就是用户名");
+            assert_eq!(c.secret, u.credentials.hy2_password);
+            // 有凭据才渲染得出住宅 HY2 节点（T7 的 `nodes_for`）
+            assert!(
+                bui_schema::nodes::nodes_for(u, &s.node, &s.residential)
+                    .iter()
+                    .any(|n| n.kind == bui_schema::nodes::NodeKind::Hy2Residential),
+                "{} 的订阅里没有住宅 HY2 节点",
+                u.username
+            );
+        }
+        drop(s);
+        assert_eq!(
+            migrate_hy2_pool_on_start(&ctx).await.unwrap(),
+            PoolMigration::default(),
+            "幂等：零变更"
+        );
+    }
+
+    /// 「凭据指针悬空」必须被治（第一波复核发现）：`hy2_resi_cred` 指向池里已不存在的 id
+    /// 时，`hy2pool::assign` 原样还回那个 id、`cred_of` 却是 `None`，而 `migrate` 判 pending
+    /// 用 `is_none()` ⇒ 这类用户既不被治愈也不进 `unassigned`，表现为「有权益但订阅里渲染
+    /// 不出住宅 HY2 节点」且零告警。
+    #[tokio::test]
+    async fn a_dangling_cred_pointer_is_healed_and_reported() {
+        let d = tempfile::tempdir().unwrap();
+        let (store, bus) = store_with(d.path(), 1, 2).await;
+        let (ctx, _host) = ctx_of(d.path(), store.clone(), bus.clone()).await;
+        migrate_hy2_pool_on_start(&ctx).await.unwrap();
+        // 人工把 u1 的指针指到池外（人工改 state / 回滚后再升级 / 池被缩过）
+        store
+            .update(|s| {
+                s.users[0].credentials.hy2_resi_cred = Some("r999".into());
+            })
+            .await
+            .unwrap();
+        {
+            let s = store.read().await;
+            assert!(
+                bui_schema::hy2pool::cred_of(&s.users[0], &s.residential).is_none(),
+                "前提：悬空指针拿不到凭据"
+            );
+        }
+
+        let r = migrate_hy2_pool_on_start(&ctx).await.unwrap();
+        assert_eq!((r.healed, r.changed, r.unassigned), (1, 1, 0));
+        let s = store.read().await;
+        let c = bui_schema::hy2pool::cred_of(&s.users[0], &s.residential)
+            .expect("治愈后必须拿到池里真实存在的凭据");
+        assert_ne!(c.id, "r999");
+        assert!(
+            bui_schema::nodes::nodes_for(&s.users[0], &s.node, &s.residential)
+                .iter()
+                .any(|n| n.kind == bui_schema::nodes::NodeKind::Hy2Residential),
+            "治愈后订阅里要有住宅 HY2 节点"
+        );
+        let inc = crate::modules::sentinel::incidents::from_runtime(&ctx.runtime.read().await);
+        let warn = inc
+            .iter()
+            .find(|i| i.signature == CRED_DANGLING_SIG)
+            .expect("悬空指针必须留一条 Warn 级事件");
+        assert_eq!(warn.level, Level::Warn);
+        assert_eq!(warn.subject, "u1", "事件只写用户名与个数");
+        assert!(
+            !warn.result.contains(&c.secret) && !warn.subject.contains(&c.secret),
+            "事件里一个凭据字节都不许有"
+        );
+    }
+
+    /// 空闲凭据全在 24 小时冷却期内 ⇒ 建用户**不被拒**：当场扩容再分（spec §3.1）。
+    /// 少了这条兜底，池的常规目标容量早已达标（`size_for` 不补一条），新用户会静默地
+    /// 一直没有凭据、订阅里永远少一个节点。
+    #[tokio::test]
+    async fn a_new_user_still_gets_a_cred_when_every_idle_cred_is_cooling_down() {
+        let d = tempfile::tempdir().unwrap();
+        let (store, bus) = store_with(d.path(), 1, 1).await;
+        let (ctx, host) = ctx_of(d.path(), store.clone(), bus.clone()).await;
+        migrate_hy2_pool_on_start(&ctx).await.unwrap();
+        let before = store.read().await.residential.hy2_pool.creds.len();
+        let newbie = Uuid::from_u128(0x2000);
+        // 盖章与判定用**同一个注入时钟**：墙钟会让这一格测不到（假时钟 2026-09-11 配真实
+        // now 之差早就超过 24 小时，冷却期直接被绕开）
+        let stamp = fmt_rfc3339(host.now());
+        host.advance(3600);
+        let now = host.now();
+        store
+            .update(|s| {
+                // 全部空闲凭据都「1 小时前释放」⇒ 一条都不许发出去
+                let used: BTreeSet<String> = s
+                    .users
+                    .iter()
+                    .filter_map(|u| u.credentials.hy2_resi_cred.clone())
+                    .collect();
+                for c in s
+                    .residential
+                    .hy2_pool
+                    .creds
+                    .iter_mut()
+                    .filter(|c| !used.contains(&c.id))
+                {
+                    c.released_at = Some(stamp.clone());
+                }
+                let mut u = s.users[0].clone();
+                u.user_id = newbie;
+                u.username = "newbie".into();
+                u.credentials.hy2_resi_cred = None;
+                s.users.push(u);
+                assign_new_user(s, newbie, now);
+            })
+            .await
+            .unwrap();
+        let s = store.read().await;
+        let u = s.users.iter().find(|u| u.user_id == newbie).unwrap();
+        assert!(
+            bui_schema::hy2pool::cred_of(u, &s.residential).is_some(),
+            "冷却期内耗尽也不许让新用户没有凭据"
+        );
+        assert!(
+            s.residential.hy2_pool.creds.len() > before,
+            "当场扩容过：{} → {}",
+            before,
+            s.residential.hy2_pool.creds.len()
+        );
+    }
+
+    /// id 域用尽 ⇒ Error 级事件（spec §3.1：不静默吞掉「没拿到凭据」）
+    #[tokio::test]
+    async fn an_exhausted_id_space_is_reported_as_an_error() {
+        let d = tempfile::tempdir().unwrap();
+        let (store, bus) = store_with(d.path(), 1, 1).await;
+        let (ctx, _host) = ctx_of(d.path(), store.clone(), bus.clone()).await;
+        // 池已满到上限、全部空闲凭据都在 24 小时冷却期内 ⇒ 谁都分不到
+        store
+            .update(|s| {
+                s.residential.hy2_pool.creds = (0..bui_schema::hy2pool::POOL_MAX)
+                    .map(|i| bui_schema::model::ReservedCred {
+                        id: format!("r{i:03}"),
+                        name: format!("r{i:03}"),
+                        secret: "x".repeat(22),
+                        released_at: Some("2099-01-01T00:00:00Z".into()),
+                    })
+                    .collect();
+            })
+            .await
+            .unwrap();
+
+        let r = migrate_hy2_pool_on_start(&ctx).await.unwrap();
+        assert_eq!((r.healed, r.changed, r.unassigned), (0, 0, 1));
+        let inc = crate::modules::sentinel::incidents::from_runtime(&ctx.runtime.read().await);
+        let err = inc
+            .iter()
+            .find(|i| i.signature == POOL_EXHAUSTED_SIG)
+            .expect("池耗尽必须留一条 Error 级事件");
+        assert_eq!(err.level, Level::Error);
+    }
+
+    /// spec §3.1 的第三道防线：`hy2-residential.json` 这一轮本来就要重写（§3.5 四件事之一，
+    /// 这里用池扩容）⇒ 落盘前把**空闲**凭据的 secret 重随机、`released_at` 清掉；
+    /// **在用的那一条一个字节都不许动**（动了就是把在线用户踢下线）。
+    ///
+    /// 不接上这道防线的话，被 `release` 掉的凭据 secret 终生不变：24 小时冷却期一过，
+    /// 同 id、同 secret 原样发给下一个人，前任持有人手里的旧订阅直接连上新人的门。
+    /// 反过来，**文件不变的那一轮一个字节都不许动**：否则每轮对账都会因为自己刚换的
+    /// secret 重写文件 + 重启住宅内核，全体在线连接跟着断。
+    #[tokio::test]
+    async fn a_rewrite_of_the_residential_config_rerolls_only_the_idle_secrets() {
+        let d = tempfile::tempdir().unwrap();
+        let (store, bus) = store_with(d.path(), 1, 1).await;
+        let (ctx, host) = ctx_of(d.path(), store.clone(), bus.clone()).await;
+        migrate_hy2_pool_on_start(&ctx).await.unwrap();
+        let path = crate::modules::core_files::hy2_resi_config_path(&ctx.paths);
+        let secrets = |s: &State| -> Vec<(String, String, Option<String>)> {
+            s.residential
+                .hy2_pool
+                .creds
+                .iter()
+                .map(|c| (c.id.clone(), c.secret.clone(), c.released_at.clone()))
+                .collect()
+        };
+        // 一条空闲凭据「已经被释放过」——它正是这道防线要保护的那一类
+        let cooled = store.read().await.residential.hy2_pool.creds[1].id.clone();
+        let stamp = fmt_rfc3339(host.now());
+        store
+            .update(|s| {
+                if let Some(c) = s
+                    .residential
+                    .hy2_pool
+                    .creds
+                    .iter_mut()
+                    .find(|c| c.id == cooled)
+                {
+                    c.released_at = Some(stamp.clone());
+                }
+            })
+            .await
+            .unwrap();
+        // 盘上那份 = 当前期望态 ⇒ 这一轮不会重写它
+        {
+            let s = store.read().await;
+            let bytes = serde_json::to_vec_pretty(&bui_schema::render::hy2_singbox::config(
+                &s.node,
+                &ctx.paths,
+                &s.residential.hy2_pool,
+            ))
+            .unwrap();
+            host.write_file(&path, &bytes, 0o600).unwrap();
+        }
+        let before = secrets(&store.read().await.clone());
+        assert_eq!(
+            reroll_idle_hy2_secrets(&ctx).await,
+            0,
+            "文件不变的那一轮一个字节都不许动，否则每轮对账都重写 + 重启住宅内核"
+        );
+        assert_eq!(secrets(&store.read().await.clone()), before, "零变更");
+
+        // 池扩容（spec §3.5 四件事之一）⇒ 渲染结果与盘上不一致，这一轮本来就要重写
+        store
+            .update(|s| {
+                s.residential
+                    .hy2_pool
+                    .creds
+                    .push(bui_schema::model::ReservedCred {
+                        id: "r099".into(),
+                        name: "r099".into(),
+                        secret: "x".repeat(22),
+                        released_at: None,
+                    });
+            })
+            .await
+            .unwrap();
+        let used = store.read().await.users[0]
+            .credentials
+            .hy2_resi_cred
+            .clone()
+            .expect("前提：u1 占着一条");
+        let n = reroll_idle_hy2_secrets(&ctx).await;
+        let after = secrets(&store.read().await.clone());
+        assert_eq!(n, after.len() - 1, "除了在用那一条，全部空闲凭据都要换");
+        for (id, secret, _) in &before {
+            let now = after
+                .iter()
+                .find(|(i, _, _)| i == id)
+                .expect("凭据不会消失");
+            if *id == used {
+                assert_eq!(&now.1, secret, "在用的凭据 secret 一个字节都不许动");
+            } else {
+                assert_ne!(&now.1, secret, "空闲凭据 {id} 的 secret 没换");
+            }
+        }
+        let cooled_after = after.iter().find(|(i, _, _)| *i == cooled).unwrap();
+        assert!(
+            cooled_after.2.is_none(),
+            "换了 secret 就顺带清 released_at（旧密码已经无效，不必再压着冷却期）"
+        );
+    }
+
+    /// 24 小时冷却期的判定时钟必须是**注入的** `Host::now()` —— 与盖 `released_at` 的那个
+    /// 同源。用墙钟的话：假时钟盖的 `released_at` 配真实 `now_utc()` 之差早就超过 24 小时，
+    /// 刚释放的凭据当场就能再分配出去（前任的旧订阅直接连上新人的门），而且测不到。
+    #[tokio::test]
+    async fn the_reclaim_cooldown_is_judged_by_the_injected_clock() {
+        let d = tempfile::tempdir().unwrap();
+        let (store, bus) = store_with(d.path(), 1, 1).await;
+        let (ctx, host) = ctx_of(d.path(), store.clone(), bus.clone()).await;
+        let _ = &ctx;
+        let stamp = fmt_rfc3339(host.now());
+        let newbie = Uuid::from_u128(0x2000);
+        // 池满到 id 域上限、除 u1 那条之外全部「此刻刚释放」⇒ 扩容也补不出新的，
+        // 能不能分出去完全由冷却期这一条判据决定
+        store
+            .update(|s| {
+                s.residential.hy2_pool.creds = (0..bui_schema::hy2pool::POOL_MAX)
+                    .map(|i| bui_schema::model::ReservedCred {
+                        id: format!("r{i:03}"),
+                        name: format!("r{i:03}"),
+                        secret: "x".repeat(22),
+                        released_at: (i > 0).then(|| stamp.clone()),
+                    })
+                    .collect();
+                s.users[0].credentials.hy2_resi_cred = Some("r000".into());
+                let mut u = s.users[0].clone();
+                u.user_id = newbie;
+                u.username = "newbie".into();
+                u.credentials.hy2_resi_cred = None;
+                s.users.push(u);
+            })
+            .await
+            .unwrap();
+
+        host.advance(23 * 3600);
+        let at23 = host.now();
+        store
+            .update(|s| {
+                assign_hy2_cred(s, newbie, at23);
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store.read().await.users[1].credentials.hy2_resi_cred,
+            None,
+            "23 小时 < 24 小时冷却期 ⇒ 一条都不许发（墙钟判定会在这里放行）"
+        );
+
+        host.advance(2 * 3600);
+        let at25 = host.now();
+        store
+            .update(|s| {
+                assign_hy2_cred(s, newbie, at25);
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store.read().await.users[1]
+                .credentials
+                .hy2_resi_cred
+                .as_deref(),
+            Some("r001"),
+            "过了 24 小时才可再分配，取 released_at 最早的那条"
+        );
+    }
+
+    /// 新建用户同一次写盘里既分槽、也分凭据（否则他的订阅里从一开始就少一个节点）
+    #[tokio::test]
+    async fn a_new_user_gets_a_slot_and_a_cred_in_the_same_write() {
+        let d = tempfile::tempdir().unwrap();
+        let (store, bus) = store_with(d.path(), 2, 1).await;
+        let (ctx, host) = ctx_of(d.path(), store.clone(), bus.clone()).await;
+        migrate_on_start(&store, &bus).await.unwrap();
+        migrate_hy2_pool_on_start(&ctx).await.unwrap();
+        let newbie = Uuid::from_u128(0x2000);
+        let now = host.now();
+        store
+            .update(|s| {
+                let mut u = s.users[0].clone();
+                u.user_id = newbie;
+                u.username = "newbie".into();
+                u.credentials.hy2_resi_cred = None;
+                u.entitlements.residential.as_mut().unwrap().slot_id = None;
+                s.users.push(u);
+                assign_new_user(s, newbie, now);
+            })
+            .await
+            .unwrap();
+        let s = store.read().await;
+        let u = s.users.iter().find(|u| u.user_id == newbie).unwrap();
+        assert!(slots::slot_id_of_user(u).is_some(), "分到了槽");
+        let c = bui_schema::hy2pool::cred_of(u, &s.residential).expect("分到了凭据");
+        assert_eq!(c.name, c.id, "新发凭据的 name = id（spec §3.1）");
+        assert_ne!(
+            c.secret, u.credentials.hy2_password,
+            "住宅凭据与直连密码各走各的"
+        );
+        assert!(
+            bui_schema::nodes::nodes_for(u, &s.node, &s.residential)
+                .iter()
+                .any(|n| n.kind == bui_schema::nodes::NodeKind::Hy2Residential),
+            "新用户的订阅里要有住宅 HY2 节点"
+        );
     }
 
     #[tokio::test]
