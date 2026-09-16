@@ -804,6 +804,15 @@ fn store_import<S: Sys, N: Net, P: Prompt>(
     let mut prof = Profiles::load(ctx.sys, ctx.paths)?;
     let loaded = prof.clone();
     let had_active = prof.active_profile().is_some();
+    // token 名先洗掉，**必须在匹配之前**（spec §5.6、C6）：之后的「更新节点 X」、说明行与
+    // 墓碑名单里都不再有 token；对全部 profile 做，不看这批命中了什么，所以端口没变、
+    // 命中同一连接的那一趟也照样改名。改名、`active`、墓碑显示名与这批节点在同一个
+    // `&mut Profiles` 里改，由下面那次 `save` 在同一把锁里一次写盘（C7）；没有 token 名时
+    // `heal_token_names` 一个字段都不动，`prof != loaded` 也就不会凭空写盘
+    let healed = prof.heal_token_names();
+    for (old, new) in &healed.renamed {
+        tell(ctx, menu::renamed_line(old, new));
+    }
     // 粘一条就是明确要这一个：直接加回并清墓碑，不必再问（spec §5.7）
     let single = inc.src == Source::Paste && inc.fetched.nodes.len() == 1;
     let stored = store_fetched(
@@ -965,21 +974,24 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
             // 读 profiles.json 之前拿锁（spec §8.3）：锁外读的那份可能已经被别的会话改过
             let g = take_lock(ctx)?;
             let mut prof = Profiles::load(ctx.sys, ctx.paths)?;
+            // 三句都用显示名（spec §8.3）：名字是人打进来的，但打出去的是屏幕上那一份，
+            // token 名照样要打码——菜单的「上次：」行拿的就是这几句
+            let shown = menu::display_name(name).into_owned();
             if !prof.profiles.iter().any(|p| &p.name == name) {
                 return Err(Error::msg(format!(
-                    "节点 {name} 不存在，用 `bui-c list` 看可用节点"
+                    "节点 {shown} 不存在，用 `bui-c list` 看可用节点"
                 )));
             }
             if prof.active.as_deref() == Some(name.as_str()) {
                 // 兜底 apply 一次：配置丢了、单元没建时这是唯一不绕路的补救；配置没变就不重启
                 apply_with_ufw(ctx, &prof, &g)?;
-                ctx.say(format!("已是当前节点：{name}"));
+                ctx.say(format!("已是当前节点：{shown}"));
                 return Ok(());
             }
             prof.active = Some(name.clone());
             prof.save(ctx.sys, ctx.paths)?;
             apply_with_ufw(ctx, &prof, &g)?;
-            ctx.say(format!("已切到 {name}"));
+            ctx.say(format!("已切到 {shown}"));
             Ok(())
         }
         Cmd::Mode { mode } => {
@@ -1344,9 +1356,11 @@ fn import_v3_cmd<S: Sys, N: Net, P: Prompt>(
         ctx.say("已恢复被 v3 关掉的 UFW");
     }
     apply_with_ufw(ctx, &prof, &g)?;
+    // 名字过 `display_name`（spec §8.3）：v3 这条路不改名，列表里留着的 token 名只能靠打码挡住
+    let active = prof.active.clone().unwrap_or_default();
     ctx.say_aside(format!(
         "{CURRENT_NODE_HEAD}{}",
-        prof.active.clone().unwrap_or_default()
+        menu::display_name(&active)
     ));
     Ok(r)
 }
@@ -1659,12 +1673,15 @@ fn switch_node<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>, name: Stri
     let tun_down = ctx.transcript[start..]
         .lines()
         .any(|l| l.trim() == TUN_NOT_READY);
+    // 摘要里拼的是显示名（spec §8.3）：`fit_name_in_last` 拿显示名去摘要里找名字那一段，
+    // 拼原名它找不到、整句原样返回，token 名就漏在「上次：」行上了
+    let shown = menu::display_name(&name);
     let done = if already {
-        format!("已是当前节点：{name}")
+        format!("已是当前节点：{shown}")
     } else if tun_down {
-        format!("已切到 {name}，但 bui-tun 没起来")
+        format!("已切到 {shown}，但 bui-tun 没起来")
     } else {
-        format!("已切到 {name}")
+        format!("已切到 {shown}")
     };
     out.map_summary(|s| {
         let s = if s.starts_with("失败：") { s } else { done };
@@ -2222,6 +2239,9 @@ fn delete_nodes<S: Sys, N: Net, P: Prompt>(
         }
         PlanKind::Switch { to } => {
             report.switched = true;
+            // 失败那几句里的切换目标一律用显示名（spec §8.3）：停顿页与「上次：」行共用它们，
+            // token 名要打码（`menu::fit_name_in_last` 也是拿显示名去摘要里找的）
+            let to = &menu::display_name(to);
             // ⑤ 预检：动数据面之前挡住「内核缺失」「check 不通过」
             if let Err(e) = Engine::new(ctx.sys, ctx.paths).preflight(&plan.next) {
                 let kernel = e.to_string().starts_with(crate::engine::KERNEL_MISSING);
@@ -2425,7 +2445,11 @@ fn delete_menu<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<
     match &kind {
         PlanKind::Switch { .. } => tell(
             ctx,
-            format!("正在切到 {}…", switch_to.clone().unwrap_or_default()),
+            // 名字过 `display_name`（spec §8.3）：进度行也在屏幕上
+            format!(
+                "正在切到 {}…",
+                menu::display_name(switch_to.as_deref().unwrap_or_default())
+            ),
         ),
         PlanKind::Empty => tell(ctx, "正在停止代理…"),
         PlanKind::Passive => {}
@@ -14293,5 +14317,482 @@ mod tests {
         let p = got(&s, &pp, "panel.example.com-hy2-direct");
         assert_eq!(p.source, Source::ApiNodes, "{t}");
         assert_eq!(p.split, split_keywords(), "{t}");
+    }
+
+    // ───────────── T10：导入时先洗 token 名、人读出口全打码（spec §5.6、§8.2、§8.3） ─────────────
+
+    /// 4.0.0 用 token 订阅链接导入过的机器上，节点名长这样：`<合成 token>-hy2-resi`。
+    fn token_name() -> String {
+        format!("{TOKEN}-hy2-resi")
+    }
+
+    /// 它在人读输出里该长的样子（[`menu::display_name`]）：token 段只剩前 4 位加 `…`。
+    fn masked_name() -> String {
+        format!("{}…-hy2-resi", &TOKEN[..4])
+    }
+
+    /// 改名之后的规范名：`profile_name("", node)` = `<主机>-<kind>`。
+    const HEALED_NAME: &str = "panel.example.com-hy2-resi";
+
+    /// 另一台服务器上的一条粘贴链接：与 `panel.example.com` 上的账号毫无关系。
+    fn other_host_uri() -> String {
+        let tag = percent_encoding::utf8_percent_encode(
+            "bob-HY2直连",
+            percent_encoding::NON_ALPHANUMERIC,
+        );
+        format!("hysteria2://bob:bob-pw@other.example.com:10000/?sni=other.example.com#{tag}")
+    }
+
+    /// 另一个账号的活动节点 + 一条 token 名墓碑（rc 删掉住宅节点时记下的那种）。
+    /// 落盘用 `Profiles::save`，逐字节比对的基准只能是它写出来的那份。
+    fn buried_token_fixture(s: &FakeSys, pp: &Paths) {
+        let mut prof = Profiles::new_default();
+        prof.profiles.push(entry(
+            "bob-hy2-direct",
+            crate::testutil::hy2_account_node("bob"),
+            Source::ApiNodes,
+            split_keywords(),
+        ));
+        prof.active = Some("bob-hy2-direct".into());
+        prof.deleted.push(crate::profiles::Tombstone {
+            key: crate::profiles::tombstone_key(&crate::testutil::hy2_resi_node()),
+            name: token_name(),
+            at: 1,
+            extra: Default::default(),
+        });
+        prof.save(s, pp).unwrap();
+    }
+
+    /// 26（C6、§5.6）：改名在匹配之前、对全部 profile 做，不看这批命中了什么——端口没变、
+    /// 命中同一连接的那一趟也照样把 token 名洗掉。
+    #[test]
+    fn a_token_named_profile_is_renamed_even_when_the_endpoint_is_unchanged() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        listed(
+            &s,
+            &pp,
+            vec![entry(
+                &token_name(),
+                crate::testutil::hy2_resi_node(),
+                Source::ApiNodes,
+                split_keywords(),
+            )],
+            &token_name(),
+        );
+        let writes = s.writes("/opt/bui-c/profiles.json");
+        let t = import_from_panel(&s, &pp, "alice", vec![crate::testutil::hy2_resi_node()]);
+        assert_eq!(names(&s, &pp), vec![HEALED_NAME], "{t}");
+        assert_eq!(
+            Profiles::load(&s, &pp).unwrap().active.as_deref(),
+            Some(HEALED_NAME),
+            "active 跟着改名（§8.2）：{t}"
+        );
+        assert!(
+            said_line(&t, &menu::renamed_line(&token_name(), HEALED_NAME)),
+            "{t}"
+        );
+        assert!(
+            said_line(&t, &format!("节点 {HEALED_NAME} 无变化")),
+            "端口没变、命中同一连接，照样改名（C6）：{t}"
+        );
+        assert!(!t.contains(TOKEN), "完整 token 不许出现：{t}");
+        assert_eq!(
+            s.writes("/opt/bui-c/profiles.json") - writes,
+            1,
+            "改名与这批节点在同一把锁里一次写盘（C7）：{t}"
+        );
+    }
+
+    /// 27（§5.6、§8.2、§8.3）：token 名的活动节点遇上换端口——先改名、再按账号原地替换；
+    /// 屏上只有打码后的旧名，改名 / active / 节点一次写盘，配置因端口变 apply 一次。
+    #[test]
+    fn token_named_profiles_are_renamed_on_import_and_the_full_token_is_never_printed() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        listed(
+            &s,
+            &pp,
+            vec![entry(
+                &token_name(),
+                bui_schema::nodes::Node {
+                    port: 40003,
+                    hop: Some((44000, 45000)),
+                    ..crate::testutil::hy2_resi_node()
+                },
+                Source::ApiNodes,
+                split_keywords(),
+            )],
+            &token_name(),
+        );
+        let (before, writes) = (s.calls().len(), s.writes("/opt/bui-c/profiles.json"));
+        let t = import_from_panel(&s, &pp, "alice", vec![crate::testutil::hy2_resi_node()]);
+        assert_eq!(names(&s, &pp), vec![HEALED_NAME], "{t}");
+        assert_eq!(got(&s, &pp, HEALED_NAME).node.port, 40000, "{t}");
+        assert_eq!(
+            Profiles::load(&s, &pp).unwrap().active.as_deref(),
+            Some(HEALED_NAME),
+            "{t}"
+        );
+        assert!(
+            said_line(
+                &t,
+                &format!("节点 {}…-hy2-resi 已改名为 {HEALED_NAME}", &TOKEN[..4])
+            ),
+            "改名行逐字（旧名只剩前 4 位）：{t}"
+        );
+        assert!(
+            said_line(&t, &menu::port_moved_line(HEALED_NAME, 40003, 40000)),
+            "端口变化行说的是新名字：{t}"
+        );
+        assert!(!t.contains(TOKEN), "{t}");
+        assert!(!t.contains(&TOKEN[..8]), "半截 token 也不该露出来：{t}");
+        assert_eq!(
+            s.writes("/opt/bui-c/profiles.json") - writes,
+            1,
+            "改名、active、节点同一次写盘（C7）：{t}"
+        );
+        assert_eq!(restarts_since(&s, before), 1, "端口变了要 apply：{t}");
+    }
+
+    /// 28（§5.7、§8.2）：只改名不是内容变化——活动节点的 token 名被洗掉，配置不重渲、服务不重启。
+    #[test]
+    fn renaming_a_token_active_profile_alone_does_not_restart() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let uri = hy2_uri("alice", "hy2-pw", 40000, "alice-HY2住宅");
+        listed(
+            &s,
+            &pp,
+            vec![entry(
+                &token_name(),
+                uri_node(&uri),
+                Source::ApiNodes,
+                crate::profiles::default_split(),
+            )],
+            &token_name(),
+        );
+        let (before, writes) = (marks(&s), s.writes("/opt/bui-c/profiles.json"));
+        let t = import_paste(&s, &pp, &[&uri]);
+        assert_eq!(names(&s, &pp), vec![HEALED_NAME], "{t}");
+        assert_eq!(
+            Profiles::load(&s, &pp).unwrap().active.as_deref(),
+            Some(HEALED_NAME),
+            "{t}"
+        );
+        assert!(
+            said_line(&t, &menu::renamed_line(&token_name(), HEALED_NAME)),
+            "{t}"
+        );
+        assert!(!t.contains(TOKEN), "{t}");
+        assert_eq!(
+            s.writes("/opt/bui-c/profiles.json") - writes,
+            1,
+            "改名要落盘：{t}"
+        );
+        assert_not_applied(&s, before, "只改名，节点与分流都没变", &t);
+    }
+
+    /// 29（§5.6）：改名不依赖这批命中了什么——粘一条另一台服务器的链接，遗留的 token 名照样洗掉。
+    #[test]
+    fn an_unrelated_import_still_renames_leftover_token_names() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        listed(
+            &s,
+            &pp,
+            vec![entry(
+                &token_name(),
+                crate::testutil::hy2_resi_node(),
+                Source::ApiNodes,
+                split_keywords(),
+            )],
+            &token_name(),
+        );
+        let t = import_paste(&s, &pp, &[&other_host_uri()]);
+        let mut got_names = names(&s, &pp);
+        got_names.sort();
+        assert_eq!(
+            got_names,
+            vec![
+                "other.example.com-hy2-direct".to_string(),
+                HEALED_NAME.to_string()
+            ],
+            "{t}"
+        );
+        assert!(
+            said_line(&t, &menu::renamed_line(&token_name(), HEALED_NAME)),
+            "这批没碰到它也改名：{t}"
+        );
+        assert!(!t.contains(TOKEN), "{t}");
+        assert_eq!(
+            Profiles::load(&s, &pp).unwrap().active.as_deref(),
+            Some(HEALED_NAME),
+            "{t}"
+        );
+    }
+
+    /// 30（§8.3、C7）：墓碑名里的 token 也不许漏——改名那一趟把墓碑显示名一起换成账号维度的
+    /// 名字，命令行的「跳过…」与菜单的 `buried_head` 都只有它。
+    #[test]
+    fn a_token_in_a_tombstone_name_is_masked_on_import() {
+        let pp = paths();
+
+        // ① 命令行 `bui-c import`：跳过那一行
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        buried_token_fixture(&s, &pp);
+        let t = import_from_panel(&s, &pp, "alice", vec![crate::testutil::hy2_resi_node()]);
+        assert_eq!(names(&s, &pp), vec!["bob-hy2-direct"], "墓碑挡住了：{t}");
+        assert!(
+            said_line(&t, &menu::buried_skipped(&[HEALED_NAME.to_string()])),
+            "{t}"
+        );
+        assert!(!t.contains(TOKEN), "{t}");
+        assert!(!t.contains(&TOKEN[..8]), "{t}");
+
+        // ② 菜单 [3]：`buried_head` 那一句。粘两条（单条粘贴按明确意愿直接加回，不会被挡）
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        buried_token_fixture(&s, &pp);
+        let n = FakeNet::new();
+        let resi = hy2_uri("alice", "hy2-pw", 40000, "alice-HY2住宅");
+        let direct = hy2_uri("alice", "hy2-pw", 10000, "alice-HY2直连");
+        let r = run_menu(&s, &n, &pp, &["3", &resi, &direct, "", "n", "n", "0"], true);
+        assert!(
+            r.asked.iter().any(|q| q == menu::BURIED_ASK),
+            "{:?}",
+            r.asked
+        );
+        assert!(
+            said_line(&r.t, &menu::buried_head(&[HEALED_NAME.to_string()])),
+            "{}",
+            r.t
+        );
+        assert!(!r.t.contains(TOKEN), "{}", r.t);
+    }
+
+    /// 31（D3、§8.3）：`import-v3` 这条路不改名（v3 目录是冻结快照，`prof` 一个字段都不动），
+    /// 墓碑名里的 token 只能靠显示打码挡住。两格：没有 v3 残留单元（`run` 提前返回、不写盘）；
+    /// 有残留单元（`run` 原样写一次，`profiles.json` 逐字节不变）。
+    #[test]
+    fn import_v3_never_prints_a_full_token_from_a_tombstone_name() {
+        let pp = paths();
+        // 命中墓碑的那个 v3 目录（alice 的住宅口）
+        const RESI_DIR: &str = "/opt/hysteria-client/configs/hysteria2-1/uri.txt";
+        const RESI_URI: &str = "hysteria2://alice:hy2-pw@panel.example.com:40000/?sni=panel.example.com#alice-HY2%E4%BD%8F%E5%AE%85";
+        // 盘上那条活动节点对应的 v3 目录：落进 `existing`，`nothing_to_apply` 因此为假
+        const BOB_DIR: &str = "/opt/hysteria-client/configs/hysteria2-2/uri.txt";
+        const BOB_URI: &str = "hysteria2://bob:bob-pw@panel.example.com:10000/?sni=panel.example.com#bob-HY2%E7%9B%B4%E8%BF%9E";
+
+        // ① 没有 v3 残留单元：`run` 在「无事可做」那一步提前返回，`profiles.json` 不被写
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        buried_token_fixture(&s, &pp);
+        s.put(RESI_DIR, RESI_URI);
+        let n = FakeNet::new();
+        let writes = s.writes("/opt/bui-c/profiles.json");
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["import-v3"]), &mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert!(
+            said_line(&t, &menu::buried_skipped(&[token_name()])),
+            "墓碑名打码后才打出来：{t}"
+        );
+        assert!(t.contains(&masked_name()), "{t}");
+        assert!(!t.contains(TOKEN), "{t}");
+        assert!(!t.contains(&TOKEN[..8]), "{t}");
+        assert_eq!(
+            s.writes("/opt/bui-c/profiles.json"),
+            writes,
+            "提前返回，不写盘：{t}"
+        );
+
+        // ①′ 菜单 [7] → [3]：`buried_head` 那一句同样只有打码后的名字
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        buried_token_fixture(&s, &pp);
+        s.put(RESI_DIR, RESI_URI);
+        let n = FakeNet::new();
+        let r = run_menu(&s, &n, &pp, &["7", "3", "n", "", "0"], true);
+        assert!(
+            said_line(&r.t, &menu::buried_head(&[token_name()])),
+            "{}",
+            r.t
+        );
+        assert!(r.t.contains(&masked_name()), "{}", r.t);
+        assert!(!r.t.contains(TOKEN), "{}", r.t);
+
+        // ② 有 v3 残留单元：`run` 会走到落盘那一步，写出来的必须与基准逐字节相同
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        buried_token_fixture(&s, &pp);
+        s.put(RESI_DIR, RESI_URI);
+        s.put(BOB_DIR, BOB_URI);
+        for f in v3_unit_files(&pp) {
+            s.put(f.to_str().unwrap(), "[Unit]");
+        }
+        let baseline = s.get("/opt/bui-c/profiles.json").unwrap();
+        let n = FakeNet::new();
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["import-v3"]), &mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert!(said_line(&t, &menu::buried_skipped(&[token_name()])), "{t}");
+        assert!(!t.contains(TOKEN), "{t}");
+        assert!(!t.contains(&TOKEN[..8]), "{t}");
+        // 走过 `run` 的落盘那一步：残留单元被 teardown 删掉了（`removed_units` 非空）
+        assert!(
+            t.contains(&format!(
+                "清掉 {} 个残留的 v3 单元",
+                v3_unit_files(&pp).len()
+            )),
+            "前提：真的走到了落盘与 teardown：{t}"
+        );
+        for f in v3_unit_files(&pp) {
+            assert!(!s.exists(&f), "{} 该被卸掉：{t}", f.display());
+        }
+        assert_eq!(
+            s.get("/opt/bui-c/profiles.json").unwrap(),
+            baseline,
+            "原样写一次，逐字节不变：{t}"
+        );
+    }
+
+    /// 32（D3、§8.3）：`--json` 是机器接口，名字原样给——打码会让字段有损、按名字写的脚本坏掉。
+    #[test]
+    fn json_outputs_keep_the_raw_token_name() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        listed(
+            &s,
+            &pp,
+            vec![entry(
+                &token_name(),
+                crate::testutil::hy2_resi_node(),
+                Source::ApiNodes,
+                split_keywords(),
+            )],
+            &token_name(),
+        );
+        let n = FakeNet::new();
+        for args in [["list", "--json"], ["status", "--json"]] {
+            let mut p = Scripted::from([]);
+            let mut ctx = Ctx::new(&s, &n, &pp, &mut p, true, false);
+            dispatch(&parse(&args), &mut ctx).unwrap();
+            assert!(
+                ctx.out.contains(TOKEN),
+                "{args:?} 不打码，原名原样给：{}",
+                ctx.out
+            );
+        }
+    }
+
+    /// 33（D3、§8.3）：同一台从没导入过的机器，人读的四处出口都只有 `0123…`。
+    #[test]
+    fn human_outputs_mask_token_names() {
+        let pp = paths();
+        let n = FakeNet::new();
+        // 两条节点的机器：活动节点是普通名字，token 名那条留着当切换目标
+        let two = |s: &FakeSys| {
+            let mut prof = Profiles::new_default();
+            prof.profiles.push(entry(
+                "alice-reality-direct",
+                reality_direct_node(),
+                Source::ApiNodes,
+                split_keywords(),
+            ));
+            prof.profiles.push(entry(
+                &token_name(),
+                crate::testutil::hy2_resi_node(),
+                Source::ApiNodes,
+                split_keywords(),
+            ));
+            prof.active = Some("alice-reality-direct".into());
+            prof.save(s, &pp).unwrap();
+        };
+
+        // ① `list` 表格、② `status` 人读部分
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        listed(
+            &s,
+            &pp,
+            vec![entry(
+                &token_name(),
+                crate::testutil::hy2_resi_node(),
+                Source::ApiNodes,
+                split_keywords(),
+            )],
+            &token_name(),
+        );
+        for args in [["list"], ["status"]] {
+            let mut p = Scripted::from([]);
+            let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+            dispatch(&parse(&args), &mut ctx).unwrap();
+            let t = ctx.transcript.clone();
+            assert!(t.contains(&masked_name()), "{args:?}：{t}");
+            assert!(!t.contains(TOKEN), "{args:?}：{t}");
+            assert!(!t.contains(&TOKEN[..8]), "{args:?}：{t}");
+        }
+
+        // ③ 删除确认块 + ④ `cli_summary`：删掉活动节点、切到 token 名那条
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        two(&s);
+        let tn = token_name();
+        let mut p = Scripted::from(["yes"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(
+            &parse(&["delete", "alice-reality-direct", "--switch-to", &tn]),
+            &mut ctx,
+        )
+        .unwrap();
+        let t = ctx.transcript.clone();
+        assert_eq!(names(&s, &pp), vec![tn.clone()], "删掉的是活动那条：{t}");
+        assert!(t.contains(&masked_name()), "确认块里就打码：{t}");
+        assert!(
+            said_line(&t, &format!("当前节点已删除，切到 {}", masked_name())),
+            "结果行也打码：{t}"
+        );
+        assert!(!t.contains(TOKEN), "{t}");
+        assert!(!t.contains(&TOKEN[..8]), "{t}");
+
+        // ⑤ 菜单「上次：」行：切到 token 名那条
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        two(&s);
+        let r = run_menu(&s, &n, &pp, &["1", "2", "", "0"], true);
+        assert_eq!(
+            Profiles::load(&s, &pp).unwrap().active.as_deref(),
+            Some(tn.as_str()),
+            "{}",
+            r.t
+        );
+        assert!(
+            said_line(&r.t, &format!("上次：已切到 {}", masked_name())),
+            "{}",
+            r.t
+        );
+        assert!(!r.t.contains(TOKEN), "{}", r.t);
+        assert!(!r.t.contains(&TOKEN[..8]), "{}", r.t);
     }
 }
