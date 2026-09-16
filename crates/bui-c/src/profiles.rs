@@ -31,6 +31,20 @@ pub enum Source {
     V3,
 }
 
+impl Source {
+    /// 来源等级：`ApiNodes` 3 > `Subscription` 2 > `Paste` 1 = `V3` 1（spec §4）。
+    ///
+    /// 只用于「只升不降」（spec §5.5）：粘贴与 v3 同级，互相之间不改来源——
+    /// 两者都是用户手里的副本，谁都不比谁新。
+    pub fn rank(self) -> u8 {
+        match self {
+            Source::ApiNodes => 3,
+            Source::Subscription => 2,
+            Source::Paste | Source::V3 => 1,
+        }
+    }
+}
+
 /// 面板坐标。`base_url` 不带尾斜杠，`username` 是订阅路径的最后一段（等价凭据）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Panel {
@@ -97,7 +111,8 @@ pub struct Profiles {
     pub auto_update: bool,
     pub panel: Option<Panel>,
     pub profiles: Vec<Profile>,
-    /// 删掉过的节点（spec §5.7）。**放在最后、且没有墓碑时不写进文件**：这样
+    /// 删掉过的节点（spec §5.7）。**放在已知字段的最后（其后只有 flatten 的 `extra`，
+    /// 为空时不产生键）、且没有墓碑时不写进文件**：这样
     /// `SCHEMA_VERSION` 不必动，没墓碑的机器上 `profiles.json` 与改动前逐字节相同。
     /// [`Profiles`] 永远不加 `deny_unknown_fields`，旧版本读到它直接忽略。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -113,6 +128,26 @@ pub enum Upsert {
     Added,
     Replaced,
     Unchanged,
+}
+
+/// 同账号条目为什么没进账号组（spec §5.1、§5.3）。
+///
+/// 每一条的原因**先判是否受保护，门槛次之，两条都报**（A1）：
+/// [`protected`] 且不 [`same_params`] → 条目来源是 `ApiNodes` 则 [`Blocked::PanelEntry`]、
+/// 否则 [`Blocked::ActiveEntry`]，两者都带 `kind_unsure: !gate_ok(..)`，**不论门槛内外**；
+/// 其余（必然在门槛外、且不受保护）→ [`Blocked::KindUnsure`]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Blocked {
+    /// 受保护、且条目来源是 `ApiNodes`（不管是不是活动节点）：出路是从面板重新导入。
+    ///
+    /// `kind_unsure` 为真表示它同时在门槛外（端口不同、且来件的 kind 是按备注猜的——
+    /// 条目自己来源是 `ApiNodes`，kind 恒可信），说明句按 §5.3 补那半句。
+    PanelEntry { kind_unsure: bool },
+    /// 受保护、且条目是非面板来源的活动节点：出路是确认新节点能用后切换过去。
+    /// `kind_unsure` 同上（端口不同，且两边 kind 至少一边是按备注猜的）。
+    ActiveEntry { kind_unsure: bool },
+    /// 不受保护、且在门槛外：kind 至少一边是按备注猜的、端口不同。
+    KindUnsure,
 }
 
 pub fn kind_slug(kind: NodeKind) -> &'static str {
@@ -158,6 +193,12 @@ pub fn profile_name(user: &str, node: &Node) -> String {
     }
 }
 
+/// 名字里带 4.0.0 的订阅 token：按 `-` 切开后有一段恰好是 32 位十六进制
+/// （判据同 [`crate::source::looks_like_token`]，spec §4、§8）。
+pub fn name_has_token(name: &str) -> bool {
+    name.split('-').any(crate::source::looks_like_token)
+}
+
 /// 同一个账号位：同一台服务器（`host`）上 `kind` 相同、凭据主体相同
 /// （Hysteria2 的 `username`、Reality 的 `uuid`）。
 ///
@@ -165,9 +206,11 @@ pub fn profile_name(user: &str, node: &Node) -> String {
 /// 必须看 host：ASCII 用户名（`alice`）在两台服务器上各有一个账号时 [`profile_name`] 都是
 /// `alice-<kind>`，那是两个账号，第二台不能把第一台的节点换掉（换了主机名的同一账号
 /// 顶多多出一个 `-2`，不丢东西）。不同账号（家人账号）哪怕撞名也不是同一个账号位。
+/// `host` 不区分大小写（D6，spec §5.2）：与 [`tombstone_key`] 的 `to_lowercase` 同口径，
+/// 否则「墓碑挡得住」与「账号组命中」会因为大小写分叉。
 pub fn same_account(a: &Node, b: &Node) -> bool {
     a.kind == b.kind
-        && a.host == b.host
+        && a.host.to_lowercase() == b.host.to_lowercase()
         && match (&a.transport, &b.transport) {
             (
                 Transport::Hysteria2 { username: ua, .. },
@@ -205,15 +248,34 @@ pub fn tombstone_key(node: &Node) -> String {
     )
 }
 
-/// 同一个连接：[`same_account`]，且 `host`、`port` 相同，Hysteria2 的 `password` 也相同
-/// （Reality 的 uuid 已经是凭据全部）。
+/// 从墓碑 key 推出可以展示的名字 `<sanitize(host)>-<kind_slug>`（spec §5.1）：
+/// key 的第 0 段是 kind_slug、第 1 段是小写 host，`sanitize(host)` 为空就退回 kind_slug。
+///
+/// 墓碑记的名字可能带订阅 token（4.0.0 起过的名字），打码之前先用账号维度的 key 换一个
+/// 干净名字——key 里本来就没有凭据（C7）。
+///
+/// 定稿 §5.1 写的就是私有函数：只给本文件的 `bury` / `heal_token_names` 用，不进 crate 的
+/// 公共 API。T6 把这两处生产调用点接上之后，删掉下面这行 `allow`。
+#[cfg_attr(not(test), allow(dead_code))]
+fn key_display(key: &str) -> String {
+    let mut parts = key.split('|');
+    let kind = parts.next().unwrap_or_default();
+    let host = sanitize(parts.next().unwrap_or_default());
+    if host.is_empty() {
+        kind.to_string()
+    } else {
+        format!("{host}-{kind}")
+    }
+}
+
+/// 同一个连接：[`same_account`]（host 已在那里按小写比过，D6），且 `port` 相同，
+/// Hysteria2 的 `password` 也相同（Reality 的 uuid 已经是凭据全部）。
 ///
 /// 故意不比 `label`、`hop`、`sni` / `server_name`、`public_key`、`short_id`、
 /// `obfs_password`：这些是面板能改的展示或参数，改了应原地更新，不是新节点——
 /// 否则 import-v3 带 v3 备注进来的节点，经面板导入一次就在列表里出现两份。
 pub fn same_endpoint(a: &Node, b: &Node) -> bool {
     same_account(a, b)
-        && a.host == b.host
         && a.port == b.port
         && match (&a.transport, &b.transport) {
             (
@@ -222,6 +284,56 @@ pub fn same_endpoint(a: &Node, b: &Node) -> bool {
             ) => pa == pb,
             _ => true,
         }
+}
+
+/// kind 是来源明说的，还是 [`node_uri`](bui_schema::parse) 按备注猜的（spec §4）。
+///
+/// 面板 `/api/nodes` 下发的 kind 是服务端给的，恒可信；URI 只看备注含不含「住宅」，
+/// 所以备注点名「直连」或「住宅」的才算数。
+pub fn kind_trusted(node: &Node, src: Source) -> bool {
+    src == Source::ApiNodes || node.label.contains("直连") || node.label.contains("住宅")
+}
+
+/// 门槛内：同一个账号，且跨端口时两边 kind 都可信（spec §5.2）。
+///
+/// 端口相同就不必问 kind：猜错 kind 也换不到别的实例上去。端口不同才要两边都可信——
+/// 否则一条备注被改成 `custom` 的住宅链接会把直连节点改写到住宅端口。
+pub fn gate_ok(p: &Profile, node: &Node, src: Source) -> bool {
+    same_account(&p.node, node)
+        && (p.node.port == node.port
+            || (kind_trusted(&p.node, p.source) && kind_trusted(node, src)))
+}
+
+/// 只升不降（D1，spec §5.3）：非面板来件不许覆盖面板来源的条目或活动节点。
+///
+/// 例外是「订阅来件遇订阅条目」：订阅是现拉的服务端数据，不是用户手里的过期副本，
+/// 面板取失败、退回订阅路径的机器照常受益。
+pub fn protected(p: &Profile, is_active: bool, src: Source) -> bool {
+    src != Source::ApiNodes
+        && (p.source == Source::ApiNodes
+            || (is_active && !(src == Source::Subscription && p.source == Source::Subscription)))
+}
+
+/// 同参数：除 `label`、`hop` 以外 `node` 全等，`host` 按 [`same_account`] 的口径
+/// 不区分大小写（C2，spec §5.3）。
+///
+/// 比「同一个连接」严：[`same_endpoint`] 有意不比 `obfs_password`、`sni`、`public_key`、
+/// `short_id`，而面板开了混淆之后粘进来的一条旧链接端口与密码都相同——照 `same_endpoint`
+/// 覆盖上去，活动节点的 obfs 密码被抹掉并立即 apply，TUN 下整机断网。
+pub fn same_params(a: &Node, b: &Node) -> bool {
+    same_account(a, b) && {
+        let mut x = a.clone();
+        x.label = b.label.clone();
+        x.hop = b.hop;
+        x.host = b.host.clone(); // same_account 已按小写比过
+        x == *b
+    }
+}
+
+/// 这条 profile 能不能被来件原地替换：门槛内，且不受保护或与来件同参数
+/// （[`same_params`] 蕴含 [`same_endpoint`]）。
+pub fn movable(p: &Profile, is_active: bool, node: &Node, src: Source) -> bool {
+    gate_ok(p, node, src) && (!protected(p, is_active, src) || same_params(&p.node, node))
 }
 
 /// 订阅与粘贴来源拿不到服务端的住宅分流信息：按「活动节点承担全部流量」处理。
@@ -553,6 +665,15 @@ mod tests {
             "username 不同就是另一个账号"
         );
 
+        let host_case = Node {
+            host: "Panel.Example.com".into(),
+            ..hy2_direct_node()
+        };
+        assert!(
+            same_endpoint(&base, &host_case),
+            "host 只差大小写仍是同一个连接（D6）"
+        );
+
         let moved_host = Node {
             host: "b.example.com".into(),
             ..hy2_direct_node()
@@ -610,6 +731,438 @@ mod tests {
             Some("hysteria2-1785892136")
         );
         assert!(p.find_same_endpoint(&rotated).is_none());
+    }
+
+    /// 换掉 hy2 直连节点的 Hysteria2 字段，`None` = 不动。
+    fn hy2_with(
+        username: Option<&str>,
+        password: Option<&str>,
+        sni: Option<&str>,
+        obfs: Option<&str>,
+    ) -> Node {
+        let mut n = hy2_direct_node();
+        if let Transport::Hysteria2 {
+            username: u,
+            password: pw,
+            sni: s,
+            obfs_password: o,
+        } = &mut n.transport
+        {
+            if let Some(v) = username {
+                *u = v.into();
+            }
+            if let Some(v) = password {
+                *pw = v.into();
+            }
+            if let Some(v) = sni {
+                *s = v.into();
+            }
+            if let Some(v) = obfs {
+                *o = Some(v.into());
+            }
+        }
+        n
+    }
+
+    /// 换掉 Reality 直连节点的服务端参数，`None` = 不动。
+    fn reality_with(
+        public_key: Option<&str>,
+        short_id: Option<&str>,
+        server_name: Option<&str>,
+        flow: Option<&str>,
+    ) -> Node {
+        let mut n = crate::testutil::reality_direct_node();
+        if let Transport::Reality {
+            public_key: pk,
+            short_id: sid,
+            server_name: sn,
+            flow: fl,
+            ..
+        } = &mut n.transport
+        {
+            if let Some(v) = public_key {
+                *pk = v.into();
+            }
+            if let Some(v) = short_id {
+                *sid = v.into();
+            }
+            if let Some(v) = server_name {
+                *sn = v.into();
+            }
+            if let Some(v) = flow {
+                *fl = v.into();
+            }
+        }
+        n
+    }
+
+    /// 来源等级：粘贴与 v3 同级，谁都不压过谁（spec §4，只升不降的底座）。
+    #[test]
+    fn source_rank_puts_paste_and_v3_at_the_same_level() {
+        assert_eq!(Source::Paste.rank(), Source::V3.rank());
+        assert!(Source::Subscription.rank() > Source::Paste.rank());
+        assert!(Source::ApiNodes.rank() > Source::Subscription.rank());
+    }
+
+    /// kind 可信 = 来源是面板，或备注里点名「直连」/「住宅」（spec §4、§5.1）。
+    #[test]
+    fn kind_trusted_only_for_panel_nodes_or_labels_naming_direct_or_residential() {
+        let guessed = Node {
+            label: "示例备注".into(),
+            ..hy2_direct_node()
+        };
+        assert!(
+            kind_trusted(&guessed, Source::ApiNodes),
+            "面板明说了 kind，备注写什么都可信"
+        );
+        for src in [Source::Subscription, Source::Paste, Source::V3] {
+            assert!(!kind_trusted(&guessed, src), "{src:?}：备注不含直连 / 住宅");
+            assert!(
+                kind_trusted(&hy2_direct_node(), src),
+                "{src:?}：备注含「直连」"
+            );
+            assert!(
+                kind_trusted(&hy2_resi_node(), src),
+                "{src:?}：备注含「住宅」"
+            );
+            assert!(
+                kind_trusted(
+                    &Node {
+                        label: "alice-HY2住宅-备用".into(),
+                        ..hy2_resi_node()
+                    },
+                    src
+                ),
+                "{src:?}：备注里带「住宅」二字就够"
+            );
+            assert!(
+                !kind_trusted(
+                    &Node {
+                        label: "custom".into(),
+                        ..hy2_resi_node()
+                    },
+                    src
+                ),
+                "{src:?}：kind 是住宅但备注是自定义的，kind 就是猜的"
+            );
+        }
+    }
+
+    /// D6：`same_account` / `same_endpoint` 的 host 与 `tombstone_key` 同口径，不区分大小写。
+    #[test]
+    fn same_account_and_same_endpoint_ignore_host_case_like_the_tombstone_key() {
+        let lower = hy2_direct_node();
+        let upper = Node {
+            host: "Panel.Example.com".into(),
+            ..lower.clone()
+        };
+        assert!(same_account(&lower, &upper), "host 只差大小写是同一个账号");
+        assert!(same_endpoint(&lower, &upper), "也是同一个连接");
+        assert_eq!(
+            tombstone_key(&lower),
+            tombstone_key(&upper),
+            "墓碑 key 本来就小写，三者从此一致"
+        );
+
+        let moved = Node {
+            port: 10009,
+            ..upper
+        };
+        assert!(same_account(&lower, &moved), "换端口仍是同一个账号");
+        assert!(!same_endpoint(&lower, &moved), "但不是同一个连接");
+
+        let resi = Node {
+            kind: NodeKind::Hy2Residential,
+            host: "PANEL.EXAMPLE.COM".into(),
+            ..lower.clone()
+        };
+        assert!(!same_account(&lower, &resi), "kind 不同不是同一个账号");
+        assert!(!same_endpoint(&lower, &resi));
+        assert_ne!(tombstone_key(&lower), tombstone_key(&resi));
+
+        let other_host = Node {
+            host: "OTHER.example.com".into(),
+            ..lower.clone()
+        };
+        assert!(
+            !same_account(&lower, &other_host),
+            "宽到大小写为止：换了主机仍是另一个账号"
+        );
+        assert!(!same_endpoint(&lower, &other_host));
+    }
+
+    /// §5.3 只升不降扩到节点（D1）：非面板来件不许覆盖面板条目或活动节点，
+    /// 例外是「订阅来件遇订阅条目」；受保护的条目只接受同参数的来件。
+    ///
+    /// 函数名沿用定稿 §11.1 第 5 条的 r2 措辞（`same_endpoint`），断言按 r3 收紧后的
+    /// `same_params` 写——改名会与 §11.1 的编号对不上，留给文档收尾轮更正那一行。
+    #[test]
+    fn protected_entries_need_the_same_endpoint_for_non_panel_sources() {
+        let sources = [
+            Source::ApiNodes,
+            Source::Subscription,
+            Source::Paste,
+            Source::V3,
+        ];
+        // 同参数来件：只差 label 与 hop
+        let same = Node {
+            label: "面板改过的备注".into(),
+            hop: None,
+            ..hy2_direct_node()
+        };
+        // 不同参数来件：端口与 HY2 密码都相同（同一个连接），只多了 obfs 密码——
+        // 受保护条目要挡的正是这一种（§5.3，C2）
+        let differing = hy2_with(None, None, None, Some("obfs-pw"));
+        assert!(same_params(&hy2_direct_node(), &same));
+        assert!(!same_params(&hy2_direct_node(), &differing));
+        assert!(
+            same_endpoint(&hy2_direct_node(), &differing),
+            "它是同一个连接，只有 same_params 挡得住"
+        );
+
+        for src in sources {
+            for entry_src in sources {
+                for is_active in [true, false] {
+                    for (node, params_equal) in [(&same, true), (&differing, false)] {
+                        let mut p = prof("alice-hy2-direct", hy2_direct_node());
+                        p.source = entry_src;
+                        assert!(
+                            gate_ok(&p, node, src),
+                            "同端口的同账号来件一律在门槛内：{src:?} × {entry_src:?}"
+                        );
+                        // §5.3 表：面板来件整行可替换；ApiNodes 条目与活动节点只接受同参数，
+                        // 例外是订阅来件遇订阅条目；其余条目可替换
+                        let only_same_params = match (src, entry_src, is_active) {
+                            (Source::ApiNodes, _, _) => false,
+                            (_, Source::ApiNodes, _) => true,
+                            (Source::Subscription, Source::Subscription, true) => false,
+                            (_, _, true) => true,
+                            _ => false,
+                        };
+                        assert_eq!(
+                            movable(&p, is_active, node, src),
+                            !only_same_params || params_equal,
+                            "来件 {src:?} × 条目 {entry_src:?} × active={is_active} × 同参数={params_equal}"
+                        );
+                        assert_eq!(
+                            protected(&p, is_active, src),
+                            only_same_params,
+                            "受保护与否：{src:?} × {entry_src:?} × active={is_active}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// §5.2 kind 门槛的跨端口那一支：端口变了的来件，**条目与来件两边**的 kind 都可信
+    /// 才算在门槛内。
+    ///
+    /// 测试 5 的来件与条目同端口，`gate_ok` 走 `p.node.port == node.port` 短路，kind 分支
+    /// 一格都没走到；这里专钉那一支，顺带钉住 `movable` 里 `gate_ok &&` 的前件不是恒真。
+    #[test]
+    fn the_kind_gate_needs_both_sides_trusted_once_the_port_moves() {
+        // 条目：kind 是 Hy2Direct，但备注不点名、来源也不是面板——kind 是猜的
+        let entry = |src: Source| {
+            let mut p = prof(
+                "alice-hy2-direct",
+                Node {
+                    label: "示例备注".into(),
+                    ..hy2_direct_node()
+                },
+            );
+            p.source = src;
+            p
+        };
+        // 来件：同账号、同 kind（备注不含「住宅」，node_uri 一律猜直连），只换了端口
+        let incoming = |label: &str| Node {
+            label: label.into(),
+            port: 40003,
+            ..hy2_direct_node()
+        };
+        let named = incoming("alice-HY2直连");
+        let unnamed = incoming("custom");
+        assert!(
+            same_account(&entry(Source::V3).node, &named)
+                && !same_endpoint(&hy2_direct_node(), &named),
+            "前提：同账号、跨端口，门槛之外没有别的东西拦着"
+        );
+
+        // (a) 条目侧是猜的：来件点名也进不了门槛（§5.2 表第二行的方向）
+        let guessed = entry(Source::V3);
+        assert!(
+            !gate_ok(&guessed, &named, Source::Paste),
+            "条目的 kind 是猜的，跨端口不给动"
+        );
+        assert!(
+            !gate_ok(&guessed, &named, Source::ApiNodes),
+            "来件是面板也一样：猜错 kind 的条目会被挪到另一个实例上去"
+        );
+        assert!(
+            !protected(&guessed, false, Source::Paste),
+            "前提：非活动的 v3 条目不受保护，这一格挡住它的只能是门槛"
+        );
+        assert!(
+            !movable(&guessed, false, &named, Source::Paste),
+            "门槛外就不可替换，与保护、同参数无关"
+        );
+
+        // (b) 条目来自面板：kind 是服务端给的，两边都可信
+        let panel = entry(Source::ApiNodes);
+        assert!(
+            gate_ok(&panel, &named, Source::Paste),
+            "条目 kind 面板明说、来件备注点名「直连」"
+        );
+
+        // (c) 来件侧是猜的：备注被改成 custom 的链接不许把节点挪到别的端口（§5.2 表第一行）
+        assert!(
+            !gate_ok(&panel, &unnamed, Source::Paste),
+            "来件的 kind 是猜的，跨端口不给动"
+        );
+
+        // (d) 来件也来自面板：备注写什么都可信
+        assert!(
+            gate_ok(&panel, &unnamed, Source::ApiNodes),
+            "面板明说了 kind，备注是 custom 也放行"
+        );
+
+        // 门槛内且不受保护时 movable 跟着放行：证明上面的 !movable 是门槛给的
+        let named_entry = {
+            let mut p = prof("alice-hy2-direct", hy2_direct_node());
+            p.source = Source::V3;
+            p
+        };
+        assert!(
+            kind_trusted(&named_entry.node, named_entry.source),
+            "前提：hy2_direct_node 的备注点名「直连」"
+        );
+        assert!(
+            movable(&named_entry, false, &named, Source::Paste),
+            "两边都点名了 kind，非活动的 v3 条目可以原地换端口"
+        );
+    }
+
+    /// C2：同参数比「同一个连接」严——只放过 label、hop 与 host 大小写。
+    #[test]
+    fn same_params_ignores_only_label_and_hop() {
+        let base = hy2_direct_node();
+        let cosmetic = Node {
+            label: "示例专用名-小组".into(),
+            hop: None,
+            host: "Panel.Example.com".into(),
+            ..base.clone()
+        };
+        let cases: Vec<(&str, Node, bool)> = vec![
+            ("label / hop / host 大小写", cosmetic, true),
+            (
+                "端口",
+                Node {
+                    port: 10009,
+                    ..base.clone()
+                },
+                false,
+            ),
+            (
+                "HY2 密码",
+                hy2_with(None, Some("rotated"), None, None),
+                false,
+            ),
+            (
+                "obfs 密码（None → Some）",
+                hy2_with(None, None, None, Some("obfs-pw")),
+                false,
+            ),
+            (
+                "sni",
+                hy2_with(None, None, Some("other.example.com"), None),
+                false,
+            ),
+            ("username", hy2_with(Some("bob"), None, None, None), false),
+        ];
+        for (what, other, want) in &cases {
+            assert_eq!(same_params(&base, other), *want, "{what}");
+            assert!(
+                !same_params(&base, other) || same_endpoint(&base, other),
+                "same_params 蕴含 same_endpoint：{what}"
+            );
+        }
+
+        let reality = crate::testutil::reality_direct_node();
+        let reality_cases: Vec<(&str, Node)> = vec![
+            (
+                "public_key",
+                reality_with(Some("OTHER-PUB"), None, None, None),
+            ),
+            (
+                "short_id",
+                reality_with(None, Some("fedcba9876543210"), None, None),
+            ),
+            (
+                "server_name",
+                reality_with(None, None, Some("www.example.com"), None),
+            ),
+            ("flow", reality_with(None, None, None, Some(""))),
+        ];
+        for (what, other) in &reality_cases {
+            assert!(
+                !same_params(&reality, other),
+                "Reality 的 {what} 是连接参数，不同就不是同参数"
+            );
+            assert!(
+                same_endpoint(&reality, other),
+                "但按「同一个连接」它们相同——同参数严在这里：{what}"
+            );
+        }
+        assert!(
+            same_params(
+                &reality,
+                &Node {
+                    label: "改过的备注".into(),
+                    ..reality.clone()
+                }
+            ),
+            "Reality 也只放过 label 与 hop"
+        );
+    }
+
+    /// 名字里带 4.0.0 的订阅 token（spec §4、§8）。
+    #[test]
+    fn name_has_token_matches_4_0_0_token_names_only() {
+        let token = "0123456789abcdef0123456789abcdef";
+        assert!(name_has_token(&format!("{token}-hy2-resi")));
+        assert!(name_has_token(&format!("{token}-hy2-resi-2")));
+        assert!(name_has_token(&format!(
+            "{}-hy2-resi",
+            token.to_uppercase()
+        )));
+        assert!(name_has_token(token));
+        assert!(
+            !name_has_token(&format!("{}-hy2-resi", &token[..31])),
+            "31 位不是 token"
+        );
+        assert!(!name_has_token("alice-hy2-resi"));
+        assert!(!name_has_token("hysteria2-1785892136"));
+        assert!(!name_has_token("panel.example.com-hy2-direct"));
+    }
+
+    /// 墓碑 key 推出的显示名：`<sanitize(host)>-<kind_slug>`，字段索引不写反。
+    #[test]
+    fn key_display_names_the_account_by_host_and_kind() {
+        let key = tombstone_key(&hy2_resi_node());
+        assert!(
+            key.starts_with("hy2-resi|panel.example.com|"),
+            "kind 在第 0 段、host 在第 1 段：{key}"
+        );
+        assert_eq!(key_display(&key), "panel.example.com-hy2-resi");
+        assert_eq!(
+            key_display(&tombstone_key(&crate::testutil::reality_direct_node())),
+            "panel.example.com-reality-direct"
+        );
+        assert_eq!(
+            key_display("hy2-direct|示例主机|0123456789abcdef"),
+            "hy2-direct",
+            "host 清洗后为空就退回 kind_slug"
+        );
     }
 
     #[test]
