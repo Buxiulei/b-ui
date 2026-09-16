@@ -108,9 +108,8 @@ pub fn firewall_ports(p: &Ports, compat: bool) -> Vec<PortSpec> {
 }
 
 /// 住宅 HY2 端口跳跃那张 nft 表的期望项（4.1）。规则集只有
-/// [`bui_schema::render::nft::ruleset`] 一处实现；`bui nft apply` 复用这个函数，
-/// watchdog 每 60 秒那处自愈 **T12 起**才有（现在还没有那段代码），落地时一并复用它，
-/// 免得三处各拼一遍。
+/// [`bui_schema::render::nft::ruleset`] 一处实现：`bui nft apply` 与 watchdog 每 60 秒那处
+/// 自愈（`crate::modules::watchdog::check_nft`）都从同一个渲染器取，三处不各拼一遍。
 pub fn nft_artifact(s: &State) -> Artifact {
     Artifact::NftTable {
         family: bui_schema::render::nft::FAMILY.to_string(),

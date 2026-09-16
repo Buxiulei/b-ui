@@ -4,8 +4,8 @@
 //! 规则集只有 [`bui_schema::render::nft::ruleset`] 一处实现，这里只负责把它喂给 `nft`。
 //!
 //! **`apply` 必须能在守护进程没跑的时候工作**：它是住宅单元的
-//! `ExecStartPre=-{bin}/bui nft apply`（今天两处幂等重放之一，另一处是每轮对账；
-//! watchdog 每 60 秒那第三处 **T12 起**才有，现在还没有那段代码），
+//! `ExecStartPre=-{bin}/bui nft apply`（三处幂等重放之一，另两处是每轮对账与 watchdog
+//! 每 60 秒的 `modules::watchdog::check_nft`），
 //! 而单元启动时 `b-ui.service` 可能还没起来。所以它**直接读
 //! `state.json` + 自己跑 `nft`，不经 `/run/b-ui.sock`**。
 //!
