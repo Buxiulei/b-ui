@@ -1360,7 +1360,9 @@ function loadResiHealth() {
                 const cPort = document.createElement("span");
                 const hop = Array.isArray(s.hop) ? s.hop : [];
                 cPort.textContent = _sysFmt(s.hy2_port) + " + " + _sysFmt(hop[0]) + "-" + _sysFmt(hop[1]);
-                cPort.title = "这一槽的用户在订阅里拿到的 HY2 住宅端口与跳跃区间";
+                // 4.1 起住宅 HY2 只有一个监听端口、整段跳跃由 `table inet bui` 送进去，
+                // 所以每一槽显示的都是同一对值（与用户列表那一列、与三种订阅同源）。
+                cPort.title = "住宅用户在订阅里拿到的 HY2 端口与跳跃区间（4.1 起与槽位无关，每一槽都一样）";
                 const cUsers = document.createElement("span");
                 cUsers.textContent = (s.users || []).join("、") || "—";
                 cUsers.title = cUsers.textContent;

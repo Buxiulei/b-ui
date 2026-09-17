@@ -119,6 +119,34 @@ pub fn free_count(p: &Hy2Pool, used: &BTreeSet<String>) -> usize {
     p.creds.iter().filter(|c| !used.contains(&c.id)).count()
 }
 
+/// 池用量的**唯一口径**：`bui status` 的那一行与 `GET /api/residential/pool` 都调它。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PoolUsage {
+    /// 池里的凭据条数
+    pub size: usize,
+    /// 其中 id 真被人占着的条数
+    pub used: usize,
+    /// 其余的（`used + free == size` 恒成立）
+    pub free: usize,
+}
+
+/// 按池里的凭据算 —— **不是**按「有指针的用户数」。
+///
+/// 差别在悬空指针：用户指向池里已不存在的 id（上一代池里的凭据，`migrate` 下次启动才清）
+/// 时，按用户数算会让 `used + free > size`，于是两处告警门槛（`bui status` 判
+/// `used > 80%·size`、`bui residential pool status` 判 `free < 20%·size`）互相打脸 ——
+/// 同一台机器上一处喊「空闲不足」另一处说没事。
+pub fn usage(s: &State) -> PoolUsage {
+    let used_ids = used_ids(s);
+    let p = &s.residential.hy2_pool;
+    let free = free_count(p, &used_ids);
+    PoolUsage {
+        size: p.creds.len(),
+        used: p.creds.len() - free,
+        free,
+    }
+}
+
 /// [`migrate`] 的结果：改动的用户数，以及**仍然没拿到凭据**的用户数。
 ///
 /// `unassigned > 0` 时调用方必须打 Error 级事件（spec §3.1：空闲耗尽时建用户不拒绝，
@@ -456,6 +484,30 @@ mod tests {
             (low as f64) / (size_for(1) as f64) < LOW_FREE_RATIO,
             "空闲 < 20% ⇒ 哨兵一次性告警 hy2_resi_pool_low"
         );
+    }
+
+    /// 池用量只有 [`usage`] 一处口径（`bui status` 与 `GET /api/residential/pool` 都调它），
+    /// 而且 **`used + free == size` 恒成立** —— 悬空指针不计已用。
+    ///
+    /// 按「有指针的用户数」另算一套（T14 之前 `bui status` 就是那样）会让指向已消失 id 的
+    /// 用户也计进已用，`used + free > size`：两处的低空闲门槛（`used > 80%·size` /
+    /// `free < 20%·size`）于是可能一处喊「空闲不足」另一处说没事。
+    #[test]
+    fn the_pool_usage_has_one_reading_and_never_counts_a_dangling_pointer() {
+        let mut s = state(2);
+        migrate(&mut s, datetime!(2026-09-15 00:00 UTC));
+        let u = usage(&s);
+        assert_eq!((u.size, u.used, u.free), (size_for(2), 2, size_for(2) - 2));
+
+        // 悬空指针：这个人指向池里压根没有的 id（上一代池的凭据，下次启动才被 migrate 清）
+        s.users[1].credentials.hy2_resi_cred = Some("r999".into());
+        let d = usage(&s);
+        assert_eq!(
+            (d.size, d.used, d.free),
+            (size_for(2), 1, size_for(2) - 1),
+            "悬空指针不占池里的凭据，所以只剩 1 条真被占着"
+        );
+        assert_eq!(d.used + d.free, d.size, "used + free 必须恒等于 size");
     }
 
     /// `assign` 幂等：已持凭据的用户再分一次拿回原来那条，旧凭据不许被静默孤立

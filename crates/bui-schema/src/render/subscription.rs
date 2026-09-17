@@ -165,8 +165,10 @@ fn dial_host<'a>(host: &'a str, dial_ip: &'a str) -> &'a str {
     }
 }
 
+/// 空串既不是域名也不是 IP：**零节点用户**（见 [`singbox`]）的 `host` 就是空串，当成域名
+/// 会渲出 `dns.rules[0].domain: [""]`，而 sing-box 拒绝空 item ⇒ 整份配置加载失败。
 fn host_is_domain(host: &str) -> bool {
-    host.parse::<std::net::Ipv4Addr>().is_err()
+    !host.is_empty() && host.parse::<std::net::Ipv4Addr>().is_err()
 }
 
 fn singbox_outbound(node: &Node, dial: &str) -> Value {
@@ -239,6 +241,14 @@ fn urltest(tag: &str, outbounds: &[&str]) -> Value {
 ///
 /// `dial_ip` 是服务器域名对应的公网 IPv4（`State.node.public_ip`）：出站按它直连、
 /// DNS 段同时下发 predefined 应答防 GFW 投毒 bootstrap。为空则退回用域名拨号。
+///
+/// **零节点守卫**：`nodes` 可以是空的 —— 只有住宅 HY2 权益、而凭据池耗尽
+/// （`hy2pool::MigrateReport::unassigned > 0`）或建完用户到下一轮收敛之间那一瞬，
+/// [`nodes_for`](crate::nodes::nodes_for) 一个节点都不发。此时绝不能渲出空 `urltest`
+/// （sing-box：`outbounds: []` ⇒ 加载失败），也不能让 `dns.servers[remote].detour` 与
+/// `route.final` 指向它 —— 那样该用户的 `/api/subscription/<token>` **整份不可用**，
+/// 而不只是少一个节点。零节点一律退成全部走 `direct`：配置仍然加载得起来，客户端起得来、
+/// 只是没有代理出口，下一轮收敛补上凭据后重新拉一次订阅即可。
 pub fn singbox(nodes: &[Node], split: &SplitRules, dial_ip: &str) -> Value {
     let host = nodes.first().map(|n| n.host.as_str()).unwrap_or("");
     let dial = dial_host(host, dial_ip);
@@ -267,7 +277,11 @@ pub fn singbox(nodes: &[Node], split: &SplitRules, dial_ip: &str) -> Value {
     // 只有同时有直连池和住宅池才做 global / 域名分流；单池直接 final
     let primary;
     let route_final;
-    if !direct_tags.is_empty() && !resi_tags.is_empty() {
+    if direct_tags.is_empty() && resi_tags.is_empty() {
+        // 零节点守卫（见函数文档）：不产空 `urltest`，DNS 与 route 都指向恒存在的 `direct`
+        primary = "direct";
+        route_final = "direct";
+    } else if !direct_tags.is_empty() && !resi_tags.is_empty() {
         outbounds.push(urltest("direct-pool", &direct_tags));
         outbounds.push(urltest("residential-pool", &resi_tags));
         primary = "direct-pool";
@@ -489,6 +503,11 @@ pub fn clash(nodes: &[Node], username: &str, split: &SplitRules) -> String {
     let mut select: Vec<String> = members.clone();
     select.extend(direct_names.iter().cloned());
     select.extend(resi_names.iter().cloned());
+    // 零节点守卫，与 [`singbox`] 同一个理由：空的 `select` 组 + 指向不存在的组的 `MATCH`
+    // 会让 mihomo 拒绝整份配置，而不只是少一个节点。
+    if select.is_empty() {
+        select.push("DIRECT".into());
+    }
     groups.push(ymap(vec![
         ("name", y("PROXY")),
         ("type", y("select")),
@@ -502,10 +521,12 @@ pub fn clash(nodes: &[Node], username: &str, split: &SplitRules) -> String {
         } else {
             "直连自动"
         }
-    } else if direct_names.is_empty() {
+    } else if !resi_names.is_empty() {
         "住宅自动"
-    } else {
+    } else if !direct_names.is_empty() {
         "直连自动"
+    } else {
+        "DIRECT" // 零节点：两个自动组都不存在，MATCH 只能指内置出站
     };
 
     let mut rules = vec![

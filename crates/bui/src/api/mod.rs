@@ -559,6 +559,118 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap(), Event::StateChanged("obfs"));
     }
 
+    /// `POST /api/system/hy2-resi-compat`（T14 第六波复核收口）：**30 天门禁在端点这一侧
+    /// 同样成立**，判据与 CLI 是同一个函数（`commands::config::check_compat_takedown`）。
+    ///
+    /// 为什么端点也必须拦：`runtime.json` 的累计命中守护进程自己就持有（`AppState.runtime`），
+    /// 「只有本地读得到」不成立；不拦的话面板、curl、任何走 socket / HTTP 的运维脚本都能
+    /// 零检查关掉兼容段 —— 而那正是 2026-09-17 裁决要防的那件事（把仍在用的兼容段关掉，
+    /// 全部还没刷订阅的 4.0 住宅用户当场断联）。
+    #[tokio::test]
+    async fn the_compat_endpoint_enforces_the_same_thirty_day_gate_as_the_cli() {
+        let (app, d, _h, rt, bus) = app_with_bus().await;
+        let token = login(&app).await;
+        let mut rx = bus.subscribe();
+        let read = || -> bool {
+            let bytes = std::fs::read(d.path().join("state.json")).unwrap();
+            serde_json::from_slice::<bui_schema::model::State>(&bytes)
+                .unwrap()
+                .system
+                .hy2_resi_compat_ports
+        };
+        let switch = |value: &str, force: bool| {
+            let token = token.clone();
+            let app = app.clone();
+            let body = serde_json::json!({"value": value, "force": force});
+            async move {
+                let res = app
+                    .oneshot(with_token(
+                        post("/api/system/hy2-resi-compat", body),
+                        &token,
+                    ))
+                    .await
+                    .unwrap();
+                (res.status(), json(res).await)
+            }
+        };
+        assert!(read(), "sample_state 默认开着兼容段");
+
+        // ① 命中统计未就绪 ⇒ fail-closed，一个字节都不写、也不发事件
+        let (code, body) = switch("off", false).await;
+        assert_eq!(code, StatusCode::FORBIDDEN);
+        let why = body["error"].as_str().unwrap().to_string();
+        assert!(why.contains("命中统计未就绪"), "{why}");
+        assert!(read(), "被拒的那次不许改期望态");
+        assert!(rx.try_recv().is_err(), "也不发事件");
+
+        // ② 命中过 ⇒ 拒，且把人判断需要的三个值 + 区间都回给调用方
+        //    （区间由 `nft::compat_range(&ports)` 算，不是写死的字面量）
+        rt.update(|r| {
+            r.extra.insert(
+                crate::commands::nft::COMPAT_HITS_KEY.into(),
+                serde_json::json!({
+                    "total": 12, "seen": 12,
+                    "last_hit_at": "2026-09-10T10:00:00Z",
+                    "since": "2026-08-01T00:00:00Z",
+                }),
+            );
+        })
+        .await;
+        let (code, body) = switch("off", false).await;
+        assert_eq!(code, StatusCode::FORBIDDEN);
+        let why = body["error"].as_str().unwrap().to_string();
+        for must in [
+            "累计命中 12 次",
+            "最近一次 2026-09-10T10:00:00Z",
+            "起算时刻 2026-08-01T00:00:00Z",
+            "40001-40007",
+            "当场断联",
+            "--force",
+        ] {
+            assert!(why.contains(must), "回包缺「{must}」：{why}");
+        }
+        assert!(read(), "被拒的那次不许改期望态");
+        assert!(rx.try_recv().is_err());
+
+        // ③ 开兼容段从不过门禁（危险方向只有关）：已经是 on ⇒ 200 + changed=false
+        let (code, body) = switch("on", false).await;
+        assert_eq!(
+            (code, body["changed"].clone()),
+            (StatusCode::OK, false.into())
+        );
+
+        // ④ 显式 force ⇒ 放行并落盘
+        let (code, body) = switch("off", true).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(
+            (body["enabled"].clone(), body["changed"].clone()),
+            (false.into(), true.into())
+        );
+        assert!(!read());
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Event::StateChanged("hy2-resi-compat")
+        );
+
+        // ⑤ 一次都没命中 + 静默满 30 天 ⇒ 不带 force 也放行（开回来同样不用 force）
+        let (code, _) = switch("on", false).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Event::StateChanged("hy2-resi-compat")
+        );
+        rt.update(|r| {
+            r.extra.insert(
+                crate::commands::nft::COMPAT_HITS_KEY.into(),
+                serde_json::json!({"total": 0, "seen": 0, "since": "2026-08-01T00:00:00Z"}),
+            );
+        })
+        .await;
+        let (code, body) = switch("off", false).await;
+        assert_eq!(code, StatusCode::OK, "{body}");
+        assert!(!read());
+    }
+
     #[tokio::test]
     async fn service_action_rejects_unmanaged_units() {
         let (app, _d, host) = app().await;

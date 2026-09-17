@@ -417,6 +417,12 @@ mod tests {
     /// 漏了 rename 的后果与 `subToken` 那条同款且更隐蔽：投影发出 `hy2_resi_gate`，
     /// 前端 `x.hy2ResiGate` 对每个用户都是 `undefined` ⇒ 到期 / 封禁用户的「拒绝」标记
     /// 整个消失（看上去人人正常），而 fmt / clippy / 全量测试照样全绿。
+    ///
+    /// 断言**咬住每一个出现点**，不是「文件里某处出现过」：`app.js` 里它出现 3 次
+    /// （`_resiGateHint` 取门位 + 用户行的「拒绝」/「未分配」两个徽标）。只断言
+    /// `contains` 时，把 `_resiGateHint` 那一处改回 `x.hy2_resi_gate` 仍然全绿 —— 而
+    /// 后果是每个用户的槽位列只剩端口一行，spec §6 那段「客户端仍显示已连接、请求全被拒」
+    /// 整段消失。这是第六波复核用变异（M40）抓出来的假绿。
     #[test]
     fn the_panel_user_gate_key_is_exactly_what_app_js_reads() {
         let users_rs = include_str!("users.rs");
@@ -426,9 +432,31 @@ mod tests {
             "PanelUser 的 hy2_resi_gate 必须带 #[serde(rename = \"hy2ResiGate\")]"
         );
         let js = String::from_utf8(web_file("app.js").unwrap()).unwrap();
+        assert_eq!(
+            js.matches("x.hy2ResiGate").count(),
+            3,
+            "app.js 读 hy2ResiGate 的地方不再是 3 处（门位提示 + 两个徽标）：\
+             改了投影那一侧要一起改；确实增删了读取点就同步改这条契约"
+        );
+        // 逐处上下文：光数个数会被「三处都挪到徽标里」骗过
+        let hint = js
+            .split_once("function _resiGateHint(")
+            .expect("_resiGateHint 没了")
+            .1;
+        let body = hint.split_once("\n}").expect("_resiGateHint 没收尾").0;
         assert!(
-            js.contains("x.hy2ResiGate"),
-            "app.js 读的 key 变了，投影那一侧要一起改"
+            body.contains("x.hy2ResiGate"),
+            "_resiGateHint 不再读门位 ⇒ 槽位列只剩端口一行、spec §6 的语义整段消失：{body}"
+        );
+        // 切在**调用点**（`function _resiGateHint(x)` 这个定义头也含同样的子串）
+        let row = js
+            .split_once("esc(_resiGateHint(x))")
+            .expect("用户行不再挂门位提示")
+            .1;
+        assert_eq!(
+            row.matches("x.hy2ResiGate").count(),
+            2,
+            "用户行的「拒绝」/「未分配」两个徽标各读一次"
         );
     }
 

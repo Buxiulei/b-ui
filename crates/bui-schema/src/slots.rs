@@ -651,8 +651,25 @@ mod tests {
     /// 端口与区间完全相同、与槽位无关 —— 名单机制随之退役。
     ///
     /// 这条用例是那次退役的回归锁：只要哪天端口又跟槽序号挂上钩，它就红。
+    ///
+    /// 每条腿都**先断言槽位真的动过**（4.0.x 算端口用的那两个输入：每个用户的槽序号 +
+    /// 槽位空间宽度）—— 否则某天 `sync_slots` / `rebalance` 退化成 no-op，「订阅没变」
+    /// 会在「什么都没变」的情况下照旧全绿（第六波复核点名）。
+    /// `assign` 那条路在 `bui` 侧覆盖（`residential::slots` 与 `residential::upstream`
+    /// 各有一条带「他确实换了槽」断言的用例），所以这里是四条腿。
     #[test]
     fn changing_the_pool_never_moves_anybody_s_subscription() {
+        /// 4.0.x 算端口/区间的两个输入：每人的槽序号 + 槽位空间宽度（`hop_slice` 的分母）。
+        fn port_inputs(s: &State) -> (Vec<(String, u16)>, u16) {
+            let mut per_user: Vec<(String, u16)> = s
+                .users
+                .iter()
+                .map(|u| (u.username.clone(), index_of_user(u, &s.residential)))
+                .collect();
+            per_user.sort();
+            (per_user, slot_span(&s.residential))
+        }
+
         let mut s = state(3, 5);
         migrate_unassigned(&mut s);
         crate::hy2pool::migrate(&mut s, time::OffsetDateTime::now_utc());
@@ -662,21 +679,36 @@ mod tests {
             before.iter().all(|x| *x == (40000, Some((41000, 50000)))),
             "4.1：端口与整段跳跃对每个用户都一样，{before:?}"
         );
+        // rebalance 在已经均匀的池上是 no-op，那样这条腿什么都没验 —— 先把所有人压到槽 0
+        let squeezed = {
+            let mut r = s.clone();
+            let slot0 = sorted(&r.residential)[0].upstream_id;
+            for u in r.users.iter_mut() {
+                u.entitlements.residential.as_mut().unwrap().slot_id = Some(slot0);
+            }
+            r
+        };
+        let rebalanced = {
+            let mut r = squeezed.clone();
+            assert!(rebalance(&mut r) > 0, "rebalance 没搬人，这条腿什么都没验");
+            r
+        };
         // 删 0 号槽（不变量 3 会把槽 1 搬到 0）、删顶槽、加一条上游、rebalance —— 四条
         // 改槽路径挨个来一遍，订阅里那个节点一个字节都不许动
-        for after in [
-            after_remove(&s, Uuid::from_u128(1)),
-            after_remove(&s, Uuid::from_u128(3)),
-            after_add(&s, 3),
-            {
-                let mut r = s.clone();
-                rebalance(&mut r);
-                r
-            },
+        for (path, from, after) in [
+            ("删 0 号槽", &s, after_remove(&s, Uuid::from_u128(1))),
+            ("删顶槽", &s, after_remove(&s, Uuid::from_u128(3))),
+            ("加一条上游", &s, after_add(&s, 3)),
+            ("rebalance", &squeezed, rebalanced),
         ] {
+            assert_ne!(
+                port_inputs(&after),
+                port_inputs(from),
+                "{path}：槽序号与槽位空间都没变 —— 这条腿证明不了「改槽不动订阅」"
+            );
             let now: Vec<(u16, Option<(u16, u16)>)> =
                 (1..=5).map(|n| node_of(&after, &format!("u{n}"))).collect();
-            assert_eq!(now, before, "改槽动了订阅里的住宅 HY2 节点");
+            assert_eq!(now, before, "{path}：改槽动了订阅里的住宅 HY2 节点");
         }
     }
 

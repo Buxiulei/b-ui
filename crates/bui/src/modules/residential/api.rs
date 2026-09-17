@@ -363,8 +363,12 @@ pub fn slot_rows(s: &SchemaState, r: &state::ResiRuntime) -> Vec<SlotRow> {
                 back_rounds: sr.back_rounds,
                 back_rounds_needed: crate::modules::residential::SLOT_BACK_ROUNDS,
                 relay_port: res.relay_port,
-                hy2_port: res.hy2_port,
-                hop: res.hop,
+                // 4.1：住宅 HY2 只有**一个**监听端口、整段跳跃由 `table inet bui` 送进去，
+                // 与槽序号无关（`nodes::nodes_for` 就是这么发订阅的）。这两个值必须与
+                // `panel::users` 那一列同源，否则同一个面板会自相矛盾；关掉兼容段之后
+                // 4.0.x 的 `40000+槽序号` 已经不通，照旧显示它等于把排障指向错方向。
+                hy2_port: s.node.ports.hy2_resi,
+                hop: s.node.ports.hy2_resi_hop,
                 user_count: users.len(),
                 users,
                 metrics: metrics_of(&h(sl.upstream_id)),
@@ -415,8 +419,11 @@ pub struct SlotRow {
     /// 借用中「本槽已连续恢复几轮」与门槛
     pub back_rounds: u32,
     pub back_rounds_needed: u32,
-    /// 这一槽的端口资源（面板据此告诉运维该放行什么、订阅里是哪个端口）
+    /// 这一槽自己的中继 socks 入站（`2080 + 槽序号`，面板据此告诉运维该放行什么）
     pub relay_port: u16,
+    /// 住宅 HY2 的监听端口与整段跳跃区间。**4.1 起与槽序号无关**（一个 sing-box 入站 +
+    /// `table inet bui` 把整段 REDIRECT 进去），所以每一行都是同一对值，与用户列表那一列
+    /// 和三种订阅逐字一致。4.0.x 这里曾是 `40000+槽序号` 与「整段按槽数等分的第 i 片」。
     pub hy2_port: u16,
     pub hop: (u16, u16),
     /// 落在这一槽上的用户（用户名，按名字升序）与数量
@@ -999,14 +1006,13 @@ async fn get_pool(State(app): State<AppState>) -> ApiResult {
 }
 
 /// [`get_pool`] 的纯函数本体。
+///
+/// `size` / `used` / `free` 走 `hy2pool::usage` 这**一处**口径（`bui status` 的
+/// 「住宅 HY2 凭据池」那一行同源）—— 两套算法会在有悬空指针时让两边的低空闲告警互相打脸。
 fn pool_view(s: &bui_schema::model::State) -> serde_json::Value {
-    let used: std::collections::BTreeSet<&str> = s
-        .users
-        .iter()
-        .filter_map(|u| u.credentials.hy2_resi_cred.as_deref())
-        .collect();
     // 持有人按用户名升序（输出要确定性）；指向池里已不存在的 id 的用户也算持有人 ——
-    // 他确实占着一个指针，`migrate_hy2_pool_on_start` 下次启动才清
+    // 他确实占着一个指针，`migrate_hy2_pool_on_start` 下次启动才清（但**不计已用**，
+    // 那条凭据压根不在池里）
     let mut holders: Vec<&str> = s
         .users
         .iter()
@@ -1015,11 +1021,11 @@ fn pool_view(s: &bui_schema::model::State) -> serde_json::Value {
         .collect();
     holders.sort_unstable();
     let pool = &s.residential.hy2_pool;
-    let owned: std::collections::BTreeSet<String> = used.iter().map(|x| (*x).to_string()).collect();
+    let u = bui_schema::hy2pool::usage(s);
     serde_json::json!({
-        "size": pool.creds.len(),
-        "used": pool.creds.iter().filter(|c| owned.contains(&c.id)).count(),
-        "free": bui_schema::hy2pool::free_count(pool, &owned),
+        "size": u.size,
+        "used": u.used,
+        "free": u.free,
         "generation": pool.generation,
         "target": bui_schema::hy2pool::size_for(bui_schema::hy2pool::resi_hy2_users(s)),
         "holders": holders,
@@ -2801,9 +2807,42 @@ mod tests {
         assert_eq!(rows[0]["index"], 0);
         assert_eq!(rows[0]["selector"], "slot-0-pool");
         assert_eq!(rows[0]["upstream_tag"], "resi-1");
-        assert_eq!(rows[1]["relay_port"], 2081);
-        assert_eq!(rows[1]["hy2_port"], 40001);
-        assert_eq!(rows[1]["hop"], serde_json::json!([44000, 46999]));
+        assert_eq!(rows[1]["relay_port"], 2081, "中继入站仍是 2080+槽序号");
+        // 4.1：住宅 HY2 端口与整段跳跃**与槽序号无关**，每一行都是期望态里那一对
+        // （4.0.x 这里是 40001 + 按槽数等分的第 1 片 [44000,46999]）。槽位表与用户列表
+        // 必须同源，否则同一个面板上两处数字自相矛盾 —— 而槽位列的 tooltip 说的正是
+        // 「用户在订阅里拿到的端口与区间」。
+        let ports = h.ctx.store.read().await.node.ports.clone();
+        for (i, r) in rows.iter().enumerate() {
+            assert_eq!(r["hy2_port"], ports.hy2_resi, "槽 {i} 的住宅 HY2 端口");
+            assert_eq!(
+                r["hop"],
+                serde_json::json!([ports.hy2_resi_hop.0, ports.hy2_resi_hop.1]),
+                "槽 {i} 的跳跃区间"
+            );
+        }
+        // 与订阅里那个节点逐字相同（真源只有 `nodes::nodes_for` 一处）：
+        // 先把凭据池补上，没凭据的用户压根不发住宅 HY2 节点（T7）
+        let now = crate::sys::Host::now(h.ctx.host.as_ref());
+        h.ctx
+            .store
+            .update(|s| {
+                bui_schema::hy2pool::migrate(s, now);
+            })
+            .await
+            .unwrap();
+        let s = h.ctx.store.read().await;
+        let node = bui_schema::nodes::nodes_for(&s.users[0], &s.node, &s.residential)
+            .into_iter()
+            .find(|n| n.kind == bui_schema::nodes::NodeKind::Hy2Residential)
+            .expect("alice 订阅里没有住宅 HY2 节点");
+        drop(s);
+        assert_eq!(rows[1]["hy2_port"], node.port, "槽位表与订阅不一致");
+        assert_eq!(
+            rows[1]["hop"],
+            serde_json::json!([node.hop.unwrap().0, node.hop.unwrap().1]),
+            "槽位表与订阅不一致"
+        );
         assert_eq!(rows[1]["user_count"], 1);
         assert_eq!(
             rows[1]["users"],
@@ -3027,6 +3066,37 @@ mod tests {
         assert!(
             !body.contains("\"r0") && !body.contains("secret"),
             "回包不许带凭据 id / secret：{body}"
+        );
+
+        // 悬空指针（用户指向池里已不存在的 id，`migrate_hy2_pool_on_start` 下次启动才清）
+        // **不计已用**：三个数与 `bui status` 那一行同源（`hy2pool::usage`），
+        // 否则 `used + free > size`，两处的「空闲不足 20%」门槛会互相打脸。
+        h.ctx
+            .store
+            .update(|s| s.users[0].credentials.hy2_resi_cred = Some("r999".into()))
+            .await
+            .unwrap();
+        let (_, v) = call(&h.app, "GET", "/api/residential/pool", None).await;
+        assert_eq!(
+            (v["size"].clone(), v["used"].clone(), v["free"].clone()),
+            (32.into(), 0.into(), 32.into()),
+            "悬空指针不占池里的凭据"
+        );
+        assert_eq!(
+            v["holders"],
+            serde_json::json!(["alice"]),
+            "他仍然算持有人（确实攥着一个指针），只是不算已用"
+        );
+        let s = h.ctx.store.read().await;
+        let u = bui_schema::hy2pool::usage(&s);
+        assert_eq!(
+            (v["size"].as_u64(), v["used"].as_u64(), v["free"].as_u64()),
+            (
+                Some(u.size as u64),
+                Some(u.used as u64),
+                Some(u.free as u64)
+            ),
+            "端点与 `hy2pool::usage` 必须是同一份口径"
         );
     }
 

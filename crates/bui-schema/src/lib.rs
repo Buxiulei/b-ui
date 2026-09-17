@@ -57,6 +57,9 @@
 //!   `assign` 是墙钟便利版，只给 bui-schema 自己的用例用。
 //! - [`hy2pool::regenerate_idle_secrets`]：重写配置时顺带重随机全部空闲凭据的 `secret`。
 //! - [`hy2pool::free_count`] / [`hy2pool::LOW_FREE_RATIO`]：空闲率与 20% 告警门槛。
+//! - [`hy2pool::usage`] → [`hy2pool::PoolUsage`]：`bui status` 与
+//!   `GET /api/residential/pool` 的**唯一**用量口径（`used + free == size`，
+//!   悬空指针不计已用）。
 //! - [`hy2pool::migrate`]：v4 → 4.1 一次性分配（迁移用户 `name = 用户名`、
 //!   `secret = hy2_password` 的副本 ⇒ 订阅逐字不变），幂等；返回
 //!   [`hy2pool::MigrateReport`]（`changed` / `unassigned`，后者非零时调用方打 Error 事件）。

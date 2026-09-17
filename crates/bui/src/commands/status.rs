@@ -168,6 +168,10 @@ pub fn format_legacy_sub(until: Option<&str>, now: OffsetDateTime) -> String {
 /// 空闲耗尽会把建用户 / 轮换推到「当场扩容 ⇒ 重写 `hy2-residential.json` ⇒ 重启
 /// `hysteria-residential`」那条路上（全体住宅 HY2 会话重连一次），所以已用 / 容量是运维
 /// 要盯的第一个数。「第 N 代」= 池被重写过几次，日志与事件按它指称。
+///
+/// `used` / `size` **只能来自 [`hy2pool::usage`](bui_schema::hy2pool::usage)**
+/// （`GET /api/residential/pool` 同源）：自己另算一套会把悬空指针也计进已用，于是这一行的
+/// 「空闲不足 20%」比 `bui residential pool status` 更早喊，同一台机器上两处互相打脸。
 pub fn format_hy2_pool((used, size, generation): (usize, usize, u64)) -> String {
     let low =
         size > 0 && (used as f64) > (1.0 - bui_schema::hy2pool::LOW_FREE_RATIO) * (size as f64);
@@ -231,10 +235,15 @@ pub fn format_gate_replay(residential: Option<&serde_json::Value>) -> String {
         .into_iter()
         .flatten()
         .filter_map(|x| x.as_str())
-        .find(|s| s.starts_with(crate::modules::panel::gates::GATE_REPLAY_FAIL_ALERT));
+        // **剥掉告警自己的前缀**：告警原文是「住宅 HY2 门位重放失败（<原因>），门留在
+        // deny，60 秒安全网继续收敛」，整条塞进括号会套两层前缀（「门位重放：失败（住宅
+        // HY2 门位重放失败（…）…）」）。
+        .find_map(|s| s.strip_prefix(crate::modules::panel::gates::GATE_REPLAY_FAIL_ALERT));
     match fail {
         None => "门位重放：正常".to_string(),
-        Some(why) => format!("门位重放：失败（{why}）"),
+        // 剩下的部分正好接在「失败」后面 ⇒「失败（<原因>），门留在 deny，…」，
+        // 与计划 / CHANGELOG 的写法一致，那句下一步也不丢。
+        Some(rest) => format!("门位重放：失败{rest}"),
     }
 }
 
@@ -281,21 +290,15 @@ pub async fn run_with(
         match Store::open(crate::paths::state_file(&paths)).await {
             Ok(store) => {
                 let s = store.read().await;
-                let used = s
-                    .users
-                    .iter()
-                    .filter_map(|u| u.credentials.hy2_resi_cred.as_deref())
-                    .collect::<std::collections::BTreeSet<_>>()
-                    .len();
+                // 已用 / 容量走 `hy2pool::usage` 这**一处**口径（`GET /api/residential/pool`
+                // 同源）：按「有指针的用户数」另算一套会把悬空指针也计进已用，于是这一行的
+                // 「空闲不足 20%」比 `bui residential pool status` 更早喊，两处互相打脸。
+                let u = bui_schema::hy2pool::usage(s.as_ref());
                 let compat = s.system.hy2_resi_compat_ports;
                 (
                     s.system.hy2_auth,
                     s.system.legacy_sub_until.clone(),
-                    (
-                        used,
-                        s.residential.hy2_pool.creds.len(),
-                        s.residential.hy2_pool.generation,
-                    ),
+                    (u.used, u.size, s.residential.hy2_pool.generation),
                     bui_schema::render::nft::rule_count(compat),
                     compat.then(|| bui_schema::render::nft::compat_range(&s.node.ports)),
                 )
@@ -535,7 +538,17 @@ mod tests {
         let mut h = sample();
         h.residential = Some(serde_json::json!({ "alerts": [why.clone()] }));
         let t = format_status(&h, Hy2Auth::Http, None, &extra_with_pool(), t0());
-        assert!(t.contains(&format!("门位重放：失败（{why}）")), "{t}");
+        // 告警自己的前缀要被剥掉：整条塞进括号会变成「失败（住宅 HY2 门位重放失败（…）…）」
+        assert!(
+            t.contains("门位重放：失败（Clash API 未就绪），门留在 deny，60 秒安全网继续收敛"),
+            "{t}"
+        );
+        assert_eq!(
+            t.matches(crate::modules::panel::gates::GATE_REPLAY_FAIL_ALERT)
+                .count(),
+            0,
+            "「住宅 HY2 门位重放失败」这个前缀不许再出现一次（套两层）：{t}"
+        );
         assert!(!t.contains("门位重放：正常"), "{t}");
         // 别的住宅告警不算门位重放失败
         h.residential = Some(serde_json::json!({ "alerts": ["上游 407 凭据失效"] }));

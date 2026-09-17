@@ -222,6 +222,9 @@ async fn switch_obfs(value: &str, paths: &Paths, socket: &Path) -> Result<String
 ///
 /// `None`（统计还没就绪）一律返回 `false` —— **fail-closed**，误判方向是危险的那一侧。
 ///
+/// 别直接拿它当门禁：走 [`check_compat_takedown`]，那是 CLI 与
+/// `POST /api/system/hy2-resi-compat` **共用的唯一一处**判据（含 `on` / `--force` 的旁路）。
+///
 /// **T12 依赖**：这三个值由 `modules::watchdog` 每轮采样写进 `runtime.json`
 /// （`CompatHits`），T12 合并之前这里恒为 `None` ⇒ `off` 一律要 `--force`。T12 合并后把
 /// 本函数体换成 `hits.is_some_and(|h| h.idle_for_takedown(now))` 即可（判据一处、两边同源）。
@@ -243,8 +246,32 @@ pub fn compat_idle_for_takedown(
 /// 兼容段自动判闲置要静默多少天（spec §2.4：「连续 30 天为 0」）。
 pub const COMPAT_IDLE_DAYS: i64 = 30;
 
+/// 兼容段下线的**完整门禁，CLI 与 `POST /api/system/hy2-resi-compat` 共用这一处**。
+///
+/// 放行 ⇒ `Ok(())`；拒绝 ⇒ `Err(那段要打给人看的话)`（CLI `bail!` 它，端点 403 回它）。
+/// 两条路都必须过：面板 / curl / 运维脚本走端点绕开 CLI 也关不掉一个还在被用的兼容段
+/// ——「把仍在用的兼容段关掉，全部还没刷订阅的 4.0 住宅用户当场断联」正是这条裁决要防的事。
+///
+/// 开兼容段（`on`）与显式 `--force` 都直接放行：门禁只拦「不带 force 的自动下线」。
+pub fn check_compat_takedown(
+    on: bool,
+    force: bool,
+    hits: Option<&crate::commands::nft::CompatHits>,
+    compat: (u16, u16),
+    now: time::OffsetDateTime,
+) -> Result<(), String> {
+    if on || force || compat_idle_for_takedown(hits, now) {
+        return Ok(());
+    }
+    Err(compat_refusal(hits, compat))
+}
+
 /// 拒绝下线时那段话：把人判断需要的三个值**全部**打出来（spec §2.4）。
-fn compat_refusal(hits: Option<&crate::commands::nft::CompatHits>) -> String {
+///
+/// `compat` 由 [`nft::compat_range`](bui_schema::render::nft::compat_range) 从期望态算出，
+/// **不写字面量**：`ports.hy2_resi` 是 `NodeParams` 里的字段，一旦它不是 40000，这段话
+/// 就会对着人说错区间 —— 而它的全部作用就是让人凭它判断要不要 `--force`。
+fn compat_refusal(hits: Option<&crate::commands::nft::CompatHits>, (a, b): (u16, u16)) -> String {
     let detail = match hits {
         Some(h) => format!(
             "累计命中 {} 次；最近一次 {}；起算时刻 {}",
@@ -255,13 +282,18 @@ fn compat_refusal(hits: Option<&crate::commands::nft::CompatHits>) -> String {
         None => "命中统计未就绪（守护进程还没采过一轮）".to_string(),
     };
     format!(
-        "拒绝关闭住宅 HY2 的 4.0 兼容段：{detail}。\n         关掉它 = `inet bui` 删掉 {} 那两条 REDIRECT 规则 + 防火墙收口，\n         **全部还没刷订阅的 4.0 住宅用户当场断联**（他们的订阅里是裸 `40000+槽序号`）。\n         判据是连续 {COMPAT_IDLE_DAYS} 天累计命中为 0；确认无人在用请加 --force。",
-        "40001-40007"
+        "拒绝关闭住宅 HY2 的 4.0 兼容段：{detail}。\n         关掉它 = `inet bui` 删掉 {a}-{b} 那两条 REDIRECT 规则 + 防火墙收口，\n         **全部还没刷订阅的 4.0 住宅用户当场断联**（他们的订阅里是裸 `40000+槽序号`）。\n         判据是连续 {COMPAT_IDLE_DAYS} 天累计命中为 0；确认无人在用请加 --force。"
     )
 }
 
-/// 改完之后的那段说明（状态 + 下一步）。
-fn compat_notice(on: bool, changed: bool, daemon: bool, forced: bool) -> String {
+/// 改完之后的那段说明（状态 + 下一步）。`compat` 的来源与理由同 [`compat_refusal`]。
+fn compat_notice(
+    on: bool,
+    changed: bool,
+    daemon: bool,
+    forced: bool,
+    (a, b): (u16, u16),
+) -> String {
     if !changed {
         return if on {
             "住宅 HY2 的 4.0 兼容段已经是开启状态，无需改动。".into()
@@ -270,9 +302,9 @@ fn compat_notice(on: bool, changed: bool, daemon: bool, forced: bool) -> String 
         };
     }
     let head = if on {
-        "住宅 HY2 的 4.0 兼容段已开启（40001-40007 一并 REDIRECT 到单一监听端口）。"
+        format!("住宅 HY2 的 4.0 兼容段已开启（{a}-{b} 一并 REDIRECT 到单一监听端口）。")
     } else {
-        "住宅 HY2 的 4.0 兼容段已关闭（`inet bui` 只剩两条规则，防火墙同步收口）。"
+        "住宅 HY2 的 4.0 兼容段已关闭（`inet bui` 只剩两条规则，防火墙同步收口）。".to_string()
     };
     let warn = if !on && forced {
         "\n**这是 --force 下线**：还在用裸 `40000+槽序号` 订阅的 4.0 用户会立刻断联，让他们重新获取一次订阅。"
@@ -320,8 +352,9 @@ pub async fn run_hy2_resi_compat_with(
 
 /// [`run_hy2_resi_compat_with`] 的本体：返回要打印的那段话（单元测试直接断言它）。
 ///
-/// 门禁在**这一处**（不在守护进程那一侧）：`runtime.json` 本地就读得到，而且要在改任何
-/// 东西之前就拒掉。
+/// 门禁在这里**先**跑一遍（`runtime.json` 本地就读得到，而且要在改任何东西之前就拒掉，
+/// 好给出带三个值的那段话），守护进程那一侧的端点**再**跑同一个
+/// [`check_compat_takedown`] —— 不绕开 CLI 也关不掉（`force` 随请求一起送过去）。
 async fn switch_hy2_resi_compat(
     value: &str,
     force: bool,
@@ -335,8 +368,12 @@ async fn switch_hy2_resi_compat(
             .read()
             .await,
     );
-    if !on && !force && !compat_idle_for_takedown(hits.as_ref(), now) {
-        anyhow::bail!("{}", compat_refusal(hits.as_ref()));
+    // 兼容段区间从期望态算，不写字面量（理由见 `compat_refusal`）。守护进程在跑时也只
+    // **读**这份文件，写盘仍旧只经端点。
+    let store = Store::open(crate::paths::state_file(paths)).await?;
+    let compat = bui_schema::render::nft::compat_range(&store.read().await.node.ports);
+    if let Err(why) = check_compat_takedown(on, force, hits.as_ref(), compat, now) {
+        anyhow::bail!("{why}");
     }
     let client = crate::ipc::Client::new(socket);
     if client.available().await {
@@ -344,23 +381,25 @@ async fn switch_hy2_resi_compat(
             .request(
                 "POST",
                 "/api/system/hy2-resi-compat",
-                Some(serde_json::json!({"value": if on { "on" } else { "off" }})),
+                Some(serde_json::json!({
+                    "value": if on { "on" } else { "off" },
+                    "force": force,
+                })),
             )
             .await?;
         if !(200..300).contains(&status) {
             anyhow::bail!("守护进程拒绝了这次修改（HTTP {status}）：{body}");
         }
         let changed = body["changed"].as_bool().unwrap_or(true);
-        return Ok(compat_notice(on, changed, true, force));
+        return Ok(compat_notice(on, changed, true, force, compat));
     }
-    let store = Store::open(crate::paths::state_file(paths)).await?;
     if store.read().await.system.hy2_resi_compat_ports == on {
-        return Ok(compat_notice(on, false, false, force));
+        return Ok(compat_notice(on, false, false, force, compat));
     }
     store
         .update(|s| s.system.hy2_resi_compat_ports = on)
         .await?;
-    Ok(compat_notice(on, true, false, force))
+    Ok(compat_notice(on, true, false, force, compat))
 }
 
 #[cfg(test)]
@@ -425,6 +464,43 @@ mod tests {
             t0()
         ));
         assert_eq!(COMPAT_IDLE_DAYS, 30, "spec §2.4：连续 30 天为 0");
+
+        // 门禁本体（CLI 与 `POST /api/system/hy2-resi-compat` 共用的这一处）：
+        // 开兼容段与显式 --force 直接放行，其余按上面的判据
+        let r = (40001, 40007);
+        assert!(
+            check_compat_takedown(true, false, None, r, t0()).is_ok(),
+            "开兼容段不过门禁"
+        );
+        assert!(
+            check_compat_takedown(false, true, None, r, t0()).is_ok(),
+            "--force 放行"
+        );
+        assert!(check_compat_takedown(false, false, Some(&idle), r, t0()).is_ok());
+        assert!(check_compat_takedown(false, false, None, r, t0()).is_err());
+        assert!(check_compat_takedown(false, false, Some(&hit_long_ago), r, t0()).is_err());
+    }
+
+    /// 兼容段区间**不许写字面量**：它是 `ports.hy2_resi` 的函数（改端口 / 多机不同配置都会
+    /// 漂），而拒绝话术与开关说明正是运维据以判断「要不要 --force」的文字 —— 打错区间等于
+    /// 把人指向错误的端口（第六波复核点名）。
+    #[test]
+    fn the_compat_texts_take_the_range_from_the_desired_state() {
+        let mut ports = sample_state().node.ports;
+        assert_eq!(
+            bui_schema::render::nft::compat_range(&ports),
+            (40001, 40007),
+            "默认端口下的区间"
+        );
+        ports.hy2_resi = 41000; // 换了住宅监听端口的机器
+        let range = bui_schema::render::nft::compat_range(&ports);
+        assert_eq!(range, (41001, 41007));
+        let refusal = compat_refusal(None, range);
+        assert!(refusal.contains("41001-41007"), "{refusal}");
+        assert!(!refusal.contains("40001"), "还在打默认区间：{refusal}");
+        let notice = compat_notice(true, true, true, false, range);
+        assert!(notice.contains("41001-41007"), "{notice}");
+        assert!(!notice.contains("40001"), "还在打默认区间：{notice}");
     }
 
     /// `bui set hy2-resi-compat off` 在门禁不放行时**必须拒绝并打出三个值**（total /
