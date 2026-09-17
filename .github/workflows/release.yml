@@ -31,6 +31,10 @@ jobs:
       prerelease: ${{ steps.v.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v4
+        # 发布门禁判的是「必需提交是不是 HEAD 的祖先」，默认浅克隆（depth 1）拿不到祖先关系，
+        # 会把门禁误判成「提交在本仓库里找不到」⇒ 必须取全量历史。
+        with:
+          fetch-depth: 0
       - name: dispatch 路径不允许发布
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == false }}
         run: |
@@ -64,6 +68,10 @@ jobs:
             printf 'tag=%s\n' "$TAG"
             printf 'prerelease=%s\n' "$PRERELEASE"
           } >> "$GITHUB_OUTPUT"
+      - name: 发布门禁（4.1.x 起：bui-c 那条改动必须已在 HEAD 里）
+        env:
+          TAG: ${{ steps.v.outputs.tag }}
+        run: bash scripts/release/check-release-gate.sh "$TAG"
       - name: 内核 lock 是否还贴着轨道（只告警，不卡发版）
         run: |
           bash scripts/release/pin-kernels.sh --check \
