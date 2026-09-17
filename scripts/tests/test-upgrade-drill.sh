@@ -279,18 +279,24 @@ reset_env() {
     chmod 755 "$WORK/base/bin/sing-box"
 }
 
-run_to() {  # $1 = --to 的目标版本，$2 = --out 目录
-    bash "$ROOT/scripts/ops/upgrade-drill.sh" --to "$1" \
+run_to() {  # $1 = --to 的目标版本，$2 = --out 目录；$3 起原样追加给演练脚本
+    # 解释器写 `$BASH` 的绝对路径而不是 `bash`：下面「缺 nft」/「缺 ss」两条分支把含该工具的
+    # 目录整段从 PATH 摘掉，而 usr-merge 的发行版上那往往正是 bash 自己所在的目录（本机
+    # `ss` 就在 /usr/bin）⇒ 写 `bash` 会退 127，把守卫用例判成假红
+    "$BASH" "$ROOT/scripts/ops/upgrade-drill.sh" --to "$1" \
         --manifest-url http://127.0.0.1:8000/v4.0.1/manifest.json --users alice,bob \
-        --out "$2" --base "$WORK/base" --bui "$WORK/bin/bui" --api http://127.0.0.1:8080
+        --out "$2" --base "$WORK/base" --bui "$WORK/bin/bui" --api http://127.0.0.1:8080 \
+        "${@:3}"
 }
-run() { run_to 4.0.1 "$1"; }
-# 「缺 nft」那条分支不能靠「白名单目录里没有 nft」这个外部事实（`/usr/sbin` 合并进 `/usr/bin`
-# 的发行版上真 nft 照样在 PATH 里）：逐段摘掉含 nft 可执行文件的目录，其余目录一个不动
-path_without_nft() {
-    local d out="" IFS=:
+run() { run_to 4.0.1 "$@"; }
+# `--units` 覆盖的最自然写法：4.1 期望态的固定六个
+U41="b-ui hysteria-server hysteria-residential xray b-ui-relay caddy"
+# 「缺 nft」/「缺 ss」那两条分支不能靠「白名单目录里没有它」这个外部事实（`/usr/sbin` 合并进
+# `/usr/bin` 的发行版上真 nft 照样在 PATH 里）：逐段摘掉含该可执行文件的目录，其余目录一个不动
+path_without() {  # $1 = 可执行文件名
+    local tool="$1" d out="" IFS=:
     for d in $PATH; do
-        [[ -z "$d" || -x "$d/nft" ]] && continue
+        [[ -z "$d" || -x "$d/$tool" ]] && continue
         out="${out:+$out:}$d"
     done
     printf '%s\n' "$out"
@@ -368,11 +374,23 @@ assert_contains "with_v2ray_api" "$out" "核过装上的 sing-box 带 with_v2ray
 # —— 缺 nft：4.0.1→4.1 那一跳唯一的机器闸门（bui upgrade 由旧二进制执行，进程内拦不住）——
 # PATH 里摘掉 nft 的 stub 与真 nft 所在目录，其余 stub 与系统工具一个不少
 reset_env
-out=$(PATH="$(path_without_nft)" run "$WORK/nonft" 2>&1); rc=$?
+out=$(PATH="$(path_without nft)" run "$WORK/nonft" 2>&1); rc=$?
 assert_eq "2" "$rc" "缺 nft 退 2"
 assert_contains "缺少 nft" "$out" "点名缺的是 nft"
 assert_contains "apt-get install -y nftables" "$out" "打印安装命令"
 assert_eq "0" "$([[ -f "$WORK/nonft/drill.csv" ]] && echo 1 || echo 0)" "一个相位都没进（连 CSV 都没建）"
+assert_not_contains "upgrade" "$(cat "$WORK/bui.log" 2>/dev/null)" "没去升级"
+
+# —— 缺 ss：全部 listen 判据都走 `ss -lnu`，iproute2 缺了 `listening()` 一律 false ⇒ 先白等满
+# `--settle`（默认 300 秒）再判「住宅入站没起来」，把「没装 iproute2」报成住宅全断 ——
+reset_env
+out=$(PATH="$(path_without ss)" run "$WORK/noss" 2>&1); rc=$?
+assert_eq "2" "$rc" "缺 ss 退 2"
+assert_contains "缺少 ss" "$out" "点名缺的是 ss"
+assert_contains "apt-get install -y iproute2" "$out" "打印安装命令"
+assert_eq "0" "$([[ -f "$WORK/noss/drill.csv" ]] && echo 1 || echo 0)" "一个相位都没进（连 CSV 都没建）"
+assert_not_contains "对账仍未收敛" "$out" "不白等满 --settle 才报错"
+assert_not_contains "住宅入站" "$out" "不把缺 iproute2 报成住宅入站没起来"
 assert_not_contains "upgrade" "$(cat "$WORK/bui.log" 2>/dev/null)" "没去升级"
 
 # —— 回滚后表还在 ⇒ 必判 FAIL（4.0.1 的槽 0 会把整段全吸走，比回归事故更糟，spec §9.1）——
@@ -418,6 +436,15 @@ printf '4.1.0\n' > "$WORK/version"
 out=$(run_to 4.1.1 "$WORK/sbplan41" 2>&1); rc=$?
 assert_eq "0" "$rc" "4.1.x 执行升级、计划里有 sing-box ⇒ 放行"
 assert_contains "升级计划里的 sing-box：sing-box     1.14.1" "$out" "打印计划里的 sing-box 那一行"
+# 代次判据只认 4.1 这一代次：本脚本的判据按「4.0.x → 4.1 与回滚」写死（4.2 及以后要复用得跟
+# `plan_upgrade` 的口径一起改），所以将来的 4.10.x 不能落进 4.1.x 那一档 —— glob 一松成 `4.1*`
+# 就会（`4.1.[0-9]*` 与 `4.1.*` 都不会：`.` 在 glob 里是字面量）
+reset_env
+printf '4.10.0\n' > "$WORK/version"
+out=$(FAKE_SINGBOX_NOT_PLANNED=1 run_to 4.10.1 "$WORK/nosbplan410" 2>&1); rc=$?
+assert_eq "0" "$rc" "4.10.0 不被当成 4.1.x"
+assert_contains "升级由旧二进制（4.10.0）执行" "$out" "4.10.x 走的是「旧二进制」那一档"
+assert_not_contains "升级计划里没有 sing-box" "$out" "不拿 4.10.x 当 4.1.x 判计划缺 sing-box"
 
 # —— 装上的 sing-box 没有 with_v2ray_api ⇒ hy2-residential.json 每轮 check 必 FATAL ——
 reset_env
@@ -473,6 +500,22 @@ assert_eq "1" "$rc" "升级后按槽端口还有人听退 1"
 assert_contains "监听 after-upgrade 的 listen:udp:40001：期望 no，实测 yes" "$out" "点名兼容段首端口还有人听"
 assert_contains "槽 1 的 4.0.x 实例端口 after-upgrade 的 listen:udp:40001" "$out" "按槽序号也逐个点名"
 assert_contains "first_failure=upgrade-listen" "$(cat "$WORK/resiport/DONE")" "DONE 记 upgrade-listen"
+
+# —— `--units` 覆盖（4.1 机器上最自然的调试写法就是把固定六个抄进去）：按槽实例的单元名不在
+# 采样清单里，按槽的**单元**断言只会 awk 出空值 ⇒ 不许因此把一次健康的升级判成 FAIL ——
+reset_env
+out=$(run "$WORK/units" --units "$U41" 2>&1); rc=$?
+assert_eq "0" "$rc" "--units 覆盖固定六个时成功路径照样退 0"
+assert_contains "verdict=PASS" "$(cat "$WORK/units/DONE")" "--units 覆盖不判假 FAIL"
+assert_not_contains "upgrade-resi-units" "$out" "不拿没采到的槽位单元判升级相位 FAIL"
+assert_not_contains "rollback-resi-units" "$out" "回滚相位同样不判"
+assert_contains "--units 覆盖了采样清单" "$out" "说清按槽的单元断言为什么跳过"
+# `--units` 只关掉按槽的**单元**断言：按槽端口那组的来源是 state.json 的槽位表，与它无关
+reset_env
+out=$(FAKE_RESI_PORT_STUCK=1 run "$WORK/unitsport" --units "$U41" 2>&1); rc=$?
+assert_eq "1" "$rc" "--units 覆盖时按槽端口断言照判"
+assert_contains "槽 1 的 4.0.x 实例端口 after-upgrade 的 listen:udp:40001" "$out" "按槽端口不被 --units 关掉"
+assert_contains "first_failure=upgrade-listen" "$(cat "$WORK/unitsport/DONE")" "DONE 记 upgrade-listen"
 
 # —— 对账晚几轮才收敛：这是真机 4.0.1→4.1 的常态（内核要从 GitHub 拉回来），固定睡 5 秒
 #    取指纹会把一次健康的升级判成 FAIL ——
