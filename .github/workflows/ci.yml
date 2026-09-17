@@ -20,6 +20,9 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        # 发布门禁预检判的是提交祖先关系，默认浅克隆（depth 1）拿不到 ⇒ 必须取全量历史。
+        with:
+          fetch-depth: 0
       - name: 缓存 cargo
         uses: actions/cache@v4
         with:
@@ -63,6 +66,11 @@ jobs:
         run: bash scripts/tests/run-all.sh
       - name: 版本号三处一致
         run: bash scripts/release/check-version.sh
+      - name: 发布门禁预检（只告警，不卡 CI）
+        run: |
+          set -euo pipefail
+          ver=$(awk '/^\[workspace\.package\]/ {f = 1; next} f && /^\[/ {f = 0} f && /^version[[:space:]]*=/ {gsub(/[^0-9.]/, ""); print; exit}' Cargo.toml)
+          bash scripts/release/check-release-gate.sh "v$ver" --warn
       - name: 内核 lock 没有漂移出轨道
         run: bash scripts/release/pin-kernels.sh --check
 
