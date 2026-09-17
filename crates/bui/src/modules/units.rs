@@ -272,8 +272,8 @@ WantedBy=multi-user.target
 ///
 /// 与 4.0 的 apernet 版差三处，每一处都是有意的：
 /// - `ExecStartPre=-{bin}/bui nft apply`：跳跃不再由内核自己建 NAT 规则，而是 b-ui 自管的
-///   `inet bui` 表。今天有两处幂等重放：这里与每轮对账；第三处（watchdog 每 60 秒自愈）
-///   **T12 起**才有，现在还没有那段代码。
+///   `inet bui` 表。三处幂等重放：这里、每轮对账、watchdog 每 60 秒
+///   （`modules::watchdog::check_nft`）。
 ///   `-` 前缀保证重放失败不阻塞内核启动。孤儿链清理的 `bui hy2-prestart` 随之退役 ——
 ///   sing-box 不建 NAT 规则，也就没有孤儿链。
 /// - **不设 `GOMEMLIMIT`**（与 `b-ui-relay` 今天一致，spec §14 裁决 5：sidecar 实测 RSS 65 MB，

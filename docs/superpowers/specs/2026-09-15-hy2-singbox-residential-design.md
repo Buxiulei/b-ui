@@ -167,7 +167,9 @@ table inet bui {
 ```
 
 - **双 hook 是 tizi PoC 实测得出的硬要求**：只挂 prerouting 时，本机发往自身公网 IP 的包不过 prerouting，跳跃失效；apernet 的规则同样是 PREROUTING + OUTPUT 两条（`portjump.rs:6-9` 的实录）。`bui selfcheck` 与 m1/m3 都用 bundled 客户端在本机带 `mport` 打自己，没有 output 链就会假 FAIL。族用 `inet`（一张表覆盖 v4/v6），对应 apernet 分别在 v4 / v6 建规则的事实（`portjump.rs:50` `TABLES`）。
-- **`counter` 是兼容段命中的采集手段，判据读持久值**（2026-09-16 裁决）：nft 的 `counter` 是瞬时流计数，`render::nft` 每次重放先 `flush table` 会把它清零（开机 / `bui nft apply` / watchdog 自愈 / 改端口都算），所以每次重放前先读一次活计数、增量累加进 `runtime.json`（累计命中 + `last_hit_at`）；下面这条判据与 `bui status` **一律读持久值，绝不读活 counter**（误判方向危险：把仍在用的兼容段判成闲置关掉 ⇒ 未刷订阅的 4.0 住宅用户当场断联）。`bui status` 打印「兼容段 40001-40007 最近命中 N 次（自 <时刻>）」；**连续 30 天为 0** 才 `bui set hy2-resi-compat off`（删那两条规则 + 防火墙收口），下线前在 CHANGELOG 与面板事件提前 30 天通知。这条判据**不收紧**（§14 裁决 3）。4.0 发出的按槽订阅只有 `40000+i` 这一个端口会失效（切片本来就在整段里），所以兼容段只为它存在。
+- **`counter` 是兼容段命中的采集手段，判据读持久值**（2026-09-16 裁决）：nft 的 `counter` 是瞬时流计数，`render::nft` 每次重放先 `flush table` 会把它清零（开机 / `bui nft apply` / watchdog 自愈 / 改端口都算），所以每次重放前先读一次活计数、增量累加进 `runtime.json`（累计命中 + `last_hit_at`）；下面这条判据与 `bui status` **一律读持久值，绝不读活 counter**（误判方向危险：把仍在用的兼容段判成闲置关掉 ⇒ 未刷订阅的 4.0 住宅用户当场断联）。`bui status` 打印「兼容段 40001-40007 最近命中 N 次（自 <时刻>）」；**连续 30 天为 0** 才 `bui set hy2-resi-compat off`（删那两条规则 + 防火墙收口），下线前在 CHANGELOG 与面板事件提前 30 天通知。这条判据**不收紧**（§14 裁决 3）。
+  - **自动判闲置的判据是「累计命中 `total == 0` 且静默 ≥ 30 天」，`total > 0` 就永不自动判闲置**（2026-09-17 裁决，T12 复核）。理由：兼容段的 counter 是 **nat 链**计数，只计每条 conntrack 流的首包（`man nft`），一个 24×7 不断线的 4.0 客户端（订阅里是裸 `40000+i`、没有 `mport`）只在建连那一刻记 1 次，之后几十天不再涨 ⇒ 只看「最近命中时刻」会把**正在用**的兼容段判成闲置并关掉。落地：`watchdog::CompatHits::idle_for_takedown(now)`（`total == 0` && 静默 ≥ `COMPAT_IDLE_DAYS` = 30，起算时刻读不出来也判「不闲置」）是门禁唯一入口；`bui set hy2-resi-compat off` 在 `total > 0` 时**要求 `--force`**，并打印 `total` / `last_hit_at` / `since` 三个值交人判断（写入侧在 T12，门禁与 `--force` 在 T14）。
+  - **已知误差（接受，不加跨进程协调）**：采样只在 watchdog 自己那处重放之前做（每 60 秒一次，重放过的那一轮把比较基准归零），另两处幂等重放（住宅单元的 `ExecStartPre=-bui nft apply`、对账的 `ApplyNftTable`）没有采样点 —— 它们在两次采样之间 flush 过表时，那一段增量（最多 60 秒的流数）会丢。有了上面「`total > 0` 永不自动判闲置」之后，漏计不再能把在用的兼容段判成闲置，所以不为它加协调（2026-09-17 裁决）。4.0 发出的按槽订阅只有 `40000+i` 这一个端口会失效（切片本来就在整段里），所以兼容段只为它存在。
 - **下线前的通知必须点名 Linux 客户端重新导入**（bui-c 会话 2026-09-15 提出，已采纳；与其客户端定稿口径一致）。原因：`bui-c` **不会自动刷新节点**——每分钟的 `check` 与每日自动更新都不取节点，取节点只有 `bui-c import` 与菜单 [3] 两条路；**从不重新导入的机器会在兼容段下线当天直接连不上**。所以下线流程必须三件齐备：
   1. 下线公告里**单列一段**「Linux 客户端（bui-c）必须重新导入一次」，给出 `bui-c import --sub -` 与菜单 [3] 两条路径；
   2. 下线前用上面那个 `counter` 判定兼容段是否仍有流量命中——**有命中说明还有机器没导入，窗口顺延**；
@@ -489,6 +491,7 @@ Clash API 客户端复用 `modules/residential/clash.rs` 的 `Clash` trait（`re
 - `targets()`（`:180-205`）：住宅只剩一条 `{ unit: "hysteria-residential", proto: Udp, port: ports.hy2_resi }`，按槽枚举删除。
 - `HY2_CONFIGS`（`:34-37`）只留 `("hysteria-server", "config.yaml")`：孤儿链自愈只对 apernet 直连有意义。`coupling.facts` 里「端口跳跃自愈只覆盖 2 个实例（已知缺口）」那条缺口**随住宅实例一起消失**（直连那一支的 nft 孤儿清理**已在 4.0.1 rc2 修好**并在 `bwg-tizi` 实测过，不再是待核项：§2.4、§14 裁决 7）。
 - 新增每轮检查：`nft list table inet bui` 存在且规则集哈希 = 期望，否则重放并记 `nft_table_missing`。
+  - **`nft list` 非零分两种，默认方向是「表不在」**（2026-09-17 裁决，T12 复核）：「表不在」⇒ 重放，「读不到」（权限 / 事务占用 / 包装脚本，表可能好着）⇒ 记 `nft_list_failed`（Warn）且这一轮既不重放也不采样。判据**不许依赖 glibc 的 strerror 文案**——nft 的正文是英文 `Error: ` 加 strerror(errno)，后半句跟 locale 翻译（中文主机上 ENOENT 是「没有那个文件或目录」），而守护进程的 locale 继承 systemd manager 的 `LANG`。落地两层：① `crate::sys::real` 给**每个**子进程钉 `LC_ALL=C` + `LANGUAGE=C`（错误文案既是判据也是事件正文的原文）；② `watchdog::table_missing` 只把认得出的「读不到」标记挑走，认不出的一律当「表不在」——认错只多重放一次（整表替换幂等），认反了整表自愈永久失效、住宅整段跳跃一直不通。
 - Clash API `9092` 与 v2ray_api `10086` **不进** watchdog 目标（回环面，进程在就有；进程僵死靠 `40000/udp` 判）。
 
 ### 8.3 自检（`commands/selfcheck.rs`）
