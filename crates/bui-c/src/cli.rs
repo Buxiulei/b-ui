@@ -12,8 +12,8 @@ use crate::net::Net;
 use crate::nettest::{self, Event, Hooks, Painter};
 use crate::paths::{Paths, UNIT_MAIN, UNIT_TIMER};
 use crate::profiles::{
-    https_base, kind_slug, profile_name, rfc3339, same_account, Mode, Panel, Profile, Profiles,
-    Source, Upsert,
+    best_source, https_base, kind_slug, profile_name, rfc3339, same_endpoint, Blocked, Mode, Panel,
+    Profile, Profiles, Source, Upsert,
 };
 use crate::source::{self, Fetched};
 use crate::sys::{systemd, Sys};
@@ -465,35 +465,75 @@ fn apply_with_ufw<S: Sys, N: Net, P: Prompt>(
     Ok(applied)
 }
 
+/// 存量重复的一组（spec §5.4 ①、§5.8）：`keeper` 是这次被更新到服务端参数的那一条，
+/// `others` 是同一个账号、留在旧端口或旧凭据上的**存量**条目（本批副本当场并掉，不进来）。
+#[derive(Debug, Default, PartialEq)]
+struct DupGroup {
+    keeper: String,
+    others: Vec<String>,
+}
+
+#[derive(Debug, Default, PartialEq)]
 struct Stored {
-    added: usize,
+    /// 真正新增的 profile 名（rc 这里是个计数）：结果行用 `len()`，菜单的切换追问用名字
+    added: Vec<String>,
     names: Vec<String>,
-    /// upsert 结果为 [`Upsert::Replaced`] 的 profile 名：原地更新了活动节点就得 apply
+    /// upsert 结果为 [`Upsert::Replaced`] 的 profile 名（[`apply_import`] 已改成按内容判断，
+    /// 这里留给菜单与测试看「哪几条被原地更新了」）
     replaced: Vec<String>,
     /// 命中墓碑、这次没写入的节点名（墓碑里记的那个名字，spec §5.7）：菜单据此问一句，
     /// 命令行据此打 [`menu::buried_skipped`]
     buried: Vec<String>,
     /// 命中墓碑但按明确意愿加回来的 profile 名（墓碑已清）
     restored: Vec<String>,
+    /// 存量重复（spec §5.8）：命令行只提示，菜单问一句要不要合并
+    dups: Vec<DupGroup>,
+    /// ① 里活动节点被挡下（[`Blocked::ActiveEntry`]）时的留存者名：菜单据此追问
+    /// 「切换到 {keep}？」（spec §5.4 ①、§5.10），排在 `added` 前面——它关系到当前节点
+    /// 正停在旧参数上。本批当场并掉的名字只从 `added` / `names` / `replaced` / `restored`
+    /// 四个名单里清，这里不清，所以这里的名字不保证还在列表里（审查 T9 r1 M7）：
+    /// [`menu_import`] 用导完之后的列表过滤一遍再问
+    switch_to: Vec<String>,
 }
 
-/// profile 名是 upsert 的主键，名字按连接身份定：
+impl Stored {
+    /// 记一组存量重复：同一个留存者只占一组，`others` 去重（spec §5.4 ①）。
+    fn push_dups(&mut self, keeper: &str, others: Vec<String>) {
+        if !self.dups.iter().any(|g| g.keeper == keeper) {
+            self.dups.push(DupGroup {
+                keeper: keeper.to_string(),
+                others: Vec::new(),
+            });
+        }
+        let g = self
+            .dups
+            .iter_mut()
+            .find(|g| g.keeper == keeper)
+            .expect("上一句刚补过这一组");
+        for o in others {
+            if !g.others.contains(&o) {
+                g.others.push(o);
+            }
+        }
+    }
+}
+
+/// 按**账号**匹配（spec §5.4）：名字只用来起名，绝不据此覆盖。
 ///
-/// 1. 已有同一个连接（[`Profiles::find_same_endpoint`]）→ 沿用它的名字，原地更新
-///    label / hop / 分流 / 来源（import-v3 的 `hysteria2-<ts>` 经面板导入不会多出一份）；
-/// 2. 否则取 [`profile_name`]：同名的是同一账号（[`same_account`]，换了密码或主机）→
-///    凭据轮换，替换；同名的是**另一个**账号 → `-2`、`-3` 另起，绝不覆盖——面板用户名
-///    全是中文时名字回落成 `<主机名>-<kind>`，同一台服务器上的家人账号必然撞名。
+/// 每个节点三条路：
 ///
-/// upsert 逐个做，同一批里后一个节点看到的「已有同名」就包括前一个，规则一样成立。
+/// 1. 账号组（[`Profiles::account_group`]）非空 → 原地替换 [`Profiles::pick_keeper`] 选中的那一条，
+///    不看名字、也不看墓碑（它本来就在列表里，不算「回来」）。组里其余成员：本批刚写入的副本
+///    当场并掉（不提示、不记墓碑），存量副本进 [`Stored::dups`]，只提示、由菜单确认合并（§5.8）。
+///    被 §5.3 挡下的同账号条目（面板来源条目或活动节点）再打一行说明（A2）。
+/// 2. 组为空 → 认墓碑（`restore` 为假时跳过并记进 [`Stored::buried`]）。
+/// 3. 起名：先看没进组的同账号条目——受保护的打 [`menu::protected_new`]、只是卡在 kind 门槛外的
+///    打 [`menu::kind_unsure_new`]，都另起一条；否则 [`profile_name`]，被**另一个**账号占着就 `-2`。
 ///
-/// `restore` 为假时认墓碑（spec §5.7）：删掉过的节点不写入，名字收进 [`Stored::buried`]；
-/// 为真时照常写入并把墓碑清掉（`--with-deleted`、菜单里答了 y、单独粘贴一条链接）。
-///
-/// 墓碑只挡**新**节点（与 [`import_v3::import`] 同一个顺序：先认已有连接、再认墓碑）。
-/// 已经在列表里的节点不是「回来」：住宅换槽位后新旧两个同 key 的节点并存、删掉旧的之后，
-/// 新的那个照常刷新，与它同 key 的那条过期墓碑顺手清掉——否则它从此收不到凭据轮换，
-/// 每刷新一次还要拿已经删掉的旧名字问一遍。
+/// 分流与来源只升不降（§5.5）：非面板来件沿用组里面板成员的 `split`，来源取来件 / 留存者 /
+/// 组内面板成员三者里等级最高的那个（[`best_source`]），`Unchanged` 时经
+/// [`Profiles::raise_source`] 单独写——否则 V3 / Paste 条目被命中多少次都还记作 V3 / Paste，
+/// 下一次换端口就被 §5.3 误当成受保护条目。
 ///
 /// 一个节点都没存下（全被墓碑挡下）时不动 panel：什么都没导入，不该换自动更新来源。
 fn store_fetched<S: Sys, N: Net, P: Prompt>(
@@ -505,45 +545,156 @@ fn store_fetched<S: Sys, N: Net, P: Prompt>(
     restore: bool,
 ) -> Stored {
     let mut out = Stored {
-        added: 0,
         names: Vec::with_capacity(f.nodes.len()),
-        replaced: Vec::new(),
-        buried: Vec::new(),
-        restored: Vec::new(),
+        ..Default::default()
     };
+    // 存量与本批副本的分界（spec §4）：下标 < known 的是这次导入之前就在的
+    let known = prof.profiles.len();
+    // 这一批里已经当过留存者的**存量**条目名（spec §5.4「同一批里同一账号出现两次：
+    // 后一条生效」）：同账号的第二条来件沿用第一条选出的留存者。不定住的话 `pick_keeper`
+    // 第 3 级「与来件同一连接」会让两条来件各自挑中端口相同的那一条，互相把对方报成存量
+    // 重复（两句提示自相矛盾），生效的还是前一条。
+    // 只记下标 < `known` 的：本批刚写入的副本当上留存者，只可能是组里没有存量成员的时候
+    // （有存量成员时 `pick_keeper` 第 2 级必选它），这时没有可矛盾的第二条；记下来反而会
+    // 让后一条来件跟着本批副本走，抢掉 §9「本批条目当场并掉、老名字保住」那一行
+    let mut batch_keepers: Vec<String> = Vec::new();
     for node in &f.nodes {
-        let (name, is_new) = match prof.find_same_endpoint(node) {
-            Some(same) => (same.name.clone(), false),
-            None => {
-                // 删过的节点默认不写回来：面板 / 订阅导入是刷新节点的日常操作，不记墓碑的话
-                // 每刷新一次删掉的就全回来（spec §5.7）。名字取墓碑里记的那个——用户删它时
-                // 在列表上看到的就是它，这会儿的 profile 名还没算出来
-                if !restore {
-                    if let Some(t) = prof.tombstone_of(node) {
-                        out.buried.push(t.name.clone());
-                        continue;
-                    }
+        let wanted = profile_name(&f.user, node);
+        let group = prof.account_group(node, src);
+        let (name, is_new, old_port, keep_src, panel_split) = if !group.is_empty() {
+            // ① 账号已在列表里：原地替换。本批早先的来件已经为这个账号选过留存者，
+            // 而且它还在组里，就沿用它（上面 `batch_keepers` 的理由）。
+            // 组里有活动节点时不沿用，一律交给 `pick_keeper`（第 1 级就是它）：§5.8 的
+            // 「合并不碰活动节点」依赖「active 只要在组里就是留存者」，沿用不能把它挤掉
+            let has_active = group
+                .iter()
+                .any(|&i| prof.active.as_deref() == Some(prof.profiles[i].name.as_str()));
+            // 组里有面板来源、且与来件同一连接的存量成员时也不沿用，交回 `pick_keeper`（第 3 级
+            // 本来就会选中它）：沿用会把面板那条挤成存量重复，菜单答 y 就用粘贴那条的名字并掉
+            // 了它，与 §5.3「面板来源条目不被非面板来件动」相抵
+            let has_panel_endpoint = group.iter().any(|&i| {
+                i < known
+                    && prof.profiles[i].source == Source::ApiNodes
+                    && same_endpoint(&prof.profiles[i].node, node)
+            });
+            let k = group
+                .iter()
+                .copied()
+                .find(|&i| batch_keepers.contains(&prof.profiles[i].name))
+                .filter(|_| !has_active && !has_panel_endpoint)
+                .unwrap_or_else(|| prof.pick_keeper(&group, node, &wanted, known));
+            let keep = prof.profiles[k].name.clone();
+            if k < known && !batch_keepers.contains(&keep) {
+                batch_keepers.push(keep.clone());
+            }
+            let old_port = prof.profiles[k].node.port;
+            let keep_src = prof.profiles[k].source;
+            // D7：**在 remove 之前**、从合并前的整个账号组里取面板成员的分流（spec §5.5）
+            let panel_split = group
+                .iter()
+                .map(|&i| &prof.profiles[i])
+                .find(|p| p.source == Source::ApiNodes)
+                .map(|p| p.split.clone());
+            let (batch, stale): (Vec<usize>, Vec<usize>) = group
+                .iter()
+                .copied()
+                .filter(|&i| i != k)
+                .partition(|&i| i >= known);
+            let stale: Vec<String> = stale
+                .iter()
+                .map(|&i| prof.profiles[i].name.clone())
+                .collect();
+            let batch: Vec<String> = batch
+                .iter()
+                .map(|&i| prof.profiles[i].name.clone())
+                .collect();
+            // 本批副本不是存量：当场并掉，不提示、不记墓碑。只删下标 ≥ known 的，前 known 条
+            // 下标不变；删掉的名字要同步从这四个名单里清掉，否则结果行与后续追问会提到
+            // 一个已经不在列表里的名字
+            for d in &batch {
+                prof.remove(d);
+                for list in [
+                    &mut out.added,
+                    &mut out.names,
+                    &mut out.replaced,
+                    &mut out.restored,
+                ] {
+                    list.retain(|n| n != d);
                 }
-                let wanted = profile_name(&f.user, node);
-                let name = match prof.profiles.iter().find(|p| p.name == wanted) {
-                    Some(taken) if !same_account(&taken.node, node) => {
+            }
+            if !stale.is_empty() {
+                out.push_dups(&keep, stale);
+            }
+            // A2：组非空时被 §5.3 挡下的同账号条目也要说明——不说的话，活动节点停在旧端口而
+            // 另一条副本被悄悄换到新端口，用户看不出当前节点没动。`KindUnsure` 在 ① 不说：
+            // 门槛外又不受保护的条目本来就当作另一种出口，③ 第一次另起时已经说过
+            match prof.blocked_same_account(node, src) {
+                Some((i, why @ Blocked::PanelEntry { .. })) => {
+                    let other = prof.profiles[i].name.clone();
+                    tell(ctx, menu::protected_kept(&other, &keep, why));
+                }
+                Some((i, why @ Blocked::ActiveEntry { .. })) => {
+                    let other = prof.profiles[i].name.clone();
+                    tell(ctx, menu::protected_kept(&other, &keep, why));
+                    out.switch_to.push(keep.clone());
+                }
+                Some((_, Blocked::KindUnsure)) | None => {}
+            }
+            (keep, false, Some(old_port), Some(keep_src), panel_split)
+        } else {
+            // ② 账号不在列表里：认墓碑。删过的节点默认不写回来——面板 / 订阅导入是刷新节点的
+            // 日常操作，不记墓碑的话每刷新一次删掉的就全回来（spec §5.7）。名字取墓碑里记的
+            // 那个：用户删它时在列表上看到的就是它
+            if !restore {
+                if let Some(t) = prof.tombstone_of(node) {
+                    out.buried.push(t.name.clone());
+                    continue;
+                }
+            }
+            // ③ 起名。先查没进组的同账号条目（不看名字）：它为什么没进组，就按那个原因说一句
+            let name = match prof.blocked_same_account(node, src) {
+                Some((i, why)) => {
+                    let other = prof.profiles[i].name.clone();
+                    let fresh = prof.free_name(&wanted);
+                    tell(
+                        ctx,
+                        match why {
+                            Blocked::PanelEntry { .. } | Blocked::ActiveEntry { .. } => {
+                                menu::protected_new(&other, &fresh, why)
+                            }
+                            Blocked::KindUnsure => menu::kind_unsure_new(&other, &fresh),
+                        },
+                    );
+                    fresh
+                }
+                // 同名的必然是**另一个**账号：同账号要么进了组，要么上面已经报过原因
+                None => match prof.profiles.iter().find(|p| p.name == wanted) {
+                    None => wanted,
+                    Some(_) => {
                         let fresh = prof.free_name(&wanted);
                         ctx.say(format!(
                             "节点名 {wanted} 已被另一个账号占用，新节点命名为 {fresh}"
                         ));
                         fresh
                     }
-                    _ => wanted,
-                };
-                (name, true)
-            }
+                },
+            };
+            (name, true, None, None, None)
         };
+
+        // §5.5：分流——非面板来件在组里找到面板成员就沿用它的；来源——三者取等级最高的
+        let has_panel_member = panel_split.is_some();
+        let split = panel_split
+            .filter(|_| src != Source::ApiNodes)
+            .unwrap_or_else(|| f.split.clone());
+        let source = best_source(src, keep_src, has_panel_member);
         let r = prof.upsert(Profile {
             name: name.clone(),
             node: node.clone(),
-            split: f.split.clone(),
-            source: src,
+            split,
+            source,
             imported_at: rfc3339(ctx.sys),
+            extra: Default::default(),
         });
         // 新节点走到这里就是明确要它：墓碑清掉，下次导入不再跳过（spec §5.7）。已有节点
         // 清的是同 key 的过期墓碑，它本来就在列表里，不算「恢复」
@@ -551,12 +702,20 @@ fn store_fetched<S: Sys, N: Net, P: Prompt>(
             out.restored.push(name.clone());
         }
         match r {
-            Upsert::Added => out.added += 1,
+            Upsert::Added => out.added.push(name.clone()),
             Upsert::Replaced => {
-                ctx.say(format!("更新节点 {name}"));
+                match old_port.filter(|p| *p != node.port) {
+                    // 端口变化行经 `tell`：按宽度折行、缩进两列（spec §5.4 末、§10）
+                    Some(from) => tell(ctx, menu::port_moved_line(&name, from, node.port)),
+                    None => ctx.say(format!("更新节点 {}", menu::display_name(&name))),
+                }
                 out.replaced.push(name.clone());
             }
-            Upsert::Unchanged => ctx.say(format!("节点 {name} 无变化")),
+            Upsert::Unchanged => {
+                // 节点与分流都没变，来源仍要升（spec §5.5）
+                prof.raise_source(&name, source);
+                ctx.say(format!("节点 {} 无变化", menu::display_name(&name)));
+            }
         }
         out.names.push(name);
     }
@@ -631,6 +790,9 @@ struct Imported {
     prof: Profiles,
     /// 这一趟真的选出了活动节点（首次导入或 `activate`，且至少存下了一个节点）
     activated: bool,
+    /// 导入**之前**活动节点的内容（节点与分流）：[`apply_import`] 按内容比，
+    /// 改名、升来源、被 §5.3 挡下都不 apply（spec §5.7）
+    before_active: Option<(bui_schema::nodes::Node, bui_schema::render::SplitRules)>,
 }
 
 /// 落盘一批节点；首次导入或 `activate` 时激活第一个并 apply，原地更新了活动节点也 apply。
@@ -673,6 +835,15 @@ fn store_import<S: Sys, N: Net, P: Prompt>(
     let mut prof = Profiles::load(ctx.sys, ctx.paths)?;
     let loaded = prof.clone();
     let had_active = prof.active_profile().is_some();
+    // token 名先洗掉，**必须在匹配之前**（spec §5.6、C6）：之后的「更新节点 X」、说明行与
+    // 墓碑名单里都不再有 token；对全部 profile 做，不看这批命中了什么，所以端口没变、
+    // 命中同一连接的那一趟也照样改名。改名、`active`、墓碑显示名与这批节点在同一个
+    // `&mut Profiles` 里改，由下面那次 `save` 在同一把锁里一次写盘（C7）；没有 token 名时
+    // `heal_token_names` 一个字段都不动，`prof != loaded` 也就不会凭空写盘
+    let healed = prof.heal_token_names();
+    for (old, new) in &healed.renamed {
+        tell(ctx, menu::renamed_line(old, new));
+    }
     // 粘一条就是明确要这一个：直接加回并清墓碑，不必再问（spec §5.7）
     let single = inc.src == Source::Paste && inc.fetched.nodes.len() == 1;
     let stored = store_fetched(
@@ -696,9 +867,15 @@ fn store_import<S: Sys, N: Net, P: Prompt>(
     }
     ctx.say_result(format!(
         "导入 {} 个新节点，共 {} 个",
-        stored.added,
+        stored.added.len(),
         prof.profiles.len()
     ));
+    // 存量重复：同一账号还有几条停在旧端口或旧凭据上（spec §5.8）。命令行与菜单同一句，
+    // 经 `tell` 折行；命令行紧接着补一行怎么合并（`Cmd::Import`，在 apply 之前，两句连体），
+    // 菜单则在放锁之后问一句
+    for g in &stored.dups {
+        tell(ctx, menu::dups_head(&g.keeper, &g.others));
+    }
     // 粘的这一条之前被删过：说一句，让人知道墓碑起过作用、现在已经清了。菜单里答 y 的第二趟
     // （`with_deleted`）往往也只剩一条，但那是多条粘贴里被挡下的那几个，结果照计数说
     // （spec §5.7 表第 1 行；审查 T7b r2 M6）
@@ -709,6 +886,9 @@ fn store_import<S: Sys, N: Net, P: Prompt>(
         stored,
         prof,
         activated,
+        before_active: loaded
+            .active_profile()
+            .map(|p| (p.node.clone(), p.split.clone())),
     })
 }
 
@@ -722,18 +902,22 @@ fn apply_import<S: Sys, N: Net, P: Prompt>(
     let prof = &imported.prof;
     if imported.activated {
         apply_with_ufw(ctx, prof, g)?;
+        let active = prof.active.clone().unwrap_or_default();
         ctx.say_aside(format!(
             "{CURRENT_NODE_HEAD}{}",
-            prof.active.clone().unwrap_or_default()
+            menu::display_name(&active)
         ));
-    } else if prof
-        .active
-        .as_ref()
-        .is_some_and(|a| imported.stored.replaced.contains(a))
-    {
-        // 活动节点被原地更新（凭据轮换、端口变了）：不 apply 的话还跑着旧配置。
-        // 只改了 label 时渲出的配置字节不变，engine 不会重启
-        apply_with_ufw(ctx, prof, g)?;
+    } else if let Some(now) = prof.active_profile() {
+        // 按内容判断（spec §5.7）：端口变了、凭据轮换了就 apply；只改名或只升了来源、
+        // 过期粘贴被 §5.3 挡下时内容没变，不 apply。只改 label 的照样 apply，但渲出的
+        // 配置字节不变，engine 不会重启
+        let same = imported
+            .before_active
+            .as_ref()
+            .is_some_and(|(n, s)| *n == now.node && *s == now.split);
+        if !same {
+            apply_with_ufw(ctx, prof, g)?;
+        }
     }
     Ok(())
 }
@@ -821,21 +1005,24 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
             // 读 profiles.json 之前拿锁（spec §8.3）：锁外读的那份可能已经被别的会话改过
             let g = take_lock(ctx)?;
             let mut prof = Profiles::load(ctx.sys, ctx.paths)?;
+            // 三句都用显示名（spec §8.3）：名字是人打进来的，但打出去的是屏幕上那一份，
+            // token 名照样要打码——菜单的「上次：」行拿的就是这几句
+            let shown = menu::display_name(name).into_owned();
             if !prof.profiles.iter().any(|p| &p.name == name) {
                 return Err(Error::msg(format!(
-                    "节点 {name} 不存在，用 `bui-c list` 看可用节点"
+                    "节点 {shown} 不存在，用 `bui-c list` 看可用节点"
                 )));
             }
             if prof.active.as_deref() == Some(name.as_str()) {
                 // 兜底 apply 一次：配置丢了、单元没建时这是唯一不绕路的补救；配置没变就不重启
                 apply_with_ufw(ctx, &prof, &g)?;
-                ctx.say(format!("已是当前节点：{name}"));
+                ctx.say(format!("已是当前节点：{shown}"));
                 return Ok(());
             }
             prof.active = Some(name.clone());
             prof.save(ctx.sys, ctx.paths)?;
             apply_with_ufw(ctx, &prof, &g)?;
-            ctx.say(format!("已切到 {name}"));
+            ctx.say(format!("已切到 {shown}"));
             Ok(())
         }
         Cmd::Mode { mode } => {
@@ -909,6 +1096,14 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
             // 打墓碑那一行在放锁之后
             let g = take_lock(ctx)?;
             let imported = store_import(ctx, inc, *activate, *with_deleted, &g)?;
+            // 存量重复那一句已经在 `store_import` 里打过（命令行与菜单同一句）：命令行不问、
+            // 不改，只紧跟着补一行怎么合并（spec §5.8）。**打在 apply 之前**：这两句是连体的
+            // （spec §10 表），中间插进 apply 的 `TUN_NOT_READY`、「当前节点：X」或墓碑那一行
+            // 就断开了。菜单不打这一行（它当场问一句要不要合并），所以它留在这里、不进
+            // `store_import`
+            if !imported.stored.dups.is_empty() {
+                tell(ctx, menu::DUPS_HINT_CLI);
+            }
             let applied = apply_import(ctx, &imported, &g);
             drop(g);
             // 命令行不提问（脚本里跑它不能卡在一个 [y/N] 上）：说清跳了哪几个、怎么加回来。
@@ -1192,9 +1387,11 @@ fn import_v3_cmd<S: Sys, N: Net, P: Prompt>(
         ctx.say("已恢复被 v3 关掉的 UFW");
     }
     apply_with_ufw(ctx, &prof, &g)?;
+    // 名字过 `display_name`（spec §8.3）：v3 这条路不改名，列表里留着的 token 名只能靠打码挡住
+    let active = prof.active.clone().unwrap_or_default();
     ctx.say_aside(format!(
         "{CURRENT_NODE_HEAD}{}",
-        prof.active.clone().unwrap_or_default()
+        menu::display_name(&active)
     ));
     Ok(r)
 }
@@ -1507,12 +1704,15 @@ fn switch_node<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>, name: Stri
     let tun_down = ctx.transcript[start..]
         .lines()
         .any(|l| l.trim() == TUN_NOT_READY);
+    // 摘要里拼的是显示名（spec §8.3）：`fit_name_in_last` 拿显示名去摘要里找名字那一段，
+    // 拼原名它找不到、整句原样返回，token 名就漏在「上次：」行上了
+    let shown = menu::display_name(&name);
     let done = if already {
-        format!("已是当前节点：{name}")
+        format!("已是当前节点：{shown}")
     } else if tun_down {
-        format!("已切到 {name}，但 bui-tun 没起来")
+        format!("已切到 {shown}，但 bui-tun 没起来")
     } else {
-        format!("已切到 {name}")
+        format!("已切到 {shown}")
     };
     out.map_summary(|s| {
         let s = if s.starts_with("失败：") { s } else { done };
@@ -1526,9 +1726,16 @@ fn switch_node<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>, name: Stri
 const LOCK_WAIT: Duration = Duration::from_secs(15);
 /// 第一次没拿到锁时说一句（然后才开始等）。容量口径 51 列。
 const LOCK_WAITING: &str = "另一个 bui-c 操作正在进行，等它结束（最多 15 秒）…";
-/// 等不到锁：别的 bui-c 正在改东西（退出码 1，spec §0.2 R15）。锁在动手之前拿，所以
-/// 「什么都没改」在每个入口都成立。容量口径 51 列。
+/// 等不到锁：别的 bui-c 正在改东西（退出码 1，spec §0.2 R15）。**顶层入口**都在动手之前拿锁，
+/// 「这次什么都没改」才成立；菜单 `[3]` 与 `[7]`→`[3]` 墓碑答 y 的第二趟（[`menu_import`] /
+/// [`menu_import_v3`]）是**已知例外**——第一趟（`save_import` / `import_v3_cmd`）早写过盘了，
+/// 这一趟自己再拿一次锁，拿不到报的仍是这一句（account-match spec §9，rc 既有行为，留待后续）。
+/// 合并那一次另用 [`menu::MERGE_LOCK_BUSY`]。容量口径 51 列。
 const LOCK_BUSY: &str = "另一个 bui-c 操作还没结束，这次什么都没改，稍后再试";
+// 菜单 `[3]` 合并那一次拿不到锁时打的那一句是 [`menu::MERGE_LOCK_BUSY`]：用户可见文案一律
+// 收在 `menu`，宽度才盖得到——卡它的是 `menu::tests::dups_head_caps_the_list_and_masks_names`
+// 里的两条断言（裸文案 ≤ 59 列、带「失败：」前缀进「上次：」行不被 60 列尾截），
+// `every_line_fits_by_budget` 里那两格只守字符归类与「折得开」。
 
 /// 顶层入口拿锁（spec §8.3、§0.2 R11）：先试一次；没拿到就说一句「在等」并冲出去（人看得到
 /// 为什么卡住），再每 250ms 试一次，最多 15 秒，还拿不到报 [`LOCK_BUSY`]。`--json` 下那一句不打。
@@ -2070,6 +2277,9 @@ fn delete_nodes<S: Sys, N: Net, P: Prompt>(
         }
         PlanKind::Switch { to } => {
             report.switched = true;
+            // 失败那几句里的切换目标一律用显示名（spec §8.3）：停顿页与「上次：」行共用它们，
+            // token 名要打码（`menu::fit_name_in_last` 也是拿显示名去摘要里找的）
+            let to = &menu::display_name(to);
             // ⑤ 预检：动数据面之前挡住「内核缺失」「check 不通过」
             if let Err(e) = Engine::new(ctx.sys, ctx.paths).preflight(&plan.next) {
                 let kernel = e.to_string().starts_with(crate::engine::KERNEL_MISSING);
@@ -2273,7 +2483,11 @@ fn delete_menu<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<
     match &kind {
         PlanKind::Switch { .. } => tell(
             ctx,
-            format!("正在切到 {}…", switch_to.clone().unwrap_or_default()),
+            // 名字过 `display_name`（spec §8.3）：进度行也在屏幕上
+            format!(
+                "正在切到 {}…",
+                menu::display_name(switch_to.as_deref().unwrap_or_default())
+            ),
         ),
         PlanKind::Empty => tell(ctx, "正在停止代理…"),
         PlanKind::Passive => {}
@@ -2850,15 +3064,24 @@ const PASTE_PROMPT: &str = "粘贴节点链接或订阅地址";
 
 /// 菜单 `[3] 导入节点`：节点链接与面板 / 订阅地址都从这一个口子进。
 ///
-/// 导入失败只打「失败：…」留在菜单里。导入了新节点、而活动节点不在其中时追问一次要不要
-/// 切过去——命令行 `bui-c import` 不问，保持非交互。
+/// 导入失败只打「失败：…」留在菜单里。导入完最多追问三句，固定顺序是
+/// **墓碑 → 存量重复 → 切换**（spec §5.10），三句都在 [`save_import`] 放锁之后问
+/// （§0.2 R11）——命令行 `bui-c import` 一句也不问，保持非交互：
 ///
-/// 回主菜单停不停照 [`outcome_since`]：失败、有附加行（面板退回订阅、跳过…）就停；「上次：」行
-/// 一律是导入结果本身（[`Ctx::say_result`] 标的那一行），不会被它前面的附加提示占掉。追问过
-/// 「切换到新导入的 X？」或墓碑那一问的，人已经在提问处看过导入结果：答 y 用切换的结果，答否不再停。
+/// 1. **墓碑**（§7）：命中的节点先不写入，问一句要不要加回，答 y 拿同一批节点另拿一次锁
+///    再导一次（只导这几个，不再联网）；
+/// 2. **存量重复**（§5.8 D2）：同一账号还有几条停在旧端口或旧凭据上，问一句要不要合并，
+///    答 y 走 [`menu_merge_dups`]（再拿一次锁、重读、一次写盘）；
+/// 3. **切换**（§5.10）：候选按 `switch_to` → 本趟 `added` → 墓碑第二趟 `added` 排，先把按 D9
+///    改过名的留存者换成新名字，再拿导完之后的列表过滤掉已经不存在的名字（合并掉的自然
+///    出局）；只问第一个候选，活动节点已是候选就不问。换端口、改名、合并都不是新节点，
+///    都不弹这一问。
 ///
-/// 墓碑（spec §5.7）：命中的节点先不写入，导入之后、**放锁之后**（`save_import` 里的锁已经放了，
-/// spec §0.2 R11）问一句要不要加回，答 y 拿同一批节点再导一次（只导这几个，不再联网）。
+/// 回主菜单停不停照 [`outcome_since`]：失败、有附加行（面板退回订阅、跳过、端口变化…）就停；
+/// 「上次：」行一律是导入结果本身（[`Ctx::say_result`] 标的那一行），不会被它前面的附加提示占掉。
+/// 问过一句就不再多停一次，但只算提问**之前**打的行——那些人已经在提问处看过了。答完之后
+/// 才打的行（第二趟导入的结果、合并与改名那几句）没人看过，后面又没有别的问句时照旧停一次
+/// （§10 F7）。
 fn menu_import<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<Outcome> {
     let start = ctx.transcript.len();
     let lines: Vec<String> = ctx
@@ -2871,11 +3094,6 @@ fn menu_import<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<
     if lines.is_empty() {
         return Ok(note(ctx, "已取消，没有导入任何节点"));
     }
-    let before: Vec<String> = Profiles::load(ctx.sys, ctx.paths)?
-        .profiles
-        .into_iter()
-        .map(|p| p.name)
-        .collect();
     // 取节点与落盘分两步：墓碑那一问答 y 时要拿同一批节点再导一次，不能再去联网
     let imported = match lines.as_slice() {
         [url] if source::is_http_url(url) => fetch_http(ctx, url),
@@ -2916,46 +3134,137 @@ fn menu_import<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<
             return Ok(outcome_since(ctx, start));
         }
     };
-    // 墓碑那一问：答 y 另拿一次锁，只把这几个导回来（spec §5.7、§0.2 R11）
-    let mut asked = false;
+    // 切换候选（spec §5.10）：`switch_to` 排最前——它关系到当前节点正停在旧参数上；
+    // `bool` 是问句的措辞（真正新增的才是「新导入的」）。不再拿导入前后的名字求差集：
+    // 改名（token 名被洗掉）与合并会让差集里冒出「新名字」，误问「切换到新导入的 X？」
+    let mut cands: Vec<(String, bool)> = stored
+        .switch_to
+        .iter()
+        .map(|n| (n.clone(), false))
+        .chain(stored.added.iter().map(|n| (n.clone(), true)))
+        .collect();
+    // 三问的顺序：墓碑 → 存量重复 → 切换；每一问只兜住它之前打的行（spec §5.10、§13 R19）。
+    // `asked_at` 记最后一问时 transcript 的长度：提问之前的行人已经在提问处看过了，答完之后
+    // 才打的行没人看过，其后没有别的问句时照旧停一次
+    let mut asked_at: Option<usize> = None;
+    // 墓碑那一问：答 y 另拿一次锁，只把这几个导回来（spec §7、§0.2 R11）
     if !stored.buried.is_empty() {
-        asked = true;
         tell(ctx, menu::buried_head(&stored.buried));
         ctx.flush();
+        asked_at = Some(ctx.transcript.len());
         if ctx.prompt.confirm(menu::BURIED_ASK)? {
             let live = Profiles::load(ctx.sys, ctx.paths)?;
             let mut only = again;
             only.fetched.nodes.retain(|n| live.is_deleted(n));
-            if let Err(e) = save_import(ctx, only, false, true) {
-                ctx.say(format!("失败：{e}"));
-                return Ok(outcome_since(ctx, start));
+            match save_import(ctx, only, false, true) {
+                // 第二趟加回来的也是新节点，照样要问切换
+                Ok(second) => cands.extend(second.added.into_iter().map(|n| (n, true))),
+                Err(e) => {
+                    ctx.say(format!("失败：{e}"));
+                    return Ok(outcome_since(ctx, start));
+                }
             }
         }
     }
+    // 存量重复那一问（spec §5.8 D2）：名单已经在 `dups_head` 里打过了，这里只问一句。
+    // 同样在放锁之后：答 y 才另拿一次锁重读、合并
+    let mut merged: Vec<crate::profiles::Merged> = Vec::new();
+    if !stored.dups.is_empty() {
+        ctx.flush();
+        asked_at = Some(ctx.transcript.len());
+        if ctx.prompt.confirm(menu::MERGE_ASK)? {
+            match menu_merge_dups(ctx, &stored.dups) {
+                // 重读之后一组都没并成：别的会话删了、改了
+                Ok(done) if done.is_empty() => tell(ctx, menu::MERGE_NOTHING),
+                Ok(done) => merged = done,
+                Err(e) => {
+                    ctx.say(format!("失败：{e}"));
+                    return Ok(outcome_since(ctx, start));
+                }
+            }
+        }
+    }
+    // 留存者按 D9 取回规范名时（`c-2` → `c`）候选记的还是合并前那个名字：不换过来，下面那句
+    // 过滤就把它当成「已经不在了」，活动节点被挡下时该问的「切换到 {keep}？」会静默丢掉。
+    // 定稿 §5.10「过 after 过滤之前先按 `Merged::renamed_from` → `keeper` 换名」那一条
+    // （实现期补准，裁决二）
+    for (n, _) in &mut cands {
+        for m in &merged {
+            if m.renamed_from.as_deref() == Some(n.as_str()) {
+                n.clone_from(&m.keeper);
+            }
+        }
+    }
+    // 合并掉的、被别的会话删掉的那几个名字自然出局
     let after = Profiles::load(ctx.sys, ctx.paths)?;
-    let fresh: Vec<&str> = after
-        .profiles
-        .iter()
-        .map(|p| p.name.as_str())
-        .filter(|n| !before.iter().any(|b| b == n))
-        .collect();
+    cands.retain(|(n, _)| after.profiles.iter().any(|p| p.name == *n));
     let mut shown = outcome_since(ctx, start);
-    if asked {
-        // 墓碑那一问本身就是停顿：导入结果已经在提问处看过了
+    // 提问本身就是停顿，但只管提问之前打的行；答完之后才打的行（第二趟导入、合并与改名
+    // 那几句）没人看过，这一趟照旧停一次让人看到（§10 F7）
+    if asked_at.is_some_and(|at| matches!(outcome_since(ctx, at), Outcome::Nothing)) {
         shown = asked_is_a_pause(shown);
     }
-    let Some(first) = fresh.first() else {
+    let Some((first, fresh)) = cands.first() else {
         return Ok(shown);
     };
-    if after.active.as_deref().is_some_and(|a| fresh.contains(&a)) {
+    if after
+        .active
+        .as_deref()
+        .is_some_and(|a| cands.iter().any(|(n, _)| n == a))
+    {
         return Ok(shown); // 首次导入已经激活了新节点
     }
     ctx.flush();
-    if ctx.prompt.confirm(&format!("切换到新导入的 {first}？"))? {
-        return Ok(switch_node(ctx, first.to_string()));
+    if ctx.prompt.confirm(&menu::switch_ask(first, *fresh))? {
+        return Ok(switch_node(ctx, first.clone()));
     }
     // 提问本身就是停顿：导入结果已经在提问处看过了，答否回主菜单不再停
     Ok(asked_is_a_pause(shown))
+}
+
+/// 菜单 `[3]` 存量重复那一问答 y（spec §5.8 D2、§0.2 R11）：**另拿一次锁**、重读
+/// `profiles.json`、逐组 [`Profiles::merge_into`]、一次写盘、放锁，再把结果打出来。
+///
+/// 锁不能沿用 [`save_import`] 那一把：那把在问「要合并吗？」之前就放了，人看提示的这段时间里
+/// 别的会话可能已经改过节点列表——所以这里重读，[`Profiles::merge_into`] 自己再逐条核对
+/// （还在、同账号、不是活动节点），不满足的跳过。
+///
+/// 拿不到锁时报 [`menu::MERGE_LOCK_BUSY`]，不是 [`LOCK_BUSY`]：第一趟导入早就写过盘了，
+/// 「这次什么都没改」在这里不成立，没做的只有合并。
+///
+/// 返回并成的那几组（按 `dups` 的顺序）：一组都没并成时是空的，调用方打
+/// [`menu::MERGE_NOTHING`]；`renamed_from` 还要回填切换候选（D9，`menu_import`）。
+///
+/// 不 apply：留存者第 1 级就是活动节点，`others` 里永远没有它，合并只删别的条目、
+/// 顶多给留存者取回规范名（D9）——改名不是内容变化（§5.7）。
+fn menu_merge_dups<S: Sys, N: Net, P: Prompt>(
+    ctx: &mut Ctx<'_, S, N, P>,
+    dups: &[DupGroup],
+) -> Result<Vec<crate::profiles::Merged>> {
+    let Some(g) = wait_for_lock(ctx)? else {
+        return Err(Error::msg(menu::MERGE_LOCK_BUSY));
+    };
+    let mut prof = Profiles::load(ctx.sys, ctx.paths)?;
+    let done: Vec<crate::profiles::Merged> = dups
+        .iter()
+        .map(|d| prof.merge_into(&d.keeper, &d.others))
+        .filter(|m| !m.removed.is_empty())
+        .collect();
+    if done.is_empty() {
+        return Ok(done); // 一组都没并成：不写盘
+    }
+    prof.save(ctx.sys, ctx.paths)?;
+    drop(g);
+    for m in &done {
+        // 「已把 a、b 并入 X」里的 X 是合并那一刻人在列表上看到的名字：取回规范名时
+        // 它还叫 `-2`，改名由下一句单说——拿改完的新名字去拼会打出「已把 X 并入 X」
+        let shown = m.renamed_from.as_deref().unwrap_or(&m.keeper);
+        tell(ctx, menu::merged_line(&m.removed, shown));
+        if let Some(old) = &m.renamed_from {
+            tell(ctx, menu::renamed_line(old, &m.keeper));
+        }
+    }
+    Ok(done)
 }
 
 /// 菜单 `[7]` → `[3]` 从 v3 导入（spec §5.7 表第 3 行、§0.2 R11）：先照常导一趟，被墓碑挡下的
@@ -3433,6 +3742,7 @@ mod tests {
             split: split_keywords(),
             source: crate::profiles::Source::ApiNodes,
             imported_at: "2026-09-11T00:00:00Z".into(),
+            extra: Default::default(),
         });
         prof.save(&s, &pp).unwrap();
         let n = FakeNet::new();
@@ -3735,6 +4045,7 @@ mod tests {
             split: crate::profiles::default_split(),
             source: crate::profiles::Source::V3,
             imported_at: "2026-09-11T00:00:00Z".into(),
+            extra: Default::default(),
         });
         prof.active = Some("hysteria2-1785892136".into());
         prof.save(&s, &pp).unwrap();
@@ -6181,6 +6492,7 @@ mod tests {
             split: split_keywords(),
             source: crate::profiles::Source::ApiNodes,
             imported_at: "2026-09-11T00:00:00Z".into(),
+            extra: Default::default(),
         });
         prof.save(s, pp).unwrap();
     }
@@ -6930,6 +7242,7 @@ mod tests {
             split: split_keywords(),
             source: crate::profiles::Source::ApiNodes,
             imported_at: "2026-09-11T00:00:00Z".into(),
+            extra: Default::default(),
         });
         prof.save(&s, &pp).unwrap();
         let n = FakeNet::new();
@@ -10102,7 +10415,8 @@ mod tests {
         let pp = paths();
         let url = "https://panel.example.com/api/nodes/alice";
         let (s, n) = all_buried(&pp, url);
-        let r = run_menu(&s, &n, &pp, &["3", url, "", "y", "0"], true);
+        // 末尾多一个空串：第二趟的结果是答完才打的，这一趟要停一次（R19），由它吃掉
+        let r = run_menu(&s, &n, &pp, &["3", url, "", "y", "", "0"], true);
         assert!(
             r.asked.iter().any(|q| q == menu::BURIED_ASK),
             "要问一句：{:?}\n{}",
@@ -10128,10 +10442,21 @@ mod tests {
             "{}",
             r.t
         );
+        assert_eq!(
+            pauses(&r.asked),
+            1,
+            "第二趟的结果是答完才打的，要停一次（§13 R19）：{:?}\n{}",
+            r.asked,
+            r.t
+        );
     }
 
     /// 审查 I1：住宅换槽位后旧槽 :40000 与新槽 :40001 并存（同账号、同 host、同 kind，只差端口），
     /// 删掉旧的之后面板发来新的——它已经在列表里，照常刷新，不算「删过的」，也不问。
+    ///
+    /// setup 里那条 `-2` 是 4.0.2 之前（按名字匹配的 rc）留在盘上的存量副本：本版按账号匹配，
+    /// 留下的这条与来件同一连接，走 §5.4 ① 原地刷新并清掉同 key 的过期墓碑，行为不变
+    /// （spec §7 表、§11.2 测试 59）。
     #[test]
     fn a_live_profile_sharing_the_key_is_refreshed_not_reported_as_deleted() {
         let pp = paths();
@@ -10599,6 +10924,23 @@ mod tests {
         );
         assert_eq!(no_prompt_under_lock(&s, from, "[3] 导入"), 2, "{t}");
         assert_eq!(names(&s, &pp).len(), 2, "{t}");
+
+        // [3] 存量重复（T11，spec §5.8）：「要合并吗？」同样在放锁之后问，
+        // 答 y 另拿一次锁——不能沿用 save_import 那一把（它已经放了）
+        let (s, n) = (FakeSys::new(), FakeNet::new());
+        ready(&s);
+        // 进菜单那一下的收敛不该再占一把锁：夹具先 apply 一次，让数据面与节点列表一致
+        let prof = dup_machine(&s, &pp);
+        Engine::new(&s, &pp).apply(&prof).unwrap();
+        n.route(
+            &crate::source::nodes_url(PANEL_BASE, "alice"),
+            nodes_payload("alice", vec![resi_at(40009)]),
+        );
+        let from = s.calls().len();
+        let (t, asked) = logged_menu(&s, &n, &pp, &["3", url, "", "y", "", "0"]);
+        assert!(asked.iter().any(|q| q == menu::MERGE_ASK), "{asked:?}");
+        assert_eq!(no_prompt_under_lock(&s, from, "[3] 合并"), 2, "{t}");
+        assert_eq!(names(&s, &pp), vec!["alice-hy2-resi".to_string()], "{t}");
 
         // [4] 重启
         let (s, n) = (FakeSys::new(), FakeNet::new());
@@ -12047,6 +12389,4052 @@ mod tests {
         assert!(
             menu::budget_width(PENDING_FAILED) <= room,
             "{PENDING_FAILED}"
+        );
+    }
+
+    // ───────────── T9：按账号匹配的导入编排（spec §5.4、§5.5、§5.7、§5.8） ─────────────
+
+    /// 合成一条 HY2 粘贴链接。备注同时决定两件事（§11 通则）：含「住宅」才解析成住宅 kind，
+    /// 含「直连」或「住宅」才 `kind_trusted`——所以备注必须与被比条目的 kind 同向，
+    /// 否则根本不是同一个账号，用例会静默空过。
+    fn hy2_uri(user: &str, pw: &str, port: u16, label: &str) -> String {
+        let tag = percent_encoding::utf8_percent_encode(label, percent_encoding::NON_ALPHANUMERIC);
+        format!("hysteria2://{user}:{pw}@panel.example.com:{port}/?sni=panel.example.com&mport=20000-30000#{tag}")
+    }
+
+    fn uri_node(uri: &str) -> bui_schema::nodes::Node {
+        bui_schema::parse::node_uri(uri).unwrap_or_else(|e| panic!("测试链接解析失败：{e}"))
+    }
+
+    /// 列表里的一条 profile。
+    fn entry(
+        name: &str,
+        node: bui_schema::nodes::Node,
+        source: Source,
+        split: bui_schema::render::SplitRules,
+    ) -> Profile {
+        Profile {
+            name: name.into(),
+            node,
+            split,
+            source,
+            imported_at: "2026-09-11T00:00:00Z".into(),
+            extra: Default::default(),
+        }
+    }
+
+    /// 落盘一份列表并把它交回来（断言 `blocked_same_account` 用的就是这份导入前的状态）。
+    fn listed(s: &FakeSys, pp: &Paths, entries: Vec<Profile>, active: &str) -> Profiles {
+        let mut prof = Profiles::new_default();
+        prof.profiles = entries;
+        prof.active = Some(active.into());
+        prof.save(s, pp).unwrap();
+        prof
+    }
+
+    fn got(s: &FakeSys, pp: &Paths, name: &str) -> Profile {
+        Profiles::load(s, pp)
+            .unwrap()
+            .profiles
+            .into_iter()
+            .find(|p| p.name == name)
+            .unwrap_or_else(|| panic!("列表里没有 {name}"))
+    }
+
+    /// `since` 之后又重启过几次：说明行与端口行经 `tell` 打，判「有没有 apply」看这个。
+    fn restarts_since(s: &FakeSys, since: usize) -> usize {
+        s.calls()
+            .into_iter()
+            .skip(since)
+            .filter(|c| c == "systemctl restart bui-c.service")
+            .count()
+    }
+
+    /// 「有没有 apply」的取样点：已经跑过的命令条数 + `config.json` 被写过几次。
+    fn marks(s: &FakeSys) -> (usize, usize) {
+        (s.calls().len(), s.writes("/opt/bui-c/config.json"))
+    }
+
+    /// 断言这一趟没 apply：既没重启，也没重写 `config.json`。只数重启会静默空过——
+    /// 夹具里先 apply 过一次之后，内容相同的第二趟本来就不重启（`write_if_changed`），
+    /// 代理就不再代理任何东西（审查 T9 r1 M6）。
+    fn assert_not_applied(s: &FakeSys, before: (usize, usize), why: &str, t: &str) {
+        assert_eq!(restarts_since(s, before.0), 0, "{why}（重启了）：{t}");
+        assert_eq!(
+            s.writes("/opt/bui-c/config.json"),
+            before.1,
+            "{why}（重写了 config.json）：{t}"
+        );
+    }
+
+    /// transcript 里有没有这一行。经 `tell` 的行带两列缩进（命令行下 `say` 没有），一律 `trim()` 比。
+    fn said_line(t: &str, line: &str) -> bool {
+        t.lines().any(|l| l.trim() == line)
+    }
+
+    /// 说明行与存量重复提示都很长：测试里把终端放宽，`tell` 就不折行，断言能逐行比。
+    fn wide(s: &FakeSys) {
+        s.set_term_size(Some((400, 24)));
+    }
+
+    /// `bui-c import -`：粘贴这几行。
+    fn import_paste(s: &FakeSys, pp: &Paths, uris: &[&str]) -> String {
+        import_paste_with(s, pp, uris, &[])
+    }
+
+    /// 同 `import_paste`，外加命令行开关（`--activate` / `--with-deleted`）。
+    fn import_paste_with(s: &FakeSys, pp: &Paths, uris: &[&str], flags: &[&str]) -> String {
+        let n = FakeNet::new();
+        let mut p = Scripted {
+            queue: uris.iter().map(|x| x.to_string()).collect(),
+            asked: Vec::new(),
+            tty: true,
+        };
+        let mut ctx = Ctx::new(s, &n, pp, &mut p, false, false);
+        let mut argv = vec!["import", "-"];
+        argv.extend_from_slice(flags);
+        dispatch(&parse(&argv), &mut ctx).unwrap();
+        ctx.transcript.clone()
+    }
+
+    /// `bui-c import --sub`：第三方订阅地址（不是面板链接，不试 `/api/nodes`），末段是用户名。
+    fn import_from_sub(s: &FakeSys, pp: &Paths, user: &str, uris: &[&str]) -> String {
+        let n = FakeNet::new();
+        let url = format!("https://sub.example.com/link/{user}");
+        n.route(&url, b64(&uris.join("\n")));
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(s, &n, pp, &mut p, false, false);
+        dispatch(&parse(&["import", "--sub", &url]), &mut ctx).unwrap();
+        ctx.transcript.clone()
+    }
+
+    /// 直接跑一趟 `store_fetched`（不落盘、不 apply）：断言 `Stored` 本身的用例用它。
+    fn stored_from(
+        s: &FakeSys,
+        pp: &Paths,
+        prof: &mut Profiles,
+        user: &str,
+        nodes: Vec<bui_schema::nodes::Node>,
+        src: Source,
+    ) -> (Stored, String) {
+        stored_restoring(s, pp, prof, user, nodes, src, false)
+    }
+
+    /// 同 `stored_from`，外加 `restore`（`--with-deleted` 与单条粘贴那一路：墓碑不挡，清掉）。
+    fn stored_restoring(
+        s: &FakeSys,
+        pp: &Paths,
+        prof: &mut Profiles,
+        user: &str,
+        nodes: Vec<bui_schema::nodes::Node>,
+        src: Source,
+        restore: bool,
+    ) -> (Stored, String) {
+        let n = FakeNet::new();
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(s, &n, pp, &mut p, false, false);
+        let f = crate::source::Fetched {
+            user: user.into(),
+            split: crate::profiles::default_split(),
+            nodes,
+            skipped: Vec::new(),
+        };
+        let out = store_fetched(&mut ctx, prof, &f, src, None, restore);
+        (out, ctx.transcript.clone())
+    }
+
+    /// 22：4.1 把住宅槽端口从 40003 挪到 40000、跳跃段从切片变整段——同一个账号，原地替换，
+    /// 名字不动，不多出 `-2`，也不算「新节点」。
+    #[test]
+    fn port_move_replaces_in_place_under_the_existing_name() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let old = bui_schema::nodes::Node {
+            port: 40003,
+            hop: Some((44000, 45000)),
+            ..crate::testutil::hy2_resi_node()
+        };
+        listed(
+            &s,
+            &pp,
+            vec![entry(
+                "alice-hy2-resi",
+                old,
+                Source::ApiNodes,
+                split_keywords(),
+            )],
+            "alice-hy2-resi",
+        );
+        let t = import_from_panel(&s, &pp, "alice", vec![crate::testutil::hy2_resi_node()]);
+        assert_eq!(names(&s, &pp), vec!["alice-hy2-resi"], "{t}");
+        let p = got(&s, &pp, "alice-hy2-resi");
+        assert_eq!(p.node.port, 40000, "{t}");
+        assert_eq!(p.node.hop, Some((41000, 50000)), "跳跃段跟着换成整段：{t}");
+        assert!(
+            said_line(&t, "更新节点 alice-hy2-resi：端口 40003 → 40000"),
+            "{t}"
+        );
+        assert!(t.contains("导入 0 个新节点"), "端口变化不算新节点：{t}");
+    }
+
+    /// 23：v3 目录名（用户拿它 `switch`）不因为端口变了就被丢掉；来源升成 ApiNodes。
+    #[test]
+    fn port_move_keeps_a_v3_dir_name() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let v3 = bui_schema::nodes::Node {
+            label: "示例专用名-HY2住宅".into(),
+            port: 40003,
+            ..crate::testutil::hy2_resi_node()
+        };
+        listed(
+            &s,
+            &pp,
+            vec![entry(
+                "hysteria2-1785892136",
+                v3,
+                Source::V3,
+                crate::testutil::split_global(),
+            )],
+            "hysteria2-1785892136",
+        );
+        let t = import_from_panel(&s, &pp, "alice", vec![crate::testutil::hy2_resi_node()]);
+        assert_eq!(names(&s, &pp), vec!["hysteria2-1785892136"], "{t}");
+        let p = got(&s, &pp, "hysteria2-1785892136");
+        assert_eq!(p.node.port, 40000, "{t}");
+        assert_eq!(p.source, Source::ApiNodes, "{t}");
+        assert!(
+            said_line(&t, "更新节点 hysteria2-1785892136：端口 40003 → 40000"),
+            "{t}"
+        );
+    }
+
+    /// 24：第二台服务器上的 `-2` 换了端口还是 `-2`，不涨成 `-3`（rc 靠名字匹配才会涨）。
+    #[test]
+    fn port_move_keeps_the_suffix_on_the_second_server() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        import_from_panel(&s, &pp, "alice", vec![hy2_account("alice", "pw-a")]);
+        let other = |port: u16| bui_schema::nodes::Node {
+            host: "other.example.com".into(),
+            port,
+            ..hy2_account("alice", "pw-b")
+        };
+        import_from_panel(&s, &pp, "alice", vec![other(10000)]);
+        assert_eq!(
+            names(&s, &pp),
+            vec!["alice-hy2-direct", "alice-hy2-direct-2"],
+            "前提：第二台另起了 -2"
+        );
+        let t = import_from_panel(&s, &pp, "alice", vec![other(10007)]);
+        assert_eq!(
+            names(&s, &pp),
+            vec!["alice-hy2-direct", "alice-hy2-direct-2"],
+            "{t}"
+        );
+        assert_eq!(got(&s, &pp, "alice-hy2-direct-2").node.port, 10007, "{t}");
+        assert_eq!(
+            got(&s, &pp, "alice-hy2-direct").node.port,
+            10000,
+            "第一台不受影响：{t}"
+        );
+    }
+
+    /// 25：先粘贴得到 `<主机>-<kind>` 名，再从面板导入同一账号的新端口 → 名字不变、原地换端口。
+    /// 列表里先摆一条别人的活动节点：粘进来的这条**不是** active（定稿 §11.2），留存者由
+    /// `pick_keeper` 的第 2 级「导入前已存在」选出，不是第 1 级「是当前活动节点」。
+    #[test]
+    fn port_move_keeps_a_host_kind_name_after_a_panel_import() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        listed(
+            &s,
+            &pp,
+            vec![entry(
+                "bob-hy2-direct",
+                crate::testutil::hy2_account_node("bob"),
+                Source::ApiNodes,
+                split_keywords(),
+            )],
+            "bob-hy2-direct",
+        );
+        let t = import_paste(
+            &s,
+            &pp,
+            &[&hy2_uri("alice", "hy2-pw", 40003, "alice-HY2住宅")],
+        );
+        assert_eq!(
+            names(&s, &pp),
+            vec!["bob-hy2-direct", "panel.example.com-hy2-resi"],
+            "{t}"
+        );
+        assert_eq!(
+            Profiles::load(&s, &pp).unwrap().active.as_deref(),
+            Some("bob-hy2-direct"),
+            "前提：粘进来的这条不是活动节点：{t}"
+        );
+        let t = import_from_panel(&s, &pp, "alice", vec![crate::testutil::hy2_resi_node()]);
+        assert_eq!(
+            names(&s, &pp),
+            vec!["bob-hy2-direct", "panel.example.com-hy2-resi"],
+            "{t}"
+        );
+        assert_eq!(
+            got(&s, &pp, "panel.example.com-hy2-resi").node.port,
+            40000,
+            "{t}"
+        );
+        assert!(
+            said_line(
+                &t,
+                "更新节点 panel.example.com-hy2-resi：端口 40003 → 40000"
+            ),
+            "{t}"
+        );
+    }
+
+    /// 34（D1）：过期密码的粘贴永远换不掉活动的 V3 节点。三格——同端口 / 跨端口两边备注都可信 /
+    /// 跨端口条目备注不可信（门槛外，说明句补那半句）。
+    #[test]
+    fn a_stale_password_paste_never_replaces_an_active_v3_node() {
+        for (entry_label, paste_label, port, unsure) in [
+            ("示例专用名", "custom", 10000u16, false),
+            ("示例专用名-HY2直连", "alice-HY2直连", 10005, false),
+            ("示例专用名", "custom", 10005, true),
+        ] {
+            let pp = paths();
+            let s = FakeSys::new();
+            ready(&s);
+            wide(&s);
+            let live = bui_schema::nodes::Node {
+                label: entry_label.into(),
+                ..hy2_account("alice", "hy2-pw")
+            };
+            let prof = listed(
+                &s,
+                &pp,
+                vec![entry(
+                    "hysteria2-1785892136",
+                    live.clone(),
+                    Source::V3,
+                    crate::testutil::split_global(),
+                )],
+                "hysteria2-1785892136",
+            );
+            let uri = hy2_uri("alice", "stale-pw", port, paste_label);
+            let why = Blocked::ActiveEntry {
+                kind_unsure: unsure,
+            };
+            assert_eq!(
+                prof.blocked_same_account(&uri_node(&uri), Source::Paste),
+                Some((0, why)),
+                "前提：这条真的被挡下（{entry_label} / {paste_label} / {port}）"
+            );
+            let before = marks(&s);
+            let t = import_paste(&s, &pp, &[&uri]);
+            let saved = Profiles::load(&s, &pp).unwrap();
+            assert_eq!(saved.active.as_deref(), Some("hysteria2-1785892136"), "{t}");
+            assert_eq!(
+                saved.profiles[0].node, live,
+                "活动节点一个字段都不许动：{t}"
+            );
+            assert_eq!(saved.profiles.len(), 2, "另起一条：{t}");
+            assert!(
+                said_line(
+                    &t,
+                    &menu::protected_new(
+                        "hysteria2-1785892136",
+                        "panel.example.com-hy2-direct",
+                        why
+                    )
+                ),
+                "{t}"
+            );
+            assert_eq!(
+                t.contains("当前节点不变，同时认不准是直连还是住宅；"),
+                unsure,
+                "门槛外才补那半句（{paste_label} / {port}）：{t}"
+            );
+            assert_not_applied(&s, before, "活动节点没动就不 apply", &t);
+        }
+    }
+
+    /// 35（D1）：过期密码的粘贴也换不掉面板来源的条目（不管它是不是活动节点）。
+    /// 两格：跨端口备注可信 / 不可信，报的都是 `PanelEntry`。
+    #[test]
+    fn a_stale_password_paste_never_replaces_a_panel_node() {
+        for (paste_label, unsure) in [("alice-HY2直连", false), ("custom", true)] {
+            let pp = paths();
+            let s = FakeSys::new();
+            ready(&s);
+            wide(&s);
+            let panel_entry = hy2_account("alice", "hy2-pw");
+            let prof = listed(
+                &s,
+                &pp,
+                vec![
+                    entry(
+                        "bob-hy2-direct",
+                        crate::testutil::hy2_account_node("bob"),
+                        Source::ApiNodes,
+                        split_keywords(),
+                    ),
+                    entry(
+                        "alice-hy2-direct",
+                        panel_entry.clone(),
+                        Source::ApiNodes,
+                        split_keywords(),
+                    ),
+                ],
+                "bob-hy2-direct",
+            );
+            let uri = hy2_uri("alice", "stale-pw", 10005, paste_label);
+            let why = Blocked::PanelEntry {
+                kind_unsure: unsure,
+            };
+            assert_eq!(
+                prof.blocked_same_account(&uri_node(&uri), Source::Paste),
+                Some((1, why)),
+                "前提：这条真的被挡下（{paste_label}）"
+            );
+            let before = marks(&s);
+            let t = import_paste(&s, &pp, &[&uri]);
+            assert_eq!(
+                got(&s, &pp, "alice-hy2-direct").node,
+                panel_entry,
+                "面板条目不许被过期链接改写：{t}"
+            );
+            assert!(
+                said_line(
+                    &t,
+                    &menu::protected_new("alice-hy2-direct", "panel.example.com-hy2-direct", why)
+                ),
+                "{t}"
+            );
+            assert!(t.contains("要更新它请从面板重新导入"), "{t}");
+            assert_eq!(
+                t.contains("alice-hy2-direct 不变，同时认不准是直连还是住宅；"),
+                unsure,
+                "{t}"
+            );
+            assert_not_applied(&s, before, "面板条目没动就不 apply", &t);
+        }
+    }
+
+    /// 36（D1 例外）：订阅是现拉的服务端数据——订阅来源的活动节点换了端口照常原地替换。
+    #[test]
+    fn a_subscription_refresh_still_replaces_an_active_subscription_node_across_ports() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let old = uri_node(&hy2_uri("alice", "hy2-pw", 40003, "alice-HY2住宅"));
+        listed(
+            &s,
+            &pp,
+            vec![entry(
+                "alice-hy2-resi",
+                old,
+                Source::Subscription,
+                crate::profiles::default_split(),
+            )],
+            "alice-hy2-resi",
+        );
+        let before = s.calls().len();
+        let t = import_from_sub(
+            &s,
+            &pp,
+            "alice",
+            &[&hy2_uri("alice", "hy2-pw", 40000, "alice-HY2住宅")],
+        );
+        assert_eq!(names(&s, &pp), vec!["alice-hy2-resi"], "{t}");
+        assert_eq!(got(&s, &pp, "alice-hy2-resi").node.port, 40000, "{t}");
+        assert!(
+            said_line(&t, "更新节点 alice-hy2-resi：端口 40003 → 40000"),
+            "{t}"
+        );
+        assert_eq!(
+            restarts_since(&s, before),
+            1,
+            "活动节点换了端口要 apply：{t}"
+        );
+    }
+
+    /// 36a（§5.5）：参数全同的一趟订阅刷新也把 V3 来源升成 Subscription，
+    /// 下一次换端口就能原地替换，不再被当成受保护条目。
+    #[test]
+    fn a_no_op_subscription_refresh_raises_a_v3_source_so_the_next_port_move_is_in_place() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let uri = hy2_uri("alice", "hy2-pw", 40003, "alice-HY2住宅");
+        listed(
+            &s,
+            &pp,
+            vec![entry(
+                "hysteria2-1785892136",
+                uri_node(&uri),
+                Source::V3,
+                crate::profiles::default_split(),
+            )],
+            "hysteria2-1785892136",
+        );
+        let (before, writes) = (marks(&s), s.writes("/opt/bui-c/profiles.json"));
+        let t = import_from_sub(&s, &pp, "alice", &[&uri]);
+        assert!(said_line(&t, "节点 hysteria2-1785892136 无变化"), "{t}");
+        assert_eq!(
+            got(&s, &pp, "hysteria2-1785892136").source,
+            Source::Subscription,
+            "命中即升级：{t}"
+        );
+        assert_eq!(
+            s.writes("/opt/bui-c/profiles.json") - writes,
+            1,
+            "来源升了就写一次盘：{t}"
+        );
+        assert_not_applied(&s, before, "内容没变不 apply", &t);
+
+        let before = s.calls().len();
+        let t = import_from_sub(
+            &s,
+            &pp,
+            "alice",
+            &[&hy2_uri("alice", "hy2-pw", 40000, "alice-HY2住宅")],
+        );
+        assert_eq!(names(&s, &pp), vec!["hysteria2-1785892136"], "{t}");
+        assert_eq!(got(&s, &pp, "hysteria2-1785892136").node.port, 40000, "{t}");
+        assert!(!t.contains("当前节点不变"), "升过来源就不再另起：{t}");
+        assert_eq!(restarts_since(&s, before), 1, "{t}");
+    }
+
+    /// 36b（§5.5）：参数全同的一趟面板导入把 V3 条目升成 ApiNodes，之后过期粘贴就被挡下。
+    /// 两格：粘贴备注可信 / 不可信——条目已是 ApiNodes，两格报的都是 `PanelEntry`。
+    #[test]
+    fn a_no_op_panel_refresh_raises_the_source_and_then_blocks_a_stale_paste() {
+        for (paste_label, unsure) in [("alice-HY2直连", false), ("custom", true)] {
+            let pp = paths();
+            let s = FakeSys::new();
+            ready(&s);
+            wide(&s);
+            listed(
+                &s,
+                &pp,
+                vec![
+                    entry(
+                        "bob-hy2-direct",
+                        crate::testutil::hy2_account_node("bob"),
+                        Source::ApiNodes,
+                        split_keywords(),
+                    ),
+                    entry(
+                        "hysteria2-1778329470",
+                        hy2_direct_node(),
+                        Source::V3,
+                        split_keywords(),
+                    ),
+                ],
+                "bob-hy2-direct",
+            );
+            let t = import_from_panel(&s, &pp, "alice", vec![hy2_direct_node()]);
+            assert!(said_line(&t, "节点 hysteria2-1778329470 无变化"), "{t}");
+            assert_eq!(
+                got(&s, &pp, "hysteria2-1778329470").source,
+                Source::ApiNodes,
+                "命中即升级：{t}"
+            );
+
+            let uri = hy2_uri("alice", "stale-pw", 10005, paste_label);
+            let why = Blocked::PanelEntry {
+                kind_unsure: unsure,
+            };
+            assert_eq!(
+                Profiles::load(&s, &pp)
+                    .unwrap()
+                    .blocked_same_account(&uri_node(&uri), Source::Paste),
+                Some((1, why)),
+                "前提：升过来源之后真的被挡下（{paste_label}）"
+            );
+            let t = import_paste(&s, &pp, &[&uri]);
+            assert_eq!(
+                got(&s, &pp, "hysteria2-1778329470").node,
+                hy2_direct_node(),
+                "{t}"
+            );
+            assert!(
+                said_line(
+                    &t,
+                    &menu::protected_new(
+                        "hysteria2-1778329470",
+                        "panel.example.com-hy2-direct",
+                        why
+                    )
+                ),
+                "{t}"
+            );
+            assert!(t.contains("要更新它请从面板重新导入"), "{t}");
+        }
+    }
+
+    /// 37（D1）：从未被订阅或面板命中过的 V3 活动节点，订阅刷新遇上换端口只能另起一条，
+    /// 出路是「切换过去」，不叫人再导一次订阅（照做只会重复同样的结果）。
+    #[test]
+    fn a_subscription_refresh_never_replaces_an_active_v3_node_across_ports() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let live = uri_node(&hy2_uri("alice", "old-pw", 40003, "alice-HY2住宅"));
+        let prof = listed(
+            &s,
+            &pp,
+            vec![entry(
+                "hysteria2-1785892136",
+                live.clone(),
+                Source::V3,
+                crate::profiles::default_split(),
+            )],
+            "hysteria2-1785892136",
+        );
+        let fresh_uri = hy2_uri("alice", "new-pw", 40000, "alice-HY2住宅");
+        assert_eq!(
+            prof.blocked_same_account(&uri_node(&fresh_uri), Source::Subscription),
+            Some((0, Blocked::ActiveEntry { kind_unsure: false })),
+            "前提：这条真的被挡下（§11 通则，防静默空过）"
+        );
+        let before = marks(&s);
+        let t = import_from_sub(&s, &pp, "alice", &[&fresh_uri]);
+        let saved = Profiles::load(&s, &pp).unwrap();
+        assert_eq!(saved.active.as_deref(), Some("hysteria2-1785892136"), "{t}");
+        assert_eq!(saved.profiles[0].node, live, "{t}");
+        assert_eq!(names(&s, &pp).len(), 2, "{t}");
+        assert!(
+            said_line(
+                &t,
+                "与当前节点 hysteria2-1785892136 同一账号但连接参数不同，已按新节点导入为 alice-hy2-resi，当前节点不变；确认新节点能用后可以切换过去"
+            ),
+            "{t}"
+        );
+        assert!(!t.contains("订阅"), "出路不是再导一次订阅：{t}");
+        assert_not_applied(&s, before, "活动节点没动就不 apply", &t);
+    }
+
+    /// 38（D1）：面板来件不受保护规则限制——活动的 V3 条目与面板来源条目都照常原地替换。
+    #[test]
+    fn a_panel_import_replaces_protected_members() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let v3 = bui_schema::nodes::Node {
+            label: "示例专用名-HY2直连".into(),
+            port: 10003,
+            ..hy2_direct_node()
+        };
+        let old_resi = bui_schema::nodes::Node {
+            port: 40003,
+            ..crate::testutil::hy2_resi_node()
+        };
+        listed(
+            &s,
+            &pp,
+            vec![
+                entry("hysteria2-1778329470", v3, Source::V3, split_keywords()),
+                entry(
+                    "alice-hy2-resi",
+                    old_resi,
+                    Source::ApiNodes,
+                    split_keywords(),
+                ),
+            ],
+            "hysteria2-1778329470",
+        );
+        let t = import_from_panel(
+            &s,
+            &pp,
+            "alice",
+            vec![hy2_direct_node(), crate::testutil::hy2_resi_node()],
+        );
+        assert_eq!(
+            names(&s, &pp),
+            vec!["hysteria2-1778329470", "alice-hy2-resi"],
+            "{t}"
+        );
+        assert_eq!(got(&s, &pp, "hysteria2-1778329470").node.port, 10000, "{t}");
+        assert_eq!(got(&s, &pp, "alice-hy2-resi").node.port, 40000, "{t}");
+    }
+
+    /// 38a（C2）：面板开了混淆之后粘进来的旧链接，端口与密码都相同，但 obfs 密码没了——
+    /// 按「同一连接」覆盖上去活动节点就连不上，所以收紧到同参数。两格：面板来源 / V3 来源。
+    #[test]
+    fn a_stale_paste_without_obfs_never_replaces_the_active_node() {
+        for (src, way) in [
+            (Source::ApiNodes, "要更新它请从面板重新导入"),
+            (Source::V3, "确认新节点能用后可以切换过去"),
+        ] {
+            let pp = paths();
+            let s = FakeSys::new();
+            ready(&s);
+            wide(&s);
+            let uri = hy2_uri("alice", "hy2-pw", 40000, "alice-HY2住宅");
+            let live = bui_schema::nodes::Node {
+                transport: bui_schema::nodes::Transport::Hysteria2 {
+                    username: "alice".into(),
+                    password: "hy2-pw".into(),
+                    sni: "panel.example.com".into(),
+                    obfs_password: Some("obfs-pw".into()),
+                },
+                ..uri_node(&uri)
+            };
+            let prof = listed(
+                &s,
+                &pp,
+                vec![entry("alice-hy2-resi", live.clone(), src, split_keywords())],
+                "alice-hy2-resi",
+            );
+            let why = match src {
+                Source::ApiNodes => Blocked::PanelEntry { kind_unsure: false },
+                _ => Blocked::ActiveEntry { kind_unsure: false },
+            };
+            assert_eq!(
+                prof.blocked_same_account(&uri_node(&uri), Source::Paste),
+                Some((0, why)),
+                "前提：同端口同密码，但少了 obfs，仍然挡下"
+            );
+            let before = marks(&s);
+            let t = import_paste(&s, &pp, &[&uri]);
+            assert_eq!(
+                got(&s, &pp, "alice-hy2-resi").node,
+                live,
+                "obfs 密码不许被抹掉：{t}"
+            );
+            assert_eq!(names(&s, &pp).len(), 2, "另起一条：{t}");
+            assert!(t.contains(way), "{t}");
+            assert_not_applied(&s, before, "活动节点没动就不 apply", &t);
+        }
+    }
+
+    /// 38b（A2）：组非空时，被挡下的活动节点也要说明——否则它停在旧端口、另一条副本悄悄
+    /// 换到新端口，用户看不出当前节点没动。留存者名进 `switch_to`，菜单据此追问切换。
+    #[test]
+    fn a_subscription_refresh_explains_a_blocked_active_node_when_another_copy_moves() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let old = uri_node(&hy2_uri("alice", "hy2-pw", 40003, "alice-HY2住宅"));
+        let live = bui_schema::nodes::Node {
+            label: "alice-HY2住宅".into(),
+            ..old.clone()
+        };
+        let mut prof = listed(
+            &s,
+            &pp,
+            vec![
+                entry(
+                    "hysteria2-1785892136",
+                    live.clone(),
+                    Source::V3,
+                    crate::profiles::default_split(),
+                ),
+                entry(
+                    "panel.example.com-hy2-resi",
+                    old,
+                    Source::Subscription,
+                    crate::profiles::default_split(),
+                ),
+            ],
+            "hysteria2-1785892136",
+        );
+        let fresh = uri_node(&hy2_uri("alice", "hy2-pw", 40000, "alice-HY2住宅"));
+        assert_eq!(
+            prof.blocked_same_account(&fresh, Source::Subscription),
+            Some((0, Blocked::ActiveEntry { kind_unsure: false })),
+            "前提：活动的 V3 节点被挡下"
+        );
+        // Stored.switch_to：菜单的切换候选（§5.10）
+        let (out, _) = stored_from(
+            &s,
+            &pp,
+            &mut prof,
+            "alice",
+            vec![fresh.clone()],
+            Source::Subscription,
+        );
+        assert_eq!(
+            out.switch_to,
+            vec!["panel.example.com-hy2-resi".to_string()]
+        );
+        assert!(out.added.is_empty(), "{:?}", out.added);
+
+        let before = marks(&s);
+        let t = import_from_sub(
+            &s,
+            &pp,
+            "alice",
+            &[&hy2_uri("alice", "hy2-pw", 40000, "alice-HY2住宅")],
+        );
+        assert!(
+            said_line(
+                &t,
+                "当前节点 hysteria2-1785892136 与 panel.example.com-hy2-resi 同一账号但连接参数不同，当前节点不变；确认 panel.example.com-hy2-resi 能用后可以切换过去"
+            ),
+            "{t}"
+        );
+        let saved = Profiles::load(&s, &pp).unwrap();
+        assert_eq!(saved.active.as_deref(), Some("hysteria2-1785892136"), "{t}");
+        assert_eq!(saved.profiles[0].node, live, "{t}");
+        assert_eq!(
+            got(&s, &pp, "panel.example.com-hy2-resi").node.port,
+            40000,
+            "{t}"
+        );
+        assert_not_applied(&s, before, "活动节点没动就不 apply", &t);
+    }
+
+    /// 38c（A2、§9 表后说明）：组非空、另有一条面板来源的副本被过期粘贴挡下 → 打基础版
+    /// `protected_kept`，不进 `switch_to`。再补两格，钉住「从面板重新导入」这条出路的两种落法。
+    #[test]
+    fn a_panel_import_with_a_blocked_panel_copy_is_explained() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let panel_copy = bui_schema::nodes::Node {
+            port: 40000,
+            ..crate::testutil::hy2_resi_node()
+        };
+        let pasted = uri_node(&hy2_uri("alice", "old-pw", 40003, "alice-HY2住宅"));
+        let mut prof = listed(
+            &s,
+            &pp,
+            vec![
+                entry(
+                    "bob-hy2-direct",
+                    crate::testutil::hy2_account_node("bob"),
+                    Source::ApiNodes,
+                    split_keywords(),
+                ),
+                entry(
+                    "alice-hy2-resi",
+                    panel_copy.clone(),
+                    Source::ApiNodes,
+                    split_keywords(),
+                ),
+                entry(
+                    "panel.example.com-hy2-resi-2",
+                    pasted,
+                    Source::Paste,
+                    crate::profiles::default_split(),
+                ),
+            ],
+            "bob-hy2-direct",
+        );
+        let fresh = uri_node(&hy2_uri("alice", "new-pw", 40003, "alice-HY2住宅"));
+        assert_eq!(
+            prof.blocked_same_account(&fresh, Source::Paste),
+            Some((1, Blocked::PanelEntry { kind_unsure: false })),
+            "前提：面板副本被挡下，备注与它同向所以门槛内"
+        );
+        let (out, t) = stored_from(&s, &pp, &mut prof, "", vec![fresh], Source::Paste);
+        assert!(out.switch_to.is_empty(), "面板条目那一句不给切换候选");
+        assert!(
+            said_line(
+                &t,
+                "alice-hy2-resi 与 panel.example.com-hy2-resi-2 同一账号但连接参数不同，alice-hy2-resi 不变；要更新它请从面板重新导入"
+            ),
+            "{t}"
+        );
+
+        // (a) 该账号只剩被挡过的那条面板条目 → 面板重新导入时它就是留存者，被原地替换
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        listed(
+            &s,
+            &pp,
+            vec![entry(
+                "alice-hy2-resi",
+                bui_schema::nodes::Node {
+                    port: 40003,
+                    ..crate::testutil::hy2_resi_node()
+                },
+                Source::ApiNodes,
+                split_keywords(),
+            )],
+            "alice-hy2-resi",
+        );
+        let t = import_from_panel(&s, &pp, "alice", vec![crate::testutil::hy2_resi_node()]);
+        assert_eq!(got(&s, &pp, "alice-hy2-resi").node.port, 40000, "{t}");
+
+        // (b) 该账号还有一条自身 kind 可信的活动节点 → 它是留存者，面板条目转成存量重复
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let stale = bui_schema::nodes::Node {
+            port: 40003,
+            ..crate::testutil::hy2_resi_node()
+        };
+        listed(
+            &s,
+            &pp,
+            vec![
+                entry(
+                    "hysteria2-1785892136",
+                    bui_schema::nodes::Node {
+                        label: "alice-HY2住宅".into(),
+                        ..stale.clone()
+                    },
+                    Source::V3,
+                    split_keywords(),
+                ),
+                entry("alice-hy2-resi", stale, Source::ApiNodes, split_keywords()),
+            ],
+            "hysteria2-1785892136",
+        );
+        let t = import_from_panel(&s, &pp, "alice", vec![crate::testutil::hy2_resi_node()]);
+        assert_eq!(got(&s, &pp, "hysteria2-1785892136").node.port, 40000, "{t}");
+        assert_eq!(
+            got(&s, &pp, "alice-hy2-resi").node.port,
+            40003,
+            "不是留存者的那条不动：{t}"
+        );
+        assert!(
+            said_line(
+                &t,
+                &menu::dups_head("hysteria2-1785892136", &["alice-hy2-resi".to_string()])
+            ),
+            "{t}"
+        );
+        assert!(
+            Profiles::load(&s, &pp).unwrap().deleted.is_empty(),
+            "只提示不删：{t}"
+        );
+    }
+
+    /// 39（D2）：命令行只提示存量重复，不问、不改。
+    #[test]
+    fn cli_import_reports_duplicates_without_merging() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let at = |port: u16| bui_schema::nodes::Node {
+            port,
+            ..crate::testutil::hy2_resi_node()
+        };
+        let mut prof = listed(
+            &s,
+            &pp,
+            vec![
+                entry(
+                    "alice-hy2-resi",
+                    at(40003),
+                    Source::ApiNodes,
+                    split_keywords(),
+                ),
+                entry(
+                    "alice-hy2-resi-2",
+                    at(40007),
+                    Source::ApiNodes,
+                    split_keywords(),
+                ),
+            ],
+            "alice-hy2-resi",
+        );
+        // 这一批里再带一个删过的账号：它的「跳过 N 个删过的节点」是 apply 之后才打的，
+        // 正好钉住存量重复那两句连着打在它前面（spec §10）
+        prof.bury(
+            &entry(
+                "panel.example.com-hy2-direct",
+                hy2_direct_node(),
+                Source::ApiNodes,
+                split_keywords(),
+            ),
+            0,
+        );
+        prof.save(&s, &pp).unwrap();
+        let before = s.calls().len();
+        let t = import_from_panel(&s, &pp, "alice", vec![at(40009), hy2_direct_node()]);
+        assert_eq!(got(&s, &pp, "alice-hy2-resi").node.port, 40009, "{t}");
+        assert_eq!(
+            got(&s, &pp, "alice-hy2-resi-2").node.port,
+            40007,
+            "命令行一条都不动：{t}"
+        );
+        // 提示句与「怎么合并」那一行是连体输出（spec §10 表），中间不许插进 apply 的输出
+        let head = menu::dups_head("alice-hy2-resi", &["alice-hy2-resi-2".to_string()]);
+        let said: Vec<&str> = t.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        let i = said
+            .iter()
+            .position(|l| *l == head)
+            .unwrap_or_else(|| panic!("没打存量重复提示：{t}"));
+        assert_eq!(
+            said.get(i + 1).copied(),
+            Some(menu::DUPS_HINT_CLI),
+            "两句中间插了别的行：{t}"
+        );
+        assert!(
+            said_line(
+                &t,
+                &menu::buried_skipped(&["panel.example.com-hy2-direct".to_string()])
+            ),
+            "删过的那个照样只跳过、只报一行：{t}"
+        );
+        assert_eq!(
+            Profiles::load(&s, &pp).unwrap().deleted.len(),
+            1,
+            "只剩事先埋的那一条：存量重复只提示、不删，也不记墓碑：{t}"
+        );
+        assert_eq!(
+            restarts_since(&s, before),
+            1,
+            "活动节点换了端口要 apply：{t}"
+        );
+    }
+
+    /// 39a（§5.4 ①）：`push_dups` 按留存者合并、`others` 去重——同一个账号在一批里被点名
+    /// 两次（本批两行都落进它的账号组）时，提示句只打一遍，菜单也只问一遍。
+    #[test]
+    fn push_dups_merges_by_keeper_and_dedups_others() {
+        let mut out = Stored::default();
+        out.push_dups("alice-hy2-resi", vec!["alice-hy2-resi-2".into()]);
+        out.push_dups(
+            "alice-hy2-resi",
+            vec!["alice-hy2-resi-3".into(), "alice-hy2-resi-2".into()],
+        );
+        out.push_dups("bob-hy2-direct", vec!["bob-hy2-direct-2".into()]);
+        assert_eq!(
+            out.dups,
+            vec![
+                DupGroup {
+                    keeper: "alice-hy2-resi".into(),
+                    others: vec!["alice-hy2-resi-2".into(), "alice-hy2-resi-3".into()],
+                },
+                DupGroup {
+                    keeper: "bob-hy2-direct".into(),
+                    others: vec!["bob-hy2-direct-2".into()],
+                },
+            ]
+        );
+    }
+
+    /// 40：这批没带到的账号，列表里有重复也不动、不提示。
+    #[test]
+    fn duplicates_of_accounts_outside_the_batch_are_left_alone() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let at = |port: u16| bui_schema::nodes::Node {
+            port,
+            ..crate::testutil::hy2_resi_node()
+        };
+        listed(
+            &s,
+            &pp,
+            vec![
+                entry(
+                    "alice-hy2-direct",
+                    hy2_direct_node(),
+                    Source::ApiNodes,
+                    split_keywords(),
+                ),
+                entry(
+                    "alice-hy2-resi",
+                    at(40003),
+                    Source::ApiNodes,
+                    split_keywords(),
+                ),
+                entry(
+                    "alice-hy2-resi-2",
+                    at(40007),
+                    Source::ApiNodes,
+                    split_keywords(),
+                ),
+            ],
+            "alice-hy2-direct",
+        );
+        let t = import_from_panel(&s, &pp, "alice", vec![hy2_direct_node()]);
+        assert_eq!(got(&s, &pp, "alice-hy2-resi").node.port, 40003, "{t}");
+        assert_eq!(got(&s, &pp, "alice-hy2-resi-2").node.port, 40007, "{t}");
+        assert!(!t.contains("同一账号还有"), "没带到的账号不提示：{t}");
+    }
+
+    /// 41：同一批里先写入的副本落进后一条的账号组 → 当场并掉，不提示、不记墓碑、不算新节点。
+    #[test]
+    fn a_batch_written_copy_is_merged_on_the_spot_and_not_counted_as_new() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let prof = listed(
+            &s,
+            &pp,
+            vec![
+                entry(
+                    "bob-hy2-direct",
+                    crate::testutil::hy2_account_node("bob"),
+                    Source::ApiNodes,
+                    split_keywords(),
+                ),
+                entry(
+                    "hysteria2-1785892136",
+                    bui_schema::nodes::Node {
+                        label: "alice-HY2直连".into(),
+                        ..hy2_account("alice", "hy2-pw")
+                    },
+                    Source::V3,
+                    crate::testutil::split_global(),
+                ),
+            ],
+            "bob-hy2-direct",
+        );
+        let guessed = hy2_uri("alice", "hy2-pw", 10005, "custom");
+        assert_eq!(
+            prof.blocked_same_account(&uri_node(&guessed), Source::Paste),
+            Some((1, Blocked::KindUnsure)),
+            "前提：第一条卡在门槛外、另起一条（§11 通则）"
+        );
+        let t = import_paste(
+            &s,
+            &pp,
+            &[
+                &guessed,
+                &hy2_uri("alice", "hy2-pw", 10005, "alice-HY2直连"),
+            ],
+        );
+        assert_eq!(
+            names(&s, &pp),
+            vec!["bob-hy2-direct", "hysteria2-1785892136"],
+            "本批副本当场并掉：{t}"
+        );
+        assert_eq!(got(&s, &pp, "hysteria2-1785892136").node.port, 10005, "{t}");
+        assert!(t.contains("导入 0 个新节点"), "并掉的不算新节点：{t}");
+        assert!(!t.contains("同一账号还有"), "本批副本不作存量重复提示：{t}");
+        assert!(
+            said_line(
+                &t,
+                &menu::kind_unsure_new("hysteria2-1785892136", "panel.example.com-hy2-direct")
+            ),
+            "第一条那句说明已经打出去了，留在输出里（spec §5.4 逐条说明）：{t}"
+        );
+        assert!(Profiles::load(&s, &pp).unwrap().deleted.is_empty(), "{t}");
+    }
+
+    /// 41a（§5.4 ①）：当场并掉的本批副本也要从 `names` 里清掉。`--activate`（或列表本来没有
+    /// 活动节点）时活动节点取 `stored.names.first()`——留着它，active 就指向一条已经不在列表里
+    /// 的 profile，apply 当场报「没有激活的节点」。
+    #[test]
+    fn a_merged_batch_copy_never_becomes_the_active_node() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let prof = listed(
+            &s,
+            &pp,
+            vec![
+                entry(
+                    "bob-hy2-direct",
+                    crate::testutil::hy2_account_node("bob"),
+                    Source::ApiNodes,
+                    split_keywords(),
+                ),
+                entry(
+                    "hysteria2-1785892136",
+                    bui_schema::nodes::Node {
+                        label: "alice-HY2直连".into(),
+                        ..hy2_account("alice", "hy2-pw")
+                    },
+                    Source::V3,
+                    crate::testutil::split_global(),
+                ),
+            ],
+            "bob-hy2-direct",
+        );
+        let guessed = hy2_uri("alice", "hy2-pw", 10005, "custom");
+        assert_eq!(
+            prof.blocked_same_account(&uri_node(&guessed), Source::Paste),
+            Some((1, Blocked::KindUnsure)),
+            "前提：第一条卡在门槛外、另起一条（§11 通则）"
+        );
+        let t = import_paste_with(
+            &s,
+            &pp,
+            &[
+                &guessed,
+                &hy2_uri("alice", "hy2-pw", 10005, "alice-HY2直连"),
+            ],
+            &["--activate"],
+        );
+        assert_eq!(
+            names(&s, &pp),
+            vec!["bob-hy2-direct", "hysteria2-1785892136"],
+            "本批副本当场并掉：{t}"
+        );
+        assert_eq!(
+            Profiles::load(&s, &pp).unwrap().active.as_deref(),
+            Some("hysteria2-1785892136"),
+            "活动节点是留存者，不是被并掉的那条：{t}"
+        );
+    }
+
+    /// 41b（§5.4 ①）：并掉的本批副本从 `added` / `names` / `replaced` / `restored` 四个名单里
+    /// 一起清掉——留在任何一个里，结果行、菜单追问与「加回来了」那一句都会提到一条已经不在
+    /// 列表里的 profile。三行粘贴把四个名单都用上：① 门槛外另起一条（`added`，顺手清掉这个
+    /// 账号的墓碑 → `restored`）；② 同端口换了密码，把它原地更新（`replaced`）；③ 备注可信的
+    /// 那一条跨端口进组，留存者是导入前就在的 V3 条目，副本当场并掉。
+    #[test]
+    fn a_merged_batch_copy_is_cleared_from_every_name_list() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let v3 = bui_schema::nodes::Node {
+            label: "alice-HY2直连".into(),
+            ..hy2_account("alice", "hy2-pw")
+        };
+        let mut prof = listed(
+            &s,
+            &pp,
+            vec![
+                entry(
+                    "bob-hy2-direct",
+                    crate::testutil::hy2_account_node("bob"),
+                    Source::ApiNodes,
+                    split_keywords(),
+                ),
+                entry(
+                    "hysteria2-1785892136",
+                    v3.clone(),
+                    Source::V3,
+                    crate::testutil::split_global(),
+                ),
+            ],
+            "bob-hy2-direct",
+        );
+        // 这个账号删过一条副本（另一条还在列表里）：墓碑是账号级的，所以门槛外另起的那一条
+        // 会清掉它、记进 `restored`
+        prof.bury(
+            &entry(
+                "panel.example.com-hy2-direct",
+                v3.clone(),
+                Source::Paste,
+                crate::profiles::default_split(),
+            ),
+            0,
+        );
+        let guessed = |pw: &str| uri_node(&hy2_uri("alice", pw, 10005, "custom"));
+        assert_eq!(
+            prof.blocked_same_account(&guessed("hy2-pw"), Source::Paste),
+            Some((1, Blocked::KindUnsure)),
+            "前提：第一条卡在门槛外、另起一条（§11 通则）"
+        );
+        let (out, t) = stored_restoring(
+            &s,
+            &pp,
+            &mut prof,
+            "",
+            vec![
+                guessed("hy2-pw"),
+                guessed("rotated-pw"),
+                uri_node(&hy2_uri("alice", "hy2-pw", 10005, "alice-HY2直连")),
+            ],
+            Source::Paste,
+            true,
+        );
+        let keeper = "hysteria2-1785892136".to_string();
+        assert_eq!(out.names, vec![keeper.clone()], "{t}");
+        assert_eq!(out.replaced, vec![keeper], "{t}");
+        assert!(out.added.is_empty(), "并掉的不算新节点：{out:?}");
+        assert!(
+            out.restored.is_empty(),
+            "并掉的那条不留在 restored 里：{out:?}"
+        );
+        assert!(out.dups.is_empty(), "本批副本不是存量重复：{out:?}");
+        assert_eq!(
+            prof.profiles.iter().map(|p| &p.name).collect::<Vec<_>>(),
+            vec!["bob-hy2-direct", "hysteria2-1785892136"],
+            "{t}"
+        );
+        assert_eq!(prof.profiles[1].node.port, 10005, "{t}");
+    }
+
+    /// 42：活动节点停在旧端口、另一条副本已是新端口 → 留存者仍是活动节点，它被挪过去。
+    #[test]
+    fn a_stale_active_with_an_up_to_date_duplicate_moves_the_active() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let at = |port: u16| bui_schema::nodes::Node {
+            port,
+            ..crate::testutil::hy2_resi_node()
+        };
+        listed(
+            &s,
+            &pp,
+            vec![
+                entry(
+                    "alice-hy2-resi",
+                    at(40003),
+                    Source::ApiNodes,
+                    split_keywords(),
+                ),
+                entry(
+                    "alice-hy2-resi-2",
+                    at(40000),
+                    Source::ApiNodes,
+                    split_keywords(),
+                ),
+            ],
+            "alice-hy2-resi",
+        );
+        let t = import_from_panel(&s, &pp, "alice", vec![at(40000)]);
+        assert_eq!(got(&s, &pp, "alice-hy2-resi").node.port, 40000, "{t}");
+        assert!(
+            s.get("/opt/bui-c/config.json")
+                .is_some_and(|c| c.contains("40000")),
+            "活动节点挪过去就要重渲配置：{t}"
+        );
+        // 收尾 M2：这条副本恰好已经与来件全等，所以 `dups_head` 只报事实、不许断言
+        // 「与服务端这次给的端口或凭据不一致」——那句话在这一格是假的
+        assert!(
+            crate::profiles::same_params(&got(&s, &pp, "alice-hy2-resi-2").node, &at(40000)),
+            "{t}"
+        );
+        assert!(
+            said_line(
+                &t,
+                &menu::dups_head("alice-hy2-resi", &["alice-hy2-resi-2".to_string()])
+            ),
+            "{t}"
+        );
+    }
+
+    /// 43：活动节点已是新端口、旧端口那条非活动 → `Unchanged`，只提示，不重启。
+    #[test]
+    fn an_unchanged_active_with_a_stale_duplicate_does_not_restart() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let at = |port: u16| bui_schema::nodes::Node {
+            port,
+            ..crate::testutil::hy2_resi_node()
+        };
+        listed(
+            &s,
+            &pp,
+            vec![
+                entry(
+                    "alice-hy2-resi",
+                    at(40000),
+                    Source::ApiNodes,
+                    split_keywords(),
+                ),
+                entry(
+                    "alice-hy2-resi-2",
+                    at(40003),
+                    Source::ApiNodes,
+                    split_keywords(),
+                ),
+            ],
+            "alice-hy2-resi",
+        );
+        let before = marks(&s);
+        let t = import_from_panel(&s, &pp, "alice", vec![at(40000)]);
+        assert!(said_line(&t, "节点 alice-hy2-resi 无变化"), "{t}");
+        assert!(
+            said_line(
+                &t,
+                &menu::dups_head("alice-hy2-resi", &["alice-hy2-resi-2".to_string()])
+            ),
+            "{t}"
+        );
+        assert_not_applied(&s, before, "内容没变不 apply", &t);
+    }
+
+    /// 44（A1）：备注被改过的粘贴遇上既受保护又在门槛外的条目 → 报 `PanelEntry` 并补那半句，
+    /// 不打 `kind_unsure_new`；直连节点与 active 一动不动。
+    #[test]
+    fn a_guessed_kind_paste_is_explained_as_a_protected_panel_entry() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let prof = listed(
+            &s,
+            &pp,
+            vec![entry(
+                "alice-hy2-direct",
+                hy2_direct_node(),
+                Source::ApiNodes,
+                split_keywords(),
+            )],
+            "alice-hy2-direct",
+        );
+        let uri = hy2_uri("alice", "hy2-pw", 40003, "custom");
+        let why = Blocked::PanelEntry { kind_unsure: true };
+        assert_eq!(
+            prof.blocked_same_account(&uri_node(&uri), Source::Paste),
+            Some((0, why)),
+            "前提：既受保护又在门槛外"
+        );
+        let before = marks(&s);
+        let t = import_paste(&s, &pp, &[&uri]);
+        let saved = Profiles::load(&s, &pp).unwrap();
+        assert_eq!(saved.profiles[0].node, hy2_direct_node(), "{t}");
+        assert_eq!(saved.active.as_deref(), Some("alice-hy2-direct"), "{t}");
+        assert_eq!(saved.profiles.len(), 2, "{t}");
+        assert!(
+            said_line(
+                &t,
+                &menu::protected_new("alice-hy2-direct", "panel.example.com-hy2-direct", why)
+            ),
+            "{t}"
+        );
+        assert!(
+            t.contains("alice-hy2-direct 不变，同时认不准是直连还是住宅；"),
+            "{t}"
+        );
+        assert!(
+            !t.contains("同一账号但端口不同"),
+            "保护优先，不打门槛那一句：{t}"
+        );
+        assert_not_applied(&s, before, "活动节点没动就不 apply", &t);
+    }
+
+    /// 45：备注猜出来的 kind 活动 profile 不会被面板直连节点吞掉（出口会静默从住宅换成 VPS）。
+    #[test]
+    fn a_guessed_kind_active_profile_is_not_swallowed_by_a_panel_direct_node() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let live = bui_schema::nodes::Node {
+            label: "alice-HY2".into(),
+            port: 40003,
+            ..hy2_direct_node()
+        };
+        let prof = listed(
+            &s,
+            &pp,
+            vec![entry(
+                "hysteria2-1785892136",
+                live.clone(),
+                Source::V3,
+                crate::testutil::split_global(),
+            )],
+            "hysteria2-1785892136",
+        );
+        assert_eq!(
+            prof.blocked_same_account(&hy2_direct_node(), Source::ApiNodes),
+            Some((0, Blocked::KindUnsure)),
+            "前提：这条真的被挡下（§11 通则，防静默空过）"
+        );
+        let before = marks(&s);
+        let t = import_from_panel(&s, &pp, "alice", vec![hy2_direct_node()]);
+        let saved = Profiles::load(&s, &pp).unwrap();
+        assert_eq!(saved.profiles[0].node, live, "{t}");
+        assert_eq!(saved.active.as_deref(), Some("hysteria2-1785892136"), "{t}");
+        assert_eq!(names(&s, &pp).len(), 2, "面板直连节点另起一条：{t}");
+        assert!(
+            said_line(
+                &t,
+                &menu::kind_unsure_new("hysteria2-1785892136", "alice-hy2-direct")
+            ),
+            "{t}"
+        );
+        assert_not_applied(&s, before, "活动节点没动就不 apply", &t);
+    }
+
+    /// 46：端口相同就不必问 kind——猜错 kind 也换不到别的实例上去，原地替换，名字保留。
+    #[test]
+    fn a_guessed_kind_profile_on_the_same_port_is_updated_in_place() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        listed(
+            &s,
+            &pp,
+            vec![entry(
+                "hysteria2-1778329470",
+                bui_schema::nodes::Node {
+                    label: "示例备注".into(),
+                    ..hy2_direct_node()
+                },
+                Source::V3,
+                crate::testutil::split_global(),
+            )],
+            "hysteria2-1778329470",
+        );
+        let t = import_from_panel(&s, &pp, "alice", vec![hy2_direct_node()]);
+        assert_eq!(names(&s, &pp), vec!["hysteria2-1778329470"], "{t}");
+        let p = got(&s, &pp, "hysteria2-1778329470");
+        assert_eq!(p.node.label, "HY2直连", "{t}");
+        assert_eq!(p.source, Source::ApiNodes, "{t}");
+    }
+
+    /// 47（D9 ③）：门槛外的同账号条目名字与这次要起的名字不同，也照样打说明行。
+    /// 这条条目非活动、非面板来源（不受保护），报的是 `KindUnsure`。
+    #[test]
+    fn a_blocked_same_account_entry_with_another_name_is_explained() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let prof = listed(
+            &s,
+            &pp,
+            vec![
+                entry(
+                    "bob-hy2-direct",
+                    crate::testutil::hy2_account_node("bob"),
+                    Source::ApiNodes,
+                    split_keywords(),
+                ),
+                entry(
+                    "hysteria2-1778329470",
+                    bui_schema::nodes::Node {
+                        label: "示例备注".into(),
+                        ..hy2_direct_node()
+                    },
+                    Source::V3,
+                    crate::testutil::split_global(),
+                ),
+            ],
+            "bob-hy2-direct",
+        );
+        let uri = hy2_uri("alice", "hy2-pw", 40003, "custom");
+        assert_eq!(
+            prof.blocked_same_account(&uri_node(&uri), Source::Paste),
+            Some((1, Blocked::KindUnsure)),
+            "前提：不受保护、只是卡在门槛外"
+        );
+        let t = import_paste(&s, &pp, &[&uri]);
+        assert!(
+            said_line(
+                &t,
+                &menu::kind_unsure_new("hysteria2-1778329470", "panel.example.com-hy2-direct")
+            ),
+            "名字对不上也要说明：{t}"
+        );
+        assert_eq!(names(&s, &pp).len(), 3, "{t}");
+    }
+
+    /// 48：同一批里同一账号出现两次、都在门槛内 → 后一条生效，只留一条。
+    #[test]
+    fn the_same_account_twice_in_a_trusted_batch_keeps_the_later_one() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let t = import_paste(
+            &s,
+            &pp,
+            &[
+                &hy2_uri("alice", "hy2-pw", 10005, "alice-HY2直连"),
+                &hy2_uri("alice", "hy2-pw", 10007, "alice-HY2直连"),
+            ],
+        );
+        assert_eq!(names(&s, &pp), vec!["panel.example.com-hy2-direct"], "{t}");
+        assert_eq!(
+            got(&s, &pp, "panel.example.com-hy2-direct").node.port,
+            10007,
+            "{t}"
+        );
+    }
+
+    /// 48a（§5.4「后一条生效」）：同一批里同账号的两条可信来件必须认同一个留存者。
+    /// 不定住的话 `pick_keeper` 第 3 级「与来件同一连接」会让两条来件各自挑中端口相同的
+    /// 那一条，互相把对方报成存量重复（两句提示自相矛盾），最后生效的还是前一条。
+    #[test]
+    fn the_same_account_twice_in_a_trusted_batch_keeps_one_keeper() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let first = hy2_uri("alice", "hy2-pw", 10005, "alice-HY2直连");
+        let second = hy2_uri("alice", "hy2-pw", 10007, "alice-HY2直连");
+        listed(
+            &s,
+            &pp,
+            vec![
+                entry(
+                    "bob-hy2-direct",
+                    crate::testutil::hy2_account_node("bob"),
+                    Source::ApiNodes,
+                    split_keywords(),
+                ),
+                entry(
+                    "alice-hy2-direct",
+                    uri_node(&first),
+                    Source::Paste,
+                    crate::profiles::default_split(),
+                ),
+                entry(
+                    "alice-hy2-direct-2",
+                    uri_node(&second),
+                    Source::Paste,
+                    crate::profiles::default_split(),
+                ),
+            ],
+            "bob-hy2-direct",
+        );
+        let t = import_paste(&s, &pp, &[&first, &second]);
+        assert_eq!(
+            names(&s, &pp),
+            vec!["bob-hy2-direct", "alice-hy2-direct", "alice-hy2-direct-2"],
+            "两条存量都还在（合并要菜单答 y）：{t}"
+        );
+        assert_eq!(
+            got(&s, &pp, "alice-hy2-direct").node.port,
+            10007,
+            "两条来件认同一个留存者，后一条生效：{t}"
+        );
+        assert_eq!(
+            t.lines()
+                .filter(|l| l.trim().starts_with("同一账号还有"))
+                .count(),
+            1,
+            "只报一次存量重复，不许两句互相点名：{t}"
+        );
+        assert!(
+            said_line(
+                &t,
+                &menu::dups_head("alice-hy2-direct", &["alice-hy2-direct-2".to_string()])
+            ),
+            "{t}"
+        );
+    }
+
+    /// 48b（§5.8「合并不碰活动节点」）：沿用本批留存者不能把活动节点从留存者位上挤掉。
+    /// 第一条来件够不着受保护的活动节点、只选中了副本；第二条与活动节点同参数、把它带进组，
+    /// 这时留存者必须仍按 `pick_keeper` 第 1 级选活动节点——否则活动节点会被点名成存量重复，
+    /// 而 `merge_into` 又拒绝并掉活动节点，菜单答 y 只会打「节点列表已经变了，没有合并」。
+
+    #[test]
+    fn a_batch_keeper_never_displaces_the_active_node() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let active = hy2_uri("alice", "hy2-pw", 10000, "alice-HY2直连");
+        let other = hy2_uri("alice", "hy2-pw", 10005, "alice-HY2直连");
+        listed(
+            &s,
+            &pp,
+            vec![
+                entry(
+                    "alice-hy2-direct",
+                    uri_node(&active),
+                    Source::Paste,
+                    crate::profiles::default_split(),
+                ),
+                entry(
+                    "alice-hy2-direct-2",
+                    uri_node(&other),
+                    Source::Paste,
+                    crate::profiles::default_split(),
+                ),
+            ],
+            "alice-hy2-direct",
+        );
+        let before = marks(&s);
+        let t = import_paste(&s, &pp, &[&other, &active]);
+        assert_eq!(
+            got(&s, &pp, "alice-hy2-direct").node.port,
+            10000,
+            "活动节点原地不动：{t}"
+        );
+        assert!(
+            said_line(
+                &t,
+                &menu::dups_head("alice-hy2-direct", &["alice-hy2-direct-2".to_string()])
+            ),
+            "留存者是活动节点，被点名的是副本：{t}"
+        );
+        assert_not_applied(&s, before, "活动节点内容没变", &t);
+    }
+
+    /// 48c（收尾复核）：本批沿用留存者不许挤掉面板来源的那一条。列表里同账号有一条粘贴来源
+    /// 与一条非活动的面板来源，一次粘贴同时带这两个端口时，后一条来件交回 `pick_keeper`
+    /// 第 3 级选中面板那条，而不是沿用前一条选的粘贴条目——否则面板那条会被报成存量重复，
+    /// 菜单答 y 就用粘贴的名字把它并掉了，与 §5.3「面板来源条目不被非面板来件动」相抵。
+    #[test]
+    fn a_batch_keeper_never_displaces_a_panel_entry_on_the_same_endpoint() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let first = hy2_uri("alice", "hy2-pw", 10005, "alice-HY2直连");
+        let second = hy2_uri("alice", "hy2-pw", 10007, "alice-HY2直连");
+        listed(
+            &s,
+            &pp,
+            vec![
+                entry(
+                    "bob-hy2-direct",
+                    crate::testutil::hy2_account_node("bob"),
+                    Source::ApiNodes,
+                    split_keywords(),
+                ),
+                entry(
+                    "alice-hy2-direct",
+                    uri_node(&first),
+                    Source::Paste,
+                    crate::profiles::default_split(),
+                ),
+                // 面板来源、非活动，端口正是第二条来件的端口
+                entry(
+                    "panel.example.com-hy2-direct",
+                    uri_node(&second),
+                    Source::ApiNodes,
+                    split_keywords(),
+                ),
+            ],
+            "bob-hy2-direct",
+        );
+        let t = import_paste(&s, &pp, &[&first, &second]);
+        assert_eq!(
+            got(&s, &pp, "panel.example.com-hy2-direct").node.port,
+            10007,
+            "面板那条仍在原处、原地收下第二条来件：{t}"
+        );
+        assert_eq!(
+            got(&s, &pp, "alice-hy2-direct").node.port,
+            10005,
+            "粘贴那条只收第一条来件，没有被第二条挤着改端口：{t}"
+        );
+        assert!(
+            said_line(
+                &t,
+                &menu::dups_head(
+                    "panel.example.com-hy2-direct",
+                    &["alice-hy2-direct".to_string()]
+                )
+            ),
+            "留存者是面板那条、被点名的是粘贴那条，不是反过来：{t}"
+        );
+    }
+
+    /// 49：同一批里同一账号出现两次、kind 是猜的且端口不同 → 两条都保留（rc 会覆盖成一条）。
+    #[test]
+    fn the_same_account_twice_in_a_guessed_paste_keeps_both() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let t = import_paste(
+            &s,
+            &pp,
+            &[
+                &hy2_uri("alice", "hy2-pw", 10005, "custom"),
+                &hy2_uri("alice", "hy2-pw", 10007, "custom2"),
+            ],
+        );
+        assert_eq!(
+            names(&s, &pp),
+            vec![
+                "panel.example.com-hy2-direct",
+                "panel.example.com-hy2-direct-2"
+            ],
+            "{t}"
+        );
+        assert_eq!(
+            got(&s, &pp, "panel.example.com-hy2-direct").node.port,
+            10005,
+            "{t}"
+        );
+        assert_eq!(
+            got(&s, &pp, "panel.example.com-hy2-direct-2").node.port,
+            10007,
+            "{t}"
+        );
+    }
+
+    /// 50：同一台服务器上直连与住宅共用凭据（HY2 共用 username、Reality 共用 uuid），
+    /// 只靠 kind 区分 → 换端口时永不互相合并。
+    #[test]
+    fn direct_and_residential_sharing_credentials_never_merge_on_port_move() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let resi_at = |port: u16| bui_schema::nodes::Node {
+            port,
+            ..crate::testutil::hy2_resi_node()
+        };
+        let reality_resi = |port: u16| bui_schema::nodes::Node {
+            kind: bui_schema::nodes::NodeKind::RealityResidential,
+            label: "Reality住宅".into(),
+            port,
+            ..reality_direct_node()
+        };
+        let direct_at = |port: u16| bui_schema::nodes::Node {
+            port,
+            ..hy2_direct_node()
+        };
+        let reality_at = |port: u16| bui_schema::nodes::Node {
+            port,
+            ..reality_direct_node()
+        };
+        listed(
+            &s,
+            &pp,
+            vec![
+                entry(
+                    "alice-hy2-direct",
+                    direct_at(10000),
+                    Source::ApiNodes,
+                    split_keywords(),
+                ),
+                entry(
+                    "alice-hy2-resi",
+                    resi_at(40003),
+                    Source::ApiNodes,
+                    split_keywords(),
+                ),
+                entry(
+                    "alice-reality-direct",
+                    reality_at(10001),
+                    Source::ApiNodes,
+                    split_keywords(),
+                ),
+                entry(
+                    "alice-reality-resi",
+                    reality_resi(10002),
+                    Source::ApiNodes,
+                    split_keywords(),
+                ),
+            ],
+            "alice-hy2-direct",
+        );
+        let t = import_from_panel(
+            &s,
+            &pp,
+            "alice",
+            vec![
+                direct_at(10005),
+                resi_at(40000),
+                reality_at(10011),
+                reality_resi(10012),
+            ],
+        );
+        assert_eq!(
+            names(&s, &pp),
+            vec![
+                "alice-hy2-direct",
+                "alice-hy2-resi",
+                "alice-reality-direct",
+                "alice-reality-resi"
+            ],
+            "{t}"
+        );
+        assert_eq!(got(&s, &pp, "alice-hy2-direct").node.port, 10005, "{t}");
+        assert_eq!(got(&s, &pp, "alice-hy2-resi").node.port, 40000, "{t}");
+        assert_eq!(got(&s, &pp, "alice-reality-direct").node.port, 10011, "{t}");
+        assert_eq!(got(&s, &pp, "alice-reality-resi").node.port, 10012, "{t}");
+    }
+
+    /// 51：同一台服务器上的家人账号凭据主体不同 → 换端口也永不互相合并。
+    #[test]
+    fn family_accounts_on_one_host_never_merge_on_port_move() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let bob_at = |port: u16| bui_schema::nodes::Node {
+            port,
+            ..crate::testutil::hy2_account_node("bob")
+        };
+        listed(
+            &s,
+            &pp,
+            vec![
+                entry(
+                    "alice-hy2-direct",
+                    hy2_account("alice", "hy2-pw"),
+                    Source::ApiNodes,
+                    split_keywords(),
+                ),
+                entry(
+                    "alice-hy2-direct-2",
+                    bob_at(10000),
+                    Source::ApiNodes,
+                    split_keywords(),
+                ),
+            ],
+            "alice-hy2-direct",
+        );
+        let t = import_from_panel(
+            &s,
+            &pp,
+            "alice",
+            vec![
+                bui_schema::nodes::Node {
+                    port: 10005,
+                    ..hy2_account("alice", "hy2-pw")
+                },
+                bob_at(10006),
+            ],
+        );
+        assert_eq!(
+            names(&s, &pp),
+            vec!["alice-hy2-direct", "alice-hy2-direct-2"],
+            "{t}"
+        );
+        let saved = Profiles::load(&s, &pp).unwrap();
+        assert_eq!(
+            hy2_credentials(&saved.profiles[0]),
+            ("alice", "hy2-pw"),
+            "{t}"
+        );
+        assert_eq!(saved.profiles[0].node.port, 10005, "{t}");
+        assert_eq!(
+            hy2_credentials(&saved.profiles[1]),
+            ("bob", "bob-pw"),
+            "{t}"
+        );
+        assert_eq!(saved.profiles[1].node.port, 10006, "{t}");
+    }
+
+    /// 52（D6）：host 只差大小写是同一个账号（与墓碑 key 同口径），换端口照样原地替换。
+    #[test]
+    fn a_host_case_difference_is_the_same_account_on_import() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        listed(
+            &s,
+            &pp,
+            vec![entry(
+                "alice-hy2-resi",
+                bui_schema::nodes::Node {
+                    host: "Panel.Example.com".into(),
+                    port: 40003,
+                    ..crate::testutil::hy2_resi_node()
+                },
+                Source::ApiNodes,
+                split_keywords(),
+            )],
+            "alice-hy2-resi",
+        );
+        let t = import_from_panel(&s, &pp, "alice", vec![crate::testutil::hy2_resi_node()]);
+        assert_eq!(names(&s, &pp), vec!["alice-hy2-resi"], "{t}");
+        let p = got(&s, &pp, "alice-hy2-resi");
+        assert_eq!(p.node.port, 40000, "{t}");
+        assert_eq!(p.node.host, "panel.example.com", "{t}");
+    }
+
+    /// 53（§7）：墓碑 key 不含端口——删过的账号换了端口照样挡得住。
+    #[test]
+    fn a_deleted_account_stays_deleted_after_its_port_moves() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let mut prof = Profiles::new_default();
+        prof.profiles.push(entry(
+            "bob-hy2-direct",
+            crate::testutil::hy2_account_node("bob"),
+            Source::ApiNodes,
+            split_keywords(),
+        ));
+        prof.active = Some("bob-hy2-direct".into());
+        prof.bury(
+            &entry(
+                "alice-hy2-resi",
+                bui_schema::nodes::Node {
+                    port: 40003,
+                    ..crate::testutil::hy2_resi_node()
+                },
+                Source::ApiNodes,
+                split_keywords(),
+            ),
+            0,
+        );
+        prof.save(&s, &pp).unwrap();
+        let t = import_from_panel(&s, &pp, "alice", vec![crate::testutil::hy2_resi_node()]);
+        assert_eq!(names(&s, &pp), vec!["bob-hy2-direct"], "{t}");
+        assert!(
+            said_line(&t, &menu::buried_skipped(&["alice-hy2-resi".to_string()])),
+            "{t}"
+        );
+        assert_eq!(Profiles::load(&s, &pp).unwrap().deleted.len(), 1, "{t}");
+    }
+
+    /// 54（§7 有意的新行为）：删掉新端口副本、留着旧端口副本，再导入 → 活着的那条被挪过去，
+    /// 墓碑顺手清掉，不提问、不打「跳过」。墓碑是账号维度的，用户留着这个账号的一条节点。
+    #[test]
+    fn deleting_the_new_port_copy_then_reimporting_moves_the_old_copy() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let mut prof = Profiles::new_default();
+        prof.profiles.push(entry(
+            "alice-hy2-resi",
+            bui_schema::nodes::Node {
+                port: 40003,
+                ..crate::testutil::hy2_resi_node()
+            },
+            Source::ApiNodes,
+            split_keywords(),
+        ));
+        prof.active = Some("alice-hy2-resi".into());
+        prof.bury(
+            &entry(
+                "alice-hy2-resi-2",
+                crate::testutil::hy2_resi_node(),
+                Source::ApiNodes,
+                split_keywords(),
+            ),
+            0,
+        );
+        prof.save(&s, &pp).unwrap();
+        let t = import_from_panel(&s, &pp, "alice", vec![crate::testutil::hy2_resi_node()]);
+        assert_eq!(names(&s, &pp), vec!["alice-hy2-resi"], "{t}");
+        assert_eq!(got(&s, &pp, "alice-hy2-resi").node.port, 40000, "{t}");
+        assert!(
+            Profiles::load(&s, &pp).unwrap().deleted.is_empty(),
+            "活着的赢，过期墓碑清掉：{t}"
+        );
+        assert!(!t.contains("跳过 "), "{t}");
+    }
+
+    /// 55：`--with-deleted` 把删过的账号按新端口加回来，墓碑清掉。
+    #[test]
+    fn with_deleted_restores_a_deleted_account_at_its_new_port() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let mut prof = Profiles::new_default();
+        prof.profiles.push(entry(
+            "bob-hy2-direct",
+            crate::testutil::hy2_account_node("bob"),
+            Source::ApiNodes,
+            split_keywords(),
+        ));
+        prof.active = Some("bob-hy2-direct".into());
+        prof.bury(
+            &entry(
+                "alice-hy2-resi",
+                bui_schema::nodes::Node {
+                    port: 40003,
+                    ..crate::testutil::hy2_resi_node()
+                },
+                Source::ApiNodes,
+                split_keywords(),
+            ),
+            0,
+        );
+        prof.save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        n.route(
+            &crate::source::nodes_url("https://panel.example.com", "alice"),
+            nodes_payload("alice", vec![crate::testutil::hy2_resi_node()]),
+        );
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(
+            &parse(&[
+                "import",
+                "--panel",
+                "https://panel.example.com",
+                "--user",
+                "alice",
+                "--with-deleted",
+            ]),
+            &mut ctx,
+        )
+        .unwrap();
+        let t = ctx.transcript.clone();
+        assert_eq!(
+            names(&s, &pp),
+            vec!["bob-hy2-direct", "alice-hy2-resi"],
+            "{t}"
+        );
+        assert_eq!(got(&s, &pp, "alice-hy2-resi").node.port, 40000, "{t}");
+        assert!(Profiles::load(&s, &pp).unwrap().deleted.is_empty(), "{t}");
+    }
+
+    /// 56：Reality uuid 轮换不在范围内——新 uuid 就是新账号，另起 `-2`，旧的留下。
+    #[test]
+    fn a_rotated_reality_uuid_still_gets_a_suffix() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        listed(
+            &s,
+            &pp,
+            vec![entry(
+                "alice-reality-direct",
+                reality_direct_node(),
+                Source::ApiNodes,
+                split_keywords(),
+            )],
+            "alice-reality-direct",
+        );
+        let rotated = bui_schema::nodes::Node {
+            transport: bui_schema::nodes::Transport::Reality {
+                uuid: uuid::Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap(),
+                public_key: "PUB".into(),
+                short_id: "0123456789abcdef".into(),
+                server_name: "www.bing.com".into(),
+                fingerprint: "chrome".into(),
+                flow: "xtls-rprx-vision".into(),
+            },
+            ..reality_direct_node()
+        };
+        let t = import_from_panel(&s, &pp, "alice", vec![rotated]);
+        assert_eq!(
+            names(&s, &pp),
+            vec!["alice-reality-direct", "alice-reality-direct-2"],
+            "{t}"
+        );
+        assert!(t.contains("已被另一个账号占用"), "{t}");
+    }
+
+    /// 57（D7）：分流从**合并前的整个账号组**里取面板成员那一份——只看留存者会把面板分流丢掉。
+    #[test]
+    fn a_subscription_refresh_keeps_the_panel_split_when_the_panel_copy_is_merged_away() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let fresh_uri = hy2_uri("alice", "hy2-pw", 40000, "alice-HY2住宅");
+        listed(
+            &s,
+            &pp,
+            vec![
+                entry(
+                    "panel.example.com-hy2-resi",
+                    uri_node(&hy2_uri("alice", "hy2-pw", 40003, "alice-HY2住宅")),
+                    Source::Subscription,
+                    crate::profiles::default_split(),
+                ),
+                entry(
+                    "alice-hy2-resi",
+                    uri_node(&fresh_uri),
+                    Source::ApiNodes,
+                    split_keywords(),
+                ),
+            ],
+            "panel.example.com-hy2-resi",
+        );
+        let t = import_from_sub(&s, &pp, "alice", &[&fresh_uri]);
+        let keeper = got(&s, &pp, "panel.example.com-hy2-resi");
+        assert_eq!(keeper.node.port, 40000, "{t}");
+        assert_eq!(keeper.split, split_keywords(), "面板分流不许丢：{t}");
+        assert_eq!(keeper.source, Source::ApiNodes, "来源只升不降：{t}");
+        assert!(
+            said_line(
+                &t,
+                &menu::dups_head(
+                    "panel.example.com-hy2-resi",
+                    &["alice-hy2-resi".to_string()]
+                )
+            ),
+            "{t}"
+        );
+    }
+
+    /// 57a（§5.5）：面板来件用**这一趟**的分流，不沿用组里那条旧面板条目的——面板改了关键字表
+    /// 或开关，一次重新导入就该跟着变（`panel_split` 只给非面板来件兜底）。
+    #[test]
+    fn a_panel_import_uses_this_rounds_split_not_the_stored_one() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        listed(
+            &s,
+            &pp,
+            vec![entry(
+                "alice-hy2-resi",
+                bui_schema::nodes::Node {
+                    port: 40003,
+                    ..crate::testutil::hy2_resi_node()
+                },
+                Source::ApiNodes,
+                crate::testutil::split_global(),
+            )],
+            "alice-hy2-resi",
+        );
+        let t = import_from_panel(&s, &pp, "alice", vec![crate::testutil::hy2_resi_node()]);
+        let p = got(&s, &pp, "alice-hy2-resi");
+        assert_eq!(p.node.port, 40000, "{t}");
+        assert_eq!(
+            p.split,
+            split_keywords(),
+            "面板来件的分流是这一趟 payload 那一份：{t}"
+        );
+        assert_ne!(
+            p.split,
+            crate::testutil::split_global(),
+            "不许沿用组里旧面板条目的分流：{t}"
+        );
+    }
+
+    /// 58（D7、§5.5）：粘贴刷新面板来的节点 → 分流与来源都保留面板那份。
+    #[test]
+    fn a_paste_refresh_keeps_the_panel_split_and_source() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let uri = hy2_uri("alice", "hy2-pw", 10000, "alice-HY2直连");
+        listed(
+            &s,
+            &pp,
+            vec![
+                entry(
+                    "bob-hy2-direct",
+                    crate::testutil::hy2_account_node("bob"),
+                    Source::ApiNodes,
+                    split_keywords(),
+                ),
+                entry(
+                    "alice-hy2-direct",
+                    uri_node(&uri),
+                    Source::ApiNodes,
+                    split_keywords(),
+                ),
+            ],
+            "bob-hy2-direct",
+        );
+        let t = import_paste(
+            &s,
+            &pp,
+            &[&hy2_uri("alice", "hy2-pw", 10000, "改过的备注-HY2直连")],
+        );
+        let p = got(&s, &pp, "alice-hy2-direct");
+        assert_eq!(p.node.label, "改过的备注-HY2直连", "{t}");
+        assert_eq!(p.split, split_keywords(), "{t}");
+        assert_eq!(p.source, Source::ApiNodes, "粘贴不许把来源降下来：{t}");
+    }
+
+    /// 58（§5.5）：面板导入把粘贴来的条目升成 ApiNodes，并带上服务端分流。
+    #[test]
+    fn a_panel_refresh_upgrades_a_pasted_profile() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        listed(
+            &s,
+            &pp,
+            vec![entry(
+                "panel.example.com-hy2-direct",
+                hy2_direct_node(),
+                Source::Paste,
+                crate::profiles::default_split(),
+            )],
+            "panel.example.com-hy2-direct",
+        );
+        let t = import_from_panel(&s, &pp, "alice", vec![hy2_direct_node()]);
+        assert_eq!(names(&s, &pp), vec!["panel.example.com-hy2-direct"], "{t}");
+        let p = got(&s, &pp, "panel.example.com-hy2-direct");
+        assert_eq!(p.source, Source::ApiNodes, "{t}");
+        assert_eq!(p.split, split_keywords(), "{t}");
+    }
+
+    // ───────────── T10：导入时先洗 token 名、人读出口全打码（spec §5.6、§8.2、§8.3） ─────────────
+
+    /// 4.0.0 用 token 订阅链接导入过的机器上，节点名长这样：`<合成 token>-hy2-resi`。
+    fn token_name() -> String {
+        format!("{TOKEN}-hy2-resi")
+    }
+
+    /// 它在人读输出里该长的样子（[`menu::display_name`]）：token 段只剩前 4 位加 `…`。
+    fn masked_name() -> String {
+        format!("{}…-hy2-resi", &TOKEN[..4])
+    }
+
+    /// 改名之后的规范名：`profile_name("", node)` = `<主机>-<kind>`。
+    const HEALED_NAME: &str = "panel.example.com-hy2-resi";
+
+    /// 另一台服务器上的一条粘贴链接：与 `panel.example.com` 上的账号毫无关系。
+    fn other_host_uri() -> String {
+        let tag = percent_encoding::utf8_percent_encode(
+            "bob-HY2直连",
+            percent_encoding::NON_ALPHANUMERIC,
+        );
+        format!("hysteria2://bob:bob-pw@other.example.com:10000/?sni=other.example.com#{tag}")
+    }
+
+    /// 另一个账号的活动节点 + 一条 token 名墓碑（rc 删掉住宅节点时记下的那种）。
+    /// 落盘用 `Profiles::save`，逐字节比对的基准只能是它写出来的那份。
+    fn buried_token_fixture(s: &FakeSys, pp: &Paths) {
+        let mut prof = Profiles::new_default();
+        prof.profiles.push(entry(
+            "bob-hy2-direct",
+            crate::testutil::hy2_account_node("bob"),
+            Source::ApiNodes,
+            split_keywords(),
+        ));
+        prof.active = Some("bob-hy2-direct".into());
+        prof.deleted.push(crate::profiles::Tombstone {
+            key: crate::profiles::tombstone_key(&crate::testutil::hy2_resi_node()),
+            name: token_name(),
+            at: 1,
+            extra: Default::default(),
+        });
+        prof.save(s, pp).unwrap();
+    }
+
+    /// 26（C6、§5.6）：改名在匹配之前、对全部 profile 做，不看这批命中了什么——端口没变、
+    /// 命中同一连接的那一趟也照样把 token 名洗掉。
+    #[test]
+    fn a_token_named_profile_is_renamed_even_when_the_endpoint_is_unchanged() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        listed(
+            &s,
+            &pp,
+            vec![entry(
+                &token_name(),
+                crate::testutil::hy2_resi_node(),
+                Source::ApiNodes,
+                split_keywords(),
+            )],
+            &token_name(),
+        );
+        let writes = s.writes("/opt/bui-c/profiles.json");
+        let t = import_from_panel(&s, &pp, "alice", vec![crate::testutil::hy2_resi_node()]);
+        assert_eq!(names(&s, &pp), vec![HEALED_NAME], "{t}");
+        assert_eq!(
+            Profiles::load(&s, &pp).unwrap().active.as_deref(),
+            Some(HEALED_NAME),
+            "active 跟着改名（§8.2）：{t}"
+        );
+        assert!(
+            said_line(&t, &menu::renamed_line(&token_name(), HEALED_NAME)),
+            "{t}"
+        );
+        assert!(
+            said_line(&t, &format!("节点 {HEALED_NAME} 无变化")),
+            "端口没变、命中同一连接，照样改名（C6）：{t}"
+        );
+        assert!(!t.contains(TOKEN), "完整 token 不许出现：{t}");
+        assert_eq!(
+            s.writes("/opt/bui-c/profiles.json") - writes,
+            1,
+            "改名与这批节点在同一把锁里一次写盘（C7）：{t}"
+        );
+    }
+
+    /// 27（§5.6、§8.2、§8.3）：token 名的活动节点遇上换端口——先改名、再按账号原地替换；
+    /// 屏上只有打码后的旧名，改名 / active / **墓碑显示名**一次写盘，配置因端口变 apply 一次。
+    ///
+    /// 墓碑那半句要夹具里真有一条 token 名墓碑才钉得住（收尾 M5）：它是**另一个账号**的
+    /// （直连口），不会被这一趟的 `forget` 清掉，也不参与匹配，只被 `heal_token_names`
+    /// 顺手改掉显示名。
+    #[test]
+    fn token_named_profiles_are_renamed_on_import_and_the_full_token_is_never_printed() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let mut prof = listed(
+            &s,
+            &pp,
+            vec![entry(
+                &token_name(),
+                bui_schema::nodes::Node {
+                    port: 40003,
+                    hop: Some((44000, 45000)),
+                    ..crate::testutil::hy2_resi_node()
+                },
+                Source::ApiNodes,
+                split_keywords(),
+            )],
+            &token_name(),
+        );
+        // 删过的直连节点，墓碑名是 4.0.0 留下的 token 名（`bury` 自己不会写出这种名字，
+        // 只有旧文件里才有，所以直接造一条）
+        prof.deleted.push(crate::profiles::Tombstone {
+            key: crate::profiles::tombstone_key(&hy2_direct_node()),
+            name: format!("{TOKEN}-hy2-direct"),
+            at: 7,
+            extra: Default::default(),
+        });
+        prof.save(&s, &pp).unwrap();
+        let (before, writes) = (s.calls().len(), s.writes("/opt/bui-c/profiles.json"));
+        let t = import_from_panel(&s, &pp, "alice", vec![crate::testutil::hy2_resi_node()]);
+        assert_eq!(names(&s, &pp), vec![HEALED_NAME], "{t}");
+        assert_eq!(got(&s, &pp, HEALED_NAME).node.port, 40000, "{t}");
+        assert_eq!(
+            Profiles::load(&s, &pp).unwrap().active.as_deref(),
+            Some(HEALED_NAME),
+            "{t}"
+        );
+        assert!(
+            said_line(
+                &t,
+                &format!("节点 {}…-hy2-resi 已改名为 {HEALED_NAME}", &TOKEN[..4])
+            ),
+            "改名行逐字（旧名只剩前 4 位）：{t}"
+        );
+        assert!(
+            said_line(&t, &menu::port_moved_line(HEALED_NAME, 40003, 40000)),
+            "端口变化行说的是新名字：{t}"
+        );
+        assert!(!t.contains(TOKEN), "{t}");
+        assert!(!t.contains(&TOKEN[..8]), "半截 token 也不该露出来：{t}");
+        let saved = Profiles::load(&s, &pp).unwrap();
+        assert_eq!(
+            saved
+                .deleted
+                .iter()
+                .map(|x| x.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["panel.example.com-hy2-direct"],
+            "墓碑显示名也在这一次写盘里改掉：{t}"
+        );
+        assert_eq!(
+            (saved.deleted[0].key.as_str(), saved.deleted[0].at),
+            (
+                crate::profiles::tombstone_key(&hy2_direct_node()).as_str(),
+                7
+            ),
+            "墓碑只改显示名：{t}"
+        );
+        assert_eq!(
+            s.writes("/opt/bui-c/profiles.json") - writes,
+            1,
+            "改名、active、墓碑显示名、节点同一次写盘（C7）：{t}"
+        );
+        assert_eq!(restarts_since(&s, before), 1, "端口变了要 apply：{t}");
+    }
+
+    /// 28（§5.7、§8.2）：只改名不是内容变化——活动节点的 token 名被洗掉，配置不重渲、服务不重启。
+    #[test]
+    fn renaming_a_token_active_profile_alone_does_not_restart() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let uri = hy2_uri("alice", "hy2-pw", 40000, "alice-HY2住宅");
+        listed(
+            &s,
+            &pp,
+            vec![entry(
+                &token_name(),
+                uri_node(&uri),
+                Source::ApiNodes,
+                crate::profiles::default_split(),
+            )],
+            &token_name(),
+        );
+        let (before, writes) = (marks(&s), s.writes("/opt/bui-c/profiles.json"));
+        let t = import_paste(&s, &pp, &[&uri]);
+        assert_eq!(names(&s, &pp), vec![HEALED_NAME], "{t}");
+        assert_eq!(
+            Profiles::load(&s, &pp).unwrap().active.as_deref(),
+            Some(HEALED_NAME),
+            "{t}"
+        );
+        assert!(
+            said_line(&t, &menu::renamed_line(&token_name(), HEALED_NAME)),
+            "{t}"
+        );
+        assert!(!t.contains(TOKEN), "{t}");
+        assert_eq!(
+            s.writes("/opt/bui-c/profiles.json") - writes,
+            1,
+            "改名要落盘：{t}"
+        );
+        assert_not_applied(&s, before, "只改名，节点与分流都没变", &t);
+    }
+
+    /// 29（§5.6）：改名不依赖这批命中了什么——粘一条另一台服务器的链接，遗留的 token 名照样洗掉。
+    #[test]
+    fn an_unrelated_import_still_renames_leftover_token_names() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        listed(
+            &s,
+            &pp,
+            vec![entry(
+                &token_name(),
+                crate::testutil::hy2_resi_node(),
+                Source::ApiNodes,
+                split_keywords(),
+            )],
+            &token_name(),
+        );
+        let t = import_paste(&s, &pp, &[&other_host_uri()]);
+        let mut got_names = names(&s, &pp);
+        got_names.sort();
+        assert_eq!(
+            got_names,
+            vec![
+                "other.example.com-hy2-direct".to_string(),
+                HEALED_NAME.to_string()
+            ],
+            "{t}"
+        );
+        assert!(
+            said_line(&t, &menu::renamed_line(&token_name(), HEALED_NAME)),
+            "这批没碰到它也改名：{t}"
+        );
+        assert!(!t.contains(TOKEN), "{t}");
+        assert_eq!(
+            Profiles::load(&s, &pp).unwrap().active.as_deref(),
+            Some(HEALED_NAME),
+            "{t}"
+        );
+    }
+
+    /// 30（§8.3、C7）：墓碑名里的 token 也不许漏——改名那一趟把墓碑显示名一起换成账号维度的
+    /// 名字，命令行的「跳过…」与菜单的 `buried_head` 都只有它。
+    #[test]
+    fn a_token_in_a_tombstone_name_is_masked_on_import() {
+        let pp = paths();
+
+        // ① 命令行 `bui-c import`：跳过那一行
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        buried_token_fixture(&s, &pp);
+        let t = import_from_panel(&s, &pp, "alice", vec![crate::testutil::hy2_resi_node()]);
+        assert_eq!(names(&s, &pp), vec!["bob-hy2-direct"], "墓碑挡住了：{t}");
+        assert!(
+            said_line(&t, &menu::buried_skipped(&[HEALED_NAME.to_string()])),
+            "{t}"
+        );
+        assert!(!t.contains(TOKEN), "{t}");
+        assert!(!t.contains(&TOKEN[..8]), "{t}");
+
+        // ② 菜单 [3]：`buried_head` 那一句。粘两条（单条粘贴按明确意愿直接加回，不会被挡）
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        buried_token_fixture(&s, &pp);
+        let n = FakeNet::new();
+        let resi = hy2_uri("alice", "hy2-pw", 40000, "alice-HY2住宅");
+        let direct = hy2_uri("alice", "hy2-pw", 10000, "alice-HY2直连");
+        let r = run_menu(&s, &n, &pp, &["3", &resi, &direct, "", "n", "n", "0"], true);
+        assert!(
+            r.asked.iter().any(|q| q == menu::BURIED_ASK),
+            "{:?}",
+            r.asked
+        );
+        assert!(
+            said_line(&r.t, &menu::buried_head(&[HEALED_NAME.to_string()])),
+            "{}",
+            r.t
+        );
+        assert!(!r.t.contains(TOKEN), "{}", r.t);
+    }
+
+    /// 31（D3、§8.3）：`import-v3` 这条路不改名（v3 目录是冻结快照，`prof` 一个字段都不动），
+    /// 墓碑名里的 token 只能靠显示打码挡住。两格：没有 v3 残留单元（`run` 提前返回、不写盘）；
+    /// 有残留单元（`run` 原样写一次，`profiles.json` 逐字节不变）。
+    #[test]
+    fn import_v3_never_prints_a_full_token_from_a_tombstone_name() {
+        let pp = paths();
+        // 命中墓碑的那个 v3 目录（alice 的住宅口）
+        const RESI_DIR: &str = "/opt/hysteria-client/configs/hysteria2-1/uri.txt";
+        const RESI_URI: &str = "hysteria2://alice:hy2-pw@panel.example.com:40000/?sni=panel.example.com#alice-HY2%E4%BD%8F%E5%AE%85";
+        // 盘上那条活动节点对应的 v3 目录：落进 `existing`，`nothing_to_apply` 因此为假
+        const BOB_DIR: &str = "/opt/hysteria-client/configs/hysteria2-2/uri.txt";
+        const BOB_URI: &str = "hysteria2://bob:bob-pw@panel.example.com:10000/?sni=panel.example.com#bob-HY2%E7%9B%B4%E8%BF%9E";
+
+        // ① 没有 v3 残留单元：`run` 在「无事可做」那一步提前返回，`profiles.json` 不被写
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        buried_token_fixture(&s, &pp);
+        s.put(RESI_DIR, RESI_URI);
+        let n = FakeNet::new();
+        let writes = s.writes("/opt/bui-c/profiles.json");
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["import-v3"]), &mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert!(
+            said_line(&t, &menu::buried_skipped(&[token_name()])),
+            "墓碑名打码后才打出来：{t}"
+        );
+        assert!(t.contains(&masked_name()), "{t}");
+        assert!(!t.contains(TOKEN), "{t}");
+        assert!(!t.contains(&TOKEN[..8]), "{t}");
+        assert_eq!(
+            s.writes("/opt/bui-c/profiles.json"),
+            writes,
+            "提前返回，不写盘：{t}"
+        );
+
+        // ①′ 菜单 [7] → [3]：`buried_head` 那一句同样只有打码后的名字
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        buried_token_fixture(&s, &pp);
+        s.put(RESI_DIR, RESI_URI);
+        let n = FakeNet::new();
+        let r = run_menu(&s, &n, &pp, &["7", "3", "n", "", "0"], true);
+        assert!(
+            said_line(&r.t, &menu::buried_head(&[token_name()])),
+            "{}",
+            r.t
+        );
+        assert!(r.t.contains(&masked_name()), "{}", r.t);
+        assert!(!r.t.contains(TOKEN), "{}", r.t);
+
+        // ② 有 v3 残留单元：`run` 会走到落盘那一步，写出来的必须与基准逐字节相同
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        buried_token_fixture(&s, &pp);
+        s.put(RESI_DIR, RESI_URI);
+        s.put(BOB_DIR, BOB_URI);
+        for f in v3_unit_files(&pp) {
+            s.put(f.to_str().unwrap(), "[Unit]");
+        }
+        let baseline = s.get("/opt/bui-c/profiles.json").unwrap();
+        let n = FakeNet::new();
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["import-v3"]), &mut ctx).unwrap();
+        let t = ctx.transcript.clone();
+        assert!(said_line(&t, &menu::buried_skipped(&[token_name()])), "{t}");
+        assert!(!t.contains(TOKEN), "{t}");
+        assert!(!t.contains(&TOKEN[..8]), "{t}");
+        // 走过 `run` 的落盘那一步：残留单元被 teardown 删掉了（`removed_units` 非空）
+        assert!(
+            t.contains(&format!(
+                "清掉 {} 个残留的 v3 单元",
+                v3_unit_files(&pp).len()
+            )),
+            "前提：真的走到了落盘与 teardown：{t}"
+        );
+        for f in v3_unit_files(&pp) {
+            assert!(!s.exists(&f), "{} 该被卸掉：{t}", f.display());
+        }
+        assert_eq!(
+            s.get("/opt/bui-c/profiles.json").unwrap(),
+            baseline,
+            "原样写一次，逐字节不变：{t}"
+        );
+    }
+
+    /// 32（D3、§8.3）：`--json` 是机器接口，名字原样给——打码会让字段有损、按名字写的脚本坏掉。
+    #[test]
+    fn json_outputs_keep_the_raw_token_name() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        listed(
+            &s,
+            &pp,
+            vec![entry(
+                &token_name(),
+                crate::testutil::hy2_resi_node(),
+                Source::ApiNodes,
+                split_keywords(),
+            )],
+            &token_name(),
+        );
+        let n = FakeNet::new();
+        for args in [["list", "--json"], ["status", "--json"]] {
+            let mut p = Scripted::from([]);
+            let mut ctx = Ctx::new(&s, &n, &pp, &mut p, true, false);
+            dispatch(&parse(&args), &mut ctx).unwrap();
+            assert!(
+                ctx.out.contains(TOKEN),
+                "{args:?} 不打码，原名原样给：{}",
+                ctx.out
+            );
+        }
+    }
+
+    /// 33（D3、§8.3）：同一台从没导入过的机器，人读的四处出口都只有 `0123…`。
+    #[test]
+    fn human_outputs_mask_token_names() {
+        let pp = paths();
+        let n = FakeNet::new();
+        // 两条节点的机器：活动节点是普通名字，token 名那条留着当切换目标
+        let two = |s: &FakeSys| {
+            let mut prof = Profiles::new_default();
+            prof.profiles.push(entry(
+                "alice-reality-direct",
+                reality_direct_node(),
+                Source::ApiNodes,
+                split_keywords(),
+            ));
+            prof.profiles.push(entry(
+                &token_name(),
+                crate::testutil::hy2_resi_node(),
+                Source::ApiNodes,
+                split_keywords(),
+            ));
+            prof.active = Some("alice-reality-direct".into());
+            prof.save(s, &pp).unwrap();
+        };
+
+        // ① `list` 表格、② `status` 人读部分
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        listed(
+            &s,
+            &pp,
+            vec![entry(
+                &token_name(),
+                crate::testutil::hy2_resi_node(),
+                Source::ApiNodes,
+                split_keywords(),
+            )],
+            &token_name(),
+        );
+        for args in [["list"], ["status"]] {
+            let mut p = Scripted::from([]);
+            let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+            dispatch(&parse(&args), &mut ctx).unwrap();
+            let t = ctx.transcript.clone();
+            assert!(t.contains(&masked_name()), "{args:?}：{t}");
+            assert!(!t.contains(TOKEN), "{args:?}：{t}");
+            assert!(!t.contains(&TOKEN[..8]), "{args:?}：{t}");
+        }
+
+        // ③ 删除确认块 + ④ `cli_summary`：删掉活动节点、切到 token 名那条
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        two(&s);
+        let tn = token_name();
+        let mut p = Scripted::from(["yes"]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(
+            &parse(&["delete", "alice-reality-direct", "--switch-to", &tn]),
+            &mut ctx,
+        )
+        .unwrap();
+        let t = ctx.transcript.clone();
+        assert_eq!(names(&s, &pp), vec![tn.clone()], "删掉的是活动那条：{t}");
+        assert!(t.contains(&masked_name()), "确认块里就打码：{t}");
+        assert!(
+            said_line(&t, &format!("当前节点已删除，切到 {}", masked_name())),
+            "结果行也打码：{t}"
+        );
+        assert!(!t.contains(TOKEN), "{t}");
+        assert!(!t.contains(&TOKEN[..8]), "{t}");
+
+        // ⑤ 菜单「上次：」行：切到 token 名那条
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        two(&s);
+        let r = run_menu(&s, &n, &pp, &["1", "2", "", "0"], true);
+        assert_eq!(
+            Profiles::load(&s, &pp).unwrap().active.as_deref(),
+            Some(tn.as_str()),
+            "{}",
+            r.t
+        );
+        assert!(
+            said_line(&r.t, &format!("上次：已切到 {}", masked_name())),
+            "{}",
+            r.t
+        );
+        assert!(!r.t.contains(TOKEN), "{}", r.t);
+        assert!(!r.t.contains(&TOKEN[..8]), "{}", r.t);
+    }
+
+    // ───────────── T11：菜单 [3] 的三问（spec §5.8、§5.10、§11.3） ─────────────
+
+    const PROFILES_JSON: &str = "/opt/bui-c/profiles.json";
+    const PANEL_BASE: &str = "https://panel.example.com";
+
+    /// 菜单 `[3]` 的一串输入：菜单键 → 粘贴的每一行 → 空行结束粘贴 → `answers` → 回车 → `0`。
+    ///
+    /// 末尾那个空串两用：这一趟停了就被「回车返回菜单」吃掉，没停就是一次「直接回车重画」，
+    /// 两种走法后面都接得上 `0` 退出——用例因此不必先算准这一趟到底停不停。
+    fn import_inputs(paste: &[&str], answers: &[&str]) -> Vec<String> {
+        let mut v = vec!["3".to_string()];
+        v.extend(paste.iter().map(|x| x.to_string()));
+        v.push(String::new());
+        v.extend(answers.iter().map(|x| x.to_string()));
+        v.push(String::new());
+        v.push("0".to_string());
+        v
+    }
+
+    /// 面板节点表的路由，外加菜单里要粘的那条地址。
+    fn panel_net(user: &str, nodes: Vec<bui_schema::nodes::Node>) -> (FakeNet, String) {
+        let n = FakeNet::new();
+        n.route(
+            &crate::source::nodes_url(PANEL_BASE, user),
+            nodes_payload(user, nodes),
+        );
+        (n, format!("{PANEL_BASE}/api/nodes/{user}"))
+    }
+
+    /// 落盘一份列表，顺手把面板来源记上：不记的话每次面板导入都多打一行「自动更新来源改为 …」，
+    /// 数附加行的用例（66）会被它带偏。
+    fn listed_from_panel(
+        s: &FakeSys,
+        pp: &Paths,
+        entries: Vec<Profile>,
+        active: &str,
+        user: &str,
+    ) -> Profiles {
+        let mut prof = Profiles::new_default();
+        prof.profiles = entries;
+        prof.active = Some(active.into());
+        prof.panel = Some(crate::profiles::Panel {
+            base_url: PANEL_BASE.into(),
+            username: user.into(),
+        });
+        prof.save(s, pp).unwrap();
+        prof
+    }
+
+    /// 菜单 `[3]` 从面板导入一趟：`answers` 是粘完地址之后的那几个回答。
+    fn menu_panel(
+        s: &FakeSys,
+        pp: &Paths,
+        user: &str,
+        nodes: Vec<bui_schema::nodes::Node>,
+        answers: &[&str],
+    ) -> Ran {
+        let (n, url) = panel_net(user, nodes);
+        let inputs = import_inputs(&[&url], answers);
+        let refs: Vec<&str> = inputs.iter().map(String::as_str).collect();
+        run_menu(s, &n, pp, &refs, true)
+    }
+
+    /// 菜单 `[3]` 粘一个第三方订阅地址（不是面板路径 → [`Source::Subscription`]）。
+    fn menu_sub(s: &FakeSys, pp: &Paths, user: &str, uris: &[&str], answers: &[&str]) -> Ran {
+        let n = FakeNet::new();
+        let url = format!("https://sub.example.com/link/{user}");
+        n.route(&url, b64(&uris.join("\n")));
+        let inputs = import_inputs(&[&url], answers);
+        let refs: Vec<&str> = inputs.iter().map(String::as_str).collect();
+        run_menu(s, &n, pp, &refs, true)
+    }
+
+    /// [`WatchAsk`] 的钩子：问到那一句时替「别的会话」动手。
+    type AtAsk<'a> = Box<dyn Fn(&FakeSys) + 'a>;
+
+    /// 问到某一句时取一次样：那时 `profiles.json` 被写过几次、[`marks`] 是多少。用来钉住
+    /// 这一问**之后**发生了什么（用例 63、64）；`run_menu` 的 [`Scripted`] 插不进取样点。
+    ///
+    /// 每一问也照 [`LoggingPrompt`] 记一条 `ask …` 流水，[`no_prompt_under_lock`] 才查得到
+    /// 「持锁期间提问了」（审查 T11 r2 第 7 条）。
+    struct WatchAsk<'a> {
+        inner: Scripted,
+        sys: &'a FakeSys,
+        watch: &'static str,
+        seen: Option<(usize, (usize, usize))>,
+        /// 问到那一句时替「别的会话」动一下手（[`FakeSys::stage_on_lock`] 改盘、
+        /// [`FakeSys::lock_busy`] 占锁）：答 y 之后的那次拿锁就撞上它
+        hook: Option<AtAsk<'a>>,
+    }
+
+    impl<'a> WatchAsk<'a> {
+        fn new(sys: &'a FakeSys, watch: &'static str, inputs: &[String]) -> Self {
+            Self {
+                inner: Scripted {
+                    queue: inputs.iter().cloned().collect(),
+                    asked: Vec::new(),
+                    tty: true,
+                },
+                sys,
+                watch,
+                seen: None,
+                hook: None,
+            }
+        }
+
+        /// 问到那一句时跑一下 `f`。
+        fn at_ask(mut self, f: impl Fn(&FakeSys) + 'a) -> Self {
+            self.hook = Some(Box::new(f));
+            self
+        }
+
+        /// 取样点：问到那一句时才有值，没问到就是 `None`（用例据此确认这一问真的出现过）。
+        fn sampled(&self) -> (usize, (usize, usize)) {
+            self.seen.expect("这一趟根本没问到那一句")
+        }
+    }
+
+    impl Prompt for WatchAsk<'_> {
+        fn interactive(&self) -> bool {
+            self.inner.interactive()
+        }
+        fn read(&mut self, prompt: &str) -> Result<Option<String>> {
+            self.sys.mark(format!("ask {prompt}"));
+            self.inner.read(prompt)
+        }
+        fn lines_until_blank(&mut self, prompt: &str) -> Result<Vec<String>> {
+            self.sys.mark(format!("ask {prompt}"));
+            self.inner.lines_until_blank(prompt)
+        }
+        fn confirm(&mut self, prompt: &str) -> Result<bool> {
+            self.sys.mark(format!("ask {prompt}"));
+            // 取样在记完这一条流水之后：`marks` 存的是「问过这一句之后」的位置，
+            // `assert_not_applied` 从这里往后数重启才不会把提问本身算进去
+            if prompt == self.watch && self.seen.is_none() {
+                self.seen = Some((self.sys.writes(PROFILES_JSON), marks(self.sys)));
+                if let Some(f) = &self.hook {
+                    f(self.sys);
+                }
+            }
+            self.inner.confirm(prompt)
+        }
+    }
+
+    fn run_menu_with<P: Prompt>(s: &FakeSys, n: &FakeNet, pp: &Paths, p: &mut P) -> String {
+        let mut ctx = Ctx::new(s, n, pp, p, false, false);
+        menu_loop(&mut ctx).unwrap();
+        ctx.transcript.clone()
+    }
+
+    fn resi_at(port: u16) -> bui_schema::nodes::Node {
+        bui_schema::nodes::Node {
+            port,
+            ..crate::testutil::hy2_resi_node()
+        }
+    }
+
+    /// 存量重复的夹具（用例 63、64）：active 停在 40003，另一条副本停在 40007。
+    fn dup_machine(s: &FakeSys, pp: &Paths) -> Profiles {
+        listed_from_panel(
+            s,
+            pp,
+            vec![
+                entry(
+                    "alice-hy2-resi",
+                    resi_at(40003),
+                    Source::ApiNodes,
+                    split_keywords(),
+                ),
+                entry(
+                    "alice-hy2-resi-2",
+                    resi_at(40007),
+                    Source::ApiNodes,
+                    split_keywords(),
+                ),
+            ],
+            "alice-hy2-resi",
+            "alice",
+        )
+    }
+
+    /// 60（§5.10）：端口原地挪了不是新节点，菜单不问切换。
+    #[test]
+    fn menu_import_port_move_does_not_offer_to_switch() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        listed_from_panel(
+            &s,
+            &pp,
+            vec![entry(
+                "alice-hy2-resi",
+                bui_schema::nodes::Node {
+                    hop: Some((44000, 45000)),
+                    ..resi_at(40003)
+                },
+                Source::ApiNodes,
+                split_keywords(),
+            )],
+            "alice-hy2-resi",
+            "alice",
+        );
+        let r = menu_panel(
+            &s,
+            &pp,
+            "alice",
+            vec![crate::testutil::hy2_resi_node()],
+            &[],
+        );
+        assert_eq!(
+            names(&s, &pp),
+            vec!["alice-hy2-resi".to_string()],
+            "{}",
+            r.t
+        );
+        assert_eq!(got(&s, &pp, "alice-hy2-resi").node.port, 40000, "{}", r.t);
+        assert!(
+            said_line(&r.t, &menu::port_moved_line("alice-hy2-resi", 40003, 40000)),
+            "{}",
+            r.t
+        );
+        assert!(
+            !r.asked.iter().any(|q| q.starts_with("切换到")),
+            "换端口的是同一条老节点，不该问切换：{:?}",
+            r.asked
+        );
+    }
+
+    /// 60a（§11.2 测试 41 的菜单那一半）：本批副本被当场并掉不是新节点，菜单不问切换。
+    /// 夹具与 `a_batch_written_copy_is_merged_on_the_spot_and_not_counted_as_new` 同一份，
+    /// 只把命令行换成菜单 `[3]` 粘贴。
+    ///
+    /// **钉的是菜单接线，不是 `added` 名单的守卫**：切换候选还要过一道「导入之后列表里还在
+    /// 不在」的过滤（`menu_import` 里的 `cands.retain`），所以「当场并掉」与「after 过滤」
+    /// 两层都失效这一问才会冒出来。`added` 里不留并掉的名字这一层由测试 41 在命令行钉住。
+    #[test]
+    fn menu_import_batch_written_copy_does_not_offer_to_switch() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        listed(
+            &s,
+            &pp,
+            vec![
+                entry(
+                    "bob-hy2-direct",
+                    crate::testutil::hy2_account_node("bob"),
+                    Source::ApiNodes,
+                    split_keywords(),
+                ),
+                entry(
+                    "hysteria2-1785892136",
+                    bui_schema::nodes::Node {
+                        label: "alice-HY2直连".into(),
+                        ..hy2_account("alice", "hy2-pw")
+                    },
+                    Source::V3,
+                    crate::testutil::split_global(),
+                ),
+            ],
+            "bob-hy2-direct",
+        );
+        let guessed = hy2_uri("alice", "hy2-pw", 10005, "custom");
+        let trusted = hy2_uri("alice", "hy2-pw", 10005, "alice-HY2直连");
+        let inputs = import_inputs(&[&guessed, &trusted], &[]);
+        let refs: Vec<&str> = inputs.iter().map(String::as_str).collect();
+        let n = FakeNet::new();
+        let r = run_menu(&s, &n, &pp, &refs, true);
+        assert_eq!(
+            names(&s, &pp),
+            vec!["bob-hy2-direct", "hysteria2-1785892136"],
+            "本批副本当场并掉：{}",
+            r.t
+        );
+        assert_eq!(
+            got(&s, &pp, "hysteria2-1785892136").node.port,
+            10005,
+            "{}",
+            r.t
+        );
+        assert!(
+            !r.asked.iter().any(|q| q.starts_with("切换到")),
+            "并掉的不是新导入的节点，不该问切换：{:?}\n{}",
+            r.asked,
+            r.t
+        );
+        assert!(
+            !r.asked.iter().any(|q| q == menu::MERGE_ASK),
+            "本批副本不作存量重复，不该问合并：{:?}\n{}",
+            r.asked,
+            r.t
+        );
+    }
+
+    /// 61（§5.10）：token 名被洗掉也不是新节点——问的是这一趟真正新增的那一条。
+    #[test]
+    fn menu_import_token_rename_does_not_offer_to_switch() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        listed_from_panel(
+            &s,
+            &pp,
+            vec![entry(
+                &token_name(),
+                resi_at(40003),
+                Source::ApiNodes,
+                split_keywords(),
+            )],
+            &token_name(),
+            "alice",
+        );
+        // 住宅那一条命中 token 名条目（改名 + 换端口），直连那一条是真正的新节点
+        let r = menu_panel(
+            &s,
+            &pp,
+            "alice",
+            vec![crate::testutil::hy2_resi_node(), hy2_direct_node()],
+            &["n"],
+        );
+        assert_eq!(
+            names(&s, &pp),
+            vec![HEALED_NAME.to_string(), "alice-hy2-direct".to_string()],
+            "{}",
+            r.t
+        );
+        assert!(
+            said_line(&r.t, &menu::renamed_line(&token_name(), HEALED_NAME)),
+            "{}",
+            r.t
+        );
+        assert_eq!(
+            r.asked
+                .iter()
+                .filter(|q| q.starts_with("切换到"))
+                .collect::<Vec<_>>(),
+            vec![&menu::switch_ask("alice-hy2-direct", true)],
+            "只问真正新增的那一条：{}",
+            r.t
+        );
+        assert!(!r.t.contains(TOKEN), "{}", r.t);
+    }
+
+    /// 62（§5.10）：墓碑答 y 第二趟加回来的节点仍然要问切换——第二趟的 `added` 不能丢。
+    #[test]
+    fn menu_import_second_pass_new_nodes_are_still_offered() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let mut prof = Profiles::new_default();
+        prof.profiles.push(entry(
+            "bob-hy2-direct",
+            crate::testutil::hy2_account_node("bob"),
+            Source::ApiNodes,
+            split_keywords(),
+        ));
+        prof.active = Some("bob-hy2-direct".into());
+        prof.panel = Some(crate::profiles::Panel {
+            base_url: PANEL_BASE.into(),
+            username: "alice".into(),
+        });
+        prof.bury(
+            &entry(
+                "alice-hy2-resi",
+                crate::testutil::hy2_resi_node(),
+                Source::ApiNodes,
+                split_keywords(),
+            ),
+            0,
+        );
+        prof.save(&s, &pp).unwrap();
+        // 墓碑答 y 加回来 → 随后仍要问切换，答 y 切过去
+        let r = menu_panel(
+            &s,
+            &pp,
+            "alice",
+            vec![crate::testutil::hy2_resi_node()],
+            &["y", "y"],
+        );
+        assert!(
+            r.asked.iter().any(|q| q == menu::BURIED_ASK),
+            "前提：先问墓碑：{:?}\n{}",
+            r.asked,
+            r.t
+        );
+        assert!(
+            r.asked.contains(&menu::switch_ask("alice-hy2-resi", true)),
+            "第二趟加回来的也是新节点：{:?}\n{}",
+            r.asked,
+            r.t
+        );
+        assert_eq!(
+            Profiles::load(&s, &pp).unwrap().active.as_deref(),
+            Some("alice-hy2-resi"),
+            "{}",
+            r.t
+        );
+    }
+
+    /// 62 的另一半（§5.10、§10 F7）：墓碑答 y 之后第二趟打了导入结果行，而加回来的这条一落盘
+    /// 就成了活动节点（这台机器本来没有活动节点）→ 后面一句都不问，那几行没人看过，得停一次。
+    #[test]
+    fn menu_import_second_pass_result_pauses_when_nothing_else_is_asked() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        // 节点还列着但没有活动节点：进菜单那一下不收敛（`tidy_for` → None），
+        // 第二趟加回来的那条因此自己就当上活动节点，切换一句都不用问
+        let mut prof = Profiles::new_default();
+        prof.profiles.push(entry(
+            "bob-hy2-direct",
+            crate::testutil::hy2_account_node("bob"),
+            Source::ApiNodes,
+            split_keywords(),
+        ));
+        prof.panel = Some(crate::profiles::Panel {
+            base_url: PANEL_BASE.into(),
+            username: "alice".into(),
+        });
+        prof.bury(
+            &entry(
+                "alice-hy2-resi",
+                crate::testutil::hy2_resi_node(),
+                Source::ApiNodes,
+                split_keywords(),
+            ),
+            0,
+        );
+        prof.save(&s, &pp).unwrap();
+        let r = menu_panel(
+            &s,
+            &pp,
+            "alice",
+            vec![crate::testutil::hy2_resi_node()],
+            &["y"],
+        );
+        assert!(
+            r.asked.iter().any(|q| q == menu::BURIED_ASK),
+            "前提：先问墓碑：{:?}\n{}",
+            r.asked,
+            r.t
+        );
+        assert_eq!(
+            Profiles::load(&s, &pp).unwrap().active.as_deref(),
+            Some("alice-hy2-resi"),
+            "前提：加回来的这条自己就是活动节点：{}",
+            r.t
+        );
+        assert_eq!(
+            r.asked
+                .iter()
+                .filter(|q| q.starts_with("切换到") || *q == menu::MERGE_ASK)
+                .count(),
+            0,
+            "前提：墓碑之后一句都不问：{:?}\n{}",
+            r.asked,
+            r.t
+        );
+        assert_eq!(
+            pauses(&r.asked),
+            1,
+            "第二趟的导入结果是答完之后才打的，没人看过：{:?}\n{}",
+            r.asked,
+            r.t
+        );
+    }
+
+    /// 63（§5.8 D2）：存量重复那一问默认 N（空行；EOF 经 [`Prompt::line`] 的 `unwrap_or_default`
+    /// 与空行同路，末尾再单跑一趟钉住）→ 两条都留着，提问之后不再写盘，也不再多停一次。
+    #[test]
+    fn menu_import_duplicates_answer_no_keeps_both() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        dup_machine(&s, &pp);
+        let (n, url) = panel_net("alice", vec![resi_at(40009)]);
+        let inputs = import_inputs(&[&url], &[]);
+        let mut p = WatchAsk::new(&s, menu::MERGE_ASK, &inputs);
+        let t = run_menu_with(&s, &n, &pp, &mut p);
+        assert!(
+            said_line(
+                &t,
+                &menu::dups_head("alice-hy2-resi", &["alice-hy2-resi-2".to_string()])
+            ),
+            "{t}"
+        );
+        assert_eq!(
+            names(&s, &pp),
+            vec!["alice-hy2-resi".to_string(), "alice-hy2-resi-2".to_string()],
+            "{t}"
+        );
+        assert_eq!(got(&s, &pp, "alice-hy2-resi").node.port, 40009, "{t}");
+        assert_eq!(
+            got(&s, &pp, "alice-hy2-resi-2").node.port,
+            40007,
+            "答 N 一条都不动：{t}"
+        );
+        assert!(
+            Profiles::load(&s, &pp).unwrap().deleted.is_empty(),
+            "合并不记墓碑：{t}"
+        );
+        assert!(
+            !t.contains(menu::DUPS_HINT_CLI),
+            "菜单里不提命令行的那句出路：{t}"
+        );
+        let (writes, _) = p.sampled();
+        assert_eq!(
+            s.writes(PROFILES_JSON),
+            writes,
+            "答 N 之后一个字节都不许再写：{t}"
+        );
+        assert_eq!(
+            pauses(&p.inner.asked),
+            0,
+            "存量重复那一问本身就是停顿，答完之后一行都没打：{t}"
+        );
+
+        // 真 EOF：队列在这一问处耗尽，走的是 `Prompt::line` 的 `unwrap_or_default`
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        dup_machine(&s, &pp);
+        let (n, url) = panel_net("alice", vec![resi_at(40009)]);
+        let mut p = Scripted::from(["3", url.as_str(), ""]);
+        let t = run_menu_with(&s, &n, &pp, &mut p);
+        assert!(p.asked.iter().any(|q| q == menu::MERGE_ASK), "{t}");
+        assert_eq!(
+            names(&s, &pp),
+            vec!["alice-hy2-resi".to_string(), "alice-hy2-resi-2".to_string()],
+            "EOF 也按 N：{t}"
+        );
+    }
+
+    /// 64（§5.8 D2）：答 y → 只剩 `pick_keeper` 选中的那条，名字不变、不记墓碑、不 apply。
+    #[test]
+    fn menu_import_duplicates_answer_yes_merges_and_keeps_the_keeper_name() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        dup_machine(&s, &pp);
+        let (n, url) = panel_net("alice", vec![resi_at(40009)]);
+        let inputs = import_inputs(&[&url], &["y"]);
+        let mut p = WatchAsk::new(&s, menu::MERGE_ASK, &inputs);
+        let t = run_menu_with(&s, &n, &pp, &mut p);
+        assert_eq!(names(&s, &pp), vec!["alice-hy2-resi".to_string()], "{t}");
+        assert_eq!(
+            got(&s, &pp, "alice-hy2-resi").node.port,
+            40009,
+            "留存者的名字与数据都不变：{t}"
+        );
+        assert_eq!(
+            Profiles::load(&s, &pp).unwrap().active.as_deref(),
+            Some("alice-hy2-resi"),
+            "{t}"
+        );
+        assert!(
+            Profiles::load(&s, &pp).unwrap().deleted.is_empty(),
+            "合并不记墓碑：{t}"
+        );
+        assert!(
+            said_line(
+                &t,
+                &menu::merged_line(&["alice-hy2-resi-2".to_string()], "alice-hy2-resi")
+            ),
+            "{t}"
+        );
+        let (writes, before) = p.sampled();
+        assert_eq!(s.writes(PROFILES_JSON), writes + 1, "合并只写一次盘：{t}");
+        assert_not_applied(&s, before, "合并不碰活动节点", &t);
+        assert_eq!(
+            p.inner
+                .asked
+                .iter()
+                .filter(|q| q.starts_with("切换到"))
+                .count(),
+            0,
+            "原地合并不是新节点：{:?}",
+            p.inner.asked
+        );
+        assert_eq!(
+            pauses(&p.inner.asked),
+            1,
+            "合并那几句是答完之后才打的，没人在提问处看过，得停一次：{t}"
+        );
+    }
+
+    /// 64 的另一半（§5.10、§10 F7）：合并答 y 之后还有「切换到 …？」那一问——合并结果行在
+    /// 那一问处就看到了，答 N 回主菜单不再多停一次（`asked_at` 只管提问之前打的行）。
+    #[test]
+    fn menu_import_merge_then_a_switch_question_does_not_pause_again() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        dup_machine(&s, &pp);
+        // 同一趟还来一个新账号：合并答 y 之后仍有一句切换可问，把结果行兜在它前面
+        let r = menu_panel(
+            &s,
+            &pp,
+            "alice",
+            vec![resi_at(40009), crate::testutil::hy2_account_node("bob")],
+            &["y", "n"],
+        );
+        assert!(
+            r.asked.iter().any(|q| q == menu::MERGE_ASK),
+            "前提：先问合并：{:?}\n{}",
+            r.asked,
+            r.t
+        );
+        assert!(
+            said_line(
+                &r.t,
+                &menu::merged_line(&["alice-hy2-resi-2".to_string()], "alice-hy2-resi")
+            ),
+            "前提：合并结果行是答完之后才打的：{}",
+            r.t
+        );
+        assert_eq!(
+            r.asked
+                .iter()
+                .filter(|q| q.starts_with("切换到"))
+                .collect::<Vec<_>>(),
+            vec![&menu::switch_ask("alice-hy2-direct", true)],
+            "前提：随后还有切换那一问：{:?}\n{}",
+            r.asked,
+            r.t
+        );
+        assert_eq!(
+            Profiles::load(&s, &pp).unwrap().active.as_deref(),
+            Some("alice-hy2-resi"),
+            "切换答 N 不切：{}",
+            r.t
+        );
+        assert_eq!(
+            pauses(&r.asked),
+            0,
+            "合并结果行在切换那一问处已经看过了：{:?}\n{}",
+            r.asked,
+            r.t
+        );
+    }
+
+    /// 65（§5.8 D9）：token 名的留存者先只能叫 `-2`，合并掉占着规范名的那条之后取回规范名。
+    #[test]
+    fn menu_import_merge_gives_a_token_keeper_the_canonical_name() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        listed_from_panel(
+            &s,
+            &pp,
+            vec![
+                entry(
+                    &token_name(),
+                    resi_at(40003),
+                    Source::ApiNodes,
+                    split_keywords(),
+                ),
+                entry(
+                    HEALED_NAME,
+                    crate::testutil::hy2_resi_node(),
+                    Source::ApiNodes,
+                    split_keywords(),
+                ),
+            ],
+            &token_name(),
+            "alice",
+        );
+        let numbered = format!("{HEALED_NAME}-2");
+        let r = menu_panel(
+            &s,
+            &pp,
+            "alice",
+            vec![crate::testutil::hy2_resi_node()],
+            &["y"],
+        );
+        assert!(
+            said_line(&r.t, &menu::renamed_line(&token_name(), &numbered)),
+            "规范名被同账号占着，先只能叫 -2：{}",
+            r.t
+        );
+        assert_eq!(names(&s, &pp), vec![HEALED_NAME.to_string()], "{}", r.t);
+        assert_eq!(
+            Profiles::load(&s, &pp).unwrap().active.as_deref(),
+            Some(HEALED_NAME),
+            "{}",
+            r.t
+        );
+        assert_eq!(got(&s, &pp, HEALED_NAME).node.port, 40000, "{}", r.t);
+        assert!(
+            said_line(
+                &r.t,
+                &menu::merged_line(&[HEALED_NAME.to_string()], &numbered)
+            ),
+            "并入的是那一刻还叫 -2 的留存者：{}",
+            r.t
+        );
+        assert!(
+            said_line(&r.t, &menu::renamed_line(&numbered, HEALED_NAME)),
+            "取回规范名要再说一句：{}",
+            r.t
+        );
+        assert!(!r.t.contains(TOKEN), "{}", r.t);
+    }
+
+    /// §5.8、§5.10：答 y 之后另拿一次锁重读，别的会话已经把该并的那条删了 → 一组都没并成，
+    /// 打「节点列表已经变了，没有合并」、一个字节都不写；那一份列表里连本趟新增的节点也没了
+    /// → `after` 过滤把候选清空，切换一句都不问。
+    #[test]
+    fn menu_import_merge_after_the_list_changed_says_so_and_asks_nothing() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        // 进菜单那一下的收敛不该再占一把锁：夹具先 apply 一次，让数据面与节点列表一致
+        let prof = dup_machine(&s, &pp);
+        Engine::new(&s, &pp).apply(&prof).unwrap();
+        // 别的会话把 -2 那条副本与本趟新增的 bob 都删了：合并那把锁一拿到就读到这份
+        let mut theirs = Profiles::new_default();
+        theirs.profiles = vec![entry(
+            "alice-hy2-resi",
+            resi_at(40009),
+            Source::ApiNodes,
+            split_keywords(),
+        )];
+        theirs.active = Some("alice-hy2-resi".into());
+        theirs.panel = Some(crate::profiles::Panel {
+            base_url: PANEL_BASE.into(),
+            username: "alice".into(),
+        });
+        let theirs = String::from_utf8(serde_json::to_vec_pretty(&theirs).unwrap()).unwrap();
+        let (n, url) = panel_net(
+            "alice",
+            vec![resi_at(40009), crate::testutil::hy2_account_node("bob")],
+        );
+        let inputs = import_inputs(&[&url], &["y"]);
+        let mut p = WatchAsk::new(&s, menu::MERGE_ASK, &inputs)
+            .at_ask(move |s| s.stage_on_lock(PROFILES_JSON, &theirs));
+        let from = s.calls().len();
+        let t = run_menu_with(&s, &n, &pp, &mut p);
+        // 前提：第一趟真把 bob 加进来了（不然下面「别问切换到它」那条断言静默空过——
+        // 它要查的是「加过、又被别的会话删掉、所以不问」，不是「压根没加过」）
+        assert!(
+            t.contains("导入 1 个新节点，共 3 个"),
+            "前提：第一趟把 bob 加进了列表：{t}"
+        );
+        assert!(said_line(&t, menu::MERGE_NOTHING), "{t}");
+        assert!(!t.contains("已把"), "一组都没并成，不许打合并结果行：{t}");
+        let (writes, _) = p.sampled();
+        assert_eq!(s.writes(PROFILES_JSON), writes, "一组都没并成就不写盘：{t}");
+        assert_eq!(names(&s, &pp), vec!["alice-hy2-resi".to_string()], "{t}");
+        assert_eq!(
+            p.inner
+                .asked
+                .iter()
+                .filter(|q| q.starts_with("切换到"))
+                .count(),
+            0,
+            "本趟新增的那条已经不在列表里了，别问切换到它：{:?}\n{t}",
+            p.inner.asked
+        );
+        // [`WatchAsk`] 也记 `ask …` 流水，下面那句「持锁期间没提问」才真的在查提问，
+        // MERGE_NOTHING 这条路的 R11 也就有了覆盖（审查 T11 r2 第 7 条）
+        assert!(
+            s.calls()[from..]
+                .iter()
+                .any(|c| *c == format!("ask {}", menu::MERGE_ASK)),
+            "前提：提问进了调用流水：{:?}",
+            s.calls()
+        );
+        assert_eq!(no_prompt_under_lock(&s, from, "[3] 合并"), 2, "{t}");
+        assert_eq!(
+            pauses(&p.inner.asked),
+            1,
+            "「没有合并」是答完之后才打的，没人看过：{t}"
+        );
+    }
+
+    /// §5.8、§0.2 R15：合并那次拿不到锁 → 打一句「失败：…」就回菜单，两条都留着、菜单停一次。
+    /// 文案不能沿用导入那句「这次什么都没改」：第一趟 `save_import` 早写过盘了，没做的只有合并。
+    #[test]
+    fn menu_import_merge_with_the_lock_busy_merges_nothing_and_says_so() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        dup_machine(&s, &pp);
+        let (n, url) = panel_net("alice", vec![resi_at(40009)]);
+        let inputs = import_inputs(&[&url], &["y"]);
+        // 第一趟那把锁早放了，问到「要合并吗？」这一刻才被别人占住
+        let mut p = WatchAsk::new(&s, menu::MERGE_ASK, &inputs).at_ask(|s| s.lock_busy(u32::MAX));
+        let t = run_menu_with(&s, &n, &pp, &mut p);
+        assert!(
+            said_line(&t, &format!("失败：{}", menu::MERGE_LOCK_BUSY)),
+            "{t}"
+        );
+        assert!(t.contains("等它结束"), "先说一句在等：{t}");
+        assert!(
+            !t.contains("这次什么都没改"),
+            "导入已经写过盘了，没做的只有合并：{t}"
+        );
+        assert_eq!(
+            names(&s, &pp),
+            vec!["alice-hy2-resi".to_string(), "alice-hy2-resi-2".to_string()],
+            "{t}"
+        );
+        assert_eq!(
+            got(&s, &pp, "alice-hy2-resi").node.port,
+            40009,
+            "导入本身照旧：{t}"
+        );
+        let (writes, _) = p.sampled();
+        assert_eq!(s.writes(PROFILES_JSON), writes, "合并没做，不写盘：{t}");
+        assert_eq!(pauses(&p.inner.asked), 1, "失败要停一次：{t}");
+    }
+
+    /// 66（§10）：端口变化行经 `tell` 单独出现时也算附加行，菜单停一次。
+    #[test]
+    fn menu_import_extra_lines_pause_before_returning() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        listed_from_panel(
+            &s,
+            &pp,
+            vec![entry(
+                "alice-hy2-resi",
+                resi_at(40003),
+                Source::ApiNodes,
+                split_keywords(),
+            )],
+            "alice-hy2-resi",
+            "alice",
+        );
+        let r = menu_panel(
+            &s,
+            &pp,
+            "alice",
+            vec![crate::testutil::hy2_resi_node()],
+            &[],
+        );
+        assert!(
+            said_line(&r.t, &menu::port_moved_line("alice-hy2-resi", 40003, 40000)),
+            "{}",
+            r.t
+        );
+        assert_eq!(
+            r.asked.iter().filter(|q| q.starts_with("切换到")).count(),
+            0,
+            "{:?}",
+            r.asked
+        );
+        assert_eq!(pauses(&r.asked), 1, "一问都没问，就得停一次：{:?}", r.asked);
+    }
+
+    /// 38b 菜单版的夹具（§5.3、§5.10）：活动节点是 V3 条目、停在旧端口 → 被 §5.3 挡下，
+    /// `switch_to` 由它而来；同账号的 `HEALED_NAME` 是留存者，跟着来件更新到新端口。
+    /// 返回落盘的那份列表与来件的两条 URI（留存者那条 + 另一个账号真正新增的那条）。
+    fn blocked_active_machine(s: &FakeSys, pp: &Paths) -> (Profiles, String, String) {
+        let stale = uri_node(&hy2_uri("alice", "hy2-pw", 40003, "alice-HY2住宅"));
+        let pre = listed(
+            s,
+            pp,
+            vec![
+                entry(
+                    "hysteria2-1785892136",
+                    bui_schema::nodes::Node {
+                        label: "alice-HY2住宅".into(),
+                        ..stale.clone()
+                    },
+                    Source::V3,
+                    crate::profiles::default_split(),
+                ),
+                entry(
+                    HEALED_NAME,
+                    stale,
+                    Source::Subscription,
+                    crate::profiles::default_split(),
+                ),
+            ],
+            "hysteria2-1785892136",
+        );
+        let fresh = hy2_uri("alice", "hy2-pw", 40000, "alice-HY2住宅");
+        assert!(
+            matches!(
+                pre.blocked_same_account(&uri_node(&fresh), Source::Subscription),
+                Some((_, Blocked::ActiveEntry { .. }))
+            ),
+            "前提：活动节点被 §5.3 挡下，才会有「切换到 {{keep}}？」这一问"
+        );
+        // 同一趟还粘一条真正新增的节点：`switch_to` 排在 `added` 前面（§5.10），顺序反了
+        // 「切换到 {留存者}？」就永远轮不上——只问第一个候选
+        let brand_new = hy2_uri("bob", "hy2-pw", 10000, "bob-HY2直连");
+        (pre, fresh, brand_new)
+    }
+
+    /// 38b 菜单版（A2、§5.10）：组非空、活动节点被挡下 → 问「切换到 {留存者}？」，答 y 切过去。
+    /// 它不是新导入的，所以问句不带「新导入的」。
+    #[test]
+    fn menu_import_offers_the_keeper_when_the_active_node_is_blocked() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let (_, fresh, brand_new) = blocked_active_machine(&s, &pp);
+        let r = menu_sub(&s, &pp, "alice", &[&fresh, &brand_new], &["y"]);
+        assert_eq!(
+            r.asked
+                .iter()
+                .filter(|q| q.starts_with("切换到"))
+                .collect::<Vec<_>>(),
+            vec![&menu::switch_ask(HEALED_NAME, false)],
+            "问句不带「新导入的」，而且排在新节点前面：{:?}\n{}",
+            r.asked,
+            r.t
+        );
+        let saved = Profiles::load(&s, &pp).unwrap();
+        assert_eq!(saved.active.as_deref(), Some(HEALED_NAME), "{}", r.t);
+        assert_eq!(got(&s, &pp, HEALED_NAME).node.port, 40000, "{}", r.t);
+        assert_eq!(
+            got(&s, &pp, "hysteria2-1785892136").node.port,
+            40003,
+            "被挡下的那条一个字段都不动：{}",
+            r.t
+        );
+    }
+
+    /// 38b 菜单版答 n（A2、§5.10、§5.7）：同一夹具答 n → 一个字都不切，活动节点还停在被挡下的
+    /// 那条旧节点上；留存者该更新的照旧更新（那是导入干的，与这一问无关）；数据面一个字节没动；
+    /// 提问本身就是停顿，答否回主菜单不再停一次。
+    #[test]
+    fn menu_import_keeps_the_blocked_active_node_when_the_offer_is_declined() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let (pre, fresh, brand_new) = blocked_active_machine(&s, &pp);
+        // 夹具先 apply 一次，让数据面与节点列表一致：进菜单那一下的收敛就不写 `config.json`、
+        // 不重启，`assert_not_applied` 数的才是这一趟导入自己有没有动数据面
+        Engine::new(&s, &pp).apply(&pre).unwrap();
+        let before = marks(&s);
+        let r = menu_sub(&s, &pp, "alice", &[&fresh, &brand_new], &["n"]);
+        assert_eq!(
+            r.asked
+                .iter()
+                .filter(|q| q.starts_with("切换到"))
+                .collect::<Vec<_>>(),
+            vec![&menu::switch_ask(HEALED_NAME, false)],
+            "问的仍是留存者那一句，只问一次：{:?}\n{}",
+            r.asked,
+            r.t
+        );
+        let saved = Profiles::load(&s, &pp).unwrap();
+        assert_eq!(
+            saved.active.as_deref(),
+            Some("hysteria2-1785892136"),
+            "答 n 不切：活动节点还是被挡下的那条旧节点：{}",
+            r.t
+        );
+        assert_eq!(
+            got(&s, &pp, HEALED_NAME).node.port,
+            40000,
+            "留存者的端口照旧更新，不因为答 n 而回退：{}",
+            r.t
+        );
+        assert_eq!(
+            got(&s, &pp, "hysteria2-1785892136").node.port,
+            40003,
+            "被挡下的那条一个字段都不动：{}",
+            r.t
+        );
+        assert_not_applied(&s, before, "答 n 没换活动节点，数据面不动", &r.t);
+        assert_eq!(
+            pauses(&r.asked),
+            0,
+            "问过了就不再停一次：{:?}\n{}",
+            r.asked,
+            r.t
+        );
+    }
+
+    /// 38b + D9：留存者答 y 合并时按 D9 从 `-2` 取回规范名，切换候选记的还是合并**前**那个名字
+    /// ——不跟着换，下面那句 `after` 过滤就把它当成「已经不在了」，活动节点被挡下时该问的
+    /// 「切换到 {keep}？」会静默丢掉。钉住定稿 §5.10「过 after 过滤之前先按
+    /// `Merged::renamed_from` → `keeper` 换名」那一条（实现期补准，裁决二）。
+    #[test]
+    fn menu_import_offers_the_keeper_by_the_name_it_took_back_in_the_merge() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let fresh = hy2_uri("alice", "hy2-pw", 40000, "alice-HY2住宅");
+        let stale = |port| uri_node(&hy2_uri("alice", "hy2-pw", port, "alice-HY2住宅"));
+        let pre = listed(
+            &s,
+            &pp,
+            vec![
+                // 活动节点：V3 条目、与来件不同参数 → §5.3 挡下，`switch_to` 由它而来
+                entry(
+                    "hysteria2-1785892136",
+                    stale(40003),
+                    Source::V3,
+                    crate::profiles::default_split(),
+                ),
+                // token 名那条与来件同一连接 → 留存者；规范名被下面那条占着，洗名只能叫 -2
+                entry(
+                    &token_name(),
+                    uri_node(&fresh),
+                    Source::Subscription,
+                    crate::profiles::default_split(),
+                ),
+                // 占着规范名的存量副本：停在另一个端口，答 y 时被并掉，规范名腾出来
+                entry(
+                    HEALED_NAME,
+                    stale(40007),
+                    Source::Subscription,
+                    crate::profiles::default_split(),
+                ),
+            ],
+            "hysteria2-1785892136",
+        );
+        assert!(
+            matches!(
+                pre.blocked_same_account(&uri_node(&fresh), Source::Subscription),
+                Some((_, Blocked::ActiveEntry { .. }))
+            ),
+            "前提：活动节点被 §5.3 挡下，才会有「切换到 {{keep}}？」这一问"
+        );
+        let numbered = format!("{HEALED_NAME}-2");
+        let r = menu_sub(&s, &pp, "alice", &[&fresh], &["y", "y"]);
+        assert!(
+            said_line(
+                &r.t,
+                &menu::merged_line(&[HEALED_NAME.to_string()], &numbered)
+            ),
+            "{}",
+            r.t
+        );
+        assert!(
+            said_line(&r.t, &menu::renamed_line(&numbered, HEALED_NAME)),
+            "取回规范名要单说一句：{}",
+            r.t
+        );
+        assert_eq!(
+            r.asked
+                .iter()
+                .filter(|q| q.starts_with("切换到"))
+                .collect::<Vec<_>>(),
+            vec![&menu::switch_ask(HEALED_NAME, false)],
+            "问的是留存者合并之后的新名字：{:?}\n{}",
+            r.asked,
+            r.t
+        );
+        assert_eq!(
+            Profiles::load(&s, &pp).unwrap().active.as_deref(),
+            Some(HEALED_NAME),
+            "{}",
+            r.t
+        );
+        assert_eq!(got(&s, &pp, HEALED_NAME).node.port, 40000, "{}", r.t);
+        assert!(!r.t.contains(TOKEN), "{}", r.t);
+    }
+
+    /// 57 菜单版（D7）：答 y 合并掉那条面板副本之后，留存者仍是关键字分流、来源仍是 `ApiNodes`。
+    #[test]
+    fn menu_import_merging_the_panel_copy_keeps_the_keyword_split() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let fresh = hy2_uri("alice", "hy2-pw", 40000, "alice-HY2住宅");
+        listed(
+            &s,
+            &pp,
+            vec![
+                entry(
+                    HEALED_NAME,
+                    uri_node(&hy2_uri("alice", "hy2-pw", 40003, "alice-HY2住宅")),
+                    Source::Subscription,
+                    crate::profiles::default_split(),
+                ),
+                entry(
+                    "alice-hy2-resi",
+                    uri_node(&fresh),
+                    Source::ApiNodes,
+                    split_keywords(),
+                ),
+            ],
+            HEALED_NAME,
+        );
+        let r = menu_sub(&s, &pp, "alice", &[&fresh], &["y"]);
+        assert_eq!(names(&s, &pp), vec![HEALED_NAME.to_string()], "{}", r.t);
+        let keeper = got(&s, &pp, HEALED_NAME);
+        assert_eq!(keeper.node.port, 40000, "{}", r.t);
+        assert_eq!(keeper.split, split_keywords(), "面板分流不许丢：{}", r.t);
+        assert_eq!(keeper.source, Source::ApiNodes, "来源只升不降：{}", r.t);
+        assert!(
+            said_line(
+                &r.t,
+                &menu::merged_line(&["alice-hy2-resi".to_string()], HEALED_NAME)
+            ),
+            "{}",
+            r.t
+        );
+    }
+
+    /// 53 菜单版（§7）：墓碑只问一句，答 N 之后不再问别的。
+    #[test]
+    fn menu_import_a_buried_account_asks_exactly_once() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let mut prof = Profiles::new_default();
+        prof.profiles.push(entry(
+            "bob-hy2-direct",
+            crate::testutil::hy2_account_node("bob"),
+            Source::ApiNodes,
+            split_keywords(),
+        ));
+        prof.active = Some("bob-hy2-direct".into());
+        prof.panel = Some(crate::profiles::Panel {
+            base_url: PANEL_BASE.into(),
+            username: "alice".into(),
+        });
+        prof.bury(
+            &entry(
+                "alice-hy2-resi",
+                resi_at(40003),
+                Source::ApiNodes,
+                split_keywords(),
+            ),
+            0,
+        );
+        prof.save(&s, &pp).unwrap();
+        let r = menu_panel(
+            &s,
+            &pp,
+            "alice",
+            vec![crate::testutil::hy2_resi_node()],
+            &["n"],
+        );
+        assert_eq!(
+            r.asked.iter().filter(|q| *q == menu::BURIED_ASK).count(),
+            1,
+            "{:?}\n{}",
+            r.asked,
+            r.t
+        );
+        assert!(
+            said_line(&r.t, &menu::buried_head(&["alice-hy2-resi".to_string()])),
+            "{}",
+            r.t
+        );
+        assert_eq!(
+            names(&s, &pp),
+            vec!["bob-hy2-direct".to_string()],
+            "{}",
+            r.t
+        );
+        assert_eq!(
+            r.asked
+                .iter()
+                .filter(|q| *q == menu::MERGE_ASK || q.starts_with("切换到"))
+                .count(),
+            0,
+            "答 N 之后没别的可问：{:?}",
+            r.asked
+        );
+    }
+
+    /// §5.10：三问的顺序是墓碑 → 存量重复 → 切换；三个 n 各自生效——墓碑挡下的没被加回来、
+    /// 存量重复那条还在、活动节点没换。
+    ///
+    /// 末尾那句 `pauses == 0` 查的是另一回事（§10 F7）：**最后**一问答完之后一行都没打，
+    /// 提问本身就是停顿（`asked_is_a_pause`），与前面三问的顺序无关。
+    #[test]
+    fn menu_import_asks_in_order_buried_then_merge_then_switch() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        wide(&s);
+        let mut prof = Profiles::new_default();
+        prof.profiles = vec![
+            entry(
+                "alice-hy2-resi",
+                resi_at(40003),
+                Source::ApiNodes,
+                split_keywords(),
+            ),
+            entry(
+                "alice-hy2-resi-2",
+                resi_at(40007),
+                Source::ApiNodes,
+                split_keywords(),
+            ),
+        ];
+        prof.active = Some("alice-hy2-resi".into());
+        prof.panel = Some(crate::profiles::Panel {
+            base_url: PANEL_BASE.into(),
+            username: "alice".into(),
+        });
+        prof.bury(
+            &entry(
+                "carol-hy2-direct",
+                crate::testutil::hy2_account_node("carol"),
+                Source::ApiNodes,
+                split_keywords(),
+            ),
+            0,
+        );
+        prof.save(&s, &pp).unwrap();
+        // 住宅那一条换端口（带出存量重复）、bob 是新账号、carol 被墓碑挡下
+        let r = menu_panel(
+            &s,
+            &pp,
+            "alice",
+            vec![
+                resi_at(40009),
+                crate::testutil::hy2_account_node("bob"),
+                crate::testutil::hy2_account_node("carol"),
+            ],
+            &["n", "n", "n"],
+        );
+        let switch = menu::switch_ask("alice-hy2-direct", true);
+        let at = |q: &str| {
+            r.asked
+                .iter()
+                .position(|x| x == q)
+                .unwrap_or_else(|| panic!("没问「{q}」：{:?}\n{}", r.asked, r.t))
+        };
+        let (buried, merge, switch) = (at(menu::BURIED_ASK), at(menu::MERGE_ASK), at(&switch));
+        assert!(
+            buried < merge && merge < switch,
+            "顺序该是墓碑 → 存量重复 → 切换：{:?}",
+            r.asked
+        );
+        // 三个 n 各自生效：墓碑挡下的 carol 没被加回来（列表里没有 carol 那条）、存量重复
+        // 那条没被并掉（`-2` 还在）、切换那一问没换活动节点
+        assert_eq!(
+            names(&s, &pp),
+            vec![
+                "alice-hy2-resi".to_string(),
+                "alice-hy2-resi-2".to_string(),
+                "alice-hy2-direct".to_string(),
+            ],
+            "墓碑答 n 就不加回来、合并答 n 就不并掉：{:?}\n{}",
+            r.asked,
+            r.t
+        );
+        assert_eq!(
+            Profiles::load(&s, &pp).unwrap().active.as_deref(),
+            Some("alice-hy2-resi"),
+            "切换答 n 就不换活动节点：{:?}\n{}",
+            r.asked,
+            r.t
+        );
+        assert_eq!(
+            pauses(&r.asked),
+            0,
+            "最后一问答完之后一行都没打：提问本身就是停顿，不再停一次（与三问的顺序无关）：{:?}",
+            r.asked
         );
     }
 }

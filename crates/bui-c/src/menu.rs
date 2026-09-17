@@ -2,7 +2,7 @@
 //!
 //! 渲染输出不含 ANSI 颜色：颜色会让快照测试变脆，可读性靠对齐与 `●`/`○`/`★` 够用。
 
-use crate::profiles::{kind_slug, Mode, Profiles};
+use crate::profiles::{kind_slug, Blocked, Mode, Profiles};
 use crate::update::{Report, SelfReason};
 use crate::{Error, Result};
 use std::borrow::Cow;
@@ -613,6 +613,36 @@ pub fn sanitize(s: &str) -> Cow<'_, str> {
     )
 }
 
+/// 人读输出里的节点名：先过 [`sanitize`]，再把每个 token 段打码成前 4 位加 `…`。
+///
+/// 4.0.0 用 token 订阅链接导入过的机器，名字里带着整串 32 位十六进制的订阅 token
+/// （判据同 [`crate::source::looks_like_token`]）。token 等价订阅凭据，而名字会出现在
+/// 列表、菜单、状态、删除确认块与「上次：」行里，截图就带出去了：`<合成 token>-hy2-resi`
+/// 打成 `0123…-hy2-resi`（spec §8.3）。没有 token 段时返回净化的结果，Borrowed 时原样借出。
+///
+/// 只改显示、不写盘，所以只读入口也能用，从不导入的机器也覆盖到；`--json` 与
+/// `profiles.json` 不走这里（它们是机器接口，打码只会让字段有损）。
+///
+/// **打码一定在截断之前**：先截后打的话，[`truncate_middle`] 留下的头部还是 token 的前若干位。
+pub fn display_name(name: &str) -> Cow<'_, str> {
+    let clean = sanitize(name);
+    if !clean.split('-').any(crate::source::looks_like_token) {
+        return clean;
+    }
+    let masked: Vec<String> = clean
+        .split('-')
+        .map(|seg| {
+            if crate::source::looks_like_token(seg) {
+                // token 段是 32 位 ASCII 十六进制，按字节切前 4 位切不到半个字
+                format!("{}{ELLIPSIS}", &seg[..4])
+            } else {
+                seg.to_string()
+            }
+        })
+        .collect();
+    Cow::Owned(masked.join("-"))
+}
+
 /// `s` 最长的、容量口径不超过 `budget` 列的前缀（只在字符边界上切）。
 fn prefix_within(s: &str, budget: usize) -> &str {
     let mut used = 0;
@@ -751,10 +781,11 @@ fn last_line(text: &str, width: usize) -> String {
 
 /// 「上次：」行的摘要里带节点名时，名字单独中间截断（spec §0.2 R6）：名字的预算是行宽上限
 /// 减去「  上次：」与名字前后的文字，放得下就原样。摘要里找不到名字就原样返回，整行照旧由
-/// [`render`] 尾截。先净化，免得控制字符把宽度算错。
+/// [`render`] 尾截。名字先过 [`display_name`]（净化 + token 打码；调用方拼摘要时用的也是
+/// 显示名，打码幂等，所以照样找得到），免得控制字符把宽度算错、token 露出来。
 pub fn fit_name_in_last(summary: &str, name: &str, width: usize) -> String {
     let summary = sanitize(summary);
-    let name = sanitize(name);
+    let name = display_name(name);
     let Some(at) = summary.find(name.as_ref()) else {
         return summary.into_owned();
     };
@@ -774,13 +805,13 @@ pub const NO_NODES: &str = "没有节点，先用 [3] 导入节点";
 pub const BURIED_LIST_MAX: usize = 3;
 
 /// 被墓碑挡下的节点名列成一串：`a、b、c`；多于 [`BURIED_LIST_MAX`] 个时
-/// `a、b、c 等 N 个`。名字先过 [`sanitize`]，不截断——折行交给调用方（菜单经
-/// [`wrap`]，命令行交给终端）。
+/// `a、b、c 等 N 个`。名字先过 [`display_name`]（净化 + token 打码，没有 token 段时
+/// 与 [`sanitize`] 恒等），不截断——折行交给调用方（菜单经 [`wrap`]，命令行交给终端）。
 pub fn buried_list(names: &[String]) -> String {
     let head: Vec<String> = names
         .iter()
         .take(BURIED_LIST_MAX)
-        .map(|n| sanitize(n).into_owned())
+        .map(|n| display_name(n).into_owned())
         .collect();
     let listed = head.join("、");
     if names.len() > BURIED_LIST_MAX {
@@ -821,6 +852,169 @@ pub fn buried_skipped(names: &[String]) -> String {
 /// 粘一条就是明确要它，直接加回并清掉墓碑，不再问。
 pub const BURIED_RESTORED: &str = "它之前被删过，已恢复";
 
+// ───────────── 存量重复、改名与切换（spec §5.4、§5.6、§5.8、§5.10） ─────────────
+
+/// 导入之后、存量重复那一问上面的那一句（spec §5.8）：
+/// `同一账号还有 N 个节点：a、b（本次已更新 X）`。
+///
+/// 名单的个数上限与净化复用 [`buried_list`]（多于 [`BURIED_LIST_MAX`] 个写成「等 N 个」），
+/// 名字与留存者 `keeper` 都过 [`display_name`]，不截断——折行交给调用方（经 `tell`）。
+/// 4.1 之前旧槽端口的副本还能连、只是从另一个住宅 IP 出去，所以文案不写「死节点」。
+///
+/// **只报事实、不断言原因**（收尾 M2）：组里的非留存者副本可能恰好已经与来件全等——rc 留下
+/// 的 `-2` 正停在新端口上（测试 42），或者它占着留存者要取回的规范名（测试 65，D9）——这时
+/// 「与服务端这次给的端口或凭据不一致」与事实相反。改的是文案不是名单：把已全等的副本滤掉
+/// 会连这两条合并出路一起消掉，而它们正是本版要收拢的场景。
+pub fn dups_head(keeper: &str, others: &[String]) -> String {
+    format!(
+        "同一账号还有 {} 个节点：{}（本次已更新 {}）",
+        others.len(),
+        buried_list(others),
+        display_name(keeper)
+    )
+}
+
+/// 紧跟 [`dups_head`] 的那一问（spec §5.8；`[y/N]` 由 `Prompt::confirm` 自己补，默认 N）。
+/// 菜单在**放锁之后**、墓碑那一问之后问它，答 y 才另拿一次锁合并。名字在上一句里，
+/// 问句本身短到 40 列也不折。
+pub const MERGE_ASK: &str = "要合并吗？";
+
+/// 答 y 之后重读 `profiles.json`、逐条核对，一个都没并成时打的那一行（spec §5.8）：
+/// 别的会话删了、改了。
+pub const MERGE_NOTHING: &str = "节点列表已经变了，没有合并";
+
+/// 命令行 `bui-c import` 打完 [`dups_head`] 之后的那一行（spec §5.8）：命令行不问、不改，
+/// 退出码不变。
+pub const DUPS_HINT_CLI: &str = "要合并请在菜单 [3] 里导入并答 y";
+
+/// 菜单 `[3]` 答 y 之后、合并那一次拿不到锁时打的那一行（spec §5.8、§0.2 R15）：导入已经
+/// 写过盘了，只有合并没做——这里不能说 `cli::LOCK_BUSY` 的「这次什么都没改」。
+/// 由 `cli` 拼成「失败：…」经 `say` 原样打。裸文案容量口径 45 列，连「失败：」前缀 51 列，
+/// 60 列终端的「上次：」行（`LAST_HEAD` 占 8 列，`line_limit(60)` = 59）刚好放满。
+/// （[`crate::cli`] 的 `LOCK_BUSY` 裸文案也是 51 列，但它上屏同样带「失败：」= 57 列、进
+/// 「上次：」行是 65 列，60 列下会被 `render` 尾截——只有本句这个长度放得下。）
+pub const MERGE_LOCK_BUSY: &str = "另一个 bui-c 操作还没结束，没有合并，稍后再试";
+
+/// 合并成功那一行（spec §5.8）：`已把 a、b 并入 X`。名字逐个过 [`display_name`]，
+/// 不截断、不设个数上限——它报的是实际并掉了哪几条，折行交给调用方（经 `tell`）。
+pub fn merged_line(others: &[String], keeper: &str) -> String {
+    let listed: Vec<String> = others
+        .iter()
+        .map(|n| display_name(n).into_owned())
+        .collect();
+    format!("已把 {} 并入 {}", listed.join("、"), display_name(keeper))
+}
+
+/// token 名改名那一行（spec §5.6、§8.1）：`节点 0123…-hy2-resi 已改名为 panel.example.com-hy2-resi`。
+///
+/// 旧名过 [`display_name`]——带 token 的就是它；新名由 `profiles::profile_name` 现起，
+/// 只有主机与 kind，已经过净化。
+pub fn renamed_line(old: &str, new: &str) -> String {
+    format!("节点 {} 已改名为 {new}", display_name(old))
+}
+
+/// 端口变了的更新行（spec §5.4、§10）：`更新节点 alice-hy2-resi：端口 40003 → 40000`。
+/// 端口没变时调用方打 rc 原文「更新节点 X」，不走这里。
+pub fn port_moved_line(name: &str, from: u16, to: u16) -> String {
+    format!("更新节点 {}：端口 {from} → {to}", display_name(name))
+}
+
+/// 菜单 `[3]` 导入之后的切换追问（spec §5.10；`[y/N]` 由 `Prompt::confirm` 自己补）。
+///
+/// `fresh` 为真是真正新增的节点（rc 原文 `切换到新导入的 X？`）；为假是账号组非空、
+/// 活动节点被挡下时的留存者，它不是新导入的，只是刚被更新到服务端参数，所以问
+/// `切换到 X？`。
+pub fn switch_ask(name: &str, fresh: bool) -> String {
+    let shown = display_name(name);
+    if fresh {
+        format!("切换到新导入的 {shown}？")
+    } else {
+        format!("切换到 {shown}？")
+    }
+}
+
+/// 受保护条目同时在门槛外时，四句说明句都补的那半句（spec §5.3 A1）：插在「…不变」之后、
+/// 分号之前，四句插入点一致，其余逐字不变，所以一共八种输出。
+const KIND_UNSURE_HALF: &str = "，同时认不准是直连还是住宅";
+
+/// §5.4 ③：同账号的条目受保护、挡下了原地替换，于是另起了一条新节点时的说明（spec §5.3、§10）。
+///
+/// `old` 是被挡下的那条、`new` 是刚起的新名，两者都先过 [`display_name`]（调用点传原名即可）。
+/// `why` 整枚传进来：[`Blocked::PanelEntry`] 与 [`Blocked::ActiveEntry`] 的出路不同，
+/// `kind_unsure` 为真时在「…不变」之后补 [`KIND_UNSURE_HALF`]——追加半句只补原因、不改出路
+/// （面板重新导入门槛必过，切换与门槛无关，§5.3）。
+///
+/// 只处理这两种原因；[`Blocked::KindUnsure`] 是调用方写错了（③ 那一格该打 [`kind_unsure_new`]），
+/// `debug_assert!` 挡住，release 下回落成 [`kind_unsure_new`] 的措辞、不 panic。
+pub fn protected_new(old: &str, new: &str, why: Blocked) -> String {
+    let (o, n) = (display_name(old), display_name(new));
+    let (head, kind_unsure, way) = match why {
+        Blocked::PanelEntry { kind_unsure } => (
+            format!("与 {o} 同一账号但连接参数不同，已按新节点导入为 {n}，{o} 不变"),
+            kind_unsure,
+            "要更新它请从面板重新导入",
+        ),
+        Blocked::ActiveEntry { kind_unsure } => (
+            format!("与当前节点 {o} 同一账号但连接参数不同，已按新节点导入为 {n}，当前节点不变"),
+            kind_unsure,
+            "确认新节点能用后可以切换过去",
+        ),
+        Blocked::KindUnsure => {
+            debug_assert!(
+                false,
+                "protected_new 只处理受保护条目，KindUnsure 走 kind_unsure_new"
+            );
+            return kind_unsure_new(old, new);
+        }
+    };
+    let half = if kind_unsure { KIND_UNSURE_HALF } else { "" };
+    format!("{head}{half}；{way}")
+}
+
+/// §5.4 ①：账号组非空、留存者 `keep` 已经更新到新参数，而组外还有一条同账号的条目被挡下
+/// （A2）时的说明（spec §5.3、§10）。
+///
+/// `old` 是被挡下的那条、`keep` 是刚更新的留存者，两者都先过 [`display_name`]。
+/// `why`、`kind_unsure` 与回落规则同 [`protected_new`]；[`Blocked::ActiveEntry`] 时调用方
+/// 还要把 `keep` 记进 `switch_to`（菜单据此追问切换，§5.10）。
+pub fn protected_kept(old: &str, keep: &str, why: Blocked) -> String {
+    let (o, k) = (display_name(old), display_name(keep));
+    let (head, kind_unsure, way) = match why {
+        Blocked::PanelEntry { kind_unsure } => (
+            format!("{o} 与 {k} 同一账号但连接参数不同，{o} 不变"),
+            kind_unsure,
+            "要更新它请从面板重新导入".to_string(),
+        ),
+        Blocked::ActiveEntry { kind_unsure } => (
+            format!("当前节点 {o} 与 {k} 同一账号但连接参数不同，当前节点不变"),
+            kind_unsure,
+            format!("确认 {k} 能用后可以切换过去"),
+        ),
+        Blocked::KindUnsure => {
+            debug_assert!(
+                false,
+                "protected_kept 只处理受保护条目，KindUnsure 在 ① 里什么都不打"
+            );
+            return kind_unsure_new(old, keep);
+        }
+    };
+    let half = if kind_unsure { KIND_UNSURE_HALF } else { "" };
+    format!("{head}{half}；{way}")
+}
+
+/// §5.4 ③：同账号的条目不受保护、只是卡在 kind 门槛外（端口不同、kind 是按备注猜的）时的
+/// 说明（spec §5.3、§10）。措辞与 [`protected_new`] 刻意不同：这里说的是「端口不同」，
+/// 原因写在句中，也不给出路——两条都保留本来就是更安全的结果。
+///
+/// 没有 `kind_unsure` 之分（这一格按定义就在门槛外），名字同样先过 [`display_name`]。
+pub fn kind_unsure_new(old: &str, new: &str) -> String {
+    format!(
+        "与 {} 同一账号但端口不同，认不准是直连还是住宅，按新节点导入为 {}",
+        display_name(old),
+        display_name(new)
+    )
+}
+
 /// 输错时回显的那一行，不含缩进（调用方经 `say` 在菜单里加两列）：`{head}{输入}{tail}`。
 /// 回显的输入先净化（方向键是 `ESC [ A`，不能原样写回终端、写进 transcript），再尾截，
 /// 整行按容量口径不超过行宽上限——误把一整条链接贴进来也只占一行。
@@ -855,7 +1049,7 @@ pub fn invalid_service_choice(input: &str, width: usize) -> String {
 ///
 /// 标准版式：`   节点   ●  运行中  {名字}`，连名字放不下时名字另起一行；下面是详情行
 /// `label  kind  服务器:端口`，缩进到 `●` 那一列。窄版式：状态词、名字、详情各占一行，前缀收紧。
-/// 名字只做中间截断；详情怎么降级见 [`status_detail`]。
+/// 名字先过 [`display_name`]（打码在截断之前），只做中间截断；详情怎么降级见 [`status_detail`]。
 pub fn render_status(st: &Status, width: usize) -> String {
     let limit = line_limit(width);
     let narrow = is_narrow(width);
@@ -882,7 +1076,7 @@ pub fn render_status(st: &Status, width: usize) -> String {
     if st.node.is_empty() {
         out.push_str(&format!("{head}\n"));
     } else {
-        let name = sanitize(&st.node);
+        let name = display_name(&st.node);
         let one = format!("{head}  {name}");
         if !narrow && budget_width(&one) <= limit {
             out.push_str(&format!("{one}\n"));
@@ -1059,7 +1253,8 @@ fn number_lead(prof: &Profiles, i: usize, width: usize) -> String {
 /// `label  kind  服务器:端口`，整张表都不显示 kind（同一张表的列要一致），仍放不下的行按
 /// [`list_detail`] 降级。窄版式（40–49 列）编号行缩进 2 列，不显示 kind，第二行一律只出 label
 /// （没有 label 才出服务器:端口，放不下尾截；spec §2.5）。
-/// 名字、label、服务器先过 [`sanitize`]。
+/// 名字先过 [`display_name`]（净化 + token 打码，打码在截断之前），label 与服务器先过
+/// [`sanitize`]。
 ///
 /// `with_back`：菜单里选节点要打编号与 `[0] 返回`；一次性 `bui-c list` 不打编号
 /// （`bui-c switch` 只认名字），第一行形如 `  ★ name` / `    name`。
@@ -1108,7 +1303,7 @@ pub fn render_nodes(prof: &Profiles, with_back: bool, width: usize) -> String {
         let name_room = limit - budget_width(&lead) - budget_width(mark);
         out.push_str(&format!(
             "{lead}{mark}{}\n",
-            truncate_middle(&sanitize(&p.name), name_room)
+            truncate_middle(&display_name(&p.name), name_room)
         ));
         let detail = if show_kind {
             full.clone()
@@ -1648,7 +1843,7 @@ const QUESTION_NAME_MIN: usize = 8;
 /// `确认删除 {名字}？` / `确认删除 {名字} 等 N 个节点？`；会断网的写 `[yes/N]`，否则 `[y/N]`。
 /// 连 `  ▸ ` 与冒号整行放不下时名字中间截断；可用不到 [`QUESTION_NAME_MIN`] 列时退回
 /// `确认删除这 N 个节点？`（R1 的窄屏例外：40–44 列删几个长名字的节点时），被删清单就在上面几行。
-/// 删单个节点时 40 列也有 15 列给名字。
+/// 删单个节点时 40 列也有 15 列给名字。名字先过 [`display_name`]（打码在截断之前）。
 fn delete_question(prof: &Profiles, picks: &[usize], form: DeleteForm, width: usize) -> String {
     let n = picks.len();
     let tag = if form == DeleteForm::Passive {
@@ -1660,7 +1855,7 @@ fn delete_question(prof: &Profiles, picks: &[usize], form: DeleteForm, width: us
     let Some(&first) = picks.first() else {
         return plain;
     };
-    let name = sanitize(&prof.profiles[first].name);
+    let name = display_name(&prof.profiles[first].name);
     let after = if n == 1 {
         format!("？{tag}")
     } else {
@@ -1682,7 +1877,8 @@ fn delete_question(prof: &Profiles, picks: &[usize], form: DeleteForm, width: us
 /// 编号、缩进与 [`render_nodes`] 相同，眼睛能直接对上。名字中间截断；两个被删节点截断后一样
 /// （全名其实不同）时改成全名、按行宽折行（§2.3 撞名保护）。label 与服务器:端口完整不截：
 /// `label  kind  服务器:端口` 有一个放不下就整块去掉 kind（窄版式本来就不显示），还放不下就
-/// 各占一行，一行仍放不下就折行。外来文字先过 [`sanitize`]。
+/// 各占一行，一行仍放不下就折行。名字先过 [`display_name`]（打码在截断之前），
+/// 其余外来文字先过 [`sanitize`]。
 fn victim_lines(prof: &Profiles, picks: &[usize], width: usize) -> Vec<String> {
     struct Victim {
         head: String,
@@ -1707,7 +1903,7 @@ fn victim_lines(prof: &Profiles, picks: &[usize], width: usize) -> Vec<String> {
             let mark = if active == Some(i) { "★ " } else { "  " };
             let head = format!("{}{mark}", number_lead(prof, i, width));
             let name_room = limit.saturating_sub(budget_width(&head));
-            let name = sanitize(&p.name).into_owned();
+            let name = display_name(&p.name).into_owned();
             let short = truncate_middle(&name, name_room);
             let label = sanitize(&p.node.label).into_owned();
             let hp = sanitize(&format!("{}:{}", p.node.host, p.node.port)).into_owned();
@@ -1763,7 +1959,8 @@ fn victim_lines(prof: &Profiles, picks: &[usize], width: usize) -> Vec<String> {
 const ALT_LABEL_MIN: usize = 5;
 
 /// 删到当前节点时逐行列出的可换节点（spec §5.3 第 3 条）：`[编号] 名字  label`，编号保留原来的，
-/// 列表滚出屏幕也能照着打。名字中间截断；label 尾截，剩不到 5 列就不显示；窄版式只显示名字。
+/// 列表滚出屏幕也能照着打。名字先过 [`display_name`] 再中间截断；label 尾截，剩不到 5 列
+/// 就不显示；窄版式只显示名字。
 fn alternative_lines(prof: &Profiles, remaining: &[usize], width: usize) -> Vec<String> {
     let limit = line_limit(width);
     let narrow = is_narrow(width);
@@ -1773,7 +1970,7 @@ fn alternative_lines(prof: &Profiles, remaining: &[usize], width: usize) -> Vec<
             let p = &prof.profiles[k];
             let lead = number_lead(prof, k, width);
             let room = limit.saturating_sub(budget_width(&lead));
-            let name = truncate_middle(&sanitize(&p.name), room);
+            let name = truncate_middle(&display_name(&p.name), room);
             let label = sanitize(&p.node.label);
             let label_room = room.saturating_sub(budget_width(&name) + 2);
             if narrow || label.is_empty() || label_room < ALT_LABEL_MIN {
@@ -1973,14 +2170,14 @@ pub fn render_delete_confirm(
 }
 
 /// `  删完切到 [n] 名字`（含换行）：确认块①的第一行；确认时打编号改了替换目标，菜单再打一行
-/// 同样的。名字中间截断到行宽上限；编号不存在时返回空串。
+/// 同样的。名字先过 [`display_name`]、再中间截断到行宽上限；编号不存在时返回空串。
 pub fn render_switch_to(prof: &Profiles, to: usize, width: usize) -> String {
     let Some(p) = prof.profiles.get(to) else {
         return String::new();
     };
     let head = format!("  删完切到 [{}] ", to + 1);
     let room = line_limit(width).saturating_sub(budget_width(&head));
-    format!("{head}{}\n", truncate_middle(&sanitize(&p.name), room))
+    format!("{head}{}\n", truncate_middle(&display_name(&p.name), room))
 }
 
 /// 连接检查失败后「下一步」小菜单里的一次选择（spec §6.5、§0.2 R3）。键固定，不随状态漂移。
@@ -2741,6 +2938,7 @@ mod tests {
                 split: split_global(),
                 source: Source::ApiNodes,
                 imported_at: "2026-09-11T00:00:00Z".into(),
+                extra: Default::default(),
             });
         }
         p.active = Some("alice-reality-direct".into());
@@ -2794,6 +2992,7 @@ mod tests {
             split: split_global(),
             source: Source::ApiNodes,
             imported_at: "2026-09-11T00:00:00Z".into(),
+            extra: Default::default(),
         });
         assert!(
             render_nodes(&p, true, 80).contains("[0] 返回"),
@@ -3268,6 +3467,118 @@ mod tests {
         {
             out.push(("token-cli", delete::page(&[line], width)));
         }
+        // T3：按账号匹配新增的几句（spec §5.4、§5.6、§5.8、§5.10）。它们一律经 `tell`，
+        // 折法就是 `delete::page`；两问的 `[y/N]` 由 `Prompt::confirm` 自己补，收进这张表
+        // 只为守住字符归类与「折得开」。名字取样例里最长的 38 列那个
+        let keeper = "rick-node.example-a.net-reality-direct";
+        let dups: Vec<String> = prof.profiles.iter().map(|p| p.name.clone()).collect();
+        for n in [1usize, 2, 3, 4, 9] {
+            out.push((
+                "dups-head",
+                delete::page(&[dups_head(keeper, &dups[..n])], width),
+            ));
+        }
+        for line in [
+            MERGE_ASK.to_string(),
+            MERGE_NOTHING.to_string(),
+            DUPS_HINT_CLI.to_string(),
+            merged_line(&dups[..2], keeper),
+            merged_line(&dups, keeper),
+            renamed_line(&format!("{TOKEN}-hy2-resi"), "panel.example.com-hy2-resi"),
+            renamed_line(keeper, "panel.example.com-hy2-resi-2"),
+            port_moved_line(keeper, 40003, 40000),
+            port_moved_line(&format!("{TOKEN}-hy2-resi"), 40003, 40000),
+            switch_ask(keeper, true),
+            switch_ask(keeper, false),
+        ] {
+            out.push(("account-match-line", delete::page(&[line], width)));
+        }
+        // T11：合并那一次拿不到锁的那一句。`cli` 把它拼成「失败：…」经 `say` 原样打（不折行）：
+        // 上屏 51 列，40 列终端里由终端自己折，与 `cli` 的 `LOCK_BUSY` 同款——所以下面这两格
+        // 只守字符归类与「折得开」：`page` 自己折行、`render` 按 room 尾截，文案加长一个字它们
+        // 照样绿。真正卡宽度的是 `dups_head_caps_the_list_and_masks_names` 里的两条断言：
+        // 裸文案 ≤ 59 列，以及带「失败：」前缀进「上次：」行不被 60 列尾截
+        let merge_busy = format!("失败：{MERGE_LOCK_BUSY}");
+        out.push((
+            "merge-busy",
+            delete::page(std::slice::from_ref(&merge_busy), width),
+        ));
+        out.push(("merge-busy-last", render(&st(), width, Some(&merge_busy))));
+        // T5：八种受保护说明句（③ 的 `protected_new` 与 ① 的 `protected_kept`，各配
+        // `PanelEntry` / `ActiveEntry` 与 `kind_unsure` 真假）与 `kind_unsure_new`。
+        // 它们也经 `tell`，折法就是 `delete::page`；名字仍取最长的 38 列那个，
+        // 带「同时认不准是直连还是住宅」那半句的是最长的样本（A1）
+        for why in [
+            Blocked::PanelEntry { kind_unsure: false },
+            Blocked::PanelEntry { kind_unsure: true },
+            Blocked::ActiveEntry { kind_unsure: false },
+            Blocked::ActiveEntry { kind_unsure: true },
+        ] {
+            out.push((
+                "protected-new",
+                delete::page(&[protected_new(keeper, keeper, why)], width),
+            ));
+            out.push((
+                "protected-kept",
+                delete::page(&[protected_kept(keeper, keeper, why)], width),
+            ));
+        }
+        out.push((
+            "kind-unsure-new",
+            delete::page(&[kind_unsure_new(keeper, keeper)], width),
+        ));
+        // T3：打码样本——把样例里最后一条换成 4.0.0 的 token 名，喂给列表、状态与确认块
+        let mut tokened = baiyi_like();
+        let tname = format!("{TOKEN}-hy2-resi");
+        tokened.profiles[8].name = tname.clone();
+        tokened.active = Some(tname.clone());
+        out.push(("token-nodes", render_nodes(&tokened, true, width)));
+        out.push(("token-list", render_nodes(&tokened, false, width)));
+        out.push(("token-picker", render_node_picker(&tokened, width)));
+        let p8 = tokened.profiles[8].clone();
+        out.push((
+            "token-status",
+            render_status(
+                &Status {
+                    node: tname.clone(),
+                    label: p8.node.label.clone(),
+                    kind: kind_slug(p8.node.kind).to_string(),
+                    host_port: format!("{}:{}", p8.node.host, p8.node.port),
+                    ..st()
+                },
+                width,
+            ),
+        ));
+        // 活动节点换成第一个短名、删它：token 名节点这才落进「想换就输入下面的编号：」的可换清单
+        let mut alt_tokened = tokened.clone();
+        alt_tokened.active = Some(alt_tokened.profiles[0].name.clone());
+        for rows in [17, 40] {
+            out.push((
+                "token-delete",
+                render_delete_confirm(&tokened, &[8], Some(0), width, rows),
+            ));
+            out.push((
+                "token-delete-passive",
+                render_delete_confirm(&tokened, &[0, 8], Some(1), width, rows),
+            ));
+            out.push((
+                "token-delete-alts",
+                render_delete_confirm(&alt_tokened, &[0], Some(8), width, rows),
+            ));
+        }
+        out.push(("token-switch-to", render_switch_to(&tokened, 8, width)));
+        out.push((
+            "token-last",
+            render(
+                &st(),
+                width,
+                Some(&fit_name_in_last(
+                    &format!("已切到 {}", display_name(&tname)),
+                    &tname,
+                    width,
+                )),
+            ),
+        ));
         // T11：连接检查报告的整屏（真跑一遍 nettest::run，用逐行事件拼出来）与日志页
         out.extend(crate::nettest::sample::report_screens(width));
         out
@@ -3315,6 +3626,384 @@ mod tests {
             budget_width(&asked) <= line_limit(40),
             "{}：{asked}",
             budget_width(&asked)
+        );
+    }
+
+    /// 合成 token：32 位十六进制，与 `source.rs` / `cli.rs` 的测试同一串（spec §11 门禁段）。
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+    /// 测试 76（spec §8.3）：人读输出里的节点名先净化、再把每个 token 段打码成前 4 位加 `…`，
+    /// 而且打码一定在截断之前——先截后打的话，截出来的片段还是 token 的前若干位。
+    #[test]
+    fn display_name_masks_each_token_segment_to_four_chars_and_sanitizes_first() {
+        // 4.0.0 用 token 订阅链接导入时留下的名字（B 类）
+        assert_eq!(display_name(&format!("{TOKEN}-hy2-resi")), "0123…-hy2-resi");
+        assert_eq!(
+            display_name(&format!("{TOKEN}-hy2-resi-2")),
+            "0123…-hy2-resi-2"
+        );
+        // 大写 hex 也是 token；前 4 位原样保留（不折大小写）
+        assert_eq!(
+            display_name(&format!("{}-hy2-direct", TOKEN.to_ascii_uppercase())),
+            "0123…-hy2-direct"
+        );
+        // 每一段各打各的
+        assert_eq!(display_name(&format!("{TOKEN}-{TOKEN}")), "0123…-0123…");
+        // 不是 token 的段原样：31 位 hex、v3 目录名、`<主机>-<kind>`、用户名
+        assert_eq!(display_name(&TOKEN[..31]), TOKEN[..31]);
+        assert_eq!(display_name("hysteria2-1778329470"), "hysteria2-1778329470");
+        assert_eq!(
+            display_name("panel.example.com-hy2-direct"),
+            "panel.example.com-hy2-direct"
+        );
+        assert_eq!(display_name("alice-hy2-resi"), "alice-hy2-resi");
+        // 没有 token 段时原样借出，不复制
+        assert!(matches!(display_name("alice-hy2-resi"), Cow::Borrowed(_)));
+        // 先净化再打码：控制字符换成 `?` 之后那一段就不是 32 位 hex 了，整段留着（但已无害）
+        let mixed = format!("{}\u{1b}{}-hy2-resi", &TOKEN[..16], &TOKEN[17..]);
+        assert_eq!(
+            display_name(&mixed),
+            format!("{}?{}-hy2-resi", &TOKEN[..16], &TOKEN[17..])
+        );
+        // 有 token 段时别的段也照样净化：净化是打码之前对整个名字做的，不是「只在没 token 时做」
+        assert_eq!(
+            display_name(&format!("{TOKEN}-hy2\u{1b}resi")),
+            "0123…-hy2?resi"
+        );
+        // 打码是幂等的：显示名再过一遍还是它自己（`fit_name_in_last` 收到的就是显示名）
+        assert_eq!(display_name("0123…-hy2-resi"), "0123…-hy2-resi");
+
+        // 出口：列表、一次性 list、选择页、状态、确认块、`删完切到` 行、「上次：」行
+        let mut p = baiyi_like();
+        let tokened = format!("{TOKEN}-hy2-resi");
+        p.profiles[8].name = tokened.clone();
+        p.active = Some(tokened.clone());
+        let status = Status {
+            node: tokened.clone(),
+            ..st()
+        };
+        // 确认块里的「想换就输入下面的编号：」那一段（`alternative_lines`）只列 picks 之外的节点：
+        // token 名节点被删时永远进不了这个清单，得换一个活动节点、删它，才能把这个出口渲染出来。
+        let mut alt = p.clone();
+        alt.active = Some(alt.profiles[0].name.clone());
+        for w in [40, 50, 59, 60, 80] {
+            let outs = [
+                render_nodes(&p, true, w),
+                render_nodes(&p, false, w),
+                render_node_picker(&p, w),
+                render_status(&status, w),
+                render_delete_confirm(&p, &[8], Some(0), w, 40),
+                render_delete_confirm(&p, &[0, 8], Some(1), w, 40),
+                // 删第 1 个（活动节点），token 名节点留在可换清单里
+                render_delete_confirm(&alt, &[0], Some(8), w, 40),
+                render_switch_to(&p, 8, w),
+                fit_name_in_last(&format!("已切到 {}", display_name(&tokened)), &tokened, w),
+            ];
+            for o in outs {
+                assert!(!o.contains(TOKEN), "@{w} 整串 token 不许上屏：{o}");
+                // 先截后打的话，40 列的列表会留下 `0123456789a…` 这种前缀
+                assert!(!o.contains(&TOKEN[..8]), "@{w} 打码要在截断之前：{o}");
+                assert!(o.contains("0123…"), "@{w} 打码后的前 4 位要留着：{o}");
+            }
+            // 上一格确实渲染了可换清单那一段，而不是压成「可换：…」或整段没出现
+            let alts = render_delete_confirm(&alt, &[0], Some(8), w, 40);
+            assert!(
+                alts.contains("想换就输入下面的编号") && alts.contains("0123…-hy2-resi"),
+                "@{w} 可换清单没渲染出 token 名节点：{alts}"
+            );
+        }
+
+        // `fit_name_in_last` 出口：名字放不下、真的中间截断的那一格。名字过的是 display_name
+        // 而不是 sanitize——换成 sanitize 的话，摘要里是显示名、`find` 找不到原名，整句原样返回，
+        // 截断根本不发生，所以这里钉的是「截断发生了」而不只是「没露 token」。
+        let long = format!("{TOKEN}-{TOKEN}-hy2-resi");
+        let shown = display_name(&long).into_owned();
+        assert_eq!(shown, "0123…-0123…-hy2-resi");
+        let summary = format!("已切到 {shown}，但 bui-tun 没起来");
+        let fitted = fit_name_in_last(&summary, &long, 40);
+        assert_ne!(fitted, summary, "名字放不下就该中间截断");
+        assert!(!fitted.contains(&shown), "显示名整串还在，没截：{fitted}");
+        assert!(
+            !fitted.contains(TOKEN) && !fitted.contains(&TOKEN[..8]),
+            "{fitted}"
+        );
+        assert!(fitted.contains('…'), "{fitted}");
+        assert!(
+            fitted.starts_with("已切到 ") && fitted.ends_with("，但 bui-tun 没起来"),
+            "名字前后的文字要原样留着：{fitted}"
+        );
+        // 传原名与传显示名同一个结果（打码幂等，调用方拼摘要时用的就是显示名）
+        assert_eq!(fitted, fit_name_in_last(&summary, &shown, 40));
+        assert!(
+            budget_width(&format!("{LAST_HEAD}{fitted}")) <= line_limit(40),
+            "{fitted}"
+        );
+    }
+
+    /// 测试 77（spec §5.8）：存量重复那一句的名单上限同墓碑、名字与留存者都打码、不截断；
+    /// 同一簇的三句固定文案也在这里守宽度。
+    #[test]
+    fn dups_head_caps_the_list_and_masks_names() {
+        let n: Vec<String> = ["a", "b", "c", "d", "e"]
+            .iter()
+            .map(|x| x.to_string())
+            .collect();
+        assert_eq!(
+            dups_head("alice-hy2-resi", &n[..1]),
+            "同一账号还有 1 个节点：a（本次已更新 alice-hy2-resi）"
+        );
+        assert_eq!(
+            dups_head("alice-hy2-resi", &n[..3]),
+            "同一账号还有 3 个节点：a、b、c（本次已更新 alice-hy2-resi）"
+        );
+        // 名单的个数上限与墓碑同一个常量：多出来的写成「等 N 个」，N 是总数
+        assert_eq!(BURIED_LIST_MAX, 3);
+        assert_eq!(
+            dups_head("alice-hy2-resi", &n[..4]),
+            "同一账号还有 4 个节点：a、b、c 等 4 个（本次已更新 alice-hy2-resi）"
+        );
+        // 名单与留存者都过 display_name；不截断，折行交给调用方（经 `tell`）
+        assert_eq!(
+            dups_head(
+                &format!("{TOKEN}-hy2-resi"),
+                &[format!("{TOKEN}-hy2-resi-2")]
+            ),
+            "同一账号还有 1 个节点：0123…-hy2-resi-2（本次已更新 0123…-hy2-resi）"
+        );
+        // 名字先净化：方向键、颜色码里的 ESC 不能原样写回终端
+        assert_eq!(
+            dups_head("alice-hy2-resi", &["\u{1b}[A".to_string()]),
+            "同一账号还有 1 个节点：?[A（本次已更新 alice-hy2-resi）"
+        );
+        // 合并结果行不设上限（它报的是实际并掉了哪几条），名字照样打码
+        assert_eq!(
+            merged_line(&n[..2], "alice-hy2-resi"),
+            "已把 a、b 并入 alice-hy2-resi"
+        );
+        assert_eq!(
+            merged_line(
+                &[format!("{TOKEN}-hy2-resi-2")],
+                &format!("{TOKEN}-hy2-resi")
+            ),
+            "已把 0123…-hy2-resi-2 并入 0123…-hy2-resi"
+        );
+        // 改名行：旧名打码，新名是 profile_name 现起的 `<主机>-<kind>`
+        assert_eq!(
+            renamed_line(&format!("{TOKEN}-hy2-resi"), "panel.example.com-hy2-resi"),
+            "节点 0123…-hy2-resi 已改名为 panel.example.com-hy2-resi"
+        );
+        // 端口变化行与两种切换问句
+        assert_eq!(
+            port_moved_line(&format!("{TOKEN}-hy2-resi"), 40003, 40000),
+            "更新节点 0123…-hy2-resi：端口 40003 → 40000"
+        );
+        assert_eq!(
+            switch_ask(&format!("{TOKEN}-hy2-resi"), true),
+            "切换到新导入的 0123…-hy2-resi？"
+        );
+        assert_eq!(
+            switch_ask(&format!("{TOKEN}-hy2-resi"), false),
+            "切换到 0123…-hy2-resi？"
+        );
+        // 固定文案（不含名字）≤ 59 列
+        for fixed in [MERGE_ASK, MERGE_NOTHING, DUPS_HINT_CLI, MERGE_LOCK_BUSY] {
+            assert!(
+                budget_width(fixed) <= 59,
+                "{}：{fixed}",
+                budget_width(fixed)
+            );
+        }
+        // `MERGE_LOCK_BUSY` 挑这个长度的理由（60 列终端的「上次：」行刚好放满）在这里钉住：
+        // `cli` 把它拼成「失败：…」，这一整句还要进主菜单的「上次：」行。`every_line_fits_by_budget`
+        // 的两格样本盖不住——`delete::page` 自己折行、`render` 按 room 尾截，文案加长一个字两格
+        // 照样绿，而「上次：」行其实已经被静默尾截
+        let merge_busy = format!("失败：{MERGE_LOCK_BUSY}");
+        assert!(
+            budget_width(&merge_busy) <= line_limit(60) - budget_width(LAST_HEAD),
+            "{} 列，「上次：」行只剩 {} 列：{merge_busy}",
+            budget_width(&merge_busy),
+            line_limit(60) - budget_width(LAST_HEAD)
+        );
+        // 问句连 `  ▸ `、冒号与 `[y/N]` 在 40 列里也放得下：不折、不截（名字在上一句里）
+        let asked = prompt_text(&format!("{MERGE_ASK} [y/N]"));
+        assert!(
+            budget_width(&asked) <= line_limit(40),
+            "{}：{asked}",
+            budget_width(&asked)
+        );
+    }
+
+    /// 测试 75 的字面部分（spec §5.3、§10）：四句基础文案各配一个 A1 追加版 = 八种输出，
+    /// 逐字对着定稿写；追加半句只插在「…不变」之后、分号之前，四句插入点一致。
+    /// `kind_unsure_new` 的措辞刻意与这八句不同（「端口不同」、不带出路），一起钉在这里。
+    #[test]
+    fn protected_texts_match_spec_word_for_word() {
+        let panel = |kind_unsure| Blocked::PanelEntry { kind_unsure };
+        let active = |kind_unsure| Blocked::ActiveEntry { kind_unsure };
+        // ③ 组为空、另起了新节点：面板来源条目挡下
+        assert_eq!(
+            protected_new(
+                "alice-hy2-direct",
+                "panel.example.com-hy2-direct",
+                panel(false)
+            ),
+            "与 alice-hy2-direct 同一账号但连接参数不同，已按新节点导入为 panel.example.com-hy2-direct，alice-hy2-direct 不变；要更新它请从面板重新导入"
+        );
+        assert_eq!(
+            protected_new(
+                "alice-hy2-direct",
+                "panel.example.com-hy2-direct",
+                panel(true)
+            ),
+            "与 alice-hy2-direct 同一账号但连接参数不同，已按新节点导入为 panel.example.com-hy2-direct，alice-hy2-direct 不变，同时认不准是直连还是住宅；要更新它请从面板重新导入"
+        );
+        // ③：非面板来源的活动节点挡下
+        assert_eq!(
+            protected_new(
+                "hysteria2-1785892136",
+                "panel.example.com-hy2-resi",
+                active(false)
+            ),
+            "与当前节点 hysteria2-1785892136 同一账号但连接参数不同，已按新节点导入为 panel.example.com-hy2-resi，当前节点不变；确认新节点能用后可以切换过去"
+        );
+        assert_eq!(
+            protected_new(
+                "hysteria2-1785892136",
+                "panel.example.com-hy2-resi",
+                active(true)
+            ),
+            "与当前节点 hysteria2-1785892136 同一账号但连接参数不同，已按新节点导入为 panel.example.com-hy2-resi，当前节点不变，同时认不准是直连还是住宅；确认新节点能用后可以切换过去"
+        );
+        // ① 组非空、留存者已更新：面板来源条目挡下
+        assert_eq!(
+            protected_kept("alice-hy2-resi", "panel.example.com-hy2-resi", panel(false)),
+            "alice-hy2-resi 与 panel.example.com-hy2-resi 同一账号但连接参数不同，alice-hy2-resi 不变；要更新它请从面板重新导入"
+        );
+        assert_eq!(
+            protected_kept("alice-hy2-resi", "panel.example.com-hy2-resi", panel(true)),
+            "alice-hy2-resi 与 panel.example.com-hy2-resi 同一账号但连接参数不同，alice-hy2-resi 不变，同时认不准是直连还是住宅；要更新它请从面板重新导入"
+        );
+        // ①：活动节点挡下，出路是切到留存者
+        assert_eq!(
+            protected_kept(
+                "hysteria2-1785892136",
+                "panel.example.com-hy2-resi",
+                active(false)
+            ),
+            "当前节点 hysteria2-1785892136 与 panel.example.com-hy2-resi 同一账号但连接参数不同，当前节点不变；确认 panel.example.com-hy2-resi 能用后可以切换过去"
+        );
+        assert_eq!(
+            protected_kept(
+                "hysteria2-1785892136",
+                "panel.example.com-hy2-resi",
+                active(true)
+            ),
+            "当前节点 hysteria2-1785892136 与 panel.example.com-hy2-resi 同一账号但连接参数不同，当前节点不变，同时认不准是直连还是住宅；确认 panel.example.com-hy2-resi 能用后可以切换过去"
+        );
+        // 门槛挡下、不受保护：措辞是「端口不同」，没有 kind_unsure 之分、也不给出路
+        assert_eq!(
+            kind_unsure_new("hysteria2-1785892136", "panel.example.com-hy2-direct"),
+            "与 hysteria2-1785892136 同一账号但端口不同，认不准是直连还是住宅，按新节点导入为 panel.example.com-hy2-direct"
+        );
+        // 四句的追加半句逐字相同、插入点一致：去掉它就退回基础文案
+        for (long, short) in [
+            (
+                protected_new(
+                    "alice-hy2-direct",
+                    "panel.example.com-hy2-direct",
+                    panel(true),
+                ),
+                protected_new(
+                    "alice-hy2-direct",
+                    "panel.example.com-hy2-direct",
+                    panel(false),
+                ),
+            ),
+            (
+                protected_new(
+                    "hysteria2-1785892136",
+                    "panel.example.com-hy2-resi",
+                    active(true),
+                ),
+                protected_new(
+                    "hysteria2-1785892136",
+                    "panel.example.com-hy2-resi",
+                    active(false),
+                ),
+            ),
+            (
+                protected_kept("alice-hy2-resi", "panel.example.com-hy2-resi", panel(true)),
+                protected_kept("alice-hy2-resi", "panel.example.com-hy2-resi", panel(false)),
+            ),
+            (
+                protected_kept(
+                    "hysteria2-1785892136",
+                    "panel.example.com-hy2-resi",
+                    active(true),
+                ),
+                protected_kept(
+                    "hysteria2-1785892136",
+                    "panel.example.com-hy2-resi",
+                    active(false),
+                ),
+            ),
+        ] {
+            assert_eq!(
+                long.replace("，同时认不准是直连还是住宅", ""),
+                short,
+                "{long}"
+            );
+            assert_eq!(
+                long.matches("不变，同时认不准是直连还是住宅；").count(),
+                1,
+                "{long}"
+            );
+        }
+        // 三个函数的名字入参都先过 display_name：token 段打码、外来名字先净化
+        assert_eq!(
+            protected_new(
+                &format!("{TOKEN}-hy2-resi"),
+                &format!("{TOKEN}-hy2-resi-2"),
+                active(false)
+            ),
+            "与当前节点 0123…-hy2-resi 同一账号但连接参数不同，已按新节点导入为 0123…-hy2-resi-2，当前节点不变；确认新节点能用后可以切换过去"
+        );
+        assert_eq!(
+            protected_kept(
+                &format!("{TOKEN}-hy2-resi"),
+                "panel.example.com-hy2-resi",
+                panel(false)
+            ),
+            "0123…-hy2-resi 与 panel.example.com-hy2-resi 同一账号但连接参数不同，0123…-hy2-resi 不变；要更新它请从面板重新导入"
+        );
+        assert_eq!(
+            kind_unsure_new("\u{1b}[A", &format!("{TOKEN}-hy2-direct")),
+            "与 ?[A 同一账号但端口不同，认不准是直连还是住宅，按新节点导入为 0123…-hy2-direct"
+        );
+    }
+
+    /// `KindUnsure` 到不了 `protected_new`（调用方按 §5.4 ③ 分派），debug 下 `debug_assert!` 挡住。
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "protected_new")]
+    fn protected_new_rejects_kind_unsure_in_debug() {
+        let _ = protected_new(
+            "alice-hy2-direct",
+            "panel.example.com-hy2-direct",
+            Blocked::KindUnsure,
+        );
+    }
+
+    /// 同上：`protected_kept` 只处理 `PanelEntry` / `ActiveEntry`（§5.4 ① 的三分支里
+    /// `KindUnsure` 什么都不打）。
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "protected_kept")]
+    fn protected_kept_rejects_kind_unsure_in_debug() {
+        let _ = protected_kept(
+            "alice-hy2-resi",
+            "panel.example.com-hy2-resi",
+            Blocked::KindUnsure,
         );
     }
 

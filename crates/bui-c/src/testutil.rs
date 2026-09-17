@@ -92,6 +92,7 @@ fn one(mode: Mode) -> Profiles {
         split: split_global(),
         source: Source::ApiNodes,
         imported_at: "2026-09-11T00:00:00Z".into(),
+        extra: Default::default(),
     });
     p.active = Some("alice-hy2-direct".into());
     p
@@ -115,6 +116,7 @@ pub fn named(name: &str, node: Node) -> Profile {
         split: split_global(),
         source: Source::ApiNodes,
         imported_at: "2026-09-11T00:00:00Z".into(),
+        extra: Default::default(),
     }
 }
 
