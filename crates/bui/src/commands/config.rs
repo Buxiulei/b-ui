@@ -213,39 +213,6 @@ async fn switch_obfs(value: &str, paths: &Paths, socket: &Path) -> Result<String
 
 // ── `bui set hy2-resi-compat on|off`（4.1，spec §2.4）─────────────────────────
 
-/// 兼容段下线的**门禁判据**（2026-09-17 裁决）：满足它才允许不带 `--force` 关掉。
-///
-/// 判据是「**一次都没命中过** 且静默满 30 天」。为什么不能只看静默时长：兼容段的 counter
-/// 是 **nat 链**计数，只计每条 conntrack 流的首包（`man nft`），一个 24×7 不断线的 4.0
-/// 客户端只在建连那一刻记 1 次，之后几十天一动不动 ⇒ 只看静默就会把**正在用**的兼容段
-/// 判成闲置并关掉，那批还没刷订阅的 4.0 住宅用户当场断联。所以命中过就只能人工 `--force`。
-///
-/// `None`（统计还没就绪）一律返回 `false` —— **fail-closed**，误判方向是危险的那一侧。
-///
-/// 别直接拿它当门禁：走 [`check_compat_takedown`]，那是 CLI 与
-/// `POST /api/system/hy2-resi-compat` **共用的唯一一处**判据（含 `on` / `--force` 的旁路）。
-///
-/// **T12 依赖**：这三个值由 `modules::watchdog` 每轮采样写进 `runtime.json`
-/// （`CompatHits`），T12 合并之前这里恒为 `None` ⇒ `off` 一律要 `--force`。T12 合并后把
-/// 本函数体换成 `hits.is_some_and(|h| h.idle_for_takedown(now))` 即可（判据一处、两边同源）。
-pub fn compat_idle_for_takedown(
-    hits: Option<&crate::commands::nft::CompatHits>,
-    now: time::OffsetDateTime,
-) -> bool {
-    let Some(h) = hits else { return false };
-    if h.total > 0 {
-        return false;
-    }
-    match crate::util::parse_rfc3339(h.quiet_since()) {
-        // 起算时刻读不出来（字段被人改坏）⇒ 不判闲置
-        None => false,
-        Some(t) => now - t >= time::Duration::days(COMPAT_IDLE_DAYS),
-    }
-}
-
-/// 兼容段自动判闲置要静默多少天（spec §2.4：「连续 30 天为 0」）。
-pub const COMPAT_IDLE_DAYS: i64 = 30;
-
 /// 兼容段下线的**完整门禁，CLI 与 `POST /api/system/hy2-resi-compat` 共用这一处**。
 ///
 /// 放行 ⇒ `Ok(())`；拒绝 ⇒ `Err(那段要打给人看的话)`（CLI `bail!` 它，端点 403 回它）。
@@ -256,11 +223,15 @@ pub const COMPAT_IDLE_DAYS: i64 = 30;
 pub fn check_compat_takedown(
     on: bool,
     force: bool,
-    hits: Option<&crate::commands::nft::CompatHits>,
+    hits: Option<&crate::modules::watchdog::CompatHits>,
     compat: (u16, u16),
     now: time::OffsetDateTime,
 ) -> Result<(), String> {
-    if on || force || compat_idle_for_takedown(hits, now) {
+    // 「闲置了吗」这一问只有写入侧那一处实现（2026-09-17 合并裁决）：判据 = `total == 0`
+    // 且静默满 `COMPAT_IDLE_DAYS` 天，`None`（统计还没就绪）一律 fail-closed 当没闲置。
+    // T14 曾在本文件抄一份同构实现（当时 T12 还没合进来），两份会各自漂移成「`bui status`
+    // 说闲置、门禁说没闲置」；现在只 `use` 那一处，连天数常量都不在这里另立一个。
+    if on || force || hits.is_some_and(|h| h.idle_for_takedown(now)) {
         return Ok(());
     }
     Err(compat_refusal(hits, compat))
@@ -271,7 +242,10 @@ pub fn check_compat_takedown(
 /// `compat` 由 [`nft::compat_range`](bui_schema::render::nft::compat_range) 从期望态算出，
 /// **不写字面量**：`ports.hy2_resi` 是 `NodeParams` 里的字段，一旦它不是 40000，这段话
 /// 就会对着人说错区间 —— 而它的全部作用就是让人凭它判断要不要 `--force`。
-fn compat_refusal(hits: Option<&crate::commands::nft::CompatHits>, (a, b): (u16, u16)) -> String {
+fn compat_refusal(
+    hits: Option<&crate::modules::watchdog::CompatHits>,
+    (a, b): (u16, u16),
+) -> String {
     let detail = match hits {
         Some(h) => format!(
             "累计命中 {} 次；最近一次 {}；起算时刻 {}",
@@ -282,7 +256,8 @@ fn compat_refusal(hits: Option<&crate::commands::nft::CompatHits>, (a, b): (u16,
         None => "命中统计未就绪（守护进程还没采过一轮）".to_string(),
     };
     format!(
-        "拒绝关闭住宅 HY2 的 4.0 兼容段：{detail}。\n         关掉它 = `inet bui` 删掉 {a}-{b} 那两条 REDIRECT 规则 + 防火墙收口，\n         **全部还没刷订阅的 4.0 住宅用户当场断联**（他们的订阅里是裸 `40000+槽序号`）。\n         判据是连续 {COMPAT_IDLE_DAYS} 天累计命中为 0；确认无人在用请加 --force。"
+        "拒绝关闭住宅 HY2 的 4.0 兼容段：{detail}。\n         关掉它 = `inet bui` 删掉 {a}-{b} 那两条 REDIRECT 规则 + 防火墙收口，\n         **全部还没刷订阅的 4.0 住宅用户当场断联**（他们的订阅里是裸 `40000+槽序号`）。\n         判据是连续 {days} 天累计命中为 0；确认无人在用请加 --force。",
+        days = crate::modules::watchdog::COMPAT_IDLE_DAYS
     )
 }
 
@@ -363,7 +338,7 @@ async fn switch_hy2_resi_compat(
     now: time::OffsetDateTime,
 ) -> Result<String> {
     let on = parse_obfs(value)?; // 同一套 on/off 判据
-    let hits = crate::commands::nft::compat_hits(
+    let hits = crate::modules::watchdog::compat_hits(
         &crate::state::runtime::Runtime::load(crate::paths::runtime_file(paths))
             .read()
             .await,
@@ -426,11 +401,12 @@ mod tests {
         time::macros::datetime!(2026-10-20 00:00:00 UTC)
     }
 
-    fn hits(total: u64, last: Option<&str>, since: &str) -> crate::commands::nft::CompatHits {
-        crate::commands::nft::CompatHits {
+    fn hits(total: u64, last: Option<&str>, since: &str) -> crate::modules::watchdog::CompatHits {
+        crate::modules::watchdog::CompatHits {
             total,
             last_hit_at: last.map(str::to_string),
             since: since.to_string(),
+            ..Default::default()
         }
     }
 
@@ -442,32 +418,37 @@ mod tests {
     /// **正在用**的兼容段判成闲置并关掉，那批还没刷订阅的 4.0 住宅用户当场断联。
     #[test]
     fn the_takedown_gate_fails_closed_on_everything_but_a_provably_idle_range() {
-        // 统计未就绪（T12 的采样还没落地 / 守护进程刚起）⇒ 不判闲置
-        assert!(!compat_idle_for_takedown(None, t0()));
+        // 判据只有写入侧那一处（`watchdog::CompatHits::idle_for_takedown`），门禁是它的
+        // 唯一外壳，所以这里一律经 `check_compat_takedown` 断言，不另调一个判据函数。
+        let r = (40001, 40007);
+        let gate = |h: Option<&crate::modules::watchdog::CompatHits>, now| {
+            check_compat_takedown(false, false, h, r, now).is_ok()
+        };
+        // 统计未就绪（守护进程还没采过一轮）⇒ 不判闲置
+        assert!(!gate(None, t0()));
         // 一次都没命中 + 静默 30 天 ⇒ 放行
         let idle = hits(0, None, "2026-09-15T00:00:00Z");
-        assert!(compat_idle_for_takedown(Some(&idle), t0()));
+        assert!(gate(Some(&idle), t0()));
         // 差一天都不行
-        assert!(!compat_idle_for_takedown(
+        assert!(!gate(
             Some(&idle),
             time::macros::datetime!(2026-10-14 23:59:59 UTC)
         ));
         // **命中过就永不自动判闲置**，哪怕最近那一次已经过了一年
         let hit_long_ago = hits(1, Some("2025-01-01T00:00:00Z"), "2024-01-01T00:00:00Z");
         assert!(
-            !compat_idle_for_takedown(Some(&hit_long_ago), t0()),
+            !gate(Some(&hit_long_ago), t0()),
             "nat 链只计首包：一个常连的 4.0 客户端几十天只记 1 次"
         );
         // 起算时刻被人改坏 ⇒ 不判闲置
-        assert!(!compat_idle_for_takedown(
-            Some(&hits(0, None, "下周")),
-            t0()
-        ));
-        assert_eq!(COMPAT_IDLE_DAYS, 30, "spec §2.4：连续 30 天为 0");
+        assert!(!gate(Some(&hits(0, None, "下周")), t0()));
+        assert_eq!(
+            crate::modules::watchdog::COMPAT_IDLE_DAYS,
+            30,
+            "spec §2.4：连续 30 天为 0"
+        );
 
-        // 门禁本体（CLI 与 `POST /api/system/hy2-resi-compat` 共用的这一处）：
-        // 开兼容段与显式 --force 直接放行，其余按上面的判据
-        let r = (40001, 40007);
+        // 门禁本体的两条旁路：开兼容段与显式 --force 直接放行
         assert!(
             check_compat_takedown(true, false, None, r, t0()).is_ok(),
             "开兼容段不过门禁"
@@ -476,9 +457,176 @@ mod tests {
             check_compat_takedown(false, true, None, r, t0()).is_ok(),
             "--force 放行"
         );
-        assert!(check_compat_takedown(false, false, Some(&idle), r, t0()).is_ok());
-        assert!(check_compat_takedown(false, false, None, r, t0()).is_err());
-        assert!(check_compat_takedown(false, false, Some(&hit_long_ago), r, t0()).is_err());
+    }
+
+    /// 「写入 → 读取 → 门禁」三段用的是**同一个键、同一个判据**（2026-09-17 合并裁决）。
+    ///
+    /// T14 曾在 `commands::nft` 与本文件各放一份 `CompatHits` 投影 + 一份同构的 30 天实现
+    /// （当时 T12 还没合进来）。两份今天逐字同构、明天就会漂：改了一处 30 天、另一处不改，
+    /// `bui status` 那一行与门禁就会一个说闲置、一个说没闲置。这条用例把「同一处」钉住：
+    /// 写入侧（[`crate::modules::watchdog::accumulate`]）产出的那份值，原样落在写入侧的
+    /// 键上，CLI 的门禁就必须据它拒绝，而且拒绝话术里的三个值来自那份值本身。
+    #[tokio::test]
+    async fn the_write_read_and_gate_sides_share_one_key_and_one_criterion() {
+        let (d, paths) = scratch().await;
+        let sock = d.path().join("nope.sock");
+        // 写入侧：watchdog 自己那套累加（不是手搓 JSON），落在 watchdog 自己那个键上
+        let written = crate::modules::watchdog::accumulate(
+            None,
+            7,
+            time::macros::datetime!(2026-10-19 10:00:00 UTC),
+            false,
+        );
+        assert_eq!(written.total, 7, "前提：写入侧真累加出了命中");
+        crate::state::runtime::Runtime::load(crate::paths::runtime_file(&paths))
+            .update(|r| {
+                r.extra.insert(
+                    crate::modules::watchdog::COMPAT_HITS_KEY.into(),
+                    serde_json::to_value(&written).unwrap(),
+                );
+            })
+            .await;
+        // 读取侧 + 门禁：命中过 ⇒ 拒绝，且拒绝话术里的值就是写入侧那份
+        let e = switch_hy2_resi_compat("off", false, &paths, &sock, t0())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("累计命中 7 次"), "读取侧没读到写入侧那份值：{e}");
+        assert!(e.contains("最近一次 2026-10-19T10:00:00Z"), "{e}");
+        // 判据函数也只有一处：门禁的放行/拒绝与写入侧类型上那个方法逐一致
+        for (h, now) in [
+            (hits(0, None, "2026-09-15T00:00:00Z"), t0()),
+            (
+                hits(3, Some("2026-01-01T00:00:00Z"), "2025-01-01T00:00:00Z"),
+                t0(),
+            ),
+            (hits(0, None, "2026-10-19T00:00:00Z"), t0()),
+        ] {
+            assert_eq!(
+                check_compat_takedown(false, false, Some(&h), (40001, 40007), now).is_ok(),
+                h.idle_for_takedown(now),
+                "门禁与 watchdog::CompatHits::idle_for_takedown 判得不一样 ⇒ 判据又成了两份"
+            );
+        }
+    }
+
+    /// **`--force` 真的随请求送到了守护进程那一侧**（第九波复核点名：这条接线零覆盖）。
+    ///
+    /// 坏掉的方向恰好是把唯一的逃生门焊死：守护进程在跑时（正常生产态）CLI 只经端点写盘，
+    /// 端点那道门禁读的 `force` 是 `#[serde(default)] = false`；请求体里少了那一行，
+    /// `bui set hy2-resi-compat off --force` 就会被自己的端点 403 回来，运维**永远**关不掉
+    /// 兼容段，而报错只是「守护进程拒绝了这次修改（HTTP 403）」，看不出是自家漏了字段。
+    ///
+    /// 已有的三条 CLI 用例都用 `nope.sock`（无守护进程 ⇒ 只走本地写盘分支），端点用例又是
+    /// 直接打 `app`，中间这段 CLI → socket → 端点从来没人串起来跑过。这条用例把真 router
+    /// 服务在真 unix socket 上跑一遍。
+    #[tokio::test]
+    async fn the_cli_carries_force_all_the_way_to_the_daemon_endpoint() {
+        let (d, paths) = scratch().await;
+        let sock = d.path().join("b-ui.sock");
+        let rt = crate::state::runtime::Runtime::load(crate::paths::runtime_file(&paths));
+        // 命中过 ⇒ 两道门禁都只能靠 --force 过（写入侧自己那套累加，不手搓 JSON）
+        let hit = crate::modules::watchdog::accumulate(
+            None,
+            5,
+            time::macros::datetime!(2026-10-19 10:00:00 UTC),
+            false,
+        );
+        rt.update(|r| {
+            r.extra.insert(
+                crate::modules::watchdog::COMPAT_HITS_KEY.into(),
+                serde_json::to_value(&hit).unwrap(),
+            );
+        })
+        .await;
+        // 守护进程那一侧：与生产同一个 router，服务在真 socket 上
+        let app_state = crate::api::state::AppState {
+            store: Store::open(crate::paths::state_file(&paths)).await.unwrap(),
+            bus: crate::api::EventBus::new(),
+            runtime: rt.clone(),
+            host: Arc::new(FakeHost::new()),
+            started_at: t0(),
+            version: "4.1.0",
+            login: Default::default(),
+        };
+        let router = crate::api::router(app_state, &[]);
+        let serving = tokio::spawn({
+            let sock = sock.clone();
+            async move { crate::ipc::serve_uds(&sock, router).await }
+        });
+        let client = crate::ipc::Client::new(&sock);
+        for _ in 0..200 {
+            if client.available().await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            client.available().await,
+            "socket 没起来，这条用例证明不了任何事"
+        );
+
+        // 不带 --force：CLI 自己那道门禁就拒（还没走到 socket）
+        let e = switch_hy2_resi_compat("off", false, &paths, &sock, t0())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("拒绝关闭"), "{e}");
+
+        // 带 --force：必须一路过到端点并落盘。少了请求体里那个 `force` 字段，
+        // 端点会 403（回 `守护进程拒绝了这次修改`），这条断言当场红。
+        let out = switch_hy2_resi_compat("off", true, &paths, &sock, t0())
+            .await
+            .unwrap_or_else(|e| panic!("--force 没送到端点，被自家守护进程拒了：{e}"));
+        assert!(out.contains("4.0 兼容段已关闭"), "{out}");
+        assert!(out.contains("--force 下线"), "要说清这是强制下线：{out}");
+        // 写盘发生在守护进程那一侧（CLI 的本地分支没走）
+        let disk: bui_schema::model::State =
+            serde_json::from_slice(&std::fs::read(crate::paths::state_file(&paths)).unwrap())
+                .unwrap();
+        assert!(
+            !disk.system.hy2_resi_compat_ports,
+            "端点没把期望态落盘，说明这次没真的经过它"
+        );
+        serving.abort();
+    }
+
+    /// 兼容段命中数的类型 / 键名 / 天数常量 / 闲置判据**只许有一处定义**：`modules::watchdog`
+    /// （写入侧，spec §8.2 的裁决落在它身上）。源级契约，因为「两份同构实现」这种回归在
+    /// 行为上今天一点不坏、只会在下一个人改其中一处时才爆 —— 那时 `bui status` 与门禁会
+    /// 一个说闲置一个说没闲置，而兼容段关错了就是那批没刷订阅的 4.0 住宅用户当场断联。
+    #[test]
+    fn only_the_watchdog_defines_the_compat_hits_type_key_and_criterion() {
+        for (file, src) in [
+            ("commands/config.rs", include_str!("config.rs")),
+            ("commands/nft.rs", include_str!("nft.rs")),
+            ("commands/status.rs", include_str!("status.rs")),
+            ("api/system.rs", include_str!("../api/system.rs")),
+        ] {
+            // 针串起来拼，不写成字面量：本用例自己也在 `include_str!` 进来的那份源里，
+            // 写字面量就会匹配到自己、无论被测文件干净与否都红。
+            for banned in [
+                format!("struct {}", "CompatHits"),
+                format!("{}: &str", "COMPAT_HITS_KEY"),
+                format!("{}: i64", "COMPAT_IDLE_DAYS"),
+                format!("fn {}", "idle_for_takedown"),
+                format!("fn {}", "compat_idle_for_takedown"),
+            ] {
+                assert!(
+                    !src.contains(&banned),
+                    "{file} 又自己定义了一份 `{banned}`：判据必须只在 modules::watchdog 一处"
+                );
+            }
+        }
+        // 键名逐字同一个（写入侧那一处的字面量）
+        assert_eq!(
+            crate::modules::watchdog::COMPAT_HITS_KEY,
+            "hy2_resi_compat_hits"
+        );
+        assert!(
+            include_str!("../modules/watchdog.rs").contains(&format!("fn {}", "idle_for_takedown")),
+            "判据的唯一定义处必须还在 modules::watchdog"
+        );
     }
 
     /// 兼容段区间**不许写字面量**：它是 `ports.hy2_resi` 的函数（改端口 / 多机不同配置都会
@@ -528,7 +676,7 @@ mod tests {
         let rt = crate::state::runtime::Runtime::load(crate::paths::runtime_file(&paths));
         rt.update(|r| {
             r.extra.insert(
-                crate::commands::nft::COMPAT_HITS_KEY.into(),
+                crate::modules::watchdog::COMPAT_HITS_KEY.into(),
                 serde_json::json!({
                     "total": 12, "seen": 12,
                     "last_hit_at": "2026-10-19T10:00:00Z",
@@ -585,7 +733,7 @@ mod tests {
         crate::state::runtime::Runtime::load(crate::paths::runtime_file(&paths))
             .update(|r| {
                 r.extra.insert(
-                    crate::commands::nft::COMPAT_HITS_KEY.into(),
+                    crate::modules::watchdog::COMPAT_HITS_KEY.into(),
                     serde_json::json!({
                         "total": 0, "seen": 0, "since": "2026-09-15T00:00:00Z",
                     }),

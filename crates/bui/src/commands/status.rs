@@ -27,7 +27,7 @@ pub struct StatusExtra<'a> {
     pub compat_range: Option<(u16, u16)>,
     /// 兼容段的**累计**命中（T12 落在 `runtime.json` 的那份，**绝不是活 counter**）；
     /// `None` = 守护进程还没采过一轮
-    pub compat_hits: Option<&'a crate::commands::nft::CompatHits>,
+    pub compat_hits: Option<&'a crate::modules::watchdog::CompatHits>,
 }
 
 /// 把 `/api/health` 渲染成人读文本。
@@ -203,7 +203,7 @@ pub fn format_hy2_pool((used, size, generation): (usize, usize, u64)) -> String 
 pub fn format_nft_table(
     rules: usize,
     compat: Option<(u16, u16)>,
-    hits: Option<&crate::commands::nft::CompatHits>,
+    hits: Option<&crate::modules::watchdog::CompatHits>,
 ) -> String {
     let table = bui_schema::render::nft::TABLE;
     let Some((a, b)) = compat else {
@@ -308,7 +308,7 @@ pub async fn run_with(
             Err(_) => (Hy2Auth::default(), None, (0, 0, 0), 0, None),
         };
     // **兼容段的累计命中读 `runtime.json` 的持久值，绝不读活 counter**（2026-09-16 裁决）。
-    let hits = crate::commands::nft::compat_hits(
+    let hits = crate::modules::watchdog::compat_hits(
         &crate::state::runtime::Runtime::load(crate::paths::runtime_file(&paths))
             .read()
             .await,
@@ -476,12 +476,48 @@ mod tests {
         }
     }
 
-    fn hits(total: u64, last: Option<&str>, since: &str) -> crate::commands::nft::CompatHits {
-        crate::commands::nft::CompatHits {
+    fn hits(total: u64, last: Option<&str>, since: &str) -> crate::modules::watchdog::CompatHits {
+        crate::modules::watchdog::CompatHits {
             total,
             last_hit_at: last.map(str::to_string),
             since: since.to_string(),
+            ..Default::default()
         }
+    }
+
+    /// 已用 / 容量的口径只有 [`bui_schema::hy2pool::usage`] **一处**，`run_with` 这一侧
+    /// 也得锁住（第九波复核点名：端点那一侧有逐值相等的断言，这一侧没有 —— 把 `run_with`
+    /// 里那句 `hy2pool::usage` 换回 T14 之前的「去重后的非空 `hy2_resi_cred` 个数」全绿）。
+    ///
+    /// 为什么值得一条源级契约：`run_with` 是 I/O 路径，没有单元测试能直接钉它，而两套算法
+    /// 的差别只在**悬空指针**（用户指向上一代池里已不存在的 id）—— 按用户数算会让
+    /// `used + free > size`，于是 `bui status` 判「`used > 80%·size`」与
+    /// `bui residential pool status` 判「`free < 20%·size`」在同一台机器上一处喊空闲不足、
+    /// 另一处说没事，正是这次要修的那个症状。
+    #[test]
+    fn the_status_side_takes_used_and_size_from_the_one_pool_usage_criterion() {
+        // 只看出厂代码那一半：本用例自己也在 `include_str!` 进来的那份源里，
+        // 连测试一起 grep 就会匹配到自己、无论 `run_with` 干净与否都红。
+        let src = include_str!("status.rs");
+        let prod = src
+            .split_once("\n#[cfg(test)]\n")
+            .expect("status.rs 的测试模块标记变了")
+            .0;
+        assert_eq!(
+            prod.matches(&format!("hy2pool::{}(", "usage")).count(),
+            1,
+            "`run_with` 必须有且只有一处调 hy2pool::usage"
+        );
+        // 出厂代码没有任何理由自己去摸这个字段：摸它就是在重算一套已用数
+        let field = format!("hy2_resi{}", "_cred");
+        assert!(
+            !prod.contains(&field),
+            "status.rs 又自己按 `{field}` 算了一遍已用数：口径只许有 hy2pool::usage 一处"
+        );
+        // 顺带钉住两处门槛同源：这一行的「空闲不足」与端点判的 free 比例是同一个常量
+        assert_eq!(bui_schema::hy2pool::LOW_FREE_RATIO, 0.2);
+        let u = bui_schema::hy2pool::usage(&crate::testutil::sample_state());
+        assert_eq!(u.used + u.free, u.size, "usage 的三个数必须自洽");
     }
 
     /// T14 的三行新输出（纯函数，不碰机器）。

@@ -64,57 +64,19 @@ pub fn apply(host: &dyn Host, paths: &Paths) -> Result<String> {
     ))
 }
 
-/// 兼容段累计命中的**只读投影**：T12 的 watchdog 每轮采样之前读一次活 counter、把增量
-/// 累加进 `runtime.json` 的 `hy2_resi_compat_hits` 键（`modules::watchdog::CompatHits`），
-/// 字段名与这里逐字相同。
-///
-/// **`bui status` 与下线门禁一律读这份持久值，绝不读活 counter**（2026-09-16 裁决）：
-/// `render::nft::ruleset` 每次重放都先 `flush table`，开机 / `bui nft apply` / watchdog
-/// 自愈 / 改端口都把活计数清回 0，拿它当判据就会把**仍在用**的兼容段判成闲置并关掉，
-/// 全部还没刷订阅的 4.0 住宅用户当场断联 —— 而兼容段存在的唯一理由就是防这件事。
-///
-/// 这里只做**显示**：`total > 0` / `total == 0` 的判闲置策略在 T12 的
-/// `CompatHits::idle_for_takedown`（`total == 0` 且静默 ≥ 30 天），不在本文件重写一遍。
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
-pub struct CompatHits {
-    /// 累计命中（量纲是 conntrack 流数：nat 链的 counter 只计每条流的首包）
-    #[serde(default)]
-    pub total: u64,
-    /// 最近一次涨过的时刻（`None` = 从没命中过）
-    #[serde(default)]
-    pub last_hit_at: Option<String>,
-    /// 开始统计的时刻（第一次采样）
-    #[serde(default)]
-    pub since: String,
-}
-
-/// T12 把 [`CompatHits`] 落在 `runtime.extra` 的这个键上。
-pub const COMPAT_HITS_KEY: &str = "hy2_resi_compat_hits";
-
-impl CompatHits {
-    /// 「从这一刻起没再命中过」：有过命中就是最近那一次，否则是开始统计的时刻。
-    pub fn quiet_since(&self) -> &str {
-        self.last_hit_at.as_deref().unwrap_or(&self.since)
-    }
-}
-
-/// 取持久化的兼容段命中数（`None` = 守护进程还没采过一轮，或字段坏了）。
-///
-/// **T12 依赖**：那份值由 `modules::watchdog` 的每轮 nft 校验写入；T12 合并之前这个键
-/// 永远不存在，于是 `bui status` 那一行报「命中统计未就绪」、下线门禁一律要 `--force`。
-pub fn compat_hits(rt: &crate::state::runtime::RuntimeData) -> Option<CompatHits> {
-    rt.extra
-        .get(COMPAT_HITS_KEY)
-        .cloned()
-        .and_then(|v| serde_json::from_value(v).ok())
-}
-
 /// 表在不在 + 四条规则的**瞬时**流计数。
 ///
 /// 这里打出来的 counter **不是**兼容段的下线判据（2026-09-16 裁决）：`flush table` 每次
 /// 重放都把它清回 0，nat 链的 counter 又只计每条 conntrack 流的首包。累计命中数与
 /// `last_hit_at` 由守护进程在每次重放之前采样、累加进 `runtime.json`，
 /// `bui status` 与 `bui set hy2-resi-compat off` 的 30 天门禁读的是那份持久值。
+///
+/// 那份持久值的类型、键名与判据**只有 [`crate::modules::watchdog`] 一处**（2026-09-17
+/// 合并裁决）：写入侧就在那里，spec §2.4 的「`total == 0` 且静默 ≥ 30 天才算闲置」落在
+/// [`CompatHits::idle_for_takedown`](crate::modules::watchdog::CompatHits::idle_for_takedown)。
+/// T14 曾在本文件与 `commands::config` 各放一份只读投影 + 一份同构的 30 天实现（当时 T12
+/// 还没合进来），两份会漂移成「`bui status` 说闲置、门禁说没闲置」——读取侧与门禁现在
+/// 一律指向那一处，别在这里重写第二份。
 pub fn status(host: &dyn Host, paths: &Paths) -> Result<String> {
     let s = load_state(host, paths)?;
     require_nft(host)?;

@@ -439,4 +439,17 @@ fn a_user_with_no_nodes_still_gets_a_loadable_subscription() {
         ["DIRECT", "REJECT"].contains(&m.as_str()) || groups.contains(&m),
         "MATCH,{m} 指向不存在的组，groups={groups:?}"
     );
+    // mihomo 的 DNS 段同样不许出现空串域名：`fake-ip-filter` 与 `nameserver-policy` 的键
+    // 都是编译进域名 trie 的匹配面（零节点时 `nodes.first()` 取不到 host ⇒ 空串），
+    // 与 sing-box 那侧的空 `domain` 项同形 —— 那一侧实测是硬 FATAL。
+    let filter = doc["dns"]["fake-ip-filter"].as_sequence().unwrap();
+    assert!(
+        !filter.is_empty() && !filter.iter().any(|x| x.as_str() == Some("")),
+        "fake-ip-filter 里有空串项：{filter:?}"
+    );
+    let policy = doc["dns"]["nameserver-policy"].as_mapping().unwrap();
+    assert!(
+        !policy.keys().any(|k| k.as_str() == Some("")),
+        "nameserver-policy 有空串键：{policy:?}"
+    );
 }

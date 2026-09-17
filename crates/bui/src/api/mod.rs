@@ -607,7 +607,7 @@ mod tests {
         //    （区间由 `nft::compat_range(&ports)` 算，不是写死的字面量）
         rt.update(|r| {
             r.extra.insert(
-                crate::commands::nft::COMPAT_HITS_KEY.into(),
+                crate::modules::watchdog::COMPAT_HITS_KEY.into(),
                 serde_json::json!({
                     "total": 12, "seen": 12,
                     "last_hit_at": "2026-09-10T10:00:00Z",
@@ -661,7 +661,7 @@ mod tests {
         );
         rt.update(|r| {
             r.extra.insert(
-                crate::commands::nft::COMPAT_HITS_KEY.into(),
+                crate::modules::watchdog::COMPAT_HITS_KEY.into(),
                 serde_json::json!({"total": 0, "seen": 0, "since": "2026-08-01T00:00:00Z"}),
             );
         })

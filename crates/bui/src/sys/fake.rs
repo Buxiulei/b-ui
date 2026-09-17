@@ -40,6 +40,15 @@ pub struct FakeInner {
     /// 失败的，而对账把「带 restart 的 WriteFile 写失败」也算作搁置该单元的理由
     /// （`reconcile::apply` 第 1 步），不给假机器造出写失败就没法钉住那一半。
     pub fail_writes: BTreeSet<PathBuf>,
+    /// 令 `run` / `run_stdin` **执行不了**（返回 `Err`，不是非零退出）：前缀匹配命令行，
+    /// 命中即失败。真实机器上这是「二进制在 PATH 里但 fork/exec 失败、被 seccomp 挡、
+    /// 权限不足」那一类；它与「跑起来了但退非零」（用 [`FakeInner::scripted`] 播
+    /// `CmdOut`）是两条不同的路，而只有前者能走到调用方的 `Err` 分支。
+    ///
+    /// 有它才测得出「回滚里删 nft 表失败只记 note、绝不中断回滚」这种**单向门**上的
+    /// 容错分支（`commands::upgrade::rollback`）：`nft::delete` 对「没有 nft 二进制」与
+    /// 「表本来不在」都返回 `Ok(note)`，只有 `host.run` 自己失败才返回 `Err`。
+    pub fail_runs: BTreeSet<String>,
     /// 令某单元**永远不 active**：`systemctl start/restart` 照样退 0，单元却起不来
     /// （203/EXEC、start-limit-hit 的真实形态）。裸名与全名两种键各查一次。
     pub never_active: BTreeSet<String>,
@@ -66,6 +75,14 @@ pub struct FakeInner {
     pub ops: Vec<String>,
 }
 
+/// [`FakeInner::fail_runs`] 命中（前缀匹配）⇒ 让 `run` / `run_stdin` 返 `Err`。
+fn fail_run(i: &FakeInner, line: &str) -> Result<()> {
+    if let Some(p) = i.fail_runs.iter().find(|p| line.starts_with(p.as_str())) {
+        anyhow::bail!("执行 `{line}` 失败：假机器播了 fail_runs（{p}）");
+    }
+    Ok(())
+}
+
 // `time::OffsetDateTime` 没有 `Default`，所以 `FakeInner` 的 `Default` 手写（计划里写的是
 // `#[derive(Default)]`，derive 编不过）；默认的机器事实与假时钟一并在这里定下。
 impl Default for FakeInner {
@@ -86,6 +103,7 @@ impl Default for FakeInner {
             scripted: Vec::new(),
             fail_units: BTreeSet::new(),
             fail_writes: BTreeSet::new(),
+            fail_runs: BTreeSet::new(),
             never_active: BTreeSet::new(),
             listening: BTreeMap::new(),
             mem_mb: 2048,
@@ -331,6 +349,7 @@ impl Host for FakeHost {
         let line = cmd_line(program, args);
         self.push_op(format!("run:{line}"));
         let i = self.lock();
+        fail_run(&i, &line)?;
         for (prefix, out) in &i.scripted {
             if line.starts_with(prefix.as_str()) {
                 return Ok(out.clone());
@@ -344,6 +363,7 @@ impl Host for FakeHost {
         self.push_op(format!("run:{line}"));
         let mut i = self.lock();
         i.stdins.push((line.clone(), stdin.to_string()));
+        fail_run(&i, &line)?;
         for (prefix, out) in &i.scripted {
             if line.starts_with(prefix.as_str()) {
                 return Ok(out.clone());

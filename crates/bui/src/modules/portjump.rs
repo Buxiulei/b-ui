@@ -1276,8 +1276,9 @@ table ip6 hysteria_4d4d4d4d
     /// 里摘掉，这条用例当场红，提醒他把那条清理路径（函数本体 + `RESI_CONFIGS_PER_ROUND`
     /// + `reconcile::apply` 第 7.5 步的调用点 + 本用例）一起删掉。
     ///
-    /// 探测的份数也钉在这里：少于 8 份就会漏掉高序号槽留下的孤儿规则（它们与
-    /// `inet bui` 同挂 nat priority -100，先注册者先做 NAT ⇒ 那一片跳跃端口静默丢包）。
+    /// 这里只钉「常量定义没被人改小」；**份数由
+    /// [`tests::the_legacy_cleanup_probes_every_one_of_the_eight_slots`] 按实际发出的
+    /// dump 次数钉**（本条的等式按定义恒真，捕获不到有人改消费它的那个循环）。
     #[test]
     fn the_legacy_residential_cleanup_retires_with_the_legacy_units() {
         let legacy = crate::reconcile::LEGACY_UNITS;
@@ -1291,7 +1292,69 @@ table ip6 hysteria_4d4d4d4d
         assert_eq!(
             RESI_CONFIGS_PER_ROUND,
             crate::reconcile::MAX_RESI_SLOTS,
-            "每轮探测的份数必须覆盖槽 0..7 全部 4.0 配置"
+            "常量定义被改小了 ⇒ 探测份数覆盖不到槽 0..7 全部 4.0 配置"
+        );
+    }
+
+    /// **探测的份数真的是 8 份**（第九波复核点名：旁边那条「探 8 份」的断言是同义反复
+    /// —— `RESI_CONFIGS_PER_ROUND` 按定义就 `= MAX_RESI_SLOTS`，它只能捕获「有人改常量
+    /// 定义」，捕获不到「有人改消费它的那个循环」）。
+    ///
+    /// 这条把 8 份 4.0 配置全放上盘，按**实际发出的 dump 次数**数份数：循环上界少 1，
+    /// 顶槽 `config-residential-7.yaml` 就永远不被探测、它留下的孤儿 NAT 规则永远不清 ——
+    /// 那一片跳跃端口与 `inet bui` 同挂 nat priority -100，先注册者先做 NAT ⇒ 静默丢包，
+    /// 与 2026-09-15 那次事故同类。
+    #[test]
+    fn the_legacy_cleanup_probes_every_one_of_the_eight_slots() {
+        let slots = crate::reconcile::MAX_RESI_SLOTS;
+        let h = FakeHost::new();
+        // 每槽一份配置 + dump 里一条指向它 base 端口的孤儿链（链名按槽序号编，便于点名）
+        let mut dump = String::from("-P PREROUTING ACCEPT\n");
+        for i in 0..slots {
+            dump.push_str(&format!(
+                "-N HYSTERIA-PR-0000000{i}\n-A HYSTERIA-PR-0000000{i} -p udp -j REDIRECT \
+                 --to-ports {}\n",
+                40000 + i
+            ));
+        }
+        h.with(|inv| {
+            inv.which.insert("iptables".into());
+            for i in 0..slots {
+                inv.files.insert(
+                    crate::modules::core_files::resi_config_path(&Paths::default_server(), i),
+                    (
+                        format!("listen: :{},41000-50000\n", 40000 + i).into_bytes(),
+                        0o600,
+                    ),
+                );
+            }
+            inv.scripted.push((
+                "iptables -t nat -S".into(),
+                crate::sys::CmdOut::success(&dump),
+            ));
+        });
+
+        let done = cleanup_legacy_residential(&h, &Paths::default_server());
+        let ops = h.ops();
+        assert_eq!(
+            ops.iter()
+                .filter(|o| *o == "run:iptables -t nat -S")
+                .count(),
+            usize::from(slots),
+            "盘上 {slots} 份配置就得发 {slots} 次 dump，少一次就有一槽的孤儿规则没人清：{ops:?}"
+        );
+        // 顶槽那一份必须真的被清（份数少 1 时它是第一个掉出去的）
+        let top = slots - 1;
+        assert!(
+            done.iter().any(|l| l
+                .starts_with(&format!("/opt/b-ui/config-residential-{top}.yaml："))
+                && l.contains(&format!("HYSTERIA-PR-0000000{top}"))),
+            "顶槽（{top}）的孤儿链没被清：{done:?}"
+        );
+        assert!(
+            ops.iter()
+                .any(|o| *o == format!("run:iptables -t nat -X HYSTERIA-PR-0000000{top}")),
+            "{ops:?}"
         );
     }
 

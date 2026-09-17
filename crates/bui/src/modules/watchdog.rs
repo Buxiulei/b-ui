@@ -1063,9 +1063,13 @@ mod tests {
         );
     }
 
-    /// 孤儿链自愈那条重启路径同样要广播（它重启的也是 `hysteria-residential`）
+    /// 合并裁决（T11 ↔ T12，2026-09-17）：孤儿链自愈这条来路在 4.1 **不再**广播。
+    /// [`HY2_CONFIGS`] 收成直连一项后它只会重启 `hysteria-server`，住宅换 sing-box
+    /// 不建 NAT 规则、没有孤儿链可清；4.0 起那条「自愈完也广播」的用例（断言这一路
+    /// 重启了 `hysteria-residential`）按 T12 的口径已不可满足，改成正面钉住新口径：
+    /// 自愈这一路**只**碰直连实例、住宅一个命令都收不到、门位也不白重放一轮。
     #[tokio::test]
-    async fn healing_a_crash_loop_also_announces_the_restart() {
+    async fn healing_a_crash_loop_restarts_only_the_direct_inbound_and_announces_nothing() {
         let host = crash_looping_host();
         let (c, _d) = ctx(host.clone()).await;
         let mut rx = c.bus.subscribe();
@@ -1073,12 +1077,19 @@ mod tests {
         assert!(
             host.ops()
                 .iter()
-                .any(|o| o == "systemd:restart:hysteria-residential"),
-            "前提：自愈这一路重启了住宅入站"
+                .any(|o| o == "systemd:restart:hysteria-server"),
+            "前提：自愈这一路重启了直连实例"
         );
-        assert_eq!(
-            rx.try_recv().ok(),
-            Some(crate::api::Event::Hy2ResiRestarted)
+        assert!(
+            !host
+                .ops()
+                .iter()
+                .any(|o| o == "systemd:restart:hysteria-residential"),
+            "4.1 的孤儿链自愈不许碰住宅入站（它不建 NAT 规则、没有孤儿链可清）"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "住宅入站没重启 ⇒ 不许广播（白重放一轮门位 = 多打一次 GET /proxies 与若干 PUT）"
         );
     }
 

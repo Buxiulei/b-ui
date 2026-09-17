@@ -209,7 +209,7 @@ pub async fn set_hy2_resi_compat(
                 .into_response()
         }
     };
-    let hits = crate::commands::nft::compat_hits(&app.runtime.read().await);
+    let hits = crate::modules::watchdog::compat_hits(&app.runtime.read().await);
     let compat = bui_schema::render::nft::compat_range(&app.store.read().await.node.ports);
     if let Err(why) = crate::commands::config::check_compat_takedown(
         on,

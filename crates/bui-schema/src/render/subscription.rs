@@ -556,9 +556,16 @@ pub fn clash(nodes: &[Node], username: &str, split: &SplitRules) -> String {
         ("ipv6", y(false)),
         ("enhanced-mode", y("fake-ip")),
         ("fake-ip-range", y("198.18.0.1/16")),
+        // 零节点用户的 `host` 是空串（见 [`singbox`]）：`fake-ip-filter` 与
+        // `nameserver-policy` 都是编译进域名 trie 的匹配面，空串是它的非法输入
+        // （同形状的空 domain 项在 sing-box 上是硬 FATAL），所以空 host 一项都不进。
         (
             "fake-ip-filter",
-            y(["*.lan", "*.local", "*.localhost", host]),
+            if host.is_empty() {
+                y(["*.lan", "*.local", "*.localhost"])
+            } else {
+                y(["*.lan", "*.local", "*.localhost", host])
+            },
         ),
         ("default-nameserver", y(["223.5.5.5", "119.29.29.29"])),
         (
@@ -568,7 +575,14 @@ pub fn clash(nodes: &[Node], username: &str, split: &SplitRules) -> String {
                 "https://doh.pub/dns-query",
             ]),
         ),
-        ("nameserver-policy", ymap(vec![(host, y("223.5.5.5"))])),
+        (
+            "nameserver-policy",
+            ymap(if host.is_empty() {
+                vec![]
+            } else {
+                vec![(host, y("223.5.5.5"))]
+            }),
+        ),
         (
             "fallback",
             y(["https://8.8.8.8/dns-query", "https://1.1.1.1/dns-query"]),

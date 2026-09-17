@@ -917,7 +917,11 @@ mod tests {
         );
     }
 
-    /// 没有 `nft` 二进制 / 表不存在 ⇒ 只记 note，不算失败（回滚绝不能因此中断）。
+    /// 没有 `nft` 二进制 ⇒ 只记 note，不算失败（回滚绝不能因此中断）。
+    ///
+    /// 这条只覆盖 `nft::delete` 的 **`Ok` 支路**（`which("nft")` 为假）；
+    /// 「`nft` 真的执行不了」那条 `Err` 支路见
+    /// [`a_failing_nft_delete_still_finishes_the_rollback`]。
     #[test]
     fn a_missing_nft_table_does_not_fail_the_rollback() {
         let d = tempfile::tempdir().unwrap();
@@ -930,6 +934,62 @@ mod tests {
         assert!(
             notes.iter().any(|n| n.contains("已恢复上一版 bui")),
             "缺 nft 不许中断回滚：{notes:?}"
+        );
+    }
+
+    /// **删 nft 表这一步真的失败时，回滚照样跑完**（第九波复核点名：这条 `Err` 支路此前
+    /// 无覆盖，而且 `FakeHost` 结构上测不出来 —— `run` 永远返 `Ok`。本轮给它加了
+    /// `fail_runs` 注错口，与已有的 `fail_units` / `fail_writes` 同构）。
+    ///
+    /// 为什么这条分支值得一条用例：回滚是**单向门**。`delete` 的返回值用 `?` 抛出去，
+    /// 回滚就在**恢复 `bin/bui` 之前**中止，机器停在「跑着 4.1 的 bui、住宅单元已停、
+    /// nft 表状态不明」的半吊子态 —— 比不回滚更糟，而这段代码存在的全部理由就是防它。
+    /// `nft::delete` 对「没有 nft 二进制」与「表本来不在」都返回 `Ok(note)`，只有
+    /// `host.run` 本身执行不了（fork/exec 失败、被挡）才返回 `Err`。
+    #[test]
+    fn a_failing_nft_delete_still_finishes_the_rollback() {
+        let d = tempfile::tempdir().unwrap();
+        let (h, p) = host_with_prev_binaries(&d);
+        h.with(|i| {
+            i.fail_runs.insert("nft delete table".into());
+        });
+        let notes = rollback(&h, &p).unwrap();
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("nft 表删除失败（回滚继续）")),
+            "失败要留一行说明（运维据它去手工确认表的状态）：{notes:?}"
+        );
+        // 关键：中止在这里 = 停在「跑着新版 bui、住宅已停、表状态不明」的半吊子态
+        assert!(
+            notes.iter().any(|n| n.contains("已恢复上一版 bui")),
+            "删表失败不许中断回滚：{notes:?}"
+        );
+        assert_eq!(
+            h.read_file(&p.bin_dir.join("bui")).unwrap().as_deref(),
+            Some(&b"OLDBUI"[..]),
+            "bin/bui 必须真的换回旧字节"
+        );
+        for name in crate::kernels::KERNELS {
+            assert_eq!(
+                h.read_file(&p.bin_dir.join(name)).unwrap().as_deref(),
+                Some(&b"OLDK"[..]),
+                "{name} 也要恢复完"
+            );
+        }
+        // 住宅单元照旧只停一次、不重启（spec §9.1）
+        let calls: Vec<String> = h
+            .ops()
+            .into_iter()
+            .filter(|o| o.starts_with("systemd:"))
+            .collect();
+        assert!(
+            calls.contains(&format!("systemd:stop:{RESI_UNIT}")),
+            "{calls:?}"
+        );
+        assert!(
+            !calls.contains(&format!("systemd:restart:{RESI_UNIT}")),
+            "{calls:?}"
         );
     }
 
