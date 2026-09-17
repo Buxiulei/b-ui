@@ -6,9 +6,13 @@
 #      由服务端经 v2ray_api 采上来，脚本只读 `GET /api/users`）
 #   ③ 到期语义（4.1 变了）：**住宅握手仍成功、请求全被拒**，`/api/online` 里该用户归零、
 #      同槽邻居的会话不断；直连仍是握手即拒，`auth-hook.log` 记 expired / blocked
-#   ④ 删一个上游后：任一用户三种订阅的 sha 不变、每个人的门位与期望一致、**门位重放没报
-#      过失败事件**（`bui incidents`）、**未封用户经住宅节点仍真能出网**、
-#      `hysteria-residential` 不重启
+#   ④ 删一个上游后：任一用户三种订阅的 sha 不变、每个人的门位与期望一致、
+#      `hysteria-residential` 不重启（**要 `--remove-upstream`**，删上游不可逆）
+#   ④' 门位的两件**活体**证据，**默认就跑**（只读、无副作用，不需要 `--remove-upstream`）：
+#      **门位重放没报过失败事件**（`bui incidents`）、**未封用户经住宅节点仍真能出网**。
+#      判据 ④ 的门位那半条只比「面板算出的期望门位」（真机上几乎恒真），所以这两件事才是
+#      spec §3.4 真正要盯的；它们锁在 `--remove-upstream` 后面就等于没人看得到（T19 正文
+#      那条命令也不带那个开关）。
 #   ⑤ 重启守护进程后计数不重复（不翻倍）
 #
 #   真机：sudo bash scripts/m3-acceptance.sh
@@ -17,11 +21,17 @@
 # 选项：--admin-password-file <文件>  管理员密码（`ADMIN_PASSWORD=` 行或整行密码）；
 #                                    缺省读 <base>/v3-backup/admin.env
 #       --download-url <url>         下载源（缺省按候选列表逐个 HEAD 探活取第一个可用的）
-#       --keep-url <url>             保活用的小文件（缺省同站 2KB）
+#       --keep-url <url>             保活用的小文件（**必须回 200 且只有几 KB**——它的字节
+#                                    数进判据 ② 的计数）。同一个 URL 在不同出口 IP 上结果
+#                                    不一样（Cloudflare 的 `__down` 在开发机回 200、在 rick
+#                                    实测 403），**staging 跑 ①–④ 前先用 `--keep-url` 钉一个
+#                                    在那台机器上实测回 200 的小文件**。
 #       --base <目录>                缺省 /opt/b-ui
 #       --remove-upstream <sel>      判据 ④ 要删的那条上游（`host:port` / uuid / `resi-N`）。
-#                                    **不给就整条判据 SKIP**：删上游是不可逆的（上游凭据
-#                                    删了这脚本取不回来），只在 staging 显式开。
+#                                    **不给就判据 ④ SKIP**（④' 照跑）：删上游是不可逆的
+#                                    （上游凭据删了这脚本取不回来），只在 staging 显式开，
+#                                    **且只在池里 ≥2 条上游时开**——删成空池后中继 fail-open
+#                                    全部直连，④' 的活体探测无论门位对不对都回 200。
 #       --strict                     把 SKIP 也算进退出码（判据被跳过 = 那一条没验收到）。
 # 环境变量：M3_ADD_WAIT / M3_FLUSH_WAIT / M3_STABLE_WAIT / M3_KICK_WAIT /
 #           M3_RESTART_WAIT / M3_KEEP_INTERVAL / M3_USAGE_POLL / M3_FIRST_OK_WAIT /
@@ -37,9 +47,15 @@ LC_ALL=C
 
 BASE=${BASE:-/opt/b-ui}
 ADMIN_PW_FILE=""
-KEEP_URL="https://speed.cloudflare.com/__down?bytes=2048"
+# 保活源：每秒打一次、字节数要进判据 ② 的计数 ⇒ 只能是几 KB 的小文件，而且**必须回 200**
+# （判据 ①③④' 都拿「200」当通路证据）。缺省曾是 `speed.cloudflare.com/__down?bytes=2048`，
+# 但这脚本自己下面那段注释就记着它在 rick 实测 403（速度站按出口 IP / ASN 挡）——默认值
+# 指着一个已知会 403 的源，真机上三条判据会集体假 FAIL。换成 IANA 的 example.com 首页
+# （2026-09-17 实测 200 / 559 字节，没有速度站那套限流）。出口不同结果就可能不同，所以
+# staging 前照 `usage()` 那行提示用 `--keep-url` 钉一个在那台机器上实测过的源。
+KEEP_URL="https://example.com/"
 SELF_TEST=0
-# 判据 ④ 要删的上游（`--remove-upstream`）。空 = 整条判据 SKIP
+# 判据 ④ 要删的上游（`--remove-upstream`）。空 = 判据 ④ SKIP（只读的 ④' 不受影响，照跑）
 REMOVE_UPSTREAM=""
 # `--strict`：SKIP 也进退出码
 STRICT=0
@@ -96,6 +112,11 @@ BLOCK_WAIT=${M3_BLOCK_WAIT:-15}
 # 判据 ④ 的门位收敛窗口：删上游改了槽位，门位重放走「`StateChanged` + 60 秒安全网」两条
 # 触发路径（spec §3.4），所以最坏要等满那一轮安全网。
 GATE_WAIT=${M3_GATE_WAIT:-75}
+# 判据 ④' 的事件窗口起点：**在脚本干任何事之前**取（这里是加载期，比加用户 / 到期 / 删上游
+# 都早），所以窗口必然盖住删上游与它后面那一轮门位重放。方向只能往早不能往晚：取晚了
+# （比如挪到 `sleep "$GATE_WAIT"` 之后、或挪进 check_gate_live 里）窗口就漏掉正要盯的那一段
+# 失败事件，判据 ④' 恒绿。池里早先的旧失败在这个起点之前，照样不算这一笔。
+GATE_SINCE=$(date +%s)
 # 判据 ③ 的「`/api/online` 归零」要连续读到几轮才算数（一次读到 0 可能只是采样间隙）
 ONLINE_ZERO_ROUNDS=3
 
@@ -492,6 +513,28 @@ try:
 except Exception:
     raise SystemExit(0)
 print(d.get(sys.argv[2], 0) if isinstance(d, dict) else 0)
+PY
+}
+
+# 「有效」上游数：`GET /api/residential/status` 的 `upstreams` 行数，**池无效时一律回 0**
+# （`status.enabled` = `ResidentialGroup::pool_active()` = 开关开着 **且** 池非空）。
+# 读不到 / 形状不对回显空。
+#
+# 判据 ④' 的活体探测靠它判「探测还有没有判别力」：池无效时中继渲染成「监听照在、出口全
+# direct」（`render::relay::config` 的 fail-open，relay.rs 的
+# `an_inactive_pool_keeps_the_slot_inbounds_and_fails_open` 就是它的守门测试），于是无论
+# 门位指着哪个槽，探测都回 200 —— 那个 200 什么都不证明。
+upstream_count() {
+  [ "$(api GET /api/residential/status)" = "200" ] || return 0
+  python3 - "$API_OUT" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    raise SystemExit(0)
+u = d.get("upstreams") if isinstance(d, dict) else None
+if isinstance(u, list):
+    print(len(u) if d.get("enabled") else 0)
 PY
 }
 
@@ -989,7 +1032,7 @@ judge_gate_incidents() {
   esac
   n=$(printf '%s\n' "${1:-}" | grep -c .)
   [ "$n" = "0" ] ||
-    printf '删上游后有 %s 条门位同步/重放失败事件（bui incidents）：%s' \
+    printf '窗口内有 %s 条门位同步/重放失败事件（bui incidents）：%s' \
       "$n" "$(printf '%s' "$1" | tr '\n' ';')"
 }
 
@@ -1354,19 +1397,17 @@ check_expiry() {
   stop_client "$npid"
 }
 
-# 判据 ④：删一个上游后，任一用户三种订阅的 sha 不变、每个人的门位与期望一致、门位重放
-# 没报过失败事件、一个未封用户经住宅节点仍真能出网、`hysteria-residential` 不重启
-# （spec §6 的 m3 判据 ④）。
+# 判据 ④：删一个上游后，任一用户三种订阅的 sha 不变、每个人的门位与期望一致、
+# `hysteria-residential` 不重启（spec §6 的 m3 判据 ④）。
 #
 # 门位那一项只比「面板算出的期望门位」（`GET /api/users` 的 `hy2ResiGate`，与
-# `panel::gates::expected` 同源）—— 真机上它几乎恒真，抓不到 Clash API 的 select 重放失败，
-# 所以另外两件**活体**证据（哨兵事件 + 真打一次住宅节点）才是这条判据的判别力所在。
+# `panel::gates::expected` 同源）—— 真机上它几乎恒真，抓不到 Clash API 的 select 重放失败；
+# 两件**活体**证据（哨兵事件 + 真打一次住宅节点）在 check_gate_live 里，**默认就跑**。
 #
 # **这一步会真删一条上游**，而上游的凭据删了这脚本取不回来 ⇒ 只在显式给了
 # `--remove-upstream <sel>` 时才走，缺省整条 SKIP。
 check_remove_upstream() {
-  local tok sha0 sha1 gates before after out code since
-  local nrow nuser ntok gname gsecret gport gsocks gcfg gpid gok=0
+  local tok sha0 sha1 gates before after out code
   if [ -z "$REMOVE_UPSTREAM" ]; then
     skip "step4 删上游后订阅 sha 与门位不变（没给 --remove-upstream <host:port|uuid|resi-N>；它不可逆，只在 staging 开）"
     return
@@ -1382,8 +1423,6 @@ check_remove_upstream() {
   fi
   sha0=$(sub_shas "$tok")
   before=$(unit_stamps "$RESI_UNIT")
-  # 事件窗口的起点：只看删上游之后落的门位失败事件（真机上池里早先的失败不该记在这一笔上）
-  since=$(date +%s)
   code=$(remove_upstream "$REMOVE_UPSTREAM")
   if [ "$code" != "200" ]; then
     no "step4 删上游失败（POST /api/residential/remove $REMOVE_UPSTREAM → HTTP $code）" "$(api_body)"
@@ -1407,52 +1446,73 @@ check_remove_upstream() {
     no "step4 删上游后有人的门位不对" "$out"
   fi
 
-  # 上面那半条比的是**期望值**（面板与脚本同一个纯函数的两次求值）⇒ 必须再要两件活体证据：
-  # ① 哨兵没报过门位同步 / 重放失败；② 一个**未封**住宅 HY2 用户真连一次 `ports.hy2_resi`
-  # 还能出网（`PUT /proxies/gate-<id>` 失败、选择子仍指着已删除的槽出站时，面板这一侧
-  # 照样回显期望门位，只有这两件事看得见）。
-  out=$(judge_gate_incidents "$(gate_incident_rows "$since")")
-  if [ -z "$out" ]; then
-    ok "step4 删上游后没有门位同步/重放失败事件（bui incidents 自 epoch $since 起）"
-  else
-    no "step4 删上游后门位重放报了失败" "$out"
-  fi
-
-  nrow=$(resi_neighbour_from_api "$TMP_USER" "")
-  nuser=$(printf '%s\n' "$nrow" | sed -n 1p)
-  ntok=$(printf '%s\n' "$nrow" | sed -n 2p)
-  if [ -z "$nuser" ] || [ -z "$ntok" ] || [ ! -x "$BASE/bin/hysteria" ]; then
-    skip "step4 门位活体探测（没有第二个未封的住宅 HY2 用户 / 没有 $BASE/bin/hysteria）"
-  else
-    nrow=$(resi_node_of "$ntok")
-    gname=$(printf '%s\n' "$nrow" | sed -n 1p)
-    gsecret=$(printf '%s\n' "$nrow" | sed -n 2p)
-    gport=$(printf '%s\n' "$nrow" | sed -n 3p)
-    if [ -z "$gname" ] || [ -z "$gsecret" ] || [ -z "$gport" ]; then
-      skip "step4 门位活体探测（$nuser 的 /api/nodes 里没有住宅 HY2 节点）"
-    else
-      gsocks=$(free_port)
-      gcfg="$WORK/gate-live.yaml"
-      write_client_cfg "$gcfg" "$gname" "$gsecret" "$gsocks" "$gport"
-      gpid=$(start_hy2_client "$gcfg" "$WORK/gate-live.client.log" "$gsocks")
-      track_pid "$gpid"
-      read -r gok _ < <(probe_first_ok "$gsocks" "$FIRST_OK_WAIT")
-      stop_client "$gpid"
-      if [ "$(first_ok_code "$gok")" = "200" ]; then
-        ok "step4 删上游后未封用户 $nuser 经 :$gport 仍真能出网（门位活体探测 200）"
-      else
-        no "step4 删上游后未封用户 $nuser 经 :$gport 出不了网：门位可能还指着已删除的槽" \
-          "客户端日志末行：$(tail -n 1 "$WORK/gate-live.client.log" 2>/dev/null)"
-      fi
-    fi
-  fi
-
   after=$(unit_stamps "$RESI_UNIT")
   out=$(judge_stamps "$before" "$after")
   if [ -z "$out" ]; then
     ok "step4 删上游没重启 $RESI_UNIT"
   else
     no "step4 删上游把住宅内核重启了" "$out"
+  fi
+}
+
+# 判据 ④'：门位的两件**活体**证据，**默认就跑**（两件都只读、没有副作用）：
+#   ① `bui incidents` 里没有 `hy2_resi_gate_sync_failed` / `hy2_resi_gate_replay_failed`
+#      （窗口 = `GATE_SINCE`，脚本加载时取的，必然盖住本次加用户 / 到期 / 删上游触发的
+#      那几轮门位重放）；
+#   ② 一个**未封**住宅 HY2 用户真连一次 `ports.hy2_resi` 还能出网。
+# 这两件事原先锁在 `--remove-upstream` 后面 ⇒ 缺省整跑与 T19 正文那条命令都看不到它们，
+# 而判据 ④ 的门位那半条只比期望值、真机上几乎恒真。所以这里独立成项：删上游那一步
+# （不可逆）留在 check_remove_upstream，只读的这两件默认就跑。
+#
+# 顺序上跑在 check_remove_upstream 之后：给了 `--remove-upstream` 时，这两件证据正好落在
+# 「删上游 + 门位重放收敛」之后量。
+check_gate_live() {
+  local out n nrow nuser ntok gname gsecret gport gsocks gcfg gpid gok=0
+  out=$(judge_gate_incidents "$(gate_incident_rows "$GATE_SINCE")")
+  if [ -z "$out" ]; then
+    ok "step4' 没有门位同步/重放失败事件（bui incidents 自 epoch $GATE_SINCE 起）"
+  else
+    no "step4' 门位重放报了失败" "$out"
+  fi
+
+  # 活体探测的判别力前提：池有效（开关开着 + 池非空）。池无效 ⇒ 中继 fail-open、监听照在
+  # 但出口全直连，探测无论门位对不对都 200，那就不是证据而是假 PASS ⇒ 明说并 SKIP。
+  n=$(upstream_count)
+  if [ -z "$n" ]; then
+    skip "step4' 门位活体探测（读不到 GET /api/residential/status 的 enabled / upstreams ⇒ 判不出池还有没有效、探测有没有判别力）"
+    return
+  fi
+  if [ "$n" = "0" ]; then
+    skip "step4' 门位活体探测（池无效：池空或住宅开关关着 ⇒ 中继 fail-open 全部直连，无论门位对不对都回 200，这个探测没有判别力）"
+    return
+  fi
+  nrow=$(resi_neighbour_from_api "$TMP_USER" "")
+  nuser=$(printf '%s\n' "$nrow" | sed -n 1p)
+  ntok=$(printf '%s\n' "$nrow" | sed -n 2p)
+  if [ -z "$nuser" ] || [ -z "$ntok" ] || [ ! -x "$BASE/bin/hysteria" ]; then
+    skip "step4' 门位活体探测（没有第二个未封的住宅 HY2 用户 / 没有 $BASE/bin/hysteria）"
+    return
+  fi
+  nrow=$(resi_node_of "$ntok")
+  gname=$(printf '%s\n' "$nrow" | sed -n 1p)
+  gsecret=$(printf '%s\n' "$nrow" | sed -n 2p)
+  gport=$(printf '%s\n' "$nrow" | sed -n 3p)
+  if [ -z "$gname" ] || [ -z "$gsecret" ] || [ -z "$gport" ]; then
+    skip "step4' 门位活体探测（$nuser 的 /api/nodes 里没有住宅 HY2 节点）"
+    return
+  fi
+  gsocks=$(free_port)
+  gcfg="$WORK/gate-live.yaml"
+  write_client_cfg "$gcfg" "$gname" "$gsecret" "$gsocks" "$gport"
+  gpid=$(start_hy2_client "$gcfg" "$WORK/gate-live.client.log" "$gsocks")
+  track_pid "$gpid"
+  read -r gok _ < <(probe_first_ok "$gsocks" "$FIRST_OK_WAIT")
+  stop_client "$gpid"
+  if [ "$(first_ok_code "$gok")" = "200" ]; then
+    ok "step4' 未封用户 $nuser 经 :$gport 仍真能出网（门位活体探测 200，池里 $n 条上游）"
+  else
+    no "step4' 未封用户 $nuser 经 :$gport 出不了网：门位可能还指着已删除的槽" \
+      "客户端日志末行：$(tail -n 1 "$WORK/gate-live.client.log" 2>/dev/null)"
   fi
 }
 
@@ -1520,6 +1580,7 @@ run_checks() {
   check_traffic
   check_expiry
   check_remove_upstream
+  check_gate_live
   check_restart_count
   check_cleanup
 }
@@ -1549,7 +1610,10 @@ online_while_pid（{"file": PID 文件, "user": 用户名}：只要那个进程�
 resi_node（`GET /api/nodes/<token>` 里那个住宅 HY2 节点的 {username,password,port}，
 null = 没有住宅 HY2 节点）/ sub_bodies（三种订阅的响应体原文）/
 remove_ok（`POST /api/residential/remove` 是否成功）/ remove_breaks_subs（删上游后把订阅
-改掉，摆 4.1 最怕的那种回归）/ remove_breaks_gates（删上游后把未封用户的门位写成 deny）。
+改掉，摆 4.1 最怕的那种回归）/ remove_breaks_gates（删上游后把未封用户的门位写成 deny）/
+upstreams（`GET /api/residential/status` 的 `upstreams` 行数；`[]` = 池空，判据 ④' 的活体
+探测据此 SKIP。null = 这个键整个缺席，摆「读不到上游数」）/ resi_enabled（那个端点的
+`enabled`，即 `pool_active()`；false = 池里有上游但住宅开关关着，中继照样 fail-open）。
 """
 import json
 import os
@@ -1689,6 +1753,13 @@ class H(BaseHTTPRequestHandler):
             return self.reply(200, {"user": u["username"], "split": {}, "nodes": nodes})
         if not self.authed(d):
             return self.reply(401, {"error": "Unauthorized"})
+        if self.path == "/api/residential/status":
+            # 真面板回的是一大张 StatusResponse；本脚本只读 `enabled` 与 `upstreams` 行数
+            u = d.get("upstreams")
+            on = d.get("resi_enabled", True)
+            if u is None:
+                return self.reply(200, {"enabled": on})
+            return self.reply(200, {"enabled": on, "upstreams": u})
         if self.path == "/api/online":
             out = {}
             hold = d.get("online_while_pid") or {}
@@ -1839,6 +1910,7 @@ st_stub_reset() {
 {"password": "stub-admin-pw", "token": "stub-token", "users": [], "ramp": {},
  "ramp_seq": {}, "expire_marks_blocked": true, "online": ["m3-selftest"],
  "resi_node": {"username": "r000", "password": "s3cret-r000", "port": 40000},
+ "upstreams": [{"id": "u1"}, {"id": "u2"}],
  "sub_bodies": {"sub": "c3R1Yi1zdWI=", "subscription": "{\"outbounds\":[]}", "clash": "proxies: []"}}
 JSON
 }
@@ -2741,113 +2813,22 @@ st_check_remove_upstream() {
   else
     no "自测：判据④ 的 SKIP 分支不对" "$out"
   fi
-  # ② 通过：删上游后三种订阅 sha 不变、门位与期望一致、没有门位失败事件、未封邻居的
-  # 活体探测 200、住宅单元没重启（五条）
+  # ② 通过：删上游后三种订阅 sha 不变、门位与期望一致、住宅单元没重启（三条）。
+  # 两件活体证据（哨兵事件 + 活体探测）在 st_check_gate_live 里，**不**在这一步
+  # （它们只读、默认就跑，不该跟着这个不可逆开关走）
   out=$(
     TMP_USER=m3-selftest
     REMOVE_UPSTREAM="203.0.113.10:10007"
     GATE_WAIT=0.2
     st_stub_set users "$(st_users_with_neighbour 0)"
-    start_hy2_client() { st_fake_client "$@"; }
-    probe_socks_code() { echo 200; }
     check_remove_upstream
   )
-  if [ "$(printf '%s\n' "$out" | grep -c '^PASS')" = "5" ] &&
+  if [ "$(printf '%s\n' "$out" | grep -c '^PASS')" = "3" ] &&
     [[ "$out" == *"三种订阅 sha 全不变"* && "$out" == *门位都与期望一致* &&
-    "$out" == *没有门位同步/重放失败事件* && "$out" == *门位活体探测\ 200* && "$out" == *没重启* ]]; then
-    ok "自测：判据④（订阅 sha 不变 + 门位对 + 没有失败事件 + 活体探测通 + 不重启）PASS"
+    "$out" == *没重启* ]]; then
+    ok "自测：判据④（订阅 sha 不变 + 门位对 + 不重启）PASS"
   else
     no "自测：判据④ 通过分支不对" "$out"
-  fi
-  st_stub_reset
-  # ②' 通过：窗口**之前**的旧门位失败事件不算这一笔（真机上池里早先的失败不该记在删上游头上）
-  out=$(
-    TMP_USER=m3-selftest
-    REMOVE_UPSTREAM="203.0.113.10:10007"
-    GATE_WAIT=0.2
-    st_incidents 'hy2_resi_gate_replay_failed@2026-01-01T00:00:00Z'
-    st_stub_set users "$(st_users_with_neighbour 0)"
-    start_hy2_client() { st_fake_client "$@"; }
-    probe_socks_code() { echo 200; }
-    check_remove_upstream
-  )
-  if [[ "$out" == *没有门位同步/重放失败事件* ]]; then
-    ok "自测：判据④ 只看删上游之后的门位事件（窗口前的旧事件不算）"
-  else
-    no "自测：窗口前的旧事件把判据④ 判红了" "$out"
-  fi
-  st_incidents
-  st_stub_reset
-  # ②'' 失败：门位重放报了失败事件 —— 这是判据④ 唯一的**活体**证据：面板的 `hy2ResiGate`
-  # 是期望值，`PUT /proxies/gate-<id>` 失败在那一侧看不出来（spec §3.4 / §5.7）
-  out=$(
-    TMP_USER=m3-selftest
-    REMOVE_UPSTREAM="203.0.113.10:10007"
-    GATE_WAIT=0.2
-    st_incidents hy2_resi_gate_sync_failed hy2_resi_gate_replay_failed
-    st_stub_set users "$(st_users_with_neighbour 0)"
-    start_hy2_client() { st_fake_client "$@"; }
-    probe_socks_code() { echo 200; }
-    check_remove_upstream
-  )
-  if [[ "$out" == *"门位重放报了失败"* && "$out" == *2\ 条* &&
-    "$out" == *hy2_resi_gate_replay_failed* ]]; then
-    ok "自测：判据④（哨兵报了门位同步/重放失败）FAIL"
-  else
-    no "自测：门位重放失败事件没被判出来" "$out"
-  fi
-  st_incidents
-  st_stub_reset
-  # ②''' 失败：`bui incidents --json` 读不出来（守护进程没在跑 / 回包不是 JSON）⇒ 无从核对，
-  # 不许当成「干净」
-  out=$(
-    TMP_USER=m3-selftest
-    REMOVE_UPSTREAM="203.0.113.10:10007"
-    GATE_WAIT=0.2
-    printf 'bui: 连不上 /run/b-ui.sock\n' >"$BASE/incidents.json"
-    st_stub_set users "$(st_users_with_neighbour 0)"
-    start_hy2_client() { st_fake_client "$@"; }
-    probe_socks_code() { echo 200; }
-    check_remove_upstream
-  )
-  if [[ "$out" == *无从核对* ]]; then
-    ok "自测：判据④（读不到 bui incidents）FAIL"
-  else
-    no "自测：读不到事件表却没判失败" "$out"
-  fi
-  st_incidents
-  st_stub_reset
-  # ②'''' 失败：门位是期望值、事件也干净，但未封用户经住宅节点**真打一次打不通**
-  # （选择子指着已删除的槽出站就是这个形态）
-  out=$(
-    TMP_USER=m3-selftest
-    REMOVE_UPSTREAM="203.0.113.10:10007"
-    GATE_WAIT=0.2
-    st_stub_set users "$(st_users_with_neighbour 0)"
-    start_hy2_client() { st_fake_client "$@"; }
-    probe_socks_code() { echo 000; }
-    check_remove_upstream
-  )
-  if [[ "$out" == *"出不了网：门位可能还指着已删除的槽"* ]]; then
-    ok "自测：判据④（未封用户的活体探测不通）FAIL"
-  else
-    no "自测：活体探测不通却没判失败" "$out"
-  fi
-  st_stub_reset
-  # ②''''' 只有一个住宅 HY2 用户（没有第二个未封的）⇒ 活体探测那一项 SKIP，不假装通过
-  out=$(
-    TMP_USER=m3-selftest
-    REMOVE_UPSTREAM="203.0.113.10:10007"
-    GATE_WAIT=0.2
-    st_stub_set users "$(st_tmp_user_json 0)"
-    start_hy2_client() { st_fake_client "$@"; }
-    probe_socks_code() { echo 200; }
-    check_remove_upstream
-  )
-  if [[ "$out" == *"SKIP  step4 门位活体探测"* ]]; then
-    ok "自测：没有第二个未封住宅用户 ⇒ 门位活体探测 SKIP（进摘要的 SKIP 计数）"
-  else
-    no "自测：活体探测没有可用邻居时没 SKIP" "$out"
   fi
   st_stub_reset
   # ③ 失败：删上游把订阅改了（4.0.x 按槽切跳跃段就是这个形态 —— 全员必须刷新订阅）
@@ -2893,6 +2874,207 @@ st_check_remove_upstream() {
     ok "自测：判据④（删上游被面板拒）FAIL"
   else
     no "自测：删上游失败没被判出来" "$out"
+  fi
+  st_stub_reset
+}
+
+# 判据 ④'：两件活体证据**默认就跑**（每个用例都把 REMOVE_UPSTREAM 摆空 —— 这一条要是
+# 又被锁回那个不可逆开关后面，整块就红）。
+st_check_gate_live() {
+  local out
+  # ① 通过：不给 --remove-upstream 也照跑，两项都过（事件干净 + 活体探测 200）
+  out=$(
+    TMP_USER=m3-selftest
+    REMOVE_UPSTREAM=""
+    st_stub_set users "$(st_users_with_neighbour 0)"
+    start_hy2_client() { st_fake_client "$@"; }
+    probe_socks_code() { echo 200; }
+    check_gate_live
+  )
+  if [ "$(printf '%s\n' "$out" | grep -c '^PASS')" = "2" ] &&
+    [ "$(printf '%s\n' "$out" | grep -c '^SKIP')" = "0" ] &&
+    [[ "$out" == *没有门位同步/重放失败事件* && "$out" == *门位活体探测\ 200* ]]; then
+    ok "自测：判据④'（不给 --remove-upstream 也跑：事件干净 + 活体探测通）PASS"
+  else
+    no "自测：判据④' 没在缺省整跑里跑起来（T19 正文那条命令就看不到这两件事）" "$out"
+  fi
+  st_stub_reset
+  # ② 失败：哨兵报了门位同步 / 重放失败 —— 面板的 `hy2ResiGate` 是期望值，
+  # `PUT /proxies/gate-<id>` 失败在那一侧看不出来（spec §3.4 / §5.7）
+  out=$(
+    TMP_USER=m3-selftest
+    REMOVE_UPSTREAM=""
+    st_incidents hy2_resi_gate_sync_failed hy2_resi_gate_replay_failed
+    st_stub_set users "$(st_users_with_neighbour 0)"
+    start_hy2_client() { st_fake_client "$@"; }
+    probe_socks_code() { echo 200; }
+    check_gate_live
+  )
+  if [[ "$out" == *"门位重放报了失败"* && "$out" == *2\ 条* &&
+    "$out" == *hy2_resi_gate_replay_failed* ]]; then
+    ok "自测：判据④'（哨兵报了门位同步/重放失败）FAIL"
+  else
+    no "自测：门位重放失败事件没被判出来" "$out"
+  fi
+  st_incidents
+  st_stub_reset
+  # ③ 通过：窗口**之前**的旧门位失败事件不算这一笔（池里早先的失败不该记在本次头上）
+  out=$(
+    TMP_USER=m3-selftest
+    REMOVE_UPSTREAM=""
+    st_incidents 'hy2_resi_gate_replay_failed@2026-01-01T00:00:00Z'
+    st_stub_set users "$(st_users_with_neighbour 0)"
+    start_hy2_client() { st_fake_client "$@"; }
+    probe_socks_code() { echo 200; }
+    check_gate_live
+  )
+  if [[ "$out" == *没有门位同步/重放失败事件* ]]; then
+    ok "自测：判据④' 只看脚本开跑之后的门位事件（窗口前的旧事件不算）"
+  else
+    no "自测：窗口前的旧事件把判据④' 判红了" "$out"
+  fi
+  st_incidents
+  st_stub_reset
+  # ④ 失败：事件窗口的**方向**。GATE_SINCE 是脚本加载时取的 ⇒ 必须盖住开跑之后落的一切
+  # 门位失败事件。这一格**不覆盖 GATE_SINCE**，专门钉「起点被挪到动作之后」那种变异
+  # （挪到 `sleep "$GATE_WAIT"` 之后 / 挪进 check_gate_live 里）：事件时刻取
+  # `GATE_SINCE + 1`（开跑之后、此刻之前），起点一挪晚这条就被过滤掉、判据 ④' 恒绿。
+  while [ "$(($(date +%s) - GATE_SINCE))" -lt 2 ]; do sleep 0.5; done
+  out=$(
+    TMP_USER=m3-selftest
+    REMOVE_UPSTREAM=""
+    st_incidents "hy2_resi_gate_replay_failed@$(date -u -d "@$((GATE_SINCE + 1))" +%Y-%m-%dT%H:%M:%SZ)"
+    st_stub_set users "$(st_users_with_neighbour 0)"
+    start_hy2_client() { st_fake_client "$@"; }
+    probe_socks_code() { echo 200; }
+    check_gate_live
+  )
+  if [[ "$out" == *"门位重放报了失败"* ]]; then
+    ok "自测：判据④' 的事件窗口起点早于脚本的一切动作（起点取晚了就漏掉这条）"
+  else
+    no "自测：窗口起点被挪晚了 —— 开跑后落的门位失败事件没被判出来" "$out"
+  fi
+  st_incidents
+  st_stub_reset
+  # ④' 同一个方向，但走完整次序（删上游 → 等门位收敛 → 才量证据）：起点被挪进删上游那一步
+  # （尤其挪到 `sleep "$GATE_WAIT"` 之后）时，正要盯的那一段失败事件同样会被过滤掉。
+  # GATE_WAIT 给 2 秒 ⇒ 挪晚后的起点必然大于事件时刻（`date` 只到秒）
+  out=$(
+    TMP_USER=m3-selftest
+    REMOVE_UPSTREAM="203.0.113.10:10007"
+    GATE_WAIT=2
+    st_incidents "hy2_resi_gate_replay_failed@$(date -u -d "@$((GATE_SINCE + 1))" +%Y-%m-%dT%H:%M:%SZ)"
+    st_stub_set users "$(st_users_with_neighbour 0)"
+    start_hy2_client() { st_fake_client "$@"; }
+    probe_socks_code() { echo 200; }
+    check_remove_upstream >/dev/null
+    check_gate_live
+  )
+  if [[ "$out" == *"门位重放报了失败"* ]]; then
+    ok "自测：窗口起点不许挪到删上游/门位收敛之后（挪了这条就漏）"
+  else
+    no "自测：起点挪到删上游那一段之后 —— 门位重放失败事件被窗口过滤掉了" "$out"
+  fi
+  st_incidents
+  st_stub_reset
+  # ⑤ 失败：`bui incidents --json` 读不出来（守护进程没在跑 / 回包不是 JSON）⇒ 无从核对，
+  # 不许当成「干净」
+  out=$(
+    TMP_USER=m3-selftest
+    REMOVE_UPSTREAM=""
+    printf 'bui: 连不上 /run/b-ui.sock\n' >"$BASE/incidents.json"
+    st_stub_set users "$(st_users_with_neighbour 0)"
+    start_hy2_client() { st_fake_client "$@"; }
+    probe_socks_code() { echo 200; }
+    check_gate_live
+  )
+  if [[ "$out" == *无从核对* ]]; then
+    ok "自测：判据④'（读不到 bui incidents）FAIL"
+  else
+    no "自测：读不到事件表却没判失败" "$out"
+  fi
+  st_incidents
+  st_stub_reset
+  # ⑥ 失败：事件干净，但未封用户经住宅节点**真打一次打不通**（门位还指着已删除的槽
+  # 出站就是这个形态）
+  out=$(
+    TMP_USER=m3-selftest
+    REMOVE_UPSTREAM=""
+    st_stub_set users "$(st_users_with_neighbour 0)"
+    start_hy2_client() { st_fake_client "$@"; }
+    probe_socks_code() { echo 000; }
+    check_gate_live
+  )
+  if [[ "$out" == *"出不了网：门位可能还指着已删除的槽"* ]]; then
+    ok "自测：判据④'（未封用户的活体探测不通）FAIL"
+  else
+    no "自测：活体探测不通却没判失败" "$out"
+  fi
+  st_stub_reset
+  # ⑦ 池空 ⇒ 活体探测没有判别力（中继 fail-open 全部直连，门位对不对都回 200）⇒ SKIP。
+  # 这正是「把池里最后一条上游删掉」之后的局面：探测回 200 是假 PASS
+  out=$(
+    TMP_USER=m3-selftest
+    REMOVE_UPSTREAM=""
+    st_stub_set users "$(st_users_with_neighbour 0)"
+    st_stub_set upstreams '[]'
+    start_hy2_client() { st_fake_client "$@"; }
+    probe_socks_code() { echo 200; }
+    check_gate_live
+  )
+  if [[ "$out" == *"SKIP  step4' 门位活体探测（池无效"* && "$out" != *活体探测\ 200* ]]; then
+    ok "自测：池空 ⇒ 门位活体探测 SKIP（不拿 fail-open 的 200 当证据）"
+  else
+    no "自测：池空了还拿活体探测的 200 当通过" "$out"
+  fi
+  st_stub_reset
+  # ⑦' 池里有上游、但住宅开关关着（`status.enabled` = `pool_active()` 为假）⇒ 同样是
+  # fail-open 全直连，同样没有判别力：光数 `upstreams` 行数会漏掉这一种
+  out=$(
+    TMP_USER=m3-selftest
+    REMOVE_UPSTREAM=""
+    st_stub_set users "$(st_users_with_neighbour 0)"
+    st_stub_set resi_enabled false
+    start_hy2_client() { st_fake_client "$@"; }
+    probe_socks_code() { echo 200; }
+    check_gate_live
+  )
+  if [[ "$out" == *"SKIP  step4' 门位活体探测（池无效"* && "$out" != *活体探测\ 200* ]]; then
+    ok "自测：住宅开关关着（池无效）⇒ 门位活体探测 SKIP"
+  else
+    no "自测：池无效（开关关着）却拿活体探测的 200 当通过" "$out"
+  fi
+  st_stub_reset
+  # ⑧ 读不到上游数（`/api/residential/status` 没有 `upstreams`）⇒ 同样 SKIP：
+  # 判不出探测有没有判别力，就不能拿它的 200 当证据
+  out=$(
+    TMP_USER=m3-selftest
+    REMOVE_UPSTREAM=""
+    st_stub_set users "$(st_users_with_neighbour 0)"
+    st_stub_set upstreams null
+    start_hy2_client() { st_fake_client "$@"; }
+    probe_socks_code() { echo 200; }
+    check_gate_live
+  )
+  if [[ "$out" == *"读不到 GET /api/residential/status"* && "$out" != *活体探测\ 200* ]]; then
+    ok "自测：读不到上游数 ⇒ 门位活体探测 SKIP"
+  else
+    no "自测：读不到上游数却照样拿探测结果当证据" "$out"
+  fi
+  st_stub_reset
+  # ⑨ 只有一个住宅 HY2 用户（没有第二个未封的）⇒ 活体探测那一项 SKIP，不假装通过
+  out=$(
+    TMP_USER=m3-selftest
+    REMOVE_UPSTREAM=""
+    st_stub_set users "$(st_tmp_user_json 0)"
+    start_hy2_client() { st_fake_client "$@"; }
+    probe_socks_code() { echo 200; }
+    check_gate_live
+  )
+  if [[ "$out" == *"SKIP  step4' 门位活体探测（没有第二个未封"* ]]; then
+    ok "自测：没有第二个未封住宅用户 ⇒ 门位活体探测 SKIP（进摘要的 SKIP 计数）"
+  else
+    no "自测：活体探测没有可用邻居时没 SKIP" "$out"
   fi
   st_stub_reset
 }
@@ -2948,6 +3130,7 @@ self_test() {
   st_check_expiry
   st_summary_counts
   st_check_remove_upstream
+  st_check_gate_live
   st_check_restart
   st_check_cleanup
   st_teardown
@@ -2955,6 +3138,8 @@ self_test() {
 
 usage() {
   printf '用法：%s [--self-test] [--strict] [--admin-password-file <文件>] [--download-url <url>] [--keep-url <url>] [--base <目录>] [--remove-upstream <host:port|uuid|resi-N>]\n' "$0" >&2
+  printf '  --keep-url  保活源必须回 200 且只有几 KB（字节数进判据 ② 的计数）。同一个 URL 在不同出口 IP 上结果不一样（Cloudflare 的 __down 在开发机 200、在 rick 实测 403）⇒ staging 跑判据 ①–④ 前先用 --keep-url 钉一个在那台机器上实测回 200 的小文件\n' >&2
+  printf '  --remove-upstream  不可逆（上游凭据删了取不回来），而且只在池里 ≥2 条上游时用：删成空池后中继 fail-open 全部直连，判据 ④'"'"' 的门位活体探测无论门位对不对都回 200（那时它会 SKIP，不会假 PASS）\n' >&2
   exit 2
 }
 

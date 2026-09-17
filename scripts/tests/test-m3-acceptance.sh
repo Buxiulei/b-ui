@@ -24,7 +24,7 @@ assert_contains "判据②（/api/nodes 里没有住宅 HY2 节点）SKIP" "$out
     "判据② 的静默 SKIP 路径有用例"
 
 # 自测里每条判据的断言标签都以「PASS」或「FAIL」收尾，分别对应被测分支
-for c in 判据① 判据② 判据③ 判据④ 判据⑤; do
+for c in 判据① 判据② 判据③ 判据④ "判据④'" 判据⑤; do
     p=$(printf '%s\n' "$out" | grep -c "^PASS.*$c.*PASS$")
     f=$(printf '%s\n' "$out" | grep -c "^PASS.*$c.*FAIL$")
     assert_eq "1" "$([[ "$p" -ge 1 ]] && echo 1 || echo 0)" "$c 的通过分支有断言（实测 $p 条）"
@@ -38,11 +38,41 @@ assert_contains "判据③（住宅握手被拒）FAIL" "$out" "住宅连握手�
 assert_contains "内核单元固定三项" "$out" "KERNEL_UNITS 回固定三项有断言"
 
 # 判据④ 的门位那一项只比「面板算出的期望门位」（真机上几乎恒真）⇒ 必须另有活体证据：
-# 哨兵的门位同步/重放失败事件 + 未封用户真打一次住宅节点（spec §3.4 / §6）
-assert_contains "判据④（哨兵报了门位同步/重放失败）FAIL" "$out" "门位重放失败事件有失败分支"
-assert_contains "判据④（读不到 bui incidents）FAIL" "$out" "读不到事件表算失败而不是干净"
-assert_contains "判据④（未封用户的活体探测不通）FAIL" "$out" "门位活体探测有失败分支"
-assert_contains "判据④ 只看删上游之后的门位事件" "$out" "事件窗口的起点有断言"
+# 哨兵的门位同步/重放失败事件 + 未封用户真打一次住宅节点（spec §3.4 / §6）。
+# 这两件只读证据是判据 ④'，**默认就跑**：锁在不可逆的 --remove-upstream 后面就等于
+# 缺省整跑与 T19 正文那条命令都看不到它们
+assert_contains "判据④'（不给 --remove-upstream 也跑：事件干净 + 活体探测通）PASS" "$out" \
+    "判据④' 默认就跑（不需要 --remove-upstream）有断言"
+assert_contains "判据④'（哨兵报了门位同步/重放失败）FAIL" "$out" "门位重放失败事件有失败分支"
+assert_contains "判据④'（读不到 bui incidents）FAIL" "$out" "读不到事件表算失败而不是干净"
+assert_contains "判据④'（未封用户的活体探测不通）FAIL" "$out" "门位活体探测有失败分支"
+assert_contains "判据④' 只看脚本开跑之后的门位事件" "$out" "事件窗口的起点有断言"
+assert_contains "判据④' 的事件窗口起点早于脚本的一切动作" "$out" "事件窗口起点的方向有断言"
+assert_contains "窗口起点不许挪到删上游/门位收敛之后" "$out" \
+    "起点挪到 sleep GATE_WAIT 之后这种变异有用例钉住"
+# 删到池空 ⇒ 中继 fail-open 全部直连，活体探测无论门位对不对都 200（假 PASS）⇒ 必须 SKIP
+assert_contains "池空 ⇒ 门位活体探测 SKIP" "$out" "池空时活体探测 SKIP 有断言"
+assert_contains "住宅开关关着（池无效）⇒ 门位活体探测 SKIP" "$out" \
+    "池无效（开关关着）时活体探测 SKIP 有断言"
+assert_contains "读不到上游数 ⇒ 门位活体探测 SKIP" "$out" "读不到上游数时活体探测 SKIP 有断言"
+# 判据④' 是独立的一项：它的两件证据不许再出现在删上游那一步里（回退就等于又被锁上）
+assert_eq "1" "$(grep -c '^check_gate_live() {' "$ROOT/scripts/m3-acceptance.sh")" \
+    "活体证据独立成 check_gate_live"
+assert_eq "1" "$(grep -c '^  check_gate_live$' "$ROOT/scripts/m3-acceptance.sh")" \
+    "check_gate_live 进了 run_checks（默认整跑就跑）"
+
+# CLAUDE.md 的 scripts/ 约定：`#!/usr/bin/env bash` + `LC_ALL=C`
+assert_eq "1" "$(grep -c '^LC_ALL=C$' "$ROOT/scripts/m3-acceptance.sh")" "脚本带 LC_ALL=C"
+
+# 缺省保活源不许是脚本自己注释里记着「rick 实测 403」的那个（判据 ①③④' 都拿 200 当通路证据）
+assert_eq "0" "$(grep -c '^KEEP_URL=.*speed\.cloudflare\.com' "$ROOT/scripts/m3-acceptance.sh")" \
+    "缺省 --keep-url 不指向实测 403 的源"
+
+# 帮助文本要点明两件真机上会踩的事：--keep-url 的源必须实测 200、--remove-upstream 只在
+# 池里 ≥2 条上游时开
+out2=$(bash "$ROOT/scripts/m3-acceptance.sh" --keep-url 2>&1)
+assert_contains "实测回 200" "$out2" "用法点明 --keep-url 要钉一个实测 200 的源"
+assert_contains "≥2 条上游" "$out2" "用法点明 --remove-upstream 只在池里 ≥2 条上游时用"
 
 # 归零测量的三个辅助（复核里四个变异全存活的那几处）
 assert_contains "online_count 回显空（fail-closed）" "$out" "online_count 读不到时不当成归零"
