@@ -6,7 +6,7 @@
 
 轻量级 Hysteria2 + Xray 多协议代理一键部署工具，内置 Web 管理面板与全功能流量管理。
 
-**当前版本**: v4.0.1（Rust 单二进制；版本号唯一来源是根 `Cargo.toml` 的 `[workspace.package] version`）
+**当前版本**: v4.0.2（Rust 单二进制；版本号唯一来源是根 `Cargo.toml` 的 `[workspace.package] version`）
 
 ---
 
@@ -309,7 +309,7 @@ IP 后区间按槽位切开，服务端会点名需要重新拉订阅的用户�
 `bui-c` 无参数运行即进数字菜单（Rust 渲染，零外部依赖）：
 
 ```
-  ── B-UI 客户端 v4.0.1 ──
+  ── B-UI 客户端 v4.0.2 ──
 
    节点   ●  运行中  alice-reality-direct
           Reality直连  reality-direct  panel.example.com:10001
