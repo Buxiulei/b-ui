@@ -386,6 +386,9 @@ Clash API 客户端复用 `modules/residential/clash.rs` 的 `Clash` trait（`re
 - **`bui set hy2-auth http|command`**：只重渲染直连 `config.yaml`、只重启 `hysteria-server`；CLI 帮助与 `bui status` 的「HY2 鉴权」行注明「仅直连」。
 - **m1 判据变化**（`scripts/m1-acceptance.sh`：`hy2_auth_probe` 在 `:219`、`check_hy2_auth` 在 `:278`、住宅探测调用在 `:305`）：直连探测不变（bundled hysteria 客户端 → https 200 → `auth-hook.log` 末行 `allow`，`:215`）；**住宅探测改为**用该用户的住宅凭据（`name:secret`）连 `127.0.0.1:40000` → https 200，且 `journalctl -u hysteria-residential --since <探测起点>` 出现 `[<name>] inbound connection`；再加一步带 `mport=41000-50000` 打回环，验 nft 的 **output** 链。
 - **m3 判据变化**（`scripts/m3-acceptance.sh`）：① 加用户 → 三个内核单元 `NRestarts` / `MainPID` 不变（`KERNEL_UNITS` 回固定三项，删 `:67`、`:73-76`、`:1306-1310` 的按槽枚举）且邻居会话不断；② 100 MB 计数误差 ≤ 1%（住宅经 v2ray_api）；③ 到期：**新握手仍成功**但 10 秒内经它的请求全部失败、同槽其他用户客户端 `connected` 计数不变、`/connections` 里该用户条数归零（`:828-833` 那两条读 `auth-hook.log` 的断言只对直连保留）；④ 删一个上游 → 任一用户三种订阅 sha 不变、门位重放正确（`bui residential slots --json` 里每个用户的 `gate` 与期望一致）。
+  - **实现口径回写（2026-09-17，与上面这一行的逐字表述有两处偏离）**：
+    - ③ 的「`/connections` 里该用户条数归零」只能经 `GET /api/online` 观察（面板把直连 `/online` 与住宅 `/connections` 归一成「这个人在线」、值恒为 1、不在线的人不进表，`panel/traffic.rs`），所以脚本判的是「该用户从 `/api/online` 消失且连续三轮确认」；而且**必须先收掉他的直连通路再量**——合并表里只要直连会话还挂着就一直非零，与住宅门位切没切干净无关。
+    - ④ 的门位**不读** `bui residential slots --json`：`SlotRow`（`modules/residential/api.rs`）没有 per-user 门位字段，per-user 门位只在 `GET /api/users` 的 `hy2ResiGate`。但它与脚本的期望值同源（都是 `panel::gates::expected`）⇒ 这一项在真机上几乎恒真，抓不到本节要盯的「Clash API 的 select 重放失败」。因此判据④ 另加两件**活体**证据：`bui incidents --json` 里删上游之后没有 `hy2_resi_gate_sync_failed` / `hy2_resi_gate_replay_failed`（§5.7 的签名），且一个**未封**住宅 HY2 用户用池凭据真连一次 `ports.hy2_resi` 仍出得网。要直接读「内核里当前的门位」需要一个透出中继 Clash `/proxies` 的管理端点，今天没有。
 
 ---
 
