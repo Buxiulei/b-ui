@@ -240,9 +240,12 @@ tonic 客户端，proto 从 Xray-core `v26.3.27` vendor 进仓（以仓库根为
 运维提前收口：`bui set legacy-sub off`（置 `None`）或 `bui set legacy-sub <RFC3339>`；`bui status` 有「旧订阅链接」一行。
 
 **轮换**：`POST /api/users/{name}/rotate`（管理员鉴权内，body 空对象；面板配置弹窗里的「重置订阅链接与凭据」，
-二次确认）四件事一起做：换 `sub_token`、换 `hy2_password` / `vless_uuid`、把 `legacy_sub_disabled` 置 true
+二次确认）**五件事**一起做（第 5 件自 4.1 起，见 `2026-09-15-hy2-singbox-residential-design.md` §6 / §7.4）：换 `sub_token`、换 `hy2_password` / `vless_uuid`、把 `legacy_sub_disabled` 置 true
 （全局宽限期没到也立刻停用他的用户名链接）、踢掉他已建立的 hy2 会话（两条鉴权路径都只在握手时鉴权；
-先发 `StateChanged("users")` 再按 `traffic::stats_ports` 逐个 hy2 实例 kick，best-effort，失败只记 warn）。
+先发 `StateChanged("users")` 再按 `traffic::stats_ports` 逐个 hy2 实例 kick，best-effort，失败只记 warn）、
+**置换住宅 HY2 的池凭据并当场切门**（4.1 起：住宅密码不在 `credentials` 而在 `hy2_pool`，所以只换 `hy2_password` 对住宅链接无效；
+显式 `hy2pool::release`（记 `released_at`、24 小时冷却）再 `slots::assign_hy2_cred`，随后两次 `PUT`——旧门当场 `deny` 掐存量流、新门开到本槽；
+`hy2-residential.json` 一字节不动。代价是住宅账号名从用户名变成 `rNNN`，Linux 客户端要重新导入**并切换**，见 §7.4）。
 回包给出新 token 与新凭据（与 `create_user` 同口径）。uuid 变化必须让 xray 当场生效
 （`render::xray::structural_hash` 剥掉了 clients，对账不会因此重启 xray）：`panel::users::sync_users`
 先经 `GetInboundUsers`（`XrayApi::inbound_user_uuid`）**读内核**当前挂的 uuid——等于期望值就不发写请求，

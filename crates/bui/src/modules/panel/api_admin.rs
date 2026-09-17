@@ -1298,6 +1298,8 @@ mod tests {
             "第一个新节点",
             "菜单 [1]",
             "bui-c switch",
+            "新增的只有住宅 HY2",
+            "HY2 直连是原地更新、不新增",
         ] {
             assert!(
                 notice.contains(must),

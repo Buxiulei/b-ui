@@ -5,7 +5,7 @@
 //! 4.1：住宅 HY2 从「每槽一个 apernet hysteria 实例 + 一份 `config-residential[-<i>].yaml`」
 //! 换成**一份** sing-box 配置 `hy2-residential.json`（`render::hy2_singbox`），全部
 //! `config-residential*.yaml` 产 `Absent`。那份 JSON 的内容与用户无关（凭据池 + 门 + 槽出站），
-//! 所以**不用 `restart_key`**：它只会因池扩容 / obfs / 证书 / 端口这四件事变化（spec §3.5），
+//! 所以**不用 `restart_key`**：它只会因池扩容 / obfs / 证书 / 端口 / 伪装域这五件事变化（spec §3.5），
 //! 用户的生命周期动作一律走 Clash API 切门、一个字节都不许改它。
 //!
 //! 除 Caddyfile 之外的每份配置都**原样**落 `bui-schema` 的渲染结果（总纲 C1）：P1 绝不自己
@@ -215,7 +215,7 @@ impl Module for CoreFilesModule {
             .restart(Unit::restart("hysteria-server")),
         );
         // 住宅 HY2：一份 sing-box 配置（spec §2.3）。**没有 `restart_key`** —— 文件内容与
-        // 用户无关，改了就是那四件事之一，该重启（spec §3.5）。
+        // 用户无关，改了就是那五件事之一，该重启（spec §3.5）。
         out.push(
             Artifact::file(
                 hy2_resi_config_path(p),

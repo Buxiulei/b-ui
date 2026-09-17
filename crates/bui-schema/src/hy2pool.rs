@@ -105,7 +105,7 @@ pub fn cred_of<'a>(u: &User, r: &'a Residential) -> Option<&'a ReservedCred> {
 
 /// 重随机全部空闲凭据的 `secret` 并清 `released_at`，返回改动条数。
 ///
-/// 每次因 spec §3.5 四件事重写配置时顺带做：空闲凭据的旧密码只有前任持有人知道，
+/// 每次因 spec §3.5 那五件事重写配置时顺带做：空闲凭据的旧密码只有前任持有人知道，
 /// 重启是唯一能换掉它的时机。**在用的（`used` 里的）一条都不动。**
 pub fn regenerate_idle_secrets(p: &mut Hy2Pool, used: &BTreeSet<String>) -> usize {
     let mut n = 0;

@@ -261,7 +261,7 @@ pub async fn migrate_hy2_pool_on_start(ctx: &DaemonCtx) -> anyhow::Result<PoolMi
 }
 
 /// 对账前的期望态整备（spec §3.1 第三道防线）：`hy2-residential.json` 这一轮**本来就要
-/// 重写**（§3.5 的四件事之一 ⇒ 住宅内核要重启）时，顺带把**空闲**凭据的 `secret` 重随机。
+/// 重写**（§3.5 的那五件事之一 ⇒ 住宅内核要重启）时，顺带把**空闲**凭据的 `secret` 重随机。
 /// 返回换掉的条数。
 ///
 /// 为什么非做不可：被 `release` 掉的凭据只有 24 小时冷却期这一道屏障，冷却期一过它就
@@ -1603,7 +1603,7 @@ mod tests {
         assert_eq!(err.level, Level::Error);
     }
 
-    /// spec §3.1 的第三道防线：`hy2-residential.json` 这一轮本来就要重写（§3.5 四件事之一，
+    /// spec §3.1 的第三道防线：`hy2-residential.json` 这一轮本来就要重写（§3.5 那五件事之一，
     /// 这里用池扩容）⇒ 落盘前把**空闲**凭据的 secret 重随机、`released_at` 清掉；
     /// **在用的那一条一个字节都不许动**（动了就是把在线用户踢下线）。
     ///
@@ -1662,7 +1662,7 @@ mod tests {
         );
         assert_eq!(secrets(&store.read().await.clone()), before, "零变更");
 
-        // 池扩容（spec §3.5 四件事之一）⇒ 渲染结果与盘上不一致，这一轮本来就要重写
+        // 池扩容（spec §3.5 那五件事之一）⇒ 渲染结果与盘上不一致，这一轮本来就要重写
         store
             .update(|s| {
                 s.residential

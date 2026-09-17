@@ -312,7 +312,7 @@ mod tests {
         );
     }
 
-    /// 文件内容与用户无关：只有 §3.5 的四件事能改它
+    /// 文件内容与用户无关：只有 §3.5 的那五件事能改它
     #[test]
     fn obfs_and_the_pool_are_the_only_things_that_change_the_bytes() {
         let (n, p) = (node(), Paths::default_server());

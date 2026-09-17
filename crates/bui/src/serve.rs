@@ -177,7 +177,7 @@ pub async fn reconcile_from_ctx(
     force: bool,
     dry_run: bool,
 ) -> anyhow::Result<ReconcileReport> {
-    // spec §3.1 第三道防线：这一轮本来就要重写 `hy2-residential.json`（§3.5 四件事之一）
+    // spec §3.1 第三道防线：这一轮本来就要重写 `hy2-residential.json`（§3.5 那五件事之一）
     // ⇒ 落盘前先把空闲凭据的 secret 重随机。放在读期望态之前：它自己也改期望态。
     // `--dry-run` 一个字节都不许写。
     if !dry_run {
@@ -1850,7 +1850,7 @@ mod tests {
             "文件不变的那一轮不许换 secret —— 换了就是每轮对账都重启一次住宅内核"
         );
 
-        // 池扩容（spec §3.5 四件事之一）⇒ 这一轮本来就要重写 `hy2-residential.json`
+        // 池扩容（spec §3.5 那五件事之一）⇒ 这一轮本来就要重写 `hy2-residential.json`
         ctx.store
             .update(|s| {
                 s.residential
