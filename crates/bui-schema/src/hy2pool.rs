@@ -32,9 +32,12 @@ pub fn size_for(users: usize) -> usize {
     (users.saturating_mul(2).div_ceil(16) * 16).clamp(POOL_MIN, POOL_MAX)
 }
 
-/// 「有住宅权益且开 hysteria2」的用户数 —— 池容量的基数。
+/// 「有住宅 HY2」的用户数 —— 池容量的基数。判据只有 [`is_resi_hy2`] 一处。
 pub fn resi_hy2_users(s: &State) -> usize {
-    s.users.iter().filter(|u| is_resi_hy2(u)).count()
+    s.users
+        .iter()
+        .filter(|u| is_resi_hy2(u, &s.residential))
+        .count()
 }
 
 /// 把池补到 `target` 条（上限 [`POOL_MAX`]），返回新增条数。
@@ -204,7 +207,7 @@ pub fn migrate(s: &mut State, now: OffsetDateTime) -> MigrateReport {
     let mut pending: Vec<Uuid> = s
         .users
         .iter()
-        .filter(|u| is_resi_hy2(u) && u.credentials.hy2_resi_cred.is_none())
+        .filter(|u| is_resi_hy2(u, &s.residential) && u.credentials.hy2_resi_cred.is_none())
         .map(|u| u.user_id)
         .collect();
     changed += assign_pending(s, &mut pending, now);
@@ -227,9 +230,23 @@ fn assign_pending(s: &mut State, pending: &mut Vec<Uuid>, now: OffsetDateTime) -
     before - pending.len()
 }
 
-/// 「有住宅权益且开 hysteria2」—— 池容量、迁移与门位收敛共用的判据。
-fn is_resi_hy2(u: &User) -> bool {
-    u.entitlements.residential.is_some() && u.entitlements.protocols.contains(&Protocol::Hysteria2)
+/// 「有住宅权益、权益指向的分组真实存在、且开了 hysteria2」—— **住宅 HY2 的唯一判据**。
+///
+/// 池容量、迁移分凭据、门位收敛（`panel::gates::expected`）、建号 / 轮换分凭据、面板投影
+/// 与踢人全用这一处（2026-09-16 裁决：4.0.x 起这里曾有两套 —— 本函数不看分组、`bui` 侧的
+/// `gates::has_resi_hy2` 看分组，T15 合成一处，取更严的那个）。分头写两遍就会漂移成
+/// 「门开着但没凭据」或「有凭据但门不开」。
+///
+/// **分组存在性不能省**：[`nodes::nodes_for`](crate::nodes::nodes_for) 的 `resi_ok` 也要求
+/// `resi.groups.contains_key(&e.group_id)`，`group_id` 悬空时（人工改 `state.json`、分组被删）
+/// 订阅里已经不发住宅 HY2 节点了。凭据与门是授权落点，取两者里更严的那个 —— 少了这一条，
+/// 拿着旧订阅的人会继续从住宅 IP 出海。
+pub fn is_resi_hy2(u: &User, r: &Residential) -> bool {
+    u.entitlements
+        .residential
+        .as_ref()
+        .is_some_and(|e| r.groups.contains_key(&e.group_id))
+        && u.entitlements.protocols.contains(&Protocol::Hysteria2)
 }
 
 /// 住宅 hysteria2 用户的 id，按 `created_at` 升序（同刻按 `state.json` 里的原序）。
@@ -237,7 +254,7 @@ fn in_creation_order(s: &State) -> Vec<Uuid> {
     let mut v: Vec<(&str, Uuid)> = s
         .users
         .iter()
-        .filter(|u| is_resi_hy2(u))
+        .filter(|u| is_resi_hy2(u, &s.residential))
         .map(|u| (u.created_at.as_str(), u.user_id))
         .collect();
     v.sort_by_key(|(t, _)| *t); // 稳定排序：同一时刻保持原序
@@ -337,6 +354,44 @@ mod tests {
             .map(|i| user(i + 1, &format!("u{i}"), true))
             .collect();
         s
+    }
+
+    /// 判据合成一处（T15）：`is_resi_hy2` 必须**同时**要求住宅权益、分组真实存在、开了
+    /// hysteria2。4.0.x 这里有两套 —— 本 crate 的旧版不看分组存在性、`bui` 侧
+    /// `gates::has_resi_hy2` 看，于是 `group_id` 悬空的用户会「有凭据但门永远 deny」：
+    /// 白占一个门位、`bui status` 的池用量偏高，而他的订阅里本来就没有住宅 HY2 节点
+    /// （`nodes_for` 的 `resi_ok` 同样要求分组存在）。
+    #[test]
+    fn the_residential_hy2_predicate_also_requires_the_group_to_exist() {
+        let mut s = state(2);
+        assert_eq!(resi_hy2_users(&s), 2);
+        assert!(is_resi_hy2(&s.users[0], &s.residential));
+
+        // ① 分组悬空（人工改 state、分组被删）⇒ 既不算基数，也分不到凭据
+        s.users[1].entitlements.residential = Some(ResidentialEntitlement {
+            group_id: "gone".into(),
+            slot_id: None,
+        });
+        assert!(!is_resi_hy2(&s.users[1], &s.residential), "分组不存在");
+        assert_eq!(resi_hy2_users(&s), 1, "悬空分组的用户不进池容量基数");
+        let r = migrate(&mut s, datetime!(2026-09-15 00:00 UTC));
+        assert_eq!(r.changed, 1, "只给 u0 发凭据");
+        assert!(cred_of(&s.users[0], &s.residential).is_some());
+        assert!(
+            s.users[1].credentials.hy2_resi_cred.is_none(),
+            "分组悬空的用户不许占门位"
+        );
+
+        // ② 没有住宅权益、或没开 hysteria2 ⇒ 同样不算
+        let mut plain = user(7, "no-resi", false);
+        assert!(!is_resi_hy2(&plain, &s.residential));
+        plain.entitlements.residential = Some(ResidentialEntitlement {
+            group_id: DEFAULT_GROUP.into(),
+            slot_id: None,
+        });
+        assert!(is_resi_hy2(&plain, &s.residential));
+        plain.entitlements.protocols = vec![Protocol::Reality];
+        assert!(!is_resi_hy2(&plain, &s.residential), "没开 hysteria2");
     }
 
     /// 池容量始终 ≥ 2 倍用户数，向上取到 16 的倍数，并夹在 [32, 256]（spec §3.1、§14 裁决 2）

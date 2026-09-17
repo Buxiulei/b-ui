@@ -363,6 +363,11 @@ fn cleanup_with(host: &dyn Host, config: &Path, backend: Option<&str>) -> Vec<St
     done
 }
 
+/// [`cleanup_legacy_residential`] 每轮探测多少份 4.0 的按槽配置：槽 0..7 共
+/// [`crate::reconcile::MAX_RESI_SLOTS`] 份（`config-residential.yaml` 与
+/// `config-residential-1..7.yaml`）。与那条清理路径同生共死，见它的「下线判据」一节。
+const RESI_CONFIGS_PER_ROUND: u16 = crate::reconcile::MAX_RESI_SLOTS;
+
 /// 4.0 的按槽住宅实例（`hysteria-residential[-<i>]`，apernet）留下的端口跳跃 NAT 规则：
 /// 对**每份仍在盘上**的 `config-residential[-<i>].yaml` 各调一次 [`cleanup`]。
 ///
@@ -377,9 +382,21 @@ fn cleanup_with(host: &dyn Host, config: &Path, backend: Option<&str>) -> Vec<St
 /// 不挂在 `Change::ApplyNftTable` 上 —— 「4.1 落过表 → `--rollback` 回 4.0（不删表）→
 /// 再升 4.1」这条路上哈希与表都没变、不产变更，挂在变更上就一次清理都不跑。
 /// 配置已经不在盘上 = 上一轮已经清过 = 什么都不做，于是它对「二次对账零变更」无影响。
+///
+/// # 下线判据（T15 定，别让它永久留在热路径上）
+///
+/// 这是一条**纯 4.0 遗留清理路径**：稳态下每轮对账白跑 8 次 `read_file` 探测（零命令、
+/// 零 note、零变更）。它的寿命与那七个遗留单元绑在一起 —— **`hysteria-residential-<i>.service`
+/// 从 [`crate::reconcile::LEGACY_UNITS`] 里摘掉的那一刻，本函数、[`RESI_CONFIGS_PER_ROUND`]、
+/// 它在 `reconcile::apply` 第 7.5 步的调用点与
+/// [`tests::the_legacy_residential_cleanup_retires_with_the_legacy_units`] 一起删**。
+/// 那张名单本身的下线条件是「全部在役机器都升过 4.1、`config-residential*.yaml` 与那些单元
+/// 在任一机器上都不再出现」，与兼容段 `40001-40007` 的下线（连续 30 天零命中 + 提前 30 天
+/// 通知，spec §2.4）各算各的 —— 兼容段管的是**客户端**手里的旧订阅，这里管的是**服务端**
+/// 盘上的旧 NAT 规则。那条断言用例就是这个判据的机器可验形式：谁摘名单，它当场红。
 pub fn cleanup_legacy_residential(host: &dyn Host, paths: &Paths) -> Vec<String> {
     let mut done = Vec::new();
-    for i in 0..crate::reconcile::MAX_RESI_SLOTS {
+    for i in 0..RESI_CONFIGS_PER_ROUND {
         let cfg = crate::modules::core_files::resi_config_path(paths, i);
         if host.read_file(&cfg).unwrap_or_default().is_none() {
             continue;
@@ -1270,6 +1287,31 @@ table ip6 hysteria_4d4d4d4d
 -A PREROUTING -p udp -m udp --dport 45500:50000 -j HYSTERIA-PR-7c1e0f2a
 -A HYSTERIA-PR-7c1e0f2a -p udp -j REDIRECT --to-ports 40002
 ";
+
+    /// 下线判据的机器可验形式（T15）：[`cleanup_legacy_residential`] 是纯 4.0 遗留清理
+    /// 路径，稳态每轮白跑 8 次 `read_file`。它的寿命与那七个遗留单元绑死 ——
+    /// 谁把 `hysteria-residential-<i>.service` 从 [`crate::reconcile::LEGACY_UNITS`]
+    /// 里摘掉，这条用例当场红，提醒他把那条清理路径（函数本体 + `RESI_CONFIGS_PER_ROUND`
+    /// + `reconcile::apply` 第 7.5 步的调用点 + 本用例）一起删掉。
+    ///
+    /// 探测的份数也钉在这里：少于 8 份就会漏掉高序号槽留下的孤儿规则（它们与
+    /// `inet bui` 同挂 nat priority -100，先注册者先做 NAT ⇒ 那一片跳跃端口静默丢包）。
+    #[test]
+    fn the_legacy_residential_cleanup_retires_with_the_legacy_units() {
+        let legacy = crate::reconcile::LEGACY_UNITS;
+        for i in 1..crate::reconcile::MAX_RESI_SLOTS {
+            assert!(
+                legacy.contains(&format!("hysteria-residential-{i}.service").as_str()),
+                "hysteria-residential-{i}.service 不在 LEGACY_UNITS 了 ⇒ \
+                 portjump::cleanup_legacy_residential 与它的调用点、本用例一起删掉"
+            );
+        }
+        assert_eq!(
+            RESI_CONFIGS_PER_ROUND,
+            crate::reconcile::MAX_RESI_SLOTS,
+            "每轮探测的份数必须覆盖槽 0..7 全部 4.0 配置"
+        );
+    }
 
     /// 枚举**从槽 0 开始**：`config-residential.yaml`（单槽 4.0 机器唯一有的那份）
     /// 与 `config-residential-<i>.yaml` 一视同仁，盘上没有的那几格一个命令都不发。

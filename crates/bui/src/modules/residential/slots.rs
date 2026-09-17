@@ -90,7 +90,7 @@ pub fn assign_new_user(s: &mut State, user_id: Uuid, now: OffsetDateTime) -> boo
 /// 权益（不该占凭据），或池的 id 域（[`POOL_MAX`](bui_schema::hy2pool::POOL_MAX) = 256 条）
 /// 用尽 —— 后者调用方要记 Error 级事件。
 ///
-/// **权益判据不能省**（口径只有 [`gates::has_resi_hy2`](crate::modules::panel::gates) 一处）：
+/// **权益判据不能省**（口径只有 [`bui_schema::hy2pool::is_resi_hy2`] 一处）：
 /// 纯直连用户白占一条凭据会把空闲吃掉，进而触发「当场扩容」= 重写 `hy2-residential.json`
 /// + 重启 `hysteria-residential` ⇒ 全体住宅 HY2 会话重连一次。
 ///
@@ -108,7 +108,7 @@ pub fn assign_hy2_cred(s: &mut State, user_id: Uuid, now: OffsetDateTime) -> Opt
         .users
         .iter()
         .find(|u| u.user_id == user_id)
-        .is_some_and(|u| crate::modules::panel::gates::has_resi_hy2(u, &s.residential));
+        .is_some_and(|u| bui_schema::hy2pool::is_resi_hy2(u, &s.residential));
     if !entitled {
         return None;
     }

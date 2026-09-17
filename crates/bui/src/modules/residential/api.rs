@@ -331,7 +331,7 @@ pub fn slot_rows(s: &SchemaState, r: &state::ResiRuntime) -> Vec<SlotRow> {
         .into_iter()
         .filter_map(|sl| {
             let own = g.upstreams.iter().find(|u| u.id == sl.upstream_id)?;
-            let res = bui_schema::slots::resources_of(&s.node.ports, &s.residential, sl.index);
+            let res = bui_schema::slots::resources(sl.index);
             let sr = r
                 .slots
                 .get(&sl.index.to_string())

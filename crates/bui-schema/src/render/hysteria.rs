@@ -1,12 +1,16 @@
-//! Hysteria2 两个实例的配置渲染（模板移植自 v3 `server/core.sh:527-580` 直连、`595-660` 住宅）。
+//! Hysteria2 **直连**实例的配置渲染（模板移植自 v3 `server/core.sh:527-580`）。
+//!
+//! 4.1 起这个文件只管直连一个实例：住宅 HY2 换成了 sing-box 的单入站 + 凭据池
+//! （[`crate::render::hy2_singbox`]），4.0.x 那两个渲染器
+//! （`residential_yaml` / `residential_slot_yaml`）连签名一起删了（spec §4.2、§13 C1）。
 //!
 //! `auth` 段有两种形态（spec §3.2，2026-09-13 裁决）：默认 [`Hy2Auth::Http`] 指向守护进程
 //! 自己监听的 [`AUTH_HTTP_PORT`]（进程内应答，不 fork）；[`Hy2Auth::Command`] 是退路开关，
-//! 回到钩子 `bin/bui-auth-hook`。`masquerade.proxy.url` 由 REALITY 伪装域推导；
+//! 回到钩子 `bin/bui-auth-hook`。**两种形态都只作用于直连**（住宅侧是 sing-box 的静态
+//! `users` 列表 + 门，配置里没有 `auth` 段）。`masquerade.proxy.url` 由 REALITY 伪装域推导；
 //! `obfs` 段只在启用时输出。
 use crate::model::{Hy2Auth, NodeParams};
 use crate::paths::Paths;
-use crate::slots::{self, SlotRes};
 use serde_yaml::{Mapping, Value};
 
 /// 守护进程的鉴权端口：**只监听 127.0.0.1**，不挂在面板端口上（面板经 Caddy 对外，
@@ -14,7 +18,7 @@ use serde_yaml::{Mapping, Value};
 /// 10002 / 10085 / 2080+ 与住宅跳跃段 41000–50000。
 pub const AUTH_HTTP_PORT: u16 = 18789;
 
-/// 写进两份配置的 `auth.http.url`。
+/// 写进直连配置的 `auth.http.url`（4.1：只有 `config.yaml` 还有 `auth` 段）。
 pub fn auth_http_url() -> String {
     format!("http://127.0.0.1:{AUTH_HTTP_PORT}/auth")
 }
@@ -34,56 +38,7 @@ pub fn direct_yaml(node: &NodeParams, paths: &Paths, auth: Hy2Auth) -> String {
     to_yaml(doc)
 }
 
-/// 住宅实例 `config-residential[-<i>].yaml`：出站 socks5 → 本槽的 relay 入站，`acl: relay(all)`。
-///
-/// 每个槽一个实例（spec §5.6）：监听 `:{hy2_port},{hop.0}-{hop.1}`，出站
-/// `127.0.0.1:{relay_port}`，`trafficStats` 监听 `127.0.0.1:{stats_port}`。
-/// 端口全部来自 [`SlotRes`]，本函数不自己算任何端口。
-pub fn residential_slot_yaml(
-    node: &NodeParams,
-    paths: &Paths,
-    res: &SlotRes,
-    auth: Hy2Auth,
-) -> String {
-    let listen = format!(":{},{}-{}", res.hy2_port, res.hop.0, res.hop.1);
-    let mut doc = common_doc(node, paths, &listen, res.stats_port, auth);
-
-    let mut relay = Mapping::new();
-    relay.insert(key("name"), str_val("relay"));
-    relay.insert(key("type"), str_val("socks5"));
-    relay.insert(
-        key("socks5"),
-        map(vec![(
-            "addr",
-            str_val(&format!("127.0.0.1:{}", res.relay_port)),
-        )]),
-    );
-    doc.insert(
-        key("outbounds"),
-        Value::Sequence(vec![
-            Value::Mapping(relay),
-            Value::Mapping(direct_outbound()),
-        ]),
-    );
-    doc.insert(
-        key("acl"),
-        map(vec![(
-            "inline",
-            Value::Sequence(vec![str_val("relay(all)")]),
-        )]),
-    );
-    // 混淆覆盖全部 HY2 实例（2026-09-15 裁决）：订阅给住宅 HY2 节点同样带 obfs 参数，两边必须一致。
-    push_obfs(&mut doc, node);
-    to_yaml(doc)
-}
-
-/// 单槽（槽 0）的住宅配置。保留这个签名给 golden 与 `import-v3`：
-/// 池空 / 只有一条上游时，输出与 v3 单实例逐字节相同。
-pub fn residential_yaml(node: &NodeParams, paths: &Paths, auth: Hy2Auth) -> String {
-    residential_slot_yaml(node, paths, &slots::resources(&node.ports, 0, 1), auth)
-}
-
-/// 两个实例共有的字段（顺序按 v3 模板）。
+/// 直连实例的字段（顺序按 v3 模板；4.0.x 的住宅实例也共用过这一份）。
 fn common_doc(
     node: &NodeParams,
     paths: &Paths,
@@ -225,7 +180,6 @@ fn to_yaml(doc: Mapping) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::slots;
 
     fn node() -> NodeParams {
         serde_json::from_str(
@@ -238,88 +192,27 @@ mod tests {
         .unwrap()
     }
 
-    /// 槽 0 单槽的输出必须与今天的 `residential_yaml` **逐字节相同**：
-    /// golden、M1 验收与 `import-v3` 都按它写死。
+    /// 混淆跟着开关走（2026-09-15 裁决：直连与住宅 HY2 同一段 salamander）——
+    /// 这里只管直连，住宅那半在 `render::hy2_singbox` 的用例里。
     #[test]
-    fn slot_zero_of_a_single_slot_pool_is_byte_identical_to_the_old_output() {
-        let (n, p) = (node(), Paths::default_server());
-        let one = slots::resources(&n.ports, 0, 1);
-        assert_eq!(
-            residential_slot_yaml(&n, &p, &one, Hy2Auth::Http),
-            residential_yaml(&n, &p, Hy2Auth::Http)
-        );
-        let text = residential_yaml(&n, &p, Hy2Auth::Http);
-        // serde_yaml 对 `:40000,…` 这种以冒号开头的标量不加引号，原样输出
-        assert!(
-            text.lines().any(|l| l == "listen: :40000,41000-50000"),
-            "{text}"
-        );
-        assert!(text.contains("127.0.0.1:9998"));
-        assert!(text.contains("127.0.0.1:2080"));
-    }
-
-    #[test]
-    fn each_slot_gets_its_own_listen_relay_and_stats_port() {
-        let (n, p) = (node(), Paths::default_server());
-        let texts: Vec<String> = (0..3)
-            .map(|i| {
-                residential_slot_yaml(&n, &p, &slots::resources(&n.ports, i, 3), Hy2Auth::Command)
-            })
-            .collect();
-        let listen = |t: &str| -> String {
-            t.lines()
-                .find(|l| l.starts_with("listen:"))
-                .unwrap()
-                .to_string()
-        };
-        assert!(listen(&texts[0]).contains(":40000,41000-43999"));
-        assert!(listen(&texts[1]).contains(":40001,44000-46999"));
-        assert!(listen(&texts[2]).contains(":40002,47000-50000"));
-        assert!(
-            texts[1].contains("127.0.0.1:2081"),
-            "出站指向本槽的 relay 入站"
-        );
-        assert!(texts[1].contains("127.0.0.1:9997"), "trafficStats 按槽递减");
-        assert!(texts[2].contains("127.0.0.1:2082"));
-        assert!(texts[2].contains("127.0.0.1:9996"));
-        // node() 的 obfs 是关闭的：住宅实例不输出 obfs 段
-        for t in &texts {
-            assert!(!t.contains("salamander"));
-            assert!(t.contains("relay(all)"));
-            assert!(t.contains("/opt/b-ui/bin/bui-auth-hook"));
-        }
-    }
-
-    /// 混淆覆盖全部 HY2 实例（2026-09-15 裁决）：开启时直连与每个住宅槽都带同一段 salamander，
-    /// 关闭时一律不带 —— 订阅给直连与住宅 HY2 节点都带 obfs 参数，服务端必须一致。
-    #[test]
-    fn obfs_follows_the_switch_on_direct_and_every_residential_slot() {
+    fn obfs_follows_the_switch_on_direct() {
         let (mut n, p) = (node(), Paths::default_server());
-        let render_all = |n: &NodeParams| -> Vec<String> {
-            let mut v = vec![direct_yaml(n, &p, Hy2Auth::Http)];
-            v.extend((0..3).map(|i| {
-                residential_slot_yaml(n, &p, &slots::resources(&n.ports, i, 3), Hy2Auth::Http)
-            }));
-            v
-        };
         n.obfs = crate::model::Obfs {
             enabled: true,
             password: "obfs-pw".into(),
         };
-        for t in render_all(&n) {
-            let y: Value = serde_yaml::from_str(&t).unwrap();
-            assert_eq!(y["obfs"]["type"].as_str(), Some("salamander"), "{t}");
-            assert_eq!(
-                y["obfs"]["salamander"]["password"].as_str(),
-                Some("obfs-pw"),
-                "{t}"
-            );
-        }
+        let t = direct_yaml(&n, &p, Hy2Auth::Http);
+        let y: Value = serde_yaml::from_str(&t).unwrap();
+        assert_eq!(y["obfs"]["type"].as_str(), Some("salamander"), "{t}");
+        assert_eq!(
+            y["obfs"]["salamander"]["password"].as_str(),
+            Some("obfs-pw"),
+            "{t}"
+        );
         n.obfs.enabled = false;
-        for t in render_all(&n) {
-            let y: Value = serde_yaml::from_str(&t).unwrap();
-            assert!(y.get("obfs").is_none(), "{t}");
-        }
+        let t = direct_yaml(&n, &p, Hy2Auth::Http);
+        let y: Value = serde_yaml::from_str(&t).unwrap();
+        assert!(y.get("obfs").is_none(), "{t}");
     }
 
     /// 两种鉴权模式各自的 `auth` 段（2026-09-13 裁决）。http 是默认，command 是退路：
@@ -327,31 +220,22 @@ mod tests {
     #[test]
     fn the_auth_section_is_the_only_difference_between_the_two_modes() {
         let (n, p) = (node(), Paths::default_server());
-        for text in [
-            direct_yaml(&n, &p, Hy2Auth::Http),
-            residential_yaml(&n, &p, Hy2Auth::Http),
-        ] {
-            let y: Value = serde_yaml::from_str(&text).unwrap();
-            assert_eq!(y["auth"]["type"].as_str(), Some("http"));
-            assert_eq!(
-                y["auth"]["http"]["url"].as_str(),
-                Some("http://127.0.0.1:18789/auth")
-            );
-            assert_eq!(y["auth"]["http"]["insecure"].as_bool(), Some(false));
-            assert!(y["auth"].get("command").is_none());
-        }
-        for text in [
-            direct_yaml(&n, &p, Hy2Auth::Command),
-            residential_yaml(&n, &p, Hy2Auth::Command),
-        ] {
-            let y: Value = serde_yaml::from_str(&text).unwrap();
-            assert_eq!(y["auth"]["type"].as_str(), Some("command"));
-            assert_eq!(
-                y["auth"]["command"].as_str(),
-                Some("/opt/b-ui/bin/bui-auth-hook")
-            );
-            assert!(y["auth"].get("http").is_none());
-        }
+        let y: Value = serde_yaml::from_str(&direct_yaml(&n, &p, Hy2Auth::Http)).unwrap();
+        assert_eq!(y["auth"]["type"].as_str(), Some("http"));
+        assert_eq!(
+            y["auth"]["http"]["url"].as_str(),
+            Some("http://127.0.0.1:18789/auth")
+        );
+        assert_eq!(y["auth"]["http"]["insecure"].as_bool(), Some(false));
+        assert!(y["auth"].get("command").is_none());
+
+        let y: Value = serde_yaml::from_str(&direct_yaml(&n, &p, Hy2Auth::Command)).unwrap();
+        assert_eq!(y["auth"]["type"].as_str(), Some("command"));
+        assert_eq!(
+            y["auth"]["command"].as_str(),
+            Some("/opt/b-ui/bin/bui-auth-hook")
+        );
+        assert!(y["auth"].get("http").is_none());
         // 除 auth 之外逐键相等
         let mut a: Mapping = serde_yaml::from_str(&direct_yaml(&n, &p, Hy2Auth::Http)).unwrap();
         let mut b: Mapping = serde_yaml::from_str(&direct_yaml(&n, &p, Hy2Auth::Command)).unwrap();

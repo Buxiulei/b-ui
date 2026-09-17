@@ -1,6 +1,11 @@
 # b-ui v4 架构设计（方案一：单二进制「期望态」控制器）
 
-日期：2026-09-11。状态：**已与主理人逐节确认（①–⑦）**，待 spec 审阅后进入 `superpowers:writing-plans`。
+日期：2026-09-11。状态：**已与主理人逐节确认（①–⑦）**，v4.0.0 / v4.0.1 已发布。
+**住宅 HY2 的那一部分已被 4.1 取代**：见 `docs/superpowers/specs/2026-09-15-hy2-singbox-residential-design.md`
+（一个 sing-box hysteria2 入站 `:40000` + 静态凭据池 + 每凭据一个门，整段跳跃由 b-ui 自管的
+`table inet bui` REDIRECT 进去；实施计划 `docs/superpowers/plans/2026-09-15-v41-hy2-singbox.md` T1–T20）。
+本文凡写「每槽一个 `hysteria-residential-<i>` 实例 / `40000+i` / 按槽切跳跃段 / `9998-i`」的地方都已就地标注 4.1 口径，
+其余各节仍然有效。
 输入：`docs/superpowers/audits/2026-09-11-architecture-audit.md`（审计汇总）、`docs/superpowers/research/2026-09-11-research-review.md`（调研审查 + Decodo 实测）、`docs/superpowers/specs/2026-09-11-residential-auto-blacklist-design.md`（R13）。
 生产主机只用别名：`bwg-rick`（测试机，先上）、`bwg-tizi`（生产，验收后上）、`baiyi`（Linux 客户端主机）。
 
@@ -32,7 +37,8 @@
   v2rayN / bui-c ──────▶ hysteria-server      :10000 + 20000-30000  ── direct(IPv4) ───▶ Internet
                        ▶ xray  vless-direct   :10001 REALITY        ── freedom ─────────▶ Internet
                        ▶ xray  vless-resi     :10002 REALITY ──┐
-                       ▶ hysteria-residential :40000 + 41000-50000 ─┤ socks 127.0.0.1:2080
+                       ▶ hysteria-residential :40000 单端口（sing-box）─┤ socks 127.0.0.1:(2080+槽)
+                       │   ▲ 41000-50000（+ 兼容段 40001-40007）由 table inet bui REDIRECT 进 :40000
                        │                                            ▼
                        │                       b-ui-relay (sing-box) ── resi-pool(selector) ──▶ 住宅上游 ──▶ Internet
                        │                                                └─ 黑名单 / 分流 / fail-open → direct
@@ -83,13 +89,13 @@ Cargo workspace：
 
 | 类别 | 项 | 差异动作 |
 |---|---|---|
-| 文件 | `config.yaml`、`config-residential.yaml`、`xray-config.json`、`singbox-relay.json`、`Caddyfile`、`auth-snapshot.json`、6 个 systemd 单元、`/etc/sysctl.d/99-b-ui-*.conf`、`/etc/modprobe.d`、`/etc/resolv.conf`、`sshd_config.d/00-b-ui-hardening.conf` | 按内容哈希比对，只写有差异的 |
+| 文件 | `config.yaml`、`hy2-residential.json`（4.1；4.0 是 `config-residential[-<i>].yaml`，现在一律产 `Absent`）、`xray-config.json`、`singbox-relay.json`、`Caddyfile`、`auth-snapshot.json`、6 个 systemd 单元、`/etc/sysctl.d/99-b-ui-*.conf`、`/etc/modprobe.d`、`/etc/resolv.conf`、`sshd_config.d/00-b-ui-hardening.conf` | 按内容哈希比对，只写有差异的 |
 | 二进制 | `/opt/b-ui/bin/{hysteria,xray,sing-box,caddy}` | 版本不符则下载校验替换 |
 | 服务 | 6 个单元的 enabled/active | `daemon-reload` + enable/start |
 | 内核参数 | sysctl 值、`nf_conntrack` 模块 | `sysctl -w` |
 | 防火墙 | ufw / firewalld 规则 | 装了就开端口集；没装就在体检里提示云侧放行 |
 
-**重启映射**：`config.yaml` 变 → 重启 hysteria-server；`config-residential.yaml` 变 → 重启 hysteria-residential；`xray-config.json` 的**结构哈希**（排除 `inbounds[].settings.clients`）变 → 重启 xray；`singbox-relay.json` 变 → 重启 b-ui-relay 并随后重放上次选中的上游；`Caddyfile` 变 → `caddy reload`；单元变 → `daemon-reload` + 重启该单元。
+**重启映射**：`config.yaml` 变 → 重启 hysteria-server；`hy2-residential.json` 变 → 重启 hysteria-residential（4.1；只会因 spec §3.5 那五件事变，用户生命周期动作只切门、不动这个文件）；`inet bui` 规则集变 → 一个 `nft -f -` 事务整表替换，不重启任何单元；`xray-config.json` 的**结构哈希**（排除 `inbounds[].settings.clients`）变 → 重启 xray；`singbox-relay.json` 变 → 重启 b-ui-relay 并随后重放上次选中的上游；`Caddyfile` 变 → `caddy reload`；单元变 → `daemon-reload` + 重启该单元。
 
 **触发**：启动时；每次 API 变更后（500ms 去抖）；每 10 分钟漂移检查；`bui reconcile` 手动。
 
@@ -114,14 +120,20 @@ Cargo workspace：
 | 内核 | 单元 | 监听 | 出口 | 变化 |
 |---|---|---|---|---|
 | hysteria-server | `hysteria-server.service` | `:10000,20000-30000`（`listen:` 一行） | 内置 direct，`mode: 4` | 鉴权改 `command`；**不再有任何 iptables/nft 规则**，`hy2-portjump-cleanup.sh` 与面板的 iptables REDIRECT 路径删除 |
-| hysteria-residential | `hysteria-residential[-<i>].service`（每槽一个，槽 0 用无后缀名） | `:(40000+i),<41000-50000 按槽位空间等分的第 i 片>` | `acl: relay(all)` → socks5 `127.0.0.1:(2080+i)` | 同上；实例数 = 槽位数（§5.6） |
+| hysteria-residential | `hysteria-residential.service`（**4.1：只有一个**，跑 sing-box，配置 `hy2-residential.json`） | `:40000` 单端口；`41000-50000` 与兼容段 `40001-40007` 由 `table inet bui` REDIRECT 进来（`ListenOptions` 没有端口范围字段，这正是必须自管 nft 的原因） | 每条池凭据一个 `gate-<id>` selector → `slot-<i>-out` = socks `127.0.0.1:(2080+i)`，或 `deny` | 4.0 的「每槽一个 apernet 实例 `:(40000+i)` + 按槽切跳跃段」已退役（回归事故，见 4.1 spec §1.1）；单元名沿用 |
 | xray | `xray.service` | `:10001` vless-direct、`:10002` vless-residential（同一 REALITY 密钥、同一 UUID 集）、`127.0.0.1:10085` api（services：Handler / Stats / **Routing**） | freedom ForceIPv4 / socks `127.0.0.1:(2080+i)`，住宅入站按**用户 email** 路由到槽（每个用户一条带 `ruleTag` 的规则，增删走 `RoutingService` gRPC，不重启） | 用户增删走 gRPC |
 | sing-box relay | `b-ui-relay.service` | `127.0.0.1:(2080+i)` socks（每槽一个入站）、`127.0.0.1:9091` Clash API | `slot-<i>-pool` selector（每槽一个，本槽优先）/ `resi-pool`（DNS detour 与全局最优）/ `direct` | 规则见 §5 |
 | Caddy | `caddy.service` | 80/443 | reverse_proxy 127.0.0.1:8080 | 不变 |
 
-四个内核都是从各自 GitHub Releases 下载的静态二进制（sha256 校验），放 `/opt/b-ui/bin/`；不再调用 `get.hy2.sh` / Xray-install / 发行版包，不再装 Node.js。sing-box 上限 1.14（v2rayN 7.25 封顶）。
+四个内核都是静态二进制（sha256 校验），放 `/opt/b-ui/bin/`；不再调用 `get.hy2.sh` / Xray-install / 发行版包，不再装 Node.js。sing-box 上限 1.14（v2rayN 7.25 封顶）。**4.1 起 sing-box 改为自建**：随发布分发的那一个由 CI 按上游 tag 编译、带上 `with_v2ray_api`（官方 release 二进制不含它，而住宅 HY2 的按用户计量必须走 v2ray_api），`kernels.lock` 里它那两行的 URL 列是 `build:` URI、sha256 是构建产物的 sha；其余三个仍是上游归档。
 
-### 3.2 Hysteria2 鉴权：默认 `auth.type: http`，`command` 为退路开关
+### 3.2 Hysteria2 鉴权（**4.1 起仅直连**）：默认 `auth.type: http`，`command` 为退路开关
+
+> **4.1 作用域**：本节只管**直连**那一个 apernet 实例。住宅 HY2 换成 sing-box 之后是静态凭据池
+> （`users[].password = "{name}:{secret}"`）+ 每凭据一个门，配置里连 `auth` 这个字段都不存在 ⇒
+> `bui set hy2-auth` 只重渲染 `config.yaml`、只重启 `hysteria-server`（`bui status` 的「鉴权模式」
+> 一行同步标注「仅直连」），住宅侧鉴权失败也**没有日志**（4.1 spec §6、§8.1）。
+> `auth-snapshot.json` 与 `bin/bui-auth-hook` 的形状不变。
 
 **默认（2026-09-13 主理人裁决）**：`auth: { type: http, http: { url: "http://127.0.0.1:18789/auth", insecure: false } }`。内核对每条新 QUIC 连接 POST 一次 `{"addr": "…", "auth": "user:pass", "tx": 0}`，`bui` 守护进程**进程内**应答 `{"ok": true, "id": "<user_id>"}` / `{"ok": false}`（`id` 就是 `/traffic`、`/online`、`/kick` 的键）。改默认的理由：bwg-rick 压测 200 登录/秒 p99 37ms，判据是 < 20ms，瓶颈是 `command` 每次登录 fork 一个进程（≈15ms 固定开销）。
 
@@ -132,7 +144,7 @@ Cargo workspace：
 
 **退路开关**：`bui set hy2-auth command` 切回 `auth: { type: command, command: /opt/b-ui/bin/bui-auth-hook }`（`bui set hy2-auth http` 切回来）。内核对每条新连接 `exec.Command(a.Cmd, addr, auth, tx)`，不过 shell、不拆空格，所以 `auth.command` 只能是一个不带参数的可执行路径（`bin/bui-auth-hook` 是 `bin/bui` 的符号链接，按 argv[0] 分发；调研 H15）。钩子读 `/opt/b-ui/auth-snapshot.json`（600），自设 ≤ 2 秒硬超时，走极简路径（不初始化 tokio/tracing、不加载 state）；内核对钩子不设超时也不限流（H8/H9），stderr 不进 journal（H5）。
 
-- 开关落在 `state.system.hy2_auth`（`"http" | "command"`，serde default = `http`；**旧 state 缺字段就是 http**）。改它 ⇒ 对账重渲染两份 hysteria 配置 ⇒ 两个实例**各重启一次**，重启窗口内既有连接断开、客户端自动重连（`import-v3` 与既有安装升级到本版时同样吃这一次重启）。`bui status` 打印当前模式。
+- 开关落在 `state.system.hy2_auth`（`"http" | "command"`，serde default = `http`；**旧 state 缺字段就是 http**）。改它 ⇒ 对账重渲染 `config.yaml` ⇒ **只有直连实例重启一次**（4.1；4.0.x 是两份配置、两个实例各重启一次），重启窗口内直连的既有连接断开、客户端自动重连。`bui status` 打印当前模式并标注「仅直连」。
 - 效果（两种模式相同）：增删用户、到期、超限在建连时生效，内核不重启；无面板 SPOF。
 - 代价：http 模式下守护进程是鉴权的必经之路（它挂了 = 新连接全拒，既有连接不受影响）；command 模式下每次建连 fork 一个静态二进制。M5 压测判据不变：200 建连/秒 p99 < 20ms（`scripts/ops/authhttp-bench.py` 打 http 面，`scripts/ops/authhook-bench.sh` 打钩子面，两者产物同格式，`scripts/ops/authhook-report.sh` 都读得懂）。
 - 密码以明文存 state 与快照（v3 的 `config.yaml` 本来就是明文，订阅也需要明文）；文件 600，日志脱敏。
@@ -143,10 +155,10 @@ tonic 客户端，proto 从 Xray-core `v26.3.27` vendor 进仓（以仓库根为
 
 ### 3.4 证书、系统状态、watchdog
 
-- 证书：Caddy 继续签；守护进程 inotify 监听 Caddy 证书目录，内容变化才复制到 `/opt/b-ui/certs/`，然后**间隔 10 秒**依次重启两个 hysteria。
+- 证书：Caddy 继续签；守护进程 inotify 监听 Caddy 证书目录，内容变化才复制到 `/opt/b-ui/certs/`，然后**间隔 10 秒**依次重启两个 HY2 单元（4.1 = 直连的 apernet + 住宅的 sing-box，单元名两代相同）。
 - 静态 DNS：`system.static_dns=true` 时写 `/etc/resolv.conf`（1.1.1.1 / 8.8.8.8）并 `chattr +i`，systemd-resolved 存在则先禁用；两台机统一行为；可在 state 关闭。
 - sysctl：BBR、somaxconn、按内存分档的 `nf_conntrack_max`（131072 / 262144 / 524288），与 v3 同值。
-- 防火墙：装了 ufw/firewalld → 开 22/`PORT`/80/443/10001/10002/`40000..40000+span-1` + 两个跳跃段；否则体检提示。`span` 是**槽位空间宽度**（最高槽序号 + 1，`bui_schema::slots::slot_span`），不是 IP 个数：序号有空洞时（删掉中间那条上游）会多放一个没人监听的 UDP 端口，可接受（§5.6 落地细节 D3 的连带效果）。住宅跳跃段 41000–50000 整段放行，各槽只用其中一片。
+- 防火墙（**4.1 口径**）：装了 ufw/firewalld → 开 22/`PORT`/80/443/10001/10002/`40000` + 两个跳跃段；否则体检提示。住宅侧只有 `40000` 一个监听端口，`41000-50000` 整段放行（包进来先过 nat 的 REDIRECT），兼容段开着时再放 `40001-40007`——`reserved_ports` / `firewall_ports` 的参数因此从 `slots: u16` 改成 `compat: bool`。4.0.x 那套「按槽位空间宽度 `span` 开 `40000..40000+span-1`」已退役。
 - SSH 硬化：一份实现（禁密码登录，仅当存在公钥；`sshd -t` 失败则不写并记录），装机与 `b-ui harden-ssh` 同一函数。
 - systemd 单元全部带 `LimitNOFILE=1048576`；两个 hysteria 与 relay、xray 带 `MemoryHigh/MemoryMax`（relay 与 xray 是 v3 缺的）；`Nice=-5`；`b-ui.service` 自身 `MemoryMax=200M`、`Restart=always`。
 - watchdog：守护进程每 60 秒检查四个内核（单元 active + 监听端口存在，读 `/proc/net/{udp,tcp}`）：进程不 active 交给 systemd `Restart=always` 自愈，watchdog 不插手；只对「active 但端口不在听/探测失败」连续 2 次的情况执行 `systemctl restart`（退避 1/2/4 分钟），体检显示最近重启记录。`/tmp/hy2-watchdog-*` 文件与 timer 删除。
@@ -178,7 +190,7 @@ tonic 客户端，proto 从 Xray-core `v26.3.27` vendor 进仓（以仓库根为
 
 ### 4.2 流量采样与限额
 
-- 守护进程内 10 秒任务：hysteria 直连 `GET /traffic?clear=1`（9999）+ 住宅（9998）增量相加（`clear` 在同一把锁内序列化并清零，原子，H10；trafficStats 若设 `secret`，请求头 `Authorization: <secret>`，无 `Bearer` 前缀，H13）；Xray `QueryStats(reset=true)`；累加到内存中的 `usage`，最多每 30 秒合并落盘一次。
+- 守护进程内 10 秒任务（**4.1 口径**）：hysteria 直连 `GET /traffic?clear=1`（9999，`clear` 在同一把锁内序列化并清零，原子，H10；trafficStats 若设 `secret`，请求头 `Authorization: <secret>`，无 `Bearer` 前缀，H13）+ **住宅 sing-box 的 v2ray_api `StatsService.QueryStats(reset=true)`（`127.0.0.1:10086`）** + Xray `QueryStats(reset=true)`（`127.0.0.1:10085`），三路增量相加；累加到内存中的 `usage`，最多每 30 秒合并落盘一次。4.0.x 那条「住宅 trafficStats `9998 - 槽序号`」已退役，`9991..9998` 全部释放；在线与踢人走住宅的 Clash API（`127.0.0.1:9092` 的 `/connections`）。
 - 在线：hysteria 两个 `/online` 的并集（值是该用户当前 QUIC 连接数，`>0` 即在线，H11）∪ 最近 30 秒有 Xray 增量的用户。
 - 月度重置：服务器本地时间每月 1 日 00:00，`month_key` 变化时清零 `monthly_bytes`。
 - 执行：到期 / 超限 / 禁用 → 快照标记拒绝（主保障：新连接一律被钩子拒绝）+ 对两个 hysteria `POST /kick`（请求体 `["<user_id>"]`；kick 只是标记，要等该用户下次有流量才断连，空闲连接可能长期不断，被踢后客户端会重连并再次过钩子，H12）+ Xray `RemoveUser`（只阻新握手，见 §3.3）；恢复条件满足时反向操作（快照放行 + Xray `AddUser`）。限额判断每次采样后执行。
@@ -326,26 +338,26 @@ tonic 客户端，proto 从 Xray-core `v26.3.27` vendor 进仓（以仓库根为
 
 **槽位资源**（持久化在 `state.residential.slots[]`，增删上游时分配/释放，取最小空闲序号 i）：
 - 中继入口：sing-box 每槽一个 socks 入站 `127.0.0.1:(2080+i)`；路由 `inbound = slot-i ⇒ selector slot-i-pool`，成员顺序 = [本槽 IP, 其余 IP…]。巡检按槽驱动 selector：本槽 IP 健康且 Google 通 ⇒ 用本槽；否则临时借用排名最高的其他健康 IP，本槽恢复（连续 3 轮）后切回。UDP、测速、黑名单、`ports_allowed` 按上游不变。
-- HY2 住宅：每槽一个 Hysteria 实例 `hysteria-residential-<i>.service`（配置 `config-residential-<i>.yaml`），监听 `:(40000+i)`，跳跃区间把 41000–50000 按槽数等分连续切片；出站 socks5 `127.0.0.1:(2080+i)`；鉴权钩子、流量采样、看门狗同原实例。槽 0 保持今天的 40000 与 `hysteria-residential.service` 名字兼容。
+- HY2 住宅（**4.1 已改**）：**一个** sing-box 实例 `hysteria-residential.service`（配置 `hy2-residential.json`），监听 `:40000` 单端口，整段 `41000-50000`（+ 兼容段 `40001-40007`）由 `table inet bui` REDIRECT 进来；每条池凭据一个 `gate-<id>` selector 指向该用户那一槽的 `slot-<i>-out`（= socks `127.0.0.1:(2080+i)`）或 `deny`。**端口与槽位无关**，改槽只换出口 IP。4.0 的「每槽一个 apernet 实例 `:(40000+i)` + 按槽切跳跃段」是 2026-09-15 回归事故的成因，已退役（4.1 spec §1.1）。
 - REALITY 住宅：入站 `:10002` 不变；Xray 路由规则按用户 email 分到 `relay-slot-<i>` 出站（socks `127.0.0.1:(2080+i)`），未分配的用户走槽 0。
-- 防火墙：放行 `40000..40000+N-1/udp` 与 `41000–50000/udp`。
+- 防火墙（4.1）：放行 `40000/udp` 与 `41000–50000/udp`，兼容段开着时再放 `40001-40007/udp`。
 
 **分配规则**（`user.residential.slot_id: Option<Uuid>`）：
 1. 新建用户：分到**用户数最少**的槽，平手取序号最小（确定性）。
 2. 删除上游（IP 更换）：该槽用户按规则 1 逐个重新分配；新增上游不自动搬动既有用户（避免抖动），只承接之后的新用户与 `rebalance`。
 3. `bui residential rebalance`（与面板按钮）：把用户在各槽均匀重排（按创建时间稳定排序，尽量少动）；`bui residential assign <user> <slot|upstream>` 手动指定。
-4. 升级迁移：已有用户按创建时间顺序轮流落槽（如 5 人 3 IP ⇒ 2/2/1）；非槽 0 的用户住宅 HY2 端口会变，需刷新一次订阅（主理人已接受）。
+4. 升级迁移：已有用户按创建时间顺序轮流落槽（如 5 人 3 IP ⇒ 2/2/1）。**4.1 起这一步不动任何人的订阅**（住宅 HY2 端口与槽位无关）；4.0.x 那句「非槽 0 的用户住宅 HY2 端口会变，需刷新一次订阅」已作废。
 
-**订阅**：住宅 HY2 节点用该用户槽位的端口与跳跃区间；REALITY 住宅节点不变；直连节点不变。**展示**：`bui residential status/health` 与面板按槽列出 IP、当前实际出口（本槽/借用自 X）、用户数与用户名、指标；用户列表显示其槽位/IP。**不做**：连接级轮询多 IP（风控）。
+**订阅（4.1 口径）**：住宅 HY2 节点一律是 `:40000` + 整段 `mport=41000-50000`，**每个用户完全相同、与槽位无关**（密码是他那条池凭据 `{name}:{secret}`）；REALITY 住宅节点不变；直连节点不变。于是增删上游 / `assign` / `rebalance` 都不改已下发的订阅，4.0.x 那套「必须重新获取订阅」的名单机制已整体退役。**展示**：`bui residential status/health` 与面板按槽列出 IP、当前实际出口（本槽/借用自 X）、用户数与用户名、指标；用户列表显示其槽位/IP。**不做**：连接级轮询多 IP（风控）。
 
 #### 落地细节（2026-09-13 实施计划 D1–D11，`docs/superpowers/plans/2026-09-13-v4-p3-ip-pool.md`）
 
 - **D1 槽位是持久化状态，不是池顺序的派生视图**：`state.residential.slots[] = [{index, upstream_id}]`，序号取 0..7 里**最小空闲值**。不从 `upstreams` 的下标派生 —— `upstream::add` 覆盖同 `host:port` 时先 `retain` 再 `push`，派生方案下改一次凭据就会让所有序号集体错位。
-- **D2 槽位不变量：池非空 ⇒ 序号 0 的槽一定存在**。`slots::sync_slots` 维护它（序号 0 被释放时把现存最小序号的槽搬到 0）。`40000` / `2080` / `9998` / `hysteria-residential.service` 这四个名字是 v3 兼容面，M1 验收、`watchdog::targets`、漂移白名单与面板都按它们写死。代价：删掉序号 0 那条上游时另一个槽的用户端口下移一次，需刷新订阅（与「非槽 0 用户需刷新订阅」同一性质）。搬动序号**不置** `xray_slot_rules_dirty`：它只改端口，由对账重渲染 + 重启对应 `hysteria-residential*` 承接；xray 那边出站表本身也变了 ⇒ `structural_hash` 变 ⇒ 本来就要重启。
-- **D3 跳跃区间按「槽位空间」等分，不是按「槽位个数」**：`slot_span = 最高序号 + 1`（空池按 1）。序号有空洞时那一片暂时闲置，**不重切**（重切会让所有存活槽的 `mport=` 一起改）。单槽 ⇒ 槽 0 拿到完整 `41000-50000`，与 v3 单实例逐字等价。
-- **D4 槽位端口全部是序号的纯函数**：`relay_port = 2080 + i`、`hy2_port = ports.hy2_resi + i`、`stats_port = 9998 - i`（只能递减：`9999` 已被直连实例占用，8 个槽占 `9991..9998`，全部只监听回环）、`hop = hop_slice(ports.hy2_resi_hop, i, slot_span)`。唯一实现在 `bui_schema::slots`。
+- **D2 槽位不变量：池非空 ⇒ 序号 0 的槽一定存在**。`slots::sync_slots` 维护它（序号 0 被释放时把现存最小序号的槽搬到 0）。**4.1 起它只保护两个名字**：relay 的 `2080` 与 xray 的 `relay-slot-0`——`40000` 归整个住宅 HY2 入站、`9998` 已消失、`hysteria-residential.service` 归那个入站，三者都不再与槽 0 绑定；搬序号也因此**不再有「需刷新订阅」的代价**（4.0.x 有）。搬动序号**不置** `xray_slot_rules_dirty`：它只改端口，由对账重渲染 + 重启对应 `hysteria-residential*` 承接；xray 那边出站表本身也变了 ⇒ `structural_hash` 变 ⇒ 本来就要重启。
+- ~~**D3 跳跃区间按「槽位空间」等分**~~ —— **4.1 作废**：跳跃段不再切片，整段 `41000-50000` 由 `table inet bui` 送进唯一的监听端口，`slots::slot_span` / `hop_slice` 连签名一起删除。这一条正是 2026-09-15 回归事故的成因（客户端手里是旧的整段订阅 ⇒ 每 30 秒换端口时 2/3 的概率跳进别的实例、静默丢包）。
+- **D4 槽位端口是序号的纯函数**（**4.1 只剩一项**）：`relay_port = 2080 + i`。`hy2_port` / `stats_port` / `hop` 三项连同 `hop_slice` / `slot_span` / `HY2_STATS_RESI_BASE` / `resources_of` 一起删除，`SlotRes` 收成 `{index, relay_port}`、`resources(index)` 只吃槽序号（4.1 spec §4.2、§14 裁决 6：留一个还能按槽算端口的旧签名，下一个人就会继续那么算）。唯一实现仍在 `bui_schema::slots`。
 - **D5 `MAX_SLOTS = 8`**，与 `residential::MAX_UPSTREAMS` 同值（池上限即槽位上限），有守门测试断言两者相等。
-- **D6 三处 C1 签名变更**：`render::relay::config(&ResidentialGroup, &[Slot], &RelayOpts)`、新增 `render::hysteria::residential_slot_yaml(&NodeParams, &Paths, &SlotRes)`（`residential_yaml` 保留为槽 0 的薄包装）、`render::xray::config(&NodeParams, &[User], &Residential, &Paths)`。`nodes::nodes_for` 与三个订阅渲染器的签名不变。
+- **D6 三处 C1 签名变更**：`render::relay::config(&ResidentialGroup, &[Slot], &RelayOpts)`、新增 `render::hysteria::residential_slot_yaml(&NodeParams, &Paths, &SlotRes)`（`residential_yaml` 保留为槽 0 的薄包装）、`render::xray::config(&NodeParams, &[User], &Residential, &Paths)`。`nodes::nodes_for` 与三个订阅渲染器的签名不变。**4.1**：那两个住宅 hysteria 渲染器已删除，住宅配置由 `render::hy2_singbox::config(&NodeParams, &Paths, &Hy2Pool)` 产出。
 - **D7 Xray 的槽路由靠 `RoutingService` gRPC 增删，xray 不重启**：规则粒度是「每个用户一条」`{"type":"field","ruleTag":"resi-u-<user_id>","inboundTag":["vless-residential"],"user":["<user_id>"],"outboundTag":"relay-slot-<i>"}`，末尾一条无 `user` 的兜底 `resi-fallback`（兜底槽的用户同样各有自己的一条规则）。三条内核事实：① `AddRule` 的 `ruleTag` 重名会让整条请求报错 ⇒ 加之前必须先删；② `RemoveRule` 对不存在的 tag 返回成功（幂等）；③ 空 `ruleTag` 永不参与重名判定。追加即表尾 ⇒ 每轮追加过用户规则就要把兜底规则删掉再追加一次。`structural_hash` 除了剔掉 `inbounds[].settings.clients`，**再剔掉 `routing.rules` 里带 `user` 的规则**（兜底规则没有 `user`，留在哈希里）。磁盘上的 `xray-config.json` 仍渲染完整规则表供启动加载；`slot_rules_hash`（只看带 `user` 的规则）是「跑着的那份 vs 期望的那份」的比对键。收敛的唯一入口是 `residential::slots::converge_xray`，挂在对账 consumer 的末尾：**`ListRule()` 是真源**，与期望态求差后只对差集调 `RemoveRule` / `AddRule`；任一步 gRPC 失败才退回 —— **仅当磁盘上那份 `xray-config.json` 的 `slot_rules_hash` 已等于期望值**（对账刚写完）才 `systemctl restart xray`，成功后记哈希、清脏并 `push_alert`；磁盘还没落地就什么都不做、脏标记留到下一轮。
 - **D8 巡检分两层**：既有的 `resi-pool` 全局最优逻辑（手动锁定、更优候选防抖、DNS detour）原样保留；新增**按槽驱动**器 —— 手动 pin 优先，其次本槽 IP 健康且 Google 通就用本槽，否则借用排名最高的其他健康 IP，本槽连续 3 轮恢复后切回；一个健康的都没有时本轮**保持沉默**（不 PUT、不改 `current_upstream_id`，fail-open）。
 - **D9 升级时 `b-ui-relay` 与 `xray` 各重启一次**（中继入站改成每槽一个 `slot-<i>`、xray 住宅出站改名 `relay-slot-<i>` 且 `api.services` 追加 `RoutingService`），此后稳定。
@@ -356,7 +368,7 @@ tonic 客户端，proto 从 Xray-core `v26.3.27` vendor 进仓（以仓库根为
 
 落地计划：`docs/superpowers/plans/2026-09-13-v4-log-sentinel.md`（设计裁决 D1–D16，本节按它修订）。
 
-**采集**：守护进程内一个任务（`modules::sentinel`），每 2 秒用 `journalctl -o json --after-cursor <c>` 增量读受管单元全集（`reconcile::managed_units`：`b-ui-relay`、`hysteria-server`、每个住宅槽的 `hysteria-residential[-i]`、`xray`、`caddy`，外加 `b-ui` 自己——xray gRPC 的失败只出现在守护进程自己的日志里）。首次启动或游标失效时用 `--since @<现在>`，**不回放历史**。游标以内存为准，落 `runtime.extra["sentinel"]`（有事件立即落，只是游标前进至少隔 60 秒落一次；重启后续读，早于签名窗口的积压不计数）。读取经 `Host::journal_read`（测试用 `FakeHost` 的队列）；`MESSAGE` 含 ANSI 色码时 journald 编成字节数组，按字节解码后剥色码；tracing-journald 的 `error` 字段在 `F_ERROR`。
+**采集**：守护进程内一个任务（`modules::sentinel`），每 2 秒用 `journalctl -o json --after-cursor <c>` 增量读受管单元全集（`reconcile::managed_units`：`b-ui-relay`、`hysteria-server`、`hysteria-residential`（4.1 起只有这一个，跑 sing-box）、`xray`、`caddy`，外加 `b-ui` 自己——xray gRPC 的失败只出现在守护进程自己的日志里）。首次启动或游标失效时用 `--since @<现在>`，**不回放历史**。游标以内存为准，落 `runtime.extra["sentinel"]`（有事件立即落，只是游标前进至少隔 60 秒落一次；重启后续读，早于签名窗口的积压不计数）。读取经 `Host::journal_read`（测试用 `FakeHost` 的队列）；`MESSAGE` 含 ANSI 色码时 journald 编成字节数组，按字节解码后剥色码；tracing-journald 的 `error` 字段在 `F_ERROR`。
 
 **去抖与冷却**：同签名同对象在各自窗口内达门槛才触发，触发后 60 秒内不再触发；同「动作 + 对象」10 分钟内不重复执行（冷却表持久化，重启不失忆），冷却中的触发不记事件。
 
@@ -365,11 +377,13 @@ tonic 客户端，proto 从 Xray-core `v26.3.27` vendor 进仓（以仓库根为
 | `relay_upstream_error` | relay `open connection to … using outbound/(http 或 socks)[resi-N]: <原因>`，原因是 connection refused / i/o timeout / deadline exceeded / no route / network unreachable。目标级的其它 4xx/5xx 与 SOCKS5 REP 拒绝归 §5.4 黑名单，哨兵不计 | 同一上游 60 秒 ≥2 条 | 带外快探（先 TCP 连上游网关：解析出的各地址并发拨、整体 3 秒，连不上即判不可达、不再跑完整探测；连得上再走巡检同口径的可达性探测，含 407 补判）。**整个快探被 `QUICK_PROBE_BUDGET_SECS` = 4 秒的整体预算包住、结论三值**（`health::probe_quick_within`，与下面借用后那次验证共用同一份）：`probe_quick` 只在网关 TCP 连不上时才 ≤3 秒返回，网关活着、隧道挂死时它会走完可达性探测（`timed_get` 8 秒 + `get` 5 秒 + 407 补判 5 秒，多地址网关按地址串行，实测单次 28.4 秒），不截断就破下面两条 SLA；**没能在预算内确认 ⇒ 与「确认不可用」同样处置**（2026-09-14 审查第 2 条）：`timed_get` 的超时 `LATENCY_PROBE_TIMEOUT_SECS` = 8 秒大于这 4 秒预算，所以「网关活着、隧道挂死」这条路上 `Dead` 算术上不可达 —— 而它恰恰是本签名（relay 的 `i/o timeout` / `deadline exceeded`）最常报的形态。若这里不动作，哨兵在**主打的故障形态**上就是永久空操作，只能等巡检 ≈4–5 分钟（`HEALTH_INTERVAL_SECS` 120 秒 × `FAIL_TO_UNHEALTHY` 2 轮迟滞，且隧道挂死时每轮 `probe_member` 自己要 ~40 秒）。判据是**佐证**而不是「无证据」：relay 刚在 60 秒内独立报了 ≥2 条错误，带外也过不去；误判死的代价是多借一次兄弟 IP（吵闹：它已被 `mark_unhealthy`，巡检要先连续 `OK_TO_HEALTHY` = 2 轮探通重新判健康、再攒满 `SLOT_BACK_ROUNDS` = 3 轮，恢复后第 4 轮才切回，约 8 分钟），不动作的代价是用户静默断网几分钟。告警文案如实写「没能在 4 秒内确认可用（网关通但隧道无响应…），加上 relay 刚连报错误，按不可用处置」，不写「不可达」；级别 Error（真动了手，照常占 10 分钟冷却）。**确认**不可用 ⇒ 立即判不健康 + 按 §5.6 让**当前出口就是它**的槽立即借用最佳健康 IP（手动 pin 的槽不动）+ 上游级告警「IP X 不可达，槽 i 已临时切到 Y」。**借到的那条要当下用同一个快探验证**（候选来自上一轮巡检的 `runtime.health`，最坏情况已过期；不验证就等于可能切到另一条同样不通的上游，而三处界面都说处置成功）：验证**逐条按 `host:port` 探，绝不按网关主机归组**（池里多条上游常常是同一网关的不同静态端口、各自一个出口 IP，「单个出口 IP 挂掉」时借兄弟端口是唯一可行的处置）；验证有**整体时限** `QUICK_PROBE_BUDGET_SECS = 4` 秒（与上面判原上游那次共用；`probe_quick` 只在网关 TCP 连不上时才 ≤3 秒返回，网关活着时会继续走完整可达性探测，实测单次 28.4 秒 —— 而「网关活着、某个静态端口背后的出口 IP 死了」正是这条预案主打的故障形态）。4 秒对真实住宅出口偏紧是**已知取舍**：经隧道首包 1–3 秒并不罕见，健康候选也可能报「未确认」——借用这一侧是 fail-safe（保留候选、不记不健康），判原上游那一侧会多借一次兄弟 IP（恢复后第 4 轮巡检才切回，约 8 分钟），是否放宽等真机实测后定，结论**三值**：确认可用 ⇒ 借到了、告警说「已临时切到 Y」；确认不可用 ⇒ 把**这一条**判不健康、试下一个候选；预算内未能确认 ⇒ **保留这个候选**（本槽原来的出口是已知死的，未知优于已知死）、不判它不健康，告警如实说「已切到 Y，未能在 4 秒内确认可用」，巡检下一轮用完整预算复核 —— 这一侧与上面判原上游那侧对「未能确认」的**处置故意不同**：那边有 relay 连报错误作佐证，这条候选没人报过错。验证次数的上限是**单次借用调用**的、跨槽共享的 `BORROW_PROBES_PER_CALL = 3`（按槽循环，槽级上限会让单次调用最坏做「池大小 − 1」次验证），调用内缓存「已证死 / 已确认可用」不重复探；预算用尽后剩下的槽照样切到各自的最优候选，按「未确认」报，绝不把槽留在已证死的上游上。候选**逐条都被证死** ⇒ 把 selector **放回本槽自己的 IP**（不补探它）并如实告警「候选 X、Y 都探不通，当前指向本槽 IP Z，当前无可用出口」——绝不允许报「已临时切到」一条刚验证过是死路的上游，也不允许只说「没有可用出口」却不说现在指向谁；连这次 PUT 都失败时告警把这一层也说出来（「放回本槽 IP 也失败：…，当前指向 …」）。中途 Clash PUT 失败停下来时**不说**「无可用出口」（剩下的候选压根没探过）；候选被「本次调用已证死」剪空的槽走同一条「全不通」口径，而一开始就没有候选（`runtime.health` 里一个健康的都没有）仍是 §5.6 规则 4 的 fail-open「保持现状」 |
 | `relay_upstream_auth_failed` | 同上形态，原因是 407 / proxy authentication / SOCKS5 认证被拒（凭据失效） | 同一上游 60 秒 ≥3 条 | 同 `relay_upstream_error`（同一个动作，共享冷却；告警写「凭据失效」） |
 | `relay_google_blocked` | 同上形态，`403` 且含 `serp` 或目标是 Google 搜索域名 | 1 条 | 带外 Google 搜索复核：可用 ⇒ 不动作；被封（403 / 429 / sorry 页）或没结论 ⇒ `google_ok=false` + 借用 + 告警 |
-| `hy2_auth_http_failed` | hysteria 连不上 `127.0.0.1:18789/auth`（仅 `hy2_auth=http`） | 60 秒 ≥3 条 | 事件 + 告警（带「守护进程是否在听」）。**不重启 b-ui**（由 systemd 拉起；原表「失败则重启 b-ui」改判）；原 watchdog 每 60 秒翻日志的同名检测迁到这里 |
+| `hy2_auth_http_failed` | hysteria 连不上 `127.0.0.1:18789/auth`（仅 `hy2_auth=http`；**4.1 起判据是 `unit == "hysteria-server"`**——住宅单元没有 `/auth` 回调，这个签名在它上面失去对象） | 60 秒 ≥3 条 | 事件 + 告警（带「守护进程是否在听」）。**不重启 b-ui**（由 systemd 拉起；原表「失败则重启 b-ui」改判）；原 watchdog 每 60 秒翻日志的同名检测迁到这里 |
 | `kernel_bind_in_use` / `kernel_crash_loop` | hysteria / xray `bind: address already in use`；systemd `Start request repeated too quickly` / `restart counter is at N`（N ≥ 5） | 1 条 | 交给现有看门狗与 systemd，只记事件 |
 | `xray_grpc_unavailable` | `b-ui` 自己的「用户同步有失败项」行且错误含 Unavailable | 150 秒 ≥2 条 | xray API 端口在听 ⇒ 立即重跑一轮用户同步安全网；不在听 ⇒ 只记事件 |
 | `caddy_cert_failed` | caddy `"level":"error"` 且含 obtaining certificate / could not get certificate | 1 条 | 告警（不自动动作） |
 | `upstream_long_unreachable` | （巡查，非日志）住宅上游被判不健康连续 30 分钟 | — | 一次性告警建议替换（恢复即清） |
+
+**4.1 新增五个签名**，判据、门槛与动作逐条见 `2026-09-15-hy2-singbox-residential-design.md` §8.1，这里不复制一遍（一份表两处维护必然漂移）：`hy2_resi_relay_unreachable`（住宅 sing-box 拨不到 relay 的 `slot-<i>` 入站；`outbound/socks[deny]` 的拒绝行是被封用户的正常噪音，一律忽略）、`hy2_resi_gate_sync_failed`（门位收敛打不到 Clash API ⇒ 重跑一轮用户同步）、`hy2_resi_gate_replay_failed`（非日志，重启后门位重放失败 ⇒ 没重放到的门留在 `deny`）、`hy2_resi_pool_low`（巡查：空闲凭据 < 20%）、`nft_table_missing` / `nft_missing`（watchdog 发现 `inet bui` 不在或规则不符 ⇒ 重放 + 记事件）。同节还记着一条**不动**的：`resi_slot_port_changed` 不是 `Sig` 成员，它随「必须重新获取订阅」机制一起退役。
 
 **切回**：哨兵不做切回。带外确认不可达的 IP 立即判不健康，恢复要巡检连续 2 轮探通（§5.3 迟滞）才重新算健康，再攒满 §5.6 按槽切回的 3 轮，所以**恢复后第 4 轮巡检（约 8 分钟）切回**。
 
@@ -419,7 +433,7 @@ tonic 客户端，proto 从 Xray-core `v26.3.27` vendor 进仓（以仓库根为
 |---|---|---|
 | M1 控制面闭环（2 周） | `bui install --import-v3`、对账器、四内核渲染、面板（旧前端）、三种订阅、`/api/nodes` | 每个现有用户三种订阅与 v3 逐项相同；sing-box JSON 过 1.12/1.13/1.14 `check`；v2rayN 四节点可连；二次 `install` 零变更；体检无漂移 |
 | M2 住宅模块（1.5 周） | 池导入、健康切换、黑名单、体检、面板体检卡 | relay 重启后选中不变；24h 内学到 Decodo 的 `ports_allowed` 与支付域名；relay 日拒绝数较 v3 基线降 ≥ 90%；pin 立即生效 |
-| M3 用户与流量（1 周） | 采样合并、限额执行、`auth-hook`、gRPC 增删、用户域 API 桩 | 加用户时 `NRestarts` 不变且在线会话不断；每节点 100MB 已知流量计数误差 ±5%；到期用户被拒并被踢；重启守护进程计数不重复 |
+| M3 用户与流量（1 周） | 采样合并、限额执行、`auth-hook`、gRPC 增删、用户域 API 桩 | 加用户时 `NRestarts` 不变且在线会话不断；每节点 100MB 已知流量计数误差 ±5%；到期用户被拒并被踢；重启守护进程计数不重复。**4.1 的「被拒」分两种形态**（判据随之改，见 4.1 spec §6）：直连在**建连时**被拒；住宅 HY2 的门切到 `deny` ⇒ **握手照旧成功、客户端仍显示已连接，但每个请求都被拒**（判据改成「回环经该用户凭据发请求必失败」，不是「连不上」）。住宅侧计量改走 v2ray_api（`127.0.0.1:10086`），在线与踢人走 Clash API（`127.0.0.1:9092`） |
 | M4 客户端（2 周） | `bui-c` 全功能 | baiyi 上四节点 SOCKS/TUN 均通；裸 IPv6 回落符合 spec；杀 sing-box 一分钟内自愈；从 v3 客户端原地升级不丢节点 |
 | M5 硬化与发布（1 周） | soak、压测、升级回滚演练、CHANGELOG、v4.0.0 | 72h soak Xray RSS 无单调增长、`bui` RSS < 50MB；`auth-hook` 200 建连/秒 p99 < 20ms；`upgrade` 与 `--rollback` 各演练成功 |
 

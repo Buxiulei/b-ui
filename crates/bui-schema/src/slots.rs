@@ -6,31 +6,30 @@
 //! 三条不变量，全靠 [`sync_slots`] 维护：
 //! 1. 每条上游恰好一个槽，每个槽恰好指向一条在池里的上游；
 //! 2. 序号取 `0..MAX_SLOTS` 的最小空闲值；
-//! 3. **池非空 ⇒ 序号 0 的槽存在**（`40000` / `2080` / `9998` /
-//!    `hysteria-residential.service` 是 v3 兼容面，不许悬空）。
-use crate::model::{Ports, Residential, Slot, State, User, DEFAULT_GROUP};
+//! 3. **池非空 ⇒ 序号 0 的槽存在**（relay 的 `2080` 与 xray 的 `relay-slot-0` 是兼容面，
+//!    不许悬空）。4.1 起这条不变量**只保护这两个名字**：`40000` 归整个住宅 HY2 入站、
+//!    `9998` 已消失、`hysteria-residential.service` 归那个入站，三者都不再与槽 0 绑定
+//!    （spec §4.2 末段）。
+use crate::model::{Residential, Slot, State, User, DEFAULT_GROUP};
 use uuid::Uuid;
 
 /// relay 每槽一个 socks 入站的基准端口：槽 i 监听 `127.0.0.1:(2080 + i)`。
 pub const RELAY_SOCKS_BASE: u16 = 2080;
-/// 住宅 hysteria 实例 `trafficStats` 的基准端口：槽 i 用 `9998 - i`。
-/// **只能递减**：`9999` 是直连实例（`HY2_STATS_PORT_DIRECT`）。
-pub const HY2_STATS_RESI_BASE: u16 = 9998;
 /// 槽位上限，与住宅池上限同值（D5）。
 pub const MAX_SLOTS: u16 = 8;
 
-/// 一个槽位的全部端口资源。每一项都是序号的纯函数。
+/// 一个槽位的端口资源。每一项都是序号的纯函数。
+///
+/// 4.1 起只剩一项：**槽位与住宅 HY2 的对外端口彻底脱钩**（住宅 HY2 是一个 sing-box 入站
+/// `ports.hy2_resi`，整段跳跃由 `table inet bui` 送进去），所以这里只服务 relay 的 socks
+/// 入站与 xray 住宅出站。4.0.x 的 `hy2_port` / `stats_port` / `hop` 三项连同
+/// `hop_slice` / `slot_span` / `HY2_STATS_RESI_BASE` / `resources_of` 一起删掉了
+/// （spec §4.2、§14 裁决 6）——按槽算对外端口正是 2026-09-15 回归事故的入口。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SlotRes {
     pub index: u16,
-    /// relay 的 socks 入站端口，也是该槽 hysteria / xray 出站的目标
+    /// relay 的 socks 入站端口，也是该槽 xray 住宅出站的目标
     pub relay_port: u16,
-    /// 该槽 hysteria 住宅实例的监听端口
-    pub hy2_port: u16,
-    /// 该槽 hysteria 住宅实例的 `trafficStats.listen` 端口
-    pub stats_port: u16,
-    /// 该槽分到的端口跳跃区间（闭区间）
-    pub hop: (u16, u16),
 }
 
 /// 全部槽位，按序号升序（`state.residential.slots` 的规范视图）。
@@ -57,57 +56,13 @@ pub fn fallback_index(r: &Residential) -> u16 {
     indices(r)[0]
 }
 
-/// 槽位空间的宽度 = 最高序号 + 1，也就是「把跳跃区间切成几片」（D3）。
-/// 空池按 1 算 ⇒ 槽 0 拿到完整区间。
-pub fn slot_span(r: &Residential) -> u16 {
-    r.slots
-        .iter()
-        .map(|s| s.index + 1)
-        .max()
-        .unwrap_or(1)
-        .clamp(1, MAX_SLOTS)
-}
-
-/// 把闭区间 `range` 切成 `span` 段连续切片，返回第 `index` 段；最后一段吃掉余数。
-/// `span <= 1`、区间退化、或区间比 `span` 还短时一律返回整个区间（**绝不返回空区间**：
-/// 空的 `mport=` 会让客户端连不上）。
-pub fn hop_slice(range: (u16, u16), index: u16, span: u16) -> (u16, u16) {
-    let (start, end) = range;
-    let span = span.clamp(1, MAX_SLOTS);
-    let index = index.min(span - 1);
-    if span == 1 || end <= start {
-        return (start, end);
-    }
-    let total = u32::from(end - start) + 1;
-    let width = total / u32::from(span);
-    if width == 0 {
-        return (start, end);
-    }
-    let lo = u32::from(start) + width * u32::from(index);
-    let hi = if index + 1 >= span {
-        u32::from(end)
-    } else {
-        lo + width - 1
-    };
-    (lo as u16, hi as u16)
-}
-
-/// 槽 `index` 在 `span` 宽的槽位空间里的端口资源。
-pub fn resources(ports: &Ports, index: u16, span: u16) -> SlotRes {
-    let span = span.clamp(1, MAX_SLOTS);
-    let index = index.min(span - 1);
+/// 槽 `index` 的端口资源。序号越界（> [`MAX_SLOTS`] - 1）夹到最后一个槽。
+pub fn resources(index: u16) -> SlotRes {
+    let index = index.min(MAX_SLOTS - 1);
     SlotRes {
         index,
         relay_port: RELAY_SOCKS_BASE + index,
-        hy2_port: ports.hy2_resi + index,
-        stats_port: HY2_STATS_RESI_BASE - index,
-        hop: hop_slice(ports.hy2_resi_hop, index, span),
     }
-}
-
-/// 同 [`resources`]，但槽位空间直接从期望态取（调用方少算一次 [`slot_span`]）。
-pub fn resources_of(ports: &Ports, r: &Residential, index: u16) -> SlotRes {
-    resources(ports, index, slot_span(r))
 }
 
 /// 用户粘住的槽位键（上游 uuid）。没有住宅权益 / 没分过槽 ⇒ `None`。
@@ -155,8 +110,8 @@ pub fn sync_slots(r: &mut Residential) -> Vec<Slot> {
     }
     r.slots.sort_by_key(|s| s.index);
     // 不变量 3：池非空时序号 0 必须有人（D2）。序号 0 被释放掉时，把现存序号
-    // 最小的那个槽搬到 0 —— 代价是那一槽的用户端口下移一次，但 40000 / 2080 /
-    // 9998 / hysteria-residential.service 这四个兼容面绝不能悬空。
+    // 最小的那个槽搬到 0 —— 4.1 起这不动任何人的订阅（住宅 HY2 的端口与槽无关），
+    // 只是让 relay 的 `2080` 与 xray 的 `relay-slot-0` 这两个兼容面不悬空。
     if let Some(first) = r.slots.first_mut() {
         if first.index != 0 {
             first.index = 0;
@@ -293,14 +248,6 @@ mod tests {
     use crate::model::{Residential, Slot};
     use pretty_assertions::assert_eq;
 
-    fn ports() -> Ports {
-        serde_json::from_str(
-            r#"{"hy2":10000,"hy2_hop":[20000,30000],"hy2_resi":40000,"hy2_resi_hop":[41000,50000],
-                "reality_direct":10001,"reality_resi":10002,"admin":8080}"#,
-        )
-        .unwrap()
-    }
-
     fn resi(indices: &[u16]) -> Residential {
         Residential {
             slots: indices
@@ -319,82 +266,61 @@ mod tests {
     fn max_slots_is_eight() {
         assert_eq!(MAX_SLOTS, 8);
         assert_eq!(RELAY_SOCKS_BASE, 2080);
-        assert_eq!(HY2_STATS_RESI_BASE, 9998);
     }
 
-    /// 单槽（含空池）必须与 v3 单实例逐字等价 —— golden 的生命线。
+    /// 单槽（含空池）：槽 0 的 relay 入站必须还是 `2080`（xray 的 `relay-slot-0`
+    /// 与中继配置都按它走）。
     #[test]
-    fn a_single_slot_keeps_the_v3_ports_exactly() {
+    fn a_single_slot_keeps_the_v3_relay_port_exactly() {
         let empty = Residential::default();
         assert_eq!(indices(&empty), vec![0]);
-        assert_eq!(slot_span(&empty), 1);
         assert_eq!(fallback_index(&empty), 0);
-        let r = resources_of(&ports(), &empty, 0);
         assert_eq!(
-            r,
+            resources(0),
             SlotRes {
                 index: 0,
                 relay_port: 2080,
-                hy2_port: 40000,
-                stats_port: 9998,
-                hop: (41000, 50000),
             }
         );
     }
 
+    /// `SlotRes` 只剩两项：端口换算只服务 relay 入站与 xray 住宅出站。
+    ///
+    /// 下面这几行必须**编译不过**（字段与函数都已删干净，spec §14 裁决 6）：
+    /// `let _ = r.hy2_port;` / `let _ = r.stats_port;` / `let _ = r.hop;` /
+    /// `slots::hop_slice(...)` / `slots::slot_span(&r)` / `slots::resources_of(&p, &r, 0)`。
     #[test]
-    fn three_slots_split_the_hop_range_into_contiguous_slices() {
-        let r = resi(&[0, 1, 2]);
-        assert_eq!(slot_span(&r), 3);
-        let p = ports();
-        let s: Vec<SlotRes> = (0..3).map(|i| resources_of(&p, &r, i)).collect();
-        assert_eq!(s[0].hop, (41000, 43999));
-        assert_eq!(s[1].hop, (44000, 46999));
-        // 最后一段吃掉余数，右端必须正好落在 50000（否则客户端跳到没人监听的端口）
-        assert_eq!(s[2].hop, (47000, 50000));
-        assert_eq!(
-            s.iter().map(|x| x.hy2_port).collect::<Vec<_>>(),
-            vec![40000, 40001, 40002]
-        );
+    fn slot_resources_are_now_only_the_relay_port() {
+        let r = resources(3);
+        assert_eq!(r.index, 3);
+        assert_eq!(r.relay_port, RELAY_SOCKS_BASE + 3);
+    }
+
+    /// 8 槽下每个槽的 relay 端口互不相同，且与 `MAX_SLOTS` 同源。
+    #[test]
+    fn eight_slots_get_eight_distinct_relay_ports() {
+        let ports: std::collections::BTreeSet<u16> =
+            (0..MAX_SLOTS).map(|i| resources(i).relay_port).collect();
+        assert_eq!(ports.len(), usize::from(MAX_SLOTS));
+        assert_eq!(*ports.iter().next().unwrap(), 2080);
+        assert_eq!(*ports.iter().last().unwrap(), 2087);
+    }
+
+    /// 三个槽各拿自己那一个 relay 端口，**不再有跳跃段可切**（4.0.x 那三条「切片首尾
+    /// 相接」的断言随 `hop_slice` 一起删了）。越界序号夹到最后一个槽，不 panic。
+    #[test]
+    fn three_slots_get_three_contiguous_relay_ports() {
+        let s: Vec<SlotRes> = (0..3).map(resources).collect();
         assert_eq!(
             s.iter().map(|x| x.relay_port).collect::<Vec<_>>(),
             vec![2080, 2081, 2082]
         );
         assert_eq!(
-            s.iter().map(|x| x.stats_port).collect::<Vec<_>>(),
-            vec![9998, 9997, 9996],
-            "9999 归直连实例，住宅只能往下走"
+            resources(MAX_SLOTS),
+            resources(MAX_SLOTS - 1),
+            "越界夹到顶槽"
         );
-        // 切片必须首尾相接、不重叠
-        assert_eq!(s[0].hop.1 + 1, s[1].hop.0);
-        assert_eq!(s[1].hop.1 + 1, s[2].hop.0);
-    }
-
-    /// D3：序号有空洞时闲置那一片，**不重切** —— 否则删一条上游就要全员刷订阅。
-    #[test]
-    fn a_hole_in_the_index_space_leaves_its_slice_idle() {
-        let r = resi(&[0, 2]);
-        assert_eq!(slot_span(&r), 3, "空间宽度按最高序号算，不按槽位个数");
-        let p = ports();
-        assert_eq!(resources_of(&p, &r, 0).hop, (41000, 43999), "槽 0 的片没变");
-        assert_eq!(resources_of(&p, &r, 2).hop, (47000, 50000));
-    }
-
-    #[test]
-    fn hop_slice_never_returns_an_empty_range() {
-        // 区间比槽数还短：全部共用整个区间
-        assert_eq!(hop_slice((41000, 41001), 1, 8), (41000, 41001));
-        // 退化区间
-        assert_eq!(hop_slice((41000, 41000), 0, 3), (41000, 41000));
-        // 越界序号夹到最后一段
-        assert_eq!(hop_slice((41000, 50000), 9, 2), (45500, 50000));
-        for span in 1..=MAX_SLOTS {
-            for i in 0..span {
-                let (lo, hi) = hop_slice((41000, 50000), i, span);
-                assert!(lo <= hi, "span={span} i={i} 切出了空区间");
-                assert!((41000..=50000).contains(&lo) && (41000..=50000).contains(&hi));
-            }
-        }
+        assert_eq!(resources(99).relay_port, 2087);
     }
 
     #[test]
@@ -659,7 +585,10 @@ mod tests {
     /// 各有一条带「他确实换了槽」断言的用例），所以这里是四条腿。
     #[test]
     fn changing_the_pool_never_moves_anybody_s_subscription() {
-        /// 4.0.x 算端口/区间的两个输入：每人的槽序号 + 槽位空间宽度（`hop_slice` 的分母）。
+        /// 4.0.x 算端口/区间的两个输入：每人的槽序号 + 槽位空间宽度（当年 `hop_slice`
+        /// 的分母 = 最高序号 + 1）。两个输入都已经不参与订阅了，这里就地算一遍只为
+        /// 证明「槽位真的动过」—— 否则某天 `sync_slots` / `rebalance` 退化成 no-op，
+        /// 「订阅没变」会在「什么都没变」的情况下照旧全绿。
         fn port_inputs(s: &State) -> (Vec<(String, u16)>, u16) {
             let mut per_user: Vec<(String, u16)> = s
                 .users
@@ -667,7 +596,14 @@ mod tests {
                 .map(|u| (u.username.clone(), index_of_user(u, &s.residential)))
                 .collect();
             per_user.sort();
-            (per_user, slot_span(&s.residential))
+            let span = s
+                .residential
+                .slots
+                .iter()
+                .map(|x| x.index + 1)
+                .max()
+                .unwrap_or(1);
+            (per_user, span)
         }
 
         let mut s = state(3, 5);

@@ -109,8 +109,8 @@ selector gate-r000 { outbounds: ["deny","slot-0-out"…"slot-7-out"], default: "
              "key_path": "/opt/b-ui/certs/privkey.pem" }
   }],
   "outbounds": [
-    { "type": "socks", "tag": "deny", "server": "127.0.0.1", "server_port": 1 },
-    { "type": "socks", "tag": "slot-0-out", "server": "127.0.0.1", "server_port": 2080 },
+    { "type": "socks", "tag": "deny", "server": "127.0.0.1", "server_port": 1, "version": "5" },
+    { "type": "socks", "tag": "slot-0-out", "server": "127.0.0.1", "server_port": 2080, "version": "5" },
     { "type": "selector", "tag": "gate-r000",
       "outbounds": ["deny","slot-0-out","slot-1-out","slot-2-out","slot-3-out",
                     "slot-4-out","slot-5-out","slot-6-out","slot-7-out"],
@@ -136,6 +136,8 @@ selector gate-r000 { outbounds: ["deny","slot-0-out"…"slot-7-out"], default: "
 字段出处：`users[].name/password`、`obfs`、`masquerade`、`ignore_client_bandwidth`、`bbr_profile`（1.14 起，缺省 `standard`，不写）、`tls` 必填——https://sing-box.sagernet.org/configuration/inbound/hysteria2/ ；`ListenOptions` 只有单个 `listen_port`、**没有端口范围字段**——https://sing-box.sagernet.org/configuration/shared/listen/ （评估 `sb.facts[5-入站无端口范围字段]`，这正是必须自管 nft 的原因）；`v2ray_api.stats.users` = "User list to count traffic" 且 "V2Ray API is not included by default"——https://sing-box.sagernet.org/configuration/experimental/v2ray-api/ 。
 
 与今天 apernet 配置（`render/hysteria.rs:86-152` `common_doc`）的逐项对应：`sniGuard: disable` → sing-box 无此概念，不需要字段；`resolver`（DoH）→ 本实例不解析目标域名，不要 `dns` 段；`trafficStats` → `v2ray_api`；`auth` → `users[]`；`sniff` → route 的 `sniff` action；`quic.maxIdleTimeout: 60s` → 字段名待核（§12 第 7 项）。这四个 apernet 专属字段在 sing-box 的入站 schema 里根本不存在，是配置模型的结构性差异而不是改名（评估 `sb.facts[1-apernet专属字段无对应]`）。
+
+`deny` 与 8 个槽出站的 `"version": "5"` 是实现照 `render/relay.rs` 的同风格显式写死的（sing-box 的 socks 出站默认就是 5，行为中性；写出来是为了两份渲染器逐字同形）。
 
 **新端口常量**：`HY2_RESI_CLASH_API = "127.0.0.1:9092"`（relay 是 9091，`residential/mod.rs:42` + 测试 `:388`）、`HY2_RESI_V2RAY_API = "127.0.0.1:10086"`（Xray api 是 10085）。两个面都**只监听回环、不设 secret**，与 relay 的 Clash API 同口径。`render/hysteria.rs` 里那条「鉴权端口避开全部监听端口」的守门测试扩成一张端口占用表，把这两个也钉进去。
 
@@ -258,12 +260,13 @@ Clash API 客户端复用 `modules/residential/clash.rs` 的 `Clash` trait（`re
 
 ### 3.5 配置重写与重启的契约
 
-`hy2-residential.json` 是 `Artifact::File` + `verify(Verify::SingBox)` + `restart(Unit::restart("hysteria-residential"))`，**不用 `restart_key`**——文件内容本身就与用户无关：只含凭据池、8 个槽出站、门、规则、两个回环端点、obfs、证书路径、监听端口。它只会因**四件事**变化：
+`hy2-residential.json` 是 `Artifact::File` + `verify(Verify::SingBox)` + `restart(Unit::restart("hysteria-residential"))`，**不用 `restart_key`**——文件内容本身就与用户无关：只含凭据池、8 个槽出站、门、规则、两个回环端点、obfs、伪装域、证书路径、监听端口。它只会因**五件事**变化：
 
 1. **凭据池扩容**（含 §3.1 的空闲密码重随机，只在重写时顺带做）；
 2. **`bui set obfs on|off`**（`node.obfs`）；
 3. **证书轮换**（`certs.rs:131-151` 那次重启，单元名没变所以代码不动；sing-box 是否会热加载证书从而免掉这次重启 → §12 第 9 项）；
-4. **`ports.hy2_resi` / `hy2_resi_hop` 改动**（`POST /api/config/port-hopping`，同时重写 nft 表）。
+4. **`ports.hy2_resi` / `hy2_resi_hop` 改动**（`POST /api/config/port-hopping`，同时重写 nft 表）；
+5. **伪装域变更**（面板 `POST /api/masquerade` 改 `reality.dest`；渲染器的 `masquerade.url` 由 `node.reality.sni()` 推导）⇒ 同样重写本文件并重启住宅实例。今天改伪装域也会重启两个 apernet 实例，所以这不是回归，但这次重启要算进重启账里（2026-09-16 第二波复核追加）。
 
 用户的任何生命周期动作**不许**触碰本文件。守门测试写进 `core_files.rs`：对同一 state 增删用户、换槽、置到期，渲染出的 `hy2-residential.json` 字节**逐字相等**（形状照 `core_files.rs:517-535` 那条「加用户改内容但不改 restart_key」的现有测试）。
 
@@ -603,7 +606,7 @@ Clash API 客户端复用 `modules/residential/clash.rs` 的 `Clash` trait（`re
 
 ### C3 文件与路径
 
-- **新**：`<base>/hy2-residential.json`（对账产物，0600）。**不新增** `BASE_WHITELIST` 条目（不开 `cache_file`，§3.4）⇒ 白名单仍是 13 项。
+- **新**：`<base>/hy2-residential.json`（对账产物，0600）。它是 `Artifact::File`，**不进** `BASE_WHITELIST`（漂移扫描只管「不是 artifact 的顶层条目」），而且不开 `cache_file`（§3.4）也就没有缓存文件要放行 ⇒ 白名单条目数不变，**是 14 项**（本文早先写的「13 项」是按更早的代码数的：`reconcile::drift::BASE_WHITELIST` 在 4.1 之前就已经是 14 项 —— bin / certs / caddy / packages / state.backups / .verify / v3-backup / state.json / runtime.json / manifest.json / manifest.prev.json / relay-cache.db / auth-snapshot.json / auth-hook.log）。
 - **退役**：`config-residential.yaml`、`config-residential-<i>.yaml`（对账产 `Absent`）。
 - 单元仍是六个名字；`hysteria-residential.service` 的 `ExecStart` 换成 sing-box、`ExecStartPre=-{bin}/bui nft apply`。
 - 回环端点新增 `127.0.0.1:9092`（Clash API）与 `127.0.0.1:10086`（v2ray_api）；`9991..9998` 释放。

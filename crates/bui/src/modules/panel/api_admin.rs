@@ -52,7 +52,7 @@ async fn report_pool_exhausted_for(app: &AppState, user_id: uuid::Uuid) {
         s.users
             .iter()
             .find(|u| u.user_id == user_id)
-            .filter(|u| super::gates::has_resi_hy2(u, &s.residential))
+            .filter(|u| bui_schema::hy2pool::is_resi_hy2(u, &s.residential))
             .filter(|u| bui_schema::hy2pool::cred_of(u, &s.residential).is_none())
             .map(|u| u.username.clone())
     };
@@ -382,7 +382,7 @@ async fn rotate_user(
             };
             users::rotate(&mut s.users[idx]);
             let uid = s.users[idx].user_id;
-            let resi = super::gates::has_resi_hy2(&s.users[idx], &s.residential);
+            let resi = bui_schema::hy2pool::is_resi_hy2(&s.users[idx], &s.residential);
             // 释放记 `released_at` ⇒ 24 小时冷却期，旧凭据不会立刻发给下一个人
             old_cred = bui_schema::hy2pool::release(s, uid, now);
             if resi {
@@ -1135,7 +1135,7 @@ mod tests {
     /// 纯直连用户建号不许白占一条住宅凭据（第七波复核）：池容量恒为
     /// 2 × 住宅 hysteria2 用户数（下限 32），直连用户把空闲吃掉后会先告警 `hy2_resi_pool_low`、
     /// 再触发「当场扩容」= 重写 `hy2-residential.json` + 重启 `hysteria-residential`
-    /// ⇒ 全体住宅 HY2 会话重连一次。判据只有 `gates::has_resi_hy2` 一处。
+    /// ⇒ 全体住宅 HY2 会话重连一次。判据只有 `bui_schema::hy2pool::is_resi_hy2` 一处。
     #[tokio::test]
     async fn creating_a_direct_only_user_mints_no_residential_cred() {
         let h = harness().await;

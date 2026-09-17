@@ -72,8 +72,10 @@ pub fn format_status(
             width = width
         ));
     }
+    // 「仅直连」不是修饰语而是作用域（spec §6、C5）：4.1 的住宅 HY2 是 sing-box 的静态
+    // 凭据池 + 门，配置里没有 `auth` 段 —— 拿这一行去判断住宅侧鉴权会判错。
     out.push(format!(
-        "鉴权模式    Hysteria2 {}",
+        "鉴权模式    Hysteria2 {}（仅直连；住宅 HY2 走凭据池 + 门）",
         match hy2_auth {
             Hy2Auth::Http => "auth.type=http（守护进程进程内应答）",
             Hy2Auth::Command => "auth.type=command（钩子 bin/bui-auth-hook，退路）",
@@ -633,6 +635,8 @@ mod tests {
             t.contains("鉴权模式") && t.contains("auth.type=http"),
             "{t}"
         );
+        // 4.1：这一行的作用域只有直连（C5：`bui set hy2-auth` 语义同步缩窄）
+        assert!(t.contains("仅直连"), "{t}");
         assert!(!t.contains("auth.type=command"), "{t}");
         let t = format_status(
             &sample(),

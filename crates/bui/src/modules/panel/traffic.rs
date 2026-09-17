@@ -111,8 +111,9 @@ pub fn resi_kick_targets(s: &State, ids: &[Uuid], open: &BTreeSet<Uuid>) -> Vec<
         .filter_map(|id| {
             let u = s.users.iter().find(|u| u.user_id == *id)?;
             let c = bui_schema::hy2pool::cred_of(u, &s.residential)?;
-            let restore_to = (open.contains(id) && super::gates::has_resi_hy2(u, &s.residential))
-                .then(|| slot_out_tag(bui_schema::slots::index_of_user(u, &s.residential)));
+            let restore_to = (open.contains(id)
+                && bui_schema::hy2pool::is_resi_hy2(u, &s.residential))
+            .then(|| slot_out_tag(bui_schema::slots::index_of_user(u, &s.residential)));
             Some(ResiKickTarget {
                 cred_id: c.id.clone(),
                 name: c.name.clone(),

@@ -137,10 +137,11 @@ pub fn project(
         });
         (idx, ip)
     });
-    // 门位：有住宅 hysteria2 权益才有这一档（口径同 `gates::expected` 的 `has_resi_hy2`）。
+    // 门位：有住宅 hysteria2 权益才有这一档（口径同 `gates::expected`，判据是
+    // `bui_schema::hy2pool::is_resi_hy2`）。
     // 持有的凭据 id 不在 `gates` 里（悬空指针、或池刚扩容还没收敛）一律按「未分配」显示，
     // 不猜一个放行值。
-    let hy2_resi_gate = super::gates::has_resi_hy2(u, resi).then(|| {
+    let hy2_resi_gate = bui_schema::hy2pool::is_resi_hy2(u, resi).then(|| {
         u.credentials
             .hy2_resi_cred
             .as_deref()

@@ -9,7 +9,10 @@
 //! 三件事在这个文件里：
 //!
 //! 1. [`expected`] —— 期望门位的**唯一**口径（纯函数）。面板投影（T14 的 `hy2ResiGate`）
-//!    与 CLI 都读它，免得「谁该放行」在三处各写一遍。
+//!    与 CLI 都读它，免得「谁该放行」在三处各写一遍。「谁算住宅 HY2 用户」这半条判据
+//!    在 [`bui_schema::hy2pool::is_resi_hy2`]：T15 把 4.0.x 那两套（本文件不看分组存在性
+//!    的旧 `has_resi_hy2` / schema 里不看分组的 `is_resi_hy2`）合成了一处，取更严的那个，
+//!    池容量、分凭据、门位、面板与踢人从此同源。
 //! 2. [`converge`] —— 挂在 [`users::sync_users`](super::users::sync_users) 末尾，与它旁边
 //!    那段 xray 收敛**同构**：读一次内核真源（`GET /proxies`）、求差集、只 PUT 不一致的那几个。
 //!    触发路径沿用现成的两条（`StateChanged` + 60 秒安全网），不新增定时器。
@@ -28,7 +31,8 @@ use crate::modules::residential::health::REPLAY_RETRY_BUDGET;
 use crate::modules::residential::state as resi_state;
 use crate::modules::sentinel::incidents::{self, Incident, Level};
 use crate::reconcile::DaemonCtx;
-use bui_schema::model::{Protocol, Residential, State, User};
+use bui_schema::hy2pool::is_resi_hy2;
+use bui_schema::model::{State, User};
 use bui_schema::render::hy2_singbox::{gate_tag, slot_out_tag, DENY_TAG};
 use bui_schema::slots::index_of_user;
 use std::collections::{BTreeMap, BTreeSet};
@@ -55,24 +59,6 @@ pub struct GateOutcome {
     pub switched: usize,
     /// 失败项的人读原因；进 `SyncOutcome.errors` ⇒ `USER_SYNC_FAILED_LOG`
     pub errors: Vec<String>,
-}
-
-/// 「有住宅权益、权益指向的分组真实存在、且开了 hysteria2」—— 门只对这些人开。
-///
-/// 一份口径给门位收敛、建号 / 轮换分凭据（[`slots::assign_hy2_cred`](crate::modules::residential::slots::assign_hy2_cred)）、
-/// 面板投影与踢人（[`super::traffic::resi_kick_targets`]）用，分头写两遍就会漂移成
-/// 「门开着但没凭据」或「有凭据但门不开」。
-///
-/// **分组存在性不能省**：`nodes_for` 的 `resi_ok` 也要求
-/// `resi.groups.contains_key(&r.group_id)`（`bui-schema/src/nodes.rs`），`group_id` 悬空时
-/// （人工改 `state.json`、分组被删）订阅里已经不发住宅 HY2 节点了。门是授权落点，
-/// 取两者里更严的那个 —— 少了这一条，拿着旧订阅的人会继续从住宅 IP 出海。
-pub(crate) fn has_resi_hy2(u: &User, r: &Residential) -> bool {
-    u.entitlements
-        .residential
-        .as_ref()
-        .is_some_and(|e| r.groups.contains_key(&e.group_id))
-        && u.entitlements.protocols.contains(&Protocol::Hysteria2)
 }
 
 /// 期望门位：凭据 `id` → 出站 tag（spec §3.3）。
@@ -103,7 +89,7 @@ pub fn expected(s: &State, blocked: &BTreeSet<Uuid>) -> BTreeMap<String, String>
             let tag = holder
                 .get(c.id.as_str())
                 .filter(|u| {
-                    !u.disabled && !blocked.contains(&u.user_id) && has_resi_hy2(u, &s.residential)
+                    !u.disabled && !blocked.contains(&u.user_id) && is_resi_hy2(u, &s.residential)
                 })
                 .map(|u| slot_out_tag(index_of_user(u, &s.residential)))
                 .unwrap_or_else(|| DENY_TAG.to_string());
@@ -281,6 +267,7 @@ mod tests {
     use super::*;
     use crate::modules::panel::testsupport::{harness, Harness};
     use crate::testutil::sample_state;
+    use bui_schema::model::Protocol;
     use pretty_assertions::assert_eq;
     use time::macros::datetime;
 

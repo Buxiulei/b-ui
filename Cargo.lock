@@ -211,7 +211,7 @@ dependencies = [
 
 [[package]]
 name = "bui"
-version = "4.0.1"
+version = "4.1.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -256,7 +256,7 @@ dependencies = [
 
 [[package]]
 name = "bui-c"
-version = "4.0.1"
+version = "4.1.0"
 dependencies = [
  "base64",
  "bui-schema",
@@ -278,7 +278,7 @@ dependencies = [
 
 [[package]]
 name = "bui-schema"
-version = "4.0.1"
+version = "4.1.0"
 dependencies = [
  "argon2",
  "base64",

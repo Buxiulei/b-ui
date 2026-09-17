@@ -30,14 +30,18 @@
 //!
 //! ## IP 池与槽位 —— [`slots`]
 //!
-//! - [`slots::SlotRes`]：一个槽位的全部端口（relay 入站 / HY2 监听 / trafficStats / 跳跃区间），
-//!   由 [`slots::resources_of`] 从 [`Ports`](model::Ports) 与槽序号纯函数算出。
+//! - [`slots::SlotRes`] `{ index, relay_port }`：槽 i 的那**一个**端口（relay 的 socks
+//!   入站 `2080 + i`，也是 xray 住宅出站的目标），由 [`slots::resources`] 从槽序号纯函数
+//!   算出 —— **不吃 [`Ports`](model::Ports)**，因为 4.1 起槽位与对外端口无关。
 //! - [`slots::sync_slots`] / [`slots::least_loaded`] / [`slots::assign`] /
 //!   [`slots::migrate_unassigned`] / [`slots::rebalance`]：spec §5.6 的分配规则，纯函数。
 //! - **没有「必须重新获取订阅」这回事了**（4.1，spec §1.2 目标 1）：住宅 HY2 只有一个
 //!   监听端口、整段跳跃由 `table inet bui` 送进去，每个用户的端口与区间完全相同、与槽位
 //!   无关，所以增删上游 / `assign` / `rebalance` 都不动已下发的订阅。4.0.x 那套按原因分
 //!   三组的 `resubscribe_impact` / `ResubscribeImpact` 随之删除。
+//! - 同一批删掉的还有按槽算对外端口的一整套（spec §4.2、§13 C1、§14 裁决 6，连签名一起，
+//!   不留 `#[deprecated]` 也不留转发壳）：`SlotRes.{hy2_port, stats_port, hop}`、
+//!   `slots::{HY2_STATS_RESI_BASE, hop_slice, slot_span, resources_of}`。
 //!
 //! ## 住宅 HY2 凭据池 —— [`hy2pool`]
 //!
@@ -84,8 +88,17 @@
 //!
 //! ## 服务端配置渲染 —— [`render`]
 //!
-//! - [`render::hysteria::direct_yaml`] / [`render::hysteria::residential_yaml`]：两个
-//!   Hysteria2 实例的 `config.yaml` / `config-residential.yaml`。
+//! - [`render::hysteria::direct_yaml`]：**直连** Hysteria2 实例的 `config.yaml`
+//!   （4.1 起这是唯一一个 apernet hysteria 实例；4.0.x 的
+//!   `residential_yaml` / `residential_slot_yaml` 与 `config-residential[-<i>].yaml`
+//!   一起退役）。
+//! - [`render::hy2_singbox::config`]：**住宅** HY2 的 `hy2-residential.json`（一个 sing-box
+//!   hysteria2 入站 + 凭据池 + 每凭据一个 `gate-<id>` selector），端点常量
+//!   [`render::hy2_singbox::HY2_RESI_CLASH_API`] / [`render::hy2_singbox::HY2_RESI_V2RAY_API`]
+//!   与标签 [`render::hy2_singbox::INBOUND_TAG`] / [`render::hy2_singbox::DENY_TAG`] /
+//!   [`render::hy2_singbox::gate_tag`] / [`render::hy2_singbox::slot_out_tag`] 都只有这一处来源。
+//! - [`render::nft::ruleset`]：住宅 HY2 端口跳跃那张 `table inet bui`
+//!   （[`render::nft::TABLE`]，整段 + 可选的 4.0 兼容段 REDIRECT 到单一监听端口）。
 //! - [`render::xray::config`]：含 `vless-direct` / `vless-residential` 两个 REALITY 入站的
 //!   `xray-config.json`；[`render::xray::structural_hash`] 忽略 `clients` 后取哈希，
 //!   用于判断是否只是加减用户（可热更新而不必重启）。
