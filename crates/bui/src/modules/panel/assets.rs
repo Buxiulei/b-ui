@@ -497,4 +497,53 @@ mod tests {
             assert!(value.contains(must), "spec §6 的文案缺「{must}」：{value}");
         }
     }
+
+    /// 面板「重置订阅链接与凭据」（rotate）的文案（spec §7.4 第 3 条，2026-09-17 裁决）：
+    /// 二次确认与成功提示**都要说「切换」**。
+    ///
+    /// rotate 换掉住宅凭据的 `name` ⇒ 对按账号匹配的 `bui-c` 等于换了账号：重新导入只
+    /// **新增**新节点、旧的留在原地当当前节点，而它的门已被切 `deny` ⇒ 显示已连接但
+    /// 请求全被拒。只说「重新导入」，运维照着做完用户照旧打不开网页 —— 这正是本次裁决要
+    /// 写清楚的后果。
+    ///
+    /// 「切换」还必须说清**切到哪**（2026-09-17 复核订正）：导入完那一问问的是**第一个**新
+    /// 节点，而 rotate 也换 `vless_uuid` ⇒ 融合权益的用户 Reality 两条也各新增一条，
+    /// `nodes::nodes_for` 又把 Reality直连 排在最前 ⇒ 答 y 通常切到 Reality 直连、住宅出口
+    /// 静默丢掉。所以文案里「第一个新节点」与「菜单 [1]」这两句同样是断言项。
+    ///
+    /// 断言切在 `rotateSub()` 的**函数体**里，不是整份文件：同样的字眼也写在常量旁边的
+    /// 注释里，按整份文件断言时把 `_ROTATE_SWITCH` 从 `confirm(` 里摘掉仍然全绿。
+    #[test]
+    fn the_panel_rotate_copy_says_reimport_and_switch() {
+        let js = String::from_utf8(web_file("app.js").unwrap()).unwrap();
+        let decl = js
+            .split_once("const _ROTATE_SWITCH =")
+            .expect("rotate 的文案常量没了")
+            .1;
+        let value = decl.split_once(";\n").expect("_ROTATE_SWITCH 没收尾").0;
+        for must in [
+            "切换到新的住宅 HY2 节点",
+            "旧的留在原地",
+            "请求被拒",
+            "第一个新节点",
+            "菜单 [1]",
+        ] {
+            assert!(value.contains(must), "rotate 的文案缺「{must}」：{value}");
+        }
+        let body = js
+            .split_once("function rotateSub(")
+            .expect("rotateSub 没了")
+            .1
+            .split_once("\n}")
+            .expect("rotateSub 没收尾")
+            .0;
+        assert!(
+            body.contains("_ROTATE_SWITCH"),
+            "二次确认不再带 rotate 的后果文案：{body}"
+        );
+        assert!(
+            body.contains("并切换到新的住宅 HY2 节点"),
+            "成功提示不再点名「切换」：{body}"
+        );
+    }
 }
