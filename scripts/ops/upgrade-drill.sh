@@ -37,7 +37,8 @@ API="http://127.0.0.1:8080"
 # `not-found`（固定六个缺一个照判 FAIL）；「该有的槽位单元到底回来没有」另由槽位表点名。
 UNITS_V41="b-ui hysteria-server hysteria-residential xray b-ui-relay caddy"
 UNITS_V40="$UNITS_V41 hysteria-residential-1 hysteria-residential-2 hysteria-residential-3 hysteria-residential-4 hysteria-residential-5 hysteria-residential-6 hysteria-residential-7"
-# `--units` 覆盖：给了就三个相位都用它（调试用）
+# `--units` 覆盖：给了就三个相位都用它（调试用）。按槽实例的单元名随之不在采样清单里，
+# 所以按槽的**单元**断言跟着跳过（见 `slot_units_sampled`）
 UNITS=""
 # Global Constraints 钉死的期望态端口，与 `bui_schema::render::nft` 同源：住宅 HY2 只剩
 # `:40000`，整段 41000-50000 与 4.0 兼容段 40001-40007 由 `table inet bui` REDIRECT 过去。
@@ -79,6 +80,12 @@ done
 # 唯一的机器闸门**：`bui upgrade` 由**旧**二进制执行，4.1 自己那道 `nft_blocking_for` 闸门
 # （commands/upgrade.rs）在这一跳里根本没被执行到。一个相位都不进、一个字都不落盘。
 command -v nft >/dev/null 2>&1 || { printf '缺少 nft：4.1 住宅跳跃全靠它，先 apt-get install -y nftables\n' >&2; exit 2; }
+# `ss` 前置：全部 listen 判据（升级后只有 :40000 在听、回滚后 40000+i 逐个回来）都走 `ss -lnu`，
+# iproute2 缺了 `listening()` 一律返回 false ⇒ 先白等满 `--settle`（默认 300 秒）再判「住宅入站
+# 没起来」，把「本机没装 iproute2」报成住宅全断。口径同上下两道守卫：一个相位都不进、一个字都
+# 不落盘。排在 python3 之前，好让「摘掉含 ss 的目录」时先撞上这一条（usr-merge 的机器上
+# `ss` 与 `python3` 常在同一个目录）。
+command -v ss >/dev/null 2>&1 || { printf '缺少 ss：监听端口判据全靠它，先 apt-get install -y iproute2\n' >&2; exit 2; }
 # state.json 里的订阅 token 要用 python3 解（口径同 scripts/ops/sentinel-drill.sh）
 command -v python3 >/dev/null 2>&1 || { printf '需要 python3 来解析 state.json\n' >&2; exit 2; }
 
@@ -151,6 +158,13 @@ units_required() {
         printf '%s\n' "$UNITS_V40"
     fi
 }
+
+# 按槽实例的**单元**断言（升级相位「一个不剩」、回滚相位「每槽都 active」）能不能判：`--units`
+# 一给，采样清单里就没有 `hysteria-residential-<i>` 了，那两条断言只会 `awk` 出空值、判出
+# 「期望 not-found，实测（没记到）」的假 FAIL（4.1 机器上最自然的调试写法就是把固定六个抄进
+# `--units`）。所以 `--units` 覆盖时跳过它们；按槽的**端口**断言来源是 state.json 的槽位表，
+# 与 `--units` 无关，照判。
+slot_units_sampled() { [[ -z "$UNITS" ]]; }
 
 # $1 = 端口 → `ss -lnu` 上有没有人在听。`-F:` 取末段，免得 41000 被 141000 命中
 listening() {
@@ -345,6 +359,8 @@ log "演练开始：base=$BASE bui=$BUI to=${TO:-manifest 里的版本} manifest
 # 升级前那份 state.json 的槽位表 = 4.0.x 的槽位表（回滚会把 state 恢复到同一份）
 SLOTS=$(slot_indices | sort -n | tr '\n' ' ')
 log "升级前的住宅槽位：${SLOTS:-（无，住宅未启用）}"
+slot_units_sampled ||
+    log "note --units 覆盖了采样清单（$UNITS）：按槽实例的单元断言跳过，按槽端口断言照判"
 # 监听指纹要采的端口：住宅基础端口、跳跃段首端口（4.1 里被 REDIRECT 掉、永远无人监听）、
 # 兼容段第一个，再加 4.0.x 每槽一个的 40000+i
 LISTEN_PORTS="$HY2_RESI $HY2_RESI_HOP_START $((HY2_RESI + 1))"
@@ -400,8 +416,10 @@ compare_subs before after-upgrade || note_fail "upgrade-subs"
 # sha 不进 `p.kernels`、`format_plan` 也就不打这一行 ⇒ 在 4.0.x → 4.1 这一跳上无条件要求它
 # 等于把健康的升级判成 FAIL（而计划 Step 6 的口径是「任一相位 FAIL 就按 §9 回滚」）。自建那份
 # 照样会被装上，只是由重启后的 4.1 守护进程按 `kernel_build_differs` 装（reconcile/diff.rs）。
-# 4.2 及以后要复用本脚本，这里的代次判据得跟着 `plan_upgrade` 的口径一起改。
-if [[ "$before_ver" == 4.1.* ]]; then
+# 4.2 及以后要复用本脚本，这里的代次判据得跟着 `plan_upgrade` 的口径一起改——glob 钉成
+# `4.1.[0-9]*`：patch 段必须是数字，这样将来的 `4.10.x`（写成 `4.1*` 就会被吃掉）与 `4.1.`
+# 这类残缺串（写成 `4.1.*` 会被吃掉）都落不进这一档。
+if [[ "$before_ver" == 4.1.[0-9]* ]]; then
     if grep -q '^sing-box ' "$UPOUT"; then
         log "升级计划里的 sing-box：$(grep -m1 '^sing-box ' "$UPOUT")"
     else
@@ -434,7 +452,9 @@ fi
 # 有洞时覆盖不到别的槽）。
 for i in $SLOTS; do
     [[ "$i" == "0" ]] && continue
-    expect after-upgrade "load:hysteria-residential-$i" not-found "槽 $i 的 4.0.x 实例单元" || note_fail "upgrade-resi-units"
+    if slot_units_sampled; then
+        expect after-upgrade "load:hysteria-residential-$i" not-found "槽 $i 的 4.0.x 实例单元" || note_fail "upgrade-resi-units"
+    fi
     expect after-upgrade "listen:udp:$((HY2_RESI + i))" no "槽 $i 的 4.0.x 实例端口" || note_fail "upgrade-listen"
 done
 
@@ -462,6 +482,7 @@ compare_listen before after-rollback || note_fail "rollback-listen"
 # `all_active` 会跳过 `not-found` 的单元，所以这一条是「该有的槽位单元没回来」的唯一守门。
 for i in $SLOTS; do
     expect after-rollback "listen:udp:$((HY2_RESI + i))" yes "槽 $i 的监听" || note_fail "rollback-listen"
+    slot_units_sampled || continue
     unit="hysteria-residential"
     [[ "$i" == "0" ]] || unit="hysteria-residential-$i"
     expect after-rollback "unit:$unit" active "槽 $i 的单元" || note_fail "rollback-resi-units"
