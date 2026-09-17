@@ -23,6 +23,10 @@ assert_eq "0" "$(grep -c 'hysteria-residential-' "$ROOT/scripts/m1-acceptance.sh
 assert_eq "0" "$(grep -c '9998' "$ROOT/scripts/m1-acceptance.sh")" \
     "脚本里没有 4.0 的住宅计量端口"
 
+# CLAUDE.md：`scripts/` 下的脚本都带 `#!/usr/bin/env bash` + `LC_ALL=C`。判据里全是中文
+# 子串与 `grep`，locale 一歪就可能连排序带匹配一起变。
+assert_eq "1" "$(grep -c '^LC_ALL=C$' "$ROOT/scripts/m1-acceptance.sh")" "脚本带 LC_ALL=C"
+
 # 编排层的最后一环：每一步真的在 run_checks 里被调用。`--self-test` 只跑各 check_* 与
 # 判定函数、不跑 run_checks，所以把其中一行调用整条删掉自测照样全绿 —— 只能在这里钉。
 body=$(sed -n '/^run_checks()/,/^}$/p' "$ROOT/scripts/m1-acceptance.sh")

@@ -6,6 +6,7 @@
 # 环境变量：BUI（默认 /opt/b-ui/bin/bui）、BASE（默认 /opt/b-ui）、
 #           SB112/SB113/SB114（三个 sing-box 版本的二进制路径，缺则跳过该版本）
 set -uo pipefail
+LC_ALL=C
 
 BUI=${BUI:-/opt/b-ui/bin/bui}
 BASE=${BASE:-/opt/b-ui}
@@ -1116,10 +1117,12 @@ panel.example.com
     no "自测：鉴权通了却没判通过" "$out"
   fi
   # ①b 三条探测的 server 行与 auth 串：直连用 hy2_password，住宅两条用池凭据，
-  #     第三条把整段跳跃写进 server（`:40000,41000-50000` = 订阅里的 mport=）
+  #     第三条把整段跳跃写进 server（`:40100,45000-46000` = 订阅里的 mport=）。
+  #     `40100` / `45000-46000` 是夹具里的**非默认**端口（见 `self_test_hy2_state`）⇒
+  #     住宅那两条要是写死了期望态默认值，这里当场转红。
   if [ "$(grep -c '^server: 127.0.0.1:10000$' "$d/seen.yaml")" = "1" ] &&
-    [ "$(grep -c '^server: 127.0.0.1:40000$' "$d/seen.yaml")" = "1" ] &&
-    [ "$(grep -c '^server: 127.0.0.1:40000,41000-50000$' "$d/seen.yaml")" = "1" ] &&
+    [ "$(grep -c '^server: 127.0.0.1:40100$' "$d/seen.yaml")" = "1" ] &&
+    [ "$(grep -c '^server: 127.0.0.1:40100,45000-46000$' "$d/seen.yaml")" = "1" ] &&
     [ "$(grep -c '^auth: "alice:pw:with:colons"$' "$d/seen.yaml")" = "1" ] &&
     [ "$(grep -c '^auth: "r007:c2VjcmV0LTIyLWNoYXJz"$' "$d/seen.yaml")" = "2" ]; then
     ok "自测：住宅两条用池凭据、其中一条带整段跳跃（验 output 链）"
@@ -1183,11 +1186,16 @@ panel.example.com
 
 # step 6 自测用的 state.json：$1 = 目录，$2 = 塞进 node 的额外片段（obfs），
 # $3 非空则那个用户**没有** hy2_resi_cred（还没分到住宅凭据）
+#
+# 住宅端口 `40100` 与整段 `45000-46000` 都是**故意的非默认值**（期望态默认是 40000 与
+# 41000-50000）。裁决是「住宅端口与整段跳跃只从期望态 node.ports 取」，夹具要是用默认值，
+# 把 `check_hy2_auth` 里那句 `resi_ports` 换成写死的 40000 / 41000-50000 照样全绿 ——
+# 非默认值一上，①b 那两条 `server:` 断言就成了这条裁决的活体判据。
 self_test_hy2_state() {
   local cred='"hy2_resi_cred":"r007",'
   [ -z "${3:-}" ] || cred=
   printf '%s\n' \
-    "{\"node\":{\"domain\":\"panel.example.com\",$2\"ports\":{\"hy2_resi\":40000,\"hy2_resi_hop\":[41000,50000]}}," \
+    "{\"node\":{\"domain\":\"panel.example.com\",$2\"ports\":{\"hy2_resi\":40100,\"hy2_resi_hop\":[45000,46000]}}," \
     ' "residential":{"hy2_pool":{"creds":[{"id":"r000","name":"bob","secret":"c2VjcmV0LWJvYi0yMmNo"},' \
     '                                     {"id":"r007","name":"r007","secret":"c2VjcmV0LTIyLWNoYXJz"}]}},' \
     ' "users":[{"username":"ghost","disabled":true,"credentials":{"hy2_password":"x"}},' \
@@ -1364,9 +1372,13 @@ EOF
 
 # step 7 自测用的 state.json：$1 = 目录，$2 = users[0] 里 sub_token 那个键值对（空 = 没有
 # token）。住宅端口 / 整段跳跃 / 面板端口全在期望态里，脚本不重算。
+#
+# 与 step 6 的夹具同一理由：`40100` / `45000-46000` 是**故意的非默认值**，`check_slots`
+# 里那句 `resi_ports` 换成写死的 40000 / 41000-50000 时，下面 ① 的监听判据与订阅口径
+# 判据会一起转红（夹具用默认值的话两道门禁照样全绿）。
 self_test_slots_state() {
   printf '%s\n' \
-    '{"node":{"ports":{"hy2_resi":40000,"hy2_resi_hop":[41000,50000],"admin":9876}},' \
+    '{"node":{"ports":{"hy2_resi":40100,"hy2_resi_hop":[45000,46000],"admin":9876}},' \
     " \"users\":[{\"username\":\"alice\"${2:+,$2}}]}" \
     > "$1/state.json"
 }
@@ -1409,19 +1421,20 @@ self_test_check_slots() {
   printf '%s\n' '{"slots":[{"index":0,"relay_port":2080,"borrowed":false,"users":["alice"]}]}' > "$d/slots.json"
   self_test_slots_state "$d" '"sub_token":"0123456789abcdef0123456789abcdef"'
   clean='State  Recv-Q Send-Q Local Address:Port  Peer Address:Port
-UNCONN 0      0            0.0.0.0:40000      0.0.0.0:*
-UNCONN 0      0               [::]:40000         [::]:*'
+UNCONN 0      0            0.0.0.0:40100      0.0.0.0:*
+UNCONN 0      0               [::]:40100         [::]:*'
   stray="$clean
-UNCONN 0      0               [::]:41234         [::]:*"
+UNCONN 0      0               [::]:45234         [::]:*"
   # 订阅正文（base64 解出来的那串 URI）：直连那条也在，判据不许跟它混
   body='hysteria2://alice:pw@example.com:10000?sni=example.com&insecure=0&mport=20000-30000#alice-HY2%E7%9B%B4%E8%BF%9E
-hysteria2://r007:c2VjcmV0@example.com:40000?sni=example.com&insecure=0&mport=41000-50000#alice-HY2%E4%BD%8F%E5%AE%85'
+hysteria2://r007:c2VjcmV0@example.com:40100?sni=example.com&insecure=0&mport=45000-46000#alice-HY2%E4%BD%8F%E5%AE%85'
 
-  # ① 健康：槽位表自洽 / 单元在跑 / 只在住宅端口上听 / 跳跃段无监听 / 订阅口径一致
+  # ① 健康：槽位表自洽 / 单元在跑 / 只在住宅端口上听 / 跳跃段无监听 / 订阅口径一致。
+  #    夹具里那对端口是非默认值 ⇒ 住宅端口与整段跳跃要是写死了默认值，这一条当场转红。
   out=$(self_test_slots_run "$d" "$clean" "$body")
   if [ "$(printf '%s\n' "$out" | grep -c '^PASS')" = "5" ] &&
     [ "$(printf '%s\n' "$out" | grep -c '^FAIL')" = "0" ] &&
-    [[ "$out" == *"住宅端口 = 40000、mport = 41000-50000"* ]]; then
+    [[ "$out" == *"住宅端口 = 40100、mport = 45000-46000"* ]]; then
     ok "自测：健康机器 → step7 五条 PASS"
   else
     no "自测：健康机器的 step7 没全绿" "$out"
@@ -1429,13 +1442,13 @@ hysteria2://r007:c2VjcmV0@example.com:40000?sni=example.com&insecure=0&mport=410
   # ② 跳跃段上冒出监听 = 4.0 那些按槽起的实例还活着 ⇒ 跨进程静默丢包
   out=$(self_test_slots_run "$d" "$stray" "$body")
   if [ "$(printf '%s\n' "$out" | grep -c '^FAIL')" = "1" ] && [[ "$out" == *游离监听* ]] &&
-    [[ "$out" == *41234* ]]; then
+    [[ "$out" == *45234* ]]; then
     ok "自测：跳跃段上冒出监听 → 判失败"
   else
     no "自测：游离监听没被判失败" "$out"
   fi
   # ③ 订阅里的 mport 与期望态不符（改过端口却没刷订阅）
-  out=$(self_test_slots_run "$d" "$clean" "${body//41000-50000/41000-41999}")
+  out=$(self_test_slots_run "$d" "$clean" "${body//45000-46000/45000-45999}")
   if [ "$(printf '%s\n' "$out" | grep -c '^FAIL')" = "1" ] && [[ "$out" == *"mport 不对"* ]]; then
     ok "自测：订阅的 mport 与期望态不符 → 判失败"
   else
@@ -1482,8 +1495,8 @@ hysteria2://r007:c2VjcmV0@example.com:40000?sni=example.com&insecure=0&mport=410
     no "自测：单元没在跑却没判失败" "$out"
   fi
   # ⑨ 住宅端口上压根没人听（单元起着但监听没落，或端口被改过）
-  out=$(self_test_slots_run "$d" "$(printf '%s\n' "$clean" | grep -v 40000)" "$body")
-  if [ "$(printf '%s\n' "$out" | grep -c '^FAIL')" = "1" ] && [[ "$out" == *"没在听 :40000/udp"* ]]; then
+  out=$(self_test_slots_run "$d" "$(printf '%s\n' "$clean" | grep -v 40100)" "$body")
+  if [ "$(printf '%s\n' "$out" | grep -c '^FAIL')" = "1" ] && [[ "$out" == *"没在听 :40100/udp"* ]]; then
     ok "自测：住宅端口上没有监听 → 判失败"
   else
     no "自测：住宅端口没人听却没判失败" "$out"
