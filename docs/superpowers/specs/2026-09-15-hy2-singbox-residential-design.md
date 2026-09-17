@@ -247,7 +247,7 @@ Clash API 客户端复用 `modules/residential/clash.rs` 的 `Clash` trait（`re
 | 删用户 | 释放凭据 | `PUT gate-<id> → deny` | 同到期 |
 | 删上游（槽消失） | `sync_slots` 释放槽 + 用户重分配 | 受影响用户各一次 `PUT` | relay 照今天重启一次（`core_files.rs:250-256` 无 `restart_key`）；hysteria 配置不变、**订阅不变** |
 | 加上游 | 新槽 | 无 | 无 |
-| 凭据池扩容 / obfs 开关 / 证书轮换 / 端口改动 | 重写配置 | 重启单元 → §3.4 重放 | 全体住宅 HY2 会话重连一次（与今天 obfs 开关 / 证书轮换的影响面相同） |
+| 凭据池扩容 / obfs 开关 / 证书轮换 / 端口改动 / 伪装域变更（§3.5 那五件事，一件不少） | 重写配置 | 重启单元 → §3.4 重放 | 全体住宅 HY2 会话重连一次（与今天 obfs 开关 / 证书轮换的影响面相同） |
 
 **收敛入口只有一个**：`panel::users::sync_users`（`users.rs:465`）增加「门位收敛」段——算期望门位、`selected_all()` 读真源、只对差集 `select`，与它旁边那段 xray 收敛（读内核 → 差集 AddUser/RemoveUser）同构；`StateChanged` 与 60 秒安全网（`SYNC_INTERVAL_SECS`，`users.rs:25`）两条触发路径不变。任一 PUT 失败进 `SyncOutcome.errors` → 打 `USER_SYNC_FAILED_LOG`（`users.rs:29`）→ 哨兵新签名 `hy2_resi_gate_sync_failed`（§8.1）。`/api/users` 的投影增加 `hy2ResiGate`（`slot-3-out` / `deny` / `未分配`），面板与 `bui residential slots` 按槽列用户时读它。
 

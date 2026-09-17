@@ -897,8 +897,12 @@ mod tests {
     }
 
     /// 守门（spec §3.5）：对同一 state 增删用户 / 换槽 / 置到期，`hy2-residential.json`
-    /// 的字节**逐字相等** —— 只有池扩容 / obfs / 证书 / 端口这四件事能改它。
+    /// 的字节**逐字相等** —— 只有池扩容 / obfs / 证书 / 端口 / 伪装域这五件事能改它。
     /// 破了这条就等于用户每次到期都要重启一次住宅内核，全体在线连接一起断。
+    ///
+    /// 反面断言逐件对着 §3.5 的清单：除了证书（路径是常量、内容不进这份配置），第 1、2、4、5
+    /// 件各有一条 `assert_ne!`。伪装域那一条是 2026-09-17 复核补的 —— 第 5 件此前只有文档、
+    /// 没有守门，而它在代码里只由 `render::hy2_singbox` 那一处 `node.reality.sni()` 推导支撑。
     #[test]
     fn user_lifecycle_never_touches_the_residential_config() {
         let base = state_with_pool();
@@ -942,7 +946,11 @@ mod tests {
                 secret: "s".into(),
                 released_at: None,
             });
-        assert_ne!(bytes(&grown), want, "只有池扩容 / obfs / 证书 / 端口能改它");
+        assert_ne!(
+            bytes(&grown),
+            want,
+            "只有池扩容 / obfs / 证书 / 端口 / 伪装域能改它"
+        );
         let mut obfs = base.clone();
         obfs.node.obfs.enabled = true;
         obfs.node.obfs.password = "pw".into();
@@ -950,6 +958,13 @@ mod tests {
         let mut ports = base.clone();
         ports.node.ports.hy2_resi = 45000;
         assert_ne!(bytes(&ports), want, "改端口要改它");
+        // 第 5 件（spec §3.5 第 5 条）：伪装域变更（面板 `POST /api/masquerade` 改
+        // `reality.dest`）。`masquerade.url` 由 `node.reality.sni()` 推导 ⇒ 这一处推导被
+        // 写死成常量域名的话，改伪装域就不再重写这份配置、也不再重启住宅实例，
+        // 而住宅 HY2 的伪装域会永远停在旧值上（与直连实例不再同源）。
+        let mut masq = base.clone();
+        masq.node.reality.dest = "www.example.com:443".into();
+        assert_ne!(bytes(&masq), want, "改伪装域（reality.dest）要改它");
     }
 
     /// 全新装机（`hy2pool::migrate` 之前）池是空的：此时也必须渲染出合法配置

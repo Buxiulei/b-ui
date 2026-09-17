@@ -81,12 +81,13 @@ token 不是密码，不做 hash：它必须能原样发给用户，也必须能
 
 ## 6. 轮换
 
-`POST /api/users/{username}/rotate`（管理员鉴权内，请求体是空对象；面板配置弹窗里的「重置订阅链接与凭据」按钮，`rotateSub()` 先二次确认再发）。四件事必须一起做，少一件就不叫轮换：
+`POST /api/users/{username}/rotate`（管理员鉴权内，请求体是空对象；面板配置弹窗里的「重置订阅链接与凭据」按钮，`rotateSub()` 先二次确认再发）。五件事必须一起做，少一件就不叫轮换（第 5 件是 **4.1 起新增**的，随住宅 HY2 换成静态凭据池 + 门一起来）：
 
 1. **换 token**（`sub_token = new_sub_token()`）——旧链接的路径段作废；
 2. **换 hy2 密码与 vless uuid**（`credentials`）——泄露的链接里同时有这两样，只换 token 等于没换；
 3. **停用这个用户的用户名链接**（`legacy_sub_disabled = true`）——否则全局宽限期没到时，旧的用户名链接照样能取到**新**凭据；
 4. **踢掉他已经建立的 hy2 会话**：两条鉴权路径都只在**握手时**过 `auth_hook::decide`，xray 的 RemoveUser/AddUser 也只影响新握手，所以不踢的话拿着旧凭据的那一方照旧有流量，直到连接自己断。先发 `StateChanged("users")`（两条鉴权路径据此刷新、鉴权快照重写）再按 `traffic::stats_ports` 对这一刻期望态里的每个 hy2 实例踢一次，被踢的客户端拿旧密码重连时已经会被拒；踢是 best-effort，失败只记 warn（新凭据已经生效，踢不动只是旧会话多活一会儿）。
+5. **置换住宅 HY2 的池凭据并当场切门**（**4.1 起新增**，2026-09-15 spec §3.3「rotate」那一行 / §7.4）：住宅 HY2 的密码不在 `credentials` 里，而是 `hy2_pool` 里那条静态凭据 `{name}:{secret}` ⇒ 只换第 2 件的 `hy2_password` 对住宅那条链接毫无作用。所以必须显式**先 `hy2pool::release`（记 `released_at`，24 小时冷却，旧凭据不会立刻发给下一个人）再 `slots::assign_hy2_cred`** —— `hy2pool::assign` 是幂等的，不 release 就原样拿回旧凭据、轮换等于没换；随后 `finish_cred_swap` 两次 `PUT /proxies`：旧凭据的门**当场**切 `deny`（门是 `interrupt_exist_connections` 的 selector，这一下才掐断拿着旧订阅那一方的存量流；只靠 60 秒门位收敛的话旧凭据在那一分钟里照旧能从住宅 IP 出网），新凭据的门开到他自己那一槽。`hy2-residential.json` 一个字节都不动、住宅内核不重启（§3.5 的守门契约）。**代价写在 2026-09-15 spec §7.4**：凭据连 `name` 一起换了 ⇒ 对按账号匹配的 `bui-c` 等于换了账号，rotate 之后必须重新导入**并明确切换**到新的住宅 HY2 节点；旧节点在切换前一直「显示已连接但所有请求被拒」。
 
 回包直接给出新的 `subToken` / `password` / `uuid`（与 `create_user` 同口径：这条路由在 `require_admin` 里面，面板本来就在显示每个用户的密码与 uuid）。
 
