@@ -381,7 +381,7 @@ Clash API 客户端复用 `modules/residential/clash.rs` 的 `Clash` trait（`re
 
 - **今天**：到期 / 封禁 / 超限 / rotate 后的旧密码在**握手**即被拒（`auth_hook::decide`：常量时间比密码 + `blocked` + `expires_at`，fail-closed），客户端显示连不上。
 - **4.1 住宅**：密码静态在 `users[]` 里，**握手成功**，`metadata.User` 落到门 `deny` ⇒ 每条流 `connection refused`。客户端显示「已连接」但所有请求失败。**tizi PoC 已验证**：默认门 deny 的用户握手成功、请求全部 HTTP 000。直连 HY2 与 Reality 不变。
-- **面板与 CLI 文案**（用户列表状态 tooltip + `bui status` 用户段）：「已停用 / 已到期：**住宅 HY2 客户端仍会显示已连接，但所有请求会被拒绝**；直连节点在连接时即被拒绝。」`docs/residential-proxy-guide.md` 同步一段；rotate 的回包提示加一句「住宅 HY2 的旧凭据会在刷新订阅前一直显示已连接但不通」。
+- **面板与 CLI 文案**（用户列表状态 tooltip + `bui status` 用户段）：「已停用 / 已到期：**住宅 HY2 客户端仍会显示已连接，但所有请求会被拒绝**；直连节点在连接时即被拒绝。」`docs/residential-proxy-guide.md` 同步一段；rotate 的回包提示加两句：「住宅 HY2 的旧凭据会在刷新订阅前一直显示已连接但不通」与「**Linux 客户端还要明确切换到新的住宅 HY2 节点**」（导入完那一问只切**第一个**新节点，融合权益时那通常是 Reality 直连 ⇒ 文案要点名菜单 [1] / `bui-c switch`）—— rotate 换掉住宅凭据的 `name`（`alice` → `rNNN`），对按账号匹配的客户端等于换了账号，重新导入只新增新节点、旧的留在原地，见 §7.4 第 3 条「rotate 的后果」。
 - **`auth-hook.log`**：住宅路径**不再有任何记录**——sing-box 对 hysteria2 鉴权失败不打任何日志（评估 `sb.facts[7-鉴权失败无日志]`，tizi PoC 复验「鉴权失败仍无日志」）。文件保留给直连，格式不变。住宅侧排查改看 `journalctl -u hysteria-residential`：tizi PoC 实测日志**带用户名**——`inbound/hysteria2[hy2-resi]: inbound connection from <ip>:<port>` 与 `[r000] inbound connection to <host>:<port>`，比 apernet 更好定位。
 - **`bui set hy2-auth http|command`**：只重渲染直连 `config.yaml`、只重启 `hysteria-server`；CLI 帮助与 `bui status` 的「HY2 鉴权」行注明「仅直连」。
 - **m1 判据变化**（`scripts/m1-acceptance.sh`：`hy2_auth_probe` 在 `:219`、`check_hy2_auth` 在 `:278`、住宅探测调用在 `:305`）：直连探测不变（bundled hysteria 客户端 → https 200 → `auth-hook.log` 末行 `allow`，`:215`）；**住宅探测改为**用该用户的住宅凭据（`name:secret`）连 `127.0.0.1:40000` → https 200，且 `journalctl -u hysteria-residential --since <探测起点>` 出现 `[<name>] inbound connection`；再加一步带 `mport=41000-50000` 打回环，验 nft 的 **output** 链。
@@ -430,6 +430,15 @@ Clash API 客户端复用 `modules/residential/clash.rs` 的 `Clash` trait（`re
 3. > `bui-c check` **不会**自动重拉订阅（check.rs/update.rs 不取节点、不存 token）⇒ 服务端换槽/改段/开混淆后 bui-c 用户要手动 `import --sub -`。B 的目标之一就是让「换槽不再需要刷订阅」。
 
    ⇒ 这正是 §1.2 目标 2 的价值所在：4.1 之后换槽 / 增删 IP **不再产生任何需要重导的理由**。`slots.rs` 里那句「要等下一次订阅更新（`bui-c` 的每日 timer…）」的注释**与事实不符**（`bui-c` 的 `check` 与每日自动更新都不取节点），已在 4.0.1 按事实改写成「Linux 客户端不会自动刷新节点，必须由用户手动 `bui-c import --sub -` 或菜单 [3] 重新导入」；这套机制本身随 §4.2 退役时连注释一起删。仍需人工重导的只剩两种：rotate（今天已是如此）与**兼容段下线时**那一代「4.0 多槽、槽 ≥ 1」的导入。
+
+   **rotate 的后果（2026-09-17 主会话裁决：不改行为，把后果写清楚）**：4.1 的 rotate 对按账号匹配的客户端**等于换了账号** —— 迁移用户的住宅凭据 `name = 用户名`（`alice`），而池里空闲凭据的 `name` 全是 `rNNN`，所以 rotate 之后订阅里的住宅 HY2 账号从 `alice` 变成 `r017`。于是：
+
+   - 客户端重新导入只会**新增**一条 `r017` 的住宅节点，`alice` 那条**留在原地**（`docs/superpowers/specs/2026-09-15-bui-c-account-match-design.md:100` 的前提「同一次轮换里 HY2 只换密码、username 不变」在 4.1 的住宅 HY2 上不再成立）；**融合权益的用户不止多这一条**：rotate 同时换 `vless_uuid`，而 `bui-c` 的 Reality 账号判据就是 uuid（`profiles::same_account`）⇒ Reality 直连与 Reality 住宅两条也各新增一条，旧的两条从此**连不上**（不是「连着被拒」）；只有没有 Reality 权益的纯 HY2 用户才真的只多一条；
+   - `alice` 那条凭据在 rotate 里已经 `release` + 切到 `deny` ⇒ 旧节点**显示已连接但所有请求被拒**（§6 的 `deny` 语义）；它正好是当前活动节点时，用户就是「连着但什么都打不开」；
+   - ⇒ **rotate 之后 Linux 客户端要重新导入，并明确切换到新的住宅 HY2 节点**。**不能只指着菜单 [3] 导入完那句「切换到新导入的 …？」**（2026-09-17 复核订正）：它问的是 `fresh.first()`，即**第一个**新节点（`crates/bui-c/src/cli.rs` 的 `confirm("切换到新导入的 {first}？")`），而新节点按 `nodes::nodes_for` 的顺序（Reality直连 → Reality住宅 → HY2直连 → HY2住宅）追加进 `profiles`（`profiles::upsert` 只往尾部 push）⇒ 融合权益的用户答 y 切到的是 **Reality 直连**那条，住宅出口被静默丢掉（`import --activate` 同理，它激活的是这批导入的第一个节点）。出路是菜单 [1] 选节点，或命令行 `sudo bui-c switch <新的住宅 HY2 节点名>`（`bui-c import` 不替你切），切过去之后再删旧节点；**节点名的具体形态按 `bui-c` 侧的命名规则**（见 `docs/HANDOVER-bui-c.md` §6），服务端侧的文案与本节都不写死；
+   - 失败形态会随时间收敛（是止损，不是修复）：释放的凭据带 `released_at`，下一次因 §3.5 五件事（池扩容 / `bui set obfs on|off` / 证书轮换 / 改 `ports.hy2_resi` 与 `hy2_resi_hop` / 伪装域变更）重写 `hy2-residential.json` 时 `hy2pool::regenerate_idle_secrets` 会换掉它的 `secret`，那之后旧节点从「连上被拒」变成**握手即失败**。
+
+   **为什么不改成「rotate 只换 secret、保留 name」**（bui-c 会话的提议，裁决否）：改 `secret` 就要改 `hy2-residential.json` 的 `users[]`，而那份文件写盘即**重启住宅入站**（`core_files.rs` 里它是 `Verify::SingBox` + restart、没有 `restart_key`），且有守门测试 `core_files.rs:903 user_lifecycle_never_touches_the_residential_config()` 钉住「用户生命周期动作一个字节都不许碰它」—— 为一个人换凭据而打断全体住宅用户，方向不对。这也是结构使然：零重载的 rotate 只能在**已写进配置**的凭据之间搬人，而空闲凭据的名字全是 `rNNN`。客户端侧同样**不加「rotate」字样**：客户端分不清一条新节点是 rotate 来的还是用户自己新加的（bui-c 会话的理由，成立）。
 
 ---
 

@@ -343,6 +343,37 @@ async fn update_user(
     ok_json(json!({"success": true, "user": new_name}))
 }
 
+/// rotate 回包里那句人读提示（spec §6 的文案要求 + §7.4 第 3 条「rotate 的后果」，
+/// 2026-09-17 主会话裁决）。
+///
+/// 两件事必须一起说，少一件运维就会漏掉一整类报障：
+/// 1. 住宅 HY2 的旧凭据此刻已被 `release` + 切 `deny` ⇒ 它**握手照旧成功**、每个请求被拒
+///    （§6 的 `deny` 语义），在用户重新导入之前一直是「显示已连接但打不开网页」；
+/// 2. 住宅凭据的 `name` 也换了（迁移用户的 `alice` → 池里的 `rNNN`），所以对按账号匹配的
+///    Linux 客户端（`bui-c`）**等于换了账号**：重新导入只会**新增**一条住宅 HY2 节点，
+///    旧的留在原地，它正好是当前活动节点时，光导入不切换等于什么都没变。
+///
+/// 而「切换」不能只指着导入完那一问（2026-09-17 复核订正）：`bui-c` 那一问问的是**第一个**
+/// 新节点（`crates/bui-c/src/cli.rs` 的 `confirm("切换到新导入的 …？")`），而 rotate 同时换
+/// `vless_uuid`、Reality 那边是按 uuid 认账号（`bui-c` 的 `profiles::same_account`）⇒ 同时有
+/// Reality 权益时 Reality 两条也各算新账号、各新增一条；节点顺序是
+/// Reality直连 → Reality住宅 → HY2直连 → HY2住宅（`bui_schema::nodes::nodes_for`），新节点按这个
+/// 顺序追加 ⇒ 第一个新节点通常就是 Reality 直连那条，照着答 y 只会切到它、住宅出口静默丢掉。
+/// 所以文案必须点名菜单 [1] / `bui-c switch`。节点名的具体形态是 `bui-c` 侧的命名规则，
+/// 这里**不写死**。
+///
+/// 裁决是**不改行为**（不做「只换 secret、保留 name」：那要改 `hy2-residential.json` 的
+/// `users[]`，而那份文件写盘即重启住宅入站，见 `core_files.rs` 的
+/// `user_lifecycle_never_touches_the_residential_config`），只把后果写清楚。
+const ROTATE_NOTICE: &str = "旧链接与旧凭据已失效，请让该用户重新导入一次新订阅链接，\
+并在导入后明确切换到新的住宅 HY2 节点：住宅凭据连名字一起换了，\
+对按账号匹配的 Linux 客户端（bui-c）等于换了账号，重新导入只会新增新节点、旧的留在原地，\
+而旧的住宅节点会一直显示已连接但所有请求被拒（它正好是当前节点时，用户就是「连着但什么都打不开」）。\
+菜单 [3] 导入完那句「切换到新导入的 …？」问的是第一个新节点，答 y 不一定切到住宅节点：\
+rotate 也换了 VLESS UUID，同时有 Reality 权益时 Reality 两条同样各新增一条（旧的连不上了），\
+而第一个新节点通常就是 Reality 直连那条。所以要用菜单 [1] 选节点，\
+或命令行 sudo bui-c switch <新的住宅 HY2 节点名>，旧节点切过去之后再删。";
+
 /// `POST /api/users/{username}/rotate`（2026-09-14 裁决）：换订阅 token + hy2 密码 + vless uuid，
 /// 并停用这个用户的「用户名链接」。请求体是空对象（没有可调项，所以一个字节都不读）。
 ///
@@ -363,6 +394,9 @@ async fn update_user(
 /// - Reality 那条**已建立**的连接没有对应手段（xray 没有 kick），要等它自己断；
 /// - 踢的是「这一刻的期望态里该有的」全部 hy2 实例（`traffic::stats_ports`），
 ///   对内核没起来的实例会记一条 warn。
+///
+/// 回包带一句人读提示 `notice`（spec §6 / §7.4 第 3 条，2026-09-17 裁决）：见
+/// [`ROTATE_NOTICE`]。面板 `rotateSub()` 的二次确认与成功提示是同一口径的另一份文案。
 async fn rotate_user(
     State(app): State<AppState>,
     Path(username): Path<String>,
@@ -425,6 +459,7 @@ async fn rotate_user(
         "subToken": u.sub_token,
         "password": u.credentials.hy2_password,
         "uuid": u.credentials.vless_uuid,
+        "notice": ROTATE_NOTICE,
     }))
 }
 
@@ -1219,6 +1254,49 @@ mod tests {
         // 面板列表跟着给出新 token（前端据此拼订阅链接）
         let (_, list) = send(&r, "GET", "/api/users", Some(&t), None).await;
         assert_eq!(list[0]["subToken"], token_now);
+    }
+
+    /// rotate 回包那句人读提示（spec §6 的文案要求 + §7.4 第 3 条，2026-09-17 裁决）。
+    ///
+    /// 三个要点少一个都会漏掉一整类报障，所以逐条断言而不是只判「非空」：
+    /// - **切换到住宅节点**：rotate 换掉住宅凭据的 `name` ⇒ 对按账号匹配的 `bui-c`
+    ///   （`profiles::same_account` 比的就是 Hysteria2 的 `username`）等于换了账号，
+    ///   重新导入只**新增**新节点、旧的留在原地当当前节点 ⇒ 只说「重新导入」等于没说；
+    /// - **旧节点显示已连接但请求被拒**：旧凭据的门已切 `deny`（§6 语义），
+    ///   不写这句，运维会把「用户说还连着但打不开」当成面板数据不对；
+    /// - **导入完那一问只切第一个新节点**（2026-09-17 复核订正）：rotate 也换 `vless_uuid`，
+    ///   Reality 按 uuid 认账号 ⇒ 融合权益的用户 Reality 两条也各新增一条，而
+    ///   `nodes::nodes_for` 的顺序把 Reality直连 排在最前 ⇒ 那一问问的通常是 Reality 直连，
+    ///   答 y 就把住宅出口静默丢了。所以文案必须点名菜单 [1] / `bui-c switch`。
+    #[tokio::test]
+    async fn rotate_tells_the_operator_to_reimport_and_switch() {
+        let h = harness().await;
+        with_pool(&h).await;
+        let (r, t) = app(&h).await;
+        let (s, v) = send(
+            &r,
+            "POST",
+            "/api/users/alice/rotate",
+            Some(&t),
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(s, axum::http::StatusCode::OK);
+        let notice = v["notice"].as_str().expect("回包必须带人读提示 notice");
+        for must in [
+            "重新导入",
+            "切换到新的住宅 HY2 节点",
+            "显示已连接",
+            "请求被拒",
+            "第一个新节点",
+            "菜单 [1]",
+            "bui-c switch",
+        ] {
+            assert!(
+                notice.contains(must),
+                "rotate 回包的提示缺「{must}」：{notice}"
+            );
+        }
     }
 
     /// 轮换的住宅那半（spec §3.3）：释放旧凭据（记 `released_at` ⇒ 24 小时冷却期）、
