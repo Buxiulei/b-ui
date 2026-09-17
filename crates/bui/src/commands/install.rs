@@ -1075,6 +1075,24 @@ pub async fn run_with_wait(
                 if !answers.first_user.is_empty() {
                     state.users.push(first_user(&answers.first_user)?);
                 }
+                // spec §3.1：建住宅 HY2 凭据池并给首用户分一条 —— 全新装机的第一个用户
+                // **不走** `residential::slots::assign_new_user`（他是在这里 push 进去的），
+                // 少了这一步他从一开始就没有住宅 HY2 凭据 ⇒ `nodes_for` 不发那个节点、
+                // `hy2-residential.json` 渲染出空池（一个门都没有）。
+                //
+                // **先 `grow` 再 `migrate`**：`migrate` 的「池为空」分支是 **v3 迁移**口径
+                // （`name` = 用户名、`secret` = 直连 `hy2_password` 的副本），为的是让升级
+                // 零刷新订阅。全新装机没有 v3 订阅要保，白付那份耦合 —— 首用户的住宅凭据
+                // 从一开始就等于他的直连密码，正是 spec §3.1「复制一份、之后各走各的」
+                // 想切断的那条。所以先把池按 `size_for` 建成新发凭据（`name = id`、
+                // `secret` 16 字节随机），`migrate` 只负责从空闲里分一条给他。
+                // `--import-v3` 那条路不走这里，仍是迁移口径（订阅逐字不变）。
+                let taken: std::collections::BTreeSet<String> =
+                    state.users.iter().map(|u| u.username.clone()).collect();
+                let target =
+                    bui_schema::hy2pool::size_for(bui_schema::hy2pool::resi_hy2_users(&state));
+                bui_schema::hy2pool::grow(&mut state.residential.hy2_pool, target, &taken);
+                bui_schema::hy2pool::migrate(&mut state, host.now());
                 state
             }
         };
@@ -3251,6 +3269,34 @@ mod tests {
         assert_eq!(
             snap["users"][DEFAULT_FIRST_USER]["hy2_password"],
             serde_json::json!(u.credentials.hy2_password)
+        );
+        // spec §3.1：首用户装机时就该拿到住宅 HY2 凭据。少了它 `nodes_for` 不发住宅 HY2
+        // 节点（T7），而 `hy2-residential.json` 会渲染出空池 —— 一个门都没有。
+        assert!(
+            u.credentials.hy2_resi_cred.is_some(),
+            "首用户没拿到住宅 HY2 凭据 ⇒ 他的订阅里永远没有住宅 HY2 节点"
+        );
+        let cred = bui_schema::hy2pool::cred_of(u, &state.residential)
+            .expect("指针必须指向池里真实存在的凭据");
+        // 全新装机是**新发**口径（spec §3.1），不是迁移口径：迁移那份 `name = 用户名`、
+        // `secret = hy2_password 的副本` 只为「v3 升上来零刷新订阅」而存在，全新装机白付
+        // 那份耦合 —— 住宅凭据会等于他的直连密码。
+        assert_eq!(cred.name, cred.id, "全新装机：新发凭据的 name = id");
+        assert_ne!(
+            cred.secret, u.credentials.hy2_password,
+            "住宅凭据的 secret 不许是直连密码的副本（否则改直连密码不动它 = 吊销不生效）"
+        );
+        assert_eq!(cred.secret.len(), 22, "16 字节 base64url 无填充");
+        assert_eq!(
+            state.residential.hy2_pool.creds.len(),
+            bui_schema::hy2pool::POOL_MIN,
+            "池要补到下限，空闲凭据就是预留的门位"
+        );
+        assert!(
+            bui_schema::nodes::nodes_for(u, &state.node, &state.residential)
+                .iter()
+                .any(|n| n.kind == bui_schema::nodes::NodeKind::Hy2Residential),
+            "首用户的节点表里要有住宅 HY2"
         );
         // 装完那一屏打出去的三条订阅地址必须真的渲染得出东西来（2026-09-12 审查 blocking：
         // 只断言 state 里有这个用户，渲染不出来照样是「面板空的、订阅无处可填」）。

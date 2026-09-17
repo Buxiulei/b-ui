@@ -16,6 +16,26 @@
 //!
 //! 住宅的计数器同样不跨 sing-box 重启存活（与 apernet 那个内存 trafficStats 计数器
 //! 是同一种丢失窗口：重启丢掉「上次采样到重启」这一段），**这里不做任何补偿或降级**。
+//!
+//! ## 在线数的量纲：**每人 0 / 1**（T14 裁决，第五波复核）
+//!
+//! 三个来源报回来的东西量纲根本不同：
+//! - 直连 hysteria2 的 `/online` 是**会话数**（apernet 按已鉴权会话计，一人多设备 = N）；
+//! - 住宅 sing-box 的 Clash `/connections` 是**连接条数**（[`online_of`]，一个只在刷网页
+//!   的住宅用户轻易到 30 条）；
+//! - Xray 压根没有连接数接口，只能「最近 30 秒有增量就算 1」。
+//!
+//! 直接相加，面板那个「在线设备」卡就是把会话数、连接条数与常数 1 加在一起 —— 它等于
+//! 任何东西。所以 [`tick`] 在把 `online` 交给面板缓存之前，把每个来源都收成「**这个人
+//! 现在有没有在线**」：任一来源 > 0 ⇒ 这个人记 1（[`apply_sample`] 只管流量累加，压根
+//! 不碰 `online`）。于是 `/api/online` 的值恒为 `1`（不在线的人压根不进表）、
+//! 面板那个卡是「在线用户数」，全站一个量纲。
+//!
+//! 为什么不是另一个选项（面板把住宅那一列单独标成「连接数」）：住宅那条路**取不到会话
+//! 概念** —— sing-box 的 hysteria2 入站不在 Clash API 里暴露会话，只有连接；两列不同量纲
+//! 的数字也没法喂给同一个汇总卡。踢人（`on ? 断开按钮 : 无`）与限额判定都只看「在不在线」
+//! 这个布尔，一个都不需要基数。**代价说清**：直连用户的多设备数不再显示（只显示「在线」），
+//! 要看会话基数请打 `/online`（`bui` 不再转述它）。
 
 use super::hy2resi::online_of;
 use super::users::{self, month_key};
@@ -80,14 +100,6 @@ pub struct ResiKickTarget {
     pub restore_to: Option<String>,
 }
 
-/// 「有住宅权益且开 hysteria2」—— 门只对这些人开（同 `hy2pool` 里那条池容量判据）。
-fn has_resi_hy2(u: &bui_schema::model::User) -> bool {
-    u.entitlements.residential.is_some()
-        && u.entitlements
-            .protocols
-            .contains(&bui_schema::model::Protocol::Hysteria2)
-}
-
 /// 这些用户在住宅侧的踢人目标；没有凭据的用户（没住宅权益、或池还没分过）不在表里。
 ///
 /// `open` = 这些人里「踢完还该放行」的那些（手动踢人时 = 没被 `users::blocked_set` 判拒
@@ -99,8 +111,9 @@ pub fn resi_kick_targets(s: &State, ids: &[Uuid], open: &BTreeSet<Uuid>) -> Vec<
         .filter_map(|id| {
             let u = s.users.iter().find(|u| u.user_id == *id)?;
             let c = bui_schema::hy2pool::cred_of(u, &s.residential)?;
-            let restore_to = (open.contains(id) && has_resi_hy2(u))
-                .then(|| slot_out_tag(bui_schema::slots::index_of_user(u, &s.residential)));
+            let restore_to = (open.contains(id)
+                && bui_schema::hy2pool::is_resi_hy2(u, &s.residential))
+            .then(|| slot_out_tag(bui_schema::slots::index_of_user(u, &s.residential)));
             Some(ResiKickTarget {
                 cred_id: c.id.clone(),
                 name: c.name.clone(),
@@ -384,10 +397,19 @@ pub async fn tick(ctx: &DaemonCtx, shared: &Shared) -> anyhow::Result<()> {
             *online.entry(uid).or_insert(0) += *n;
         }
     }
-    // Xray 没有连接数接口：最近 30 秒有增量就按 1 计（spec §4.2 的并集）
+    // Xray 没有连接数接口：最近 30 秒有增量就算在线（spec §4.2 的并集）
     for uid in shared.xray_seen().await.keys() {
         online.entry(*uid).or_insert(1);
     }
+    // **归一成每人 0 / 1**（见模块文档「在线数的量纲」）：上面三个来源分别是直连会话数、
+    // 住宅连接条数、Xray 的常数 1，相加等于任何东西。收成布尔就一个量纲，面板那个卡是
+    // 「在线用户数」。**这一行是唯一的归一点** —— 删了它就回到 4.0.x 那个混量纲的和。
+    //
+    // 不必再 `retain` 掉 0：三个来源都不产 0 —— `hy2::parse_online` 明确「`n <= 0` 视为
+    // 不在线、不进表」，`hy2resi::online_of` 是按连接条数累加（没连接就没这个键），
+    // Xray 那一档写的是常数 1。不在线的人压根不进这张表。
+    online.values_mut().for_each(|n| *n = 1);
+
     let mut cache = shared.cache_mut().await;
     for (id, d) in &deltas {
         if let Some(name) = state
@@ -654,6 +676,71 @@ mod tests {
         );
     }
 
+    /// T14 的量纲判据（第五波复核）：三个来源（直连会话数 / 住宅连接条数 / Xray「有增量」）
+    /// 同时报回来，面板缓存里这个人仍然只是 **1 个在线**。
+    ///
+    /// 4.0.x 是三者相加：一个只在刷网页、住宅开了 30 条连接的用户会显示成「30 在线」，
+    /// 而面板顶上那个「在线设备」卡把全表这种数加起来 —— 那个数不代表任何东西。
+    /// 原始采样（[`Sample::online`]）照旧是各来源的原值，归一只在 [`tick`] 里那一行。
+    #[tokio::test]
+    async fn the_panel_counts_one_online_user_not_the_sum_of_three_dimensions() {
+        let h = harness().await;
+        with_pool(&h).await;
+        let ctx = ctx_of(&h);
+        let id = h.store.read().await.users[0].user_id.to_string();
+        // 直连：3 个会话
+        h.hy2.with(|i| {
+            i.online.insert(9999, BTreeMap::from([(id.clone(), 3u32)]));
+        });
+        // 住宅：30 条连接
+        let conns: Vec<(String, String)> = (0..30)
+            .map(|n| {
+                (
+                    format!("c{n}"),
+                    "auth_user=alice => route(gate-r000)".to_string(),
+                )
+            })
+            .collect();
+        h.hy2resi.set_conns(
+            conns
+                .iter()
+                .map(|(a, b)| (a.as_str(), b.as_str()))
+                .collect(),
+        );
+        // **先不给 Xray 流量**：Xray 那一档写的是常数 1，有它在就会把「直连会话数 + 住宅
+        // 连接条数」这个混量纲的和掩盖掉（第一版用例就是被它掩盖的，变异验证抓出来的）
+        tick(&ctx, &h.shared).await.unwrap();
+        assert_eq!(
+            h.shared.cache().await.online.get("alice").copied(),
+            Some(1),
+            "3 个会话 + 30 条连接 = 1 个在线用户（4.0.x 这里是 33）"
+        );
+        // 再加上 Xray 的那一档，还是 1
+        h.xray.with(|i| {
+            i.deltas.insert(id.clone(), TxRx { tx: 1, rx: 1 });
+        });
+        tick(&ctx, &h.shared).await.unwrap();
+        assert_eq!(
+            h.shared.cache().await.online.get("alice").copied(),
+            Some(1),
+            "3 个会话 + 30 条连接 + Xray 有量 = 1 个在线用户"
+        );
+
+        // 全部来源归零 ⇒ 这个人压根不进表（前端按 falsy 显示「离线」、不给断开按钮）
+        h.hy2.with(|i| {
+            i.online.insert(9999, BTreeMap::new());
+        });
+        h.hy2resi.set_conns(vec![]);
+        h.xray.with(|i| i.deltas.clear());
+        h.shared.xray_seen().await.clear();
+        tick(&ctx, &h.shared).await.unwrap();
+        assert!(
+            !h.shared.cache().await.online.contains_key("alice"),
+            "不在线的人不进表：{:?}",
+            h.shared.cache().await.online
+        );
+    }
+
     /// 住宅的字节与在线数要真的落进**生产路径**：`tick` 自己那一次
     /// `resi_name_to_user` 读出的换键表。
     ///
@@ -688,8 +775,9 @@ mod tests {
         );
         assert_eq!(
             h.shared.cache().await.online.get("alice").copied(),
-            Some(2),
-            "在线数 = /connections 里归到他的条数"
+            Some(1),
+            "面板缓存的在线是**每人 0/1**：住宅那两条连接归到他，他就是 1 个在线用户，\
+             不是 2（量纲见模块文档）"
         );
         assert!(h.shared.cache().await.errors.is_empty());
 

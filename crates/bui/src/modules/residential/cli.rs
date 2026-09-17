@@ -8,7 +8,6 @@
 //! 全部路由与载荷都能在不起守护进程的情况下单测。
 
 use crate::commands::menu::{MenuAction, MenuItem};
-use crate::modules::residential::upstream;
 use std::path::PathBuf;
 
 /// `bui residential` 的子命令。
@@ -72,10 +71,34 @@ pub enum ResidentialCmd {
     Rebalance,
     /// 把某个用户钉到某一槽（`<槽序号>`、`<uuid>`、`resi-N` / `url-N` 或 `<host:port>`）
     Assign { user: String, target: String },
+    /// 住宅 HY2 的静态凭据池（4.1，spec §3.1）：看已用 / 容量 / 代号，或手动扩容
+    Pool {
+        #[command(subcommand)]
+        cmd: PoolCmd,
+    },
     /// 黑名单（查看 / 钉住 / 立即应用）
     Blacklist {
         #[command(subcommand)]
         cmd: BlacklistCmd,
+    },
+}
+
+/// `bui residential pool` 的子命令（4.1，spec §3.1）。
+#[derive(Debug, Clone, clap::Subcommand, PartialEq, Eq)]
+pub enum PoolCmd {
+    /// 已用 / 容量 / 空闲 / 第几代 + 持有人（只读，不动任何东西）
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// 扩容到 `--to` 条（不给就补到 `hy2pool::size_for(住宅 hysteria2 用户数)`）。
+    ///
+    /// **幂等**：已经够大就零改动。真扩容会重写 `hy2-residential.json` + 重启
+    /// `hysteria-residential`（spec §3.5），全体住宅 HY2 会话重连一次 —— 所以它是运维
+    /// 手动预留门位的入口，正常路径由建用户那条自己按需扩。
+    Grow {
+        #[arg(long)]
+        to: Option<usize>,
     },
 }
 
@@ -185,6 +208,20 @@ pub fn to_request(
             "POST",
             "/api/residential/assign".into(),
             Some(serde_json::json!({"user": user, "target": target})),
+        ),
+        C::Pool {
+            cmd: PoolCmd::Status { .. },
+        } => ("GET", "/api/residential/pool".into(), None),
+        C::Pool {
+            cmd: PoolCmd::Grow { to },
+        } => (
+            "POST",
+            "/api/residential/pool/grow".into(),
+            // `--to` 不给就让服务端按 `size_for` 算（CLI 不读 state，spec §2.4）
+            Some(match to {
+                Some(n) => serde_json::json!({"to": n}),
+                None => serde_json::json!({}),
+            }),
         ),
         C::Blacklist { cmd } => return blacklist_request(cmd),
     })
@@ -675,72 +712,85 @@ fn upstream_groups(
     out
 }
 
-/// 回包里的 `port_changed` → 三组名单。没有这个键、或解析不了都按**空名单**
-/// （老守护进程的回包、以及不涉及改槽的路径）。
-fn impact_of(v: &serde_json::Value) -> bui_schema::slots::ResubscribeImpact {
-    v.get("port_changed")
-        .cloned()
-        .and_then(|x| serde_json::from_value(x).ok())
-        .unwrap_or_default()
-}
-
-/// 名单的人读渲染，**四条改槽路径（add / remove / assign / rebalance）共用**：
-/// `。<标题>：` 再每组一行（两空格缩进）。**空名单返回空串** —— 于是各路径那句一行提示
-/// 后面什么都不多打。
+/// `remove` 的人读渲染。
 ///
-/// 名单是服务端在那次写入的临界区里算的（按「手里那份订阅还能不能用」分三组）：HY2 住宅
-/// 节点的端口与跳跃段写死在已下发的订阅里，客户端要等下一次订阅更新才知道它变了，在那之
-/// 前反复断联。组名与原因直接取 [`upstream::impact_title`] / [`upstream::impact_groups`]，
-/// 与哨兵事件、面板同一份口径。
-fn impact_suffix(v: &serde_json::Value) -> String {
-    let impact = impact_of(v);
-    if impact.is_empty() {
-        return String::new();
-    }
-    let mut out = format!("。{}：", upstream::impact_title(&impact));
-    for line in upstream::impact_groups(&impact) {
-        out.push_str("\n  ");
-        out.push_str(&line);
-    }
-    out
-}
-
-/// `remove` 的人读渲染。**没有人受影响时明说一句**（删上游是破坏性操作，操作者需要
-/// 「确实没人受影响」这个肯定答复，而不是沉默）。
-pub fn format_remove(v: &serde_json::Value) -> String {
-    let suffix = impact_suffix(v);
-    if suffix.is_empty() {
-        return "上游已移除（没有用户需要重新获取订阅）".into();
-    }
-    format!("上游已移除{suffix}")
+/// **4.1 起只有一句**（spec §1.2 目标 1）：住宅 HY2 只有一个监听端口、整段跳跃由
+/// `table inet bui` 送进去，端口与区间与槽位无关 ⇒ 删上游动不到任何人手里那份订阅。
+/// 4.0.x 那句「（没有用户需要重新获取订阅）」与它对面的三组名单一起退役 —— 保留它会让
+/// 运维以为「这次恰好没人受影响」，而实际上这个问题已经不存在了。
+pub fn format_remove(_v: &serde_json::Value) -> String {
+    "上游已移除".into()
 }
 
 /// `assign` 的人读渲染。
-pub fn format_assign(user: &str, target: &str, v: &serde_json::Value) -> String {
-    format!(
-        "已把用户 {user} 分到 {target}，约 1 秒后槽路由生效（不重启 xray）{}",
-        impact_suffix(v)
-    )
+pub fn format_assign(user: &str, target: &str, _v: &serde_json::Value) -> String {
+    format!("已把用户 {user} 分到 {target}，约 1 秒后槽路由生效（不重启 xray）")
 }
 
 /// `rebalance` 的人读渲染。
 pub fn format_rebalance(v: &serde_json::Value) -> String {
     format!(
-        "已重排 {} 个用户{}{}",
+        "已重排 {} 个用户{}",
         v.get("moved").and_then(|m| m.as_u64()).unwrap_or(0),
         if v.get("xray_rules_pending") == Some(&serde_json::json!(true)) {
             "，约 1 秒后槽路由生效（不重启 xray）"
         } else {
             ""
-        },
-        impact_suffix(v)
+        }
     )
 }
 
 /// `add` 的人读渲染：回包原样打给脚本（字段照 v3：`success` / `exitIp` / `ispInfo` /
-/// `type`…），影响名单是人读的，附在后面。
+/// `type`…）。
 pub fn format_add(v: &serde_json::Value) -> String {
-    format!("{v}{}", impact_suffix(v))
+    format!("{v}")
+}
+
+/// `pool status` 的人读渲染（4.1，spec §3.1）。
+///
+/// 空闲凭据就是**预留的门位**：有空闲，建用户 / 轮换只是切一次门（`hy2-residential.json`
+/// 一个字节不动、内核不重启）；空闲耗尽才落到「当场扩容 ⇒ 重写配置 ⇒ 重启住宅内核」，
+/// 全体住宅 HY2 会话跟着重连一次。所以空闲率是这一行要突出的东西。
+pub fn format_pool(v: &serde_json::Value) -> String {
+    let (size, used, free) = (as_u64(v, "size"), as_u64(v, "used"), as_u64(v, "free"));
+    let mut out = vec![format!(
+        "住宅 HY2 凭据池：已用 {used} / {size}，空闲 {free}，第 {} 代",
+        as_u64(v, "generation")
+    )];
+    if size > 0 && (free as f64) < bui_schema::hy2pool::LOW_FREE_RATIO * (size as f64) {
+        out.push(format!(
+            "  空闲不足 {}%：下次建用户 / 轮换会当场扩容 —— 重写 hy2-residential.json + 重启住宅内核（全体会话重连一次）",
+            (bui_schema::hy2pool::LOW_FREE_RATIO * 100.0) as u32
+        ));
+    }
+    let holders = as_arr(v, "holders");
+    if holders.is_empty() {
+        out.push("  持有人：无".into());
+    } else {
+        // **只有用户名**，不含凭据 id、不含 secret
+        out.push(format!(
+            "  持有人（{}）：{}",
+            holders.len(),
+            holders
+                .iter()
+                .filter_map(|x| x.as_str())
+                .collect::<Vec<_>>()
+                .join("、")
+        ));
+    }
+    out.join("\n")
+}
+
+/// `pool grow` 的人读渲染。
+pub fn format_pool_grow(v: &serde_json::Value) -> String {
+    let added = as_u64(v, "added");
+    if added == 0 {
+        return format!("凭据池已有 {} 条，无需扩容。", as_u64(v, "size"));
+    }
+    format!(
+        "凭据池扩到 {} 条（新增 {added}）；对账会重写 hy2-residential.json 并重启 hysteria-residential，全体住宅 HY2 会话重连一次。",
+        as_u64(v, "size")
+    )
 }
 
 fn print_or(json: bool, v: &serde_json::Value, f: impl Fn(&serde_json::Value) -> String) {
@@ -786,6 +836,12 @@ pub async fn run(cmd: ResidentialCmd, socket: PathBuf) -> anyhow::Result<()> {
             cmd: BlacklistCmd::List { json },
         } => print_or(*json, &v, format_blacklist),
         ResidentialCmd::Slots { json } => print_or(*json, &v, format_slots),
+        ResidentialCmd::Pool {
+            cmd: PoolCmd::Status { json },
+        } => print_or(*json, &v, format_pool),
+        ResidentialCmd::Pool {
+            cmd: PoolCmd::Grow { .. },
+        } => println!("{}", format_pool_grow(&v)),
         ResidentialCmd::Remove { .. } => println!("{}", format_remove(&v)),
         ResidentialCmd::SlotPin { index, auto, .. } => println!(
             "槽 {index} {}",
@@ -810,7 +866,8 @@ pub async fn run(cmd: ResidentialCmd, socket: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 住宅子菜单的 12 项（两列渲染沿用 P1 的 [`crate::commands::menu::render_with`]）。
+/// 住宅子菜单的 13 项（两列渲染沿用 P1 的 [`crate::commands::menu::render_with`]）。
+/// 每一项的 key 都必须在 [`menu`] 里有 dispatch 分支（用例钉着）。
 pub fn menu_items() -> Vec<MenuItem> {
     vec![
         MenuItem {
@@ -867,6 +924,13 @@ pub fn menu_items() -> Vec<MenuItem> {
         MenuItem {
             key: "11",
             title: "指定用户的槽位",
+            action: MenuAction::Residential,
+        },
+        // 4.1：住宅 HY2 的静态凭据池（spec §3.1）。空闲凭据就是预留的门位，空闲耗尽会把
+        // 建用户 / 轮换推到「当场扩容 ⇒ 重启住宅内核」那条路上，所以运维要看得到。
+        MenuItem {
+            key: "12",
+            title: "住宅 HY2 凭据池（查看 / 扩容）",
             action: MenuAction::Residential,
         },
         MenuItem {
@@ -989,6 +1053,44 @@ pub async fn menu(socket: PathBuf) -> anyhow::Result<()> {
                     continue;
                 }
                 ResidentialCmd::Assign { user, target }
+            }
+            "12" => {
+                // 先看池，再问要不要扩：扩容会重写 hy2-residential.json + 重启住宅内核
+                // （全体住宅 HY2 会话重连一次），不该一按就动
+                if let Err(e) = run(
+                    ResidentialCmd::Pool {
+                        cmd: PoolCmd::Status { json: false },
+                    },
+                    socket.clone(),
+                )
+                .await
+                {
+                    println!("执行失败：{e:#}");
+                    continue;
+                }
+                let to = prompt("扩容到几条（直接回车 = 不扩，按用户数自动补则填 auto）: ")?;
+                if to.is_empty() {
+                    continue;
+                }
+                let to = if to == "auto" {
+                    None
+                } else {
+                    match to.parse::<usize>() {
+                        Ok(n) => Some(n),
+                        Err(_) => {
+                            println!("只能填条数或 auto，实际 {to}");
+                            continue;
+                        }
+                    }
+                };
+                println!("扩容会重写 hy2-residential.json 并重启 hysteria-residential，全体住宅 HY2 会话重连一次。");
+                if prompt("确认？(yes): ")? != "yes" {
+                    println!("已取消");
+                    continue;
+                }
+                ResidentialCmd::Pool {
+                    cmd: PoolCmd::Grow { to },
+                }
             }
             "0" => return Ok(()),
             other => {
@@ -1241,54 +1343,109 @@ mod tests {
         );
     }
 
-    /// `remove` 的回包渲染：三组各一行，每行一句原因，标题给同一个后果与下一步
-    /// （反复断联、重新拉订阅）。空组不出现；三组全空时一个名字都不打。
+    /// 4.1 的退役判据（spec §1.2 目标 1）：四条改槽路径（remove / assign / rebalance /
+    /// add）的人读渲染里**一个字都不提订阅**。
+    ///
+    /// 4.0.x 的三组名单是 `port_changed` 的投影；那个字段与它的整套渲染已经删掉，所以
+    /// 就算回包里还塞着一个（老守护进程 + 新 CLI 的混搭）也不许打出来 —— 打出来就是在
+    /// 教运维去做一件 4.1 里毫无意义的事。
     #[test]
-    fn format_remove_tells_the_operator_who_must_refetch_the_subscription() {
-        let v = |removed: &[&str], moved: &[&str], resliced: &[&str]| {
-            serde_json::json!({"success": true, "port_changed": {
-                "slot_removed": removed, "slot_moved": moved, "hop_resliced": resliced,
-            }})
-        };
-        assert_eq!(
-            format_remove(&v(&[], &[], &[])),
-            "上游已移除（没有用户需要重新获取订阅）"
-        );
-        // 只有一组时也是「N 个用户……」+ 那一组一行
-        assert_eq!(
-            format_remove(&v(&[], &[], &["alice"])),
-            "上游已移除。1 个用户的 HY2 住宅节点会反复断联，需重新拉订阅：\n  \
-             端口跳跃区间被重切（1 人，端口没变，但旧段里的端口会跳进别的实例）：alice"
-        );
-        // 三组齐全：顺序固定（组一 → 组二 → 组三），每组的原因都不一样
-        assert_eq!(
-            format_remove(&v(&["alice"], &["bob", "carol"], &["dave"])),
-            "上游已移除。4 个用户的 HY2 住宅节点会反复断联，需重新拉订阅：\n  \
-             原槽位已删除、已换槽（1 人，旧端口与旧跳跃段都不再属于他那一槽的实例）：alice\n  \
-             槽位序号变了（2 人，端口与跳跃段一起变）：bob、carol\n  \
-             端口跳跃区间被重切（1 人，端口没变，但旧段里的端口会跳进别的实例）：dave"
-        );
-        // 四条路径共用同一个后缀：assign / rebalance / add 那句提示后面接同一份名单
-        assert_eq!(
-            format_assign("alice", "resi-2", &v(&[], &["alice"], &[])),
-            "已把用户 alice 分到 resi-2，约 1 秒后槽路由生效（不重启 xray）。\
-             1 个用户的 HY2 住宅节点会反复断联，需重新拉订阅：\n  \
-             槽位序号变了（1 人，端口与跳跃段一起变）：alice"
-        );
-        // 空名单 ⇒ 那三条路径一个名字都不打（只剩自己那句一行提示）
-        assert_eq!(
-            format_assign("alice", "resi-2", &serde_json::json!({"success": true})),
-            "已把用户 alice 分到 resi-2，约 1 秒后槽路由生效（不重启 xray）"
-        );
+    fn the_human_output_no_longer_mentions_resubscribing() {
+        let stale = serde_json::json!({"success": true, "port_changed": {
+            "slot_removed": ["alice"], "slot_moved": ["bob"], "hop_resliced": ["carol"],
+        }});
+        for v in [
+            serde_json::json!({"success": true}),
+            stale.clone(),
+            serde_json::json!({}),
+        ] {
+            assert_eq!(format_remove(&v), "上游已移除");
+            assert_eq!(
+                format_assign("alice", "resi-2", &v),
+                "已把用户 alice 分到 resi-2，约 1 秒后槽路由生效（不重启 xray）"
+            );
+            for out in [
+                format_remove(&v),
+                format_assign("alice", "resi-2", &v),
+                format_rebalance(&v),
+                format_add(&v),
+            ] {
+                for banned in ["重新获取订阅", "重新拉订阅", "反复断联", "槽位序号变了"]
+                {
+                    assert!(!out.contains(banned), "{out} 里还有「{banned}」");
+                }
+            }
+        }
         assert_eq!(
             format_rebalance(&serde_json::json!({"moved": 0})),
             "已重排 0 个用户"
         );
-        // 没有 port_changed 字段的回包不该 panic
         assert_eq!(
-            format_remove(&serde_json::json!({"success": true})),
-            "上游已移除（没有用户需要重新获取订阅）"
+            format_rebalance(&serde_json::json!({"moved": 3, "xray_rules_pending": true})),
+            "已重排 3 个用户，约 1 秒后槽路由生效（不重启 xray）"
         );
+    }
+
+    /// 池的 CLI（T14）：`status` 只读、`grow` 幂等到 `--to`。
+    #[test]
+    fn the_pool_cli_maps_to_two_endpoints() {
+        assert_eq!(
+            to_request(&ResidentialCmd::Pool {
+                cmd: PoolCmd::Status { json: false }
+            })
+            .unwrap(),
+            ("GET", "/api/residential/pool".to_string(), None)
+        );
+        let (m, p, b) = to_request(&ResidentialCmd::Pool {
+            cmd: PoolCmd::Grow { to: Some(64) },
+        })
+        .unwrap();
+        assert_eq!((m, p.as_str()), ("POST", "/api/residential/pool/grow"));
+        assert_eq!(b.unwrap()["to"], 64);
+        // `--to` 不给 ⇒ 空体，由服务端按 `size_for` 算（CLI 不读 state，spec §2.4）
+        let (_, _, b) = to_request(&ResidentialCmd::Pool {
+            cmd: PoolCmd::Grow { to: None },
+        })
+        .unwrap();
+        assert_eq!(b.unwrap(), serde_json::json!({}));
+    }
+
+    /// `pool status` 的人读渲染：**只有用户名**，空闲率跌破 20% 要点名那次重启。
+    #[test]
+    fn the_pool_status_line_names_the_holders_and_the_restart_risk() {
+        let v = serde_json::json!({
+            "size": 32, "used": 3, "free": 29, "generation": 3,
+            "holders": ["alice", "bob", "carol"],
+        });
+        let out = format_pool(&v);
+        assert!(
+            out.starts_with("住宅 HY2 凭据池：已用 3 / 32，空闲 29，第 3 代"),
+            "{out}"
+        );
+        assert!(out.contains("持有人（3）：alice、bob、carol"), "{out}");
+        assert!(!out.contains("空闲不足"), "29/32 空闲不算低：{out}");
+        // 空闲 < 20% ⇒ 点名「下次建用户会重启住宅内核」
+        let tight = serde_json::json!({
+            "size": 32, "used": 26, "free": 6, "generation": 1, "holders": [],
+        });
+        let out = format_pool(&tight);
+        assert!(out.contains("空闲不足 20%"), "{out}");
+        assert!(out.contains("重启住宅内核"), "{out}");
+        assert!(out.contains("持有人：无"), "{out}");
+        // 回包里压根没有凭据 id / secret，渲染也不许凭空造
+        assert!(!out.contains("r0"), "{out}");
+    }
+
+    /// `pool grow` 的人读渲染：零改动明说「无需扩容」，真扩容点名那次内核重启。
+    #[test]
+    fn the_pool_grow_line_says_whether_the_kernel_restarts() {
+        assert_eq!(
+            format_pool_grow(&serde_json::json!({"success": true, "size": 32, "added": 0})),
+            "凭据池已有 32 条，无需扩容。"
+        );
+        let out = format_pool_grow(&serde_json::json!({"success": true, "size": 48, "added": 16}));
+        assert!(out.contains("扩到 48 条（新增 16）"), "{out}");
+        assert!(out.contains("重启 hysteria-residential"), "{out}");
     }
 
     #[test]
@@ -1467,11 +1624,30 @@ mod tests {
     }
 
     #[test]
-    fn the_menu_lists_twelve_items_and_the_p1_menu_gains_one() {
+    fn the_menu_lists_thirteen_items_and_the_p1_menu_gains_one() {
         let items = menu_items();
-        assert_eq!(items.len(), 12);
+        assert_eq!(items.len(), 13);
+        // 4.1 新增的那一项（spec §3.1）
+        assert!(items.iter().any(|i| i.title.contains("住宅 HY2 凭据池")));
         assert_eq!(items.last().unwrap().action, MenuAction::Quit);
         assert!(items.iter().any(|i| i.title.contains("黑名单")));
+        // **菜单里有的 key，`menu()` 里必须有分支**：只往 `menu_items()` 加一项、忘了加
+        // dispatch 的后果是「菜单显示 [12]，选了打「无效选择」」，而全套用例照旧全绿。
+        let dispatch = include_str!("cli.rs")
+            .split_once("pub async fn menu(")
+            .expect("menu() 没了")
+            .1;
+        let dispatch = dispatch
+            .split_once("\n#[cfg(test)]")
+            .map_or(dispatch, |x| x.0);
+        for i in &items {
+            assert!(
+                dispatch.contains(&format!("\"{}\" =>", i.key)),
+                "菜单项 [{}]「{}」在 menu() 里没有 dispatch 分支",
+                i.key,
+                i.title
+            );
+        }
         // 两处「钉住」的文案必须能区分开：一个钉域名，一个钉槽位的出口 IP（spec §5.6）
         assert!(items.iter().any(|i| i.title.contains("按槽查看住宅出口")));
         assert!(items.iter().any(|i| i.title == "钉住某一槽的出口 IP"));

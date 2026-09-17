@@ -707,6 +707,15 @@ pub fn run_stamp(now: OffsetDateTime) -> serde_json::Value {
 /// 跑一轮：先治 hysteria 的端口跳跃孤儿链崩溃循环（[`heal_chain_conflict`]），再校验住宅
 /// 跳跃那张 nft 表（[`check_nft`]，顺带采一次兼容段命中数），再读单元状态与监听端口
 /// （都经 `Host`，时钟也取 `host.now()`），按裁决重启，落 `runtime.json`。
+///
+/// 重启过 `hysteria-residential` 就广播 [`Event::Hy2ResiRestarted`]：不开 `cache_file`
+/// （spec §14 裁决 1）⇒ 重启把每个 `gate-<id>` 打回 `default = deny`，不重放就是全体住宅
+/// HY2 用户被拒到下一轮 60 秒安全网，而且没有任何告警说明原因。relay 早就为完全一样的
+/// 来路补过重放（`residential::health` 规则 6a），住宅 HY2 这条在这里补。
+///
+/// **4.1 起这条广播只有一条来路**：「进程在、端口不 listen」连续两轮那条。孤儿链自愈随
+/// [`HY2_CONFIGS`] 收成直连一项后只会重启 `hysteria-server`（住宅换 sing-box、不建 NAT
+/// 规则），而 [`check_nft`] 的整表重放不重启任何单元、门位不会回落 ⇒ 都不该广播。
 pub async fn check_once(ctx: &DaemonCtx) -> anyhow::Result<Vec<(String, Decision)>> {
     let state = ctx.store.read().await;
     let targets = targets(&state);
@@ -728,9 +737,11 @@ pub async fn check_once(ctx: &DaemonCtx) -> anyhow::Result<Vec<(String, Decision
     let host = ctx.host.clone();
     let paths = ctx.paths.clone();
     let st = state.clone();
-    let (decisions, records, heals, nft, now) =
+    let (decisions, records, heals, nft, now, restarted) =
         tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             let now = host.now();
+            // 本轮真的被 `systemctl restart` 过的单元（自愈 + 监听失活两条来路都记）
+            let mut restarted: std::collections::BTreeSet<String> = Default::default();
             // 孤儿链自愈排在监听探测之前：崩溃循环里的实例根本没进程，按端口判只会得出
             // `Healthy`（`!alive` 交给 systemd），而 systemd 的 `Restart=always` 在这个错误上
             // 永远治不好——链不清掉，下一次 `-N` 还是 "Chain already exists"。
@@ -744,6 +755,7 @@ pub async fn check_once(ctx: &DaemonCtx) -> anyhow::Result<Vec<(String, Decision
                     rec.at = fmt_rfc3339(now);
                     rec.count += 1;
                     rec.done = done;
+                    restarted.insert(unit.to_string());
                 }
             }
             // 住宅那一侧的自愈：表被人删了 / 规则不符就整表重放（采样在重放之前）
@@ -762,12 +774,17 @@ pub async fn check_once(ctx: &DaemonCtx) -> anyhow::Result<Vec<(String, Decision
                 if d == Decision::Restart {
                     tracing::warn!(unit = %t.unit, port = t.port, "监听失活连续 2 轮，重启");
                     let _ = host.systemd("restart", &t.unit);
+                    restarted.insert(t.unit.clone());
                 }
                 out.push((t.unit.clone(), d));
             }
-            Ok((out, records, heals, nft, now))
+            Ok((out, records, heals, nft, now, restarted))
         })
         .await??;
+    // 门位在重启时全部回落 `deny` ⇒ 通知 `gates::replay_loop` 立刻重放（见本函数文档）
+    if restarted.contains("hysteria-residential") {
+        ctx.bus.send(crate::api::Event::Hy2ResiRestarted);
+    }
     let nft_record = nft_event(&nft, &state, &nft_heals, now);
     // 命中数每轮都并一次（不只在重放那一轮）：采样点就是重放之前的那一刻，
     // 这一轮自己重放过就把 `seen` 归零（`nft -f` 先 flush table），中途被别的路径
@@ -1002,6 +1019,110 @@ mod tests {
         let rt = c.runtime.read().await;
         assert_eq!(rt.watchdog["hysteria-server"].restarts, 1);
         assert_eq!(rt.watchdog["xray"].fails, 0);
+    }
+
+    /// 看门狗重启住宅入站之后必须广播 `Event::Hy2ResiRestarted`（第七波复核）：
+    /// 不开 `cache_file`（spec §14 裁决 1）⇒ 重启把每个 `gate-<id>` selector 打回
+    /// `default = deny`，没人重放就是全体住宅 HY2 用户被拒到下一轮 60 秒安全网，
+    /// 而且没有任何告警说明原因。relay 早就为完全一样的两条来路补过重放。
+    #[tokio::test]
+    async fn restarting_the_residential_inbound_is_announced_so_the_gates_get_replayed() {
+        let host = Arc::new(FakeHost::new());
+        host.with(|i| {
+            for u in [
+                "hysteria-server",
+                "hysteria-residential",
+                "xray",
+                "b-ui-relay",
+            ] {
+                i.units_active.insert(format!("{u}.service"));
+            }
+            // 40000 失活（进程在、端口不 listen）⇒ 连续两轮后重启住宅入站
+            i.listening
+                .insert(Proto::Udp, [10000].into_iter().collect());
+            i.listening
+                .insert(Proto::Tcp, [10001, 2080].into_iter().collect());
+        });
+        let (c, _d) = ctx(host.clone()).await;
+        let mut rx = c.bus.subscribe();
+        check_once(&c).await.unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "第一轮只是 Failing，没重启 ⇒ 不许广播"
+        );
+        host.advance(60);
+        let second = check_once(&c).await.unwrap();
+        assert_eq!(
+            second[1],
+            ("hysteria-residential".to_string(), Decision::Restart)
+        );
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(crate::api::Event::Hy2ResiRestarted),
+            "重启了住宅入站却不广播 ⇒ 门全停在 deny、没人重放"
+        );
+    }
+
+    /// 合并裁决（T11 ↔ T12，2026-09-17）：孤儿链自愈这条来路在 4.1 **不再**广播。
+    /// [`HY2_CONFIGS`] 收成直连一项后它只会重启 `hysteria-server`，住宅换 sing-box
+    /// 不建 NAT 规则、没有孤儿链可清；4.0 起那条「自愈完也广播」的用例（断言这一路
+    /// 重启了 `hysteria-residential`）按 T12 的口径已不可满足，改成正面钉住新口径：
+    /// 自愈这一路**只**碰直连实例、住宅一个命令都收不到、门位也不白重放一轮。
+    #[tokio::test]
+    async fn healing_a_crash_loop_restarts_only_the_direct_inbound_and_announces_nothing() {
+        let host = crash_looping_host();
+        let (c, _d) = ctx(host.clone()).await;
+        let mut rx = c.bus.subscribe();
+        check_once(&c).await.unwrap();
+        assert!(
+            host.ops()
+                .iter()
+                .any(|o| o == "systemd:restart:hysteria-server"),
+            "前提：自愈这一路重启了直连实例"
+        );
+        assert!(
+            !host
+                .ops()
+                .iter()
+                .any(|o| o == "systemd:restart:hysteria-residential"),
+            "4.1 的孤儿链自愈不许碰住宅入站（它不建 NAT 规则、没有孤儿链可清）"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "住宅入站没重启 ⇒ 不许广播（白重放一轮门位 = 多打一次 GET /proxies 与若干 PUT）"
+        );
+    }
+
+    /// 只重启直连实例时不许广播（白重放一轮门位 = 多打一次 `GET /proxies` 与若干 PUT）
+    #[tokio::test]
+    async fn restarting_only_the_direct_inbound_announces_nothing() {
+        let host = Arc::new(FakeHost::new());
+        host.with(|i| {
+            for u in [
+                "hysteria-server",
+                "hysteria-residential",
+                "xray",
+                "b-ui-relay",
+            ] {
+                i.units_active.insert(format!("{u}.service"));
+            }
+            i.listening
+                .insert(Proto::Udp, [40000].into_iter().collect()); // 10000 失活
+            i.listening
+                .insert(Proto::Tcp, [10001, 2080].into_iter().collect());
+        });
+        let (c, _d) = ctx(host.clone()).await;
+        let mut rx = c.bus.subscribe();
+        check_once(&c).await.unwrap();
+        host.advance(60);
+        check_once(&c).await.unwrap();
+        assert!(
+            host.ops()
+                .iter()
+                .any(|o| o == "systemd:restart:hysteria-server"),
+            "前提：重启了直连实例"
+        );
+        assert!(rx.try_recv().is_err(), "住宅入站没重启 ⇒ 不许广播");
     }
 
     #[test]

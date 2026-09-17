@@ -5,12 +5,22 @@ use crate::sys::Host;
 use std::sync::Arc;
 use time::OffsetDateTime;
 
-/// 进程内事件：state 变更、relay 重启（P3 据此重放上游）、显式请求对账。
+/// 进程内事件：state 变更、relay 重启（P3 据此重放上游）、住宅 HY2 入站重启
+/// （4.1 据此重放门位）、显式请求对账。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     StateChanged(&'static str),
     RelayRestarted,
-    ReconcileRequested { force: bool },
+    /// `hysteria-residential`（住宅 HY2 的 sing-box 入站）刚被重启过。
+    ///
+    /// 不开 `cache_file`（spec §14 裁决 1）⇒ 重启后每个 `gate-<id>` selector 回到
+    /// `default = "deny"`、住宅 HY2 全员 fail-closed，由
+    /// [`panel::gates::replay_after_restart`](crate::modules::panel::gates::replay_after_restart)
+    /// 重放真实门位。
+    Hy2ResiRestarted,
+    ReconcileRequested {
+        force: bool,
+    },
 }
 
 #[derive(Clone)]

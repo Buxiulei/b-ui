@@ -32,9 +32,12 @@ pub fn size_for(users: usize) -> usize {
     (users.saturating_mul(2).div_ceil(16) * 16).clamp(POOL_MIN, POOL_MAX)
 }
 
-/// 「有住宅权益且开 hysteria2」的用户数 —— 池容量的基数。
+/// 「有住宅 HY2」的用户数 —— 池容量的基数。判据只有 [`is_resi_hy2`] 一处。
 pub fn resi_hy2_users(s: &State) -> usize {
-    s.users.iter().filter(|u| is_resi_hy2(u)).count()
+    s.users
+        .iter()
+        .filter(|u| is_resi_hy2(u, &s.residential))
+        .count()
 }
 
 /// 把池补到 `target` 条（上限 [`POOL_MAX`]），返回新增条数。
@@ -70,8 +73,10 @@ pub fn assign(s: &mut State, user_id: Uuid) -> Option<String> {
     assign_at(s, user_id, OffsetDateTime::now_utc())
 }
 
-/// [`assign`] 的可注入时钟版本（冷却期判定要可测）。
-fn assign_at(s: &mut State, user_id: Uuid, now: OffsetDateTime) -> Option<String> {
+/// [`assign`] 的可注入时钟版本。**生产一律走这个**：24 小时冷却期是安全判据，
+/// 判定时钟必须与 [`release`] 盖 `released_at` 的那个时钟同源（`bui` 侧的 `Host::now()`），
+/// 否则一个偏移 / 冻结的时钟就能把冷却期静默作废，而且测不到。
+pub fn assign_at(s: &mut State, user_id: Uuid, now: OffsetDateTime) -> Option<String> {
     let idx = s.users.iter().position(|u| u.user_id == user_id)?;
     if let Some(held) = s.users[idx].credentials.hy2_resi_cred.clone() {
         return Some(held); // 幂等：不许静默孤立仍然有效的凭据
@@ -115,6 +120,34 @@ pub fn regenerate_idle_secrets(p: &mut Hy2Pool, used: &BTreeSet<String>) -> usiz
 /// 空闲凭据条数（`used` = 已被用户占着的 id 集合）。
 pub fn free_count(p: &Hy2Pool, used: &BTreeSet<String>) -> usize {
     p.creds.iter().filter(|c| !used.contains(&c.id)).count()
+}
+
+/// 池用量的**唯一口径**：`bui status` 的那一行与 `GET /api/residential/pool` 都调它。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PoolUsage {
+    /// 池里的凭据条数
+    pub size: usize,
+    /// 其中 id 真被人占着的条数
+    pub used: usize,
+    /// 其余的（`used + free == size` 恒成立）
+    pub free: usize,
+}
+
+/// 按池里的凭据算 —— **不是**按「有指针的用户数」。
+///
+/// 差别在悬空指针：用户指向池里已不存在的 id（上一代池里的凭据，`migrate` 下次启动才清）
+/// 时，按用户数算会让 `used + free > size`，于是两处告警门槛（`bui status` 判
+/// `used > 80%·size`、`bui residential pool status` 判 `free < 20%·size`）互相打脸 ——
+/// 同一台机器上一处喊「空闲不足」另一处说没事。
+pub fn usage(s: &State) -> PoolUsage {
+    let used_ids = used_ids(s);
+    let p = &s.residential.hy2_pool;
+    let free = free_count(p, &used_ids);
+    PoolUsage {
+        size: p.creds.len(),
+        used: p.creds.len() - free,
+        free,
+    }
 }
 
 /// [`migrate`] 的结果：改动的用户数，以及**仍然没拿到凭据**的用户数。
@@ -174,7 +207,7 @@ pub fn migrate(s: &mut State, now: OffsetDateTime) -> MigrateReport {
     let mut pending: Vec<Uuid> = s
         .users
         .iter()
-        .filter(|u| is_resi_hy2(u) && u.credentials.hy2_resi_cred.is_none())
+        .filter(|u| is_resi_hy2(u, &s.residential) && u.credentials.hy2_resi_cred.is_none())
         .map(|u| u.user_id)
         .collect();
     changed += assign_pending(s, &mut pending, now);
@@ -197,10 +230,23 @@ fn assign_pending(s: &mut State, pending: &mut Vec<Uuid>, now: OffsetDateTime) -
     before - pending.len()
 }
 
-/// 「有住宅权益且开 hysteria2」—— 池容量、迁移、门位收敛与装完自检共用的判据。
-/// 权益被撤掉的持凭据用户**不**满足它：他的门本来就该停在 `deny`。
-pub fn is_resi_hy2(u: &User) -> bool {
-    u.entitlements.residential.is_some() && u.entitlements.protocols.contains(&Protocol::Hysteria2)
+/// 「有住宅权益、权益指向的分组真实存在、且开了 hysteria2」—— **住宅 HY2 的唯一判据**。
+///
+/// 池容量、迁移分凭据、门位收敛（`panel::gates::expected`）、建号 / 轮换分凭据、面板投影
+/// 与踢人全用这一处（2026-09-16 裁决：4.0.x 起这里曾有两套 —— 本函数不看分组、`bui` 侧的
+/// `gates::has_resi_hy2` 看分组，T15 合成一处，取更严的那个）。分头写两遍就会漂移成
+/// 「门开着但没凭据」或「有凭据但门不开」。
+///
+/// **分组存在性不能省**：[`nodes::nodes_for`](crate::nodes::nodes_for) 的 `resi_ok` 也要求
+/// `resi.groups.contains_key(&e.group_id)`，`group_id` 悬空时（人工改 `state.json`、分组被删）
+/// 订阅里已经不发住宅 HY2 节点了。凭据与门是授权落点，取两者里更严的那个 —— 少了这一条，
+/// 拿着旧订阅的人会继续从住宅 IP 出海。
+pub fn is_resi_hy2(u: &User, r: &Residential) -> bool {
+    u.entitlements
+        .residential
+        .as_ref()
+        .is_some_and(|e| r.groups.contains_key(&e.group_id))
+        && u.entitlements.protocols.contains(&Protocol::Hysteria2)
 }
 
 /// 住宅 hysteria2 用户的 id，按 `created_at` 升序（同刻按 `state.json` 里的原序）。
@@ -208,7 +254,7 @@ fn in_creation_order(s: &State) -> Vec<Uuid> {
     let mut v: Vec<(&str, Uuid)> = s
         .users
         .iter()
-        .filter(|u| is_resi_hy2(u))
+        .filter(|u| is_resi_hy2(u, &s.residential))
         .map(|u| (u.created_at.as_str(), u.user_id))
         .collect();
     v.sort_by_key(|(t, _)| *t); // 稳定排序：同一时刻保持原序
@@ -308,6 +354,44 @@ mod tests {
             .map(|i| user(i + 1, &format!("u{i}"), true))
             .collect();
         s
+    }
+
+    /// 判据合成一处（T15）：`is_resi_hy2` 必须**同时**要求住宅权益、分组真实存在、开了
+    /// hysteria2。4.0.x 这里有两套 —— 本 crate 的旧版不看分组存在性、`bui` 侧
+    /// `gates::has_resi_hy2` 看，于是 `group_id` 悬空的用户会「有凭据但门永远 deny」：
+    /// 白占一个门位、`bui status` 的池用量偏高，而他的订阅里本来就没有住宅 HY2 节点
+    /// （`nodes_for` 的 `resi_ok` 同样要求分组存在）。
+    #[test]
+    fn the_residential_hy2_predicate_also_requires_the_group_to_exist() {
+        let mut s = state(2);
+        assert_eq!(resi_hy2_users(&s), 2);
+        assert!(is_resi_hy2(&s.users[0], &s.residential));
+
+        // ① 分组悬空（人工改 state、分组被删）⇒ 既不算基数，也分不到凭据
+        s.users[1].entitlements.residential = Some(ResidentialEntitlement {
+            group_id: "gone".into(),
+            slot_id: None,
+        });
+        assert!(!is_resi_hy2(&s.users[1], &s.residential), "分组不存在");
+        assert_eq!(resi_hy2_users(&s), 1, "悬空分组的用户不进池容量基数");
+        let r = migrate(&mut s, datetime!(2026-09-15 00:00 UTC));
+        assert_eq!(r.changed, 1, "只给 u0 发凭据");
+        assert!(cred_of(&s.users[0], &s.residential).is_some());
+        assert!(
+            s.users[1].credentials.hy2_resi_cred.is_none(),
+            "分组悬空的用户不许占门位"
+        );
+
+        // ② 没有住宅权益、或没开 hysteria2 ⇒ 同样不算
+        let mut plain = user(7, "no-resi", false);
+        assert!(!is_resi_hy2(&plain, &s.residential));
+        plain.entitlements.residential = Some(ResidentialEntitlement {
+            group_id: DEFAULT_GROUP.into(),
+            slot_id: None,
+        });
+        assert!(is_resi_hy2(&plain, &s.residential));
+        plain.entitlements.protocols = vec![Protocol::Reality];
+        assert!(!is_resi_hy2(&plain, &s.residential), "没开 hysteria2");
     }
 
     /// 池容量始终 ≥ 2 倍用户数，向上取到 16 的倍数，并夹在 [32, 256]（spec §3.1、§14 裁决 2）
@@ -455,6 +539,30 @@ mod tests {
             (low as f64) / (size_for(1) as f64) < LOW_FREE_RATIO,
             "空闲 < 20% ⇒ 哨兵一次性告警 hy2_resi_pool_low"
         );
+    }
+
+    /// 池用量只有 [`usage`] 一处口径（`bui status` 与 `GET /api/residential/pool` 都调它），
+    /// 而且 **`used + free == size` 恒成立** —— 悬空指针不计已用。
+    ///
+    /// 按「有指针的用户数」另算一套（T14 之前 `bui status` 就是那样）会让指向已消失 id 的
+    /// 用户也计进已用，`used + free > size`：两处的低空闲门槛（`used > 80%·size` /
+    /// `free < 20%·size`）于是可能一处喊「空闲不足」另一处说没事。
+    #[test]
+    fn the_pool_usage_has_one_reading_and_never_counts_a_dangling_pointer() {
+        let mut s = state(2);
+        migrate(&mut s, datetime!(2026-09-15 00:00 UTC));
+        let u = usage(&s);
+        assert_eq!((u.size, u.used, u.free), (size_for(2), 2, size_for(2) - 2));
+
+        // 悬空指针：这个人指向池里压根没有的 id（上一代池的凭据，下次启动才被 migrate 清）
+        s.users[1].credentials.hy2_resi_cred = Some("r999".into());
+        let d = usage(&s);
+        assert_eq!(
+            (d.size, d.used, d.free),
+            (size_for(2), 1, size_for(2) - 1),
+            "悬空指针不占池里的凭据，所以只剩 1 条真被占着"
+        );
+        assert_eq!(d.used + d.free, d.size, "used + free 必须恒等于 size");
     }
 
     /// `assign` 幂等：已持凭据的用户再分一次拿回原来那条，旧凭据不许被静默孤立

@@ -173,6 +173,22 @@ pub enum SetCmd {
         /// `on` 或 `off`；取值合法性由 `commands::config::parse_obfs` 判。
         value: String,
     },
+    /// 住宅 HY2 的 **4.0 兼容段**（`inet bui` 里把 `40001-40007` 也 REDIRECT 到单一监听
+    /// 端口的那两条规则，spec §2.4）：`on` / `off`。
+    ///
+    /// 它存在的唯一理由是「4.0 发出的按槽订阅里那个 `40000+i` 端口还能连」。**关掉之前
+    /// 必须确认没人还在用**：判据是持久化的累计命中（`runtime.json`，watchdog 每轮在重放
+    /// 之前采样累加），**不是 `bui nft status` 打出来的活 counter**（每次重放都清回 0）。
+    /// 误判方向是危险的那一侧 —— 把仍在用的兼容段关掉，全部还没刷订阅的 4.0 住宅用户
+    /// 当场断联。所以 `off` 在「命中过、或统计还没就绪」时要求 `--force`。
+    Hy2ResiCompat {
+        /// `on` 或 `off`；取值合法性由 `commands::config::parse_obfs` 判（同一套 on/off）。
+        value: String,
+        /// 累计命中 > 0（或统计未就绪）时也照样关。会打印 total / last_hit_at / 起算时刻
+        /// 供人判断。
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 /// `/usr/local/bin/b-ui` 这个符号链接裸跑时进菜单（spec §1、§2.4）。
@@ -487,6 +503,76 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(help.contains("obfs"), "{help}");
+    }
+
+    /// `bui set hy2-resi-compat on|off [--force]`（4.1，spec §2.4）。
+    #[test]
+    fn parses_the_compat_switch_and_its_force_flag() {
+        for value in ["on", "off"] {
+            assert_eq!(
+                Cli::try_parse_from(["bui", "set", "hy2-resi-compat", value])
+                    .unwrap()
+                    .command,
+                Some(Command::Set {
+                    cmd: SetCmd::Hy2ResiCompat {
+                        value: value.into(),
+                        force: false
+                    }
+                })
+            );
+        }
+        assert_eq!(
+            Cli::try_parse_from(["bui", "set", "hy2-resi-compat", "off", "--force"])
+                .unwrap()
+                .command,
+            Some(Command::Set {
+                cmd: SetCmd::Hy2ResiCompat {
+                    value: "off".into(),
+                    force: true
+                }
+            })
+        );
+        assert!(Cli::try_parse_from(["bui", "set", "hy2-resi-compat"]).is_err());
+        let help = Cli::try_parse_from(["bui", "set", "--help"])
+            .unwrap_err()
+            .to_string();
+        assert!(help.contains("hy2-resi-compat"), "{help}");
+    }
+
+    /// `bui residential pool status|grow [--to N]`（4.1，spec §3.1）。
+    #[test]
+    fn parses_the_pool_subcommands() {
+        use crate::modules::residential::cli::{PoolCmd, ResidentialCmd};
+        assert_eq!(
+            Cli::try_parse_from(["bui", "residential", "pool", "status"])
+                .unwrap()
+                .command,
+            Some(Command::Residential {
+                cmd: ResidentialCmd::Pool {
+                    cmd: PoolCmd::Status { json: false }
+                }
+            })
+        );
+        assert_eq!(
+            Cli::try_parse_from(["bui", "residential", "pool", "grow", "--to", "64"])
+                .unwrap()
+                .command,
+            Some(Command::Residential {
+                cmd: ResidentialCmd::Pool {
+                    cmd: PoolCmd::Grow { to: Some(64) }
+                }
+            })
+        );
+        assert_eq!(
+            Cli::try_parse_from(["bui", "residential", "pool", "grow"])
+                .unwrap()
+                .command,
+            Some(Command::Residential {
+                cmd: ResidentialCmd::Pool {
+                    cmd: PoolCmd::Grow { to: None }
+                }
+            })
+        );
     }
 
     #[test]

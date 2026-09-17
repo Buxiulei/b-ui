@@ -60,7 +60,7 @@ pub fn config(node: &NodeParams, users: &[User], resi: &Residential, _paths: &Pa
         json!({"tag": "direct", "protocol": "freedom", "settings": {"domainStrategy": "ForceIPv4"}}),
     ];
     for i in slots::indices(resi) {
-        let res = slots::resources_of(&node.ports, resi, i);
+        let res = slots::resources(i);
         outbounds.push(json!({
             "tag": relay_tag(i),
             "protocol": "socks",

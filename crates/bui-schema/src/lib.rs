@@ -30,13 +30,18 @@
 //!
 //! ## IP 池与槽位 —— [`slots`]
 //!
-//! - [`slots::SlotRes`]：一个槽位的全部端口（relay 入站 / HY2 监听 / trafficStats / 跳跃区间），
-//!   由 [`slots::resources_of`] 从 [`Ports`](model::Ports) 与槽序号纯函数算出。
+//! - [`slots::SlotRes`] `{ index, relay_port }`：槽 i 的那**一个**端口（relay 的 socks
+//!   入站 `2080 + i`，也是 xray 住宅出站的目标），由 [`slots::resources`] 从槽序号纯函数
+//!   算出 —— **不吃 [`Ports`](model::Ports)**，因为 4.1 起槽位与对外端口无关。
 //! - [`slots::sync_slots`] / [`slots::least_loaded`] / [`slots::assign`] /
 //!   [`slots::migrate_unassigned`] / [`slots::rebalance`]：spec §5.6 的分配规则，纯函数。
-//! - [`slots::resubscribe_impact`]：比对改池前后两份期望态，算出手里那份订阅已经不能用的
-//!   用户名，按后果分成 [`slots::ResubscribeImpact`] 三组（槽位被删 / 槽位序号被搬到 0 /
-//!   跳跃区间被重切）；改池的执行路径据此逐组提示操作者哪些人要重新获取订阅。
+//! - **没有「必须重新获取订阅」这回事了**（4.1，spec §1.2 目标 1）：住宅 HY2 只有一个
+//!   监听端口、整段跳跃由 `table inet bui` 送进去，每个用户的端口与区间完全相同、与槽位
+//!   无关，所以增删上游 / `assign` / `rebalance` 都不动已下发的订阅。4.0.x 那套按原因分
+//!   三组的 `resubscribe_impact` / `ResubscribeImpact` 随之删除。
+//! - 同一批删掉的还有按槽算对外端口的一整套（spec §4.2、§13 C1、§14 裁决 6，连签名一起，
+//!   不留 `#[deprecated]` 也不留转发壳）：`SlotRes.{hy2_port, stats_port, hop}`、
+//!   `slots::{HY2_STATS_RESI_BASE, hop_slice, slot_span, resources_of}`。
 //!
 //! ## 住宅 HY2 凭据池 —— [`hy2pool`]
 //!
@@ -47,14 +52,21 @@
 //! - [`hy2pool::POOL_MIN`] / [`hy2pool::POOL_MAX`] / [`hy2pool::size_for`]：池容量 =
 //!   `clamp(ceil16(2 × 住宅 hysteria2 用户数), 32, 256)`；基数由
 //!   [`hy2pool::resi_hy2_users`] 数出。
-//! - [`hy2pool::is_resi_hy2`]：「有住宅权益且开 hysteria2」——池容量、迁移、门位收敛与
-//!   装完自检挑探测用户共用的那条判据（权益被撤掉的持凭据用户不满足它）。
+//! - [`hy2pool::is_resi_hy2`]：「有住宅权益、权益指向的分组真实存在、且开了 hysteria2」
+//!   ——池容量、迁移分凭据、门位收敛、面板投影、踢人与装完自检挑探测用户共用的**唯一**
+//!   那条判据（权益被撤掉、或 `group_id` 悬空的持凭据用户都不满足它）。
 //! - [`hy2pool::grow`]：补到目标条数（`id` = 最小空闲 `r%03d`，`name = id`）。
-//! - [`hy2pool::assign`] / [`hy2pool::release`] / [`hy2pool::cred_of`]：分配（先「从未用过」、
-//!   再「`released_at` 最早且 ≥ 24 小时」；**幂等**，已持凭据的用户原样拿回那一条，换凭据
-//!   必须显式 `release` + `assign`）、释放（记 `released_at`）与按用户取凭据。
+//! - [`hy2pool::assign_at`] / [`hy2pool::assign`] / [`hy2pool::release`] /
+//!   [`hy2pool::cred_of`]：分配（先「从未用过」、再「`released_at` 最早且 ≥ 24 小时」；
+//!   **幂等**，已持凭据的用户原样拿回那一条，换凭据必须显式 `release` + `assign`）、
+//!   释放（记 `released_at`）与按用户取凭据。**生产一律走 `assign_at`**：24 小时冷却期是
+//!   安全判据，判定时钟必须与盖 `released_at` 的那个同源（`bui` 侧的 `Host::now()`）；
+//!   `assign` 是墙钟便利版，只给 bui-schema 自己的用例用。
 //! - [`hy2pool::regenerate_idle_secrets`]：重写配置时顺带重随机全部空闲凭据的 `secret`。
 //! - [`hy2pool::free_count`] / [`hy2pool::LOW_FREE_RATIO`]：空闲率与 20% 告警门槛。
+//! - [`hy2pool::usage`] → [`hy2pool::PoolUsage`]：`bui status` 与
+//!   `GET /api/residential/pool` 的**唯一**用量口径（`used + free == size`，
+//!   悬空指针不计已用）。
 //! - [`hy2pool::migrate`]：v4 → 4.1 一次性分配（迁移用户 `name = 用户名`、
 //!   `secret = hy2_password` 的副本 ⇒ 订阅逐字不变），幂等；返回
 //!   [`hy2pool::MigrateReport`]（`changed` / `unassigned`，后者非零时调用方打 Error 事件）。
@@ -79,8 +91,17 @@
 //!
 //! ## 服务端配置渲染 —— [`render`]
 //!
-//! - [`render::hysteria::direct_yaml`] / [`render::hysteria::residential_yaml`]：两个
-//!   Hysteria2 实例的 `config.yaml` / `config-residential.yaml`。
+//! - [`render::hysteria::direct_yaml`]：**直连** Hysteria2 实例的 `config.yaml`
+//!   （4.1 起这是唯一一个 apernet hysteria 实例；4.0.x 的
+//!   `residential_yaml` / `residential_slot_yaml` 与 `config-residential[-<i>].yaml`
+//!   一起退役）。
+//! - [`render::hy2_singbox::config`]：**住宅** HY2 的 `hy2-residential.json`（一个 sing-box
+//!   hysteria2 入站 + 凭据池 + 每凭据一个 `gate-<id>` selector），端点常量
+//!   [`render::hy2_singbox::HY2_RESI_CLASH_API`] / [`render::hy2_singbox::HY2_RESI_V2RAY_API`]
+//!   与标签 [`render::hy2_singbox::INBOUND_TAG`] / [`render::hy2_singbox::DENY_TAG`] /
+//!   [`render::hy2_singbox::gate_tag`] / [`render::hy2_singbox::slot_out_tag`] 都只有这一处来源。
+//! - [`render::nft::ruleset`]：住宅 HY2 端口跳跃那张 `table inet bui`
+//!   （[`render::nft::TABLE`]，整段 + 可选的 4.0 兼容段 REDIRECT 到单一监听端口）。
 //! - [`render::xray::config`]：含 `vless-direct` / `vless-residential` 两个 REALITY 入站的
 //!   `xray-config.json`；[`render::xray::structural_hash`] 忽略 `clients` 后取哈希，
 //!   用于判断是否只是加减用户（可热更新而不必重启）。

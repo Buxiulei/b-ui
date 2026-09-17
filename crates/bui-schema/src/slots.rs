@@ -6,32 +6,30 @@
 //! 三条不变量，全靠 [`sync_slots`] 维护：
 //! 1. 每条上游恰好一个槽，每个槽恰好指向一条在池里的上游；
 //! 2. 序号取 `0..MAX_SLOTS` 的最小空闲值；
-//! 3. **池非空 ⇒ 序号 0 的槽存在**（`40000` / `2080` / `9998` /
-//!    `hysteria-residential.service` 是 v3 兼容面，不许悬空）。
-use crate::model::{NodeParams, Ports, Residential, Slot, State, User, DEFAULT_GROUP};
-use crate::nodes::{self, NodeKind};
+//! 3. **池非空 ⇒ 序号 0 的槽存在**（relay 的 `2080` 与 xray 的 `relay-slot-0` 是兼容面，
+//!    不许悬空）。4.1 起这条不变量**只保护这两个名字**：`40000` 归整个住宅 HY2 入站、
+//!    `9998` 已消失、`hysteria-residential.service` 归那个入站，三者都不再与槽 0 绑定
+//!    （spec §4.2 末段）。
+use crate::model::{Residential, Slot, State, User, DEFAULT_GROUP};
 use uuid::Uuid;
 
 /// relay 每槽一个 socks 入站的基准端口：槽 i 监听 `127.0.0.1:(2080 + i)`。
 pub const RELAY_SOCKS_BASE: u16 = 2080;
-/// 住宅 hysteria 实例 `trafficStats` 的基准端口：槽 i 用 `9998 - i`。
-/// **只能递减**：`9999` 是直连实例（`HY2_STATS_PORT_DIRECT`）。
-pub const HY2_STATS_RESI_BASE: u16 = 9998;
 /// 槽位上限，与住宅池上限同值（D5）。
 pub const MAX_SLOTS: u16 = 8;
 
-/// 一个槽位的全部端口资源。每一项都是序号的纯函数。
+/// 一个槽位的端口资源。每一项都是序号的纯函数。
+///
+/// 4.1 起只剩一项：**槽位与住宅 HY2 的对外端口彻底脱钩**（住宅 HY2 是一个 sing-box 入站
+/// `ports.hy2_resi`，整段跳跃由 `table inet bui` 送进去），所以这里只服务 relay 的 socks
+/// 入站与 xray 住宅出站。4.0.x 的 `hy2_port` / `stats_port` / `hop` 三项连同
+/// `hop_slice` / `slot_span` / `HY2_STATS_RESI_BASE` / `resources_of` 一起删掉了
+/// （spec §4.2、§14 裁决 6）——按槽算对外端口正是 2026-09-15 回归事故的入口。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SlotRes {
     pub index: u16,
-    /// relay 的 socks 入站端口，也是该槽 hysteria / xray 出站的目标
+    /// relay 的 socks 入站端口，也是该槽 xray 住宅出站的目标
     pub relay_port: u16,
-    /// 该槽 hysteria 住宅实例的监听端口
-    pub hy2_port: u16,
-    /// 该槽 hysteria 住宅实例的 `trafficStats.listen` 端口
-    pub stats_port: u16,
-    /// 该槽分到的端口跳跃区间（闭区间）
-    pub hop: (u16, u16),
 }
 
 /// 全部槽位，按序号升序（`state.residential.slots` 的规范视图）。
@@ -58,57 +56,13 @@ pub fn fallback_index(r: &Residential) -> u16 {
     indices(r)[0]
 }
 
-/// 槽位空间的宽度 = 最高序号 + 1，也就是「把跳跃区间切成几片」（D3）。
-/// 空池按 1 算 ⇒ 槽 0 拿到完整区间。
-pub fn slot_span(r: &Residential) -> u16 {
-    r.slots
-        .iter()
-        .map(|s| s.index + 1)
-        .max()
-        .unwrap_or(1)
-        .clamp(1, MAX_SLOTS)
-}
-
-/// 把闭区间 `range` 切成 `span` 段连续切片，返回第 `index` 段；最后一段吃掉余数。
-/// `span <= 1`、区间退化、或区间比 `span` 还短时一律返回整个区间（**绝不返回空区间**：
-/// 空的 `mport=` 会让客户端连不上）。
-pub fn hop_slice(range: (u16, u16), index: u16, span: u16) -> (u16, u16) {
-    let (start, end) = range;
-    let span = span.clamp(1, MAX_SLOTS);
-    let index = index.min(span - 1);
-    if span == 1 || end <= start {
-        return (start, end);
-    }
-    let total = u32::from(end - start) + 1;
-    let width = total / u32::from(span);
-    if width == 0 {
-        return (start, end);
-    }
-    let lo = u32::from(start) + width * u32::from(index);
-    let hi = if index + 1 >= span {
-        u32::from(end)
-    } else {
-        lo + width - 1
-    };
-    (lo as u16, hi as u16)
-}
-
-/// 槽 `index` 在 `span` 宽的槽位空间里的端口资源。
-pub fn resources(ports: &Ports, index: u16, span: u16) -> SlotRes {
-    let span = span.clamp(1, MAX_SLOTS);
-    let index = index.min(span - 1);
+/// 槽 `index` 的端口资源。序号越界（> [`MAX_SLOTS`] - 1）夹到最后一个槽。
+pub fn resources(index: u16) -> SlotRes {
+    let index = index.min(MAX_SLOTS - 1);
     SlotRes {
         index,
         relay_port: RELAY_SOCKS_BASE + index,
-        hy2_port: ports.hy2_resi + index,
-        stats_port: HY2_STATS_RESI_BASE - index,
-        hop: hop_slice(ports.hy2_resi_hop, index, span),
     }
-}
-
-/// 同 [`resources`]，但槽位空间直接从期望态取（调用方少算一次 [`slot_span`]）。
-pub fn resources_of(ports: &Ports, r: &Residential, index: u16) -> SlotRes {
-    resources(ports, index, slot_span(r))
 }
 
 /// 用户粘住的槽位键（上游 uuid）。没有住宅权益 / 没分过槽 ⇒ `None`。
@@ -156,8 +110,8 @@ pub fn sync_slots(r: &mut Residential) -> Vec<Slot> {
     }
     r.slots.sort_by_key(|s| s.index);
     // 不变量 3：池非空时序号 0 必须有人（D2）。序号 0 被释放掉时，把现存序号
-    // 最小的那个槽搬到 0 —— 代价是那一槽的用户端口下移一次，但 40000 / 2080 /
-    // 9998 / hysteria-residential.service 这四个兼容面绝不能悬空。
+    // 最小的那个槽搬到 0 —— 4.1 起这不动任何人的订阅（住宅 HY2 的端口与槽无关），
+    // 只是让 relay 的 `2080` 与 xray 的 `relay-slot-0` 这两个兼容面不悬空。
     if let Some(first) = r.slots.first_mut() {
         if first.index != 0 {
             first.index = 0;
@@ -172,140 +126,6 @@ pub fn users_of_slot(s: &State, slot_upstream_id: Uuid) -> Vec<&User> {
         .iter()
         .filter(|u| slot_id_of_user(u) == Some(slot_upstream_id))
         .collect()
-}
-
-/// 改池 / 改槽之后手里那份订阅已经不能照旧用的用户，按**原因**分三组（见
-/// [`resubscribe_impact`]）。每组都是升序的**用户名**，不含凭据、不含订阅 token。
-///
-/// **三组的后果是同一个：这些用户的 HY2 住宅节点会反复断联，需重新拉订阅。** 每个
-/// `hysteria-residential[-<i>]` 实例只把自己那一片跳跃段 REDIRECT 到自己的监听端口，
-/// 而客户端每 30 秒在**手里那份订阅**写着的段里随机换一个目的端口 —— 换到已经不属于
-/// 本槽的端口时，包落到别的实例（那里没有这条连接的状态）或没人监听的端口上被丢掉，
-/// 30 秒 idle 超时后重连。分组只说明**为什么**变了，不是后果轻重之分。
-///
-/// 三组互斥：前两组是端口变了（旧端口不再是他那一槽的实例），第三组是端口没变、只有
-/// 跳跃段变了。三组之外的住宅用户手里那份订阅照旧可用，不必打扰。
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(default)]
-pub struct ResubscribeImpact {
-    /// 组一：他粘着的那个槽位随上游一起被删，人已被重新分配到别的槽 ⇒ 手里那份订阅的
-    /// 端口与跳跃段都不再属于他那一槽的实例。
-    pub slot_removed: Vec<String>,
-    /// 组二：他粘着的那个槽位还在池里，但**槽序号变了**：删 0 号槽时不变量 3 把最低序号
-    /// 的槽搬到 0，或者 `assign` / `rebalance` 把他换到了别的槽 ⇒ 端口与跳跃段一起变。
-    pub slot_moved: Vec<String>,
-    /// 组三：端口没变，但 [`slot_span`] 一变、本槽的跳跃段就跟着被重切（[`hop_slice`] 按
-    /// **当下槽数**等分），旧段里划给别的槽的那些端口会打到**另一个 hysteria 进程**。
-    /// 所以**增删上游、rebalance 这类与他本人无关的操作也会把他列进来** —— 4.1 把住宅
-    /// HY2 改成单进程共享一段跳跃段之后，这一组才会消失。
-    pub hop_resliced: Vec<String>,
-}
-
-impl ResubscribeImpact {
-    /// 三组总人数。
-    pub fn total(&self) -> usize {
-        self.slot_removed.len() + self.slot_moved.len() + self.hop_resliced.len()
-    }
-
-    /// 一个人都不用重新获取订阅。
-    pub fn is_empty(&self) -> bool {
-        self.total() == 0
-    }
-}
-
-/// 两份期望态之间，**必须重新拉订阅**的用户，按原因分成 [`ResubscribeImpact`] 三组。
-///
-/// HY2 住宅节点的端口（`hy2_resi + 槽序号`）与端口跳跃区间（`mport=`，把 `hy2_resi_hop`
-/// 按 [`slot_span`] 等分给各槽）都写死在用户手里那份订阅里。客户端不会主动发现它们变了：
-/// v2rayN 要等用户点一次更新订阅，而 **Linux 客户端 `bui-c` 根本不会自动刷新节点**——每分钟
-/// 的 `bui-c check` 与每日自动更新**都不取节点**，必须由用户手动 `bui-c import --sub -` 或菜单
-/// [3] 重新导入。在那之前**反复断联**（后果见 [`ResubscribeImpact`]，三组都是同一个）。
-/// 所以任何动到槽位的写入都得把名单打给操作者：`residential` 的 add / remove / assign /
-/// rebalance 四条路径都经它上报；运维通知里还要点名 `bui-c` 这一类用户 —— 他们不会自己恢复。
-///
-/// 判据是「手里那份订阅还能不能用」，不是「有没有变」：端口必须一样，且旧的跳跃区间整段
-/// 仍落在本槽的新区间里 —— 区间被切成前缀时（`41000-43999` ⊆ `41000-45499`）每个端口照旧
-/// 打到本槽实例，这种人不上名单。节点取自 [`nodes::nodes_for`]（订阅内容的唯一真源），
-/// 所以没开 hysteria2 协议、没有住宅权益、权益指向的分组不存在的用户自动不在名单里。
-///
-/// `before` / `after` 必须是**同一次写入**的前后两份期望态（`after` 是 [`sync_slots`] 与
-/// [`migrate_unassigned`] 跑完之后的），否则名单是过期的。
-pub fn resubscribe_impact(before: &State, after: &State) -> ResubscribeImpact {
-    let mut out = ResubscribeImpact::default();
-    for u in &before.users {
-        let Some(old) = hy2_resi_node(u, &before.node, &before.residential) else {
-            continue;
-        };
-        let Some(new) = after
-            .users
-            .iter()
-            .find(|x| x.user_id == u.user_id)
-            .and_then(|a| hy2_resi_node(a, &after.node, &after.residential))
-        else {
-            continue;
-        };
-        if still_usable(&old, &new) {
-            continue;
-        }
-        // 端口 = `hy2_resi + 槽序号`，所以端口一变就只有两种成因：他的槽被删掉了（人被
-        // 重新分配），或者他的槽还在、序号被搬了。端口没变而上面判出不可用 ⇒ 只剩区间。
-        let group = if old.port == new.port {
-            &mut out.hop_resliced
-        } else if slot_is_gone(before, after, u) {
-            &mut out.slot_removed
-        } else {
-            &mut out.slot_moved
-        };
-        group.push(u.username.clone());
-    }
-    // 输出要确定性。**不含凭据、不含订阅 token。**
-    for g in [
-        &mut out.slot_removed,
-        &mut out.slot_moved,
-        &mut out.hop_resliced,
-    ] {
-        g.sort_unstable();
-    }
-    out
-}
-
-/// 用户在 `before` 里**实际渲染出的**那个槽位，在 `after` 里还在池里吗。
-///
-/// 按序号找槽（不是按 `slot_id`）：没分过槽、或分配指向了已消失槽位的用户渲染时落在兜底
-/// 槽上（[`index_of_user`]），他手里那份订阅写的就是兜底槽的端口。
-fn slot_is_gone(before: &State, after: &State, u: &User) -> bool {
-    let index = index_of_user(u, &before.residential);
-    let Some(old) = before.residential.slots.iter().find(|s| s.index == index) else {
-        return false; // 空池 ⇒ 没有槽可被删
-    };
-    !after
-        .residential
-        .slots
-        .iter()
-        .any(|s| s.upstream_id == old.upstream_id)
-}
-
-/// 用户订阅里的 HY2 住宅节点；没有这个节点 ⇒ `None`。
-///
-/// 真源是 [`nodes::nodes_for`]：只开了 vless-reality 的住宅用户订阅里压根没有 HY2 住宅
-/// 节点（Reality 住宅固定 `:10002`，换槽在服务端的 xray 路由里完成，订阅内容不变），
-/// 改池动不到他们。
-fn hy2_resi_node(u: &User, node: &NodeParams, r: &Residential) -> Option<nodes::Node> {
-    nodes::nodes_for(u, node, r)
-        .into_iter()
-        .find(|n| n.kind == NodeKind::Hy2Residential)
-}
-
-/// 手里那份 `old` 节点在新期望态下还连得上吗。
-fn still_usable(old: &nodes::Node, new: &nodes::Node) -> bool {
-    old.port == new.port
-        && match (old.hop, new.hop) {
-            // 旧订阅没有 mport ⇒ 只用基础端口，端口相同就还能用
-            (None, _) => true,
-            (Some(_), None) => false,
-            // 旧区间 ⊆ 新区间：每个端口照旧落在本槽实例上
-            (Some((a, b)), Some((c, d))) => c <= a && b <= d,
-        }
 }
 
 /// 用户数最少的槽（平手取序号最小，序号也平手取 uuid —— 完全确定性）。
@@ -428,14 +248,6 @@ mod tests {
     use crate::model::{Residential, Slot};
     use pretty_assertions::assert_eq;
 
-    fn ports() -> Ports {
-        serde_json::from_str(
-            r#"{"hy2":10000,"hy2_hop":[20000,30000],"hy2_resi":40000,"hy2_resi_hop":[41000,50000],
-                "reality_direct":10001,"reality_resi":10002,"admin":8080}"#,
-        )
-        .unwrap()
-    }
-
     fn resi(indices: &[u16]) -> Residential {
         Residential {
             slots: indices
@@ -454,82 +266,61 @@ mod tests {
     fn max_slots_is_eight() {
         assert_eq!(MAX_SLOTS, 8);
         assert_eq!(RELAY_SOCKS_BASE, 2080);
-        assert_eq!(HY2_STATS_RESI_BASE, 9998);
     }
 
-    /// 单槽（含空池）必须与 v3 单实例逐字等价 —— golden 的生命线。
+    /// 单槽（含空池）：槽 0 的 relay 入站必须还是 `2080`（xray 的 `relay-slot-0`
+    /// 与中继配置都按它走）。
     #[test]
-    fn a_single_slot_keeps_the_v3_ports_exactly() {
+    fn a_single_slot_keeps_the_v3_relay_port_exactly() {
         let empty = Residential::default();
         assert_eq!(indices(&empty), vec![0]);
-        assert_eq!(slot_span(&empty), 1);
         assert_eq!(fallback_index(&empty), 0);
-        let r = resources_of(&ports(), &empty, 0);
         assert_eq!(
-            r,
+            resources(0),
             SlotRes {
                 index: 0,
                 relay_port: 2080,
-                hy2_port: 40000,
-                stats_port: 9998,
-                hop: (41000, 50000),
             }
         );
     }
 
+    /// `SlotRes` 只剩两项：端口换算只服务 relay 入站与 xray 住宅出站。
+    ///
+    /// 下面这几行必须**编译不过**（字段与函数都已删干净，spec §14 裁决 6）：
+    /// `let _ = r.hy2_port;` / `let _ = r.stats_port;` / `let _ = r.hop;` /
+    /// `slots::hop_slice(...)` / `slots::slot_span(&r)` / `slots::resources_of(&p, &r, 0)`。
     #[test]
-    fn three_slots_split_the_hop_range_into_contiguous_slices() {
-        let r = resi(&[0, 1, 2]);
-        assert_eq!(slot_span(&r), 3);
-        let p = ports();
-        let s: Vec<SlotRes> = (0..3).map(|i| resources_of(&p, &r, i)).collect();
-        assert_eq!(s[0].hop, (41000, 43999));
-        assert_eq!(s[1].hop, (44000, 46999));
-        // 最后一段吃掉余数，右端必须正好落在 50000（否则客户端跳到没人监听的端口）
-        assert_eq!(s[2].hop, (47000, 50000));
-        assert_eq!(
-            s.iter().map(|x| x.hy2_port).collect::<Vec<_>>(),
-            vec![40000, 40001, 40002]
-        );
+    fn slot_resources_are_now_only_the_relay_port() {
+        let r = resources(3);
+        assert_eq!(r.index, 3);
+        assert_eq!(r.relay_port, RELAY_SOCKS_BASE + 3);
+    }
+
+    /// 8 槽下每个槽的 relay 端口互不相同，且与 `MAX_SLOTS` 同源。
+    #[test]
+    fn eight_slots_get_eight_distinct_relay_ports() {
+        let ports: std::collections::BTreeSet<u16> =
+            (0..MAX_SLOTS).map(|i| resources(i).relay_port).collect();
+        assert_eq!(ports.len(), usize::from(MAX_SLOTS));
+        assert_eq!(*ports.iter().next().unwrap(), 2080);
+        assert_eq!(*ports.iter().last().unwrap(), 2087);
+    }
+
+    /// 三个槽各拿自己那一个 relay 端口，**不再有跳跃段可切**（4.0.x 那三条「切片首尾
+    /// 相接」的断言随 `hop_slice` 一起删了）。越界序号夹到最后一个槽，不 panic。
+    #[test]
+    fn three_slots_get_three_contiguous_relay_ports() {
+        let s: Vec<SlotRes> = (0..3).map(resources).collect();
         assert_eq!(
             s.iter().map(|x| x.relay_port).collect::<Vec<_>>(),
             vec![2080, 2081, 2082]
         );
         assert_eq!(
-            s.iter().map(|x| x.stats_port).collect::<Vec<_>>(),
-            vec![9998, 9997, 9996],
-            "9999 归直连实例，住宅只能往下走"
+            resources(MAX_SLOTS),
+            resources(MAX_SLOTS - 1),
+            "越界夹到顶槽"
         );
-        // 切片必须首尾相接、不重叠
-        assert_eq!(s[0].hop.1 + 1, s[1].hop.0);
-        assert_eq!(s[1].hop.1 + 1, s[2].hop.0);
-    }
-
-    /// D3：序号有空洞时闲置那一片，**不重切** —— 否则删一条上游就要全员刷订阅。
-    #[test]
-    fn a_hole_in_the_index_space_leaves_its_slice_idle() {
-        let r = resi(&[0, 2]);
-        assert_eq!(slot_span(&r), 3, "空间宽度按最高序号算，不按槽位个数");
-        let p = ports();
-        assert_eq!(resources_of(&p, &r, 0).hop, (41000, 43999), "槽 0 的片没变");
-        assert_eq!(resources_of(&p, &r, 2).hop, (47000, 50000));
-    }
-
-    #[test]
-    fn hop_slice_never_returns_an_empty_range() {
-        // 区间比槽数还短：全部共用整个区间
-        assert_eq!(hop_slice((41000, 41001), 1, 8), (41000, 41001));
-        // 退化区间
-        assert_eq!(hop_slice((41000, 41000), 0, 3), (41000, 41000));
-        // 越界序号夹到最后一段
-        assert_eq!(hop_slice((41000, 50000), 9, 2), (45500, 50000));
-        for span in 1..=MAX_SLOTS {
-            for i in 0..span {
-                let (lo, hi) = hop_slice((41000, 50000), i, span);
-                assert!(lo <= hi, "span={span} i={i} 切出了空区间");
-                assert!((41000..=50000).contains(&lo) && (41000..=50000).contains(&hi));
-            }
-        }
+        assert_eq!(resources(99).relay_port, 2087);
     }
 
     #[test]
@@ -751,10 +542,14 @@ mod tests {
         after
     }
 
-    /// 某用户订阅里 HY2 住宅节点的 `(端口, 跳跃区间)`。
+    /// 某用户订阅里 HY2 住宅节点的 `(端口, 跳跃区间)`。订阅内容的真源只有
+    /// [`nodes::nodes_for`] 一处。
     fn node_of(s: &State, name: &str) -> (u16, Option<(u16, u16)>) {
         let u = s.users.iter().find(|u| u.username == name).unwrap();
-        let n = hy2_resi_node(u, &s.node, &s.residential).unwrap();
+        let n = crate::nodes::nodes_for(u, &s.node, &s.residential)
+            .into_iter()
+            .find(|n| n.kind == crate::nodes::NodeKind::Hy2Residential)
+            .expect("该用户订阅里没有 HY2 住宅节点");
         (n.port, n.hop)
     }
 
@@ -772,155 +567,85 @@ mod tests {
         after
     }
 
-    /// 三组名单的字面量，省掉一堆 `to_string()`。
-    fn imp(removed: &[&str], moved: &[&str], resliced: &[&str]) -> ResubscribeImpact {
-        let v = |x: &[&str]| x.iter().map(|s| (*s).to_string()).collect();
-        ResubscribeImpact {
-            slot_removed: v(removed),
-            slot_moved: v(moved),
-            hop_resliced: v(resliced),
-        }
-    }
-
-    /// 删掉序号最高的槽：两种原因必须分开报。u3 的槽被删、人换了槽（`40002` → `40000`，
-    /// 旧端口 40002 已无人监听）；槽位空间 3 → 2 又把槽 1 的区间从 `44000-46999` 挪成
-    /// `45500-50000`，u2 的端口没变，但 44000-45499 那段已划给槽 0 的**另一个 hysteria
-    /// 进程**，他每 30 秒跳一次端口、跳到那一段里就丢包。两组的后果一样：反复断联、要
-    /// 重新拉订阅。
+    /// 4.1 的退役判据（spec §1.2 目标 1）：**改槽不动订阅**。
     ///
-    /// 槽 0 的 u1 一个组都不进：`41000-43999` ⊂ 新区间 `41000-45499`，每个端口照旧落在
-    /// 本槽实例 —— 判据是「旧区间是不是本槽新区间的子集」，不是「区间变没变」。
-    #[test]
-    fn removing_the_top_slot_splits_the_deleted_slot_from_the_resliced_survivors() {
-        let mut s = state(3, 3);
-        migrate_unassigned(&mut s); // u1 → 槽 0，u2 → 槽 1，u3 → 槽 2
-        let after = after_remove(&s, Uuid::from_u128(3));
-        assert_eq!(
-            resubscribe_impact(&s, &after),
-            imp(&["u3"], &[], &["u2"]),
-            "u3 = 组一（槽被删、换槽）；u2 = 组三（区间被重切）；u1 一组都不进"
-        );
-        // 三个人各自变了什么：只有 u1 那份订阅还能照旧用
-        assert_eq!(node_of(&s, "u1"), (40000, Some((41000, 43999))));
-        assert_eq!(node_of(&after, "u1"), (40000, Some((41000, 45499))));
-        assert_eq!(node_of(&s, "u2"), (40001, Some((44000, 46999))));
-        assert_eq!(node_of(&after, "u2"), (40001, Some((45500, 50000))));
-        assert_eq!(node_of(&s, "u3"), (40002, Some((47000, 50000))));
-        assert_eq!(node_of(&after, "u3"), (40000, Some((41000, 45499))));
-    }
-
-    /// 被删的槽上**一个用户都没有**也要打名单：槽位空间一缩，存活槽的区间就被重切。
-    /// 这条是「只算端口」那版实现的漏报 —— 它会回一句「没有用户受影响」。
-    #[test]
-    fn removing_an_empty_top_slot_still_lists_the_survivors_whose_range_moved() {
-        let mut s = state(3, 2);
-        migrate_unassigned(&mut s); // u1 → 槽 0，u2 → 槽 1；槽 2 空着
-        let after = after_remove(&s, Uuid::from_u128(3));
-        assert_eq!(
-            resubscribe_impact(&s, &after),
-            imp(&[], &[], &["u2"]),
-            "u2 的区间 44000-46999 → 45500-50000（不是子集）；u1 的 41000-43999 是新区间前缀"
-        );
-    }
-
-    /// 加一条上游：**存活槽的跳跃段被全部重切，于是池里的住宅用户一个不落都要重新拉
-    /// 订阅。** [`hop_slice`] 按当下槽数等分，1 → 2 条把槽 0 的 `41000-50000` 砍成
-    /// `41000-45499`，2 → 3 条又把槽 1 的整段挪走；而客户端每 30 秒在手里那份订阅写着的
-    /// 段里随机换一个目的端口，换到已经划给别的 `hysteria-residential` 实例的端口上就
-    /// 丢包、30 秒 idle 超时后重连。所以「加一条上游」这种与现有用户毫无关系的操作会让
-    /// 全部住宅 HY2 用户反复断联，直到各自刷新订阅。
+    /// 4.0.x 里住宅 HY2 节点的端口是 `hy2_resi + 槽序号`、跳跃段是 `hy2_resi_hop` 按当下
+    /// 槽数等分的第 i 片，于是增删上游、`assign`、`rebalance` 都会改掉已下发订阅里的端口
+    /// 或段，受影响的用户必须重新获取订阅（那套「必须重新获取订阅」的名单机制就是为它存在
+    /// 的）。4.1 起住宅 HY2 只有**一个**监听端口、整段 `41000-50000` 由 `table inet bui`
+    /// 的 REDIRECT 送进去（[`nodes::nodes_for`](crate::nodes::nodes_for)），所以每个用户的
+    /// 端口与区间完全相同、与槽位无关 —— 名单机制随之退役。
     ///
-    /// 4.0.1 不改切法（4.1 改成 sing-box 单进程共享一段跳跃段），所以这条路径**必须点名**
-    /// —— 名单落在组三：端口一个没动，只有段变了。
+    /// 这条用例是那次退役的回归锁：只要哪天端口又跟槽序号挂上钩，它就红。
+    ///
+    /// 每条腿都**先断言槽位真的动过**（4.0.x 算端口用的那两个输入：每个用户的槽序号 +
+    /// 槽位空间宽度）—— 否则某天 `sync_slots` / `rebalance` 退化成 no-op，「订阅没变」
+    /// 会在「什么都没变」的情况下照旧全绿（第六波复核点名）。
+    /// `assign` 那条路在 `bui` 侧覆盖（`residential::slots` 与 `residential::upstream`
+    /// 各有一条带「他确实换了槽」断言的用例），所以这里是四条腿。
     #[test]
-    fn adding_an_upstream_reslices_every_survivors_hop_range() {
-        for n in 1..MAX_SLOTS {
-            let mut before = state(n, 3);
-            migrate_unassigned(&mut before);
-            let after = after_add(&before, n);
-            assert_eq!(
-                resubscribe_impact(&before, &after),
-                imp(&[], &[], &["u1", "u2", "u3"]),
-                "{n} → {} 条上游：每个住宅用户的 mport= 都被重切了，名单不许漏人",
-                n + 1
-            );
+    fn changing_the_pool_never_moves_anybody_s_subscription() {
+        /// 4.0.x 算端口/区间的两个输入：每人的槽序号 + 槽位空间宽度（当年 `hop_slice`
+        /// 的分母 = 最高序号 + 1）。两个输入都已经不参与订阅了，这里就地算一遍只为
+        /// 证明「槽位真的动过」—— 否则某天 `sync_slots` / `rebalance` 退化成 no-op，
+        /// 「订阅没变」会在「什么都没变」的情况下照旧全绿。
+        fn port_inputs(s: &State) -> (Vec<(String, u16)>, u16) {
+            let mut per_user: Vec<(String, u16)> = s
+                .users
+                .iter()
+                .map(|u| (u.username.clone(), index_of_user(u, &s.residential)))
+                .collect();
+            per_user.sort();
+            let span = s
+                .residential
+                .slots
+                .iter()
+                .map(|x| x.index + 1)
+                .max()
+                .unwrap_or(1);
+            (per_user, span)
         }
-        // 具体数字：1 → 2 条把槽 0 的整段砍成前半段，端口一个没动
-        let mut before = state(1, 1);
-        migrate_unassigned(&mut before);
-        assert_eq!(node_of(&before, "u1"), (40000, Some((41000, 50000))));
-        let after = after_add(&before, 1);
-        assert_eq!(node_of(&after, "u1"), (40000, Some((41000, 45499))));
-    }
 
-    /// 删 0 号槽：只列手里那份订阅**真的**不能用了的人，而且列进的是组二。不变量 3 把槽 1
-    /// 搬到 0（端口下移、旧端口 40001 无人监听 ⇒ 连不上），而被删槽上的 u1 常常被重新分配
-    /// 回序号 0（`40000` → `40000`，区间也没动 ⇒ 一组都不进）—— 照「被删槽上的人」列名单
-    /// 就是误报。
-    #[test]
-    fn removing_slot_zero_lists_only_the_users_whose_node_really_moves() {
-        let mut s = state(3, 3);
-        migrate_unassigned(&mut s); // u1 → 槽 0，u2 → 槽 1，u3 → 槽 2
-        let after = after_remove(&s, Uuid::from_u128(1));
-        assert_eq!(
-            resubscribe_impact(&s, &after),
-            imp(&[], &["u2"], &[]),
-            "槽 1（u2）被搬到 0：40001 → 40000"
-        );
-        // 名单与删后逐用户核对的结果逐字一致
-        assert_eq!(node_of(&after, "u1"), node_of(&s, "u1"));
-        assert_eq!(node_of(&after, "u2"), (40000, Some((41000, 43999))));
-        assert_eq!(node_of(&after, "u3"), node_of(&s, "u3"));
-    }
-
-    /// 删 0 号槽可以同时打到组一与组二：被重新分配到别的槽的（u1），以及槽序号被搬到 0
-    /// 的（u2、u5）。两组的后果是同一个（HY2 住宅节点反复断联、需重新拉订阅），分组只
-    /// 说明原因不同。
-    #[test]
-    fn removing_slot_zero_can_hit_both_the_reassigned_and_the_moved() {
         let mut s = state(3, 5);
-        migrate_unassigned(&mut s); // 槽 0：u1、u4；槽 1：u2、u5；槽 2：u3
-        assert_eq!(load(&s), vec![2, 2, 1]);
-        let after = after_remove(&s, Uuid::from_u128(1));
-        let i = resubscribe_impact(&s, &after);
-        assert_eq!(
-            i,
-            imp(&["u1"], &["u2", "u5"], &[]),
-            "u1 被重新分配到槽 2（40000 → 40002）= 组一；u2 / u5 随槽 1 被搬到 0 = 组二；\
-             u4 落回序号 0，端口与区间都没动"
-        );
-        assert_eq!(i.total(), 3);
-        assert_eq!(node_of(&after, "u4"), node_of(&s, "u4"));
-    }
-
-    /// 只开 vless-reality 的住宅用户永不进名单：他的订阅里压根没有 HY2 住宅节点
-    /// （Reality 住宅固定 `:10002`，换槽在服务端的 xray 路由里完成）。
-    #[test]
-    fn a_reality_only_user_is_never_listed() {
-        let mut s = state(3, 3);
         migrate_unassigned(&mut s);
-        s.users[1].entitlements.protocols = vec![crate::model::Protocol::Reality];
-        // 删槽 1（上面只有 u2）：槽 0 / 槽 2 的序号与区间都不动，u2 自己没有 HY2 住宅节点
-        assert!(resubscribe_impact(&s, &after_remove(&s, Uuid::from_u128(2))).is_empty());
-    }
-
-    /// 空名单：期望态没变，以及池里只剩一条时删掉它（槽位表清空 ⇒ 渲染退回单槽，
-    /// `40000` + 完整区间照旧有人听）。
-    #[test]
-    fn nobody_is_listed_when_the_subscription_still_works() {
-        let mut s = state(3, 3);
-        migrate_unassigned(&mut s);
-        assert_eq!(
-            resubscribe_impact(&s, &s),
-            ResubscribeImpact::default(),
-            "同一份期望态 ⇒ 三组全空"
+        crate::hy2pool::migrate(&mut s, time::OffsetDateTime::now_utc());
+        let before: Vec<(u16, Option<(u16, u16)>)> =
+            (1..=5).map(|n| node_of(&s, &format!("u{n}"))).collect();
+        assert!(
+            before.iter().all(|x| *x == (40000, Some((41000, 50000)))),
+            "4.1：端口与整段跳跃对每个用户都一样，{before:?}"
         );
-        let mut one = state(1, 2);
-        migrate_unassigned(&mut one);
-        let after = after_remove(&one, Uuid::from_u128(1));
-        assert!(after.residential.slots.is_empty());
-        assert_eq!(node_of(&after, "u1"), (40000, Some((41000, 50000))));
-        assert!(resubscribe_impact(&one, &after).is_empty());
+        // rebalance 在已经均匀的池上是 no-op，那样这条腿什么都没验 —— 先把所有人压到槽 0
+        let squeezed = {
+            let mut r = s.clone();
+            let slot0 = sorted(&r.residential)[0].upstream_id;
+            for u in r.users.iter_mut() {
+                u.entitlements.residential.as_mut().unwrap().slot_id = Some(slot0);
+            }
+            r
+        };
+        let rebalanced = {
+            let mut r = squeezed.clone();
+            assert!(rebalance(&mut r) > 0, "rebalance 没搬人，这条腿什么都没验");
+            r
+        };
+        // 删 0 号槽（不变量 3 会把槽 1 搬到 0）、删顶槽、加一条上游、rebalance —— 四条
+        // 改槽路径挨个来一遍，订阅里那个节点一个字节都不许动
+        for (path, from, after) in [
+            ("删 0 号槽", &s, after_remove(&s, Uuid::from_u128(1))),
+            ("删顶槽", &s, after_remove(&s, Uuid::from_u128(3))),
+            ("加一条上游", &s, after_add(&s, 3)),
+            ("rebalance", &squeezed, rebalanced),
+        ] {
+            assert_ne!(
+                port_inputs(&after),
+                port_inputs(from),
+                "{path}：槽序号与槽位空间都没变 —— 这条腿证明不了「改槽不动订阅」"
+            );
+            let now: Vec<(u16, Option<(u16, u16)>)> =
+                (1..=5).map(|n| node_of(&after, &format!("u{n}"))).collect();
+            assert_eq!(now, before, "{path}：改槽动了订阅里的住宅 HY2 节点");
+        }
     }
 
     /// 规则 3：rebalance 均匀重排，且**幂等**（连调两次第二次零改动）。

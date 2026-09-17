@@ -1,4 +1,8 @@
-//! Hysteria2 直连/住宅配置渲染的形状校验（Task 7）+ 真实内核的配置加载校验。
+//! Hysteria2 **直连**配置渲染的形状校验（Task 7）+ 真实内核的配置加载校验。
+//!
+//! 4.1 起住宅 HY2 不再是 apernet hysteria（换成 sing-box 的单入站 + 凭据池），本文件里
+//! 那几条住宅腿连同 `residential_yaml` / `residential_slot_yaml` 一起删了；住宅侧的
+//! 形状与真内核校验在 `kernel_hy2_singbox.rs`。
 mod common;
 
 use bui_schema::model::Hy2Auth;
@@ -89,41 +93,6 @@ fn hysteria_direct_without_obfs_or_hop() {
     .unwrap();
     assert_eq!(y["listen"].as_str().unwrap(), ":10000");
     assert!(y.get("obfs").is_none());
-    let y: serde_yaml::Value = serde_yaml::from_str(&hysteria::residential_yaml(
-        &s.node,
-        &Paths::default_server(),
-        Hy2Auth::Http,
-    ))
-    .unwrap();
-    assert!(y.get("obfs").is_none(), "混淆关闭时住宅实例也不带 obfs");
-}
-
-#[test]
-fn hysteria_residential_shape() {
-    let s = common::state("obfs");
-    let y: serde_yaml::Value = serde_yaml::from_str(&hysteria::residential_yaml(
-        &s.node,
-        &Paths::default_server(),
-        Hy2Auth::Command,
-    ))
-    .unwrap();
-    assert_eq!(y["listen"].as_str().unwrap(), ":40000,41000-50000");
-    assert_eq!(
-        y["trafficStats"]["listen"].as_str().unwrap(),
-        "127.0.0.1:9998"
-    );
-    assert_eq!(y["outbounds"][0]["name"].as_str().unwrap(), "relay");
-    assert_eq!(
-        y["outbounds"][0]["socks5"]["addr"].as_str().unwrap(),
-        "127.0.0.1:2080"
-    );
-    assert_eq!(y["acl"]["inline"][0].as_str().unwrap(), "relay(all)");
-    // 混淆覆盖全部 HY2 实例（2026-09-15 裁决），与订阅里住宅 HY2 节点的 obfs 参数一致
-    assert_eq!(y["obfs"]["type"].as_str().unwrap(), "salamander");
-    assert_eq!(
-        y["obfs"]["salamander"]["password"].as_str().unwrap(),
-        "obfs-pw-test"
-    );
 }
 
 /// 事故回归（2026-09-12 bwg-rick，约 1 小时全员鉴权失败）：Hysteria2 的 `auth.command`
@@ -134,69 +103,27 @@ fn hysteria_residential_shape() {
 /// 区分），两台实例全员 404。
 ///
 /// 正式修法是让 `bin/bui-auth-hook`（指向同目录 `bui` 的符号链接）自己就是那个路径，
-/// 由 `bui` 的 argv[0] 分发进钩子。两份配置都必须是**不含空白**的单路径。
+/// 由 `bui` 的 argv[0] 分发进钩子。这个路径必须是**不含空白**的单路径。
+/// （4.1 起只有直连还走 `auth.command`，住宅侧是 sing-box 的静态 `users` + 门。）
 #[test]
 fn hysteria_auth_command_is_a_single_executable_path_without_arguments() {
     let s = common::state("obfs");
     let p = Paths::default_server();
-    for (which, yaml) in [
-        (
-            "config.yaml",
-            hysteria::direct_yaml(&s.node, &p, Hy2Auth::Command),
-        ),
-        (
-            "config-residential.yaml",
-            hysteria::residential_yaml(&s.node, &p, Hy2Auth::Command),
-        ),
-    ] {
-        let y: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
-        let cmd = y["auth"]["command"].as_str().unwrap();
-        assert_eq!(y["auth"]["type"].as_str().unwrap(), "command", "{which}");
-        assert_eq!(
-            cmd,
-            p.auth_hook_bin().to_str().unwrap(),
-            "{which} 的 auth.command 必须是 bin/bui-auth-hook"
-        );
-        assert_eq!(cmd, "/opt/b-ui/bin/bui-auth-hook", "{which}");
-        assert!(
-            !cmd.chars().any(char::is_whitespace),
-            "{which} 的 auth.command 一旦带空白，内核就会去找一个文件名带空格的可执行文件：{cmd:?}"
-        );
-    }
-}
-
-/// 三个住宅实例的配置都得是合法 YAML、`listen` 行互不重叠 —— hysteria 没有
-/// `check` 子命令（spec §2.2），所以这一层只能靠 schema 测试兜底。
-#[test]
-fn three_residential_slot_configs_parse_and_do_not_overlap() {
-    let s = common::state("global");
-    let p = bui_schema::paths::Paths::default_server();
-    let mut seen: Vec<(u16, u16)> = vec![];
-    for i in 0..3u16 {
-        let r = bui_schema::slots::resources(&s.node.ports, i, 3);
-        let text =
-            bui_schema::render::hysteria::residential_slot_yaml(&s.node, &p, &r, Hy2Auth::Http);
-        let v: serde_yaml::Value = serde_yaml::from_str(&text).expect("合法 YAML");
-        assert_eq!(
-            v["listen"].as_str().unwrap(),
-            format!(":{},{}-{}", r.hy2_port, r.hop.0, r.hop.1)
-        );
-        assert_eq!(
-            v["outbounds"][0]["socks5"]["addr"].as_str().unwrap(),
-            format!("127.0.0.1:{}", r.relay_port)
-        );
-        assert_eq!(
-            v["trafficStats"]["listen"].as_str().unwrap(),
-            format!("127.0.0.1:{}", r.stats_port)
-        );
-        for (lo, hi) in &seen {
-            assert!(
-                r.hop.1 < *lo || r.hop.0 > *hi,
-                "槽 {i} 的跳跃区间与已有区间重叠"
-            );
-        }
-        seen.push(r.hop);
-    }
+    let which = "config.yaml";
+    let yaml = hysteria::direct_yaml(&s.node, &p, Hy2Auth::Command);
+    let y: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+    let cmd = y["auth"]["command"].as_str().unwrap();
+    assert_eq!(y["auth"]["type"].as_str().unwrap(), "command", "{which}");
+    assert_eq!(
+        cmd,
+        p.auth_hook_bin().to_str().unwrap(),
+        "{which} 的 auth.command 必须是 bin/bui-auth-hook"
+    );
+    assert_eq!(cmd, "/opt/b-ui/bin/bui-auth-hook", "{which}");
+    assert!(
+        !cmd.chars().any(char::is_whitespace),
+        "{which} 的 auth.command 一旦带空白，内核就会去找一个文件名带空格的可执行文件：{cmd:?}"
+    );
 }
 
 /// 真实内核校验：hysteria **没有** `check` 子命令（spec §2.2），所以只能真起一次
@@ -228,19 +155,8 @@ fn both_auth_modes_load_in_the_real_hysteria_kernel() {
         certs_dir: dir.path().to_path_buf(),
         bin_dir: dir.path().join("bin"),
     };
-    let slot0 = bui_schema::slots::resources(&s.node.ports, 0, 1);
     for (mode, auth) in [("http", Hy2Auth::Http), ("command", Hy2Auth::Command)] {
-        for (which, text) in [
-            ("direct", hysteria::direct_yaml(&s.node, &paths, auth)),
-            // 住宅实例同样带 obfs（2026-09-15 裁决）；跳跃区间同样要 root，换成单端口
-            (
-                "residential",
-                with_listen(
-                    &hysteria::residential_slot_yaml(&s.node, &paths, &slot0, auth),
-                    &format!(":{}", free_udp_port()),
-                ),
-            ),
-        ] {
+        for (which, text) in [("direct", hysteria::direct_yaml(&s.node, &paths, auth))] {
             let mode = format!("{mode}-{which}");
             assert!(text.contains("salamander"), "{mode} 应带 obfs：{text}");
             let cfg = dir.path().join(format!("{mode}.yaml"));
@@ -316,7 +232,7 @@ fn wait_for_log(
     false
 }
 
-/// 端到端（本机回环，不出网）：obfs 开启时渲染出的直连与住宅服务端配置，真起 `hysteria server`，
+/// 端到端（本机回环，不出网）：obfs 开启时渲染出的直连服务端配置，真起 `hysteria server`，
 /// 同密码的 `hysteria client` 必须鉴权通过；**不带 obfs** 的客户端必须连不上，且在限时内以
 /// 「failed to initialize client」退出（终态断言，不靠超时挂起判失败）。
 ///
@@ -340,18 +256,11 @@ fn obfs_server_admits_a_matching_client_and_refuses_one_without_obfs() {
         certs_dir: dir.path().to_path_buf(),
         bin_dir: dir.path().join("bin"),
     };
-    let slot0 = bui_schema::slots::resources(&s.node.ports, 0, 1);
     let obfs_pw = s.node.obfs.password.clone();
-    for (which, rendered) in [
-        (
-            "direct",
-            hysteria::direct_yaml(&s.node, &paths, Hy2Auth::Http),
-        ),
-        (
-            "residential",
-            hysteria::residential_slot_yaml(&s.node, &paths, &slot0, Hy2Auth::Http),
-        ),
-    ] {
+    for (which, rendered) in [(
+        "direct",
+        hysteria::direct_yaml(&s.node, &paths, Hy2Auth::Http),
+    )] {
         let port = free_udp_port();
         let mut text = with_listen(&rendered, &format!("127.0.0.1:{port}"));
         text = with_key(
@@ -481,7 +390,7 @@ fn obfs_server_admits_a_matching_client_and_refuses_one_without_obfs() {
     }
 }
 
-/// 两种鉴权模式各一份 golden（`tests/fixtures/hysteria/<模式>/`）。
+/// 两种鉴权模式各一份 golden（`tests/fixtures/hysteria/<模式>/config.yaml`）。
 ///
 /// 逐字节比对而不是比 YAML 树：`auth` 段是唯一允许随模式变的地方，任何顺带的字段重排
 /// （端口、伪装、sniff）都要在这里当场撞红 —— 切鉴权模式会重启两份 hysteria，
@@ -490,17 +399,11 @@ fn obfs_server_admits_a_matching_client_and_refuses_one_without_obfs() {
 fn both_auth_modes_match_their_golden_config() {
     let s = common::state("obfs");
     let p = Paths::default_server();
-    let slot0 = bui_schema::slots::resources(&s.node.ports, 0, 1);
     for (mode, auth) in [("http", Hy2Auth::Http), ("command", Hy2Auth::Command)] {
         assert_eq!(
             hysteria::direct_yaml(&s.node, &p, auth),
             golden(mode, "config.yaml"),
             "{mode} 模式的 config.yaml 与 golden 不符"
-        );
-        assert_eq!(
-            hysteria::residential_slot_yaml(&s.node, &p, &slot0, auth),
-            golden(mode, "config-residential.yaml"),
-            "{mode} 模式的 config-residential.yaml 与 golden 不符"
         );
     }
 }

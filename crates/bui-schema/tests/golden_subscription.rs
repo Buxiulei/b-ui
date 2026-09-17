@@ -282,10 +282,10 @@ fn disabled_pool_emits_no_keyword_rules() {
     assert!(!yaml.contains("DOMAIN-KEYWORD"));
 }
 
-/// 多槽时三种订阅里的 HY2 住宅端口/跳跃区间都跟着用户的槽位走，
-/// 其余节点与 golden 逐字相同。
+/// 4.1：多槽也不再动三种订阅里的 HY2 住宅端点 —— 每个用户都是期望态里那一对
+/// `hy2_resi` / `hy2_resi_hop`（整段），其余节点与 golden 逐字相同。
 #[test]
-fn multi_slot_moves_only_the_residential_hy2_endpoint() {
+fn multi_slot_does_not_move_the_residential_hy2_endpoint() {
     let mut s = common::state("global");
     // fixture 自带 2 条上游，补到 3 条并按创建时间轮流落槽
     let g = s.residential.groups.get_mut("default").unwrap();
@@ -293,28 +293,30 @@ fn multi_slot_moves_only_the_residential_hy2_endpoint() {
     third.id = uuid::Uuid::from_u128(0xdead);
     third.host = "isp3.example.net".into();
     g.upstreams.push(third);
+    // 4.1：住宅 HY2 不再含槽位信息 —— 三条上游、三个槽，**每个用户端口与区间都一样**
     bui_schema::slots::sync_slots(&mut s.residential);
     bui_schema::slots::migrate_unassigned(&mut s);
-    assert_eq!(bui_schema::slots::slot_span(&s.residential), 3);
+    bui_schema::hy2pool::migrate(&mut s, time::OffsetDateTime::now_utc());
 
+    let (port, hop) = (s.node.ports.hy2_resi, s.node.ports.hy2_resi_hop);
     let split = split_of(&s);
+    let mut seen = std::collections::BTreeSet::new();
     for u in USERS {
-        let Some(user) = s.users.iter().find(|x| x.username == u) else {
+        if !s.users.iter().any(|x| x.username == u) {
             continue;
-        };
-        let idx = bui_schema::slots::index_of_user(user, &s.residential);
-        let res = bui_schema::slots::resources_of(&s.node.ports, &s.residential, idx);
+        }
         let nodes = nodes_of(&s, u);
         let Some(resi) = nodes
             .iter()
             .find(|n| n.kind == bui_schema::nodes::NodeKind::Hy2Residential)
         else {
-            continue; // 没有住宅权益的用户
+            continue; // 没有住宅权益（或没开 hysteria2）的用户
         };
-        assert_eq!(resi.port, res.hy2_port, "user={u}");
-        assert_eq!(resi.hop, Some(res.hop), "user={u}");
+        assert_eq!(resi.port, port, "user={u}");
+        assert_eq!(resi.hop, Some(hop), "user={u}");
+        seen.insert((resi.port, resi.hop));
 
-        // URI 列表里出现的就是这一槽的端口与 mport
+        // URI 列表里出现的就是这一对固定值
         let text = String::from_utf8(
             base64::engine::general_purpose::STANDARD
                 .decode(subscription::uri_list(&nodes, u).trim())
@@ -322,12 +324,11 @@ fn multi_slot_moves_only_the_residential_hy2_endpoint() {
         )
         .unwrap();
         assert!(
-            text.contains(&format!(":{}?", res.hy2_port)),
-            "user={u} 的 URI 里没有槽位端口 {}：\n{text}",
-            res.hy2_port
+            text.contains(&format!(":{port}?")),
+            "user={u} 的 URI 里没有住宅端口 {port}：\n{text}"
         );
         assert!(
-            text.contains(&format!("mport={}-{}", res.hop.0, res.hop.1)),
+            text.contains(&format!("mport={}-{}", hop.0, hop.1)),
             "user={u}"
         );
 
@@ -340,12 +341,115 @@ fn multi_slot_moves_only_the_residential_hy2_endpoint() {
             .find(|o| o["tag"] == "hy2-residential")
             .unwrap()
             .clone();
-        assert_eq!(out["server_port"], res.hy2_port, "user={u}");
+        assert_eq!(out["server_port"], port, "user={u}");
         common::check_singbox_all(&sb);
         let yaml = subscription::clash(&nodes, u, &split);
         assert!(
-            yaml.contains(&format!("port: {}", res.hy2_port)),
-            "user={u} 的 clash YAML 里没有槽位端口"
+            yaml.contains(&format!("port: {port}")),
+            "user={u} 的 clash YAML 里没有住宅端口"
         );
     }
+    assert_eq!(seen.len(), 1, "多槽下的端口/区间必须是同一对，不该有第二种");
+}
+
+/// 4.1（T14 收口）：**零节点用户的订阅必须整份仍然可用**。
+///
+/// 谁会零节点：只有住宅权益、只开 hysteria2 的用户（fixture 里的 bob），在凭据池耗尽
+/// （`hy2pool::migrate` 报 `unassigned > 0`）或建完用户到下一轮收敛之间那一瞬，
+/// `hy2pool::cred_of` 为 `None` ⇒ `nodes_for` 一个节点都不发（spec §3.1）。
+///
+/// 为什么不是「少一个节点」这么轻：空节点集会渲出 `urltest` 的 `outbounds: []`，而
+/// `dns.servers[remote].detour` 与 `route.final` 都指着它，sing-box 直接拒绝加载
+/// **整份**配置（实测 1.14.0 先在空 `domain` 项上 FATAL，改掉后仍在空 urltest 上失败）；
+/// mihomo 那侧同理（空 `select` 组 + 指向不存在组的 `MATCH`）。于是这个用户连订阅都用
+/// 不了、客户端起不来 —— 比「没有住宅节点」严重得多。
+#[test]
+fn a_user_with_no_nodes_still_gets_a_loadable_subscription() {
+    let mut s = common::state("split");
+    // bob：单 hysteria2 + 只有住宅（`direct=false`），摘掉他的凭据指针就是「池耗尽」那一瞬
+    let bob = s
+        .users
+        .iter_mut()
+        .find(|u| u.username == "bob")
+        .expect("fixture 里没有 bob");
+    bob.credentials.hy2_resi_cred = None;
+    let nodes = nodes_of(&s, "bob");
+    assert!(
+        nodes.is_empty(),
+        "这条用例的前提是零节点，实际 {:?}",
+        nodes.iter().map(|n| n.kind).collect::<Vec<_>>()
+    );
+
+    let split = split_of(&s);
+    let sb = subscription::singbox(&nodes, &split, &s.node.public_ip);
+    // 不许渲出 urltest（它的 outbounds 只能是空的），DNS / route 的落点必须真实存在
+    let tags: Vec<&str> = sb["outbounds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["tag"].as_str().unwrap())
+        .collect();
+    for o in sb["outbounds"].as_array().unwrap() {
+        assert!(o["type"] != "urltest", "零节点渲出了 urltest：{o}");
+    }
+    let route_final = sb["route"]["final"].as_str().unwrap();
+    assert!(
+        tags.contains(&route_final),
+        "route.final={route_final} 不存在"
+    );
+    let detour = sb["dns"]["servers"][0]["detour"].as_str().unwrap();
+    assert!(tags.contains(&detour), "dns detour={detour} 不存在");
+    for r in sb["dns"]["rules"].as_array().unwrap() {
+        if let Some(d) = r["domain"].as_array() {
+            assert!(
+                !d.iter().any(|x| x.as_str() == Some("")),
+                "DNS 规则里有空 domain 项，sing-box 会拒绝加载：{r}"
+            );
+        }
+    }
+    // 判据：真内核跑一遍 check（缺内核则 skip）
+    common::check_singbox_all(&sb);
+
+    // mihomo 那侧：组不许是空的，`MATCH` 的落点要么是内置出站、要么是真实存在的组
+    let yaml = subscription::clash(&nodes, "bob", &split);
+    let doc: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+    let groups: Vec<String> = doc["proxy-groups"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .map(|g| g["name"].as_str().unwrap().to_string())
+        .collect();
+    for g in doc["proxy-groups"].as_sequence().unwrap() {
+        assert!(
+            !g["proxies"].as_sequence().unwrap().is_empty(),
+            "空的 proxy-group，mihomo 会拒绝加载：{g:?}"
+        );
+    }
+    let m = doc["rules"]
+        .as_sequence()
+        .unwrap()
+        .last()
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .strip_prefix("MATCH,")
+        .expect("最后一条规则不是 MATCH")
+        .to_string();
+    assert!(
+        ["DIRECT", "REJECT"].contains(&m.as_str()) || groups.contains(&m),
+        "MATCH,{m} 指向不存在的组，groups={groups:?}"
+    );
+    // mihomo 的 DNS 段同样不许出现空串域名：`fake-ip-filter` 与 `nameserver-policy` 的键
+    // 都是编译进域名 trie 的匹配面（零节点时 `nodes.first()` 取不到 host ⇒ 空串），
+    // 与 sing-box 那侧的空 `domain` 项同形 —— 那一侧实测是硬 FATAL。
+    let filter = doc["dns"]["fake-ip-filter"].as_sequence().unwrap();
+    assert!(
+        !filter.is_empty() && !filter.iter().any(|x| x.as_str() == Some("")),
+        "fake-ip-filter 里有空串项：{filter:?}"
+    );
+    let policy = doc["dns"]["nameserver-policy"].as_mapping().unwrap();
+    assert!(
+        !policy.keys().any(|k| k.as_str() == Some("")),
+        "nameserver-policy 有空串键：{policy:?}"
+    );
 }

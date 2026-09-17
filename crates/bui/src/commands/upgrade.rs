@@ -176,6 +176,10 @@ fn kernel_prev(bin_dir: &Path, name: &str) -> PathBuf {
     bin_dir.join(format!("{name}.prev"))
 }
 
+/// 住宅 HY2 那个单元名（4.1 = sing-box，4.0 = 槽 0 的 apernet；名字两代相同，spec §2.5）。
+/// [`rollback`] 停它、并在恢复 sing-box 时跳过它的 restart。
+const RESI_UNIT: &str = "hysteria-residential";
+
 /// 升级前的快照：`manifest.json` → `manifest.prev.json`，四个内核 → 各自 `.prev`。
 ///
 /// 由 [`prepare`] 在**算出计划、确认真有东西要换之后、写新 manifest 缓存与替换内核之前**调：
@@ -225,9 +229,21 @@ pub fn prepare(
     Ok((plan, asset))
 }
 
+/// **先停 `hysteria-residential` 并删掉 `table inet bui`**（spec §9.1），再
 /// `bin/bui.prev` → `bin/bui`、四个内核 ← 各自 `.prev`、`manifest.json` ←
 /// `manifest.prev.json`、`state.json` ← 最近一份备份，最后重启 `b-ui`（重启后守护进程自己
 /// 对账）。
+///
+/// 前两步的顺序不能换、也不能省（4.1 → 4.0.1 的回滚判据）：4.1 的住宅 HY2 是一个
+/// sing-box 入站 `:40000` + 那张表把整段 `41000-50000`（开着兼容段时还有 `40001-40007`）
+/// REDIRECT 进去。表留着回到 4.0.1，整段就全被 REDIRECT 到槽 0 的 apernet 实例 ——
+/// 全体住宅用户从槽 0 那个 IP 出去、`40000+i` 无人应答，比 2026-09-15 那次切片跨进程的
+/// 回归事故更糟；反过来先删表后停单元，那一瞬 sing-box 还独占着 `:40000`。
+/// 停完**不再重启它**：`units_for_binary("sing-box")` 含 `hysteria-residential`（P-D），
+/// 恢复 sing-box 时若跟着 restart 一遍，4.1 的单元又起来、在没有表的情况下只听单端口，
+/// 得等 4.0.1 的下一轮对账才改回按槽的 apernet —— 那一段时间住宅整段仍然不通。
+/// 起回来的活交给恢复后的 `b-ui`：它重启后第一轮对账重渲染
+/// `config-residential*.yaml` 与单元，再把它启起来。
 ///
 /// 恢复后的 manifest 与恢复后的内核二进制是同一版，对账时 Binary 的比对（实际探测版本 vs
 /// manifest 记的版本）必然相等 ⇒ 零变更、不下载。正因为零变更，对账不会替我们重启内核单元，
@@ -243,8 +259,18 @@ pub fn rollback(host: &dyn Host, paths: &Paths) -> anyhow::Result<Vec<String>> {
     let bytes = host
         .read_file(&prev)?
         .ok_or_else(|| anyhow::anyhow!("没有 {}，无法回滚二进制", prev.display()))?;
+    // 第 0 步（spec §9.1）：停住宅单元 → 删 nft 表。两步都只记 note，失败不中断回滚。
+    let mut done = Vec::new();
+    let _ = host.systemd("stop", RESI_UNIT);
+    done.push(format!(
+        "已停 {RESI_UNIT}（回滚后由恢复的 bui 对账重渲染为 4.0 的 apernet 实例并启回来）"
+    ));
+    match crate::commands::nft::delete(host, paths) {
+        Ok(line) => done.push(format!("nft 表：{line}")),
+        Err(e) => done.push(format!("nft 表删除失败（回滚继续）：{e}")),
+    }
     host.write_file(&paths.bin_dir.join("bui"), &bytes, 0o755)?;
-    let mut done = vec![format!("已恢复上一版 bui（{}）", prev.display())];
+    done.push(format!("已恢复上一版 bui（{}）", prev.display()));
     for name in crate::kernels::KERNELS {
         let prev = kernel_prev(&paths.bin_dir, name);
         match host.read_file(&prev)? {
@@ -255,6 +281,10 @@ pub fn rollback(host: &dyn Host, paths: &Paths) -> anyhow::Result<Vec<String>> {
                 // 与盘上的版本、sha 都一致 ⇒ 对账零变更 ⇒ apply 第 0 步（只在 InstallBinary
                 // 成功时才收单元）不会替我们重启。所以这里自己重启；跳过的内核不碰它的单元。
                 for unit in crate::reconcile::apply::units_for_binary(name) {
+                    // 住宅单元上面已经停了，这里不许再 restart 一遍（见函数文档末段）
+                    if unit.name == RESI_UNIT {
+                        continue;
+                    }
                     let _ = host.systemd("restart", &unit.name);
                     done.push(format!("已重启 {}", unit.name));
                 }
@@ -814,6 +844,155 @@ mod tests {
         assert!(h.ops().contains(&"systemd:restart:b-ui".to_string()));
     }
 
+    /// 回滚夹具：`bui.prev` + 四个内核的 `.prev` 都在盘上，PATH 上有 `nft`。
+    fn host_with_prev_binaries(d: &tempfile::TempDir) -> (FakeHost, bui_schema::paths::Paths) {
+        let paths = bui_schema::paths::Paths {
+            base_dir: d.path().into(),
+            certs_dir: d.path().join("certs"),
+            bin_dir: d.path().join("bin"),
+        };
+        let h = FakeHost::new();
+        h.write_file(&paths.bin_dir.join("bui.prev"), b"OLDBUI", 0o755)
+            .unwrap();
+        h.write_file(&paths.bin_dir.join("bui"), b"NEWBUI", 0o755)
+            .unwrap();
+        for name in crate::kernels::KERNELS {
+            h.write_file(&kernel_prev(&paths.bin_dir, name), b"OLDK", 0o755)
+                .unwrap();
+        }
+        h.with(|i| {
+            i.which.insert("nft".into());
+        });
+        h.clear_ops();
+        (h, paths)
+    }
+
+    /// 回滚必须**先停住宅单元、再删 nft 表**，而且整趟只停/起它一次（spec §9.1）。
+    ///
+    /// 表留着会把整段 `41000-50000` 与兼容段 `40001-40007` 全 REDIRECT 进 `:40000`，
+    /// 而 4.0.1 在那个端口上跑的是槽 0 的 apernet 实例 —— 全体住宅用户从槽 0 的 IP 出去、
+    /// `40000+i` 无人应答，比 2026-09-15 那次回归事故更糟。
+    ///
+    /// 顺序反了同样致命：先删表、后停单元的那一瞬，sing-box 还在 `:40000` 上接管着整段。
+    #[test]
+    fn rollback_stops_the_residential_unit_and_deletes_the_nft_table() {
+        let d = tempfile::tempdir().unwrap();
+        let (h, p) = host_with_prev_binaries(&d);
+        let notes = rollback(&h, &p).unwrap();
+        let calls = h.ops();
+        let stop = calls
+            .iter()
+            .position(|c| c == "systemd:stop:hysteria-residential")
+            .unwrap_or_else(|| panic!("先停单元：{calls:?}"));
+        let del = calls
+            .iter()
+            .position(|c| c.starts_with("run:nft delete table"))
+            .unwrap_or_else(|| panic!("再删表：{calls:?}"));
+        assert!(stop < del, "顺序错了：{calls:?}");
+        // 恢复二进制必须排在这两步之后（表还在的时候换 sing-box 等于把整段交给旧内核）
+        let restore = calls
+            .iter()
+            .position(|c| c.starts_with(&format!("write:{}", p.bin_dir.join("bui").display())))
+            .unwrap_or_else(|| panic!("恢复 bui：{calls:?}"));
+        assert!(del < restore, "先删表再恢复二进制：{calls:?}");
+        // 别重启两次：`units_for_binary("sing-box")` 含 `hysteria-residential`（P-D），
+        // 恢复 sing-box 时不许再 restart 它一遍 —— 那会让 4.1 的 sing-box 单元又起来、
+        // 在没有表的情况下只听 `:40000`，直到下一轮 4.0.1 的对账才改回 apernet。
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| c.contains(":hysteria-residential"))
+                .collect::<Vec<_>>(),
+            vec!["systemd:stop:hysteria-residential"],
+            "住宅单元整趟只碰一次：{calls:?}"
+        );
+        assert!(
+            calls.contains(&"systemd:restart:b-ui-relay".to_string()),
+            "中继照旧重启：{calls:?}"
+        );
+        assert!(notes.iter().any(|n| n.contains("nft")), "{notes:?}");
+        assert!(
+            notes.iter().any(|n| n.contains("hysteria-residential")),
+            "停单元要记一行：{notes:?}"
+        );
+    }
+
+    /// 没有 `nft` 二进制 ⇒ 只记 note，不算失败（回滚绝不能因此中断）。
+    ///
+    /// 这条只覆盖 `nft::delete` 的 **`Ok` 支路**（`which("nft")` 为假）；
+    /// 「`nft` 真的执行不了」那条 `Err` 支路见
+    /// [`a_failing_nft_delete_still_finishes_the_rollback`]。
+    #[test]
+    fn a_missing_nft_table_does_not_fail_the_rollback() {
+        let d = tempfile::tempdir().unwrap();
+        let (h, p) = host_with_prev_binaries(&d);
+        h.with(|i| {
+            i.which.remove("nft");
+        });
+        let notes = rollback(&h, &p).unwrap();
+        assert!(notes.iter().any(|n| n.contains("nft")), "{notes:?}");
+        assert!(
+            notes.iter().any(|n| n.contains("已恢复上一版 bui")),
+            "缺 nft 不许中断回滚：{notes:?}"
+        );
+    }
+
+    /// **删 nft 表这一步真的失败时，回滚照样跑完**（第九波复核点名：这条 `Err` 支路此前
+    /// 无覆盖，而且 `FakeHost` 结构上测不出来 —— `run` 永远返 `Ok`。本轮给它加了
+    /// `fail_runs` 注错口，与已有的 `fail_units` / `fail_writes` 同构）。
+    ///
+    /// 为什么这条分支值得一条用例：回滚是**单向门**。`delete` 的返回值用 `?` 抛出去，
+    /// 回滚就在**恢复 `bin/bui` 之前**中止，机器停在「跑着 4.1 的 bui、住宅单元已停、
+    /// nft 表状态不明」的半吊子态 —— 比不回滚更糟，而这段代码存在的全部理由就是防它。
+    /// `nft::delete` 对「没有 nft 二进制」与「表本来不在」都返回 `Ok(note)`，只有
+    /// `host.run` 本身执行不了（fork/exec 失败、被挡）才返回 `Err`。
+    #[test]
+    fn a_failing_nft_delete_still_finishes_the_rollback() {
+        let d = tempfile::tempdir().unwrap();
+        let (h, p) = host_with_prev_binaries(&d);
+        h.with(|i| {
+            i.fail_runs.insert("nft delete table".into());
+        });
+        let notes = rollback(&h, &p).unwrap();
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("nft 表删除失败（回滚继续）")),
+            "失败要留一行说明（运维据它去手工确认表的状态）：{notes:?}"
+        );
+        // 关键：中止在这里 = 停在「跑着新版 bui、住宅已停、表状态不明」的半吊子态
+        assert!(
+            notes.iter().any(|n| n.contains("已恢复上一版 bui")),
+            "删表失败不许中断回滚：{notes:?}"
+        );
+        assert_eq!(
+            h.read_file(&p.bin_dir.join("bui")).unwrap().as_deref(),
+            Some(&b"OLDBUI"[..]),
+            "bin/bui 必须真的换回旧字节"
+        );
+        for name in crate::kernels::KERNELS {
+            assert_eq!(
+                h.read_file(&p.bin_dir.join(name)).unwrap().as_deref(),
+                Some(&b"OLDK"[..]),
+                "{name} 也要恢复完"
+            );
+        }
+        // 住宅单元照旧只停一次、不重启（spec §9.1）
+        let calls: Vec<String> = h
+            .ops()
+            .into_iter()
+            .filter(|o| o.starts_with("systemd:"))
+            .collect();
+        assert!(
+            calls.contains(&format!("systemd:stop:{RESI_UNIT}")),
+            "{calls:?}"
+        );
+        assert!(
+            !calls.contains(&format!("systemd:restart:{RESI_UNIT}")),
+            "{calls:?}"
+        );
+    }
+
     /// 事故回归（2026-09-12 bwg-rick）：Hysteria2 的 `auth.command` 指的是
     /// `<base>/bin/bui-auth-hook`，而那是一条目标为**相对** `bui` 的符号链接。
     /// 升级与回滚都只是原地换掉 `bin/bui` 这个文件，所以链接天然指向换上来的那一版：
@@ -1212,21 +1391,28 @@ mod tests {
             "manifest 缓存也要回到升级前，否则对账又把内核拉成新版"
         );
         assert!(h.ops().contains(&"systemd:restart:b-ui".to_string()));
-        // 光把字节写回盘上不算回滚：五个内核单元还在内存里跑新版二进制，而恢复后的
+        // 光把字节写回盘上不算回滚：内核单元还在内存里跑新版二进制，而恢复后的
         // manifest 与盘上版本一致 ⇒ 对账零变更 ⇒ apply 第 0 步不会替我们重启任何一个。
-        for unit in [
-            "hysteria-server",
-            "hysteria-residential",
-            "xray",
-            "b-ui-relay",
-            "caddy",
-        ] {
+        for unit in ["hysteria-server", "xray", "b-ui-relay", "caddy"] {
             assert!(
                 h.ops().contains(&format!("systemd:restart:{unit}")),
                 "{unit} 必须随内核回滚一起重启：{:?}",
                 h.ops()
             );
         }
+        // 住宅单元是唯一的例外（T15，spec §9.1）：回滚**先停它再删 nft 表**，之后不许再
+        // restart 一遍（`units_for_binary("sing-box")` 里有它）——重启会让 4.1 的 sing-box
+        // 单元在表已删的情况下又只听单端口，住宅整段要等 4.0.1 的下一轮对账才通。
+        assert_eq!(
+            h.ops()
+                .iter()
+                .filter(|c| c.contains(":hysteria-residential"))
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["systemd:stop:hysteria-residential".to_string()],
+            "住宅单元整趟只停一次、不重启：{:?}",
+            h.ops()
+        );
         assert!(
             done.iter().any(|l| l.contains("manifest.prev.json")),
             "{done:?}"

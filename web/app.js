@@ -108,15 +108,42 @@ function init() {
     setInterval(load, 5000);
 }
 
+// spec §6 的到期 / 封禁语义，**一处文案**：徽标 tooltip 与槽位列 tooltip 都用它。
+// 两条路的拒绝时机不一样，说不清就会被当成「面板数据不对」：
+//   - 住宅 HY2 = sing-box 的静态凭据池 + 门位（selector）。凭据没变，握手照旧成功，
+//     门位指向 deny（那个打 127.0.0.1:1 的出站）⇒ **客户端一直显示已连接，但每个请求被拒**。
+//   - 直连 = apernet hysteria2 的 auth 钩子，鉴权那一步就回绝 ⇒ 连接时即被拒。
+const _DENY_SEMANTICS =
+    "已停用 / 已到期：住宅 HY2 客户端仍会显示已连接，但所有请求会被拒绝（门位 deny，握手照旧成功）；" +
+    "直连节点在连接时即被拒。";
+
+// 住宅槽位那一列的 tooltip：端口固定（4.1 起住宅 HY2 单端口 + 整段跳跃由 nft 送进去），
+// 再加一句门位语义。**到期 / 封禁的住宅 HY2 客户端仍会显示已连接，但所有请求会被拒绝**
+// （门位 = deny，握手照旧成功），直连节点则在连接时就被拒 —— 这一句是运维唯一看得到的
+// 解释，不写用户会以为「显示连着就是能用」。
+function _resiGateHint(x) {
+    const port = 'HY2 住宅 :' + x.slotPort +
+        (Array.isArray(x.slotHop) ? ' + ' + x.slotHop[0] + '-' + x.slotHop[1] : '');
+    const g = x.hy2ResiGate;
+    if (g === 'deny') {
+        return port + '\n门位 deny：' + _DENY_SEMANTICS;
+    }
+    if (g === '未分配') {
+        return port + '\n还没分到住宅 HY2 凭据：订阅里没有这个节点（下一轮收敛会补上）。';
+    }
+    if (g) return port + '\n门位 ' + g + '：放行，走本槽的住宅 IP 出网。';
+    return port;
+}
+
 // Load data
 // 返回 Promise：轮换凭据后要等用户列表刷新完再按新 token 重画配置弹窗（见 rotateSub）
 function load() {
     return Promise.all([api("/users"), api("/online"), api("/stats")]).then(([u, o, s]) => {
         $("#st-u").innerText = u.length;
-        // 在线设备：累加所有用户的连接数
-        let totalOnline = 0;
-        Object.values(o).forEach(v => { totalOnline += (typeof v === 'number' ? v : 1); });
-        $("#st-o").innerText = totalOnline;
+        // 在线用户：`/api/online` 的值恒为 1（每人 0/1，量纲见 modules/panel/traffic.rs
+        // 的「在线数的量纲」），所以键的个数就是在线用户数。4.0.x 这里累加的是
+        // 「直连会话数 + 住宅连接条数 + 常数 1」，量纲混在一起，数字不代表任何东西。
+        $("#st-o").innerText = Object.keys(o).length;
 
         // 流量统计：使用用户的历史累计流量（与用户列表一致）
         let tu = 0, td = 0;
@@ -151,7 +178,13 @@ function load() {
             const exp = x.limits?.expiresAt ? new Date(x.limits.expiresAt) < new Date() : "";
             const tlim = x.limits?.trafficLimit;
             const over = tlim && total >= tlim;
-            const badge = exp ? ' <span class="tag" style="color:var(--danger)">已过期</span>' : (over ? ' <span class="tag" style="color:var(--danger)">流量耗尽</span>' : "");
+            // spec §6：**住宅 HY2 客户端仍会显示已连接，但所有请求会被拒绝**（门位切到
+            // deny，握手照旧成功）；直连节点在连接时即被拒。运维只有这句话能解释
+            // 「用户说还连着，为什么打不开网页」。
+            const badge = (exp || over || x.disabled)
+                ? ' <span class="tag" style="color:var(--danger)" title="' + esc(_DENY_SEMANTICS) + '">' +
+                  (x.disabled ? '已停用' : exp ? '已过期' : '流量耗尽') + '</span>'
+                : "";
             const proto = x.protocol || "hysteria2";
             const ptag = proto === "fusion" ? '<span class="proto-tag proto-sub">订阅</span>' :
                 proto === "vless-reality" ? '<span class="proto-tag proto-vless">VLESS</span>' :
@@ -160,13 +193,15 @@ function load() {
 
             return '<tr>' +
                 '<td><div style="display:flex;align-items:center;gap:8px"><span style="font-weight:600">' + esc(x.username) + '</span>' + ptag + badge + '</div></td>' +
-                '<td><span class="tag ' + (on ? 'on' : '') + ' ">' + (on ? on + ' 在线' : '离线') + '</span></td>' +
+                '<td><span class="tag ' + (on ? 'on' : '') + ' ">' + (on ? '在线' : '离线') + '</span></td>' +
                 // v4 P3（spec §5.6）：这个用户走哪个住宅 IP。没有住宅权益就打「—」。
                 '<td class="hide-m" style="font-family:monospace;color:var(--text-dim)">' +
                 (x.slot == null ? '—' :
-                    '<span title="' + esc('HY2 住宅 :' + x.slotPort +
-                        (Array.isArray(x.slotHop) ? ' + ' + x.slotHop[0] + '-' + x.slotHop[1] : '')) + '">#' +
-                    x.slot + (x.slotIp ? ' ' + esc(x.slotIp) : '') + '</span>') +
+                    '<span title="' + esc(_resiGateHint(x)) + '">#' +
+                    x.slot + (x.slotIp ? ' ' + esc(x.slotIp) : '') +
+                    (x.hy2ResiGate === 'deny' ? ' <span class="tag" style="color:var(--danger)">拒绝</span>' :
+                        x.hy2ResiGate === '未分配' ? ' <span class="tag">未分配</span>' : '') +
+                    '</span>') +
                 '</td>' +
                 '<td class="hide-m" style="font-family:monospace;color:var(--text-dim)">' + sz(monthly) + '</td>' +
                 '<td class="hide-m" style="font-family:monospace;color:var(--text-dim)">' + sz(total) + (tlim ? ' / ' + sz(tlim) : '') + '</td>' +
@@ -887,58 +922,21 @@ function addResidentialUrl() {
         restore();
         if (r.success) {
             cancelAddResiUrl();
-            // 用户名只经 textContent 的 _resiErr 输出：toast 走 innerHTML，不喂用户数据
-            const imp = _resiImpact(r.port_changed);
-            toast("节点已添加（" + _resiTypeLabel(r.type || "socks5") + "）" +
-                (imp.total ? "，" + imp.total + " 个用户需重新拉订阅" : ""), imp.total > 0);
-            if (imp.total) _resiErr(imp.text);
+            // 4.1 起改槽不动订阅（住宅 HY2 单端口 + 整段跳跃由 nft 送进去），
+            // 所以这里没有「N 个用户需重新拉订阅」可报
+            toast("节点已添加（" + _resiTypeLabel(r.type || "socks5") + "）");
             _resiReload();
         } else _resiErr(r.error || "添加失败");
     }).catch(e => { restore(); _resiErr(e.message || "请求失败"); });
-}
-
-// 改槽回包 port_changed 的三组：组名与原因是
-// crates/bui/src/modules/residential/upstream.rs 的 IMPACT_GROUPS 的逐字副本
-// （CLI / 面板 / 哨兵事件三处同一份口径），顺序也必须一致。
-// 三组的后果是同一个：这些用户的 HY2 住宅节点会反复断联，需重新拉订阅。
-const _RESI_IMPACT_GROUPS = [
-    ["slot_removed", "原槽位已删除、已换槽",
-        "旧端口与旧跳跃段都不再属于他那一槽的实例"],
-    ["slot_moved", "槽位序号变了",
-        "端口与跳跃段一起变"],
-    ["hop_resliced", "端口跳跃区间被重切",
-        "端口没变，但旧段里的端口会跳进别的实例"],
-];
-
-// 把回包的 port_changed 渲染成 `{ total, text }`。text 与哨兵事件那一行同构
-// （标题 + 逐组一句后果 + 用户名），三组都空时 total = 0、text = ""。
-function _resiImpact(pc) {
-    const obj = pc && typeof pc === "object" ? pc : {};
-    let total = 0;
-    const parts = [];
-    _RESI_IMPACT_GROUPS.forEach(([key, name, effect]) => {
-        const who = Array.isArray(obj[key]) ? obj[key] : [];
-        if (!who.length) return;
-        total += who.length;
-        parts.push(name + "（" + who.length + " 人，" + effect + "）：" + who.join("、"));
-    });
-    if (!total) return { total: 0, text: "" };
-    return {
-        total,
-        text: total + " 个用户的 HY2 住宅节点会反复断联，需重新拉订阅：" + parts.join("；"),
-    };
 }
 
 function removeResidentialUrl(hostPort) {
     _resiClearErr();
     api("/residential/urls/" + hostPort, { method: "DELETE" }).then(r => {
         if (!r.success) { _resiErr(r.error || "移除失败"); return; }
-        // 用户名只经 textContent 的 _resiErr 输出：toast 走 innerHTML，不喂用户数据
-        const imp = _resiImpact(r.port_changed);
+        // 4.1 起删上游只是把那一槽的用户换个出口 IP，订阅内容一个字节都不变
         _resiReload();
-        if (!imp.total) { toast("节点已移除"); return; }
-        toast("节点已移除，" + imp.total + " 个用户需重新获取订阅", true);
-        _resiErr("上游已移除。" + imp.text + "（同一份名单也记在「系统状态」的「事件」卡里）");
+        toast("节点已移除");
     }).catch(e => _resiErr(e.message || "请求失败"));
 }
 
@@ -1362,7 +1360,9 @@ function loadResiHealth() {
                 const cPort = document.createElement("span");
                 const hop = Array.isArray(s.hop) ? s.hop : [];
                 cPort.textContent = _sysFmt(s.hy2_port) + " + " + _sysFmt(hop[0]) + "-" + _sysFmt(hop[1]);
-                cPort.title = "这一槽的用户在订阅里拿到的 HY2 住宅端口与跳跃区间";
+                // 4.1 起住宅 HY2 只有一个监听端口、整段跳跃由 `table inet bui` 送进去，
+                // 所以每一槽显示的都是同一对值（与用户列表那一列、与三种订阅同源）。
+                cPort.title = "住宅用户在订阅里拿到的 HY2 端口与跳跃区间（4.1 起与槽位无关，每一槽都一样）";
                 const cUsers = document.createElement("span");
                 cUsers.textContent = (s.users || []).join("、") || "—";
                 cUsers.title = cUsers.textContent;
@@ -1378,21 +1378,17 @@ function loadResiHealth() {
 }
 
 // v4 P3（spec §5.6）：把住宅用户在各槽间均匀重排。约 1 秒后（对账 + gRPC 收口）生效，
-// xray 不重启、现有连接不断；二次确认只为「别误点」——被挪动的用户订阅里的住宅
-// HY2 端口会变，需要重新导入一次。
+// xray 不重启、现有连接不断。**4.1 起被挪动的用户不用重新导入订阅**：住宅 HY2 只有一个
+// 监听端口、整段跳跃由 `table inet bui` 送进去，端口与区间与槽位无关，重排只换出口 IP。
 function rebalanceSlots() {
-    if (!confirm("按槽重排全部住宅用户？\n约 1 秒后生效（不重启 xray）；被挪动的用户要重新导入订阅。")) return;
+    if (!confirm("按槽重排全部住宅用户？\n约 1 秒后生效（不重启 xray）；用户不必重新获取订阅。")) return;
     const btn = document.getElementById("resi-rebalance");
     if (btn) { btn.disabled = true; btn.textContent = "重排中…"; }
     api("/residential/rebalance", { method: "POST" }).then(r => {
         if (btn) { btn.disabled = false; btn.textContent = "按槽重排"; }
         if (r && r.success) {
-            // 用户名只经 textContent 的 _resiErr 输出：toast 走 innerHTML，不喂用户数据
-            const imp = _resiImpact(r.port_changed);
             toast("已重排 " + (r.moved || 0) + " 个用户" +
-                (r.xray_rules_pending ? "，约 1 秒后槽路由生效（不重启 xray）" : "") +
-                (imp.total ? "，" + imp.total + " 个用户需重新拉订阅" : ""), imp.total > 0);
-            if (imp.total) _resiErr(imp.text);
+                (r.xray_rules_pending ? "，约 1 秒后槽路由生效（不重启 xray）" : ""));
             loadResiHealth();
             load();   // 用户列表的槽位列跟着刷新
         } else {

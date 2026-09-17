@@ -8,6 +8,44 @@
 `version` 的唯一来源是根 `Cargo.toml` 的 `[workspace.package] version`；改版本必须同时在本文件加一段，`scripts/release/check-version.sh` 会在 CI 里卡住不一致（它只认 `## [<version>]` 这个标题，日期不参与校验）。
 未发布的版本日期写「未发布」，由主理人打 tag 发版时替换成当天日期（UTC）。
 
+## [4.1.0] - 未发布
+
+住宅 HY2 换成**一个** sing-box 入站 + 静态凭据池 + 门位（selector）：端口跳跃整段由 `table inet bui` 送进单一监听端口，于是**增删住宅上游、`assign`、`rebalance` 都不再动任何人手里那份订阅**。
+
+**升级零刷新订阅**：4.0.x 的现役订阅在 4.1 上逐字有效，没有任何用户需要重新获取订阅、v2rayN 不用重新导入、`bui-c` 也不用重导。
+迁移用户的住宅 HY2 凭据是 `用户名:<当时的 hy2_password>` 的副本（`bui import-v3` 直装也一样），端口仍是 `40000`、`mport` 仍是整段 `41000-50000`；
+4.0 多槽时代发出的 `40001-40007` 由 `inet bui` 的**兼容段**继续接住。三种订阅（`/api/sub` / `/api/subscription` / `/api/clash`）的字节在升级前后不变，升级演练以它们的 sha256 为判据。
+
+> 本段由 4.1 的多条任务分支各自追加，发版时由主理人合并整理。
+
+### 新增
+- 面板用户列表的槽位列带上**门位**（`hy2ResiGate`）：`slot-<i>-out` = 放行、走那一槽的住宅 IP；`deny` = 已停用 / 已到期；「未分配」= 还没拿到凭据（订阅里也没有住宅 HY2 节点）。鼠标悬停说明到期 / 封禁的语义（spec §6）：**住宅 HY2 客户端仍会显示已连接，但所有请求会被拒绝**（门位切到 deny，握手照旧成功），直连节点则在连接时即被拒 —— 这是「用户说还连着但打不开网页」的唯一解释。
+- `bui residential pool status|grow [--to N]`：看住宅 HY2 静态凭据池的已用 / 容量 / 空闲 / 第几代与持有人（只有用户名，凭据 id 与密码一个都不出端点），或手动扩容（幂等）。空闲不足 20% 时点名「下次建用户会当场扩容 ⇒ 重写配置 + 重启住宅内核 ⇒ 全体住宅 HY2 会话重连一次」。住宅子菜单新增 [12] 同款入口。
+- `bui set hy2-resi-compat on|off [--force]`：住宅 HY2 的 4.0 兼容段（`inet bui` 里把 `40001-40007` 也 REDIRECT 到单一监听端口的那两条规则）开关。**关它必须先证明没人在用**：判据是 `runtime.json` 里持久化的累计命中（守护进程每轮在重放之前采样累加），**不是 `bui nft status` 打出来的活 counter**（每次重放都清回 0）——连续 30 天累计为 0 才允许不带 `--force`，否则拒绝并打出累计命中 / 最近一次 / 起算时刻三个值供人判断。**门禁两条路都拦**：`bui set` 与守护进程的 `POST /api/system/hy2-resi-compat`（面板、curl、任何走 socket 的运维脚本）同一个判据，不带 `force` 过不了就 403、一个字节都不写。误判方向是危险的那一侧：把仍在用的兼容段关掉，全部还没刷订阅的 4.0 住宅用户当场断联。
+- `bui status` 增三行：「住宅 HY2 凭据池：已用 N / M，第 K 代」（空闲不足 20% 时点名那次内核重启）、「nft 表 inet bui：N 条规则；兼容段 40001-40007 最近命中 N 次（自 <时刻>）」（读持久值；统计还没就绪时明说「未就绪」，绝不打成 0）、「门位重放：正常 / 失败（<原因>） / 未知（守护进程未运行）」（住宅 sing-box 不开 `cache_file`，每次重启门位回到 `deny`，由 b-ui 重放；重放失败 ⇒ 没重放到的门留在 `deny`，那批用户握手成功但请求全被拒。这一行读的是 `/api/health` 里的住宅告警表，`b-ui` 没在跑时本地探测拿不到它 ⇒ 如实打「未知」，不会谎报「正常」）。
+
+### 变更
+- **「必须重新获取订阅」这套机制整体退役**：4.0.x 里住宅 HY2 的端口是 `40000 + 槽序号`、跳跃段是 `41000-50000` 按当下槽数等分的第 i 片，所以增删上游 / `assign` / `rebalance` 都会改掉已下发订阅里的端口或段，那批人反复断联到各自刷新订阅为止 —— 4.0.1 为此加了按原因分三组的名单（CLI 逐组打印、回包 `port_changed`、面板渲染、`resi_slot_port_changed` 事件）。4.1 起住宅 HY2 只有一个监听端口、整段跳跃由 `table inet bui` 送进去，端口与区间与槽位无关，**这个问题不存在了**：`slots::resubscribe_impact` / `ResubscribeImpact`、`SlotSync.impact`、四条改槽路径回包里的 `port_changed`、CLI 那三组渲染、面板的 `_RESI_IMPACT_GROUPS` / `_resiImpact` 与 `resi_slot_port_changed` 事件全部删除。`bui residential remove` 现在只打一句「上游已移除」；按槽重排的二次确认也不再说「被挪动的用户要重新导入订阅」。
+- 面板用户列表**与槽位表**显示的住宅 HY2 端口与跳跃区间不再跟槽序号挂钩（4.0.x 是 `40001` + 那一槽的切片，现在一律 `40000` + 整段 `41000-50000`），与订阅里的值逐字一致；同一份投影喂着 `bui residential slots` 与 `bui status` / `/api/health` 末尾的槽位段，三处不再自相矛盾。槽位自己的中继端口（`2080+槽序号`）、槽位与出口 IP 的显示不变。
+- `bui status` 的「已用 / 容量」与 `bui residential pool status` 改走同一份口径：指向已消失凭据 id 的用户（上一代池的悬空指针，下次启动才清）不再计进已用，于是 `已用 + 空闲` 恒等于容量，两处的「空闲不足 20%」不会再一处喊另一处说没事。
+- **在线数统一成「每人 0 / 1」**：`/api/online` 的值此前是「直连 hysteria2 的会话数 + 住宅 Clash `/connections` 的连接条数 + Xray 的常数 1」，三个量纲相加 —— 一个只在刷网页、住宅开了 30 条连接的用户会显示成「30 在线」，面板顶上那个卡把全表这种数加起来，结果不代表任何东西。现在任一来源有量即记 1，那个卡改叫「在线用户」，用户行的徽标只显示「在线 / 离线」。**代价**：直连用户的多设备会话数不再显示。
+
+- **自建 sing-box**：随发布分发的 `sing-box-linux-<arch>` 改成 CI 自己按上游 tag 构建，编译标签里带上 `with_v2ray_api`（官方 release 二进制不含它）——住宅 HY2 的按用户流量从此走 v2ray_api 的 `StatsService.QueryStats(reset=true)`，而不是轮询 Clash API 的 `/connections`（那个只给未关闭的连接，两次采样之间开闭的短连接会漏掉、限额执行偏松）。`kernels.lock` 里 `sing-box` 那两行的 URL 列因此是 `build:` URI、sha256 是构建产物的 sha，不再是上游归档的 sha；构建失败时发布链保持上一版并告警，不会静默发一个不带 v2ray_api 的二进制。**只有随发布分发的那一个是自建**，用户机器上的 `bui-c` 与开发机上的 sing-box 不受影响。
+- `bui set hy2-auth` 的作用域缩为**仅直连**（`bui status` 的「鉴权模式」一行同步标注）：4.1 的住宅 HY2 是 sing-box 的静态凭据池 + 门，配置里连 `auth` 这个字段都不存在，所以切换只重渲染 `config.yaml`、只重启 `hysteria-server`，住宅内核一个字节都不动、不重启。`auth-snapshot.json` 的形状不变（只服务直连与 `command` 退路）。
+- `bui upgrade --rollback` 多做两步、顺序固定（spec §9.1）：**先 `systemctl stop hysteria-residential`、再 `nft delete table inet bui`**，然后才恢复二进制与期望态备份；住宅单元停完不再重启（恢复 `sing-box` 时跳过它），起回来交给恢复后的 `bui` 第一轮对账。表留着回滚会把整段 `41000-50000` 与兼容段全 REDIRECT 进 `:40000` 上那个 4.0.1 的槽 0 实例 —— 全体住宅用户从槽 0 的 IP 出去、`40000+i` 无人应答，比 2026-09-15 那次切片跨进程的回归事故更糟。缺 `nft` 或表本来就不在只记一行 note，不算失败。
+- **退役的 `bui-schema` 公共 API**（C1 契约，连签名一起删，不留 `#[deprecated]`、不留转发壳）：`slots::{HY2_STATS_RESI_BASE, hop_slice, slot_span, resources_of, resubscribe_impact, ResubscribeImpact}`、`SlotRes.{hy2_port, stats_port, hop}`、`render::hysteria::{residential_yaml, residential_slot_yaml}`。`SlotRes` 收成 `{ index, relay_port }`、`resources(index)` 只吃槽序号：4.1 之后**槽位与对外端口无关**，留一个还能按槽算端口的旧签名，下一个人就会继续那么算 —— 那正是回归事故的入口。`bui` 侧同批清掉 `panel::HY2_STATS_PORT_RESI`，并把「谁算住宅 HY2 用户」的两套判据（`hy2pool::is_resi_hy2` 不看分组 / `panel::gates::has_resi_hy2` 看分组）合成一处 `bui_schema::hy2pool::is_resi_hy2(&User, &Residential)`，取更严的那个（分组悬空的用户不占门位、不进池容量基数）。
+
+### 升级与回滚提示
+- **升级**：不需要任何用户刷新订阅（见段首）。机器侧要求 `nftables` 已装且内核 ≥ 5.2（`inet` 族的 `type nat` 链）——装机与升级路径上有硬闸门，`bui nft apply` 落地前先 `nft -c -f -` 预检，失败以可操作的中文错误显式失败，绝不让端口跳跃静默消失。
+- **回滚到 4.0.1 之前必看两条**：
+  1. **开着混淆要先 `bui set obfs off`**——否则回滚后直连与住宅两边的 obfs 状态与用户手里的订阅不一致，HY2 全员连不上。
+  2. **4.1 期间新建或 rotate 过的用户手里是 `r017:secret` 这类池凭据，4.0.1 认不出** ⇒ 他们的住宅 HY2 握手被拒，必须刷新订阅。回滚前用 `bui residential pool status` 列出「持有新发凭据的用户」（`name` 不等于用户名的那些）逐个核对、提前通知。迁移用户（`name` = 用户名、`secret` = 当时的 `hy2_password`）不受影响。
+- **兼容段 `40001-40007` 的下线判据**（`bui set hy2-resi-compat off`）：`runtime.json` 里持久化的累计命中**连续 30 天为 0**，且**提前 30 天通知**用户重新获取订阅；两条都满足才关，否则 `bui set` 与 `POST /api/system/hy2-resi-compat` 双双拒绝（要 `--force` 才过）。判据一律读持久值，绝不读 `bui nft status` 打出来的活 counter（每次重放都清回 0）。真正的风险点是「从不重新导入」的客户端，由通知与发布门禁覆盖，不靠加长零命中窗口。
+- **服务端 4.1 之后 `bui-c` 无需重导**：住宅 HY2 节点是 `40000` + 整段 `41000-50000`，旧导入继续可用；只有 **4.0 多槽时代导入过槽 ≥ 1 的住宅节点**（端口 `40001`..`40007`）的客户端需要在兼容段下线前重新获取一次订阅。
+
+### 修复
+- 一个节点都没有的用户，sing-box 与 mihomo 订阅不再整份失效：住宅凭据池耗尽、或建完用户到下一轮收敛之间那一瞬，只有住宅权益且只开 hysteria2 的用户拿到的是空节点集，此前会渲出一个空的 `urltest`（sing-box 直接拒绝加载整个配置文件）与指向不存在出站的 DNS / 路由落点，客户端连订阅都用不了。现在这种情况退成全部走 `direct`：配置照旧加载得起来，等下一轮补上凭据后重新拉一次订阅即可。mihomo 那一侧同批修掉两处空串域名项（`dns.fake-ip-filter` 的末项与 `dns.nameserver-policy` 的键都取自节点的 host，零节点时是空串）；sing-box 侧有真内核 `check` 为判据，mihomo 侧只有渲染结构断言（本仓不校验 mihomo 配置，也没有 mihomo 二进制）。
+
 ## [4.0.1] - 2026-09-16
 
 Linux 客户端 `bui-c` 的数字菜单 v2：能删除节点、[5] 连接检查补齐到 v3.6.2、窄屏可用，以及多个会话同时操作时的互斥与中断后的自我收拾。

@@ -14,6 +14,7 @@ pub mod api_public;
 pub mod assets;
 pub mod auth_hook;
 pub mod auth_http;
+pub mod gates;
 pub mod hy2;
 pub mod hy2resi;
 pub mod packages;
@@ -39,16 +40,11 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 pub const MODULE_NAME: &str = "panel";
-/// 两个 hysteria 的 trafficStats 监听端口（由 `bui_schema::render::hysteria` 写死）。
+/// **直连**那一个 hysteria 的 trafficStats 监听端口（由 `bui_schema::render::hysteria`
+/// 写死）。4.1 起这就是全部：住宅是一个 sing-box 入站，计量走 v2ray_api、在线与踢人走
+/// Clash API（[`traffic::stats_ports`] 因此只剩这一个端口），4.0.x 的
+/// `HY2_STATS_PORT_RESI` / `slots::HY2_STATS_RESI_BASE`（`9998 - 槽序号`）已随 T15 删除。
 pub const HY2_STATS_PORT_DIRECT: u16 = 9999;
-/// 住宅实例的 `trafficStats` 端口基准（槽 i = `9998 - i`，见 `bui_schema::slots`）。
-/// 单槽时就是今天的 9998。
-///
-/// **4.1 起没有任何生产调用点**：住宅是一个 sing-box 入站，计量走 v2ray_api、在线与踢人
-/// 走 Clash API（[`traffic::stats_ports`] 因此只剩直连那一个端口）。符号本身留给 T15
-/// 的「删旧 API」一起清，`allow` 就是它已经是死代码的记号 —— 别再给它加调用点。
-#[allow(dead_code)]
-pub const HY2_STATS_PORT_RESI: u16 = bui_schema::slots::HY2_STATS_RESI_BASE;
 /// 住宅 HY2（sing-box）的两个回环控制面（spec §2.3）：`HY2_RESI_CLASH_API` 上跑在线数、
 /// 踢连接与门位（selector），`HY2_RESI_V2RAY_API` 上跑 `StatsService.QueryStats` 的计量。
 /// 两个面都**只监听回环、不设 secret** ⇒ 这条路从不发 Authorization 头。
@@ -343,9 +339,15 @@ impl Module for PanelModule {
     /// 三个后台任务，顺序固定：①10 秒采样 ②用户同步反应器（事件驱动 + 60 秒）③每日包缓存。
     fn spawn(&self, ctx: DaemonCtx) -> Vec<tokio::task::JoinHandle<()>> {
         self.shared.set_paths(&ctx.paths);
+        // **先 subscribe 再 spawn**：broadcast 丢弃「发送时还没有订阅者」的事件，
+        // 若让 `gates::replay_loop` 自己 subscribe，紧随 spawn 的第一次对账重启就可能漏掉
+        // （口径同 `residential::mod` 里那条 relay 重放）。
+        let rx = ctx.bus.subscribe();
         vec![
             tokio::spawn(traffic::sampling_loop(ctx.clone(), self.shared.clone())),
             tokio::spawn(users::sync_loop(ctx.clone(), self.shared.clone())),
+            // spec §3.4：住宅入站任何重启之后立刻重放门位（不开 `cache_file` ⇒ 重启即全拒）
+            tokio::spawn(gates::replay_loop(ctx.clone(), self.shared.clone(), rx)),
             tokio::spawn(packages::cache_loop(
                 ctx,
                 self.shared.clone(),
@@ -657,7 +659,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_starts_three_tasks_and_hands_the_paths_to_shared() {
+    async fn spawn_starts_four_tasks_and_hands_the_paths_to_shared() {
         let h = testsupport::harness().await;
         let s = Shared::new(
             Box::new(super::fakes::FakeXray::new()),
@@ -696,7 +698,7 @@ mod tests {
             paths: h.paths.clone(),
         };
         let handles = m.spawn(ctx);
-        assert_eq!(handles.len(), 3, "采样 / 用户同步 / 包缓存");
+        assert_eq!(handles.len(), 4, "采样 / 用户同步 / 门位重放 / 包缓存");
         assert_eq!(m.shared().paths().base_dir, h.paths.base_dir);
         // 让第一轮跑完再收摊，确认三个任务都没有立刻 panic
         for _ in 0..200 {

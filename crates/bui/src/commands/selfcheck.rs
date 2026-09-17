@@ -397,7 +397,7 @@ fn hy2_resi_loopback(host: &dyn Host, paths: &Paths, state: &State, cert_ready: 
     let open = |u: &bui_schema::model::User| {
         crate::modules::panel::users::is_blocked(u, crate::modules::panel::TxRx::default(), now)
             .is_none()
-            && bui_schema::hy2pool::is_resi_hy2(u)
+            && bui_schema::hy2pool::is_resi_hy2(u, &state.residential)
     };
     let Some((user, cred)) = state
         .users

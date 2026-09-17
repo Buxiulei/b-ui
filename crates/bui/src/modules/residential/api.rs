@@ -331,7 +331,7 @@ pub fn slot_rows(s: &SchemaState, r: &state::ResiRuntime) -> Vec<SlotRow> {
         .into_iter()
         .filter_map(|sl| {
             let own = g.upstreams.iter().find(|u| u.id == sl.upstream_id)?;
-            let res = bui_schema::slots::resources_of(&s.node.ports, &s.residential, sl.index);
+            let res = bui_schema::slots::resources(sl.index);
             let sr = r
                 .slots
                 .get(&sl.index.to_string())
@@ -363,8 +363,12 @@ pub fn slot_rows(s: &SchemaState, r: &state::ResiRuntime) -> Vec<SlotRow> {
                 back_rounds: sr.back_rounds,
                 back_rounds_needed: crate::modules::residential::SLOT_BACK_ROUNDS,
                 relay_port: res.relay_port,
-                hy2_port: res.hy2_port,
-                hop: res.hop,
+                // 4.1：住宅 HY2 只有**一个**监听端口、整段跳跃由 `table inet bui` 送进去，
+                // 与槽序号无关（`nodes::nodes_for` 就是这么发订阅的）。这两个值必须与
+                // `panel::users` 那一列同源，否则同一个面板会自相矛盾；关掉兼容段之后
+                // 4.0.x 的 `40000+槽序号` 已经不通，照旧显示它等于把排障指向错方向。
+                hy2_port: s.node.ports.hy2_resi,
+                hop: s.node.ports.hy2_resi_hop,
                 user_count: users.len(),
                 users,
                 metrics: metrics_of(&h(sl.upstream_id)),
@@ -415,8 +419,11 @@ pub struct SlotRow {
     /// 借用中「本槽已连续恢复几轮」与门槛
     pub back_rounds: u32,
     pub back_rounds_needed: u32,
-    /// 这一槽的端口资源（面板据此告诉运维该放行什么、订阅里是哪个端口）
+    /// 这一槽自己的中继 socks 入站（`2080 + 槽序号`，面板据此告诉运维该放行什么）
     pub relay_port: u16,
+    /// 住宅 HY2 的监听端口与整段跳跃区间。**4.1 起与槽序号无关**（一个 sing-box 入站 +
+    /// `table inet bui` 把整段 REDIRECT 进去），所以每一行都是同一对值，与用户列表那一列
+    /// 和三种订阅逐字一致。4.0.x 这里曾是 `40000+槽序号` 与「整段按槽数等分的第 i 片」。
     pub hy2_port: u16,
     pub hop: (u16, u16),
     /// 落在这一槽上的用户（用户名，按名字升序）与数量
@@ -436,6 +443,14 @@ pub struct PinSlotRequest {
     /// 解除 pin
     #[serde(default)]
     pub auto: bool,
+}
+
+/// `POST /api/residential/pool/grow` 的请求体（空体也合法 ⇒ 补到 `size_for`）。
+#[derive(Debug, Deserialize)]
+pub struct PoolGrowRequest {
+    /// 目标条数；不给就按 `hy2pool::size_for(住宅 hysteria2 用户数)` 算
+    #[serde(default)]
+    pub to: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -598,6 +613,8 @@ pub fn routes_with(
         .route("/api/residential/blacklist/apply", post(post_apply))
         // ── 槽位（spec §5.6）──
         .route("/api/residential/slots", get(get_slots))
+        .route("/api/residential/pool", get(get_pool))
+        .route("/api/residential/pool/grow", post(post_pool_grow))
         .route("/api/residential/slots/pin", post(post_pin_slot))
         .route("/api/residential/rebalance", post(post_rebalance))
         .route("/api/residential/assign", post(post_assign))
@@ -979,6 +996,91 @@ async fn get_slots(State(app): State<AppState>) -> ApiResult {
     Ok(Json(serde_json::json!({ "slots": slot_rows(&s, &r) })).into_response())
 }
 
+/// `GET /api/residential/pool`（4.1，spec §3.1）：住宅 HY2 静态凭据池的只读视图。
+///
+/// **`holders` 只有用户名**：凭据 `id` 与 `secret` 一个都不出这个端点 —— 拿到 `name:secret`
+/// 就能直接连住宅 HY2（那就是密码本身），面板与 CLI 都不需要它。
+async fn get_pool(State(app): State<AppState>) -> ApiResult {
+    let s = app.store.read().await;
+    Ok(Json(pool_view(&s)).into_response())
+}
+
+/// [`get_pool`] 的纯函数本体。
+///
+/// `size` / `used` / `free` 走 `hy2pool::usage` 这**一处**口径（`bui status` 的
+/// 「住宅 HY2 凭据池」那一行同源）—— 两套算法会在有悬空指针时让两边的低空闲告警互相打脸。
+fn pool_view(s: &bui_schema::model::State) -> serde_json::Value {
+    // 持有人按用户名升序（输出要确定性）；指向池里已不存在的 id 的用户也算持有人 ——
+    // 他确实占着一个指针，`migrate_hy2_pool_on_start` 下次启动才清（但**不计已用**，
+    // 那条凭据压根不在池里）
+    let mut holders: Vec<&str> = s
+        .users
+        .iter()
+        .filter(|u| u.credentials.hy2_resi_cred.is_some())
+        .map(|u| u.username.as_str())
+        .collect();
+    holders.sort_unstable();
+    let pool = &s.residential.hy2_pool;
+    let u = bui_schema::hy2pool::usage(s);
+    serde_json::json!({
+        "size": u.size,
+        "used": u.used,
+        "free": u.free,
+        "generation": pool.generation,
+        "target": bui_schema::hy2pool::size_for(bui_schema::hy2pool::resi_hy2_users(s)),
+        "holders": holders,
+    })
+}
+
+/// `POST /api/residential/pool/grow`（4.1，spec §3.1）：把凭据池补到 `to` 条
+/// （不给就补到 `hy2pool::size_for`），**幂等**。
+///
+/// 真扩容 ⇒ 发 `StateChanged("residential")`，对账重写 `hy2-residential.json` 并重启
+/// `hysteria-residential`（spec §3.5），全体住宅 HY2 会话重连一次。零改动不写盘、不发事件。
+async fn post_pool_grow(
+    State(app): State<AppState>,
+    Extension(d): Extension<Deps>,
+    body: Option<Json<PoolGrowRequest>>,
+) -> ApiResult {
+    let to = body.and_then(|Json(b)| b.to);
+    if let Some(n) = to {
+        if n > bui_schema::hy2pool::POOL_MAX {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "凭据池上限是 {} 条（spec §14 裁决 2），收到 {n}",
+                    bui_schema::hy2pool::POOL_MAX
+                ),
+            ));
+        }
+    }
+    let ctx = ctx_of(&app, &d.paths);
+    let mut added = 0usize;
+    let a = &mut added;
+    ctx.store
+        .update(|s| {
+            let target = to.unwrap_or_else(|| {
+                bui_schema::hy2pool::size_for(bui_schema::hy2pool::resi_hy2_users(s))
+            });
+            // `taken` = 现有用户名 + 现有凭据名：`validate_username` 允许 `r017` 这种
+            // 用户名，撞上了 `auth_user` 就归错人（口径同 `hy2pool::grow` 的文档）
+            let taken: std::collections::BTreeSet<String> = s
+                .users
+                .iter()
+                .map(|u| u.username.clone())
+                .chain(s.residential.hy2_pool.creds.iter().map(|c| c.name.clone()))
+                .collect();
+            *a = bui_schema::hy2pool::grow(&mut s.residential.hy2_pool, target, &taken);
+        })
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if added > 0 {
+        ctx.bus.send(crate::api::Event::StateChanged("residential"));
+    }
+    let size = app.store.read().await.residential.hy2_pool.creds.len();
+    Ok(Json(serde_json::json!({ "success": true, "size": size, "added": added })).into_response())
+}
+
 /// `POST /api/residential/slots/pin`：把一槽的出口钉在指定上游上（`auto=true` 解除）。
 async fn post_pin_slot(
     State(app): State<AppState>,
@@ -1008,20 +1110,17 @@ async fn post_pin_slot(
 /// `POST /api/residential/rebalance`（spec §5.6 规则 3）：把住宅用户在各槽间均匀重排。
 async fn post_rebalance(State(app): State<AppState>, Extension(d): Extension<Deps>) -> ApiResult {
     let ctx = ctx_of(&app, &d.paths);
-    let (moved, impact) = crate::modules::residential::slots::rebalance_users(&ctx)
+    let moved = crate::modules::residential::slots::rebalance_users(&ctx)
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     // `xray_rules_pending` 提醒前端：槽路由要等下一轮对账（≈1 秒）走 gRPC 收口才生效（D7），
-    // 那一下不重启 xray、不掐连接
-    let mut body = serde_json::json!({
+    // 那一下不重启 xray、不掐连接。**没有 `port_changed`**：4.1 起改槽不动订阅。
+    Ok(Json(serde_json::json!({
         "success": true,
         "moved": moved,
         "xray_rules_pending": moved > 0
-    });
-    if let Some(pc) = upstream::impact_field(&impact) {
-        body["port_changed"] = pc;
-    }
-    Ok(Json(body).into_response())
+    }))
+    .into_response())
 }
 
 /// `POST /api/residential/assign`（spec §5.6 规则 3）：把某个用户钉到某一槽。
@@ -1051,7 +1150,7 @@ async fn post_assign(
     };
     drop(s);
     let ctx = ctx_of(&app, &d.paths);
-    let (ok, impact) = crate::modules::residential::slots::assign_user(&ctx, user_id, slot_id)
+    let ok = crate::modules::residential::slots::assign_user(&ctx, user_id, slot_id)
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if !ok {
@@ -1063,11 +1162,7 @@ async fn post_assign(
     // **不在这里调 converge_xray**：守护进程里只许对账 consumer 那一处调它（D7）。
     // `assign_user` 已经发了 `StateChanged("residential")`，约 1 秒后对账末尾那次调用
     // 会走 gRPC 把这个用户的规则改掉，xray 不重启。
-    let mut body = serde_json::json!({ "success": true, "xray_rules_pending": true });
-    if let Some(pc) = upstream::impact_field(&impact) {
-        body["port_changed"] = pc;
-    }
-    Ok(Json(body).into_response())
+    Ok(Json(serde_json::json!({ "success": true, "xray_rules_pending": true })).into_response())
 }
 
 async fn post_add(
@@ -1097,7 +1192,7 @@ async fn post_add(
         });
     }
     // 响应字段照 v3 的 add：success / exitIp / ispInfo / type
-    let mut body = serde_json::json!({
+    Ok(Json(serde_json::json!({
         "success": true,
         "exitIp": out.exit_ip,
         "ispInfo": out.isp,
@@ -1105,33 +1200,17 @@ async fn post_add(
         "id": out.id,
         "name": out.name,
         "class": out.class_label,
-    });
-    if let Some(pc) = upstream::impact_field(&out.impact) {
-        body["port_changed"] = pc;
-    }
-    Ok(Json(body).into_response())
+    }))
+    .into_response())
 }
 
-/// 删上游两个端点共用的回包：v3 的 `success` + v4 追加的 `port_changed`（spec §5.6）。
+/// 删上游两个端点共用的回包。
 ///
-/// `port_changed` 是必须重新拉订阅的用户，按**原因**分三组（`slot_removed` /
-/// `slot_moved` / `hop_resliced`，见 [`bui_schema::slots::ResubscribeImpact`]），每组
-/// 是一列升序的**用户名**，不含凭据、不含订阅 token。三组都空 ⇒ 无人受影响。
-///
-/// **这两个端点无条件带这个键**（v3 起就有，`web/app.js` 按它渲染）；另外三条改槽路径
-/// （add / assign / rebalance）用同名字段，但空名单时不带（`upstream::impact_field`）。
-///
-/// 他们的 HY2 住宅节点端口（`hy2_resi + 槽序号`）或端口跳跃段（`hy2_resi_hop` 按槽位
-/// 空间等分）被这次删除改了，而那两样都写死在已下发的订阅里、客户端不会主动发现（要等下
-/// 一次订阅更新），在那之前**反复断联**。只列手里那份订阅**真的**不能用了的人：被删槽上
-/// 的用户常常被重新分配回序号 0（端口没变），旧跳跃段仍整段落在本槽新段内的也不算（段被
-/// 切成前缀时每个端口照旧打到本槽实例）。
-///
-/// 同一份名单也落一条 `runtime.json` 的 `incidents`（签名 `resi_slot_port_changed`），
-/// 面板事件卡与 `bui incidents` 都看得到；三处的组名与后果文案同出一处
-/// （`upstream::impact_title` / `impact_groups`）。
-fn remove_response(impact: &bui_schema::slots::ResubscribeImpact) -> axum::response::Response {
-    Json(serde_json::json!({ "success": true, "port_changed": impact })).into_response()
+/// **4.1 起只有 `success`**：`port_changed`（必须重新获取订阅的用户，按原因分三组）随
+/// 整套机制退役 —— 住宅 HY2 只有一个监听端口、整段跳跃由 `table inet bui` 送进去，
+/// 端口与区间与槽位无关，删上游动不到任何人手里那份订阅（spec §1.2 目标 1）。
+fn remove_response() -> axum::response::Response {
+    Json(serde_json::json!({ "success": true })).into_response()
 }
 
 async fn post_remove(
@@ -1150,10 +1229,10 @@ async fn post_remove(
         (None, None) => return Err(err(StatusCode::BAD_REQUEST, "id 或 host_port 字段必填")),
     };
     let ctx = ctx_of(&app, &d.paths);
-    let impact = upstream::remove(&ctx, &sel)
+    upstream::remove(&ctx, &sel)
         .await
         .map_err(map_upstream_err)?;
-    Ok(remove_response(&impact))
+    Ok(remove_response())
 }
 
 /// v3 别名 `DELETE /api/residential/urls/<host:port>`（路径段是 URL 编码的 `host:port`）
@@ -1165,10 +1244,10 @@ async fn delete_url(
     let sel = upstream::UpstreamSel::parse_host_port(&host_port)
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "路径必须是 host:port"))?;
     let ctx = ctx_of(&app, &d.paths);
-    let impact = upstream::remove(&ctx, &sel)
+    upstream::remove(&ctx, &sel)
         .await
         .map_err(map_upstream_err)?;
-    Ok(remove_response(&impact))
+    Ok(remove_response())
 }
 
 /// v3 的空体启用请求（`web/app.js:37-50` 不带 `Content-Type`）：提取器必须是
@@ -2051,12 +2130,11 @@ mod tests {
         );
     }
 
-    /// 删上游的回包必须带 `port_changed` 三组名单（面板与 CLI 的唯一提示来源），同一份
-    /// 名单落一条事件。名单里只有用户名，且只有手里那份订阅**真的**不能用了的人 —— 删 0
-    /// 号槽时被删槽上的 alice 被重新分配回序号 0（端口还是 40000、旧跳跃区间仍整段落在新
-    /// 区间内），她不该被要求重取订阅；bob 随槽 1 被搬到 0 号，进的是组二。
+    /// 4.1 的退役判据（spec §1.2 目标 1）：删上游的回包**只有 `success`**，不记事件，
+    /// CLI 也只打一句。4.0.x 的 `port_changed` 三组名单存在的理由是「端口 = 40000 + 槽
+    /// 序号、跳跃段按槽数等分」，4.1 两样都与槽位无关了。
     #[tokio::test]
-    async fn removing_an_upstream_reports_who_must_refetch_the_subscription() {
+    async fn removing_an_upstream_no_longer_talks_about_resubscribing() {
         let d = tempfile::tempdir().unwrap();
         let h = harness(&d).await;
         // 再加一条 ⇒ 槽 0 = isp.example.net（夹具那条），槽 1 = isp2.example.net
@@ -2091,7 +2169,7 @@ mod tests {
             .await
             .unwrap();
 
-        // 删 0 号槽（v3 的 DELETE 别名，面板走的就是它）
+        // 删 0 号槽（v3 的 DELETE 别名，面板走的就是它）；不变量 3 把槽 1 搬到序号 0
         let (st, v) = call(
             &h.app,
             "DELETE",
@@ -2100,33 +2178,23 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::OK);
-        assert_eq!(v["success"], true);
         assert_eq!(
-            v["port_changed"],
-            serde_json::json!({
-                "slot_removed": [], "slot_moved": ["bob"], "hop_resliced": [],
-            }),
-            "bob 随槽 1 被搬到 0（40001 → 40000）= 组二；alice 落回序号 0，端口与区间都还能用"
-        );
-        let body = v.to_string();
-        assert!(
-            !body.contains("pw-alice-01") && !body.contains("sub_token"),
-            "名单只写用户名，不带凭据 / 订阅 token：{body}"
+            v,
+            serde_json::json!({ "success": true }),
+            "回包只有 success"
         );
         // CLI 打印的就是这份回包
-        assert_eq!(
-            crate::modules::residential::cli::format_remove(&v),
-            "上游已移除。1 个用户的 HY2 住宅节点会反复断联，需重新拉订阅：\n  \
-             槽位序号变了（1 人，端口与跳跃段一起变）：bob"
+        let out = crate::modules::residential::cli::format_remove(&v);
+        assert_eq!(out, "上游已移除");
+        assert!(
+            !out.contains("重新获取订阅") && !out.contains("重新拉订阅"),
+            "订阅不再含槽位信息，这个问题不存在了：{out}"
         );
-        // 事件落盘一条：bui incidents 与面板事件卡都看得到，口径与 CLI 同出一处
-        let incs = crate::modules::sentinel::incidents::from_runtime(&h.ctx.runtime.read().await);
-        assert_eq!(incs.len(), 1);
-        assert_eq!(incs[0].signature, "resi_slot_port_changed");
-        assert_eq!(
-            incs[0].result,
-            "1 个用户的 HY2 住宅节点会反复断联，需重新拉订阅：\
-             槽位序号变了（1 人，端口与跳跃段一起变）：bob"
+        // 事件表干净：`resi_slot_port_changed` 这个签名已经没有了
+        assert!(
+            crate::modules::sentinel::incidents::from_runtime(&h.ctx.runtime.read().await)
+                .is_empty(),
+            "删上游不再是「让订阅失效」的事件"
         );
     }
 
@@ -2730,7 +2798,6 @@ mod tests {
             crate::modules::residential::slots::assign_user(&h.ctx, uid, slot1)
                 .await
                 .unwrap()
-                .0
         );
 
         let (code, v) = call(&h.app, "GET", "/api/residential/slots", None).await;
@@ -2740,9 +2807,42 @@ mod tests {
         assert_eq!(rows[0]["index"], 0);
         assert_eq!(rows[0]["selector"], "slot-0-pool");
         assert_eq!(rows[0]["upstream_tag"], "resi-1");
-        assert_eq!(rows[1]["relay_port"], 2081);
-        assert_eq!(rows[1]["hy2_port"], 40001);
-        assert_eq!(rows[1]["hop"], serde_json::json!([44000, 46999]));
+        assert_eq!(rows[1]["relay_port"], 2081, "中继入站仍是 2080+槽序号");
+        // 4.1：住宅 HY2 端口与整段跳跃**与槽序号无关**，每一行都是期望态里那一对
+        // （4.0.x 这里是 40001 + 按槽数等分的第 1 片 [44000,46999]）。槽位表与用户列表
+        // 必须同源，否则同一个面板上两处数字自相矛盾 —— 而槽位列的 tooltip 说的正是
+        // 「用户在订阅里拿到的端口与区间」。
+        let ports = h.ctx.store.read().await.node.ports.clone();
+        for (i, r) in rows.iter().enumerate() {
+            assert_eq!(r["hy2_port"], ports.hy2_resi, "槽 {i} 的住宅 HY2 端口");
+            assert_eq!(
+                r["hop"],
+                serde_json::json!([ports.hy2_resi_hop.0, ports.hy2_resi_hop.1]),
+                "槽 {i} 的跳跃区间"
+            );
+        }
+        // 与订阅里那个节点逐字相同（真源只有 `nodes::nodes_for` 一处）：
+        // 先把凭据池补上，没凭据的用户压根不发住宅 HY2 节点（T7）
+        let now = crate::sys::Host::now(h.ctx.host.as_ref());
+        h.ctx
+            .store
+            .update(|s| {
+                bui_schema::hy2pool::migrate(s, now);
+            })
+            .await
+            .unwrap();
+        let s = h.ctx.store.read().await;
+        let node = bui_schema::nodes::nodes_for(&s.users[0], &s.node, &s.residential)
+            .into_iter()
+            .find(|n| n.kind == bui_schema::nodes::NodeKind::Hy2Residential)
+            .expect("alice 订阅里没有住宅 HY2 节点");
+        drop(s);
+        assert_eq!(rows[1]["hy2_port"], node.port, "槽位表与订阅不一致");
+        assert_eq!(
+            rows[1]["hop"],
+            serde_json::json!([node.hop.unwrap().0, node.hop.unwrap().1]),
+            "槽位表与订阅不一致"
+        );
         assert_eq!(rows[1]["user_count"], 1);
         assert_eq!(
             rows[1]["users"],
@@ -2854,16 +2954,32 @@ mod tests {
         assert_eq!(v["slots"][0]["users"], serde_json::json!(["alice"]));
     }
 
-    /// 改槽的四条路径（add / remove / assign / rebalance）都用**同一个**回包字段
-    /// `port_changed` 上报「手里那份订阅已经不能照旧用」的人，CLI 也照同一份口径打给操作者。
-    /// 空名单不出现这个键（也就什么都不打）。
+    /// 4.1 的退役判据：改槽的四条路径（add / remove / assign / rebalance）回包里**一个
+    /// `port_changed` 都没有**，CLI 也一句名单都不打。
+    ///
+    /// 同时钉住「改槽真的动了槽位、却没动订阅」：`assign` 把 alice 从槽 0 挪到槽 1、
+    /// `rebalance` 再挪回来，她订阅里的住宅 HY2 节点全程是 `40000` + 整段 `41000-50000`。
     #[tokio::test]
-    async fn assign_and_rebalance_report_who_must_refetch_the_subscription() {
+    async fn assign_and_rebalance_no_longer_talk_about_resubscribing() {
         let d = tempfile::tempdir().unwrap();
         let h = harness(&d).await;
         grow_pool(&h, 2).await;
+        // 有凭据才渲染得出住宅 HY2 节点（spec §3.1）
+        crate::modules::residential::slots::migrate_hy2_pool_on_start(&h.ctx)
+            .await
+            .unwrap();
+        let node_of = || async {
+            let s = h.ctx.store.read().await;
+            let u = s.users.iter().find(|u| u.username == "alice").unwrap();
+            bui_schema::nodes::nodes_for(u, &s.node, &s.residential)
+                .into_iter()
+                .find(|n| n.kind == bui_schema::nodes::NodeKind::Hy2Residential)
+                .map(|n| (n.port, n.hop))
+        };
+        let before = node_of().await;
+        assert_eq!(before, Some((40000, Some((41000, 50000)))));
 
-        // ① assign：alice 槽 0 → 槽 1，端口 40000 → 40001，跳跃段一起变
+        // ① assign：alice 槽 0 → 槽 1
         let (code, v) = call(
             &h.app,
             "POST",
@@ -2872,53 +2988,40 @@ mod tests {
         )
         .await;
         assert_eq!(code, StatusCode::OK);
+        assert!(v.get("port_changed").is_none(), "{v}");
         assert_eq!(
-            v["port_changed"],
-            serde_json::json!({
-                "slot_removed": [], "slot_moved": ["alice"], "hop_resliced": [],
-            })
+            bui_schema::slots::index_of_user(
+                h.ctx
+                    .store
+                    .read()
+                    .await
+                    .users
+                    .iter()
+                    .find(|u| u.username == "alice")
+                    .unwrap(),
+                &h.ctx.store.read().await.residential
+            ),
+            1,
+            "她确实换了槽 —— 否则这条用例什么都没验"
         );
+        assert_eq!(node_of().await, before, "换槽不许动订阅");
         assert_eq!(
             crate::modules::residential::cli::format_assign("alice", "resi-2", &v),
-            "已把用户 alice 分到 resi-2，约 1 秒后槽路由生效（不重启 xray）。\
-             1 个用户的 HY2 住宅节点会反复断联，需重新拉订阅：\n  \
-             槽位序号变了（1 人，端口与跳跃段一起变）：alice"
+            "已把用户 alice 分到 resi-2，约 1 秒后槽路由生效（不重启 xray）"
         );
 
-        // ② rebalance：把她挪回槽 0，同样上报
+        // ② rebalance：把她挪回槽 0
         let (code, v) = call(&h.app, "POST", "/api/residential/rebalance", None).await;
         assert_eq!(code, StatusCode::OK);
         assert_eq!(v["moved"], 1);
-        assert_eq!(
-            v["port_changed"],
-            serde_json::json!({
-                "slot_removed": [], "slot_moved": ["alice"], "hop_resliced": [],
-            })
-        );
-        assert!(
-            crate::modules::residential::cli::format_rebalance(&v)
-                .contains("槽位序号变了（1 人，端口与跳跃段一起变）：alice"),
-            "{}",
-            crate::modules::residential::cli::format_rebalance(&v)
-        );
-
-        // ③ 没人被挪动 ⇒ 键不出现、CLI 一个名字都不打
-        let (_, v) = call(&h.app, "POST", "/api/residential/rebalance", None).await;
-        assert_eq!(v["moved"], 0);
-        assert!(v.get("port_changed").is_none(), "空名单不进回包：{v}");
+        assert!(v.get("port_changed").is_none(), "{v}");
+        assert_eq!(node_of().await, before, "重排不许动订阅");
         assert_eq!(
             crate::modules::residential::cli::format_rebalance(&v),
-            "已重排 0 个用户"
+            "已重排 1 个用户，约 1 秒后槽路由生效（不重启 xray）"
         );
-    }
 
-    /// 加一条上游会把**存活槽的跳跃段全部重切**（按当下槽数等分），所以池里的住宅用户
-    /// 一个不落都要重新拉订阅 —— 4.0.0 把这份名单算出来又丢掉了，操作者只看到「加成功了」，
-    /// 用户那头开始反复断联。名单落在组三：端口一个没动，只有段变了。
-    #[tokio::test]
-    async fn adding_an_upstream_reports_the_users_whose_hop_range_is_resliced() {
-        let d = tempfile::tempdir().unwrap();
-        let h = harness(&d).await;
+        // ③ add：4.0.x 下加一条上游会把存活槽的跳跃段全部重切，4.1 什么都不动
         let (code, v) = call(
             &h.app,
             "POST",
@@ -2928,19 +3031,152 @@ mod tests {
         .await;
         assert_eq!(code, StatusCode::OK);
         assert_eq!(v["success"], true);
-        assert_eq!(
-            v["port_changed"],
-            serde_json::json!({
-                "slot_removed": [], "slot_moved": [], "hop_resliced": ["alice"],
-            }),
-            "槽 0 的段从整段砍成前半段 ⇒ alice 手里那份订阅的 mport= 有一半跳进槽 1"
-        );
+        assert!(v.get("port_changed").is_none(), "{v}");
+        assert_eq!(node_of().await, before, "加上游不许动订阅");
         assert!(
-            crate::modules::residential::cli::format_add(&v).contains(
-                "端口跳跃区间被重切（1 人，端口没变，但旧段里的端口会跳进别的实例）：alice"
-            ),
+            !crate::modules::residential::cli::format_add(&v).contains("重新拉订阅"),
             "{}",
             crate::modules::residential::cli::format_add(&v)
+        );
+    }
+
+    /// `GET /api/residential/pool`（T14）：已用 / 容量 / 空闲 / 代号 / 持有人，
+    /// **凭据 id 与 secret 一个都不出这个端点**（拿到 `name:secret` 就能直接连住宅 HY2）。
+    #[tokio::test]
+    async fn the_pool_endpoint_reports_the_counts_without_leaking_a_single_secret() {
+        let d = tempfile::tempdir().unwrap();
+        let h = harness(&d).await;
+        crate::modules::residential::slots::migrate_hy2_pool_on_start(&h.ctx)
+            .await
+            .unwrap();
+        let (code, v) = call(&h.app, "GET", "/api/residential/pool", None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v["size"], 32, "1 个住宅用户 ⇒ 下限 32 条（size_for）");
+        assert_eq!(v["used"], 1);
+        assert_eq!(v["free"], 31);
+        assert_eq!(v["target"], 32);
+        assert_eq!(v["holders"], serde_json::json!(["alice"]));
+        // 池里那条凭据的 secret 绝不能出现在回包里
+        let secret = h.ctx.store.read().await.residential.hy2_pool.creds[0]
+            .secret
+            .clone();
+        let body = v.to_string();
+        assert!(!secret.is_empty());
+        assert!(!body.contains(&secret), "回包漏了凭据 secret：{body}");
+        assert!(
+            !body.contains("\"r0") && !body.contains("secret"),
+            "回包不许带凭据 id / secret：{body}"
+        );
+
+        // 悬空指针（用户指向池里已不存在的 id，`migrate_hy2_pool_on_start` 下次启动才清）
+        // **不计已用**：三个数与 `bui status` 那一行同源（`hy2pool::usage`），
+        // 否则 `used + free > size`，两处的「空闲不足 20%」门槛会互相打脸。
+        h.ctx
+            .store
+            .update(|s| s.users[0].credentials.hy2_resi_cred = Some("r999".into()))
+            .await
+            .unwrap();
+        let (_, v) = call(&h.app, "GET", "/api/residential/pool", None).await;
+        assert_eq!(
+            (v["size"].clone(), v["used"].clone(), v["free"].clone()),
+            (32.into(), 0.into(), 32.into()),
+            "悬空指针不占池里的凭据"
+        );
+        assert_eq!(
+            v["holders"],
+            serde_json::json!(["alice"]),
+            "他仍然算持有人（确实攥着一个指针），只是不算已用"
+        );
+        let s = h.ctx.store.read().await;
+        let u = bui_schema::hy2pool::usage(&s);
+        assert_eq!(
+            (v["size"].as_u64(), v["used"].as_u64(), v["free"].as_u64()),
+            (
+                Some(u.size as u64),
+                Some(u.used as u64),
+                Some(u.free as u64)
+            ),
+            "端点与 `hy2pool::usage` 必须是同一份口径"
+        );
+    }
+
+    /// `POST /api/residential/pool/grow`（T14）：扩到 `to`、**幂等**、上限挡住。
+    #[tokio::test]
+    async fn growing_the_pool_is_idempotent_and_capped() {
+        let d = tempfile::tempdir().unwrap();
+        let h = harness(&d).await;
+        // 显式扩到 48
+        let (code, v) = call(
+            &h.app,
+            "POST",
+            "/api/residential/pool/grow",
+            Some(serde_json::json!({"to": 48})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(
+            (v["size"].as_u64(), v["added"].as_u64()),
+            (Some(48), Some(48))
+        );
+        // 再来一次：零改动
+        let (code, v) = call(
+            &h.app,
+            "POST",
+            "/api/residential/pool/grow",
+            Some(serde_json::json!({"to": 48})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(
+            (v["size"].as_u64(), v["added"].as_u64()),
+            (Some(48), Some(0))
+        );
+        // 不给 `to`：补到 `size_for`（1 个住宅用户 ⇒ 32），已经 48 条 ⇒ 不缩
+        let (code, v) = call(&h.app, "POST", "/api/residential/pool/grow", None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(
+            (v["size"].as_u64(), v["added"].as_u64()),
+            (Some(48), Some(0))
+        );
+        // 超上限 ⇒ 400，且一条都不加
+        let (code, v) = call(
+            &h.app,
+            "POST",
+            "/api/residential/pool/grow",
+            Some(serde_json::json!({"to": 257})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert!(v["error"].as_str().unwrap().contains("256"), "{v}");
+        assert_eq!(
+            h.ctx.store.read().await.residential.hy2_pool.creds.len(),
+            48
+        );
+    }
+
+    /// 凭据名不许撞用户名（`validate_username` 允许 `r017` 这种名字，撞上了 `auth_user`
+    /// 就归错人）：占着那个名字的用户存在时，`grow` 必须跳过那个 id。
+    #[tokio::test]
+    async fn growing_the_pool_skips_an_id_that_collides_with_a_username() {
+        let d = tempfile::tempdir().unwrap();
+        let h = harness(&d).await;
+        h.ctx
+            .store
+            .update(|s| {
+                let mut squatter = s.users[0].clone();
+                squatter.user_id = Uuid::from_u128(0x5000);
+                squatter.username = "r000".into();
+                s.users.push(squatter);
+            })
+            .await
+            .unwrap();
+        let (code, _) = call(&h.app, "POST", "/api/residential/pool/grow", None).await;
+        assert_eq!(code, StatusCode::OK);
+        let creds = h.ctx.store.read().await.residential.hy2_pool.creds.clone();
+        assert!(
+            creds.iter().all(|c| c.name != "r000"),
+            "撞用户名的凭据名必须跳过：{:?}",
+            creds.iter().map(|c| c.name.clone()).collect::<Vec<_>>()
         );
     }
 

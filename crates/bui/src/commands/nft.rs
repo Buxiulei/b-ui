@@ -70,6 +70,13 @@ pub fn apply(host: &dyn Host, paths: &Paths) -> Result<String> {
 /// 重放都把它清回 0，nat 链的 counter 又只计每条 conntrack 流的首包。累计命中数与
 /// `last_hit_at` 由守护进程在每次重放之前采样、累加进 `runtime.json`，
 /// `bui status` 与 `bui set hy2-resi-compat off` 的 30 天门禁读的是那份持久值。
+///
+/// 那份持久值的类型、键名与判据**只有 [`crate::modules::watchdog`] 一处**（2026-09-17
+/// 合并裁决）：写入侧就在那里，spec §2.4 的「`total == 0` 且静默 ≥ 30 天才算闲置」落在
+/// [`CompatHits::idle_for_takedown`](crate::modules::watchdog::CompatHits::idle_for_takedown)。
+/// T14 曾在本文件与 `commands::config` 各放一份只读投影 + 一份同构的 30 天实现（当时 T12
+/// 还没合进来），两份会漂移成「`bui status` 说闲置、门禁说没闲置」——读取侧与门禁现在
+/// 一律指向那一处，别在这里重写第二份。
 pub fn status(host: &dyn Host, paths: &Paths) -> Result<String> {
     let s = load_state(host, paths)?;
     require_nft(host)?;

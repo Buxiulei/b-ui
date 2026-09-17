@@ -1,5 +1,6 @@
-//! CLI 通过 unix socket 调的五个系统端点（spec §2.4）：触发一轮对账、动一个受管单元、
-//! 切 Hysteria2 的鉴权方式、改旧订阅链接的宽限期、开关 HY2 混淆。
+//! CLI 通过 unix socket 调的六个系统端点（spec §2.4）：触发一轮对账、动一个受管单元、
+//! 切 Hysteria2 的鉴权方式、改旧订阅链接的宽限期、开关 HY2 混淆、开关住宅 HY2 的 4.0
+//! 兼容段（4.1 新增，带 30 天下线门禁）。
 //!
 //! 这两个端点是「菜单与 CLI 不自己动手」的唯一出口：`sudo b-ui` 的重启/停止都经过这里，
 //! 于是三条对账路径（启动、去抖、10 分钟巡检）仍只有守护进程里那一个 consumer 在跑（S6）。
@@ -176,6 +177,82 @@ pub async fn set_obfs(State(app): State<AppState>, Json(req): Json<ObfsRequest>)
     }
 }
 
+#[derive(Debug, Deserialize)]
+pub struct CompatRequest {
+    /// `on` / `off`；合法性由 `commands::config::parse_obfs` 判。
+    pub value: String,
+    /// 显式跳过 30 天门禁（`bui set hy2-resi-compat off --force` 会带上它）。
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// `POST /api/system/hy2-resi-compat`（4.1，spec §2.4）：住宅 HY2 的 4.0 兼容段开关。
+///
+/// **下线门禁也在这里**（2026-09-17 裁决的 fail-closed 必须两边都成立）：判据是
+/// `runtime.json` 里持久化的累计命中 —— 守护进程自己就持有那份 `runtime`，
+/// 「本地才读得到」不成立，所以没有理由让走端点的调用方（面板、curl、任何经 socket /
+/// HTTP 的运维脚本）绕开它。判据一处：`commands::config::check_compat_takedown`，
+/// 与 CLI 逐字同源；不放行 ⇒ 403 + 那段带三个值的话，**一个字节都不写**。
+///
+/// 放行之后只写期望态 + 发事件，让对账重放 `inet bui` 并同步防火墙端口。
+pub async fn set_hy2_resi_compat(
+    State(app): State<AppState>,
+    Json(req): Json<CompatRequest>,
+) -> Response {
+    let on = match crate::commands::config::parse_obfs(&req.value) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    };
+    let hits = crate::modules::watchdog::compat_hits(&app.runtime.read().await);
+    let compat = bui_schema::render::nft::compat_range(&app.store.read().await.node.ports);
+    if let Err(why) = crate::commands::config::check_compat_takedown(
+        on,
+        req.force,
+        hits.as_ref(),
+        compat,
+        app.host.now(),
+    ) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": why})),
+        )
+            .into_response();
+    }
+    let mut changed = false;
+    let res = app
+        .store
+        .update(|s| {
+            if s.system.hy2_resi_compat_ports != on {
+                s.system.hy2_resi_compat_ports = on;
+                changed = true;
+            }
+        })
+        .await;
+    match res {
+        Ok(_) => {
+            if changed {
+                app.bus.send(Event::StateChanged("hy2-resi-compat"));
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"ok": true, "enabled": on, "changed": changed})),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 /// `POST /api/services/{unit}/{action}`；`unit` 只接受 `reconcile::is_managed_unit` 认的名字
 /// （4.1 起就是那六个固定名字：带序号的住宅实例已退役进 `LEGACY_UNITS`），其余 400。
 pub async fn service_action(
@@ -197,13 +274,23 @@ pub async fn service_action(
             .into_response();
     }
     let host = app.host.clone();
+    // 住宅入站被这个端点拉起来 / 重启之后，每个 `gate-<id>` selector 都回到
+    // `default = deny`（不开 `cache_file`，spec §14 裁决 1）⇒ 必须广播，让
+    // `gates::replay_loop` 立刻重放真实门位；少了它就是全体住宅 HY2 用户被拒到下一轮
+    // 60 秒安全网，且没有任何告警说明原因。`stop` 不发（门跟着内核一起没了）。
+    let announce = unit == "hysteria-residential" && matches!(action.as_str(), "restart" | "start");
     let out = tokio::task::spawn_blocking(move || host.systemd(&action, &unit)).await;
     match out {
-        Ok(Ok(o)) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"ok": o.ok(), "detail": o.stderr})),
-        )
-            .into_response(),
+        Ok(Ok(o)) => {
+            if announce && o.ok() {
+                app.bus.send(Event::Hy2ResiRestarted);
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"ok": o.ok(), "detail": o.stderr})),
+            )
+                .into_response()
+        }
         _ => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": "systemctl 调用失败"})),

@@ -252,6 +252,15 @@ async fn dispatch(command: Command) -> Result<()> {
                 )
                 .await
             }
+            cli::SetCmd::Hy2ResiCompat { value, force } => {
+                commands::config::run_hy2_resi_compat(
+                    &value,
+                    force,
+                    bui_schema::paths::Paths::default_server(),
+                    std::sync::Arc::new(sys::real::RealHost::new()),
+                )
+                .await
+            }
         },
         Command::Menu => {
             commands::menu::run(
