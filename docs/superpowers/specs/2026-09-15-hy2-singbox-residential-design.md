@@ -117,8 +117,7 @@ selector gate-r000 { outbounds: ["deny","slot-0-out"…"slot-7-out"], default: "
       "default": "deny", "interrupt_exist_connections": true }
   ],
   "route": {
-    "rules": [ { "action": "sniff" },
-               { "auth_user": ["alice"], "outbound": "gate-r000" } ],
+    "rules": [ { "auth_user": ["alice"], "outbound": "gate-r000" } ],
     "final": "deny"
   },
   "experimental": {
@@ -131,11 +130,17 @@ selector gate-r000 { outbounds: ["deny","slot-0-out"…"slot-7-out"], default: "
 
 **哪些已在 1.14.0 真机上过 `check`**（tizi PoC，逐条）：hysteria2 入站 + `users[{name,password:"r000:<pw>"}]` + salamander `obfs` + `masquerade proxy{url,rewrite_host}` + 复用生产证书 + `ignore_client_bandwidth` + 三个 selector 门 + 两条 `auth_user` 规则 + `clash_api`；**route 规则用传统 `"outbound"` 字段即可（无需 action 语法）**——所以渲染器就产出这个已验证的写法。
 
-**哪些还没验**（PoC 配置里没有，进 §12）：`experimental.v2ray_api` 段（tizi 上跑的是官方 1.14.0 二进制，不带 `with_v2ray_api`，这段配置在它上面必然 FATAL，只能等自建二进制）、`{"action":"sniff"}` 规则、QUIC 空闲超时字段名。
+**`route.rules` 只有 `auth_user` 规则、不 sniff**（2026-09-18 T3 裁决，§14 裁决 ①）。早先这份形状的 `rules[0]` 是一条裸 `{"action":"sniff"}`，已删：
+
+- **次序死锁**：apernet hysteria 客户端在 fastOpen 关闭时（上游文档默认值为 `false`）要等服务端回 `TCPResponse` 才发首包，而 sing-box 是在 route（sniff 就在 `route/route.go:337` 的规则匹配里跑）走完、出站也拨通之后才 `N.ReportConnHandshakeSuccess`（`route/conn.go:122`），那一步才触达 sing-quic 的 `hysteria2` 服务写回 `TCPResponse`（`service.go:403`）⇒ sniff 等首包、客户端等响应，对等到嗅探超时到点，**嗅探必然空手而归，代价是每条 TCP 流白等一个超时**。
+- **五格实测**（25 次/格，apernet 客户端 fastOpen 关，TLS 首字节中位数 / 嗅到域名）：缺省 300 ms 档 **307.1 ms、0/25**；`timeout:"50ms"` **56.6 ms、0/25**；`timeout:"1s"` **1010.6 ms、0/25**；**不 sniff 5.6 ms**。即延迟 ≈ 超时值、成功率恒为 0 ⇒ 裁决是 drop 而不是缩短 `timeout`。（sing-box 当客户端时先发首包，同一格 5.9 ms、25/25；对照格 E = apernet **服务端** + `sniff.rewriteDomain` 两种客户端都是 5 ms 级 ⇒ 这是 sing-box 这个实现的次序，不是协议本身的代价。）
+- **分流不受影响**：住宅 split 的关键字匹配靠的是 **relay 自己那条 `rules[0]` 无过滤 sniff**（`render/relay.rs`，`kernel_relay.rs` 有守门断言）+ `domain_keyword` 优先匹配 `metadata.Domain`（§12 第 12 项）。
+
+**哪些还没验**（PoC 配置里没有，进 §12）：`experimental.v2ray_api` 段（tizi 上跑的是官方 1.14.0 二进制，不带 `with_v2ray_api`，这段配置在它上面必然 FATAL，只能等自建二进制）、QUIC 空闲超时字段名。
 
 字段出处：`users[].name/password`、`obfs`、`masquerade`、`ignore_client_bandwidth`、`bbr_profile`（1.14 起，缺省 `standard`，不写）、`tls` 必填——https://sing-box.sagernet.org/configuration/inbound/hysteria2/ ；`ListenOptions` 只有单个 `listen_port`、**没有端口范围字段**——https://sing-box.sagernet.org/configuration/shared/listen/ （评估 `sb.facts[5-入站无端口范围字段]`，这正是必须自管 nft 的原因）；`v2ray_api.stats.users` = "User list to count traffic" 且 "V2Ray API is not included by default"——https://sing-box.sagernet.org/configuration/experimental/v2ray-api/ 。
 
-与今天 apernet 配置（`render/hysteria.rs:86-152` `common_doc`）的逐项对应：`sniGuard: disable` → sing-box 无此概念，不需要字段；`resolver`（DoH）→ 本实例不解析目标域名，不要 `dns` 段；`trafficStats` → `v2ray_api`；`auth` → `users[]`；`sniff` → route 的 `sniff` action；`quic.maxIdleTimeout: 60s` → 字段名待核（§12 第 7 项）。这四个 apernet 专属字段在 sing-box 的入站 schema 里根本不存在，是配置模型的结构性差异而不是改名（评估 `sb.facts[1-apernet专属字段无对应]`）。
+与今天 apernet 配置（`render/hysteria.rs:86-152` `common_doc`）的逐项对应：`sniGuard: disable` → sing-box 无此概念，不需要字段；`resolver`（DoH）→ 本实例不解析目标域名，不要 `dns` 段；`trafficStats` → `v2ray_api`；`auth` → `users[]`；**`sniff` 没有对应物**（route 的 `sniff` action 在这条路上必然空手而归，见上，裁决是不用它）；`quic.maxIdleTimeout: 60s` → sing-box 侧字段名是 `idle_timeout`，**渲染器不写、吃默认值 30 s**（§12 第 7 项已验）。这四个 apernet 专属字段在 sing-box 的入站 schema 里根本不存在，是配置模型的结构性差异而不是改名（评估 `sb.facts[1-apernet专属字段无对应]`）。
 
 `deny` 与 8 个槽出站的 `"version": "5"` 是实现照 `render/relay.rs` 的同风格显式写死的（sing-box 的 socks 出站默认就是 5，行为中性；写出来是为了两份渲染器逐字同形）。
 
@@ -211,6 +216,7 @@ table inet bui {
 
 - **`id`** = `r` + 三位十进制（`r000`…`r255`，id 域随 `POOL_MAX = 256` 收，§14 裁决 2）。**ASCII、稳定、只在本机内部用**：门的 tag `gate-<id>`、Clash API 路径、日志匹配都按它——生产用户名是中文，不能进 URL 路径。
 - **`name`** = sing-box `users[].name`，也是 `auth_user` 匹配值与 `stats.users` 的计数键。**迁移用户 `name = username`**（保住订阅逐字不变，§4.3），**新发凭据 `name = id`**。生成时跳过与现有用户名 / 凭据名冲突的值（`validate_username` 允许 `r017` 这种名字，`panel/users.rs:168`）。
+  **迁移用户的凭据 `name` = 用户名**（这正是旧订阅逐字不变的原因，§4.3 / §7.5），而本部署的用户名是中文 ⇒ 迁移用户的 auth 串就是**中文**的 `"<中文用户名>:<secret>"`。**已在真机验证**（2026-09-18，`bwg-tizi` sidecar + 自建 1.14.1，§12 第 1 项）：非 ASCII name（含一条带空格与 U+00B7 中点的）在 `users[].name`、`route.rules` 的 `auth_user`、`v2ray_api.stats.users` 三处一字不改地工作 —— `check` 退 0、握手成功、`auth_user` 路由命中、`QueryStats` 返回 `user>>><中文 name>>>>traffic>>>{uplink,downlink}` 且按用户计量正常。
 - **`secret`**：迁移用户 = 当时的 `credentials.hy2_password`（复制一份，之后各走各的）；新发凭据 = 16 字节随机 base64url 无填充（22 字符，**不含 `:`**）。
 - **`password`（写进 sing-box）= `"{name}:{secret}"`**。这个形态是实测出来的：sing-box 的 `users[].password` 就是客户端发送的**整个 auth 串**，写 `p1` 握手 404、写 `r00:p1` 才通（本机 PoC `sb1.json` + `hyc.yaml`；官方文档明写不提供 `userpass` 别名；tizi PoC 的配置同样是 `password:"r000:<pw>"` 并握手成功）。于是 `hysteria2://name:secret@host:40000?…` 的 URI 形态、以及三处 `"password": format!("{username}:{password}")`（`render/subscription.rs:208` sing-box 订阅、`:411` clash YAML、`render/client.rs:331` 客户端）**一个字都不用改**。
 - 用户侧指针：`User.credentials.hy2_resi_cred: Option<String>` = 凭据 `id`。一个凭据最多属于一个用户；`hy2_password` **保留给直连**（§4）。
@@ -247,7 +253,8 @@ Clash API 客户端复用 `modules/residential/clash.rs` 的 `Clash` trait（`re
 | 删用户 | 释放凭据 | `PUT gate-<id> → deny` | 同到期 |
 | 删上游（槽消失） | `sync_slots` 释放槽 + 用户重分配 | 受影响用户各一次 `PUT` | relay 照今天重启一次（`core_files.rs:250-256` 无 `restart_key`）；hysteria 配置不变、**订阅不变** |
 | 加上游 | 新槽 | 无 | 无 |
-| 凭据池扩容 / obfs 开关 / 证书轮换 / 端口改动 / 伪装域变更（§3.5 那五件事，一件不少） | 重写配置 | 重启单元 → §3.4 重放 | 全体住宅 HY2 会话重连一次（与今天 obfs 开关 / 证书轮换的影响面相同） |
+| 凭据池扩容 / obfs 开关 / 端口改动 / 伪装域变更（§3.5 那五件事里除证书轮换之外的四件） | 重写配置 | 重启单元 → §3.4 重放 | 全体住宅 HY2 会话重连一次（与今天 obfs 开关的影响面相同） |
+| 证书轮换（§3.5 第 3 件） | — | 无 | **无感**：住宅实例自己热加载证书（§12 第 9 项 2026-09-18 已验），既有连接与新握手都不断 |
 
 **收敛入口只有一个**：`panel::users::sync_users`（`users.rs:465`）增加「门位收敛」段——算期望门位、`selected_all()` 读真源、只对差集 `select`，与它旁边那段 xray 收敛（读内核 → 差集 AddUser/RemoveUser）同构；`StateChanged` 与 60 秒安全网（`SYNC_INTERVAL_SECS`，`users.rs:25`）两条触发路径不变。任一 PUT 失败进 `SyncOutcome.errors` → 打 `USER_SYNC_FAILED_LOG`（`users.rs:29`）→ 哨兵新签名 `hy2_resi_gate_sync_failed`（§8.1）。`/api/users` 的投影增加 `hy2ResiGate`（`slot-3-out` / `deny` / `未分配`），面板与 `bui residential slots` 按槽列用户时读它。
 
@@ -266,7 +273,7 @@ Clash API 客户端复用 `modules/residential/clash.rs` 的 `Clash` trait（`re
 
 1. **凭据池扩容**（含 §3.1 的空闲密码重随机，只在重写时顺带做）；
 2. **`bui set obfs on|off`**（`node.obfs`）；
-3. **证书轮换**（`certs.rs:131-151` 那次重启，单元名没变所以代码不动；sing-box 是否会热加载证书从而免掉这次重启 → §12 第 9 项）；
+3. **证书轮换：住宅实例热加载，不再无条件重启**（§12 第 9 项 2026-09-18 已验，§14 裁决 ④）。sing-box 1.14.1 的 hysteria2 入站自己 watch `tls.certificate_path` / `key_path`：新握手 **≤ 0.16 s** 用上新证书、**既有连接零影响**（10 次换证、31/31 请求 200、客户端无重连行）。所以 `certs.rs` 改成「写完证书后确认热加载（journald 里见 `inbound/hysteria2[hy2-resi]: reloaded TLS certificate`），**10 s 内没见才回退重启**」（`RESTART_GAP_SECS` 从「两实例错峰间隔」转用作这个确认时限）；`hysteria-server`（apernet，`CanReload=no`）仍无条件重启。**注意**：我们写盘是 tmp+rename、先 cert 后 key，所以每次轮换**必然**先出一条 `ERROR … reload certificate: reload key pair: tls: private key does not match public key`（cert 已换 key 未换那几毫秒的中间态）再出成功那条 INFO —— 无害，但哨兵不许把它当异常（§8.1）。非原子轮换期间（key 晚落）旧证书对继续服务，失败的 reload 被 sing-box 自己丢弃，不留半截状态；
 4. **`ports.hy2_resi` / `hy2_resi_hop` 改动**（`POST /api/config/port-hopping`，同时重写 nft 表）；
 5. **伪装域变更**（面板 `POST /api/masquerade` 改 `reality.dest`；渲染器的 `masquerade.url` 由 `node.reality.sni()` 推导）⇒ 同样重写本文件并重启住宅实例。今天改伪装域也会重启两个 apernet 实例，所以这不是回归，但这次重启要算进重启账里（2026-09-16 第二波复核追加）。
 
@@ -346,7 +353,7 @@ Clash API 客户端复用 `modules/residential/clash.rs` 的 `Clash` trait（`re
 
 ### 5.2 在线与踢人：`/connections` 的 `rule` 字段 + `DELETE`
 
-- `GET /connections` 每条含 `rule` 字段（值是 `F.ToString(c.Rule, " => ", c.Rule.Action())`），PoC 实测形如 `auth_user=r000 => route(gate-r000)`，`chains` 含门 tag（评估 `ev.key_facts[7]`）。**在线数** = 按 `rule` 里的 `auth_user=<name>` 归组的连接条数（`> 0` 即在线），并入 `Sample.online`。`metadata` 里**没有** user 字段（评估 `sb.facts[4-clash_api连接列表不带用户名]`），只能靠这个串——这正是「每凭据一条规则」的理由（§3.2）。
+- `GET /connections` 每条含 `rule` 字段（值是 `F.ToString(c.Rule, " => ", c.Rule.Action())`），实测形如 `auth_user=<凭据 name> => route(gate-<id>)`（**`auth_user` 位置是凭据 `name`**，迁移用户就是他的中文用户名；只有新发凭据的 `name` 恰好等于 id），`chains` 含门 tag（评估 `ev.key_facts[7]`）。**在线数** = 按 `rule` 里的 `auth_user=<name>` 归组的连接条数（`> 0` 即在线），并入 `Sample.online`。`metadata` 里**没有** user 字段（评估 `sb.facts[4-clash_api连接列表不带用户名]`），只能靠这个串——这正是「每凭据一条规则」的理由（§3.2）。
 - **踢单条**：`DELETE /connections/{id}`。**踢用户** = 门切 `deny`（`interrupt_exist_connections` 掐既有流）+ 逐条 DELETE 兜底。`GET /connections` 是现取快照，10 秒采样够用，不上 websocket。
 - 新 trait `Hy2ResiApi`（`panel/mod.rs` 里与 `XrayApi` / `Hy2Api` 并列）：`query_user_deltas` / `connections` / `close_connection` / `selected_all` / `select`；`fakes.rs` 补 `FakeHy2Resi`。`panel/traffic.rs:592-593` 那条「两个实例都要 kick（`kick:9999` + `kick:9998`）」的断言改成「直连 kick:9999 + 住宅 gate→deny」。
 - 直连的 `Hy2Client`（`panel/hy2.rs`）保留，只服务 `9999`。
@@ -382,7 +389,7 @@ Clash API 客户端复用 `modules/residential/clash.rs` 的 `Clash` trait（`re
 - **今天**：到期 / 封禁 / 超限 / rotate 后的旧密码在**握手**即被拒（`auth_hook::decide`：常量时间比密码 + `blocked` + `expires_at`，fail-closed），客户端显示连不上。
 - **4.1 住宅**：密码静态在 `users[]` 里，**握手成功**，`metadata.User` 落到门 `deny` ⇒ 每条流 `connection refused`。客户端显示「已连接」但所有请求失败。**tizi PoC 已验证**：默认门 deny 的用户握手成功、请求全部 HTTP 000。直连 HY2 与 Reality 不变。
 - **面板与 CLI 文案**（用户列表状态 tooltip + `bui status` 用户段）：「已停用 / 已到期：**住宅 HY2 客户端仍会显示已连接，但所有请求会被拒绝**；直连节点在连接时即被拒绝。」`docs/residential-proxy-guide.md` 同步一段；rotate 的回包提示加两句：「住宅 HY2 的旧凭据会在刷新订阅前一直显示已连接但不通」与「**Linux 客户端还要明确切换到新的住宅 HY2 节点**」（导入完那一问只切**第一个**新节点，融合权益时那通常是 Reality 直连 ⇒ 文案要点名菜单 [1] / `bui-c switch`）—— rotate 换掉住宅凭据的 `name`（`alice` → `rNNN`），对按账号匹配的客户端等于换了账号，重新导入只新增新节点、旧的留在原地，见 §7.4 第 3 条「rotate 的后果」。
-- **`auth-hook.log`**：住宅路径**不再有任何记录**——sing-box 对 hysteria2 鉴权失败不打任何日志（评估 `sb.facts[7-鉴权失败无日志]`，tizi PoC 复验「鉴权失败仍无日志」）。文件保留给直连，格式不变。住宅侧排查改看 `journalctl -u hysteria-residential`：tizi PoC 实测日志**带用户名**——`inbound/hysteria2[hy2-resi]: inbound connection from <ip>:<port>` 与 `[r000] inbound connection to <host>:<port>`，比 apernet 更好定位。
+- **`auth-hook.log`**：住宅路径**不再有任何记录**——sing-box 对 hysteria2 鉴权失败不打任何日志（评估 `sb.facts[7-鉴权失败无日志]`，tizi PoC 复验「鉴权失败仍无日志」）。文件保留给直连，格式不变。住宅侧排查改看 `journalctl -u hysteria-residential`：tizi PoC 实测日志**带用户名**——`inbound/hysteria2[hy2-resi]: inbound connection from <ip>:<port>` 与 `[<凭据 name>] inbound connection to <host>:<port>`（方括号里是凭据 `name`，迁移用户就是他的中文用户名），比 apernet 更好定位。
 - **`bui set hy2-auth http|command`**：只重渲染直连 `config.yaml`、只重启 `hysteria-server`；CLI 帮助与 `bui status` 的「HY2 鉴权」行注明「仅直连」。
 - **m1 判据变化**（`scripts/m1-acceptance.sh`：`hy2_auth_probe` 在 `:219`、`check_hy2_auth` 在 `:278`、住宅探测调用在 `:305`）：直连探测不变（bundled hysteria 客户端 → https 200 → `auth-hook.log` 末行 `allow`，`:215`）；**住宅探测改为**用该用户的住宅凭据（`name:secret`）连 `127.0.0.1:40000` → https 200，且 `journalctl -u hysteria-residential --since <探测起点>` 出现 `[<name>] inbound connection`；再加一步带 `mport=41000-50000` 打回环，验 nft 的 **output** 链。
 - **m3 判据变化**（`scripts/m3-acceptance.sh`）：① 加用户 → 三个内核单元 `NRestarts` / `MainPID` 不变（`KERNEL_UNITS` 回固定三项，删 `:67`、`:73-76`、`:1306-1310` 的按槽枚举）且邻居会话不断；② 100 MB 计数误差 ≤ 1%（住宅经 v2ray_api）；③ 到期：**新握手仍成功**但 10 秒内经它的请求全部失败、同槽其他用户客户端 `connected` 计数不变、`/connections` 里该用户条数归零（`:828-833` 那两条读 `auth-hook.log` 的断言只对直连保留）；④ 删一个上游 → 任一用户三种订阅 sha 不变、门位重放正确（`bui residential slots --json` 里每个用户的 `gate` 与期望一致）。
@@ -481,6 +488,18 @@ Clash API 客户端复用 `modules/residential/clash.rs` 的 `Clash` trait（`re
    「这两条出口 IP 不同」）；等 4.1 把旧端口汇到同一出口之后再考虑自动合并。这条是主会话与
    bui-c 会话的**共同结论**。
 
+## 已知限制（2026-09-18 T3 实测后补；非 4.1 引入的也一并写明）
+
+这五条都是**实测出来的**、会被误当成 4.1 回归的行为。写在这里是为了下一次排查时不必重新发现。
+
+1. **无 SNI / 不可嗅探的流量在 split 模式下落 relay 的 `final: direct`（fail-open）**。住宅路径的关键字分流依赖 relay 那一跳嗅出域名（§12 第 12 项）；无 SNI 的 TLS（已实测）与非 TLS / 非 HTTP 的自定义协议两侧都嗅不到域名 ⇒ 不命中 `domain_keyword` ⇒ 走 VPS 直连，**不报错、不告警**。**这不是 4.1 引入的**：apernet 的 `sniff.rewriteDomain` 同样依赖嗅探成功；也符合 fail-open 取向（嗅不出就别断用户的网）。实测旁证：同一格里 sidecar 与 relay 的嗅探器集合与首包完全相同 ⇒ **relay 的嗅探成败 ≡ 住宅内核那一侧的嗅探成败**，加什么 `override_destination` 都救不了。
+2. **客户端在本地解析目标时，住宅上游拿到的是 VPS 侧解析出的 IP**。sing-box 1.14 的 sniff 动作不改写连接目标，住宅 HY2 把客户端原样发来的地址交给 relay、relay 交给上游 ⇒ 客户端只发 IP 时，住宅出口拿到的是**这台 VPS 的 DNS 选出的那个 IP**，而不是由住宅出口自己解析。对「地理一致性 / CDN 就近」敏感的场景（AI 站点的反爬画像）这有实际差别。与直连 HY2（apernet，`rewriteDomain: true` 把目标改写成域名再交给出站）**语义不同**。正常客户端（v2rayN / `bui-c` / 任何 sing-box 客户端）发的是域名、不受影响；受影响的是自己解析后只发 IP 的应用。
+3. **`deny` 的日志速率会吃掉整个单元的 journald 配额，连带丢掉别人的排查线索**。实测每条被拒请求恒 **4 行**（UDP 是**每个数据包 4 行**、无摊销）：13 req/s ⇒ **3120 行/分钟**，10 包/秒 ⇒ **2400 行/分钟**，而单元的 `LogRateLimitIntervalSec=10s` + `Burst=200` 上限是 **1200 行/分钟** ⇒ journald 不会被撑爆，但超出的部分被 systemd 丢掉。**限速是按单元的**：一个被封用户就能吃光 10 秒配额，同窗口里**其他用户**那条带用户名的 `[<name>] inbound connection to …`（§6 唯一的排查线索）也一起被丢。对哨兵不造成误报（`deny` 行本来要忽略），但**有漏报风险**（真故障的行也可能被丢）。裁决保持现状（§14 裁决 ②）。
+4. **`/connections` 的 `metadata.inboundUser` 是 `null`**，用户名只出现在 `rule` 字符串里（`auth_user=<name> => route(gate-<id>)`）。面板 / CLI 按用户展示现存连接只能解析 `rule` 或 `chains`，**不能指望 `inboundUser`**。同理 `metadata.destinationIP` 在客户端发域名时是空串（sing-box 不替代理连接做解析），`metadata.host` 才是嗅探到的域名。
+5. **relay 侧三个哨兵签名与黑名单自动学习在当前 selector 拓扑下不工作**（`relay_upstream_error` / `relay_upstream_auth_failed` / `relay_google_blocked` + `residential/journal.rs::parse_line`）。两处判据都只认成员直连形状（`outbound/http[resi-N]` / `outbound/socks[resi-N]`），而路由规则指向的是 group（`slot-<i>-pool` / `resi-pool`）⇒ ERROR 只带外层 group 的 tag。两台生产机 14 天取样证实：分界线之后成员直连形状**归零**，一条真实错误行都喂不进去。顶上的只有 `residential::health` 每 120 秒一轮的主动探测（面窄、比哨兵设计的「60 秒 2 条」慢一个数量级）；黑名单那边**连兜底都没有**，只剩每日固定的 12 域名 `PROBE_SET`。**`resi-pool` 那层的盲区是结构性的、一直都在，`slot-<i>-pool` 只是 4.1 新增的同类实例**；裁决是 4.1.1 首个设计项（§14 裁决 ③）。**运维口径：不要以为黑名单自动学习还在正常工作。**
+
+---
+
 ## 8. 哨兵 / watchdog / 自检改动清单
 
 ### 8.1 签名表（`sentinel/signature.rs`）
@@ -489,14 +508,19 @@ Clash API 客户端复用 `modules/residential/clash.rs` 的 `Clash` trait（`re
 |---|---|
 | `hy2_auth_http_failed`（`signature.rs:56`） | **作用域缩为直连**：`classify` 里那个分支的判据从 `unit.starts_with("hysteria-")`（`signature.rs:169`）改成 `unit == "hysteria-server"`——住宅单元不再有 `/auth` 回调，签名在它上面**失去对象**（评估 `sb.facts[7-b-ui现有哨兵签名无法直接复用]`，tizi PoC 复验鉴权失败无日志）。夹具里那条 `hysteria-residential-2` 的断言删除。`watchdog::is_auth_http_failure`（`watchdog.rs:73`）与阈值 `AUTH_HTTP_FAIL_THRESHOLD`（`watchdog.rs:58`）保留，只喂直连的日志 |
 | `kernel_bind_in_use` / `kernel_crash_loop` | 保留（`starts_with("hysteria-")` 的内核判定因为单元名沿用而继续生效，`signature.rs:160`）；对 `hysteria-residential` 的夹具按 sing-box 真机日志重采（下表）。`is_crash_loop` 只看 systemd 文案，不变 |
-| **新** `hy2_resi_relay_unreachable` | `hysteria-residential` 的 `open connection to … using outbound/socks[slot-<i>-out]: … connection refused / i/o timeout` ⇒ relay 或它的 `slot-<i>` 入站不在 ⇒ 60 秒 ≥ 3 条 → `DelegateWatchdog` + 事件。**`outbound/socks[deny]` 的拒绝行一律忽略**（那是被封用户的正常噪音）。relay 侧的 `parse_relay` 只认 `resi-` 前缀的 tag，`slot-<i>-out` / `deny` 天然不会被误认成上游成员 |
+| **新** `hy2_resi_relay_unreachable` | **判据是门 selector 形态**（2026-09-18 T3 真机实测订正，§12 第 10 项副产品）：`hysteria-residential` 的 `... using outbound/selector[gate-<id>]: dial tcp 127.0.0.1:<port>: connect: connection refused` ⇒ 60 秒 ≥ 3 条 → `DelegateWatchdog` + 事件。**成员 tag 不出现在 ERROR 行里**——路由规则指向的是 `gate-<id>` 这个 selector，`route/conn.go` 拼 `using <dialerString>` 时 dialer 就是 selector，带 `outbound/socks[slot-<i>-out]` / `outbound/socks[deny]` 的只有它自己那条**无不可达标记的 INFO**。所以 deny 噪音与「拨不通槽」只能靠 reason 里的**回环端口**区分：`127.0.0.1:1`（`DENY_DIAL_PORT`）⇒ 被封 / 到期用户的正常噪音，判 `None`；落在 `RELAY_SOCKS_BASE..+MAX_SLOTS`（2080–2087）⇒ 拨不通那个槽 ⇒ 签名。TCP 打 `open connection to <目标> using …`、UDP 打 `listen packet connection using  using …`，两种都要认。1.14.0 无门配置的成员出站形态保留双认。**早先写成 `outbound/socks[slot-<i>-out]` 是错的**：真机上不存在「既含它又含不可达标记」的行 ⇒ 这条签名曾经永不触发（漏报），而单测因为喂的是同一份写错的夹具而全绿 —— 测试绿 ≠ 判据有效 |
+| ~~relay 侧三签名 `relay_upstream_error` / `relay_upstream_auth_failed` / `relay_google_blocked`~~ + 黑名单自动学习（`residential/journal.rs::parse_line`） | **在当前 selector 拓扑下不工作（全盲）**，本期不修：`parse_relay` 与 `parse_line` 都要求 `kind ∈ {http, socks}` 且 `tag` 以 `resi-` 开头（成员直连形状），而 `render/relay.rs` 现在没有任何一条路由规则直接指向成员——全部先落 `slot-<i>-pool`（split）或 `resi-pool`（DNS / global），于是 ERROR 只带外层 group 的 tag（`selector[slot-N-pool]` / `urltest[resi-pool]`）。两台生产机 14 天取样：分界线（≈09-12~09-15）之后成员直连形状**归零**。详见 **§14 裁决 ③**（非 4.1 回归、不进 4.1.0、4.1.1 首个设计项）与「已知限制」 |
 | **新** `hy2_resi_gate_sync_failed` | `b-ui` 自己的 `USER_SYNC_FAILED_LOG` 行且错误含 `Clash API 不可达` / `拒绝切换`（`ClashError` 两种文案，`clash.rs:30-36`）⇒ 150 秒 ≥ 2 条 → `RetryUserSync`（与 `xray_grpc_unavailable` 同预案：9092 在听就立刻重跑一轮收敛） |
 | **新** `hy2_resi_gate_replay_failed` | 非日志签名，由 §3.4 的重放直接记事件 + 告警，恢复即清 |
 | **新** `hy2_resi_pool_low` | 巡查类（同 `upstream_long_unreachable`）：空闲凭据 < 20% 一次性告警 |
 | **新** `nft_table_missing` / `nft_missing` | watchdog 发现 `inet bui` 不存在或规则不符 ⇒ 重放 + 记事件；`which nft` 为假 ⇒ 告警（10 分钟冷却） |
 | ~~`resi_slot_port_changed`~~ | **本表不动它**：它不是 `Sig` 成员，而是 `residential/upstream.rs:20` 的事件签名常量，随 §4.2 的「必须重新获取订阅」机制一起退役 |
 
-**要按 sing-box 真机日志重采的夹具**（阶段 0 在 tizi sidecar 上采 `journalctl -u <单元> -o cat`，每条一个单测常量）：① 启动行 + `inbound/hysteria2[hy2-resi]: udp server started at [::]:40000`；② 成功连接两行（tizi 实测形态：`inbound connection from <ip>:<port>` 与 `[r000] inbound connection to <host>:<port>`）；③ `bind: address already in use` 的 FATAL 行（sing-box 措辞待采）；④ systemd 崩溃循环两行（与今天相同）；⑤ 到 relay 的拨号失败行；⑥ `deny` 噪音行（必须判 `None`）；⑦ `clash-api: restful api listening at 127.0.0.1:9092`；⑧ v2ray_api 起监听行（要自建二进制才有）。
+**按 sing-box 真机日志采的夹具**（`sentinel/fixtures_hy2_resi.rs`，每条一个单测常量；**2026-09-18 已在 `bwg-tizi` sidecar 上按自建 1.14.1 采完并合入 `cd430ff`**）：① 启动行 + `inbound/hysteria2[hy2-resi]: udp server started at [::]:40000`；② 成功连接两行（实测形态：`inbound connection from <ip>:<port>` 与 `[<凭据 name>] inbound connection to <host>:<port>` —— **方括号里是凭据 `name`，迁移用户就是他的中文用户名**，夹具里三条非 ASCII 合成名与 `alice` 各一条）；③ `bind: address already in use` 的 FATAL 行；④ systemd 崩溃循环两行（与今天相同）；⑤ 到 relay 的拨号失败行（**门 selector 形态**，见上一行的判据）；⑥ `deny` 噪音行（同一形态、端口 1，必须判 `None`）；⑦ `clash-api: restful api listening at 127.0.0.1:9092`；⑧ v2ray_api 起监听行（要自建二进制才有；实跑原文与源码推断的正文逐字一致，只差端口）。
+
+**另外要加白的一行**（§3.5 第 3 件、§12 第 9 项）：证书热加载的中间态 `ERROR ... reload certificate: reload key pair: tls: private key does not match public key` 是每次正常轮换**必然**出现的（写盘是 tmp+rename、先 cert 后 key），紧跟着才是 `INFO ... reloaded TLS certificate`。哨兵不许把它报成事件。
+
+**journald 原文带 ANSI 色码**（`-o cat` 里 level 处是 `^[[36mINFO^[[0m` 这种），匹配前必须先剥 `\x1b\[[0-9;]*m`；时间戳形态是 `<tzoffset> <date> <time>`。
 
 ### 8.2 watchdog（`modules/watchdog.rs`）
 
@@ -577,26 +601,38 @@ Clash API 客户端复用 `modules/residential/clash.rs` 的 `Clash` trait（`re
 - ~~**与 apernet 共存**：与生产现有 9 张 `hysteria_*` nft 表同族共存无冲突，期间生产五单元全程 active~~ ✅ 已验证（24 小时长跑未做，由阶段 4 的 24 小时观察涵盖）
 - ~~**配置形状过 `check`**：hysteria2 入站 + `users[{name,password:"r000:<pw>"}]` + salamander obfs + masquerade proxy + 生产证书 + `ignore_client_bandwidth` + 三个 selector 门 + 两条 `auth_user` 规则 + `clash_api`；route 用传统 `"outbound"` 字段即可~~ ✅ 已验证（1.14.0）
 - ~~**到期语义**：默认门 deny 的用户握手成功、请求全 000~~ ✅ 已验证
-- ~~**日志可用性**：日志带用户名（`[r000] inbound connection to …`）；鉴权失败仍无日志 ⇒ `Hy2AuthHttpFailed` 对住宅单元失效~~ ✅ 已验证
+- ~~**日志可用性**：日志带用户名（`[<凭据 name>] inbound connection to …`）；鉴权失败仍无日志 ⇒ `Hy2AuthHttpFailed` 对住宅单元失效~~ ✅ 已验证
 - ~~**内存**：sing-box 单进程 61.8 → 65.2 MB；apernet 每实例 28.1 MB ⇒ 3 槽起更省~~ ✅ 已验证
 
-剩下要验的：
+**阶段 0（T3）已于 2026-09-18 跑完**，逐项结论见结果文件
+`scratchpad/t3/RESULTS-stage0.md`（**不入库**）与各 item 的 `RESULT.md`。下面每一项都按实测结论改写；
+**已验的划掉**，只留真正未知的那几半。
 
-1. **三种客户端矩阵（最高优先）**：v2rayN（默认内核）、mihomo、`bui-c`（sing-box 客户端 `server_ports: ["50001:53000"]` + `hop_interval: "30s"`）对 `password="<名>:<密码>"` 与**共享整段**的互通。每种连 sidecar 跑 30 分钟持续请求。判据：客户端 `connected` 计数 = 1、服务端日志里源端口变化 ≥ 10 次且无错误行；同时验**中文用户名**凭据握手通过。
-2. **`nft` 跨发行版**（**已部分实测，2026-09-16**：`bwg-rick` Ubuntu 26.04 LTS 无 `nft`、nftables 包未装、`nftables.service` 为 `not-found`；`bwg-tizi` 同版本有 nftables 1.1.6 且服务 `disabled`。结论：Ubuntu 云镜像不预装，缺失是常态而非边缘情形）：其余发行版仍待验——Ubuntu 22.04 / 24.04、Debian 12、CentOS Stream 9 上 `which nft` / `nft --version`、`inet` 族 nat 链对 `redirect` 的支持、`nft -f` 单事务「declare + flush + define」是否原子；记最低可用版本。
-3. **v2ray_api gRPC**：sing-box `experimental/v2rayapi` 的 proto package 名与 `QueryStats(reset=true)` 语义（以源码为准）；用自建二进制 + `grpcurl` 打一次，确认键形如 `user>>>alice>>>traffic>>>uplink`。同时验 `experimental.v2ray_api` 段能过自建二进制的 `check`（官方 1.14.0 上必然 FATAL，无法在 tizi 现有二进制上验）。
-4. **自建标签集**：官方同版本归档 `sing-box version` 的 `Tags:` 作为基线写进 `SINGBOX_TAGS`；自建 ⊇ 基线 + `with_v2ray_api`；`-checklinkname=0` 是否必需。
-5. **可重现构建**：同 tag、同 Go 版本、两次构建 ⇒ amd64 与 arm64 的 sha256 各自一致。
-6. **体积与客户端**：自建 vs 官方二进制体积差；`bui-c` 用自建二进制 `sing-box check` + 连四个节点。
-7. **QUIC 空闲超时字段名**：hysteria2 入站是否接受 `idle_timeout`（或对应名）以对应今天的 `quic.maxIdleTimeout: 60s`；`check` 对未知字段 FATAL，一试便知。
-8. **凭据池上限**：**256** 凭据 + 256 门 + 256 规则的空载 RSS 与 `check` 耗时（128 已实测不涨）。上限已由 §14 裁决 2 从 512 压到 256，这一项按 **256** 量，只是复核余量。
-9. **证书热加载**：替换 `certs/` 下的文件后 sing-box 是否自动重载 ⇒ 决定 §3.5 第 3 条那次重启能否省掉。
-10. **`interrupt_exist_connections` 对 UDP**：门切 `deny` 后既有 UDP（如到目标站的 QUIC）是否也被掐断；`DELETE /connections/{id}` 对 UDP 条目的行为。
-11. **`deny` 日志速率**（§14 裁决 4 把这一项留作裁决依据：**实测后裁**）：一个被封用户持续请求 10 分钟，`journalctl` 行数/分钟（§11 #10 的判据）。超过 relay 今天的量级就动退路——把 `deny` 换成本机 blackhole 端口，或把 `log.level` 降 `warn`；本期一个字不预先改。
-12. **`{"action":"sniff"}` 是否保住今天的语义**：apernet 侧 `sniff.rewriteDomain: true` 会把目标改写成嗅探到的域名再交给 relay；要确认 sing-box 的 sniff action 之后，socks 出站发给 relay 的目标**是域名而不是 IP**（否则 relay 的 split 关键字分流会失配，住宅流量悄悄走直连）。判据：relay 日志里看到域名 + split 模式下命中关键字。
-13. **回归事故的丢包机制**（补证，不阻塞实施）：跨进程的跳跃包是被静默丢弃还是收到 stateless reset；决定「静默丢包 → 30 秒 idle 超时」这句描述的精确措辞。
+1. ~~**三种客户端矩阵（最高优先）**：v2rayN（默认内核）、mihomo、`bui-c`（sing-box 客户端 `server_ports: ["50001:53000"]` + `hop_interval: "30s"`）对 `password="<名>:<密码>"` 与**共享整段**的互通~~ **PARTIAL（2026-09-18）**：
+   - **腿 A**（官方 sing-box 1.14.1 跑渲染器 mixed 配置 = `bui-c` 那一腿的等价体，凭据 name 是**中文**）：`03:08:02Z–03:38:00Z` 每 5 秒一次请求，共 **335 次：332 次 204**；3 次 `000` 全部落在 `03:18:05/03:18:11/03:18:16Z`，是**人为把门切 `deny`** 的到期语义复验，切回后下一次请求即恢复；客户端日志无 `reconnect` / `connect error` / `FATAL` 任一行 ⇒ **零重连**。
+   - **腿 B**（mihomo v1.19.31，凭据 ASCII name，`ports: "50001-53000"` + `hop-interval: 30` + 真证书，绑网卡直出）：`03:26:46Z–03:56:42Z` 共 **335 次请求全部 204**，客户端 790 行日志零 error/fail。
+   - **中文 / 含空格凭据：PASS** —— `bwg-tizi` sidecar 真机上，非 ASCII name（含一条带空格与 U+00B7 中点的）在 `users[].name` / `auth_user` / `stats.users` 三处一字不改地工作：`check` 退 0、握手成功、路由命中、`QueryStats` 按用户计量正常。**这是本部署的主线**（迁移用户的凭据 `name` = 中文用户名，§3.1）。
+   - **旧腿 B 作废**：早先那条经本机 `bui-tun` 双隧道的腿 113 次请求里 25 次超时（10–15 s），失败归因不到被测对象，整腿作废、只留作「双隧道叠加放大超时」的旁证。
+   - **未跑 / 待补**：**v2rayN 腿未跑**（主理人未回复；pcap 里没出现第三条连接，按「未出现」记）；**「源端口变化 ≥ 10 次」这半尚未判定** —— 两个 `ss` 采样文件是空的，唯一证据是 pcap（按 QUIC DCID 分组数握手簇与跳跃次数），**以矩阵终报告为准**。
+2. ~~**`nft` 跨发行版**~~ **PASS（2026-09-18，docker 四发行版）**：Ubuntu 22.04（nft **1.0.2**）/ 24.04（1.0.9）/ Debian 12（1.0.6）/ CentOS Stream 9（1.0.9）四者对 `apply` 实际喂给 `nft -f -` 的那份规则集（与 `render::nft` 的黄金测试**逐字节相同**）全绿：`nft -c -f` 预检、落地、**重放幂等**（规则不翻倍）、compat 开 4 条 / 关 2 条、删表清净，每步 rc=0。**实测最低可用用户态版本 = 1.0.2**。**四个基础镜像无一预装 `nft`** ⇒ 安装 / 升级的硬闸门必须对所有受支持发行版一律生效（叠加已知事实：`bwg-rick` 的 Ubuntu 26.04 云镜像不预装、`bwg-tizi` 是 1.1.6）。一处纯显示层差异：输入 `priority -100`，`nft list` 回显在 1.0.2/1.0.6 上 prerouting 是 `dstnat`、output 是 `-100`，1.0.9 上两条都是 `dstnat` —— 当前判据只数 `udp dport` 行与表存在性，不受影响；将来若加 priority parity 检查必须同时容忍两种回显。内核（文档值）：5.15 / 6.8 / 6.1 / **5.14**，四者均 ≥ 5.2。
+3. ~~**v2ray_api gRPC**~~ **PASS（2026-09-18）**：真实服务路径 = **`/v2ray.core.app.stats.command.StatsService/QueryStats`**（候选 `experimental.v2rayapi.StatsService` 回 `Unimplemented`）；**v2ray_api 面没有注册 gRPC 反射**（`grpcurl list` 回 `server does not support the reflection API`）⇒ 服务名靠「两候选路径对打」判定、grpcurl 必须自带 proto。`QueryStats` **只读重复字段 `patterns`**，deprecated 的单数 `pattern` 一个字都不看；**`patterns` 为空 ⇒ 无过滤返回全部，且 `reset=true` 时把 `inbound>>>` 等全部计数器一起清零**（清零那一半**受 `reset` 门控**，`reset=false` 时返回全表但不清 —— 注释已按此订正，`4a7225e`）。计数器键 = **`user>>>{凭据 name}>>>traffic>>>uplink|downlink`**，可复用 `xray::parse_user_counter`；中文 name 同样命中。`experimental.v2ray_api` 段过自建二进制 `check`：本机与 `bwg-tizi` 真机各 rc=0。**未验**：计数器跨内核重启是否存活；`outbound>>>` 计数器整轮未出现。
+4. ~~**自建标签集**~~ **PASS（2026-09-18）**：`comm` 双向差只有一项 ⇒ **自建 = 官方 18 个 tag + `with_v2ray_api`**，与 `kernel-versions.env` 的 `SINGBOX_TAGS` 口径一致。**`-checklinkname=0` 非必需**：受控构建里唯独去掉它，构建成功且 sha **与基线完全一致**（两个源码级 tag `badlinkname` / `tfogo_checklinkname0` 已让越权 linkname 合规）；脚本仍带它，是因为它随上游 `release/LDFLAGS` 一并读入、与官方 Makefile 逐字一致。
+5. ~~**可重现构建**~~ **PASS（2026-09-18）**：amd64 `5fca8139…` == `kernels.lock` 第 5 行 == T1 于 2026-09-16 的独立构建（`cmp` 字节相同）== 今日 CI 的冷缓存产物；arm64 `26aff63b…` == lock 第 6 行。受控构建四变体证明差异只由 ldflags 来：去掉 `-X runtime.godebugDefault=…` 会**字节级复现**历史那份异常产物，而那份是脚本入库前的未提交草稿（mtime 早于最早提交），与当前脚本无关。
+6. **体积与客户端：PARTIAL**。体积 **PASS**：官方 amd64 `81236197 B` vs 自建 `81314048 B` ⇒ **+77851 B（+0.096%）**，来自多出的 `with_v2ray_api` 代码 + 工具链差（官方 go1.26.8 / 自建 go1.25.5）。**arm64 体积未比**（本机没有官方归档，按纪律不下载）。**`bui-c` 用自建二进制 `sing-box check` + 连四个节点：未验**，留着。
+7. ~~**QUIC 空闲超时字段名**~~ **PASS（2026-09-18，源码 = 被测二进制同一提交）**：字段名就是 **`inbounds[0].idle_timeout`**（`badoption.Duration`，来自 `option/hysteria2.go` 嵌入的 `QUICOptions` → `HTTP2Options.IdleTimeout`），配套 `keep_alive_period`；`max_idle_timeout` / `quic_max_idle_timeout` 各回 `json: unknown field` FATAL；`udp_timeout` 合法但语义不同（UDP NAT 会话超时，默认 5 min）。**渲染器不写这个字段 = 主动吃默认值**：`sing-quic v0.7.0` 的 `DefaultMaxIdleTimeout = 30s` / `DefaultKeepAlivePeriod = 10s`。于是住宅这条是 **30 s**、直连那条 apernet 被写死 **60 s**（`render/hysteria.rs:60`）—— **这个不对称实际上等效**：RFC 9000 §10.1 规定连接的空闲超时取**双方通告值的较小值**，一端 30 s 另一端 60 s 时实际就是 30 s；且服务端默认 keepalive 10 s 远小于 30 s，不会误断连。真实差别只在「客户端静默且不发 keepalive」的场合：连接在 30 s 而非 60 s 后被回收，表现为下一次请求多一次握手，不是断网。**未验**：没测长连接在 30 s 空闲后是否真被回收；没核对 apernet 那 60 s 的由来。
+8. ~~**凭据池上限**~~ **PASS（2026-09-18，按 256 量）**，绝对数如下（同机同二进制）：配置文件 **148138 B**（32 条池 20458 B）、结构 `outbounds 265 / rules 257 / users 256`；**`run` 空载 RSS 61796 kB（60.3 MiB）→ 64720 kB（63.2 MiB）**，+2924 kB（**+4.73%**，三次采样完全一致）；`check` 期间 Max RSS 56312 → 60052 kB（+6.6%）；**`check` wall 27.1 ms → 39.5 ms**（20 次均值，+12.4 ms / **+45.8%**）。每条凭据常驻 ≈ **11.4 kB** ⇒ 256 条池只有 63.2 MiB，`POOL_MAX = 256` 的余量复核通过。**判据措辞要改**：`check` 耗时按「±10% 内」这个字面判据不算「不涨」，但 40 ms 的绝对值对对账器（每次 reconcile 至多一次 `check`）无意义 ⇒ 判据应改成**绝对量 `< 100 ms` / `< 5 MiB`**，±10% 在 30 ms 基线上没有意义。旁证：32 条池实测 61796 kB 与上面已划掉那条「61.8 MB」逐位吻合。
+9. ~~**证书热加载**~~ **PASS（2026-09-18）**：sing-box 1.14.1 的 hysteria2 入站自己 watch 证书文件，新握手 **≤ 0.16 s** 用上新证书（细测 0.15/0.30/0.50 s 三档全 OK），**既有连接零影响**（覆盖 10 次换证的 31 次请求 31/31 = 200，客户端无重连行）；非原子轮换（key 晚落 3 s）期间旧证书对继续服务、失败的 reload 被自己丢弃、不留半截状态。⇒ **§3.5 第 3 条那次重启省掉了**：`certs.rs` 已改成「确认热加载（journald 见 `reloaded TLS certificate`），10 s 内没见才回退重启」（`a774f3b`，合入 `45cbdca`）。**未验**：`hysteria-server`（apernet，`CanReload=no`）是否热加载 —— 不在范围，仍无条件重启；生产上 Caddy → `certs/` 的真实轮换路径（不许 ssh）；不同内核 / 文件系统的 inotify 行为；证书过期 / 多级链 / ECDSA↔RSA 切换。
+10. ~~**`interrupt_exist_connections` 对 UDP**~~ **PASS（2026-09-18）**：门切 `deny` **立刻掐断既有 UDP**（50 ms 采样档下，切换后 **40 ms** 内发出的第一个包就收不到回显），既有 TCP 同时被掐（下一次读即 EOF）；切完 2 秒查 `/connections` **数组为空**。解封同样立刻：`PUT` 返回后 **8–9 ms** 的包就通，**不要求客户端重新 associate**。**`DELETE /connections/{id}` 对 UDP 条目：返回 204、服务端条目确实消失，但不掐用户的流量 —— 零丢包**（客户端的 SOCKS UDP association 活着，下一个数据包在服务端**透明重建一条新 session（新 id）**并继续走同一个门）⇒ **不能把它当作切断 UDP 的手段**，UDP 的强制只有门切换；同一个 DELETE 打在 TCP 条目上则立刻可见（EOF + 重连）。**副产品（已修）**：真机 ERROR 行的出站段是 `outbound/selector[gate-<id>]` 而非成员出站 ⇒ 旧夹具与判据写错、`Hy2ResiRelayUnreachable` 曾永不触发（`f678862`，合入 `cd430ff`，见 §8.1）。
+11. ~~**`deny` 日志速率**~~ **PASS（2026-09-18，已量出数；裁决 = 保持现状，§14 裁决 ②）**：**每条被拒请求恒定 4 行**（不是原先写的「一行」）—— 2 条入站 INFO（含那条带用户名的 `[<name>] inbound connection to …`）+ 1 条 `outbound/socks[deny]` 的 INFO + 1 条 ERROR；逐分钟计数完全线性、无聚合去重。三档实测：高并发 **13.00 req/s ⇒ 3120 行/分钟**（峰值 3136）；温和 0.76 req/s ⇒ **182 行/分钟**；**UDP 10 包/秒 ⇒ 2400 行/分钟（每个数据包 4 行，无摊销）**。单元的 `LogRateLimitIntervalSec=10s` + `Burst=200` = **1200 行/分钟** ⇒ 高并发档是上限 **2.6 倍**、UDP 档 2 倍：journald **不会被撑爆但会丢**，而**限速是按单元的** ⇒ 一个被封用户就能吃光配额、连带丢掉同窗口其他用户的排查线索（已知限制第 3 条）。与 relay 今天量级的直接比较**未验**（禁 ssh）；同内核的结构性对照是「成功流量每条连接 3 行且按连接摊销」⇒ 量级差一到两个数量级。
+12. ~~**`{"action":"sniff"}` 是否保住今天的语义**~~ **PASS（2026-09-18），但原判据写错、已改写**。原文要求「确认 socks 出站发给 relay 的目标**是域名而不是 IP**」—— 实测在客户端本地解析时**就是 IP**，而 split 照样命中池。**正确判据两条**：(a) `relay::config` 的 `route.rules[0]` 必须是 `{"action":"sniff"}`（守门 `kernel_relay.rs:60`，`7d2ba4f` 又给 split 用例补了一条同款断言）；(b) sing-box 的 `domain_keyword` / `domain` / `domain_suffix` **优先匹配 `metadata.Domain`（本跳嗅探结果）**、才退回 `Destination.Fqdn`（源码 `route/rule/rule_item_domain_keyword.go`）—— 即 **relay 自己那条 `rules[0]` sniff 才是分流的生命线**，住宅内核那一侧嗅到什么都传不到 relay（sniff 动作不改写连接目标）。对照实验坐实：摘掉 relay 那条后，客户端发 IP 的流量**悄悄走直连**。顺带：`override_destination: true` 在 1.14.1 上**根本配不上**（`RouteActionSniff` 只有 `sniffer` / `timeout`，实测 `unknown field` FATAL；legacy 的 `sniff_override_destination` 整块被拒；Go 层那个字段 3 处读、**0 处写**）。**衍生裁决**：住宅这一侧那条裸 sniff 已按 §14 裁决 ① 删掉（§2.3）。**未验**：QUIC/h3 端到端（本机 curl 无 `--http3`；混池下 relay 的 `udp/443 reject` 在 split 规则之前命中 ⇒ 这条路径对生产这一支**不适用**）；全 socks5 池（`udp_via_pool=true`）那一支的 UDP/QUIC 分流。
+13. **回归事故的丢包机制：PARTIAL**（补证，不阻塞实施）。**30 秒常量已核实**：`sing-quic v0.7.0` `hysteria/protocol.go:20` `DefaultMaxIdleTimeout = 30 * time.Second` ⇒ §1.1「静默丢包 → 30 秒 idle 超时」这句里的 30 秒成立。**丢包机制本身仍未验**：跨进程的跳跃包是被静默丢弃还是收到 stateless reset，本轮没做。
 14. ~~**既有缺陷核实（另案）**：生产上 apernet 建的是 `hysteria_*` **nft 表**，而 `portjump.rs` 只扫 iptables 的 `HYSTERIA-PR-*` 链 ⇒ 直连实例的孤儿清理可能是 no-op。~~ **本项已作废（4.0.1 rc2 已修，§14 裁决 7）**：rc2 已加 nft 后端扫描，判据是「表正文 `redirect` / `dnat` 到**本实例 base 端口**」，直连实例的 base `10000` 同样覆盖；2026-09-15 在 `bwg-tizi` 实测孤儿命中 2 → 0、现役表正常重建（§2.4）。**序号保留、不重排**，以免与别处引用错位。
 15. **吞吐：不作为 A/B 判据、不在生产机上重试（已裁决，§14 裁决 8）**。tizi 三轮都没拿到可用数据，原因都不在被测对象上：① 源站（瑞典）下 sidecar 与 apernet **同为 0.5 MB/s** ⇒ 瓶颈在源站/链路；② 换 Cloudflare 源后**直连控制组也是 0.0 MB/s** ⇒ tizi 到该源不通，整轮无效；③ 第三轮脚本在聚合步骤挂死，已 kill 并清理（tizi 上曾遗留一个监听 `:40100` 的 sing-box 与临时目录，已删净，生产八个单元 `NRestarts` 全 0）。结论：吞吐不是 A/B 判据（同 quic-go 家族、服务端都 BBR、无公开基准），spec 如实写**未验**；真要数字就在阶段 0 用一台临时机 + iperf3 双向做，**不要拿 curl 打公共源站**。
+
+**阶段 0 的两项清单外发现**（都在 `RESULTS-stage0.md` 里有原始数据，各有一条裁决）：
+
+- **300 ms 次序死锁**（第 12 项的衍生）：住宅那条裸 `{"action":"sniff"}` 给每条 TCP 流白等一个嗅探超时且**永远嗅不到** ⇒ 裁决 = drop（§2.3、§14 裁决 ①），已合入。
+- **relay 侧三签名与黑名单自动学习在当前 selector 拓扑下全盲** ⇒ 裁决 = 非 4.1 回归、不进 4.1.0、列 4.1.1 首个设计项（§8.1、§14 裁决 ③、「已知限制」第 5 条）。
 
 **staging 方式**：已由主理人定为 **tizi sidecar**，且 tizi PoC 已证明这条路可行、对生产无感，后续阶段**复用同一套隔离端口**（`:40100`、`50001-53000`、Clash API `9192`、v2ray_api `10186`、表名 `inet bui_sidecar`；与生产的 `41000-50000` / `20000-30000` 不重叠）。纪律照 PoC 那次执行：文件放 `/opt/b-ui` 之外（否则漂移扫描报陌生文件）、`nft -f` 前先 `nft -c` 校验、上线前人工核对表内容、防火墙临时放行测完即关、结束自清理并核对生产单元 `NRestarts`。
 
@@ -652,9 +688,10 @@ Clash API 客户端复用 `modules/residential/clash.rs` 的 `Clash` trait（`re
 
 ---
 
-## 14. 主会话终审裁决（2026-09-15）
+## 14. 主会话终审裁决（2026-09-15 八条 + 2026-09-18 六条）
 
-本节是**终审**：八条已拍板，正文已按裁决改写，实施者按正文做，不必回来问。
+本节是**终审**：正文已按裁决改写，实施者按正文做，不必回来问。下面 **1–8** 是 2026-09-15 按设计拍的；
+**§14.9 的 ①–⑥** 是 2026-09-18 拿到 T3 阶段 0 实测数字之后拍的（引用时写「§14 裁决 ①」即指后者）。
 
 1. **不开 sing-box 的 `cache_file`，保持 fail-closed。**
    **裁决**：`hy2-residential.json` 不写 `experimental.cache_file`；重启后每个门回到
@@ -707,3 +744,110 @@ Clash API 客户端复用 `modules/residential/clash.rs` 的 `Clash` trait（`re
    `iperf3` 双向测（§11 #13、§12 第 15 项）。
    **理由**：apernet 与 sing-box 同属 quic-go 家族、服务端都走 BBR、无公开基准；tizi 三轮失败
    的原因都在源站 / 链路上，继续拿 curl 打公共源站只会再产出无效数据。
+
+### 14.9 阶段 0（T3）实测之后的追加裁决（2026-09-18，编号 ①–⑥）
+
+上面八条是 2026-09-15 按设计拍的；下面六条是 **T3 阶段 0 跑完、拿到实测数字之后**拍的。
+正文已按裁决改写，实施者按正文做。原始数据见 `scratchpad/t3/RESULTS-stage0.md`（**不入库**）。
+
+① **住宅 HY2 的 `route.rules` 去掉裸 `{"action":"sniff"}`（drop，而不是缩短 `timeout`）。**
+   **裁决**：`render::hy2_singbox` 产出的 `route.rules` 只有每凭据一条 `auth_user` 规则，
+   **一条 sniff 都没有**（§2.3）。已落地并合入 v4（`bb14fa4` → `9a1581a`）；验证方式是用**自建
+   1.14.1** 二进制对含 `experimental.v2ray_api` + 空 `rules` 的**完整**配置跑 `check`，退 0。
+   **理由**：这是 Hysteria2 协议与 sing-box 实现的**次序死锁**，不是可以调参数绕开的慢：
+   apernet hysteria 客户端在 fastOpen 关闭时（上游文档默认值为 `false`；本次矩阵对开 / 关各测了
+   一格）要等服务端回 `TCPResponse` 才发首包，而 sing-box 是在 route（sniff 在 `route/route.go:337`
+   的规则匹配里先跑）走完、出站也拨通之后才 `N.ReportConnHandshakeSuccess`（`route/conn.go:122`），
+   那一步才触达 sing-quic 的 `hysteria2` 服务写回 `TCPResponse`（`service.go:403`）。
+   ⇒ sniff 等首包、客户端等响应，必然等满超时且**嗅探成功率恒为 0**。五格实测（25 次/格，
+   apernet 客户端 fastOpen 关，TLS 首字节中位数 / 嗅到域名）：缺省 300 ms 档 **307.1 ms、0/25**；
+   `timeout:"50ms"` **56.6 ms、0/25**；`timeout:"1s"` **1010.6 ms、0/25**；**不 sniff 5.6 ms**。
+   延迟 ≈ 超时值、成功率与超时无关 ⇒ 缩短超时只是缩短白等，**drop 才是唯一有收益的动作**。
+   分流不受影响（靠 relay 自己那条 `rules[0]` sniff，§12 第 12 项）；面板 / CLI 不受影响
+   （归户只读 `rule` / `chains` / `id`，`metadata.host` 全仓一处都没读）。
+   附：sing-box 当客户端时先发首包、同一格 5.9 ms、25/25 嗅到域名；对照格 E = apernet
+   **服务端** + `sniff.rewriteDomain` 两种客户端都是 5 ms 级 ⇒ 这是 sing-box 这个实现的次序，
+   不是 Hysteria2 协议本身的代价。
+
+② **`deny` 的日志噪音：保持现状（本期一字不改），把数字写进 spec。**
+   **裁决**：§14 裁决 4 那条「实测后再裁」到此结案 —— **维持现状**，两条退路都不进本期。
+   §11 #10 与 §2.2 里「每个请求打一行」的口径改成**实测的 4 行**，并补 UDP 那一格。
+   **数字**（2026-09-18）：每条被拒请求恒定 **4 行**（2 条入站 INFO + 1 条 `outbound/socks[deny]`
+   的 INFO + 1 条 ERROR），UDP 是**每个数据包 4 行、无摊销**；13.00 req/s ⇒ **3120 行/分钟**
+   （峰值 3136），0.76 req/s ⇒ **182 行/分钟**，10 包/秒 ⇒ **2400 行/分钟**；单元
+   `LogRateLimitIntervalSec=10s` + `Burst=200` 的上限是 **1200 行/分钟** ⇒ 高并发档超 **2.6 倍**、
+   UDP 档超 2 倍。
+   **理由**：按裁决 4 的字面判据（「超过 relay 今天的量级就动退路」）确实超了一到两个数量级，
+   但三条路的性价比差得很远：① 限速已把落盘量钉在 1200 行/分钟，**磁盘与 journald 安全**；
+   ② `deny` 行实测不会造成哨兵误报；③ 被封用户在生产里是少数且短暂。两条退路：换 blackhole
+   端口只能把 4 行压到 3 行（ERROR 没了、三条 INFO 还在），收益最小、还要多一个常驻监听，
+   **不做**；降 `log.level` 到 `warn` 能压到 1 行，但吃掉 §6 那条带用户名的排查线索。
+   **残余风险明确记下**（已知限制第 3 条）：限速按单元 ⇒ 一个被封用户能吃光配额、连带丢掉
+   同窗口其他用户的排查线索。真要动，优先级是**降 `warn` > blackhole**，且只在「生产上真出现
+   被封用户导致排查线索丢失」这个具体事故之后再动。
+   **新事实**（改变了裁决 4 里的代价估算）：真正想留的是那条带用户名的 INFO，而故障检测要认的
+   是 ERROR ⇒ 降 `warn` **不会**削弱故障检测，只削弱人工排查。
+
+③ **relay 侧三签名与黑名单自动学习的 selector 盲区：列为 4.1.x 设计项，不阻塞 4.1.0。**
+   **裁决**：`relay_upstream_error` / `relay_upstream_auth_failed` / `relay_google_blocked` 与
+   `residential/journal.rs::parse_line`（黑名单候选自动学习）在当前 selector 拓扑下**全盲**，
+   **本期（4.1.0-rc1 及 4.1.0 正式版）不修**，列为 **4.1.1 的第一个设计项**。
+   CHANGELOG 与 spec 的「已知限制」**如实写**「relay 侧三签名与黑名单自动学习在当前 selector
+   拓扑下不工作」，不掩饰。
+   **盲区范围**（两台生产机 14 天取样 + 源码定性）：`parse_relay` 与 `parse_line` 都要求
+   `kind ∈ {http, socks}` 且 `tag` 以 `resi-` 开头（**成员直连**形状），而 `render/relay.rs`
+   现在没有任何一条路由规则直接指向成员 —— 全部先落 `slot-<i>-pool`（split）或 `resi-pool`
+   （DNS / global）。sing-box 的 `route/conn.go:113-117` 只把**路由选中的那个 outbound** 的
+   `Type()`/`Tag()` 拼进 ERROR，而 `Selector.NewConnection`（`selector.go:161-168`）/
+   `URLTest.NewConnection` 在成员不实现 `adapter.ConnectionHandler` 时传下去的是 **`s` 自己** ⇒
+   唯一那条 `open connection to … using outbound/…` ERROR 永远只带外层 group 的 tag。
+   真机分布：`bwg-rick` 78249 条 / `bwg-tizi` 46100 条 ERROR·WARN，量最大的一类是
+   `using outbound/urltest[resi-pool]: socks5: request rejected, code=<n>`（各 2.4 万 / 2.0 万条）；
+   分界线（≈09-12~09-15）之后**成员直连形状归零**，一条真实错误行都喂不进去。
+   **`resi-pool` 那层的盲区是结构性的、一直都在（它从一开始就是 group），`slot-<i>-pool`
+   只是 4.1 新增的同类实例** —— 这正是「非 4.1 回归」的依据。
+   **最小修法方向**（4.1.1 的设计输入）：**路径 A（无 I/O）** —— `reason` 形如
+   `dial tcp <ip>:<port>: …` 时那个地址就是成员自己的 `host:port`，把 `kind` 白名单放宽到也接受
+   `{selector, urltest}`（`tag` 收窄到 `resi-pool` / `slot-<i>-pool`），按地址匹配 `g.upstreams`
+   归因；**路径 B（查 Clash API）** —— pool tag 且路径 A 没归因时 `GET /proxies/<pool-tag>` 取
+   `.now`、再走既有的 `clash::id_of_tag`，覆盖真机量最大的协议层被拒（`socks5: request rejected`
+   / `unexpected status` / `authentication required` / `unexpected EOF`，这些 reason 里不含成员地址）
+   与黑名单的主要信号。`Clash` trait 已有 `selected()`，`resi.rs` / `slots::borrow_now` 完全不用动
+   （它们只认 `Uuid`）；归因层加在 `run.rs::tick()`（每 tick 至多 `MAX_SLOTS + 1` 次预取），
+   `classify()` 保持纯函数。
+   **实现前必须想清的风险**：5 秒窗口内 `now` 被巡检抢先切换会误归因 —— 哨兵那边代价不对称、
+   可接受（白探测一次，健康成员不会被误下线）；**黑名单那边风险更明确**（误记会把某域名的拒绝
+   记到错的上游头上），要跑「高频借用 / 切换期间灌大量日志」的对抗测试，并先核
+   `CONFIRM_NEEDED` / `CONFIRM_MIN_GAP_SECS` 的容错空间。另外**顺手给 relay 落一份真机原文夹具**
+   （比照 `fixtures_hy2_resi.rs`）：现有 relay 测试全是手工拼的成员直连形状，绿灯正是这次盲区
+   能潜伏到今天的原因 —— **测试绿 ≠ 判据有效**。
+
+④ **证书轮换省掉住宅那次重启。**
+   **裁决**：`certs.rs` 改成「写完证书后确认住宅实例热加载（journald 里见
+   `inbound/hysteria2[hy2-resi]: reloaded TLS certificate`），**10 s 内没见才回退重启**」；
+   `hysteria-server`（apernet，`CanReload=no`）仍无条件重启。`RESTART_GAP_SECS` 从「两实例错峰
+   间隔」转用作这个确认时限。已落地（`a774f3b`，合入 `45cbdca`），§3.3 表与 §3.5 第 3 条已改写。
+   **理由**：实测 sing-box 1.14.1 的 hysteria2 入站自己 watch 证书文件，新握手 **≤ 0.16 s** 用上
+   新证书、**既有连接零影响**（10 次换证、31/31 请求 200、客户端无重连行），非原子轮换期间旧证书
+   对继续服务且不留半截状态。住宅 HY2 用户从此证书轮换 **0 中断**；保留「确认不到就重启」这半，
+   是因为热加载依赖 inotify，不同内核 / 文件系统未逐一验过，失败方向必须是「重启一次」而不是
+   「悄悄用着过期证书」。
+   **配套**：每次轮换**必然**先出一条 `ERROR … reload certificate: reload key pair: tls: private
+   key does not match public key`（我们写盘是 tmp+rename、先 cert 后 key，中间态必现），哨兵必须
+   加白（§8.1）。
+
+⑤ **`check` 耗时的判据从「±10% 内」改成绝对量。**
+   **裁决**：凭据池规模相关的性能判据写成**绝对量 `check < 100 ms` / 空载 RSS 增量 `< 5 MiB`**，
+   不再用「±10% 内」（§12 第 8 项）。
+   **理由**：256 条池实测 `check` 27.1 → 39.5 ms（+45.8%，按字面不算「不涨」）、空载 RSS
+   60.3 → 63.2 MiB（+4.73%）。40 ms 的绝对值对对账器（每次 reconcile 至多一次 `check`）没有意义，
+   而 ±10% 定在 30 ms 的基线上也没有意义 —— 判据应该量的是「会不会拖慢对账 / 吃掉 VPS 内存」，
+   那是绝对量的事。`POOL_MAX = 256` 的余量按绝对量复核**通过**（每条凭据 ≈ 11.4 kB）。
+
+⑥ **26 小时窗口（`2026-09-15-bui-c-account-match-design.md` §12.5 路径 A）跳过。**
+   **裁决**：主理人 2026-09-18 决定**不等**那 ≥ 26 小时，直接进 4.1 的升级演练与发布
+   （plan Task 19 已记一行）。
+   **理由**：4.1 对旧订阅**零刷新**（§7.3 / §7.5），所以那个窗口保护的只剩一种情形 ——
+   「还没升到 4.0.2 的**未知**客户端在窗口内从面板重新导入」；而已知的两台客户端**都已经是
+   4.0.2**，窗口对它们没有任何作用。为一个已知为空的集合等 26 小时不值得，
+   代价（等待）确定、收益（未知客户端）为零。
