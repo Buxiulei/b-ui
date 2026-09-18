@@ -282,26 +282,60 @@ pub fn parse_relay(message: &str) -> Option<(String, String, u16, String)> {
 
 /// 住宅 HY2 入站（sing-box）那一路：拨不通 relay 的槽入站 ⇒ 签名；`deny` 的拒绝行 ⇒ 噪音。
 ///
-/// 判据只认「出站 tag + 不可达原因」，**不认正文前半句**：sing-box 对 TCP 打
-/// `open connection to <目标> using outbound/socks[<tag>]: <原因>`，对 UDP 打
-/// `listen packet connection using  using outbound/socks[<tag>]: <原因>`
-/// （`route/conn.go`，两种形态都在 `fixtures_hy2_resi` 里），只认前者会漏掉 UDP 那一半。
-/// 两个 tag 的形状由 [`bui_schema::render::hy2_singbox`] 的 `slot_out_tag` / `DENY_TAG` 决定。
+/// **生产形态**（2026-09-18 tizi sidecar 自建 1.14.1 真机，RESULT-up.md）：每条凭据一个
+/// `gate-<id>` selector 门，成员是 `deny` 与 8 个 `slot-<i>-out`。选中的成员拨号失败时，
+/// refused 的 ERROR 行挂在最外层的**门 selector** 上（`... using outbound/selector[gate-<id>]:
+/// dial tcp 127.0.0.1:<port>: <原因>`），成员 tag 只出现在它自己的 INFO 行里。所以判据认
+/// `outbound/selector[gate-` 并靠 `dial tcp 127.0.0.1:<port>` 里的回环端口区分：端口 =
+/// [`DENY_DIAL_PORT`]（1）⇒ deny 噪音；落在 `RELAY_SOCKS_BASE..+MAX_SLOTS`（2080..2088）⇒
+/// 拨不通某个槽入站。
+///
+/// **1.14.0 无门配置的成员出站形态**（`outbound/socks[slot-<i>-out]` / `outbound/socks[deny]`）
+/// 保留双认：那种配置生产不再出现，但两种形态都认。TCP 打 `open connection to <目标> using
+/// outbound/<...>: <原因>`，UDP 打 `listen packet connection using  using outbound/<...>: <原因>`
+/// （`route/conn.go`，`fixtures_hy2_resi` 里 TCP / UDP 各有），只认前者会漏掉 UDP 那一半。
+/// tag / 端口的形状由 [`bui_schema::render::hy2_singbox`]（`slot_out_tag` / `DENY_TAG` /
+/// [`DENY_DIAL_PORT`]）与 [`bui_schema::slots`]（`RELAY_SOCKS_BASE` / `MAX_SLOTS`）决定。
+///
+/// [`DENY_DIAL_PORT`]: bui_schema::render::hy2_singbox::DENY_DIAL_PORT
 fn hy2_resi(unit: &str, message: &str) -> Option<Match> {
+    use bui_schema::render::hy2_singbox::DENY_DIAL_PORT;
+    use bui_schema::slots::{MAX_SLOTS, RELAY_SOCKS_BASE};
+
+    let lower = message.to_ascii_lowercase();
+    // ── 成员出站形态（1.14.0 无门配置，判据看 tag）──
     // 被封 / 到期用户持续请求时每条流都打一条 `socks[deny]` 的拒绝行（`dial tcp 127.0.0.1:1:
-    // connect: connection refused`）——那是门在正常工作的证据，spec §8.1 要求一律忽略。
-    // 下面的 `slot-` 前缀今天已经把它排除在外，这条 guard 是**判据被放宽时的保险**：
-    // 谁把 tag 判据放宽成 `outbound/socks[`，噪音也不会变成 60 秒 20 条的告警风暴
+    // connect: connection refused`）——门在正常工作的证据，spec §8.1 要求一律忽略。
     if message.contains("outbound/socks[deny]") {
         return None;
     }
-    let lower = message.to_ascii_lowercase();
     if lower.contains("outbound/socks[slot-")
         && UNREACHABLE_MARKERS.iter().any(|k| lower.contains(k))
     {
         return Some(hit(Sig::Hy2ResiRelayUnreachable, unit, message));
     }
+    // ── 生产形态（门 selector 上的拨号失败，靠回环端口区分 deny 与槽）──
+    // 门 selector tag 是 `gate-<id>`，看不出选中的是 deny 还是哪个槽，只能看
+    // `dial tcp 127.0.0.1:<port>` 里的端口：= DENY_DIAL_PORT ⇒ deny 噪音（None）；落在槽入站
+    // 端口段 ⇒ 拨不通那个槽 ⇒ 签名。段外的端口不认（既不误报也不漏真的槽）。
+    if lower.contains("using outbound/selector[gate-") {
+        if let Some(port) = loopback_dial_port(&lower) {
+            if port == DENY_DIAL_PORT {
+                return None;
+            }
+            if (RELAY_SOCKS_BASE..RELAY_SOCKS_BASE + MAX_SLOTS).contains(&port) {
+                return Some(hit(Sig::Hy2ResiRelayUnreachable, unit, message));
+            }
+        }
+    }
     None
+}
+
+/// 从 `... dial tcp 127.0.0.1:<port>: <原因>` 里取回环端口。门 selector 的拨号失败只带最外层
+/// selector tag，deny 与槽的区分全靠这个端口（见 [`hy2_resi`]）。
+fn loopback_dial_port(lower: &str) -> Option<u16> {
+    let rest = lower.split_once("dial tcp 127.0.0.1:")?.1;
+    rest.split_once(':')?.0.trim().parse().ok()
 }
 
 fn is_google_search_host(host: &str) -> bool {
@@ -574,18 +608,31 @@ mod tests {
     /// `outbound/socks[deny]` 的拒绝行是被封用户的正常噪音，**一律忽略**
     #[test]
     fn dialing_the_relay_slot_is_a_signature_but_the_deny_noise_is_not() {
-        for l in [fx::RELAY_DIAL_FAIL, fx::RELAY_DIAL_FAIL_UDP] {
+        // 生产的门 selector 形态（`selector[gate-<id>]`，2026-09-18 真机）与 1.14.0 无门
+        // 配置的成员出站形态（`socks[slot-<i>-out]`）都要认，TCP 与 UDP 各两条
+        for l in [
+            fx::RELAY_DIAL_FAIL,
+            fx::RELAY_DIAL_FAIL_UDP,
+            fx::RELAY_DIAL_FAIL_SOCKS_FORM,
+            fx::RELAY_DIAL_FAIL_UDP_SOCKS_FORM,
+        ] {
             assert_eq!(
                 sig_of("hysteria-residential", l),
                 Some((Sig::Hy2ResiRelayUnreachable, "hysteria-residential".into())),
-                "TCP 与 UDP 两种形态都要认（UDP 那条的正文是 `listen packet connection`）：{l}"
+                "门 selector 与成员出站、TCP 与 UDP 四种形态都要认：{l}"
             );
         }
-        for l in [fx::DENY_NOISE, fx::DENY_NOISE_CONN] {
+        // deny 噪音（门 selector 拨 `127.0.0.1:1`、成员出站 `socks[deny]`、以及 INFO 前半条）
+        // 一律 None：门在正常拒绝，不是故障
+        for l in [
+            fx::DENY_NOISE,
+            fx::DENY_NOISE_SOCKS_FORM,
+            fx::DENY_NOISE_CONN,
+        ] {
             assert_eq!(
                 sig_of("hysteria-residential", l),
                 None,
-                "deny 噪音不许进事件"
+                "deny 噪音不许进事件：{l}"
             );
         }
         assert_eq!(
@@ -626,6 +673,41 @@ mod tests {
         assert_eq!(sig_of("hysteria-residential", &line(DENY_TAG)), None);
     }
 
+    /// 生产的门 selector 形态：ERROR 行只带 `gate-<id>`，deny 与槽的区分全靠回环端口，
+    /// 端口段就是渲染器产出的那一段。改了 [`bui_schema::slots::RELAY_SOCKS_BASE`] /
+    /// `MAX_SLOTS` / [`bui_schema::render::hy2_singbox::DENY_DIAL_PORT`] 而忘了改判据，本用例
+    /// 转红（哨兵对生产那一路会整体失明）
+    #[test]
+    fn the_selector_form_tracks_the_renderer_ports() {
+        use bui_schema::render::hy2_singbox::DENY_DIAL_PORT;
+        use bui_schema::slots::{MAX_SLOTS, RELAY_SOCKS_BASE};
+        // gate-<id> selector 上的拨号失败（2026-09-18 真机形态）；端口在原文里
+        let line = |port: u16| {
+            format!(
+                "+0000 2026-09-18 02:52:23 ERROR [1393264390 301ms] connection: open connection to \
+                 www.example.com:443 using outbound/selector[gate-r000]: dial tcp 127.0.0.1:{port}: \
+                 connect: connection refused"
+            )
+        };
+        // 每个槽入站端口 ⇒ 拨不通那个槽
+        for i in 0..MAX_SLOTS {
+            assert_eq!(
+                sig_of("hysteria-residential", &line(RELAY_SOCKS_BASE + i)),
+                Some((Sig::Hy2ResiRelayUnreachable, "hysteria-residential".into())),
+                "槽 {i}（端口 {}）",
+                RELAY_SOCKS_BASE + i
+            );
+        }
+        // deny 端口 ⇒ 门在正常拒绝的噪音
+        assert_eq!(sig_of("hysteria-residential", &line(DENY_DIAL_PORT)), None);
+        // 段外端口（紧邻上界）既不是 deny 也不是任何槽 ⇒ 不认，不误报
+        assert_eq!(
+            sig_of("hysteria-residential", &line(RELAY_SOCKS_BASE + MAX_SLOTS)),
+            None,
+            "端口段外不许误报"
+        );
+    }
+
     /// 门位收敛失败：b-ui 自己的日志行 + ClashError 两种文案
     #[test]
     fn a_failing_gate_sync_retries_the_user_sync() {
@@ -662,6 +744,8 @@ mod tests {
             fx::START_LINE,
             fx::CONN_FROM,
             fx::CONN_TO_USER,
+            fx::CONN_TO_USER_ZH,
+            fx::CONN_TO_USER_ZH_SPACE,
             fx::CONN_TO_USER_UDP,
             fx::SLOT_OUT_CONN,
             fx::CLASH_API_LISTEN,

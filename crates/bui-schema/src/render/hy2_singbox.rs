@@ -41,6 +41,12 @@ pub const INBOUND_TAG: &str = "hy2-resi";
 /// 拒绝出站的 tag：门的 `default`、`route.final` 都指它。
 pub const DENY_TAG: &str = "deny";
 
+/// `deny` 出站拨的回环端口：本机永不监听 ⇒ 每条流当场 connection refused。门 selector 上
+/// 的拨号失败靠这个端口把 deny 噪音（到期 / 封禁用户的正常拒绝）和「拨不通 relay 的槽入站」
+/// 分开（`crate::modules::sentinel` 无法从 `gate-<id>` selector tag 看出选中的是 deny 还是槽，
+/// 只能看 `dial tcp 127.0.0.1:<port>` 里的这个端口）。**唯一一处**定义。
+pub const DENY_DIAL_PORT: u16 = 1;
+
 /// 凭据 `id` 的门（selector）tag。
 pub fn gate_tag(cred_id: &str) -> String {
     format!("gate-{cred_id}")
@@ -97,7 +103,7 @@ pub fn config(node: &NodeParams, paths: &Paths, pool: &Hy2Pool) -> Value {
     let members: Vec<String> = std::iter::once(DENY_TAG.to_string())
         .chain((0..MAX_SLOTS).map(slot_out_tag))
         .collect();
-    let mut outbounds = vec![socks_out(DENY_TAG, 1)];
+    let mut outbounds = vec![socks_out(DENY_TAG, DENY_DIAL_PORT)];
     outbounds.extend((0..MAX_SLOTS).map(|i| socks_out(&slot_out_tag(i), RELAY_SOCKS_BASE + i)));
     outbounds.extend(pool.creds.iter().map(|c| {
         json!({
