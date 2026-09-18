@@ -119,6 +119,9 @@ GATE_WAIT=${M3_GATE_WAIT:-75}
 GATE_SINCE=$(date +%s)
 # 判据 ③ 的「`/api/online` 归零」要连续读到几轮才算数（一次读到 0 可能只是采样间隙）
 ONLINE_ZERO_ROUNDS=3
+# 判据 ③ 住宅那半（`probe_until_fail`）的「稳定失败」判据：要连续读到几次非 200 才认门已切
+# `deny`（一次失败可能是收敛中途的抖动）。与 `wait_session_drop` / `wait_online_zero` 同一口径。
+RESI_FAIL_ROUNDS=3
 
 pass=0
 fail=0
@@ -768,21 +771,36 @@ probe_first_ok() {
   printf '%s %s\n' "$o" "$b"
 }
 
-# 4.1 判据 ③：到期后经**新建**连接的请求必须全部失败。$1=socks 端口 $2=最多探几秒 →
-# 回显「代表码」：期间只要成功过一次就回 200（那就是 FAIL 的证据），否则回最后一次的码。
-probe_all_fail() {
-  local deadline=$((SECONDS + $2)) c last=000
+# 4.1 判据 ③（住宅到期）：到期后经**新建**连接的请求必须**稳定失败**（门切到 `deny`）。
+#
+# 竞态口径（rick 2026-09-18 实测）：住宅到期是**时间点、无事件**，门（`gate-<id>` selector）
+# 收敛不是即时的——由 `traffic::sampling_loop` 每 10 秒那次 `sync_now → gates::converge`
+# 把门切 `deny`（`SAMPLE_INTERVAL_SECS=10`；兜底是 `sync_loop` 的 60 秒安全网 `SYNC_INTERVAL_SECS`）。
+# 实测孤立到期用户 ~8–9 秒门切 `deny`、探测随之 200→000。所以到期后**头 ~10 秒里探到 200 是
+# 正常的**（还没到下一个采样轮），不是 FAIL——旧做法「一看到 200 就判 FAIL」正是在这个
+# 窗口里抢跑误判。门一旦 `deny`，出站黑洞掉一切请求，收敛后不可能再漏 200。
+#
+# 于是判据反过来：轮询到**连续 RESI_FAIL_ROUNDS 次失败**（门已收敛）就回该失败码（PASS）；
+# 到 deadline 仍未稳定失败（最后还能 200 / 一直抖不收敛）才回 200（= 门没切干净，FAIL）。
+# $1=socks 端口 $2=最多等几秒（门位收敛窗口，传 GATE_WAIT，覆盖到 60 秒兜底路径都够）→ 代表码。
+probe_until_fail() {
+  local deadline=$((SECONDS + $2)) c run=0
   while :; do
     c=$(probe_socks_code "$1" "$KEEP_URL")
     if [ "$c" = "200" ]; then
-      printf '200\n'
-      return
+      run=0
+    else
+      run=$((run + 1))
+      [ "$run" -ge "$RESI_FAIL_ROUNDS" ] && {
+        printf '%s\n' "${c:-000}"
+        return
+      }
     fi
-    last=${c:-000}
     [ "$SECONDS" -lt "$deadline" ] || break
     sleep "$KEEP_INTERVAL"
   done
-  printf '%s\n' "$last"
+  # 到窗口末仍没连续失败够 RESI_FAIL_ROUNDS 次 ⇒ 门没稳定切到 deny，判 FAIL（回 200）。
+  printf '200\n'
 }
 
 # $1=客户端日志 → 日志里 `connected to server` 出现的次数。
@@ -1237,6 +1255,10 @@ wait_for_usage() {
 # 门 `gate-<id>` 切到 `deny` ⇒ **握手照旧成功**、每条流被拒。客户端那边显示「已连接」但
 # 所有请求失败，`/connections` 里他归零（`interrupt_exist_connections: true` 连存量流一起
 # 掐断）。同槽其他用户不受影响 —— 切的是单个 selector。
+# **门切 `deny` 有延迟、不是到期即时事件**（rick 2026-09-18 实测 ~8–9 秒）：到期是时间点、
+# 无 `StateChanged`，靠 `traffic::sampling_loop` 每 10 秒（`SAMPLE_INTERVAL_SECS`）那次
+# `sync_now → gates::converge` 收敛，兜底才是 `sync_loop` 的 60 秒安全网。所以到期后要
+# **轮询到稳定失败**（`probe_until_fail`，窗口 GATE_WAIT），别用「一看到 200 就 FAIL」抢跑。
 # 直连：一个字没改，仍是 `auth_hook::decide` 在**握手**就拒（它自己比 `expires_at`，不等
 # 快照重写），`auth-hook.log` 记 `expired` / `blocked`；既有连接要等采样轮（≤10s）算出
 # newly_blocked 再 `POST /kick`，而 kick 只是标记，要等该用户下次有流量才真断（H12）。
@@ -1247,7 +1269,7 @@ check_expiry() {
   local socks cfg pid rok=0 resi_pre=000 resi_post=000 zero=0 code probe hres out
   local dsocks dcfg dpid dlive=0 dok=0 dbad=0
   local nsocks="" ncfg="" npid="" nuser="" ntok="" nslot="" nrow="" nok=0 nconn0=0 nconn1=0 nprobe=000
-  local bsocks bcfg bpid slot
+  local bsocks bcfg bpid slot bwait
   if [ -z "$TMP_USER" ] || [ -z "$TMP_PASS" ]; then
     skip "step3 到期语义（没有临时用户）"
     return
@@ -1320,13 +1342,25 @@ check_expiry() {
     no "step3 面板没把到期用户判成 blocked" "limits.expiresAt=$(read_user_row "$TMP_USER" | sed -n 3p)"
   fi
 
-  # 住宅新建连接：**握手仍该成功**（凭据没动），但请求要全部失败
+  # 住宅新建连接：**握手仍该成功**（凭据没动），但请求要在门位收敛后稳定失败。门切 `deny`
+  # 不是到期即时事件，靠 10 秒采样轮收敛（兜底 60 秒安全网，rick 实测 ~8–9 秒），所以这里给
+  # 门位收敛窗口 GATE_WAIT（≥ 兜底路径）、轮询到稳定失败为止，别用「一看到 200 就 FAIL」抢跑。
   bsocks=$(free_port)
   bcfg="$WORK/relogin-resi.yaml"
   write_client_cfg "$bcfg" "$RESI_NAME" "$RESI_SECRET" "$bsocks" "$RESI_PORT"
   bpid=$(start_hy2_client "$bcfg" "$WORK/relogin-resi.client.log" "$bsocks")
   track_pid "$bpid"
-  resi_post=$(probe_all_fail "$bsocks" "$BLOCK_WAIT")
+  # 先等这条新连接**握手成功**（日志里出现 connected to server）再探请求是否稳定失败：
+  # 客户端刚起、还没拨通那几秒探到的 000 不是「门切了 deny」而是「还没连上」，若门其实没切
+  # （真漏），慢启动会让 probe_until_fail 在连上之前先凑满连续失败、把漏判成 PASS —— 误判到
+  # 危险的那一侧。等到握手成功后，000 才唯一地意味着「握手成功但请求被拒」（4.1 到期语义）。
+  bwait=0
+  while [ "$bwait" -lt "$FIRST_OK_WAIT" ] &&
+    [ "$(client_connects "$WORK/relogin-resi.client.log")" -eq 0 ]; do
+    sleep 1
+    bwait=$((bwait + 1))
+  done
+  resi_post=$(probe_until_fail "$bsocks" "$GATE_WAIT")
   if [ "$(client_connects "$WORK/relogin-resi.client.log")" -gt 0 ]; then
     ok "step3 到期用户的住宅节点仍握手成功（客户端日志有 connected to server）"
   else
@@ -1986,6 +2020,9 @@ JSON
   EXPIRE_TTL=1
   FIRST_OK_WAIT=3
   BLOCK_WAIT=2
+  # 判据 ③ 住宅那半改用 probe_until_fail（窗口取 GATE_WAIT），到期没生效那条 FAIL 用例会一直
+  # 探到 200、轮询满整个窗口才回 200 ⇒ 自测里也得把它压到秒级（默认 75s 会拖满一分多钟）。
+  GATE_WAIT=2
 
   # 自测不出网：HEAD 探活整体桩成「首个候选就 200 + 100MB」。要摆 403 / 全挂的场景，
   # 各用例在自己的子外壳里再覆盖一次。
@@ -2706,7 +2743,8 @@ st_check_expiry() {
 
 # 归零测量的三个辅助（复核发现：这三处改坏了原先没有任何断言会红）。它们决定判据 ③
 # 第三项能不能失败：`online_count` 必须 fail-closed（读不到就不算归零）、`wait_online_zero`
-# 必须连续 ONLINE_ZERO_ROUNDS 轮才认、`probe_all_fail` 中途成功过一次就必须回 200。
+# 必须连续 ONLINE_ZERO_ROUNDS 轮才认、`probe_until_fail` 必须轮询到连续 RESI_FAIL_ROUNDS 次
+# 失败才算门已切（收敛前的 200 不许当结论），到窗口末仍收不敛才回 200（FAIL）。
 st_online_and_probe() {
   local out
   st_stub_set users "$(st_tmp_user_json 0)"
@@ -2750,26 +2788,58 @@ st_online_and_probe() {
   else
     no "自测：一次 0 就被当成归零" "$out"
   fi
-  # probe_all_fail：中途成功过一次就必须回 200（只看最后一次会漏掉「到期后还能出网」）
+  # probe_until_fail（判据③ 住宅到期，取代旧的「一看到 200 就 FAIL」做法）：门切 deny 有 ~10 秒采样轮延迟
+  # （rick 实测），所以要**轮询到连续 RESI_FAIL_ROUNDS 次失败**才算 PASS——收敛中途探到 200 是
+  # 正常态，别抢跑判 FAIL；到窗口末仍能 200 / 一直抖不收敛才回 200（FAIL）。
+  # A. 到期后先 200 两轮、随后稳定失败 ⇒ 回失败码（PASS）。KEEP_INTERVAL=0 让 seq 一次跑完。
   out=$(
-    printf '000\n200\n000\n' >"$ST_DIR/probe.seq"
+    KEEP_INTERVAL=0
+    printf '200\n200\n000\n000\n000\n' >"$ST_DIR/probe.seq"
     probe_socks_code() {
       sed -n 1p "$ST_DIR/probe.seq"
       tail -n +2 "$ST_DIR/probe.seq" >"$ST_DIR/probe.seq.tmp"
       mv "$ST_DIR/probe.seq.tmp" "$ST_DIR/probe.seq"
     }
-    probe_all_fail 1080 2
+    probe_until_fail 1080 1080
   )
-  if [ "$out" = "200" ]; then
-    ok "自测：probe_all_fail 中途成功过一次就回 200"
+  if [ "$out" = "000" ]; then
+    ok "自测：probe_until_fail 收敛前的 200 不误判、连续失败后回失败码（PASS）"
   else
-    no "自测：probe_all_fail 漏掉了中途那次成功" "$out"
+    no "自测：probe_until_fail 把收敛中途的 200 当成了结论（退回一看到 200 就 FAIL 的抢跑）" "$out"
   fi
+  # B. 到窗口末一直 200（门根本没切）⇒ 回 200（FAIL）。
   out=$(
-    probe_socks_code() { echo 403; }
-    probe_all_fail 1080 1
+    KEEP_INTERVAL=1
+    probe_socks_code() { echo 200; }
+    probe_until_fail 1080 1
   )
-  if [ "$out" = "403" ]; then ok "自测：probe_all_fail 全失败时回最后一次的码"; else no "自测：probe_all_fail 的失败码不对" "$out"; fi
+  if [ "$out" = "200" ]; then ok "自测：probe_until_fail 门没切（一直 200）到窗口末回 200（FAIL）"; else no "自测：门没切却没判 FAIL" "$out"; fi
+  # C. 一直抖（000/200 交替、凑不满连续 RESI_FAIL_ROUNDS 次失败）⇒ 回 200（FAIL）。
+  #    钉住「连续 N 次」：换成「见一次失败就回」会在这里回 000（假 PASS）。
+  out=$(
+    KEEP_INTERVAL=1
+    printf '0\n' >"$ST_DIR/flap.n"
+    probe_socks_code() {
+      local n
+      n=$(cat "$ST_DIR/flap.n")
+      echo $((n + 1)) >"$ST_DIR/flap.n"
+      if [ $((n % 2)) -eq 0 ]; then echo 000; else echo 200; fi
+    }
+    probe_until_fail 1080 2
+  )
+  if [ "$out" = "200" ]; then ok "自测：probe_until_fail 凑不满连续失败（一直抖）判 FAIL"; else no "自测：抖动被当成稳定失败（连续 N 次判据丢了）" "$out"; fi
+  # D. 稳定失败时回显**最后一次的码**（403 而不是笼统 000），保留诊断信息。
+  out=$(
+    KEEP_INTERVAL=0
+    printf '403\n403\n403\n' >"$ST_DIR/probe.seq"
+    probe_socks_code() {
+      sed -n 1p "$ST_DIR/probe.seq"
+      tail -n +2 "$ST_DIR/probe.seq" >"$ST_DIR/probe.seq.tmp"
+      mv "$ST_DIR/probe.seq.tmp" "$ST_DIR/probe.seq"
+    }
+    probe_until_fail 1080 1080
+  )
+  if [ "$out" = "403" ]; then ok "自测：probe_until_fail 稳定失败时回最后一次的码（403）"; else no "自测：probe_until_fail 的失败码不对" "$out"; fi
   st_stub_reset
 }
 
