@@ -5,9 +5,9 @@
 
 use super::{CLASH_API, CLASH_TIMEOUT_SECS, MEMBER_PREFIX};
 // 生产实现按调用方传进来的 selector 拼路径，不再自己引用全局池的 tag；
-// `FakeClash` 与测试仍要用它当默认 selector
+// `unstable_pools` 要用它区分「全局池 vs. 槽池」，`FakeClash` 与测试用它当默认 selector
 use super::journal::RelaySubject;
-#[cfg(test)]
+use super::state::ResiRuntime;
 use super::POOL;
 use bui_schema::model::ResidentialGroup;
 use uuid::Uuid;
@@ -252,6 +252,53 @@ pub fn pool_of(s: &RelaySubject) -> Option<&str> {
     }
 }
 
+/// 某池此刻 relay 里选中的上游（`None` = `now` 读不到、或那个 tag 已不在当前池里）
+fn now_id(g: &ResidentialGroup, now: &PoolNow, pool: &str) -> Option<Uuid> {
+    id_of_tag(g, now.get(pool)?.as_deref()?)
+}
+
+/// runtime 记下的「这个池当前该生效的上游」：全局池是
+/// [`ResiRuntime::selected_upstream_id`]，槽池是该槽的
+/// [`super::state::SlotRuntime::current_upstream_id`]。`None` = 没记过（首轮 / 刚被清零），
+/// 无从比较。**换算只经 [`super::slot_selector`]**，不在这里再拼一遍 `slot-<i>-pool`。
+fn recorded_id(r: &ResiRuntime, pool: &str) -> Option<Uuid> {
+    if pool == POOL {
+        return r.selected_upstream_id;
+    }
+    r.slots
+        .iter()
+        .find(|(k, _)| {
+            k.parse::<u16>()
+                .is_ok_and(|i| super::slot_selector(i) == pool)
+        })
+        .and_then(|(_, s)| s.current_upstream_id)
+}
+
+/// 归因前的**通用兜底**（2026-09-18 第三次裁决 ③）：某池此刻的 `now` 与 runtime 记下的
+/// 「该池当前选择」不一致 ⇒ 中间发生过一次**没记账**的切换（relay 重启把 selector 打回
+/// 配置里的 default、有人手动 `curl` 过 Clash API、某条落账路径漏写…）。这些池本批的
+/// **路径 B** 行整批丢弃，调用方还要当场 `note_pool_switch(now)` 把账补上 —— 否则这一批
+/// 之后的每一批都会继续把老成员的失败记到新成员头上。
+///
+/// 只在两边**都读得到**时才下结论：`now` 读不到（relay 没起）时路径 B 本来就归不了因；
+/// runtime 没记过该池的选择时无从比较 —— 宁可少丢，也不因为读不到记录就把整条链停掉
+/// （与 [`within_switch_grace`] 同口径）。
+pub fn unstable_pools(
+    g: &ResidentialGroup,
+    now: &PoolNow,
+    r: &ResiRuntime,
+) -> std::collections::BTreeSet<String> {
+    now.keys()
+        .filter(
+            |p| match (now_id(g, now, p.as_str()), recorded_id(r, p.as_str())) {
+                (Some(n), Some(rec)) => n != rec,
+                _ => false,
+            },
+        )
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 #[derive(Default)]
 pub struct FakeClashInner {
@@ -265,6 +312,12 @@ pub struct FakeClashInner {
     /// relay 刚重启、Clash API 还没起监听时的形态
     pub refuse: u32,
     pub calls: Vec<String>,
+    /// 每次**成功**的 `select` 把这台假主机的时钟往前拨这么多秒：真实世界里「轮首取
+    /// `now` → 发 PUT → select 返回」之间是有时间差的，归因时间戳门的用例要把它复现出来
+    pub advance_on_select: Option<(std::sync::Arc<crate::sys::fake::FakeHost>, i64)>,
+    /// 每次 `selected`（= `clash::pool_now` 问 `now` 的那一刻）先跑一下这个钩子：
+    /// 用来把「采日志 → 读 `now`」之间发生的切换注入进去（黑名单读序的用例）
+    pub on_selected: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
 #[cfg(test)]
@@ -321,6 +374,11 @@ impl Clash for FakeClash {
     }
 
     fn selected(&self, selector: &str) -> Option<String> {
+        // 钩子在拿锁之前跑：它自己可能回头读 `FakeClash`
+        let hook = self.inner.lock().unwrap().on_selected.clone();
+        if let Some(f) = hook {
+            f();
+        }
         let mut i = self.inner.lock().unwrap();
         i.calls.push(format!("get:{selector}"));
         if refused(&mut i) {
@@ -342,6 +400,10 @@ impl Clash for FakeClash {
             });
         }
         i.now.insert(selector.to_string(), tag.to_string());
+        // 切成功才走时钟：切失败什么都没变，时刻也不该动
+        if let Some((h, secs)) = i.advance_on_select.clone() {
+            h.advance(secs);
+        }
         Ok(())
     }
 }

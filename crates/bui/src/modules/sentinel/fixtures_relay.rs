@@ -143,6 +143,15 @@ pub const POOL_URLTEST_DIAL_TIMEOUT: &str = line!(
     "www.example.com:443 using outbound/urltest[resi-pool]: dial tcp 203.0.113.7:10007: i/o timeout"
 );
 
+/// 【合成】dial 错误被上层包了一层前缀的形态：`reason.starts_with("dial tcp")` 认不出它，
+/// 而路径 A 的 [`super::super::residential::journal::dial_addr`] 照样能从里面取出上游自己的
+/// `host:port` ⇒ 「这条说的是上游、不是目标」的判据只能与 `dial_addr()` **同源**
+/// （2026-09-18 第三次裁决 ④）。§2 的采样里没有这个形状，它是按 Go 的 `fmt.Errorf("%s: %w")`
+/// 包装惯例造的负例：真出现时绝不能被兜底关键词表里的 `refused` 学成一条域名黑名单规则
+pub const POOL_SELECTOR_WRAPPED_DIAL_REFUSED: &str = line!(
+    "www.example.com:443 using outbound/selector[slot-3-pool]: socks5: connect to upstream: dial tcp 203.0.113.7:10007: connect: connection refused"
+);
+
 /// 【合成】上游主机名解析不出来：`dial tcp: lookup …`，**没有** `host:port` ⇒ 路径 A 归不了因。
 /// §2 里没有这个形状，造它是为了钉住「没有 host:port 就别猜」
 pub const POOL_SELECTOR_DIAL_NO_ROUTE: &str = line!(

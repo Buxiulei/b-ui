@@ -99,10 +99,10 @@ pub fn port_allowed(up: &Upstream, port: u16) -> bool {
 /// b-ui 切过一次池，老成员的失败就记到新成员头上；候选表按 `(upstream_id, host, port)`
 /// 累计、误记会一直攒着，所以本批证据宁可放弃、等下次复发。
 pub async fn learn_from_journal(ctx: &DaemonCtx, clash: Arc<dyn Clash>) -> anyhow::Result<usize> {
-    let (cursor, switch_at) = {
-        let r = state::read(&ctx.runtime).await;
-        (r.journal_cursor, r.pool_switch_at)
-    };
+    // 游标可以早读（它只决定从哪一条往后读），但 `pool_switch_at` **必须**等到采完日志、
+    // 读完 `now` 之后再读（2026-09-18 第三次裁决 ②）：早读的那一份看不见「采日志 → 读 now」
+    // 这段窗口里发生的切换，切换前产生的行就会被路径 B 记到新成员头上。
+    let cursor = state::read(&ctx.runtime).await.journal_cursor;
     let host = ctx.host.clone();
     // **碰 `Host` 一律 spawn_blocking**（与 P1 的 `Fetcher`/`Facts::probe` 同一条铁律）：
     // `RealHost::which` 会同步扫 PATH、`collect` 会 exec journalctl，两件事放进同一次
@@ -142,8 +142,19 @@ pub async fn learn_from_journal(ctx: &DaemonCtx, clash: Arc<dyn Clash>) -> anyho
         .into_iter()
         .collect();
     let pool_now = clash::pool_now(&clash, &pools).await;
+    // 读序见上：`pool_switch_at` 在采日志与读 `now` **之后**才读
+    let rt = state::read(&ctx.runtime).await;
+    let switch_at = rt.pool_switch_at.clone();
+    // 通用兜底：`now` 与 runtime 记的该池当前选择对不上 ⇒ 中间有过一次没记账的切换
+    // （relay 重启回落 default、有人手动 curl 过 Clash API…）。这些池本批整批丢弃，
+    // 并在下面把账补上（2026-09-18 第三次裁决 ③）
+    let unstable = clash::unstable_pools(&g, &pool_now, &rt);
     let mut lines: Vec<(Uuid, journal::RejectLine)> = Vec::new();
     for l in &batch.lines {
+        if clash::pool_of(&l.subject).is_some_and(|p| unstable.contains(p)) {
+            tracing::debug!(host = %l.host, port = l.port, "该池的 now 与运行时记录不一致（有过没记账的切换），本批证据放弃");
+            continue;
+        }
         match clash::attribute(&g, &l.subject, &pool_now, &switch_at, l.ts) {
             clash::Attrib::Upstream(id) => lines.push((id, l.clone())),
             clash::Attrib::Switched => {
@@ -153,6 +164,11 @@ pub async fn learn_from_journal(ctx: &DaemonCtx, clash: Arc<dyn Clash>) -> anyho
                 tracing::debug!(host = %l.host, port = l.port, "relay 拒绝行归不了因，丢弃（绝不猜）")
             }
         }
+    }
+    // 没记账的切换当场补记：不补的话下一批、再下一批都会继续把老成员的失败记到新成员头上
+    if !unstable.is_empty() {
+        let pools: Vec<String> = unstable.iter().cloned().collect();
+        state::mark_pools_switch(&ctx.runtime, &pools, ctx.host.now()).await;
     }
     // ──────────────────────────────────────────────────────────────────────────
     state::update(&ctx.runtime, |r| {
@@ -950,6 +966,79 @@ mod tests {
             .await
             .candidates
             .contains_key(&candidate_key(Uuid::from_u128(2), "www.example.com", 443)));
+    }
+
+    /// **裁决 ②**（2026-09-18 第三次）：`pool_switch_at` 必须在**采完日志、读完 `now`
+    /// 之后**才读。早读的那一份看不见「采日志 → 读 `now`」这段窗口里发生的切换，而 `now`
+    /// 看得见 ⇒ 切换之前产生的行会被路径 B 记到**新**成员头上。这里把切换正好注入在
+    /// 读 `now` 的那一刻（`FakeClash::on_selected`），早读的写法必转红。
+    #[tokio::test]
+    async fn a_switch_landing_between_the_journal_read_and_the_now_read_still_drops_the_batch() {
+        let d = tempfile::tempdir().unwrap();
+        let (c, host) = ctx(&d).await;
+        add_second_upstream(&c).await;
+        let sel = crate::modules::residential::slot_selector(3);
+        let t_line = host.now();
+        feed_at(&host, t_line, fx::POOL_SELECTOR_SOCKS_CODE2);
+        let clash = FakeClash::new(None);
+        clash.with(|i| {
+            i.now.insert(sel.clone(), "resi-2".into());
+        });
+        // 读 `now` 的那一刻才落账的一次切换：`now` 已经是切换后的 resi-2，
+        // 而这条日志行产生在切换之前（t_line < 切换时刻）
+        let (rt, at, s2) = (
+            c.runtime.clone(),
+            t_line + time::Duration::seconds(1),
+            sel.clone(),
+        );
+        clash.with(|i| {
+            i.on_selected = Some(Arc::new(move || {
+                let (rt, s2) = (rt.clone(), s2.clone());
+                tokio::runtime::Handle::current()
+                    .block_on(async move { rstate::mark_pool_switch(&rt, &s2, at).await });
+            }));
+        });
+        let clash: Arc<dyn Clash> = Arc::new(clash);
+        assert_eq!(
+            learn_from_journal(&c, clash).await.unwrap(),
+            0,
+            "切换落在「采日志 → 读 now」之间：这条行说的是老成员，本批放弃"
+        );
+        assert!(
+            rstate::read(&c.runtime).await.candidates.is_empty(),
+            "黑名单候选表零新增"
+        );
+    }
+
+    /// **裁决 ③ 的通用兜底**：某池此刻的 `now` 与 runtime 记下的「该池当前选择」对不上
+    /// ⇒ 中间有过一次**没记账**的切换（relay 重启把 selector 打回配置里的 default 是最常见
+    /// 的一种，也可能是有人手动 `curl` 过 Clash API）。这一批该池的路径 B 行整批丢弃，
+    /// 并**当场把账补上** —— 不补的话下一批、再下一批都会继续把老成员的失败记到新成员头上。
+    #[tokio::test]
+    async fn an_unaccounted_switch_drops_the_batch_and_stamps_the_pool() {
+        let d = tempfile::tempdir().unwrap();
+        let (c, host) = ctx(&d).await;
+        add_second_upstream(&c).await;
+        let sel = crate::modules::residential::slot_selector(3);
+        // runtime 记着槽 3 当前用的是第二条上游
+        rstate::update(&c.runtime, |r| {
+            r.slots.entry("3".into()).or_default().current_upstream_id = Some(Uuid::from_u128(2));
+        })
+        .await;
+        feed(&host, fx::POOL_SELECTOR_SOCKS_CODE2);
+        // relay 重启：这个 selector 的 `now` 已经回落到配置里的 default（第一条上游）
+        assert_eq!(
+            learn_from_journal(&c, clash_at("resi-1")).await.unwrap(),
+            0,
+            "now 与 runtime 记录不一致 ⇒ 本批该池的证据整批放弃"
+        );
+        let r = rstate::read(&c.runtime).await;
+        assert!(r.candidates.is_empty(), "黑名单候选表零新增");
+        assert_eq!(
+            r.pool_switch_at.get(&sel).cloned(),
+            Some(crate::util::fmt_rfc3339(host.now())),
+            "没记账的切换当场补记，下一批才有门可依"
+        );
     }
 
     /// **`dial tcp` 开头的 reason 不进黑名单候选**：它说的是「连不上上游自己」（上游级，

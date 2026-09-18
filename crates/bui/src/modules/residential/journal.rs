@@ -145,12 +145,18 @@ pub fn parse_line(line: &str, ts: time::OffsetDateTime) -> Option<RejectLine> {
             status: None,
         });
     }
-    // **`dial tcp` 开头的 reason 是上游级，不是目标级**（2026-09-18 第二次裁决）：它说的是
+    // **带 `dial tcp` 的 reason 是上游级，不是目标级**（2026-09-18 第二次裁决）：它说的是
     // 「连不上上游自己」（connection refused / i/o timeout / no route to host），不是「上游
     // 拒绝了这个域名」。下面兜底关键词表里的 `refused` 正好会命中
     // `dial tcp …: connect: connection refused`，把一次上游抖动学成一条域名黑名单规则。
     // 这类行是哨兵的地盘（`Sig::RelayUpstreamError` → 快探 + 借用），这里一概不收。
-    if reason.starts_with("dial tcp") {
+    //
+    // 判据与路径 A 的 [`dial_addr`] **同源**（2026-09-18 第三次裁决 ④）：原来的
+    // `starts_with` 在 sing-box 把 dial 错误包上一层前缀时（`socks5: … : dial tcp …`）会漏排，
+    // 而「能从 reason 里取出上游自己的 host:port」正是「这条说的是上游」的判据。
+    // 解析失败那一种（`dial tcp: lookup <域名>: …`）没有端口、[`dial_addr`] 取不到地址，
+    // 单列一条排掉。
+    if dial_addr(reason).is_some() || reason.contains("dial tcp: lookup ") {
         return None;
     }
     // 其余 SOCKS5 拒绝形态（REP ≠ 0 的文字化）。超时/EOF 一类不是拒绝，不学。
@@ -480,9 +486,19 @@ mod tests {
             fx::MEMBER_DIAL_REFUSED,
             fx::POOL_URLTEST_DIAL_TIMEOUT,
             fx::POOL_SELECTOR_DIAL_NO_ROUTE,
+            // 2026-09-18 第三次裁决 ④：被包了一层前缀的 dial 错误同样是上游级。
+            // 判据与路径 A 的 `dial_addr()` 同源，`starts_with` 会把它漏排
+            fx::POOL_SELECTOR_WRAPPED_DIAL_REFUSED,
         ] {
             assert_eq!(p(l), None, "{l}");
         }
+        // 钉住「同源」这件事本身：这条行的 reason 取得出上游地址（路径 A 能归因），
+        // 所以它绝不能同时又被黑名单当成「上游拒绝了这个域名」
+        assert!(
+            dial_addr("socks5: connect to upstream: dial tcp 203.0.113.7:10007: connect: connection refused")
+                .is_some(),
+            "包一层前缀之后 dial_addr 照样取得出地址"
+        );
         // 目标级的拒绝仍然照学：排掉的只是 `dial tcp` 这个前缀，不是 `refused` 这个词
         assert!(p(fx::POOL_SELECTOR_403).is_some());
         assert!(p(SOCKS_DENY).is_some());

@@ -44,7 +44,9 @@ pub struct ResiRuntime {
     pub last_switch_at: Option<String>,
     /// 每个**池 selector** 最近一次成功切换的时刻（RFC3339，键 = 池 tag：[`super::POOL`] 或
     /// `slot-<i>-pool`）。relay 错误行归因的**时间戳门**（[`super::SWITCH_ATTRIB_GRACE_SECS`]）
-    /// 就读它：写入口只有 [`mark_pool_switch`]，调用点是全部 `Clash::select` 成功返回处。
+    /// 就读它：写入口只有 [`note_pool_switch`] 与它的落盘壳 [`mark_pool_switch`]（以及批量版
+    /// [`note_pools_switch`] / [`mark_pools_switch`]，供「relay 重启 = 全池切换」那几条来路用），
+    /// 调用点是全部 `Clash::select` 成功返回处、以及检测到没记账的切换时的补记处。
     /// 与上面那个全局的 `last_switch_at` 不是一回事——那个是巡检切换的 60 秒限速游标，
     /// 只记全局池、重放时还故意不写。键数上限 = `MAX_SLOTS + 1`。
     pub pool_switch_at: BTreeMap<String, String>,
@@ -269,6 +271,38 @@ pub fn note_pool_switch(r: &mut ResiRuntime, pool: &str, now: OffsetDateTime) {
 /// [`note_pool_switch`] 的独立落盘版：调用点手头没有别的 runtime 改动时用它
 pub async fn mark_pool_switch(runtime: &Runtime, pool: &str, now: OffsetDateTime) {
     update(runtime, |r| note_pool_switch(r, pool, now)).await;
+}
+
+/// 对一批池各记一次切换时刻。**relay 重启 = 一次全池切换**（2026-09-18 第三次裁决 ③）：
+/// 不开 `cache_file`，一重启每个 selector 的 `now` 都回落到配置里的 default，
+/// 所以凡是检测 / 处理 relay 重启的来路都拿 [`all_pool_selectors`] 走这个批量版。
+pub fn note_pools_switch(r: &mut ResiRuntime, pools: &[String], now: OffsetDateTime) {
+    for p in pools {
+        note_pool_switch(r, p, now);
+    }
+}
+
+/// [`note_pools_switch`] 的独立落盘版；空表直接返回，不白写一次盘
+pub async fn mark_pools_switch(runtime: &Runtime, pools: &[String], now: OffsetDateTime) {
+    if pools.is_empty() {
+        return;
+    }
+    update(runtime, |r| note_pools_switch(r, pools, now)).await;
+}
+
+/// relay 里**全部**池 selector：全局池 [`super::POOL`] + 每槽一个（[`super::slot_selector`]）。
+/// 池未启用时 relay 是 fail-open 直连、一个 selector 都没有 ⇒ 空表。
+pub fn all_pool_selectors(s: &State) -> Vec<String> {
+    if !group_of(s).pool_active() {
+        return Vec::new();
+    }
+    std::iter::once(super::POOL.to_string())
+        .chain(
+            bui_schema::slots::sorted(&s.residential)
+                .iter()
+                .map(|sl| super::slot_selector(sl.index)),
+        )
+        .collect()
 }
 
 /// 记一条告警：同文案去重、最新的排在最前、截断到 [`ALERTS_MAX`]
