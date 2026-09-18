@@ -88,8 +88,17 @@ fn relay_split_uses_keywords_and_direct_final() {
     let s = common::state("split");
     let g = s.residential.default_group().unwrap().clone();
     let cfg = relay::config(&g, &[], &opts());
+    let rules = cfg["route"]["rules"].as_array().unwrap();
+    // split 分流的生命线：hy2 侧 `{"action":"sniff"}` 不改写目标，客户端本地解析后 relay 只
+    // 收到 IP；唯有 rules[0] 这条无过滤 sniff 再嗅一次、让下面各槽的 domain_keyword 匹配到
+    // metadata.Domain，关键字流量才进得了住宅出口。T3 2026-09-18 对照实验摘掉它 ⇒ 静默直连
+    // （与 global 用例的 rules[0] 断言同一口径，实现见 relay.rs:126）。
+    assert_eq!(
+        rules[0]["action"], "sniff",
+        "rules[0] 必须是 sniff（split 分流前提）"
+    );
     assert_eq!(cfg["route"]["final"], "direct");
-    let last = cfg["route"]["rules"].as_array().unwrap().last().unwrap();
+    let last = rules.last().unwrap();
     assert_eq!(last["outbound"], "slot-0-pool");
     assert_eq!(
         last["domain_keyword"].as_array().unwrap().len(),

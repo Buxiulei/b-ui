@@ -123,6 +123,8 @@ pub fn config(g: &ResidentialGroup, slots: &[Slot], opts: &RelayOpts) -> Value {
         Blacklist::default()
     };
 
+    // rules[0] 这条无过滤 sniff 是 split 分流的前提：客户端本地解析后 relay 只收到 IP，靠它
+    // 再嗅出域名，下面各槽的 domain_keyword 才匹配得到（T3 2026-09-18 对照实验摘掉它 ⇒ 静默直连）。
     let mut route_rules = vec![json!({ "action": "sniff" })];
     if let Some(r) = bl.domain_rule("outbound", "direct") {
         route_rules.push(r);
