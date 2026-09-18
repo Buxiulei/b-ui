@@ -1,18 +1,28 @@
-//! 证书同步：Caddy 签发的证书 → `<base>/certs/{fullchain,privkey}.pem`，变了就错峰重启两个
+//! 证书同步：Caddy 签发的证书 → `<base>/certs/{fullchain,privkey}.pem`，变了就更新两个
 //! hysteria（spec §3.4）。
 //!
 //! 移植 `server/core.sh:923-1040`（`setup_cert_sync` 写出的 `cert-sync.sh` + timer + cron 三重触发）。
 //! v4 的变化（审计 §3.1「证书同步三重触发 → 合并」）：既不写 `cert-sync.sh`、也不建 timer/cron，
 //! 改成守护进程里的 inotify 任务 + 兜底轮询任务；比对从 `cmp` 改成 sha256 指纹记在
-//! `runtime.cert_sha256`；两个 hysteria 之间加 10 秒间隔（v3 是连续 restart，曾造成两实例同时失联）。
+//! `runtime.cert_sha256`。
+//!
+//! 两个实例读证书的方式不同（T3 §12 第 9 项，2026-09-18 实测）：
+//! - `hysteria-server` 是 apernet hysteria，只在启动时读证书（`CanReload=no`），换证必须重启；
+//! - `hysteria-residential` 是自建 sing-box（1.14），hysteria2 入站会 watch 证书文件热加载，
+//!   写完亚秒级打出 `inbound/hysteria2[hy2-resi]: reloaded TLS certificate`，既有连接不受影响。
+//!   所以住宅实例改成「确认热加载、超时才回退重启」（[`confirm_reload`]），不再无条件重启。
 
 use crate::reconcile::{Artifact, DaemonCtx, Module, RenderCtx};
-use crate::sys::Host;
+use crate::sys::{Host, JournalFrom};
 use bui_schema::model::State;
 use std::path::{Path, PathBuf};
 
-/// 两个 hysteria 之间的重启间隔（spec §3.4「间隔 10 秒依次重启两个 hysteria」）。
+/// 住宅实例写完证书后确认热加载的时限：超过它没在 journald 看到 `reloaded TLS certificate`
+/// 就回退重启（spec §3.4 原本是「两个 hysteria 错峰重启」的 10 秒间隔；4.1 住宅改热加载后，
+/// 只剩直连一个实例要重启、错峰无意义，这个常量转用作住宅实例的热加载确认时限）。
 pub const RESTART_GAP_SECS: u64 = 10;
+/// 住宅实例（自建 sing-box）hysteria2 入站热加载证书成功时逐字打出的日志片段。
+const RELOAD_MARK: &str = "reloaded TLS certificate";
 /// 已经有证书之后的兜底轮询间隔（inotify 漏事件时的保险）。
 pub const FALLBACK_POLL_SECS: u64 = 21600; // 6h
 /// **还没拿到首张证书**时的轮询间隔：全新装机时 Caddy 的 `certificates/` 目录还不存在，
@@ -101,12 +111,15 @@ pub fn copy_pair(host: &dyn Host, pair: &CertPair, certs_dir: &Path) -> anyhow::
     Ok(())
 }
 
-/// 同步一轮：找证书 → 判断 → 复制 → 错峰重启两个 hysteria。返回新指纹（无变化则 `None`）。
+/// 同步一轮：找证书 → 判断 → 复制 → 更新两个 hysteria（直连重启、住宅确认热加载）。
+/// 返回新指纹（无变化则 `None`）。
 pub async fn sync_once(ctx: &DaemonCtx, domain: &str) -> anyhow::Result<Option<String>> {
     let known = ctx.runtime.read().await.cert_sha256;
     let host = ctx.host.clone();
     let paths = ctx.paths.clone();
     let domain_owned = domain.to_string();
+    // 读住宅实例 journald 的起点必须在写证书之前（热加载行随写入而生）；抓在复制动作前一刻。
+    let since = ctx.host.now();
     let action = tokio::task::spawn_blocking(move || -> anyhow::Result<CertAction> {
         let Some(pair) = find_cert(
             host.as_ref(),
@@ -128,31 +141,70 @@ pub async fn sync_once(ctx: &DaemonCtx, domain: &str) -> anyhow::Result<Option<S
     ctx.runtime
         .update(|r| r.cert_sha256 = Some(sha256.clone()))
         .await;
-    // hysteria 只在启动时读证书（CanReload=no），两个实例共用同一份，都要重启；
-    // 间隔 10 秒，避免两条线路同时失联。
-    for (i, unit) in ["hysteria-server", "hysteria-residential"]
-        .iter()
-        .enumerate()
-    {
-        if i > 0 {
-            tokio::time::sleep(std::time::Duration::from_secs(RESTART_GAP_SECS)).await;
-        }
-        let host = ctx.host.clone();
-        let u = unit.to_string();
-        let restarted = tokio::task::spawn_blocking(move || {
-            // 没在跑的实例交给 systemd，证书同步不负责拉起（移植 core.sh:1000-1006）
-            if host.unit_is_active(&u).unwrap_or(false) {
-                host.systemd("restart", &u).map(|o| o.ok()).unwrap_or(false)
-            } else {
-                false
-            }
-        })
-        .await?;
-        if restarted {
-            tracing::info!(unit = *unit, "证书更新后已重启");
+    // 直连 hysteria（apernet）只在启动时读证书（CanReload=no），换证必须重启。
+    // 没在跑的实例交给 systemd，证书同步不负责拉起（移植 core.sh:1000-1006）。
+    if unit_active(ctx, "hysteria-server").await? && restart(ctx, "hysteria-server").await? {
+        tracing::info!(unit = "hysteria-server", "证书更新后已重启");
+    }
+    // 住宅实例（自建 sing-box）会 watch 证书文件热加载：先确认，超时才回退重启（fail-safe，
+    // 行为不比 4.0 差）。没在跑就同样交给 systemd（下次启动读新证书），既不读 journald 也不重启。
+    if unit_active(ctx, "hysteria-residential").await? {
+        if confirm_reload(ctx, "hysteria-residential", since).await {
+            tracing::info!(unit = "hysteria-residential", "证书已热加载，无需重启");
+        } else if restart(ctx, "hysteria-residential").await? {
+            tracing::warn!(
+                unit = "hysteria-residential",
+                secs = RESTART_GAP_SECS,
+                "证书热加载未在时限内确认，已回退重启"
+            );
         }
     }
     Ok(Some(sha256))
+}
+
+/// 单元是否在跑（`ctx.host` 的阻塞调用挪到 blocking 线程）。
+async fn unit_active(ctx: &DaemonCtx, unit: &'static str) -> anyhow::Result<bool> {
+    let host = ctx.host.clone();
+    Ok(tokio::task::spawn_blocking(move || host.unit_is_active(unit).unwrap_or(false)).await?)
+}
+
+/// 重启单元，返回是否成功（调用方已确认它在跑）。
+async fn restart(ctx: &DaemonCtx, unit: &'static str) -> anyhow::Result<bool> {
+    let host = ctx.host.clone();
+    Ok(tokio::task::spawn_blocking(move || {
+        host.systemd("restart", unit)
+            .map(|o| o.ok())
+            .unwrap_or(false)
+    })
+    .await?)
+}
+
+/// 写完证书后确认住宅实例（自建 sing-box）已热加载：在 [`RESTART_GAP_SECS`] 秒内反复读它的
+/// journald（复用哨兵那条 [`Host::journal_read`]，从写证书前一刻 [`JournalFrom::Since`] 读起、
+/// 只看新行），看到 [`RELOAD_MARK`] 即确认返回 `true`。
+///
+/// `copy_pair` 先写 fullchain 再写 privkey（两次 rename），中间态必然先出一条
+/// `reload key pair: tls: private key does not match public key` ERROR 再成功，所以只认最终
+/// 那行 `reloaded TLS certificate`；超时没看到返回 `false`，由调用方回退重启。
+async fn confirm_reload(ctx: &DaemonCtx, unit: &'static str, since: time::OffsetDateTime) -> bool {
+    let from = JournalFrom::Since(since);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(RESTART_GAP_SECS);
+    loop {
+        let host = ctx.host.clone();
+        let units = vec![unit.to_string()];
+        let from2 = from.clone();
+        if let Ok(Ok(recs)) =
+            tokio::task::spawn_blocking(move || host.journal_read(&units, &from2)).await
+        {
+            if recs.iter().any(|r| r.message.contains(RELOAD_MARK)) {
+                return true;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
 }
 
 /// 本轮兜底轮询该等多久：没证书 30s，有证书回到 6h。
@@ -404,19 +456,62 @@ mod tests {
         )
     }
 
+    /// 住宅实例热加载证书成功那行（前面那条 key-mismatch ERROR 略去，confirm_reload 只认它）。
+    fn reload_rec() -> crate::sys::JournalRecord {
+        crate::sys::JournalRecord {
+            cursor: "c-resi-0".into(),
+            unit: "hysteria-residential".into(),
+            ts: time::macros::datetime!(2026-09-11 00:00:01 UTC),
+            message: "inbound/hysteria2[hy2-resi]: reloaded TLS certificate".into(),
+        }
+    }
+
+    /// 热加载行出现 → 只重启直连、不重启住宅（T3 §12 第 9 项）。
     #[tokio::test(start_paused = true)]
-    async fn sync_restarts_both_hysteria_with_a_ten_second_gap() {
+    async fn residential_hot_reload_is_confirmed_and_skips_the_restart() {
         let host = Arc::new(FakeHost::new());
         host.with(|i| {
             i.units_active.insert("hysteria-server.service".into());
             i.units_active.insert("hysteria-residential.service".into());
+            i.journal.push_back(Ok(vec![reload_rec()]));
+        });
+        seed(&host, "CERT", "KEY");
+        let (ctx, _d) = ctx_with(host.clone()).await;
+        let sum = sync_once(&ctx, "example.com").await.unwrap().unwrap();
+        assert_eq!(sum, crate::kernels::sha256_hex(b"CERT"));
+        let ops = host.ops();
+        assert!(
+            ops.iter().any(|o| o == "systemd:restart:hysteria-server"),
+            "直连 hysteria 始终重启：{ops:?}"
+        );
+        assert!(
+            !ops.iter()
+                .any(|o| o == "systemd:restart:hysteria-residential"),
+            "住宅实例热加载已确认，绝不重启：{ops:?}"
+        );
+        assert_eq!(
+            ctx.runtime.read().await.cert_sha256.as_deref(),
+            Some(sum.as_str())
+        );
+    }
+
+    /// journald 里等不到 reloaded 行 → 回退重启住宅（fail-safe），且必然在确认时限之后。
+    #[tokio::test(start_paused = true)]
+    async fn residential_falls_back_to_restart_when_reload_is_not_seen() {
+        let host = Arc::new(FakeHost::new());
+        host.with(|i| {
+            i.units_active.insert("hysteria-server.service".into());
+            i.units_active.insert("hysteria-residential.service".into());
+            // journal 队列不塞 reloaded 行：每轮读回 Ok(vec![])，确认必然超时
         });
         seed(&host, "CERT", "KEY");
         let (ctx, _d) = ctx_with(host.clone()).await;
         let start = tokio::time::Instant::now();
-        let sum = sync_once(&ctx, "example.com").await.unwrap().unwrap();
-        assert_eq!(sum, crate::kernels::sha256_hex(b"CERT"));
-        assert!(tokio::time::Instant::now().duration_since(start).as_secs() >= RESTART_GAP_SECS);
+        sync_once(&ctx, "example.com").await.unwrap().unwrap();
+        assert!(
+            tokio::time::Instant::now().duration_since(start).as_secs() >= RESTART_GAP_SECS,
+            "回退重启必须等满确认时限"
+        );
         let ops = host.ops();
         let i1 = ops
             .iter()
@@ -425,12 +520,32 @@ mod tests {
         let i2 = ops
             .iter()
             .position(|o| o == "systemd:restart:hysteria-residential")
-            .unwrap();
-        assert!(i1 < i2, "先直连后住宅");
-        assert_eq!(
-            ctx.runtime.read().await.cert_sha256.as_deref(),
-            Some(sum.as_str())
-        );
+            .expect("热加载超时必须回退重启住宅");
+        assert!(i1 < i2, "先直连、住宅在确认超时后");
+    }
+
+    /// 无论住宅实例是热加载还是回退重启，直连 hysteria 都必须重启（apernet 只在启动时读证书）。
+    #[tokio::test(start_paused = true)]
+    async fn the_direct_hysteria_is_always_restarted() {
+        for journal in [Some(vec![reload_rec()]), None] {
+            let host = Arc::new(FakeHost::new());
+            host.with(|i| {
+                i.units_active.insert("hysteria-server.service".into());
+                i.units_active.insert("hysteria-residential.service".into());
+                if let Some(recs) = journal.clone() {
+                    i.journal.push_back(Ok(recs));
+                }
+            });
+            seed(&host, "CERT", "KEY");
+            let (ctx, _d) = ctx_with(host.clone()).await;
+            sync_once(&ctx, "example.com").await.unwrap().unwrap();
+            assert!(
+                host.ops()
+                    .iter()
+                    .any(|o| o == "systemd:restart:hysteria-server"),
+                "直连 hysteria 始终重启（journal={journal:?}）"
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]
