@@ -785,6 +785,15 @@ pub async fn check_once(ctx: &DaemonCtx) -> anyhow::Result<Vec<(String, Decision
     if restarted.contains("hysteria-residential") {
         ctx.bus.send(crate::api::Event::Hy2ResiRestarted);
     }
+    // relay 被重启过 = 一次**全池**切换：它的每个池 selector 的 `now` 都回落到配置里的
+    // default，归因的时间戳门要当场对全池记一次（2026-09-18 第三次裁决 ③），否则这一刻
+    // 之前产生的 relay 错误行会被路径 B 记到新成员头上。选择本身的重放由
+    // `residential::health` 的规则 6a 与 `drive_slots` 下一轮兜底 —— 这条来路按既有口径
+    // **不发** `Event::RelayRestarted`（§C 末段）。
+    if restarted.contains("b-ui-relay") {
+        let pools = crate::modules::residential::state::all_pool_selectors(&state);
+        crate::modules::residential::state::mark_pools_switch(&ctx.runtime, &pools, now).await;
+    }
     let nft_record = nft_event(&nft, &state, &nft_heals, now);
     // 命中数每轮都并一次（不只在重放那一轮）：采样点就是重放之前的那一刻，
     // 这一轮自己重放过就把 `seen` 归零（`nft -f` 先 flush table），中途被别的路径

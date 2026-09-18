@@ -279,11 +279,28 @@ pub async fn service_action(
     // `gates::replay_loop` 立刻重放真实门位；少了它就是全体住宅 HY2 用户被拒到下一轮
     // 60 秒安全网，且没有任何告警说明原因。`stop` 不发（门跟着内核一起没了）。
     let announce = unit == "hysteria-residential" && matches!(action.as_str(), "restart" | "start");
+    // relay 被这个端点重启 / 拉起 = 一次**全池**切换：每个池 selector 的 `now` 都回落到
+    // 配置里的 default ⇒ 归因的时间戳门要当场对全池记一次（2026-09-18 第三次裁决 ③）。
+    // 选择本身的重放由 `residential::health` 的规则 6a 下一轮兜底（这条来路同样不发
+    // `Event::RelayRestarted`，见 `health::check_round` 规则 6a 的注释）。
+    let relay_restarted = unit == "b-ui-relay" && matches!(action.as_str(), "restart" | "start");
     let out = tokio::task::spawn_blocking(move || host.systemd(&action, &unit)).await;
     match out {
         Ok(Ok(o)) => {
             if announce && o.ok() {
                 app.bus.send(Event::Hy2ResiRestarted);
+            }
+            if relay_restarted && o.ok() {
+                let pools = {
+                    let s = app.store.read().await;
+                    crate::modules::residential::state::all_pool_selectors(&s)
+                };
+                crate::modules::residential::state::mark_pools_switch(
+                    &app.runtime,
+                    &pools,
+                    app.host.now(),
+                )
+                .await;
             }
             (
                 StatusCode::OK,

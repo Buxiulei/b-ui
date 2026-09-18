@@ -172,7 +172,18 @@ pub async fn tick(ctx: &DaemonCtx, deps: &Deps, s: &mut Sentinel) -> TickReport 
         .into_iter()
         .collect();
     let pool_now = clash::pool_now(&deps.clash, &pools).await;
-    let switch_at = rstate::read(&ctx.runtime).await.pool_switch_at;
+    // 读序：`pool_switch_at` 在读 `now` **之后**才读（2026-09-18 第三次裁决 ②），
+    // 否则「读 now → 读 switch_at」之间的切换不在门里
+    let rt = rstate::read(&ctx.runtime).await;
+    let switch_at = rt.pool_switch_at.clone();
+    // 通用兜底：`now` 与 runtime 记的该池当前选择对不上 ⇒ 中间有过一次没记账的切换
+    // （relay 重启回落 default、有人手动 curl 过 Clash API…）。这些池本批整批丢弃，
+    // 并在下面把账补上（2026-09-18 第三次裁决 ③）
+    let unstable = clash::unstable_pools(&g, &pool_now, &rt);
+    if !unstable.is_empty() {
+        let list: Vec<String> = unstable.iter().cloned().collect();
+        rstate::mark_pools_switch(&ctx.runtime, &list, ctx.host.now()).await;
+    }
 
     // ②c 归因 + 去抖
     let mut fired: Vec<Fired> = Vec::new();
@@ -181,6 +192,14 @@ pub async fn tick(ctx: &DaemonCtx, deps: &Deps, s: &mut Sentinel) -> TickReport 
             let Some(sub) = m.relay.as_ref() else {
                 continue;
             };
+            if clash::pool_of(sub).is_some_and(|p| unstable.contains(p)) {
+                tracing::debug!(
+                    signature = m.sig.id(),
+                    subject = %m.subject,
+                    "该池的 now 与运行时记录不一致（有过没记账的切换），本批证据放弃"
+                );
+                continue;
+            }
             match clash::attribute(&g, sub, &pool_now, &switch_at, r.ts) {
                 clash::Attrib::Upstream(id) => Some(id),
                 clash::Attrib::Switched => {
@@ -711,6 +730,47 @@ mod tests {
         let rep = tick(&k.ctx, &k.deps, &mut s).await;
         assert_eq!(rep.incidents.len(), 1, "{:?}", rep.incidents);
         assert_eq!(rep.incidents[0].subject, "isp2.example.net:10007");
+    }
+
+    /// **裁决 ③ 的通用兜底**（2026-09-18 第三次）：relay 重启把每个 selector 打回配置里的
+    /// default，而这次重启**没有任何一条记账路径跑过**（守护进程自己刚起、或有人手动
+    /// `curl` 过 Clash API）。归因时发现某池的 `now` 与 runtime 记的「该池当前选择」对不上
+    /// ⇒ 这一批该池的路径 B 行整批丢弃（一次探测都不发），并**当场**把切换时刻补记上。
+    /// 少了这层兜底，重启之前那批老成员的失败会被整批记到重启后 default 的那条上游头上，
+    /// 而 `on_upstream_error` 的 `Unconfirmed` 是按不可用处置的（借槽 + 判不健康）。
+    #[tokio::test]
+    async fn an_unaccounted_relay_restart_drops_the_batch_and_stamps_the_pool() {
+        let k = kit().await;
+        // t=0：槽 1 被切到 resi-2，走的是生产那条 `Clash::select` 路径，runtime 记下了
+        let c: Arc<dyn Clash> = k.clash.clone();
+        slots::pin_slot(&k.ctx, c, 1, Some(Uuid::from_u128(2)))
+            .await
+            .unwrap();
+        // t=60：relay 重启，selector 回落到配置里的 default（resi-1）——没人记这一笔。
+        // 时间戳门在这里救不了场：那一笔记的是 t=0，错误行是 t=60 之后的
+        k.host.advance(60);
+        k.clash.with(|i| {
+            i.now.insert("slot-1-pool".into(), "resi-1".into());
+        });
+        feed(
+            &k,
+            (0..3)
+                .map(|t| rec("b-ui-relay", 60 + t, fx::POOL_SELECTOR_DEADLINE_SLOT1))
+                .collect(),
+        );
+        let mut s = Sentinel::default();
+        let rep = tick(&k.ctx, &k.deps, &mut s).await;
+        assert!(rep.incidents.is_empty(), "{:?}", rep.incidents);
+        assert!(k.prober.calls().is_empty(), "归不了因就别探测");
+        assert_eq!(
+            rstate::read(&k.ctx.runtime)
+                .await
+                .pool_switch_at
+                .get("slot-1-pool")
+                .map(String::as_str),
+            Some("2026-09-11T00:01:00Z"),
+            "没记账的切换当场补记，下一批才有门可依"
+        );
     }
 
     /// 门**只管路径 B**：同一批里 `dial tcp <上游地址>` 的行写的就是当时实际拨的那个上游，
