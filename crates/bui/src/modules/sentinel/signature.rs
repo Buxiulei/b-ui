@@ -755,6 +755,21 @@ mod tests {
         }
     }
 
+    /// 证书热加载每次都必然打一对 `reload certificate: reload key pair: … private key does not match
+    /// public key`（ERROR）+ `reloaded TLS certificate`（INFO）（§3.5 第 3 件、§12 第 9 项）。没人给它
+    /// 加白 —— `classify` 是签名白名单、这两条匹配不到任何签名 ⇒ 默认忽略、判 `None`。这条守门把「默认
+    /// 忽略」钉死：将来若有人加一条泛 ERROR 签名把轮换中间态当异常报出来，本用例转红。
+    #[test]
+    fn cert_reload_churn_is_default_ignored_not_a_signature() {
+        for l in [fx::CERT_RELOAD_MISMATCH, fx::CERT_RELOADED] {
+            assert_eq!(
+                sig_of("hysteria-residential", l),
+                None,
+                "证书热加载的正常轮换行不许报成事件：{l}"
+            );
+        }
+    }
+
     /// 签名表与遗留清单的不变量：四个新 id 都稳定、且没有重名
     #[test]
     fn the_new_signature_ids_are_stable_and_unique() {
