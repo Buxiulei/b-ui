@@ -6,7 +6,7 @@
 
 轻量级 Hysteria2 + Xray 多协议代理一键部署工具，内置 Web 管理面板与全功能流量管理。
 
-**当前版本**: v4.1.0（Rust 单二进制；版本号唯一来源是根 `Cargo.toml` 的 `[workspace.package] version`）
+**当前版本**: v4.1.1（Rust 单二进制；版本号唯一来源是根 `Cargo.toml` 的 `[workspace.package] version`）
 
 ---
 

@@ -8,6 +8,13 @@
 `version` 的唯一来源是根 `Cargo.toml` 的 `[workspace.package] version`；改版本必须同时在本文件加一段，`scripts/release/check-version.sh` 会在 CI 里卡住不一致（它只认 `## [<version>]` 这个标题，日期不参与校验）。
 未发布的版本日期写「未发布」，由主理人打 tag 发版时替换成当天日期（UTC）。
 
+## [4.1.1] - 2026-09-18
+
+只含运维脚本、面板文案与文档，**不改服务端与客户端行为**；已在 4.1.0 上的机器不需要为它升级。
+
+### 变更
+- **面板一键安装命令去掉冗余的 `BUI_C_SOURCE=`**：面板下发的 `bui-c-install.sh` 里 `PANEL_SOURCE` 已指向本面板 `/packages`、脚本自会回落，命令再设一遍没有作用；而 `sudo VAR=… bash` 要求 sudoers 有 SETENV，受限 sudoers 会报「not allowed to set the following environment variables」直接失败（2026-09-18 bui-c 线在 baiyi 实测）。现在是 `curl -fsSL --noproxy '*' '<面板>/packages/bui-c-install.sh' | sudo bash`；面板那段说明补了「已是 root 就去掉 sudo」「没有 curl 先装」两句。脚本正文仍认 `BUI_C_SOURCE`（手动运行仓库副本时覆盖制品源）。
+
 ## [4.1.0] - 2026-09-18
 
 **发版时的生产记账**（口径同 4.0.1）：正式 tag 从 `v4.1.0-rc1` 之后 2 个提交打出，两者之间**只改了 `scripts/ops/upgrade-drill.sh` 与它的测试**（`crates/`、`web/`、`install.sh`、`Cargo.*` 零改动），服务端与客户端二进制内容与 rc1 同源。rc1 构建在打 tag 时的实跑时长：**bwg-rick 约 2.9 小时**（2026-09-18T05:46Z 起，先做了一轮升级 + §9 回滚演练再定格）、**bwg-tizi 约 0.1 小时**（08:35Z 起，同样先演练再定格）；主理人裁定当天上线、不等 T19 写的 24 小时观察，两台各挂了每 2 小时的只读观察至 09-19。m3 机器化验收在 rick 跑了两轮：13 PASS / 1 SKIP（删上游那条不可逆、只在 staging 开）/ 1 FAIL——那条「住宅到期语义」已定性为验收脚本竞态（住宅门位在 60 秒用户同步周期上收敛、非事件驱动，脚本一见 200 即判失败），脚本修正与「到期 ≤60 秒生效」的文档说明随 4.1.1 发；同批推迟到 4.1.1 的还有面板一键安装命令去掉冗余的 `BUI_C_SOURCE=`（受限 sudoers 会因 SETENV 失败）。

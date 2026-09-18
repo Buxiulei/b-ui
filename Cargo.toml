@@ -5,7 +5,7 @@ members = ["crates/bui-schema", "crates/bui", "crates/bui-c"]
 [workspace.package]
 edition = "2021"
 rust-version = "1.85"
-version = "4.1.0"
+version = "4.1.1"
 license = "MIT"
 
 [workspace.dependencies]
