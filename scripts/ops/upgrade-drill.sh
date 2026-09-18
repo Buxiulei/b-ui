@@ -19,6 +19,18 @@
 # `plan_upgrade` 只比版本号、不比资产 sha256（第二波裁决 P-A），而自建与官方归档同打 1.14.1
 # ⇒ 4.0.x → 4.1 这一跳的计划里本来就不会有它，一次完全健康的升级也会被判 FAIL。这一跳的真
 # 不变量是升级后 `bin/sing-box version` 的 Tags 含 with_v2ray_api（下面那道闸门）。
+# 订阅判据（4.1 关键订正，2026-09-18 bwg-rick 真机演练）：4.1 的住宅 HY2 节点在订阅里**必然**
+# 从 `:(40000+槽)` + 按槽切片的 `mport` 变成 `:40000` + 整段 `mport=41000-50000`
+# （CLAUDE.md「Subscriptions」/ spec §7.5），而 auth 串、obfs、sni、其它节点全不变。「旧订阅
+# 零刷新」= 旧订阅**仍能用**（兼容段 REDIRECT 进 :40000），不是订阅字节不变——把它当成字节不变
+# 就会把一次健康的 4.0.x → 4.1 升级判成漂移。所以升级相位（before → after-upgrade）在**目标
+# 版本主次 ≥ 4.1** 时按「只许住宅 HY2 的端口/跳跃段变」判：三种订阅各自把住宅 HY2 节点的端口
+# 归一成 :40000、跳跃段归一成 41000-50000 后必须逐字相同（userinfo/password/obfs/sni/其它节点
+# 全不变），归一后仍不同才算漂移。目标 < 4.1（4.0.x → 4.0.x）仍按逐字节严格相等——归一会把 4.0
+# 的住宅端口也改成 40000，严格相等才抓得住「4.0 → 4.0 住宅端口意外变了」这种真事故。回滚相位
+# （before → after-rollback）永远严格逐字节相等（回滚必须回到原样）。住宅 HY2 的识别口径取自
+# 渲染器（不猜）：sub / clash 认冻结的 label「HY2住宅」，subscription 认出站 tag
+# `hy2-residential`（见 `normalize_sub`）。
 set -uo pipefail
 LC_ALL=C
 
@@ -90,6 +102,11 @@ command -v ss >/dev/null 2>&1 || { printf '缺少 ss：监听端口判据全靠�
 command -v python3 >/dev/null 2>&1 || { printf '需要 python3 来解析 state.json\n' >&2; exit 2; }
 
 mkdir -p "$OUT" || exit 2
+# 订阅原文（含 hy2 明文密码与 vless uuid）只在归一比对时临时落到一个 700 的 mktemp 目录，
+# 退出即删——不写进 $OUT（那是留档目录，虽然它里头的备份 tar 本就带凭据，仍不额外散落明文订阅），
+# 日志里的差异也一律经 redact_creds 打码。
+SUBDIR=$(mktemp -d "${TMPDIR:-/tmp}/bui-drill-subs.XXXXXX") || exit 2
+trap 'rm -rf "$SUBDIR"' EXIT
 CSV="$OUT/drill.csv"
 LOG="$OUT/drill.log"
 DONE="$OUT/DONE"
@@ -101,6 +118,13 @@ rec() { printf '%s,%s,%s\n' "$1" "$2" "$3" >> "$CSV"; }
 
 sha_str() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
 sha_file() { [[ -f "$1" ]] && sha256sum "$1" | cut -d' ' -f1 || printf 'missing\n'; }
+
+# 目标版本主次 ≥ 4.1？取字符串里第一处 `x.y`（容忍 `bui X.Y.Z`、`X.Y.Z-rcN` 等前后缀）。
+# 决定升级相位的订阅判据走归一比对（≥ 4.1）还是逐字节严格相等（< 4.1，见文件头）。
+version_ge_41() {
+    [[ "$1" =~ ([0-9]+)\.([0-9]+) ]] || return 1
+    (( BASH_REMATCH[1] > 4 || (BASH_REMATCH[1] == 4 && BASH_REMATCH[2] >= 1) ))
+}
 
 # $1 = 用户名 → 该用户的订阅 token（state.json 的 users[].sub_token），取不到就空串。
 # 2026-09-14 裁决：四个免鉴权端点认随机 token，用户名链接只在全局宽限期内还认 ⇒ 演练必须
@@ -246,7 +270,12 @@ snapshot() {
                 note_fail "sub-fetch:$phase:$u:$kind"
                 continue
             fi
+            # 原文落临时目录供归一比对用（退出即删，见开头 SUBDIR）。sub: 记原文 sha（严格判据
+            # 与 FAIL 输出用），subnorm: 记住宅 HY2 端口/跳跃段归一后的 sha（≥ 4.1 的零刷新判据用）。
+            printf '%s' "$body" > "$SUBDIR/$phase.$u.$kind"
             rec "$phase" "sub:$u:$kind" "$(sha_str "$body")"
+            rec "$phase" "subnorm:$u:$kind" \
+                "$(normalize_sub "$kind" "$SUBDIR/$phase.$u.$kind" | sha256sum | cut -d' ' -f1)"
         done
     done
 }
@@ -269,6 +298,120 @@ compare_subs() { compare_keys "$1" "$2" '^sub:' "订阅漂移"; }
 compare_bins() { compare_keys "$1" "$2" '^sha:bin/' "二进制未复原"; }
 compare_nft() { compare_keys "$1" "$2" '^nft:' "nft 指纹未复原"; }
 compare_listen() { compare_keys "$1" "$2" '^listen:udp:' "监听端口未复原"; }
+
+# 住宅 HY2 节点的端口/跳跃段归一：把该节点的端口归一成 :40000、跳跃段归一成 41000-50000，
+# 其余字节一律不动，输出可重复的规范文本（subnorm sha 与 FAIL 差异都用它）。识别口径取自渲染器
+# （不猜，CLAUDE.md「Subscriptions」/ nodes.rs `the_four_labels_are_frozen`）：sub / clash 认冻结
+# 的 label「HY2住宅」（node_uri 的 fragment 是 `{user}-HY2住宅`、clash 代理名同），subscription
+# 认出站 tag `hy2-residential`（render::subscription::tag）。解析不了的 body（取订阅失败留下的
+# 占位、非订阅内容）原样输出 ⇒ subnorm 退回等于原文 sha，绝不 FATAL。clash 优先用 pyyaml 规范化
+# 整份结构，装不上（生产常态）则按行归一住宅代理块的 port:/ports:。
+# $1 = kind（sub|subscription|clash），$2 = 订阅原文文件
+normalize_sub() {
+    python3 - "$1" "$2" <<'PY'
+import base64, json, os, re, sys
+kind, path = sys.argv[1], sys.argv[2]
+raw = open(path, "rb").read()
+RESI_LABEL = "HY2住宅"          # 冻结 label：住宅 HY2（sub 的 fragment、clash 的 name）
+RESI_TAG = "hy2-residential"    # sing-box 住宅出站 tag
+PORT = 40000
+HOP = (41000, 50000)
+
+def normalize():
+    if kind == "sub":
+        import urllib.parse
+        out = []
+        for ln in base64.b64decode(raw).decode("utf-8").split("\n"):
+            frag = urllib.parse.unquote(ln.split("#", 1)[1]) if "#" in ln else ""
+            if ln.startswith("hysteria2://") and frag.endswith(RESI_LABEL):
+                ln = re.sub(r"(@[^:?#]*):[0-9]+", r"\g<1>:%d" % PORT, ln, count=1)
+                ln = re.sub(r"mport=[0-9]+-[0-9]+", "mport=%d-%d" % HOP, ln, count=1)
+            out.append(ln)
+        return "\n".join(out)
+    if kind == "subscription":
+        d = json.loads(raw)
+        for o in d.get("outbounds", []):
+            if isinstance(o, dict) and o.get("tag") == RESI_TAG:
+                if "server_port" in o:
+                    o["server_port"] = PORT
+                if "server_ports" in o:
+                    o["server_ports"] = ["%d:%d" % HOP]
+        return json.dumps(d, sort_keys=True, indent=2, ensure_ascii=False)
+    if kind == "clash":
+        try:
+            if os.environ.get("BUI_DRILL_NO_PYYAML"):
+                raise ImportError
+            import yaml
+            d = yaml.safe_load(raw)
+            if not isinstance(d, dict):
+                raise ValueError
+            for p in (d.get("proxies") or []):
+                if isinstance(p, dict) and p.get("type") == "hysteria2" \
+                        and str(p.get("name", "")).endswith(RESI_LABEL):
+                    if "port" in p:
+                        p["port"] = PORT
+                    if "ports" in p:
+                        p["ports"] = "%d-%d" % HOP
+            return json.dumps(d, sort_keys=True, indent=2, ensure_ascii=False, default=str)
+        except ImportError:
+            # 无 pyyaml：按行归一住宅代理块的 port:/ports:，块的边界与归属靠 name: 认
+            in_resi = False
+            out = []
+            for ln in raw.decode("utf-8").split("\n"):
+                s = ln.strip()
+                if s.startswith("- name:") or s.startswith("name:"):
+                    in_resi = RESI_LABEL in s
+                if in_resi:
+                    ln = re.sub(r"(\bport:\s*)[0-9]+", r"\g<1>%d" % PORT, ln)
+                    ln = re.sub(r"(\bports:\s*)\S+", r'\g<1>"%d-%d"' % HOP, ln)
+                out.append(ln)
+            return "\n".join(out)
+    return None
+
+try:
+    result = normalize()
+    if result is None:
+        raise ValueError
+    sys.stdout.write(result)
+except Exception:
+    sys.stdout.buffer.write(raw)
+PY
+}
+
+# 差异输出打码：URI 的 userinfo（user:pw / vless uuid）、URI query 里的 obfs-password / password，
+# 与 JSON/YAML 里的 password / uuid / secret / obfs 值，一律换成 <redacted>——凭据绝不进日志
+# （CLAUDE.md 硬规矩）。端口、mport、sni、节点名等非凭据保留，好让运维看清漂在哪。
+redact_creds() {
+    sed -E \
+        -e 's#(://)[^@[:space:]/]*@#\1<redacted>@#g' \
+        -e 's/((obfs-password|password)=)[^&#[:space:]]*/\1<redacted>/g' \
+        -e 's/("(password|uuid|secret|obfs_password)": *")[^"]*/\1<redacted>/g' \
+        -e 's/((password|obfs-password): *"?)[^"[:space:]]*/\1<redacted>/g'
+}
+
+# 升级相位「零刷新」的归一判据（目标 ≥ 4.1）：只许住宅 HY2 的端口/跳跃段变，归一后必须逐字相同。
+# 归一后仍不同 ⇒ FAIL 订阅漂移（照旧输出 before/after 的原文 sha），再打印第一处差异（已打码）。
+compare_subs_norm() {
+    local a="$1" b="$2" u kind na nb sa sb rc=0
+    for u in ${USERS//,/ }; do
+        for kind in sub subscription clash; do
+            na=$(awk -F, -v p="$a" -v k="subnorm:$u:$kind" '$1 == p && $2 == k {print $3}' "$CSV")
+            nb=$(awk -F, -v p="$b" -v k="subnorm:$u:$kind" '$1 == p && $2 == k {print $3}' "$CSV")
+            # 缺记录 = 取订阅失败，snapshot 已 note_fail，这里不重复报
+            [[ -z "$na" || -z "$nb" ]] && continue
+            [[ "$na" == "$nb" ]] && continue
+            sa=$(awk -F, -v p="$a" -v k="sub:$u:$kind" '$1 == p && $2 == k {print $3}' "$CSV")
+            sb=$(awk -F, -v p="$b" -v k="sub:$u:$kind" '$1 == p && $2 == k {print $3}' "$CSV")
+            log "FAIL 订阅漂移 sub:$u:$kind：$a=$sa $b=$sb"
+            log "  归一后仍不同（住宅 HY2 端口/跳跃段之外有变化），第一处差异（凭据已打码）："
+            diff <(normalize_sub "$kind" "$SUBDIR/$a.$u.$kind") \
+                 <(normalize_sub "$kind" "$SUBDIR/$b.$u.$kind") |
+                head -12 | redact_creds | sed 's/^/    /' | tee -a "$LOG" >&3
+            rc=1
+        done
+    done
+    return "$rc"
+}
 
 # 相位相关的期望值（不是逐相位相等）：$1 = phase，$2 = key，$3 = 期望值，$4 = 失败前缀
 expect() {
@@ -404,8 +547,15 @@ if [[ -n "$TO" && "$after_ver" != "$TO" ]]; then
     note_fail "upgrade-version"
 fi
 all_active after-upgrade || note_fail "upgrade-units"
-# 三种订阅的 sha 对**每个**用户逐行不变 —— 4.1「零刷新」的判据本体
-compare_subs before after-upgrade || note_fail "upgrade-subs"
+# 三种订阅的判据（见文件头「订阅判据」）：目标主次 ≥ 4.1 时按「只许住宅 HY2 端口/跳跃段变」的
+# 归一比对（4.1 的住宅节点必然从 :(40000+槽)+按槽切片变成 :40000+41000-50000）；目标 < 4.1
+# （4.0.x → 4.0.x）仍逐字节严格相等。目标版本优先看 --to，没给则看升级后实测版本（manifest 里
+# 那份）——两者在健康升级里相等（上面 upgrade-version 已核）。
+if version_ge_41 "${TO:-$after_ver}"; then
+    compare_subs_norm before after-upgrade || note_fail "upgrade-subs"
+else
+    compare_subs before after-upgrade || note_fail "upgrade-subs"
+fi
 
 # 自建 sing-box 必须真的装上（Global Constraints 第二波裁决 P-A）：内核身份现在是
 # 「版本号 + 资产 sha256」，装不上就会让 `hy2-residential.json` 每轮 `sing-box check` 必 FATAL
