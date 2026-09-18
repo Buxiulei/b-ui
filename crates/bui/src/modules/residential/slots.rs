@@ -2854,6 +2854,16 @@ mod tests {
         let r = state::read(&ctx.runtime).await;
         assert_eq!(r.slots["1"].current_upstream_id, Some(Uuid::from_u128(3)));
         assert_eq!(r.slots["1"].back_rounds, 0, "被挪走的槽从头数切回轮数");
+        // 切成功 ⇒ 记下切换时刻：relay 错误行的归因靠它判「这条行是切换前还是切换后的」
+        //（`clash::within_switch_grace`）。借用是生产里最频繁的切换路径，漏记这一笔，
+        // 哨兵与黑名单就会把老出口的失败记到刚借来的这条上游头上
+        assert_eq!(
+            r.pool_switch_at.get("slot-1-pool").map(String::as_str),
+            Some("2026-09-11T00:00:00Z"),
+            "{:?}",
+            r.pool_switch_at
+        );
+        assert_eq!(r.pool_switch_at.len(), 1, "没切的槽不记");
     }
 
     #[tokio::test]

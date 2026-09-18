@@ -1438,6 +1438,15 @@ mod tests {
             out.notes
         );
         assert_eq!(clash.selected(POOL).as_deref(), Some("resi-2"));
+        // 重放不写 `last_switch_at`（不吃 60 秒限速），但 selector 的 `now` 确实换了值 ⇒
+        // 归因的时间戳门照记
+        let r = rstate::read(&c.runtime).await;
+        assert_eq!(r.last_switch_at, None, "重放不吃切换限速");
+        assert!(
+            r.pool_switch_at.contains_key(POOL),
+            "{:?}",
+            r.pool_switch_at
+        );
         let r = rstate::read(&c.runtime).await;
         assert_eq!(
             r.selected_upstream_id,
@@ -1527,6 +1536,12 @@ mod tests {
         assert_eq!(out.healthy, vec!["resi-2"]);
         assert_eq!(out.switched_to.as_deref(), Some("resi-2"));
         let r = rstate::read(&c.runtime).await;
+        // 巡检切换同样要记切换时刻（归因的时间戳门）
+        assert!(
+            r.pool_switch_at.contains_key(POOL),
+            "{:?}",
+            r.pool_switch_at
+        );
         // 告警以 uuid 为键（url-N 是位置名，删条目后会被新条目复用），文案用 host:port
         let msg = r
             .upstream_alerts
@@ -2521,9 +2536,14 @@ mod tests {
             .unwrap();
         assert_eq!(tag, "resi-2");
         assert_eq!(clash.selected(POOL).as_deref(), Some("resi-2"));
+        let r = rstate::read(&c.runtime).await;
+        assert_eq!(r.selected_upstream_id, Some(Uuid::from_u128(2)));
+        // 手动切也是切：归因的时间戳门要记（`state::note_pool_switch`）
         assert_eq!(
-            rstate::read(&c.runtime).await.selected_upstream_id,
-            Some(Uuid::from_u128(2))
+            r.pool_switch_at.get(POOL).map(String::as_str),
+            Some("2026-09-11T00:00:00Z"),
+            "{:?}",
+            r.pool_switch_at
         );
         // 不写 state ⇒ 不重启 relay
         assert_eq!(
@@ -2695,6 +2715,17 @@ mod tests {
         );
         assert_eq!(clash.peek("slot-0-pool"), None, "用本槽 IP 的槽不发 PUT");
         let r = rstate::read(&c.runtime).await;
+        // 重放也换了每个 selector 的 `now` ⇒ 归因的时间戳门要记（`state::note_pool_switch`）：
+        // 重放之前打出来的那批错误行说的是 relay 重启前的成员，不能按重放后的 `now` 归因
+        assert_eq!(
+            r.pool_switch_at.keys().cloned().collect::<Vec<_>>(),
+            vec![
+                POOL.to_string(),
+                "slot-1-pool".to_string(),
+                "slot-2-pool".to_string()
+            ],
+            "重放成功的三个 selector 各记一笔，没重放的槽 0 不记"
+        );
         assert_eq!(r.slots["1"].current_upstream_id, Some(Uuid::from_u128(3)));
         assert_eq!(r.slots["1"].back_rounds, 1);
         assert_eq!(r.slots["2"].current_upstream_id, Some(Uuid::from_u128(1)));
