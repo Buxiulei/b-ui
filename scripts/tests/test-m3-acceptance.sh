@@ -77,7 +77,15 @@ assert_contains "≥2 条上游" "$out2" "用法点明 --remove-upstream 只在�
 # 归零测量的三个辅助（复核里四个变异全存活的那几处）
 assert_contains "online_count 回显空（fail-closed）" "$out" "online_count 读不到时不当成归零"
 assert_contains "只读到一次 0 ⇒ 不算归零" "$out" "wait_online_zero 的连续轮数有断言"
-assert_contains "probe_all_fail 中途成功过一次就回 200" "$out" "probe_all_fail 的早退有断言"
+# 判据③ 住宅到期改用 probe_until_fail（门切 deny 有 ~10 秒采样轮延迟，不能「一看到 200 就 FAIL」）：
+# PASS 分支（收敛前 200 不误判）、门没切的 FAIL、抖不收敛的 FAIL、失败码回显四条都要有断言，
+# 且脚本里不许再残留旧的 probe_all_fail。
+assert_contains "probe_until_fail 收敛前的 200 不误判" "$out" "probe_until_fail 的 PASS 分支有断言"
+assert_contains "probe_until_fail 门没切（一直 200）到窗口末回 200（FAIL）" "$out" "门没切的 FAIL 分支有断言"
+assert_contains "probe_until_fail 凑不满连续失败（一直抖）判 FAIL" "$out" "连续 N 次失败判据有断言"
+assert_contains "probe_until_fail 稳定失败时回最后一次的码（403）" "$out" "失败码回显有断言"
+assert_eq "0" "$(grep -c 'probe_all_fail' "$ROOT/scripts/m3-acceptance.sh")" \
+    "脚本里没有旧 probe_all_fail 的残留（判据③ 住宅那半已换成 probe_until_fail）"
 
 # 4.0.x 的按槽枚举彻底退场：带后缀的单元名、住宅那个 trafficStats 端口、
 # 两个按槽展开的函数都不许再出现在脚本里（spec §2.5 / §5.1）
