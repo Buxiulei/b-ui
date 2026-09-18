@@ -8,6 +8,22 @@
 `version` 的唯一来源是根 `Cargo.toml` 的 `[workspace.package] version`；改版本必须同时在本文件加一段，`scripts/release/check-version.sh` 会在 CI 里卡住不一致（它只认 `## [<version>]` 这个标题，日期不参与校验）。
 未发布的版本日期写「未发布」，由主理人打 tag 发版时替换成当天日期（UTC）。
 
+## [4.1.2] - 未发布
+
+**只改守护进程的日志解析与归因，不动渲染器、不动订阅、不动内核配置**：升级前后三种订阅的字节不变。
+这一段改变守护进程的**行为**——自动黑名单会开始按真实的被拒行学习（此前两台生产机上它一条都没学到过），
+所以先发 rc、在 bwg-rick 上观察，观察项见下。
+
+### 修复
+- **relay 的错误行归因修好：三个哨兵签名与自动黑名单学习不再全盲**。sing-box 的 `route/conn.go` 只把「路由选中的那个出站」的类型与 tag 写进 `open connection to … using outbound/<kind>[<tag>]`；而 4.1 的 relay 路由规则一律指向 group（每槽 `slot-<i>-pool`、DNS 与 global 模式 `resi-pool`），group 的 `NewConnection` 又把**自己**当 dialer 传下去 ⇒ **生产日志里成员 tag `resi-<n>` 一个字都不出现**。`sentinel::signature::parse_relay` 与 `residential::journal::parse_line` 原先都只认 `http|socks[resi-N]`，于是：`relay_upstream_error` / `relay_upstream_auth_failed` / `relay_google_blocked` 三个签名**再也不会被真实流量触发**（两台生产机 14 天窗口采样：2026-09-15 拓扑切换之后成员形状 0 条），住宅上游故障只剩每 120 秒一轮的主动体检兜底；自动黑名单的候选学习**一条都没学到过**（量最大的 `socks5: request rejected, code=2` 两机合计每天几千到两万多条，全部漏掉），只剩每日 12 个域名的固定探针集。现在两处解析都认池形状（`selector` / `urltest`，且 tag 必须是已知池名 `resi-pool` / `slot-<i>-pool`），「哪个上游」由调用方归因：先用错误原文里 `dial tcp <ip>:<port>` 的上游地址（零 I/O、唯一命中才算），不成再问一次该池的 Clash API `now`（每轮每池只查一次）。归不了因的行一律丢弃、只记 debug，**绝不猜**。
+- **归因的竞态防护**：同一轮里在归因前后**各读一次**每个池的 `now`，两次不一致的池（正被巡检或另一次借用切着）本轮归因到它的行**整批丢弃**、连去抖计数都不进，下一轮重新观察。否则一条老成员的失败会被记到新成员头上——哨兵那边的代价是白探一个健康上游，黑名单那边会按 `(上游, 域名, 端口)` 一直累计。
+- **`authentication required` 补进凭据失效的判据**：这是 sing-box http 出站鉴权失败的形状（一台生产机 14 天窗口 2650 条），此前落不进任何一支、静默丢弃。`unexpected EOF`（同窗口 17217 条）语义含糊（上游掐的还是目标掐的分不出来），**仍然不归类**，两边都不学，已由用例钉住。
+- 哨兵与黑名单的 relay 用例改喂新的真机夹具 `fixtures_relay`（两台生产机 14 天窗口采到的每一类形状各一条，已脱敏），不再拿手工拼的成员形状当唯一用例——正是那批「测试全绿、生产全瞎」的用例让这个盲区潜伏了下来。
+
+### 发布后观察项（bwg-rick）
+- `bui incidents` 里是否开始出现 `relay_upstream_error` / `relay_upstream_auth_failed` 一类事件，以及借用是否合理（探测通过 = Info、不动作是正常的）。
+- `runtime.json` 的 `candidates` 是否开始累计，以及每日 04:00 之后 `state.blacklist.auto` 有没有出现**不该被拉黑**的域名。确认路径是「硬拒 + 直连可达、间隔 ≥10 分钟连续 2 次」，误学一次不会直接生效，但要盯住第一批被确认的条目。
+
 ## [4.1.1] - 2026-09-18
 
 只含运维脚本、面板文案与文档，**不改服务端与客户端行为**；已在 4.1.0 上的机器不需要为它升级。
