@@ -204,6 +204,23 @@ if [[ "$*" == *"-K -"* ]]; then
 fi
 printf '%s\n' "$url" >> "$CURL_LOG"
 if [[ "${FAKE_404:-0}" == "1" ]]; then exit 22; fi
+# FAKE_REAL_SUBS=1：返回**构造好的三种真实订阅体**（base64 URI / sing-box JSON / clash YAML），
+# 住宅 HY2 节点在 4.0 形态是 :40001+42000-43000、4.1 形态（hy2-residential.json 在盘上）是
+# :40000+41000-50000，其余节点两态一字不差——钉住 `compare_subs_norm` 的归一判据（升级相位只许
+# 住宅端口/跳跃段变）。FAKE_RESI_USERINFO_DRIFT=1 让 4.1 形态的住宅 userinfo 也变（归一抹不掉 ⇒
+# 判漂移）；FAKE_DIRECT_DRIFT=1 让 4.1 形态的直连节点端口也变（非住宅节点不归一 ⇒ 判漂移）。
+if [[ "${FAKE_REAL_SUBS:-0}" == "1" ]]; then
+  tok=${url##*/}; rest=${url%/*}; kind=${rest##*/}
+  case "$tok" in "$ALICE_TOK") user=alice ;; "$BOB_TOK") user=bob ;; *) user=$tok ;; esac
+  shape=40; [[ -f "$BASEDIR/hy2-residential.json" ]] && shape=41
+  resi_pw="$user:resi-secret"; direct_port=10000
+  if [[ "$shape" == 41 ]]; then
+    [[ "${FAKE_RESI_USERINFO_DRIFT:-0}" == "1" ]] && resi_pw="$user:resi-DRIFTED"
+    [[ "${FAKE_DIRECT_DRIFT:-0}" == "1" ]] && direct_port=10099
+  fi
+  python3 "$GEN_SUB" "$kind" "$user" "$shape" "$resi_pw" "$direct_port"
+  exit 0
+fi
 body="sub:${url##*/}"
 if [[ "${FAKE_DRIFT:-0}" == "1" && -f "$VERFILE.prev" ]]; then body="$body-drifted"; fi
 # FAKE_DRIFT_UPGRADE_ONLY=1：只在 4.1 的形态（hy2-residential.json 在盘上）漂移 ⇒ 漂移被
@@ -213,6 +230,59 @@ if [[ "${FAKE_DRIFT_UPGRADE_ONLY:-0}" == "1" && -f "$BASEDIR/hy2-residential.jso
 fi
 printf '%s\n' "$body"
 STUB
+# 三种订阅体的生成器（FAKE_REAL_SUBS 用）：字段名与渲染器同口径——sub 的 fragment 与 clash 的
+# name 用冻结 label「HY2住宅」，sing-box 住宅出站 tag 用 `hy2-residential`。合成值只用
+# example.com / alice|bob / 0123…（公开仓库不写真域名/凭据）。
+cat > "$WORK/gensub.py" <<'PY'
+import base64, json, sys
+kind, user, shape, resi_pw, direct_port = sys.argv[1:6]
+direct_port = int(direct_port)
+resi_port, resi_hop_uri = (40000, "41000-50000") if shape == "41" else (40001, "42000-43000")
+resi_ports_sb = resi_hop_uri.replace("-", ":")
+uuid = "11111111-1111-4111-8111-111111111111"
+if kind == "sub":
+    lines = [
+        f"vless://{uuid}@example.com:10001?security=reality&encryption=none&pbk=0123456789abcdef&headerType=&fp=chrome&spx=%2F&type=tcp&flow=xtls-rprx-vision&sni=www.bing.com&sid=0123456789abcdef#{user}-Reality%E7%9B%B4%E8%BF%9E",
+        f"vless://{uuid}@example.com:10002?security=reality&encryption=none&pbk=0123456789abcdef&headerType=&fp=chrome&spx=%2F&type=tcp&flow=xtls-rprx-vision&sni=www.bing.com&sid=0123456789abcdef#{user}-Reality%E4%BD%8F%E5%AE%85",
+        f"hysteria2://{user}:pw-direct@example.com:{direct_port}?sni=example.com&insecure=0&mport=20000-30000&obfs=salamander&obfs-password=obfs-pw#{user}-HY2%E7%9B%B4%E8%BF%9E",
+        f"hysteria2://{resi_pw}@example.com:{resi_port}?sni=example.com&insecure=0&mport={resi_hop_uri}&obfs=salamander&obfs-password=obfs-pw#{user}-HY2%E4%BD%8F%E5%AE%85",
+    ]
+    sys.stdout.write(base64.b64encode("\n".join(lines).encode()).decode())
+elif kind == "subscription":
+    doc = {"log": {"level": "info"}, "outbounds": [
+        {"type": "vless", "tag": "vless-direct", "server": "example.com", "server_port": 10001, "uuid": uuid},
+        {"type": "vless", "tag": "vless-residential", "server": "example.com", "server_port": 10002, "uuid": uuid},
+        {"type": "hysteria2", "tag": "hy2-direct", "server": "example.com", "server_port": direct_port,
+         "server_ports": ["20000:30000"], "password": f"{user}:pw-direct"},
+        {"type": "hysteria2", "tag": "hy2-residential", "server": "example.com", "server_port": resi_port,
+         "server_ports": [resi_ports_sb], "password": resi_pw},
+        {"type": "direct", "tag": "direct"},
+    ]}
+    sys.stdout.write(json.dumps(doc, indent=2, ensure_ascii=False))
+elif kind == "clash":
+    try:
+        import yaml
+    except ImportError:
+        yaml = None
+    doc = {"proxies": [
+        {"name": f"{user}-Reality直连", "type": "vless", "server": "example.com", "port": 10001, "uuid": uuid},
+        {"name": f"{user}-HY2直连", "type": "hysteria2", "server": "example.com", "port": direct_port,
+         "ports": "20000-30000", "password": f"{user}:pw-direct", "obfs": "salamander", "obfs-password": "obfs-pw"},
+        {"name": f"{user}-HY2住宅", "type": "hysteria2", "server": "example.com", "port": resi_port,
+         "ports": resi_hop_uri, "password": resi_pw, "obfs": "salamander", "obfs-password": "obfs-pw"},
+    ]}
+    if yaml is not None:
+        sys.stdout.write("# B-UI Clash Meta 订阅配置\n\n" + yaml.safe_dump(doc, allow_unicode=True, sort_keys=False))
+    else:
+        out = ["# B-UI Clash Meta 订阅配置", "", "proxies:"]
+        for p in doc["proxies"]:
+            out.append(f'  - name: "{p["name"]}"')
+            for k, v in p.items():
+                if k == "name":
+                    continue
+                out.append(f'    {k}: {json.dumps(v, ensure_ascii=False)}')
+        sys.stdout.write("\n".join(out) + "\n")
+PY
 # tar stub：只记录被调用，避免真的打包 /opt
 cat > "$WORK/bin/tar" <<'STUB'
 #!/usr/bin/env bash
@@ -256,7 +326,8 @@ chmod +x "$WORK/bin"/* "$WORK/nftbin"/*
 export PATH="$WORK/bin:$WORK/nftbin:$PATH" VERFILE="$WORK/version" TAR_LOG="$WORK/tar.log" \
        BUI_LOG="$WORK/bui.log" BASEDIR="$WORK/base" CURL_LOG="$WORK/curl.log" \
        CURL_ARGV_LOG="$WORK/curl.argv.log" NFT_STATE="$WORK/nftstate" \
-       SLEEP_LOG="$WORK/sleep.log"
+       SLEEP_LOG="$WORK/sleep.log" GEN_SUB="$WORK/gensub.py" \
+       ALICE_TOK="$ALICE_TOK" BOB_TOK="$BOB_TOK"
 
 reset_env() {
     rm -f "$WORK/version.prev" "$WORK/bui.log" "$WORK/curl.log" "$WORK/curl.argv.log" \
@@ -598,4 +669,60 @@ out=$(bash "$ROOT/scripts/ops/upgrade-drill.sh" --users alice --settle 5s \
 assert_eq "2" "$rc" "--settle 不是整数秒退 2"
 assert_contains "--settle <秒>" "$out" "用法里列出 --settle"
 assert_eq "0" "$([[ -f "$WORK/badsettle/drill.csv" ]] && echo 1 || echo 0)" "--settle 写错就一个相位都不进"
+
+# ================= 4.1 订阅归一判据（2026-09-18 bwg-rick 真机演练订正）=================
+# 4.1 的住宅 HY2 节点在订阅里**必然**从 :(40000+槽)+按槽切片变成 :40000+41000-50000（CLAUDE.md
+# 「Subscriptions」/ spec §7.5），auth/obfs/sni/其它节点全不变——旧演练拿逐字节相等判，把这次
+# 健康升级判成 upgrade-subs FAIL（真机唯一的 FAIL）。现在升级相位在目标主次 ≥ 4.1 时按「只许住宅
+# 端口/跳跃段变」的归一比对判，目标 < 4.1 仍逐字节严格相等；回滚相位永远严格相等。curl 桩用
+# FAKE_REAL_SUBS 返回构造好的三种真实订阅体（合成值：example.com / alice|bob / 0123…）。
+
+# ① 4.1 目标、只有住宅端口/跳跃段变 ⇒ PASS（归一后三种订阅逐字相同）
+reset_env
+out=$(FAKE_REAL_SUBS=1 run_to 4.1.1 "$WORK/subsok" 2>&1); rc=$?
+assert_eq "0" "$rc" "4.1 目标、只住宅端口/段变 ⇒ 归一后 PASS"
+assert_contains "verdict=PASS" "$(cat "$WORK/subsok/DONE")" "零刷新健康升级不判漂移"
+assert_not_contains "订阅漂移" "$out" "住宅端口/段变不算漂移"
+# subnorm: 每相位每用户每种订阅各记一条（2 用户 × 3 种 = 6）
+assert_eq "6" "$(awk -F, '$1 == "before" && $2 ~ /^subnorm:/ {c++} END {print c + 0}' "$WORK/subsok/drill.csv")" \
+    "before 相位记了 6 条 subnorm 指纹"
+# 归一是「把差异抹平」而非「本来就相同」：原文 sub sha 升级前后**确实变了**，归一后才相同
+assert_eq "1" "$([[ "$(csv before sub:alice:sub "$WORK/subsok/drill.csv")" \
+    != "$(csv after-upgrade sub:alice:sub "$WORK/subsok/drill.csv")" ]] && echo 1 || echo 0)" \
+    "住宅端口/段变了 ⇒ 原文 sub sha 前后不同"
+assert_eq "$(csv before subnorm:alice:sub "$WORK/subsok/drill.csv")" \
+    "$(csv after-upgrade subnorm:alice:sub "$WORK/subsok/drill.csv")" \
+    "归一后 sub 指纹前后相同（住宅端口/段被归一）"
+assert_eq "$(csv before subnorm:alice:subscription "$WORK/subsok/drill.csv")" \
+    "$(csv after-upgrade subnorm:alice:subscription "$WORK/subsok/drill.csv")" \
+    "归一后 sing-box 订阅指纹前后相同"
+assert_eq "$(csv before subnorm:alice:clash "$WORK/subsok/drill.csv")" \
+    "$(csv after-upgrade subnorm:alice:clash "$WORK/subsok/drill.csv")" \
+    "归一后 clash 订阅指纹前后相同"
+
+# ② 4.1 目标、住宅 userinfo 变 ⇒ FAIL（归一只抹端口/段，凭据变照抓）
+reset_env
+out=$(FAKE_REAL_SUBS=1 FAKE_RESI_USERINFO_DRIFT=1 run_to 4.1.1 "$WORK/subspw" 2>&1); rc=$?
+assert_eq "1" "$rc" "4.1 目标、住宅 userinfo 变 ⇒ FAIL"
+assert_contains "FAIL 订阅漂移 sub:alice:sub：before=" "$out" "点名住宅 userinfo 漂移（照旧带原文 sha）"
+assert_contains "first_failure=upgrade-subs" "$(cat "$WORK/subspw/DONE")" "DONE 记 upgrade-subs"
+assert_contains "第一处差异（凭据已打码）" "$out" "打印第一处差异"
+assert_contains "<redacted>" "$out" "差异里的 userinfo / password 打码"
+assert_not_contains "resi-DRIFTED" "$out" "变了的凭据本身绝不落日志"
+
+# ③ 4.1 目标、直连节点变 ⇒ FAIL（非住宅节点不归一）
+reset_env
+out=$(FAKE_REAL_SUBS=1 FAKE_DIRECT_DRIFT=1 run_to 4.1.1 "$WORK/subsdir" 2>&1); rc=$?
+assert_eq "1" "$rc" "4.1 目标、直连节点变 ⇒ FAIL"
+assert_contains "FAIL 订阅漂移 sub:alice:sub" "$out" "点名订阅漂移"
+assert_contains "first_failure=upgrade-subs" "$(cat "$WORK/subsdir/DONE")" "DONE 记 upgrade-subs"
+assert_contains "10099" "$out" "差异里看得到直连端口变化（端口非凭据、不打码）"
+
+# ④ 4.0 目标、住宅端口变 ⇒ FAIL（严格模式：归一只在目标 ≥ 4.1 时启用）
+reset_env
+out=$(FAKE_REAL_SUBS=1 run_to 4.0.2 "$WORK/subs40" 2>&1); rc=$?
+assert_eq "1" "$rc" "4.0 目标、住宅端口变 ⇒ 严格模式判 FAIL"
+assert_contains "FAIL 订阅漂移 sub:alice:sub" "$out" "4.0→4.0 住宅端口意外变了照样抓住"
+assert_contains "first_failure=upgrade-subs" "$(cat "$WORK/subs40/DONE")" "DONE 记 upgrade-subs"
+
 finish
