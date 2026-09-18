@@ -970,8 +970,15 @@ mod tests {
     }
 
     async fn ctx(host: Arc<FakeHost>) -> (crate::reconcile::DaemonCtx, tempfile::TempDir) {
+        ctx_with_state(host, sample_state()).await
+    }
+
+    async fn ctx_with_state(
+        host: Arc<FakeHost>,
+        state: State,
+    ) -> (crate::reconcile::DaemonCtx, tempfile::TempDir) {
         let d = tempfile::tempdir().unwrap();
-        let store = Store::create(d.path().join("state.json"), sample_state())
+        let store = Store::create(d.path().join("state.json"), state)
             .await
             .unwrap();
         let runtime = Runtime::load(d.path().join("runtime.json"));
@@ -1069,6 +1076,74 @@ mod tests {
             rx.try_recv().ok(),
             Some(crate::api::Event::Hy2ResiRestarted),
             "重启了住宅入站却不广播 ⇒ 门全停在 deny、没人重放"
+        );
+    }
+
+    /// 2026-09-18 第三次裁决 ③：看门狗重启 `b-ui-relay` = 一次**全池**切换。不开
+    /// `cache_file` ⇒ 重启把**每个**池 selector 的 `now` 都打回配置里的 default，
+    /// 而这条来路按既有口径**不发** `Event::RelayRestarted`（重放交给规则 6a /
+    /// `drive_slots` 下一轮兜底）—— 那就更得当场把归因的时间戳门记上，否则这一刻
+    /// 之前产生的 relay 错误行会被路径 B 整批记到重启后 default 的那条上游头上。
+    #[tokio::test]
+    async fn restarting_the_relay_stamps_every_pool_for_the_attribution_gate() {
+        let host = Arc::new(FakeHost::new());
+        host.with(|i| {
+            for u in [
+                "hysteria-server",
+                "hysteria-residential",
+                "xray",
+                "b-ui-relay",
+            ] {
+                i.units_active.insert(format!("{u}.service"));
+            }
+            // relay 进程在、2080 不 listen ⇒ 连续两轮后重启它
+            i.listening
+                .insert(Proto::Udp, [10000, 40000].into_iter().collect());
+            i.listening
+                .insert(Proto::Tcp, [10001].into_iter().collect());
+        });
+        // 池有效 + 两个槽 ⇒ 全池 = 全局池 + slot-0-pool + slot-1-pool
+        let mut state = crate::modules::residential::sample_state_with_pool();
+        let up = state.residential.groups["default"].upstreams[0].id;
+        state.residential.slots = (0..2)
+            .map(|index| bui_schema::model::Slot {
+                index,
+                upstream_id: up,
+            })
+            .collect();
+        let (c, _d) = ctx_with_state(host.clone(), state).await;
+        let mut rx = c.bus.subscribe();
+        check_once(&c).await.unwrap();
+        assert!(
+            crate::modules::residential::state::read(&c.runtime)
+                .await
+                .pool_switch_at
+                .is_empty(),
+            "第一轮只是 Failing、没重启 ⇒ 一笔都不许记"
+        );
+        host.advance(60);
+        let second = check_once(&c).await.unwrap();
+        assert!(
+            second.contains(&("b-ui-relay".to_string(), Decision::Restart)),
+            "{second:?}"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "这条来路不发 Event::RelayRestarted（口径没变）"
+        );
+        assert_eq!(
+            crate::modules::residential::state::read(&c.runtime)
+                .await
+                .pool_switch_at
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![
+                crate::modules::residential::POOL.to_string(),
+                crate::modules::residential::slot_selector(0),
+                crate::modules::residential::slot_selector(1),
+            ],
+            "relay 重启 = 全池切换：每个池 selector 都要记一笔"
         );
     }
 

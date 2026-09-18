@@ -1598,12 +1598,22 @@ mod tests {
     /// 规则 6a 的重放同样要在 `select` 成功之后取时刻（裁决 ①），而且它检测到的是
     /// **relay 刚重启过** ⇒ 每个池 selector 的 `now` 都回落到了配置里的 default，
     /// 时间戳门要对**全池**记一次，不是只记全局那一个（裁决 ③）。
+    ///
+    /// 两个槽的 `current_upstream_id` **先坐实成本槽自己的 IP**：这一轮 `drive_slots`
+    /// 于是一个 PUT 都不发（`current == target`），槽池的那两笔时刻只可能来自 6a 这条
+    /// 分支。不坐实的话 `put_slot` 自己会把它们记上，这条用例就钉不住 6a 的全池记账。
     #[tokio::test]
     async fn the_rule_6a_replay_stamps_every_pool_after_the_select() {
         let d = tempfile::tempdir().unwrap();
         let (c, host) = ctx_with_slots(&d, &[10, 20], 2).await;
         rstate::update(&c.runtime, |r| {
-            r.selected_upstream_id = Some(Uuid::from_u128(2))
+            r.selected_upstream_id = Some(Uuid::from_u128(2));
+            for i in 0..2u16 {
+                r.slots
+                    .entry(i.to_string())
+                    .or_default()
+                    .current_upstream_id = Some(Uuid::from_u128(i as u128 + 1));
+            }
         })
         .await;
         let clash = Arc::new(FakeClash::new(Some("resi-1")));

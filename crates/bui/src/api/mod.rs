@@ -98,8 +98,20 @@ mod tests {
         Runtime,
         EventBus,
     ) {
+        app_with_state(crate::testutil::sample_state()).await
+    }
+
+    /// 同 [`app_with_bus`]，但期望态由调用方给（住宅池要有上游 / 槽位的用例用它）
+    async fn app_with_state(
+        mut state: bui_schema::model::State,
+    ) -> (
+        axum::Router,
+        tempfile::TempDir,
+        Arc<FakeHost>,
+        Runtime,
+        EventBus,
+    ) {
         let d = tempfile::tempdir().unwrap();
-        let mut state = crate::testutil::sample_state();
         state.admin.password_hash = crate::api::auth::hash_password("test123").unwrap();
         let units = crate::reconcile::managed_units(&state);
         let store = Store::create(d.path().join("state.json"), state)
@@ -756,6 +768,65 @@ mod tests {
             StatusCode::OK
         );
         assert!(rx.try_recv().is_err(), "直连实例与住宅门位无关");
+    }
+
+    /// 2026-09-18 第三次裁决 ③：`POST /api/services/b-ui-relay/restart|start` = 一次
+    /// **全池**切换。不开 `cache_file` ⇒ 每个池 selector 的 `now` 都回落到配置里的
+    /// default，而这条来路按既有口径**不发** `Event::RelayRestarted`（重放交给规则 6a /
+    /// `drive_slots` 下一轮兜底），所以归因的时间戳门必须在这里当场记上 —— 否则这一刻
+    /// 之前产生的 relay 错误行会被路径 B 整批记到重启后 default 的那条上游头上。
+    /// `stop` 不记：relay 停着时一个 selector 都没有，路径 B 本来就归不了因。
+    #[tokio::test]
+    async fn restarting_the_relay_stamps_every_pool_for_the_attribution_gate() {
+        use crate::modules::residential::{slot_selector, state as rstate, POOL};
+        // 池有效 + 两个槽 ⇒ 全池 = 全局池 + slot-0-pool + slot-1-pool
+        let mut state = crate::modules::residential::sample_state_with_pool();
+        let up = state.residential.groups["default"].upstreams[0].id;
+        state.residential.slots = (0..2)
+            .map(|index| bui_schema::model::Slot {
+                index,
+                upstream_id: up,
+            })
+            .collect();
+        let (app, _d, _h, rt, bus) = app_with_state(state).await;
+        let token = login(&app).await;
+        let mut rx = bus.subscribe();
+        let call = |action: &str| {
+            let (token, app) = (token.clone(), app.clone());
+            let uri = format!("/api/services/b-ui-relay/{action}");
+            async move {
+                app.oneshot(with_token(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                    &token,
+                ))
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(call("stop").await.status(), StatusCode::OK);
+        assert!(
+            rstate::read(&rt).await.pool_switch_at.is_empty(),
+            "stop 不记：relay 停着时一个 selector 都没有"
+        );
+        assert_eq!(call("restart").await.status(), StatusCode::OK);
+        assert_eq!(
+            rstate::read(&rt)
+                .await
+                .pool_switch_at
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![POOL.to_string(), slot_selector(0), slot_selector(1)],
+            "relay 重启 = 全池切换：每个池 selector 都要记一笔"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "这条来路不发 Event::RelayRestarted（口径没变）"
+        );
     }
 
     /// 一个只为「公开路由不过鉴权、受保护路由仍要 Bearer」而存在的模块（裁决 D1 的回归锁）
