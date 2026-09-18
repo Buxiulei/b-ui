@@ -6,7 +6,10 @@
 //!
 //! - **计量**走 v2ray_api 的 `StatsService.QueryStats`，计数器名是
 //!   `user>>>{凭据 name}>>>traffic>>>uplink|downlink` —— 与 Xray 那条路**同名同义**，
-//!   所以解析复用 [`super::xray::parse_user_counter`]，不重写。
+//!   所以解析复用 [`super::xray::parse_user_counter`]，不重写。**键里那一段是凭据 `name`
+//!   而不是 `id`**：新发凭据的 `name` 恰好等于 `id`（`user>>>r001>>>…`），而迁移用户的
+//!   `name` 是他的用户名，本部署即中文（`user>>><中文用户名>>>>…`，T3 2026-09-18 真机实测
+//!   中文与含空格的 name 计量正常）⇒ 返回的键要经 `hy2_pool` 换成 `user_id`。
 //!   两个上游事实（v1.14.1 源码，见 [`QUERY_STATS_PATH`] 与 [`Hy2ResiApi::query_user_deltas`]）：
 //!   ① 服务名在 `init()` 里被覆盖过；② `QueryStats` 只读 `patterns`，deprecated 的 `pattern`
 //!   一个字都不看。
@@ -67,7 +70,13 @@ pub struct Hy2ResiConn {
 /// 形态是 sing-box 自己拼的：`F.ToString(c.Rule, " => ", c.Rule.Action())`
 /// （`experimental/clashapi/connections.go`），`auth_user` 那一项的 `String()` 是
 /// `"auth_user=" + users[0]`，`route` 动作的是 `"route(" + 出站 + ")"`
-/// ⇒ `auth_user=r000 => route(gate-r000)`。没有规则命中时 sing-box 写的是 `"final"`。
+/// ⇒ `auth_user=<凭据 name> => route(gate-<id>)`。没有规则命中时 sing-box 写的是 `"final"`。
+///
+/// **`auth_user` 位置是凭据 `name`，不是 `id`**（T3 2026-09-18 真机复核）：新发凭据的
+/// `name` 恰好等于 `id`（于是形如 `auth_user=r000 => route(gate-r000)`），而**迁移用户的
+/// `name` 是他的用户名**（本部署即中文，spec §3.1）—— 真机实测中文 / 含空格的 name 在
+/// `auth_user`、`users[].name`、`stats.users` 三处都一字不改地工作。所以这个函数返回的是
+/// 凭据 `name`，调用方要经 `hy2_pool` 才换得到 `user_id`，别把它当 `id` 用。
 ///
 /// 多用户形态（`auth_user=[a b]`，规则里写了多个 user）归不到单个用户，返回 `None`
 /// —— 我们每条规则只写一个用户（spec §3.2），出现它就是渲染出了错，宁可不计。
@@ -363,7 +372,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     /// `/connections` 的 rule 字段是唯一能把连接归到用户的线索（metadata 里没有 user 字段）。
-    /// 形态来自 tizi PoC 实测：`auth_user=r000 => route(gate-r000)`
+    /// 形态来自真机实测：`auth_user=<凭据 name> => route(gate-<id>)` —— 下面两组分别是
+    /// 「新发凭据（name == id）」与「迁移用户（name = 用户名）」两种口径。
     #[test]
     fn connections_are_grouped_by_the_auth_user_in_the_rule_string() {
         assert_eq!(
