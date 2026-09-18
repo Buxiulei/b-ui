@@ -9,6 +9,8 @@ pub mod api;
 pub mod engine;
 #[cfg(test)]
 pub mod fixtures_hy2_resi;
+#[cfg(test)]
+pub mod fixtures_relay;
 pub mod incidents;
 pub mod resi;
 pub mod run;

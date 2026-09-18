@@ -236,12 +236,12 @@ impl Module for ResidentialModule {
             // spec §5.3：每 2 分钟一轮巡检 + 切换
             tokio::spawn(health::health_loop(ctx.clone(), p.clone(), c.clone())),
             // spec §5.3 最后一句：relay 任何重启后立即重放 runtime.selected_upstream_id
-            tokio::spawn(health::replay_loop(ctx.clone(), c, rx)),
+            tokio::spawn(health::replay_loop(ctx.clone(), c.clone(), rx)),
             // spec §5.4 (a)：跟随 relay 日志学候选（契约决策 §E：游标增量，不用 -f），
             // 同一轮里紧接着做一次确认 ⇒ ≥10 分钟就能进 pending（裁决「黑名单确认节奏」）
-            tokio::spawn(blacklist::journal_loop(ctx.clone(), p.clone())),
+            tokio::spawn(blacklist::journal_loop(ctx.clone(), p.clone(), c.clone())),
             // spec §5.4：每日 04:00 批量生效 + 每日探针/端口集 + 复核移除（不做确认）
-            tokio::spawn(blacklist::daily_loop(ctx, p)),
+            tokio::spawn(blacklist::daily_loop(ctx, p, c)),
         ]
     }
 }

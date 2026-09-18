@@ -6,6 +6,7 @@
 use super::{CLASH_API, CLASH_TIMEOUT_SECS, MEMBER_PREFIX};
 // 生产实现按调用方传进来的 selector 拼路径，不再自己引用全局池的 tag；
 // `FakeClash` 与测试仍要用它当默认 selector
+use super::journal::RelaySubject;
 #[cfg(test)]
 use super::POOL;
 use bui_schema::model::ResidentialGroup;
@@ -132,6 +133,83 @@ pub fn id_of_tag(g: &ResidentialGroup, tag: &str) -> Option<Uuid> {
     let n: usize = tag.strip_prefix(MEMBER_PREFIX)?.parse().ok()?;
     // tag 从 1 开始；0 与越界都返回 None
     g.upstreams.get(n.checked_sub(1)?).map(|u| u.id)
+}
+
+/// 归因**路径 A**（零 I/O）：relay 日志 reason 里 `dial tcp <ip>:<port>` 的那个地址就是上游
+/// 自己的 host:port（Go `net.Dialer` 的错误原文自带）→ 上游 id。
+///
+/// 只认**唯一**命中（host 大小写不敏感 + 端口相等）：一个都不中、或多个上游共用同一个
+/// host:port（同 IP 不同凭据）⇒ `None`，交给路径 B，**绝不猜**。上游配的是域名时，报错里
+/// 已经是解析后的 IP、与 [`Upstream::host`] 不字面相等 ⇒ 这里也匹配不上，同样由路径 B 兜住
+/// （**不做 DNS 解析**：那要 I/O，而路径 B 本来就更准）。
+///
+/// [`Upstream::host`]: bui_schema::model::Upstream::host
+pub fn id_of_dial_addr(g: &ResidentialGroup, host: &str, port: u16) -> Option<Uuid> {
+    let mut hit = g
+        .upstreams
+        .iter()
+        .filter(|u| u.port == port && u.host.eq_ignore_ascii_case(host));
+    let first = hit.next()?;
+    hit.next().is_none().then_some(first.id)
+}
+
+/// 一批池 selector 此刻各自选中谁（`None` = relay 没起 / 没这个 selector / 读不到）
+pub type PoolNow = std::collections::BTreeMap<String, Option<String>>;
+
+/// 把一批池的 `now` 一次读回来，**每个池只查一次**。`Clash` 是同步 trait ⇒ 整批放进一次
+/// `spawn_blocking`（与 `Prober` 同一条铁律）。池数上限是 `MAX_SLOTS + 1`，量很小。
+pub async fn pool_now(clash: &std::sync::Arc<dyn Clash>, pools: &[String]) -> PoolNow {
+    if pools.is_empty() {
+        return PoolNow::new();
+    }
+    let (c, ps) = (clash.clone(), pools.to_vec());
+    tokio::task::spawn_blocking(move || {
+        ps.into_iter()
+            .map(|p| {
+                let now = c.selected(&p);
+                (p, now)
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// 本轮被切过的池：归因**前后各读一次** `now`，两次不一致的池就在这里。
+///
+/// 归因到这些池的日志行必须**整批丢弃**：`now` 是「此刻选中谁」，日志行说的是「刚才是谁
+/// 失败了」，中途被巡检（`health::drive_slots`）或另一次借用切过，就会把老成员的失败记到新
+/// 成员头上。哨兵那边的代价是白探一次，黑名单那边是把一个域名的拒绝算到无辜上游的候选表上
+/// ——后者会累计，所以宁可丢弃、下一轮重新观察，**不做「基本不会变」式的假设**。
+pub fn unstable_pools(before: &PoolNow, after: &PoolNow) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    for (pool, was) in before {
+        if after.get(pool) != Some(was) {
+            out.insert(pool.clone());
+        }
+    }
+    out
+}
+
+/// relay 一行日志的出站主体 → 上游 id：成员 tag 直接换算；池形态先走**路径 A**
+/// （[`id_of_dial_addr`]，零 I/O），再走**路径 B**（本轮缓存的 `now` → [`id_of_tag`]）。
+/// 两条都归不了因 ⇒ `None`，调用方丢弃该行并记一行 debug，**绝不猜**。
+pub fn id_of_subject(g: &ResidentialGroup, s: &RelaySubject, now: &PoolNow) -> Option<Uuid> {
+    match s {
+        RelaySubject::Member(tag) => id_of_tag(g, tag),
+        RelaySubject::Pool { pool, dial_addr } => dial_addr
+            .as_ref()
+            .and_then(|(h, p)| id_of_dial_addr(g, h, *p))
+            .or_else(|| id_of_tag(g, now.get(pool)?.as_deref()?)),
+    }
+}
+
+/// 池形态的行属于哪个池（成员形态 → `None`）：[`unstable_pools`] 按池整批丢弃时要用
+pub fn pool_of(s: &RelaySubject) -> Option<&str> {
+    match s {
+        RelaySubject::Pool { pool, .. } => Some(pool),
+        RelaySubject::Member(_) => None,
+    }
 }
 
 #[cfg(test)]
