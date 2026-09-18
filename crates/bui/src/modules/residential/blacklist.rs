@@ -9,7 +9,7 @@ use super::proxy::{ConnectVerdict, Prober};
 use super::{
     check, clash, journal, port_probe_host, state, BASE_PORTS, CANDIDATE_THRESHOLD,
     CONFIRM_MIN_GAP_SECS, CONFIRM_NEEDED, DAILY_HOUR, DAILY_TICK_SECS, JOURNAL_POLL_SECS,
-    PROBE_PORTS, REVIEW_PASSES_TO_REMOVE,
+    PROBE_PORTS, REVIEW_PASSES_TO_REMOVE, SWITCH_ATTRIB_GRACE_SECS,
 };
 use crate::reconcile::DaemonCtx;
 use crate::util::parse_rfc3339;
@@ -155,7 +155,17 @@ pub async fn learn_from_journal(ctx: &DaemonCtx, clash: Arc<dyn Clash>) -> anyho
             tracing::debug!(host = %l.host, port = l.port, "该池的 now 与运行时记录不一致（有过没记账的切换），本批证据放弃");
             continue;
         }
-        match clash::attribute(&g, &l.subject, &pool_now, &switch_at, l.ts) {
+        // 宽限窗固定取非超时那一档：黑名单只收「上游拒绝了这个目标」的行，超时 / EOF /
+        // 带 `dial tcp` 地址的一类在 `journal::parse_line` 就被排掉了，路径 B 这里
+        // 根本见不到超时类 reason（裁决 ④ 的宽窗是哨兵那条链的事）
+        match clash::attribute(
+            &g,
+            &l.subject,
+            &pool_now,
+            &switch_at,
+            l.ts,
+            SWITCH_ATTRIB_GRACE_SECS,
+        ) {
             clash::Attrib::Upstream(id) => lines.push((id, l.clone())),
             clash::Attrib::Switched => {
                 tracing::debug!(host = %l.host, port = l.port, "这条行产生时该池刚被切过，本批证据放弃、等下次复发")
@@ -165,10 +175,15 @@ pub async fn learn_from_journal(ctx: &DaemonCtx, clash: Arc<dyn Clash>) -> anyho
             }
         }
     }
-    // 没记账的切换当场补记：不补的话下一批、再下一批都会继续把老成员的失败记到新成员头上
-    if !unstable.is_empty() {
-        let pools: Vec<String> = unstable.iter().cloned().collect();
-        state::mark_pools_switch(&ctx.runtime, &pools, ctx.host.now()).await;
+    // 没记账的切换当场补记：不补的话下一批、再下一批都会继续把老成员的失败记到新成员头上。
+    // 顺带记连续批次账：同一池连续 UNSTABLE_BATCHES_TO_ALERT 批不稳定 ⇒ 告警 + 收敛一次
+    // （裁决 ③：兜底不许变哑巴）
+    let seen: Vec<String> = pool_now.keys().cloned().collect();
+    if !state::mark_unstable_pools(&ctx.runtime, &seen, &unstable, ctx.host.now())
+        .await
+        .is_empty()
+    {
+        ctx.bus.send(crate::api::Event::RelayRestarted);
     }
     // ──────────────────────────────────────────────────────────────────────────
     state::update(&ctx.runtime, |r| {
@@ -1038,6 +1053,96 @@ mod tests {
             r.pool_switch_at.get(&sel).cloned(),
             Some(crate::util::fmt_rfc3339(host.now())),
             "没记账的切换当场补记，下一批才有门可依"
+        );
+    }
+
+    /// **第四次裁决 ③：兜底不许变哑巴**。一次 relay 重启 / 一次手动 `curl` 让一批不稳定
+    /// 是兜底正常工作的样子（补记时刻、丢这一批）；同一池**连续 3 批**不稳定说明有一条
+    /// 落账路径在持续漏写、或有人在外面反复动 selector —— 那时归因已经在长期丢证据。
+    /// 所以：连续 [`UNSTABLE_BATCHES_TO_ALERT`] 批 ⇒ 告警一次（带冷却，别刷屏）+ 发一次
+    /// `Event::RelayRestarted` 触发该池的重放 / 收敛，第 4 批起不再重复。
+    #[tokio::test]
+    async fn three_consecutive_unstable_batches_alert_once_and_ask_for_one_replay() {
+        let d = tempfile::tempdir().unwrap();
+        let (c, host) = ctx(&d).await;
+        add_second_upstream(&c).await;
+        let sel = crate::modules::residential::slot_selector(3);
+        // runtime 记着槽 3 当前用的是第二条上游，而 relay 的 `now` 一直是第一条
+        // ⇒ 每一批都判不稳定（没有任何路径去修 current_upstream_id）
+        rstate::update(&c.runtime, |r| {
+            r.slots.entry("3".into()).or_default().current_upstream_id = Some(Uuid::from_u128(2));
+        })
+        .await;
+        let mut rx = c.bus.subscribe();
+        let alerts = |r: &rstate::ResiRuntime| {
+            r.alerts
+                .iter()
+                .filter(|a| a.starts_with(rstate::UNSTABLE_ALERT))
+                .count()
+        };
+        for batch in 1..=2 {
+            host.advance(300);
+            feed(&host, fx::POOL_SELECTOR_SOCKS_CODE2);
+            assert_eq!(learn_from_journal(&c, clash_at("resi-1")).await.unwrap(), 0);
+            let r = rstate::read(&c.runtime).await;
+            assert_eq!(r.unstable_streak.get(&sel).copied(), Some(batch));
+            assert_eq!(alerts(&r), 0, "第 {batch} 批还不该喊：一次重启就长这样");
+            assert!(rx.try_recv().is_err(), "第 {batch} 批也不该要求重放");
+        }
+        // 第 3 批：告警一次 + 要求收敛一次
+        host.advance(300);
+        feed(&host, fx::POOL_SELECTOR_SOCKS_CODE2);
+        assert_eq!(learn_from_journal(&c, clash_at("resi-1")).await.unwrap(), 0);
+        let r = rstate::read(&c.runtime).await;
+        assert_eq!(alerts(&r), 1, "连续 3 批 ⇒ 告警一次：{:?}", r.alerts);
+        assert!(
+            r.alerts.iter().any(|a| a.contains(&sel)),
+            "告警要点出是哪个池：{:?}",
+            r.alerts
+        );
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(crate::api::Event::RelayRestarted),
+            "连续 3 批 ⇒ 触发一次该池的重放 / 收敛"
+        );
+        // 第 4 批：冷却内不重复告警、也不重复要求重放
+        host.advance(300);
+        feed(&host, fx::POOL_SELECTOR_SOCKS_CODE2);
+        assert_eq!(learn_from_journal(&c, clash_at("resi-1")).await.unwrap(), 0);
+        let r = rstate::read(&c.runtime).await;
+        assert_eq!(alerts(&r), 1, "第 4 批不重复告警（冷却）：{:?}", r.alerts);
+        assert_eq!(r.unstable_streak.get(&sel).copied(), Some(4), "账照旧在攒");
+        assert!(rx.try_recv().is_err(), "第 4 批也不重复要求重放");
+    }
+
+    /// 稳定一批就清零：下一次要重新攒满 3 批才再喊
+    #[tokio::test]
+    async fn one_stable_batch_resets_the_unstable_streak() {
+        let d = tempfile::tempdir().unwrap();
+        let (c, host) = ctx(&d).await;
+        add_second_upstream(&c).await;
+        let sel = crate::modules::residential::slot_selector(3);
+        rstate::update(&c.runtime, |r| {
+            r.slots.entry("3".into()).or_default().current_upstream_id = Some(Uuid::from_u128(2));
+        })
+        .await;
+        for _ in 0..2 {
+            host.advance(300);
+            feed(&host, fx::POOL_SELECTOR_SOCKS_CODE2);
+            learn_from_journal(&c, clash_at("resi-1")).await.unwrap();
+        }
+        assert_eq!(
+            rstate::read(&c.runtime).await.unstable_streak.get(&sel),
+            Some(&2)
+        );
+        // `now` 与 runtime 记录一致的一批 ⇒ 账清零
+        host.advance(300);
+        feed(&host, fx::POOL_SELECTOR_SOCKS_CODE2);
+        learn_from_journal(&c, clash_at("resi-2")).await.unwrap();
+        assert_eq!(
+            rstate::read(&c.runtime).await.unstable_streak.get(&sel),
+            None,
+            "稳定一批即清零"
         );
     }
 

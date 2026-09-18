@@ -16,6 +16,10 @@ use uuid::Uuid;
 /// `alerts` 的长度上限：面板只展示最近几条，无上限会把 `runtime.json` 撑爆
 pub const ALERTS_MAX: usize = 20;
 
+/// 「这个池反复有没记账的切换」告警的固定前缀（[`note_unstable_pools`] 写、
+/// 面板与用例按它认领）。文案里点出是哪个池 —— 不然运维不知道该查哪一条落账路径。
+pub const UNSTABLE_ALERT: &str = "住宅池 selector 反复与运行时记录不一致";
+
 /// `runtime.json` 的 `extra["residential"]`（spec §2.1：健康 streak、黑名单候选计数、
 /// 上次选中的上游、采样游标都放 runtime.json，丢了也能从零重建）
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -50,6 +54,14 @@ pub struct ResiRuntime {
     /// 与上面那个全局的 `last_switch_at` 不是一回事——那个是巡检切换的 60 秒限速游标，
     /// 只记全局池、重放时还故意不写。键数上限 = `MAX_SLOTS + 1`。
     pub pool_switch_at: BTreeMap<String, String>,
+    /// 每个池 selector 连续被 [`super::clash::unstable_pools`] 判成「有过没记账的切换」的
+    /// **批次数**（键 = 池 tag）。稳定一批即清零，攒满
+    /// [`super::UNSTABLE_BATCHES_TO_ALERT`] 就告警 + 收敛一次（2026-09-18 第四次裁决 ③：
+    /// 兜底不许变哑巴）。写入口只有 [`note_unstable_pools`]。键数上限 = `MAX_SLOTS + 1`。
+    pub unstable_streak: BTreeMap<String, u32>,
+    /// 上一次为「这个池反复不稳定」告警的时刻（RFC3339，键 = 池 tag）：告警与收敛共用
+    /// 这一个冷却游标（[`super::UNSTABLE_ALERT_COOLDOWN_SECS`]），别刷屏、也别反复重放
+    pub unstable_alert_at: BTreeMap<String, String>,
     /// `state.selected_upstream_id` 与 `selected_upstream_id` 已漂移，等下一个 04:00 窗口写回
     pub selected_pending_persist: bool,
     /// 面板「立即巡检一轮」按钮的限速游标（T10 的 `POST /api/residential/health/check`）
@@ -264,6 +276,12 @@ pub async fn update(runtime: &Runtime, f: impl FnOnce(&mut ResiRuntime)) -> Resi
 /// 返回时刻」。切失败的那次不写——什么都没变，写了只会白丢一段本该学的行。
 /// relay 重启后的**重放**也算切换：它同样让 selector 的 `now` 变了值（它不算「切换」的只是
 /// 巡检那条 60 秒限速，那是另一回事）。
+///
+/// **`slots::drive_slots` 只给自己真 PUT 过的那几槽记，不对全池盖章** —— 追认为设计
+/// （2026-09-18 第四次裁决 ⑤）：它是逐槽驱动，没动过的 selector 的 `now` 一个字都没变，
+/// 给它们盖章只会白丢一段本该学的行。「全池都变了」是 relay 重启那件事的性质，由那几条
+/// 来路（看门狗 / 服务端点 / 规则 6a / [`mark_unstable_pools`] 的兜底）走
+/// [`note_pools_switch`]。
 pub fn note_pool_switch(r: &mut ResiRuntime, pool: &str, now: OffsetDateTime) {
     r.pool_switch_at.insert(pool.to_string(), fmt_rfc3339(now));
 }
@@ -288,6 +306,83 @@ pub async fn mark_pools_switch(runtime: &Runtime, pools: &[String], now: OffsetD
         return;
     }
     update(runtime, |r| note_pools_switch(r, pools, now)).await;
+}
+
+/// 「没记账的切换」兜底的**连续批次**账（2026-09-18 第四次裁决 ③：兜底不许变哑巴）。
+///
+/// `seen` = 本批读过 `now` 的全部池，`unstable` = 其中被
+/// [`super::clash::unstable_pools`] 判成不稳定的那些。不稳定的池 streak +1，其余清零
+/// （`seen` 之外的池本批没有证据，账不动）。某池连续
+/// [`super::UNSTABLE_BATCHES_TO_ALERT`] 批不稳定 ⇒ **告警一次**并要求收敛一次，之后
+/// [`super::UNSTABLE_ALERT_COOLDOWN_SECS`] 秒内同一池不再重复（否则每批一条告警 +
+/// 每批一次重放）。
+///
+/// 返回本批**刚触发**的池（调用方据此发一次 [`crate::api::Event::RelayRestarted`] 让
+/// `health::replay_after_restart` 把 runtime 与 relay 收敛回来）。告警已在函数内 push。
+pub fn note_unstable_pools(
+    r: &mut ResiRuntime,
+    seen: &[String],
+    unstable: &std::collections::BTreeSet<String>,
+    now: OffsetDateTime,
+) -> Vec<String> {
+    let mut fired = Vec::new();
+    for p in seen {
+        if !unstable.contains(p) {
+            // 稳定一批就清零：下次要重新攒满才再喊
+            r.unstable_streak.remove(p);
+            r.unstable_alert_at.remove(p);
+            continue;
+        }
+        let streak = r.unstable_streak.entry(p.clone()).or_insert(0);
+        *streak += 1;
+        if *streak < super::UNSTABLE_BATCHES_TO_ALERT {
+            continue;
+        }
+        let streak = *streak;
+        // 冷却：同一池的告警与收敛共用这一个游标，别每批喊一次、每批重放一次
+        let cooling = r
+            .unstable_alert_at
+            .get(p)
+            .and_then(|s| parse_rfc3339(s))
+            .is_some_and(|t| {
+                now < t + time::Duration::seconds(super::UNSTABLE_ALERT_COOLDOWN_SECS)
+            });
+        if cooling {
+            continue;
+        }
+        r.unstable_alert_at.insert(p.clone(), fmt_rfc3339(now));
+        push_alert(
+            r,
+            format!(
+                "{UNSTABLE_ALERT}：{p} 连续 {streak} 批被判有没记账的切换，\
+                 这些批的归因证据已放弃；正在重放收敛，请查该池的落账路径"
+            ),
+        );
+        fired.push(p.clone());
+    }
+    fired
+}
+
+/// [`note_unstable_pools`] 的落盘版：兜底的补记切换时刻与连续批次账**并成一次写**
+/// （两件事读的是同一批证据，分两次写会在中间留一个不一致的窗口）。
+/// 返回值同 [`note_unstable_pools`]。
+pub async fn mark_unstable_pools(
+    runtime: &Runtime,
+    seen: &[String],
+    unstable: &std::collections::BTreeSet<String>,
+    now: OffsetDateTime,
+) -> Vec<String> {
+    if seen.is_empty() {
+        return Vec::new();
+    }
+    let pools: Vec<String> = unstable.iter().cloned().collect();
+    let mut fired = Vec::new();
+    update(runtime, |r| {
+        note_pools_switch(r, &pools, now);
+        fired = note_unstable_pools(r, seen, unstable, now);
+    })
+    .await;
+    fired
 }
 
 /// relay 里**全部**池 selector：全局池 [`super::POOL`] + 每槽一个（[`super::slot_selector`]）。

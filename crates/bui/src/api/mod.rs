@@ -102,7 +102,10 @@ mod tests {
     }
 
     /// 同 [`app_with_bus`]，但期望态由调用方给（住宅池要有上游 / 槽位的用例用它）
-    async fn app_with_state(
+    /// 同 [`app_with_bus`]，但期望态由调用方给，并连 [`Store`] 一起交出来
+    /// （要自己拼一个 `DaemonCtx` 的用例用它：`Store` 是 `DaemonCtx` 的第一个字段）
+    #[allow(clippy::type_complexity)]
+    async fn app_with_store(
         mut state: bui_schema::model::State,
     ) -> (
         axum::Router,
@@ -110,6 +113,7 @@ mod tests {
         Arc<FakeHost>,
         Runtime,
         EventBus,
+        Store,
     ) {
         let d = tempfile::tempdir().unwrap();
         state.admin.password_hash = crate::api::auth::hash_password("test123").unwrap();
@@ -141,7 +145,28 @@ mod tests {
             version: "4.0.0",
             login: crate::api::auth::LoginLimiter::default(),
         };
-        (router(app_state, &[]), d, host, runtime, bus)
+        (
+            router(app_state.clone(), &[]),
+            d,
+            host,
+            runtime,
+            bus,
+            app_state.store,
+        )
+    }
+
+    /// 同 [`app_with_store`]，丢掉 `Store`（绝大多数用例只要路由）
+    async fn app_with_state(
+        state: bui_schema::model::State,
+    ) -> (
+        axum::Router,
+        tempfile::TempDir,
+        Arc<FakeHost>,
+        Runtime,
+        EventBus,
+    ) {
+        let (app, d, host, rt, bus, _store) = app_with_store(state).await;
+        (app, d, host, rt, bus)
     }
 
     async fn app() -> (axum::Router, tempfile::TempDir, Arc<FakeHost>) {
@@ -770,27 +795,47 @@ mod tests {
         assert!(rx.try_recv().is_err(), "直连实例与住宅门位无关");
     }
 
-    /// 2026-09-18 第三次裁决 ③：`POST /api/services/b-ui-relay/restart|start` = 一次
-    /// **全池**切换。不开 `cache_file` ⇒ 每个池 selector 的 `now` 都回落到配置里的
-    /// default，而这条来路按既有口径**不发** `Event::RelayRestarted`（重放交给规则 6a /
-    /// `drive_slots` 下一轮兜底），所以归因的时间戳门必须在这里当场记上 —— 否则这一刻
-    /// 之前产生的 relay 错误行会被路径 B 整批记到重启后 default 的那条上游头上。
-    /// `stop` 不记：relay 停着时一个 selector 都没有，路径 B 本来就归不了因。
-    #[tokio::test]
-    async fn restarting_the_relay_stamps_every_pool_for_the_attribution_gate() {
-        use crate::modules::residential::{slot_selector, state as rstate, POOL};
-        // 池有效 + 两个槽 ⇒ 全池 = 全局池 + slot-0-pool + slot-1-pool
-        let mut state = crate::modules::residential::sample_state_with_pool();
-        let up = state.residential.groups["default"].upstreams[0].id;
-        state.residential.slots = (0..2)
-            .map(|index| bui_schema::model::Slot {
-                index,
-                upstream_id: up,
+    /// 池有效 + 两条上游 + 两个槽（槽 i 的 IP = 第 i 条）：全池 = 全局池 + slot-0/1-pool，
+    /// 而且有可借的第二条，槽能 pin 到别人身上
+    fn relay_pool_state() -> bui_schema::model::State {
+        let mut s = crate::modules::residential::sample_state_with_pool();
+        let g = s.residential.groups.get_mut("default").unwrap();
+        let proto = g.upstreams[0].clone();
+        g.upstreams = (0..2u16)
+            .map(|i| bui_schema::model::Upstream {
+                id: uuid::Uuid::from_u128(i as u128 + 1),
+                name: format!("url-{}", i + 1),
+                host: format!("isp{}.example.net", i + 1),
+                ..proto.clone()
             })
             .collect();
-        let (app, _d, _h, rt, bus) = app_with_state(state).await;
+        g.selected_upstream_id = g.upstreams.first().map(|u| u.id);
+        s.residential.slots = (0..2u16)
+            .map(|index| bui_schema::model::Slot {
+                index,
+                upstream_id: uuid::Uuid::from_u128(index as u128 + 1),
+            })
+            .collect();
+        s
+    }
+
+    /// 2026-09-18 第三次裁决 ③ + **第四次裁决 ①**：`POST /api/services/b-ui-relay/restart|start`
+    /// = 一次**全池**切换。不开 `cache_file` ⇒ 每个池 selector 的 `now` 都回落到配置里的
+    /// default，所以归因的时间戳门必须在这里当场记上 —— 否则这一刻之前产生的 relay 错误行
+    /// 会被路径 B 整批记到重启后 default 的那条上游头上。
+    ///
+    /// 记的时刻必须取自 `systemctl` **返回之后**（裁决 ①）：`systemctl` 是阻塞的，
+    /// selector 回落 default 就发生在「发命令 → 返回」那段里，记发命令之前等于把门开在
+    /// 事件之前。用 `FakeHost::advance_on_systemd` 在 systemd stub 里拨表复现这段耗时。
+    ///
+    /// `stop` 不记：relay 停着时一个 selector 都没有，路径 B 本来就归不了因。
+    #[tokio::test]
+    async fn restarting_the_relay_stamps_every_pool_after_the_systemctl_returns() {
+        use crate::modules::residential::{slot_selector, state as rstate, POOL};
+        let (app, _d, host, rt, _bus) = app_with_state(relay_pool_state()).await;
+        // 「发 systemctl → 返回」之间走掉 30 秒（真机上是内核起不起来那一段）
+        host.with(|i| i.advance_on_systemd = 30);
         let token = login(&app).await;
-        let mut rx = bus.subscribe();
         let call = |action: &str| {
             let (token, app) = (token.clone(), app.clone());
             let uri = format!("/api/services/b-ui-relay/{action}");
@@ -812,20 +857,99 @@ mod tests {
             rstate::read(&rt).await.pool_switch_at.is_empty(),
             "stop 不记：relay 停着时一个 selector 都没有"
         );
+        let before = host.now(); // 发 restart 之前
         assert_eq!(call("restart").await.status(), StatusCode::OK);
+        let returned = host.now(); // systemctl 返回之后
         assert_eq!(
-            rstate::read(&rt)
-                .await
-                .pool_switch_at
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>(),
+            returned,
+            before + time::Duration::seconds(30),
+            "stub 拨过表：这一段就是 systemctl 的阻塞时间"
+        );
+        let at = rstate::read(&rt).await;
+        assert_eq!(
+            at.pool_switch_at.keys().cloned().collect::<Vec<_>>(),
             vec![POOL.to_string(), slot_selector(0), slot_selector(1)],
             "relay 重启 = 全池切换：每个池 selector 都要记一笔"
         );
-        assert!(
-            rx.try_recv().is_err(),
-            "这条来路不发 Event::RelayRestarted（口径没变）"
+        for (pool, raw) in &at.pool_switch_at {
+            let t = crate::util::parse_rfc3339(raw).expect("记下的时刻要能解析");
+            assert!(
+                t >= returned,
+                "{pool} 记的是 {t}，比 systemctl 返回时刻 {returned} 早 ⇒ 门开在事件之前"
+            );
+        }
+    }
+
+    /// **第四次裁决 ②**：`POST /api/services/b-ui-relay/restart` 也要发
+    /// `Event::RelayRestarted`（与同端点重启 `hysteria-residential` 那条口径一致）。
+    /// 少了它，`health::replay_loop` 不跑，借用 / pin 中的槽就停在配置里的 default ——
+    /// 靠 `drive_slots` 下一轮兜底意味着最坏 2 分钟里借槽的用户都被打回坏 IP。
+    /// `stop` 仍不发：relay 停着时没有 selector 可重放。
+    #[tokio::test]
+    async fn restarting_the_relay_is_announced_so_the_selection_gets_replayed() {
+        use crate::modules::residential::clash::{Clash, FakeClash};
+        use crate::modules::residential::health::replay_loop;
+        use crate::modules::residential::{slot_selector, state as rstate};
+
+        let (app, _d, host, rt, bus, store) = app_with_store(relay_pool_state()).await;
+        let token = login(&app).await;
+        // 槽 0 被管理员 pin 在第二条上游上（≠ 本槽自己的 IP）⇒ 重启后必须被重放回去
+        rstate::update(&rt, |r| {
+            r.slots.entry("0".into()).or_default().pinned_upstream_id =
+                Some(uuid::Uuid::from_u128(2));
+        })
+        .await;
+        let clash = Arc::new(FakeClash::new(None));
+        // relay 重启后 selector 停在配置里的 default（本槽自己的 IP）
+        clash.with(|i| {
+            i.now.insert(slot_selector(0), "resi-1".into());
+        });
+        let ctx = crate::reconcile::DaemonCtx {
+            store,
+            runtime: rt.clone(),
+            bus: bus.clone(),
+            host: host.clone(),
+            paths: bui_schema::paths::Paths::default_server(),
+        };
+        let rx = bus.subscribe();
+        let mut watch = bus.subscribe();
+        let replay = tokio::spawn(replay_loop(ctx, clash.clone() as Arc<dyn Clash>, rx));
+        let call = |action: &str| {
+            let (token, app) = (token.clone(), app.clone());
+            let uri = format!("/api/services/b-ui-relay/{action}");
+            async move {
+                app.oneshot(with_token(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                    &token,
+                ))
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(call("stop").await.status(), StatusCode::OK);
+        assert!(watch.try_recv().is_err(), "stop 不发：没有 selector 可重放");
+        assert_eq!(call("restart").await.status(), StatusCode::OK);
+        assert_eq!(
+            watch.try_recv().ok(),
+            Some(Event::RelayRestarted),
+            "重启了 relay 却不广播 ⇒ 借用 / pin 的槽全停在 default、没人重放"
+        );
+        let sel = slot_selector(0);
+        for _ in 0..200 {
+            if clash.peek(&sel).as_deref() == Some("resi-2") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        replay.abort();
+        assert_eq!(
+            clash.peek(&sel).as_deref(),
+            Some("resi-2"),
+            "重放跑过：pin 的槽被重新 PUT 回去，不再停在 default"
         );
     }
 

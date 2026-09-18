@@ -280,9 +280,13 @@ pub async fn service_action(
     // 60 秒安全网，且没有任何告警说明原因。`stop` 不发（门跟着内核一起没了）。
     let announce = unit == "hysteria-residential" && matches!(action.as_str(), "restart" | "start");
     // relay 被这个端点重启 / 拉起 = 一次**全池**切换：每个池 selector 的 `now` 都回落到
-    // 配置里的 default ⇒ 归因的时间戳门要当场对全池记一次（2026-09-18 第三次裁决 ③）。
-    // 选择本身的重放由 `residential::health` 的规则 6a 下一轮兜底（这条来路同样不发
-    // `Event::RelayRestarted`，见 `health::check_round` 规则 6a 的注释）。
+    // 配置里的 default ⇒ 归因的时间戳门要当场对全池记一次（2026-09-18 第三次裁决 ③），
+    // 时刻取 `systemd` **返回之后**的 `app.host.now()`（第四次裁决 ①：systemctl 是阻塞的，
+    // selector 回落 default 就发生在那段里）。并且**要广播** `Event::RelayRestarted`
+    // （第四次裁决 ②，与上面 `hysteria-residential` 那条同口径）：让
+    // `health::replay_loop` 立刻把借用 / pin 中的槽重放回去，不必等 `drive_slots`
+    // 下一轮（最坏 2 分钟）。当场盖章保留：重放成功的池会在 `select` 返回后再记一次。
+    // `stop` 两件都不做（relay 停着时一个 selector 都没有）。
     let relay_restarted = unit == "b-ui-relay" && matches!(action.as_str(), "restart" | "start");
     let out = tokio::task::spawn_blocking(move || host.systemd(&action, &unit)).await;
     match out {
@@ -301,6 +305,7 @@ pub async fn service_action(
                     app.host.now(),
                 )
                 .await;
+                app.bus.send(Event::RelayRestarted);
             }
             (
                 StatusCode::OK,

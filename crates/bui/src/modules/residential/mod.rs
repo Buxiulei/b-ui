@@ -132,6 +132,31 @@ pub const JOURNAL_POLL_SECS: u64 = 300;
 /// 来自不同时钟路径（内核 → journald 落盘 vs. 守护进程读 `host.now()`），只需要覆盖这点抖动；
 /// 再长就会在高频切换时把本该学的行也丢光。
 pub const SWITCH_ATTRIB_GRACE_SECS: i64 = 1;
+/// **超时类** reason 的宽限窗（2026-09-18 第四次裁决 ④）：命中
+/// [`crate::modules::sentinel::signature::is_unreachable_reason`] 那一组标记
+/// （`i/o timeout` / `deadline exceeded` / `connection refused` / `no route to host` /
+/// `network is unreachable`，= 哨兵 `Sig::RelayUpstreamError` 的判据，**不新造标记**）的
+/// 路径 B 行走这个值，其余仍走 [`SWITCH_ATTRIB_GRACE_SECS`]。
+///
+/// 为什么单列：这类行的日志时刻比**路由决策时刻**晚一个完整的拨号 / 握手超时 ——
+/// sing-box 选中成员后才开始拨，拨不通要等超时才写日志。于是「切换前选中的老成员」
+/// 打出的超时行会带着一个**切换之后**的时间戳，1 秒的门拦不住它，路径 B 就把它记到
+/// 新成员头上。30 s ≥ sing-box 的拨号 / 握手超时（`connect_timeout` 默认 5 s、
+/// TLS/HTTP CONNECT 那一段最坏也在十几秒量级），够覆盖整段延迟。
+///
+/// 代价是这类行在切换后 30 秒内一律不学 —— 方向正确：宁可少学，也绝不错记。
+pub const SWITCH_ATTRIB_GRACE_TIMEOUT_SECS: i64 = 30;
+/// 「没记账的切换」兜底的发声门槛（2026-09-18 第四次裁决 ③）：同一池连续这么多批被
+/// [`clash::unstable_pools`] 判成不稳定 ⇒ 告警一次 + 收敛一次。
+///
+/// 为什么不是第一批就喊：一次 relay 重启 / 一次手动 `curl` 就会让一批不稳定，那是兜底
+/// **正常工作**的样子（补记时刻、丢这一批证据），喊了只是噪音。连续 3 批说明有一条落账
+/// 路径在持续漏写，或有人在外面反复动 selector —— 那时归因已经在长期丢证据，必须有人知道。
+pub const UNSTABLE_BATCHES_TO_ALERT: u32 = 3;
+/// 同一池两次「反复不稳定」告警 / 收敛之间的最小间隔：两条链的批间隔差得远
+/// （哨兵 [`crate::modules::sentinel::POLL_SECS`] 2 秒、黑名单 [`JOURNAL_POLL_SECS`]
+/// 300 秒），不设冷却的话哨兵那条链能每 2 秒喊一次、每 2 秒重放一次。
+pub const UNSTABLE_ALERT_COOLDOWN_SECS: i64 = 3600;
 /// 候选阈值：同一 (上游, 主机, 端口) 累计被拒次数（R13 §6.2）
 pub const CANDIDATE_THRESHOLD: u64 = 3;
 /// 确认：两次确认之间至少间隔 10 分钟、连续 2 次（spec §5.4）

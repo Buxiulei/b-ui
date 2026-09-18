@@ -1589,6 +1589,7 @@ mod tests {
                 &now,
                 &r.pool_switch_at,
                 head + time::Duration::seconds(10),
+                crate::modules::residential::SWITCH_ATTRIB_GRACE_SECS,
             ),
             clash::Attrib::Switched,
             "轮首之后 select 之前的行落在切换宽限窗里，本批证据放弃"

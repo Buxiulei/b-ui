@@ -180,9 +180,14 @@ pub async fn tick(ctx: &DaemonCtx, deps: &Deps, s: &mut Sentinel) -> TickReport 
     // （relay 重启回落 default、有人手动 curl 过 Clash API…）。这些池本批整批丢弃，
     // 并在下面把账补上（2026-09-18 第三次裁决 ③）
     let unstable = clash::unstable_pools(&g, &pool_now, &rt);
-    if !unstable.is_empty() {
-        let list: Vec<String> = unstable.iter().cloned().collect();
-        rstate::mark_pools_switch(&ctx.runtime, &list, ctx.host.now()).await;
+    // 顺带记连续批次账：同一池连续 `UNSTABLE_BATCHES_TO_ALERT` 批不稳定 ⇒ 告警 + 收敛
+    // 各一次（裁决 ③：兜底不许变哑巴）
+    let seen: Vec<String> = pool_now.keys().cloned().collect();
+    if !rstate::mark_unstable_pools(&ctx.runtime, &seen, &unstable, ctx.host.now())
+        .await
+        .is_empty()
+    {
+        ctx.bus.send(crate::api::Event::RelayRestarted);
     }
 
     // ②c 归因 + 去抖
@@ -200,7 +205,11 @@ pub async fn tick(ctx: &DaemonCtx, deps: &Deps, s: &mut Sentinel) -> TickReport 
                 );
                 continue;
             }
-            match clash::attribute(&g, sub, &pool_now, &switch_at, r.ts) {
+            // 宽限窗按这条行自己的 reason 现算（裁决 ④）：超时类的行的时间戳比路由决策
+            // 晚一个完整的拨号 / 握手超时，1 秒的门拦不住 —— `switch_grace_secs` 喂整条
+            // message 与喂 reason 同结论（判据是 `contains`）
+            let grace = clash::switch_grace_secs(&r.message);
+            match clash::attribute(&g, sub, &pool_now, &switch_at, r.ts, grace) {
                 clash::Attrib::Upstream(id) => Some(id),
                 clash::Attrib::Switched => {
                     tracing::debug!(
@@ -680,9 +689,13 @@ mod tests {
     /// `now` 说的是「此刻选中谁」，这批行说的是「刚才是谁失败了」——真实暴露窗口是整段
     /// 「日志行产生 → 归因读 `now`」，不是归因那几毫秒，所以按**时间戳门**判：
     /// 门内的路径 B 行整批丢弃，连去抖计数都不进（否则下一轮一条就够触发），哨兵零动作；
-    /// 宽限窗（[`SWITCH_ATTRIB_GRACE_SECS`] = 1 秒）之后的行照常归因到新成员。
+    /// 宽限窗之后的行照常归因到新成员。
     ///
-    /// [`SWITCH_ATTRIB_GRACE_SECS`]: crate::modules::residential::SWITCH_ATTRIB_GRACE_SECS
+    /// 本用例的行是 `deadline exceeded`（超时类）⇒ 宽限窗是
+    /// [`SWITCH_ATTRIB_GRACE_TIMEOUT_SECS`] = 30 秒，不是 1 秒（2026-09-18 第四次裁决 ④）：
+    /// 这类行的时间戳比路由决策晚一个完整超时，切换后十几秒才落盘的那条说的还是老成员。
+    ///
+    /// [`SWITCH_ATTRIB_GRACE_TIMEOUT_SECS`]: crate::modules::residential::SWITCH_ATTRIB_GRACE_TIMEOUT_SECS
     #[tokio::test]
     async fn lines_logged_before_a_pool_switch_are_dropped_and_later_ones_fire_normally() {
         let k = kit().await;
@@ -715,17 +728,32 @@ mod tests {
         let rep = tick(&k.ctx, &k.deps, &mut s).await;
         assert!(rep.incidents.is_empty(), "{:?}", rep.incidents);
         assert!(k.prober.calls().is_empty(), "哨兵零动作：一次探测都没发生");
-        // 宽限窗之后的两条：照常归因到池此刻选中的 resi-2（= isp2），去抖门槛 2 条 ⇒ 触发。
-        // 上一轮那 200 条要是进了去抖计数，这里第一条就会触发
+        // 裁决 ④：切换后 10 秒才落盘的两条超时行**仍然**在窗里 —— 拨号是切换之前发起的，
+        // 说的是老成员。1 秒的门会把它们记到 resi-2 头上（threshold=2 ⇒ 当场触发预案）
+        k.host.advance(5);
         feed(
             &k,
-            vec![rec("b-ui-relay", 6, fx::POOL_SELECTOR_DEADLINE_SLOT1)],
+            (10..12)
+                .map(|t| rec("b-ui-relay", t, fx::POOL_SELECTOR_DEADLINE_SLOT1))
+                .collect(),
+        );
+        assert!(tick(&k.ctx, &k.deps, &mut s).await.incidents.is_empty());
+        assert!(
+            k.prober.calls().is_empty(),
+            "超时类的宽限窗 30 秒：切换后 10 秒的行照样丢，一次探测都没发生"
+        );
+        // 宽限窗（30 秒）之后的两条：照常归因到池此刻选中的 resi-2（= isp2），
+        // 去抖门槛 2 条 ⇒ 触发。前面那些要是进了去抖计数，这里第一条就会触发
+        k.host.advance(30);
+        feed(
+            &k,
+            vec![rec("b-ui-relay", 36, fx::POOL_SELECTOR_DEADLINE_SLOT1)],
         );
         assert!(tick(&k.ctx, &k.deps, &mut s).await.incidents.is_empty());
         k.host.advance(1);
         feed(
             &k,
-            vec![rec("b-ui-relay", 7, fx::POOL_SELECTOR_DEADLINE_SLOT1)],
+            vec![rec("b-ui-relay", 37, fx::POOL_SELECTOR_DEADLINE_SLOT1)],
         );
         let rep = tick(&k.ctx, &k.deps, &mut s).await;
         assert_eq!(rep.incidents.len(), 1, "{:?}", rep.incidents);

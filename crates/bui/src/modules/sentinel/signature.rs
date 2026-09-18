@@ -218,6 +218,17 @@ const UNREACHABLE_MARKERS: [&str; 5] = [
     "network is unreachable",
 ];
 
+/// 这段文字里有没有 [`UNREACHABLE_MARKERS`]（大小写不敏感，整条 message 或只给 reason
+/// 都是同一结论 —— 判据是 `contains`）。
+///
+/// 转出来是为了让归因的**超时类宽限窗**
+/// （[`crate::modules::residential::SWITCH_ATTRIB_GRACE_TIMEOUT_SECS`]）与本模块 `relay`
+/// 分支 ④（`Sig::RelayUpstreamError`）用**同一组标记**，不在别处再抄一份。
+pub fn is_unreachable_reason(reason: &str) -> bool {
+    let lower = reason.to_ascii_lowercase();
+    UNREACHABLE_MARKERS.iter().any(|k| lower.contains(k))
+}
+
 /// 一行日志（`unit` 是裸单元名，`message` 已剥色码）→ 签名。不认识的一律 `None`。
 pub fn classify(unit: &str, message: &str) -> Option<Match> {
     let kernel = unit == "xray" || unit == "b-ui-relay" || unit.starts_with("hysteria-");

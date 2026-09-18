@@ -184,19 +184,43 @@ pub async fn pool_now(clash: &std::sync::Arc<dyn Clash>, pools: &[String]) -> Po
 /// [`super::state::ResiRuntime::pool_switch_at`]
 pub type PoolSwitchAt = std::collections::BTreeMap<String, String>;
 
-/// 这条日志行落在该池切换的宽限窗里吗（`ts < last_switch_at[pool] + GRACE`）。
+/// 这条日志行落在该池切换的宽限窗里吗（`ts < last_switch_at[pool] + grace_secs`）。
 ///
 /// 只对**路径 B** 有意义：`now` 说的是「此刻选中谁」，切换之前产生的行说的是老成员。
 /// 没记过切换（进程刚起）、或时刻解析不出来 ⇒ `false`（不丢弃：宁可少丢，也不因为读不到
 /// 记录就把整条链停掉）。
-pub fn within_switch_grace(switch_at: &PoolSwitchAt, pool: &str, ts: time::OffsetDateTime) -> bool {
+///
+/// `grace_secs` 由调用方按这条行的 reason 现算（[`switch_grace_secs`]）：超时类的行的
+/// 时间戳比路由决策晚一个完整超时，1 秒的门拦不住。
+pub fn within_switch_grace(
+    switch_at: &PoolSwitchAt,
+    pool: &str,
+    ts: time::OffsetDateTime,
+    grace_secs: i64,
+) -> bool {
     let Some(t0) = switch_at
         .get(pool)
         .and_then(|s| crate::util::parse_rfc3339(s))
     else {
         return false;
     };
-    ts < t0 + time::Duration::seconds(super::SWITCH_ATTRIB_GRACE_SECS)
+    ts < t0 + time::Duration::seconds(grace_secs)
+}
+
+/// 这条 relay 错误行的路径 B 宽限窗该取多少秒（2026-09-18 第四次裁决 ④）。
+///
+/// 命中「连不上上游 / 超时」那一组**既有**标记
+/// （[`crate::modules::sentinel::signature::is_unreachable_reason`]，= 哨兵
+/// `Sig::RelayUpstreamError` 的判据）⇒ [`super::SWITCH_ATTRIB_GRACE_TIMEOUT_SECS`]；
+/// 其余 ⇒ [`super::SWITCH_ATTRIB_GRACE_SECS`]。
+///
+/// `text` 可以是整条 message，也可以只是 reason —— 判据是 `contains`，两者同结论。
+pub fn switch_grace_secs(text: &str) -> i64 {
+    if crate::modules::sentinel::signature::is_unreachable_reason(text) {
+        super::SWITCH_ATTRIB_GRACE_TIMEOUT_SECS
+    } else {
+        super::SWITCH_ATTRIB_GRACE_SECS
+    }
 }
 
 /// 一行 relay 错误行的归因结论
@@ -219,12 +243,15 @@ pub enum Attrib {
 ///   （[`within_switch_grace`]），落在切换宽限窗里的行判 [`Attrib::Switched`]。
 ///
 /// 两条都不成 ⇒ [`Attrib::Unknown`]，调用方丢弃该行并记一行 debug。
+///
+/// `grace_secs` 是这条行自己的宽限窗（[`switch_grace_secs`]）：超时类 reason 要宽得多。
 pub fn attribute(
     g: &ResidentialGroup,
     s: &RelaySubject,
     now: &PoolNow,
     switch_at: &PoolSwitchAt,
     ts: time::OffsetDateTime,
+    grace_secs: i64,
 ) -> Attrib {
     let unknown = |o: Option<Uuid>| o.map_or(Attrib::Unknown, Attrib::Upstream);
     match s {
@@ -236,7 +263,7 @@ pub fn attribute(
             {
                 return Attrib::Upstream(id);
             }
-            if within_switch_grace(switch_at, pool, ts) {
+            if within_switch_grace(switch_at, pool, ts, grace_secs) {
                 return Attrib::Switched;
             }
             unknown(now.get(pool).and_then(|t| id_of_tag(g, t.as_deref()?)))
@@ -613,7 +640,7 @@ mod tests {
             pool: "slot-0-pool".into(),
             dial_addr: dial.map(|(h, p)| (h.to_string(), p)),
         };
-        let at = |s: &RelaySubject| attribute(&g, s, &now, &never, T1);
+        let at = |s: &RelaySubject| attribute(&g, s, &now, &never, T1, GRACE);
         assert_eq!(
             at(&RelaySubject::Member("resi-2".into())),
             Attrib::Upstream(Uuid::from_u128(2))
@@ -630,7 +657,7 @@ mod tests {
         );
         let empty = PoolNow::new();
         assert_eq!(
-            attribute(&g, &pool(None), &empty, &never, T1),
+            attribute(&g, &pool(None), &empty, &never, T1, GRACE),
             Attrib::Unknown,
             "两条都不成"
         );
@@ -643,6 +670,10 @@ mod tests {
 
     const T0: time::OffsetDateTime = time::macros::datetime!(2026-09-18 12:00:00 UTC);
     const T1: time::OffsetDateTime = time::macros::datetime!(2026-09-18 12:00:01 UTC);
+    /// 非超时类 reason 的宽限窗（`SWITCH_ATTRIB_GRACE_SECS`）
+    const GRACE: i64 = crate::modules::residential::SWITCH_ATTRIB_GRACE_SECS;
+    /// 超时类 reason 的宽限窗（`SWITCH_ATTRIB_GRACE_TIMEOUT_SECS`）
+    const GRACE_T: i64 = crate::modules::residential::SWITCH_ATTRIB_GRACE_TIMEOUT_SECS;
 
     /// 时间戳门（2026-09-18 第二次裁决）：池在 `t0` 被切过，`ts < t0 + GRACE` 的行落在窗里
     #[test]
@@ -656,30 +687,36 @@ mod tests {
         assert!(within_switch_grace(
             &sw,
             "slot-0-pool",
-            T0 - time::Duration::seconds(30)
+            T0 - time::Duration::seconds(30),
+            GRACE
         ));
-        assert!(within_switch_grace(&sw, "slot-0-pool", T0));
+        assert!(within_switch_grace(&sw, "slot-0-pool", T0, GRACE));
         assert!(
-            within_switch_grace(&sw, "slot-0-pool", T1 - time::Duration::milliseconds(1)),
+            within_switch_grace(
+                &sw,
+                "slot-0-pool",
+                T1 - time::Duration::milliseconds(1),
+                GRACE
+            ),
             "GRACE = 1 秒，边界之前仍在窗内"
         );
         assert!(
-            !within_switch_grace(&sw, "slot-0-pool", T1),
+            !within_switch_grace(&sw, "slot-0-pool", T1, GRACE),
             "t0 + GRACE 起放行"
         );
         assert!(
-            !within_switch_grace(&sw, "resi-pool", T0),
+            !within_switch_grace(&sw, "resi-pool", T0, GRACE),
             "别的池没被切过，不受牵连"
         );
         assert!(
-            !within_switch_grace(&PoolSwitchAt::new(), "slot-0-pool", T0),
+            !within_switch_grace(&PoolSwitchAt::new(), "slot-0-pool", T0, GRACE),
             "没记过切换（进程刚起）⇒ 不丢弃"
         );
         let bad: PoolSwitchAt = [("slot-0-pool".to_string(), "不是时刻".to_string())]
             .into_iter()
             .collect();
         assert!(
-            !within_switch_grace(&bad, "slot-0-pool", T0),
+            !within_switch_grace(&bad, "slot-0-pool", T0, GRACE),
             "解析不出来 ⇒ 不丢弃"
         );
     }
@@ -704,7 +741,14 @@ mod tests {
         };
         // 切换之前产生的路径 B 行：`now` 说的是新成员，这条行说的是老成员 ⇒ 丢
         assert_eq!(
-            attribute(&g, &pool(None), &now, &sw, T0 - time::Duration::seconds(5)),
+            attribute(
+                &g,
+                &pool(None),
+                &now,
+                &sw,
+                T0 - time::Duration::seconds(5),
+                GRACE
+            ),
             Attrib::Switched
         );
         // 同一批里的路径 A 行不受门影响
@@ -714,7 +758,8 @@ mod tests {
                 &pool(Some(("203.0.113.8", 10007))),
                 &now,
                 &sw,
-                T0 - time::Duration::seconds(5)
+                T0 - time::Duration::seconds(5),
+                GRACE
             ),
             Attrib::Upstream(Uuid::from_u128(2))
         );
@@ -724,15 +769,84 @@ mod tests {
                 &RelaySubject::Member("resi-2".into()),
                 &now,
                 &sw,
-                T0 - time::Duration::seconds(5)
+                T0 - time::Duration::seconds(5),
+                GRACE
             ),
             Attrib::Upstream(Uuid::from_u128(2)),
             "成员 tag 是 sing-box 自己写的那个成员，同样不受门约束"
         );
         // 宽限窗之后的路径 B 行照常归到新成员
         assert_eq!(
-            attribute(&g, &pool(None), &now, &sw, T1),
+            attribute(&g, &pool(None), &now, &sw, T1, GRACE),
             Attrib::Upstream(Uuid::from_u128(1))
+        );
+    }
+
+    /// **裁决 ④**（2026-09-18 第四次）：超时类 reason 的日志时刻比**路由决策时刻**晚一个
+    /// 完整的拨号 / 握手超时（选中成员 → 拨 → 等超时 → 才写日志），所以切换之后才落盘的
+    /// 那条行说的可能还是**老**成员。1 秒的门拦不住，这类行改用
+    /// [`super::SWITCH_ATTRIB_GRACE_TIMEOUT_SECS`]；其余 reason 照旧 1 秒。
+    #[test]
+    fn timeout_class_reasons_ride_the_wide_grace_window() {
+        // 判据只复用哨兵那一组既有标记，没有新造
+        assert_eq!(
+            switch_grace_secs("dial tcp 203.0.113.7:10007: i/o timeout"),
+            GRACE_T
+        );
+        assert_eq!(switch_grace_secs("context deadline exceeded"), GRACE_T);
+        assert_eq!(
+            switch_grace_secs(
+                "open connection to www.example.com:443 using outbound/selector[slot-0-pool]: \
+                 context deadline exceeded"
+            ),
+            GRACE_T,
+            "喂整条 message 与只喂 reason 同结论（判据是 contains）"
+        );
+        assert_eq!(
+            switch_grace_secs("socks5: request rejected, code=2"),
+            GRACE,
+            "上游拒绝目标是当场应答，没有超时延迟"
+        );
+        assert_eq!(switch_grace_secs("unexpected status: 403 Forbidden"), GRACE);
+
+        let g = group(2);
+        let now: PoolNow = [("slot-0-pool".to_string(), Some("resi-1".to_string()))]
+            .into_iter()
+            .collect();
+        let sw: PoolSwitchAt = [(
+            "slot-0-pool".to_string(),
+            "2026-09-18T12:00:00Z".to_string(),
+        )]
+        .into_iter()
+        .collect();
+        let line = RelaySubject::Pool {
+            pool: "slot-0-pool".into(),
+            dial_addr: None,
+        };
+        let at = |secs: i64, reason: &str| {
+            attribute(
+                &g,
+                &line,
+                &now,
+                &sw,
+                T0 + time::Duration::seconds(secs),
+                switch_grace_secs(reason),
+            )
+        };
+        assert_eq!(
+            at(10, "context deadline exceeded"),
+            Attrib::Switched,
+            "切换后 10 秒打出的超时行：拨号是切换之前发起的，说的是老成员 ⇒ 本批放弃"
+        );
+        assert_eq!(
+            at(5, "socks5: request rejected, code=2"),
+            Attrib::Upstream(Uuid::from_u128(1)),
+            "切换后 5 秒的拒绝行没有超时延迟，照常归到此刻选中的成员"
+        );
+        assert_eq!(
+            at(GRACE_T, "context deadline exceeded"),
+            Attrib::Upstream(Uuid::from_u128(1)),
+            "超时类也不是永远丢：t0 + 30 秒起放行"
         );
     }
 

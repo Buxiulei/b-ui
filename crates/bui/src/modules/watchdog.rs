@@ -716,6 +716,13 @@ pub fn run_stamp(now: OffsetDateTime) -> serde_json::Value {
 /// **4.1 起这条广播只有一条来路**：「进程在、端口不 listen」连续两轮那条。孤儿链自愈随
 /// [`HY2_CONFIGS`] 收成直连一项后只会重启 `hysteria-server`（住宅换 sing-box、不建 NAT
 /// 规则），而 [`check_nft`] 的整表重放不重启任何单元、门位不会回落 ⇒ 都不该广播。
+///
+/// 重启过 `b-ui-relay` 同理广播 [`Event::RelayRestarted`]（2026-09-18 第四次裁决 ②）：
+/// 不开 `cache_file` ⇒ 每个池 selector 都回落到配置里的 default，借用 / pin 中的槽要靠
+/// `residential::health::replay_loop` 立刻重放，并在重放之前先把归因的时间戳门对全池记上
+/// （时刻取 `systemctl restart` 返回之后的那一刻，裁决 ①）。
+///
+/// [`Event::RelayRestarted`]: crate::api::Event::RelayRestarted
 pub async fn check_once(ctx: &DaemonCtx) -> anyhow::Result<Vec<(String, Decision)>> {
     let state = ctx.store.read().await;
     let targets = targets(&state);
@@ -787,12 +794,22 @@ pub async fn check_once(ctx: &DaemonCtx) -> anyhow::Result<Vec<(String, Decision
     }
     // relay 被重启过 = 一次**全池**切换：它的每个池 selector 的 `now` 都回落到配置里的
     // default，归因的时间戳门要当场对全池记一次（2026-09-18 第三次裁决 ③），否则这一刻
-    // 之前产生的 relay 错误行会被路径 B 记到新成员头上。选择本身的重放由
-    // `residential::health` 的规则 6a 与 `drive_slots` 下一轮兜底 —— 这条来路按既有口径
-    // **不发** `Event::RelayRestarted`（§C 末段）。
+    // 之前产生的 relay 错误行会被路径 B 记到新成员头上。
+    //
+    // 时刻取 `ctx.host.now()`（**`systemctl restart` 返回之后**，第四次裁决 ①）而不是
+    // 轮首的 `now`：`systemctl` 是阻塞的，selector 回落 default 就发生在「发命令 → 返回」
+    // 那段里，记轮首等于把门开在事件之前，那段里产生的老成员失败行会漏过门。
+    //
+    // 并且**要发** `Event::RelayRestarted`（第四次裁决 ②，与 `hysteria-residential`
+    // 那条重启口径一致）：让 `health::replay_loop` 把 runtime 与 relay 收敛回来，
+    // 借用 / pin 中的槽不必等 `drive_slots` 下一轮（最坏 2 分钟）才被 PUT 回去。
+    // 上面那次当场盖章保留：重放成功的池会在 `select` 返回后再记一次更晚更准的时刻。
     if restarted.contains("b-ui-relay") {
         let pools = crate::modules::residential::state::all_pool_selectors(&state);
-        crate::modules::residential::state::mark_pools_switch(&ctx.runtime, &pools, now).await;
+        let restarted_at = ctx.host.now();
+        crate::modules::residential::state::mark_pools_switch(&ctx.runtime, &pools, restarted_at)
+            .await;
+        ctx.bus.send(crate::api::Event::RelayRestarted);
     }
     let nft_record = nft_event(&nft, &state, &nft_heals, now);
     // 命中数每轮都并一次（不只在重放那一轮）：采样点就是重放之前的那一刻，
@@ -1079,13 +1096,10 @@ mod tests {
         );
     }
 
-    /// 2026-09-18 第三次裁决 ③：看门狗重启 `b-ui-relay` = 一次**全池**切换。不开
-    /// `cache_file` ⇒ 重启把**每个**池 selector 的 `now` 都打回配置里的 default，
-    /// 而这条来路按既有口径**不发** `Event::RelayRestarted`（重放交给规则 6a /
-    /// `drive_slots` 下一轮兜底）—— 那就更得当场把归因的时间戳门记上，否则这一刻
-    /// 之前产生的 relay 错误行会被路径 B 整批记到重启后 default 的那条上游头上。
-    #[tokio::test]
-    async fn restarting_the_relay_stamps_every_pool_for_the_attribution_gate() {
+    /// 一台「四个内核都在跑、relay 的 2080 不 listen」的假机器：连续两轮后重启 relay。
+    /// `advance_on_systemd` 把「发 `systemctl restart` → 命令返回」那段真实耗时复现出来
+    /// （裁决 ①：全池记的必须是**返回之后**的时刻）
+    fn relay_half_dead_host(restart_secs: i64) -> Arc<FakeHost> {
         let host = Arc::new(FakeHost::new());
         host.with(|i| {
             for u in [
@@ -1096,23 +1110,51 @@ mod tests {
             ] {
                 i.units_active.insert(format!("{u}.service"));
             }
-            // relay 进程在、2080 不 listen ⇒ 连续两轮后重启它
             i.listening
                 .insert(Proto::Udp, [10000, 40000].into_iter().collect());
             i.listening
                 .insert(Proto::Tcp, [10001].into_iter().collect());
+            i.advance_on_systemd = restart_secs;
         });
-        // 池有效 + 两个槽 ⇒ 全池 = 全局池 + slot-0-pool + slot-1-pool
-        let mut state = crate::modules::residential::sample_state_with_pool();
-        let up = state.residential.groups["default"].upstreams[0].id;
-        state.residential.slots = (0..2)
-            .map(|index| bui_schema::model::Slot {
-                index,
-                upstream_id: up,
+        host
+    }
+
+    /// 池有效 + `n` 条上游 + `n` 个槽（槽 i 的 IP = 第 i 条）：relay 重启的重放要有可借的第二条
+    fn relay_pool_state(n: u16) -> State {
+        let mut s = crate::modules::residential::sample_state_with_pool();
+        let g = s.residential.groups.get_mut("default").unwrap();
+        let proto = g.upstreams[0].clone();
+        g.upstreams = (0..n)
+            .map(|i| bui_schema::model::Upstream {
+                id: uuid::Uuid::from_u128(i as u128 + 1),
+                name: format!("url-{}", i + 1),
+                host: format!("isp{}.example.net", i + 1),
+                ..proto.clone()
             })
             .collect();
-        let (c, _d) = ctx_with_state(host.clone(), state).await;
-        let mut rx = c.bus.subscribe();
+        g.selected_upstream_id = g.upstreams.first().map(|u| u.id);
+        s.residential.slots = (0..n)
+            .map(|index| bui_schema::model::Slot {
+                index,
+                upstream_id: uuid::Uuid::from_u128(index as u128 + 1),
+            })
+            .collect();
+        s
+    }
+
+    /// 2026-09-18 第三次裁决 ③ + **第四次裁决 ①**：看门狗重启 `b-ui-relay` = 一次**全池**
+    /// 切换。不开 `cache_file` ⇒ 重启把**每个**池 selector 的 `now` 都打回配置里的 default，
+    /// 所以当场把归因的时间戳门对全池记上，否则这一刻之前产生的 relay 错误行会被路径 B
+    /// 整批记到重启后 default 的那条上游头上。
+    ///
+    /// 记的时刻必须取自 `systemctl restart` **返回之后**（裁决 ①）：`systemctl` 是阻塞的，
+    /// 「轮首」与「重启返回」之间差着内核起不起来那段时间，而 selector 回落 default 是在
+    /// 那段**里面**发生的 —— 记轮首就等于把门开在事件之前，那段里产生的老成员失败行会
+    /// 漏过门。对照 `health::the_pool_switch_timestamp_is_taken_after_the_select_returns`。
+    #[tokio::test]
+    async fn restarting_the_relay_stamps_every_pool_after_the_restart_returns() {
+        let host = relay_half_dead_host(30);
+        let (c, _d) = ctx_with_state(host.clone(), relay_pool_state(2)).await;
         check_once(&c).await.unwrap();
         assert!(
             crate::modules::residential::state::read(&c.runtime)
@@ -1122,28 +1164,91 @@ mod tests {
             "第一轮只是 Failing、没重启 ⇒ 一笔都不许记"
         );
         host.advance(60);
+        let head = host.now(); // 第二轮的轮首时刻
         let second = check_once(&c).await.unwrap();
         assert!(
             second.contains(&("b-ui-relay".to_string(), Decision::Restart)),
             "{second:?}"
         );
-        assert!(
-            rx.try_recv().is_err(),
-            "这条来路不发 Event::RelayRestarted（口径没变）"
-        );
+        let at = crate::modules::residential::state::read(&c.runtime).await;
         assert_eq!(
-            crate::modules::residential::state::read(&c.runtime)
-                .await
-                .pool_switch_at
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>(),
+            at.pool_switch_at.keys().cloned().collect::<Vec<_>>(),
             vec![
                 crate::modules::residential::POOL.to_string(),
                 crate::modules::residential::slot_selector(0),
                 crate::modules::residential::slot_selector(1),
             ],
             "relay 重启 = 全池切换：每个池 selector 都要记一笔"
+        );
+        let returned = host.now(); // `systemctl restart` 返回之后的时刻
+        assert_eq!(returned, head + time::Duration::seconds(30));
+        for (pool, raw) in &at.pool_switch_at {
+            let t = parse_rfc3339(raw).expect("记下的时刻要能解析");
+            assert!(
+                t >= returned,
+                "{pool} 记的是 {t}，比 restart 返回时刻 {returned} 早 ⇒ 门开在事件之前"
+            );
+        }
+    }
+
+    /// **第四次裁决 ②**：看门狗重启 relay 之后必须发 `Event::RelayRestarted`（与
+    /// `hysteria-residential` 那条重启口径一致）。少了它，`health::replay_loop` 不跑，
+    /// 借用 / pin 中的槽就一直停在配置里的 default —— 靠 `drive_slots` 下一轮兜底意味着
+    /// 最坏 2 分钟里所有借槽的用户都被打回坏 IP，而且没有任何告警说明原因。
+    /// 当场盖章（裁决 ③）保留：重放成功的池会在 `select` 返回后再记一次更晚更准的时刻。
+    #[tokio::test]
+    async fn restarting_the_relay_is_announced_so_the_selection_gets_replayed() {
+        use crate::modules::residential::clash::{Clash, FakeClash};
+        use crate::modules::residential::state as rstate;
+
+        let host = relay_half_dead_host(0);
+        let (c, _d) = ctx_with_state(host.clone(), relay_pool_state(2)).await;
+        // 槽 0 被管理员 pin 在第二条上游上（≠ 本槽自己的 IP）⇒ 重启后必须被重放回去
+        rstate::update(&c.runtime, |r| {
+            r.slots.entry("0".into()).or_default().pinned_upstream_id =
+                Some(uuid::Uuid::from_u128(2));
+        })
+        .await;
+        let clash = Arc::new(FakeClash::new(None));
+        // relay 重启后 selector 都停在配置里的 default（本槽自己的 IP）
+        clash.with(|i| {
+            i.now.insert(
+                crate::modules::residential::slot_selector(0),
+                "resi-1".into(),
+            );
+        });
+        let rx = c.bus.subscribe();
+        let mut watch = c.bus.subscribe();
+        let replay = tokio::spawn(crate::modules::residential::health::replay_loop(
+            c.clone(),
+            clash.clone() as Arc<dyn Clash>,
+            rx,
+        ));
+        check_once(&c).await.unwrap();
+        host.advance(60);
+        let second = check_once(&c).await.unwrap();
+        assert!(
+            second.contains(&("b-ui-relay".to_string(), Decision::Restart)),
+            "{second:?}"
+        );
+        assert_eq!(
+            watch.try_recv().ok(),
+            Some(crate::api::Event::RelayRestarted),
+            "重启了 relay 却不广播 ⇒ 借用 / pin 的槽全停在 default、没人重放"
+        );
+        // 重放是另一个任务，等它把 PUT 打出去
+        let sel = crate::modules::residential::slot_selector(0);
+        for _ in 0..200 {
+            if clash.peek(&sel).as_deref() == Some("resi-2") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        replay.abort();
+        assert_eq!(
+            clash.peek(&sel).as_deref(),
+            Some("resi-2"),
+            "重放跑过：pin 的槽被重新 PUT 回去，不再停在 default"
         );
     }
 
