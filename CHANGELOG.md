@@ -14,6 +14,7 @@
 
 ### 变更
 - **面板一键安装命令去掉冗余的 `BUI_C_SOURCE=`**：面板下发的 `bui-c-install.sh` 里 `PANEL_SOURCE` 已指向本面板 `/packages`、脚本自会回落，命令再设一遍没有作用；而 `sudo VAR=… bash` 要求 sudoers 有 SETENV，受限 sudoers 会报「not allowed to set the following environment variables」直接失败（2026-09-18 bui-c 线在 baiyi 实测）。现在是 `curl -fsSL --noproxy '*' '<面板>/packages/bui-c-install.sh' | sudo bash`；面板那段说明补了「已是 root 就去掉 sudo」「没有 curl 先装」两句。脚本正文仍认 `BUI_C_SOURCE`（手动运行仓库副本时覆盖制品源）。
+- **m3 验收脚本「住宅到期语义」判据修正**：4.1.0 发版当天在 bwg-rick 两轮 FAIL 都是脚本竞态——`probe_all_fail` 一看到 200 就判失败，而住宅门位切 `deny` 是在 `traffic::sampling_loop` 每 10 秒那轮 `sync_now` 上收敛（实测 ~8–9 秒；60 秒用户同步只是兜底上界）。改成 `probe_until_fail`：在 75 秒门位收敛窗口内轮询到**连续 3 次**失败才算 PASS，窗口末仍能 200 才 FAIL；探测前先等新连接握手成功，免得客户端慢启动的 000 被误判成"门已切"。spec §3.3 把无事件收敛的触发路径从两条订正为三条并写明典型/上界延迟。
 
 ## [4.1.0] - 2026-09-18
 
