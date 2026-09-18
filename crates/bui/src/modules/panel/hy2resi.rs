@@ -176,14 +176,21 @@ pub fn deltas_from_stats(stats: &[Stat]) -> BTreeMap<String, TxRx> {
 /// 发给 sing-box 的 `QueryStats` 请求（每轮采样都是这一个常量请求）。
 ///
 /// **`patterns`（repeated，字段 3）填、单数 `pattern`（字段 1）必须留空** —— 上游
-/// `experimental/v2rayapi/stats.go:199-208`（v1.14.1）：
+/// `experimental/v2rayapi/stats.go` 的 `QueryStats`（`:203-212`，v1.14.1）：
 ///
 /// ```text
-/// if len(request.Patterns) == 0 { for name, counter := range s.counters { … counter.Swap(0) … } }
+/// if len(request.Patterns) == 0 {
+///     for name, counter := range s.counters {
+///         if request.Reset_ { value = counter.Swap(0) } else { value = counter.Load() }  // :206-210
+///         response.Stat = append(response.Stat, …)
+///     }
+/// }
 /// ```
 ///
-/// 即 `patterns` 为空时它**无过滤地返回并清零全部计数器**；整个 `QueryStats` 里
-/// `request.Pattern` 一次都没被读（`:210/:211/:233` 只读 `Patterns`）。所以照 Xray 那条路
+/// 即 `patterns` 为空时它**无过滤地返回全部计数器**，清零那一半受 `request.Reset_` 门控
+/// （`reset=false` 只 `Load()` 读不清零、`reset=true` 才 `Swap(0)` 清零取增量）；我们恒填
+/// `reset=true`，对本进程仍是每轮原子清零取增量。整个 `QueryStats` 里单数 `request.Pattern`
+/// 一次都没被读（只读 `Patterns`，`:203/:215/:223`）。所以照 Xray 那条路
 /// 写 `pattern = "user>>>"` 会变成「每轮把 `inbound>>>` / `outbound>>>` 的计数器一起
 /// `Swap(0)`、并把非用户计数器混进返回体」——**两边不能照抄**（Xray 侧仍是
 /// `pattern`，见 `panel::xray` 的 `query_user_deltas`）。非 regexp 分支是
@@ -462,8 +469,9 @@ mod tests {
     ///
     /// 这是一条裁决性偏离（计划与 spec 原先写的是 `pattern="user>>>"`，2026-09-16 按上游
     /// 源码订正），所以必须有断言钉住：sing-box 的 `QueryStats` 只读 `patterns`
-    /// （`experimental/v2rayapi/stats.go:199-208`、`:210/:211/:233`，v1.14.1），`patterns`
-    /// 为空时**无过滤地返回并清零全部计数器**，而 `request.Pattern` 一次都没被读。
+    /// （`experimental/v2rayapi/stats.go:203-212`，v1.14.1）：`patterns` 为空时**无过滤地返回
+    /// 全部计数器**、清零受 `reset` 门控（`reset=true` 才 `Swap(0)`，我们恒填），而单数
+    /// `request.Pattern` 一次都没被读。
     /// 把这里改回 `pattern=` 编译照样过、别处的测试照样全绿，后果却是每轮把
     /// `inbound>>>` / `outbound>>>` 一起 `Swap(0)`、并把非用户计数器混进返回体。
     #[test]
