@@ -968,7 +968,7 @@ mod tests {
     }
 
     /// 全新装机（`hy2pool::migrate` 之前）池是空的：此时也必须渲染出合法配置
-    /// （`users: []` + 9 个出站 + 1 条 sniff 规则），且能过真实 `sing-box check`。
+    /// （`users: []` + 9 个出站 + **空** `route.rules`），且能过真实 `sing-box check`。
     /// 没有这一格的话「首装当轮住宅内核起不来」只能等真机才发现（2026-09-16 第二波复核）。
     #[test]
     fn an_empty_pool_still_renders_a_valid_residential_config() {
@@ -987,10 +987,10 @@ mod tests {
             1 + usize::from(bui_schema::slots::MAX_SLOTS),
             "deny + 8 个槽出站，一个门都没有"
         );
-        assert_eq!(
-            v["route"]["rules"].as_array().unwrap().len(),
-            1,
-            "只剩 sniff"
+        assert!(
+            v["route"]["rules"].as_array().unwrap().is_empty(),
+            "一条规则都不剩：每凭据一条 auth_user，池空就没有；\
+             住宅 HY2 侧不渲染 sniff（见 `render::hy2_singbox` 模块文档）"
         );
         assert_eq!(
             v["experimental"]["v2ray_api"]["stats"]["users"],
