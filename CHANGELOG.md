@@ -24,6 +24,7 @@
 
 ### 发布后观察项（bwg-rick）
 - **本分支让 `relay_upstream_error` / `relay_upstream_auth_failed` / `relay_google_blocked` 三个签名第一次在生产真正触发**，而 `sentinel/resi.rs::on_upstream_error` 对带外快探的三值结论里，`Verdict::Unconfirmed`（预算内没能确认可用）是**按不可用处置**的：`mark_unhealthy` + `slots::borrow_now`，与确认不可用同一条路径（2026-09-14 裁决，理由写在那条分支的注释里）。所以一次误归因的代价**不只是白探一次**：它可能把一条健康上游判成不健康并把槽借走，恢复要等巡检连续 2 轮探通 + 攒满 3 轮切回防抖（约 8 分钟）。头几天要盯：`bui incidents` 里这三个签名的事件频率、`借用 / 切槽`事件的密度，以及被判不健康的上游在体检里是否其实一直是好的。
+- **`journal::collect` 改 `-o json` 之后，游标失效那一轮的 stdout 会比 `-o cat` 涨 5–10 倍**：`-o cat` 每行只有 `MESSAGE`，`-o json` 每行还带 `__CURSOR` / `__REALTIME_TIMESTAMP` / `_SYSTEMD_UNIT` 等字段；而游标失效（日志轮转 / relay 重启）那一轮走的是 `--since -25h`，**一次性读进内存**再逐行解析。relay 单元每天几千到两万多条拒绝行，25 小时那一轮按每行约 1 KB 估是几十 MB 的一次性峰值。头几天盯 `systemctl show b-ui -p MemoryCurrent`（守护进程重启后的第一轮、以及每日 04:00 前后各看一次）有没有异常尖峰；真撞上再改成流式读 / 缩短回看窗口。
 - `bui incidents` 里是否开始出现 `relay_upstream_error` / `relay_upstream_auth_failed` 一类事件，以及借用是否合理（探测通过 = Info、不动作是正常的）。
 - `runtime.json` 的 `candidates` 是否开始累计，以及每日 04:00 之后 `state.blacklist.auto` 有没有出现**不该被拉黑**的域名。确认路径是「硬拒 + 直连可达、间隔 ≥10 分钟连续 2 次」，误学一次不会直接生效，但要盯住第一批被确认的条目。
 
