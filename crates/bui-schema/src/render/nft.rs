@@ -16,8 +16,9 @@
 //!    （`man nft` NAT STATEMENTS：「When used in the inet family (available with kernel 5.2),
 //!    the dnat and snat statements …」），更低的内核会把整份事务拒掉（`Error: Chain of type
 //!    "nat" is not supported, perhaps kernel support is missing?`），跳跃段与兼容段双双不通。
-//!    受支持目标（Ubuntu 22.04+ / Debian 12 / CentOS Stream 9）内核都 ≥ 5.15，低于 5.2 的只有
-//!    已 EOL 的 CentOS 7（3.10）与 Debian 10（4.19），所以 4.1 直接钉这道下限，**不**退回
+//!    硬下限是 Linux ≥ 5.2；受支持目标（Ubuntu 22.04+ / Debian 12 / CentOS Stream 9）默认内核
+//!    最低是 CentOS Stream 9 的 5.14（nft-distros 实测表：5.15 / 6.8 / 6.1 / 5.14，均 ≥ 5.2），
+//!    低于 5.2 的只有已 EOL 的 CentOS 7（3.10）与 Debian 10（4.19），所以 4.1 直接钉这道下限，**不**退回
 //!    `ip` + `ip6` 双表（双表会让规则数翻倍，`rule_count` 与自检 / watchdog 的判据随之分叉）；
 //!    落地路径负责 `nft -c -f` 预检与内核版本核对，失败时显式报错而不是让跳跃静默消失
 //!    （2026-09-16 裁决）。

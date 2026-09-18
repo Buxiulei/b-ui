@@ -134,3 +134,17 @@ pub const CLASH_API_LISTEN: &str =
 /// 能在真机上采到，替换掉先前的源码推断版
 pub const V2RAY_API_LISTEN: &str =
     "+0000 2026-09-18 02:48:21 INFO v2ray-api: grpc server started at 127.0.0.1:10086";
+
+/// ⑨a 证书热加载的中间态 ERROR（2026-09-18 本机自建 1.14.1 换证实测，item09/logs/sidecar.log，
+/// `+0800` 是那次本机运行的真时区、逐字原文；行里无端口 / 路径 / 用户名，无需归一）。
+/// b-ui 写盘是 tmp+rename、先 cert 后 key，每次轮换都必然先出这条「cert 已换 key 未换那几毫秒」
+/// 的 ERROR（§3.5 第 3 件、§12 第 9 项）。**没人给它加白**：`classify` 是签名白名单，这条匹配不到
+/// 任何签名 ⇒ 默认忽略、判 `None`；本常量是把这条「默认忽略」钉死的守门夹具，防止将来有人加一条
+/// 泛 ERROR 签名把它当异常报出来
+pub const CERT_RELOAD_MISMATCH: &str = "+0800 2026-09-18 10:45:22 ERROR inbound/hysteria2[hy2-resi]: \
+                                        reload certificate: reload key pair: tls: private key does not match public key";
+
+/// ⑨b 证书热加载成功那条 INFO（同一次实测，紧跟 [`CERT_RELOAD_MISMATCH`] 之后）：key 落盘后第二次
+/// reload 成功。同样匹配不到任何签名 ⇒ 判 `None`
+pub const CERT_RELOADED: &str =
+    "+0800 2026-09-18 10:45:22 INFO inbound/hysteria2[hy2-resi]: reloaded TLS certificate";

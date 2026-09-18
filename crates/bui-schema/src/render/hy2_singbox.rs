@@ -34,8 +34,8 @@
 //! 嗅探超时（缺省 300 ms），而且永远嗅不到东西** —— 成因是 Hysteria2 协议与 sing-box
 //! 实现的次序死锁：
 //!
-//! - apernet 客户端（v2rayN 里那个、`hysteria` CLI）缺省 `fastOpen: false`，
-//!   要等服务端回 `TCPResponse` 之后才发首包；
+//! - apernet hysteria 客户端（`hysteria` CLI）**在 fastOpen 关闭时**（上游文档的默认值是
+//!   `false`；本次矩阵对开 / 关**各测了一格**）要等服务端回 `TCPResponse` 之后才发首包；
 //! - 而 sing-box 是在 **route（sniff 动作在 `route/route.go` 的规则匹配里跑）走完、
 //!   出站也拨通之后**才 `N.ReportConnHandshakeSuccess`（`route/conn.go:122`），
 //!   那一步才触达 sing-quic 的 `hysteria2.serverConn.HandshakeSuccess`
@@ -54,7 +54,7 @@
 //!
 //! 即：延迟 ≈ 超时值，缩短超时只是缩短白等；嗅探成功率恒为 0，无论超时多大。
 //! （sing-box 当客户端时先发首包、不受影响：同一格 5.9 ms、25/25 嗅到域名；
-//! 但**服务端不能假设客户端是谁**——v2rayN 用户走的就是 apernet 客户端那条路。
+//! 但**服务端不能假设客户端是谁** —— v2rayN 若用 apernet 内核同理，**未在本次测量**。
 //! 对照格 E：apernet **服务端** + `sniff.rewriteDomain` 两种客户端都是 5 ms 级，
 //! 所以这不是协议本身的代价，是 sing-box 这个实现的次序。）
 //!
@@ -63,8 +63,10 @@
 //! - **分流**：住宅路径的 split 关键字匹配靠的是 relay 自己那条 `rules[0]` 无过滤
 //!   sniff（[`crate::render::relay`]，`kernel_relay.rs` 有守门断言）。sing-box 1.14 的
 //!   sniff 动作**不改写连接目标**，这一侧嗅到的域名原本就传不到 relay；relay 会在自己
-//!   那一跳重新嗅一次，`domain_keyword` 优先匹配 `metadata.Domain`。T3 item12 的对照
-//!   实验已经证明：摘掉 relay 那条会静默直连，摘掉这一条不会。
+//!   那一跳重新嗅一次，`domain_keyword` 优先匹配 `metadata.Domain`。T3 item12 的对照实验
+//!   **直接证明的是前半**：摘掉 relay 那条，客户端只发 IP 的流量会静默直连。「摘掉这一条
+//!   不会」是由 item12 第 ① 条（hy2 侧的 sniff **不改写连接目标**、relay 收到的始终是客户端
+//!   原样发来的地址）**推得**的推论，不是对照实验的直接结论。
 //! - **面板 / CLI**：`/connections` 的归户只读 `rule` / `chains` / `id`
 //!   （`bui` 的 `panel::hy2resi::Hy2ResiConn`），`metadata.host` 一处都没读；失去它
 //!   不改变任何显示。`inbound connection to …` 那条日志行在 route 之前打，照旧。
