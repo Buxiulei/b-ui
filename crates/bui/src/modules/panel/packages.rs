@@ -218,10 +218,12 @@ pub fn install_command(host: &str) -> String {
     // 沿用 v3 的 `--noproxy '*'`（机房里客户端可能有 http_proxy 环境变量），但**去掉 v3 的 `-k`**：
     // v4 的面板证书由 Caddy 正规签发（P1 Task 11），`-k` 已无必要，而它会把这条
     // pipe-to-sudo 命令的可信度削掉一半（中间人可以换掉脚本）。也**不带 install key**
-    // （spec §4.3 改动 2）。`BUI_C_SOURCE` 让引导脚本优先从本面板取二进制（P4 决策 9）。
-    format!(
-        "curl -fsSL --noproxy '*' 'https://{host}/packages/{INSTALL_SCRIPT}' | sudo BUI_C_SOURCE='https://{host}/packages' bash"
-    )
+    // （spec §4.3 改动 2）。**不带 `BUI_C_SOURCE=`**：面板下发本脚本时已把脚本里的
+    // `PANEL_SOURCE` 占位符替换成本面板 `/packages`（[`fill_panel_source`]），脚本回落到它
+    //（scripts/bui-c-install.sh），命令里再设一遍是冗余的；而且 `sudo VAR=val` 要 sudoers
+    // 有 SETENV，受限（非 `ALL`）sudoers 会直接报错失败（2026-09-18 baiyi 真机实测）。
+    // 脚本正文仍认 `BUI_C_SOURCE`，供手动运行仓库副本时覆盖源。
+    format!("curl -fsSL --noproxy '*' 'https://{host}/packages/{INSTALL_SCRIPT}' | sudo bash")
 }
 
 /// 面板域名：**只**取期望态的 `node.domain`，过 [`safe_host`] 才用，不过（含空）⇒ `None`。
@@ -445,7 +447,7 @@ mod tests {
         assert_eq!(
             c,
             "curl -fsSL --noproxy '*' 'https://panel.example.com/packages/bui-c-install.sh' \
-             | sudo BUI_C_SOURCE='https://panel.example.com/packages' bash"
+             | sudo bash"
         );
         assert!(
             !c.contains(" -k "),
@@ -454,6 +456,25 @@ mod tests {
         assert!(
             !c.contains("key="),
             "spec §4.3 改动 2：install key 机制已删除"
+        );
+        // 命令里不再带 BUI_C_SOURCE=：面板下发的脚本 PANEL_SOURCE 已指向本面板 /packages，
+        // 再在 `sudo VAR=val` 里设它是冗余的，而且要 sudoers SETENV、受限 sudoers 会失败
+        //（2026-09-18 baiyi 真机实测）。
+        assert!(
+            !c.contains("BUI_C_SOURCE"),
+            "命令不该带 BUI_C_SOURCE=（冗余且 sudo SETENV 受限 sudoers 会失败）"
+        );
+        assert!(
+            c.ends_with(" | sudo bash"),
+            "以 `| sudo bash` 结尾，中间不夹环境变量"
+        );
+        assert!(
+            c.contains("--noproxy '*'"),
+            "机房里客户端可能有 http_proxy，沿用 --noproxy '*'"
+        );
+        assert!(
+            c.contains("https://panel.example.com/packages/bui-c-install.sh"),
+            "取本面板 /packages 下的引导脚本"
         );
     }
 
