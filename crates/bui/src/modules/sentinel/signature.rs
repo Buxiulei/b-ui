@@ -1,5 +1,6 @@
 //! 日志哨兵的签名表（spec §5.7）：一行日志 → 哪一类故障、落在哪个对象上、触发门槛多少。
-//! **纯函数**，不碰机器；fixtures 用真机原文。
+//! **纯函数**，不碰机器；fixtures 以真机采样为主，每条的出处（采样 / 转写 / 合成）逐条标在
+//! `fixtures_relay` 与 `fixtures_hy2_resi` 的常量头上。
 //!
 //! 边界（设计裁决 D4）：relay 里「上游拒绝了**这个目标**」（`unexpected status: 4xx/5xx`、SOCKS5
 //! 的 REP 拒绝）归黑名单（spec §5.4，`residential::journal::parse_line`），哨兵不碰；哨兵只认
@@ -700,6 +701,11 @@ mod tests {
                 Sig::RelayUpstreamAuthFailed,
                 "resi-1",
             ),
+            (
+                fx::MEMBER_SOCKS_AUTH,
+                Sig::RelayUpstreamAuthFailed,
+                "resi-2",
+            ),
         ] {
             assert_eq!(sig_of("b-ui-relay", l), Some((sig, tag.to_string())), "{l}");
         }
@@ -718,11 +724,12 @@ mod tests {
         }
     }
 
-    /// `unexpected EOF` 语义含糊（上游掐的还是目标掐的分不出来）⇒ **不归类**：
+    /// 语义含糊的 reason（`unexpected EOF` 是上游掐的还是目标掐的分不出来、`context canceled`
+    /// 是客户端自己断的、`malformed MIME header line` 什么都说明不了）⇒ **不归类**：
     /// 既不当上游故障（会误借用），也不学进黑名单（会误拉黑）。真机每天上万条，
     /// 归错一边的代价都很大
     #[test]
-    fn an_unexpected_eof_is_never_classified() {
+    fn ambiguous_reasons_are_never_classified() {
         for l in [fx::MEMBER_UNEXPECTED_EOF, fx::POOL_SELECTOR_UNEXPECTED_EOF] {
             assert_eq!(sig_of("b-ui-relay", l), None, "{l}");
         }
@@ -731,6 +738,9 @@ mod tests {
             sig_of("b-ui-relay", fx::POOL_SELECTOR_CONTEXT_CANCELED),
             None
         );
+        // 上游回了个不合 HTTP 的响应头（真机 rick 15 条 / tizi 94 条）：既不说明上游整体不能用，
+        // 也不是对这个目标的拒绝 ⇒ 同样不归类。这条是采样里有量、此前没人钉过的形状
+        assert_eq!(sig_of("b-ui-relay", fx::MEMBER_MALFORMED_MIME), None);
     }
 
     /// 目标级拒绝（黑名单的地盘）在池形状下同样不许进哨兵

@@ -647,6 +647,37 @@ mod tests {
         assert_eq!(k.clash.selected("slot-1-pool").as_deref(), Some("resi-1"));
     }
 
+    /// 同一条链路，喂**采样原文**：`slot-<i>-pool` 上的 SOCKS5 凭据被拒（tizi 14 天窗口 10 条，
+    /// 池形状里唯一逐字采到的「上游本身坏了」形状）。上面那条用例的
+    /// [`fx::POOL_SELECTOR_DEADLINE_SLOT1`] 是按 §3 拼的合成形状——归因层只看
+    /// `RelaySubject`、与 reason 无关，所以拿它测机制没问题，但真机形状得有一条端到端的
+    #[tokio::test]
+    async fn a_verbatim_sampled_pool_line_is_attributed_end_to_end() {
+        let k = kit().await;
+        k.prober.with_gateways_up(&["isp1.example.net:10007"]);
+        k.clash.with(|i| {
+            i.now.insert("slot-0-pool".into(), "resi-3".into());
+        });
+        k.host.advance(3);
+        feed(
+            &k,
+            (0..3)
+                .map(|t| rec("b-ui-relay", t, fx::POOL_SELECTOR_SOCKS_AUTH))
+                .collect(),
+        );
+        let mut s = Sentinel::default();
+        let rep = tick(&k.ctx, &k.deps, &mut s).await;
+        assert_eq!(rep.incidents.len(), 1, "{:?}", rep.incidents);
+        assert_eq!(
+            (
+                rep.incidents[0].signature.as_str(),
+                rep.incidents[0].subject.as_str()
+            ),
+            ("relay_upstream_auth_failed", "isp3.example.net:10007"),
+            "对象是 slot-0-pool 此刻选中的那个上游"
+        );
+    }
+
     /// 归不了因（池的 `now` 指向池外的 tag）⇒ 整批丢弃、零动作，且**每个池每轮只查一次**
     /// `now`（归因前后各一次），不因为日志条数多就狂打 Clash API
     #[tokio::test]

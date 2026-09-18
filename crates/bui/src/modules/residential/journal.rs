@@ -383,6 +383,10 @@ mod tests {
         assert_eq!(parse_line(UNRELATED), None);
         // 超时不是拒绝：算进候选会把网络抖动学成黑名单
         assert_eq!(parse_line(TIMEOUT), None);
+        // 上游凭据被拒（rick 308 条）是「整条上游不能用」，哨兵的地盘；不合 HTTP 的响应头
+        //（rick 15 条 / tizi 94 条）语义不明。两者都不是「拒绝了这个目标」⇒ 都不学
+        assert_eq!(parse_line(fx::MEMBER_SOCKS_AUTH), None);
+        assert_eq!(parse_line(fx::MEMBER_MALFORMED_MIME), None);
         // SOCKS5 REP=4（主机不可达）/ 1（通用失败）是目标或网络的问题，不是策略拒绝
         assert_eq!(parse_line(SOCKS_CODE4), None);
         assert_eq!(parse_line(SOCKS_CODE1), None);
