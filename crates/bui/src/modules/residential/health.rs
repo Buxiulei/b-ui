@@ -639,6 +639,7 @@ pub async fn check_round(
         // 先算判定，好把防抖计数与下面的选择落账并成同一次写盘
         let d = improve_decision(&g, &rt, &healthy, cur, now);
         let mut alerts: Vec<String> = Vec::new();
+        let mut replayed_pool = false;
         if want == Some(cur) && Some(cur) != sel_id {
             // tag 现算（位置键，不做主键）；cur 来自当前池，tag_of 必有值
             let tag = clash::tag_of(&g, cur).expect("cur 取自当前池");
@@ -649,7 +650,9 @@ pub async fn check_round(
                     out.notes.push(format!(
                         "relay 的当前选择 {sel_tag} 与运行时记录的 {tag} 不一致（relay 刚重启过），已重放运行时的选择"
                     ));
-                    // 重放不是切换：不写 last_switch_at、不吃 60s 限速
+                    // 重放不是切换：不写 last_switch_at、不吃 60s 限速。但 selector 的 `now`
+                    // 确实换了值 ⇒ 归因的时间戳门要记（`state::note_pool_switch` 的文档）
+                    replayed_pool = true;
                     out.replayed_to = Some(tag);
                 }
                 Err(e) => {
@@ -665,6 +668,9 @@ pub async fn check_round(
             r.selected_pending_persist = pending;
             r.improve_candidate_id = cand;
             r.improve_rounds = rounds;
+            if replayed_pool {
+                state::note_pool_switch(r, POOL, now);
+            }
             for a in alerts.drain(..) {
                 state::push_alert(r, a);
             }
@@ -836,6 +842,7 @@ async fn switch_to(
             state::update(&ctx.runtime, move |r| {
                 r.selected_upstream_id = Some(target_id);
                 r.last_switch_at = Some(fmt_rfc3339(now));
+                state::note_pool_switch(r, POOL, now);
                 r.selected_pending_persist = pending;
                 if manual_dropped.is_some() {
                     r.manual_selected_id = None;
@@ -1123,7 +1130,13 @@ pub async fn replay_after_restart(ctx: &DaemonCtx, c: Arc<dyn Clash>) -> ReplayO
         .join("；");
     let alert = (!out.failed.is_empty())
         .then(|| format!("{REPLAY_FAIL_ALERT}（{failed_list}），下一轮巡检兜底"));
+    let now = ctx.host.now();
+    let switched: Vec<String> = done.iter().map(|i| i.selector.clone()).collect();
     state::update(&ctx.runtime, move |r| {
+        // 重放成功的每个 selector 的 `now` 都换了值 ⇒ 归因的时间戳门要记
+        for sel in &switched {
+            state::note_pool_switch(r, sel, now);
+        }
         for (idx, seen, landed) in slot_writes {
             if let Some(e) = r.slots.get_mut(&idx.to_string()) {
                 if e.current_upstream_id == seen {
@@ -1187,6 +1200,7 @@ pub async fn select_manual(ctx: &DaemonCtx, c: Arc<dyn Clash>, id: Uuid) -> anyh
         r.selected_upstream_id = Some(id);
         r.manual_selected_id = Some(id);
         r.last_switch_at = Some(fmt_rfc3339(now));
+        state::note_pool_switch(r, POOL, now);
         r.selected_pending_persist = pending;
     })
     .await;

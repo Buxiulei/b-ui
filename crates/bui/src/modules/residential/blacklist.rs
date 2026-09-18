@@ -94,10 +94,15 @@ pub fn port_allowed(up: &Upstream, port: u16) -> bool {
 /// `urltest[resi-pool]`），成员 tag 一个字都不出现（[`journal::RelaySubject`]），所以
 /// 「哪个上游」要在这里换：路径 A 用 reason 里的 `dial tcp` 地址（零 I/O），路径 B 问一次
 /// relay 的 Clash API 拿池的 `now`（**每池只查一次**）。归不了因的行一律丢弃，**绝不猜**。
-/// 归因前后各读一次 `now`，两次不一致的池本轮整批丢弃（[`clash::unstable_pools`]）——候选表
-/// 按 `(upstream_id, host, port)` 累计，误记会一直攒着，宁可少学一轮。
+/// 路径 B 的行还要过一道**时间戳门**（[`clash::within_switch_grace`]，2026-09-18 第二次
+/// 裁决）：这条链的轮询间隔是 [`JOURNAL_POLL_SECS`] 秒，「日志行产生 → 读 `now`」之间只要
+/// b-ui 切过一次池，老成员的失败就记到新成员头上；候选表按 `(upstream_id, host, port)`
+/// 累计、误记会一直攒着，所以本批证据宁可放弃、等下次复发。
 pub async fn learn_from_journal(ctx: &DaemonCtx, clash: Arc<dyn Clash>) -> anyhow::Result<usize> {
-    let cursor = state::read(&ctx.runtime).await.journal_cursor;
+    let (cursor, switch_at) = {
+        let r = state::read(&ctx.runtime).await;
+        (r.journal_cursor, r.pool_switch_at)
+    };
     let host = ctx.host.clone();
     // **碰 `Host` 一律 spawn_blocking**（与 P1 的 `Fetcher`/`Facts::probe` 同一条铁律）：
     // `RealHost::which` 会同步扫 PATH、`collect` 会 exec journalctl，两件事放进同一次
@@ -136,27 +141,19 @@ pub async fn learn_from_journal(ctx: &DaemonCtx, clash: Arc<dyn Clash>) -> anyho
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    let before = clash::pool_now(&clash, &pools).await;
-    let mut staged: Vec<(Uuid, journal::RejectLine)> = Vec::new();
+    let pool_now = clash::pool_now(&clash, &pools).await;
+    let mut lines: Vec<(Uuid, journal::RejectLine)> = Vec::new();
     for l in &batch.lines {
-        let Some(id) = clash::id_of_subject(&g, &l.subject, &before) else {
-            tracing::debug!(host = %l.host, port = l.port, "relay 拒绝行归不了因，丢弃（绝不猜）");
-            continue;
-        };
-        staged.push((id, l.clone()));
-    }
-    let after = clash::pool_now(&clash, &pools).await;
-    let unstable = clash::unstable_pools(&before, &after);
-    let lines: Vec<(Uuid, journal::RejectLine)> = staged
-        .into_iter()
-        .filter(|(_, l)| match clash::pool_of(&l.subject) {
-            Some(p) if unstable.contains(p) => {
-                tracing::debug!(pool = p, "本轮这个池被切过，归因到它的拒绝行整批丢弃");
-                false
+        match clash::attribute(&g, &l.subject, &pool_now, &switch_at, l.ts) {
+            clash::Attrib::Upstream(id) => lines.push((id, l.clone())),
+            clash::Attrib::Switched => {
+                tracing::debug!(host = %l.host, port = l.port, "这条行产生时该池刚被切过，本批证据放弃、等下次复发")
             }
-            _ => true,
-        })
-        .collect();
+            clash::Attrib::Unknown => {
+                tracing::debug!(host = %l.host, port = l.port, "relay 拒绝行归不了因，丢弃（绝不猜）")
+            }
+        }
+    }
     // ──────────────────────────────────────────────────────────────────────────
     state::update(&ctx.runtime, |r| {
         for (id, l) in &lines {
@@ -776,39 +773,6 @@ mod tests {
         tokio::task::yield_now().await;
     }
 
-    /// 每读一次 `selected` 就往下走一格的 Clash：模拟归因期间被巡检 / 借用切走
-    struct FlipClash {
-        seq: Vec<String>,
-        reads: std::sync::Mutex<usize>,
-    }
-
-    impl FlipClash {
-        fn new<const N: usize>(seq: [&str; N]) -> Self {
-            Self {
-                seq: seq.iter().map(|s| s.to_string()).collect(),
-                reads: std::sync::Mutex::new(0),
-            }
-        }
-        fn reads(&self) -> usize {
-            *self.reads.lock().unwrap()
-        }
-    }
-
-    impl Clash for FlipClash {
-        fn ready(&self) -> bool {
-            true
-        }
-        fn selected(&self, _selector: &str) -> Option<String> {
-            let mut n = self.reads.lock().unwrap();
-            let tag = self.seq.get(*n).or_else(|| self.seq.last())?.clone();
-            *n += 1;
-            Some(tag)
-        }
-        fn select(&self, _selector: &str, _tag: &str) -> Result<(), clash::ClashError> {
-            Ok(())
-        }
-    }
-
     /// 归因用的 relay Clash API：池 selector 的 `now` 播种在 `slot-0-pool` 上
     fn clash_at(tag: &str) -> Arc<dyn Clash> {
         let c = FakeClash::new(None);
@@ -869,8 +833,26 @@ mod tests {
         .unwrap();
     }
 
-    /// 把一段日志喂给 `learn_from_journal`（游标每次都新，免得被 scripted 前缀匹配吃掉）
-    fn feed(host: &FakeHost, body: &str) {
+    /// 一行 `journalctl -o json`（`collect` 现在读的就是这个格式：归因的时间戳门要每行
+    /// 自己的时刻）
+    fn json_line(at: time::OffsetDateTime, n: usize, message: &str) -> String {
+        serde_json::json!({
+            "__CURSOR": format!("c-{n}"),
+            "__REALTIME_TIMESTAMP": (at.unix_timestamp() * 1_000_000).to_string(),
+            "_SYSTEMD_UNIT": format!("{}.service", crate::modules::residential::JOURNAL_UNIT),
+            "MESSAGE": message,
+        })
+        .to_string()
+    }
+
+    /// 把一段日志（一行一条原文）按 `at` 打上时刻喂给 `learn_from_journal`
+    ///（游标每次都新，免得被 scripted 前缀匹配吃掉）
+    fn feed_at(host: &FakeHost, at: time::OffsetDateTime, body: &str) {
+        let out: String = body
+            .lines()
+            .enumerate()
+            .map(|(n, l)| json_line(at, n, l) + "\n")
+            .collect();
         host.with(|i| {
             // `scripted` 是前缀匹配、先到先得：换一批日志要先清掉上一批
             i.scripted.clear();
@@ -879,9 +861,14 @@ mod tests {
                     "journalctl -u {} --no-pager",
                     crate::modules::residential::JOURNAL_UNIT
                 ),
-                CmdOut::success(&format!("{body}\n-- cursor: s=1\n")),
+                CmdOut::success(&format!("{out}-- cursor: s=1\n")),
             ));
         });
+    }
+
+    /// 按假机器的**当前**时刻喂日志（没有切换、时间戳门不参与的用例都用它）
+    fn feed(host: &FakeHost, body: &str) {
+        feed_at(host, host.now(), body);
     }
 
     /// **本次修法的核心**：生产的 relay 日志只打池 tag，成员 tag 一个字都不出现
@@ -908,25 +895,6 @@ mod tests {
         assert_eq!(r.candidates.len(), 1);
     }
 
-    /// 路径 A：reason 里的 `dial tcp <ip>:<port>` 唯一命中某个上游 ⇒ 零 I/O 归因，
-    /// **不采信** Clash 的 `now`（它说的是「此刻」，日志说的是「刚才」）
-    #[tokio::test]
-    async fn the_dial_address_attributes_without_trusting_the_clash_now() {
-        let d = tempfile::tempdir().unwrap();
-        let (c, host) = ctx(&d).await;
-        add_second_upstream(&c).await;
-        feed(&host, fx::POOL_SELECTOR_DIAL_REFUSED);
-        // `now` 指向 resi-1，但拨的是 203.0.113.7:10007 = 第二个上游
-        assert_eq!(learn_from_journal(&c, clash_at("resi-1")).await.unwrap(), 1);
-        let r = rstate::read(&c.runtime).await;
-        assert!(r.candidates.contains_key(&candidate_key(
-            Uuid::from_u128(2),
-            "www.example.com",
-            443
-        )));
-        assert_eq!(r.candidates.len(), 1);
-    }
-
     /// 归不了因（池的 `now` 读不到、成员 tag 越界、tag 不是已知池名）一律丢弃，**绝不猜**
     #[tokio::test]
     async fn unattributable_lines_are_dropped_never_guessed() {
@@ -945,30 +913,38 @@ mod tests {
         assert!(rstate::read(&c.runtime).await.candidates.is_empty());
     }
 
-    /// **对抗**：高频借用 / 巡检切换期间灌大量日志。归因前后各读一次 `now`，两次不一致的池
-    /// 本轮归因到它的行**整批丢弃**——候选表按 `(upstream_id, host, port)` 累计，误记会一直
-    /// 攒着，宁可少学一轮。切换停下来之后照常学。
+    /// **对抗**：高频借用 / 巡检切换期间灌大量日志。真实暴露窗口是「日志行产生 → 归因读
+    /// `now`」整段（这条链的轮询间隔是 `JOURNAL_POLL_SECS` = 300 秒），切换落在其中就会把
+    /// 老成员的失败记到新成员头上。b-ui 是两级池唯一的切换者，所以按**时间戳门**判：
+    /// 切换时刻之前（含 `SWITCH_ATTRIB_GRACE_SECS` 宽限）产生的路径 B 行整批放弃，
+    /// 门之后的行照常学。
     #[tokio::test]
-    async fn a_pool_switched_mid_attribution_loses_the_whole_batch_and_recovers_next_round() {
+    async fn lines_logged_before_a_pool_switch_are_dropped_and_later_ones_are_learned() {
         let d = tempfile::tempdir().unwrap();
         let (c, host) = ctx(&d).await;
         add_second_upstream(&c).await;
+        // 池在 t0 被切到 resi-2（写入口 = 生产那条：`Clash::select` 成功后记时刻）
+        let t0 = host.now() + time::Duration::seconds(100);
+        rstate::mark_pool_switch(&c.runtime, "slot-3-pool", t0).await;
         let flood: String = std::iter::repeat_n(fx::POOL_SELECTOR_SOCKS_CODE2, 200)
             .collect::<Vec<_>>()
             .join("\n");
-        feed(&host, &flood);
-        // 第一次读 now = resi-1，第二次 = resi-2（中途被切）
-        let flip = Arc::new(FlipClash::new(["resi-1", "resi-2"]));
+        feed_at(&host, t0 - time::Duration::seconds(5), &flood);
         assert_eq!(
-            learn_from_journal(&c, flip.clone()).await.unwrap(),
+            learn_from_journal(&c, clash_at("resi-2")).await.unwrap(),
             0,
-            "该池本轮被切过 ⇒ 200 条全丢"
+            "这 200 条产生在切换之前，`now` 说的却是切换之后 ⇒ 整批放弃"
         );
-        let r = rstate::read(&c.runtime).await;
-        assert!(r.candidates.is_empty(), "黑名单候选表零新增");
-        assert_eq!(flip.reads(), 2, "每个池每轮只查一次 now，前后各一次");
-        // 下一轮 now 稳定 ⇒ 正常归因
-        feed(&host, fx::POOL_SELECTOR_SOCKS_CODE2);
+        assert!(
+            rstate::read(&c.runtime).await.candidates.is_empty(),
+            "黑名单候选表零新增"
+        );
+        // 宽限窗（1 秒）之后的行照常归到池此刻选中的那个上游
+        feed_at(
+            &host,
+            t0 + time::Duration::seconds(1),
+            fx::POOL_SELECTOR_SOCKS_CODE2,
+        );
         assert_eq!(learn_from_journal(&c, clash_at("resi-2")).await.unwrap(), 1);
         assert!(rstate::read(&c.runtime)
             .await
@@ -976,22 +952,35 @@ mod tests {
             .contains_key(&candidate_key(Uuid::from_u128(2), "www.example.com", 443)));
     }
 
+    /// **`dial tcp` 开头的 reason 不进黑名单候选**：它说的是「连不上上游自己」（上游级，
+    /// 哨兵的地盘），不是「上游拒绝了这个域名」。兜底关键词表里的 `refused` 会命中
+    /// `connect: connection refused`，所以要按前缀整个排掉
+    #[tokio::test]
+    async fn a_failed_dial_to_the_upstream_never_becomes_a_candidate() {
+        let d = tempfile::tempdir().unwrap();
+        let (c, host) = ctx(&d).await;
+        add_second_upstream(&c).await;
+        feed(
+            &host,
+            &format!(
+                "{}\n{}\n{}",
+                fx::POOL_SELECTOR_DIAL_REFUSED,
+                fx::MEMBER_DIAL_REFUSED,
+                fx::POOL_URLTEST_DIAL_TIMEOUT
+            ),
+        );
+        assert_eq!(learn_from_journal(&c, clash_at("resi-1")).await.unwrap(), 0);
+        assert!(rstate::read(&c.runtime).await.candidates.is_empty());
+        // 同一条池上的**目标级**拒绝照常学：排掉的只是 `dial tcp` 这个前缀
+        feed(&host, fx::POOL_SELECTOR_SOCKS_CODE2);
+        assert_eq!(learn_from_journal(&c, clash_at("resi-1")).await.unwrap(), 1);
+    }
+
     #[tokio::test]
     async fn journal_learning_counts_per_upstream_host_port_and_drops_bare_ips() {
         let d = tempfile::tempdir().unwrap();
         let (c, host) = ctx(&d).await;
-        let cmd = format!(
-            "journalctl -u {} --no-pager -o cat --show-cursor --since -25h",
-            crate::modules::residential::JOURNAL_UNIT
-        );
-        host.with(|i| {
-            i.scripted.push((
-                cmd,
-                CmdOut::success(&format!(
-                    "{HTTP_403}\n{HTTP_403}\n{IP_403}\n-- cursor: s=1\n"
-                )),
-            ));
-        });
+        feed(&host, &format!("{HTTP_403}\n{HTTP_403}\n{IP_403}"));
         assert_eq!(
             learn_from_journal(&c, no_clash()).await.unwrap(),
             2,
@@ -1012,18 +1001,10 @@ mod tests {
         const PUSH_403: &str = "open connection to courier.push.apple.com:5228 using outbound/http[resi-1]: unexpected status: 403 Forbidden";
         let d = tempfile::tempdir().unwrap();
         let (c, host) = ctx(&d).await;
-        let cmd = format!(
-            "journalctl -u {} --no-pager", // scripted 前缀匹配，两种游标形态共用
-            crate::modules::residential::JOURNAL_UNIT
+        feed(
+            &host,
+            &format!("{PUSH_403}\n{PUSH_403}\n{PUSH_403}\n{HTTP_403}"),
         );
-        host.with(|i| {
-            i.scripted.push((
-                cmd,
-                CmdOut::success(&format!(
-                    "{PUSH_403}\n{PUSH_403}\n{PUSH_403}\n{HTTP_403}\n-- cursor: s=1\n"
-                )),
-            ));
-        });
         // ports_allowed 还没学到（None）⇒ 按 BASE_PORTS = [80, 443] 看待
         assert!(rstate::group_of(&*c.store.read().await).upstreams[0]
             .ports_allowed
@@ -1099,17 +1080,10 @@ mod tests {
         })
         .await
         .unwrap();
-        host.with(|i| {
-            i.scripted.push((
-                format!(
-                    "journalctl -u {} --no-pager",
-                    crate::modules::residential::JOURNAL_UNIT
-                ),
-                CmdOut::success(&format!(
-                    "{CODE2}\n{CODE4}\n{CODE4}\n{CODE4}\n{CODE1}\n{CODE1}\n{CODE1}\n-- cursor: s=1\n"
-                )),
-            ));
-        });
+        feed(
+            &host,
+            &format!("{CODE2}\n{CODE4}\n{CODE4}\n{CODE4}\n{CODE1}\n{CODE1}\n{CODE1}"),
+        );
         assert_eq!(
             learn_from_journal(&c, no_clash()).await.unwrap(),
             1,
@@ -1204,18 +1178,8 @@ mod tests {
         // 04:00 才确认一次 ⇒ 一条规则要两天」。
         let d = tempfile::tempdir().unwrap();
         let (c, host) = ctx(&d).await;
-        host.with(|i| {
-            // scripted 是前缀匹配：--since -25h 与 --after-cursor 两种形态共用这一条
-            i.scripted.push((
-                format!(
-                    "journalctl -u {} --no-pager",
-                    crate::modules::residential::JOURNAL_UNIT
-                ),
-                CmdOut::success(&format!(
-                    "{HTTP_403}\n{HTTP_403}\n{HTTP_403}\n-- cursor: s=1\n"
-                )),
-            ));
-        });
+        // scripted 是前缀匹配：--since -25h 与 --after-cursor 两种形态共用这一条
+        feed(&host, &format!("{HTTP_403}\n{HTTP_403}\n{HTTP_403}"));
         let p = rejector(&["gateway.icloud.com:443"], &["gateway.icloud.com:443"]);
         let key = candidate_key(Uuid::from_u128(1), "gateway.icloud.com", 443);
         let task = tokio::spawn(journal_loop(c.clone(), p, no_clash()));
@@ -1344,7 +1308,7 @@ mod tests {
         host.with(|i| {
             i.scripted.push((
                 format!(
-                    "journalctl -u {} --no-pager -o cat --show-cursor --after-cursor s=stale",
+                    "journalctl -u {} --no-pager -o json --show-cursor --after-cursor s=stale",
                     crate::modules::residential::JOURNAL_UNIT
                 ),
                 CmdOut::failure(1, "Failed to seek to cursor: Invalid argument"),

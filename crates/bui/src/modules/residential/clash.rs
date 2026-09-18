@@ -143,6 +143,11 @@ pub fn id_of_tag(g: &ResidentialGroup, tag: &str) -> Option<Uuid> {
 /// 已经是解析后的 IP、与 [`Upstream::host`] 不字面相等 ⇒ 这里也匹配不上，同样由路径 B 兜住
 /// （**不做 DNS 解析**：那要 I/O，而路径 B 本来就更准）。
 ///
+/// **已知边角**（不修，代价可接受）：池里一条上游按 IP 录入、另一条按域名录入，而那个域名
+/// 恰好解析到同一个 `IP:port` 时，报错原文里的地址是解析后的 IP ⇒ 本函数会**自信地**归到
+/// 按 IP 录入的那一条，另一条的失败就记错了人。判据只看字面，看不出这种重合；要看出来得做
+/// DNS 解析（I/O，而且解析结果随时会变）。真正的防线是别把同一个出口重复录两遍。
+///
 /// [`Upstream::host`]: bui_schema::model::Upstream::host
 pub fn id_of_dial_addr(g: &ResidentialGroup, host: &str, port: u16) -> Option<Uuid> {
     let mut hit = g
@@ -175,32 +180,67 @@ pub async fn pool_now(clash: &std::sync::Arc<dyn Clash>, pools: &[String]) -> Po
     .unwrap_or_default()
 }
 
-/// 本轮被切过的池：归因**前后各读一次** `now`，两次不一致的池就在这里。
+/// 每个池 selector 最近一次成功切换的时刻（RFC3339），真源是
+/// [`super::state::ResiRuntime::pool_switch_at`]
+pub type PoolSwitchAt = std::collections::BTreeMap<String, String>;
+
+/// 这条日志行落在该池切换的宽限窗里吗（`ts < last_switch_at[pool] + GRACE`）。
 ///
-/// 归因到这些池的日志行必须**整批丢弃**：`now` 是「此刻选中谁」，日志行说的是「刚才是谁
-/// 失败了」，中途被巡检（`health::drive_slots`）或另一次借用切过，就会把老成员的失败记到新
-/// 成员头上。哨兵那边的代价是白探一次，黑名单那边是把一个域名的拒绝算到无辜上游的候选表上
-/// ——后者会累计，所以宁可丢弃、下一轮重新观察，**不做「基本不会变」式的假设**。
-pub fn unstable_pools(before: &PoolNow, after: &PoolNow) -> std::collections::BTreeSet<String> {
-    let mut out = std::collections::BTreeSet::new();
-    for (pool, was) in before {
-        if after.get(pool) != Some(was) {
-            out.insert(pool.clone());
-        }
-    }
-    out
+/// 只对**路径 B** 有意义：`now` 说的是「此刻选中谁」，切换之前产生的行说的是老成员。
+/// 没记过切换（进程刚起）、或时刻解析不出来 ⇒ `false`（不丢弃：宁可少丢，也不因为读不到
+/// 记录就把整条链停掉）。
+pub fn within_switch_grace(switch_at: &PoolSwitchAt, pool: &str, ts: time::OffsetDateTime) -> bool {
+    let Some(t0) = switch_at
+        .get(pool)
+        .and_then(|s| crate::util::parse_rfc3339(s))
+    else {
+        return false;
+    };
+    ts < t0 + time::Duration::seconds(super::SWITCH_ATTRIB_GRACE_SECS)
 }
 
-/// relay 一行日志的出站主体 → 上游 id：成员 tag 直接换算；池形态先走**路径 A**
-/// （[`id_of_dial_addr`]，零 I/O），再走**路径 B**（本轮缓存的 `now` → [`id_of_tag`]）。
-/// 两条都归不了因 ⇒ `None`，调用方丢弃该行并记一行 debug，**绝不猜**。
-pub fn id_of_subject(g: &ResidentialGroup, s: &RelaySubject, now: &PoolNow) -> Option<Uuid> {
+/// 一行 relay 错误行的归因结论
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attrib {
+    /// 归到这条上游
+    Upstream(Uuid),
+    /// 路径 B 的行落在该池切换的宽限窗内：本批证据放弃、等下次复发
+    Switched,
+    /// 两条路径都归不了因：丢弃，**绝不猜**
+    Unknown,
+}
+
+/// relay 一行日志的出站主体 → 上游 id。
+///
+/// - **路径 A**（零 I/O，不受时间戳门约束）：成员 tag 直接换算（sing-box 写的就是当时失败的
+///   那个成员），或 reason 里 `dial tcp <ip>:<port>` 的上游地址（[`id_of_dial_addr`]，写的就是
+///   当时实际拨的那个上游）——两者说的都是**过去**，与此刻选中谁无关；
+/// - **路径 B**（本轮缓存的 `now` → [`id_of_tag`]）：`now` 说的是**此刻**，所以先过时间戳门
+///   （[`within_switch_grace`]），落在切换宽限窗里的行判 [`Attrib::Switched`]。
+///
+/// 两条都不成 ⇒ [`Attrib::Unknown`]，调用方丢弃该行并记一行 debug。
+pub fn attribute(
+    g: &ResidentialGroup,
+    s: &RelaySubject,
+    now: &PoolNow,
+    switch_at: &PoolSwitchAt,
+    ts: time::OffsetDateTime,
+) -> Attrib {
+    let unknown = |o: Option<Uuid>| o.map_or(Attrib::Unknown, Attrib::Upstream);
     match s {
-        RelaySubject::Member(tag) => id_of_tag(g, tag),
-        RelaySubject::Pool { pool, dial_addr } => dial_addr
-            .as_ref()
-            .and_then(|(h, p)| id_of_dial_addr(g, h, *p))
-            .or_else(|| id_of_tag(g, now.get(pool)?.as_deref()?)),
+        RelaySubject::Member(tag) => unknown(id_of_tag(g, tag)),
+        RelaySubject::Pool { pool, dial_addr } => {
+            if let Some(id) = dial_addr
+                .as_ref()
+                .and_then(|(h, p)| id_of_dial_addr(g, h, *p))
+            {
+                return Attrib::Upstream(id);
+            }
+            if within_switch_grace(switch_at, pool, ts) {
+                return Attrib::Switched;
+            }
+            unknown(now.get(pool).and_then(|t| id_of_tag(g, t.as_deref()?)))
+        }
     }
 }
 
@@ -498,7 +538,7 @@ mod tests {
         assert_eq!(id_of_dial_addr(&g, "203.0.113.7", 10007), None);
     }
 
-    /// 归因：成员 tag 直接换；池先走路径 A 再走路径 B；两条都不成 ⇒ `None`
+    /// 归因：成员 tag 直接换；池先走路径 A 再走路径 B；两条都不成 ⇒ [`Attrib::Unknown`]
     #[test]
     fn subject_attribution_prefers_the_dial_address_over_the_clash_now() {
         let mut g = group(2);
@@ -506,54 +546,131 @@ mod tests {
         let now: PoolNow = [("slot-0-pool".to_string(), Some("resi-1".to_string()))]
             .into_iter()
             .collect();
+        let never = PoolSwitchAt::new();
         let pool = |dial: Option<(&str, u16)>| RelaySubject::Pool {
             pool: "slot-0-pool".into(),
             dial_addr: dial.map(|(h, p)| (h.to_string(), p)),
         };
+        let at = |s: &RelaySubject| attribute(&g, s, &now, &never, T1);
         assert_eq!(
-            id_of_subject(&g, &RelaySubject::Member("resi-2".into()), &now),
-            Some(Uuid::from_u128(2))
+            at(&RelaySubject::Member("resi-2".into())),
+            Attrib::Upstream(Uuid::from_u128(2))
         );
         assert_eq!(
-            id_of_subject(&g, &pool(Some(("203.0.113.8", 10007))), &now),
-            Some(Uuid::from_u128(2)),
+            at(&pool(Some(("203.0.113.8", 10007)))),
+            Attrib::Upstream(Uuid::from_u128(2)),
             "路径 A 说的是『刚才拨的是谁』，优先于 `now` 的『此刻选中谁』"
         );
         assert_eq!(
-            id_of_subject(&g, &pool(None), &now),
-            Some(Uuid::from_u128(1)),
+            at(&pool(None)),
+            Attrib::Upstream(Uuid::from_u128(1)),
             "没有地址线索 ⇒ 路径 B"
         );
         let empty = PoolNow::new();
-        assert_eq!(id_of_subject(&g, &pool(None), &empty), None, "两条都不成");
         assert_eq!(
-            id_of_subject(&g, &RelaySubject::Member("resi-9".into()), &now),
-            None
+            attribute(&g, &pool(None), &empty, &never, T1),
+            Attrib::Unknown,
+            "两条都不成"
+        );
+        assert_eq!(
+            at(&RelaySubject::Member("resi-9".into())),
+            Attrib::Unknown,
+            "成员 tag 不在池里"
         );
     }
 
-    /// 双读竞态防护：两次 `now` 不一致的池要被点名（调用方按池整批丢弃）
+    const T0: time::OffsetDateTime = time::macros::datetime!(2026-09-18 12:00:00 UTC);
+    const T1: time::OffsetDateTime = time::macros::datetime!(2026-09-18 12:00:01 UTC);
+
+    /// 时间戳门（2026-09-18 第二次裁决）：池在 `t0` 被切过，`ts < t0 + GRACE` 的行落在窗里
     #[test]
-    fn a_pool_whose_now_moved_between_the_two_reads_is_unstable() {
-        let at = |p: &str, t: Option<&str>| (p.to_string(), t.map(str::to_string));
-        let before: PoolNow = [at("slot-0-pool", Some("resi-1")), at("resi-pool", None)]
-            .into_iter()
-            .collect();
-        let after: PoolNow = [at("slot-0-pool", Some("resi-2")), at("resi-pool", None)]
-            .into_iter()
-            .collect();
-        assert_eq!(
-            unstable_pools(&before, &after),
-            ["slot-0-pool".to_string()].into_iter().collect()
+    fn the_grace_window_covers_everything_up_to_one_second_after_the_switch() {
+        let sw: PoolSwitchAt = [(
+            "slot-0-pool".to_string(),
+            "2026-09-18T12:00:00Z".to_string(),
+        )]
+        .into_iter()
+        .collect();
+        assert!(within_switch_grace(
+            &sw,
+            "slot-0-pool",
+            T0 - time::Duration::seconds(30)
+        ));
+        assert!(within_switch_grace(&sw, "slot-0-pool", T0));
+        assert!(
+            within_switch_grace(&sw, "slot-0-pool", T1 - time::Duration::milliseconds(1)),
+            "GRACE = 1 秒，边界之前仍在窗内"
         );
-        assert!(unstable_pools(&before, &before).is_empty());
-        // 第二次读不到（relay 正在重启）也算变了：不能拿第一次的读数硬归因
-        let gone: PoolNow = [at("slot-0-pool", None), at("resi-pool", None)]
+        assert!(
+            !within_switch_grace(&sw, "slot-0-pool", T1),
+            "t0 + GRACE 起放行"
+        );
+        assert!(
+            !within_switch_grace(&sw, "resi-pool", T0),
+            "别的池没被切过，不受牵连"
+        );
+        assert!(
+            !within_switch_grace(&PoolSwitchAt::new(), "slot-0-pool", T0),
+            "没记过切换（进程刚起）⇒ 不丢弃"
+        );
+        let bad: PoolSwitchAt = [("slot-0-pool".to_string(), "不是时刻".to_string())]
             .into_iter()
             .collect();
+        assert!(
+            !within_switch_grace(&bad, "slot-0-pool", T0),
+            "解析不出来 ⇒ 不丢弃"
+        );
+    }
+
+    /// 门只管路径 B：路径 A（`dial tcp` 地址 / 成员 tag）写的就是当时实际拨的那个上游
+    #[test]
+    fn the_switch_gate_drops_path_b_only() {
+        let mut g = group(2);
+        g.upstreams[1].host = "203.0.113.8".into();
+        let now: PoolNow = [("slot-0-pool".to_string(), Some("resi-1".to_string()))]
+            .into_iter()
+            .collect();
+        let sw: PoolSwitchAt = [(
+            "slot-0-pool".to_string(),
+            "2026-09-18T12:00:00Z".to_string(),
+        )]
+        .into_iter()
+        .collect();
+        let pool = |dial: Option<(&str, u16)>| RelaySubject::Pool {
+            pool: "slot-0-pool".into(),
+            dial_addr: dial.map(|(h, p)| (h.to_string(), p)),
+        };
+        // 切换之前产生的路径 B 行：`now` 说的是新成员，这条行说的是老成员 ⇒ 丢
         assert_eq!(
-            unstable_pools(&before, &gone),
-            ["slot-0-pool".to_string()].into_iter().collect()
+            attribute(&g, &pool(None), &now, &sw, T0 - time::Duration::seconds(5)),
+            Attrib::Switched
+        );
+        // 同一批里的路径 A 行不受门影响
+        assert_eq!(
+            attribute(
+                &g,
+                &pool(Some(("203.0.113.8", 10007))),
+                &now,
+                &sw,
+                T0 - time::Duration::seconds(5)
+            ),
+            Attrib::Upstream(Uuid::from_u128(2))
+        );
+        assert_eq!(
+            attribute(
+                &g,
+                &RelaySubject::Member("resi-2".into()),
+                &now,
+                &sw,
+                T0 - time::Duration::seconds(5)
+            ),
+            Attrib::Upstream(Uuid::from_u128(2)),
+            "成员 tag 是 sing-box 自己写的那个成员，同样不受门约束"
+        );
+        // 宽限窗之后的路径 B 行照常归到新成员
+        assert_eq!(
+            attribute(&g, &pool(None), &now, &sw, T1),
+            Attrib::Upstream(Uuid::from_u128(1))
         );
     }
 

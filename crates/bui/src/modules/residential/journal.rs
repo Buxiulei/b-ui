@@ -34,6 +34,10 @@ pub enum RelaySubject {
 pub struct RejectLine {
     /// 出站主体（成员 tag 或池 tag + 拨号地址），由调用方归因成上游 id
     pub subject: RelaySubject,
+    /// journald 给这条行打的时刻（`__REALTIME_TIMESTAMP`）。归因的**时间戳门**
+    /// （[`super::SWITCH_ATTRIB_GRACE_SECS`]）比的就是它与池切换时刻——所以本模块的
+    /// [`collect`] 必须读带时间戳的输出（`-o json`），不能再用 `-o cat`
+    pub ts: time::OffsetDateTime,
     pub host: String,
     pub port: u16,
     /// HTTP 上游的 CONNECT 状态码；SOCKS 拒绝行没有状态码 → `None`
@@ -98,8 +102,9 @@ pub struct JournalBatch {
 /// 既有调用点与测试（`strip_ansi_removes_color_codes_only`）不变。
 pub use crate::util::strip_ansi;
 
-/// 解析一行；不是拒绝行（或不含状态/拒绝语义）→ `None`
-pub fn parse_line(line: &str) -> Option<RejectLine> {
+/// 解析一行；不是拒绝行（或不含状态/拒绝语义）→ `None`。`ts` 是 journald 给这条行打的时刻
+/// （[`RejectLine::ts`]，归因的时间戳门要用），解析本身一个字都不看它。
+pub fn parse_line(line: &str, ts: time::OffsetDateTime) -> Option<RejectLine> {
     let line = strip_ansi(line);
     // open connection to <host>:<port> using outbound/<kind>[<tag>]: <reason>
     let rest = line.split_once("open connection to ")?.1;
@@ -122,6 +127,7 @@ pub fn parse_line(line: &str) -> Option<RejectLine> {
         }
         return Some(RejectLine {
             subject,
+            ts,
             host: host.to_string(),
             port,
             status: Some(code),
@@ -133,10 +139,19 @@ pub fn parse_line(line: &str) -> Option<RejectLine> {
     if let Some(code) = reason.strip_prefix("socks5: request rejected, code=") {
         return (code.trim() == "2").then(|| RejectLine {
             subject,
+            ts,
             host: host.to_string(),
             port,
             status: None,
         });
+    }
+    // **`dial tcp` 开头的 reason 是上游级，不是目标级**（2026-09-18 第二次裁决）：它说的是
+    // 「连不上上游自己」（connection refused / i/o timeout / no route to host），不是「上游
+    // 拒绝了这个域名」。下面兜底关键词表里的 `refused` 正好会命中
+    // `dial tcp …: connect: connection refused`，把一次上游抖动学成一条域名黑名单规则。
+    // 这类行是哨兵的地盘（`Sig::RelayUpstreamError` → 快探 + 借用），这里一概不收。
+    if reason.starts_with("dial tcp") {
+        return None;
     }
     // 其余 SOCKS5 拒绝形态（REP ≠ 0 的文字化）。超时/EOF 一类不是拒绝，不学。
     let lower = reason.to_ascii_lowercase();
@@ -145,6 +160,7 @@ pub fn parse_line(line: &str) -> Option<RejectLine> {
         .any(|k| lower.contains(k));
     denied.then(|| RejectLine {
         subject,
+        ts,
         host: host.to_string(),
         port,
         status: None,
@@ -153,6 +169,12 @@ pub fn parse_line(line: &str) -> Option<RejectLine> {
 
 /// 增量读日志：有游标用 `--after-cursor`，否则 `--since -25h`（与 R13 §6.2 同窗口）。
 /// `journalctl` 不存在 → `Ok(JournalBatch::default())`（调用方据此记一条 alert）。
+///
+/// **输出格式是 `-o json` 而不是 `-o cat`**（2026-09-18 第二次裁决）：归因的时间戳门要每条行
+/// 自己的时刻，`-o cat` 只有 `MESSAGE` 一段。解析直接复用哨兵那条路的
+/// [`crate::sys::parse_journal_json`]（同一口径：按单元过滤、剥色码、字节数组形式的
+/// `MESSAGE` 也认），游标仍取 `--show-cursor` 打在末尾的那一行 —— 它是**本轮读到的最后一条**
+/// 的游标，与本轮解析出几条拒绝行无关，所以安静时段也照常前进。
 pub fn collect(host: &dyn Host, cursor: Option<&str>) -> anyhow::Result<JournalBatch> {
     if !host.which("journalctl") {
         return Ok(JournalBatch::default());
@@ -162,7 +184,7 @@ pub fn collect(host: &dyn Host, cursor: Option<&str>) -> anyhow::Result<JournalB
         JOURNAL_UNIT,
         "--no-pager",
         "-o",
-        "cat",
+        "json",
         "--show-cursor",
     ];
     match cursor {
@@ -185,10 +207,12 @@ pub fn collect(host: &dyn Host, cursor: Option<&str>) -> anyhow::Result<JournalB
     for line in out.stdout.lines() {
         if let Some(c) = line.trim().strip_prefix("-- cursor: ") {
             batch.cursor = Some(c.trim().to_string());
-            continue;
         }
-        if let Some(r) = parse_line(line) {
-            batch.lines.push(r);
+    }
+    let units = [JOURNAL_UNIT.to_string()];
+    for r in crate::sys::parse_journal_json(&out.stdout, &units) {
+        if let Some(l) = parse_line(&r.message, r.ts) {
+            batch.lines.push(l);
         }
     }
     Ok(batch)
@@ -200,6 +224,14 @@ mod tests {
     use crate::modules::sentinel::fixtures_relay as fx;
     use crate::sys::{fake::FakeHost, CmdOut};
     use pretty_assertions::assert_eq;
+
+    /// 夹具行的默认时刻：解析层不看它，用例只要一个稳定值好做全量相等断言
+    const TS: time::OffsetDateTime = time::macros::datetime!(2026-09-18 12:00:00 UTC);
+
+    /// 按 [`TS`] 解析一行（解析本身与时刻无关）
+    fn p(line: &str) -> Option<RejectLine> {
+        parse_line(line, TS)
+    }
 
     fn member(tag: &str) -> RelaySubject {
         RelaySubject::Member(tag.into())
@@ -218,44 +250,54 @@ mod tests {
     #[test]
     fn learns_from_pool_shaped_lines_which_are_the_only_ones_production_emits() {
         assert_eq!(
-            parse_line(fx::POOL_URLTEST_SOCKS_CODE2),
+            p(fx::POOL_URLTEST_SOCKS_CODE2),
             Some(RejectLine {
                 subject: pool("resi-pool"),
+                ts: TS,
                 host: "www.example.com".into(),
                 port: 443,
                 status: None
             })
         );
         assert_eq!(
-            parse_line(fx::POOL_SELECTOR_SOCKS_CODE2),
+            p(fx::POOL_SELECTOR_SOCKS_CODE2),
             Some(RejectLine {
                 subject: pool("slot-3-pool"),
+                ts: TS,
                 host: "www.example.com".into(),
                 port: 443,
                 status: None
             })
         );
         assert_eq!(
-            parse_line(fx::POOL_SELECTOR_403),
+            p(fx::POOL_SELECTOR_403),
             Some(RejectLine {
                 subject: pool("slot-1-pool"),
+                ts: TS,
                 host: "www.example.com".into(),
                 port: 443,
                 status: Some(403)
             })
         );
         assert_eq!(
-            parse_line(fx::POOL_SELECTOR_502),
+            p(fx::POOL_SELECTOR_502),
             Some(RejectLine {
                 subject: pool("slot-1-pool"),
+                ts: TS,
                 host: "www.example.com".into(),
                 port: 443,
                 status: Some(502)
             })
         );
-        // 拨号失败的行带着上游自己的地址：解析层原样带出来，归因（路径 A）归调用方
+        // 拨号失败的行带着上游自己的地址：`subject_of`（与哨兵的 `parse_relay` 共用）原样
+        // 带出来，归因（路径 A）归调用方。黑名单侧本身**不收**这类行，见
+        // [`a_failed_dial_to_the_upstream_is_never_a_blacklist_candidate`]
         assert_eq!(
-            parse_line(fx::POOL_SELECTOR_DIAL_REFUSED).map(|l| l.subject),
+            subject_of(
+                "selector",
+                "slot-2-pool",
+                "dial tcp 203.0.113.7:10007: connect: connection refused"
+            ),
             Some(RelaySubject::Pool {
                 pool: "slot-2-pool".into(),
                 dial_addr: Some(("203.0.113.7".into(), 10007)),
@@ -267,9 +309,10 @@ mod tests {
     #[test]
     fn member_shaped_lines_are_still_parsed() {
         assert_eq!(
-            parse_line(fx::MEMBER_SOCKS_CODE2),
+            p(fx::MEMBER_SOCKS_CODE2),
             Some(RejectLine {
                 subject: member("resi-1"),
+                ts: TS,
                 host: "www.example.com".into(),
                 port: 443,
                 status: None
@@ -285,7 +328,7 @@ mod tests {
             fx::GATE_SELECTOR,
             fx::DIRECT_DIAL_TIMEOUT,
         ] {
-            assert_eq!(parse_line(l), None, "{l}");
+            assert_eq!(p(l), None, "{l}");
         }
         assert!(is_pool_tag("resi-pool"));
         assert!(is_pool_tag("slot-0-pool"));
@@ -319,9 +362,17 @@ mod tests {
             dial_addr("unexpected status: 407 Proxy Authentication Required"),
             None
         );
+        // 解析不出来的 `dial tcp: lookup …` 在 subject 这一层就没有地址 ⇒ 路径 A 归不了因
         assert_eq!(
-            parse_line(fx::POOL_SELECTOR_DIAL_NO_ROUTE).map(|l| l.subject),
-            None
+            subject_of(
+                "selector",
+                "slot-0-pool",
+                "dial tcp: lookup isp.example.net: no route to host"
+            ),
+            Some(RelaySubject::Pool {
+                pool: "slot-0-pool".into(),
+                dial_addr: None,
+            })
         );
     }
 
@@ -340,27 +391,30 @@ mod tests {
     #[test]
     fn parses_the_three_real_rejection_shapes() {
         assert_eq!(
-            parse_line(HTTP_403),
+            p(HTTP_403),
             Some(RejectLine {
                 subject: member("resi-1"),
+                ts: TS,
                 host: "gateway.icloud.com".into(),
                 port: 443,
                 status: Some(403)
             })
         );
         assert_eq!(
-            parse_line(HTTP_403_PORT),
+            p(HTTP_403_PORT),
             Some(RejectLine {
                 subject: member("resi-1"),
+                ts: TS,
                 host: "198.51.100.9".into(),
                 port: 5228,
                 status: Some(403)
             })
         );
         assert_eq!(
-            parse_line(SOCKS_DENY),
+            p(SOCKS_DENY),
             Some(RejectLine {
                 subject: member("resi-2"),
+                ts: TS,
                 host: "x.com".into(),
                 port: 443,
                 status: None
@@ -368,9 +422,10 @@ mod tests {
         );
         // REP=2（connection not allowed by ruleset）才是策略拒绝
         assert_eq!(
-            parse_line(SOCKS_CODE2),
+            p(SOCKS_CODE2),
             Some(RejectLine {
                 subject: member("resi-1"),
+                ts: TS,
                 host: "smtp.gmail.com".into(),
                 port: 465,
                 status: None
@@ -380,38 +435,57 @@ mod tests {
 
     #[test]
     fn ignores_lines_that_are_not_upstream_rejections() {
-        assert_eq!(parse_line(UNRELATED), None);
+        assert_eq!(p(UNRELATED), None);
         // 超时不是拒绝：算进候选会把网络抖动学成黑名单
-        assert_eq!(parse_line(TIMEOUT), None);
+        assert_eq!(p(TIMEOUT), None);
         // 上游凭据被拒（rick 308 条）是「整条上游不能用」，哨兵的地盘；不合 HTTP 的响应头
         //（rick 15 条 / tizi 94 条）语义不明。两者都不是「拒绝了这个目标」⇒ 都不学
-        assert_eq!(parse_line(fx::MEMBER_SOCKS_AUTH), None);
-        assert_eq!(parse_line(fx::MEMBER_MALFORMED_MIME), None);
+        assert_eq!(p(fx::MEMBER_SOCKS_AUTH), None);
+        assert_eq!(p(fx::MEMBER_MALFORMED_MIME), None);
         // SOCKS5 REP=4（主机不可达）/ 1（通用失败）是目标或网络的问题，不是策略拒绝
-        assert_eq!(parse_line(SOCKS_CODE4), None);
-        assert_eq!(parse_line(SOCKS_CODE1), None);
+        assert_eq!(p(SOCKS_CODE4), None);
+        assert_eq!(p(SOCKS_CODE1), None);
         // 2xx 不是拒绝
         assert_eq!(
-            parse_line(
-                "open connection to a.com:443 using outbound/http[resi-1]: unexpected status: 200 OK"
-            ),
+            p("open connection to a.com:443 using outbound/http[resi-1]: unexpected status: 200 OK"),
             None
         );
         // direct 出站的行与住宅无关
         assert_eq!(
-            parse_line(
-                "open connection to a.com:443 using outbound/direct[direct]: unexpected status: 403 Forbidden"
-            ),
+            p("open connection to a.com:443 using outbound/direct[direct]: unexpected status: 403 Forbidden"),
             None
         );
-        assert_eq!(parse_line(""), None);
+        assert_eq!(p(""), None);
         // 端口不是数字
         assert_eq!(
-            parse_line(
-                "open connection to a.com:https using outbound/http[resi-1]: unexpected status: 403 x"
-            ),
+            p("open connection to a.com:https using outbound/http[resi-1]: unexpected status: 403 x"),
             None
         );
+        // `unexpected EOF`（rick 17217 条）与 `context canceled`（tizi 7 条）语义含糊 /
+        // 是客户端自己断的，都不是「上游拒绝了这个目标」⇒ 不进候选（哨兵那边同样不归类）
+        assert_eq!(p(fx::POOL_SELECTOR_UNEXPECTED_EOF), None);
+        assert_eq!(p(fx::MEMBER_UNEXPECTED_EOF), None);
+        assert_eq!(p(fx::POOL_SELECTOR_CONTEXT_CANCELED), None);
+    }
+
+    /// **`dial tcp` 开头的 reason 是上游级，不是目标级**（2026-09-18 第二次裁决）：
+    /// 「连不上上游自己」与「上游拒绝了这个域名」是两回事，前者是哨兵的地盘
+    /// （`RelayUpstreamError` → 快探 + 借用），学进黑名单等于把一次上游抖动写成
+    /// 「这条上游代理不了这个域名」。兜底拒绝关键词表里的 `refused` 正好会命中
+    /// `dial tcp …: connect: connection refused`，所以要把这个前缀整个排掉
+    #[test]
+    fn a_failed_dial_to_the_upstream_is_never_a_blacklist_candidate() {
+        for l in [
+            fx::POOL_SELECTOR_DIAL_REFUSED,
+            fx::MEMBER_DIAL_REFUSED,
+            fx::POOL_URLTEST_DIAL_TIMEOUT,
+            fx::POOL_SELECTOR_DIAL_NO_ROUTE,
+        ] {
+            assert_eq!(p(l), None, "{l}");
+        }
+        // 目标级的拒绝仍然照学：排掉的只是 `dial tcp` 这个前缀，不是 `refused` 这个词
+        assert!(p(fx::POOL_SELECTOR_403).is_some());
+        assert!(p(SOCKS_DENY).is_some());
     }
 
     #[test]
@@ -420,30 +494,56 @@ mod tests {
         assert_eq!(strip_ansi("plain"), "plain");
     }
 
+    /// `journalctl -o json` 的一条记录（只放本模块要的四个字段，与
+    /// [`crate::sys::parse_journal_json`] 的判据同源）。`secs` 是相对 [`TS`] 的偏移
+    fn json_rec(cursor: &str, secs: i64, message: &str) -> String {
+        let us = (TS + time::Duration::seconds(secs)).unix_timestamp() * 1_000_000;
+        serde_json::json!({
+            "__CURSOR": cursor,
+            "__REALTIME_TIMESTAMP": us.to_string(),
+            "_SYSTEMD_UNIT": format!("{JOURNAL_UNIT}.service"),
+            "MESSAGE": message,
+        })
+        .to_string()
+    }
+
+    /// 每条拒绝行都带上 journald 的时刻（归因的时间戳门要用），游标照旧从
+    /// `--show-cursor` 的末行取
     #[test]
     fn collect_uses_since_on_the_first_run_and_after_cursor_afterwards() {
         let h = FakeHost::new();
         h.with(|i| {
             i.which.insert("journalctl".into());
             i.scripted.push((
-                format!("journalctl -u {JOURNAL_UNIT} --no-pager -o cat --show-cursor --since -25h"),
+                format!(
+                    "journalctl -u {JOURNAL_UNIT} --no-pager -o json --show-cursor --since -25h"
+                ),
                 CmdOut::success(&format!(
-                    "{HTTP_403}\n{SOCKS_DENY}\n{UNRELATED}\n-- cursor: s=abc;i=1;b=2\n"
+                    "{}\n{}\n{}\n-- cursor: s=abc;i=1;b=2\n",
+                    json_rec("c1", 0, HTTP_403),
+                    json_rec("c2", 7, SOCKS_DENY),
+                    json_rec("c3", 9, UNRELATED)
                 )),
             ));
             i.scripted.push((
                 format!(
-                    "journalctl -u {JOURNAL_UNIT} --no-pager -o cat --show-cursor --after-cursor s=abc;i=1;b=2"
+                    "journalctl -u {JOURNAL_UNIT} --no-pager -o json --show-cursor --after-cursor s=abc;i=1;b=2"
                 ),
-                CmdOut::success(&format!("{HTTP_403_PORT}\n-- cursor: s=abc;i=9;b=2\n")),
+                CmdOut::success(&format!(
+                    "{}\n-- cursor: s=abc;i=9;b=2\n",
+                    json_rec("c4", 30, HTTP_403_PORT)
+                )),
             ));
         });
         let first = collect(&h, None).unwrap();
         assert_eq!(first.lines.len(), 2, "两条拒绝行，无关行被丢掉");
+        assert_eq!(first.lines[0].ts, TS, "时刻来自 `__REALTIME_TIMESTAMP`");
+        assert_eq!(first.lines[1].ts, TS + time::Duration::seconds(7));
         assert_eq!(first.cursor.as_deref(), Some("s=abc;i=1;b=2"));
         let second = collect(&h, first.cursor.as_deref()).unwrap();
         assert_eq!(second.lines.len(), 1);
         assert_eq!(second.lines[0].port, 5228);
+        assert_eq!(second.lines[0].ts, TS + time::Duration::seconds(30));
         assert_eq!(second.cursor.as_deref(), Some("s=abc;i=9;b=2"));
     }
 

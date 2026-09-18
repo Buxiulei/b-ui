@@ -42,6 +42,12 @@ pub struct ResiRuntime {
     /// 真正的差分真源是 `ListRule()` 读回来的那张表，不是这个字段。
     pub xray_slot_rules_hash: Option<String>,
     pub last_switch_at: Option<String>,
+    /// 每个**池 selector** 最近一次成功切换的时刻（RFC3339，键 = 池 tag：[`super::POOL`] 或
+    /// `slot-<i>-pool`）。relay 错误行归因的**时间戳门**（[`super::SWITCH_ATTRIB_GRACE_SECS`]）
+    /// 就读它：写入口只有 [`mark_pool_switch`]，调用点是全部 `Clash::select` 成功返回处。
+    /// 与上面那个全局的 `last_switch_at` 不是一回事——那个是巡检切换的 60 秒限速游标，
+    /// 只记全局池、重放时还故意不写。键数上限 = `MAX_SLOTS + 1`。
+    pub pool_switch_at: BTreeMap<String, String>,
     /// `state.selected_upstream_id` 与 `selected_upstream_id` 已漂移，等下一个 04:00 窗口写回
     pub selected_pending_persist: bool,
     /// 面板「立即巡检一轮」按钮的限速游标（T10 的 `POST /api/residential/health/check`）
@@ -248,6 +254,21 @@ pub async fn update(runtime: &Runtime, f: impl FnOnce(&mut ResiRuntime)) -> Resi
         })
         .await;
     out
+}
+
+/// 记一次池 selector 的切换时刻（[`ResiRuntime::pool_switch_at`] 的**唯一**写入口）。
+///
+/// **必须在 `Clash::select` 成功返回之后立刻调**：门比较的就是「日志行时间戳 vs. `select`
+/// 返回时刻」。切失败的那次不写——什么都没变，写了只会白丢一段本该学的行。
+/// relay 重启后的**重放**也算切换：它同样让 selector 的 `now` 变了值（它不算「切换」的只是
+/// 巡检那条 60 秒限速，那是另一回事）。
+pub fn note_pool_switch(r: &mut ResiRuntime, pool: &str, now: OffsetDateTime) {
+    r.pool_switch_at.insert(pool.to_string(), fmt_rfc3339(now));
+}
+
+/// [`note_pool_switch`] 的独立落盘版：调用点手头没有别的 runtime 改动时用它
+pub async fn mark_pool_switch(runtime: &Runtime, pool: &str, now: OffsetDateTime) {
+    update(runtime, |r| note_pool_switch(r, pool, now)).await;
 }
 
 /// 记一条告警：同文案去重、最新的排在最前、截断到 [`ALERTS_MAX`]

@@ -21,6 +21,8 @@
 //! **脱敏**：上游主机名 → `isp.example.net`、上游/目标 IP → `203.0.113.x`、
 //! 目标域名 → `www.example.com`（Google 那条保留真实的 `www.google.com`：判据按它分类）。
 //! `dial tcp <ip>:<port>` 的地址在采样命令里就被 `sed` 归一掉了，本文件里的地址一律是脱敏值。
+//! **槽序号也一样**：§2 的归并把 `slot-<i>-pool` 归一成了 `slot-N-pool`，本文件里每条常量上
+//! 的那个序号是**为用例挑的**（各用例要打在假机器真存在的槽上），不是采到那条行时的真实槽号。
 //!
 //! **关键点（RESEARCH §3，sing-box `route/conn.go` + `protocol/group/{selector,urltest}.go`）**：
 //! 路由规则的 `outbound` 指向一个 group（4.1 的 relay 只有这一种：每槽 `slot-<i>-pool`、
@@ -133,8 +135,10 @@ pub const POOL_SELECTOR_DIAL_REFUSED: &str = line!(
     "www.example.com:443 using outbound/selector[slot-2-pool]: dial tcp 203.0.113.7:10007: connect: connection refused"
 );
 
-/// 【采样】TCP 拨号超时（tizi 的「`urltest[resi-pool]` 的 dial 变体」+ rick 的
-/// `dial tcp <ip>:<port>: i/o timeout`），同样带上游地址
+/// 【转写】TCP 拨号超时：`urltest[resi-pool]` 上有 dial 变体（tizi）、`dial tcp <ip>:<port>:
+/// i/o timeout` 这个尾巴也采到了（rick），但**两者不在同一条采样行里** —— 本常量是把 rick 的
+/// 尾巴接到 tizi 的池 tag 上拼出来的，地址那一段还被 §2 的 `sed` 归一过。§3 的结论（group 只
+/// 换 tag、不换 reason）保证这种拼法成立，但它不是哪一条采样行的逐字原文
 pub const POOL_URLTEST_DIAL_TIMEOUT: &str = line!(
     "www.example.com:443 using outbound/urltest[resi-pool]: dial tcp 203.0.113.7:10007: i/o timeout"
 );

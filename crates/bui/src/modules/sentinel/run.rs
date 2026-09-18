@@ -158,6 +158,11 @@ pub async fn tick(ctx: &DaemonCtx, deps: &Deps, s: &mut Sentinel) -> TickReport 
     // ②b 归因（有 I/O）：relay 的错误行在生产里只带池 tag（`selector[slot-<i>-pool]` /
     // `urltest[resi-pool]`），成员 tag 一个字都不出现，所以「哪个上游」要在这里换 —— 路径 A
     // 用 reason 里的 `dial tcp` 地址（零 I/O），路径 B 问一次池的 `now`（**每池只查一次**）。
+    // 路径 B 的行还要过一道**时间戳门**（`clash::within_switch_grace`）：`now` 说的是「此刻
+    // 选中谁」，日志行说的是「刚才是谁失败了」，中间只要 b-ui 切过一次池，老成员的失败就会
+    // 记到新成员头上。b-ui 是两级池唯一的切换者（都是 `type: selector`，没有 urltest 自动
+    // 切换），所以每次 `Clash::select` 成功都在 runtime 里记下时刻，这里按日志行自己的时间戳
+    // 判。路径 A 不受门约束——它写的就是当时实际拨的那个上游。
     // 归不了因的一律丢弃并记一行 debug，**绝不猜**
     let pools: Vec<String> = matched
         .iter()
@@ -166,48 +171,38 @@ pub async fn tick(ctx: &DaemonCtx, deps: &Deps, s: &mut Sentinel) -> TickReport 
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect();
-    let now_before = clash::pool_now(&deps.clash, &pools).await;
-    let mut staged: Vec<(
-        &JournalRecord,
-        signature::Match,
-        Option<Uuid>,
-        Option<String>,
-    )> = Vec::new();
-    for (r, m) in matched {
-        if !m.sig.on_upstream() {
-            staged.push((r, m, None, None));
-            continue;
-        }
-        let subject = m.relay.clone();
-        match subject
-            .as_ref()
-            .and_then(|sub| clash::id_of_subject(&g, sub, &now_before).map(|id| (sub, id)))
-        {
-            Some((sub, id)) => {
-                let pool = clash::pool_of(sub).map(str::to_string);
-                staged.push((r, m, Some(id), pool));
-            }
-            None => tracing::debug!(
-                signature = m.sig.id(),
-                subject = %m.subject,
-                "relay 错误行归不了因，丢弃（绝不猜）"
-            ),
-        }
-    }
+    let pool_now = clash::pool_now(&deps.clash, &pools).await;
+    let switch_at = rstate::read(&ctx.runtime).await.pool_switch_at;
 
-    // ②c 竞态硬防护：归因**前后各读一次**每个池的 `now`，两次不一致的池说明本轮正被巡检或
-    // 另一次借用切着 —— 归因到它的行整批丢弃，下一轮自然重新观察。哨兵这边误归因的代价是
-    // 白探一个健康上游，黑名单那边会一直累计，所以两边都不做「基本不会变」式的假设
-    let now_after = clash::pool_now(&deps.clash, &pools).await;
-    let unstable = clash::unstable_pools(&now_before, &now_after);
-
-    // ②d 去抖
+    // ②c 归因 + 去抖
     let mut fired: Vec<Fired> = Vec::new();
-    for (r, m, upstream, pool) in staged {
-        if let Some(p) = pool.as_deref().filter(|p| unstable.contains(*p)) {
-            tracing::debug!(pool = p, "本轮这个池被切过，归因到它的错误行整批丢弃");
-            continue;
-        }
+    for (r, m) in matched {
+        let upstream = if m.sig.on_upstream() {
+            let Some(sub) = m.relay.as_ref() else {
+                continue;
+            };
+            match clash::attribute(&g, sub, &pool_now, &switch_at, r.ts) {
+                clash::Attrib::Upstream(id) => Some(id),
+                clash::Attrib::Switched => {
+                    tracing::debug!(
+                        signature = m.sig.id(),
+                        subject = %m.subject,
+                        "这条行产生时该池刚被切过，本批证据放弃、等下次复发"
+                    );
+                    continue;
+                }
+                clash::Attrib::Unknown => {
+                    tracing::debug!(
+                        signature = m.sig.id(),
+                        subject = %m.subject,
+                        "relay 错误行归不了因，丢弃（绝不猜）"
+                    );
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
         let key = upstream.map_or_else(|| m.subject.clone(), |id| id.to_string());
         if s.engine.observe(m.sig, &key, r.ts, now) {
             fired.push((m.sig, key, upstream, r.clone(), m));
@@ -347,6 +342,7 @@ mod tests {
     use super::*;
     use crate::modules::residential::clash::{Clash, FakeClash};
     use crate::modules::residential::proxy::FakeProber;
+    use crate::modules::residential::slots;
     use crate::modules::sentinel::fixtures_relay as fx;
     use crate::modules::sentinel::incidents::Level;
     use crate::modules::sentinel::testkit::{panel_shared, pool_ctx, rec};
@@ -355,48 +351,6 @@ mod tests {
     use crate::sys::fake::FakeHost;
     use pretty_assertions::assert_eq;
     use std::sync::Arc;
-
-    /// 每读一次 `selected` 就往下走一格的 Clash：模拟归因期间被巡检 / 借用切走
-    struct FlipClash {
-        seq: Vec<String>,
-        reads: std::sync::Mutex<usize>,
-        selects: std::sync::Mutex<Vec<String>>,
-    }
-
-    impl FlipClash {
-        fn new<const N: usize>(seq: [&str; N]) -> Self {
-            Self {
-                seq: seq.iter().map(|s| s.to_string()).collect(),
-                reads: std::sync::Mutex::new(0),
-                selects: std::sync::Mutex::new(Vec::new()),
-            }
-        }
-        fn reads(&self) -> usize {
-            *self.reads.lock().unwrap()
-        }
-        fn selects(&self) -> Vec<String> {
-            self.selects.lock().unwrap().clone()
-        }
-    }
-
-    impl Clash for FlipClash {
-        fn ready(&self) -> bool {
-            true
-        }
-        fn selected(&self, _selector: &str) -> Option<String> {
-            let mut n = self.reads.lock().unwrap();
-            let tag = self.seq.get(*n).or_else(|| self.seq.last())?.clone();
-            *n += 1;
-            Some(tag)
-        }
-        fn select(&self, selector: &str, tag: &str) -> Result<(), clash::ClashError> {
-            self.selects
-                .lock()
-                .unwrap()
-                .push(format!("{selector}:{tag}"));
-            Ok(())
-        }
-    }
 
     #[derive(Default)]
     struct Recorder(std::sync::Mutex<Vec<Incident>>);
@@ -679,7 +633,7 @@ mod tests {
     }
 
     /// 归不了因（池的 `now` 指向池外的 tag）⇒ 整批丢弃、零动作，且**每个池每轮只查一次**
-    /// `now`（归因前后各一次），不因为日志条数多就狂打 Clash API
+    /// `now`，不因为日志条数多就狂打 Clash API
     #[tokio::test]
     async fn unattributable_pool_lines_are_dropped_and_the_pool_is_read_once_per_tick() {
         let k = kit().await;
@@ -697,55 +651,128 @@ mod tests {
         assert!(tick(&k.ctx, &k.deps, &mut s).await.incidents.is_empty());
         assert_eq!(
             k.clash.calls(),
-            vec!["get:slot-1-pool", "get:slot-1-pool"],
-            "20 条日志只查两次 now（归因前 + 归因后），且没有任何切换"
+            vec!["get:slot-1-pool"],
+            "20 条日志只查一次 now，且没有任何切换"
         );
         assert!(k.prober.calls().is_empty(), "归不了因就别探测");
     }
 
-    /// **对抗**：高频借用 / 巡检切换期间灌大量日志。归因前后各读一次 `now`，两次不一致的池
-    /// 本轮归因到它的行整批丢弃——连去抖计数都不进（否则下一轮一条就够触发），哨兵零动作。
-    /// 切换停下来之后照常归因。
+    /// **对抗**：巡检 / 借用切走了某个槽的 selector，切换**之前**产生的那批错误行还在队列里。
+    /// `now` 说的是「此刻选中谁」，这批行说的是「刚才是谁失败了」——真实暴露窗口是整段
+    /// 「日志行产生 → 归因读 `now`」，不是归因那几毫秒，所以按**时间戳门**判：
+    /// 门内的路径 B 行整批丢弃，连去抖计数都不进（否则下一轮一条就够触发），哨兵零动作；
+    /// 宽限窗（[`SWITCH_ATTRIB_GRACE_SECS`] = 1 秒）之后的行照常归因到新成员。
+    ///
+    /// [`SWITCH_ATTRIB_GRACE_SECS`]: crate::modules::residential::SWITCH_ATTRIB_GRACE_SECS
     #[tokio::test]
-    async fn a_pool_switched_mid_tick_loses_the_whole_batch_without_polluting_the_debouncer() {
+    async fn lines_logged_before_a_pool_switch_are_dropped_and_later_ones_fire_normally() {
         let k = kit().await;
         k.prober.with_gateways_up(&["isp1.example.net:10007"]);
-        let flip = Arc::new(FlipClash::new(["resi-2", "resi-3"]));
-        let deps = Deps {
-            clash: flip.clone(),
-            ..k.deps.clone()
-        };
-        k.host.advance(3);
+        // t=0..2 打出 200 条错误行（槽 1 的 selector）
         feed(
             &k,
             (0..200)
-                .map(|t| rec("b-ui-relay", t % 30, fx::POOL_SELECTOR_DEADLINE_SLOT1))
+                .map(|t| rec("b-ui-relay", t % 3, fx::POOL_SELECTOR_DEADLINE_SLOT1))
                 .collect(),
         );
-        let mut s = Sentinel::default();
-        let rep = tick(&k.ctx, &deps, &mut s).await;
-        assert!(rep.incidents.is_empty(), "{:?}", rep.incidents);
-        assert_eq!(flip.reads(), 2, "每个池每轮只查一次 now，前后各一次");
-        assert!(flip.selects().is_empty(), "哨兵零动作：一次借用都没发生");
-        assert!(k.prober.calls().is_empty());
-        // 下一轮 `now` 稳定：一条还不够（门槛 2 条）⇒ 证明上一轮那 200 条没进去抖计数
-        k.clash.with(|i| {
-            i.now.insert("slot-1-pool".into(), "resi-2".into());
-        });
+        // t=5：槽 1 被手动 pin 到 resi-2 —— 走的是生产那条 `Clash::select` 路径，
+        // 成功之后 `state::note_pool_switch` 把时刻记进 runtime
         k.host.advance(5);
+        let c: Arc<dyn Clash> = k.clash.clone();
+        slots::pin_slot(&k.ctx, c, 1, Some(Uuid::from_u128(2)))
+            .await
+            .unwrap();
+        assert_eq!(
+            rstate::read(&k.ctx.runtime)
+                .await
+                .pool_switch_at
+                .get("slot-1-pool")
+                .map(String::as_str),
+            Some("2026-09-11T00:00:05Z"),
+            "切换时刻落进 runtime，归因的时间戳门读它"
+        );
+        k.host.advance(1);
+        let mut s = Sentinel::default();
+        let rep = tick(&k.ctx, &k.deps, &mut s).await;
+        assert!(rep.incidents.is_empty(), "{:?}", rep.incidents);
+        assert!(k.prober.calls().is_empty(), "哨兵零动作：一次探测都没发生");
+        // 宽限窗之后的两条：照常归因到池此刻选中的 resi-2（= isp2），去抖门槛 2 条 ⇒ 触发。
+        // 上一轮那 200 条要是进了去抖计数，这里第一条就会触发
         feed(
             &k,
-            vec![rec("b-ui-relay", 8, fx::POOL_SELECTOR_DEADLINE_SLOT1)],
+            vec![rec("b-ui-relay", 6, fx::POOL_SELECTOR_DEADLINE_SLOT1)],
         );
         assert!(tick(&k.ctx, &k.deps, &mut s).await.incidents.is_empty());
         k.host.advance(1);
         feed(
             &k,
-            vec![rec("b-ui-relay", 9, fx::POOL_SELECTOR_DEADLINE_SLOT1)],
+            vec![rec("b-ui-relay", 7, fx::POOL_SELECTOR_DEADLINE_SLOT1)],
         );
         let rep = tick(&k.ctx, &k.deps, &mut s).await;
-        assert_eq!(rep.incidents.len(), 1, "切换停下来之后照常归因");
+        assert_eq!(rep.incidents.len(), 1, "{:?}", rep.incidents);
         assert_eq!(rep.incidents[0].subject, "isp2.example.net:10007");
+    }
+
+    /// 门**只管路径 B**：同一批里 `dial tcp <上游地址>` 的行写的就是当时实际拨的那个上游，
+    /// 与「此刻选中谁」无关 ⇒ 照常归因、照常触发预案
+    #[tokio::test]
+    async fn the_switch_gate_lets_the_dial_address_path_through() {
+        let k = kit().await;
+        // 上游 3 改成裸 IP，好让 `dial tcp 203.0.113.7:10007` 唯一命中它（路径 A）
+        crate::modules::residential::state::update_group(&k.ctx.store, &k.ctx.bus, |g| {
+            g.upstreams[2].host = "203.0.113.7".into();
+        })
+        .await
+        .unwrap();
+        k.prober.with_gateways_up(&["isp1.example.net:10007"]);
+        // 槽 2 在 t=5 被切走；错误行都产生在那之前
+        k.host.advance(5);
+        let c: Arc<dyn Clash> = k.clash.clone();
+        slots::pin_slot(&k.ctx, c, 2, Some(Uuid::from_u128(1)))
+            .await
+            .unwrap();
+        k.host.advance(1);
+        feed(
+            &k,
+            (0..2)
+                .map(|t| rec("b-ui-relay", t, fx::POOL_SELECTOR_DIAL_REFUSED))
+                .collect(),
+        );
+        let mut s = Sentinel::default();
+        let rep = tick(&k.ctx, &k.deps, &mut s).await;
+        assert_eq!(rep.incidents.len(), 1, "{:?}", rep.incidents);
+        assert_eq!(
+            (
+                rep.incidents[0].signature.as_str(),
+                rep.incidents[0].subject.as_str()
+            ),
+            ("relay_upstream_error", "203.0.113.7:10007"),
+            "归到 reason 里那个地址，不是 `slot-2-pool` 此刻选中的 resi-1"
+        );
+        assert_eq!(
+            k.clash.selected("slot-2-pool").as_deref(),
+            Some("resi-1"),
+            "池此刻选中的仍是 resi-1（= isp1）：事件没有跟着 `now` 走"
+        );
+    }
+
+    /// 同一条 `dial tcp …: connect: connection refused` 在两条链上的分工：哨兵判
+    /// [`Sig::RelayUpstreamError`]（连不上上游自己），黑名单**不收**（它不是「上游拒绝了
+    /// 这个域名」）。黑名单那一侧的用例在
+    /// `residential::journal::tests::a_failed_dial_to_the_upstream_is_never_a_blacklist_candidate`
+    #[test]
+    fn a_failed_dial_is_an_upstream_error_for_the_sentinel() {
+        let m = signature::classify("b-ui-relay", fx::POOL_SELECTOR_DIAL_REFUSED)
+            .expect("哨兵仍认这条行");
+        assert_eq!(m.sig, Sig::RelayUpstreamError);
+        assert_eq!(
+            crate::modules::residential::journal::parse_line(
+                fx::POOL_SELECTOR_DIAL_REFUSED,
+                time::macros::datetime!(2026-09-11 00:00:00 UTC)
+            ),
+            None,
+            "黑名单侧一概不收：上游级，不是目标级"
+        );
     }
 
     #[tokio::test]

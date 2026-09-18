@@ -119,6 +119,19 @@ pub const RATE_WINDOW_SECS: i64 = 86_400;
 pub const RATE_SAMPLES_MAX: usize = 1024;
 /// journald 增量轮询间隔（契约决策 §E）
 pub const JOURNAL_POLL_SECS: u64 = 300;
+/// 归因**时间戳门**的宽限窗（2026-09-18 第二次裁决）：池 selector 在 `t0` 被切过之后，
+/// 日志时间戳 `ts < t0 + 本值` 的**路径 B**（经 Clash `now` 归因）行一律丢弃。
+///
+/// 为什么需要门：`now` 说的是「此刻选中谁」，日志行说的是「刚才是谁失败了」，而真实暴露
+/// 窗口是「日志行产生 → 归因读 `now`」整段（哨兵 [`crate::modules::sentinel::POLL_SECS`]
+/// 2 秒、黑名单 [`JOURNAL_POLL_SECS`] 300 秒）——切换落在其中，老成员的失败就被记到新成员
+/// 头上。`render::relay` 的两级池都是 `type: selector`（没有 urltest 自动切换），**b-ui 是
+/// 唯一的切换者**，所以把每次 `Clash::select` 成功返回的时刻记下来就够判。
+///
+/// 为什么是 1 秒：门比的是「journald 给这条行打的时间戳」与「`select` 返回的那一刻」，两者
+/// 来自不同时钟路径（内核 → journald 落盘 vs. 守护进程读 `host.now()`），只需要覆盖这点抖动；
+/// 再长就会在高频切换时把本该学的行也丢光。
+pub const SWITCH_ATTRIB_GRACE_SECS: i64 = 1;
 /// 候选阈值：同一 (上游, 主机, 端口) 累计被拒次数（R13 §6.2）
 pub const CANDIDATE_THRESHOLD: u64 = 3;
 /// 确认：两次确认之间至少间隔 10 分钟、连续 2 次（spec §5.4）
