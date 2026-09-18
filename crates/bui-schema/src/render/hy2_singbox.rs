@@ -25,8 +25,49 @@
 //! 与今天 apernet 配置（[`crate::render::hysteria`] 的 `common_doc`）的结构性差异：
 //! `sniGuard` / `resolver` / `trafficStats` / `auth` / `acl` / `quic` 在 sing-box 的入站
 //! schema 里根本不存在 —— `trafficStats` 的位置由 `experimental.v2ray_api` 接，`auth` 由
-//! `users[]` 接，`sniff` 由 route 的 `sniff` action 接，目标域名仍不在本机解析（**不要
+//! `users[]` 接，**`sniff` 这一项没有对应物（见下）**，目标域名仍不在本机解析（**不要
 //! `dns` 段**），原样经 socks 交给 relay。
+//!
+//! # 为什么这份配置不 sniff（`route.rules` 里没有 `{"action":"sniff"}`）
+//!
+//! 曾经有过一条裸 `{"action":"sniff"}` 在 `rules[0]`。**它只会给每条 TCP 流加满一个
+//! 嗅探超时（缺省 300 ms），而且永远嗅不到东西** —— 成因是 Hysteria2 协议与 sing-box
+//! 实现的次序死锁：
+//!
+//! - apernet 客户端（v2rayN 里那个、`hysteria` CLI）缺省 `fastOpen: false`，
+//!   要等服务端回 `TCPResponse` 之后才发首包；
+//! - 而 sing-box 是在 **route（sniff 动作在 `route/route.go` 的规则匹配里跑）走完、
+//!   出站也拨通之后**才 `N.ReportConnHandshakeSuccess`（`route/conn.go:122`），
+//!   那一步才触达 sing-quic 的 `hysteria2.serverConn.HandshakeSuccess`
+//!   （`service.go:403`）把 `TCPResponse` 写回去。
+//!
+//! 于是 sniff 在等客户端首包、客户端在等服务端的 `TCPResponse`，双方对等到嗅探超时
+//! 到点为止：嗅探必然空手而归，代价是每条流白等一个超时。T3 2026-09-18 的五格实测
+//! （25 次/格，`scratchpad/t3/item-300ms/results/matrix.txt`）：
+//!
+//! | 配置 | apernet 客户端（fastOpen 关）TTFB 中位数 | 嗅到域名 |
+//! |---|---|---|
+//! | `{"action":"sniff"}`（缺省 300 ms） | 307.1 ms | 0 / 25 |
+//! | `{"action":"sniff","timeout":"50ms"}` | 56.6 ms | 0 / 25 |
+//! | `{"action":"sniff","timeout":"1s"}` | 1010.6 ms | 0 / 25 |
+//! | **不 sniff（现状）** | **5.6 ms** | 0 / 25 |
+//!
+//! 即：延迟 ≈ 超时值，缩短超时只是缩短白等；嗅探成功率恒为 0，无论超时多大。
+//! （sing-box 当客户端时先发首包、不受影响：同一格 5.9 ms、25/25 嗅到域名；
+//! 但**服务端不能假设客户端是谁**——v2rayN 用户走的就是 apernet 客户端那条路。
+//! 对照格 E：apernet **服务端** + `sniff.rewriteDomain` 两种客户端都是 5 ms 级，
+//! 所以这不是协议本身的代价，是 sing-box 这个实现的次序。）
+//!
+//! 删掉它不影响任何功能：
+//!
+//! - **分流**：住宅路径的 split 关键字匹配靠的是 relay 自己那条 `rules[0]` 无过滤
+//!   sniff（[`crate::render::relay`]，`kernel_relay.rs` 有守门断言）。sing-box 1.14 的
+//!   sniff 动作**不改写连接目标**，这一侧嗅到的域名原本就传不到 relay；relay 会在自己
+//!   那一跳重新嗅一次，`domain_keyword` 优先匹配 `metadata.Domain`。T3 item12 的对照
+//!   实验已经证明：摘掉 relay 那条会静默直连，摘掉这一条不会。
+//! - **面板 / CLI**：`/connections` 的归户只读 `rule` / `chains` / `id`
+//!   （`bui` 的 `panel::hy2resi::Hy2ResiConn`），`metadata.host` 一处都没读；失去它
+//!   不改变任何显示。`inbound connection to …` 那条日志行在 route 之前打，照旧。
 use crate::model::{Hy2Pool, NodeParams};
 use crate::paths::Paths;
 use crate::slots::{MAX_SLOTS, RELAY_SOCKS_BASE};
@@ -118,8 +159,9 @@ pub fn config(node: &NodeParams, paths: &Paths, pool: &Hy2Pool) -> Value {
     }));
 
     // 每凭据**一条**规则：`/connections` 的 `rule` 字段是唯一能把连接归到用户的线索
-    // （spec §5.2），合并规则就丢了它
-    let mut rules = vec![json!({ "action": "sniff" })];
+    // （spec §5.2），合并规则就丢了它。
+    // **这张表里没有 `{"action":"sniff"}`**，理由见模块文档「为什么这份配置不 sniff」。
+    let mut rules: Vec<Value> = Vec::with_capacity(pool.creds.len());
     rules.extend(
         pool.creds
             .iter()
@@ -293,13 +335,23 @@ mod tests {
     fn routing_has_one_auth_user_rule_per_cred_and_finals_to_deny() {
         let v = config(&node(), &Paths::default_server(), &pool());
         let rules = v["route"]["rules"].as_array().unwrap();
-        assert_eq!(rules[0], serde_json::json!({ "action": "sniff" }));
         assert_eq!(
-            rules[1],
+            rules[0],
             serde_json::json!({ "auth_user": ["alice"], "outbound": "gate-r000" }),
             "route 规则用传统 outbound 字段即可（tizi PoC 已验证）"
         );
-        assert_eq!(rules[2]["auth_user"], serde_json::json!(["r001"]));
+        assert_eq!(rules[1]["auth_user"], serde_json::json!(["r001"]));
+        assert_eq!(
+            rules.len(),
+            2,
+            "每凭据一条，别的什么都没有 —— 特别是**不许**有 sniff（模块文档：\
+             apernet 客户端等 TCPResponse、sing-box 在 route 后才写它 ⇒ sniff 必然\
+             等满超时且嗅不到，每条 TCP 流白加 300 ms；分流靠 relay 那条 sniff）"
+        );
+        assert!(
+            rules.iter().all(|r| r["action"] != "sniff"),
+            "住宅 HY2 侧不许 sniff：{rules:#?}"
+        );
         assert_eq!(v["route"]["final"], DENY_TAG);
         assert_eq!(
             v["experimental"]["clash_api"]["external_controller"],

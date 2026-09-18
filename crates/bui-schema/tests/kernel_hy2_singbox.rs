@@ -5,7 +5,7 @@
 //! 本机 1.14.0（官方二进制）实测，逐字：
 //! `FATAL create v2ray-server: v2ray api is not included in this build, rebuild with -tags with_v2ray_api`
 //! ——把 `experimental.v2ray_api` 摘掉后同一份配置 `check` 退 0，所以除那一段之外的形状
-//! （凭据池 / deny socks / 8 个槽出站 / 门 / `{"action":"sniff"}` + `auth_user` 规则 /
+//! （凭据池 / deny socks / 8 个槽出站 / 门 / `auth_user` 规则 /
 //! `route.final` / `clash_api` / salamander / masquerade proxy）已在真实 1.14 上验过。
 mod common;
 
@@ -62,8 +62,9 @@ fn residential_inbound_config_passes_check_on_the_self_built_singbox() {
 }
 
 /// 全新装机那一格：`hy2pool::migrate` 之前池是空的，此时渲染出的 `users: []`、9 个出站、
-/// 1 条 sniff 规则**也必须过 check**（2026-09-16 第二波复核：T5 只手工验过，没有自动化
-/// 测试守着）。空 `users` 数组被 sing-box 判非法的话，首装当轮住宅内核就起不来。
+/// **空 `route.rules`（住宅 HY2 侧不 sniff，见 `render::hy2_singbox` 模块文档）
+/// 也必须过 check**（2026-09-16 第二波复核：T5 只手工验过，没有自动化测试守着）。
+/// 空 `users` 或空 `rules` 数组被 sing-box 判非法的话，首装当轮住宅内核就起不来。
 #[test]
 fn an_empty_credential_pool_also_passes_check() {
     if !singbox_has_v2ray_api() {
