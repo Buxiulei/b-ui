@@ -143,8 +143,8 @@ pub async fn tick(ctx: &DaemonCtx, deps: &Deps, s: &mut Sentinel) -> TickReport 
         }
     };
 
-    // ② 匹配 + 去抖。relay 的对象当场从成员 tag（位置键）换成 uuid，换不出来的丢弃
-    let mut fired: Vec<Fired> = Vec::new();
+    // ②a 匹配（`signature::classify` 是纯函数，不碰机器）
+    let mut matched: Vec<(&JournalRecord, signature::Match)> = Vec::new();
     for r in &records {
         let Some(m) = signature::classify(&r.unit, &r.message) else {
             continue;
@@ -152,10 +152,81 @@ pub async fn tick(ctx: &DaemonCtx, deps: &Deps, s: &mut Sentinel) -> TickReport 
         if m.sig == Sig::Hy2AuthHttpFailed && !hy2_http {
             continue;
         }
+        matched.push((r, m));
+    }
+
+    // ②b 归因（有 I/O）：relay 的错误行在生产里只带池 tag（`selector[slot-<i>-pool]` /
+    // `urltest[resi-pool]`），成员 tag 一个字都不出现，所以「哪个上游」要在这里换 —— 路径 A
+    // 用 reason 里的 `dial tcp` 地址（零 I/O），路径 B 问一次池的 `now`（**每池只查一次**）。
+    // 路径 B 的行还要过一道**时间戳门**（`clash::within_switch_grace`）：`now` 说的是「此刻
+    // 选中谁」，日志行说的是「刚才是谁失败了」，中间只要 b-ui 切过一次池，老成员的失败就会
+    // 记到新成员头上。b-ui 是两级池唯一的切换者（都是 `type: selector`，没有 urltest 自动
+    // 切换），所以每次 `Clash::select` 成功都在 runtime 里记下时刻，这里按日志行自己的时间戳
+    // 判。路径 A 不受门约束——它写的就是当时实际拨的那个上游。
+    // 归不了因的一律丢弃并记一行 debug，**绝不猜**
+    let pools: Vec<String> = matched
+        .iter()
+        .filter_map(|(_, m)| m.relay.as_ref().and_then(clash::pool_of))
+        .map(str::to_string)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let pool_now = clash::pool_now(&deps.clash, &pools).await;
+    // 读序：`pool_switch_at` 在读 `now` **之后**才读（2026-09-18 第三次裁决 ②），
+    // 否则「读 now → 读 switch_at」之间的切换不在门里
+    let rt = rstate::read(&ctx.runtime).await;
+    let switch_at = rt.pool_switch_at.clone();
+    // 通用兜底：`now` 与 runtime 记的该池当前选择对不上 ⇒ 中间有过一次没记账的切换
+    // （relay 重启回落 default、有人手动 curl 过 Clash API…）。这些池本批整批丢弃，
+    // 并在下面把账补上（2026-09-18 第三次裁决 ③）
+    let unstable = clash::unstable_pools(&g, &pool_now, &rt);
+    // 顺带记连续批次账：同一池连续 `UNSTABLE_BATCHES_TO_ALERT` 批不稳定 ⇒ 告警 + 收敛
+    // 各一次（裁决 ③：兜底不许变哑巴）
+    let seen: Vec<String> = pool_now.keys().cloned().collect();
+    if !rstate::mark_unstable_pools(&ctx.runtime, &seen, &unstable, ctx.host.now())
+        .await
+        .is_empty()
+    {
+        ctx.bus.send(crate::api::Event::RelayRestarted);
+    }
+
+    // ②c 归因 + 去抖
+    let mut fired: Vec<Fired> = Vec::new();
+    for (r, m) in matched {
         let upstream = if m.sig.on_upstream() {
-            match clash::id_of_tag(&g, &m.subject) {
-                Some(id) => Some(id),
-                None => continue,
+            let Some(sub) = m.relay.as_ref() else {
+                continue;
+            };
+            if clash::pool_of(sub).is_some_and(|p| unstable.contains(p)) {
+                tracing::debug!(
+                    signature = m.sig.id(),
+                    subject = %m.subject,
+                    "该池的 now 与运行时记录不一致（有过没记账的切换），本批证据放弃"
+                );
+                continue;
+            }
+            // 宽限窗按这条行自己的 reason 现算（裁决 ④）：超时类的行的时间戳比路由决策
+            // 晚一个完整的拨号 / 握手超时，1 秒的门拦不住 —— `switch_grace_secs` 喂整条
+            // message 与喂 reason 同结论（判据是 `contains`）
+            let grace = clash::switch_grace_secs(&r.message);
+            match clash::attribute(&g, sub, &pool_now, &switch_at, r.ts, grace) {
+                clash::Attrib::Upstream(id) => Some(id),
+                clash::Attrib::Switched => {
+                    tracing::debug!(
+                        signature = m.sig.id(),
+                        subject = %m.subject,
+                        "这条行产生时该池刚被切过，本批证据放弃、等下次复发"
+                    );
+                    continue;
+                }
+                clash::Attrib::Unknown => {
+                    tracing::debug!(
+                        signature = m.sig.id(),
+                        subject = %m.subject,
+                        "relay 错误行归不了因，丢弃（绝不猜）"
+                    );
+                    continue;
+                }
             }
         } else {
             None
@@ -299,6 +370,8 @@ mod tests {
     use super::*;
     use crate::modules::residential::clash::{Clash, FakeClash};
     use crate::modules::residential::proxy::FakeProber;
+    use crate::modules::residential::slots;
+    use crate::modules::sentinel::fixtures_relay as fx;
     use crate::modules::sentinel::incidents::Level;
     use crate::modules::sentinel::testkit::{panel_shared, pool_ctx, rec};
     use crate::modules::sentinel::{Notifier, SentinelModule};
@@ -523,6 +596,270 @@ mod tests {
             2,
             "整段只探了两次：故障 IP 一次 + 借用目标的验证一次（{:?}）",
             k.prober.calls()
+        );
+    }
+
+    /// 池形状（生产唯一形状）：对象是池 tag，归因经 Clash 的 `now` 换成上游 uuid，
+    /// 事件落在那个上游上、借用照常发生
+    #[tokio::test]
+    async fn a_pool_shaped_error_is_attributed_to_the_upstream_the_pool_has_selected() {
+        let k = kit().await;
+        k.prober.with_gateways_up(&["isp1.example.net:10007"]);
+        k.clash.with(|i| {
+            i.now.insert("slot-1-pool".into(), "resi-2".into());
+        });
+        k.host.advance(3);
+        feed(
+            &k,
+            (0..2)
+                .map(|t| rec("b-ui-relay", t, fx::POOL_SELECTOR_DEADLINE_SLOT1))
+                .collect(),
+        );
+        let mut s = Sentinel::default();
+        let rep = tick(&k.ctx, &k.deps, &mut s).await;
+        assert_eq!(rep.incidents.len(), 1, "{:?}", rep.incidents);
+        assert_eq!(
+            (
+                rep.incidents[0].signature.as_str(),
+                rep.incidents[0].subject.as_str()
+            ),
+            ("relay_upstream_error", "isp2.example.net:10007"),
+            "对象是池此刻选中的那个上游，不是池 tag"
+        );
+        assert_eq!(k.clash.selected("slot-1-pool").as_deref(), Some("resi-1"));
+    }
+
+    /// 同一条链路，喂**采样原文**：`slot-<i>-pool` 上的 SOCKS5 凭据被拒（tizi 14 天窗口 10 条，
+    /// 池形状里唯一逐字采到的「上游本身坏了」形状）。上面那条用例的
+    /// [`fx::POOL_SELECTOR_DEADLINE_SLOT1`] 是按 §3 拼的合成形状——归因层只看
+    /// `RelaySubject`、与 reason 无关，所以拿它测机制没问题，但真机形状得有一条端到端的
+    #[tokio::test]
+    async fn a_verbatim_sampled_pool_line_is_attributed_end_to_end() {
+        let k = kit().await;
+        k.prober.with_gateways_up(&["isp1.example.net:10007"]);
+        k.clash.with(|i| {
+            i.now.insert("slot-0-pool".into(), "resi-3".into());
+        });
+        k.host.advance(3);
+        feed(
+            &k,
+            (0..3)
+                .map(|t| rec("b-ui-relay", t, fx::POOL_SELECTOR_SOCKS_AUTH))
+                .collect(),
+        );
+        let mut s = Sentinel::default();
+        let rep = tick(&k.ctx, &k.deps, &mut s).await;
+        assert_eq!(rep.incidents.len(), 1, "{:?}", rep.incidents);
+        assert_eq!(
+            (
+                rep.incidents[0].signature.as_str(),
+                rep.incidents[0].subject.as_str()
+            ),
+            ("relay_upstream_auth_failed", "isp3.example.net:10007"),
+            "对象是 slot-0-pool 此刻选中的那个上游"
+        );
+    }
+
+    /// 归不了因（池的 `now` 指向池外的 tag）⇒ 整批丢弃、零动作，且**每个池每轮只查一次**
+    /// `now`，不因为日志条数多就狂打 Clash API
+    #[tokio::test]
+    async fn unattributable_pool_lines_are_dropped_and_the_pool_is_read_once_per_tick() {
+        let k = kit().await;
+        k.clash.with(|i| {
+            i.now.insert("slot-1-pool".into(), "resi-9".into()); // 池里没有 resi-9
+        });
+        k.host.advance(3);
+        feed(
+            &k,
+            (0..20)
+                .map(|t| rec("b-ui-relay", t, fx::POOL_SELECTOR_DEADLINE_SLOT1))
+                .collect(),
+        );
+        let mut s = Sentinel::default();
+        assert!(tick(&k.ctx, &k.deps, &mut s).await.incidents.is_empty());
+        assert_eq!(
+            k.clash.calls(),
+            vec!["get:slot-1-pool"],
+            "20 条日志只查一次 now，且没有任何切换"
+        );
+        assert!(k.prober.calls().is_empty(), "归不了因就别探测");
+    }
+
+    /// **对抗**：巡检 / 借用切走了某个槽的 selector，切换**之前**产生的那批错误行还在队列里。
+    /// `now` 说的是「此刻选中谁」，这批行说的是「刚才是谁失败了」——真实暴露窗口是整段
+    /// 「日志行产生 → 归因读 `now`」，不是归因那几毫秒，所以按**时间戳门**判：
+    /// 门内的路径 B 行整批丢弃，连去抖计数都不进（否则下一轮一条就够触发），哨兵零动作；
+    /// 宽限窗之后的行照常归因到新成员。
+    ///
+    /// 本用例的行是 `deadline exceeded`（超时类）⇒ 宽限窗是
+    /// [`SWITCH_ATTRIB_GRACE_TIMEOUT_SECS`] = 30 秒，不是 1 秒（2026-09-18 第四次裁决 ④）：
+    /// 这类行的时间戳比路由决策晚一个完整超时，切换后十几秒才落盘的那条说的还是老成员。
+    ///
+    /// [`SWITCH_ATTRIB_GRACE_TIMEOUT_SECS`]: crate::modules::residential::SWITCH_ATTRIB_GRACE_TIMEOUT_SECS
+    #[tokio::test]
+    async fn lines_logged_before_a_pool_switch_are_dropped_and_later_ones_fire_normally() {
+        let k = kit().await;
+        k.prober.with_gateways_up(&["isp1.example.net:10007"]);
+        // t=0..2 打出 200 条错误行（槽 1 的 selector）
+        feed(
+            &k,
+            (0..200)
+                .map(|t| rec("b-ui-relay", t % 3, fx::POOL_SELECTOR_DEADLINE_SLOT1))
+                .collect(),
+        );
+        // t=5：槽 1 被手动 pin 到 resi-2 —— 走的是生产那条 `Clash::select` 路径，
+        // 成功之后 `state::note_pool_switch` 把时刻记进 runtime
+        k.host.advance(5);
+        let c: Arc<dyn Clash> = k.clash.clone();
+        slots::pin_slot(&k.ctx, c, 1, Some(Uuid::from_u128(2)))
+            .await
+            .unwrap();
+        assert_eq!(
+            rstate::read(&k.ctx.runtime)
+                .await
+                .pool_switch_at
+                .get("slot-1-pool")
+                .map(String::as_str),
+            Some("2026-09-11T00:00:05Z"),
+            "切换时刻落进 runtime，归因的时间戳门读它"
+        );
+        k.host.advance(1);
+        let mut s = Sentinel::default();
+        let rep = tick(&k.ctx, &k.deps, &mut s).await;
+        assert!(rep.incidents.is_empty(), "{:?}", rep.incidents);
+        assert!(k.prober.calls().is_empty(), "哨兵零动作：一次探测都没发生");
+        // 裁决 ④：切换后 10 秒才落盘的两条超时行**仍然**在窗里 —— 拨号是切换之前发起的，
+        // 说的是老成员。1 秒的门会把它们记到 resi-2 头上（threshold=2 ⇒ 当场触发预案）
+        k.host.advance(5);
+        feed(
+            &k,
+            (10..12)
+                .map(|t| rec("b-ui-relay", t, fx::POOL_SELECTOR_DEADLINE_SLOT1))
+                .collect(),
+        );
+        assert!(tick(&k.ctx, &k.deps, &mut s).await.incidents.is_empty());
+        assert!(
+            k.prober.calls().is_empty(),
+            "超时类的宽限窗 30 秒：切换后 10 秒的行照样丢，一次探测都没发生"
+        );
+        // 宽限窗（30 秒）之后的两条：照常归因到池此刻选中的 resi-2（= isp2），
+        // 去抖门槛 2 条 ⇒ 触发。前面那些要是进了去抖计数，这里第一条就会触发
+        k.host.advance(30);
+        feed(
+            &k,
+            vec![rec("b-ui-relay", 36, fx::POOL_SELECTOR_DEADLINE_SLOT1)],
+        );
+        assert!(tick(&k.ctx, &k.deps, &mut s).await.incidents.is_empty());
+        k.host.advance(1);
+        feed(
+            &k,
+            vec![rec("b-ui-relay", 37, fx::POOL_SELECTOR_DEADLINE_SLOT1)],
+        );
+        let rep = tick(&k.ctx, &k.deps, &mut s).await;
+        assert_eq!(rep.incidents.len(), 1, "{:?}", rep.incidents);
+        assert_eq!(rep.incidents[0].subject, "isp2.example.net:10007");
+    }
+
+    /// **裁决 ③ 的通用兜底**（2026-09-18 第三次）：relay 重启把每个 selector 打回配置里的
+    /// default，而这次重启**没有任何一条记账路径跑过**（守护进程自己刚起、或有人手动
+    /// `curl` 过 Clash API）。归因时发现某池的 `now` 与 runtime 记的「该池当前选择」对不上
+    /// ⇒ 这一批该池的路径 B 行整批丢弃（一次探测都不发），并**当场**把切换时刻补记上。
+    /// 少了这层兜底，重启之前那批老成员的失败会被整批记到重启后 default 的那条上游头上，
+    /// 而 `on_upstream_error` 的 `Unconfirmed` 是按不可用处置的（借槽 + 判不健康）。
+    #[tokio::test]
+    async fn an_unaccounted_relay_restart_drops_the_batch_and_stamps_the_pool() {
+        let k = kit().await;
+        // t=0：槽 1 被切到 resi-2，走的是生产那条 `Clash::select` 路径，runtime 记下了
+        let c: Arc<dyn Clash> = k.clash.clone();
+        slots::pin_slot(&k.ctx, c, 1, Some(Uuid::from_u128(2)))
+            .await
+            .unwrap();
+        // t=60：relay 重启，selector 回落到配置里的 default（resi-1）——没人记这一笔。
+        // 时间戳门在这里救不了场：那一笔记的是 t=0，错误行是 t=60 之后的
+        k.host.advance(60);
+        k.clash.with(|i| {
+            i.now.insert("slot-1-pool".into(), "resi-1".into());
+        });
+        feed(
+            &k,
+            (0..3)
+                .map(|t| rec("b-ui-relay", 60 + t, fx::POOL_SELECTOR_DEADLINE_SLOT1))
+                .collect(),
+        );
+        let mut s = Sentinel::default();
+        let rep = tick(&k.ctx, &k.deps, &mut s).await;
+        assert!(rep.incidents.is_empty(), "{:?}", rep.incidents);
+        assert!(k.prober.calls().is_empty(), "归不了因就别探测");
+        assert_eq!(
+            rstate::read(&k.ctx.runtime)
+                .await
+                .pool_switch_at
+                .get("slot-1-pool")
+                .map(String::as_str),
+            Some("2026-09-11T00:01:00Z"),
+            "没记账的切换当场补记，下一批才有门可依"
+        );
+    }
+
+    /// 门**只管路径 B**：同一批里 `dial tcp <上游地址>` 的行写的就是当时实际拨的那个上游，
+    /// 与「此刻选中谁」无关 ⇒ 照常归因、照常触发预案
+    #[tokio::test]
+    async fn the_switch_gate_lets_the_dial_address_path_through() {
+        let k = kit().await;
+        // 上游 3 改成裸 IP，好让 `dial tcp 203.0.113.7:10007` 唯一命中它（路径 A）
+        crate::modules::residential::state::update_group(&k.ctx.store, &k.ctx.bus, |g| {
+            g.upstreams[2].host = "203.0.113.7".into();
+        })
+        .await
+        .unwrap();
+        k.prober.with_gateways_up(&["isp1.example.net:10007"]);
+        // 槽 2 在 t=5 被切走；错误行都产生在那之前
+        k.host.advance(5);
+        let c: Arc<dyn Clash> = k.clash.clone();
+        slots::pin_slot(&k.ctx, c, 2, Some(Uuid::from_u128(1)))
+            .await
+            .unwrap();
+        k.host.advance(1);
+        feed(
+            &k,
+            (0..2)
+                .map(|t| rec("b-ui-relay", t, fx::POOL_SELECTOR_DIAL_REFUSED))
+                .collect(),
+        );
+        let mut s = Sentinel::default();
+        let rep = tick(&k.ctx, &k.deps, &mut s).await;
+        assert_eq!(rep.incidents.len(), 1, "{:?}", rep.incidents);
+        assert_eq!(
+            (
+                rep.incidents[0].signature.as_str(),
+                rep.incidents[0].subject.as_str()
+            ),
+            ("relay_upstream_error", "203.0.113.7:10007"),
+            "归到 reason 里那个地址，不是 `slot-2-pool` 此刻选中的 resi-1"
+        );
+        assert_eq!(
+            k.clash.selected("slot-2-pool").as_deref(),
+            Some("resi-1"),
+            "池此刻选中的仍是 resi-1（= isp1）：事件没有跟着 `now` 走"
+        );
+    }
+
+    /// 同一条 `dial tcp …: connect: connection refused` 在两条链上的分工：哨兵判
+    /// [`Sig::RelayUpstreamError`]（连不上上游自己），黑名单**不收**（它不是「上游拒绝了
+    /// 这个域名」）。黑名单那一侧的用例在
+    /// `residential::journal::tests::a_failed_dial_to_the_upstream_is_never_a_blacklist_candidate`
+    #[test]
+    fn a_failed_dial_is_an_upstream_error_for_the_sentinel() {
+        let m = signature::classify("b-ui-relay", fx::POOL_SELECTOR_DIAL_REFUSED)
+            .expect("哨兵仍认这条行");
+        assert_eq!(m.sig, Sig::RelayUpstreamError);
+        assert_eq!(
+            crate::modules::residential::journal::parse_line(
+                fx::POOL_SELECTOR_DIAL_REFUSED,
+                time::macros::datetime!(2026-09-11 00:00:00 UTC)
+            ),
+            None,
+            "黑名单侧一概不收：上游级，不是目标级"
         );
     }
 

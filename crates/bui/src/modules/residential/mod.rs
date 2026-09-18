@@ -119,6 +119,44 @@ pub const RATE_WINDOW_SECS: i64 = 86_400;
 pub const RATE_SAMPLES_MAX: usize = 1024;
 /// journald 增量轮询间隔（契约决策 §E）
 pub const JOURNAL_POLL_SECS: u64 = 300;
+/// 归因**时间戳门**的宽限窗（2026-09-18 第二次裁决）：池 selector 在 `t0` 被切过之后，
+/// 日志时间戳 `ts < t0 + 本值` 的**路径 B**（经 Clash `now` 归因）行一律丢弃。
+///
+/// 为什么需要门：`now` 说的是「此刻选中谁」，日志行说的是「刚才是谁失败了」，而真实暴露
+/// 窗口是「日志行产生 → 归因读 `now`」整段（哨兵 [`crate::modules::sentinel::POLL_SECS`]
+/// 2 秒、黑名单 [`JOURNAL_POLL_SECS`] 300 秒）——切换落在其中，老成员的失败就被记到新成员
+/// 头上。`render::relay` 的两级池都是 `type: selector`（没有 urltest 自动切换），**b-ui 是
+/// 唯一的切换者**，所以把每次 `Clash::select` 成功返回的时刻记下来就够判。
+///
+/// 为什么是 1 秒：门比的是「journald 给这条行打的时间戳」与「`select` 返回的那一刻」，两者
+/// 来自不同时钟路径（内核 → journald 落盘 vs. 守护进程读 `host.now()`），只需要覆盖这点抖动；
+/// 再长就会在高频切换时把本该学的行也丢光。
+pub const SWITCH_ATTRIB_GRACE_SECS: i64 = 1;
+/// **超时类** reason 的宽限窗（2026-09-18 第四次裁决 ④）：命中
+/// [`crate::modules::sentinel::signature::is_unreachable_reason`] 那一组标记
+/// （`i/o timeout` / `deadline exceeded` / `connection refused` / `no route to host` /
+/// `network is unreachable`，= 哨兵 `Sig::RelayUpstreamError` 的判据，**不新造标记**）的
+/// 路径 B 行走这个值，其余仍走 [`SWITCH_ATTRIB_GRACE_SECS`]。
+///
+/// 为什么单列：这类行的日志时刻比**路由决策时刻**晚一个完整的拨号 / 握手超时 ——
+/// sing-box 选中成员后才开始拨，拨不通要等超时才写日志。于是「切换前选中的老成员」
+/// 打出的超时行会带着一个**切换之后**的时间戳，1 秒的门拦不住它，路径 B 就把它记到
+/// 新成员头上。30 s ≥ sing-box 的拨号 / 握手超时（`connect_timeout` 默认 5 s、
+/// TLS/HTTP CONNECT 那一段最坏也在十几秒量级），够覆盖整段延迟。
+///
+/// 代价是这类行在切换后 30 秒内一律不学 —— 方向正确：宁可少学，也绝不错记。
+pub const SWITCH_ATTRIB_GRACE_TIMEOUT_SECS: i64 = 30;
+/// 「没记账的切换」兜底的发声门槛（2026-09-18 第四次裁决 ③）：同一池连续这么多批被
+/// [`clash::unstable_pools`] 判成不稳定 ⇒ 告警一次 + 收敛一次。
+///
+/// 为什么不是第一批就喊：一次 relay 重启 / 一次手动 `curl` 就会让一批不稳定，那是兜底
+/// **正常工作**的样子（补记时刻、丢这一批证据），喊了只是噪音。连续 3 批说明有一条落账
+/// 路径在持续漏写，或有人在外面反复动 selector —— 那时归因已经在长期丢证据，必须有人知道。
+pub const UNSTABLE_BATCHES_TO_ALERT: u32 = 3;
+/// 同一池两次「反复不稳定」告警 / 收敛之间的最小间隔：两条链的批间隔差得远
+/// （哨兵 [`crate::modules::sentinel::POLL_SECS`] 2 秒、黑名单 [`JOURNAL_POLL_SECS`]
+/// 300 秒），不设冷却的话哨兵那条链能每 2 秒喊一次、每 2 秒重放一次。
+pub const UNSTABLE_ALERT_COOLDOWN_SECS: i64 = 3600;
 /// 候选阈值：同一 (上游, 主机, 端口) 累计被拒次数（R13 §6.2）
 pub const CANDIDATE_THRESHOLD: u64 = 3;
 /// 确认：两次确认之间至少间隔 10 分钟、连续 2 次（spec §5.4）
@@ -236,12 +274,12 @@ impl Module for ResidentialModule {
             // spec §5.3：每 2 分钟一轮巡检 + 切换
             tokio::spawn(health::health_loop(ctx.clone(), p.clone(), c.clone())),
             // spec §5.3 最后一句：relay 任何重启后立即重放 runtime.selected_upstream_id
-            tokio::spawn(health::replay_loop(ctx.clone(), c, rx)),
+            tokio::spawn(health::replay_loop(ctx.clone(), c.clone(), rx)),
             // spec §5.4 (a)：跟随 relay 日志学候选（契约决策 §E：游标增量，不用 -f），
             // 同一轮里紧接着做一次确认 ⇒ ≥10 分钟就能进 pending（裁决「黑名单确认节奏」）
-            tokio::spawn(blacklist::journal_loop(ctx.clone(), p.clone())),
+            tokio::spawn(blacklist::journal_loop(ctx.clone(), p.clone(), c.clone())),
             // spec §5.4：每日 04:00 批量生效 + 每日探针/端口集 + 复核移除（不做确认）
-            tokio::spawn(blacklist::daily_loop(ctx, p)),
+            tokio::spawn(blacklist::daily_loop(ctx, p, c)),
         ]
     }
 }

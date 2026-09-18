@@ -788,8 +788,10 @@ impl PutFail {
 }
 
 /// 把槽 `index` 的 selector 切到 `target`：成功返回目标 tag。[`drive_slots`] 与 [`borrow_now`]
-/// 共用，「切一槽」只有这一份实现。
+/// 共用，「切一槽」只有这一份实现 —— 所以归因时间戳门的落账（[`state::mark_pool_switch`]）
+/// 也只在这里写一次，切成功了才写。
 async fn put_slot(
+    ctx: &DaemonCtx,
     c: Arc<dyn Clash>,
     g: &ResidentialGroup,
     index: u16,
@@ -798,9 +800,13 @@ async fn put_slot(
     let Some(tag) = clash::tag_of(g, target) else {
         return Err(PutFail::Gone);
     };
-    let (sel, t) = (super::slot_selector(index), tag.clone());
-    match tokio::task::spawn_blocking(move || c.select(&sel, &t)).await {
-        Ok(Ok(())) => Ok(tag),
+    let sel = super::slot_selector(index);
+    let (s2, t) = (sel.clone(), tag.clone());
+    match tokio::task::spawn_blocking(move || c.select(&s2, &t)).await {
+        Ok(Ok(())) => {
+            state::mark_pool_switch(&ctx.runtime, &sel, ctx.host.now()).await;
+            Ok(tag)
+        }
         Ok(Err(e)) => Err(PutFail::Rejected(format!("切到 {tag} 失败：{e}"))),
         Err(e) => Err(PutFail::Task(format!("切换任务异常：{e}"))),
     }
@@ -898,7 +904,7 @@ pub async fn drive_slots(
 
         let mut switched = false;
         if !hold && current != Some(target) {
-            match put_slot(c.clone(), g, s.index, target).await {
+            match put_slot(ctx, c.clone(), g, s.index, target).await {
                 Ok(tag) => {
                     switched = true;
                     tracing::info!(slot = s.index, to = %tag, "按槽切换住宅出口");
@@ -1126,7 +1132,7 @@ pub async fn borrow_now(
         // 借到了：(目标, 没能确认可用的原因)
         let mut borrowed_to: Option<(Uuid, Option<String>)> = None;
         for up in &cands {
-            match put_slot(c.clone(), &g, sl.index, up.id).await {
+            match put_slot(ctx, c.clone(), &g, sl.index, up.id).await {
                 Ok(tag) => {
                     landed = Some(up.id);
                     if proven_alive.contains(&up.id) {
@@ -1207,7 +1213,7 @@ pub async fn borrow_now(
         let mut note = put_err;
         let mut target = landed.unwrap_or(current);
         if target != own {
-            match put_slot(c.clone(), &g, sl.index, own).await {
+            match put_slot(ctx, c.clone(), &g, sl.index, own).await {
                 Ok(_) => target = own,
                 Err(f) => {
                     let back = format!("放回本槽 IP 也失败：{}", f.note());
@@ -1276,8 +1282,10 @@ pub async fn pin_slot(
     drop(s);
     if let Some(t) = target {
         let tag = clash::tag_of(&g, t).ok_or_else(|| anyhow::anyhow!("目标上游不在住宅池里"))?;
-        let (cc, sel) = (c, super::slot_selector(index));
-        tokio::task::spawn_blocking(move || cc.select(&sel, &tag)).await??;
+        let sel = super::slot_selector(index);
+        let (cc, s2) = (c, sel.clone());
+        tokio::task::spawn_blocking(move || cc.select(&s2, &tag)).await??;
+        state::mark_pool_switch(&ctx.runtime, &sel, ctx.host.now()).await;
     }
     state::update(&ctx.runtime, move |r| {
         let e = r.slots.entry(index.to_string()).or_default();
@@ -2846,6 +2854,16 @@ mod tests {
         let r = state::read(&ctx.runtime).await;
         assert_eq!(r.slots["1"].current_upstream_id, Some(Uuid::from_u128(3)));
         assert_eq!(r.slots["1"].back_rounds, 0, "被挪走的槽从头数切回轮数");
+        // 切成功 ⇒ 记下切换时刻：relay 错误行的归因靠它判「这条行是切换前还是切换后的」
+        //（`clash::within_switch_grace`）。借用是生产里最频繁的切换路径，漏记这一笔，
+        // 哨兵与黑名单就会把老出口的失败记到刚借来的这条上游头上
+        assert_eq!(
+            r.pool_switch_at.get("slot-1-pool").map(String::as_str),
+            Some("2026-09-11T00:00:00Z"),
+            "{:?}",
+            r.pool_switch_at
+        );
+        assert_eq!(r.pool_switch_at.len(), 1, "没切的槽不记");
     }
 
     #[tokio::test]

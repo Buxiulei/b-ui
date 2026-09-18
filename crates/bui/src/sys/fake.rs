@@ -52,6 +52,11 @@ pub struct FakeInner {
     /// 令某单元**永远不 active**：`systemctl start/restart` 照样退 0，单元却起不来
     /// （203/EXEC、start-limit-hit 的真实形态）。裸名与全名两种键各查一次。
     pub never_active: BTreeSet<String>,
+    /// 每次 `systemd` 动作把假时钟往前拨这么多秒（0 = 不拨）：真机上 `systemctl restart`
+    /// 是**阻塞**的（内核起不起来要等 `Type=notify` / 超时），「发命令」与「命令返回」之间
+    /// 差着可观的时间。relay 重启后记归因时间戳门的那几条来路必须用**返回之后**的时刻，
+    /// 这个钩子就是把那段差值复现出来（对照 [`crate::modules::residential::clash::FakeClashInner::advance_on_select`]）。
+    pub advance_on_systemd: i64,
     pub listening: BTreeMap<Proto, BTreeSet<u16>>,
     pub mem_mb: u64,
     pub arch: String,
@@ -105,6 +110,7 @@ impl Default for FakeInner {
             fail_writes: BTreeSet::new(),
             fail_runs: BTreeSet::new(),
             never_active: BTreeSet::new(),
+            advance_on_systemd: 0,
             listening: BTreeMap::new(),
             mem_mb: 2048,
             arch: "x86_64".into(),
@@ -387,6 +393,9 @@ impl Host for FakeHost {
         let mut i = self.lock();
         // ops 里记的是**传进来的原样名字**
         i.ops.push(format!("systemd:{verb}:{unit}"));
+        // 真机上 systemctl 是阻塞的：时钟先走，调用方之后取的 `now` 才是「返回时刻」
+        let advance = i.advance_on_systemd;
+        i.now += time::Duration::seconds(advance);
         // fail_units 裸名与全名两种键各查一次，任一命中即失败（Task 5 的回滚测试按裸名播种）
         if i.fail_units.contains(&full) || i.fail_units.contains(&bare) {
             return Ok(CmdOut::failure(1, "Job failed"));

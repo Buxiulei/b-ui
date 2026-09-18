@@ -639,6 +639,11 @@ pub async fn check_round(
         // 先算判定，好把防抖计数与下面的选择落账并成同一次写盘
         let d = improve_decision(&g, &rt, &healthy, cur, now);
         let mut alerts: Vec<String> = Vec::new();
+        // 重放成功的那一刻（`None` = 这一轮没重放）。**取自 `select` 返回之后**，不是轮首的
+        // `now`：探测那一段少则几秒、多则几十秒，用轮首的时刻记账等于把门开在切换之前，
+        // 这中间产生的路径 B 行会被记到新成员头上（2026-09-18 第三次裁决 ①，写法对齐
+        // `slots::put_slot`）。
+        let mut replayed_at: Option<OffsetDateTime> = None;
         if want == Some(cur) && Some(cur) != sel_id {
             // tag 现算（位置键，不做主键）；cur 来自当前池，tag_of 必有值
             let tag = clash::tag_of(&g, cur).expect("cur 取自当前池");
@@ -649,7 +654,9 @@ pub async fn check_round(
                     out.notes.push(format!(
                         "relay 的当前选择 {sel_tag} 与运行时记录的 {tag} 不一致（relay 刚重启过），已重放运行时的选择"
                     ));
-                    // 重放不是切换：不写 last_switch_at、不吃 60s 限速
+                    // 重放不是切换：不写 last_switch_at、不吃 60s 限速。但 selector 的 `now`
+                    // 确实换了值 ⇒ 归因的时间戳门要记（`state::note_pool_switch` 的文档）
+                    replayed_at = Some(ctx.host.now());
                     out.replayed_to = Some(tag);
                 }
                 Err(e) => {
@@ -660,11 +667,21 @@ pub async fn check_round(
         }
         let pending = Some(cur) != g.selected_upstream_id;
         let (cand, rounds) = (d.cand, d.rounds);
+        // 走到重放这条分支 = relay 刚被重启过（看门狗 / `POST /api/services/…/restart`），
+        // 它的**每个** selector 的 `now` 都回落到了配置里的 default ⇒ 归因的时间戳门要对
+        // 全池记一次，不是只记全局那一个（2026-09-18 第三次裁决 ③）
+        let pools = match replayed_at {
+            Some(_) => state::all_pool_selectors(&ctx.store.read().await.clone()),
+            None => Vec::new(),
+        };
         state::update(&ctx.runtime, move |r| {
             r.selected_upstream_id = Some(cur);
             r.selected_pending_persist = pending;
             r.improve_candidate_id = cand;
             r.improve_rounds = rounds;
+            if let Some(t) = replayed_at {
+                state::note_pools_switch(r, &pools, t);
+            }
             for a in alerts.drain(..) {
                 state::push_alert(r, a);
             }
@@ -833,9 +850,16 @@ async fn switch_to(
     match tokio::task::spawn_blocking(move || cc.select(POOL, &t2)).await? {
         Ok(()) => {
             let pending = Some(target_id) != g.selected_upstream_id;
+            // 归因的时间戳门比较的是「日志行时间戳 vs. `select` 返回时刻」，所以这里**当场**
+            // 再取一次时钟，而不是用传进来的轮首 `now` —— 探测那一段少则几秒、多则几十秒，
+            // 用轮首时刻记账等于把门开在切换之前（2026-09-18 第三次裁决 ①，写法对齐
+            // `slots::put_slot`）。`last_switch_at` 是另一回事（巡检的 60 秒限速游标，
+            // 按轮首计），不跟着改。
+            let switched_at = ctx.host.now();
             state::update(&ctx.runtime, move |r| {
                 r.selected_upstream_id = Some(target_id);
                 r.last_switch_at = Some(fmt_rfc3339(now));
+                state::note_pool_switch(r, POOL, switched_at);
                 r.selected_pending_persist = pending;
                 if manual_dropped.is_some() {
                     r.manual_selected_id = None;
@@ -1061,11 +1085,12 @@ async fn select_with_retry(
 ///   （`drive_slots` 重 PUT；规则 6a 发现 now 与运行时不一致就重放）；
 /// - `back_rounds` 一律不清：它记的是「本槽自己健康了几轮」，与 relay 重启无关。
 pub async fn replay_after_restart(ctx: &DaemonCtx, c: Arc<dyn Clash>) -> ReplayOutcome {
-    let (g, view) = {
+    let (g, view, all_pools) = {
         let s = ctx.store.read().await;
         (
             state::group_of(&s),
             bui_schema::slots::sorted(&s.residential),
+            state::all_pool_selectors(&s),
         )
     };
     // 池无效时 relay 里一个 selector 都没有（fail-open 直连），没什么可重放
@@ -1079,7 +1104,13 @@ pub async fn replay_after_restart(ctx: &DaemonCtx, c: Arc<dyn Clash>) -> ReplayO
         .filter_map(|i| i.slot)
         .map(|(idx, _, _)| idx.to_string())
         .collect();
+    // relay 重启 = **全池**切换：每个 selector 的 `now` 都已经回落到配置里的 default
+    // （不开 `cache_file`，spec §14 裁决 1）。所以在重放之前就先把全池的时间戳门记上
+    // （2026-09-18 第三次裁决 ③）—— 重放不了 / 重放失败的那些池同样换过值，不能只记
+    // 重放成功的那几个。重放成功的池下面还会用 `select` 返回后的时刻再记一次（更晚、更准）。
+    let restarted_at = ctx.host.now();
     state::update(&ctx.runtime, move |r| {
+        state::note_pools_switch(r, &all_pools, restarted_at);
         for (k, s) in r.slots.iter_mut() {
             if !kept.contains(k) {
                 s.current_upstream_id = None;
@@ -1123,7 +1154,13 @@ pub async fn replay_after_restart(ctx: &DaemonCtx, c: Arc<dyn Clash>) -> ReplayO
         .join("；");
     let alert = (!out.failed.is_empty())
         .then(|| format!("{REPLAY_FAIL_ALERT}（{failed_list}），下一轮巡检兜底"));
+    let now = ctx.host.now();
+    let switched: Vec<String> = done.iter().map(|i| i.selector.clone()).collect();
     state::update(&ctx.runtime, move |r| {
+        // 重放成功的每个 selector 的 `now` 都换了值 ⇒ 归因的时间戳门要记
+        for sel in &switched {
+            state::note_pool_switch(r, sel, now);
+        }
         for (idx, seen, landed) in slot_writes {
             if let Some(e) = r.slots.get_mut(&idx.to_string()) {
                 if e.current_upstream_id == seen {
@@ -1187,6 +1224,7 @@ pub async fn select_manual(ctx: &DaemonCtx, c: Arc<dyn Clash>, id: Uuid) -> anyh
         r.selected_upstream_id = Some(id);
         r.manual_selected_id = Some(id);
         r.last_switch_at = Some(fmt_rfc3339(now));
+        state::note_pool_switch(r, POOL, now);
         r.selected_pending_persist = pending;
     })
     .await;
@@ -1424,6 +1462,15 @@ mod tests {
             out.notes
         );
         assert_eq!(clash.selected(POOL).as_deref(), Some("resi-2"));
+        // 重放不写 `last_switch_at`（不吃 60 秒限速），但 selector 的 `now` 确实换了值 ⇒
+        // 归因的时间戳门照记
+        let r = rstate::read(&c.runtime).await;
+        assert_eq!(r.last_switch_at, None, "重放不吃切换限速");
+        assert!(
+            r.pool_switch_at.contains_key(POOL),
+            "{:?}",
+            r.pool_switch_at
+        );
         let r = rstate::read(&c.runtime).await;
         assert_eq!(
             r.selected_upstream_id,
@@ -1461,6 +1508,160 @@ mod tests {
             rstate::read(&c.runtime).await.selected_upstream_id,
             Some(Uuid::from_u128(1)),
             "规则 6b：runtime 的选择失效 ⇒ 用 Clash 的 now 重新初始化"
+        );
+    }
+
+    /// 槽位版的 [`ctx`]：期望态里带 `n` 个槽（槽 i → 第 i 条上游），
+    /// 于是 `state::all_pool_selectors` 会给出「全局池 + 每槽一个」的完整表
+    async fn ctx_with_slots(
+        d: &tempfile::TempDir,
+        prios: &[u32],
+        n: u16,
+    ) -> (DaemonCtx, Arc<FakeHost>) {
+        let mut s = sample_state();
+        let g = s.residential.groups.get_mut("default").unwrap();
+        g.enabled = true;
+        g.upstreams = prios
+            .iter()
+            .enumerate()
+            .map(|(i, p)| upstream(i as u128 + 1, *p))
+            .collect();
+        g.selected_upstream_id = g.upstreams.first().map(|u| u.id);
+        g.blacklist.auto.clear();
+        s.residential.slots = (0..n)
+            .map(|i| Slot {
+                index: i,
+                upstream_id: Uuid::from_u128(i as u128 + 1),
+            })
+            .collect();
+        let host = Arc::new(FakeHost::new());
+        let c = DaemonCtx {
+            store: Store::create(d.path().join("state.json"), s).await.unwrap(),
+            runtime: Runtime::load(d.path().join("runtime.json")),
+            bus: EventBus::new(),
+            host: host.clone(),
+            paths: bui_schema::paths::Paths::default_server(),
+        };
+        (c, host)
+    }
+
+    /// 一条**路径 B** 形态的 relay 错误行（reason 里没有 `dial tcp` 地址 ⇒ 只能靠池的 `now`）
+    fn pool_line(pool: &str) -> crate::modules::residential::journal::RelaySubject {
+        crate::modules::residential::journal::RelaySubject::Pool {
+            pool: pool.to_string(),
+            dial_addr: None,
+        }
+    }
+
+    /// 2026-09-18 第三次裁决 ①：切换时刻必须取自 `Clash::select` **成功返回之后**。
+    /// 轮首取 `now` → 探完全池（真机上几秒到几十秒）→ 才发 PUT，用轮首那个时刻记账
+    /// 等于把归因的时间戳门开在切换之前：这中间产生的路径 B 行会被记到**新**成员头上。
+    /// 这里让假时钟在 `select` 里往前走，断言记下的时刻 ≥ select 时刻。
+    #[tokio::test]
+    async fn the_pool_switch_timestamp_is_taken_after_the_select_returns() {
+        let d = tempfile::tempdir().unwrap();
+        let (c, host) = ctx(&d, &[10, 20]).await;
+        let clash = Arc::new(FakeClash::new(Some("resi-1")));
+        // 「发 PUT → select 返回」之间走掉 30 秒（真机上是探测那一段的耗时）
+        clash.with(|i| i.advance_on_select = Some((host.clone(), 30)));
+        let p = by_host(&["isp1.example.net"], &[]);
+        check_once(&c, p.clone(), clash.clone()).await.unwrap();
+        host.advance(120);
+        let head = host.now(); // 第二轮的轮首时刻
+        let out = check_once(&c, p, clash.clone()).await.unwrap();
+        assert_eq!(out.switched_to.as_deref(), Some("resi-2"), "这一轮必须真切");
+        let at = parse_rfc3339(rstate::read(&c.runtime).await.pool_switch_at[POOL].as_str())
+            .expect("记下的时刻要能解析");
+        assert_eq!(
+            at,
+            head + time::Duration::seconds(30),
+            "记的是 select 返回时刻，不是轮首的 now"
+        );
+
+        // 轮首之后、select 之前产生的那条路径 B 行必须被门丢弃：它说的是**老**成员
+        let r = rstate::read(&c.runtime).await;
+        let now = clash::pool_now(&(clash.clone() as Arc<dyn Clash>), &[POOL.to_string()]).await;
+        let g = rstate::group_of(&*c.store.read().await);
+        assert_eq!(
+            clash::attribute(
+                &g,
+                &pool_line(POOL),
+                &now,
+                &r.pool_switch_at,
+                head + time::Duration::seconds(10),
+                crate::modules::residential::SWITCH_ATTRIB_GRACE_SECS,
+            ),
+            clash::Attrib::Switched,
+            "轮首之后 select 之前的行落在切换宽限窗里，本批证据放弃"
+        );
+    }
+
+    /// 规则 6a 的重放同样要在 `select` 成功之后取时刻（裁决 ①），而且它检测到的是
+    /// **relay 刚重启过** ⇒ 每个池 selector 的 `now` 都回落到了配置里的 default，
+    /// 时间戳门要对**全池**记一次，不是只记全局那一个（裁决 ③）。
+    ///
+    /// 两个槽的 `current_upstream_id` **先坐实成本槽自己的 IP**：这一轮 `drive_slots`
+    /// 于是一个 PUT 都不发（`current == target`），槽池的那两笔时刻只可能来自 6a 这条
+    /// 分支。不坐实的话 `put_slot` 自己会把它们记上，这条用例就钉不住 6a 的全池记账。
+    #[tokio::test]
+    async fn the_rule_6a_replay_stamps_every_pool_after_the_select() {
+        let d = tempfile::tempdir().unwrap();
+        let (c, host) = ctx_with_slots(&d, &[10, 20], 2).await;
+        rstate::update(&c.runtime, |r| {
+            r.selected_upstream_id = Some(Uuid::from_u128(2));
+            for i in 0..2u16 {
+                r.slots
+                    .entry(i.to_string())
+                    .or_default()
+                    .current_upstream_id = Some(Uuid::from_u128(i as u128 + 1));
+            }
+        })
+        .await;
+        let clash = Arc::new(FakeClash::new(Some("resi-1")));
+        clash.with(|i| i.advance_on_select = Some((host.clone(), 30)));
+        let head = host.now();
+        let out = check_once(&c, by_host(&[], &[]), clash.clone())
+            .await
+            .unwrap();
+        assert_eq!(out.replayed_to.as_deref(), Some("resi-2"));
+        let r = rstate::read(&c.runtime).await;
+        // 全局池 + 两个槽池都要记上（relay 重启 = 全池切换）
+        assert_eq!(
+            r.pool_switch_at.keys().cloned().collect::<Vec<_>>(),
+            vec![
+                POOL.to_string(),
+                super::super::slot_selector(0),
+                super::super::slot_selector(1)
+            ]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>(),
+            "relay 重启 = 全池切换，每个池都要记"
+        );
+        let at = parse_rfc3339(r.pool_switch_at[POOL].as_str()).unwrap();
+        assert!(
+            at >= head + time::Duration::seconds(30),
+            "全局池记的是重放 select 返回之后的时刻：{at} < {head}+30s"
+        );
+    }
+
+    /// 裁决 ③：`Event::RelayRestarted` 那条来路也要对**全池**记一次 —— 重放不了 /
+    /// 重放失败的池同样被打回了 default，只记「重放成功的那几个」会漏掉它们。
+    #[tokio::test]
+    async fn a_relay_restart_stamps_every_pool_even_when_nothing_is_replayed() {
+        let d = tempfile::tempdir().unwrap();
+        let (c, _host) = ctx_with_slots(&d, &[10, 20], 2).await;
+        // runtime 一片空白 ⇒ `replay_plan` 没什么可重放
+        let clash = Arc::new(FakeClash::new(None));
+        let out = replay_after_restart(&c, clash.clone()).await;
+        assert!(out.replayed.is_empty(), "本来就没什么可重放");
+        let r = rstate::read(&c.runtime).await;
+        assert_eq!(
+            r.pool_switch_at.len(),
+            3,
+            "全局池 + 两个槽池：{:?}",
+            r.pool_switch_at
         );
     }
 
@@ -1513,6 +1714,12 @@ mod tests {
         assert_eq!(out.healthy, vec!["resi-2"]);
         assert_eq!(out.switched_to.as_deref(), Some("resi-2"));
         let r = rstate::read(&c.runtime).await;
+        // 巡检切换同样要记切换时刻（归因的时间戳门）
+        assert!(
+            r.pool_switch_at.contains_key(POOL),
+            "{:?}",
+            r.pool_switch_at
+        );
         // 告警以 uuid 为键（url-N 是位置名，删条目后会被新条目复用），文案用 host:port
         let msg = r
             .upstream_alerts
@@ -2507,9 +2714,14 @@ mod tests {
             .unwrap();
         assert_eq!(tag, "resi-2");
         assert_eq!(clash.selected(POOL).as_deref(), Some("resi-2"));
+        let r = rstate::read(&c.runtime).await;
+        assert_eq!(r.selected_upstream_id, Some(Uuid::from_u128(2)));
+        // 手动切也是切：归因的时间戳门要记（`state::note_pool_switch`）
         assert_eq!(
-            rstate::read(&c.runtime).await.selected_upstream_id,
-            Some(Uuid::from_u128(2))
+            r.pool_switch_at.get(POOL).map(String::as_str),
+            Some("2026-09-11T00:00:00Z"),
+            "{:?}",
+            r.pool_switch_at
         );
         // 不写 state ⇒ 不重启 relay
         assert_eq!(
@@ -2681,6 +2893,20 @@ mod tests {
         );
         assert_eq!(clash.peek("slot-0-pool"), None, "用本槽 IP 的槽不发 PUT");
         let r = rstate::read(&c.runtime).await;
+        // 重放也换了每个 selector 的 `now` ⇒ 归因的时间戳门要记（`state::note_pool_switch`）：
+        // 重放之前打出来的那批错误行说的是 relay 重启前的成员，不能按重放后的 `now` 归因。
+        // **2026-09-18 第三次裁决 ③：relay 重启 = 全池切换** —— 没重放的槽 0 同样被打回了
+        // 配置里的 default（它的 `now` 也换了值），所以它也要记一笔，不能只记重放成功的那几个
+        assert_eq!(
+            r.pool_switch_at.keys().cloned().collect::<Vec<_>>(),
+            vec![
+                POOL.to_string(),
+                "slot-0-pool".to_string(),
+                "slot-1-pool".to_string(),
+                "slot-2-pool".to_string()
+            ],
+            "relay 重启 = 全池切换：四个 selector 各记一笔"
+        );
         assert_eq!(r.slots["1"].current_upstream_id, Some(Uuid::from_u128(3)));
         assert_eq!(r.slots["1"].back_rounds, 1);
         assert_eq!(r.slots["2"].current_upstream_id, Some(Uuid::from_u128(1)));

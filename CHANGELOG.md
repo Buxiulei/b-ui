@@ -8,6 +8,28 @@
 `version` 的唯一来源是根 `Cargo.toml` 的 `[workspace.package] version`；改版本必须同时在本文件加一段，`scripts/release/check-version.sh` 会在 CI 里卡住不一致（它只认 `## [<version>]` 这个标题，日期不参与校验）。
 未发布的版本日期写「未发布」，由主理人打 tag 发版时替换成当天日期（UTC）。
 
+## [4.1.2] - 未发布
+
+**只改守护进程的日志解析与归因，不动渲染器、不动订阅、不动内核配置**：升级前后三种订阅的字节不变。
+这一段改变守护进程的**行为**——自动黑名单会开始按真实的被拒行学习（此前两台生产机上它一条都没学到过），
+所以先发 rc、在 bwg-rick 上观察，观察项见下。
+
+### 修复
+- **relay 的错误行归因修好：三个哨兵签名与自动黑名单学习不再全盲**。sing-box 的 `route/conn.go` 只把「路由选中的那个出站」的类型与 tag 写进 `open connection to … using outbound/<kind>[<tag>]`；而 4.1 的 relay 路由规则一律指向 group（每槽 `slot-<i>-pool`、DNS 与 global 模式 `resi-pool`），group 的 `NewConnection` 又把**自己**当 dialer 传下去 ⇒ **生产日志里成员 tag `resi-<n>` 一个字都不出现**。`sentinel::signature::parse_relay` 与 `residential::journal::parse_line` 原先都只认 `http|socks[resi-N]`，于是：`relay_upstream_error` / `relay_upstream_auth_failed` / `relay_google_blocked` 三个签名**再也不会被真实流量触发**（两台生产机 14 天窗口采样：2026-09-15 拓扑切换之后成员形状 0 条），住宅上游故障只剩每 120 秒一轮的主动体检兜底；自动黑名单的候选学习**一条都没学到过**（量最大的 `socks5: request rejected, code=2` 两机合计每天几千到两万多条，全部漏掉），只剩每日 12 个域名的固定探针集。现在两处解析都认池形状（`selector` / `urltest`，且 tag 必须是已知池名 `resi-pool` / `slot-<i>-pool`），「哪个上游」由调用方归因：先用错误原文里 `dial tcp <ip>:<port>` 的上游地址（零 I/O、唯一命中才算），不成再问一次该池的 Clash API `now`（每轮每池只查一次）。归不了因的行一律丢弃、只记 debug，**绝不猜**。
+- **归因的竞态防护改成时间戳门**：`now` 说的是「此刻选中谁」，日志行说的是「刚才是谁失败了」，真实暴露窗口是「日志行产生 → 归因读 `now`」**整段**（哨兵每 2 秒一轮、黑名单每 300 秒一轮），切换落在其中就会把一条老成员的失败记到新成员头上。relay 的两级池都是 `type: selector`（没有 urltest 自动切换）、**b-ui 是唯一的切换者**，所以每次 `Clash::select` 成功返回都把时刻记进 `runtime.json` 的 `residential.pool_switch_at`（巡检切换、借用、切回、手动 pin、手动选、relay 重启后的重放，全部写），归因时按**这条日志行自己的时间戳**判：`ts < 该池最近一次切换 + 宽限窗` 的行整批丢弃、连去抖计数都不进，等下次复发。宽限窗按这条行的原因分两档：**超时类**（`i/o timeout` / `deadline exceeded` / `connection refused` / `no route to host` / `network is unreachable`，与哨兵 `relay_upstream_error` 同一组既有标记）取 **30 秒**，其余取 **1 秒** —— 超时类的行是「选中成员 → 拨 → 等超时 → 才写日志」，日志时刻比路由决策晚一个完整超时，1 秒的门拦不住它，切换前选中的老成员的失败会被记到新成员头上。只有经 `now` 归因的那条路径（路径 B）受门约束；`dial tcp <上游地址>` 那条（路径 A）写的就是当时实际拨的那个上游，不受影响。
+- **`dial tcp …` 开头的错误行不再进黑名单候选**：它说的是「连不上上游自己」（上游级，哨兵的 `relay_upstream_error` 预案的地盘），不是「上游拒绝了这个域名」。黑名单解析的兜底拒绝关键词表里有 `refused`，正好会把 `dial tcp <ip>:<port>: connect: connection refused` 误判成目标级拒绝，把一次上游抖动学成一条域名规则。
+- **黑名单那一侧改读 `journalctl -o json`**（原先是 `-o cat`，没有时间戳）：解析复用哨兵那条路的 `sys::parse_journal_json`，游标仍取 `--show-cursor` 的末行，行为不变。
+- **`authentication required` 补进凭据失效的判据**：这是 sing-box http 出站鉴权失败的形状（一台生产机 14 天窗口 2650 条），此前落不进任何一支、静默丢弃。`unexpected EOF`（同窗口 17217 条）语义含糊（上游掐的还是目标掐的分不出来），**仍然不归类**，两边都不学，已由用例钉住。
+- 哨兵与黑名单新增 / 改写的 relay 用例改喂新夹具 `fixtures_relay`，不再拿手工拼的成员形状当唯一用例——正是那批「测试全绿、生产全瞎」的用例让这个盲区潜伏了下来。夹具以两台生产机 14 天窗口采到的形状为主（已脱敏），**每条常量都逐条标了出处**：【采样】是逐字原文，【转写】是「前半截采到、尾巴采样命令折叠掉了 / 成员形状采到、池形态按 sing-box 源码推」，【合成】是采样里没有的形状与有意造的负例——避免夹具文件自己变成新一轮「看着像真机原文」的想当然。同批补了两条采样里有量、此前没人钉过的形状：`socks5: incorrect user name or password` 的成员形态（一台 308 条）与 `malformed MIME header line …`（两台合计 109 条，两边都判不归类）。
+- **relay 重启的两条运维来路补齐重放与记账**：看门狗的「进程在、2080 不 listen 连续两轮 ⇒ 重启」与 `POST /api/services/b-ui-relay/restart|start` 现在都广播 `Event::RelayRestarted`（与重启 `hysteria-residential` 那条口径一致），让 `health::replay_after_restart` 立刻把借用 / pin 中的槽 selector 重放回去 —— 此前这两条只盖时间戳、把重放交给 `drive_slots` 下一轮兜底，最坏 2 分钟里所有借槽的用户都被打回自己那条坏 IP，且没有任何告警说明原因。同时这两条盖的全池时间戳改取 `systemctl` **返回之后**的时刻：`systemctl` 是阻塞的，selector 回落 default 就发生在「发命令 → 返回」那段里，记发命令之前等于把门开在事件之前、那段里产生的老成员失败行会漏过门。
+- **「没记账的切换」兜底不再是哑巴**：某池的 `now` 与 `runtime` 记的该池当前选择对不上时，除了丢弃本批路径 B 证据并补记时刻，现在还按池累计连续批次（`runtime.json` 的 `residential.unstable_streak`，稳定一批即清零）。同一池**连续 3 批**不稳定 ⇒ 记一条住宅告警（点名是哪个池，面板可见）并发一次 `Event::RelayRestarted` 触发该池的重放收敛，之后 1 小时冷却内不重复。一次 relay 重启 / 一次手动 `curl` 造成的单批不稳定仍然静默（那是兜底正常工作的样子）；连续 3 批说明有一条落账路径在持续漏写、或有人在外面反复动 selector，那时归因已经在长期丢证据。
+
+### 发布后观察项（bwg-rick）
+- **本分支让 `relay_upstream_error` / `relay_upstream_auth_failed` / `relay_google_blocked` 三个签名第一次在生产真正触发**，而 `sentinel/resi.rs::on_upstream_error` 对带外快探的三值结论里，`Verdict::Unconfirmed`（预算内没能确认可用）是**按不可用处置**的：`mark_unhealthy` + `slots::borrow_now`，与确认不可用同一条路径（2026-09-14 裁决，理由写在那条分支的注释里）。所以一次误归因的代价**不只是白探一次**：它可能把一条健康上游判成不健康并把槽借走，恢复要等巡检连续 2 轮探通 + 攒满 3 轮切回防抖（约 8 分钟）。头几天要盯：`bui incidents` 里这三个签名的事件频率、`借用 / 切槽`事件的密度，以及被判不健康的上游在体检里是否其实一直是好的。
+- **`journal::collect` 改 `-o json` 之后，游标失效那一轮的 stdout 会比 `-o cat` 涨 5–10 倍**：`-o cat` 每行只有 `MESSAGE`，`-o json` 每行还带 `__CURSOR` / `__REALTIME_TIMESTAMP` / `_SYSTEMD_UNIT` 等字段；而游标失效（日志轮转 / relay 重启）那一轮走的是 `--since -25h`，**一次性读进内存**再逐行解析。relay 单元每天几千到两万多条拒绝行，25 小时那一轮按每行约 1 KB 估是几十 MB 的一次性峰值。头几天盯 `systemctl show b-ui -p MemoryCurrent`（守护进程重启后的第一轮、以及每日 04:00 前后各看一次）有没有异常尖峰；真撞上再改成流式读 / 缩短回看窗口。
+- `bui incidents` 里是否开始出现 `relay_upstream_error` / `relay_upstream_auth_failed` 一类事件，以及借用是否合理（探测通过 = Info、不动作是正常的）。
+- `runtime.json` 的 `candidates` 是否开始累计，以及每日 04:00 之后 `state.blacklist.auto` 有没有出现**不该被拉黑**的域名。确认路径是「硬拒 + 直连可达、间隔 ≥10 分钟连续 2 次」，误学一次不会直接生效，但要盯住第一批被确认的条目。
+
 ## [4.1.1] - 2026-09-18
 
 只含运维脚本、面板文案与文档，**不改服务端与客户端行为**；已在 4.1.0 上的机器不需要为它升级。
