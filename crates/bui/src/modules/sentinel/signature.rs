@@ -5,7 +5,7 @@
 //! 的 REP 拒绝）归黑名单（spec §5.4，`residential::journal::parse_line`），哨兵不碰；哨兵只认
 //! 「**上游本身**不能用了」（连不上 / 超时 / 凭据失效）与「上游对 Google 搜索整域拒绝」。
 
-use crate::modules::residential::MEMBER_PREFIX;
+use crate::modules::residential::journal::{subject_of, RelaySubject};
 
 /// 签名。`id()` 是事件、面板与演练脚本共用的稳定字符串。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -94,7 +94,8 @@ impl Sig {
         }
     }
 
-    /// 对象是住宅上游的 relay 签名：日志里是成员 tag，调用方当场换成 uuid
+    /// 对象是住宅上游的 relay 签名：日志里是成员 tag 或**池 tag**（生产只有后者），
+    /// 调用方按 [`Match::relay`] 当场归因成 uuid，归不了因的丢弃
     pub fn on_upstream(self) -> bool {
         matches!(
             self,
@@ -176,11 +177,17 @@ impl Action {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Match {
     pub sig: Sig,
-    /// 对象在日志里的名字：relay 是成员 tag（`resi-2`，**位置键**，调用方当场经
-    /// `clash::id_of_tag` 换成 uuid 再计数）、caddy 是域名、xray gRPC 是 `xray`、其余是单元名
+    /// 对象在日志里的名字：relay 是成员 tag（`resi-2`）或池 tag（`slot-<i>-pool` /
+    /// `resi-pool`，生产只有这种）、caddy 是域名、xray gRPC 是 `xray`、其余是单元名。
+    /// relay 那几个签名的**计数键不是它**，见 [`Match::relay`]
     pub subject: String,
     /// 先脱敏再截断的原文，进事件的 `sample`
     pub detail: String,
+    /// relay 签名专用的**待归因中间态**：成员 tag 直接换 uuid，池 tag 要调用方按
+    /// `dial tcp` 地址（零 I/O）或 Clash API 的 `now` 换 uuid。非 relay 签名 `None`。
+    /// 解析层保持纯函数（本模块的承诺），归因的那点 I/O 全在 `run::tick` 与
+    /// `residential::blacklist::learn_from_journal` 里
+    pub relay: Option<RelaySubject>,
 }
 
 /// `sample` 的长度上限（按字符）
@@ -188,11 +195,15 @@ pub const DETAIL_MAX: usize = 240;
 /// `restart counter is at N` 里 N 到多少算崩溃循环
 pub const CRASH_LOOP_RESTARTS: u32 = 5;
 pub const BIND_IN_USE: &str = "bind: address already in use";
-/// 「凭据失效」（reason 小写）。`407` 只认状态行开头，免得把端口 4070 当成 407
-const AUTH_MARKERS: [&str; 3] = [
+/// 「凭据失效」（reason 小写）。`407` 只认状态行开头，免得把端口 4070 当成 407。
+/// `authentication required` 是 sing-box http 出站的形状（rick 14 天窗口 2650 条），
+/// 2026-09-18 补进来；这一行里的 `unexpected status:` 一定是**上游**对 CONNECT 的应答
+/// （目标站点的状态码根本不出现在这条 error 里），所以按凭据失效判不会误伤目标
+const AUTH_MARKERS: [&str; 4] = [
     "proxy authentication",
     "incorrect user name or password",
     "username/password authentication failed",
+    "authentication required",
 ];
 /// 「这条用户同步的失败项说的是切门」的判据：[`crate::modules::residential::clash::ClashError`]
 /// 两种文案各取不带占位符的那一截（`Unreachable` / `Rejected`）
@@ -241,6 +252,22 @@ fn hit(sig: Sig, subject: &str, message: &str) -> Match {
         sig,
         subject: subject.to_string(),
         detail: detail_of(message),
+        relay: None,
+    }
+}
+
+/// relay 的匹配结果：`subject` 只是日志里那个名字（成员 tag 或池 tag），真正的计数键由
+/// 调用方归因出来（[`Match::relay`]）
+fn relay_hit(sig: Sig, subject: &RelaySubject, message: &str) -> Match {
+    let name = match subject {
+        RelaySubject::Member(tag) => tag,
+        RelaySubject::Pool { pool, .. } => pool,
+    };
+    Match {
+        sig,
+        subject: name.clone(),
+        detail: detail_of(message),
+        relay: Some(subject.clone()),
     }
 }
 
@@ -264,20 +291,26 @@ pub fn is_crash_loop(message: &str) -> bool {
         .is_some_and(|n| n >= CRASH_LOOP_RESTARTS)
 }
 
-/// `open connection to <host>:<port> using outbound/<http|socks>[resi-N]: <reason>` →
-/// `(tag, host, port, reason)`；不是住宅出站的行一律 `None`（与 `residential::journal::parse_line`
-/// 同一形态，但那边只收「上游拒绝了目标」）。
-pub fn parse_relay(message: &str) -> Option<(String, String, u16, String)> {
+/// `open connection to <host>:<port> using outbound/<kind>[<tag>]: <reason>` →
+/// `(主体, host, port, reason)`；不是住宅出站的行一律 `None`。
+///
+/// kind / tag 的白名单与 [`subject_of`] 共用一份（`residential::journal` 那边是黑名单学习，
+/// 只收「上游拒绝了目标」那一类 reason）：成员形状 `http|socks[resi-N]` 与池形状
+/// `selector|urltest[resi-pool|slot-<i>-pool]` 都认。**生产只剩池形状**（RESEARCH §3：
+/// 路由规则指向 group，sing-box 的 ERROR 只挂 group 自己的 tag），所以只认成员形状 =
+/// 全盲。「池 → 哪个上游」有 I/O，归调用方（`run::tick`）。
+pub fn parse_relay(message: &str) -> Option<(RelaySubject, String, u16, String)> {
     let rest = message.split_once("open connection to ")?.1;
     let (target, rest) = rest.split_once(" using outbound/")?;
     let (host, port) = target.rsplit_once(':')?;
     let port: u16 = port.parse().ok()?;
     let (kind_tag, reason) = rest.split_once("]: ")?;
     let (kind, tag) = kind_tag.split_once('[')?;
-    if !matches!(kind, "http" | "socks") || !tag.starts_with(MEMBER_PREFIX) || host.is_empty() {
+    if host.is_empty() {
         return None;
     }
-    Some((tag.to_string(), host.to_string(), port, reason.to_string()))
+    let subject = subject_of(kind, tag, reason)?;
+    Some((subject, host.to_string(), port, reason.to_string()))
 }
 
 /// 住宅 HY2 入站（sing-box）那一路：拨不通 relay 的槽入站 ⇒ 签名；`deny` 的拒绝行 ⇒ 噪音。
@@ -344,9 +377,9 @@ fn is_google_search_host(host: &str) -> bool {
 }
 
 fn relay(message: &str) -> Option<Match> {
-    let (tag, host, _port, reason) = parse_relay(message)?;
+    let (subject, host, _port, reason) = parse_relay(message)?;
     let lower = reason.to_ascii_lowercase();
-    let m = |sig: Sig| Some(hit(sig, &tag, message));
+    let m = |sig: Sig| Some(relay_hit(sig, &subject, message));
     // ① 凭据失效：整条上游都不能用（调研 §D），与连不上同一个预案、各自的门槛
     if lower.starts_with("unexpected status: 407") || AUTH_MARKERS.iter().any(|k| lower.contains(k))
     {
@@ -397,6 +430,7 @@ fn caddy(message: &str) -> Option<Match> {
         sig: Sig::CaddyCertFailed,
         subject: domain,
         detail: detail_of(message),
+        relay: None,
     })
 }
 
@@ -419,7 +453,9 @@ fn xray_grpc(message: &str) -> Option<Match> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::modules::sentinel::fixtures_hy2_resi as fx;
+    use crate::modules::residential::journal::RelaySubject;
+    use crate::modules::sentinel::fixtures_hy2_resi as fx_hy2;
+    use crate::modules::sentinel::fixtures_relay as fx;
     use pretty_assertions::assert_eq;
 
     /// relay 行的真实前缀（R13 §6.2 夹具，bwg-tizi `journalctl -u b-ui-relay -o cat`，色码已剥）
@@ -562,6 +598,156 @@ mod tests {
         assert_eq!(sig_of("b-ui-relay", &gateway), None, "5xx 不是封 Google");
     }
 
+    /// **本次修法的核心**：生产的 relay 路由规则一律指向 group，sing-box 只把 group 自己的
+    /// tag 写进 ERROR 行（RESEARCH §3），成员 tag 一个字都不出现。三个 relay 签名原先只认
+    /// `http|socks[resi-N]` ⇒ 两台真机 2026-09-15 之后一条都没再命中过。
+    #[test]
+    fn pool_shaped_relay_lines_are_classified_with_the_pool_as_subject() {
+        for (l, sig, pool) in [
+            (
+                fx::POOL_SELECTOR_SOCKS_AUTH,
+                Sig::RelayUpstreamAuthFailed,
+                "slot-0-pool",
+            ),
+            (
+                fx::POOL_SELECTOR_AUTH_REQUIRED,
+                Sig::RelayUpstreamAuthFailed,
+                "slot-1-pool",
+            ),
+            (
+                fx::POOL_SELECTOR_407,
+                Sig::RelayUpstreamAuthFailed,
+                "slot-6-pool",
+            ),
+            (
+                fx::POOL_SELECTOR_403_SERP,
+                Sig::RelayGoogleBlocked,
+                "slot-7-pool",
+            ),
+            (
+                fx::POOL_SELECTOR_DEADLINE,
+                Sig::RelayUpstreamError,
+                "slot-4-pool",
+            ),
+            (
+                fx::POOL_SELECTOR_DIAL_REFUSED,
+                Sig::RelayUpstreamError,
+                "slot-2-pool",
+            ),
+            (
+                fx::POOL_URLTEST_DIAL_TIMEOUT,
+                Sig::RelayUpstreamError,
+                "resi-pool",
+            ),
+            (
+                fx::POOL_SELECTOR_DIAL_NO_ROUTE,
+                Sig::RelayUpstreamError,
+                "slot-0-pool",
+            ),
+        ] {
+            assert_eq!(
+                sig_of("b-ui-relay", l),
+                Some((sig, pool.to_string())),
+                "{l}"
+            );
+        }
+    }
+
+    /// 归因层要用的中间态：池 tag + `dial tcp` 里那个**上游自己**的地址（只有 TCP 拨号失败
+    /// 才有；协议层失败的 reason 一点线索都没有，只能问 Clash 的 `now`）
+    #[test]
+    fn the_dial_address_rides_along_for_the_attribution_layer() {
+        let relay_of = |l: &str| classify("b-ui-relay", l).and_then(|m| m.relay);
+        assert_eq!(
+            relay_of(fx::POOL_SELECTOR_DIAL_REFUSED),
+            Some(RelaySubject::Pool {
+                pool: "slot-2-pool".into(),
+                dial_addr: Some(("203.0.113.7".into(), 10007)),
+            })
+        );
+        assert_eq!(
+            relay_of(fx::POOL_SELECTOR_DEADLINE),
+            Some(RelaySubject::Pool {
+                pool: "slot-4-pool".into(),
+                dial_addr: None,
+            }),
+            "握手阶段的失败不带上游地址"
+        );
+        assert_eq!(
+            relay_of(fx::POOL_SELECTOR_DIAL_NO_ROUTE),
+            Some(RelaySubject::Pool {
+                pool: "slot-0-pool".into(),
+                dial_addr: None,
+            }),
+            "`dial tcp: lookup …` 没有 host:port"
+        );
+        assert_eq!(
+            relay_of(fx::MEMBER_DIAL_REFUSED),
+            Some(RelaySubject::Member("resi-2".into())),
+            "成员形状直接就是位置键，不需要归因"
+        );
+    }
+
+    /// 成员形状（2026-09-15 之前的真机形状）仍然双认
+    #[test]
+    fn member_shaped_relay_lines_are_still_classified() {
+        for (l, sig, tag) in [
+            (fx::MEMBER_DIAL_REFUSED, Sig::RelayUpstreamError, "resi-2"),
+            (fx::MEMBER_DEADLINE, Sig::RelayUpstreamError, "resi-3"),
+            (fx::MEMBER_407, Sig::RelayUpstreamAuthFailed, "resi-1"),
+            (
+                fx::MEMBER_AUTH_REQUIRED,
+                Sig::RelayUpstreamAuthFailed,
+                "resi-1",
+            ),
+        ] {
+            assert_eq!(sig_of("b-ui-relay", l), Some((sig, tag.to_string())), "{l}");
+        }
+    }
+
+    /// group 类 kind 的 tag **必须**是已知池名，否则任何 group（住宅 HY2 的门、外部站点的
+    /// 出站组）都能冒充住宅池
+    #[test]
+    fn only_known_pool_tags_count_as_pools() {
+        for l in [
+            fx::POOL_TAG_OUT_OF_RANGE,
+            fx::GATE_SELECTOR,
+            fx::DIRECT_DIAL_TIMEOUT,
+        ] {
+            assert_eq!(sig_of("b-ui-relay", l), None, "{l}");
+        }
+    }
+
+    /// `unexpected EOF` 语义含糊（上游掐的还是目标掐的分不出来）⇒ **不归类**：
+    /// 既不当上游故障（会误借用），也不学进黑名单（会误拉黑）。真机每天上万条，
+    /// 归错一边的代价都很大
+    #[test]
+    fn an_unexpected_eof_is_never_classified() {
+        for l in [fx::MEMBER_UNEXPECTED_EOF, fx::POOL_SELECTOR_UNEXPECTED_EOF] {
+            assert_eq!(sig_of("b-ui-relay", l), None, "{l}");
+        }
+        // `context canceled` 是客户端自己断的，同样不归类
+        assert_eq!(
+            sig_of("b-ui-relay", fx::POOL_SELECTOR_CONTEXT_CANCELED),
+            None
+        );
+    }
+
+    /// 目标级拒绝（黑名单的地盘）在池形状下同样不许进哨兵
+    #[test]
+    fn target_side_rejections_stay_out_of_the_sentinel_in_pool_shape_too() {
+        for l in [
+            fx::POOL_SELECTOR_403,
+            fx::POOL_SELECTOR_502,
+            fx::POOL_SELECTOR_SOCKS_CODE2,
+            fx::POOL_URLTEST_SOCKS_CODE2,
+            fx::POOL_URLTEST_SOCKS_CODE4,
+            fx::POOL_SELECTOR_IP_TARGET_403,
+        ] {
+            assert_eq!(sig_of("b-ui-relay", l), None, "{l}");
+        }
+    }
+
     /// 鉴权签名的作用域缩成**仅直连**：住宅那一路 4.1 起是 sing-box 的静态凭据池、
     /// 没有 auth 段，鉴权失败也不打任何日志（auth 不命中走 masquerade）⇒ 签名失去对象
     #[test]
@@ -592,10 +778,10 @@ mod tests {
     #[test]
     fn crash_loops_and_bind_conflicts_still_cover_the_residential_unit() {
         assert_eq!(
-            sig_of("hysteria-residential", fx::BIND_IN_USE),
+            sig_of("hysteria-residential", fx_hy2::BIND_IN_USE),
             Some((Sig::KernelBindInUse, "hysteria-residential".into()))
         );
-        for l in [fx::CRASH_LOOP_A, fx::CRASH_LOOP_B] {
+        for l in [fx_hy2::CRASH_LOOP_A, fx_hy2::CRASH_LOOP_B] {
             assert_eq!(
                 sig_of("hysteria-residential", l),
                 Some((Sig::KernelCrashLoop, "hysteria-residential".into())),
@@ -611,10 +797,10 @@ mod tests {
         // 生产的门 selector 形态（`selector[gate-<id>]`，2026-09-18 真机）与 1.14.0 无门
         // 配置的成员出站形态（`socks[slot-<i>-out]`）都要认，TCP 与 UDP 各两条
         for l in [
-            fx::RELAY_DIAL_FAIL,
-            fx::RELAY_DIAL_FAIL_UDP,
-            fx::RELAY_DIAL_FAIL_SOCKS_FORM,
-            fx::RELAY_DIAL_FAIL_UDP_SOCKS_FORM,
+            fx_hy2::RELAY_DIAL_FAIL,
+            fx_hy2::RELAY_DIAL_FAIL_UDP,
+            fx_hy2::RELAY_DIAL_FAIL_SOCKS_FORM,
+            fx_hy2::RELAY_DIAL_FAIL_UDP_SOCKS_FORM,
         ] {
             assert_eq!(
                 sig_of("hysteria-residential", l),
@@ -625,9 +811,9 @@ mod tests {
         // deny 噪音（门 selector 拨 `127.0.0.1:1`、成员出站 `socks[deny]`、以及 INFO 前半条）
         // 一律 None：门在正常拒绝，不是故障
         for l in [
-            fx::DENY_NOISE,
-            fx::DENY_NOISE_SOCKS_FORM,
-            fx::DENY_NOISE_CONN,
+            fx_hy2::DENY_NOISE,
+            fx_hy2::DENY_NOISE_SOCKS_FORM,
+            fx_hy2::DENY_NOISE_CONN,
         ] {
             assert_eq!(
                 sig_of("hysteria-residential", l),
@@ -647,8 +833,8 @@ mod tests {
             Action::DelegateWatchdog
         );
         // 直连单元不跑 sing-box，也就没有槽出站；relay 自己的行归 relay 那张表
-        assert_eq!(sig_of("hysteria-server", fx::RELAY_DIAL_FAIL), None);
-        assert_eq!(sig_of("b-ui-relay", fx::RELAY_DIAL_FAIL), None);
+        assert_eq!(sig_of("hysteria-server", fx_hy2::RELAY_DIAL_FAIL), None);
+        assert_eq!(sig_of("b-ui-relay", fx_hy2::RELAY_DIAL_FAIL), None);
     }
 
     /// 判据里的两个出站 tag 就是渲染器产出的那两个：改了 `slot_out_tag` / `DENY_TAG`
@@ -741,15 +927,15 @@ mod tests {
     #[test]
     fn healthy_residential_log_lines_classify_to_none() {
         for l in [
-            fx::START_LINE,
-            fx::CONN_FROM,
-            fx::CONN_TO_USER,
-            fx::CONN_TO_USER_ZH,
-            fx::CONN_TO_USER_ZH_SPACE,
-            fx::CONN_TO_USER_UDP,
-            fx::SLOT_OUT_CONN,
-            fx::CLASH_API_LISTEN,
-            fx::V2RAY_API_LISTEN,
+            fx_hy2::START_LINE,
+            fx_hy2::CONN_FROM,
+            fx_hy2::CONN_TO_USER,
+            fx_hy2::CONN_TO_USER_ZH,
+            fx_hy2::CONN_TO_USER_ZH_SPACE,
+            fx_hy2::CONN_TO_USER_UDP,
+            fx_hy2::SLOT_OUT_CONN,
+            fx_hy2::CLASH_API_LISTEN,
+            fx_hy2::V2RAY_API_LISTEN,
         ] {
             assert_eq!(sig_of("hysteria-residential", l), None, "误报：{l}");
         }
@@ -761,7 +947,7 @@ mod tests {
     /// 忽略」钉死：将来若有人加一条泛 ERROR 签名把轮换中间态当异常报出来，本用例转红。
     #[test]
     fn cert_reload_churn_is_default_ignored_not_a_signature() {
-        for l in [fx::CERT_RELOAD_MISMATCH, fx::CERT_RELOADED] {
+        for l in [fx_hy2::CERT_RELOAD_MISMATCH, fx_hy2::CERT_RELOADED] {
             assert_eq!(
                 sig_of("hysteria-residential", l),
                 None,

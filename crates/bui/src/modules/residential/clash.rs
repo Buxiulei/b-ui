@@ -478,6 +478,85 @@ mod tests {
         );
     }
 
+    /// 路径 A：`dial tcp <ip>:<port>` 唯一命中才算，**绝不猜**
+    #[test]
+    fn the_dial_address_attributes_only_on_a_unique_hit() {
+        let mut g = group(2);
+        g.upstreams[0].host = "203.0.113.7".into();
+        assert_eq!(
+            id_of_dial_addr(&g, "203.0.113.7", 10007),
+            Some(Uuid::from_u128(1))
+        );
+        assert_eq!(id_of_dial_addr(&g, "203.0.113.7", 10008), None, "端口不对");
+        assert_eq!(
+            id_of_dial_addr(&g, "203.0.113.8", 10007),
+            None,
+            "池里没有这个地址；上游配的是域名时报错里是解析后的 IP，也走这一支（交给路径 B）"
+        );
+        // 同一个 IP:端口被两条凭据共用 ⇒ 分不清是哪条，不猜
+        g.upstreams[1].host = "203.0.113.7".into();
+        assert_eq!(id_of_dial_addr(&g, "203.0.113.7", 10007), None);
+    }
+
+    /// 归因：成员 tag 直接换；池先走路径 A 再走路径 B；两条都不成 ⇒ `None`
+    #[test]
+    fn subject_attribution_prefers_the_dial_address_over_the_clash_now() {
+        let mut g = group(2);
+        g.upstreams[1].host = "203.0.113.8".into();
+        let now: PoolNow = [("slot-0-pool".to_string(), Some("resi-1".to_string()))]
+            .into_iter()
+            .collect();
+        let pool = |dial: Option<(&str, u16)>| RelaySubject::Pool {
+            pool: "slot-0-pool".into(),
+            dial_addr: dial.map(|(h, p)| (h.to_string(), p)),
+        };
+        assert_eq!(
+            id_of_subject(&g, &RelaySubject::Member("resi-2".into()), &now),
+            Some(Uuid::from_u128(2))
+        );
+        assert_eq!(
+            id_of_subject(&g, &pool(Some(("203.0.113.8", 10007))), &now),
+            Some(Uuid::from_u128(2)),
+            "路径 A 说的是『刚才拨的是谁』，优先于 `now` 的『此刻选中谁』"
+        );
+        assert_eq!(
+            id_of_subject(&g, &pool(None), &now),
+            Some(Uuid::from_u128(1)),
+            "没有地址线索 ⇒ 路径 B"
+        );
+        let empty = PoolNow::new();
+        assert_eq!(id_of_subject(&g, &pool(None), &empty), None, "两条都不成");
+        assert_eq!(
+            id_of_subject(&g, &RelaySubject::Member("resi-9".into()), &now),
+            None
+        );
+    }
+
+    /// 双读竞态防护：两次 `now` 不一致的池要被点名（调用方按池整批丢弃）
+    #[test]
+    fn a_pool_whose_now_moved_between_the_two_reads_is_unstable() {
+        let at = |p: &str, t: Option<&str>| (p.to_string(), t.map(str::to_string));
+        let before: PoolNow = [at("slot-0-pool", Some("resi-1")), at("resi-pool", None)]
+            .into_iter()
+            .collect();
+        let after: PoolNow = [at("slot-0-pool", Some("resi-2")), at("resi-pool", None)]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            unstable_pools(&before, &after),
+            ["slot-0-pool".to_string()].into_iter().collect()
+        );
+        assert!(unstable_pools(&before, &before).is_empty());
+        // 第二次读不到（relay 正在重启）也算变了：不能拿第一次的读数硬归因
+        let gone: PoolNow = [at("slot-0-pool", None), at("resi-pool", None)]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            unstable_pools(&before, &gone),
+            ["slot-0-pool".to_string()].into_iter().collect()
+        );
+    }
+
     #[test]
     fn a_refusing_fake_clash_answers_like_a_relay_that_is_not_listening_yet() {
         let c = FakeClash::new(Some("resi-1"));

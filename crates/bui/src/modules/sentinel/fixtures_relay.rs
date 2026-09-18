@@ -70,6 +70,11 @@ pub const POOL_SELECTOR_CONTEXT_CANCELED: &str =
 pub const POOL_SELECTOR_DEADLINE: &str =
     line!("www.example.com:443 using outbound/selector[slot-4-pool]: context deadline exceeded");
 
+/// [`POOL_SELECTOR_DEADLINE`] 的 `slot-1-pool` 变体：`pool_ctx` 的假机器只有 0/1/2 三个槽，
+/// 哨兵的归因用例要打在真存在的槽上
+pub const POOL_SELECTOR_DEADLINE_SLOT1: &str =
+    line!("www.example.com:443 using outbound/selector[slot-1-pool]: context deadline exceeded");
+
 /// `unexpected EOF`（rick 17217 条，成员形状采到；这里是池形态）。语义含糊——可能是上游
 /// 掐了连接、也可能是目标掐的——**不归类**（既不进哨兵也不进黑名单），本常量就是钉这件事的
 pub const POOL_SELECTOR_UNEXPECTED_EOF: &str =
