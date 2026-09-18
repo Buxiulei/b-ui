@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # B-UI Linux 客户端（bui-c）首次安装。装完之后的升级走 `bui-c update`。
 #   curl -fsSL https://<面板域名>/packages/bui-c-install.sh | sudo bash
-#   sudo BUI_C_SOURCE=https://<面板域名>/packages bash bui-c-install.sh
+#   已是 root 用户则去掉 sudo：curl -fsSL https://<面板域名>/packages/bui-c-install.sh | bash
+#   手动运行仓库副本、要覆盖制品源：sudo BUI_C_SOURCE=https://<面板域名>/packages bash bui-c-install.sh
 set -euo pipefail
 
 # 制品源按序试三条，取到 manifest 的那条也用来取二进制：
