@@ -415,6 +415,25 @@ pub fn remove_alerts_with_prefix(r: &mut ResiRuntime, prefix: &str) -> usize {
     before - r.alerts.len()
 }
 
+/// 按**精确文案**撤一条全局告警：某条路径恢复了，认领它自己写的那一句。返回是否真的撤了
+pub fn clear_alert(r: &mut ResiRuntime, msg: &str) -> bool {
+    let before = r.alerts.len();
+    r.alerts.retain(|a| a != msg);
+    before != r.alerts.len()
+}
+
+/// [`clear_alert`] 并落盘——**只在真有这条时写**：巡检每轮都会调，每次 `update` 都是
+/// tmp + fsync + rename（同 [`purge_stale_alerts`]）。
+pub async fn clear_alert_persisted(runtime: &Runtime, msg: &str) {
+    if !read(runtime).await.alerts.iter().any(|a| a == msg) {
+        return;
+    }
+    update(runtime, |r| {
+        clear_alert(r, msg);
+    })
+    .await;
+}
+
 /// 记一条上游级告警（同一 uuid 只留最新一条）。`msg` 里请写 `host:port`，别写 `url-N`
 pub fn set_upstream_alert(r: &mut ResiRuntime, id: Uuid, msg: impl Into<String>) {
     r.upstream_alerts.insert(id, msg.into());
@@ -1097,6 +1116,39 @@ mod tests {
         .await;
         let r = purge_stale_alerts(&runtime, &g).await;
         assert_eq!(r.alerts.len(), 3, "全局告警不受影响：{:?}", r.alerts);
+    }
+
+    /// 按精确文案撤一条全局告警：别的告警不动，没有这条时不写盘（每轮巡检都会调）。
+    #[tokio::test]
+    async fn clearing_a_global_alert_is_exact_and_does_not_write_when_absent() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("runtime.json");
+        let runtime = Runtime::load(&p);
+        const MSG: &str = "全部住宅上游探测不达标，出口已降级但未切换";
+
+        clear_alert_persisted(&runtime, MSG).await;
+        assert!(!p.exists(), "无变化不写盘");
+
+        update(&runtime, |r| {
+            push_alert(r, "切换住宅出口到 resi-2 失败：connection refused");
+            push_alert(r, MSG);
+            push_alert(r, format!("{MSG}（前缀相同的别的文案）"));
+        })
+        .await;
+        clear_alert_persisted(&runtime, MSG).await;
+        let r = read(&runtime).await;
+        assert_eq!(
+            r.alerts,
+            vec![
+                format!("{MSG}（前缀相同的别的文案）"),
+                "切换住宅出口到 resi-2 失败：connection refused".to_string(),
+            ],
+            "只撤精确匹配的那一条"
+        );
+
+        std::fs::remove_file(&p).unwrap();
+        clear_alert_persisted(&runtime, MSG).await;
+        assert!(!p.exists(), "已经没有这条了，再调一次不写盘");
     }
 
     #[test]
