@@ -855,7 +855,7 @@ pub async fn watch_loop(ctx: DaemonCtx) {
     loop {
         tick.tick().await;
         if let Err(e) = check_once(&ctx).await {
-            tracing::warn!(error = %e, "watchdog 一轮检查失败");
+            tracing::warn!(error = %e, "watchdog 一轮检查失败：{e}");
         }
     }
 }

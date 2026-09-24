@@ -347,7 +347,7 @@ pub async fn selfcheck_loop(
                             tokio::task::spawn_blocking(move || h.write_file(&path, &bytes, 0o644))
                                 .await;
                     }
-                    Err(e) => tracing::warn!(error = %e, "manifest 序列化失败"),
+                    Err(e) => tracing::warn!(error = %e, "manifest 序列化失败：{e}"),
                 }
                 // 「有没有新的 bui」不能只比版本号：rc 通道下 rc1 / rc2 / 正式版的 Cargo 版本号
                 // 都是同一个，同版本重建要靠 sha256 才认得出（`kernels::bui_build_differs`）。
@@ -402,7 +402,7 @@ pub async fn selfcheck_loop(
             Ok(Err(e)) if crate::kernels::is_not_found(&e) => {
                 tracing::info!(error = %e, "每日自检：还没有可用的 manifest，跳过本轮")
             }
-            Ok(Err(e)) => tracing::warn!(error = %e, "每日自检拉取 manifest 失败"),
+            Ok(Err(e)) => tracing::warn!(error = %e, "每日自检拉取 manifest 失败：{e}"),
             Err(e) => tracing::warn!(error = %e, "每日自检任务 panic"),
         }
         tokio::time::sleep(std::time::Duration::from_secs(SELFCHECK_INTERVAL_SECS)).await;
@@ -453,7 +453,7 @@ pub async fn backfill_public_ip(store: &Store, host: Arc<dyn Host>) {
     let value = ip.clone();
     match store.update(|s| s.node.public_ip = value).await {
         Ok(_) => tracing::info!(public_ip = %ip, "已回填 state.node.public_ip"),
-        Err(e) => tracing::warn!(error = %e, "回填 state.node.public_ip 写盘失败"),
+        Err(e) => tracing::warn!(error = %e, "回填 state.node.public_ip 写盘失败：{e}"),
     }
 }
 
@@ -502,21 +502,21 @@ pub async fn run(paths: Paths, host: Arc<dyn Host>) -> anyhow::Result<()> {
             crate::modules::residential::slots::mark_xray_rules_dirty(&runtime).await;
         }
         Ok(_) => {}
-        Err(e) => tracing::warn!(error = %e, "住宅槽位迁移失败，本次启动按单槽渲染"),
+        Err(e) => tracing::warn!(error = %e, "住宅槽位迁移失败，本次启动按单槽渲染：{e}"),
     }
     // spec §4.3 + §3.1：把住宅 HY2 凭据池拉到期望态（先治悬空指针、再给没有凭据的人补发）。
     // **必须在下面那轮启动对账之前**：`hy2-residential.json` 的凭据、门与 `auth_user` 规则
     // 全从池里渲染，池空就等于全体住宅 HY2 用户没有节点、没有门。
     // 幂等、零变更不写盘；失败只告警（下次启动重试，本轮按现有池渲染）。
     if let Err(e) = crate::modules::residential::slots::migrate_hy2_pool_on_start(&ctx).await {
-        tracing::warn!(error = %e, "住宅 HY2 凭据池迁移失败，下次启动重试");
+        tracing::warn!(error = %e, "住宅 HY2 凭据池迁移失败，下次启动重试：{e}");
     }
     // 2026-09-14 裁决：升级上来的老 `state.json` 里的用户没有随机订阅 token，启动时补齐，
     // 并给他们手里那条「用户名链接」开宽限期。幂等、零变更不写盘，所以无条件跑一次；
     // 失败只告警、下次启动重试——写盘失败时挡住启动只会让面板与四个订阅端点一起停摆。
     if let Err(e) = crate::modules::panel::users::backfill_sub_tokens(&ctx.store, host.now()).await
     {
-        tracing::warn!(error = %e, "补随机订阅 token 失败，下次启动重试");
+        tracing::warn!(error = %e, "补随机订阅 token 失败，下次启动重试：{e}");
     }
     // 启动时先对账一次，再拉起后台任务
     let mut startup_restarted_hy2_resi = false;
@@ -531,7 +531,7 @@ pub async fn run(paths: Paths, host: Arc<dyn Host>) -> anyhow::Result<()> {
             // 报告已落盘，这时才允许重启自己（B5）
             finish_self_restart(&ctx, &r, true).await;
         }
-        Err(e) => tracing::error!(error = %e, "启动对账失败"),
+        Err(e) => tracing::error!(error = %e, "启动对账失败：{e}"),
     }
     // spec §5.6 + D7：对账刚把新的 xray-config.json 落盘，这时收敛住宅槽路由 ——
     // 走 RoutingService gRPC 增删受影响用户的规则，**不重启 xray**；只有 gRPC 失败且
@@ -587,7 +587,7 @@ pub async fn run(paths: Paths, host: Arc<dyn Host>) -> anyhow::Result<()> {
             while let Some(force) = rx.recv().await {
                 match reconcile_from_ctx(&ctx2, &mods2, f2.clone(), force, false).await {
                     Ok(r) => finish_self_restart(&ctx2, &r, true).await,
-                    Err(e) => tracing::error!(error = %e, "对账失败"),
+                    Err(e) => tracing::error!(error = %e, "对账失败：{e}"),
                 }
                 // spec §5.6 + D7：同上，对账落盘之后收敛住宅槽路由（gRPC 增删，不重启）
                 crate::modules::residential::slots::converge_xray(&ctx2, panel2.xray()).await;

@@ -148,7 +148,7 @@ impl Runtime {
         let path = path.into();
         let data = match std::fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-                tracing::warn!(error = %e, path = %path.display(), "runtime.json 解析失败，按空白重建");
+                tracing::warn!(error = %e, path = %path.display(), "runtime.json 解析失败，按空白重建：{e}");
                 RuntimeData::default()
             }),
             Err(_) => RuntimeData::default(),
@@ -189,15 +189,38 @@ impl Runtime {
                     Ok(Err(e)) => tracing::warn!(
                         path = %self.0.path.display(),
                         error = format!("{e:#}"),
-                        "runtime.json 落盘失败（忽略）"
+                        "runtime.json 落盘失败（忽略）：{e:#}"
                     ),
-                    Err(e) => tracing::warn!(error = %e, "runtime.json 落盘任务 panic（忽略）"),
+                    Err(e) => match join_error_kind(&e) {
+                        // SIGTERM 退出时 runtime 关停会取消还没跑完的 blocking 任务，不是故障
+                        JoinFailure::Cancelled => {
+                            tracing::debug!("runtime.json 落盘任务被取消（进程退出中）")
+                        }
+                        JoinFailure::Panic => {
+                            tracing::warn!(error = %e, "runtime.json 落盘任务 panic（忽略）：{e}")
+                        }
+                    },
                     Ok(Ok(())) => {}
                 }
             }
-            Err(e) => tracing::warn!(error = %e, "runtime.json 序列化失败（忽略）"),
+            Err(e) => tracing::warn!(error = %e, "runtime.json 序列化失败（忽略）：{e}"),
         }
         snapshot
+    }
+}
+
+/// `spawn_blocking(..).await` 的 `JoinError` 只有这两种来源。
+#[derive(Debug, PartialEq, Eq)]
+enum JoinFailure {
+    Cancelled,
+    Panic,
+}
+
+fn join_error_kind(e: &tokio::task::JoinError) -> JoinFailure {
+    if e.is_cancelled() {
+        JoinFailure::Cancelled
+    } else {
+        JoinFailure::Panic
     }
 }
 
@@ -205,6 +228,21 @@ impl Runtime {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    /// 退出中被取消的落盘任务与真的 panic 走不同的日志级别：SIGTERM 退出时那条
+    /// 「落盘任务 panic」WARN 其实是 cancelled，不该让人去查 panic。
+    #[tokio::test]
+    async fn join_error_kind_tells_cancelled_from_panic() {
+        let panicked = tokio::task::spawn_blocking(|| panic!("boom"))
+            .await
+            .unwrap_err();
+        assert_eq!(join_error_kind(&panicked), JoinFailure::Panic);
+
+        let pending = tokio::spawn(std::future::pending::<()>());
+        pending.abort();
+        let cancelled = pending.await.unwrap_err();
+        assert_eq!(join_error_kind(&cancelled), JoinFailure::Cancelled);
+    }
 
     #[tokio::test]
     async fn missing_file_loads_defaults() {

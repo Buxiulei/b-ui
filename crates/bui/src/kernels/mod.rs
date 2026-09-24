@@ -315,7 +315,7 @@ impl HttpFetcher {
         // 函数补一个脱敏地址——journal 与上抛给 Task 15/16/17 的错误串都只可能见到 `***:***`。
         let resp = client.get(url).send().map_err(|e| {
             let e = e.without_url();
-            tracing::warn!(url = %crate::redact::url_credentials(url), error = %e, "下载失败");
+            tracing::warn!(url = %crate::redact::url_credentials(url), error = %e, "下载失败：{e}");
             anyhow::Error::new(e)
                 .context(format!("下载 {} 失败", crate::redact::url_credentials(url)))
         })?;

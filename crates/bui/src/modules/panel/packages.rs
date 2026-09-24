@@ -203,7 +203,7 @@ pub async fn cache_loop(ctx: DaemonCtx, shared: Arc<Shared>, fetcher: Arc<dyn Fe
                     tracing::warn!(note = %n, "客户端包缓存提示");
                 }
                 for e in &r.errors {
-                    tracing::warn!(error = %e, "客户端包缓存失败项");
+                    tracing::warn!(error = %e, "客户端包缓存失败项：{e}");
                 }
                 if !r.downloaded.is_empty() {
                     tracing::info!(files = ?r.downloaded, "客户端包缓存已更新");

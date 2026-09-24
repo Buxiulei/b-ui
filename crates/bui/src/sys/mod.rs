@@ -103,6 +103,10 @@ pub trait Host: Send + Sync {
     /// 载荷不进 argv（`ps` 会泄露）也不进日志：`nft -f -` 的规则集、`curl -K -` 的代理凭据
     /// 都走这一条。`ops` 里记的仍是 `run:<program> <args>`，stdin 单独记账。
     fn run_stdin(&self, program: &str, args: &[&str], stdin: &str) -> Result<CmdOut>;
+    /// 读日志专用：`journalctl <args>`，真机上经 [`isolated_journalctl_argv`] 放进临时单元，
+    /// systemd-run 自身不可用时回落直接执行。返回值语义与 `run("journalctl", args)` 相同
+    /// （退出码 / stdout / stderr 都是 journalctl 的）；假主机记账也同形：`run:journalctl <args>`。
+    fn run_journalctl(&self, args: &[&str]) -> Result<CmdOut>;
     fn which(&self, program: &str) -> bool;
     fn systemd_daemon_reload(&self) -> Result<()>;
     fn systemd(&self, verb: &str, unit: &str) -> Result<CmdOut>;
@@ -189,6 +193,59 @@ pub fn journal_args(units: &[String], from: &JournalFrom) -> Vec<String> {
         }
     }
     v
+}
+
+/// journalctl 临时单元的内存上限：只兜住它冷读 journal 时的页缓存（实测单次 36–49 MB）。
+pub const JOURNAL_UNIT_MEMORY_MAX: &str = "MemoryMax=128M";
+
+/// 把一次 `journalctl <args>` 包成 `systemd-run --wait --pipe … journalctl <args>` 的完整 argv
+/// （`argv[0]` 是 `systemd-run`）。
+///
+/// 为什么：journalctl 是 b-ui 的子进程、在 `b-ui.service` 的 cgroup 里，它 mmap 的 journal 页
+/// 首次触达就记到 b-ui 头上，累积到 `MemoryMax=200M` 后守护进程每次分配都在上限处回收
+/// （2026-09-24 bwg-tizi 实测 `file` 201 MB / `anon` 3.8 MB）。放进临时单元后页缓存记在
+/// 那个单元名下，单元回收时归到上级 slice。
+///
+/// 为什么是临时 **service** 而不是 `--scope`：scope 没有 exec 上下文、不收 `LogLevelMax=`，
+/// PID 1 每起一个 scope 都往 journal 写一行 info 级的「Started bui-journal-….scope」——
+/// 哨兵每 2 秒读一次，一天 4 万多行，写进的正是我们要读的那份 journal。service 带
+/// `LogLevelMax=warning` 时成功的一次一行都不写（开发机 systemd 255 实测），失败时只剩
+/// 一行「Failed with result」。`--wait --pipe` 让 systemd-run 把 stdin/stdout/stderr 直接交给
+/// journalctl 并以它的退出码退出，`--quiet` 去掉 systemd-run 自己的提示行，`--collect` 让
+/// 失败的单元也被回收。service 由 PID 1 起、不继承 b-ui 的环境，所以 locale 要用 `-E` 再钉一次
+/// （同 `real.rs::command` 的理由：错误文案是判据）。
+pub fn isolated_journalctl_argv(unit: &str, args: &[&str]) -> Vec<String> {
+    let mut v: Vec<String> = ["systemd-run", "--wait", "--pipe", "--quiet", "--collect"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    v.push(format!("--unit={unit}"));
+    for p in [JOURNAL_UNIT_MEMORY_MAX, "LogLevelMax=warning"] {
+        v.push("-p".into());
+        v.push(p.into());
+    }
+    for e in ["LC_ALL=C", "LANGUAGE=C"] {
+        v.push("-E".into());
+        v.push(e.into());
+    }
+    v.push("journalctl".into());
+    v.extend(args.iter().map(|a| a.to_string()));
+    v
+}
+
+/// 这次非零退出是不是 **systemd-run 自己**没起来（没连上 PID 1、选项/属性不认、单元重名、
+/// 找不到 journalctl）——是则调用方回落成直接执行 journalctl。journalctl 自己的失败（游标失效
+/// 「Failed to seek to cursor」）不算。误判也不伤语义：回落只是再直接读一次，只读、幂等。
+pub fn is_systemd_run_failure(out: &CmdOut) -> bool {
+    const OWN: [&str; 6] = [
+        "transient service",
+        "systemd-run:",
+        "Unknown assignment",
+        "Failed to connect to bus",
+        "Failed to create bus connection",
+        "Failed to find executable",
+    ];
+    !out.ok() && OWN.iter().any(|m| out.stderr.contains(m))
 }
 
 /// journald 的 JSON 字段值 → 文本。字段里含不可打印字节（sing-box 的 ANSI 色码就是 ESC）时，
@@ -485,6 +542,69 @@ mod tests {
             since[since.len() - 2..].to_vec(),
             vec!["--since".to_string(), format!("@{}", j0().unix_timestamp())],
             "systemd.time(7) 的 @<unix 秒> 写法，与时区无关"
+        );
+    }
+
+    /// journalctl 放进临时 service 单元：页缓存记到那个单元名下（回收后归到上级 slice），
+    /// 不再记到 `b-ui.service` 的 `MemoryMax=200M` 头上。原参数原样接在 `journalctl` 后面。
+    /// 用 service 而不是 `--scope`：scope 不收 `LogLevelMax=`，PID 1 每起一个 scope 就往
+    /// journal 写一行「Started …scope」，哨兵每 2 秒读一次 ⇒ 每天 4 万多行。
+    #[test]
+    fn isolated_journalctl_argv_wraps_the_original_args_in_a_transient_unit() {
+        let units = vec!["xray".to_string()];
+        let args = journal_args(&units, &JournalFrom::Cursor("s=abc;i=9".into()));
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let argv = isolated_journalctl_argv("bui-journal-42-7", &refs);
+        assert_eq!(
+            argv[..5].to_vec(),
+            ["systemd-run", "--wait", "--pipe", "--quiet", "--collect"].map(String::from)
+        );
+        let j = argv
+            .iter()
+            .position(|a| a == "journalctl")
+            .expect("要有 journalctl");
+        let opts = &argv[..j];
+        for want in [
+            "--unit=bui-journal-42-7",
+            "MemoryMax=128M",
+            "LogLevelMax=warning",
+            "LC_ALL=C",
+            "LANGUAGE=C",
+        ] {
+            assert!(opts.contains(&want.to_string()), "{want}：{argv:?}");
+        }
+        let p = opts.iter().position(|a| a == "MemoryMax=128M").unwrap();
+        assert_eq!(opts[p - 1], "-p");
+        assert_eq!(argv[j + 1..].to_vec(), args, "journalctl 的参数原样");
+    }
+
+    /// 只有 systemd-run **自己**失败才回落直接执行；journalctl 的非零退出（游标失效）原样
+    /// 交给调用方——`--wait --pipe` 下退出码与 stderr 就是 journalctl 的。
+    /// stderr 取自 systemd 255 在开发机上的实测（`LC_ALL=C`）。
+    #[test]
+    fn only_systemd_run_own_failures_trigger_the_direct_fallback() {
+        let fail = |stderr: &str| CmdOut::failure(1, stderr);
+        for own in [
+            "Failed to start transient service unit: Connection timed out",
+            "Failed to start transient service unit: Unit bui-journal-1-2.service already exists.",
+            "systemd-run: unrecognized option '--collect'",
+            "Unknown assignment: LogLevelMax=warning",
+            "Failed to connect to bus: No such file or directory",
+            "Failed to create bus connection: No such file or directory",
+            "Failed to find executable journalctl: No such file or directory",
+        ] {
+            assert!(is_systemd_run_failure(&fail(own)), "{own}");
+        }
+        for journal in [
+            "Failed to seek to cursor: Invalid argument",
+            "No journal files were found.",
+            "",
+        ] {
+            assert!(!is_systemd_run_failure(&fail(journal)), "{journal}");
+        }
+        assert!(
+            !is_systemd_run_failure(&CmdOut::success("")),
+            "成功的一次不回落"
         );
     }
 

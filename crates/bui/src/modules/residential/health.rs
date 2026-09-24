@@ -552,6 +552,11 @@ pub async fn check_round(
         .iter()
         .filter_map(|id| clash::tag_of(&g, *id))
         .collect();
+    // 规则 7 那句「全部不达标」的清除路径：放在这里而不是规则 7 之后，因为当前出口健康时
+    // 规则 6c 会提前 return，走不到规则 7 后面。无这条告警时不写盘
+    if !healthy.is_empty() {
+        state::clear_alert_persisted(&ctx.runtime, ALL_UNHEALTHY_ALERT).await;
+    }
 
     // spec §5.6：按槽驱动各自的 selector。放在 healthy 算完、全局切换判定之前 ——
     // 它与全局 selector 的决策彼此独立（D8），而且不管全局这一轮切不切，
@@ -716,11 +721,7 @@ pub async fn check_round(
         out.notes.push(format!(
             "全部上游探测不达标，保持当前出口 {sel_tag}（降级总比乱切好）"
         ));
-        persist_alerts(
-            ctx,
-            &["全部住宅上游探测不达标，出口已降级但未切换".to_string()],
-        )
-        .await;
+        persist_alerts(ctx, &[ALL_UNHEALTHY_ALERT.to_string()]).await;
         return Ok(out);
     }
 
@@ -934,7 +935,7 @@ pub async fn health_loop(ctx: DaemonCtx, p: Arc<dyn Prober>, c: Arc<dyn Clash>) 
     loop {
         tick.tick().await;
         if let Err(e) = check_once(&ctx, p.clone(), c.clone()).await {
-            tracing::warn!(error = %e, "住宅巡检一轮失败");
+            tracing::warn!(error = %e, "住宅巡检一轮失败：{e}");
         }
     }
 }
@@ -946,6 +947,9 @@ const REPLAY_RETRY_FIRST: Duration = Duration::from_millis(300);
 /// [`super::CLASH_TIMEOUT_SECS`] 的超时，最后一次尝试本身的耗时不计在内
 pub const REPLAY_RETRY_BUDGET: Duration = Duration::from_secs(15);
 /// 重放最终失败那条告警的固定前缀：下一次重放全部成功时按它认领、清掉
+/// 规则 7 的全局告警。只要某一轮有健康成员就撤掉（[`check_round`] 算完 `healthy` 处）
+const ALL_UNHEALTHY_ALERT: &str = "全部住宅上游探测不达标，出口已降级但未切换";
+
 const REPLAY_FAIL_ALERT: &str = "relay 重启后重放住宅出口选择失败";
 
 /// [`replay_after_restart`] 的结论（给测试与日志）
@@ -1865,6 +1869,49 @@ mod tests {
             .alerts
             .iter()
             .any(|a| a.contains("全部")));
+    }
+
+    /// 「全部不达标」是全局告警，`purge_stale_alerts` 不清它；只要有一条上游恢复健康，
+    /// 这一轮就该把它撤掉（生产 bwg-rick 上它在全绿的 24h 采样下挂了 7 天）。
+    #[tokio::test]
+    async fn the_all_unhealthy_alert_clears_once_any_member_is_healthy_again() {
+        let d = tempfile::tempdir().unwrap();
+        let (c, host) = ctx(&d, &[10, 20]).await;
+        let clash = Arc::new(FakeClash::new(Some("resi-1")));
+        let all_down = by_host(&["isp1.example.net", "isp2.example.net"], &[]);
+        check_once(&c, all_down.clone(), clash.clone())
+            .await
+            .unwrap();
+        host.advance(120);
+        check_once(&c, all_down, clash.clone()).await.unwrap();
+        let alerts = rstate::read(&c.runtime).await.alerts;
+        assert!(
+            alerts.iter().any(|a| a == ALL_UNHEALTHY_ALERT),
+            "{alerts:?}"
+        );
+
+        // isp2 恢复：迟滞要连续几轮才回到健康，回到健康的那一轮告警必须消失
+        let one_up = by_host(&["isp1.example.net"], &[]);
+        let mut recovered = false;
+        for _ in 0..5 {
+            host.advance(120);
+            let out = check_once(&c, one_up.clone(), clash.clone()).await.unwrap();
+            let alerts = rstate::read(&c.runtime).await.alerts;
+            if out.healthy.is_empty() {
+                assert!(
+                    alerts.iter().any(|a| a == ALL_UNHEALTHY_ALERT),
+                    "{alerts:?}"
+                );
+            } else {
+                assert!(
+                    !alerts.iter().any(|a| a == ALL_UNHEALTHY_ALERT),
+                    "{alerts:?}"
+                );
+                recovered = true;
+                break;
+            }
+        }
+        assert!(recovered, "isp2 连续探通后必须回到健康");
     }
 
     #[tokio::test]

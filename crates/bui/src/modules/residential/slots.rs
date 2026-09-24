@@ -308,7 +308,7 @@ pub async fn reroll_idle_hy2_secrets(ctx: &DaemonCtx) -> usize {
         })
         .await;
     if let Err(e) = r {
-        tracing::warn!(error = %e, "重随机空闲住宅 HY2 凭据写盘失败，下一轮对账重试");
+        tracing::warn!(error = %e, "重随机空闲住宅 HY2 凭据写盘失败，下一轮对账重试：{e}");
         return 0;
     }
     if rerolled > 0 {
@@ -413,7 +413,7 @@ pub async fn converge_xray(ctx: &DaemonCtx, xray: &dyn XrayApi) -> ConvergeOutco
             ConvergeOutcome::Applied(calls)
         }
         Err(e) => {
-            tracing::warn!(error = %e, "Xray RoutingService 收敛失败，看磁盘配置是否已落盘");
+            tracing::warn!(error = %e, "Xray RoutingService 收敛失败，看磁盘配置是否已落盘：{e}");
             restart_fallback(ctx, &want_hash, &e.to_string()).await
         }
     }

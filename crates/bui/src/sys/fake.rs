@@ -364,6 +364,11 @@ impl Host for FakeHost {
         Ok(CmdOut::success(""))
     }
 
+    /// 与 `run("journalctl", args)` 同形记账（`run:journalctl …`）：包临时单元是真机的事
+    fn run_journalctl(&self, args: &[&str]) -> Result<CmdOut> {
+        self.run("journalctl", args)
+    }
+
     fn run_stdin(&self, program: &str, args: &[&str], stdin: &str) -> Result<CmdOut> {
         let line = cmd_line(program, args);
         self.push_op(format!("run:{line}"));

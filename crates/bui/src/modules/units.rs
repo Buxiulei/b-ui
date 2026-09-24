@@ -10,7 +10,9 @@
 //! `ExecStartPre=…hy2-portjump-cleanup.sh` 换成内置子命令
 //! `ExecStartPre=-{bin}/bui hy2-prestart <该实例的配置>`；`xray` 与 `b-ui-relay`
 //! 补上 v3 缺的 `MemoryHigh/MemoryMax`；全部 `LimitNOFILE=1048576`，四个数据面单元 `Nice=-5`；
-//! `b-ui.service` 自身 `MemoryMax=200M`；不生成任何 timer。
+//! `b-ui.service` 自身 `MemoryMax=200M`（4.1.3 起守护进程读日志的 `journalctl` 经
+//! `Host::run_journalctl` 放进临时单元 `bui-journal-*.service` 运行，它冷读 journal 的页缓存
+//! 不再记到本单元头上，200M 现在只量守护进程自身）；不生成任何 timer。
 
 use crate::paths::{caddy_xdg, CLI_LINKS};
 use crate::reconcile::{Artifact, Module, RenderCtx, Unit, LEGACY_UNITS, MANAGED_UNITS};
