@@ -224,7 +224,7 @@ pub async fn poll_loop(ctx: DaemonCtx) {
         tokio::time::sleep(poll_interval(ready)).await;
         let domain = ctx.store.read().await.node.domain.clone();
         if let Err(e) = sync_once(&ctx, &domain).await {
-            tracing::warn!(error = %e, "兜底轮询的证书同步失败");
+            tracing::warn!(error = %e, "兜底轮询的证书同步失败：{e}");
         }
     }
 }
@@ -232,18 +232,18 @@ pub async fn poll_loop(ctx: DaemonCtx) {
 pub async fn watch_loop(ctx: DaemonCtx) {
     let domain = ctx.store.read().await.node.domain.clone();
     if let Err(e) = sync_once(&ctx, &domain).await {
-        tracing::warn!(error = %e, "启动时证书同步失败");
+        tracing::warn!(error = %e, "启动时证书同步失败：{e}");
     }
     let dir = crate::paths::caddy_data(&ctx.paths).join("certificates");
     // 全新装机时这个目录还不存在（Caddy 签到证书才建）；不先建出来，watches.add 会 ENOENT，
     // 整个监听退化成兜底轮询（B6）。目录在我们自己的 XDG 数据目录里，先建无害。
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        tracing::warn!(error = %e, dir = %dir.display(), "创建证书目录失败");
+        tracing::warn!(error = %e, dir = %dir.display(), "创建证书目录失败：{e}");
     }
     let mut watcher = match CertWatcher::open(&dir) {
         Ok(w) => Some(w),
         Err(e) => {
-            tracing::warn!(error = %e, dir = %dir.display(), "inotify 建立失败，只靠兜底轮询");
+            tracing::warn!(error = %e, dir = %dir.display(), "inotify 建立失败，只靠兜底轮询：{e}");
             None
         }
     };
@@ -266,7 +266,7 @@ pub async fn watch_loop(ctx: DaemonCtx) {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         let domain = ctx.store.read().await.node.domain.clone();
         if let Err(e) = sync_once(&ctx, &domain).await {
-            tracing::warn!(error = %e, "证书同步失败");
+            tracing::warn!(error = %e, "证书同步失败：{e}");
         }
     }
 }
@@ -309,7 +309,7 @@ impl CertWatcher {
         for d in walk_dirs(&self.root) {
             if !self.watched.contains(&d) {
                 if let Err(e) = self.add(&d) {
-                    tracing::warn!(error = %e, dir = %d.display(), "补加 watch 失败");
+                    tracing::warn!(error = %e, dir = %d.display(), "补加 watch 失败：{e}");
                 }
             }
         }

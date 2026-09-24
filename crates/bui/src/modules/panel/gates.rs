@@ -152,7 +152,7 @@ pub async fn converge(ctx: &DaemonCtx, shared: &Shared, blocked: &BTreeSet<Uuid>
 pub(super) async fn put_gate(shared: &Shared, cred_id: &str, tag: &str) {
     let gate = gate_tag(cred_id);
     if let Err(e) = shared.hy2resi().select(&gate, tag).await {
-        tracing::warn!(gate = %gate, tag, error = %e, "住宅 HY2 门位切换失败；门位收敛会补上");
+        tracing::warn!(gate = %gate, tag, error = %e, "住宅 HY2 门位切换失败；门位收敛会补上：{e}");
     }
 }
 

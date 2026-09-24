@@ -243,7 +243,7 @@ pub fn from_runtime(rt: &RuntimeData) -> ResiRuntime {
     match rt.extra.get(RUNTIME_KEY) {
         None => ResiRuntime::default(),
         Some(v) => serde_json::from_value(v.clone()).unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "runtime.json 的 residential 段解析失败，按空值重建");
+            tracing::warn!(error = %e, "runtime.json 的 residential 段解析失败，按空值重建：{e}");
             ResiRuntime::default()
         }),
     }

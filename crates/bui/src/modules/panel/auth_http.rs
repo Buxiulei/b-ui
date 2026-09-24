@@ -157,7 +157,7 @@ pub async fn serve(st: Arc<AuthHttp>) -> anyhow::Result<()> {
 /// 后台任务：绑定 + 服务，失败只记 error（不能让整个守护进程退出）。
 pub async fn serve_loop(st: Arc<AuthHttp>) {
     if let Err(e) = serve(st).await {
-        tracing::error!(error = %e, port = AUTH_HTTP_PORT, "http 鉴权监听失败");
+        tracing::error!(error = %e, port = AUTH_HTTP_PORT, "http 鉴权监听失败：{e}");
     }
 }
 

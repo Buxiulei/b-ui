@@ -934,7 +934,7 @@ pub async fn health_loop(ctx: DaemonCtx, p: Arc<dyn Prober>, c: Arc<dyn Clash>) 
     loop {
         tick.tick().await;
         if let Err(e) = check_once(&ctx, p.clone(), c.clone()).await {
-            tracing::warn!(error = %e, "住宅巡检一轮失败");
+            tracing::warn!(error = %e, "住宅巡检一轮失败：{e}");
         }
     }
 }

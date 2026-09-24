@@ -207,7 +207,7 @@ pub async fn login(State(app): State<AppState>, req: axum::extract::Request) -> 
         )
             .into_response(),
         Err(e) => {
-            tracing::error!(error = %e, "签发 JWT 失败");
+            tracing::error!(error = %e, "签发 JWT 失败：{e}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 axum::Json(serde_json::json!({"error": "Internal error"})),

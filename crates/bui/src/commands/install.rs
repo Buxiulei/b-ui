@@ -393,7 +393,7 @@ fn fetch_and_install_kernels(
                 error = %e,
                 url = %crate::redact::url_credentials(&url),
                 env = crate::kernels::MANIFEST_URL_ENV,
-                "拉取 manifest 失败，跳过内核安装（可用该环境变量覆盖地址）"
+                "拉取 manifest 失败，跳过内核安装（可用该环境变量覆盖地址）：{e}"
             );
             println!("{}", manifest_failure_notice(&url, &e.to_string()));
             return (url, None);
@@ -404,7 +404,7 @@ fn fetch_and_install_kernels(
         // 内容相同就不写：`a_second_install_changes_nothing` 要求第二次 install 零写入
         if host.read_file(&path).ok().flatten().as_deref() != Some(bytes.as_slice()) {
             if let Err(e) = host.write_file(&path, &bytes, 0o644) {
-                tracing::warn!(error = %e, "缓存 manifest 失败");
+                tracing::warn!(error = %e, "缓存 manifest 失败：{e}");
             }
         }
     }
@@ -437,7 +437,7 @@ fn fetch_and_install_kernels(
             &asset.url,
             &paths.bin_dir.join(name),
         ) {
-            tracing::warn!(kernel = name, error = %e, "内核安装失败");
+            tracing::warn!(kernel = name, error = %e, "内核安装失败：{e}");
         }
     }
     // 第 4 步：不齐就打印怎么补，但不中断（v3 机器上内核可能已在 PATH 里）

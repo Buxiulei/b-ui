@@ -944,6 +944,31 @@ mod tests {
         assert_eq!(sig_of("b-ui", "Clash API 不可达：connection refused"), None);
     }
 
+    /// 用户同步失败行把原因拼进了文案（`-o cat` 也看得见），哨兵仍按常量包含匹配认得出；
+    /// journald 那条路还会在后面再接一次 ` error=<F_ERROR>`，同样认得出。
+    #[test]
+    fn a_sync_failure_with_reason_in_message_is_still_recognized() {
+        use crate::modules::panel::users::{sync_failed_message, USER_SYNC_FAILED_LOG};
+        let reason = "住宅 HY2 门位读不到（GET /proxies）：Clash API 不可达：connection refused";
+        let msg = sync_failed_message(reason);
+        assert!(msg.starts_with(USER_SYNC_FAILED_LOG), "{msg}");
+        assert!(msg.contains(reason), "{msg}");
+        for line in [msg.clone(), format!("{msg} error={reason}")] {
+            assert_eq!(
+                sig_of("b-ui", &line),
+                Some((Sig::Hy2ResiGateSyncFailed, "b-ui".into())),
+                "{line}"
+            );
+        }
+        let xray = sync_failed_message(
+            "AddUser vless-direct 失败：code: 'The service is currently unavailable'",
+        );
+        assert_eq!(
+            sig_of("b-ui", &xray),
+            Some((Sig::XrayGrpcUnavailable, "xray".into()))
+        );
+    }
+
     /// 正常日志不许误报（启动行、成功连接三行、槽出站的正常拨号、两个管理面的监听行）
     #[test]
     fn healthy_residential_log_lines_classify_to_none() {

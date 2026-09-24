@@ -1187,7 +1187,7 @@ async fn post_add(
         let (c2, p2, id) = (ctx.clone(), d.prober.clone(), out.id);
         tokio::spawn(async move {
             if let Err(e) = check::run_and_store(&c2, p2, id).await {
-                tracing::warn!(error = %e, "新增上游后的体检失败");
+                tracing::warn!(error = %e, "新增上游后的体检失败：{e}");
             }
         });
     }
@@ -1483,7 +1483,7 @@ async fn post_check(
         let p = d.prober.clone();
         tokio::spawn(async move {
             if let Err(e) = check::run_and_store(&ctx, p, id).await {
-                tracing::warn!(error = %e, "体检失败");
+                tracing::warn!(error = %e, "体检失败：{e}");
             }
         });
     }

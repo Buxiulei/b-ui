@@ -822,9 +822,15 @@ pub async fn sync_loop(ctx: DaemonCtx, shared: Arc<Shared>) {
     }
 }
 
+/// 失败原因拼进文案：`tracing_journald` 把 `error` 字段写成独立的 `F_ERROR`，`journalctl -o cat`
+/// 只看得到 `MESSAGE`。常量打头不变——哨兵（`sentinel::signature::xray_grpc`）按包含匹配。
+pub fn sync_failed_message(e: impl std::fmt::Display) -> String {
+    format!("{USER_SYNC_FAILED_LOG}：{e}")
+}
+
 fn report(out: SyncOutcome) {
     for e in &out.errors {
-        tracing::warn!(error = %e, "{}", USER_SYNC_FAILED_LOG);
+        tracing::warn!(error = %e, "{}", sync_failed_message(e));
     }
     if out.snapshot_written || !out.added.is_empty() || !out.removed.is_empty() {
         tracing::info!(

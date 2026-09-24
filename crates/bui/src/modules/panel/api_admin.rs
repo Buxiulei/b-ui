@@ -456,7 +456,7 @@ async fn rotate_user(
     let ids = [u.user_id.to_string()];
     for port in ports {
         if let Err(e) = shared.hy2().kick(port, &ids).await {
-            tracing::warn!(port, error = %e, "轮换后踢下线失败（旧会话可能还在跑）");
+            tracing::warn!(port, error = %e, "轮换后踢下线失败（旧会话可能还在跑）：{e}");
         }
     }
     tracing::info!(user = %u.username, "已轮换订阅凭据并停用该用户的用户名链接");
@@ -567,7 +567,7 @@ async fn kick(State(app): State<AppState>, shared: Arc<Shared>, body: Bytes) -> 
     let mut all_ok = true;
     for port in ports {
         if let Err(e) = shared.hy2().kick(port, &ids).await {
-            tracing::warn!(port, error = %e, "kick 失败");
+            tracing::warn!(port, error = %e, "kick 失败：{e}");
             all_ok = false;
         }
     }

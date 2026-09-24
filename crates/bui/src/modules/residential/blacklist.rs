@@ -125,7 +125,7 @@ pub async fn learn_from_journal(ctx: &DaemonCtx, clash: Arc<dyn Clash>) -> anyho
         Ok(b) => b,
         Err(e) => {
             // 游标失效（日志轮转/重启）→ 丢掉游标，下一轮用 --since -25h 重来
-            tracing::warn!(error = %e, "journalctl 读取失败，重置游标");
+            tracing::warn!(error = %e, "journalctl 读取失败，重置游标：{e}");
             state::update(&ctx.runtime, |r| r.journal_cursor = None).await;
             return Ok(0);
         }
@@ -234,14 +234,14 @@ pub async fn journal_loop(ctx: DaemonCtx, p: Arc<dyn Prober>, c: Arc<dyn Clash>)
         // 做第 1 次确认，于是「间隔 ≥ CONFIRM_MIN_GAP_SECS、连续 CONFIRM_NEEDED 次」
         // 最快 10 分钟走完（第 1 轮 + t=600 秒那轮），而不是一天一次、要两天。
         if let Err(e) = learn_from_journal(&ctx, c.clone()).await {
-            tracing::warn!(error = %e, "黑名单候选学习失败");
+            tracing::warn!(error = %e, "黑名单候选学习失败：{e}");
         }
         match confirm_round(&ctx, p.clone()).await {
             Ok(n) if n > 0 => {
                 tracing::info!(promoted = n, "黑名单候选确认完毕，等 04:00 批量生效")
             }
             Ok(_) => {}
-            Err(e) => tracing::warn!(error = %e, "黑名单候选确认失败"),
+            Err(e) => tracing::warn!(error = %e, "黑名单候选确认失败：{e}"),
         }
     }
 }
@@ -654,7 +654,7 @@ pub async fn daily_loop(ctx: DaemonCtx, p: Arc<dyn Prober>, c: Arc<dyn Clash>) {
                 ports_learned = rep.ports_learned,
                 "住宅黑名单每日轮次完成"
             ),
-            Err(e) => tracing::warn!(error = %e, "住宅黑名单每日轮次失败"),
+            Err(e) => tracing::warn!(error = %e, "住宅黑名单每日轮次失败：{e}"),
         }
     }
 }

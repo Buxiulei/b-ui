@@ -148,7 +148,7 @@ impl Runtime {
         let path = path.into();
         let data = match std::fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-                tracing::warn!(error = %e, path = %path.display(), "runtime.json 解析失败，按空白重建");
+                tracing::warn!(error = %e, path = %path.display(), "runtime.json 解析失败，按空白重建：{e}");
                 RuntimeData::default()
             }),
             Err(_) => RuntimeData::default(),
@@ -189,7 +189,7 @@ impl Runtime {
                     Ok(Err(e)) => tracing::warn!(
                         path = %self.0.path.display(),
                         error = format!("{e:#}"),
-                        "runtime.json 落盘失败（忽略）"
+                        "runtime.json 落盘失败（忽略）：{e:#}"
                     ),
                     Err(e) => match join_error_kind(&e) {
                         // SIGTERM 退出时 runtime 关停会取消还没跑完的 blocking 任务，不是故障
@@ -197,13 +197,13 @@ impl Runtime {
                             tracing::debug!("runtime.json 落盘任务被取消（进程退出中）")
                         }
                         JoinFailure::Panic => {
-                            tracing::warn!(error = %e, "runtime.json 落盘任务 panic（忽略）")
+                            tracing::warn!(error = %e, "runtime.json 落盘任务 panic（忽略）：{e}")
                         }
                     },
                     Ok(Ok(())) => {}
                 }
             }
-            Err(e) => tracing::warn!(error = %e, "runtime.json 序列化失败（忽略）"),
+            Err(e) => tracing::warn!(error = %e, "runtime.json 序列化失败（忽略）：{e}"),
         }
         snapshot
     }

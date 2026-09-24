@@ -141,7 +141,7 @@ pub async fn kick_residential(shared: &Shared, targets: &[ResiKickTarget]) -> us
     for t in targets {
         let gate = gate_tag(&t.cred_id);
         if let Err(e) = shared.hy2resi().select(&gate, DENY_TAG).await {
-            tracing::warn!(gate = %gate, error = %e, "住宅 HY2 门切 deny 失败；快照拒绝仍然生效");
+            tracing::warn!(gate = %gate, error = %e, "住宅 HY2 门切 deny 失败；快照拒绝仍然生效：{e}");
         }
     }
     let closed = close_conns_of(shared, targets).await;
@@ -151,7 +151,7 @@ pub async fn kick_residential(shared: &Shared, targets: &[ResiKickTarget]) -> us
         };
         let gate = gate_tag(&t.cred_id);
         if let Err(e) = shared.hy2resi().select(&gate, slot).await {
-            tracing::warn!(gate = %gate, error = %e, "住宅 HY2 门切回槽出站失败；门位收敛会补上");
+            tracing::warn!(gate = %gate, error = %e, "住宅 HY2 门切回槽出站失败；门位收敛会补上：{e}");
         }
     }
     closed
@@ -177,7 +177,7 @@ async fn close_conns_of(shared: &Shared, targets: &[ResiKickTarget]) -> usize {
         }
         match shared.hy2resi().close_connection(&c.id).await {
             Ok(()) => closed += 1,
-            Err(e) => tracing::warn!(error = %e, "住宅 HY2 关连接失败"),
+            Err(e) => tracing::warn!(error = %e, "住宅 HY2 关连接失败：{e}"),
         }
     }
     closed
@@ -376,7 +376,7 @@ pub async fn tick(ctx: &DaemonCtx, shared: &Shared) -> anyhow::Result<()> {
         let ids: Vec<String> = out.newly_blocked.iter().map(Uuid::to_string).collect();
         for port in ports.iter().copied() {
             if let Err(e) = shared.hy2().kick(port, &ids).await {
-                tracing::warn!(port, error = %e, "kick 失败；快照拒绝仍然生效");
+                tracing::warn!(port, error = %e, "kick 失败；快照拒绝仍然生效：{e}");
             }
         }
         // 住宅那条路没有 `/kick`：门切 `deny` + 逐条 DELETE（spec §5.2）。
@@ -466,7 +466,7 @@ pub async fn sampling_loop(ctx: DaemonCtx, shared: Arc<Shared>) {
     loop {
         iv.tick().await;
         if let Err(e) = tick(&ctx, &shared).await {
-            tracing::warn!(error = %e, "采样周期失败");
+            tracing::warn!(error = %e, "采样周期失败：{e}");
         }
         write_health_summary(&ctx, &shared).await;
     }
