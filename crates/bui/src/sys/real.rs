@@ -261,6 +261,34 @@ impl Host for RealHost {
         })
     }
 
+    fn run_journalctl(&self, args: &[&str]) -> Result<CmdOut> {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        // 同一进程里哨兵 / 黑名单 / 证书确认可能同时读，单元名必须各不相同（重名会被拒）
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        // 回落只说一次：没有 systemd-run 的机器上哨兵每几秒读一次，别刷屏
+        static FALLBACK_NOTED: AtomicBool = AtomicBool::new(false);
+        let why = if self.which("systemd-run") {
+            let unit = format!(
+                "bui-journal-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            );
+            let argv = super::isolated_journalctl_argv(&unit, args);
+            let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+            match self.run(refs[0], &refs[1..]) {
+                Ok(out) if !super::is_systemd_run_failure(&out) => return Ok(out),
+                Ok(out) => out.stderr.trim().to_string(),
+                Err(e) => format!("{e:#}"),
+            }
+        } else {
+            "没有 systemd-run".to_string()
+        };
+        if !FALLBACK_NOTED.swap(true, Ordering::Relaxed) {
+            tracing::debug!(reason = %why, "journalctl 无法放进临时单元，直接执行（本进程只提示一次）：{why}");
+        }
+        self.run("journalctl", args)
+    }
+
     fn run_stdin(&self, program: &str, args: &[&str], stdin: &str) -> Result<CmdOut> {
         use std::io::Write;
         // 同样不把 args 与 stdin 写进日志：stdin 里可能是凭据（规则集不是，但口径统一）。
@@ -416,7 +444,7 @@ impl Host for RealHost {
         }
         let args = super::journal_args(units, from);
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let out = self.run("journalctl", &refs)?;
+        let out = self.run_journalctl(&refs)?;
         if !out.ok() {
             // 游标失效（日志轮转 / vacuum 之后）就是这一支：调用方丢游标、从「现在」重来
             bail!("journalctl 退出码 {}：{}", out.status, out.stderr.trim());

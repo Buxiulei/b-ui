@@ -204,7 +204,8 @@ pub fn collect(host: &dyn Host, cursor: Option<&str>) -> anyhow::Result<JournalB
             args.push("-25h");
         }
     }
-    let out = host.run("journalctl", &args)?;
+    // 经临时单元读（`Host::run_journalctl`）：`--since -25h` 冷读的页缓存不记到 b-ui 头上
+    let out = host.run_journalctl(&args)?;
     if !out.ok() {
         // 游标失效时 journalctl 会报错；调用方下一轮会用 None 重来（见 Task 9）
         anyhow::bail!("journalctl 退出码 {}", out.status);
