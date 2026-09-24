@@ -8,7 +8,7 @@
 `version` 的唯一来源是根 `Cargo.toml` 的 `[workspace.package] version`；改版本必须同时在本文件加一段，`scripts/release/check-version.sh` 会在 CI 里卡住不一致（它只认 `## [<version>]` 这个标题，日期不参与校验）。
 未发布的版本日期写「未发布」，由主理人打 tag 发版时替换成当天日期（UTC）。
 
-## [4.1.2] - 未发布
+## [4.1.2] - 2026-09-24
 
 **只改守护进程的日志解析与归因，不动渲染器、不动订阅、不动内核配置**：升级前后三种订阅的字节不变。
 这一段改变守护进程的**行为**——自动黑名单会开始按真实的被拒行学习（此前两台生产机上它一条都没学到过），
@@ -24,9 +24,13 @@
 - **relay 重启的两条运维来路补齐重放与记账**：看门狗的「进程在、2080 不 listen 连续两轮 ⇒ 重启」与 `POST /api/services/b-ui-relay/restart|start` 现在都广播 `Event::RelayRestarted`（与重启 `hysteria-residential` 那条口径一致），让 `health::replay_after_restart` 立刻把借用 / pin 中的槽 selector 重放回去 —— 此前这两条只盖时间戳、把重放交给 `drive_slots` 下一轮兜底，最坏 2 分钟里所有借槽的用户都被打回自己那条坏 IP，且没有任何告警说明原因。同时这两条盖的全池时间戳改取 `systemctl` **返回之后**的时刻：`systemctl` 是阻塞的，selector 回落 default 就发生在「发命令 → 返回」那段里，记发命令之前等于把门开在事件之前、那段里产生的老成员失败行会漏过门。
 - **「没记账的切换」兜底不再是哑巴**：某池的 `now` 与 `runtime` 记的该池当前选择对不上时，除了丢弃本批路径 B 证据并补记时刻，现在还按池累计连续批次（`runtime.json` 的 `residential.unstable_streak`，稳定一批即清零）。同一池**连续 3 批**不稳定 ⇒ 记一条住宅告警（点名是哪个池，面板可见）并发一次 `Event::RelayRestarted` 触发该池的重放收敛，之后 1 小时冷却内不重复。一次 relay 重启 / 一次手动 `curl` 造成的单批不稳定仍然静默（那是兜底正常工作的样子）；连续 3 批说明有一条落账路径在持续漏写、或有人在外面反复动 selector，那时归因已经在长期丢证据。
 
+### 观察记账
+- rc1 于 2026-09-18T14:19Z 上 bwg-rick，观察 6 天（每 2 小时一轮只读巡检）：三个 relay 签名与 `借用 / 切槽` 事件 0 次、`unstable_streak` 全程为空、`candidates` 43 → 44、每日 04:00 批次后 `state.blacklist.auto` 无新增、守护进程 `NRestarts` 0、`oom_kill` 0。
+- bwg-tizi 于 2026-09-24T07:39Z 从 4.1.1 升到同一二进制：只重启 b-ui，四个内核单元与 xray 的 MainPID 全部不变，门位重放正常、对账 0 变更。正式版与 rc1 代码相同，仅本文件记账。
+
 ### 发布后观察项（bwg-rick）
 - **本分支让 `relay_upstream_error` / `relay_upstream_auth_failed` / `relay_google_blocked` 三个签名第一次在生产真正触发**，而 `sentinel/resi.rs::on_upstream_error` 对带外快探的三值结论里，`Verdict::Unconfirmed`（预算内没能确认可用）是**按不可用处置**的：`mark_unhealthy` + `slots::borrow_now`，与确认不可用同一条路径（2026-09-14 裁决，理由写在那条分支的注释里）。所以一次误归因的代价**不只是白探一次**：它可能把一条健康上游判成不健康并把槽借走，恢复要等巡检连续 2 轮探通 + 攒满 3 轮切回防抖（约 8 分钟）。头几天要盯：`bui incidents` 里这三个签名的事件频率、`借用 / 切槽`事件的密度，以及被判不健康的上游在体检里是否其实一直是好的。
-- **`journal::collect` 改 `-o json` 之后，游标失效那一轮的 stdout 会比 `-o cat` 涨 5–10 倍**：`-o cat` 每行只有 `MESSAGE`，`-o json` 每行还带 `__CURSOR` / `__REALTIME_TIMESTAMP` / `_SYSTEMD_UNIT` 等字段；而游标失效（日志轮转 / relay 重启）那一轮走的是 `--since -25h`，**一次性读进内存**再逐行解析。relay 单元每天几千到两万多条拒绝行，25 小时那一轮按每行约 1 KB 估是几十 MB 的一次性峰值。头几天盯 `systemctl show b-ui -p MemoryCurrent`（守护进程重启后的第一轮、以及每日 04:00 前后各看一次）有没有异常尖峰；真撞上再改成流式读 / 缩短回看窗口。
+- **`journal::collect` 改 `-o json` 之后，游标失效那一轮的 stdout 会比 `-o cat` 涨 5–10 倍**：`-o cat` 每行只有 `MESSAGE`，`-o json` 每行还带 `__CURSOR` / `__REALTIME_TIMESTAMP` / `_SYSTEMD_UNIT` 等字段；而游标失效（日志轮转 / relay 重启）那一轮走的是 `--since -25h`，**一次性读进内存**再逐行解析。relay 单元每天几千到两万多条拒绝行；bwg-rick 上 rc1 实测游标失效那一轮 `-o json --since -25h` 只有 738 行、约 1.1 MB（relay 日志级别是 `error`，量远小于按全量估的「几十 MB」），守护进程 6 天内 `memory.events` 的 `oom_kill` 为 0、匿名内存稳定在 5–6 MB。真信号是 `memory.events` 的 `oom_kill` 与 `memory.stat` 的 `anon`（`memory.current` 常年贴着 `MemoryMax` 是可回收的 page cache，不是泄漏）；真撞上再改成流式读 / 缩短回看窗口。
 - `bui incidents` 里是否开始出现 `relay_upstream_error` / `relay_upstream_auth_failed` 一类事件，以及借用是否合理（探测通过 = Info、不动作是正常的）。
 - `runtime.json` 的 `candidates` 是否开始累计，以及每日 04:00 之后 `state.blacklist.auto` 有没有出现**不该被拉黑**的域名。确认路径是「硬拒 + 直连可达、间隔 ≥10 分钟连续 2 次」，误学一次不会直接生效，但要盯住第一批被确认的条目。
 
