@@ -168,3 +168,6 @@ jobs:
             printf '%s\n' "$missed"
             exit 1
           fi
+      - name: 住宅 UDP 实际收发（发布内核）
+        if: matrix.singbox == '1.14'
+        run: cargo test -p bui-schema --test kernel_traffic -- --ignored --nocapture
