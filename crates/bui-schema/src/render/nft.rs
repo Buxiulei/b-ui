@@ -34,6 +34,11 @@
 //!    apernet 那些表在 ip / ip6（第 1 条的 `NFT_FAMILIES`），本表在 inet，天然不共享名字空间；
 //!    直连 HY2 仍是 apernet 的内置跳跃，它那些表照旧存在，本表只认住宅那两段端口。
 //!
+//! 每条规则先确认目标地址属于本机（`fib daddr type local`），再 REDIRECT。
+//! 只按端口匹配会把服务器发往外部同号端口的 UDP（如 SOCKS5 UDP relay）送回自己的
+//! HY2 入站；prerouting 也必须排除经本机转发的外部流量。fib 同时覆盖 IPv4/IPv6、
+//! 回环和本机公网地址，不把安装时探到的公网 IP 固化进规则。
+//!
 //! 双 hook 是硬要求：只挂 `prerouting` 时，**本机发往自身公网 IP 的包不过 prerouting**，
 //! 跳跃对本机自测直接失效（spec §2.4，tizi PoC 实测；apernet 的规则同样是
 //! PREROUTING + OUTPUT 两条）。
@@ -84,11 +89,11 @@ pub fn ruleset(p: &Ports, compat: bool) -> String {
             "    type nat hook {hook} priority -100; policy accept;\n"
         ));
         out.push_str(&format!(
-            "    udp dport {hop_start}-{hop_end} counter redirect to :{base} comment \"hy2 residential hop{suffix}\"\n"
+            "    udp dport {hop_start}-{hop_end} fib daddr type local counter redirect to :{base} comment \"hy2 residential hop{suffix}\"\n"
         ));
         if compat {
             out.push_str(&format!(
-                "    udp dport {compat_start}-{compat_end} counter redirect to :{base} comment \"hy2 residential 4.0 compat{suffix}\"\n"
+                "    udp dport {compat_start}-{compat_end} fib daddr type local counter redirect to :{base} comment \"hy2 residential 4.0 compat{suffix}\"\n"
             ));
         }
         out.push_str("  }\n");
@@ -119,13 +124,13 @@ mod tests {
 table inet bui {
   chain prerouting {
     type nat hook prerouting priority -100; policy accept;
-    udp dport 41000-50000 counter redirect to :40000 comment \"hy2 residential hop\"
-    udp dport 40001-40007 counter redirect to :40000 comment \"hy2 residential 4.0 compat\"
+    udp dport 41000-50000 fib daddr type local counter redirect to :40000 comment \"hy2 residential hop\"
+    udp dport 40001-40007 fib daddr type local counter redirect to :40000 comment \"hy2 residential 4.0 compat\"
   }
   chain output {
     type nat hook output priority -100; policy accept;
-    udp dport 41000-50000 counter redirect to :40000 comment \"hy2 residential hop (local)\"
-    udp dport 40001-40007 counter redirect to :40000 comment \"hy2 residential 4.0 compat (local)\"
+    udp dport 41000-50000 fib daddr type local counter redirect to :40000 comment \"hy2 residential hop (local)\"
+    udp dport 40001-40007 fib daddr type local counter redirect to :40000 comment \"hy2 residential 4.0 compat (local)\"
   }
 }
 ";
@@ -141,7 +146,9 @@ table inet bui {
     #[test]
     fn turning_the_compat_range_off_leaves_two_rules() {
         let got = ruleset(&ports(), false);
-        assert!(got.contains("udp dport 41000-50000 counter redirect to :40000"));
+        assert!(
+            got.contains("udp dport 41000-50000 fib daddr type local counter redirect to :40000")
+        );
         assert!(!got.contains("40001-40007"), "兼容段的两条规则一起消失");
         assert_eq!(got.matches("counter redirect").count(), 2);
         assert_eq!(rule_count(false), 2);
@@ -155,7 +162,11 @@ table inet bui {
         p.hy2_resi = 45000;
         p.hy2_resi_hop = (46000, 47000);
         let got = ruleset(&p, true);
-        assert!(got.contains("udp dport 46000-47000 counter redirect to :45000"));
-        assert!(got.contains("udp dport 45001-45007 counter redirect to :45000"));
+        assert!(
+            got.contains("udp dport 46000-47000 fib daddr type local counter redirect to :45000")
+        );
+        assert!(
+            got.contains("udp dport 45001-45007 fib daddr type local counter redirect to :45000")
+        );
     }
 }

@@ -15,6 +15,28 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
+  nft:
+    name: nft packet regression
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Network namespace test tools
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends nftables iproute2 python3
+      - name: Build isolated packet test
+        run: |
+          cargo test -p bui-schema --test kernel_nft --no-run --message-format=json > /tmp/nft-build.jsonl
+          python3 - <<'PY' > /tmp/nft-test-bin
+          import json
+          for line in open('/tmp/nft-build.jsonl'):
+              item = json.loads(line)
+              if item.get('executable') and item.get('target', {}).get('name') == 'kernel_nft':
+                  print(item['executable'])
+          PY
+          test -s /tmp/nft-test-bin
+      - name: Verify real IPv4 and IPv6 packets in isolated namespaces
+        run: sudo "$(cat /tmp/nft-test-bin)" --ignored --nocapture
+
   lint:
     name: lint
     runs-on: ubuntu-24.04
