@@ -602,6 +602,17 @@ async fn check_health_round(
         }
     }
 
+    // 槽驱动已经释放同一把锁，此处只包住全局决策与落账，不能把外部健康探测锁进去。
+    // 等锁期间可能有人手动选过出口，必须重读 runtime；否则旧快照仍会撤销已生效的选择。
+    let _switch = super::slots::slot_switch(ctx).lock_owned().await;
+    let g = state::group_of(&*ctx.store.read().await);
+    if ids_of(&g) != before {
+        out.notes
+            .push("住宅池成员在等待出口决策时变化，本轮不切换全局出口".into());
+        return Ok(out);
+    }
+    let rt = state::read(&ctx.runtime).await;
+
     // 规则 5：读不到当前选择（relay 没起来或旧配置）→ 不切
     let cc = c.clone();
     let sel_tag = tokio::task::spawn_blocking(move || cc.selected(POOL)).await?;
@@ -852,6 +863,7 @@ fn switch_cooldown(r: &ResiRuntime, now: OffsetDateTime) -> Option<i64> {
 /// 手动锁定 / 归零防抖计数）并返回 `true`；失败 → 记全局告警、**不改 runtime** 并返回
 /// `false`（别把没生效的选择记成生效，下一轮重新评估）。
 /// 规则 10/11 与规则 6c 两条切换路径共用它，免得落账口径有两份。
+/// 唯一调用方 `check_health_round` 已持有出口决策锁；这里不能重复加锁。
 #[allow(clippy::too_many_arguments)]
 async fn switch_to(
     ctx: &DaemonCtx,
@@ -1108,6 +1120,8 @@ async fn select_with_retry(
 ///   （`drive_slots` 重 PUT；规则 6a 发现 now 与运行时不一致就重放）；
 /// - `back_rounds` 一律不清：它记的是「本槽自己健康了几轮」，与 relay 重启无关。
 pub async fn replay_after_restart(ctx: &DaemonCtx, c: Arc<dyn Clash>) -> ReplayOutcome {
+    // 锁必须早于计划快照，且覆盖内核 PUT 与落账，避免旧重放覆盖新的 pin/巡检决策。
+    let _switch = super::slots::slot_switch(ctx).lock_owned().await;
     let (g, view, all_pools) = {
         let s = ctx.store.read().await;
         (
@@ -1156,8 +1170,7 @@ pub async fn replay_after_restart(ctx: &DaemonCtx, c: Arc<dyn Clash>) -> ReplayO
             .map(|(i, e)| (i.selector.clone(), i.tag.clone(), e.clone()))
             .collect(),
     };
-    // 槽的落账与告警并成一次写。重放期间巡检也可能动过某一槽（drive_slots 同样会 PUT）：
-    // 只在 current 还是事件时那个值时才改，别覆盖它
+    // 槽的落账与告警并成一次写。出口决策共用锁，保留旧值比较以防槽被配置变更移除/重建。
     let slot_writes: Vec<(u16, Option<Uuid>, Option<Uuid>)> = done
         .iter()
         .filter_map(|i| i.slot)
@@ -1237,6 +1250,7 @@ pub async fn replay_loop(
 /// 管理员手动切换（`POST /api/residential/select`）：只走 Clash API，不写 state（契约决策 §C），
 /// 并**锁定**到这条上游，直到它不健康（R2 ①）——否则下一轮巡检按 priority 就把它换走了。
 pub async fn select_manual(ctx: &DaemonCtx, c: Arc<dyn Clash>, id: Uuid) -> anyhow::Result<String> {
+    let _switch = super::slots::slot_switch(ctx).lock_owned().await;
     let g = state::group_of(&*ctx.store.read().await);
     let tag = clash::tag_of(&g, id).ok_or_else(|| anyhow::anyhow!("上游不在当前池里"))?;
     let (cc, t2) = (c.clone(), tag.clone());
@@ -1258,6 +1272,7 @@ pub async fn select_manual(ctx: &DaemonCtx, c: Arc<dyn Clash>, id: Uuid) -> anyh
 /// 只清锁定位，**不动** relay 的当前选择 —— 下一轮巡检自己按 Google / priority 重新挑，
 /// 免得一按「自动」就无谓地掐一次连接。
 pub async fn select_auto(ctx: &DaemonCtx) {
+    let _switch = super::slots::slot_switch(ctx).lock_owned().await;
     state::update(&ctx.runtime, |r| r.manual_selected_id = None).await;
 }
 
