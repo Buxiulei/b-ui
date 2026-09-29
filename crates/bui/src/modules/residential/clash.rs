@@ -26,6 +26,11 @@ pub trait Clash: Send + Sync + 'static {
     /// `PUT /proxies/<selector>` `{"name":"<tag>"}`；与配置切换走同一条 `SelectOutbound`
     /// 路径（调研 S4），`interrupt_exist_connections: false` 保证不掐既有连接
     fn select(&self, selector: &str, tag: &str) -> Result<(), ClashError>;
+    /// 只有实际运行的 relay 已确认是旧拓扑，才允许按 `resi-N` / selector 归因。
+    /// 新策略端点的外层错误是合成结果；API 不可读也不能猜成旧拓扑。
+    fn legacy_attribution(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -74,6 +79,15 @@ impl Default for HttpClash {
 }
 
 impl Clash for HttpClash {
+    fn legacy_attribution(&self) -> bool {
+        self.client()
+            .ok()
+            .and_then(|c| c.get(format!("http://{}/proxies", self.api)).send().ok())
+            .and_then(|r| r.error_for_status().ok())
+            .and_then(|r| r.json::<serde_json::Value>().ok())
+            .is_some_and(|v| legacy_proxy_inventory(&v))
+    }
+
     fn ready(&self) -> bool {
         self.client()
             .ok()
@@ -110,6 +124,46 @@ impl Clash for HttpClash {
             })
         }
     }
+}
+
+/// 使用实际内核的出站清单，不能使用可能尚未对账的期望态来判断日志形状。
+/// 即使新标签格式未知也保守丢弃旧形状，防止将端点外层的合成错误算到供应商头上。
+fn legacy_proxy_inventory(value: &serde_json::Value) -> bool {
+    let Some(proxies) = value.get("proxies").and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    !proxies
+        .keys()
+        .any(|tag| tag.starts_with("resi-egress-") || tag.starts_with("resi-policy-"))
+        && proxies.keys().any(|tag| super::journal::is_member_tag(tag))
+}
+
+/// 纯旧形状的批次只读一次拓扑；含任一 UUID 出口则整批只接受 UUID。
+/// 后者也保护「日志已产生、读 API 前回滚成旧拓扑」的窗口，宁可丢弃混批里的旧证据，
+/// 不能把新拓扑的外层副本重新计数。空批与 UUID 批次均不依赖 Clash 的可用性。
+pub async fn legacy_attribution<'a>(
+    clash: &std::sync::Arc<dyn Clash>,
+    subjects: impl IntoIterator<Item = &'a RelaySubject>,
+) -> bool {
+    let mut has_legacy = false;
+    for subject in subjects {
+        if matches!(subject, RelaySubject::Egress(_)) {
+            return false;
+        }
+        has_legacy = true;
+    }
+    if !has_legacy {
+        return false;
+    }
+    let c = clash.clone();
+    tokio::task::spawn_blocking(move || c.legacy_attribution())
+        .await
+        .unwrap_or(false)
+}
+
+/// 新拓扑只统计内层 UUID 行；旧拓扑与未知拓扑都不改变 UUID 的直接归因。
+pub fn attributable(subject: &RelaySubject, legacy: bool) -> bool {
+    matches!(subject, RelaySubject::Egress(_)) || legacy
 }
 
 /// 当前池的全部成员 tag，顺序与 `g.upstreams` 一致
@@ -236,6 +290,9 @@ pub enum Attrib {
 
 /// relay 一行日志的出站主体 → 上游 id。
 ///
+/// 调用方须先经 [`attributable`] 排除新拓扑的外层错误。稳定 UUID 直接定位仍在池里的
+/// 上游；以下两条路径仅用于已确认的旧拓扑。
+///
 /// - **路径 A**（零 I/O，不受时间戳门约束）：成员 tag 直接换算（sing-box 写的就是当时失败的
 ///   那个成员），或 reason 里 `dial tcp <ip>:<port>` 的上游地址（[`id_of_dial_addr`]，写的就是
 ///   当时实际拨的那个上游）——两者说的都是**过去**，与此刻选中谁无关；
@@ -255,6 +312,7 @@ pub fn attribute(
 ) -> Attrib {
     let unknown = |o: Option<Uuid>| o.map_or(Attrib::Unknown, Attrib::Upstream);
     match s {
+        RelaySubject::Egress(id) => unknown(g.upstreams.iter().find(|u| u.id == *id).map(|u| u.id)),
         RelaySubject::Member(tag) => unknown(id_of_tag(g, tag)),
         RelaySubject::Pool { pool, dial_addr } => {
             if let Some(id) = dial_addr
@@ -275,7 +333,7 @@ pub fn attribute(
 pub fn pool_of(s: &RelaySubject) -> Option<&str> {
     match s {
         RelaySubject::Pool { pool, .. } => Some(pool),
-        RelaySubject::Member(_) => None,
+        RelaySubject::Egress(_) | RelaySubject::Member(_) => None,
     }
 }
 
@@ -329,6 +387,8 @@ pub fn unstable_pools(
 #[cfg(test)]
 #[derive(Default)]
 pub struct FakeClashInner {
+    /// 缺省假内核仍是旧拓扑；新端点 / API 不可读用 false。
+    pub legacy_attribution: bool,
     /// 每个 selector 各记一份当前选择（键 = selector tag）
     pub now: std::collections::BTreeMap<String, String>,
     /// 令 `select` 失败（测「切换失败只告警不改 runtime」）
@@ -358,6 +418,7 @@ impl FakeClash {
     pub fn new(now: Option<&str>) -> Self {
         Self {
             inner: std::sync::Mutex::new(FakeClashInner {
+                legacy_attribution: true,
                 now: now
                     .map(|t| [(POOL.to_string(), t.to_string())].into_iter().collect())
                     .unwrap_or_default(),
@@ -394,6 +455,10 @@ fn refused(i: &mut FakeClashInner) -> bool {
 
 #[cfg(test)]
 impl Clash for FakeClash {
+    fn legacy_attribution(&self) -> bool {
+        self.inner.lock().unwrap().legacy_attribution
+    }
+
     fn ready(&self) -> bool {
         let mut i = self.inner.lock().unwrap();
         i.calls.push("ready".into());
@@ -572,6 +637,73 @@ mod tests {
             "PUT 的 body 就是 name 字段：{:?}",
             reqs[1]
         );
+    }
+
+    #[test]
+    fn legacy_attribution_requires_a_readable_legacy_outbound_inventory() {
+        let legacy = serde_json::json!({"proxies": {"resi-1": {"type": "Socks5"}, "resi-pool": {"type": "Selector"}}});
+        assert!(legacy_proxy_inventory(&legacy));
+        for value in [
+            serde_json::json!({"proxies": {"resi-1": {}, "resi-egress-00000000-0000-0000-0000-000000000002": {}}}),
+            serde_json::json!({"proxies": {"resi-1": {}, "resi-egress-unknown": {}}}),
+            serde_json::json!({"proxies": {"resi-1": {}, "resi-policy-unknown": {}}}),
+            serde_json::json!({"proxies": {"resi-pool": {}}}),
+            serde_json::json!({"proxies": {"resi-+1": {}, "resi-0": {}}}),
+            serde_json::json!({"proxies": []}),
+            serde_json::json!({}),
+        ] {
+            assert!(!legacy_proxy_inventory(&value), "{value}");
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_or_empty_batches_never_query_the_topology_api() {
+        struct NoApi(std::sync::atomic::AtomicUsize);
+        impl Clash for NoApi {
+            fn ready(&self) -> bool {
+                panic!("unexpected API call")
+            }
+            fn selected(&self, _: &str) -> Option<String> {
+                panic!("unexpected API call")
+            }
+            fn select(&self, _: &str, _: &str) -> Result<(), ClashError> {
+                panic!("unexpected API call")
+            }
+            fn legacy_attribution(&self) -> bool {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                true
+            }
+        }
+        let tracked = std::sync::Arc::new(NoApi(std::sync::atomic::AtomicUsize::new(0)));
+        let c: std::sync::Arc<dyn Clash> = tracked.clone();
+        let raw = RelaySubject::Egress(Uuid::from_u128(2));
+        let outer = RelaySubject::Member("resi-2".into());
+        for subjects in [
+            vec![],
+            vec![raw.clone()],
+            vec![outer.clone(), raw.clone()],
+            vec![raw, outer],
+        ] {
+            assert!(!legacy_attribution(&c, subjects.iter()).await);
+        }
+        assert_eq!(tracked.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn http_clash_reads_live_topology_and_does_not_treat_api_failure_as_legacy() {
+        const LEGACY: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"proxies\":{\"resi-1\":{}}}";
+        const POLICY: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"proxies\":{\"resi-1\":{},\"resi-egress-00000000-0000-0000-0000-000000000002\":{}}}";
+        let (api, h) = fake_clash_api(vec![LEGACY, POLICY, NOT_FOUND, OK_NOW]);
+        let c = HttpClash::with_api(api, 2);
+        assert!(c.legacy_attribution());
+        assert!(!c.legacy_attribution());
+        assert!(!c.legacy_attribution());
+        assert!(!c.legacy_attribution());
+        assert!(h
+            .join()
+            .unwrap()
+            .iter()
+            .all(|r| r.starts_with("GET /proxies HTTP/1.1\r\n")));
     }
 
     #[test]

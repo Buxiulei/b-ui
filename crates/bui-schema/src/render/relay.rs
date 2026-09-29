@@ -4,19 +4,21 @@
 //! （池模式）与 `write_singbox_config_direct`（直连模式），外加 spec §5.4 的黑名单与
 //! 端口白名单两段规则。
 //!
-//! 两个 hysteria 住宅实例与 xray 的 `vless-residential` 都把流量交给 `127.0.0.1:2080`，
+//! 住宅 HY2 凭据门与 xray 的 `vless-residential` 都把流量交给每槽的 `127.0.0.1:2080+i`，
 //! 所以这份配置是住宅分流的唯一决策点：
 //!
 //! - 池无效（`enabled=false` 或没有上游）→ 只有 `direct` 出站，全部直连（fail-open）；
-//! - 池有效 → 每个上游一个出站 + `resi-pool` selector（巡检经 Clash API 热切换，不重启）。
+//! - 池有效 → selector → 每上游回环策略端点 → 稳定 UUID 的真实出口。
+//!   巡检经 Clash API 热切换时，新连接的规则与实际出口一起切换，已有连接保持。
 use crate::model::{ResidentialGroup, Rule, Slot, Upstream, UpstreamKind};
+use crate::relay_policy;
 use crate::render::SplitRules;
 use serde_json::{json, Map, Value};
 
 /// 渲染 relay 配置需要的本机参数。
 #[derive(Debug, Clone, PartialEq)]
 pub struct RelayOpts {
-    /// socks 入站端口（固定 2080，两个数据面内核都指向它）
+    /// slot socks 入站基准端口（生产固定 2080）
     pub listen_port: u16,
     /// Clash API 监听地址（巡检热切换用）
     pub api: String,
@@ -106,10 +108,13 @@ fn inbounds(view: &[Slot], base: u16) -> Vec<Value> {
 
 /// 渲染一份 relay 配置。
 ///
+/// 调用者须先经 [`relay_policy::validate_group`] 校验池容量；生产由 Store 的读写边界
+/// 保证此契约。超过支持范围应明确报错，不截断上游或静默 fail-open。
+///
 /// `slots` 是 `state.residential.slots`（spec §5.6）：每个槽在这里落成
 /// 「一个 socks 入站 `slot-<i>`（端口 `opts.listen_port + i`）+ 一个 selector
 /// `slot-<i>-pool`（成员本槽优先）+ 一条 `inbound → selector` 路由」。
-/// 传空 slice ⇒ 单槽视图（槽 0），渲染结果与 v3 单实例逐字等价。
+/// 传空 slice ⇒ 单槽视图（槽 0），保持旧版数据面的 2080 入口兼容。
 /// 指向已不在池里的槽位一律忽略（绝不产生指向不存在出站的路由）。
 pub fn config(g: &ResidentialGroup, slots: &[Slot], opts: &RelayOpts) -> Value {
     let split = SplitRules::from_group(g);
@@ -118,55 +123,115 @@ pub fn config(g: &ResidentialGroup, slots: &[Slot], opts: &RelayOpts) -> Value {
     let view = slot_view(g, slots);
     // 池无效时全部直连，黑名单与端口白名单都无意义
     let bl = if active {
-        Blacklist::collect(g)
+        Blacklist::collect(g.blacklist.pins.iter().map(|p| &p.rule))
     } else {
         Blacklist::default()
     };
+    let policies: Vec<_> = if active {
+        g.upstreams
+            .iter()
+            .map(|u| {
+                let auto = Blacklist::collect(
+                    g.blacklist
+                        .auto
+                        .iter()
+                        .filter(|e| e.upstream_id == u.id)
+                        .map(|e| &e.rule),
+                );
+                (u, auto)
+            })
+            .collect()
+    } else {
+        vec![]
+    };
 
-    // rules[0] 这条无过滤 sniff 是 split 分流的前提：客户端本地解析后 relay 只收到 IP，靠它
-    // 再嗅出域名，下面各槽的 domain_keyword 才匹配得到（T3 2026-09-18 对照实验摘掉它 ⇒ 静默直连）。
-    let mut route_rules = vec![json!({ "action": "sniff" })];
-    if let Some(r) = bl.domain_rule("outbound", "direct") {
+    // slot 入口先 sniff，才能按 IP-only 连接的 SNI/Host 做公共分流。
+    // policy 入站是否需要第二次嗅探，在它自己的规则内判断。
+    let slot_inbounds: Vec<_> = if view.is_empty() {
+        vec![inbound_tag(0)]
+    } else {
+        view.iter().map(|s| inbound_tag(s.index)).collect()
+    };
+    let mut route_rules = vec![json!({ "inbound": slot_inbounds, "action": "sniff" })];
+    if let Some(mut r) = bl.domain_rule("outbound", "direct") {
+        r["inbound"] = json!(slot_inbounds);
         route_rules.push(r);
     }
     if !bl.ports.is_empty() {
-        route_rules.push(json!({ "port": bl.ports, "outbound": "direct" }));
-    }
-    // 上游只放行部分端口时，其余端口直连（否则会在上游侧被硬拒，表现为连不上）
-    if let Some(allowed) = selected
-        .filter(|_| active)
-        .and_then(|u| u.ports_allowed.as_deref())
-    {
-        let ranges = inverted_port_ranges(allowed);
-        if !ranges.is_empty() {
-            route_rules.push(json!({ "port_range": ranges, "outbound": "direct" }));
-        }
+        route_rules
+            .push(json!({ "inbound": slot_inbounds, "port": bl.ports, "outbound": "direct" }));
     }
     // 客户端的明文 DNS 一律由本机解析（与 dns 段的 dns_direct 同语义），行为不随池类型变
-    route_rules.push(json!({ "network": "udp", "port": 53, "outbound": "direct" }));
+    route_rules.push(
+        json!({ "inbound": slot_inbounds, "network": "udp", "port": 53, "outbound": "direct" }),
+    );
     // 池里混有 http 上游（sing-box 的 http 出站没有 UDP 能力，selector 选到它会报错）时，
     // 沿用 v3 的降级：QUIC 拒绝（浏览器回退 TCP 走住宅）、其余 UDP 直连。
     // 全 socks5 池则什么都不拦，UDP 跟 TCP 一样交给 route.final / 关键字规则走住宅
     // （否则 UDP 应用永远暴露 VPS 自身 IP）。判据见 [`ResidentialGroup::udp_via_pool`]。
     if !g.udp_via_pool() {
-        route_rules.push(json!({ "network": "udp", "port": 443, "action": "reject" }));
-        route_rules.push(json!({ "network": "udp", "outbound": "direct" }));
-    } else {
-        // 全 socks5 池：UDP 目标先在本机解析成 IPv4 再进 socks 出站。Decodo 的 UDP ASSOCIATE
-        // 只收 IPv4 目标（ATYP=3 域名 / ATYP=4 IPv6 都回 code=8，2026-09-13 实测），而 socks
-        // 出站会把 sniff 出的域名原样发出。TCP 不解析，域名照旧交给上游。
-        route_rules.push(json!({
-            "network": "udp",
-            "action": "resolve",
-            "server": "dns_direct",
-            "strategy": "ipv4_only"
-        }));
+        route_rules.push(
+            json!({ "inbound": slot_inbounds, "network": "udp", "port": 443, "action": "reject" }),
+        );
+        route_rules
+            .push(json!({ "inbound": slot_inbounds, "network": "udp", "outbound": "direct" }));
     }
     let mut ip_cidr: Vec<String> = PRIVATE_CIDRS.iter().map(|c| c.to_string()).collect();
     if let Some(ip) = &opts.server_ip {
         ip_cidr.push(format!("{ip}/32"));
     }
-    route_rules.push(json!({ "ip_cidr": ip_cidr, "outbound": "direct" }));
+    route_rules.push(json!({ "inbound": slot_inbounds, "ip_cidr": ip_cidr, "outbound": "direct" }));
+    // 策略规则和末尾真实出口必须绑定同一个 policy 入站，且在 slot 规则之前终止。
+    // 每次 selector 热切只换端点，新连接自动采用实际出口的 auto / ports_allowed。
+    for (u, bl) in &policies {
+        let inbound = json!([relay_policy::inbound_tag(u.id)]);
+        // 客户端 UDP/53 已在 slot 层直连，能进这里的是 dns_resi 的内部 detour。
+        // 旧版 DNS detour 直接拨真实上游，不经过公共 pins / auto / 端口策略；保留该路径，
+        // 避免新增 wrapper 悄悄把住宅 DNS 变成 VPS 直连 DNS。
+        route_rules.push(json!({ "inbound": inbound, "network": "udp", "port": 53, "outbound": relay_policy::egress_tag(u.id) }));
+        if bl.has_domains() {
+            // SOCKS 回环不携带外层 metadata.Domain；仅 IP-only 请求需要重建 SNI/Host。
+            // 目标本来就是 FQDN 时 domain matcher 可直接读取 Destination.Fqdn，无须再等
+            // 一次首包；尤其不能让 server-first 协议无端多出一个 sniff timeout。
+            route_rules.push(json!({
+                "type": "logical", "mode": "and",
+                "rules": [
+                    { "inbound": inbound },
+                    { "domain_regex": [".+"], "invert": true }
+                ],
+                "action": "sniff"
+            }));
+        }
+        if let Some(mut rule) = bl.domain_rule("outbound", "direct") {
+            rule["inbound"] = inbound.clone();
+            route_rules.push(rule);
+        }
+        if !bl.ports.is_empty() {
+            route_rules.push(json!({ "inbound": inbound, "port": bl.ports, "outbound": "direct" }));
+        }
+        if g.udp_via_pool() {
+            // 回环 SOCKS 能接收域名；在实际出口选定、auto 域名策略匹配后才解析。
+            // 真实住宅 SOCKS 的 UDP 仍只收到 IPv4（部分供应商拒绝 ATYP=3/4）。
+            route_rules.push(json!({
+                "inbound": inbound,
+                "network": "udp",
+                "action": "resolve",
+                "server": "dns_direct",
+                "strategy": "ipv4_only"
+            }));
+        }
+        // 内层 resolve 后再次检查私网；不能把解析到回环/内网的 UDP 交给住宅出口。
+        route_rules.push(json!({ "inbound": inbound, "ip_cidr": ip_cidr, "outbound": "direct" }));
+        if let Some(allowed) = &u.ports_allowed {
+            let ranges = inverted_port_ranges(allowed);
+            if !ranges.is_empty() {
+                route_rules.push(
+                    json!({ "inbound": inbound, "port_range": ranges, "outbound": "direct" }),
+                );
+            }
+        }
+        route_rules.push(json!({ "inbound": inbound, "outbound": relay_policy::egress_tag(u.id) }));
+    }
     // 每槽一条「本槽入站 → 本槽 selector」。split 模式把关键字挂在这条规则上
     // （v3 的单条 `domain_keyword → resi-pool` 就是它在单槽下的特例）。
     if active {
@@ -197,6 +262,16 @@ pub fn config(g: &ResidentialGroup, slots: &[Slot], opts: &RelayOpts) -> Value {
     }
     dns_servers.push(json!({ "tag": "dns_direct", "type": "udp", "server": "1.1.1.1" }));
 
+    let mut listeners = inbounds(&view, opts.listen_port);
+    if active {
+        listeners.extend(g.upstreams.iter().enumerate().map(|(i, u)| json!({
+            "type": "socks",
+            "tag": relay_policy::inbound_tag(u.id),
+            "listen": "127.0.0.1",
+            "listen_port": relay_policy::policy_port(i).expect("住宅上游池已校验不超过 MAX_SLOTS")
+        })));
+    }
+
     json!({
         "log": { "level": "error" },
         "dns": {
@@ -205,7 +280,7 @@ pub fn config(g: &ResidentialGroup, slots: &[Slot], opts: &RelayOpts) -> Value {
             "final": if active && split.global { "dns_resi" } else { "dns_direct" },
             "strategy": "ipv4_only"
         },
-        "inbounds": inbounds(&view, opts.listen_port),
+        "inbounds": listeners,
         "outbounds": outbounds(g, active, selected, &view),
         "experimental": {
             "clash_api": { "external_controller": opts.api },
@@ -226,7 +301,7 @@ fn selected_upstream(g: &ResidentialGroup) -> Option<&Upstream> {
         .or_else(|| g.upstreams.first())
 }
 
-/// 出站表：`resi-1..N` 成员 + 每槽一个 `slot-<i>-pool` + 全局 `resi-pool` + `direct`；
+/// 出站表：`resi-1..N` 回环成员 + UUID 真实出口 + 每槽 selector + 全局 selector + direct；
 /// 池无效时只有 `direct`。
 fn outbounds(
     g: &ResidentialGroup,
@@ -238,32 +313,33 @@ fn outbounds(
         return vec![json!({ "type": "direct", "tag": "direct" })];
     }
     let tag = member_tag;
-    let mut out: Vec<Value> = g
-        .upstreams
-        .iter()
-        .enumerate()
-        .map(|(i, u)| {
-            let mut o = json!({
-                "tag": tag(i),
-                "server": u.host,
-                "server_port": u.port,
-                "username": u.username,
-                "password": u.password
-            });
-            let m = o.as_object_mut().expect("json object");
-            match u.kind {
-                // http 上游是 sing-box 的 http 出站（无 version 字段、TCP only）
-                UpstreamKind::Http => {
-                    m.insert("type".into(), json!("http"));
-                }
-                UpstreamKind::Socks5 => {
-                    m.insert("type".into(), json!("socks"));
-                    m.insert("version".into(), json!("5"));
-                }
+    let mut out: Vec<Value> = g.upstreams.iter().enumerate().map(|(i, _)| json!({
+        "type": "socks",
+        "tag": tag(i),
+        "server": "127.0.0.1",
+        "server_port": relay_policy::policy_port(i).expect("住宅上游池已校验不超过 MAX_SLOTS"),
+        "version": "5"
+    })).collect();
+    out.extend(g.upstreams.iter().map(|u| {
+        let mut o = json!({
+            "tag": relay_policy::egress_tag(u.id),
+            "server": u.host,
+            "server_port": u.port,
+            "username": u.username,
+            "password": u.password
+        });
+        let m = o.as_object_mut().expect("json object");
+        match u.kind {
+            UpstreamKind::Http => {
+                m.insert("type".into(), json!("http"));
             }
-            o
-        })
-        .collect();
+            UpstreamKind::Socks5 => {
+                m.insert("type".into(), json!("socks"));
+                m.insert("version".into(), json!("5"));
+            }
+        }
+        o
+    }));
     let tags: Vec<String> = (0..g.upstreams.len()).map(tag).collect();
 
     // 每槽一个 selector：成员顺序 = [本槽 IP, 其余按池内顺序]，default = 本槽
@@ -302,7 +378,7 @@ fn outbounds(
     out
 }
 
-/// 生效的黑名单：`pins` ∪ `auto` 中属于当前选中上游的条目。
+/// 同一作用域的黑名单；人工 pins 为公共作用域，auto 各自绑定上游 UUID。
 #[derive(Debug, Default)]
 struct Blacklist {
     suffixes: Vec<String>,
@@ -311,16 +387,9 @@ struct Blacklist {
 }
 
 impl Blacklist {
-    fn collect(g: &ResidentialGroup) -> Self {
-        let selected = g.selected_upstream_id;
-        let auto = g
-            .blacklist
-            .auto
-            .iter()
-            .filter(|e| Some(e.upstream_id) == selected)
-            .map(|e| &e.rule);
+    fn collect<'a>(rules: impl IntoIterator<Item = &'a Rule>) -> Self {
         let mut bl = Self::default();
-        for rule in g.blacklist.pins.iter().map(|p| &p.rule).chain(auto) {
+        for rule in rules {
             match rule {
                 Rule::DomainSuffix(v) => bl.suffixes.push(v.clone()),
                 Rule::Domain(v) => bl.domains.push(v.clone()),
@@ -328,6 +397,10 @@ impl Blacklist {
             }
         }
         bl
+    }
+
+    fn has_domains(&self) -> bool {
+        !self.suffixes.is_empty() || !self.domains.is_empty()
     }
 
     /// 黑名单域名规则（`domain` / `domain_suffix` 在同一条规则里是 OR）。
@@ -445,26 +518,209 @@ mod tests {
             .collect()
     }
 
-    fn tags_of(cfg: &Value, key: &str) -> Vec<String> {
+    // 内部 policy 入站 / raw 出站之外，旧的入口与 selector 标签保持兼容。
+    fn legacy_tags_of(cfg: &Value, key: &str) -> Vec<String> {
         cfg[key]
             .as_array()
             .unwrap()
             .iter()
             .map(|o| o["tag"].as_str().unwrap().to_string())
+            .filter(|tag| !tag.starts_with("resi-policy-") && !tag.starts_with("resi-egress-"))
             .collect()
     }
 
+    /// 策略只能挂到实际出口的 policy inbound；不能在槽选择之前先用全局选中上游决定。
     #[test]
-    fn a_single_slot_renders_exactly_what_v3_rendered() {
-        // 槽 0 单槽：一个 2080 入站、一个 slot-0-pool、resi-pool 仍在（DNS detour 用）
+    fn policy_rules_are_bound_to_the_actual_upstream_and_not_global_selection() {
+        use crate::model::{AutoEntry, Pin};
+        let mut g = group(2, ResiMode::Global);
+        g.upstreams[0].ports_allowed = Some(vec![80, 443]);
+        g.upstreams[1].ports_allowed = Some(vec![8443]);
+        for (i, domain) in [(0, "a.example.com"), (1, "b.example.com")] {
+            g.blacklist.auto.push(AutoEntry {
+                upstream_id: g.upstreams[i].id,
+                rule: Rule::Domain(domain.into()),
+                hits: 3,
+                confirmed_at: "2026-09-29T00:00:00Z".into(),
+                last_verified_at: "2026-09-29T00:00:00Z".into(),
+                passes: 0,
+            });
+        }
+        g.blacklist.pins.push(Pin {
+            rule: Rule::DomainSuffix("pinned.example.com".into()),
+            note: String::new(),
+            created_at: "2026-09-29T00:00:00Z".into(),
+        });
+        let first = config(&g, &slots(&[0, 1]), &opts());
+        g.selected_upstream_id = Some(g.upstreams[1].id);
+        let second = config(&g, &slots(&[0, 1]), &opts());
+        assert_eq!(
+            first["route"], second["route"],
+            "全局默认选中不应改变任何出口的策略"
+        );
+        assert_eq!(
+            first["dns"], second["dns"],
+            "上游 auto 不得污染全局 DNS 规则"
+        );
+        let rules = first["route"]["rules"].as_array().unwrap();
+        for (i, domain, allowed) in [
+            (0, "a.example.com", vec![80, 443]),
+            (1, "b.example.com", vec![8443]),
+        ] {
+            let policy = format!("resi-policy-{}", g.upstreams[i].id);
+            let domain_rule = rules
+                .iter()
+                .find(|r| r["domain"] == json!([domain]))
+                .expect("每个上游的 auto 都必须渲染");
+            assert_eq!(domain_rule["inbound"], json!([policy]));
+            let ranges = json!(inverted_port_ranges(&allowed));
+            let port_rule = rules.iter().find(|r| r["port_range"] == ranges).unwrap();
+            assert_eq!(port_rule["inbound"], json!([policy]));
+            let end = rules
+                .iter()
+                .find(|r| {
+                    r["inbound"] == json!([policy])
+                        && r.get("network").is_none()
+                        && r["outbound"] == format!("resi-egress-{}", g.upstreams[i].id)
+                })
+                .expect("policy 必须终止到对应真实出口，不能回到 selector");
+            assert!(end.get("domain").is_none() && end.get("port_range").is_none());
+        }
+        let pin = rules
+            .iter()
+            .find(|r| r["domain_suffix"] == json!(["pinned.example.com"]))
+            .unwrap();
+        assert_eq!(
+            pin["inbound"],
+            json!(["slot-0", "slot-1"]),
+            "人工 pins 对所有用户入口生效"
+        );
+    }
+
+    #[test]
+    fn selector_members_follow_policy_endpoints_without_embedding_provider_credentials() {
+        let g = group(2, ResiMode::Global);
+        let cfg = config(&g, &slots(&[0, 1]), &opts());
+        for (i, u) in g.upstreams.iter().enumerate() {
+            let endpoint = cfg["inbounds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|v| v["tag"] == format!("resi-policy-{}", u.id))
+                .expect("缺少 policy inbound");
+            assert_eq!(endpoint["listen"], "127.0.0.1");
+            assert_eq!(endpoint["listen_port"], 2180 + i);
+            let member = cfg["outbounds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|v| v["tag"] == member_tag(i))
+                .unwrap();
+            assert_eq!(member["type"], "socks");
+            assert_eq!(member["server"], "127.0.0.1");
+            assert_eq!(member["server_port"], endpoint["listen_port"]);
+            assert!(member.get("password").is_none());
+            let raw = cfg["outbounds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|v| v["tag"] == format!("resi-egress-{}", u.id))
+                .expect("真实出口 UUID 必须稳定可归因");
+            assert_eq!(raw["server"], u.host);
+            assert_eq!(raw["password"], u.password);
+        }
+    }
+
+    #[test]
+    fn policy_reuses_domain_sniff_only_where_auto_rules_need_it() {
+        let mut g = group(3, ResiMode::Global);
+        for (i, rule) in [
+            (0, Rule::DomainSuffix("auto.example.com".into())),
+            (1, Rule::Port(5228)),
+        ] {
+            g.blacklist.auto.push(crate::model::AutoEntry {
+                upstream_id: g.upstreams[i].id,
+                rule,
+                hits: 3,
+                confirmed_at: "2026-09-29T00:00:00Z".into(),
+                last_verified_at: "2026-09-29T00:00:00Z".into(),
+                passes: 0,
+            });
+        }
+        let cfg = config(&g, &slots(&[0, 1, 2]), &opts());
+        assert_eq!(
+            cfg["route"]["rules"][0],
+            json!({
+                "action": "sniff", "inbound": ["slot-0", "slot-1", "slot-2"]
+            })
+        );
+        let inner: Vec<_> = cfg["route"]["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .skip(1)
+            .filter(|r| r["action"] == "sniff")
+            .collect();
+        assert_eq!(inner.len(), 1, "只有带域名 auto 的出口需要第二次嗅探");
+        assert_eq!(
+            *inner[0],
+            json!({
+                "type": "logical", "mode": "and",
+                "rules": [
+                    { "inbound": [relay_policy::inbound_tag(g.upstreams[0].id)] },
+                    { "domain_regex": [".+"], "invert": true }
+                ],
+                "action": "sniff"
+            }),
+            "已有目标域名时不得再次等待 server-first 首包"
+        );
+    }
+
+    #[test]
+    fn removing_an_upstream_does_not_rename_the_remaining_real_egress() {
+        let mut g = group(2, ResiMode::Global);
+        let id = g.upstreams[1].id;
+        let before = config(&g, &slots(&[0, 1]), &opts());
+        g.upstreams.remove(0);
+        let after = config(&g, &slots(&[1]), &opts());
+        let raw = |cfg: &Value| {
+            cfg["outbounds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|o| o["tag"] == relay_policy::egress_tag(id))
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(
+            raw(&before),
+            raw(&after),
+            "raw UUID 出口必须跨池下标重排保持身份"
+        );
+        let member = |cfg: &Value, tag: &str| {
+            cfg["outbounds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|o| o["tag"] == tag)
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(member(&before, "resi-2")["server_port"], 2181);
+        assert_eq!(member(&after, "resi-1")["server_port"], 2180);
+    }
+
+    #[test]
+    fn a_single_slot_keeps_the_legacy_ingress_and_selector_contract() {
+        // 槽 0 对外仍是 2080 入站与 slot-0-pool；内部增加 policy 端点。
         let g = group(1, ResiMode::Global);
         let cfg = config(&g, &slots(&[0]), &opts());
-        assert_eq!(tags_of(&cfg, "inbounds"), vec!["slot-0"]);
+        assert_eq!(legacy_tags_of(&cfg, "inbounds"), vec!["slot-0"]);
         assert_eq!(cfg["inbounds"][0]["listen_port"], 2080);
         assert_eq!(cfg["inbounds"][0]["listen"], "127.0.0.1");
         assert_eq!(cfg["inbounds"][0]["type"], "socks");
         assert_eq!(
-            tags_of(&cfg, "outbounds"),
+            legacy_tags_of(&cfg, "outbounds"),
             vec!["resi-1", "slot-0-pool", "resi-pool", "direct"]
         );
         assert_eq!(cfg["dns"]["servers"][0]["detour"], "resi-pool");
@@ -475,7 +731,7 @@ mod tests {
         let g = group(3, ResiMode::Global);
         let cfg = config(&g, &slots(&[0, 1, 2]), &opts());
         assert_eq!(
-            tags_of(&cfg, "inbounds"),
+            legacy_tags_of(&cfg, "inbounds"),
             vec!["slot-0", "slot-1", "slot-2"]
         );
         assert_eq!(
@@ -483,12 +739,13 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
+                .filter(|i| i["tag"].as_str().unwrap().starts_with("slot-"))
                 .map(|i| i["listen_port"].as_u64().unwrap())
                 .collect::<Vec<_>>(),
             vec![2080, 2081, 2082]
         );
         assert_eq!(
-            tags_of(&cfg, "outbounds"),
+            legacy_tags_of(&cfg, "outbounds"),
             vec![
                 "resi-1",
                 "resi-2",
@@ -536,7 +793,10 @@ mod tests {
         for i in 0..3u16 {
             let r = rules
                 .iter()
-                .find(|r| r["inbound"] == serde_json::json!([format!("slot-{i}")]))
+                .find(|r| {
+                    r["inbound"] == serde_json::json!([format!("slot-{i}")])
+                        && r["outbound"] == format!("slot-{i}-pool")
+                })
                 .unwrap_or_else(|| panic!("缺 slot-{i} 的路由"));
             assert_eq!(r["outbound"], format!("slot-{i}-pool"));
             assert!(r.get("domain_keyword").is_none());
@@ -550,7 +810,9 @@ mod tests {
         let rules = cfg["route"]["rules"].as_array().unwrap();
         let r0 = rules
             .iter()
-            .find(|r| r["inbound"] == serde_json::json!(["slot-0"]))
+            .find(|r| {
+                r["inbound"] == serde_json::json!(["slot-0"]) && r["outbound"] == "slot-0-pool"
+            })
             .unwrap();
         assert_eq!(
             r0["domain_keyword"],
@@ -566,13 +828,13 @@ mod tests {
         let mut g = group(3, ResiMode::Global);
         g.upstreams.retain(|u| u.id != Uuid::from_u128(2));
         let cfg = config(&g, &slots(&[0, 2]), &opts());
-        assert_eq!(tags_of(&cfg, "inbounds"), vec!["slot-0", "slot-2"]);
+        assert_eq!(legacy_tags_of(&cfg, "inbounds"), vec!["slot-0", "slot-2"]);
         assert_eq!(
             cfg["inbounds"][1]["listen_port"], 2082,
             "端口跟序号走，不跟位置走"
         );
         assert_eq!(
-            tags_of(&cfg, "outbounds"),
+            legacy_tags_of(&cfg, "outbounds"),
             vec![
                 "resi-1",
                 "resi-2",
@@ -621,23 +883,24 @@ mod tests {
             ),
         ] {
             let cfg = config(&g, &sl, &opts());
-            assert_eq!(tags_of(&cfg, "inbounds"), want_inbounds);
+            assert_eq!(legacy_tags_of(&cfg, "inbounds"), want_inbounds);
             assert_eq!(
                 cfg["inbounds"]
                     .as_array()
                     .unwrap()
                     .iter()
+                    .filter(|i| i["tag"].as_str().unwrap().starts_with("slot-"))
                     .map(|i| i["listen_port"].as_u64().unwrap())
                     .collect::<Vec<_>>(),
                 want_ports
             );
-            assert_eq!(tags_of(&cfg, "outbounds"), vec!["direct"]);
+            assert_eq!(legacy_tags_of(&cfg, "outbounds"), vec!["direct"]);
             assert_eq!(cfg["route"]["final"], "direct");
             assert!(cfg["route"]["rules"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .all(|r| r.get("inbound").is_none()));
+                .all(|r| { r.get("outbound").is_none() || r["outbound"] == "direct" }));
         }
     }
 
@@ -647,9 +910,9 @@ mod tests {
     fn slots_pointing_at_a_vanished_upstream_are_dropped() {
         let g = group(1, ResiMode::Global);
         let cfg = config(&g, &slots(&[0, 1]), &opts());
-        assert_eq!(tags_of(&cfg, "inbounds"), vec!["slot-0"]);
+        assert_eq!(legacy_tags_of(&cfg, "inbounds"), vec!["slot-0"]);
         assert_eq!(
-            tags_of(&cfg, "outbounds"),
+            legacy_tags_of(&cfg, "outbounds"),
             vec!["resi-1", "slot-0-pool", "resi-pool", "direct"]
         );
     }

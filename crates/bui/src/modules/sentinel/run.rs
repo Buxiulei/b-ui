@@ -155,7 +155,20 @@ pub async fn tick(ctx: &DaemonCtx, deps: &Deps, s: &mut Sentinel) -> TickReport 
         matched.push((r, m));
     }
 
-    // ②b 归因（有 I/O）：relay 的错误行在生产里只带池 tag（`selector[slot-<i>-pool]` /
+    // ②b 新拓扑只接受内层 UUID 出口：外层 SOCKS 会转换错误码，不能再次归因/计数。
+    // 仅当实际内核清单确认旧拓扑，才继续保留下述兼容路径；API 不可读时绝不猜。
+    let legacy = clash::legacy_attribution(
+        &deps.clash,
+        matched.iter().filter_map(|(_, m)| m.relay.as_ref()),
+    )
+    .await;
+    matched.retain(|(_, m)| {
+        m.relay
+            .as_ref()
+            .is_none_or(|sub| clash::attributable(sub, legacy))
+    });
+
+    // 旧拓扑归因（有 I/O）：relay 的错误行只带池 tag（`selector[slot-<i>-pool]` /
     // `urltest[resi-pool]`），成员 tag 一个字都不出现，所以「哪个上游」要在这里换 —— 路径 A
     // 用 reason 里的 `dial tcp` 地址（零 I/O），路径 B 问一次池的 `now`（**每池只查一次**）。
     // 路径 B 的行还要过一道**时间戳门**（`clash::within_switch_grace`）：`now` 说的是「此刻
@@ -432,6 +445,74 @@ mod tests {
             "ERROR[4006] [2302991392 6.42s] connection: open connection to www.gstatic.com:443 \
              using outbound/socks[{tag}]: dial tcp 198.51.100.8:10007: i/o timeout"
         )
+    }
+
+    #[tokio::test]
+    async fn policy_egress_timeouts_follow_the_uuid_after_member_reordering() {
+        let k = kit().await;
+        rstate::update_group(&k.ctx.store, &k.ctx.bus, |g| g.upstreams.reverse())
+            .await
+            .unwrap();
+        k.prober.with_gateways_up(&["isp1.example.net:10007"]);
+        k.host.advance(3);
+        let tag = bui_schema::relay_policy::egress_tag(Uuid::from_u128(2));
+        feed(
+            &k,
+            (0..2)
+                .map(|t| rec("b-ui-relay", t, &timeout(&tag)))
+                .collect(),
+        );
+        let mut s = Sentinel::default();
+        let rep = tick(&k.ctx, &k.deps, &mut s).await;
+        assert_eq!(rep.incidents.len(), 1, "{:?}", rep.incidents);
+        assert_eq!(rep.incidents[0].subject, "isp2.example.net:10007");
+        assert!(rep.incidents[0].sample.as_deref().unwrap().contains(&tag));
+    }
+
+    #[tokio::test]
+    async fn policy_egress_and_outer_errors_do_not_double_the_fault_count() {
+        let k = kit().await;
+        // 采完新拓扑日志后、读取 API 前已经回滚成旧拓扑；批内 UUID 仍证明外层可能是副本。
+        k.clash.with(|i| i.legacy_attribution = true);
+        k.prober.with_gateways_up(&["isp1.example.net:10007"]);
+        k.host.advance(3);
+        let tag = bui_schema::relay_policy::egress_tag(Uuid::from_u128(2));
+        feed(
+            &k,
+            vec![
+                rec("b-ui-relay", 0, &timeout(&tag)),
+                rec("b-ui-relay", 1, &timeout("resi-2")),
+                rec("b-ui-relay", 2, fx::POOL_SELECTOR_DEADLINE_SLOT1),
+            ],
+        );
+        let mut s = Sentinel::default();
+        assert!(tick(&k.ctx, &k.deps, &mut s).await.incidents.is_empty());
+        assert!(
+            k.prober.calls().is_empty(),
+            "一条真实失败不能被外层复制成两条"
+        );
+        assert!(k.clash.calls().is_empty(), "不查询外层当前选择");
+        k.host.advance(3);
+        feed(&k, vec![rec("b-ui-relay", 4, &timeout(&tag))]);
+        let rep = tick(&k.ctx, &k.deps, &mut s).await;
+        assert_eq!(rep.incidents.len(), 1, "{:?}", rep.incidents);
+        assert_eq!(rep.incidents[0].subject, "isp2.example.net:10007");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_policy_egress_cannot_trigger_a_probe_or_borrow() {
+        let k = kit().await;
+        let tag = bui_schema::relay_policy::egress_tag(Uuid::from_u128(99));
+        k.host.advance(3);
+        feed(
+            &k,
+            (0..3)
+                .map(|t| rec("b-ui-relay", t, &timeout(&tag)))
+                .collect(),
+        );
+        let mut s = Sentinel::default();
+        assert!(tick(&k.ctx, &k.deps, &mut s).await.incidents.is_empty());
+        assert!(k.prober.calls().is_empty());
     }
 
     fn journal_op(host: &FakeHost) -> String {

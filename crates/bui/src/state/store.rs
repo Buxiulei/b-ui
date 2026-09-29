@@ -38,12 +38,14 @@ impl Store {
             std::fs::read(&path).with_context(|| format!("读取 {} 失败", path.display()))?;
         let state: State = serde_json::from_slice(&bytes)
             .with_context(|| format!("解析 {} 失败", path.display()))?;
+        validate_residential_groups(&state)?;
         Ok(Self::wrap(path, state))
     }
 
     /// 首次落盘（`bui install`）：没有旧版可备份，直接写。
     pub async fn create(path: impl Into<PathBuf>, state: State) -> Result<Self> {
         let path = path.into();
+        validate_residential_groups(&state)?;
         let store = Self::wrap(path, state);
         let bytes = serde_json::to_vec_pretty(&*store.read().await)?;
         let inner = store.0.clone();
@@ -86,6 +88,7 @@ impl Store {
         let old_bytes = serde_json::to_vec_pretty(&*current)?;
         let mut next = (*current).clone();
         f(&mut next);
+        validate_residential_groups(&next)?;
         if let Some(why) = upstream_shrink_refusal(&current, &next, caller) {
             // error 级：这是「数据要没了」级别的事件，运维必须在 journal 里看得见
             tracing::error!(caller, "{why}");
@@ -108,6 +111,17 @@ impl Store {
         *self.0.cache.write().await = next.clone();
         Ok(next)
     }
+}
+
+/// 渲染器的内部端口是有界资源。所有分组在进入缓存或写盘之前校验，防止旧版导入 /
+/// 手工编辑绕过 add API 的容量限制后，直到对账时才 panic。错误只带分组名与数量。
+fn validate_residential_groups(state: &State) -> Result<()> {
+    for (name, group) in &state.residential.groups {
+        bui_schema::relay_policy::validate_group(group)
+            .map_err(anyhow::Error::msg)
+            .with_context(|| format!("住宅分组 {name} 配置无效"))?;
+    }
+    Ok(())
 }
 
 /// 住宅上游池变短的拒写判据（R3 ①）：返回 `Some(理由)` 就拒绝这次写盘。
@@ -392,6 +406,86 @@ mod tests {
         s
     }
 
+    #[tokio::test]
+    async fn opening_an_oversized_pool_is_a_clear_error_and_preserves_the_file() {
+        let d = dir();
+        let p = d.path().join("state.json");
+        let bytes = serde_json::to_vec_pretty(&state_with_pool(9)).unwrap();
+        std::fs::write(&p, &bytes).unwrap();
+        let error = Store::open(&p)
+            .await
+            .err()
+            .expect("超容量 state 不能进入 renderer");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("default") && message.contains('8') && message.contains('9'),
+            "{message}"
+        );
+        assert!(!message.contains("pw-secret"), "{message}");
+        assert_eq!(std::fs::read(&p).unwrap(), bytes);
+        assert!(!d.path().join("state.backups").exists());
+    }
+
+    #[tokio::test]
+    async fn creating_an_oversized_secondary_pool_never_writes_or_overwrites_state() {
+        let d = dir();
+        let p = d.path().join("state.json");
+        let mut invalid = state_with_pool(0);
+        invalid.residential.groups.insert(
+            "secondary".into(),
+            state_with_pool(9)
+                .residential
+                .groups
+                .remove("default")
+                .unwrap(),
+        );
+        let error = Store::create(&p, invalid.clone())
+            .await
+            .err()
+            .expect("非 default 分组也须校验");
+        assert!(format!("{error:#}").contains("secondary"));
+        assert!(!p.exists(), "失败创建不能留下无效 state");
+        Store::create(&p, state_with_pool(8)).await.unwrap();
+        let bytes = std::fs::read(&p).unwrap();
+        assert!(Store::create(&p, invalid).await.is_err());
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            bytes,
+            "失败创建不得覆盖已有 state"
+        );
+        assert!(!d.path().join("state.backups").exists());
+    }
+
+    #[tokio::test]
+    async fn updating_beyond_pool_capacity_keeps_disk_cache_and_backups_unchanged() {
+        let d = dir();
+        let p = d.path().join("state.json");
+        let store = Store::create(&p, state_with_pool(8)).await.unwrap();
+        let bytes = std::fs::read(&p).unwrap();
+        let before = store.read().await;
+        for caller in [CALLER_UNLABELED, CALLER_RESI_REMOVE] {
+            let error = store
+                .update_as(caller, |s| {
+                    s.residential.groups = state_with_pool(9).residential.groups;
+                    s.node.name = "must-not-be-written".into();
+                })
+                .await
+                .expect_err("任何调用点都不能写入超容量上游池");
+            let message = format!("{error:#}");
+            assert!(message.contains('8') && message.contains('9'), "{message}");
+            assert!(!message.contains("pw-secret"), "{message}");
+            assert!(
+                Arc::ptr_eq(&before, &store.read().await),
+                "拒写后缓存也不能换成新状态"
+            );
+            assert_eq!(std::fs::read(&p).unwrap(), bytes);
+            assert!(
+                !d.path().join("state.backups").exists(),
+                "拒写不应挤占备份额度"
+            );
+        }
+    }
+
     /// R3 ①：住宅上游池只能由 `upstream::remove` 变短。任何别的调用点（陈旧克隆被写回、
     /// 并发写互相覆盖、将来某个模块顺手改了住宅段）都必须**拒写**，而不是静默少两条。
     #[tokio::test]
@@ -436,7 +530,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_remove_caller_may_shrink_and_growth_is_always_allowed() {
+    async fn the_remove_caller_may_shrink_and_growth_within_capacity_is_allowed() {
         let d = dir();
         let p = d.path().join("state.json");
         let store = Store::create(&p, state_with_pool(3)).await.unwrap();
