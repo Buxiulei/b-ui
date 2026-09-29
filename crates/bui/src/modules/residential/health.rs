@@ -441,6 +441,37 @@ pub async fn check_round(
     c: Arc<dyn Clash>,
     before: Vec<Uuid>,
 ) -> anyhow::Result<RoundOutcome> {
+    // 故障切换先完成，再跑可选的吞吐测速。每成员上下行各可等 60 秒，
+    // 不能让已经确认失效的出口继续承载流量，排队等待全池测速结束。
+    let out = check_health_round(ctx, p.clone(), c, before.clone()).await?;
+    let s = ctx.store.read().await.clone();
+    let g = state::group_of(&s);
+    if !g.pool_active() || ids_of(&g) != before {
+        return Ok(out);
+    }
+    let rt = state::read(&ctx.runtime).await;
+    let now = ctx.host.now();
+    let (down_bytes, up_bytes, interval) = speedtest_cfg(&s);
+    let due = match rt.last_speedtest_at.as_deref().and_then(parse_rfc3339) {
+        Some(t) => {
+            let mins = (now - t).whole_minutes();
+            mins >= interval || mins < 0
+        }
+        None => true,
+    };
+    if due {
+        run_speedtest(ctx, p, &g.upstreams, down_bytes, up_bytes, now).await;
+    }
+    Ok(out)
+}
+
+/// 一轮探测与选路；只有这一步完成后才允许可选的吞吐测速占用巡检任务。
+async fn check_health_round(
+    ctx: &DaemonCtx,
+    p: Arc<dyn Prober>,
+    c: Arc<dyn Clash>,
+    before: Vec<Uuid>,
+) -> anyhow::Result<RoundOutcome> {
     let mut out = RoundOutcome::default();
     let g = state::group_of(&*ctx.store.read().await);
     // R1 之前按位置名写进 alerts 的上游告警、以及已被删出池的 uuid 留下的孤儿告警：
@@ -522,21 +553,6 @@ pub async fn check_round(
     })
     .await;
 
-    // 每小时一轮**全量测速**（主理人 2026-09-12）：与巡检同一个 tick，不另起调度器；
-    // 到点与否看 runtime 的游标，所以守护进程重启既不会漏测也不会连着测两次。
-    // 放在健康判定之后：测速失败只记 note，一个字节都不影响上面那份判定。
-    let (down_bytes, up_bytes, interval) = speedtest_cfg(&ctx.store.read().await.clone());
-    let due = match rt.last_speedtest_at.as_deref().and_then(parse_rfc3339) {
-        // 时钟回跳（NTP 校时）不该把测速永久锁死
-        Some(t) => {
-            let mins = (now - t).whole_minutes();
-            mins >= interval || mins < 0
-        }
-        None => true,
-    };
-    if due {
-        run_speedtest(ctx, p.clone(), &ups, down_bytes, up_bytes, now).await;
-    }
     let healthy: Vec<Uuid> = probed
         .iter()
         .map(|(id, _)| *id)
@@ -558,6 +574,17 @@ pub async fn check_round(
         state::clear_alert_persisted(&ctx.runtime, ALL_UNHEALTHY_ALERT).await;
     }
 
+    // 规则 4：成员集在本轮内变化 → 只写 runtime，不切
+    let after = ids_of(&state::group_of(&*ctx.store.read().await));
+    if after != before {
+        out.notes.push(format!(
+            "住宅池成员集在本轮探测期间变化（{} → {} 个成员），本轮不切换",
+            before.len(),
+            after.len()
+        ));
+        return Ok(out);
+    }
+
     // spec §5.6：按槽驱动各自的 selector。放在 healthy 算完、全局切换判定之前 ——
     // 它与全局 selector 的决策彼此独立（D8），而且不管全局这一轮切不切，
     // 每个槽都得按「本槽优先 / 借用 / 3 轮切回」收敛到位。
@@ -575,16 +602,16 @@ pub async fn check_round(
         }
     }
 
-    // 规则 4：成员集在本轮内变化 → 只写 runtime，不切
-    let after = ids_of(&state::group_of(&*ctx.store.read().await));
-    if after != before {
-        out.notes.push(format!(
-            "住宅池成员集在本轮探测期间变化（{} → {} 个成员），本轮不切换",
-            before.len(),
-            after.len()
-        ));
+    // 槽驱动已经释放同一把锁，此处只包住全局决策与落账，不能把外部健康探测锁进去。
+    // 等锁期间可能有人手动选过出口，必须重读 runtime；否则旧快照仍会撤销已生效的选择。
+    let _switch = super::slots::slot_switch(ctx).lock_owned().await;
+    let g = state::group_of(&*ctx.store.read().await);
+    if ids_of(&g) != before {
+        out.notes
+            .push("住宅池成员在等待出口决策时变化，本轮不切换全局出口".into());
         return Ok(out);
     }
+    let rt = state::read(&ctx.runtime).await;
 
     // 规则 5：读不到当前选择（relay 没起来或旧配置）→ 不切
     let cc = c.clone();
@@ -836,6 +863,7 @@ fn switch_cooldown(r: &ResiRuntime, now: OffsetDateTime) -> Option<i64> {
 /// 手动锁定 / 归零防抖计数）并返回 `true`；失败 → 记全局告警、**不改 runtime** 并返回
 /// `false`（别把没生效的选择记成生效，下一轮重新评估）。
 /// 规则 10/11 与规则 6c 两条切换路径共用它，免得落账口径有两份。
+/// 唯一调用方 `check_health_round` 已持有出口决策锁；这里不能重复加锁。
 #[allow(clippy::too_many_arguments)]
 async fn switch_to(
     ctx: &DaemonCtx,
@@ -937,6 +965,9 @@ pub async fn health_loop(ctx: DaemonCtx, p: Arc<dyn Prober>, c: Arc<dyn Clash>) 
         if let Err(e) = check_once(&ctx, p.clone(), c.clone()).await {
             tracing::warn!(error = %e, "住宅巡检一轮失败：{e}");
         }
+        // 慢探测/测速跨过多个 tick 时，不补跑历史轮次：补跑会瞬间用尽两轮迟滞，
+        // 也会把「连续三轮恢复」压缩成几秒。下一轮从本轮完成后重新计时。
+        tick.reset();
     }
 }
 
@@ -1089,6 +1120,8 @@ async fn select_with_retry(
 ///   （`drive_slots` 重 PUT；规则 6a 发现 now 与运行时不一致就重放）；
 /// - `back_rounds` 一律不清：它记的是「本槽自己健康了几轮」，与 relay 重启无关。
 pub async fn replay_after_restart(ctx: &DaemonCtx, c: Arc<dyn Clash>) -> ReplayOutcome {
+    // 锁必须早于计划快照，且覆盖内核 PUT 与落账，避免旧重放覆盖新的 pin/巡检决策。
+    let _switch = super::slots::slot_switch(ctx).lock_owned().await;
     let (g, view, all_pools) = {
         let s = ctx.store.read().await;
         (
@@ -1137,8 +1170,7 @@ pub async fn replay_after_restart(ctx: &DaemonCtx, c: Arc<dyn Clash>) -> ReplayO
             .map(|(i, e)| (i.selector.clone(), i.tag.clone(), e.clone()))
             .collect(),
     };
-    // 槽的落账与告警并成一次写。重放期间巡检也可能动过某一槽（drive_slots 同样会 PUT）：
-    // 只在 current 还是事件时那个值时才改，别覆盖它
+    // 槽的落账与告警并成一次写。出口决策共用锁，保留旧值比较以防槽被配置变更移除/重建。
     let slot_writes: Vec<(u16, Option<Uuid>, Option<Uuid>)> = done
         .iter()
         .filter_map(|i| i.slot)
@@ -1218,6 +1250,7 @@ pub async fn replay_loop(
 /// 管理员手动切换（`POST /api/residential/select`）：只走 Clash API，不写 state（契约决策 §C），
 /// 并**锁定**到这条上游，直到它不健康（R2 ①）——否则下一轮巡检按 priority 就把它换走了。
 pub async fn select_manual(ctx: &DaemonCtx, c: Arc<dyn Clash>, id: Uuid) -> anyhow::Result<String> {
+    let _switch = super::slots::slot_switch(ctx).lock_owned().await;
     let g = state::group_of(&*ctx.store.read().await);
     let tag = clash::tag_of(&g, id).ok_or_else(|| anyhow::anyhow!("上游不在当前池里"))?;
     let (cc, t2) = (c.clone(), tag.clone());
@@ -1239,6 +1272,7 @@ pub async fn select_manual(ctx: &DaemonCtx, c: Arc<dyn Clash>, id: Uuid) -> anyh
 /// 只清锁定位，**不动** relay 的当前选择 —— 下一轮巡检自己按 Google / priority 重新挑，
 /// 免得一按「自动」就无谓地掐一次连接。
 pub async fn select_auto(ctx: &DaemonCtx) {
+    let _switch = super::slots::slot_switch(ctx).lock_owned().await;
     state::update(&ctx.runtime, |r| r.manual_selected_id = None).await;
 }
 
@@ -1311,6 +1345,7 @@ mod tests {
         speed: std::collections::BTreeMap<String, (f64, f64)>,
         /// host → UDP 探测结果（http 上游由 `proxy::http_no_udp` 兜底，不看这张表）
         udp: std::collections::BTreeMap<String, proxy::UdpProbe>,
+        on_speedtest: Option<Box<dyn Fn() + Send + Sync>>,
     }
     impl Prober for ByHost {
         fn connect(
@@ -1380,6 +1415,9 @@ mod tests {
                 .unwrap_or_default()
         }
         fn speedtest(&self, up: &Upstream, _d: u64, _u: u64) -> proxy::SpeedSample {
+            if let Some(observe) = &self.on_speedtest {
+                observe();
+            }
             match self.speed.get(&up.host) {
                 Some((d, u)) => proxy::SpeedSample {
                     down_mbps: Some(*d),
@@ -2200,6 +2238,61 @@ mod tests {
         let h2 = &r.health[&Uuid::from_u128(2).to_string()];
         assert_eq!(h2.http_ms, vec![120], "每个成员各自记");
         assert_eq!(h2.down_mbps, vec![20.0]);
+    }
+
+    #[tokio::test]
+    async fn a_dead_exit_is_replaced_before_any_throughput_test_starts() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let d = tempfile::tempdir().unwrap();
+        let (c, _) = ctx_with_slots(&d, &[10, 20], 2).await;
+        let clash = Arc::new(FakeClash::new(Some("resi-1")));
+        // 当前出口已经失败一轮：本轮应达到故障切换门槛，同时首次测速到期。
+        rstate::update(&c.runtime, |r| {
+            r.health
+                .entry(Uuid::from_u128(1).to_string())
+                .or_default()
+                .failstreak = 1;
+        })
+        .await;
+        let checked = Arc::new(AtomicUsize::new(0));
+        let ready = Arc::new(AtomicBool::new(true));
+        let (c2, checked2, ready2) = (clash.clone(), checked.clone(), ready.clone());
+        let p = ByHost {
+            bad: ["isp1.example.net".to_string()].into_iter().collect(),
+            on_speedtest: Some(Box::new(move || {
+                let switched = c2.peek(POOL).as_deref() == Some("resi-2")
+                    && c2.peek("slot-0-pool").as_deref() == Some("resi-2");
+                ready2.fetch_and(switched, Ordering::SeqCst);
+                checked2.fetch_add(1, Ordering::SeqCst);
+            })),
+            ..Default::default()
+        };
+        check_once(&c, Arc::new(p), clash).await.unwrap();
+        assert_eq!(checked.load(Ordering::SeqCst), 2, "仍然保留每小时测速");
+        assert!(
+            ready.load(Ordering::SeqCst),
+            "全局与槽出口必须先避开死上游，不能等测速超时"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_changed_pool_cannot_switch_slots_using_the_old_member_positions() {
+        let d = tempfile::tempdir().unwrap();
+        let (c, host) = ctx_with_slots(&d, &[10, 20], 2).await;
+        let clash = Arc::new(FakeClash::new(Some("resi-1")));
+        let p = by_host(&["isp1.example.net"], &[]);
+        check_once(&c, p.clone(), clash.clone()).await.unwrap();
+        let before_calls = clash.calls().len();
+        host.advance(120);
+        let stale = vec![Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3)];
+        let out = check_round(&c, p, clash.clone(), stale).await.unwrap();
+        assert!(out.notes.iter().any(|n| n.contains("成员集")));
+        assert!(
+            !clash.calls()[before_calls..]
+                .iter()
+                .any(|x| x.starts_with("put:")),
+            "成员位置变过时，槽 selector 和全局 selector 一律不能按旧快照切换"
+        );
     }
 
     #[tokio::test]

@@ -742,9 +742,13 @@ pub struct SlotOutcome {
     pub dead: Vec<Uuid>,
 }
 
-/// 按槽切换的互斥（设计裁决 D7）：[`drive_slots`] 整轮「读快照 → 逐槽 PUT → 按快照写回
-/// `current_upstream_id`」，[`borrow_now`] 若落在中间，它写的记录会被那轮写回盖成旧值（relay 的
-/// selector 已经切走，runtime 还记着旧值）。两者各自整段持锁。
+/// relay 出口决策的互斥：巡检、借用、手动选择与重启重放必须共同串行化
+/// 「读快照 → PUT → 写 runtime」。只在写 runtime 时比较旧值挡不住陈旧 PUT：
+/// 内核可能已被旧计划切回、runtime 却仍记着新选择。
+///
+/// 先拿本锁，再短暂读写 store/runtime；不在它们的写入闭包里反过来拿本锁。
+/// 调用方不得嵌套加锁；全局巡检在 [`drive_slots`] 返回后才获取它。常规健康探测和
+/// 吞吐测速留在锁外；重放的就绪重试与借用后的限时验证保留既有预算。
 ///
 /// **锁内不只有毫秒级的 Clash PUT**：[`borrow_now`] 在锁内最多做 [`BORROW_PROBES_PER_CALL`] 次
 /// 带外验证，每次上限 [`health::QUICK_PROBE_BUDGET_SECS`] 秒，所以一次持锁最坏是「每个受影响的
@@ -756,7 +760,7 @@ pub struct SlotOutcome {
 /// 一个进程只有一个 `DaemonCtx`，等于进程级一把。不写成进程级 `static`：同一个测试二进制里的多个
 /// `#[tokio::test]` 会共用这把锁，`start_paused` 的测试在等别的测试放锁时假时钟自动推进，
 /// 「等到出现」的循环瞬间耗尽（同 `api::auth::LoginLimiter` 不用进程级 `OnceLock` 的理由）。
-fn slot_switch(ctx: &DaemonCtx) -> Arc<tokio::sync::Mutex<()>> {
+pub(super) fn slot_switch(ctx: &DaemonCtx) -> Arc<tokio::sync::Mutex<()>> {
     static LOCKS: std::sync::Mutex<BTreeMap<usize, Arc<tokio::sync::Mutex<()>>>> =
         std::sync::Mutex::new(BTreeMap::new());
     let key = Arc::as_ptr(&ctx.host).cast::<()>() as usize;
@@ -817,8 +821,8 @@ async fn put_slot(
 ///
 /// 每槽的规则（比全局 selector 的规则简单得多，D8）：
 /// 1. 手动 pin 且目标还在池里 ⇒ 用 pin，不看健康度（管理员的判断压过巡检）；
-/// 2. 本槽自己的 IP 健康**且** Google 没被封 ⇒ 用本槽；正在借用时要先攒满
-///    [`SLOT_BACK_ROUNDS`] 轮才切回（防抖）；
+/// 2. 本槽自己的 IP 健康**且** Google 没被封 ⇒ 用本槽；借用出口仍健康且 Google
+///    没被封时先攒满 [`SLOT_BACK_ROUNDS`] 轮才切回（防抖），借用出口失效则立即切回；
 /// 3. 否则借用 [`health::rank_healthy`] 里排名最高的**其他**健康 IP；
 /// 4. 一个健康的都没有 ⇒ **本轮什么都不做**：不发 Clash PUT、不改 runtime 里的
 ///    `current_upstream_id`，只记一条 note（fail-open，降级总比乱切好）。首轮就全池不健康
@@ -867,8 +871,14 @@ pub async fn drive_slots(
                 (p, 0, Some("手动 pin".to_string()), false)
             }
             _ if own_good => {
-                // 规则 2：正在借用时要攒轮数
-                if current.is_some_and(|cur| cur != s.upstream_id) {
+                // 恢复防抖只保护仍可用的借用出口。借用出口已坏或被移除时，
+                // 本槽既已健康就立即回去，不能再把用户留在坏出口上等三轮。
+                if current.is_some_and(|cur| {
+                    cur != s.upstream_id
+                        && g.upstreams.iter().any(|u| u.id == cur)
+                        && is_healthy(cur)
+                        && google_ok(cur)
+                }) {
                     let r = sr.back_rounds + 1;
                     if r >= SLOT_BACK_ROUNDS {
                         (s.upstream_id, 0, None, false)
@@ -1267,6 +1277,7 @@ pub async fn pin_slot(
     index: u16,
     target: Option<Uuid>,
 ) -> anyhow::Result<()> {
+    let _switch = slot_switch(ctx).lock_owned().await;
     let s = ctx.store.read().await;
     let g = state::group_of(&s);
     anyhow::ensure!(
@@ -2661,6 +2672,270 @@ mod tests {
         assert!(s1.switched);
         assert_eq!(clash.selected("slot-1-pool").as_deref(), Some("resi-2"));
         assert_eq!(state::read(&ctx.runtime).await.slots["1"].back_rounds, 0);
+    }
+
+    /// 恢复防抖只保护仍可用的借用出口；它坏掉时不能继续等三轮。
+    #[tokio::test]
+    async fn a_failed_borrow_returns_to_the_healthy_own_ip_without_waiting() {
+        for borrowed_google in [Some(true), Some(false)] {
+            let d = tempfile::tempdir().unwrap();
+            let (ctx, clash) = three_slot_ctx(d.path()).await;
+            let borrowed_active = borrowed_google == Some(false);
+            seed_health(
+                &ctx,
+                &[
+                    (1, borrowed_google, 100, borrowed_active),
+                    (2, Some(true), 100, true),
+                    (3, Some(true), 100, true),
+                ],
+            )
+            .await;
+            state::update(&ctx.runtime, |r| {
+                r.slots.entry("1".into()).or_default().current_upstream_id =
+                    Some(Uuid::from_u128(1));
+            })
+            .await;
+            clash.with(|i| {
+                i.now.insert("slot-1-pool".into(), "resi-1".into());
+            });
+            let grp = state::group_of(&*ctx.store.read().await);
+            let healthy = if borrowed_active {
+                vec![Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3)]
+            } else {
+                vec![Uuid::from_u128(2), Uuid::from_u128(3)]
+            };
+            let out = drive_slots(
+                &ctx,
+                clash.clone(),
+                &grp,
+                &healthy,
+                OffsetDateTime::UNIX_EPOCH,
+            )
+            .await;
+            let own = out.iter().find(|o| o.index == 1).unwrap();
+            assert!(own.switched, "借用出口失效时应立即切回已健康的本槽");
+            assert_eq!(clash.peek("slot-1-pool").as_deref(), Some("resi-2"));
+            let rt = state::read(&ctx.runtime).await;
+            assert_eq!(rt.slots["1"].current_upstream_id, Some(Uuid::from_u128(2)));
+            assert_eq!(rt.slots["1"].back_rounds, 0);
+        }
+    }
+
+    /// 只暂停一次指定 PUT，复现旧重放计划晚于新选择到达内核的交错。
+    /// 外部 Clash API 用假件，其余驱动、重放和落账均走生产实现。
+    struct PausingClash {
+        inner: Arc<FakeClash>,
+        selector: &'static str,
+        tag: &'static str,
+        entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        resume: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl Clash for PausingClash {
+        fn ready(&self) -> bool {
+            self.inner.ready()
+        }
+
+        fn selected(&self, selector: &str) -> Option<String> {
+            self.inner.selected(selector)
+        }
+
+        fn select(
+            &self,
+            selector: &str,
+            tag: &str,
+        ) -> Result<(), crate::modules::residential::clash::ClashError> {
+            if selector == self.selector && tag == self.tag {
+                let entered = self.entered.lock().unwrap().take();
+                if let Some(entered) = entered {
+                    let _ = entered.send(());
+                    self.resume
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("测试应释放被暂停的 PUT");
+                }
+            }
+            self.inner.select(selector, tag)
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_cannot_overwrite_a_newer_slot_pin_or_health_decision() {
+        for manual in [true, false] {
+            let d = tempfile::tempdir().unwrap();
+            let (ctx, clash) = three_slot_ctx(d.path()).await;
+            seed_health(
+                &ctx,
+                &[
+                    (1, Some(true), 100, true),
+                    (2, Some(true), 100, true),
+                    (3, Some(true), 100, true),
+                ],
+            )
+            .await;
+            state::update(&ctx.runtime, |r| {
+                let slot = r.slots.entry("1".into()).or_default();
+                slot.current_upstream_id = Some(Uuid::from_u128(1));
+                slot.back_rounds = 2;
+            })
+            .await;
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            let paused: Arc<dyn Clash> = Arc::new(PausingClash {
+                inner: clash.clone(),
+                selector: "slot-1-pool",
+                tag: "resi-1",
+                entered: std::sync::Mutex::new(Some(entered_tx)),
+                resume: std::sync::Mutex::new(resume_rx),
+            });
+            let (replay_ctx, replay_clash) = (ctx.clone(), paused.clone());
+            let replay = tokio::spawn(async move {
+                health::replay_after_restart(&replay_ctx, replay_clash).await
+            });
+            entered_rx.await.unwrap();
+            let (new_ctx, new_clash) = (ctx.clone(), paused.clone());
+            let mut newer = tokio::spawn(async move {
+                if manual {
+                    pin_slot(&new_ctx, new_clash, 1, Some(Uuid::from_u128(2)))
+                        .await
+                        .unwrap();
+                } else {
+                    let grp = state::group_of(&*new_ctx.store.read().await);
+                    drive_slots(
+                        &new_ctx,
+                        new_clash,
+                        &grp,
+                        &[Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3)],
+                        OffsetDateTime::UNIX_EPOCH,
+                    )
+                    .await;
+                }
+            });
+            // 旧实现的新选择会在重放暂停时完成；修复后会等重放释放同一把锁。
+            let finished = match tokio::time::timeout(Duration::from_millis(200), &mut newer).await
+            {
+                Ok(result) => {
+                    result.unwrap();
+                    true
+                }
+                Err(_) => false,
+            };
+            resume_tx.send(()).unwrap();
+            assert!(replay.await.unwrap().failed.is_empty());
+            if !finished {
+                newer.await.unwrap();
+            }
+            let rt = state::read(&ctx.runtime).await;
+            assert_eq!(rt.slots["1"].current_upstream_id, Some(Uuid::from_u128(2)));
+            assert_eq!(
+                clash.peek("slot-1-pool").as_deref(),
+                Some("resi-2"),
+                "重放不能让内核回到旧出口、runtime 却记着新出口；manual={manual}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_cannot_overwrite_a_newer_global_manual_selection() {
+        let d = tempfile::tempdir().unwrap();
+        let (ctx, clash) = three_slot_ctx(d.path()).await;
+        state::update(&ctx.runtime, |r| {
+            r.selected_upstream_id = Some(Uuid::from_u128(1));
+        })
+        .await;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let paused: Arc<dyn Clash> = Arc::new(PausingClash {
+            inner: clash.clone(),
+            selector: "resi-pool",
+            tag: "resi-1",
+            entered: std::sync::Mutex::new(Some(entered_tx)),
+            resume: std::sync::Mutex::new(resume_rx),
+        });
+        let (replay_ctx, replay_clash) = (ctx.clone(), paused.clone());
+        let replay =
+            tokio::spawn(
+                async move { health::replay_after_restart(&replay_ctx, replay_clash).await },
+            );
+        entered_rx.await.unwrap();
+        let (new_ctx, new_clash) = (ctx.clone(), paused.clone());
+        let mut newer = tokio::spawn(async move {
+            health::select_manual(&new_ctx, new_clash, Uuid::from_u128(2))
+                .await
+                .unwrap();
+        });
+        let finished = match tokio::time::timeout(Duration::from_millis(200), &mut newer).await {
+            Ok(result) => {
+                result.unwrap();
+                true
+            }
+            Err(_) => false,
+        };
+        resume_tx.send(()).unwrap();
+        assert!(replay.await.unwrap().failed.is_empty());
+        if !finished {
+            newer.await.unwrap();
+        }
+        let rt = state::read(&ctx.runtime).await;
+        assert_eq!(rt.selected_upstream_id, Some(Uuid::from_u128(2)));
+        assert_eq!(rt.manual_selected_id, Some(Uuid::from_u128(2)));
+        assert_eq!(clash.peek("resi-pool").as_deref(), Some("resi-2"));
+    }
+
+    #[tokio::test]
+    async fn a_health_round_cannot_overwrite_a_newer_global_manual_selection() {
+        let d = tempfile::tempdir().unwrap();
+        let (ctx, clash) = three_slot_ctx(d.path()).await;
+        state::update(&ctx.runtime, |r| {
+            r.selected_upstream_id = Some(Uuid::from_u128(1));
+        })
+        .await;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let entered = std::sync::Mutex::new(Some(entered_tx));
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let resume = std::sync::Mutex::new(resume_rx);
+        clash.with(|i| {
+            i.on_selected = Some(Arc::new(move || {
+                if let Some(entered) = entered.lock().unwrap().take() {
+                    let _ = entered.send(());
+                    resume
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap();
+                }
+            }));
+        });
+        let (health_ctx, health_clash) = (ctx.clone(), clash.clone());
+        let round = tokio::spawn(async move {
+            health::check_once(&health_ctx, prober_up(&[]), health_clash)
+                .await
+                .unwrap()
+        });
+        entered_rx.await.unwrap();
+        let (new_ctx, new_clash) = (ctx.clone(), clash.clone());
+        let mut newer = tokio::spawn(async move {
+            health::select_manual(&new_ctx, new_clash, Uuid::from_u128(2))
+                .await
+                .unwrap();
+        });
+        let finished = match tokio::time::timeout(Duration::from_millis(200), &mut newer).await {
+            Ok(result) => {
+                result.unwrap();
+                true
+            }
+            Err(_) => false,
+        };
+        resume_tx.send(()).unwrap();
+        round.await.unwrap();
+        if !finished {
+            newer.await.unwrap();
+        }
+        let rt = state::read(&ctx.runtime).await;
+        assert_eq!(rt.selected_upstream_id, Some(Uuid::from_u128(2)));
+        assert_eq!(rt.manual_selected_id, Some(Uuid::from_u128(2)));
+        assert_eq!(clash.peek("resi-pool").as_deref(), Some("resi-2"));
     }
 
     #[tokio::test]

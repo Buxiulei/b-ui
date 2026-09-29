@@ -116,13 +116,13 @@ pub struct NftRound {
     pub seen_rules: usize,
 }
 
-/// `nft list table` 的回显（或渲染器的规则集）里每条 redirect 的 `(链, dport, 目标端口)`。
+/// `nft list table` 的回显（或渲染器的规则集）里每条 redirect 的 `(链, dport, 目标端口, 目标必须属于本机)`。
 ///
 /// **不逐字比 `nft` 的回显**：`nft list` 会重排空白、把 `priority -100` 打成
 /// `priority dstnat`、给每条规则插一段 `counter packets N bytes N`，逐字比必然假 FAIL。
 /// 链名进 key 是为了守住「prerouting + output 双 hook」那条硬要求（少一条链时条数就不对，
 /// 而只挂 prerouting 时本机发往自身公网 IP 的包不过 prerouting、跳跃对本机自测直接失效）。
-pub fn redirect_rules(text: &str) -> Vec<(String, String, String)> {
+pub fn redirect_rules(text: &str) -> Vec<(String, String, String, bool)> {
     let mut chain = String::new();
     let mut out = Vec::new();
     for line in text.lines().map(str::trim) {
@@ -147,7 +147,17 @@ pub fn redirect_rules(text: &str) -> Vec<(String, String, String)> {
         let Some(target) = tail.split_whitespace().next() else {
             continue;
         };
-        out.push((chain.clone(), (*dport).to_string(), target.to_string()));
+        // 旧规则的端口完全相同，但缺少本机目标限制，会误截外部 UDP。
+        // 把这项纳入规范化结果，升级/自愈才能识别并修复旧规则。
+        let local_only = w.windows(4).any(|v| v == ["fib", "daddr", "type", "local"])
+            || w.windows(5)
+                .any(|v| v == ["fib", "daddr", "type", "==", "local"]);
+        out.push((
+            chain.clone(),
+            (*dport).to_string(),
+            target.to_string(),
+            local_only,
+        ));
     }
     out.sort();
     out
@@ -1671,16 +1681,43 @@ mod tests {
 table inet bui {
 \tchain prerouting {
 \t\ttype nat hook prerouting priority dstnat; policy accept;
-\t\tudp dport 41000-50000 counter packets 12 bytes 480 redirect to :40000 comment \"hy2 residential hop\"
-\t\tudp dport 40001-40007 counter packets 3 bytes 120 redirect to :40000 comment \"hy2 residential 4.0 compat\"
+\t\tudp dport 41000-50000 fib daddr type local counter packets 12 bytes 480 redirect to :40000 comment \"hy2 residential hop\"
+\t\tudp dport 40001-40007 fib daddr type local counter packets 3 bytes 120 redirect to :40000 comment \"hy2 residential 4.0 compat\"
 \t}
 \tchain output {
 \t\ttype nat hook output priority dstnat; policy accept;
-\t\tudp dport 41000-50000 counter packets 0 bytes 0 redirect to :40000 comment \"hy2 residential hop (local)\"
-\t\tudp dport 40001-40007 counter packets 1 bytes 40 redirect to :40000 comment \"hy2 residential 4.0 compat (local)\"
+\t\tudp dport 41000-50000 fib daddr type local counter packets 0 bytes 0 redirect to :40000 comment \"hy2 residential hop (local)\"
+\t\tudp dport 40001-40007 fib daddr type local counter packets 1 bytes 40 redirect to :40000 comment \"hy2 residential 4.0 compat (local)\"
 \t}
 }
 ";
+
+    #[test]
+    fn an_unrestricted_redirect_is_repaired_without_restarting_services() {
+        let s = sample_state();
+        let old = LISTED.replace("fib daddr type local ", "");
+        let h = FakeHost::new();
+        h.with(|i| {
+            i.which.insert("nft".into());
+            i.scripted.push((
+                "nft list table inet bui".into(),
+                crate::sys::CmdOut::success(&old),
+            ));
+        });
+        let r = check_nft(&h, &s);
+        assert_eq!(r.verdict, NftVerdict::Replayed);
+        assert_eq!(r.compat_live, Some(4), "修复前仍采集旧规则计数");
+        assert_eq!(r.seen_rules, 4, "条数相同也必须识别旧规则");
+        assert!(h.stdins().iter().any(|(cmd, input)| {
+            cmd == "nft -f -" && input.matches("fib daddr type local").count() == 4
+        }));
+        assert!(!h.ops().iter().any(|o| o.starts_with("systemd:")));
+        assert_eq!(
+            redirect_rules(LISTED),
+            redirect_rules(&LISTED.replace("type local", "type == local")),
+            "nft 显式输出等号时不应反复重放"
+        );
+    }
 
     /// 表被人删掉 ⇒ 整表重放；`nft` 不存在 ⇒ 只告警、一条命令都不发；规则一致 ⇒ 什么都不做。
     #[test]

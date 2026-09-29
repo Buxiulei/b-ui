@@ -14,13 +14,13 @@ use bui_schema::model::{Upstream, UpstreamKind};
 pub enum ConnectVerdict {
     /// 隧道建立：HTTP 上游 CONNECT 2xx，或 SOCKS5 REP = 0x00
     Open,
-    /// **硬拒**：HTTP 上游 CONNECT 4xx/5xx（不含 407），或 SOCKS5 REP ≠ 0x00。
+    /// **硬拒**：HTTP 上游 CONNECT 4xx/5xx（不含 407），或 SOCKS5 REP = 0x02。
     /// `code` = HTTP 状态码，或 SOCKS5 的 REP 值（0x02 = not allowed by ruleset）
     Refused { code: u16 },
     /// 凭据失效：CONNECT 407，或 SOCKS5 用户名密码认证被拒（RFC1929 STATUS ≠ 0）。
     /// 调研 §D 的 407 场景：**整条上游不可用**，不是「这个目标被拒」
     AuthFailed,
-    /// 连不上上游本身 / 超时 / 协议对不上
+    /// 上游或目标不可达 / 超时 / 协议对不上；不是已确认的策略拒绝
     Unreachable { detail: String },
 }
 
@@ -268,9 +268,13 @@ pub fn parse_connect_status(first_line: &str) -> ConnectVerdict {
 pub fn socks_verdict(rep: u8) -> ConnectVerdict {
     match rep {
         0x00 => ConnectVerdict::Open,
-        // 0x02 not allowed by ruleset / 0x05 connection refused / 0x03 network unreachable…
-        // 一律算硬拒：这是「上游明确回绝了这个目标」，与 TCP 层连不上（Unreachable）不同
-        r => ConnectVerdict::Refused { code: u16::from(r) },
+        // RFC1928：只有 not allowed by ruleset 是策略拒绝，与被动日志学习口径一致。
+        0x02 => ConnectVerdict::Refused { code: 2 },
+        // REP=4（host unreachable）等不能证明目标被供应商封禁。否则一次目标故障
+        // 加直连对照成功就会推进黑名单确认，最终把瞬时失败固化成出口绕行。
+        r => ConnectVerdict::Unreachable {
+            detail: format!("SOCKS5 请求失败，REP={r}（非策略拒绝）"),
+        },
     }
 }
 
@@ -1085,11 +1089,10 @@ mod tests {
             ConnectVerdict::Refused { code: 2 },
             "not allowed by ruleset"
         );
-        assert_eq!(
+        assert!(matches!(
             socks_verdict(0x05),
-            ConnectVerdict::Refused { code: 5 },
-            "connection refused"
-        );
+            ConnectVerdict::Unreachable { .. }
+        ));
         // 硬拒只有 Refused 一种：凭据失效与连不上都不是「这个目标被拒」，
         // `label()` 的四个取值就是黑名单与体检读到的全部判据
         assert_eq!(ConnectVerdict::Refused { code: 403 }.label(), "refused:403");
@@ -1560,6 +1563,42 @@ mod tests {
             req.contains("Proxy-Authorization: Basic dXNlcjE6cHcx\r\n"),
             "实际 {req:?}"
         );
+    }
+
+    #[test]
+    fn socks5_destination_failures_do_not_confirm_a_bypass_rule() {
+        // 真实 SOCKS 握手 + 真实直连可达对照。只有 RFC1928 REP=2 是策略拒绝；
+        // REP=4 等瞬时目标错误不能积累成长期直连规则。
+        let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let target_port = target.local_addr().unwrap().port();
+        let p = ReqwestProber::with_timeout(2);
+        assert!(p.direct_tcp("127.0.0.1", target_port));
+        for (rep, expected) in [
+            (0x04, None),
+            (0x01, None),
+            (0x03, None),
+            (0x05, None),
+            (0x06, None),
+            (0x07, None),
+            (0x08, None),
+            (0xff, None),
+            (0x02, Some(true)),
+            (0x00, Some(false)),
+        ] {
+            let (port, peer) = fake_proxy(vec![
+                vec![0x05, 0x02],
+                vec![0x01, 0x00],
+                vec![0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0],
+            ]);
+            let observed = super::super::blacklist::confirm_once(
+                &p,
+                &local(UpstreamKind::Socks5, port),
+                "127.0.0.1",
+                target_port,
+            );
+            peer.join().unwrap();
+            assert_eq!(observed, expected, "REP={rep} 的黑名单确认结果");
+        }
     }
 
     #[test]
