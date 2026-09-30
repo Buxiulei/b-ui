@@ -2,8 +2,9 @@
 //!
 //! 契约决策 §C：**当前实际生效的出口**的真源是 `runtime.selected_upstream_id`（uuid），
 //! 自动切换与手动 `select` 都只经 Clash API + runtime，**不写 state**，因此不重启 relay；
-//! `state.selected_upstream_id` 只是「配置里的落点」（selector 的 `default`、
-//! `ports_allowed` 取反依据、`auto` 过滤依据），由增删上游 / 每日 04:00 窗口改写。
+//! `state.selected_upstream_id` 只是全局 selector 下次启动的 `default`，
+//! 由增删上游 / 每日 04:00 窗口保存；已确认结构未变时，仅保存 default 写盘但不重启 relay。
+//! `ports_allowed` 与 `auto` 在实际选中上游的策略端点执行，不依赖这个持久化选择。
 //! `resi-N` 是**位置键**（增删上游会 renumber），只在调 Clash API 的那一瞬由
 //! `clash::tag_of` 现算，绝不当运行时主键。
 

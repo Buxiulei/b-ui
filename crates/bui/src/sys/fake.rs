@@ -36,6 +36,8 @@ pub struct FakeInner {
     pub scripted: Vec<(String, CmdOut)>,
     /// 令某单元的 systemd 动作失败（测回滚）
     pub fail_units: BTreeSet<String>,
+    /// 指定 `(动作, 单元名)` 仅失败一次；裸名与全名均可，其他动作不会消耗它。
+    pub fail_unit_actions_once: BTreeSet<(String, String)>,
     /// 令某个路径的 `write_file` 失败（盘满 / 只读挂载 / 目录建不出来）：真实机器上写盘是会
     /// 失败的，而对账把「带 restart 的 WriteFile 写失败」也算作搁置该单元的理由
     /// （`reconcile::apply` 第 1 步），不给假机器造出写失败就没法钉住那一半。
@@ -107,6 +109,7 @@ impl Default for FakeInner {
             modules: BTreeSet::new(),
             scripted: Vec::new(),
             fail_units: BTreeSet::new(),
+            fail_unit_actions_once: BTreeSet::new(),
             fail_writes: BTreeSet::new(),
             fail_runs: BTreeSet::new(),
             never_active: BTreeSet::new(),
@@ -401,8 +404,13 @@ impl Host for FakeHost {
         // 真机上 systemctl 是阻塞的：时钟先走，调用方之后取的 `now` 才是「返回时刻」
         let advance = i.advance_on_systemd;
         i.now += time::Duration::seconds(advance);
+        let fail_once = i
+            .fail_unit_actions_once
+            .remove(&(verb.to_string(), full.clone()))
+            || i.fail_unit_actions_once
+                .remove(&(verb.to_string(), bare.clone()));
         // fail_units 裸名与全名两种键各查一次，任一命中即失败（Task 5 的回滚测试按裸名播种）
-        if i.fail_units.contains(&full) || i.fail_units.contains(&bare) {
+        if fail_once || i.fail_units.contains(&full) || i.fail_units.contains(&bare) {
             return Ok(CmdOut::failure(1, "Job failed"));
         }
         // 语义跟真实 systemd 对齐：`disable` 不停服务，`stop` 不改 enable 状态。
@@ -603,6 +611,24 @@ mod tests {
         assert!(h.run("sshd", &["-t"]).unwrap().ok());
         assert!(!h.systemd("restart", "b-ui-relay").unwrap().ok());
         assert!(h.systemd("restart", "xray").unwrap().ok());
+    }
+
+    #[test]
+    fn a_scripted_unit_action_fails_once_without_affecting_other_actions_or_units() {
+        for name in ["b-ui-relay", "b-ui-relay.service"] {
+            let h = FakeHost::new();
+            h.with(|i| {
+                i.fail_unit_actions_once
+                    .insert(("restart".into(), name.into()));
+            });
+            assert!(h.systemd("reset-failed", "b-ui-relay").unwrap().ok());
+            assert!(h.systemd("restart", "xray").unwrap().ok());
+            assert!(!h.systemd("restart", "b-ui-relay").unwrap().ok());
+            assert!(!h.unit_is_active("b-ui-relay").unwrap());
+            assert!(h.systemd("restart", "b-ui-relay.service").unwrap().ok());
+            assert!(h.unit_is_active("b-ui-relay").unwrap());
+            h.with(|i| assert!(i.fail_unit_actions_once.is_empty()));
+        }
     }
 
     #[test]

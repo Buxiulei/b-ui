@@ -8,7 +8,7 @@ use tokio::sync::RwLock;
 /// 守护进程的运行时数据。`extra` 必须是最后一个字段（`flatten` 会吃掉所有未知键）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct RuntimeData {
-    /// 已落盘配置的重启判据（`restart_key` → 上次写盘时的值）。
+    /// 已确认的结构激活键与完整文件指纹；另含 sysctl / nft / firewall 的生效记录。
     #[serde(default)]
     pub restart_keys: BTreeMap<String, String>,
     #[serde(default)]

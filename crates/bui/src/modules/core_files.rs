@@ -254,13 +254,15 @@ impl Module for CoreFilesModule {
             &bui_schema::slots::sorted(&s.residential),
             &relay_opts(s, p),
         );
+        let relay_hash = bui_schema::render::relay::structural_hash(&relay);
         out.push(
             Artifact::file(
                 p.base_dir.join("singbox-relay.json"),
                 serde_json::to_vec_pretty(&relay).expect("relay 配置必须可序列化"),
             )
             .verify(Verify::SingBox)
-            .restart(Unit::restart("b-ui-relay")),
+            .restart(Unit::restart("b-ui-relay"))
+            .restart_key(relay_hash),
         );
         // 外部站点通道（2026-09-13 裁决）：占位 README 只为把目录建出来（写文件会建父目录），
         // 排在 Caddyfile 之前，这样首装当轮 caddy validate 时目录已经在了。
@@ -564,6 +566,163 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// 只对 relay 文件走真实 render → plan → apply，避免用手造 key 掩盖模块漏接。
+    fn apply_relay(
+        s: &State,
+        host: &crate::sys::fake::FakeHost,
+        keys: &BTreeMap<String, String>,
+    ) -> crate::reconcile::apply::ApplyOutcome {
+        use crate::reconcile::{apply, diff};
+        struct NoBinaryInstall;
+        impl apply::BinaryInstaller for NoBinaryInstall {
+            fn install(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: &std::path::Path,
+            ) -> anyhow::Result<()> {
+                panic!("relay 文件回归不应安装二进制")
+            }
+        }
+        let ctx = ctx();
+        let artifacts = [find_file(
+            &CoreFilesModule::new(None).render(s, &ctx),
+            "/opt/b-ui/singbox-relay.json",
+        )];
+        let plan = diff::plan(
+            diff::PlanInput {
+                artifacts: &artifacts,
+                paths: &ctx.paths,
+                keys,
+                installed_versions: &BTreeMap::new(),
+                facts: &ctx.facts,
+            },
+            host,
+        )
+        .unwrap();
+        let out = apply::apply(
+            apply::ApplyInput {
+                plan,
+                paths: &ctx.paths,
+                facts: &ctx.facts,
+                installer: &NoBinaryInstall,
+                dry_run: false,
+            },
+            host,
+        );
+        assert!(out.errors.is_empty(), "{out:?}");
+        assert!(out.verify_failures.is_empty(), "{out:?}");
+        out
+    }
+
+    fn relay_host() -> crate::sys::fake::FakeHost {
+        let host = crate::sys::fake::FakeHost::new();
+        host.with(|i| {
+            i.files.insert(
+                "/opt/b-ui/bin/sing-box".into(),
+                (b"test kernel".to_vec(), 0o755),
+            );
+        });
+        host
+    }
+
+    #[test]
+    fn saving_the_runtime_selection_writes_the_default_without_restarting_relay() {
+        let mut s = state_with_slots(2);
+        let host = relay_host();
+        let landed = apply_relay(&s, &host, &BTreeMap::new());
+        assert!(landed.relay_restarted, "首次激活必须启动配置");
+        host.clear_ops();
+
+        let group = s.residential.groups.get_mut("default").unwrap();
+        group.selected_upstream_id = Some(group.upstreams[1].id);
+        let out = apply_relay(&s, &host, &landed.keys);
+        let disk: serde_json::Value =
+            serde_json::from_str(&host.text("/opt/b-ui/singbox-relay.json").unwrap()).unwrap();
+        let pool = disk["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["tag"] == "resi-pool")
+            .unwrap();
+        assert_eq!(pool["default"], "resi-2", "重启后的落点仍必须写盘");
+        assert!(!out.changed.is_empty(), "default 保存确实产生文件变更");
+        assert!(!out.relay_restarted, "仅保存选择不能中断现有流：{out:?}");
+        assert!(out.restarted.is_empty(), "{out:?}");
+        assert!(
+            !host.ops().iter().any(|op| op.starts_with("systemd:")),
+            "不能用 restart 以外的 systemd 动作绕过不断流契约"
+        );
+
+        // 按 serve::reconcile_once 的真实方式合并确认键。保存 default 的完整内容指纹
+        // 也必须前进，否则下一轮会把自己刚写的文件误判为外部漂移并重启。
+        let mut keys = landed.keys;
+        keys.extend(out.keys);
+        host.clear_ops();
+        let settled = apply_relay(&s, &host, &keys);
+        assert!(settled.changed.is_empty(), "第三轮必须收敛：{settled:?}");
+        assert!(settled.restarted.is_empty(), "{settled:?}");
+        assert!(host.ops().is_empty(), "第三轮不应再写盘或调用 systemd");
+    }
+
+    #[test]
+    fn changing_an_egress_credential_still_restarts_relay() {
+        let mut s = state_with_slots(2);
+        let host = relay_host();
+        let landed = apply_relay(&s, &host, &BTreeMap::new());
+        s.residential.groups.get_mut("default").unwrap().upstreams[0].password =
+            "rotated-placeholder".into();
+        let out = apply_relay(&s, &host, &landed.keys);
+        assert!(out.relay_restarted, "供应商凭据改变仍必须激活：{out:?}");
+        assert_ne!(out.keys, landed.keys, "新结构必须记录独立的激活键");
+        assert!(host
+            .text("/opt/b-ui/singbox-relay.json")
+            .unwrap()
+            .contains("rotated-placeholder"));
+    }
+
+    #[test]
+    fn saving_a_selection_without_an_activation_key_conservatively_restarts_relay() {
+        let mut s = state_with_slots(2);
+        let host = relay_host();
+        apply_relay(&s, &host, &BTreeMap::new());
+        let group = s.residential.groups.get_mut("default").unwrap();
+        group.selected_upstream_id = Some(group.upstreams[1].id);
+        let out = apply_relay(&s, &host, &BTreeMap::new());
+        assert!(out.relay_restarted, "不能把盘上配置当作已激活的证据");
+    }
+
+    #[test]
+    fn a_legacy_structure_key_without_a_content_fingerprint_activates_once_then_settles() {
+        let s = state_with_slots(2);
+        let host = relay_host();
+        let landed = apply_relay(&s, &host, &BTreeMap::new());
+        let mut legacy_keys = BTreeMap::from([(
+            "file:/opt/b-ui/singbox-relay.json".to_string(),
+            landed.keys["file:/opt/b-ui/singbox-relay.json"].clone(),
+        )]);
+        let previous = host.text("/opt/b-ui/singbox-relay.json").unwrap();
+        host.clear_ops();
+        let upgraded = apply_relay(&s, &host, &legacy_keys);
+        assert!(upgraded.relay_restarted, "只有结构 key 仍不能确认盘上内容");
+        assert_eq!(host.text("/opt/b-ui/singbox-relay.json"), Some(previous));
+        assert!(upgraded
+            .keys
+            .contains_key("file-content:/opt/b-ui/singbox-relay.json"));
+
+        legacy_keys.extend(upgraded.keys);
+        host.clear_ops();
+        let settled = apply_relay(&s, &host, &legacy_keys);
+        assert!(
+            settled.changed.is_empty(),
+            "激活一次后必须收敛：{settled:?}"
+        );
+        assert!(settled.restarted.is_empty(), "{settled:?}");
+        assert!(host.ops().is_empty(), "不能每轮重复激活");
     }
 
     #[test]

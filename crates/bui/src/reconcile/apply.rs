@@ -39,7 +39,7 @@ pub struct ApplyOutcome {
     pub notes: Vec<String>,
     pub verify_failures: Vec<String>,
     pub errors: Vec<String>,
-    /// 本轮**真正落地**的 `restart_key`：从 `plan.keys` 搬过来（第 1 步与第 10 步写明了搬的条件）。
+    /// 本轮确认生效的 `restart_key` 及文件指纹：只写字段落盘即可，需激活的结构要等服务运行。
     /// Task 15 的 `reconcile_once` 把它 `extend` 进 `runtime.restart_keys`；不搬 = 下一轮 `keys[id] != k`
     /// 永远成立 = 每次改 `clients` 都重启 xray（spec §3.3 失效），乱搬 = 该重启时不重启。
     pub keys: BTreeMap<String, String>,
@@ -97,6 +97,9 @@ pub fn apply(input: ApplyInput<'_>, host: &dyn Host) -> ApplyOutcome {
     let mut restart: BTreeSet<Unit> = BTreeSet::new();
     // 单元名 → 本轮为它写过的文件（重启失败时按这份回滚）
     let mut restores: BTreeMap<String, Vec<Restore>> = BTreeMap::new();
+    // Candidate file keys belong to the same activation boundary as their unit.
+    // A write, held unit, failed activation, or rollback never confirms a new structure.
+    let mut pending_keys: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
     let mut need_daemon_reload = false;
     // 「配置这轮没落地」的单元 → 原因。第 1 步记，第 3 步与第 12 步据此搁置单元文件与重启。
     let mut held: BTreeMap<String, &'static str> = BTreeMap::new();
@@ -186,10 +189,18 @@ pub fn apply(input: ApplyInput<'_>, host: &dyn Host) -> ApplyOutcome {
             }
         }
         out.changed.push(path.display().to_string());
-        // `Artifact::id()` 的格式；只有写盘真的落地了才搬 key
         let id = format!("file:{}", path.display());
         if let Some(k) = candidate_keys.get(&id) {
-            out.keys.insert(id, k.clone());
+            let keys = if let Some(unit) = unit {
+                pending_keys.entry(unit.name.clone()).or_default()
+            } else {
+                &mut out.keys
+            };
+            keys.insert(id, k.clone());
+            keys.insert(
+                super::diff::file_content_key(path),
+                crate::kernels::sha256_hex(content),
+            );
         }
         if let Some(u) = unit {
             restart.insert(u.clone());
@@ -534,6 +545,9 @@ pub fn apply(input: ApplyInput<'_>, host: &dyn Host) -> ApplyOutcome {
         };
         if activate(host, &unit) {
             record_restarted(&mut out, &unit.name);
+            if let Some(keys) = pending_keys.remove(&unit.name) {
+                out.keys.extend(keys);
+            }
             continue;
         }
         // 回滚该单元本轮写过的文件，再启一次
@@ -1365,6 +1379,10 @@ mod tests {
                     "file:/opt/b-ui/config.yaml".to_string(),
                     "hash-B".to_string()
                 ),
+                (
+                    "file-content:/opt/b-ui/config.yaml".to_string(),
+                    crate::kernels::sha256_hex(b"listen: :10000")
+                ),
                 ("firewall".to_string(), "fw-1".to_string()),
             ])
         );
@@ -2115,6 +2133,154 @@ mod tests {
                 "/opt/b-ui/config.yaml".to_string(),
                 "sing-box 1.14.1".to_string()
             ]
+        );
+    }
+    #[test]
+    fn a_failed_activation_does_not_acknowledge_the_candidate_restart_key() {
+        let h = FakeHost::new();
+        let path = "/opt/b-ui/singbox-relay.json";
+        h.with(|i| {
+            i.files.insert(path.into(), (b"previous".to_vec(), 0o600));
+            i.fail_units.insert("b-ui-relay".into());
+        });
+        let out = run(
+            Plan {
+                changes: vec![Change::WriteFile {
+                    path: path.into(),
+                    content: b"candidate".to_vec(),
+                    mode: 0o600,
+                    verify: None,
+                    restart: Some(Unit::restart("b-ui-relay")),
+                }],
+                keys: BTreeMap::from([(format!("file:{path}"), "new-structure".into())]),
+                unchanged: 0,
+            },
+            &h,
+            &NoopInstaller,
+        );
+        assert_eq!(h.text(path).as_deref(), Some("previous"));
+        assert!(
+            out.keys.is_empty(),
+            "failed generation must not be marked active: {:?}",
+            out.keys
+        );
+    }
+
+    #[test]
+    fn a_successful_rollback_does_not_acknowledge_candidate_keys() {
+        let h = FakeHost::new();
+        let path = "/opt/b-ui/singbox-relay.json";
+        h.with(|i| {
+            i.files.insert(path.into(), (b"previous".to_vec(), 0o600));
+            i.fail_unit_actions_once
+                .insert(("restart".into(), "b-ui-relay".into()));
+        });
+        let out = run(
+            Plan {
+                changes: vec![Change::WriteFile {
+                    path: path.into(),
+                    content: b"candidate".to_vec(),
+                    mode: 0o600,
+                    verify: None,
+                    restart: Some(Unit::restart("b-ui-relay")),
+                }],
+                keys: BTreeMap::from([(format!("file:{path}"), "new-structure".into())]),
+                unchanged: 0,
+            },
+            &h,
+            &NoopInstaller,
+        );
+        assert_eq!(h.text(path).as_deref(), Some("previous"));
+        assert_eq!(
+            h.ops(),
+            vec![
+                "write:/opt/b-ui/singbox-relay.json:600",
+                "systemd:reset-failed:b-ui-relay",
+                "systemd:restart:b-ui-relay",
+                "write:/opt/b-ui/singbox-relay.json:600",
+                "systemd:reset-failed:b-ui-relay",
+                "systemd:restart:b-ui-relay",
+            ]
+        );
+        assert!(h.unit_is_active("b-ui-relay").unwrap());
+        assert_eq!(out.restarted, vec!["b-ui-relay"]);
+        assert!(out.relay_restarted);
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert!(out
+            .notes
+            .iter()
+            .any(|note| note.contains("已回滚上一版配置并重启成功")));
+        assert!(
+            out.keys.is_empty(),
+            "recovering the previous config cannot acknowledge candidate structure or content: {:?}",
+            out.keys
+        );
+    }
+
+    #[test]
+    fn a_requested_self_restart_does_not_acknowledge_candidate_keys() {
+        // Synthetic guard: requesting a restart is not proof that the next process loaded the file.
+        let h = FakeHost::new();
+        let path = "/opt/b-ui/daemon-test.json";
+        let out = run(
+            Plan {
+                changes: vec![Change::WriteFile {
+                    path: path.into(),
+                    content: b"candidate".to_vec(),
+                    mode: 0o600,
+                    verify: None,
+                    restart: Some(Unit::restart("b-ui")),
+                }],
+                keys: BTreeMap::from([(format!("file:{path}"), "new-structure".into())]),
+                unchanged: 0,
+            },
+            &h,
+            &NoopInstaller,
+        );
+        assert_eq!(h.text(path).as_deref(), Some("candidate"));
+        assert!(out.self_restart_required);
+        assert!(out.restarted.is_empty());
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(h.ops(), vec!["write:/opt/b-ui/daemon-test.json:600"]);
+        assert!(
+            out.keys.is_empty(),
+            "a deferred self restart cannot acknowledge candidate structure or content: {:?}",
+            out.keys
+        );
+    }
+
+    #[test]
+    fn a_held_unit_does_not_acknowledge_another_landed_files_restart_key() {
+        let h = FakeHost::new();
+        h.with(|i| {
+            i.fail_writes.insert("/opt/b-ui/failing.json".into());
+        });
+        let out = run(
+            Plan {
+                changes: ["landed.json", "failing.json"]
+                    .into_iter()
+                    .map(|name| Change::WriteFile {
+                        path: format!("/opt/b-ui/{name}").into(),
+                        content: b"candidate".to_vec(),
+                        mode: 0o600,
+                        verify: None,
+                        restart: Some(Unit::restart("b-ui-relay")),
+                    })
+                    .collect(),
+                keys: BTreeMap::from([(
+                    "file:/opt/b-ui/landed.json".into(),
+                    "new-structure".into(),
+                )]),
+                unchanged: 0,
+            },
+            &h,
+            &NoopInstaller,
+        );
+        assert!(out.restarted.is_empty());
+        assert!(
+            out.keys.is_empty(),
+            "writes alone do not prove activation: {:?}",
+            out.keys
         );
     }
 }
