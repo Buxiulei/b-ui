@@ -66,7 +66,7 @@ pub enum Change {
 }
 
 /// 一轮比对的结果。`keys` 只是**候选** `restart_key`：真正落盘由 apply 在写盘成功后
-/// 搬进 `ApplyOutcome.keys`（校验失败 / 写失败 / 没有防火墙都不搬）。
+/// 搬进 `ApplyOutcome.keys`（需激活的文件还须服务加载成功；失败或回滚不搬）。
 #[derive(Debug, Default, PartialEq)]
 pub struct Plan {
     pub changes: Vec<Change>,
@@ -100,21 +100,25 @@ pub fn plan(input: PlanInput<'_>, host: &dyn Host) -> Result<Plan> {
                 verify,
             } => {
                 let current = host.read_file(path)?;
-                if current.as_deref() != Some(content.as_slice()) {
-                    let restart = match restart_key {
-                        Some(k) => {
-                            let id = art.id();
-                            let landed =
-                                input.keys.get(&id).map(String::as_str) == Some(k.as_str());
-                            out.keys.insert(id, k.clone());
-                            // 结构哈希没变（xray 只改了 clients）→ 写盘但不重启，spec §3.3
-                            if landed {
-                                None
-                            } else {
-                                restart.clone()
-                            }
-                        }
-                        None => restart.clone(),
+                // A file on disk is not proof that the service loaded it. Structural keys
+                // are acknowledged only after activation; the full content fingerprint
+                // additionally detects external writes hidden by a matching cached key.
+                let confirmed = restart_key.as_ref().is_none_or(|key| {
+                    input.keys.get(&art.id()) == Some(key)
+                        && current.as_ref().is_some_and(|bytes| {
+                            input.keys.get(&file_content_key(path))
+                                == Some(&crate::kernels::sha256_hex(bytes))
+                        })
+                });
+                if current.as_deref() != Some(content.as_slice()) || !confirmed {
+                    if let Some(key) = restart_key {
+                        out.keys.insert(art.id(), key.clone());
+                    }
+                    let restart = if restart_key.is_some() && confirmed {
+                        // Only live/default fields changed; the running structure is known.
+                        None
+                    } else {
+                        restart.clone()
                     };
                     out.changes.push(Change::WriteFile {
                         path: path.clone(),
@@ -291,6 +295,12 @@ pub fn plan(input: PlanInput<'_>, host: &dyn Host) -> Result<Plan> {
     Ok(out)
 }
 
+/// Full-file evidence paired with an activated structural key. Separate namespace
+/// keeps existing runtime files readable; absent evidence triggers a conservative reload.
+pub(crate) fn file_content_key(path: &std::path::Path) -> String {
+    format!("file-content:{}", path.display())
+}
+
 /// 规则集的指纹：落地过同一份就不再重放 `nft -f`（配合 `facts.nft_tables` 一起判）。
 pub fn ruleset_key(ruleset: &str) -> String {
     use sha2::{Digest, Sha256};
@@ -414,6 +424,10 @@ mod tests {
         keys.insert(
             "file:/opt/b-ui/xray-config.json".to_string(),
             "hash-A".to_string(),
+        );
+        keys.insert(
+            file_content_key(std::path::Path::new("/opt/b-ui/xray-config.json")),
+            crate::kernels::sha256_hex(b"{\"clients\":[1]}"),
         );
         let versions = BTreeMap::new();
         let arts = vec![
@@ -879,5 +893,65 @@ mod tests {
             "symlink:/usr/local/bin/b-ui"
         );
         assert_eq!(Artifact::FirewallPorts { ports: vec![] }.id(), "firewall");
+    }
+    #[test]
+    fn identical_file_with_unconfirmed_restart_key_still_needs_activation() {
+        let h = FakeHost::new();
+        let paths = Paths::default_server();
+        let path = paths.base_dir.join("singbox-relay.json");
+        h.write_file(&path, b"same-config", 0o600).unwrap();
+        let arts = vec![Artifact::file(&path, "same-config")
+            .restart(Unit::restart("b-ui-relay"))
+            .restart_key("generation-B")];
+        for keys in [
+            BTreeMap::new(),
+            BTreeMap::from([(arts[0].id(), "generation-A".into())]),
+        ] {
+            let p = plan(input(&arts, &paths, &keys, &BTreeMap::new()), &h).unwrap();
+            assert!(
+                matches!(p.changes.first(), Some(Change::WriteFile { restart: Some(u), .. }) if u.name == "b-ui-relay"),
+                "same bytes are not proof that the running process loaded them: {p:?}"
+            );
+        }
+        let keys = BTreeMap::from([
+            (arts[0].id(), "generation-B".into()),
+            (
+                file_content_key(&path),
+                crate::kernels::sha256_hex(b"same-config"),
+            ),
+        ]);
+        assert!(plan(input(&arts, &paths, &keys, &BTreeMap::new()), &h)
+            .unwrap()
+            .changes
+            .is_empty());
+    }
+
+    #[test]
+    fn external_file_drift_cannot_hide_behind_a_matching_restart_key() {
+        let h = FakeHost::new();
+        let paths = Paths::default_server();
+        let path = paths.base_dir.join("singbox-relay.json");
+        h.write_file(&path, b"external-config", 0o600).unwrap();
+        let arts = vec![Artifact::file(&path, "our-config")
+            .restart(Unit::restart("b-ui-relay"))
+            .restart_key("structure-A")];
+        let keys = BTreeMap::from([
+            (arts[0].id(), "structure-A".into()),
+            (
+                format!("file-content:{}", path.display()),
+                crate::kernels::sha256_hex(b"our-config"),
+            ),
+        ]);
+        let p = plan(input(&arts, &paths, &keys, &BTreeMap::new()), &h).unwrap();
+        assert!(
+            matches!(
+                p.changes.first(),
+                Some(Change::WriteFile {
+                    restart: Some(_),
+                    ..
+                })
+            ),
+            "an external process may have loaded the drifted bytes: {p:?}"
+        );
     }
 }

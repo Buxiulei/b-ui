@@ -14,6 +14,7 @@ use crate::model::{ResidentialGroup, Rule, Slot, Upstream, UpstreamKind};
 use crate::relay_policy;
 use crate::render::SplitRules;
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 
 /// 渲染 relay 配置需要的本机参数。
 #[derive(Debug, Clone, PartialEq)]
@@ -44,6 +45,26 @@ const PRIVATE_CIDRS: &[&str] = &[
 /// 全局 selector 的 tag：`dns_resi` 的 detour 与 global 模式的 `route.final` 用它，
 /// 巡检既有的「全局最优」逻辑（手动锁定 / 更优候选防抖）也驱动它（D8）。
 pub const POOL: &str = "resi-pool";
+
+/// relay 的结构哈希：只排除全局 `resi-pool` selector 的 `default`。
+///
+/// 当前选择经 Clash API 生效；保存它只更新下次启动的落点，不应中断现有流。
+/// 槽 selector 的 default、池成员、端点凭据、出口策略、嗅探与 DNS 都属于结构，
+/// 任何变化仍需激活。调用方只在结构成功激活后确认这个 key，不能以写盘替代激活。
+pub fn structural_hash(cfg: &Value) -> String {
+    let mut structure = cfg.clone();
+    if let Some(outbounds) = structure.get_mut("outbounds").and_then(Value::as_array_mut) {
+        for outbound in outbounds {
+            if outbound["type"] == "selector" && outbound["tag"] == POOL {
+                if let Some(fields) = outbound.as_object_mut() {
+                    fields.remove("default");
+                }
+            }
+        }
+    }
+    let bytes = serde_json::to_vec(&structure).expect("Value 序列化不会失败");
+    hex::encode(Sha256::digest(bytes))
+}
 
 /// 槽 `i` 的 socks 入站 tag。
 fn inbound_tag(i: u16) -> String {
@@ -516,6 +537,89 @@ mod tests {
                 upstream_id: Uuid::from_u128(u128::from(*i) + 1),
             })
             .collect()
+    }
+
+    #[test]
+    fn structural_hash_excludes_the_saved_global_selection_only() {
+        let mut g = group(2, ResiMode::Global);
+        let before = config(&g, &slots(&[0, 1]), &opts());
+        g.selected_upstream_id = Some(g.upstreams[1].id);
+        let after = config(&g, &slots(&[0, 1]), &opts());
+        assert_ne!(before, after, "启动默认出口仍必须持久化");
+        assert_eq!(structural_hash(&before), structural_hash(&after));
+
+        let mut slot_changed = after.clone();
+        let slot = slot_changed["outbounds"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|o| o["tag"] == "slot-0-pool")
+            .unwrap();
+        slot["default"] = json!("resi-2");
+        assert_ne!(structural_hash(&after), structural_hash(&slot_changed));
+
+        // 不能把所有 selector.default 或任何叫 resi-pool 的字段都当成运行期数据。
+        let unusual = json!({"outbounds": [
+            {"type": "selector", "tag": "another-pool", "default": "resi-1"},
+            {"type": "socks", "tag": POOL, "default": "resi-1"}
+        ]});
+        for i in 0..2 {
+            let mut changed = unusual.clone();
+            changed["outbounds"][i]["default"] = json!("resi-2");
+            assert_ne!(structural_hash(&unusual), structural_hash(&changed));
+        }
+    }
+
+    #[test]
+    fn structural_hash_retains_every_other_network_field() {
+        let g = group(2, ResiMode::Split);
+        let cfg = config(&g, &slots(&[0, 1]), &opts());
+        let key = structural_hash(&cfg);
+        // 真实渲染输出的关键结构：wrapper 端口、raw 凭据、slot 入站、sniff、DNS。
+        // 每个路径必须已存在，避免测成「随便新增字段当然改变 hash」。
+        for (pointer, value) in [
+            ("/outbounds/0/server_port", json!(2280)),
+            ("/outbounds/2/password", json!("rotated-placeholder")),
+            ("/inbounds/0/listen_port", json!(2088)),
+            ("/route/rules/0/action", json!("reject")),
+            ("/dns/servers/0/server", json!("9.9.9.9")),
+            ("/dns/servers/0/detour", json!("direct")),
+        ] {
+            let mut changed = cfg.clone();
+            *changed.pointer_mut(pointer).expect("渲染字段必须存在") = value;
+            assert_ne!(key, structural_hash(&changed), "不能排除 {pointer}");
+        }
+        let mut members_changed = cfg.clone();
+        let pool = members_changed["outbounds"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|o| o["tag"] == POOL)
+            .unwrap();
+        pool["outbounds"] = json!(["resi-1"]);
+        assert_ne!(key, structural_hash(&members_changed), "池成员属于结构");
+
+        let mut policy_changed = g.clone();
+        policy_changed.upstreams[1].ports_allowed = Some(vec![443]);
+        assert_ne!(
+            key,
+            structural_hash(&config(&policy_changed, &slots(&[0, 1]), &opts())),
+            "端口能力属于实际出口策略"
+        );
+        policy_changed = g;
+        policy_changed.blacklist.auto.push(crate::model::AutoEntry {
+            upstream_id: policy_changed.upstreams[1].id,
+            rule: Rule::Domain("auto.example.com".into()),
+            hits: 3,
+            confirmed_at: "2026-09-29T00:00:00Z".into(),
+            last_verified_at: "2026-09-29T00:00:00Z".into(),
+            passes: 0,
+        });
+        assert_ne!(
+            key,
+            structural_hash(&config(&policy_changed, &slots(&[0, 1]), &opts())),
+            "自动策略与它需要的嗅探仍属于结构"
+        );
     }
 
     // 内部 policy 入站 / raw 出站之外，旧的入口与 selector 标签保持兼容。
