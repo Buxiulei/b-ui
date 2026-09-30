@@ -97,12 +97,8 @@ jobs:
         run: bash scripts/release/pin-kernels.sh --check
 
   test:
-    name: test (${{ matrix.singbox }})
+    name: test (sing-box 1.14.2)
     runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        singbox: ["1.12", "1.13", "1.14"]
     steps:
       - uses: actions/checkout@v4
       - name: 缓存 cargo
@@ -117,20 +113,13 @@ jobs:
         uses: ./.github/actions/setup-kernels
         with:
           dir: ${{ runner.temp }}/kernels-amd64
-          role: all
           arch: amd64
-      - name: 把本矩阵的 sing-box 放到 PATH 首位
+      - name: 把发布内核放到 PATH 首位
         run: |
           set -euo pipefail
           BIN="$RUNNER_TEMP/pathbin"
           mkdir -p "$BIN"
-          SB="$RUNNER_TEMP/kernels-amd64/singbox/${{ matrix.singbox }}/sing-box"
-          if [[ ! -x "$SB" ]]; then
-            # target minor（1.14）不在 check 目录里，走 bin/ 那一份 —— 也就是**自建**的那个
-            # （带 with_v2ray_api）。1.12 / 1.13 两格仍是上游归档、不带这个标签（spec §5.3）。
-            SB="$RUNNER_TEMP/kernels-amd64/bin/sing-box"
-          fi
-          ln -sf "$SB" "$BIN/sing-box"
+          ln -sf "$RUNNER_TEMP/kernels-amd64/bin/sing-box" "$BIN/sing-box"
           ln -sf "$RUNNER_TEMP/kernels-amd64/bin/xray" "$BIN/xray"
           ln -sf "$RUNNER_TEMP/kernels-amd64/bin/hysteria" "$BIN/hysteria"
           echo "$BIN" >> "$GITHUB_PATH"
@@ -138,36 +127,15 @@ jobs:
           # 而 ubuntu-24.04 镜像不预装 caddy：软链进 /usr/local/bin 才能真跑校验。
           sudo ln -sf "$RUNNER_TEMP/kernels-amd64/bin/caddy" /usr/local/bin/caddy
           caddy version | head -1
-      - name: 确认版本就是矩阵要求的
-        run: |
-          set -euo pipefail
-          got=$(sing-box version | awk '/^sing-box version/ {print $3; exit}')
-          echo "sing-box = $got"
-          case "$got" in ${{ matrix.singbox }}.*) ;; *) echo "版本不符：期望 ${{ matrix.singbox }}.x"; exit 1 ;; esac
       - name: cargo test（渲染结果过真实内核）
         run: |
           set -euo pipefail
           cargo test --workspace -- --nocapture 2>&1 | tee "$RUNNER_TEMP/test.log"
-          # 只判「内核校验漏跑」这一种 skip：内核二进制没在 PATH 上（含带版本后缀的形态，
-          # 如 `skipped: sing-box-1.12 not found`），或 caddy 不在三个绝对路径上。
-          # 白名单——这三条 skip 在 CI 里必然出现、也本该出现，放行：
-          #   skipped: sing-box-1.12 not found / -1.13 / -1.14
-          # 它们是 crates/bui-schema/tests/common/mod.rs 的 check_singbox_all 除默认名外额外
-          # 找的多版本二进制。本 job 每格只装默认名 sing-box 的矩阵版本，并由上一步
-          # `sing-box version` 守门钉死大版本，1.12/1.13/1.14 三版覆盖由三格矩阵提供，
-          # 带后缀的二进制在 CI 里根本不存在。给 check_singbox_all 加新版本时要同时加进
-          # matrix.singbox 与这条白名单，否则新版本漏跑会判红——这正是要的。
-          # 测试里另有几种设计内的 skip（缺 P0 的 v3 fixture、P5 删掉 server/core.sh 后的
-          # v3 sysctl 对照、openssl 不可用、开发机设了域名环境变量），不是内核校验，天然不匹配。
-          # 住宅 HY2 那份配置只在**自建**的 1.14 上过 check（v2ray_api 段要 with_v2ray_api），
-          # 1.12 / 1.13 两格是上游归档、必然 skip，所以这种 skip 也进白名单。
-          kernel_skips=$(grep -E 'skipped: ((sing-box|xray|hysteria)(-[0-9.]+)? not found|本机没有 caddy 二进制|自建 sing-box（with_v2ray_api）不可用)' "$RUNNER_TEMP/test.log" || true)
-          missed=$(printf '%s\n' "$kernel_skips" | grep -Ev 'skipped: (sing-box-1\.(12|13|14) not found|自建 sing-box（with_v2ray_api）不可用)' || true)
-          if [[ -n "$missed" ]]; then
-            echo "内核校验被跳过，说明没找到内核二进制：CI 不接受 skip"
-            printf '%s\n' "$missed"
+          # 配置和真实流量只验发布内核；二进制缺失或漏编计量能力均不接受 skip。
+          if grep -Eq 'skipped: ((sing-box|xray|hysteria) not found|本机没有 caddy 二进制|自建 sing-box（with_v2ray_api）不可用)' "$RUNNER_TEMP/test.log"; then
+            echo "内核校验被跳过：CI 不接受 skip"
+            grep -E 'skipped: ' "$RUNNER_TEMP/test.log"
             exit 1
           fi
       - name: 住宅 UDP 实际收发（发布内核）
-        if: matrix.singbox == '1.14'
         run: cargo test -p bui-schema --test kernel_traffic -- --ignored --nocapture

@@ -2,7 +2,6 @@
 import copy
 import io
 import json
-import re
 import socket
 import struct
 import subprocess
@@ -261,9 +260,7 @@ def udp_session(kernel, slot, fake, first_host, resolved=True):
 def main():
     data, binary = json.load(sys.stdin), sys.argv[1]
     version = subprocess.check_output([binary, "version"], text=True).splitlines()[0]
-    match = re.search(r"version (\d+)\.(\d+)", version)
-    assert match, version
-    udp_selector_supported = tuple(map(int, match.groups())) >= (1, 14)
+    assert version == "sing-box version 1.14.2", f"policy regression requires sing-box 1.14.2, got {version}"
     direct = Fake("DIRECT", port=data["target_port"])
     a, b, http_a = Fake("A", "socks"), Fake("B", "socks"), Fake("HTTP-A", "http")
     direct_socks = Fake("DIRECT", "socks")
@@ -308,13 +305,10 @@ def main():
                     elapsed = time.monotonic() - started
                     assert elapsed < 3, f"server-first banner delayed {elapsed:.3f}s"
                     print(f"server-first banner: {elapsed * 1000:.2f}ms", flush=True)
-                    if udp_selector_supported:
-                        udp_session(kernel, 1, b, "203.0.113.9")
-                        udp_session(kernel, 1, b, "echo.invalid")
-                        kernel.select(1, 1)
-                        udp_session(kernel, 1, a, "203.0.113.9")
-                    else:
-                        print(f"UDP selector requires pinned 1.14 target; TCP policy passed on {version}", flush=True)
+                    udp_session(kernel, 1, b, "203.0.113.9")
+                    udp_session(kernel, 1, b, "echo.invalid")
+                    kernel.select(1, 1)
+                    udp_session(kernel, 1, a, "203.0.113.9")
                 elif case == "sniff":
                     assert kernel.request(0, port, "203.0.113.9", host_header="a-block.invalid") == "DIRECT"
                     assert kernel.request(0, port, "203.0.113.9", host_header="b-block.invalid") == "A"
@@ -327,14 +321,13 @@ def main():
                     destinations = [target for fake, offset in before.items() for target in fake.destinations[offset:]]
                     assert ("service.invalid", port) in destinations, destinations
                     assert all(target[0] != "a-block.invalid" for target in destinations), "sniff rewrote explicit FQDN destination"
-                    if udp_selector_supported:
-                        udp_session(kernel, 0, direct_socks, "a-block.invalid", resolved=False)
-                        udp_session(kernel, 0, a, "b-block.invalid")
-                        kernel.select(1, 2)
-                        udp_session(kernel, 1, b, "a-block.invalid")
-                        udp_session(kernel, 1, direct_socks, "b-block.invalid", resolved=False)
-                        kernel.select(1, 1)
-                        udp_session(kernel, 1, direct_socks, "a-block.invalid", resolved=False)
+                    udp_session(kernel, 0, direct_socks, "a-block.invalid", resolved=False)
+                    udp_session(kernel, 0, a, "b-block.invalid")
+                    kernel.select(1, 2)
+                    udp_session(kernel, 1, b, "a-block.invalid")
+                    udp_session(kernel, 1, direct_socks, "b-block.invalid", resolved=False)
+                    kernel.select(1, 1)
+                    udp_session(kernel, 1, direct_socks, "a-block.invalid", resolved=False)
                 else:
                     assert kernel.request(0, port) == "HTTP-A"
                     assert kernel.request(1, port) == "B"

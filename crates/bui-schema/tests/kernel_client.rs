@@ -451,16 +451,16 @@ fn probe_config_tags_stay_unique_for_same_named_nodes() {
 fn probe_config_passes_sing_box_check() {
     // 四种节点（HY2 直连带跳跃与 obfs），单个目标与四个目标各过一遍；
     // 再过一遍同名的：四种节点各测两次，外加另一台服务器上 label 相同的四个节点。
-    // PATH 上的 sing-box / sing-box-1.12 / -1.13 / -1.14 缺哪个跳哪个
+    // 使用 PATH 上的发布内核，CI 保证版本与 lock 一致。
     let s = common::state("obfs");
     let u = &s.users[0];
     let nodes = bui_schema::nodes::nodes_for(u, &s.node, &s.residential);
     assert_eq!(nodes.len(), 4, "alice 是 fusion + 住宅");
     let targets = probe_targets(&nodes);
     for t in &targets {
-        common::check_singbox_all(&client::probe_config(std::slice::from_ref(t)));
+        common::check_singbox(&client::probe_config(std::slice::from_ref(t)));
     }
-    common::check_singbox_all(&client::probe_config(&targets));
+    common::check_singbox(&client::probe_config(&targets));
 
     let twins: Vec<Node> = nodes
         .iter()
@@ -472,7 +472,7 @@ fn probe_config_passes_sing_box_check() {
     let same_named = probe_targets(nodes.iter().chain(&nodes).chain(&twins));
     let cfg = client::probe_config(&same_named);
     // 先过内核再核对标签：标签重复时 sing-box 自己就会报出来
-    common::check_singbox_all(&cfg);
+    common::check_singbox(&cfg);
     assert_probe_tags(&cfg, same_named.len());
 }
 

@@ -12,9 +12,9 @@ trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/bin" "$WORK/srv" "$WORK/out"
 
 # 造三份上游资产：sing-box tar.gz、xray zip、hysteria 裸二进制
-mkdir -p "$WORK/build/sing-box-1.14.5-linux-amd64"
-printf '#!/bin/sh\necho sing-box 1.14.5\n' > "$WORK/build/sing-box-1.14.5-linux-amd64/sing-box"
-tar -C "$WORK/build" -czf "$WORK/srv/singbox.tar.gz" sing-box-1.14.5-linux-amd64
+mkdir -p "$WORK/build/sing-box-1.14.2-linux-amd64"
+printf '#!/bin/sh\necho sing-box 1.14.2\n' > "$WORK/build/sing-box-1.14.2-linux-amd64/sing-box"
+tar -C "$WORK/build" -czf "$WORK/srv/singbox.tar.gz" sing-box-1.14.2-linux-amd64
 printf '#!/bin/sh\necho xray\n' > "$WORK/build/xray"
 (cd "$WORK/build" && zip -q "$WORK/srv/xray.zip" xray)
 printf '#!/bin/sh\necho hysteria\n' > "$WORK/srv/hysteria"
@@ -41,7 +41,7 @@ printf '%s\n' "$url" >> "$CURL_LOG"
 if [[ "$url" == https://github.com/* && "${FAKE_GITHUB_OK:-0}" != "1" ]]; then exit 22; fi
 src=""
 case "$url" in
-  *sing-box-1.14.5-linux-amd64.tar.gz) src="$SRV/singbox.tar.gz" ;;
+  *sing-box-1.14.2-linux-amd64.tar.gz) src="$SRV/singbox.tar.gz" ;;
   *Xray-linux-64.zip)                  src="$SRV/xray.zip" ;;
   *hysteria-linux-amd64)               src="$SRV/hysteria" ;;
   *caddy_2.11.4_linux_amd64.tar.gz)    src="$SRV/caddy.tar.gz" ;;
@@ -55,43 +55,41 @@ export PATH="$WORK/bin:$PATH" SRV="$WORK/srv" CURL_LOG="$WORK/curl.log"
 LOCK="$WORK/kernels.lock"
 {
   printf '# kernel role version arch sha256 url\n'
-  printf 'sing-box target 1.14.5 amd64 %s https://github.com/SagerNet/sing-box/releases/download/v1.14.5/sing-box-1.14.5-linux-amd64.tar.gz\n' "$SB_SHA"
+  printf 'sing-box target 1.14.2 amd64 %s https://github.com/SagerNet/sing-box/releases/download/v1.14.2/sing-box-1.14.2-linux-amd64.tar.gz\n' "$SB_SHA"
   printf 'xray target 26.3.27 amd64 %s https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-linux-64.zip\n' "$XR_SHA"
   printf 'hysteria target 2.12.2 amd64 %s https://github.com/apernet/hysteria/releases/download/app/v2.12.2/hysteria-linux-amd64\n' "$HY_SHA"
   printf 'caddy target 2.11.4 amd64 %s https://github.com/caddyserver/caddy/releases/download/v2.11.4/caddy_2.11.4_linux_amd64.tar.gz\n' "$CD_SHA"
-  printf 'sing-box check 1.14.5 amd64 %s https://github.com/SagerNet/sing-box/releases/download/v1.14.5/sing-box-1.14.5-linux-amd64.tar.gz\n' "$SB_SHA"
 } > "$LOCK"
 
-run() { BUI_MIRRORS="https://mirror-a.example/" bash "$ROOT/scripts/ci/fetch-kernels.sh" --out "$WORK/out" --lock "$LOCK" --arch amd64 "$@"; }
+run() { BUI_MIRRORS="https://mirror-a.example/" bash "$ROOT/scripts/ci/fetch-kernels.sh" --out "$WORK/out" --lock "$LOCK" --arch amd64; }
 
 : > "$CURL_LOG"
-out=$(run --role all 2>&1); rc=$?
+out=$(run 2>&1); rc=$?
 assert_eq "0" "$rc" "首次获取成功（GitHub 失败 → 镜像回退）"
 assert_eq "1" "$([[ -x "$WORK/out/bin/sing-box" ]] && echo 1 || echo 0)" "tar.gz 解出可执行 sing-box"
 assert_eq "1" "$([[ -x "$WORK/out/bin/xray" ]] && echo 1 || echo 0)" "zip 解出可执行 xray"
 assert_eq "1" "$([[ -x "$WORK/out/bin/hysteria" ]] && echo 1 || echo 0)" "裸二进制落地并可执行"
 assert_eq "1" "$([[ -x "$WORK/out/bin/caddy" ]] && echo 1 || echo 0)" "caddy tar.gz 解出可执行裸二进制"
 assert_eq "0" "$([[ -e "$WORK/out/bin/LICENSE" || -e "$WORK/out/bin/README.md" ]] && echo 1 || echo 0)" "归档里的非二进制文件不泄漏进 bin/"
-assert_eq "1" "$([[ -x "$WORK/out/singbox/1.14/sing-box" ]] && echo 1 || echo 0)" "check 版本按 minor 目录落地"
 assert_contains "https://mirror-a.example/https://github.com/" "$(cat "$CURL_LOG")" "用了镜像前缀"
-assert_eq "5" "$(grep -c . "$WORK/out/.fetched")" "清单记录 5 项"
+assert_eq "4" "$(grep -c . "$WORK/out/.fetched")" "清单只记录四种发布内核"
 
 : > "$CURL_LOG"
-out=$(run --role all 2>&1); rc=$?
+out=$(run 2>&1); rc=$?
 assert_eq "0" "$rc" "二次运行成功"
 assert_eq "0" "$(grep -c . "$CURL_LOG")" "已就位则零下载（cache 命中语义）"
 assert_contains "cached" "$out" "输出说明命中缓存"
 
 : > "$CURL_LOG"
 rm -rf "$WORK/out"
-out=$(FAKE_CORRUPT=1 run --role target 2>&1); rc=$?
+out=$(FAKE_CORRUPT=1 run 2>&1); rc=$?
 assert_eq "4" "$rc" "sha256 不匹配退 4"
 assert_contains "sha256 不匹配" "$out" "有中文错误"
 assert_eq "0" "$([[ -e "$WORK/out/bin/sing-box" ]] && echo 1 || echo 0)" "坏文件不留在输出目录"
 
 : > "$CURL_LOG"
 rm -rf "$WORK/out"
-out=$(BUI_MIRRORS="" bash "$ROOT/scripts/ci/fetch-kernels.sh" --out "$WORK/out" --lock "$LOCK" --arch amd64 --role target 2>&1); rc=$?
+out=$(BUI_MIRRORS="" bash "$ROOT/scripts/ci/fetch-kernels.sh" --out "$WORK/out" --lock "$LOCK" --arch amd64 2>&1); rc=$?
 assert_eq "3" "$rc" "全部源失败退 3"
 
 out=$(bash "$ROOT/scripts/ci/fetch-kernels.sh" --out "$WORK/out" --lock "$WORK/nope.lock" 2>&1); rc=$?
@@ -105,7 +103,7 @@ hy_lock() { # $1 = hysteria sha
     printf 'hysteria target 2.12.2 amd64 %s https://github.com/apernet/hysteria/releases/download/app/v2.12.2/hysteria-linux-amd64\n' "$1"
   } > "$WORK/lock-hy"
 }
-hy_run() { BUI_MIRRORS="https://mirror-a.example/" bash "$ROOT/scripts/ci/fetch-kernels.sh" --out "$WORK/out2" --lock "$WORK/lock-hy" --arch amd64 --role target; }
+hy_run() { BUI_MIRRORS="https://mirror-a.example/" bash "$ROOT/scripts/ci/fetch-kernels.sh" --out "$WORK/out2" --lock "$WORK/lock-hy" --arch amd64; }
 
 printf '#!/bin/sh\necho hysteria 2.12.1\n' > "$WORK/srv/hysteria"
 HY_OLD=$(sha_of "$WORK/srv/hysteria")
@@ -146,7 +144,7 @@ built_sha=$(printf '#!/bin/sh\necho "sing-box version 1.14.1"\n' | sha256sum | c
 sed -i "s/SHA_PLACEHOLDER/$built_sha/" "$BLOCK"
 
 out=$(BUI_SINGBOX_BUILDER="$WORK/stub-release/build-singbox.sh" \
-  bash "$ROOT/scripts/ci/fetch-kernels.sh" --out "$WORK/out-build" --lock "$BLOCK" --role target 2>&1)
+  bash "$ROOT/scripts/ci/fetch-kernels.sh" --out "$WORK/out-build" --lock "$BLOCK" 2>&1)
 rc=$?
 assert_eq "0" "$rc" "build: 行构建成功退 0"
 assert_contains "built sing-box" "$out" "打印了构建分支的日志行"
@@ -163,7 +161,7 @@ assert_contains "--go go1.25.4" "$argv" "透传锁里的 go=（工具链被钉�
 
 # 第二次跑：缓存命中，不再调构建器（构建器换成会失败的版本也必须退 0）
 out=$(BUI_SINGBOX_BUILDER=/bin/false \
-  bash "$ROOT/scripts/ci/fetch-kernels.sh" --out "$WORK/out-build" --lock "$BLOCK" --role target 2>&1)
+  bash "$ROOT/scripts/ci/fetch-kernels.sh" --out "$WORK/out-build" --lock "$BLOCK" 2>&1)
 assert_eq "0" "$?" "缓存命中不再构建"
 assert_contains "cached" "$out" "命中打印 cached"
 
@@ -171,7 +169,7 @@ assert_contains "cached" "$out" "命中打印 cached"
 sed -i "s/$built_sha/0000000000000000000000000000000000000000000000000000000000000000/" "$BLOCK"
 rm -rf "$WORK/out-build"
 BUI_SINGBOX_BUILDER="$WORK/stub-release/build-singbox.sh" \
-  bash "$ROOT/scripts/ci/fetch-kernels.sh" --out "$WORK/out-build" --lock "$BLOCK" --role target >/dev/null 2>&1
+  bash "$ROOT/scripts/ci/fetch-kernels.sh" --out "$WORK/out-build" --lock "$BLOCK" >/dev/null 2>&1
 assert_eq "4" "$?" "构建产物 sha 与锁不符退 4"
 assert_eq "0" "$([[ -f "$WORK/out-build/bin/sing-box" ]] && echo 1 || echo 0)" "sha 不符时不留下二进制"
 
@@ -184,7 +182,7 @@ NOGO="$WORK/kernels-nogo.lock"
 : > "$ARGV_LOG"
 rm -rf "$WORK/out-nogo"
 out=$(BUI_SINGBOX_BUILDER="$WORK/stub-release/build-singbox.sh" \
-  bash "$ROOT/scripts/ci/fetch-kernels.sh" --out "$WORK/out-nogo" --lock "$NOGO" --role target 2>&1); rc=$?
+  bash "$ROOT/scripts/ci/fetch-kernels.sh" --out "$WORK/out-nogo" --lock "$NOGO" 2>&1); rc=$?
 assert_eq "3" "$rc" "build: URI 缺 go= 退 3"
 assert_contains "build: URI 不合规" "$out" "点名 URI 不合规"
 assert_eq "0" "$(grep -c . "$ARGV_LOG")" "缺 go= 时根本不调构建器"
@@ -198,7 +196,7 @@ rm -rf "$WORK/out-noperm"
 mkdir -p "$WORK/out-noperm/bin"
 chmod 500 "$WORK/out-noperm/bin"
 out=$(BUI_SINGBOX_BUILDER="$WORK/stub-release/build-singbox.sh" \
-  bash "$ROOT/scripts/ci/fetch-kernels.sh" --out "$WORK/out-noperm" --lock "$BLOCK2" --role target 2>&1); rc=$?
+  bash "$ROOT/scripts/ci/fetch-kernels.sh" --out "$WORK/out-noperm" --lock "$BLOCK2" 2>&1); rc=$?
 chmod 755 "$WORK/out-noperm/bin"
 assert_eq "3" "$rc" "build: 行落地失败退 3"
 assert_contains "落地失败" "$out" "有中文错误"

@@ -4,10 +4,6 @@ inputs:
   dir:
     description: 落地目录
     required: true
-  role:
-    description: all | target | check
-    required: false
-    default: all
   arch:
     description: amd64 | arm64
     required: false
@@ -63,16 +59,17 @@ runs:
       run: |
         bash scripts/ci/fetch-kernels.sh \
           --out "${{ inputs.dir }}" \
-          --arch "${{ inputs.arch }}" \
-          --role "${{ inputs.role }}"
+          --arch "${{ inputs.arch }}"
     - name: 打印版本（只对本机架构可执行）
       if: ${{ inputs.arch == 'amd64' }}
       shell: bash
       run: |
         "${{ inputs.dir }}/bin/sing-box" version | tee "$RUNNER_TEMP/sing-box-version.txt"
+        expected=$(awk '$1 == "sing-box" && $2 == "target" {print $3; exit}' scripts/release/kernels.lock)
+        actual=$(awk '/^sing-box version/ {print $3; exit}' "$RUNNER_TEMP/sing-box-version.txt")
+        [[ "$actual" == "$expected" ]] || { echo "sing-box 版本不符：期望 $expected，实际 $actual"; exit 1; }
         "${{ inputs.dir }}/bin/xray" version | head -1
         "${{ inputs.dir }}/bin/hysteria" version | head -3
-        ls -1 "${{ inputs.dir }}/singbox" 2>/dev/null || true
         # 随发布分发的那一个 sing-box 是自建的，唯一动机就是 with_v2ray_api（住宅计量要它，
         # spec §5.3）：缺了就当场判红，别等装到机器上才发现 QueryStats 那一面没编进去。
         grep -q 'with_v2ray_api' "$RUNNER_TEMP/sing-box-version.txt" \

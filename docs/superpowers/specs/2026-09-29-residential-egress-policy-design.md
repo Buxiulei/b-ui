@@ -34,9 +34,9 @@ HY2 gate / Xray → slot-i SOCKS 入站 → 公共规则 → slot-i-pool selecto
 2. B → A → B 热切，新连接跟随对应策略，旧 TCP 流继续收发；内核 PID 不变。
 3. 全 SOCKS 的 UDP 双向通信、域名解析和同会话地址变化仍正常；混池规则保持。
 4. raw UUID 错误能正确归因；外层派生错误不触发重复事件，旧拓扑兼容不退化。
-5. 内核配置通过 sing-box 1.12/1.13/1.14 校验和实际回环测试。
+5. 唯一目标为锁定的 sing-box 1.14.2 发布内核；配置校验和全部实际 TCP/UDP 回环测试均在该内核执行，不保留旧 minor 适配矩阵。
 6. 量化额外转发层的短连接分位延迟、server-first 等待、长流吞吐与 FD；记录环境，不把回环成绩当作公网 SLA。
 
 主要风险是多一次本地 SOCKS 握手、额外文件描述符、重复嗅探和 UDP 会话包装。上线前必须通过真实内核验证。未来“准备新配置 → 切新流 → 排空旧配置”的双代 relay 属于另一阶段，不在本 PR 中混入。
 
-上游行为参考：[SOCKS 出站](https://sing-box.sagernet.org/configuration/outbound/socks/)、[路由动作与嗅探](https://sing-box.sagernet.org/configuration/route/rule_action/)。最终兼容性以固定内核版本的实际测试为准。
+上游行为参考：[SOCKS 出站](https://sing-box.sagernet.org/configuration/outbound/socks/)、[路由动作与嗅探](https://sing-box.sagernet.org/configuration/route/rule_action/)。运行语义以固定 1.14.2 发布内核的实际测试为准。

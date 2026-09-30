@@ -4,7 +4,7 @@
 
 测试入口：`cargo test -p bui-schema --test kernel_relay_policy -- --nocapture`。测试将生产 Rust renderer 输出交给真实 sing-box；只移动监听端口、提供离线 DNS、替换供应商为回环 SOCKS/HTTP 模拟端，并关闭持久缓存。测试不使用生产配置或外网。
 
-覆盖：A/B 不同端口与自动域名策略隔离；B → A → B 热切后新流使用新策略，已有 B TCP 保留；half-close 后完整响应；私网直连；HTTP/SOCKS 混池；UDP 双向与同会话源端口；IP-only HTTP Host 嗅探和原始 FQDN 不改写。UDP selector 部分在固定 1.14 轨道执行，TCP/HTTP 与策略检查在 1.12/1.13/1.14 全部执行。
+覆盖：A/B 不同端口与自动域名策略隔离；B → A → B 热切后新流使用新策略，已有 B TCP 保留；half-close 后完整响应；私网直连；HTTP/SOCKS 混池；UDP 双向与同会话源端口；IP-only HTTP Host 嗅探和原始 FQDN 不改写。全部测试只针对锁定的 sing-box 1.14.2 发布内核，半关闭与 UDP 断言均不可按版本跳过。2026-09-30 用户明确要求停止旧 minor 适配，发布轨道、CI 和下载资产随之收敛到 1.14.2。
 
 IP-only 公网目标用例将 `direct` 最终接收器替换成本机 fake SOCKS，保持生产路由规则和目标元数据，防止失败测试访问外网。该用例验证路由选择，真实 direct 网络栈另由回环用例覆盖。
 
@@ -34,3 +34,11 @@ IP-only 公网目标用例将 `direct` 最终接收器替换成本机 fake SOCKS
 真实内核实验证实：供应商 REP2/REP4 会分别产生内层稳定 UUID 的真实错误，以及外层 selector 的合成 REP1。内层使用 UUID 定位，外层不作为独立供应商故障。未知 UUID、API 不可读及回滚混批有业务回归保护。
 
 本阶段不引入自研转发协议。Rust 控制面生成路由、管理选择和解释故障，实际协议仍由上游内核处理。热切保留连接，但修改策略或池结构仍会重启整个 relay；同 UUID 跨配置代际的旧日志仍需未来 generation/epoch 处理。要消除配置更新导致的断联，需要后续单独实现准备、验证、发布新流和旧流排空，不能将本阶段描述为已经完成该能力。
+
+## 2026-09-30 内核范围收敛的证据
+
+此前 CI 的 1.13.21 半关闭用例失败，已用相同模拟端和新旧拓扑作对照：原单层、普通 wrapper、auto wrapper，分别测试立即 FIN、延后 1 ms / 10 ms FIN，以及复用连接后 FIN，每组 100 次。Linux 1.13.21 为 1200 次失败；macOS 1.14.2 为 1200 次通过，供应商在失败场景已收到上传结束并发回响应。该差异不是 Rust renderer 新增回环层独有的回归。
+
+源码解释与实验一致：1.13.21 的 TCP 跟踪包装隐藏了 CloseWrite；1.14.2 的 connectionCopy 在判断半关闭前解开计数和连接包装。[1.14.2 connectionCopy](https://github.com/SagerNet/sing-box/blob/v1.14.2/route/conn.go) 与 [1.13.21 connectionCopy](https://github.com/SagerNet/sing-box/blob/v1.13.21/route/conn.go) 是对照依据。
+
+不为旧内核添加行为分支。1.14.2 的 TCP 半关闭、热切保留旧连接和 UDP 收发继续作为发布必过条件；此处记录旧结果仅解释先前 CI 失败。

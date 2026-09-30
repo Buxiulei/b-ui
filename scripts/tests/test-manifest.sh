@@ -20,18 +20,17 @@ done
 
 LOCK="$WORK/kernels.lock"
 # sing-box target 两行的 URL 列是 build: URI（自建，唯一动机 with_v2ray_api，spec §5.3），
-# 版本列仍是第 3 列；check 的 1.13 那行仍是上游归档。
+# 版本列仍是第 3 列。
 cat > "$LOCK" <<'EOF'
 # kernel role version arch sha256 url
-sing-box target 1.14.5 amd64 9999999999999999999999999999999999999999999999999999999999999999 build:SagerNet/sing-box@v1.14.5;go=go1.25.4;tags=with_quic,with_v2ray_api
-sing-box target 1.14.5 arm64 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa build:SagerNet/sing-box@v1.14.5;go=go1.25.4;tags=with_quic,with_v2ray_api
+sing-box target 1.14.2 amd64 9999999999999999999999999999999999999999999999999999999999999999 build:SagerNet/sing-box@v1.14.2;go=go1.25.4;tags=with_quic,with_v2ray_api
+sing-box target 1.14.2 arm64 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa build:SagerNet/sing-box@v1.14.2;go=go1.25.4;tags=with_quic,with_v2ray_api
 xray target 26.3.27 amd64 7777777777777777777777777777777777777777777777777777777777777777 https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-linux-64.zip
 xray target 26.3.27 arm64 8888888888888888888888888888888888888888888888888888888888888888 https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-linux-arm64-v8a.zip
 hysteria target 2.12.2 amd64 5555555555555555555555555555555555555555555555555555555555555555 https://github.com/apernet/hysteria/releases/download/app/v2.12.2/hysteria-linux-amd64
 hysteria target 2.12.2 arm64 6666666666666666666666666666666666666666666666666666666666666666 https://github.com/apernet/hysteria/releases/download/app/v2.12.2/hysteria-linux-arm64
 caddy target 2.11.4 amd64 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb https://github.com/caddyserver/caddy/releases/download/v2.11.4/caddy_2.11.4_linux_amd64.tar.gz
 caddy target 2.11.4 arm64 cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc https://github.com/caddyserver/caddy/releases/download/v2.11.4/caddy_2.11.4_linux_arm64.tar.gz
-sing-box check 1.13.21 amd64 dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd https://github.com/SagerNet/sing-box/releases/download/v1.13.21/sing-box-1.13.21-linux-amd64.tar.gz
 EOF
 
 M="$WORK/manifest.json"
@@ -43,8 +42,8 @@ assert_eq "4.0.0" "$(jq -r '.version' "$M")" "顶层 version"
 assert_eq "null" "$(jq -r '.schema // "null"' "$M")" "C4 没有 schema 字段"
 assert_eq "null" "$(jq -r '.binaries // "null"' "$M")" "C4 没有 binaries 段（放弃草稿形状）"
 assert_eq "5" "$(jq -r '.kernels | keys | length' "$M")" "kernels 恰好五项版本号"
-assert_eq "1.14.5" "$(jq -r '.kernels.sing_box' "$M")" "kernels.sing_box 用下划线键，取 target 行"
-assert_eq "1.14.5" "$(jq -r '.kernels.client_sing_box' "$M")" "client_sing_box 与服务端同版本"
+assert_eq "1.14.2" "$(jq -r '.kernels.sing_box' "$M")" "kernels.sing_box 用下划线键，取 target 行"
+assert_eq "1.14.2" "$(jq -r '.kernels.client_sing_box' "$M")" "client_sing_box 与服务端同版本"
 assert_eq "2.11.4" "$(jq -r '.kernels.caddy' "$M")" "kernels.caddy 取 target 行"
 assert_eq "string" "$(jq -r '.kernels.xray | type' "$M")" "kernels 的值是版本号字符串，不是对象"
 assert_eq "12" "$(jq -r '.artifacts | keys | length' "$M")" "artifacts 恰好 12 项"
@@ -55,8 +54,6 @@ assert_eq "$(sha256sum "$DIST/bui-c-linux-arm64" | cut -d' ' -f1)" \
 assert_eq "0" "$(jq -r '[.artifacts[].url | select(test("\\.tar\\.gz$|\\.zip$"))] | length' "$M")" \
     "没有任何 url 指向归档（内核已由 Actions 解包重传）"
 assert_eq "2" "$(jq -r '[.artifacts | keys[] | select(startswith("bui-c-"))] | length' "$M")" "bui-c 两个架构各一项"
-assert_not_contains "1.13.19" "$(cat "$M")" "check 用的旧 minor 不进 manifest"
-assert_not_contains "1.13.21" "$(cat "$M")" "check 行的版本不进 kernels"
 assert_eq "https://github.com/Buxiulei/b-ui/releases/tag/v4.0.0" "$(jq -r '.changelog_url' "$M")" "changelog_url 指向 Release 页"
 assert_eq "v4.0.0" "$(jq -r '.tag' "$M")" "不传 --tag 时 tag 默认 v<version>"
 assert_eq "2026-09-18T07:22:10Z" "$(jq -r '.released' "$M")" "released 原样写入"

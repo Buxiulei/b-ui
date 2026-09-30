@@ -230,7 +230,7 @@ fn relay_all_socks5_pool_lets_udp_reach_the_pool() {
         "「其余 UDP 直连」那条要删掉（否则 UDP 永远暴露 VPS 自身 IP）：{rules:#?}"
     );
     assert_eq!(cfg["route"]["final"], "resi-pool");
-    common::check_singbox_all(&cfg);
+    common::check_singbox(&cfg);
 }
 
 /// 混合池（fixture 自带 http + socks5）：http 出站没有 UDP 能力，规则保持 v3 三条。
@@ -251,7 +251,7 @@ fn relay_mixed_pool_keeps_the_three_udp_rules() {
         udp_resolve_pos(rules).is_none(),
         "混合池的 UDP 不进 socks 出站，不需要先解析：{rules:#?}"
     );
-    common::check_singbox_all(&cfg);
+    common::check_singbox(&cfg);
 }
 
 /// 全 http 池：同上，三条规则一条不少。
@@ -273,7 +273,7 @@ fn relay_all_http_pool_keeps_the_three_udp_rules() {
         udp_resolve_pos(rules).is_none(),
         "全 http 池的 UDP 不进 socks 出站，不需要先解析：{rules:#?}"
     );
-    common::check_singbox_all(&cfg);
+    common::check_singbox(&cfg);
 }
 
 /// UDP 域名要先经过实际出口 auto，再解析成 IPv4；因此 resolve 属于 policy 入站。
@@ -328,7 +328,7 @@ fn relay_all_socks5_pool_resolves_udp_after_policy_matching_before_raw_egress() 
                 "解析之后仍须挡住私网目标"
             );
         }
-        common::check_singbox_all(&cfg);
+        common::check_singbox(&cfg);
     }
 }
 
@@ -369,7 +369,7 @@ fn residential_dns_detour_bypasses_client_dns_and_port_rules() {
             "内部住宅 DNS 不能因 wrapper 的端口策略悄悄变直连"
         );
     }
-    common::check_singbox_all(&cfg);
+    common::check_singbox(&cfg);
 }
 
 fn udp_resolve_pos(rules: &[serde_json::Value]) -> Option<usize> {
@@ -425,10 +425,10 @@ fn relay_disabled_group_is_direct_only() {
     common::check_singbox(&cfg);
 }
 
-/// 多槽配置必须在 1.12 / 1.13 / 1.14 三版上都过 `sing-box check`：每槽一个 socks 入站、
+/// 多槽配置必须在发布内核上过 `sing-box check`：每槽一个 socks 入站、
 /// 每槽一个 selector、按 `inbound` 分流 —— 这三样都是 `check` 会严格校验的字段。
 #[test]
-fn a_three_slot_relay_passes_singbox_check_on_all_versions() {
+fn a_three_slot_relay_passes_singbox_check_on_the_target_kernel() {
     let s = common::state("global");
     let mut g = s.residential.default_group().unwrap().clone();
     // fixture 自带 2 条上游，补到 3 条
@@ -448,5 +448,5 @@ fn a_three_slot_relay_passes_singbox_check_on_all_versions() {
         .collect();
     let cfg = relay::config(&g, &slots, &opts());
     assert_eq!(cfg["inbounds"].as_array().unwrap().len(), 6);
-    common::check_singbox_all(&cfg);
+    common::check_singbox(&cfg);
 }
