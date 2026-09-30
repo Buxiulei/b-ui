@@ -158,6 +158,7 @@ pub mod model;
 pub mod nodes;
 pub mod parse;
 pub mod paths;
+pub mod relay_generation;
 pub mod relay_policy;
 pub mod render;
 pub mod slots;

@@ -16,6 +16,8 @@ use crate::render::SplitRules;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
+pub mod generation;
+
 /// 渲染 relay 配置需要的本机参数。
 #[derive(Debug, Clone, PartialEq)]
 pub struct RelayOpts {
