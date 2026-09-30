@@ -209,7 +209,7 @@ fn obfs_reaches_residential_hy2_in_all_three_subscriptions() {
     let want = serde_json::json!({"type": "salamander", "password": "obfs-pw-test"});
     assert_eq!(out("hy2-residential")["obfs"], want);
     assert_eq!(out("hy2-direct")["obfs"], want);
-    common::check_singbox_all(&sb);
+    common::check_singbox(&sb);
 
     let clash: serde_yaml::Value =
         serde_yaml::from_str(&subscription::clash(&nodes, "alice", &split)).unwrap();
@@ -342,7 +342,7 @@ fn multi_slot_does_not_move_the_residential_hy2_endpoint() {
             .unwrap()
             .clone();
         assert_eq!(out["server_port"], port, "user={u}");
-        common::check_singbox_all(&sb);
+        common::check_singbox(&sb);
         let yaml = subscription::clash(&nodes, u, &split);
         assert!(
             yaml.contains(&format!("port: {port}")),
@@ -408,7 +408,7 @@ fn a_user_with_no_nodes_still_gets_a_loadable_subscription() {
         }
     }
     // 判据：真内核跑一遍 check（缺内核则 skip）
-    common::check_singbox_all(&sb);
+    common::check_singbox(&sb);
 
     // mihomo 那侧：组不许是空的，`MATCH` 的落点要么是内置出站、要么是真实存在的组
     let yaml = subscription::clash(&nodes, "bob", &split);

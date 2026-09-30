@@ -134,9 +134,11 @@ pub async fn learn_from_journal(ctx: &DaemonCtx, clash: Arc<dyn Clash>) -> anyho
     let now = crate::util::fmt_rfc3339(ctx.host.now());
     let mut learned = 0usize;
     // ── 归因层（有 I/O）────────────────────────────────────────────────────────
+    let legacy = clash::legacy_attribution(&clash, batch.lines.iter().map(|l| &l.subject)).await;
     let pools: Vec<String> = batch
         .lines
         .iter()
+        .filter(|l| clash::attributable(&l.subject, legacy))
         .filter_map(|l| clash::pool_of(&l.subject).map(str::to_string))
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -151,6 +153,10 @@ pub async fn learn_from_journal(ctx: &DaemonCtx, clash: Arc<dyn Clash>) -> anyho
     let unstable = clash::unstable_pools(&g, &pool_now, &rt);
     let mut lines: Vec<(Uuid, journal::RejectLine)> = Vec::new();
     for l in &batch.lines {
+        if !clash::attributable(&l.subject, legacy) {
+            tracing::debug!(host = %l.host, port = l.port, "relay 外层错误或拓扑未知，丢弃合成拒绝证据");
+            continue;
+        }
         if clash::pool_of(&l.subject).is_some_and(|p| unstable.contains(p)) {
             tracing::debug!(host = %l.host, port = l.port, "该池的 now 与运行时记录不一致（有过没记账的切换），本批证据放弃");
             continue;
@@ -828,6 +834,91 @@ mod tests {
             refused: refused.iter().map(|s| s.to_string()).collect(),
             direct: direct.iter().map(|s| s.to_string()).collect(),
         })
+    }
+
+    #[tokio::test]
+    async fn policy_egress_errors_keep_their_uuid_after_member_reordering() {
+        let d = tempfile::tempdir().unwrap();
+        let (c, host) = ctx(&d).await;
+        add_second_upstream(&c).await;
+        rstate::update_group(&c.store, &c.bus, |g| g.upstreams.reverse())
+            .await
+            .unwrap();
+        let id = Uuid::from_u128(2);
+        feed(&host, &format!(
+            "ERROR connection: open connection to blocked.example.com:443 using outbound/socks[resi-egress-{id}]: socks5: request rejected, code=2"
+        ));
+        assert_eq!(learn_from_journal(&c, no_clash()).await.unwrap(), 1);
+        let r = rstate::read(&c.runtime).await;
+        assert_eq!(r.candidates.values().next().unwrap().upstream_id, id);
+    }
+
+    #[tokio::test]
+    async fn policy_egress_rejections_count_once_and_unknown_ids_are_dropped() {
+        let d = tempfile::tempdir().unwrap();
+        let (c, host) = ctx(&d).await;
+        add_second_upstream(&c).await;
+        let clash = Arc::new(FakeClash::new(Some("resi-1")));
+        clash.with(|i| i.legacy_attribution = false);
+        let raw = bui_schema::relay_policy::egress_tag(Uuid::from_u128(2));
+        // 1.14.2 回环实测：供应商 REP2 => 内层 REP2 + 外层 selector 合成 REP1。
+        feed(&host, &format!(
+            "ERROR connection: open connection to blocked.example.com:443 using outbound/socks[{raw}]: socks5: request rejected, code=2\n\
+             ERROR connection: open connection to blocked.example.com:443 using outbound/selector[resi-pool]: socks5: request rejected, code=1"
+        ));
+        assert_eq!(learn_from_journal(&c, clash.clone()).await.unwrap(), 1);
+        let r = rstate::read(&c.runtime).await;
+        assert_eq!(r.candidates.len(), 1);
+        let candidate = r.candidates.values().next().unwrap();
+        assert_eq!(candidate.upstream_id, Uuid::from_u128(2));
+        assert_eq!(candidate.hits, 1);
+
+        let unknown = bui_schema::relay_policy::egress_tag(Uuid::from_u128(99));
+        feed(&host, &format!(
+            "ERROR connection: open connection to unknown.example.com:443 using outbound/socks[{unknown}]: socks5: request rejected, code=2"
+        ));
+        assert_eq!(learn_from_journal(&c, clash).await.unwrap(), 0);
+        assert_eq!(rstate::read(&c.runtime).await.candidates.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn legacy_rejections_need_a_confirmed_legacy_runtime_topology() {
+        let d = tempfile::tempdir().unwrap();
+        let (c, host) = ctx(&d).await;
+        let clash = Arc::new(FakeClash::new(Some("resi-1")));
+        clash.with(|i| i.legacy_attribution = false);
+        for outbound in ["socks[resi-1]", "selector[resi-pool]"] {
+            let line = format!(
+                "ERROR connection: open connection to blocked.example.com:443 using outbound/{outbound}: socks5: request rejected, code=2"
+            );
+            feed(&host, &line);
+            assert_eq!(learn_from_journal(&c, clash.clone()).await.unwrap(), 0);
+        }
+        assert!(rstate::read(&c.runtime).await.candidates.is_empty());
+        assert!(clash.calls().is_empty(), "不查询合成行的当前 selector 选择");
+        clash.with(|i| i.legacy_attribution = true);
+        feed(&host, "ERROR connection: open connection to blocked.example.com:443 using outbound/selector[resi-pool]: socks5: request rejected, code=2");
+        assert_eq!(learn_from_journal(&c, clash).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn mixed_policy_and_legacy_rejections_ignore_outer_evidence_after_rollback() {
+        let d = tempfile::tempdir().unwrap();
+        let (c, host) = ctx(&d).await;
+        add_second_upstream(&c).await;
+        let raw = bui_schema::relay_policy::egress_tag(Uuid::from_u128(2));
+        // API 已显示旧拓扑；同批 UUID 行仍证明至少部分日志来自新拓扑。
+        feed(&host, &format!(
+            "ERROR connection: open connection to blocked.example.com:443 using outbound/socks[{raw}]: socks5: request rejected, code=2\n\
+             ERROR connection: open connection to blocked.example.com:443 using outbound/socks[resi-1]: socks5: request rejected, code=2"
+        ));
+        assert_eq!(learn_from_journal(&c, clash_at("resi-1")).await.unwrap(), 1);
+        let r = rstate::read(&c.runtime).await;
+        assert_eq!(r.candidates.len(), 1);
+        assert_eq!(
+            r.candidates.values().next().unwrap().upstream_id,
+            Uuid::from_u128(2)
+        );
     }
 
     #[test]

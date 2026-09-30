@@ -73,10 +73,24 @@ def main():
         threading.Thread(target=accept, daemon=True).start()
         # Only relocate listeners and replace DNS with a deterministic, offline
         # answer. Keep the generated routing, SOCKS outbound and selectors intact.
-        with bound(socket.SOCK_STREAM) as reserved:
-            listen_port = reserved.getsockname()[1]
-        cfg["inbounds"][0]["listen_port"] = listen_port
-        cfg["outbounds"][0]["server_port"] = gateway.getsockname()[1]
+        # Relocate both slot and policy listeners. Replacing resi-1 directly
+        # would bypass the policy hop and silently stop testing the real path.
+        reservations = [bound(socket.SOCK_STREAM) for _ in cfg["inbounds"]]
+        ports = {}
+        for inbound, reserved in zip(cfg["inbounds"], reservations):
+            ports[inbound["listen_port"]] = reserved.getsockname()[1]
+            inbound["listen_port"] = reserved.getsockname()[1]
+        listen_port = cfg["inbounds"][0]["listen_port"]
+        raw_count = 0
+        for outbound in cfg["outbounds"]:
+            if outbound["tag"].startswith("resi-egress-"):
+                outbound["server_port"] = gateway.getsockname()[1]
+                raw_count += 1
+            elif outbound.get("type") == "socks" and outbound.get("server") == "127.0.0.1":
+                outbound["server_port"] = ports[outbound["server_port"]]
+        assert raw_count == 1, "fixture must exercise one real policy endpoint"
+        for reserved in reservations:
+            reserved.close()
         cfg["dns"]["servers"] = [
             {"type": "hosts", "tag": tag, "predefined": {"echo.example.invalid": ["203.0.113.9"]}}
             for tag in ("dns_direct", "dns_resi")

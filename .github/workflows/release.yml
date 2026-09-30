@@ -80,9 +80,8 @@ jobs:
         uses: ./.github/actions/setup-kernels
         with:
           dir: ${{ runner.temp }}/kernels-amd64
-          role: all
           arch: amd64
-      - name: 全量测试（sing-box 1.14 = target）
+      - name: 全量测试（sing-box 1.14.2）
         run: |
           set -euo pipefail
           BIN="$RUNNER_TEMP/pathbin"
@@ -95,13 +94,7 @@ jobs:
           # 而 ubuntu-24.04 镜像不预装 caddy：软链进 /usr/local/bin 才能真跑校验（同 ci.yml）。
           sudo ln -sf "$RUNNER_TEMP/kernels-amd64/bin/caddy" /usr/local/bin/caddy
           cargo test --workspace -- --nocapture 2>&1 | tee "$RUNNER_TEMP/test.log"
-          # 只判「内核校验漏跑」这一种 skip（与 ci.yml 同一口径）：测试里另有两种设计内的
-          # skip（缺 P0 的 v3 fixture、Task 13 删掉 server/core.sh 后的 v3 sysctl 对照），
-          # 不能算漏跑判红——否则 Task 13 之后每次发版都会无故红。
-          # 「自建 sing-box（with_v2ray_api）不可用」这种 skip 在 ci.yml 是白名单（1.12/1.13
-          # 两格本来就是上游归档），在**发布路径上恰恰相反**：PATH 上的 sing-box 就是 bin/
-          # 里那份自建的，住宅那份配置必须真跑 check ⇒ 这条 skip 一出现就判红。下面是单条
-          # 「出现即判红」的 grep（不是 ci.yml 的「收集 + 放行」两段式），所以它要写进 grep 里。
+          # 配置和真实流量只验发布内核；二进制缺失或漏编计量能力均不接受 skip。
           if grep -Eq 'skipped: ((sing-box|xray|hysteria) not found|本机没有 caddy 二进制|自建 sing-box（with_v2ray_api）不可用)' "$RUNNER_TEMP/test.log"; then
             echo "内核校验被跳过，说明没找到内核二进制：发版不接受 skip"
             grep -E 'skipped: ' "$RUNNER_TEMP/test.log"
@@ -212,13 +205,11 @@ jobs:
         uses: ./.github/actions/setup-kernels
         with:
           dir: ${{ runner.temp }}/kernels-amd64
-          role: target
           arch: amd64
       - name: 准备内核（arm64）
         uses: ./.github/actions/setup-kernels
         with:
           dir: ${{ runner.temp }}/kernels-arm64
-          role: target
           arch: arm64
       - name: 把上游内核以裸二进制归集进 dist（C4：artifacts 全是裸二进制）
         run: |

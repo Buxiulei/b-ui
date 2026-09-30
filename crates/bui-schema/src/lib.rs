@@ -43,6 +43,14 @@
 //!   不留 `#[deprecated]` 也不留转发壳）：`SlotRes.{hy2_port, stats_port, hop}`、
 //!   `slots::{HY2_STATS_RESI_BASE, hop_slice, slot_span, resources_of}`。
 //!
+//! ## 实际住宅出口策略 —— [`relay_policy`]
+//!
+//! - [`relay_policy::validate_group`]：state 读写前校验池容量，不截断无效输入。
+//! - [`relay_policy::policy_port`]：每个上游的回环 policy SOCKS 端口，保留范围
+//!   [`relay_policy::POLICY_SOCKS_BASE`] 起的 8 个端口；上游选择热切不会移动策略。
+//! - [`relay_policy::inbound_tag`] / [`relay_policy::egress_tag`]：策略入站与真实供应商
+//!   出站的稳定 UUID 标签；[`relay_policy::upstream_from_egress_tag`] 供日志归因使用。
+//!
 //! ## 住宅 HY2 凭据池 —— [`hy2pool`]
 //!
 //! 住宅 HY2 是**一个** sing-box hysteria2 入站 + 一池静态凭据
@@ -150,6 +158,7 @@ pub mod model;
 pub mod nodes;
 pub mod parse;
 pub mod paths;
+pub mod relay_policy;
 pub mod render;
 pub mod slots;
 pub mod sub;

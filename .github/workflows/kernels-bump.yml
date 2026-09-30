@@ -108,7 +108,6 @@ jobs:
         uses: ./.github/actions/setup-kernels
         with:
           dir: ${{ runner.temp }}/kernels-amd64
-          role: all
           arch: amd64
       - name: 按新锁准备内核 arm64（只为复算交叉编译那一份的 sha）
         if: steps.bump.outputs.changed == '1'
@@ -118,7 +117,6 @@ jobs:
         uses: ./.github/actions/setup-kernels
         with:
           dir: ${{ runner.temp }}/kernels-arm64
-          role: target
           arch: arm64
       - name: 自建 Tags ⊇ 官方同版本归档的 Tags
         if: steps.bump.outputs.changed == '1'
@@ -154,41 +152,17 @@ jobs:
           set -euo pipefail
           BIN="$RUNNER_TEMP/pathbin"
           mkdir -p "$BIN"
-          # 默认名 sing-box = bin/ 里那份**自建**的 target（1.14，带 with_v2ray_api）
+          # 默认名 sing-box = bin/ 里的固定发布版本，带 with_v2ray_api
           ln -sf "$RUNNER_TEMP/kernels-amd64/bin/sing-box" "$BIN/sing-box"
           ln -sf "$RUNNER_TEMP/kernels-amd64/bin/xray" "$BIN/xray"
           ln -sf "$RUNNER_TEMP/kernels-amd64/bin/hysteria" "$BIN/hysteria"
-          # ci.yml 靠三格矩阵拿到 1.12 / 1.13 的订阅兼容覆盖，本作业只有一格：不建这两个
-          # 软链的话 check_singbox_all（crates/bui-schema/tests/common/mod.rs）直接静默 skip，
-          # 而 bot 改的**恰恰是内核版本**——多版本兼容正是它唯一能抓的东西。
-          # shellcheck disable=SC1091
-          . scripts/release/kernel-versions.env
-          for m in $SINGBOX_CHECK_MINORS; do
-            ln -sf "$RUNNER_TEMP/kernels-amd64/singbox/$m/sing-box" "$BIN/sing-box-$m"
-          done
           export PATH="$BIN:$PATH"
-          # 软链真的可执行、且真的是那个 minor：断在这里而不是靠下面的 skip 口径，
-          # 否则哪天落点变了只会表现成一条被白名单放行的 skip。
-          for m in $SINGBOX_CHECK_MINORS; do
-            got=$("sing-box-$m" version | awk '/^sing-box version/ {print $3; exit}')
-            echo "sing-box-$m = $got"
-            case "$got" in "$m".*) ;; *) echo "sing-box-$m 版本不符：期望 $m.x"; exit 1 ;; esac
-          done
           # caddy 的 validate 用例只认三个绝对路径、不查 PATH（同 ci.yml / release.yml）
           sudo ln -sf "$RUNNER_TEMP/kernels-amd64/bin/caddy" /usr/local/bin/caddy
           cargo test --workspace -- --nocapture 2>&1 | tee "$RUNNER_TEMP/test.log"
-          # 「内核校验漏跑判红」，口径同 ci.yml。白名单两条：
-          #   sing-box-1.14 not found —— 1.14 的覆盖由默认名 sing-box（自建 target）提供，
-          #     带 -1.14 后缀的二进制在这里不存在；1.12 / 1.13 的 not found **不**放行
-          #     （上面刚建了软链并断言过版本），漏了就该红。
-          #   自建 sing-box（with_v2ray_api）不可用 —— 这条 skip 的真闸门在 setup-kernels 的
-          #     Tags 硬断言（更早一步、已经判过红），这里再判一次只会因 1.12/1.13 不带该标签
-          #     而每周误红。
-          kernel_skips=$(grep -E 'skipped: ((sing-box|xray|hysteria)(-[0-9.]+)? not found|本机没有 caddy 二进制|自建 sing-box（with_v2ray_api）不可用)' "$RUNNER_TEMP/test.log" || true)
-          missed=$(printf '%s\n' "$kernel_skips" | grep -Ev 'skipped: (sing-box-1\.14 not found|自建 sing-box（with_v2ray_api）不可用)' || true)
-          if [[ -n "$missed" ]]; then
-            echo "内核校验被跳过，说明没找到内核二进制：不接受 skip"
-            printf '%s\n' "$missed"
+          if grep -Eq 'skipped: ((sing-box|xray|hysteria) not found|本机没有 caddy 二进制|自建 sing-box（with_v2ray_api）不可用)' "$RUNNER_TEMP/test.log"; then
+            echo "内核校验被跳过：不接受 skip"
+            grep -E 'skipped: ' "$RUNNER_TEMP/test.log"
             exit 1
           fi
       - name: 开 PR
@@ -218,7 +192,7 @@ jobs:
             git diff --cached -U0 -- scripts/release/kernels.lock \
               | grep -E '^[-+][^-+]' | grep -v '生成时间' || true
             printf '```\n\n'
-            printf '本工作流已用新内核（含 sing-box-1.12 / 1.13 两版兼容用例）跑过 cargo test --workspace，并核过自建 Tags ⊇ 官方同版本归档。GITHUB_TOKEN 推的分支不触发 ci.yml，PR 上要看 CI 请手动 re-run。\n'
+            printf '本工作流已用锁定的发布内核跑过 cargo test --workspace，并核过自建 Tags ⊇ 官方同版本归档。GITHUB_TOKEN 推的分支不触发 ci.yml，PR 上要看 CI 请手动 re-run。\n'
           } > "$RUNNER_TEMP/pr-msg.txt"
           git commit -F "$RUNNER_TEMP/pr-msg.txt"
           git push -u origin HEAD

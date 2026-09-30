@@ -138,7 +138,7 @@ pub struct StatusResponse {
     pub last_verified_isp_info: String,
     // v4 追加（只追加，不改不删任何 v3 字段）
     pub mode: ResiMode,
-    /// **state 里的配置落点**（selector 的 default、`ports_allowed` 取反与 `auto` 过滤的依据）
+    /// **state 里的默认落点**（仅用于全局 selector 的 default；端口与 auto 策略绑定各自出口）
     pub selected_upstream_id: Option<Uuid>,
     /// **当前实际生效的上游**（`runtime.selected_upstream_id`，契约决策 §C）
     pub active_upstream_id: Option<Uuid>,

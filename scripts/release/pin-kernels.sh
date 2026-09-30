@@ -9,7 +9,6 @@
 # 解包后裸二进制的 sha256（gen-manifest.sh 现算），两者不同，不要互相照抄。
 # 例外：`sing-box target` 两行是**自建**（唯一动机 with_v2ray_api，spec §5.3），URL 列是
 # `build:<repo>@v<ver>;go=<go>;tags=<tags>`，sha256 列就是构建出来的裸二进制的 sha256。
-# `sing-box check` 的 1.12 / 1.13 不自建，仍是上游归档。
 set -euo pipefail
 LC_ALL=C
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -19,10 +18,7 @@ LOCK="$HERE/kernels.lock"
 
 gh_tags() {
     # $1 = owner/repo, $2 = ERE；输出匹配 tag，按版本号倒序（最高在第一行）。
-    # 用 git ls-remote 而不是 GitHub API：API 的 /releases 一次最多 100 条且要分页
-    # （2026-09-12 实测 sing-box 的 v1.12.25 排在第 89 位，再来十几个 alpha/patch 发布
-    #  minor:1.12 就解析不到，--write 会退 1、CI 的 1.12 矩阵失去数据源），
-    # 而 ls-remote 一次给全部 tag、不限速、不需要 token。
+    # ls-remote 一次给全部 tag，不受 releases API 分页限制。
     git ls-remote --tags --refs "https://github.com/$1" 2>/dev/null \
         | awk '{print $2}' \
         | sed -E 's#^refs/tags/##' \
@@ -116,7 +112,7 @@ build_singbox_row() {
 }
 
 write_lock() {
-    local tmp row kernel role ver arch url sha minor built notes
+    local tmp row kernel role ver arch url sha built notes
     tmp=$(mktemp)
     # 锁里已有的**手写**注记行（哪两行是回填的、某个内核为什么顶了版本之类）要留住：
     # --write 是整文件重生成，不留的话每次重写都静默删掉它们，而周更 bot 的 PR 正文
@@ -151,19 +147,12 @@ write_lock() {
             printf '  pinned %s %s %s %s\n' "$kernel" "$ver" "$arch" "${sha:0:12}" >&2
         done
     done
-    for minor in $SINGBOX_CHECK_MINORS; do
-        ver=$(resolve_track "$SINGBOX_REPO" "minor:$minor")
-        url=$(asset_url sing-box "$ver" amd64)
-        sha=$(remote_sha256 "$url")
-        printf 'sing-box check %s amd64 %s %s\n' "$ver" "$sha" "$url" >> "$tmp"
-        printf '  pinned sing-box(check) %s amd64 %s\n' "$ver" "${sha:0:12}" >&2
-    done
     mv "$tmp" "$LOCK"
     printf '写入 %s\n' "$LOCK" >&2
 }
 
 check_lock() {
-    local rc=0 kernel repo track locked resolved minor ltags
+    local rc=0 kernel repo track locked resolved ltags
     for kernel in sing-box:"$SINGBOX_REPO":"$SINGBOX_TRACK" \
                   xray:"$XRAY_REPO":"$XRAY_TRACK" \
                   hysteria:"$HYSTERIA_REPO":"$HYSTERIA_TRACK" \
@@ -176,17 +165,6 @@ check_lock() {
             rc=1
         else
             printf '一致：%s %s\n' "$kernel" "$locked" >&2
-        fi
-    done
-    # check minor 也要盯：只比 target 的话 CI 的 1.12 / 1.13 矩阵会在上游出新 patch 后失去数据源
-    for minor in $SINGBOX_CHECK_MINORS; do
-        locked=$(awk -v p="$minor." '$1 == "sing-box" && $2 == "check" && index($3, p) == 1 {print $3; exit}' "$LOCK")
-        resolved=$(resolve_track "$SINGBOX_REPO" "minor:$minor")
-        if [[ "$locked" != "$resolved" ]]; then
-            printf '漂移：sing-box(check %s) lock=%s 轨道解析=%s（跑 pin-kernels.sh --write）\n' "$minor" "${locked:-缺失}" "$resolved" >&2
-            rc=1
-        else
-            printf '一致：sing-box(check %s) %s\n' "$minor" "$locked" >&2
         fi
     done
     # 自建那两行的 tags= 也要盯：只比版本号的话，改了 env 的 SINGBOX_TAGS 而忘了 --write

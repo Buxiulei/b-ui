@@ -8,12 +8,11 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 OUT=""
 LOCK="$HERE/../release/kernels.lock"
 ARCH="amd64"
-ROLE="all"
 # ${VAR-默认} 而非 ${VAR:-默认}：BUI_MIRRORS="" 表示「只用直连」，测试与离网环境都要这个语义
 MIRRORS="${BUI_MIRRORS-https://ghfast.top/ https://gh-proxy.com/}"
 
 usage() {
-    printf '用法：%s --out <dir> [--lock <kernels.lock>] [--arch amd64|arm64] [--role all|target|check]\n' "$0" >&2
+    printf '用法：%s --out <dir> [--lock <kernels.lock>] [--arch amd64|arm64]\n' "$0" >&2
     exit 2
 }
 
@@ -22,7 +21,6 @@ while [[ $# -gt 0 ]]; do
         --out) OUT="${2:-}"; shift 2 ;;
         --lock) LOCK="${2:-}"; shift 2 ;;
         --arch) ARCH="${2:-}"; shift 2 ;;
-        --role) ROLE="${2:-}"; shift 2 ;;
         *) usage ;;
     esac
 done
@@ -105,13 +103,8 @@ rc_final=0
 while read -r kernel role version arch sha url; do
     case "$kernel" in '#'* | '') continue ;; esac
     [[ "$arch" == "$ARCH" ]] || continue
-    [[ "$ROLE" == "all" || "$ROLE" == "$role" ]] || continue
-
-    if [[ "$role" == "check" ]]; then
-        rel="singbox/${version%.*}/$kernel"
-    else
-        rel="bin/$kernel"
-    fi
+    [[ "$role" == "target" ]] || { printf '未知内核角色：%s\n' "$role" >&2; exit 2; }
+    rel="bin/$kernel"
     dst="$OUT/$rel"
     mkdir -p "$(dirname "$dst")"
 

@@ -2,6 +2,7 @@
 mod common;
 
 use bui_schema::model::{Pin, Rule, UpstreamKind};
+use bui_schema::relay_policy;
 use bui_schema::render::relay::{self, RelayOpts};
 
 fn opts() -> RelayOpts {
@@ -39,6 +40,7 @@ fn relay_global_with_blacklist_and_ports_allowed() {
         .unwrap()
         .iter()
         .map(|o| o["tag"].as_str().unwrap().to_string())
+        .filter(|tag| !tag.starts_with("resi-egress-"))
         .collect();
     assert_eq!(
         tags,
@@ -51,20 +53,36 @@ fn relay_global_with_blacklist_and_ports_allowed() {
             "direct"
         ]
     );
-    assert_eq!(cfg["outbounds"][0]["type"], "http");
-    assert_eq!(cfg["outbounds"][1]["type"], "socks");
-    assert_eq!(cfg["outbounds"][1]["version"], "5");
+    let raw = |id| {
+        cfg["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["tag"] == relay_policy::egress_tag(id))
+            .unwrap()
+    };
+    assert_eq!(raw(g.upstreams[0].id)["type"], "http");
+    assert_eq!(raw(g.upstreams[1].id)["type"], "socks");
+    assert_eq!(raw(g.upstreams[1].id)["version"], "5");
     assert_eq!(cfg["route"]["final"], "resi-pool");
 
     let rules = cfg["route"]["rules"].as_array().unwrap();
     assert_eq!(rules[0]["action"], "sniff");
     assert_eq!(rules[1]["domain_suffix"][0], "pay.google.com");
     assert_eq!(rules[1]["outbound"], "direct");
+    let ports = rules
+        .iter()
+        .find(|r| r.get("port_range").is_some())
+        .unwrap();
     assert_eq!(
-        rules[2]["port_range"],
+        ports["inbound"],
+        serde_json::json!([relay_policy::inbound_tag(g.upstreams[0].id)])
+    );
+    assert_eq!(
+        ports["port_range"],
         serde_json::json!(["1:79", "81:442", "444:65535"])
     );
-    assert_eq!(rules[2]["outbound"], "direct");
+    assert_eq!(ports["outbound"], "direct");
     assert!(rules
         .iter()
         .any(|r| r["network"] == "udp" && r["port"] == 443 && r["action"] == "reject"));
@@ -111,7 +129,7 @@ fn relay_split_uses_keywords_and_direct_final() {
 }
 
 #[test]
-fn relay_blacklist_takes_pins_and_selected_upstream_auto_only() {
+fn relay_blacklist_keeps_pins_global_and_auto_with_each_actual_upstream() {
     use bui_schema::model::AutoEntry;
     let s = common::state("split");
     let mut g = s.residential.default_group().unwrap().clone();
@@ -144,14 +162,43 @@ fn relay_blacklist_takes_pins_and_selected_upstream_auto_only() {
     let cfg = relay::config(&g, &[], &opts());
     let rules = cfg["route"]["rules"].as_array().unwrap();
     assert_eq!(rules[1]["domain"], serde_json::json!(["www.paypal.com"]));
+    assert!(rules[1].get("domain_suffix").is_none());
     assert_eq!(
-        rules[1]["domain_suffix"],
-        serde_json::json!(["gateway.icloud.com"])
+        rules[1]["inbound"],
+        serde_json::json!(["slot-0"]),
+        "人工 pins 对用户入口生效"
     );
-    assert_eq!(rules[1]["outbound"], "direct");
-    assert_eq!(rules[2]["port"], serde_json::json!([5228]));
-    assert_eq!(rules[2]["outbound"], "direct");
-    assert!(!serde_json::to_string(&cfg)
+    let auto = rules
+        .iter()
+        .find(|r| r["domain_suffix"] == serde_json::json!(["gateway.icloud.com"]))
+        .unwrap();
+    assert_eq!(
+        auto["inbound"],
+        serde_json::json!([relay_policy::inbound_tag(selected)])
+    );
+    assert_eq!(auto["outbound"], "direct");
+    let port = rules
+        .iter()
+        .find(|r| r["port"] == serde_json::json!([5228]))
+        .unwrap();
+    assert_eq!(
+        port["inbound"],
+        serde_json::json!([relay_policy::inbound_tag(selected)])
+    );
+    assert_eq!(port["outbound"], "direct");
+    let other_auto = rules
+        .iter()
+        .find(|r| r["domain_suffix"] == serde_json::json!(["other.example.net"]))
+        .unwrap();
+    assert_eq!(
+        other_auto["inbound"],
+        serde_json::json!([relay_policy::inbound_tag(other)])
+    );
+    assert_eq!(other_auto["outbound"], "direct");
+    assert!(!serde_json::to_string(&cfg["dns"])
+        .unwrap()
+        .contains("gateway.icloud.com"));
+    assert!(!serde_json::to_string(&cfg["dns"])
         .unwrap()
         .contains("other.example.net"));
     common::check_singbox(&cfg);
@@ -183,7 +230,7 @@ fn relay_all_socks5_pool_lets_udp_reach_the_pool() {
         "「其余 UDP 直连」那条要删掉（否则 UDP 永远暴露 VPS 自身 IP）：{rules:#?}"
     );
     assert_eq!(cfg["route"]["final"], "resi-pool");
-    common::check_singbox_all(&cfg);
+    common::check_singbox(&cfg);
 }
 
 /// 混合池（fixture 自带 http + socks5）：http 出站没有 UDP 能力，规则保持 v3 三条。
@@ -204,7 +251,7 @@ fn relay_mixed_pool_keeps_the_three_udp_rules() {
         udp_resolve_pos(rules).is_none(),
         "混合池的 UDP 不进 socks 出站，不需要先解析：{rules:#?}"
     );
-    common::check_singbox_all(&cfg);
+    common::check_singbox(&cfg);
 }
 
 /// 全 http 池：同上，三条规则一条不少。
@@ -226,18 +273,12 @@ fn relay_all_http_pool_keeps_the_three_udp_rules() {
         udp_resolve_pos(rules).is_none(),
         "全 http 池的 UDP 不进 socks 出站，不需要先解析：{rules:#?}"
     );
-    common::check_singbox_all(&cfg);
+    common::check_singbox(&cfg);
 }
 
-/// 全 socks5 池：UDP 目标先在本机解析成 IPv4 再进 socks 出站。
-///
-/// 2026-09-13 实测（经 Decodo SOCKS5）：UDP ASSOCIATE 的请求地址只收 ATYP=1（IPv4），
-/// ATYP=3（域名）与 ATYP=4（IPv6）都回 code=8；而 sing-box 的 socks 出站会把 sniff
-/// 出的域名原样当 UDP 目标发出（relay 日志 24h 823 条 `request rejected, code=8`）。
-/// 这条 resolve 在 sniff 与 UDP/53 直连之后、各槽 inbound 规则之前，全表只一条；
-/// 只作用于 UDP，TCP 的域名照旧原样交给上游。
+/// UDP 域名要先经过实际出口 auto，再解析成 IPv4；因此 resolve 属于 policy 入站。
 #[test]
-fn relay_all_socks5_pool_resolves_udp_targets_to_ipv4_before_the_slot_rules() {
+fn relay_all_socks5_pool_resolves_udp_after_policy_matching_before_raw_egress() {
     for mode in ["global", "split"] {
         let s = common::state(mode);
         let mut g = s.residential.default_group().unwrap().clone();
@@ -255,39 +296,85 @@ fn relay_all_socks5_pool_resolves_udp_targets_to_ipv4_before_the_slot_rules() {
             .collect();
         let cfg = relay::config(&g, &slots, &opts());
         let rules = cfg["route"]["rules"].as_array().unwrap();
-        let at = udp_resolve_pos(rules)
-            .unwrap_or_else(|| panic!("{mode}：缺 UDP → IPv4 的 resolve：{rules:#?}"));
-        let sniff = rules.iter().position(|r| r["action"] == "sniff").unwrap();
-        let dns53 = rules
-            .iter()
-            .position(|r| r["network"] == "udp" && r["port"] == 53)
-            .unwrap();
-        let first_slot = rules
-            .iter()
-            .position(|r| r.get("inbound").is_some())
-            .unwrap();
-        assert!(sniff < at, "{mode}：resolve 要在 sniff 之后：{rules:#?}");
-        assert!(dns53 < at, "{mode}：UDP/53 直连不必先解析：{rules:#?}");
-        assert!(
-            at < first_slot,
-            "{mode}：resolve 要在各槽 inbound 规则之前：{rules:#?}"
-        );
         let resolves: Vec<_> = rules.iter().filter(|r| r["action"] == "resolve").collect();
-        assert_eq!(resolves.len(), 1, "{mode}：只一条，不按槽重复：{rules:#?}");
-        assert_eq!(resolves[0]["network"], "udp", "{mode}：TCP 不解析");
-        common::check_singbox_all(&cfg);
+        assert_eq!(
+            resolves.len(),
+            g.upstreams.len(),
+            "每个真实出口各自解析，外层保留域名"
+        );
+        for u in &g.upstreams {
+            let inbound = serde_json::json!([relay_policy::inbound_tag(u.id)]);
+            let resolve = rules
+                .iter()
+                .position(|r| r["action"] == "resolve" && r["inbound"] == inbound)
+                .unwrap();
+            assert_eq!(rules[resolve]["network"], "udp", "TCP 域名仍交给上游");
+            assert_eq!(rules[resolve]["server"], "dns_direct");
+            assert_eq!(rules[resolve]["strategy"], "ipv4_only");
+            let private = rules
+                .iter()
+                .position(|r| r.get("ip_cidr").is_some() && r["inbound"] == inbound)
+                .unwrap();
+            let raw = rules
+                .iter()
+                .position(|r| {
+                    r["inbound"] == inbound
+                        && r.get("network").is_none()
+                        && r["outbound"] == relay_policy::egress_tag(u.id)
+                })
+                .unwrap();
+            assert!(
+                resolve < private && private < raw,
+                "解析之后仍须挡住私网目标"
+            );
+        }
+        common::check_singbox(&cfg);
     }
 }
 
-/// 「UDP 目标先在本机解析成 IPv4」那条 resolve 的位置
+#[test]
+fn residential_dns_detour_bypasses_client_dns_and_port_rules() {
+    let mut g = common::state("global")
+        .residential
+        .default_group()
+        .unwrap()
+        .clone();
+    for u in &mut g.upstreams {
+        u.ports_allowed = Some(vec![80, 443]);
+    }
+    let cfg = relay::config(&g, &[], &opts());
+    let rules = cfg["route"]["rules"].as_array().unwrap();
+    let client_dns = rules
+        .iter()
+        .find(|r| r["network"] == "udp" && r["port"] == 53 && r["outbound"] == "direct")
+        .unwrap();
+    assert_eq!(client_dns["inbound"], serde_json::json!(["slot-0"]));
+    for u in &g.upstreams {
+        let inbound = serde_json::json!([relay_policy::inbound_tag(u.id)]);
+        let dns = rules
+            .iter()
+            .position(|r| {
+                r["inbound"] == inbound
+                    && r["network"] == "udp"
+                    && r["port"] == 53
+                    && r["outbound"] == relay_policy::egress_tag(u.id)
+            })
+            .unwrap();
+        let ports = rules
+            .iter()
+            .position(|r| r["inbound"] == inbound && r.get("port_range").is_some())
+            .unwrap();
+        assert!(
+            dns < ports,
+            "内部住宅 DNS 不能因 wrapper 的端口策略悄悄变直连"
+        );
+    }
+    common::check_singbox(&cfg);
+}
+
 fn udp_resolve_pos(rules: &[serde_json::Value]) -> Option<usize> {
     rules.iter().position(|r| {
-        *r == serde_json::json!({
-            "network": "udp",
-            "action": "resolve",
-            "server": "dns_direct",
-            "strategy": "ipv4_only"
-        })
+        r["network"] == "udp" && r["action"] == "resolve" && r["server"] == "dns_direct"
     })
 }
 
@@ -338,10 +425,10 @@ fn relay_disabled_group_is_direct_only() {
     common::check_singbox(&cfg);
 }
 
-/// 多槽配置必须在 1.12 / 1.13 / 1.14 三版上都过 `sing-box check`：每槽一个 socks 入站、
+/// 多槽配置必须在发布内核上过 `sing-box check`：每槽一个 socks 入站、
 /// 每槽一个 selector、按 `inbound` 分流 —— 这三样都是 `check` 会严格校验的字段。
 #[test]
-fn a_three_slot_relay_passes_singbox_check_on_all_versions() {
+fn a_three_slot_relay_passes_singbox_check_on_the_target_kernel() {
     let s = common::state("global");
     let mut g = s.residential.default_group().unwrap().clone();
     // fixture 自带 2 条上游，补到 3 条
@@ -360,6 +447,6 @@ fn a_three_slot_relay_passes_singbox_check_on_all_versions() {
         })
         .collect();
     let cfg = relay::config(&g, &slots, &opts());
-    assert_eq!(cfg["inbounds"].as_array().unwrap().len(), 3);
-    common::check_singbox_all(&cfg);
+    assert_eq!(cfg["inbounds"].as_array().unwrap().len(), 6);
+    common::check_singbox(&cfg);
 }

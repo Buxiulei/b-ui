@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 # 自建随发布分发的那一个 sing-box（唯一动机：官方归档不带 with_v2ray_api，住宅计量要它）。
-# CI 里跑 `sing-box check` 的 1.12 / 1.13 不自建，继续用上游归档（spec §5.3）。
 #   build-singbox.sh --version <x.y.z> --arch amd64|arm64 --out <path> [--repo <owner/repo>] [--tags <逗号分隔>] [--go <go1.x.y>]
 # `--go` 是**可重现性的开关**：给了就把 GOTOOLCHAIN 钉死在这一版并断言探到的就是它，
 # 于是 sha256 与宿主 Go 解耦（取件时 fetch-kernels.sh 从锁的 `go=` 透传）；

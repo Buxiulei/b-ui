@@ -4,7 +4,11 @@
 use super::{JOURNAL_UNIT, MEMBER_PREFIX};
 use crate::sys::Host;
 
-/// relay 一行出站失败日志里的**出站主体**：成员出站，还是包了一层的池（group）出站。
+/// relay 一行出站失败日志里的**出站主体**。
+///
+/// 策略端点拓扑的内层真实出站带稳定 UUID；外层 selector / `resi-N` 只连接回环端点，
+/// 其错误可能是内层失败转换出的 SOCKS REP，不能再据当前选择归因或重复计数。
+/// 以下池归因仅为运行中的旧拓扑保留，由调用方先经 Clash API 确认拓扑。
 ///
 /// sing-box 的 `route/conn.go` 只把「路由选中的那个出站」的 `Type()`/`Tag()` 写进
 /// `open connection to … using outbound/<kind>[<tag>]`；而 4.1 的 relay 路由规则一律指向
@@ -17,7 +21,10 @@ use crate::sys::Host;
 /// [`super::blacklist::learn_from_journal`]）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RelaySubject {
-    /// `http` / `socks` 成员出站，tag = `resi-<n>`。历史形状，当前渲染器不再产生，仍认
+    /// 策略端点的真实供应商出站，身份与池排序、借用和 selector 此刻的选择无关。
+    Egress(uuid::Uuid),
+    /// `http` / `socks`，tag = `resi-<n>`。旧拓扑是真实成员，新拓扑是回环 wrapper；
+    /// 调用方必须确认实际内核仍为旧拓扑，才能使用下标归因。
     Member(String),
     /// `selector` / `urltest` 池出站，tag = `resi-pool` 或 `slot-<i>-pool`
     Pool {
@@ -27,6 +34,14 @@ pub enum RelaySubject {
         /// 协议层失败（4xx / 407 / SOCKS5 REP / EOF）的 reason 不含上游地址 ⇒ `None`
         dial_addr: Option<(String, u16)>,
     },
+}
+
+/// 旧拓扑的成员标签，只认规范正整数下标，UUID 标签不能误入此分支。
+pub fn is_member_tag(tag: &str) -> bool {
+    tag.strip_prefix(MEMBER_PREFIX).is_some_and(|n| {
+        n.parse::<usize>()
+            .is_ok_and(|i| i > 0 && i.to_string() == n)
+    })
 }
 
 /// relay 日志里一条「上游拒绝了这个目标」的记录
@@ -75,14 +90,13 @@ pub fn dial_addr(reason: &str) -> Option<(String, u16)> {
     (!h.is_empty()).then(|| (h.to_string(), port))
 }
 
-/// `<kind>[<tag>]` + reason → 出站主体。**唯一**一处 kind/tag 白名单：成员类 kind 的 tag 要
-/// 以 [`MEMBER_PREFIX`] 打头（`resi-pool` 本身除外，它是池不是成员），group 类 kind 的 tag
-/// 必须是已知池名。不在白名单里的（`direct`、`gate-<id>`、越界槽号…）一律 `None`。
+/// `<kind>[<tag>]` + reason → 出站主体。真实出口只接受规范 UUID；旧成员只接受 `resi-N`，
+/// group 类 kind 的 tag 必须是已知池名。不在白名单里的标签一律 `None`。
 pub fn subject_of(kind: &str, tag: &str, reason: &str) -> Option<RelaySubject> {
     match kind {
-        "http" | "socks" if tag.starts_with(MEMBER_PREFIX) && !is_pool_tag(tag) => {
-            Some(RelaySubject::Member(tag.to_string()))
-        }
+        "http" | "socks" => bui_schema::relay_policy::upstream_from_egress_tag(tag)
+            .map(RelaySubject::Egress)
+            .or_else(|| is_member_tag(tag).then(|| RelaySubject::Member(tag.to_string()))),
         "selector" | "urltest" if is_pool_tag(tag) => Some(RelaySubject::Pool {
             pool: tag.to_string(),
             dial_addr: dial_addr(reason),
@@ -249,6 +263,27 @@ mod tests {
             pool: tag.into(),
             dial_addr: None,
         }
+    }
+
+    #[test]
+    fn policy_egress_identity_is_strict_and_cannot_fall_back_to_member_parsing() {
+        let id = uuid::Uuid::from_u128(2);
+        let tag = bui_schema::relay_policy::egress_tag(id);
+        for kind in ["http", "socks"] {
+            assert_eq!(subject_of(kind, &tag, ""), Some(RelaySubject::Egress(id)));
+        }
+        for invalid in [
+            format!("{tag} extra"),
+            "resi-egress-invalid".into(),
+            bui_schema::relay_policy::inbound_tag(id),
+            "resi-0".into(),
+            "resi-+1".into(),
+            "resi-01".into(),
+        ] {
+            assert_eq!(subject_of("socks", &invalid, ""), None, "{invalid}");
+        }
+        assert_eq!(subject_of("selector", &tag, ""), None);
+        assert_eq!(subject_of("socks", "resi-2", ""), Some(member("resi-2")));
     }
 
     /// 生产（4.1 的 per-slot selector 拓扑）**只会**打池形状的行：路由规则指向 group，

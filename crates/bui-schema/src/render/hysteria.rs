@@ -267,7 +267,7 @@ mod tests {
     /// 自己的常量取**（写字面量的话，改坏常量这张表照样全绿 —— 它就只是在自证）。
     #[test]
     fn every_loopback_management_port_is_distinct() {
-        let ports: Vec<(u16, &str)> = vec![
+        let mut ports: Vec<(u16, &str)> = vec![
             (AUTH_HTTP_PORT, "hy2 直连的 http 鉴权"),
             (9999, "hy2 直连 trafficStats"),
             (9091, "relay Clash API"),
@@ -286,6 +286,13 @@ mod tests {
             (40000, "住宅 HY2"),
             (8080, "面板"),
         ];
+        for index in 0..crate::slots::MAX_SLOTS {
+            ports.push((crate::slots::resources(index).relay_port, "槽位 SOCKS"));
+            ports.push((
+                crate::relay_policy::policy_port(usize::from(index)).unwrap(),
+                "实际出口策略 SOCKS",
+            ));
+        }
         let mut seen = std::collections::BTreeMap::new();
         for (p, who) in ports {
             if let Some(prev) = seen.insert(p, who) {

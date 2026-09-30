@@ -95,7 +95,7 @@ impl Sig {
         }
     }
 
-    /// 对象是住宅上游的 relay 签名：日志里是成员 tag 或**池 tag**（生产只有后者），
+    /// 对象是住宅上游的 relay 签名：日志里是真实出口 UUID tag 或旧拓扑的成员 / 池 tag，
     /// 调用方按 [`Match::relay`] 当场归因成 uuid，归不了因的丢弃
     pub fn on_upstream(self) -> bool {
         matches!(
@@ -178,13 +178,13 @@ impl Action {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Match {
     pub sig: Sig,
-    /// 对象在日志里的名字：relay 是成员 tag（`resi-2`）或池 tag（`slot-<i>-pool` /
-    /// `resi-pool`，生产只有这种）、caddy 是域名、xray gRPC 是 `xray`、其余是单元名。
+    /// 对象在日志里的名字：relay 是 `resi-egress-<uuid>`、旧成员 `resi-2` 或池 tag，
+    /// caddy 是域名、xray gRPC 是 `xray`、其余是单元名。
     /// relay 那几个签名的**计数键不是它**，见 [`Match::relay`]
     pub subject: String,
     /// 先脱敏再截断的原文，进事件的 `sample`
     pub detail: String,
-    /// relay 签名专用的**待归因中间态**：成员 tag 直接换 uuid，池 tag 要调用方按
+    /// relay 签名专用的**待归因中间态**：真实出口 UUID 可直接定位，旧池 tag 要调用方按
     /// `dial tcp` 地址（零 I/O）或 Clash API 的 `now` 换 uuid。非 relay 签名 `None`。
     /// 解析层保持纯函数（本模块的承诺），归因的那点 I/O 全在 `run::tick` 与
     /// `residential::blacklist::learn_from_journal` 里
@@ -272,12 +272,13 @@ fn hit(sig: Sig, subject: &str, message: &str) -> Match {
 /// 调用方归因出来（[`Match::relay`]）
 fn relay_hit(sig: Sig, subject: &RelaySubject, message: &str) -> Match {
     let name = match subject {
-        RelaySubject::Member(tag) => tag,
-        RelaySubject::Pool { pool, .. } => pool,
+        RelaySubject::Egress(id) => bui_schema::relay_policy::egress_tag(*id),
+        RelaySubject::Member(tag) => tag.clone(),
+        RelaySubject::Pool { pool, .. } => pool.clone(),
     };
     Match {
         sig,
-        subject: name.clone(),
+        subject: name,
         detail: detail_of(message),
         relay: Some(subject.clone()),
     }
