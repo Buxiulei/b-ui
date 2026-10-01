@@ -739,7 +739,7 @@ pub async fn check_once(ctx: &DaemonCtx) -> anyhow::Result<Vec<(String, Decision
     let c = ctx.clone();
     // The table shares the publication resource with apply. Sample only after
     // admission, so a queued replay cannot overwrite a newly committed topology.
-    let (state, nft) = owner
+    let observed = owner
         .execute(move |tx| async move {
             tx.recover_pending(&c).await?;
             let mut state = (*c.store.read().await).clone();
@@ -749,7 +749,21 @@ pub async fn check_once(ctx: &DaemonCtx) -> anyhow::Result<Vec<(String, Decision
                 tokio::task::spawn_blocking(move || check_nft(c.host.as_ref(), &sample)).await?;
             Ok((state, nft))
         })
-        .await?;
+        .await;
+    // A residential evidence failure cannot disable independent native healing.
+    let (state, nft, residential_known) = match observed {
+        Ok((state, nft)) => (state, nft, true),
+        Err(error) => (
+            (*ctx.store.read().await).clone(),
+            NftRound {
+                verdict: NftVerdict::Unreadable,
+                compat_live: None,
+                error: Some(error.to_string()),
+                seen_rules: 0,
+            },
+            false,
+        ),
+    };
     let targets = targets(&state);
     let rt = ctx.runtime.read().await;
     let mut heals: std::collections::BTreeMap<String, ChainHeal> = rt
@@ -794,6 +808,10 @@ pub async fn check_once(ctx: &DaemonCtx) -> anyhow::Result<Vec<(String, Decision
             let tcp = host.listening_ports(Proto::Tcp);
             let mut out = Vec::with_capacity(targets.len());
             for t in &targets {
+                if t.unit == crate::residential_lifecycle::UNIT && !residential_known {
+                    out.push((t.unit.clone(), Decision::Unknown));
+                    continue;
+                }
                 let rec = records.entry(t.unit.clone()).or_default();
                 let alive = host.unit_is_active(&t.unit);
                 let ports = match t.proto {
@@ -881,8 +899,10 @@ pub async fn check_once(ctx: &DaemonCtx) -> anyhow::Result<Vec<(String, Decision
             }
         }
     }
-    if let Err(error) = owner.repair(ctx.clone()).await {
-        tracing::warn!(%error, "residential instance recovery pending");
+    if residential_known {
+        if let Err(error) = owner.repair(ctx.clone()).await {
+            tracing::warn!(%error, "residential instance recovery pending");
+        }
     }
     // relay 被重启过 = 一次**全池**切换：它的每个池 selector 的 `now` 都回落到配置里的
     // default，归因的时间戳门要当场对全池记一次（2026-09-18 第三次裁决 ③），否则这一刻
@@ -1120,6 +1140,11 @@ mod tests {
             .unwrap();
         let state = ctx.store.read().await;
         let want = bui_schema::render::nft::ruleset(&state.node.ports, false);
+        crate::residential_lifecycle::seed_applied_fixture(
+            ctx.store.directory(),
+            &state,
+            &ctx.paths,
+        );
         release.send(()).unwrap();
         first.await.unwrap().unwrap();
         check.await.unwrap().unwrap();
@@ -1159,6 +1184,11 @@ mod tests {
         state: State,
     ) -> (crate::reconcile::DaemonCtx, tempfile::TempDir) {
         let d = tempfile::tempdir().unwrap();
+        crate::residential_lifecycle::seed_applied_fixture(
+            d.path(),
+            &state,
+            &Paths::default_server(),
+        );
         let store = Store::create(d.path().join("state.json"), state)
             .await
             .unwrap();
@@ -1248,6 +1278,7 @@ mod tests {
             .await
             .unwrap();
         let current = c.store.read().await;
+        crate::residential_lifecycle::seed_applied_fixture(c.store.directory(), &current, &c.paths);
         host.with(|i| {
             i.which.insert("nft".into());
             i.nft_table = Some(bui_schema::render::nft::ruleset(

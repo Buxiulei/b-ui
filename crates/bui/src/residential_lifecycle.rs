@@ -159,13 +159,25 @@ fn read_binding(base: &Path) -> Result<Option<TopologyBinding>> {
     }
 }
 /// ExecStartPre and watchdog use the durable owner-selected target. A corrupt
-/// binding is Unknown; only absence permits bootstrap from State.
+/// or missing binding is Unknown. The owner establishes first-candidate and
+/// verified-adoption bindings before either independent writer may use them.
 pub fn project_applied(base: &Path, s: &mut bui_schema::model::State) -> Result<()> {
-    if let Some(b) = read_binding(base)? {
-        b.project(s);
-    }
+    let b = read_binding(base)?
+        .context("residential topology binding is missing; owner verification required")?;
+    b.project(s);
     Ok(())
 }
+#[cfg(test)]
+pub fn seed_applied_fixture(base: &Path, s: &bui_schema::model::State, paths: &Paths) {
+    let config = config_bytes(s, paths).expect("fixture config");
+    persist_metadata(
+        &base.join(".residential-lifecycle"),
+        "topology.json",
+        &TopologyBinding::from_state(s, &config),
+    )
+    .expect("fixture binding");
+}
+
 fn verify_table(host: &dyn Host, rules: &str) -> Result<()> {
     let out = host.run("nft", &["list", "table", "inet", "bui"])?;
     anyhow::ensure!(
@@ -514,6 +526,52 @@ fn persist_metadata(dir: &Path, name: &str, value: &impl Serialize) -> Result<()
     }
     result
 }
+fn validate_recovery_evidence(ctx: &DaemonCtx, r: &Receipt) -> Result<()> {
+    let binding = read_binding(ctx.store.directory())?;
+    let config = ctx
+        .host
+        .file_sha256(&crate::modules::core_files::hy2_resi_config_path(
+            &ctx.paths,
+        ))?;
+    let previous_sha = r.saved_config.as_ref().map(|saved| saved.sha256.as_str());
+    let target_sha = r.target_topology.as_ref().map(|b| b.config_sha.as_str());
+    let previous_config =
+        config.as_deref() == previous_sha && (config.is_some() || r.previous_topology.is_none());
+    let target_config = config.is_some() && config.as_deref() == target_sha;
+    anyhow::ensure!(
+        previous_config || target_config,
+        "foreign or missing live residential configuration prevents recovery"
+    );
+    // Absence is an original prepared prefix only when no binding existed and
+    // the live configuration is still the known previous candidate (or fresh absence).
+    let inferred_absence = binding.is_none() && !r.previous_binding_present && previous_config;
+    anyhow::ensure!(
+        (binding.is_some() && (binding == r.previous_topology || binding == r.target_topology))
+            || inferred_absence,
+        "foreign or missing topology prevents recovery"
+    );
+    if let Some(saved) = &r.saved_config {
+        anyhow::ensure!(
+            ctx.host.file_sha256(&saved.path)?.as_deref() == Some(saved.sha256.as_str()),
+            "saved recovery configuration is missing or foreign"
+        );
+    }
+    for backup in &r.backups {
+        let current = ctx.host.file_sha256(&backup.path)?;
+        let moved_binary = current.is_none()
+            && backup.path == ctx.paths.bin_dir.join("sing-box")
+            && backup
+                .previous
+                .as_ref()
+                .is_some_and(|p| ctx.host.file_sha256(p).ok().flatten() == backup.previous_sha);
+        anyhow::ensure!(
+            current == backup.previous_sha || current == backup.published_sha || moved_binary,
+            "foreign file prevents recovery"
+        );
+    }
+    Ok(())
+}
+
 async fn observe_async(ctx: &DaemonCtx) -> Result<Observation> {
     let host = ctx.host.clone();
     tokio::task::spawn_blocking(move || observe(host.as_ref())).await?
@@ -556,6 +614,14 @@ impl Transaction {
 
     pub async fn recover_pending(&self, ctx: &DaemonCtx) -> Result<()> {
         if let Some(mut r) = read_record(ctx)? {
+            if matches!(r.phase.as_str(), "active" | "recovered" | "stopped")
+                && r.target_topology.is_some()
+            {
+                anyhow::ensure!(
+                    read_binding(ctx.store.directory())?.is_some(),
+                    "accepted residential topology binding is missing"
+                );
+            }
             if r.maintenance
                 && matches!(r.source, Source::Manual)
                 && r.phase != "stopped"
@@ -573,34 +639,16 @@ impl Transaction {
                 persist(ctx, &r)?;
             }
             if (r.replacement
+                || (matches!(r.source, Source::Recovery)
+                    && r.rejected_config_sha.is_some()
+                    && r.saved_config.is_some())
                 || (matches!(r.source, Source::Certificate) && !r.certificate_pair_published))
                 && !matches!(
                     r.phase.as_str(),
                     "active" | "recovered" | "stopped" | "failed"
                 )
             {
-                let binding = read_binding(ctx.store.directory())?;
-                let inferred_absence = binding.is_none() && !r.previous_binding_present;
-                anyhow::ensure!(
-                    binding == r.previous_topology
-                        || binding == r.target_topology
-                        || inferred_absence,
-                    "foreign or missing topology prevents interrupted recovery"
-                );
-                for backup in &r.backups {
-                    let current = ctx.host.file_sha256(&backup.path)?;
-                    let moved_binary = current.is_none()
-                        && backup.path == ctx.paths.bin_dir.join("sing-box")
-                        && backup.previous.as_ref().is_some_and(|p| {
-                            ctx.host.file_sha256(p).ok().flatten() == backup.previous_sha
-                        });
-                    anyhow::ensure!(
-                        current == backup.previous_sha
-                            || current == backup.published_sha
-                            || moved_binary,
-                        "foreign file prevents interrupted recovery"
-                    );
-                }
+                validate_recovery_evidence(ctx, &r)?;
                 self.rollback(
                     ctx,
                     &mut r,
@@ -1223,7 +1271,12 @@ impl Transaction {
         binding: CandidateBinding<'_>,
     ) -> Result<()> {
         let current = ctx.store.read().await;
-        let target = match &r.target_topology {
+        let selected = if matches!(binding, CandidateBinding::Saved(_)) {
+            &r.previous_topology
+        } else {
+            &r.target_topology
+        };
+        let target = match selected {
             Some(b) => b.clone(),
             None => {
                 anyhow::ensure!(
@@ -1383,13 +1436,7 @@ impl Transaction {
         r: &mut Receipt,
         original: anyhow::Error,
     ) -> Result<Receipt> {
-        let binding = read_binding(ctx.store.directory())?;
-        anyhow::ensure!(
-            binding == r.previous_topology
-                || binding == r.target_topology
-                || (binding.is_none() && !r.previous_binding_present),
-            "foreign or missing binding prevents rollback"
-        );
+        validate_recovery_evidence(ctx, r)?;
         r.phase = "recovery_required".into();
         r.error = Some(crate::redact::url_credentials(&original.to_string()));
         let mut journal_error = persist(ctx, r).err();
@@ -1462,9 +1509,12 @@ impl Transaction {
         let mut previous = r.clone();
         previous.source = Source::Recovery;
         previous.replacement = false;
-        previous.target_topology = r.previous_topology.clone();
         previous.pending_keys.clear();
-        previous.rejected_config_sha = Some(r.requested_config_sha.clone());
+        previous.rejected_config_sha = Some(
+            r.rejected_config_sha
+                .clone()
+                .unwrap_or_else(|| r.requested_config_sha.clone()),
+        );
         previous.before = None;
         previous.after = None;
         previous.authorization_sha = None;
@@ -2063,6 +2113,228 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fix_round2_interrupted_recovery_restarts_old_candidate_under_original_operation() {
+        let (_dir, ctx, host, _) = fixture().await;
+        let live = crate::modules::core_files::hy2_resi_config_path(&ctx.paths);
+        let old = host.read_file(&live).unwrap().unwrap();
+        let old_binding = read_binding(ctx.store.directory()).unwrap().unwrap();
+        let work = changed_candidate(&ctx).await;
+        let c = ctx.clone();
+        let p = ctx
+            .bus
+            .residential()
+            .execute(move |tx| async move { tx.publish(&c, work, None).await })
+            .await
+            .unwrap();
+        let mut interrupted = p.receipt;
+        let original_target = interrupted.target_topology.clone();
+        interrupted.source = Source::Recovery;
+        interrupted.replacement = false;
+        interrupted.rejected_config_sha = Some(interrupted.requested_config_sha.clone());
+        interrupted.requested_config_sha = crate::kernels::sha256_hex(&old);
+        interrupted.pending_keys.clear();
+        interrupted.phase = "activating".into();
+        host.write_file(&live, &old, 0o600).unwrap();
+        persist_metadata(&directory(&ctx), "topology.json", &old_binding).unwrap();
+        persist(&ctx, &interrupted).unwrap();
+        host.with(|i| {
+            i.failed_units.insert("hysteria-residential.service".into());
+            i.units_active.remove("hysteria-residential.service");
+        });
+        host.clear_ops();
+        assert!(
+            ctx.bus.residential().repair(ctx.clone()).await.is_err(),
+            "the interrupted new request stays rejected"
+        );
+        let r = read_record(&ctx).unwrap().unwrap();
+        assert_eq!(r.phase, "recovered", "{:?}", r.error);
+        assert_eq!(r.operation_id, interrupted.operation_id);
+        assert_eq!(
+            r.target_topology, original_target,
+            "original target provenance survives recovery"
+        );
+        assert_eq!(r.previous_topology, Some(old_binding));
+        assert!(host.unit_is_active(UNIT).unwrap());
+        assert_eq!(
+            host.ops()
+                .iter()
+                .filter(|op| op.as_str() == "systemd:restart:hysteria-residential")
+                .count(),
+            1
+        );
+        assert!(ctx.runtime.read().await.restart_keys.is_empty());
+    }
+
+    async fn absent_binding_writer(writer: &str, accepted: &str) {
+        let (_dir, ctx, host, _) = fixture().await;
+        if accepted != "none" {
+            ctx.bus.residential().repair(ctx.clone()).await.unwrap();
+            let mut r = read_record(&ctx).unwrap().unwrap();
+            r.phase = accepted.into();
+            persist(&ctx, &r).unwrap();
+        }
+        ctx.store
+            .update(|s| s.node.ports.hy2_resi = 45000)
+            .await
+            .unwrap();
+        host.write_file(
+            &crate::paths::state_file(&ctx.paths),
+            &serde_json::to_vec(&*ctx.store.read().await).unwrap(),
+            0o600,
+        )
+        .unwrap();
+        std::fs::remove_file(directory(&ctx).join("topology.json")).unwrap();
+        let before = std::fs::read(directory(&ctx).join("record.json")).ok();
+        host.clear_ops();
+        let rejected = if writer == "prestart" {
+            crate::commands::nft::apply(host.as_ref(), &ctx.paths).is_err()
+        } else {
+            crate::modules::watchdog::check_once(&ctx)
+                .await
+                .unwrap()
+                .iter()
+                .any(|(unit, decision)| {
+                    unit == UNIT && *decision == crate::modules::watchdog::Decision::Unknown
+                })
+        };
+        assert!(
+            rejected,
+            "{writer}/{accepted} cannot infer desired port from missing binding"
+        );
+        assert!(host.stdins().is_empty());
+        assert!(!host.ops().iter().any(|op| op.starts_with("systemd:")));
+        assert_eq!(
+            std::fs::read(directory(&ctx).join("record.json")).ok(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn fix_round2_unknown_residential_binding_does_not_stop_native_watchdog() {
+        let (_dir, ctx, host, _) = fixture().await;
+        std::fs::write(directory(&ctx).join("topology.json"), b"{invalid").unwrap();
+        host.with(|i| {
+            i.units_active.insert("hysteria-server.service".into());
+        });
+        host.clear_ops();
+        for _ in 0..2 {
+            let result = crate::modules::watchdog::check_once(&ctx)
+                .await
+                .expect("native checks must remain available");
+            assert!(result.iter().any(|(unit, decision)| unit == UNIT
+                && *decision == crate::modules::watchdog::Decision::Unknown));
+            host.advance(60);
+        }
+        assert!(host
+            .ops()
+            .iter()
+            .any(|op| op == "systemd:restart:hysteria-server"));
+        assert!(!host
+            .ops()
+            .iter()
+            .any(|op| op == "systemd:restart:hysteria-residential"));
+        assert!(host.stdins().is_empty());
+    }
+
+    async fn omitted_config_recovery(kind: &str, missing: bool) {
+        let (_dir, ctx, host, _) = fixture().await;
+        let config = crate::modules::core_files::hy2_resi_config_path(&ctx.paths);
+        let candidate = if kind == "binary" {
+            let old = ctx.paths.bin_dir.join("sing-box");
+            let new = ctx.paths.bin_dir.join("candidate");
+            host.write_file(&old, b"old binary", 0o755).unwrap();
+            host.write_file(&new, b"new binary", 0o755).unwrap();
+            Some(Candidate {
+                path: new,
+                sha256: crate::kernels::sha256_hex(b"new binary"),
+            })
+        } else {
+            ctx.store
+                .update(|s| s.node.ports.hy2_resi_hop = (51000, 52000))
+                .await
+                .unwrap();
+            None
+        };
+        let c = ctx.clone();
+        let p = ctx
+            .bus
+            .residential()
+            .execute(move |tx| async move { tx.publish(&c, Deferred::default(), candidate).await })
+            .await
+            .unwrap();
+        assert!(!p.receipt.backups.iter().any(|b| b.path == config));
+        if missing {
+            host.remove_file(&config).unwrap();
+        } else {
+            let mut foreign = (*ctx.store.read().await).clone();
+            foreign.node.ports.hy2_resi = 47000;
+            host.write_file(&config, &config_bytes(&foreign, &ctx.paths).unwrap(), 0o600)
+                .unwrap();
+        }
+        let wal = std::fs::read(directory(&ctx).join("record.json")).unwrap();
+        let binding = std::fs::read(directory(&ctx).join("topology.json")).unwrap();
+        host.clear_ops();
+        assert!(ctx.bus.residential().repair(ctx.clone()).await.is_err());
+        assert_eq!(
+            std::fs::read(directory(&ctx).join("record.json")).unwrap(),
+            wal,
+            "unknown live config must preserve original WAL"
+        );
+        assert_eq!(
+            std::fs::read(directory(&ctx).join("topology.json")).unwrap(),
+            binding
+        );
+        assert!(host.stdins().is_empty());
+        assert!(
+            !host.ops().iter().any(|op| op.starts_with("systemd:")
+                || op.starts_with("write:")
+                || op.starts_with("rename:")
+                || op.starts_with("remove:")),
+            "{:?}",
+            host.ops()
+        );
+    }
+    #[tokio::test]
+    async fn fix_round2_prestart_rejects_missing_binding_none() {
+        absent_binding_writer("prestart", "none").await;
+    }
+    #[tokio::test]
+    async fn fix_round2_prestart_rejects_missing_binding_active() {
+        absent_binding_writer("prestart", "active").await;
+    }
+    #[tokio::test]
+    async fn fix_round2_prestart_rejects_missing_binding_recovered() {
+        absent_binding_writer("prestart", "recovered").await;
+    }
+    #[tokio::test]
+    async fn fix_round2_watchdog_rejects_missing_binding_none() {
+        absent_binding_writer("watchdog", "none").await;
+    }
+    #[tokio::test]
+    async fn fix_round2_watchdog_rejects_missing_binding_active() {
+        absent_binding_writer("watchdog", "active").await;
+    }
+    #[tokio::test]
+    async fn fix_round2_watchdog_rejects_missing_binding_recovered() {
+        absent_binding_writer("watchdog", "recovered").await;
+    }
+    #[tokio::test]
+    async fn fix_round2_hop_recovery_rejects_missing_config_before_mutation() {
+        omitted_config_recovery("hop", true).await;
+    }
+    #[tokio::test]
+    async fn fix_round2_hop_recovery_rejects_foreign_config_before_mutation() {
+        omitted_config_recovery("hop", false).await;
+    }
+    #[tokio::test]
+    async fn fix_round2_binary_recovery_rejects_missing_config_before_mutation() {
+        omitted_config_recovery("binary", true).await;
+    }
+    #[tokio::test]
+    async fn fix_round2_binary_recovery_rejects_foreign_config_before_mutation() {
+        omitted_config_recovery("binary", false).await;
+    }
+    #[tokio::test]
     async fn fix_round1_binding_drift_during_gate_barrier_cannot_be_active() {
         let (_dir, ctx, _host, fake) = fixture().await;
         let mut foreign = read_binding(ctx.store.directory()).unwrap().unwrap();
@@ -2126,7 +2398,12 @@ mod tests {
         std::fs::write(directory(&ctx).join("topology.json"), b"{broken").unwrap();
         host.clear_ops();
         assert!(crate::commands::nft::apply(host.as_ref(), &ctx.paths).is_err());
-        assert!(crate::modules::watchdog::check_once(&ctx).await.is_err());
+        assert!(crate::modules::watchdog::check_once(&ctx)
+            .await
+            .unwrap()
+            .iter()
+            .any(|(unit, decision)| unit == UNIT
+                && *decision == crate::modules::watchdog::Decision::Unknown));
         assert!(host.stdins().is_empty());
         assert!(!host
             .ops()

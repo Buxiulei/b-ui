@@ -182,6 +182,7 @@ mod tests {
         };
         let h = FakeHost::new();
         let s = crate::testutil::sample_state();
+        crate::residential_lifecycle::seed_applied_fixture(d.path(), &s, &paths);
         h.write_file(
             &crate::paths::state_file(&paths),
             &serde_json::to_vec(&s).unwrap(),
@@ -255,6 +256,7 @@ mod tests {
         let (_d, paths, h) = seeded();
         let mut s = crate::testutil::sample_state();
         s.system.hy2_resi_compat_ports = false;
+        crate::residential_lifecycle::seed_applied_fixture(&paths.base_dir, &s, &paths);
         h.write_file(
             &crate::paths::state_file(&paths),
             &serde_json::to_vec(&s).unwrap(),
