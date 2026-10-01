@@ -8,6 +8,21 @@
 `version` 的唯一来源是根 `Cargo.toml` 的 `[workspace.package] version`；改版本必须同时在本文件加一段，`scripts/release/check-version.sh` 会在 CI 里卡住不一致（它只认 `## [<version>]` 这个标题，日期不参与校验）。
 未发布的版本日期写「未发布」，由主理人打 tag 发版时替换成当天日期（UTC）。
 
+## [4.1.5] - 未发布
+
+### Rust 控制面修复
+
+- 住宅入站的配置、共享 sing-box 二进制、证书和服务动作由同一个住宅 owner 串行发布；候选先校验，严格持久 prepared 记录先于发布，实例、预期 UDP 监听、实际 BUI nft 表和完整门位读回通过后才确认 active 与住宅 restart keys。失败恢复上一候选，并明确区分恢复旧配置与新配置已激活。
+- 门位屏障严格核对 stock sing-box 1.14.2 的版本、Selector 成员和最终选择；先关禁用、到期、超额及旧门，再开放当前授权。PUT 成功不能代替读回，状态与待入账流量遵循同一写者顺序，持久提交前再次检查到期。
+- daemon 与离线写命令共用机器控制 lease，在线命令经 UDS 交给现有控制写者。请求取消不释放正在落盘或执行服务动作的写权；住宅 prestart 的 nft 子步骤免 lease 重入，daemon handoff 在事务结束及 lease 释放后执行。
+- 住宅已发布的监听端口、跳跃段、兼容开关与配置 SHA 独立于期望 State；apply、prestart 和 watchdog 使用同一绑定，恢复旧候选后不被新期望端口覆盖。明确维护 stop 不被 watchdog 撤销，Unknown 监听、实例或表观察不作为自动重启和激活成功依据。首次缺证书保留 pending，实际鉴权 listener 在较长住宅等待前就绪。
+
+### 验证与边界
+
+- 增加显式 opt-in 的隔离 Linux stock 1.14.2 集成夹具，调用实际 Rust 门位屏障和住宅 HY2 renderer，验证两个用户的不同槽供应商响应、禁用/到期/空闲拒绝，以及维护重启后的 fail-closed 默认门和新请求恢复；wrapper 核对内核 SHA、版本及 network=none，限制运行时间并清理精确子进程。
+- 增加仅测试使用的离线纯 renderer/严格采样 Plan 适配器，复用四个生产 producer 和原始 runtime keys；缺观察、非空 Plan 或当前受管字节差异均阻断预检，私有输入与输出保留在受限权限目录，不新增产品命令。
+- 本次收口 Rust 控制面，继续使用原版网络内核，不修改客户端、Mac、路由规则或日志级别，不启用 relay generation bank。门位正确不代表上游业务健康；维护重启允许既有 QUIC/TCP/UDP 连接损失，不宣称零断流，也不以零 ERROR 为验收条件。
+
 ## [4.1.4] - 未发布
 
 ### 修复

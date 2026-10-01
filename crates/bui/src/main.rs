@@ -19,6 +19,8 @@ mod ipc;
 mod kernels;
 mod logging;
 mod modules;
+#[cfg(test)]
+mod offline_renderer_snapshot;
 mod paths;
 mod reconcile;
 mod redact;

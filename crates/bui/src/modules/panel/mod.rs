@@ -26,6 +26,8 @@ pub mod xray;
 #[cfg(test)]
 pub mod fakes;
 #[cfg(test)]
+mod stock_gate_fixture;
+#[cfg(test)]
 pub mod testsupport;
 
 use crate::api::AppState;
