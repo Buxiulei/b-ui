@@ -860,7 +860,13 @@ mod tests {
             certs_dir: d.path().join("certs"),
             bin_dir: d.path().join("bin"),
         };
+        let current = store.read().await;
         host.with(|i| {
+            i.which.insert("nft".into());
+            i.nft_table = Some(bui_schema::render::nft::ruleset(
+                &current.node.ports,
+                current.system.hy2_resi_compat_ports,
+            ));
             i.instances.insert("hysteria-residential.service".into(), 1);
             i.stock_singbox = true;
             i.listening

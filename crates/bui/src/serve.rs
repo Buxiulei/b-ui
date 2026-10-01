@@ -80,14 +80,17 @@ pub struct ReconcileInput<'a> {
 }
 
 /// 一次完整对账：探事实 → 收集 artifacts → diff → apply → 漂移扫描 → 报告
-pub fn reconcile_once(
-    input: ReconcileInput<'_>,
-    host: &dyn Host,
-) -> anyhow::Result<(
+type ReconcileOutcome = (
     ReconcileReport,
     BTreeMap<String, String>,
     Option<crate::residential_lifecycle::Deferred>,
-)> {
+    crate::reconcile::apply::RelayApplyOutcome,
+);
+
+pub fn reconcile_once(
+    input: ReconcileInput<'_>,
+    host: &dyn Host,
+) -> anyhow::Result<ReconcileOutcome> {
     let facts = Facts::probe(host)?;
     let ctx = RenderCtx {
         paths: input.paths.clone(),
@@ -172,7 +175,7 @@ pub fn reconcile_once(
     if out.relay_restarted {
         tracing::info!("b-ui-relay 已重启，需要重放选中的住宅上游");
     }
-    Ok((report, keys, out.residential))
+    Ok((report, keys, out.residential, out.relay))
 }
 
 /// Only prerequisites that can make the first certificate arrive. Keep the full
@@ -244,7 +247,7 @@ pub async fn reconcile_from_ctx(
             keys: p
                 .keys
                 .iter()
-                .filter(|(k, _)| k.contains("hy2-residential.json"))
+                .filter(|(k, _)| k.contains("hy2-residential.json") || k.as_str() == "nft:inet:bui")
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
         };
@@ -306,9 +309,16 @@ pub async fn reconcile_from_ctx(
     let (c, mods) = (ctx.clone(), modules.to_vec());
     ctx.bus.residential().execute(move |tx| async move {
         let candidate = binaries.remove("sing-box");
+        let previous_keys=c.runtime.read().await.restart_keys;
+        let relay_config=if candidate.is_some() {
+            let state=c.store.read().await;
+            let render=RenderCtx{paths:c.paths.clone(),facts:Facts::probe(c.host.as_ref())?};
+            mods.iter().flat_map(|m|m.render(&state,&render)).find_map(|a|match a {crate::reconcile::Artifact::File{path,content,..} if path==c.paths.base_dir.join("singbox-relay.json")=>Some(content), _=>None})
+        } else {None};
         let mut certificate_bootstrap = false;
         let published = if !dry_run && !work.changes.is_empty() {
-            match tx.publish(&c, work, candidate).await {
+            let publication=if candidate.is_some() {tx.publish_with_relay(&c,work,candidate,relay_config).await} else {tx.publish(&c,work,None).await};
+            match publication {
                 Ok(published) => Some(published),
                 Err(error) if error.is::<crate::residential_lifecycle::AwaitingCertificate>() => { certificate_bootstrap = true; None },
                 Err(error) => return Err(error),
@@ -318,16 +328,29 @@ pub async fn reconcile_from_ctx(
         let residential_activated = published.as_ref().is_some_and(|p| matches!(p.action, crate::residential_lifecycle::Action::Start | crate::residential_lifecycle::Action::Restart));
         let (host, paths) = (c.host.clone(), c.paths.clone());
         let current_state = c.store.read().await;
-        let (mut report, mut keys, _) = tokio::task::spawn_blocking(move || {
+        let applied = tokio::task::spawn_blocking(move || {
             let installer = PreparedInstaller { host: host.as_ref(), binaries: &binaries };
             reconcile_once(ReconcileInput { certificate_bootstrap, state: &current_state, modules: &mods, paths: &paths, keys: &keys, installer: &installer, force, dry_run }, host.as_ref())
-        }).await??;
+        }).await.map_err(anyhow::Error::from).and_then(|result| result);
+        let (mut report, mut keys, _, relay_outcome) = match applied {
+            Ok(outcome)=>outcome,
+            Err(error)=>return match published {Some(p)=>Err(tx.reject(&c,p,error).await.expect_err("rejected shared publication")),None=>Err(error)},
+        };
         if !dry_run {
             let mut relay_failed = false;
-            if shared_binary_changed && !report.restarted.iter().any(|u| u == "b-ui-relay") {
-                let host = c.host.clone();
-                let ok = tokio::task::spawn_blocking(move || host.systemd("restart", "b-ui-relay").is_ok_and(|o| o.ok()) && host.unit_is_active("b-ui-relay").unwrap_or(false)).await?;
-                if ok { report.restarted.push("b-ui-relay".into()); } else { relay_failed = true; report.errors.push("shared sing-box relay activation failed".into()); }
+            if shared_binary_changed {
+                let confirmed = async {
+                    let expected=published.as_ref().and_then(|p|p.validated_relay_sha.as_ref());
+                    let bound=expected.is_some() && c.host.file_sha256(&c.paths.base_dir.join("singbox-relay.json"))?.as_ref()==expected;
+                    anyhow::ensure!(relay_outcome!=crate::reconcile::apply::RelayApplyOutcome::Held && bound,"relay validation/publication held");
+                    if relay_outcome==crate::reconcile::apply::RelayApplyOutcome::Unchanged {
+                        let out=tx.relay(&c,"restart".into()).await?;
+                        anyhow::ensure!(out.ok() && c.host.unit_is_active("b-ui-relay")?,"shared relay activation failed");
+                        report.restarted.push("b-ui-relay".into());
+                    }
+                    Ok::<(),anyhow::Error>(())
+                }.await;
+                if let Err(error)=confirmed { relay_failed=true; report.errors.push(format!("shared sing-box relay not confirmed: {}",crate::redact::url_credentials(&error.to_string()))); }
             }
             let completion = if certificate_bootstrap {
                 report.notes.push("住宅与 relay 等待首张 TLS 证书；Caddy 与 daemon 启动前置已执行，尚未确认住宅 active".into());
@@ -339,6 +362,10 @@ pub async fn reconcile_from_ctx(
             } else {
                 tx.activate(&c, crate::residential_lifecycle::Source::Recovery, crate::residential_lifecycle::Action::Observe, None).await
             };
+            if shared_binary_changed && completion.is_err() {
+                keys.retain(|key,_|!key.contains("singbox-relay.json"));
+                keys.extend(previous_keys.into_iter().filter(|(key,_)|key.contains("singbox-relay.json")));
+            }
             match completion {
                 Ok(receipt) => { if receipt.phase == "active" { keys.extend(receipt.pending_keys); if residential_activated { report.restarted.push("hysteria-residential".into()); } } }
                 Err(error) => report.errors.push(format!("residential activation: {error}")),
@@ -971,7 +998,7 @@ mod tests {
         let paths = bui_schema::paths::Paths::default_server();
         let reg = modules(None);
         let keys = BTreeMap::new();
-        let (first, keys, _) = reconcile_once(
+        let (first, keys, _, _) = reconcile_once(
             input(&state, &reg.modules, &paths, &keys, &NoopInstaller),
             host.as_ref(),
         )
@@ -1014,7 +1041,7 @@ mod tests {
             "{keys:?}"
         );
         host.clear_ops();
-        let (second, _, _) = reconcile_once(
+        let (second, _, _, _) = reconcile_once(
             input(&state, &reg.modules, &paths, &keys, &NoopInstaller),
             host.as_ref(),
         )
@@ -1076,7 +1103,7 @@ mod tests {
         let state = crate::testutil::sample_state();
         let paths = bui_schema::paths::Paths::default_server();
         let reg = modules(None);
-        let (first, keys, deferred) = reconcile_once(
+        let (first, keys, deferred, _) = reconcile_once(
             input(
                 &state,
                 &reg.modules,
@@ -1104,29 +1131,10 @@ mod tests {
         ] {
             assert!(ops.iter().any(|o| o == op), "缺 {op}：{ops:?}");
         }
-        // ②
-        assert_eq!(
-            ops.iter().filter(|o| o.as_str() == "run:nft -f -").count(),
-            1,
-            "{ops:?}"
-        );
-        assert_eq!(
-            host.stdins()
-                .iter()
-                .filter(|(cmd, _)| cmd == "nft -f -")
-                .map(|(_, body)| body.clone())
-                .collect::<Vec<_>>(),
-            vec![bui_schema::render::nft::ruleset(&state.node.ports, true)],
-            "喂进去的必须是 bui-schema 渲染的那一份"
-        );
-        assert_eq!(
-            keys.get("nft:inet:bui").map(String::as_str),
-            Some(crate::reconcile::diff::ruleset_key(
-                &bui_schema::render::nft::ruleset(&state.node.ports, true)
-            ))
-            .as_deref(),
-            "{keys:?}"
-        );
+        // Table and keys now share the owner's activation boundary.
+        assert!(!ops.iter().any(|o| o == "run:nft -f -"));
+        assert!(!keys.contains_key("nft:inet:bui"));
+        assert!(deferred.as_ref().unwrap().changes.iter().any(|c| matches!(c, crate::reconcile::diff::Change::ApplyNftTable {ruleset,..} if ruleset==&bui_schema::render::nft::ruleset(&state.node.ports,true))));
         // Residential artifacts are handed to the owner before any activation.
         assert!(host
             .text("/etc/systemd/system/hysteria-residential.service")
@@ -1135,7 +1143,7 @@ mod tests {
         assert!(deferred.unwrap().changes.iter().any(|c| matches!(c, crate::reconcile::diff::Change::WriteUnit { unit, .. } if unit.name == "hysteria-residential")));
         // ④
         host.clear_ops();
-        let (second, _, _) = reconcile_once(
+        let (second, _, _, _) = reconcile_once(
             input(&state, &reg.modules, &paths, &keys, &NoopInstaller),
             host.as_ref(),
         )
@@ -1164,7 +1172,7 @@ mod tests {
         let state = crate::testutil::sample_state();
         let paths = bui_schema::paths::Paths::default_server();
         let reg = modules(None);
-        let (first, keys, _) = reconcile_once(
+        let (first, keys, _, _) = reconcile_once(
             input(
                 &state,
                 &reg.modules,
@@ -1182,7 +1190,7 @@ mod tests {
             first.notes
         );
         assert!(!keys.contains_key("nft:inet:bui"), "没落地就不许记账");
-        let (second, _, _) = reconcile_once(
+        let (second, _, _, _) = reconcile_once(
             input(&state, &reg.modules, &paths, &keys, &NoopInstaller),
             host.as_ref(),
         )
@@ -1203,7 +1211,7 @@ mod tests {
         let state = crate::testutil::sample_state();
         let paths = bui_schema::paths::Paths::default_server();
         let reg = modules(None);
-        let (first, keys, _) = reconcile_once(
+        let (first, keys, _, _) = reconcile_once(
             input(
                 &state,
                 &reg.modules,
@@ -1220,7 +1228,7 @@ mod tests {
             "被钳制的键要留一条提示：{:?}",
             first.notes
         );
-        let (second, _, _) = reconcile_once(
+        let (second, _, _, _) = reconcile_once(
             input(&state, &reg.modules, &paths, &keys, &NoopInstaller),
             host.as_ref(),
         )
@@ -1238,7 +1246,7 @@ mod tests {
         let state = crate::testutil::sample_state();
         let paths = bui_schema::paths::Paths::default_server();
         let reg = modules(None);
-        let (_, keys, _) = reconcile_once(
+        let (_, keys, _, _) = reconcile_once(
             input(
                 &state,
                 &reg.modules,
@@ -1252,7 +1260,7 @@ mod tests {
         host.write_file(Path::new("/opt/b-ui/config.yaml"), b"listen: :1\n", 0o600)
             .unwrap();
         host.clear_ops();
-        let (report, _, _) = reconcile_once(
+        let (report, _, _, _) = reconcile_once(
             input(&state, &reg.modules, &paths, &keys, &NoopInstaller),
             host.as_ref(),
         )
@@ -1273,7 +1281,7 @@ mod tests {
         let state = crate::testutil::sample_state();
         let paths = bui_schema::paths::Paths::default_server();
         let reg = modules(None);
-        let (report, keys, _) = reconcile_once(
+        let (report, keys, _, _) = reconcile_once(
             input(
                 &state,
                 &reg.modules,
@@ -1299,7 +1307,7 @@ mod tests {
         );
         let mut forced = input(&state, &reg.modules, &paths, &keys, &NoopInstaller);
         forced.force = true;
-        let (report2, _, _) = reconcile_once(forced, host.as_ref()).unwrap();
+        let (report2, _, _, _) = reconcile_once(forced, host.as_ref()).unwrap();
         assert!(
             host.text("/etc/systemd/system/xray.service.d/50-manual.conf")
                 .is_none(),
@@ -1323,7 +1331,7 @@ mod tests {
         let state = crate::testutil::sample_state();
         let paths = bui_schema::paths::Paths::default_server();
         let reg = modules(None);
-        let (first, keys, _) = reconcile_once(
+        let (first, keys, _, _) = reconcile_once(
             input(
                 &state,
                 &reg.modules,
@@ -1351,7 +1359,7 @@ mod tests {
             !keys.contains_key("firewall"),
             "没改过防火墙就不该记 key：{keys:?}"
         );
-        let (second, _, _) = reconcile_once(
+        let (second, _, _, _) = reconcile_once(
             input(&state, &reg.modules, &paths, &keys, &NoopInstaller),
             host.as_ref(),
         )
@@ -1369,7 +1377,7 @@ mod tests {
         let state = crate::testutil::sample_state();
         let paths = bui_schema::paths::Paths::default_server();
         let reg = modules(None);
-        let (report, _, _) = reconcile_once(
+        let (report, _, _, _) = reconcile_once(
             input(
                 &state,
                 &reg.modules,
@@ -1420,7 +1428,7 @@ mod tests {
         let state = crate::testutil::sample_state();
         let paths = bui_schema::paths::Paths::default_server();
         let reg = modules(Some(m));
-        let (_report, _, deferred) = reconcile_once(
+        let (_report, _, deferred, _) = reconcile_once(
             input(
                 &state,
                 &reg.modules,
@@ -1443,7 +1451,7 @@ mod tests {
         let keys = BTreeMap::new();
         let mut i = input(&state, &reg.modules, &paths, &keys, &NoopInstaller);
         i.dry_run = true;
-        let (report, _, _) = reconcile_once(i, host.as_ref()).unwrap();
+        let (report, _, _, _) = reconcile_once(i, host.as_ref()).unwrap();
         assert!(!report.changed.is_empty());
         assert!(report.dry_run);
         assert!(host.text("/opt/b-ui/config.yaml").is_none());
@@ -1509,6 +1517,13 @@ mod tests {
         });
         let mut state = crate::testutil::sample_state();
         bui_schema::hy2pool::grow(&mut state.residential.hy2_pool, 32, &Default::default());
+        host.with(|i| {
+            i.which.insert("nft".into());
+            i.nft_table = Some(bui_schema::render::nft::ruleset(
+                &state.node.ports,
+                state.system.hy2_resi_compat_ports,
+            ));
+        });
         let store = Store::create(d.path().join("state.json"), state)
             .await
             .unwrap();
@@ -1523,6 +1538,113 @@ mod tests {
                 certs_dir: d.path().join("certs"),
                 bin_dir: d.path().join("bin"),
             },
+        }
+    }
+
+    use crate::reconcile::Artifact;
+    struct SharedBinaryFixture {
+        relay: Vec<u8>,
+    }
+    impl Module for SharedBinaryFixture {
+        fn name(&self) -> &'static str {
+            "shared-binary-fixture"
+        }
+        fn render(&self, s: &State, c: &RenderCtx) -> Vec<Artifact> {
+            vec![
+                Artifact::Binary {
+                    name: "sing-box".into(),
+                    version: "1.14.2".into(),
+                    sha256: crate::kernels::sha256_hex(b"new binary"),
+                    url: "https://fixture/sing-box".into(),
+                },
+                Artifact::file(
+                    crate::modules::core_files::hy2_resi_config_path(&c.paths),
+                    crate::residential_lifecycle::config_bytes(s, &c.paths).unwrap(),
+                )
+                .restart(crate::reconcile::Unit::restart("hysteria-residential")),
+                Artifact::file(
+                    c.paths.base_dir.join("singbox-relay.json"),
+                    self.relay.clone(),
+                )
+                .verify(crate::reconcile::Verify::SingBox)
+                .restart(crate::reconcile::Unit::restart("b-ui-relay")),
+            ]
+        }
+    }
+    #[tokio::test]
+    async fn fix_round1_shared_binary_never_bypasses_relay_validation_or_write_hold() {
+        for case in ["bad-new", "bad-retained", "write-held"] {
+            let host = ready_host();
+            let d = tempfile::tempdir().unwrap();
+            let ctx = ctx_for(host.clone(), &d).await;
+            let config =
+                crate::residential_lifecycle::config_bytes(&*ctx.store.read().await, &ctx.paths)
+                    .unwrap();
+            let path = crate::modules::core_files::hy2_resi_config_path(&ctx.paths);
+            host.write_file(&path, &config, 0o600).unwrap();
+            let binary = ctx.paths.bin_dir.join("sing-box");
+            host.write_file(&binary, b"old binary", 0o755).unwrap();
+            let relay = ctx.paths.base_dir.join("singbox-relay.json");
+            let old = if case == "bad-retained" {
+                b"bad relay".as_slice()
+            } else {
+                b"old relay".as_slice()
+            };
+            host.write_file(&relay, old, 0o600).unwrap();
+            let next = if case == "write-held" {
+                b"new relay".to_vec()
+            } else {
+                b"bad relay".to_vec()
+            };
+            host.with(|i| {
+                if case == "write-held" {
+                    i.fail_writes.insert(relay.clone());
+                } else {
+                    i.rejected_check_contents.insert(next.clone());
+                }
+            });
+            let modules: Vec<Arc<dyn Module>> = vec![Arc::new(SharedBinaryFixture { relay: next })];
+            let f: Arc<dyn Fetcher> = Arc::new(FakeFetcher(Mutex::new(vec![(
+                "https://fixture/sing-box".into(),
+                b"new binary".to_vec(),
+            )])));
+            host.clear_ops();
+            let result = reconcile_from_ctx(&ctx, &modules, f, false, false).await;
+            assert!(
+                result.is_err()
+                    || result
+                        .as_ref()
+                        .is_ok_and(|r| !r.errors.is_empty() || !r.verify_failures.is_empty()),
+                "{case} must fail the shared transaction"
+            );
+            assert_eq!(
+                host.read_file(&binary).unwrap(),
+                Some(b"old binary".to_vec()),
+                "{case}"
+            );
+            assert_eq!(host.read_file(&relay).unwrap(), Some(old.to_vec()));
+            let ops = host.ops();
+            if case == "write-held" {
+                let restore = ops
+                    .iter()
+                    .position(|o| o.starts_with("rename:") && o.contains("previous-sing-box"))
+                    .unwrap();
+                assert!(
+                    !ops[..restore]
+                        .iter()
+                        .any(|o| o == "systemd:restart:b-ui-relay"),
+                    "validation/write hold bypassed before rollback: {ops:?}"
+                );
+            } else {
+                assert!(
+                    !ops.iter().any(|o| o == "systemd:restart:b-ui-relay"),
+                    "candidate rejection must precede any relay activation"
+                );
+            }
+            assert!(ctx.runtime.read().await.restart_keys.is_empty());
+            assert!(crate::residential_lifecycle::read_record(&ctx)
+                .unwrap()
+                .is_none_or(|r| r.phase != "active"));
         }
     }
 

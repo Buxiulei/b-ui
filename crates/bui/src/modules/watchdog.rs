@@ -740,8 +740,10 @@ pub async fn check_once(ctx: &DaemonCtx) -> anyhow::Result<Vec<(String, Decision
     // The table shares the publication resource with apply. Sample only after
     // admission, so a queued replay cannot overwrite a newly committed topology.
     let (state, nft) = owner
-        .execute(move |_tx| async move {
-            let state = c.store.read().await;
+        .execute(move |tx| async move {
+            tx.recover_pending(&c).await?;
+            let mut state = (*c.store.read().await).clone();
+            crate::residential_lifecycle::project_applied(c.store.directory(), &mut state)?;
             let sample = state.clone();
             let nft =
                 tokio::task::spawn_blocking(move || check_nft(c.host.as_ref(), &sample)).await?;
@@ -1245,7 +1247,13 @@ mod tests {
             })
             .await
             .unwrap();
+        let current = c.store.read().await;
         host.with(|i| {
+            i.which.insert("nft".into());
+            i.nft_table = Some(bui_schema::render::nft::ruleset(
+                &current.node.ports,
+                current.system.hy2_resi_compat_ports,
+            ));
             i.instances.insert("hysteria-residential.service".into(), 1);
             i.stock_singbox = true;
             i.start_listeners

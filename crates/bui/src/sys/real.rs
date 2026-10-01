@@ -17,6 +17,36 @@ impl RealHost {
     }
 }
 
+fn listener_tables(
+    proto: Proto,
+    ipv6_supported: bool,
+    mut read: impl FnMut(&str) -> std::io::Result<String>,
+) -> Result<BTreeSet<u16>> {
+    // UDP 没有 LISTEN 状态，只能看「有本地端口绑定」。
+    let (files, listening_only) = match proto {
+        Proto::Tcp => (["/proc/net/tcp", "/proc/net/tcp6"], true),
+        Proto::Udp => (["/proc/net/udp", "/proc/net/udp6"], false),
+    };
+    let mut out = BTreeSet::new();
+    for f in files {
+        let text = match read(f) {
+            Ok(text) => text,
+            Err(error)
+                if f.ends_with('6')
+                    && !ipv6_supported
+                    && error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                continue
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("listener table unavailable: {f}"))
+            }
+        };
+        out.extend(parse_proc_net(&text, listening_only));
+    }
+    Ok(out)
+}
+
 impl Default for RealHost {
     fn default() -> Self {
         Self::new()
@@ -437,18 +467,21 @@ impl Host for RealHost {
     }
 
     fn listening_ports(&self, proto: Proto) -> Result<BTreeSet<u16>> {
-        // UDP 没有 LISTEN 状态，只能看「有本地端口绑定」。
-        let (files, listening_only) = match proto {
-            Proto::Tcp => (["/proc/net/tcp", "/proc/net/tcp6"], true),
-            Proto::Udp => (["/proc/net/udp", "/proc/net/udp6"], false),
+        use nix::sys::socket::{socket, AddressFamily, SockFlag, SockType};
+        let ipv6_supported = match socket(
+            AddressFamily::Inet6,
+            SockType::Datagram,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        ) {
+            Ok(socket) => {
+                drop(socket);
+                true
+            }
+            Err(nix::errno::Errno::EAFNOSUPPORT | nix::errno::Errno::EPROTONOSUPPORT) => false,
+            Err(error) => return Err(error).context("cannot establish IPv6 family support"),
         };
-        let mut out = BTreeSet::new();
-        for f in files {
-            let text = std::fs::read_to_string(f)
-                .with_context(|| format!("listener table unavailable: {f}"))?;
-            out.extend(parse_proc_net(&text, listening_only));
-        }
-        Ok(out)
+        listener_tables(proto, ipv6_supported, |p| std::fs::read_to_string(p))
     }
 
     fn now(&self) -> time::OffsetDateTime {
@@ -490,6 +523,37 @@ fn command(program: &str, args: &[&str]) -> std::process::Command {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn fix_round1_only_explicitly_unsupported_ipv6_can_be_absent() {
+        let table = " sl local_address rem_address st\n 0: 00000000:9C40 00000000:0000 07\n";
+        let read = |path: &str| {
+            if path.ends_with('6') {
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+            } else {
+                Ok(table.to_string())
+            }
+        };
+        assert!(listener_tables(Proto::Udp, false, read)
+            .unwrap()
+            .contains(&40000));
+        assert!(listener_tables(Proto::Udp, true, read).is_err());
+        for error in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::Other,
+        ] {
+            assert!(listener_tables(Proto::Udp, false, |p| if p.ends_with('6') {
+                Err(error.into())
+            } else {
+                Ok(table.into())
+            })
+            .is_err());
+        }
+        assert!(listener_tables(Proto::Udp, false, |_| Err(
+            std::io::ErrorKind::NotFound.into()
+        ))
+        .is_err());
+    }
 
     /// 只碰 tempfile 给的临时目录：原子写 + 权限 + 只列直接子项 + 悬空链接可被顶替。
     #[test]

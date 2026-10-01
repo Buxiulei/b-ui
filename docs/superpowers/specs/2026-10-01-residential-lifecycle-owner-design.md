@@ -13,7 +13,7 @@ daemon 的 reconcile 已经串行，但住宅入站的 API、watchdog、证书�
 - `hysteria-residential` 的配置发布、start/restart/reload/stop、证书激活和恢复由同一个住宅专用 Rust owner 串行管理。其范围不是整个网络栈，也不把原生 HY2 鉴权处理锁在服务操作后面。
 - sing-box 是住宅与 relay 的共享二进制；资源 owner 内发布候选后，relay 保留既有 apply 的校验与单次激活语义，回滚显式处理两个消费者，不能用旧 binary 校验新配置或漏重启。下载准备仍在资源锁外，不引入 relay generation bank。
 - relay 的既有手动服务动作与 watchdog restart 也经过共享 binary 资源 guard；保留其原归因/通知语义，不套住宅门位屏障，不新增 relay generation 行为。
-- watchdog 对 BUI nft 表的既有检查/整表重放，在同一资源 guard 后取得最新 State；不使用排队前的旧拓扑，不改变规则正文或一致时的无写入行为。ExecStartPre 的 nft 子步骤保持免重入。
+- 住宅监听端口、跳跃段和兼容开关组成最小已发布拓扑绑定，分别于期望 State。住宅 owner 在严格持久 prepared 记录后发布本次目标绑定；apply、ExecStartPre 和 watchdog 三处 BUI nft 表写者使用同一绑定投影与既有 renderer。恢复旧候选时先恢复旧绑定，再恢复服务与规则并读回验证；后续 watchdog 不得用新期望端口覆盖旧运行拓扑。仅跳跃段/兼容开关变化也属于完整发布。规则正文及一致时的无写入行为保持，prestart 子步骤免 lease 重入。
 - startup 在住宅事务前发布当前鉴权 snapshot 并实际 bind 确认原生 HY2 独立 HTTP listener 可用，再执行较长的下载/激活；只 spawn 未就绪任务不足以保证服务可用。
 - 机器上只有一个控制写者。daemon 持有进程间独占 lease；在线 CLI 通过 UDS 提交，无法连接 UDS 不能证明离线。离线写者（包括独立 import-v3 写受管 state 的入口）先取得同一 lease，不能与 daemon 并行写配置或 runtime。
 - `harden-ssh` 保留既有加固行为，但在线经 UDS 提交给 daemon，离线在读取写入依据前取得控制 lease。SSH-only apply 不执行住宅网络清理；daemon reconcile 与 CLI 不能同时发布相同 SSH 配置文件。
@@ -32,6 +32,10 @@ daemon 的 reconcile 已经串行，但住宅入站的 API、watchdog、证书�
 首次安装已知缺少候选证书、住宅服务尚未部署或启动时，返回明确的 `awaiting_certificate`/pending；允许必需的 Caddy 与 bootstrap/handoff 前置步骤继续，证书到达后再校验并激活。此阶段不发布未经校验的住宅 live 配置、不确认住宅 keys 或 active；普通候选校验错误与不明证书读取故障不属于该例外，共享 binary 失败仍须保持 relay 消费者一致性。
 
 流程为 `prepare → durable prepared record → publish → activate → observe instance → restore gates → read back → active record/keys`。记录包含操作 ID、来源、候选配置摘要、观察到的进程实例、阶段及明确失败原因，不包含代理密码或私钥。操作记录必须严格原子持久化，不能以 runtime 的 best-effort 写盘冒充持久提交。
+
+已发布绑定仅保存住宅三项拓扑及配置 SHA，不保存代理密码或私钥，不回滚当前授权 State。prepared 记录保存 previous/target，作为绑定发布的写前依据。建立新 prepared 之前必须优先处理既有未完成记录：对比 live 配置 SHA 与完整三字段绑定的 previous/target 组合，沿原操作恢复或继续并严格收尾；foreign/missing/unreadable 组合不能覆盖旧记录。绑定、配置和表的发布/恢复必须覆盖每个中断窗口，未验证的组合不能确认 active。没有绑定的初次 adoption 仅在 live 配置等于当前 renderer 且实际 BUI 表匹配时建立；未知或损坏绑定不可用期望态替代。候选校验被 hold 或首次待证书时，apply 不能提前按新期望态改变旧运行表。恢复后的监听判据、预启动和 watchdog 均消费已恢复绑定，直到下一完整新候选提交。
+
+普通 adoption 必须绑定当前期望配置；明确恢复上一候选时使用已保存候选的配置、端口与发布证据，并仍按最新授权读回门位。恢复记录诚实区分 rejected-new 与 recovered-old，不能假称旧配置等于新期望态，也不能确认新 keys。恢复不以失败服务已 active 为前提；新发布后的各验证阶段失败均进入恢复。保存的维护/停止意图优先于恢复重启，只有明确手动 start/restart 解除维护。
 
 既有同步 apply 的住宅操作改为可延续的待激活结果，候选 keys 与回滚点交给 async owner；其他服务的既有 apply 语义保持。启动直接等待该屏障，不依赖订阅时序。住宅通知事件只作为观察信号，不承担正确性。manual stop 是明确维护状态，不让 watchdog 立即启动；明确 start/restart 才解除维护状态。
 

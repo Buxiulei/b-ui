@@ -32,6 +32,14 @@ pub trait BinaryInstaller: Send + Sync {
     ) -> anyhow::Result<()>;
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum RelayApplyOutcome {
+    #[default]
+    Unchanged,
+    Activated,
+    Held,
+}
+
 #[derive(Debug, Default, PartialEq)]
 pub struct ApplyOutcome {
     pub residential: Option<crate::residential_lifecycle::Deferred>,
@@ -45,6 +53,7 @@ pub struct ApplyOutcome {
     /// 永远成立 = 每次改 `clients` 都重启 xray（spec §3.3 失效），乱搬 = 该重启时不重启。
     pub keys: BTreeMap<String, String>,
     pub relay_restarted: bool,
+    pub relay: RelayApplyOutcome,
     /// `b-ui.service` 自身需要重启；apply **绝不**自己动它（第 12 步），由调用方处理
     pub self_restart_required: bool,
 }
@@ -107,12 +116,21 @@ pub fn apply(input: ApplyInput<'_>, host: &dyn Host) -> ApplyOutcome {
             true
         }
     });
+    if residential
+        .iter()
+        .any(|c| matches!(c, Change::ApplyNftTable { .. }))
+        && !host.which("nft")
+    {
+        out.notes.push("PATH 上没有 nft，住宅 HY2 全体现役订阅的端口跳跃无法确认；请安装 nftables，owner 将保持未确认状态".into());
+    }
     if !residential.is_empty() {
         out.residential = Some(crate::residential_lifecycle::Deferred {
             changes: residential,
             keys: candidate_keys
                 .iter()
-                .filter(|(key, _)| key.contains("hy2-residential.json"))
+                .filter(|(key, _)| {
+                    key.contains("hy2-residential.json") || key.as_str() == "nft:inet:bui"
+                })
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
         });
@@ -475,7 +493,17 @@ pub fn apply(input: ApplyInput<'_>, host: &dyn Host) -> ApplyOutcome {
         }
         // 本轮要 restart 的单元不再额外 start：首装时那会变成「start 紧跟 restart」的双启动
         if *active && !restart.iter().any(|u| u.name.as_str() == unit.as_str()) {
-            let _ = host.systemd("start", unit);
+            if unit.as_str() == "b-ui-relay" {
+                if host.systemd("start", unit).is_ok_and(|o| o.ok())
+                    && host.unit_is_active(unit).unwrap_or(false)
+                {
+                    record_restarted(&mut out, unit);
+                } else {
+                    out.relay = RelayApplyOutcome::Held;
+                }
+            } else {
+                let _ = host.systemd("start", unit);
+            }
         }
     }
 
@@ -588,6 +616,9 @@ pub fn apply(input: ApplyInput<'_>, host: &dyn Host) -> ApplyOutcome {
             }
             continue;
         }
+        if unit.name == "b-ui-relay" {
+            out.relay = RelayApplyOutcome::Held;
+        }
         // 回滚该单元本轮写过的文件，再启一次
         let mut restored_a_unit_file = false;
         if let Some(items) = restores.get(&unit.name) {
@@ -619,6 +650,12 @@ pub fn apply(input: ApplyInput<'_>, host: &dyn Host) -> ApplyOutcome {
             ));
         }
     }
+    if held.contains_key("b-ui-relay") {
+        out.relay = RelayApplyOutcome::Held;
+    } else if out.relay != RelayApplyOutcome::Held && out.relay_restarted {
+        out.relay = RelayApplyOutcome::Activated;
+    }
+
     out
 }
 
@@ -995,24 +1032,22 @@ mod tests {
             &NoopInstaller,
         );
         assert!(out.errors.is_empty(), "{:?}", out.errors);
-        assert_eq!(out.changed, vec!["nft table inet bui".to_string()]);
+        assert!(out.changed.is_empty());
+        assert!(
+            out.keys.is_empty(),
+            "sync boundary must not acknowledge nft"
+        );
+        let deferred = out.residential.unwrap();
         assert_eq!(
-            out.keys.get("nft:inet:bui").map(String::as_str),
+            deferred.keys.get("nft:inet:bui").map(String::as_str),
             Some("abc123")
         );
-        assert_eq!(
-            h.stdins(),
-            vec![("nft -f -".to_string(), ruleset.to_string())],
-            "规则集经 stdin 喂进去，一个事务一次调用"
+        assert!(
+            matches!(&deferred.changes[0], Change::ApplyNftTable {ruleset:body,..} if body==ruleset)
         );
         assert!(
-            h.ops()
-                .iter()
-                .filter(|o| o.starts_with("run:nft -f"))
-                .count()
-                == 1,
-            "{:?}",
-            h.ops()
+            h.stdins().is_empty(),
+            "owner alone publishes the selected topology"
         );
     }
 
@@ -1046,8 +1081,12 @@ mod tests {
         );
         assert_eq!(out.changed, Vec::<String>::new());
         assert!(out.keys.is_empty(), "{:?}", out.keys);
-        assert_eq!(out.errors.len(), 1, "{:?}", out.errors);
-        assert!(out.errors[0].contains("Chain of type"), "{:?}", out.errors);
+        assert!(out.errors.is_empty());
+        assert!(
+            out.residential.is_some(),
+            "transaction failure is observed by the async owner"
+        );
+        assert!(h.stdins().is_empty());
     }
 
     /// 缺 `nft`：**不算 apply 失败**（装包不是对账能决定的），但提示必须报出真实量级 ——
@@ -1129,15 +1168,16 @@ mod tests {
         );
         assert!(out.errors.is_empty(), "{:?}", out.errors);
         let ops = h.ops();
-        let x = ops
-            .iter()
-            .position(|o| o == "run:iptables -t nat -X HYSTERIA-PR-7c1e0f2a")
-            .unwrap_or_else(|| panic!("没清掉槽 1 的孤儿链：{ops:?}"));
-        let land = ops
-            .iter()
-            .position(|o| o == "run:nft -f -")
-            .unwrap_or_else(|| panic!("没落地 nft 表：{ops:?}"));
-        assert!(x < land, "清理必须发生在 nft -f 之前：{ops:?}");
+        assert!(
+            ops.iter()
+                .any(|o| o == "run:iptables -t nat -X HYSTERIA-PR-7c1e0f2a"),
+            "old orphan cleanup is retained"
+        );
+        assert!(!ops.iter().any(|o| o == "run:nft -f -"));
+        assert!(
+            out.residential.is_some(),
+            "table is handed to owner after cleanup"
+        );
         assert!(
             out.notes
                 .iter()

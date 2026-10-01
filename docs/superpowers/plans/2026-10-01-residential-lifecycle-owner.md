@@ -52,7 +52,7 @@ assert!(parse_gate_inventory(r#"{"proxies":{"gate-a":{"type":"Selector","all":["
 
 ### Task 2: One residential lifecycle writer and durable completion
 
-**Files:** 新建 `crates/bui/src/residential_lifecycle.rs`（可按 owner/record/lease 分为相邻文件）；修改 `reconcile/apply.rs`、`reconcile/mod.rs`、`serve.rs`、`api/state.rs`、`api/system.rs`、`modules/certs.rs`、`modules/watchdog.rs`、`modules/panel/auth_http.rs`、`commands/install.rs`、`commands/upgrade.rs`、`commands/config.rs`、独立 live `commands/import_v3.rs` 的 lease 边界、`commands/harden_ssh.rs` 与最小 UDS intent route 的单写者边界、`kernels/mod.rs`、Host 最小原子 rename 方法及 RealHost/FakeHost listening probe、对应测试构造器、必要 paths/drift whitelist；`state/runtime.rs` 仅实际 blocking 持久写者的取消安全与 daemon lease 随行。
+**Files:** 新建 `crates/bui/src/residential_lifecycle.rs`（可按 owner/record/lease 分为相邻文件）；修改 `reconcile/apply.rs`、`reconcile/mod.rs`、`serve.rs`、`api/state.rs`、`api/system.rs`、`modules/certs.rs`、`modules/watchdog.rs`、`modules/panel/auth_http.rs`、`commands/install.rs`、`commands/upgrade.rs`、`commands/config.rs`、独立 live `commands/import_v3.rs` 的 lease 边界、`commands/harden_ssh.rs` 与最小 UDS intent route 的单写者边界、`commands/nft.rs` 读取住宅已发布拓扑绑定的最小边界、`kernels/mod.rs`、Host 最小原子 rename 方法及 RealHost/FakeHost listening probe、对应测试构造器、必要 paths/drift whitelist；`state/runtime.rs` 仅实际 blocking 持久写者的取消安全与 daemon lease 随行。
 
 **Interfaces:** 消费 Task 1 的 `GateManifest` 与 `restore_and_verify`。住宅专用 owner 共享给 daemon/app/module；apply 提供待激活住宅动作、候选 keys 与可回滚文件，不自行确认这些 keys。操作来源枚举区分 reconcile/manual/watchdog/certificate/recovery。进程间 lease 持有范围覆盖整个控制写者，prestart 例外；活跃 receipt 包含 requested_config_sha、操作 ID、授权摘要与前后相同的观察实例。
 
@@ -63,7 +63,7 @@ assert!(parse_gate_inventory(r#"{"proxies":{"gate-a":{"type":"Selector","all":["
 - [x] `harden-ssh` 在线经最小 UDS intent 交同一控制写者，离线读取写入依据前持有控制 lease；UDS 不通且 lease busy 则拒绝。保留原加固行为；SSH-only apply 关闭住宅网络清理，并覆盖同路径写入竞争及正常在线使用测试。
 - [x] 首装缺证书且住宅未部署/启动时明确 awaiting_certificate/pending，允许必需 Caddy/bootstrap/handoff 前置继续，住宅配置完成校验后才发布、确认 active/keys。普通校验故障不得降成待证书，共享 binary 失败不能导致 relay 使用不一致候选。
 - [x] 共享 binary 的 relay 手动服务动作与 watchdog restart 通过同一资源 guard，保留既有归因与广播；用持锁竞争测试证明不会提前执行，不新增住宅屏障或 generation 行为。
-- [x] watchdog 的单步 check_nft 在取得资源 guard 后读取最新 State 并执行既有比对/重放；排队中 State 变更测试验证使用新拓扑。规则正文不改、不包整个 watchdog，prestart nft 子步骤保持免重入。
+- [x] watchdog 的单步 check_nft 在资源 guard 后取得最新 State 与 owner 的已发布住宅绑定，执行既有比对/重放；apply 与 prestart 读取同一绑定，候选 hold/pending 不提前重写旧表。previous/target 严格 prepared 后再发布，新 prepared 前优先消费既有未完成操作且不覆写 Unknown/foreign 证据，恢复旧配置前恢复旧绑定并验证表/监听，后续 watchdog 仍保持旧端口；仅 hop/compat 变化也触发完整发布，未知绑定 fail closed。排队中 State 变更、changed-port 失败恢复和各绑定发布中断测试使用实际规则 payload；规则正文和 healthy no-write 不变，不包整个 watchdog，prestart 保持免 lease 重入。
 - [x] 在较长的 startup reconcile/住宅barrier前，fresh鉴权snapshot并实际bind独立AuthHttp listener确认成功；测试住宅屏障未完成时native auth仍可响应。RealHost必要proc监听表读取错误保留为Unknown而非空集合；测试读取故障不累计restart证据，不增加平台兼容工作。
 - [x] 跑新用例及完整 `cargo test --workspace --locked`、`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets --locked -- -D warnings`。实际失败修复后再重跑覆盖范围，不无限复测。
 - [x] 更新接口/实施说明与 report，记录已证实的保证和外部边界；detect_changes 后作任务提交。

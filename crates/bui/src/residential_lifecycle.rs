@@ -72,6 +72,7 @@ pub fn is_residential_change(c: &Change, paths: &Paths) -> bool {
         Change::WriteUnit { unit, .. } => unit.name == UNIT,
         Change::SetUnitState { unit, .. } => unit == UNIT,
         Change::InstallBinary { name, .. } => name == "sing-box",
+        Change::ApplyNftTable { family, name, .. } => family == "inet" && name == "bui",
         _ => false,
     }
 }
@@ -91,6 +92,104 @@ pub struct Published {
     config: Vec<u8>,
     pub action: Action,
     pub binary_changed: bool,
+    pub validated_relay_sha: Option<String>,
+    kind: PublicationKind,
+}
+#[derive(Clone, Copy)]
+enum PublicationKind {
+    Replacement,
+    RepairOnly,
+    Certificate,
+}
+enum CandidateBinding<'a> {
+    Desired,
+    Saved(&'a str),
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SavedConfiguration {
+    path: PathBuf,
+    sha256: String,
+}
+
+/// Only the inputs of the existing residential nft renderer, bound to live config.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopologyBinding {
+    config_sha: String,
+    listen_port: u16,
+    hop_range: (u16, u16),
+    compat: bool,
+}
+impl TopologyBinding {
+    fn from_state(s: &bui_schema::model::State, config: &[u8]) -> Self {
+        Self {
+            config_sha: crate::kernels::sha256_hex(config),
+            listen_port: s.node.ports.hy2_resi,
+            hop_range: s.node.ports.hy2_resi_hop,
+            compat: s.system.hy2_resi_compat_ports,
+        }
+    }
+    fn project(&self, s: &mut bui_schema::model::State) {
+        s.node.ports.hy2_resi = self.listen_port;
+        s.node.ports.hy2_resi_hop = self.hop_range;
+        s.system.hy2_resi_compat_ports = self.compat;
+    }
+    fn rules(&self, s: &bui_schema::model::State) -> String {
+        let mut projected = s.clone();
+        self.project(&mut projected);
+        bui_schema::render::nft::ruleset(&projected.node.ports, self.compat)
+    }
+}
+fn read_binding(base: &Path) -> Result<Option<TopologyBinding>> {
+    match std::fs::read(base.join(".residential-lifecycle/topology.json")) {
+        Ok(bytes) => {
+            let b: TopologyBinding =
+                serde_json::from_slice(&bytes).context("invalid applied residential topology")?;
+            anyhow::ensure!(
+                b.listen_port > 0
+                    && b.hop_range.0 > 0
+                    && b.hop_range.0 <= b.hop_range.1
+                    && b.config_sha.len() == 64
+                    && b.config_sha.bytes().all(|c| c.is_ascii_hexdigit()),
+                "invalid applied residential topology fields"
+            );
+            Ok(Some(b))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+/// ExecStartPre and watchdog use the durable owner-selected target. A corrupt
+/// binding is Unknown; only absence permits bootstrap from State.
+pub fn project_applied(base: &Path, s: &mut bui_schema::model::State) -> Result<()> {
+    if let Some(b) = read_binding(base)? {
+        b.project(s);
+    }
+    Ok(())
+}
+fn verify_table(host: &dyn Host, rules: &str) -> Result<()> {
+    let out = host.run("nft", &["list", "table", "inet", "bui"])?;
+    anyhow::ensure!(
+        out.ok()
+            && crate::modules::watchdog::redirect_rules(&out.stdout)
+                == crate::modules::watchdog::redirect_rules(rules),
+        "residential nft topology readback failed"
+    );
+    Ok(())
+}
+fn ensure_table(host: &dyn Host, rules: &str) -> Result<()> {
+    if verify_table(host, rules).is_ok() {
+        return Ok(());
+    }
+    anyhow::ensure!(host.which("nft"), "residential nft binary missing");
+    anyhow::ensure!(
+        host.run_stdin("nft", &["-c", "-f", "-"], rules)?.ok(),
+        "residential nft precheck failed"
+    );
+    anyhow::ensure!(
+        host.run_stdin("nft", &["-f", "-"], rules)?.ok(),
+        "residential nft publication failed"
+    );
+    verify_table(host, rules)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -202,6 +301,22 @@ pub struct Receipt {
     pub cert_sha: Option<String>,
     pub relay_recovery_confirmed: Option<bool>,
     backups: Vec<Backup>,
+    #[serde(default)]
+    saved_config: Option<SavedConfiguration>,
+    #[serde(default)]
+    pub rejected_config_sha: Option<String>,
+    #[serde(default)]
+    previous_relay_active: Option<bool>,
+    #[serde(default)]
+    previous_topology: Option<TopologyBinding>,
+    #[serde(default)]
+    previous_binding_present: bool,
+    #[serde(default)]
+    target_topology: Option<TopologyBinding>,
+    #[serde(default)]
+    replacement: bool,
+    #[serde(default)]
+    certificate_pair_published: bool,
 }
 
 pub struct Lifecycle {
@@ -275,6 +390,7 @@ impl Lifecycle {
     }
     pub async fn repair(self: &Arc<Self>, ctx: DaemonCtx) -> Result<Option<Receipt>> {
         self.execute(move |tx| async move {
+            tx.recover_pending(&ctx).await?;
             if maintenance(&ctx)? {
                 return Ok(None);
             }
@@ -296,9 +412,11 @@ impl Lifecycle {
         port: u16,
     ) -> Result<bool> {
         self.execute(move |tx| async move {
+            tx.recover_pending(&ctx).await?;
             if maintenance(&ctx)? {
                 return Ok(false);
             }
+            let port = read_binding(ctx.store.directory())?.map_or(port, |b| b.listen_port);
             let host = ctx.host.clone();
             let needs = tokio::task::spawn_blocking(move || -> Result<bool> {
                 Ok(matches!(observe(host.as_ref())?, Observation::Running(_))
@@ -323,6 +441,7 @@ pub fn config_bytes(s: &bui_schema::model::State, paths: &Paths) -> Result<Vec<u
 }
 fn topology(s: &bui_schema::model::State, paths: &Paths) -> Result<String> {
     let mut bytes = config_bytes(s, paths)?;
+    bytes.extend_from_slice(&serde_json::to_vec(&s.node.ports.hy2_resi_hop)?);
     bytes.extend_from_slice(if s.system.hy2_resi_compat_ports {
         b"compat:on"
     } else {
@@ -357,11 +476,26 @@ pub fn read_record(ctx: &DaemonCtx) -> Result<Option<Receipt>> {
 pub fn maintenance(ctx: &DaemonCtx) -> Result<bool> {
     Ok(read_record(ctx)?.is_some_and(|r| r.maintenance))
 }
+fn save_configuration(
+    ctx: &DaemonCtx,
+    directory: &Path,
+    bytes: &[u8],
+) -> Result<SavedConfiguration> {
+    let path = directory.join("previous-config.json");
+    ctx.host.write_file(&path, bytes, 0o600)?;
+    ctx.host.sync_parent(&path)?;
+    Ok(SavedConfiguration {
+        path,
+        sha256: crate::kernels::sha256_hex(bytes),
+    })
+}
 fn persist(ctx: &DaemonCtx, r: &Receipt) -> Result<()> {
+    persist_metadata(&directory(ctx), "record.json", r)
+}
+fn persist_metadata(dir: &Path, name: &str, value: &impl Serialize) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    let dir = directory(ctx);
-    private_dir(&dir)?;
+    private_dir(dir)?;
     let path = dir.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
     let result = (|| -> Result<()> {
         let mut f = std::fs::OpenOptions::new()
@@ -369,10 +503,10 @@ fn persist(ctx: &DaemonCtx, r: &Receipt) -> Result<()> {
             .create_new(true)
             .mode(0o600)
             .open(&path)?;
-        f.write_all(&serde_json::to_vec_pretty(r)?)?;
+        f.write_all(&serde_json::to_vec_pretty(value)?)?;
         f.sync_all()?;
-        std::fs::rename(&path, dir.join("record.json"))?;
-        std::fs::File::open(&dir)?.sync_all()?;
+        std::fs::rename(&path, dir.join(name))?;
+        std::fs::File::open(dir)?.sync_all()?;
         Ok(())
     })();
     if result.is_err() {
@@ -420,12 +554,80 @@ impl Transaction {
         Ok(out)
     }
 
+    pub async fn recover_pending(&self, ctx: &DaemonCtx) -> Result<()> {
+        if let Some(mut r) = read_record(ctx)? {
+            if r.maintenance
+                && matches!(r.source, Source::Manual)
+                && r.phase != "stopped"
+                && !r.replacement
+            {
+                systemd(ctx, "stop").await?;
+                anyhow::ensure!(
+                    matches!(
+                        observe_async(ctx).await?,
+                        Observation::Stopped | Observation::Undeployed
+                    ),
+                    "interrupted stop not confirmed"
+                );
+                r.phase = "stopped".into();
+                persist(ctx, &r)?;
+            }
+            if (r.replacement
+                || (matches!(r.source, Source::Certificate) && !r.certificate_pair_published))
+                && !matches!(
+                    r.phase.as_str(),
+                    "active" | "recovered" | "stopped" | "failed"
+                )
+            {
+                let binding = read_binding(ctx.store.directory())?;
+                let inferred_absence = binding.is_none() && !r.previous_binding_present;
+                anyhow::ensure!(
+                    binding == r.previous_topology
+                        || binding == r.target_topology
+                        || inferred_absence,
+                    "foreign or missing topology prevents interrupted recovery"
+                );
+                for backup in &r.backups {
+                    let current = ctx.host.file_sha256(&backup.path)?;
+                    let moved_binary = current.is_none()
+                        && backup.path == ctx.paths.bin_dir.join("sing-box")
+                        && backup.previous.as_ref().is_some_and(|p| {
+                            ctx.host.file_sha256(p).ok().flatten() == backup.previous_sha
+                        });
+                    anyhow::ensure!(
+                        current == backup.previous_sha
+                            || current == backup.published_sha
+                            || moved_binary,
+                        "foreign file prevents interrupted recovery"
+                    );
+                }
+                self.rollback(
+                    ctx,
+                    &mut r,
+                    anyhow::anyhow!("interrupted residential replacement"),
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn publish(
         &self,
         ctx: &DaemonCtx,
         work: Deferred,
         candidate: Option<Candidate>,
     ) -> Result<Published> {
+        self.publish_with_relay(ctx, work, candidate, None).await
+    }
+    pub async fn publish_with_relay(
+        &self,
+        ctx: &DaemonCtx,
+        work: Deferred,
+        candidate: Option<Candidate>,
+        relay_config: Option<Vec<u8>>,
+    ) -> Result<Published> {
+        self.recover_pending(ctx).await?;
         let desired = ctx.store.read().await;
         let config = work
             .changes
@@ -452,6 +654,31 @@ impl Transaction {
                 &ctx.paths,
             ))?;
         let already_published = live_config.as_deref() == Some(config.as_slice());
+        let target = TopologyBinding::from_state(&desired, &config);
+        let old_binding = if let Some(old) = &live_config {
+            let existing = read_binding(ctx.store.directory())?;
+            let b = match existing {
+                Some(b) => {
+                    anyhow::ensure!(
+                        b.config_sha == crate::kernels::sha256_hex(old),
+                        "applied topology/config mismatch"
+                    );
+                    b
+                }
+                None => {
+                    anyhow::ensure!(
+                        already_published,
+                        "cannot infer previous topology from changed desired state"
+                    );
+                    verify_table(ctx.host.as_ref(), &target.rules(&desired))?;
+                    target.clone()
+                }
+            };
+            Some(b)
+        } else {
+            None
+        };
+        let topology_changed = old_binding.as_ref() != Some(&target);
         if live_config.is_none()
             && matches!(observed, Ok(Observation::Stopped | Observation::Undeployed))
         {
@@ -477,11 +704,41 @@ impl Transaction {
                 return Err(AwaitingCertificate.into());
             }
         }
+        if !topology_changed
+            && candidate.is_none()
+            && work
+                .changes
+                .iter()
+                .all(|c| matches!(c, Change::ApplyNftTable { .. }))
+        {
+            let mut r = self
+                .prepared(ctx, Source::Reconcile, &config, was_maintenance)
+                .await?;
+            r.pending_keys = work.keys;
+            r.previous_topology = old_binding;
+            r.target_topology = Some(target.clone());
+            persist(ctx, &r)?;
+            if read_binding(ctx.store.directory())?.is_none() {
+                persist_metadata(&directory(ctx), "topology.json", &target)?;
+            }
+            return Ok(Published {
+                receipt: r,
+                config,
+                action: if was_maintenance {
+                    Action::Stop
+                } else {
+                    Action::Observe
+                },
+                binary_changed: false,
+                validated_relay_sha: None,
+                kind: PublicationKind::RepairOnly,
+            });
+        }
         // A prior failed gate check does not require another restart of this same instance.
         let repair_only = already_published && prior.as_ref().is_some_and(|r| {
             r.requested_config_sha == crate::kernels::sha256_hex(&config)
                 && matches!(&observed, Ok(Observation::Running(i)) if r.after.as_ref() == Some(i))
-        }) && candidate.is_none();
+        }) && candidate.is_none() && !topology_changed;
         let mut r = self
             .prepared(ctx, Source::Reconcile, &config, was_maintenance)
             .await?;
@@ -512,7 +769,7 @@ impl Transaction {
                     enable = Some(enabled);
                     stop |= !active;
                 }
-                Change::InstallBinary { .. } => {}
+                Change::InstallBinary { .. } | Change::ApplyNftTable { .. } => {}
                 _ => anyhow::bail!("unsupported residential publication change"),
             }
         }
@@ -525,14 +782,35 @@ impl Transaction {
             .as_ref()
             .map(|c| c.path.clone())
             .unwrap_or_else(|| ctx.paths.bin_dir.join("sing-box"));
+        let relay_path = ctx.paths.base_dir.join("singbox-relay.json");
+        let relay = if candidate.is_some() {
+            Some(match relay_config {
+                Some(bytes) => bytes,
+                None => ctx
+                    .host
+                    .read_file(&relay_path)?
+                    .context("shared binary requires a relay configuration")?,
+            })
+        } else {
+            None
+        };
+        let validated_relay_sha = relay
+            .as_ref()
+            .map(|bytes| crate::kernels::sha256_hex(bytes));
+        let relay_check = relay.clone();
+        let relay_verify = op_dir.join("candidate-relay.json");
         let config2 = config.clone();
         let validated = tokio::task::spawn_blocking(move || -> Result<()> {
-            host.write_file(&verify, &config2, 0o600)?;
-            let out = host.run(
-                &bin.display().to_string(),
-                &["check", "-c", &verify.display().to_string()],
-            )?;
-            anyhow::ensure!(out.ok(), "residential candidate validation failed");
+            for (path, bytes) in std::iter::once((verify, config2))
+                .chain(relay_check.map(|bytes| (relay_verify, bytes)))
+            {
+                host.write_file(&path, &bytes, 0o600)?;
+                let out = host.run(
+                    &bin.display().to_string(),
+                    &["check", "-c", &path.display().to_string()],
+                )?;
+                anyhow::ensure!(out.ok(), "shared sing-box candidate validation failed");
+            }
             Ok(())
         })
         .await?;
@@ -541,6 +819,12 @@ impl Transaction {
             r.error = Some(crate::redact::url_credentials(&error.to_string()));
             persist(ctx, &r)?;
             return Err(error);
+        }
+        if let Some(old) = &live_config {
+            r.saved_config = Some(save_configuration(ctx, &op_dir, old)?);
+        }
+        if binary_changed {
+            r.previous_relay_active = Some(ctx.host.unit_is_active("b-ui-relay")?);
         }
         for (index, (path, content, mode)) in writes.iter().enumerate() {
             let previous = if let Some(old) = ctx.host.read_file(path)? {
@@ -557,6 +841,24 @@ impl Transaction {
                 previous_sha: ctx.host.file_sha256(path)?,
                 published_sha: Some(crate::kernels::sha256_hex(content)),
                 mode: *mode,
+            });
+        }
+        if let Some(bytes) = &relay {
+            let previous_sha = ctx.host.file_sha256(&relay_path)?;
+            let previous = if let Some(old) = ctx.host.read_file(&relay_path)? {
+                let backup = op_dir.join("previous-relay.json");
+                ctx.host.write_file(&backup, &old, 0o600)?;
+                ctx.host.sync_parent(&backup)?;
+                Some(backup)
+            } else {
+                None
+            };
+            r.backups.push(Backup {
+                path: relay_path,
+                previous,
+                previous_sha,
+                published_sha: Some(crate::kernels::sha256_hex(bytes)),
+                mode: 0o600,
             });
         }
         if let Some(c) = &candidate {
@@ -580,15 +882,14 @@ impl Transaction {
                 mode: 0o755,
             });
         }
+        r.previous_binding_present = read_binding(ctx.store.directory())?.is_some();
+        r.previous_topology = old_binding;
+        r.target_topology = Some(target.clone());
+        r.replacement = restart || topology_changed;
         std::fs::File::open(&op_dir)?.sync_all()?;
         persist(ctx, &r)?; // write ahead before any live file mutation
         let publish = (|| -> Result<()> {
-            if let Some(enabled) = enable {
-                let out = ctx
-                    .host
-                    .systemd(if enabled { "enable" } else { "disable" }, UNIT)?;
-                anyhow::ensure!(out.ok(), "residential unit enablement failed");
-            }
+            persist_metadata(&directory(ctx), "topology.json", &target)?;
             if let Some(c) = candidate {
                 let live = ctx.paths.bin_dir.join("sing-box");
                 if let Some(previous) = r.backups.last().and_then(|b| b.previous.as_ref()) {
@@ -606,6 +907,12 @@ impl Transaction {
                 .any(|(p, _, _)| p.starts_with("/etc/systemd/system"))
             {
                 ctx.host.systemd_daemon_reload()?;
+            }
+            if let Some(enabled) = enable {
+                let out = ctx
+                    .host
+                    .systemd(if enabled { "enable" } else { "disable" }, UNIT)?;
+                anyhow::ensure!(out.ok(), "residential unit enablement failed");
             }
             Ok(())
         })();
@@ -632,6 +939,12 @@ impl Transaction {
             config,
             action,
             binary_changed,
+            validated_relay_sha,
+            kind: if restart || topology_changed {
+                PublicationKind::Replacement
+            } else {
+                PublicationKind::RepairOnly
+            },
         })
     }
     pub async fn publish_certificate(
@@ -641,6 +954,7 @@ impl Transaction {
         key: Vec<u8>,
         sha: String,
     ) -> Result<Published> {
+        self.recover_pending(ctx).await?;
         let config = ctx
             .host
             .read_file(&crate::modules::core_files::hy2_resi_config_path(
@@ -651,8 +965,27 @@ impl Transaction {
             .prepared(ctx, Source::Certificate, &config, maintenance(ctx)?)
             .await?;
         receipt.cert_sha = Some(sha);
+        if receipt.target_topology.is_none() && receipt.previous_instance.is_some() {
+            let state = ctx.store.read().await;
+            anyhow::ensure!(
+                config == config_bytes(&state, &ctx.paths)?,
+                "certificate candidate has no verified applied topology"
+            );
+            let old = TopologyBinding::from_state(&state, &config);
+            verify_table(ctx.host.as_ref(), &old.rules(&state))?;
+            receipt.previous_topology = Some(old.clone());
+            receipt.target_topology = Some(old);
+        }
         let dir = directory(ctx).join(&receipt.operation_id);
         private_dir(&dir)?;
+        if let Some(old) = ctx
+            .host
+            .read_file(&crate::modules::core_files::hy2_resi_config_path(
+                &ctx.paths,
+            ))?
+        {
+            receipt.saved_config = Some(save_configuration(ctx, &dir, &old)?);
+        }
         let files = [
             (ctx.paths.certs_dir.join("fullchain.pem"), cert, 0o644),
             (ctx.paths.certs_dir.join("privkey.pem"), key, 0o600),
@@ -676,6 +1009,9 @@ impl Transaction {
             });
         }
         persist(ctx, &receipt)?;
+        if let Some(target) = &receipt.target_topology {
+            persist_metadata(&directory(ctx), "topology.json", target)?;
+        }
         for (path, bytes, mode) in files {
             if let Err(error) = ctx
                 .host
@@ -688,11 +1024,15 @@ impl Transaction {
                     .expect_err("failed certificate publication"));
             }
         }
+        receipt.certificate_pair_published = true;
+        persist(ctx, &receipt)?;
         Ok(Published {
             receipt,
             config,
             action: Action::Observe,
             binary_changed: false,
+            validated_relay_sha: None,
+            kind: PublicationKind::Certificate,
         })
     }
 
@@ -724,22 +1064,29 @@ impl Transaction {
 
     pub async fn complete(&self, ctx: &DaemonCtx, mut published: Published) -> Result<Receipt> {
         let r = &mut published.receipt;
-        if matches!(published.action, Action::Stop) {
-            systemd(ctx, "stop").await?;
-            anyhow::ensure!(
-                observe_async(ctx).await? == Observation::Stopped,
-                "stop not observed"
-            );
-            r.phase = "stopped".into();
-            persist(ctx, r)?;
-            return Ok(published.receipt);
-        }
-        match self
-            .finish(ctx, r, &published.config, published.action)
+        let result = if matches!(published.action, Action::Stop) {
+            async {
+                systemd(ctx, "stop").await?;
+                anyhow::ensure!(
+                    matches!(
+                        observe_async(ctx).await?,
+                        Observation::Stopped | Observation::Undeployed
+                    ),
+                    "stop not observed"
+                );
+                r.phase = "stopped".into();
+                persist(ctx, r)
+            }
             .await
-        {
+        } else {
+            self.finish(ctx, r, &published.config, published.action)
+                .await
+        };
+        match result {
             Ok(()) => Ok(published.receipt),
-            Err(e) if r.phase == "activating" => self.rollback(ctx, r, e).await,
+            Err(e) if matches!(published.kind, PublicationKind::Replacement) => {
+                self.rollback(ctx, r, e).await
+            }
             Err(e) => {
                 r.phase = "repair_required".into();
                 r.error = Some(crate::redact::url_credentials(&e.to_string()));
@@ -748,6 +1095,7 @@ impl Transaction {
             }
         }
     }
+
     async fn prepared(
         &self,
         ctx: &DaemonCtx,
@@ -775,6 +1123,14 @@ impl Transaction {
             cert_sha: None,
             relay_recovery_confirmed: None,
             backups: Vec::new(),
+            saved_config: None,
+            rejected_config_sha: None,
+            previous_relay_active: None,
+            previous_topology: read_binding(ctx.store.directory())?,
+            previous_binding_present: read_binding(ctx.store.directory())?.is_some(),
+            target_topology: read_binding(ctx.store.directory())?,
+            replacement: false,
+            certificate_pair_published: false,
         })
     }
     pub async fn activate(
@@ -795,6 +1151,8 @@ impl Transaction {
             }
             None => anyhow::bail!("residential configuration missing"),
         };
+        self.recover_pending(ctx).await?;
+        let recovered = read_record(ctx)?.and_then(|old| old.rejected_config_sha);
         let explicit = matches!(source, Source::Manual);
         anyhow::ensure!(
             explicit || !maintenance(ctx)?,
@@ -804,6 +1162,7 @@ impl Transaction {
             .prepared(ctx, source, &config, matches!(action, Action::Stop))
             .await?;
         r.cert_sha = cert_sha;
+        r.rejected_config_sha = recovered.clone();
         persist(ctx, &r)?;
         if matches!(action, Action::Stop) {
             let result = async {
@@ -824,7 +1183,20 @@ impl Transaction {
             }
             return Ok(r);
         }
-        if let Err(e) = self.finish(ctx, &mut r, &config, action).await {
+        let saved_sha = r
+            .target_topology
+            .as_ref()
+            .filter(|b| b.config_sha == crate::kernels::sha256_hex(&config))
+            .map(|b| b.config_sha.clone());
+        let mode = if recovered.is_some() {
+            saved_sha
+                .as_deref()
+                .map(CandidateBinding::Saved)
+                .unwrap_or(CandidateBinding::Desired)
+        } else {
+            CandidateBinding::Desired
+        };
+        if let Err(e) = self.finish_bound(ctx, &mut r, &config, action, mode).await {
             r.phase = "repair_required".into();
             r.error = Some(crate::redact::url_credentials(&e.to_string()));
             persist(ctx, &r)?;
@@ -839,15 +1211,67 @@ impl Transaction {
         config: &[u8],
         action: Action,
     ) -> Result<()> {
+        self.finish_bound(ctx, r, config, action, CandidateBinding::Desired)
+            .await
+    }
+    async fn finish_bound(
+        &self,
+        ctx: &DaemonCtx,
+        r: &mut Receipt,
+        config: &[u8],
+        action: Action,
+        binding: CandidateBinding<'_>,
+    ) -> Result<()> {
         let current = ctx.store.read().await;
+        let target = match &r.target_topology {
+            Some(b) => b.clone(),
+            None => {
+                anyhow::ensure!(
+                    matches!(binding, CandidateBinding::Desired)
+                        && config == config_bytes(&current, &ctx.paths)?,
+                    "unbound live candidate cannot be adopted"
+                );
+                let b = TopologyBinding::from_state(&current, config);
+                verify_table(ctx.host.as_ref(), &b.rules(&current))?;
+                r.target_topology = Some(b.clone());
+                persist(ctx, r)?;
+                persist_metadata(&directory(ctx), "topology.json", &b)?;
+                b
+            }
+        };
         anyhow::ensure!(
-            config == config_bytes(&current, &ctx.paths)?,
-            "live residential candidate differs from current desired topology"
+            target.config_sha == crate::kernels::sha256_hex(config),
+            "topology binding config mismatch"
         );
+        match binding {
+            CandidateBinding::Desired => anyhow::ensure!(
+                config == config_bytes(&current, &ctx.paths)?
+                    && target == TopologyBinding::from_state(&current, config),
+                "live residential candidate differs from current desired topology"
+            ),
+            CandidateBinding::Saved(sha) => anyhow::ensure!(
+                crate::kernels::sha256_hex(config) == sha,
+                "saved recovery candidate digest mismatch"
+            ),
+        }
         anyhow::ensure!(
             r.topology_sha == topology(&current, &ctx.paths)?,
             "residential topology superseded before activation"
         );
+        if matches!(binding, CandidateBinding::Saved(_)) {
+            let out = ctx.host.run(
+                &ctx.paths.bin_dir.join("sing-box").display().to_string(),
+                &[
+                    "check",
+                    "-c",
+                    &crate::modules::core_files::hy2_resi_config_path(&ctx.paths)
+                        .display()
+                        .to_string(),
+                ],
+            )?;
+            anyhow::ensure!(out.ok(), "saved candidate validation failed");
+        }
+        ensure_table(ctx.host.as_ref(), &target.rules(&current))?;
         r.phase = "activating".into();
         persist(ctx, r)?;
         match action {
@@ -886,6 +1310,10 @@ impl Transaction {
             "candidate residential UDP listener is ambiguous"
         );
         let expected_port = ports[0];
+        anyhow::ensure!(
+            expected_port == target.listen_port,
+            "applied topology/listener mismatch"
+        );
         let host = ctx.host.clone();
         let listening = tokio::time::timeout_at(
             deadline,
@@ -917,10 +1345,20 @@ impl Transaction {
                 == Some(r.requested_config_sha.as_str()),
             "published residential file drifted during activation"
         );
+        anyhow::ensure!(
+            read_binding(ctx.store.directory())?.as_ref() == Some(&target),
+            "applied topology binding drifted during activation"
+        );
+        verify_table(ctx.host.as_ref(), &target.rules(&current))?;
         permit.validate_or_close(ctx.host.now(), deadline).await?;
         r.authorization_sha = Some(permit.projection_sha256().to_owned());
         r.gate_count = manifest.gates().len();
-        r.phase = "active".into();
+        r.phase = if matches!(binding, CandidateBinding::Desired) {
+            "active"
+        } else {
+            "recovered"
+        }
+        .into();
         r.error = None;
         persist(ctx, r)?;
         // Time is not frozen by the Store fence. Expiry across the fsync also
@@ -931,9 +1369,11 @@ impl Transaction {
             persist(ctx, r)?;
             return Err(e);
         }
-        ctx.runtime
-            .update(|rt| rt.restart_keys.extend(r.pending_keys.clone()))
-            .await;
+        if matches!(binding, CandidateBinding::Desired) {
+            ctx.runtime
+                .update(|rt| rt.restart_keys.extend(r.pending_keys.clone()))
+                .await;
+        }
         drop(permit);
         Ok(())
     }
@@ -943,9 +1383,16 @@ impl Transaction {
         r: &mut Receipt,
         original: anyhow::Error,
     ) -> Result<Receipt> {
+        let binding = read_binding(ctx.store.directory())?;
+        anyhow::ensure!(
+            binding == r.previous_topology
+                || binding == r.target_topology
+                || (binding.is_none() && !r.previous_binding_present),
+            "foreign or missing binding prevents rollback"
+        );
         r.phase = "recovery_required".into();
         r.error = Some(crate::redact::url_credentials(&original.to_string()));
-        persist(ctx, r)?;
+        let mut journal_error = persist(ctx, r).err();
         for backup in r.backups.iter().rev() {
             let current = ctx.host.file_sha256(&backup.path)?;
             if current == backup.previous_sha {
@@ -983,45 +1430,108 @@ impl Transaction {
             .any(|b| b.path == ctx.paths.bin_dir.join("sing-box"))
         {
             let host = ctx.host.clone();
+            let should_run = r.previous_relay_active.unwrap_or(true);
+            let relay_binary = ctx.paths.bin_dir.join("sing-box");
+            let relay_config = ctx.paths.base_dir.join("singbox-relay.json");
             let recovered = tokio::task::spawn_blocking(move || -> Result<bool> {
-                Ok(host.systemd("restart", "b-ui-relay")?.ok()
-                    && host.unit_is_active("b-ui-relay")?)
+                if should_run {
+                    anyhow::ensure!(
+                        host.run(
+                            &relay_binary.display().to_string(),
+                            &["check", "-c", &relay_config.display().to_string()]
+                        )?
+                        .ok(),
+                        "saved relay candidate validation failed"
+                    );
+                }
+                Ok(host
+                    .systemd(if should_run { "restart" } else { "stop" }, "b-ui-relay")?
+                    .ok()
+                    && host.unit_is_active("b-ui-relay")? == should_run)
             })
             .await?;
             r.relay_recovery_confirmed = Some(recovered.unwrap_or(false));
-            persist(ctx, r)?;
+            if let Err(error) = persist(ctx, r) {
+                journal_error = Some(error);
+            }
             anyhow::ensure!(
                 r.relay_recovery_confirmed == Some(true),
                 "shared binary rollback could not confirm relay recovery"
             );
         }
-        if let Some(config) =
-            ctx.host
-                .read_file(&crate::modules::core_files::hy2_resi_config_path(
-                    &ctx.paths,
-                ))?
-        {
-            let mut previous = self.prepared(ctx, Source::Recovery, &config, false).await?;
-            previous.pending_keys.clear();
-            previous.relay_recovery_confirmed = r.relay_recovery_confirmed;
-            match self
-                .finish(ctx, &mut previous, &config, Action::Restart)
-                .await
-            {
-                Ok(()) => {
-                    previous.error = Some(crate::redact::url_credentials(&format!(
-                        "candidate rejected; previous configuration recovered: {original}"
-                    )));
-                    persist(ctx, &previous)?;
-                }
-                Err(e) => {
-                    previous.phase = "recovery_required".into();
-                    previous.error = Some(crate::redact::url_credentials(&format!(
-                        "candidate: {original}; rollback: {e}"
-                    )));
-                    persist(ctx, &previous)?;
-                }
+        let mut previous = r.clone();
+        previous.source = Source::Recovery;
+        previous.replacement = false;
+        previous.target_topology = r.previous_topology.clone();
+        previous.pending_keys.clear();
+        previous.rejected_config_sha = Some(r.requested_config_sha.clone());
+        previous.before = None;
+        previous.after = None;
+        previous.authorization_sha = None;
+        previous.topology_sha = topology(ctx.store.read().await.as_ref(), &ctx.paths)?;
+        let restored = async {
+            if let Some(old) = &r.previous_topology {
+                persist_metadata(&directory(ctx), "topology.json", old)?;
+                ensure_table(ctx.host.as_ref(), &old.rules(&*ctx.store.read().await))?;
+            } else {
+                anyhow::ensure!(
+                    r.saved_config.is_none(),
+                    "previous residential topology is unknown"
+                );
             }
+            let saved = r.saved_config.as_ref();
+            if r.maintenance || r.previous_instance.is_none() || saved.is_none() {
+                systemd(ctx, "stop").await?;
+                anyhow::ensure!(
+                    matches!(
+                        observe_async(ctx).await?,
+                        Observation::Stopped | Observation::Undeployed
+                    ),
+                    "previous stopped intent not restored"
+                );
+                previous.phase = if saved.is_some() { "stopped" } else { "failed" }.into();
+                return Ok(());
+            }
+            let saved = saved.expect("checked saved candidate");
+            let config = ctx
+                .host
+                .read_file(&saved.path)?
+                .context("saved recovery config missing")?;
+            anyhow::ensure!(
+                crate::kernels::sha256_hex(&config) == saved.sha256,
+                "saved recovery config changed"
+            );
+            previous.requested_config_sha = saved.sha256.clone();
+            previous.gate_count = gates::GateManifest::from_config(&config)?.gates().len();
+            self.finish_bound(
+                ctx,
+                &mut previous,
+                &config,
+                Action::Restart,
+                CandidateBinding::Saved(&saved.sha256),
+            )
+            .await
+        }
+        .await;
+        match restored {
+            Ok(()) => {
+                previous.error = Some(crate::redact::url_credentials(&format!(
+                    "candidate rejected; previous intent recovered: {original}"
+                )))
+            }
+            Err(error) => {
+                previous = r.clone();
+                previous.phase = "recovery_required".into();
+                previous.error = Some(crate::redact::url_credentials(&format!(
+                    "candidate: {original}; rollback: {error}"
+                )));
+            }
+        }
+        if let Err(error) = persist(ctx, &previous) {
+            journal_error = Some(error);
+        }
+        if let Some(error) = journal_error {
+            return Err(error.context("candidate rejected; recovery journal unavailable"));
         }
         Err(original)
     }
@@ -1045,11 +1555,17 @@ mod tests {
         bui_schema::hy2pool::grow(&mut state.residential.hy2_pool, 32, &Default::default());
         let host = Arc::new(FakeHost::new());
         host.with(|i| {
+            i.which.insert("nft".into());
+            i.nft_table = Some(bui_schema::render::nft::ruleset(
+                &state.node.ports,
+                state.system.hy2_resi_compat_ports,
+            ));
             i.instances.insert(format!("{UNIT}.service"), 1);
             i.stock_singbox = true;
             i.listening
                 .insert(Proto::Udp, [40000].into_iter().collect());
             i.units_active.insert(format!("{UNIT}.service"));
+            i.units_active.insert("b-ui-relay.service".into());
         });
         host.write_file(
             &crate::modules::core_files::hy2_resi_config_path(&paths),
@@ -1057,6 +1573,8 @@ mod tests {
             0o600,
         )
         .unwrap();
+        host.write_file(&paths.base_dir.join("singbox-relay.json"), b"{}", 0o600)
+            .unwrap();
         let fake = FakeHy2Resi::new();
         let shared = Arc::new(
             Shared::new(Box::new(FakeXray::new()), Box::new(FakeHy2::new()))
@@ -1072,6 +1590,15 @@ mod tests {
             paths,
         };
         ctx.bus.bind_residential(shared);
+        persist_metadata(
+            &directory(&ctx),
+            "topology.json",
+            &TopologyBinding::from_state(
+                &*ctx.store.read().await,
+                &config_bytes(&*ctx.store.read().await, &ctx.paths).unwrap(),
+            ),
+        )
+        .unwrap();
         (dir, ctx, host, fake)
     }
 
@@ -1087,6 +1614,639 @@ mod tests {
                 .unwrap(),
             Observation::Stopped
         );
+    }
+
+    #[tokio::test]
+    async fn fix_round1_first_certificate_publishes_and_loads_unit_before_enable() {
+        let (_dir, ctx, host, _fake) = fixture().await;
+        let path = crate::modules::core_files::hy2_resi_config_path(&ctx.paths);
+        host.remove_file(&path).unwrap();
+        host.with(|i| {
+            i.units_active.remove("hysteria-residential.service");
+            i.strict_units.insert("hysteria-residential.service".into());
+        });
+        let config = config_bytes(&*ctx.store.read().await, &ctx.paths).unwrap();
+        let changes = vec![
+            Change::WriteFile {
+                path,
+                content: config,
+                mode: 0o600,
+                verify: None,
+                restart: Some(crate::reconcile::Unit::restart(UNIT)),
+            },
+            Change::WriteUnit {
+                path: "/etc/systemd/system/hysteria-residential.service".into(),
+                content: "[Service]\nExecStart=/bin/sing-box\n".into(),
+                unit: crate::reconcile::Unit::restart(UNIT),
+            },
+            Change::SetUnitState {
+                unit: UNIT.into(),
+                enabled: true,
+                active: true,
+            },
+        ];
+        let c = ctx.clone();
+        let first = changes.clone();
+        assert!(ctx
+            .bus
+            .residential()
+            .execute(move |tx| async move {
+                tx.publish(
+                    &c,
+                    Deferred {
+                        changes: first,
+                        keys: BTreeMap::new(),
+                    },
+                    None,
+                )
+                .await
+            })
+            .await
+            .err()
+            .unwrap()
+            .is::<AwaitingCertificate>());
+        host.write_file(&ctx.paths.certs_dir.join("fullchain.pem"), b"cert", 0o644)
+            .unwrap();
+        host.write_file(&ctx.paths.certs_dir.join("privkey.pem"), b"key", 0o600)
+            .unwrap();
+        let c = ctx.clone();
+        ctx.bus
+            .residential()
+            .execute(move |tx| async move {
+                let p = tx
+                    .publish(
+                        &c,
+                        Deferred {
+                            changes,
+                            keys: BTreeMap::new(),
+                        },
+                        None,
+                    )
+                    .await?;
+                tx.complete(&c, p).await
+            })
+            .await
+            .unwrap();
+        assert_eq!(read_record(&ctx).unwrap().unwrap().phase, "active");
+        let ops = host.ops();
+        let write = ops
+            .iter()
+            .position(|o| o.starts_with("write:/etc/systemd/system/hysteria-residential.service:"))
+            .unwrap();
+        let reload = ops.iter().position(|o| o == "daemon-reload").unwrap();
+        let enable = ops
+            .iter()
+            .position(|o| o == "systemd:enable:hysteria-residential")
+            .unwrap();
+        assert!(write < reload && reload < enable);
+    }
+
+    async fn changed_candidate(ctx: &DaemonCtx) -> Deferred {
+        ctx.store
+            .update(|s| s.node.ports.hy2_resi = 45000)
+            .await
+            .unwrap();
+        Deferred {
+            changes: vec![Change::WriteFile {
+                path: crate::modules::core_files::hy2_resi_config_path(&ctx.paths),
+                content: config_bytes(&*ctx.store.read().await, &ctx.paths).unwrap(),
+                mode: 0o600,
+                verify: None,
+                restart: Some(crate::reconcile::Unit::restart(UNIT)),
+            }],
+            keys: BTreeMap::from([("new-config".into(), "new-key".into())]),
+        }
+    }
+
+    #[tokio::test]
+    async fn fix_round1_changed_candidate_recovers_after_failed_service_start() {
+        let (_dir, ctx, host, _fake) = fixture().await;
+        let path = crate::modules::core_files::hy2_resi_config_path(&ctx.paths);
+        let old = host.read_file(&path).unwrap();
+        let work = changed_candidate(&ctx).await;
+        let c = ctx.clone();
+        let h = host.clone();
+        assert!(ctx
+            .bus
+            .residential()
+            .execute(move |tx| async move {
+                let published = tx.publish(&c, work, None).await?;
+                h.with(|i| {
+                    i.failed_units.insert("hysteria-residential.service".into());
+                    i.units_active.remove("hysteria-residential.service");
+                    i.fail_unit_actions_once
+                        .insert(("restart".into(), UNIT.into()));
+                });
+                tx.complete(&c, published).await
+            })
+            .await
+            .is_err());
+        assert_eq!(host.read_file(&path).unwrap(), old);
+        assert!(
+            host.unit_is_active(UNIT).unwrap(),
+            "old candidate must actually be restarted from failed state"
+        );
+        let record = read_record(&ctx).unwrap().unwrap();
+        assert_eq!(record.phase, "recovered");
+        assert_eq!(
+            record.requested_config_sha,
+            crate::kernels::sha256_hex(old.as_ref().unwrap())
+        );
+        assert!(ctx.runtime.read().await.restart_keys.is_empty());
+        assert_eq!(
+            host.ops()
+                .iter()
+                .filter(|o| o.as_str() == "systemd:restart:hysteria-residential")
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn fix_round1_post_start_gate_failure_restores_shared_binary_and_old_candidate() {
+        let (_dir, ctx, host, fake) = fixture().await;
+        let path = crate::modules::core_files::hy2_resi_config_path(&ctx.paths);
+        let old = host.read_file(&path).unwrap();
+        let binary = ctx.paths.bin_dir.join("sing-box");
+        let candidate = ctx.paths.bin_dir.join("candidate-sing-box");
+        host.write_file(&binary, b"old binary", 0o755).unwrap();
+        host.write_file(&candidate, b"new binary", 0o755).unwrap();
+        host.with(|i| {
+            i.listening.entry(Proto::Udp).or_default().insert(45000);
+        });
+        fake.with(|i| {
+            i.selected.remove("gate-r000");
+        });
+        let f = fake.clone();
+        fake.with(|i| {
+            i.on_inventory_read = Some(Arc::new(move |n| {
+                if n == 1 {
+                    f.with(|i| {
+                        i.selected.insert("gate-r000".into(), "deny".into());
+                    });
+                }
+            }))
+        });
+        let work = changed_candidate(&ctx).await;
+        let c = ctx.clone();
+        assert!(ctx
+            .bus
+            .residential()
+            .execute(move |tx| async move {
+                let p = tx
+                    .publish(
+                        &c,
+                        work,
+                        Some(Candidate {
+                            path: candidate,
+                            sha256: crate::kernels::sha256_hex(b"new binary"),
+                        }),
+                    )
+                    .await?;
+                tx.complete(&c, p).await
+            })
+            .await
+            .is_err());
+        assert_eq!(host.read_file(&path).unwrap(), old);
+        assert_eq!(
+            host.read_file(&binary).unwrap(),
+            Some(b"old binary".to_vec())
+        );
+        let record = read_record(&ctx).unwrap().unwrap();
+        assert_eq!(record.phase, "recovered");
+        assert_eq!(record.relay_recovery_confirmed, Some(true));
+        assert!(record.error.is_some());
+        assert!(ctx.runtime.read().await.restart_keys.is_empty());
+        assert_eq!(
+            host.ops()
+                .iter()
+                .filter(|o| o.as_str() == "systemd:restart:hysteria-residential")
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn fix_round1_recovered_topology_controls_prestart_and_next_watchdog() {
+        let (_dir, ctx, host, _fake) = fixture().await;
+        let old = ctx.store.read().await;
+        let old_rules =
+            bui_schema::render::nft::ruleset(&old.node.ports, old.system.hy2_resi_compat_ports);
+        host.with(|i| {
+            i.which.insert("nft".into());
+            i.nft_table = Some(old_rules.clone());
+        });
+        ctx.bus.residential().repair(ctx.clone()).await.unwrap();
+        assert!(
+            host.stdins().is_empty(),
+            "healthy adoption must not rewrite matching nft rules"
+        );
+        let work = changed_candidate(&ctx).await;
+        ctx.store
+            .update(|s| {
+                s.node.ports.hy2_resi_hop = (51000, 52000);
+                s.system.hy2_resi_compat_ports = false;
+            })
+            .await
+            .unwrap();
+        let c = ctx.clone();
+        let h = host.clone();
+        assert!(ctx
+            .bus
+            .residential()
+            .execute(move |tx| async move {
+                let p = tx.publish(&c, work, None).await?;
+                h.with(|i| {
+                    i.fail_unit_actions_once
+                        .insert(("restart".into(), UNIT.into()));
+                });
+                tx.complete(&c, p).await
+            })
+            .await
+            .is_err());
+        assert!(host.unit_is_active(UNIT).unwrap());
+        host.write_file(
+            &crate::paths::state_file(&ctx.paths),
+            &serde_json::to_vec(&*ctx.store.read().await).unwrap(),
+            0o600,
+        )
+        .unwrap();
+        host.clear_ops();
+        crate::commands::nft::apply(host.as_ref(), &ctx.paths).unwrap();
+        let payload = host.stdins();
+        assert_eq!(
+            payload.last().unwrap().1,
+            old_rules,
+            "prestart must consume restored applied topology, not new desired ports"
+        );
+        let before = host.stdins().len();
+        crate::modules::watchdog::check_once(&ctx).await.unwrap();
+        assert_eq!(
+            host.stdins().len(),
+            before,
+            "next watchdog must preserve matching recovered table"
+        );
+        assert!(!host
+            .ops()
+            .iter()
+            .any(|o| o == "systemd:restart:hysteria-residential"));
+        assert!(ctx.runtime.read().await.restart_keys.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fix_round1_hop_only_commit_and_superseded_hop_never_ack_early() {
+        for superseded in [false, true] {
+            let (_dir, ctx, host, _) = fixture().await;
+            let old = read_binding(ctx.store.directory()).unwrap().unwrap();
+            ctx.store
+                .update(|s| {
+                    s.node.ports.hy2_resi_hop = (51000, 52000);
+                    s.system.hy2_resi_compat_ports = false;
+                })
+                .await
+                .unwrap();
+            let desired = ctx.store.read().await;
+            let rules = bui_schema::render::nft::ruleset(&desired.node.ports, false);
+            let work = Deferred {
+                changes: vec![Change::ApplyNftTable {
+                    family: "inet".into(),
+                    name: "bui".into(),
+                    ruleset: rules.clone(),
+                    key: "new-nft".into(),
+                }],
+                keys: [("nft:inet:bui".into(), "new-nft".into())]
+                    .into_iter()
+                    .collect(),
+            };
+            let c = ctx.clone();
+            let result = ctx
+                .bus
+                .residential()
+                .execute(move |tx| async move {
+                    let p = tx.publish(&c, work, None).await?;
+                    anyhow::ensure!(
+                        c.runtime.read().await.restart_keys.is_empty(),
+                        "early nft acknowledgement"
+                    );
+                    if superseded {
+                        c.store
+                            .update(|s| s.node.ports.hy2_resi_hop = (53000, 54000))
+                            .await?;
+                    }
+                    tx.complete(&c, p).await
+                })
+                .await;
+            if superseded {
+                assert!(result.is_err());
+                assert_eq!(
+                    read_binding(ctx.store.directory()).unwrap(),
+                    Some(old.clone())
+                );
+                assert!(ctx.runtime.read().await.restart_keys.is_empty());
+                verify_table(host.as_ref(), &old.rules(&desired)).unwrap();
+            } else {
+                assert_eq!(result.unwrap().phase, "active");
+                assert_eq!(
+                    ctx.runtime
+                        .read()
+                        .await
+                        .restart_keys
+                        .get("nft:inet:bui")
+                        .map(String::as_str),
+                    Some("new-nft")
+                );
+                verify_table(host.as_ref(), &rules).unwrap();
+                assert!(!host
+                    .ops()
+                    .iter()
+                    .any(|o| o == "systemd:restart:hysteria-residential"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fix_round1_interrupted_publication_recovers_original_operation_before_admission() {
+        for point in [
+            "config-new-binding-old",
+            "config-old-binding-new",
+            "both-new",
+            "foreign",
+            "missing",
+        ] {
+            let (_dir, ctx, host, _) = fixture().await;
+            let path = crate::modules::core_files::hy2_resi_config_path(&ctx.paths);
+            let old_config = host.read_file(&path).unwrap().unwrap();
+            let old_binding = read_binding(ctx.store.directory()).unwrap().unwrap();
+            let work = changed_candidate(&ctx).await;
+            let c = ctx.clone();
+            let p = ctx
+                .bus
+                .residential()
+                .execute(move |tx| async move { tx.publish(&c, work, None).await })
+                .await
+                .unwrap();
+            let operation = p.receipt.operation_id;
+            if point == "config-new-binding-old" {
+                persist_metadata(&directory(&ctx), "topology.json", &old_binding).unwrap();
+            }
+            if point == "config-old-binding-new" {
+                host.write_file(&path, &old_config, 0o600).unwrap();
+            }
+            if point == "foreign" {
+                let mut b = old_binding.clone();
+                b.hop_range = (56000, 57000);
+                persist_metadata(&directory(&ctx), "topology.json", &b).unwrap();
+            }
+            if point == "missing" {
+                std::fs::remove_file(directory(&ctx).join("topology.json")).unwrap();
+            }
+            let original = std::fs::read(directory(&ctx).join("record.json")).unwrap();
+            assert!(ctx.bus.residential().repair(ctx.clone()).await.is_err());
+            let record = read_record(&ctx).unwrap().unwrap();
+            assert_eq!(record.operation_id, operation);
+            if matches!(point, "foreign" | "missing") {
+                assert_eq!(
+                    std::fs::read(directory(&ctx).join("record.json")).unwrap(),
+                    original,
+                    "unknown evidence cannot overwrite the WAL"
+                );
+            } else {
+                assert_eq!(record.phase, "recovered", "{point}: {:?}", record.error);
+                assert_eq!(host.read_file(&path).unwrap(), Some(old_config));
+                assert_eq!(
+                    read_binding(ctx.store.directory()).unwrap(),
+                    Some(old_binding.clone())
+                );
+                verify_table(host.as_ref(), &old_binding.rules(&*ctx.store.read().await)).unwrap();
+            }
+            assert!(ctx.runtime.read().await.restart_keys.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn fix_round1_unfinished_manual_stop_is_completed_by_admission() {
+        let (_dir, ctx, host, _) = fixture().await;
+        let c = ctx.clone();
+        ctx.bus
+            .residential()
+            .execute(move |tx| async move {
+                let config = config_bytes(&*c.store.read().await, &c.paths)?;
+                let r = tx.prepared(&c, Source::Manual, &config, true).await?;
+                persist(&c, &r)
+            })
+            .await
+            .unwrap();
+        assert!(host.unit_is_active(UNIT).unwrap());
+        assert!(ctx
+            .bus
+            .residential()
+            .repair(ctx.clone())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!host.unit_is_active(UNIT).unwrap());
+        assert_eq!(read_record(&ctx).unwrap().unwrap().phase, "stopped");
+    }
+
+    #[tokio::test]
+    async fn fix_round1_unreadable_nft_cannot_confirm_active_even_with_listener_and_gates() {
+        let (_dir, ctx, host, _) = fixture().await;
+        host.with(|i| {
+            i.scripted.push((
+                "nft list table inet bui".into(),
+                crate::sys::CmdOut::failure(1, "Permission denied"),
+            ))
+        });
+        assert!(ctx.bus.residential().repair(ctx.clone()).await.is_err());
+        assert_ne!(read_record(&ctx).unwrap().unwrap().phase, "active");
+        assert!(ctx.runtime.read().await.restart_keys.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fix_round1_binding_drift_during_gate_barrier_cannot_be_active() {
+        let (_dir, ctx, _host, fake) = fixture().await;
+        let mut foreign = read_binding(ctx.store.directory()).unwrap().unwrap();
+        foreign.hop_range = (58000, 59000);
+        let dir = directory(&ctx);
+        fake.with(|i| {
+            i.on_inventory_read = Some(Arc::new(move |_| {
+                persist_metadata(&dir, "topology.json", &foreign).unwrap();
+            }))
+        });
+        assert!(ctx.bus.residential().repair(ctx.clone()).await.is_err());
+        assert_ne!(read_record(&ctx).unwrap().unwrap().phase, "active");
+        assert!(ctx.runtime.read().await.restart_keys.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fix_round1_partial_certificate_crash_restores_pair_without_ack() {
+        let (_dir, ctx, host, _) = fixture().await;
+        let cert = ctx.paths.certs_dir.join("fullchain.pem");
+        let key = ctx.paths.certs_dir.join("privkey.pem");
+        host.write_file(&cert, b"old cert", 0o644).unwrap();
+        host.write_file(&key, b"old key", 0o600).unwrap();
+        let c = ctx.clone();
+        let p = ctx
+            .bus
+            .residential()
+            .execute(move |tx| async move {
+                tx.publish_certificate(
+                    &c,
+                    b"new cert".to_vec(),
+                    b"new key".to_vec(),
+                    "new cert SHA".into(),
+                )
+                .await
+            })
+            .await
+            .unwrap();
+        // Disk image of a crash after certificate rename, before key rename / pair fsync receipt.
+        host.write_file(&key, b"old key", 0o600).unwrap();
+        let mut interrupted = p.receipt;
+        interrupted.certificate_pair_published = false;
+        persist(&ctx, &interrupted).unwrap();
+        assert!(ctx.bus.residential().repair(ctx.clone()).await.is_err());
+        assert_eq!(host.read_file(&cert).unwrap(), Some(b"old cert".to_vec()));
+        assert_eq!(host.read_file(&key).unwrap(), Some(b"old key".to_vec()));
+        let terminal = read_record(&ctx).unwrap().unwrap();
+        assert_eq!(terminal.operation_id, interrupted.operation_id);
+        assert_eq!(terminal.phase, "recovered");
+        assert!(ctx.runtime.read().await.cert_sha256.is_none());
+    }
+
+    #[tokio::test]
+    async fn fix_round1_invalid_binding_blocks_prestart_and_watchdog_without_state_fallback() {
+        let (_dir, ctx, host, _) = fixture().await;
+        host.write_file(
+            &crate::paths::state_file(&ctx.paths),
+            &serde_json::to_vec(&*ctx.store.read().await).unwrap(),
+            0o600,
+        )
+        .unwrap();
+        std::fs::write(directory(&ctx).join("topology.json"), b"{broken").unwrap();
+        host.clear_ops();
+        assert!(crate::commands::nft::apply(host.as_ref(), &ctx.paths).is_err());
+        assert!(crate::modules::watchdog::check_once(&ctx).await.is_err());
+        assert!(host.stdins().is_empty());
+        assert!(!host
+            .ops()
+            .iter()
+            .any(|op| op.starts_with("systemd:restart:")));
+    }
+
+    #[tokio::test]
+    async fn fix_round1_unbound_healthy_adoption_writes_only_binding_metadata() {
+        let (_dir, ctx, host, _) = fixture().await;
+        std::fs::remove_file(directory(&ctx).join("topology.json")).unwrap();
+        host.clear_ops();
+        ctx.bus.residential().repair(ctx.clone()).await.unwrap();
+        assert!(read_binding(ctx.store.directory()).unwrap().is_some());
+        assert!(host.stdins().is_empty());
+        assert!(!host.ops().iter().any(|op| op.starts_with("write:")
+            || op.starts_with("systemd:restart:")
+            || op.starts_with("systemd:start:")));
+        assert_eq!(read_record(&ctx).unwrap().unwrap().phase, "active");
+    }
+
+    #[tokio::test]
+    async fn fix_round1_rejected_nft_publication_keeps_previous_topology_and_keys() {
+        for fault in ["missing-binary", "precheck", "transaction"] {
+            let (_dir, ctx, host, _) = fixture().await;
+            let old = read_binding(ctx.store.directory()).unwrap().unwrap();
+            ctx.store
+                .update(|s| s.node.ports.hy2_resi_hop = (51000, 52000))
+                .await
+                .unwrap();
+            host.with(|i| match fault {
+                "missing-binary" => {
+                    i.which.remove("nft");
+                }
+                "precheck" => i.scripted.push((
+                    "nft -c -f -".into(),
+                    crate::sys::CmdOut::failure(1, "rejected candidate"),
+                )),
+                _ => i.scripted.push((
+                    "nft -f -".into(),
+                    crate::sys::CmdOut::failure(1, "Chain of type nat is not supported"),
+                )),
+            });
+            let c = ctx.clone();
+            assert!(ctx
+                .bus
+                .residential()
+                .execute(move |tx| async move {
+                    let p = tx
+                        .publish(
+                            &c,
+                            Deferred {
+                                changes: vec![],
+                                keys: [("nft:inet:bui".into(), "new".into())]
+                                    .into_iter()
+                                    .collect(),
+                            },
+                            None,
+                        )
+                        .await?;
+                    tx.complete(&c, p).await
+                })
+                .await
+                .is_err());
+            assert_eq!(
+                read_binding(ctx.store.directory()).unwrap(),
+                Some(old.clone())
+            );
+            verify_table(host.as_ref(), &old.rules(&*ctx.store.read().await)).unwrap();
+            assert!(ctx.runtime.read().await.restart_keys.is_empty());
+            assert_ne!(read_record(&ctx).unwrap().unwrap().phase, "active");
+        }
+    }
+
+    #[tokio::test]
+    async fn fix_round1_failed_publication_preserves_manual_maintenance() {
+        let (_dir, ctx, host, _fake) = fixture().await;
+        ctx.bus
+            .residential()
+            .manual(ctx.clone(), Action::Stop)
+            .await
+            .unwrap();
+        let path = ctx.paths.base_dir.join("associated.json");
+        host.write_file(&path, b"old", 0o600).unwrap();
+        host.with(|i| {
+            i.fail_writes.insert(path.clone());
+        });
+        host.clear_ops();
+        let c = ctx.clone();
+        assert!(ctx
+            .bus
+            .residential()
+            .execute(move |tx| async move {
+                tx.publish(
+                    &c,
+                    Deferred {
+                        changes: vec![Change::WriteFile {
+                            path,
+                            content: b"new".to_vec(),
+                            mode: 0o600,
+                            verify: None,
+                            restart: Some(crate::reconcile::Unit::restart(UNIT)),
+                        }],
+                        keys: BTreeMap::new(),
+                    },
+                    None,
+                )
+                .await
+            })
+            .await
+            .is_err());
+        assert!(!host.unit_is_active(UNIT).unwrap());
+        let record = read_record(&ctx).unwrap().unwrap();
+        assert!(record.maintenance);
+        assert_eq!(record.phase, "stopped");
+        assert!(!host
+            .ops()
+            .iter()
+            .any(|o| o == "systemd:restart:hysteria-residential"
+                || o == "systemd:start:hysteria-residential"));
     }
 
     #[tokio::test]

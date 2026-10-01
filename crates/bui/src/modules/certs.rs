@@ -503,6 +503,11 @@ mod tests {
         let mut state = crate::testutil::sample_state();
         bui_schema::hy2pool::grow(&mut state.residential.hy2_pool, 32, &Default::default());
         host.with(|i| {
+            i.which.insert("nft".into());
+            i.nft_table = Some(bui_schema::render::nft::ruleset(
+                &state.node.ports,
+                state.system.hy2_resi_compat_ports,
+            ));
             i.instances.insert("hysteria-residential.service".into(), 1);
             i.stock_singbox = true;
             i.listening

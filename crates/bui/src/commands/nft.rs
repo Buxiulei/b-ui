@@ -132,7 +132,10 @@ fn load_state(host: &dyn Host, paths: &Paths) -> Result<State> {
     let bytes = host
         .read_file(&path)?
         .with_context(|| format!("读不到期望态 {}", path.display()))?;
-    serde_json::from_slice(&bytes).with_context(|| format!("{} 解析失败", path.display()))
+    let mut state =
+        serde_json::from_slice(&bytes).with_context(|| format!("{} 解析失败", path.display()))?;
+    crate::residential_lifecycle::project_applied(&paths.base_dir, &mut state)?;
+    Ok(state)
 }
 
 fn require_nft(host: &dyn Host) -> Result<()> {
