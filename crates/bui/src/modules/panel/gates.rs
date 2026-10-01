@@ -98,11 +98,303 @@ pub fn expected(s: &State, blocked: &BTreeSet<Uuid>) -> BTreeMap<String, String>
         .collect()
 }
 
+/// Complete selector manifest from the candidate's entire configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateManifest {
+    gates: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl GateManifest {
+    pub fn gates(&self) -> &BTreeMap<String, BTreeSet<String>> {
+        &self.gates
+    }
+    pub fn from_config(bytes: &[u8]) -> anyhow::Result<Self> {
+        let config: serde_json::Value = serde_json::from_slice(bytes)?;
+        let outbounds = config
+            .get("outbounds")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("candidate missing outbounds"))?;
+        let mut tags = BTreeSet::new();
+        for outbound in outbounds {
+            let tag = outbound
+                .get("tag")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("candidate outbound missing tag"))?;
+            anyhow::ensure!(
+                tags.insert(tag.to_owned()),
+                "candidate duplicate outbound {tag}"
+            );
+        }
+        let mut gates = BTreeMap::new();
+        for outbound in outbounds {
+            let tag = outbound["tag"].as_str().unwrap();
+            if !tag.starts_with(&gate_tag("")) {
+                continue;
+            }
+            anyhow::ensure!(
+                outbound["type"].as_str() == Some("selector"),
+                "candidate gate {tag} is not selector"
+            );
+            let members = outbound
+                .get("outbounds")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| anyhow::anyhow!("candidate gate {tag} missing members"))?
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| anyhow::anyhow!("candidate gate {tag} invalid member"))
+                })
+                .collect::<anyhow::Result<BTreeSet<_>>>()?;
+            anyhow::ensure!(
+                members.contains(DENY_TAG),
+                "candidate gate {tag} missing deny"
+            );
+            anyhow::ensure!(
+                members.iter().all(|s| tags.contains(s)),
+                "candidate gate {tag} references missing outbound"
+            );
+            gates.insert(tag.to_owned(), members);
+        }
+        anyhow::ensure!(!gates.is_empty(), "candidate has no residential gates");
+        fn validate_refs(
+            value: &serde_json::Value,
+            gates: &BTreeMap<String, BTreeSet<String>>,
+        ) -> anyhow::Result<()> {
+            match value {
+                serde_json::Value::Object(object) => {
+                    if let Some(tag) = object.get("outbound").and_then(serde_json::Value::as_str) {
+                        anyhow::ensure!(
+                            !tag.starts_with(&gate_tag("")) || gates.contains_key(tag),
+                            "candidate references missing gate {tag}"
+                        );
+                    }
+                    for value in object.values() {
+                        validate_refs(value, gates)?;
+                    }
+                }
+                serde_json::Value::Array(values) => {
+                    for value in values {
+                        validate_refs(value, gates)?;
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+        validate_refs(&config, &gates)?;
+        Ok(Self { gates })
+    }
+
+    fn validate(&self, inventory: &super::hy2resi::GateInventory) -> anyhow::Result<()> {
+        for (tag, members) in &self.gates {
+            let gate = inventory.gates.get(tag).ok_or_else(|| {
+                anyhow::anyhow!("candidate gate {tag} missing from running inventory")
+            })?;
+            anyhow::ensure!(gate.kind == "Selector", "gate {tag} is not Selector");
+            let actual: BTreeSet<_> = gate.all.iter().cloned().collect();
+            anyhow::ensure!(
+                &actual == members,
+                "gate {tag} members differ from candidate"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Authorization evidence only: the stock API supplies no loaded-config hash or instance ID.
+/// Gate + Store writer ownership remains private until the owner drops this after durable commit.
+pub struct GateActivationPermit {
+    _gate: tokio::sync::OwnedMutexGuard<()>,
+    api: std::sync::Arc<dyn super::Hy2ResiApi>,
+    _publication: crate::state::store::PublicationPermit,
+    state: std::sync::Arc<State>,
+    pending: BTreeMap<Uuid, super::TxRx>,
+    manifest: GateManifest,
+    projection: BTreeMap<String, String>,
+    digest: String,
+    valid_until: Option<time::OffsetDateTime>,
+}
+
+impl GateActivationPermit {
+    pub fn projection(&self) -> &BTreeMap<String, String> {
+        &self.projection
+    }
+    pub fn projection_sha256(&self) -> &str {
+        &self.digest
+    }
+    /// Earliest expiry of a currently allowed credential. None means no expiry bound.
+    pub fn authorization_valid_until(&self) -> Option<time::OffsetDateTime> {
+        self.valid_until
+    }
+    /// Time can revoke a grant despite both writer fences. Call immediately before durable commit.
+    pub fn validate_now(&self, now: time::OffsetDateTime) -> anyhow::Result<()> {
+        let want = projection(
+            &self.state,
+            &self.pending,
+            now,
+            &self.manifest,
+            self.projection.keys(),
+        );
+        anyhow::ensure!(
+            want == self.projection,
+            "authorization changed with time before active commit"
+        );
+        Ok(())
+    }
+    /// Owner commit check: expired grants are closed under the retained fences before error.
+    /// A failure still requires the owner to drop this receipt and strictly repair/stop the service.
+    pub async fn validate_or_close(
+        &self,
+        now: time::OffsetDateTime,
+        deadline: tokio::time::Instant,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "activation commit check deadline exceeded"
+        );
+        let want = projection(
+            &self.state,
+            &self.pending,
+            now,
+            &self.manifest,
+            self.projection.keys(),
+        );
+        if want == self.projection {
+            return Ok(());
+        }
+        tokio::time::timeout_at(
+            deadline,
+            close_revoked(self.api.as_ref(), &self.projection, &want),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("expired activation permit cleanup deadline exceeded"))??;
+        anyhow::bail!("authorization expired before active commit; revoked gates closed")
+    }
+}
+
+fn projection<'a>(
+    state: &State,
+    pending: &BTreeMap<Uuid, super::TxRx>,
+    now: time::OffsetDateTime,
+    manifest: &GateManifest,
+    tags: impl Iterator<Item = &'a String>,
+) -> BTreeMap<String, String> {
+    let want = expected(state, &users::blocked_set(state, pending, now));
+    tags.map(|tag| {
+        let target = if manifest.gates.contains_key(tag) {
+            tag.strip_prefix(&gate_tag(""))
+                .and_then(|id| want.get(id))
+                .map(String::as_str)
+                .unwrap_or(DENY_TAG)
+        } else {
+            DENY_TAG
+        };
+        (tag.clone(), target.to_owned())
+    })
+    .collect()
+}
+
+/// Close only previously granted selectors whose latest authorization no longer permits that grant.
+/// Errors propagate: a failed close/readback must be visible to the owner, never treated as readiness.
+async fn close_revoked(
+    api: &dyn super::Hy2ResiApi,
+    before: &BTreeMap<String, String>,
+    after: &BTreeMap<String, String>,
+) -> anyhow::Result<()> {
+    let revoked: Vec<_> = before
+        .iter()
+        .filter(|(tag, target)| target.as_str() != DENY_TAG && after.get(*tag) != Some(*target))
+        .map(|(tag, _)| tag)
+        .collect();
+    if revoked.is_empty() {
+        return Ok(());
+    }
+    for tag in &revoked {
+        api.select(tag, DENY_TAG).await?;
+    }
+    let inventory = api.inventory().await?;
+    for tag in revoked {
+        anyhow::ensure!(
+            inventory
+                .gates
+                .get(tag)
+                .is_some_and(|gate| gate.now == DENY_TAG),
+            "revoked gate {tag} cleanup readback failed"
+        );
+    }
+    Ok(())
+}
+
+/// Absolute deadline includes readiness, both lock waits, every write and final readback.
+pub async fn restore_and_verify(
+    ctx: &DaemonCtx,
+    shared: &Shared,
+    manifest: &GateManifest,
+    deadline: tokio::time::Instant,
+) -> anyhow::Result<GateActivationPermit> {
+    anyhow::ensure!(
+        tokio::time::Instant::now() < deadline,
+        "gate activation deadline exceeded"
+    );
+    tokio::time::timeout_at(deadline, async {
+        // Waiting for a restarting API must not exclude ordinary gate writers.
+        loop {
+            if shared.hy2resi().ready().await { break; }
+            tokio::time::sleep(REPLAY_RETRY_FIRST).await;
+        }
+        let version = shared.hy2resi().version().await?;
+        anyhow::ensure!(version == "sing-box 1.14.2", "expected stock sing-box 1.14.2, observed {version}");
+        let gate = shared.gate_guard().await;
+        let publication = ctx.store.publication_permit().await;
+        let state = publication.state().clone();
+        let pending = shared.pending().await.clone();
+        let initial = shared.hy2resi().inventory().await?;
+        manifest.validate(&initial)?;
+        let want = projection(&state, &pending, ctx.host.now(), manifest, initial.gates.keys());
+        // Close revoked/obsolete grants before opening any current grant.
+        for deny in [true, false] {
+            for (tag, target) in &want {
+                if (target == DENY_TAG) != deny || initial.gates[tag].now == *target { continue; }
+                anyhow::ensure!(initial.gates[tag].all.contains(target), "gate {tag} missing target {target}");
+                shared.hy2resi().select(tag, target).await?;
+            }
+        }
+        let final_inventory = shared.hy2resi().inventory().await?;
+        manifest.validate(&final_inventory)?;
+        // Do not let extra gates appearing between reads escape the deny requirement.
+        let final_want = projection(&state, &pending, ctx.host.now(), manifest, final_inventory.gates.keys());
+        if want != final_want {
+            close_revoked(shared.hy2resi(), &want, &final_want).await?;
+            anyhow::bail!("gate inventory or authorization changed before final readback; revoked gates closed");
+        }
+        for (tag, target) in &final_want {
+            anyhow::ensure!(final_inventory.gates[tag].now == *target, "gate {tag} final readback mismatch");
+        }
+        use sha2::Digest;
+        let digest = format!("{:x}", sha2::Sha256::digest(serde_json::to_vec(&final_want)?));
+        let valid_until = state.users.iter().filter(|user| {
+            user.credentials.hy2_resi_cred.as_ref().is_some_and(|id| {
+                final_want.get(&gate_tag(id)).is_some_and(|tag| tag != DENY_TAG)
+            })
+        }).filter_map(|user| {
+            user.entitlements.expires_at.as_deref().and_then(crate::util::parse_rfc3339)
+        }).min();
+        anyhow::ensure!(tokio::time::Instant::now() < deadline, "gate activation deadline exceeded");
+        Ok(GateActivationPermit {
+            _gate: gate, api: shared.hy2resi.clone(), _publication: publication,
+            state, pending, manifest: manifest.clone(), projection: final_want, digest, valid_until,
+        })
+    }).await.map_err(|_| anyhow::anyhow!("gate activation deadline exceeded"))?
+}
+
 /// 一轮门位收敛：读一次 `GET /proxies`，只 PUT 与期望不一致的门（spec §3.3）。
 ///
 /// 遍历的是**内核报回来的**门位表（见模块文档末段）；期望态里没有的门一律按 `deny`
 /// 收 —— 凭据被人工从池里删掉时，它的门不许留在某个槽上。
-pub async fn converge(ctx: &DaemonCtx, shared: &Shared, blocked: &BTreeSet<Uuid>) -> GateOutcome {
+pub async fn converge(ctx: &DaemonCtx, shared: &Shared, _blocked: &BTreeSet<Uuid>) -> GateOutcome {
+    let _gate = shared.gate_guard().await;
+    let publication = ctx.store.publication_permit().await;
     // **先读内核、后算期望**：两次读之间可能落进一次 rotate / kick（它们写盘之后自己
     // 当场 PUT 两下）。这个顺序下陈旧的那半只会是 `live`，配上更新的 `want` 得出的是
     // 「按新期望再收一次」= fail-closed；反过来（先算 want）会拿旧持有人的期望覆盖掉
@@ -118,8 +410,9 @@ pub async fn converge(ctx: &DaemonCtx, shared: &Shared, blocked: &BTreeSet<Uuid>
         }
     };
     let want = {
-        let s = ctx.store.read().await;
-        expected(&s, blocked)
+        let pending = shared.pending().await.clone();
+        let s = publication.state();
+        expected(s, &users::blocked_set(s, &pending, ctx.host.now()))
     };
     let mut out = GateOutcome::default();
     for (gate, now) in &live {
@@ -149,7 +442,25 @@ pub async fn converge(ctx: &DaemonCtx, shared: &Shared, blocked: &BTreeSet<Uuid>
 ///
 /// **best-effort**：失败只记 warn —— 主保障是鉴权快照与下一轮门位收敛。换凭据这类
 /// 「立刻生效」的动作不许只靠 60 秒安全网：泄露的旧凭据在那一分钟里照旧能出网。
-pub(super) async fn put_gate(shared: &Shared, cred_id: &str, tag: &str) {
+pub(super) async fn put_gate(
+    store: &crate::state::store::Store,
+    shared: &Shared,
+    host: &dyn crate::sys::Host,
+    cred_id: &str,
+    tag: &str,
+) {
+    let _guard = shared.gate_guard().await;
+    let publication = store.publication_permit().await;
+    let pending = shared.pending().await.clone();
+    let want = expected(
+        publication.state(),
+        &users::blocked_set(publication.state(), &pending, host.now()),
+    );
+    let tag = if tag == DENY_TAG {
+        DENY_TAG
+    } else {
+        want.get(cred_id).map(String::as_str).unwrap_or(DENY_TAG)
+    };
     let gate = gate_tag(cred_id);
     if let Err(e) = shared.hy2resi().select(&gate, tag).await {
         tracing::warn!(gate = %gate, tag, error = %e, "住宅 HY2 门位切换失败；门位收敛会补上：{e}");
@@ -178,12 +489,45 @@ pub async fn replay_after_restart(ctx: &DaemonCtx, shared: &Shared) -> GateOutco
     let mut attempts = 0u32;
     loop {
         attempts += 1;
-        if shared.hy2resi().ready().await {
-            let round = converge(ctx, shared, &blocked).await;
+        if tokio::time::timeout_at(deadline, shared.hy2resi().ready())
+            .await
+            .unwrap_or(false)
+        {
+            let round =
+                match tokio::time::timeout_at(deadline, converge(ctx, shared, &blocked)).await {
+                    Ok(round) => round,
+                    Err(_) => GateOutcome {
+                        switched: 0,
+                        errors: vec!["gate replay deadline exceeded".into()],
+                    },
+                };
             out.switched += round.switched;
             out.errors = round.errors;
             if out.errors.is_empty() {
-                break;
+                let verify = async {
+                    let _guard = shared.gate_guard().await;
+                    let publication = ctx.store.publication_permit().await;
+                    let pending = shared.pending().await.clone();
+                    let want = expected(
+                        publication.state(),
+                        &users::blocked_set(publication.state(), &pending, ctx.host.now()),
+                    );
+                    let live = shared.hy2resi().selected_all().await?;
+                    for (gate, now) in live {
+                        let tag = gate
+                            .strip_prefix(&gate_tag(""))
+                            .and_then(|id| want.get(id))
+                            .map(String::as_str)
+                            .unwrap_or(DENY_TAG);
+                        anyhow::ensure!(now == tag, "gate {gate} readback mismatch");
+                    }
+                    Ok::<_, anyhow::Error>(())
+                };
+                match tokio::time::timeout_at(deadline, verify).await {
+                    Ok(Ok(())) => break,
+                    Ok(Err(e)) => out.errors = vec![e.to_string()],
+                    Err(_) => out.errors = vec!["gate replay deadline exceeded".into()],
+                }
             }
         } else {
             out.errors =
@@ -270,6 +614,430 @@ mod tests {
     use bui_schema::model::Protocol;
     use pretty_assertions::assert_eq;
     use time::macros::datetime;
+
+    // Catches PUT 204 being mistaken for activation without a final readback.
+    #[tokio::test(start_paused = true)]
+    async fn replay_rejects_a_successful_put_that_does_not_change_the_gate() {
+        let h = harness().await;
+        h.store
+            .update(|s| *s = three_slot_state_with_pool())
+            .await
+            .unwrap();
+        h.hy2resi
+            .set_selected(BTreeMap::from([("gate-r000".into(), "deny".into())]));
+        h.hy2resi.with(|i| i.select_noop = true);
+        let out = replay_after_restart(&ctx_of(&h), &h.shared).await;
+        assert!(
+            !out.errors.is_empty(),
+            "a no-op PUT must not announce restored gates"
+        );
+    }
+
+    fn literal_manifest() -> GateManifest {
+        GateManifest::from_config(br#"{"outbounds":[
+          {"type":"socks","tag":"deny"},
+          {"type":"socks","tag":"slot-0-out"},
+          {"type":"socks","tag":"slot-3-out"},
+          {"type":"socks","tag":"slot-4-out"},
+          {"type":"socks","tag":"slot-5-out"},
+          {"type":"socks","tag":"slot-6-out"},
+          {"type":"socks","tag":"slot-7-out"},
+          {"type":"socks","tag":"slot-1-out"},
+          {"type":"socks","tag":"slot-2-out"},
+          {"type":"selector","tag":"gate-r000","outbounds":["deny","slot-0-out","slot-1-out","slot-2-out","slot-3-out","slot-4-out","slot-5-out","slot-6-out","slot-7-out"]},
+          {"type":"selector","tag":"gate-r001","outbounds":["deny","slot-0-out","slot-1-out","slot-2-out","slot-3-out","slot-4-out","slot-5-out","slot-6-out","slot-7-out"]}
+        ]}"#).unwrap()
+    }
+
+    // Removing manifest references validation would accept a candidate with unbound authorization rules.
+    #[test]
+    fn manifest_rejects_missing_or_invalid_candidate_gates() {
+        for config in [
+            r#"{"outbounds":[]}"#,
+            r#"{"outbounds":[{"type":"selector","tag":"gate-a","outbounds":["slot-0-out"]}]}"#,
+            r#"{"outbounds":[{"type":"socks","tag":"gate-a"}]}"#,
+            r#"{"outbounds":[{"type":"socks","tag":"deny"},{"type":"selector","tag":"gate-a","outbounds":["deny"]}],"route":{"rules":[{"outbound":"gate-missing"}]}}"#,
+        ] {
+            assert!(
+                GateManifest::from_config(config.as_bytes()).is_err(),
+                "{config}"
+            );
+        }
+    }
+
+    // Omitting the full manifest coverage check would verify only the one gate still present.
+    #[tokio::test]
+    async fn activation_rejects_a_missing_candidate_gate() {
+        let h = harness_with_pool().await;
+        h.hy2resi
+            .set_selected(BTreeMap::from([("gate-r000".into(), "deny".into())]));
+        assert!(restore_and_verify(
+            &ctx_of(&h),
+            &h.shared,
+            &literal_manifest(),
+            tokio::time::Instant::now() + Duration::from_secs(1)
+        )
+        .await
+        .is_err());
+        assert_eq!(h.hy2resi.selected()["gate-r000"], "deny");
+    }
+
+    // Missing final readback would return a permit despite the kernel ignoring successful PUTs.
+    #[tokio::test]
+    async fn activation_rejects_a_noop_put_and_a_final_get_error() {
+        for noop in [true, false] {
+            let h = harness_with_pool().await;
+            h.hy2resi.set_selected(BTreeMap::from([
+                ("gate-r000".into(), "deny".into()),
+                ("gate-r001".into(), "deny".into()),
+            ]));
+            h.hy2resi.with(|i| {
+                i.select_noop = noop;
+                i.fail_inventory_read = (!noop).then_some(2);
+            });
+            assert!(restore_and_verify(
+                &ctx_of(&h),
+                &h.shared,
+                &literal_manifest(),
+                tokio::time::Instant::now() + Duration::from_secs(1)
+            )
+            .await
+            .is_err());
+        }
+    }
+
+    // Opening before closing, omitting stale gates, or releasing either fence would break the commit contract.
+    #[tokio::test]
+    async fn activation_closes_old_gates_first_and_retains_both_commit_fences() {
+        let h = harness_with_pool().await;
+        h.hy2resi.set_selected(BTreeMap::from([
+            ("gate-r000".into(), "deny".into()),
+            ("gate-r001".into(), "deny".into()),
+            ("gate-old".into(), "slot-1-out".into()),
+        ]));
+        let ctx = ctx_of(&h);
+        let permit = restore_and_verify(
+            &ctx,
+            &h.shared,
+            &literal_manifest(),
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            permit.projection(),
+            &BTreeMap::from([
+                ("gate-r000".into(), "slot-1-out".into()),
+                ("gate-r001".into(), "slot-2-out".into()),
+                ("gate-old".into(), "deny".into())
+            ])
+        );
+        let puts: Vec<_> = h
+            .hy2resi
+            .calls()
+            .into_iter()
+            .filter(|c| c.starts_with("select:"))
+            .collect();
+        assert_eq!(
+            puts,
+            [
+                "select:gate-old:deny",
+                "select:gate-r000:slot-1-out",
+                "select:gate-r001:slot-2-out"
+            ]
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), h.shared.gate_guard())
+                .await
+                .is_err()
+        );
+        assert!(tokio::time::timeout(
+            Duration::from_millis(20),
+            h.store.update(|s| s.users[0].disabled = true)
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            h.store.read().await.users[0].disabled,
+            false,
+            "snapshot readers still run"
+        );
+        drop(permit);
+        h.store
+            .update(|s| s.users[0].disabled = true)
+            .await
+            .unwrap();
+    }
+
+    // Using a pre-lock snapshot or excluding pending from quota would restore an already-revoked grant.
+    #[tokio::test]
+    async fn activation_uses_current_authorization_and_unflushed_traffic() {
+        let h = harness_with_pool().await;
+        h.hy2resi.set_selected(BTreeMap::from([
+            ("gate-r000".into(), "deny".into()),
+            ("gate-r001".into(), "deny".into()),
+        ]));
+        let id = h.store.read().await.users[0].user_id;
+        h.store
+            .update(|s| s.users[0].entitlements.traffic_limit.total_bytes = Some(10))
+            .await
+            .unwrap();
+        h.shared
+            .pending()
+            .await
+            .insert(id, super::super::TxRx { tx: 10, rx: 0 });
+        let permit = restore_and_verify(
+            &ctx_of(&h),
+            &h.shared,
+            &literal_manifest(),
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(permit.projection()["gate-r000"], "deny");
+    }
+
+    // Store state is frozen but time is not: a receipt cannot carry an expired allow into owner commit.
+    #[tokio::test]
+    async fn activation_permit_rechecks_expiry_at_commit() {
+        let h = harness_with_pool().await;
+        h.store
+            .update(|s| s.users[0].entitlements.expires_at = Some("2026-09-11T00:00:01Z".into()))
+            .await
+            .unwrap();
+        h.hy2resi.set_selected(BTreeMap::from([
+            ("gate-r000".into(), "deny".into()),
+            ("gate-r001".into(), "deny".into()),
+        ]));
+        let permit = restore_and_verify(
+            &ctx_of(&h),
+            &h.shared,
+            &literal_manifest(),
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            permit.authorization_valid_until(),
+            Some(t0() + time::Duration::seconds(1))
+        );
+        assert!(permit
+            .validate_now(t0() + time::Duration::seconds(2))
+            .is_err());
+        assert!(permit
+            .validate_or_close(
+                t0() + time::Duration::seconds(2),
+                tokio::time::Instant::now() + Duration::from_secs(1)
+            )
+            .await
+            .is_err());
+        assert_eq!(h.hy2resi.selected()["gate-r000"], "deny");
+    }
+
+    // Bounding only sleeps would hang waiting for a competing gate writer.
+    #[tokio::test]
+    async fn activation_deadline_covers_lock_wait_and_ready_does_not_hold_gate() {
+        let h = harness_with_pool().await;
+        let ctx = ctx_of(&h);
+        let guard = h.shared.gate_guard().await;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(20);
+        assert!(
+            restore_and_verify(&ctx, &h.shared, &literal_manifest(), deadline)
+                .await
+                .is_err()
+        );
+        drop(guard);
+        h.hy2resi.set_never_ready();
+        let manifest = literal_manifest();
+        let work = restore_and_verify(
+            &ctx,
+            &h.shared,
+            &manifest,
+            tokio::time::Instant::now() + Duration::from_millis(40),
+        );
+        let observer = async {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            tokio::time::timeout(Duration::from_millis(10), h.shared.gate_guard())
+                .await
+                .unwrap();
+        };
+        let (result, ()) = tokio::join!(work, observer);
+        assert!(result.is_err());
+    }
+    // Catches caching an allow projection before acquiring the gate + Store writer.
+    #[tokio::test]
+    async fn activation_waiting_for_a_writer_observes_the_new_disable() {
+        let h = harness_with_pool().await;
+        h.hy2resi.set_selected(BTreeMap::from([
+            ("gate-r000".into(), "deny".into()),
+            ("gate-r001".into(), "deny".into()),
+        ]));
+        let guard = h.shared.gate_guard().await;
+        let ctx = ctx_of(&h);
+        let manifest = literal_manifest();
+        let future = restore_and_verify(
+            &ctx,
+            &h.shared,
+            &manifest,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        );
+        tokio::pin!(future);
+        tokio::select! { _=&mut future=>panic!("barrier must wait for gate writer"), _=tokio::time::sleep(Duration::from_millis(5))=>{} }
+        h.store
+            .update(|state| state.users[0].disabled = true)
+            .await
+            .unwrap();
+        drop(guard);
+        let permit = future.await.unwrap();
+        assert_eq!(permit.projection()["gate-r000"], "deny");
+    }
+
+    // Catches a final GET consuming the remaining expiry window without rechecking authorization.
+    #[tokio::test]
+    async fn expiry_during_final_readback_cannot_receive_an_activation_permit() {
+        let h = harness_with_pool().await;
+        h.store
+            .update(|state| {
+                state.users[0].entitlements.expires_at = Some("2026-09-11T00:00:01Z".into())
+            })
+            .await
+            .unwrap();
+        h.hy2resi.set_selected(BTreeMap::from([
+            ("gate-r000".into(), "deny".into()),
+            ("gate-r001".into(), "deny".into()),
+        ]));
+        let host = h.host.clone();
+        h.hy2resi.with(|i| {
+            i.on_inventory_read = Some(std::sync::Arc::new(move |read| {
+                if read == 2 {
+                    host.advance(2);
+                }
+            }))
+        });
+        assert!(restore_and_verify(
+            &ctx_of(&h),
+            &h.shared,
+            &literal_manifest(),
+            tokio::time::Instant::now() + Duration::from_secs(1)
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            h.hy2resi.selected()["gate-r000"],
+            "deny",
+            "expiry must close the grant before returning error"
+        );
+    }
+
+    // Catches pending->usage dropping bytes or bypassing an activation commit fence.
+    #[tokio::test]
+    async fn pending_flush_waits_for_commit_and_preserves_quota_bytes() {
+        let h = harness_with_pool().await;
+        let id = h.store.read().await.users[0].user_id;
+        h.store
+            .update(|s| s.users[0].entitlements.traffic_limit.total_bytes = Some(10))
+            .await
+            .unwrap();
+        h.shared
+            .pending()
+            .await
+            .insert(id, super::super::TxRx { tx: 10, rx: 0 });
+        h.shared.cache_mut().await.last_flush_at = Some(t0() - time::Duration::seconds(31));
+        h.hy2resi.set_selected(BTreeMap::from([
+            ("gate-r000".into(), "deny".into()),
+            ("gate-r001".into(), "deny".into()),
+        ]));
+        let ctx = ctx_of(&h);
+        let permit = restore_and_verify(
+            &ctx,
+            &h.shared,
+            &literal_manifest(),
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(permit.projection()["gate-r000"], "deny");
+        let flush = super::super::traffic::tick(&ctx, &h.shared);
+        tokio::pin!(flush);
+        tokio::select! {_=&mut flush=>panic!("flush must wait for activation commit"), _=tokio::time::sleep(Duration::from_millis(5))=>{}}
+        assert_eq!(h.shared.pending().await[&id].tx, 10);
+        assert_eq!(h.store.read().await.users[0].usage.total_bytes, 0);
+        drop(permit);
+        flush.await.unwrap();
+        assert_eq!(h.store.read().await.users[0].usage.total_bytes, 10);
+        assert!(h.shared.pending().await.is_empty());
+        assert_eq!(h.hy2resi.selected()["gate-r000"], "deny");
+    }
+
+    // Catches accepting another stock version or malformed product evidence as readiness.
+    #[tokio::test]
+    async fn activation_rejects_a_different_product_version() {
+        let h = harness_with_pool().await;
+        h.hy2resi.with(|i| i.version = "sing-box 1.14.1".into());
+        assert!(restore_and_verify(
+            &ctx_of(&h),
+            &h.shared,
+            &literal_manifest(),
+            tokio::time::Instant::now() + Duration::from_secs(1)
+        )
+        .await
+        .is_err());
+        assert_eq!(h.hy2resi.selected()["gate-r000"], "deny");
+    }
+
+    // Catches timeout_at polling an immediately-ready fake to success after an expired deadline.
+    #[tokio::test]
+    async fn activation_rejects_an_already_elapsed_deadline() {
+        let h = harness_with_pool().await;
+        h.hy2resi.set_selected(BTreeMap::from([
+            ("gate-r000".into(), "deny".into()),
+            ("gate-r001".into(), "deny".into()),
+        ]));
+        assert!(restore_and_verify(
+            &ctx_of(&h),
+            &h.shared,
+            &literal_manifest(),
+            tokio::time::Instant::now() - Duration::from_millis(1)
+        )
+        .await
+        .is_err());
+        assert_eq!(h.hy2resi.selected()["gate-r000"], "deny");
+    }
+
+    // Catches per-request timeouts allowing the whole activation to exceed its deadline.
+    #[tokio::test(start_paused = true)]
+    async fn activation_deadline_bounds_put_and_final_readback() {
+        for slow_put in [true, false] {
+            let h = harness_with_pool().await;
+            h.hy2resi.set_selected(BTreeMap::from([
+                ("gate-r000".into(), "deny".into()),
+                ("gate-r001".into(), "deny".into()),
+            ]));
+            h.hy2resi.with(|i| {
+                if slow_put {
+                    i.select_delay = Duration::from_secs(1);
+                } else {
+                    i.inventory_delays = vec![Duration::ZERO, Duration::from_secs(1)];
+                }
+            });
+            let start = tokio::time::Instant::now();
+            assert!(restore_and_verify(
+                &ctx_of(&h),
+                &h.shared,
+                &literal_manifest(),
+                start + Duration::from_millis(20)
+            )
+            .await
+            .is_err());
+            assert_eq!(
+                tokio::time::Instant::now() - start,
+                Duration::from_millis(20)
+            );
+            tokio::time::timeout(Duration::from_millis(1), h.shared.gate_guard())
+                .await
+                .unwrap();
+        }
+    }
 
     fn t0() -> time::OffsetDateTime {
         datetime!(2026-09-11 00:00:00 UTC)

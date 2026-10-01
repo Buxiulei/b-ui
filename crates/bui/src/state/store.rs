@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use bui_schema::model::State;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 
 /// 备份保留份数（spec §2.1）。
 pub const BACKUP_KEEP: usize = 10;
@@ -27,7 +27,20 @@ struct Inner {
     path: PathBuf,
     backups: PathBuf,
     cache: RwLock<Arc<State>>,
-    write: Mutex<()>,
+    write: Arc<Mutex<()>>,
+}
+
+/// Read-only fence on state publication. It leaves auth/snapshot reads concurrent.
+/// Dropping the permit releases the existing Store writer, never a separate lookalike lock.
+pub struct PublicationPermit {
+    guard: OwnedMutexGuard<()>,
+    current: Arc<State>,
+}
+
+impl PublicationPermit {
+    pub fn state(&self) -> &Arc<State> {
+        &self.current
+    }
 }
 
 impl Store {
@@ -62,7 +75,7 @@ impl Store {
             path,
             backups,
             cache: RwLock::new(Arc::new(state)),
-            write: Mutex::new(()),
+            write: Arc::new(Mutex::new(())),
         }))
     }
 
@@ -83,8 +96,24 @@ impl Store {
         caller: &'static str,
         f: impl FnOnce(&mut State),
     ) -> Result<Arc<State>> {
-        let _guard = self.0.write.lock().await;
+        let permit = self.publication_permit().await;
+        self.update_permitted(permit, caller, f).await
+    }
+
+    pub async fn publication_permit(&self) -> PublicationPermit {
+        let guard = self.0.write.clone().lock_owned().await;
         let current = self.read().await;
+        PublicationPermit { guard, current }
+    }
+
+    /// Consumes a writer permit already acquired in gate -> Store -> pending order.
+    pub(crate) async fn update_permitted(
+        &self,
+        permit: PublicationPermit,
+        caller: &'static str,
+        f: impl FnOnce(&mut State),
+    ) -> Result<Arc<State>> {
+        let PublicationPermit { guard, current } = permit;
         let old_bytes = serde_json::to_vec_pretty(&*current)?;
         let mut next = (*current).clone();
         f(&mut next);
@@ -100,16 +129,19 @@ impl Store {
         }
         let inner = self.0.clone();
         let bytes = new_bytes.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        let next = Arc::new(next);
+        tokio::task::spawn_blocking(move || -> Result<Arc<State>> {
+            // The blocking operation owns the writer through disk + cache publication,
+            // even when the async caller is cancelled.
+            let _guard = guard;
             if inner.path.exists() {
                 backup(&inner.path, &inner.backups)?;
             }
-            write_atomic(&inner.path, &bytes)
+            write_atomic(&inner.path, &bytes)?;
+            *inner.cache.blocking_write() = next.clone();
+            Ok(next)
         })
-        .await??;
-        let next = Arc::new(next);
-        *self.0.cache.write().await = next.clone();
-        Ok(next)
+        .await?
     }
 }
 
@@ -238,6 +270,51 @@ mod tests {
 
     fn dir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    // Catches a cancelled waiter releasing the writer while durable write/cache publish still runs.
+    #[tokio::test]
+    async fn cancelled_update_keeps_writer_until_cache_publication_finishes() {
+        let d = dir();
+        let store = Store::create(d.path().join("state.json"), sample_state())
+            .await
+            .unwrap();
+        let cache_read = store.0.cache.read().await;
+        let worker_store = store.clone();
+        let worker = tokio::spawn(async move {
+            worker_store
+                .update(|s| s.node.name = "durably-written".into())
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let bytes = std::fs::read(&store.0.path).unwrap();
+                let disk: State = serde_json::from_slice(&bytes).unwrap();
+                if disk.node.name == "durably-written" {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+        assert!(
+            store.0.write.try_lock().is_err(),
+            "writer fence must survive cancelled waiter until cache publishes"
+        );
+        drop(cache_read);
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if store.read().await.node.name == "durably-written" {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

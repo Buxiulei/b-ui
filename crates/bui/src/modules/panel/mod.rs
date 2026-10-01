@@ -157,7 +157,12 @@ pub trait Hy2ResiApi: Send + Sync {
     /// `DELETE /connections/{id}`：踢用户时「门切 `deny`」之后的逐条兜底
     async fn close_connection(&self, id: &str) -> anyhow::Result<()>;
     /// `GET /proxies` 一次读全部门位：selector tag → 当前成员
-    async fn selected_all(&self) -> anyhow::Result<BTreeMap<String, String>>;
+    async fn inventory(&self) -> anyhow::Result<hy2resi::GateInventory>;
+    async fn selected_all(&self) -> anyhow::Result<BTreeMap<String, String>> {
+        Ok(self.inventory().await?.selected())
+    }
+    /// Stock Clash API exposes product version, not instance identity or loaded-config SHA.
+    async fn version(&self) -> anyhow::Result<String>;
     /// `PUT /proxies/<selector>` `{"name":"<tag>"}`
     async fn select(&self, selector: &str, tag: &str) -> anyhow::Result<()>;
     /// `GET /version` 是否 2xx（住宅 sing-box 刚重启时还没起监听，重放门位前先探这一下）
@@ -170,11 +175,12 @@ pub struct Shared {
     applied: tokio::sync::Mutex<Applied>,
     /// 同步反应器的轮次锁（见 [`Shared::sync_guard`]）
     sync: tokio::sync::Mutex<()>,
-    pending: tokio::sync::Mutex<BTreeMap<Uuid, TxRx>>,
+    pending: Arc<tokio::sync::Mutex<BTreeMap<Uuid, TxRx>>>,
+    gate: Arc<tokio::sync::Mutex<()>>,
     xray_seen: tokio::sync::Mutex<BTreeMap<Uuid, OffsetDateTime>>,
     xray: Box<dyn XrayApi>,
     hy2: Box<dyn Hy2Api>,
-    hy2resi: Box<dyn Hy2ResiApi>,
+    hy2resi: Arc<dyn Hy2ResiApi>,
 }
 
 impl Shared {
@@ -184,7 +190,8 @@ impl Shared {
             cache: tokio::sync::RwLock::new(SampleCache::default()),
             applied: tokio::sync::Mutex::new(Applied::default()),
             sync: tokio::sync::Mutex::new(()),
-            pending: tokio::sync::Mutex::new(BTreeMap::new()),
+            pending: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+            gate: Arc::new(tokio::sync::Mutex::new(())),
             xray_seen: tokio::sync::Mutex::new(BTreeMap::new()),
             xray,
             hy2,
@@ -193,9 +200,9 @@ impl Shared {
             // 真按调用点数少数派（生产只有 `PanelModule::new` 一处）去改签名，代价是
             // 动 `users.rs` / `sentinel/*` 五处（T15 的签名收缩才碰它们）。
             #[cfg(test)]
-            hy2resi: Box::new(fakes::FakeHy2Resi::new()),
+            hy2resi: Arc::new(fakes::FakeHy2Resi::new()),
             #[cfg(not(test))]
-            hy2resi: Box::new(hy2resi::Hy2ResiClient::new()),
+            hy2resi: Arc::new(hy2resi::Hy2ResiClient::new()),
         }
     }
 
@@ -205,7 +212,7 @@ impl Shared {
     /// `fakes::FakeHy2Resi`。所以**这个 builder 只在测试要拿句柄记账 / 注入失败时才用**
     /// （T11 的 fail-closed 用例），漏用它也不会让测试去打 `127.0.0.1` 的两个回环面。
     pub fn with_hy2resi(mut self, hy2resi: Box<dyn Hy2ResiApi>) -> Self {
-        self.hy2resi = hy2resi;
+        self.hy2resi = Arc::from(hy2resi);
         self
     }
 
@@ -261,6 +268,11 @@ impl Shared {
     /// `traffic::write_health_summary` 会跟着卡住，`/api/users/health` 一起卡。
     pub async fn sync_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.sync.lock().await
+    }
+
+    /// All gate mutations and pending accounting share this writer.
+    pub async fn gate_guard(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.gate.clone().lock_owned().await
     }
 
     pub async fn pending(&self) -> tokio::sync::MutexGuard<'_, BTreeMap<Uuid, TxRx>> {
