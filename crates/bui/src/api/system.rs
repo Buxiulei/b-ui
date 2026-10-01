@@ -273,49 +273,146 @@ pub async fn service_action(
         )
             .into_response();
     }
-    let host = app.host.clone();
-    // 住宅入站被这个端点拉起来 / 重启之后，每个 `gate-<id>` selector 都回到
-    // `default = deny`（不开 `cache_file`，spec §14 裁决 1）⇒ 必须广播，让
-    // `gates::replay_loop` 立刻重放真实门位；少了它就是全体住宅 HY2 用户被拒到下一轮
-    // 60 秒安全网，且没有任何告警说明原因。`stop` 不发（门跟着内核一起没了）。
-    let announce = unit == "hysteria-residential" && matches!(action.as_str(), "restart" | "start");
-    // relay 被这个端点重启 / 拉起 = 一次**全池**切换：每个池 selector 的 `now` 都回落到
-    // 配置里的 default ⇒ 归因的时间戳门要当场对全池记一次（2026-09-18 第三次裁决 ③），
-    // 时刻取 `systemd` **返回之后**的 `app.host.now()`（第四次裁决 ①：systemctl 是阻塞的，
-    // selector 回落 default 就发生在那段里）。并且**要广播** `Event::RelayRestarted`
-    // （第四次裁决 ②，与上面 `hysteria-residential` 那条同口径）：让
-    // `health::replay_loop` 立刻把借用 / pin 中的槽重放回去，不必等 `drive_slots`
-    // 下一轮（最坏 2 分钟）。当场盖章保留：重放成功的池会在 `select` 返回后再记一次。
-    // `stop` 两件都不做（relay 停着时一个 selector 都没有）。
-    let relay_restarted = unit == "b-ui-relay" && matches!(action.as_str(), "restart" | "start");
-    let out = tokio::task::spawn_blocking(move || host.systemd(&action, &unit)).await;
-    match out {
-        Ok(Ok(o)) => {
-            if announce && o.ok() {
-                app.bus.send(Event::Hy2ResiRestarted);
-            }
-            if relay_restarted && o.ok() {
-                let pools = {
-                    let s = app.store.read().await;
-                    crate::modules::residential::state::all_pool_selectors(&s)
-                };
-                crate::modules::residential::state::mark_pools_switch(
-                    &app.runtime,
-                    &pools,
-                    app.host.now(),
+    if unit == crate::residential_lifecycle::UNIT {
+        use crate::residential_lifecycle::Action;
+        let intent = match action.as_str() {
+            "start" => Action::Start,
+            "restart" => Action::Restart,
+            "stop" => Action::Stop,
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error":"residential reload is unsupported"})),
                 )
-                .await;
-                app.bus.send(Event::RelayRestarted);
+                    .into_response()
             }
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({"ok": o.ok(), "detail": o.stderr})),
+        };
+        let ctx = crate::reconcile::DaemonCtx {
+            store: app.store.clone(),
+            runtime: app.runtime.clone(),
+            bus: app.bus.clone(),
+            host: app.host.clone(),
+            paths: control_paths(&app),
+        };
+        return match app.bus.residential().manual(ctx, intent).await {
+            Ok(receipt) => Json(serde_json::json!({"ok":true,"receipt":receipt})).into_response(),
+            Err(e) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": e.to_string()})),
             )
-                .into_response()
+                .into_response(),
+        };
+    }
+    let out = if unit == "b-ui-relay" {
+        let ctx = crate::reconcile::DaemonCtx {
+            store: app.store.clone(),
+            runtime: app.runtime.clone(),
+            bus: app.bus.clone(),
+            host: app.host.clone(),
+            paths: control_paths(&app),
+        };
+        app.bus
+            .residential()
+            .execute(move |tx| async move { tx.relay(&ctx, action).await })
+            .await
+    } else {
+        let host = app.host.clone();
+        match tokio::task::spawn_blocking(move || host.systemd(&action, &unit)).await {
+            Ok(out) => out,
+            Err(error) => Err(error.into()),
         }
+    };
+    match out {
+        Ok(o) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"ok": o.ok(), "detail": o.stderr})),
+        )
+            .into_response(),
         _ => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": "systemctl 调用失败"})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct UpgradeRequest {
+    version: Option<String>,
+    manifest_url: Option<String>,
+}
+
+pub async fn upgrade(
+    State(app): State<AppState>,
+    peer: Option<axum::Extension<crate::api::auth::UdsPeer>>,
+    Json(req): Json<UpgradeRequest>,
+) -> Response {
+    if peer.is_none_or(|p| p.0.uid != 0) {
+        return (StatusCode::FORBIDDEN, "upgrade requires the root UDS").into_response();
+    }
+    let job = tokio::spawn(async move {
+        let paths = control_paths(&app);
+        let ctx = crate::reconcile::DaemonCtx {
+            store: app.store.clone(),
+            runtime: app.runtime.clone(),
+            bus: app.bus.clone(),
+            host: app.host.clone(),
+            paths,
+        };
+        let changed = crate::commands::upgrade::publish_upgrade(
+            ctx.clone(),
+            req.version,
+            req.manifest_url,
+            std::sync::Arc::new(crate::kernels::HttpFetcher::new()),
+        )
+        .await?;
+        if changed {
+            let report = crate::state::runtime::ReconcileReport {
+                self_restart_required: true,
+                ..Default::default()
+            };
+            crate::serve::finish_self_restart(&ctx, &report, true).await;
+        }
+        Ok::<_, anyhow::Error>(changed)
+    });
+    match job.await {
+        Ok(Ok(changed)) => Json(serde_json::json!({"changed":changed})).into_response(),
+        result => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error":format!("{result:?}")})),
+        )
+            .into_response(),
+    }
+}
+
+fn control_paths(app: &AppState) -> bui_schema::paths::Paths {
+    let base = app.store.directory().to_path_buf();
+    bui_schema::paths::Paths {
+        bin_dir: base.join("bin"),
+        certs_dir: base.join("certs"),
+        base_dir: base,
+    }
+}
+
+pub async fn harden_ssh(
+    State(app): State<AppState>,
+    peer: Option<axum::Extension<crate::api::auth::UdsPeer>>,
+) -> Response {
+    if peer.is_none_or(|p| p.0.uid != 0) {
+        return (StatusCode::FORBIDDEN, "SSH hardening requires the root UDS").into_response();
+    }
+    let paths = control_paths(&app);
+    let owner = app.bus.residential();
+    match owner
+        .execute(move |_tx| async move {
+            crate::commands::harden_ssh::run_with(app.store, paths, app.host).await
+        })
+        .await
+    {
+        Ok(()) => Json(serde_json::json!({"ok":true})).into_response(),
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error":e.to_string()})),
         )
             .into_response(),
     }

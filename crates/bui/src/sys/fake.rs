@@ -60,6 +60,11 @@ pub struct FakeInner {
     /// 这个钩子就是把那段差值复现出来（对照 [`crate::modules::residential::clash::FakeClashInner::advance_on_select`]）。
     pub advance_on_systemd: i64,
     pub listening: BTreeMap<Proto, BTreeSet<u16>>,
+    pub fail_listening: BTreeSet<Proto>,
+    /// Explicit opt-in process fixtures; absent entries remain unknown.
+    pub instances: BTreeMap<String, u64>,
+    pub start_listeners: BTreeMap<String, (Proto, u16)>,
+    pub stock_singbox: bool,
     pub mem_mb: u64,
     pub arch: String,
     pub hostname: String,
@@ -115,6 +120,10 @@ impl Default for FakeInner {
             never_active: BTreeSet::new(),
             advance_on_systemd: 0,
             listening: BTreeMap::new(),
+            fail_listening: BTreeSet::new(),
+            instances: BTreeMap::new(),
+            start_listeners: BTreeMap::new(),
+            stock_singbox: false,
             mem_mb: 2048,
             arch: "x86_64".into(),
             hostname: "node-a".into(),
@@ -258,6 +267,42 @@ impl Host for FakeHost {
         Ok(())
     }
 
+    fn set_file_mode(&self, path: &Path, mode: u32) -> Result<()> {
+        let mut i = self.lock();
+        i.files
+            .get_mut(path)
+            .ok_or_else(|| anyhow::anyhow!("missing chmod target"))?
+            .1 = mode;
+        i.ops.push(format!("chmod:{}:{mode:03o}", path.display()));
+        Ok(())
+    }
+
+    fn sync_parent(&self, path: &Path) -> Result<()> {
+        let mut i = self.lock();
+        i.ops.push(format!("sync_parent:{}", path.display()));
+        anyhow::ensure!(
+            !i.fail_writes.contains(path),
+            "parent durability unavailable"
+        );
+        Ok(())
+    }
+
+    fn rename_file(&self, from: &Path, to: &Path) -> Result<()> {
+        let mut i = self.lock();
+        anyhow::ensure!(
+            !i.fail_writes.contains(to),
+            "rename destination unavailable"
+        );
+        let file = i
+            .files
+            .remove(from)
+            .ok_or_else(|| anyhow::anyhow!("missing rename source {}", from.display()))?;
+        i.files.insert(to.to_path_buf(), file);
+        i.ops
+            .push(format!("rename:{}:{}", from.display(), to.display()));
+        Ok(())
+    }
+
     fn stage_file<'a>(&'a self, dest: &Path, mode: u32) -> Result<Box<dyn StagedWrite + 'a>> {
         self.lock().staged.push(dest.to_path_buf());
         Ok(Box::new(FakeStaged {
@@ -364,6 +409,21 @@ impl Host for FakeHost {
                 return Ok(out.clone());
             }
         }
+        if line.starts_with("systemctl show hysteria-residential.service --property=InvocationID,")
+        {
+            if let Some(generation) = i.instances.get("hysteria-residential.service") {
+                let active = i.units_active.contains("hysteria-residential.service");
+                return Ok(CmdOut::success(&format!("LoadState=loaded\nActiveState={}\nSubState={}\nMainPID={}\nInvocationID={:032x}\nExecMainStartTimestampMonotonic={}\n", if active {"active"} else {"inactive"}, if active {"running"} else {"dead"}, if active {100 + generation} else {0}, generation, generation)));
+            }
+        }
+        if i.stock_singbox
+            && Path::new(program)
+                .file_name()
+                .is_some_and(|n| n == "sing-box")
+            && args == ["version"]
+        {
+            return Ok(CmdOut::success("sing-box version 1.14.2\n"));
+        }
         Ok(CmdOut::success(""))
     }
 
@@ -416,6 +476,12 @@ impl Host for FakeHost {
         // 语义跟真实 systemd 对齐：`disable` 不停服务，`stop` 不改 enable 状态。
         match verb {
             "start" | "restart" | "reload-or-restart" => {
+                if let Some(generation) = i.instances.get_mut(&full) {
+                    *generation += 1;
+                }
+                if let Some((proto, port)) = i.start_listeners.get(&full).copied() {
+                    i.listening.entry(proto).or_default().insert(port);
+                }
                 if !(i.never_active.contains(&full) || i.never_active.contains(&bare)) {
                     i.units_active.insert(full);
                 }
@@ -496,6 +562,10 @@ impl Host for FakeHost {
     }
 
     fn listening_ports(&self, proto: Proto) -> Result<BTreeSet<u16>> {
+        anyhow::ensure!(
+            !self.lock().fail_listening.contains(&proto),
+            "listener probe unavailable"
+        );
         Ok(self
             .lock()
             .listening

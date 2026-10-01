@@ -803,6 +803,7 @@ mod tests {
         .unwrap();
         apply(
             ApplyInput {
+                legacy_residential_cleanup: true,
                 plan: p,
                 paths: &ctx.paths,
                 facts: &ctx.facts,

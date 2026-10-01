@@ -22,6 +22,7 @@ mod modules;
 mod paths;
 mod reconcile;
 mod redact;
+mod residential_lifecycle;
 mod serve;
 mod state;
 mod sys;

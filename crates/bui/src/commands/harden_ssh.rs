@@ -1,9 +1,8 @@
 //! `bui harden-ssh`：只跑 ssh 模块的一次对账（spec §3.4 的提示语「加好公钥后运行
 //! `b-ui harden-ssh`」指向它）。
 //!
-//! 守护进程未运行时也放行：它只渲染 [`SshModule`] 的一个 artifact——不写 `.verify/`
-//! （`Verify::Sshd` 是「先写目标文件再 `sshd -t`」的特例，不落候选文件）、不写
-//! `runtime.json`、不碰任何内核单元，因此与守护进程正在跑的对账没有交叉写。
+//! 在线经 root UDS 交给 daemon 的控制 owner；离线持机器 lease 后才读状态与写配置。
+//! SSH-only apply 不运行住宅网络清理，避免越过这个命令的资源范围。
 
 use crate::modules::ssh::SshModule;
 use crate::reconcile::apply::{apply, ApplyInput, BinaryInstaller};
@@ -18,8 +17,26 @@ use std::path::Path;
 use std::sync::Arc;
 
 pub async fn run(paths: Paths, host: Arc<dyn Host>) -> Result<()> {
-    let store = Store::open(crate::paths::state_file(&paths)).await?;
-    run_with(store, paths, host).await
+    run_at_socket(paths, host, std::path::Path::new(crate::paths::SOCKET_PATH)).await
+}
+
+async fn run_at_socket(paths: Paths, host: Arc<dyn Host>, socket: &Path) -> Result<()> {
+    let client = crate::ipc::Client::new(socket);
+    if client.available().await {
+        let (status, body) = client.request("POST", "/api/harden-ssh", None).await?;
+        anyhow::ensure!(
+            (200..300).contains(&status),
+            "daemon SSH hardening failed (HTTP {status}): {body}"
+        );
+        println!("{body}");
+        return Ok(());
+    }
+    let lease_paths = paths.clone();
+    crate::residential_lifecycle::offline(&lease_paths, async move {
+        let store = Store::open(crate::paths::state_file(&paths)).await?;
+        run_with(store, paths, host).await
+    })
+    .await
 }
 
 pub async fn run_with(store: Store, paths: Paths, host: Arc<dyn Host>) -> Result<()> {
@@ -47,6 +64,7 @@ pub async fn run_with(store: Store, paths: Paths, host: Arc<dyn Host>) -> Result
         )?;
         Ok(apply(
             ApplyInput {
+                legacy_residential_cleanup: false,
                 plan: p,
                 paths: &paths,
                 facts: &ctx.facts,
@@ -94,6 +112,20 @@ mod tests {
             certs_dir: d.path().join("certs"),
             bin_dir: d.path().join("bin"),
         }
+    }
+
+    #[tokio::test]
+    async fn busy_owner_and_unavailable_uds_refuses_before_reading_state() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = scratch(&d);
+        let _lease = crate::residential_lifecycle::ControlLease::acquire(&paths).unwrap();
+        let host = Arc::new(FakeHost::new());
+        let error = run_at_socket(paths, host.clone(), &d.path().join("missing.sock"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("owner unavailable"));
+        assert!(host.ops().is_empty());
+        assert!(!d.path().join("state.json").exists());
     }
 
     #[tokio::test]
@@ -148,6 +180,37 @@ mod tests {
             "sshd -t 失败要回滚"
         );
         assert!(!host.ops().iter().any(|o| o.starts_with("systemd:reload")));
+    }
+
+    #[tokio::test]
+    async fn ssh_only_apply_does_not_touch_legacy_residential_network_state() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = scratch(&d);
+        let host = Arc::new(FakeHost::new());
+        host.write_file(
+            &paths.base_dir.join("config-residential.yaml"),
+            b"listen: :40000\n",
+            0o600,
+        )
+        .unwrap();
+        host.with(|i| {
+            i.which.insert("iptables".into());
+        });
+        let store = Store::create(
+            crate::paths::state_file(&paths),
+            crate::testutil::sample_state(),
+        )
+        .await
+        .unwrap();
+        host.clear_ops();
+        run_with(store, paths, host.clone()).await.unwrap();
+        assert!(
+            !host.ops().iter().any(|op| op.contains("iptables")
+                || op.contains("nft")
+                || op.contains("hysteria-residential")),
+            "{:?}",
+            host.ops()
+        );
     }
 
     #[tokio::test]

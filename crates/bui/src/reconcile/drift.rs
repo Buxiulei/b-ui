@@ -14,8 +14,10 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 /// `<base>` 顶层允许存在、但不是 artifact 的条目（少一项就会每轮报永久漂移）
-pub const BASE_WHITELIST: [&str; 14] = [
+pub const BASE_WHITELIST: [&str; 16] = [
     "bin",
+    ".residential-lifecycle",
+    ".residential-control.lock",
     "certs",
     "caddy",
     "packages",

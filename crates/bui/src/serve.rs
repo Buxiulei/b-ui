@@ -69,6 +69,7 @@ pub fn modules(manifest: Option<Manifest>) -> Registry {
 }
 
 pub struct ReconcileInput<'a> {
+    pub certificate_bootstrap: bool,
     pub state: &'a State,
     pub modules: &'a [Arc<dyn Module>],
     pub paths: &'a Paths,
@@ -82,7 +83,11 @@ pub struct ReconcileInput<'a> {
 pub fn reconcile_once(
     input: ReconcileInput<'_>,
     host: &dyn Host,
-) -> anyhow::Result<(ReconcileReport, BTreeMap<String, String>)> {
+) -> anyhow::Result<(
+    ReconcileReport,
+    BTreeMap<String, String>,
+    Option<crate::residential_lifecycle::Deferred>,
+)> {
     let facts = Facts::probe(host)?;
     let ctx = RenderCtx {
         paths: input.paths.clone(),
@@ -93,7 +98,7 @@ pub fn reconcile_once(
         artifacts.extend(m.render(input.state, &ctx));
     }
     let installed = crate::kernels::installed_versions(host, &input.paths.bin_dir);
-    let p = plan(
+    let mut p = plan(
         PlanInput {
             artifacts: &artifacts,
             paths: input.paths,
@@ -103,9 +108,14 @@ pub fn reconcile_once(
         },
         host,
     )?;
+    if input.certificate_bootstrap {
+        p.changes
+            .retain(|change| certificate_bootstrap_change(change, input.paths));
+    }
     let mut keys = input.keys.clone();
     let out = apply(
         ApplyInput {
+            legacy_residential_cleanup: !input.certificate_bootstrap,
             plan: p,
             paths: input.paths,
             facts: &ctx.facts,
@@ -162,7 +172,24 @@ pub fn reconcile_once(
     if out.relay_restarted {
         tracing::info!("b-ui-relay 已重启，需要重放选中的住宅上游");
     }
-    Ok((report, keys))
+    Ok((report, keys, out.residential))
+}
+
+/// Only prerequisites that can make the first certificate arrive. Keep the full
+/// artifact inventory for drift, but do not publish either sing-box consumer.
+fn certificate_bootstrap_change(change: &crate::reconcile::diff::Change, paths: &Paths) -> bool {
+    use crate::reconcile::diff::Change;
+    match change {
+        Change::WriteFile { path, .. } => {
+            path == &paths.base_dir.join("Caddyfile")
+                || path.starts_with(paths.base_dir.join("caddy"))
+        }
+        Change::WriteUnit { unit, .. } => matches!(unit.name.as_str(), "caddy" | "b-ui"),
+        Change::SetUnitState { unit, .. } => matches!(unit.as_str(), "caddy" | "b-ui"),
+        Change::InstallBinary { name, .. } => name == "caddy",
+        Change::WriteSymlink { .. } | Change::OpenPorts { .. } => true,
+        _ => false,
+    }
 }
 
 /// 从 [`DaemonCtx`] 跑一轮并把报告 / 漂移 / 重启键写进 runtime；relay 重启时发 [`Event::RelayRestarted`]。
@@ -177,56 +204,175 @@ pub async fn reconcile_from_ctx(
     force: bool,
     dry_run: bool,
 ) -> anyhow::Result<ReconcileReport> {
-    // spec §3.1 第三道防线：这一轮本来就要重写 `hy2-residential.json`（§3.5 那五件事之一）
-    // ⇒ 落盘前先把空闲凭据的 secret 重随机。放在读期望态之前：它自己也改期望态。
-    // `--dry-run` 一个字节都不许写。
     if !dry_run {
         crate::modules::residential::slots::reroll_idle_hy2_secrets(ctx).await;
     }
     let state = ctx.store.read().await;
     let keys = ctx.runtime.read().await.restart_keys;
-    let host = ctx.host.clone();
-    let paths = ctx.paths.clone();
-    let mods = modules.to_vec();
-    // 整轮对账（含 reqwest::blocking 下载内核）都在阻塞线程里跑：
-    // reqwest 文档明确 blocking 客户端在 async runtime 里会 panic。
-    let (report, keys) = tokio::task::spawn_blocking(move || {
-        let installer = KernelInstaller {
-            fetcher: fetcher.as_ref(),
-            host: host.as_ref(),
+    let (host, paths, mods) = (ctx.host.clone(), ctx.paths.clone(), modules.to_vec());
+    let state2 = state.clone();
+    let keys2 = keys.clone();
+    // Render a read-only plan, then download to private same-filesystem paths.
+    let (work, mut binaries) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let facts = Facts::probe(host.as_ref())?;
+        let render = RenderCtx {
+            paths: paths.clone(),
+            facts,
         };
-        reconcile_once(
-            ReconcileInput {
-                state: &state,
-                modules: &mods,
+        let artifacts: Vec<_> = mods
+            .iter()
+            .flat_map(|m| m.render(&state2, &render))
+            .collect();
+        let installed = crate::kernels::installed_versions(host.as_ref(), &paths.bin_dir);
+        let p = plan(
+            PlanInput {
+                artifacts: &artifacts,
                 paths: &paths,
-                keys: &keys,
-                installer: &installer,
-                force,
-                dry_run,
+                keys: &keys2,
+                installed_versions: &installed,
+                facts: &render.facts,
             },
             host.as_ref(),
-        )
+        )?;
+        let work = crate::residential_lifecycle::Deferred {
+            changes: p
+                .changes
+                .iter()
+                .filter(|c| crate::residential_lifecycle::is_residential_change(c, &paths))
+                .cloned()
+                .collect(),
+            keys: p
+                .keys
+                .iter()
+                .filter(|(k, _)| k.contains("hy2-residential.json"))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        };
+        let mut binaries = BTreeMap::new();
+        if !dry_run {
+            use crate::reconcile::diff::Change;
+            let installer = KernelInstaller {
+                fetcher: fetcher.as_ref(),
+                host: host.as_ref(),
+            };
+            for change in &p.changes {
+                if let Change::InstallBinary {
+                    name,
+                    version,
+                    sha256,
+                    url,
+                    ..
+                } = change
+                {
+                    if name == "sing-box" {
+                        anyhow::ensure!(
+                            version.trim_start_matches('v') == "1.14.2",
+                            "only stock sing-box 1.14.2 is supported"
+                        );
+                    }
+                    let path = paths
+                        .bin_dir
+                        .join(format!(".prepared-{}", uuid::Uuid::new_v4()))
+                        .join(name);
+                    use std::os::unix::fs::DirBuilderExt;
+                    std::fs::DirBuilder::new()
+                        .recursive(true)
+                        .mode(0o700)
+                        .create(path.parent().expect("candidate parent"))?;
+                    installer.install(name, version, sha256, url, &path)?;
+                    if name == "sing-box" {
+                        let version = host.run(&path.display().to_string(), &["version"])?;
+                        anyhow::ensure!(
+                            version.ok()
+                                && crate::kernels::parse_version("sing-box", &version.stdout)
+                                    .as_deref()
+                                    == Some("1.14.2"),
+                            "candidate is not stock sing-box 1.14.2"
+                        );
+                    }
+                    binaries.insert(
+                        name.clone(),
+                        crate::residential_lifecycle::Candidate {
+                            path,
+                            sha256: sha256.clone(),
+                        },
+                    );
+                }
+            }
+        }
+        Ok((work, binaries))
     })
     .await??;
-    if !dry_run {
-        ctx.runtime
-            .update(|r| {
-                r.restart_keys = keys;
-                r.drift = report.drift.clone();
-                r.last_reconcile = Some(report.clone());
-            })
-            .await;
+    let (c, mods) = (ctx.clone(), modules.to_vec());
+    ctx.bus.residential().execute(move |tx| async move {
+        let candidate = binaries.remove("sing-box");
+        let mut certificate_bootstrap = false;
+        let published = if !dry_run && !work.changes.is_empty() {
+            match tx.publish(&c, work, candidate).await {
+                Ok(published) => Some(published),
+                Err(error) if error.is::<crate::residential_lifecycle::AwaitingCertificate>() => { certificate_bootstrap = true; None },
+                Err(error) => return Err(error),
+            }
+        } else { None };
+        let shared_binary_changed = published.as_ref().is_some_and(|p| p.binary_changed);
+        let residential_activated = published.as_ref().is_some_and(|p| matches!(p.action, crate::residential_lifecycle::Action::Start | crate::residential_lifecycle::Action::Restart));
+        let (host, paths) = (c.host.clone(), c.paths.clone());
+        let current_state = c.store.read().await;
+        let (mut report, mut keys, _) = tokio::task::spawn_blocking(move || {
+            let installer = PreparedInstaller { host: host.as_ref(), binaries: &binaries };
+            reconcile_once(ReconcileInput { certificate_bootstrap, state: &current_state, modules: &mods, paths: &paths, keys: &keys, installer: &installer, force, dry_run }, host.as_ref())
+        }).await??;
+        if !dry_run {
+            let mut relay_failed = false;
+            if shared_binary_changed && !report.restarted.iter().any(|u| u == "b-ui-relay") {
+                let host = c.host.clone();
+                let ok = tokio::task::spawn_blocking(move || host.systemd("restart", "b-ui-relay").is_ok_and(|o| o.ok()) && host.unit_is_active("b-ui-relay").unwrap_or(false)).await?;
+                if ok { report.restarted.push("b-ui-relay".into()); } else { relay_failed = true; report.errors.push("shared sing-box relay activation failed".into()); }
+            }
+            let completion = if certificate_bootstrap {
+                report.notes.push("住宅与 relay 等待首张 TLS 证书；Caddy 与 daemon 启动前置已执行，尚未确认住宅 active".into());
+                crate::residential_lifecycle::read_record(&c)?.ok_or_else(|| anyhow::anyhow!("certificate pending receipt missing"))
+            } else if let Some(published) = published {
+                if relay_failed { tx.reject(&c, published, anyhow::anyhow!("shared sing-box relay activation failed")).await } else { tx.complete(&c, published).await }
+            } else if crate::residential_lifecycle::maintenance(&c)? {
+                crate::residential_lifecycle::read_record(&c)?.ok_or_else(|| anyhow::anyhow!("maintenance record missing"))
+            } else {
+                tx.activate(&c, crate::residential_lifecycle::Source::Recovery, crate::residential_lifecycle::Action::Observe, None).await
+            };
+            match completion {
+                Ok(receipt) => { if receipt.phase == "active" { keys.extend(receipt.pending_keys); if residential_activated { report.restarted.push("hysteria-residential".into()); } } }
+                Err(error) => report.errors.push(format!("residential activation: {error}")),
+            }
+            c.runtime.update(|r| { r.restart_keys = keys; r.drift = report.drift.clone(); r.last_reconcile = Some(report.clone()); }).await;
+        }
+        if report.restarted.iter().any(|u| u == "b-ui-relay") { c.bus.send(Event::RelayRestarted); }
+        Ok(report)
+    }).await
+}
+
+struct PreparedInstaller<'a> {
+    host: &'a dyn Host,
+    binaries: &'a BTreeMap<String, crate::residential_lifecycle::Candidate>,
+}
+impl BinaryInstaller for PreparedInstaller<'_> {
+    fn install(
+        &self,
+        name: &str,
+        _version: &str,
+        sha: &str,
+        _url: &str,
+        dest: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        let c = self
+            .binaries
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("kernel plan changed after preparation: {name}"))?;
+        anyhow::ensure!(
+            c.sha256 == sha && self.host.file_sha256(&c.path)?.as_deref() == Some(sha),
+            "prepared kernel identity changed"
+        );
+        self.host.rename_file(&c.path, dest)
     }
-    if report.restarted.iter().any(|u| u == "b-ui-relay") {
-        ctx.bus.send(Event::RelayRestarted);
-    }
-    // spec §3.4：住宅入站重启后每个门回到 default = deny（不开 `cache_file`），
-    // 订阅者立刻重放真实门位；不重放的话全体住宅 HY2 用户一直被拒到 60 秒安全网那一轮。
-    if hy2_resi_restarted(&report) {
-        ctx.bus.send(Event::Hy2ResiRestarted);
-    }
-    Ok(report)
 }
 
 /// 这一轮对账重启过住宅 HY2 入站吗（判据只有这一处）。
@@ -325,6 +471,7 @@ pub async fn selfcheck_loop(
             .await
             .ok()
             .flatten();
+        let expected_cache = cached.as_ref().and_then(|m| serde_json::to_vec(m).ok());
         let f = fetcher.clone();
         let u = url_override.clone();
         match tokio::task::spawn_blocking(move || {
@@ -338,17 +485,19 @@ pub async fn selfcheck_loop(
         .await
         {
             Ok(Ok(Some((_url, m)))) => {
-                // 写缓存：下次启动直接用，拉不到网也能装内核
+                let owned_ctx = ctx.clone();
+                let owned_manifest = manifest.clone();
+                let publication = ctx.bus.residential().execute(move |_tx| async move {
+                let ctx = owned_ctx;
+                let manifest = owned_manifest;
+                // A concurrent explicit upgrade supersedes this lock-free download.
+                let (h, p) = (ctx.host.clone(), ctx.paths.clone());
+                let current_cache = tokio::task::spawn_blocking(move || load_cached_manifest(h.as_ref(), &p).and_then(|m| serde_json::to_vec(&m).ok())).await?;
+                if current_cache != expected_cache { return Ok(()); }
                 let path = crate::paths::manifest_file(&ctx.paths);
-                match serde_json::to_vec_pretty(&m) {
-                    Ok(bytes) => {
-                        let h = ctx.host.clone();
-                        let _ =
-                            tokio::task::spawn_blocking(move || h.write_file(&path, &bytes, 0o644))
-                                .await;
-                    }
-                    Err(e) => tracing::warn!(error = %e, "manifest 序列化失败：{e}"),
-                }
+                let bytes = serde_json::to_vec_pretty(&m)?;
+                let h = ctx.host.clone();
+                tokio::task::spawn_blocking(move || h.write_file(&path, &bytes, 0o644)).await??;
                 // 「有没有新的 bui」不能只比版本号：rc 通道下 rc1 / rc2 / 正式版的 Cargo 版本号
                 // 都是同一个，同版本重建要靠 sha256 才认得出（`kernels::bui_build_differs`）。
                 // 读盘是阻塞调用，照本文件的铁律放进 spawn_blocking。
@@ -390,6 +539,11 @@ pub async fn selfcheck_loop(
                 }
                 // 内核版本随 manifest 走：请求一次对账（不 force）
                 ctx.bus.send(Event::ReconcileRequested { force: false });
+                Ok(())
+                }).await;
+                if let Err(e) = publication {
+                    tracing::warn!(error = %e, "manifest owner publication failed");
+                }
             }
             // 候选不比本机当前版本新（`pick_selfcheck_manifest` 已记一行）：缓存、内核、提示
             // 全不动，顺带把可能留下的假「可升级」清掉（事故里它被写成了更旧的 4.0.0）
@@ -459,10 +613,15 @@ pub async fn backfill_public_ip(store: &Store, host: Arc<dyn Host>) {
 
 /// `bui serve`：装好 Router 与全部后台任务，监听面板 HTTP 与 unix socket。
 pub async fn run(paths: Paths, host: Arc<dyn Host>) -> anyhow::Result<()> {
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let lease = Arc::new(crate::residential_lifecycle::ControlLease::acquire(&paths)?);
     let store = Store::open(crate::paths::state_file(&paths)).await?;
+    store.retain_control_lease(lease.clone());
     // 在启动对账之前补：渲染出来的配置与订阅都读 `node.public_ip`
-    backfill_public_ip(&store, host.clone()).await;
+
     let runtime = Runtime::load(crate::paths::runtime_file(&paths));
+    runtime.retain_control_lease(lease);
     let bus = EventBus::new();
     let cached = {
         let h = host.clone();
@@ -472,6 +631,7 @@ pub async fn run(paths: Paths, host: Arc<dyn Host>) -> anyhow::Result<()> {
     let reg = modules(cached);
     let mods = reg.modules.clone();
     let panel = reg.panel.clone();
+    bus.bind_residential(panel.clone());
     let fetcher: Arc<dyn Fetcher> = Arc::new(HttpFetcher::new());
     let ctx = DaemonCtx {
         store: store.clone(),
@@ -495,6 +655,14 @@ pub async fn run(paths: Paths, host: Arc<dyn Host>) -> anyhow::Result<()> {
     let app = crate::api::router(app_state, &mods);
     // spec §5.6 规则 4：旧 state 没有 slots 字段时补齐，既有住宅用户按创建时间轮流落槽。
     // 幂等，所以每次启动无条件跑一次；失败只告警（对账仍能按单槽视图渲染，行为退回 v3）。
+    // Bind native authentication before any long residential control operation.
+    let (_, mut tasks) = crate::modules::panel::auth_http::start(
+        ctx.clone(),
+        panel.clone(),
+        std::net::SocketAddr::from(([127, 0, 0, 1], bui_schema::render::hysteria::AUTH_HTTP_PORT)),
+    )
+    .await?;
+    backfill_public_ip(&ctx.store, host.clone()).await;
     match crate::modules::residential::slots::migrate_on_start(&ctx.store, &bus).await {
         // spec §5.6 + D7：迁移动过分槽 ⇒ 槽规则要跟着收敛，这里只置脏，
         // 收口交给紧接着那一轮对账末尾的 converge_xray
@@ -518,8 +686,7 @@ pub async fn run(paths: Paths, host: Arc<dyn Host>) -> anyhow::Result<()> {
     {
         tracing::warn!(error = %e, "补随机订阅 token 失败，下次启动重试：{e}");
     }
-    // 启动时先对账一次，再拉起后台任务
-    let mut startup_restarted_hy2_resi = false;
+
     match reconcile_from_ctx(&ctx, &mods, fetcher.clone(), false, false).await {
         Ok(r) => {
             tracing::info!(
@@ -527,7 +694,6 @@ pub async fn run(paths: Paths, host: Arc<dyn Host>) -> anyhow::Result<()> {
                 restarted = r.restarted.len(),
                 "启动对账完成"
             );
-            startup_restarted_hy2_resi = hy2_resi_restarted(&r);
             // 报告已落盘，这时才允许重启自己（B5）
             finish_self_restart(&ctx, &r, true).await;
         }
@@ -537,42 +703,8 @@ pub async fn run(paths: Paths, host: Arc<dyn Host>) -> anyhow::Result<()> {
     // 走 RoutingService gRPC 增删受影响用户的规则，**不重启 xray**；只有 gRPC 失败且
     // 文件已落地才退回一次重启。干净时是零成本 no-op，所以无条件调。
     crate::modules::residential::slots::converge_xray(&ctx, panel.xray()).await;
-    let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     for m in &mods {
         tasks.extend(m.spawn(ctx.clone()));
-    }
-    // spec §3.4：启动那一轮对账重启了住宅入站 ⇒ 启动路径**自己**补一次门位重放。
-    // 上面那一轮发的 `Event::Hy2ResiRestarted` 必然被丢弃：那一刻总线上一个订阅者都没有
-    // （`EventBus` 是裸 `broadcast::Sender`，`send` 吞 Err），`gates::replay_loop` 要到上面
-    // 那行 `m.spawn(..)` 才订阅。少了这一次重放，「重启后按 `ready()` 探测 + 15 秒退避重放」
-    // 这条路在**最常发生的场景**（升级 / 首装 / 任何改了住宅配置的重启）根本不走，兜底只剩
-    // `sync_loop` 起来时那一次 `sync_now` —— 它没有 `ready()` 探测，sing-box 刚重启时
-    // `GET /proxies` 大概率还连不上 ⇒ 全体住宅 HY2 用户停在 `deny`（握手成功、每个请求被拒）。
-    // 不走总线而直接调：这样它不依赖「补发必须晚于 spawn」这个顺序，挪到哪里都成立。
-    if startup_restarted_hy2_resi {
-        let (c, sh) = (ctx.clone(), panel.clone());
-        tasks.push(tokio::spawn(async move {
-            crate::modules::panel::gates::replay_after_restart(&c, &sh).await;
-        }));
-    }
-    // Hysteria2 的 http 鉴权（spec §3.2）：**独立**监听 127.0.0.1:AUTH_HTTP_PORT，
-    // 绝不挂在下面那个面板监听上 —— 面板经 Caddy 对外，挂上去等于把鉴权面暴露到公网。
-    // 无条件起：`hy2_auth=command` 时它只是没人来敲，换回 http 就不必重启守护进程。
-    {
-        let auth = Arc::new(crate::modules::panel::auth_http::AuthHttp::new(
-            paths.clone(),
-            host.clone(),
-        ));
-        tasks.push(tokio::spawn(
-            crate::modules::panel::auth_http::refresh_loop(
-                ctx.clone(),
-                panel.clone(),
-                auth.clone(),
-            ),
-        ));
-        tasks.push(tokio::spawn(crate::modules::panel::auth_http::serve_loop(
-            auth,
-        )));
     }
     // 守护进程里**只有这一个** consumer 会调 reconcile_from_ctx（启动那一轮在它之前、串行跑完）：
     // 去抖触发、10 分钟巡检、每日自检（经 bus → 去抖）全部经这条 mpsc 排队，天然互斥。
@@ -620,7 +752,13 @@ pub async fn run(paths: Paths, host: Arc<dyn Host>) -> anyhow::Result<()> {
     )));
     let sock = PathBuf::from(crate::paths::SOCKET_PATH);
     let admin_bind = format!("127.0.0.1:{}", ctx.store.read().await.node.ports.admin);
-    let http = tokio::net::TcpListener::bind(&admin_bind).await?;
+    let http = match tokio::net::TcpListener::bind(&admin_bind).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            drain_tasks(&ctx, tasks).await;
+            return Err(error.into());
+        }
+    };
     tracing::info!(bind = %admin_bind, "面板 HTTP 就绪（Caddy 反代）");
     let app_uds = app.clone();
     tasks.push(tokio::spawn(async move {
@@ -632,16 +770,23 @@ pub async fn run(paths: Paths, host: Arc<dyn Host>) -> anyhow::Result<()> {
     let service = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
     // systemd stop / restart 发的是 SIGTERM，不是 SIGINT：只 select ctrl_c 的话
     // `systemctl restart b-ui` 时后台任务不会走 abort 路径（socket 文件也不会被清掉）。
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    tokio::select! {
-        r = axum::serve(http, service).into_future() => { r?; }
-        _ = sigterm.recv() => tracing::info!("收到 SIGTERM，退出"),
-        _ = tokio::signal::ctrl_c() => tracing::info!("收到中断，退出"),
+    let result = tokio::select! {
+        r = axum::serve(http, service).into_future() => r.map_err(anyhow::Error::from),
+        _ = sigterm.recv() => { tracing::info!("收到 SIGTERM，退出"); Ok(()) },
+        _ = sigint.recv() => { tracing::info!("收到中断，退出"); Ok(()) },
+    };
+    drain_tasks(&ctx, tasks).await;
+    result
+}
+
+async fn drain_tasks(ctx: &DaemonCtx, tasks: Vec<tokio::task::JoinHandle<()>>) {
+    ctx.bus.residential().drain().await;
+    for task in &tasks {
+        task.abort();
     }
-    for t in tasks {
-        t.abort();
+    for task in tasks {
+        let _ = task.await;
     }
-    Ok(())
 }
 
 /// `bui reconcile`：socket 可用就走 API，否则进程内直接跑。
@@ -667,6 +812,21 @@ pub async fn reconcile_cli(
         println!("已提交给守护进程（HTTP {status}）：{body}");
         return Ok(());
     }
+    let lease = crate::residential_lifecycle::ControlLease::acquire(&paths)?;
+    tokio::spawn(async move {
+        let result = reconcile_offline(paths, host, force, dry_run, lease).await;
+        result
+    })
+    .await?
+}
+
+pub async fn reconcile_offline(
+    paths: Paths,
+    host: Arc<dyn Host>,
+    force: bool,
+    dry_run: bool,
+    lease: crate::residential_lifecycle::ControlLease,
+) -> anyhow::Result<()> {
     let store = Store::open(crate::paths::state_file(&paths)).await?;
     let runtime = Runtime::load(crate::paths::runtime_file(&paths));
     let ctx = DaemonCtx {
@@ -682,10 +842,13 @@ pub async fn reconcile_cli(
         tokio::task::spawn_blocking(move || load_cached_manifest(h.as_ref(), &p)).await?
     };
     let reg = modules(cached);
+    ctx.bus.bind_residential(reg.panel.clone());
     let fetcher: Arc<dyn Fetcher> = Arc::new(HttpFetcher::new());
     let report = reconcile_from_ctx(&ctx, &reg.modules, fetcher, force, dry_run).await?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     // CLI 路径：报告与 restart_keys 已落盘，这时同步重启守护进程（B5）
+    ctx.bus.residential().drain().await;
+    drop(lease);
     finish_self_restart(&ctx, &report, false).await;
     if !report.errors.is_empty() || !report.verify_failures.is_empty() {
         anyhow::bail!("对账有失败项，见上面的报告");
@@ -790,6 +953,7 @@ mod tests {
         installer: &'a dyn crate::reconcile::apply::BinaryInstaller,
     ) -> ReconcileInput<'a> {
         ReconcileInput {
+            certificate_bootstrap: false,
             state,
             modules: mods,
             paths,
@@ -807,7 +971,7 @@ mod tests {
         let paths = bui_schema::paths::Paths::default_server();
         let reg = modules(None);
         let keys = BTreeMap::new();
-        let (first, keys) = reconcile_once(
+        let (first, keys, _) = reconcile_once(
             input(&state, &reg.modules, &paths, &keys, &NoopInstaller),
             host.as_ref(),
         )
@@ -850,7 +1014,7 @@ mod tests {
             "{keys:?}"
         );
         host.clear_ops();
-        let (second, _) = reconcile_once(
+        let (second, _, _) = reconcile_once(
             input(&state, &reg.modules, &paths, &keys, &NoopInstaller),
             host.as_ref(),
         )
@@ -912,7 +1076,7 @@ mod tests {
         let state = crate::testutil::sample_state();
         let paths = bui_schema::paths::Paths::default_server();
         let reg = modules(None);
-        let (first, keys) = reconcile_once(
+        let (first, keys, deferred) = reconcile_once(
             input(
                 &state,
                 &reg.modules,
@@ -963,16 +1127,15 @@ mod tests {
             .as_deref(),
             "{keys:?}"
         );
-        // ③
-        assert_eq!(
-            host.text("/etc/systemd/system/hysteria-residential.service")
-                .map(|t| t.contains("sing-box run -c /opt/b-ui/hy2-residential.json")),
-            Some(true)
-        );
-        assert!(host.text("/opt/b-ui/hy2-residential.json").is_some());
+        // Residential artifacts are handed to the owner before any activation.
+        assert!(host
+            .text("/etc/systemd/system/hysteria-residential.service")
+            .is_none());
+        assert!(host.text("/opt/b-ui/hy2-residential.json").is_none());
+        assert!(deferred.unwrap().changes.iter().any(|c| matches!(c, crate::reconcile::diff::Change::WriteUnit { unit, .. } if unit.name == "hysteria-residential")));
         // ④
         host.clear_ops();
-        let (second, _) = reconcile_once(
+        let (second, _, _) = reconcile_once(
             input(&state, &reg.modules, &paths, &keys, &NoopInstaller),
             host.as_ref(),
         )
@@ -1001,7 +1164,7 @@ mod tests {
         let state = crate::testutil::sample_state();
         let paths = bui_schema::paths::Paths::default_server();
         let reg = modules(None);
-        let (first, keys) = reconcile_once(
+        let (first, keys, _) = reconcile_once(
             input(
                 &state,
                 &reg.modules,
@@ -1019,7 +1182,7 @@ mod tests {
             first.notes
         );
         assert!(!keys.contains_key("nft:inet:bui"), "没落地就不许记账");
-        let (second, _) = reconcile_once(
+        let (second, _, _) = reconcile_once(
             input(&state, &reg.modules, &paths, &keys, &NoopInstaller),
             host.as_ref(),
         )
@@ -1040,7 +1203,7 @@ mod tests {
         let state = crate::testutil::sample_state();
         let paths = bui_schema::paths::Paths::default_server();
         let reg = modules(None);
-        let (first, keys) = reconcile_once(
+        let (first, keys, _) = reconcile_once(
             input(
                 &state,
                 &reg.modules,
@@ -1057,7 +1220,7 @@ mod tests {
             "被钳制的键要留一条提示：{:?}",
             first.notes
         );
-        let (second, _) = reconcile_once(
+        let (second, _, _) = reconcile_once(
             input(&state, &reg.modules, &paths, &keys, &NoopInstaller),
             host.as_ref(),
         )
@@ -1075,7 +1238,7 @@ mod tests {
         let state = crate::testutil::sample_state();
         let paths = bui_schema::paths::Paths::default_server();
         let reg = modules(None);
-        let (_, keys) = reconcile_once(
+        let (_, keys, _) = reconcile_once(
             input(
                 &state,
                 &reg.modules,
@@ -1089,7 +1252,7 @@ mod tests {
         host.write_file(Path::new("/opt/b-ui/config.yaml"), b"listen: :1\n", 0o600)
             .unwrap();
         host.clear_ops();
-        let (report, _) = reconcile_once(
+        let (report, _, _) = reconcile_once(
             input(&state, &reg.modules, &paths, &keys, &NoopInstaller),
             host.as_ref(),
         )
@@ -1110,7 +1273,7 @@ mod tests {
         let state = crate::testutil::sample_state();
         let paths = bui_schema::paths::Paths::default_server();
         let reg = modules(None);
-        let (report, keys) = reconcile_once(
+        let (report, keys, _) = reconcile_once(
             input(
                 &state,
                 &reg.modules,
@@ -1136,7 +1299,7 @@ mod tests {
         );
         let mut forced = input(&state, &reg.modules, &paths, &keys, &NoopInstaller);
         forced.force = true;
-        let (report2, _) = reconcile_once(forced, host.as_ref()).unwrap();
+        let (report2, _, _) = reconcile_once(forced, host.as_ref()).unwrap();
         assert!(
             host.text("/etc/systemd/system/xray.service.d/50-manual.conf")
                 .is_none(),
@@ -1160,7 +1323,7 @@ mod tests {
         let state = crate::testutil::sample_state();
         let paths = bui_schema::paths::Paths::default_server();
         let reg = modules(None);
-        let (first, keys) = reconcile_once(
+        let (first, keys, _) = reconcile_once(
             input(
                 &state,
                 &reg.modules,
@@ -1188,7 +1351,7 @@ mod tests {
             !keys.contains_key("firewall"),
             "没改过防火墙就不该记 key：{keys:?}"
         );
-        let (second, _) = reconcile_once(
+        let (second, _, _) = reconcile_once(
             input(&state, &reg.modules, &paths, &keys, &NoopInstaller),
             host.as_ref(),
         )
@@ -1206,7 +1369,7 @@ mod tests {
         let state = crate::testutil::sample_state();
         let paths = bui_schema::paths::Paths::default_server();
         let reg = modules(None);
-        let (report, _) = reconcile_once(
+        let (report, _, _) = reconcile_once(
             input(
                 &state,
                 &reg.modules,
@@ -1257,7 +1420,7 @@ mod tests {
         let state = crate::testutil::sample_state();
         let paths = bui_schema::paths::Paths::default_server();
         let reg = modules(Some(m));
-        let (report, _) = reconcile_once(
+        let (_report, _, deferred) = reconcile_once(
             input(
                 &state,
                 &reg.modules,
@@ -1268,11 +1431,7 @@ mod tests {
             host.as_ref(),
         )
         .unwrap();
-        assert!(
-            report.changed.iter().any(|c| c.contains("sing-box")),
-            "{:?}",
-            report.changed
-        );
+        assert!(deferred.unwrap().changes.iter().any(|c| matches!(c, crate::reconcile::diff::Change::InstallBinary { name, .. } if name == "sing-box")));
     }
 
     #[test]
@@ -1284,7 +1443,7 @@ mod tests {
         let keys = BTreeMap::new();
         let mut i = input(&state, &reg.modules, &paths, &keys, &NoopInstaller);
         i.dry_run = true;
-        let (report, _) = reconcile_once(i, host.as_ref()).unwrap();
+        let (report, _, _) = reconcile_once(i, host.as_ref()).unwrap();
         assert!(!report.changed.is_empty());
         assert!(report.dry_run);
         assert!(host.text("/opt/b-ui/config.yaml").is_none());
@@ -1340,7 +1499,17 @@ mod tests {
     }
 
     async fn ctx_for(host: Arc<FakeHost>, d: &tempfile::TempDir) -> DaemonCtx {
-        let store = Store::create(d.path().join("state.json"), crate::testutil::sample_state())
+        host.with(|i| {
+            i.instances.insert("hysteria-residential.service".into(), 1);
+            i.stock_singbox = true;
+            i.listening
+                .entry(crate::sys::Proto::Udp)
+                .or_default()
+                .insert(40000);
+        });
+        let mut state = crate::testutil::sample_state();
+        bui_schema::hy2pool::grow(&mut state.residential.hy2_pool, 32, &Default::default());
+        let store = Store::create(d.path().join("state.json"), state)
             .await
             .unwrap();
         let runtime = Runtime::load(d.path().join("runtime.json"));
@@ -1740,7 +1909,7 @@ mod tests {
     /// 重启会把每个门打回 `default = deny`，不重放就是全体住宅 HY2 用户被拒到 60 秒安全网
     /// 那一轮。
     #[tokio::test]
-    async fn restarting_the_residential_inbound_announces_it_on_the_bus() {
+    async fn residential_reconcile_finishes_with_a_durable_active_receipt() {
         let host = ready_host();
         let d = tempfile::tempdir().unwrap();
         let ctx = ctx_for(host.clone(), &d).await;
@@ -1760,8 +1929,15 @@ mod tests {
             seen.push(e);
         }
         assert!(
-            seen.contains(&Event::Hy2ResiRestarted),
-            "住宅入站重启没有广播出去：{seen:?}"
+            !seen.contains(&Event::Hy2ResiRestarted),
+            "residential completion must not rely on asynchronous replay: {seen:?}"
+        );
+        assert_eq!(
+            crate::residential_lifecycle::read_record(&ctx)
+                .unwrap()
+                .unwrap()
+                .phase,
+            "active"
         );
     }
 
@@ -1899,11 +2075,20 @@ mod tests {
             let v: serde_json::Value = serde_json::from_str(&text).unwrap();
             v["inbounds"][0]["users"].as_array().map_or(0, Vec::len)
         };
-        // 反面（顺序破了）：池还没迁移就对账
-        reconcile_from_ctx(&ctx, &reg.modules, fetcher.clone(), false, false)
+        ctx.store
+            .update(|s| s.residential.hy2_pool = Default::default())
             .await
             .unwrap();
-        assert_eq!(auth_users(), 0, "空池 ⇒ 谁都通不过住宅入站的鉴权");
+        // Empty candidate is rejected before publishing or starting the service.
+        reconcile_from_ctx(&ctx, &reg.modules, fetcher.clone(), false, false)
+            .await
+            .unwrap_err();
+        assert!(host
+            .read_file(&crate::modules::core_files::hy2_resi_config_path(
+                &ctx.paths
+            ))
+            .unwrap()
+            .is_none());
         // 生产顺序：先迁移池，再对账
         crate::modules::residential::slots::migrate_hy2_pool_on_start(&ctx)
             .await

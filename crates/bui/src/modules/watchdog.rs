@@ -623,6 +623,7 @@ pub struct Target {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
     Healthy,
+    Unknown,
     Failing { fails: u32 },
     Restart,
     Backoff,
@@ -734,7 +735,19 @@ pub fn run_stamp(now: OffsetDateTime) -> serde_json::Value {
 ///
 /// [`Event::RelayRestarted`]: crate::api::Event::RelayRestarted
 pub async fn check_once(ctx: &DaemonCtx) -> anyhow::Result<Vec<(String, Decision)>> {
-    let state = ctx.store.read().await;
+    let owner = ctx.bus.residential();
+    let c = ctx.clone();
+    // The table shares the publication resource with apply. Sample only after
+    // admission, so a queued replay cannot overwrite a newly committed topology.
+    let (state, nft) = owner
+        .execute(move |_tx| async move {
+            let state = c.store.read().await;
+            let sample = state.clone();
+            let nft =
+                tokio::task::spawn_blocking(move || check_nft(c.host.as_ref(), &sample)).await?;
+            Ok((state, nft))
+        })
+        .await?;
     let targets = targets(&state);
     let rt = ctx.runtime.read().await;
     let mut heals: std::collections::BTreeMap<String, ChainHeal> = rt
@@ -753,8 +766,8 @@ pub async fn check_once(ctx: &DaemonCtx) -> anyhow::Result<Vec<(String, Decision
     let mut records = rt.watchdog;
     let host = ctx.host.clone();
     let paths = ctx.paths.clone();
-    let st = state.clone();
-    let (decisions, records, heals, nft, now, restarted) =
+    let action_targets = targets.clone();
+    let (mut decisions, mut records, heals, now, restarted) =
         tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             let now = host.now();
             // 本轮真的被 `systemctl restart` 过的单元（自愈 + 监听失活两条来路都记）
@@ -775,32 +788,99 @@ pub async fn check_once(ctx: &DaemonCtx) -> anyhow::Result<Vec<(String, Decision
                     restarted.insert(unit.to_string());
                 }
             }
-            // 住宅那一侧的自愈：表被人删了 / 规则不符就整表重放（采样在重放之前）
-            let nft = check_nft(&*host, &st);
-            let udp = host.listening_ports(Proto::Udp).unwrap_or_default();
-            let tcp = host.listening_ports(Proto::Tcp).unwrap_or_default();
+            let udp = host.listening_ports(Proto::Udp);
+            let tcp = host.listening_ports(Proto::Tcp);
             let mut out = Vec::with_capacity(targets.len());
             for t in &targets {
                 let rec = records.entry(t.unit.clone()).or_default();
-                let alive = host.unit_is_active(&t.unit).unwrap_or(false);
-                let listening = match t.proto {
-                    Proto::Udp => udp.contains(&t.port),
-                    Proto::Tcp => tcp.contains(&t.port),
+                let alive = host.unit_is_active(&t.unit);
+                let ports = match t.proto {
+                    Proto::Udp => &udp,
+                    Proto::Tcp => &tcp,
                 };
-                let d = decide(rec, alive, listening, now);
+                let (Ok(alive), Ok(ports)) = (alive, ports) else {
+                    out.push((t.unit.clone(), Decision::Unknown));
+                    continue;
+                };
+                let previous = rec.clone();
+                let d = decide(rec, alive, ports.contains(&t.port), now);
                 if d == Decision::Restart {
-                    tracing::warn!(unit = %t.unit, port = t.port, "监听失活连续 2 轮，重启");
-                    let _ = host.systemd("restart", &t.unit);
-                    restarted.insert(t.unit.clone());
+                    if matches!(
+                        t.unit.as_str(),
+                        crate::residential_lifecycle::UNIT | "b-ui-relay"
+                    ) {
+                        *rec = previous; // only the owned outcome accounts a restart
+                    } else if host.systemd("restart", &t.unit).is_ok_and(|o| o.ok()) {
+                        restarted.insert(t.unit.clone());
+                    } else {
+                        *rec = previous;
+                    }
                 }
                 out.push((t.unit.clone(), d));
             }
-            Ok((out, records, heals, nft, now, restarted))
+            Ok((out, records, heals, now, restarted))
         })
         .await??;
-    // 门位在重启时全部回落 `deny` ⇒ 通知 `gates::replay_loop` 立刻重放（见本函数文档）
-    if restarted.contains("hysteria-residential") {
-        ctx.bus.send(crate::api::Event::Hy2ResiRestarted);
+    for (unit, decision) in &mut decisions {
+        if unit == "b-ui-relay" && *decision == Decision::Restart {
+            let c = ctx.clone();
+            let target = action_targets
+                .iter()
+                .find(|t| t.unit == *unit)
+                .expect("relay target");
+            let (proto, port) = (target.proto, target.port);
+            match owner
+                .execute(move |tx| async move {
+                    let host = c.host.clone();
+                    let missing = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+                        Ok(host.unit_is_active("b-ui-relay")?
+                            && !host.listening_ports(proto)?.contains(&port))
+                    })
+                    .await??;
+                    if !missing {
+                        return Ok(false);
+                    }
+                    let out = tx.relay(&c, "restart".into()).await?;
+                    anyhow::ensure!(out.ok(), "relay watchdog restart failed");
+                    Ok(true)
+                })
+                .await
+            {
+                Ok(true) => {
+                    let _ = decide(
+                        records.entry(unit.clone()).or_default(),
+                        true,
+                        false,
+                        ctx.host.now(),
+                    );
+                }
+                Ok(false) => *decision = Decision::Healthy,
+                Err(error) => {
+                    tracing::warn!(%error, "relay watchdog operation unconfirmed");
+                    *decision = Decision::Unknown;
+                }
+            }
+        }
+        if unit == crate::residential_lifecycle::UNIT && *decision == Decision::Restart {
+            let target = action_targets
+                .iter()
+                .find(|t| t.unit == *unit)
+                .expect("watchdog target");
+            match owner.watchdog(ctx.clone(), target.proto, target.port).await {
+                Ok(true) => {
+                    let rec = records.entry(unit.clone()).or_default();
+                    let _ = decide(rec, true, false, ctx.host.now());
+                }
+                Ok(false) => *decision = Decision::Healthy,
+                Err(error) => {
+                    tracing::warn!(%error, "residential watchdog operation unconfirmed");
+                    *decision = Decision::Unknown;
+                }
+            }
+        }
+    }
+    if let Err(error) = owner.repair(ctx.clone()).await {
+        tracing::warn!(%error, "residential instance recovery pending");
     }
     // relay 被重启过 = 一次**全池**切换：它的每个池 selector 的 `now` 都回落到配置里的
     // default，归因的时间戳门要当场对全池记一次（2026-09-18 第三次裁决 ③），否则这一刻
@@ -992,12 +1072,84 @@ mod tests {
     fn acting_ops(host: &FakeHost) -> Vec<String> {
         host.ops()
             .into_iter()
-            .filter(|o| !o.starts_with("run:journalctl"))
+            .filter(|o| !o.starts_with("run:journalctl") && !o.starts_with("run:systemctl show"))
             .collect()
     }
 
     async fn ctx(host: Arc<FakeHost>) -> (crate::reconcile::DaemonCtx, tempfile::TempDir) {
         ctx_with_state(host, sample_state()).await
+    }
+
+    #[tokio::test]
+    async fn queued_nft_replay_uses_state_sampled_after_acquiring_resource_owner() {
+        let host = Arc::new(FakeHost::new());
+        host.with(|i| {
+            i.which.insert("nft".into());
+        });
+        let (ctx, _dir) = ctx(host.clone()).await;
+        let owner = ctx.bus.residential();
+        let occupied = owner.clone();
+        let (entered, seen) = tokio::sync::oneshot::channel();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let first = tokio::spawn(async move {
+            occupied
+                .execute(move |_tx| async move {
+                    entered.send(()).unwrap();
+                    wait.await?;
+                    Ok(())
+                })
+                .await
+        });
+        seen.await.unwrap();
+        let c = ctx.clone();
+        let mut check = tokio::spawn(async move { check_once(&c).await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut check)
+                .await
+                .is_err()
+        );
+        let wrote_while_occupied = !host.stdins().is_empty();
+        ctx.store
+            .update(|s| {
+                s.node.ports.hy2_resi = 45000;
+                s.system.hy2_resi_compat_ports = false;
+            })
+            .await
+            .unwrap();
+        let state = ctx.store.read().await;
+        let want = bui_schema::render::nft::ruleset(&state.node.ports, false);
+        release.send(()).unwrap();
+        first.await.unwrap().unwrap();
+        check.await.unwrap().unwrap();
+        assert_eq!(
+            host.stdins(),
+            vec![("nft -f -".into(), want)],
+            "queued replay must use the newly committed ports and compatibility intent"
+        );
+        assert!(
+            !wrote_while_occupied,
+            "nft cannot publish across another resource transaction"
+        );
+        owner.drain().await;
+    }
+
+    #[tokio::test]
+    async fn unknown_listener_does_not_accumulate_restart_evidence() {
+        let host = Arc::new(FakeHost::new());
+        host.with(|i| {
+            i.units_active.insert("hysteria-residential.service".into());
+            i.fail_listening.insert(Proto::Udp);
+        });
+        let (c, _d) = ctx(host.clone()).await;
+        check_once(&c).await.unwrap();
+        host.advance(60);
+        check_once(&c).await.unwrap();
+        let r = c.runtime.read().await;
+        assert_eq!(r.watchdog["hysteria-residential"].fails, 0);
+        assert_eq!(r.watchdog["hysteria-residential"].restarts, 0);
+        assert!(!host
+            .ops()
+            .contains(&"systemd:restart:hysteria-residential".into()));
     }
 
     async fn ctx_with_state(
@@ -1069,7 +1221,7 @@ mod tests {
     /// `default = deny`，没人重放就是全体住宅 HY2 用户被拒到下一轮 60 秒安全网，
     /// 而且没有任何告警说明原因。relay 早就为完全一样的两条来路补过重放。
     #[tokio::test]
-    async fn restarting_the_residential_inbound_is_announced_so_the_gates_get_replayed() {
+    async fn residential_restart_finishes_strict_gate_repair_before_returning() {
         let host = Arc::new(FakeHost::new());
         host.with(|i| {
             for u in [
@@ -1087,6 +1239,25 @@ mod tests {
                 .insert(Proto::Tcp, [10001, 2080].into_iter().collect());
         });
         let (c, _d) = ctx(host.clone()).await;
+        c.store
+            .update(|s| {
+                bui_schema::hy2pool::grow(&mut s.residential.hy2_pool, 32, &Default::default());
+            })
+            .await
+            .unwrap();
+        host.with(|i| {
+            i.instances.insert("hysteria-residential.service".into(), 1);
+            i.stock_singbox = true;
+            i.start_listeners
+                .insert("hysteria-residential.service".into(), (Proto::Udp, 40000));
+        });
+        host.write_file(
+            &crate::modules::core_files::hy2_resi_config_path(&c.paths),
+            &crate::residential_lifecycle::config_bytes(c.store.read().await.as_ref(), &c.paths)
+                .unwrap(),
+            0o600,
+        )
+        .unwrap();
         let mut rx = c.bus.subscribe();
         check_once(&c).await.unwrap();
         assert!(
@@ -1099,10 +1270,13 @@ mod tests {
             second[1],
             ("hysteria-residential".to_string(), Decision::Restart)
         );
+        assert!(rx.try_recv().is_err(), "no asynchronous success broadcast");
         assert_eq!(
-            rx.try_recv().ok(),
-            Some(crate::api::Event::Hy2ResiRestarted),
-            "重启了住宅入站却不广播 ⇒ 门全停在 deny、没人重放"
+            crate::residential_lifecycle::read_record(&c)
+                .unwrap()
+                .unwrap()
+                .phase,
+            "active"
         );
     }
 
@@ -1150,6 +1324,49 @@ mod tests {
             })
             .collect();
         s
+    }
+
+    #[tokio::test]
+    async fn shared_relay_watchdog_waits_for_the_resource_owner() {
+        let host = relay_half_dead_host(0);
+        let (ctx, _dir) = ctx_with_state(host.clone(), relay_pool_state(2)).await;
+        check_once(&ctx).await.unwrap();
+        host.advance(60);
+        let owner = ctx.bus.residential();
+        let occupied = owner.clone();
+        let (entered, seen) = tokio::sync::oneshot::channel();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let first = tokio::spawn(async move {
+            occupied
+                .execute(move |_tx| async move {
+                    entered.send(()).unwrap();
+                    wait.await?;
+                    Ok(())
+                })
+                .await
+        });
+        seen.await.unwrap();
+        let mut check = tokio::spawn(async move { check_once(&ctx).await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut check)
+                .await
+                .is_err()
+        );
+        assert!(
+            !host.ops().iter().any(|o| o == "systemd:restart:b-ui-relay"),
+            "relay restart must wait for shared binary publication"
+        );
+        release.send(()).unwrap();
+        first.await.unwrap().unwrap();
+        check.await.unwrap().unwrap();
+        assert_eq!(
+            host.ops()
+                .iter()
+                .filter(|o| o.as_str() == "systemd:restart:b-ui-relay")
+                .count(),
+            1
+        );
+        owner.drain().await;
     }
 
     /// 2026-09-18 第三次裁决 ③ + **第四次裁决 ①**：看门狗重启 `b-ui-relay` = 一次**全池**
@@ -1418,7 +1635,8 @@ mod tests {
             "{ops:?}"
         );
         assert!(
-            !ops.iter().any(|o| o.contains("hysteria-residential")),
+            !ops.iter()
+                .any(|o| o.starts_with("systemd:") && o.contains("hysteria-residential")),
             "住宅实例是 active（4.1 也不建 NAT 规则），不该被碰：{ops:?}"
         );
         // 事件落盘

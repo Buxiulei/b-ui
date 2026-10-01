@@ -11,11 +11,16 @@ daemon 的 reconcile 已经串行，但住宅入站的 API、watchdog、证书�
 ## 不变量
 
 - `hysteria-residential` 的配置发布、start/restart/reload/stop、证书激活和恢复由同一个住宅专用 Rust owner 串行管理。其范围不是整个网络栈，也不把原生 HY2 鉴权处理锁在服务操作后面。
+- sing-box 是住宅与 relay 的共享二进制；资源 owner 内发布候选后，relay 保留既有 apply 的校验与单次激活语义，回滚显式处理两个消费者，不能用旧 binary 校验新配置或漏重启。下载准备仍在资源锁外，不引入 relay generation bank。
+- relay 的既有手动服务动作与 watchdog restart 也经过共享 binary 资源 guard；保留其原归因/通知语义，不套住宅门位屏障，不新增 relay generation 行为。
+- watchdog 对 BUI nft 表的既有检查/整表重放，在同一资源 guard 后取得最新 State；不使用排队前的旧拓扑，不改变规则正文或一致时的无写入行为。ExecStartPre 的 nft 子步骤保持免重入。
 - startup 在住宅事务前发布当前鉴权 snapshot 并实际 bind 确认原生 HY2 独立 HTTP listener 可用，再执行较长的下载/激活；只 spawn 未就绪任务不足以保证服务可用。
-- 机器上只有一个控制写者。daemon 持有进程间独占 lease；在线 CLI 通过 UDS 提交，无法连接 UDS 不能证明离线。离线写者先取得同一 lease，不能与 daemon 并行写配置或 runtime。
+- 机器上只有一个控制写者。daemon 持有进程间独占 lease；在线 CLI 通过 UDS 提交，无法连接 UDS 不能证明离线。离线写者（包括独立 import-v3 写受管 state 的入口）先取得同一 lease，不能与 daemon 并行写配置或 runtime。
+- `harden-ssh` 保留既有加固行为，但在线经 UDS 提交给 daemon，离线在读取写入依据前取得控制 lease。SSH-only apply 不执行住宅网络清理；daemon reconcile 与 CLI 不能同时发布相同 SSH 配置文件。
 - 住宅 ExecStartPre 的 `bui nft apply` 不取得控制写者 lease，防止 owner→systemctl→prestart→owner 死锁。离线安装/对账的 daemon handoff 在住宅流程结束并释放 lease 后进行。
 - 请求取消不会把已开始的阻塞写操作遗留在 owner 外面。服务操作由受管事务完成，等待者取消不释放正在使用的资源锁。
 - 无法观测监听状态、接口就绪、进程身份或读回门位属于 Unknown/失败，不作为成功或单独重启的依据。
+- active 确认时住宅 UDP listener 必须已知且覆盖候选配置的预期端口；缺失、错误端口或 Unknown 均不确认候选 keys。
 - RealHost 监听采样必须传播必要 `/proc/net` 表读取错误，不能伪造成功空集合；协议 family 不存在与读取故障分别处理并明确记录判据。
 - 新的住宅 restart_keys 只能在完整激活后确认。证书指纹仅在相关运行消费者激活成功后确认；失败保留重试依据，不能提前标记 UpToDate。
 - 激活失败不声称新配置生效。回滚后同样需要验证旧配置对应的门位；回滚失败可见地降级。未完成事务在下一次启动进入恢复/重新验证，不盲信旧 active receipt。
@@ -23,6 +28,8 @@ daemon 的 reconcile 已经串行，但住宅入站的 API、watchdog、证书�
 ## 住宅 owner 的流程
 
 准备与下载可以并行于正常业务，候选文件先用将要运行的原版内核校验。下载在资源提交锁外；实际二进制替换、文件发布与服务激活在该资源 owner 下完成。普通 reconcile 不因周期检查无差异而重启。
+
+首次安装已知缺少候选证书、住宅服务尚未部署或启动时，返回明确的 `awaiting_certificate`/pending；允许必需的 Caddy 与 bootstrap/handoff 前置步骤继续，证书到达后再校验并激活。此阶段不发布未经校验的住宅 live 配置、不确认住宅 keys 或 active；普通候选校验错误与不明证书读取故障不属于该例外，共享 binary 失败仍须保持 relay 消费者一致性。
 
 流程为 `prepare → durable prepared record → publish → activate → observe instance → restore gates → read back → active record/keys`。记录包含操作 ID、来源、候选配置摘要、观察到的进程实例、阶段及明确失败原因，不包含代理密码或私钥。操作记录必须严格原子持久化，不能以 runtime 的 best-effort 写盘冒充持久提交。
 

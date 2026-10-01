@@ -9,6 +9,7 @@
 
 use crate::kernels::{Asset, Fetcher, HttpFetcher, Manifest};
 use crate::sys::Host;
+use anyhow::Context;
 use bui_schema::paths::Paths;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -259,11 +260,34 @@ pub fn rollback(host: &dyn Host, paths: &Paths) -> anyhow::Result<Vec<String>> {
     let bytes = host
         .read_file(&prev)?
         .ok_or_else(|| anyhow::anyhow!("没有 {}，无法回滚二进制", prev.display()))?;
+    let manifest = host
+        .read_file(&crate::paths::manifest_prev_file(paths))?
+        .context("rollback requires a supported previous manifest")?;
+    let manifest: Manifest = serde_json::from_slice(&manifest)?;
+    let arch = host.arch()?;
+    let (version, asset) = manifest.kernel_asset("sing-box", &arch)?;
+    anyhow::ensure!(
+        version.trim_start_matches('v') == "1.14.2",
+        "rollback across residential kernel/layout versions is unsupported"
+    );
+    let previous_kernel = paths.bin_dir.join("sing-box.prev");
+    let candidate = if host.file_sha256(&previous_kernel)?.is_some() {
+        previous_kernel
+    } else {
+        paths.bin_dir.join("sing-box")
+    };
+    anyhow::ensure!(
+        host.file_sha256(&candidate)?.as_deref() == Some(asset.sha256.as_str()),
+        "rollback sing-box candidate does not match supported manifest SHA"
+    );
     // 第 0 步（spec §9.1）：停住宅单元 → 删 nft 表。两步都只记 note，失败不中断回滚。
     let mut done = Vec::new();
-    let _ = host.systemd("stop", RESI_UNIT);
+    anyhow::ensure!(
+        host.systemd("stop", RESI_UNIT)?.ok(),
+        "rollback could not stop residential consumer"
+    );
     done.push(format!(
-        "已停 {RESI_UNIT}（回滚后由恢复的 bui 对账重渲染为 4.0 的 apernet 实例并启回来）"
+        "已停 {RESI_UNIT}（释放 lease 后由恢复的 bui 重新验证并启回来）"
     ));
     match crate::commands::nft::delete(host, paths) {
         Ok(line) => done.push(format!("nft 表：{line}")),
@@ -285,7 +309,11 @@ pub fn rollback(host: &dyn Host, paths: &Paths) -> anyhow::Result<Vec<String>> {
                     if unit.name == RESI_UNIT {
                         continue;
                     }
-                    let _ = host.systemd("restart", &unit.name);
+                    anyhow::ensure!(
+                        host.systemd("restart", &unit.name)?.ok(),
+                        "rollback failed to restart {}",
+                        unit.name
+                    );
                     done.push(format!("已重启 {}", unit.name));
                 }
             }
@@ -321,8 +349,7 @@ pub fn rollback(host: &dyn Host, paths: &Paths) -> anyhow::Result<Vec<String>> {
         host.write_file(&crate::paths::state_file(paths), &bytes, 0o600)?;
         done.push(format!("已恢复期望态备份 {}", newest.display()));
     }
-    let _ = host.systemd("restart", "b-ui");
-    done.push("已重启 b-ui".into());
+    done.push("恢复完成；释放离线 lease 后交接 b-ui".into());
     Ok(done)
 }
 
@@ -354,79 +381,197 @@ pub async fn run_with(
     host: Arc<dyn Host>,
     fetcher: Arc<dyn Fetcher>,
 ) -> anyhow::Result<()> {
-    if rollback_flag {
-        let (h, p) = (host.clone(), paths.clone());
-        let done = tokio::task::spawn_blocking(move || rollback(h.as_ref(), &p)).await??;
-        for line in done {
-            println!("{line}");
-        }
+    let socket = PathBuf::from(crate::paths::SOCKET_PATH);
+    let client = crate::ipc::Client::new(&socket);
+    if client.available().await {
+        anyhow::ensure!(
+            !rollback_flag,
+            "rollback requires an offline control lease; stop the daemon first"
+        );
+        let (status, body) = client
+            .request(
+                "POST",
+                "/api/upgrade",
+                Some(serde_json::json!({"version":version,"manifest_url":manifest_url})),
+            )
+            .await?;
+        anyhow::ensure!(
+            (200..300).contains(&status),
+            "daemon upgrade failed (HTTP {status}): {body}"
+        );
+        println!("{body}");
         return Ok(());
     }
-    let (h, f, p) = (host.clone(), fetcher.clone(), paths.clone());
-    let want = version.clone();
-    let cli = manifest_url.clone();
-    let (plan, asset) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        // 总纲 C4 的解析顺序在 kernels 里一处实现：--manifest-url > --version（模板）
-        // > $BUI_MANIFEST_URL > latest；什么都没指定且 latest 404 时无条件改跟 releases
-        // 列表里最新的 rc（仓库里还没有正式版）
-        let env = std::env::var(crate::kernels::MANIFEST_URL_ENV).ok();
-        let (_, m) = crate::kernels::fetch_manifest_with(
-            f.as_ref(),
-            cli.as_deref(),
-            want.as_deref(),
-            env.as_deref(),
-        )?;
-        if let Some(v) = want.as_deref() {
-            // 指定了版本就必须拿到那一版（本地文件或 $BUI_MANIFEST_URL 里可能是别的版本）
-            anyhow::ensure!(
-                m.version == v.trim_start_matches('v'),
-                "manifest 里是 {}，不是请求的 {v}",
-                m.version
-            );
+    let lease = crate::residential_lifecycle::ControlLease::acquire(&paths)?;
+    tokio::spawn(async move {
+        if rollback_flag {
+            let (h, p) = (host.clone(), paths.clone());
+            let done = tokio::task::spawn_blocking(move || rollback(h.as_ref(), &p)).await??;
+            for line in done {
+                println!("{line}");
+            }
+            drop(lease);
+            let h = host.clone();
+            tokio::task::spawn_blocking(move || h.systemd("restart", "b-ui")).await??;
+            return Ok(());
         }
-        // 三个覆盖都没给（= 跟着 latest 走）时才守降级：显式点名的目标是操作者意图
-        // （含 M5 演练故意装旧版），照办不拦
-        if crate::kernels::nothing_specified(cli.as_deref(), want.as_deref(), env.as_deref()) {
-            refuse_downgrade(
-                crate::serve::load_cached_manifest(h.as_ref(), &p).as_ref(),
+        let ctx = crate::reconcile::DaemonCtx {
+            store: crate::state::store::Store::open(crate::paths::state_file(&paths)).await?,
+            runtime: crate::state::runtime::Runtime::load(crate::paths::runtime_file(&paths)),
+            bus: crate::api::EventBus::new(),
+            host: host.clone(),
+            paths: paths.clone(),
+        };
+        if publish_upgrade(ctx, version, manifest_url, fetcher).await? {
+            crate::serve::reconcile_offline(paths, host, false, false, lease).await
+        } else {
+            Ok(())
+        }
+    })
+    .await?
+}
+
+/// Online and offline use the same resource owner. Download private candidates
+/// first, then re-plan under the owner before snapshots or live publication.
+pub async fn publish_upgrade(
+    ctx: crate::reconcile::DaemonCtx,
+    version: Option<String>,
+    manifest_url: Option<String>,
+    fetcher: Arc<dyn Fetcher>,
+) -> anyhow::Result<bool> {
+    let (h, f, p) = (ctx.host.clone(), fetcher.clone(), ctx.paths.clone());
+    let (manifest, candidate, expected_cache, expected_bui) =
+        tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let expected_cache = h.file_sha256(&crate::paths::manifest_file(&p))?;
+            let expected_bui = h.file_sha256(&p.bin_dir.join("bui"))?;
+            let env = std::env::var(crate::kernels::MANIFEST_URL_ENV).ok();
+            let (_, m) = crate::kernels::fetch_manifest_with(
+                f.as_ref(),
+                manifest_url.as_deref(),
+                version.as_deref(),
+                env.as_deref(),
+            )?;
+            if let Some(v) = &version {
+                anyhow::ensure!(
+                    m.version == v.trim_start_matches('v'),
+                    "manifest version does not match request"
+                );
+            }
+            if crate::kernels::nothing_specified(
+                manifest_url.as_deref(),
+                version.as_deref(),
+                env.as_deref(),
+            ) {
+                refuse_downgrade(
+                    crate::serve::load_cached_manifest(h.as_ref(), &p).as_ref(),
+                    &m,
+                    env!("CARGO_PKG_VERSION"),
+                )?;
+            }
+            if let Some(msg) = crate::sys::env_probe::nft_blocking_for(h.as_ref()) {
+                return Err(crate::sys::env_probe::EnvBlocked(msg).into());
+            }
+            let arch = h.arch()?;
+            anyhow::ensure!(
+                m.kernel_asset("sing-box", &arch)?.0.trim_start_matches('v') == "1.14.2",
+                "only stock sing-box 1.14.2 is supported"
+            );
+            let installed = crate::kernels::installed_versions(h.as_ref(), &p.bin_dir);
+            let plan = plan_upgrade(
+                h.as_ref(),
+                &p.bin_dir,
                 &m,
                 env!("CARGO_PKG_VERSION"),
+                &installed,
+                &arch,
             )?;
-        }
-        // 4.1 的硬前置（2026-09-16 裁决）：缺 `nft`（或内核低于 inet nat 要求的 5.2）
-        // 就**硬性拒绝**升级 —— 退出码 2、一个字不落盘、不装系统包。判据与文案同
-        // `bui install` 的 `env.blocking()` 共用 `env_probe::nft_blocking`。
-        // 位置在 `prepare` 之前：那之后就会写 `.prev` 快照与新 manifest 缓存。
-        //
-        // **注意这道闸门拦不住 4.0.1 → 4.1 那一跳**：`bui upgrade` 由**旧**二进制执行，
-        // 旧的那版没有这段代码。那一跳由 T18 的演练 preflight 与 T19 闸门 5 守。
-        if let Some(msg) = crate::sys::env_probe::nft_blocking_for(h.as_ref()) {
-            return Err(crate::sys::env_probe::EnvBlocked(msg).into());
-        }
-        let arch = h.arch()?;
-        // 计划先算、快照与新缓存只在真要换东西时才写（见 `prepare` 的说明）
-        prepare(h.as_ref(), &p, &m, env!("CARGO_PKG_VERSION"), &arch)
-    })
-    .await??;
-    println!("{}", format_plan(&plan));
-    if plan.self_to.is_none() && plan.kernels.is_empty() {
-        return Ok(());
-    }
-    if plan.self_to.is_some() {
-        let (h, f, bin) = (host.clone(), fetcher.clone(), paths.bin_dir.clone());
-        tokio::task::spawn_blocking(move || apply_self(h.as_ref(), f.as_ref(), &asset, &bin))
-            .await??;
-    }
-    // 守护进程重启后自己会对账（内核随 manifest 落地）；它没在跑就本进程内跑一次
-    let socket = PathBuf::from(crate::paths::SOCKET_PATH);
-    if crate::ipc::Client::new(&socket).available().await {
-        let h = host.clone();
-        let _ = tokio::task::spawn_blocking(move || h.systemd("restart", "b-ui")).await;
-        println!("已重启 b-ui，升级后的对账由守护进程完成");
-        return Ok(());
-    }
-    println!("守护进程未运行，改为本进程内对账一次");
-    crate::serve::reconcile_cli(paths, host, socket, false, false).await
+            if plan.self_to.is_none() && plan.kernels.is_empty() {
+                return Ok((m, None, expected_cache, expected_bui));
+            }
+            let candidate = if plan.self_to.is_some() {
+                use crate::reconcile::apply::BinaryInstaller;
+                let path = p
+                    .bin_dir
+                    .join(format!(".upgrade-{}", uuid::Uuid::new_v4()))
+                    .join("bui");
+                use std::os::unix::fs::DirBuilderExt;
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(path.parent().expect("upgrade candidate parent"))?;
+                let asset = m.bui_asset(&arch)?;
+                crate::kernels::KernelInstaller {
+                    host: h.as_ref(),
+                    fetcher: f.as_ref(),
+                }
+                .install("bui", &m.version, &asset.sha256, &asset.url, &path)?;
+                Some((path, asset.sha256.clone()))
+            } else {
+                None
+            };
+            Ok((m, candidate, expected_cache, expected_bui))
+        })
+        .await??;
+    let owner = ctx.bus.residential();
+    owner
+        .execute(move |_tx| async move {
+            let host = ctx.host.clone();
+            tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+                let arch = host.arch()?;
+                anyhow::ensure!(
+                    host.file_sha256(&crate::paths::manifest_file(&ctx.paths))? == expected_cache
+                        && host.file_sha256(&ctx.paths.bin_dir.join("bui"))? == expected_bui,
+                    "upgrade preparation superseded; retry"
+                );
+                let installed =
+                    crate::kernels::installed_versions(host.as_ref(), &ctx.paths.bin_dir);
+                let plan = plan_upgrade(
+                    host.as_ref(),
+                    &ctx.paths.bin_dir,
+                    &manifest,
+                    env!("CARGO_PKG_VERSION"),
+                    &installed,
+                    &arch,
+                )?;
+                if plan.self_to.is_none() && plan.kernels.is_empty() {
+                    return Ok(false);
+                }
+                if plan.self_to.is_some() {
+                    let (path, sha) = candidate
+                        .as_ref()
+                        .context("upgrade candidate became stale; retry preparation")?;
+                    anyhow::ensure!(
+                        host.file_sha256(path)?.as_deref() == Some(sha.as_str()),
+                        "upgrade candidate changed before publication"
+                    );
+                }
+                prepare(
+                    host.as_ref(),
+                    &ctx.paths,
+                    &manifest,
+                    env!("CARGO_PKG_VERSION"),
+                    &arch,
+                )?;
+                if plan.self_to.is_some() {
+                    let (candidate, sha) =
+                        candidate.context("upgrade candidate became stale; retry preparation")?;
+                    anyhow::ensure!(
+                        host.file_sha256(&candidate)?.as_deref() == Some(sha.as_str()),
+                        "upgrade candidate changed before publication"
+                    );
+                    let live = ctx.paths.bin_dir.join("bui");
+                    if let Some(old) = host.read_file(&live)? {
+                        let previous = ctx.paths.bin_dir.join("bui.prev");
+                        host.write_file(&previous, &old, 0o755)?;
+                        host.sync_parent(&previous)?;
+                    }
+                    host.rename_file(&candidate, &live)?;
+                }
+                Ok(true)
+            })
+            .await?
+        })
+        .await
 }
 
 /// 升级计划的人读文本。
@@ -503,6 +648,111 @@ mod tests {
         h.write_file(&std::path::Path::new(BIN).join("bui"), body, 0o755)
             .unwrap();
         h
+    }
+
+    #[tokio::test]
+    async fn no_op_owned_upgrade_never_touches_snapshots_or_live_files() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = scratch(&d);
+        let h = Arc::new(FakeHost::new());
+        h.with(|i| {
+            i.which.insert("nft".into());
+        });
+        let manifest = manifest_json(env!("CARGO_PKG_VERSION"), OLD_KERNELS, "current-bui");
+        h.write_file(&paths.bin_dir.join("bui"), b"current-bui", 0o755)
+            .unwrap();
+        for (name, version) in crate::kernels::KERNELS.iter().zip(OLD_KERNELS) {
+            h.write_file(
+                &paths.bin_dir.join(name),
+                kernel_body(name, version).as_bytes(),
+                0o755,
+            )
+            .unwrap();
+        }
+        script_versions(&h, &paths, OLD_KERNELS);
+        let fetcher: Arc<dyn Fetcher> = Arc::new(F(Mutex::new(vec![(
+            "https://fixture/manifest".into(),
+            manifest.into_bytes(),
+        )])));
+        let ctx = crate::reconcile::DaemonCtx {
+            store: crate::state::store::Store::create(
+                crate::paths::state_file(&paths),
+                crate::testutil::sample_state(),
+            )
+            .await
+            .unwrap(),
+            runtime: crate::state::runtime::Runtime::load(crate::paths::runtime_file(&paths)),
+            bus: crate::api::EventBus::new(),
+            host: h.clone(),
+            paths: paths.clone(),
+        };
+        h.clear_ops();
+        assert!(
+            !publish_upgrade(ctx, None, Some("https://fixture/manifest".into()), fetcher)
+                .await
+                .unwrap()
+        );
+        assert!(
+            h.ops().iter().all(|op| op.starts_with("run:")),
+            "{:?}",
+            h.ops()
+        );
+        assert!(h
+            .read_file(&crate::paths::manifest_prev_file(&paths))
+            .unwrap()
+            .is_none());
+        assert!(!paths.base_dir.join(".residential-lifecycle").exists());
+    }
+
+    #[tokio::test]
+    async fn self_publication_failure_preserves_the_live_executable() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = scratch(&d);
+        let h = Arc::new(FakeHost::new());
+        h.with(|i| {
+            i.which.insert("nft".into());
+        });
+        let manifest = manifest_json(env!("CARGO_PKG_VERSION"), OLD_KERNELS, "new-bui");
+        h.write_file(&paths.bin_dir.join("bui"), b"current-bui", 0o755)
+            .unwrap();
+        for (name, version) in crate::kernels::KERNELS.iter().zip(OLD_KERNELS) {
+            h.write_file(
+                &paths.bin_dir.join(name),
+                kernel_body(name, version).as_bytes(),
+                0o755,
+            )
+            .unwrap();
+        }
+        script_versions(&h, &paths, OLD_KERNELS);
+        let fetcher: Arc<dyn Fetcher> = Arc::new(F(Mutex::new(vec![
+            ("https://x/bui".into(), b"new-bui".to_vec()),
+            ("https://fixture/manifest".into(), manifest.into_bytes()),
+        ])));
+        let ctx = crate::reconcile::DaemonCtx {
+            store: crate::state::store::Store::create(
+                crate::paths::state_file(&paths),
+                crate::testutil::sample_state(),
+            )
+            .await
+            .unwrap(),
+            runtime: crate::state::runtime::Runtime::load(crate::paths::runtime_file(&paths)),
+            bus: crate::api::EventBus::new(),
+            host: h.clone(),
+            paths: paths.clone(),
+        };
+        h.with(|i| {
+            i.fail_writes.insert(paths.bin_dir.join("bui"));
+        });
+        assert!(
+            publish_upgrade(ctx, None, Some("https://fixture/manifest".into()), fetcher)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            h.read_file(&paths.bin_dir.join("bui")).unwrap(),
+            Some(b"current-bui".to_vec())
+        );
+        assert!(!h.ops().iter().any(|op| op.contains("--no-block")));
     }
 
     /// 总纲 C4 形状；只放 amd64 资产，用来顺带测「缺架构资产直接报错」
@@ -583,6 +833,12 @@ mod tests {
     async fn run_with_refuses_to_walk_back_and_writes_nothing() {
         let d = tempfile::tempdir().unwrap();
         let paths = scratch(&d);
+        crate::state::store::Store::create(
+            crate::paths::state_file(&paths),
+            crate::testutil::sample_state(),
+        )
+        .await
+        .unwrap();
         let h = Arc::new(FakeHost::new());
         // 缓存 = 4.0.1-rc1（一次显式 `bui upgrade --manifest-url` 写下的那一份）
         let cached = r#"{"version":"4.0.1","tag":"v4.0.1-rc1","kernels":{},"artifacts":{}}"#;
@@ -621,6 +877,12 @@ mod tests {
     async fn run_with_refuses_to_upgrade_without_nft_and_writes_nothing() {
         let d = tempfile::tempdir().unwrap();
         let paths = scratch(&d);
+        crate::state::store::Store::create(
+            crate::paths::state_file(&paths),
+            crate::testutil::sample_state(),
+        )
+        .await
+        .unwrap();
         let h = Arc::new(FakeHost::new());
         h.with(|i| {
             i.files.insert(
@@ -821,6 +1083,7 @@ mod tests {
             .unwrap();
         h.write_file(&paths.bin_dir.join("bui"), b"NEWBUI", 0o755)
             .unwrap();
+        seed_supported_previous(&h, &paths);
         let done = rollback(&h, &paths).unwrap();
         assert_eq!(
             h.text(paths.bin_dir.join("bui").to_str().unwrap())
@@ -841,7 +1104,33 @@ mod tests {
         assert!(done
             .iter()
             .any(|l| l.contains("state-20260911T000000Z-001.json")));
-        assert!(h.ops().contains(&"systemd:restart:b-ui".to_string()));
+        assert!(
+            !h.ops().contains(&"systemd:restart:b-ui".to_string()),
+            "SELF handoff belongs after lease release"
+        );
+    }
+
+    fn seed_supported_previous(h: &FakeHost, paths: &Paths) {
+        let previous = paths.bin_dir.join("sing-box.prev");
+        let sum = match h.file_sha256(&previous).unwrap() {
+            Some(sum) => sum,
+            None => {
+                h.write_file(
+                    &paths.bin_dir.join("sing-box"),
+                    b"supported stock binary",
+                    0o755,
+                )
+                .unwrap();
+                crate::kernels::sha256_hex(b"supported stock binary")
+            }
+        };
+        let m = manifest("4.1.4", "1.14.2", &sum);
+        h.write_file(
+            &crate::paths::manifest_prev_file(paths),
+            &serde_json::to_vec(&m).unwrap(),
+            0o644,
+        )
+        .unwrap();
     }
 
     /// 回滚夹具：`bui.prev` + 四个内核的 `.prev` 都在盘上，PATH 上有 `nft`。
@@ -878,6 +1167,7 @@ mod tests {
     fn rollback_stops_the_residential_unit_and_deletes_the_nft_table() {
         let d = tempfile::tempdir().unwrap();
         let (h, p) = host_with_prev_binaries(&d);
+        seed_supported_previous(&h, &p);
         let notes = rollback(&h, &p).unwrap();
         let calls = h.ops();
         let stop = calls
@@ -929,6 +1219,7 @@ mod tests {
         h.with(|i| {
             i.which.remove("nft");
         });
+        seed_supported_previous(&h, &p);
         let notes = rollback(&h, &p).unwrap();
         assert!(notes.iter().any(|n| n.contains("nft")), "{notes:?}");
         assert!(
@@ -953,6 +1244,7 @@ mod tests {
         h.with(|i| {
             i.fail_runs.insert("nft delete table".into());
         });
+        seed_supported_previous(&h, &p);
         let notes = rollback(&h, &p).unwrap();
         assert!(
             notes
@@ -1041,6 +1333,7 @@ mod tests {
             .unwrap();
         h.write_file(&bui, b"NEWBUI", 0o755).unwrap();
         h.symlink(std::path::Path::new("bui"), &hook).unwrap();
+        seed_supported_previous(&h, &paths);
         rollback(&h, &paths).unwrap();
         assert_eq!(h.text(bui.to_str().unwrap()).as_deref(), Some("OLDBUI"));
         assert_eq!(
@@ -1098,20 +1391,20 @@ mod tests {
         }
     }
 
-    const OLD_KERNELS: [&str; 4] = ["2.12.2", "26.3.27", "1.13.19", "2.10.2"];
-    const NEW_KERNELS: [&str; 4] = ["2.13.0", "26.4.0", "1.14.2", "2.11.0"];
+    const OLD_KERNELS: [&str; 4] = ["2.12.2", "26.3.27", "1.14.2", "2.10.2"];
+    const NEW_KERNELS: [&str; 4] = ["2.13.0", "26.4.0", "1.14.3", "2.11.0"];
     /// 升级前盘上的五个二进制（内容当版本指纹用，回滚后逐字节比对）
     const OLD_BINS: [(&str, &str); 5] = [
         ("bui", "BUI-4.0.0"),
         ("hysteria", "HY-2.12.2"),
         ("xray", "XRAY-26.3.27"),
-        ("sing-box", "SB-1.13.19"),
+        ("sing-box", "SB-1.14.2"),
         ("caddy", "CADDY-2.10.2"),
     ];
     const NEW_BINS: [(&str, &str); 4] = [
         ("hysteria", "HY-2.13.0"),
         ("xray", "XRAY-26.4.0"),
-        ("sing-box", "SB-1.14.2"),
+        ("sing-box", "SB-1.14.3"),
         ("caddy", "CADDY-2.11.0"),
     ];
 
@@ -1390,7 +1683,10 @@ mod tests {
             Some(old_manifest.as_str()),
             "manifest 缓存也要回到升级前，否则对账又把内核拉成新版"
         );
-        assert!(h.ops().contains(&"systemd:restart:b-ui".to_string()));
+        assert!(
+            !h.ops().contains(&"systemd:restart:b-ui".to_string()),
+            "SELF handoff belongs after lease release"
+        );
         // 光把字节写回盘上不算回滚：内核单元还在内存里跑新版二进制，而恢复后的
         // manifest 与盘上版本一致 ⇒ 对账零变更 ⇒ apply 第 0 步不会替我们重启任何一个。
         for unit in ["hysteria-server", "xray", "b-ui-relay", "caddy"] {
@@ -1456,7 +1752,7 @@ mod tests {
     }
 
     #[test]
-    fn rollback_without_kernel_prev_files_only_notes_it() {
+    fn rollback_without_supported_previous_manifest_refuses_before_writes() {
         let d = tempfile::tempdir().unwrap();
         let paths = scratch(&d);
         // 只升过 bui 自己、没升过内核的机器：只有 bin/bui.prev
@@ -1471,31 +1767,10 @@ mod tests {
             0o644,
         )
         .unwrap();
-        let done = rollback(&h, &paths).unwrap();
-        assert_eq!(
-            text(&h, &paths.bin_dir.join("bui")).as_deref(),
-            Some("OLDBUI")
-        );
-        for name in crate::kernels::KERNELS {
-            assert!(
-                done.iter().any(|l| l.contains(&format!("{name}.prev"))),
-                "缺 {name}.prev 只记一条 note：{done:?}"
-            );
-        }
-        assert!(
-            text(&h, &crate::paths::manifest_file(&paths)).is_none(),
-            "没有上一版 manifest 就删掉当前缓存，免得对账按新版把内核又拉上去"
-        );
-        let restarts: Vec<String> = h
-            .ops()
-            .into_iter()
-            .filter(|o| o.starts_with("systemd:restart:"))
-            .collect();
-        assert_eq!(
-            restarts,
-            vec!["systemd:restart:b-ui".to_string()],
-            "没恢复内核就不该重启内核服务"
-        );
+        h.clear_ops();
+        let error = rollback(&h, &paths).unwrap_err();
+        assert!(error.to_string().contains("supported previous manifest"));
+        assert!(h.ops().is_empty(), "unverifiable rollback must not write");
     }
 
     #[test]

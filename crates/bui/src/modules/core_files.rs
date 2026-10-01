@@ -606,6 +606,7 @@ mod tests {
         .unwrap();
         let out = apply::apply(
             apply::ApplyInput {
+                legacy_residential_cleanup: true,
                 plan,
                 paths: &ctx.paths,
                 facts: &ctx.facts,

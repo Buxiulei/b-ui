@@ -132,6 +132,27 @@ impl Host for RealHost {
         Ok(())
     }
 
+    fn set_file_mode(&self, path: &Path, mode: u32) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+        std::fs::File::open(path)?.sync_all()?;
+        Ok(())
+    }
+
+    fn sync_parent(&self, path: &Path) -> Result<()> {
+        std::fs::File::open(path.parent().context("publication path has no parent")?)?
+            .sync_all()?;
+        Ok(())
+    }
+
+    fn rename_file(&self, from: &Path, to: &Path) -> Result<()> {
+        std::fs::rename(from, to)?;
+        for parent in [from.parent(), to.parent()].into_iter().flatten() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    }
+
     fn stage_file<'a>(&'a self, dest: &Path, mode: u32) -> Result<Box<dyn StagedWrite + 'a>> {
         let parent = dest
             .parent()
@@ -423,9 +444,9 @@ impl Host for RealHost {
         };
         let mut out = BTreeSet::new();
         for f in files {
-            if let Ok(text) = std::fs::read_to_string(f) {
-                out.extend(parse_proc_net(&text, listening_only));
-            }
+            let text = std::fs::read_to_string(f)
+                .with_context(|| format!("listener table unavailable: {f}"))?;
+            out.extend(parse_proc_net(&text, listening_only));
         }
         Ok(out)
     }

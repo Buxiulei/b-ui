@@ -91,7 +91,8 @@ struct Inner {
     path: PathBuf,
     data: RwLock<RuntimeData>,
     /// 落盘串行化锁：见 [`Runtime::update`]。
-    write: tokio::sync::Mutex<()>,
+    write: Arc<tokio::sync::Mutex<()>>,
+    lease: std::sync::OnceLock<Arc<crate::residential_lifecycle::ControlLease>>,
 }
 
 /// 临时文件名的进程内序号，配合 pid 保证每次落盘的临时文件互不相同（见 [`persist`]）。
@@ -156,8 +157,16 @@ impl Runtime {
         Self(Arc::new(Inner {
             path,
             data: RwLock::new(data),
-            write: tokio::sync::Mutex::new(()),
+            write: Arc::new(tokio::sync::Mutex::new(())),
+            lease: std::sync::OnceLock::new(),
         }))
+    }
+
+    pub(crate) fn retain_control_lease(
+        &self,
+        lease: Arc<crate::residential_lifecycle::ControlLease>,
+    ) {
+        let _ = self.0.lease.set(lease);
     }
 
     pub async fn read(&self) -> RuntimeData {
@@ -174,15 +183,19 @@ impl Runtime {
     /// 并发 `update()`，放开锁再写盘会让两次落盘交错，落在文件里的可能是**较旧**那份快照。
     /// 锁的粒度是「一次 update」，写盘本身在 `spawn_blocking` 里，不占 async 工作线程。
     pub async fn update(&self, f: impl FnOnce(&mut RuntimeData)) -> RuntimeData {
-        let _write = self.0.write.lock().await;
+        let write = self.0.write.clone().lock_owned().await;
         let mut guard = self.0.data.write().await;
         f(&mut guard);
         let snapshot = guard.clone();
         drop(guard);
         match serde_json::to_vec_pretty(&snapshot) {
             Ok(bytes) => {
-                let path = self.0.path.clone();
-                let joined = tokio::task::spawn_blocking(move || persist(&path, &bytes)).await;
+                let inner = self.0.clone();
+                let joined = tokio::task::spawn_blocking(move || {
+                    let _write = write;
+                    persist(&inner.path, &bytes)
+                })
+                .await;
                 match joined {
                     // `{e:#}` 带上 anyhow 的整条 context 链（哪一步、哪个路径、errno）；
                     // 原来只有 `%e`，真机上就只剩一句「落盘失败（忽略）」查不下去
@@ -227,6 +240,60 @@ fn join_error_kind(e: &tokio::task::JoinError) -> JoinFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelled_runtime_waiter_does_not_release_an_unfinished_disk_writer() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let data = Runtime::load(dir.path().join("runtime.json"));
+            let paths = bui_schema::paths::Paths {
+                base_dir: dir.path().into(),
+                bin_dir: dir.path().join("bin"),
+                certs_dir: dir.path().join("certs"),
+            };
+            data.retain_control_lease(Arc::new(
+                crate::residential_lifecycle::ControlLease::acquire(&paths).unwrap(),
+            ));
+            let (release, wait) = std::sync::mpsc::channel();
+            let (entered, seen) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                entered.send(()).unwrap();
+                wait.recv().unwrap();
+            });
+            seen.await.unwrap();
+            let (prepared, preparation) = tokio::sync::oneshot::channel();
+            let update = data.clone();
+            let waiter = tokio::spawn(async move {
+                update
+                    .update(|r| {
+                        r.cert_sha256 = Some("unconfirmed".into());
+                        prepared.send(()).unwrap();
+                    })
+                    .await
+            });
+            preparation.await.unwrap();
+            waiter.abort();
+            let _ = waiter.await;
+            let still_locked = data.0.write.try_lock().is_err();
+            drop(data);
+            let lease_busy = crate::residential_lifecycle::ControlLease::acquire(&paths).is_err();
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            assert!(
+                lease_busy,
+                "actual queued persistence must retain the machine lease"
+            );
+            assert!(
+                still_locked,
+                "cancelled waiter released the lock while disk publication was queued"
+            );
+        });
+    }
     use pretty_assertions::assert_eq;
 
     /// 退出中被取消的落盘任务与真的 panic 走不同的日志级别：SIGTERM 退出时那条

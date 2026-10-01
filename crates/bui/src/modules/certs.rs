@@ -114,50 +114,110 @@ pub fn copy_pair(host: &dyn Host, pair: &CertPair, certs_dir: &Path) -> anyhow::
 /// 同步一轮：找证书 → 判断 → 复制 → 更新两个 hysteria（直连重启、住宅确认热加载）。
 /// 返回新指纹（无变化则 `None`）。
 pub async fn sync_once(ctx: &DaemonCtx, domain: &str) -> anyhow::Result<Option<String>> {
+    let c = ctx.clone();
+    let domain = domain.to_owned();
+    ctx.bus
+        .residential()
+        .execute(move |tx| async move { sync_owned(&c, &domain, &tx).await })
+        .await
+}
+
+async fn sync_owned(
+    ctx: &DaemonCtx,
+    domain: &str,
+    tx: &crate::residential_lifecycle::Transaction,
+) -> anyhow::Result<Option<String>> {
     let known = ctx.runtime.read().await.cert_sha256;
     let host = ctx.host.clone();
     let paths = ctx.paths.clone();
     let domain_owned = domain.to_string();
     // 读住宅实例 journald 的起点必须在写证书之前（热加载行随写入而生）；抓在复制动作前一刻。
     let since = ctx.host.now();
-    let action = tokio::task::spawn_blocking(move || -> anyhow::Result<CertAction> {
+    let prepared = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let Some(pair) = find_cert(
             host.as_ref(),
             &crate::paths::caddy_data(&paths),
             &domain_owned,
         ) else {
-            return Ok(CertAction::NotReady);
+            return Ok(None);
         };
-        let action = decide(host.as_ref(), &pair, known.as_deref())?;
-        if let CertAction::Copy { .. } = &action {
-            copy_pair(host.as_ref(), &pair, &paths.certs_dir)?;
-        }
-        Ok(action)
+        let CertAction::Copy { sha256 } = decide(host.as_ref(), &pair, known.as_deref())? else {
+            return Ok(None);
+        };
+        let cert = host
+            .read_file(&pair.cert)?
+            .ok_or_else(|| anyhow::anyhow!("certificate disappeared"))?;
+        let key = host
+            .read_file(&pair.key)?
+            .ok_or_else(|| anyhow::anyhow!("certificate key disappeared"))?;
+        Ok(Some((sha256, cert, key)))
     })
     .await??;
-    let CertAction::Copy { sha256 } = action else {
+    let Some((sha256, cert, key)) = prepared else {
         return Ok(None);
     };
+    let prior = crate::residential_lifecycle::read_record(ctx)?;
+    let mut published = tx
+        .publish_certificate(ctx, cert, key, sha256.clone())
+        .await?;
+    let repair_same_instance = prior.as_ref().is_some_and(|r| {
+        r.cert_sha.as_deref() == Some(&sha256)
+            && r.after.is_some()
+            && r.after == published.receipt.previous_instance
+    });
+    // 直连 hysteria（apernet）只在启动时读证书（CanReload=no），换证必须重启。
+    // 没在跑的实例交给 systemd，证书同步不负责拉起（移植 core.sh:1000-1006）。
+    let native_key = "cert_native_confirmed_sha";
+    let native_confirmed = ctx
+        .runtime
+        .read()
+        .await
+        .extra
+        .get(native_key)
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    if unit_active(ctx, "hysteria-server").await? && native_confirmed.as_deref() != Some(&sha256) {
+        anyhow::ensure!(
+            restart(ctx, "hysteria-server").await?,
+            "native certificate activation failed"
+        );
+        ctx.runtime
+            .update(|r| {
+                r.extra.insert(native_key.into(), serde_json::json!(sha256));
+            })
+            .await;
+    }
+    if published.receipt.previous_instance.is_some() {
+        let reloaded =
+            repair_same_instance || confirm_reload(ctx, "hysteria-residential", since).await;
+        // The journal marker belongs to the same observed process as the file publication.
+        let same_instance = matches!(crate::residential_lifecycle::observe(ctx.host.as_ref())?, crate::residential_lifecycle::Observation::Running(ref i) if Some(i) == published.receipt.previous_instance.as_ref());
+        anyhow::ensure!(
+            same_instance,
+            "certificate consumer instance changed during reload observation"
+        );
+        published.action = if reloaded {
+            crate::residential_lifecycle::Action::Observe
+        } else {
+            crate::residential_lifecycle::Action::Restart
+        };
+        if !published.receipt.maintenance {
+            tx.complete(ctx, published).await?;
+        } else {
+            anyhow::bail!("residential maintenance prevents certificate activation");
+        }
+    } else {
+        tx.certificate_stopped(ctx, published)?;
+    }
     ctx.runtime
         .update(|r| r.cert_sha256 = Some(sha256.clone()))
         .await;
-    // 直连 hysteria（apernet）只在启动时读证书（CanReload=no），换证必须重启。
-    // 没在跑的实例交给 systemd，证书同步不负责拉起（移植 core.sh:1000-1006）。
-    if unit_active(ctx, "hysteria-server").await? && restart(ctx, "hysteria-server").await? {
-        tracing::info!(unit = "hysteria-server", "证书更新后已重启");
-    }
-    // 住宅实例（自建 sing-box）会 watch 证书文件热加载：先确认，超时才回退重启（fail-safe，
-    // 行为不比 4.0 差）。没在跑就同样交给 systemd（下次启动读新证书），既不读 journald 也不重启。
-    if unit_active(ctx, "hysteria-residential").await? {
-        if confirm_reload(ctx, "hysteria-residential", since).await {
-            tracing::info!(unit = "hysteria-residential", "证书已热加载，无需重启");
-        } else if restart(ctx, "hysteria-residential").await? {
-            tracing::warn!(
-                unit = "hysteria-residential",
-                secs = RESTART_GAP_SECS,
-                "证书热加载未在时限内确认，已回退重启"
-            );
-        }
+    if prior
+        .as_ref()
+        .is_some_and(|r| r.phase == "awaiting_certificate")
+    {
+        ctx.bus
+            .send(crate::api::Event::ReconcileRequested { force: false });
     }
     Ok(Some(sha256))
 }
@@ -165,7 +225,7 @@ pub async fn sync_once(ctx: &DaemonCtx, domain: &str) -> anyhow::Result<Option<S
 /// 单元是否在跑（`ctx.host` 的阻塞调用挪到 blocking 线程）。
 async fn unit_active(ctx: &DaemonCtx, unit: &'static str) -> anyhow::Result<bool> {
     let host = ctx.host.clone();
-    Ok(tokio::task::spawn_blocking(move || host.unit_is_active(unit).unwrap_or(false)).await?)
+    tokio::task::spawn_blocking(move || host.unit_is_active(unit)).await?
 }
 
 /// 重启单元，返回是否成功（调用方已确认它在跑）。
@@ -440,7 +500,23 @@ mod tests {
     async fn ctx_with(host: Arc<FakeHost>) -> (DaemonCtx, tempfile::TempDir) {
         let d = tempfile::tempdir().unwrap();
         let paths = Paths::default_server();
-        let store = Store::create(d.path().join("state.json"), crate::testutil::sample_state())
+        let mut state = crate::testutil::sample_state();
+        bui_schema::hy2pool::grow(&mut state.residential.hy2_pool, 32, &Default::default());
+        host.with(|i| {
+            i.instances.insert("hysteria-residential.service".into(), 1);
+            i.stock_singbox = true;
+            i.listening
+                .entry(crate::sys::Proto::Udp)
+                .or_default()
+                .insert(40000);
+        });
+        host.write_file(
+            &crate::modules::core_files::hy2_resi_config_path(&paths),
+            &crate::residential_lifecycle::config_bytes(&state, &paths).unwrap(),
+            0o600,
+        )
+        .unwrap();
+        let store = Store::create(d.path().join("state.json"), state)
             .await
             .unwrap();
         let runtime = Runtime::load(d.path().join("runtime.json"));
@@ -456,6 +532,23 @@ mod tests {
         )
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn failed_consumer_restart_does_not_acknowledge_certificate() {
+        let host = Arc::new(FakeHost::new());
+        host.with(|i| {
+            i.units_active.insert("hysteria-server.service".into());
+            i.fail_units.insert("hysteria-server.service".into());
+        });
+        seed(&host, "CERT", "KEY");
+        let (ctx, _d) = ctx_with(host).await;
+        let _ = sync_once(&ctx, "example.com").await;
+        assert_eq!(
+            ctx.runtime.read().await.cert_sha256,
+            None,
+            "failed native consumer must remain retryable"
+        );
+    }
+
     /// 住宅实例热加载证书成功那行（前面那条 key-mismatch ERROR 略去，confirm_reload 只认它）。
     fn reload_rec() -> crate::sys::JournalRecord {
         crate::sys::JournalRecord {
@@ -464,6 +557,48 @@ mod tests {
             ts: time::macros::datetime!(2026-09-11 00:00:01 UTC),
             message: "inbound/hysteria2[hy2-resi]: reloaded TLS certificate".into(),
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_gate_confirmation_repairs_without_restarting_certificate_consumers_again() {
+        use crate::modules::panel::{
+            fakes::{FakeHy2, FakeHy2Resi, FakeXray},
+            Shared,
+        };
+        let host = Arc::new(FakeHost::new());
+        host.with(|i| {
+            i.units_active.insert("hysteria-server.service".into());
+            i.units_active.insert("hysteria-residential.service".into());
+        });
+        seed(&host, "CERT", "KEY");
+        let (ctx, _d) = ctx_with(host.clone()).await;
+        let fake = FakeHy2Resi::new();
+        fake.with(|f| {
+            f.selected.remove("gate-r000");
+        });
+        ctx.bus.bind_residential(Arc::new(
+            Shared::new(Box::new(FakeXray::new()), Box::new(FakeHy2::new()))
+                .with_hy2resi(Box::new(fake.clone())),
+        ));
+        assert!(sync_once(&ctx, "example.com").await.is_err());
+        assert!(ctx.runtime.read().await.cert_sha256.is_none());
+        fake.with(|f| {
+            f.selected.insert("gate-r000".into(), "deny".into());
+        });
+        sync_once(&ctx, "example.com").await.unwrap();
+        for unit in ["hysteria-server", "hysteria-residential"] {
+            assert_eq!(
+                host.ops()
+                    .iter()
+                    .filter(|o| o.as_str() == format!("systemd:restart:{unit}"))
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(
+            ctx.runtime.read().await.cert_sha256,
+            Some(crate::kernels::sha256_hex(b"CERT"))
+        );
     }
 
     /// 热加载行出现 → 只重启直连、不重启住宅（T3 §12 第 9 项）。

@@ -28,6 +28,7 @@ struct Inner {
     backups: PathBuf,
     cache: RwLock<Arc<State>>,
     write: Arc<Mutex<()>>,
+    lease: std::sync::OnceLock<Arc<crate::residential_lifecycle::ControlLease>>,
 }
 
 /// Read-only fence on state publication. It leaves auth/snapshot reads concurrent.
@@ -44,6 +45,15 @@ impl PublicationPermit {
 }
 
 impl Store {
+    pub(crate) fn retain_control_lease(
+        &self,
+        lease: Arc<crate::residential_lifecycle::ControlLease>,
+    ) {
+        let _ = self.0.lease.set(lease);
+    }
+    pub(crate) fn directory(&self) -> &Path {
+        self.0.path.parent().expect("state file has a parent")
+    }
     /// 读现成的 `state.json`；文件缺失或内容不合 schema 一律报错（装机前的判据）。
     pub async fn open(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
@@ -76,6 +86,7 @@ impl Store {
             backups,
             cache: RwLock::new(Arc::new(state)),
             write: Arc::new(Mutex::new(())),
+            lease: std::sync::OnceLock::new(),
         }))
     }
 
