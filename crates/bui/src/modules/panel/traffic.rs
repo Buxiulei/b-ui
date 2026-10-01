@@ -341,14 +341,20 @@ pub async fn tick(ctx: &DaemonCtx, shared: &Shared) -> anyhow::Result<()> {
     let sample = sample_once(shared, &ports, &resi_names).await;
     let deltas = to_uuid_map(&sample.deltas);
 
-    // ① 内存累加
-    {
-        let _gate = shared.gate_guard().await;
-        let mut pending = shared.pending().await;
-        for (id, d) in &deltas {
-            pending.entry(*id).or_default().add(*d);
+    // ① A completed reset-style sample must have an owner before the next await.
+    // The publication task retains its bytes while waiting for an activation's gate;
+    // cancellation of this sampling waiter only drops the JoinHandle, not the task.
+    let gate = shared.gate.clone();
+    let pending = shared.pending.clone();
+    let publish_deltas = deltas.clone();
+    tokio::spawn(async move {
+        let _gate = gate.lock_owned().await;
+        let mut pending = pending.lock().await;
+        for (id, delta) in publish_deltas {
+            pending.entry(id).or_default().add(delta);
         }
-    }
+    })
+    .await?;
     // ② Xray 在线窗口
     {
         let mut seen = shared.xray_seen().await;
@@ -536,6 +542,83 @@ mod tests {
     async fn sample_args(h: &Harness) -> (Vec<u16>, BTreeMap<String, Uuid>) {
         let st = h.store.read().await;
         (stats_ports(st.as_ref()), resi_name_to_user(st.as_ref()))
+    }
+
+    // Catches dropping successfully reset counters when the sampling waiter is cancelled
+    // while a gate activation/commit prevents publication into pending.
+    #[tokio::test]
+    async fn cancelling_a_sample_waiting_for_gate_preserves_consumed_quota_bytes() {
+        use std::future::Future;
+
+        let h = harness().await;
+        with_pool(&h).await;
+        let id = h.store.read().await.users[0].user_id;
+        h.store
+            .update(|state| {
+                state.users[0].entitlements.traffic_limit.total_bytes = Some(10);
+            })
+            .await
+            .unwrap();
+        h.hy2.with(|inner| {
+            inner.traffic.insert(
+                9999,
+                BTreeMap::from([(id.to_string(), TxRx { tx: 10, rx: 0 })]),
+            );
+        });
+        let gate = h.shared.gate_guard().await;
+        let ctx = ctx_of(&h);
+        let worker_ctx = ctx.clone();
+        let shared = h.shared.clone();
+        let (blocked_tx, blocked_rx) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            let work = tick(&worker_ctx, &shared);
+            tokio::pin!(work);
+            let mut blocked_tx = Some(blocked_tx);
+            std::future::poll_fn(|cx| {
+                let result = work.as_mut().poll(cx);
+                if result.is_pending() {
+                    if let Some(tx) = blocked_tx.take() {
+                        tx.send(()).unwrap();
+                    }
+                }
+                result
+            })
+            .await
+        });
+        blocked_rx.await.unwrap();
+        // All fake sampling APIs are immediately ready. Counter consumption + the last
+        // Xray query proves this Pending is after the complete sample, with the gate held.
+        let mut consumed = false;
+        h.hy2
+            .with(|inner| consumed = !inner.traffic.contains_key(&9999));
+        assert!(
+            consumed,
+            "the reset-style counter must already have been consumed"
+        );
+        assert!(h.xray.calls().iter().any(|call| call == "query"));
+        assert!(h.shared.pending().await.is_empty());
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        drop(gate);
+        tick(&ctx, &h.shared).await.unwrap();
+        let pending = h
+            .shared
+            .pending()
+            .await
+            .get(&id)
+            .copied()
+            .unwrap_or_default()
+            .total();
+        let accounted = h.store.read().await.users[0].usage.total_bytes + pending;
+        assert_eq!(
+            accounted, 10,
+            "consumed bytes must survive cancellation of the waiting sampler"
+        );
+        assert_eq!(
+            h.hy2resi.selected()["gate-r000"],
+            "deny",
+            "the consumed 10-byte quota must revoke the gate"
+        );
     }
 
     #[test]
