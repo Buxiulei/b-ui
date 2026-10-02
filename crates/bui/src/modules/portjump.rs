@@ -86,17 +86,16 @@
 //! 通信，加一次 `systemctl show` 等于给每次 HY2 启动新增一个依赖。
 //!
 //! 所以 [`run`] 收一个 `spawned_by_systemd`：为真（被 systemd 拉起）时**直接清理，一次
-//! [`Host::unit_property`] 都不发**，只有手动调用才查 `ActiveState`。判据是环境里有没有
-//! [`SYSTEMD_INVOCATION_ENV`]——2026-09-15 在 systemd 259 上实测 `ExecStartPre=` 进程确实有它
-//! ——由 `main` 读出来**按参数传进来**（[`Host`] 没有环境变量入口、[`crate::sys::fake::FakeHost`]
-//! 也注入不了 env，就地 `std::env::var` 会让这段逻辑不可测）。
+//! [`Host::unit_property`] 都不发**，只有手动调用才查 `ActiveState`。CLI 由
+//! [`crate::commands::maintenance`] 核验调用 ID、PID 1/systemd 直接父进程、精确单元 cgroup
+//! 及受管配置路径后**按参数传进来**；只有 `INVOCATION_ID` 不能证明是本单元 prestart。
+//! 普通手工调用（包括 force）先取得机器 control lease，再进入这里读取护栏/配置并清理。
 //!
 //! 两条**不受**护栏影响的路径（改动的全部风险都在这里，各有用例守住）：
-//! - **systemd 的 `ExecStartPre=`**：`INVOCATION_ID` 把整个护栏短路掉，正常启动路径一步不变、
-//!   也不多一次 systemd 往返。万一短路没生效（环境被清过），判定也只认**字面** `active`——
-//!   systemd 跑 `ExecStartPre=` 时单元是 `activating`，于是 `activating` / `inactive` /
-//!   `failed` / 查不到 / 查询失败一律放行（把 `activating` 也算进去就等于每次启动都清不了
-//!   孤儿链，护栏自己制造出它要防的那个崩溃循环）；推不出单元名同样放行。这道第二保险照旧留着。
+//! - **systemd 的 `ExecStartPre=`**：已核实的直接单元调用把整个护栏短路掉，正常启动路径一步不变、
+//!   也不多一次 systemd 往返。身份观察缺失或不匹配时，CLI 先按普通手工调用取得 lease；
+//!   lease 忙则拒绝，不把未知身份当作豁免。取得 lease 后的既有护栏仍只认字面 `active`，
+//!   `activating` / `inactive` / `failed` / 查不到 / 查询失败及未知配置名不触发该护栏。
 //! - **watchdog 自愈与对账**：它们直接调 [`cleanup`]，护栏只在 [`run`] 里，所以进程内调用点
 //!   行为一字不变（崩溃循环中的实例在 systemd 眼里可能正是 `active`，自愈要的就是先清再重启）。
 
@@ -119,7 +118,7 @@ pub const FIREWALL_BACKEND_ENV: &str = "HYSTERIA_FIREWALL_BACKEND";
 /// systemd 给一次单元启动里的**每个**进程设的调用 ID（`ExecStartPre=` 进程与同一次启动的
 /// `ExecStart` 进程同值）。2026-09-15 在两台生产机（systemd 259）上用 `systemd-run --wait
 /// --collect` 起瞬态单元实测：`ExecStartPre=` 进程的环境里确实有它，值长 32。
-/// `main` 读它、按参数传进 [`run`]（见模块文档「为什么要短路」）。
+/// [`crate::commands::maintenance::Invocation`] 将它与父进程及 cgroup 一起核验，单独存在不授予豁免。
 pub const SYSTEMD_INVOCATION_ENV: &str = "INVOCATION_ID";
 
 /// nft 后端的表名前缀（上游 `"hysteria_" + shortHash(...)`）。
@@ -453,7 +452,7 @@ fn active_unit(host: &dyn Host, config: &Path) -> Option<String> {
 /// 唯一的例外是护栏（模块文档「运行中的实例」）：该实例的 `ActiveState` 恰为
 /// [`ACTIVE_STATE`] 而 `force` 为假时**一步清理都不做**，报 [`InstanceRunning`]。
 ///
-/// `spawned_by_systemd`（`main` 按 [`SYSTEMD_INVOCATION_ENV`] 算出）为真时**整个护栏短路、
+/// `spawned_by_systemd`（CLI 入口已核实的直接单元 prestart）为真时**整个护栏短路、
 /// 一次 systemd 查询都不发**：启动关键路径上不加这个依赖（模块文档「为什么要短路」）。
 pub fn run(
     host: &dyn Host,

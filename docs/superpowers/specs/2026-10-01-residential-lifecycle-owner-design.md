@@ -16,6 +16,7 @@ daemon 的 reconcile 已经串行，但住宅入站的 API、watchdog、证书�
 - 住宅监听端口、跳跃段和兼容开关组成最小已发布拓扑绑定，分别于期望 State。住宅 owner 在严格持久 prepared 记录后发布本次目标绑定；apply、ExecStartPre 和 watchdog 三处 BUI nft 表写者使用同一绑定投影与既有 renderer。恢复旧候选时先恢复旧绑定，再恢复服务与规则并读回验证；后续 watchdog 不得用新期望端口覆盖旧运行拓扑。仅跳跃段/兼容开关变化也属于完整发布。规则正文及一致时的无写入行为保持，prestart 子步骤免 lease 重入。
 - startup 在住宅事务前发布当前鉴权 snapshot 并实际 bind 确认原生 HY2 独立 HTTP listener 可用，再执行较长的下载/激活；只 spawn 未就绪任务不足以保证服务可用。
 - 机器上只有一个控制写者。daemon 持有进程间独占 lease；在线 CLI 通过 UDS 提交，无法连接 UDS 不能证明离线。离线写者（包括独立 import-v3 写受管 state 的入口）先取得同一 lease，不能与 daemon 并行写配置或 runtime。
+- 普通手工 `nft apply/delete` 与 `hy2-prestart`（包括 `--force`）在任何受管 State、已发布 binding、活跃护栏或配置读取前取得同一机器 lease，并持有至同步操作真正返回；busy 直接拒绝。只读 nft status 不取 lease。只有当前渲染单元中的直接 ExecStartPre 可免重入：有效调用 ID、PID 1/systemd 父进程、精确 system.slice 单元 cgroup；native 还必须是精确受管 config.yaml 且不带 force。未知身份按手工入口处理，不为维护命令新增 UDS intent。内部已持有 ownership 的 rollback delete 与独立 native watchdog 清理不二次取锁。
 - `harden-ssh` 保留既有加固行为，但在线经 UDS 提交给 daemon，离线在读取写入依据前取得控制 lease。SSH-only apply 不执行住宅网络清理；daemon reconcile 与 CLI 不能同时发布相同 SSH 配置文件。
 - 住宅 ExecStartPre 的 `bui nft apply` 不取得控制写者 lease，防止 owner→systemctl→prestart→owner 死锁。离线安装/对账的 daemon handoff 在住宅流程结束并释放 lease 后进行。
 - 请求取消不会把已开始的阻塞写操作遗留在 owner 外面。服务操作由受管事务完成，等待者取消不释放正在使用的资源锁。
