@@ -15,6 +15,8 @@ pub struct FakeXrayInner {
     pub calls: Vec<String>,
     /// `inbound_user_uuid` 的调用：`"get:<tag>:<user_id>"`
     pub gets: Vec<String>,
+    /// All-list inventory reads; separate from per-email gets and all write/statistic calls.
+    pub inventories: Vec<String>,
     /// 内核里「现在挂着」的用户：`(tag, user_id)` → vless uuid。`add_user` / `remove_user`
     /// 成功时跟着变，`inbound_user_uuid` 从这里读 —— 测试要模拟「内核里挂着旧 uuid」
     /// 直接往这里塞（`sync_users` 先读后写，光靠 `error_text` 已经描述不了内核状态）。
@@ -64,6 +66,10 @@ impl FakeXray {
 
     pub fn gets(&self) -> Vec<String> {
         self.0.lock().unwrap().gets.clone()
+    }
+
+    pub fn inventories(&self) -> Vec<String> {
+        self.0.lock().unwrap().inventories.clone()
     }
 
     pub fn rules(&self) -> Vec<(String, String)> {
@@ -118,6 +124,26 @@ impl XrayApi for FakeXray {
             anyhow::bail!("{msg}");
         }
         Ok(i.users.get(&(tag.to_string(), user_id)).copied())
+    }
+
+    async fn inbound_users(&self, tag: &str) -> anyhow::Result<BTreeMap<Uuid, Uuid>> {
+        let key = format!("inventory:{tag}");
+        let mut inner = self.0.lock().unwrap();
+        inner.inventories.push(key.clone());
+        if inner.fail_on.contains(&key) {
+            let message = inner
+                .error_text
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| format!("fake GetInboundUsers inventory failed: {tag}"));
+            anyhow::bail!("{message}");
+        }
+        Ok(inner
+            .users
+            .iter()
+            .filter(|((inbound, _), _)| inbound == tag)
+            .map(|((_, user_id), vless_id)| (*user_id, *vless_id))
+            .collect())
     }
 
     async fn query_user_deltas(&self) -> anyhow::Result<BTreeMap<String, TxRx>> {
@@ -507,6 +533,55 @@ mod tests {
                 "query".to_string(),
                 "query".to_string(),
             ]
+        );
+    }
+
+    // All-list must enumerate remote users that are absent from any current BUI desired-user list.
+    #[tokio::test]
+    async fn inventory_contract_fake_enumerates_the_requested_inbound_without_writes() {
+        let xray = FakeXray::new();
+        xray.with(|inner| {
+            inner.users.insert(
+                ("vless-direct".into(), Uuid::from_u128(1)),
+                Uuid::from_u128(11),
+            );
+            inner.users.insert(
+                ("vless-direct".into(), Uuid::from_u128(2)),
+                Uuid::from_u128(22),
+            );
+            inner.users.insert(
+                ("vless-residential".into(), Uuid::from_u128(3)),
+                Uuid::from_u128(33),
+            );
+        });
+        let inventory = xray.inbound_users("vless-direct").await;
+        assert!(
+            inventory.is_ok(),
+            "full inventory must be implemented: {inventory:?}"
+        );
+        assert_eq!(
+            inventory.unwrap(),
+            BTreeMap::from([
+                (Uuid::from_u128(1), Uuid::from_u128(11)),
+                (Uuid::from_u128(2), Uuid::from_u128(22))
+            ])
+        );
+        assert_eq!(xray.inventories(), vec!["inventory:vless-direct"]);
+        assert!(
+            xray.calls().is_empty(),
+            "inventory must not write or reset statistics"
+        );
+        assert!(
+            xray.gets().is_empty(),
+            "inventory must not hide desired-state-only per-email reads"
+        );
+        xray.with(|inner| {
+            inner.fail_on.insert("inventory:vless-direct".into());
+        });
+        assert!(xray.inbound_users("vless-direct").await.is_err());
+        assert_eq!(
+            xray.inbound_users("vless-residential").await.unwrap(),
+            BTreeMap::from([(Uuid::from_u128(3), Uuid::from_u128(33))])
         );
     }
 

@@ -237,7 +237,13 @@ impl Module for CoreFilesModule {
                 path: resi_config_path(p, i),
             });
         }
-        let xray = bui_schema::render::xray::config(&s.node, &s.users, &s.residential, p);
+        let authorized_users: Vec<_> = s
+            .users
+            .iter()
+            .filter(|u| !ctx.account_blocked.contains(&u.user_id))
+            .cloned()
+            .collect();
+        let xray = bui_schema::render::xray::config(&s.node, &authorized_users, &s.residential, p);
         let hash = bui_schema::render::xray::structural_hash(&xray);
         out.push(
             Artifact::file(
@@ -292,6 +298,7 @@ mod tests {
 
     fn ctx() -> RenderCtx {
         RenderCtx {
+            account_blocked: Default::default(),
             paths: Paths::default_server(),
             facts: Facts {
                 mem_mb: 2048,
@@ -478,6 +485,48 @@ mod tests {
             !resi_cmd.contains("18789") && !resi_cmd.contains("bui-auth-hook"),
             "{resi_cmd}"
         );
+    }
+
+    #[test]
+    fn xray_startup_config_never_reissues_expired_or_exhausted_credentials() {
+        let mut s = sample_state();
+        let expired_id = s.users[0].user_id;
+        s.users[0].entitlements.expires_at = Some("2000-01-01T00:00:00Z".into());
+        let mut exhausted = s.users[0].clone();
+        exhausted.user_id = uuid::Uuid::from_u128(2);
+        exhausted.entitlements.expires_at = None;
+        exhausted.entitlements.traffic_limit.total_bytes = Some(5);
+        exhausted.usage.total_bytes = 5;
+        s.users.push(exhausted);
+        let mut render_ctx = ctx();
+        render_ctx.account_blocked = crate::modules::panel::users::blocked_set(
+            &s,
+            &Default::default(),
+            time::OffsetDateTime::now_utc(),
+        );
+        assert_eq!(
+            render_ctx.account_blocked,
+            std::collections::BTreeSet::from([expired_id, uuid::Uuid::from_u128(2)])
+        );
+        let arts = CoreFilesModule::new(None).render(&s, &render_ctx);
+        let cfg: serde_json::Value = match find_file(&arts, "/opt/b-ui/xray-config.json") {
+            Artifact::File { content, .. } => serde_json::from_slice(&content).unwrap(),
+            other => panic!("{other:?}"),
+        };
+        for inbound in cfg["inbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|i| i["protocol"] == "vless")
+        {
+            assert!(
+                inbound["settings"]["clients"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty(),
+                "blocked accounts ({expired_id}) must remain refused after Xray restart"
+            );
+        }
     }
 
     #[test]

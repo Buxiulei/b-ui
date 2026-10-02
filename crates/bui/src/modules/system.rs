@@ -285,6 +285,7 @@ mod tests {
 
     fn ctx(mem_mb: u64, ufw: bool, firewalld: bool, resolved: bool) -> RenderCtx {
         RenderCtx {
+            account_blocked: Default::default(),
             paths: Paths::default_server(),
             facts: Facts {
                 mem_mb,

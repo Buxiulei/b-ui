@@ -4,6 +4,7 @@
 //! 它不是对账的 `Artifact`（P1 不比对它的内容，只把它放进 `BASE_WHITELIST`），
 //! 由本模块在每次用户 / 限额变化时原子重写（tmp + 0600 + rename）。
 
+use bui_schema::egress::{access_for, AuthorizedEgress, RequestedEgress};
 use bui_schema::model::{Protocol, State};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -37,9 +38,8 @@ impl Snapshot {
         }
     }
 
-    /// 期望态 + 本轮判定的拒绝集合 → 快照。只收有 `hysteria2` 权益的用户
-    /// （只有 Reality 权益的用户建不了 QUIC 连接，放进来只会让「快照里有他
-    /// ⇒ 他能用 HY2」这条读法出错）。
+    /// Native HY2 serves the explicitly granted direct path. Keep protocol users in
+    /// the snapshot shape, but mark every denied direct grant blocked for the hook.
     pub fn from_state(state: &State, blocked: &BTreeSet<Uuid>) -> Self {
         let users = state
             .users
@@ -52,7 +52,16 @@ impl Snapshot {
                         user_id: u.user_id.to_string(),
                         hy2_password: u.credentials.hy2_password.clone(),
                         expires_at: u.entitlements.expires_at.clone(),
-                        blocked: u.disabled || blocked.contains(&u.user_id),
+                        blocked: !matches!(
+                            access_for(
+                                u,
+                                &state.residential,
+                                Protocol::Hysteria2,
+                                RequestedEgress::Direct,
+                                blocked.contains(&u.user_id),
+                            ),
+                            Ok(AuthorizedEgress::Direct)
+                        ),
                     },
                 )
             })
@@ -151,6 +160,31 @@ mod tests {
         let mut s = sample_state();
         s.users[0].entitlements.protocols = vec![bui_schema::model::Protocol::Reality];
         assert!(Snapshot::from_state(&s, &BTreeSet::new()).users.is_empty());
+    }
+
+    // A residential-only credential must not authenticate on native HY2's direct port.
+    #[test]
+    fn egress_contract_native_hy2_requires_an_explicit_direct_grant() {
+        use crate::modules::panel::auth_hook::{decide, Decision};
+        use time::macros::datetime;
+
+        let now = datetime!(2026-09-11 00:00:00 UTC);
+        let mut state = sample_state();
+        state.users[0].entitlements.direct = false;
+        let snapshot = Snapshot::from_state(&state, &BTreeSet::new());
+        assert_eq!(
+            decide(&snapshot, "alice:pw-alice-01", now),
+            Decision::Deny { reason: "blocked" }
+        );
+
+        state.users[0].entitlements.direct = true;
+        let snapshot = Snapshot::from_state(&state, &BTreeSet::new());
+        assert_eq!(
+            decide(&snapshot, "alice:pw-alice-01", now),
+            Decision::Allow {
+                user_id: "8d5a1a1e-3b2c-4d1e-9f00-0000000000aa".into()
+            }
+        );
     }
 
     #[test]

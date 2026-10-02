@@ -92,13 +92,46 @@ pub fn add_user_request(tag: &str, user_id: Uuid, vless_uuid: Uuid) -> AlterInbo
     }
 }
 
-/// 组装 `GetInboundUsers` 请求：tag + email（不填 email 是「列出这个 inbound 的全部用户」，
-/// 我们从不那么用 —— 一次只问一个 email）。
+/// Request one email; unlike the full named-user inventory, a missing email may return [{}].
 pub fn get_inbound_user_request(tag: &str, user_id: Uuid) -> GetInboundUserRequest {
     GetInboundUserRequest {
         tag: tag.to_string(),
         email: user_id.to_string(),
     }
+}
+
+/// Request the complete named-user inventory rather than a desired-state email subset.
+pub fn get_inbound_users_request(tag: &str) -> GetInboundUserRequest {
+    GetInboundUserRequest {
+        tag: tag.to_string(),
+        email: String::new(),
+    }
+}
+
+/// Decode a complete BUI-owned inbound inventory; malformed rows must not disappear.
+pub fn inbound_users_of(users: &[PbUser]) -> anyhow::Result<BTreeMap<Uuid, Uuid>> {
+    let mut inventory = BTreeMap::new();
+    for (index, user) in users.iter().enumerate() {
+        let user_id = Uuid::parse_str(&user.email)
+            .map_err(|_| anyhow::anyhow!("Xray inventory row {index}: invalid account identity"))?;
+        let account = user
+            .account
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Xray inventory row {index}: missing VLESS account"))?;
+        anyhow::ensure!(
+            account.r#type == TYPE_VLESS_ACCOUNT,
+            "Xray inventory row {index}: unexpected account type"
+        );
+        let account = Account::decode(account.value.as_slice())
+            .map_err(|_| anyhow::anyhow!("Xray inventory row {index}: malformed VLESS account"))?;
+        let vless_id = Uuid::parse_str(&account.id)
+            .map_err(|_| anyhow::anyhow!("Xray inventory row {index}: invalid VLESS identity"))?;
+        anyhow::ensure!(
+            inventory.insert(user_id, vless_id).is_none(),
+            "Xray inventory row {index}: duplicate account identity"
+        );
+    }
+    Ok(inventory)
 }
 
 /// `GetInboundUserResponse.users` → 这个 email 在内核里挂着的 vless uuid；位置空着返回 `None`。
@@ -293,6 +326,14 @@ impl XrayApi for XrayClient {
             .get_inbound_users(get_inbound_user_request(tag, user_id))
             .await?;
         Ok(vless_uuid_of(&resp.into_inner().users, user_id))
+    }
+
+    async fn inbound_users(&self, tag: &str) -> anyhow::Result<BTreeMap<Uuid, Uuid>> {
+        let mut client = HandlerServiceClient::new(self.channel()?);
+        let response = client
+            .get_inbound_users(get_inbound_users_request(tag))
+            .await?;
+        inbound_users_of(&response.into_inner().users)
     }
 
     async fn query_user_deltas(&self) -> anyhow::Result<BTreeMap<String, TxRx>> {
@@ -564,6 +605,224 @@ mod tests {
         let req = get_inbound_user_request("vless-direct", uid());
         assert_eq!(req.tag, "vless-direct");
         assert_eq!(req.email, uid().to_string(), "email 就是 user_id");
+    }
+
+    // Populating email with a desired user would omit identities deleted during a daemon crash.
+    #[test]
+    fn inventory_contract_request_uses_the_tag_and_an_empty_email() {
+        let request = get_inbound_users_request("vless-residential");
+        assert_eq!(request.tag, "vless-residential");
+        assert_eq!(request.email, "");
+    }
+
+    fn inventory_user(email: &str, id: &str) -> PbUser {
+        PbUser {
+            level: 0,
+            email: email.into(),
+            account: Some(typed(
+                TYPE_VLESS_ACCOUNT,
+                &Account {
+                    id: id.into(),
+                    ..Default::default()
+                },
+            )),
+        }
+    }
+
+    // A partial/default map would conceal an old identity that no longer appears in desired state.
+    #[test]
+    fn inventory_contract_parser_retains_every_named_identity() {
+        let users = [
+            inventory_user(
+                "00000000-0000-0000-0000-000000000001",
+                "11111111-1111-4111-8111-111111111111",
+            ),
+            inventory_user(
+                "00000000-0000-0000-0000-000000000002",
+                "22222222-2222-4222-8222-222222222222",
+            ),
+        ];
+        let inventory = inbound_users_of(&users);
+        assert!(
+            inventory.is_ok(),
+            "valid named-user inventory must decode: {inventory:?}"
+        );
+        assert_eq!(
+            inventory.unwrap(),
+            BTreeMap::from([
+                (
+                    Uuid::from_u128(1),
+                    Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap()
+                ),
+                (
+                    Uuid::from_u128(2),
+                    Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap()
+                ),
+            ])
+        );
+        let empty = inbound_users_of(&[]);
+        assert!(empty.is_ok(), "a genuinely empty list is a valid inventory");
+        assert!(empty.unwrap().is_empty());
+    }
+
+    // Any malformed row invalidates the entire inventory, preventing silent partial convergence.
+    #[test]
+    fn inventory_contract_parser_rejects_malformed_or_ambiguous_rows() {
+        let valid = inventory_user(
+            "8d5a1a1e-3b2c-4d1e-9f00-0000000000aa",
+            "11111111-1111-4111-8111-111111111111",
+        );
+        let cases = [
+            (
+                "empty-email",
+                inventory_user("", "22222222-2222-4222-8222-222222222222"),
+            ),
+            (
+                "malformed-email",
+                inventory_user("unparseable", "22222222-2222-4222-8222-222222222222"),
+            ),
+            (
+                "missing-account",
+                PbUser {
+                    email: "00000000-0000-0000-0000-000000000002".into(),
+                    ..Default::default()
+                },
+            ),
+            (
+                "wrong-account-type",
+                PbUser {
+                    email: "00000000-0000-0000-0000-000000000002".into(),
+                    account: Some(typed(
+                        "xray.proxy.vmess.Account",
+                        &Account {
+                            id: "22222222-2222-4222-8222-222222222222".into(),
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                },
+            ),
+            (
+                "malformed-account-wire",
+                PbUser {
+                    email: "00000000-0000-0000-0000-000000000002".into(),
+                    account: Some(TypedMessage {
+                        r#type: TYPE_VLESS_ACCOUNT.into(),
+                        value: vec![0xff],
+                    }),
+                    ..Default::default()
+                },
+            ),
+            (
+                "malformed-vless-id",
+                inventory_user("00000000-0000-0000-0000-000000000002", "unparseable"),
+            ),
+            ("duplicate-email", valid.clone()),
+            (
+                "duplicate-canonical-email",
+                inventory_user(
+                    "8D5A1A1E-3B2C-4D1E-9F00-0000000000AA",
+                    "22222222-2222-4222-8222-222222222222",
+                ),
+            ),
+        ];
+        for (case, row) in cases {
+            assert!(
+                inbound_users_of(&[valid.clone(), row]).is_err(),
+                "{case}: a partial list must never be accepted"
+            );
+        }
+    }
+
+    // Explicit opt-in, never a silent skip: the real stock RPC must enumerate orphaned named users.
+    #[tokio::test]
+    #[ignore = "requires isolated stock Xray"]
+    async fn stock_inbound_inventory_reads_all_named_users() {
+        assert!(
+            have_xray(),
+            "this stock fact test requires an installed Xray binary"
+        );
+        let free_port = || {
+            std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port()
+        };
+        let (api_port, vless_port) = (free_port(), free_port());
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("inventory-xray.json");
+        let seed_user = Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
+        let seed_vless = Uuid::parse_str("66666666-6666-4666-8666-666666666666").unwrap();
+        let orphan_user = Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap();
+        let orphan_vless = Uuid::parse_str("77777777-7777-4777-8777-777777777777").unwrap();
+        let cfg = serde_json::json!({
+            "log": {"loglevel": "warning"},
+            "api": {"tag": "api", "services": ["HandlerService", "RoutingService"]},
+            "inbounds": [
+                {"tag": "api", "port": api_port, "listen": "127.0.0.1", "protocol": "dokodemo-door", "settings": {"address": "127.0.0.1"}},
+                {"tag": "inventory-fixture", "port": vless_port, "listen": "127.0.0.1", "protocol": "vless", "settings": {"clients": [{"id": seed_vless, "email": seed_user}], "decryption": "none"}}
+            ],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+            "routing": {"rules": [{"type": "field", "inboundTag": ["api"], "outboundTag": "api"}]}
+        });
+        std::fs::write(&config, serde_json::to_vec_pretty(&cfg).unwrap()).unwrap();
+        let _kernel = Xrayd::spawn(&config);
+        let client = XrayClient::with_addr(format!("127.0.0.1:{api_port}"));
+        let mut ready = false;
+        for _ in 0..50 {
+            if client.list_rules().await.is_ok() {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            ready,
+            "stock Xray must accept RPC before the inventory assertion"
+        );
+        assert_eq!(
+            client.inbound_users("inventory-fixture").await.unwrap(),
+            BTreeMap::from([(seed_user, seed_vless)])
+        );
+        client
+            .add_user("inventory-fixture", orphan_user, orphan_vless)
+            .await
+            .unwrap();
+        // The literal expected set includes a user that is absent from future desired state.
+        assert_eq!(
+            client.inbound_users("inventory-fixture").await.unwrap(),
+            BTreeMap::from([(seed_user, seed_vless), (orphan_user, orphan_vless)])
+        );
+        assert_eq!(
+            client
+                .inbound_user_uuid("inventory-fixture", orphan_user)
+                .await
+                .unwrap(),
+            Some(orphan_vless)
+        );
+        client
+            .remove_user("inventory-fixture", orphan_user)
+            .await
+            .unwrap();
+        assert_eq!(
+            client.inbound_users("inventory-fixture").await.unwrap(),
+            BTreeMap::from([(seed_user, seed_vless)])
+        );
+        client
+            .remove_user("inventory-fixture", seed_user)
+            .await
+            .unwrap();
+        assert!(client
+            .inbound_users("inventory-fixture")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(client
+            .inbound_users("missing-inventory-fixture")
+            .await
+            .is_err());
+        println!("stock Xray named-user inventory: seed, orphan, removal, empty, missing-inbound verified");
     }
 
     #[test]

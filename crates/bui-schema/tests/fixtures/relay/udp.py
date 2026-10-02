@@ -10,6 +10,8 @@ import threading
 import time
 from pathlib import Path
 
+from policy import dns_reply
+
 
 def exact(sock, size):
     data = b""
@@ -46,7 +48,7 @@ def main():
     with bound(socket.SOCK_STREAM) as gateway, bound(socket.SOCK_DGRAM) as upstream:
         gateway.listen()
         done = threading.Event()
-        errors = []
+        errors, dns_queries = [], []
 
         def control(conn):
             with conn:
@@ -55,10 +57,23 @@ def main():
                     methods = exact(conn, exact(conn, 1)[0])
                     assert 0 in methods
                     conn.sendall(b"\x05\x00")
-                    assert exact(conn, 3) == b"\x05\x03\x00"
-                    address(lambda n: exact(conn, n))
+                    version, command, reserved = exact(conn, 3)
+                    assert (version, reserved) == (5, 0)
+                    destination = address(lambda n: exact(conn, n))
+                    assert command in (1, 3), command
                     conn.sendall(b"\x05\x00\x00\x01\x7f\x00\x00\x01" + struct.pack("!H", upstream.getsockname()[1]))
-                    done.wait(20)
+                    if command == 3:
+                        done.wait(20)
+                    else:
+                        assert destination == ("8.8.8.8", 53), destination
+                        while not done.is_set():
+                            size = struct.unpack("!H", exact(conn, 2))[0]
+                            query = exact(conn, size)
+                            dns_queries.append(query)
+                            reply = dns_reply(query)
+                            conn.sendall(struct.pack("!H", len(reply)) + reply)
+                except (EOFError, ConnectionResetError, BrokenPipeError):
+                    pass  # Closing the owned kernel ends its retained DNS transport.
                 except Exception as e:
                     errors.append(repr(e))
 
@@ -71,8 +86,8 @@ def main():
                 threading.Thread(target=control, args=(conn,), daemon=True).start()
 
         threading.Thread(target=accept, daemon=True).start()
-        # Only relocate listeners and replace DNS with a deterministic, offline
-        # answer. Keep the generated routing, SOCKS outbound and selectors intact.
+        # Only relocate listeners and offline bootstrap DNS. Business DNS keeps
+        # the generated supplier detour and is answered over its real TCP hop.
         # Relocate both slot and policy listeners. Replacing resi-1 directly
         # would bypass the policy hop and silently stop testing the real path.
         reservations = [bound(socket.SOCK_STREAM) for _ in cfg["inbounds"]]
@@ -91,10 +106,10 @@ def main():
         assert raw_count == 1, "fixture must exercise one real policy endpoint"
         for reserved in reservations:
             reserved.close()
-        cfg["dns"]["servers"] = [
-            {"type": "hosts", "tag": tag, "predefined": {"echo.example.invalid": ["203.0.113.9"]}}
-            for tag in ("dns_direct", "dns_resi")
-        ]
+        for index, server in enumerate(cfg["dns"]["servers"]):
+            if server["tag"] == "dns_direct":
+                cfg["dns"]["servers"][index] = {"type": "hosts", "tag": "dns_direct",
+                    "predefined": {"echo.example.invalid": ["203.0.113.9"]}}
         cfg.pop("experimental", None)
         cfg["log"] = {"level": "debug"}
         with tempfile.TemporaryDirectory() as directory:
@@ -143,6 +158,7 @@ def main():
                                 reply, _ = udp.recvfrom(2048)
                                 assert reply.endswith(payload), reply.hex()
                     assert not errors, errors
+                    assert dns_queries, "initial UDP FQDN did not use residential TCP DNS"
                     print("PASS: residential UDP resolves initial domains, preserves later address changes, and returns replies")
                 except Exception:
                     log.flush()

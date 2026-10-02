@@ -261,22 +261,16 @@ pub fn build_state(
 /// hysteria 鉴权钩子读的快照（spec §3.2）。形状**逐字照总纲 C5**：
 /// `{"schema":1,"users":{"<username>":{user_id,hy2_password,expires_at,blocked}}}`；
 /// 没有用户时 `users` 是空对象。P2 的钩子与快照重写按同一形状。
-pub fn auth_snapshot(state: &State) -> serde_json::Value {
-    // 写成「顶层直接以用户名为键」的扁平对象，P2 的钩子就读不到用户，
-    // `bui install --import-v3` 之后导入的用户建连一律 fail-closed。
-    let mut users = serde_json::Map::new();
-    for u in &state.users {
-        users.insert(
-            u.username.clone(),
-            serde_json::json!({
-                "user_id": u.user_id.to_string(),
-                "hy2_password": u.credentials.hy2_password,
-                "expires_at": u.entitlements.expires_at,
-                "blocked": u.disabled,
-            }),
-        );
-    }
-    serde_json::json!({ "schema": 1, "users": serde_json::Value::Object(users) })
+pub fn auth_snapshot(state: &State, now: time::OffsetDateTime) -> serde_json::Value {
+    // Offline install owns the control lease and has no daemon pending ledger.
+    // Use the same durable quota/expiry and native direct authorization as the
+    // daemon; reinstall must not reopen an account before reconciliation succeeds.
+    let blocked =
+        crate::modules::panel::users::blocked_set(state, &std::collections::BTreeMap::new(), now);
+    serde_json::to_value(crate::modules::panel::snapshot::Snapshot::from_state(
+        state, &blocked,
+    ))
+    .expect("native authentication snapshot has only serializable fields")
 }
 
 /// 只在内容变化时写（0600）；否则第二次 `bui install` 就不是零写入了。
@@ -692,6 +686,9 @@ pub fn summary(
                 out.push(format!("订阅        {}（v2rayN）", urls.uri));
                 out.push(format!("            {}（sing-box）", urls.singbox));
                 out.push(format!("            {}（mihomo）", urls.clash));
+                if u.entitlements.residential.is_some() {
+                    out.push("住宅提示    此账户有住宅权益；住宅不可用时整份订阅返回 503。请先配置并启用住宅上游、完成出口绑定；仅需直连时，新建未勾选住宅权益的账户。".to_string());
+                }
             }
             None => out.push(format!(
                 "订阅        https://{d}/api/sub/<订阅token>（v2rayN）· /api/subscription/<订阅token>（sing-box）· /api/clash/<订阅token>（mihomo）"
@@ -1209,7 +1206,7 @@ async fn install_owned(
     // 8：初版 auth-snapshot.json（钩子的输入；内容不变则不写，保证第二次 install 零写入）
     {
         let state = ctx.store.read().await;
-        let bytes = serde_json::to_vec_pretty(&auth_snapshot(&state))?;
+        let bytes = serde_json::to_vec_pretty(&auth_snapshot(&state, host.now()))?;
         let (h, p) = (host.clone(), paths.clone());
         tokio::task::spawn_blocking(move || write_auth_snapshot(h.as_ref(), &p, &bytes)).await??;
     }
@@ -1219,7 +1216,7 @@ async fn install_owned(
     let reg = crate::serve::modules(manifest);
     ctx.bus.bind_residential(reg.panel.clone());
     let report =
-        crate::serve::reconcile_from_ctx(&ctx, &reg.modules, fetcher, false, false).await?;
+        crate::serve::reconcile_from_ctx(&ctx, &reg.modules, fetcher, None, false, false).await?;
     ctx.bus.residential().drain().await;
     drop(lease);
     crate::serve::finish_self_restart(&ctx, &report, false).await;
@@ -1695,7 +1692,7 @@ mod tests {
         let mut empty = crate::testutil::sample_state();
         empty.users.clear();
         assert_eq!(
-            auth_snapshot(&empty),
+            auth_snapshot(&empty, t0()),
             serde_json::json!({ "schema": 1, "users": {} })
         );
         assert_eq!(
@@ -1706,7 +1703,7 @@ mod tests {
         // 有用户时：users 的键 = 用户名，四个字段与 P2 的 auth-hook 约定一致
         let state = crate::testutil::sample_state();
         let u = &state.users[0];
-        let snap = auth_snapshot(&state);
+        let snap = auth_snapshot(&state, t0());
         assert_eq!(snap["schema"], 1);
         assert_eq!(
             snap["users"][u.username.as_str()],
@@ -1718,6 +1715,66 @@ mod tests {
             })
         );
         assert!(snap["users"].get("nobody").is_none());
+    }
+
+    #[test]
+    fn install_snapshot_denies_every_non_direct_account_in_the_real_auth_hook() {
+        use crate::modules::panel::{auth_hook, snapshot::Snapshot};
+        use bui_schema::model::Protocol;
+        let mut state = crate::testutil::sample_state();
+        let template = state.users[0].clone();
+        state.users = (1..=8)
+            .map(|id| {
+                let mut user = template.clone();
+                user.user_id = uuid::Uuid::from_u128(id);
+                user.username = format!("account-{id}");
+                user.entitlements.expires_at = None;
+                user
+            })
+            .collect();
+        state.users[1].entitlements.direct = false;
+        state.users[2].entitlements.protocols = vec![Protocol::Reality];
+        state.users[3].entitlements.traffic_limit.total_bytes = Some(100);
+        state.users[3].usage.total_bytes = 100;
+        state.users[4].entitlements.traffic_limit.monthly_bytes = Some(100);
+        state.users[4].usage.monthly_bytes = 100;
+        state.users[4].usage.month_key = "2026-09".to_string();
+        state.users[5].disabled = true;
+        state.users[6].entitlements.expires_at = Some("2026-09-13T00:00:00Z".into());
+        state.users[7].entitlements.expires_at = Some("invalid-expiry".into());
+        let directory = tempfile::tempdir().unwrap();
+        let paths = scratch(&directory);
+        let host = FakeHost::new();
+        let bytes = serde_json::to_vec_pretty(&auth_snapshot(&state, t0())).unwrap();
+        write_auth_snapshot(&host, &paths, &bytes).unwrap();
+        let written = host
+            .read_file(&crate::paths::auth_snapshot_file(&paths))
+            .unwrap()
+            .expect("installation must write the command hook input");
+        let snapshot: Snapshot = serde_json::from_slice(&written).unwrap();
+        assert_eq!(
+            auth_hook::decide(&snapshot, "account-1:pw-alice-01", t0()),
+            auth_hook::Decision::Allow {
+                user_id: uuid::Uuid::from_u128(1).to_string()
+            }
+        );
+        for id in 2..=8 {
+            assert!(
+                matches!(
+                    auth_hook::decide(&snapshot, &format!("account-{id}:pw-alice-01"), t0()),
+                    auth_hook::Decision::Deny { .. }
+                ),
+                "installation must not reopen denied native HY2 account {id}"
+            );
+        }
+        assert_eq!(
+            host.mode(
+                &crate::paths::auth_snapshot_file(&paths)
+                    .display()
+                    .to_string()
+            ),
+            Some(0o600)
+        );
     }
 
     #[tokio::test]
@@ -2493,6 +2550,7 @@ mod tests {
         let state = store.read().await;
         let reg = crate::serve::modules(None);
         let ctx = crate::reconcile::RenderCtx {
+            account_blocked: Default::default(),
             paths: paths.clone(),
             facts: crate::reconcile::Facts::probe(host.as_ref()).unwrap(),
         };
@@ -2815,7 +2873,7 @@ mod tests {
         assert!(s.contains("https://example.com/"), "{s}");
         assert!(s.contains("hunter2"), "一次性密码只在摘要里出现这一次：{s}");
         assert!(s.contains("alice"), "第一个用户名要在摘要里：{s}");
-        // 有用户时给的是**能直接粘进客户端**的三条真地址，而不是 `<用户名>` 形状
+        // Addresses identify this account; residential delivery readiness is disclosed separately.
         for url in [
             "https://example.com/api/sub/alice",
             "https://example.com/api/subscription/alice",
@@ -3421,17 +3479,42 @@ mod tests {
             bui_schema::hy2pool::POOL_MIN,
             "池要补到下限，空闲凭据就是预留的门位"
         );
-        assert!(
-            bui_schema::nodes::nodes_for(u, &state.node, &state.residential)
-                .iter()
-                .any(|n| n.kind == bui_schema::nodes::NodeKind::Hy2Residential),
-            "首用户的节点表里要有住宅 HY2"
+        // Reservation is distinct from deliverability: a fresh install has no
+        // residential supplier and must not advertise a fictitious residence path.
+        let initial_nodes = bui_schema::nodes::nodes_for(u, &state.node, &state.residential);
+        assert_eq!(
+            initial_nodes.iter().map(|n| n.kind).collect::<Vec<_>>(),
+            vec![
+                bui_schema::nodes::NodeKind::RealityDirect,
+                bui_schema::nodes::NodeKind::Hy2Direct,
+            ]
         );
+        let (static_nodes, _) =
+            crate::modules::panel::api_public::nodes_and_split(&state, DEFAULT_FIRST_USER)
+                .expect("existing account has a static node projection");
+        assert_eq!(static_nodes, initial_nodes);
+        // After an operator configures a real residential supplier and binds the
+        // account, all four granted paths become deliverable using the reserved credential.
+        let mut ready_state = state.clone();
+        let group = ready_state
+            .residential
+            .groups
+            .get_mut(bui_schema::model::DEFAULT_GROUP)
+            .unwrap();
+        group.enabled = true;
+        group.upstreams = vec![serde_json::from_value(serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000001", "name": "test-residence", "kind": "socks5",
+            "host": "isp.example.net", "port": 10080
+        }))
+        .unwrap()];
+        bui_schema::slots::sync_slots(&mut ready_state.residential);
+        bui_schema::slots::migrate_unassigned(&mut ready_state);
+        let state = &ready_state;
         // 装完那一屏打出去的三条订阅地址必须真的渲染得出东西来（2026-09-12 审查 blocking：
         // 只断言 state 里有这个用户，渲染不出来照样是「面板空的、订阅无处可填」）。
         // 走面板 `/api/sub`、`/api/subscription`、`/api/clash` 同一个入口取节点与分流规则。
         let (nodes, split) =
-            crate::modules::panel::api_public::nodes_and_split(&state, DEFAULT_FIRST_USER)
+            crate::modules::panel::api_public::nodes_and_split(state, DEFAULT_FIRST_USER)
                 .expect("第一个用户要取得出节点集合");
         assert!(
             !nodes.is_empty(),

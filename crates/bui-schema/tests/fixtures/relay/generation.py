@@ -9,6 +9,7 @@ import json
 import os
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -17,7 +18,7 @@ import time
 import urllib.request
 from pathlib import Path
 
-from policy import address, bound, encoded, exact, header, http, socks
+from policy import address, bound, dns_reply, encoded, exact, header, http, socks
 
 # Fixed independent oracles paired with relay_generation_kernel.rs; do not
 # derive expected identities from potentially incorrect renderer output.
@@ -57,7 +58,7 @@ class Supplier:
         self.closed = threading.Event()
         self.half_started = threading.Event()
         self.release_half = threading.Event()
-        self.errors, self.connections = [], []
+        self.errors, self.connections, self.destinations, self.dns_queries = [], [], [], []
         threading.Thread(target=self.accept, daemon=True).start()
 
     def accept(self):
@@ -88,7 +89,8 @@ class Supplier:
                     connection.sendall(b"\x01\x00")
                 version, command, reserved = exact(connection, 3)
                 assert (version, reserved) == (5, 0)
-                address(lambda size: exact(connection, size))
+                destination = address(lambda size: exact(connection, size))
+                self.destinations.append((command, destination))
                 if command == 3:
                     with bound(socket.SOCK_DGRAM) as udp:
                         udp.settimeout(0.1)
@@ -121,6 +123,15 @@ class Supplier:
                     return
                 assert command == 1
                 connection.sendall(b"\x05\x00\x00" + encoded("127.0.0.1", self.port))
+                if destination[1] == 53:
+                    assert destination == ("8.8.8.8", 53), destination
+                    while not self.closed.is_set():
+                        size = struct.unpack("!H", exact(connection, 2))[0]
+                        query = exact(connection, size)
+                        self.dns_queries.append(query)
+                        reply = dns_reply(query)
+                        connection.sendall(struct.pack("!H", len(reply)) + reply)
+                    return
                 while not self.closed.is_set():
                     request = header(connection)
                     if request.startswith(b"POST /delayed-half "):
@@ -233,9 +244,10 @@ def relocate(data, suppliers):
         reservations.append(api)
         cfg["experimental"] = {"clash_api": {"external_controller": f"127.0.0.1:{api.getsockname()[1]}"}}
         if "dns" in cfg:
-            tags = [server["tag"] for server in cfg["dns"].get("servers", [])]
             names = {name: ["203.0.113.9"] for name in ("service.invalid", "second.invalid", "a-block.invalid", "b-block.invalid")}
-            cfg["dns"]["servers"] = [{"type": "hosts", "tag": tag, "predefined": names} for tag in tags]
+            for index, server in enumerate(cfg["dns"]["servers"]):
+                if server["tag"] == "dns_direct":
+                    cfg["dns"]["servers"][index] = {"type": "hosts", "tag": "dns_direct", "predefined": names}
         cfg["log"] = {"level": "error"}
     for name, cfg in configs.items():
         for outbound in cfg["outbounds"]:
@@ -284,12 +296,26 @@ def request(front, slot, expected, host="service.invalid", port=443):
         assert http(connection, host) == expected, (slot, host, expected)
 
 
+def rejected(front, suppliers, slot, host="service.invalid", port=443):
+    before = {name: len(supplier.destinations) for name, supplier in suppliers.items()}
+    try:
+        with tcp(front, slot, host, port) as connection:
+            result = http(connection, host)
+    except TimeoutError:
+        raise AssertionError("rejected generation request must fail explicitly, not hang")
+    except (EOFError, ConnectionResetError, BrokenPipeError, ConnectionRefusedError):
+        pass
+    else:
+        raise AssertionError(f"blocked generation request returned data: {result!r}")
+    assert {name: len(supplier.destinations) for name, supplier in suppliers.items()} == before, "blocked generation request reached a terminal receiver"
+
+
 class UdpSession:
     def __init__(self, front, slot):
         self.control, self.relay = socks(front.ports[f"slot-{slot}"], "0.0.0.0", 0, udp=True)
         self.client = bound(socket.SOCK_DGRAM)
 
-    def round_trip(self, expected, sequence, target="203.0.113.9", port=12345):
+    def round_trip(self, expected, sequence, target="203.0.113.9", port=12345, supplier_host=None):
         payload = str(sequence).encode()
         self.client.sendto(b"\x00\x00\x00" + encoded(target, port) + payload, self.relay)
         packet, _ = self.client.recvfrom(4096)
@@ -299,7 +325,8 @@ class UdpSession:
         assert returned_target == (target, port), (target, port, returned_target)
         assert reader.read(len(expected) + 1) == expected + b":", (expected, packet)
         supplier_target = address(reader.read)
-        assert supplier_target == (target, port), (target, port, supplier_target)
+        expected_supplier = supplier_host or target
+        assert supplier_target == (expected_supplier, port), (expected_supplier, port, supplier_target)
         assert reader.read() == payload, packet
 
     def close(self):
@@ -373,9 +400,9 @@ def main():
                 assert json_call(front.api, f"/proxies/resi-{member}")["now"] == bank_member(front, member, "a")
             # Policy behavior comes from generated routes: A1 blocks the A domain
             # and the disallowed port, B1 changes both policy decisions.
-            request(front, 0, b"DIRECT-A", "a-block.invalid")
+            rejected(front, suppliers, 0, "a-block.invalid")
             request(front, 0, b"A1", "b-block.invalid")
-            request(front, 0, b"DIRECT-A", port=2222)
+            rejected(front, suppliers, 0, port=2222)
             for index in range(50):
                 slot = index % 2
                 connection = tcp(front, slot)
@@ -411,7 +438,7 @@ def main():
             new_b_udp.round_trip(b"B1", "new-partial-B")
             new_a_udp.round_trip(b"A2", "new-partial-A")
             request(front, 0, b"B1", "a-block.invalid")
-            request(front, 0, b"DIRECT-B", "b-block.invalid")
+            rejected(front, suppliers, 0, "b-block.invalid")
             request(front, 0, b"B1", port=2222)
             new_b, new_a = tcp(front, 0), tcp(front, 1)
             extras.extend((new_b, new_a))
@@ -442,6 +469,13 @@ def main():
             # then return to its first target; its bank must remain A throughout.
             for target, port in (("second.invalid", 12346), ("203.0.113.10", 12345), ("203.0.113.9", 12345)):
                 udp_flows[0][0].round_trip(b"A1", "multi-" + target, target, port)
+            # An existing association retains its first routing decision. A new
+            # association whose first packet is a domain executes the candidate
+            # bank's provider-specific resolution, independently of global DNS.
+            dns_first = UdpSession(front, 0)
+            extra_udp.append(dns_first)
+            dns_first.round_trip(b"B1", "initial-domain", "dns-first.invalid", supplier_host="203.0.113.9")
+            assert suppliers["b1"].dns_queries, "initial UDP FQDN skipped its immutable supplier's TCP DNS"
             suppliers["a1"].release_half.set()
             response = header(half)
             length = next(int(line.split(b":", 1)[1]) for line in response.split(b"\r\n") if line.lower().startswith(b"content-length:"))
@@ -478,6 +512,7 @@ def main():
             request(front, 0, b"B1")
             request(front, 1, b"B2")
             udp_request(front, 1, b"B2", "after-stop")
+            assert all(not suppliers[name].destinations for name in ("direct-a", "direct-b", "direct-front")), "generation policy sent business traffic through a VPS terminal"
             assert not any(supplier.errors for supplier in suppliers.values()), [supplier.errors for supplier in suppliers.values()]
             failed = False
             print("PASS generation: old_tcp=50 old_udp=50 preparation=preserved partial_members=2 network_generation_uuid_chains=verified half_close=preserved udp_multi_target=preserved handshake_untracked=front+backend stop_old=new_bank_healthy", flush=True)

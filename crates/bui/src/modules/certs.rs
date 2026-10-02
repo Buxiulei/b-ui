@@ -761,6 +761,7 @@ mod tests {
     #[test]
     fn module_renders_nothing() {
         let ctx = RenderCtx {
+            account_blocked: Default::default(),
             paths: Paths::default_server(),
             facts: crate::reconcile::Facts {
                 mem_mb: 2048,

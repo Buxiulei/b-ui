@@ -6,12 +6,13 @@
 //! 路径末段从 2026-09-14 裁决起是**每用户的随机订阅 token**（`bui_schema::sub`），旧的
 //! 「用户名链接」只在全局宽限期内还认 —— 四个端点同一口径，见 [`resolve`]。
 
-use super::Shared;
+use super::{users, Shared};
 use crate::api::AppState;
 use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use bui_schema::egress::{access_for, RequestedEgress};
 use bui_schema::model::{ResidentialGroup, State as BuiState, User};
 use bui_schema::nodes::{nodes_for, Node};
 use bui_schema::render::subscription::{clash, singbox, uri_list};
@@ -78,18 +79,64 @@ pub fn resolve<'a>(state: &'a BuiState, seg: &str, now: OffsetDateTime) -> Optio
         .find(|u| u.username == seg && !u.legacy_sub_disabled)
 }
 
-/// 四个 handler 的共用前半段：[`resolve`] → 节点集合 + 分流规则 + **查到的**用户名。
-///
-/// 返回的用户名一律来自期望态，不是路径末段：节点标签、`/api/nodes` 的 `user` 与
-/// [`safe_filename`] 都用它，否则 token 链接下载到的文件名就是那个 token。
-fn lookup(
-    state: &BuiState,
-    seg: &str,
-    now: OffsetDateTime,
-) -> Option<(String, Vec<Node>, SplitRules)> {
-    let user = resolve(state, seg, now)?;
+struct Delivery {
+    user: String,
+    nodes: Vec<Node>,
+    split: SplitRules,
+    dial_ip: String,
+    /// Original requested identity survives filtering of the delivered nodes.
+    residential_unavailable: bool,
+}
+
+enum LookupFailure {
+    NotFound,
+    AccountUnavailable,
+}
+
+impl LookupFailure {
+    fn response(self) -> Response {
+        match self {
+            Self::NotFound => not_found(),
+            Self::AccountUnavailable => (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "Account unavailable"})),
+            )
+                .into_response(),
+        }
+    }
+}
+
+/// Fence pending accounting and desired-state publication for one authorization snapshot.
+/// The gate -> Store -> pending order matches the existing quota flush transaction.
+async fn lookup(app: &AppState, shared: &Shared, seg: &str) -> Result<Delivery, LookupFailure> {
+    let _gate = shared.gate_guard().await;
+    let publication = app.store.publication_permit().await;
+    let pending = shared.pending().await;
+    let state = publication.state();
+    let now = app.host.now();
+    let user = resolve(state, seg, now).ok_or(LookupFailure::NotFound)?;
+    if users::blocked_set(state, &pending, now).contains(&user.user_id) {
+        return Err(LookupFailure::AccountUnavailable);
+    }
+    let residential_requested = user.entitlements.residential.is_some();
+    let residential_available = user.entitlements.protocols.iter().any(|protocol| {
+        access_for(
+            user,
+            &state.residential,
+            *protocol,
+            RequestedEgress::RequiredResidential,
+            false,
+        )
+        .is_ok()
+    });
     let (nodes, split) = nodes_and_split_of(state, user);
-    Some((user.username.clone(), nodes, split))
+    Ok(Delivery {
+        user: user.username.clone(),
+        nodes,
+        split,
+        dial_ip: state.node.public_ip.clone(),
+        residential_unavailable: residential_requested && !residential_available,
+    })
 }
 
 /// 移植 `web/server.js:1800`：`encodeURIComponent(username).replace(/%/g, "_") + ".json"`。
@@ -120,26 +167,55 @@ fn not_found() -> Response {
         .into_response()
 }
 
-async fn get_sub(State(app): State<AppState>, Path(seg): Path<String>) -> Response {
-    let state = app.store.read().await;
-    let Some((user, nodes, _split)) = lookup(&state, &seg, app.host.now()) else {
-        return not_found();
-    };
+fn residential_unavailable() -> Response {
     (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-        uri_list(&nodes, &user),
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({"error": "Residential route unavailable"})),
     )
         .into_response()
 }
 
-async fn get_subscription(State(app): State<AppState>, Path(seg): Path<String>) -> Response {
-    let state = app.store.read().await;
-    let Some((user, nodes, split)) = lookup(&state, &seg, app.host.now()) else {
-        return not_found();
+async fn get_sub(
+    State(app): State<AppState>,
+    State(shared): State<Arc<Shared>>,
+    Path(seg): Path<String>,
+) -> Response {
+    let delivery = match lookup(&app, &shared, &seg).await {
+        Ok(delivery) => delivery,
+        Err(failure) => return failure.response(),
     };
+    if delivery.residential_unavailable {
+        return residential_unavailable();
+    }
+    if delivery.nodes.is_empty() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "Proxy route unavailable"})),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        uri_list(&delivery.nodes, &delivery.user),
+    )
+        .into_response()
+}
+
+async fn get_subscription(
+    State(app): State<AppState>,
+    State(shared): State<Arc<Shared>>,
+    Path(seg): Path<String>,
+) -> Response {
+    let delivery = match lookup(&app, &shared, &seg).await {
+        Ok(delivery) => delivery,
+        Err(failure) => return failure.response(),
+    };
+    if delivery.residential_unavailable {
+        return residential_unavailable();
+    }
     // 总纲 C1：dial_ip = node.public_ip（IPv6 接管设计的「按 IP 拨号、SNI 用域名」）
-    let cfg = singbox(&nodes, &split, &state.node.public_ip);
+    let cfg = singbox(&delivery.nodes, &delivery.split, &delivery.dial_ip);
     let body = serde_json::to_vec_pretty(&cfg).unwrap_or_default();
     (
         StatusCode::OK,
@@ -150,7 +226,7 @@ async fn get_subscription(State(app): State<AppState>, Path(seg): Path<String>) 
             ),
             (
                 header::CONTENT_DISPOSITION,
-                format!("inline; filename=\"{}\"", safe_filename(&user)),
+                format!("inline; filename=\"{}\"", safe_filename(&delivery.user)),
             ),
         ],
         body,
@@ -158,40 +234,82 @@ async fn get_subscription(State(app): State<AppState>, Path(seg): Path<String>) 
         .into_response()
 }
 
-async fn get_clash(State(app): State<AppState>, Path(seg): Path<String>) -> Response {
-    let state = app.store.read().await;
-    let Some((user, nodes, split)) = lookup(&state, &seg, app.host.now()) else {
-        return not_found();
+async fn get_clash(
+    State(app): State<AppState>,
+    State(shared): State<Arc<Shared>>,
+    Path(seg): Path<String>,
+) -> Response {
+    let delivery = match lookup(&app, &shared, &seg).await {
+        Ok(delivery) => delivery,
+        Err(failure) => return failure.response(),
     };
+    if delivery.residential_unavailable {
+        return residential_unavailable();
+    }
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/yaml; charset=utf-8")],
-        clash(&nodes, &user, &split),
+        clash(&delivery.nodes, &delivery.user, &delivery.split),
     )
         .into_response()
 }
 
 /// `bui-c` 的「面板导入」靠它，所以它和三种订阅一样必须认 token —— 不认就退化成订阅导入、
 /// 丢掉分流规则（2026-09-14 裁决第 5 条）。
-async fn get_nodes(State(app): State<AppState>, Path(seg): Path<String>) -> Response {
-    let state = app.store.read().await;
-    let Some((user, nodes, split)) = lookup(&state, &seg, app.host.now()) else {
-        return not_found();
+async fn get_nodes(
+    State(app): State<AppState>,
+    State(shared): State<Arc<Shared>>,
+    Path(seg): Path<String>,
+) -> Response {
+    let delivery = match lookup(&app, &shared, &seg).await {
+        Ok(delivery) => delivery,
+        Err(failure) => return failure.response(),
     };
-    (StatusCode::OK, Json(NodesPayload { user, split, nodes })).into_response()
+    if delivery.residential_unavailable {
+        return residential_unavailable();
+    }
+    (
+        StatusCode::OK,
+        Json(NodesPayload {
+            user: delivery.user,
+            split: delivery.split,
+            nodes: delivery.nodes,
+        }),
+    )
+        .into_response()
 }
 
 /// 四个端点都无鉴权（spec §4.3），挂在 `public_routes()` 里；末段的解析口径见 [`resolve`]。
 ///
-/// `_shared` 参数是**有意留的**：四个 handler 只需要 `AppState`，但 Task 13 把所有子路由按
-/// 同一个签名 `fn(Arc<Shared>) -> Router<AppState>` 合并，签名统一比省一个下划线更值。
-pub fn public_routes(_shared: Arc<Shared>) -> axum::Router<AppState> {
+/// Shared accounting is required: unflushed traffic must revoke feed credentials too.
+pub fn public_routes(shared: Arc<Shared>) -> axum::Router<AppState> {
     use axum::routing::get;
     axum::Router::new()
-        .route("/api/sub/{seg}", get(get_sub))
-        .route("/api/subscription/{seg}", get(get_subscription))
-        .route("/api/clash/{seg}", get(get_clash))
-        .route("/api/nodes/{seg}", get(get_nodes))
+        .route(
+            "/api/sub/{seg}",
+            get({
+                let shared = shared.clone();
+                move |app, path| get_sub(app, State(shared), path)
+            }),
+        )
+        .route(
+            "/api/subscription/{seg}",
+            get({
+                let shared = shared.clone();
+                move |app, path| get_subscription(app, State(shared), path)
+            }),
+        )
+        .route(
+            "/api/clash/{seg}",
+            get({
+                let shared = shared.clone();
+                move |app, path| get_clash(app, State(shared), path)
+            }),
+        )
+        .route(
+            "/api/nodes/{seg}",
+            get(move |app, path| get_nodes(app, State(shared), path)),
+        )
 }
 
 #[cfg(test)]
@@ -208,7 +326,12 @@ mod tests {
 
     async fn with_token(h: &Harness) {
         h.store
-            .update(|s| s.users[0].sub_token = Some(TOK.into()))
+            .update(|s| {
+                s.users[0].sub_token = Some(TOK.into());
+                // Success-path fixtures request direct service explicitly. Residential
+                // availability is exercised separately rather than inferred from nodes.
+                s.users[0].entitlements.residential = None;
+            })
             .await
             .unwrap();
     }
@@ -517,5 +640,239 @@ mod tests {
             !v["split"]["keywords"].as_array().unwrap().is_empty(),
             "keywords=null ⇒ 跟随 DEFAULT_KEYWORDS（67 条）"
         );
+    }
+
+    #[tokio::test]
+    async fn unavailable_residential_intent_is_not_replaced_by_remaining_direct_nodes() {
+        let h = harness().await;
+        with_token(&h).await;
+        h.store
+            .update(|s| {
+                s.users[0].entitlements.residential =
+                    Some(bui_schema::model::ResidentialEntitlement {
+                        group_id: "default".into(),
+                        slot_id: None,
+                    });
+            })
+            .await
+            .unwrap();
+        let r = mount(&h.app, public_routes(h.shared.clone()));
+        let mut observed = Vec::new();
+        for endpoint in ["nodes", "sub", "subscription", "clash"] {
+            let (status, _, bytes) =
+                raw(&r, "GET", &format!("/api/{endpoint}/{TOK}"), None, None).await;
+            observed.push((endpoint, status));
+            if status == StatusCode::SERVICE_UNAVAILABLE {
+                let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(value["error"], "Residential route unavailable");
+                assert!(
+                    value.get("nodes").is_none(),
+                    "unavailable feed signed credentials"
+                );
+            }
+        }
+        assert_eq!(
+            observed,
+            vec![
+                ("nodes", StatusCode::SERVICE_UNAVAILABLE),
+                ("sub", StatusCode::SERVICE_UNAVAILABLE),
+                ("subscription", StatusCode::SERVICE_UNAVAILABLE),
+                ("clash", StatusCode::SERVICE_UNAVAILABLE),
+            ]
+        );
+        // bui-c tries /api/nodes first and may then fetch /api/sub. Both must
+        // refuse the same original residential intent, so fallback cannot sign
+        // a different identity from the remaining authorized direct nodes.
+    }
+
+    #[tokio::test]
+    async fn residential_only_accounts_do_not_receive_an_empty_successful_uri_feed() {
+        let h = harness().await;
+        with_token(&h).await;
+        h.store
+            .update(|s| {
+                s.users[0].entitlements.direct = false;
+                s.users[0].entitlements.residential =
+                    Some(bui_schema::model::ResidentialEntitlement {
+                        group_id: "default".into(),
+                        slot_id: None,
+                    });
+            })
+            .await
+            .unwrap();
+        let r = mount(&h.app, public_routes(h.shared.clone()));
+        for endpoint in ["sub", "subscription", "clash", "nodes"] {
+            let (status, _, bytes) =
+                raw(&r, "GET", &format!("/api/{endpoint}/{TOK}"), None, None).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{endpoint}");
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["error"], "Residential route unavailable");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_exact_available_residential_binding_delivers_complete_proxy_configs() {
+        use bui_schema::model::{
+            Protocol, ResiMode, ResidentialEntitlement, Slot, Upstream, UpstreamKind,
+        };
+        let h = harness().await;
+        with_token(&h).await;
+        let upstream_id = uuid::Uuid::from_u128(0x416);
+        h.store
+            .update(|s| {
+                let group = s.residential.groups.get_mut("default").unwrap();
+                group.enabled = true;
+                group.mode = ResiMode::Global;
+                group.upstreams.push(Upstream {
+                    id: upstream_id,
+                    name: "fixture-residential".into(),
+                    kind: UpstreamKind::Socks5,
+                    host: "residential.example.test".into(),
+                    port: 1080,
+                    username: "fixture".into(),
+                    password: "fixture-secret".into(),
+                    priority: 10,
+                    provider: None,
+                    region: None,
+                    ports_allowed: None,
+                    verified: None,
+                });
+                s.residential.slots = vec![Slot {
+                    index: 0,
+                    upstream_id,
+                }];
+                s.users[0].entitlements.protocols = vec![Protocol::Reality];
+                s.users[0].entitlements.residential = Some(ResidentialEntitlement {
+                    group_id: "default".into(),
+                    slot_id: Some(upstream_id),
+                });
+            })
+            .await
+            .unwrap();
+        let r = mount(&h.app, public_routes(h.shared.clone()));
+        let (status, nodes) = send(&r, "GET", &format!("/api/nodes/{TOK}"), None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        let kinds: Vec<_> = nodes["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|node| node["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["reality_direct", "reality_residential"]);
+        let (status, config) =
+            send(&r, "GET", &format!("/api/subscription/{TOK}"), None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(config["route"]["final"], "residential-pool");
+        assert_eq!(config["dns"]["servers"][0]["detour"], "residential-pool");
+        assert!(config["route"]["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|rule| rule["outbound"] != "direct"));
+        let (status, yaml) = text(&r, &format!("/api/clash/{TOK}")).await;
+        assert_eq!(status, StatusCode::OK);
+        let config: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(
+            config["rules"]
+                .as_sequence()
+                .unwrap()
+                .last()
+                .unwrap()
+                .as_str(),
+            Some("MATCH,住宅自动")
+        );
+        let (status, _, _) = raw(&r, "GET", &format!("/api/sub/{TOK}"), None, None).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn feeds_authorize_after_the_existing_accounting_publication_fence() {
+        let h = harness().await;
+        with_token(&h).await;
+        let r = mount(&h.app, public_routes(h.shared.clone()));
+        let gate = h.shared.gate_guard().await;
+        let request = tokio::spawn(async move { text(&r, &format!("/api/sub/{TOK}")).await });
+        tokio::task::yield_now().await;
+        assert!(
+            !request.is_finished(),
+            "feed bypassed the accounting writer fence"
+        );
+        h.store
+            .update(|s| s.users[0].disabled = true)
+            .await
+            .unwrap();
+        drop(gate);
+        let (status, _) = request.await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "feed retained the pre-publication grant"
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_accounts_never_receive_credentials_from_any_public_feed() {
+        use super::super::TxRx;
+        let mut observed = Vec::new();
+        for reason in [
+            "disabled",
+            "expired",
+            "invalid_expiry",
+            "total",
+            "monthly",
+            "pending_total",
+            "pending_monthly",
+        ] {
+            let h = harness().await;
+            with_token(&h).await;
+            let r = mount(&h.app, public_routes(h.shared.clone()));
+            let (control, _) = text(&r, &format!("/api/sub/{TOK}")).await;
+            assert_eq!(control, StatusCode::OK, "positive control before {reason}");
+            h.store
+                .update(|s| {
+                    let u = &mut s.users[0];
+                    match reason {
+                        "disabled" => u.disabled = true,
+                        "expired" => {
+                            u.entitlements.expires_at = Some("2026-09-11T00:00:00Z".into())
+                        }
+                        "invalid_expiry" => u.entitlements.expires_at = Some("invalid".into()),
+                        "total" | "pending_total" => {
+                            u.entitlements.traffic_limit.total_bytes = Some(100);
+                            u.usage.total_bytes = if reason == "total" { 100 } else { 90 };
+                        }
+                        "monthly" | "pending_monthly" => {
+                            u.entitlements.traffic_limit.monthly_bytes = Some(100);
+                            u.usage.monthly_bytes = if reason == "monthly" { 100 } else { 90 };
+                        }
+                        _ => unreachable!(),
+                    }
+                })
+                .await
+                .unwrap();
+            if reason.starts_with("pending_") {
+                let id = h.store.read().await.users[0].user_id;
+                h.shared.pending().await.insert(id, TxRx { tx: 4, rx: 6 });
+            }
+            for endpoint in ["sub", "subscription", "clash", "nodes"] {
+                let (status, _, bytes) =
+                    raw(&r, "GET", &format!("/api/{endpoint}/{TOK}"), None, None).await;
+                observed.push((reason, endpoint, status));
+                if status == StatusCode::FORBIDDEN {
+                    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(body["error"], "Account unavailable");
+                    let body = String::from_utf8(bytes).unwrap();
+                    assert!(!body.contains("pw-alice-01"));
+                    assert!(!body.contains("11111111-1111-4111-8111-111111111111"));
+                }
+            }
+        }
+        assert!(
+            observed
+                .iter()
+                .all(|(_, _, status)| *status == StatusCode::FORBIDDEN),
+            "{observed:?}"
+        );
+        assert_eq!(observed.len(), 28, "every failure route must actually run");
     }
 }

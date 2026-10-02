@@ -1,4 +1,4 @@
-//! 三种订阅渲染器与 v3 golden 样本逐项等价（base64 按行、JSON/YAML 按语义）。
+//! Historical subscription fixtures plus explicit 4.1.6 refusal and proxy-only safety changes.
 mod common;
 
 use base64::Engine;
@@ -28,6 +28,65 @@ fn b64(s: &str) -> String {
             .unwrap(),
     )
     .unwrap()
+}
+
+#[test]
+fn complete_configs_keep_business_traffic_and_dns_on_authorized_proxy_paths() {
+    for mode in ["global", "split"] {
+        let s = common::state(mode);
+        let nodes = nodes_of(&s, "alice");
+        assert!(nodes
+            .iter()
+            .any(|node| node.kind == bui_schema::nodes::NodeKind::RealityResidential));
+        assert!(nodes
+            .iter()
+            .any(|node| node.kind == bui_schema::nodes::NodeKind::RealityDirect));
+        let split = split_of(&s);
+        let sb = subscription::singbox(&nodes, &split, &s.node.public_ip);
+        for rule in sb["route"]["rules"].as_array().unwrap() {
+            assert!(
+                rule["outbound"] != "direct",
+                "{mode}: application rule escapes through local DIRECT: {rule}"
+            );
+        }
+        assert_eq!(
+            sb["route"]["rules"][2]["action"], "reject",
+            "private application destinations require explicit permission"
+        );
+        assert_eq!(
+            sb["dns"]["servers"][0]["detour"], "residential-pool",
+            "business DNS must preserve residential identity"
+        );
+        assert_eq!(
+            sb["route"]["final"],
+            if mode == "global" {
+                "residential-pool"
+            } else {
+                "direct-pool"
+            }
+        );
+        let doc: serde_yaml::Value =
+            serde_yaml::from_str(&subscription::clash(&nodes, "alice", &split)).unwrap();
+        for rule in doc["rules"].as_sequence().unwrap() {
+            assert!(
+                !rule
+                    .as_str()
+                    .unwrap()
+                    .split(',')
+                    .any(|field| field == "DIRECT"),
+                "{mode}: implicit local application egress: {rule:?}"
+            );
+        }
+        assert_eq!(
+            doc["dns"]["nameserver"],
+            serde_yaml::to_value(["https://8.8.8.8/dns-query#住宅自动"]).unwrap()
+        );
+        assert!(
+            doc["dns"]["nameserver-policy"].is_null(),
+            "bootstrap exceptions must not apply to business DNS"
+        );
+        common::check_singbox(&sb);
+    }
 }
 
 #[test]
@@ -83,7 +142,7 @@ fn clash_matches_v3() {
 /// （/config/rules/）。目标客户端是 v2rayN 7.x 内置 mihomo 与 Clash Verge。
 ///
 /// 语义对应 sing-box 订阅（`docs/superpowers/specs/2026-09-10-ipv6-takeover-design.md` §2/§3.1）：
-/// `ip_is_private ⇒ direct` ↔ `IP-CIDR6,fc00::/7|fe80::/10,DIRECT`，
+/// 私网目的地拒绝；IPv6 也全部拒绝，不隐含 LAN 直连授权。
 /// `ip_version 6 ⇒ reject` ↔ `IP-CIDR6,::/0,REJECT`；TUN v6 地址与 sing-box 侧同源。
 /// `tun.enable` 故意不下发：TUN 开关归客户端（v2rayN / Clash Verge）自己管。
 ///
@@ -161,8 +220,8 @@ fn clash_declares_ipv6_takeover() {
             assert_eq!(
                 tail[..3],
                 [
-                    "IP-CIDR6,fc00::/7,DIRECT,no-resolve",
-                    "IP-CIDR6,fe80::/10,DIRECT,no-resolve",
+                    "IP-CIDR6,fc00::/7,REJECT,no-resolve",
+                    "IP-CIDR6,fe80::/10,REJECT,no-resolve",
                     "IP-CIDR6,::/0,REJECT,no-resolve",
                 ],
                 "{ctx}"
@@ -251,8 +310,8 @@ fn uri_list_round_trips_through_node_uri_parser() {
     }
 }
 
-/// 池失效（未启用 / 空池）时不发分流关键字：中继此时 fail-open 直连，
-/// 再发规则只是把流量导向一个直连池。住宅节点本身仍在（与 v3 的 4 节点拓扑一致）。
+/// Empty pools do not issue residential credentials or keyword targets.
+/// The public complete-feed handler separately refuses the original residential intent.
 #[test]
 fn disabled_pool_emits_no_keyword_rules() {
     let mut s = common::state("split");
@@ -272,7 +331,7 @@ fn disabled_pool_emits_no_keyword_rules() {
         .unwrap()
         .iter()
         .all(|r| r.get("domain_keyword").is_none()));
-    assert!(sb["outbounds"]
+    assert!(!sb["outbounds"]
         .as_array()
         .unwrap()
         .iter()
@@ -352,104 +411,45 @@ fn multi_slot_does_not_move_the_residential_hy2_endpoint() {
     assert_eq!(seen.len(), 1, "多槽下的端口/区间必须是同一对，不该有第二种");
 }
 
-/// 4.1（T14 收口）：**零节点用户的订阅必须整份仍然可用**。
-///
-/// 谁会零节点：只有住宅权益、只开 hysteria2 的用户（fixture 里的 bob），在凭据池耗尽
-/// （`hy2pool::migrate` 报 `unassigned > 0`）或建完用户到下一轮收敛之间那一瞬，
-/// `hy2pool::cred_of` 为 `None` ⇒ `nodes_for` 一个节点都不发（spec §3.1）。
-///
-/// 为什么不是「少一个节点」这么轻：空节点集会渲出 `urltest` 的 `outbounds: []`，而
-/// `dns.servers[remote].detour` 与 `route.final` 都指着它，sing-box 直接拒绝加载
-/// **整份**配置（实测 1.14.0 先在空 `domain` 项上 FATAL，改掉后仍在空 urltest 上失败）；
-/// mihomo 那侧同理（空 `select` 组 + 指向不存在组的 `MATCH`）。于是这个用户连订阅都用
-/// 不了、客户端起不来 —— 比「没有住宅节点」严重得多。
+/// Zero available nodes produce a loadable refusal config, never local direct service.
+/// The stock runtime test additionally verifies no connection reaches a live target.
 #[test]
 fn a_user_with_no_nodes_still_gets_a_loadable_subscription() {
     let mut s = common::state("split");
-    // bob：单 hysteria2 + 只有住宅（`direct=false`），摘掉他的凭据指针就是「池耗尽」那一瞬
-    let bob = s
-        .users
-        .iter_mut()
-        .find(|u| u.username == "bob")
-        .expect("fixture 里没有 bob");
+    let bob = s.users.iter_mut().find(|u| u.username == "bob").unwrap();
     bob.credentials.hy2_resi_cred = None;
     let nodes = nodes_of(&s, "bob");
     assert!(
         nodes.is_empty(),
-        "这条用例的前提是零节点，实际 {:?}",
-        nodes.iter().map(|n| n.kind).collect::<Vec<_>>()
+        "the unavailable credential fixture must execute the empty case"
     );
 
     let split = split_of(&s);
     let sb = subscription::singbox(&nodes, &split, &s.node.public_ip);
-    // 不许渲出 urltest（它的 outbounds 只能是空的），DNS / route 的落点必须真实存在
-    let tags: Vec<&str> = sb["outbounds"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|o| o["tag"].as_str().unwrap())
-        .collect();
-    for o in sb["outbounds"].as_array().unwrap() {
-        assert!(o["type"] != "urltest", "零节点渲出了 urltest：{o}");
-    }
-    let route_final = sb["route"]["final"].as_str().unwrap();
-    assert!(
-        tags.contains(&route_final),
-        "route.final={route_final} 不存在"
+    assert_eq!(sb["outbounds"], serde_json::json!([]));
+    assert_eq!(
+        sb["route"]["rules"],
+        serde_json::json!([{ "action": "reject" }])
     );
-    let detour = sb["dns"]["servers"][0]["detour"].as_str().unwrap();
-    assert!(tags.contains(&detour), "dns detour={detour} 不存在");
-    for r in sb["dns"]["rules"].as_array().unwrap() {
-        if let Some(d) = r["domain"].as_array() {
-            assert!(
-                !d.iter().any(|x| x.as_str() == Some("")),
-                "DNS 规则里有空 domain 项，sing-box 会拒绝加载：{r}"
-            );
-        }
-    }
-    // 判据：真内核跑一遍 check（缺内核则 skip）
+    assert!(sb["route"].get("final").is_none());
+    assert!(
+        sb.get("dns").is_none(),
+        "an empty subscription must not send direct DNS queries"
+    );
     common::check_singbox(&sb);
 
-    // mihomo 那侧：组不许是空的，`MATCH` 的落点要么是内置出站、要么是真实存在的组
     let yaml = subscription::clash(&nodes, "bob", &split);
     let doc: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
-    let groups: Vec<String> = doc["proxy-groups"]
-        .as_sequence()
-        .unwrap()
-        .iter()
-        .map(|g| g["name"].as_str().unwrap().to_string())
-        .collect();
-    for g in doc["proxy-groups"].as_sequence().unwrap() {
-        assert!(
-            !g["proxies"].as_sequence().unwrap().is_empty(),
-            "空的 proxy-group，mihomo 会拒绝加载：{g:?}"
-        );
-    }
-    let m = doc["rules"]
-        .as_sequence()
-        .unwrap()
-        .last()
-        .unwrap()
-        .as_str()
-        .unwrap()
-        .strip_prefix("MATCH,")
-        .expect("最后一条规则不是 MATCH")
-        .to_string();
-    assert!(
-        ["DIRECT", "REJECT"].contains(&m.as_str()) || groups.contains(&m),
-        "MATCH,{m} 指向不存在的组，groups={groups:?}"
+    assert_eq!(
+        doc["rules"],
+        serde_yaml::to_value(["MATCH,REJECT"]).unwrap()
     );
-    // mihomo 的 DNS 段同样不许出现空串域名：`fake-ip-filter` 与 `nameserver-policy` 的键
-    // 都是编译进域名 trie 的匹配面（零节点时 `nodes.first()` 取不到 host ⇒ 空串），
-    // 与 sing-box 那侧的空 `domain` 项同形 —— 那一侧实测是硬 FATAL。
-    let filter = doc["dns"]["fake-ip-filter"].as_sequence().unwrap();
-    assert!(
-        !filter.is_empty() && !filter.iter().any(|x| x.as_str() == Some("")),
-        "fake-ip-filter 里有空串项：{filter:?}"
+    assert_eq!(
+        doc["proxy-groups"][0]["proxies"],
+        serde_yaml::to_value(["REJECT"]).unwrap()
     );
-    let policy = doc["dns"]["nameserver-policy"].as_mapping().unwrap();
-    assert!(
-        !policy.keys().any(|k| k.as_str() == Some("")),
-        "nameserver-policy 有空串键：{policy:?}"
+    assert_eq!(
+        doc["dns"]["nameserver"],
+        serde_yaml::to_value(["udp://127.0.0.1:1"]).unwrap()
     );
 }

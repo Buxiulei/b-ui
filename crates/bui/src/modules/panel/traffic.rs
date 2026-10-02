@@ -104,16 +104,25 @@ pub struct ResiKickTarget {
 ///
 /// `open` = 这些人里「踢完还该放行」的那些（手动踢人时 = 没被 `users::blocked_set` 判拒
 /// 的），他们的 [`ResiKickTarget::restore_to`] 是自己槽的出站 tag；限额封禁那条路传空集
-/// ⇒ 全部停在 `deny`。撤掉了住宅 hysteria2 权益的用户即使在 `open` 里也不回切 —— 他的门
-/// 本来就该是 `deny`，踢一下不许把它开回去。
+/// ⇒ 全部停在 `deny`。`open` 只证明账户未被拒绝；回切仍须由共享住宅策略确认
+/// 池、精确槽绑定与凭据，住宅不可交付时不能把门开到兜底槽。
 pub fn resi_kick_targets(s: &State, ids: &[Uuid], open: &BTreeSet<Uuid>) -> Vec<ResiKickTarget> {
     ids.iter()
         .filter_map(|id| {
             let u = s.users.iter().find(|u| u.user_id == *id)?;
             let c = bui_schema::hy2pool::cred_of(u, &s.residential)?;
-            let restore_to = (open.contains(id)
-                && bui_schema::hy2pool::is_resi_hy2(u, &s.residential))
-            .then(|| slot_out_tag(bui_schema::slots::index_of_user(u, &s.residential)));
+            let restore_to = match bui_schema::egress::access_for(
+                u,
+                &s.residential,
+                bui_schema::model::Protocol::Hysteria2,
+                bui_schema::egress::RequestedEgress::RequiredResidential,
+                !open.contains(id),
+            ) {
+                Ok(bui_schema::egress::AuthorizedEgress::Residential(binding)) => {
+                    Some(slot_out_tag(binding.slot_index))
+                }
+                _ => None,
+            };
             Some(ResiKickTarget {
                 cred_id: c.id.clone(),
                 name: c.name.clone(),
@@ -532,10 +541,40 @@ mod tests {
     async fn with_pool(h: &Harness) {
         h.store
             .update(|s| {
+                provision_active_residential(s);
                 bui_schema::hy2pool::migrate(s, t0());
             })
             .await
             .unwrap();
+    }
+
+    fn provision_active_residential(state: &mut State) {
+        let upstream_id = Uuid::from_u128(7);
+        let group = state.residential.groups.get_mut("default").unwrap();
+        group.enabled = true;
+        group.upstreams = vec![bui_schema::model::Upstream {
+            id: upstream_id,
+            name: "fixture-isp".into(),
+            kind: bui_schema::model::UpstreamKind::Socks5,
+            host: "isp.example.net".into(),
+            port: 10007,
+            username: "fixture-user".into(),
+            password: "fixture-password".into(),
+            priority: 100,
+            provider: None,
+            region: None,
+            ports_allowed: None,
+            verified: None,
+        }];
+        state.residential.slots = vec![bui_schema::model::Slot {
+            index: 0,
+            upstream_id,
+        }];
+        for user in &mut state.users {
+            if let Some(entitlement) = user.entitlements.residential.as_mut() {
+                entitlement.slot_id = Some(upstream_id);
+            }
+        }
     }
 
     /// 当前期望态里的「采样端口 + 凭据 name → user_id」——`tick` 里那一读的测试版。
@@ -1256,10 +1295,29 @@ mod tests {
         );
     }
 
+    // Catches interpreting a caller's account-open set as proof of a usable residential route.
+    #[test]
+    fn egress_contract_kick_target_cannot_restore_a_disabled_pool() {
+        let mut state = crate::testutil::sample_state();
+        bui_schema::hy2pool::migrate(&mut state, t0());
+        let id = state.users[0].user_id;
+        let target = resi_kick_targets(&state, &[id], &BTreeSet::from([id]));
+        assert_eq!(
+            target.len(),
+            1,
+            "the old credential still needs its gate closed"
+        );
+        assert_eq!(
+            target[0].restore_to, None,
+            "disabled pool cannot supply a residential route"
+        );
+    }
+
     /// 手动踢人的后半截（spec §5.2）：未封用户的目标要带回切 tag = 他自己那个槽的出站。
     #[test]
     fn an_unblocked_kick_target_carries_its_slot_outbound_to_restore() {
         let mut s = crate::testutil::sample_state();
+        provision_active_residential(&mut s);
         bui_schema::hy2pool::migrate(&mut s, t0());
         let id = s.users[0].user_id;
         let open = BTreeSet::from([id]);

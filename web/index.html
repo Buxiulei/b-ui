@@ -250,7 +250,7 @@
                 <input type="checkbox" id="nresi" checked style="cursor:pointer">
                 <span style="display:flex; flex-direction:column; gap:2px">
                     <span id="nresi-title" style="font-size:13px; font-weight:600">订阅包含住宅节点</span>
-                    <span id="nresi-hint" style="font-size:11px; color:var(--text-dim)">勾选 → 4 节点 (直连+住宅 ×2)；不勾 → 仅 2 节点 (直连 ×2)</span>
+                    <span id="nresi-hint" style="font-size:11px; color:var(--text-dim)">勾选住宅后，住宅不可用时整份订阅不可用。请配置并启用住宅上游、完成出口绑定；需要仅直连时，请新建未勾选住宅的账户。</span>
                 </span>
             </label>
             <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:16px">
@@ -300,15 +300,15 @@
                 </div>
                 <h3>住宅 IP 出站</h3>
             </div>
-            <div class="resi-desc">v3.5: 多 URL urltest 池 + 全局/分流切换。住宅 URL 池非空时 -住宅 节点走池子，否则 fallback 直连。</div>
+            <div class="resi-desc">住宅节点的业务只经住宅出口。住宅池停用、为空、出口绑定无效或请求受限时拒绝连接。全局与域名分流用于客户端完整配置；域名分流需要同时授权直连和住宅两条通路。</div>
             <div id="resi-status" class="resi-status-card">
                 <div class="resi-shimmer-line" style="width:55%"></div>
             </div>
             <!-- v3.5.0: 全局模式开关 -->
             <div class="resi-global-row">
                 <div class="resi-global-label">
-                    <span class="resi-global-title">全局模式</span>
-                    <span class="resi-global-hint" id="resi-global-hint">域名分流</span>
+                    <span class="resi-global-title">完整配置全局模式</span>
+                    <span class="resi-global-hint" id="resi-global-hint">完整配置：关键词走住宅，其余走授权直连</span>
                 </div>
                 <label class="switch">
                     <input type="checkbox" id="resi-global-toggle" onchange="toggleResidentialGlobal(this.checked)">
@@ -344,13 +344,13 @@
             <details id="resi-domains-details" class="resi-domains-details">
                 <summary class="resi-domains-summary">
                     <svg class="resi-chevron" xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
-                    <span>分流域名设置</span>
+                    <span>完整配置分流域名</span>
                     <span id="resi-domains-count" class="resi-count-badge"></span>
                 </summary>
                 <div class="resi-domains-body">
                     <textarea id="resi-domains" rows="6" class="resi-domains-ta"
                         placeholder="每行一个关键词&#10;openai&#10;google&#10;anthropic"></textarea>
-                    <div class="resi-domains-hint">每行一个关键词（如 openai），自动匹配所有含该词的域名（openai.com / openai.net 等）</div>
+                    <div class="resi-domains-hint">完整配置按关键词匹配住宅通路；其余业务需要授权直连通路。单独连接住宅节点时，全部业务仍只走住宅出口。</div>
                     <!-- v3.6.2 R12: 恢复默认 = 写 domains=null（跟随版本内置默认表）；仅更新 = 固化成自定义表 -->
                     <div class="resi-domains-actions">
                         <button class="btn btn-secondary resi-update-btn" onclick="resetResidentialDomains()">恢复默认（跟随最新默认表）</button>

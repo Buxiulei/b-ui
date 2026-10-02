@@ -105,20 +105,24 @@ pub struct SampleCache {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Applied {
     pub snapshot_sha: Option<String>,
-    /// 已 AddUser 的 `user_id` → `vless_uuid`
+    /// 完整达成两入口授权目标的 `user_id` → `vless_uuid`（仅供健康用户计数）。
     pub xray_users: BTreeMap<Uuid, Uuid>,
+    /// 实际同步成功的 `(inbound, user_id)` → `vless_uuid`，入口权益互不替代。
+    pub xray_inbound_users: BTreeMap<(&'static str, Uuid), Uuid>,
+    /// 已确认撤销的入口身份。daemon/xray 重启后清空，重新检查所有拒绝身份。
+    pub xray_inbound_removed: BTreeSet<(&'static str, Uuid)>,
+    /// 发起过授权但可能尚未收到应答的身份；取消与删除后仍须收回潜在远程副作用。
+    pub xray_touched: BTreeSet<(&'static str, Uuid)>,
     /// 上次同步时 xray 的 `NRestarts`
     pub xray_restarts: Option<String>,
-    /// 已经 RemoveUser 成功的用户（被封 / 到期 / 禁用）。被封用户要**无条件**删（决策 D6），
-    /// 不能靠 `xray_users` 判「该不该删」——守护进程重启后 `xray_users` 是空的，
-    /// 而 `xray-config.json` 里还带着他们的凭据。`xray_restarts` 变化时与 `xray_users` 一起清空。
-    pub xray_removed: BTreeSet<Uuid>,
     /// 上次判定为拒绝的用户
     pub blocked: BTreeSet<Uuid>,
 }
 
 #[async_trait::async_trait]
 pub trait XrayApi: Send + Sync {
+    /// Read BUI-owned named UUID identities on an inlet; failure is never an empty list.
+    async fn inbound_users(&self, inbound_tag: &str) -> anyhow::Result<BTreeMap<Uuid, Uuid>>;
     async fn add_user(&self, tag: &str, user_id: Uuid, vless_uuid: Uuid) -> anyhow::Result<()>;
     async fn remove_user(&self, tag: &str, user_id: Uuid) -> anyhow::Result<()>;
     /// 读回这个 email 在 `tag` 里挂着的 vless uuid（`HandlerService.GetInboundUsers`）；
@@ -402,6 +406,7 @@ mod tests {
 
     fn ctx(paths: &Paths) -> RenderCtx {
         RenderCtx {
+            account_blocked: BTreeSet::new(),
             paths: paths.clone(),
             facts: Facts {
                 mem_mb: 2048,
@@ -782,9 +787,18 @@ mod tests {
         // 订阅无鉴权（末段是随机 token，见 `api_public::resolve`）
         let tok = "0123456789abcdef0123456789abcdef";
         h.store
-            .update(|s| s.users[0].sub_token = Some(tok.into()))
+            .update(|s| {
+                // This exercises a healthy feed; the baseline residential pool is off.
+                s.users[0].entitlements.direct = true;
+                s.users[0].entitlements.residential = None;
+                s.users[0].sub_token = Some(tok.into());
+            })
             .await
             .unwrap();
+        let published = h.app.store.read().await;
+        assert!(published.users[0].entitlements.direct);
+        assert!(published.users[0].entitlements.residential.is_none());
+        assert_eq!(published.users[0].sub_token.as_deref(), Some(tok));
         let (s_sub, _) = testsupport::text(&router, &format!("/api/sub/{tok}")).await;
         assert_eq!(s_sub, axum::http::StatusCode::OK);
         // 管理员端点要 token

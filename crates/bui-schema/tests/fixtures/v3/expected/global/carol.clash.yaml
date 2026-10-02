@@ -11,7 +11,7 @@ global-client-fingerprint: chrome
 
 ipv6: true
 
-# 以下 tun/ipv6/IP-CIDR6 三处为 v4 在 v3 输出之上新增（2026-09-12 裁决），其余与 v3 一字不差
+# 4.1.6: business routes use authorized proxies or reject; bootstrap DNS is separate
 tun:
   stack: mixed
   auto-route: true
@@ -34,18 +34,10 @@ dns:
     - "example.com"
   default-nameserver:
     - 223.5.5.5
-    - 119.29.29.29
   nameserver:
-    - https://dns.alidns.com/dns-query
-    - https://doh.pub/dns-query
-  nameserver-policy:
-    "example.com": "223.5.5.5"
-  fallback:
-    - https://8.8.8.8/dns-query
-    - https://1.1.1.1/dns-query
-  fallback-filter:
-    geoip: true
-    geoip-code: CN
+    - https://8.8.8.8/dns-query#住宅自动
+  proxy-server-nameserver:
+    - 223.5.5.5
 
 proxies:
   - name: "carol-Reality住宅"
@@ -79,10 +71,8 @@ proxy-groups:
       - "carol-Reality住宅"
 
 rules:
-  - GEOIP,private,DIRECT,no-resolve
-  - GEOSITE,cn,DIRECT
-  - GEOIP,cn,DIRECT,no-resolve
-  - IP-CIDR6,fc00::/7,DIRECT,no-resolve
-  - IP-CIDR6,fe80::/10,DIRECT,no-resolve
+  - GEOIP,private,REJECT,no-resolve
+  - IP-CIDR6,fc00::/7,REJECT,no-resolve
+  - IP-CIDR6,fe80::/10,REJECT,no-resolve
   - IP-CIDR6,::/0,REJECT,no-resolve
   - MATCH,住宅自动

@@ -24,6 +24,10 @@ pub fn state(mode: &str) -> State {
             password: "obfs-pw-test".into(),
         };
     }
+    // Ordinary renderer fixtures represent a server after startup migration.
+    // Missing/invalid-binding cases must remove that explicit grant themselves.
+    bui_schema::slots::sync_slots(&mut s.residential);
+    bui_schema::slots::migrate_unassigned(&mut s);
     s
 }
 

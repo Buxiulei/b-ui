@@ -2,6 +2,7 @@
 //!
 //! 字段逐条对齐 v3 `server/core.sh` 的 `xray-config.json` 模板。
 
+use crate::egress::{self, AuthorizedEgress, RequestedEgress, ResidentialBinding};
 use crate::model::{NodeParams, Protocol, Residential, User};
 use crate::paths::Paths;
 use crate::slots;
@@ -14,6 +15,8 @@ use sha2::{Digest, Sha256};
 pub const USER_RULE_PREFIX: &str = "resi-u-";
 /// 兜底规则的 `ruleTag`：永远排在表尾，兜住「一条规则都没有的 email」。
 pub const FALLBACK_RULE_TAG: &str = "resi-fallback";
+/// Unknown or no longer authorized residential traffic terminates here.
+pub const DENY_OUTBOUND_TAG: &str = "blocked";
 
 /// 用户 `user_id`（= xray 侧的 email）对应的规则 tag。
 pub fn user_rule_tag(user_id: uuid::Uuid) -> String {
@@ -38,7 +41,7 @@ const RESI_INBOUND_TAG: &str = "vless-residential";
 
 /// 渲染整份 `xray-config.json`。
 ///
-/// `users` 里只有开通了 [`Protocol::Reality`] 且未停用的用户进 `clients`，两个 inbound 共用同一份。
+/// 两个 inbound 分别检查 direct / RequiredResidential 权益，不能共享凭据集合。
 ///
 /// `resi` 提供槽位表（spec §5.6）：每槽一个 `relay-slot-<i>` 出站（socks →
 /// `127.0.0.1:(2080+i)`），住宅入站**每个用户一条规则**分到自己的槽（`ruleTag`
@@ -54,9 +57,13 @@ const RESI_INBOUND_TAG: &str = "vless-residential";
 ///
 /// 当前模板不需要磁盘路径，`_paths` 只为满足 C1 契约的统一签名。
 pub fn config(node: &NodeParams, users: &[User], resi: &Residential, _paths: &Paths) -> Value {
-    let clients = clients(users);
+    let direct_clients = clients(users, resi, RequestedEgress::Direct);
+    let residential_clients = clients(users, resi, RequestedEgress::RequiredResidential);
 
+    // Xray uses the first outbound when no routing rule matches. Keep that
+    // default denied even while RoutingService replaces the residential fallback.
     let mut outbounds = vec![
+        json!({"tag": DENY_OUTBOUND_TAG, "protocol": "blackhole", "settings": {}}),
         json!({"tag": "direct", "protocol": "freedom", "settings": {"domainStrategy": "ForceIPv4"}}),
     ];
     for i in slots::indices(resi) {
@@ -98,8 +105,8 @@ pub fn config(node: &NodeParams, users: &[User], resi: &Residential, _paths: &Pa
                 "protocol": "dokodemo-door",
                 "settings": {"address": "127.0.0.1"}
             },
-            vless_inbound("vless-direct", node.ports.reality_direct, node, &clients),
-            vless_inbound("vless-residential", node.ports.reality_resi, node, &clients),
+            vless_inbound("vless-direct", node.ports.reality_direct, node, &direct_clients),
+            vless_inbound("vless-residential", node.ports.reality_resi, node, &residential_clients),
         ],
         "outbounds": outbounds,
         "routing": {"rules": rules}
@@ -111,23 +118,23 @@ pub fn config(node: &NodeParams, users: &[User], resi: &Residential, _paths: &Pa
 /// 渲染（写文件）与 gRPC 收敛（`residential::slots::converge_xray`）共用这一个函数，
 /// 两边不可能各算出一份不同的表（D7）。
 ///
-/// 被封（超限/到期）的用户**留着**他的规则：他的凭据已经被 `sync_users` 从 `clients`
-/// 里摘掉了，规则匹配不到任何连接，留着能让「渲染 = runtime」这条不变量保持简单。
+/// 调用方传入当前账户有效集合；缺少精确住宅绑定的用户没有允许规则，
+/// 末尾兜底拒绝所有未知 email，不能借默认槽绕过授权。
 pub fn slot_rules(users: &[User], resi: &Residential) -> Vec<SlotRule> {
-    let mut out: Vec<SlotRule> = slot_users(users)
+    let mut out: Vec<SlotRule> = slot_users(users, resi)
         .into_iter()
-        .map(|u| SlotRule {
+        .map(|(u, binding)| SlotRule {
             rule_tag: user_rule_tag(u.user_id),
             inbound_tag: RESI_INBOUND_TAG.to_string(),
             emails: vec![u.user_id.to_string()],
-            outbound_tag: relay_tag(slots::index_of_user(u, resi)),
+            outbound_tag: relay_tag(binding.slot_index),
         })
         .collect();
     out.push(SlotRule {
         rule_tag: FALLBACK_RULE_TAG.to_string(),
         inbound_tag: RESI_INBOUND_TAG.to_string(),
         emails: vec![],
-        outbound_tag: relay_tag(slots::fallback_index(resi)),
+        outbound_tag: DENY_OUTBOUND_TAG.to_string(),
     });
     out
 }
@@ -152,19 +159,24 @@ fn relay_tag(i: u16) -> String {
     format!("relay-slot-{i}")
 }
 
-/// 会出现在槽规则里的用户：未停用、有 Reality 权益、**且有住宅权益**（其余人没有住宅
-/// 节点，列进 `user` 只会匹配一个用不到的 email）。按 `user_id` 升序 —— 渲染必须确定性，
-/// 顺序抖动会让文件与两个哈希无谓地变。
-fn slot_users(users: &[User]) -> Vec<&User> {
-    let mut v: Vec<&User> = users
+/// Authorized residential users and their exact binding, sorted by stable email.
+fn slot_users<'a>(users: &'a [User], resi: &Residential) -> Vec<(&'a User, ResidentialBinding)> {
+    let mut v: Vec<_> = users
         .iter()
-        .filter(|u| {
-            !u.disabled
-                && u.entitlements.protocols.contains(&Protocol::Reality)
-                && u.entitlements.residential.is_some()
+        .filter_map(|u| {
+            match egress::access_for(
+                u,
+                resi,
+                Protocol::Reality,
+                RequestedEgress::RequiredResidential,
+                false,
+            ) {
+                Ok(AuthorizedEgress::Residential(binding)) => Some((u, binding)),
+                _ => None,
+            }
         })
         .collect();
-    v.sort_unstable_by_key(|u| u.user_id);
+    v.sort_unstable_by_key(|(u, _)| u.user_id);
     v
 }
 
@@ -173,7 +185,7 @@ fn slot_users(users: &[User]) -> Vec<&User> {
 ///
 /// 用户增删走 gRPC、用户改槽位只改这些 `user` 规则（也走 gRPC），两者都不该触发
 /// xray 重启（D7 / spec §3.3；重启会掐断全部 REALITY 连接）。兜底规则没有 `user`，
-/// 留在哈希里 —— 它只在兜底槽序号变化时变，那一刻本来就该重启。
+/// 留在哈希里，拒绝策略变更不能被用户规则摘要跳过。
 pub fn structural_hash(cfg: &Value) -> String {
     let mut stripped = cfg.clone();
     if let Some(inbounds) = stripped.get_mut("inbounds").and_then(Value::as_array_mut) {
@@ -212,10 +224,10 @@ pub fn slot_rules_hash(cfg: &Value) -> String {
 /// 有 Reality 权益且未停用的用户 → `clients` 条目。
 ///
 /// 同上：不做期限/超限判断，调用方须只传入当前有效的用户。
-fn clients(users: &[User]) -> Vec<Value> {
+fn clients(users: &[User], resi: &Residential, requested: RequestedEgress) -> Vec<Value> {
     users
         .iter()
-        .filter(|u| !u.disabled && u.entitlements.protocols.contains(&Protocol::Reality))
+        .filter(|u| egress::access_for(u, resi, Protocol::Reality, requested, false).is_ok())
         .map(|u| {
             json!({
                 "id": u.credentials.vless_uuid,
@@ -257,6 +269,104 @@ mod tests {
     use crate::paths::Paths;
     use pretty_assertions::assert_eq;
     use uuid::Uuid;
+
+    #[test]
+    fn unmatched_traffic_defaults_to_rejection_during_rule_replacement() {
+        let cfg = config(
+            &node(),
+            &[user(1, Some(Uuid::from_u128(1)))],
+            &resi(1),
+            &Paths::default_server(),
+        );
+        // Xray's unmatching-route behavior is the first outbound. The dynamic
+        // residential fallback may be absent between RemoveRule and AddRule.
+        assert_eq!(cfg["outbounds"][0]["protocol"], "blackhole");
+        assert_eq!(cfg["outbounds"][0]["tag"], "blocked");
+        assert!(rules(&cfg)
+            .iter()
+            .any(|r| r["inboundTag"] == json!(["vless-direct"]) && r["outboundTag"] == "direct"));
+    }
+
+    // These consumers must reject a credential whose entitlement belongs to the other entry.
+    #[test]
+    fn reality_inbounds_authorize_their_own_egress() {
+        let mut residential_only = user(1, Some(Uuid::from_u128(2)));
+        residential_only.entitlements.direct = false;
+        let mut direct_only = user(2, None);
+        direct_only.entitlements.residential = None;
+        let both = user(3, Some(Uuid::from_u128(1)));
+        let cfg = config(
+            &node(),
+            &[residential_only.clone(), direct_only.clone(), both.clone()],
+            &resi(2),
+            &Paths::default_server(),
+        );
+        let emails = |index: usize| {
+            cfg["inbounds"][index]["settings"]["clients"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c["email"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            emails(1),
+            vec![direct_only.user_id.to_string(), both.user_id.to_string()]
+        );
+        assert_eq!(
+            emails(2),
+            vec![
+                residential_only.user_id.to_string(),
+                both.user_id.to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_residential_binding_has_no_client_and_cannot_use_fallback() {
+        let unassigned = user(1, None);
+        let missing = user(2, Some(Uuid::from_u128(99)));
+        let cfg = config(
+            &node(),
+            &[unassigned, missing],
+            &resi(2),
+            &Paths::default_server(),
+        );
+        assert!(cfg["inbounds"][2]["settings"]["clients"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(user_rules(&cfg).is_empty());
+        assert_eq!(rules(&cfg).last().unwrap()["outboundTag"], "blocked");
+        assert!(cfg["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o["tag"] == "blocked" && o["protocol"] == "blackhole"));
+    }
+
+    #[test]
+    fn disabled_pool_preserves_explicit_direct_but_rejects_residential() {
+        let u = user(1, Some(Uuid::from_u128(1)));
+        let mut r = resi(1);
+        r.groups.get_mut(DEFAULT_GROUP).unwrap().enabled = false;
+        let cfg = config(
+            &node(),
+            std::slice::from_ref(&u),
+            &r,
+            &Paths::default_server(),
+        );
+        assert_eq!(
+            cfg["inbounds"][1]["settings"]["clients"][0]["email"],
+            u.user_id.to_string()
+        );
+        assert!(cfg["inbounds"][2]["settings"]["clients"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(user_rules(&cfg).is_empty());
+        assert_eq!(rules(&cfg).last().unwrap()["outboundTag"], "blocked");
+    }
 
     #[test]
     fn rule_tags_are_stable_and_prefixed() {
@@ -366,7 +476,7 @@ mod tests {
 
     #[test]
     fn a_single_slot_routes_its_one_user_to_slot_zero() {
-        let u = user(1, None);
+        let u = user(1, Some(Uuid::from_u128(1)));
         let cfg = config(
             &node(),
             std::slice::from_ref(&u),
@@ -379,11 +489,11 @@ mod tests {
             .iter()
             .map(|o| o["tag"].as_str().unwrap().to_string())
             .collect();
-        assert_eq!(tags, vec!["direct", "relay-slot-0"]);
-        assert_eq!(cfg["outbounds"][1]["settings"]["servers"][0]["port"], 2080);
+        assert_eq!(tags, vec!["blocked", "direct", "relay-slot-0"]);
+        assert_eq!(cfg["outbounds"][2]["settings"]["servers"][0]["port"], 2080);
         let r = rules(&cfg);
         assert_eq!(r.len(), 4, "api / 直连 / 这个用户一条 / 住宅兜底");
-        // 未分配的用户也有自己的一条规则，指向兜底槽（D7：一人一条，追加顺序才无所谓）
+        // 精确绑定用户有自己的槽规则，未知 email 由最后的 blackhole 拒绝。
         assert_eq!(
             user_rules(&cfg),
             vec![(
@@ -394,7 +504,7 @@ mod tests {
         );
         let last = r.last().unwrap();
         assert_eq!(last["ruleTag"], "resi-fallback");
-        assert_eq!(last["outboundTag"], "relay-slot-0");
+        assert_eq!(last["outboundTag"], "blocked");
         assert_eq!(last["inboundTag"], serde_json::json!(["vless-residential"]));
         assert!(last.get("user").is_none(), "兜底规则不带 user");
     }
@@ -407,7 +517,7 @@ mod tests {
             user(2, Some(Uuid::from_u128(2))), // 槽 1
             user(3, Some(Uuid::from_u128(3))), // 槽 2
             user(4, Some(Uuid::from_u128(2))), // 槽 1
-            user(5, None),                     // 未分配 ⇒ 兜底槽（槽 0）
+            user(5, None),                     // 未分配 ⇒ 不授权住宅
         ];
         let cfg = config(&node(), &users, &r3, &Paths::default_server());
         assert_eq!(
@@ -421,6 +531,7 @@ mod tests {
                 ))
                 .collect::<Vec<_>>(),
             vec![
+                ("blocked".to_string(), None),
                 ("direct".to_string(), None),
                 ("relay-slot-0".to_string(), Some(2080)),
                 ("relay-slot-1".to_string(), Some(2081)),
@@ -430,14 +541,28 @@ mod tests {
         // 一人一条，按 user_id 升序（渲染必须确定性：顺序抖动会让文件与哈希无谓地变）
         assert_eq!(
             user_rules(&cfg),
-            users
-                .iter()
-                .map(|u| (
-                    format!("resi-u-{}", u.user_id),
-                    format!("relay-slot-{}", crate::slots::index_of_user(u, &r3)),
-                    u.user_id.to_string()
-                ))
-                .collect::<Vec<_>>()
+            vec![
+                (
+                    format!("resi-u-{}", users[0].user_id),
+                    "relay-slot-0".into(),
+                    users[0].user_id.to_string()
+                ),
+                (
+                    format!("resi-u-{}", users[1].user_id),
+                    "relay-slot-1".into(),
+                    users[1].user_id.to_string()
+                ),
+                (
+                    format!("resi-u-{}", users[2].user_id),
+                    "relay-slot-2".into(),
+                    users[2].user_id.to_string()
+                ),
+                (
+                    format!("resi-u-{}", users[3].user_id),
+                    "relay-slot-1".into(),
+                    users[3].user_id.to_string()
+                ),
+            ]
         );
         assert_eq!(
             user_rules(&cfg)
@@ -448,8 +573,7 @@ mod tests {
                 "relay-slot-0",
                 "relay-slot-1",
                 "relay-slot-2",
-                "relay-slot-1",
-                "relay-slot-0"
+                "relay-slot-1"
             ]
         );
         // 兜底必须是最后一条（前面每个人的规则先匹配）
@@ -464,7 +588,7 @@ mod tests {
         let users = vec![user(1, Some(Uuid::from_u128(2))), user(2, None)];
         let cfg = config(&node(), &users, &r, &Paths::default_server());
         let want = slot_rules(&users, &r);
-        assert_eq!(want.len(), 3, "两个用户各一条 + 兜底一条");
+        assert_eq!(want.len(), 2, "只有已绑定用户一条 + 拒绝兜底一条");
         assert_eq!(want.last().unwrap().rule_tag, FALLBACK_RULE_TAG);
         assert!(want.last().unwrap().emails.is_empty());
         let rendered: Vec<(String, String)> = rules(&cfg)
@@ -493,7 +617,7 @@ mod tests {
             &resi(2),
             &Paths::default_server(),
         );
-        assert_eq!(cfg["outbounds"].as_array().unwrap().len(), 3);
+        assert_eq!(cfg["outbounds"].as_array().unwrap().len(), 4);
         assert!(
             !rules(&cfg)
                 .iter()
@@ -560,18 +684,19 @@ mod tests {
         assert_ne!(structural_hash(&a), structural_hash(&b));
     }
 
-    /// 兜底规则没有 `user` ⇒ **留在**结构哈希里：它只在兜底槽序号变化时变，
-    /// 那一刻本来就该重启（D7）。
+    /// Changing the fallback from rejection to an allowed path must be structural.
     #[test]
     fn the_fallback_rule_stays_inside_the_structural_hash() {
         let p = Paths::default_server();
-        let mut r = resi(2);
-        let a = config(&node(), &[], &r, &p);
-        // 删掉序号 0 那个槽 ⇒ 兜底槽变成槽 1
-        r.slots.retain(|s| s.index != 0);
-        let b = config(&node(), &[], &r, &p);
-        assert_eq!(rules(&b).last().unwrap()["outboundTag"], "relay-slot-1");
-        assert_ne!(structural_hash(&a), structural_hash(&b));
+        let a = config(&node(), &[], &resi(2), &p);
+        let mut changed = a.clone();
+        changed["routing"]["rules"]
+            .as_array_mut()
+            .unwrap()
+            .last_mut()
+            .unwrap()["outboundTag"] = json!("direct");
+        assert_eq!(rules(&a).last().unwrap()["outboundTag"], "blocked");
+        assert_ne!(structural_hash(&a), structural_hash(&changed));
     }
 
     #[test]
