@@ -24,11 +24,33 @@ pub enum Event {
 }
 
 #[derive(Clone)]
-pub struct EventBus(tokio::sync::broadcast::Sender<Event>);
+pub struct EventBus(
+    tokio::sync::broadcast::Sender<Event>,
+    Arc<std::sync::OnceLock<Arc<crate::residential_lifecycle::Lifecycle>>>,
+);
 
 impl EventBus {
     pub fn new() -> Self {
-        Self(tokio::sync::broadcast::channel(64).0)
+        Self(
+            tokio::sync::broadcast::channel(64).0,
+            Arc::new(std::sync::OnceLock::new()),
+        )
+    }
+
+    pub fn bind_residential(&self, shared: Arc<crate::modules::panel::Shared>) {
+        let _ = self
+            .1
+            .set(crate::residential_lifecycle::Lifecycle::new(shared));
+    }
+
+    pub fn residential(&self) -> Arc<crate::residential_lifecycle::Lifecycle> {
+        self.1
+            .get_or_init(|| {
+                crate::residential_lifecycle::Lifecycle::new(
+                    crate::modules::panel::PanelModule::new().shared(),
+                )
+            })
+            .clone()
     }
 
     /// 没有订阅者时静默丢弃（装机阶段还没起后台任务）。

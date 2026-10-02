@@ -251,6 +251,15 @@ pub struct FakeHy2ResiInner {
     pub selected: BTreeMap<String, String>,
     /// `ready()` 的返回值（默认 true；置 false 模拟 sing-box 刚重启还没起监听）
     pub ready: bool,
+    pub select_noop: bool,
+    pub fail_inventory_read: Option<usize>,
+    pub inventory_reads: usize,
+    pub inventory_override: Option<super::hy2resi::GateInventory>,
+    pub version: String,
+    pub members: Vec<String>,
+    pub on_inventory_read: Option<Arc<dyn Fn(usize) + Send + Sync>>,
+    pub inventory_delays: Vec<std::time::Duration>,
+    pub select_delay: std::time::Duration,
     /// 命中就返回 `Err`（键同 `calls` 的记法），用来测某一条调用长期失败
     pub fail_on: BTreeSet<String>,
     /// 下一次**任何**调用失败一次（命中即清空），错误串取这里 ——
@@ -264,8 +273,32 @@ impl Default for FakeHy2ResiInner {
             calls: Vec::new(),
             deltas: BTreeMap::new(),
             conns: Vec::new(),
-            selected: BTreeMap::new(),
+            selected: (0..32)
+                .map(|n| (format!("gate-r{n:03}"), "deny".into()))
+                .collect(),
             ready: true,
+            select_noop: false,
+            fail_inventory_read: None,
+            inventory_reads: 0,
+            inventory_override: None,
+            version: "sing-box 1.14.2".into(),
+            members: [
+                "deny",
+                "slot-0-out",
+                "slot-1-out",
+                "slot-2-out",
+                "slot-3-out",
+                "slot-4-out",
+                "slot-5-out",
+                "slot-6-out",
+                "slot-7-out",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            on_inventory_read: None,
+            inventory_delays: Vec::new(),
+            select_delay: std::time::Duration::ZERO,
             fail_on: BTreeSet::new(),
             fail_next: None,
         }
@@ -365,18 +398,75 @@ impl Hy2ResiApi for FakeHy2Resi {
         Ok(())
     }
 
-    async fn selected_all(&self) -> anyhow::Result<BTreeMap<String, String>> {
+    async fn inventory(&self) -> anyhow::Result<super::hy2resi::GateInventory> {
         self.record("selected_all".into())?;
-        Ok(self.0.lock().unwrap().selected.clone())
+        let (inventory, delay, hook, read, fail) = {
+            let mut i = self.0.lock().unwrap();
+            i.inventory_reads += 1;
+            let read = i.inventory_reads;
+            let inventory =
+                i.inventory_override
+                    .clone()
+                    .unwrap_or_else(|| super::hy2resi::GateInventory {
+                        gates: i
+                            .selected
+                            .iter()
+                            .map(|(tag, now)| {
+                                (
+                                    tag.clone(),
+                                    super::hy2resi::GateSelector {
+                                        kind: "Selector".into(),
+                                        now: now.clone(),
+                                        all: i.members.clone(),
+                                    },
+                                )
+                            })
+                            .collect(),
+                    });
+            (
+                inventory,
+                i.inventory_delays
+                    .get(read - 1)
+                    .copied()
+                    .unwrap_or_default(),
+                i.on_inventory_read.clone(),
+                read,
+                i.fail_inventory_read == Some(read),
+            )
+        };
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        if let Some(hook) = hook {
+            hook(read);
+        }
+        anyhow::ensure!(!fail, "fake final inventory read failure");
+        Ok(inventory)
+    }
+
+    async fn version(&self) -> anyhow::Result<String> {
+        self.record("version".into())?;
+        Ok(self.0.lock().unwrap().version.clone())
     }
 
     async fn select(&self, selector: &str, tag: &str) -> anyhow::Result<()> {
         self.record(format!("select:{selector}:{tag}"))?;
-        self.0
-            .lock()
-            .unwrap()
-            .selected
-            .insert(selector.to_string(), tag.to_string());
+        let delay = self.0.lock().unwrap().select_delay;
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        let mut inner = self.0.lock().unwrap();
+        anyhow::ensure!(
+            inner.selected.contains_key(selector),
+            "fake stock selector not found: {selector}"
+        );
+        anyhow::ensure!(
+            inner.members.iter().any(|member| member == tag),
+            "fake stock selector missing member: {tag}"
+        );
+        if !inner.select_noop {
+            inner.selected.insert(selector.to_string(), tag.to_string());
+        }
         Ok(())
     }
 
@@ -556,6 +646,7 @@ mod tests {
         );
 
         // 切门写完能读回来（门位收敛的幂等判据）
+        r.set_selected(BTreeMap::from([("gate-r000".into(), "deny".into())]));
         r.select("gate-r000", "slot-0-out").await.unwrap();
         assert_eq!(
             r.selected_all().await.unwrap(),

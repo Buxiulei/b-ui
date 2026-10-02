@@ -4,6 +4,7 @@ pub mod harden_ssh;
 pub mod import_v3;
 pub mod incidents;
 pub mod install;
+pub mod maintenance;
 pub mod menu;
 pub mod nft;
 pub mod selfcheck;

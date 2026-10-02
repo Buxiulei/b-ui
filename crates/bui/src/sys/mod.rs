@@ -80,6 +80,10 @@ pub trait Host: Send + Sync {
     /// 600 秒一轮 —— 用 `read_file` 算 sha 就是每 10 分钟复现一次的 OOM/重启循环面。
     fn file_sha256(&self, path: &Path) -> Result<Option<String>>;
     fn write_file(&self, path: &Path, content: &[u8], mode: u32) -> Result<()>;
+    fn rename_file(&self, from: &Path, to: &Path) -> Result<()>;
+    /// Complete publication durability for an owner-managed path.
+    fn sync_parent(&self, path: &Path) -> Result<()>;
+    fn set_file_mode(&self, path: &Path, mode: u32) -> Result<()>;
     /// 开一个写入槽：内容边到边写临时文件，[`StagedWrite::commit`] 才按 `mode` 原子提升成
     /// `dest`。**大文件（内核 / 客户端二进制，单笔约 81 MB）只许走这一条**，理由与语义见
     /// [`StagedWrite`]。返回值借着 `&self`（[`fake::FakeHost`] 的槽要写回它那份内存文件系统），

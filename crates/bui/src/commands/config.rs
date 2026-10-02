@@ -40,14 +40,19 @@ pub async fn run_hy2_auth_with(
         println!("Hysteria2 鉴权已切到 {mode}；对账会重渲染 config.yaml 并重启 hysteria-server（4.1 起只作用于直连）。");
         return Ok(());
     }
-    let store = Store::open(crate::paths::state_file(&paths)).await?;
-    if store.read().await.system.hy2_auth == mode {
-        println!("Hysteria2 鉴权已经是 {mode}，无需改动。");
-        return Ok(());
-    }
-    store.update(|s| s.system.hy2_auth = mode).await?;
-    println!("Hysteria2 鉴权已切到 {mode}；守护进程没在跑，请执行 `bui reconcile` 让它生效。");
-    Ok(())
+    let owned_paths = paths.clone();
+    crate::residential_lifecycle::offline(&paths, async move {
+        let paths = owned_paths;
+        let store = Store::open(crate::paths::state_file(&paths)).await?;
+        if store.read().await.system.hy2_auth == mode {
+            println!("Hysteria2 鉴权已经是 {mode}，无需改动。");
+            return Ok(());
+        }
+        store.update(|s| s.system.hy2_auth = mode).await?;
+        println!("Hysteria2 鉴权已切到 {mode}；守护进程没在跑，请执行 `bui reconcile` 让它生效。");
+        Ok(())
+    })
+    .await
 }
 
 /// `bui set legacy-sub <值>` 的取值校验：`off`（不分大小写）⇒ `None`，也就是立刻停用
@@ -101,15 +106,20 @@ pub async fn run_legacy_sub_with(
         println!("{}", legacy_sub_notice(until.as_deref()));
         return Ok(());
     }
-    let store = Store::open(crate::paths::state_file(&paths)).await?;
-    if store.read().await.system.legacy_sub_until == until {
-        println!("宽限期已经是这个值，无需改动。");
-        return Ok(());
-    }
-    let value = until.clone();
-    store.update(|s| s.system.legacy_sub_until = value).await?;
-    println!("{}", legacy_sub_notice(until.as_deref()));
-    Ok(())
+    let owned_paths = paths.clone();
+    crate::residential_lifecycle::offline(&paths, async move {
+        let paths = owned_paths;
+        let store = Store::open(crate::paths::state_file(&paths)).await?;
+        if store.read().await.system.legacy_sub_until == until {
+            println!("宽限期已经是这个值，无需改动。");
+            return Ok(());
+        }
+        let value = until.clone();
+        store.update(|s| s.system.legacy_sub_until = value).await?;
+        println!("{}", legacy_sub_notice(until.as_deref()));
+        Ok(())
+    })
+    .await
 }
 
 /// obfs 密码的十六进制位数：16 字节随机，与订阅 token（`bui_schema::sub`）同量级。
@@ -203,12 +213,17 @@ async fn switch_obfs(value: &str, paths: &Paths, socket: &Path) -> Result<String
         let changed = body["changed"].as_bool().unwrap_or(true);
         return Ok(obfs_notice(on, changed, true));
     }
-    let store = Store::open(crate::paths::state_file(paths)).await?;
-    let Some(next) = obfs_switched(&store.read().await.node.obfs, on) else {
-        return Ok(obfs_notice(on, false, false));
-    };
-    store.update(|s| s.node.obfs = next).await?;
-    Ok(obfs_notice(on, true, false))
+    let owned_paths = paths.clone();
+    crate::residential_lifecycle::offline(paths, async move {
+        let paths = owned_paths;
+        let store = Store::open(crate::paths::state_file(&paths)).await?;
+        let Some(next) = obfs_switched(&store.read().await.node.obfs, on) else {
+            return Ok(obfs_notice(on, false, false));
+        };
+        store.update(|s| s.node.obfs = next).await?;
+        Ok(obfs_notice(on, true, false))
+    })
+    .await
 }
 
 // ── `bui set hy2-resi-compat on|off`（4.1，spec §2.4）─────────────────────────
@@ -338,43 +353,53 @@ async fn switch_hy2_resi_compat(
     now: time::OffsetDateTime,
 ) -> Result<String> {
     let on = parse_obfs(value)?; // 同一套 on/off 判据
-    let hits = crate::modules::watchdog::compat_hits(
-        &crate::state::runtime::Runtime::load(crate::paths::runtime_file(paths))
-            .read()
-            .await,
-    );
-    // 兼容段区间从期望态算，不写字面量（理由见 `compat_refusal`）。守护进程在跑时也只
-    // **读**这份文件，写盘仍旧只经端点。
-    let store = Store::open(crate::paths::state_file(paths)).await?;
-    let compat = bui_schema::render::nft::compat_range(&store.read().await.node.ports);
-    if let Err(why) = check_compat_takedown(on, force, hits.as_ref(), compat, now) {
-        anyhow::bail!("{why}");
-    }
     let client = crate::ipc::Client::new(socket);
     if client.available().await {
         let (status, body) = client
             .request(
                 "POST",
                 "/api/system/hy2-resi-compat",
-                Some(serde_json::json!({
-                    "value": if on { "on" } else { "off" },
-                    "force": force,
-                })),
+                Some(serde_json::json!({"value":if on {"on"} else {"off"},"force":force})),
             )
             .await?;
-        if !(200..300).contains(&status) {
-            anyhow::bail!("守护进程拒绝了这次修改（HTTP {status}）：{body}");
+        anyhow::ensure!(
+            (200..300).contains(&status),
+            "守护进程拒绝修改（HTTP {status}）：{body}"
+        );
+        return Ok(format!(
+            "4.0 兼容段已{}{}；守护进程：{body}",
+            if on { "开启" } else { "关闭" },
+            if force && !on {
+                "（--force 下线）"
+            } else {
+                ""
+            }
+        ));
+    }
+    let owned_paths = paths.clone();
+    crate::residential_lifecycle::offline(paths, async move {
+        let paths = &owned_paths;
+        let hits = crate::modules::watchdog::compat_hits(
+            &crate::state::runtime::Runtime::load(crate::paths::runtime_file(paths))
+                .read()
+                .await,
+        );
+        // 兼容段区间从期望态算，不写字面量（理由见 `compat_refusal`）。守护进程在跑时也只
+        // **读**这份文件，写盘仍旧只经端点。
+        let store = Store::open(crate::paths::state_file(paths)).await?;
+        let compat = bui_schema::render::nft::compat_range(&store.read().await.node.ports);
+        if let Err(why) = check_compat_takedown(on, force, hits.as_ref(), compat, now) {
+            anyhow::bail!("{why}");
         }
-        let changed = body["changed"].as_bool().unwrap_or(true);
-        return Ok(compat_notice(on, changed, true, force, compat));
-    }
-    if store.read().await.system.hy2_resi_compat_ports == on {
-        return Ok(compat_notice(on, false, false, force, compat));
-    }
-    store
-        .update(|s| s.system.hy2_resi_compat_ports = on)
-        .await?;
-    Ok(compat_notice(on, true, false, force, compat))
+        if store.read().await.system.hy2_resi_compat_ports == on {
+            return Ok(compat_notice(on, false, false, force, compat));
+        }
+        store
+            .update(|s| s.system.hy2_resi_compat_ports = on)
+            .await?;
+        Ok(compat_notice(on, true, false, force, compat))
+    })
+    .await
 }
 
 #[cfg(test)]

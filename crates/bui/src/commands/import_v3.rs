@@ -565,6 +565,19 @@ pub async fn run(
     paths: Paths,
     host: Arc<dyn Host>,
 ) -> anyhow::Result<()> {
+    let lease_paths = paths.clone();
+    crate::residential_lifecycle::offline(&lease_paths, async move {
+        run_owned(dir, out, paths, host).await
+    })
+    .await
+}
+
+async fn run_owned(
+    dir: PathBuf,
+    out: Option<PathBuf>,
+    paths: Paths,
+    host: Arc<dyn Host>,
+) -> anyhow::Result<()> {
     let report = bui_schema::v3::import(&dir)?;
     for w in &report.warnings {
         println!("导入提示：{w}");

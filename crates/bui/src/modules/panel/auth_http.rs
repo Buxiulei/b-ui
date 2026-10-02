@@ -28,7 +28,6 @@ use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use bui_schema::paths::Paths;
-use bui_schema::render::hysteria::AUTH_HTTP_PORT;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -144,21 +143,25 @@ pub fn router(st: Arc<AuthHttp>) -> axum::Router {
         .with_state(st)
 }
 
-/// 监听 `127.0.0.1:AUTH_HTTP_PORT` 并一直服务。绑不上就记 error 返回：
-/// hysteria 那边随即全员拒绝（fail-closed），watchdog 会在日志里看到连不上并记一条事件。
-pub async fn serve(st: Arc<AuthHttp>) -> anyhow::Result<()> {
-    let bind = format!("127.0.0.1:{AUTH_HTTP_PORT}");
-    let listener = tokio::net::TcpListener::bind(&bind).await?;
-    tracing::info!(bind = %bind, "Hysteria2 http 鉴权就绪（只监听回环）");
-    axum::serve(listener, router(st)).await?;
-    Ok(())
-}
-
-/// 后台任务：绑定 + 服务，失败只记 error（不能让整个守护进程退出）。
-pub async fn serve_loop(st: Arc<AuthHttp>) {
-    if let Err(e) = serve(st).await {
-        tracing::error!(error = %e, port = AUTH_HTTP_PORT, "http 鉴权监听失败：{e}");
-    }
+/// Initialize authorization and bind before returning, so a long residential
+/// startup cannot leave native authentication waiting for the control plane.
+pub async fn start(
+    ctx: DaemonCtx,
+    shared: Arc<Shared>,
+    bind: std::net::SocketAddr,
+) -> anyhow::Result<(std::net::SocketAddr, Vec<tokio::task::JoinHandle<()>>)> {
+    let st = Arc::new(AuthHttp::new(ctx.paths.clone(), ctx.host.clone()));
+    refresh(&ctx, &shared, &st).await;
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+    let address = listener.local_addr()?;
+    let serve_state = st.clone();
+    let server = tokio::spawn(async move {
+        if let Err(error) = axum::serve(listener, router(serve_state)).await {
+            tracing::error!(%error, "native authentication listener ended");
+        }
+    });
+    let refresh = tokio::spawn(refresh_loop(ctx, shared, st));
+    Ok((address, vec![server, refresh]))
 }
 
 /// 把「期望态 + 本轮拒绝集合」刷进内存快照。与 `users::sync_now` 算的是同一件事，
@@ -370,6 +373,56 @@ mod tests {
         let (code, body) = post(&r, r#"{"addr":"a:1","auth":"alice:pw","tx":0}"#).await;
         assert_eq!(code, StatusCode::OK);
         assert_eq!(body, serde_json::json!({"ok": false}));
+    }
+
+    #[tokio::test]
+    async fn native_auth_is_bound_and_fresh_while_residential_owner_is_pending() {
+        let h = testsupport::harness().await;
+        h.app.bus.bind_residential(h.shared.clone());
+        let ctx = DaemonCtx {
+            store: h.store.clone(),
+            runtime: h.runtime.clone(),
+            bus: h.app.bus.clone(),
+            host: h.host.clone(),
+            paths: h.paths.clone(),
+        };
+        let owner = ctx.bus.residential();
+        let (entered, seen) = tokio::sync::oneshot::channel();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let busy = owner.clone();
+        let job = tokio::spawn(async move {
+            busy.execute(move |_tx| async move {
+                entered.send(()).unwrap();
+                wait.await?;
+                Ok(())
+            })
+            .await
+        });
+        seen.await.unwrap();
+        let (address, tasks) = start(ctx, h.shared.clone(), "127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            reqwest::Client::new()
+                .post(format!("http://{address}/auth"))
+                .json(&serde_json::json!({"auth":"alice:pw-alice-01","addr":"127.0.0.1"}))
+                .send(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(
+            body["ok"], true,
+            "fresh snapshot must already authorize the existing native user"
+        );
+        release.send(()).unwrap();
+        job.await.unwrap().unwrap();
+        owner.drain().await;
+        for task in tasks {
+            task.abort();
+        }
     }
 
     /// 内存快照与 `auth-snapshot.json` 同源：刷新之后两边给出同一个判定。

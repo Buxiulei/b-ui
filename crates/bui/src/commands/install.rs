@@ -369,7 +369,7 @@ fn manifest_failure_notice(url: &str, err: &str) -> String {
 
 /// 第 3 + 4 步：拉 manifest → 缓存（内容相同不写）→ 把四个内核装到 `bin/`（版本一致则跳过）。
 /// manifest 拉不到只警告并返回 `None`；**是否继续装机由调用方的内核闸门决定**
-/// （[`run_with`] 的「内核缺一即中止」）。
+/// （[`run_with_wait`] 的「内核缺一即中止」）。
 ///
 /// 返回 **(实际用的 manifest 地址, manifest)**：地址由
 /// [`crate::kernels::fetch_manifest_with`] 定（可能是 404 回退后的预发布 tag），闸门的报错文案
@@ -412,6 +412,9 @@ fn fetch_and_install_kernels(
     let installed = crate::kernels::installed_versions(host, &paths.bin_dir);
     let installer = KernelInstaller { fetcher, host };
     for name in crate::kernels::KERNELS {
+        if name == "sing-box" {
+            continue;
+        }
         let (version, asset) = match manifest.kernel_asset(name, &arch) {
             Ok(v) => v,
             Err(e) => {
@@ -445,7 +448,7 @@ fn fetch_and_install_kernels(
     let missing: Vec<&str> = crate::kernels::KERNELS
         .iter()
         .copied()
-        .filter(|k| !have.contains_key(*k))
+        .filter(|k| *k != "sing-box" && !have.contains_key(*k))
         .collect();
     if !missing.is_empty() {
         println!(
@@ -657,7 +660,7 @@ fn first_user(username: &str) -> anyhow::Result<bui_schema::model::User> {
 /// ——本函数在**已装机的对账**路径上也会跑，`until` 完全可能已经是过去时刻（v3 导入机 8 天后
 /// 重跑 `bui install`）。`now` 由调用方传入（[`final_summary`] 取 `now_utc`），测试于是可控。
 ///
-/// `fresh` = 这一趟是不是全新装机（判据与 [`run`] / [`run_with`] 同一条：`state.json` 在不在）。
+/// `fresh` = 这一趟是不是全新装机（判据与 [`run`] / [`run_with_wait`] 同一条：`state.json` 在不在）。
 /// 已装机上重跑 `bui install` 只是对账，没有新建任何用户，照打「第一个用户 <名>」+ 他的订阅会
 /// 让人以为刚给他建了号（2026-09-13 bwg-rick 真机误读）——那条路径只报一行用户数。
 pub fn summary(
@@ -719,7 +722,7 @@ pub fn summary(
 }
 
 /// 已装机时的 `Answers`：事实全部复用 `state.json`，密码留空。
-/// （[`run_with`] 的非全新路径只对账，`answers` 一概不看；这里给出的是「与现状一致」的形状，
+/// （[`run_with_wait`] 的非全新路径只对账，`answers` 一概不看；这里给出的是「与现状一致」的形状，
 /// 而不是一组会误导人的新值。）
 fn answers_from_state(state: &State) -> Answers {
     Answers {
@@ -881,8 +884,13 @@ async fn final_summary(state_path: &Path, notice: Option<&str>, fresh: bool) -> 
     ))
 }
 
-/// 面向真实终端的入口：读已装机的期望态 → 收集 `Answers` → 交给 [`run_with`]。
+/// 面向真实终端的入口：读已装机的期望态 → 收集 `Answers` → 交给 [`run_with_wait`]。
 pub async fn run(opts: InstallOpts, paths: Paths, host: Arc<dyn Host>) -> anyhow::Result<()> {
+    if online_reconcile(&opts.socket).await? {
+        return Ok(());
+    }
+    let lease = crate::residential_lifecycle::ControlLease::acquire(&paths)?;
+
     // 判据与 `run_with` 的 `fresh` 完全同一条（`state.json` 在不在），两边不会分叉
     let state_path = crate::paths::state_file(&paths);
     let installed = if state_path.exists() {
@@ -906,13 +914,15 @@ pub async fn run(opts: InstallOpts, paths: Paths, host: Arc<dyn Host>) -> anyhow
     .await?;
     // C4 的两个覆盖读一次就固定（`install.sh` 把它选定的那个 tag export 成 `$BUI_MANIFEST_URL`）
     let manifest = ManifestSource::from_env(opts.manifest_url.clone());
-    let outcome = run_with(
+    let outcome = run_with_wait_leased(
         opts,
         answers,
         manifest,
         paths,
         host,
         Arc::new(HttpFetcher::new()),
+        crate::commands::selfcheck::Wait::default(),
+        lease,
     )
     .await;
     // 环境闸门（端口被占 / 缺 nft / 内核过低）：一个破坏性动作都还没做，所以**不打**装机摘要，
@@ -946,27 +956,7 @@ pub async fn run(opts: InstallOpts, paths: Paths, host: Arc<dyn Host>) -> anyhow
 
 /// spec §7 的十步。`manifest` 是 C4 的覆盖来源（[`ManifestSource`]），由调用方读一次；
 /// 测试传 `"<url>".into()` 钉死地址，不读进程环境。
-pub async fn run_with(
-    opts: InstallOpts,
-    answers: Answers,
-    manifest: ManifestSource,
-    paths: Paths,
-    host: Arc<dyn Host>,
-    fetcher: Arc<dyn Fetcher>,
-) -> anyhow::Result<()> {
-    run_with_wait(
-        opts,
-        answers,
-        manifest,
-        paths,
-        host,
-        fetcher,
-        crate::commands::selfcheck::Wait::default(),
-    )
-    .await
-}
-
-/// [`run_with`] 外加「自检前等多久」（见 [`crate::commands::selfcheck::Wait`]）。
+/// [`run_with_wait`] 外加「自检前等多久」（见 [`crate::commands::selfcheck::Wait`]）。
 /// 全新装机要等首张证书，所以默认 120s；**故意坏掉的**那几个测试传 `Wait::NONE`，
 /// 否则每条都要真睡满两分钟。
 #[allow(clippy::too_many_arguments)]
@@ -978,6 +968,80 @@ pub async fn run_with_wait(
     host: Arc<dyn Host>,
     fetcher: Arc<dyn Fetcher>,
     wait: crate::commands::selfcheck::Wait,
+) -> anyhow::Result<()> {
+    if online_reconcile(&opts.socket).await? {
+        return Ok(());
+    }
+    let lease = crate::residential_lifecycle::ControlLease::acquire(&paths)?;
+    run_with_wait_leased(
+        opts,
+        answers,
+        manifest_src,
+        paths,
+        host,
+        fetcher,
+        wait,
+        lease,
+    )
+    .await
+}
+
+async fn online_reconcile(socket: &std::path::Path) -> anyhow::Result<bool> {
+    let client = crate::ipc::Client::new(socket);
+    if !client.available().await {
+        return Ok(false);
+    }
+    let (status, body) = client
+        .request(
+            "POST",
+            "/api/reconcile",
+            Some(serde_json::json!({"force":false,"dry_run":false})),
+        )
+        .await?;
+    anyhow::ensure!(
+        (200..300).contains(&status),
+        "daemon rejected install reconcile (HTTP {status}): {body}"
+    );
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_with_wait_leased(
+    opts: InstallOpts,
+    answers: Answers,
+    manifest_src: ManifestSource,
+    paths: Paths,
+    host: Arc<dyn Host>,
+    fetcher: Arc<dyn Fetcher>,
+    wait: crate::commands::selfcheck::Wait,
+    lease: crate::residential_lifecycle::ControlLease,
+) -> anyhow::Result<()> {
+    tokio::spawn(async move {
+        install_owned(
+            opts,
+            answers,
+            manifest_src,
+            paths,
+            host,
+            fetcher,
+            wait,
+            lease,
+        )
+        .await
+    })
+    .await?
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn install_owned(
+    opts: InstallOpts,
+    answers: Answers,
+    manifest_src: ManifestSource,
+    paths: Paths,
+    host: Arc<dyn Host>,
+    fetcher: Arc<dyn Fetcher>,
+    wait: crate::commands::selfcheck::Wait,
+    lease: crate::residential_lifecycle::ControlLease,
 ) -> anyhow::Result<()> {
     let state_path = crate::paths::state_file(&paths);
     let fresh = !state_path.exists();
@@ -1032,7 +1096,7 @@ pub async fn run_with_wait(
             // 降级守卫、自检 FAIL 同一口径）。此时期望态、配置、单元与 v3 都一字未动。
             return Err(crate::sys::env_probe::EnvBlocked(msg).into());
         }
-        let missing = {
+        let mut missing = {
             // 探测走 spawn_blocking：`installed_versions` 会 run 四次 `<bin>/<kernel> version`
             let (h, p) = (host.clone(), paths.clone());
             tokio::task::spawn_blocking(move || {
@@ -1040,6 +1104,13 @@ pub async fn run_with_wait(
             })
             .await?
         };
+        if manifest
+            .as_ref()
+            .and_then(|m| m.kernels.get("sing_box"))
+            .is_some_and(|v| v.trim_start_matches('v') == "1.14.2")
+        {
+            missing.retain(|name| *name != "sing-box");
+        }
         if !missing.is_empty() {
             anyhow::bail!(
                 "缺少内核：{}（manifest：{}）；已中止安装，v3 与现有服务一字未动。\
@@ -1145,23 +1216,13 @@ pub async fn run_with_wait(
     // 9：一次完整对账。守护进程已经在跑（活机器上重跑 install）就交给它，别在本进程里并发再跑
     // 一轮——两边会同时 restart 同一个单元、`.verify/<file>` 候选文件互相覆盖、
     // `runtime.json` 交叉写（与 `serve::reconcile_cli` 同一条口径）。
-    let client = crate::ipc::Client::new(&opts.socket);
-    let report = if client.available().await {
-        let (status, body) = client
-            .request(
-                "POST",
-                "/api/reconcile",
-                Some(serde_json::json!({"force": false, "dry_run": false})),
-            )
-            .await?;
-        println!("守护进程已在运行，对账已交给它（HTTP {status}）：{body}");
-        serde_json::from_value(body).unwrap_or_default()
-    } else {
-        let reg = crate::serve::modules(manifest);
-        let r = crate::serve::reconcile_from_ctx(&ctx, &reg.modules, fetcher, false, false).await?;
-        crate::serve::finish_self_restart(&ctx, &r, false).await;
-        r
-    };
+    let reg = crate::serve::modules(manifest);
+    ctx.bus.bind_residential(reg.panel.clone());
+    let report =
+        crate::serve::reconcile_from_ctx(&ctx, &reg.modules, fetcher, false, false).await?;
+    ctx.bus.residential().drain().await;
+    drop(lease);
+    crate::serve::finish_self_restart(&ctx, &report, false).await;
     for line in report
         .notes
         .iter()
@@ -1169,6 +1230,14 @@ pub async fn run_with_wait(
         .chain(report.errors.iter())
     {
         println!("{line}");
+    }
+    if report.errors.is_empty()
+        && report.verify_failures.is_empty()
+        && crate::residential_lifecycle::read_record(&ctx)?
+            .is_some_and(|r| r.phase == "awaiting_certificate")
+    {
+        println!("Caddy 与 daemon 启动前置已完成；住宅和 relay 等待首张证书，尚未激活。证书到达后自动继续对账，可用 bui status 复检。");
+        return Ok(());
     }
     // 10：装完自检（PASS/FAIL 表）。判据照 `scripts/m1-acceptance.sh`，外加一条 HY2 回环鉴权。
     // 摘要（面板地址 / 一次性密码 / 订阅形状）由 [`run`] 在这之后打，是最后一屏。
@@ -1375,7 +1444,7 @@ mod tests {
         let asset = |n: &str| serde_json::json!({"url": format!("https://x/{n}"), "sha256": sum});
         let manifest = serde_json::json!({
             "version": "4.0.0",
-            "kernels": { "hysteria": "2.12.2", "xray": "26.3.27", "sing_box": "1.13.19", "caddy": "2.10.2" },
+            "kernels": { "hysteria": "2.12.2", "xray": "26.3.27", "sing_box": "1.14.2", "caddy": "2.10.2" },
             "artifacts": {
                 "bui-linux-amd64": asset("bui"),
                 "hysteria-linux-amd64": asset("hysteria"),
@@ -1439,6 +1508,8 @@ mod tests {
         let bin = |n: &str| paths.bin_dir.join(n).display().to_string();
         let h = Arc::new(FakeHost::new());
         h.with(|i| {
+            i.stock_singbox = true;
+            i.instances.insert("hysteria-residential.service".into(), 1);
             i.files.insert(
                 "/root/.ssh/authorized_keys".into(),
                 (b"ssh-ed25519 AAAA me\n".to_vec(), 0o600),
@@ -1479,6 +1550,10 @@ mod tests {
                 paths.certs_dir.join("fullchain.pem"),
                 (b"CERT".to_vec(), 0o644),
             );
+            i.files.insert(
+                paths.certs_dir.join("privkey.pem"),
+                (b"KEY".to_vec(), 0o600),
+            );
             // 自检的 HY2 回环探测脚本（有用户时才跑）
             i.scripted.push(("sh ".into(), CmdOut::success("200\n")));
             i.scripted
@@ -1493,7 +1568,7 @@ mod tests {
             ));
             i.scripted.push((
                 format!("{} version", bin("sing-box")),
-                CmdOut::success("sing-box version 1.13.19\n"),
+                CmdOut::success("sing-box version 1.14.2\n"),
             ));
             i.scripted.push((
                 format!("{} version", bin("caddy")),
@@ -1830,7 +1905,7 @@ mod tests {
     /// 与官方归档打同一个版本号（`sing-box version` 都是 1.13.19 这种），只比版本号的话它
     /// 永远装不上去，而依赖 `with_v2ray_api` 的配置每轮 `check` 必然 FATAL。
     #[test]
-    fn the_kernel_step_replaces_a_same_version_binary_whose_bytes_differ() {
+    fn early_kernel_step_leaves_shared_singbox_for_the_owner() {
         let d = tempfile::tempdir().unwrap();
         let paths = scratch(&d);
         let h = host_for_install(&paths);
@@ -1851,8 +1926,8 @@ mod tests {
         assert!(m.is_some(), "manifest 要拉得到");
         assert_eq!(
             h.text(&sb.display().to_string()).as_deref(),
-            Some("ELF"),
-            "同版本异 sha 要换成 manifest 资产那一份"
+            Some("SB-official"),
+            "shared binary publication waits for the owner"
         );
         let writes: Vec<String> = h
             .ops()
@@ -1861,7 +1936,7 @@ mod tests {
             .collect();
         assert_eq!(
             writes,
-            vec![format!("write:{}:755", sb.display())],
+            Vec::<String>::new(),
             "版本与 sha 都对得上的那三个一个都不许重下"
         );
     }
@@ -2562,10 +2637,10 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let paths = scratch(&d);
         let host = host_for_install(&paths);
-        // HY2 的两个 UDP 端口没在监听 → 自检的「关键端口」那一项 FAIL
+        // Native UDP is absent; residential readiness remains independently valid.
         host.with(|i| {
             i.listening
-                .insert(crate::sys::Proto::Udp, Default::default());
+                .insert(crate::sys::Proto::Udp, [40000].into_iter().collect());
         });
         let err = run_with_wait(
             opts(&d),
@@ -2620,6 +2695,60 @@ mod tests {
         )
         .await
         .expect("证书未到不该让装机退 2");
+        assert!(
+            host.read_file(&crate::modules::core_files::hy2_resi_config_path(&paths))
+                .unwrap()
+                .is_none(),
+            "unvalidated residential configuration is not published"
+        );
+        assert!(
+            host.read_file(&paths.bin_dir.join("sing-box"))
+                .unwrap()
+                .is_none(),
+            "shared binary waits with both consumers"
+        );
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(paths.base_dir.join(".residential-lifecycle/record.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(receipt["phase"], "awaiting_certificate");
+        let ops = host.ops();
+        assert!(
+            ops.iter()
+                .any(|op| op == "systemd:start:caddy" || op == "systemd:restart:caddy"),
+            "{ops:?}"
+        );
+        assert!(host
+            .read_file(&paths.base_dir.join("Caddyfile"))
+            .unwrap()
+            .is_some());
+        assert!(
+            ops.iter().any(|op| op == "systemd:restart:b-ui"
+                || (op.starts_with("run:systemctl ")
+                    && op.contains("--no-block")
+                    && op.contains("b-ui"))),
+            "SELF handoff missing: {ops:?}"
+        );
+        for unit in [
+            "hysteria-residential",
+            "b-ui-relay",
+            "hysteria-server",
+            "xray",
+        ] {
+            assert!(
+                !ops.iter().any(|op| ["start", "restart", "reload"]
+                    .iter()
+                    .any(|action| op == &format!("systemd:{action}:{unit}"))),
+                "premature consumer activation: {ops:?}"
+            );
+        }
+        let runtime = crate::state::runtime::Runtime::load(crate::paths::runtime_file(&paths))
+            .read()
+            .await;
+        assert!(!runtime
+            .restart_keys
+            .keys()
+            .any(|key| key.contains("hy2-residential")));
     }
 
     /// 一次性管理员密码只有装机最后一屏这一次机会：`Store::create` 之后的失败（这里用

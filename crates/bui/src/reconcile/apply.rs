@@ -32,8 +32,17 @@ pub trait BinaryInstaller: Send + Sync {
     ) -> anyhow::Result<()>;
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum RelayApplyOutcome {
+    #[default]
+    Unchanged,
+    Activated,
+    Held,
+}
+
 #[derive(Debug, Default, PartialEq)]
 pub struct ApplyOutcome {
+    pub residential: Option<crate::residential_lifecycle::Deferred>,
     pub changed: Vec<String>,
     pub restarted: Vec<String>,
     pub notes: Vec<String>,
@@ -44,11 +53,13 @@ pub struct ApplyOutcome {
     /// 永远成立 = 每次改 `clients` 都重启 xray（spec §3.3 失效），乱搬 = 该重启时不重启。
     pub keys: BTreeMap<String, String>,
     pub relay_restarted: bool,
+    pub relay: RelayApplyOutcome,
     /// `b-ui.service` 自身需要重启；apply **绝不**自己动它（第 12 步），由调用方处理
     pub self_restart_required: bool,
 }
 
 pub struct ApplyInput<'a> {
+    pub legacy_residential_cleanup: bool,
     pub plan: Plan,
     pub paths: &'a Paths,
     pub facts: &'a Facts,
@@ -72,6 +83,7 @@ struct Restore {
 
 pub fn apply(input: ApplyInput<'_>, host: &dyn Host) -> ApplyOutcome {
     let ApplyInput {
+        legacy_residential_cleanup,
         plan,
         paths,
         facts,
@@ -79,7 +91,7 @@ pub fn apply(input: ApplyInput<'_>, host: &dyn Host) -> ApplyOutcome {
         dry_run,
     } = input;
     let Plan {
-        changes,
+        mut changes,
         keys: candidate_keys,
         ..
     } = plan;
@@ -93,6 +105,36 @@ pub fn apply(input: ApplyInput<'_>, host: &dyn Host) -> ApplyOutcome {
     }
 
     let mut out = ApplyOutcome::default();
+    // Residential publication and activation belong to the async owner, including
+    // the shared sing-box replacement. This synchronous boundary never activates it.
+    let mut residential = Vec::new();
+    changes.retain(|change| {
+        if crate::residential_lifecycle::is_residential_change(change, paths) {
+            residential.push(change.clone());
+            false
+        } else {
+            true
+        }
+    });
+    if residential
+        .iter()
+        .any(|c| matches!(c, Change::ApplyNftTable { .. }))
+        && !host.which("nft")
+    {
+        out.notes.push("PATH 上没有 nft，住宅 HY2 全体现役订阅的端口跳跃无法确认；请安装 nftables，owner 将保持未确认状态".into());
+    }
+    if !residential.is_empty() {
+        out.residential = Some(crate::residential_lifecycle::Deferred {
+            changes: residential,
+            keys: candidate_keys
+                .iter()
+                .filter(|(key, _)| {
+                    key.contains("hy2-residential.json") || key.as_str() == "nft:inet:bui"
+                })
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        });
+    }
     // 待重启/重载的单元集合（按 (name, action) 去重、按 name 排序）
     let mut restart: BTreeSet<Unit> = BTreeSet::new();
     // 单元名 → 本轮为它写过的文件（重启失败时按这份回滚）
@@ -347,10 +389,12 @@ pub fn apply(input: ApplyInput<'_>, host: &dyn Host) -> ApplyOutcome {
     // （不删表）→ 再升 4.1 时哈希与表都没变 ⇒ 不产变更，挂在变更上就一次清理都不跑，
     // 被 SIGKILL 的 4.0 槽实例的孤儿规则会带进 4.1。配置不在盘上时它是 no-op，
     // 所以对「二次对账零变更」没有影响。
-    out.notes
-        .extend(crate::modules::portjump::cleanup_legacy_residential(
-            host, paths,
-        ));
+    if legacy_residential_cleanup {
+        out.notes
+            .extend(crate::modules::portjump::cleanup_legacy_residential(
+                host, paths,
+            ));
+    }
     for c in &changes {
         let Change::ApplyNftTable {
             family,
@@ -424,6 +468,15 @@ pub fn apply(input: ApplyInput<'_>, host: &dyn Host) -> ApplyOutcome {
         out.changed.push((*unit).clone());
     }
     for (unit, enabled, active) in &unit_states {
+        if unit.as_str() == SELF_UNIT {
+            if *enabled {
+                let _ = host.systemd("enable", unit);
+            }
+            if *active {
+                out.self_restart_required = true;
+            }
+            continue;
+        }
         if !*enabled {
             let _ = host.systemd("disable", unit);
         }
@@ -432,12 +485,25 @@ pub fn apply(input: ApplyInput<'_>, host: &dyn Host) -> ApplyOutcome {
         }
     }
     for (unit, enabled, active) in &unit_states {
+        if unit.as_str() == SELF_UNIT {
+            continue;
+        }
         if *enabled {
             let _ = host.systemd("enable", unit);
         }
         // 本轮要 restart 的单元不再额外 start：首装时那会变成「start 紧跟 restart」的双启动
         if *active && !restart.iter().any(|u| u.name.as_str() == unit.as_str()) {
-            let _ = host.systemd("start", unit);
+            if unit.as_str() == "b-ui-relay" {
+                if host.systemd("start", unit).is_ok_and(|o| o.ok())
+                    && host.unit_is_active(unit).unwrap_or(false)
+                {
+                    record_restarted(&mut out, unit);
+                } else {
+                    out.relay = RelayApplyOutcome::Held;
+                }
+            } else {
+                let _ = host.systemd("start", unit);
+            }
         }
     }
 
@@ -550,6 +616,9 @@ pub fn apply(input: ApplyInput<'_>, host: &dyn Host) -> ApplyOutcome {
             }
             continue;
         }
+        if unit.name == "b-ui-relay" {
+            out.relay = RelayApplyOutcome::Held;
+        }
         // 回滚该单元本轮写过的文件，再启一次
         let mut restored_a_unit_file = false;
         if let Some(items) = restores.get(&unit.name) {
@@ -581,6 +650,12 @@ pub fn apply(input: ApplyInput<'_>, host: &dyn Host) -> ApplyOutcome {
             ));
         }
     }
+    if held.contains_key("b-ui-relay") {
+        out.relay = RelayApplyOutcome::Held;
+    } else if out.relay != RelayApplyOutcome::Held && out.relay_restarted {
+        out.relay = RelayApplyOutcome::Activated;
+    }
+
     out
 }
 
@@ -862,6 +937,7 @@ mod tests {
         let paths = Paths::default_server();
         apply(
             ApplyInput {
+                legacy_residential_cleanup: true,
                 plan,
                 paths: &paths,
                 facts: &facts(),
@@ -870,6 +946,64 @@ mod tests {
             },
             host,
         )
+    }
+
+    #[test]
+    fn residential_start_and_self_start_wait_for_owned_completion() {
+        let h = FakeHost::new();
+        run(
+            Plan {
+                changes: ["hysteria-residential", "b-ui"]
+                    .into_iter()
+                    .map(|unit| Change::SetUnitState {
+                        unit: unit.into(),
+                        enabled: true,
+                        active: true,
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+            &h,
+            &NoopInstaller,
+        );
+        assert!(
+            !h.ops()
+                .iter()
+                .any(|o| o == "systemd:start:hysteria-residential" || o == "systemd:start:b-ui"),
+            "synchronous apply must hand off activation: {:?}",
+            h.ops()
+        );
+    }
+
+    #[test]
+    fn residential_candidate_keys_wait_for_the_gate_barrier() {
+        let h = FakeHost::new();
+        let path = PathBuf::from("/opt/b-ui/hy2-residential.json");
+        let out = run(
+            Plan {
+                changes: vec![Change::WriteFile {
+                    path: path.clone(),
+                    content: b"{}".to_vec(),
+                    mode: 0o600,
+                    verify: None,
+                    restart: Some(Unit::restart("hysteria-residential")),
+                }],
+                keys: [(
+                    "file:/opt/b-ui/hy2-residential.json".into(),
+                    "candidate".into(),
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            },
+            &h,
+            &NoopInstaller,
+        );
+        assert!(
+            out.keys.is_empty(),
+            "no gate barrier ran, so candidate must not be confirmed: {:?}",
+            out.keys
+        );
     }
 
     /// 4.1：一个 `nft -f -` 事务把整份规则集喂进去（**不进 argv**），成功后才搬
@@ -898,24 +1032,22 @@ mod tests {
             &NoopInstaller,
         );
         assert!(out.errors.is_empty(), "{:?}", out.errors);
-        assert_eq!(out.changed, vec!["nft table inet bui".to_string()]);
+        assert!(out.changed.is_empty());
+        assert!(
+            out.keys.is_empty(),
+            "sync boundary must not acknowledge nft"
+        );
+        let deferred = out.residential.unwrap();
         assert_eq!(
-            out.keys.get("nft:inet:bui").map(String::as_str),
+            deferred.keys.get("nft:inet:bui").map(String::as_str),
             Some("abc123")
         );
-        assert_eq!(
-            h.stdins(),
-            vec![("nft -f -".to_string(), ruleset.to_string())],
-            "规则集经 stdin 喂进去，一个事务一次调用"
+        assert!(
+            matches!(&deferred.changes[0], Change::ApplyNftTable {ruleset:body,..} if body==ruleset)
         );
         assert!(
-            h.ops()
-                .iter()
-                .filter(|o| o.starts_with("run:nft -f"))
-                .count()
-                == 1,
-            "{:?}",
-            h.ops()
+            h.stdins().is_empty(),
+            "owner alone publishes the selected topology"
         );
     }
 
@@ -949,8 +1081,12 @@ mod tests {
         );
         assert_eq!(out.changed, Vec::<String>::new());
         assert!(out.keys.is_empty(), "{:?}", out.keys);
-        assert_eq!(out.errors.len(), 1, "{:?}", out.errors);
-        assert!(out.errors[0].contains("Chain of type"), "{:?}", out.errors);
+        assert!(out.errors.is_empty());
+        assert!(
+            out.residential.is_some(),
+            "transaction failure is observed by the async owner"
+        );
+        assert!(h.stdins().is_empty());
     }
 
     /// 缺 `nft`：**不算 apply 失败**（装包不是对账能决定的），但提示必须报出真实量级 ——
@@ -1032,15 +1168,16 @@ mod tests {
         );
         assert!(out.errors.is_empty(), "{:?}", out.errors);
         let ops = h.ops();
-        let x = ops
-            .iter()
-            .position(|o| o == "run:iptables -t nat -X HYSTERIA-PR-7c1e0f2a")
-            .unwrap_or_else(|| panic!("没清掉槽 1 的孤儿链：{ops:?}"));
-        let land = ops
-            .iter()
-            .position(|o| o == "run:nft -f -")
-            .unwrap_or_else(|| panic!("没落地 nft 表：{ops:?}"));
-        assert!(x < land, "清理必须发生在 nft -f 之前：{ops:?}");
+        assert!(
+            ops.iter()
+                .any(|o| o == "run:iptables -t nat -X HYSTERIA-PR-7c1e0f2a"),
+            "old orphan cleanup is retained"
+        );
+        assert!(!ops.iter().any(|o| o == "run:nft -f -"));
+        assert!(
+            out.residential.is_some(),
+            "table is handed to owner after cleanup"
+        );
         assert!(
             out.notes
                 .iter()
@@ -1133,7 +1270,7 @@ mod tests {
 
     /// 同一映射的端到端形态：一轮对账里换了 sing-box，住宅单元要真的被重启。
     #[test]
-    fn installing_singbox_restarts_the_residential_unit_in_the_same_round() {
+    fn shared_singbox_installation_is_deferred_with_both_consumers() {
         let h = FakeHost::new();
         let out = run(
             Plan {
@@ -1151,27 +1288,17 @@ mod tests {
             &NoopInstaller,
         );
         assert!(out.errors.is_empty(), "{:?}", out.errors);
-        let ops = h.ops();
+        assert_eq!(out.residential.as_ref().unwrap().changes.len(), 1);
+        assert!(out.restarted.is_empty());
         assert!(
-            ops.iter()
-                .any(|o| o == "systemd:restart:hysteria-residential"),
-            "{ops:?}"
-        );
-        assert!(
-            ops.iter().any(|o| o == "systemd:restart:b-ui-relay"),
-            "{ops:?}"
+            h.ops().is_empty(),
+            "shared binary publication belongs to the owner"
         );
     }
 
-    /// 2026-09-16 裁决 P-B：内核二进制先于带 `Verify` 的文件 —— 校验必须用**将要运行该配置的
-    /// 那个二进制**。
-    ///
-    /// 这个假机器复刻 4.1 首轮对账：盘上是官方 sing-box（`check` 拒掉带 `v2ray_api` 的配置），
-    /// 装上自建那一份之后同一条命令才通过。顺序反了的话（写文件在前）校验必然 FATAL，
-    /// 配置永不落盘、住宅单元被 P-C 搁置 —— 加上「同轮已删旧配置」就是永久崩溃循环。
     #[test]
     fn kernel_binaries_are_installed_before_the_configs_they_verify() {
-        /// 真写 FakeHost 的 installer：装完才让 `sing-box check` 成功。
+        /// 真写 FakeHost 的 installer：装完才让 `xray run -test` 成功。
         struct SeedingInstaller<'a>(&'a FakeHost);
         impl BinaryInstaller for SeedingInstaller<'_> {
             fn install(
@@ -1191,35 +1318,35 @@ mod tests {
         let h = FakeHost::new();
         h.with(|i| {
             i.files.insert(
-                "/opt/b-ui/bin/sing-box".into(),
+                "/opt/b-ui/bin/xray".into(),
                 (b"SB-official".to_vec(), 0o755),
             );
             i.scripted.push((
-                "/opt/b-ui/bin/sing-box check".into(),
+                "/opt/b-ui/bin/xray run -test".into(),
                 CmdOut::failure(1, "FATAL v2ray api is not included in this build"),
             ));
         });
-        let unit_path = "/etc/systemd/system/hysteria-residential.service";
+        let unit_path = "/etc/systemd/system/xray.service";
         let plan = Plan {
             changes: vec![
                 Change::WriteFile {
-                    path: "/opt/b-ui/hy2-residential.json".into(),
+                    path: "/opt/b-ui/xray-config.json".into(),
                     content: b"{}".to_vec(),
                     mode: 0o600,
-                    verify: Some(Verify::SingBox),
-                    restart: Some(Unit::restart("hysteria-residential")),
+                    verify: Some(Verify::Xray),
+                    restart: Some(Unit::restart("xray")),
                 },
                 Change::WriteUnit {
                     path: unit_path.into(),
-                    content: "[Service]\nExecStart=/opt/b-ui/bin/sing-box run\n".into(),
-                    unit: Unit::restart("hysteria-residential"),
+                    content: "[Service]\nExecStart=/opt/b-ui/bin/xray run\n".into(),
+                    unit: Unit::restart("xray"),
                 },
                 Change::InstallBinary {
-                    name: "sing-box".into(),
+                    name: "xray".into(),
                     version: "1.14.1".into(),
                     sha256: "aa".into(),
-                    url: "https://example.com/sing-box".into(),
-                    path: "/opt/b-ui/bin/sing-box".into(),
+                    url: "https://example.com/xray".into(),
+                    path: "/opt/b-ui/bin/xray".into(),
                 },
             ],
             keys: Default::default(),
@@ -1233,22 +1360,19 @@ mod tests {
                 .unwrap_or_else(|| panic!("{needle} 没出现在 {ops:?}"))
         };
         assert!(
-            pos("write:/opt/b-ui/bin/sing-box") < pos("run:/opt/b-ui/bin/sing-box check"),
+            pos("write:/opt/b-ui/bin/xray") < pos("run:/opt/b-ui/bin/xray run -test"),
             "先装二进制，再拿它校验：{ops:?}"
         );
         assert!(out.verify_failures.is_empty(), "{:?}", out.verify_failures);
         assert!(out.errors.is_empty(), "{:?}", out.errors);
         assert_eq!(
-            h.text("/opt/b-ui/hy2-residential.json").as_deref(),
+            h.text("/opt/b-ui/xray-config.json").as_deref(),
             Some("{}"),
             "校验过了就该落盘"
         );
         assert!(h.text(unit_path).is_some(), "配置落了盘，单元文件照换");
         assert_eq!(
-            out.restarted
-                .iter()
-                .filter(|u| *u == "hysteria-residential")
-                .count(),
+            out.restarted.iter().filter(|u| *u == "xray").count(),
             1,
             "住宅单元恰重启一次：{:?}",
             out.restarted
@@ -1441,20 +1565,20 @@ mod tests {
                 CmdOut::failure(1, "FATAL v2ray api is not included in this build"),
             ));
         });
-        let unit_path = "/etc/systemd/system/hysteria-residential.service";
+        let unit_path = "/etc/systemd/system/b-ui-relay.service";
         let plan = Plan {
             changes: vec![
                 Change::WriteFile {
-                    path: "/opt/b-ui/hy2-residential.json".into(),
+                    path: "/opt/b-ui/singbox-relay.json".into(),
                     content: b"{}".to_vec(),
                     mode: 0o600,
                     verify: Some(Verify::SingBox),
-                    restart: Some(Unit::restart("hysteria-residential")),
+                    restart: Some(Unit::restart("b-ui-relay")),
                 },
                 Change::WriteUnit {
                     path: unit_path.into(),
                     content: "[Service]\nExecStart=/opt/b-ui/bin/sing-box run\n".into(),
-                    unit: Unit::restart("hysteria-residential"),
+                    unit: Unit::restart("b-ui-relay"),
                 },
             ],
             keys: Default::default(),
@@ -1462,7 +1586,7 @@ mod tests {
         };
         let out = run(plan, &h, &NoopInstaller);
         assert!(
-            h.text("/opt/b-ui/hy2-residential.json").is_none(),
+            h.text("/opt/b-ui/singbox-relay.json").is_none(),
             "校验失败不写盘"
         );
         assert!(h.text(unit_path).is_none(), "配置没落地，单元文件一并搁置");
@@ -1474,12 +1598,12 @@ mod tests {
         // 单元文件那一条搁置 note；重启那一条由下一个用例（`InstallBinary` 塞进来的重启）覆盖。
         assert_eq!(
             out.notes,
-            vec!["hysteria-residential 的配置未通过校验，单元文件本轮一并搁置".to_string()]
+            vec!["b-ui-relay 的配置未通过校验，单元文件本轮一并搁置".to_string()]
         );
         assert!(
             !h.ops()
                 .iter()
-                .any(|o| o.contains("hysteria-residential") || o == "daemon-reload"),
+                .any(|o| o.contains("b-ui-relay") || o == "daemon-reload"),
             "{:?}",
             h.ops()
         );
@@ -1492,34 +1616,34 @@ mod tests {
         let h = FakeHost::new();
         h.with(|i| {
             i.files
-                .insert("/opt/b-ui/bin/sing-box".into(), (b"ELF".to_vec(), 0o755));
+                .insert("/opt/b-ui/bin/xray".into(), (b"ELF".to_vec(), 0o755));
             i.scripted.push((
-                "/opt/b-ui/bin/sing-box check".into(),
+                "/opt/b-ui/bin/xray run -test".into(),
                 CmdOut::failure(1, "FATAL bad inbound"),
             ));
         });
         let plan = Plan {
             changes: vec![
                 Change::WriteFile {
-                    path: "/opt/b-ui/hy2-residential.json".into(),
+                    path: "/opt/b-ui/xray-config.json".into(),
                     content: b"{}".to_vec(),
                     mode: 0o600,
-                    verify: Some(Verify::SingBox),
-                    restart: Some(Unit::restart("hysteria-residential")),
+                    verify: Some(Verify::Xray),
+                    restart: Some(Unit::restart("xray")),
                 },
                 Change::WriteFile {
                     path: "/opt/b-ui/other.json".into(),
                     content: b"{}".to_vec(),
                     mode: 0o600,
                     verify: None,
-                    restart: Some(Unit::restart("hysteria-residential")),
+                    restart: Some(Unit::restart("xray")),
                 },
                 Change::InstallBinary {
-                    name: "sing-box".into(),
+                    name: "xray".into(),
                     version: "1.14.1".into(),
                     sha256: "aa".into(),
                     url: "https://x/sb".into(),
-                    path: "/opt/b-ui/bin/sing-box".into(),
+                    path: "/opt/b-ui/bin/xray".into(),
                 },
             ],
             keys: Default::default(),
@@ -1533,13 +1657,13 @@ mod tests {
         );
         assert_eq!(
             out.restarted,
-            vec!["b-ui-relay".to_string()],
-            "换了 sing-box 该重启的中继照重启，住宅单元被搁置"
+            Vec::<String>::new(),
+            "换了 xray 该重启的中继照重启，住宅单元被搁置"
         );
         assert!(out
             .notes
             .iter()
-            .any(|n| n == "hysteria-residential 的配置未通过校验，重启本轮一并搁置"));
+            .any(|n| n == "xray 的配置未通过校验，重启本轮一并搁置"));
     }
 
     /// 搁置的另一半理由：**写盘失败**（盘满 / 只读挂载）。校验失败那一半有上面两个用例钉着，
@@ -1549,8 +1673,8 @@ mod tests {
     /// 配置」+ `Restart=always` = 永久崩溃循环）。
     #[test]
     fn a_failed_config_write_also_holds_the_unit_file_and_the_restart() {
-        let cfg = "/opt/b-ui/hy2-residential.json";
-        let unit_path = "/etc/systemd/system/hysteria-residential.service";
+        let cfg = "/opt/b-ui/singbox-relay.json";
+        let unit_path = "/etc/systemd/system/b-ui-relay.service";
         let h = FakeHost::new();
         h.with(|i| {
             i.fail_writes.insert(cfg.into());
@@ -1563,12 +1687,12 @@ mod tests {
                     mode: 0o600,
                     // 校验不是这条路径的前提：`verify: None` 也照样会写失败
                     verify: None,
-                    restart: Some(Unit::restart("hysteria-residential")),
+                    restart: Some(Unit::restart("b-ui-relay")),
                 },
                 Change::WriteUnit {
                     path: unit_path.into(),
                     content: "[Service]\nExecStart=/opt/b-ui/bin/sing-box run\n".into(),
-                    unit: Unit::restart("hysteria-residential"),
+                    unit: Unit::restart("b-ui-relay"),
                 },
             ],
             keys: Default::default(),
@@ -1583,12 +1707,12 @@ mod tests {
         assert_eq!(out.changed, Vec::<String>::new());
         assert_eq!(
             out.notes,
-            vec!["hysteria-residential 的配置写入失败，单元文件本轮一并搁置".to_string()]
+            vec!["b-ui-relay 的配置写入失败，单元文件本轮一并搁置".to_string()]
         );
         assert!(
             !h.ops()
                 .iter()
-                .any(|o| o.contains("hysteria-residential") || o == "daemon-reload"),
+                .any(|o| o.contains("b-ui-relay") || o == "daemon-reload"),
             "{:?}",
             h.ops()
         );
@@ -1959,11 +2083,11 @@ mod tests {
         let h = FakeHost::new();
         let plan = Plan {
             changes: vec![Change::InstallBinary {
-                name: "sing-box".into(),
+                name: "xray".into(),
                 version: "1.13.19".into(),
                 sha256: "bb".into(),
                 url: "https://x/z".into(),
-                path: "/opt/b-ui/bin/sing-box".into(),
+                path: "/opt/b-ui/bin/xray".into(),
             }],
             keys: Default::default(),
             unchanged: 0,
@@ -2012,6 +2136,7 @@ mod tests {
         };
         let out = apply(
             ApplyInput {
+                legacy_residential_cleanup: true,
                 plan,
                 paths: &paths,
                 facts: &f,
@@ -2113,6 +2238,7 @@ mod tests {
         };
         let out = apply(
             ApplyInput {
+                legacy_residential_cleanup: true,
                 plan,
                 paths: &paths,
                 facts: &facts(),

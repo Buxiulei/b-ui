@@ -25,6 +25,8 @@ pub struct FakeInner {
     pub units_active: BTreeSet<String>,
     pub units_enabled: BTreeSet<String>,
     pub units_exist: BTreeSet<String>,
+    pub strict_units: BTreeSet<String>,
+    pub failed_units: BTreeSet<String>,
     /// 键是 `(单元**全名**, 属性名)`，如 `("hysteria-server.service", "NRestarts")`
     pub unit_props: BTreeMap<(String, String), String>,
     pub sysctl: BTreeMap<String, String>,
@@ -51,6 +53,7 @@ pub struct FakeInner {
     /// 容错分支（`commands::upgrade::rollback`）：`nft::delete` 对「没有 nft 二进制」与
     /// 「表本来不在」都返回 `Ok(note)`，只有 `host.run` 自己失败才返回 `Err`。
     pub fail_runs: BTreeSet<String>,
+    pub rejected_check_contents: BTreeSet<Vec<u8>>,
     /// 令某单元**永远不 active**：`systemctl start/restart` 照样退 0，单元却起不来
     /// （203/EXEC、start-limit-hit 的真实形态）。裸名与全名两种键各查一次。
     pub never_active: BTreeSet<String>,
@@ -60,6 +63,13 @@ pub struct FakeInner {
     /// 这个钩子就是把那段差值复现出来（对照 [`crate::modules::residential::clash::FakeClashInner::advance_on_select`]）。
     pub advance_on_systemd: i64,
     pub listening: BTreeMap<Proto, BTreeSet<u16>>,
+    pub fail_listening: BTreeSet<Proto>,
+    /// Explicit opt-in process fixtures; absent entries remain unknown.
+    pub instances: BTreeMap<String, u64>,
+    pub start_listeners: BTreeMap<String, (Proto, u16)>,
+    pub stock_singbox: bool,
+    /// Explicit kernel table fixture: successful nft transactions replace it.
+    pub nft_table: Option<String>,
     pub mem_mb: u64,
     pub arch: String,
     pub hostname: String,
@@ -102,6 +112,8 @@ impl Default for FakeInner {
             units_active: BTreeSet::new(),
             units_enabled: BTreeSet::new(),
             units_exist: BTreeSet::new(),
+            strict_units: BTreeSet::new(),
+            failed_units: BTreeSet::new(),
             unit_props: BTreeMap::new(),
             sysctl: BTreeMap::new(),
             sysctl_clamp: BTreeMap::new(),
@@ -112,9 +124,15 @@ impl Default for FakeInner {
             fail_unit_actions_once: BTreeSet::new(),
             fail_writes: BTreeSet::new(),
             fail_runs: BTreeSet::new(),
+            rejected_check_contents: BTreeSet::new(),
             never_active: BTreeSet::new(),
             advance_on_systemd: 0,
             listening: BTreeMap::new(),
+            fail_listening: BTreeSet::new(),
+            instances: BTreeMap::new(),
+            start_listeners: BTreeMap::new(),
+            stock_singbox: false,
+            nft_table: None,
             mem_mb: 2048,
             arch: "x86_64".into(),
             hostname: "node-a".into(),
@@ -258,6 +276,42 @@ impl Host for FakeHost {
         Ok(())
     }
 
+    fn set_file_mode(&self, path: &Path, mode: u32) -> Result<()> {
+        let mut i = self.lock();
+        i.files
+            .get_mut(path)
+            .ok_or_else(|| anyhow::anyhow!("missing chmod target"))?
+            .1 = mode;
+        i.ops.push(format!("chmod:{}:{mode:03o}", path.display()));
+        Ok(())
+    }
+
+    fn sync_parent(&self, path: &Path) -> Result<()> {
+        let mut i = self.lock();
+        i.ops.push(format!("sync_parent:{}", path.display()));
+        anyhow::ensure!(
+            !i.fail_writes.contains(path),
+            "parent durability unavailable"
+        );
+        Ok(())
+    }
+
+    fn rename_file(&self, from: &Path, to: &Path) -> Result<()> {
+        let mut i = self.lock();
+        anyhow::ensure!(
+            !i.fail_writes.contains(to),
+            "rename destination unavailable"
+        );
+        let file = i
+            .files
+            .remove(from)
+            .ok_or_else(|| anyhow::anyhow!("missing rename source {}", from.display()))?;
+        i.files.insert(to.to_path_buf(), file);
+        i.ops
+            .push(format!("rename:{}:{}", from.display(), to.display()));
+        Ok(())
+    }
+
     fn stage_file<'a>(&'a self, dest: &Path, mode: u32) -> Result<Box<dyn StagedWrite + 'a>> {
         self.lock().staged.push(dest.to_path_buf());
         Ok(Box::new(FakeStaged {
@@ -364,6 +418,43 @@ impl Host for FakeHost {
                 return Ok(out.clone());
             }
         }
+        if line == "nft list table inet bui" {
+            if let Some(table) = &i.nft_table {
+                return Ok(CmdOut::success(table));
+            }
+        }
+        if args.first() == Some(&"check") {
+            if let Some(path) = args
+                .windows(2)
+                .find(|pair| pair[0] == "-c")
+                .map(|pair| Path::new(pair[1]))
+            {
+                if i.files
+                    .get(path)
+                    .is_some_and(|(bytes, _)| i.rejected_check_contents.contains(bytes))
+                {
+                    return Ok(CmdOut::failure(1, "rejected fixture config"));
+                }
+            }
+        }
+        if line.starts_with("systemctl show hysteria-residential.service --property=InvocationID,")
+        {
+            if let Some(generation) = i.instances.get("hysteria-residential.service") {
+                if i.failed_units.contains("hysteria-residential.service") {
+                    return Ok(CmdOut::success("LoadState=loaded\nActiveState=failed\nSubState=failed\nMainPID=0\nInvocationID=\nExecMainStartTimestampMonotonic=0\n"));
+                }
+                let active = i.units_active.contains("hysteria-residential.service");
+                return Ok(CmdOut::success(&format!("LoadState=loaded\nActiveState={}\nSubState={}\nMainPID={}\nInvocationID={:032x}\nExecMainStartTimestampMonotonic={}\n", if active {"active"} else {"inactive"}, if active {"running"} else {"dead"}, if active {100 + generation} else {0}, generation, generation)));
+            }
+        }
+        if i.stock_singbox
+            && Path::new(program)
+                .file_name()
+                .is_some_and(|n| n == "sing-box")
+            && args == ["version"]
+        {
+            return Ok(CmdOut::success("sing-box version 1.14.2\n"));
+        }
         Ok(CmdOut::success(""))
     }
 
@@ -383,6 +474,9 @@ impl Host for FakeHost {
                 return Ok(out.clone());
             }
         }
+        if line == "nft -f -" && i.nft_table.is_some() {
+            i.nft_table = Some(stdin.into());
+        }
         Ok(CmdOut::success(""))
     }
 
@@ -391,7 +485,15 @@ impl Host for FakeHost {
     }
 
     fn systemd_daemon_reload(&self) -> Result<()> {
-        self.push_op("daemon-reload".into());
+        let mut i = self.lock();
+        let units: Vec<_> = i
+            .files
+            .keys()
+            .filter(|p| p.parent() == Some(Path::new("/etc/systemd/system")))
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_owned))
+            .collect();
+        i.units_exist.extend(units);
+        i.ops.push("daemon-reload".into());
         Ok(())
     }
 
@@ -416,14 +518,28 @@ impl Host for FakeHost {
         // 语义跟真实 systemd 对齐：`disable` 不停服务，`stop` 不改 enable 状态。
         match verb {
             "start" | "restart" | "reload-or-restart" => {
+                i.failed_units.remove(&full);
+                if let Some(generation) = i.instances.get_mut(&full) {
+                    *generation += 1;
+                }
+                if let Some((proto, port)) = i.start_listeners.get(&full).copied() {
+                    i.listening.entry(proto).or_default().insert(port);
+                }
                 if !(i.never_active.contains(&full) || i.never_active.contains(&bare)) {
                     i.units_active.insert(full);
                 }
             }
             "stop" => {
+                i.failed_units.remove(&full);
                 i.units_active.remove(&full);
             }
             "enable" => {
+                if i.strict_units.contains(&full) && !i.units_exist.contains(&full) {
+                    return Ok(CmdOut::failure(
+                        1,
+                        "Unit does not exist or daemon-reload has not loaded it",
+                    ));
+                }
                 i.units_enabled.insert(full);
             }
             "disable" => {
@@ -496,6 +612,10 @@ impl Host for FakeHost {
     }
 
     fn listening_ports(&self, proto: Proto) -> Result<BTreeSet<u16>> {
+        anyhow::ensure!(
+            !self.lock().fail_listening.contains(&proto),
+            "listener probe unavailable"
+        );
         Ok(self
             .lock()
             .listening

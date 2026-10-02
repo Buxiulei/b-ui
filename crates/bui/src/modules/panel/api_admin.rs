@@ -97,7 +97,14 @@ async fn finish_cred_swap(
     new_cred: Option<&str>,
 ) {
     if let Some(old) = old_cred {
-        super::gates::put_gate(shared, old, bui_schema::render::hy2_singbox::DENY_TAG).await;
+        super::gates::put_gate(
+            &app.store,
+            shared,
+            app.host.as_ref(),
+            old,
+            bui_schema::render::hy2_singbox::DENY_TAG,
+        )
+        .await;
     }
     if let Some(new) = new_cred {
         let tag = {
@@ -110,7 +117,7 @@ async fn finish_cred_swap(
             })
         };
         if let Some(tag) = tag {
-            super::gates::put_gate(shared, new, &tag).await;
+            super::gates::put_gate(&app.store, shared, app.host.as_ref(), new, &tag).await;
         }
     }
     // 该有凭据却没拿到（id 域用尽）⇒ Error 级事件（spec §3.1）
@@ -516,7 +523,14 @@ async fn delete_user(
         return fail(StatusCode::NOT_FOUND, "User not found");
     }
     if let Some(id) = freed.as_deref() {
-        super::gates::put_gate(&shared, id, bui_schema::render::hy2_singbox::DENY_TAG).await;
+        super::gates::put_gate(
+            &app.store,
+            &shared,
+            app.host.as_ref(),
+            id,
+            bui_schema::render::hy2_singbox::DENY_TAG,
+        )
+        .await;
     }
     // 他那条 `resi-u-<user_id>` 槽规则要删掉（D7），置脏交给对账末尾收敛
     crate::modules::residential::slots::mark_xray_rules_dirty(&app.runtime).await;
@@ -571,7 +585,7 @@ async fn kick(State(app): State<AppState>, shared: Arc<Shared>, body: Bytes) -> 
             all_ok = false;
         }
     }
-    super::traffic::kick_residential(&shared, &targets).await;
+    super::traffic::kick_residential(&app.store, app.host.as_ref(), &shared, &targets).await;
     ok_json(json!({"success": all_ok, "kicked": ids.len()}))
 }
 

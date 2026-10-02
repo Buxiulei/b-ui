@@ -126,32 +126,80 @@ pub fn parse_connections(body: &str) -> Vec<Hy2ResiConn> {
         .collect()
 }
 
-/// `GET /proxies` 的响应体 → **门位** tag → 当前成员（`now`）。
-///
-/// 只有出站组才有 `now`（`experimental/clashapi/proxies.go` 的 `proxyInfo`），
-/// 非组出站（`deny`、各槽 socks）没有这个键 ⇒ 不进表。
-///
-/// 除此之外还要按 `gate-` 前缀筛一道：sing-box 为了让 clash dashboard 能用，在
-/// `getProxies` 里**无条件**多塞一个伪组 `GLOBAL`（`now = route.final`，对我们就是
-/// `"deny"`），它不是 Selector，`PUT` 过去会被回 400 "Must be a Selector"。生产上必然有
-/// 这一项而 `FakeHy2Resi` 的表里永远没有，不筛掉就是一处 fake / 生产不对等：任何
-/// 「遍历读回来的键去收敛 / 投影 / 自检」的写法都会在测试里全绿、在生产上对 `GLOBAL`
-/// 动手。前缀取自渲染器的 [`gate_tag`]，门位的唯一形态由它决定。
-pub fn parse_proxies_now(body: &str) -> BTreeMap<String, String> {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
-        return BTreeMap::new();
-    };
-    let Some(obj) = v.get("proxies").and_then(|p| p.as_object()) else {
-        return BTreeMap::new();
-    };
-    let prefix = gate_tag("");
-    obj.iter()
-        .filter(|(tag, _)| tag.starts_with(&prefix))
-        .filter_map(|(tag, info)| {
-            let now = info.get("now")?.as_str()?;
-            Some((tag.clone(), now.to_string()))
-        })
-        .collect()
+/// Typed stock Clash selector inventory; invalid gates never become an empty success.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateSelector {
+    pub kind: String,
+    pub now: String,
+    pub all: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GateInventory {
+    pub gates: BTreeMap<String, GateSelector>,
+}
+
+impl GateInventory {
+    pub fn selected(&self) -> BTreeMap<String, String> {
+        self.gates
+            .iter()
+            .map(|(tag, gate)| (tag.clone(), gate.now.clone()))
+            .collect()
+    }
+}
+
+pub fn parse_gate_inventory(body: &str) -> anyhow::Result<GateInventory> {
+    let value: serde_json::Value = serde_json::from_str(body)?;
+    let proxies = value
+        .get("proxies")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("Clash inventory missing proxies object"))?;
+    let mut gates = BTreeMap::new();
+    for (tag, value) in proxies
+        .iter()
+        .filter(|(tag, _)| tag.starts_with(&gate_tag("")))
+    {
+        let kind = value
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("gate {tag} missing type"))?;
+        anyhow::ensure!(kind == "Selector", "gate {tag} is not a Selector");
+        let now = value
+            .get("now")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("gate {tag} missing now"))?;
+        let all = value
+            .get("all")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("gate {tag} missing all"))?
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| anyhow::anyhow!("gate {tag} invalid member"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        anyhow::ensure!(all.iter().any(|s| s == "deny"), "gate {tag} missing deny");
+        anyhow::ensure!(
+            all.iter().any(|s| s == now),
+            "gate {tag} selection is not a member"
+        );
+        anyhow::ensure!(all.iter().all(|s| !s.is_empty()), "gate {tag} empty member");
+        gates.insert(
+            tag.clone(),
+            GateSelector {
+                kind: kind.into(),
+                now: now.into(),
+                all,
+            },
+        );
+    }
+    Ok(GateInventory { gates })
+}
+
+/// Strict projection for callers needing only current selections.
+pub fn parse_proxies_now(body: &str) -> anyhow::Result<BTreeMap<String, String>> {
+    Ok(parse_gate_inventory(body)?.selected())
 }
 
 /// `QueryStatsResponse.stat` → 凭据 name → 增量。
@@ -334,8 +382,17 @@ impl Hy2ResiApi for Hy2ResiClient {
         Ok(())
     }
 
-    async fn selected_all(&self) -> anyhow::Result<BTreeMap<String, String>> {
-        Ok(parse_proxies_now(&self.clash_get("/proxies").await?))
+    async fn inventory(&self) -> anyhow::Result<GateInventory> {
+        parse_gate_inventory(&self.clash_get("/proxies").await?)
+    }
+
+    async fn version(&self) -> anyhow::Result<String> {
+        let value: serde_json::Value = serde_json::from_str(&self.clash_get("/version").await?)?;
+        Ok(value
+            .get("version")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("Clash version missing product version"))?
+            .to_owned())
     }
 
     async fn select(&self, selector: &str, tag: &str) -> anyhow::Result<()> {
@@ -370,6 +427,51 @@ impl Hy2ResiApi for Hy2ResiClient {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    // Catches accepting malformed inventories as an empty successful authorization table.
+    #[test]
+    fn inventory_rejects_unknown_shape_type_selection_and_members() {
+        for body in [
+            "not json",
+            "{}",
+            r#"{"proxies":[]}"#,
+            r#"{"proxies":{"gate-a":{"type":"Selector","all":["deny","slot-0-out"]}}}"#,
+            r#"{"proxies":{"gate-a":{"type":"Selector","now":"deny"}}}"#,
+            r#"{"proxies":{"gate-a":{"type":"Fallback","now":"deny","all":["deny"]}}}"#,
+            r#"{"proxies":{"gate-a":{"type":"Selector","now":"missing","all":["deny"]}}}"#,
+            r#"{"proxies":{"gate-a":{"type":"Selector","now":"slot-0-out","all":["slot-0-out"]}}}"#,
+        ] {
+            assert!(parse_gate_inventory(body).is_err(), "{body}");
+        }
+        let inventory=parse_gate_inventory(r#"{"proxies":{"GLOBAL":{"type":"Fallback"},"gate-a":{"type":"Selector","now":"deny","all":["deny","slot-0-out"]}}}"#).unwrap();
+        assert_eq!(inventory.gates["gate-a"].now, "deny");
+        assert_eq!(inventory.gates.len(), 1);
+    }
+
+    // Catches treating a successful version HTTP status as valid product evidence.
+    #[tokio::test]
+    async fn version_uses_the_real_http_product_body_and_rejects_bad_json() {
+        for mode in [ClashMode::Ok, ClashMode::BadVersion] {
+            let (port, _rx) = fake_clash(mode).await;
+            let c = Hy2ResiClient::with_apis(format!("127.0.0.1:{port}"), "unused");
+            if mode == ClashMode::Ok {
+                assert_eq!(c.version().await.unwrap(), "sing-box 1.14.2");
+            } else {
+                assert!(c.version().await.is_err());
+            }
+        }
+    }
+
+    // Catches the old empty-map / skipped-entry fallback accepting unknown authorization.
+    #[tokio::test]
+    async fn incomplete_gate_inventory_is_an_error() {
+        let (port, _rx) = fake_clash(ClashMode::Incomplete).await;
+        let c = Hy2ResiClient::with_apis(format!("127.0.0.1:{port}"), "unused");
+        assert!(
+            c.selected_all().await.is_err(),
+            "a gate without all must fail closed"
+        );
+    }
 
     /// `/connections` 的 rule 字段是唯一能把连接归到用户的线索（metadata 里没有 user 字段）。
     /// 形态来自真机实测：`auth_user=<凭据 name> => route(gate-<id>)` —— 下面两组分别是
@@ -625,7 +727,8 @@ mod tests {
                 "gate-r001":{"type":"Selector","now":"deny","all":["deny"]},
                 "deny":{"type":"Socks","udp":true}
             }}"#,
-        );
+        )
+        .unwrap();
         assert_eq!(now.get("gate-r000").map(String::as_str), Some("slot-0-out"));
         assert_eq!(now.get("gate-r001").map(String::as_str), Some("deny"));
         assert!(!now.contains_key("deny"), "非组出站没有 now ⇒ 不进表");
@@ -633,7 +736,7 @@ mod tests {
         // 「遍历读回来的键」的写法会在生产上对它发 PUT（它不是 Selector，回 400）
         assert!(!now.contains_key("GLOBAL"), "GLOBAL 不是门位：{now:?}");
         assert_eq!(now.len(), 2, "只有 gate- 前缀的才是门位：{now:?}");
-        assert!(parse_proxies_now("not json").is_empty());
+        assert!(parse_proxies_now("not json").is_err());
     }
 
     /// 切门失败的两种文案与 relay 那条路**逐字一致**（T13 的哨兵签名表按这两句话认）。
@@ -675,6 +778,8 @@ mod tests {
     enum ClashMode {
         /// 正常回；约定的坏 tag（`gate-bad` / 连接 `bad`）回非 2xx
         Ok,
+        Incomplete,
+        BadVersion,
         /// 一律回 500，`GET /version` 回 404（sing-box 对未知 selector 也是 404）
         AllBad,
     }
@@ -730,7 +835,7 @@ mod tests {
                     }),
                     ClashMode::Ok if req.starts_with("PUT /proxies/gate-bad") => Some(400),
                     ClashMode::Ok if req.starts_with("DELETE /connections/bad") => Some(404),
-                    ClashMode::Ok => None,
+                    ClashMode::Ok | ClashMode::Incomplete | ClashMode::BadVersion => None,
                 };
                 // 只有 GET 才有响应体，PUT / DELETE 学 sing-box 回 204（render.NoContent）
                 let body = if bad.is_some() {
@@ -738,9 +843,17 @@ mod tests {
                 } else if req.starts_with("GET /connections") {
                     r#"{"connections":[{"id":"c1","rule":"auth_user=r000 => route(gate-r000)","chains":[]}]}"#
                 } else if req.starts_with("GET /proxies") {
-                    r#"{"proxies":{"gate-r000":{"type":"Selector","now":"deny"}}}"#
+                    if mode == ClashMode::Incomplete {
+                        r#"{"proxies":{"gate-r000":{"type":"Selector","now":"deny"}}}"#
+                    } else {
+                        r#"{"proxies":{"gate-r000":{"type":"Selector","now":"deny","all":["deny","slot-0-out"]}}}"#
+                    }
                 } else if req.starts_with("GET /version") {
-                    r#"{"version":"sing-box 1.14.1","premium":true,"meta":true}"#
+                    if mode == ClashMode::BadVersion {
+                        "not JSON"
+                    } else {
+                        r#"{"version":"sing-box 1.14.2","premium":true,"meta":true}"#
+                    }
                 } else {
                     ""
                 };

@@ -132,7 +132,10 @@ fn load_state(host: &dyn Host, paths: &Paths) -> Result<State> {
     let bytes = host
         .read_file(&path)?
         .with_context(|| format!("读不到期望态 {}", path.display()))?;
-    serde_json::from_slice(&bytes).with_context(|| format!("{} 解析失败", path.display()))
+    let mut state =
+        serde_json::from_slice(&bytes).with_context(|| format!("{} 解析失败", path.display()))?;
+    crate::residential_lifecycle::project_applied(&paths.base_dir, &mut state)?;
+    Ok(state)
 }
 
 fn require_nft(host: &dyn Host) -> Result<()> {
@@ -179,6 +182,7 @@ mod tests {
         };
         let h = FakeHost::new();
         let s = crate::testutil::sample_state();
+        crate::residential_lifecycle::seed_applied_fixture(d.path(), &s, &paths);
         h.write_file(
             &crate::paths::state_file(&paths),
             &serde_json::to_vec(&s).unwrap(),
@@ -252,6 +256,7 @@ mod tests {
         let (_d, paths, h) = seeded();
         let mut s = crate::testutil::sample_state();
         s.system.hy2_resi_compat_ports = false;
+        crate::residential_lifecycle::seed_applied_fixture(&paths.base_dir, &s, &paths);
         h.write_file(
             &crate::paths::state_file(&paths),
             &serde_json::to_vec(&s).unwrap(),

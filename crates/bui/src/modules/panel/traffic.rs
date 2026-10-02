@@ -134,10 +134,17 @@ pub fn resi_kick_targets(s: &State, ids: &[Uuid], open: &BTreeSet<Uuid>) -> Vec<
 /// **回切不能省**：限额封禁那条路的人本来就该停在 `deny`，但面板「断开」按钮踢的多数是
 /// 正常用户 —— 少了这一次 PUT，他会一直断到下一次门位收敛（最长 60 秒的安全网），而
 /// spec §5.2 的判据是「未封者下一请求即通」。
-pub async fn kick_residential(shared: &Shared, targets: &[ResiKickTarget]) -> usize {
+pub async fn kick_residential(
+    store: &crate::state::store::Store,
+    host: &dyn crate::sys::Host,
+    shared: &Shared,
+    targets: &[ResiKickTarget],
+) -> usize {
     if targets.is_empty() {
         return 0;
     }
+    let _guard = shared.gate_guard().await;
+    let publication = store.publication_permit().await;
     for t in targets {
         let gate = gate_tag(&t.cred_id);
         if let Err(e) = shared.hy2resi().select(&gate, DENY_TAG).await {
@@ -145,8 +152,18 @@ pub async fn kick_residential(shared: &Shared, targets: &[ResiKickTarget]) -> us
         }
     }
     let closed = close_conns_of(shared, targets).await;
+    let pending = shared.pending().await.clone();
+    let want = super::gates::expected(
+        publication.state(),
+        &users::blocked_set(publication.state(), &pending, host.now()),
+    );
     for t in targets {
-        let Some(slot) = t.restore_to.as_deref() else {
+        let Some(slot) = t
+            .restore_to
+            .as_ref()
+            .and_then(|_| want.get(&t.cred_id))
+            .filter(|slot| slot.as_str() != DENY_TAG)
+        else {
             continue;
         };
         let gate = gate_tag(&t.cred_id);
@@ -324,13 +341,20 @@ pub async fn tick(ctx: &DaemonCtx, shared: &Shared) -> anyhow::Result<()> {
     let sample = sample_once(shared, &ports, &resi_names).await;
     let deltas = to_uuid_map(&sample.deltas);
 
-    // ① 内存累加
-    {
-        let mut pending = shared.pending().await;
-        for (id, d) in &deltas {
-            pending.entry(*id).or_default().add(*d);
+    // ① A completed reset-style sample must have an owner before the next await.
+    // The publication task retains its bytes while waiting for an activation's gate;
+    // cancellation of this sampling waiter only drops the JoinHandle, not the task.
+    let gate = shared.gate.clone();
+    let pending = shared.pending.clone();
+    let publish_deltas = deltas.clone();
+    tokio::spawn(async move {
+        let _gate = gate.lock_owned().await;
+        let mut pending = pending.lock().await;
+        for (id, delta) in publish_deltas {
+            pending.entry(id).or_default().add(delta);
         }
-    }
+    })
+    .await?;
     // ② Xray 在线窗口
     {
         let mut seen = shared.xray_seen().await;
@@ -351,23 +375,30 @@ pub async fn tick(ctx: &DaemonCtx, shared: &Shared) -> anyhow::Result<()> {
         }
     };
     if due {
-        let taken = std::mem::take(&mut *shared.pending().await);
-        if let Err(e) = ctx
-            .store
-            .update(|s| {
-                apply_sample(s, &taken, now);
-            })
-            .await
-        {
-            // 落盘失败（磁盘满、备份目录写不动…）不能把本轮取走的增量丢掉：按用户键累加回
-            // `pending`，下轮再试。`last_flush_at` 也没被推进（下面那一段在 `?` 之后），
-            // 所以下一轮仍然判「到点该落盘了」。
-            let mut pending = shared.pending().await;
-            for (id, d) in &taken {
-                pending.entry(*id).or_default().add(*d);
+        // Detached owned transaction retains gate + writer until flush/refund finishes,
+        // even when the sampling waiter is cancelled.
+        let gate = shared.gate.clone();
+        let pending = shared.pending.clone();
+        let store = ctx.store.clone();
+        tokio::spawn(async move {
+            let _gate = gate.lock_owned().await;
+            let publication = store.publication_permit().await;
+            let mut pending = pending.lock().await;
+            let taken = std::mem::take(&mut *pending);
+            let result = store
+                .update_permitted(publication, crate::state::store::CALLER_UNLABELED, |s| {
+                    apply_sample(s, &taken, now);
+                })
+                .await;
+            if let Err(error) = result {
+                for (id, d) in taken {
+                    pending.entry(id).or_default().add(d);
+                }
+                return Err(error);
             }
-            return Err(e);
-        }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
     }
 
     // ④ 限额执行与恢复（快照拒绝 + Xray 增删 + kick）
@@ -386,7 +417,7 @@ pub async fn tick(ctx: &DaemonCtx, shared: &Shared) -> anyhow::Result<()> {
             &out.newly_blocked,
             &BTreeSet::new(),
         );
-        kick_residential(shared, &targets).await;
+        kick_residential(&ctx.store, ctx.host.as_ref(), shared, &targets).await;
     }
 
     // ⑤ 刷新面板缓存
@@ -511,6 +542,83 @@ mod tests {
     async fn sample_args(h: &Harness) -> (Vec<u16>, BTreeMap<String, Uuid>) {
         let st = h.store.read().await;
         (stats_ports(st.as_ref()), resi_name_to_user(st.as_ref()))
+    }
+
+    // Catches dropping successfully reset counters when the sampling waiter is cancelled
+    // while a gate activation/commit prevents publication into pending.
+    #[tokio::test]
+    async fn cancelling_a_sample_waiting_for_gate_preserves_consumed_quota_bytes() {
+        use std::future::Future;
+
+        let h = harness().await;
+        with_pool(&h).await;
+        let id = h.store.read().await.users[0].user_id;
+        h.store
+            .update(|state| {
+                state.users[0].entitlements.traffic_limit.total_bytes = Some(10);
+            })
+            .await
+            .unwrap();
+        h.hy2.with(|inner| {
+            inner.traffic.insert(
+                9999,
+                BTreeMap::from([(id.to_string(), TxRx { tx: 10, rx: 0 })]),
+            );
+        });
+        let gate = h.shared.gate_guard().await;
+        let ctx = ctx_of(&h);
+        let worker_ctx = ctx.clone();
+        let shared = h.shared.clone();
+        let (blocked_tx, blocked_rx) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            let work = tick(&worker_ctx, &shared);
+            tokio::pin!(work);
+            let mut blocked_tx = Some(blocked_tx);
+            std::future::poll_fn(|cx| {
+                let result = work.as_mut().poll(cx);
+                if result.is_pending() {
+                    if let Some(tx) = blocked_tx.take() {
+                        tx.send(()).unwrap();
+                    }
+                }
+                result
+            })
+            .await
+        });
+        blocked_rx.await.unwrap();
+        // All fake sampling APIs are immediately ready. Counter consumption + the last
+        // Xray query proves this Pending is after the complete sample, with the gate held.
+        let mut consumed = false;
+        h.hy2
+            .with(|inner| consumed = !inner.traffic.contains_key(&9999));
+        assert!(
+            consumed,
+            "the reset-style counter must already have been consumed"
+        );
+        assert!(h.xray.calls().iter().any(|call| call == "query"));
+        assert!(h.shared.pending().await.is_empty());
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        drop(gate);
+        tick(&ctx, &h.shared).await.unwrap();
+        let pending = h
+            .shared
+            .pending()
+            .await
+            .get(&id)
+            .copied()
+            .unwrap_or_default()
+            .total();
+        let accounted = h.store.read().await.users[0].usage.total_bytes + pending;
+        assert_eq!(
+            accounted, 10,
+            "consumed bytes must survive cancellation of the waiting sampler"
+        );
+        assert_eq!(
+            h.hy2resi.selected()["gate-r000"],
+            "deny",
+            "the consumed 10-byte quota must revoke the gate"
+        );
     }
 
     #[test]
@@ -1195,13 +1303,32 @@ mod tests {
             let id = st.users[0].user_id;
             resi_kick_targets(st.as_ref(), &[id], &BTreeSet::new())
         };
-        let closed = kick_residential(&h.shared, &targets).await;
+        let closed = kick_residential(&h.store, h.host.as_ref(), &h.shared, &targets).await;
         assert_eq!(closed, 0, "一条连接都没有");
         assert_eq!(
             h.hy2resi.selected().get("gate-r000").map(String::as_str),
             Some("deny"),
             "门位必须落在 deny"
         );
+    }
+
+    // Catches replaying the old restore_to after disable, rotation, expiry or quota revoke.
+    #[tokio::test]
+    async fn kicking_a_previously_allowed_user_cannot_restore_a_revoked_grant() {
+        let h = harness().await;
+        with_pool(&h).await;
+        let targets = {
+            let state = h.store.read().await;
+            let id = state.users[0].user_id;
+            resi_kick_targets(&state, &[id], &BTreeSet::from([id]))
+        };
+        assert_eq!(targets[0].restore_to.as_deref(), Some("slot-0-out"));
+        h.store
+            .update(|state| state.users[0].disabled = true)
+            .await
+            .unwrap();
+        kick_residential(&h.store, h.host.as_ref(), &h.shared, &targets).await;
+        assert_eq!(h.hy2resi.selected()["gate-r000"], "deny");
     }
 
     /// 未封用户被踢：`deny` 掐断存量流 → 逐条 DELETE → **再切回他的槽出站**
@@ -1218,7 +1345,10 @@ mod tests {
         };
         h.hy2resi
             .set_conns(vec![("c1", "auth_user=alice => route(gate-r000)")]);
-        assert_eq!(kick_residential(&h.shared, &targets).await, 1);
+        assert_eq!(
+            kick_residential(&h.store, h.host.as_ref(), &h.shared, &targets).await,
+            1
+        );
         assert_eq!(
             h.hy2resi.calls(),
             vec![
@@ -1237,11 +1367,15 @@ mod tests {
 
         // `/connections` 挂了也要回切（早返回会让被踢的正常用户一直断到门位收敛）
         h.hy2resi.clear_calls();
-        h.hy2resi.set_selected(BTreeMap::new());
+        h.hy2resi
+            .set_selected(BTreeMap::from([("gate-r000".into(), "deny".into())]));
         h.hy2resi.with(|i| {
             i.fail_on.insert("connections".into());
         });
-        assert_eq!(kick_residential(&h.shared, &targets).await, 0);
+        assert_eq!(
+            kick_residential(&h.store, h.host.as_ref(), &h.shared, &targets).await,
+            0
+        );
         assert_eq!(
             h.hy2resi.selected().get("gate-r000").map(String::as_str),
             Some("slot-0-out"),

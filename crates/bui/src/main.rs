@@ -19,9 +19,12 @@ mod ipc;
 mod kernels;
 mod logging;
 mod modules;
+#[cfg(test)]
+mod offline_renderer_snapshot;
 mod paths;
 mod reconcile;
 mod redact;
+mod residential_lifecycle;
 mod serve;
 mod state;
 mod sys;
@@ -190,20 +193,10 @@ async fn dispatch(command: Command) -> Result<()> {
         }
         Command::AuthHook { .. } => unreachable!("auth-hook 已在 main 里提前返回"),
         Command::Hy2Prestart { config, force } => {
-            // 护栏（4.0.1）：该实例正在运行时清理会删掉它**现役**的端口跳跃规则，所以打印
-            // 一行中文并以退出码 2 结束、什么都不清（`bui upgrade` 的降级守卫同一口径）。
-            // 护栏只管**手动**调用：systemd 自己拉起（`ExecStartPre=`）时环境里有
-            // `INVOCATION_ID`，`run` 据此直接清理、一次 systemd 查询都不发（理由见
-            // `portjump` 模块文档「为什么要短路」）。环境变量在这里读、按参数传下去，
-            // 好让 `portjump::run` 保持纯函数可测（`kernels::resolve_manifest_url` 同一惯例）。
-            let spawned_by_systemd =
-                std::env::var(modules::portjump::SYSTEMD_INVOCATION_ENV).is_ok();
-            match modules::portjump::run(
-                &sys::real::RealHost::new(),
-                &config,
-                force,
-                spawned_by_systemd,
-            ) {
+            let host = sys::real::RealHost::new();
+            let paths = bui_schema::paths::Paths::default_server();
+            let invocation = commands::maintenance::Invocation::current(&host);
+            match commands::maintenance::hy2_prestart(&host, &paths, &config, force, &invocation) {
                 Err(e) if e.is::<modules::portjump::InstanceRunning>() => {
                     eprintln!("{e}");
                     std::process::exit(2);
@@ -212,15 +205,10 @@ async fn dispatch(command: Command) -> Result<()> {
             }
         }
         Command::Nft { cmd } => {
-            // 直接读 state.json + 自己跑 nft：`bui nft apply` 是住宅单元的 ExecStartPre，
-            // 那时 `b-ui.service` 可能还没起来（`commands::nft` 模块文档）。
             let host = sys::real::RealHost::new();
             let paths = bui_schema::paths::Paths::default_server();
-            let out = match cmd {
-                cli::NftCmd::Apply => commands::nft::apply(&host, &paths),
-                cli::NftCmd::Status => commands::nft::status(&host, &paths),
-                cli::NftCmd::Delete => commands::nft::delete(&host, &paths),
-            }?;
+            let invocation = commands::maintenance::Invocation::current(&host);
+            let out = commands::maintenance::nft_command(&host, &paths, cmd, &invocation)?;
             println!("{out}");
             Ok(())
         }

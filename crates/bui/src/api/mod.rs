@@ -20,6 +20,8 @@ pub fn router(state: AppState, modules: &[Arc<dyn Module>]) -> axum::Router {
     let protected = axum::Router::new()
         .route("/api/health", axum::routing::get(health::get))
         .route("/api/reconcile", axum::routing::post(system::reconcile))
+        .route("/api/upgrade", axum::routing::post(system::upgrade))
+        .route("/api/harden-ssh", axum::routing::post(system::harden_ssh))
         .route(
             "/api/services/{unit}/{action}",
             axum::routing::post(system::service_action),
@@ -743,13 +745,142 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn online_ssh_intent_waits_for_the_control_owner_and_then_applies() {
+        let (app, _dir, host, _runtime, bus) = app_with_bus().await;
+        host.write_file(
+            std::path::Path::new("/root/.ssh/authorized_keys"),
+            b"ssh-ed25519 AAAA test\n",
+            0o600,
+        )
+        .unwrap();
+        host.clear_ops();
+        let owner = bus.residential();
+        let occupied = owner.clone();
+        let (entered, seen) = tokio::sync::oneshot::channel();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let first = tokio::spawn(async move {
+            occupied
+                .execute(move |_tx| async move {
+                    entered.send(()).unwrap();
+                    wait.await?;
+                    Ok(())
+                })
+                .await
+        });
+        seen.await.unwrap();
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/api/harden-ssh")
+            .body(Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(crate::api::auth::UdsPeer { uid: 0 });
+        let mut response = tokio::spawn(async move { app.oneshot(request).await.unwrap() });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut response)
+                .await
+                .is_err()
+        );
+        assert!(
+            host.ops().is_empty(),
+            "SSH must not write across the active owner transaction"
+        );
+        release.send(()).unwrap();
+        first.await.unwrap().unwrap();
+        assert_eq!(response.await.unwrap().status(), StatusCode::OK);
+        assert!(host
+            .text(crate::modules::ssh::HARDENING_CONF)
+            .unwrap()
+            .contains("PasswordAuthentication no"));
+        assert!(host.ops().contains(&"systemd:reload:sshd".into()));
+        owner.drain().await;
+    }
+
+    #[tokio::test]
+    async fn shared_relay_manual_restart_waits_for_the_resource_owner() {
+        let (app, _dir, host, _runtime, bus) = app_with_bus().await;
+        let owner = bus.residential();
+        let occupied = owner.clone();
+        let (entered, seen) = tokio::sync::oneshot::channel();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let first = tokio::spawn(async move {
+            occupied
+                .execute(move |_tx| async move {
+                    entered.send(()).unwrap();
+                    wait.await?;
+                    Ok(())
+                })
+                .await
+        });
+        seen.await.unwrap();
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/api/services/b-ui-relay/restart")
+            .body(Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(crate::api::auth::UdsPeer { uid: 0 });
+        let mut response = tokio::spawn(async move { app.oneshot(request).await.unwrap() });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut response)
+                .await
+                .is_err()
+        );
+        assert!(
+            host.ops().is_empty(),
+            "relay must not restart across shared binary publication"
+        );
+        release.send(()).unwrap();
+        first.await.unwrap().unwrap();
+        assert_eq!(response.await.unwrap().status(), StatusCode::OK);
+        assert_eq!(
+            host.ops()
+                .iter()
+                .filter(|o| o.as_str() == "systemd:restart:b-ui-relay")
+                .count(),
+            1
+        );
+        owner.drain().await;
+    }
+
     /// 面板 / CLI 手动重启住宅入站之后必须广播 `Event::Hy2ResiRestarted`（第七波复核）：
     /// 不开 `cache_file`（spec §14 裁决 1）⇒ 重启把每个 `gate-<id>` selector 打回
     /// `default = deny`，没人重放就是全体住宅 HY2 用户被拒到下一轮 60 秒安全网。
     /// 别的单元、以及 `stop`（门跟着内核一起没了）都不广播 —— 白重放一轮是多余的 HTTP。
     #[tokio::test]
-    async fn restarting_the_residential_inbound_announces_it_for_the_gate_replay() {
-        let (app, _d, _h, _rt, bus) = app_with_bus().await;
+    async fn residential_api_returns_only_after_durable_active_confirmation() {
+        let mut state = crate::testutil::sample_state();
+        bui_schema::hy2pool::grow(&mut state.residential.hy2_pool, 32, &Default::default());
+        let (app, d, host, _rt, bus, store) = app_with_store(state).await;
+        let paths = bui_schema::paths::Paths {
+            base_dir: d.path().into(),
+            certs_dir: d.path().join("certs"),
+            bin_dir: d.path().join("bin"),
+        };
+        let current = store.read().await;
+        host.with(|i| {
+            i.which.insert("nft".into());
+            i.nft_table = Some(bui_schema::render::nft::ruleset(
+                &current.node.ports,
+                current.system.hy2_resi_compat_ports,
+            ));
+            i.instances.insert("hysteria-residential.service".into(), 1);
+            i.stock_singbox = true;
+            i.listening
+                .entry(crate::sys::Proto::Udp)
+                .or_default()
+                .insert(40000);
+        });
+        host.write_file(
+            &crate::modules::core_files::hy2_resi_config_path(&paths),
+            &crate::residential_lifecycle::config_bytes(store.read().await.as_ref(), &paths)
+                .unwrap(),
+            0o600,
+        )
+        .unwrap();
         let token = login(&app).await;
         let mut rx = bus.subscribe();
         let call = |unit: &str, action: &str| {
@@ -773,16 +904,18 @@ mod tests {
             call("hysteria-residential", "restart").await.status(),
             StatusCode::OK
         );
-        assert_eq!(rx.try_recv().ok(), Some(Event::Hy2ResiRestarted));
+        assert!(rx.try_recv().is_err());
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(d.path().join(".residential-lifecycle/record.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(receipt["phase"], "active");
+        assert_eq!(receipt["before"], receipt["after"]);
         assert_eq!(
             call("hysteria-residential", "start").await.status(),
             StatusCode::OK
         );
-        assert_eq!(
-            rx.try_recv().ok(),
-            Some(Event::Hy2ResiRestarted),
-            "`start` 之后门同样是 default = deny"
-        );
+        assert!(rx.try_recv().is_err());
         assert_eq!(
             call("hysteria-residential", "stop").await.status(),
             StatusCode::OK
