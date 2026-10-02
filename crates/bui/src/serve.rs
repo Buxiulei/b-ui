@@ -70,6 +70,7 @@ pub fn modules(manifest: Option<Manifest>) -> Registry {
 
 pub struct ReconcileInput<'a> {
     pub certificate_bootstrap: bool,
+    pub account_blocked: Option<&'a std::collections::BTreeSet<uuid::Uuid>>,
     pub state: &'a State,
     pub modules: &'a [Arc<dyn Module>],
     pub paths: &'a Paths,
@@ -92,7 +93,13 @@ pub fn reconcile_once(
     host: &dyn Host,
 ) -> anyhow::Result<ReconcileOutcome> {
     let facts = Facts::probe(host)?;
+    let mut account_blocked =
+        crate::modules::panel::users::blocked_set(input.state, &BTreeMap::new(), host.now());
+    if let Some(blocked) = input.account_blocked {
+        account_blocked.extend(blocked.iter().copied());
+    }
     let ctx = RenderCtx {
+        account_blocked,
         paths: input.paths.clone(),
         facts,
     };
@@ -204,6 +211,7 @@ pub async fn reconcile_from_ctx(
     ctx: &DaemonCtx,
     modules: &[Arc<dyn Module>],
     fetcher: Arc<dyn Fetcher>,
+    shared: Option<&Arc<crate::modules::panel::Shared>>,
     force: bool,
     dry_run: bool,
 ) -> anyhow::Result<ReconcileReport> {
@@ -211,6 +219,13 @@ pub async fn reconcile_from_ctx(
         crate::modules::residential::slots::reroll_idle_hy2_secrets(ctx).await;
     }
     let state = ctx.store.read().await;
+    let pending = match shared {
+        Some(panel) => panel.pending().await.clone(),
+        None => BTreeMap::new(),
+    };
+    let account_blocked =
+        crate::modules::panel::users::blocked_set(&state, &pending, ctx.host.now());
+    let accounting = shared.cloned();
     let keys = ctx.runtime.read().await.restart_keys;
     let (host, paths, mods) = (ctx.host.clone(), ctx.paths.clone(), modules.to_vec());
     let state2 = state.clone();
@@ -219,6 +234,7 @@ pub async fn reconcile_from_ctx(
     let (work, mut binaries) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let facts = Facts::probe(host.as_ref())?;
         let render = RenderCtx {
+            account_blocked,
             paths: paths.clone(),
             facts,
         };
@@ -312,7 +328,7 @@ pub async fn reconcile_from_ctx(
         let previous_keys=c.runtime.read().await.restart_keys;
         let relay_config=if candidate.is_some() {
             let state=c.store.read().await;
-            let render=RenderCtx{paths:c.paths.clone(),facts:Facts::probe(c.host.as_ref())?};
+            let render=RenderCtx{account_blocked: Default::default(),paths:c.paths.clone(),facts:Facts::probe(c.host.as_ref())?};
             mods.iter().flat_map(|m|m.render(&state,&render)).find_map(|a|match a {crate::reconcile::Artifact::File{path,content,..} if path==c.paths.base_dir.join("singbox-relay.json")=>Some(content), _=>None})
         } else {None};
         let mut certificate_bootstrap = false;
@@ -327,11 +343,19 @@ pub async fn reconcile_from_ctx(
         let shared_binary_changed = published.as_ref().is_some_and(|p| p.binary_changed);
         let residential_activated = published.as_ref().is_some_and(|p| matches!(p.action, crate::residential_lifecycle::Action::Start | crate::residential_lifecycle::Action::Restart));
         let (host, paths) = (c.host.clone(), c.paths.clone());
-        let current_state = c.store.read().await;
+        let publication = c.store.publication_permit().await;
+        let current_state = publication.state();
+        let pending = match accounting.as_ref() {
+            Some(panel) => panel.pending().await.clone(),
+            None => BTreeMap::new(),
+        };
+        let account_blocked = crate::modules::panel::users::blocked_set(current_state, &pending, c.host.now());
+        let current_state = current_state.clone();
         let applied = tokio::task::spawn_blocking(move || {
             let installer = PreparedInstaller { host: host.as_ref(), binaries: &binaries };
-            reconcile_once(ReconcileInput { certificate_bootstrap, state: &current_state, modules: &mods, paths: &paths, keys: &keys, installer: &installer, force, dry_run }, host.as_ref())
+            reconcile_once(ReconcileInput { certificate_bootstrap, account_blocked: Some(&account_blocked), state: &current_state, modules: &mods, paths: &paths, keys: &keys, installer: &installer, force, dry_run }, host.as_ref())
         }).await.map_err(anyhow::Error::from).and_then(|result| result);
+        drop(publication);
         let (mut report, mut keys, _, relay_outcome) = match applied {
             Ok(outcome)=>outcome,
             Err(error)=>return match published {Some(p)=>Err(tx.reject(&c,p,error).await.expect_err("rejected shared publication")),None=>Err(error)},
@@ -714,7 +738,7 @@ pub async fn run(paths: Paths, host: Arc<dyn Host>) -> anyhow::Result<()> {
         tracing::warn!(error = %e, "补随机订阅 token 失败，下次启动重试：{e}");
     }
 
-    match reconcile_from_ctx(&ctx, &mods, fetcher.clone(), false, false).await {
+    match reconcile_from_ctx(&ctx, &mods, fetcher.clone(), Some(&panel), false, false).await {
         Ok(r) => {
             tracing::info!(
                 changed = r.changed.len(),
@@ -729,7 +753,7 @@ pub async fn run(paths: Paths, host: Arc<dyn Host>) -> anyhow::Result<()> {
     // spec §5.6 + D7：对账刚把新的 xray-config.json 落盘，这时收敛住宅槽路由 ——
     // 走 RoutingService gRPC 增删受影响用户的规则，**不重启 xray**；只有 gRPC 失败且
     // 文件已落地才退回一次重启。干净时是零成本 no-op，所以无条件调。
-    crate::modules::residential::slots::converge_xray(&ctx, panel.xray()).await;
+    crate::modules::residential::slots::converge_xray(&ctx, &panel).await;
     for m in &mods {
         tasks.extend(m.spawn(ctx.clone()));
     }
@@ -744,12 +768,14 @@ pub async fn run(paths: Paths, host: Arc<dyn Host>) -> anyhow::Result<()> {
         let panel2 = panel.clone();
         tasks.push(tokio::spawn(async move {
             while let Some(force) = rx.recv().await {
-                match reconcile_from_ctx(&ctx2, &mods2, f2.clone(), force, false).await {
+                match reconcile_from_ctx(&ctx2, &mods2, f2.clone(), Some(&panel2), force, false)
+                    .await
+                {
                     Ok(r) => finish_self_restart(&ctx2, &r, true).await,
                     Err(e) => tracing::error!(error = %e, "对账失败：{e}"),
                 }
                 // spec §5.6 + D7：同上，对账落盘之后收敛住宅槽路由（gRPC 增删，不重启）
-                crate::modules::residential::slots::converge_xray(&ctx2, panel2.xray()).await;
+                crate::modules::residential::slots::converge_xray(&ctx2, &panel2).await;
             }
         }));
     }
@@ -871,7 +897,7 @@ pub async fn reconcile_offline(
     let reg = modules(cached);
     ctx.bus.bind_residential(reg.panel.clone());
     let fetcher: Arc<dyn Fetcher> = Arc::new(HttpFetcher::new());
-    let report = reconcile_from_ctx(&ctx, &reg.modules, fetcher, force, dry_run).await?;
+    let report = reconcile_from_ctx(&ctx, &reg.modules, fetcher, None, force, dry_run).await?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     // CLI 路径：报告与 restart_keys 已落盘，这时同步重启守护进程（B5）
     ctx.bus.residential().drain().await;
@@ -981,6 +1007,7 @@ mod tests {
     ) -> ReconcileInput<'a> {
         ReconcileInput {
             certificate_bootstrap: false,
+            account_blocked: None,
             state,
             modules: mods,
             paths,
@@ -989,6 +1016,131 @@ mod tests {
             force: false,
             dry_run: false,
         }
+    }
+
+    #[test]
+    fn reconcile_once_persists_only_canonical_account_grants() {
+        use bui_schema::model::{Protocol, Slot};
+        use std::collections::BTreeSet;
+        use uuid::Uuid;
+
+        let host = ready_host();
+        let mut state = crate::testutil::sample_state();
+        let base = state.users[0].clone();
+        state.users = (1..=8)
+            .map(|id| {
+                let mut user = base.clone();
+                user.user_id = Uuid::from_u128(id);
+                user.username = format!("account-{id}");
+                user.credentials.vless_uuid = Uuid::from_u128(100 + id);
+                user.entitlements.protocols = vec![Protocol::Reality];
+                user.entitlements.residential = None;
+                user
+            })
+            .collect();
+        let supplier = Uuid::from_u128(1000);
+        let group = state
+            .residential
+            .groups
+            .get_mut(bui_schema::model::DEFAULT_GROUP)
+            .unwrap();
+        group.enabled = true;
+        group.upstreams = vec![serde_json::from_value(serde_json::json!({
+            "id": supplier, "name": "test-residence", "kind": "socks5", "host": "isp.example.net", "port": 10080
+        }))
+        .unwrap()];
+        state.residential.slots = vec![Slot {
+            index: 0,
+            upstream_id: supplier,
+        }];
+        state.users[1].entitlements.direct = false;
+        state.users[1].entitlements.residential = Some(bui_schema::model::ResidentialEntitlement {
+            group_id: bui_schema::model::DEFAULT_GROUP.into(),
+            slot_id: Some(supplier),
+        });
+        state.users[2].entitlements.expires_at = Some(crate::util::fmt_rfc3339(host.now()));
+        state.users[3].entitlements.traffic_limit.total_bytes = Some(10);
+        state.users[3].usage.total_bytes = 10;
+        state.users[4].entitlements.traffic_limit.monthly_bytes = Some(10);
+        state.users[4].usage.monthly_bytes = 10;
+        state.users[4].usage.month_key = crate::modules::panel::users::month_key(host.now());
+        state.users[6].disabled = true;
+        state.users[7].entitlements.protocols.clear();
+        let provided = BTreeSet::from([Uuid::from_u128(6)]);
+        let paths = bui_schema::paths::Paths::default_server();
+        let reg = modules(None);
+        let keys = BTreeMap::new();
+        let mut request = input(&state, &reg.modules, &paths, &keys, &NoopInstaller);
+        request.account_blocked = Some(&provided);
+        let (report, keys, _, _) = reconcile_once(request, host.as_ref()).unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(
+            report.verify_failures.is_empty(),
+            "{:?}",
+            report.verify_failures
+        );
+        let persisted: serde_json::Value =
+            serde_json::from_str(&host.text("/opt/b-ui/xray-config.json").unwrap()).unwrap();
+        let clients = |tag: &str| -> BTreeSet<(String, String)> {
+            persisted["inbounds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|i| i["tag"] == tag)
+                .unwrap()["settings"]["clients"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|u| {
+                    (
+                        u["email"].as_str().unwrap().to_owned(),
+                        u["id"].as_str().unwrap().to_owned(),
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(
+            clients("vless-direct"),
+            BTreeSet::from([(
+                Uuid::from_u128(1).to_string(),
+                Uuid::from_u128(101).to_string()
+            ),])
+        );
+        assert_eq!(
+            clients("vless-residential"),
+            BTreeSet::from([(
+                Uuid::from_u128(2).to_string(),
+                Uuid::from_u128(102).to_string()
+            ),])
+        );
+        assert_eq!(persisted["outbounds"][0]["protocol"], "blackhole");
+
+        host.clear_ops();
+        let mut request = input(&state, &reg.modules, &paths, &keys, &NoopInstaller);
+        request.account_blocked = Some(&provided);
+        let (second, keys, _, _) = reconcile_once(request, host.as_ref()).unwrap();
+        assert!(second.changed.is_empty(), "{:?}", second.changed);
+        assert!(second.errors.is_empty(), "{:?}", second.errors);
+        assert!(second.restarted.is_empty(), "{:?}", second.restarted);
+
+        state.users[0].entitlements.expires_at = Some(crate::util::fmt_rfc3339(host.now()));
+        host.clear_ops();
+        let mut request = input(&state, &reg.modules, &paths, &keys, &NoopInstaller);
+        request.account_blocked = Some(&provided);
+        let (expired, _, _, _) = reconcile_once(request, host.as_ref()).unwrap();
+        assert!(expired.errors.is_empty(), "{:?}", expired.errors);
+        assert!(!expired.restarted.iter().any(|u| u == "xray"));
+        let persisted: serde_json::Value =
+            serde_json::from_str(&host.text("/opt/b-ui/xray-config.json").unwrap()).unwrap();
+        assert!(persisted["inbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["tag"] == "vless-direct")
+            .unwrap()["settings"]["clients"]
+            .as_array()
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -1609,7 +1761,7 @@ mod tests {
                 b"new binary".to_vec(),
             )])));
             host.clear_ops();
-            let result = reconcile_from_ctx(&ctx, &modules, f, false, false).await;
+            let result = reconcile_from_ctx(&ctx, &modules, f, None, false, false).await;
             assert!(
                 result.is_err()
                     || result
@@ -2038,7 +2190,7 @@ mod tests {
         let reg = modules(None);
         let fetcher: Arc<dyn Fetcher> = Arc::new(FakeFetcher(Mutex::new(vec![])));
         let mut rx = ctx.bus.subscribe();
-        let report = reconcile_from_ctx(&ctx, &reg.modules, fetcher, false, false)
+        let report = reconcile_from_ctx(&ctx, &reg.modules, fetcher, None, false, false)
             .await
             .unwrap();
         assert!(
@@ -2078,7 +2230,7 @@ mod tests {
         let reg = modules(None);
         let fetcher: Arc<dyn Fetcher> = Arc::new(FakeFetcher(Mutex::new(vec![])));
         // 生产顺序：启动对账在前，后台任务（唯一的订阅者）在后
-        let report = reconcile_from_ctx(&ctx, &reg.modules, fetcher, false, false)
+        let report = reconcile_from_ctx(&ctx, &reg.modules, fetcher, None, false, false)
             .await
             .unwrap();
         let mut rx = ctx.bus.subscribe();
@@ -2116,7 +2268,9 @@ mod tests {
         let run = |dry: bool| {
             let (c, mods, f) = (ctx.clone(), reg.modules.clone(), f.clone());
             async move {
-                reconcile_from_ctx(&c, &mods, f, false, dry).await.unwrap();
+                reconcile_from_ctx(&c, &mods, f, None, false, dry)
+                    .await
+                    .unwrap();
             }
         };
         crate::modules::residential::slots::migrate_hy2_pool_on_start(&ctx)
@@ -2202,7 +2356,7 @@ mod tests {
             .await
             .unwrap();
         // Empty candidate is rejected before publishing or starting the service.
-        reconcile_from_ctx(&ctx, &reg.modules, fetcher.clone(), false, false)
+        reconcile_from_ctx(&ctx, &reg.modules, fetcher.clone(), None, false, false)
             .await
             .unwrap_err();
         assert!(host
@@ -2215,7 +2369,7 @@ mod tests {
         crate::modules::residential::slots::migrate_hy2_pool_on_start(&ctx)
             .await
             .unwrap();
-        reconcile_from_ctx(&ctx, &reg.modules, fetcher, false, false)
+        reconcile_from_ctx(&ctx, &reg.modules, fetcher, None, false, false)
             .await
             .unwrap();
         assert!(
@@ -2232,7 +2386,7 @@ mod tests {
         let ctx = ctx_for(host.clone(), &d).await;
         let reg = modules(None);
         let fetcher: Arc<dyn Fetcher> = Arc::new(FakeFetcher(Mutex::new(vec![])));
-        let report = reconcile_from_ctx(&ctx, &reg.modules, fetcher, false, false)
+        let report = reconcile_from_ctx(&ctx, &reg.modules, fetcher, None, false, false)
             .await
             .unwrap();
         assert!(report.self_restart_required);
@@ -2299,6 +2453,7 @@ mod tests {
         // 句柄与 core-files 模块里的是同一个锁：写进去以后 render 会看到
         let state = crate::testutil::sample_state();
         let ctx = crate::reconcile::RenderCtx {
+            account_blocked: Default::default(),
             paths: bui_schema::paths::Paths::default_server(),
             facts: crate::reconcile::Facts::probe(&FakeHost::new()).unwrap(),
         };

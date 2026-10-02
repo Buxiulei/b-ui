@@ -117,6 +117,35 @@ const _DENY_SEMANTICS =
     "已停用 / 已到期：住宅 HY2 客户端仍会显示已连接，但所有请求会被拒绝（门位 deny，握手照旧成功）；" +
     "直连节点在连接时即被拒。";
 
+const _RESI_UNAVAILABLE_REASONS = new Map([
+    ["account disabled", "账户已停用"],
+    ["account blocked", "账户到期、流量耗尽或暂不可用"],
+    ["protocol not granted", "未开通所需协议"],
+    ["direct path not granted", "未开通直连通路"],
+    ["residential path not granted", "未开通住宅通路"],
+    ["residential group missing", "住宅分组不存在"],
+    ["residential group unsupported", "住宅分组尚不支持"],
+    ["residential pool disabled", "住宅池未启用"],
+    ["residential pool empty", "住宅池没有可用上游"],
+    ["residential slot unassigned", "住宅出口尚未分配"],
+    ["residential slot missing", "住宅槽位不存在"],
+    ["residential slot ambiguous", "住宅槽位绑定冲突"],
+    ["residential slot index invalid", "住宅槽位配置无效"],
+    ["residential upstream missing", "住宅上游不存在"],
+    ["residential upstream ambiguous", "住宅上游绑定冲突"],
+    ["residential upstream invalid", "住宅上游配置无效"],
+    ["residential HY2 credential missing", "住宅 HY2 凭据尚未分配"],
+    ["residential HY2 credential invalid", "住宅 HY2 凭据无效"]
+]);
+const _RESI_REQUIRED_HINT = "住宅业务仅走住宅出口，不可用时拒绝连接。";
+const _RESI_GLOBAL_HINT = "完整配置：全部业务走住宅";
+const _RESI_SPLIT_HINT = "完整配置：关键词走住宅，其余走授权直连";
+
+function _resiUnavailableHint(x) {
+    if (!x.residentialUnavailable) return "";
+    return _RESI_UNAVAILABLE_REASONS.get(x.residentialUnavailable) || "住宅出口不可用";
+}
+
 // 「重置订阅链接与凭据」（rotate）的后果，**一处文案**：二次确认与成功提示都用它
 // （spec §7.4 第 3 条，2026-09-17 裁决）。rotate 把住宅凭据连名字一起换掉
 // （迁移用户的用户名 → 池里的 rNNN），所以对按账号匹配的 bui-c 等于换了账号：
@@ -146,6 +175,8 @@ const _ROTATE_SWITCH =
 // （门位 = deny，握手照旧成功），直连节点则在连接时就被拒 —— 这一句是运维唯一看得到的
 // 解释，不写用户会以为「显示连着就是能用」。
 function _resiGateHint(x) {
+    const unavailable = _resiUnavailableHint(x);
+    if (unavailable) return unavailable + '\n' + _RESI_REQUIRED_HINT;
     const port = 'HY2 住宅 :' + x.slotPort +
         (Array.isArray(x.slotHop) ? ' + ' + x.slotHop[0] + '-' + x.slotHop[1] : '');
     const g = x.hy2ResiGate;
@@ -202,6 +233,10 @@ function load() {
             const exp = x.limits?.expiresAt ? new Date(x.limits.expiresAt) < new Date() : "";
             const tlim = x.limits?.trafficLimit;
             const over = tlim && total >= tlim;
+            const unavailable = _resiUnavailableHint(x);
+            const residentialBadge = unavailable
+                ? ' <span class="tag" style="color:var(--danger)" title="' + esc(unavailable + '。' + _RESI_REQUIRED_HINT) + '">住宅不可用</span>'
+                : '';
             // spec §6：**住宅 HY2 客户端仍会显示已连接，但所有请求会被拒绝**（门位切到
             // deny，握手照旧成功）；直连节点在连接时即被拒。运维只有这句话能解释
             // 「用户说还连着，为什么打不开网页」。
@@ -216,11 +251,11 @@ function load() {
                         '<span class="proto-tag proto-hy2">HY2</span>';
 
             return '<tr>' +
-                '<td><div style="display:flex;align-items:center;gap:8px"><span style="font-weight:600">' + esc(x.username) + '</span>' + ptag + badge + '</div></td>' +
+                '<td><div style="display:flex;align-items:center;gap:8px"><span style="font-weight:600">' + esc(x.username) + '</span>' + ptag + badge + residentialBadge + '</div></td>' +
                 '<td><span class="tag ' + (on ? 'on' : '') + ' ">' + (on ? '在线' : '离线') + '</span></td>' +
                 // v4 P3（spec §5.6）：这个用户走哪个住宅 IP。没有住宅权益就打「—」。
                 '<td class="hide-m" style="font-family:monospace;color:var(--text-dim)">' +
-                (x.slot == null ? '—' :
+                (unavailable ? '<span style="color:var(--danger)" title="' + esc(unavailable + '。' + _RESI_REQUIRED_HINT) + '">' + esc(unavailable) + '</span>' : x.slot == null ? '—' :
                     '<span title="' + esc(_resiGateHint(x)) + '">#' +
                     x.slot + (x.slotIp ? ' ' + esc(x.slotIp) : '') +
                     (x.hy2ResiGate === 'deny' ? ' <span class="tag" style="color:var(--danger)">拒绝</span>' :
@@ -371,12 +406,13 @@ function saveUser() {
 // 它真出现就只有一种成因 —— 面板与服务端版本不匹配（投影没发 subToken），而那时
 // 「重启」和「点重置」都救不回来，所以文案不承诺任何自救动作（审查 6）。
 const SUB_TOKEN_MISSING = "取不到该用户的订阅 token，请联系运维核对面板与服务端版本是否匹配";
+const SINGLE_NODE_UNAVAILABLE = "该账户暂不提供单节点连接链接，请检查账户状态和通路授权。";
 
 function subPath(x, kind) {
     return x && x.subToken ? "/api/" + kind + "/" + encodeURIComponent(x.subToken) : null;
 }
 
-// Generate URI - 根据协议类型生成不同的链接
+// 单节点 URI 由服务端从同一份授权节点生成；前端只拼融合订阅的 token 地址。
 function genUri(x) {
     // 融合订阅用户: 返回 v2rayN 原生订阅 URL (带备注)
     if (x.protocol === "fusion") {
@@ -385,54 +421,8 @@ function genUri(x) {
         // URL 末尾的 #备注 会被 v2rayNG 识别为订阅名称（不编码）
         return "https://" + location.host + path + "#" + x.username;
     }
-    // v3.6.0: 单协议用户按 residential 选直连版/住宅版端口与备注，
-    // 判定与 server.js /api/sub 的 includeResi 完全一致（未设 residential 视为开）
-    const includeResi = x.residential !== false;
-    if (x.protocol === "vless-reality") {
-        // sni 以服务端实时 reality 配置(cfg.sni)为准，user.sni 是建用户时的旧拷贝。
-        // 改伪装后只动 xray-config、不回写老用户 sni；若优先 user.sni 会下发旧 sni →
-        // 与服务端 serverNames 不匹配 → REALITY received real certificate → 连不上。
-        // (与 server.js v3.5.13 订阅修复保持一致，避免"复制链接"路径重蹈覆辙)
-        const userSni = cfg.sni || x.sni || "www.bing.com";
-        // 参数顺序与 /api/sub 的 buildVlessUrl 逐字节一致，方便与订阅比对
-        const vlessParams = "security=reality&encryption=none&pbk=" + cfg.pubKey +
-            "&headerType=&fp=chrome&spx=%2F&type=tcp&flow=xtls-rprx-vision&sni=" + userSni +
-            "&sid=" + cfg.shortId;
-        return "vless://" + x.uuid + "@" + cfg.domain + ":" +
-            (includeResi ? 10002 : (cfg.xrayPort || 10001)) + "?" + vlessParams + "#" +
-            encodeURIComponent(x.username + "-" + (includeResi ? "Reality住宅" : "Reality直连"));
-    }
-    if (x.protocol === "vless-ws-tls") {
-        const hostSni = x.sni || "www.bing.com";
-        // :10003 — vless-ws-tls 端口(v3.5.0 起 :10002 被 vless-residential 占用)
-        return "vless://" + x.uuid + "@" + cfg.domain + ":" + (cfg.wsPort || 10003) +
-            "?encryption=none&security=tls&sni=" + cfg.domain +
-            "&type=ws&host=" + hostSni + "&path=%2Fws#" +
-            encodeURIComponent(x.username);
-    }
-    // Hysteria2: v2rayN 兼容格式
-    // 分段 encode（与 /api/sub 一致：整串编码会把 : 变成 %3A，客户端拆不出 user/pass）
-    const auth = encodeURIComponent(x.username) + ":" + encodeURIComponent(x.password);
-
-    // 住宅版端口与跳跃区间由后端按用户槽位下发（spec §5.6）；
-    // 老后端没有这两个字段时退回 v3 的单槽值，链接与那时的订阅一致。
-    const port = includeResi ? (x.slotPort || 40000) : (cfg.port || 10000);
-    const resiHop = Array.isArray(x.slotHop) ? x.slotHop[0] + "-" + x.slotHop[1] : "41000-50000";
-    const hopRange = includeResi
-        ? resiHop
-        : (cfg.portHopping && cfg.portHopping.enabled ? cfg.portHopping.start + "-" + cfg.portHopping.end : null);
-
-    // 查询参数构建（顺序与 /api/sub 的 buildHy2Url 一致）
-    let queryParams = "sni=" + cfg.domain + "&insecure=0";
-    // 端口跳跃使用 mport 参数（v2rayN 格式）
-    if (hopRange) queryParams += "&mport=" + hopRange;
-    // salamander obfs 覆盖直连与全部住宅 HY2 实例（与 /api/sub 的两种 HY2 节点一致）
-    if (cfg.obfs && cfg.obfs.enabled && cfg.obfs.type === "salamander" && cfg.obfs.password) {
-        queryParams += "&obfs=salamander&obfs-password=" + encodeURIComponent(cfg.obfs.password);
-    }
-
-    return "hysteria2://" + auth + "@" + cfg.domain + ":" + port + "?" + queryParams + "#" +
-        encodeURIComponent(x.username + "-" + (includeResi ? "HY2住宅" : "HY2直连"));
+    if (x.disabled || x.blocked || x.residentialUnavailable) return "";
+    return typeof x.nodeUri === "string" ? x.nodeUri : "";
 }
 
 // 当前显示的用户名 (用于下载订阅)
@@ -457,12 +447,15 @@ function showU(uname) {
     if (!x) return;
     currentShowUser = x;
     const uri = genUri(x);
-    $("#uri").innerText = uri || SUB_TOKEN_MISSING;
+    const unavailable = _resiUnavailableHint(x);
+    $("#uri").innerText = uri || (unavailable ? unavailable + '。' + _RESI_REQUIRED_HINT :
+        x.protocol === "fusion" ? SUB_TOKEN_MISSING : SINGLE_NODE_UNAVAILABLE);
 
     // 融合订阅用户显示订阅链接
     if (x.protocol === "fusion") {
         $("#cfg-title").innerText = "融合订阅配置";
-        $("#cfg-desc").innerHTML = "Hysteria2 + VLESS 自动故障切换<br><small>可导入 v2rayN / v2rayNG / Shadowrocket / bui-c 客户端</small>";
+        $("#cfg-desc").innerHTML = "按授权提供 Hysteria2 与 VLESS 节点<br><small>可导入 v2rayN / v2rayNG / Shadowrocket / bui-c 客户端</small>" +
+            (unavailable ? '<br><small style="color:var(--danger)">' + esc(unavailable + '。' + _RESI_REQUIRED_HINT) + '</small>' : '');
 
         // 显示二维码（本地生成，节点链接不外发）
         renderQR(uri);
@@ -482,7 +475,7 @@ function showU(uname) {
                 x.protocol === "vless-ws-tls" ? "VLESS-WS" : x.protocol;
 
         $("#cfg-title").innerText = protoName + " 配置";
-        $("#cfg-desc").innerText = "单协议客户端配置";
+        $("#cfg-desc").innerText = uri ? "单协议客户端配置" : "当前没有可用的单节点连接链接";
 
         // 显示二维码（本地生成，节点链接不外发）
         renderQR(uri);
@@ -490,8 +483,9 @@ function showU(uname) {
         // 按钮 - 根据协议类型显示
         let btnHtml = `<button class="btn" onclick="copy()"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;margin-right:5px"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>复制链接</button>`;
 
-        $("#cfg-buttons").innerHTML = btnHtml;
-        $("#cfg-hint").innerText = "扫码或复制链接导入客户端";
+        $("#cfg-buttons").innerHTML = uri ? btnHtml : '';
+        $("#cfg-hint").innerText = uri ? "扫码或复制链接导入客户端" :
+            unavailable ? unavailable + '。' + _RESI_REQUIRED_HINT : SINGLE_NODE_UNAVAILABLE;
     }
 
     openM("m-cfg");
@@ -507,11 +501,13 @@ function syncOpenConfig(users) {
     if (!old || !$("#m-cfg").classList.contains("on")) return;
     const fresh = users.find(u => u.username === old.username);
     if (!fresh) return;
-    if (["subToken", "password", "uuid"].every(k => fresh[k] === old[k])) return;
+    const credentialsChanged = !["subToken", "password", "uuid"].every(k => fresh[k] === old[k]);
+    if (!credentialsChanged && fresh.nodeUri === old.nodeUri &&
+        fresh.residentialUnavailable === old.residentialUnavailable) return;
     showU(fresh.username);
     // 第二个参数选的是警告样式（橙色三角），这是有意的：管理员屏幕上那条链接刚刚作废，
     // 已经发给用户的旧链接也一起废了，不是一条可以扫过去的普通告知。
-    toast("该用户的订阅链接与凭据已被重置，弹窗已按新值刷新", 1);
+    toast(credentialsChanged ? "该用户的订阅链接与凭据已被重置，弹窗已按新值刷新" : "该用户的连接配置或住宅出口状态已变化，弹窗已刷新", 1);
 }
 
 // Copy URI
@@ -521,7 +517,9 @@ function copy() {
     if (!currentShowUser) return toast("请先选择用户", 1);
     const fusion = currentShowUser.protocol === "fusion";
     if (fusion && !currentShowUser.subToken) return toast(SUB_TOKEN_MISSING, 1);
-    navigator.clipboard.writeText($("#uri").innerText);
+    const uri = genUri(currentShowUser);
+    if (!uri) return toast(_resiUnavailableHint(currentShowUser) || SINGLE_NODE_UNAVAILABLE, 1);
+    navigator.clipboard.writeText(uri);
     if (fusion) {
         toast("订阅链接已复制，可粘贴到 v2rayN / Shadowrocket");
     } else {
@@ -707,7 +705,7 @@ function toggleSniSelect() {
     if (proto === "fusion") {
         wrap.style.display = "flex";
         title.textContent = "订阅包含住宅节点";
-        hint.textContent = "勾选 → 4 节点 (直连+住宅 ×2)；不勾 → 仅 2 节点 (直连 ×2)";
+        hint.textContent = "勾选住宅后，住宅不可用时整份订阅不可用。请配置并启用住宅上游、完成出口绑定；需要仅直连时，请新建未勾选住宅的账户。";
     } else if (proto === "hysteria2") {
         wrap.style.display = "flex";
         title.textContent = "使用住宅版 (HY2)";
@@ -968,8 +966,8 @@ function toggleResidentialGlobal(checked) {
     api("/residential/global", { method: "POST", body: JSON.stringify({ global: checked }) }).then(r => {
         if (r.success) {
             const hint = $("#resi-global-hint");
-            if (hint) hint.textContent = checked ? "全走住宅" : "域名分流";
-            toast(checked ? "已切换为全局模式" : "已切换为域名分流");
+            if (hint) hint.textContent = checked ? _RESI_GLOBAL_HINT : _RESI_SPLIT_HINT;
+            toast(checked ? "完整配置已设为全走住宅" : "完整配置已设为域名分流；需要授权直连与住宅两条通路");
         } else {
             _resiErr(r.error || "切换失败");
             const tog = $("#resi-global-toggle");
@@ -990,7 +988,7 @@ function _resiReload() {
         const hint = $("#resi-global-hint");
         if (disBtn) disBtn.style.display = (r.enabled ? "" : "none");
         if (tog) tog.checked = !!r.global;
-        if (hint) hint.textContent = r.global ? "全走住宅" : "域名分流";
+        if (hint) hint.textContent = r.global ? _RESI_GLOBAL_HINT : _RESI_SPLIT_HINT;
     }).catch(() => {});
 }
 
@@ -1005,7 +1003,7 @@ function toggleResidentialEnabled(checked) {
         }).catch(e => { _resiErr(e.message || "请求失败"); openResi(); });
     } else {
         api("/residential", { method: "DELETE" }).then(r => {
-            if (r.success) { toast("住宅代理已禁用，fallback 直连"); openResi(); }
+            if (r.success) { toast("住宅代理已禁用，住宅连接将被拒绝"); openResi(); }
             else { _resiErr(r.error || "禁用失败"); openResi(); }
         }).catch(e => { _resiErr(e.message || "请求失败"); openResi(); });
     }
@@ -1039,12 +1037,12 @@ function openResi() {
         dot.className = "resi-dot " + (r.enabled ? "active" : "inactive");
         const label = document.createElement("span");
         label.className = "resi-status-label " + (r.enabled ? "active" : "inactive");
-        label.textContent = r.enabled ? "已启用" : "未启用";
+        label.textContent = r.enabled ? "住宅池已启用" : "住宅池未启用，住宅连接将被拒绝";
         // v3.5.3: 总开关 toggle — 点亮启用住宅，禁用时回 disable
         const masterTog = document.createElement("label");
         masterTog.className = "switch";
         masterTog.style.cssText = "margin-left:auto";
-        masterTog.title = r.enabled ? "点击禁用" : "点击启用（需池中有至少 1 个 URL）";
+        masterTog.title = r.enabled ? "禁用后住宅连接将被拒绝" : "点击启用（需池中有至少 1 个 URL）";
         const masterInp = document.createElement("input");
         masterInp.type = "checkbox";
         masterInp.checked = !!r.enabled;
@@ -1086,7 +1084,7 @@ function openResi() {
         const tog = $("#resi-global-toggle");
         const hint = $("#resi-global-hint");
         if (tog) tog.checked = !!r.global;
-        if (hint) hint.textContent = r.global ? "全走住宅" : "域名分流";
+        if (hint) hint.textContent = r.global ? _RESI_GLOBAL_HINT : _RESI_SPLIT_HINT;
 
         _resiRenderDomains(r);
     }).catch(() => {
@@ -1149,7 +1147,7 @@ function saveDomainsOnly() {
 function disableResi() {
     _resiClearErr();
     api("/residential", { method: "DELETE" }).then(r => {
-        if (r.success) { closeM(); toast("住宅 IP 已禁用"); }
+        if (r.success) { closeM(); toast("住宅 IP 已禁用，住宅连接将被拒绝"); }
         else _resiErr(r.error || "禁用失败");
     }).catch(e => {
         _resiErr(e.message || "请求失败");

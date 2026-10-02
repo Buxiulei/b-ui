@@ -6,7 +6,7 @@
 //! `config-residential[-<i>].yaml`、`singbox-relay.json`、`xray-config.json` 都由
 //! `crate::modules::core_files` / `units` 从期望态渲染。
 use crate::api::{Event, EventBus};
-use crate::modules::panel::XrayApi;
+use crate::modules::panel::{users, Shared, TxRx, XrayApi};
 use crate::modules::residential::clash::{self, Clash};
 use crate::modules::residential::proxy::Prober;
 use crate::modules::residential::state;
@@ -14,10 +14,10 @@ use crate::modules::residential::{health, SLOT_BACK_ROUNDS};
 use crate::modules::sentinel::incidents::{self, Incident, Level};
 use crate::reconcile::DaemonCtx;
 use crate::state::runtime::Runtime;
-use crate::state::store::Store;
+use crate::state::store::{PublicationPermit, Store};
 use crate::sys::Host;
 use crate::util::{fmt_rfc3339, parse_rfc3339};
-use bui_schema::model::{ResidentialGroup, Slot, State, Upstream, DEFAULT_GROUP};
+use bui_schema::model::{ResidentialGroup, Slot, State, Upstream, User, DEFAULT_GROUP};
 use bui_schema::render::xray as xray_render;
 use bui_schema::render::xray::SlotRule;
 use bui_schema::slots;
@@ -356,7 +356,7 @@ pub async fn mark_xray_rules_dirty(runtime: &Runtime) {
 /// 1. `runtime.residential.xray_slot_rules_dirty` 没置位 ⇒ 什么都不做；
 /// 2. 置位但 `xray_slot_rules_hash` 已等于当前渲染的 `slot_rules_hash` ⇒ 清脏、不动 xray
 ///    （这一轮的变化与槽路由无关，例如加了个没有住宅权益的用户）；
-/// 3. 磁盘上那份 `xray-config.json` 已是期望槽规则，**且** xray 本次启动晚于它的写入
+/// 3. 磁盘上那份 `xray-config.json` 等于当前完整授权配置，**且** xray 本次启动晚于它的写入
 ///    （[`loaded_from_disk`]）⇒ 进程就是从这份文件起来的：记哈希、清脏，不调 gRPC、
 ///    不重启（对账刚为别的原因重启过 xray 的那一轮就是这样）；
 /// 4. 否则 `ListRule()` 读回**进程里正在跑的**那张表，与期望态求差，只对差集调
@@ -365,7 +365,8 @@ pub async fn mark_xray_rules_dirty(runtime: &Runtime) {
 ///    所以哈希只在顺序与内容都收敛之后才写；全成功 ⇒ 记哈希、清脏。连接类错误
 ///    （xray 刚重启、还没起监听）先按退避重试（[`apply_with_retry`]）；
 /// 5. 重试用完或非连接类错误 ⇒ [`restart_fallback`]：只有磁盘上那份 `xray-config.json`
-///    已经是新规则时才重启一次并记事件，否则什么都不做、脏标记留着。
+///    等于最新 durable + pending + 时钟的完整入口授权与规则时才重启一次并记事件，
+///    否则什么都不做、脏标记留着。槽哈希相同不能证明直接入口凭据仍可授予。
 ///
 /// 第 3、4 道门成功时顺带清掉第 5 道门以前写下的「gRPC 失败」告警（[`mark_converged`]）。
 ///
@@ -373,16 +374,38 @@ pub async fn mark_xray_rules_dirty(runtime: &Runtime) {
 /// `xray-config.json` 刚落盘，第 4 步的判据才可能成立。干净时是个零成本 no-op，
 /// 可以无条件调。**不在这里发 `ReconcileRequested`**：那会与「对账末尾调本函数」
 /// 组成自触发环；脏标记留着等 10 分钟巡检 tick / 下一次 `StateChanged` / 每日自检更安全。
-pub async fn converge_xray(ctx: &DaemonCtx, xray: &dyn XrayApi) -> ConvergeOutcome {
+///
+/// 内部 owner 持有 sync → Store publication → pending 的实际授权事务。调用者取消只
+/// detach owner，不让已经启动的 blocking restart 在锁被提前释放后继续授予旧配置。
+pub async fn converge_xray(ctx: &DaemonCtx, shared: &Arc<Shared>) -> ConvergeOutcome {
     if !state::read(&ctx.runtime).await.xray_slot_rules_dirty {
         return ConvergeOutcome::Clean;
     }
-    let (want, want_hash) = {
-        let s = ctx.store.read().await;
-        let cfg = xray_render::config(&s.node, &s.users, &s.residential, &ctx.paths);
+    let (ctx, shared) = (ctx.clone(), shared.clone());
+    match tokio::spawn(async move { converge_xray_owned(&ctx, &shared).await }).await {
+        Ok(out) => out,
+        Err(error) => {
+            tracing::warn!(%error, "Xray 槽路由授权事务未完成，保留脏标记");
+            ConvergeOutcome::Deferred
+        }
+    }
+}
+
+async fn converge_xray_owned(ctx: &DaemonCtx, shared: &Shared) -> ConvergeOutcome {
+    let _sync = shared.sync_guard().await;
+    let publication = ctx.store.publication_permit().await;
+    if !state::read(&ctx.runtime).await.xray_slot_rules_dirty {
+        return ConvergeOutcome::Clean;
+    }
+    let (want, want_hash, want_config) = {
+        let s = publication.state();
+        let pending = shared.pending().await;
+        let authorized = authorized_xray_users(s, &pending, ctx.host.now());
+        let cfg = xray_render::config(&s.node, &authorized, &s.residential, &ctx.paths);
         (
-            xray_render::slot_rules(&s.users, &s.residential),
+            xray_render::slot_rules(&authorized, &s.residential),
             xray_render::slot_rules_hash(&cfg),
+            cfg,
         )
     };
     if state::read(&ctx.runtime)
@@ -394,14 +417,14 @@ pub async fn converge_xray(ctx: &DaemonCtx, xray: &dyn XrayApi) -> ConvergeOutco
         state::update(&ctx.runtime, |r| r.xray_slot_rules_dirty = false).await;
         return ConvergeOutcome::Clean;
     }
-    if loaded_from_disk(ctx, &want_hash).await {
+    if loaded_from_disk(ctx, &want_config).await {
         mark_converged(ctx, want_hash).await;
         tracing::info!(
             "xray 本次启动晚于 xray-config.json 落盘，已从磁盘加载完整槽规则：直接记账（不调 gRPC、不重启）"
         );
         return ConvergeOutcome::LoadedFromDisk;
     }
-    match apply_with_retry(xray, &want).await {
+    match apply_with_retry(shared.xray(), &want).await {
         Ok(calls) => {
             mark_converged(ctx, want_hash).await;
             if calls > 0 {
@@ -414,9 +437,23 @@ pub async fn converge_xray(ctx: &DaemonCtx, xray: &dyn XrayApi) -> ConvergeOutco
         }
         Err(e) => {
             tracing::warn!(error = %e, "Xray RoutingService 收敛失败，看磁盘配置是否已落盘：{e}");
-            restart_fallback(ctx, &want_hash, &e.to_string()).await
+            restart_fallback(ctx, shared, &publication, &want_hash, &e.to_string()).await
         }
     }
+}
+
+fn authorized_xray_users(
+    state: &State,
+    pending: &BTreeMap<Uuid, TxRx>,
+    now: OffsetDateTime,
+) -> Vec<User> {
+    let blocked = users::blocked_set(state, pending, now);
+    state
+        .users
+        .iter()
+        .filter(|u| !blocked.contains(&u.user_id))
+        .cloned()
+        .collect()
 }
 
 /// 收敛成功（gRPC 增删，或第 3 道门确认进程已从磁盘加载）的记账：记哈希、清脏，并认领
@@ -436,8 +473,8 @@ async fn mark_converged(ctx: &DaemonCtx, hash: String) {
     }
 }
 
-/// 磁盘上那份 `xray-config.json` 的槽路由哈希（读不到 / 解析不了 ⇒ `None`）。
-async fn landed_hash(ctx: &DaemonCtx) -> Option<String> {
+/// 完整磁盘配置；读不到 / 解析不了一律不能作为重启授权证明。
+async fn landed_config(ctx: &DaemonCtx) -> Option<serde_json::Value> {
     let path = ctx.paths.base_dir.join("xray-config.json");
     let host = ctx.host.clone();
     tokio::task::spawn_blocking(move || host.read_file(&path))
@@ -446,14 +483,13 @@ async fn landed_hash(ctx: &DaemonCtx) -> Option<String> {
         .and_then(Result::ok)
         .flatten()
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-        .map(|v| xray_render::slot_rules_hash(&v))
 }
 
-/// 第 3 道门：磁盘上已是期望槽规则，**且** xray 本次启动严格晚于该文件的最后一次写入 ⇒
-/// 进程就是从这份文件起来的，里面已是完整槽规则。改分槽只重写文件、不重启 xray
+/// 第 3 道门：磁盘上等于完整入口授权与规则，**且** xray 本次启动严格晚于该文件的最后一次写入 ⇒
+/// 进程就是从这份文件起来的，里面已是完整配置。改分槽只重写文件、不重启 xray
 /// （`restart_key` 是结构哈希），那时启动早于写入，这道门自然不成立。
-async fn loaded_from_disk(ctx: &DaemonCtx, want_hash: &str) -> bool {
-    if landed_hash(ctx).await.as_deref() != Some(want_hash) {
+async fn loaded_from_disk(ctx: &DaemonCtx, want: &serde_json::Value) -> bool {
+    if landed_config(ctx).await.as_ref() != Some(want) {
         return false;
     }
     let path = ctx.paths.base_dir.join("xray-config.json");
@@ -524,9 +560,20 @@ async fn apply_with_retry(xray: &dyn XrayApi, want: &[SlotRule]) -> anyhow::Resu
     let deadline = tokio::time::Instant::now() + GRPC_RETRY_BUDGET;
     let mut delay = GRPC_RETRY_FIRST;
     loop {
-        let err = match apply_slot_rules(xray, want).await {
-            Err(e) if is_connect_error(&e) => e,
-            other => return other,
+        if tokio::time::Instant::now() >= deadline {
+            return Err(
+                tonic::Status::deadline_exceeded("Xray route retry budget exhausted").into(),
+            );
+        }
+        let attempt = tokio::time::timeout_at(deadline, apply_slot_rules(xray, want)).await;
+        let err = match attempt {
+            Err(_) => {
+                return Err(
+                    tonic::Status::deadline_exceeded("Xray route retry budget exhausted").into(),
+                )
+            }
+            Ok(Err(e)) if is_connect_error(&e) => e,
+            Ok(other) => return other,
         };
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
         if left.is_zero() {
@@ -604,7 +651,7 @@ async fn apply_slot_rules(xray: &dyn XrayApi, want: &[SlotRule]) -> anyhow::Resu
     }
     // ③ `AddRule` 只能追加到表尾 ⇒ 这一轮追加过、或兜底本身缺了 / 指错了 / 排在别的
     //    槽规则前面，就把兜底删掉再追加一次，让它回到全部用户规则之后。两次调用之间
-    //    有个亚毫秒窗口，期间「一条规则都没有的 email」落到首个出站 direct（D7 已接受）。
+    //    暂时没有兜底时，未知 email 仍由首个 blackhole 出站拒绝；失败也不改走 direct。
     //    ①删掉的那些不算数：判位置只看留下来的（`wanted` 里的）那些规则的相对次序。
     let last_kept = live
         .iter()
@@ -626,20 +673,41 @@ async fn apply_slot_rules(xray: &dyn XrayApi, want: &[SlotRule]) -> anyhow::Resu
 }
 
 /// gRPC 收敛失败时的唯一退路：重启一次 xray，让它把磁盘上那份**完整**规则表读回来。
-/// 只有磁盘哈希已等于期望哈希才动手 —— 否则重启只是把旧规则重新加载一遍。
-async fn restart_fallback(ctx: &DaemonCtx, want_hash: &str, err: &str) -> ConvergeOutcome {
-    let landed = landed_hash(ctx).await;
-    if landed.as_deref() != Some(want_hash) {
-        tracing::debug!(
-            landed = ?landed,
-            want = %want_hash,
-            "xray-config.json 还没落到新的槽路由，本轮不重启（脏标记留着）"
-        );
+/// 重启会重新授予磁盘里的两入口 clients：必须比较完整配置，并在最终读取之后重新
+/// 采样时钟。owner 持有 Store publication，pending 则在实际 restart 与终态记账完成前
+/// 保持锁定；不使用 async timeout 假装中止不可取消的 systemctl worker。
+async fn restart_fallback(
+    ctx: &DaemonCtx,
+    shared: &Shared,
+    publication: &PublicationPermit,
+    want_hash: &str,
+    err: &str,
+) -> ConvergeOutcome {
+    let pending = shared.pending().await;
+    let pending_snapshot = pending.clone();
+    let current = publication.state().clone();
+    let paths = ctx.paths.clone();
+    let hash = want_hash.to_string();
+    let host = ctx.host.clone();
+    let out = tokio::task::spawn_blocking(move || {
+        let landed = host
+            .read_file(&paths.base_dir.join("xray-config.json"))
+            .ok()
+            .flatten()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+        let authorized = authorized_xray_users(&current, &pending_snapshot, host.now());
+        let wanted = xray_render::config(&current.node, &authorized, &current.residential, &paths);
+        if landed.as_ref() != Some(&wanted) || xray_render::slot_rules_hash(&wanted) != hash {
+            return None;
+        }
+        Some(host.systemd("restart", "xray.service"))
+    })
+    .await;
+    if matches!(out, Ok(None)) {
+        tracing::debug!("xray-config.json 不等于最新完整入口授权与规则，本轮不重启（脏标记留着）");
         return ConvergeOutcome::Deferred;
     }
-    let host = ctx.host.clone();
-    let out = tokio::task::spawn_blocking(move || host.systemd("restart", "xray.service")).await;
-    if !matches!(out, Ok(Ok(ref o)) if o.status == 0) {
+    if !matches!(out, Ok(Some(Ok(ref o))) if o.status == 0) {
         tracing::warn!("重启 xray 失败，槽路由等下一轮对账再收敛");
         return ConvergeOutcome::Deferred;
     }
@@ -656,6 +724,7 @@ async fn restart_fallback(ctx: &DaemonCtx, want_hash: &str, err: &str) -> Conver
         state::push_alert(r, msg);
     })
     .await;
+    drop(pending); // Terminal bookkeeping precedes accounting/state publication release.
     tracing::info!("已重启 xray 使住宅槽路由生效（gRPC 退路，spec §5.6）");
     ConvergeOutcome::Restarted
 }
@@ -1449,6 +1518,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let (store, bus) = store_with(d.path(), 1, 3).await;
         let (ctx, _host) = ctx_of(d.path(), store.clone(), bus.clone()).await;
+        migrate_on_start(&store, &bus).await.unwrap(); // delivery requires an explicit slot binding
         let r = migrate_hy2_pool_on_start(&ctx).await.unwrap();
         assert_eq!(
             r,
@@ -1485,6 +1555,49 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn pool_migration_keeps_reserved_credentials_when_residential_is_unavailable() {
+        let d = tempfile::tempdir().unwrap();
+        let (store, bus) = store_with(d.path(), 1, 1).await;
+        let (ctx, _host) = ctx_of(d.path(), store.clone(), bus.clone()).await;
+        migrate_on_start(&store, &bus).await.unwrap();
+        store
+            .update(|s| s.residential.groups.get_mut(DEFAULT_GROUP).unwrap().enabled = false)
+            .await
+            .unwrap();
+        assert_eq!(migrate_hy2_pool_on_start(&ctx).await.unwrap().changed, 1);
+        let reserved = {
+            let s = store.read().await;
+            let credential = bui_schema::hy2pool::cred_of(&s.users[0], &s.residential)
+                .unwrap()
+                .clone();
+            assert!(
+                !bui_schema::nodes::nodes_for(&s.users[0], &s.node, &s.residential)
+                    .iter()
+                    .any(|n| n.kind == bui_schema::nodes::NodeKind::Hy2Residential),
+                "reserved credentials do not authorize an unavailable path"
+            );
+            credential
+        };
+        store
+            .update(|s| s.residential.groups.get_mut(DEFAULT_GROUP).unwrap().enabled = true)
+            .await
+            .unwrap();
+        assert_eq!(
+            migrate_hy2_pool_on_start(&ctx).await.unwrap(),
+            PoolMigration::default()
+        );
+        let s = store.read().await;
+        let restored = bui_schema::hy2pool::cred_of(&s.users[0], &s.residential).unwrap();
+        assert_eq!(restored.id, reserved.id);
+        assert_eq!(restored.secret, reserved.secret);
+        assert!(
+            bui_schema::nodes::nodes_for(&s.users[0], &s.node, &s.residential)
+                .iter()
+                .any(|n| n.kind == bui_schema::nodes::NodeKind::Hy2Residential)
+        );
+    }
+
     /// 「凭据指针悬空」必须被治（第一波复核发现）：`hy2_resi_cred` 指向池里已不存在的 id
     /// 时，`hy2pool::assign` 原样还回那个 id、`cred_of` 却是 `None`，而 `migrate` 判 pending
     /// 用 `is_none()` ⇒ 这类用户既不被治愈也不进 `unassigned`，表现为「有权益但订阅里渲染
@@ -1494,6 +1607,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let (store, bus) = store_with(d.path(), 1, 2).await;
         let (ctx, _host) = ctx_of(d.path(), store.clone(), bus.clone()).await;
+        migrate_on_start(&store, &bus).await.unwrap(); // delivery requires an explicit slot binding
         migrate_hy2_pool_on_start(&ctx).await.unwrap();
         // 人工把 u1 的指针指到池外（人工改 state / 回滚后再升级 / 池被缩过）
         store
@@ -1931,6 +2045,13 @@ mod tests {
         )
     }
 
+    fn xray_shared(xray: &FakeXray) -> Arc<Shared> {
+        Arc::new(Shared::new(
+            Box::new(xray.clone()),
+            Box::new(crate::modules::panel::fakes::FakeHy2::new()),
+        ))
+    }
+
     /// 期望态的 `(ruleTag, 出站)` 表，末尾一定是兜底那条。
     async fn want_rules(ctx: &DaemonCtx) -> Vec<(String, String)> {
         let s = ctx.store.read().await;
@@ -1983,6 +2104,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn xray_rule_convergence_removes_expired_residential_route_without_restart() {
+        let d = tempfile::tempdir().unwrap();
+        let (store, bus) = store_with(d.path(), 1, 1).await;
+        let (ctx, host) = ctx_of(d.path(), store, bus).await;
+        migrate_on_start(&ctx.store, &ctx.bus).await.unwrap();
+        let x = FakeXray::new();
+        mark_xray_rules_dirty(&ctx.runtime).await;
+        assert!(matches!(
+            converge_xray(&ctx, &xray_shared(&x)).await,
+            ConvergeOutcome::Applied(_)
+        ));
+        assert!(
+            x.rules().iter().any(|(tag, _)| tag.starts_with("resi-u-")),
+            "reachable control: initial authorized route actually installed"
+        );
+        ctx.store
+            .update(|s| s.users[0].entitlements.expires_at = Some("2000-01-01T00:00:00Z".into()))
+            .await
+            .unwrap();
+        mark_xray_rules_dirty(&ctx.runtime).await;
+        let _blocked = {
+            let s = ctx.store.read().await;
+            let blocked =
+                crate::modules::panel::users::blocked_set(&s, &BTreeMap::new(), host.now());
+            assert_eq!(blocked, BTreeSet::from([s.users[0].user_id]));
+            blocked
+        };
+        assert!(matches!(
+            converge_xray(&ctx, &xray_shared(&x)).await,
+            ConvergeOutcome::Applied(_)
+        ));
+        assert_eq!(
+            x.rules(),
+            vec![("resi-fallback".to_string(), "blocked".to_string())]
+        );
+        assert_eq!(restarts_of_xray(&host), 0);
+    }
+
+    #[tokio::test]
     async fn converge_xray_is_a_no_op_when_nothing_is_dirty() {
         let d = tempfile::tempdir().unwrap();
         let (store, bus) = store_with(d.path(), 2, 2).await;
@@ -1990,7 +2150,10 @@ mod tests {
         migrate_on_start(&ctx.store, &ctx.bus).await.unwrap();
         state::update(&ctx.runtime, |r| r.xray_slot_rules_dirty = false).await;
         let x = FakeXray::new();
-        assert_eq!(converge_xray(&ctx, &x).await, ConvergeOutcome::Clean);
+        assert_eq!(
+            converge_xray(&ctx, &xray_shared(&x)).await,
+            ConvergeOutcome::Clean
+        );
         assert!(
             x.calls().is_empty(),
             "干净时连 ListRule 都不该发：{:?}",
@@ -2008,7 +2171,7 @@ mod tests {
         mark_xray_rules_dirty(&ctx.runtime).await;
         let x = FakeXray::new();
 
-        let n = match converge_xray(&ctx, &x).await {
+        let n = match converge_xray(&ctx, &xray_shared(&x)).await {
             ConvergeOutcome::Applied(n) => n,
             other => panic!("期望 Applied，实际 {other:?}"),
         };
@@ -2026,7 +2189,10 @@ mod tests {
         // 幂等：再置一次脏也只会 ListRule 一次、什么都不改
         x.clear_calls();
         mark_xray_rules_dirty(&ctx.runtime).await;
-        assert_eq!(converge_xray(&ctx, &x).await, ConvergeOutcome::Clean);
+        assert_eq!(
+            converge_xray(&ctx, &xray_shared(&x)).await,
+            ConvergeOutcome::Clean
+        );
         assert_eq!(
             x.calls(),
             Vec::<String>::new(),
@@ -2044,7 +2210,7 @@ mod tests {
         migrate_on_start(&ctx.store, &ctx.bus).await.unwrap();
         mark_xray_rules_dirty(&ctx.runtime).await;
         let x = FakeXray::new();
-        converge_xray(&ctx, &x).await;
+        converge_xray(&ctx, &xray_shared(&x)).await;
 
         let (moved, other) = {
             let s = ctx.store.read().await;
@@ -2054,7 +2220,7 @@ mod tests {
         assert!(assign_user(&ctx, moved, slot1).await.unwrap());
         x.clear_calls();
         assert!(matches!(
-            converge_xray(&ctx, &x).await,
+            converge_xray(&ctx, &xray_shared(&x)).await,
             ConvergeOutcome::Applied(_)
         ));
         assert_eq!(
@@ -2064,7 +2230,7 @@ mod tests {
                 format!("remove-rule:resi-u-{moved}"),
                 format!("add-rule:resi-u-{moved}:relay-slot-1"),
                 "remove-rule:resi-fallback".to_string(),
-                "add-rule:resi-fallback:relay-slot-0".to_string(),
+                "add-rule:resi-fallback:blocked".to_string(),
             ],
             "先删再加（重名会让整条 AddRule 报错），最后把兜底挪回表尾"
         );
@@ -2078,7 +2244,7 @@ mod tests {
     }
 
     /// 上一轮「把兜底挪回表尾」那步失败留下的错序（兜底排在用户规则中间）：
-    /// 内容一模一样，但 Xray 首条匹配会把后面那些用户吃到兜底槽。差分必须看见这个差异，
+    /// 内容一模一样，但 Xray 首条匹配会把后面那些已授权用户拒绝。差分必须看见这个差异，
     /// 把兜底挪回表尾，而且**不重启** xray。
     #[tokio::test]
     async fn a_fallback_stuck_in_the_middle_is_moved_back_to_the_tail() {
@@ -2095,7 +2261,7 @@ mod tests {
         x.with(|i| i.rules = live);
 
         assert!(matches!(
-            converge_xray(&ctx, &x).await,
+            converge_xray(&ctx, &xray_shared(&x)).await,
             ConvergeOutcome::Applied(_)
         ));
         assert_eq!(
@@ -2103,7 +2269,7 @@ mod tests {
             vec![
                 "list-rules".to_string(),
                 "remove-rule:resi-fallback".to_string(),
-                "add-rule:resi-fallback:relay-slot-0".to_string(),
+                "add-rule:resi-fallback:blocked".to_string(),
             ],
             "只挪兜底，用户规则一条都不碰"
         );
@@ -2112,7 +2278,10 @@ mod tests {
         // 收敛之后才记哈希：再置脏一轮就什么都不发了
         x.clear_calls();
         mark_xray_rules_dirty(&ctx.runtime).await;
-        assert_eq!(converge_xray(&ctx, &x).await, ConvergeOutcome::Clean);
+        assert_eq!(
+            converge_xray(&ctx, &xray_shared(&x)).await,
+            ConvergeOutcome::Clean
+        );
         assert_eq!(x.calls(), Vec::<String>::new());
     }
 
@@ -2125,7 +2294,7 @@ mod tests {
         migrate_on_start(&ctx.store, &ctx.bus).await.unwrap();
         mark_xray_rules_dirty(&ctx.runtime).await;
         let x = FakeXray::new();
-        converge_xray(&ctx, &x).await;
+        converge_xray(&ctx, &xray_shared(&x)).await;
 
         let gone = ctx.store.read().await.users[0].user_id;
         ctx.store
@@ -2135,7 +2304,7 @@ mod tests {
         mark_xray_rules_dirty(&ctx.runtime).await;
         x.clear_calls();
         assert!(matches!(
-            converge_xray(&ctx, &x).await,
+            converge_xray(&ctx, &xray_shared(&x)).await,
             ConvergeOutcome::Applied(_)
         ));
         assert_eq!(
@@ -2165,7 +2334,10 @@ mod tests {
             i.fail_on.insert("list-rules".into());
         });
 
-        assert_eq!(converge_xray(&ctx, &x).await, ConvergeOutcome::Restarted);
+        assert_eq!(
+            converge_xray(&ctx, &xray_shared(&x)).await,
+            ConvergeOutcome::Restarted
+        );
         assert_eq!(
             x.calls(),
             vec!["list-rules".to_string()],
@@ -2181,8 +2353,246 @@ mod tests {
             r.alerts
         );
         // 再来一轮：已经不脏了 ⇒ 不再重启（「退回一次」的含义）
-        assert_eq!(converge_xray(&ctx, &x).await, ConvergeOutcome::Clean);
+        assert_eq!(
+            converge_xray(&ctx, &xray_shared(&x)).await,
+            ConvergeOutcome::Clean
+        );
         assert_eq!(restarts_of_xray(&host), 1);
+    }
+
+    #[tokio::test]
+    async fn a_restart_fallback_cannot_reload_a_quota_revoked_direct_grant() {
+        use crate::modules::panel::{fakes::FakeHy2, users, Shared, TxRx};
+        use bui_schema::model::Protocol;
+
+        let d = tempfile::tempdir().unwrap();
+        let (store, bus) = store_with(d.path(), 1, 2).await;
+        store
+            .update(|s| {
+                for (index, u) in s.users.iter_mut().enumerate() {
+                    u.entitlements.protocols = vec![Protocol::Reality];
+                    u.credentials.vless_uuid = Uuid::from_u128(0x2000 + index as u128);
+                }
+                s.users[0].entitlements.direct = true;
+                s.users[0].entitlements.residential = None;
+                s.users[0].entitlements.traffic_limit.total_bytes = Some(10);
+                s.users[1].entitlements.direct = false;
+            })
+            .await
+            .unwrap();
+        let (mut ctx, host) = ctx_of(d.path(), store, bus).await;
+        ctx.paths.base_dir = d.path().to_path_buf();
+        migrate_on_start(&ctx.store, &ctx.bus).await.unwrap();
+        let x = FakeXray::new();
+        let shared = Arc::new(Shared::new(Box::new(x.clone()), Box::new(FakeHy2::new())));
+        shared.set_paths(&ctx.paths);
+        let direct = ctx.store.read().await.users[0].user_id;
+
+        users::sync_users(&ctx, &shared, &BTreeSet::new()).await;
+        x.with(|i| {
+            assert!(i.users.contains_key(&("vless-direct".into(), direct)));
+        });
+        land_xray_config(&ctx, &host).await;
+        let landed = landed_config(&ctx).await.unwrap();
+        let disk_direct = landed["inbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|inbound| inbound["tag"] == "vless-direct")
+            .unwrap();
+        assert!(
+            disk_direct["settings"]["clients"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|client| client["email"] == direct.to_string()),
+            "reachable control: the stale disk really contains the direct identity"
+        );
+        let old_slot_hash = xray_render::slot_rules_hash(&landed);
+        shared
+            .pending()
+            .await
+            .insert(direct, TxRx { tx: 11, rx: 0 });
+        users::sync_users(&ctx, &shared, &BTreeSet::new()).await;
+        x.with(|i| {
+            assert!(
+                !i.users.contains_key(&("vless-direct".into(), direct)),
+                "reachable control: user synchronization really revoked the live direct grant"
+            );
+            i.fail_on.insert("list-rules".into());
+        });
+        let blocked = {
+            let s = ctx.store.read().await;
+            let pending = shared.pending().await;
+            users::blocked_set(&s, &pending, host.now())
+        };
+        assert!(blocked.contains(&direct));
+        let authorized: Vec<_> = ctx
+            .store
+            .read()
+            .await
+            .users
+            .iter()
+            .filter(|u| !blocked.contains(&u.user_id))
+            .cloned()
+            .collect();
+        let s = ctx.store.read().await;
+        let current = xray_render::config(&s.node, &authorized, &s.residential, &ctx.paths);
+        assert_eq!(
+            old_slot_hash,
+            xray_render::slot_rules_hash(&current),
+            "direct-only revocation leaves the residential slot hash unchanged"
+        );
+        drop(s);
+        mark_xray_rules_dirty(&ctx.runtime).await;
+        assert_eq!(
+            converge_xray(&ctx, &shared).await,
+            ConvergeOutcome::Deferred,
+            "a slot-hash match cannot authorize restart from stale direct clients"
+        );
+        assert_eq!(restarts_of_xray(&host), 0);
+        assert!(state::read(&ctx.runtime).await.xray_slot_rules_dirty);
+    }
+
+    struct DelayedListXray {
+        inner: FakeXray,
+        delay: Duration,
+        advance_clock: Option<Arc<FakeHost>>,
+    }
+
+    #[async_trait::async_trait]
+    impl XrayApi for DelayedListXray {
+        async fn inbound_users(&self, tag: &str) -> anyhow::Result<BTreeMap<Uuid, Uuid>> {
+            self.inner.inbound_users(tag).await
+        }
+        async fn add_user(&self, tag: &str, id: Uuid, uuid: Uuid) -> anyhow::Result<()> {
+            self.inner.add_user(tag, id, uuid).await
+        }
+        async fn remove_user(&self, tag: &str, id: Uuid) -> anyhow::Result<()> {
+            self.inner.remove_user(tag, id).await
+        }
+        async fn inbound_user_uuid(&self, tag: &str, id: Uuid) -> anyhow::Result<Option<Uuid>> {
+            self.inner.inbound_user_uuid(tag, id).await
+        }
+        async fn query_user_deltas(
+            &self,
+        ) -> anyhow::Result<BTreeMap<String, crate::modules::panel::TxRx>> {
+            self.inner.query_user_deltas().await
+        }
+        async fn add_rule(&self, rule: &SlotRule) -> anyhow::Result<()> {
+            self.inner.add_rule(rule).await
+        }
+        async fn remove_rule(&self, tag: &str) -> anyhow::Result<()> {
+            self.inner.remove_rule(tag).await
+        }
+        async fn list_rules(&self) -> anyhow::Result<Vec<(String, String)>> {
+            if let Some(host) = &self.advance_clock {
+                host.with(|i| i.now += time::Duration::seconds(2));
+            }
+            tokio::time::sleep(self.delay).await;
+            self.inner.list_rules().await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_successful_route_rpc_cannot_exceed_the_retry_budget() {
+        let inner = FakeXray::new();
+        inner.with(|i| {
+            i.rules = vec![("resi-fallback".into(), "blocked".into())];
+        });
+        let xray = DelayedListXray {
+            inner,
+            delay: Duration::from_secs(20),
+            advance_clock: None,
+        };
+        let expected = vec![SlotRule {
+            rule_tag: "resi-fallback".into(),
+            inbound_tag: "vless-residential".into(),
+            emails: Vec::new(),
+            outbound_tag: "blocked".into(),
+        }];
+        let started = tokio::time::Instant::now();
+        let result = apply_with_retry(&xray, &expected).await;
+        assert!(
+            result.is_err(),
+            "a successful reply after the total deadline cannot commit convergence"
+        );
+        assert!(started.elapsed() <= GRPC_RETRY_BUDGET);
+    }
+
+    #[tokio::test]
+    async fn a_restart_fallback_rechecks_expiry_after_the_failed_rpc() {
+        let d = tempfile::tempdir().unwrap();
+        let (store, bus) = store_with(d.path(), 1, 2).await;
+        let (ctx, host) = ctx_of(d.path(), store, bus).await;
+        ctx.store
+            .update(|s| {
+                s.users[0].entitlements.direct = true;
+                s.users[0].entitlements.residential = None;
+                s.users[0].entitlements.expires_at =
+                    Some(fmt_rfc3339(host.now() + time::Duration::seconds(1)));
+            })
+            .await
+            .unwrap();
+        migrate_on_start(&ctx.store, &ctx.bus).await.unwrap();
+        land_xray_config(&ctx, &host).await;
+        mark_xray_rules_dirty(&ctx.runtime).await;
+        let inner = FakeXray::new();
+        inner.with(|i| {
+            i.fail_on.insert("list-rules".into());
+        });
+        let xray = DelayedListXray {
+            inner,
+            delay: Duration::ZERO,
+            advance_clock: Some(host.clone()),
+        };
+        let shared = Arc::new(Shared::new(
+            Box::new(xray),
+            Box::new(crate::modules::panel::fakes::FakeHy2::new()),
+        ));
+        assert_eq!(
+            converge_xray(&ctx, &shared).await,
+            ConvergeOutcome::Deferred,
+            "expiry crossed during the failed RPC must invalidate the disk restart grant"
+        );
+        assert_eq!(restarts_of_xray(&host), 0);
+        assert!(state::read(&ctx.runtime).await.xray_slot_rules_dirty);
+    }
+
+    #[tokio::test]
+    async fn a_restart_fallback_rejects_unknown_disk_clients_when_routes_match() {
+        let d = tempfile::tempdir().unwrap();
+        let (store, bus) = store_with(d.path(), 1, 1).await;
+        let (ctx, host) = ctx_of(d.path(), store, bus).await;
+        migrate_on_start(&ctx.store, &ctx.bus).await.unwrap();
+        land_xray_config(&ctx, &host).await;
+        let path = ctx.paths.base_dir.join("xray-config.json");
+        host.with(|i| {
+            let bytes = &mut i.files.get_mut(&path).unwrap().0;
+            let mut cfg: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+            let before = xray_render::slot_rules_hash(&cfg);
+            cfg["inbounds"][1]["settings"]["clients"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({
+                    "id": Uuid::from_u128(777),
+                    "email": Uuid::from_u128(999).to_string(),
+                    "flow": "xtls-rprx-vision"
+                }));
+            assert_eq!(xray_render::slot_rules_hash(&cfg), before);
+            *bytes = serde_json::to_vec_pretty(&cfg).unwrap();
+        });
+        mark_xray_rules_dirty(&ctx.runtime).await;
+        let xray = FakeXray::new();
+        xray.with(|i| {
+            i.fail_on.insert("list-rules".into());
+        });
+        assert_eq!(
+            converge_xray(&ctx, &xray_shared(&xray)).await,
+            ConvergeOutcome::Deferred,
+            "unknown disk credentials cannot be regranted by a matching route hash"
+        );
+        assert_eq!(restarts_of_xray(&host), 0);
     }
 
     /// gRPC 挂了、而且磁盘上还是旧配置（对账在 500ms 之后，或全新装机还没跑过第一轮）：
@@ -2204,7 +2614,10 @@ mod tests {
             i.fail_on.insert("list-rules".into());
         });
 
-        assert_eq!(converge_xray(&ctx, &x).await, ConvergeOutcome::Deferred);
+        assert_eq!(
+            converge_xray(&ctx, &xray_shared(&x)).await,
+            ConvergeOutcome::Deferred
+        );
         assert_eq!(restarts_of_xray(&host), 0, "{:?}", host.ops());
         assert!(
             state::read(&ctx.runtime).await.xray_slot_rules_dirty,
@@ -2212,7 +2625,10 @@ mod tests {
         );
         // 对账把新文件写下去之后（serve.rs 的每轮收口），同一条路才走到重启
         land_xray_config(&ctx, &host).await;
-        assert_eq!(converge_xray(&ctx, &x).await, ConvergeOutcome::Restarted);
+        assert_eq!(
+            converge_xray(&ctx, &xray_shared(&x)).await,
+            ConvergeOutcome::Restarted
+        );
         assert_eq!(restarts_of_xray(&host), 1);
     }
 
@@ -2232,7 +2648,10 @@ mod tests {
         x.with(|i| {
             i.fail_on.insert("list-rules".into());
         });
-        assert_eq!(converge_xray(&ctx, &x).await, ConvergeOutcome::Deferred);
+        assert_eq!(
+            converge_xray(&ctx, &xray_shared(&x)).await,
+            ConvergeOutcome::Deferred
+        );
         assert_eq!(restarts_of_xray(&host), 1, "重启确实发了一次，只是失败了");
         assert!(
             state::read(&ctx.runtime).await.xray_slot_rules_dirty,
@@ -2254,7 +2673,10 @@ mod tests {
         x.with(|i| {
             i.fail_on.insert("add-rule".into());
         });
-        assert_eq!(converge_xray(&ctx, &x).await, ConvergeOutcome::Restarted);
+        assert_eq!(
+            converge_xray(&ctx, &xray_shared(&x)).await,
+            ConvergeOutcome::Restarted
+        );
         assert_eq!(restarts_of_xray(&host), 1);
     }
 
@@ -2294,7 +2716,10 @@ mod tests {
         x.with(|i| i.list_rules_unavailable = 2);
 
         assert!(
-            matches!(converge_xray(&ctx, &x).await, ConvergeOutcome::Applied(_)),
+            matches!(
+                converge_xray(&ctx, &xray_shared(&x)).await,
+                ConvergeOutcome::Applied(_)
+            ),
             "{:?}",
             x.calls()
         );
@@ -2324,7 +2749,10 @@ mod tests {
         x.with(|i| i.list_rules_unavailable = u32::MAX);
 
         let t0 = tokio::time::Instant::now();
-        assert_eq!(converge_xray(&ctx, &x).await, ConvergeOutcome::Restarted);
+        assert_eq!(
+            converge_xray(&ctx, &xray_shared(&x)).await,
+            ConvergeOutcome::Restarted
+        );
         let waited = t0.elapsed();
         assert!(waited <= GRPC_RETRY_BUDGET, "退避总时长超预算：{waited:?}");
         assert!(
@@ -2367,7 +2795,7 @@ mod tests {
         let x = FakeXray::new();
 
         assert_eq!(
-            converge_xray(&ctx, &x).await,
+            converge_xray(&ctx, &xray_shared(&x)).await,
             ConvergeOutcome::LoadedFromDisk
         );
         assert!(x.calls().is_empty(), "不许调 gRPC：{:?}", x.calls());
@@ -2381,7 +2809,10 @@ mod tests {
         );
         // 记下的就是期望哈希：再置脏一轮走第 2 道门，什么都不发
         mark_xray_rules_dirty(&ctx.runtime).await;
-        assert_eq!(converge_xray(&ctx, &x).await, ConvergeOutcome::Clean);
+        assert_eq!(
+            converge_xray(&ctx, &xray_shared(&x)).await,
+            ConvergeOutcome::Clean
+        );
         assert!(x.calls().is_empty(), "{:?}", x.calls());
     }
 
@@ -2403,7 +2834,7 @@ mod tests {
         let x = FakeXray::new();
 
         assert!(matches!(
-            converge_xray(&ctx, &x).await,
+            converge_xray(&ctx, &xray_shared(&x)).await,
             ConvergeOutcome::Applied(_)
         ));
         assert_eq!(x.calls().first().map(String::as_str), Some("list-rules"));
@@ -2429,7 +2860,10 @@ mod tests {
         x.with(|i| {
             i.fail_on.insert("list-rules".into());
         });
-        assert_eq!(converge_xray(&ctx, &x).await, ConvergeOutcome::Restarted);
+        assert_eq!(
+            converge_xray(&ctx, &xray_shared(&x)).await,
+            ConvergeOutcome::Restarted
+        );
         assert_eq!(state::read(&ctx.runtime).await.alerts.len(), 2);
 
         // gRPC 恢复；改一个人的分槽 ⇒ 下一轮走 gRPC 增删
@@ -2438,7 +2872,7 @@ mod tests {
         let slot1 = second_slot_id(&ctx).await;
         assert!(assign_user(&ctx, uid, slot1).await.unwrap());
         assert!(matches!(
-            converge_xray(&ctx, &x).await,
+            converge_xray(&ctx, &xray_shared(&x)).await,
             ConvergeOutcome::Applied(_)
         ));
         assert_eq!(
@@ -3923,6 +4357,366 @@ mod tests {
                 r.health[&o.target.to_string()].active,
                 "没探过的那条不许被记成不健康：{o:?}"
             );
+        }
+    }
+    mod restart_cancellation_fence {
+        use super::*;
+        use crate::modules::panel::{fakes::FakeHy2, Shared, TxRx};
+        use crate::sys::{CmdOut, Host, JournalFrom, JournalRecord, Proto, StagedWrite};
+        use pretty_assertions::assert_eq;
+        use std::collections::BTreeSet;
+        use std::path::{Path, PathBuf};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Condvar, Mutex};
+        use std::time::Duration;
+        use tokio::sync::Notify;
+
+        /// The irreversible systemd restart worker is intercepted immediately before
+        /// its actual side effect; both final config reads still execute normally.
+        /// All other Host effects remain the actual FakeHost implementation.
+        struct RestartFenceHost {
+            inner: Arc<FakeHost>,
+            config_path: PathBuf,
+            config_reads: AtomicUsize,
+            entered: Notify,
+            exited: Notify,
+            restarted: Notify,
+            released: Mutex<bool>,
+            release_cv: Condvar,
+        }
+
+        impl RestartFenceHost {
+            fn new(inner: Arc<FakeHost>, config_path: PathBuf) -> Self {
+                Self {
+                    inner,
+                    config_path,
+                    config_reads: AtomicUsize::new(0),
+                    entered: Notify::new(),
+                    exited: Notify::new(),
+                    restarted: Notify::new(),
+                    released: Mutex::new(false),
+                    release_cv: Condvar::new(),
+                }
+            }
+
+            fn release(&self) {
+                *self.released.lock().expect("release mutex") = true;
+                self.release_cv.notify_all();
+            }
+        }
+
+        /// Also releases on early panic / timeout so runtime cleanup cannot wait on
+        /// a permanently blocked spawn_blocking task. Normal assertions happen
+        /// only AFTER explicit release and after the restart worker has exited.
+        struct ReleaseRestartOnDrop(Arc<RestartFenceHost>);
+
+        impl Drop for ReleaseRestartOnDrop {
+            fn drop(&mut self) {
+                self.0.release();
+            }
+        }
+
+        impl Host for RestartFenceHost {
+            fn read_file(&self, path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
+                if path == self.config_path.as_path() {
+                    self.config_reads.fetch_add(1, Ordering::SeqCst);
+                }
+                self.inner.read_file(path)
+            }
+            fn file_sha256(&self, p: &Path) -> anyhow::Result<Option<String>> {
+                self.inner.file_sha256(p)
+            }
+            fn write_file(&self, p: &Path, b: &[u8], m: u32) -> anyhow::Result<()> {
+                self.inner.write_file(p, b, m)
+            }
+            fn rename_file(&self, a: &Path, b: &Path) -> anyhow::Result<()> {
+                self.inner.rename_file(a, b)
+            }
+            fn sync_parent(&self, p: &Path) -> anyhow::Result<()> {
+                self.inner.sync_parent(p)
+            }
+            fn set_file_mode(&self, p: &Path, m: u32) -> anyhow::Result<()> {
+                self.inner.set_file_mode(p, m)
+            }
+            fn stage_file<'a>(
+                &'a self,
+                p: &Path,
+                m: u32,
+            ) -> anyhow::Result<Box<dyn StagedWrite + 'a>> {
+                self.inner.stage_file(p, m)
+            }
+            fn remove_file(&self, p: &Path) -> anyhow::Result<()> {
+                self.inner.remove_file(p)
+            }
+            fn list_dir(&self, p: &Path) -> anyhow::Result<Vec<PathBuf>> {
+                self.inner.list_dir(p)
+            }
+            fn is_dir(&self, p: &Path) -> anyhow::Result<bool> {
+                self.inner.is_dir(p)
+            }
+            fn remove_dir_all(&self, p: &Path) -> anyhow::Result<()> {
+                self.inner.remove_dir_all(p)
+            }
+            fn is_symlink(&self, p: &Path) -> anyhow::Result<bool> {
+                self.inner.is_symlink(p)
+            }
+            fn read_link(&self, p: &Path) -> anyhow::Result<Option<PathBuf>> {
+                self.inner.read_link(p)
+            }
+            fn symlink(&self, a: &Path, b: &Path) -> anyhow::Result<()> {
+                self.inner.symlink(a, b)
+            }
+            fn set_immutable(&self, p: &Path, on: bool) -> anyhow::Result<()> {
+                self.inner.set_immutable(p, on)
+            }
+            fn is_immutable(&self, p: &Path) -> anyhow::Result<bool> {
+                self.inner.is_immutable(p)
+            }
+            fn run(&self, p: &str, a: &[&str]) -> anyhow::Result<CmdOut> {
+                self.inner.run(p, a)
+            }
+            fn run_stdin(&self, p: &str, a: &[&str], s: &str) -> anyhow::Result<CmdOut> {
+                self.inner.run_stdin(p, a, s)
+            }
+            fn run_journalctl(&self, a: &[&str]) -> anyhow::Result<CmdOut> {
+                self.inner.run_journalctl(a)
+            }
+            fn which(&self, p: &str) -> bool {
+                self.inner.which(p)
+            }
+            fn systemd_daemon_reload(&self) -> anyhow::Result<()> {
+                self.inner.systemd_daemon_reload()
+            }
+            fn systemd(&self, verb: &str, unit: &str) -> anyhow::Result<CmdOut> {
+                let restart = verb == "restart" && (unit == "xray" || unit == "xray.service");
+                if restart {
+                    self.entered.notify_one();
+                    let mut released = self.released.lock().expect("release mutex");
+                    while !*released {
+                        released = self.release_cv.wait(released).expect("release condvar");
+                    }
+                }
+                let result = self.inner.systemd(verb, unit);
+                if restart {
+                    self.restarted.notify_one();
+                    self.exited.notify_one();
+                }
+                result
+            }
+            fn unit_is_active(&self, u: &str) -> anyhow::Result<bool> {
+                self.inner.unit_is_active(u)
+            }
+            fn unit_is_enabled(&self, u: &str) -> anyhow::Result<bool> {
+                self.inner.unit_is_enabled(u)
+            }
+            fn unit_exists(&self, u: &str) -> anyhow::Result<bool> {
+                self.inner.unit_exists(u)
+            }
+            fn unit_property(&self, u: &str, p: &str) -> anyhow::Result<Option<String>> {
+                self.inner.unit_property(u, p)
+            }
+            fn sysctl_get(&self, k: &str) -> anyhow::Result<Option<String>> {
+                self.inner.sysctl_get(k)
+            }
+            fn sysctl_set(&self, k: &str, v: &str) -> anyhow::Result<()> {
+                self.inner.sysctl_set(k, v)
+            }
+            fn modprobe(&self, m: &str) -> anyhow::Result<()> {
+                self.inner.modprobe(m)
+            }
+            fn mem_mb(&self) -> anyhow::Result<u64> {
+                self.inner.mem_mb()
+            }
+            fn arch(&self) -> anyhow::Result<String> {
+                self.inner.arch()
+            }
+            fn hostname(&self) -> anyhow::Result<String> {
+                self.inner.hostname()
+            }
+            fn listening_ports(&self, p: Proto) -> anyhow::Result<BTreeSet<u16>> {
+                self.inner.listening_ports(p)
+            }
+            fn now(&self) -> time::OffsetDateTime {
+                self.inner.now()
+            }
+            fn journal_read(
+                &self,
+                u: &[String],
+                f: &JournalFrom,
+            ) -> anyhow::Result<Vec<JournalRecord>> {
+                self.inner.journal_read(u, f)
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn aborting_outer_convergence_retains_restart_authorization_fences() {
+            let d = tempfile::tempdir().unwrap();
+            let (store, bus) = store_with(d.path(), 1, 1).await;
+            let (mut ctx, inner) = ctx_of(d.path(), store, bus).await;
+            ctx.paths.base_dir = d.path().to_path_buf();
+            migrate_on_start(&ctx.store, &ctx.bus).await.unwrap();
+            land_xray_config(&ctx, &inner).await;
+            state::update(&ctx.runtime, |r| {
+                r.xray_slot_rules_dirty = true;
+                r.xray_slot_rules_hash = None;
+            })
+            .await;
+            let xray = FakeXray::new();
+            xray.with(|i| {
+                i.fail_on.insert("list-rules".into());
+            });
+            let shared = Arc::new(Shared::new(
+                Box::new(xray.clone()),
+                Box::new(FakeHy2::new()),
+            ));
+            shared.set_paths(&ctx.paths);
+            let fence = Arc::new(RestartFenceHost::new(
+                inner.clone(),
+                ctx.paths.base_dir.join("xray-config.json"),
+            ));
+            let _release_on_drop = ReleaseRestartOnDrop(fence.clone());
+            ctx.host = fence.clone();
+
+            let outer_ctx = ctx.clone();
+            let outer_shared = shared.clone();
+            let outer = tokio::spawn(async move { converge_xray(&outer_ctx, &outer_shared).await });
+            let entered =
+                tokio::time::timeout(Duration::from_secs(5), fence.entered.notified()).await;
+            if entered.is_err() {
+                fence.release();
+                outer.abort();
+                let _ = outer.await;
+                panic!("reachability: the actual fallback restart worker was never entered");
+            }
+            outer.abort();
+            let outer_result = outer.await;
+
+            let store_started = Arc::new(Notify::new());
+            let pending_started = Arc::new(Notify::new());
+            let store_entered = Arc::new(AtomicBool::new(false));
+            let pending_entered = Arc::new(AtomicBool::new(false));
+            let writer_store = ctx.store.clone();
+            let writer_runtime = ctx.runtime.clone();
+            let store_signal = store_started.clone();
+            let store_entered_marker = store_entered.clone();
+            let mut store_writer = tokio::spawn(async move {
+                store_signal.notify_one();
+                let result = writer_store
+                    .update(|s| {
+                        store_entered_marker.store(true, Ordering::SeqCst);
+                        s.users[0].usage.last_seen_at = Some("2026-09-11T00:00:01Z".into());
+                    })
+                    .await;
+                mark_xray_rules_dirty(&writer_runtime).await;
+                result
+            });
+            let writer_shared = shared.clone();
+            let pending_signal = pending_started.clone();
+            let pending_entered_marker = pending_entered.clone();
+            let pending_marker = Uuid::from_u128(0x9919);
+            let mut pending_writer = tokio::spawn(async move {
+                pending_signal.notify_one();
+                let mut pending = writer_shared.pending().await;
+                pending_entered_marker.store(true, Ordering::SeqCst);
+                pending.insert(pending_marker, TxRx { tx: 1, rx: 0 });
+            });
+            let writers_started = tokio::time::timeout(Duration::from_secs(5), async {
+                store_started.notified().await;
+                pending_started.notified().await;
+            })
+            .await;
+
+            // Polling a JoinHandle by &mut lets cleanup retain it after timeout.
+            // Completed RED handles are not polled a second time.
+            let store_before =
+                tokio::time::timeout(Duration::from_millis(100), &mut store_writer).await;
+            let pending_before =
+                tokio::time::timeout(Duration::from_millis(100), &mut pending_writer).await;
+            let store_was_blocked = store_before.is_err();
+            let pending_was_blocked = pending_before.is_err();
+            let store_entered_before_release = store_entered.load(Ordering::SeqCst);
+            let pending_entered_before_release = pending_entered.load(Ordering::SeqCst);
+
+            // ALWAYS release before making the RED/GREEN assertions or awaiting
+            // further work. This is also safe on the old implementation's failure.
+            fence.release();
+            let restart_exited =
+                tokio::time::timeout(Duration::from_secs(5), fence.exited.notified()).await;
+            let store_done = match store_before {
+                Ok(done) => done,
+                Err(_) => tokio::time::timeout(Duration::from_secs(5), &mut store_writer)
+                    .await
+                    .expect("released store writer must complete"),
+            };
+            let pending_done = match pending_before {
+                Ok(done) => done,
+                Err(_) => tokio::time::timeout(Duration::from_secs(5), &mut pending_writer)
+                    .await
+                    .expect("released pending writer must complete"),
+            };
+            let restarted =
+                tokio::time::timeout(Duration::from_secs(2), fence.restarted.notified()).await;
+            let terminal_finished = restarted.is_ok()
+                && state::read(&ctx.runtime)
+                    .await
+                    .xray_slot_rules_hash
+                    .is_some();
+
+            assert!(
+                restart_exited.is_ok(),
+                "blocking restart must complete after release"
+            );
+            assert!(
+                writers_started.is_ok(),
+                "both competing writers actually started"
+            );
+            assert!(outer_result.is_err_and(|e| e.is_cancelled()));
+            assert!(
+                !store_entered_before_release,
+                "Store writer acquired publication before the restart worker was released"
+            );
+            assert!(
+                !pending_entered_before_release,
+                "pending writer acquired authorization before the restart worker was released"
+            );
+            assert!(
+                store_was_blocked,
+                "outer abort released Store publication while restart worker was in flight"
+            );
+            assert!(
+                pending_was_blocked,
+                "outer abort released pending authorization while restart worker was in flight"
+            );
+            store_done
+                .expect("Store writer task")
+                .expect("Store writer publication");
+            pending_done.expect("pending writer task");
+            assert!(
+                restarted.is_ok(),
+                "detached owner must finish the authorized restart"
+            );
+            assert!(
+                terminal_finished,
+                "owner must finish terminal runtime bookkeeping"
+            );
+            assert_eq!(restarts_of_xray(&inner), 1);
+            assert!(
+                state::read(&ctx.runtime).await.xray_slot_rules_dirty,
+                "the writer after terminal completion must retain its later dirty event"
+            );
+            assert_eq!(
+                ctx.store.read().await.users[0]
+                    .usage
+                    .last_seen_at
+                    .as_deref(),
+                Some("2026-09-11T00:00:01Z"),
+                "positive control: the real Store writer completed after release"
+            );
+            assert!(
+                shared.pending().await.contains_key(&pending_marker),
+                "positive control: the real pending writer completed after release"
+            );
+            assert_eq!(fence.config_reads.load(Ordering::SeqCst), 2);
         }
     }
 }

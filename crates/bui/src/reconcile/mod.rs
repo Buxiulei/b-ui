@@ -464,6 +464,8 @@ pub fn count_pubkeys(text: &str) -> u32 {
 pub struct RenderCtx {
     pub paths: Paths,
     pub facts: Facts,
+    /// Canonical account denials for this state publication, including live usage.
+    pub account_blocked: std::collections::BTreeSet<uuid::Uuid>,
 }
 
 /// P2/P3 各实现一个，注册在 `serve.rs` 的 `modules()`。

@@ -1,4 +1,4 @@
-//! relay（sing-box 本地中继）配置渲染：规则顺序、黑名单、端口白名单、fail-open，并用真实内核校验。
+//! relay 配置渲染：精确槽位、住宅出口策略、拒绝退路，并用真实内核校验。
 mod common;
 
 use bui_schema::model::{Pin, Rule, UpstreamKind};
@@ -12,6 +12,17 @@ fn opts() -> RelayOpts {
         cache_path: "/opt/b-ui/relay-cache.db".into(),
         server_ip: Some("203.0.113.10".into()),
     }
+}
+
+fn slots(g: &bui_schema::model::ResidentialGroup) -> Vec<bui_schema::model::Slot> {
+    g.upstreams
+        .iter()
+        .enumerate()
+        .map(|(index, upstream)| bui_schema::model::Slot {
+            index: index as u16,
+            upstream_id: upstream.id,
+        })
+        .collect()
 }
 
 #[test]
@@ -69,7 +80,8 @@ fn relay_global_with_blacklist_and_ports_allowed() {
     let rules = cfg["route"]["rules"].as_array().unwrap();
     assert_eq!(rules[0]["action"], "sniff");
     assert_eq!(rules[1]["domain_suffix"][0], "pay.google.com");
-    assert_eq!(rules[1]["outbound"], "direct");
+    assert_eq!(rules[1]["action"], "reject");
+    assert!(rules[1].get("outbound").is_none());
     let ports = rules
         .iter()
         .find(|r| r.get("port_range").is_some())
@@ -82,49 +94,55 @@ fn relay_global_with_blacklist_and_ports_allowed() {
         ports["port_range"],
         serde_json::json!(["1:79", "81:442", "444:65535"])
     );
-    assert_eq!(ports["outbound"], "direct");
+    assert_eq!(ports["action"], "reject");
+    assert!(ports.get("outbound").is_none());
     assert!(rules
         .iter()
-        .any(|r| r["network"] == "udp" && r["port"] == 443 && r["action"] == "reject"));
-    // 本机公网 IP 与私网一律直连
-    assert!(rules.iter().any(|r| r["ip_cidr"]
-        .as_array()
-        .map(|a| a.iter().any(|c| c == "203.0.113.10/32"))
-        .unwrap_or(false)));
+        .any(|r| r["network"] == "udp" && r.get("port").is_none() && r["action"] == "reject"));
+    // 本机公网 IP 与私网业务不能变成 VPS 直连。
+    assert!(rules.iter().any(|r| r["action"] == "reject"
+        && r["ip_cidr"]
+            .as_array()
+            .map(|a| a.iter().any(|c| c == "203.0.113.10/32"))
+            .unwrap_or(false)));
     // global 模式没有 domain_keyword 分流（全部走住宅）
     assert!(rules.iter().all(|r| r.get("domain_keyword").is_none()));
 
-    assert_eq!(cfg["dns"]["rules"][0]["domain_suffix"][0], "pay.google.com");
-    assert_eq!(cfg["dns"]["rules"][0]["server"], "dns_direct");
+    assert_eq!(cfg["dns"]["rules"], serde_json::json!([]));
     assert_eq!(cfg["dns"]["final"], "dns_resi");
+    assert_eq!(
+        rules.last().unwrap(),
+        &serde_json::json!({"action":"reject"})
+    );
 
     common::check_singbox(&cfg);
 }
 
 #[test]
-fn relay_split_uses_keywords_and_direct_final() {
+fn relay_split_keeps_every_authorized_slot_on_residential_egress() {
     let s = common::state("split");
     let g = s.residential.default_group().unwrap().clone();
-    let cfg = relay::config(&g, &[], &opts());
+    let cfg = relay::config(&g, &slots(&g), &opts());
     let rules = cfg["route"]["rules"].as_array().unwrap();
-    // split 分流的生命线：hy2 侧 `{"action":"sniff"}` 不改写目标，客户端本地解析后 relay 只
-    // 收到 IP；唯有 rules[0] 这条无过滤 sniff 再嗅一次、让下面各槽的 domain_keyword 匹配到
-    // metadata.Domain，关键字流量才进得了住宅出口。T3 2026-09-18 对照实验摘掉它 ⇒ 静默直连
-    // （与 global 用例的 rules[0] 断言同一口径，实现见 relay.rs:126）。
+    // legacy split 关键字不再把住宅入口的其余业务改成 VPS 直连；嗅探仍用于策略匹配。
     assert_eq!(
         rules[0]["action"], "sniff",
-        "rules[0] 必须是 sniff（split 分流前提）"
+        "rules[0] 必须是 sniff（入口策略匹配前提）"
     );
-    assert_eq!(cfg["route"]["final"], "direct");
-    let last = rules.last().unwrap();
-    assert_eq!(last["outbound"], "slot-0-pool");
+    assert_eq!(cfg["route"]["final"], "resi-pool");
+    for index in [0, 1] {
+        assert!(rules.iter().any(|rule| rule["inbound"]
+            == serde_json::json!([format!("slot-{index}")])
+            && rule["outbound"] == format!("slot-{index}-pool")
+            && rule.get("domain_keyword").is_none()));
+    }
+    assert!(rules.iter().all(|r| r.get("domain_keyword").is_none()));
     assert_eq!(
-        last["domain_keyword"].as_array().unwrap().len(),
-        bui_schema::keywords::DEFAULT_KEYWORDS.len()
+        rules.last().unwrap(),
+        &serde_json::json!({"action":"reject"})
     );
-    // DNS 镜像：关键字走住宅 DNS，其余直连
-    assert_eq!(cfg["dns"]["rules"][0]["server"], "dns_resi");
-    assert_eq!(cfg["dns"]["final"], "dns_direct");
+    assert_eq!(cfg["dns"]["rules"], serde_json::json!([]));
+    assert_eq!(cfg["dns"]["final"], "dns_resi");
     common::check_singbox(&cfg);
 }
 
@@ -159,13 +177,13 @@ fn relay_blacklist_keeps_pins_global_and_auto_with_each_actual_upstream() {
         .auto
         .push(entry(other, Rule::DomainSuffix("other.example.net".into())));
 
-    let cfg = relay::config(&g, &[], &opts());
+    let cfg = relay::config(&g, &slots(&g), &opts());
     let rules = cfg["route"]["rules"].as_array().unwrap();
     assert_eq!(rules[1]["domain"], serde_json::json!(["www.paypal.com"]));
     assert!(rules[1].get("domain_suffix").is_none());
     assert_eq!(
         rules[1]["inbound"],
-        serde_json::json!(["slot-0"]),
+        serde_json::json!(["slot-0", "slot-1"]),
         "人工 pins 对用户入口生效"
     );
     let auto = rules
@@ -176,7 +194,7 @@ fn relay_blacklist_keeps_pins_global_and_auto_with_each_actual_upstream() {
         auto["inbound"],
         serde_json::json!([relay_policy::inbound_tag(selected)])
     );
-    assert_eq!(auto["outbound"], "direct");
+    assert_eq!(auto["action"], "reject");
     let port = rules
         .iter()
         .find(|r| r["port"] == serde_json::json!([5228]))
@@ -185,7 +203,7 @@ fn relay_blacklist_keeps_pins_global_and_auto_with_each_actual_upstream() {
         port["inbound"],
         serde_json::json!([relay_policy::inbound_tag(selected)])
     );
-    assert_eq!(port["outbound"], "direct");
+    assert_eq!(port["action"], "reject");
     let other_auto = rules
         .iter()
         .find(|r| r["domain_suffix"] == serde_json::json!(["other.example.net"]))
@@ -194,7 +212,7 @@ fn relay_blacklist_keeps_pins_global_and_auto_with_each_actual_upstream() {
         other_auto["inbound"],
         serde_json::json!([relay_policy::inbound_tag(other)])
     );
-    assert_eq!(other_auto["outbound"], "direct");
+    assert_eq!(other_auto["action"], "reject");
     assert!(!serde_json::to_string(&cfg["dns"])
         .unwrap()
         .contains("gateway.icloud.com"));
@@ -204,8 +222,7 @@ fn relay_blacklist_keeps_pins_global_and_auto_with_each_actual_upstream() {
     common::check_singbox(&cfg);
 }
 
-/// 全 socks5 池：UDP ASSOCIATE 可用（2026-09-12 实测 Decodo ISP，QUIC 握手双向 1200 字节通），
-/// 所以只保留 UDP/53 直连，其余 UDP 交给 `route.final`（global 时 = resi-pool）。
+/// 全 socks5 池具有 UDP 能力，业务 DNS 与其余 UDP 均保持住宅出口。
 #[test]
 fn relay_all_socks5_pool_lets_udp_reach_the_pool() {
     let s = common::state("global");
@@ -213,11 +230,11 @@ fn relay_all_socks5_pool_lets_udp_reach_the_pool() {
     for u in &mut g.upstreams {
         u.kind = UpstreamKind::Socks5;
     }
-    let cfg = relay::config(&g, &[], &opts());
+    let cfg = relay::config(&g, &slots(&g), &opts());
     let rules = cfg["route"]["rules"].as_array().unwrap();
     assert!(
-        udp_dns_direct(rules),
-        "客户端明文 DNS 仍由本机解析：{rules:#?}"
+        !udp_dns_direct(rules),
+        "客户端明文 DNS 不允许改成 VPS 出口：{rules:#?}"
     );
     assert!(
         !rules
@@ -233,20 +250,20 @@ fn relay_all_socks5_pool_lets_udp_reach_the_pool() {
     common::check_singbox(&cfg);
 }
 
-/// 混合池（fixture 自带 http + socks5）：http 出站没有 UDP 能力，规则保持 v3 三条。
+/// 混合池有 HTTP 成员，能力不足的 UDP 明确拒绝。
 #[test]
-fn relay_mixed_pool_keeps_the_three_udp_rules() {
+fn relay_mixed_pool_rejects_all_business_udp() {
     let s = common::state("global");
     let g = s.residential.default_group().unwrap().clone();
     assert!(g.upstreams.iter().any(|u| u.kind == UpstreamKind::Http));
     assert!(g.upstreams.iter().any(|u| u.kind == UpstreamKind::Socks5));
-    let cfg = relay::config(&g, &[], &opts());
+    let cfg = relay::config(&g, &slots(&g), &opts());
     let rules = cfg["route"]["rules"].as_array().unwrap();
-    assert!(udp_dns_direct(rules));
+    assert!(!udp_dns_direct(rules));
     assert!(rules
         .iter()
-        .any(|r| r["network"] == "udp" && r["port"] == 443 && r["action"] == "reject"));
-    assert!(udp_catch_all_direct(rules));
+        .any(|r| r["network"] == "udp" && r.get("port").is_none() && r["action"] == "reject"));
+    assert!(!udp_catch_all_direct(rules));
     assert!(
         udp_resolve_pos(rules).is_none(),
         "混合池的 UDP 不进 socks 出站，不需要先解析：{rules:#?}"
@@ -254,21 +271,21 @@ fn relay_mixed_pool_keeps_the_three_udp_rules() {
     common::check_singbox(&cfg);
 }
 
-/// 全 http 池：同上，三条规则一条不少。
+/// 全 HTTP 池同样拒绝 UDP，包含业务 DNS。
 #[test]
-fn relay_all_http_pool_keeps_the_three_udp_rules() {
+fn relay_all_http_pool_rejects_all_business_udp() {
     let s = common::state("split");
     let mut g = s.residential.default_group().unwrap().clone();
     for u in &mut g.upstreams {
         u.kind = UpstreamKind::Http;
     }
-    let cfg = relay::config(&g, &[], &opts());
+    let cfg = relay::config(&g, &slots(&g), &opts());
     let rules = cfg["route"]["rules"].as_array().unwrap();
-    assert!(udp_dns_direct(rules));
+    assert!(!udp_dns_direct(rules));
     assert!(rules
         .iter()
-        .any(|r| r["network"] == "udp" && r["port"] == 443 && r["action"] == "reject"));
-    assert!(udp_catch_all_direct(rules));
+        .any(|r| r["network"] == "udp" && r.get("port").is_none() && r["action"] == "reject"));
+    assert!(!udp_catch_all_direct(rules));
     assert!(
         udp_resolve_pos(rules).is_none(),
         "全 http 池的 UDP 不进 socks 出站，不需要先解析：{rules:#?}"
@@ -309,8 +326,17 @@ fn relay_all_socks5_pool_resolves_udp_after_policy_matching_before_raw_egress() 
                 .position(|r| r["action"] == "resolve" && r["inbound"] == inbound)
                 .unwrap();
             assert_eq!(rules[resolve]["network"], "udp", "TCP 域名仍交给上游");
-            assert_eq!(rules[resolve]["server"], "dns_direct");
+            let server = format!("dns-resi-{}", u.id);
+            assert_eq!(rules[resolve]["server"], server);
             assert_eq!(rules[resolve]["strategy"], "ipv4_only");
+            let dns = cfg["dns"]["servers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|dns| dns["tag"] == server)
+                .unwrap();
+            assert_eq!(dns["type"], "tcp");
+            assert_eq!(dns["detour"], relay_policy::egress_tag(u.id));
             let private = rules
                 .iter()
                 .position(|r| r.get("ip_cidr").is_some() && r["inbound"] == inbound)
@@ -333,49 +359,48 @@ fn relay_all_socks5_pool_resolves_udp_after_policy_matching_before_raw_egress() 
 }
 
 #[test]
-fn residential_dns_detour_bypasses_client_dns_and_port_rules() {
+fn business_dns_obeys_supplier_ports_and_internal_dns_uses_supplier_detour() {
     let mut g = common::state("global")
         .residential
         .default_group()
         .unwrap()
         .clone();
     for u in &mut g.upstreams {
+        u.kind = UpstreamKind::Socks5;
         u.ports_allowed = Some(vec![80, 443]);
     }
-    let cfg = relay::config(&g, &[], &opts());
+    let cfg = relay::config(&g, &slots(&g), &opts());
     let rules = cfg["route"]["rules"].as_array().unwrap();
-    let client_dns = rules
-        .iter()
-        .find(|r| r["network"] == "udp" && r["port"] == 53 && r["outbound"] == "direct")
-        .unwrap();
-    assert_eq!(client_dns["inbound"], serde_json::json!(["slot-0"]));
+    assert!(!udp_dns_direct(rules));
     for u in &g.upstreams {
         let inbound = serde_json::json!([relay_policy::inbound_tag(u.id)]);
-        let dns = rules
-            .iter()
-            .position(|r| {
-                r["inbound"] == inbound
-                    && r["network"] == "udp"
-                    && r["port"] == 53
-                    && r["outbound"] == relay_policy::egress_tag(u.id)
-            })
-            .unwrap();
         let ports = rules
             .iter()
-            .position(|r| r["inbound"] == inbound && r.get("port_range").is_some())
+            .find(|r| r["inbound"] == inbound && r.get("port_range").is_some())
             .unwrap();
-        assert!(
-            dns < ports,
-            "内部住宅 DNS 不能因 wrapper 的端口策略悄悄变直连"
+        assert_eq!(ports["action"], "reject");
+        assert_eq!(
+            ports["port_range"][0], "1:79",
+            "业务 DNS/53 必须受端口策略约束"
         );
+        let server = format!("dns-resi-{}", u.id);
+        let dns = cfg["dns"]["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|dns| dns["tag"] == server)
+            .unwrap();
+        assert_eq!(dns["type"], "tcp");
+        assert_eq!(dns["server"], "8.8.8.8");
+        assert_eq!(dns["detour"], relay_policy::egress_tag(u.id));
     }
     common::check_singbox(&cfg);
 }
 
 fn udp_resolve_pos(rules: &[serde_json::Value]) -> Option<usize> {
-    rules.iter().position(|r| {
-        r["network"] == "udp" && r["action"] == "resolve" && r["server"] == "dns_direct"
-    })
+    rules
+        .iter()
+        .position(|r| r["network"] == "udp" && r["action"] == "resolve")
 }
 
 fn udp_dns_direct(rules: &[serde_json::Value]) -> bool {
@@ -395,7 +420,7 @@ fn udp_catch_all_direct(rules: &[serde_json::Value]) -> bool {
 }
 
 #[test]
-fn relay_fail_open_when_pool_empty() {
+fn relay_empty_pool_rejects_before_infrastructure_direct_final() {
     let g = bui_schema::model::ResidentialGroup {
         enabled: true,
         ..Default::default()
@@ -408,17 +433,35 @@ fn relay_fail_open_when_pool_empty() {
         .iter()
         .all(|o| o["tag"] != "resi-pool"));
     assert_eq!(cfg["dns"]["final"], "dns_direct");
+    assert_eq!(
+        cfg["route"]["rules"].as_array().unwrap().last().unwrap(),
+        &serde_json::json!({"action":"reject"})
+    );
+    assert!(cfg["route"]["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|rule| rule.get("outbound").is_none()));
     common::check_singbox(&cfg);
 }
 
 #[test]
-fn relay_disabled_group_is_direct_only() {
+fn relay_disabled_group_rejects_before_infrastructure_direct_final() {
     let s = common::state("global");
     let mut g = s.residential.default_group().unwrap().clone();
     g.enabled = false;
     let cfg = relay::config(&g, &[], &opts());
     assert_eq!(cfg["route"]["final"], "direct");
     assert_eq!(cfg["dns"]["final"], "dns_direct");
+    assert_eq!(
+        cfg["route"]["rules"].as_array().unwrap().last().unwrap(),
+        &serde_json::json!({"action":"reject"})
+    );
+    assert!(cfg["route"]["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|rule| rule.get("outbound").is_none()));
     assert!(!serde_json::to_string(&cfg)
         .unwrap()
         .contains("isp.example.net"));

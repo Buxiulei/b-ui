@@ -21,12 +21,13 @@
                 "tag": "remote",
                 "type": "https",
                 "server": "8.8.8.8",
-                "detour": "direct-pool"
+                "detour": "residential-pool"
             },
             {
-                "tag": "local",
+                "tag": "bootstrap",
                 "type": "udp",
-                "server": "223.5.5.5"
+                "server": "223.5.5.5",
+                "detour": "bootstrap-direct"
             }
         ],
         "rules": [
@@ -38,52 +39,6 @@
                 "answer": [
                     "example.com. IN A 203.0.113.10"
                 ]
-            },
-            {
-                "domain_suffix": [
-                    ".qq.com",
-                    ".qpic.cn",
-                    ".qlogo.cn",
-                    ".wechat.com",
-                    ".weixin.qq.com",
-                    ".wx.qq.com",
-                    ".tencent.com",
-                    ".tencent-cloud.net",
-                    ".myqcloud.com",
-                    ".gtimg.com",
-                    ".xiaohongshu.com",
-                    ".xhscdn.com",
-                    ".douyin.com",
-                    ".douyincdn.com",
-                    ".amemv.com",
-                    ".bytedance.com",
-                    ".bytecdntp.com",
-                    ".toutiao.com",
-                    ".iesdouyin.com",
-                    ".kuaishou.com",
-                    ".ksapisrv.com",
-                    ".bilibili.com",
-                    ".bilivideo.com",
-                    ".hdslb.com",
-                    ".taobao.com",
-                    ".tbcdn.cn",
-                    ".alicdn.com",
-                    ".aliyuncs.com",
-                    ".alipay.com",
-                    ".alipayobjects.com",
-                    ".alibaba.com",
-                    ".alibabacloud.com",
-                    ".tmall.com",
-                    ".tmall.hk",
-                    ".jd.com",
-                    ".360buyimg.com",
-                    ".jdcdn.com",
-                    ".baidu.com",
-                    ".bdstatic.com",
-                    ".bdimg.com",
-                    ".cn"
-                ],
-                "server": "local"
             }
         ],
         "final": "remote",
@@ -215,7 +170,7 @@
         },
         {
             "type": "direct",
-            "tag": "direct"
+            "tag": "bootstrap-direct"
         }
     ],
     "route": {
@@ -229,61 +184,15 @@
             },
             {
                 "ip_is_private": true,
-                "outbound": "direct"
+                "action": "reject"
             },
             {
                 "ip_version": 6,
                 "action": "reject"
-            },
-            {
-                "domain_suffix": [
-                    ".qq.com",
-                    ".qpic.cn",
-                    ".qlogo.cn",
-                    ".wechat.com",
-                    ".weixin.qq.com",
-                    ".wx.qq.com",
-                    ".tencent.com",
-                    ".tencent-cloud.net",
-                    ".myqcloud.com",
-                    ".gtimg.com",
-                    ".xiaohongshu.com",
-                    ".xhscdn.com",
-                    ".douyin.com",
-                    ".douyincdn.com",
-                    ".amemv.com",
-                    ".bytedance.com",
-                    ".bytecdntp.com",
-                    ".toutiao.com",
-                    ".iesdouyin.com",
-                    ".kuaishou.com",
-                    ".ksapisrv.com",
-                    ".bilibili.com",
-                    ".bilivideo.com",
-                    ".hdslb.com",
-                    ".taobao.com",
-                    ".tbcdn.cn",
-                    ".alicdn.com",
-                    ".aliyuncs.com",
-                    ".alipay.com",
-                    ".alipayobjects.com",
-                    ".alibaba.com",
-                    ".alibabacloud.com",
-                    ".tmall.com",
-                    ".tmall.hk",
-                    ".jd.com",
-                    ".360buyimg.com",
-                    ".jdcdn.com",
-                    ".baidu.com",
-                    ".bdstatic.com",
-                    ".bdimg.com",
-                    ".cn"
-                ],
-                "outbound": "direct"
             }
         ],
         "final": "residential-pool",
         "auto_detect_interface": true,
-        "default_domain_resolver": "local"
+        "default_domain_resolver": "bootstrap"
     }
 }

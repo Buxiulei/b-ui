@@ -10,10 +10,12 @@ use super::{Shared, TxRx, XRAY_INBOUND_TAGS};
 use crate::api::Event;
 use crate::reconcile::DaemonCtx;
 use crate::state::store::Store;
+use bui_schema::egress::{access_for, AuthorizedEgress, RequestedEgress};
 use bui_schema::model::{
     Billing, Credentials, Entitlements, NodeParams, PortalAuth, Protocol, Residential,
     ResidentialEntitlement, State, TrafficLimit, Usage, User, DEFAULT_GROUP,
 };
+use bui_schema::nodes::{nodes_for, NodeKind};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -59,8 +61,18 @@ pub struct PanelUser {
     /// （补齐由守护进程启动时的 [`backfill_sub_tokens`] 做，所以这一档只在那之前可见）。
     #[serde(rename = "subToken", skip_serializing_if = "Option::is_none")]
     pub sub_token: Option<String>,
+    /// 单协议账户当前可交付的规范节点 URI，直接来自同一份授权节点与订阅格式器。
+    /// 融合账户使用订阅 token 地址；不可交付时省略，不让前端猜凭据、端口或 SNI。
+    #[serde(rename = "nodeUri", skip_serializing_if = "Option::is_none")]
+    pub node_uri: Option<String>,
     pub sni: String,
     pub residential: bool,
+    /// 当前住宅通路不可交付的原因；不会含凭据或猜测的出口地址。
+    #[serde(
+        rename = "residentialUnavailable",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub residential_unavailable: Option<String>,
     /// 该用户所在的 IP 槽位序号（spec §5.6；没有住宅权益 ⇒ `None`）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub slot: Option<u16>,
@@ -108,34 +120,58 @@ pub fn project(
     blocked: &BTreeSet<Uuid>,
     gates: &BTreeMap<String, String>,
 ) -> PanelUser {
-    // spec §5.6：面板要显示每个用户的槽位与 IP。
-    //
-    // **端口与跳跃区间不再跟槽序号挂钩**（4.1，spec §1.2 目标 1）：住宅 HY2 只有一个
-    // 监听端口 `ports.hy2_resi`，整段 `ports.hy2_resi_hop` 由 `table inet bui` 的 REDIRECT
-    // 送进去，所以每个用户显示的端口 / 区间都一样，且与 `nodes_for` 逐字一致（那里也是直接
-    // 取这两个字段）。槽位与 IP 的投影不变 —— 它们仍由 `slots::index_of_user` 给。
-    let slot = u.entitlements.residential.as_ref().map(|_| {
-        let idx = bui_schema::slots::index_of_user(u, resi);
-        // 槽位表为空（旧 state 首次启动、`reconcile` CLI 这条没跑过迁移的路径）时退回
-        // **池首上游**，与 `render::relay::slot_view` / `slots::fallback_index` 的 fail-open
-        // 同一口径（Fable 2026-09-13 裁决）：那时槽 0 事实上就是池里第一条，
-        // 面板显示的 IP 必须和 relay 真正在用的那条一致，不能因为「表还没建」就显示空白。
-        let ip = resi.default_group().and_then(|g| {
-            let by_slot = bui_schema::slots::sorted(resi)
-                .into_iter()
-                .find(|s| s.index == idx)
-                .and_then(|s| g.upstreams.iter().find(|x| x.id == s.upstream_id));
-            by_slot
-                .or_else(|| {
-                    if resi.slots.is_empty() {
-                        g.upstreams.first()
-                    } else {
-                        None
-                    }
-                })
-                .and_then(|x| x.verified.as_ref().map(|v| v.ip.clone()))
-        });
-        (idx, ip)
+    // 使用用户实际拥有的协议检查精确绑定；fusion 的 REALITY 不依赖 HY2 凭据预留。
+    // 暂时不可交付时不猜槽 0 / 池首 IP，面板显示明确原因。
+    let residential_access = u.entitlements.residential.as_ref().map(|_| {
+        let protocol = if u.entitlements.protocols.contains(&Protocol::Reality) {
+            Protocol::Reality
+        } else {
+            Protocol::Hysteria2
+        };
+        access_for(
+            u,
+            resi,
+            protocol,
+            RequestedEgress::RequiredResidential,
+            blocked.contains(&u.user_id),
+        )
+    });
+    let residential_unavailable = residential_access
+        .as_ref()
+        .and_then(|a| a.as_ref().err())
+        .map(ToString::to_string);
+    let single_kind = match (
+        u.entitlements.protocols.contains(&Protocol::Hysteria2),
+        u.entitlements.protocols.contains(&Protocol::Reality),
+        u.entitlements.residential.is_some(),
+    ) {
+        (true, false, true) => Some(NodeKind::Hy2Residential),
+        (true, false, false) => Some(NodeKind::Hy2Direct),
+        (false, true, true) => Some(NodeKind::RealityResidential),
+        (false, true, false) => Some(NodeKind::RealityDirect),
+        _ => None,
+    };
+    let node_uri =
+        if u.disabled || blocked.contains(&u.user_id) || residential_unavailable.is_some() {
+            None
+        } else {
+            single_kind.and_then(|kind| {
+                nodes_for(u, node, resi)
+                    .into_iter()
+                    .find(|node| node.kind == kind)
+                    .map(|node| bui_schema::render::subscription::node_uri(&node, &u.username))
+            })
+        };
+    let slot = residential_access.and_then(Result::ok).and_then(|access| {
+        let AuthorizedEgress::Residential(binding) = access else {
+            return None;
+        };
+        let ip = resi
+            .default_group()
+            .and_then(|g| g.upstreams.iter().find(|x| x.id == binding.upstream_id))
+            .and_then(|x| x.verified.as_ref())
+            .map(|v| v.ip.clone());
+        Some((binding.slot_index, ip))
     });
     // 门位：有住宅 hysteria2 权益才有这一档（口径同 `gates::expected`，判据是
     // `bui_schema::hy2pool::is_resi_hy2`）。
@@ -168,9 +204,11 @@ pub fn project(
         password: u.credentials.hy2_password.clone(),
         uuid: u.credentials.vless_uuid,
         sub_token: u.sub_token.clone(),
+        node_uri,
         // v4 没有 per-user sni：面板与订阅都用全局 REALITY 伪装域（v3.5.13 的修复口径）
         sni: node.reality.sni().to_string(),
         residential: u.entitlements.residential.is_some(),
+        residential_unavailable,
         slot: slot.as_ref().map(|(i, _)| *i),
         slot_ip: slot.as_ref().and_then(|(_, ip)| ip.clone()),
         slot_port: slot.as_ref().map(|_| node.ports.hy2_resi),
@@ -494,57 +532,64 @@ pub struct SyncOutcome {
 }
 
 /// 幂等：把「期望态 + 拒绝集合」同步到内核 —— 重写快照 + 对两个 inbound 做 gRPC 差分。
-pub async fn sync_users(ctx: &DaemonCtx, shared: &Shared, blocked: &BTreeSet<Uuid>) -> SyncOutcome {
-    // 轮次锁：采样任务与事件反应器都会调本函数，同一时刻只许一轮。
-    // 注意它与 `applied` 是两把锁 —— `applied` 只在算差分与写回记账时短暂加锁，
-    // 绝不跨 gRPC await 持有（否则 xray 掉线时 `/api/users/health` 会跟着卡）。
+pub async fn sync_users(
+    ctx: &DaemonCtx,
+    shared: &Shared,
+    caller_blocked: &BTreeSet<Uuid>,
+) -> SyncOutcome {
     let _turn = shared.sync_guard().await;
-    let state = ctx.store.read().await;
+    // Keep the actual Store writer fence until all Xray side effects are accounted for.
+    // A cancelled RPC can have reached the remote kernel; touched identities survive cancellation.
+    let publication = ctx.store.publication_permit().await;
+    let state = publication.state().clone();
+    let pending = shared.pending().await.clone();
+    let mut blocked = blocked_set(&state, &pending, ctx.host.now());
+    blocked.extend(caller_blocked);
     let mut out = SyncOutcome::default();
-
-    // ① 快照（hysteria 侧的主保障）
-    let snap = Snapshot::from_state(&state, blocked);
+    let snap = Snapshot::from_state(&state, &blocked);
     let path = shared.snapshot_path();
     match snapshot::write_if_changed(&path, &snap) {
         Ok(written) => out.snapshot_written = written,
         Err(e) => out.errors.push(format!("写 auth-snapshot.json 失败：{e}")),
     }
-
-    // ② xray 重启侦测（决策 D6）：重启会把 xray-config.json 里的全部 clients 读回来，
-    //    包括被封的那些，所以必须清空两份记账、重放差分。
     let host = ctx.host.clone();
     let restarts =
         tokio::task::spawn_blocking(move || host.unit_property("xray", "NRestarts").ok().flatten())
             .await
             .ok()
             .flatten();
-
-    // ③ 期望态：只有「未禁用、未被封、有 Reality 权益」的用户该留在两个 inbound 里
-    let desired: BTreeMap<Uuid, Uuid> = state
-        .users
-        .iter()
-        .filter(|u| {
-            !u.disabled
-                && !blocked.contains(&u.user_id)
-                && u.entitlements.protocols.contains(&Protocol::Reality)
-        })
-        .map(|u| (u.user_id, u.credentials.vless_uuid))
-        .collect();
-    // 该被拒的 Reality 用户：**无条件**删（决策 D6）。不看 `applied.xray_users`——
-    // 那份记账只活在本进程内，守护进程重启后是空的，而 `xray-config.json` 里
-    // 还带着他们的凭据（P1 Task 10 传的是全量 `state.users`）。
-    let mut want_removed: BTreeSet<Uuid> = state
-        .users
-        .iter()
-        .filter(|u| {
-            u.entitlements.protocols.contains(&Protocol::Reality)
-                && !desired.contains_key(&u.user_id)
-        })
-        .map(|u| u.user_id)
-        .collect();
-
-    // ④ 短暂加锁算差分
-    let (to_add, to_remove) = {
+    let desired = xray_grants(&state, &blocked);
+    let mut live = BTreeMap::new();
+    let mut readable = BTreeSet::new();
+    for tag in XRAY_INBOUND_TAGS {
+        match shared.xray().inbound_users(tag).await {
+            Ok(users) => {
+                readable.insert(tag);
+                live.extend(users.into_iter().map(|(id, vid)| ((tag, id), vid)));
+            }
+            Err(e) => out
+                .errors
+                .push(format!("Xray inventory {tag} 读取失败：{e}")),
+        }
+    }
+    let mut want_removed = BTreeSet::new();
+    // Revoke denied identities regardless of in-memory success markers: a stale startup
+    // configuration can contain a user this daemon never added, including removed protocols.
+    for u in &state.users {
+        for tag in XRAY_INBOUND_TAGS {
+            if !desired.contains_key(&(tag, u.user_id)) {
+                want_removed.insert((tag, u.user_id));
+            }
+        }
+    }
+    // Running named-user inventory survives daemon restarts; deleted accounts are
+    // absent from both State and a fresh Applied ledger, but still must be revoked.
+    want_removed.extend(
+        live.keys()
+            .filter(|key| !desired.contains_key(key))
+            .copied(),
+    );
+    let (to_add, to_remove, grant_set_changed) = {
         let mut applied = shared.applied().await;
         applied.snapshot_sha = Some(snap.sha256());
         if applied.xray_restarts != restarts {
@@ -552,158 +597,369 @@ pub async fn sync_users(ctx: &DaemonCtx, shared: &Shared, blocked: &BTreeSet<Uui
                 tracing::info!(?restarts, "xray 重启过，重放 gRPC 用户差分");
             }
             applied.xray_restarts = restarts;
+            let previous: Vec<_> = applied.xray_inbound_users.keys().copied().collect();
+            applied.xray_touched.extend(previous);
             applied.xray_users.clear();
-            applied.xray_removed.clear();
+            applied.xray_inbound_users.clear();
+            applied.xray_inbound_removed.clear();
         }
-        // 已从面板删掉的用户不在 `state` 里，只能靠 `applied.xray_users` 发现
-        for id in applied.xray_users.keys() {
-            if !desired.contains_key(id) {
-                want_removed.insert(*id);
+        for key in applied
+            .xray_inbound_users
+            .keys()
+            .chain(applied.xray_touched.iter())
+        {
+            if !desired.contains_key(key) {
+                want_removed.insert(*key);
             }
         }
-        // `applied.xray_users` 在这里只当**跳过位**：记账说已经挂上这个 uuid 了就整个跳过，
-        // 省掉一次 gRPC 读。它不是判据 —— 记账只活在进程内，b-ui 一重启就是空的，
-        // xray 从落后的 `xray-config.json` 起来时也一样对不上；真判据是下面 ⑤ 的
-        // `GetInboundUsers`（读回这个 email 当前挂的 uuid）。
-        let to_add: Vec<(Uuid, Uuid)> = desired
+        let grant_set_changed = desired != applied.xray_inbound_users;
+        let to_add: Vec<_> = desired
             .iter()
-            .filter(|(id, vid)| applied.xray_users.get(id) != Some(vid))
-            .map(|(id, vid)| (*id, *vid))
+            .filter(|(key, vid)| {
+                readable.contains(key.0)
+                    && (applied.xray_inbound_users.get(key) != Some(vid)
+                        || live.get(key) != Some(vid))
+            })
+            .map(|(key, vid)| (*key, *vid))
             .collect();
-        let to_remove: Vec<Uuid> = want_removed
+        let to_remove: Vec<_> = want_removed
             .iter()
-            .filter(|id| !applied.xray_removed.contains(id))
+            .filter(|key| live.contains_key(key) || !applied.xray_inbound_removed.contains(key))
             .copied()
             .collect();
+        // This is an attempt ledger, not success evidence. Record before any awaited RPC.
+        for (key, _) in &to_add {
+            applied.xray_touched.insert(*key);
+            // An in-flight grant invalidates earlier evidence that the same inlet is empty.
+            applied.xray_inbound_removed.remove(key);
+        }
         out.newly_blocked = blocked.difference(&applied.blocked).copied().collect();
         applied.blocked = blocked.clone();
-        (to_add, to_remove)
+        (to_add, to_remove, grant_set_changed)
     };
-
-    // ⑤ gRPC 差分（不持 `applied`）。两个 inbound 都成功才记账，否则留给 60 秒安全网重试。
-    let mut added: Vec<(Uuid, Uuid)> = Vec::new();
-    for (id, vid) in to_add {
+    let mut removed = Vec::new();
+    // Close old grants first; a residential grant never keeps the direct inlet authorized.
+    for (tag, id) in to_remove {
+        match free_the_email(ctx, shared, tag, id).await {
+            Ok(()) => removed.push((tag, id)),
+            Err(e) => out.errors.push(format!("RemoveUser {tag} 失败：{e}")),
+        }
+    }
+    let mut added = Vec::new();
+    let by_id: BTreeMap<_, _> = state.users.iter().map(|u| (u.user_id, u)).collect();
+    for ((tag, id), vid) in to_add {
+        let user = by_id[&id];
+        if !xray_grant_current(ctx, shared, &state, user, tag, caller_blocked).await {
+            continue;
+        }
         let mut ok = true;
-        for tag in XRAY_INBOUND_TAGS {
-            // 先读后写（2026-09-14 审查意见①②）：`GetInboundUsers` 读回这个 email 当前挂的
-            // uuid，所以「换 uuid 要先摘再加」这件事不必靠进程内记账、也不必靠错误文案猜。
-            // 关键收益是 uuid 没变时**一个写请求都不发**：b-ui 或 xray 一重启 `applied`
-            // 就清空，全部健康用户都会重新走一遍这里，盲目「摘掉再加」等于给每个人开一个
-            // 「已摘出、还没加回」的窗口 —— 那一步失败（inbound 正在重载）就把好用户摘掉，
-            // 要等 60 秒安全网才补回来。
-            match shared.xray().inbound_user_uuid(tag, id).await {
-                // 挂的就是期望的 uuid ⇒ 目标已达成，不写
-                Ok(Some(cur)) if cur == vid => continue,
-                // 挂着别的 uuid（轮换、或面板给只有 Reality 权益的用户改 UUID）⇒ 摘掉腾位置：
-                // AddUser 撞同名 email 只会报「已存在」，新 uuid 挂不上
-                Ok(Some(_)) => {
-                    if let Err(e) = free_the_email(ctx, shared, tag, id).await {
-                        // 位置没腾出来，AddUser 只会再撞一次「已存在」：这一轮不加，
-                        // 留给 60 秒安全网重试（幂等）
-                        ok = false;
-                        out.errors
-                            .push(format!("换 uuid 前 RemoveUser {tag} 失败：{e}"));
-                        continue;
-                    }
-                }
-                // 位置空着 ⇒ 直接加
-                Ok(None) => {}
-                // 读不到（xray 掉线、inbound 还没起、或内核老到没这个 RPC）⇒ 退回下面那条
-                // 只靠错误文案的老路：AddUser 撞「已存在」就摘掉再加
-                Err(e) => {
-                    tracing::debug!(tag, %id, error = %e, "GetInboundUsers 读不到，退回 AddUser 那一路")
+        match shared.xray().inbound_user_uuid(tag, id).await {
+            // 挂的就是期望的 uuid ⇒ 目标已达成，不写
+            Ok(Some(cur)) if cur == vid => {
+                added.push(((tag, id), vid));
+                continue;
+            }
+            // 挂着别的 uuid（轮换、或面板给只有 Reality 权益的用户改 UUID）⇒ 摘掉腾位置：
+            // AddUser 撞同名 email 只会报「已存在」，新 uuid 挂不上
+            Ok(Some(_)) => {
+                if let Err(e) = free_the_email(ctx, shared, tag, id).await {
+                    // 位置没腾出来，AddUser 只会再撞一次「已存在」：这一轮不加，
+                    // 留给 60 秒安全网重试（幂等）
+                    out.errors
+                        .push(format!("换 uuid 前 RemoveUser {tag} 失败：{e}"));
+                    continue;
                 }
             }
-            match shared.xray().add_user(tag, id, vid).await {
-                Ok(()) => {}
-                // xray 说这个 email 已经在 inbound 里 = 位置被占。**绝不**把它记成已达目标：
-                // 上面的读失败了才走到这儿，挂着的可能正是要换掉的旧 uuid（吃下这条错误就等于
-                // 把旧 uuid 记成新 uuid —— 泄露的旧凭据一直有效到 xray 下次重启，而
-                // `render::xray::structural_hash` 剥掉了 clients，对账也不会重启它）。
-                Err(e) if email_taken(&e.to_string()) => {
-                    match free_the_email(ctx, shared, tag, id).await {
-                        Err(e2) => {
+            // 位置空着 ⇒ 直接加
+            Ok(None) => {}
+            // 读不到（xray 掉线、inbound 还没起、或内核老到没这个 RPC）⇒ 退回下面那条
+            // 只靠错误文案的老路：AddUser 撞「已存在」就摘掉再加
+            Err(e) => {
+                tracing::debug!(tag, %id, error = %e, "GetInboundUsers 读不到，退回 AddUser 那一路")
+            }
+        }
+        if !xray_grant_current(ctx, shared, &state, user, tag, caller_blocked).await {
+            continue;
+        }
+        match shared.xray().add_user(tag, id, vid).await {
+            Ok(()) => {}
+            // xray 说这个 email 已经在 inbound 里 = 位置被占。**绝不**把它记成已达目标：
+            // 上面的读失败了才走到这儿，挂着的可能正是要换掉的旧 uuid（吃下这条错误就等于
+            // 把旧 uuid 记成新 uuid —— 泄露的旧凭据一直有效到 xray 下次重启，而
+            // `render::xray::structural_hash` 剥掉了 clients，对账也不会重启它）。
+            Err(e) if email_taken(&e.to_string()) => {
+                match free_the_email(ctx, shared, tag, id).await {
+                    Err(e2) => {
+                        ok = false;
+                        out.errors.push(format!(
+                            "AddUser {tag} 报已存在、腾位置的 RemoveUser 又失败：{e2}"
+                        ));
+                    }
+                    Ok(()) => {
+                        if !xray_grant_current(ctx, shared, &state, user, tag, caller_blocked).await
+                        {
+                            continue;
+                        }
+                        if let Err(e2) = shared.xray().add_user(tag, id, vid).await {
+                            // 已经摘出去了、又没加回来 ⇒ 这个用户此刻**在 `tag` 上握不了新手**，
+                            // 要等 60 秒安全网补回。单独写清楚，别让运维以为只是加不上。
                             ok = false;
                             out.errors.push(format!(
-                                "AddUser {tag} 报已存在、腾位置的 RemoveUser 又失败：{e2}"
+                                "AddUser {tag} 重试失败，该用户已被摘出 {tag}、等下一轮补回：{e2}"
                             ));
-                        }
-                        Ok(()) => {
-                            if let Err(e2) = shared.xray().add_user(tag, id, vid).await {
-                                // 已经摘出去了、又没加回来 ⇒ 这个用户此刻**在 `tag` 上握不了新手**，
-                                // 要等 60 秒安全网补回。单独写清楚，别让运维以为只是加不上。
-                                ok = false;
-                                out.errors.push(format!(
-                                    "AddUser {tag} 重试失败，该用户已被摘出 {tag}、等下一轮补回：{e2}"
-                                ));
-                            } else {
-                                tracing::info!(tag, %id, "AddUser 报已存在，摘掉旧的重加一次");
-                            }
+                        } else {
+                            tracing::info!(tag, %id, "AddUser 报已存在，摘掉旧的重加一次");
                         }
                     }
                 }
-                Err(e) => {
-                    ok = false;
-                    out.errors.push(format!("AddUser {tag} 失败：{e}"));
-                }
+            }
+            Err(e) => {
+                ok = false;
+                out.errors.push(format!("AddUser {tag} 失败：{e}"));
             }
         }
         if ok {
-            added.push((id, vid));
-            out.added.push(id);
+            added.push(((tag, id), vid));
         }
     }
-    let mut removed: Vec<Uuid> = Vec::new();
-    for id in to_remove {
-        let mut ok = true;
+    // Time and pending quota can advance while RPCs are in flight even with Store publication
+    // fenced. Close every grant that became invalid, including users skipped as already applied.
+    let pending = shared.pending().await.clone();
+    blocked = blocked_set(&state, &pending, ctx.host.now());
+    blocked.extend(caller_blocked);
+    let mut final_desired = xray_grants(&state, &blocked);
+    for (tag, id) in desired
+        .keys()
+        .filter(|key| !final_desired.contains_key(key))
+        .copied()
+    {
+        match free_the_email(ctx, shared, tag, id).await {
+            Ok(()) => removed.push((tag, id)),
+            Err(e) => out
+                .errors
+                .push(format!("授权在同步期间失效，RemoveUser {tag} 失败：{e}")),
+        }
+    }
+    let mut final_snapshot = Snapshot::from_state(&state, &blocked);
+    match snapshot::write_if_changed(&path, &final_snapshot) {
+        Ok(written) => out.snapshot_written |= written,
+        Err(e) => out
+            .errors
+            .push(format!("更新 auth-snapshot.json 失败：{e}")),
+    }
+    let mut final_live = BTreeMap::new();
+    let mut final_readable = BTreeSet::new();
+    let mut verified = BTreeSet::new();
+    // Final observation is part of authorization publication: quota and clock can
+    // advance during these RPCs too. One repair-and-readback round is bounded; further
+    // changes are reported as unsettled, never committed as synchronized authority.
+    for attempt in 0..2 {
+        final_live.clear();
+        final_readable.clear();
+        verified.clear();
         for tag in XRAY_INBOUND_TAGS {
-            if let Err(e) = shared.xray().remove_user(tag, id).await {
-                let msg = e.to_string();
-                if target_already_reached(&msg) {
-                    // xray 侧本来就没有这个 email ⇒ 目标已达成，不必跑 CLI 退路
-                    tracing::debug!(tag, %id, "RemoveUser 报不存在，按成功处理");
-                } else if !cli_remove(ctx, tag, &id.to_string()).await {
-                    // CLI 退路（X9、决策 D12）：RemoveUser 这条方向不自愈，必须补上
-                    ok = false;
-                    out.errors.push(format!("RemoveUser {tag} 失败：{msg}"));
+            match shared.xray().inbound_users(tag).await {
+                Ok(users) => {
+                    final_readable.insert(tag);
+                    final_live.extend(users.into_iter().map(|(id, vid)| ((tag, id), vid)));
                 }
+                Err(e) => out
+                    .errors
+                    .push(format!("Xray inventory {tag} 最终读回失败：{e}")),
             }
         }
-        if ok {
-            removed.push(id);
-            out.removed.push(id);
+        let pending = shared.pending().await.clone();
+        let mut observed_blocked = blocked_set(&state, &pending, ctx.host.now());
+        observed_blocked.extend(caller_blocked);
+        let observed_desired = xray_grants(&state, &observed_blocked);
+        blocked = observed_blocked;
+        final_snapshot = Snapshot::from_state(&state, &blocked);
+        match snapshot::write_if_changed(&path, &final_snapshot) {
+            Ok(written) => out.snapshot_written |= written,
+            Err(e) => out
+                .errors
+                .push(format!("更新 auth-snapshot.json 失败：{e}")),
         }
+        if observed_desired != final_desired {
+            for (tag, id) in final_desired
+                .keys()
+                .filter(|key| !observed_desired.contains_key(key))
+                .copied()
+            {
+                match free_the_email(ctx, shared, tag, id).await {
+                    Ok(()) => removed.push((tag, id)),
+                    Err(e) => out.errors.push(format!(
+                        "授权在最终读回期间失效，RemoveUser {tag} 失败：{e}"
+                    )),
+                }
+            }
+            final_desired = observed_desired;
+            if attempt == 1 {
+                final_readable.clear();
+                out.errors
+                    .push("Xray inventory 授权在最终观察期间继续变化，未记为已收敛".into());
+                break;
+            }
+            continue;
+        }
+        for tag in &final_readable {
+            let expected: BTreeMap<_, _> = final_desired
+                .iter()
+                .filter(|((inbound, _), _)| inbound == tag)
+                .map(|((_, id), vid)| (*id, *vid))
+                .collect();
+            let observed: BTreeMap<_, _> = final_live
+                .iter()
+                .filter(|((inbound, _), _)| inbound == tag)
+                .map(|((_, id), vid)| (*id, *vid))
+                .collect();
+            if observed == expected {
+                verified.insert(*tag);
+            } else {
+                out.errors
+                    .push(format!("Xray inventory {tag} 未达到当前授权集合"));
+            }
+        }
+        break;
     }
-
-    // ⑥ 短暂加锁写回记账
     {
         let mut applied = shared.applied().await;
-        for (id, vid) in added {
-            applied.xray_users.insert(id, vid);
-            // 恢复过的用户将来再被封，还要能再删一次
-            applied.xray_removed.remove(&id);
+        applied.snapshot_sha = Some(final_snapshot.sha256());
+        let added_ids: BTreeSet<_> = added.iter().map(|((_, id), _)| *id).collect();
+        let removed_ids: BTreeSet<_> = removed.iter().map(|(_, id)| *id).collect();
+        for (key, vid) in added {
+            if final_desired.get(&key) == Some(&vid) {
+                applied.xray_inbound_users.insert(key, vid);
+                applied.xray_inbound_removed.remove(&key);
+            }
         }
-        for id in removed {
-            applied.xray_users.remove(&id);
-            applied.xray_removed.insert(id);
+        for key in removed {
+            applied.xray_inbound_users.remove(&key);
+            applied.xray_inbound_removed.insert(key);
+            applied.xray_touched.remove(&key);
         }
-        // 已从 state 里删掉的用户不必再记账（同一个 user_id 不会回来），顺手别让这个集合长胖
-        let known: BTreeSet<Uuid> = state.users.iter().map(|u| u.user_id).collect();
-        applied.xray_removed.retain(|id| known.contains(id));
+        // Follow final kernel truth: an RPC acknowledgement is insufficient evidence
+        // after reload, and cannot hide an unknown user whose removal failed.
+        applied
+            .xray_inbound_users
+            .retain(|key, vid| !final_readable.contains(key.0) || final_live.get(key) == Some(vid));
+        for (key, vid) in &final_live {
+            if final_desired.get(key) == Some(vid) {
+                applied.xray_inbound_users.insert(*key, *vid);
+                applied.xray_inbound_removed.remove(key);
+            }
+        }
+        applied.xray_users = state
+            .users
+            .iter()
+            .filter(|u| {
+                let mut has_grant = false;
+                for tag in XRAY_INBOUND_TAGS {
+                    if !verified.contains(tag) {
+                        return false;
+                    }
+                    let key = (tag, u.user_id);
+                    if let Some(vid) = final_desired.get(&key) {
+                        has_grant = true;
+                        if applied.xray_inbound_users.get(&key) != Some(vid) {
+                            return false;
+                        }
+                    } else if !applied.xray_inbound_removed.contains(&key) {
+                        return false;
+                    }
+                }
+                has_grant
+            })
+            .map(|u| (u.user_id, u.credentials.vless_uuid))
+            .collect();
+        out.added = added_ids
+            .into_iter()
+            .filter(|id| applied.xray_users.contains_key(id))
+            .collect();
+        out.removed = removed_ids
+            .into_iter()
+            .filter(|id| {
+                XRAY_INBOUND_TAGS
+                    .into_iter()
+                    .filter(|tag| !final_desired.contains_key(&(*tag, *id)))
+                    .all(|tag| applied.xray_inbound_removed.contains(&(tag, *id)))
+            })
+            .collect();
+        out.newly_blocked
+            .extend(blocked.difference(&applied.blocked).copied());
+        out.newly_blocked.sort_unstable();
+        out.newly_blocked.dedup();
+        applied.blocked = blocked.clone();
+        let known: BTreeSet<_> = state.users.iter().map(|u| u.user_id).collect();
+        applied
+            .xray_inbound_removed
+            .retain(|(_, id)| known.contains(id));
     }
-    // ⑦ 住宅 HY2 的门位收敛（spec §3.3）：与上面那段 xray 收敛同构 —— 读一次内核真源
-    //    （`GET /proxies`）、求差集、只 PUT 不一致的那几个。用户的到期 / 封禁 / 解禁 /
-    //    换槽全部在这里落地，`hy2-residential.json` 一个字节都不动（spec §3.5）。
-    //    失败项进 `out.errors` ⇒ `report()` 打 `USER_SYNC_FAILED_LOG` ⇒ 哨兵认
-    //    `hy2_resi_gate_sync_failed`，60 秒安全网下一轮重试（幂等）。
-    let gates = super::gates::converge(ctx, shared, blocked).await;
-    out.errors.extend(gates.errors);
-
-    // 用户集合变了 ⇒ Xray 的槽规则表要跟着增删（D7），置脏交给对账末尾收敛
-    if !out.added.is_empty() || !out.removed.is_empty() {
+    drop(publication); // Gate convergence takes its own Store fence; never nest it.
+    if grant_set_changed || desired != final_desired || !out.removed.is_empty() {
+        // Authorization revocation changes slot routes even when an RPC failure prevents
+        // the aggregate user count from being reported as fully synchronized.
         crate::modules::residential::slots::mark_xray_rules_dirty(&ctx.runtime).await;
     }
+    let gates = super::gates::converge(ctx, shared, &blocked).await;
+    out.errors.extend(gates.errors);
     out
+}
+
+/// Exact identities for each separately authorized REALITY inlet.
+fn xray_grants(state: &State, blocked: &BTreeSet<Uuid>) -> BTreeMap<(&'static str, Uuid), Uuid> {
+    let mut grants = BTreeMap::new();
+    for user in &state.users {
+        for (tag, request) in [
+            (XRAY_INBOUND_TAGS[0], RequestedEgress::Direct),
+            (XRAY_INBOUND_TAGS[1], RequestedEgress::RequiredResidential),
+        ] {
+            if access_for(
+                user,
+                &state.residential,
+                Protocol::Reality,
+                request,
+                blocked.contains(&user.user_id),
+            )
+            .is_ok()
+            {
+                grants.insert((tag, user.user_id), user.credentials.vless_uuid);
+            }
+        }
+    }
+    grants
+}
+
+/// Recheck the owning accounting policy after awaited readback/removal, before a grant.
+async fn xray_grant_current(
+    ctx: &DaemonCtx,
+    shared: &Shared,
+    state: &State,
+    user: &User,
+    tag: &str,
+    forced_blocked: &BTreeSet<Uuid>,
+) -> bool {
+    let delta = shared
+        .pending()
+        .await
+        .get(&user.user_id)
+        .copied()
+        .unwrap_or_default();
+    let account_blocked =
+        forced_blocked.contains(&user.user_id) || is_blocked(user, delta, ctx.host.now()).is_some();
+    let requested = if tag == XRAY_INBOUND_TAGS[0] {
+        RequestedEgress::Direct
+    } else {
+        RequestedEgress::RequiredResidential
+    };
+    access_for(
+        user,
+        &state.residential,
+        Protocol::Reality,
+        requested,
+        account_blocked,
+    )
+    .is_ok()
 }
 
 /// `RemoveUser` 撞上「email 不存在」时 xray 返回错误，而这时目标状态其实已经达成
@@ -845,7 +1101,7 @@ fn report(out: SyncOutcome) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::modules::panel::testsupport::{harness, Harness};
+    use crate::modules::panel::testsupport::{harness as bare_harness, Harness};
     use crate::testutil::sample_state;
     use pretty_assertions::assert_eq;
     use time::macros::datetime;
@@ -968,29 +1224,25 @@ mod tests {
         assert!(v["slotPort"].is_null());
     }
 
-    /// 槽位表还是空的（旧 state 首次启动、`reconcile` CLI 路径）：槽位显示退回
-    /// 「槽 0 + 池首上游」，与 `render::relay::slot_view` / `slots::fallback_index` 的
-    /// fail-open 同口径（Fable 2026-09-13 裁决）。面板显示的 IP 必须就是 relay 真正在用的那条。
+    /// 槽位表没有建立时，展示待绑定原因，不签出一个猜测的池首地址。
     #[test]
-    fn an_empty_slot_table_falls_back_to_the_head_of_the_pool() {
+    fn an_empty_slot_table_reports_missing_binding_without_a_fallback_ip() {
         let s = crate::modules::residential::sample_state_with_pool();
         assert!(
             s.residential.slots.is_empty(),
             "sample 没有槽位表，正是要测的那一档"
         );
         let v = serde_json::to_value(&project_all(&s, &BTreeSet::new())[0]).unwrap();
-        assert_eq!(v["slot"], 0);
-        assert_eq!(v["slotPort"], 40000);
-        assert_eq!(v["slotHop"], serde_json::json!([41000, 50000]));
-        assert_eq!(
-            v["slotIp"], "198.51.100.7",
-            "退回池首上游的 verified.ip（sample_group 的第一条）"
-        );
+        assert!(v["slot"].is_null());
+        assert!(v["slotPort"].is_null());
+        assert!(v["slotHop"].is_null());
+        assert!(v["slotIp"].is_null());
+        assert_eq!(v["residentialUnavailable"], "residential slot unassigned");
     }
 
-    /// 池是空的（住宅没开）：槽位序号与端口照给（fail-open 的监听照在），IP 只能是空。
+    /// 空池没有住宅通路可交付，不能继续显示可用端口和猜测的槽位。
     #[test]
-    fn an_empty_pool_reports_the_v3_port_with_no_ip() {
+    fn an_empty_pool_reports_unavailability_without_a_connectable_port() {
         let mut s = crate::modules::residential::sample_state_with_pool();
         s.residential
             .groups
@@ -999,15 +1251,15 @@ mod tests {
             .upstreams
             .clear();
         let v = serde_json::to_value(&project_all(&s, &BTreeSet::new())[0]).unwrap();
-        assert_eq!(v["slot"], 0);
-        assert_eq!(v["slotPort"], 40000);
+        assert!(v["slot"].is_null());
+        assert!(v["slotPort"].is_null());
         assert!(v["slotIp"].is_null());
+        assert_eq!(v["residentialUnavailable"], "residential pool empty");
     }
 
-    /// 槽位表**非空**但这个用户指向的槽不在表里（刚被删掉的上游）：退回兜底槽的 IP，
-    /// **不**退回池首 —— 表非空时兜底槽就是表里序号最小的那个，池首可能根本没有槽位。
+    /// 绑定已经消失时，不把其它供应商的地址显示成该用户的出口。
     #[test]
-    fn a_stale_slot_id_falls_back_to_the_fallback_slots_ip() {
+    fn a_stale_slot_id_reports_missing_slot_without_using_another_suppliers_ip() {
         let mut s = crate::modules::residential::sample_state_with_pool();
         bui_schema::slots::sync_slots(&mut s.residential);
         assert_eq!(s.residential.slots.len(), 1);
@@ -1022,8 +1274,9 @@ mod tests {
             .unwrap()
             .slot_id = Some(Uuid::from_u128(0xdead));
         let v = serde_json::to_value(&project_all(&s, &BTreeSet::new())[0]).unwrap();
-        assert_eq!(v["slot"], 0);
-        assert_eq!(v["slotIp"], "198.51.100.7");
+        assert!(v["slot"].is_null());
+        assert!(v["slotIp"].is_null());
+        assert_eq!(v["residentialUnavailable"], "residential slot missing");
     }
 
     /// 面板投影（T14）：**端口与槽位解耦** + 门位那一档。
@@ -1129,6 +1382,183 @@ mod tests {
         );
         assert!(p.blocked);
         assert_eq!(project_all(&s, &BTreeSet::from([id])).len(), 1);
+    }
+
+    fn canonical_single_node_state() -> State {
+        let mut state = crate::modules::residential::sample_state_with_pool();
+        state.node.domain = "edge.example".into();
+        state.node.ports.hy2 = 12345;
+        state.node.ports.hy2_resi = 42345;
+        state.node.ports.hy2_resi_hop = (43000, 43999);
+        state.node.obfs.enabled = true;
+        state.node.obfs.password = "obfs/pw?".into();
+        state.users = vec![new_user(
+            &CreateRequest {
+                username: "alice".into(),
+                password: Some("native-only-secret".into()),
+                protocol: Some("hysteria2".into()),
+                residential: Some(true),
+                ..Default::default()
+            },
+            t0(),
+        )
+        .unwrap()];
+        bui_schema::slots::sync_slots(&mut state.residential);
+        let uid = state.users[0].user_id;
+        let upstream = state.residential.default_group().unwrap().upstreams[0].id;
+        assert!(bui_schema::slots::assign(&mut state, uid, upstream));
+        bui_schema::hy2pool::grow(&mut state.residential.hy2_pool, 32, &BTreeSet::new());
+        assert_eq!(
+            bui_schema::hy2pool::assign_at(&mut state, uid, t0()).as_deref(),
+            Some("r000")
+        );
+        state.residential.hy2_pool.creds[0].secret = "reserved-create".into();
+        state
+    }
+
+    #[test]
+    fn canonical_node_uri_uses_reserved_identity_after_create_and_rotate() {
+        let mut state = canonical_single_node_state();
+        for (id, secret) in [("r000", "reserved-create"), ("r001", "reserved-rotated")] {
+            let cred = bui_schema::hy2pool::cred_of(&state.users[0], &state.residential).unwrap();
+            assert_eq!(cred.name, id);
+            assert_eq!(cred.secret, secret);
+            assert_ne!(cred.name, state.users[0].username);
+            assert_ne!(cred.secret, state.users[0].credentials.hy2_password);
+            let expected = match id {
+                "r000" => "hysteria2://r000:reserved-create@edge.example:42345?sni=edge.example&insecure=0&mport=43000-43999&obfs=salamander&obfs-password=obfs%2Fpw%3F#alice-HY2%E4%BD%8F%E5%AE%85",
+                _ => "hysteria2://r001:reserved-rotated@edge.example:42345?sni=edge.example&insecure=0&mport=43000-43999&obfs=salamander&obfs-password=obfs%2Fpw%3F#alice-HY2%E4%BD%8F%E5%AE%85",
+            };
+            let payload = serde_json::to_value(&project_all(&state, &BTreeSet::new())[0]).unwrap();
+            assert_eq!(payload["nodeUri"], expected, "the product projection must publish the reserved identity, not the direct password");
+            let parsed = bui_schema::parse::node_uri(payload["nodeUri"].as_str().unwrap()).unwrap();
+            assert_eq!(
+                (parsed.host.as_str(), parsed.port, parsed.hop),
+                ("edge.example", 42345, Some((43000, 43999)))
+            );
+            assert_eq!(
+                parsed.transport,
+                bui_schema::nodes::Transport::Hysteria2 {
+                    username: id.into(),
+                    password: secret.into(),
+                    sni: "edge.example".into(),
+                    obfs_password: Some("obfs/pw?".into()),
+                }
+            );
+            let stock = bui_schema::render::client::probe_config(&[
+                bui_schema::render::client::ProbeTarget {
+                    node: &parsed,
+                    listen_port: 12001,
+                    user: "fixture-user".into(),
+                    pass: "fixture-password".into(),
+                },
+            ]);
+            let outbound = &stock["outbounds"][0];
+            assert_eq!(outbound["type"], "hysteria2");
+            assert_eq!(outbound["server"], "edge.example");
+            assert_eq!(outbound["server_port"], 42345);
+            assert_eq!(outbound["server_ports"], serde_json::json!(["43000:43999"]));
+            assert_eq!(outbound["password"], format!("{id}:{secret}"));
+            assert_eq!(outbound["tls"]["server_name"], "edge.example");
+            assert_eq!(outbound["obfs"]["password"], "obfs/pw?");
+            if let Some(directory) = std::env::var_os("BUI_TEST_PANEL_NODE_URI_FIXTURE_DIR") {
+                let directory = std::path::PathBuf::from(directory);
+                std::fs::create_dir_all(&directory).unwrap();
+                std::fs::write(
+                    directory.join(format!("{id}-panel.json")),
+                    serde_json::to_vec_pretty(&payload).unwrap(),
+                )
+                .unwrap();
+                std::fs::write(
+                    directory.join(format!("{id}-stock-client.json")),
+                    serde_json::to_vec_pretty(&stock).unwrap(),
+                )
+                .unwrap();
+            }
+            if id == "r000" {
+                let uid = state.users[0].user_id;
+                rotate(&mut state.users[0]);
+                assert_eq!(
+                    bui_schema::hy2pool::release(&mut state, uid, t0()).as_deref(),
+                    Some("r000")
+                );
+                assert_eq!(
+                    bui_schema::hy2pool::assign_at(&mut state, uid, t0()).as_deref(),
+                    Some("r001")
+                );
+                state.residential.hy2_pool.creds[1].secret = "reserved-rotated".into();
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_node_uri_preserves_authorized_direct_and_reality_parameters() {
+        let mut state = canonical_single_node_state();
+        state.users[0].entitlements.residential = None;
+        state.users[0].entitlements.direct = true;
+        let payload = serde_json::to_value(&project_all(&state, &BTreeSet::new())[0]).unwrap();
+        assert_eq!(payload["nodeUri"], "hysteria2://alice:native-only-secret@edge.example:12345?sni=edge.example&insecure=0&mport=20000-30000&obfs=salamander&obfs-password=obfs%2Fpw%3F#alice-HY2%E7%9B%B4%E8%BF%9E");
+        state.users[0].entitlements.protocols = vec![Protocol::Reality];
+        state.users[0].credentials.vless_uuid = Uuid::from_u128(0x222);
+        state.node.reality.public_key = "CANONICAL-PUB".into();
+        state.node.reality.dest = "masked.example:443".into();
+        state.node.reality.short_ids = vec!["0123456789abcdef".into()];
+        state.node.ports.reality_direct = 22345;
+        let payload = serde_json::to_value(&project_all(&state, &BTreeSet::new())[0]).unwrap();
+        assert_eq!(payload["nodeUri"], "vless://00000000-0000-0000-0000-000000000222@edge.example:22345?security=reality&encryption=none&pbk=CANONICAL-PUB&headerType=&fp=chrome&spx=%2F&type=tcp&flow=xtls-rprx-vision&sni=masked.example&sid=0123456789abcdef#alice-Reality%E7%9B%B4%E8%BF%9E");
+    }
+
+    #[test]
+    fn canonical_node_uri_is_absent_for_denied_or_unsupported_single_nodes() {
+        let control = canonical_single_node_state();
+        let mut cases = Vec::new();
+        let mut state = control.clone();
+        state.users[0].disabled = true;
+        cases.push(("disabled", state, BTreeSet::new()));
+        cases.push((
+            "blocked",
+            control.clone(),
+            BTreeSet::from([control.users[0].user_id]),
+        ));
+        let mut state = control.clone();
+        state.users[0]
+            .entitlements
+            .residential
+            .as_mut()
+            .unwrap()
+            .slot_id = Some(Uuid::from_u128(0xdead));
+        cases.push(("bad slot", state, BTreeSet::new()));
+        let mut state = control.clone();
+        state
+            .residential
+            .groups
+            .get_mut(DEFAULT_GROUP)
+            .unwrap()
+            .enabled = false;
+        cases.push(("disabled pool", state, BTreeSet::new()));
+        let mut state = control.clone();
+        state.users[0].credentials.hy2_resi_cred = None;
+        cases.push(("missing reserved identity", state, BTreeSet::new()));
+        let mut state = control.clone();
+        state.users[0].entitlements.protocols.clear();
+        cases.push(("no supported protocol", state, BTreeSet::new()));
+        let mut state = control.clone();
+        state.users[0].entitlements.residential = None;
+        state.users[0].entitlements.direct = false;
+        cases.push(("no path grant", state, BTreeSet::new()));
+        let mut state = control;
+        state.users[0]
+            .entitlements
+            .protocols
+            .push(Protocol::Reality);
+        cases.push(("fusion uses feed URL", state, BTreeSet::new()));
+        for (reason, state, blocked) in cases {
+            let payload = serde_json::to_value(&project_all(&state, &blocked)[0]).unwrap();
+            assert!(
+                payload.get("nodeUri").is_none(),
+                "{reason} must not publish a guessed single-node URI"
+            );
+        }
     }
 
     #[test]
@@ -1492,7 +1922,7 @@ mod tests {
         assert!(make(Some("fusion"), Some(true)).entitlements.direct);
         assert!(make(Some("fusion"), Some(false)).entitlements.direct);
 
-        // 面板回显不看 direct：protocol 仍按协议集合回显 v3 名字，住宅与槽位字段照旧
+        // 创建权益保留住宅意图；默认池未启用时，面板不能猜出一个可用槽位。
         let s = sample_state();
         for (u, label) in [(&hy2, "hysteria2"), (&reality, "vless-reality")] {
             let v = serde_json::to_value(project(
@@ -1505,8 +1935,9 @@ mod tests {
             .unwrap();
             assert_eq!(v["protocol"], label);
             assert_eq!(v["residential"], true);
-            assert_eq!(v["slot"], 0);
-            assert_eq!(v["slotPort"], 40000);
+            assert!(v["slot"].is_null());
+            assert!(v["slotPort"].is_null());
+            assert_eq!(v["residentialUnavailable"], "residential pool disabled");
         }
     }
 
@@ -1703,6 +2134,471 @@ mod tests {
             host: h.host.clone(),
             paths: h.paths.clone(),
         }
+    }
+
+    async fn residential_access_harness() -> Harness {
+        let h = bare_harness().await;
+        h.store
+            .update(|s| {
+                let pool = crate::modules::residential::sample_state_with_pool();
+                s.residential = pool.residential;
+                bui_schema::slots::sync_slots(&mut s.residential);
+                bui_schema::slots::migrate_unassigned(s);
+                bui_schema::hy2pool::migrate(s, t0());
+            })
+            .await
+            .unwrap();
+        h
+    }
+
+    // Positive sync scenarios exercise two genuinely provisioned entry points.
+    // A disabled/empty legacy pool no longer authorizes the residential inlet.
+    async fn harness() -> Harness {
+        residential_access_harness().await
+    }
+
+    struct PausingXray {
+        inner: super::super::fakes::FakeXray,
+        entered: Arc<tokio::sync::Notify>,
+        resume: Arc<tokio::sync::Semaphore>,
+        pause_once: std::sync::atomic::AtomicBool,
+        pause_in_add: bool,
+        pause_inventory_at: Option<usize>,
+        inventory_reads: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl super::super::XrayApi for PausingXray {
+        async fn inbound_users(&self, tag: &str) -> anyhow::Result<BTreeMap<Uuid, Uuid>> {
+            let n = self
+                .inventory_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            if self.pause_inventory_at == Some(n) {
+                self.entered.notify_one();
+                self.resume.acquire().await.unwrap().forget();
+            }
+            super::super::XrayApi::inbound_users(&self.inner, tag).await
+        }
+        async fn add_user(&self, tag: &str, id: Uuid, vid: Uuid) -> anyhow::Result<()> {
+            super::super::XrayApi::add_user(&self.inner, tag, id, vid).await?;
+            if self.pause_in_add
+                && self
+                    .pause_once
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                self.entered.notify_one();
+                self.resume.acquire().await.unwrap().forget();
+            }
+            Ok(())
+        }
+        async fn remove_user(&self, tag: &str, id: Uuid) -> anyhow::Result<()> {
+            super::super::XrayApi::remove_user(&self.inner, tag, id).await
+        }
+        async fn inbound_user_uuid(&self, tag: &str, id: Uuid) -> anyhow::Result<Option<Uuid>> {
+            if self.pause_inventory_at.is_none()
+                && !self.pause_in_add
+                && self
+                    .pause_once
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                self.entered.notify_one();
+                self.resume.acquire().await.unwrap().forget();
+            }
+            super::super::XrayApi::inbound_user_uuid(&self.inner, tag, id).await
+        }
+        async fn query_user_deltas(&self) -> anyhow::Result<BTreeMap<String, TxRx>> {
+            super::super::XrayApi::query_user_deltas(&self.inner).await
+        }
+        async fn add_rule(&self, r: &bui_schema::render::xray::SlotRule) -> anyhow::Result<()> {
+            super::super::XrayApi::add_rule(&self.inner, r).await
+        }
+        async fn remove_rule(&self, tag: &str) -> anyhow::Result<()> {
+            super::super::XrayApi::remove_rule(&self.inner, tag).await
+        }
+        async fn list_rules(&self) -> anyhow::Result<Vec<(String, String)>> {
+            super::super::XrayApi::list_rules(&self.inner).await
+        }
+    }
+
+    #[tokio::test]
+    async fn xray_authorization_publication_is_fenced_and_cancellation_releases_it() {
+        let h = residential_access_harness().await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Semaphore::new(0));
+        let shared = Arc::new(
+            Shared::new(
+                Box::new(PausingXray {
+                    inner: h.xray.clone(),
+                    entered: entered.clone(),
+                    resume,
+                    pause_once: std::sync::atomic::AtomicBool::new(true),
+                    pause_in_add: false,
+                    pause_inventory_at: None,
+                    inventory_reads: std::sync::atomic::AtomicUsize::new(0),
+                }),
+                Box::new(h.hy2.clone()),
+            )
+            .with_hy2resi(Box::new(h.hy2resi.clone())),
+        );
+        shared.set_paths(&h.paths);
+        let sync_ctx = ctx_of(&h);
+        let sync_shared = shared.clone();
+        let sync =
+            tokio::spawn(
+                async move { sync_users(&sync_ctx, &sync_shared, &BTreeSet::new()).await },
+            );
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        let store = h.store.clone();
+        let mut writer =
+            tokio::spawn(async move { store.update(|s| s.users[0].disabled = true).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut writer)
+                .await
+                .is_err(),
+            "revoke cannot publish between the authorization read and an in-flight Xray grant"
+        );
+        sync.abort();
+        assert!(sync.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(2), writer)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            h.store.read().await.users[0].disabled,
+            "cancel must release the existing Store writer fence"
+        );
+        let outcome = sync_now(&ctx_of(&h), &shared).await;
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            !h.xray.calls().iter().any(|c| c.starts_with("add:")),
+            "the cancelled round cannot leave a delayed authorized grant behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_remote_grant_is_revoked_even_after_the_user_is_deleted() {
+        let h = residential_access_harness().await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let shared = Arc::new(
+            Shared::new(
+                Box::new(PausingXray {
+                    inner: h.xray.clone(),
+                    entered: entered.clone(),
+                    resume: Arc::new(tokio::sync::Semaphore::new(0)),
+                    pause_once: std::sync::atomic::AtomicBool::new(true),
+                    pause_in_add: true,
+                    pause_inventory_at: None,
+                    inventory_reads: std::sync::atomic::AtomicUsize::new(0),
+                }),
+                Box::new(h.hy2.clone()),
+            )
+            .with_hy2resi(Box::new(h.hy2resi.clone())),
+        );
+        shared.set_paths(&h.paths);
+        let ctx = ctx_of(&h);
+        let id = h.store.read().await.users[0].user_id;
+        // Establish previous revoke markers first: the subsequent grant attempt must
+        // invalidate them even when the remote acknowledgement is lost to cancellation.
+        let denied = sync_users(&ctx, &shared, &BTreeSet::from([id])).await;
+        assert!(denied.errors.is_empty(), "{:?}", denied.errors);
+        h.xray.with(|i| assert!(i.users.is_empty()));
+        h.xray.clear_calls();
+        let sync_ctx = ctx.clone();
+        let sync_shared = shared.clone();
+        let sync =
+            tokio::spawn(
+                async move { sync_users(&sync_ctx, &sync_shared, &BTreeSet::new()).await },
+            );
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        h.xray.with(|i| {
+            assert!(
+                i.users.contains_key(&("vless-direct".into(), id)),
+                "remote side effect must have happened before cancellation"
+            )
+        });
+        sync.abort();
+        assert!(sync.await.unwrap_err().is_cancelled());
+        h.store.update(|s| s.users.clear()).await.unwrap();
+        let out = sync_now(&ctx, &shared).await;
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        h.xray.with(|i| {
+            assert!(
+                i.users.is_empty(),
+                "an unacknowledged remote grant must not outlive its deleted account"
+            )
+        });
+        h.xray.clear_calls();
+        sync_now(&ctx, &shared).await;
+        assert!(
+            h.xray.calls().is_empty(),
+            "successful orphan cleanup must converge to no writes"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_quota_crossed_during_final_inventory_is_revoked_before_completion() {
+        let h = residential_access_harness().await;
+        h.store
+            .update(|s| s.users[0].entitlements.traffic_limit.total_bytes = Some(10))
+            .await
+            .unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Semaphore::new(0));
+        let shared = Arc::new(
+            Shared::new(
+                Box::new(PausingXray {
+                    inner: h.xray.clone(),
+                    entered: entered.clone(),
+                    resume: resume.clone(),
+                    pause_once: std::sync::atomic::AtomicBool::new(false),
+                    pause_in_add: false,
+                    pause_inventory_at: Some(3),
+                    inventory_reads: std::sync::atomic::AtomicUsize::new(0),
+                }),
+                Box::new(h.hy2.clone()),
+            )
+            .with_hy2resi(Box::new(h.hy2resi.clone())),
+        );
+        shared.set_paths(&h.paths);
+        let id = h.store.read().await.users[0].user_id;
+        let ctx = ctx_of(&h);
+        let worker_shared = shared.clone();
+        let worker = tokio::spawn(async move { sync_now(&ctx, &worker_shared).await });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        h.xray.with(|i| {
+            assert_eq!(
+                i.users.len(),
+                2,
+                "positive grants must have reached both inlets before the quota transition"
+            )
+        });
+        shared.pending().await.insert(id, TxRx { tx: 11, rx: 0 });
+        resume.add_permits(1);
+        let out = tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        h.xray.with(|i| {
+            assert!(
+                i.users.is_empty(),
+                "final observations cannot commit a grant after live quota revocation"
+            )
+        });
+        assert!(snapshot::read(&shared.snapshot_path()).users["alice"].blocked);
+        assert!(!shared.applied().await.xray_users.contains_key(&id));
+        assert!(out.newly_blocked.contains(&id));
+    }
+
+    #[tokio::test]
+    async fn a_fresh_daemon_removes_unknown_live_identities_without_touching_healthy_users() {
+        let h = residential_access_harness().await;
+        let u = h.store.read().await.users[0].clone();
+        let orphan = Uuid::from_u128(0xbad);
+        h.xray.with(|i| {
+            for tag in XRAY_INBOUND_TAGS {
+                i.users
+                    .insert((tag.into(), u.user_id), u.credentials.vless_uuid);
+                i.users
+                    .insert((tag.into(), orphan), Uuid::from_u128(0xcafe));
+            }
+        });
+        let fresh = Shared::new(Box::new(h.xray.clone()), Box::new(h.hy2.clone()))
+            .with_hy2resi(Box::new(h.hy2resi.clone()));
+        fresh.set_paths(&h.paths);
+        let out = sync_now(&ctx_of(&h), &fresh).await;
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(
+            h.xray.calls(),
+            vec![
+                format!("remove:vless-direct:{orphan}"),
+                format!("remove:vless-residential:{orphan}")
+            ]
+        );
+        h.xray.with(|i| {
+            assert_eq!(
+                i.users.len(),
+                2,
+                "only the two authorized inlet identities remain"
+            );
+            for tag in XRAY_INBOUND_TAGS {
+                assert_eq!(
+                    i.users.get(&(tag.into(), u.user_id)),
+                    Some(&u.credentials.vless_uuid)
+                );
+            }
+        });
+        h.xray.clear_calls();
+        let again = sync_now(&ctx_of(&h), &fresh).await;
+        assert!(again.errors.is_empty(), "{:?}", again.errors);
+        assert!(
+            h.xray.calls().is_empty(),
+            "inventory reconciliation is a no-op after actual cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_xray_inventory_cannot_be_reported_as_a_converged_grant() {
+        let h = residential_access_harness().await;
+        let id = h.store.read().await.users[0].user_id;
+        h.xray.with(|i| {
+            i.fail_on.insert("inventory:vless-direct".into());
+        });
+        let out = sync_now(&ctx_of(&h), &h.shared).await;
+        assert!(
+            out.errors
+                .iter()
+                .any(|e| e.contains("inventory") && e.contains("vless-direct")),
+            "inventory failure must be visible as an authorization observation failure: {:?}",
+            out.errors
+        );
+        assert!(
+            !h.xray
+                .calls()
+                .iter()
+                .any(|c| c.starts_with("add:vless-direct:")),
+            "an unreadable inlet must not receive new grants"
+        );
+        assert!(
+            !h.shared.applied().await.xray_users.contains_key(&id),
+            "missing kernel truth cannot be counted as fully synchronized"
+        );
+    }
+
+    #[tokio::test]
+    async fn residential_only_credentials_cannot_be_kept_on_the_direct_inbound() {
+        let h = residential_access_harness().await;
+        h.store
+            .update(|s| s.users[0].entitlements.direct = false)
+            .await
+            .unwrap();
+        let u = h.store.read().await.users[0].clone();
+        h.xray.with(|i| {
+            i.users
+                .insert(("vless-direct".into(), u.user_id), u.credentials.vless_uuid);
+            i.users.insert(
+                ("vless-residential".into(), u.user_id),
+                u.credentials.vless_uuid,
+            );
+        });
+        let out = sync_users(&ctx_of(&h), &h.shared, &BTreeSet::new()).await;
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(
+            h.xray.calls(),
+            vec![format!("remove:vless-direct:{}", u.user_id)]
+        );
+        h.xray.with(|i| {
+            assert!(!i.users.contains_key(&("vless-direct".into(), u.user_id)));
+            assert_eq!(
+                i.users.get(&("vless-residential".into(), u.user_id)),
+                Some(&u.credentials.vless_uuid)
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn direct_only_credentials_cannot_be_kept_on_the_residential_inbound() {
+        let h = harness().await;
+        h.store
+            .update(|s| s.users[0].entitlements.residential = None)
+            .await
+            .unwrap();
+        let u = h.store.read().await.users[0].clone();
+        h.xray.with(|i| {
+            i.users
+                .insert(("vless-direct".into(), u.user_id), u.credentials.vless_uuid);
+            i.users.insert(
+                ("vless-residential".into(), u.user_id),
+                u.credentials.vless_uuid,
+            );
+        });
+        let out = sync_users(&ctx_of(&h), &h.shared, &BTreeSet::new()).await;
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(
+            h.xray.calls(),
+            vec![format!("remove:vless-residential:{}", u.user_id)]
+        );
+        h.xray.with(|i| {
+            assert_eq!(
+                i.users.get(&("vless-direct".into(), u.user_id)),
+                Some(&u.credentials.vless_uuid)
+            );
+            assert!(!i
+                .users
+                .contains_key(&("vless-residential".into(), u.user_id)));
+        });
+    }
+
+    #[tokio::test]
+    async fn residential_pool_loss_revokes_only_that_inbound_and_recovery_is_idempotent() {
+        let h = residential_access_harness().await;
+        let ctx = ctx_of(&h);
+        let u = h.store.read().await.users[0].clone();
+        sync_users(&ctx, &h.shared, &BTreeSet::new()).await;
+        h.xray.clear_calls();
+        h.store
+            .update(|s| s.residential.groups.get_mut(DEFAULT_GROUP).unwrap().enabled = false)
+            .await
+            .unwrap();
+        let out = sync_users(&ctx, &h.shared, &BTreeSet::new()).await;
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(
+            h.xray.calls(),
+            vec![format!("remove:vless-residential:{}", u.user_id)]
+        );
+        h.xray.clear_calls();
+        sync_users(&ctx, &h.shared, &BTreeSet::new()).await;
+        assert!(
+            h.xray.calls().is_empty(),
+            "repeated deny must not remove the authorized direct user"
+        );
+        h.store
+            .update(|s| s.residential.groups.get_mut(DEFAULT_GROUP).unwrap().enabled = true)
+            .await
+            .unwrap();
+        sync_users(&ctx, &h.shared, &BTreeSet::new()).await;
+        assert_eq!(
+            h.xray.calls(),
+            vec![format!(
+                "add:vless-residential:{}:{}",
+                u.user_id, u.credentials.vless_uuid
+            )]
+        );
+        h.xray.clear_calls();
+        sync_users(&ctx, &h.shared, &BTreeSet::new()).await;
+        assert!(
+            h.xray.calls().is_empty(),
+            "restored access must converge to a no-op"
+        );
+        assert_eq!(
+            h.shared.applied().await.xray_users.len(),
+            1,
+            "the health count is users, not inbounds"
+        );
+    }
+
+    #[test]
+    fn missing_residential_binding_is_not_projected_as_a_real_slot_or_ip() {
+        let mut s = crate::modules::residential::sample_state_with_pool();
+        bui_schema::slots::sync_slots(&mut s.residential);
+        s.users[0]
+            .entitlements
+            .residential
+            .as_mut()
+            .unwrap()
+            .slot_id = Some(Uuid::from_u128(0xdead));
+        let p = project_all(&s, &BTreeSet::new());
+        assert_eq!(p[0].slot, None);
+        assert_eq!(p[0].slot_ip, None);
+        assert_eq!(p[0].slot_port, None);
     }
 
     #[tokio::test]

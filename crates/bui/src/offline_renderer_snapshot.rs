@@ -596,6 +596,16 @@ fn exercise_snapshot(input: PathBuf, output: PathBuf) -> Result<()> {
         "snapshot production Paths mismatch"
     );
     let ctx = RenderCtx {
+        account_blocked: crate::modules::panel::users::blocked_set(
+            &state,
+            &BTreeMap::new(),
+            time::OffsetDateTime::parse(
+                host.observed["started_utc"]
+                    .as_str()
+                    .context("snapshot authorization time missing")?,
+                &time::format_description::well_known::Rfc3339,
+            )?,
+        ),
         paths,
         facts: facts(&host)?,
     };

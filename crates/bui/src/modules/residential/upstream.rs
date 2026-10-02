@@ -936,17 +936,38 @@ mod tests {
         );
     }
 
-    /// 池里只剩一条时删掉它：槽位表清空、relay 回落 fail-open 直连，而订阅里那个节点
-    /// 照旧是 `40000` + 完整跳跃区间（4.1 起它与槽位无关）。不记事件（事件卡只该有真事）。
+    /// Removing the last supplier revokes residence delivery rather than assigning
+    /// a direct identity. The reserved credential remains available for recovery.
     #[tokio::test]
-    async fn removing_the_last_upstream_leaves_every_subscription_working() {
+    async fn removing_the_last_upstream_denies_residential_delivery_without_a_direct_fallback() {
         let d = tempfile::tempdir().unwrap();
         let c = ctx_with_slots(&d, 1, &["alice"]).await;
-        let before = node_of(&c, "alice").await;
+        assert_eq!(node_of(&c, "alice").await, (40000, Some((41000, 50000))));
+        let reserved = c.store.read().await.users[0]
+            .credentials
+            .hy2_resi_cred
+            .clone();
         remove(&c, &UpstreamSel::Id(Uuid::from_u128(1)))
             .await
             .unwrap();
-        assert_eq!(node_of(&c, "alice").await, before);
+        let state = c.store.read().await;
+        let user = state.users.iter().find(|u| u.username == "alice").unwrap();
+        assert_eq!(user.credentials.hy2_resi_cred, reserved);
+        assert!(
+            bui_schema::nodes::nodes_for(user, &state.node, &state.residential)
+                .iter()
+                .all(|n| !matches!(
+                    n.kind,
+                    bui_schema::nodes::NodeKind::Hy2Residential
+                        | bui_schema::nodes::NodeKind::RealityResidential
+                ))
+        );
+        let (static_nodes, _) = crate::modules::panel::api_public::nodes_and_split(&state, "alice")
+            .expect("existing account has a static node projection");
+        assert_eq!(
+            static_nodes,
+            bui_schema::nodes::nodes_for(user, &state.node, &state.residential)
+        );
         assert!(
             incidents_of(&c).await.is_empty(),
             "空名单不记事件（事件卡只该有真事）"

@@ -46,6 +46,7 @@ pub async fn run_with(store: Store, paths: Paths, host: Arc<dyn Host>) -> Result
     let out = tokio::task::spawn_blocking(move || -> Result<_> {
         let facts = Facts::probe(h.as_ref())?;
         let ctx = RenderCtx {
+            account_blocked: Default::default(),
             paths: paths.clone(),
             facts,
         };

@@ -1,5 +1,6 @@
 //! 权益 → 节点集合：把一个用户的 [`Entitlements`](crate::model::Entitlements) 展开成他订阅里该出现的节点。
 
+use crate::egress::{access_for, RequestedEgress};
 use crate::model::{NodeParams, Protocol, Residential, User};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -58,18 +59,12 @@ impl Node {
 /// 按权益生成节点集合，顺序固定为 v3 `/api/sub` 的顺序：
 /// Reality直连、Reality住宅、HY2直连、HY2住宅。
 ///
-/// 住宅节点只在用户有住宅权益、且权益指向的分组真实存在时才给出；
-/// HY2 住宅还要求他在凭据池里占着一条（[`hy2pool::cred_of`](crate::hy2pool::cred_of)），
+/// 节点只在 [`access_for`] 对协议与通路授权成功时给出；住宅节点必须有有效池和精确槽绑定，
+/// HY2 住宅还要求他在凭据池里占着唯一的一条，
 /// 端口与跳跃区间恒为期望态里的 `hy2_resi` / `hy2_resi_hop`（**与槽位无关**）。
 /// obfs 加在直连与住宅两种 HY2 节点上（混淆覆盖全部 HY2 实例，2026-09-15 裁决）。
 pub fn nodes_for(user: &User, node: &NodeParams, resi: &Residential) -> Vec<Node> {
-    let e = &user.entitlements;
-    let has = |p: Protocol| e.protocols.contains(&p);
-    let resi_ok = e
-        .residential
-        .as_ref()
-        .map(|r| resi.groups.contains_key(&r.group_id))
-        .unwrap_or(false);
+    let allowed = |protocol, requested| access_for(user, resi, protocol, requested, false).is_ok();
     let sni = node.domain.clone();
     let obfs = if node.obfs.enabled && !node.obfs.password.is_empty() {
         Some(node.obfs.password.clone())
@@ -112,48 +107,44 @@ pub fn nodes_for(user: &User, node: &NodeParams, resi: &Residential) -> Vec<Node
         },
     };
     let mut out = Vec::with_capacity(4);
-    if has(Protocol::Reality) {
-        if e.direct {
-            out.push(reality(
-                node.ports.reality_direct,
-                NodeKind::RealityDirect,
-                "Reality直连",
-            ));
-        }
-        if resi_ok {
-            out.push(reality(
-                node.ports.reality_resi,
-                NodeKind::RealityResidential,
-                "Reality住宅",
-            ));
-        }
+    if allowed(Protocol::Reality, RequestedEgress::Direct) {
+        out.push(reality(
+            node.ports.reality_direct,
+            NodeKind::RealityDirect,
+            "Reality直连",
+        ));
     }
-    if has(Protocol::Hysteria2) {
-        if e.direct {
+    if allowed(Protocol::Reality, RequestedEgress::RequiredResidential) {
+        out.push(reality(
+            node.ports.reality_resi,
+            NodeKind::RealityResidential,
+            "Reality住宅",
+        ));
+    }
+    if allowed(Protocol::Hysteria2, RequestedEgress::Direct) {
+        out.push(hy2(
+            node.ports.hy2,
+            node.ports.hy2_hop,
+            NodeKind::Hy2Direct,
+            "HY2直连",
+            (&user.username, &user.credentials.hy2_password),
+            obfs.clone(),
+        ));
+    }
+    // 4.1：住宅 HY2 只剩一个监听端口，整段 `41000-50000` 由 `table inet bui` 的
+    // REDIRECT 送到它，于是**每个用户的端口与区间完全相同**、改槽不再动订阅
+    // （spec §1.2 目标 1）。认证用凭据池里那条；还没分到凭据的用户不发这个节点
+    // （门位未就绪，发出去也连不上）。
+    if allowed(Protocol::Hysteria2, RequestedEgress::RequiredResidential) {
+        if let Some(c) = crate::hy2pool::cred_of(user, resi) {
             out.push(hy2(
-                node.ports.hy2,
-                node.ports.hy2_hop,
-                NodeKind::Hy2Direct,
-                "HY2直连",
-                (&user.username, &user.credentials.hy2_password),
-                obfs.clone(),
+                node.ports.hy2_resi,
+                Some(node.ports.hy2_resi_hop),
+                NodeKind::Hy2Residential,
+                "HY2住宅",
+                (&c.name, &c.secret),
+                obfs,
             ));
-        }
-        // 4.1：住宅 HY2 只剩一个监听端口，整段 `41000-50000` 由 `table inet bui` 的
-        // REDIRECT 送到它，于是**每个用户的端口与区间完全相同**、改槽不再动订阅
-        // （spec §1.2 目标 1）。认证用凭据池里那条；还没分到凭据的用户不发这个节点
-        // （门位未就绪，发出去也连不上）。
-        if resi_ok {
-            if let Some(c) = crate::hy2pool::cred_of(user, resi) {
-                out.push(hy2(
-                    node.ports.hy2_resi,
-                    Some(node.ports.hy2_resi_hop),
-                    NodeKind::Hy2Residential,
-                    "HY2住宅",
-                    (&c.name, &c.secret),
-                    obfs,
-                ));
-            }
         }
     }
     out
@@ -185,6 +176,8 @@ mod tests {
         u.entitlements.protocols = protocols;
         if !resi {
             u.entitlements.residential = None;
+        } else {
+            u.entitlements.residential.as_mut().unwrap().slot_id = Some(Uuid::from_u128(1));
         }
         u
     }
@@ -193,7 +186,7 @@ mod tests {
     fn fusion_gives_four_in_v3_order() {
         let (u, r) = minted(
             user(vec![Protocol::Hysteria2, Protocol::Reality], true),
-            Residential::default(),
+            resi_with_slots(1),
         );
         let ns = nodes_for(&u, &node(), &r);
         let kinds: Vec<_> = ns.iter().map(|n| n.kind).collect();
@@ -250,10 +243,7 @@ mod tests {
 
     #[test]
     fn hysteria2_only_with_residential_gives_two() {
-        let (u, r) = minted(
-            user(vec![Protocol::Hysteria2], true),
-            Residential::default(),
-        );
+        let (u, r) = minted(user(vec![Protocol::Hysteria2], true), resi_with_slots(1));
         let ns = nodes_for(&u, &node(), &r);
         assert_eq!(
             ns.iter().map(|n| n.kind).collect::<Vec<_>>(),
@@ -278,7 +268,7 @@ mod tests {
     fn direct_false_gives_residential_only() {
         let mut u = user(vec![Protocol::Reality], true);
         u.entitlements.direct = false;
-        let ns = nodes_for(&u, &node(), &Residential::default());
+        let ns = nodes_for(&u, &node(), &resi_with_slots(1));
         assert_eq!(
             ns.iter().map(|n| n.kind).collect::<Vec<_>>(),
             vec![NodeKind::RealityResidential]
@@ -352,6 +342,93 @@ mod tests {
         s.residential = r;
         crate::hy2pool::migrate(&mut s, time::OffsetDateTime::now_utc());
         (s.users.remove(0), s.residential)
+    }
+
+    #[test]
+    fn unavailable_residential_binding_never_issues_a_node() {
+        let mut u = user(vec![Protocol::Hysteria2, Protocol::Reality], true);
+        u.entitlements.residential.as_mut().unwrap().slot_id = Some(Uuid::from_u128(1));
+        let (u, r) = minted(u, resi_with_slots(1));
+        let baseline = nodes_for(&u, &node(), &r);
+        assert_eq!(baseline.len(), 4, "reachable valid binding is the control");
+        let mut cases = Vec::new();
+        let mut disabled = r.clone();
+        disabled.groups.get_mut(DEFAULT_GROUP).unwrap().enabled = false;
+        cases.push(("disabled pool", u.clone(), disabled));
+        let mut empty = r.clone();
+        empty
+            .groups
+            .get_mut(DEFAULT_GROUP)
+            .unwrap()
+            .upstreams
+            .clear();
+        cases.push(("empty pool", u.clone(), empty));
+        let mut unassigned = u.clone();
+        unassigned
+            .entitlements
+            .residential
+            .as_mut()
+            .unwrap()
+            .slot_id = None;
+        cases.push(("unassigned user", unassigned, r.clone()));
+        let mut missing = r.clone();
+        missing.slots.clear();
+        cases.push(("missing slot", u.clone(), missing));
+        let mut stale = u.clone();
+        stale.entitlements.residential.as_mut().unwrap().slot_id = Some(Uuid::from_u128(99));
+        cases.push(("stale binding", stale, r.clone()));
+        let mut duplicate = r.clone();
+        duplicate.slots.push(duplicate.slots[0]);
+        cases.push(("duplicate slot", u.clone(), duplicate));
+        let mut invalid = r.clone();
+        invalid.slots[0].index = crate::slots::MAX_SLOTS;
+        cases.push(("out of range slot", u.clone(), invalid));
+        let mut foreign = r.clone();
+        foreign
+            .groups
+            .insert("foreign".into(), foreign.groups[DEFAULT_GROUP].clone());
+        let mut foreign_user = u.clone();
+        foreign_user
+            .entitlements
+            .residential
+            .as_mut()
+            .unwrap()
+            .group_id = "foreign".into();
+        cases.push(("unimplemented group", foreign_user, foreign));
+        let mut bad_upstream = r.clone();
+        let duplicate_upstream = bad_upstream.groups[DEFAULT_GROUP].upstreams[0].clone();
+        bad_upstream
+            .groups
+            .get_mut(DEFAULT_GROUP)
+            .unwrap()
+            .upstreams
+            .push(duplicate_upstream);
+        cases.push(("ambiguous upstream", u, bad_upstream));
+        let leaking: Vec<_> = cases
+            .into_iter()
+            .filter_map(|(reason, u, r)| {
+                let kinds: Vec<_> = nodes_for(&u, &node(), &r)
+                    .into_iter()
+                    .map(|n| n.kind)
+                    .collect();
+                (kinds != vec![NodeKind::RealityDirect, NodeKind::Hy2Direct]).then_some(reason)
+            })
+            .collect();
+        assert_eq!(
+            leaking,
+            Vec::<&str>::new(),
+            "invalid residential bindings must not be issued"
+        );
+    }
+
+    #[test]
+    fn disabled_account_never_issues_any_node() {
+        let mut u = user(vec![Protocol::Hysteria2, Protocol::Reality], true);
+        u.entitlements.residential.as_mut().unwrap().slot_id = Some(Uuid::from_u128(1));
+        let (mut u, r) = minted(u, resi_with_slots(1));
+        assert_eq!(nodes_for(&u, &node(), &r).len(), 4);
+        u.disabled = true;
+        assert!(nodes_for(&u, &node(), &r).is_empty());
     }
 
     /// 住宅 HY2 节点不再含任何槽位信息：8 个槽、不同槽的用户，端口与区间**完全相同**
@@ -466,13 +543,10 @@ mod tests {
         );
     }
 
-    /// 单槽（含空池）时 HY2 住宅节点必须还是 40000 + 41000-50000 —— golden 的生命线。
+    /// 单槽有效池的 HY2 住宅节点仍是 40000 + 41000-50000。
     #[test]
     fn a_single_slot_keeps_the_v3_residential_hy2_port() {
-        let (u, r) = minted(
-            user(vec![Protocol::Hysteria2], true),
-            Residential::default(),
-        );
+        let (u, r) = minted(user(vec![Protocol::Hysteria2], true), resi_with_slots(1));
         let ns = nodes_for(&u, &node(), &r);
         let r = ns
             .iter()

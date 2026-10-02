@@ -82,7 +82,7 @@ async fn report_pool_exhausted_for(app: &AppState, user_id: uuid::Uuid) {
 }
 
 /// 换住宅 HY2 凭据那半的收尾（`rotate` 与「改 hy2 密码」共用一处，spec §3.3）：
-/// 旧凭据的门**当场**切 `deny`、新凭据的门开到他自己那一槽，再按 spec §3.1 检查
+/// 旧凭据的门**当场**切 `deny`、新凭据按当前共享授权决定精确槽或 `deny`，再按 spec §3.1 检查
 /// 「该有凭据却没拿到」。
 ///
 /// 两次 PUT 不能省：门是 `interrupt_exist_connections` 的 selector，切成 `deny` 才会
@@ -107,18 +107,33 @@ async fn finish_cred_swap(
         .await;
     }
     if let Some(new) = new_cred {
+        let pending = shared.pending().await.clone();
         let tag = {
             let s = app.store.read().await;
-            s.users.iter().find(|u| u.user_id == user_id).map(|u| {
-                bui_schema::render::hy2_singbox::slot_out_tag(bui_schema::slots::index_of_user(
-                    u,
-                    &s.residential,
-                ))
-            })
+            let blocked = users::blocked_set(&s, &pending, app.host.now());
+            s.users
+                .iter()
+                .find(|u| {
+                    u.user_id == user_id && u.credentials.hy2_resi_cred.as_deref() == Some(new)
+                })
+                .and_then(|u| {
+                    match bui_schema::egress::access_for(
+                        u,
+                        &s.residential,
+                        bui_schema::model::Protocol::Hysteria2,
+                        bui_schema::egress::RequestedEgress::RequiredResidential,
+                        blocked.contains(&u.user_id),
+                    ) {
+                        Ok(bui_schema::egress::AuthorizedEgress::Residential(binding)) => Some(
+                            bui_schema::render::hy2_singbox::slot_out_tag(binding.slot_index),
+                        ),
+                        _ => None,
+                    }
+                })
+                .unwrap_or_else(|| bui_schema::render::hy2_singbox::DENY_TAG.to_string())
         };
-        if let Some(tag) = tag {
-            super::gates::put_gate(&app.store, shared, app.host.as_ref(), new, &tag).await;
-        }
+        // put_gate rechecks the latest canonical authorization under both writer fences.
+        super::gates::put_gate(&app.store, shared, app.host.as_ref(), new, &tag).await;
     }
     // 该有凭据却没拿到（id 域用尽）⇒ Error 级事件（spec §3.1）
     report_pool_exhausted_for(app, user_id).await;
@@ -791,10 +806,101 @@ mod tests {
         let now = crate::sys::Host::now(h.host.as_ref());
         h.store
             .update(|s| {
+                provision_active_residential(s);
                 bui_schema::hy2pool::migrate(s, now);
             })
             .await
             .unwrap();
+    }
+
+    fn provision_active_residential(state: &mut BuiState) {
+        let upstream_id = uuid::Uuid::from_u128(7);
+        let group = state.residential.groups.get_mut("default").unwrap();
+        group.enabled = true;
+        group.upstreams = vec![bui_schema::model::Upstream {
+            id: upstream_id,
+            name: "fixture-isp".into(),
+            kind: bui_schema::model::UpstreamKind::Socks5,
+            host: "isp.example.net".into(),
+            port: 10007,
+            username: "fixture-user".into(),
+            password: "fixture-password".into(),
+            priority: 100,
+            provider: None,
+            region: None,
+            ports_allowed: None,
+            verified: None,
+        }];
+        state.residential.slots = vec![bui_schema::model::Slot {
+            index: 0,
+            upstream_id,
+        }];
+        for user in &mut state.users {
+            if let Some(entitlement) = user.entitlements.residential.as_mut() {
+                entitlement.slot_id = Some(upstream_id);
+            }
+        }
+    }
+
+    // Catches credential rotation restoring an old residential allow while the pool is disabled.
+    #[tokio::test]
+    async fn egress_contract_rotation_keeps_old_and_new_gates_denied_when_pool_is_disabled() {
+        let h = harness().await;
+        with_pool(&h).await;
+        let before = h.store.read().await.users[0]
+            .credentials
+            .hy2_resi_cred
+            .clone()
+            .unwrap();
+        // Stock has a selector for every reserved credential, including the one rotation will assign.
+        let mut inventory: std::collections::BTreeMap<_, _> = h
+            .store
+            .read()
+            .await
+            .residential
+            .hy2_pool
+            .creds
+            .iter()
+            .map(|cred| (format!("gate-{}", cred.id), "deny".to_string()))
+            .collect();
+        inventory.insert(format!("gate-{before}"), "slot-0-out".into());
+        h.hy2resi.set_selected(inventory);
+        h.store
+            .update(|state| state.residential.groups.get_mut("default").unwrap().enabled = false)
+            .await
+            .unwrap();
+        let (router, token) = app(&h).await;
+        let (status, response) = send(
+            &router,
+            "POST",
+            "/api/users/alice/rotate",
+            Some(&token),
+            Some(json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response["success"], true);
+        assert_eq!(response["user"], "alice");
+        let after = h.store.read().await.users[0]
+            .credentials
+            .hy2_resi_cred
+            .clone()
+            .unwrap();
+        assert_ne!(before, after);
+        assert_eq!(
+            h.hy2resi
+                .selected()
+                .get(&format!("gate-{before}"))
+                .map(String::as_str),
+            Some("deny")
+        );
+        assert_eq!(
+            h.hy2resi
+                .selected()
+                .get(&format!("gate-{after}"))
+                .map(String::as_str),
+            Some("deny")
+        );
     }
 
     #[test]

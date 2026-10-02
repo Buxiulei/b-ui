@@ -60,6 +60,20 @@ def header(conn):
     return data
 
 
+def dns_reply(query):
+    """Return one offline A answer while retaining the provider's TCP DNS hop."""
+    assert len(query) >= 17, "incomplete synthetic DNS query"
+    end = 12
+    while query[end] != 0:
+        end += 1 + query[end]
+        assert end < len(query), "truncated synthetic DNS question"
+    end += 5
+    return query[:2] + b"\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00" + query[12:end] + (
+        b"\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x01\x00\x04"
+        + socket.inet_pton(socket.AF_INET, "203.0.113.9")
+    )
+
+
 class Fake:
     def __init__(self, label, protocol="direct", port=0):
         self.label, self.protocol = label, protocol
@@ -67,7 +81,7 @@ class Fake:
         self.sock.listen()
         self.port = self.sock.getsockname()[1]
         self.stop = threading.Event()
-        self.errors, self.udp_seen, self.destinations = [], [], []
+        self.errors, self.udp_seen, self.destinations, self.dns_seen = [], [], [], []
         self.banner_hosts = {"banner.invalid"}
         threading.Thread(target=self.accept, daemon=True).start()
 
@@ -115,6 +129,17 @@ class Fake:
                     assert request.startswith(b"CONNECT "), request
                     self.destinations.append(request.split(b" ")[1].decode())
                     conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    host, port = request.split(b" ")[1].decode().rsplit(":", 1)
+                    destination = host.strip("[]"), int(port)
+                if self.protocol in ("socks", "http") and destination[1] == 53:
+                    assert destination == ("8.8.8.8", 53), destination
+                    while not self.stop.is_set():
+                        size = struct.unpack("!H", exact(conn, 2))[0]
+                        query = exact(conn, size)
+                        self.dns_seen.append(query)
+                        reply = dns_reply(query)
+                        conn.sendall(struct.pack("!H", len(reply)) + reply)
+                    return
                 while not self.stop.is_set():
                     request = header(conn)
                     path = request.split(b" ")[1]
@@ -141,9 +166,16 @@ def socks(port, host="service.invalid", target_port=443, udp=False):
     conn.sendall(b"\x05\x01\x00")
     assert exact(conn, 2) == b"\x05\x00"
     conn.sendall(b"\x05" + (b"\x03" if udp else b"\x01") + b"\x00" + encoded(host, target_port))
-    assert exact(conn, 3) == b"\x05\x00\x00"
-    reply = address(lambda n: exact(conn, n))
-    return conn, reply
+    try:
+        reply = exact(conn, 3)
+        assert reply[0] == 5 and reply[2] == 0, reply
+        endpoint = address(lambda n: exact(conn, n))
+        if reply[1] != 0:
+            raise ConnectionRefusedError(f"SOCKS refused request: status {reply[1]}")
+        return conn, endpoint
+    except Exception:
+        conn.close()
+        raise
 
 
 def http(conn, host="service.invalid", path="/", half=False):
@@ -160,7 +192,7 @@ class Kernel:
         self.cfg = copy.deepcopy(cfg)
         self.directory = tempfile.TemporaryDirectory()
         self.log = (Path(self.directory.name) / "kernel.log").open("w+")
-        # Only relocate addresses, supply offline DNS and disable persistent cache.
+        # Only relocate addresses, supply offline bootstrap DNS and disable persistent cache.
         # Preserve all generated policy rules, selectors and protocol capabilities.
         old_to_new, self.ports, reservations = {}, {}, []
         for inbound in self.cfg["inbounds"]:
@@ -195,7 +227,9 @@ class Kernel:
         names["echo.invalid"] = ["203.0.113.9"]
         if "DIRECT" in fakes:
             names.update({name: ["203.0.113.9"] for name in ("a-block.invalid", "b-block.invalid")})
-        self.cfg["dns"]["servers"] = [{"type": "hosts", "tag": tag, "predefined": names} for tag in ("dns_direct", "dns_resi")]
+        for index, server in enumerate(self.cfg["dns"]["servers"]):
+            if server["tag"] == "dns_direct":
+                self.cfg["dns"]["servers"][index] = {"type": "hosts", "tag": "dns_direct", "predefined": names}
         self.cfg["log"] = {"level": "error"}
         config = Path(self.directory.name) / "relay.json"
         config.write_text(json.dumps(self.cfg))
@@ -257,46 +291,77 @@ def udp_session(kernel, slot, fake, first_host, resolved=True):
             assert seen[0][2] == 1, "initial UDP destination must be IPv4, not ATYP=domain"
 
 
+def receiver_counts(fakes):
+    return [(len(fake.destinations), len(fake.udp_seen), len(fake.dns_seen)) for fake in fakes]
+
+
+def rejected(kernel, fakes, slot, port, host="service.invalid", host_header=None):
+    before = receiver_counts(fakes)
+    try:
+        result = kernel.request(slot, port, host, host_header=host_header)
+    except TimeoutError:
+        raise AssertionError("rejected TCP request must fail explicitly, not hang")
+    except (EOFError, ConnectionResetError, BrokenPipeError, ConnectionRefusedError):
+        pass
+    else:
+        raise AssertionError(f"blocked request returned application data: {result!r}")
+    assert receiver_counts(fakes) == before, "blocked request reached a terminal receiver"
+
+
+def udp_rejected(kernel, fakes, slot, host, port):
+    before = receiver_counts(fakes)
+    control, relay = socks(kernel.ports[f"slot-{slot}"], "0.0.0.0", 0, udp=True)
+    with control, bound(socket.SOCK_DGRAM) as client:
+        client.settimeout(0.2)
+        client.sendto(b"\x00\x00\x00" + encoded(host, port) + b"must-not-escape", relay)
+        try:
+            response = client.recvfrom(4096)
+        except TimeoutError:
+            pass  # UDP rejection has no stream-level response.
+        else:
+            raise AssertionError(f"blocked UDP returned data: {response!r}")
+    assert receiver_counts(fakes) == before, "blocked UDP reached a terminal receiver"
+
+
 def main():
     data, binary = json.load(sys.stdin), sys.argv[1]
     version = subprocess.check_output([binary, "version"], text=True).splitlines()[0]
     assert version == "sing-box version 1.14.2", f"policy regression requires sing-box 1.14.2, got {version}"
-    direct = Fake("DIRECT", port=data["target_port"])
     a, b, http_a = Fake("A", "socks"), Fake("B", "socks"), Fake("HTTP-A", "http")
     direct_socks = Fake("DIRECT", "socks")
+    receivers = (a, b, http_a, direct_socks)
     try:
         for case in ("ports", "auto", "plain", "mixed", "sniff"):
-            fakes = {"A": http_a if case == "mixed" else a, "B": b}
-            if case in ("sniff", "plain"):
-                fakes["DIRECT"] = direct_socks
+            fakes = {"A": http_a if case == "mixed" else a, "B": b, "DIRECT": direct_socks}
             kernel = Kernel(data["configs"]["auto" if case == "sniff" else case], binary, fakes)
             failed = True
             try:
                 port = data["target_port"]
                 if case == "ports":
-                    assert kernel.request(0, port) == "DIRECT"
+                    rejected(kernel, receivers, 0, port)
                     assert kernel.request(1, port) == "B", "A's disallowed port contaminated B"
                     kernel.select(1, 1)
-                    assert kernel.request(1, port) == "DIRECT", "borrowed A did not use A's ports"
+                    rejected(kernel, receivers, 1, port)
                     kernel.select(1, 2)
                     assert kernel.request(1, port) == "B"
                 elif case == "auto":
-                    for slot, a_result, b_result in ((0, "DIRECT", "A"), (1, "B", "DIRECT")):
-                        assert kernel.request(slot, port, "a-block.invalid") == a_result
-                        assert kernel.request(slot, port, "b-block.invalid") == b_result
+                    rejected(kernel, receivers, 0, port, "a-block.invalid")
+                    assert kernel.request(0, port, "b-block.invalid") == "A"
+                    assert kernel.request(1, port, "a-block.invalid") == "B"
+                    rejected(kernel, receivers, 1, port, "b-block.invalid")
                     old, _ = socks(kernel.ports["slot-1"], "service.invalid", port)
                     with old:
                         assert http(old) == b"B"
                         kernel.select(1, 1)
                         assert http(old) == b"B", "hot switch closed or moved the existing B stream"
-                        assert kernel.request(1, port, "a-block.invalid") == "DIRECT"
+                        rejected(kernel, receivers, 1, port, "a-block.invalid")
                         assert kernel.request(1, port, "b-block.invalid") == "A"
                         assert kernel.request(1, port) == "A"
                         kernel.select(1, 2)
                         assert http(old) == b"B"
-                        assert kernel.request(1, port, "b-block.invalid") == "DIRECT"
+                        rejected(kernel, receivers, 1, port, "b-block.invalid")
                     assert kernel.request(1, port, path="/half", half=True) == "B", "wrapper lost half-close reply"
-                    assert kernel.request(1, port, "127.0.0.1") == "DIRECT", "private literal escaped into provider"
+                    rejected(kernel, receivers, 1, port, "127.0.0.1")
                 elif case == "plain":
                     started = time.monotonic()
                     banner, _ = socks(kernel.ports["slot-1"], "banner.invalid", port)
@@ -307,54 +372,55 @@ def main():
                     print(f"server-first banner: {elapsed * 1000:.2f}ms", flush=True)
                     udp_session(kernel, 1, b, "203.0.113.9")
                     udp_session(kernel, 1, b, "echo.invalid")
+                    assert b.dns_seen, "UDP FQDN did not use B's residential TCP DNS"
                     kernel.select(1, 1)
                     udp_session(kernel, 1, a, "203.0.113.9")
                 elif case == "sniff":
-                    assert kernel.request(0, port, "203.0.113.9", host_header="a-block.invalid") == "DIRECT"
+                    rejected(kernel, receivers, 0, port, "203.0.113.9", "a-block.invalid")
                     assert kernel.request(0, port, "203.0.113.9", host_header="b-block.invalid") == "A"
                     assert kernel.request(1, port, "203.0.113.9", host_header="a-block.invalid") == "B"
-                    assert kernel.request(1, port, "203.0.113.9", host_header="b-block.invalid") == "DIRECT"
+                    rejected(kernel, receivers, 1, port, "203.0.113.9", "b-block.invalid")
                     kernel.select(1, 1)
-                    assert kernel.request(1, port, "203.0.113.9", host_header="a-block.invalid") == "DIRECT"
+                    rejected(kernel, receivers, 1, port, "203.0.113.9", "a-block.invalid")
                     before = {fake: len(fake.destinations) for fake in (a, b, direct_socks)}
                     kernel.request(1, port, "service.invalid", host_header="a-block.invalid")
                     destinations = [target for fake, offset in before.items() for target in fake.destinations[offset:]]
                     assert ("service.invalid", port) in destinations, destinations
                     assert all(target[0] != "a-block.invalid" for target in destinations), "sniff rewrote explicit FQDN destination"
-                    udp_session(kernel, 0, direct_socks, "a-block.invalid", resolved=False)
+                    udp_rejected(kernel, receivers, 0, "a-block.invalid", 12345)
                     udp_session(kernel, 0, a, "b-block.invalid")
                     kernel.select(1, 2)
                     udp_session(kernel, 1, b, "a-block.invalid")
-                    udp_session(kernel, 1, direct_socks, "b-block.invalid", resolved=False)
+                    udp_rejected(kernel, receivers, 1, "b-block.invalid", 12345)
                     kernel.select(1, 1)
-                    udp_session(kernel, 1, direct_socks, "a-block.invalid", resolved=False)
+                    udp_rejected(kernel, receivers, 1, "a-block.invalid", 12345)
                 else:
                     assert kernel.request(0, port) == "HTTP-A"
                     assert kernel.request(1, port) == "B"
                     kernel.select(1, 1)
                     assert kernel.request(1, port) == "HTTP-A"
-                    # Mixed pools retain their existing fail-open UDP policy. An
-                    # unrelated HTTP member must not silently become UDP-capable.
+                    # A mixed pool's capability gap must fail without a VPS fallback.
                     rules = kernel.cfg["route"]["rules"]
-                    assert any(r.get("network") == "udp" and r.get("port") == 443 and r.get("action") == "reject" for r in rules)
-                    before = len(a.udp_seen) + len(b.udp_seen)
+                    assert any(r.get("network") == "udp" and "port" not in r and r.get("action") == "reject" for r in rules)
                     with bound(socket.SOCK_DGRAM) as echo:
-                        control, relay = socks(kernel.ports["slot-1"], "0.0.0.0", 0, udp=True)
-                        with control, bound(socket.SOCK_DGRAM) as client:
-                            packet = b"\x00\x00\x00" + encoded("127.0.0.1", echo.getsockname()[1]) + b"mixed-direct"
-                            client.sendto(packet, relay)
-                            received, source = echo.recvfrom(1024)
-                            assert received == b"mixed-direct"
-                            echo.sendto(received, source)
-                            assert client.recvfrom(2048)[0].endswith(received)
-                    assert len(a.udp_seen) + len(b.udp_seen) == before
-                assert not (a.errors + b.errors + direct.errors + http_a.errors + direct_socks.errors), (a.errors, b.errors, direct.errors, http_a.errors, direct_socks.errors)
+                        echo.settimeout(0.1)
+                        udp_rejected(kernel, receivers, 1, "127.0.0.1", echo.getsockname()[1])
+                        try:
+                            received = echo.recvfrom(1024)
+                        except TimeoutError:
+                            pass
+                        else:
+                            raise AssertionError(f"mixed UDP escaped to raw direct target: {received!r}")
+                    udp_rejected(kernel, receivers, 1, "203.0.113.9", 443)
+                    udp_rejected(kernel, receivers, 1, "203.0.113.9", 53)
+                assert not any(fake.errors for fake in receivers), [fake.errors for fake in receivers]
+                assert not direct_socks.destinations and not direct_socks.udp_seen, "a business request used the VPS terminal"
                 failed = False
                 print(f"PASS: {case}", flush=True)
             finally:
                 kernel.close(failed)
     finally:
-        for fake in (direct, a, b, http_a, direct_socks):
+        for fake in receivers:
             fake.close()
 
 

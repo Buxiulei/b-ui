@@ -11,6 +11,27 @@ fn fixture() -> &'static Path {
     ))
 }
 
+/// Positive node fixtures represent the daemon after `migrate_on_start`:
+/// importing preserves v3 identity, then startup assigns exact residential slots.
+fn prepare_startup_slots(s: &mut State) {
+    let residential_users = s
+        .users
+        .iter()
+        .filter(|u| u.entitlements.residential.is_some())
+        .count();
+    assert!(residential_users > 0, "positive fixture must require slots");
+    assert!(
+        s.residential.slots.is_empty(),
+        "raw import has no slot migration"
+    );
+    bui_schema::slots::sync_slots(&mut s.residential);
+    assert_eq!(
+        bui_schema::slots::migrate_unassigned(s),
+        residential_users,
+        "startup must assign every imported residential user"
+    );
+}
+
 #[test]
 fn imports_node_params() {
     let s = bui_schema::v3::import(fixture()).unwrap().state;
@@ -153,7 +174,8 @@ fn decoded_uri_list(s: &State, username: &str) -> String {
 #[test]
 fn earliest_v3_user_record_imports_with_v3_semantics() {
     let tmp = fixture_with_users(&legacy_users_json());
-    let r = bui_schema::v3::import(tmp.path()).unwrap();
+    let mut r = bui_schema::v3::import(tmp.path()).unwrap();
+    prepare_startup_slots(&mut r.state);
     let s = &r.state;
     assert_eq!(s.users.len(), 2);
 
@@ -278,7 +300,8 @@ fn single_protocol_users_get_either_the_residential_or_the_direct_node() {
  {"username":"erin","password":"pw-erin-05","uuid":"55555555-5555-4555-8555-555555555555","protocol":"hysteria2","residential":false,"limits":{}}
 ]"#,
     );
-    let s = bui_schema::v3::import(tmp.path()).unwrap().state;
+    let mut s = bui_schema::v3::import(tmp.path()).unwrap().state;
+    prepare_startup_slots(&mut s);
 
     // 单协议 + 住宅：只有住宅版
     assert!(!entitlements(&s, "bob").direct);
@@ -307,7 +330,8 @@ fn fusion_and_protocol_less_users_keep_the_direct_nodes() {
  {"username":"ivan","password":"pw-ivan-09","uuid":"99999999-9999-4999-8999-999999999999","limits":{}}
 ]"#,
     );
-    let s = bui_schema::v3::import(tmp.path()).unwrap().state;
+    let mut s = bui_schema::v3::import(tmp.path()).unwrap().state;
+    prepare_startup_slots(&mut s);
     let all_four = vec![
         NodeKind::RealityDirect,
         NodeKind::RealityResidential,
@@ -328,6 +352,57 @@ fn fusion_and_protocol_less_users_keep_the_direct_nodes() {
     );
     assert!(entitlements(&s, "ivan").direct);
     assert_eq!(node_kinds(&s, "ivan"), all_four);
+}
+
+/// Imported identity and reserved HY2 credentials do not authorize an unassigned
+/// residential path. Only the separate startup migration can establish that grant.
+#[test]
+fn imported_residential_users_require_startup_slot_migration() {
+    use bui_schema::egress::{access_for, EgressDeny, RequestedEgress};
+
+    let s = bui_schema::v3::import(fixture()).unwrap().state;
+    assert!(s.residential.slots.is_empty());
+    let group = s.residential.default_group().unwrap();
+    assert!(group.enabled && !group.upstreams.is_empty());
+    for (username, protocol) in [
+        ("alice", Protocol::Hysteria2),
+        ("alice", Protocol::Reality),
+        ("bob", Protocol::Hysteria2),
+        ("carol", Protocol::Reality),
+    ] {
+        let user = s.users.iter().find(|u| u.username == username).unwrap();
+        assert!(user
+            .entitlements
+            .residential
+            .as_ref()
+            .unwrap()
+            .slot_id
+            .is_none());
+        if protocol == Protocol::Hysteria2 {
+            assert!(bui_schema::hy2pool::cred_of(user, &s.residential).is_some());
+        }
+        assert_eq!(
+            access_for(
+                user,
+                &s.residential,
+                protocol,
+                RequestedEgress::RequiredResidential,
+                false,
+            ),
+            Err(EgressDeny::MissingSlotBinding),
+            "{username}/{protocol:?}: identity must not imply a residential slot"
+        );
+    }
+    assert_eq!(
+        node_kinds(&s, "alice"),
+        vec![NodeKind::RealityDirect, NodeKind::Hy2Direct]
+    );
+    assert_eq!(node_kinds(&s, "bob"), Vec::<NodeKind>::new());
+    assert_eq!(node_kinds(&s, "carol"), Vec::<NodeKind>::new());
+    assert_eq!(
+        node_kinds(&s, "dave"),
+        vec![NodeKind::RealityDirect, NodeKind::Hy2Direct]
+    );
 }
 
 /// 真正无法导入的记录（缺 password）仍然报错。

@@ -59,6 +59,7 @@ mod tests {
 
     fn ctx(pubkeys: u32, ssh_unit: &str) -> RenderCtx {
         RenderCtx {
+            account_blocked: Default::default(),
             paths: Paths::default_server(),
             facts: Facts {
                 mem_mb: 2048,

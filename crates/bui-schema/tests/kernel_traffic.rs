@@ -13,7 +13,10 @@ fn residential_selector_round_trips_udp_ips_and_domains() {
     .unwrap();
     let cfg = bui_schema::render::relay::config(
         &group,
-        &[],
+        &[bui_schema::model::Slot {
+            index: 0,
+            upstream_id: uuid::Uuid::from_u128(1),
+        }],
         &bui_schema::render::relay::RelayOpts {
             listen_port: 2080,
             api: "127.0.0.1:9091".into(),

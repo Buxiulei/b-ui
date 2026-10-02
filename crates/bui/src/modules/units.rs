@@ -334,6 +334,7 @@ mod tests {
 
     fn ctx() -> RenderCtx {
         RenderCtx {
+            account_blocked: Default::default(),
             paths: Paths::default_server(),
             facts: Facts {
                 mem_mb: 2048,

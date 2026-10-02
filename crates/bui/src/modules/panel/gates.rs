@@ -9,10 +9,9 @@
 //! 三件事在这个文件里：
 //!
 //! 1. [`expected`] —— 期望门位的**唯一**口径（纯函数）。面板投影（T14 的 `hy2ResiGate`）
-//!    与 CLI 都读它，免得「谁该放行」在三处各写一遍。「谁算住宅 HY2 用户」这半条判据
-//!    在 [`bui_schema::hy2pool::is_resi_hy2`]：T15 把 4.0.x 那两套（本文件不看分组存在性
-//!    的旧 `has_resi_hy2` / schema 里不看分组的 `is_resi_hy2`）合成了一处，取更严的那个，
-//!    池容量、分凭据、门位、面板与踢人从此同源。
+//!    与 CLI 都读它，免得「谁该放行」在三处各写一遍。放行使用
+//!    [`bui_schema::egress::access_for`] 的严格住宅契约；
+//!    [`bui_schema::hy2pool::is_resi_hy2`] 仅表示静态凭据需求，池暂时停用仍保留预留。
 //! 2. [`converge`] —— 挂在 [`users::sync_users`](super::users::sync_users) 末尾，与它旁边
 //!    那段 xray 收敛**同构**：读一次内核真源（`GET /proxies`）、求差集、只 PUT 不一致的那几个。
 //!    触发路径沿用现成的两条（`StateChanged` + 60 秒安全网），不新增定时器。
@@ -31,10 +30,9 @@ use crate::modules::residential::health::REPLAY_RETRY_BUDGET;
 use crate::modules::residential::state as resi_state;
 use crate::modules::sentinel::incidents::{self, Incident, Level};
 use crate::reconcile::DaemonCtx;
-use bui_schema::hy2pool::is_resi_hy2;
-use bui_schema::model::{State, User};
+use bui_schema::egress::{access_for, AuthorizedEgress, RequestedEgress};
+use bui_schema::model::{Protocol, State, User};
 use bui_schema::render::hy2_singbox::{gate_tag, slot_out_tag, DENY_TAG};
-use bui_schema::slots::index_of_user;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 use uuid::Uuid;
@@ -64,23 +62,23 @@ pub struct GateOutcome {
 /// 期望门位：凭据 `id` → 出站 tag（spec §3.3）。
 ///
 /// 持有人存在、不在 `blocked`（`users::blocked_set`：disabled / 到期 / 超总量 / 超月量）、
-/// 且有住宅 hysteria2 权益 ⇒ 他那一槽的出站；**其余一律 `deny`**，含全部空闲凭据。
+/// 且共享出口策略确认住宅池、精确槽绑定与凭据均可交付 ⇒ 他那一槽的出站；
+/// **其余一律 `deny`**，含全部空闲凭据。静态预留凭据不代表当前放行授权。
 ///
 /// `hy2_resi_cred` 指向池里已不存在的 id（人工改 state、回滚后再升级）时那个用户不进表
 /// —— 他压根没有门；这种悬空指针由
 /// [`slots::migrate_hy2_pool_on_start`](crate::modules::residential::slots::migrate_hy2_pool_on_start)
 /// 在启动时清掉并补发。
 pub fn expected(s: &State, blocked: &BTreeSet<Uuid>) -> BTreeMap<String, String> {
-    let holder: BTreeMap<&str, &User> = s
-        .users
-        .iter()
-        .filter_map(|u| {
-            u.credentials
-                .hy2_resi_cred
-                .as_deref()
-                .map(|id| (id, u as &User))
-        })
-        .collect();
+    let mut holder: BTreeMap<&str, Option<&User>> = BTreeMap::new();
+    for user in &s.users {
+        if let Some(id) = user.credentials.hy2_resi_cred.as_deref() {
+            holder
+                .entry(id)
+                .and_modify(|owner| *owner = None)
+                .or_insert(Some(user));
+        }
+    }
     s.residential
         .hy2_pool
         .creds
@@ -88,10 +86,22 @@ pub fn expected(s: &State, blocked: &BTreeSet<Uuid>) -> BTreeMap<String, String>
         .map(|c| {
             let tag = holder
                 .get(c.id.as_str())
-                .filter(|u| {
-                    !u.disabled && !blocked.contains(&u.user_id) && is_resi_hy2(u, &s.residential)
+                .copied()
+                .flatten()
+                .and_then(|u| {
+                    match access_for(
+                        u,
+                        &s.residential,
+                        Protocol::Hysteria2,
+                        RequestedEgress::RequiredResidential,
+                        blocked.contains(&u.user_id),
+                    ) {
+                        Ok(AuthorizedEgress::Residential(binding)) => {
+                            Some(slot_out_tag(binding.slot_index))
+                        }
+                        _ => None,
+                    }
                 })
-                .map(|u| slot_out_tag(index_of_user(u, &s.residential)))
                 .unwrap_or_else(|| DENY_TAG.to_string());
             (c.id.clone(), tag)
         })
@@ -1125,6 +1135,88 @@ mod tests {
             .find(|u| u.username == username)
             .and_then(|u| u.credentials.hy2_resi_cred.clone())
             .expect("迁移后每个住宅 hysteria2 用户都有凭据")
+    }
+
+    // Catches opening a credential on a fallback slot despite an undeliverable residential grant.
+    #[test]
+    fn egress_contract_gates_reject_undeliverable_residential_bindings() {
+        for fault in [
+            "disabled-pool",
+            "empty-pool",
+            "unassigned",
+            "missing-slot",
+            "unsupported-group",
+        ] {
+            let mut state = three_slot_state_with_pool();
+            match fault {
+                "disabled-pool" => {
+                    state.residential.groups.get_mut("default").unwrap().enabled = false
+                }
+                "empty-pool" => state
+                    .residential
+                    .groups
+                    .get_mut("default")
+                    .unwrap()
+                    .upstreams
+                    .clear(),
+                "unassigned" => {
+                    state.users[0]
+                        .entitlements
+                        .residential
+                        .as_mut()
+                        .unwrap()
+                        .slot_id = None
+                }
+                "missing-slot" => state.residential.slots.retain(|slot| slot.index != 1),
+                "unsupported-group" => {
+                    let group = state.residential.groups["default"].clone();
+                    state.residential.groups.insert("other".into(), group);
+                    state.users[0]
+                        .entitlements
+                        .residential
+                        .as_mut()
+                        .unwrap()
+                        .group_id = "other".into();
+                }
+                _ => unreachable!(),
+            }
+            let blocked = users::blocked_set(&state, &Default::default(), t0());
+            assert_eq!(expected(&state, &blocked)["r000"], "deny", "{fault}");
+        }
+    }
+
+    // A corrupt shared credential must not inherit the last holder's otherwise valid slot.
+    #[test]
+    fn egress_contract_ambiguous_credential_holders_are_all_denied() {
+        let mut state = three_slot_state_with_pool();
+        assert_eq!(expected(&state, &BTreeSet::new())["r000"], "slot-1-out");
+        assert_eq!(expected(&state, &BTreeSet::new())["r001"], "slot-2-out");
+        state.users[1].credentials.hy2_resi_cred = Some("r000".into());
+        let gates = expected(&state, &BTreeSet::new());
+        assert_eq!(
+            gates["r000"], "deny",
+            "two holders are not an authorization proof"
+        );
+        assert_eq!(
+            gates["r001"], "deny",
+            "an unowned credential must remain closed"
+        );
+    }
+
+    // Removing the pool authorization check would leave a live kernel gate open after pool disable.
+    #[tokio::test]
+    async fn egress_contract_convergence_closes_a_live_gate_when_the_pool_is_disabled() {
+        let h = harness_with_pool().await;
+        h.hy2resi
+            .set_selected(BTreeMap::from([("gate-r000".into(), "slot-1-out".into())]));
+        h.store
+            .update(|state| state.residential.groups.get_mut("default").unwrap().enabled = false)
+            .await
+            .unwrap();
+        let outcome = converge(&ctx_of(&h), &h.shared, &BTreeSet::new()).await;
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert_eq!(outcome.switched, 1);
+        assert_eq!(h.hy2resi.selected()["gate-r000"], "deny");
     }
 
     /// 期望门位：有权益且未被封 ⇒ 本槽出站；其余（含全部空闲凭据）⇒ deny

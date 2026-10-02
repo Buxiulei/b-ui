@@ -80,7 +80,7 @@ pub fn front_config(
                 "interrupt_exist_connections": false
             })
         }));
-        // Keep slot preference, global selection and direct semantics from the same renderer;
+        // Keep slot preference, global selection and bootstrap dialer from the same renderer;
         // discard every original loopback member and raw supplier credential.
         outbounds.extend(
             cfg["outbounds"]
@@ -92,6 +92,10 @@ pub fn front_config(
         );
         cfg["outbounds"] = json!(outbounds);
     }
+    cfg["dns"]["servers"]
+        .as_array_mut()
+        .expect("relay renderer always emits DNS servers")
+        .retain(|server| server["tag"] == "dns_direct" || server["tag"] == "dns_resi");
     Ok(cfg)
 }
 
@@ -148,9 +152,10 @@ pub fn backend_config(group: &ResidentialGroup, opts: &BackendOpts) -> Result<Va
         .as_array_mut()
         .expect("relay renderer always emits route rules");
     rules.retain(|rule| targets_policy(rule, &policies));
-    for rule in rules {
+    for rule in rules.iter_mut() {
         rename_rule(rule, &inbound_names, &raw_names);
     }
+    rules.push(json!({ "action": "reject" }));
     cfg["route"]["final"] = json!("direct");
     let outbounds = cfg["outbounds"]
         .as_array_mut()
@@ -164,12 +169,25 @@ pub fn backend_config(group: &ResidentialGroup, opts: &BackendOpts) -> Result<Va
             outbound["tag"] = json!(tag);
         }
     }
-    cfg["dns"]["servers"]
+    // The backend owns immutable supplier policy, not the front's hot-selected
+    // global default. Explicit business resolvers below stay bound to each UUID.
+    let default_supplier = group
+        .upstreams
+        .first()
+        .map(|upstream| egress_tag(opts.generation, upstream.id))
+        .transpose()?;
+    for server in cfg["dns"]["servers"]
         .as_array_mut()
         .expect("relay renderer always emits DNS servers")
-        .retain(|server| server["tag"] == "dns_direct");
-    cfg["dns"]["rules"] = json!([]);
-    cfg["dns"]["final"] = json!("dns_direct");
+    {
+        if let Some(tag) = server["detour"].as_str().and_then(|tag| raw_names.get(tag)) {
+            server["detour"] = json!(tag);
+        } else if server["detour"] == super::POOL {
+            server["detour"] = json!(default_supplier
+                .as_ref()
+                .expect("active group has a supplier"));
+        }
+    }
     cfg["experimental"]
         .as_object_mut()
         .expect("relay renderer always emits experimental options")
@@ -508,9 +526,6 @@ mod tests {
         });
         cases.push(("public pin", changed));
         let mut changed = g.clone();
-        changed.mode = ResiMode::Split;
-        cases.push(("split mode", changed));
-        let mut changed = g.clone();
         changed.upstreams[0].kind = UpstreamKind::Http;
         cases.push(("UDP capability", changed));
         let mut changed = g.clone();
@@ -549,7 +564,11 @@ mod tests {
         split.mode = ResiMode::Split;
         let split_before = front_structural_hash(&front_config(&split, &slots(&g), &opts).unwrap());
         split.keywords = Some(vec!["another".into()]);
-        assert_ne!(
+        assert_eq!(
+            before, split_before,
+            "legacy split belongs to the client rather than the shared relay"
+        );
+        assert_eq!(
             split_before,
             front_structural_hash(&front_config(&split, &slots(&g), &opts).unwrap())
         );
@@ -692,37 +711,37 @@ mod tests {
                 r["inbound"] == json!([second]) || r["rules"][0]["inbound"] == json!([second])
             })
             .collect();
-        assert_eq!(second_routes.len(), 8);
+        assert_eq!(second_routes.len(), 7);
         assert_eq!(
             second_routes[0],
-            &json!({"inbound":[second],"network":"udp","port":53,"outbound":"resi-egress-g42-00000000-0000-0000-0000-000000000002"})
-        );
-        assert_eq!(
-            second_routes[1],
             &json!({"type":"logical","mode":"and","rules":[{"inbound":[second]},{"domain_regex":[".+"],"invert":true}],"action":"sniff"})
         );
         assert_eq!(
-            second_routes[2]["domain_suffix"],
+            second_routes[1]["domain_suffix"],
             json!(["failed.example.test"])
         );
-        assert_eq!(second_routes[2]["outbound"], "direct");
-        assert_eq!(second_routes[3]["port"], json!([8443]));
+        assert_eq!(second_routes[1]["action"], "reject");
+        assert_eq!(second_routes[2]["port"], json!([8443]));
+        assert_eq!(second_routes[2]["action"], "reject");
         assert_eq!(
-            second_routes[4],
-            &json!({"inbound":[second],"network":"udp","action":"resolve","server":"dns_direct","strategy":"ipv4_only"})
+            second_routes[3],
+            &json!({"inbound":[second],"network":"udp","action":"resolve","server":"dns-resi-00000000-0000-0000-0000-000000000002","strategy":"ipv4_only"})
         );
-        assert!(second_routes[5]["ip_cidr"]
+        assert!(second_routes[4]["ip_cidr"]
             .as_array()
             .unwrap()
             .contains(&json!("203.0.113.10/32")));
+        assert_eq!(second_routes[4]["action"], "reject");
         assert_eq!(
-            second_routes[6]["port_range"],
+            second_routes[5]["port_range"],
             json!(["1:442", "444:65535"])
         );
+        assert_eq!(second_routes[5]["action"], "reject");
         assert_eq!(
-            second_routes[7]["outbound"],
+            second_routes[6]["outbound"],
             "resi-egress-g42-00000000-0000-0000-0000-000000000002"
         );
+        assert_eq!(routes.last(), Some(&json!({"action":"reject"})));
         assert!(!cfg.to_string().contains("public.example.test"));
         assert!(routes
             .iter()
@@ -730,14 +749,12 @@ mod tests {
                 |r| r["inbound"] == json!(["resi-policy-g42-00000000-0000-0000-0000-000000000001"])
             )
             .all(|r| r.get("domain_suffix").is_none() && r.get("port_range").is_none()));
-        assert_eq!(
-            cfg["dns"]["servers"],
-            json!([{"tag":"dns_direct","type":"udp","server":"1.1.1.1"}])
-        );
+        assert_eq!(cfg["dns"]["final"], "dns_resi");
+        assert!(cfg["dns"]["servers"].as_array().unwrap().contains(&json!({"tag":"dns-resi-00000000-0000-0000-0000-000000000002","type":"tcp","server":"8.8.8.8","detour":"resi-egress-g42-00000000-0000-0000-0000-000000000002"})));
     }
 
     #[test]
-    fn front_keeps_public_pins_split_and_mixed_http_udp_guards_before_selectors() {
+    fn front_rejects_public_guards_and_mixed_http_udp_before_residential_selectors() {
         let mut g = group(2);
         g.mode = ResiMode::Split;
         g.upstreams[1].kind = UpstreamKind::Http;
@@ -759,38 +776,22 @@ mod tests {
         );
         assert_eq!(r[1]["domain_suffix"], json!(["public.example.test"]));
         assert_eq!(r[2]["port"], json!([8443]));
+        assert_eq!(r[1]["action"], "reject");
+        assert_eq!(r[2]["action"], "reject");
         assert_eq!(
             r[3],
-            json!({"inbound":["slot-0","slot-1"],"network":"udp","port":53,"outbound":"direct"})
+            json!({"inbound":["slot-0","slot-1"],"network":"udp","action":"reject"})
         );
-        assert_eq!(
-            r[4],
-            json!({"inbound":["slot-0","slot-1"],"network":"udp","port":443,"action":"reject"})
-        );
-        assert_eq!(
-            r[5],
-            json!({"inbound":["slot-0","slot-1"],"network":"udp","outbound":"direct"})
-        );
-        assert!(r[6]["ip_cidr"]
+        assert!(r[4]["ip_cidr"]
             .as_array()
             .unwrap()
             .contains(&json!("127.0.0.0/8")));
-        assert_eq!(
-            r[7],
-            json!({"inbound":["slot-0"],"domain_keyword":["example"],"outbound":"slot-0-pool"})
-        );
-        assert_eq!(
-            r[8],
-            json!({"inbound":["slot-1"],"domain_keyword":["example"],"outbound":"slot-1-pool"})
-        );
-        assert_eq!(cfg["route"]["final"], "direct");
-        assert_eq!(
-            cfg["dns"]["rules"],
-            json!([
-                {"domain_suffix":["public.example.test"],"server":"dns_direct"},
-                {"domain_keyword":["example"],"server":"dns_resi"}
-            ])
-        );
+        assert_eq!(r[4]["action"], "reject");
+        assert_eq!(r[5], json!({"inbound":["slot-0"],"outbound":"slot-0-pool"}));
+        assert_eq!(r[6], json!({"inbound":["slot-1"],"outbound":"slot-1-pool"}));
+        assert_eq!(r[7], json!({"action":"reject"}));
+        assert_eq!(cfg["dns"]["final"], "dns_resi");
+        assert_eq!(cfg["dns"]["rules"], json!([]));
         let back = backend_config(&g, &backend(Bank::A)).unwrap();
         assert!(back["route"]["rules"]
             .as_array()
@@ -807,7 +808,7 @@ mod tests {
     }
 
     #[test]
-    fn disabled_or_empty_pools_keep_direct_front_and_no_backend_references() {
+    fn disabled_or_empty_pools_reject_payloads_without_backend_references() {
         let mut disabled = group(2);
         disabled.enabled = false;
         for g in [disabled, group(0)] {
@@ -825,6 +826,11 @@ mod tests {
                 .any(|i| i["listen_port"] == 2080));
             assert_eq!(back["inbounds"], json!([]));
             assert_eq!(back["outbounds"], json!([{"type":"direct","tag":"direct"}]));
+            for cfg in [&front, &back] {
+                let rules = cfg["route"]["rules"].as_array().unwrap();
+                assert_eq!(rules.last(), Some(&json!({"action":"reject"})));
+                assert!(rules.iter().all(|rule| rule.get("outbound").is_none()));
+            }
             assert_no_dangling_outbounds(&front);
             assert_no_dangling_outbounds(&back);
         }

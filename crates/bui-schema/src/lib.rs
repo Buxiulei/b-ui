@@ -28,6 +28,13 @@
 //! - [`nodes::nodes_for`]：按用户权限展开该用户可见的节点集合，返回
 //!   [`Node`](nodes::Node)（[`NodeKind`](nodes::NodeKind) / [`Transport`](nodes::Transport)）。
 //!
+//! ## 通路授权 —— [`egress`]
+//!
+//! - [`egress::access_for`]：订阅与服务端认证共用的纯授权函数。直连需要明确权益；
+//!   住宅需要有效池、受支持的分组、精确且唯一的槽与上游绑定，以及协议对应凭据。
+//!   住宅不可交付时返回 [`egress::EgressDeny`]，不授权兜底槽或直连出口。
+//! - 账户到期与限额由调用方的唯一判定传入，不在 schema 里另读时钟。
+//!
 //! ## IP 池与槽位 —— [`slots`]
 //!
 //! - [`slots::SlotRes`] `{ index, relay_port }`：槽 i 的那**一个**端口（relay 的 socks
@@ -61,8 +68,8 @@
 //!   `clamp(ceil16(2 × 住宅 hysteria2 用户数), 32, 256)`；基数由
 //!   [`hy2pool::resi_hy2_users`] 数出。
 //! - [`hy2pool::is_resi_hy2`]：「有住宅权益、权益指向的分组真实存在、且开了 hysteria2」
-//!   ——池容量、迁移分凭据、门位收敛、面板投影、踢人与装完自检挑探测用户共用的**唯一**
-//!   那条判据（权益被撤掉、或 `group_id` 悬空的持凭据用户都不满足它）。
+//!   ——池容量、迁移分凭据与凭据预留的静态判据。运行通路授权由 [`egress::access_for`]
+//!   判断，临时停用住宅池不释放用户的预留凭据。
 //! - [`hy2pool::grow`]：补到目标条数（`id` = 最小空闲 `r%03d`，`name = id`）。
 //! - [`hy2pool::assign_at`] / [`hy2pool::assign`] / [`hy2pool::release`] /
 //!   [`hy2pool::cred_of`]：分配（先「从未用过」、再「`released_at` 最早且 ≥ 24 小时」；
@@ -113,7 +120,8 @@
 //! - [`render::xray::config`]：含 `vless-direct` / `vless-residential` 两个 REALITY 入站的
 //!   `xray-config.json`；[`render::xray::structural_hash`] 忽略 `clients` 后取哈希，
 //!   用于判断是否只是加减用户（可热更新而不必重启）。
-//! - [`render::relay::config`]：本地 sing-box 中继 `singbox-relay.json`（池空时 fail-open 直连）。
+//! - [`render::relay::config`]：本地 sing-box 中继 `singbox-relay.json`；住宅业务只走住宅，
+//!   池不可用时拒绝业务连接。
 //!
 //! ## 订阅渲染 —— [`render::subscription`]
 //!
@@ -152,6 +160,7 @@
 //! fn render_everything(_state: &State) { /* ... */ }
 //! ```
 
+pub mod egress;
 pub mod hy2pool;
 pub mod keywords;
 pub mod model;
