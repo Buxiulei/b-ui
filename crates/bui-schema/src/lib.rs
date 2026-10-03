@@ -170,6 +170,7 @@ pub mod egress;
 pub mod hy2pool;
 pub mod keywords;
 pub mod managed;
+pub mod managed_binding;
 pub mod model;
 pub mod nodes;
 pub mod parse;

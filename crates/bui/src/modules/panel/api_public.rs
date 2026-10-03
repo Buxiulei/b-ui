@@ -139,6 +139,151 @@ async fn lookup(app: &AppState, shared: &Shared, seg: &str) -> Result<Delivery, 
     })
 }
 
+/// One owned authorization snapshot. Deliberately no Debug/Serialize: nodes contain secrets.
+#[allow(dead_code)] // Task4 consumes this helper; no new endpoint is installed in Task2.
+pub(crate) struct ManagedDelivery {
+    pub username: String,
+    pub nodes: Vec<Node>,
+    pub policy: bui_schema::managed::ManagedPolicy,
+    pub dial_ip: String,
+    stamp: ManagedStamp,
+}
+struct ManagedStamp {
+    original_segment: String,
+    user_id: uuid::Uuid,
+    semantic: bui_schema::managed_binding::SemanticStamp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManagedDeliveryFailure {
+    NotFound,
+    MissingSelection,
+    Unauthorized,
+    Unavailable,
+}
+impl ManagedDeliveryFailure {
+    #[allow(dead_code)]
+    pub(crate) fn response(self) -> Response {
+        match self {
+            Self::NotFound => not_found(),
+            Self::MissingSelection => (
+                StatusCode::CONFLICT,
+                Json(json!({"error":"Managed egress selection required"})),
+            )
+                .into_response(),
+            Self::Unauthorized => (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error":"Account unavailable"})),
+            )
+                .into_response(),
+            Self::Unavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error":"Managed route unavailable"})),
+            )
+                .into_response(),
+        }
+    }
+}
+fn valid_managed_evidence(policy: &bui_schema::managed::ManagedPolicy, now: i64) -> bool {
+    use bui_schema::managed::{allows, EvidenceStatus};
+    let c = &policy.capabilities;
+    [&c.v4_tcp, &c.v4_udp, &c.v6_tcp, &c.v6_udp]
+        .into_iter()
+        .all(|status| {
+            !matches!(status, EvidenceStatus::Verified(_))
+                || allows(status, &policy.path_fingerprint, now)
+        })
+}
+
+#[allow(dead_code)]
+pub(crate) async fn managed_delivery(
+    app: &AppState,
+    shared: &Shared,
+    seg: &str,
+) -> Result<ManagedDelivery, ManagedDeliveryFailure> {
+    use bui_schema::managed::{select_nodes, ManagedPolicy};
+    use bui_schema::managed_binding::{path_fingerprint, semantic_stamp};
+    let _gate = shared.gate_guard().await;
+    let publication = app.store.publication_permit().await;
+    let pending = shared.pending().await;
+    let state = publication.state();
+    let now = app.host.now();
+    let user = resolve(state, seg, now).ok_or(ManagedDeliveryFailure::NotFound)?;
+    if users::blocked_set(state, &pending, now).contains(&user.user_id) {
+        return Err(ManagedDeliveryFailure::Unauthorized);
+    }
+    if state
+        .users
+        .iter()
+        .filter(|u| u.user_id == user.user_id)
+        .count()
+        != 1
+    {
+        return Err(ManagedDeliveryFailure::Unavailable);
+    }
+    let identity = user
+        .managed_egress
+        .ok_or(ManagedDeliveryFailure::MissingSelection)?;
+    if !bui_schema::managed_binding::selection_granted(user, state, identity) {
+        return Err(ManagedDeliveryFailure::Unauthorized);
+    }
+    let nodes = select_nodes(&nodes_for(user, &state.node, &state.residential), identity);
+    if nodes.is_empty() {
+        return Err(ManagedDeliveryFailure::Unavailable);
+    }
+    let path = path_fingerprint(state, user).map_err(|_| ManagedDeliveryFailure::Unavailable)?;
+    let revision = user
+        .managed_profile_revision
+        .filter(|r| *r > 0)
+        .ok_or(ManagedDeliveryFailure::Unavailable)?;
+    let policy = ManagedPolicy {
+        revision,
+        selected_identity: identity,
+        capabilities: state
+            .managed_egress_capabilities
+            .get(&path)
+            .cloned()
+            .unwrap_or_default(),
+        path_fingerprint: path,
+    };
+    if !valid_managed_evidence(&policy, now.unix_timestamp()) {
+        return Err(ManagedDeliveryFailure::Unavailable);
+    }
+    Ok(ManagedDelivery {
+        username: user.username.clone(),
+        nodes,
+        policy,
+        dial_ip: state.node.public_ip.clone(),
+        stamp: ManagedStamp {
+            original_segment: seg.to_owned(),
+            user_id: user.user_id,
+            semantic: semantic_stamp(state, user)
+                .map_err(|_| ManagedDeliveryFailure::Unavailable)?,
+        },
+    })
+}
+
+/// Short fresh authorization check immediately before Task4 returns success. All guards drop
+/// before HTTP writes; this is not an atomic network fence or an existing-session revocation.
+#[allow(dead_code)]
+pub(crate) async fn validate_managed_delivery(
+    app: &AppState,
+    shared: &Shared,
+    delivery: &ManagedDelivery,
+) -> Result<(), ManagedDeliveryFailure> {
+    let current = managed_delivery(app, shared, &delivery.stamp.original_segment).await?;
+    if current.stamp.user_id != delivery.stamp.user_id {
+        return Err(ManagedDeliveryFailure::NotFound);
+    }
+    if current.stamp.semantic != delivery.stamp.semantic
+        || current.policy.revision != delivery.policy.revision
+        || !valid_managed_evidence(&delivery.policy, app.host.now().unix_timestamp())
+    {
+        return Err(ManagedDeliveryFailure::Unavailable);
+    }
+    Ok(())
+}
+
 /// 移植 `web/server.js:1800`：`encodeURIComponent(username).replace(/%/g, "_") + ".json"`。
 /// `encodeURIComponent` 不编码的集合是 `A-Za-z0-9-_.!~*'()`。
 ///
@@ -317,6 +462,367 @@ mod tests {
     use super::*;
     use crate::modules::panel::testsupport::{full_with, harness, mount, raw, send, text, Harness};
     use pretty_assertions::assert_eq;
+
+    #[tokio::test]
+    async fn managed_residential_outage_with_surviving_vps_is_503() {
+        let h = harness().await;
+        h.store
+            .update(|s| {
+                s.users[0].sub_token = Some(TOK.into());
+                s.users[0] = serde_json::from_value({
+                    let mut value = serde_json::to_value(&s.users[0]).unwrap();
+                    value["managed_egress"] = json!("residential");
+                    value
+                })
+                .unwrap();
+            })
+            .await
+            .unwrap();
+        let s = h.store.read().await;
+        assert!(
+            !nodes_for(&s.users[0], &s.node, &s.residential).is_empty(),
+            "VPS control must survive"
+        );
+        assert!(matches!(
+            managed_delivery(&h.app, &h.shared, TOK).await,
+            Err(ManagedDeliveryFailure::Unavailable)
+        ));
+        assert_eq!(
+            ManagedDeliveryFailure::Unavailable.response().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_both_rights_without_explicit_default_is_missing_selection() {
+        let h = harness().await;
+        h.store
+            .update(|s| s.users[0].sub_token = Some(TOK.into()))
+            .await
+            .unwrap();
+        let s = h.store.read().await;
+        assert!(s.users[0].entitlements.direct);
+        assert!(s.users[0].entitlements.residential.is_some());
+        assert!(matches!(
+            managed_delivery(&h.app, &h.shared, TOK).await,
+            Err(ManagedDeliveryFailure::MissingSelection)
+        ));
+        assert_eq!(
+            ManagedDeliveryFailure::MissingSelection.response().status(),
+            StatusCode::CONFLICT
+        );
+    }
+
+    async fn managed_fixture() -> Harness {
+        let h = harness().await;
+        h.store
+            .update(|s| {
+                s.admin.jwt_secret = "0123456789abcdef".repeat(4);
+                s.users[0].sub_token = Some(TOK.into());
+                s.users[0].managed_egress = Some(bui_schema::managed::EgressIdentity::Vps);
+            })
+            .await
+            .unwrap();
+        h
+    }
+
+    #[tokio::test]
+    async fn managed_unknown_evidence_snapshot_is_owned_and_writer_is_released() {
+        let h = managed_fixture().await;
+        let delivery = managed_delivery(&h.app, &h.shared, TOK).await.ok().unwrap();
+        assert_eq!(
+            delivery.policy.capabilities,
+            bui_schema::managed::EgressCapabilities::default()
+        );
+        assert_eq!(delivery.username, "alice");
+        assert_eq!(delivery.dial_ip, "203.0.113.10");
+        let old_nodes = delivery.nodes.clone();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            h.store
+                .update(|s| s.users[0].credentials.hy2_password = "replacement-fixture".into()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(delivery.nodes, old_nodes);
+        assert_eq!(
+            validate_managed_delivery(&h.app, &h.shared, &delivery).await,
+            Err(ManagedDeliveryFailure::Unavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_presend_rechecks_disabled_expiry_quota_pending_token_and_rights() {
+        for change in 0..7 {
+            let h = managed_fixture().await;
+            let delivery = managed_delivery(&h.app, &h.shared, TOK).await.ok().unwrap();
+            let expected = match change {
+                0 => {
+                    h.store
+                        .update(|s| s.users[0].disabled = true)
+                        .await
+                        .unwrap();
+                    ManagedDeliveryFailure::Unauthorized
+                }
+                1 => {
+                    h.store
+                        .update(|s| {
+                            s.users[0].entitlements.expires_at = Some("2026-09-10T00:00:00Z".into())
+                        })
+                        .await
+                        .unwrap();
+                    ManagedDeliveryFailure::Unauthorized
+                }
+                2 => {
+                    h.store
+                        .update(|s| {
+                            s.users[0].entitlements.traffic_limit.total_bytes = Some(1);
+                            s.users[0].usage.total_bytes = 1;
+                        })
+                        .await
+                        .unwrap();
+                    ManagedDeliveryFailure::Unauthorized
+                }
+                3 => {
+                    h.store
+                        .update(|s| s.users[0].entitlements.traffic_limit.total_bytes = Some(10))
+                        .await
+                        .unwrap();
+                    let id = h.store.read().await.users[0].user_id;
+                    h.shared
+                        .pending()
+                        .await
+                        .insert(id, super::super::TxRx { tx: 4, rx: 6 });
+                    ManagedDeliveryFailure::Unauthorized
+                }
+                4 => {
+                    h.store
+                        .update(|s| s.users[0].sub_token = Some(OTHER_TOK.into()))
+                        .await
+                        .unwrap();
+                    ManagedDeliveryFailure::NotFound
+                }
+                5 => {
+                    h.store
+                        .update(|s| s.users[0].entitlements.direct = false)
+                        .await
+                        .unwrap();
+                    ManagedDeliveryFailure::Unauthorized
+                }
+                _ => {
+                    h.store
+                        .update(|s| s.node.public_ip = "203.0.113.2".into())
+                        .await
+                        .unwrap();
+                    ManagedDeliveryFailure::Unavailable
+                }
+            };
+            assert_eq!(
+                validate_managed_delivery(&h.app, &h.shared, &delivery).await,
+                Err(expected),
+                "change {change}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_presend_rechecks_fresh_time_and_original_legacy_token() {
+        let h = managed_fixture().await;
+        open_grace(&h).await;
+        let delivery = managed_delivery(&h.app, &h.shared, "alice")
+            .await
+            .ok()
+            .unwrap();
+        h.host.advance(8 * 86400);
+        assert_eq!(
+            validate_managed_delivery(&h.app, &h.shared, &delivery).await,
+            Err(ManagedDeliveryFailure::NotFound)
+        );
+        assert!(managed_delivery(&h.app, &h.shared, TOK).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn managed_evidence_expiry_future_and_mismatched_path_deny_without_revision_churn() {
+        use bui_schema::managed::{Evidence, EvidenceStatus};
+        let h = managed_fixture().await;
+        let now = h.app.host.now().unix_timestamp();
+        let s = h.store.read().await;
+        let path = bui_schema::managed_binding::path_fingerprint(&s, &s.users[0]).unwrap();
+        h.store
+            .update(|s| {
+                s.managed_egress_capabilities
+                    .entry(path.clone())
+                    .or_default()
+                    .v4_tcp = EvidenceStatus::Verified(Evidence {
+                    path_fingerprint: path.clone(),
+                    observed_at: now,
+                    expires_at: now + 10,
+                    observed_identity: "fixture-proof".into(),
+                });
+            })
+            .await
+            .unwrap();
+        let delivery = managed_delivery(&h.app, &h.shared, TOK).await.ok().unwrap();
+        let revision = delivery.policy.revision;
+        h.host.advance(10);
+        assert_eq!(
+            validate_managed_delivery(&h.app, &h.shared, &delivery).await,
+            Err(ManagedDeliveryFailure::Unavailable)
+        );
+        assert!(matches!(
+            managed_delivery(&h.app, &h.shared, TOK).await,
+            Err(ManagedDeliveryFailure::Unavailable)
+        ));
+        assert_eq!(
+            h.store.read().await.users[0].managed_profile_revision,
+            Some(revision)
+        );
+        for change in 0..2 {
+            h.store
+                .update(|s| {
+                    if let EvidenceStatus::Verified(e) =
+                        &mut s.managed_egress_capabilities.get_mut(&path).unwrap().v4_tcp
+                    {
+                        e.expires_at = now + 100;
+                        if change == 0 {
+                            e.observed_at = now + 20;
+                        } else {
+                            e.observed_at = now;
+                            e.path_fingerprint = "other-path".into();
+                        }
+                    }
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                managed_delivery(&h.app, &h.shared, TOK).await,
+                Err(ManagedDeliveryFailure::Unavailable)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_snapshot_waiting_on_writer_observes_current_authorization() {
+        let h = managed_fixture().await;
+        let permit = h.store.publication_permit().await;
+        let app = h.app.clone();
+        let shared = h.shared.clone();
+        let task = tokio::spawn(async move { managed_delivery(&app, &shared, TOK).await });
+        tokio::task::yield_now().await;
+        h.store
+            .update_permitted(permit, crate::state::store::CALLER_UNLABELED, |s| {
+                s.users[0].disabled = true
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            task.await.unwrap(),
+            Err(ManagedDeliveryFailure::Unauthorized)
+        ));
+    }
+
+    #[tokio::test]
+    async fn managed_each_family_proof_and_previously_allowed_horizon_are_checked() {
+        use bui_schema::managed::{Evidence, EvidenceStatus};
+        for index in 0..4 {
+            let h = managed_fixture().await;
+            let now = h.app.host.now().unix_timestamp();
+            let state = h.store.read().await;
+            let path =
+                bui_schema::managed_binding::path_fingerprint(&state, &state.users[0]).unwrap();
+            h.store
+                .update(|s| {
+                    let caps = s
+                        .managed_egress_capabilities
+                        .entry(path.clone())
+                        .or_default();
+                    let slot = match index {
+                        0 => &mut caps.v4_tcp,
+                        1 => &mut caps.v4_udp,
+                        2 => &mut caps.v6_tcp,
+                        _ => &mut caps.v6_udp,
+                    };
+                    *slot = EvidenceStatus::Verified(Evidence {
+                        path_fingerprint: path.clone(),
+                        observed_at: now,
+                        expires_at: now + 10,
+                        observed_identity: "fixture".into(),
+                    });
+                })
+                .await
+                .unwrap();
+            let delivery = managed_delivery(&h.app, &h.shared, TOK).await.ok().unwrap();
+            h.host.advance(10);
+            assert!(matches!(
+                managed_delivery(&h.app, &h.shared, TOK).await,
+                Err(ManagedDeliveryFailure::Unavailable)
+            ));
+            h.store
+                .update(|s| {
+                    let caps = s.managed_egress_capabilities.get_mut(&path).unwrap();
+                    let slot = match index {
+                        0 => &mut caps.v4_tcp,
+                        1 => &mut caps.v4_udp,
+                        2 => &mut caps.v6_tcp,
+                        _ => &mut caps.v6_udp,
+                    };
+                    if let EvidenceStatus::Verified(e) = slot {
+                        e.expires_at = now + 100;
+                    }
+                })
+                .await
+                .unwrap();
+            assert!(managed_delivery(&h.app, &h.shared, TOK).await.is_ok());
+            assert_eq!(
+                h.store.read().await.users[0].managed_profile_revision,
+                Some(delivery.policy.revision)
+            );
+            assert_eq!(
+                validate_managed_delivery(&h.app, &h.shared, &delivery).await,
+                Err(ManagedDeliveryFailure::Unavailable)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_noop_is_publishable_but_expiry_without_write_and_key_rotation_are_not() {
+        let h = managed_fixture().await;
+        let expires = h.app.host.now() + time::Duration::seconds(10);
+        h.store
+            .update(|s| {
+                s.users[0].entitlements.expires_at = Some(crate::util::fmt_rfc3339(expires))
+            })
+            .await
+            .unwrap();
+        let delivery = managed_delivery(&h.app, &h.shared, TOK).await.ok().unwrap();
+        h.store
+            .update(|s| {
+                s.users[0].note = "operator note".into();
+                s.users[0].usage.last_seen_at = Some("2026-09-11T00:00:01Z".into());
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            validate_managed_delivery(&h.app, &h.shared, &delivery).await,
+            Ok(())
+        );
+        h.host.advance(10);
+        assert_eq!(
+            validate_managed_delivery(&h.app, &h.shared, &delivery).await,
+            Err(ManagedDeliveryFailure::Unauthorized)
+        );
+        let h = managed_fixture().await;
+        let delivery = managed_delivery(&h.app, &h.shared, TOK).await.ok().unwrap();
+        h.store
+            .update(|s| s.admin.jwt_secret = "fedcba9876543210".repeat(4))
+            .await
+            .unwrap();
+        assert_eq!(
+            validate_managed_delivery(&h.app, &h.shared, &delivery).await,
+            Err(ManagedDeliveryFailure::Unavailable)
+        );
+    }
 
     /// 夹具 token：`sample_state` 的 alice 没有 `sub_token`（= 升级上来还没补齐的老 state），
     /// 四个端点的正路一律走 token，所以每个用例先给她一个。

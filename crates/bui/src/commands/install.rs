@@ -236,6 +236,7 @@ pub fn build_state(
     reality.dest = answers.masquerade.clone();
     reality.server_names = vec![reality.sni().to_string()];
     Ok(State {
+        managed_egress_capabilities: Default::default(),
         schema_version: SCHEMA_VERSION,
         node: NodeParams {
             id: uuid::Uuid::new_v4(),

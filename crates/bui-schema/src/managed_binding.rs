@@ -1,0 +1,228 @@
+//! Private canonical projections for managed publication. No network/probe owner lives here.
+//! Secret-bearing canonical bytes never leave this module or implement Debug/Serialize.
+use crate::egress::{access_for, AuthorizedEgress, EgressDeny, RequestedEgress};
+use crate::managed::{select_nodes, EgressIdentity, EvidenceStatus};
+use crate::model::{Protocol, State, User};
+use crate::nodes::{nodes_for, Transport};
+use hmac::{Hmac, Mac};
+use serde_json::{json, Value};
+use sha2::Sha256;
+use std::collections::BTreeSet;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum BindingError {
+    #[error("managed path unavailable")]
+    Unavailable,
+    #[error("ambiguous managed account identity")]
+    AmbiguousUser,
+    #[error("managed revision exhausted")]
+    RevisionOverflow,
+    #[error("managed canonicalization failed")]
+    Canonicalization,
+}
+
+/// Validate intent against the same authority as nodes_for, ignoring account/service outages.
+/// This never creates a grant, repairs a binding, or substitutes a different identity.
+pub fn selection_granted(user: &User, state: &State, identity: EgressIdentity) -> bool {
+    let mut candidate = user.clone();
+    candidate.disabled = false;
+    let requested = match identity {
+        EgressIdentity::Vps => RequestedEgress::Direct,
+        EgressIdentity::Residential => RequestedEgress::RequiredResidential,
+    };
+    [Protocol::Hysteria2, Protocol::Reality]
+        .into_iter()
+        .any(|protocol| {
+            !matches!(
+                access_for(&candidate, &state.residential, protocol, requested, false),
+                Err(EgressDeny::ProtocolNotGranted
+                    | EgressDeny::DirectNotGranted
+                    | EgressDeny::ResidentialNotGranted)
+            )
+        })
+}
+
+fn key(state: &State) -> Result<Vec<u8>, BindingError> {
+    // Install/import generate 32 random bytes as hex. Do not accept a password/short key.
+    if state.admin.jwt_secret.len() != 64 {
+        return Err(BindingError::Unavailable);
+    }
+    hex::decode(&state.admin.jwt_secret).map_err(|_| BindingError::Unavailable)
+}
+fn digest(state: &State, domain: &[u8], value: &Value) -> Result<String, BindingError> {
+    let bytes = serde_json::to_vec(value).map_err(|_| BindingError::Canonicalization)?;
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(&key(state)?).map_err(|_| BindingError::Unavailable)?;
+    mac.update(domain);
+    mac.update(&bytes);
+    Ok(hex::encode(mac.finalize().into_bytes()))
+}
+
+/// Exact authorized service-path key. Subscriber secrets are deliberately excluded.
+/// Returns no fingerprint at all when the key, selection, or selected path is unavailable.
+pub fn path_fingerprint(state: &State, user: &User) -> Result<String, BindingError> {
+    key(state)?;
+    let identity = user.managed_egress.ok_or(BindingError::Unavailable)?;
+    let nodes = select_nodes(&nodes_for(user, &state.node, &state.residential), identity);
+    if nodes.is_empty() {
+        return Err(BindingError::Unavailable);
+    }
+    let mut scope = Vec::new();
+    let mut binding = None;
+    for node in nodes {
+        let (protocol, service) = match node.transport {
+            Transport::Hysteria2 {
+                sni, obfs_password, ..
+            } => (
+                Protocol::Hysteria2,
+                json!({"protocol":"hysteria2", "sni":sni,"obfs":obfs_password}),
+            ),
+            Transport::Reality {
+                public_key,
+                short_id,
+                server_name,
+                fingerprint,
+                flow,
+                ..
+            } => (
+                Protocol::Reality,
+                json!({"protocol":"reality","public_key":public_key,"short_id":short_id,"server_name":server_name,"fingerprint":fingerprint,"flow":flow,
+                    "private_key":state.node.reality.private_key}),
+            ),
+        };
+        if identity == EgressIdentity::Residential {
+            let authorized = access_for(
+                user,
+                &state.residential,
+                protocol,
+                RequestedEgress::RequiredResidential,
+                false,
+            )
+            .map_err(|_| BindingError::Unavailable)?;
+            let AuthorizedEgress::Residential(b) = authorized else {
+                return Err(BindingError::Unavailable);
+            };
+            if binding.is_some_and(|previous| previous != b) {
+                return Err(BindingError::Unavailable);
+            }
+            binding = Some(b);
+        }
+        scope.push(json!({"host":node.host,"port":node.port,"hop":node.hop,"service":service}));
+    }
+    let supplier = if let Some(binding) = binding {
+        let entitlement = user
+            .entitlements
+            .residential
+            .as_ref()
+            .ok_or(BindingError::Unavailable)?;
+        let group = state
+            .residential
+            .groups
+            .get(&entitlement.group_id)
+            .ok_or(BindingError::Unavailable)?;
+        let upstream = group
+            .upstreams
+            .iter()
+            .find(|u| u.id == binding.upstream_id)
+            .ok_or(BindingError::Unavailable)?;
+        let mut ports = upstream.ports_allowed.clone();
+        if let Some(ports) = ports.as_mut() {
+            ports.sort_unstable();
+            ports.dedup();
+        }
+        json!({"group":entitlement.group_id,"upstream":upstream.id,"slot":binding.slot_index,
+            "kind":upstream.kind,"host":upstream.host,"port":upstream.port,"username":upstream.username,
+            "password":upstream.password,"provider":upstream.provider,"ports_allowed":ports})
+    } else {
+        Value::Null
+    };
+    digest(
+        state,
+        b"bui-managed-path-v1\0",
+        &json!({"node_id":state.node.id,
+        "identity":identity,"dial_ip":state.node.public_ip,"scope":scope,"supplier":supplier}),
+    )
+}
+
+fn evidence_semantics(status: &EvidenceStatus) -> Value {
+    match status {
+        EvidenceStatus::Unknown => json!({"status":"unknown"}),
+        EvidenceStatus::Unsupported => json!({"status":"unsupported"}),
+        EvidenceStatus::Verified(e) => {
+            json!({"status":"verified","path":e.path_fingerprint,"identity":e.observed_identity})
+        }
+    }
+}
+
+/// Opaque equality stamp; no Debug/Serialize and no secret-bearing data exposed.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SemanticStamp(String);
+
+pub fn semantic_stamp(state: &State, user: &User) -> Result<SemanticStamp, BindingError> {
+    let Some(identity) = user.managed_egress else {
+        return Ok(SemanticStamp("unset".into()));
+    };
+    if key(state).is_err() {
+        // Deterministic, nonsecret unavailable category permits legacy/key repair.
+        return Ok(SemanticStamp(format!("invalid-key:{identity:?}")));
+    }
+    let path = match path_fingerprint(state, user) {
+        Ok(path) => Some(path),
+        Err(BindingError::Unavailable) => None,
+        Err(error) => return Err(error),
+    };
+    let caps = path
+        .as_ref()
+        .and_then(|p| state.managed_egress_capabilities.get(p))
+        .cloned()
+        .unwrap_or_default();
+    let nodes = select_nodes(&nodes_for(user, &state.node, &state.residential), identity);
+    Ok(SemanticStamp(digest(
+        state,
+        b"bui-managed-semantics-v1\0",
+        &json!({
+            "identity":identity,"path":path,"nodes":nodes,"username":user.username,
+            "token":user.sub_token,"legacy_disabled":user.legacy_sub_disabled,
+            "dial_ip":state.node.public_ip,
+            "capabilities":[evidence_semantics(&caps.v4_tcp),evidence_semantics(&caps.v4_udp),evidence_semantics(&caps.v6_tcp),evidence_semantics(&caps.v6_udp)]
+        }),
+    )?))
+}
+
+/// Reconcile all writers centrally, by stable account ID. Calculate every result first:
+/// overflow/ambiguous IDs/canonicalization never leave a partially revised candidate.
+pub fn reconcile_revisions(old: &State, next: &mut State) -> Result<(), BindingError> {
+    for state in [old, &*next] {
+        let mut ids = BTreeSet::new();
+        if state.users.iter().any(|u| !ids.insert(u.user_id)) {
+            return Err(BindingError::AmbiguousUser);
+        }
+    }
+    let revisions: Result<Vec<_>, BindingError> = next
+        .users
+        .iter()
+        .map(|user| {
+            if user.managed_egress.is_none() {
+                return Ok(None);
+            }
+            let previous = old.users.iter().find(|u| u.user_id == user.user_id);
+            let Some(previous) = previous.filter(|u| u.managed_egress.is_some()) else {
+                return Ok(Some(1));
+            };
+            let Some(revision) = previous.managed_profile_revision.filter(|r| *r > 0) else {
+                return Ok(Some(1));
+            };
+            if semantic_stamp(old, previous)? == semantic_stamp(next, user)? {
+                return Ok(Some(revision));
+            }
+            revision
+                .checked_add(1)
+                .map(Some)
+                .ok_or(BindingError::RevisionOverflow)
+        })
+        .collect();
+    for (user, revision) in next.users.iter_mut().zip(revisions?) {
+        user.managed_profile_revision = revision;
+    }
+    Ok(())
+}

@@ -11,6 +11,8 @@ pub const DEFAULT_GROUP: &str = "default";
 /// 期望态根对象（`/opt/b-ui/state.json`）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct State {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub managed_egress_capabilities: BTreeMap<String, crate::managed::EgressCapabilities>,
     pub schema_version: u32,
     pub node: NodeParams,
     pub admin: Admin,
@@ -94,6 +96,10 @@ pub struct Admin {
 /// 一个订阅用户。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct User {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_egress: Option<crate::managed::EgressIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_profile_revision: Option<u64>,
     pub user_id: Uuid,
     pub username: String,
     #[serde(default)]

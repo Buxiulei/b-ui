@@ -145,6 +145,7 @@ pub fn import(dir: &Path) -> Result<ImportReport, ImportError> {
 
     let now = time::OffsetDateTime::now_utc();
     let mut state = State {
+        managed_egress_capabilities: Default::default(),
         schema_version: SCHEMA_VERSION,
         node: NodeParams {
             id: Uuid::new_v4(),
@@ -392,6 +393,8 @@ fn user_from_v3(u: V3User, warnings: &mut Vec<String>) -> Result<User, ImportErr
         // 2026-09-14 裁决：导入出来的用户一律带随机订阅 token；他手里那条用户名链接
         // 由 `system.legacy_sub_until` 的宽限期兜着（见 `import`），不在这里停用。
         sub_token: Some(new_sub_token()),
+        managed_egress: None,
+        managed_profile_revision: None,
         legacy_sub_disabled: false,
     })
 }

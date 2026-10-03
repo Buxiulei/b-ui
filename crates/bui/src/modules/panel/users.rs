@@ -336,6 +336,8 @@ pub fn new_user(req: &CreateRequest, now: OffsetDateTime) -> Result<User, String
         // 装机首用户也走这里（`commands::install::first_user`），所以三条建用户路径里
         // 有两条由这一行负责，第三条是 `bui_schema::v3::user_from_v3`。
         sub_token: Some(bui_schema::sub::new_sub_token()),
+        managed_egress: req.managed_egress,
+        managed_profile_revision: None,
         legacy_sub_disabled: false,
     })
 }
@@ -418,6 +420,9 @@ pub fn apply_update(u: &mut User, req: &UpdateRequest, now: OffsetDateTime) -> R
     if let Some(d) = req.disabled {
         u.disabled = d;
     }
+    if let Some(identity) = req.managed_egress {
+        u.managed_egress = Some(identity);
+    }
     // req.speed 接受但忽略（决策 D13：spec §0「按用户限速…删除」）
     Ok(())
 }
@@ -483,6 +488,9 @@ pub fn blocked_set(
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct CreateRequest {
+    /// Explicit administrator intent; never accepts evidence or revision.
+    #[serde(default)]
+    pub managed_egress: Option<bui_schema::managed::EgressIdentity>,
     pub username: String,
     #[serde(default)]
     pub password: Option<String>,
@@ -506,6 +514,9 @@ pub struct CreateRequest {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct UpdateRequest {
+    /// Explicit administrator intent; never accepts evidence or revision.
+    #[serde(default)]
+    pub managed_egress: Option<bui_schema::managed::EgressIdentity>,
     #[serde(default)]
     pub username: Option<String>,
     #[serde(default)]
@@ -1804,6 +1815,7 @@ mod tests {
     #[test]
     fn new_user_converts_days_and_gigabytes_like_v3() {
         let req = CreateRequest {
+            managed_egress: None,
             username: "bob".into(),
             password: None,
             days: Some(30.0),
@@ -1963,6 +1975,7 @@ mod tests {
         apply_update(
             &mut u,
             &UpdateRequest {
+                managed_egress: None,
                 username: Some("bob2".into()),
                 password: Some("pw2".into()),
                 days: Some(3.0),
@@ -1995,6 +2008,7 @@ mod tests {
         apply_update(
             u,
             &UpdateRequest {
+                managed_egress: None,
                 username: Some("alice2".into()),
                 password: Some("new-pw".into()),
                 days: Some(10.0),

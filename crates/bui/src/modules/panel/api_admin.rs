@@ -238,6 +238,7 @@ async fn create_user(State(app): State<AppState>, body: Bytes) -> Response {
         Err(e) => return fail(StatusCode::BAD_REQUEST, e),
     };
     let mut dup = false;
+    let mut unauthorized = false;
     let to_push = user.clone();
     let uid = to_push.user_id;
     if let Err(e) = app
@@ -245,6 +246,12 @@ async fn create_user(State(app): State<AppState>, body: Bytes) -> Response {
         .update(|s| {
             if s.users.iter().any(|u| u.username == to_push.username) {
                 dup = true;
+                return;
+            }
+            if to_push.managed_egress.is_some_and(|identity| {
+                !bui_schema::managed_binding::selection_granted(&to_push, s, identity)
+            }) {
+                unauthorized = true;
                 return;
             }
             s.users.push(to_push);
@@ -257,6 +264,9 @@ async fn create_user(State(app): State<AppState>, body: Bytes) -> Response {
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Save failed: {e}"),
         );
+    }
+    if unauthorized {
+        return fail(StatusCode::FORBIDDEN, "Managed egress not granted");
     }
     if dup {
         return fail(StatusCode::BAD_REQUEST, "用户名已存在");
@@ -304,6 +314,7 @@ async fn update_user(
     };
     let now = app.host.now();
     let mut missing = false;
+    let mut unauthorized = false;
     let mut problem: Option<String> = None;
     let mut new_name = username.clone();
     // 改 hy2 密码 ⇒ 顺带换住宅 HY2 凭据（见函数文档）：旧 / 新凭据 id + 这个用户的 id
@@ -325,6 +336,12 @@ async fn update_user(
                     let pw_before = copy.credentials.hy2_password.clone();
                     match users::apply_update(&mut copy, &req, now) {
                         Ok(()) => {
+                            if req.managed_egress.is_some_and(|identity| {
+                                !bui_schema::managed_binding::selection_granted(&copy, s, identity)
+                            }) {
+                                unauthorized = true;
+                                return;
+                            }
                             let pw_changed = copy.credentials.hy2_password != pw_before;
                             let uid = copy.user_id;
                             new_name = copy.username.clone();
@@ -351,6 +368,9 @@ async fn update_user(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Save failed: {e}"),
         );
+    }
+    if unauthorized {
+        return fail(StatusCode::FORBIDDEN, "Managed egress not granted");
     }
     if missing {
         return fail(StatusCode::NOT_FOUND, "User not found");
@@ -795,6 +815,99 @@ mod tests {
     use crate::modules::panel::testsupport::{full_with, harness, mount, send, token, Harness};
     use crate::modules::panel::TxRx;
     use pretty_assertions::assert_eq;
+
+    #[tokio::test]
+    async fn managed_vps_only_cannot_select_residential_admin_403() {
+        let h = harness().await;
+        h.store
+            .update(|s| s.users[0].entitlements.residential = None)
+            .await
+            .unwrap();
+        let before = h.store.read().await;
+        let (r, t) = app(&h).await;
+        let (status, _) = send(
+            &r,
+            "PUT",
+            "/api/users/alice",
+            Some(&t),
+            Some(json!({"managed_egress":"residential", "username":"changed"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(*h.store.read().await, *before);
+    }
+
+    #[tokio::test]
+    async fn managed_creation_uses_explicit_selection_and_never_json_revision_or_proof() {
+        let h = harness().await;
+        let (r, t) = app(&h).await;
+        let (status, _) = send(
+            &r,
+            "POST",
+            "/api/users",
+            Some(&t),
+            Some(json!({
+                "username":"bob", "residential":false, "managed_egress":"residential"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(h.store.read().await.users.len(), 1);
+        let (status, _) = send(
+            &r,
+            "POST",
+            "/api/users",
+            Some(&t),
+            Some(json!({
+                "username":"bob", "residential":false, "managed_egress":"vps",
+                "managed_profile_revision":999, "managed_egress_capabilities":{"forged":"verified"}
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let state = h.store.read().await;
+        let user = state.users.iter().find(|u| u.username == "bob").unwrap();
+        assert_eq!(
+            user.managed_egress,
+            Some(bui_schema::managed::EgressIdentity::Vps)
+        );
+        assert_eq!(user.managed_profile_revision, Some(1));
+        assert!(state.managed_egress_capabilities.is_empty());
+    }
+
+    #[tokio::test]
+    async fn managed_admin_may_save_granted_residential_intent_during_outage() {
+        let h = harness().await;
+        let (r, t) = app(&h).await;
+        let (status, _) = send(
+            &r,
+            "PUT",
+            "/api/users/alice",
+            Some(&t),
+            Some(json!({"managed_egress":"residential"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let state = h.store.read().await;
+        assert_eq!(
+            state.users[0].managed_egress,
+            Some(bui_schema::managed::EgressIdentity::Residential)
+        );
+        assert_eq!(state.users[0].managed_profile_revision, Some(1));
+        let (status, _) = send(
+            &r,
+            "PUT",
+            "/api/users/alice",
+            Some(&t),
+            Some(json!({"managed_egress":"residential","managed_profile_revision":999})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            h.store.read().await.users[0].managed_profile_revision,
+            Some(1)
+        );
+    }
 
     async fn app(h: &Harness) -> (axum::Router, String) {
         (mount(&h.app, routes(h.shared.clone())), token(h).await)
