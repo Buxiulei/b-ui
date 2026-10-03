@@ -6,7 +6,7 @@
 
 BUI 的授权、配置编译、交付和管理控制仍由 Rust 实现。本候选的隔离编译器业务证据来自官方 sing-box 1.14.2 Linux ARM64 归档；首个完整配置交付目标固定为 macOS v2rayN 7.25.4 与官方 sing-box 1.14.2。Linux 实验的核心身份不能代替当前 Mac 实际加载的核心身份，Mac 和 Android/iOS 的设备验收尚未完成。
 
-现有发布链保持不变：`scripts/release/kernels.lock` 的 sing-box 两个架构仍锁定上游 1.14.2 源码构建并启用 `with_v2ray_api`，发布流水线没有在本任务中迁移到官方归档。这条既有发布构建链与本候选的官方归档编译器证据分属不同来源，不能互相替代。官方归档计量迁移仍被 G0 FAIL 阻断，尚未通过；本候选也不能证明现有发布二进制已完成迁移。
+现有发布链保持不变：`scripts/release/kernels.lock` 的 sing-box 两个架构仍锁定上游 1.14.2 源码构建并启用 `with_v2ray_api`，发布流水线没有在本任务中迁移到官方归档。这条既有发布构建链与本候选的官方归档编译器证据分属不同来源，不能互相替代。G0 FAIL 阻断官方预编译归档的计量／发布来源迁移；已批准架构没有要求所有既有未改上游源码构建物都迁移到归档。保留现有 source-build 名称、哈希与 provenance 不能证明已部署产物已独立核验，也不能授予新 managed 服务。当前计量 readiness、业务完整性、实际路径能力与 admission 闭环仍未通过，是否迁移均不改变该阻断。
 
 完整受管配置复用一致的账户授权，显式选择一个获准出口身份。双栈 TUN 编译器捕获 IPv4、IPv6 和业务 DNS，并按 IPv4/IPv6 × TCP/UDP 四格分别授予或拒绝业务能力。业务没有本机 DIRECT、国家／域名／端口旁路或应用进程旁路；住宅失败时拒绝，不回落到 VPS 或本机，也不按延迟跨出口身份选择。未知、未支持、过期或路径不匹配的能力拒绝业务，捕获范围不因物理网络暂时缺少 IPv6 而缩小。
 
@@ -25,8 +25,11 @@ BUI 的授权、配置编译、交付和管理控制仍由 Rust 实现。本候�
 | 补充配置检查／启动变体 | PASS | 3/3：REALITY-only、HY2 hop+obfs、多 literal endpoint。仅 check/start，零业务回执不计为交付证明；与 18 个业务场景分开统计。 |
 | Native feed／API／面板行为 | PASS | 服务器包 1318 项通过，另有 3 项既有忽略、1 项 G0 过滤；定向 API 等 13 项通过。实际整页 Node 行为 27/27、既有节点 URI 16/16。覆盖响应／拒绝、快照、令牌边界与页面竞争等软件行为；没有实际客户端导入或 live-service admission 结论。 |
 | 独立任务审查 | PASS | 固定交付候选的规格符合、质量 Approved，Critical／Important／Minor 均为 0；实际／live 验收缺口明确保留。审查不是实时业务准入。 |
+| 固定源码候选 CI | PASS | run 37126330349 对 HEAD `3dca789383052448173f8d0d338a8371a31cc3be` 的 nft／lint／test 为 SUCCESS；Caddy 2.11.7 实际 validate 执行且 skip 为 0。仅该源码候选的 CI，4.1.7 未发布、未部署，不覆盖当前 Mac 或 managed admission。 |
 | G0 官方计量迁移 | FAIL | 12 个实际场景执行，8 项归户完整、4 项有缺口或不完整。缺口可观察及隔离拒绝不等于计费契约成立，也不是生产准入 owner 的验收。 |
 | 独立原版 HY2 通用半关闭 | FAIL | 57 个实际业务场景：21 项业务 PASS、36 项 FAIL。关闭 sniff／rewrite 未修复；DNS adapter 通过没有消除该独立阻断。 |
+| 两次 HY2 服务端替换 CONTROL | 未验收 | native 与 sing-box 服务端各一次，均 INCONCLUSIVE／exit 2。初始两条 TCP 的双向字节通过、TERM／reap／replacement UP 只证明所达阶段；替换后 C 正向业务未完成，旧端点关闭观察 NOT_RUN。 |
+| 固定 VLESS／REALITY 普通 TCP 完整性 | FAIL | 官方 sing-box 1.14.2→官方 Xray 26.3.27 Vision／REALITY→freedom 的有限六案全部实际到达／执行：直接对照 A 的 3 案与 B 普通响应 PASS，B 两个半关闭案 FAIL，整体 exit 1。Bclient 的 target upload receipt 缺失；Btarget 的反向交付取得独立 0 字节＋EOF 反例。另有 Bclient target worker 未 join 的 cleanup ERROR，不能称全清理成功；不授予 Verified、完整 F6 或 managed 准入。 |
 | 当前 Mac 私有备份与只读预检 | PASS | 仅一致备份与当前环境只读观察的准备工作；不包含候选导入、加载、授权或真实流量。 |
 | 候选导入、首次 TUN 授权与实际加载证明 | 未验收 | 必须核实实际官方核心、active profile、revision／hash、系统权限及路由。 |
 | Mac 原始 IPv4／IPv6、TCP／UDP／DNS 的 TUN 捕获 | 未验收 | 需在无显式代理的环境验证 literal、A/AAAA-only、冷缓存 UDP/TCP 53 与应用 DoH 的受控目标双向字节和身份回执；显式 HTTP/SOCKS 请求不能替代。 |
@@ -48,8 +51,28 @@ BUI 的授权、配置编译、交付和管理控制仍由 Rust 实现。本候�
 
 隔离测试、有限 API／面板测试及独立代码审查可验证候选的软件行为，不能构成真实服务准入。当前实际 producer、精确映射和服务端串行撤权／开放未闭环，因此保持封闭候选，不承诺一次导入即可完整接管、双栈可用、无中断更新或断开保护。
 
+## 本次有限架构检查点
+
+编译器证明、业务完整性与运行时准入分别记账。18 个合成业务场景验证 compiler 的有限输出与路径语义；它们没有生成真实服务 Verified，也没有覆盖通用 HY2 半关闭。两个服务端替换 CONTROL 中，每次初始 A/B 两条 TCP 都取得精确的 client→target 128 字节与 target→client 192 字节。随后实际 TERM 成功、旧服务端 reap、新服务端 UP，原客户端连续运行且成功连接计数仍为 1；C 未在约 3 秒 I/O timeout 前完成成功 CONNECT 或业务回执。配置的 5 秒 action budget 未完整观察，旧端点 observation 阶段未进入，不能给四方向关闭、替换后连接或完整矩阵通过信用。源码中的 native `clientDo` 在一次调用返回 ClosedError 后只使后续调用重新连接，不保证当前请求重试或一次服务重启必定满足 count2；现有结果也没有裁定重连永久失败或固定内核必然在某时限内恢复。
+
+固定 REALITY 源码补件仅闭合最小普通 TCP 复现所需的服务端握手／关闭与 TLS target 问题。固定客户端的 [Vision／EOF 复制关闭路径](https://github.com/SagerNet/sing-box/blob/af6e64c3b69e6132ebaee0e1a3d24e93903f6709/route/conn.go#L273)、[REALITY CloseWrite](https://github.com/SagerNet/sing-box/blob/af6e64c3b69e6132ebaee0e1a3d24e93903f6709/common/tls/reality_client.go#L335)，以及固定 Xray 的 [freedom EOF 路径](https://github.com/XTLS/Xray-core/blob/d2758a023cd7f4174a5a5fa4ff66e487d4342ba0/proxy/freedom/freedom.go#L176) 存在各自的半关闭风险；源码推论与下述实际业务 FAIL 分开记录，实测没有定位每个源码分支的因果。源码完整、真实握手或普通响应通过均不产生完整性资格，也不回填历史 F6 的 `NOT_RUN_SOURCE_INCOMPLETE` 为 PASS。
+
+首次隔离尝试在 B 启动核心前未满足源码前置条件，A 3 案 PASS、B 3 案 NOT_RUN、整体 INCONCLUSIVE／exit 2，该历史结果保留。修正 fixture 后的最终尝试是独立的六案实际证据：A 为真实应用 TCP 直接对照，B 为真实应用 TCP→官方 sing-box 1.14.2→官方 Xray 26.3.27 Vision／REALITY→freedom→同一业务目标，Rust 不在数据路径。独立 TLS target 已实际完成 TLS 1.3／X25519（group 29）及启动所需的无 ALPN、http/1.1、h2 握手；这些握手回执不计入业务字节。
+
+| 普通 TCP 行为 | A 直接对照 | B Vision／REALITY→freedom |
+|---|---|---|
+| 普通完整响应 | PASS：精确请求／响应字节及 hash | PASS：精确 139275 字节上传、524301 字节下载及 hash，正常响应闭环 |
+| client write-half-close 后延迟响应 | PASS：目标观察上传 EOF，延迟 2 秒后完整响应 | FAIL：client 响应 0 字节并在本地 cleanup 前观察 early EOF。target upload receipt 缺失，worker 未 join、目标接收阶段未完成；target EOF 与延迟响应阶段 NOT_OBSERVED。不能称 target 已完整收上传，也不能称实际已提交的延迟响应被丢失。 |
+| server write-half-close 后反向继续发送 | PASS：应用观察读 EOF，等待至少 2 秒后反向数据完整到达目标 | FAIL：client 完整收到 524301 字节及 EOF，等待至少 2 秒后本地提交 139275 字节返回；独立 target 已在该等待结束前、且在本地 cleanup 前观察到 0 字节＋EOF。本地写成功没有形成目标交付，构成该有界路径的反向交付反例。 |
+
+A 三案各自精确完成 139275 字节上传、524301 字节下载及各自 hash，并通过对应 EOF／2 秒方向 oracle。最终尝试六案实际到达／执行，4 案 PASS、2 案 FAIL，整体 FAIL／exit 1；没有 timeout 或失败后重跑 B 来替换结果。清理另记 ERROR：Bclient 的一个 target worker 未 join，whole cleanup 为 false；两颗核心均 TERM、reap returncode 0，root 独立确认两个 PID 已不存在，并停止／移除该隔离实验环境。核心退出和容器撤除不能改写 worker 清理失败，也不能给业务或服务撤权信用。
+
+该有限诊断属于已批准架构 §8 的官方传输完整性评估，保留既有权益与服务范围，不采用新传输、不缩减 managed 范围、不切默认、不补 fallback 或本地规则、不静音 ERROR，也不以频繁重启代替完整性。它不覆盖 TLS payload、supplier SOCKS／HTTP、IPv6、DNS、计量或服务 owner，更不完成 Task 5。当前固定 REALITY 路径的普通响应／握手通过不能使 Rust 配置或控制层授予半关闭完整性与准入资格。
+
 ## 后续主线
 
-先对官方原版核心做 stock 可行性验证，明确每种入口对新准入、旧 QUIC 新流、既有 TCP／UDP 与半关闭流的实际关闭单位和边界。在此基础上实现真实内部四格 verifier 与精确路径／供应商／实例映射，并在既有 Store、ControlLease 和 Lifecycle 的所有权下串行执行撤回、重新校验和准入：先关闭旧或未选身份，再开放有当前证据的选定服务。必须覆盖证据到期、账号撤销、凭据或绑定变化、失败读回与 daemon crash/restart。这是待实现和待验证的方向，不表示该架构已经落地。
+主线保持一个 State 授权真源与 canonical binding → 有限业务完整性和实际服务路径资格 → 既有 Store／ControlLease／Lifecycle owner 下的准入撤回与 fresh proof → 服务器完整 profile → 当前 Mac 的真实双栈、DNS、更新与失败验收。各阶段不能借下一阶段的软件准备反向授予上一阶段的实际资格；不增加另一份账户／计量库或 probe 专属节点范围。
 
-实际能力与 admission 阶段通过后，再对固定 Mac 候选执行导入／加载、无代理原始 socket 捕获、原生公网 IPv6、旧缓存拒绝、停止／恢复及 135 秒更新连续流验收，并如实公布失败或重建窗口。G0 官方计量迁移与通用 HY2 半关闭继续独立阻断，不能借候选版本或预发布绕过；版本与最终发布门禁也须在最终候选上独立完成。
+业务字节完整性和精确路径资格先通过，才能实施真实内部四格 verifier 与路径／供应商／实例映射，并由既有 owner 串行撤回旧或未选身份，重新验证后才开放有当前证据的选定服务。必须实证新登录、旧 QUIC 新流、既有 TCP／UDP 与半关闭流的实际边界，覆盖证据到期、账号撤销、凭据／绑定变化、失败读回和 daemon crash/restart。保留原计量契约与 readiness 门禁；来源不变或原版核心身份均不能代替这些结果。这是待实施、待验收的方向。
+
+实际能力与 admission 闭环通过后，再对固定 Mac 候选执行导入／加载、无代理原始 socket 捕获、原生公网 IPv6、同身份 DNS、旧缓存拒绝、停止／恢复及 135 秒更新连续流验收，并如实公布失败或重建窗口。G0 官方归档计量迁移仍 FAIL，通用 HY2 半关闭仍 FAIL；当前 managed admission 与 Task 5 仍未完成，候选版本或预发布均不豁免。版本与最终发布门禁也须在最终候选上独立完成。

@@ -4,7 +4,7 @@
 
 **Goal:** Rust 从一致授权快照发布默认完整受管配置，使当前 Mac 用户一次导入与 TUN 授权后无需逐条编辑路由和 DNS；IPv4/IPv6 都捕获，无法确认的出口能力明确拒绝。
 
-**Architecture:** 账户默认出口、能力证据、配置发布与客户端运行状态分离。单一 ManagedPolicy 经固定 sing-box1.14.2 compiler 交付到 v2rayN/macOS；bui-c 复用业务语义。官方发行内核与计量迁移以独立 G0 验证阻止不满足契约的发布。
+**Architecture:** 账户默认出口、能力证据、配置发布与客户端运行状态分离。单一 ManagedPolicy 经固定 sing-box1.14.2 compiler 交付到 v2rayN/macOS；bui-c 复用业务语义。独立 G0 验证官方预编译归档的计量与发布来源迁移，FAIL 阻止该迁移；已批准架构未要求所有既有未改上游源码构建物都迁移到归档。现有 source-build 发布链及 provenance 原样保留，不改称官方归档，也不由此获得新 managed 准入；当前业务完整性、计量 readiness、实际能力和 admission 闭环仍未通过。固定 REALITY 普通 TCP 六案中的两个半关闭案实测 FAIL，握手与普通响应通过不能替代完整性资格；有限评估不改变既有权益与服务范围，也不构成采用。
 
 **Tech Stack:** Rust、serde、Axum、现有 tonic/prost、官方 sing-box1.14.2、原生 JS；不新增自研网络内核。
 
@@ -270,7 +270,7 @@ let target = match target_segment.as_str() {
 ## 发布与后续交付围栏
 
 - [ ] 逐任务fresh review和全分支review；cargo fmt --all -- --check；Linux cargo clippy --workspace --all-targets -- -D warnings；对应package test与scripts/tests/run-all.sh。Mac不以Linux inotify/kcmp失败误判schema；服务端完整gate在Linux执行。
-- [ ] G0可行性通过后单独审阅实际账本迁移与官方archive锁定计划，再切release/kernels.lock、CI、manifest；旧1a60测试不得改名充当b861官方发行验证。G0不通过则阻止该生产切换，不删除计量契约。
+- [ ] G0可行性通过后单独审阅实际账本迁移与官方archive锁定计划，再切release/kernels.lock、CI、manifest；旧1a60测试不得改名充当b861官方发行验证。G0 FAIL阻止该生产计量／来源切换，不删除计量契约；它不要求迁移每个既有未改上游源码构建物。保留既有source-build及其真实provenance不能证明部署产物已独立核验，不能豁免计量／业务完整性／准入资格；无论是否迁移，当前managed admission均保持阻断。
 - [ ] VPS/住宅各自真实双栈网络能力通过，再审阅对应server renderer/6in4持久化与故障验收计划；不执行用户粘贴的命令或VM停机。服务器mode4与relay IPv4解析仍未改时不宣称IPv6转发完成。
 - [ ] Android Xray完整profile与iOS配置分别取得设备验证，再形成独立交付计划；保留一个策略真源，没有大量旧版本兼容分支。
 - [ ] 实际版本候选4.1.7：先重读version.json与远端版本，写version字段和changelog；跑scripts/release/check-version.sh、check-release-gate.sh、validate-manifest.sh规定参数。docs-only阶段不改版本。commit使用`bump: v4.1.7 server-managed full profiles`。
