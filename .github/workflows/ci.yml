@@ -59,6 +59,8 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - name: 面板节点交付契约（实际 app.js）
         run: node scripts/tests/test-panel-node-uri.cjs
+      - name: Managed complete profile panel regression
+        run: node scripts/tests/test-panel-managed-profile.cjs
       - name: 安装 shellcheck
         run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends shellcheck
       - name: 收集脚本清单

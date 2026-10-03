@@ -47,5 +47,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &["proto-v2ray"],
         )?;
     println!("cargo:rerun-if-changed=proto-v2ray");
+    // G0 fixture only: generated separately; included exclusively by a cfg(test) module.
+    tonic_prost_build::configure()
+        .build_server(false)
+        .build_client(true)
+        .include_file("official_api.rs")
+        .compile_protos(&["proto-api/daemon/started_service.proto"], &["proto-api"])?;
+    println!("cargo:rerun-if-changed=proto-api");
     Ok(())
 }

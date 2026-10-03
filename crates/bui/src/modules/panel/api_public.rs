@@ -139,6 +139,148 @@ async fn lookup(app: &AppState, shared: &Shared, seg: &str) -> Result<Delivery, 
     })
 }
 
+/// One owned authorization snapshot. Deliberately no Debug/Serialize: nodes contain secrets.
+pub(crate) struct ManagedDelivery {
+    #[allow(dead_code)] // Retained owned identity label for internal snapshot consumers.
+    pub username: String,
+    pub nodes: Vec<Node>,
+    pub policy: bui_schema::managed::ManagedPolicy,
+    pub dial_ip: String,
+    stamp: ManagedStamp,
+}
+struct ManagedStamp {
+    original_segment: String,
+    user_id: uuid::Uuid,
+    semantic: bui_schema::managed_binding::SemanticStamp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManagedDeliveryFailure {
+    NotFound,
+    MissingSelection,
+    Unauthorized,
+    Unavailable,
+}
+impl ManagedDeliveryFailure {
+    pub(crate) fn response(self) -> Response {
+        match self {
+            Self::NotFound => not_found(),
+            Self::MissingSelection => (
+                StatusCode::CONFLICT,
+                Json(json!({"error":"Managed egress selection required"})),
+            )
+                .into_response(),
+            Self::Unauthorized => (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error":"Account unavailable"})),
+            )
+                .into_response(),
+            Self::Unavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error":"Managed route unavailable"})),
+            )
+                .into_response(),
+        }
+    }
+}
+fn valid_managed_evidence(policy: &bui_schema::managed::ManagedPolicy, now: i64) -> bool {
+    use bui_schema::managed::{allows, EvidenceStatus};
+    let c = &policy.capabilities;
+    [&c.v4_tcp, &c.v4_udp, &c.v6_tcp, &c.v6_udp]
+        .into_iter()
+        .all(|status| {
+            !matches!(status, EvidenceStatus::Verified(_))
+                || allows(status, &policy.path_fingerprint, now)
+        })
+}
+
+pub(crate) async fn managed_delivery(
+    app: &AppState,
+    shared: &Shared,
+    seg: &str,
+) -> Result<ManagedDelivery, ManagedDeliveryFailure> {
+    use bui_schema::managed::{select_nodes, ManagedPolicy};
+    use bui_schema::managed_binding::{path_fingerprint, semantic_stamp};
+    let _gate = shared.gate_guard().await;
+    let publication = app.store.publication_permit().await;
+    let pending = shared.pending().await;
+    let state = publication.state();
+    let now = app.host.now();
+    let user = resolve(state, seg, now).ok_or(ManagedDeliveryFailure::NotFound)?;
+    if users::blocked_set(state, &pending, now).contains(&user.user_id) {
+        return Err(ManagedDeliveryFailure::Unauthorized);
+    }
+    if state
+        .users
+        .iter()
+        .filter(|u| u.user_id == user.user_id)
+        .count()
+        != 1
+    {
+        return Err(ManagedDeliveryFailure::Unavailable);
+    }
+    let identity = user
+        .managed_egress
+        .ok_or(ManagedDeliveryFailure::MissingSelection)?;
+    if !bui_schema::managed_binding::selection_granted(user, state, identity) {
+        return Err(ManagedDeliveryFailure::Unauthorized);
+    }
+    let nodes = select_nodes(&nodes_for(user, &state.node, &state.residential), identity);
+    if nodes.is_empty() {
+        return Err(ManagedDeliveryFailure::Unavailable);
+    }
+    let path = path_fingerprint(state, user).map_err(|_| ManagedDeliveryFailure::Unavailable)?;
+    let revision = user
+        .managed_profile_revision
+        .filter(|r| *r > 0)
+        .ok_or(ManagedDeliveryFailure::Unavailable)?;
+    let policy = ManagedPolicy {
+        revision,
+        selected_identity: identity,
+        capabilities: state
+            .managed_egress_capabilities
+            .get(&path)
+            .cloned()
+            .unwrap_or_default(),
+        path_fingerprint: path,
+    };
+    if !valid_managed_evidence(&policy, now.unix_timestamp()) {
+        return Err(ManagedDeliveryFailure::Unavailable);
+    }
+    Ok(ManagedDelivery {
+        username: user.username.clone(),
+        nodes,
+        policy,
+        dial_ip: state.node.public_ip.clone(),
+        stamp: ManagedStamp {
+            original_segment: seg.to_owned(),
+            user_id: user.user_id,
+            semantic: semantic_stamp(state, user)
+                .map_err(|_| ManagedDeliveryFailure::Unavailable)?,
+        },
+    })
+}
+
+/// Short fresh authorization check immediately before Task4 returns success. All guards drop
+/// before HTTP writes; this is not an atomic network fence or an existing-session revocation.
+pub(crate) async fn validate_managed_delivery(
+    app: &AppState,
+    shared: &Shared,
+    delivery: &ManagedDelivery,
+) -> Result<(), ManagedDeliveryFailure> {
+    let current = managed_delivery(app, shared, &delivery.stamp.original_segment).await?;
+    if current.stamp.user_id != delivery.stamp.user_id {
+        return Err(ManagedDeliveryFailure::NotFound);
+    }
+    if current.stamp.semantic != delivery.stamp.semantic
+        || current.policy.revision != delivery.policy.revision
+        || !valid_managed_evidence(&delivery.policy, app.host.now().unix_timestamp())
+    {
+        return Err(ManagedDeliveryFailure::Unavailable);
+    }
+    Ok(())
+}
+
 /// 移植 `web/server.js:1800`：`encodeURIComponent(username).replace(/%/g, "_") + ".json"`。
 /// `encodeURIComponent` 不编码的集合是 `A-Za-z0-9-_.!~*'()`。
 ///
@@ -279,12 +421,95 @@ async fn get_nodes(
         .into_response()
 }
 
+/// Native profile for the fixed, explicitly selected consumer. Query remarks is display-only.
+async fn get_managed_profile(
+    State(app): State<AppState>,
+    State(shared): State<Arc<Shared>>,
+    Path((seg, target)): Path<(String, String)>,
+) -> Response {
+    if target != "v2rayn-sb1142-macos" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"Unknown profile target"})),
+        )
+            .into_response();
+    }
+    // Legacy username grace belongs only to the old feeds, never to native credential JSON.
+    if !bui_schema::sub::is_sub_token(&seg) {
+        return not_found();
+    }
+    let delivery = match managed_delivery(&app, &shared, &seg).await {
+        Ok(delivery) => delivery,
+        Err(failure) => return failure.response(),
+    };
+    complete_profile_response(&app, &shared, &delivery, &target).await
+}
+
+async fn complete_profile_response(
+    app: &AppState,
+    shared: &Shared,
+    delivery: &ManagedDelivery,
+    target: &str,
+) -> Response {
+    use bui_schema::render::managed::{compile, ManagedRuntime};
+    let body = compile(
+        &delivery.policy,
+        &delivery.nodes,
+        &delivery.dial_ip,
+        &ManagedRuntime {
+            interface_name: String::new(),
+            mixed_port: 10808,
+            enable_tun: true,
+        },
+        app.host.now().unix_timestamp(),
+    );
+    let bytes = match serde_json::to_vec(&body) {
+        Ok(bytes) => bytes,
+        Err(_) => return ManagedDeliveryFailure::Unavailable.response(),
+    };
+    let etag = match delivery.stamp.semantic.profile_etag(
+        delivery.stamp.user_id,
+        target,
+        delivery.policy.revision,
+        &bytes,
+    ) {
+        Ok(etag) => etag,
+        Err(_) => return ManagedDeliveryFailure::Unavailable.response(),
+    };
+    // No Store locks survive compilation or response writes. Fresh revalidation cannot
+    // revoke existing client sessions or promise a transactional consumer reload.
+    if let Err(failure) = validate_managed_delivery(app, shared, delivery).await {
+        return failure.response();
+    }
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/json".to_owned()),
+            (header::CACHE_CONTROL, "private, no-store".to_owned()),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"bui-managed-macos.json\"".to_owned(),
+            ),
+            (header::ETAG, etag),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
 /// 四个端点都无鉴权（spec §4.3），挂在 `public_routes()` 里；末段的解析口径见 [`resolve`]。
 ///
 /// Shared accounting is required: unflushed traffic must revoke feed credentials too.
 pub fn public_routes(shared: Arc<Shared>) -> axum::Router<AppState> {
     use axum::routing::get;
     axum::Router::new()
+        .route(
+            "/api/profile/{seg}/{target}",
+            get({
+                let shared = shared.clone();
+                move |app, path| get_managed_profile(app, State(shared), path)
+            }),
+        )
         .route(
             "/api/sub/{seg}",
             get({
@@ -317,6 +542,700 @@ mod tests {
     use super::*;
     use crate::modules::panel::testsupport::{full_with, harness, mount, raw, send, text, Harness};
     use pretty_assertions::assert_eq;
+
+    #[tokio::test]
+    async fn managed_residential_outage_with_surviving_vps_is_503() {
+        let h = harness().await;
+        h.store
+            .update(|s| {
+                s.users[0].sub_token = Some(TOK.into());
+                s.users[0] = serde_json::from_value({
+                    let mut value = serde_json::to_value(&s.users[0]).unwrap();
+                    value["managed_egress"] = json!("residential");
+                    value
+                })
+                .unwrap();
+            })
+            .await
+            .unwrap();
+        let s = h.store.read().await;
+        assert!(
+            !nodes_for(&s.users[0], &s.node, &s.residential).is_empty(),
+            "VPS control must survive"
+        );
+        assert!(matches!(
+            managed_delivery(&h.app, &h.shared, TOK).await,
+            Err(ManagedDeliveryFailure::Unavailable)
+        ));
+        assert_eq!(
+            ManagedDeliveryFailure::Unavailable.response().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_both_rights_without_explicit_default_is_missing_selection() {
+        let h = harness().await;
+        h.store
+            .update(|s| s.users[0].sub_token = Some(TOK.into()))
+            .await
+            .unwrap();
+        let s = h.store.read().await;
+        assert!(s.users[0].entitlements.direct);
+        assert!(s.users[0].entitlements.residential.is_some());
+        assert!(matches!(
+            managed_delivery(&h.app, &h.shared, TOK).await,
+            Err(ManagedDeliveryFailure::MissingSelection)
+        ));
+        assert_eq!(
+            ManagedDeliveryFailure::MissingSelection.response().status(),
+            StatusCode::CONFLICT
+        );
+    }
+
+    const PROFILE: &str = "/api/profile/0123456789abcdef0123456789abcdef/v2rayn-sb1142-macos";
+
+    #[tokio::test]
+    async fn complete_profile_native_fixed_mac_headers_and_stable_repeat() {
+        let h = managed_fixture().await;
+        let r = h.router();
+        let (status, headers, bytes) = raw(
+            &r,
+            "GET",
+            &format!("{PROFILE}?remarks=BUI%20Managed%20macOS"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers["content-type"], "application/json");
+        assert_eq!(headers["cache-control"], "private, no-store");
+        assert_eq!(
+            headers["content-disposition"],
+            "attachment; filename=\"bui-managed-macos.json\""
+        );
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(body.get("profile").is_none());
+        assert_eq!(body["route"]["final"], "managed-proxy");
+        assert_eq!(body["inbounds"][0]["listen_port"], 10808);
+        assert_eq!(body["inbounds"][1]["type"], "tun");
+        assert_eq!(body["inbounds"][1]["interface_name"], "");
+        assert_eq!(
+            body["inbounds"][1]["address"],
+            json!(["172.19.0.1/30", "fdfe:dcba:9876::1/126"])
+        );
+        assert_eq!(
+            body["outbounds"],
+            json!([{"type":"block","tag":"managed-proxy"}])
+        );
+        assert_eq!(
+            body["dns"]["rules"],
+            json!([{"action":"predefined","rcode":"REFUSED"}])
+        );
+        h.host.advance(3);
+        let (again, next_headers, next_bytes) = raw(&r, "GET", PROFILE, None, None).await;
+        assert_eq!(again, StatusCode::OK);
+        assert_eq!(bytes, next_bytes);
+        assert_eq!(headers["etag"], next_headers["etag"]);
+        assert!(!headers["etag"].to_str().unwrap().contains(TOK));
+    }
+
+    #[tokio::test]
+    async fn complete_profile_target_and_token_boundary_precede_account_details() {
+        let h = managed_fixture().await;
+        // Isolate credential admission from the legacy residential-outage refusal.
+        h.store
+            .update(|s| s.users[0].entitlements.residential = None)
+            .await
+            .unwrap();
+        open_grace(&h).await;
+        let r = h.router();
+        for segment in [
+            "alice",
+            "0123456789abcdef0123456789abcde",
+            "0123456789abcdef0123456789abcdef0",
+            "0123456789ABCDEF0123456789abcdef",
+            "gggggggggggggggggggggggggggggggg",
+            "ffffffffffffffffffffffffffffffff",
+        ] {
+            let (status, body) = send(
+                &r,
+                "GET",
+                &format!("/api/profile/{segment}/v2rayn-sb1142-macos"),
+                None,
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert!(body.get("inbounds").is_none());
+        }
+        let (status, _) = send(&r, "GET", "/api/profile/alice/android", None, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = send(&r, "GET", PROFILE, None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        // The existing generic helper and legacy feed retain the grace contract.
+        assert!(managed_delivery(&h.app, &h.shared, "alice").await.is_ok());
+        assert_eq!(text(&r, "/api/sub/alice").await.0, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn complete_profile_account_errors_never_return_native_fallback() {
+        for (reason, expected) in [
+            ("unset", StatusCode::CONFLICT),
+            ("disabled", StatusCode::FORBIDDEN),
+            ("residential", StatusCode::SERVICE_UNAVAILABLE),
+            ("key", StatusCode::SERVICE_UNAVAILABLE),
+            ("rotated", StatusCode::NOT_FOUND),
+        ] {
+            let h = managed_fixture().await;
+            h.store
+                .update(|s| match reason {
+                    "unset" => s.users[0].managed_egress = None,
+                    "disabled" => s.users[0].disabled = true,
+                    "residential" => {
+                        s.users[0].managed_egress =
+                            Some(bui_schema::managed::EgressIdentity::Residential)
+                    }
+                    "key" => s.admin.jwt_secret = "invalid".into(),
+                    _ => s.users[0].sub_token = Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
+                })
+                .await
+                .unwrap();
+            let (status, body) = send(&h.router(), "GET", PROFILE, None, None).await;
+            assert_eq!(status, expected, "{reason}");
+            assert!(body.get("inbounds").is_none());
+            assert!(body.get("outbounds").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_profile_etag_isolates_accounts_even_for_identical_closed_body() {
+        let h = managed_fixture().await;
+        h.store
+            .update(|s| {
+                let mut bob = s.users[0].clone();
+                bob.username = "bob".into();
+                bob.user_id = uuid::Uuid::from_u128(999);
+                bob.sub_token = Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into());
+                s.users.push(bob);
+            })
+            .await
+            .unwrap();
+        let r = h.router();
+        let (a, ah, ab) = raw(&r, "GET", PROFILE, None, None).await;
+        let (b, bh, bb) = raw(
+            &r,
+            "GET",
+            "/api/profile/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/v2rayn-sb1142-macos",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!((a, b), (StatusCode::OK, StatusCode::OK));
+        assert_eq!(ab, bb);
+        assert_ne!(ah["etag"], bh["etag"]);
+    }
+
+    #[tokio::test]
+    async fn complete_profile_waits_for_publication_and_observes_revocation() {
+        let h = managed_fixture().await;
+        let r = h.router();
+        let gate = h.shared.gate_guard().await;
+        let request = tokio::spawn(async move { send(&r, "GET", PROFILE, None, None).await });
+        tokio::task::yield_now().await;
+        assert!(
+            !request.is_finished(),
+            "complete feed bypassed accounting fence"
+        );
+        h.store
+            .update(|s| s.users[0].disabled = true)
+            .await
+            .unwrap();
+        drop(gate);
+        let (status, body) = request.await.unwrap();
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.get("inbounds").is_none());
+    }
+
+    #[tokio::test]
+    async fn complete_profile_presend_revalidates_original_token_selection_and_pending_budget() {
+        for reason in ["token", "selection", "pending"] {
+            let h = managed_fixture().await;
+            if reason == "pending" {
+                h.store
+                    .update(|s| s.users[0].entitlements.traffic_limit.total_bytes = Some(1))
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                send(&h.router(), "GET", PROFILE, None, None).await.0,
+                StatusCode::OK
+            );
+            let delivery = managed_delivery(&h.app, &h.shared, TOK).await.ok().unwrap();
+            let expected = match reason {
+                "token" => {
+                    h.store
+                        .update(|s| {
+                            s.users[0].sub_token = Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into())
+                        })
+                        .await
+                        .unwrap();
+                    StatusCode::NOT_FOUND
+                }
+                "selection" => {
+                    h.store
+                        .update(|s| s.users[0].managed_egress = None)
+                        .await
+                        .unwrap();
+                    StatusCode::CONFLICT
+                }
+                _ => {
+                    let id = h.store.read().await.users[0].user_id;
+                    h.shared
+                        .pending()
+                        .await
+                        .insert(id, super::super::TxRx { tx: 1, rx: 0 });
+                    StatusCode::FORBIDDEN
+                }
+            };
+            let response =
+                complete_profile_response(&h.app, &h.shared, &delivery, "v2rayn-sb1142-macos")
+                    .await;
+            assert_eq!(response.status(), expected);
+            let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            assert!(!String::from_utf8_lossy(&bytes).contains("inbounds"));
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_profile_repeat_after_proof_expiry_never_serves_cached_success() {
+        use bui_schema::managed::{Evidence, EvidenceStatus};
+        let h = managed_fixture().await;
+        let now = h.app.host.now().unix_timestamp();
+        let state = h.store.read().await;
+        let path = bui_schema::managed_binding::path_fingerprint(&state, &state.users[0]).unwrap();
+        h.store
+            .update(|s| {
+                s.managed_egress_capabilities
+                    .entry(path.clone())
+                    .or_default()
+                    .v4_tcp = EvidenceStatus::Verified(Evidence {
+                    path_fingerprint: path.clone(),
+                    observed_at: now,
+                    expires_at: now + 1,
+                    observed_identity: "fixture-only".into(),
+                })
+            })
+            .await
+            .unwrap();
+        let r = h.router();
+        let (status, body) = send(&r, "GET", PROFILE, None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o["type"] == "selector"));
+        let delivery = managed_delivery(&h.app, &h.shared, TOK).await.ok().unwrap();
+        h.host.advance(1);
+        assert_eq!(
+            complete_profile_response(&h.app, &h.shared, &delivery, "v2rayn-sb1142-macos")
+                .await
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let (status, body) = send(&r, "GET", PROFILE, None, None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.get("inbounds").is_none());
+    }
+
+    async fn managed_fixture() -> Harness {
+        let h = harness().await;
+        h.store
+            .update(|s| {
+                s.admin.jwt_secret = "0123456789abcdef".repeat(4);
+                s.users[0].sub_token = Some(TOK.into());
+                s.users[0].managed_egress = Some(bui_schema::managed::EgressIdentity::Vps);
+            })
+            .await
+            .unwrap();
+        h
+    }
+
+    #[tokio::test]
+    async fn managed_unknown_evidence_snapshot_is_owned_and_writer_is_released() {
+        let h = managed_fixture().await;
+        let delivery = managed_delivery(&h.app, &h.shared, TOK).await.ok().unwrap();
+        assert_eq!(
+            delivery.policy.capabilities,
+            bui_schema::managed::EgressCapabilities::default()
+        );
+        assert_eq!(delivery.username, "alice");
+        assert_eq!(delivery.dial_ip, "203.0.113.10");
+        let old_nodes = delivery.nodes.clone();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            h.store
+                .update(|s| s.users[0].credentials.hy2_password = "replacement-fixture".into()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(delivery.nodes, old_nodes);
+        assert_eq!(
+            validate_managed_delivery(&h.app, &h.shared, &delivery).await,
+            Err(ManagedDeliveryFailure::Unavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_presend_rechecks_disabled_expiry_quota_pending_token_and_rights() {
+        for change in 0..7 {
+            let h = managed_fixture().await;
+            let delivery = managed_delivery(&h.app, &h.shared, TOK).await.ok().unwrap();
+            let expected = match change {
+                0 => {
+                    h.store
+                        .update(|s| s.users[0].disabled = true)
+                        .await
+                        .unwrap();
+                    ManagedDeliveryFailure::Unauthorized
+                }
+                1 => {
+                    h.store
+                        .update(|s| {
+                            s.users[0].entitlements.expires_at = Some("2026-09-10T00:00:00Z".into())
+                        })
+                        .await
+                        .unwrap();
+                    ManagedDeliveryFailure::Unauthorized
+                }
+                2 => {
+                    h.store
+                        .update(|s| {
+                            s.users[0].entitlements.traffic_limit.total_bytes = Some(1);
+                            s.users[0].usage.total_bytes = 1;
+                        })
+                        .await
+                        .unwrap();
+                    ManagedDeliveryFailure::Unauthorized
+                }
+                3 => {
+                    h.store
+                        .update(|s| s.users[0].entitlements.traffic_limit.total_bytes = Some(10))
+                        .await
+                        .unwrap();
+                    let id = h.store.read().await.users[0].user_id;
+                    h.shared
+                        .pending()
+                        .await
+                        .insert(id, super::super::TxRx { tx: 4, rx: 6 });
+                    ManagedDeliveryFailure::Unauthorized
+                }
+                4 => {
+                    h.store
+                        .update(|s| s.users[0].sub_token = Some(OTHER_TOK.into()))
+                        .await
+                        .unwrap();
+                    ManagedDeliveryFailure::NotFound
+                }
+                5 => {
+                    h.store
+                        .update(|s| s.users[0].entitlements.direct = false)
+                        .await
+                        .unwrap();
+                    ManagedDeliveryFailure::Unauthorized
+                }
+                _ => {
+                    h.store
+                        .update(|s| s.node.public_ip = "203.0.113.2".into())
+                        .await
+                        .unwrap();
+                    ManagedDeliveryFailure::Unavailable
+                }
+            };
+            assert_eq!(
+                validate_managed_delivery(&h.app, &h.shared, &delivery).await,
+                Err(expected),
+                "change {change}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_presend_rechecks_fresh_time_and_original_legacy_token() {
+        let h = managed_fixture().await;
+        open_grace(&h).await;
+        let delivery = managed_delivery(&h.app, &h.shared, "alice")
+            .await
+            .ok()
+            .unwrap();
+        h.host.advance(8 * 86400);
+        assert_eq!(
+            validate_managed_delivery(&h.app, &h.shared, &delivery).await,
+            Err(ManagedDeliveryFailure::NotFound)
+        );
+        assert!(managed_delivery(&h.app, &h.shared, TOK).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn managed_evidence_expiry_future_and_mismatched_path_deny_without_revision_churn() {
+        use bui_schema::managed::{Evidence, EvidenceStatus};
+        let h = managed_fixture().await;
+        let now = h.app.host.now().unix_timestamp();
+        let s = h.store.read().await;
+        let path = bui_schema::managed_binding::path_fingerprint(&s, &s.users[0]).unwrap();
+        h.store
+            .update(|s| {
+                s.managed_egress_capabilities
+                    .entry(path.clone())
+                    .or_default()
+                    .v4_tcp = EvidenceStatus::Verified(Evidence {
+                    path_fingerprint: path.clone(),
+                    observed_at: now,
+                    expires_at: now + 10,
+                    observed_identity: "fixture-proof".into(),
+                });
+            })
+            .await
+            .unwrap();
+        let delivery = managed_delivery(&h.app, &h.shared, TOK).await.ok().unwrap();
+        let revision = delivery.policy.revision;
+        h.host.advance(10);
+        assert_eq!(
+            validate_managed_delivery(&h.app, &h.shared, &delivery).await,
+            Err(ManagedDeliveryFailure::Unavailable)
+        );
+        assert!(matches!(
+            managed_delivery(&h.app, &h.shared, TOK).await,
+            Err(ManagedDeliveryFailure::Unavailable)
+        ));
+        assert_eq!(
+            h.store.read().await.users[0].managed_profile_revision,
+            Some(revision)
+        );
+        for change in 0..2 {
+            h.store
+                .update(|s| {
+                    if let EvidenceStatus::Verified(e) =
+                        &mut s.managed_egress_capabilities.get_mut(&path).unwrap().v4_tcp
+                    {
+                        e.expires_at = now + 100;
+                        if change == 0 {
+                            e.observed_at = now + 20;
+                        } else {
+                            e.observed_at = now;
+                            e.path_fingerprint = "other-path".into();
+                        }
+                    }
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                managed_delivery(&h.app, &h.shared, TOK).await,
+                Err(ManagedDeliveryFailure::Unavailable)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_snapshot_waiting_on_writer_observes_current_authorization() {
+        let h = managed_fixture().await;
+        let permit = h.store.publication_permit().await;
+        let app = h.app.clone();
+        let shared = h.shared.clone();
+        let task = tokio::spawn(async move { managed_delivery(&app, &shared, TOK).await });
+        tokio::task::yield_now().await;
+        h.store
+            .update_permitted(permit, crate::state::store::CALLER_UNLABELED, |s| {
+                s.users[0].disabled = true
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            task.await.unwrap(),
+            Err(ManagedDeliveryFailure::Unauthorized)
+        ));
+    }
+
+    #[tokio::test]
+    async fn managed_each_family_proof_and_previously_allowed_horizon_are_checked() {
+        use bui_schema::managed::{Evidence, EvidenceStatus};
+        for index in 0..4 {
+            let h = managed_fixture().await;
+            let now = h.app.host.now().unix_timestamp();
+            let state = h.store.read().await;
+            let path =
+                bui_schema::managed_binding::path_fingerprint(&state, &state.users[0]).unwrap();
+            h.store
+                .update(|s| {
+                    let caps = s
+                        .managed_egress_capabilities
+                        .entry(path.clone())
+                        .or_default();
+                    let slot = match index {
+                        0 => &mut caps.v4_tcp,
+                        1 => &mut caps.v4_udp,
+                        2 => &mut caps.v6_tcp,
+                        _ => &mut caps.v6_udp,
+                    };
+                    *slot = EvidenceStatus::Verified(Evidence {
+                        path_fingerprint: path.clone(),
+                        observed_at: now,
+                        expires_at: now + 10,
+                        observed_identity: "fixture".into(),
+                    });
+                })
+                .await
+                .unwrap();
+            let delivery = managed_delivery(&h.app, &h.shared, TOK).await.ok().unwrap();
+            h.host.advance(10);
+            assert!(matches!(
+                managed_delivery(&h.app, &h.shared, TOK).await,
+                Err(ManagedDeliveryFailure::Unavailable)
+            ));
+            h.store
+                .update(|s| {
+                    let caps = s.managed_egress_capabilities.get_mut(&path).unwrap();
+                    let slot = match index {
+                        0 => &mut caps.v4_tcp,
+                        1 => &mut caps.v4_udp,
+                        2 => &mut caps.v6_tcp,
+                        _ => &mut caps.v6_udp,
+                    };
+                    if let EvidenceStatus::Verified(e) = slot {
+                        e.expires_at = now + 100;
+                    }
+                })
+                .await
+                .unwrap();
+            assert!(managed_delivery(&h.app, &h.shared, TOK).await.is_ok());
+            assert_eq!(
+                h.store.read().await.users[0].managed_profile_revision,
+                Some(delivery.policy.revision)
+            );
+            assert_eq!(
+                validate_managed_delivery(&h.app, &h.shared, &delivery).await,
+                Err(ManagedDeliveryFailure::Unavailable)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_noop_is_publishable_but_expiry_without_write_and_key_rotation_are_not() {
+        let h = managed_fixture().await;
+        let expires = h.app.host.now() + time::Duration::seconds(10);
+        h.store
+            .update(|s| {
+                s.users[0].entitlements.expires_at = Some(crate::util::fmt_rfc3339(expires))
+            })
+            .await
+            .unwrap();
+        let delivery = managed_delivery(&h.app, &h.shared, TOK).await.ok().unwrap();
+        h.store
+            .update(|s| {
+                s.users[0].note = "operator note".into();
+                s.users[0].usage.last_seen_at = Some("2026-09-11T00:00:01Z".into());
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            validate_managed_delivery(&h.app, &h.shared, &delivery).await,
+            Ok(())
+        );
+        h.host.advance(10);
+        assert_eq!(
+            validate_managed_delivery(&h.app, &h.shared, &delivery).await,
+            Err(ManagedDeliveryFailure::Unauthorized)
+        );
+        let h = managed_fixture().await;
+        let delivery = managed_delivery(&h.app, &h.shared, TOK).await.ok().unwrap();
+        h.store
+            .update(|s| s.admin.jwt_secret = "fedcba9876543210".repeat(4))
+            .await
+            .unwrap();
+        assert_eq!(
+            validate_managed_delivery(&h.app, &h.shared, &delivery).await,
+            Err(ManagedDeliveryFailure::Unavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_unavailable_desired_edits_publish_revisions_without_enabling_delivery() {
+        use bui_schema::managed::EgressIdentity;
+        use bui_schema::model::{Protocol, ResidentialEntitlement, Slot};
+        for missing_credential in [false, true] {
+            let h = managed_fixture().await;
+            let upstream_id = uuid::Uuid::from_u128(7);
+            h.store.update(|s| {
+                let user = &mut s.users[0];
+                user.managed_egress = Some(EgressIdentity::Residential);
+                user.entitlements.protocols = vec![Protocol::Hysteria2];
+                user.entitlements.residential = Some(ResidentialEntitlement {group_id:"default".into(),slot_id:Some(upstream_id)});
+                user.credentials.hy2_resi_cred = Some("r000".into());
+                s.residential.slots = vec![Slot {index:0,upstream_id}];
+                if !missing_credential {
+                    s.residential.hy2_pool.creds.push(serde_json::from_value(json!({"id":"r000","name":"fixture-subscriber","secret":"fixture-secret"})).unwrap());
+                }
+                let group = s.residential.groups.get_mut("default").unwrap();
+                group.enabled = missing_credential;
+                group.upstreams.push(serde_json::from_value(json!({"id":upstream_id,"name":"fixture-provider","kind":"socks5","host":"provider.example.test","port":10007,"username":"fixture","password":"fixture-secret"})).unwrap());
+            }).await.unwrap();
+            let mut revision = h.store.read().await.users[0]
+                .managed_profile_revision
+                .unwrap();
+            for change in 0..5 {
+                assert!(matches!(
+                    managed_delivery(&h.app, &h.shared, TOK).await,
+                    Err(ManagedDeliveryFailure::Unavailable)
+                ));
+                h.store
+                    .update(|s| match change {
+                        0 => s.residential.groups.get_mut("default").unwrap().upstreams[0]
+                            .password
+                            .push('x'),
+                        1 => s.users[0].credentials.hy2_password.push('x'),
+                        2 => s.node.ports.hy2_resi += 1,
+                        3 => s.residential.slots[0].index += 1,
+                        _ => {
+                            s.users[0]
+                                .entitlements
+                                .residential
+                                .as_mut()
+                                .unwrap()
+                                .slot_id = Some(uuid::Uuid::from_u128(99))
+                        }
+                    })
+                    .await
+                    .unwrap();
+                revision += 1;
+                assert_eq!(
+                    h.store.read().await.users[0].managed_profile_revision,
+                    Some(revision)
+                );
+                assert!(matches!(
+                    managed_delivery(&h.app, &h.shared, TOK).await,
+                    Err(ManagedDeliveryFailure::Unavailable)
+                ));
+                h.store
+                    .update(|s| s.users[0].usage.last_seen_at = Some("2026-09-11T00:00:01Z".into()))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    h.store.read().await.users[0].managed_profile_revision,
+                    Some(revision)
+                );
+            }
+            let state = h.store.read().await;
+            assert!(
+                !nodes_for(&state.users[0], &state.node, &state.residential).is_empty(),
+                "authorized VPS control survives"
+            );
+            assert!(state.managed_egress_capabilities.is_empty());
+        }
+    }
 
     /// 夹具 token：`sample_state` 的 alice 没有 `sub_token`（= 升级上来还没补齐的老 state），
     /// 四个端点的正路一律走 token，所以每个用例先给她一个。

@@ -320,6 +320,7 @@ mod tests {
             })
             .collect();
         State {
+            managed_egress_capabilities: Default::default(),
             schema_version: SCHEMA_VERSION,
             node: node(),
             admin: Admin {

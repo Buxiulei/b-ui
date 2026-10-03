@@ -223,9 +223,16 @@ async fn blocked_now(app: &AppState, shared: &Shared) -> std::collections::BTree
 }
 
 async fn list_users(State(app): State<AppState>, shared: Arc<Shared>) -> Response {
-    let blocked = blocked_now(&app, &shared).await;
-    let state = app.store.read().await;
-    ok_json(users::project_all(&state, &blocked))
+    let rows = {
+        let _gate = shared.gate_guard().await;
+        let publication = app.store.publication_permit().await;
+        let pending = shared.pending().await;
+        let state = publication.state();
+        let now = app.host.now();
+        let blocked = users::blocked_set(state, &pending, now);
+        users::project_managed_all(state, &blocked, now)
+    };
+    ok_json(rows)
 }
 
 async fn create_user(State(app): State<AppState>, body: Bytes) -> Response {
@@ -238,6 +245,7 @@ async fn create_user(State(app): State<AppState>, body: Bytes) -> Response {
         Err(e) => return fail(StatusCode::BAD_REQUEST, e),
     };
     let mut dup = false;
+    let mut unauthorized = false;
     let to_push = user.clone();
     let uid = to_push.user_id;
     if let Err(e) = app
@@ -245,6 +253,12 @@ async fn create_user(State(app): State<AppState>, body: Bytes) -> Response {
         .update(|s| {
             if s.users.iter().any(|u| u.username == to_push.username) {
                 dup = true;
+                return;
+            }
+            if to_push.managed_egress.is_some_and(|identity| {
+                !bui_schema::managed_binding::selection_granted(&to_push, s, identity)
+            }) {
+                unauthorized = true;
                 return;
             }
             s.users.push(to_push);
@@ -257,6 +271,9 @@ async fn create_user(State(app): State<AppState>, body: Bytes) -> Response {
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Save failed: {e}"),
         );
+    }
+    if unauthorized {
+        return fail(StatusCode::FORBIDDEN, "Managed egress not granted");
     }
     if dup {
         return fail(StatusCode::BAD_REQUEST, "用户名已存在");
@@ -304,6 +321,7 @@ async fn update_user(
     };
     let now = app.host.now();
     let mut missing = false;
+    let mut unauthorized = false;
     let mut problem: Option<String> = None;
     let mut new_name = username.clone();
     // 改 hy2 密码 ⇒ 顺带换住宅 HY2 凭据（见函数文档）：旧 / 新凭据 id + 这个用户的 id
@@ -325,6 +343,12 @@ async fn update_user(
                     let pw_before = copy.credentials.hy2_password.clone();
                     match users::apply_update(&mut copy, &req, now) {
                         Ok(()) => {
+                            if req.managed_egress.is_some_and(|identity| {
+                                !bui_schema::managed_binding::selection_granted(&copy, s, identity)
+                            }) {
+                                unauthorized = true;
+                                return;
+                            }
                             let pw_changed = copy.credentials.hy2_password != pw_before;
                             let uid = copy.user_id;
                             new_name = copy.username.clone();
@@ -351,6 +375,9 @@ async fn update_user(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Save failed: {e}"),
         );
+    }
+    if unauthorized {
+        return fail(StatusCode::FORBIDDEN, "Managed egress not granted");
     }
     if missing {
         return fail(StatusCode::NOT_FOUND, "User not found");
@@ -795,6 +822,347 @@ mod tests {
     use crate::modules::panel::testsupport::{full_with, harness, mount, send, token, Harness};
     use crate::modules::panel::TxRx;
     use pretty_assertions::assert_eq;
+
+    #[tokio::test]
+    async fn managed_vps_only_cannot_select_residential_admin_403() {
+        let h = harness().await;
+        h.store
+            .update(|s| s.users[0].entitlements.residential = None)
+            .await
+            .unwrap();
+        let before = h.store.read().await;
+        let (r, t) = app(&h).await;
+        let (status, _) = send(
+            &r,
+            "PUT",
+            "/api/users/alice",
+            Some(&t),
+            Some(json!({"managed_egress":"residential", "username":"changed"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(*h.store.read().await, *before);
+    }
+
+    #[tokio::test]
+    async fn managed_creation_uses_explicit_selection_and_never_json_revision_or_proof() {
+        let h = harness().await;
+        let (r, t) = app(&h).await;
+        let (status, _) = send(
+            &r,
+            "POST",
+            "/api/users",
+            Some(&t),
+            Some(json!({
+                "username":"bob", "residential":false, "managed_egress":"residential"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(h.store.read().await.users.len(), 1);
+        let (status, _) = send(
+            &r,
+            "POST",
+            "/api/users",
+            Some(&t),
+            Some(json!({
+                "username":"bob", "residential":false, "managed_egress":"vps",
+                "managed_profile_revision":999, "managed_egress_capabilities":{"forged":"verified"}
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let state = h.store.read().await;
+        let user = state.users.iter().find(|u| u.username == "bob").unwrap();
+        assert_eq!(
+            user.managed_egress,
+            Some(bui_schema::managed::EgressIdentity::Vps)
+        );
+        assert_eq!(user.managed_profile_revision, Some(1));
+        assert!(state.managed_egress_capabilities.is_empty());
+    }
+
+    #[tokio::test]
+    async fn managed_admin_may_save_granted_residential_intent_during_outage() {
+        let h = harness().await;
+        let (r, t) = app(&h).await;
+        let (status, _) = send(
+            &r,
+            "PUT",
+            "/api/users/alice",
+            Some(&t),
+            Some(json!({"managed_egress":"residential"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let state = h.store.read().await;
+        assert_eq!(
+            state.users[0].managed_egress,
+            Some(bui_schema::managed::EgressIdentity::Residential)
+        );
+        assert_eq!(state.users[0].managed_profile_revision, Some(1));
+        let (status, _) = send(
+            &r,
+            "PUT",
+            "/api/users/alice",
+            Some(&t),
+            Some(json!({"managed_egress":"residential","managed_profile_revision":999})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            h.store.read().await.users[0].managed_profile_revision,
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_profile_admin_dto_is_sanitized_and_tracks_current_proof() {
+        use bui_schema::managed::{EgressIdentity, Evidence, EvidenceStatus};
+        let h = harness().await;
+        h.store
+            .update(|s| {
+                s.admin.jwt_secret = "0123456789abcdef".repeat(4);
+                s.users[0].managed_egress = Some(EgressIdentity::Vps);
+            })
+            .await
+            .unwrap();
+        let state = h.store.read().await;
+        let path = bui_schema::managed_binding::path_fingerprint(&state, &state.users[0]).unwrap();
+        let now = h.app.host.now().unix_timestamp();
+        h.store
+            .update(|s| {
+                let c = s
+                    .managed_egress_capabilities
+                    .entry(path.clone())
+                    .or_default();
+                c.v4_tcp = EvidenceStatus::Verified(Evidence {
+                    path_fingerprint: path.clone(),
+                    observed_at: now,
+                    expires_at: now + 10,
+                    observed_identity: "PRIVATE-ID-SENTINEL".into(),
+                });
+                c.v6_tcp = EvidenceStatus::Unsupported;
+            })
+            .await
+            .unwrap();
+        let (r, t) = app(&h).await;
+        let before = h.store.read().await;
+        let (status, body) = send(&r, "GET", "/api/users", Some(&t), None).await;
+        assert_eq!(status, StatusCode::OK);
+        let dto = &body[0]["managedProfile"];
+        assert_eq!(dto["selectedEgress"], "vps");
+        assert_eq!(dto["delivery"], "available");
+        assert_eq!(
+            dto["capabilities"],
+            json!({"v4Tcp":"verified","v4Udp":"unknown","v6Tcp":"unsupported","v6Udp":"unknown"})
+        );
+        let encoded = dto.to_string();
+        for secret in [
+            path.as_str(),
+            "PRIVATE-ID-SENTINEL",
+            "fingerprint",
+            "observed",
+            "expires",
+            "evidence",
+        ] {
+            assert!(!encoded.contains(secret));
+        }
+        assert_eq!(*h.store.read().await, *before, "projection wrote state");
+        h.host.advance(10);
+        let (_, expired) = send(&r, "GET", "/api/users", Some(&t), None).await;
+        assert_eq!(
+            expired[0]["managedProfile"]["delivery"],
+            "route_unavailable"
+        );
+        assert_eq!(
+            expired[0]["managedProfile"]["capabilities"]["v4Tcp"],
+            "unknown"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_profile_admin_list_waits_for_coherent_gate_snapshot() {
+        let h = harness().await;
+        let (r, t) = app(&h).await;
+        let gate = h.shared.gate_guard().await;
+        let request =
+            tokio::spawn(async move { send(&r, "GET", "/api/users", Some(&t), None).await });
+        tokio::task::yield_now().await;
+        assert!(!request.is_finished(), "list bypassed publication fence");
+        h.store
+            .update(|s| s.users[0].disabled = true)
+            .await
+            .unwrap();
+        drop(gate);
+        let (status, body) = request.await.unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body[0]["blocked"], true);
+        assert_eq!(body[0]["managedProfile"]["delivery"], "account_unavailable");
+        // No read/publication guard can survive the response.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            h.store.update(|s| s.users[0].disabled = false),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn complete_profile_admin_legacy_none_and_null_preserve_selection() {
+        let h = harness().await;
+        let (r, t) = app(&h).await;
+        for request in [json!({}), json!({"managed_egress":null})] {
+            assert_eq!(
+                send(&r, "PUT", "/api/users/alice", Some(&t), Some(request))
+                    .await
+                    .0,
+                StatusCode::OK
+            );
+            assert!(h.store.read().await.users[0].managed_egress.is_none());
+        }
+        let (_, body) = send(&r, "GET", "/api/users", Some(&t), None).await;
+        assert_eq!(
+            body[0]["managedProfile"]["selectedEgress"],
+            serde_json::Value::Null
+        );
+        assert_eq!(body[0]["managedProfile"]["delivery"], "missing_selection");
+        assert_eq!(
+            send(
+                &r,
+                "PUT",
+                "/api/users/alice",
+                Some(&t),
+                Some(json!({"managed_egress":"vps"}))
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        let revision = h.store.read().await.users[0].managed_profile_revision;
+        for request in [json!({}), json!({"managed_egress":null})] {
+            assert_eq!(
+                send(&r, "PUT", "/api/users/alice", Some(&t), Some(request))
+                    .await
+                    .0,
+                StatusCode::OK
+            );
+            let state = h.store.read().await;
+            assert_eq!(
+                state.users[0].managed_egress,
+                Some(bui_schema::managed::EgressIdentity::Vps)
+            );
+            assert_eq!(state.users[0].managed_profile_revision, revision);
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_profile_admin_current_binding_and_admission_match_feed() {
+        use bui_schema::managed::{EgressIdentity, Evidence, EvidenceStatus};
+        for (reason, delivery, status) in [
+            (
+                "future",
+                "route_unavailable",
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                "old_path",
+                "route_unavailable",
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            ("other_identity", "available", StatusCode::OK),
+            (
+                "no_key",
+                "route_unavailable",
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            ("none", "missing_selection", StatusCode::CONFLICT),
+            ("ungranted", "account_unavailable", StatusCode::FORBIDDEN),
+            ("pending", "account_unavailable", StatusCode::FORBIDDEN),
+            (
+                "residential",
+                "route_unavailable",
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ] {
+            let h = harness().await;
+            h.store
+                .update(|s| {
+                    s.admin.jwt_secret = "0123456789abcdef".repeat(4);
+                    s.users[0].sub_token = Some("0123456789abcdef0123456789abcdef".into());
+                    s.users[0].managed_egress = Some(EgressIdentity::Vps);
+                    s.users[0].usage.total_bytes = 0;
+                })
+                .await
+                .unwrap();
+            let state = h.store.read().await;
+            let path =
+                bui_schema::managed_binding::path_fingerprint(&state, &state.users[0]).unwrap();
+            let now = h.app.host.now().unix_timestamp();
+            h.store
+                .update(|s| {
+                    let proof = EvidenceStatus::Verified(Evidence {
+                        path_fingerprint: if reason == "old_path" {
+                            "PRIVATE-OLD-PATH".into()
+                        } else {
+                            path.clone()
+                        },
+                        observed_at: if reason == "future" { now + 1 } else { now },
+                        expires_at: now + 10,
+                        observed_identity: "PRIVATE-IDENTITY".into(),
+                    });
+                    match reason {
+                        "future" | "old_path" => {
+                            s.managed_egress_capabilities
+                                .entry(path.clone())
+                                .or_default()
+                                .v4_tcp = proof
+                        }
+                        "other_identity" => {
+                            s.managed_egress_capabilities
+                                .entry("PRIVATE-OTHER-IDENTITY".into())
+                                .or_default()
+                                .v4_tcp = proof
+                        }
+                        "no_key" => s.admin.jwt_secret = "invalid".into(),
+                        "none" => s.users[0].managed_egress = None,
+                        "ungranted" => s.users[0].entitlements.direct = false,
+                        "pending" => s.users[0].entitlements.traffic_limit.total_bytes = Some(1),
+                        _ => s.users[0].managed_egress = Some(EgressIdentity::Residential),
+                    }
+                })
+                .await
+                .unwrap();
+            if reason == "pending" {
+                h.shared
+                    .pending()
+                    .await
+                    .insert(state.users[0].user_id, TxRx { tx: 1, rx: 0 });
+            }
+            let (r, t) = app(&h).await;
+            let (_, body) = send(&r, "GET", "/api/users", Some(&t), None).await;
+            let dto = &body[0]["managedProfile"];
+            assert_eq!(dto["delivery"], delivery, "{reason}");
+            assert_eq!(dto["capabilities"]["v4Tcp"], "unknown", "{reason}");
+            assert!(!dto.to_string().contains("PRIVATE"));
+            let (got, _) = send(
+                &h.router(),
+                "GET",
+                "/api/profile/0123456789abcdef0123456789abcdef/v2rayn-sb1142-macos",
+                None,
+                None,
+            )
+            .await;
+            assert_eq!(got, status, "{reason}");
+            if reason == "residential" {
+                assert!(dto["allowedChoices"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("residential")));
+            }
+        }
+    }
 
     async fn app(h: &Harness) -> (axum::Router, String) {
         (mount(&h.app, routes(h.shared.clone())), token(h).await)

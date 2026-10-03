@@ -245,6 +245,12 @@
                 <input id="nm" type="number" placeholder="月流量(GB)" min="0" step="0.1">
                 <input id="ns" type="number" placeholder="限速(Mbps) 默认100" min="0">
             </div>
+            <label for="nmanaged-egress">完整配置默认出口（明确选择，不授予权益）</label>
+            <select id="nmanaged-egress" name="managed_egress">
+                <option value="">请选择默认出口</option>
+                <option value="vps">VPS 出口</option>
+                <option value="residential">住宅出口</option>
+            </select>
             <!-- v3.5.5/3.5.6: 住宅代理开关 (语义随 protocol 变) -->
             <label id="nresi-wrap" style="display:flex; align-items:center; gap:10px; margin-top:12px; padding:12px 14px; background:var(--ivory-200); border:1px solid var(--hairline); border-radius:12px; cursor:pointer">
                 <input type="checkbox" id="nresi" checked style="cursor:pointer">
@@ -265,6 +271,12 @@
         <div class="modal-card" style="text-align:center">
             <h3 id="cfg-title">客户端配置</h3>
             <p id="cfg-desc" style="font-size:13px; color:var(--text-dim); margin-bottom:24px"></p>
+            <p id="managed-status"></p>
+            <p id="managed-capabilities"></p>
+            <div class="code-box" id="managed-url" style="word-break:break-all"></div>
+            <button id="managed-copy" class="btn" onclick="copyManagedProfile()" disabled>复制完整配置链接（Mac）</button>
+            <p id="managed-help" style="font-size:12px; text-align:left; color:var(--text-dim)"></p>
+            <details><summary>仅节点 / 旧配置：需要客户端自行管理策略</summary>
             <div id="qrcode"
                 style="margin:0 auto 24px; background:#fff; padding:16px; border-radius:18px; width:fit-content; box-shadow: 0 12px 28px -12px rgba(101,78,32,0.18), 0 2px 6px rgba(101,78,32,0.06); border:1px solid var(--hairline);">
             </div>
@@ -273,6 +285,7 @@
                 <!-- 按钮会由 JS 动态生成 -->
             </div>
             <p id="cfg-hint" style="font-size:12px; color:var(--text-dim); margin-top:12px"></p>
+            </details>
             <!-- 2026-09-14：订阅链接末段是随机 token；这里同时换 token + hy2 密码 + vless uuid，旧订阅立刻失效 -->
             <button class="btn btn-danger" id="cfg-rotate" style="margin-top:12px; width:100%" onclick="rotateSub()">重置订阅链接与凭据</button>
             <button class="btn btn-secondary" style="margin-top:12px; width:100%" onclick="closeM()">关闭</button>
@@ -459,6 +472,9 @@
         <div class="modal-card">
             <h3>编辑用户</h3>
             <input type="hidden" id="edit-orig-username">
+            <label for="edit-managed-egress">完整配置默认出口</label>
+            <select id="edit-managed-egress" name="managed_egress"></select>
+            <p id="edit-managed-hint" style="font-size:12px; color:var(--text-dim)"></p>
 
             <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px">
                 <div>

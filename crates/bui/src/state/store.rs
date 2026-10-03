@@ -134,6 +134,7 @@ impl Store {
             tracing::error!(caller, "{why}");
             anyhow::bail!("{why}");
         }
+        bui_schema::managed_binding::reconcile_revisions(&current, &mut next)?;
         let new_bytes = serde_json::to_vec_pretty(&next)?;
         if new_bytes == old_bytes {
             return Ok(current);
@@ -281,6 +282,64 @@ mod tests {
 
     fn dir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    #[tokio::test]
+    async fn managed_publication_normalizes_once_and_keeps_noop_bytes_and_backup_count() {
+        let d = dir();
+        let p = d.path().join("state.json");
+        let mut s = sample_state();
+        s.admin.jwt_secret = "0123456789abcdef".repeat(4);
+        s.users[0].managed_egress = Some(bui_schema::managed::EgressIdentity::Vps);
+        let store = Store::create(&p, s).await.unwrap();
+        assert_eq!(store.read().await.users[0].managed_profile_revision, None);
+        store.update(|_| {}).await.unwrap();
+        let before = store.read().await;
+        assert_eq!(before.users[0].managed_profile_revision, Some(1));
+        let bytes = std::fs::read(&p).unwrap();
+        let count = std::fs::read_dir(d.path().join("state.backups"))
+            .unwrap()
+            .count();
+        store
+            .update(|s| s.users[0].managed_profile_revision = Some(999))
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&before, &store.read().await));
+        assert_eq!(std::fs::read(&p).unwrap(), bytes);
+        assert_eq!(
+            std::fs::read_dir(d.path().join("state.backups"))
+                .unwrap()
+                .count(),
+            count
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_publication_overflow_or_duplicate_id_rolls_back_disk_and_cache() {
+        for duplicate in [false, true] {
+            let d = dir();
+            let p = d.path().join("state.json");
+            let mut s = sample_state();
+            s.admin.jwt_secret = "0123456789abcdef".repeat(4);
+            s.users[0].managed_egress = Some(bui_schema::managed::EgressIdentity::Vps);
+            s.users[0].managed_profile_revision = Some(u64::MAX);
+            let store = Store::create(&p, s).await.unwrap();
+            let before = store.read().await;
+            let bytes = std::fs::read(&p).unwrap();
+            let result = store
+                .update(|s| {
+                    if duplicate {
+                        s.users.push(s.users[0].clone());
+                    } else {
+                        s.node.public_ip = "203.0.113.2".into();
+                    }
+                })
+                .await;
+            assert!(result.is_err());
+            assert!(Arc::ptr_eq(&before, &store.read().await));
+            assert_eq!(std::fs::read(&p).unwrap(), bytes);
+            assert!(!d.path().join("state.backups").exists());
+        }
     }
 
     // Catches a cancelled waiter releasing the writer while durable write/cache publish still runs.

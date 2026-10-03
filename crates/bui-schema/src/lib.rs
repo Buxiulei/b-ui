@@ -35,6 +35,12 @@
 //!   住宅不可交付时返回 [`egress::EgressDeny`]，不授权兜底槽或直连出口。
 //! - 账户到期与限额由调用方的唯一判定传入，不在 schema 里另读时钟。
 //!
+//! ## 受管出口策略 —— [`managed`]
+//!
+//! - [`managed::ManagedPolicy`]：明确出口身份、路径指纹与族/协议能力的纯快照。
+//! - [`managed::allows`]：能力仅在相同路径且观测时间已到、有效期未结束时允许。
+//! - [`managed::select_nodes`]：只过滤已有授权节点，不授予权益或创建凭据。
+//!
 //! ## IP 池与槽位 —— [`slots`]
 //!
 //! - [`slots::SlotRes`] `{ index, relay_port }`：槽 i 的那**一个**端口（relay 的 socks
@@ -163,6 +169,8 @@
 pub mod egress;
 pub mod hy2pool;
 pub mod keywords;
+pub mod managed;
+pub mod managed_binding;
 pub mod model;
 pub mod nodes;
 pub mod parse;
