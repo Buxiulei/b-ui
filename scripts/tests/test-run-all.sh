@@ -24,6 +24,10 @@ prepare_fixture() {
 #!/usr/bin/env bash
 printf 'snapshot\n' >> opt-in-touched
 SH
+    cat >"$1/test-official-api-g0.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'official-api-g0\n' >> opt-in-touched
+SH
     cat >"$1/test-residential-stock-gates.sh" <<'SH'
 #!/usr/bin/env bash
 printf 'stock\n' >> opt-in-touched
@@ -39,7 +43,10 @@ assert_opt_in_not_run() {
     assert_contains "$1/run.log" 'preconfigured network=none Docker container' "$2: stock prerequisites were not explained"
     assert_contains "$1/run.log" 'BUI_TEST_CONTAINER_SOURCE=SOURCE_DIRECTORY' "$2: stock source argument was not shown"
     assert_contains "$1/run.log" 'bash scripts/tests/test-residential-stock-gates.sh' "$2: stock invocation was not shown"
-    assert_contains "$1/run.log" '# 2 explicit opt-in tools not run (not counted as passed)' "$2: opt-in tools were counted as passed or omitted from the summary"
+    assert_contains "$1/run.log" '# NOT RUN (explicit opt-in): test-official-api-g0.sh' "$2: official API exclusion was silent"
+    assert_contains "$1/run.log" 'BUI_G0_BINARY=VERIFIED_OFFICIAL_BINARY' "$2: official API binary prerequisite was not shown"
+    assert_contains "$1/run.log" 'bash scripts/tests/test-official-api-g0.sh' "$2: official API invocation was not shown"
+    assert_contains "$1/run.log" '# 3 explicit opt-in tools not run (not counted as passed)' "$2: opt-in tools were counted as passed or omitted from the summary"
 }
 
 # A failed portable test must not hide the result or stop later discovered tests.

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Automatically discover portable test-*.sh; two private Docker tools are explicit opt-in.
+# Automatically discover portable test-*.sh; private Docker tools are explicit opt-in.
 set -uo pipefail
 LC_ALL=C
 cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
@@ -11,6 +11,12 @@ executed=0
 opt_in=0
 for t in test-*.sh; do
     case "$t" in
+        test-official-api-g0.sh)
+            printf '# NOT RUN (explicit opt-in): %s requires a network=none Docker lab and digest-verified official release archive\n' "$t"
+            printf '# Run separately: BUI_G0_CONTAINER=CONTAINER BUI_G0_SOURCE=SOURCE_DIRECTORY BUI_G0_TARGET=TARGET_DIRECTORY BUI_G0_BINARY=VERIFIED_OFFICIAL_BINARY BUI_G0_ARCHIVE=VERIFIED_OFFICIAL_ARCHIVE bash scripts/tests/test-official-api-g0.sh\n'
+            opt_in=$((opt_in + 1))
+            continue
+            ;;
         test-renderer-snapshot.sh)
             printf '# NOT RUN (explicit opt-in): %s requires private INPUT_DIRECTORY and empty OUTPUT_DIRECTORY in a network=none Docker container\n' "$t"
             printf '# Run separately: bash scripts/tests/test-renderer-snapshot.sh INPUT_DIRECTORY EMPTY_OUTPUT_DIRECTORY\n'

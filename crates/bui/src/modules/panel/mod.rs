@@ -26,6 +26,8 @@ pub mod xray;
 #[cfg(test)]
 pub mod fakes;
 #[cfg(test)]
+mod official_api_fixture;
+#[cfg(test)]
 mod stock_gate_fixture;
 #[cfg(test)]
 pub mod testsupport;
