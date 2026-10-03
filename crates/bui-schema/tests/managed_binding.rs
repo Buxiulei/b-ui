@@ -294,3 +294,154 @@ fn already_selected_import_normalizes_only_at_publication_and_unset_serde_stays_
     assert_eq!(next.users[0].managed_profile_revision, Some(1));
     assert_eq!(imported.users[0].managed_profile_revision, None);
 }
+
+fn change_unavailable_desired(state: &mut State, change: &str) {
+    match change {
+        "selected_uuid" => {
+            state.users[0]
+                .entitlements
+                .residential
+                .as_mut()
+                .unwrap()
+                .slot_id = Some(uuid::Uuid::from_u128(91))
+        }
+        "slot_index" => state.residential.slots[0].index += 1,
+        "supplier_password" => state
+            .residential
+            .groups
+            .get_mut("default")
+            .unwrap()
+            .upstreams[0]
+            .password
+            .push('x'),
+        "supplier_endpoint" => {
+            state
+                .residential
+                .groups
+                .get_mut("default")
+                .unwrap()
+                .upstreams[0]
+                .host = "replacement.example.test".into()
+        }
+        "subscriber_password" => state.users[0].credentials.hy2_password.push('x'),
+        "subscriber_reference" => state.users[0].credentials.hy2_resi_cred = Some("r009".into()),
+        "reserved_secret" => state.residential.hy2_pool.creds[0].secret.push('x'),
+        "reality_uuid" => state.users[0].credentials.vless_uuid = uuid::Uuid::from_u128(93),
+        "protocol_scope" => {
+            state.users[0].entitlements.protocols = vec![bui_schema::model::Protocol::Hysteria2]
+        }
+        "service_port" => state.node.ports.hy2_resi += 1,
+        "tls" => state.node.domain = "new.example.test".into(),
+        "obfs" => {
+            state.node.obfs.enabled = true;
+            state.node.obfs.password = "fixture-new-obfs".into();
+        }
+        _ => unreachable!(),
+    }
+}
+fn assert_unavailable_changes_increment_once(old: &State, changes: &[&str]) {
+    assert!(path_fingerprint(old, &old.users[0]).is_err());
+    let mut missed = Vec::new();
+    for change in changes {
+        let mut next = old.clone();
+        change_unavailable_desired(&mut next, change);
+        assert!(
+            path_fingerprint(&next, &next.users[0]).is_err(),
+            "path must remain unavailable: {change}"
+        );
+        reconcile_revisions(old, &mut next).unwrap();
+        if next.users[0].managed_profile_revision != Some(2) {
+            missed.push(*change);
+        }
+        let published = next.clone();
+        reconcile_revisions(&published, &mut next).unwrap();
+        assert_eq!(
+            next.users[0].managed_profile_revision, published.users[0].managed_profile_revision,
+            "repeat {change}"
+        );
+    }
+    assert!(
+        missed.is_empty(),
+        "desired semantic changes lost during outage: {missed:?}"
+    );
+}
+#[test]
+fn disabled_group_desired_binding_supplier_subscriber_protocol_and_service_changes_increment_once()
+{
+    let mut old = residential();
+    old.residential.groups.get_mut("default").unwrap().enabled = false;
+    assert_unavailable_changes_increment_once(
+        &old,
+        &[
+            "selected_uuid",
+            "slot_index",
+            "supplier_password",
+            "supplier_endpoint",
+            "subscriber_password",
+            "subscriber_reference",
+            "reserved_secret",
+            "reality_uuid",
+            "protocol_scope",
+            "service_port",
+            "tls",
+            "obfs",
+        ],
+    );
+}
+#[test]
+fn missing_credential_desired_supplier_subscriber_and_service_changes_increment_once() {
+    let mut old = residential();
+    old.users[0].entitlements.protocols = vec![bui_schema::model::Protocol::Hysteria2];
+    old.residential.hy2_pool.creds.clear();
+    assert_unavailable_changes_increment_once(
+        &old,
+        &[
+            "selected_uuid",
+            "slot_index",
+            "supplier_password",
+            "supplier_endpoint",
+            "subscriber_password",
+            "subscriber_reference",
+            "service_port",
+            "tls",
+            "obfs",
+        ],
+    );
+}
+#[test]
+fn unavailable_probe_usage_timestamps_and_unselected_bindings_remain_nonsemantic() {
+    for missing_credential in [false, true] {
+        let mut old = residential();
+        if missing_credential {
+            old.users[0].entitlements.protocols = vec![bui_schema::model::Protocol::Hysteria2];
+            old.users[0].credentials.hy2_resi_cred = Some("missing".into());
+        } else {
+            old.residential.groups.get_mut("default").unwrap().enabled = false;
+        }
+        let mut next = old.clone();
+        next.users[0].entitlements.protocols.reverse();
+        let protocol = next.users[0].entitlements.protocols[0];
+        next.users[0].entitlements.protocols.push(protocol);
+        next.users[0].usage.total_bytes = 123;
+        next.users[0].usage.last_seen_at = Some("2026-10-03T01:00:00Z".into());
+        next.users[0].note = "fixture note".into();
+        next.residential.hy2_pool.generation += 1;
+        next.residential.hy2_pool.creds[0].released_at = Some("2026-10-03T01:00:00Z".into());
+        let group = next.residential.groups.get_mut("default").unwrap();
+        group.upstreams[0].verified = Some(
+            serde_json::from_value(json!({"ip":"203.0.113.8","at":"2026-10-03T01:00:00Z"}))
+                .unwrap(),
+        );
+        group.upstreams[0].priority = 3;
+        group.upstreams[0].ports_allowed = Some(vec![80, 443, 80]);
+        let mut unrelated = group.upstreams[0].clone();
+        unrelated.id = uuid::Uuid::from_u128(100);
+        unrelated.password = "unselected-fixture-secret".into();
+        group.upstreams.push(unrelated);
+        group.selected_upstream_id = Some(uuid::Uuid::from_u128(100));
+        next.node.ports.hy2 += 1;
+        reconcile_revisions(&old, &mut next).unwrap();
+        assert_eq!(next.users[0].managed_profile_revision, Some(1));
+        assert!(path_fingerprint(&next, &next.users[0]).is_err());
+    }
+}

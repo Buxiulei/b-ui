@@ -824,6 +824,81 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn managed_unavailable_desired_edits_publish_revisions_without_enabling_delivery() {
+        use bui_schema::managed::EgressIdentity;
+        use bui_schema::model::{Protocol, ResidentialEntitlement, Slot};
+        for missing_credential in [false, true] {
+            let h = managed_fixture().await;
+            let upstream_id = uuid::Uuid::from_u128(7);
+            h.store.update(|s| {
+                let user = &mut s.users[0];
+                user.managed_egress = Some(EgressIdentity::Residential);
+                user.entitlements.protocols = vec![Protocol::Hysteria2];
+                user.entitlements.residential = Some(ResidentialEntitlement {group_id:"default".into(),slot_id:Some(upstream_id)});
+                user.credentials.hy2_resi_cred = Some("r000".into());
+                s.residential.slots = vec![Slot {index:0,upstream_id}];
+                if !missing_credential {
+                    s.residential.hy2_pool.creds.push(serde_json::from_value(json!({"id":"r000","name":"fixture-subscriber","secret":"fixture-secret"})).unwrap());
+                }
+                let group = s.residential.groups.get_mut("default").unwrap();
+                group.enabled = missing_credential;
+                group.upstreams.push(serde_json::from_value(json!({"id":upstream_id,"name":"fixture-provider","kind":"socks5","host":"provider.example.test","port":10007,"username":"fixture","password":"fixture-secret"})).unwrap());
+            }).await.unwrap();
+            let mut revision = h.store.read().await.users[0]
+                .managed_profile_revision
+                .unwrap();
+            for change in 0..5 {
+                assert!(matches!(
+                    managed_delivery(&h.app, &h.shared, TOK).await,
+                    Err(ManagedDeliveryFailure::Unavailable)
+                ));
+                h.store
+                    .update(|s| match change {
+                        0 => s.residential.groups.get_mut("default").unwrap().upstreams[0]
+                            .password
+                            .push('x'),
+                        1 => s.users[0].credentials.hy2_password.push('x'),
+                        2 => s.node.ports.hy2_resi += 1,
+                        3 => s.residential.slots[0].index += 1,
+                        _ => {
+                            s.users[0]
+                                .entitlements
+                                .residential
+                                .as_mut()
+                                .unwrap()
+                                .slot_id = Some(uuid::Uuid::from_u128(99))
+                        }
+                    })
+                    .await
+                    .unwrap();
+                revision += 1;
+                assert_eq!(
+                    h.store.read().await.users[0].managed_profile_revision,
+                    Some(revision)
+                );
+                assert!(matches!(
+                    managed_delivery(&h.app, &h.shared, TOK).await,
+                    Err(ManagedDeliveryFailure::Unavailable)
+                ));
+                h.store
+                    .update(|s| s.users[0].usage.last_seen_at = Some("2026-09-11T00:00:01Z".into()))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    h.store.read().await.users[0].managed_profile_revision,
+                    Some(revision)
+                );
+            }
+            let state = h.store.read().await;
+            assert!(
+                !nodes_for(&state.users[0], &state.node, &state.residential).is_empty(),
+                "authorized VPS control survives"
+            );
+            assert!(state.managed_egress_capabilities.is_empty());
+        }
+    }
+
     /// 夹具 token：`sample_state` 的 alice 没有 `sub_token`（= 升级上来还没补齐的老 state），
     /// 四个端点的正路一律走 token，所以每个用例先给她一个。
     const TOK: &str = "0123456789abcdef0123456789abcdef";

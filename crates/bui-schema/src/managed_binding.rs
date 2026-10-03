@@ -154,6 +154,104 @@ fn evidence_semantics(status: &EvidenceStatus) -> Value {
     }
 }
 
+/// Desired semantics remain observable while access_for denies rendering. This projection
+/// is only input to the private semantic HMAC: it never authorizes nodes or creates a proof
+/// key. Exact references (including missing/ambiguous matches) are retained; no pool-wide
+/// selected upstream, health ranking, probe metadata, or alternate provider is substituted.
+fn desired_semantics(state: &State, user: &User, identity: EgressIdentity) -> Value {
+    let protocols: Vec<_> = [Protocol::Hysteria2, Protocol::Reality]
+        .into_iter()
+        .filter(|p| user.entitlements.protocols.contains(p))
+        .collect();
+    let residential = identity == EgressIdentity::Residential;
+    let grant = if residential {
+        if let Some(entitlement) = &user.entitlements.residential {
+            let group = state.residential.groups.get(&entitlement.group_id);
+            let selected_indices: BTreeSet<_> = state
+                .residential
+                .slots
+                .iter()
+                .filter(|slot| Some(slot.upstream_id) == entitlement.slot_id)
+                .map(|slot| slot.index)
+                .collect();
+            let mut slots: Vec<_> = state
+                .residential
+                .slots
+                .iter()
+                .filter(|slot| {
+                    Some(slot.upstream_id) == entitlement.slot_id
+                        || selected_indices.contains(&slot.index)
+                })
+                .map(|slot| (slot.index, slot.upstream_id))
+                .collect();
+            slots.sort_unstable();
+            let mut providers: Vec<_> = group.into_iter().flat_map(|g| &g.upstreams)
+                .filter(|upstream| Some(upstream.id) == entitlement.slot_id)
+                .map(|upstream| {
+                    let mut ports = upstream.ports_allowed.clone();
+                    if let Some(ports) = &mut ports { ports.sort_unstable(); ports.dedup(); }
+                    json!({"id":upstream.id,"kind":upstream.kind,"host":upstream.host,"port":upstream.port,
+                        "username":upstream.username,"password":upstream.password,"provider":upstream.provider,"ports_allowed":ports})
+                }).collect();
+            providers.sort_by_cached_key(Value::to_string);
+            json!({"group":entitlement.group_id,"upstream_id":entitlement.slot_id,
+                "group_enabled":group.map(|g|g.enabled),"slots":slots,"providers":providers})
+        } else {
+            Value::Null
+        }
+    } else {
+        json!({"direct":user.entitlements.direct})
+    };
+    let mut services = Vec::new();
+    if protocols.contains(&Protocol::Hysteria2) {
+        let subscriber = if residential {
+            let reference = user.credentials.hy2_resi_cred.as_ref();
+            let names: BTreeSet<_> = state
+                .residential
+                .hy2_pool
+                .creds
+                .iter()
+                .filter(|cred| Some(&cred.id) == reference)
+                .map(|cred| &cred.name)
+                .collect();
+            let mut credentials: Vec<_> = state
+                .residential
+                .hy2_pool
+                .creds
+                .iter()
+                .filter(|cred| Some(&cred.id) == reference || names.contains(&cred.name))
+                .map(|cred| json!({"id":cred.id,"name":cred.name,"secret":cred.secret}))
+                .collect();
+            credentials.sort_by_cached_key(Value::to_string);
+            json!({"reference":reference,"credentials":credentials,"desired_password":user.credentials.hy2_password})
+        } else {
+            json!({"username":user.username,"password":user.credentials.hy2_password})
+        };
+        let (port, hop) = if residential {
+            (
+                state.node.ports.hy2_resi,
+                Some(state.node.ports.hy2_resi_hop),
+            )
+        } else {
+            (state.node.ports.hy2, state.node.ports.hy2_hop)
+        };
+        services.push(
+            json!({"protocol":"hysteria2","port":port,"hop":hop,"sni":state.node.domain,
+            "obfs":state.node.obfs,"subscriber":subscriber}),
+        );
+    }
+    if protocols.contains(&Protocol::Reality) {
+        let port = if residential {
+            state.node.ports.reality_resi
+        } else {
+            state.node.ports.reality_direct
+        };
+        services.push(json!({"protocol":"reality","port":port,"tls":state.node.reality,"uuid":user.credentials.vless_uuid}));
+    }
+    json!({"identity":identity,"grant":grant,"protocols":protocols,"services":services,
+        "node_id":state.node.id,"domain":state.node.domain,"dial_ip":state.node.public_ip,"disabled":user.disabled})
+}
+
 /// Opaque equality stamp; no Debug/Serialize and no secret-bearing data exposed.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SemanticStamp(String);
@@ -182,6 +280,7 @@ pub fn semantic_stamp(state: &State, user: &User) -> Result<SemanticStamp, Bindi
         b"bui-managed-semantics-v1\0",
         &json!({
             "identity":identity,"path":path,"nodes":nodes,"username":user.username,
+            "desired":desired_semantics(state,user,identity),
             "token":user.sub_token,"legacy_disabled":user.legacy_sub_disabled,
             "dial_ip":state.node.public_ip,
             "capabilities":[evidence_semantics(&caps.v4_tcp),evidence_semantics(&caps.v4_udp),evidence_semantics(&caps.v6_tcp),evidence_semantics(&caps.v6_udp)]
