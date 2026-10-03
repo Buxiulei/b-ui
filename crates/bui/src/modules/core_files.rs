@@ -105,10 +105,11 @@ pub fn sites_glob(paths: &Paths) -> String {
         .to_string()
 }
 
-/// 四个免鉴权订阅端点的 path 匹配器（`log_skip` 用）。末段是订阅 token 或宽限期内的
+/// 五个免管理员鉴权订阅端点的 path 匹配器（`log_skip` 用）。末段是订阅 token 或宽限期内的
 /// 用户名，两者都是凭据（2026-09-14 裁决）。Caddy 的 `path` 匹配器**不分大小写**，
 /// 所以 `/API/SUB/<token>` 这种请求也一并跳过。
-const SUB_PATHS_MATCHER: &str = "/api/sub/* /api/subscription/* /api/clash/* /api/nodes/*";
+const SUB_PATHS_MATCHER: &str =
+    "/api/sub/* /api/subscription/* /api/clash/* /api/nodes/* /api/profile/*";
 
 /// `format filter` 的 `regexp` 参数：把订阅路径的末段换成 `***`（口径同 [`crate::redact::sub_path`]）。
 ///
@@ -123,7 +124,8 @@ const SUB_PATHS_MATCHER: &str = "/api/sub/* /api/subscription/* /api/clash/* /ap
 /// 所以 default 与站点两个 logger 都得挂，`request>uri` 与 `resp_headers>Location` 两个字段
 /// 都得过（`regexp` 过滤器对数组字段逐项生效，实测 `Location` 那一项被换掉）。`(?i)` 是因为
 /// Caddy 的 `path` 匹配器不分大小写，`/API/SUB/<token>` 也照样被服务到。
-const SUB_SEG_REGEXP: &str = "\"(?i)(/api/(?:sub|subscription|clash|nodes)/)[^/?]+\" \"${1}***\"";
+const SUB_SEG_REGEXP: &str =
+    "\"(?i)(/api/(?:sub|subscription|clash|nodes|profile)/)[^/?]+\" \"${1}***\"";
 
 /// Caddyfile：只反代面板端口，日志进 stderr（journald 收），不再写 `/var/log/caddy`。
 ///
@@ -809,15 +811,15 @@ mod tests {
     /// 2026-09-14 裁决「每用户随机订阅 token」：四个免鉴权订阅端点的末段是凭据，
     /// 面板块的访问日志（`output stderr` → journald）不许收它们；其余请求照旧记。
     #[test]
-    fn caddyfile_skips_the_access_log_for_the_four_subscription_paths() {
+    fn caddyfile_skips_the_access_log_for_subscription_and_complete_profile_paths() {
         let arts = CoreFilesModule::new(None).render(&sample_state(), &ctx());
         let text = match find_file(&arts, "/opt/b-ui/Caddyfile") {
             Artifact::File { content, .. } => String::from_utf8(content).unwrap(),
             other => panic!("{other:?}"),
         };
         assert!(
-            text.contains("\t@sub path /api/sub/* /api/subscription/* /api/clash/* /api/nodes/*\n"),
-            "四条路径一条都不能少：\n{text}"
+            text.contains("\t@sub path /api/sub/* /api/subscription/* /api/clash/* /api/nodes/* /api/profile/*\n"),
+            "五条路径一条都不能少：\n{text}"
         );
         assert!(text.contains("\tlog_skip @sub\n"), "\n{text}");
         // 必须在面板站点块**里面**（块外的 log_skip 不是合法的顶层指令）。
@@ -833,7 +835,7 @@ mod tests {
             at > block_start && at < block_end,
             "log_skip 得落在面板站点块里：\n{text}"
         );
-        // 只跳这四条，别把整个面板的访问日志一起关掉
+        // 只跳这些订阅路径，别把整个面板的访问日志一起关掉
         assert!(text.contains("output stderr"), "\n{text}");
     }
 
@@ -844,7 +846,9 @@ mod tests {
     #[test]
     fn caddyfile_masks_the_subscription_segment_in_both_loggers() {
         let text = caddyfile_text("example.com", 8080, "/opt/b-ui/caddy/sites/*.caddy");
-        let field = |f: &str| format!("\t\t\t\t{f} regexp {SUB_SEG_REGEXP}\n");
+        // Independent golden checks the emitted expression, not just a reused constant.
+        let expected = "\"(?i)(/api/(?:sub|subscription|clash|nodes|profile)/)[^/?]+\" \"${1}***\"";
+        let field = |f: &str| format!("\t\t\t\t{f} regexp {expected}\n");
         assert_eq!(
             text.matches(&field("request>uri")).count(),
             2,

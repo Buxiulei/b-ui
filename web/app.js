@@ -6,6 +6,7 @@
 const $ = s => document.querySelector(s);
 let tok = localStorage.getItem("t"), cfg = {};
 let allUsers = [];
+let userListRequest = 0;
 
 // Security: Escape HTML
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -163,7 +164,7 @@ function _resiUnavailableHint(x) {
 // 有 Reality 权益时那两条 Reality（uuid 换了）。不说清运维就会去列表里找一条根本不会出现的
 // 「新的 HY2 直连」，甚至把已经原地更新过的那条当成旧节点删掉。
 const _ROTATE_SWITCH =
-    "Linux 客户端（bui-c）导入后还要明确切换到新的住宅 HY2 节点：住宅凭据连名字一起换了，" +
+    "仅节点入口：Linux 客户端（bui-c）导入后还要明确切换到新的住宅 HY2 节点：住宅凭据连名字一起换了，" +
     "重新导入只会新增新节点、旧的留在原地，而旧的住宅节点会一直显示已连接但所有请求被拒。" +
     "新增的只有住宅 HY2 与（有 Reality 权益时）两条 Reality；HY2 直连是原地更新、不新增" +
     "（换的只是密码、用户名没换）。" +
@@ -193,7 +194,9 @@ function _resiGateHint(x) {
 // Load data
 // 返回 Promise：轮换凭据后要等用户列表刷新完再按新 token 重画配置弹窗（见 rotateSub）
 function load() {
+    const request = ++userListRequest;
     return Promise.all([api("/users"), api("/online"), api("/stats")]).then(([u, o, s]) => {
+        if (request !== userListRequest) return false;
         $("#st-u").innerText = u.length;
         // 在线用户：`/api/online` 的值恒为 1（每人 0/1，量纲见 modules/panel/traffic.rs
         // 的「在线数的量纲」），所以键的个数就是在线用户数。4.0.x 这里累加的是
@@ -274,6 +277,14 @@ function load() {
                 '</td>' +
                 '</tr>';
         }).join("");
+        return true;
+    }).catch(error => {
+        if (request !== userListRequest) return false;
+        if (currentShowUser) {
+            managedRefreshPending = true;
+            renderManagedProfile(currentShowUser);
+        }
+        throw error;
     });
 }
 
@@ -288,10 +299,12 @@ function addUser() {
     const proto = $("#nproto").value;
     const customSni = $("#nsni-custom")?.value || $("#nsni")?.value || "";
     const residential = $("#nresi")?.checked !== false; // 默认 true
+    const managedEgress = $("#nmanaged-egress").value;
+    if (!["vps", "residential"].includes(managedEgress)) return toast("请明确选择完整配置默认出口", 1);
 
     // v4：创建用户改为 JWT 保护的 POST /api/users（spec §4.3 改动 1）。
     // sni 与 speed 服务端会接受但忽略（v4 的 SNI 全局唯一、内核不支持按用户限速）。
-    api("/users", {
+    return api("/users", {
         method: "POST",
         body: JSON.stringify({
             username: u,
@@ -301,6 +314,7 @@ function addUser() {
             monthly: parseFloat(m),
             protocol: proto,
             residential: residential,
+            managed_egress: managedEgress,
             sni: customSni || undefined,
             speed: parseFloat(s)
         })
@@ -308,11 +322,11 @@ function addUser() {
         if (r.success) {
             closeM();
             toast("用户 " + u + " 已创建");
-            load();
+            return load();
         } else {
             toast(r.error || "操作失败", 1);
         }
-    });
+    }).catch(e => toast(e.message || "创建失败", 1));
 }
 
 // Delete user
@@ -360,6 +374,19 @@ function editUser(uname) {
     const total = x.usage?.total || 0;
     $("#edit-usage-info").innerHTML = "本月: " + sz(monthly) + " | 总计: " + sz(total);
 
+    const managed = x.managedProfile || {};
+    const choices = managed.allowedChoices || [];
+    const selected = managed.selectedEgress || "";
+    const select = $("#edit-managed-egress");
+    select.innerHTML = (selected ? "" : '<option value="">未选择（保持原值）</option>') +
+        [...new Set([...choices, ...(selected ? [selected] : [])])].map(value =>
+            '<option value="' + esc(value) + '"' + (!choices.includes(value) ? ' disabled' : '') + '>' +
+            (value === 'vps' ? 'VPS 出口' : '住宅出口') + '</option>').join('');
+    select.value = selected;
+    select.dataset.original = selected;
+    $("#edit-managed-hint").innerText = !selected ? "未选择；完整配置将返回 409。编辑其他字段可保持原值。" :
+        !choices.includes(selected) ? "当前出口无权选择或不可用；已保留实际选择，不会自动切换。" :
+        "选择只保存已授权的出口意图；出口故障时仍可能返回 503，不会自动切换身份。";
     openM("m-edit");
 }
 
@@ -377,7 +404,11 @@ function saveUser() {
         return toast("用户名不能为空", 1);
     }
 
-    api("/users/" + encodeURIComponent(origUsername), {
+    const managedSelect = $("#edit-managed-egress");
+    const managedEgress = managedSelect.value;
+    if (managedEgress !== managedSelect.dataset.original && !["vps", "residential"].includes(managedEgress))
+        return toast("请选择已授权出口；不能清空已有选择", 1);
+    return api("/users/" + encodeURIComponent(origUsername), {
         method: "PUT",
         body: JSON.stringify({
             username: newUsername,
@@ -385,17 +416,18 @@ function saveUser() {
             days: parseFloat(days),
             traffic: parseFloat(traffic),
             monthly: parseFloat(monthly),
-            speed: parseFloat(speed)
+            speed: parseFloat(speed),
+            managed_egress: managedEgress !== managedSelect.dataset.original ? managedEgress : undefined
         })
     }).then(r => {
         if (r.success) {
             closeM();
             toast("用户 " + newUsername + " 已更新");
-            load();
+            return load();
         } else {
             toast(r.error || "更新失败", 1);
         }
-    });
+    }).catch(e => toast(e.message || "更新失败", 1));
 }
 
 // 2026-09-14：四个免鉴权订阅端点的路径末段是每用户的随机订阅 token，不再是用户名
@@ -427,6 +459,36 @@ function genUri(x) {
 
 // 当前显示的用户名 (用于下载订阅)
 let currentShowUser = null;
+
+// A failed refresh/rotation retracts the primary action until an authoritative list arrives.
+let managedRefreshPending = false;
+const MANAGED_HELP = "适用 Mac v2rayN 7.25.4 / 官方 sing-box 1.14.2；Android / iOS 未验收。将完整链接导入同一订阅组并更新，不要反复导入。首次 TUN 需本地提权，应用重启后重新启用 TUN 并授权。mixed 默认 10808；若改过 GUI 端口，请一次对齐。首次手动启用自动更新，建议 60 分钟，避免短周期轮询。更新可能 reload，内容相同或 ETag 相同也不保证不重启；服务端错误不保证客户端保留旧 profile。下载后的账户与路径变化受下次刷新及核心会话生命周期约束。四格仅代表当前服务路径证据，未验收能力保持拒绝；不代表 Mac 全捕获或物理 IPv6 防泄漏已验收。停止核心或 TUN 不是 OS kill-switch；Custom 不承诺 Clash 统计与节点测速。";
+function managedProfileUrl(x) {
+    if (!x || managedRefreshPending || !/^[0-9a-f]{32}$/.test(x.subToken || "") ||
+        x.disabled || x.blocked || x.managedProfile?.delivery !== "available") return "";
+    return "https://" + location.host + "/api/profile/" + encodeURIComponent(x.subToken) +
+        "/v2rayn-sb1142-macos?remarks=" + encodeURIComponent("BUI Managed macOS");
+}
+function renderManagedProfile(x) {
+    const profile = x?.managedProfile;
+    const messages = {missing_selection:"409：请管理员明确选择完整配置默认出口", account_unavailable:"403：账户不可用", route_unavailable:"503：当前出口暂不可用，保持原选择", available:"可获取配置"};
+    const url = managedProfileUrl(x);
+    $("#managed-copy").disabled = !url;
+    $("#managed-url").innerText = url;
+    $("#managed-status").innerText = managedRefreshPending ? "列表刷新失败或正在刷新，完整链接暂不可复制" :
+        !x ? "当前用户记录已不可用" : !/^[0-9a-f]{32}$/.test(x.subToken || "") ? SUB_TOKEN_MISSING :
+        (messages[profile?.delivery] || "完整配置状态不可用，请刷新列表") +
+        (profile?.revision ? " · revision " + profile.revision : "");
+    const labels = {unknown:"未验收", unsupported:"不支持", verified:"已验收"};
+    $("#managed-capabilities").innerText = [["v4Tcp","IPv4 TCP"],["v4Udp","IPv4 UDP"],["v6Tcp","IPv6 TCP"],["v6Udp","IPv6 UDP"]]
+        .map(([key,label]) => label + "：" + (labels[profile?.capabilities?.[key]] || "未验收")).join("；");
+    $("#managed-help").innerText = MANAGED_HELP;
+}
+function copyManagedProfile() {
+    const url = managedProfileUrl(currentShowUser);
+    if (!url) return toast("完整配置暂不可复制，请检查账户状态并刷新列表", 1);
+    return navigator.clipboard.writeText(url).then(() => toast("完整配置链接已复制，请导入同一订阅组"), () => toast("复制失败", 1));
+}
 
 // 本地生成二维码（vendored /qrcode.min.js）。替代以前把节点链接(含域名/uuid/密码)
 // 发给境外 api.qrserver.com 渲染——既泄露凭据给第三方，国内还常刷不出码。
@@ -461,9 +523,9 @@ function showU(uname) {
         renderQR(uri);
 
         $("#cfg-buttons").innerHTML = `
-            <button class="btn" onclick="copy()"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;margin-right:5px"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>复制订阅链接</button>
+            <button class="btn" onclick="copy()"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;margin-right:5px"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>复制仅节点订阅</button>
             <button class="btn btn-secondary" onclick="copyClash()"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;margin-right:5px"><path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/></svg>复制 Clash 订阅</button>
-            <button class="btn btn-secondary" onclick="downloadSubscription()"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;margin-right:5px"><line x1="16.5" y1="9.4" x2="7.5" y2="4.21"/><path d="M21 16V8a2 2 0 00-1-1.73l-7-4a2 2 0 00-2 0l-7 4A2 2 0 002 8v8a2 2 0 001 1.73l7 4a2 2 0 002 0l7-4A2 2 0 0021 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>下载 sing-box 配置</button>
+            <button class="btn btn-secondary" onclick="downloadSubscription()"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;margin-right:5px"><line x1="16.5" y1="9.4" x2="7.5" y2="4.21"/><path d="M21 16V8a2 2 0 00-1-1.73l-7-4a2 2 0 00-2 0l-7 4A2 2 0 002 8v8a2 2 0 001 1.73l7 4a2 2 0 002 0l7-4A2 2 0 0021 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>下载旧 sing-box 配置</button>
         `;
 
         // 提示
@@ -481,13 +543,16 @@ function showU(uname) {
         renderQR(uri);
 
         // 按钮 - 根据协议类型显示
-        let btnHtml = `<button class="btn" onclick="copy()"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;margin-right:5px"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>复制链接</button>`;
+        let btnHtml = `<button class="btn" onclick="copy()"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-1px;margin-right:5px"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>复制仅节点链接</button>`;
 
         $("#cfg-buttons").innerHTML = uri ? btnHtml : '';
         $("#cfg-hint").innerText = uri ? "扫码或复制链接导入客户端" :
             unavailable ? unavailable + '。' + _RESI_REQUIRED_HINT : SINGLE_NODE_UNAVAILABLE;
     }
 
+    $("#cfg-title").innerText = "服务端管理的完整配置";
+    $("#cfg-desc").innerText = "Mac v2rayN 7.25.4 / sing-box 1.14.2 · 复制完整链接后导入";
+    renderManagedProfile(x);
     openM("m-cfg");
 }
 
@@ -495,26 +560,37 @@ function showU(uname) {
 // 订阅链接末段的 token、hy2 密码与 vless uuid 三样都是可轮换的凭据，旧值复制或下载出去
 // 拿到的是 404（端点对作废 token 一律回「User not found」的不可区分口径），管理员不会
 // 收到任何提示。以前末段是用户名、永不变，所以「弹窗打开期间不刷新」是安全的。
-// 用户被删或改名不在这里处理：弹窗留着，下次手动打开即可。
+// 用户被删、改名或列表刷新失败时撤销动作，直到重新确认当前记录。
 function syncOpenConfig(users) {
     const old = currentShowUser;
-    if (!old || !$("#m-cfg").classList.contains("on")) return;
+    if (!old || !$("#m-cfg").classList.contains("on")) { managedRefreshPending = false; return; }
     const fresh = users.find(u => u.username === old.username);
-    if (!fresh) return;
+    if (!fresh) {
+        currentShowUser = null;
+        managedRefreshPending = false;
+        renderManagedProfile(null);
+        $("#uri").innerText = "当前用户记录已不可用";
+        $("#cfg-buttons").innerHTML = "";
+        renderQR("");
+        return;
+    }
+    const recovering = managedRefreshPending;
+    managedRefreshPending = false;
+    const managedChanged = JSON.stringify(fresh.managedProfile) !== JSON.stringify(old.managedProfile);
     const credentialsChanged = !["subToken", "password", "uuid"].every(k => fresh[k] === old[k]);
-    if (!credentialsChanged && fresh.nodeUri === old.nodeUri &&
-        fresh.residentialUnavailable === old.residentialUnavailable) return;
+    if (!recovering && !managedChanged && !credentialsChanged && fresh.nodeUri === old.nodeUri &&
+        fresh.residentialUnavailable === old.residentialUnavailable && fresh.blocked === old.blocked && fresh.disabled === old.disabled) return;
     showU(fresh.username);
     // 第二个参数选的是警告样式（橙色三角），这是有意的：管理员屏幕上那条链接刚刚作废，
     // 已经发给用户的旧链接也一起废了，不是一条可以扫过去的普通告知。
-    toast(credentialsChanged ? "该用户的订阅链接与凭据已被重置，弹窗已按新值刷新" : "该用户的连接配置或住宅出口状态已变化，弹窗已刷新", 1);
+    if (!recovering) toast(credentialsChanged ? "该用户的订阅链接与凭据已被重置，弹窗已按新值刷新" : "该用户的连接配置或出口状态已变化，弹窗已刷新", 1);
 }
 
 // Copy URI
 function copy() {
     // 没有选中用户就别把 #uri 里剩的那份文本递出去：轮换后它是已作废的链接，
     // 端点回 404，而管理员收到的是一句「已复制」。下面两个出口同一门禁。
-    if (!currentShowUser) return toast("请先选择用户", 1);
+    if (!currentShowUser || managedRefreshPending) return toast("请先选择用户并刷新列表", 1);
     const fusion = currentShowUser.protocol === "fusion";
     if (fusion && !currentShowUser.subToken) return toast(SUB_TOKEN_MISSING, 1);
     const uri = genUri(currentShowUser);
@@ -529,7 +605,7 @@ function copy() {
 
 // 下载 sing-box 融合订阅配置
 function downloadSubscription() {
-    if (!currentShowUser) return toast("请先选择用户", 1);
+    if (!currentShowUser || managedRefreshPending) return toast("请先选择用户并刷新列表", 1);
     const path = subPath(currentShowUser, "subscription");
     if (!path) return toast(SUB_TOKEN_MISSING, 1);
     window.open(path, "_blank");
@@ -538,7 +614,7 @@ function downloadSubscription() {
 
 // 复制 Clash Verge Rev 订阅链接
 function copyClash() {
-    if (!currentShowUser) return toast("请先选择用户", 1);
+    if (!currentShowUser || managedRefreshPending) return toast("请先选择用户并刷新列表", 1);
     const path = subPath(currentShowUser, "clash");
     if (!path) return toast(SUB_TOKEN_MISSING, 1);
     navigator.clipboard.writeText("https://" + location.host + path)
@@ -547,41 +623,37 @@ function copyClash() {
 }
 
 // 重置订阅链接与凭据（2026-09-14）：POST /api/users/{name}/rotate 同时换随机订阅 token、
-// hy2 密码与 vless uuid，并停用该用户的旧「用户名链接」。旧订阅与旧客户端立刻失效，
-// 所以要二次确认；成功后刷新用户列表，再按新 token 重画这个弹窗。
+// hy2 密码与 vless uuid，并停用该用户的旧「用户名链接」。需要二次确认；
+// 已有连接的关闭取决于服务端与核心生命周期。刷新列表后才能展示新凭据。
 function rotateSub() {
     const x = currentShowUser;
     if (!x) return toast("请先选择用户", 1);
     if (!confirm("重置用户 " + x.username + " 的订阅链接与凭据？\n\n" +
-        "旧订阅链接、旧 Hysteria2 密码与旧 VLESS UUID 立刻失效：该用户现有的客户端会断连，" +
-        "必须把新链接重新导入一次。\n\n" + _ROTATE_SWITCH)) return;
+        "将替换订阅链接、Hysteria2 密码与 VLESS UUID，旧链接将不可用于获取配置。" +
+        "请在原订阅组替换新链接并更新。已有连接的关闭取决于服务端与核心生命周期。\n\n" + _ROTATE_SWITCH)) return;
     const btn = document.getElementById("cfg-rotate");
     // 文案原文在 index.html 里，这里捕获一次再还原：硬编码一份的话，改了 HTML 忘了改
     // 这里，重置一次按钮就悄悄换回旧文案。
     const label = btn ? btn.textContent : "";
     const done = () => { if (btn) { btn.disabled = false; btn.textContent = label; } };
     if (btn) { btn.disabled = true; btn.textContent = "重置中…"; }
-    api("/users/" + encodeURIComponent(x.username) + "/rotate", { method: "POST", body: JSON.stringify({}) })
+    return api("/users/" + encodeURIComponent(x.username) + "/rotate", { method: "POST", body: JSON.stringify({}) })
         .then(r => {
             if (!r || !r.success) { done(); return toast((r && r.error) || "重置失败", 1); }
-            // 链接与二维码都来自 allUsers 里的面板投影，等列表刷新完再按新 token 重画。
-            // 先清掉 currentShowUser：本会话自己发起的这次变化不该再被 syncOpenConfig
-            // 当成「别人改的」弹第二条提示；这段空窗里点复制/下载都只会提示「请先选择
-            // 用户」（三个出口的门禁见上），不会把已作废的那份递出去。
-            currentShowUser = null;
-            return load().then(() => {
+            // Keep the username for a later authoritative poll, but revoke every link
+            // action immediately while the new token is not yet confirmed.
+            ++userListRequest; // Invalidate all polls started before credential revocation.
+            managedRefreshPending = true;
+            renderManagedProfile(x);
+            return load().then(updated => {
                 done();
+                if (!updated) return;
                 showU(x.username);
-                toast("已重置，请把新订阅链接重新导入客户端，并切换到新的住宅 HY2 节点");
+                toast("已重置，请在原订阅组替换新链接并更新配置");
             }, () => {
-                // 轮换已经生效，只是这一轮列表刷新没回来（网络抖动、/api/users 或
-                // /api/stats 500）。必须把 currentShowUser 还原回去：留着 null 的话
-                // syncOpenConfig 第一句就 return，5 秒一轮的自愈通道被自己关掉，弹窗
-                // 会永久停在那条已作废的链接上，再点「重置」也只会说「请先选择用户」。
-                // 还原后下一轮 load() 就能按新值把弹窗拉回来。
-                // 用 then 的第二参而不是链一个 .catch：后者会把 showU / toast 自己抛的
-                // 异常也当成「刷新失败」报出去。
-                currentShowUser = x;
+                // Keep actions disabled; the next successful poll can recover this record.
+                managedRefreshPending = true;
+                renderManagedProfile(x);
                 done();
                 toast("已重置，但这一轮用户列表没刷新成功：弹窗里的链接稍后自动更新", 1);
             });

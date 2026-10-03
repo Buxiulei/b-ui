@@ -140,8 +140,8 @@ async fn lookup(app: &AppState, shared: &Shared, seg: &str) -> Result<Delivery, 
 }
 
 /// One owned authorization snapshot. Deliberately no Debug/Serialize: nodes contain secrets.
-#[allow(dead_code)] // Task4 consumes this helper; no new endpoint is installed in Task2.
 pub(crate) struct ManagedDelivery {
+    #[allow(dead_code)] // Retained owned identity label for internal snapshot consumers.
     pub username: String,
     pub nodes: Vec<Node>,
     pub policy: bui_schema::managed::ManagedPolicy,
@@ -162,7 +162,6 @@ pub(crate) enum ManagedDeliveryFailure {
     Unavailable,
 }
 impl ManagedDeliveryFailure {
-    #[allow(dead_code)]
     pub(crate) fn response(self) -> Response {
         match self {
             Self::NotFound => not_found(),
@@ -195,7 +194,6 @@ fn valid_managed_evidence(policy: &bui_schema::managed::ManagedPolicy, now: i64)
         })
 }
 
-#[allow(dead_code)]
 pub(crate) async fn managed_delivery(
     app: &AppState,
     shared: &Shared,
@@ -265,7 +263,6 @@ pub(crate) async fn managed_delivery(
 
 /// Short fresh authorization check immediately before Task4 returns success. All guards drop
 /// before HTTP writes; this is not an atomic network fence or an existing-session revocation.
-#[allow(dead_code)]
 pub(crate) async fn validate_managed_delivery(
     app: &AppState,
     shared: &Shared,
@@ -424,12 +421,95 @@ async fn get_nodes(
         .into_response()
 }
 
+/// Native profile for the fixed, explicitly selected consumer. Query remarks is display-only.
+async fn get_managed_profile(
+    State(app): State<AppState>,
+    State(shared): State<Arc<Shared>>,
+    Path((seg, target)): Path<(String, String)>,
+) -> Response {
+    if target != "v2rayn-sb1142-macos" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"Unknown profile target"})),
+        )
+            .into_response();
+    }
+    // Legacy username grace belongs only to the old feeds, never to native credential JSON.
+    if !bui_schema::sub::is_sub_token(&seg) {
+        return not_found();
+    }
+    let delivery = match managed_delivery(&app, &shared, &seg).await {
+        Ok(delivery) => delivery,
+        Err(failure) => return failure.response(),
+    };
+    complete_profile_response(&app, &shared, &delivery, &target).await
+}
+
+async fn complete_profile_response(
+    app: &AppState,
+    shared: &Shared,
+    delivery: &ManagedDelivery,
+    target: &str,
+) -> Response {
+    use bui_schema::render::managed::{compile, ManagedRuntime};
+    let body = compile(
+        &delivery.policy,
+        &delivery.nodes,
+        &delivery.dial_ip,
+        &ManagedRuntime {
+            interface_name: String::new(),
+            mixed_port: 10808,
+            enable_tun: true,
+        },
+        app.host.now().unix_timestamp(),
+    );
+    let bytes = match serde_json::to_vec(&body) {
+        Ok(bytes) => bytes,
+        Err(_) => return ManagedDeliveryFailure::Unavailable.response(),
+    };
+    let etag = match delivery.stamp.semantic.profile_etag(
+        delivery.stamp.user_id,
+        target,
+        delivery.policy.revision,
+        &bytes,
+    ) {
+        Ok(etag) => etag,
+        Err(_) => return ManagedDeliveryFailure::Unavailable.response(),
+    };
+    // No Store locks survive compilation or response writes. Fresh revalidation cannot
+    // revoke existing client sessions or promise a transactional consumer reload.
+    if let Err(failure) = validate_managed_delivery(app, shared, delivery).await {
+        return failure.response();
+    }
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/json".to_owned()),
+            (header::CACHE_CONTROL, "private, no-store".to_owned()),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"bui-managed-macos.json\"".to_owned(),
+            ),
+            (header::ETAG, etag),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
 /// 四个端点都无鉴权（spec §4.3），挂在 `public_routes()` 里；末段的解析口径见 [`resolve`]。
 ///
 /// Shared accounting is required: unflushed traffic must revoke feed credentials too.
 pub fn public_routes(shared: Arc<Shared>) -> axum::Router<AppState> {
     use axum::routing::get;
     axum::Router::new()
+        .route(
+            "/api/profile/{seg}/{target}",
+            get({
+                let shared = shared.clone();
+                move |app, path| get_managed_profile(app, State(shared), path)
+            }),
+        )
         .route(
             "/api/sub/{seg}",
             get({
@@ -511,6 +591,264 @@ mod tests {
             ManagedDeliveryFailure::MissingSelection.response().status(),
             StatusCode::CONFLICT
         );
+    }
+
+    const PROFILE: &str = "/api/profile/0123456789abcdef0123456789abcdef/v2rayn-sb1142-macos";
+
+    #[tokio::test]
+    async fn complete_profile_native_fixed_mac_headers_and_stable_repeat() {
+        let h = managed_fixture().await;
+        let r = h.router();
+        let (status, headers, bytes) = raw(
+            &r,
+            "GET",
+            &format!("{PROFILE}?remarks=BUI%20Managed%20macOS"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers["content-type"], "application/json");
+        assert_eq!(headers["cache-control"], "private, no-store");
+        assert_eq!(
+            headers["content-disposition"],
+            "attachment; filename=\"bui-managed-macos.json\""
+        );
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(body.get("profile").is_none());
+        assert_eq!(body["route"]["final"], "managed-proxy");
+        assert_eq!(body["inbounds"][0]["listen_port"], 10808);
+        assert_eq!(body["inbounds"][1]["type"], "tun");
+        assert_eq!(body["inbounds"][1]["interface_name"], "");
+        assert_eq!(
+            body["inbounds"][1]["address"],
+            json!(["172.19.0.1/30", "fdfe:dcba:9876::1/126"])
+        );
+        assert_eq!(
+            body["outbounds"],
+            json!([{"type":"block","tag":"managed-proxy"}])
+        );
+        assert_eq!(
+            body["dns"]["rules"],
+            json!([{"action":"predefined","rcode":"REFUSED"}])
+        );
+        h.host.advance(3);
+        let (again, next_headers, next_bytes) = raw(&r, "GET", PROFILE, None, None).await;
+        assert_eq!(again, StatusCode::OK);
+        assert_eq!(bytes, next_bytes);
+        assert_eq!(headers["etag"], next_headers["etag"]);
+        assert!(!headers["etag"].to_str().unwrap().contains(TOK));
+    }
+
+    #[tokio::test]
+    async fn complete_profile_target_and_token_boundary_precede_account_details() {
+        let h = managed_fixture().await;
+        // Isolate credential admission from the legacy residential-outage refusal.
+        h.store
+            .update(|s| s.users[0].entitlements.residential = None)
+            .await
+            .unwrap();
+        open_grace(&h).await;
+        let r = h.router();
+        for segment in [
+            "alice",
+            "0123456789abcdef0123456789abcde",
+            "0123456789abcdef0123456789abcdef0",
+            "0123456789ABCDEF0123456789abcdef",
+            "gggggggggggggggggggggggggggggggg",
+            "ffffffffffffffffffffffffffffffff",
+        ] {
+            let (status, body) = send(
+                &r,
+                "GET",
+                &format!("/api/profile/{segment}/v2rayn-sb1142-macos"),
+                None,
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert!(body.get("inbounds").is_none());
+        }
+        let (status, _) = send(&r, "GET", "/api/profile/alice/android", None, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = send(&r, "GET", PROFILE, None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        // The existing generic helper and legacy feed retain the grace contract.
+        assert!(managed_delivery(&h.app, &h.shared, "alice").await.is_ok());
+        assert_eq!(text(&r, "/api/sub/alice").await.0, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn complete_profile_account_errors_never_return_native_fallback() {
+        for (reason, expected) in [
+            ("unset", StatusCode::CONFLICT),
+            ("disabled", StatusCode::FORBIDDEN),
+            ("residential", StatusCode::SERVICE_UNAVAILABLE),
+            ("key", StatusCode::SERVICE_UNAVAILABLE),
+            ("rotated", StatusCode::NOT_FOUND),
+        ] {
+            let h = managed_fixture().await;
+            h.store
+                .update(|s| match reason {
+                    "unset" => s.users[0].managed_egress = None,
+                    "disabled" => s.users[0].disabled = true,
+                    "residential" => {
+                        s.users[0].managed_egress =
+                            Some(bui_schema::managed::EgressIdentity::Residential)
+                    }
+                    "key" => s.admin.jwt_secret = "invalid".into(),
+                    _ => s.users[0].sub_token = Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
+                })
+                .await
+                .unwrap();
+            let (status, body) = send(&h.router(), "GET", PROFILE, None, None).await;
+            assert_eq!(status, expected, "{reason}");
+            assert!(body.get("inbounds").is_none());
+            assert!(body.get("outbounds").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_profile_etag_isolates_accounts_even_for_identical_closed_body() {
+        let h = managed_fixture().await;
+        h.store
+            .update(|s| {
+                let mut bob = s.users[0].clone();
+                bob.username = "bob".into();
+                bob.user_id = uuid::Uuid::from_u128(999);
+                bob.sub_token = Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into());
+                s.users.push(bob);
+            })
+            .await
+            .unwrap();
+        let r = h.router();
+        let (a, ah, ab) = raw(&r, "GET", PROFILE, None, None).await;
+        let (b, bh, bb) = raw(
+            &r,
+            "GET",
+            "/api/profile/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/v2rayn-sb1142-macos",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!((a, b), (StatusCode::OK, StatusCode::OK));
+        assert_eq!(ab, bb);
+        assert_ne!(ah["etag"], bh["etag"]);
+    }
+
+    #[tokio::test]
+    async fn complete_profile_waits_for_publication_and_observes_revocation() {
+        let h = managed_fixture().await;
+        let r = h.router();
+        let gate = h.shared.gate_guard().await;
+        let request = tokio::spawn(async move { send(&r, "GET", PROFILE, None, None).await });
+        tokio::task::yield_now().await;
+        assert!(
+            !request.is_finished(),
+            "complete feed bypassed accounting fence"
+        );
+        h.store
+            .update(|s| s.users[0].disabled = true)
+            .await
+            .unwrap();
+        drop(gate);
+        let (status, body) = request.await.unwrap();
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.get("inbounds").is_none());
+    }
+
+    #[tokio::test]
+    async fn complete_profile_presend_revalidates_original_token_selection_and_pending_budget() {
+        for reason in ["token", "selection", "pending"] {
+            let h = managed_fixture().await;
+            if reason == "pending" {
+                h.store
+                    .update(|s| s.users[0].entitlements.traffic_limit.total_bytes = Some(1))
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                send(&h.router(), "GET", PROFILE, None, None).await.0,
+                StatusCode::OK
+            );
+            let delivery = managed_delivery(&h.app, &h.shared, TOK).await.ok().unwrap();
+            let expected = match reason {
+                "token" => {
+                    h.store
+                        .update(|s| {
+                            s.users[0].sub_token = Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into())
+                        })
+                        .await
+                        .unwrap();
+                    StatusCode::NOT_FOUND
+                }
+                "selection" => {
+                    h.store
+                        .update(|s| s.users[0].managed_egress = None)
+                        .await
+                        .unwrap();
+                    StatusCode::CONFLICT
+                }
+                _ => {
+                    let id = h.store.read().await.users[0].user_id;
+                    h.shared
+                        .pending()
+                        .await
+                        .insert(id, super::super::TxRx { tx: 1, rx: 0 });
+                    StatusCode::FORBIDDEN
+                }
+            };
+            let response =
+                complete_profile_response(&h.app, &h.shared, &delivery, "v2rayn-sb1142-macos")
+                    .await;
+            assert_eq!(response.status(), expected);
+            let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            assert!(!String::from_utf8_lossy(&bytes).contains("inbounds"));
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_profile_repeat_after_proof_expiry_never_serves_cached_success() {
+        use bui_schema::managed::{Evidence, EvidenceStatus};
+        let h = managed_fixture().await;
+        let now = h.app.host.now().unix_timestamp();
+        let state = h.store.read().await;
+        let path = bui_schema::managed_binding::path_fingerprint(&state, &state.users[0]).unwrap();
+        h.store
+            .update(|s| {
+                s.managed_egress_capabilities
+                    .entry(path.clone())
+                    .or_default()
+                    .v4_tcp = EvidenceStatus::Verified(Evidence {
+                    path_fingerprint: path.clone(),
+                    observed_at: now,
+                    expires_at: now + 1,
+                    observed_identity: "fixture-only".into(),
+                })
+            })
+            .await
+            .unwrap();
+        let r = h.router();
+        let (status, body) = send(&r, "GET", PROFILE, None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o["type"] == "selector"));
+        let delivery = managed_delivery(&h.app, &h.shared, TOK).await.ok().unwrap();
+        h.host.advance(1);
+        assert_eq!(
+            complete_profile_response(&h.app, &h.shared, &delivery, "v2rayn-sb1142-macos")
+                .await
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let (status, body) = send(&r, "GET", PROFILE, None, None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.get("inbounds").is_none());
     }
 
     async fn managed_fixture() -> Harness {

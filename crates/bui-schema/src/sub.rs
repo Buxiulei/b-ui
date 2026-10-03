@@ -70,6 +70,12 @@ pub fn sub_urls(domain: &str, token: &str) -> SubUrls {
     }
 }
 
+/// Native managed feed. Only canonical random-token syntax is accepted; display remarks
+/// is fixed and nonsecret, and never participates in server authorization.
+pub fn managed_profile_url(domain: &str, token: &str) -> Option<String> {
+    is_sub_token(token).then(|| format!("https://{domain}/api/profile/{token}/v2rayn-sb1142-macos?remarks=BUI%20Managed%20macOS"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,5 +132,16 @@ mod tests {
                 nodes: "https://example.com/api/nodes/0123456789abcdef0123456789abcdef".into(),
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod managed_url_tests {
+    #[test]
+    fn complete_profile_url_fixed_target_encoded_remarks_and_no_alias_fallback() {
+        assert_eq!(super::managed_profile_url("panel.example:8443", "0123456789abcdef0123456789abcdef").as_deref(), Some("https://panel.example:8443/api/profile/0123456789abcdef0123456789abcdef/v2rayn-sb1142-macos?remarks=BUI%20Managed%20macOS"));
+        for token in ["", "alice", "token /%", "0123456789ABCDEF0123456789abcdef"] {
+            assert!(super::managed_profile_url("panel.example", token).is_none());
+        }
     }
 }

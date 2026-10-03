@@ -24,12 +24,13 @@ pub fn url_credentials(s: &str) -> String {
     }
 }
 
-/// 四个免鉴权订阅端点的路径前缀。末段就在它们后面，见 [`sub_path`]。
-const SUB_PREFIXES: [&str; 4] = [
+/// 免管理员鉴权订阅端点的路径前缀。凭据段就在它们后面，见 [`sub_path`]。
+const SUB_PREFIXES: [&str; 5] = [
     "/api/sub/",
     "/api/subscription/",
     "/api/clash/",
     "/api/nodes/",
+    "/api/profile/",
 ];
 
 /// 路径末段里还算「同一段」的字节（用户名允许字母/数字/中文/`_`/`-`/`.`，token 是十六进制，
@@ -40,7 +41,7 @@ fn is_segment_byte(b: u8) -> bool {
         || b >= 0x80
 }
 
-/// 把 `/api/{sub,subscription,clash,nodes}/<段>` 里的 `<段>` 换成 `***`。
+/// 把 `/api/{sub,subscription,clash,nodes,profile}/<段>` 里的 `<段>` 换成 `***`。
 ///
 /// 那四个端点**免鉴权**、响应体里就是 hy2 明文密码与 vless uuid，所以路径末段本身就是凭据
 /// （随机订阅 token，或宽限期内的用户名）。整条 URI 进日志之前必须过这里：`TraceLayer` 的
@@ -232,5 +233,19 @@ mod tests {
         );
         assert!(out.contains("***:***@isp3.example.net:10007"), "{out}");
         assert_eq!(line("plain text, no creds"), "plain text, no creds");
+    }
+}
+
+#[cfg(test)]
+mod managed_profile_tests {
+    #[test]
+    fn complete_profile_uri_hides_token_and_keeps_nonsecret_target() {
+        assert_eq!(super::sub_path("GET /api/profile/0123456789abcdef0123456789abcdef/v2rayn-sb1142-macos?remarks=BUI%20Managed%20macOS"), "GET /api/profile/***/v2rayn-sb1142-macos?remarks=BUI%20Managed%20macOS");
+        assert_eq!(
+            super::sub_path(
+                "https://panel.example/API/PROFILE/encoded%2Ftoken/v2rayn-sb1142-macos"
+            ),
+            "https://panel.example/API/PROFILE/***/v2rayn-sb1142-macos"
+        );
     }
 }

@@ -256,6 +256,35 @@ fn desired_semantics(state: &State, user: &User, identity: EgressIdentity) -> Va
 #[derive(Clone, PartialEq, Eq)]
 pub struct SemanticStamp(String);
 
+impl SemanticStamp {
+    /// ETag over actual response bytes, scoped to one account/target/revision.
+    /// The existing private semantic HMAC is a pseudorandom derived key; a distinct
+    /// domain and length-delimited inputs prevent reuse as a semantic/path MAC.
+    /// Neither its bytes nor the installation JWT key are exposed to the caller.
+    pub fn profile_etag(
+        &self,
+        account: uuid::Uuid,
+        target: &str,
+        revision: u64,
+        body: &[u8],
+    ) -> Result<String, BindingError> {
+        if self.0.len() != 64 {
+            return Err(BindingError::Unavailable);
+        }
+        let derived_key = hex::decode(&self.0).map_err(|_| BindingError::Unavailable)?;
+        let mut mac =
+            Hmac::<Sha256>::new_from_slice(&derived_key).map_err(|_| BindingError::Unavailable)?;
+        mac.update(b"bui-managed-profile-etag-v1\0");
+        mac.update(account.as_bytes());
+        mac.update(&revision.to_be_bytes());
+        mac.update(&(target.len() as u64).to_be_bytes());
+        mac.update(target.as_bytes());
+        mac.update(&(body.len() as u64).to_be_bytes());
+        mac.update(body);
+        Ok(format!("\"{}\"", hex::encode(mac.finalize().into_bytes())))
+    }
+}
+
 pub fn semantic_stamp(state: &State, user: &User) -> Result<SemanticStamp, BindingError> {
     let Some(identity) = user.managed_egress else {
         return Ok(SemanticStamp("unset".into()));
@@ -324,4 +353,38 @@ pub fn reconcile_revisions(old: &State, next: &mut State) -> Result<(), BindingE
         user.managed_profile_revision = revision;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod profile_etag_tests {
+    use super::*;
+
+    #[test]
+    fn profile_etag_scopes_body_account_revision_target_and_derived_key() {
+        let stamp = SemanticStamp("01".repeat(32));
+        let id = uuid::Uuid::from_u128(1);
+        let base = stamp
+            .profile_etag(id, "v2rayn-sb1142-macos", 1, b"{}")
+            .unwrap();
+        assert_eq!(
+            base,
+            stamp
+                .profile_etag(id, "v2rayn-sb1142-macos", 1, b"{}")
+                .unwrap()
+        );
+        for changed in [
+            stamp.profile_etag(uuid::Uuid::from_u128(2), "v2rayn-sb1142-macos", 1, b"{}"),
+            stamp.profile_etag(id, "other", 1, b"{}"),
+            stamp.profile_etag(id, "v2rayn-sb1142-macos", 2, b"{}"),
+            stamp.profile_etag(id, "v2rayn-sb1142-macos", 1, b"{ }"),
+            SemanticStamp("02".repeat(32)).profile_etag(id, "v2rayn-sb1142-macos", 1, b"{}"),
+        ] {
+            assert_ne!(base, changed.unwrap());
+        }
+        for invalid in ["unset", "invalid-key:Vps", "zz", "aa"] {
+            assert!(SemanticStamp(invalid.into())
+                .profile_etag(id, "v2rayn-sb1142-macos", 1, b"{}")
+                .is_err());
+        }
+    }
 }

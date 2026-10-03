@@ -96,6 +96,8 @@ pub struct PanelUser {
     pub hy2_resi_gate: Option<String>,
     pub disabled: bool,
     pub blocked: bool,
+    #[serde(rename = "managedProfile", skip_serializing_if = "Option::is_none")]
+    pub managed_profile: Option<ManagedProfileView>,
 }
 
 /// v3 的 `protocol` 字段，映射方向与 `bui_schema::v3::import` 相反（spec §4.1）。
@@ -216,6 +218,7 @@ pub fn project(
         hy2_resi_gate,
         disabled: u.disabled,
         blocked: u.disabled || blocked.contains(&u.user_id),
+        managed_profile: None,
     }
 }
 
@@ -227,6 +230,112 @@ pub fn project_all(state: &State, blocked: &BTreeSet<Uuid>) -> Vec<PanelUser> {
         .iter()
         .map(|u| project(u, &state.node, &state.residential, blocked, &gates))
         .collect()
+}
+
+/// Sanitized display projection only; never serialized policy/proof/path or admission input.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedProfileView {
+    selected_egress: Option<bui_schema::managed::EgressIdentity>,
+    allowed_choices: Vec<bui_schema::managed::EgressIdentity>,
+    revision: Option<u64>,
+    delivery: &'static str,
+    capabilities: ManagedCapabilityView,
+}
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagedCapabilityView {
+    v4_tcp: &'static str,
+    v4_udp: &'static str,
+    v6_tcp: &'static str,
+    v6_udp: &'static str,
+}
+
+pub fn project_managed_all(
+    state: &State,
+    blocked: &BTreeSet<Uuid>,
+    now: OffsetDateTime,
+) -> Vec<PanelUser> {
+    let mut rows = project_all(state, blocked);
+    for (row, user) in rows.iter_mut().zip(&state.users) {
+        row.managed_profile = Some(managed_profile_view(
+            state,
+            user,
+            blocked,
+            now.unix_timestamp(),
+        ));
+    }
+    rows
+}
+
+fn managed_profile_view(
+    state: &State,
+    user: &User,
+    blocked: &BTreeSet<Uuid>,
+    now: i64,
+) -> ManagedProfileView {
+    use bui_schema::managed::{allows, EgressIdentity, EvidenceStatus};
+    use bui_schema::managed_binding::{path_fingerprint, selection_granted, semantic_stamp};
+    let allowed_choices = [EgressIdentity::Vps, EgressIdentity::Residential]
+        .into_iter()
+        .filter(|identity| selection_granted(user, state, *identity))
+        .collect::<Vec<_>>();
+    let path = path_fingerprint(state, user).ok();
+    let caps = path
+        .as_ref()
+        .and_then(|p| state.managed_egress_capabilities.get(p))
+        .cloned()
+        .unwrap_or_default();
+    let statuses = [&caps.v4_tcp, &caps.v4_udp, &caps.v6_tcp, &caps.v6_udp];
+    let display = statuses.map(|status| match status {
+        EvidenceStatus::Unsupported => "unsupported",
+        EvidenceStatus::Verified(_) if path.as_ref().is_some_and(|p| allows(status, p, now)) => {
+            "verified"
+        }
+        _ => "unknown",
+    });
+    let invalid_proof = statuses.iter().any(|status| {
+        matches!(status, EvidenceStatus::Verified(_))
+            && !path.as_ref().is_some_and(|p| allows(status, p, now))
+    });
+    let revision = user.managed_profile_revision.filter(|r| *r > 0);
+    let delivery = if user.disabled || blocked.contains(&user.user_id) {
+        "account_unavailable"
+    } else if state
+        .users
+        .iter()
+        .filter(|u| u.user_id == user.user_id)
+        .count()
+        != 1
+    {
+        "route_unavailable"
+    } else if let Some(identity) = user.managed_egress {
+        if !allowed_choices.contains(&identity) {
+            "account_unavailable"
+        } else if path.is_none()
+            || revision.is_none()
+            || invalid_proof
+            || semantic_stamp(state, user).is_err()
+        {
+            "route_unavailable"
+        } else {
+            "available"
+        }
+    } else {
+        "missing_selection"
+    };
+    ManagedProfileView {
+        selected_egress: user.managed_egress,
+        allowed_choices,
+        revision,
+        delivery,
+        capabilities: ManagedCapabilityView {
+            v4_tcp: display[0],
+            v4_udp: display[1],
+            v6_tcp: display[2],
+            v6_udp: display[3],
+        },
+    }
 }
 
 /// 移植 `web/server.js:246-251`。正则 `^[\p{L}\p{N}_\-.]+$` 用 `char::is_alphanumeric`
