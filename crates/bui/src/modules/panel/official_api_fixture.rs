@@ -102,6 +102,101 @@ mod ledger {
     }
 }
 
+// A target receipt is a separate oracle, never an API-provided identity repair.
+mod classification {
+    use std::collections::BTreeMap;
+    pub struct Decision {
+        pub accounting_complete: bool,
+        pub gap_detected: bool,
+        pub per_user_mismatch: bool,
+        pub aggregate_gap: bool,
+    }
+    pub fn classify(
+        delivery_verified: bool,
+        stable_fence: bool,
+        ledger_gap: bool,
+        discontinuity: bool,
+        aggregate: Option<(u64, u64)>,
+        ledger: &BTreeMap<String, (u64, u64)>,
+        receipts: &BTreeMap<String, (u64, u64)>,
+    ) -> Decision {
+        let sum = ledger.values().fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+        let aggregate_gap = stable_fence && !discontinuity && aggregate != Some(sum);
+        let per_user_mismatch = delivery_verified && stable_fence && ledger != receipts;
+        let gap_detected = ledger_gap || discontinuity || aggregate_gap || per_user_mismatch;
+        Decision {
+            accounting_complete: delivery_verified
+                && stable_fence
+                && !gap_detected
+                && ledger == receipts,
+            gap_detected,
+            per_user_mismatch,
+            aggregate_gap,
+        }
+    }
+    #[test]
+    fn balanced_instance_total_does_not_hide_wrong_user_attribution() {
+        let receipts = BTreeMap::from([("alice".into(), (100, 10)), ("bob".into(), (200, 20))]);
+        let ledger = BTreeMap::from([("alice".into(), (150, 15)), ("bob".into(), (150, 15))]);
+        let d = classify(
+            true,
+            true,
+            false,
+            false,
+            Some((300, 30)),
+            &ledger,
+            &receipts,
+        );
+        assert!(d.gap_detected);
+        assert!(d.per_user_mismatch);
+        assert!(!d.aggregate_gap);
+        assert!(!d.accounting_complete);
+    }
+    #[test]
+    fn absent_delivery_or_fence_cannot_prove_user_misattribution() {
+        let receipts = BTreeMap::from([("alice".into(), (100, 10))]);
+        let ledger = BTreeMap::from([("bob".into(), (100, 10))]);
+        for (delivery, fence) in [(false, true), (true, false), (false, false)] {
+            let d = classify(
+                delivery,
+                fence,
+                false,
+                false,
+                Some((100, 10)),
+                &ledger,
+                &receipts,
+            );
+            assert!(!d.accounting_complete);
+            assert!(!d.gap_detected);
+            assert!(!d.per_user_mismatch);
+        }
+    }
+    #[test]
+    fn complete_receipts_and_fenced_api_agreement_can_pass() {
+        let receipts = BTreeMap::from([("alice".into(), (100, 10)), ("bob".into(), (200, 20))]);
+        let ledger = BTreeMap::from([("alice".into(), (100, 10)), ("bob".into(), (200, 20))]);
+        let d = classify(
+            true,
+            true,
+            false,
+            false,
+            Some((300, 30)),
+            &ledger,
+            &receipts,
+        );
+        assert!(d.accounting_complete);
+        assert!(!d.gap_detected);
+    }
+    #[test]
+    fn known_discontinuity_remains_uncertain_without_delivery_or_fence() {
+        let empty = BTreeMap::new();
+        let d = classify(false, false, false, true, None, &empty, &empty);
+        assert!(d.gap_detected);
+        assert!(!d.accounting_complete);
+        assert!(!d.per_user_mismatch);
+    }
+}
+
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -354,25 +449,7 @@ async fn transfer(
     } else {
         let (_control, relay) = socks(proxy, user, "127.0.0.1:0".parse()?, true).await?;
         let socket = UdpSocket::bind("127.0.0.1:0").await?;
-        let mut packet = vec![0, 0, 0];
-        packet.extend(socks_address(target));
-        packet.extend(data);
-        socket.send_to(&packet, relay).await?;
-        let mut response = vec![0; 65536];
-        let (n, _) = socket.recv_from(&mut response).await?;
-        ensure!(
-            n >= 4 && response[..3] == [0, 0, 0],
-            "invalid UDP relay response"
-        );
-        let offset = match response[3] {
-            1 => 10,
-            4 => 22,
-            _ => bail!("unsupported relay response"),
-        };
-        ensure!(
-            n >= offset && digest(&response[offset..n]) == digest(data),
-            "UDP target byte/hash mismatch"
-        );
+        udp_exchange(&socket, relay, target, data).await?;
     }
     Ok(())
 }
@@ -419,43 +496,160 @@ async fn bounded_transfer(
 struct Kernel {
     child: Child,
     pid: u32,
+    command: &'static str,
+    reaped: bool,
+    exit_code: Option<i32>,
+    cleanup_error: Option<String>,
 }
 impl Kernel {
-    async fn start(binary: &Path, config: &Path, log: &Path) -> Result<Self> {
-        let check = Command::new(binary)
+    // Synchronous spawn+registration callers must not await between these operations.
+    fn spawn(mut command: Command, label: &'static str) -> Result<Self> {
+        let child = command.kill_on_drop(true).spawn()?;
+        let pid = child
+            .id()
+            .expect("newly spawned child has a PID before wait");
+        Ok(Self {
+            child,
+            pid,
+            command: label,
+            reaped: false,
+            exit_code: None,
+            cleanup_error: None,
+        })
+    }
+    fn record_exit(&mut self, status: std::process::ExitStatus) {
+        self.reaped = true;
+        self.exit_code = status.code();
+    }
+    async fn start(binary: &Path, config: &Path, log: &Path, owners: &mut Vec<Self>) -> Result<()> {
+        let check_log = log.with_extension("check.log");
+        let check_output = std::fs::File::create(&check_log)?;
+        let mut check = Command::new(binary);
+        check
             .args(["check", "-c"])
             .arg(config)
-            .output()
-            .await?;
+            .stdout(check_output.try_clone()?)
+            .stderr(check_output);
+        let status = owned_command(owners, check, "check", Duration::from_secs(3)).await?;
         ensure!(
-            check.status.success(),
+            status.success(),
             "official check failed: {}",
-            String::from_utf8_lossy(&check.stderr)
+            std::fs::read_to_string(&check_log)?
         );
         let out = std::fs::File::create(log)?;
-        let child = Command::new(binary)
-            .args(["run", "-c"])
+        let mut run = Command::new(binary);
+        run.args(["run", "-c"])
             .arg(config)
             .stdout(out.try_clone()?)
-            .stderr(out)
-            .kill_on_drop(true)
-            .spawn()?;
-        let pid = child.id().context("missing child PID")?;
-        Ok(Self { child, pid })
+            .stderr(out);
+        owners.push(Self::spawn(run, "run")?);
+        Ok(())
     }
     async fn stop(&mut self) -> Result<()> {
-        if self.child.try_wait()?.is_none() {
-            self.child.start_kill()?;
+        if let Some(status) = self.child.try_wait()? {
+            self.record_exit(status);
+            return Ok(());
         }
-        tokio::time::timeout(Duration::from_secs(3), self.child.wait()).await??;
+        self.child.start_kill()?;
+        let status = tokio::time::timeout(Duration::from_secs(3), self.child.wait()).await??;
+        self.record_exit(status);
         Ok(())
+    }
+    fn evidence(&self) -> Value {
+        json!({"pid":self.pid,"command":self.command,"reaped":self.reaped,"exit_code":self.exit_code,"cleanup_error":self.cleanup_error})
     }
 }
 impl Drop for Kernel {
     fn drop(&mut self) {
+        // Last-resort cancellation safety. No proof says reaped until a real wait completes.
         let _ = self.child.start_kill();
     }
 }
+async fn owned_command(
+    owners: &mut Vec<Kernel>,
+    command: Command,
+    label: &'static str,
+    limit: Duration,
+) -> Result<std::process::ExitStatus> {
+    owners.push(Kernel::spawn(command, label)?);
+    let owner = owners.last_mut().unwrap();
+    // The outer owner collection survives cancellation of this future.
+    match tokio::time::timeout(limit, owner.child.wait()).await {
+        Ok(result) => {
+            let status = result?;
+            owner.record_exit(status);
+            Ok(status)
+        }
+        Err(_) => {
+            owner.stop().await.context("reap timed-out command")?;
+            bail!("{label} command timed out after {}ms", limit.as_millis());
+        }
+    }
+}
+async fn reap_children(owners: &mut [Kernel]) -> bool {
+    let mut success = true;
+    for owner in owners {
+        if let Err(error) = owner.stop().await {
+            owner.cleanup_error = Some(format!("{error:#}"));
+            success = false;
+        }
+        success &= owner.reaped;
+    }
+    success
+}
+// Non-network lifecycle tests use a direct executable, never a shell/forked grandchild.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn cancelled_check_remains_owned_and_is_reaped() {
+    let mut owners = Vec::new();
+    let mut command = Command::new("/bin/sleep");
+    command.arg("60");
+    let cancelled = tokio::time::timeout(
+        Duration::from_millis(30),
+        owned_command(&mut owners, command, "check", Duration::from_secs(60)),
+    )
+    .await;
+    assert!(cancelled.is_err(), "outer cancellation branch must execute");
+    assert_eq!(owners.len(), 1, "child must be owned before first await");
+    let pid = owners[0].pid;
+    assert!(reap_children(&mut owners).await);
+    assert_eq!(owners[0].evidence()["reaped"], true);
+    assert!(owners[0].child.try_wait().unwrap().is_some());
+    assert!(
+        !Path::new(&format!("/proc/{pid}")).exists(),
+        "cancelled check child escaped reaping"
+    );
+}
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn timed_out_version_remains_owned_and_is_reaped() {
+    let mut owners = Vec::new();
+    let mut command = Command::new("/bin/sleep");
+    command.arg("60");
+    let result = owned_command(&mut owners, command, "version", Duration::from_millis(30)).await;
+    assert!(result.is_err(), "bounded wait must report timeout");
+    assert_eq!(owners.len(), 1);
+    let pid = owners[0].pid;
+    let reaped_before_return = owners[0].reaped;
+    let absent_before_cleanup = !Path::new(&format!("/proc/{pid}")).exists();
+    // Always do safety cleanup before asserting the pre-cleanup observations.
+    assert!(reap_children(&mut owners).await);
+    assert!(
+        reaped_before_return,
+        "timeout returned before its child was reaped"
+    );
+    assert!(
+        absent_before_cleanup,
+        "timeout returned with a live/zombie child"
+    );
+    assert_eq!(owners[0].evidence()["reaped"], true);
+    assert!(owners[0].child.try_wait().unwrap().is_some());
+    assert!(
+        !Path::new(&format!("/proc/{pid}")).exists(),
+        "timed-out version child escaped reaping"
+    );
+}
+
 type Client = StartedServiceClient<Channel>;
 async fn connect(port: u16) -> Result<Client> {
     for _ in 0..100 {
@@ -720,14 +914,9 @@ impl CaseRuntime<'_> {
             Ok(value) => value,
             Err(error) => Err(anyhow::anyhow!("case deadline elapsed: {error}")),
         };
-        let mut reaped = true;
-        let mut pids = Vec::new();
-        for kernel in &mut kernels {
-            pids.push(kernel.pid);
-            if kernel.stop().await.is_err() {
-                reaped = false;
-            }
-        }
+        let reaped = reap_children(&mut kernels).await;
+        let pids = kernels.iter().map(|child| child.pid).collect::<Vec<_>>();
+        let children = kernels.iter().map(Kernel::evidence).collect::<Vec<_>>();
         targets.stop().await;
         let mut value = match result {
             Ok(v) => v,
@@ -737,6 +926,7 @@ impl CaseRuntime<'_> {
         };
         value["children_reaped"] = json!(reaped);
         value["pids"] = json!(pids);
+        value["children"] = json!(children);
         value["receipts"] = json!(targets
             .receipts
             .lock()
@@ -760,14 +950,13 @@ impl CaseRuntime<'_> {
             &config_path,
             serde_json::to_vec_pretty(&config(api_port, proxy))?,
         )?;
-        kernels.push(
-            Kernel::start(
-                self.binary,
-                &config_path,
-                &self.dir.join(format!("{}.log", self.name)),
-            )
-            .await?,
-        );
+        Kernel::start(
+            self.binary,
+            &config_path,
+            &self.dir.join(format!("{}.log", self.name)),
+            kernels,
+        )
+        .await?;
         let mut client = connect(api_port).await?;
         let epoch = client
             .get_started_at(request(()))
@@ -911,9 +1100,13 @@ impl CaseRuntime<'_> {
             bounded_transfer(proxy, "bob", targets.endpoints["tcp4"], "tcp", &data).await?;
             expected.insert(digest(&data), data.len());
             kernels.last_mut().unwrap().stop().await?;
-            kernels.push(
-                Kernel::start(self.binary, &config_path, &self.dir.join("restarted.log")).await?,
-            );
+            Kernel::start(
+                self.binary,
+                &config_path,
+                &self.dir.join("restarted.log"),
+                kernels,
+            )
+            .await?;
             client = connect(api_port).await?;
             let restarted = client
                 .get_started_at(request(()))
@@ -970,13 +1163,6 @@ impl CaseRuntime<'_> {
                 l.seen.len(),
             )
         };
-        let ledger_sum = ledger_totals
-            .values()
-            .fold((0u64, 0u64), |a, b| (a.0 + b.0, a.1 + b.1));
-        let aggregate_gap = fence && !discontinuity && aggregate != Some(ledger_sum);
-        if aggregate_gap {
-            gap_reason="stable same-generation API total differs from attributed ledger; no redistribution".into();
-        }
         let mut delivery = {
             let actual = targets.receipts.lock().unwrap();
             actual.len() == expected.len()
@@ -987,13 +1173,24 @@ impl CaseRuntime<'_> {
                 })
         };
         let expected_totals = targets.totals();
-        let accounting = delivery
-            && fence
-            && !discontinuity
-            && !ledger_gap
-            && !aggregate_gap
-            && ledger_totals == expected_totals;
-        let gap = ledger_gap || aggregate_gap || discontinuity;
+        let decision = classification::classify(
+            delivery,
+            fence,
+            ledger_gap,
+            discontinuity,
+            aggregate,
+            &ledger_totals,
+            &expected_totals,
+        );
+        let accounting = decision.accounting_complete;
+        let gap = decision.gap_detected;
+        let aggregate_gap = decision.aggregate_gap;
+        if aggregate_gap {
+            gap_reason = "stable same-generation API total differs from attributed ledger; no redistribution".into();
+        }
+        if decision.per_user_mismatch && !aggregate_gap && !discontinuity && !ledger_gap {
+            gap_reason = "fixture target receipts prove per-user attribution mismatch despite equal aggregate; no API-visible detector claimed".into();
+        }
         // Keep the existing deny state. These probes occur after the observer has evidence of
         // uncertainty, not merely after an RPC acknowledgement or before gap discovery.
         let post_gap = if gap {
@@ -1013,7 +1210,8 @@ impl CaseRuntime<'_> {
         delivery &= targets.receipts.lock().unwrap().len() == expected.len();
         Ok(
             json!({"name":self.name,"executed":true,"branch_entered":true,"phase":"complete","delivery_verified":delivery,"accounting_complete":accounting,
-                "gap_detected":gap,"gap_reason":gap_reason,"actual_gate_denied":denied,"existing_tcp_flows_terminated":old_terminated,"existing_udp_sessions_terminated":old_udp_terminated,
+                "gap_detected":gap,"gap_reason":gap_reason,
+                "receipt_per_user_mismatch":decision.per_user_mismatch,"production_visible_gap_signal":ledger_gap || aggregate_gap || discontinuity,"actual_gate_denied":denied,"existing_tcp_flows_terminated":old_terminated,"existing_udp_sessions_terminated":old_udp_terminated,
                 "denial_probes":denial_probes,
                 "post_gap_denial_verified":post_gap.as_ref().map(|proof|proof.denied),
                 "post_gap_denial_probes":post_gap.as_ref().map(|proof|proof.probes),
@@ -1049,6 +1247,42 @@ async fn official_api_g0() {
     assert!(result.is_ok(), "G0 fixture failed: {result:?}");
 }
 async fn run_fixture() -> Result<()> {
+    let output = PathBuf::from(std::env::var("BUI_G0_RESULT").context("BUI_G0_RESULT required")?);
+    let mut preflight = Vec::new();
+    let attempt = run_fixture_inner(&mut preflight).await;
+    let preflight_reaped = reap_children(&mut preflight).await;
+    let mut report = match attempt {
+        Ok(report) => report,
+        Err(error) => {
+            json!({"required_cases":REQUIRED,"attempted_cases":[],"executed_cases":[],"zero_case_skips":REQUIRED.len(),
+            "identity_attribution_complete":false,"children_reaped":true,"cases":[],"gap_detected":false,"actual_gate_denied":false,
+            "failure_kind":"fixture_infrastructure","migration_gate":"FAIL","error":format!("{error:#}"),
+            "provenance":{"fixture_pid":std::process::id(),"official_archive_verified":false}})
+        }
+    };
+    report["preflight_children"] =
+        json!(preflight.iter().map(Kernel::evidence).collect::<Vec<_>>());
+    let children_reaped = preflight_reaped && report["children_reaped"] == true;
+    report["children_reaped"] = json!(children_reaped);
+    if !children_reaped {
+        report["migration_gate"] = json!("FAIL");
+    }
+    std::fs::write(&output, serde_json::to_vec_pretty(&report)?)?;
+    println!("G0_RESULT {}", output.display());
+    ensure!(children_reaped, "G0 child cleanup failed");
+    ensure!(
+        report["executed_cases"]
+            .as_array()
+            .is_some_and(|cases| cases.len() == REQUIRED.len()),
+        "G0 fixture infrastructure/partial-case failure; no upstream accounting conclusion"
+    );
+    ensure!(
+        report["identity_attribution_complete"] == true,
+        "official API cannot establish complete attribution for every required case; see G0 JSON"
+    );
+    Ok(())
+}
+async fn run_fixture_inner(preflight: &mut Vec<Kernel>) -> Result<Value> {
     ensure!(
         std::env::consts::OS == "linux",
         "G0 requires isolated Linux lab"
@@ -1071,15 +1305,22 @@ async fn run_fixture() -> Result<()> {
             == "b43a1fb1bda131c6653576741ce527eb2bdeab7c9308ca90ee8b972abb7e4a7f",
         "official archive digest mismatch"
     );
-    let version = Command::new(&binary).arg("version").output().await?;
+    let dir = tempfile::tempdir()?;
+    let version_log = dir.path().join("version.log");
+    let output = std::fs::File::create(&version_log)?;
+    let mut version = Command::new(&binary);
+    version
+        .arg("version")
+        .stdout(output.try_clone()?)
+        .stderr(output);
+    let version_status =
+        owned_command(preflight, version, "version", Duration::from_secs(3)).await?;
     ensure!(
-        version.status.success()
-            && String::from_utf8_lossy(&version.stdout).lines().next()
+        version_status.success()
+            && std::fs::read_to_string(&version_log)?.lines().next()
                 == Some("sing-box version 1.14.2"),
         "wrong official version"
     );
-    let output = PathBuf::from(std::env::var("BUI_G0_RESULT").context("BUI_G0_RESULT required")?);
-    let dir = tempfile::tempdir()?;
     let mut cases = Vec::new();
     for name in REQUIRED {
         eprintln!("G0_CASE_BEGIN {name}");
@@ -1119,16 +1360,5 @@ async fn run_fixture() -> Result<()> {
         "scope":"API feasibility only; no HY2 production accounting/admission readiness"},"cases":cases,
         "failure_kind":if executed.len()!=REQUIRED.len(){"fixture_infrastructure"}else if !complete{"accounting_incomplete"}else{"none"},
         "migration_gate":if complete && children_reaped {"PASS"}else{"FAIL"}});
-    std::fs::write(&output, serde_json::to_vec_pretty(&report)?)?;
-    println!("G0_RESULT {}", output.display());
-    ensure!(children_reaped, "G0 child cleanup failed");
-    ensure!(
-        executed.len() == REQUIRED.len(),
-        "G0 fixture infrastructure/partial-case failure; no upstream accounting conclusion"
-    );
-    ensure!(
-        complete,
-        "official API cannot establish complete attribution for every required case; see G0 JSON"
-    );
-    Ok(())
+    Ok(report)
 }
