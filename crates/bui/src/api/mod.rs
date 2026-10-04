@@ -36,6 +36,10 @@ pub fn router(state: AppState, modules: &[Arc<dyn Module>]) -> axum::Router {
         )
         .route("/api/system/obfs", axum::routing::post(system::set_obfs))
         .route(
+            "/api/system/direct-ip-policy",
+            axum::routing::post(system::set_direct_ip_policy),
+        )
+        .route(
             "/api/system/hy2-resi-compat",
             axum::routing::post(system::set_hy2_resi_compat),
         );
@@ -795,6 +799,129 @@ mod tests {
             .unwrap()
             .contains("PasswordAuthentication no"));
         assert!(host.ops().contains(&"systemd:reload:sshd".into()));
+        owner.drain().await;
+    }
+
+    #[tokio::test]
+    async fn direct_ip_policy_requires_root_uds_and_rejects_invalid_values_without_writing() {
+        let (app, dir, _host, _runtime, bus) = app_with_bus().await;
+        let token = login(&app).await;
+        let before = std::fs::read(dir.path().join("state.json")).unwrap();
+        let mut events = bus.subscribe();
+        for uid in [None, Some(1000)] {
+            let mut req = with_token(
+                post(
+                    "/api/system/direct-ip-policy",
+                    serde_json::json!({"value":"dual-stack"}),
+                ),
+                &token,
+            );
+            if let Some(uid) = uid {
+                req.extensions_mut()
+                    .insert(crate::api::auth::UdsPeer { uid });
+            }
+            assert_eq!(
+                app.clone().oneshot(req).await.unwrap().status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        let mut req = post(
+            "/api/system/direct-ip-policy",
+            serde_json::json!({"value":"auto"}),
+        );
+        req.extensions_mut()
+            .insert(crate::api::auth::UdsPeer { uid: 0 });
+        assert_eq!(
+            app.oneshot(req).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("state.json")).unwrap(),
+            before
+        );
+        assert!(events.try_recv().is_err());
+        assert!(!dir.path().join("state.backups").exists());
+    }
+
+    #[tokio::test]
+    async fn direct_ip_policy_root_uds_persists_once_and_sends_one_event() {
+        let (app, dir, _host, _runtime, bus) = app_with_bus().await;
+        let mut events = bus.subscribe();
+        for changed in [true, false] {
+            let mut req = post(
+                "/api/system/direct-ip-policy",
+                serde_json::json!({"value":"dual-stack"}),
+            );
+            req.extensions_mut()
+                .insert(crate::api::auth::UdsPeer { uid: 0 });
+            let res = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            let body = json(res).await;
+            assert_eq!(body["changed"], changed);
+            assert_eq!(body["direct_ip_policy"], "dual-stack");
+            let bytes = std::fs::read(dir.path().join("state.json")).unwrap();
+            let persisted: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(persisted["node"]["direct_ip_policy"], "dual_stack");
+            if changed {
+                assert_eq!(
+                    events.try_recv().unwrap(),
+                    Event::StateChanged("direct-ip-policy")
+                );
+            } else {
+                assert!(events.try_recv().is_err());
+            }
+        }
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("state.backups"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_ip_policy_waits_for_the_control_owner_before_writing() {
+        let (app, dir, _host, _runtime, bus) = app_with_bus().await;
+        let before = std::fs::read(dir.path().join("state.json")).unwrap();
+        let mut events = bus.subscribe();
+        let owner = bus.residential();
+        let occupied = owner.clone();
+        let (entered, seen) = tokio::sync::oneshot::channel();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let first = tokio::spawn(async move {
+            occupied
+                .execute(move |_tx| async move {
+                    entered.send(()).unwrap();
+                    wait.await?;
+                    Ok(())
+                })
+                .await
+        });
+        seen.await.unwrap();
+        let mut req = post(
+            "/api/system/direct-ip-policy",
+            serde_json::json!({"value":"dual-stack"}),
+        );
+        req.extensions_mut()
+            .insert(crate::api::auth::UdsPeer { uid: 0 });
+        let mut response = tokio::spawn(async move { app.oneshot(req).await.unwrap() });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut response)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("state.json")).unwrap(),
+            before
+        );
+        assert!(events.try_recv().is_err());
+        release.send(()).unwrap();
+        first.await.unwrap().unwrap();
+        assert_eq!(response.await.unwrap().status(), StatusCode::OK);
+        assert_eq!(
+            events.try_recv().unwrap(),
+            Event::StateChanged("direct-ip-policy")
+        );
         owner.drain().await;
     }
 

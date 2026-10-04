@@ -2,7 +2,7 @@
 //!
 //! 字段逐条对齐 v3 `server/core.sh` 的 `xray-config.json` 模板。
 
-use crate::model::{NodeParams, Protocol, Residential, User};
+use crate::model::{DirectIpPolicy, NodeParams, Protocol, Residential, User};
 use crate::paths::Paths;
 use crate::slots;
 use serde_json::{json, Value};
@@ -56,8 +56,15 @@ const RESI_INBOUND_TAG: &str = "vless-residential";
 pub fn config(node: &NodeParams, users: &[User], resi: &Residential, _paths: &Paths) -> Value {
     let clients = clients(users);
 
+    // ForceIPv4v6 先解析 IPv4，无 A 时再用 IPv6；不是拨号失败回退或连接竞速。
+    // 住宅仍把目标交给原 SOCKS relay，不改变供应商路径与出口身份。
+    let (domain_strategy, query_strategy) = match node.direct_ip_policy {
+        DirectIpPolicy::DualStack => ("ForceIPv4v6", "UseIP"),
+        DirectIpPolicy::Ipv4Only => ("ForceIPv4", "UseIPv4"),
+    };
+
     let mut outbounds = vec![
-        json!({"tag": "direct", "protocol": "freedom", "settings": {"domainStrategy": "ForceIPv4"}}),
+        json!({"tag": "direct", "protocol": "freedom", "settings": {"domainStrategy": domain_strategy}}),
     ];
     for i in slots::indices(resi) {
         let res = slots::resources(i);
@@ -88,7 +95,7 @@ pub fn config(node: &NodeParams, users: &[User], resi: &Residential, _paths: &Pa
         },
         "dns": {
             "servers": ["https+local://1.1.1.1/dns-query", "8.8.8.8"],
-            "queryStrategy": "UseIPv4"
+            "queryStrategy": query_strategy
         },
         "inbounds": [
             {

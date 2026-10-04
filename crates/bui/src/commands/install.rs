@@ -245,6 +245,7 @@ pub fn build_state(
             ports: answers.ports.clone(),
             reality,
             obfs: Obfs::default(),
+            direct_ip_policy: Default::default(),
         },
         admin: Admin {
             password_hash: crate::api::auth::hash_password(&answers.admin_password)?,

@@ -216,6 +216,14 @@ async fn dispatch(command: Command) -> Result<()> {
             modules::residential::cli::run(cmd, PathBuf::from(paths::SOCKET_PATH)).await
         }
         Command::Set { cmd } => match cmd {
+            cli::SetCmd::DirectIpPolicy { policy } => {
+                commands::config::run_direct_ip_policy_with(
+                    policy.as_str(),
+                    bui_schema::paths::Paths::default_server(),
+                    PathBuf::from(paths::SOCKET_PATH),
+                )
+                .await
+            }
             cli::SetCmd::Hy2Auth { mode } => {
                 commands::config::run_hy2_auth(
                     &mode,
