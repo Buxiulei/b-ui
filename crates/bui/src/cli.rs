@@ -154,6 +154,11 @@ pub enum NftCmd {
 /// `bui set` 的子命令。
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum SetCmd {
+    /// 直连出口地址族：ipv4-only（默认）或 dual-stack（需宿主机 IPv6 出口可用）。
+    /// 通过 root UDS 的唯一控制 owner 设置；离线必须取得机器 lease。
+    DirectIpPolicy {
+        policy: bui_schema::model::DirectIpPolicy,
+    },
     /// Hysteria2 鉴权方式：`http`（默认，守护进程进程内应答）/ `command`（退路，每条连接 fork 钩子）。
     /// **只作用于直连**（4.1：住宅换成 sing-box 的静态凭据池 + 门，配置里没有 `auth` 段）：
     /// 改完只重渲染 `config.yaml`、只重启 `hysteria-server`。
@@ -460,6 +465,16 @@ mod tests {
         assert!(Cli::try_parse_from(["bui", "set", "hy2-auth", "userpass"]).is_err());
         assert!(Cli::try_parse_from(["bui", "set", "hy2-auth"]).is_err());
         assert!(Cli::try_parse_from(["bui", "set"]).is_err());
+    }
+
+    #[test]
+    fn parses_direct_ip_policy_through_the_model_validator() {
+        for value in ["dual-stack", "ipv4-only"] {
+            assert!(Cli::try_parse_from(["bui", "set", "direct-ip-policy", value]).is_ok());
+        }
+        for value in ["auto", "dual_stack", "ipv6-only", ""] {
+            assert!(Cli::try_parse_from(["bui", "set", "direct-ip-policy", value]).is_err());
+        }
     }
 
     /// `bui set legacy-sub off|<RFC3339>`（2026-09-14 裁决的收口开关）。取值形状不由 clap 管

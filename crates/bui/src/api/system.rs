@@ -40,6 +40,59 @@ pub struct Hy2AuthRequest {
     pub mode: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirectIpPolicyRequest {
+    pub value: String,
+}
+
+/// 宿主机直连出口策略只能从 root UDS 设置；JWT 管理员不能替代这个机器权限。
+pub async fn set_direct_ip_policy(
+    State(app): State<AppState>,
+    peer: Option<axum::Extension<crate::api::auth::UdsPeer>>,
+    Json(req): Json<DirectIpPolicyRequest>,
+) -> Response {
+    if peer.is_none_or(|peer| peer.0.uid != 0) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error":"直连出口策略设置需要 root UDS"})),
+        )
+            .into_response();
+    }
+    let policy = match req.value.parse::<bui_schema::model::DirectIpPolicy>() {
+        Ok(policy) => policy,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error":error})),
+            )
+                .into_response()
+        }
+    };
+    let owner = app.bus.residential();
+    match owner
+        .execute(move |_tx| async move {
+            let changed =
+                crate::commands::config::update_direct_ip_policy(&app.store, policy).await?;
+            if changed {
+                app.bus.send(Event::StateChanged("direct-ip-policy"));
+            }
+            Ok(changed)
+        })
+        .await
+    {
+        Ok(changed) => Json(
+            serde_json::json!({"ok":true,"changed":changed,"direct_ip_policy":policy.as_str()}),
+        )
+        .into_response(),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error":error.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 /// `POST /api/system/hy2-auth`：切 Hysteria2 的鉴权方式（`bui set hy2-auth` 的落点）。
 ///
 /// 只写期望态 + 发一次 `StateChanged`：重渲染 `config.yaml`、重启 `hysteria-server`

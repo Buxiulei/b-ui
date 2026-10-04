@@ -9,7 +9,7 @@
 //! 回到钩子 `bin/bui-auth-hook`。**两种形态都只作用于直连**（住宅侧是 sing-box 的静态
 //! `users` 列表 + 门，配置里没有 `auth` 段）。`masquerade.proxy.url` 由 REALITY 伪装域推导；
 //! `obfs` 段只在启用时输出。
-use crate::model::{Hy2Auth, NodeParams};
+use crate::model::{DirectIpPolicy, Hy2Auth, NodeParams};
 use crate::paths::Paths;
 use serde_yaml::{Mapping, Value};
 
@@ -32,7 +32,7 @@ pub fn direct_yaml(node: &NodeParams, paths: &Paths, auth: Hy2Auth) -> String {
     let mut doc = common_doc(node, paths, &listen, 9999, auth);
     doc.insert(
         key("outbounds"),
-        Value::Sequence(vec![Value::Mapping(direct_outbound())]),
+        Value::Sequence(vec![Value::Mapping(direct_outbound(node.direct_ip_policy))]),
     );
     push_obfs(&mut doc, node);
     to_yaml(doc)
@@ -131,12 +131,16 @@ fn auth_section(paths: &Paths, auth: Hy2Auth) -> Value {
     }
 }
 
-/// 内置 direct 出站，`mode: 4` = 只拨 IPv4（VPS 无 IPv6 出口）。
-fn direct_outbound() -> Mapping {
+/// 双栈使用上游的字符串 `auto`；旧 IPv4 策略保留数字 `4`。
+fn direct_outbound(policy: DirectIpPolicy) -> Mapping {
     let mut o = Mapping::new();
     o.insert(key("name"), str_val("direct"));
     o.insert(key("type"), str_val("direct"));
-    o.insert(key("direct"), map(vec![("mode", Value::Number(4.into()))]));
+    let mode = match policy {
+        DirectIpPolicy::DualStack => str_val("auto"),
+        DirectIpPolicy::Ipv4Only => Value::Number(4.into()),
+    };
+    o.insert(key("direct"), map(vec![("mode", mode)]));
     o
 }
 

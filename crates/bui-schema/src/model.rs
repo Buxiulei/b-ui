@@ -37,6 +37,44 @@ pub struct NodeParams {
     pub reality: Reality,
     #[serde(default)]
     pub obfs: Obfs,
+    /// VPS 直连出站的地址族；显式启用双栈不授予客户端捕获或住宅出口能力。
+    #[serde(default, skip_serializing_if = "DirectIpPolicy::is_ipv4_only")]
+    pub direct_ip_policy: DirectIpPolicy,
+}
+
+/// 直连出口地址族策略。旧状态保留 IPv4，双栈需受管设置显式启用。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectIpPolicy {
+    DualStack,
+    #[default]
+    Ipv4Only,
+}
+
+impl DirectIpPolicy {
+    fn is_ipv4_only(&self) -> bool {
+        *self == Self::Ipv4Only
+    }
+
+    /// CLI 与控制 API 共用的外部名称；落盘名称由 serde 明确使用 snake_case。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DualStack => "dual-stack",
+            Self::Ipv4Only => "ipv4-only",
+        }
+    }
+}
+
+impl std::str::FromStr for DirectIpPolicy {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "dual-stack" => Ok(Self::DualStack),
+            "ipv4-only" => Ok(Self::Ipv4Only),
+            _ => Err("直连出口策略只能是 dual-stack 或 ipv4-only".into()),
+        }
+    }
 }
 
 /// 四条通路的端口与端口跳跃区间。

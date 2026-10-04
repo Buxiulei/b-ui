@@ -162,6 +162,7 @@ pub fn import(dir: &Path) -> Result<ImportReport, ImportError> {
             },
             reality,
             obfs,
+            direct_ip_policy: Default::default(),
         },
         admin: Admin {
             password_hash: hash_password(&admin_password)?,

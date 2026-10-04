@@ -8,10 +8,60 @@
 use crate::state::store::Store;
 use crate::sys::Host;
 use anyhow::Result;
-use bui_schema::model::{Hy2Auth, Obfs};
+use bui_schema::model::{DirectIpPolicy, Hy2Auth, Obfs};
 use bui_schema::paths::Paths;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// 显式设置直连出口的地址族；线上由守护进程唯一写者执行，离线需要机器 lease。
+pub async fn run_direct_ip_policy_with(value: &str, paths: Paths, socket: PathBuf) -> Result<()> {
+    let policy: DirectIpPolicy = value.parse().map_err(anyhow::Error::msg)?;
+    let client = crate::ipc::Client::new(&socket);
+    let changed = if client.available().await {
+        let (status, body) = client
+            .request(
+                "POST",
+                "/api/system/direct-ip-policy",
+                Some(serde_json::json!({"value":policy.as_str()})),
+            )
+            .await?;
+        anyhow::ensure!(
+            (200..300).contains(&status),
+            "守护进程拒绝直连出口策略（HTTP {status}）：{body}"
+        );
+        body["changed"]
+            .as_bool()
+            .ok_or_else(|| anyhow::anyhow!("守护进程未返回直连出口策略修改结果"))?
+    } else {
+        let lease_paths = paths.clone();
+        crate::residential_lifecycle::offline(&lease_paths, async move {
+            let store = Store::open(crate::paths::state_file(&paths)).await?;
+            update_direct_ip_policy(&store, policy).await
+        })
+        .await?
+    };
+    if changed {
+        println!(
+            "直连出口策略已设为 {}；HY2 与 Xray 的直连配置由对账统一生效，住宅策略保持现有设置。",
+            policy.as_str()
+        );
+    } else {
+        println!("直连出口策略已经是 {}，无需改动。", policy.as_str());
+    }
+    Ok(())
+}
+
+/// 调用方必须持有 daemon 控制 owner 或离线 ControlLease；变化判定在 Store 写锁中完成。
+pub(crate) async fn update_direct_ip_policy(store: &Store, policy: DirectIpPolicy) -> Result<bool> {
+    let mut changed = false;
+    store
+        .update(|state| {
+            changed = state.node.direct_ip_policy != policy;
+            state.node.direct_ip_policy = policy;
+        })
+        .await?;
+    Ok(changed)
+}
 
 pub async fn run_hy2_auth(mode: &str, paths: Paths, host: Arc<dyn Host>) -> Result<()> {
     run_hy2_auth_with(mode, paths, host, PathBuf::from(crate::paths::SOCKET_PATH)).await
@@ -785,6 +835,94 @@ mod tests {
             .unwrap();
         let store = Store::open(crate::paths::state_file(&paths)).await.unwrap();
         assert_eq!(store.read().await.system.hy2_auth, Hy2Auth::Command);
+    }
+
+    #[tokio::test]
+    async fn direct_ip_policy_offline_requires_the_control_lease_and_persists_idempotently() {
+        let (dir, paths) = scratch().await;
+        let sock = dir.path().join("absent.sock");
+        let before = disk_snapshot(&paths);
+        let lease = crate::residential_lifecycle::ControlLease::acquire(&paths).unwrap();
+        assert!(
+            run_direct_ip_policy_with("dual-stack", paths.clone(), sock.clone())
+                .await
+                .is_err()
+        );
+        assert_eq!(disk_snapshot(&paths), before);
+        drop(lease);
+        run_direct_ip_policy_with("dual-stack", paths.clone(), sock.clone())
+            .await
+            .unwrap();
+        let next = disk_snapshot(&paths);
+        let stored: serde_json::Value = serde_json::from_slice(&next.0).unwrap();
+        assert_eq!(stored["node"]["direct_ip_policy"], "dual_stack");
+        run_direct_ip_policy_with("dual-stack", paths.clone(), sock.clone())
+            .await
+            .unwrap();
+        assert_eq!(disk_snapshot(&paths), next, "重复设置不写盘、不备份");
+        run_direct_ip_policy_with("ipv4-only", paths.clone(), sock)
+            .await
+            .unwrap();
+        let restored: serde_json::Value = serde_json::from_slice(&disk_snapshot(&paths).0).unwrap();
+        assert!(restored["node"].get("direct_ip_policy").is_none());
+    }
+
+    #[tokio::test]
+    async fn direct_ip_policy_invalid_cli_value_does_not_touch_state_or_lease() {
+        let (dir, paths) = scratch().await;
+        let before = disk_snapshot(&paths);
+        let lease = paths.base_dir.join(".residential-control.lock");
+        assert!(!lease.exists());
+        assert!(
+            run_direct_ip_policy_with("auto", paths.clone(), dir.path().join("absent.sock"))
+                .await
+                .is_err()
+        );
+        assert_eq!(disk_snapshot(&paths), before);
+        assert!(!lease.exists(), "校验必须在取lease之前");
+    }
+
+    #[tokio::test]
+    async fn direct_ip_policy_online_sends_an_intent_without_local_state_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("b-ui.sock");
+        // 特意没有本地 state.json：线上必须只走 UDS，不能尝试本地读取或写入。
+        let base = dir.path().join("no-local-state");
+        let paths = Paths {
+            base_dir: base.clone(),
+            certs_dir: base.join("certs"),
+            bin_dir: base.join("bin"),
+        };
+        let calls = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let captured = calls.clone();
+        let app = axum::Router::new().route(
+            "/api/system/direct-ip-policy",
+            axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let captured = captured.clone();
+                async move {
+                    captured.lock().await.push(body);
+                    axum::Json(serde_json::json!({"changed":true}))
+                }
+            }),
+        );
+        let serve_sock = sock.clone();
+        let server = tokio::spawn(async move { crate::ipc::serve_uds(&serve_sock, app).await });
+        let client = crate::ipc::Client::new(&sock);
+        for _ in 0..100 {
+            if client.available().await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(client.available().await);
+        let result = run_direct_ip_policy_with("dual-stack", paths.clone(), sock).await;
+        server.abort();
+        result.unwrap();
+        assert_eq!(
+            *calls.lock().await,
+            vec![serde_json::json!({"value":"dual-stack"})]
+        );
+        assert!(!paths.base_dir.exists());
     }
 
     /// `off` ⇒ 停用（`None`）；RFC3339 归一成秒级；别的一律报错。

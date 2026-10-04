@@ -8,6 +8,14 @@
 `version` 的唯一来源是根 `Cargo.toml` 的 `[workspace.package] version`；改版本必须同时在本文件加一段，`scripts/release/check-version.sh` 会在 CI 里卡住不一致（它只认 `## [<version>]` 这个标题，日期不参与校验）。
 未发布的版本日期写「未发布」，由主理人打 tag 发版时替换成当天日期（UTC）。
 
+## [4.1.8] - 未发布
+
+### 服务端双栈出站
+
+- 新增统一的 VPS 直连地址族策略。经验证的节点可明确启用双栈：Hysteria2 使用 `auto`，Xray 允许 IPv6 字面目标及 AAAA-only 域名，对双栈域名优先解析 IPv4；未选择双栈的节点维持原 IPv4 出站。
+- `bui set direct-ip-policy dual-stack|ipv4-only` 通过 root UDS 与既有控制 owner 持久化期望态；守护进程停止时仅在机器控制 lease 下写入。重复设置不触发重载，非法值或非 root UDS 请求不修改状态。
+- 配置仍由 Rust 渲染与现有对账器激活。此策略不更换网络内核、不改变住宅出口身份；服务器双栈出站与客户端 TUN/DNS 捕获分别验收。
+
 ## [4.1.5] - 未发布
 
 ### Rust 控制面修复
