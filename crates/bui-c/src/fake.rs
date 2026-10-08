@@ -8,7 +8,7 @@ use crate::net::{Download, Net, Probe, ProbeError, Via};
 use crate::sys::{Output, Sys};
 use crate::{Error, Result};
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -24,6 +24,7 @@ pub struct FakeSys {
     /// `unlock`，而它活得可以比这次借用更久（spec §0.2 R2）。
     calls: Rc<RefCell<Vec<String>>>,
     replies: RefCell<BTreeMap<String, Output>>,
+    reply_sequences: RefCell<BTreeMap<String, VecDeque<Output>>>,
     envs: RefCell<BTreeMap<String, String>>,
     now: RefCell<time::OffsetDateTime>,
     sleeps: RefCell<Vec<u64>>,
@@ -44,6 +45,8 @@ pub struct FakeSys {
     lock_held: Rc<Cell<bool>>,
     /// 下一次拿到锁之前落盘的文件（[`FakeSys::stage_on_lock`]）。
     on_lock: RefCell<Vec<(PathBuf, Vec<u8>)>>,
+    /// 下一次拿到锁前改变的查询响应，模拟另一个 owner 已完成恢复。
+    on_lock_replies: RefCell<Vec<(String, Output)>>,
 }
 
 impl Default for FakeSys {
@@ -52,6 +55,7 @@ impl Default for FakeSys {
             files: RefCell::default(),
             calls: Rc::default(),
             replies: RefCell::default(),
+            reply_sequences: RefCell::default(),
             envs: RefCell::default(),
             now: RefCell::new(datetime!(2026-09-11 00:00:00 UTC)),
             sleeps: RefCell::default(),
@@ -63,6 +67,7 @@ impl Default for FakeSys {
             lock_busy: Cell::new(0),
             lock_held: Rc::default(),
             on_lock: RefCell::default(),
+            on_lock_replies: RefCell::default(),
         }
     }
 }
@@ -91,6 +96,7 @@ pub fn default_code(prog: &str, args: &[&str]) -> i32 {
     match (prog, first) {
         ("systemctl", "is-active") => 3,
         ("systemctl", "is-enabled") => 1,
+        ("systemctl", "show") => 1,
         ("ufw", "status") => 127,
         ("sysctl", "-n") => 1,
         ("ip", _) if args.contains(&"show") => 1,
@@ -112,6 +118,21 @@ impl FakeSys {
                 stdout: stdout.to_string(),
                 stderr: String::new(),
             },
+        );
+    }
+
+    /// 连续查询期间实例变化；用实际调用次数消耗响应，不在测试外修改时间或机器。
+    pub fn reply_sequence(&self, cmd: &str, replies: &[(i32, &str)]) {
+        self.reply_sequences.borrow_mut().insert(
+            cmd.to_string(),
+            replies
+                .iter()
+                .map(|(code, stdout)| Output {
+                    code: *code,
+                    stdout: stdout.to_string(),
+                    stderr: String::new(),
+                })
+                .collect(),
         );
     }
     /// 预置一个文件（权限按 0644，模拟外部落下的文件）。
@@ -192,12 +213,32 @@ impl FakeSys {
             .borrow_mut()
             .push((PathBuf::from(path), data.as_bytes().to_vec()));
     }
+
+    /// 文件未变但服务实例或本地捕获已变化；只在实际拿到下一把锁时生效。
+    pub fn stage_reply_on_lock(&self, cmd: &str, code: i32, stdout: &str) {
+        self.on_lock_replies.borrow_mut().push((
+            cmd.to_string(),
+            Output {
+                code,
+                stdout: stdout.to_string(),
+                stderr: String::new(),
+            },
+        ));
+    }
 }
 
 impl Sys for FakeSys {
     fn run(&self, prog: &str, args: &[&str]) -> Result<Output> {
         let k = key(prog, args);
         self.calls.borrow_mut().push(k.clone());
+        if let Some(output) = self
+            .reply_sequences
+            .borrow_mut()
+            .get_mut(&k)
+            .and_then(|queue| queue.pop_front())
+        {
+            return Ok(output);
+        }
         Ok(self
             .replies
             .borrow()
@@ -313,6 +354,9 @@ impl Sys for FakeSys {
         }
         for (path, data) in self.on_lock.borrow_mut().drain(..) {
             self.files.borrow_mut().insert(path, (data, 0o600));
+        }
+        for (cmd, output) in self.on_lock_replies.borrow_mut().drain(..) {
+            self.replies.borrow_mut().insert(cmd, output);
         }
         self.lock_held.set(true);
         self.calls.borrow_mut().push("lock".to_string());

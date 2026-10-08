@@ -1,17 +1,18 @@
 //! `bui-c check`：每分钟由 `bui-c.timer` 拉起的一次性巡检。
 //!
 //! 三件事：204 探测（socks 模式经本地 inbound，TUN 模式直连）+ TUN 接口与默认路由核对、
-//! 失败时按 1/2/4 分钟退避重启数据面单元（只有重启这一段持进程锁，拿不到就跳过本轮）、
+//! 本地故障时核对实例和配置，再按 1/2/4 分钟退避恢复；恢复与记账清零持同一动作锁、
+//! 仅外部探针失败时报告连通性下降、保留实例和重启记账，
 //! 判定「今天该不该自更新」；
 //! 外加 TUN 模式下幂等重放 `bui-tun` 的两条 UFW 规则（`ufw reset` 会把它们清掉）。
 //! 状态落在 `/opt/bui-c/runtime.json`（0600），丢了能从零重建。
 
-use crate::delete;
 use crate::engine::Engine;
 use crate::lock::{self, How, LockGuard};
-use crate::net::{Net, Via};
+use crate::net::{Net, ProbeError, Via};
 use crate::paths::{Paths, TUN_IFACE, UNIT_MAIN};
 use crate::profiles::{Mode, Profiles};
+use crate::service::{self, ServiceObservation};
 use crate::sys::{systemd, Sys};
 use crate::ufw;
 use crate::Result;
@@ -95,9 +96,15 @@ impl Runtime {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Failure {
     UnitDown,
-    Probe { got: Option<u16> },
+    Probe {
+        got: Option<u16>,
+    },
     TunMissing,
     TunNoDefaultRoute,
+    /// 观察失败不能当成已确认的本地故障。
+    LocalUnknown {
+        component: &'static str,
+    },
 }
 
 /// 巡检日志（journald）与 `bui-c check` 输出里的中文说法；不打 Rust 的 Debug 名。
@@ -111,6 +118,7 @@ impl std::fmt::Display for Failure {
             Failure::Probe { got: None } => write!(f, "探测 {target} 超时或连不上"),
             Failure::TunMissing => write!(f, "{TUN_IFACE} 接口不存在"),
             Failure::TunNoDefaultRoute => write!(f, "默认路由没有指向 {TUN_IFACE}"),
+            Failure::LocalUnknown { component } => write!(f, "{component} 状态未确认"),
         }
     }
 }
@@ -120,6 +128,13 @@ impl std::fmt::Display for Failure {
 pub enum Verdict {
     NoProfile,
     Ok,
+    Uncertain {
+        failures: Vec<Failure>,
+    },
+    /// 本地检查通过、仅外部探针失败：保留当前实例，不改重启记账。
+    ExternalDegraded {
+        failures: Vec<Failure>,
+    },
     Restarted {
         failures: Vec<Failure>,
         next_backoff_min: u64,
@@ -165,25 +180,112 @@ pub fn via_for(prof: &Profiles) -> Via {
 
 /// 逐项探测，收集**全部**失败项（不短路：日志里要能一眼看出是单元没起还是路由没接管）。
 pub fn probe<S: Sys, N: Net>(sys: &S, net: &N, paths: &Paths, prof: &Profiles) -> Vec<Failure> {
+    let observed = service::observe(sys, UNIT_MAIN);
+    probe_with_service(sys, net, paths, prof, &observed)
+}
+
+fn local_failures<S: Sys>(sys: &S, prof: &Profiles, observed: &ServiceObservation) -> Vec<Failure> {
     let mut out = Vec::new();
-    if !systemd::is_active(sys, UNIT_MAIN) {
-        out.push(Failure::UnitDown);
-    }
-    match net.status(PROBE_URL, via_for(prof), PROBE_TIMEOUT) {
-        Ok(204) => {}
-        Ok(code) => out.push(Failure::Probe { got: Some(code) }),
-        Err(_) => out.push(Failure::Probe { got: None }),
-    }
-    if prof.mode == Mode::Tun {
-        let e = Engine::new(sys, paths);
-        if !e.tun_up() {
-            out.push(Failure::TunMissing);
+    match observed {
+        ServiceObservation::Running(_) => {}
+        ServiceObservation::Stopped(_) => out.push(Failure::UnitDown),
+        ServiceObservation::Transitioning | ServiceObservation::Unknown => {
+            out.push(Failure::LocalUnknown {
+                component: "主服务",
+            });
         }
-        if !e.tun_default_route() {
-            out.push(Failure::TunNoDefaultRoute);
+    }
+    out.extend(capture_failures(sys, prof));
+    out
+}
+
+/// 仅观察现有客户端的 TUN 接口与 IPv4 默认路由；不是完整双栈捕获资格。
+/// 查询失败保留 Unknown，巡检与菜单共用，不能将它当成需要重启的本地故障。
+pub fn capture_failures<S: Sys>(sys: &S, prof: &Profiles) -> Vec<Failure> {
+    let mut out = Vec::new();
+    if prof.mode == Mode::Tun {
+        // 列出接口的成功结果才能证明接口缺失；命令失败只是观察不确定。
+        match sys.run("ip", &["-j", "link", "show"]) {
+            Ok(o) if o.ok() => match serde_json::from_str::<Vec<serde_json::Value>>(&o.stdout) {
+                Ok(links)
+                    if links
+                        .iter()
+                        .all(|v| v.get("ifname").and_then(|v| v.as_str()).is_some()) =>
+                {
+                    if !links.iter().any(|v| v["ifname"] == TUN_IFACE) {
+                        out.push(Failure::TunMissing);
+                    }
+                }
+                _ => out.push(Failure::LocalUnknown {
+                    component: "TUN 接口",
+                }),
+            },
+            _ => out.push(Failure::LocalUnknown {
+                component: "TUN 接口",
+            }),
+        }
+        match sys.run("ip", &["-4", "route", "show", "table", "all"]) {
+            Ok(o) if o.ok() => {
+                let captured = o.stdout.lines().any(|line| {
+                    let words: Vec<_> = line.split_ascii_whitespace().collect();
+                    words.first() == Some(&"default")
+                        && words.windows(2).any(|pair| pair == ["dev", TUN_IFACE])
+                });
+                if !captured {
+                    out.push(Failure::TunNoDefaultRoute);
+                }
+            }
+            _ => out.push(Failure::LocalUnknown {
+                component: "IPv4 路由",
+            }),
         }
     }
     out
+}
+
+fn probe_with_service<S: Sys, N: Net>(
+    sys: &S,
+    net: &N,
+    _paths: &Paths,
+    prof: &Profiles,
+    observed: &ServiceObservation,
+) -> Vec<Failure> {
+    let local = local_failures(sys, prof, observed);
+    if !local.is_empty() {
+        tracing::info!("本地服务或捕获未确认，外部连通性探测跳过");
+        return local;
+    }
+    let started = std::time::Instant::now();
+    match net.probe(PROBE_URL, via_for(prof), PROBE_TIMEOUT) {
+        Ok(p) if p.code == 204 => Vec::new(),
+        Ok(p) => {
+            tracing::warn!(
+                http_status = p.code,
+                elapsed_ms = p.elapsed.as_millis() as u64,
+                "外部探测返回异常状态，保留实例"
+            );
+            vec![Failure::Probe { got: Some(p.code) }]
+        }
+        Err(error) => {
+            let category = match error {
+                ProbeError::Timeout => "timeout",
+                ProbeError::Refused => "refused",
+                ProbeError::Dns => "dns",
+                ProbeError::Other(ref category)
+                    if matches!(category.as_str(), "tls" | "connect" | "http" | "body") =>
+                {
+                    category.as_str()
+                }
+                ProbeError::Other(_) => "unknown",
+            };
+            tracing::warn!(
+                category,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "外部探测失败，保留实例"
+            );
+            vec![Failure::Probe { got: None }]
+        }
+    }
 }
 
 /// 探测之后怎么办（[`decide`] 的结论）。
@@ -191,19 +293,37 @@ pub fn probe<S: Sys, N: Net>(sys: &S, net: &N, paths: &Paths, prof: &Profiles) -
 pub enum Decision {
     /// 各项都好：清零连击（有的话），不拿锁。
     Healthy,
+    Uncertain {
+        failures: Vec<Failure>,
+    },
+    /// 仅外部连通性异常，没有本地恢复证据：不拿锁、不重启、不改记账。
+    ExternalDegraded {
+        failures: Vec<Failure>,
+    },
     /// 还在退避窗口里：等，不拿锁。
     Wait {
         failures: Vec<Failure>,
         remaining_s: i64,
     },
     /// 该重启了：只试一次锁，拿到了才重启。
-    Restart { failures: Vec<Failure> },
+    Restart {
+        failures: Vec<Failure>,
+    },
 }
 
-/// 纯函数：探测结果 + 运行时记账 → 这一轮做什么。退避窗口按 [`wait_seconds`] 算，从上次重启起。
+/// 纯函数：仅外部探针失败不授权重启；有本地故障时才按运行时记账检查退避窗口。
 pub fn decide(rt: &Runtime, now: i64, failures: Vec<Failure>) -> Decision {
     if failures.is_empty() {
         return Decision::Healthy;
+    }
+    if failures
+        .iter()
+        .any(|f| matches!(f, Failure::LocalUnknown { .. }))
+    {
+        return Decision::Uncertain { failures };
+    }
+    if failures.iter().all(|f| matches!(f, Failure::Probe { .. })) {
+        return Decision::ExternalDegraded { failures };
     }
     if let Some(last) = rt.last_restart_at {
         let (elapsed, wait_s) = (now - last, wait_seconds(rt.fail_streak));
@@ -220,15 +340,17 @@ pub fn decide(rt: &Runtime, now: i64, failures: Vec<Failure>) -> Decision {
 /// 一次巡检（`bui-c.timer`，spec §8.3、§5.9）：探测（锁外）→ [`decide`] → 要重启时**只试一次锁**。
 ///
 /// 拿不到锁返回 [`Verdict::Busy`]，不重启、不写 `runtime.json`。拿到锁后重读 `profiles.json`，
-/// 与探测时的完整快照（节点名、active、mode、两个端口）比，任何一项变了也是 `Busy`：别人刚 apply
-/// 好的服务，不能拿旧设置的探测结果再重启一次（§0.2 R11）。重启与等 TUN 就绪都在这把锁里。
+/// 与探测时的完整 profiles、配置字节及服务实例比。任何一项变了也是 `Busy`，
+/// 不能拿旧实例的探测结果打断新实例。锁内重新确认本地故障、读取最新退避记账，
+/// 恢复与等 TUN 就绪都在同一把锁里；单元动作成功不代表全链路或防泄漏已验证。
 pub fn run<S: Sys, N: Net>(sys: &S, net: &N, paths: &Paths) -> Result<Verdict> {
     let prof = Profiles::load(sys, paths)?;
     if prof.active_profile().is_none() {
         return Ok(Verdict::NoProfile);
     }
-    let seen = delete::snapshot(&prof);
-    let mut rt = Runtime::load(sys, paths);
+    let seen_instance = service::observe(sys, UNIT_MAIN);
+    let seen_config = sys.read(&paths.config()).ok();
+    let rt = Runtime::load(sys, paths);
     let now = sys.now().unix_timestamp();
 
     // 幂等重放 bui-tun 的两条 UFW 规则：`ufw reset` / 重装 ufw 会把它们清掉，
@@ -242,13 +364,53 @@ pub fn run<S: Sys, N: Net>(sys: &S, net: &N, paths: &Paths) -> Result<Verdict> {
         }
     }
 
-    let failures = match decide(&rt, now, probe(sys, net, paths, &prof)) {
+    let mut probed = if seen_config.is_some() {
+        probe_with_service(sys, net, paths, &prof, &seen_instance)
+    } else {
+        local_failures(sys, &prof, &seen_instance)
+    };
+    if seen_config.is_none() {
+        probed.push(Failure::LocalUnknown {
+            component: "有效配置",
+        });
+    }
+    if service::observe(sys, UNIT_MAIN) != seen_instance
+        || sys.read(&paths.config()).ok() != seen_config
+        || Profiles::load(sys, paths)? != prof
+    {
+        return Ok(Verdict::Busy);
+    }
+    let failures = match decide(&rt, now, probed) {
         Decision::Healthy => {
             if rt.fail_streak != 0 {
-                rt.fail_streak = 0;
-                rt.save(sys, paths)?;
+                let Some(_g) = lock::acquire(sys, paths, How::Once)? else {
+                    return Ok(Verdict::Busy);
+                };
+                if Profiles::load(sys, paths)? != prof
+                    || sys.read(&paths.config()).ok() != seen_config
+                    || service::observe(sys, UNIT_MAIN) != seen_instance
+                    || !local_failures(sys, &prof, &seen_instance).is_empty()
+                {
+                    return Ok(Verdict::Busy);
+                }
+                let mut fresh_rt = Runtime::load(sys, paths);
+                if fresh_rt.last_restart_at != rt.last_restart_at {
+                    return Ok(Verdict::Busy);
+                }
+                if sys.read(&paths.config()).ok() != seen_config
+                    || Profiles::load(sys, paths)? != prof
+                    || service::observe(sys, UNIT_MAIN) != seen_instance
+                {
+                    return Ok(Verdict::Busy);
+                }
+                fresh_rt.fail_streak = 0;
+                fresh_rt.save(sys, paths)?;
             }
             return Ok(Verdict::Ok);
+        }
+        Decision::Uncertain { failures } => return Ok(Verdict::Uncertain { failures }),
+        Decision::ExternalDegraded { failures } => {
+            return Ok(Verdict::ExternalDegraded { failures });
         }
         Decision::Wait {
             failures,
@@ -267,8 +429,41 @@ pub fn run<S: Sys, N: Net>(sys: &S, net: &N, paths: &Paths) -> Result<Verdict> {
         return Ok(Verdict::Busy);
     };
     let fresh = Profiles::load(sys, paths)?;
-    if delete::snapshot(&fresh) != seen {
-        tracing::info!("节点设置在探测之后被改过，本轮巡检跳过");
+    let fresh_instance = service::observe(sys, UNIT_MAIN);
+    if fresh != prof
+        || sys.read(&paths.config()).ok() != seen_config
+        || fresh_instance != seen_instance
+    {
+        tracing::info!("实例或有效配置在探测之后被改过，本轮巡检跳过");
+        return Ok(Verdict::Busy);
+    }
+    let current_local = local_failures(sys, &fresh, &fresh_instance);
+    if current_local.is_empty() {
+        return Ok(Verdict::Busy);
+    }
+    match decide(
+        &Runtime::load(sys, paths),
+        sys.now().unix_timestamp(),
+        current_local,
+    ) {
+        Decision::Restart { .. } => {}
+        Decision::Wait {
+            failures,
+            remaining_s,
+        } => {
+            return Ok(Verdict::Waiting {
+                failures,
+                remaining_s,
+            })
+        }
+        Decision::Uncertain { failures } => return Ok(Verdict::Uncertain { failures }),
+        Decision::Healthy | Decision::ExternalDegraded { .. } => return Ok(Verdict::Busy),
+    }
+    // 本地查询与 runtime 读回也可能跨过 systemd 的自动拉起；动作前再次 fence。
+    if sys.read(&paths.config()).ok() != seen_config
+        || Profiles::load(sys, paths)? != prof
+        || service::observe(sys, UNIT_MAIN) != seen_instance
+    {
         return Ok(Verdict::Busy);
     }
     let mut v = restart(sys, paths, failures, &g)?;
@@ -354,8 +549,10 @@ mod tests {
     fn healthy_socks(s: &FakeSys, n: &FakeNet) {
         s.put("/opt/bui-c/bin/sing-box", "ELF");
         s.reply("systemctl is-active --quiet bui-c.service", 0, "");
+        crate::testutil::running_service(s);
         n.route(PROBE_URL, FakeReply::Status(204));
         profiles_socks().save(s, &paths()).unwrap();
+        s.put("/opt/bui-c/config.json", "{}");
     }
 
     #[test]
@@ -422,7 +619,9 @@ mod tests {
         let n = FakeNet::new();
         s.put("/opt/bui-c/bin/sing-box", "ELF");
         s.reply("systemctl is-active --quiet bui-c.service", 0, "");
+        crate::testutil::running_service(&s);
         s.reply("ip link show bui-tun", 0, "5: bui-tun");
+        crate::testutil::present_tun(&s);
         s.reply(
             "ip -4 route show table all",
             0,
@@ -430,6 +629,7 @@ mod tests {
         );
         n.route(PROBE_URL, FakeReply::Status(204));
         profiles_tun().save(&s, &paths()).unwrap();
+        s.put("/opt/bui-c/config.json", "{}");
         assert_eq!(run(&s, &n, &paths()).unwrap(), Verdict::Ok);
         assert_eq!(
             n.log()[0],
@@ -442,7 +642,9 @@ mod tests {
     fn healthy_tun(s: &FakeSys, n: &FakeNet) {
         s.put("/opt/bui-c/bin/sing-box", "ELF");
         s.reply("systemctl is-active --quiet bui-c.service", 0, "");
+        crate::testutil::running_service(s);
         s.reply("ip link show bui-tun", 0, "5: bui-tun");
+        crate::testutil::present_tun(s);
         s.reply(
             "ip -4 route show table all",
             0,
@@ -450,12 +652,60 @@ mod tests {
         );
         n.route(PROBE_URL, FakeReply::Status(204));
         profiles_tun().save(s, &paths()).unwrap();
+        s.put("/opt/bui-c/config.json", "{}");
         Runtime {
             ufw_rules: true,
             ..Runtime::default()
         }
         .save(s, &paths())
         .unwrap();
+    }
+
+    fn external_probe_failure_keeps_healthy_tun(reply: FakeReply, expected: Failure) {
+        let s = FakeSys::new();
+        let n = FakeNet::new();
+        healthy_tun(&s, &n);
+        n.route(PROBE_URL, reply);
+
+        // 明确到达「仅外部探针失败」：主单元、TUN 和默认路由均正常。
+        let prof = Profiles::load(&s, &paths()).unwrap();
+        assert_eq!(probe(&s, &n, &paths(), &prof), vec![expected]);
+        let verdict = run(&s, &n, &paths()).unwrap();
+        assert_eq!(
+            n.log(),
+            vec![
+                format!("GET {PROBE_URL} via Direct"),
+                format!("GET {PROBE_URL} via Direct"),
+            ],
+            "预置失败必须在前置核查和实际巡检中都被消费"
+        );
+        assert!(
+            !s.called("systemctl restart bui-c.service"),
+            "外部探针失败没有本地恢复授权；verdict={verdict:?}, calls={:?}",
+            s.calls()
+        );
+        assert!(!matches!(verdict, Verdict::Restarted { .. }));
+    }
+
+    #[test]
+    fn external_probe_connection_failure_keeps_a_healthy_tun_instance() {
+        external_probe_failure_keeps_healthy_tun(FakeReply::Refused, Failure::Probe { got: None });
+    }
+
+    #[test]
+    fn external_probe_http_403_keeps_a_healthy_tun_instance() {
+        external_probe_failure_keeps_healthy_tun(
+            FakeReply::Status(403),
+            Failure::Probe { got: Some(403) },
+        );
+    }
+
+    #[test]
+    fn external_probe_http_5xx_keeps_a_healthy_tun_instance() {
+        external_probe_failure_keeps_healthy_tun(
+            FakeReply::Status(503),
+            Failure::Probe { got: Some(503) },
+        );
     }
 
     const UFW_WITH_TUN_RULES: &str = "Status: active\n\n\
@@ -532,7 +782,9 @@ mod tests {
         let n = FakeNet::new();
         s.put("/opt/bui-c/bin/sing-box", "ELF");
         s.reply("systemctl is-active --quiet bui-c.service", 0, "");
+        crate::testutil::running_service(&s);
         s.reply("ip link show bui-tun", 0, "5: bui-tun");
+        crate::testutil::present_tun(&s);
         s.reply(
             "ip -4 route show table all",
             0,
@@ -540,6 +792,7 @@ mod tests {
         );
         n.route(PROBE_URL, FakeReply::Status(204));
         profiles_tun().save(&s, &paths()).unwrap();
+        s.put("/opt/bui-c/config.json", "{}");
         assert_eq!(
             probe(&s, &n, &paths(), &profiles_tun()),
             vec![Failure::TunNoDefaultRoute]
@@ -547,11 +800,13 @@ mod tests {
     }
 
     #[test]
-    fn probe_collects_all_failures() {
+    fn probe_collects_local_failures_without_sending_an_uncaptured_request() {
         let s = FakeSys::new();
         let n = FakeNet::new();
         s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        crate::testutil::stopped_service(&s);
         s.reply("ip link show bui-tun", 1, "");
+        crate::testutil::missing_tun(&s);
         s.reply("ip -4 route show table all", 0, "");
         n.route(PROBE_URL, FakeReply::Status(403));
         let f = probe(&s, &n, &paths(), &profiles_tun());
@@ -559,11 +814,11 @@ mod tests {
             f,
             vec![
                 Failure::UnitDown,
-                Failure::Probe { got: Some(403) },
                 Failure::TunMissing,
                 Failure::TunNoDefaultRoute
             ]
         );
+        assert!(n.log().is_empty(), "本地服务或捕获未就绪时不发外部请求");
     }
 
     #[test]
@@ -571,6 +826,7 @@ mod tests {
         let s = FakeSys::new();
         let n = FakeNet::new();
         s.reply("systemctl is-active --quiet bui-c.service", 0, "");
+        crate::testutil::running_service(&s);
         n.route(PROBE_URL, FakeReply::Fail("connect timeout".into()));
         assert_eq!(
             probe(&s, &n, &paths(), &profiles_socks()),
@@ -583,7 +839,9 @@ mod tests {
         let s = FakeSys::new();
         let n = FakeNet::new();
         profiles_socks().save(&s, &paths()).unwrap();
+        s.put("/opt/bui-c/config.json", "{}");
         s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        crate::testutil::stopped_service(&s);
         n.route(PROBE_URL, FakeReply::Fail("no route".into()));
         let restarts = || {
             s.calls()
@@ -613,7 +871,7 @@ mod tests {
         assert_eq!(
             v,
             Verdict::Waiting {
-                failures: vec![Failure::UnitDown, Failure::Probe { got: None }],
+                failures: vec![Failure::UnitDown],
                 remaining_s: 30
             }
         );
@@ -674,7 +932,9 @@ mod tests {
         let s = FakeSys::new();
         let n = FakeNet::new();
         profiles_socks().save(&s, &paths()).unwrap();
+        s.put("/opt/bui-c/config.json", "{}");
         s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        crate::testutil::stopped_service(&s);
         n.route(PROBE_URL, FakeReply::Fail("no route".into()));
         let restarts = || {
             s.calls()
@@ -751,8 +1011,10 @@ mod tests {
     fn broken_socks(s: &FakeSys, n: &FakeNet) {
         s.put("/opt/bui-c/bin/sing-box", "ELF");
         s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        crate::testutil::stopped_service(s);
         n.route(PROBE_URL, FakeReply::Fail("no route".into()));
         profiles_socks().save(s, &paths()).unwrap();
+        s.put("/opt/bui-c/config.json", "{}");
     }
 
     #[test]
@@ -822,9 +1084,14 @@ mod tests {
         let n = FakeNet::new();
         s.put("/opt/bui-c/bin/sing-box", "ELF");
         s.reply("systemctl is-active --quiet bui-c.service", 0, "");
+        crate::testutil::running_service(&s);
         s.reply("ip link show bui-tun", 0, "5: bui-tun");
-        n.route(PROBE_URL, FakeReply::Status(502));
+        crate::testutil::present_tun(&s);
+        // 本地默认路由丢失授权恢复，外部探针本身正常。
+        s.reply("ip -4 route show table all", 0, "");
+        n.route(PROBE_URL, FakeReply::Status(204));
         profiles_tun().save(&s, &paths()).unwrap();
+        s.put("/opt/bui-c/config.json", "{}");
         let v = run(&s, &n, &paths()).unwrap();
         assert!(
             matches!(
