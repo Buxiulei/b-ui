@@ -380,6 +380,8 @@ impl FakeHy2Resi {
                         created_at_ms: now.saturating_sub(1),
                         closed_at_ms: now,
                     }),
+                    // 假内核把每条已完成的连接当**流上的事件**送达（与生产的事件路同形）
+                    from_snapshot: false,
                 },
             })
             .collect();

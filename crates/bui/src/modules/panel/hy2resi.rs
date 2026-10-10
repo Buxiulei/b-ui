@@ -72,7 +72,9 @@ pub(super) const STREAM_DOWN_MSG: &str =
     "住宅计量流不在（未建立或已中断）：没有任何确证字节，本轮不产生增量";
 
 /// `GET /connections` 里的一条连接。`metadata` 里**没有** user 字段，所以只留
-/// 归组要用的三项（`rule` 归人、`id` 踢人、`chains` 供自检看门位是否真生效）。
+/// 归人与踢人的三项（`rule` 归人、`id` 踢人、`chains` 原样留下）。`chains` **当前没有
+/// 消费方**（2026-10-10 核查：`traffic.rs` 的归组/踢人只用 `rule` 与 `id`，`selfcheck`
+/// 不读它）—— 保留它只是照抄内核报的形状，便于将来做门位自检时不必再改解析层。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hy2ResiConn {
     pub id: String,
@@ -221,10 +223,14 @@ pub fn parse_proxies_now(body: &str) -> anyhow::Result<BTreeMap<String, String>>
 ///
 /// 三个只在线上才看得见、又最容易读错的形状（上游 `daemon.StartedService` v1.14.3，
 /// `started_service.go`；G0 实测）：
-/// ① **首帧/重连快照**：`reset = true`，把订阅之前就存在的连接以 `NEW` + 完整快照发出来，
-///    closed 环里的条目也以 `NEW` 出现（`buildInitialConnectionState`，`:878`）⇒ 账本按
-///    id **upsert**，快照总量绝不累加。
-/// ② **`UPDATE` 只带增量**、不带 `connection` 对象（`buildTrafficUpdates`，`:958`）⇒ 只能
+/// ① **首帧/重连快照**：`reset = true`，把订阅之前就存在的连接以 `NEW` + 完整快照发出来
+///    （`buildInitialConnectionState`，`:879`）⇒ 在开的连接按 id **upsert**，快照总量绝不累加。
+///    **同一个函数还把 closed 环里的已关闭连接也以 `NEW` 发出来**（`:894-902`，显式置
+///    `conn.ClosedAt`）：那不是新连接，由下面 `closed_at != 0` 那一支分流到
+///    `Closed { from_snapshot: true }` —— 绝不许 upsert 进 `open`（幻影）；入不入账由账本
+///    定：**只有在册（见过它开着、还没结过账）的连接才补终值**，不在册一律跳过（已入过账 /
+///    从没见过，两类在账面上分不开；结构性幂等的论证见 `meter::Inner::close`）。
+/// ② **`UPDATE` 只带增量**、不带 `connection` 对象（`buildTrafficUpdates`，`:947`）⇒ 只能
 ///    按 id 关联；`uplink_delta` / `downlink_delta` 由账本累进 `known`（只服务指标 A）。
 /// ③ **`CLOSED` 可能没有 `connection`**：事件带了 id，但元数据已被 GC 时 `connection` 为
 ///    nil（`applyConnectionEvent` 的 `event.Metadata.ID != uuid.Nil` 判定，`:936`；实测
@@ -242,6 +248,21 @@ pub fn frame_of_events(msg: &ConnectionEvents) -> Frame {
         }
         let kind = match ConnectionEventType::try_from(e.r#type) {
             Ok(ConnectionEventType::ConnectionEventNew) => match e.connection.as_ref() {
+                // 快照里 closed 环的条目也走 `NEW`，但它是「已关闭」的公告：上游只在那
+                // 一段（`:894-902`）显式置 `conn.ClosedAt = metadata.ClosedAt.UnixMilli()`
+                //（`:896` 是 v1.14.3 里**唯一**给 `NEW` 置非零 `closedAt` 的地方，而它只在
+                // `reset` 帧里发：`buildTrafficUpdates` / `applyConnectionEvent` 的 `NEW`
+                // 都经 `buildConnectionProto`（`:1045`）出不来非零值）⇒ `closed_at != 0`
+                // 就是判别式。按 `Closed` + `from_snapshot` 走：由账本决定入不入账 ——
+                // 在册才补终值并从 `open` 摘掉（gap 期间关掉、没入过账的连接靠它补回），
+                // 不在册一律跳过（见 `meter::Inner::close` 的结构性幂等；旧实现无条件入账，
+                // 去重条目老化后会被重订阅快照双计）。绝不 upsert 进 `open`（幻影）。
+                Some(c) if c.closed_at != 0 => EventKind::Closed {
+                    conn: Some(closed_conn(c)),
+                    // 这一支在实践中只出现在 `reset` 帧（上面那段）；按本帧自己的快照标记
+                    // 转交语义，上游真改了形态也只是退化成事件路（无条件入账）而不是丢账。
+                    from_snapshot: msg.reset,
+                },
                 Some(c) => EventKind::New { total: totals(c) },
                 // 没有快照的 NEW 语义未知（上游不这么发）⇒ 不给它在册，别猜
                 None => continue,
@@ -254,6 +275,8 @@ pub fn frame_of_events(msg: &ConnectionEvents) -> Frame {
             },
             Ok(ConnectionEventType::ConnectionEventClosed) => EventKind::Closed {
                 conn: e.connection.as_ref().map(closed_conn),
+                // 流上的事件（v1.14.3 的 `reset` 帧只含 `NEW`）：规则 1 的账源，无条件入账
+                from_snapshot: false,
             },
             // 认不出的类型（更新的内核加了新枚举值）：跳过。别当 NEW —— 拿未知语义的快照
             // 去 upsert `open`，会让指标 A 的 ΔS 从此带上一个说不清的偏差。
@@ -483,8 +506,9 @@ impl Hy2ResiApi for Hy2ResiClient {
             };
             self.ledger.apply(frame, super::meter::now_ms());
             if self.ledger.take_resubscribe() {
-                // 指标 A 越线时账本自己要求的：重订阅一次，快照能补 14–30s 内的已关闭
-                // 连接（按 id 去重，重收不重计）。故意重连也要按中断记（封账 + 可疑损失）。
+                // 指标 A 越线时账本自己要求的：重订阅一次，快照给**在册**（见过 NEW、CLOSED
+                // 丢了）的连接补终值（结构性幂等：不在册的一律跳过，重播多少次都不重计）。
+                // 故意重连也要按中断记（封账 + 可疑损失）。
                 anyhow::bail!("按账本请求重订阅一次（指标 A 越线）")
             }
         }
@@ -617,15 +641,16 @@ mod tests {
             user_of_rule("auth_user=alice => route(gate-r000)"),
             Some("alice")
         );
-        assert_eq!(user_of_rule("final => route(deny)"), None);
+        // 没有规则命中（`route.final` 兜底）时 sing-box 写的是**裸 `"final"`**、没有
+        // `" => route(...)"` 后缀（`connections.go` 的 else 分支；2026-10-10 真机实测，
+        // 官方 1.14.3 —— 别按 `"final => route(deny)"` 这种内核不会产出的形状写夹具）
+        assert_eq!(user_of_rule("final"), None);
         assert_eq!(user_of_rule(""), None);
         // 中文用户名（生产上真实存在）
         assert_eq!(
             user_of_rule("auth_user=张三 => route(gate-r007)"),
             Some("张三")
         );
-        // 没有规则命中时 sing-box 写的就是裸 "final"（connections.go 的 else 分支）
-        assert_eq!(user_of_rule("final"), None);
         // 多用户形态归不到单个用户（rule_item_auth_user.go:36）
         assert_eq!(
             user_of_rule("auth_user=[alice bob] => route(gate-r000)"),
@@ -697,7 +722,9 @@ mod tests {
     /// 用生成的真实类型构造（不是字符串 JSON）：字段名改了这里就编不过，比运行时断言更早。
     #[test]
     fn connection_events_translate_to_ledger_events() {
-        let conn = |up: i64, down: i64| Connection {
+        // `closed_at` 由调用方给：**真在开的连接恒为 0**（上游 `buildConnectionProto`
+        // 不置它），非零只出现在「已关闭」的连接上 —— 解析器就是按它分流 NEW 的。
+        let conn = |up: i64, down: i64, closed_at: i64| Connection {
             id: "a".into(),
             user: "alice".into(),
             destination: "example.com:443".into(),
@@ -705,7 +732,7 @@ mod tests {
             uplink_total: up,
             downlink_total: down,
             created_at: 1_000,
-            closed_at: 2_000,
+            closed_at,
             ..Default::default()
         };
         let msg = ConnectionEvents {
@@ -715,7 +742,7 @@ mod tests {
                 ConnectionEvent {
                     r#type: ConnectionEventType::ConnectionEventNew as i32,
                     id: "a".into(),
-                    connection: Some(conn(100, 200)),
+                    connection: Some(conn(100, 200, 0)),
                     ..Default::default()
                 },
                 // UPDATE：只有增量、没有 connection 对象（上游 buildTrafficUpdates）
@@ -734,19 +761,26 @@ mod tests {
                     downlink_delta: -6,
                     ..Default::default()
                 },
-                // CLOSED 带元数据：终值 + 归属
+                // CLOSED 带元数据：终值 + 归属（上游在这一支把 conn.ClosedAt 也置上）
                 ConnectionEvent {
                     r#type: ConnectionEventType::ConnectionEventClosed as i32,
                     id: "a".into(),
-                    connection: Some(conn(100, 200)),
+                    connection: Some(conn(100, 200, 2_000)),
                     closed_at: 2_000,
                     ..Default::default()
                 },
-                // CLOSED 没有元数据（被打到 GC 的那 14 条）：账本走 conn=None，字节进总账不归人
+                // CLOSED 没有元数据（上游这一帧没带连接明细）：账本走 conn=None，字节进总账不归人
                 ConnectionEvent {
                     r#type: ConnectionEventType::ConnectionEventClosed as i32,
                     id: "b".into(),
                     closed_at: 3_000,
+                    ..Default::default()
+                },
+                // NEW 却带非零 closed_at：快照里已关的连接（只有 reset 帧会有）
+                ConnectionEvent {
+                    r#type: ConnectionEventType::ConnectionEventNew as i32,
+                    id: "d".into(),
+                    connection: Some(conn(5, 6, 4_000)),
                     ..Default::default()
                 },
                 // 认不出的枚举值（更新的内核加了新类型）：跳过，不猜
@@ -758,13 +792,16 @@ mod tests {
                 // 空 id 是坏帧：丢掉，别造一个会互相碰撞的空键
                 ConnectionEvent {
                     r#type: ConnectionEventType::ConnectionEventNew as i32,
-                    connection: Some(conn(1, 1)),
+                    connection: Some(conn(1, 1, 0)),
                     ..Default::default()
                 },
             ],
         };
         let f = frame_of_events(&msg);
-        assert!(f.reset, "reset 透传：账本靠它决定要不要按快照 upsert");
+        assert!(
+            f.reset,
+            "reset 透传：解析器按它把 NEW+closed_at 分流成快照派生的 Closed"
+        );
         assert!(f.global.is_none(), "连接事件流不带全局总量");
         assert_eq!(
             f.events,
@@ -798,14 +835,304 @@ mod tests {
                             created_at_ms: 1_000,
                             closed_at_ms: 2_000,
                         }),
+                        // 类型 CLOSED 是流上的事件（规则 1 的账源）：即使本帧 reset=true
+                        // 也不许标成快照派生 —— 它丢了就没人补。
+                        from_snapshot: false,
                     },
                 },
                 Event {
                     id: "b".into(),
-                    kind: EventKind::Closed { conn: None },
+                    kind: EventKind::Closed {
+                        conn: None,
+                        from_snapshot: false,
+                    },
+                },
+                // NEW + closed_at != 0：只有 `reset` 帧里才有（上游 `:896` 是唯一置
+                // `ClosedAt` 的地方），转成快照派生的 Closed —— 入不入账由账本定
+                Event {
+                    id: "d".into(),
+                    kind: EventKind::Closed {
+                        conn: Some(ClosedConn {
+                            user: Some("alice".into()),
+                            destination: Some("example.com:443".into()),
+                            network: Some("tcp".into()),
+                            total: TxRx { tx: 5, rx: 6 },
+                            created_at_ms: 1_000,
+                            closed_at_ms: 4_000,
+                        }),
+                        from_snapshot: true,
+                    },
                 },
             ]
         );
+    }
+
+    /// **结构性幂等回归（本批裁决）**：去重表老化 **不是** 快照重投不再入账的依据 ——
+    /// 依据是「该 id 还在不在 `open` 里」（快照派生的 Closed 只有在册才补账，见
+    /// `meter::Inner::close`）。旧行为（快照 Closed 无条件入账）在这里会第二次 book：
+    /// 正常入账 → 去重条目 >`DEDUP_TTL_MS` 老化 → 重订阅快照把 closed 环条目原样重播
+    /// ⇒ 再记一笔。这条先红后绿，钉死的就是那笔不该出现的重复。
+    #[test]
+    fn an_aged_out_snapshot_closed_entry_is_never_rebooked() {
+        use super::super::meter::DEDUP_TTL_MS;
+        let l = Ledger::new();
+        // 正常走完一条连接：NEW → CLOSED（事件路），入账 100/200
+        let normal = ConnectionEvents {
+            reset: false,
+            events: vec![
+                ConnectionEvent {
+                    r#type: ConnectionEventType::ConnectionEventNew as i32,
+                    id: "c1".into(),
+                    connection: Some(Connection {
+                        id: "c1".into(),
+                        user: "alice".into(),
+                        created_at: 1_000,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                ConnectionEvent {
+                    r#type: ConnectionEventType::ConnectionEventClosed as i32,
+                    id: "c1".into(),
+                    connection: Some(Connection {
+                        id: "c1".into(),
+                        user: "alice".into(),
+                        created_at: 1_000,
+                        closed_at: 2_000,
+                        uplink_total: 100,
+                        downlink_total: 200,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            ],
+        };
+        l.apply(frame_of_events(&normal), 0);
+        let mut want = BTreeMap::new();
+        want.insert("alice".to_string(), TxRx { tx: 100, rx: 200 });
+        assert_eq!(l.drain(1), want, "第一次照常入账");
+        // >120s：一帧空帧把去重条目老化掉（重订阅发生在 TTL 之外是常态）
+        l.apply(Frame::default(), DEDUP_TTL_MS + 1);
+        // 重订阅快照：内核把该连接的 closed 环条目以 `NEW` + `closed_at != 0` 原样重播
+        let replay = ConnectionEvents {
+            reset: true,
+            events: vec![ConnectionEvent {
+                r#type: ConnectionEventType::ConnectionEventNew as i32,
+                id: "c1".into(),
+                connection: Some(Connection {
+                    id: "c1".into(),
+                    user: "alice".into(),
+                    created_at: 1_000,
+                    closed_at: 2_000,
+                    uplink_total: 100,
+                    downlink_total: 200,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+        };
+        l.apply(frame_of_events(&replay), DEDUP_TTL_MS + 2);
+        assert!(
+            l.drain(DEDUP_TTL_MS + 3).is_empty(),
+            "老化后的快照重播不许再入账一笔：入账只认第一次"
+        );
+        let view = l.view(DEDUP_TTL_MS + 3);
+        assert_eq!(
+            view.booked,
+            TxRx { tx: 100, rx: 200 },
+            "账本上只有第一次的 100/200"
+        );
+        assert_eq!(
+            view.stat.snapshot_closed_skipped, 1,
+            "跳过要在账面上看得见：{view:?}"
+        );
+    }
+
+    /// **补账路径**：连接在 gap 里关掉（CLOSED 事件丢），重订阅快照的 closed 环条目把它
+    /// 按终值补账 —— 但只补一次，且依据是「还在册」而不是时间：补过之后 id 离开 `open`、
+    /// 进了去重表，此后**无论隔多久**再重播都跳过（结构性幂等）。去重表老化只影响
+    /// `dup_closed` / `snapshot_closed_skipped` 的记账，不影响入不入账。
+    #[test]
+    fn snapshot_closed_compensates_an_open_connection_exactly_once() {
+        let l = Ledger::new();
+        // 快照1：连接在开（在册）；它的 CLOSED 原件在随后丢了（本测试不投）
+        let live = ConnectionEvents {
+            reset: true,
+            events: vec![ConnectionEvent {
+                r#type: ConnectionEventType::ConnectionEventNew as i32,
+                id: "gone".into(),
+                connection: Some(Connection {
+                    id: "gone".into(),
+                    user: "alice".into(),
+                    created_at: 1_000,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+        };
+        l.apply(frame_of_events(&live), 0);
+        assert_eq!(l.view(0).open_conns, 1, "见过它开着");
+        // 快照2（重订阅）：它现在的形态是 closed 环条目（`NEW` + `closed_at != 0`）
+        let closed_ring = || ConnectionEvents {
+            reset: true,
+            events: vec![ConnectionEvent {
+                r#type: ConnectionEventType::ConnectionEventNew as i32,
+                id: "gone".into(),
+                connection: Some(Connection {
+                    id: "gone".into(),
+                    user: "alice".into(),
+                    created_at: 1_000,
+                    closed_at: 2_000,
+                    uplink_total: 300,
+                    downlink_total: 400,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+        };
+        l.apply(frame_of_events(&closed_ring()), 1_000);
+        let mut want = BTreeMap::new();
+        want.insert("alice".to_string(), TxRx { tx: 300, rx: 400 });
+        assert_eq!(l.drain(1_001), want, "在册的连接靠快照补账，一次");
+        assert_eq!(l.view(1_001).open_conns, 0, "补账即摘册");
+        // 快照3：立刻重播 —— 不在册 ⇒ 跳过（去重表还热，记一笔 dup）
+        l.apply(frame_of_events(&closed_ring()), 2_000);
+        assert!(l.drain(2_001).is_empty(), "第二次不许再补");
+        assert_eq!(l.view(2_001).stat.dup_closed, 1, "热窗口里的重播记 dup");
+        // 老化（>TTL）后再重播 —— 仍然跳过：幂等不依赖时间
+        l.apply(Frame::default(), 200_000);
+        l.apply(frame_of_events(&closed_ring()), 200_001);
+        assert!(l.drain(200_002).is_empty(), "老化之后的重播也不许再入账");
+        let view = l.view(200_002);
+        assert_eq!(
+            view.booked,
+            TxRx { tx: 300, rx: 400 },
+            "账上只有一次 300/400"
+        );
+        assert_eq!(view.stat.snapshot_closed_skipped, 1, "{view:?}");
+    }
+
+    /// **正常路径不许被误伤**：流上来的 `CLOSED` 事件（非快照）照旧**无条件入账** ——
+    /// 包括从没见过 `NEW` 的 id（gap 里 NEW 与 CLOSED 一起丢的那类，靠它补回），
+    /// 也包括同一帧重投（去重表吸收，不双计）。这条在批前批后都必须绿。
+    #[test]
+    fn event_closed_for_an_id_never_seen_open_still_books() {
+        let l = Ledger::new();
+        let msg = ConnectionEvents {
+            reset: false,
+            events: vec![ConnectionEvent {
+                r#type: ConnectionEventType::ConnectionEventClosed as i32,
+                id: "x".into(),
+                connection: Some(Connection {
+                    id: "x".into(),
+                    user: "alice".into(),
+                    created_at: 1_000,
+                    closed_at: 2_000,
+                    uplink_total: 10,
+                    downlink_total: 20,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+        };
+        l.apply(frame_of_events(&msg), 2_000);
+        let mut want = BTreeMap::new();
+        want.insert("alice".to_string(), TxRx { tx: 10, rx: 20 });
+        assert_eq!(
+            l.drain(2_001),
+            want,
+            "事件路的 CLOSED 不看 open、不看去重表，无条件入账"
+        );
+        // 同一帧重投（实测 114µs）：幂等吸收，不双计
+        l.apply(frame_of_events(&msg), 2_002);
+        assert!(l.drain(2_003).is_empty(), "重投不双计");
+        assert_eq!(l.view(2_003).stat.dup_closed, 1);
+    }
+
+    /// 快照（`reset = true`）里 **closed 环的条目也以 `NEW` 出现**（上游
+    /// `buildInitialConnectionState` 的第二段循环），但它公告的是「已经关闭」：
+    /// 判别字段是 `connection.closedAt` —— 那一段显式置 `conn.ClosedAt =
+    /// metadata.ClosedAt.UnixMilli()`（`:896`），而真在开的连接经 `buildConnectionProto`
+    /// 出不来非零值。解析器必须把它**路由到 `Closed`**（且标 `from_snapshot: true`）
+    /// 而不是 `New`：
+    /// - 走 `New` ⇒ 每次（重新）订阅都把 gap 期间关闭、从未入账的连接重新种进 `g.open`
+    ///   （去重表只在入账 helper `book()` 里写，`apply` 的 `booked` 守卫挡不住这一类）
+    ///   ⇒ 永久幻影，污染指标 A 的 ΔS 基线；
+    /// - 走 `Closed` ⇒ 入不入账由账本定：**在册**（见过 NEW、CLOSED 丢了）才补终值，
+    ///   不在册一律跳过 —— 本测试里账本从没见过 `gone` 开着（重启后的新账本 /
+    ///   120 s 外的重订阅），所以它跳过不入户，重播多少次都还是跳过。
+    #[test]
+    fn snapshot_closed_ring_entries_route_to_closed_and_unseen_ones_skip() {
+        // 一帧重连快照：一条真在开的连接 + 一条 closed 环里的已关闭连接（上游原文形态）
+        let snapshot = || ConnectionEvents {
+            reset: true,
+            events: vec![
+                ConnectionEvent {
+                    r#type: ConnectionEventType::ConnectionEventNew as i32,
+                    id: "live".into(),
+                    connection: Some(Connection {
+                        id: "live".into(),
+                        user: "alice".into(),
+                        created_at: 1_000,
+                        uplink_total: 10,
+                        downlink_total: 20,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                ConnectionEvent {
+                    r#type: ConnectionEventType::ConnectionEventNew as i32,
+                    id: "gone".into(),
+                    connection: Some(Connection {
+                        id: "gone".into(),
+                        user: "alice".into(),
+                        created_at: 1_000,
+                        closed_at: 2_000,
+                        uplink_total: 300,
+                        downlink_total: 400,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            ],
+        };
+        let parsed = frame_of_events(&snapshot());
+        assert!(
+            matches!(
+                parsed.events[1].kind,
+                EventKind::Closed {
+                    conn: Some(_),
+                    from_snapshot: true
+                }
+            ),
+            "closed 环条目要翻译成快照派生的 Closed，不是 New：{:?}",
+            parsed.events[1].kind
+        );
+
+        let l = Ledger::new();
+        l.apply(parsed, 1_000);
+        let view = l.view(1_000);
+        assert_eq!(view.open_conns, 1, "只有真在开的那条该进 open（无幻影）");
+        assert_eq!(
+            view.booked,
+            TxRx { tx: 0, rx: 0 },
+            "不在册的 closed 条目跳过：账本从没见过它开着"
+        );
+        assert_eq!(view.stat.snapshot_closed_skipped, 1, "{view:?}");
+        // 重订阅会原样重发同一帧快照：仍然跳过 —— 跳过不依赖时间，永不重计
+        l.apply(frame_of_events(&snapshot()), 2_000);
+        let view = l.view(2_000);
+        assert_eq!(view.open_conns, 1, "重投的快照不许把 closed 条目种进 open");
+        assert_eq!(
+            view.booked,
+            TxRx { tx: 0, rx: 0 },
+            "跳过就是不入账，重播多少次都一样"
+        );
+        assert_eq!(
+            view.stat.snapshot_closed_skipped, 2,
+            "两次重播各记一笔跳过：{view:?}"
+        );
+        assert!(l.drain(3_000).is_empty(), "没有增量可排");
     }
 
     /// `traffic_available = false` ⇒ `global = None`（这一帧**不更新**指标 A 的 G），
@@ -836,11 +1163,13 @@ mod tests {
 
     #[test]
     fn connections_and_proxies_bodies_parse_and_tolerate_junk() {
-        // 形状抄自 `experimental/clashapi/connections.go` 的 MarshalJSON
+        // 形状抄自 `experimental/clashapi/connections.go` 的 MarshalJSON；`chains` 的顺序
+        // 照 2026-10-10 真机实测（官方 1.14.3）：**最内层在前** —— `["slot-0-out","gate-r000"]`，
+        // 别把夹具写成反的（解析器原样保留，顺序写反会让将来自检的断言对不上真机）。
         let conns = parse_connections(
             r#"{"downloadTotal":1,"uploadTotal":2,"connections":[
                 {"id":"c1","metadata":{"network":"udp","host":"example.com"},
-                 "upload":1,"download":2,"chains":["gate-r000","slot-0-out"],
+                 "upload":1,"download":2,"chains":["slot-0-out","gate-r000"],
                  "rule":"auth_user=r000 => route(gate-r000)","rulePayload":""},
                 {"id":"c2","rule":"final","chains":[]},
                 {"id":"c3"},
@@ -853,7 +1182,7 @@ mod tests {
                 Hy2ResiConn {
                     id: "c1".into(),
                     rule: "auth_user=r000 => route(gate-r000)".into(),
-                    chains: vec!["gate-r000".into(), "slot-0-out".into()],
+                    chains: vec!["slot-0-out".into(), "gate-r000".into()],
                 },
                 Hy2ResiConn {
                     id: "c2".into(),

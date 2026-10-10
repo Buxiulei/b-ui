@@ -71,9 +71,10 @@
 //!   **直接证明的是前半**：摘掉 relay 那条，客户端只发 IP 的流量会静默直连。「摘掉这一条
 //!   不会」是由 item12 第 ① 条（hy2 侧的 sniff **不改写连接目标**、relay 收到的始终是客户端
 //!   原样发来的地址）**推得**的推论，不是对照实验的直接结论。
-//! - **面板 / CLI**：`/connections` 的归户只读 `rule` / `chains` / `id`
-//!   （`bui` 的 `panel::hy2resi::Hy2ResiConn`），`metadata.host` 一处都没读；失去它
-//!   不改变任何显示。`inbound connection to …` 那条日志行在 route 之前打，照旧。
+//! - **面板 / CLI**：`/connections` 的归户只读 `rule` / `id`（`bui` 的
+//!   `panel::hy2resi::Hy2ResiConn`；`chains` 照抄内核形状留着，**当前没有消费方**），
+//!   `metadata.host` 一处都没读；失去它不改变任何显示。`inbound connection to …`
+//!   那条日志行在 route 之前打，照旧。
 use crate::model::{Hy2Pool, NodeParams};
 use crate::paths::Paths;
 use crate::slots::{MAX_SLOTS, RELAY_SOCKS_BASE};

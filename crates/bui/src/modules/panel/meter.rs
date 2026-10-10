@@ -18,11 +18,13 @@
 //! 3. **按 `(实例代际, 连接 id)` 幂等 upsert**（`reset=true` 的首帧/重连快照带订阅**之前**
 //!    就存在的连接及其累计量；同一连接两帧 CLOSED 实测相隔 114µs、字段全同）。
 //!    代际来自 `GetStartedAt`，换代即清空 id 空间（[`Ledger::note_session_start`]）。
-//!    **幂等只在窗口内承诺**：`DEDUP_TTL_MS`（120 s = 实测重投窗口 14–30 s 的 4 倍余量）
-//!    之内同一 id 的 CLOSED 只记一次，窗口外再投递按「新连接」入账 —— 有界的近似幂等
-//!    换掉无界的去重表（生产洪泛下内存无上界）。边界由
-//!    `dedup_entries_expire_after_the_ttl` 钉死；容量挤掉**年轻**（仍在重投窗口内）条目
-//!    的风险以「有损」进日志，挤掉年老条目只记 [`MeterStat::dedup_evicted`]。
+//!    **幂等有两条腿**：快照派生的 CLOSED 是**结构性幂等** —— 只有在册（`open`）的连接
+//!    才补账、补过即离册，与时间无关（[`Inner::close`]，本批裁决：旧的无条件入账在去重
+//!    条目老化后会被重订阅快照双计）；事件路的 CLOSED 在 `DEDUP_TTL_MS` 窗口内同一 id
+//!    只记一次，窗口外再投递按「新连接」入账 —— 有界的近似幂等换掉无界的去重表（生产
+//!    洪泛下内存无上界）。事件路的边界由 `dedup_entries_expire_after_the_ttl` 钉死；
+//!    容量挤掉**年轻**（仍在重投窗口内）条目的风险以「有损」进日志，挤掉年老条目只记
+//!    [`MeterStat::dedup_evicted`]。
 //! 4. **绝不用 Σdelta 与 Σtotal 相加**（朴素相加过账 **1.96–1.97×**）：两者活在两个不同的
 //!    账里，`known` 与 `booked_total` 从不相交。
 //! 5. **亚 tick 连接必须入账**（40/40 sub-ms、60/60 ~1–2ms 的终值完整）：CLOSED 一律入账，
@@ -32,8 +34,16 @@
 //! 7. **`conn=nil` 的 CLOSED 必须显式处理**（实测 14 条、39,168/41,472 字节无处登记）：
 //!    它的字节进 `booked_total`（否则会被指标 A 当成丢失）但**不进任何人的账**，
 //!    走 `stat.unnamed_closed` / `stat.unnamed_bytes` 可见。
-//! 8. **不依赖 closed 环 / 快照做审计或补账**（GC 终结器随机清空，寿命 14–30s）：账本只认
-//!    送到手上的 CLOSED 事件；快照只用来 upsert `open`（规则 3）。
+//! 8. **不把审计建在 closed 环上**（上游 1.14.3 核查：环是 1000 条定容 FIFO
+//!    （`closedConnectionsLimit`，`common/trafficcontrol/manager.go:30`），溢出 `PopFront`
+//!    淘汰最旧（`:103-104`），**没有基于时间的 GC**，只有服务停止/重载时 `Clear()`
+//!    （`:65` 把 `Clear` 注册进 scope cleanup）；条目寿命 = 1000 ÷ 关闭速率，由流量决定，
+//!    空闲时可挂无限久 —— 「GC 终结器随机清空、寿命 14–30 s」是已证伪的旧说法，别再引用）。
+//!    账本只认送到手上的 CLOSED 事件——快照里 closed 环的条目由解析器翻成 CLOSED
+//!    （`hy2resi::frame_of_events`），但**只对该 id 还在册（`open`）的连接补账**
+//!    （在册 = 确证没结过账，见 [`Inner::close`]），不在册的一律跳过、不猜（跳过量与代价
+//!    记 [`MeterStat::snapshot_closed_skipped`]）；快照里仍在开的条目只用来 upsert
+//!    `open`（规则 3）。
 //! 9. **实例代际用 `GetStartedAt`**：换代即封账（`mark = None`）+ 记一条「可疑损失」观察。
 //! 10. **UDP 计费口径 = 账本净负载**（不可配置的产品决策，见下）。
 //! 11. **归属键 = `connection.user`**（服务端 `users[].name`），出账时由采样器经
@@ -105,8 +115,11 @@ pub const METERING_LOSS_TAG: &str = "有损";
 
 /// 已入账 id 的去重窗口（实测重复 CLOSED 两帧相隔 114µs；120 秒是三个数量级的余量）
 pub const DEDUP_TTL_MS: i64 = 120_000;
-/// 「还在可能被重投的窗口里」的判据：实测 closed 环/退避补投最远 14–30 s。
-/// 容量淘汰只对**比它年轻**的条目才判有损（那些 id 的重复 CLOSED 还能再投回来）。
+/// 「还在可能被重投的窗口里」的判据：容量淘汰只对**比它年轻**的条目才判有损（那些 id 的
+/// 重复 CLOSED 若还在路上，被挤掉就会重复入账）。旧注释把它标成「实测 closed 环/退避补投
+/// 最远 14–30 s」——**快照那条路已证伪**（环没有时间 GC，且重投现在由结构性闸门挡掉、
+/// 不依赖本窗口；见规则 8 与 [`Inner::close`]）；剩下的事件路重复投递实测是 114µs 的连发
+/// 两帧（[`DEDUP_TTL_MS`]），30 s 是宽余量，不是某个实测的补投上限。
 pub const REFILL_WINDOW_MS: i64 = 30_000;
 /// 去重表容量上限（≈ 273 条/秒持续 120 s；1000 条/秒的洪泛也能盖住 30 s 补投窗口）。
 /// 超了按入账时间淘汰最旧的：淘汰**年轻**条目（年龄 < [`REFILL_WINDOW_MS`]）意味着
@@ -209,14 +222,23 @@ impl ClosedConn {
 /// 事件。`Update` 只有增量（实测它不带 `connection` 对象），`Closed` 可能没有连接对象。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventKind {
-    /// `NEW`：带创建时的快照总量（通常 0）。`reset` 快照也走这里 —— 一律 **upsert**。
+    /// `NEW`：带创建时的快照总量（通常 0）。`reset` 快照里**仍在开**的条目也走这里 ——
+    /// 一律 **upsert**（closed 环的条目由解析器分流到 `Closed`，见 `hy2resi::frame_of_events`）。
     /// **不带 user**：归属只在 CLOSED 从 `conn.user` 取（规则 11），NEW 的 user 无人读
     /// （带它会让 `Open` 不是 `Copy`、也让「归属键只有一处」这条线多一个岔口）。
     New { total: TxRx },
     /// `UPDATE`：只有增量。**只累加进 `known`**（服务指标 A 的 ΔS），绝不入账。
     Update { delta: TxRv },
     /// `CLOSED`：`conn = None` 是实测 14 条的那一类（字节无处登记，必须显式处理）。
-    Closed { conn: Option<ClosedConn> },
+    ///
+    /// `from_snapshot`：这条终结值是**快照重放**（closed 环，`reset` 帧里以 `NEW` +
+    /// `closed_at != 0` 出现）还是**流上的事件**。前者对同一 id 只承诺一次，入账判据是
+    /// 「该 id 还在不在 `open` 里」；后者是规则 1 的账源，无条件入账。判别理由见
+    /// [`Inner::close`]。
+    Closed {
+        conn: Option<ClosedConn>,
+        from_snapshot: bool,
+    },
 }
 
 /// `Update` 的增量对（与 [`TxRx`] 同构；单独起名是为了让「这里只可能是增量」写进类型里）
@@ -225,7 +247,9 @@ pub type TxRv = TxRx;
 /// 一帧（`SubscribeConnections` 的一次投递，或一次 `SubscribeStatus` 的全局量）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Frame {
-    /// `ConnectionEvents.reset`：首帧/重连快照。**按 id upsert，快照 totals 绝不累加。**
+    /// `ConnectionEvents.reset`：首帧/重连快照。**仍在开的按 id upsert（快照 totals 是重赋值，
+    /// 绝不累加）；closed 环的条目由解析器分流到 `Closed`（`from_snapshot = true`）——
+    /// 只有在册（`open`）的连接才按终值补账，其余一律跳过（[`Inner::close`]）。**
     pub reset: bool,
     /// 最近一次 `SubscribeStatus` 的 `uplinkTotal + downlinkTotal`（指标 A 的 G）。
     /// `None` = 这一帧不含全局量；`trafficAvailable = false` 时也是 `None`。
@@ -254,6 +278,9 @@ pub struct MeterStat {
     pub dup_closed: u64,
     /// 没配到 NEW 的 CLOSED（成对率 = 1 − orphan/closed）
     pub orphan_closed: u64,
+    /// 快照重放里**不在册**而被跳过的 closed 条目（已入过账、或从没见过；两类分不开）。
+    /// 它们不入账是结构性幂等的要求（[`Inner::close`]），代价在这里可见。
+    pub snapshot_closed_skipped: u64,
     /// `conn = nil` 的 CLOSED（实测 14 条）
     pub unnamed_closed: u64,
     pub unnamed_bytes: u64,
@@ -515,7 +542,10 @@ impl Ledger {
                         let entry = g.open.entry(ev.id).or_default();
                         entry.known.add(delta);
                     }
-                    EventKind::Closed { conn } => g.close(&ev.id, conn, now_ms, &mut alerts),
+                    EventKind::Closed {
+                        conn,
+                        from_snapshot,
+                    } => g.close(&ev.id, conn, from_snapshot, now_ms, &mut alerts),
                 }
             }
             // 去重表逐帧维护一次（逐事件调用是 N²）；容量淘汰的告警也走 `alerts`
@@ -568,7 +598,8 @@ impl Ledger {
                     }
                     if gap >= ALERT_BYTES || (dg > 0 && pct >= ALERT_PCT) {
                         g.stat.lossy_intervals += 1;
-                        // 重订阅一次：快照能补 14–30s 内的已关闭连接（按 id 去重，重收不重计）
+                        // 重订阅一次：快照给**在册**（见过 NEW、CLOSED 丢了）的连接补终值
+                        // （结构性幂等：不在册的一律跳过，重播多少次都不重计；见 `Inner::close`）
                         g.resubscribe = true;
                         let text = format!(
                             "后缀丢失：本区间 {gap} B 未确证（全局 {dg} B 的 {pct}%，阈值 {ALERT_BYTES} B 或 {ALERT_PCT}%），\
@@ -708,8 +739,40 @@ impl Ledger {
 
 impl Inner {
     /// `CLOSED` 的入账（规则 1/2/7/11 + 指标 C 的孤儿计数）。
-    fn close(&mut self, id: &str, conn: Option<ClosedConn>, now_ms: i64, alerts: &mut Vec<Alert>) {
+    ///
+    /// **快照派生的 Closed（`from_snapshot = true`）只有在册才入账** —— 这是结构性幂等，
+    /// 不依赖 `DEDUP_TTL_MS`（本批裁决；旧行为「无条件入账」在去重条目老化后会被重订阅
+    /// 快照双计，实测路径：常驻连接 >120 s 后再重订阅）：
+    /// - id 在 `open` 里 = 我们确证见过它开着、且还没有它的终值 ⇒ 补账一次，随即
+    ///   `open.remove` + `book()` 写入去重表。**此后 id 永远不会再回 `open`**（booked 的
+    ///   id 被 `apply` 的 New 分支挡住；已关闭的连接也不会再出现在内核的活动连接表里）
+    ///   ⇒ 下一次重播（哪怕隔几小时、去重条目早已老化）仍然不在册、仍然跳过，**不可能
+    ///   双计**。
+    /// - id 不在 `open` 里 = 已入过账（终值已落账）或从没见过（gap 里 NEW 与 CLOSED 都
+    ///   丢）⇒ 跳过：这两类在账面上分不开（去重表会老化、不能当「没入过账」的证据），
+    ///   而「结构上不可能重复入账」要求两类都不入账。
+    ///   代价（从没见过的那类补不回账）由 `snapshot_closed_skipped` 可见 —— 账目不确定
+    ///   时不猜、不静默。
+    ///
+    /// 流上的事件 `Closed`（`from_snapshot = false`）是规则 1 的账源：**无条件入账**，
+    /// 包括从没见过 NEW 的孤儿（gap 丢失靠它补回），与上面这条闸门无关。
+    fn close(
+        &mut self,
+        id: &str,
+        conn: Option<ClosedConn>,
+        from_snapshot: bool,
+        now_ms: i64,
+        alerts: &mut Vec<Alert>,
+    ) {
         self.stat.closed += 1;
+        if from_snapshot && !self.open.contains_key(id) {
+            if self.dedup.contains_key(id) {
+                self.stat.dup_closed += 1;
+            } else {
+                self.stat.snapshot_closed_skipped += 1;
+            }
+            return;
+        }
         if self.dedup.contains_key(id) {
             self.stat.dup_closed += 1;
             return;
@@ -876,6 +939,8 @@ mod tests {
         }
     }
 
+    /// 事件路的 `CLOSED`（`from_snapshot = false`）：无条件入账，不看 `open`、不看去重表
+    /// 之外的任何东西
     fn closed(user: &str, total: TxRx, created: i64, closed: i64) -> EventKind {
         EventKind::Closed {
             conn: Some(ClosedConn {
@@ -886,6 +951,7 @@ mod tests {
                 created_at_ms: created,
                 closed_at_ms: closed,
             }),
+            from_snapshot: false,
         }
     }
 
@@ -1030,7 +1096,16 @@ mod tests {
         l.drain(1_000);
         l.apply(ev("c1", new(txrx(0, 0))), 1_100);
         l.apply(ev("c1", update(39_000, 168)), 1_200);
-        l.apply(ev("c1", EventKind::Closed { conn: None }), 1_200);
+        l.apply(
+            ev(
+                "c1",
+                EventKind::Closed {
+                    conn: None,
+                    from_snapshot: false,
+                },
+            ),
+            1_200,
+        );
         // 这 39,168 B 在全局账上也是要出现的（内核没丢它们，只是没给出归属），
         // 所以第二帧全局量把它们带上 —— 缺口必须仍然是 0
         l.apply(status(79_000, 1_640), 1_300);
@@ -1261,6 +1336,7 @@ mod tests {
                         created_at_ms: 1_000,
                         closed_at_ms: 2_000,
                     }),
+                    from_snapshot: false,
                 },
             ),
             2_000,
@@ -1291,6 +1367,7 @@ mod tests {
                         created_at_ms: 1_000,
                         closed_at_ms: 1_100,
                     }),
+                    from_snapshot: false,
                 },
             ),
             1_100,
@@ -1357,9 +1434,11 @@ mod tests {
         assert!(l.available(STREAM_STALE_MS + 1), "来一帧就算活着");
     }
 
-    /// 规则 3 的边界：幂等只在 `DEDUP_TTL_MS` 窗口内承诺。窗口内重投（实测相隔 114µs）
-    /// 被吸收；窗口外再投递按「新连接」入账 —— 有界的近似幂等换掉无界去重表。这条把
-    /// 窗口两侧的行为都钉死，改 TTL 就会红。
+    /// 规则 3 的**事件路**边界：幂等只在 `DEDUP_TTL_MS` 窗口内承诺。窗口内重投（实测相隔
+    /// 114µs）被吸收；窗口外再投递按「新连接」入账 —— 有界的近似幂等换掉无界去重表。
+    /// 注意这是**流上的事件**（`from_snapshot = false`）的边界；快照派生的 Closed 是
+    /// 结构性幂等（不看本窗口，见 `hy2resi` 的补账与重播测试）。这条把窗口两侧的行为都
+    /// 钉死，改 TTL 就会红。
     #[test]
     fn dedup_entries_expire_after_the_ttl() {
         let l = Ledger::new();
@@ -1437,9 +1516,10 @@ mod tests {
         );
     }
 
-    /// 容量淘汰只在**年轻**条目上判有损：那些 id 的重复 CLOSED 还可能被补投回来
-    /// （实测补投窗口 14–30 s），挤掉它们 = 同一连接会重复入账；挤掉年老条目只是
-    /// 内存保护，只记 [`MeterStat::dedup_evicted`]。
+    /// 容量淘汰只在**年轻**条目上判有损：那些 id 的重复 CLOSED 还可能在路上（实测事件路
+    /// 连发两帧相隔 114µs；快照重投已由结构性闸门跳过、不靠本窗口，见 [`Inner::close`]），
+    /// 挤掉它们 = 同一连接可能重复入账；挤掉年老条目只是内存保护，只记
+    /// [`MeterStat::dedup_evicted`]。
     #[test]
     fn only_young_dedup_evictions_mark_lossy() {
         // 单帧塞满 DEDUP_CAP 条不同 id 的 CLOSED（正好挤掉表里多出来的那一条）

@@ -158,9 +158,15 @@ pub fn on_hy2_resi_relay(unit: &str) -> Outcome {
 /// [`meter::Ledger::lossy_at`] 供 `blocked_set` 换口径），哨兵这里只把「窗口、最近一条
 /// 判定、后果」记成事件 —— **不重启单元、不动门**：门位按用户层 fail-open 那条线算。
 ///
-/// 事件文案**不许**同时带 [`meter::METERING_MARKER`] 与 [`meter::METERING_LOSS_TAG`]：
-/// run.rs 会把 `result` 写进 b-ui 自己的 journald（`"哨兵事件：{}"`），哨兵再读到它就会
-/// 自己认领自己，无限触发。
+/// 事件文案**不许**同时带 [`meter::METERING_MARKER`] 与 [`meter::METERING_LOSS_TAG`]（本签名
+/// 的匹配器正要求两词同时在）：run.rs 会把 `result` 写进 b-ui 自己的 journald
+/// （`"哨兵事件：{}"`），而哨兵盯着 b-ui —— 文案带匹配词就是**拿自己的回响给自己的门槛
+/// 凑数**，在 `threshold≥2` 的签名上会把它凑满。
+///
+/// 注：`threshold = 1 / window = 60s` 时这条回响**不会**变成死循环（去抖 60 秒、命中窗口
+/// 也是 60 秒且过期即弹出，链条自灭）。但那条论证只对当前取值成立，**别把它当作可以放宽
+/// 文案的理由**：真理由是上面那条成文不变量，且 `threshold` 一旦被调大，回响就真的会开始
+/// 凑数。
 pub fn on_metering_lost(panel: &Shared) -> Outcome {
     let view = panel.meter().view(meter::now_ms());
     let window = match (view.lossy_since.as_deref(), view.lossy_until.as_deref()) {
