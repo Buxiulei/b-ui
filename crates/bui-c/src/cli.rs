@@ -1428,6 +1428,19 @@ fn run_check<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()
     match &v {
         Verdict::NoProfile => ctx.say("没有激活的节点，巡检跳过"),
         Verdict::Ok => ctx.say("正常：单元在跑、204 探测通过"),
+        Verdict::Uncertain { failures } => {
+            ctx.say("本地运行状态未确认，保留当前实例，本轮不执行恢复");
+            for failure in failures {
+                ctx.say(format!("  - {failure}"));
+            }
+            return Ok(());
+        }
+        Verdict::ExternalDegraded { failures } => {
+            ctx.say("外部连通性异常，本地检查通过，保留当前代理实例");
+            for f in failures {
+                ctx.say(format!("  - {f}"));
+            }
+        }
         Verdict::Restarted {
             failures,
             next_backoff_min,
@@ -1455,7 +1468,7 @@ fn run_check<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()
         // 不写 runtime.json（spec §8.3）。`Verdict::Busy` 不分这两种，这一行两种都要说得对：
         // 只说「另一个操作进行中」会和 check::run 那条「节点设置被改过」的日志打架
         Verdict::Busy => {
-            ctx.say("另一个 bui-c 操作进行中或节点设置刚改过，本轮巡检跳过");
+            ctx.say("另一个 bui-c 操作进行中，或实例、配置及本地状态已变化，本轮巡检跳过");
             return Ok(());
         }
         Verdict::Waiting {
@@ -2934,10 +2947,14 @@ fn check_menu<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<O
         let width = ctx.width();
         ctx.part(nettest::header(&prof, width));
         let (sys, net, paths) = (ctx.sys, ctx.net, ctx.paths);
+        let seen_instance = crate::service::observe(sys, UNIT_MAIN);
+        let seen_config = sys.read(&paths.config()).ok();
         let mut hooks = MenuHooks {
             ctx: &mut *ctx,
             painter: Painter::new(width),
             prof: &prof,
+            seen_instance,
+            seen_config,
         };
         let sum = nettest::run(sys, net, paths, &prof, &mut hooks)?;
         let saw_info = hooks.painter.saw_info();
@@ -2980,15 +2997,16 @@ fn check_menu<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<O
     }
 }
 
-/// [`MenuHooks::repair`] 拿到锁后发现节点设置已经变了：不动手。容量口径 34 列，接在「修复失败：」
-/// 后面 44 列。
-const REPAIR_STALE: &str = "节点设置刚被别处改过，这次没有重启";
+/// 检查开始后的配置或服务实例已变化，不用旧观测执行修复。
+const REPAIR_STALE: &str = "配置或实例已变化，这次没有重启";
 
 /// 菜单 `[5]` 的 [`Hooks`]：事件按当前宽度排好就打出来（边做边打）；修复照 spec §0.2 R13。
 struct MenuHooks<'c, 'a, S: Sys, N: Net, P: Prompt> {
     ctx: &'c mut Ctx<'a, S, N, P>,
     painter: Painter,
     prof: &'c Profiles,
+    seen_instance: crate::service::ServiceObservation,
+    seen_config: Option<Vec<u8>>,
 }
 
 impl<S: Sys, N: Net, P: Prompt> Hooks for MenuHooks<'_, '_, S, N, P> {
@@ -2999,22 +3017,38 @@ impl<S: Sys, N: Net, P: Prompt> Hooks for MenuHooks<'_, '_, S, N, P> {
 
     /// 修一次，整段持锁（spec §0.2 R11「[5] 只在 repair（重启、等就绪）那一段拿锁」）：
     ///
-    /// - 要不要修由 `nettest` 查出来的 1–4 项决定，这里**不再探测**（T11 审查 I2：以前走巡检的
-    ///   `run_manual` 会再打一次 8 秒的隧道探测，还看不见本地端口，端口没在听时一次都不重启）；
-    /// - 锁里重读 `profiles.json`，与检查开始时的快照比，变了就不动手：删光节点的会话刚拆完数据面，
-    ///   按旧设置 apply 会把删掉的节点拉起来；
+    /// - 不重复外部探测；锁内复核服务实例、配置、捕获与本地端口，只对仍成立的本地故障修复；
+    /// - 查询不确定、故障已消失或配置/实例变化时保留当前实例，不用旧检查授权动作；
     /// - 重启走 [`check::restart`]：不受退避约束，照样记进 runtime.json，timer 的退避从它算起；
     ///   然后在同一把锁里等就绪（`wait_ready`，T11 审查 M5）；
     /// - 有活动节点、主单元文件却不在（删光没做完留下的）时改做 apply：restart 一个不存在的单元只会
     ///   报 Unit not found（R13）。apply 自己等过 TUN，SOCKS 再等端口。这就是收敛的 apply 那一支，
     ///   但不经 [`converge`] 的「失败过就不再自动重试」：人点了修复，就是要再试一次。
     fn repair(&mut self, wait_ready: &mut dyn FnMut()) -> Result<Verdict> {
-        let seen = delete::snapshot(self.prof);
+        let seen = self.prof.clone();
+        let seen_instance = self.seen_instance.clone();
+        let seen_config = self.seen_config.clone();
         with_lock(self.ctx, |ctx, g| {
             let (sys, paths) = (ctx.sys, ctx.paths);
             let now = Profiles::load(sys, paths)?;
-            if delete::snapshot(&now) != seen || now.active_profile().is_none() {
+            if now != seen
+                || now.active_profile().is_none()
+                || crate::service::observe(sys, UNIT_MAIN) != seen_instance
+                || sys.read(&paths.config()).ok() != seen_config
+            {
                 return Err(Error::msg(REPAIR_STALE));
+            }
+            use crate::service::ServiceObservation;
+            if matches!(
+                seen_instance,
+                ServiceObservation::Unknown | ServiceObservation::Transitioning
+            ) || seen_config.is_none()
+            {
+                return Ok(Verdict::Uncertain {
+                    failures: vec![check::Failure::LocalUnknown {
+                        component: "运行实例或配置",
+                    }],
+                });
             }
             if !sys.exists(&paths.unit(UNIT_MAIN)) {
                 let applied = Engine::new(sys, paths).apply(&now)?;
@@ -3030,7 +3064,27 @@ impl<S: Sys, N: Net, P: Prompt> Hooks for MenuHooks<'_, '_, S, N, P> {
                     tun_ready: applied.tun_ready,
                 });
             }
-            let v = check::restart(sys, paths, Vec::new(), g)?;
+            let failures = check::capture_failures(sys, &now);
+            if failures
+                .iter()
+                .any(|failure| matches!(failure, check::Failure::LocalUnknown { .. }))
+            {
+                return Ok(Verdict::Uncertain { failures });
+            }
+            if matches!(seen_instance, ServiceObservation::Running(_))
+                && failures.is_empty()
+                && sys.tcp_listening(now.socks_port)
+                && sys.tcp_listening(now.http_port)
+            {
+                return Ok(Verdict::Ok);
+            }
+            if sys.read(&paths.config()).ok() != seen_config
+                || Profiles::load(sys, paths)? != seen
+                || crate::service::observe(sys, UNIT_MAIN) != seen_instance
+            {
+                return Err(Error::msg(REPAIR_STALE));
+            }
+            let v = check::restart(sys, paths, failures, g)?;
             wait_ready();
             Ok(v)
         })
@@ -3502,8 +3556,11 @@ mod tests {
     }
 
     fn ready(s: &FakeSys) {
+        crate::testutil::missing_tun(s);
+        s.reply("ip -4 route show table all", 0, "");
         s.put("/opt/bui-c/bin/sing-box", "ELF");
         s.reply("systemctl is-active --quiet bui-c.service", 0, "");
+        crate::testutil::running_service(s);
         s.reply("systemctl is-enabled --quiet bui-c.service", 0, "");
         s.reply("systemctl is-active --quiet bui-c.timer", 0, "");
         s.reply("systemctl is-enabled --quiet bui-c.timer", 0, "");
@@ -3810,6 +3867,7 @@ mod tests {
         ready(&s);
         s.reply("ufw status", 0, "Status: active\n");
         s.reply("ip link show bui-tun", 0, "5: bui-tun");
+        crate::testutil::present_tun(&s);
         profiles_socks().save(&s, &pp).unwrap();
         let n = FakeNet::new();
         let mut p = Scripted::from([]);
@@ -4317,6 +4375,54 @@ mod tests {
     }
 
     #[test]
+    fn check_external_probe_failure_keeps_the_installed_tun_and_restart_record() {
+        let pp = paths();
+        let s = FakeSys::new();
+        let n = FakeNet::new();
+        ready(&s);
+        with_unit(&s);
+        s.reply("ip link show bui-tun", 0, "5: bui-tun");
+        crate::testutil::present_tun(&s);
+        s.reply(
+            "ip -4 route show table all",
+            0,
+            "default dev bui-tun table 2022\n",
+        );
+        let mut prof = crate::testutil::profiles_tun();
+        prof.auto_update = false;
+        prof.save(&s, &pp).unwrap();
+        Runtime {
+            fail_streak: 2,
+            ..Runtime::default()
+        }
+        .save(&s, &pp)
+        .unwrap();
+        let before = s.get("/opt/bui-c/runtime.json").unwrap();
+        assert!(!s.exists(&pp.pending()));
+        assert!(!needs_converge(&s, &pp, &prof, &Runtime::load(&s, &pp)));
+        n.route(crate::check::PROBE_URL, FakeReply::Status(503));
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+
+        dispatch(&parse(&["check"]), &mut ctx).unwrap();
+
+        assert_eq!(
+            n.log(),
+            vec![format!("GET {} via Direct", crate::check::PROBE_URL)],
+            "实际 Cmd::Check 必须消费外部失败，不能在中断收敛路径提前返回"
+        );
+        assert!(
+            !s.called("systemctl restart bui-c.service"),
+            "完整巡检只遇外部失败，应保留实例：{:?}",
+            s.calls()
+        );
+        assert_eq!(s.get("/opt/bui-c/runtime.json").unwrap(), before);
+        assert!(ctx.transcript.contains("HTTP 503"), "{}", ctx.transcript);
+        assert!(!ctx.transcript.contains("正常："), "{}", ctx.transcript);
+        assert!(!ctx.transcript.contains("已重启"), "{}", ctx.transcript);
+    }
+
+    #[test]
     fn check_lists_every_failure_in_chinese_when_restarting_and_when_waiting() {
         // 真机：`systemctl stop bui-c` 后巡检日志里打的是 `- UnitDown` / `- TunMissing`
         let pp = paths();
@@ -4324,6 +4430,7 @@ mod tests {
         ready(&s);
         with_unit(&s);
         s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        crate::testutil::stopped_service(&s);
         let mut prof = profiles_socks();
         prof.auto_update = false; // 只看巡检结论，不去碰更新源
         prof.save(&s, &pp).unwrap();
@@ -4337,17 +4444,14 @@ mod tests {
         let t = ctx.transcript.clone();
         assert!(
             t.lines()
-                .any(|l| l == "发现 2 项异常，已重启 bui-c.service，下次退避 1 分钟"),
+                .any(|l| l == "发现 1 项异常，已重启 bui-c.service，下次退避 1 分钟"),
             "timer 巡检保留退避说法（菜单 [5] 才不提）：{t}"
         );
         let items: Vec<&str> = t.lines().filter(|l| l.starts_with("  - ")).collect();
-        assert_eq!(
-            items,
-            vec![
-                "  - bui-c.service 没在运行",
-                "  - 探测 www.gstatic.com/generate_204 返回 HTTP 502"
-            ],
-            "{t}"
+        assert_eq!(items, vec!["  - bui-c.service 没在运行"], "{t}");
+        assert!(
+            n.log().is_empty(),
+            "停机时外部探测已跳过，不能报告 HTTP 502"
         );
 
         // 紧接着再巡检（TUN 模式、探测连不上）：退避中，也要逐条列出
@@ -4364,7 +4468,6 @@ mod tests {
             items,
             vec![
                 "  - bui-c.service 没在运行",
-                "  - 探测 www.gstatic.com/generate_204 超时或连不上",
                 "  - bui-tun 接口不存在",
                 "  - 默认路由没有指向 bui-tun",
             ],
@@ -4383,6 +4486,7 @@ mod tests {
         let (s, n) = (FakeSys::new(), FakeNet::new());
         check_ready(&s, &n, &pp, Mode::Socks);
         s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        crate::testutil::stopped_service(&s);
         // 连按两次 [5]：第二次还在 timer 的退避窗口里。服务没起来有小菜单，0 回主菜单
         let mut p = Scripted::from(["5", "0", "5", "0", "0"]);
         let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
@@ -4442,6 +4546,7 @@ mod tests {
         ready(&s);
         with_unit(&s);
         s.reply("ip link show bui-tun", 0, "5: bui-tun");
+        crate::testutil::present_tun(&s);
         let mut prof = crate::testutil::profiles_tun();
         prof.auto_update = false;
         prof.save(&s, &pp).unwrap();
@@ -4464,6 +4569,7 @@ mod tests {
         ready(&s);
         with_unit(&s);
         s.reply("ip link show bui-tun", 1, "");
+        crate::testutil::missing_tun(&s);
         prof.save(&s, &pp).unwrap();
         let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
         dispatch(&parse(&["check"]), &mut ctx).unwrap();
@@ -4479,10 +4585,12 @@ mod tests {
             "\n{t}"
         );
 
-        // SOCKS 模式没有接口可等
+        // SOCKS 模式单元停机仍需恢复，但没有接口可等。
         let s = FakeSys::new();
         ready(&s);
         with_unit(&s);
+        s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        crate::testutil::stopped_service(&s);
         let mut socks = profiles_socks();
         socks.auto_update = false;
         socks.save(&s, &pp).unwrap();
@@ -5977,6 +6085,7 @@ mod tests {
         let s = FakeSys::new();
         ready(&s);
         s.reply("ip link show bui-tun", 0, "5: bui-tun");
+        crate::testutil::present_tun(&s);
         profiles_socks().save(&s, &pp).unwrap();
         let n = FakeNet::new();
         // 2 = 切换模式 → 确认 y → 0 = 退出
@@ -6049,6 +6158,7 @@ mod tests {
         let s = FakeSys::new();
         ready(&s);
         s.reply("ip link show bui-tun", 0, "5: bui-tun");
+        crate::testutil::present_tun(&s);
         profiles_socks().save(&s, &pp).unwrap();
         let n = FakeNet::new();
         // x = 无效选项 → 2 切到 TUN → y 确认 → 0 退出
@@ -6160,6 +6270,7 @@ mod tests {
         let s = FakeSys::new();
         ready(&s);
         s.reply("ip link show bui-tun", 0, "5: bui-tun");
+        crate::testutil::present_tun(&s);
         profiles_socks().save(&s, &pp).unwrap();
         let n = FakeNet::new();
         // 2 → y 切到 TUN（一行结果，不停）→ 方向键 ↑ 再回车 → 直接回车刷新 → 0
@@ -6460,6 +6571,7 @@ mod tests {
         let s = FakeSys::new();
         ready(&s);
         s.reply("ip link show bui-tun", 0, "5: bui-tun");
+        crate::testutil::present_tun(&s);
         profiles_socks().save(&s, &pp).unwrap();
         let n = FakeNet::new();
         // 回车 → 重画（不退出）→ 2 切到 TUN → y → 队列空 = EOF 退出
@@ -6586,6 +6698,7 @@ mod tests {
         let s = FakeSys::new();
         ready(&s);
         s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        crate::testutil::stopped_service(&s);
         let mut prof = profiles_socks();
         prof.auto_update = false;
         prof.save(&s, &pp).unwrap();
@@ -6676,6 +6789,7 @@ mod tests {
         ready(&s);
         s.reply("ufw status", 0, "Status: active");
         s.reply("ip link show bui-tun", 0, "5: bui-tun");
+        crate::testutil::present_tun(&s);
         two_nodes(&s, &pp);
         let mut prof = Profiles::load(&s, &pp).unwrap();
         prof.mode = Mode::Tun;
@@ -6706,6 +6820,7 @@ mod tests {
         ready(&s);
         with_unit(&s);
         s.reply("ip link show bui-tun", 1, "");
+        crate::testutil::missing_tun(&s);
         two_nodes(&s, &pp);
         let mut prof = Profiles::load(&s, &pp).unwrap();
         prof.mode = Mode::Tun;
@@ -6731,6 +6846,7 @@ mod tests {
         ready(&s);
         with_unit(&s);
         s.reply("ip link show bui-tun", 1, "");
+        crate::testutil::missing_tun(&s);
         let mut prof = crate::testutil::baiyi_like();
         prof.mode = Mode::Tun;
         prof.save(&s, &pp).unwrap();
@@ -8225,10 +8341,73 @@ mod tests {
         s.put("/opt/bui-c/config.json", "{}");
     }
 
+    #[test]
+    fn menu_repair_does_not_restart_a_replacement_instance_under_the_same_profile() {
+        let (s, n, pp) = (FakeSys::new(), FakeNet::new(), paths());
+        ready(&s);
+        with_unit(&s);
+        let prof = profiles_socks();
+        prof.save(&s, &pp).unwrap();
+        s.stage_reply_on_lock(crate::testutil::MAIN_SHOW, 0, "LoadState=loaded\nActiveState=active\nSubState=running\nInvocationID=00000000000000000000000000000002\nMainPID=102\nExecMainStartTimestampMonotonic=1002\n");
+        let mut prompt = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut prompt, false, false);
+        let mut hooks = MenuHooks {
+            ctx: &mut ctx,
+            painter: Painter::new(80),
+            prof: &prof,
+            seen_instance: crate::service::observe(&s, UNIT_MAIN),
+            seen_config: s.read(&pp.config()).ok(),
+        };
+        let _ = hooks.repair(&mut || {});
+        assert!(s.called("lock"), "必须实际到达修复锁");
+        assert!(
+            !s.called("systemctl restart bui-c.service"),
+            "{:?}",
+            s.calls()
+        );
+        assert_eq!(s.writes("/opt/bui-c/runtime.json"), 0);
+    }
+
+    #[test]
+    fn menu_repair_unknown_instance_cannot_apply_a_missing_unit() {
+        let (s, n, pp) = (FakeSys::new(), FakeNet::new(), paths());
+        ready(&s);
+        let prof = profiles_socks();
+        prof.save(&s, &pp).unwrap();
+        s.put("/opt/bui-c/config.json", "{}");
+        s.reply(crate::testutil::MAIN_SHOW, 1, "query unavailable");
+        assert!(!s.exists(&pp.unit(UNIT_MAIN)), "必须到达缺单元分支");
+        let mut prompt = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut prompt, false, false);
+        let mut hooks = MenuHooks {
+            ctx: &mut ctx,
+            painter: Painter::new(80),
+            prof: &prof,
+            seen_instance: crate::service::observe(&s, UNIT_MAIN),
+            seen_config: s.read(&pp.config()).ok(),
+        };
+        let outcome = hooks.repair(&mut || {}).unwrap();
+        assert!(s.called("lock"), "必须实际到达修复锁");
+        assert!(matches!(outcome, Verdict::Uncertain { .. }), "{outcome:?}");
+        assert!(
+            !s.called("systemctl start bui-c.service"),
+            "{:?}",
+            s.calls()
+        );
+        assert!(
+            !s.called("systemctl restart bui-c.service"),
+            "{:?}",
+            s.calls()
+        );
+        assert!(!s.exists(&pp.unit(UNIT_MAIN)));
+        assert_eq!(s.writes("/opt/bui-c/config.json"), 0);
+    }
+
     /// 还没有节点、也没装过引擎的机器：主单元不在跑、没 enable。`ready()` 登记的是装好的机器；
     /// 没有节点时照它回答，收敛会读成「节点删光了、代理却还在跑」（spec §0.2 R10）。
     fn no_engine(s: &FakeSys) {
         s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        crate::testutil::stopped_service(s);
         s.reply("systemctl is-enabled --quiet bui-c.service", 1, "");
     }
 
@@ -8372,6 +8551,7 @@ mod tests {
         ready(&s);
         with_unit(&s);
         s.reply("ip link show bui-tun", 0, "5: bui-tun");
+        crate::testutil::present_tun(&s);
         crate::testutil::profiles_tun().save(&s, &pp).unwrap();
         let n = FakeNet::new();
         let mut p = Scripted::from(["4", "1", "0"]);
@@ -8398,6 +8578,7 @@ mod tests {
         ready(&s);
         with_unit(&s);
         s.reply("ip link show bui-tun", 1, "");
+        crate::testutil::missing_tun(&s);
         s.reply(
             JOURNAL_10,
             0,
@@ -8578,6 +8759,7 @@ mod tests {
         ready(s);
         if mode == Mode::Tun {
             s.reply("ip link show bui-tun", 0, "5: bui-tun");
+            crate::testutil::present_tun(s);
         }
         let mut prof = crate::testutil::baiyi_like();
         prof.mode = mode;
@@ -8788,6 +8970,7 @@ mod tests {
         let before = restarts(&s);
         // 换过去之后接口再也起不来：TUN 5 秒没就绪也算失败（R10）
         s.reply("ip link show bui-tun", 1, "");
+        crate::testutil::missing_tun(&s);
         let seen = delete::snapshot(&prof);
         let (r, t) = del(&s, &n, &pp, &[ACTIVE], None, &seen);
         assert_eq!(
@@ -8895,6 +9078,7 @@ mod tests {
         s.reply("ufw status", 0, "Status: active\n");
         // stop 之后就不 active 了（复查通过，进不可回头段）
         s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        crate::testutil::stopped_service(&s);
         let all: Vec<&str> = prof.profiles.iter().map(|p| p.name.as_str()).collect();
         let seen = delete::snapshot(&prof);
         let (r, _) = del(&s, &n, &pp, &all, None, &seen);
@@ -8976,6 +9160,7 @@ mod tests {
         rt.save(&s, &pp).unwrap();
         s.reply("ufw status", 0, "Status: active\n");
         s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        crate::testutil::stopped_service(&s);
         s.fail_write("/opt/bui-c/profiles.json");
         let all: Vec<&str> = prof.profiles.iter().map(|p| p.name.as_str()).collect();
         let seen = delete::snapshot(&prof);
@@ -9012,6 +9197,7 @@ mod tests {
         s.reply("ufw status", 0, "Status: active\n");
         s.reply("ufw delete allow in on bui-tun", 1, "ERROR: 无效的规则");
         s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        crate::testutil::stopped_service(&s);
         let all: Vec<&str> = prof.profiles.iter().map(|p| p.name.as_str()).collect();
         let seen = delete::snapshot(&prof);
         let (r, t) = del(&s, &n, &pp, &all, None, &seen);
@@ -9381,6 +9567,7 @@ mod tests {
         let s = FakeSys::new();
         let prof = nine_nodes(&s, &pp, Mode::Socks);
         s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        crate::testutil::stopped_service(&s);
         let all: Vec<&str> = prof.profiles.iter().map(|p| p.name.as_str()).collect();
         let mut args = vec!["delete"];
         args.extend(all.iter().copied());
@@ -9580,6 +9767,7 @@ mod tests {
         nine_nodes(&s, &pp, Mode::Tun);
         s.reply("ufw status", 0, "Status: active\n");
         s.reply("ip link show bui-tun", 1, "");
+        crate::testutil::missing_tun(&s);
         let mut p = Scripted::from([]);
         let (rc, err, out) = {
             let mut ctx = Ctx::new(&s, &n, &pp, &mut p, true, true);
@@ -9624,6 +9812,7 @@ mod tests {
         ready(&s);
         with_unit(&s);
         s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        crate::testutil::stopped_service(&s);
         profiles_socks().save(&s, &pp).unwrap();
         let n = FakeNet::new();
         n.route(crate::check::PROBE_URL, FakeReply::Timeout);
@@ -9678,13 +9867,13 @@ mod tests {
             "  下载       ✓ 1 MB 用时 0.9 秒，约 1.1 MB/s（良好）",
             "  IPv4 出口  ✓ 203.0.113.7",
             "             IDC 机房  风险分 22（ippure）",
-            "  IPv6       ✓ 已被隧道拦截，没有泄漏",
-            "  全部通过（7 项），用时 0 秒",
-            "  上次：连接检查：全部通过（7 项）",
+            "  IPv6       ○ IPv6 状态未确认（未获得有效地址）",
+            "  通过 6 项，跳过 1 项，用时 0 秒",
+            "  上次：连接检查：运行状态未确认",
         ] {
             assert!(t.lines().any(|l| l == want), "缺 {want:?}：\n{t}");
         }
-        assert!(!t.contains("下一步"), "全通过不给小菜单：\n{t}");
+        assert!(!t.contains("下一步"), "没有已确认故障时不给修复菜单：\n{t}");
         assert_eq!(
             p.asked,
             vec!["选择 [0-9]", "回车返回菜单", "选择 [0-9]"],
@@ -9741,7 +9930,7 @@ mod tests {
             lines[log + 1..log + 8],
             [
                 "  2026-09-13T10:15:30+08:00 ERROR[0010] connection timeout",
-                "  本机能上网，是当前节点不通。",
+                "  外部连通性探测失败，单凭此结果不自动重启服务。",
                 "  下一步：",
                 "     [1] 再查一次",
                 "     [2] 换个节点",
@@ -9828,7 +10017,7 @@ mod tests {
         let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
         menu_loop(&mut ctx).unwrap();
         assert!(
-            ctx.transcript.contains("  全部通过（5 项），用时 0 秒"),
+            ctx.transcript.contains("  通过 5 项，跳过 1 项，用时 0 秒"),
             "{}",
             ctx.transcript
         );
@@ -9854,6 +10043,7 @@ mod tests {
         check_ready(&s, &n, &pp, Mode::Socks);
         s.remove_file(&pp.unit(UNIT_MAIN)).unwrap();
         s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        crate::testutil::stopped_service(&s);
         converge_gave_up(&s, &pp);
         let mut p = Scripted::from(["5", "0", "0"]);
         let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
@@ -10310,6 +10500,7 @@ mod tests {
         Engine::new(&s, pp).apply(&prof).unwrap();
         // 删光（Empty）：stop 之后复查不再 active 才进不可回头段
         s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        crate::testutil::stopped_service(&s);
         let seen = delete::snapshot(&prof);
         let (r, t) = del(
             &s,
@@ -10955,6 +11146,7 @@ mod tests {
         let (s, n) = (FakeSys::new(), FakeNet::new());
         check_ready(&s, &n, &pp, Mode::Socks);
         s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        crate::testutil::stopped_service(&s);
         let (t, asked) = logged_menu(&s, &n, &pp, &["5", "0", "0"]);
         assert!(asked.iter().any(|q| q == "选择 [0-3]"), "{asked:?}");
         assert_eq!(no_prompt_under_lock(&s, 0, "[5] 修复"), 1, "{t}");
@@ -11311,6 +11503,7 @@ mod tests {
         ready(&s);
         with_unit(&s);
         s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        crate::testutil::stopped_service(&s);
         let mut prof = profiles_socks();
         prof.panel = Some(crate::profiles::Panel {
             base_url: "https://panel.example.com".into(),
@@ -11339,6 +11532,7 @@ mod tests {
         ready(&s);
         with_unit(&s);
         s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        crate::testutil::stopped_service(&s);
         prof.save(&s, &pp).unwrap();
         let mut moved = prof.clone();
         moved.http_port += 1;
@@ -11351,7 +11545,7 @@ mod tests {
         assert!(s.called("lock"), "{:?}", s.calls());
         assert!(!s.called("systemctl restart bui-c.service"), "{t}");
         assert!(t.contains("本轮巡检跳过"), "{t}");
-        assert!(t.contains("节点设置刚改过"), "{t}");
+        assert!(t.contains("实例、配置及本地状态已变化"), "{t}");
     }
 
     /// 每日自更新（spec §8.3）：下载在锁外，安装只试一次锁。锁被占：下载白做了，但什么都不换、
@@ -11500,12 +11694,13 @@ mod tests {
         assert_eq!(Runtime::load(&s, &pp).last_update_at, None);
     }
 
-    /// [5] 的修复不再重复探测（T11 审查 I2）：隧道那一次 8 秒的探测只在首查与重查各做一次。
+    /// [5] 只修复明确的本地故障，首查与重查不重复同轮外部探测。
     #[test]
     fn menu_repair_restarts_without_probing_the_tunnel_a_second_time() {
         let pp = paths();
         let (s, n) = (FakeSys::new(), FakeNet::new());
         check_ready(&s, &n, &pp, Mode::Tun);
+        s.reply("ip -4 route show table all", 0, "default dev eth0\n");
         n.route(crate::check::PROBE_URL, FakeReply::Timeout);
         let r = run_menu(&s, &n, &pp, &["5", "0", "0"], true);
         assert!(s.called("systemctl restart bui-c.service"), "{}", r.t);
@@ -11550,6 +11745,7 @@ mod tests {
         // TUN：接口马上就在，只睡一拍；等接口的查询落在 restart 与 unlock 之间
         let (s, n) = (FakeSys::new(), FakeNet::new());
         check_ready(&s, &n, &pp, Mode::Tun);
+        s.reply("ip -4 route show table all", 0, "default dev eth0\n");
         n.route(crate::check::PROBE_URL, FakeReply::Timeout);
         let r = run_menu(&s, &n, &pp, &["5", "0", "0"], true);
         let calls = s.calls();
@@ -11571,6 +11767,7 @@ mod tests {
         let (s, n) = (FakeSys::new(), FakeNet::new());
         check_ready(&s, &n, &pp, Mode::Socks);
         s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        crate::testutil::stopped_service(&s);
         let r = run_menu(&s, &n, &pp, &["5", "0", "0"], true);
         assert_eq!(s.sleeps(), vec![250; 12], "{}", r.t);
         let calls = s.calls();
@@ -11593,6 +11790,7 @@ mod tests {
         let (s, n) = (FakeSys::new(), FakeNet::new());
         check_ready(&s, &n, &pp, Mode::Socks);
         s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        crate::testutil::stopped_service(&s);
         s.lock_busy(u32::MAX);
         let r = run_menu(&s, &n, &pp, &["5", "0", "0"], true);
         assert!(!s.called("systemctl restart bui-c.service"), "{}", r.t);
@@ -11614,6 +11812,7 @@ mod tests {
         let (s, n) = (FakeSys::new(), FakeNet::new());
         check_ready(&s, &n, &pp, Mode::Socks);
         s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        crate::testutil::stopped_service(&s);
         s.set_term_size(Some((40, 24)));
         s.lock_busy(u32::MAX);
         let r = run_menu(&s, &n, &pp, &["5", "0", "0"], true);
@@ -11643,6 +11842,7 @@ mod tests {
         let (s, n) = (FakeSys::new(), FakeNet::new());
         check_ready(&s, &n, &pp, Mode::Socks);
         s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        crate::testutil::stopped_service(&s);
         s.stage_on_lock("/opt/bui-c/profiles.json", &json(&theirs));
         let r = run_menu(&s, &n, &pp, &["5", "0", "0"], true);
         assert!(!s.called("systemctl restart bui-c.service"), "{}", r.t);
@@ -11655,6 +11855,7 @@ mod tests {
             check_ready(&s, &n, &pp, Mode::Socks);
             s.remove_file(&pp.unit(UNIT_MAIN)).unwrap();
             s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+            crate::testutil::stopped_service(&s);
             converge_gave_up(&s, &pp);
             s.stage_on_lock("/opt/bui-c/profiles.json", &json(&staged));
             let r = run_menu(&s, &n, &pp, &["5", "0", "0"], true);
@@ -11773,6 +11974,7 @@ mod tests {
         s.put("/opt/bui-c/pending.json", PENDING);
         // stop 之后就不在跑了；disable 之后 is-enabled 也不再为真
         s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        crate::testutil::stopped_service(&s);
         s.reply("systemctl is-enabled --quiet bui-c.service", 1, "");
         let from = s.calls().len();
         let t = timer_check(&s, &n, &pp);
@@ -11823,6 +12025,7 @@ mod tests {
         let (s, n) = (FakeSys::new(), FakeNet::new());
         let prof = nine_nodes(&s, &pp, Mode::Tun);
         s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        crate::testutil::stopped_service(&s);
         s.reply("systemctl is-enabled --quiet bui-c.service", 1, "");
         let all: Vec<&str> = prof.profiles.iter().map(|p| p.name.as_str()).collect();
         let (r, t) = del(&s, &n, &pp, &all, None, &delete::snapshot(&prof));
@@ -11987,6 +12190,7 @@ mod tests {
             let prof = nine_nodes(&s, &pp, Mode::Tun);
             let config = s.get("/opt/bui-c/config.json").unwrap();
             s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+            crate::testutil::stopped_service(&s);
             s.fail_write("/opt/bui-c/profiles.json");
             let all: Vec<&str> = prof.profiles.iter().map(|p| p.name.as_str()).collect();
             let (r, t) = del(&s, &n, &pp, &all, None, &delete::snapshot(&prof));
@@ -11999,6 +12203,7 @@ mod tests {
             // 磁盘腾出来了，服务也起得来
             s.allow_write("/opt/bui-c/profiles.json");
             s.reply("systemctl is-active --quiet bui-c.service", 0, "");
+            crate::testutil::running_service(&s);
             let said = if via_timer {
                 timer_check(&s, &n, &pp)
             } else {
@@ -12093,6 +12298,7 @@ mod tests {
             Mode::Socks,
             &|s| {
                 s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+                crate::testutil::stopped_service(s);
                 s.reply("systemctl daemon-reload", 1, "Access denied");
             },
             &[],
@@ -12118,6 +12324,7 @@ mod tests {
         // 页上那句下一步是真的：daemon-reload 好了之后，下一轮巡检按还列着的节点把代理拉回来
         s.reply("systemctl daemon-reload", 0, "");
         s.reply("systemctl is-active --quiet bui-c.service", 0, "");
+        crate::testutil::running_service(&s);
         let n = FakeNet::new();
         let said = timer_check(&s, &n, &pp);
         assert!(said.contains("收拾好"), "{said}");
@@ -12293,6 +12500,7 @@ mod tests {
 
         // 人手动停掉了服务
         s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        crate::testutil::stopped_service(&s);
         s.reply("systemctl is-enabled --quiet bui-c.service", 1, "");
         let t = timer_check(&s, &n, &pp);
         assert!(t.contains("收拾好"), "{t}");

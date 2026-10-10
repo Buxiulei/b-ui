@@ -6,6 +6,25 @@ use crate::profiles::{Mode, Profile, Profiles, Source};
 use bui_schema::nodes::{Node, NodeKind, Transport};
 use bui_schema::render::SplitRules;
 
+pub const MAIN_SHOW: &str = "systemctl show --no-pager --property=LoadState,ActiveState,SubState,InvocationID,MainPID,ExecMainStartTimestampMonotonic bui-c.service";
+
+/// 明确的完整 systemd 观察；禁止用 fake 默认空输出代替已确认实例。
+pub fn running_service(sys: &crate::fake::FakeSys) {
+    sys.reply(MAIN_SHOW, 0, "LoadState=loaded\nActiveState=active\nSubState=running\nInvocationID=00000000000000000000000000000001\nMainPID=101\nExecMainStartTimestampMonotonic=1001\n");
+}
+
+pub fn stopped_service(sys: &crate::fake::FakeSys) {
+    sys.reply(MAIN_SHOW, 0, "LoadState=loaded\nActiveState=inactive\nSubState=dead\nInvocationID=\nMainPID=0\nExecMainStartTimestampMonotonic=0\n");
+}
+
+pub fn present_tun(sys: &crate::fake::FakeSys) {
+    sys.reply("ip -j link show", 0, "[{\"ifname\":\"bui-tun\"}]");
+}
+
+pub fn missing_tun(sys: &crate::fake::FakeSys) {
+    sys.reply("ip -j link show", 0, "[]");
+}
+
 pub fn hy2_direct_node() -> Node {
     Node {
         kind: NodeKind::Hy2Direct,

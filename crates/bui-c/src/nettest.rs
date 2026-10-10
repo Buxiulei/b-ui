@@ -14,7 +14,8 @@ use crate::menu::{
 use crate::net::{Net, Probe, ProbeError, Via};
 use crate::paths::{Paths, TUN_IFACE, UNIT_MAIN};
 use crate::profiles::{Mode, Profiles};
-use crate::sys::{systemd, Sys};
+use crate::service::{self, ServiceObservation};
+use crate::sys::Sys;
 use crate::Result;
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -26,7 +27,8 @@ pub const YOUTUBE_URL: &str = "https://www.youtube.com/";
 /// 「请求日志里含不含这个地址」判，根路径会把 `https://github.com/<仓库>/releases/…` 也算进来。
 /// 探测只等响应头，robots.txt 是 GitHub 上最小、最稳的静态地址，一样看得出通不通、快不快。
 pub const GITHUB_URL: &str = "https://github.com/robots.txt";
-/// 永远直连：TUN 下按路由规则走 direct-out（验证国内分流），SOCKS 下绕过 sing-box（验证本机网络）。
+/// 传给 Net 的路径是 Via::Direct：SOCKS 模式绕过本地入站，TUN 模式仍受系统路由与
+/// sing-box 捕获、分流控制；不能据此声称经过物理出口或绕过了代理。
 pub const BAIDU_URL: &str = "https://www.baidu.com/";
 pub const DOWNLOAD_URL: &str = "https://speed.cloudflare.com/__down?bytes=1000000";
 pub const IPPURE_URL: &str = "https://my.ippure.com/v1/info";
@@ -37,7 +39,7 @@ const IPAPI_FIELDS: &str =
 /// IPv4 出口的回退：ippure 缺字段或不可达时用（spec §6.2 第 10 行）。
 pub const IPAPI_URL: &str =
     "http://ip-api.com/json/?fields=status,country,regionName,city,isp,org,as,mobile,proxy,hosting,query";
-/// IPv6 出口地址的两个来源，一律直连（spec §6.2 第 11 行）。
+/// IPv6 地址检测来源，经 Via::Direct 发请求；TUN 模式仍受系统捕获与分流控制。
 pub const IPIFY6_URL: &str = "https://api6.ipify.org";
 pub const ICANHAZIP6_URL: &str = "https://ipv6.icanhazip.com";
 /// SOCKS 模式「DNS」一行用本机解析器解析的域名。
@@ -146,7 +148,7 @@ pub enum Event {
     Journal(Vec<String>),
 }
 
-/// 一次检查的结论。计分项（spec §6.2）：TUN 模式 7 项，SOCKS 模式 5 项。
+/// 一次检查的结论。原有计分项之外，IPv6 路径没有独立证据时仅记跳过，不授予通过或失败。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Summary {
     pub passed: u32,
@@ -155,7 +157,7 @@ pub struct Summary {
     /// 没通的不计分项（YouTube、GitHub、DNS、百度直连、下载），全部通过时汇总行里点名。
     pub info_failed: Vec<Item>,
     pub first_failure: Option<Item>,
-    /// 百度直连拿到了响应（任何状态码）：本机自己能上网。
+    /// 百度探测拿到了响应（任何状态码）；只证明这次请求可达，不证明物理出口。
     pub baidu_ok: bool,
     /// 本机 DNS 解析失败：SOCKS 模式看「DNS」那一行，TUN 模式看百度直连的错误类别（spec §0.2 R13）。
     pub dns_failed: bool,
@@ -213,7 +215,11 @@ pub fn wait_ready<S: Sys>(sys: &S, paths: &Paths, prof: &Profiles) {
     }
     for _ in 0..SOCKS_WAIT_STEPS {
         sys.sleep(SOCKS_WAIT_STEP);
-        if systemd::is_active(sys, UNIT_MAIN) && sys.tcp_listening(prof.socks_port) {
+        if matches!(
+            service::observe(sys, UNIT_MAIN),
+            ServiceObservation::Running(_)
+        ) && sys.tcp_listening(prof.socks_port)
+        {
             return;
         }
     }
@@ -226,9 +232,10 @@ pub fn ipapi_url_for(addr: &str) -> String {
 
 /// 跑一遍连接检查（spec §6.2 的表，§0.2 R3、R13 的修订），每一项先报 [`Event::Begin`]、做完报结果。
 ///
-/// 服务 → 本地端口 → TUN（只在 TUN 模式）→ 隧道；1–4 有失败就经 [`Hooks::repair`] 修一次、等就绪、
-/// 重查，一轮检查只修一次。服务修过还没起来，其余全部跳过并带出日志；只有隧道不通时先测百度直连，
-/// 直连也不通就不修（R13）。隧道通了再测 Google / YouTube / GitHub、（SOCKS）DNS、百度、下载、IPv4
+/// 服务 → 本地端口 → TUN（只在 TUN 模式）→ 隧道；只有明确停止或本地入口故障才经
+/// [`Hooks::repair`] 修一次、等就绪、重查，一轮检查只修一次。服务状态未确认时停止检查并报告，
+/// 不请求恢复；明确修过还没起来，其余全部跳过并带出日志。外部探测失败只报告。
+/// 隧道通了再测 Google / YouTube / GitHub、（SOCKS）DNS、百度、下载、IPv4
 /// 出口；隧道不通时网站、下载、出口合成跳过行，百度与 IPv6 照做（它们本来就直连）。
 pub fn run<S: Sys, N: Net>(
     sys: &S,
@@ -264,6 +271,7 @@ enum TunState {
     Up,
     NoIface,
     NoRoute,
+    Unknown,
 }
 
 /// 第 2–4 项一次的结论：修复前后各查一次，比对着报。
@@ -273,7 +281,8 @@ struct Core {
     http: bool,
     /// SOCKS 模式没有这一项。
     tun: Option<TunState>,
-    tunnel: ProbeResult,
+    /// TUN 捕获状态未确认时不发探测，保留“未检查”。
+    tunnel: Option<ProbeResult>,
 }
 
 impl Core {
@@ -284,7 +293,7 @@ impl Core {
         matches!(self.tun, None | Some(TunState::Up))
     }
     fn tunnel_ok(&self) -> bool {
-        tunnel_passed(&self.tunnel)
+        self.tunnel.as_ref().is_some_and(tunnel_passed)
     }
     fn ok(&self) -> bool {
         self.ports_ok() && self.tun_ok() && self.tunnel_ok()
@@ -307,7 +316,7 @@ struct Runner<'a, 'h, S: Sys, N: Net> {
     /// 计分项的结论：`Some(true)` 通过、`Some(false)` 失败、`None` 跳过；按 [`Item`] 的顺序排。
     scored: BTreeMap<Item, Option<bool>>,
     info_failed: Vec<Item>,
-    /// 百度直连的结果与用时：R13 下隧道不通时会提前测，行还是打在原位，不测第二次。
+    /// 百度直连的结果与用时：保留报告事实，不作为重启授权。
     baidu: Option<(ProbeResult, Duration)>,
     dns_failed: bool,
 }
@@ -326,49 +335,69 @@ impl<S: Sys, N: Net> Runner<'_, '_, S, N> {
         self.scored.insert(item, ok);
     }
 
-    /// 这一模式下计分的项：TUN 7 项，SOCKS 5 项（没有 TUN，IPv6 只作提示）。
+    /// 所有需要结论的项目；IPv6 在证据不足时只记跳过。
     fn scored_items(&self) -> Vec<Item> {
         let mut v = vec![Item::Service, Item::Ports];
         if self.tun {
             v.push(Item::Tun);
         }
-        v.extend([Item::Tunnel, Item::Google, Item::V4]);
-        if self.tun {
-            v.push(Item::V6);
-        }
+        v.extend([Item::Tunnel, Item::Google, Item::V4, Item::V6]);
         v
     }
 
     fn all(&mut self) {
-        // 1 服务：没在运行就当场修一次，修完还没起来就不往下查
+        // 1 服务：只有完整快照明确 stopped 才请求恢复，查询失败不能当成 down。
         self.begin(Item::Service.name());
         let mut repaired = false;
-        if systemd::is_active(self.sys, UNIT_MAIN) {
-            self.line(Mark::Pass, format!("{UNIT_MAIN} 在运行"));
-        } else {
-            self.line(Mark::Fail, format!("{UNIT_MAIN} 没在运行"));
-            repaired = true;
-            let restarted = self.repair();
-            let up = systemd::is_active(self.sys, UNIT_MAIN);
-            match (restarted, up) {
-                (Some(true), true) => self.cont("已重启，现在在运行"),
-                (Some(true), false) => {
-                    let s = self.wait_s();
-                    self.cont(format!("已重启，{s} 秒内还是没起来"));
-                }
-                (Some(false), true) => self.cont("再看一次，已经在运行"),
-                (Some(false), false) => self.cont("再看一次，还是没在运行"),
-                (None, _) => {} // 修复失败，原因已经打在续行里
+        match service::observe(self.sys, UNIT_MAIN) {
+            ServiceObservation::Running(_) => {
+                self.line(Mark::Pass, format!("{UNIT_MAIN} 在运行"));
             }
-            if !up {
-                self.service_down();
+            ServiceObservation::Unknown | ServiceObservation::Transitioning => {
+                self.line(
+                    Mark::Info,
+                    format!("{UNIT_MAIN} 运行状态未确认，未请求恢复"),
+                );
+                self.service_unconfirmed();
                 return;
+            }
+            ServiceObservation::Stopped(_) => {
+                self.line(Mark::Fail, format!("{UNIT_MAIN} 没在运行"));
+                repaired = true;
+                let restarted = self.repair();
+                let up = match service::observe(self.sys, UNIT_MAIN) {
+                    ServiceObservation::Running(_) => true,
+                    ServiceObservation::Stopped(_) => false,
+                    ServiceObservation::Unknown | ServiceObservation::Transitioning => {
+                        self.cont("重查服务运行状态未确认，未继续检查");
+                        self.service_unconfirmed();
+                        return;
+                    }
+                };
+                match (restarted, up) {
+                    (Some(true), true) => self.cont("已重启，现在在运行"),
+                    (Some(true), false) => {
+                        let s = self.wait_s();
+                        self.cont(format!("已重启，{s} 秒内还是没起来"));
+                    }
+                    (Some(false), true) => self.cont("再看一次，已经在运行"),
+                    (Some(false), false) => self.cont("再看一次，还是没在运行"),
+                    (None, _) => {} // 修复失败，原因已经打在续行里
+                }
+                if !up {
+                    self.service_down();
+                    return;
+                }
             }
         }
         self.score(Item::Service, Some(true));
 
-        // 2–4 本地端口、TUN、隧道；有失败就修一次、重查（服务刚修过就不再修）
+        // 2–4：只恢复本地端口或 TUN 的故障，外部探测不能成为重启授权。
         let mut core = self.core_rows();
+        if core.tun == Some(TunState::Unknown) {
+            self.capture_unconfirmed(&core);
+            return;
+        }
         if !core.ok() && !repaired && self.worth_repairing(&core) {
             if let Some(restarted) = self.repair() {
                 if restarted {
@@ -376,14 +405,26 @@ impl<S: Sys, N: Net> Runner<'_, '_, S, N> {
                 } else {
                     self.cont("再试一次…");
                 }
-                if !systemd::is_active(self.sys, UNIT_MAIN) {
-                    self.cont(format!("{} {UNIT_MAIN} 没在运行", Mark::Fail.glyph()));
-                    self.service_down();
-                    return;
+                match service::observe(self.sys, UNIT_MAIN) {
+                    ServiceObservation::Running(_) => {}
+                    ServiceObservation::Stopped(_) => {
+                        self.cont(format!("{} {UNIT_MAIN} 没在运行", Mark::Fail.glyph()));
+                        self.service_down();
+                        return;
+                    }
+                    ServiceObservation::Unknown | ServiceObservation::Transitioning => {
+                        self.cont("重查服务运行状态未确认，未继续检查");
+                        self.service_unconfirmed();
+                        return;
+                    }
                 }
                 let again = self.core_check();
                 self.report_recheck(&core, &again);
                 core = again;
+                if core.tun == Some(TunState::Unknown) {
+                    self.capture_unconfirmed(&core);
+                    return;
+                }
             }
         }
         self.score(Item::Ports, Some(core.ports_ok()));
@@ -415,7 +456,7 @@ impl<S: Sys, N: Net> Runner<'_, '_, S, N> {
             self.line(Mark::Skip, "跳过（隧道不通）");
             self.score(Item::V4, None);
         }
-        // 11 IPv6：直连，隧道通不通都做
+        // 11 IPv6：只保留检测站观测，不能授予出口路径或防泄漏资格。
         self.v6_row();
     }
 
@@ -434,15 +475,9 @@ impl<S: Sys, N: Net> Runner<'_, '_, S, N> {
         }
     }
 
-    /// 只有隧道不通、端口与 TUN 都正常时，先测百度直连：本机自己也上不了网，重启 bui-c 没用，
-    /// 不修（spec §0.2 R13）。
-    fn worth_repairing(&mut self, core: &Core) -> bool {
-        let only_tunnel = core.ports_ok() && core.tun_ok() && !core.tunnel_ok();
-        if only_tunnel && self.baidu_probe().0.is_err() {
-            self.cont("本机也连不上百度，先不重启");
-            return false;
-        }
-        true
+    /// 外部超时、拒绝和状态码无法证明本地服务坏了；只采用本地入口证据。
+    fn worth_repairing(&self, core: &Core) -> bool {
+        core.tun != Some(TunState::Unknown) && (!core.ports_ok() || !core.tun_ok())
     }
 
     fn wait_s(&self) -> u64 {
@@ -465,11 +500,37 @@ impl<S: Sys, N: Net> Runner<'_, '_, S, N> {
         self.hooks.event(Event::Journal(lines));
     }
 
+    /// 未确认与停止不是同一种结论；所有依赖实例的项目都留作未检查。
+    fn service_unconfirmed(&mut self) {
+        self.begin("其余各项");
+        self.line(Mark::Skip, "跳过（服务运行状态未确认）");
+        for item in self.scored_items() {
+            self.score(item, None);
+        }
+    }
+
+    /// 已确认的服务与端口仍如实计分，依赖捕获路径的项目保持未检查。
+    fn capture_unconfirmed(&mut self, core: &Core) {
+        self.score(Item::Ports, Some(core.ports_ok()));
+        self.score(Item::Tun, None);
+        self.score(Item::Tunnel, None);
+        self.begin("其余各项");
+        self.line(Mark::Skip, "跳过（TUN 捕获状态未确认）");
+        for item in [Item::Google, Item::V4, Item::V6] {
+            self.score(item, None);
+        }
+    }
+
     fn check_tun(&self) -> TunState {
-        let e = Engine::new(self.sys, self.paths);
-        if !e.tun_up() {
+        let failures = check::capture_failures(self.sys, self.prof);
+        if failures
+            .iter()
+            .any(|failure| matches!(failure, check::Failure::LocalUnknown { .. }))
+        {
+            TunState::Unknown
+        } else if failures.contains(&check::Failure::TunMissing) {
             TunState::NoIface
-        } else if !e.tun_default_route() {
+        } else if failures.contains(&check::Failure::TunNoDefaultRoute) {
             TunState::NoRoute
         } else {
             TunState::Up
@@ -489,12 +550,13 @@ impl<S: Sys, N: Net> Runner<'_, '_, S, N> {
 
     /// 第 2–4 项，不出声（修复之后重查用）。
     fn core_check(&self) -> Core {
+        let tun = self.tun.then(|| self.check_tun());
         Core {
             socks: self.sys.tcp_listening(self.prof.socks_port),
             http: self.sys.tcp_listening(self.prof.http_port),
-            tun: self.tun.then(|| self.check_tun()),
+            tun,
             // 重查只报通没通（「还是不通」），用不上用时
-            tunnel: self.check_tunnel().0,
+            tunnel: (tun != Some(TunState::Unknown)).then(|| self.check_tunnel().0),
         }
     }
 
@@ -507,17 +569,30 @@ impl<S: Sys, N: Net> Runner<'_, '_, S, N> {
         let tun = if self.tun {
             self.begin(Item::Tun.name());
             let t = self.check_tun();
-            self.line(pass_or(t == TunState::Up, Mark::Fail), tun_text(t));
+            self.line(
+                if t == TunState::Unknown {
+                    Mark::Info
+                } else {
+                    pass_or(t == TunState::Up, Mark::Fail)
+                },
+                tun_text(t),
+            );
             Some(t)
         } else {
             None
         };
         self.begin(Item::Tunnel.name());
-        let (tunnel, spent) = self.check_tunnel();
-        self.line(
-            pass_or(tunnel_passed(&tunnel), Mark::Fail),
-            self.tunnel_text(&tunnel, spent),
-        );
+        let tunnel = if tun == Some(TunState::Unknown) {
+            self.line(Mark::Skip, "跳过（TUN 捕获状态未确认）");
+            None
+        } else {
+            let (tunnel, spent) = self.check_tunnel();
+            self.line(
+                pass_or(tunnel_passed(&tunnel), Mark::Fail),
+                self.tunnel_text(&tunnel, spent),
+            );
+            Some(tunnel)
+        };
         Core {
             socks,
             http,
@@ -563,16 +638,22 @@ impl<S: Sys, N: Net> Runner<'_, '_, S, N> {
         }
         if let (Some(b), Some(a)) = (before.tun, after.tun) {
             if b != TunState::Up || a != TunState::Up {
-                let mark = pass_or(a == TunState::Up, Mark::Fail).glyph();
+                let mark = if a == TunState::Unknown {
+                    Mark::Info
+                } else {
+                    pass_or(a == TunState::Up, Mark::Fail)
+                }
+                .glyph();
                 self.cont(format!("{}：{mark} {}", Item::Tun.name(), tun_text(a)));
             }
         }
         if !(before.tunnel_ok() && after.tunnel_ok()) {
             let fail = Mark::Fail.glyph();
             self.cont(match &after.tunnel {
-                Ok(p) if p.code == 204 => {
+                Some(Ok(p)) if p.code == 204 => {
                     format!("{} 通了  {}", Mark::Pass.glyph(), latency(p.elapsed))
                 }
+                None => "隧道：跳过（TUN 捕获状态未确认）".into(),
                 _ if before.tunnel_ok() => format!("{fail} 重启后不通了"),
                 _ => format!("{fail} 还是不通"),
             });
@@ -727,17 +808,29 @@ impl<S: Sys, N: Net> Runner<'_, '_, S, N> {
         self.score(Item::V4, Some(true));
     }
 
-    /// IPv6（一律直连）：TUN 下拿到地址就是泄漏（计分），SOCKS 下只作提示。拿到地址再用 ip-api
-    /// 按地址查归属，查到了续一行。
+    /// 检测站给出的地址是一次出口观测；没有地址也是探测未成功，二者都不能确认捕获路径。
+    /// 保留来源的请求错误，拿到地址时可按地址查询归属，但不授予物理出口或防泄漏资格。
     fn v6_row(&mut self) {
         self.begin(Item::V6.name());
-        let addr = [IPIFY6_URL, ICANHAZIP6_URL].into_iter().find_map(|u| {
-            self.net
-                .text_via(u, Via::Direct, V6_TIMEOUT)
-                .ok()
-                .map(|t| t.trim().to_string())
-                .filter(|a| valid_v6(a))
-        });
+        let mut addr = None;
+        let mut failures = Vec::new();
+        for url in [IPIFY6_URL, ICANHAZIP6_URL] {
+            let source = url.trim_start_matches("https://");
+            match self.net.text_via(url, Via::Direct, V6_TIMEOUT) {
+                Ok(body) if valid_v6(body.trim()) => {
+                    addr = Some(body.trim().to_string());
+                    break;
+                }
+                Ok(_) => failures.push(format!("{source}：未返回有效 IPv6 地址")),
+                Err(error) => {
+                    let detail = match error {
+                        crate::Error::Net { detail, .. } => detail,
+                        _ => "请求失败".into(),
+                    };
+                    failures.push(format!("{source}：{detail}"));
+                }
+            }
+        }
         let geo = addr
             .as_deref()
             .and_then(|a| {
@@ -748,20 +841,16 @@ impl<S: Sys, N: Net> Runner<'_, '_, S, N> {
             .and_then(|b| parse_ipapi(&b))
             .map(|e| join2(&[&e.country, &e.city, &e.org]))
             .filter(|g| !g.is_empty());
-        match (self.tun, addr) {
-            (true, None) => {
-                self.line(Mark::Pass, "已被隧道拦截，没有泄漏");
-                self.score(Item::V6, Some(true));
-            }
-            (true, Some(a)) => {
-                self.line(Mark::Fail, format!("IPv6 泄漏（没进隧道）：{a}"));
-                self.score(Item::V6, Some(false));
-            }
-            (false, Some(a)) => self.line(
-                Mark::Info,
-                format!("本机 IPv6 {a}（SOCKS 模式下没走代理的流量用它）"),
-            ),
-            (false, None) => self.line(Mark::Info, "本机没有 IPv6（SOCKS 模式只作提示）"),
+        self.line(
+            Mark::Info,
+            match addr {
+                Some(a) => format!("观测到 IPv6 出口 {a}，路径未确认"),
+                None => "IPv6 状态未确认（未获得有效地址）".into(),
+            },
+        );
+        self.score(Item::V6, None);
+        for failure in failures {
+            self.cont(failure);
         }
         if let Some(g) = geo {
             self.cont(g);
@@ -802,6 +891,7 @@ fn tun_text(t: TunState) -> String {
         TunState::Up => format!("{TUN_IFACE} 已建立，默认路由已接管"),
         TunState::NoIface => format!("{TUN_IFACE} 接口不存在"),
         TunState::NoRoute => format!("默认路由没有指向 {TUN_IFACE}"),
+        TunState::Unknown => "TUN 捕获状态未确认".into(),
     }
 }
 
@@ -960,19 +1050,22 @@ pub fn rating(mb_s: f64) -> &'static str {
 /// 按第一个失败的计分项给一句人话判断，外加要不要给「下一步」小菜单（spec §6.5 的表；
 /// DNS 分支 SOCKS 模式看「DNS」那一行，§0.2 R13）。全部通过（不计分项没通也算）时是 `None`。
 pub fn diagnose(s: &Summary) -> Option<(&'static str, bool)> {
+    if s.failed == 0 && s.skipped > 0 {
+        return Some(("运行状态未确认，相关网络检查已跳过。", false));
+    }
     Some(match s.first_failure? {
         Item::Service => ("服务没起来，网络检查都跳过了。", true),
         Item::Ports => ("本地端口没在监听。", true),
         Item::Tun => ("bui-tun 没接管路由；还不行就先切到 SOCKS 用。", true),
-        Item::Tunnel if s.baidu_ok => ("本机能上网，是当前节点不通。", true),
+        Item::Tunnel if s.baidu_ok => ("外部连通性探测失败，单凭此结果不自动重启服务。", true),
         Item::Tunnel if s.dns_failed => ("本机 DNS 解析失败：先检查网络设置。", true),
-        Item::Tunnel => ("这台机器自己也上不了网：先检查网线 / Wi-Fi。", true),
+        Item::Tunnel => ("多个外部连通性探测未成功，当前原因未确认。", true),
         Item::Google => (
             "隧道通但 Google 打不开：多半是出口受限，换个节点试试。",
             true,
         ),
         Item::V4 => ("出口检测站暂时连不上，网站能打开就不影响上网。", false),
-        Item::V6 => ("IPv6 没进隧道：把这一屏截图发给管理员。", false),
+        Item::V6 => ("IPv6 出口路径未确认，检测站结果不证明本地泄漏。", false),
         // 不计分项进不了 first_failure
         Item::YouTube | Item::GitHub | Item::Dns | Item::Baidu | Item::Download => return None,
     })
@@ -981,6 +1074,7 @@ pub fn diagnose(s: &Summary) -> Option<(&'static str, bool)> {
 /// 「上次：」行的摘要（spec §6.5）。
 pub fn last_summary(s: &Summary) -> String {
     match s.first_failure {
+        None if s.skipped > 0 => "连接检查：运行状态未确认".into(),
         None => format!("连接检查：全部通过（{} 项）", s.passed),
         Some(item) => format!("连接检查：失败 {} 项（{}）", s.failed, item.name()),
     }
@@ -1060,7 +1154,12 @@ fn summary_text(s: &Summary) -> String {
     if s.skipped > 0 {
         parts.push(format!("跳过 {} 项", s.skipped));
     }
-    format!("{}，用时 {} 秒", parts.join("，"), s.elapsed_s)
+    let mut text = format!("{}，用时 {} 秒", parts.join("，"), s.elapsed_s);
+    if !s.info_failed.is_empty() {
+        let names: Vec<&str> = s.info_failed.iter().map(|item| item.name()).collect();
+        text.push_str(&format!("；{} 没通，不计分", names.join("、")));
+    }
+    text
 }
 
 /// 一句人话判断：缩进 2 列，放不下就在中文标点处折。
@@ -1297,13 +1396,15 @@ pub(crate) mod sample {
     }
 
     /// 一台装好了的机器：内核与单元文件都在、单元在跑、（TUN）接口与默认路由都在，检测站都通，
-    /// 出口走 ippure（机房）；IPv6 两个来源都不通（TUN 下就是「被隧道拦截」）。本地端口没登记在听。
+    /// 出口走 ippure（机房）；IPv6 两来源显式超时，结果未确认。本地端口没登记在听。
     pub fn machine(s: &FakeSys, n: &FakeNet, mode: Mode) {
         s.put("/opt/bui-c/bin/sing-box", "ELF");
         s.put("/etc/systemd/system/bui-c.service", "[Unit]");
         s.reply("systemctl is-active --quiet bui-c.service", 0, "");
+        crate::testutil::running_service(s);
         s.set_resolve(DNS_HOST, Ok(12));
         if mode == Mode::Tun {
+            crate::testutil::present_tun(s);
             s.reply("ip link show bui-tun", 0, "5: bui-tun");
             s.reply(
                 "ip -4 route show table all",
@@ -1323,6 +1424,8 @@ pub(crate) mod sample {
             n.route(url, reply);
             n.delay(url, ms);
         }
+        n.route(IPIFY6_URL, FakeReply::Timeout);
+        n.route(ICANHAZIP6_URL, FakeReply::Timeout);
     }
 
     /// [`machine`] 再加上两个本地端口在听：各项都通。
@@ -1451,7 +1554,7 @@ pub(crate) mod sample {
         n.delay(YOUTUBE_URL, 6_000);
         out.push(("check-tun-pass", shot(&prof, &s, &n, width)));
 
-        // SOCKS 隧道不通、重启也没用：判断 + 下一步小菜单；本机有 39 列的 IPv6，归属很长
+        // SOCKS 外部探测不通：只报告，不重启；本机有 39 列的 IPv6，归属很长
         prof.mode = Mode::Socks;
         let (s, n) = (FakeSys::new(), FakeNet::new());
         healthy(&s, &n, Mode::Socks);
@@ -1478,10 +1581,11 @@ pub(crate) mod sample {
         let (s, n) = (FakeSys::new(), FakeNet::new());
         healthy(&s, &n, Mode::Tun);
         s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        crate::testutil::stopped_service(&s);
         s.reply(JOURNAL_5, 0, LONG_JOURNAL);
         out.push(("check-service-down", shot(&prof, &s, &n, width)));
 
-        // TUN 默认路由没接管（重启重查）、IPv6 泄漏（39 列地址）、下载没下完、出口回退 ip-api
+        // TUN 默认路由没接管（重启重查）、IPv6 出口观测（39 列地址）、下载没下完、出口回退 ip-api
         let (s, n) = (FakeSys::new(), FakeNet::new());
         healthy(&s, &n, Mode::Tun);
         s.reply(
@@ -1501,7 +1605,7 @@ pub(crate) mod sample {
         n.delay(DOWNLOAD_URL, 9_000);
         n.route(IPIFY6_URL, FakeReply::Text(long_v6.into()));
         n.route(&ipapi_url_for(long_v6), FakeReply::Text(v6_geo));
-        out.push(("check-leak", shot(&prof, &s, &n, width)));
+        out.push(("check-v6-unconfirmed", shot(&prof, &s, &n, width)));
 
         // 日志页：[4] → [2] 与小菜单 [3] 共用，最近 50 行里挑长的
         let lines: Vec<String> = LONG_JOURNAL
@@ -1542,7 +1646,7 @@ mod tests {
     }
 
     #[test]
-    fn tun_all_pass_report_has_eleven_lines_and_says_all_passed() {
+    fn tun_report_has_eleven_lines_and_keeps_ipv6_unconfirmed() {
         let (s, n) = (FakeSys::new(), FakeNet::new());
         sample::healthy(&s, &n, Mode::Tun);
         let mut rec = Recorder::default();
@@ -1576,7 +1680,7 @@ mod tests {
                 "✓ 32ms",
                 "✓ 1 MB 用时 0.9 秒，约 1.1 MB/s（良好）",
                 "✓ 203.0.113.7",
-                "✓ 已被隧道拦截，没有泄漏",
+                "○ IPv6 状态未确认（未获得有效地址）",
             ],
             "11 行，每行一个结果"
         );
@@ -1585,21 +1689,29 @@ mod tests {
             vec![
                 "美国  洛杉矶",
                 "Example Networks",
-                "IDC 机房  风险分 22（ippure）"
+                "IDC 机房  风险分 22（ippure）",
+                "api6.ipify.org：超时",
+                "ipv6.icanhazip.com：超时"
             ],
             "出口四行：IP / 归属 / 运营商 / 类型与风险分"
         );
         assert_eq!(
             (sum.passed, sum.failed, sum.skipped, sum.first_failure),
-            (7, 0, 0, None)
+            (6, 0, 1, None)
         );
         assert!(sum.info_failed.is_empty() && sum.baidu_ok && !sum.dns_failed);
-        assert_eq!(rec.repairs, 0, "都通就不修");
-        assert_eq!(diagnose(&sum), None);
-        assert_eq!(last_summary(&sum), "连接检查：全部通过（7 项）");
+        assert_eq!(rec.repairs, 0, "本地检查正常，不因外部 IPv6 结果请求恢复");
         assert_eq!(
-            render_summary(&sum, false, 60),
-            format!("  {}\n  全部通过（7 项），用时 0 秒\n", "─".repeat(28))
+            diagnose(&sum),
+            Some(("运行状态未确认，相关网络检查已跳过。", false))
+        );
+        assert_eq!(last_summary(&sum), "连接检查：运行状态未确认");
+        assert_eq!(
+            render_summary(&sum, true, 60),
+            format!(
+                "  {}\n  通过 6 项，跳过 1 项，用时 0 秒\n  ○ 仅供参考，不计入通过/失败\n",
+                "─".repeat(28)
+            )
         );
     }
 
@@ -1628,7 +1740,7 @@ mod tests {
         );
         let lines = rec.lines();
         assert_eq!(lines[6], "✓ 本机解析正常 12ms");
-        assert_eq!(lines[10], "○ 本机没有 IPv6（SOCKS 模式只作提示）");
+        assert_eq!(lines[10], "○ IPv6 状态未确认（未获得有效地址）");
         assert_eq!(
             (sum.passed, sum.failed),
             (5, 0),
@@ -1758,7 +1870,9 @@ mod tests {
             vec![
                 "United States  Los Angeles",
                 "Example Hosting",
-                "IDC 机房（ip-api）"
+                "IDC 机房（ip-api）",
+                "api6.ipify.org：超时",
+                "ipv6.icanhazip.com：超时"
             ],
             "ip-api 没有风险分"
         );
@@ -1785,23 +1899,26 @@ mod tests {
     }
 
     #[test]
-    fn ipv6_in_tun_is_a_leak_and_absent_is_fine() {
-        // 拿不到：被隧道拦截，没有泄漏
+    fn ipv6_is_an_exit_observation_and_missing_results_are_unconfirmed() {
+        // 拿不到有效地址不能证明拦截或无泄漏。
         let (s, n) = (FakeSys::new(), FakeNet::new());
         sample::healthy(&s, &n, Mode::Tun);
         let mut rec = Recorder::default();
         let sum = check(&s, &n, &profiles_tun(), &mut rec);
-        assert_eq!(rec.lines().last().unwrap(), "✓ 已被隧道拦截，没有泄漏");
+        assert_eq!(
+            rec.lines().last().unwrap(),
+            "○ IPv6 状态未确认（未获得有效地址）"
+        );
         assert_eq!(sum.failed, 0);
 
-        // 拿到了：泄漏，计分项失败；续行给归属，按地址查归属也直连
+        // 拿到地址也不证明捕获路径；归属仅作为出口观测的补充信息。
         n.route(IPIFY6_URL, FakeReply::Text(format!("{V6_ADDR}\n")));
         n.route(&ipapi_url_for(V6_ADDR), FakeReply::Text(IPAPI_V6.into()));
         let mut rec = Recorder::default();
         let sum = check(&s, &n, &profiles_tun(), &mut rec);
         assert_eq!(
             rec.lines().last().unwrap(),
-            "✗ IPv6 泄漏（没进隧道）：2001:db8::1"
+            "○ 观测到 IPv6 出口 2001:db8::1，路径未确认"
         );
         assert_eq!(
             rec.conts().last().unwrap(),
@@ -1810,10 +1927,13 @@ mod tests {
         assert!(n
             .log()
             .contains(&format!("GET {} via Direct", ipapi_url_for(V6_ADDR))));
-        assert_eq!((sum.failed, sum.first_failure), (1, Some(Item::V6)));
+        assert_eq!(
+            (sum.passed, sum.failed, sum.skipped, sum.first_failure),
+            (6, 0, 1, None)
+        );
         assert_eq!(
             diagnose(&sum),
-            Some(("IPv6 没进隧道：把这一屏截图发给管理员。", false))
+            Some(("运行状态未确认，相关网络检查已跳过。", false))
         );
 
         // 地址严格校验：只认十六进制与冒号、至少一个冒号、不超过 39 个字符；
@@ -1827,7 +1947,7 @@ mod tests {
         check(&s, &n, &profiles_tun(), &mut rec);
         assert_eq!(
             rec.lines().last().unwrap(),
-            "✗ IPv6 泄漏（没进隧道）：2001:db8::2"
+            "○ 观测到 IPv6 出口 2001:db8::2，路径未确认"
         );
         let too_long = "1:".repeat(20);
         n.route(ICANHAZIP6_URL, FakeReply::Timeout);
@@ -1844,12 +1964,12 @@ mod tests {
             check(&s, &n, &profiles_tun(), &mut rec);
             assert_eq!(
                 rec.lines().last().unwrap(),
-                "✓ 已被隧道拦截，没有泄漏",
+                "○ IPv6 状态未确认（未获得有效地址）",
                 "{bad:?}"
             );
         }
 
-        // SOCKS 下只作提示，不计分
+        // SOCKS 同样只能报告检测站的出口观测，不把地址说成本机网卡地址。
         let (s, n) = (FakeSys::new(), FakeNet::new());
         sample::healthy(&s, &n, Mode::Socks);
         n.route(IPIFY6_URL, FakeReply::Text(V6_ADDR.into()));
@@ -1857,10 +1977,74 @@ mod tests {
         let sum = check(&s, &n, &profiles_socks(), &mut rec);
         assert_eq!(
             rec.lines().last().unwrap(),
-            "○ 本机 IPv6 2001:db8::1（SOCKS 模式下没走代理的流量用它）"
+            "○ 观测到 IPv6 出口 2001:db8::1，路径未确认"
         );
-        assert_eq!((sum.passed, sum.failed), (5, 0));
-        assert!(sum.info_failed.is_empty(), "本机有 IPv6 不是毛病");
+        assert_eq!((sum.passed, sum.failed, sum.skipped), (5, 0, 1));
+        assert!(sum.info_failed.is_empty(), "出口路径未确认不是泄漏证据");
+    }
+
+    fn failed_ipv6_probe_is_unconfirmed(reply: FakeReply, detail: &str) {
+        let (s, n) = (FakeSys::new(), FakeNet::new());
+        sample::healthy(&s, &n, Mode::Tun);
+        n.route(IPIFY6_URL, reply.clone());
+        n.route(ICANHAZIP6_URL, reply);
+        let mut rec = Recorder::default();
+        let sum = check(&s, &n, &profiles_tun(), &mut rec);
+
+        assert!(
+            rec.events.iter().any(|event| matches!(
+                event,
+                Event::Line(Mark::Info, text) if text.contains("IPv6") && text.contains("未确认")
+            )),
+            "外部 IPv6 请求失败只能报告未确认，不能记为防泄漏通过"
+        );
+        assert_eq!((sum.passed, sum.failed, sum.skipped), (6, 0, 1));
+        assert_eq!(rec.repairs, 0);
+        assert_eq!((hits(&n, IPIFY6_URL), hits(&n, ICANHAZIP6_URL)), (1, 1));
+        assert!(
+            rec.conts().iter().any(|line| line.contains(detail)),
+            "IPv6 外部错误必须可见：{detail}"
+        );
+        assert!(rec
+            .lines()
+            .iter()
+            .all(|line| !line.contains("没有泄漏") && !line.contains("被隧道拦截")));
+    }
+
+    #[test]
+    fn ipv6_timeouts_in_tun_do_not_prove_no_leak() {
+        failed_ipv6_probe_is_unconfirmed(FakeReply::Timeout, "超时");
+    }
+
+    #[test]
+    fn ipv6_dns_failures_in_tun_do_not_prove_no_leak() {
+        failed_ipv6_probe_is_unconfirmed(FakeReply::Dns, "域名解析失败");
+    }
+
+    #[test]
+    fn observed_ipv6_address_in_tun_does_not_prove_a_local_leak() {
+        let (s, n) = (FakeSys::new(), FakeNet::new());
+        sample::healthy(&s, &n, Mode::Tun);
+        n.route(IPIFY6_URL, FakeReply::Text(V6_ADDR.into()));
+        n.route(&ipapi_url_for(V6_ADDR), FakeReply::Text(IPAPI_V6.into()));
+        let mut rec = Recorder::default();
+        let sum = check(&s, &n, &profiles_tun(), &mut rec);
+
+        assert!(
+            rec.events.iter().any(|event| matches!(
+                event,
+                Event::Line(Mark::Info, text) if text.contains(V6_ADDR) && text.contains("未确认")
+            )),
+            "地址是检测站响应的出口证据，不能单凭地址判本地泄漏"
+        );
+        assert_eq!((sum.passed, sum.failed, sum.skipped), (6, 0, 1));
+        assert_eq!(rec.repairs, 0);
+        assert_eq!(hits(&n, IPIFY6_URL), 1);
+        assert_eq!(hits(&n, ICANHAZIP6_URL), 0);
+        assert!(rec
+            .lines()
+            .iter()
+            .all(|line| !line.contains("IPv6 泄漏") && !line.contains("没进隧道")));
     }
 
     #[test]
@@ -1913,29 +2097,35 @@ mod tests {
             rec.lines()[4..7],
             ["✓ 1234ms（慢）", "○ 超时（6 秒）", "○ 连不上（不到 1 秒）"]
         );
-        assert_eq!((sum.passed, sum.failed), (7, 0), "YouTube、GitHub 不计分");
+        assert_eq!(
+            (sum.passed, sum.failed, sum.skipped),
+            (6, 0, 1),
+            "YouTube、GitHub 不计分；IPv6 保持未确认"
+        );
         assert_eq!(sum.info_failed, vec![Item::YouTube, Item::GitHub]);
         let mut p = Painter::new(60);
         for e in &rec.events {
             p.paint(e);
         }
         assert!(p.saw_info(), "打过 ○ 就要图例");
-        assert_eq!(
-            render_summary(&sum, p.saw_info(), 60),
-            format!(
-                "  {}\n  全部通过（7 项），用时 0 秒；YouTube、GitHub 没通，不计分\n  ○ 仅供参考，不计入通过/失败\n",
-                "─".repeat(28)
-            )
-        );
-        // 40 列：在中文标点处折行，续行同样缩进 2 列
-        assert_eq!(
-            render_summary(&sum, true, 40),
-            format!(
-                "  {}\n  全部通过（7 项），用时 0 秒；\n  YouTube、GitHub 没通，不计分\n  ○ 仅供参考，不计入通过/失败\n",
-                "─".repeat(18)
-            )
-        );
-        // 全是 ✓：没有图例
+        for width in [60, 40] {
+            let rendered = render_summary(&sum, p.saw_info(), width);
+            for detail in [
+                "通过 6 项",
+                "跳过 1 项",
+                "YouTube",
+                "GitHub",
+                "没通",
+                "不计分",
+                "○ 仅供参考",
+            ] {
+                assert!(rendered.contains(detail), "{detail}: {rendered}");
+            }
+            assert!(rendered
+                .lines()
+                .all(|line| budget_width(line) <= line_limit(width)));
+        }
+        // IPv6 未确认仍有 ○ 图例，不能因为其余请求都成功就把它记为通过。
         let (s, n) = (FakeSys::new(), FakeNet::new());
         sample::healthy(&s, &n, Mode::Tun);
         let mut rec = Recorder::default();
@@ -1944,7 +2134,7 @@ mod tests {
         for e in &rec.events {
             p.paint(e);
         }
-        assert!(!p.saw_info());
+        assert!(p.saw_info());
     }
 
     #[test]
@@ -1972,7 +2162,10 @@ mod tests {
                 "IPv6"
             ]
         );
-        assert_eq!(rec.conts(), vec!["本机也连不上百度，先不重启"]);
+        assert_eq!(
+            rec.conts(),
+            vec!["api6.ipify.org：超时", "ipv6.icanhazip.com：超时"]
+        );
         assert_eq!(rec.lines()[3], "✗ 超时（8 秒）");
         assert_eq!(rec.lines()[5], "○ 超时（5 秒）");
         assert_eq!(hits(&n, BAIDU_URL), 1, "提前测过的百度不测第二次");
@@ -1985,11 +2178,11 @@ mod tests {
         ] {
             assert_eq!(hits(&n, url), 0, "隧道不通时不白等 {url}");
         }
-        assert_eq!((sum.passed, sum.failed, sum.skipped), (4, 1, 2));
+        assert_eq!((sum.passed, sum.failed, sum.skipped), (3, 1, 3));
         assert!(!sum.baidu_ok);
         assert_eq!(
             diagnose(&sum),
-            Some(("这台机器自己也上不了网：先检查网线 / Wi-Fi。", true))
+            Some(("多个外部连通性探测未成功，当前原因未确认。", true))
         );
         assert_eq!(last_summary(&sum), "连接检查：失败 1 项（隧道）");
 
@@ -2022,11 +2215,134 @@ mod tests {
         );
     }
 
+    fn external_probe_failure_is_observed_without_repair(reply: FakeReply, failure: &str) {
+        for mode in [Mode::Socks, Mode::Tun] {
+            let (s, n) = (FakeSys::new(), FakeNet::new());
+            sample::healthy(&s, &n, mode);
+            s.reply(
+                "systemctl show --no-pager --property=LoadState,ActiveState,SubState,InvocationID,MainPID,ExecMainStartTimestampMonotonic bui-c.service",
+                0,
+                &format!(
+                    "LoadState=loaded\nActiveState=active\nSubState=running\nInvocationID={:032x}\nMainPID=301\nExecMainStartTimestampMonotonic=3001\n",
+                    301u128
+                ),
+            );
+            n.route(PROBE_URL, reply.clone());
+            let prof = match mode {
+                Mode::Socks => profiles_socks(),
+                Mode::Tun => profiles_tun(),
+            };
+            let mut rec = Recorder::default();
+            let sum = check(&s, &n, &prof, &mut rec);
+
+            assert_eq!(rec.repairs, 0, "外部探测失败不能授权重启本地服务");
+            assert_eq!(sum.first_failure, Some(Item::Tunnel));
+            assert_eq!(sum.failed, 1);
+            assert!(sum.baidu_ok, "百度可达也不能把外部失败升级为恢复授权");
+            assert_eq!(hits(&n, PROBE_URL), 1, "未重启就不合成修复后的重查");
+            assert!(
+                rec.events.iter().any(|event| matches!(
+                    event,
+                    Event::Line(Mark::Fail, text) if text.contains(failure)
+                )),
+                "必须保留真实外部探测失败：{failure}"
+            );
+        }
+    }
+
+    #[test]
+    fn external_probe_timeout_with_healthy_local_service_does_not_repair() {
+        external_probe_failure_is_observed_without_repair(FakeReply::Timeout, "超时");
+    }
+
+    #[test]
+    fn external_probe_http_403_with_healthy_local_service_does_not_repair() {
+        external_probe_failure_is_observed_without_repair(FakeReply::Status(403), "HTTP 403");
+    }
+
+    #[test]
+    fn external_probe_http_503_with_healthy_local_service_does_not_repair() {
+        external_probe_failure_is_observed_without_repair(FakeReply::Status(503), "HTTP 503");
+    }
+
+    #[test]
+    fn unconfirmed_service_query_does_not_repair_or_claim_the_service_is_down() {
+        for (code, output) in [
+            (1, ""),
+            (0, ""),
+            (0, "LoadState=not-found\nActiveState=inactive\nSubState=dead\nInvocationID=\nMainPID=0\nExecMainStartTimestampMonotonic=0\n"),
+        ] {
+            let (s, n) = (FakeSys::new(), FakeNet::new());
+            sample::healthy(&s, &n, Mode::Socks);
+            s.reply("systemctl is-active --quiet bui-c.service", 1, "");
+            s.reply(
+                "systemctl show --no-pager --property=LoadState,ActiveState,SubState,InvocationID,MainPID,ExecMainStartTimestampMonotonic bui-c.service",
+                code,
+                output,
+            );
+            let mut rec = Recorder::default();
+            let sum = check(&s, &n, &profiles_socks(), &mut rec);
+
+            assert_eq!(rec.repairs, 0, "服务查询不确定时不得请求恢复");
+            assert!(rec.lines().iter().any(|line| line.contains("未确认")));
+            assert!(rec.lines().iter().all(|line| !line.contains("没在运行") && !line.contains("服务没起")));
+            assert!(rec.conts().iter().all(|line| !line.contains("没在运行") && !line.contains("没起来")));
+            assert_eq!((sum.passed, sum.failed, sum.first_failure), (0, 0, None));
+            assert!(sum.skipped > 0);
+            assert!(n.log().is_empty(), "实例未确认时不继续依赖实例的网络检查");
+            assert!(!last_summary(&sum).contains("全部通过"));
+            assert!(diagnose(&sum).is_some_and(|(text, next)| text.contains("未确认") && !next));
+        }
+    }
+
+    #[test]
+    fn unconfirmed_tun_query_never_repairs_or_runs_network_probes() {
+        for (query, code, output) in [
+            ("ip -j link show", 1, ""),
+            ("ip -j link show", 0, "not-json"),
+            ("ip -4 route show table all", 1, ""),
+        ] {
+            let (s, n) = (FakeSys::new(), FakeNet::new());
+            sample::healthy(&s, &n, Mode::Tun);
+            crate::testutil::present_tun(&s);
+            s.reply(query, code, output);
+            if query == "ip -j link show" {
+                // 旧布尔接口会把同一轮查询失败当成“接口不存在”。
+                s.reply("ip link show bui-tun", 1, "");
+            }
+            let mut rec = Recorder::default();
+            let sum = check(&s, &n, &profiles_tun(), &mut rec);
+
+            assert_eq!(rec.repairs, 0, "TUN 查询不确定不得授权真实恢复回调");
+            assert!(
+                n.log().is_empty(),
+                "捕获状态未确认时不得做隧道、百度或 IPv6 探测"
+            );
+            assert!(rec
+                .lines()
+                .iter()
+                .any(|line| line.contains("bui-c.service 在运行")));
+            assert!(
+                rec.labels().contains(&"本地端口"),
+                "不是 Unknown service 提前返回的空过"
+            );
+            assert!(rec.lines().iter().any(|line| line.contains("未确认")));
+            assert!(rec
+                .lines()
+                .iter()
+                .all(|line| !line.contains("接口不存在") && !line.contains("默认路由没有")));
+            assert_eq!((sum.failed, sum.first_failure), (0, None));
+            assert!(sum.passed > 0 && sum.skipped > 0);
+            assert!(!last_summary(&sum).contains("全部通过"));
+        }
+    }
+
     #[test]
     fn service_down_restarts_once_then_skips_the_rest() {
         let (s, n) = (FakeSys::new(), FakeNet::new());
         sample::healthy(&s, &n, Mode::Tun);
         s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        crate::testutil::stopped_service(&s);
         s.reply(JOURNAL_5, 0, sample::LONG_JOURNAL);
         let mut rec = Recorder::default();
         let sum = check(&s, &n, &profiles_tun(), &mut rec);
@@ -2070,14 +2386,15 @@ mod tests {
         );
         assert!(render_summary(&sum, false, 60).contains("\n  失败 1 项，跳过 6 项，用时 0 秒\n"));
 
-        // SOCKS：等端口最多 3 秒，跳过 4 项
+        // SOCKS：等端口最多 3 秒，跳过其余 5 项，包含未确认的 IPv6。
         let (s, n) = (FakeSys::new(), FakeNet::new());
         sample::healthy(&s, &n, Mode::Socks);
         s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        crate::testutil::stopped_service(&s);
         let mut rec = Recorder::default();
         let sum = check(&s, &n, &profiles_socks(), &mut rec);
         assert_eq!(rec.conts(), vec!["已重启，3 秒内还是没起来"]);
-        assert_eq!((sum.failed, sum.skipped), (1, 4));
+        assert_eq!((sum.failed, sum.skipped), (1, 5));
     }
 
     #[test]
@@ -2085,8 +2402,10 @@ mod tests {
         let (s, n) = (FakeSys::new(), FakeNet::new());
         sample::healthy(&s, &n, Mode::Socks);
         s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        crate::testutil::stopped_service(&s);
         let mut rec = Recorder::with_repair(|| {
             s.reply("systemctl is-active --quiet bui-c.service", 0, "");
+            crate::testutil::running_service(&s);
             Ok(sample::restarted())
         });
         let sum = check(&s, &n, &profiles_socks(), &mut rec);
@@ -2101,13 +2420,13 @@ mod tests {
     }
 
     #[test]
-    fn tunnel_down_restarts_once_then_skips_sites_but_not_baidu_or_ipv6() {
+    fn external_probe_failure_skips_sites_but_not_baidu_or_ipv6_without_restarting() {
         let (s, n) = (FakeSys::new(), FakeNet::new());
         sample::healthy(&s, &n, Mode::Socks);
         n.route(PROBE_URL, FakeReply::Timeout);
         let mut rec = Recorder::default();
         let sum = check(&s, &n, &profiles_socks(), &mut rec);
-        assert_eq!(rec.repairs, 1);
+        assert_eq!(rec.repairs, 0);
         assert_eq!(
             rec.lines(),
             vec![
@@ -2118,7 +2437,7 @@ mod tests {
                 "✓ 本机解析正常 12ms",
                 "✓ 32ms",
                 "- 跳过（隧道不通）",
-                "○ 本机没有 IPv6（SOCKS 模式只作提示）",
+                "○ IPv6 状态未确认（未获得有效地址）",
             ]
         );
         assert_eq!(
@@ -2136,13 +2455,9 @@ mod tests {
         );
         assert_eq!(
             rec.conts(),
-            vec!["已重启 bui-c.service，再试一次…", "✗ 还是不通"]
+            vec!["api6.ipify.org：超时", "ipv6.icanhazip.com：超时"]
         );
-        assert_eq!(
-            hits(&n, PROBE_URL),
-            2,
-            "探测、重查各一次（重启本身归调用方）"
-        );
+        assert_eq!(hits(&n, PROBE_URL), 1, "没有恢复授权时只保留一次外部探测");
         assert_eq!(hits(&n, BAIDU_URL), 1);
         for url in [
             GOOGLE_URL,
@@ -2156,31 +2471,40 @@ mod tests {
         }
         assert_eq!(
             (sum.passed, sum.failed, sum.skipped),
-            (2, 1, 2),
+            (2, 1, 3),
             "spec §3d-60-2"
         );
         assert!(sum.baidu_ok);
-        assert_eq!(diagnose(&sum), Some(("本机能上网，是当前节点不通。", true)));
+        assert_eq!(
+            diagnose(&sum),
+            Some(("外部连通性探测失败，单凭此结果不自动重启服务。", true))
+        );
         assert!(render_summary(&sum, true, 60)
-            .contains("\n  通过 2 项，失败 1 项，跳过 2 项，用时 0 秒\n"));
+            .contains("\n  通过 2 项，失败 1 项，跳过 3 项，用时 0 秒\n"));
 
-        // 重启之后通了：续行报「通了」，照常往下查
+        // 本地入口坏了才允许恢复：修好端口和探测后照常往下查。
         let (s, n) = (FakeSys::new(), FakeNet::new());
-        sample::healthy(&s, &n, Mode::Socks);
+        sample::machine(&s, &n, Mode::Socks);
         n.route(PROBE_URL, FakeReply::Timeout);
         let mut rec = Recorder::with_repair(|| {
+            s.listen(1080);
+            s.listen(8080);
             n.route(PROBE_URL, FakeReply::Status(204));
             Ok(sample::restarted())
         });
         let sum = check(&s, &n, &profiles_socks(), &mut rec);
+        assert_eq!(rec.repairs, 1, "明确本地入口故障仍需执行恢复回调");
         assert_eq!(
             rec.conts(),
             vec![
                 "已重启 bui-c.service，再试一次…",
+                "本地端口：✓ SOCKS5 :1080   ✓ HTTP :8080",
                 "✓ 通了  356ms",
                 "美国  洛杉矶",
                 "Example Networks",
-                "IDC 机房  风险分 22（ippure）"
+                "IDC 机房  风险分 22（ippure）",
+                "api6.ipify.org：超时",
+                "ipv6.icanhazip.com：超时"
             ]
         );
         assert_eq!((sum.passed, sum.failed), (5, 0));
@@ -2203,7 +2527,9 @@ mod tests {
             vec![
                 "已重启 bui-c.service，再试一次…",
                 "本地端口：✗ SOCKS5 :1080   ✗ HTTP :8080",
-                "✗ 还是不通"
+                "✗ 还是不通",
+                "api6.ipify.org：超时",
+                "ipv6.icanhazip.com：超时"
             ]
         );
         assert_eq!(hits(&n, BAIDU_URL), 1, "百度只在自己那一行测");
@@ -2239,14 +2565,21 @@ mod tests {
     #[test]
     fn a_failed_repair_is_reported_once_and_not_rechecked() {
         let (s, n) = (FakeSys::new(), FakeNet::new());
-        sample::healthy(&s, &n, Mode::Socks);
+        sample::machine(&s, &n, Mode::Socks);
         n.route(PROBE_URL, FakeReply::Timeout);
         let mut rec = Recorder::with_repair(|| Err(crate::Error::msg("另一个 bui-c 操作正在进行")));
         let sum = check(&s, &n, &profiles_socks(), &mut rec);
         assert_eq!(rec.repairs, 1);
-        assert_eq!(rec.conts(), vec!["修复失败：另一个 bui-c 操作正在进行"]);
+        assert_eq!(
+            rec.conts(),
+            vec![
+                "修复失败：另一个 bui-c 操作正在进行",
+                "api6.ipify.org：超时",
+                "ipv6.icanhazip.com：超时"
+            ]
+        );
         assert_eq!(hits(&n, PROBE_URL), 1, "没修成就不重查");
-        assert_eq!(sum.first_failure, Some(Item::Tunnel));
+        assert_eq!(sum.first_failure, Some(Item::Ports));
     }
 
     #[test]
@@ -2274,11 +2607,11 @@ mod tests {
             ),
             (
                 failed(Item::Tunnel, true, false),
-                ("本机能上网，是当前节点不通。", true),
+                ("外部连通性探测失败，单凭此结果不自动重启服务。", true),
             ),
             (
                 failed(Item::Tunnel, false, false),
-                ("这台机器自己也上不了网：先检查网线 / Wi-Fi。", true),
+                ("多个外部连通性探测未成功，当前原因未确认。", true),
             ),
             (
                 failed(Item::Tunnel, false, true),
@@ -2297,7 +2630,7 @@ mod tests {
             ),
             (
                 failed(Item::V6, true, false),
-                ("IPv6 没进隧道：把这一屏截图发给管理员。", false),
+                ("IPv6 出口路径未确认，检测站结果不证明本地泄漏。", false),
             ),
         ];
         for (s, want) in cases {
@@ -2541,14 +2874,15 @@ mod tests {
         let mut rec = Recorder::default();
         let sum = run(&sys, &net, &paths(), &profiles_socks(), &mut rec).unwrap();
         assert_eq!(rec.lines()[2], "✗ 经 SOCKS5 :1080 连不上（5 秒）");
+        assert_eq!(rec.repairs, 0);
         assert_eq!(
             rec.conts(),
-            vec!["已重启 bui-c.service，再试一次…", "✗ 还是不通"]
+            vec!["api6.ipify.org：超时", "ipv6.icanhazip.com：超时"]
         );
-        // 汇总的用时与各行同一只钟：探测、重查各 5 秒，其余不花时间
-        assert_eq!(hits(&n, PROBE_URL), 2);
-        assert_eq!(sum.elapsed_s, 10);
-        assert!(render_summary(&sum, true, 60).contains("用时 10 秒"));
+        // 汇总的用时与各行同一只钟：外部探测只一次 5 秒，其余不花时间。
+        assert_eq!(hits(&n, PROBE_URL), 1);
+        assert_eq!(sum.elapsed_s, 5);
+        assert!(render_summary(&sum, true, 60).contains("用时 5 秒"));
 
         // TUN 模式隧道通：Google / YouTube / GitHub / 百度直连各花不同的秒数，
         // 每一行报的是自己那一次的用时，不串行、不拿时限顶替
@@ -2640,12 +2974,16 @@ mod tests {
         assert!(long.trim_end().ends_with('…'), "{long}");
         assert!(budget_width(long.trim_end()) <= line_limit(40), "{long}");
         // 收尾标点不落到行首；整段不超行宽
-        let leak = p.paint(&Event::Line(
-            Mark::Fail,
-            "IPv6 泄漏（没进隧道）：2001:db8:ffff:ffff:ffff:ffff:ffff:ffff".into(),
+        assert!(!p.saw_info());
+        let observed = p.paint(&Event::Line(
+            Mark::Info,
+            "观测到 IPv6 出口 2001:db8:ffff:ffff:ffff:ffff:ffff:ffff，路径未确认".into(),
         ));
-        assert!(leak.starts_with("✗ IPv6 泄漏（没进隧道）：\n"), "{leak}");
-        for (i, l) in leak.lines().enumerate() {
+        assert!(
+            observed.starts_with("○ ") && observed.contains("路径未确认"),
+            "{observed}"
+        );
+        for (i, l) in observed.lines().enumerate() {
             let head = if i == 0 { "  IPv4 出口 " } else { "" };
             assert!(
                 budget_width(&format!("{head}{l}")) <= line_limit(40),
@@ -2656,8 +2994,6 @@ mod tests {
                 "{l:?}"
             );
         }
-        assert!(!p.saw_info());
-        p.paint(&Event::Line(Mark::Info, "超时（6 秒）".into()));
         assert!(p.saw_info());
     }
 

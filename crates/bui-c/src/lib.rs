@@ -17,6 +17,7 @@ pub mod net;
 pub mod nettest;
 pub mod paths;
 pub mod profiles;
+pub mod service;
 pub mod source;
 pub mod sys;
 pub mod testutil;
