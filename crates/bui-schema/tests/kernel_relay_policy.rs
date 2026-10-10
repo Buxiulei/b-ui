@@ -3,20 +3,56 @@ use std::io::Write;
 use std::net::TcpListener;
 use std::process::{Command, Stdio};
 
+/// The sing-box version `scripts/release/kernels.lock` declares. The lock is the
+/// release single source of truth; an unreadable or version-less lock is a hard
+/// failure, never a skip, so the guard cannot silently become a no-op.
+fn pinned_version() -> String {
+    let lock =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/release/kernels.lock");
+    let text = std::fs::read_to_string(&lock)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", lock.display()));
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        if fields.next() == Some("sing-box") && fields.next() == Some("target") {
+            return fields
+                .next()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "`sing-box target` row without a version in {}",
+                        lock.display()
+                    )
+                })
+                .to_string();
+        }
+    }
+    panic!("no `sing-box target` row in {}", lock.display())
+}
+
 #[test]
 fn selected_upstream_policy_survives_hot_switches_and_preserves_tcp_and_udp() {
     let binary = std::env::var("BUI_SING_BOX").unwrap_or_else(|_| "sing-box".into());
-    if !Command::new(&binary)
-        .arg("version")
-        .output()
-        .map(|o| o.status.success())
+    let expected = pinned_version();
+    let version = Command::new(&binary).arg("version").output();
+    if !version
+        .as_ref()
+        .map(|output| output.status.success())
         .unwrap_or(false)
     {
         eprintln!(
-            "skipped: {binary} not found; policy traffic regression requires sing-box and python3"
+            "skipped: {binary} not found; policy traffic regression requires sing-box {expected} and python3"
         );
         return;
     }
+    let observed = String::from_utf8_lossy(&version.unwrap().stdout)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(
+        observed,
+        format!("sing-box version {expected}"),
+        "policy regression requires the sing-box declared by scripts/release/kernels.lock; expected `sing-box version {expected}`, got `{observed}`"
+    );
     // Reserve only the synthetic direct destination; the Python harness relocates
     // every kernel listener and its matching loopback outbound together.
     let target = TcpListener::bind("127.0.0.1:0").unwrap();

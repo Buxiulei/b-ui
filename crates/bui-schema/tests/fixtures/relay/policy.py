@@ -257,10 +257,21 @@ def udp_session(kernel, slot, fake, first_host, resolved=True):
             assert seen[0][2] == 1, "initial UDP destination must be IPv4, not ATYP=domain"
 
 
+def expected_sing_box_version():
+    """The sing-box version scripts/release/kernels.lock declares (release single source of truth)."""
+    lock = Path(__file__).resolve().parents[5] / "scripts" / "release" / "kernels.lock"
+    for line in lock.read_text().splitlines():
+        fields = line.split()
+        if len(fields) >= 3 and fields[0] == "sing-box" and fields[1] == "target":
+            return fields[2]
+    raise AssertionError(f"no `sing-box target` row in {lock}")
+
+
 def main():
     data, binary = json.load(sys.stdin), sys.argv[1]
+    expected = expected_sing_box_version()
     version = subprocess.check_output([binary, "version"], text=True).splitlines()[0]
-    assert version == "sing-box version 1.14.3", f"policy regression requires sing-box 1.14.3, got {version}"
+    assert version == f"sing-box version {expected}", f"policy regression requires sing-box {expected} (per scripts/release/kernels.lock), got {version}"
     direct = Fake("DIRECT", port=data["target_port"])
     a, b, http_a = Fake("A", "socks"), Fake("B", "socks"), Fake("HTTP-A", "http")
     direct_socks = Fake("DIRECT", "socks")

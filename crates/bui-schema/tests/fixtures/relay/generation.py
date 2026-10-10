@@ -17,7 +17,7 @@ import time
 import urllib.request
 from pathlib import Path
 
-from policy import address, bound, encoded, exact, header, http, socks
+from policy import address, bound, encoded, exact, expected_sing_box_version, header, http, socks
 
 # Fixed independent oracles paired with relay_generation_kernel.rs; do not
 # derive expected identities from potentially incorrect renderer output.
@@ -353,10 +353,11 @@ def wait_inventory(kernel, predicate, reason):
 
 def main():
     data, binary = json.load(sys.stdin), sys.argv[1]
+    expected = expected_sing_box_version()
     version_probe = bounded_capture([binary, "version"], 5)
     assert version_probe.returncode == 0, version_probe.stderr
     version = version_probe.stdout.splitlines()[0]
-    assert version == "sing-box version 1.14.3", f"generation regression requires 1.14.3, got {version}"
+    assert version == f"sing-box version {expected}", f"generation regression requires sing-box {expected} (per scripts/release/kernels.lock), got {version}"
     assert set(data.get("backends", {})) == {"a", "b"}, "two immutable backend banks are required"
     suppliers = {name: Supplier(name.upper(), (b"generation-18", b"synthetic-only") if name == "b1" else None)
                  for name in ("a1", "a2", "b1", "b2", "direct-a", "direct-b", "direct-front")}

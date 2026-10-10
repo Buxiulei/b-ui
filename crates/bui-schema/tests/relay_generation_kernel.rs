@@ -100,8 +100,34 @@ fn bounded_output(command: &mut Command, budget: Duration) -> io::Result<Output>
     wait_bounded(isolated(command).spawn()?, budget)
 }
 
+/// The sing-box version `scripts/release/kernels.lock` declares. The lock is the
+/// release single source of truth; an unreadable or version-less lock is a hard
+/// failure, never a skip, so the guard cannot silently become a no-op.
+fn pinned_version() -> String {
+    let lock =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/release/kernels.lock");
+    let text = std::fs::read_to_string(&lock)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", lock.display()));
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        if fields.next() == Some("sing-box") && fields.next() == Some("target") {
+            return fields
+                .next()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "`sing-box target` row without a version in {}",
+                        lock.display()
+                    )
+                })
+                .to_string();
+        }
+    }
+    panic!("no `sing-box target` row in {}", lock.display())
+}
+
 fn pinned_binary() -> Option<String> {
     let binary = std::env::var("BUI_SING_BOX").unwrap_or_else(|_| "sing-box".into());
+    let expected = pinned_version();
     let version = bounded_output(Command::new(&binary).arg("version"), Duration::from_secs(5));
     if let Err(error) = &version {
         assert_ne!(
@@ -117,17 +143,20 @@ fn pinned_binary() -> Option<String> {
     {
         assert!(
             std::env::var_os("CI").is_none(),
-            "generation traffic regression requires the pinned sing-box 1.14.3 in CI"
+            "generation traffic regression requires the pinned sing-box {expected} in CI"
         );
-        eprintln!("skipped: sing-box not found; generation traffic regression requires sing-box 1.14.3 and python3");
+        eprintln!("skipped: sing-box not found; generation traffic regression requires sing-box {expected} and python3");
         return None;
     }
+    let observed = String::from_utf8_lossy(&version.unwrap().stdout)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string();
     assert_eq!(
-        String::from_utf8_lossy(&version.unwrap().stdout)
-            .lines()
-            .next(),
-        Some("sing-box version 1.14.3"),
-        "generation regression requires the pinned sing-box 1.14.3"
+        observed,
+        format!("sing-box version {expected}"),
+        "generation regression requires the sing-box declared by scripts/release/kernels.lock; expected `sing-box version {expected}`, got `{observed}`"
     );
     Some(binary)
 }

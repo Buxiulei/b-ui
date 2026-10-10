@@ -252,6 +252,30 @@ hysteria 客户端自带的 `api.hy2.io:443` 版本探针**真实过代理并归
 | 13 | **发布纪律**：2–12 同一 release，不许拆包 | ⬜ |
 | 14 | **原子性自检（机制化闸门）**：内核来源与渲染器是否产出 `experimental.v2ray_api` 必须自洽 | ✅ **完成**（`51024f5`；`check-kernel-consistency.sh`，ci.yml 只告警 / release.yml 硬闸门。**真实 CI 里验证过会发告警**） |
 | 15 | **lock 检查的 fail-open 修复**：`pin-kernels.sh` 新增 `--warn`——只降级「漂移」，`lock 少行`／`核实不了` 仍旧退 1（原 `\|\| echo ::warning::` 把三类一起吞掉） | ✅ **完成**（`fd55363`；安全审查与对抗复审各自独立指出） |
+| 16 | **测试层的版本守卫要读 lock，不能写死**（🔴 **不做则「一直更新最新版」在实践上失效**，见 §4.2） | ⬜ **blocker** |
+
+### 4.2 为什么第 16 步是「一直更新最新版」的最后一道坎
+
+第 9 步清掉的是**生产代码**里的版本字面量。但**测试层**还钉着一批，而它们恰好是**周更 bot 自动顶版的闸门**：
+
+```
+crates/bui-schema/tests/fixtures/relay/policy.py:263      assert version == "sing-box version 1.14.3"
+crates/bui-schema/tests/fixtures/relay/generation.py:359  同上
+crates/bui-schema/tests/relay_generation_kernel.rs:129    Some("sing-box version 1.14.3")
+crates/bui/src/modules/panel/stock_gate_fixture.rs:424    version=1.14.3（+ STOCK_SHA256）
+scripts/tests/test-residential-stock-gates.sh:19          sing-box version 1.14.3
+```
+
+而这些是**硬失败、不是 skip**（设计如此：找到了内核但版本不对就该红）。于是：
+
+> `kernels-bump.yml` 第 101 行用 `cargo test --workspace` 当**自己开 PR 的闸门**（`set -euo pipefail`，
+> 测试红 = 步骤失败 = **不开 PR**）⇒ 轨道一浮到 1.14.4，bot 的自测就红 ⇒ **锁永远推不动**。
+
+**修法与第 9 步同源**：守卫要证的是「PATH 上这个内核 == `kernels.lock` 声明的那个」，
+不是「它是 1.14.3」。所以**期望值从 lock 读**（单一真源），版本号与 sha 都不写死。
+
+> 注意区分：`test-manifest.sh` / `test-fetch-kernels.sh` 里的 `1.14.3` 是**合成夹具数据**
+> （它们喂的是自己造的假 lock），不依赖真 lock，**不属于本条**，不要一并改。
 
 ### 4.1 为什么第 14 步是必需的（本日暴露的洞）
 
