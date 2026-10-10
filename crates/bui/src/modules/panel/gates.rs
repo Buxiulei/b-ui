@@ -344,7 +344,12 @@ pub async fn restore_and_verify(
             tokio::time::sleep(REPLAY_RETRY_FIRST).await;
         }
         let version = shared.hy2resi().version().await?;
-        anyhow::ensure!(version == "sing-box 1.14.3", "expected stock sing-box 1.14.3, observed {version}");
+        // 判据是**产品身份**，不是版本字面量：装上的是不是我们那份，归 manifest 声明与 sha
+        // 绑定（2026-10-10 计划 §1.4）。
+        anyhow::ensure!(
+            crate::kernels::is_singbox_clash_version(&version),
+            "expected sing-box Clash API, observed {version}"
+        );
         let gate = shared.gate_guard().await;
         let publication = ctx.store.publication_permit().await;
         let state = publication.state().clone();
@@ -969,11 +974,11 @@ mod tests {
         assert_eq!(h.hy2resi.selected()["gate-r000"], "deny");
     }
 
-    // Catches accepting another stock version or malformed product evidence as readiness.
+    // Catches accepting another product's evidence as readiness (版本不再是判据，见 §1.4).
     #[tokio::test]
     async fn activation_rejects_a_different_product_version() {
         let h = harness_with_pool().await;
-        h.hy2resi.with(|i| i.version = "sing-box 1.14.1".into());
+        h.hy2resi.with(|i| i.version = "clash 1.14.1".into());
         assert!(restore_and_verify(
             &ctx_of(&h),
             &h.shared,

@@ -230,24 +230,36 @@ pub fn prepare(
     Ok((plan, asset))
 }
 
-/// 回滚允许回到的 sing-box 版本：这两个版本的**住宅布局**是同一个（整段 `40000` + `inet bui`
-/// REDIRECT、每槽一个 relay 入站），跨 1.14.2 ⇄ 1.14.3 回滚安全，而且升级到 1.14.3 之后
-/// `.prev` 里那份 manifest 钉的正是 1.14.2 —— 这一跳恰恰是回滚安全网本身要覆盖的。1.14.2
-/// 那侧的配置（带 `experimental.v2ray_api`）与自建 1.14.2 自洽；将来渲染器摘掉那一段之后，
-/// 该段是可选的、自建 1.14.2 照样能加载。
+/// 当前住宅布局（4.1 起：单实例 sing-box `:40000` + `table inet bui` 整段 REDIRECT + 按凭据的
+/// 门，以及与之配套的 `state.json` 形状）是从这一版 **bui** 开始的。回滚不许跨过这条线。
 ///
-/// 跨**布局**（v4.0.x 那类「每槽一份 yaml + 每槽一个端口」）仍旧拒绝：那才是这条闸门要挡的
-/// 东西。长期形态是按能力/布局判定 + `prev` 资产可解析且 sha 与 `sing-box.prev` 一致，而不是
-/// 维护一张版本名单（见 2026-10-10 审计「回滚退路」一条）——那一步连同 `serve.rs` / 升级入口 /
-/// 装机的同源版本字面量一起另做。
-const ROLLBACK_SUPPORTED_SINGBOX: &[&str] = &["1.14.2", "1.14.3"];
+/// 历史语义（被本常量取代的那张名单）：这里曾写着 `ROLLBACK_SUPPORTED_SINGBOX =
+/// ["1.14.2", "1.14.3"]`，按 **sing-box 的版本号白名单**放行——当时的理由是「这两个版本共享
+/// 同一个住宅布局」。名单比的是 **`.prev` manifest 里 sing-box 的版本，也就是回滚的*目标*版本**，
+/// 所以在 2026-10-10 轨道转 `minor:1.14` 之后**晚一个补丁才发作**：名单里的目标（1.14.2 / 1.14.3）
+/// 照旧放行，但再顶一次补丁后，`1.14.5 → 1.14.4` 这种**目标 ≥ 1.14.4** 的合法回滚会被判成
+/// 「不支持」——安全网在我们自己打开的浮动轨道上悄悄关掉。
+///
+/// 现在的判据分两半，各自绑定它真正代表的东西：
+/// - **布局**归这儿：上一版 manifest 的 `version`（bui 的版本，不是 sing-box 的）必须 ≥ 这个
+///   常量。布局由 bui 的渲染器与状态模型定义，与 sing-box 版本号没有对应关系——v4.0.1 的
+///   `kernels.lock` 里同样有 sing-box 条目（那会儿它跑中继），所以「上一版 manifest 里有
+///   sing-box 资产」分辨不出两代布局；`sing-box.prev` 的字节两代都是同一个上游产物，
+///   sha 一致只能证明「恢复的是上一版声明的那份内核」，证不了布局。
+/// - **身份**归 [`rollback`] 里那条 sha 一致：候选的字节必须等于上一版 manifest 声明的 sha256。
+///
+/// 为什么布局判据是**显式常量**而不是自动判定：自动判定要有能力探针（跑得动上一版 bui 并问
+/// 它认不认 4.1 期望态），现成证据里没有——所以宁可保留一条只在**布局变更时**抬一次的常量
+/// （下次布局变更把它抬到那一版），也不写一张每个内核 patch 都要跟着维护的名单。
+const RESIDENTIAL_LAYOUT_SINCE: &str = "4.1.0";
 
 /// **先停 `hysteria-residential` 并删掉 `table inet bui`**（spec §9.1），再
 /// `bin/bui.prev` → `bin/bui`、四个内核 ← 各自 `.prev`、`manifest.json` ←
 /// `manifest.prev.json`、`state.json` ← 最近一份备份，最后重启 `b-ui`（重启后守护进程自己
 /// 对账）。
 ///
-/// 前两步的顺序不能换、也不能省（4.1 → 4.0.1 的回滚判据）：4.1 的住宅 HY2 是一个
+/// 前两步的顺序不能换、也不能省（4.1 → 4.0.1 这类住宅拓扑切换的回滚判据；那一跳本身已被
+/// [`RESIDENTIAL_LAYOUT_SINCE`] 挡在门外，但顺序仍是任何拓扑切换唯一安全的序）：4.1 的住宅 HY2 是一个
 /// sing-box 入站 `:40000` + 那张表把整段 `41000-50000`（开着兼容段时还有 `40001-40007`）
 /// REDIRECT 进去。表留着回到 4.0.1，整段就全被 REDIRECT 到槽 0 的 apernet 实例 ——
 /// 全体住宅用户从槽 0 那个 IP 出去、`40000+i` 无人应答，比 2026-09-15 那次切片跨进程的
@@ -268,7 +280,8 @@ const ROLLBACK_SUPPORTED_SINGBOX: &[&str] = &["1.14.2", "1.14.3"];
 /// （`serve.rs` 的 `selfcheck_loop`：拉 manifest → 写缓存 → 对账）换内核不经本模块、不写 `.prev`，
 /// 所以 `--rollback` 能退到的是「最近一次显式 `bui upgrade` 之前」，不是「任意一次换内核之前」。
 ///
-/// 能退到哪一版 sing-box 由 [`ROLLBACK_SUPPORTED_SINGBOX`] 定。
+/// 能退到哪一版由两条判据定：上一版 manifest 的 bui 版本 ≥ [`RESIDENTIAL_LAYOUT_SINCE`]
+/// （不跨住宅布局），且候选内核的 sha256 与上一版 manifest 声明的一致（是同一份字节）。
 pub fn rollback(host: &dyn Host, paths: &Paths) -> anyhow::Result<Vec<String>> {
     let prev = paths.bin_dir.join("bui.prev");
     let bytes = host
@@ -279,10 +292,12 @@ pub fn rollback(host: &dyn Host, paths: &Paths) -> anyhow::Result<Vec<String>> {
         .context("rollback requires a supported previous manifest")?;
     let manifest: Manifest = serde_json::from_slice(&manifest)?;
     let arch = host.arch()?;
-    let (version, asset) = manifest.kernel_asset("sing-box", &arch)?;
+    let (_, asset) = manifest.kernel_asset("sing-box", &arch)?;
     anyhow::ensure!(
-        ROLLBACK_SUPPORTED_SINGBOX.contains(&version.trim_start_matches('v')),
-        "rollback across residential kernel/layout versions is unsupported"
+        !version_lt(&manifest.version, RESIDENTIAL_LAYOUT_SINCE),
+        "上一版 manifest 是 {}：早于住宅布局 {}，跨布局回滚不支持",
+        manifest.version,
+        RESIDENTIAL_LAYOUT_SINCE
     );
     let previous_kernel = paths.bin_dir.join("sing-box.prev");
     let candidate = if host.file_sha256(&previous_kernel)?.is_some() {
@@ -486,10 +501,6 @@ pub async fn publish_upgrade(
                 return Err(crate::sys::env_probe::EnvBlocked(msg).into());
             }
             let arch = h.arch()?;
-            anyhow::ensure!(
-                m.kernel_asset("sing-box", &arch)?.0.trim_start_matches('v') == "1.14.3",
-                "only stock sing-box 1.14.3 is supported"
-            );
             let installed = crate::kernels::installed_versions(h.as_ref(), &p.bin_dir);
             let plan = plan_upgrade(
                 h.as_ref(),
@@ -1130,6 +1141,12 @@ mod tests {
     }
 
     fn seed_supported_previous(h: &FakeHost, paths: &Paths) {
+        seed_previous(h, paths, "4.1.4", "1.14.2");
+    }
+
+    /// 写一份「上一版 manifest」，sha 取盘上 `sing-box.prev`（没有就现写一份 live `sing-box`）。
+    /// bui 版本与 sing-box 版本参数化：布局判据绑定的是前者。
+    fn seed_previous(h: &FakeHost, paths: &Paths, bui: &str, sb: &str) {
         let previous = paths.bin_dir.join("sing-box.prev");
         let sum = match h.file_sha256(&previous).unwrap() {
             Some(sum) => sum,
@@ -1143,7 +1160,7 @@ mod tests {
                 crate::kernels::sha256_hex(b"supported stock binary")
             }
         };
-        let m = manifest("4.1.4", "1.14.2", &sum);
+        let m = manifest(bui, sb, &sum);
         h.write_file(
             &crate::paths::manifest_prev_file(paths),
             &serde_json::to_vec(&m).unwrap(),
@@ -1648,13 +1665,24 @@ mod tests {
     fn rollback_restores_the_four_kernels_and_the_manifest_cache_byte_for_byte() {
         let d = tempfile::tempdir().unwrap();
         let paths = scratch(&d);
-        let (h, old_manifest) = pre_upgrade(&paths);
+        let (h, _) = pre_upgrade(&paths);
+        // 回滚只在同一代住宅布局内放行（[`RESIDENTIAL_LAYOUT_SINCE`] = 4.1.0），所以夹具的
+        // bui 版本改用 4.1.x 那一对：本测试验的是字节级恢复，跨 4.0.x 布局那条路已被判据
+        // 拒绝（见 `rollback_refuses_a_previous_manifest_from_before_the_residential_layout`）。
+        // 五个二进制的内容（`OLD_BINS`）只是版本指纹，与 manifest 的版本号无关，保持原样。
+        let old_manifest = manifest_json("4.1.3", OLD_KERNELS, OLD_BINS[0].1);
+        h.write_file(
+            &crate::paths::manifest_file(&paths),
+            old_manifest.as_bytes(),
+            0o644,
+        )
+        .unwrap();
 
         // ---- 升一次：快照 → 换 manifest 缓存 → 换四个内核 → 换 bui 自己（apply_self 写 bui.prev）
         snapshot_prev(&h, &paths).unwrap();
         h.write_file(
             &crate::paths::manifest_file(&paths),
-            manifest_json("4.0.1", NEW_KERNELS, "BUI-4.0.1").as_bytes(),
+            manifest_json("4.1.4", NEW_KERNELS, "BUI-4.0.1").as_bytes(),
             0o644,
         )
         .unwrap();
@@ -1790,6 +1818,65 @@ mod tests {
         let error = rollback(&h, &paths).unwrap_err();
         assert!(error.to_string().contains("supported previous manifest"));
         assert!(h.ops().is_empty(), "unverifiable rollback must not write");
+    }
+
+    /// 事故回归（本批）：旧名单比的是**回滚目标**的 sing-box 版本，名单里的 1.14.2 / 1.14.3
+    /// 照旧放行，所以缺陷**晚一个补丁才发作**——再顶一次后，`1.14.5 → 1.14.4` 这种
+    /// **目标 ≥ 1.14.4** 的合法回滚会被判成「不支持」，安全网在自己的浮动轨道上关掉。
+    /// 判据换成「布局（bui 版本 ≥ 4.1.0）+ sha 一致」后，任何 4.1.x 上游补丁都能回退；
+    /// 这里钉住的就是「**比旧名单更新的那个目标版本**必须放行」。
+    #[test]
+    fn rollback_accepts_a_previous_singbox_newer_than_the_retired_version_list() {
+        let d = tempfile::tempdir().unwrap();
+        let (h, p) = host_with_prev_binaries(&d);
+        seed_previous(&h, &p, "4.1.4", "1.14.4");
+        let done = rollback(&h, &p).unwrap();
+        assert!(
+            done.iter().any(|l| l.contains("sing-box")),
+            "四个内核都要走一遍恢复：{done:?}"
+        );
+        assert_eq!(
+            h.read_file(&p.bin_dir.join("sing-box")).unwrap(),
+            Some(b"OLDK".to_vec()),
+            "sing-box 必须恢复成上一版字节"
+        );
+    }
+
+    /// 另一半判据：住宅布局的引入线。4.0.x 的 bui（每槽一份 yaml + 每槽一个端口）读不懂
+    /// 4.1 的期望态，跨过这条线一律拒绝——判据绑定**定义布局的那一端**（bui 的版本），
+    /// 不再绑定 sing-box 的版本号。
+    #[test]
+    fn rollback_refuses_a_previous_manifest_from_before_the_residential_layout() {
+        let d = tempfile::tempdir().unwrap();
+        let (h, p) = host_with_prev_binaries(&d);
+        seed_previous(&h, &p, "4.0.1", "1.14.4");
+        h.clear_ops();
+        let err = rollback(&h, &p).unwrap_err();
+        assert!(err.to_string().contains("跨布局回滚不支持"), "{err}");
+        assert!(h.ops().is_empty(), "拒绝必须发生在停单元/写盘之前");
+    }
+
+    /// 布局判据之外的 sha 一致：候选（`sing-box.prev`，缺了才看 live）的字节必须就是上一版
+    /// manifest 声明的那一份。比版本号硬得多的身份——版本号对不上但字节对得上是可以放行的，
+    /// 字节对不上就一定是别人的东西。
+    #[test]
+    fn rollback_refuses_a_singbox_candidate_off_the_declared_sha() {
+        let d = tempfile::tempdir().unwrap();
+        let (h, p) = host_with_prev_binaries(&d);
+        h.write_file(
+            &crate::paths::manifest_prev_file(&p),
+            &serde_json::to_vec(&manifest("4.1.4", "1.14.3", "00")).unwrap(),
+            0o644,
+        )
+        .unwrap();
+        h.clear_ops();
+        let err = rollback(&h, &p).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not match supported manifest SHA"),
+            "{err}"
+        );
+        assert!(h.ops().is_empty(), "拒绝必须发生在停单元/写盘之前");
     }
 
     #[test]

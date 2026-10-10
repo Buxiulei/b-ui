@@ -95,8 +95,17 @@ jobs:
           bash scripts/release/check-release-gate.sh "v$ver" --warn
       - name: 内核来源与渲染器自洽（只告警，不卡 CI）
         run: bash scripts/release/check-kernel-consistency.sh --warn
-      - name: 内核 lock 没有漂移出轨道
-        run: bash scripts/release/pin-kernels.sh --check
+      - name: 内核 lock 是否还贴着轨道（漂移只告警；lock 坏了仍旧判红）
+        run: |
+          # 轨道是浮动的（sing-box = minor:1.14）⇒ 上游一出 patch，lock 就"落后"于轨道，
+          # 而那时仓库里没有一个字节被改过：硬闸门会让 CI 从上游发版那天起红到周更 bot 开
+          # PR 为止（最长一周），红得与代码无关。真正的跟进执法者是 kernels-bump.yml
+          # （每周一 03:00 重跑 --write → 按新锁复算 sha → 跑全量测试 → 开 PR）。
+          #
+          # 所以这里用 `--warn`，**只把「漂移」降级为告警**；`lock 少行` 与
+          # `轨道解析/取远端失败`（「核实不了」）仍旧退 1 —— 那两类是锁或环境坏了，
+          # 把三类一起吞成告警就是 fail-open（2026-10-10 安全审查指出过这个洞）。
+          bash scripts/release/pin-kernels.sh --check --warn
 
   test:
     name: test (sing-box 1.14.3)

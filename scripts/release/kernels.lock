@@ -1,4 +1,4 @@
-# 由 scripts/release/pin-kernels.sh --write 生成，勿手工编辑（生成时间 2026-10-10T03:54:17Z）
+# 由 scripts/release/pin-kernels.sh --write 生成，勿手工编辑（生成时间 2026-10-10T04:33:41Z）
 # sing-box 两行于 2026-10-10 从自建改为上游官方发行归档（1.14.3）；sha256 是官方 tar.gz 的 sha。
 # hysteria 两行 2026-09-16 曾按轨道 appmajor:2 顶到 2.12.3；2026-10-10 的 --write 又按同一条轨道
 # 解析到 2.13.0，caddy 同步由 2.11.4 顶到 2.11.7（都是上游出了新 patch，sha256 一律自己下载自己算，

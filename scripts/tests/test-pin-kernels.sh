@@ -36,8 +36,11 @@ set +eu
 
 assert_eq "1.14.25" "$(resolve_track SagerNet/sing-box 'minor:1.14')" "minor 按版本排序，25 > 9，忽略其他 minor"
 assert_eq "1.15.0" "$(resolve_track SagerNet/sing-box 'minor:1.15')" "prerelease tag 不入选"
-assert_eq "pin:v1.14.3" "$SINGBOX_TRACK" "sing-box 只以 1.14.3 为发布和测试目标"
-assert_eq "1.14.3" "$(resolve_track "$SINGBOX_REPO" "$SINGBOX_TRACK")" "新 patch 和 minor 不改变锁定目标"
+# 2026-10-10 计划 §1.1：sing-box 从 pin:v1.14.3 改成浮动 minor:1.14（吃到 1.14.x 最新 patch，
+# 不自动跨 minor）。resolved_singbox 是下面各条断言的锚（stub 的 tag 表钉死了它）。
+assert_eq "minor:1.14" "$SINGBOX_TRACK" "sing-box 跟 1.14.x 最新补丁走，不自动跨 minor"
+resolved_singbox=$(resolve_track "$SINGBOX_REPO" "$SINGBOX_TRACK")
+assert_eq "1.14.25" "$resolved_singbox" "浮动轨道解析到该 minor 下最高 patch"
 assert_eq "26.3.27" "$(resolve_track XTLS/Xray-core 'pin:v26.3.27')" "pin 轨道原样返回，不查网络"
 assert_eq "2.12.2" "$(resolve_track apernet/hysteria 'appmajor:2')" "appmajor:2 去掉 app/v 前缀且不选 v1"
 assert_eq "2.11.4" "$(resolve_track caddyserver/caddy 'major:2')" "major:2 取最新 2.x"
@@ -70,13 +73,32 @@ done
 n=$(awk '$1 == "sing-box" && $2 == "check" {c++} END {print c + 0}' "$lock")
 assert_eq "0" "$n" "不再下载旧版本 check 内核"
 
-# 固定目标也必须验证锁文件，不能因上游出现新版本而自动前进。
+# 锁必须贴着轨道解析值：锁里还钉着旧版本（1.14.3）而轨道是浮动 minor 时必须报漂移
+# ——从前「轨道解析=1.14.3」是一致，现在 1.14.3 ≠ 1.14.25 就是漂移。
 LOCK="$WORK/drift.lock"
 cp "$lock" "$LOCK"
-sed -i 's/sing-box target 1.14.3 /sing-box target 1.14.5 /' "$LOCK"
+sed -i 's/^sing-box target [0-9][^ ]* /sing-box target 1.14.3 /' "$LOCK"
 out=$(check_lock 2>&1); rc=$?
-assert_eq "1" "$rc" "lock 与固定版本不一致必须退 1"
-assert_contains "漂移：sing-box lock=1.14.5 轨道解析=1.14.3" "$out" "漂移信息给出固定目标"
+assert_eq "1" "$rc" "lock 与轨道解析不一致必须退 1"
+assert_contains "漂移：sing-box lock=1.14.3 轨道解析=$resolved_singbox" "$out" "漂移信息给出轨道解析值"
+
+# --warn 只降级「漂移」：同一个漂移的锁，带上 --warn 变成告警 + 退 0
+WARN=1
+out=$(check_lock 2>&1); rc=$?
+WARN=0
+assert_eq "0" "$rc" "--warn 下漂移退 0"
+assert_contains "::warning::kernels.lock 落后于版本轨道" "$out" "--warn 下漂移发 GitHub 告警注解"
+
+# ⚠️ 但 --warn **不能**把「锁坏了 / 核实不了」一起吞掉——那正是 fail-open
+# （2026-10-10 安全审查与对抗复审各自独立指出过这个洞）。
+LOCK="$WORK/short.lock"
+grep -v '^sing-box ' "$lock" > "$LOCK"
+WARN=1
+out=$(check_lock 2>&1); rc=$?
+WARN=0
+assert_eq "1" "$rc" "lock 缺 sing-box 行：--warn 也退 1（lock 坏了不是漂移）"
+assert_contains "锁里没有 sing-box 的行" "$out" "缺行给出可操作的诊断"
+assert_not_contains "::warning::" "$out" "缺行不许降级成告警"
 
 # —— --write：四个内核一律下载上游资产并现算 sha256（stub curl）——
 # curl stub：remote_sha256 只用 curl 的 stdout 算 sha，给 URL 本身当内容即可（零网络）
@@ -94,11 +116,11 @@ lock_before=$(sha256sum "$lock" | cut -d' ' -f1)
 PATH="$WORK/bin:$PATH" bash "$ROOT/scripts/release/pin-kernels.sh" --write --lock "$LOCK_OUT" >/dev/null 2>&1
 assert_eq "0" "$?" "--write 退 0"
 assert_eq "$lock_before" "$(sha256sum "$lock" | cut -d' ' -f1)" "--write --lock 不许碰仓库里的 kernels.lock"
-line=$(grep '^sing-box target 1.14.3 amd64' "$LOCK_OUT")
-assert_contains "https://github.com/SagerNet/sing-box/releases/download/v1.14.3/sing-box-1.14.3-linux-amd64.tar.gz" "$line" \
-  "target 行是官方发行归档 URL（版本固定为 1.14.3）"
+line=$(grep "^sing-box target $resolved_singbox amd64" "$LOCK_OUT")
+assert_contains "https://github.com/SagerNet/sing-box/releases/download/v$resolved_singbox/sing-box-$resolved_singbox-linux-amd64.tar.gz" "$line" \
+  "target 行是官方发行归档 URL（浮动轨道解析出的版本）"
 # sha256 是「自己下载自己算」的，不是从别处抄来的：stub curl 的内容就是 URL 本身
-want_sha=$(printf '%s\n' "https://github.com/SagerNet/sing-box/releases/download/v1.14.3/sing-box-1.14.3-linux-amd64.tar.gz" | sha256sum | cut -d' ' -f1)
+want_sha=$(printf '%s\n' "https://github.com/SagerNet/sing-box/releases/download/v$resolved_singbox/sing-box-$resolved_singbox-linux-amd64.tar.gz" | sha256sum | cut -d' ' -f1)
 assert_contains "$want_sha" "$line" "sha256 按下载内容现算"
 assert_eq "0" "$(grep -c '^build:' "$LOCK_OUT")" "--write 不再生成 build: 行"
 assert_eq "0" "$(grep -c '^sing-box check ' "$LOCK_OUT")" "--write 不再生成 check 行"
@@ -120,8 +142,8 @@ assert_contains "# 手写注记乙：hysteria 为什么顶了版本" "$(cat "$NO
 assert_eq "1" "$(grep -c '^# 由 scripts/release/pin-kernels\.sh --write 生成' "$NOTES_LOCK")" \
   "生成时间那行由 --write 重写，不堆叠"
 assert_eq "1" "$(grep -c '^# kernel role version arch sha256 url' "$NOTES_LOCK")" "列名行不堆叠"
-assert_eq "1.14.3" "$(awk '$1 == "sing-box" && $2 == "target" {print $3; exit}' "$NOTES_LOCK")" \
-  "正文回到固定目标（1.14.4 → 1.14.3）"
+assert_eq "$resolved_singbox" "$(awk '$1 == "sing-box" && $2 == "target" {print $3; exit}' "$NOTES_LOCK")" \
+  "正文回到轨道解析值（1.14.4 → $resolved_singbox）"
 # 新建锁（文件不存在）时不能因为读不到注记就失败
 PATH="$WORK/bin:$PATH" bash "$ROOT/scripts/release/pin-kernels.sh" --write --lock "$WORK/fresh.lock" >/dev/null 2>&1
 assert_eq "0" "$?" "--write 到不存在的锁上仍退 0"

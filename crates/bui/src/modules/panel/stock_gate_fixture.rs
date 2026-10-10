@@ -190,8 +190,8 @@ async fn wait_api(api: &Hy2ResiClient) -> Result<()> {
     .await
     .context("stock API readiness deadline")?;
     ensure!(
-        api.version().await? == "sing-box 1.14.3",
-        "stock API version mismatch"
+        crate::kernels::is_singbox_clash_version(&api.version().await?),
+        "stock API product mismatch"
     );
     Ok(())
 }

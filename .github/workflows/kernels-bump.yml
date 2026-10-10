@@ -15,7 +15,9 @@ name: kernels-bump
 #   2. checkout 显式 `ref: v4`：schedule 触发时默认拿到的是**默认分支**，而 `--write` 是按
 #      checkout 出来的 kernel-versions.env 整文件重生成锁、PR 又是 `--base v4`；不钉 ref 的话
 #      main 与 v4 的 env 一有差异（比如 v4 钉了别的 sing-box 版本），bot 就会把 main 的版本
-#      表写进 v4 的锁，合掉之后 v4 的 CI 会在 `pin-kernels.sh --check` 上判红。
+#      表写进 v4 的锁。⚠️ 2026-10-10 起 lint 里的 `pin-kernels.sh --check` 已改成**只告警**，
+#      所以别指望 CI 拦下这一条——真正的后果是把另一个分支的版本表写进 v4 的锁，评审时按 lock
+#      的 diff 自己看（`kernels-bump.yml` 的 PR 正文也会列 `--write` 的逐行输出）。
 #   3. 用 GITHUB_TOKEN 推出来的分支不会触发 ci.yml（GitHub 的防循环规则），所以本工作流
 #      自己跑一遍 cargo test 当闸门；PR 上想看 CI 就在 PR 里手动 re-run。
 on:

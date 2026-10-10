@@ -216,7 +216,7 @@ pub async fn reconcile_from_ctx(
     let state2 = state.clone();
     let keys2 = keys.clone();
     // Render a read-only plan, then download to private same-filesystem paths.
-    let (work, mut binaries) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+    let (work, mut binaries, prepared_dirs) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let facts = Facts::probe(host.as_ref())?;
         let render = RenderCtx {
             paths: paths.clone(),
@@ -252,62 +252,76 @@ pub async fn reconcile_from_ctx(
                 .collect(),
         };
         let mut binaries = BTreeMap::new();
+        // `.prepared-<uuid>` 候选目录的登记表：这里只准备、不消费，消费在 owner 串行段里
+        // （[`PreparedInstaller::install`] 与 [`residential_lifecycle::publish_with_relay`] 改名）。
+        // 无论走哪条退出路径，最后都要收（见本函数尾部与 [`discard_prepared`]）。
+        let mut prepared_dirs: Vec<PathBuf> = Vec::new();
         if !dry_run {
             use crate::reconcile::diff::Change;
             let installer = KernelInstaller {
                 fetcher: fetcher.as_ref(),
                 host: host.as_ref(),
             };
-            for change in &p.changes {
-                if let Change::InstallBinary {
-                    name,
-                    version,
-                    sha256,
-                    url,
-                    ..
-                } = change
-                {
-                    if name == "sing-box" {
-                        anyhow::ensure!(
-                            version.trim_start_matches('v') == "1.14.3",
-                            "only stock sing-box 1.14.3 is supported"
+            let prepared = (|| -> anyhow::Result<()> {
+                for change in &p.changes {
+                    if let Change::InstallBinary {
+                        name,
+                        version,
+                        sha256,
+                        url,
+                        ..
+                    } = change
+                    {
+                        let dir = paths
+                            .bin_dir
+                            .join(format!(".prepared-{}", uuid::Uuid::new_v4()));
+                        let path = dir.join(name);
+                        use std::os::unix::fs::DirBuilderExt;
+                        std::fs::DirBuilder::new()
+                            .recursive(true)
+                            .mode(0o700)
+                            .create(&dir)?;
+                        prepared_dirs.push(dir);
+                        installer.install(name, version, sha256, url, &path)?;
+                        if name == "sing-box" {
+                            // sha256 已在 install 里验过；这里再对一次候选自报的版本与
+                            // **manifest 声明**（才是判据，不是任何版本字面量）。真正的能力门
+                            // 在下游 `publish_with_relay`：候选要先生前过住宅 + relay 两份
+                            // 配置的 `check -c`，过不了不会改名、不会重启。
+                            let observed = host.run(&path.display().to_string(), &["version"])?;
+                            anyhow::ensure!(
+                                observed.ok()
+                                    && crate::kernels::parse_version("sing-box", &observed.stdout)
+                                        .as_deref()
+                                        == Some(version.trim_start_matches('v')),
+                                "候选 sing-box 自报版本与 manifest 声明不符：声明 {version}，实得 {}",
+                                observed.stdout.lines().next().unwrap_or("(无输出)")
+                            );
+                        }
+                        binaries.insert(
+                            name.clone(),
+                            crate::residential_lifecycle::Candidate {
+                                path,
+                                sha256: sha256.clone(),
+                            },
                         );
                     }
-                    let path = paths
-                        .bin_dir
-                        .join(format!(".prepared-{}", uuid::Uuid::new_v4()))
-                        .join(name);
-                    use std::os::unix::fs::DirBuilderExt;
-                    std::fs::DirBuilder::new()
-                        .recursive(true)
-                        .mode(0o700)
-                        .create(path.parent().expect("candidate parent"))?;
-                    installer.install(name, version, sha256, url, &path)?;
-                    if name == "sing-box" {
-                        let version = host.run(&path.display().to_string(), &["version"])?;
-                        anyhow::ensure!(
-                            version.ok()
-                                && crate::kernels::parse_version("sing-box", &version.stdout)
-                                    .as_deref()
-                                    == Some("1.14.3"),
-                            "candidate is not stock sing-box 1.14.3"
-                        );
-                    }
-                    binaries.insert(
-                        name.clone(),
-                        crate::residential_lifecycle::Candidate {
-                            path,
-                            sha256: sha256.clone(),
-                        },
-                    );
                 }
+                Ok(())
+            })();
+            if let Err(error) = prepared {
+                discard_prepared(host.as_ref(), &prepared_dirs);
+                return Err(error);
             }
         }
-        Ok((work, binaries))
+        Ok((work, binaries, prepared_dirs))
     })
     .await??;
     let (c, mods) = (ctx.clone(), modules.to_vec());
-    ctx.bus.residential().execute(move |tx| async move {
+    // 清理必须放在 owner 串行段**之后**：候选的改名（[`PreparedInstaller::install`] 与
+    // `publish_with_relay` 里的 `rename_file`）都发生在 `execute` 内部，早删会把还在用的
+    // 候选二进制抽掉。成功路径上目录已被改名掏空，失败路径上可能还躺着下载好的内核。
+    let outcome = ctx.bus.residential().execute(move |tx| async move {
         let candidate = binaries.remove("sing-box");
         let previous_keys=c.runtime.read().await.restart_keys;
         let relay_config=if candidate.is_some() {
@@ -374,7 +388,21 @@ pub async fn reconcile_from_ctx(
         }
         if report.restarted.iter().any(|u| u == "b-ui-relay") { c.bus.send(Event::RelayRestarted); }
         Ok(report)
-    }).await
+    }).await;
+    discard_prepared(ctx.host.as_ref(), &prepared_dirs);
+    outcome
+}
+
+/// 删掉本轮 `.prepared-<uuid>` 候选目录（含没被消费的候选二进制）。
+///
+/// [`Host::remove_dir_all`] 幂等：成功路径上目录可能已被改名掏空，删不掉的只告警——
+/// 下一轮对账会照常重建，不能因为清理失败把对账结果翻成错误。
+fn discard_prepared(host: &dyn Host, dirs: &[PathBuf]) {
+    for dir in dirs {
+        if let Err(error) = host.remove_dir_all(dir) {
+            tracing::warn!(dir = %dir.display(), error = %error, "候选内核目录清理失败");
+        }
+    }
 }
 
 struct PreparedInstaller<'a> {
@@ -1544,6 +1572,9 @@ mod tests {
     use crate::reconcile::Artifact;
     struct SharedBinaryFixture {
         relay: Vec<u8>,
+        /// 期望安装的 sing-box 版本；`FakeHost` 的 stock 假内核自报恒为 1.14.3，两者不等时
+        /// `prepare_changes` 里那条「候选自报版本 == manifest 声明」探头必须当场中止本轮。
+        sing_box_version: &'static str,
     }
     impl Module for SharedBinaryFixture {
         fn name(&self) -> &'static str {
@@ -1553,7 +1584,7 @@ mod tests {
             vec![
                 Artifact::Binary {
                     name: "sing-box".into(),
-                    version: "1.14.3".into(),
+                    version: self.sing_box_version.into(),
                     sha256: crate::kernels::sha256_hex(b"new binary"),
                     url: "https://fixture/sing-box".into(),
                 },
@@ -1603,7 +1634,10 @@ mod tests {
                     i.rejected_check_contents.insert(next.clone());
                 }
             });
-            let modules: Vec<Arc<dyn Module>> = vec![Arc::new(SharedBinaryFixture { relay: next })];
+            let modules: Vec<Arc<dyn Module>> = vec![Arc::new(SharedBinaryFixture {
+                relay: next,
+                sing_box_version: "1.14.3",
+            })];
             let f: Arc<dyn Fetcher> = Arc::new(FakeFetcher(Mutex::new(vec![(
                 "https://fixture/sing-box".into(),
                 b"new binary".to_vec(),
@@ -1645,7 +1679,89 @@ mod tests {
             assert!(crate::residential_lifecycle::read_record(&ctx)
                 .unwrap()
                 .is_none_or(|r| r.phase != "active"));
+            // 第 11 步：候选目录（以及没被消费的候选二进制）在**每一条**退出路径上都要收掉，
+            // 否则每 tick 残留一份下载好的内核。
+            assert!(
+                ops.iter()
+                    .any(|o| o.starts_with("rmdir:") && o.contains("/.prepared-")),
+                "{case}: prepared candidate dir must be discarded: {ops:?}"
+            );
+            assert!(
+                host.list_dir(&ctx.paths.bin_dir).unwrap().iter().all(|p| !p
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with(".prepared-"))),
+                "{case}: no .prepared-* dir may survive the round"
+            );
         }
+    }
+
+    /// `prepare_changes` 那条「候选自报版本 == manifest 声明」探头的反例（此前只有正例：
+    /// 夹具声明 1.14.3、stock 假内核自报 1.14.3）。上游把 tag 打错、或 manifest 里填了别的
+    /// 二进制时，sha 校验能过（sha 是 manifest 自己声明的），自报版本这一对是最后一道：
+    /// 不等就当场中止本轮——候选不发布、活二进制不动、单元不碰、候选目录收掉。
+    #[tokio::test]
+    async fn a_candidate_reporting_a_version_off_the_manifest_aborts_the_round() {
+        let host = ready_host();
+        let d = tempfile::tempdir().unwrap();
+        let ctx = ctx_for(host.clone(), &d).await;
+        let config =
+            crate::residential_lifecycle::config_bytes(&*ctx.store.read().await, &ctx.paths)
+                .unwrap();
+        host.write_file(
+            &crate::modules::core_files::hy2_resi_config_path(&ctx.paths),
+            &config,
+            0o600,
+        )
+        .unwrap();
+        let binary = ctx.paths.bin_dir.join("sing-box");
+        host.write_file(&binary, b"old binary", 0o755).unwrap();
+        let relay = ctx.paths.base_dir.join("singbox-relay.json");
+        host.write_file(&relay, b"old relay", 0o600).unwrap();
+        let modules: Vec<Arc<dyn Module>> = vec![Arc::new(SharedBinaryFixture {
+            relay: b"new relay".to_vec(),
+            // 盘上的候选（stock 假内核）自报 `sing-box 1.14.3`：与声明的 1.14.4 不等。
+            sing_box_version: "1.14.4",
+        })];
+        let f: Arc<dyn Fetcher> = Arc::new(FakeFetcher(Mutex::new(vec![(
+            "https://fixture/sing-box".into(),
+            b"new binary".to_vec(),
+        )])));
+        host.clear_ops();
+        let error = reconcile_from_ctx(&ctx, &modules, f, false, false)
+            .await
+            .expect_err("自报版本与声明不符时必须中止本轮，而不是带着候选继续");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("候选 sing-box 自报版本与 manifest 声明不符"),
+            "{message}"
+        );
+        assert!(
+            message.contains("1.14.4") && message.contains("1.14.3"),
+            "报错要说清声明与实得：{message}"
+        );
+        assert_eq!(
+            host.read_file(&binary).unwrap(),
+            Some(b"old binary".to_vec()),
+            "候选未过探头，活二进制一个字节都不许动"
+        );
+        assert_eq!(host.read_file(&relay).unwrap(), Some(b"old relay".to_vec()));
+        let ops = host.ops();
+        assert!(
+            !ops.iter()
+                .any(|o| o.starts_with("systemd:restart:") || o.starts_with("systemd:stop:")),
+            "中止发生在任何单元动作之前：{ops:?}"
+        );
+        assert!(
+            ops.iter()
+                .any(|o| o.starts_with("rmdir:") && o.contains("/.prepared-")),
+            "失败路径必须收掉候选目录：{ops:?}"
+        );
+        assert!(
+            host.list_dir(&ctx.paths.bin_dir).unwrap().iter().all(|p| !p
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with(".prepared-"))),
+            "no .prepared-* dir may survive the round"
+        );
     }
 
     #[tokio::test(start_paused = true)]

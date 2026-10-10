@@ -685,6 +685,33 @@ pub fn parse_version(kind: &str, stdout: &str) -> Option<String> {
     .filter(|v| !v.is_empty())
 }
 
+/// Clash API `/version` 报出来的产品身份是不是 sing-box（**只判身份，不判版本**）。
+///
+/// 官方构建实测（1.14.3，本机）报 `sing-box 1.14.3`：产品 token 必须是 `sing-box`，后面跟一个
+/// 版本号 token。刻意不比版本等值——「是不是我们装的那一份」归 manifest 声明与 sha 绑定
+/// （2026-10-10 计划 §1.4：全部改成能力/sha 判据）。
+///
+/// 2026-10-10 收紧（对抗审查）：这里曾经也认「整串就是一个裸版本号」，理由是「产品前缀是上游的
+/// 自由决定」。但那让判据不再绑定 `sing-box` 这个名字——mihomo / Clash.Meta 一类的 Clash API
+/// 只要报裸版本就能通过，「这是我们那份 sing-box 的控制面」就退化成「某个实现了 Clash API 的
+/// 东西」。本机实测住宅实例报的是带产品 token 的 `sing-box 1.14.3`，收紧不会误拒我们自己的
+/// 那一份（裸版本形态现在一律判否）。
+pub fn is_singbox_clash_version(reported: &str) -> bool {
+    let mut tokens = reported.split_whitespace();
+    match (tokens.next(), tokens.next(), tokens.next()) {
+        (Some("sing-box"), Some(token), None) => is_version_token(token),
+        _ => false,
+    }
+}
+
+/// 长得像版本号的 token：可选 `v` 前缀 + 首位数字，其余为数字/字母/`.`/`-`/`+`。
+fn is_version_token(token: &str) -> bool {
+    let token = token.trim_start_matches('v');
+    let mut chars = token.chars();
+    chars.next().is_some_and(|c| c.is_ascii_digit())
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+')
+}
+
 /// 探测已装二进制的版本；文件不存在就返回 `None`（diff 会判成「要装」）。
 pub fn installed_version(host: &dyn Host, bin_dir: &Path, kind: &str) -> Option<String> {
     let bin = bin_dir.join(kind);
@@ -859,6 +886,35 @@ mod tests {
         assert_eq!(parse_version("caddy", CADDY).as_deref(), Some("2.10.2"));
         assert_eq!(parse_version("xray", ""), None);
         assert_eq!(parse_version("unknown-kernel", "whatever 1.2.3"), None);
+    }
+
+    // 2026-10-10 本机实测：官方 1.14.3 的 clash_api `/version` 报 `"version":"sing-box 1.14.3"`。
+    // 判据只认产品身份，版本字面量不进判据（计划 §1.4：能力/sha 判据）。
+    #[test]
+    fn singbox_clash_version_identity_ignores_the_version_number() {
+        assert!(is_singbox_clash_version("sing-box 1.14.3"));
+        assert!(
+            is_singbox_clash_version("sing-box 1.99.0"),
+            "未来 patch 不许再被判据拒掉"
+        );
+        assert!(!is_singbox_clash_version("clash 1.14.1"));
+        assert!(!is_singbox_clash_version("mihomo"));
+        assert!(!is_singbox_clash_version("sing-box"));
+        assert!(!is_singbox_clash_version("sing-box meta 1.14.3"));
+        assert!(!is_singbox_clash_version("sing-box 1.14.3 extra"));
+        assert!(!is_singbox_clash_version(""));
+    }
+
+    // 2026-10-10 收紧（对抗审查）：裸版本号形态曾经判真（理由写的是「产品前缀是上游的自由
+    // 决定」），那让判据不再绑定 `sing-box` 这个名字——mihomo / Clash.Meta 之类的 Clash API
+    // 只要报裸版本就能冒充「我们那份 sing-box 的控制面」。本机实测住宅实例报
+    // `sing-box 1.14.3`（带产品 token），所以收紧不误拒自己人；这些断言是**故意**从真翻成假。
+    #[test]
+    fn singbox_clash_version_rejects_bare_version_tokens() {
+        assert!(!is_singbox_clash_version("1.19.4"));
+        assert!(!is_singbox_clash_version("v1.14.3"));
+        assert!(!is_singbox_clash_version("1.14.3"));
+        assert!(is_singbox_clash_version("sing-box 1.14.3"));
     }
 
     #[test]

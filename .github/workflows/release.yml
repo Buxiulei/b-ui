@@ -74,10 +74,12 @@ jobs:
         run: bash scripts/release/check-release-gate.sh "$TAG"
       - name: 内核来源与渲染器必须自洽（硬闸门：判红即中止发布）
         run: bash scripts/release/check-kernel-consistency.sh
-      - name: 内核 lock 是否还贴着轨道（只告警，不卡发版）
+      - name: 内核 lock 是否还贴着轨道（漂移只告警；lock 坏了会中止发版）
         run: |
-          bash scripts/release/pin-kernels.sh --check \
-            || echo "::warning::kernels.lock 与版本轨道有漂移（上游出了新 patch）。本次发布用的是 lock 里的版本，产物不受影响；要跟上游就在 v4 分支重跑 pin-kernels.sh --write、commit、再打新 tag。"
+          # `--warn` 只降级「漂移」：本次发布用的是 lock 里的版本，产物不受影响，要跟上游就
+          # 在 v4 重跑 pin-kernels.sh --write、commit、再打新 tag。而 `lock 少行` /
+          # `轨道解析或取远端失败`（核实不了）仍旧退 1 —— 不能拿一份坏锁或核实不了的锁发版。
+          bash scripts/release/pin-kernels.sh --check --warn
       - name: 准备内核
         uses: ./.github/actions/setup-kernels
         with:

@@ -1105,11 +1105,12 @@ async fn install_owned(
             })
             .await?
         };
-        if manifest
-            .as_ref()
-            .and_then(|m| m.kernels.get("sing_box"))
-            .is_some_and(|v| v.trim_start_matches('v') == "1.14.3")
-        {
+        // sing-box 由对账器按 manifest 声明装（内核预取显式跳过它），所以只要**这份 manifest
+        // 能解析出本架构的 sing-box 资产**就不算缺；解析不出来才照旧中止。
+        if manifest.as_ref().is_some_and(|m| {
+            m.kernel_asset("sing-box", &host.arch().unwrap_or_default())
+                .is_ok()
+        }) {
             missing.retain(|name| *name != "sing-box");
         }
         if !missing.is_empty() {
