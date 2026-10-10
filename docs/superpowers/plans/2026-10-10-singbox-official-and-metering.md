@@ -257,7 +257,7 @@ hysteria 客户端自带的 `api.hy2.io:443` 版本探针**真实过代理并归
 | 9 | **版本钉子改能力/sha 绑定**（§1.4 的核心）：`serve.rs`（否则整轮对账中止）、`upgrade.rs`（否则升级双通道自锁）、`install.rs`（否则新装中止）、`gates.rs`（否则门停 deny 住全体住宅用户）；rollback 守卫从版本白名单改为 `RESIDENTIAL_LAYOUT_SINCE` + sha | ✅ **完成**（`fd55363`） |
 | 10 | 夹具与守卫：`relay_generation_kernel.rs`/`generation.py`/`policy.py` 版本串 ✅；`install/upgrade/serve` 夹具 1.14.2 字面量（自洽、不卡 bot）✅；stock sha 已换官方 `299f9f60…` ✅；`stock_gate_fixture.rs:449` 与 `tests/test-residential-stock-gates.sh:30` 的 `1.14.3` 硬字面量**留作升轨维护点**（opt-in 手动夹具） | 🔶 残部见 §8 |
 | 11 | 清扫：`serve.rs` 的 `bin/.prepared-<uuid>` 失败与成功路径统一清理（否则每 tick 残留 ~81MB 且不被体检暴露） | ✅ **完成**（`fd55363`） |
-| 12 | 真机兜底：官方 1.14.3 + 生产形状配置实测 `auth_user=<name> => gate` 路由串（含多用户 `[a b]` → None 分支）；演练 `/api/health` 对计量失败的 degraded 表现 | ⬜ |
+| 12 | 真机兜底：官方 1.14.3 + 生产形状配置实测 `auth_user=<name> => gate` 路由串（含多用户 `[a b]` → None 分支）；演练 `/api/health` 对计量失败的 degraded 表现 | 🔶 **前半完成**（路由串已在真机实测，见 §9）；**后半未做**（需跑整套 `bui serve`，动 systemd 单元与 `/opt`，超出实验沙箱的安全边界，留真机环境） |
 | 13 | **发布纪律**：2–12 同一 release，不许拆包 | ⬜ |
 | 14 | **原子性自检（机制化闸门）**：内核来源与渲染器是否产出 `experimental.v2ray_api` 必须自洽 | ✅ **完成**（`51024f5`；`check-kernel-consistency.sh`，ci.yml 只告警 / release.yml 硬闸门。**真实 CI 里验证过会发告警**） |
 | 15 | **lock 检查的 fail-open 修复**：`pin-kernels.sh` 新增 `--warn`——只降级「漂移」，`lock 少行`／`核实不了` 仍旧退 1（原 `\|\| echo ::warning::` 把三类一起吞掉） | ✅ **完成**（`fd55363`；安全审查与对抗复审各自独立指出） |
@@ -510,24 +510,33 @@ scripts/tests/test-residential-stock-gates.sh:19          sing-box version 1.14.
 
 | # | 位置 | 审查类别 | 裁决 |
 |---|---|---|---|
-| A | `crates/bui/src/modules/panel/hy2resi.rs` | 部署期可用性（客户端与渲染器分叉） | **正在修**（第 4/5/6 步的原子切换批）。客户端已改说官方 `daemon.StartedService`，而渲染器仍写 `experimental.v2ray_api` ⇒ 官方内核拒绝启动。**这就是本计划存在的理由**，切换批落地即消解 |
+| A | `crates/bui/src/modules/panel/hy2resi.rs` | 部署期可用性（客户端与渲染器分叉） | ✅ **已消解**（`79753b2`；本机门实测「内核来源与渲染器自洽」退 0）。客户端已改说官方 `daemon.StartedService`，而渲染器仍写 `experimental.v2ray_api` ⇒ 官方内核拒绝启动。**这就是本计划存在的理由**，切换批落地即消解 |
 | B | `crates/bui/src/modules/panel/meter.rs` `g.open` | 无上界内存（远端连接 churn 喂养） | **真缺陷，单独排期修**。见下 |
 | C | `crates/bui/src/modules/panel/users.rs` `blocked_set(.., lossy)` | fail-open 授权（攻击者可影响的状态关闭强制） | **接受的已记录风险**，但计划必须把它写成**安全控制**而非运维提示。见下 |
 
 ### 7.1 B：`g.open` 无上界（真泄漏，非理论）
 
 `meter.rs` 里 `alerts` 有 `ALERTS_KEPT`、`dedup` 有 `DEDUP_CAP` + `DEDUP_TTL_MS`，**唯独 `g.open` 没有任何上界**：
-`:492` `g.open.insert(ev.id, Open { known: total })`（NEW 事件）、`:500` `g.open.entry(ev.id).or_default()`（UPDATE，**连没见过的 id 也建条目**）、
-`:705` `self.open.remove(id)`（只在收到 CLOSED 时删）。
+`:507` `g.open.insert(ev.id, Open { known: total })`（NEW 事件）、`:515` `g.open.entry(ev.id).or_default()`（UPDATE，**连没见过的 id 也建条目**）、
+`:720` `self.open.remove(id)`（只在收到 CLOSED 时删）。
 
-**泄漏路径已核实**：判损时 `:557` 会 `resubscribe = true`（测试 `:1082` 守着），但 `note_session_start` **只在实例代际变化时 `g.open.clear()`**（`:599`）——
+**泄漏路径已核实**：判损时 `:572` 会 `resubscribe = true`（测试 `:1097` 守着），但 `note_session_start` **只在实例代际变化时 `g.open.clear()`**（`:614`）——
 重订阅同一实例代际不变 ⇒ **gap 期间关闭的连接，其条目永久留下**。而 G0 已实测流会在 ~128 KiB 流控边界被截断（丢 4%~100%）
 ⇒ 反复 gap 会持续累积。
 
 **影响面（如实界定，不夸大）**：`Open.known` **不参与入账**——入账用的是 CLOSED 事件的终值 `c.total`（规则 1）。
 所以它不污染账本，只泄内存 + 扰动指标 A 的 ΔS 项（`R = ΔG − ΔB − ΔS`）。稳定态尺寸 ≈ 并发连接数，只在反复截断时累积 —— **不是紧急缺陷，但是确定的缺陷。**
-**修法方向**（不要与本次切换搭车）：给 `open` 一个上界（超限时按「最可疑」策略淘汰并在指标里记一次事件），
-或让重订阅也换代际/清一次在册 —— 后者要小心别把仍在开的连接算漏。
+**修法方向**（不要与本次切换搭车）。⚠️ **2026-10-10 对抗复审把修法方向纠正了两次，照下面写**：
+**(a) 我原来的告诫「别把仍在开的连接算漏」方向是错的**——reset 快照（重新订阅后的第一帧）恰恰把**在开连接全部以 NEW + totals 重投**，
+所以「每次重订阅就清空 `open`」不会漏掉活跃连接。
+**(b) 但清表/设上界都拦不住真正的源头**：快照里还带 **closed 环**，其中 `closed_at != 0` 的条目被 `hy2resi.rs:245` **无条件当 `New` 收下** ⇒
+「gap 期间关闭、从未入账」的连接被**重新种回 `g.open`**（去重表只在入账 helper `book()` 里写（`meter.rs:434`），
+所以 `apply` 的 `booked` 守卫挡不住这一类）⇒ 幻影永存、ΔS 基线持续污染。
+⇒ **修法必须先在解析侧按 `closed_at` 判别**：`closed_at != 0` 是「已经关闭」的公告，不是新连接，不得 `insert` 进 `open`。
+在此之上，「在重订阅边界用 reset 快照结算幽灵（计 eviction 计数 + 发不静默的事件行，**且绝不写去重表**）」才成立。
+**(c) 关于 `ΔS` 的正面回答**（对抗复审给）：结算幽灵 K ⇒ `ΔS = −K` ⇒ `R = ΔG − ΔB − ΔS` **上跳 +K** ——
+这是**正偏差**：把「暂挂未确证」正确暴露成「永久未确证」，**不掩盖任何真实缺口**；代价只是结算瞬间指标 A 的一次无流量解释的瞬态尖峰（「解释缺失」而非「账目错误」）。
+**两条陷阱不许走**：引入「累计 write-off 项」压尖峰（迟到的真 CLOSED 会**双计**）、或去减 `mark.span`（把尖峰**永远藏掉**）。
 
 ### 7.2 C：lossy 的 fail-open 是**安全控制**，不是运维提示
 
@@ -575,11 +584,11 @@ scripts/tests/test-residential-stock-gates.sh:19          sing-box version 1.14.
 
 | # | 位置 | 性质 | 处置 |
 |---|---|---|---|
-| 1 | `docs/superpowers/plans/2026-09-11-v4-master.md:66` | **真**：C1 契约清单仍列 `HY2_RESI_V2RAY_API`，而该符号已不存在（本文件本次已被 diff 改过 `:229/:342`，唯独漏了这处契约行） | 同下一批改 |
-| 2 | `docs/superpowers/specs/2026-09-15-hy2-singbox-residential-design.md:146/:156/:542/:548/:676` | **真**：`v2ray_api` 残留未全部加订正注（该文件已有 `:18/:66/:71/:129/:135/:354/:408` 的 2026-10-10 订正，口径不齐） | 同下一批补齐 |
-| 3 | `crates/bui/src/modules/panel/stock_gate_fixture.rs` 的新守卫 | **真（不可达但守卫不严）**：只校验 `services` 是长度 1 的数组；若 `services[0]` 是非对象（如数字），随后的 `["listen"]` 赋值会 panic。当前渲染器恒产对象故不可达 | 加严成 `.as_object()` |
-| 4 | `crates/bui-schema/tests/kernel_hy2_singbox.rs` 的 openssl 早退 | **真（静默面）**：PATH 缺 sing-box 或 openssl 不可用时 `eprintln` + `return` **静默通过**；而 CI 的 skip 黑名单只匹配 `<kernel> not found` 与 caddy，**不匹配 `skipped: openssl not usable`** | 纳入 CI skip 黑名单，或让 CI 里缺内核即硬失败（照 `relay_generation_kernel.rs:143-146` 的 `assert!(CI.is_none())` 范式） |
-| 5 | `crates/bui/src/modules/panel/traffic.rs` 测试串 `fail_next("v2ray_api 不可达")`（`:787`/`:1193`）与「住宅的 QueryStats」注释 | **真（文案说谎）** | 同下一批改 |
+| 1 | `docs/superpowers/plans/2026-09-11-v4-master.md:66` | **真**：C1 契约清单仍列 `HY2_RESI_V2RAY_API`，而该符号已不存在（本文件本次已被 diff 改过 `:229/:342`，唯独漏了这处契约行） | ✅ **已完成**（`e90ad21`） |
+| 2 | `docs/superpowers/specs/2026-09-15-hy2-singbox-residential-design.md:146/:156/:542/:548/:676` | **真**：`v2ray_api` 残留未全部加订正注（该文件已有 `:18/:66/:71/:129/:135/:354/:408` 的 2026-10-10 订正，口径不齐） | ✅ **已完成**（`e90ad21`；实补 7 处并顺带查出 2 处同缺陷） |
+| 3 | `crates/bui/src/modules/panel/stock_gate_fixture.rs` 的新守卫 | **真（不可达但守卫不严）**：只校验 `services` 是长度 1 的数组；若 `services[0]` 是非对象（如数字），随后的 `["listen"]` 赋值会 panic。当前渲染器恒产对象故不可达 | ✅ **已完成**（`e90ad21`；并普查同文件同类「先索引后写」：`inbounds[0]`/`clash_api`/`outbounds` 的 `.unwrap()` 一并收口） |
+| 4 | `crates/bui-schema/tests/kernel_hy2_singbox.rs` 的 openssl 早退 | **真（静默面）**：PATH 缺 sing-box 或 openssl 不可用时 `eprintln` + `return` **静默通过**；而 CI 的 skip 黑名单只匹配 `<kernel> not found` 与 caddy，**不匹配 `skipped: openssl not usable`** | ✅ **已完成**（`e90ad21` 取**后一种**：CI 里硬失败。理由——黑名单是外部 workflow 里的转写匹配器，注定会生产侧漂移而测试全绿。并已推广到 `common/mod.rs` 的 `have()`、`kernel_hysteria.rs` 的 `self_signed()`、`kernel_relay_policy.rs`） |
+| 5 | `crates/bui/src/modules/panel/traffic.rs` 测试串 `fail_next("v2ray_api 不可达")`（`:787`/`:1193`）与「住宅的 QueryStats」注释 | **真（文案说谎）** | ✅ **已完成**（`e90ad21`，6 处） |
 | 6 | `CHANGELOG.md:20`（未发布的 4.1.9 段）仍写「sing-box 1.14.2」 | **真**：锁自 `51024f5` 起是官方 1.14.3，且 `install.rs:356` 的 `client_sing_box` 与 `sing_box` 同源 ⇒ 服务端与 bui-c 一并到 1.14.3，该句对两个角色都失真 | **随第 13 步的发布准备改**（现在改是写未发生的记录） |
 | 7 | `stock_gate_fixture.rs:449` 与 `tests/test-residential-stock-gates.sh:30` 的 `1.14.3` 硬字面量 | **维护点**：opt-in 手动夹具，升轨时须同步 | 记在此，升轨时一并 |
 | 8 | `docs/superpowers/plans/2026-09-15-v41-hy2-singbox.md:802/:907` 旧口径 | **可选**：历史计划，不改史实 | 不动 |
@@ -590,5 +599,92 @@ scripts/tests/test-residential-stock-gates.sh:19          sing-box version 1.14.
 
 - **私有渲染器快照需重采**：`offline_renderer_snapshot.rs:680` 已写明；本机无 docker 夹具故 `test-renderer-snapshot.sh` 跳过。切上线后用新渲染产物重采。
 - **stock 门位夹具容器需用官方裸二进制重建**：sha `299f9f60…`（arm64）。旧自建 1.14.2 的 PASS **不继承**。
-- **第 12 步真机兜底**：官方 1.14.3 + 生产形状配置实测 `auth_user=<name> => gate` 路由串（含多用户 `[a b]` → None 分支）；`/api/health` 对计量失败的 degraded 演练。**未见执行记录。**
+- **第 12 步真机兜底**：前半（`auth_user=<name> => gate` 路由串，含多用户 `[a b]` → None）**已于 2026-10-10 在隔离 worktree 里用官方内核实测完成**（见 §9）；**后半仍未做**——`/api/health` 对计量失败的 degraded 演练需要跑整套 `bui serve`（动 systemd 单元与 `/opt`），且**真实网络路径**同样未验（§9.2）。
 - **存量安装换核依赖真实发布 + 真机升级**。
+
+### 8.2 两条人工项的可执行规程（Fable 2026-10-10 补充，含一个新发现的阻断）
+
+**共同前置（两条都要）**：`scripts/tests/` 的两个手动 runner 都依赖同一个 **network=none 的隔离夹具容器**
+`bui-policy-tests-20260929`（可用 `BUI_TEST_CONTAINER` 覆盖名字）。**本机实测该容器不存在**（`docker inspect`
+报 `No such object`；`docker ps -a` 里只有无关的 g0-meter / nextcloud / jimeng 等）。
+两个 runner 在 run-all.sh 的无参调用下都按「缺前置 ⇒ skip」退 0（有意如此，否则 CI 的 lint job 恒红），所以**容器不在=它们静默不跑**——
+⚠️ 但两者触发条件不同，别记混：stock runner 是**缺容器即 skip**（`:19-21`）；renderer runner 是**无参调用才 skip**（`:10-13`），
+**带 2 个参数手动跑而容器缺失时它退 1 FAIL**（`:22-24` 报 `requires a network=none container`）——按下面规程 2 手动跑就会看到 FAIL 而不是 skip。
+`run-all.sh` 仍会打印 `all script tests passed`。这正是 §8 #9 记的那条「汇总不区分跑过与跳过」。
+
+#### ⚠️ 新发现的阻断：stock runner 的平台写死
+
+`scripts/tests/test-residential-stock-gates.sh:11` 把 `expected_sha` 硬编成
+**arm64** 裸二进制的 `299f9f60…`，并在容器里断言 `sing-box version 1.14.3`。
+而**本开发机是 x86_64**（`/usr/bin/sing-box` 的 sha `768d31fa…` 对上 lock 的 amd64 条目）。
+⇒ 在 amd64 机器上重建该容器时，`expected_sha` 必须同步换成 **amd64** 的 `768d31fa…`，
+否则 `:29` 那条 `test "$(sha256sum …)" = "$1"` 必红。
+
+**这不是「改一个字面量」那么简单**：它和 §8 #7 是同一类病的两种形态——**平台也写死了**。
+建议随容器重建一并处理：把 `expected_sha` 按 `uname -m` 分支（或从 `kernels.lock` 取），
+照第 16 步「期望值从单一真源读」的口径。**在改之前不要盲跑本脚本。**
+
+#### 规程 1：重建 stock 夹具容器
+
+1. 取 lock 里 amd64 的官方归档，解包取裸二进制：
+   ```
+   url=$(awk '$1=="sing-box" && $2=="target" && $3=="1.14.3" && $4=="amd64" {print $6}' scripts/release/kernels.lock)
+   sha=$(awk '$1=="sing-box" && $2=="target" && $3=="1.14.3" && $4=="amd64" {print $5}' scripts/release/kernels.lock)
+   ```
+   解包后核裸二进制 sha（本机实测 `768d31fa7f68debc067bb4626539498a1e8751d36a7b99e1a54bee6a23815f93`）。
+2. 建 `--network=none` 的容器，把裸二进制放到 `/new-kernel/sing-box` 并软链到 `/usr/local/bin/sing-box`
+   （脚本 `:28` 断言的就是这两条路径）。
+3. 按上面的平台阻断先修 `expected_sha`，再跑
+   `bash scripts/tests/test-residential-stock-gates.sh`。
+4. **旧自建 1.14.2 的 PASS 不继承**——那是另一份产物。
+
+#### 规程 2：私有渲染器快照重采
+
+1. 快照是**私有的**，不进公开仓库：输入目录需含 `inputs.private.json`，输出目录必须存在且为空。
+2. 重采**必须在切换上线之后**（用新 `bui` 的渲染产物），否则采到的还是旧形状。
+3. 跑：`bash scripts/tests/test-renderer-snapshot.sh INPUT_DIRECTORY EMPTY_OUTPUT_DIRECTORY`；
+   或对 `cargo test -p bui --ignored offline_renderer_snapshot` 设 `BUI_RENDER_INPUT_DIR` /
+   `BUI_RENDER_OUTPUT_DIR`。runner 的文档注释（`offline_renderer_snapshot.rs:675-685`）已写明
+   「本 runner 的快照需在切换上线后用新渲染产物重采」。
+4. 核对器：同目录的 `compare-renderer-snapshots.py`。
+
+---
+
+## 9. 第 12 步实测结果（Fable 2026-10-10，隔离 worktree + 官方内核）
+
+在 `c9f0289` 的 detached worktree（`/tmp/wt-step12`）里，用**本机官方 `/usr/bin/sing-box` 1.14.3**、
+**由渲染器逐字产出的**生产形状配置、真 hysteria2 客户端，对住宅门路由做了端到端实测。
+
+**证据链（复核者另建 marker + 客户端独立复现，且 `cmp` 逐字节确认配置就是渲染器产的那份）**：
+
+| 真机 `/connections` 的 `rule` 串（逐字） | 生产解析器 `user_of_rule` |
+|---|---|
+| `auth_user=alice => route(gate-r000)` | `Some("alice")` |
+| `auth_user=bob => route(gate-r001)` | `Some("bob")` |
+| `auth_user=[alice bob] => route(gate-r000)` | `None`（**多用户 `[a b]` 那一支确认**） |
+| `final` | `None` |
+
+- `chains` = `["slot-0-out","gate-r000"]`（**最内层在前**）；**`metadata` 无 `user` 字段** ——
+  面板归因**只能**靠 `rule` 串，本次逐字确认（`spec §5.2` 的前提成立）
+- 流量真的走到 `127.0.0.1:2080` 的 marker；`PUT /proxies/gate-r000` 返回 204 且**内核未重启**（PID 不变）
+- **deny 是真拒绝点**：客户端 `curl rc=97`，服务端 `dial tcp 127.0.0.1:1: connect: connection refused`
+- **认证语义**：客户端必须发**整串** `alice:pw-alice-01`；`alice:wrong-secret` 与裸 `pw-alice-01`
+  都得到服务端 `authentication error, HTTP status code: 404`——复核者用**关闭端口对照**（`timeout: no recent network activity`）
+  证明这是**真鉴权拒绝**，不是端口/证书/客户端配置的伪影
+- **按用户隔离**：bob → `gate-r001` → 2081，alice 的 2080 不受影响
+- **重启 fail-closed**：无 `cache_file`，重启后所有门回 `deny`
+
+### 9.1 实测查出的三处「代码与真机不符」
+
+1. **单测夹具的 rule 串是内核不会产出的形态**：生产单测里写 `"final => route(deny)"`，
+   而 1.14.3 真机在 final 兜底时输出的是**裸 `"final"`**。两者对 `user_of_rule` 都 → `None`（**行为正确**），
+   但夹具在教后人一个错误的形状 ⇒ **应改成真机原文**。
+2. **夹具的 `chains` 顺序是反的**：真机最内层在前，夹具相反。生产代码**无 `.chains` 消费方**
+   （`grep -rn "\.chains" crates/` 零命中，只有 `hy2resi.rs` 一处解析赋值）⇒ 无功能影响，但会误导未来的断言。
+3. **`hy2resi.rs:75` 的注释陈旧**：称「chains 供自检看门位」，而 `selfcheck` 根本没有 chains 用法。
+
+### 9.2 仍未覆盖
+
+- **`/api/health` 对计量失败的 degraded 演练**：需要对 systemd 受管单元与 `/opt` 真实状态跑 `bui serve`，
+  会改本机系统状态（本机同时是生产客户端的宿主）⇒ **超出实验沙箱的安全边界**，如实留白，交真机环境。
+- 实验全程限于回环，**未验证真实网络路径下的行为**（那属第 12 步的「真机」本义，仍未做）。
