@@ -237,20 +237,21 @@ hysteria 客户端自带的 `api.hy2.io:443` 版本探针**真实过代理并归
 
 | # | 步骤 | 状态 |
 |---|---|---|
-| 1 | 发布侧换官方：`kernels.lock` 两行改官方 1.14.3 tar.gz + 官方 sha；`kernel-versions.env` 轨道改 1.14.3、`SINGBOX_TAGS` 删；`build-singbox.sh` 与 `test-build-singbox.sh` 删；CI job 名与三处 skip-grep 自建支改 | ✅ 进行中（本轮 ①②③④） |
-| 2 | **裁决计量替代来源与迁移期语义**（fail-open 少计 / fail-closed 拒连），据此拍板 `query_user_deltas`、`10086`、`HY2_RESI_V2RAY_API`、`proto-v2ray` 的去留 | ⏳ 等 G0 |
+| 1 | 发布侧换官方：`kernels.lock` 两行改官方 1.14.3 tar.gz + 官方 sha；`kernel-versions.env` 轨道改 1.14.3、`SINGBOX_TAGS` 删；`build-singbox.sh` 与 `test-build-singbox.sh` 删；CI job 名与三处 skip-grep 自建支改 | ✅ **完成**（`51024f5`） |
+| 2 | **裁决计量替代来源与迁移期语义**（fail-open 少计 / fail-closed 拒连），据此拍板 `query_user_deltas`、`10086`、`HY2_RESI_V2RAY_API`、`proto-v2ray` 的去留 | ✅ **裁决已定**（§2/§3/§5，全部实测支撑）；**实现待第 7 步** |
 | 3 | 可见性：`serve.rs` 对账失败写 `RuntimeData.last_reconcile_error` 并映射 `/api/health` 与 `bui status` 的 degraded（**当前核实仍缺**——迁移期任何失败都是「机器不报错但状态是错的」） | ⬜ |
 | 4 | **原子核心**：删 `render/hy2_singbox.rs:185-191` 整个 `experimental.v2ray_api` 键（保留 `clash_api`；**必须删键，只删 stats 子对象无效**） | ⬜ 与内核换装同一发布 |
 | 5 | 断言同步（同提交）：`hy2_singbox.rs:362-368` 删三条+补反向守卫；`core_files.rs:1156-1160` 同步；`hysteria.rs:283-286` 端口表登记新口（不留 10086 幽灵） | ⬜ |
 | 6 | **测试改真跑**：`kernel_hy2_singbox.rs` 删 skip 门，让两用例对不含 `v2ray_api` 的产物跑官方 `sing-box check`（**CI 抓 skip 的 grep 已删，此用例现在是静默——整个切换期住宅配置形状无人验**） | ⬜ blocker |
 | 7 | 计量路径收口：`panel/hy2resi.rs:275,357` 删除或改接；`traffic.rs:240-248` Err 分支必须可见或整体删除；面板/文档承诺同步 | ⬜ 等 §3 |
 | 8 | 自检改写：`selfcheck.rs` 拆成「计量面／门位·在线面」两条判据，去掉 10086 白等 120s 与必然 FAIL | ⬜ |
-| 9 | **版本钉子改能力/sha 绑定**（§1.4 的核心）：`serve.rs:272-273,288-293`（否则整轮对账中止）、`upgrade.rs:475-477`（否则升级双通道自锁）、`install.rs:415-417,1107-1113`（否则新装中止）、`gates.rs:347`（否则门停 deny 住全体住宅用户）；**`upgrade.rs:269-272` rollback 守卫本版即断，已裁决改受支持集合** | ⬜ blocker |
+| 9 | **版本钉子改能力/sha 绑定**（§1.4 的核心）：`serve.rs`（否则整轮对账中止）、`upgrade.rs`（否则升级双通道自锁）、`install.rs`（否则新装中止）、`gates.rs`（否则门停 deny 住全体住宅用户）；rollback 守卫从版本白名单改为 `RESIDENTIAL_LAYOUT_SINCE` + sha | ✅ **完成**（`fd55363`） |
 | 10 | 夹具与守卫：`relay_generation_kernel.rs`/`generation.py`/`policy.py` 版本串；`install/upgrade/serve` 夹具 1.14.2 字面量；stock 三处换官方真实 sha；`fakes.rs` 补守卫测试 | 🔶 部分（stock sha 已换 `299f9f60…`） |
-| 11 | 清扫：`serve.rs` 的 `bin/.prepared-<uuid>` 失败与成功路径统一清理（否则每 tick 残留 ~81MB 且不被体检暴露） | ⬜ |
+| 11 | 清扫：`serve.rs` 的 `bin/.prepared-<uuid>` 失败与成功路径统一清理（否则每 tick 残留 ~81MB 且不被体检暴露） | ✅ **完成**（`fd55363`） |
 | 12 | 真机兜底：官方 1.14.3 + 生产形状配置实测 `auth_user=<name> => gate` 路由串（含多用户 `[a b]` → None 分支）；演练 `/api/health` 对计量失败的 degraded 表现 | ⬜ |
 | 13 | **发布纪律**：2–12 同一 release，不许拆包 | ⬜ |
-| 14 | **原子性自检（机制化闸门）**：加一条 `scripts/tests/` 用例——**若 `kernels.lock` 里 sing-box 是官方归档（即产物不含 `with_v2ray_api`），则渲染出的 `hy2-residential.json` 必须不含 `experimental.v2ray_api` 键**；反之亦然。不一致即判红。 | ⬜ **新增，见下** |
+| 14 | **原子性自检（机制化闸门）**：内核来源与渲染器是否产出 `experimental.v2ray_api` 必须自洽 | ✅ **完成**（`51024f5`；`check-kernel-consistency.sh`，ci.yml 只告警 / release.yml 硬闸门。**真实 CI 里验证过会发告警**） |
+| 15 | **lock 检查的 fail-open 修复**：`pin-kernels.sh` 新增 `--warn`——只降级「漂移」，`lock 少行`／`核实不了` 仍旧退 1（原 `\|\| echo ::warning::` 把三类一起吞掉） | ✅ **完成**（`fd55363`；安全审查与对抗复审各自独立指出） |
 
 ### 4.1 为什么第 14 步是必需的（本日暴露的洞）
 
