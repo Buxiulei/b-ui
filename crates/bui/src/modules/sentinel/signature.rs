@@ -39,13 +39,18 @@ pub enum Sig {
     KernelCrashLoop,
     /// 守护进程自己的日志：用户同步的 xray gRPC 调用 Unavailable（设计裁决 D10）
     XrayGrpcUnavailable,
+    /// 住宅 HY2 的计量账目有损：账本判「后缀丢失」（指标 A 越线）或计量流不可用
+    /// （`query_user_deltas` 的 `Err` 经采样器落 warn）。字节账目因此不完整 ⇒ 该窗口的
+    /// 自动封禁/计费裁决暂停（计划 §5.1：用户层 fail-open、系统层 fail-closed），
+    /// 所以它必须**有人在 `bui incidents` 上看见**，不许静默
+    Hy2ResiMeteringLost,
     /// caddy：签证书失败
     CaddyCertFailed,
 }
 
 /// 全部签名。**唯一一份名单**：`id()` 的重名不变量、最长签名窗口（`run::longest_window_secs`）
 /// 都按它枚举，新增签名只改这里。
-pub const ALL_SIGS: [Sig; 12] = [
+pub const ALL_SIGS: [Sig; 13] = [
     Sig::RelayUpstreamError,
     Sig::RelayUpstreamAuthFailed,
     Sig::RelayGoogleBlocked,
@@ -58,6 +63,7 @@ pub const ALL_SIGS: [Sig; 12] = [
     Sig::Hy2ResiGateSyncFailed,
     Sig::Hy2ResiGateReplayFailed,
     Sig::Hy2ResiPoolLow,
+    Sig::Hy2ResiMeteringLost,
 ];
 
 /// 签名对应的预案（冷却按「动作 + 对象」计，设计裁决 D12）。
@@ -92,6 +98,7 @@ impl Sig {
             Sig::Hy2ResiGateSyncFailed => "hy2_resi_gate_sync_failed",
             Sig::Hy2ResiGateReplayFailed => "hy2_resi_gate_replay_failed",
             Sig::Hy2ResiPoolLow => "hy2_resi_pool_low",
+            Sig::Hy2ResiMeteringLost => "hy2_resi_metering_lost",
         }
     }
 
@@ -111,6 +118,7 @@ impl Sig {
             Sig::Hy2AuthHttpFailed
             | Sig::CaddyCertFailed
             | Sig::Hy2ResiGateReplayFailed
+            | Sig::Hy2ResiMeteringLost
             | Sig::Hy2ResiPoolLow => Action::Alert,
             Sig::KernelBindInUse | Sig::KernelCrashLoop | Sig::Hy2ResiRelayUnreachable => {
                 Action::DelegateWatchdog
@@ -154,6 +162,7 @@ impl Sig {
             | Sig::KernelCrashLoop
             | Sig::CaddyCertFailed
             | Sig::Hy2ResiGateReplayFailed
+            | Sig::Hy2ResiMeteringLost
             | Sig::Hy2ResiPoolLow => Rule {
                 threshold: 1,
                 window_secs: 60,
@@ -238,7 +247,7 @@ pub fn classify(unit: &str, message: &str) -> Option<Match> {
     match unit {
         "b-ui-relay" => relay(message),
         "caddy" => caddy(message),
-        "b-ui" => xray_grpc(message),
+        "b-ui" => metering_lost(message).or_else(|| xray_grpc(message)),
         _ if kernel => {
             // 鉴权回调只有直连那一路有（`watchdog::is_auth_http_failure` 的门槛与判据仍在，
             // 只喂 `hysteria-server` 的日志）
@@ -445,6 +454,19 @@ fn caddy(message: &str) -> Option<Match> {
         detail: detail_of(message),
         relay: None,
     })
+}
+
+/// 计量线的告警行（`meter::log_alerts` 的「标损」行，以及采样器把
+/// `query_user_deltas` 的 `Err` 落成的那条 warn —— `hy2resi::STREAM_DOWN_MSG`）：
+/// **两个标记都要有**才认领。观察行（换代 / 恢复 / 阈值以下 / 无归属字节）只带
+/// `METERING_MARKER` 不带 `METERING_LOSS_TAG`，不报事件。
+///
+/// 自触发面：本函数认领的行由 `meter` 与 `traffic` 打出；哨兵自己的事件文案
+/// （`system::on_metering_lost`）**不许**同时带这两个词。
+fn metering_lost(message: &str) -> Option<Match> {
+    use crate::modules::panel::meter::{METERING_LOSS_TAG, METERING_MARKER};
+    let claim = message.contains(METERING_MARKER) && message.contains(METERING_LOSS_TAG);
+    claim.then(|| hit(Sig::Hy2ResiMeteringLost, "b-ui", message))
 }
 
 fn xray_grpc(message: &str) -> Option<Match> {

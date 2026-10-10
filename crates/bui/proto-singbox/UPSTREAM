@@ -1,0 +1,6 @@
+# 这棵 vendor 树的上游身份：`scripts/release/check-vendored-proto.sh` 拿它跟
+# `scripts/release/kernels.lock` 里 sing-box 那一行对（内核升了 patch，这里必须跟着重核）。
+# 逐字节 vendor 上游原文，不做任何改写（`panel::xray` 的 checksum 守门按 SHA256SUMS 核）。
+repo=SagerNet/sing-box
+tag=v1.14.3
+path=daemon/started_service.proto

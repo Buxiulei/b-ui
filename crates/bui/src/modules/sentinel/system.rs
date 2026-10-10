@@ -4,7 +4,7 @@
 
 use super::incidents::{Level, Outcome};
 use super::signature::Sig;
-use crate::modules::panel::{users, Shared, XRAY_API_ADDR};
+use crate::modules::panel::{meter, users, Shared, XRAY_API_ADDR};
 use crate::reconcile::DaemonCtx;
 use crate::sys::Proto;
 use bui_schema::render::hy2_singbox::HY2_RESI_CLASH_API;
@@ -148,6 +148,39 @@ pub fn on_hy2_resi_relay(unit: &str) -> Outcome {
         subject: unit.to_string(),
         result: format!(
             "{unit} 拨不通 relay 的槽入站（127.0.0.1:{RELAY_SOCKS_BASE} 起）：住宅用户此刻全部出不去；交给看门狗（探测 + 退避重启 b-ui-relay）与 systemd，哨兵只记事件"
+        ),
+        level: Level::Error,
+    }
+}
+
+/// 住宅 HY2 的计量账目标记为不可信（`Sig::Hy2ResiMeteringLost`，spec §5 的系统层
+/// fail-closed）：越线那一刻账本自己已经把该做的做了（标损窗口、请求重订阅一次、
+/// [`meter::Ledger::lossy_at`] 供 `blocked_set` 换口径），哨兵这里只把「窗口、最近一条
+/// 判定、后果」记成事件 —— **不重启单元、不动门**：门位按用户层 fail-open 那条线算。
+///
+/// 事件文案**不许**同时带 [`meter::METERING_MARKER`] 与 [`meter::METERING_LOSS_TAG`]：
+/// run.rs 会把 `result` 写进 b-ui 自己的 journald（`"哨兵事件：{}"`），哨兵再读到它就会
+/// 自己认领自己，无限触发。
+pub fn on_metering_lost(panel: &Shared) -> Outcome {
+    let view = panel.meter().view(meter::now_ms());
+    let window = match (view.lossy_since.as_deref(), view.lossy_until.as_deref()) {
+        (Some(since), Some(until)) => format!("窗口 {since} → {until}"),
+        _ => match view.last_frame_at.as_deref() {
+            Some(at) => format!("流不在（最近一帧 {at}），等重连快照封账"),
+            None => "流不在（一帧都还没收到）".to_string(),
+        },
+    };
+    let latest = view
+        .alerts
+        .iter()
+        .rev()
+        .find(|a| a.lossy)
+        .map(|a| a.text.clone())
+        .unwrap_or_else(|| "还没有越线的判定".to_string());
+    Outcome {
+        subject: "b-ui".to_string(),
+        result: format!(
+            "住宅 HY2 的计量账目可信度掉了（{window}）：{latest}。该窗口里未落盘的用量不参与封禁判定（只按确证字节，账目不确定不误封），已确证的用量照常判定；自动裁决暂停，要人工核账"
         ),
         level: Level::Error,
     }
@@ -328,5 +361,63 @@ mod tests {
         let low = on_resi_alert(Sig::Hy2ResiPoolLow);
         assert!(low.result.contains("空闲凭据不足"), "{}", low.result);
         assert_ne!(replay.result, low.result);
+    }
+
+    /// 计量账目不可信：事件要点名窗口、后果（fail-open 封禁口径）与人工核账，
+    /// 且文案**不带**计量日志的两个词 —— 否则哨兵会认领自己写进 journald 的那条事件
+    #[tokio::test]
+    async fn a_lossy_ledger_event_names_the_window_and_never_self_triggers() {
+        use crate::modules::panel::meter::{Frame, ALERT_BYTES};
+        use crate::modules::panel::TxRx;
+        let d = tempfile::tempdir().unwrap();
+        let (ctx, host) = pool_ctx(d.path()).await;
+        let (shared, _xray) = panel_shared(&ctx);
+        // 走真账本：先立基准（t0），再让全局量跳 1 MiB 而账本一 B 没收到 ⇒ 指标 A 越线
+        let l = shared.meter();
+        let t0 = meter::now_ms();
+        l.note_session_start(1, t0);
+        l.apply(
+            Frame {
+                global: Some(TxRx { tx: 0, rx: 0 }),
+                ..Default::default()
+            },
+            t0,
+        );
+        l.drain(t0);
+        l.apply(
+            Frame {
+                global: Some(TxRx {
+                    tx: ALERT_BYTES as u64,
+                    rx: 0,
+                }),
+                ..Default::default()
+            },
+            t0 + 1,
+        );
+        l.drain(t0 + 1);
+        assert!(l.lossy_at(meter::now_ms()), "前置：账本已标损");
+        let o = on_metering_lost(&shared);
+        assert_eq!((o.subject.as_str(), o.level), ("b-ui", Level::Error));
+        assert!(
+            o.result.contains("窗口") && o.result.contains("后缀丢失"),
+            "{}",
+            o.result
+        );
+        assert!(
+            o.result.contains("不误封") && o.result.contains("人工核账"),
+            "{}",
+            o.result
+        );
+        assert!(
+            !(o.result.contains(meter::METERING_MARKER)
+                && o.result.contains(meter::METERING_LOSS_TAG)),
+            "事件文案不许同时带计量日志的两个标记（自触发）：{}",
+            o.result
+        );
+        assert!(
+            host.ops().iter().all(|o| !o.starts_with("systemd:")),
+            "只看不动：{:?}",
+            host.ops()
+        );
     }
 }

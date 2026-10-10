@@ -1,42 +1,56 @@
-//! 住宅 HY2（自建 sing-box）的两个控制面客户端（spec §2.3、§5.1、§5.2）。
+//! 住宅 HY2（官方 sing-box）的两个控制面客户端（spec §2.3、§5.1、§5.2）。
 //!
 //! 住宅入站从 apernet hysteria 换成 sing-box 之后，「计量」与「在线 / 踢人」分别落在
 //! 两个只监听回环、都不设 secret 的面上（[`super::HY2_RESI_V2RAY_API`] /
 //! [`super::HY2_RESI_CLASH_API`]）：
 //!
-//! - **计量**走 v2ray_api 的 `StatsService.QueryStats`，计数器名是
-//!   `user>>>{凭据 name}>>>traffic>>>uplink|downlink` —— 与 Xray 那条路**同名同义**，
-//!   所以解析复用 [`super::xray::parse_user_counter`]，不重写。**键里那一段是凭据 `name`
-//!   而不是 `id`**：新发凭据的 `name` 恰好等于 `id`（`user>>>r001>>>…`），而迁移用户的
-//!   `name` 是他的用户名，本部署即中文（`user>>><中文用户名>>>>…`，T3 2026-09-18 真机实测
-//!   中文与含空格的 name 计量正常）⇒ 返回的键要经 `hy2_pool` 换成 `user_id`。
-//!   两个上游事实（v1.14.1 源码，见 [`QUERY_STATS_PATH`] 与 [`Hy2ResiApi::query_user_deltas`]）：
-//!   ① 服务名在 `init()` 里被覆盖过；② `QueryStats` 只读 `patterns`，deprecated 的 `pattern`
-//!   一个字都不看。
+//! - **计量**走官方内核自带的 `daemon.StartedService`：[`Hy2ResiClient::started_at`]（实例
+//!   代际）、[`Hy2ResiClient::subscribe_status`]（全局总量与活动连接数）、
+//!   [`Hy2ResiClient::subscribe_connections`]（逐连接事件流）。三条 RPC 的返回值由
+//!   [`frame_of_events`] / [`frame_of_status`] 翻译成 [`super::meter::Frame`]，
+//!   **语义全在账本里**（`panel::meter` 的规则 1–11，每条都有 G0 决定性实验背书）。
+//!   **不再走 v2ray_api 的 `StatsService.QueryStats`**：官方发行物永不含 `with_v2ray_api`
+//!   编译标签（2026-10-10 抽样 17 个 tag、0 次命中），那条路只在自建内核上存在；
+//!   [`Hy2ResiApi::query_user_deltas`] 因此改成「排空流驱动账本」（[`Self::meter_session`]
+//!   喂帧、采样器 `drain`），账本不在时是一条响亮的 `Err`（[`STREAM_DOWN_MSG`]）。
+//!   归属键在 `connection.user`（服务端 `users[].name`，**不是凭据 `id`**）：新发凭据两者
+//!   相同，迁移用户的 `name` 是他的用户名（本部署即中文，T3 2026-09-18 真机实测中文与含
+//!   空格的 name 在 `auth_user`、`users[].name` 三处都一字不改地工作）；`name → user_id`
+//!   的映射在采样器（`traffic.rs`），本模块只把 `user` 原样交给账本。
 //! - **在线数与踢人**走 Clash API：`GET /connections` 里**没有** user 字段，唯一能把连接
 //!   归到用户的线索是 `rule` 字符串里的 `auth_user=<name>`（[`user_of_rule`]）；踢用户 =
 //!   门（selector）切 `deny` + 逐条 `DELETE /connections/{id}` 兜底（spec §5.2）。
 //!
-//! 计数器不跨 sing-box 重启存活（与 apernet trafficStats 的内存计数器同一种丢失窗口），
-//! 这里**不做**任何降级或补偿。
+//! 内核重启会清空计量计数器：账本按 `GetStartedAt` 的代际封账（`meter` 规则 9），本模块
+//! 只把 `started_at` 原样交给它，**不做**降级或补偿。
+//!
+//! ⚠️ **过渡态（原子切换批次收口）**：渲染器此刻仍往 `hy2-residential.json` 写
+//! `experimental.v2ray_api` 段（官方内核不认它，启动即 exit=1），而本模块已经在说
+//! `daemon.StartedService`。切换那一次提交要做三件事：渲染器把那段换成
+//! `services: [{ type: "api", … }]`、`panel` 侧的常量从 `HY2_RESI_V2RAY_API` 改名成
+//! `HY2_RESI_API`、`hysteria.rs` 的端口表登记新口。**常量改名只许与渲染器同一次提交**：
+//! 分叉 = 客户端打没人听的端口而测试全绿，属静默生产故障。
 
 // 生成代码归 prost/tonic 管，clippy 的意见对它没有意义；理由同 `panel::xray::pb`。
 #[allow(clippy::all, dead_code)]
 pub mod pb {
-    // prost 生成的嵌套模块树；`v2ray.rs` 由 build.rs 的第二次 `configure()` 产出。
-    include!(concat!(env!("OUT_DIR"), "/v2ray.rs"));
+    // prost 生成的嵌套模块树；包文件是 `daemon.rs`、模块根是 `singbox_daemon.rs`
+    // （两个都出自 build.rs 的第二次 `configure()`，取名理由见 build.rs 的注释）。
+    include!(concat!(env!("OUT_DIR"), "/singbox_daemon.rs"));
 }
 
-use super::xray::{parse_user_counter, Direction, CALL_TIMEOUT, CONNECT_TIMEOUT, STATS_PATTERN};
+use super::meter::{ClosedConn, Event, EventKind, Frame, Ledger};
+use super::xray::{CALL_TIMEOUT, CONNECT_TIMEOUT};
 use super::{Hy2ResiApi, TxRx};
 use crate::modules::residential::clash::ClashError;
 use bui_schema::render::hy2_singbox::gate_tag;
 use std::collections::BTreeMap;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use tonic::transport::{Channel, Endpoint};
 
-use pb::v2ray::core::app::stats::command::{
-    stats_service_client::StatsServiceClient, QueryStatsRequest, Stat,
+use pb::daemon::{
+    started_service_client::StartedServiceClient, Connection, ConnectionEventType,
+    ConnectionEvents, Status, SubscribeConnectionsRequest, SubscribeStatusRequest,
 };
 
 /// Clash API 的超时：与直连那条 trafficStats HTTP 路同值（[`super::hy2::REQ_TIMEOUT`]）。
@@ -44,17 +58,20 @@ use pb::v2ray::core::app::stats::command::{
 /// 不是把整轮采样拖住（gRPC 那条路另有 `CONNECT_TIMEOUT` / `CALL_TIMEOUT`）。
 pub const REQ_TIMEOUT: std::time::Duration = super::hy2::REQ_TIMEOUT;
 
-/// `StatsService.QueryStats` 在线上的**真实**方法路径。
+/// 两条订阅 RPC 的 `interval`。
 ///
-/// sing-box 生成代码里的路径是 `/experimental.v2rayapi.StatsService/QueryStats`
-/// （proto 的 package 就是 `experimental.v2rayapi`），但
-/// `experimental/v2rayapi/stats.go:22` 的 `init()` 把注册名覆盖成
-/// `"v2ray.core.app.stats.command.StatsService"`，而 grpc-go 是用
-/// `ServiceDesc.ServiceName` 拼方法路径的 ⇒ 线上认的是下面这一个。
-/// 所以 `proto-v2ray/app/stats/command/command.proto` 的 package 写成
-/// `v2ray.core.app.stats.command`，让 tonic 生成的客户端天然打对路径；
-/// 本常量与那份 proto 的 package 行由守门测试钉在一起。
-pub const QUERY_STATS_PATH: &str = "/v2ray.core.app.stats.command.StatsService/QueryStats";
+/// **单位是纳秒**（Go 的 `time.Duration`：上游 `SubscribeStatus` / `SubscribeConnections`
+/// 直接 `time.Duration(request.Interval)` 交给 `time.NewTicker`，`started_service.go:466`
+/// 与 `:821`，v1.14.3）：`<= 0` ⇒ 上游默认 **1 秒**。填成毫秒不会报错，只会让流按微秒级
+/// 抖动（那会让 G0 的「tick 粒度」实测结论全部失效），所以这里恒填 0，把节奏留给内核。
+pub const SUBSCRIBE_INTERVAL_NS: i64 = 0;
+
+/// 账本不在收帧（未建立 / 已中断）时 `query_user_deltas` 的措辞。
+///
+/// 它经采样器（`traffic.rs`）带着 `METERING_MARKER` + `METERING_LOSS_TAG` 落成 `warn`，
+/// 并被哨兵 `hy2_resi_metering_lost` 认领 —— 所以**不许**写成「没有流量」这类可被读成正常的话。
+pub(super) const STREAM_DOWN_MSG: &str =
+    "住宅计量流不在（未建立或已中断）：没有任何确证字节，本轮不产生增量";
 
 /// `GET /connections` 里的一条连接。`metadata` 里**没有** user 字段，所以只留
 /// 归组要用的三项（`rule` 归人、`id` 踢人、`chains` 供自检看门位是否真生效）。
@@ -202,83 +219,125 @@ pub fn parse_proxies_now(body: &str) -> anyhow::Result<BTreeMap<String, String>>
     Ok(parse_gate_inventory(body)?.selected())
 }
 
-/// `QueryStatsResponse.stat` → 凭据 name → 增量。
+/// 一帧 `SubscribeConnections` 投递 → 账本帧。
 ///
-/// 与 [`super::xray::deltas_from_stats`] **同一套语义**（uplink 计 tx、downlink 计 rx、
-/// 负值与 0 丢弃），只是 prost 生成的 `Stat` 是另一个包的另一个类型，泛型化不值当
-/// ⇒ 两份实现的一致性由 `deltas_from_stats_agrees_with_the_xray_twin` 钉住。
-pub fn deltas_from_stats(stats: &[Stat]) -> BTreeMap<String, TxRx> {
-    let mut out: BTreeMap<String, TxRx> = BTreeMap::new();
-    for s in stats {
-        let Some((name, dir)) = parse_user_counter(&s.name) else {
-            continue;
-        };
-        // `reset=true` 之后返回的是增量；负值理论上不可能，出现就丢弃
-        // （绝不 `as u64` 回绕成天文数字，那会瞬间把用户判成超限）
-        let Ok(v) = u64::try_from(s.value) else {
-            continue;
-        };
-        if v == 0 {
+/// 三个只在线上才看得见、又最容易读错的形状（上游 `daemon.StartedService` v1.14.3，
+/// `started_service.go`；G0 实测）：
+/// ① **首帧/重连快照**：`reset = true`，把订阅之前就存在的连接以 `NEW` + 完整快照发出来，
+///    closed 环里的条目也以 `NEW` 出现（`buildInitialConnectionState`，`:878`）⇒ 账本按
+///    id **upsert**，快照总量绝不累加。
+/// ② **`UPDATE` 只带增量**、不带 `connection` 对象（`buildTrafficUpdates`，`:958`）⇒ 只能
+///    按 id 关联；`uplink_delta` / `downlink_delta` 由账本累进 `known`（只服务指标 A）。
+/// ③ **`CLOSED` 可能没有 `connection`**：事件带了 id，但元数据已被 GC 时 `connection` 为
+///    nil（`applyConnectionEvent` 的 `event.Metadata.ID != uuid.Nil` 判定，`:936`；实测
+///    14 条）⇒ [`ClosedConn`] 为 `None`，账本走规则 7（字节进总账、不进任何人的账）。
+///
+/// 包成独立函数是为了让这三条**可以被测试钉住**：字段读错（把 `uplink_delta` 当总量、
+/// 把 `r#type` 的 0/1/2 认反）编译一律过，只会静默把账算错。
+pub fn frame_of_events(msg: &ConnectionEvents) -> Frame {
+    let mut events = Vec::with_capacity(msg.events.len());
+    for e in &msg.events {
+        if e.id.is_empty() {
+            // 上游恒发 uuid；空 id 是坏帧。收下它只会给 `open` / `dedup` 造一个会互相
+            // 碰撞的空键，不如丢掉（丢掉最坏也是把它当「没有收到」）。
             continue;
         }
-        let e = out.entry(name).or_default();
-        match dir {
-            Direction::Up => e.add(TxRx { tx: v, rx: 0 }),
-            Direction::Down => e.add(TxRx { tx: 0, rx: v }),
-        }
+        let kind = match ConnectionEventType::try_from(e.r#type) {
+            Ok(ConnectionEventType::ConnectionEventNew) => match e.connection.as_ref() {
+                Some(c) => EventKind::New { total: totals(c) },
+                // 没有快照的 NEW 语义未知（上游不这么发）⇒ 不给它在册，别猜
+                None => continue,
+            },
+            Ok(ConnectionEventType::ConnectionEventUpdate) => EventKind::Update {
+                delta: TxRx {
+                    tx: non_negative(e.uplink_delta),
+                    rx: non_negative(e.downlink_delta),
+                },
+            },
+            Ok(ConnectionEventType::ConnectionEventClosed) => EventKind::Closed {
+                conn: e.connection.as_ref().map(closed_conn),
+            },
+            // 认不出的类型（更新的内核加了新枚举值）：跳过。别当 NEW —— 拿未知语义的快照
+            // 去 upsert `open`，会让指标 A 的 ΔS 从此带上一个说不清的偏差。
+            Err(_) => continue,
+        };
+        events.push(Event {
+            id: e.id.clone(),
+            kind,
+        });
     }
-    out
+    Frame {
+        reset: msg.reset,
+        global: None,
+        connections_in: None,
+        events,
+    }
 }
 
-/// 发给 sing-box 的 `QueryStats` 请求（每轮采样都是这一个常量请求）。
+/// 一帧 `SubscribeStatus` 投递 → 账本帧（只有全局总量与内核报的活动连接数）。
 ///
-/// **`patterns`（repeated，字段 3）填、单数 `pattern`（字段 1）必须留空** —— 上游
-/// `experimental/v2rayapi/stats.go` 的 `QueryStats`（`:203-212`，v1.14.1）：
-///
-/// ```text
-/// if len(request.Patterns) == 0 {
-///     for name, counter := range s.counters {
-///         if request.Reset_ { value = counter.Swap(0) } else { value = counter.Load() }  // :206-210
-///         response.Stat = append(response.Stat, …)
-///     }
-/// }
-/// ```
-///
-/// 即 `patterns` 为空时它**无过滤地返回全部计数器**，清零那一半受 `request.Reset_` 门控
-/// （`reset=false` 只 `Load()` 读不清零、`reset=true` 才 `Swap(0)` 清零取增量）；我们恒填
-/// `reset=true`，对本进程仍是每轮原子清零取增量。整个 `QueryStats` 里单数 `request.Pattern`
-/// 一次都没被读（只读 `Patterns`，`:203/:215/:223`）。所以照 Xray 那条路
-/// 写 `pattern = "user>>>"` 会变成「每轮把 `inbound>>>` / `outbound>>>` 的计数器一起
-/// `Swap(0)`、并把非用户计数器混进返回体」——**两边不能照抄**（Xray 侧仍是
-/// `pattern`，见 `panel::xray` 的 `query_user_deltas`）。非 regexp 分支是
-/// `strings.Contains(name, matcher)`（`:231-244`），子串语义与 [`STATS_PATTERN`] 一致。
-///
-/// 提成函数只为让这条裁决性偏离被测试钉住（`the_query_stats_request_fills_patterns_not_pattern`）。
-pub fn query_stats_request() -> QueryStatsRequest {
-    QueryStatsRequest {
-        pattern: String::new(),
-        reset: true,
-        patterns: vec![STATS_PATTERN.to_string()],
-        regexp: false,
+/// `traffic_available = false`（内核还没装上流量计数器）⇒ `global = None`：这一帧**不更新**
+/// 指标 A 的 G。绝不用 0 顶替 —— 顶替会让下一个区间的 ΔG 假涨成整段总量。
+pub fn frame_of_status(msg: &Status) -> Frame {
+    Frame {
+        reset: false,
+        global: msg.traffic_available.then(|| TxRx {
+            tx: non_negative(msg.uplink_total),
+            rx: non_negative(msg.downlink_total),
+        }),
+        connections_in: u64::try_from(msg.connections_in).ok(),
+        events: Vec::new(),
     }
+}
+
+/// `CLOSED` 事件里的连接元数据 → 账本要的终值（规则 1：只有这里的 `total` 入账）。
+fn closed_conn(c: &Connection) -> ClosedConn {
+    ClosedConn {
+        user: non_empty_string(&c.user),
+        destination: non_empty_string(&c.destination),
+        network: non_empty_string(&c.network),
+        total: totals(c),
+        created_at_ms: c.created_at,
+        closed_at_ms: c.closed_at,
+    }
+}
+
+fn totals(c: &Connection) -> TxRx {
+    TxRx {
+        tx: non_negative(c.uplink_total),
+        rx: non_negative(c.downlink_total),
+    }
+}
+
+/// 负数在协议上是「计数器被重置」，不是「负流量」：丢成 0，绝不 `as u64` 回绕
+/// （回绕会瞬间把用户判成超限 —— 与 Xray 那条路 `deltas_from_stats` 的同一条口径）。
+fn non_negative(v: i64) -> u64 {
+    u64::try_from(v).unwrap_or(0)
+}
+
+fn non_empty_string(s: &str) -> Option<String> {
+    (!s.is_empty()).then(|| s.to_string())
 }
 
 pub struct Hy2ResiClient {
     clash_api: String,
-    v2ray_api: String,
+    grpc_api: String,
     http: reqwest::Client,
     channel: OnceLock<Channel>,
+    /// 计量账本（`panel::meter`）。**与 `query_user_deltas` 读的是同一个**：
+    /// [`Self::meter_session`] 往里喂帧，采样器从它 `drain`，哨兵 / 裁决读它的有损位。
+    ledger: Arc<Ledger>,
 }
 
 impl Hy2ResiClient {
     pub fn new() -> Self {
-        Self::with_apis(super::HY2_RESI_CLASH_API, super::HY2_RESI_V2RAY_API)
+        Self::with_endpoints(super::HY2_RESI_CLASH_API, super::HY2_RESI_V2RAY_API)
     }
 
-    pub fn with_apis(clash_api: impl Into<String>, v2ray_api: impl Into<String>) -> Self {
+    pub fn with_endpoints(clash_api: impl Into<String>, grpc_api: impl Into<String>) -> Self {
         Self {
             clash_api: clash_api.into(),
-            v2ray_api: v2ray_api.into(),
+            grpc_api: grpc_api.into(),
             http: reqwest::Client::builder()
                 // 回环地址，绝不能走系统代理（住宅上游本身就是代理，绕回去会死锁）
                 .no_proxy()
@@ -286,6 +345,7 @@ impl Hy2ResiClient {
                 .build()
                 .expect("reqwest 客户端构造不会失败"),
             channel: OnceLock::new(),
+            ledger: Arc::new(Ledger::new()),
         }
     }
 
@@ -293,8 +353,8 @@ impl Hy2ResiClient {
         &self.clash_api
     }
 
-    pub fn v2ray_api(&self) -> &str {
-        &self.v2ray_api
+    pub fn grpc_api(&self) -> &str {
+        &self.grpc_api
     }
 
     /// Clash API 的 URL。`selector` / 连接 id 只可能是渲染器产的
@@ -303,8 +363,8 @@ impl Hy2ResiClient {
         format!("http://{}{path}", self.clash_api)
     }
 
-    pub fn v2ray_endpoint_url(&self) -> String {
-        format!("http://{}", self.v2ray_api)
+    pub fn grpc_endpoint_url(&self) -> String {
+        format!("http://{}", self.grpc_api)
     }
 
     /// `connect_lazy` 的通道：进程启动时住宅 sing-box 可能还没起来，所以不在构造时连；
@@ -313,12 +373,46 @@ impl Hy2ResiClient {
         if let Some(c) = self.channel.get() {
             return Ok(c.clone());
         }
-        let ep = Endpoint::from_shared(self.v2ray_endpoint_url())?
+        let ep = Endpoint::from_shared(self.grpc_endpoint_url())?
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(CALL_TIMEOUT);
         let c = ep.connect_lazy();
         let _ = self.channel.set(c.clone());
         Ok(c)
+    }
+
+    /// 实例代际（`GetStartedAt`，秒）。账本按它换代封账（`meter` 规则 9），
+    /// 本方法只做透传：**不做**降级、不猜「没变就是没重启」。
+    pub async fn started_at(&self) -> anyhow::Result<i64> {
+        let mut c = StartedServiceClient::new(self.channel()?);
+        Ok(c.get_started_at(()).await?.into_inner().started_at)
+    }
+
+    /// 全局状态流（`SubscribeStatus`）：指标 A 的 G 与指标 C 的活动连接数。
+    /// 返回的流由调用方驱动（`meter::metering_loop`），这里只负责把错误响亮地抛出去。
+    pub async fn subscribe_status(&self) -> anyhow::Result<tonic::Streaming<Status>> {
+        let mut c = StartedServiceClient::new(self.channel()?);
+        let stream = c
+            .subscribe_status(SubscribeStatusRequest {
+                interval: SUBSCRIBE_INTERVAL_NS,
+            })
+            .await?
+            .into_inner();
+        Ok(stream)
+    }
+
+    /// 逐连接事件流（`SubscribeConnections`）：唯一入账来源（`meter` 规则 1）。
+    pub async fn subscribe_connections(
+        &self,
+    ) -> anyhow::Result<tonic::Streaming<ConnectionEvents>> {
+        let mut c = StartedServiceClient::new(self.channel()?);
+        let stream = c
+            .subscribe_connections(SubscribeConnectionsRequest {
+                interval: SUBSCRIBE_INTERVAL_NS,
+            })
+            .await?
+            .into_inner();
+        Ok(stream)
     }
 
     /// 非 2xx 的**读**接口失败：措辞不许冒用 `Rejected` 的「拒绝切换到 {tag}」——
@@ -354,12 +448,48 @@ impl Default for Hy2ResiClient {
 
 #[async_trait::async_trait]
 impl Hy2ResiApi for Hy2ResiClient {
+    /// **签名冻结**（键 = 服务端 `users[].name`），实现换成「排空流驱动账本」：
+    /// 帧由 [`Self::meter_session`] 喂进 [`super::meter::Ledger`]，这里只把已确证的
+    /// 每用户字节取走。**流不在时必须是 `Err`**（[`Ledger::available`]）—— 静默回空表
+    /// 会被采样器读成「这轮没有字节」，正是审计核实的三条静默失效链之一。
     async fn query_user_deltas(&self) -> anyhow::Result<BTreeMap<String, TxRx>> {
-        let mut c = StatsServiceClient::new(self.channel()?);
-        // 请求体是 `query_stats_request()`（`patterns` 填、`pattern` 留空，理由与上游
-        // 源码行号写在那个函数的文档里）
-        let resp = c.query_stats(query_stats_request()).await?;
-        Ok(deltas_from_stats(&resp.into_inner().stat))
+        let now = super::meter::now_ms();
+        if !self.ledger.available(now) {
+            anyhow::bail!(STREAM_DOWN_MSG)
+        }
+        Ok(self.ledger.drain(now))
+    }
+
+    fn meter_ledger(&self) -> Arc<Ledger> {
+        self.ledger.clone()
+    }
+
+    /// 一段计量会话：`GetStartedAt` 定代际 → 建两条流 → `select!` 逐帧喂账本，
+    /// 直到任一条结束（`Ok(())` = 内核正常关流）或出错（`Err` = `metering_loop` 记中断）。
+    async fn meter_session(&self) -> anyhow::Result<()> {
+        let generation = self.started_at().await?;
+        self.ledger
+            .note_session_start(generation, super::meter::now_ms());
+        let mut status = self.subscribe_status().await?;
+        let mut conns = self.subscribe_connections().await?;
+        loop {
+            // 两条流各喂各的帧；`Streaming::message` 是 cancel-safe 的，select 里丢掉
+            // 未完成的那个分支不会丢消息（tonic 的文档保证）。
+            let frame = tokio::select! {
+                msg = status.message() => msg?.map(|s| frame_of_status(&s)),
+                msg = conns.message() => msg?.map(|m| frame_of_events(&m)),
+            };
+            let Some(frame) = frame else {
+                // 内核把流关了（正常收尾）：退避重连即可，不算异常
+                return Ok(());
+            };
+            self.ledger.apply(frame, super::meter::now_ms());
+            if self.ledger.take_resubscribe() {
+                // 指标 A 越线时账本自己要求的：重订阅一次，快照能补 14–30s 内的已关闭
+                // 连接（按 id 去重，重收不重计）。故意重连也要按中断记（封账 + 可疑损失）。
+                anyhow::bail!("按账本请求重订阅一次（指标 A 越线）")
+            }
+        }
     }
 
     async fn connections(&self) -> anyhow::Result<Vec<Hy2ResiConn>> {
@@ -428,6 +558,9 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
 
+    // 单条事件类型只在测试里构造（生产代码经 `frame_of_events` 收的是 Plural 流）
+    use super::pb::daemon::ConnectionEvent;
+
     // Catches accepting malformed inventories as an empty successful authorization table.
     #[test]
     fn inventory_rejects_unknown_shape_type_selection_and_members() {
@@ -453,7 +586,7 @@ mod tests {
     async fn version_uses_the_real_http_product_body_and_rejects_bad_json() {
         for mode in [ClashMode::Ok, ClashMode::BadVersion] {
             let (port, _rx) = fake_clash(mode).await;
-            let c = Hy2ResiClient::with_apis(format!("127.0.0.1:{port}"), "unused");
+            let c = Hy2ResiClient::with_endpoints(format!("127.0.0.1:{port}"), "unused");
             if mode == ClashMode::Ok {
                 assert_eq!(c.version().await.unwrap(), "sing-box 1.14.3");
             } else {
@@ -466,7 +599,7 @@ mod tests {
     #[tokio::test]
     async fn incomplete_gate_inventory_is_an_error() {
         let (port, _rx) = fake_clash(ClashMode::Incomplete).await;
-        let c = Hy2ResiClient::with_apis(format!("127.0.0.1:{port}"), "unused");
+        let c = Hy2ResiClient::with_endpoints(format!("127.0.0.1:{port}"), "unused");
         assert!(
             c.selected_all().await.is_err(),
             "a gate without all must fail closed"
@@ -526,25 +659,14 @@ mod tests {
         assert_eq!(m.get("r001").copied(), Some(1));
     }
 
-    /// 计数器名的解析与 Xray 那条路同构（复用 panel::xray::parse_user_counter）
-    #[test]
-    fn counter_names_are_parsed_by_the_same_function_as_xray() {
-        use crate::modules::panel::xray::{parse_user_counter, Direction};
-        assert_eq!(
-            parse_user_counter("user>>>alice>>>traffic>>>uplink"),
-            Some(("alice".to_string(), Direction::Up))
-        );
-        assert_eq!(
-            parse_user_counter("user>>>r001>>>traffic>>>downlink"),
-            Some(("r001".to_string(), Direction::Down))
-        );
-    }
-
     /// 两个回环端点的地址只有**一处**来源：写出 `hy2-residential.json` 的那个渲染器。
     ///
     /// 断言比的是「`panel` 侧的常量 == `bui_schema` 侧的常量」而不是字面量 ——
     /// 比字面量的话，`panel` 这边另定一份值、与渲染器分叉，测试照样全绿，而生产上
-    /// 计量（v2ray_api）与门位（Clash API）会双双打到没人听的端口上（静默故障）。
+    /// 计量（`daemon.StartedService` 的 gRPC 口）与门位（Clash API）会双双打到没人听的
+    /// 端口上（静默故障）。⚠️ 过渡态：第二个常量此刻仍叫 `HY2_RESI_V2RAY_API`
+    /// （渲染器也还在写 `experimental.v2ray_api` 段），原子切换那次提交把两边一起改名成
+    /// `HY2_RESI_API` 并换成 `services: [{ type: "api", … }]`。
     #[test]
     fn the_endpoints_come_from_the_renderer() {
         use bui_schema::render::hy2_singbox as renderer;
@@ -556,7 +678,7 @@ mod tests {
         assert_eq!(
             super::super::HY2_RESI_V2RAY_API,
             renderer::HY2_RESI_V2RAY_API,
-            "panel 侧的 v2ray_api 必须就是渲染器写进配置的那一个"
+            "panel 侧的 gRPC API 必须就是渲染器写进配置的那一个"
         );
         // 客户端不许自己拼地址：默认构造的两个端点就是上面那两个常量
         assert_eq!(
@@ -564,7 +686,7 @@ mod tests {
             renderer::HY2_RESI_CLASH_API
         );
         assert_eq!(
-            Hy2ResiClient::new().v2ray_api(),
+            Hy2ResiClient::new().grpc_api(),
             renderer::HY2_RESI_V2RAY_API
         );
         assert_eq!(
@@ -572,119 +694,151 @@ mod tests {
             format!("http://{}/connections", renderer::HY2_RESI_CLASH_API)
         );
         assert_eq!(
-            Hy2ResiClient::new().v2ray_endpoint_url(),
+            Hy2ResiClient::new().grpc_endpoint_url(),
             format!("http://{}", renderer::HY2_RESI_V2RAY_API)
         );
     }
 
-    /// `QueryStats` 的请求体：**`patterns` 填、单数 `pattern` 留空、`reset` 开**。
+    /// 帧转换器是「线上字段 → 账本语义」的唯一翻译层：四个最贵的读错都在这里钉住。
     ///
-    /// 这是一条裁决性偏离（计划与 spec 原先写的是 `pattern="user>>>"`，2026-09-16 按上游
-    /// 源码订正），所以必须有断言钉住：sing-box 的 `QueryStats` 只读 `patterns`
-    /// （`experimental/v2rayapi/stats.go:203-212`，v1.14.1）：`patterns` 为空时**无过滤地返回
-    /// 全部计数器**、清零受 `reset` 门控（`reset=true` 才 `Swap(0)`，我们恒填），而单数
-    /// `request.Pattern` 一次都没被读。
-    /// 把这里改回 `pattern=` 编译照样过、别处的测试照样全绿，后果却是每轮把
-    /// `inbound>>>` / `outbound>>>` 一起 `Swap(0)`、并把非用户计数器混进返回体。
+    /// 用生成的真实类型构造（不是字符串 JSON）：字段名改了这里就编不过，比运行时断言更早。
     #[test]
-    fn the_query_stats_request_fills_patterns_not_pattern() {
-        let req = query_stats_request();
-        assert_eq!(req.patterns, vec!["user>>>".to_string()]);
-        assert!(
-            req.pattern.is_empty(),
-            "单数 pattern 必须留空：上游一个字都不读它"
-        );
-        assert!(req.reset, "reset=true 才是原子交换清零的增量语义");
-        assert!(!req.regexp, "子串匹配，不是正则");
-        // 子串与 Xray 那条路同一个常量（计数器名同名同义）
-        assert_eq!(req.patterns, vec![STATS_PATTERN.to_string()]);
-    }
-
-    fn proto_v2ray_dir() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("proto-v2ray")
-    }
-
-    // `proto-v2ray/` 的 checksum 与条目数守门与 Xray 那棵树合在一条测试里遍历两棵树：
-    // `panel::xray::tests::vendored_protos_match_the_recorded_checksums`（计划 T9 的 Files）。
-
-    /// 编译的那份 proto 是上游原文的**逐字转写，只改 package 行**。
-    ///
-    /// 这条测试就是「为什么允许手改 vendor 文件」的全部理由：消息、字段号、service 与
-    /// 方法名逐行必须与上游一致，唯一的差异只许是 `package` / `option go_package`。
-    /// 上游 `init()` 把注册名覆盖成 `v2ray.core.app.stats.command.StatsService`
-    /// （`experimental/v2rayapi/stats.go:22`），tonic 只能从 package 推路径 ⇒ 必须改这一行。
-    #[test]
-    fn the_compiled_proto_only_renames_the_package_of_the_upstream_one() {
-        let root = proto_v2ray_dir();
-        let body = |rel: &str| -> Vec<String> {
-            std::fs::read_to_string(root.join(rel))
-                .unwrap_or_else(|_| panic!("缺少 {rel}"))
-                .lines()
-                .map(str::trim_end)
-                .filter(|l| {
-                    !l.trim().is_empty()
-                        && !l.trim_start().starts_with("//")
-                        && !l.starts_with("package ")
-                        && !l.starts_with("option go_package")
-                })
-                .map(str::to_string)
-                .collect()
+    fn connection_events_translate_to_ledger_events() {
+        let conn = |up: i64, down: i64| Connection {
+            id: "a".into(),
+            user: "alice".into(),
+            destination: "example.com:443".into(),
+            network: "tcp".into(),
+            uplink_total: up,
+            downlink_total: down,
+            created_at: 1_000,
+            closed_at: 2_000,
+            ..Default::default()
         };
+        let msg = ConnectionEvents {
+            reset: true,
+            events: vec![
+                // NEW：快照总量，账本按 id upsert（绝不累加）
+                ConnectionEvent {
+                    r#type: ConnectionEventType::ConnectionEventNew as i32,
+                    id: "a".into(),
+                    connection: Some(conn(100, 200)),
+                    ..Default::default()
+                },
+                // UPDATE：只有增量、没有 connection 对象（上游 buildTrafficUpdates）
+                ConnectionEvent {
+                    r#type: ConnectionEventType::ConnectionEventUpdate as i32,
+                    id: "a".into(),
+                    uplink_delta: 7,
+                    downlink_delta: 9,
+                    ..Default::default()
+                },
+                // 增量是负数（计数器被重置）：钳 0，绝不 as u64 回绕
+                ConnectionEvent {
+                    r#type: ConnectionEventType::ConnectionEventUpdate as i32,
+                    id: "a".into(),
+                    uplink_delta: -5,
+                    downlink_delta: -6,
+                    ..Default::default()
+                },
+                // CLOSED 带元数据：终值 + 归属
+                ConnectionEvent {
+                    r#type: ConnectionEventType::ConnectionEventClosed as i32,
+                    id: "a".into(),
+                    connection: Some(conn(100, 200)),
+                    closed_at: 2_000,
+                    ..Default::default()
+                },
+                // CLOSED 没有元数据（被打到 GC 的那 14 条）：账本走 conn=None，字节进总账不归人
+                ConnectionEvent {
+                    r#type: ConnectionEventType::ConnectionEventClosed as i32,
+                    id: "b".into(),
+                    closed_at: 3_000,
+                    ..Default::default()
+                },
+                // 认不出的枚举值（更新的内核加了新类型）：跳过，不猜
+                ConnectionEvent {
+                    r#type: 99,
+                    id: "c".into(),
+                    ..Default::default()
+                },
+                // 空 id 是坏帧：丢掉，别造一个会互相碰撞的空键
+                ConnectionEvent {
+                    r#type: ConnectionEventType::ConnectionEventNew as i32,
+                    connection: Some(conn(1, 1)),
+                    ..Default::default()
+                },
+            ],
+        };
+        let f = frame_of_events(&msg);
+        assert!(f.reset, "reset 透传：账本靠它决定要不要按快照 upsert");
+        assert!(f.global.is_none(), "连接事件流不带全局总量");
         assert_eq!(
-            body("app/stats/command/command.proto"),
-            body("experimental/v2rayapi/stats.proto"),
-            "除 package 行以外，编译的那份必须与上游原文逐行一致"
+            f.events,
+            vec![
+                Event {
+                    id: "a".into(),
+                    kind: EventKind::New {
+                        total: TxRx { tx: 100, rx: 200 }
+                    }
+                },
+                Event {
+                    id: "a".into(),
+                    kind: EventKind::Update {
+                        delta: TxRx { tx: 7, rx: 9 }
+                    }
+                },
+                Event {
+                    id: "a".into(),
+                    kind: EventKind::Update {
+                        delta: TxRx { tx: 0, rx: 0 }
+                    }
+                },
+                Event {
+                    id: "a".into(),
+                    kind: EventKind::Closed {
+                        conn: Some(ClosedConn {
+                            user: Some("alice".into()),
+                            destination: Some("example.com:443".into()),
+                            network: Some("tcp".into()),
+                            total: TxRx { tx: 100, rx: 200 },
+                            created_at_ms: 1_000,
+                            closed_at_ms: 2_000,
+                        }),
+                    },
+                },
+                Event {
+                    id: "b".into(),
+                    kind: EventKind::Closed { conn: None },
+                },
+            ]
         );
-        // package 行本身钉死：它决定 tonic 打哪条方法路径
-        let compiled =
-            std::fs::read_to_string(root.join("app/stats/command/command.proto")).unwrap();
-        let pkg = compiled
-            .lines()
-            .find_map(|l| l.strip_prefix("package ").and_then(|p| p.strip_suffix(';')))
-            .expect("必须有 package 行");
-        assert_eq!(pkg, "v2ray.core.app.stats.command");
-        assert_eq!(QUERY_STATS_PATH, format!("/{pkg}.StatsService/QueryStats"));
-        // 生成代码真的落在这个模块树上（编译期就证明 package 没被改回去）
-        let _ = std::any::type_name::<QueryStatsRequest>();
     }
 
-    /// 两条计量路的取数语义必须一致：同样的计数器名与值，两个 `deltas_from_stats` 出同一张表。
-    /// 一边漂了就是住宅或直连的流量被少记 / 多记，而这种错要到月底对账才看得出来。
+    /// `traffic_available = false` ⇒ `global = None`（这一帧**不更新**指标 A 的 G），
+    /// 绝不用 0 顶替：顶替会让下一个区间的 ΔG 假涨成整段总量。
     #[test]
-    fn deltas_from_stats_agrees_with_the_xray_twin() {
-        let names = [
-            ("user>>>alice>>>traffic>>>uplink", 10i64),
-            ("user>>>alice>>>traffic>>>downlink", 20),
-            ("user>>>r001>>>traffic>>>uplink", 0),
-            ("user>>>r002>>>traffic>>>downlink", -1),
-            ("inbound>>>hy2-resi>>>traffic>>>uplink", 99),
-            ("junk", 7),
-        ];
-        let mine = deltas_from_stats(
-            &names
-                .iter()
-                .map(|(n, v)| Stat {
-                    name: n.to_string(),
-                    value: *v,
-                })
-                .collect::<Vec<_>>(),
-        );
-        let theirs = super::super::xray::deltas_from_stats(
-            &names
-                .iter()
-                .map(
-                    |(n, v)| super::super::xray::pb::xray::app::stats::command::Stat {
-                        name: n.to_string(),
-                        value: *v,
-                    },
-                )
-                .collect::<Vec<_>>(),
-        );
-        assert_eq!(mine, theirs);
-        assert_eq!(mine[&"alice".to_string()], TxRx { tx: 10, rx: 20 });
-        assert!(!mine.contains_key("r001"), "0 不进表");
-        assert!(!mine.contains_key("r002"), "负值丢弃，绝不回绕");
-        assert_eq!(mine.len(), 1, "inbound>>> 与不认的名字都不进表");
+    fn status_frames_skip_an_unavailable_traffic_counter() {
+        let f = frame_of_status(&Status {
+            connections_in: 3,
+            traffic_available: true,
+            uplink_total: 500,
+            downlink_total: 700,
+            ..Default::default()
+        });
+        assert_eq!(f.global, Some(TxRx { tx: 500, rx: 700 }));
+        assert_eq!(f.connections_in, Some(3));
+        assert!(f.events.is_empty() && !f.reset);
+
+        let f = frame_of_status(&Status {
+            connections_in: -1,
+            traffic_available: false,
+            uplink_total: 500,
+            downlink_total: 700,
+            ..Default::default()
+        });
+        assert_eq!(f.global, None, "计数器没装好 ⇒ 这一帧不碰 G");
+        assert_eq!(f.connections_in, None, "负数连接数不收");
     }
 
     #[test]
@@ -754,7 +908,7 @@ mod tests {
             .to_string()
             .starts_with("Clash API 不可达："));
         // 端口 1 本机永不监听（spec §2.2 的 deny 出站用的就是它）⇒ 必是「不可达」
-        let c = Hy2ResiClient::with_apis("127.0.0.1:1", "127.0.0.1:1");
+        let c = Hy2ResiClient::with_endpoints("127.0.0.1:1", "127.0.0.1:1");
         let err = c.select("gate-r000", "deny").await.unwrap_err().to_string();
         assert!(err.starts_with("Clash API 不可达："), "{err}");
         assert!(!c.ready().await, "没人听 ⇒ ready() 为假，不是挂住");
@@ -765,6 +919,11 @@ mod tests {
             c.query_user_deltas().await.is_err(),
             "gRPC 也是 Err 不是 panic"
         );
+        // 三条 StartedService RPC 同理：Err 不是 panic、也不是挂住 —— 住宅 sing-box 没起来时
+        // 采样循环必须能退避重试（把 Err 换成 unwrap 就是整进程挂掉）
+        assert!(c.started_at().await.is_err());
+        assert!(c.subscribe_status().await.is_err());
+        assert!(c.subscribe_connections().await.is_err());
     }
 
     /// 假 Clash API 的应答口径。
@@ -878,7 +1037,7 @@ mod tests {
     #[tokio::test]
     async fn the_clash_calls_use_the_documented_methods_paths_and_bodies() {
         let (port, mut rx) = fake_clash(ClashMode::Ok).await;
-        let c = Hy2ResiClient::with_apis(format!("127.0.0.1:{port}"), "127.0.0.1:1");
+        let c = Hy2ResiClient::with_endpoints(format!("127.0.0.1:{port}"), "127.0.0.1:1");
 
         assert!(c.ready().await);
         assert!(rx
@@ -947,7 +1106,7 @@ mod tests {
     async fn a_non_2xx_answer_is_always_a_failure_never_a_silent_ok() {
         // ① select 的 400：文案与 relay 那条路逐字一致（T13 的哨兵按它认）
         let (port, _rx) = fake_clash(ClashMode::Ok).await;
-        let c = Hy2ResiClient::with_apis(format!("127.0.0.1:{port}"), "127.0.0.1:1");
+        let c = Hy2ResiClient::with_endpoints(format!("127.0.0.1:{port}"), "127.0.0.1:1");
         let err = c.select("gate-bad", "deny").await.unwrap_err().to_string();
         assert_eq!(err, "Clash API 拒绝切换到 deny（HTTP 400）");
         // ② DELETE 的 404 也是失败；措辞不冒用「拒绝切换」（当时没在切门）
@@ -959,7 +1118,7 @@ mod tests {
 
         // ③ 两个读接口（clash_get）的 500：整轮采样 / 收敛必须失败，不许回空表当真源
         let (port, _rx) = fake_clash(ClashMode::AllBad).await;
-        let c = Hy2ResiClient::with_apis(format!("127.0.0.1:{port}"), "127.0.0.1:1");
+        let c = Hy2ResiClient::with_endpoints(format!("127.0.0.1:{port}"), "127.0.0.1:1");
         assert_eq!(
             c.connections().await.unwrap_err().to_string(),
             "Clash API 不可达：GET /connections 回 HTTP 500",

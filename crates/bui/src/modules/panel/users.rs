@@ -428,16 +428,26 @@ pub fn is_blocked(u: &User, extra: TxRx, now: OffsetDateTime) -> Option<BlockRea
     None
 }
 
+/// 拒绝集合。`lossy` = 住宅计量账本此刻在有损窗口里（[`super::Shared::meter_lossy`]）：
+/// 按 spec §5 的用户层 fail-open，**未落盘的 `pending` 不参与判定** —— 那些字节是本区间
+/// 里「可能不完整」的部分，账目不确定不封人；已经确证并落盘的 `usage` 照常判定，
+/// 所以一个已经超额的用户不会因为一次计量故障被解封（那比少封更糟）。
 pub fn blocked_set(
     state: &State,
     pending: &BTreeMap<Uuid, TxRx>,
     now: OffsetDateTime,
+    lossy: bool,
 ) -> BTreeSet<Uuid> {
     state
         .users
         .iter()
         .filter(|u| {
-            is_blocked(u, pending.get(&u.user_id).copied().unwrap_or_default(), now).is_some()
+            let extra = if lossy {
+                TxRx::default()
+            } else {
+                pending.get(&u.user_id).copied().unwrap_or_default()
+            };
+            is_blocked(u, extra, now).is_some()
         })
         .map(|u| u.user_id)
         .collect()
@@ -790,7 +800,7 @@ pub async fn sync_now(ctx: &DaemonCtx, shared: &Shared) -> SyncOutcome {
     let pending = shared.pending().await.clone();
     let blocked = {
         let state = ctx.store.read().await;
-        blocked_set(&state, &pending, now)
+        blocked_set(&state, &pending, now, shared.meter_lossy())
     };
     sync_users(ctx, shared, &blocked).await
 }
@@ -1064,7 +1074,7 @@ mod tests {
         // 到期 / 封禁：门位是 deny —— UI 据此解释「显示已连接但请求全被拒」
         let mut expired = s.clone();
         expired.users[0].disabled = true;
-        let b2 = blocked_set(&expired, &BTreeMap::new(), t0());
+        let b2 = blocked_set(&expired, &BTreeMap::new(), t0(), false);
         let g2 = super::super::gates::expected(&expired, &b2);
         assert_eq!(
             project(
@@ -1691,8 +1701,31 @@ mod tests {
         s.users[0].entitlements.traffic_limit.total_bytes = Some(10);
         let id = s.users[0].user_id;
         let pending = BTreeMap::from([(id, TxRx { tx: 20, rx: 0 })]);
-        assert_eq!(blocked_set(&s, &pending, t0()), BTreeSet::from([id]));
-        assert!(blocked_set(&s, &BTreeMap::new(), t0()).is_empty());
+        assert_eq!(blocked_set(&s, &pending, t0(), false), BTreeSet::from([id]));
+        assert!(blocked_set(&s, &BTreeMap::new(), t0(), false).is_empty());
+    }
+
+    /// §5 用户层 fail-open 与「不许把已超额的人解封」两条同时成立的判据：
+    /// 有损窗口里未落盘的 `pending` 不算数（否则账目不确定就封人），但**已落盘的用量
+    /// 照常判定**（否则一次计量故障 = 给超量用户解封，比少封更糟）。
+    #[test]
+    fn a_lossy_ledger_suspends_only_the_unflushed_pending() {
+        let mut s = sample_state();
+        let id = s.users[0].user_id;
+        s.users[0].entitlements.traffic_limit.total_bytes = Some(100);
+        let pending = BTreeMap::from([(id, TxRx { tx: 20, rx: 0 })]);
+        assert_eq!(
+            blocked_set(&s, &pending, t0(), true),
+            BTreeSet::new(),
+            "有损窗口：只有 pending 越线的人不解封也不封"
+        );
+        // 已落盘的用量越线：不因有损窗口被解封
+        s.users[0].usage.total_bytes = 100;
+        assert_eq!(blocked_set(&s, &pending, t0(), true), BTreeSet::from([id]));
+        // 生命周期原因（disabled / 到期）与账本无关，任何窗口都照常判
+        s.users[0].usage.total_bytes = 0;
+        s.users[0].disabled = true;
+        assert_eq!(blocked_set(&s, &pending, t0(), true), BTreeSet::from([id]));
     }
 
     fn ctx_of(h: &Harness) -> DaemonCtx {

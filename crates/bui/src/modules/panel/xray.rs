@@ -919,16 +919,16 @@ mod tests {
         assert!(c.remove_user("vless-direct", uid()).await.is_err());
     }
 
-    /// 两棵 vendor 树各自的 checksum 守门：`proto/` 是 Xray-core 的，`proto-v2ray/` 是
-    /// sing-box 那条 v2ray_api 的（包名不同、`build.rs` 各编一次，互不影响；
+    /// 两棵 vendor 树各自的 checksum 守门：`proto/` 是 Xray-core 的，`proto-singbox/` 是
+    /// 住宅计量的 `daemon.StartedService` 的（包名不同、`build.rs` 各编一次，互不影响；
     /// 见 `panel::hy2resi`）。换 pinned 版本时必须同步更新 SHA256SUMS，
     /// 否则这条测试会告诉你 proto 变了。
     #[test]
     fn vendored_protos_match_the_recorded_checksums() {
         // 条目数各自钉死：`proto` = 10 个用户/统计面的 + RoutingService 闭包的 3 个（T0）；
-        // `proto-v2ray` = 编译用的 app/stats/command/command.proto + 上游原文
-        // experimental/v2rayapi/stats.proto（T9）
-        for (dir, want_n) in [("proto", 13usize), ("proto-v2ray", 2usize)] {
+        // `proto-singbox` = daemon/started_service.proto（上游 v1.14.3 逐字节原文，
+        // 由 `scripts/release/check-vendored-proto.sh` 对同一 tag 的在线原文再核一次）
+        for (dir, want_n) in [("proto", 13usize), ("proto-singbox", 1usize)] {
             let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(dir);
             let sums = std::fs::read_to_string(root.join("SHA256SUMS"))
                 .unwrap_or_else(|_| panic!("{dir}/SHA256SUMS 必须存在"));

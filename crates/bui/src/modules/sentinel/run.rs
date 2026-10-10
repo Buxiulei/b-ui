@@ -361,6 +361,9 @@ async fn dispatch(
         (Sig::CaddyCertFailed, _) => system::on_caddy_cert(key),
         (Sig::Hy2ResiRelayUnreachable, _) => system::on_hy2_resi_relay(&r.unit),
         (Sig::Hy2ResiGateSyncFailed, _) => system::on_gate_sync(ctx, &deps.panel).await,
+        // 有损窗口（spec §5 系统层 fail-closed）：告警 + 暂停该窗口的自动裁决，
+        // 需要人工核账 —— 处置本身在 meter 的 ledger 里，这里只把事说清楚
+        (Sig::Hy2ResiMeteringLost, _) => system::on_metering_lost(&deps.panel),
         // 非日志签名：`classify` 不产出它们（重放与池巡查直接记事件，spec §3.4 / §3.1）
         (Sig::Hy2ResiGateReplayFailed | Sig::Hy2ResiPoolLow, _) => system::on_resi_alert(sig),
     }

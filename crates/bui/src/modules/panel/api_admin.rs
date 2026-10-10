@@ -204,7 +204,7 @@ async fn blocked_now(app: &AppState, shared: &Shared) -> std::collections::BTree
     let now = app.host.now();
     let pending = shared.pending().await.clone();
     let state = app.store.read().await;
-    users::blocked_set(&state, &pending, now)
+    users::blocked_set(&state, &pending, now, shared.meter_lossy())
 }
 
 async fn list_users(State(app): State<AppState>, shared: Arc<Shared>) -> Response {

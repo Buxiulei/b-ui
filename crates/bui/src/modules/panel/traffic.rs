@@ -9,7 +9,9 @@
 //! 4.1 起**直连与住宅走两条不同的控制面**（spec §5.1、§5.2）：
 //! - **直连一个字不变**：`hysteria-server` 的 trafficStats `:9999` 上打 `/traffic?clear=1`
 //!   + `/online`，踢人打 `/kick`（[`stats_ports`] 因此只剩这一个端口）。
-//! - **住宅**（自建 sing-box）计量走 v2ray_api 的 `QueryStats`、在线走 Clash API 的
+//! - **住宅**（官方 sing-box 1.14.3，无 v2ray_api）计量走 [`super::meter`] 的账本
+//!   （`daemon.StartedService` 的 `SubscribeConnections/SubscribeStatus` 喂出来的确证
+//!   CLOSED 终值，`query_user_deltas` 只是把账本 `drain` 一次）、在线走 Clash API 的
 //!   `/connections`，踢人 = 门切 `deny` + 逐条 `DELETE /connections/{id}`，未封用户再把门
 //!   切回他自己的槽出站（[`super::Hy2ResiApi`]、[`kick_residential`]）。这两条的返回键是
 //!   **凭据 name** 而不是 `user_id`，要经 [`resi_name_to_user`] 换键才能入账。
@@ -155,7 +157,12 @@ pub async fn kick_residential(
     let pending = shared.pending().await.clone();
     let want = super::gates::expected(
         publication.state(),
-        &users::blocked_set(publication.state(), &pending, host.now()),
+        &users::blocked_set(
+            publication.state(),
+            &pending,
+            host.now(),
+            shared.meter_lossy(),
+        ),
     );
     for t in targets {
         let Some(slot) = t
@@ -235,8 +242,9 @@ pub async fn sample_once(
             Err(e) => s.errors.push(format!("hysteria :{port} /online 失败：{e}")),
         }
     }
-    // 住宅：v2ray_api 的 `QueryStats`（`reset=true` ⇒ 拿到的就是增量）+ Clash API 的
-    // `/connections`（在线数 = 按 `auth_user=` 归组的连接条数）。两条的键都是凭据 name。
+    // 住宅：**计量账本**的增量（确证的 CLOSED 终值；流不在 / 有损由 `hy2resi` 那边
+    // 按 `Ledger::available` 判成 `Err`）+ Clash API 的 `/connections`（在线数 =
+    // 按 `auth_user=` 归组的连接条数）。两条的键都是凭据 name。
     match shared.hy2resi().query_user_deltas().await {
         Ok(m) => {
             for (name, d) in m {
@@ -245,7 +253,17 @@ pub async fn sample_once(
                 }
             }
         }
-        Err(e) => s.errors.push(format!("住宅 HY2 QueryStats 失败：{e}")),
+        Err(e) => {
+            // §5「不得静默」：`api/users/health` 的 errors 前端不取（审计核实的静默链），
+            // 所以这里必须同时落一条与账本告警同标记的日志 —— 哨兵按 METERING_MARKER +
+            // METERING_LOSS_TAG 认领成 hy2_resi_metering_lost 事件进 `bui incidents`。
+            tracing::warn!(
+                "{} {}：住宅 HY2 计量流失败：{e}",
+                super::meter::METERING_MARKER,
+                super::meter::METERING_LOSS_TAG
+            );
+            s.errors.push(format!("住宅 HY2 计量流失败：{e}"));
+        }
     }
     match shared.hy2resi().connections().await {
         Ok(conns) => {
@@ -469,7 +487,11 @@ pub async fn write_health_summary(ctx: &DaemonCtx, shared: &Shared) {
     let summary = {
         let state = ctx.store.read().await;
         let pending = shared.pending().await.clone();
-        let blocked = users::blocked_set(&state, &pending, now);
+        // 有损窗口里 `pending` 不参与判定（spec §5 用户层 fail-open）——这里与门位用
+        // 同一口径，`blocked` 才与核内实际门位是同一个数；`metering_lossy` 让这件事在
+        // 健康汇总里也看得见（不该有人对着一张口径不同的数猜）
+        let lossy = shared.meter_lossy();
+        let blocked = users::blocked_set(&state, &pending, now, lossy);
         let cache = shared.cache().await;
         let xray_synced = shared.applied().await.xray_users.len();
         serde_json::json!({
@@ -481,6 +503,7 @@ pub async fn write_health_summary(ctx: &DaemonCtx, shared: &Shared) {
             "month_key": month_key(now),
             "last_sample_at": cache.last_sample_at,
             "pending_users": pending.len(),
+            "metering_lossy": lossy,
             "sample_errors": cache.errors,
         })
     };

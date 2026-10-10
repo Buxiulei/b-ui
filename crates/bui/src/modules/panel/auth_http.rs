@@ -170,7 +170,7 @@ pub async fn refresh(ctx: &DaemonCtx, shared: &Shared, st: &AuthHttp) {
     let now = ctx.host.now();
     let pending = shared.pending().await.clone();
     let state = ctx.store.read().await;
-    let blocked = users::blocked_set(&state, &pending, now);
+    let blocked = users::blocked_set(&state, &pending, now, shared.meter_lossy());
     st.set_snapshot(Snapshot::from_state(&state, &blocked));
 }
 

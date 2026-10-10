@@ -352,10 +352,12 @@ async fn exercise() -> Result<()> {
         .status()
         .await?;
     ensure!(checked.success(), "stock rejected renderer configuration");
-    let api = Hy2ResiClient::with_apis(format!("127.0.0.1:{clash}"), format!("127.0.0.1:{v2ray}"));
-    let shared = Shared::new(Box::new(h.xray.clone()), Box::new(h.hy2.clone())).with_hy2resi(
-        Box::new(Hy2ResiClient::with_apis(api.clash_api(), api.v2ray_api())),
-    );
+    let api =
+        Hy2ResiClient::with_endpoints(format!("127.0.0.1:{clash}"), format!("127.0.0.1:{v2ray}"));
+    let shared =
+        Shared::new(Box::new(h.xray.clone()), Box::new(h.hy2.clone())).with_hy2resi(Box::new(
+            Hy2ResiClient::with_endpoints(api.clash_api(), api.grpc_api()),
+        ));
     let ctx = DaemonCtx {
         store: h.store.clone(),
         runtime: h.runtime.clone(),

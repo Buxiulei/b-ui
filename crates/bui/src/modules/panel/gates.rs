@@ -210,6 +210,11 @@ pub struct GateActivationPermit {
     _publication: crate::state::store::PublicationPermit,
     state: std::sync::Arc<State>,
     pending: BTreeMap<Uuid, super::TxRx>,
+    /// 建 permit 那一刻的计量账本口径（[`Shared::meter_lossy`]）：`validate_*` 重推导
+    /// 必须用**同一口径**，否则一次有损窗口的起止就会把每一张在途 permit 判成
+    /// 「授权变了」并按 fail-closed 把门关掉（回滚风暴）。有损状态的变化不靠这里兜，
+    /// 由下一轮 60 秒门位收敛（`converge` 现读）与用户同步重新裁决。
+    lossy: bool,
     manifest: GateManifest,
     projection: BTreeMap<String, String>,
     digest: String,
@@ -233,6 +238,7 @@ impl GateActivationPermit {
             &self.state,
             &self.pending,
             now,
+            self.lossy,
             &self.manifest,
             self.projection.keys(),
         );
@@ -257,6 +263,7 @@ impl GateActivationPermit {
             &self.state,
             &self.pending,
             now,
+            self.lossy,
             &self.manifest,
             self.projection.keys(),
         );
@@ -277,10 +284,11 @@ fn projection<'a>(
     state: &State,
     pending: &BTreeMap<Uuid, super::TxRx>,
     now: time::OffsetDateTime,
+    lossy: bool,
     manifest: &GateManifest,
     tags: impl Iterator<Item = &'a String>,
 ) -> BTreeMap<String, String> {
-    let want = expected(state, &users::blocked_set(state, pending, now));
+    let want = expected(state, &users::blocked_set(state, pending, now, lossy));
     tags.map(|tag| {
         let target = if manifest.gates.contains_key(tag) {
             tag.strip_prefix(&gate_tag(""))
@@ -356,7 +364,16 @@ pub async fn restore_and_verify(
         let pending = shared.pending().await.clone();
         let initial = shared.hy2resi().inventory().await?;
         manifest.validate(&initial)?;
-        let want = projection(&state, &pending, ctx.host.now(), manifest, initial.gates.keys());
+        // 一次判定基准只取一次：`want` / `final_want` / permit 的重推导必须是同一口径
+        let lossy = shared.meter_lossy();
+        let want = projection(
+            &state,
+            &pending,
+            ctx.host.now(),
+            lossy,
+            manifest,
+            initial.gates.keys(),
+        );
         // Close revoked/obsolete grants before opening any current grant.
         for deny in [true, false] {
             for (tag, target) in &want {
@@ -368,7 +385,14 @@ pub async fn restore_and_verify(
         let final_inventory = shared.hy2resi().inventory().await?;
         manifest.validate(&final_inventory)?;
         // Do not let extra gates appearing between reads escape the deny requirement.
-        let final_want = projection(&state, &pending, ctx.host.now(), manifest, final_inventory.gates.keys());
+        let final_want = projection(
+            &state,
+            &pending,
+            ctx.host.now(),
+            lossy,
+            manifest,
+            final_inventory.gates.keys(),
+        );
         if want != final_want {
             close_revoked(shared.hy2resi(), &want, &final_want).await?;
             anyhow::bail!("gate inventory or authorization changed before final readback; revoked gates closed");
@@ -388,7 +412,7 @@ pub async fn restore_and_verify(
         anyhow::ensure!(tokio::time::Instant::now() < deadline, "gate activation deadline exceeded");
         Ok(GateActivationPermit {
             _gate: gate, api: shared.hy2resi.clone(), _publication: publication,
-            state, pending, manifest: manifest.clone(), projection: final_want, digest, valid_until,
+            state, pending, lossy, manifest: manifest.clone(), projection: final_want, digest, valid_until,
         })
     }).await.map_err(|_| anyhow::anyhow!("gate activation deadline exceeded"))?
 }
@@ -417,7 +441,10 @@ pub async fn converge(ctx: &DaemonCtx, shared: &Shared, _blocked: &BTreeSet<Uuid
     let want = {
         let pending = shared.pending().await.clone();
         let s = publication.state();
-        expected(s, &users::blocked_set(s, &pending, ctx.host.now()))
+        expected(
+            s,
+            &users::blocked_set(s, &pending, ctx.host.now(), shared.meter_lossy()),
+        )
     };
     let mut out = GateOutcome::default();
     for (gate, now) in &live {
@@ -459,7 +486,12 @@ pub(super) async fn put_gate(
     let pending = shared.pending().await.clone();
     let want = expected(
         publication.state(),
-        &users::blocked_set(publication.state(), &pending, host.now()),
+        &users::blocked_set(
+            publication.state(),
+            &pending,
+            host.now(),
+            shared.meter_lossy(),
+        ),
     );
     let tag = if tag == DENY_TAG {
         DENY_TAG
@@ -486,7 +518,7 @@ pub async fn replay_after_restart(ctx: &DaemonCtx, shared: &Shared) -> GateOutco
     let pending = shared.pending().await.clone();
     let blocked = {
         let s = ctx.store.read().await;
-        users::blocked_set(&s, &pending, now)
+        users::blocked_set(&s, &pending, now, shared.meter_lossy())
     };
     let deadline = tokio::time::Instant::now() + REPLAY_RETRY_BUDGET;
     let mut delay = REPLAY_RETRY_FIRST;
@@ -515,7 +547,12 @@ pub async fn replay_after_restart(ctx: &DaemonCtx, shared: &Shared) -> GateOutco
                     let pending = shared.pending().await.clone();
                     let want = expected(
                         publication.state(),
-                        &users::blocked_set(publication.state(), &pending, ctx.host.now()),
+                        &users::blocked_set(
+                            publication.state(),
+                            &pending,
+                            ctx.host.now(),
+                            shared.meter_lossy(),
+                        ),
                     );
                     let live = shared.hy2resi().selected_all().await?;
                     for (gate, now) in live {
@@ -1136,7 +1173,7 @@ mod tests {
     #[test]
     fn expected_gates_map_live_users_to_their_slot_and_everyone_else_to_deny() {
         let s = three_slot_state_with_pool();
-        let blocked = users::blocked_set(&s, &Default::default(), t0());
+        let blocked = users::blocked_set(&s, &Default::default(), t0(), false);
         let e = expected(&s, &blocked);
         assert_eq!(e["r000"], "slot-1-out", "alice 粘在槽 1");
         assert_eq!(e["r001"], "slot-2-out", "bob 粘在槽 2");
@@ -1328,7 +1365,7 @@ mod tests {
         ]));
         let blocked = {
             let st = h.store.read().await;
-            users::blocked_set(&st, &Default::default(), t0())
+            users::blocked_set(&st, &Default::default(), t0(), false)
         };
         let out = users::sync_users(&ctx_of(&h), &h.shared, &blocked).await;
         assert!(out.errors.is_empty(), "{:?}", out.errors);

@@ -170,8 +170,16 @@ B-UI 现有池凭据正是 `{name}:{secret}`，但**渲染器现在写进 `passw
 **指标 A（主指标，唯一能发现静默丢流）**
 
 ```
-Δ_glob = SubscribeStatus 总量差分 − Σ(区间内 CLOSED 终值)
+R = ΔG − ΔB − ΔS
+    ΔG = SubscribeStatus 总量差分（区间首尾采样）
+    ΔB = 区间内**已入账**的字节（CLOSED 终值之和）
+    ΔS = 在册未关闭连接的 known 之和在该区间的变化
 ```
+
+> ⚠️ **本式修订过（2026-10-10，由实现批的对抗复审证伪了初版）**：初版写的是
+> `Δ_glob = ΔG − Σ(区间内 CLOSED 终值)`，**漏掉了 ΔS**——那会把「区间内仍在传输的连接」
+> 的字节整体算成缺口，使健康区间也报巨额缺口，与本节「健康基线实测 = 0」自相矛盾。
+> **必须减掉 ΔS 才能让基线落在 0。** 复现方式：任一健康区间代入初版公式，R ≠ 0。
 
 - **健康基线实测 = 0**（快消费者两轮 byte-exact；全局 325,888/1,188,352 == 账本值）
 - **故障实测 = 273,920/1,095,680**（占 84–92%）
@@ -239,9 +247,9 @@ hysteria 客户端自带的 `api.hy2.io:443` 版本探针**真实过代理并归
 |---|---|---|
 | 1 | 发布侧换官方：`kernels.lock` 两行改官方 1.14.3 tar.gz + 官方 sha；`kernel-versions.env` 轨道改 1.14.3、`SINGBOX_TAGS` 删；`build-singbox.sh` 与 `test-build-singbox.sh` 删；CI job 名与三处 skip-grep 自建支改 | ✅ **完成**（`51024f5`） |
 | 2 | **裁决计量替代来源与迁移期语义**（fail-open 少计 / fail-closed 拒连），据此拍板 `query_user_deltas`、`10086`、`HY2_RESI_V2RAY_API`、`proto-v2ray` 的去留 | ✅ **裁决已定**（§2/§3/§5，全部实测支撑）；**实现待第 7 步** |
-| 3 | 可见性：`serve.rs` 对账失败写 `RuntimeData.last_reconcile_error` 并映射 `/api/health` 与 `bui status` 的 degraded（**当前核实仍缺**——迁移期任何失败都是「机器不报错但状态是错的」） | ⬜ |
+| 3 | 可见性：**整轮对账中止**要可见（**当前核实仍缺**——迁移期任何失败都是「机器不报错但状态是错的」）。⚠️ 见 §4.3 的**设计修订**：不新增 `last_reconcile_error` 字段，改为「包装 `reconcile_from_ctx` + 复用 `last_reconcile`」**加**哨兵 `Sig::ReconcileFailed` | ⬜ 施工图已就绪 |
 | 4 | **原子核心**：删 `render/hy2_singbox.rs:185-191` 整个 `experimental.v2ray_api` 键（保留 `clash_api`；**必须删键，只删 stats 子对象无效**） | ⬜ 与内核换装同一发布 |
-| 5 | 断言同步（同提交）：`hy2_singbox.rs:362-368` 删三条+补反向守卫；`core_files.rs:1156-1160` 同步；`hysteria.rs:283-286` 端口表登记新口（不留 10086 幽灵） | ⬜ |
+| 5 | 断言同步（同提交）：`hy2_singbox.rs:362-368` 删三条+补反向守卫；`core_files.rs:1156-1160` 同步；`hysteria.rs:283-286` 端口表登记新口。**端口号裁决：保留 `10086`**，只改常量名（`HY2_RESI_V2RAY_API` → `HY2_RESI_API`）与全部标签（不留「v2ray_api」幽灵）。理由：回环内部 API，号无对外语义，保留号让端口表/夹具/测试只改文案不改值；说谎的责任落在名字上。**常量改名只许与渲染器同一次提交**（`hy2resi.rs:26-31` 已把这条写死） | ⬜ |
 | 6 | **测试改真跑**：`kernel_hy2_singbox.rs` 删 skip 门，让两用例对不含 `v2ray_api` 的产物跑官方 `sing-box check`（**CI 抓 skip 的 grep 已删，此用例现在是静默——整个切换期住宅配置形状无人验**） | ⬜ blocker |
 | 7 | 计量路径收口：`panel/hy2resi.rs:275,357` 删除或改接；`traffic.rs:240-248` Err 分支必须可见或整体删除；面板/文档承诺同步 | ⬜ 等 §3 |
 | 8 | 自检改写：`selfcheck.rs` 拆成「计量面／门位·在线面」两条判据，去掉 10086 白等 120s 与必然 FAIL | ⬜ |
@@ -252,7 +260,7 @@ hysteria 客户端自带的 `api.hy2.io:443` 版本探针**真实过代理并归
 | 13 | **发布纪律**：2–12 同一 release，不许拆包 | ⬜ |
 | 14 | **原子性自检（机制化闸门）**：内核来源与渲染器是否产出 `experimental.v2ray_api` 必须自洽 | ✅ **完成**（`51024f5`；`check-kernel-consistency.sh`，ci.yml 只告警 / release.yml 硬闸门。**真实 CI 里验证过会发告警**） |
 | 15 | **lock 检查的 fail-open 修复**：`pin-kernels.sh` 新增 `--warn`——只降级「漂移」，`lock 少行`／`核实不了` 仍旧退 1（原 `\|\| echo ::warning::` 把三类一起吞掉） | ✅ **完成**（`fd55363`；安全审查与对抗复审各自独立指出） |
-| 16 | **测试层的版本守卫要读 lock，不能写死**（🔴 **不做则「一直更新最新版」在实践上失效**，见 §4.2） | ⬜ **blocker** |
+| 16 | **测试层的版本守卫要读 lock，不能写死**（🔴 **不做则「一直更新最新版」在实践上失效**，见 §4.2） | ✅ **完成**（`ddd928c`）。四个文件改完；**换版证伪实验**（私有 mount namespace bind 换入版本列=1.14.99 的锁，真文件零改动）四守卫全部改口变红；坏锁四类（缺失/空/无行/缺列）全硬失败，无一处降级为 skip。遗留：`relay_generation.rs:527`（在 `src/`、自洽故不卡 bot）与 stock 那族（opt-in 手动夹具）并入第 4/5 批 |
 
 ### 4.2 为什么第 16 步是「一直更新最新版」的最后一道坎
 
@@ -303,6 +311,63 @@ scripts/tests/test-residential-stock-gates.sh:19          sing-box version 1.14.
 > | `scripts/ops/` 下留同名脚本 | 手动/演练可跑 | 给真机兜底（第 12 步）用 |
 >
 > 这样：迁移期 CI 保持有意义（只多一行告警），而**发布路径物理上无法在不一致状态下出包**。
+
+### 4.3 第 3 步的设计修订（Fable 2026-10-10 裁决，附只读侦察证据）
+
+**原文**写的是「写 `RuntimeData.last_reconcile_error` 并映射 `/api/health` 与 `bui status` 的 degraded」。
+侦察推翻了这条的两个前提：
+
+1. **前端不消费 `/api/health`**（确证：`web/app.js` 的 `api()` 会自拼 `/api` 前缀，全文只有
+   `/api/residential/health`；`web/index.html` 对 `degraded` 与 `/api/health` 零命中）。
+   于是新字段 = **准确但没人看**，正是本计划自己在计量审计里批过的那种病
+   （「唯一能读到它的端点前端从不请求」）。按 §5 立的「不得静默」标准，光加字段**不达标**。
+2. **真正静默的是「整轮中止」，不是 apply 逐项失败**。`reconcile_from_ctx`（`serve.rs:203-394`）
+   有 **5 条 Err 出口**（`:319` 的 `??`＝Facts/plan/内核下载；`:338` 发布被拒；`:351` `reconcile_once`；
+   `:371`/`:375` 两条回执缺失），**没有一条能走到 `:387`**（唯一的 runtime 写入点）。
+   ⇒ `last_reconcile` 停在**上一次成功的、几小时前的、干净的报告**上，`/api/health` 照报 `ok`。
+   （apply 内部的 `out.errors`/`verify_failures` 本来就进报告也参与 degraded，**不是盲区**。）
+
+**修订后的做法（两件，缺一不可）：**
+
+| 件 | 落点 | 为什么 |
+|---|---|---|
+| **① 包装 `reconcile_from_ctx`** | `serve.rs:203-393`（原函数体整体下移成私有 `reconcile_inner`，外层只留 wrapper） | 一处覆盖**全部 5 条出口**与全部 4 个生产调用点（`serve.rs:745`/`:775`/`:902`、`install.rs:1224`）。**不新增字段**：Err（`!dry_run`）时把一份只填 `at` + `errors` 的合成 `ReconcileReport` 写进 `last_reconcile`——`api/health.rs:66-69` 的 degraded 第三项**自动点亮**，`status.rs:388-393` 同源判据同步点亮，`format_status:92-105` 自动打出错误行，`HealthResponse` 形状（`status.rs:18-19`/`:290`、`api/mod.rs:331` 三处注释锁死的回归面）**一字不改** |
+| **② 哨兵 `Sig::ReconcileFailed`** | `signature.rs`（`Sig` + `ALL_SIGS` + `id()` + `action()`=`Alert` + `rule()` + 匹配器）、`run.rs` 分派、`system.rs` 处理 | 让它在**有人看的地方**主动出现：`bui incidents` + **面板系统状态卡**（`web/app.js:1485` 已在拉 `/incidents?limit=20`，`web/index.html:154` 有刷新按钮）。那两行 `tracing::error!("[启动]对账失败：{e}")`（`serve.rs:755`/`:777`）**本来就在 b-ui 自己的 journald 里**，哨兵也本来就盯着 `b-ui`（`sentinel/run.rs:21-25`），**只差签名**。冷却/去重/恢复语义全是现成的 `Rule` |
+
+**两条硬约束（侦察点名、必须遵守）：**
+
+- **只许写自己那一项。** `:387` 一次写 `restart_keys` / `drift` / `last_reconcile` 三个字段；失败路径
+  若照抄整行会把真实漂移与重启键擦成空（而漂移非空**本身也是 degraded 判据**，`api/health.rs:65`）。
+- **必须「下一轮成功即清空」。** `:387` 在成功轮无条件覆盖 `last_reconcile` ⇒ 清空是自然的；但**不许**
+  另加一个只在失败时写的字段（那就要自己发明「什么时候算恢复」）。教训见 `reconcile/drift.rs:466`、`modules/system.rs:524`。
+
+**已核过的兼容性**：`last_reconcile` 的活消费者只有 4 处，合成报告在每处都**更真**——`api/health.rs:67`（degraded ✅ 想要它亮）、
+`api/health.rs:80` / `status.rs:411`（响应体 ✅）、`api/system.rs:28`（`POST /api/reconcile` 回最近一份报告 ✅）、
+`status.rs:391`（degraded ✅）。其余是测试（`serve.rs:2364`、`api/mod.rs:331/335/383`、`runtime.rs:437/439`）。
+`is_clean()` 的 7 个使用点**全在测试里**，不受影响。
+
+**顺带纠正第 16 步的遗留条目**：`relay_generation.rs:527` 的 `"1.14.3"` 字面量**不在活的生产路径上**——
+`relay_generation` 只被 `render/relay/generation.rs` 引用，而后者自己在文件头写明「当前生产 renderer 尚未调用本模块」。
+所以它不阻塞周更 bot，也**不紧急**；但一旦 generation 式 relay 启用（内核已经是 1.14.4 时）它会让 lease 证据校验
+`EvidenceMismatch` ⇒ **并进第 4/5 批顺手绑 lock**，不单独开批。（stock 那族同理：sha 已换官方；`stock_gate_fixture.rs:426`
+的 `version=1.14.3` 只是 opt-in 手动夹具的一行打印。）
+
+### 4.4 新 API 面的三段决定性实测（Fable 2026-10-10，本机官方 1.14.3）
+
+派第 4/5 步之前先把形状钉死，避免子代理在「`type` 到底写什么」上猜：
+
+| 试验 | 命令 | 结果 |
+|---|---|---|
+| 形状正确性 | `sing-box check -c` 含 `services:[{"type":"api","listen":"127.0.0.1","listen_port":10086}]` | **rc=0** ✅ |
+| `type` 字面量 | 同上但 `"type":"daemon"`（proto 包名是 `daemon`，**类型串不是**） | `FATAL … unknown inbound type: daemon` ❌ |
+| 反向守卫有意义 | 把 `services` 改成未知顶层键 | `FATAL … unknown field "services_typo"` ✅ ⇒ 官方内核**不认** `experimental.v2ray_api`，第 6 步的豁免门一旦拆掉就是硬红，不是形式主义 |
+| 运行时真的监听 | `sing-box run -c`（回环口，按 PID 清理） | 日志 `service/api[0]: tcp server started at 127.0.0.1:10086`；`ss` 确认 LISTEN ✅ |
+
+**两条推论**（改变了第 8 步的规模）：
+
+1. **保留 10086 的裁决有了实测支撑**——新 `services` 段确实会绑这个口。
+2. 切换之后 `wait_ready`（`selfcheck.rs:187`）要求的 10086 **照样在听** ⇒ 原本「官方内核不认 v2ray_api ⇒ 10086 永不监听 ⇒ 白等 120s 再 FAIL」那条路**自行消失**。
+   第 8 步因此从「拆判据 + 消白等 + 改断言」缩成「拆两行 + 改文案 + 重写 `:1555` 那条已失效的『最多睡 120s』断言」。
 
 ---
 

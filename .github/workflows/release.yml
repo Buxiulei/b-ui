@@ -74,6 +74,8 @@ jobs:
         run: bash scripts/release/check-release-gate.sh "$TAG"
       - name: 内核来源与渲染器必须自洽（硬闸门：判红即中止发布）
         run: bash scripts/release/check-kernel-consistency.sh
+      - name: vendored proto 与内核锁必须逐字节一致（硬闸门：判红即中止发布）
+        run: bash scripts/release/check-vendored-proto.sh
       - name: 内核 lock 是否还贴着轨道（漂移只告警；lock 坏了会中止发版）
         run: |
           # `--warn` 只降级「漂移」：本次发布用的是 lock 里的版本，产物不受影响，要跟上游就

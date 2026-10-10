@@ -1,6 +1,7 @@
 //! 测试用的内存 fake（`#[cfg(test)]`）：把 gRPC 与 hysteria HTTP 全挡在进程内。
 
 use super::hy2resi::Hy2ResiConn;
+use super::meter::{self, ClosedConn, Event, EventKind, Frame, Ledger};
 use super::{Hy2Api, Hy2ResiApi, TxRx, XrayApi};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -242,8 +243,6 @@ pub struct FakeHy2ResiInner {
     /// `"select:<selector>:<tag>"` / `"ready"`
     /// （记法是契约：T11 的用例按这些字面量数调用次数）
     pub calls: Vec<String>,
-    /// `query_user_deltas` 的下一次返回值（返回后清空，对应 `reset=true` 语义）
-    pub deltas: BTreeMap<String, TxRx>,
     /// `GET /connections` 的返回值
     pub conns: Vec<Hy2ResiConn>,
     /// 门位现状：selector tag → 当前成员。`select` 成功会改这里，`selected_all` 从这里读
@@ -265,13 +264,24 @@ pub struct FakeHy2ResiInner {
     /// 下一次**任何**调用失败一次（命中即清空），错误串取这里 ——
     /// T11 的 fail-closed 测试要的就是「这一次切门没成」。
     pub fail_next: Option<String>,
+    /// 计量账本：**就是生产那本**（[`meter::Ledger`]）。假流不自己算字节 ——
+    /// [`FakeHy2Resi::set_deltas`] 按「已关闭连接的终值」灌进去、`query_user_deltas` 用
+    /// `drain` 取出来，于是「缺口 / 标损 / 流断」在测试里走的是与生产逐字相同的代码
+    /// （审计点名：让不存在的面「假装成功」的 fake 是静默放大器）。
+    pub ledger: Arc<Ledger>,
+    /// 假内核的全局字节计数器（指标 A 的 G）。`set_deltas` 入账多少就跟着走多少
+    /// （健康区间 ⇒ R = 0），[`FakeHy2Resi::feed_gap`] 单独给它加缺口。
+    pub global: TxRx,
+    /// 播种连接的 id 序号（去重表按 id 幂等，每条播种必须换新 id）
+    pub conn_seq: u64,
+    /// 实例代际（`GetStartedAt` 的替身，[`FakeHy2Resi::resume_stream`] 换代）
+    pub generation: i64,
 }
 
 impl Default for FakeHy2ResiInner {
     fn default() -> Self {
-        Self {
+        let inner = Self {
             calls: Vec::new(),
-            deltas: BTreeMap::new(),
             conns: Vec::new(),
             selected: (0..32)
                 .map(|n| (format!("gate-r{n:03}"), "deny".into()))
@@ -301,7 +311,16 @@ impl Default for FakeHy2ResiInner {
             select_delay: std::time::Duration::ZERO,
             fail_on: BTreeSet::new(),
             fail_next: None,
-        }
+            ledger: Ledger::new().into_arc(),
+            global: TxRx::default(),
+            conn_seq: 0,
+            generation: 1,
+        };
+        // 假流默认**已建立**（与 `ready: true` 同款「默认可用」）：喂一帧空帧，让账本
+        // 「收过帧」⇒ `available` 为真、`query_user_deltas` 回空增量而不是 `Err`。
+        // 把流按断只有 [`FakeHy2Resi::break_stream`] 一个入口。
+        inner.ledger.apply(Frame::default(), meter::now_ms());
+        inner
     }
 }
 
@@ -326,8 +345,97 @@ impl FakeHy2Resi {
         self.0.lock().unwrap().calls.clear();
     }
 
+    /// 假流背后的真账本（与 `Shared::meter()` 是同一本）。
+    pub fn ledger(&self) -> Arc<Ledger> {
+        self.0.lock().unwrap().ledger.clone()
+    }
+
+    /// 下一轮 `query_user_deltas` 的增量：把每份 `(name, 字节)` 按**一条已关闭连接的终值**
+    /// 灌进真账本（与生产同一条路）—— 所以「取走即清空」由 [`Ledger::drain`] 负责，
+    /// 这里不存返回值。假内核的全局计数器同步走同样的字节：这是一段**健康区间**（R = 0）。
+    /// 要做缺口用 [`Self::feed_gap`]，要按断流用 [`Self::break_stream`]。
     pub fn set_deltas(&self, deltas: BTreeMap<String, TxRx>) {
-        self.0.lock().unwrap().deltas = deltas;
+        let (ledger, now, seq, global) = {
+            let mut i = self.0.lock().unwrap();
+            let mut sum = TxRx::default();
+            for d in deltas.values() {
+                sum.add(*d);
+            }
+            i.global.add(sum);
+            let seq = i.conn_seq;
+            i.conn_seq += deltas.len() as u64;
+            (i.ledger.clone(), meter::now_ms(), seq, i.global)
+        };
+        let events = deltas
+            .into_iter()
+            .enumerate()
+            .map(|(n, (name, total))| Event {
+                id: format!("fake-c{}", seq + n as u64),
+                kind: EventKind::Closed {
+                    conn: Some(ClosedConn {
+                        user: Some(name),
+                        destination: Some("example.com:443".into()),
+                        network: Some("tcp".into()),
+                        total,
+                        created_at_ms: now.saturating_sub(1),
+                        closed_at_ms: now,
+                    }),
+                },
+            })
+            .collect();
+        ledger.apply(
+            Frame {
+                reset: false,
+                global: Some(global),
+                connections_in: None,
+                events,
+            },
+            now,
+        );
+    }
+
+    /// 造一个**缺口**：假内核的全局计数器比账本多走 `bytes`（指标 A 的
+    /// `R = ΔG − ΔB − ΔS`）。`bytes` 过 [`meter::ALERT_BYTES`] 或占区间比例 ≥
+    /// [`meter::ALERT_PCT`] 时账本判「后缀丢失」⇒ `lossy_at` / `Shared::meter_lossy()`
+    /// 为真（自动裁决暂停的输入）。
+    ///
+    /// **区间在 `drain` 处结算**：先 `set_deltas` 灌过至少一个区间当基准，再喂缺口，
+    /// 然后跑一次采样（`tick`）或 `query_user_deltas` —— 判损发生在那一刻。
+    pub fn feed_gap(&self, bytes: i64) {
+        let (ledger, now, global) = {
+            let mut i = self.0.lock().unwrap();
+            i.global.add(TxRx {
+                tx: bytes.max(0) as u64,
+                rx: 0,
+            });
+            (i.ledger.clone(), meter::now_ms(), i.global)
+        };
+        ledger.apply(
+            Frame {
+                reset: false,
+                global: Some(global),
+                connections_in: None,
+                events: Vec::new(),
+            },
+            now,
+        );
+    }
+
+    /// **流断**（与生产同路：一条 `Ledger::note_interruption`）⇒ `available` 假、
+    /// `query_user_deltas` 变 `Err`（不许把「流没了」报成「这轮没有字节」）。
+    pub fn break_stream(&self, reason: &str) {
+        self.ledger().note_interruption(meter::now_ms(), reason);
+    }
+
+    /// 重连：换一代际并清中断标记（生产是 `meter_session` 重建后 `note_session_start`）。
+    pub fn resume_stream(&self) {
+        let generation = {
+            let mut i = self.0.lock().unwrap();
+            i.generation += 1;
+            i.generation
+        };
+        self.ledger()
+            .note_session_start(generation, meter::now_ms());
     }
 
     /// `(id, rule)` 对 → 连接表；`rule` 就是 sing-box 那个
@@ -382,9 +490,31 @@ impl FakeHy2Resi {
 
 #[async_trait::async_trait]
 impl Hy2ResiApi for FakeHy2Resi {
+    /// 与生产逐字同路：账本可用 ⇒ `drain`（取走即清空），不可用 ⇒ `Err`。
+    /// 「没有流量」与「流没了」必须分得开 —— 后者是本项审计核实的静默失效链之一。
     async fn query_user_deltas(&self) -> anyhow::Result<BTreeMap<String, TxRx>> {
         self.record("query".into())?;
-        Ok(std::mem::take(&mut self.0.lock().unwrap().deltas))
+        let ledger = self.ledger();
+        let now = meter::now_ms();
+        if !ledger.available(now) {
+            anyhow::bail!(super::hy2resi::STREAM_DOWN_MSG)
+        }
+        Ok(ledger.drain(now))
+    }
+
+    fn meter_ledger(&self) -> Arc<Ledger> {
+        self.ledger()
+    }
+
+    /// 假流没有真的流可驱动：建立后立刻 `Ok` 收尾（真流的 `Ok` 是流结束），
+    /// `metering_loop` 会按退避重建 —— 测试若在意，看 `calls` 里的 `meter_session`。
+    async fn meter_session(&self) -> anyhow::Result<()> {
+        self.record("meter_session".into())?;
+        let ledger = self.ledger();
+        if !ledger.available(meter::now_ms()) {
+            anyhow::bail!("fake 住宅计量流不在：先 resume_stream（或 set_deltas）再建会话")
+        }
+        Ok(())
     }
 
     async fn connections(&self) -> anyhow::Result<Vec<Hy2ResiConn>> {
@@ -688,5 +818,54 @@ mod tests {
             None,
             "失败的切门不许留下痕迹"
         );
+    }
+
+    /// 假流必须能表达**缺口**与**流断**（审计点名：让不存在的面「假装成功」的 fake
+    /// 是静默放大器）。两件事都经真账本、真公式，不是返回值上的旗子：
+    /// 缺口由指标 A 判损，流断由 `available` 把「空增量」变成 `Err`。
+    #[tokio::test]
+    async fn fake_hy2resi_expresses_gaps_and_stream_breaks_through_the_real_ledger() {
+        let r = FakeHy2Resi::new();
+        assert!(
+            r.query_user_deltas().await.is_ok(),
+            "默认流是活的：空增量可以，`Err` 不行"
+        );
+
+        // 缺口：先一个健康区间当基准（R = 0），再让全局量多走 1 MiB
+        r.set_deltas(BTreeMap::from([(
+            "r000".to_string(),
+            TxRx { tx: 10, rx: 20 },
+        )]));
+        assert_eq!(
+            r.query_user_deltas().await.unwrap()["r000"],
+            TxRx { tx: 10, rx: 20 }
+        );
+        r.feed_gap(meter::ALERT_BYTES);
+        assert!(
+            r.query_user_deltas().await.unwrap().is_empty(),
+            "缺口不进任何人的账（不折算到人）"
+        );
+        assert!(
+            r.ledger().lossy_at(meter::now_ms()),
+            "缺口越线 ⇒ 该窗口标损"
+        );
+        assert!(
+            r.ledger()
+                .recent_alerts()
+                .iter()
+                .any(|a| a.lossy && a.text.contains("后缀丢失")),
+            "{:?}",
+            r.ledger().recent_alerts()
+        );
+
+        // 流断：`query_user_deltas` 必须 Err，且错误串认得出是「流不在」
+        r.break_stream("fake 拔线");
+        let e = r.query_user_deltas().await.unwrap_err().to_string();
+        assert!(e.contains("计量流不在"), "{e}");
+        assert!(!r.ledger().available(meter::now_ms()));
+
+        // 重连（换代际）：又可用
+        r.resume_stream();
+        assert!(r.query_user_deltas().await.is_ok());
     }
 }

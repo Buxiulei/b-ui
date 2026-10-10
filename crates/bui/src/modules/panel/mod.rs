@@ -17,6 +17,10 @@ pub mod auth_http;
 pub mod gates;
 pub mod hy2;
 pub mod hy2resi;
+// 计量账本：账本规则 1–11 与指标 A/B/C 在 meter.rs 里自证；生产接线由
+// `Shared::meter()` / `Shared::meter_lossy()`、`PanelModule::spawn` 的第 5 个句柄
+// 与哨兵 `Sig::Hy2ResiMeteringLost` 三处构成。
+pub mod meter;
 pub mod packages;
 pub mod snapshot;
 pub mod traffic;
@@ -146,13 +150,25 @@ pub trait Hy2Api: Send + Sync {
     async fn kick(&self, port: u16, ids: &[String]) -> anyhow::Result<()>;
 }
 
-/// 住宅 HY2（sing-box）的控制面：计量走 v2ray_api 的 gRPC，在线 / 踢人 / 门位走 Clash API
+/// 住宅 HY2（sing-box）的控制面：计量走 `daemon.StartedService` 的 gRPC 流
+/// （官方 sing-box 不含 `with_v2ray_api`，`StatsService` 在它上面不存在），
+/// 在线 / 踢人 / 门位走 Clash API
 /// （spec §5.1、§5.2）。生产实现是 [`hy2resi::Hy2ResiClient`]，测试注入
 /// `fakes::FakeHy2Resi`（见 [`Shared::with_hy2resi`]）。
 #[async_trait::async_trait]
 pub trait Hy2ResiApi: Send + Sync {
-    /// `QueryStats(patterns=["user>>>"], reset=true)`：凭据 name → 本轮增量
+    /// 「排空自上次调用以来已确证的凭据增量」（**签名冻结**：键 = 服务端 `users[].name`）。
+    ///
+    /// 实现已从 `QueryStats(reset=true)` 换成 [`meter::Ledger::drain`]（换成流驱动账本的
+    /// 理由见 [`hy2resi`] 的模块文档）；**流不可用时必须是 `Err`** —— 拿空表冒充
+    /// 「这轮没有字节」正是审计核实的三条静默失效链之一。
     async fn query_user_deltas(&self) -> anyhow::Result<BTreeMap<String, TxRx>>;
+    /// 计量账本。必须与 `query_user_deltas` 是**同一个**账本（`Shared::meter()` 的口径）。
+    fn meter_ledger(&self) -> std::sync::Arc<meter::Ledger>;
+    /// 驱动一段计量会话：`note_session_start` + 两条流逐帧 [`meter::Ledger::apply`]，
+    /// 直到流结束 / 失败 / 要求重订阅。`Ok` = 正常收尾（[`meter::metering_loop`] 仍会退避重连），
+    /// `Err` = 异常收场（由 `metering_loop` 记成中断，指标 B/C 都从那里长出来）。
+    async fn meter_session(&self) -> anyhow::Result<()>;
     /// `GET /connections` → 每条的 (id, rule)；在线数按 rule 里的 `auth_user=<name>` 归组
     /// （`metadata` 里**没有** user 字段）
     async fn connections(&self) -> anyhow::Result<Vec<hy2resi::Hy2ResiConn>>;
@@ -250,6 +266,23 @@ impl Shared {
 
     pub fn hy2resi(&self) -> &dyn Hy2ResiApi {
         self.hy2resi.as_ref()
+    }
+
+    /// 计量账本（与 `hy2resi().query_user_deltas()` 读的是同一个 [`meter::Ledger`]）。
+    pub fn meter(&self) -> Arc<meter::Ledger> {
+        self.hy2resi.meter_ledger()
+    }
+
+    /// 住宅计量此刻在有损窗口里吗 —— 用户层 fail-open / 系统层 fail-closed 的判据
+    /// （spec §5.1：只按确证字节计费，不因账目不确定封人；`users::blocked_set` 与
+    /// `traffic.rs` 的中断语义都从这里取）。
+    pub fn meter_lossy(&self) -> bool {
+        self.meter().lossy_at(meter::now_ms())
+    }
+
+    /// 把住宅控制面整个搬走一份：`metering_loop` 的会话闭包要 `'static`，`&dyn` 借不进去。
+    pub fn hy2resi_arc(&self) -> Arc<dyn Hy2ResiApi> {
+        self.hy2resi.clone()
     }
 
     pub async fn cache(&self) -> tokio::sync::RwLockReadGuard<'_, SampleCache> {
@@ -350,13 +383,20 @@ impl Module for PanelModule {
             .merge(packages::public_routes(self.shared.clone()))
     }
 
-    /// 三个后台任务，顺序固定：①10 秒采样 ②用户同步反应器（事件驱动 + 60 秒）③每日包缓存。
+    /// 五个后台任务，顺序固定：①10 秒采样 ②用户同步反应器（事件驱动 + 60 秒）
+    /// ③住宅门位重放（总线事件驱动）④每日包缓存 ⑤住宅计量（[`meter::metering_loop`]）。
     fn spawn(&self, ctx: DaemonCtx) -> Vec<tokio::task::JoinHandle<()>> {
         self.shared.set_paths(&ctx.paths);
         // **先 subscribe 再 spawn**：broadcast 丢弃「发送时还没有订阅者」的事件，
         // 若让 `gates::replay_loop` 自己 subscribe，紧随 spawn 的第一次对账重启就可能漏掉
         // （口径同 `residential::mod` 里那条 relay 重放）。
         let rx = ctx.bus.subscribe();
+        // 会话闭包必须 `'static`：把客户端的 `Arc` 搬进闭包，每次调用再克隆一份给 future
+        let resi = self.shared.hy2resi_arc();
+        let session = move || {
+            let resi = resi.clone();
+            async move { resi.meter_session().await }
+        };
         vec![
             tokio::spawn(traffic::sampling_loop(ctx.clone(), self.shared.clone())),
             tokio::spawn(users::sync_loop(ctx.clone(), self.shared.clone())),
@@ -367,6 +407,7 @@ impl Module for PanelModule {
                 self.shared.clone(),
                 self.fetcher.clone(),
             )),
+            tokio::spawn(meter::metering_loop(self.shared.meter(), session)),
         ]
     }
 }
@@ -673,7 +714,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_starts_four_tasks_and_hands_the_paths_to_shared() {
+    async fn spawn_starts_five_tasks_and_hands_the_paths_to_shared() {
         let h = testsupport::harness().await;
         let s = Shared::new(
             Box::new(super::fakes::FakeXray::new()),
@@ -712,9 +753,13 @@ mod tests {
             paths: h.paths.clone(),
         };
         let handles = m.spawn(ctx);
-        assert_eq!(handles.len(), 4, "采样 / 用户同步 / 门位重放 / 包缓存");
+        assert_eq!(
+            handles.len(),
+            5,
+            "采样 / 用户同步 / 门位重放 / 包缓存 / 住宅计量"
+        );
         assert_eq!(m.shared().paths().base_dir, h.paths.base_dir);
-        // 让第一轮跑完再收摊，确认三个任务都没有立刻 panic
+        // 让第一轮跑完再收摊，确认五个任务都没有立刻 panic
         for _ in 0..200 {
             if fetcher.urls().len() == want.len() {
                 break;
