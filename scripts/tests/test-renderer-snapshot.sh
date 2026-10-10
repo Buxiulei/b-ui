@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 # Pure offline producer/Plan adapter. Only directory paths appear in argv, never credentials.
 set -euo pipefail
+# 这是**手动 runner**（离线快照要一份私有输入目录）。`run-all.sh` 按 `test-*.sh` 通配无参调用本文件，
+# 那种情况下按「缺前置 ⇒ skip」处理，不能算失败——否则 CI 的 lint job 恒红。
+# 真给了参数却是 1 个（用法错误）仍旧退 2，不带参数的手动调用也能用下面的 usage 自己拼。
+if [[ $# == 0 ]]; then
+  printf '%s\n' 'skipped: 手动 runner，需要 INPUT_DIRECTORY 与 EMPTY_OUTPUT_DIRECTORY（usage: test-renderer-snapshot.sh INPUT_DIRECTORY EMPTY_OUTPUT_DIRECTORY）'
+  exit 0
+fi
 [[ $# == 2 ]] || { printf '%s\n' 'usage: test-renderer-snapshot.sh INPUT_DIRECTORY EMPTY_OUTPUT_DIRECTORY' >&2; exit 2; }
 input_dir=$1
 output_dir=$2

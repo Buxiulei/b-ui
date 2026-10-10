@@ -17,7 +17,7 @@ use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-const STOCK_SHA256: &str = "1a60ac17d93042c5a12410cfe83472ddee5084131dfae7a9b9806926ffb84447";
+const STOCK_SHA256: &str = "299f9f6080d9c43504714ddddae6aa9b853d430ccfc816c456a73613b5455689";
 
 struct Kernel(Child);
 impl Kernel {
@@ -190,7 +190,7 @@ async fn wait_api(api: &Hy2ResiClient) -> Result<()> {
     .await
     .context("stock API readiness deadline")?;
     ensure!(
-        api.version().await? == "sing-box 1.14.2",
+        api.version().await? == "sing-box 1.14.3",
         "stock API version mismatch"
     );
     Ok(())
@@ -421,6 +421,6 @@ async fn exercise() -> Result<()> {
         probe(&binary, h.dir.path(), hy2_port, credential, marker).await?;
     }
     server.stop().await?;
-    println!("stock_gate_fixture version=1.14.2 sha256={STOCK_SHA256} gates=5 active=2 denied=3 restart_new_requests=verified");
+    println!("stock_gate_fixture version=1.14.3 sha256={STOCK_SHA256} gates=5 active=2 denied=3 restart_new_requests=verified");
     Ok(())
 }

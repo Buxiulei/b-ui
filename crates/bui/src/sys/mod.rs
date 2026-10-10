@@ -55,8 +55,8 @@ pub enum Proto {
 /// 一次「先写临时文件、校验过再原子提升为目标路径」的写入（由 [`Host::stage_file`] 开出来，
 /// 内容用 [`std::io::Write`] 边算边喂）。
 ///
-/// **为什么存在**：下载一个内核二进制是**单笔约 81 MB**（sing-box，自建带 `with_v2ray_api`
-/// 的更大），四个内核合计约 190 MB，而 `b-ui.service` 的 `MemoryMax=200M` 是**硬上限**
+/// **为什么存在**：下载一个内核二进制是**单笔约 81 MB**（sing-box），四个内核合计约 190 MB，
+/// 而 `b-ui.service` 的 `MemoryMax=200M` 是**硬上限**
 /// （`modules/units.rs`）—— 把整个响应体读成 `Vec<u8>` 再 `write_file` 就是「常驻一份 +
 /// 写盘一份」，安装/升级期间 systemd 会把守护进程杀在下载半路。所以下载路径一律
 /// [`crate::kernels::Fetcher::download_to`] + 本 trait：峰值只有 64 KiB 缓冲。

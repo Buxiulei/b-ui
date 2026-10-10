@@ -18,7 +18,7 @@ def verify(kind, log, input_dir=None, output_dir=None):
             or sum(line.startswith("test result:") for line in lines) != 1):
         raise ValueError("exactly one passing fixture must execute")
     if kind == "stock":
-        marker = "stock_gate_fixture version=1.14.2 sha256=1a60ac17d93042c5a12410cfe83472ddee5084131dfae7a9b9806926ffb84447 gates=5 active=2 denied=3 restart_new_requests=verified"
+        marker = "stock_gate_fixture version=1.14.3 sha256=299f9f6080d9c43504714ddddae6aa9b853d430ccfc816c456a73613b5455689 gates=5 active=2 denied=3 restart_new_requests=verified"
         if lines.count(marker) != 1 or sum(line.startswith("stock_gate_fixture ") for line in lines) != 1:
             raise ValueError("missing unique stock acceptance marker")
         return

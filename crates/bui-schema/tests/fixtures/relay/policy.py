@@ -260,7 +260,7 @@ def udp_session(kernel, slot, fake, first_host, resolved=True):
 def main():
     data, binary = json.load(sys.stdin), sys.argv[1]
     version = subprocess.check_output([binary, "version"], text=True).splitlines()[0]
-    assert version == "sing-box version 1.14.2", f"policy regression requires sing-box 1.14.2, got {version}"
+    assert version == "sing-box version 1.14.3", f"policy regression requires sing-box 1.14.3, got {version}"
     direct = Fake("DIRECT", port=data["target_port"])
     a, b, http_a = Fake("A", "socks"), Fake("B", "socks"), Fake("HTTP-A", "http")
     direct_socks = Fake("DIRECT", "socks")

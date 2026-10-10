@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 演练脚本：成功路径退 0；订阅在升级后漂移时退 1。全 stub，零网络。
 # 4.1 追加（spec §9.1）：缺 `nft` 退 2、升级相位的 nft 表与 `:40000` 断言、4.0.x 槽位实例
-# 「一个不剩」、自建 sing-box 的两道闸门（计划那一行按执行二进制的代次分档）、回滚相位
+# 「一个不剩」、sing-box 计划那一行的闸门（按执行二进制的代次分档）、回滚相位
 # 「表必须消失 + 按槽端口逐个在听 + 每槽单元 active」。nft / ss / sleep 一律 stub。
 set -uo pipefail
 LC_ALL=C
@@ -37,15 +37,13 @@ cat > "$WORK/bin/bui" <<'STUB'
 #!/usr/bin/env bash
 printf 'bui %s\n' "$*" >> "$BUI_LOG"
 kernels() { printf 'bui hysteria xray caddy\n'; }
-# 四个内核用纯文本占位；sing-box 是可执行桩——它 `version` 的 Tags 行就是演练那道
-# with_v2ray_api 闸门读的东西（只有自建那一份带）
-write_kernels() {  # $1 = v1（4.0.x，官方归档）| v2（4.1，自建）
-  local b tags="with_quic,with_utls"
+# 四个内核用纯文本占位；sing-box 是可执行桩（升级计划与代次判据读的是它那一行）
+write_kernels() {  # $1 = v1（4.0.x）| v2（4.1）
+  local b
   for b in $(kernels); do printf 'bin-%s-%s\n' "$b" "$1" > "$BASEDIR/bin/$b"; done
-  [[ "$1" == v2 && "${FAKE_SINGBOX_NO_V2RAY_API:-0}" != "1" ]] && tags="$tags,with_v2ray_api"
   cat > "$BASEDIR/bin/sing-box" <<EOF
 #!/usr/bin/env bash
-printf 'sing-box version 1.14.1 ($1)\nTags: $tags\n'
+printf 'sing-box version 1.14.1 ($1)\nTags: with_quic,with_utls\n'
 EOF
   chmod 755 "$BASEDIR/bin/sing-box"
   return 0
@@ -131,8 +129,8 @@ case "${1:-}" in
       if [[ "${FAKE_UPGRADE_DROPS_TOKEN:-0}" == "1" ]]; then
         printf '{"users":[{"username":"alice"},{"username":"bob"}]}\n' > "$BASEDIR/state.json"
       fi
-      # `bui upgrade` 先打印升级计划再动手（commands/upgrade.rs::format_plan）；自建 sing-box
-      # 与官方归档同打 1.14.1，所以它那一行的文案是「同版本的新构建」
+      # `bui upgrade` 先打印升级计划再动手（commands/upgrade.rs::format_plan）；同版本号
+      # 可以是另一份构建，所以它那一行的文案是「同版本的新构建」
       printf 'bui          %s → %s\n' "$(cat "$VERFILE.prev")" "$(cat "$VERFILE")"
       # FAKE_SINGBOX_NOT_PLANNED=1：只比版本号的旧判据 ⇒ 计划里根本没有 sing-box 那一行
       [[ "${FAKE_SINGBOX_NOT_PLANNED:-0}" == "1" ]] ||
@@ -296,7 +294,7 @@ printf 'State Recv-Q Send-Q Local-Address:Port Peer-Address:Port\n'
 cat "$NFT_STATE/listen" 2>/dev/null
 exit 0
 STUB
-# sleep stub：演练轮询等对账收敛，测试不真等（口径同 test-build-singbox.sh）。它被 wait_settle
+# sleep stub：演练轮询等对账收敛，测试不真等。它被 wait_settle
 # 每轮调一次，所以顺手当 FAKE_SLOW_SETTLE 的时钟：倒数到 0 就执行 bui 桩留下的翻面动作
 cat > "$WORK/bin/sleep" <<'STUB'
 #!/usr/bin/env bash
@@ -435,12 +433,11 @@ assert_eq "2" "$(csv after-rollback count:resi-yaml "$WORK/ok/drill.csv")" "回�
 assert_eq "missing" "$(csv before sha:hy2-residential.json "$WORK/ok/drill.csv")" "4.0.x 上没有 hy2-residential.json"
 assert_eq "1" "$([[ "$(csv after-upgrade sha:hy2-residential.json "$WORK/ok/drill.csv")" != missing ]] && echo 1 || echo 0)" \
     "升级后 hy2-residential.json 在盘上"
-# 自建 sing-box 的两道闸门（Global Constraints P-A：同版本号装不上 ⇒ 住宅永久崩溃循环）。
-# 4.0.x → 4.1 这一跳由旧二进制执行，计划里那一行判不得——只记 note，Tags 才是硬判据
+# sing-box 那一行的闸门（Global Constraints P-A：内核身份是版本号 + 资产 sha256）。
+# 4.0.x → 4.1 这一跳由旧二进制执行，计划里那一行判不得——只记 note
 assert_contains "sing-box     1.14.1（同版本的新构建）" "$(cat "$WORK/ok/upgrade.out")" "升级计划单独留了一份"
 assert_contains "升级由旧二进制（4.0.0）执行" "$out" "4.0.x 执行升级时计划那一行只记 note"
 assert_not_contains "升级计划里没有 sing-box" "$out" "健康的 4.0.x → 4.1 不会被判计划缺 sing-box"
-assert_contains "with_v2ray_api" "$out" "核过装上的 sing-box 带 with_v2ray_api"
 
 # —— 缺 nft：4.0.1→4.1 那一跳唯一的机器闸门（bui upgrade 由旧二进制执行，进程内拦不住）——
 # PATH 里摘掉 nft 的 stub 与真 nft 所在目录，其余 stub 与系统工具一个不少
@@ -516,13 +513,6 @@ out=$(FAKE_SINGBOX_NOT_PLANNED=1 run_to 4.10.1 "$WORK/nosbplan410" 2>&1); rc=$?
 assert_eq "0" "$rc" "4.10.0 不被当成 4.1.x"
 assert_contains "升级由旧二进制（4.10.0）执行" "$out" "4.10.x 走的是「旧二进制」那一档"
 assert_not_contains "升级计划里没有 sing-box" "$out" "不拿 4.10.x 当 4.1.x 判计划缺 sing-box"
-
-# —— 装上的 sing-box 没有 with_v2ray_api ⇒ hy2-residential.json 每轮 check 必 FATAL ——
-reset_env
-out=$(FAKE_SINGBOX_NO_V2RAY_API=1 run "$WORK/nov2ray" 2>&1); rc=$?
-assert_eq "1" "$rc" "sing-box 缺 with_v2ray_api 退 1"
-assert_contains "没有 with_v2ray_api" "$out" "点名 Tags 不达标"
-assert_contains "first_failure=upgrade-singbox-tags" "$(cat "$WORK/nov2ray/DONE")" "DONE 记 upgrade-singbox-tags"
 
 # —— 升级后旧住宅 yaml 还在、新 json 没落（配置转换没发生）——
 reset_env

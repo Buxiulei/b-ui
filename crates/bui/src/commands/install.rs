@@ -423,7 +423,7 @@ fn fetch_and_install_kernels(
                 continue;
             }
         };
-        // 同版本异 sha 也要装：自建 sing-box 与官方归档同版本号（`kernel_build_differs`）
+        // 同版本异 sha 也要装：同一个版本号可以是另一份构建（`kernel_build_differs`）
         if !crate::kernels::kernel_build_differs(
             host,
             &paths.bin_dir,
@@ -1108,7 +1108,7 @@ async fn install_owned(
         if manifest
             .as_ref()
             .and_then(|m| m.kernels.get("sing_box"))
-            .is_some_and(|v| v.trim_start_matches('v') == "1.14.2")
+            .is_some_and(|v| v.trim_start_matches('v') == "1.14.3")
         {
             missing.retain(|name| *name != "sing-box");
         }
@@ -1445,7 +1445,7 @@ mod tests {
         let asset = |n: &str| serde_json::json!({"url": format!("https://x/{n}"), "sha256": sum});
         let manifest = serde_json::json!({
             "version": "4.0.0",
-            "kernels": { "hysteria": "2.12.2", "xray": "26.3.27", "sing_box": "1.14.2", "caddy": "2.10.2" },
+            "kernels": { "hysteria": "2.12.2", "xray": "26.3.27", "sing_box": "1.14.3", "caddy": "2.10.2" },
             "artifacts": {
                 "bui-linux-amd64": asset("bui"),
                 "hysteria-linux-amd64": asset("hysteria"),
@@ -1569,7 +1569,7 @@ mod tests {
             ));
             i.scripted.push((
                 format!("{} version", bin("sing-box")),
-                CmdOut::success("sing-box version 1.14.2\n"),
+                CmdOut::success("sing-box version 1.14.3\n"),
             ));
             i.scripted.push((
                 format!("{} version", bin("caddy")),
@@ -1902,9 +1902,9 @@ mod tests {
         );
     }
 
-    /// P-A（2026-09-16 裁决）：装内核那一步，同版本异 sha 的二进制也要换 —— 自建 sing-box
-    /// 与官方归档打同一个版本号（`sing-box version` 都是 1.13.19 这种），只比版本号的话它
-    /// 永远装不上去，而依赖 `with_v2ray_api` 的配置每轮 `check` 必然 FATAL。
+    /// P-A（2026-09-16 裁决）：同一个版本号可以是另一份构建（`sing-box version` 都是 1.14.3
+    /// 这种），只比版本号换不掉盘上那一份。而 sing-box 是**共享**二进制（住宅与中继同用）：
+    /// 安装那一步一律不碰它，发布交给 owner（对账）。
     #[test]
     fn early_kernel_step_leaves_shared_singbox_for_the_owner() {
         let d = tempfile::tempdir().unwrap();

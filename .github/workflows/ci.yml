@@ -93,11 +93,13 @@ jobs:
           set -euo pipefail
           ver=$(awk '/^\[workspace\.package\]/ {f = 1; next} f && /^\[/ {f = 0} f && /^version[[:space:]]*=/ {gsub(/[^0-9.]/, ""); print; exit}' Cargo.toml)
           bash scripts/release/check-release-gate.sh "v$ver" --warn
+      - name: 内核来源与渲染器自洽（只告警，不卡 CI）
+        run: bash scripts/release/check-kernel-consistency.sh --warn
       - name: 内核 lock 没有漂移出轨道
         run: bash scripts/release/pin-kernels.sh --check
 
   test:
-    name: test (sing-box 1.14.2)
+    name: test (sing-box 1.14.3)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -131,8 +133,8 @@ jobs:
         run: |
           set -euo pipefail
           cargo test --workspace -- --nocapture 2>&1 | tee "$RUNNER_TEMP/test.log"
-          # 配置和真实流量只验发布内核；二进制缺失或漏编计量能力均不接受 skip。
-          if grep -Eq 'skipped: ((sing-box|xray|hysteria) not found|本机没有 caddy 二进制|自建 sing-box（with_v2ray_api）不可用)' "$RUNNER_TEMP/test.log"; then
+          # 配置和真实流量只验发布内核，二进制缺失不接受 skip。
+          if grep -Eq 'skipped: ((sing-box|xray|hysteria) not found|本机没有 caddy 二进制)' "$RUNNER_TEMP/test.log"; then
             echo "内核校验被跳过：CI 不接受 skip"
             grep -E 'skipped: ' "$RUNNER_TEMP/test.log"
             exit 1

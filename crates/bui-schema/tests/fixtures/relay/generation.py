@@ -356,7 +356,7 @@ def main():
     version_probe = bounded_capture([binary, "version"], 5)
     assert version_probe.returncode == 0, version_probe.stderr
     version = version_probe.stdout.splitlines()[0]
-    assert version == "sing-box version 1.14.2", f"generation regression requires 1.14.2, got {version}"
+    assert version == "sing-box version 1.14.3", f"generation regression requires 1.14.3, got {version}"
     assert set(data.get("backends", {})) == {"a", "b"}, "two immutable backend banks are required"
     suppliers = {name: Supplier(name.upper(), (b"generation-18", b"synthetic-only") if name == "b1" else None)
                  for name in ("a1", "a2", "b1", "b2", "direct-a", "direct-b", "direct-front")}

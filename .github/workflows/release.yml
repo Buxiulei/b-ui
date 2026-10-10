@@ -72,6 +72,8 @@ jobs:
         env:
           TAG: ${{ steps.v.outputs.tag }}
         run: bash scripts/release/check-release-gate.sh "$TAG"
+      - name: 内核来源与渲染器必须自洽（硬闸门：判红即中止发布）
+        run: bash scripts/release/check-kernel-consistency.sh
       - name: 内核 lock 是否还贴着轨道（只告警，不卡发版）
         run: |
           bash scripts/release/pin-kernels.sh --check \
@@ -81,7 +83,7 @@ jobs:
         with:
           dir: ${{ runner.temp }}/kernels-amd64
           arch: amd64
-      - name: 全量测试（sing-box 1.14.2）
+      - name: 全量测试（sing-box 1.14.3）
         run: |
           set -euo pipefail
           BIN="$RUNNER_TEMP/pathbin"
@@ -94,8 +96,8 @@ jobs:
           # 而 ubuntu-24.04 镜像不预装 caddy：软链进 /usr/local/bin 才能真跑校验（同 ci.yml）。
           sudo ln -sf "$RUNNER_TEMP/kernels-amd64/bin/caddy" /usr/local/bin/caddy
           cargo test --workspace -- --nocapture 2>&1 | tee "$RUNNER_TEMP/test.log"
-          # 配置和真实流量只验发布内核；二进制缺失或漏编计量能力均不接受 skip。
-          if grep -Eq 'skipped: ((sing-box|xray|hysteria) not found|本机没有 caddy 二进制|自建 sing-box（with_v2ray_api）不可用)' "$RUNNER_TEMP/test.log"; then
+          # 配置和真实流量只验发布内核；二进制缺失不接受 skip。
+          if grep -Eq 'skipped: ((sing-box|xray|hysteria) not found|本机没有 caddy 二进制)' "$RUNNER_TEMP/test.log"; then
             echo "内核校验被跳过，说明没找到内核二进制：发版不接受 skip"
             grep -E 'skipped: ' "$RUNNER_TEMP/test.log"
             exit 1
@@ -215,23 +217,22 @@ jobs:
         run: |
           set -euo pipefail
           # setup-kernels 已经把每个内核放成 <dir>/bin/<kernel>（scripts/ci/fetch-kernels.sh）：
-          # xray / hysteria / caddy 是上游归档解包出来的，sing-box 是锁里 build: 行现场自建的产物
-          # （唯一动机 with_v2ray_api，spec §5.3）。这里只是改名归集；Release 因此不含任何归档，
-          # install.sh 与 bui upgrade 拿到的都是裸二进制。
+          # 四个都是上游归档解包出来的（sing-box 4.1 起也用官方发行物）。这里只是改名归集；
+          # Release 因此不含任何归档，install.sh 与 bui upgrade 拿到的都是裸二进制。
           for a in amd64 arm64; do
             for k in hysteria xray sing-box caddy; do
               install -m 755 "$RUNNER_TEMP/kernels-$a/bin/$k" "dist/$k-linux-$a"
             done
           done
-      - name: dist 里的 sing-box 必须是自建的那一份（含 with_v2ray_api）
+      - name: dist 里的 sing-box 是锁里钉的那一版
         run: |
           set -euo pipefail
           # arm64 不能在 x86 runner 上执行，只靠锁里的 sha256 校验（spec §5.4 第 9 条）；
-          # amd64 这一份真跑一次，确认归集没把上游归档的二进制混进来。
-          v=$(dist/sing-box-linux-amd64 version)
-          printf '%s\n' "$v"
-          printf '%s\n' "$v" | grep -q 'with_v2ray_api' \
-            || { echo "dist 里的 sing-box 缺 with_v2ray_api"; exit 1; }
+          # amd64 这一份真跑一次，确认归集没把别的二进制混进来。
+          want=$(awk '$1 == "sing-box" && $2 == "target" {print $3; exit}' scripts/release/kernels.lock)
+          got=$(dist/sing-box-linux-amd64 version | awk '/^sing-box version/ {print $3; exit}')
+          printf 'dist sing-box %s（锁 %s）\n' "$got" "$want"
+          [[ "$got" == "$want" ]] || { echo "dist 里的 sing-box 不是锁里那一版"; exit 1; }
       - name: 清点产物（4 个自家二进制 + 8 个内核 = 12）
         run: |
           set -euo pipefail

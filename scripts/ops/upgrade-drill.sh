@@ -14,11 +14,10 @@
 # 表在且 4 条 redirect、只有 :40000 在听、4.0.x 的槽位实例（单元与 40000+i）一个不剩；回滚相位
 # 要求表消失、4.0.x 每槽一个的 40000+i 逐个在听、每槽的 hysteria-residential[-<i>] 单元 active
 # （spec §9.1）。这两组断言全靠重启后的守护进程**异步**对账，所以不是固定睡几秒，而是轮询到
-# 收敛或 `--settle` 超时（默认 300 秒——这一跳要从 GitHub 拉回自建 sing-box 与 hysteria）。
+# 收敛或 `--settle` 超时（默认 300 秒——这一跳要从 GitHub 拉回 sing-box 与 hysteria）。
 # 「升级计划里有 sing-box 那一行」只在**执行升级的二进制已是 4.1.x** 时才判 FAIL：4.0.x 的
-# `plan_upgrade` 只比版本号、不比资产 sha256（第二波裁决 P-A），而自建与官方归档同打 1.14.1
-# ⇒ 4.0.x → 4.1 这一跳的计划里本来就不会有它，一次完全健康的升级也会被判 FAIL。这一跳的真
-# 不变量是升级后 `bin/sing-box version` 的 Tags 含 with_v2ray_api（下面那道闸门）。
+# `plan_upgrade` 只比版本号、不比资产 sha256（第二波裁决 P-A）⇒ 4.0.x → 4.1 这一跳的计划里
+# 本来就不会有它，一次完全健康的升级也会被判 FAIL。
 # 订阅判据（4.1 关键订正，2026-09-18 bwg-rick 真机演练）：4.1 的住宅 HY2 节点在订阅里**必然**
 # 从 `:(40000+槽)` + 按槽切片的 `mport` 变成 `:40000` + 整段 `mport=41000-50000`
 # （CLAUDE.md「Subscriptions」/ spec §7.5），而 auth 串、obfs、sni、其它节点全不变。「旧订阅
@@ -60,7 +59,7 @@ NFT_TABLE="inet bui"
 # `render::nft::rule_count(true)`：两条链 ×（整段 + 兼容段）
 NFT_RULES_EXPECTED=4
 # 等对账收敛的上限（秒）与采样间隔：`bui upgrade` 在守护进程在跑时只 `systemctl restart b-ui`
-# 就返回（commands/upgrade.rs），内核下载安装（自建 sing-box ≈40 MB + hysteria）、
+# 就返回（commands/upgrade.rs），内核下载安装（sing-box + hysteria 各一份归档）、
 # `hy2-residential.json` 渲染 + `sing-box check`、删旧 yaml、`nft apply`、停旧槽单元起新单元
 # 全在重启后的守护进程里 ⇒ 固定睡 5 秒取指纹必判出假 FAIL。
 SETTLE=300
@@ -557,14 +556,12 @@ else
     compare_subs before after-upgrade || note_fail "upgrade-subs"
 fi
 
-# 自建 sing-box 必须真的装上（Global Constraints 第二波裁决 P-A）：内核身份现在是
-# 「版本号 + 资产 sha256」，装不上就会让 `hy2-residential.json` 每轮 `sing-box check` 必 FATAL
-# （`v2ray api is not included in this build`）、永不落盘，而同轮单元已指向它、旧
-# config-residential*.yaml 已删 ⇒ 住宅 HY2 永久崩溃循环、没有自愈点。所以演练独立验，
+# sing-box 必须真的装上（Global Constraints 第二波裁决 P-A）：内核身份是「版本号 + 资产
+# sha256」，只要盘上那一份不是 manifest 里那条资产就要换。所以演练独立验升级计划里那一行，
 # 不信任升级本身的退出码。
 # 计划里那一行按**执行升级的二进制**的代次分档：4.0.x 的 `plan_upgrade` 只比版本号，同版本异
 # sha 不进 `p.kernels`、`format_plan` 也就不打这一行 ⇒ 在 4.0.x → 4.1 这一跳上无条件要求它
-# 等于把健康的升级判成 FAIL（而计划 Step 6 的口径是「任一相位 FAIL 就按 §9 回滚」）。自建那份
+# 等于把健康的升级判成 FAIL（而计划 Step 6 的口径是「任一相位 FAIL 就按 §9 回滚」）。该装的
 # 照样会被装上，只是由重启后的 4.1 守护进程按 `kernel_build_differs` 装（reconcile/diff.rs）。
 # 4.2 及以后要复用本脚本，这里的代次判据得跟着 `plan_upgrade` 的口径一起改——glob 钉成
 # `4.1.[0-9]*`：patch 段必须是数字，这样将来的 `4.10.x`（写成 `4.1*` 就会被吃掉）与 `4.1.`
@@ -573,17 +570,11 @@ if [[ "$before_ver" == 4.1.[0-9]* ]]; then
     if grep -q '^sing-box ' "$UPOUT"; then
         log "升级计划里的 sing-box：$(grep -m1 '^sing-box ' "$UPOUT")"
     else
-        log "FAIL 升级计划里没有 sing-box 那一行——执行升级的 $before_ver 已带资产 sha256 判据，缺这一行就是自建二进制不会被装上"
+        log "FAIL 升级计划里没有 sing-box 那一行——执行升级的 $before_ver 已带资产 sha256 判据，缺这一行就是那一版内核不会被装上"
         note_fail "upgrade-singbox-plan"
     fi
 else
-    log "note 升级由旧二进制（$before_ver）执行，它只比版本号（P-A 之前的判据），计划里不会有 sing-box 那一行——这一跳改由下面的 Tags 闸门判"
-fi
-if "$BASE/bin/sing-box" version 2>/dev/null | grep -q with_v2ray_api; then
-    log "装上的 sing-box 带 with_v2ray_api"
-else
-    log "FAIL $BASE/bin/sing-box 的 Tags 里没有 with_v2ray_api——住宅配置过不了 sing-box check"
-    note_fail "upgrade-singbox-tags"
+    log "note 升级由旧二进制（$before_ver）执行，它只比版本号（P-A 之前的判据），计划里不会有 sing-box 那一行"
 fi
 # 升级相位的 nft 与监听端口（spec §9.1）
 expect after-upgrade nft:table present "nft 表" || note_fail "upgrade-nft"

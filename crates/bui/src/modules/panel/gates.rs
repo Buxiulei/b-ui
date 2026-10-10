@@ -344,7 +344,7 @@ pub async fn restore_and_verify(
             tokio::time::sleep(REPLAY_RETRY_FIRST).await;
         }
         let version = shared.hy2resi().version().await?;
-        anyhow::ensure!(version == "sing-box 1.14.2", "expected stock sing-box 1.14.2, observed {version}");
+        anyhow::ensure!(version == "sing-box 1.14.3", "expected stock sing-box 1.14.3, observed {version}");
         let gate = shared.gate_guard().await;
         let publication = ctx.store.publication_permit().await;
         let state = publication.state().clone();

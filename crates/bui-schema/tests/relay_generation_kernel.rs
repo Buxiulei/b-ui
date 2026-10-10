@@ -117,17 +117,17 @@ fn pinned_binary() -> Option<String> {
     {
         assert!(
             std::env::var_os("CI").is_none(),
-            "generation traffic regression requires the pinned sing-box 1.14.2 in CI"
+            "generation traffic regression requires the pinned sing-box 1.14.3 in CI"
         );
-        eprintln!("skipped: sing-box not found; generation traffic regression requires sing-box 1.14.2 and python3");
+        eprintln!("skipped: sing-box not found; generation traffic regression requires sing-box 1.14.3 and python3");
         return None;
     }
     assert_eq!(
         String::from_utf8_lossy(&version.unwrap().stdout)
             .lines()
             .next(),
-        Some("sing-box version 1.14.2"),
-        "generation regression requires the pinned sing-box 1.14.2"
+        Some("sing-box version 1.14.3"),
+        "generation regression requires the pinned sing-box 1.14.3"
     );
     Some(binary)
 }

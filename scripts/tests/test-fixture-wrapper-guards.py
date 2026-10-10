@@ -49,13 +49,13 @@ elif 'cargo' in a:
         if mode=='incomplete': (out/'payload/000.bin').unlink()
         if mode=='bad_proof': (out/'proof.safe.json').write_text('{}')
     marker=('offline_renderer_snapshot artifacts=1 kernels=4 raw_plan_empty=true metadata_plan_empty=true startup_noop=true unknown_accesses=0' if snapshot else
-       'stock_gate_fixture version=1.14.2 sha256=1a60ac17d93042c5a12410cfe83472ddee5084131dfae7a9b9806926ffb84447 gates=5 active=2 denied=3 restart_new_requests=verified')
+       'stock_gate_fixture version=1.14.3 sha256=299f9f6080d9c43504714ddddae6aa9b853d430ccfc816c456a73613b5455689 gates=5 active=2 denied=3 restart_new_requests=verified')
     print('running 1 test')
     if mode!='missing_marker': print(marker)
     if mode=='duplicate_marker': print(marker)
     print('test '+name+' ... ok')
     print('test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1232 filtered out; finished in 0.01s')
-elif 'sh' in a: print('sing-box version 1.14.2')
+elif 'sh' in a: print('sing-box version 1.14.3')
 else: sys.exit(90)
 '''
 

@@ -104,8 +104,8 @@ pub fn refuse_downgrade(
 /// `bui` 自己的判据不止版本号：版本相同但 manifest 里 `bui-linux-<arch>` 的 sha256 与盘上
 /// `bin/bui` 的不同（rc 通道的同版本重建）也要换，详见
 /// [`crate::kernels::bui_build_differs`]。四个内核同一判法
-/// （[`crate::kernels::kernel_build_differs`]）：自建 sing-box 与官方归档同版本号，
-/// 只比版本号的话它永远装不上去。
+/// （[`crate::kernels::kernel_build_differs`]）：同一个版本号可以是另一份构建，
+/// 只比版本号的话盘上那一份永远装不上去。
 ///
 /// 顺带消费总纲 C4 的可选字段 `min_upgrade_from`：当前版本低于它就直接报错，
 /// 提示先升到那个中间版本（消费方规则在 P1，不在 P5）。
@@ -230,6 +230,18 @@ pub fn prepare(
     Ok((plan, asset))
 }
 
+/// 回滚允许回到的 sing-box 版本：这两个版本的**住宅布局**是同一个（整段 `40000` + `inet bui`
+/// REDIRECT、每槽一个 relay 入站），跨 1.14.2 ⇄ 1.14.3 回滚安全，而且升级到 1.14.3 之后
+/// `.prev` 里那份 manifest 钉的正是 1.14.2 —— 这一跳恰恰是回滚安全网本身要覆盖的。1.14.2
+/// 那侧的配置（带 `experimental.v2ray_api`）与自建 1.14.2 自洽；将来渲染器摘掉那一段之后，
+/// 该段是可选的、自建 1.14.2 照样能加载。
+///
+/// 跨**布局**（v4.0.x 那类「每槽一份 yaml + 每槽一个端口」）仍旧拒绝：那才是这条闸门要挡的
+/// 东西。长期形态是按能力/布局判定 + `prev` 资产可解析且 sha 与 `sing-box.prev` 一致，而不是
+/// 维护一张版本名单（见 2026-10-10 审计「回滚退路」一条）——那一步连同 `serve.rs` / 升级入口 /
+/// 装机的同源版本字面量一起另做。
+const ROLLBACK_SUPPORTED_SINGBOX: &[&str] = &["1.14.2", "1.14.3"];
+
 /// **先停 `hysteria-residential` 并删掉 `table inet bui`**（spec §9.1），再
 /// `bin/bui.prev` → `bin/bui`、四个内核 ← 各自 `.prev`、`manifest.json` ←
 /// `manifest.prev.json`、`state.json` ← 最近一份备份，最后重启 `b-ui`（重启后守护进程自己
@@ -255,6 +267,8 @@ pub fn prepare(
 /// 边界（记在这里以免误判）：`.prev` 只有显式 `bui upgrade` 会留。守护进程每日自检
 /// （`serve.rs` 的 `selfcheck_loop`：拉 manifest → 写缓存 → 对账）换内核不经本模块、不写 `.prev`，
 /// 所以 `--rollback` 能退到的是「最近一次显式 `bui upgrade` 之前」，不是「任意一次换内核之前」。
+///
+/// 能退到哪一版 sing-box 由 [`ROLLBACK_SUPPORTED_SINGBOX`] 定。
 pub fn rollback(host: &dyn Host, paths: &Paths) -> anyhow::Result<Vec<String>> {
     let prev = paths.bin_dir.join("bui.prev");
     let bytes = host
@@ -267,7 +281,7 @@ pub fn rollback(host: &dyn Host, paths: &Paths) -> anyhow::Result<Vec<String>> {
     let arch = host.arch()?;
     let (version, asset) = manifest.kernel_asset("sing-box", &arch)?;
     anyhow::ensure!(
-        version.trim_start_matches('v') == "1.14.2",
+        ROLLBACK_SUPPORTED_SINGBOX.contains(&version.trim_start_matches('v')),
         "rollback across residential kernel/layout versions is unsupported"
     );
     let previous_kernel = paths.bin_dir.join("sing-box.prev");
@@ -473,8 +487,8 @@ pub async fn publish_upgrade(
             }
             let arch = h.arch()?;
             anyhow::ensure!(
-                m.kernel_asset("sing-box", &arch)?.0.trim_start_matches('v') == "1.14.2",
-                "only stock sing-box 1.14.2 is supported"
+                m.kernel_asset("sing-box", &arch)?.0.trim_start_matches('v') == "1.14.3",
+                "only stock sing-box 1.14.3 is supported"
             );
             let installed = crate::kernels::installed_versions(h.as_ref(), &p.bin_dir);
             let plan = plan_upgrade(
@@ -586,8 +600,8 @@ pub fn format_plan(p: &UpgradePlan) -> String {
         None => out.push(format!("bui          {}（已最新）", p.self_from)),
     }
     for (name, from, to) in &p.kernels {
-        // 内核也有「同版本的另一份构建」：自建 sing-box 与官方归档打同一个版本号，判据是
-        // 资产 sha256（`kernel_build_differs`）。不特判就会打印「1.14.1 → 1.14.1」。
+        // 内核也有「同版本的另一份构建」：版本号是编译期写死的字符串，换一份构建不会变，
+        // 判据是资产 sha256（`kernel_build_differs`）。不特判就会打印「1.14.1 → 1.14.1」。
         if from == to {
             out.push(format!("{name:<12} {to}（同版本的新构建）"));
             continue;
@@ -658,10 +672,13 @@ mod tests {
         h.with(|i| {
             i.which.insert("nft".into());
         });
-        let manifest = manifest_json(env!("CARGO_PKG_VERSION"), OLD_KERNELS, "current-bui");
+        // 「已是最新」这一档：目标 manifest 要过**升级入口**的 stock 闸门（sing-box 必须钉
+        // 在 1.14.3），盘上也正好是它那一份 ⇒ 才谈得上「无事可做」。回滚那一族的旧盘面
+        // （OLD_KERNELS / OLD_BINS）保持 1.14.2：那是回滚安全网要覆盖的那一跳。
+        let manifest = manifest_json(env!("CARGO_PKG_VERSION"), NEW_KERNELS, "current-bui");
         h.write_file(&paths.bin_dir.join("bui"), b"current-bui", 0o755)
             .unwrap();
-        for (name, version) in crate::kernels::KERNELS.iter().zip(OLD_KERNELS) {
+        for (name, version) in crate::kernels::KERNELS.iter().zip(NEW_KERNELS) {
             h.write_file(
                 &paths.bin_dir.join(name),
                 kernel_body(name, version).as_bytes(),
@@ -669,7 +686,7 @@ mod tests {
             )
             .unwrap();
         }
-        script_versions(&h, &paths, OLD_KERNELS);
+        script_versions(&h, &paths, NEW_KERNELS);
         let fetcher: Arc<dyn Fetcher> = Arc::new(F(Mutex::new(vec![(
             "https://fixture/manifest".into(),
             manifest.into_bytes(),
@@ -712,10 +729,12 @@ mod tests {
         h.with(|i| {
             i.which.insert("nft".into());
         });
-        let manifest = manifest_json(env!("CARGO_PKG_VERSION"), OLD_KERNELS, "new-bui");
+        // 与上一条同理：目标 manifest 要过升级入口的 stock 闸门，盘上四份内核正好是它那一份，
+        // 于是这一跳唯一的动作就是换 `bui` 自己（下面把这一笔写盘打坏来验失败语义）。
+        let manifest = manifest_json(env!("CARGO_PKG_VERSION"), NEW_KERNELS, "new-bui");
         h.write_file(&paths.bin_dir.join("bui"), b"current-bui", 0o755)
             .unwrap();
-        for (name, version) in crate::kernels::KERNELS.iter().zip(OLD_KERNELS) {
+        for (name, version) in crate::kernels::KERNELS.iter().zip(NEW_KERNELS) {
             h.write_file(
                 &paths.bin_dir.join(name),
                 kernel_body(name, version).as_bytes(),
@@ -723,7 +742,7 @@ mod tests {
             )
             .unwrap();
         }
-        script_versions(&h, &paths, OLD_KERNELS);
+        script_versions(&h, &paths, NEW_KERNELS);
         let fetcher: Arc<dyn Fetcher> = Arc::new(F(Mutex::new(vec![
             ("https://x/bui".into(), b"new-bui".to_vec()),
             ("https://fixture/manifest".into(), manifest.into_bytes()),
@@ -961,18 +980,18 @@ mod tests {
         );
     }
 
-    /// 发布阻断级回归（2026-09-16）：自建 sing-box 与官方归档同版本号，`bui upgrade` 只比
+    /// 发布阻断级回归（2026-09-16）：同一个版本号可以是另一份构建，`bui upgrade` 只比
     /// 版本号就会打印「sing-box 1.14.1（已最新）」而永远不换那份二进制。
     #[test]
     fn plan_lists_a_kernel_whose_version_matches_but_whose_asset_sha_differs() {
         // 本 fixture 里 bui 与 sing-box 两个资产共用一个 sum，所以盘上那份 bui 的字节也写成
         // 同一份（本用例要说的只是内核那一半）
-        let ours = b"SB-ours";
-        let m = manifest("4.0.0", "1.14.1", &crate::kernels::sha256_hex(ours));
+        let wanted = b"SB-wanted";
+        let m = manifest("4.0.0", "1.14.1", &crate::kernels::sha256_hex(wanted));
         let installed = BTreeMap::from([("sing-box".to_string(), "1.14.1".to_string())]);
-        let h = host_with_bui(ours);
-        // 盘上是官方那一份：版本号相同、字节不同
-        h.write_file(&Path::new(BIN).join("sing-box"), b"SB-official", 0o755)
+        let h = host_with_bui(wanted);
+        // 盘上是另一份构建：版本号相同、字节不同
+        h.write_file(&Path::new(BIN).join("sing-box"), b"SB-on-disk", 0o755)
             .unwrap();
         let p = plan_upgrade(&h, Path::new(BIN), &m, "4.0.0", &installed, "x86_64").unwrap();
         assert_eq!(p.self_to, None, "bui 自己没变");
@@ -1536,7 +1555,7 @@ mod tests {
     /// 四个内核是**同一判法**（`kernel_build_differs`：版本不同、或盘上 sha 与 manifest 不符
     /// 即重装），这一轮它们不动是因为两项判据都不成立——版本没变，盘上字节又正是 manifest
     /// 那一份。别把它读成「内核只按版本比对」：那正是 2026-09-16 P-A 修掉的发布阻断级缺陷
-    /// （自建 sing-box 与官方归档同版本号，只比版本号就永远装不上去）。
+    /// （同一个版本号可以是另一份构建，只比版本号就永远换不掉盘上那一份）。
     #[test]
     fn a_same_version_rebuild_still_upgrades_bui_but_leaves_the_kernels_alone() {
         let d = tempfile::tempdir().unwrap();

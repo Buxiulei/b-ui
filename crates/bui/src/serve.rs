@@ -269,8 +269,8 @@ pub async fn reconcile_from_ctx(
                 {
                     if name == "sing-box" {
                         anyhow::ensure!(
-                            version.trim_start_matches('v') == "1.14.2",
-                            "only stock sing-box 1.14.2 is supported"
+                            version.trim_start_matches('v') == "1.14.3",
+                            "only stock sing-box 1.14.3 is supported"
                         );
                     }
                     let path = paths
@@ -289,8 +289,8 @@ pub async fn reconcile_from_ctx(
                             version.ok()
                                 && crate::kernels::parse_version("sing-box", &version.stdout)
                                     .as_deref()
-                                    == Some("1.14.2"),
-                            "candidate is not stock sing-box 1.14.2"
+                                    == Some("1.14.3"),
+                            "candidate is not stock sing-box 1.14.3"
                         );
                     }
                     binaries.insert(
@@ -1553,7 +1553,7 @@ mod tests {
             vec![
                 Artifact::Binary {
                     name: "sing-box".into(),
-                    version: "1.14.2".into(),
+                    version: "1.14.3".into(),
                     sha256: crate::kernels::sha256_hex(b"new binary"),
                     url: "https://fixture/sing-box".into(),
                 },

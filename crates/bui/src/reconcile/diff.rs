@@ -211,8 +211,8 @@ pub fn plan(input: PlanInput<'_>, host: &dyn Host) -> Result<Plan> {
                 sha256,
                 url,
             } => {
-                // 内核身份 = 版本号 + 资产 sha256：自建 sing-box 与官方同版本归档打同一个
-                // 版本号，只比版本号的话自建那份永远装不上去（见 `kernel_build_differs`）。
+                // 内核身份 = 版本号 + 资产 sha256：同一个版本号可以是另一份构建，只比版本号
+                // 的话盘上那一份永远装不上去（见 `kernel_build_differs`）。
                 if crate::kernels::kernel_build_differs(
                     host,
                     &input.paths.bin_dir,
@@ -585,10 +585,9 @@ mod tests {
         );
     }
 
-    /// 发布阻断级回归（2026-09-16）：自建 sing-box 与官方归档**同版本号**（`sing-box version`
-    /// 都打 1.14.1），只比版本号的话 `InstallBinary` 永远不会被计划、自建二进制装不上去，
-    /// 于是 `hy2-residential.json` 每轮 `sing-box check` 必然 FATAL（`v2ray api is not
-    /// included in this build`）、永不落盘 ⇒ 住宅 HY2 永久崩溃循环。
+    /// 发布阻断级回归（2026-09-16）：同一个版本号可以对应两份不同的内核构建，只比版本号的
+    /// 话 `InstallBinary` 永远不会被计划、盘上那一份永远换不掉，于是期望态的配置（渲染自
+    /// 用户开的那份权益）可能每轮 `check` 都 FATAL、永不落盘 ⇒ 那个单元永久崩溃循环。
     #[test]
     fn a_same_version_kernel_with_a_different_asset_sha_is_reinstalled() {
         let paths = Paths::default_server();
@@ -596,19 +595,19 @@ mod tests {
             BTreeMap::new(),
             BTreeMap::from([("sing-box".to_string(), "1.14.1".to_string())]),
         );
-        let official = b"SB-1.14.1-official";
-        let ours = b"SB-1.14.1-with_v2ray_api";
+        let on_disk = b"SB-1.14.1-other-build";
+        let wanted = b"SB-1.14.1-expected-build";
         let arts = vec![Artifact::Binary {
             name: "sing-box".into(),
             version: "1.14.1".into(),
-            sha256: crate::kernels::sha256_hex(ours),
+            sha256: crate::kernels::sha256_hex(wanted),
             url: "https://x/sb".into(),
         }];
-        // 盘上是官方那一份（版本号一模一样）
+        // 盘上是另一份构建（版本号一模一样）
         let h = FakeHost::new();
         h.with(|i| {
             i.files
-                .insert("/opt/b-ui/bin/sing-box".into(), (official.to_vec(), 0o755));
+                .insert("/opt/b-ui/bin/sing-box".into(), (on_disk.to_vec(), 0o755));
         });
         let p = plan(input(&arts, &paths, &keys, &versions), &h).unwrap();
         assert_eq!(
@@ -616,7 +615,7 @@ mod tests {
             vec![Change::InstallBinary {
                 name: "sing-box".into(),
                 version: "1.14.1".into(),
-                sha256: crate::kernels::sha256_hex(ours),
+                sha256: crate::kernels::sha256_hex(wanted),
                 url: "https://x/sb".into(),
                 path: "/opt/b-ui/bin/sing-box".into(),
             }],
@@ -624,11 +623,11 @@ mod tests {
         );
         assert_eq!(p.unchanged, 0);
 
-        // 换成自建那一份之后才是零变更
+        // 换成 manifest 里那一份之后才是零变更
         let h2 = FakeHost::new();
         h2.with(|i| {
             i.files
-                .insert("/opt/b-ui/bin/sing-box".into(), (ours.to_vec(), 0o755));
+                .insert("/opt/b-ui/bin/sing-box".into(), (wanted.to_vec(), 0o755));
         });
         let p2 = plan(input(&arts, &paths, &keys, &versions), &h2).unwrap();
         assert_eq!(p2.changes, vec![], "版本与 sha 都对得上：不动");

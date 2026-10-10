@@ -453,7 +453,7 @@ impl Host for FakeHost {
                 .is_some_and(|n| n == "sing-box")
             && args == ["version"]
         {
-            return Ok(CmdOut::success("sing-box version 1.14.2\n"));
+            return Ok(CmdOut::success("sing-box version 1.14.3\n"));
         }
         Ok(CmdOut::success(""))
     }

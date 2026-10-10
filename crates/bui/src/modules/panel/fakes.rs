@@ -281,7 +281,7 @@ impl Default for FakeHy2ResiInner {
             fail_inventory_read: None,
             inventory_reads: 0,
             inventory_override: None,
-            version: "sing-box 1.14.2".into(),
+            version: "sing-box 1.14.3".into(),
             members: [
                 "deny",
                 "slot-0-out",

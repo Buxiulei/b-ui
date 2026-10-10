@@ -706,13 +706,13 @@ fn strict_snapshot_remembers_hash_errors_swallowed_by_diff() {
         unknown: Mutex::new(BTreeSet::new()),
     };
     assert!(host.known().is_ok());
-    let installed = BTreeMap::from([("sing-box".into(), "1.14.2".into())]);
+    let installed = BTreeMap::from([("sing-box".into(), "1.14.3".into())]);
     assert!(crate::kernels::kernel_build_differs(
         &host,
         Path::new("/opt/b-ui/bin"),
         &installed,
         "sing-box",
-        "1.14.2",
+        "1.14.3",
         "expected"
     ));
     assert!(host.known().is_err());

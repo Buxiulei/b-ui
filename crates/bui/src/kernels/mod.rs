@@ -132,7 +132,7 @@ pub trait Fetcher: Send + Sync + 'static {
     /// 进制）。**二进制一律走这一条**，`sink` 用 [`crate::sys::Host::stage_file`] 开的写入槽，
     /// 于是「校验过再 rename」，sha 不匹配时目标路径一个字节不动。
     ///
-    /// **为什么存在**：内核二进制单笔约 81 MB（sing-box，自建带 `with_v2ray_api` 的更大）、
+    /// **为什么存在**：内核二进制单笔约 81 MB（sing-box 最大）、
     /// 四个合计约 190 MB，而 `b-ui.service` 的 `MemoryMax=200M` 是**硬上限**
     /// （`modules/units.rs`）。`get_bytes` + `sha256_hex(&bytes)` + `write_file(&bytes)` 在一次
     /// 安装/升级里就有约 81 MB 常驻加一份写盘副本 ⇒ systemd 把守护进程杀在下载半路，形状是
@@ -166,8 +166,8 @@ const DOWNLOAD_BUDGET: std::time::Duration = std::time::Duration::from_secs(300)
 
 /// 响应体字节上限：镜像坏掉或被替换后回一个无限/超大 body 时，别一路写到 ENOSPC（盘撑满
 /// 期间 `state.json` 写入、证书续签、journald 会一起失败）。sha 校验只在下载**之后**才有
-/// 机会拒绝，所以上限必须在循环里。最大的真资产约 81 MB（sing-box，自建带 `with_v2ray_api`
-/// 的更大），512 MiB 是六倍余量；客户端那侧的同形上限是 `bui-c::net::download_via` 的
+/// 机会拒绝，所以上限必须在循环里。最大的真资产约 81 MB（sing-box），512 MiB 是六倍余量；
+/// 客户端那侧的同形上限是 `bui-c::net::download_via` 的
 /// `max_bytes`。
 const DOWNLOAD_MAX_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -769,12 +769,11 @@ pub fn bui_build_differs(
 /// 期望的那个内核构建与盘上 `bin/<name>` 是不是**两个不同的构建**。判法与
 /// [`bui_build_differs`] 一致：先比版本号，版本号相同再比 sha256。
 ///
-/// **版本号不是充分判据**（2026-09-16 裁决，发布阻断级）：自建的 sing-box 与官方同版本归档
-/// 打的是同一个版本号（ldflags 里就写着 `constant.Version=1.14.1`），差别只在构建标签
-/// （自建带 `with_v2ray_api`）。只比版本号的话，已装官方 1.14.1 的机器上 `InstallBinary`
-/// 永远不会被计划、自建二进制装不上去，`bui upgrade` 还会打印「已最新」；于是依赖
-/// `v2ray_api` 的那份配置每轮 `sing-box check` 必然 FATAL、永不落盘 —— 我们给自家二进制
-/// 做对了这件事，给内核漏了。
+/// **版本号不是充分判据**（2026-09-16 裁决，发布阻断级）：同一个版本号可以对应两份不同的
+/// 内核构建（`constant.Version` 是编译期写死的字符串，构建标签或来源不同、版本号照旧）。
+/// 只比版本号的话，「盘上那一份不是期望态的构建」永远不会被计划：`InstallBinary` 不排、
+/// `bui upgrade` 打印「已最新」，对账会把一个**不在期望态**的二进制一直留在盘上。
+/// 期望态是 manifest 里那条资产的 sha256（见 [`Manifest::kernel_asset`]），对不上就得换。
 ///
 /// `want_sha256` 取 manifest 的 `artifacts.<name>-linux-<arch>.sha256`（见
 /// [`Manifest::kernel_asset`]）。盘上二进制读不到（还没装 / 读失败）按「要装」处理。
@@ -1122,28 +1121,28 @@ mod tests {
         );
     }
 
-    /// 发布阻断级回归（2026-09-16）：自建 sing-box 与官方归档**同版本号**（都打 1.14.1），
-    /// 只比版本号的话自建那份永远装不上去 ⇒ 依赖 `with_v2ray_api` 的配置每轮 `check` 必然
-    /// FATAL、永不落盘。内核与 `bui` 同一判法：版本号相同再比盘上二进制的 sha256。
+    /// 发布阻断级回归（2026-09-16）：同一个版本号可以对应两份不同的内核构建（`constant.Version`
+    /// 是编译期写死的字符串，构建标签或来源不同、版本号照旧）。只比版本号的话，「盘上是另一份
+    /// 构建」就永远换不掉：`InstallBinary` 不排、`bui upgrade` 打印「已最新」。内核与 `bui`
+    /// 同一判法：版本号相同再比盘上二进制的 sha256。
     #[test]
     fn kernel_build_differs_falls_back_to_sha_when_the_version_is_unchanged() {
         let bin = Path::new("/opt/b-ui/bin");
-        let official = b"SB-1.14.1-official";
-        let ours = b"SB-1.14.1-with_v2ray_api";
+        let on_disk = b"SB-1.14.1-other-build";
+        let wanted = b"SB-1.14.1-expected-build";
         let installed = BTreeMap::from([("sing-box".to_string(), "1.14.1".to_string())]);
         let h = FakeHost::new();
-        h.write_file(&bin.join("sing-box"), official, 0o755)
-            .unwrap();
-        let want = sha256_hex(ours);
+        h.write_file(&bin.join("sing-box"), on_disk, 0o755).unwrap();
+        let want = sha256_hex(wanted);
         assert!(
             kernel_build_differs(&h, bin, &installed, "sing-box", "1.14.2", &want),
             "版本不同：一眼就要装"
         );
         assert!(
             kernel_build_differs(&h, bin, &installed, "sing-box", "1.14.1", &want),
-            "同版本号但盘上是官方那一份：也要装"
+            "同版本号但盘上是另一份构建：也要装"
         );
-        h.write_file(&bin.join("sing-box"), ours, 0o755).unwrap();
+        h.write_file(&bin.join("sing-box"), wanted, 0o755).unwrap();
         assert!(
             !kernel_build_differs(&h, bin, &installed, "sing-box", "1.14.1", &want),
             "同版本同 sha 才是已最新"
@@ -1180,9 +1179,8 @@ mod tests {
         let sb = bin.join("sing-box");
         let installed = BTreeMap::from([("sing-box".to_string(), "1.14.1".to_string())]);
         let h = FakeHost::new();
-        h.write_file(&sb, b"SB-1.14.1-with_v2ray_api", 0o755)
-            .unwrap();
-        let want = sha256_hex(b"SB-1.14.1-with_v2ray_api");
+        h.write_file(&sb, b"SB-1.14.1-on-disk", 0o755).unwrap();
+        let want = sha256_hex(b"SB-1.14.1-on-disk");
         h.with(|i| i.sha_reads.clear());
         assert!(
             !kernel_build_differs(&h, bin, &installed, "sing-box", "1.14.1", &want),
@@ -1743,7 +1741,7 @@ mod tests {
     ///
     /// 上一轮只改了「稳态对账算内核 sha」那一半；下载写盘这一半仍是
     /// `get_bytes` → `sha256_hex(&bytes)` → `write_file(dest, &bytes)`，一次安装/升级里单笔
-    /// 就有约 81 MB 常驻（sing-box，自建带 `with_v2ray_api` 的更大）加一份写盘副本，而
+    /// 就有约 81 MB 常驻（sing-box 单笔最大）加一份写盘副本，而
     /// `b-ui.service` 的 `MemoryMax=200M` 是**硬上限**（`modules/units.rs`）⇒ 升级期 OOM、
     /// 被 systemd 杀在下载半路。峰值 RSS 在单测里钉不住，所以这里钉**用了哪条接口**：
     /// `Fetcher::download_to` + `Host::stage_file`，`get_bytes` 一次都没碰。改回一次性读入

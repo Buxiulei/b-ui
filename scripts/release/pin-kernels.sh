@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
-# 解析 kernel-versions.env 的版本轨道 → 下载（sing-box 是自建）每个内核资产 → 算 sha256 → 写 kernels.lock。
-#   --write         解析 + 下载 / 构建 + 覆盖 kernels.lock（会下载约 200MB 并构建两次 sing-box，十几分钟）
+# 解析 kernel-versions.env 的版本轨道 → 下载每个内核资产 → 算 sha256 → 写 kernels.lock。
+# 四个内核（含 sing-box）都是上游官方发行物，不再有自建行。
+#   --write         解析 + 下载 + 覆盖 kernels.lock（会下载约 200MB，几分钟）
 #                   整文件重生成，但**保留锁里已有的手写注记行**，只重写自己那两行锁头
-#   --check         解析版本号 + 比自建行的 tags= 与 env 是否一致，有漂移退出 1（CI 用，不下载、不构建）
+#   --check         解析版本号并与锁里的版本列比对，有漂移退出 1（CI 用，不下载）
 #   --lock <path>   改写/比对别处的 lock（测试用；默认 scripts/release/kernels.lock）
 # sha256 一律「自己下载自己算」：上游 checksums 文件的命名各家不同且会变。
 # lock 里的 sha256 是**上游归档**的 sha256（fetch-kernels.sh 校验用）；manifest 里的 sha256 是
 # 解包后裸二进制的 sha256（gen-manifest.sh 现算），两者不同，不要互相照抄。
-# 例外：`sing-box target` 两行是**自建**（唯一动机 with_v2ray_api，spec §5.3），URL 列是
-# `build:<repo>@v<ver>;go=<go>;tags=<tags>`，sha256 列就是构建出来的裸二进制的 sha256。
 set -euo pipefail
 LC_ALL=C
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -85,36 +84,10 @@ remote_sha256() {
     curl -fsSL --connect-timeout 15 --max-time 600 "$1" | sha256sum | cut -d' ' -f1
 }
 
-build_singbox_row() {
-    # 随发布分发的 sing-box 自建（为了 with_v2ray_api，spec §5.3）：
-    # $1 = 版本, $2 = amd64|arm64；stdout = "<构建产物 sha256> build:<repo>@v<ver>;go=<go>;tags=<tags>"
-    # 任一步失败即退非 0 —— write_lock 在 set -e 下当场中止，锁不动（spec §5.4 第 8 条）。
-    # 这里**故意不传 --go**：GOTOOLCHAIN=auto 探出上游 go.mod 要求的版本写进锁的 go=，
-    # 取件时再由 fetch-kernels.sh 透传回去钉死（钉的人和发现的人不是同一步）。
-    local ver="$1" arch="$2" builder out raw line go tags sha
-    builder="${BUI_SINGBOX_BUILDER:-$HERE/build-singbox.sh}"
-    out=$(mktemp)
-    if ! raw=$("$builder" --repo "$SINGBOX_REPO" --version "$ver" --arch "$arch" --out "$out"); then
-        rm -f "$out"
-        printf '自建 sing-box 失败：%s %s\n' "$ver" "$arch" >&2
-        return 1
-    fi
-    rm -f "$out"
-    line=$(printf '%s\n' "$raw" | tail -1)
-    go=$(printf '%s\n' "$line" | sed -nE 's/.*(^| )go=([^ ]+).*/\2/p')
-    tags=$(printf '%s\n' "$line" | sed -nE 's/.*(^| )tags=([^ ]+).*/\2/p')
-    sha=$(printf '%s\n' "$line" | sed -nE 's/.*(^| )sha256=([0-9a-f]{64}).*/\2/p')
-    if [[ -z "$go" || -z "$tags" || -z "$sha" ]]; then
-        printf '构建器输出不合规（要 go= tags= sha256=）：%s\n' "$line" >&2
-        return 1
-    fi
-    printf '%s build:%s@v%s;go=%s;tags=%s\n' "$sha" "$SINGBOX_REPO" "$ver" "$go" "$tags"
-}
-
 write_lock() {
-    local tmp row kernel role ver arch url sha built notes
+    local tmp row kernel role ver arch url sha notes
     tmp=$(mktemp)
-    # 锁里已有的**手写**注记行（哪两行是回填的、某个内核为什么顶了版本之类）要留住：
+    # 锁里已有的**手写**注记行（某个内核为什么钉在固定版本、为什么顶了版本之类）要留住：
     # --write 是整文件重生成，不留的话每次重写都静默删掉它们，而周更 bot 的 PR 正文
     # 又只列内核行 ⇒ 评审者看不见注记被删。本函数只重写自己那两行锁头（生成时间 + 列名）。
     notes=""
@@ -136,13 +109,8 @@ write_lock() {
                "caddy target $(resolve_track "$CADDY_REPO" "$CADDY_TRACK")"; do
         read -r kernel role ver <<< "$row"
         for arch in amd64 arm64; do
-            if [[ "$kernel" == "sing-box" ]]; then
-                built=$(build_singbox_row "$ver" "$arch")
-                read -r sha url <<< "$built"
-            else
-                url=$(asset_url "$kernel" "$ver" "$arch")
-                sha=$(remote_sha256 "$url")
-            fi
+            url=$(asset_url "$kernel" "$ver" "$arch")
+            sha=$(remote_sha256 "$url")
             printf '%s %s %s %s %s %s\n' "$kernel" "$role" "$ver" "$arch" "$sha" "$url" >> "$tmp"
             printf '  pinned %s %s %s %s\n' "$kernel" "$ver" "$arch" "${sha:0:12}" >&2
         done
@@ -152,7 +120,7 @@ write_lock() {
 }
 
 check_lock() {
-    local rc=0 kernel repo track locked resolved ltags
+    local rc=0 kernel repo track locked resolved
     for kernel in sing-box:"$SINGBOX_REPO":"$SINGBOX_TRACK" \
                   xray:"$XRAY_REPO":"$XRAY_TRACK" \
                   hysteria:"$HYSTERIA_REPO":"$HYSTERIA_TRACK" \
@@ -167,16 +135,6 @@ check_lock() {
             printf '一致：%s %s\n' "$kernel" "$locked" >&2
         fi
     done
-    # 自建那两行的 tags= 也要盯：只比版本号的话，改了 env 的 SINGBOX_TAGS 而忘了 --write
-    # 是**静默 no-op**（取件读的是锁里的 tags=，CI 全绿），标签集就此与 env 脱钩。
-    # sort -u：两行不一致或哪行缺 ;tags= 都会与 env 不等，一并算漂移。
-    ltags=$(awk '$1 == "sing-box" && $2 == "target" {sub(/.*;tags=/, "", $6); print $6}' "$LOCK" | sort -u)
-    if [[ "$ltags" != "$SINGBOX_TAGS" ]]; then
-        printf '漂移：sing-box tags lock=%s env=%s（跑 pin-kernels.sh --write）\n' "${ltags:-缺失}" "$SINGBOX_TAGS" >&2
-        rc=1
-    else
-        printf '一致：sing-box tags %s\n' "$ltags" >&2
-    fi
     return "$rc"
 }
 

@@ -430,9 +430,21 @@ pub async fn upgrade(
     });
     match job.await {
         Ok(Ok(changed)) => Json(serde_json::json!({"changed":changed})).into_response(),
-        result => (
+        // 只回错误消息本身，并过 [`crate::redact::url_credentials`]（口径同
+        // `residential_lifecycle.rs` 里那几处 `r.error = Some(...)`）：清单 URL 会随
+        // `anyhow!("404 {url}")` 进错误串，带凭据的镜像地址不能原样出到响应里。
+        // 不再用 `{result:?}`——那会把整个 `Result` 打出来，`Err(JoinError)` 那一支连
+        // panic payload 都进响应体。
+        Ok(Err(error)) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error":format!("{result:?}")})),
+            Json(serde_json::json!({
+                "error": crate::redact::url_credentials(&error.to_string())
+            })),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "升级任务异常终止"})),
         )
             .into_response(),
     }

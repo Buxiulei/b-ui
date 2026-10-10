@@ -524,7 +524,7 @@ impl GenerationLedger {
                 .copied()
                 .collect::<BTreeSet<_>>();
             if evidence.binding != lease.binding
-                || evidence.kernel_version != "1.14.2"
+                || evidence.kernel_version != "1.14.3"
                 || !evidence.checked
                 || evidence.api_upstreams != expected
                 || evidence.probed_upstreams != expected
@@ -1050,7 +1050,7 @@ mod tests {
     fn ready_evidence(binding: &GenerationBinding) -> PreparedEvidence {
         PreparedEvidence {
             binding: binding.clone(),
-            kernel_version: "1.14.2".into(),
+            kernel_version: "1.14.3".into(),
             checked: true,
             api_upstreams: ids().into_iter().collect(),
             probed_upstreams: ids().into_iter().collect(),

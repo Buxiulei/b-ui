@@ -455,7 +455,7 @@ mod tests {
             let (port, _rx) = fake_clash(mode).await;
             let c = Hy2ResiClient::with_apis(format!("127.0.0.1:{port}"), "unused");
             if mode == ClashMode::Ok {
-                assert_eq!(c.version().await.unwrap(), "sing-box 1.14.2");
+                assert_eq!(c.version().await.unwrap(), "sing-box 1.14.3");
             } else {
                 assert!(c.version().await.is_err());
             }
@@ -852,7 +852,7 @@ mod tests {
                     if mode == ClashMode::BadVersion {
                         "not JSON"
                     } else {
-                        r#"{"version":"sing-box 1.14.2","premium":true,"meta":true}"#
+                        r#"{"version":"sing-box 1.14.3","premium":true,"meta":true}"#
                     }
                 } else {
                     ""
