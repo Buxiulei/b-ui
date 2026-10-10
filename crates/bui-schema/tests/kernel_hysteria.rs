@@ -18,7 +18,12 @@ fn free_udp_port() -> u16 {
 }
 
 /// 自签一张证书（`hysteria` 在校验 `auth` 之前先 `stat` 证书，缺了就走不到 auth 那一步）。
-/// 没有 `openssl` 就返回 `None`，调用方跳过。
+/// 与 `kernel_hy2_singbox.rs::self_signed` 同款；本机没有 `openssl` 就跳过。
+///
+/// **CI 里不许静默跳过**（2026-10-10 计划 §8 #4）：下面两格是「渲染出的 HY2 配置真过
+/// 内核」的自动化面，而 Linux runner 自带 openssl —— 它不可用意味着这两格会在绿 CI
+/// 底下假绿，所以照 `relay_generation_kernel.rs` 的 `assert!(CI.is_none())` 范式硬失败
+/// （本机仍只是 `skipped: openssl not usable`）。
 fn self_signed(dir: &std::path::Path) -> Option<()> {
     let out = std::process::Command::new("openssl")
         .args([
@@ -29,9 +34,16 @@ fn self_signed(dir: &std::path::Path) -> Option<()> {
         .arg("-out")
         .arg(dir.join("fullchain.pem"))
         .args(["-subj", "/CN=test.invalid"])
-        .output()
-        .ok()?;
-    out.status.success().then_some(())
+        .output();
+    let ok = matches!(&out, Ok(out) if out.status.success());
+    if !ok {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "kernel_hysteria requires a usable openssl under CI"
+        );
+        eprintln!("skipped: openssl not usable");
+    }
+    ok.then_some(())
 }
 
 /// golden：`tests/fixtures/hysteria/<模式>/<文件名>`，两种鉴权模式各一份。
@@ -135,7 +147,8 @@ fn hysteria_auth_command_is_a_single_executable_path_without_arguments() {
 /// 的错配。加载走到 auth 之前要先过 `listen` 与 `tls.cert`，所以这里去掉端口跳跃
 /// （nft 建表要 root）并临时自签一张证书。
 ///
-/// 内核不在 PATH 上、或本机没有 openssl 就跳过（与 `sing-box` / `xray` 那两条同口径）。
+/// 内核不在 PATH 上、或本机没有 openssl 就跳过（与 `sing-box` / `xray` 那两条同口径）
+/// —— 两种跳过在 CI 里都是硬失败（`common::have` 与 `self_signed` 各自的 `CI` 断言）。
 #[test]
 fn both_auth_modes_load_in_the_real_hysteria_kernel() {
     if !common::have("hysteria") {
@@ -144,7 +157,6 @@ fn both_auth_modes_load_in_the_real_hysteria_kernel() {
     }
     let dir = tempfile::tempdir().unwrap();
     if self_signed(dir.path()).is_none() {
-        eprintln!("skipped: openssl not usable");
         return;
     }
     let mut s = common::state("obfs");
@@ -247,7 +259,6 @@ fn obfs_server_admits_a_matching_client_and_refuses_one_without_obfs() {
     }
     let dir = tempfile::tempdir().unwrap();
     if self_signed(dir.path()).is_none() {
-        eprintln!("skipped: openssl not usable");
         return;
     }
     let s = common::state("obfs");

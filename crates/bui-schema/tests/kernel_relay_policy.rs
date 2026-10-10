@@ -38,6 +38,13 @@ fn selected_upstream_policy_survives_hot_switches_and_preserves_tcp_and_udp() {
         .map(|output| output.status.success())
         .unwrap_or(false)
     {
+        // CI 里不许静默跳过：本用例是策略隔离在「运行时实际选中的上游」上的唯一回归面，
+        // 而发布内核由 setup-kernels 放进 PATH ⇒ 二进制缺失只可能是环境故障。范式同
+        // `relay_generation_kernel.rs::pinned_binary`（本机仍只是 skipped）。
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "policy traffic regression requires the pinned sing-box {expected} in CI"
+        );
         eprintln!(
             "skipped: {binary} not found; policy traffic regression requires sing-box {expected} and python3"
         );

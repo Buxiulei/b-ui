@@ -37,13 +37,31 @@ pub fn expected(mode: &str, user: &str, kind: &str) -> String {
     .unwrap()
 }
 
-/// 内核二进制是否可用（不可用时测试打印 skipped 而非失败）。
+/// 内核二进制是否可用（不可用时测试打印 skipped 而非失败；**CI 里硬失败**）。
+///
+/// 这是「内核不在了就静默变绿」的唯一收口点：`kernel_xray` / `kernel_hysteria` 的直接
+/// 调用、以及 `check_singbox`（`kernel_client` / `kernel_relay` / `golden_subscription` /
+/// `kernel_hy2_singbox`）都经它。三个发布内核由 `.github/actions/setup-kernels` 放进 PATH
+/// （`ci.yml` 的 `test (sing-box 1.14.3)`、`release.yml`、`kernels-bump.yml` 三处都装），
+/// 所以在 CI 里 `have()` 为假只可能是内核没到位这类环境故障，静默 skip 会让全部「渲染
+/// 结果过真实内核」的用例假绿。断言写在这里而不是各调用点：外部 grep 黑名单那套转录会
+/// 漂移（`kernel_hysteria` 的 openssl skip 就漏在三个 workflow 的黑名单之外），把口子
+/// 收在生产者侧；范式照 `kernel_hy2_singbox.rs` / `relay_generation_kernel.rs` 的
+/// `assert!(CI.is_none())`。**要新增一个「CI 里也接受缺内核」的用例，请另写显式的
+/// opt-in 函数，别绕过这里。**
 pub fn have(bin: &str) -> bool {
-    std::process::Command::new(bin)
+    let ok = std::process::Command::new(bin)
         .arg("version")
         .output()
         .map(|o| o.status.success())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    if !ok {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "kernel validation must not skip in CI: `{bin}` is not on PATH"
+        );
+    }
+    ok
 }
 
 /// 用真实 sing-box 校验一份配置；二进制缺失时跳过。
