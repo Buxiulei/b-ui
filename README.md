@@ -4,15 +4,43 @@
 
 # B-UI
 
-轻量级 Hysteria2 + Xray 多协议代理一键部署工具，内置 Web 管理面板与全功能流量管理。
+Rust 编写的多协议代理控制与管理工具，提供服务端部署、Web 管理面板、住宅出口管理和 Linux 客户端。网络转发由 Hysteria2、Xray、sing-box 等独立内核承担。
 
-**当前版本**: v4.1.2（Rust 单二进制；版本号唯一来源是根 `Cargo.toml` 的 `[workspace.package] version`）
+**版本状态（2026-10-10 核对）**：GitHub 最新正式 Release 为 [v4.1.3](https://github.com/Buxiulei/b-ui/releases/tag/v4.1.3)；本工作分支的源码候选为 **v4.1.9，尚未发布、未部署**。版本号唯一来源是根 [Cargo.toml](Cargo.toml) 的 `[workspace.package] version`，候选进展不能当作已发布能力。
+
+**内核来源**：目标坚持使用上游原版内核，不维护协议源码补丁。当前[发布锁](scripts/release/kernels.lock)中的 sing-box 仍是从上游 v1.14.2 源码加 `with_v2ray_api` 计量标签构建的产物，与官方发布归档原件不同。官方原件的历史对照实验与现有发布产物分开记账；迁移官方分发仍须通过[计量与撤权验收 G0](docs/work-records/2026-10-10/managed-client-design.md#原版发行物与计量迁移前置-g0)。本次不变更内核来源或发布锁。
+
+## 当前架构工作与成果文档
+
+当前主线是：**控制面只依据当前实例的本地故障决定是否中断；数据面在启动、运行、退出和恢复期间，始终受管转发或明确阻断 IPv4、IPv6 与 DNS。** Rust 管理授权、期望配置和服务生命周期；本轮候选固定 sing-box **1.14.2**，按具体源码及二进制来源分别记账，不通过修改客户端规则或降低日志级别替代架构修复。
+
+截至 2026-10-10，当前实例恢复决策已有公开代码；独立出口保护、统一生命周期 owner 和隔离验收工具的后续实现仍有未完成接线。**完整 hooks、所有配置写者、冷启动双栈、强杀/重启/回滚及严格 Clippy 尚未全部通过，不能宣称已经实现完整防泄漏。**
+
+- [全部工作成果与交接索引](docs/work-records/2026-10-10/README.md)：调查经过、设计决策、实现边界、证据和下一步。
+- [架构、模块与剩余实施顺序](docs/work-records/2026-10-10/architecture-and-handover.md)：统一 owner、短锁、状态记录和生命周期接线。
+- [验证台账](docs/work-records/2026-10-10/verification-ledger.md)：逐个源码快照记录通过、失败、忽略和未运行，区分策略测试与物理网络验收。
+- [HY2、住宅代理与 IPv6 调查](docs/work-records/2026-10-10/investigation-history.md)：已确认的问题与仍不能成立的因果推断。
+- [服务端托管完整客户端配置的设计](docs/work-records/2026-10-10/managed-client-design.md)：双栈捕获、DNS、出口能力和不同客户端的交付边界。
+
+本次上传保存文档及产物指纹。较新的本地 Rust 候选和实验监督器尚未作为产品代码发布；详情见[产物与保留范围](docs/work-records/2026-10-10/artifacts-and-operations.md)。[草稿 PR #9](https://github.com/Buxiulei/b-ui/pull/9) 保留未完成状态。
+
+## 项目结构
+
+| 层次 | 代码 | 职责 |
+|---|---|---|
+| 服务端控制面 | [`crates/bui`](crates/bui) | 安装、期望态对账、授权、住宅生命周期、面板与维护 |
+| 配置与共享模型 | [`crates/bui-schema`](crates/bui-schema) | 状态模型、校验及各内核配置渲染 |
+| Linux 客户端 | [`crates/bui-c`](crates/bui-c) | 节点导入、模式、巡检及客户端恢复 |
+| 网络数据面 | [内核版本锁定](scripts/release/kernels.lock) | 上游网络内核执行转发；sing-box 分发来源见上文 |
+
+完整变更记录见 [CHANGELOG.md](CHANGELOG.md)。下面的安装说明描述已交付接口；新候选的未完成能力以上面的状态表和工作文档为准。
 
 ---
 
-## 最新更新
+<details>
+<summary>v3 维护历史（历史行为，不代表 v4 候选已交付能力）</summary>
 
-完整更新日志见 [CHANGELOG.md](CHANGELOG.md)。v4.0.0 起本节只保留 v3 的历史条目，新版本不再往这里追加。
+以下保留原有 v3 记录；当前版本的变更见 [CHANGELOG.md](CHANGELOG.md)。
 
 ### v3.5.14 ~ v3.5.18 — 安装健壮性 + 多用户/高并发硬化 + 隐私收口
 - 🧯 **端口跳跃孤儿链崩溃循环根治** (v3.5.14/16)：SIGKILL/OOM 残留 `HYSTERIA-PR` 链 / `hysteria_*` nft 表 → 下次启动 `Chain already exists` FATAL 崩溃循环。新增 `hy2-portjump-cleanup.sh` 作为两实例 `ExecStartPre`，按 base 端口 + 跳跃端口段**双重定位**（连"建了空链、还没加 redirect"的残留也清），只清本实例、兼容 iptables/nft 两后端
@@ -108,15 +136,18 @@
 ### v3.1.0 — 内核代理下载
 - 🌐 服务端自动从 GitHub 同步最新内核（每 6h），客户端优先从服务端拉取
 
+
+</details>
+
 ---
 
 ## 功能特性
 
 ### 服务端 (Core)
-- **单二进制控制面**: `bui` 一个静态二进制装机、对账、跑面板、升级；协议内核（Hysteria2 / Xray / sing-box / Caddy）仍是上游原版
-- **多协议支持**: Hysteria2（直连 + 住宅两实例）/ VLESS-Reality（直连 + 住宅两入站）
+- **单二进制控制面**: `bui` 一个静态二进制装机、对账、跑面板、升级；网络内核与 Caddy 独立分发；sing-box 的具体构建来源见上文
+- **多协议支持**: Hysteria2 直连（Hysteria 内核）与住宅（sing-box 入站）/ VLESS-Reality（直连 + 住宅两入站）
 - **用户管理**: Web 面板可视化管理，支持多用户、流量统计、在线状态监控
-- **访问控制**: 用户时长限制、总流量/月度流量限制；加用户与到期在建连时生效（Hysteria2 `auth.type: command`），不重启内核
+- **访问控制**: 用户时长限制、总流量/月度流量限制；直连鉴权与住宅凭据门位分别管理，授权变化不以重启内核为常规手段
 - **住宅 IP 出站**: sing-box 中继架构，指定域名（OpenAI/Google/Claude/ping0 等）走住宅上游，其余直出 VPS；内置上游体检与自动黑名单
 - **期望态对账**: `/opt/b-ui/state.json` 是唯一真源，装机与升级同一条代码路，非受管的手工改动只报不改
 - **自动维护**: Caddy 自动 HTTPS 证书、证书同步、watchdog、每日自检全部收进守护进程（没有 cron、没有独立 timer）
@@ -124,11 +155,11 @@
 
 ### 客户端 (Client)
 - **统一导入**: 粘贴链接即可，自动识别 Hysteria2/VLESS 链接、订阅地址、批量
-- **单引擎双模式**: sing-box（≤ 1.14）跑 SOCKS/HTTP 混合入口或全局 TUN，切模式只重渲染配置 + 重启一个单元；SSH 连接保护
-- **自愈**: `bui-c.timer` 每分钟跑 `bui-c check`，失败按 1/2/4 分钟退避重启
+- **单引擎双模式**: sing-box 跑 SOCKS/HTTP 混合入口或 TUN；本工作分支固定 1.14.2，验证按具体产物来源分别记录。独立双栈保护及完整生命周期的交付状态见上方工作记录
+- **巡检与恢复**: `bui-c.timer` 周期执行 `bui-c check`；4.1.9 候选将外部可达性异常与当前本地故障分开，外部探测失败不单独授权重启
 - **更新来源**: 面板 `/packages/` → GitHub Releases → 镜像前缀，解决 GitHub 不可达问题
 - **服务控制**: 实时状态显示，一键启停/重启/查看日志
-- 🪟 **v2rayN TUN + IPv6**：服务端无 IPv6 出口时的推荐设置见 [docs/v2rayn-tun-ipv6.md](docs/v2rayn-tun-ipv6.md)
+- **IPv4 / IPv6**：客户端捕获、代理传输与服务端出站分别验收；[完整配置设计](docs/work-records/2026-10-10/managed-client-design.md)说明当前目标。[早期 v2rayN 部署说明](docs/v2rayn-tun-ipv6.md)保留作历史参考，不代表完整双栈接管已完成
 
 ---
 
@@ -343,7 +374,7 @@ Reality 认 uuid）。同一账号的端口变了（住宅槽位换了）或 HY2
 [2] 直接写要切到的模式（SOCKS 模式下是「切到 TUN」）。[7] 更新与维护是二级菜单：[1] 检查更新、
 [2] 关闭自动更新（关着时是「开启自动更新」）、[3] 从 v3 导入；有新版时主菜单在「更新与维护」后面挂 ★。
 
-引擎只有 sing-box（≤ 1.14），切模式 = 重渲染 `config.json` + 重启 `bui-c.service`；服务端
+引擎只有 sing-box（本工作分支固定 1.14.2，验证按具体产物来源分别记录），当前切模式 = 重渲染 `config.json` + 重启 `bui-c.service`；服务端
 `sudo b-ui` 同样是数字菜单，两者都不依赖 gum/fzf。
 
 ### 内核更新策略
@@ -362,18 +393,15 @@ Reality 认 uuid）。同一账号的端口变了（住宅槽位换了）或 HY2
 
 ## 住宅 IP 出站架构
 
+```text
+直连 HY2  → Hysteria2 内核                    → VPS 直连出口
+直连 VLESS → Xray                            → VPS 直连出口
+住宅 HY2  → sing-box 凭据门（授权后按槽转发） ┐
+住宅 VLESS → Xray 按用户分槽                  ├→ 本地 relay 槽 → 供应商策略 → 住宅上游 / VPS 出口
+                                             ┘
 ```
-客户端 VPN 流量
-    │
-    ▼
-Xray / Hysteria2  (无路由逻辑，全部转发)
-    │
-    ▼
-sing-box 中继 (127.0.0.1:2080)
-    ├─ 私有 IP / 服务器自身 IP → 直出 VPS
-    ├─ 关键词域名 (openai/chatgpt/gemini.google/anthropic/claude/...) → 住宅上游（SOCKS5 或 HTTP）
-    └─ 其余 → 直出 VPS（池空时全部直出，fail-open）
-```
+
+住宅授权门和出口策略是两个边界：住宅 HY2 核心重启时门位默认拒绝，由 Rust owner 按授权重放；relay 的池启用状态、全局/分流模式和每个供应商策略决定实际出口。当前 relay 在住宅池禁用或为空时仍有直出行为，因此不能把“住宅节点”名称当作出口身份或全流量防泄漏证明。详见[调查记录与边界](docs/work-records/2026-10-10/investigation-history.md)。
 
 - 默认分流关键词 67 条，权威副本在 `crates/bui-schema/src/keywords.rs` 的 `DEFAULT_KEYWORDS`；`sudo bui residential domains` 打印当前生效的一份
 - 状态：`/opt/b-ui/state.json` 的 `residential`（600），上游凭据随它一起落盘；不再有 `residential-proxy.json`

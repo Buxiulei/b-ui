@@ -1,0 +1,266 @@
+{
+  "schema": 1,
+  "recorded_date": "2026-10-10",
+  "scope": "documentation_backup_only",
+  "candidate_version": "4.1.9",
+  "release_qualified": false,
+  "github_code_baseline": "1e8c1431a362d800273ed073495f452bdb8827ee",
+  "rust_source_map_sha256": "451d45118619a4bc5bc460311bac2ac4a0267baee1542e150d82193bf704651d",
+  "source_map_is_not_archive_digest": true,
+  "frozen_rust_comparison": {
+    "matched_files": 248,
+    "different_files": []
+  },
+  "artifacts": [
+    {
+      "name": "owner-warm-final-format.source.tar",
+      "kind": "rust_source_snapshot",
+      "bytes": 7710720,
+      "sha256": "ab89c48456216dcb78dcaced2058db9d3f4294b5fdccfe74f3e4407d7580b6d2",
+      "distribution": "retained_privately_not_uploaded"
+    },
+    {
+      "name": "owner-warm-final-format-bui-c-x86_64-musl",
+      "kind": "experimental_binary",
+      "bytes": 6634600,
+      "sha256": "ec037983d66fc6fe3f7a085a082ed5330b75dd9ce8402c198bb5ecee1325ff9d",
+      "distribution": "retained_privately_not_uploaded"
+    },
+    {
+      "name": "realm-supervisor-storage-http-final-2.source.tar",
+      "kind": "supervisor_source_snapshot",
+      "bytes": 194560,
+      "sha256": "96e8759a5cdfca2f7574abd92285d62c0226d72eea59ed184971dd8d37da01d6",
+      "distribution": "retained_privately_not_uploaded"
+    },
+    {
+      "name": "realm-supervisor-storage-http-final-2.log",
+      "kind": "test_log",
+      "bytes": 3358,
+      "sha256": "dfc1eab95bc82ec478cd77d39800b680e3af59c5611e9a9446f957a2d83c51e5",
+      "distribution": "retained_privately_not_uploaded"
+    },
+    {
+      "name": "realm-supervisor-storage-http-final-2.safe.json",
+      "kind": "test_receipt",
+      "bytes": 466,
+      "sha256": "5336251b3081032fbbecfa8ee1d24ce99b02d12652a625765b33297aa59140aa",
+      "distribution": "retained_privately_not_uploaded"
+    },
+    {
+      "name": "realm-host-supervisor.py",
+      "kind": "experimental_supervisor",
+      "bytes": 70186,
+      "sha256": "cbc146af006873efefefe97526c0bc5104f0f32e2916982fe001b9e8840f1a28",
+      "distribution": "retained_privately_not_uploaded"
+    },
+    {
+      "name": "test-realm-host-supervisor.py",
+      "kind": "supervisor_tests",
+      "bytes": 22395,
+      "sha256": "22d8bfe6654d91f649fc69e5a7a4abfad3796f203e3e0799d190018ae8b8b9ce",
+      "distribution": "retained_privately_not_uploaded"
+    }
+  ],
+  "local_candidate_source_fingerprints": [
+    {
+      "path": "crates/bui-c/src/action_scope.rs",
+      "bytes": 13963,
+      "sha256": "ee70c55c429c97f5c86346a94e77f89a3dd94e944de025a2b93c9d1741551e08",
+      "git_state": "untracked_local"
+    },
+    {
+      "path": "crates/bui-c/src/check.rs",
+      "bytes": 71127,
+      "sha256": "ce8179045c6dcc34d9ca84b65efdba7fcc3a2773bcc813006c3c9cdd925996ce",
+      "git_state": "modified_local"
+    },
+    {
+      "path": "crates/bui-c/src/cli.rs",
+      "bytes": 710842,
+      "sha256": "4f852dd42777f1fc13b8a835f4ee998162c60cd6eae908a800ba161d8e158406",
+      "git_state": "modified_local"
+    },
+    {
+      "path": "crates/bui-c/src/core_exec.rs",
+      "bytes": 51152,
+      "sha256": "445b79e2048c853cdda787887d6f2fd9c74e9e5dc660092dd93bd2fbf39a1e61",
+      "git_state": "untracked_local"
+    },
+    {
+      "path": "crates/bui-c/src/fake.rs",
+      "bytes": 37843,
+      "sha256": "00201933de4c1feb2839e85ce8d5320e6915eab4f263791910c6358c7d56bc3f",
+      "git_state": "modified_local"
+    },
+    {
+      "path": "crates/bui-c/src/guard.rs",
+      "bytes": 194238,
+      "sha256": "1155c2d3813b91dea065aef2d3c2a08a85c11217998e2b228d300e2a025546f0",
+      "git_state": "untracked_local"
+    },
+    {
+      "path": "crates/bui-c/src/hook_owner.rs",
+      "bytes": 94030,
+      "sha256": "6c73cb389b20c8e611517a8c5785d283f30723f6debb4da7f1be13c831a5ce84",
+      "git_state": "untracked_local"
+    },
+    {
+      "path": "crates/bui-c/src/identity_validation.rs",
+      "bytes": 35636,
+      "sha256": "1a892c380ee7f46c7ad5dbe0f888cb35d0e0e3d30ce64895968d912b08f0b4e7",
+      "git_state": "untracked_local"
+    },
+    {
+      "path": "crates/bui-c/src/lib.rs",
+      "bytes": 1624,
+      "sha256": "ec1665cf73ffcc57197be4aa4ef1149041c4b1742bb90fd40849b0d60e8f3b24",
+      "git_state": "modified_local"
+    },
+    {
+      "path": "crates/bui-c/src/lifecycle.rs",
+      "bytes": 209505,
+      "sha256": "59ac8acae0f78d9eb76efde24a795ed6519b84805ea0a25629136e1efb9e0f64",
+      "git_state": "untracked_local"
+    },
+    {
+      "path": "crates/bui-c/src/lock.rs",
+      "bytes": 19212,
+      "sha256": "43e7da36f469feba5ce2658771be0ff9104fa26dc7dde8a5965c917639aa09b1",
+      "git_state": "modified_local"
+    },
+    {
+      "path": "crates/bui-c/src/main.rs",
+      "bytes": 1815,
+      "sha256": "ff47a61f793cc97724a53f2cdb7dc3df0c0dc52a3d3fb0cbf47285bf972625a2",
+      "git_state": "modified_local"
+    },
+    {
+      "path": "crates/bui-c/src/management.rs",
+      "bytes": 111566,
+      "sha256": "5f7c87a54c8e0c40e4a62b5597dd780c35165d3918fa46e47540eb31d7cf233f",
+      "git_state": "untracked_local"
+    },
+    {
+      "path": "crates/bui-c/src/owner_channel.rs",
+      "bytes": 83109,
+      "sha256": "4026377f70ceb712c0fedffc2ab46d0b7948d5df742e2e4f080450392b477d95",
+      "git_state": "untracked_local"
+    },
+    {
+      "path": "crates/bui-c/src/owner_pump.rs",
+      "bytes": 39361,
+      "sha256": "292310b8d6ad723700f148642c645adce336c3a6faa00e3b0c2da7eb33409794",
+      "git_state": "untracked_local"
+    },
+    {
+      "path": "crates/bui-c/src/owner_qualification.rs",
+      "bytes": 39711,
+      "sha256": "2dd5fcf08410fda30f49a42c76506cfe01a9239336b7187fca4d70df6c33d690",
+      "git_state": "untracked_local"
+    },
+    {
+      "path": "crates/bui-c/src/owner_qualification/private_validation.rs",
+      "bytes": 47125,
+      "sha256": "9b92642a5f07150b6c88f9fb98fdfd767ef32bba54d3db405d7ed3d90388962a",
+      "git_state": "untracked_local"
+    },
+    {
+      "path": "crates/bui-c/src/platform_qualifier.rs",
+      "bytes": 192158,
+      "sha256": "9c7b3edc37f758b5889930b5b2b6aae946ae5b8224d9f0df41911eb8a2165eb8",
+      "git_state": "untracked_local"
+    },
+    {
+      "path": "crates/bui-c/src/privileged_command.rs",
+      "bytes": 51744,
+      "sha256": "67eb5b96875f3be1a7183a52489288df57c8b451f69a932e53f312f6cb585a8d",
+      "git_state": "untracked_local"
+    },
+    {
+      "path": "crates/bui-c/src/recovery.rs",
+      "bytes": 36614,
+      "sha256": "fc42c926e5792fffc30068ebc12a9788a3af49af1eef029108031a6c173b8f18",
+      "git_state": "untracked_local"
+    },
+    {
+      "path": "crates/bui-c/src/service.rs",
+      "bytes": 12460,
+      "sha256": "8fc637456b769330bf61869a83735a39fbd4ca44b9991bc547c3f91ca891e6a1",
+      "git_state": "modified_local"
+    },
+    {
+      "path": "crates/bui-c/src/socket_identity.rs",
+      "bytes": 121856,
+      "sha256": "ec98d3e0c6bc3cdf925ef683c154c9b797d0039a014b1e9edd4ab143dce440d8",
+      "git_state": "untracked_local"
+    },
+    {
+      "path": "crates/bui-c/src/sys.rs",
+      "bytes": 16298,
+      "sha256": "89813f008d57c151600bd440e5510109137a44ea3d76d5125cf168dbee9cdffb",
+      "git_state": "modified_local"
+    },
+    {
+      "path": "crates/bui-c/src/testutil.rs",
+      "bytes": 8080,
+      "sha256": "7a27a0cc2d8fbb593d9987c99f58498381a296a7485c66cfebb0170cd584faf8",
+      "git_state": "modified_local"
+    },
+    {
+      "path": "crates/bui-c/src/tun_identity.rs",
+      "bytes": 43432,
+      "sha256": "b7e9e108e93a319c7530f7e09b2f78274c34051345531a6f5b52b2961c3e30a8",
+      "git_state": "untracked_local"
+    },
+    {
+      "path": "crates/bui-c/tests/check_current_basis.rs",
+      "bytes": 16399,
+      "sha256": "b1f490573241b7f821a00da0f3828e7da38f1479171ae3e060ddaf1ed3e7b048",
+      "git_state": "untracked_local"
+    },
+    {
+      "path": "crates/bui-c/tests/fixtures/socket_identity.rs",
+      "bytes": 46788,
+      "sha256": "bd6d62ceb310beb482aa8c4e04ed1410bc8e75d748d487b41e60b468c99db830",
+      "git_state": "untracked_local"
+    },
+    {
+      "path": "crates/bui-c/tests/guard_contract.rs",
+      "bytes": 5727,
+      "sha256": "7b02003089bec86126ffdba58836c5a6889d0b9b68c3b28da7fafdf9c7ca0ec4",
+      "git_state": "untracked_local"
+    },
+    {
+      "path": "crates/bui-c/tests/lifecycle_owner.rs",
+      "bytes": 3604,
+      "sha256": "d338b5b64d55ee2f818571dd38e6cd6cfb221e7bb93d02fba4a02cccd003af55",
+      "git_state": "untracked_local"
+    },
+    {
+      "path": "crates/bui-c/tests/recovery_basis.rs",
+      "bytes": 41309,
+      "sha256": "fc3df672f9be46bb80540e407ed1c81207bc3612b7b8748ce93e02be81c75060",
+      "git_state": "untracked_local"
+    },
+    {
+      "path": "crates/bui-c/tests/recovery_owner.rs",
+      "bytes": 8782,
+      "sha256": "89739a327b9a20d4d9077d8c23e244992d7396dd83de9e45ce10aa665b4be366",
+      "git_state": "modified_local"
+    },
+    {
+      "path": "crates/bui-schema/src/render/client.rs",
+      "bytes": 24935,
+      "sha256": "082ba9cb0447362f693bafccf8ce8ce42efcc88449485f195210960ea61f07df",
+      "git_state": "modified_local"
+    },
+    {
+      "path": "crates/bui-schema/tests/kernel_client.rs",
+      "bytes": 41087,
+      "sha256": "b155b20b0646d9548fac16d408bc4e56294af3f5740a55e125e929fa8b745538",
+      "git_state": "modified_local"
+    }
+  ],
+  "notice": "Artifacts and local candidate code are not included in this documentation upload. Hashes identify retained evidence; they are not runnable proofs or a released build."
+}

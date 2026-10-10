@@ -4,26 +4,39 @@
 
 **Goal:** 外部探测异常不再破坏有效实例；恢复绑定当前配置/实例并复核本地故障；独立双栈保护、全捕获配置及生命周期通过同一验收后交付 4.1.9 候选。
 
-**Architecture:** 复用 `Sys`、`Net`、现 flock 和 `service::observe`，建立一个客户端动作入口；锁外观测，锁内重验/合并记账。新增独立 inet guard，基础拒绝不随核心退出；guard、全捕获 renderer、systemd hooks 和恢复入口是同一个交付单元。
+**Architecture:** 复用 `Sys`、`Net`、现 flock 和 `service::observe`，建立一个 Rust 生命周期 owner 和统一客户端动作入口；锁外观测，短生产锁内重验/合并记账，耗时平台验证使用同进程 worker 与独立锁。独立 inet guard 的基础拒绝不随核心退出；guard、全捕获 renderer、systemd hooks 和恢复入口是同一个交付单元。
 
 **Tech Stack:** Rust 1.85+、bui-c/bui-schema、原版 sing-box **1.14.2**、Linux systemd/nftables；FakeSys/FakeNet 仅做策略/控制流测试，物理故障门禁使用隔离 Linux 与真实核心。
 
 **Spec:** [本文 Global Constraints](#global-constraints) 为已授权恢复设计及独立出口保护设计的脱敏执行摘录；可独立随仓库流转，不含实机统计、私有路径、生产地址或账号。审计主机只用既有 alias 指代。
 
-## 执行状态（2026-10-08，按 root 实际台账）
+## 执行状态（2026-10-10，按已保存的执行记录）
 
-本节只记录实际到达/执行的切片；下方完整步骤须逐项满足后才勾选。focused RED→GREEN 不等于完整任务、full package 或发布通过。
+本节包含公开代码基线和后续本地未提交候选的进度；本次只上传文档，不把本地实现描述为已经合入。差异、完整证据范围和接手顺序见[工作成果索引](../../work-records/2026-10-10/README.md)。历史实测不是此次文档任务重新执行的结果。
+
+目标保持同一条主线：**控制面只根据当前本地故障中断实例；数据面在启动、退出、恢复全过程保持“受管转发或明确阻断”的双栈契约。** focused RED→GREEN、隔离平台资格与完整产品交付分别记账；下方完整步骤须逐项满足后才勾选。
 
 | 任务 | 已核实状态 | 仍未完成的交付边界 |
 |---|---|---|
-| Task 1 | 外部失败不授权重启的业务 RED→GREEN 已实跑；实际 API 为 `ExternalDegraded`，本地查询未知为 `Uncertain`。最终客户端 package gate 已通过。 | 本节不宣称发布或部署完成。 |
-| Task 2 | observer/fence、full Profiles Eq、实际 config bytes 对比、锁内 local 重验、healthy fresh Runtime 合并已实现，并分步实际 RED→GREEN。 | 所有 writer 的统一动作入口、network/boot/monotonic 新鲜性及 guard 尚未实现；完整 Task 2 不勾完，其余合同须继续核定。 |
-| Task 3 | 隔离 LinuxKit 的 minimum guard 平台资格实际 **FAIL**：`# CONFIG_NFT_SOCKET is not set`。同次 IPv4/IPv6 TCP/UDP 对照实际 reachable，实验资源清理成功。 | 该结果仅属于所测隔离平台，不能推断审计主机 alias 的能力。guard 实现、全捕获/lifecycle 同交付验收及防漏故障门禁未完成；禁止将可达对照或清理成功计作 guard PASS。 |
-| Task 4 | 按用户既有版本更新指令，源码 workspace/lock/CHANGELOG 已分配 **4.1.9**；仅标识源码候选，**未发布、未部署**。生产 fresh 只读核查仍为 **4.1.8**，主实例未变。 | 版本分配不获得完整候选发布资格；guard/lifecycle、回滚、完整实机验收及实际发布/部署仍未完成，原门禁持续阻断。 |
+| Task 1 | 外部失败不授权重启的恢复策略已实际 RED→GREEN；外部异常为 `ExternalDegraded`，本地证据未知为 `Uncertain`。第一阶段快照通过客户端 package gate。 | 第一阶段 package 结果不适用于此后的全部新增源码，也不代表当前候选已发布。 |
+| Task 2 | 当前配置/实例/网络 basis、锁内重验、Runtime fresh-merge 及锁来源验证已完成对应 focused gate；CLI 回归实际 286 项通过。 | 所有维护、更新、删除、卸载和 systemd 动作尚未统一接入新生命周期 owner；严格 package gate 尚未通过。 |
+| Task 3 平台与身份 | 审计主机支持实际 socket cgroup。Rust 隔离平台 10 个 case、52 条 IPv4/IPv6 TCP/UDP 对照和拒绝腿通过，独立清理通过。两种选定 raw transaction failure profile 的私有内核实验也通过。只读实际 SSH socket-activation 身份及 TUN 身份通过。 | 隔离 HostOutput 平台与当前身份不能替代完整产品：受保护域名 bootstrap、核心 sealed 启动、三类实际 hook、完整 capture/DNS、冷启动与物理故障矩阵未完成；AF_PACKET/FORWARD/桥接覆盖未获资格。 |
+| Task 3 生命周期 | 独立保护规则、完整 renderer、publication journal、短动作 scope、root Unix channel、远端 hook 身份工厂已有源码和 focused gate。owner 前台及固定 StopPost 入口已接入源码，失效 peer 隔离、原期限传递、同操作记账、跨读取文件代次及 warm 统一读取/命令预算已通过回归与独立审查。同进程资格 worker 已完成两轮隔离验证和回收。 | 全部产品调用者、实际固定角色、启动前后 hooks 与启动/退出/恢复整体接线未完成；仍须迁移持锁等待 systemd 的旧入口后再交付 hooks。独立 worker 与源码测试不代表产品 hooks、Guard/Ready 或冷启动通过。 |
+| Task 4 | workspace/lock/CHANGELOG 分配 **4.1.9 未发布候选**；此前只读记录的运行基线为 **4.1.8**，本次文档整理未复查生产。 | 完整 package、冷 IPv6/上行与管理连续性、强杀/重启/原子失败/回滚门槛通过前，不构建发布件、不部署候选、不经生产自动更新传播。 |
 
-当前不得据切片 GREEN 或源码版本分配宣称独立双栈 guard 已实现、恢复已完整验收、已证明防泄漏或已发布/部署 4.1.9；没有实际全包结果时不补写 PASS。后续执行仍遵循下列原合同，不因隔离平台不支持而放宽身份/例外规则。
+早期 LinuxKit 不支持 `CONFIG_NFT_SOCKET` 的失败记录仍有效，只描述该隔离平台；后续审计主机的实际成功是独立证据，并未回写或隐藏原失败。当前源代码不再依赖该失败平台授予资格。
 
-最终源码候选在 Linux ARM64 / Rust 1.92 / 原版 sing-box 1.14.2 环境实际完成 `cargo fmt --all -- --check`、`cargo clippy --locked -p bui-c -p bui-schema --all-targets -- -D warnings` 和 `cargo test --locked -p bui-c -p bui-schema`。同一源码快照共 917 passed / 0 failed / 3 ignored；bui-c 为 666 单元测试及 12 恢复竞态测试。ignored 分别为 golden 重录、nft 网络命名空间和住宅流量集成，均未计作通过。该包门禁没有替代 Task 3 的物理出口故障资格或生产验收。
+第一阶段源码快照实际通过 `cargo fmt --all -- --check`、`cargo clippy --locked -p bui-c -p bui-schema --all-targets -- -D warnings` 和 `cargo test --locked -p bui-c -p bui-schema`，共 917 passed / 0 failed / 3 ignored。三个 ignored 未计作通过。**这些结果不是当前新增 guard、owner、hook、socket 代码的最终 package gate；当前最终 gate 仍未完成。**
+
+worker retention 最终冻结快照（源码清单 `74dbafd0`）的客户端回归实际 **1,330 passed / 0 failed / 4 ignored**，格式检查通过，Linux x86_64-musl 私有构建通过。native 工具链实际为 Rust/Clippy 1.99.0，musl 为 Rust 1.92.0。15 项 owner 聚焦测试及实际跨线程 opaque proof 双轮验证通过；严格 clippy 仍返回 101，完整产品 hook/物理故障尚未完成。该快照结果不自动覆盖随后新增的 owner pump 源码，也未获得发布资格。
+
+owner pump 结构收尾快照（源码清单 `b9cb4bbc`）已实际通过客户端和 schema 全套 **1,417 passed / 0 failed / 4 ignored**；随后仅修改测试 import 折行的 `3611ccdb` 快照通过格式检查、6 项 lifecycle integration 回归和 Linux x86_64-musl 私有构建。七项原结构性 clippy 提示已消除，严格 clippy 仍因 89 项未接线代码提示返回 101，未计作通过。对应私有 ELF SHA 为 `05329fc24eb2aa98ae4688024711dbe91df7539fe54757a0c8fbe5fccb281d4e`，未部署或用于生产自动更新。后续 warm 统一预算工作继续单独冻结、验证，不能借用此快照结果。
+
+warm 统一预算快照（源码清单 `4730ddb1`）已实际通过全套 **1,435 passed / 0 failed / 4 ignored**。最终 `451d4511` 仅改变 lifecycle 测试排版，生产代码逐字节不变，格式检查、72 项生命周期单测、6 项集成和明确 test-binary 的 11 项 Guard 合同测试通过；四文件增量独立审查无剩余 Critical/Important。Core、请求文件、SSH policy、nft 与最终确认共用原操作期限和累计读取预算，旧事实不续期。strict clippy 仍因 **92 项未接线/未使用代码提示**返回 101；Linux x86_64-musl 私有构建成功，ELF SHA `ec037983d66fc6fe3f7a085a082ed5330b75dd9ce8402c198bb5ecee1325ff9d`，不具备发布资格。隔离固定角色环境仍处于资产和独立清理监督器准备阶段，真正 warm factory、完整角色与冷启动尚未运行。
+
+隔离监督器的最新源码冻结与 Linux 文件/协议测试已完成：22 项通过（8 项契约、5 项 HTTP/socket、1 项 pending 恢复、8 项文件发布/删除），局部独立审查已关闭。镜像构建成功；但监督器 `main` 仍禁用，停止前的 systemd 实例代次复核未接通，真实 realm 的启动、退出及完整 hook 验收尚未运行。该工具验证不等于 Rust 产品已交付。
+
+详细阶段证据见[验证台账](../../work-records/2026-10-10/verification-ledger.md)。当前不得宣称完整恢复已验收、防泄漏已证明或 4.1.9 已发布/部署。必要网络基础设施也必须纳入资格：当前隔离实验预置永久邻居，不能据此认为实际 DAD、ND、RA、DHCP、冷网关和新上行已经通过。
 
 ## Global Constraints
 
@@ -56,7 +69,7 @@
 | `crates/bui-c/src/net.rs`、`nettest.rs` | 复用 `Net::probe -> Result<Probe,ProbeError>`；保留实际 HTTP/类别/耗时，不泄露错误载荷 |
 | 新 `crates/bui-c/src/recovery.rs` | 当前 basis、短期观测新鲜性、唯一受锁动作入口及不确定动作收尾 |
 | 新 `crates/bui-c/src/guard.rs` | 有界平台资格、有限规则计划、原子安装/内核读回；私有 typed receipt，不建第二权益库 |
-| `engine.rs/cli.rs/update.rs/units.rs/paths.rs/lib.rs` | 各维护入口、guard hook、完整就绪和模块登记；不另起恢复 daemon |
+| `engine.rs/cli.rs/update.rs/units.rs/paths.rs/lib.rs` | 各维护入口、guard hook、完整就绪和模块登记；统一接入一个 Rust 生命周期 owner，避免独立恢复写者 |
 | `crates/bui-schema/src/render/client.rs` | 显式全捕获渲染；沿同一 node/outbound，删除与全捕获冲突的普通业务 direct 例外 |
 | 新 `crates/bui-c/tests/guard_linux.rs` | 隔离平台真实资格/故障门禁，严格前置和到达断言 |
 | 新 `scripts/ops/bui-c-recovery-guard-drill.sh` | 明确 lab/主机 alias 的实测及回滚记录；公共示例，不嵌生产目标 |
@@ -164,4 +177,4 @@ assert(readback.guard_remains && ssh.existing_session_ok && ssh.allowed_new_sess
 
 ## 执行记录与完成定义
 
-每项记录 `source SHA / target / test names / precondition+branch markers / PASS-FAIL-ignored / log SHA / review / rollback`，缺实际前置不作业务 RED，缺故障流量不作 guard PASS。当前已完成上述 Task 1 和 Task 2 切片，整包回归仍在修正；隔离 LinuxKit minimum guard 资格实际失败，审计主机能力不得据此推断。源码版本已分配4.1.9，但 guard 实现/lifecycle、双栈防漏故障能力、完整回滚/实机验收、候选发布资格及实际发布/部署未因本文或版本号获得通过信用。root 直接继续 Task 1→2→3→4；本计划写者不改源码、不运行 Cargo/SSH、不再向用户请求计划批准。
+每项记录 `source SHA / target / test names / precondition+branch markers / PASS-FAIL-ignored / log SHA / review / rollback`，缺实际前置不作业务 RED，缺故障流量不作 guard PASS。Task 1 和 Task 2 的已测切片按各自快照记账，完整候选门槛仍未通过；早期隔离 LinuxKit minimum guard 资格实际失败，后续支持 socket cgroup 的隔离平台已有独立成功记录，二者均不能替代新的完整 realm 与产品验收。源码版本已分配4.1.9，但 guard 实现/lifecycle、双栈防漏故障能力、完整回滚/实机验收、候选发布资格及实际发布/部署未因本文或版本号获得通过信用。root 直接继续 Task 1→2→3→4；本计划写者不改源码、不运行 Cargo/SSH、不再向用户请求计划批准。
