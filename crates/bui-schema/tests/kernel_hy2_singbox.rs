@@ -12,7 +12,12 @@ mod common;
 /// 自签一张证书：`check` 会真读 `tls.certificate_path`（缺文件即
 /// `FATAL initialize inbound[0]: read certificate: open …: no such file or directory`），
 /// 所以证书目录只能是临时目录 —— CI 与开发机上都没有 `/opt/b-ui/certs`。
-/// 与 `kernel_hysteria.rs::self_signed` 同款；没有 `openssl` 就跳过。
+/// 与 `kernel_hysteria.rs::self_signed` 同款；本机没有 `openssl` 就跳过。
+///
+/// **CI 里不许静默跳过**（2026-10-10 计划 §8 #4）：这两个用例是「渲染器产的住宅配置真过
+/// 官方内核 `check`」的唯一自动化面，而 Linux runner 自带 openssl —— 它不可用意味着这两格
+/// 会在绿 CI 底下假绿，所以照 `relay_generation_kernel.rs` 的 `assert!(CI.is_none())` 范式
+/// 硬失败（本机仍只是 `skipped: openssl not usable`）。
 fn self_signed(dir: &std::path::Path) -> Option<()> {
     let out = std::process::Command::new("openssl")
         .args([
@@ -23,16 +28,22 @@ fn self_signed(dir: &std::path::Path) -> Option<()> {
         .arg("-out")
         .arg(dir.join("fullchain.pem"))
         .args(["-subj", "/CN=test.invalid"])
-        .output()
-        .ok()?;
-    out.status.success().then_some(())
+        .output();
+    let ok = matches!(&out, Ok(out) if out.status.success());
+    if !ok {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "kernel_hy2_singbox requires a usable openssl under CI"
+        );
+        eprintln!("skipped: openssl not usable");
+    }
+    ok.then_some(())
 }
 
 #[test]
 fn residential_inbound_config_passes_check_on_the_stock_singbox() {
     let dir = tempfile::tempdir().unwrap();
     if self_signed(dir.path()).is_none() {
-        eprintln!("skipped: openssl not usable");
         return;
     }
     let mut s = common::state("obfs"); // 带 obfs 的那份 fixture，覆盖 salamander 分支
@@ -57,7 +68,6 @@ fn residential_inbound_config_passes_check_on_the_stock_singbox() {
 fn an_empty_credential_pool_also_passes_check() {
     let dir = tempfile::tempdir().unwrap();
     if self_signed(dir.path()).is_none() {
-        eprintln!("skipped: openssl not usable");
         return;
     }
     let s = common::state("obfs");

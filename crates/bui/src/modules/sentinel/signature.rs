@@ -46,11 +46,24 @@ pub enum Sig {
     Hy2ResiMeteringLost,
     /// caddy：签证书失败
     CaddyCertFailed,
+    /// 守护进程自己的日志：**整轮对账中止**（计划 §4.3）。`reconcile_from_ctx` 内层 ≥7 条
+    /// `Err` 出口（preflight、发布被拒、`reconcile_once`、回执缺失…）没有一条走得到 runtime
+    /// 写入点，`last_reconcile` 会停在几小时前那份干净报告上、`/api/health` 照报 ok；包装补的
+    /// 合成失败报告点亮 degraded，这条签名让它在 `bui incidents` 与面板上同样可见
+    /// （`subject` 见 [`RECONCILE_SUBJECT`]，**不是** `b-ui`）。
+    ///
+    /// 事件节律**是有意为之**（不是缺陷，写在这里免得后来人当 bug 修）：中止轮只在真跑对账时
+    /// 出现 —— 守护进程的 10 分钟巡检（`serve::DRIFT_INTERVAL_SECS`）与去抖触发的那一轮共排一条
+    /// mpsc ⇒ 同一持续故障最多 10 分钟一条日志行，而动作冷却 `ACTION_COOLDOWN_SECS`=600 秒
+    /// ⇒ 事件约每 **20 分钟**一条（约 72 条/天）；`INCIDENTS_MAX`=200 ⇒ 单一故障约 **2.8 天**
+    /// 占满事件环，面板系统状态卡（`/incidents?limit=20`）只覆盖约 6.7 小时。与既有 Alert 级
+    /// 签名（`Hy2AuthHttpFailed` / `CaddyCertFailed`）行为一致。
+    ReconcileFailed,
 }
 
 /// 全部签名。**唯一一份名单**：`id()` 的重名不变量、最长签名窗口（`run::longest_window_secs`）
 /// 都按它枚举，新增签名只改这里。
-pub const ALL_SIGS: [Sig; 13] = [
+pub const ALL_SIGS: [Sig; 14] = [
     Sig::RelayUpstreamError,
     Sig::RelayUpstreamAuthFailed,
     Sig::RelayGoogleBlocked,
@@ -64,6 +77,7 @@ pub const ALL_SIGS: [Sig; 13] = [
     Sig::Hy2ResiGateReplayFailed,
     Sig::Hy2ResiPoolLow,
     Sig::Hy2ResiMeteringLost,
+    Sig::ReconcileFailed,
 ];
 
 /// 签名对应的预案（冷却按「动作 + 对象」计，设计裁决 D12）。
@@ -99,6 +113,7 @@ impl Sig {
             Sig::Hy2ResiGateReplayFailed => "hy2_resi_gate_replay_failed",
             Sig::Hy2ResiPoolLow => "hy2_resi_pool_low",
             Sig::Hy2ResiMeteringLost => "hy2_resi_metering_lost",
+            Sig::ReconcileFailed => "reconcile_failed",
         }
     }
 
@@ -119,7 +134,8 @@ impl Sig {
             | Sig::CaddyCertFailed
             | Sig::Hy2ResiGateReplayFailed
             | Sig::Hy2ResiMeteringLost
-            | Sig::Hy2ResiPoolLow => Action::Alert,
+            | Sig::Hy2ResiPoolLow
+            | Sig::ReconcileFailed => Action::Alert,
             Sig::KernelBindInUse | Sig::KernelCrashLoop | Sig::Hy2ResiRelayUnreachable => {
                 Action::DelegateWatchdog
             }
@@ -156,14 +172,16 @@ impl Sig {
                 window_secs: 60,
             },
             // 一条就说明问题：403 serp 是明确的上游策略，bind / 崩溃循环 / 证书失败都不会
-            //「偶发」；后两个是非日志签名，由重放与池巡查各自记一条
+            //「偶发」；后几个是非日志签名，由重放与池巡查各自记一条；整轮对账中止同样一条算数
+            //（10 分钟 tick 的节律下门槛 >1 永不达标 —— 抄 relay 系的 2/60 就是永不触发）
             Sig::RelayGoogleBlocked
             | Sig::KernelBindInUse
             | Sig::KernelCrashLoop
             | Sig::CaddyCertFailed
             | Sig::Hy2ResiGateReplayFailed
             | Sig::Hy2ResiMeteringLost
-            | Sig::Hy2ResiPoolLow => Rule {
+            | Sig::Hy2ResiPoolLow
+            | Sig::ReconcileFailed => Rule {
                 threshold: 1,
                 window_secs: 60,
             },
@@ -205,6 +223,12 @@ pub const DETAIL_MAX: usize = 240;
 /// `restart counter is at N` 里 N 到多少算崩溃循环
 pub const CRASH_LOOP_RESTARTS: u32 = 5;
 pub const BIND_IN_USE: &str = "bind: address already in use";
+/// [`Sig::ReconcileFailed`] 的对象（事件 `subject`、动作冷却键的后半段）。
+/// **独立于 `b-ui`**：冷却键只有 `动作|对象`、不含签名（设计裁决 D12），而 `alert|b-ui` 已被
+/// [`Sig::Hy2ResiGateReplayFailed`] / [`Sig::Hy2ResiPoolLow`] / [`Sig::Hy2ResiMeteringLost`]
+/// 占用 —— 撞键的后果是这三者谁先触发、对账中止就跟它共享 600 秒冷却，期间只留一行 debug
+/// （`run::tick` 的冷却分支），事件不进 `bui incidents`。
+pub const RECONCILE_SUBJECT: &str = "reconcile";
 /// 「凭据失效」（reason 小写）。`407` 只认状态行开头，免得把端口 4070 当成 407。
 /// `authentication required` 是 sing-box http 出站的形状（rick 14 天窗口 2650 条），
 /// 2026-09-18 补进来；这一行里的 `unexpected status:` 一定是**上游**对 CONNECT 的应答
@@ -247,7 +271,9 @@ pub fn classify(unit: &str, message: &str) -> Option<Match> {
     match unit {
         "b-ui-relay" => relay(message),
         "caddy" => caddy(message),
-        "b-ui" => metering_lost(message).or_else(|| xray_grpc(message)),
+        "b-ui" => metering_lost(message)
+            .or_else(|| xray_grpc(message))
+            .or_else(|| reconcile_failed(message)),
         _ if kernel => {
             // 鉴权回调只有直连那一路有（`watchdog::is_auth_http_failure` 的门槛与判据仍在，
             // 只喂 `hysteria-server` 的日志）
@@ -469,6 +495,20 @@ fn metering_lost(message: &str) -> Option<Match> {
     claim.then(|| hit(Sig::Hy2ResiMeteringLost, "b-ui", message))
 }
 
+/// 整轮对账中止（[`Sig::ReconcileFailed`]）：认 [`crate::serve::RECONCILE_FAILED_LOG`] 这个
+/// 常量 —— matcher 与 producer 共用它，`serve.rs` 那两处 `tracing::error!`（启动轮与去抖轮）
+/// 的文案都从它拼出来。**不放宽成 `对账`**：成功那一轮的 info 行「启动对账完成」也含它，
+/// 每次成功对账都会报一条假失败。
+///
+/// 自触发面：`run.rs` 把事件 `result` 写回 b-ui 自己的 journald（`"哨兵事件：{}"`），
+/// `system::on_reconcile_failed` 的文案**不许**含这个常量（同 `on_xray_grpc` 对
+/// `users::USER_SYNC_FAILED_LOG` 的约定）。
+fn reconcile_failed(message: &str) -> Option<Match> {
+    message
+        .contains(crate::serve::RECONCILE_FAILED_LOG)
+        .then(|| hit(Sig::ReconcileFailed, RECONCILE_SUBJECT, message))
+}
+
 fn xray_grpc(message: &str) -> Option<Match> {
     if !message.contains(crate::modules::panel::users::USER_SYNC_FAILED_LOG) {
         return None;
@@ -503,6 +543,37 @@ mod tests {
 
     fn sig_of(unit: &str, msg: &str) -> Option<(Sig, String)> {
         classify(unit, msg).map(|m| (m.sig, m.subject))
+    }
+
+    /// 整轮对账中止：对象**独立于 `b-ui`**（冷却键 `动作|对象` 不看签名，`alert|b-ui` 已被
+    /// 门位重放 / 凭据池 / 计量有损三个告警占着），只认守护进程自己的行，且不放过成功轮那句
+    /// （放宽成 `对账` 就会把每次成功对账报成失败）
+    #[test]
+    fn a_reconcile_abort_is_keyed_to_reconcile_and_spares_the_success_line() {
+        let abort = format!(
+            "{}：候选 sing-box 自报版本与 manifest 声明不符（声明 1.14.4，实得 1.14.3）",
+            crate::serve::RECONCILE_FAILED_LOG
+        );
+        assert_eq!(
+            sig_of("b-ui", &abort),
+            Some((Sig::ReconcileFailed, RECONCILE_SUBJECT.to_string()))
+        );
+        assert_eq!(sig_of("xray", &abort), None, "只认守护进程自己的行");
+        assert_eq!(
+            sig_of("b-ui", "启动对账完成 changed=1 restarted=0"),
+            None,
+            "成功轮的 info 行不许被认成失败"
+        );
+        assert_eq!(
+            sig_of("b-ui", "住宅恢复：对账后收敛槽路由完成"),
+            None,
+            "别处提到「对账」的行同样不算"
+        );
+        // 计量有损的 marker 与对账无关：两者都在 b-ui 分支上按各自的判据分流
+        assert_ne!(
+            RECONCILE_SUBJECT, "b-ui",
+            "冷却键是 动作|对象：对象撞 b-ui 会与三个 Alert 级 b-ui 告警互相吃掉 600 秒冷却"
+        );
     }
 
     #[test]
@@ -1210,9 +1281,26 @@ mod tests {
             // 非日志签名：重放（spec §3.4）与池巡查（§3.1）各自一条就告警
             Sig::Hy2ResiGateReplayFailed,
             Sig::Hy2ResiPoolLow,
+            Sig::ReconcileFailed,
         ] {
             assert_eq!(s.rule().threshold, 1, "{s:?}");
         }
+        // 对账中止：10 分钟 tick 的节律下门槛 >1 永不达标（relay 系抄 2 条就是永不触发）；
+        // 窗口不许抬到 150 秒以上 —— `run::longest_window_secs` 按 ALL_SIGS 推导它
+        assert_eq!(
+            Sig::ReconcileFailed.rule(),
+            Rule {
+                threshold: 1,
+                window_secs: 60
+            }
+        );
+        assert!(Sig::ReconcileFailed.rule().window_secs <= 150);
+        assert_eq!(Sig::ReconcileFailed.id(), "reconcile_failed");
+        assert_eq!(Sig::ReconcileFailed.action().id(), "alert");
+        assert!(
+            !Sig::ReconcileFailed.on_upstream(),
+            "对账中止的对象是守护进程自己，没有 relay 归因中间态"
+        );
         assert_eq!(
             Sig::Hy2ResiRelayUnreachable.action().id(),
             "delegate_watchdog"

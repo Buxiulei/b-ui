@@ -366,6 +366,9 @@ async fn dispatch(
         (Sig::Hy2ResiMeteringLost, _) => system::on_metering_lost(&deps.panel),
         // 非日志签名：`classify` 不产出它们（重放与池巡查直接记事件，spec §3.4 / §3.1）
         (Sig::Hy2ResiGateReplayFailed | Sig::Hy2ResiPoolLow, _) => system::on_resi_alert(sig),
+        // 整轮对账中止（计划 §4.3）：只告警 —— 合成失败报告与 degraded 点亮在
+        // `serve::reconcile_from_ctx` 的包装里，哨兵这边没有可做的事（不重启任何单元）
+        (Sig::ReconcileFailed, _) => system::on_reconcile_failed(),
     }
 }
 

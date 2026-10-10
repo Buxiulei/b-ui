@@ -208,8 +208,9 @@ async fn close_conns_of(shared: &Shared, targets: &[ResiKickTarget]) -> usize {
     closed
 }
 
-/// 打直连 hysteria 的 `/traffic?clear=1` 与 `/online`，再打住宅 sing-box 的
-/// `QueryStats(reset=true)` 与 `/connections`，最后打一次 Xray 的 `QueryStats(reset=true)`。
+/// 打直连 hysteria 的 `/traffic?clear=1` 与 `/online`，再打住宅的计量账本
+/// （`query_user_deltas`，见 [`super::meter`]）与 Clash API 的 `/connections`，最后打一次
+/// Xray 的 `QueryStats(reset=true)`。
 ///
 /// 单个来源失败只记 error，不影响其余来源（spec §4.2）。`resi_names` 是
 /// [`resi_name_to_user`] 的结果：住宅那两条返回的是凭据 name，认不出的键丢弃。
@@ -219,7 +220,7 @@ pub async fn sample_once(
     resi_names: &BTreeMap<String, Uuid>,
 ) -> Sample {
     let mut s = Sample::default();
-    // 顺序固定（直连 traffic 按 ports 升序 → 直连 online 同序 → 住宅 QueryStats →
+    // 顺序固定（直连 traffic 按 ports 升序 → 直连 online 同序 → 住宅计量账本 →
     // 住宅 /connections → Xray），测试按这个顺序断言 calls()
     for port in ports.iter().copied() {
         match shared.hy2().traffic_clear(port).await {
@@ -762,7 +763,7 @@ mod tests {
         assert_eq!(
             h.hy2resi.calls(),
             vec!["query".to_string(), "connections".to_string()],
-            "住宅只有 QueryStats 与 /connections 两次调用"
+            "住宅只有计量账本与 /connections 两次调用"
         );
     }
 
@@ -770,8 +771,8 @@ mod tests {
     /// （spec §4.2 既有口径）：前面是直连的 `/traffic`，后面是同一轮的住宅
     /// `/connections` 与 Xray 的 `QueryStats`。
     ///
-    /// 「后面」这半是本用例的守门点：把住宅 `QueryStats` 的 `Err` 分支改成整轮
-    /// 提前返回（`?` 化重构最容易写成这样），Reality 的流量与住宅在线数会连带丢掉，
+    /// 「后面」这半是本用例的守门点：把住宅计量账本（`query_user_deltas`）的 `Err`
+    /// 分支改成整轮提前返回（`?` 化重构最容易写成这样），Reality 的流量与住宅在线数会连带丢掉，
     /// 而 T8 落地前住宅那个面在每台机上都是不可达的 ⇒ 每一轮都丢。
     #[tokio::test]
     async fn a_grpc_failure_does_not_lose_the_samples_before_or_after_it() {
@@ -782,9 +783,9 @@ mod tests {
             i.traffic
                 .insert(9999, BTreeMap::from([(id.clone(), TxRx { tx: 5, rx: 0 })]));
         });
-        // 住宅的 QueryStats（住宅那两条里的第一条）失败一次；它之后的 `/connections`
+        // 住宅的计量账本（住宅那两条里的第一条）失败一次；它之后的 `/connections`
         // 与 Xray 照常应答
-        h.hy2resi.fail_next("v2ray_api 不可达");
+        h.hy2resi.fail_next("计量账本不可达");
         h.hy2resi
             .set_conns(vec![("c1", "auth_user=alice => route(gate-r000)")]);
         h.xray.with(|i| {
@@ -935,7 +936,7 @@ mod tests {
         with_pool(&h).await;
         let id = h.store.read().await.users[0].user_id.to_string();
         // 直连的 /traffic 与 /online 双双失败、住宅的 /connections 失败、Xray 失败，
-        // 只剩住宅的 QueryStats 活着 —— 它那 7 字节必须照旧入账。
+        // 只剩住宅的计量账本活着 —— 它那 7 字节必须照旧入账。
         h.hy2.with(|i| {
             i.fail_ports.insert(9999);
         });
@@ -1190,7 +1191,7 @@ mod tests {
     async fn the_health_summary_lands_in_runtime_extra() {
         let h = harness().await;
         let ctx = ctx_of(&h);
-        h.hy2resi.fail_next("v2ray_api 不可达");
+        h.hy2resi.fail_next("计量账本不可达");
         tick(&ctx, &h.shared).await.unwrap();
         write_health_summary(&ctx, &h.shared).await;
         let v = h.runtime.read().await.extra["users"].clone();

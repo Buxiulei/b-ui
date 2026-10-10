@@ -195,12 +195,79 @@ fn certificate_bootstrap_change(change: &crate::reconcile::diff::Change, paths: 
     }
 }
 
+/// 「整轮对账中止」两条日志（启动那一轮与去抖队列那一轮，见 [`reconcile_abort_log`]）共用的
+/// 文案常量。日志哨兵（[`crate::modules::sentinel::signature::Sig::ReconcileFailed`]）按它匹配
+/// —— matcher 与 producer 共用同一个常量，改文案只能从这里改。**不带方括号**（源码里本来没有）。
+pub const RECONCILE_FAILED_LOG: &str = "对账失败";
+
+/// 中止轮合成报告里的那条 `notes`：两条「回执缺失」出口发生在 `reconcile_once` 已落盘、单元已
+/// 重启**之后**，那一轮真实的 `changed` / `restarted` 清单却被 `?` 整份丢弃 —— 不写这条，
+/// `bui status` 会打「变更 0 项」而事实相反（计划 §4.3 第 8 条）。
+const RECONCILE_ABORTED_NOTE: &str =
+    "本轮在写入运行数据前中止：changed/restarted 清单不可用，可能已有部分改动落盘";
+
+/// 「整轮对账中止」日志的文案（`startup` = 启动那一轮，多一个前缀）。**唯一构造点**：生产的
+/// 两处 `tracing::error!` 与自证测试都调它 —— 喂给哨兵的串就是生产打的串，matcher 一旦失明
+/// 测试必红（「照抄一个永不命中的常量而测试一起绿」是本模块最危险的回归）。
+fn reconcile_abort_log(startup: bool, error: &anyhow::Error) -> String {
+    if startup {
+        format!("启动{RECONCILE_FAILED_LOG}：{error}")
+    } else {
+        format!("{RECONCILE_FAILED_LOG}：{error}")
+    }
+}
+
 /// 从 [`DaemonCtx`] 跑一轮并把报告 / 漂移 / 重启键写进 runtime；relay 重启时发 [`Event::RelayRestarted`]。
 ///
 /// `fetcher` 用 `Arc<dyn Fetcher>` 传入并在 `spawn_blocking` 里使用（`reqwest::blocking`
 /// 不能在 async 上下文里跑）。**不重启 `b-ui` 自己**（apply 也不会）——调用方拿到报告后调
 /// [`finish_self_restart`]。
+///
+/// **整轮中止必须可见**（计划 §4.3）：内层有 ≥7 条 Err 出口（preflight、发布被拒、
+/// `reconcile_once`、回执缺失…），没有一条走得到 runtime 写入点 —— 于是 `last_reconcile` 停在
+/// 几小时前的干净报告上、`/api/health` 照报 ok。这里兜一层：`Err` 且 `!dry_run` 时写一份只填
+/// `at` / `errors` / `notes` 的合成报告（`api/health.rs` 与 `status.rs` 的 degraded 第三项据此
+/// 点亮），**只写 `last_reconcile` 一项** —— `restart_keys` / `drift` 保持原值，后者非空本身是
+/// 独立的 degraded 判据，照抄成功路径那一行会把真实漂移擦成空。
+///
+/// `errors` 先过 [`crate::redact::line`]（带错误链比 `{e}` 更可诊断）：`logging.rs` 只是
+/// subscriber 初始化、没有脱敏层，错误链里的 `scheme://user:pass@…` 会经 `runtime.json`、
+/// `/api/health`、`bui status` 与 `POST /api/reconcile` 回包扩散。
+///
+/// **`Err` 原样重抛**（不包装不吞）：四个生产调用点与两条测试硬断言都依赖它。已知取舍：内层若在
+/// 写完真实报告之后才失败（如 owner 任务 panic 后的 `ended without a result`），合成报告会覆盖
+/// 那份真实报告 —— 本轮确实失败且 degraded 判定不变，接受。
+///
+/// 覆盖边界（不许夸大）：启动那一轮**可能**漏首发（哨兵 `modules/sentinel` 的 spawn 晚于启动
+/// 对账，首 tick 用 `--since` 读同秒），后续轮与 10 分钟巡检走游标，可靠；Ok-带错误类（apply
+/// 逐项失败）走报告自身的 `errors`，不经这里。
 pub async fn reconcile_from_ctx(
+    ctx: &DaemonCtx,
+    modules: &[Arc<dyn Module>],
+    fetcher: Arc<dyn Fetcher>,
+    force: bool,
+    dry_run: bool,
+) -> anyhow::Result<ReconcileReport> {
+    let result = reconcile_from_ctx_inner(ctx, modules, fetcher, force, dry_run).await;
+    if let Err(error) = &result {
+        // dry-run 成败都不写 runtime（`reconcile_offline` 的本地路径与各测试都传 true）
+        if !dry_run {
+            let report = ReconcileReport {
+                at: crate::util::fmt_rfc3339(ctx.host.now()),
+                errors: vec![crate::redact::line(&format!("{error:#}"))],
+                notes: vec![RECONCILE_ABORTED_NOTE.into()],
+                ..Default::default()
+            };
+            ctx.runtime
+                .update(|r| r.last_reconcile = Some(report))
+                .await;
+        }
+    }
+    result
+}
+
+/// [`reconcile_from_ctx`] 的本体（包装只管「中止轮落一份合成报告」）。
+async fn reconcile_from_ctx_inner(
     ctx: &DaemonCtx,
     modules: &[Arc<dyn Module>],
     fetcher: Arc<dyn Fetcher>,
@@ -382,7 +449,10 @@ pub async fn reconcile_from_ctx(
             }
             match completion {
                 Ok(receipt) => { if receipt.phase == "active" { keys.extend(receipt.pending_keys); if residential_activated { report.restarted.push("hysteria-residential".into()); } } }
-                Err(error) => report.errors.push(format!("residential activation: {error}")),
+                Err(error) => report.errors.push(format!(
+                    "residential activation: {}",
+                    crate::redact::line(&format!("{error:#}"))
+                )),
             }
             c.runtime.update(|r| { r.restart_keys = keys; r.drift = report.drift.clone(); r.last_reconcile = Some(report.clone()); }).await;
         }
@@ -752,7 +822,9 @@ pub async fn run(paths: Paths, host: Arc<dyn Host>) -> anyhow::Result<()> {
             // 报告已落盘，这时才允许重启自己（B5）
             finish_self_restart(&ctx, &r, true).await;
         }
-        Err(e) => tracing::error!(error = %e, "启动对账失败：{e}"),
+        // 文案经 `reconcile_abort_log`（唯一构造点）—— 哨兵按同一个常量匹配，见 `RECONCILE_FAILED_LOG`。
+        // 启动那一轮与哨兵的 spawn 是同一秒的竞速：首 tick 用 `--since` 可能漏掉本行，后续轮会补。
+        Err(e) => tracing::error!(error = %e, "{}", reconcile_abort_log(true, &e)),
     }
     // spec §5.6 + D7：对账刚把新的 xray-config.json 落盘，这时收敛住宅槽路由 ——
     // 走 RoutingService gRPC 增删受影响用户的规则，**不重启 xray**；只有 gRPC 失败且
@@ -774,7 +846,7 @@ pub async fn run(paths: Paths, host: Arc<dyn Host>) -> anyhow::Result<()> {
             while let Some(force) = rx.recv().await {
                 match reconcile_from_ctx(&ctx2, &mods2, f2.clone(), force, false).await {
                     Ok(r) => finish_self_restart(&ctx2, &r, true).await,
-                    Err(e) => tracing::error!(error = %e, "对账失败：{e}"),
+                    Err(e) => tracing::error!(error = %e, "{}", reconcile_abort_log(false, &e)),
                 }
                 // spec §5.6 + D7：同上，对账落盘之后收敛住宅槽路由（gRPC 增删，不重启）
                 crate::modules::residential::slots::converge_xray(&ctx2, panel2.xray()).await;
@@ -2369,6 +2441,114 @@ mod tests {
             host.ops().last().map(String::as_str),
             Some("run:systemctl restart --no-block b-ui.service"),
             "守护进程内不能同步 restart 自己"
+        );
+    }
+
+    /// 哨兵 matcher 自证（计划 §4.3 的必做验收）：把两条 `tracing::error!` 的**实际输出文本**
+    /// 喂给 `classify` 必须命中 [`Sig::ReconcileFailed`]；成功那一轮的 info 行不许命中
+    /// （放宽成「对账」会在这一步转红）。文本经 [`reconcile_abort_log`] 构造 —— 与生产同一个
+    /// 函数，所以「哨兵认得出」不靠测试里另抄一份文案。`sys/mod.rs` 的 `parse_journal_json`
+    /// 会把 tracing 的 `error=` 字段追加进 MESSAGE，这里照同样形状补上后缀。
+    #[test]
+    fn the_two_abort_log_lines_are_recognized_by_the_sentinel() {
+        use crate::modules::sentinel::signature::{classify, Sig, RECONCILE_SUBJECT};
+        let e =
+            anyhow::anyhow!("候选 sing-box 自报版本与 manifest 声明不符：声明 1.14.4，实得 1.14.3");
+        for startup in [true, false] {
+            let line = format!("{} error={e}", reconcile_abort_log(startup, &e));
+            let m = classify("b-ui", &line).unwrap_or_else(|| panic!("哨兵没认出来：{line}"));
+            assert_eq!(m.sig, Sig::ReconcileFailed, "{line}");
+            assert_eq!(m.subject, RECONCILE_SUBJECT, "{line}");
+        }
+        assert_eq!(
+            classify("b-ui", "启动对账完成 changed=0 restarted=0"),
+            None,
+            "成功轮的 info 行不许被认成失败"
+        );
+    }
+
+    /// 中止轮回归（计划 §4.3）：一份损坏的恢复记录让 `publish_with_relay` 第一步
+    /// `recover_pending` 就 Err ⇒ 整轮中止（`:405` 那条 `Err(error) => return Err(error)`）。
+    /// 断言四件事：① 包装落了合成报告（errors 非空、notes 是那条中止说明）；② `/api/health`
+    /// 的 degraded 第三项由 false → true；③ `restart_keys` 与 `drift` 与轮前**逐字节相同**
+    /// —— 照抄成功路径那一行会把真实漂移擦空；④ `Err` 原样重抛（不能翻成 Ok）。
+    #[tokio::test]
+    async fn an_aborted_round_stays_visible_without_touching_keys_or_drift() {
+        use crate::state::runtime::{DriftItem, RuntimeData};
+        let host = ready_host();
+        let d = tempfile::tempdir().unwrap();
+        let ctx = ctx_for(host.clone(), &d).await;
+        let reg = modules(None);
+        let fetcher: Arc<dyn Fetcher> = Arc::new(FakeFetcher(Mutex::new(vec![])));
+        // 轮前：一份干净的旧报告（真实机器上它可能就是几小时前那一轮）+ 非空的重启键与漂移
+        ctx.runtime
+            .update(|r| {
+                r.restart_keys
+                    .insert("xray-config.json".into(), "deadbeef".into());
+                r.drift.push(DriftItem {
+                    kind: "unit_dropin".into(),
+                    path: "/etc/systemd/system/xray.service.d/override.conf".into(),
+                    detail: "非受管改动，只报不改".into(),
+                });
+                r.last_reconcile = Some(ReconcileReport {
+                    at: "2026-10-10T00:00:00Z".into(),
+                    ..Default::default()
+                });
+            })
+            .await;
+        let at = crate::util::fmt_rfc3339(ctx.host.now());
+        let (keys_before, drift_before) = {
+            let rt = ctx.runtime.read().await;
+            (
+                serde_json::to_string(&rt.restart_keys).unwrap(),
+                serde_json::to_string(&rt.drift).unwrap(),
+            )
+        };
+        // `read_record` 走真实文件系统（`residential_lifecycle::directory`），不是 FakeHost
+        let lc = d.path().join(".residential-lifecycle");
+        std::fs::create_dir_all(&lc).unwrap();
+        std::fs::write(lc.join("record.json"), b"{ not json").unwrap();
+
+        let err = reconcile_from_ctx(&ctx, &reg.modules, fetcher, false, false)
+            .await
+            .expect_err("损坏的恢复记录必须中止整轮（Err 原样往外）");
+        assert!(
+            format!("{err:#}").contains("residential recovery record"),
+            "{err:#}"
+        );
+
+        let rt = ctx.runtime.read().await;
+        let report = rt
+            .last_reconcile
+            .as_ref()
+            .expect("中止轮必须落一份合成报告（旧的干净报告不许留着）");
+        assert_eq!(report.at, at);
+        assert_eq!(report.notes, vec![RECONCILE_ABORTED_NOTE.to_string()]);
+        assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+        assert!(
+            report.errors[0].contains("residential recovery record"),
+            "合成报告要留住错误链：{:?}",
+            report.errors
+        );
+        assert!(report.changed.is_empty() && report.restarted.is_empty());
+        assert!(!report.dry_run);
+        // `/api/health` 与 `bui status` 的 degraded 第三项（api/health.rs:66-70 同一口径）
+        let degraded = |rt: &RuntimeData| {
+            rt.last_reconcile
+                .as_ref()
+                .is_some_and(|r| !r.errors.is_empty() || !r.verify_failures.is_empty())
+        };
+        assert!(degraded(&rt), "中止轮必须把 degraded 点亮");
+        // 真实运行数据一个字节都不许动
+        assert_eq!(
+            serde_json::to_string(&rt.restart_keys).unwrap(),
+            keys_before,
+            "照抄成功路径那一行会把 restart_keys 换掉"
+        );
+        assert_eq!(
+            serde_json::to_string(&rt.drift).unwrap(),
+            drift_before,
+            "drift 非空本身是独立的 degraded 判据，不许被合成报告擦空"
         );
     }
 

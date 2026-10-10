@@ -3,7 +3,7 @@
 //! （设计裁决 D9 / D10 / D11）。
 
 use super::incidents::{Level, Outcome};
-use super::signature::Sig;
+use super::signature::{Sig, RECONCILE_SUBJECT};
 use crate::modules::panel::{meter, users, Shared, XRAY_API_ADDR};
 use crate::reconcile::DaemonCtx;
 use crate::sys::Proto;
@@ -186,6 +186,24 @@ pub fn on_metering_lost(panel: &Shared) -> Outcome {
     }
 }
 
+/// 整轮对账中止（`Sig::ReconcileFailed`，计划 §4.3）：只告警。`serve::reconcile_from_ctx` 的
+/// 包装已经落了合成失败报告（`/api/health` 与 `bui status` 据此 degraded），这条事件把
+/// 「中止了、而且可能已有改动落盘」带到 `bui incidents` 上；**不重启任何单元**（单元归 systemd
+/// 与看门狗；中止轮恰恰可能刚重启过内核，再叠一次重启只会更乱）。
+///
+/// 文案**不许**包含 `crate::serve::RECONCILE_FAILED_LOG`：run.rs 把 `result` 写回 b-ui 自己的
+/// journald（`"哨兵事件：{}"`），哨兵再读到它就会自己认领自己，无限触发（同 `on_xray_grpc`
+/// 对 `users::USER_SYNC_FAILED_LOG` 那条约定）。
+pub fn on_reconcile_failed() -> Outcome {
+    Outcome {
+        subject: RECONCILE_SUBJECT.to_string(),
+        result: "守护进程有一轮期望态收敛在写运行数据前中断了：changed/restarted 清单不可用，\
+                 可能已有部分改动落盘。看 `bui status` 的错误项与守护进程日志；先不重启任何单元"
+            .to_string(),
+        level: Level::Error,
+    }
+}
+
 /// 两个**非日志**签名的告警文案：它们由门位重放（spec §3.4）与凭据池巡查（§3.1）
 /// 直接记事件，`classify` 不会产出它们；这里只兜住「万一从日志那条路进来了」。
 pub fn on_resi_alert(sig: Sig) -> Outcome {
@@ -361,6 +379,28 @@ mod tests {
         let low = on_resi_alert(Sig::Hy2ResiPoolLow);
         assert!(low.result.contains("空闲凭据不足"), "{}", low.result);
         assert_ne!(replay.result, low.result);
+    }
+
+    /// 整轮对账中止：只告警、指路，文案**不带** `serve::RECONCILE_FAILED_LOG`，
+    /// 且 run.rs 的回写行（`"哨兵事件：{result}"`）喂回 `classify` 认不出任何签名 ——
+    /// 哨兵读自己的 journald，带上了就是无限自触发
+    #[test]
+    fn a_reconcile_abort_event_never_self_triggers() {
+        use crate::modules::sentinel::signature::classify;
+        let o = on_reconcile_failed();
+        assert_eq!((o.subject.as_str(), o.level), ("reconcile", Level::Error));
+        assert!(
+            !o.result.contains(crate::serve::RECONCILE_FAILED_LOG),
+            "事件文案不许含匹配常量（自触发）：{}",
+            o.result
+        );
+        assert!(
+            o.result.contains("落盘") && o.result.contains("bui status"),
+            "要点名「可能已有部分改动落盘」并指路：{}",
+            o.result
+        );
+        let echo = format!("哨兵事件：{}", o.result);
+        assert_eq!(classify("b-ui", &echo), None, "回写行被自己认领了：{echo}");
     }
 
     /// 计量账目不可信：事件要点名窗口、后果（fail-open 封禁口径）与人工核账，

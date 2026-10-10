@@ -327,22 +327,35 @@ async fn exercise() -> Result<()> {
     let mut config =
         bui_schema::render::hy2_singbox::config(&state.node, &h.paths, &state.residential.hy2_pool);
     // Preserve the actual renderer's routing, logging, users, selectors and deny outbound.
+    // 每个注入点都先验形状再按下标写：serde_json 的 `IndexMut` 在中间层是错类型时直接
+    // panic，而「渲染器改道」应当以带解释的 ensure 错误结束（今天都不可达，守卫要严）。
+    ensure!(
+        config["inbounds"][0].as_object().is_some(),
+        "renderer must emit the hy2 inbound as an object"
+    );
     config["inbounds"][0]["listen"] = json!("127.0.0.1");
     config["inbounds"][0]["listen_port"] = json!(hy2_port);
+    ensure!(
+        config["experimental"]["clash_api"].as_object().is_some(),
+        "renderer must emit experimental.clash_api as an object"
+    );
     config["experimental"]["clash_api"]["external_controller"] =
         json!(format!("127.0.0.1:{clash}"));
     // 计量面 = 渲染器产的顶层 `services[0]`（官方内核内置 api 服务，`daemon.StartedService`
-    // 的 gRPC）。先确认真有一个服务再按下标写：4.x 的 `experimental.v2ray_api` 官方发行物
-    // 不认（启动即 FATAL），谁把渲染器改回去，这里要挡在指纹对不上之前。
+    // 的 gRPC）。先确认真有一个服务对象再按下标写：4.x 的 `experimental.v2ray_api` 官方
+    // 发行物不认（启动即 FATAL），谁把渲染器改回去，这里要挡在指纹对不上之前。
     ensure!(
         config["services"]
             .as_array()
-            .is_some_and(|services| services.len() == 1),
-        "renderer must emit exactly one service (the api service)"
+            .is_some_and(|services| services.len() == 1 && services[0].as_object().is_some()),
+        "renderer must emit exactly one service object (the api service)"
     );
     config["services"][0]["listen"] = json!("127.0.0.1");
     config["services"][0]["listen_port"] = json!(v2ray);
-    for outbound in config["outbounds"].as_array_mut().unwrap() {
+    let outbounds = config["outbounds"]
+        .as_array_mut()
+        .context("renderer must emit an outbounds array")?;
+    for outbound in outbounds {
         match outbound["tag"].as_str() {
             Some("slot-0-out") => outbound["server_port"] = json!(a.port),
             Some("slot-1-out") => outbound["server_port"] = json!(b.port),

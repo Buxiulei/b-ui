@@ -145,6 +145,8 @@ selector gate-r000 { outbounds: ["deny","slot-0-out"…"slot-7-out"], default: "
 
 **哪些还没验**（PoC 配置里没有，进 §12）：`experimental.v2ray_api` 段（tizi 上跑的是官方 1.14.0 二进制，不带 `with_v2ray_api`，这段配置在它上面必然 FATAL，只能等自建二进制）、QUIC 空闲超时字段名。
 
+> **（2026-10-10 订正）**：`experimental.v2ray_api` 那半已不成立 —— 自建链退役、随发布分发回到官方发行物，渲染器改产官方内核内置的顶层 `"services": [ { "type": "api", … } ]`（本小节上方 JSON 的订正），官方二进制上直接可跑，不再「只能等自建二进制」；仍未验的只剩 QUIC 空闲超时字段名。本小节其余把 `v2ray_api` 当计量面的提法同此订正。见 `docs/superpowers/plans/2026-10-10-singbox-official-and-metering.md` §2–§3。
+
 字段出处：`users[].name/password`、`obfs`、`masquerade`、`ignore_client_bandwidth`、`bbr_profile`（1.14 起，缺省 `standard`，不写）、`tls` 必填——https://sing-box.sagernet.org/configuration/inbound/hysteria2/ ；`ListenOptions` 只有单个 `listen_port`、**没有端口范围字段**——https://sing-box.sagernet.org/configuration/shared/listen/ （评估 `sb.facts[5-入站无端口范围字段]`，这正是必须自管 nft 的原因）；`v2ray_api.stats.users` = "User list to count traffic" 且 "V2Ray API is not included by default"——https://sing-box.sagernet.org/configuration/experimental/v2ray-api/ 。
 
 与今天 apernet 配置（`render/hysteria.rs:86-152` `common_doc`）的逐项对应：`sniGuard: disable` → sing-box 无此概念，不需要字段；`resolver`（DoH）→ 本实例不解析目标域名，不要 `dns` 段；`trafficStats` → `v2ray_api`；`auth` → `users[]`；**`sniff` 没有对应物**（route 的 `sniff` action 在这条路上必然空手而归，见上，裁决是不用它）；`quic.maxIdleTimeout: 60s` → sing-box 侧字段名是 `idle_timeout`，**渲染器不写、吃默认值 30 s**（§12 第 7 项已验）。这四个 apernet 专属字段在 sing-box 的入站 schema 里根本不存在，是配置模型的结构性差异而不是改名（评估 `sb.facts[1-apernet专属字段无对应]`）。
@@ -153,7 +155,11 @@ selector gate-r000 { outbounds: ["deny","slot-0-out"…"slot-7-out"], default: "
 
 **新端口常量**：`HY2_RESI_CLASH_API = "127.0.0.1:9092"`（relay 是 9091，`residential/mod.rs:42` + 测试 `:388`）、`HY2_RESI_V2RAY_API = "127.0.0.1:10086"`（Xray api 是 10085）。两个面都**只监听回环、不设 secret**，与 relay 的 Clash API 同口径。`render/hysteria.rs` 里那条「鉴权端口避开全部监听端口」的守门测试扩成一张端口占用表，把这两个也钉进去。
 
+> **（2026-10-10 订正）**：第二个常量已改名 `HY2_RESI_API`（`HY2_RESI_V2RAY_API` 这个名字随自建链退役），端口 `127.0.0.1:10086` 不变 —— 官方内核内置 `services` 的 `api` 服务，不再是 v2ray_api。见 2026-10-10 计划 §2–§3。
+
 **兼容矩阵不适用于本文件**：它只在我们自建的 sing-box（≥ 1.14，带 `with_v2ray_api`）上跑，CI 只对它跑自建 1.14 的 `check`（§5.4 第 9 条）。三种订阅 / relay / `bui-c` 必须继续过 1.12–1.14 三版 `check` 的约束不变。
+
+> **（2026-10-10 订正）**：前提「我们自建的 sing-box（带 `with_v2ray_api`）」随自建链退役作废 —— 本文件现在就是官方发行物（官方 v1.14.3），CI 对它的 `check` 跑官方二进制；「兼容矩阵不适用于本文件」（只验 1.14 一档）的结论不变。见 2026-10-10 计划 §2–§3。
 
 ### 2.4 端口与 nft 表
 
@@ -540,12 +546,14 @@ Clash API 客户端复用 `modules/residential/clash.rs` 的 `Clash` trait（`re
 - 新增每轮检查：`nft list table inet bui` 存在且规则集哈希 = 期望，否则重放并记 `nft_table_missing`。
   - **`nft list` 非零分两种，默认方向是「表不在」**（2026-09-17 裁决，T12 复核）：「表不在」⇒ 重放，「读不到」（权限 / 事务占用 / 包装脚本，表可能好着）⇒ 记 `nft_list_failed`（Warn）且这一轮既不重放也不采样。判据**不许依赖 glibc 的 strerror 文案**——nft 的正文是英文 `Error: ` 加 strerror(errno)，后半句跟 locale 翻译（中文主机上 ENOENT 是「没有那个文件或目录」），而守护进程的 locale 继承 systemd manager 的 `LANG`。落地两层：① `crate::sys::real` 给**每个**子进程钉 `LC_ALL=C` + `LANGUAGE=C`（错误文案既是判据也是事件正文的原文）；② `watchdog::table_missing` 只把认得出的「读不到」标记挑走，认不出的一律当「表不在」——认错只多重放一次（整表替换幂等），认反了整表自愈永久失效、住宅整段跳跃一直不通。
 - Clash API `9092` 与 v2ray_api `10086` **不进** watchdog 目标（回环面，进程在就有；进程僵死靠 `40000/udp` 判）。
+  - **（2026-10-10 订正）**：`10086` 现在是官方内核内置 `services` 的 `api` 服务（不再是 v2ray_api）；「该面不进 watchdog 目标」的结论与理由不变。见 2026-10-10 计划 §2–§3。
 
 ### 8.3 自检（`commands/selfcheck.rs`）
 
 - `listen_ports`（`:188-200`）**已经**只查 `p.hy2_resi` 一个住宅端口，注释也已写「端口跳跃区间不查（redirect 过来的，本身不监听）」⇒ **本函数不用改**，槽 1..7 的端口本来就没进去过。
 - `hy2_loopback`（`:248`）保留直连探测；新增住宅回环探测：取首个有 `hy2_resi_cred` 的用户的 `name:secret`（配置文件 0600、用完即删，同 `hy2_client_yaml` 套路，`:201`）连 `127.0.0.1:40000` 且带 `mport=41000-50000`（验 output 链）→ https 200。证书未就绪时 SKIP 而不是 FAIL（沿用 `:150` 那套口径）。
 - 新增四行：「nft 表 inet bui」（存在 + 规则数 = 4，兼容段关掉后是 2）、「端口 1 未被监听」（`deny` 出站的前提）、「住宅 HY2 凭据池」（已用 / 空闲 / 代数）、「Clash API 9092 与 v2ray_api 10086 在听」。
+  - **（2026-10-10 订正）**：该行文案现为「Clash API 127.0.0.1:9092 与 api 服务 127.0.0.1:10086 在监听」（`commands/selfcheck.rs:589`）——`10086` 是官方内核内置 `services` 的 `api` 服务，不再是 v2ray_api。见 2026-10-10 计划 §2–§3。
 
 ---
 
@@ -658,6 +666,7 @@ Clash API 客户端复用 `modules/residential/clash.rs` 的 `Clash` trait（`re
 - **删**：`slots::{HY2_STATS_RESI_BASE, hop_slice, slot_span, resources_of, resubscribe_impact, ResubscribeImpact}`、`SlotRes.{hy2_port, stats_port, hop}`、`render::hysteria::{residential_slot_yaml, residential_yaml}`。
 - **改**：`SlotRes { index, relay_port }`；`slots::resources(&Ports, index, span)` → `resources(index)`。`slots` 其余导出（`indices` / `sorted` / `fallback_index` / `slot_id_of_user` / `index_of_user` / `free_index` / `sync_slots` / `users_of_slot` / `least_loaded` / `assign` / `assign_least_loaded` / `migrate_unassigned` / `rebalance`）与 `MAX_SLOTS` / `RELAY_SOCKS_BASE` **签名不变**。
 - **增**：`model::{Hy2Pool, ReservedCred}`、`Credentials.hy2_resi_cred`、`SystemSettings.hy2_resi_compat_ports`；`hy2pool::{size_for, grow, assign, release, cred_of, regenerate_idle_secrets, POOL_MIN, POOL_MAX}`；`render::hy2_singbox::{config(&NodeParams, &Paths, &Hy2Pool) -> serde_json::Value, HY2_RESI_CLASH_API, HY2_RESI_V2RAY_API, INBOUND_TAG, DENY_TAG, gate_tag(&str), slot_out_tag(u16)}`；`render::nft::{ruleset(&Ports, compat: bool) -> String, TABLE}`。
+  - **（2026-10-10 订正）**：`HY2_RESI_V2RAY_API` 已改名 `HY2_RESI_API`（端口 `127.0.0.1:10086` 不变；官方内核内置 `services` 的 `api` 服务，不再是 v2ray_api）。见 2026-10-10 计划 §2–§3；C1 总纲那处同款订正见 `docs/superpowers/plans/2026-09-11-v4-master.md:66`。
 - **不变**：`nodes_for` 签名、三种订阅与 `render::client` 的签名、`render::relay::config`、`render::xray::config`、`v3::import`（内部多调一次 `hy2pool`）。
 
 ### C2 `bui` 内部模块边界
@@ -674,6 +683,7 @@ Clash API 客户端复用 `modules/residential/clash.rs` 的 `Clash` trait（`re
 - **退役**：`config-residential.yaml`、`config-residential-<i>.yaml`（对账产 `Absent`）。
 - 单元仍是六个名字；`hysteria-residential.service` 的 `ExecStart` 换成 sing-box、`ExecStartPre=-{bin}/bui nft apply`。
 - 回环端点新增 `127.0.0.1:9092`（Clash API）与 `127.0.0.1:10086`（v2ray_api）；`9991..9998` 释放。
+  - **（2026-10-10 订正）**：`10086` 现在是官方内核内置 `services` 的 `api` 服务（不再是 v2ray_api）；9092 Clash API 与「`9991..9998` 释放」不变。见 2026-10-10 计划 §2–§3。
 
 ### C4 `manifest.json`
 
