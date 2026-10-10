@@ -191,9 +191,14 @@ pub fn on_metering_lost(panel: &Shared) -> Outcome {
 /// 「中止了、而且可能已有改动落盘」带到 `bui incidents` 上；**不重启任何单元**（单元归 systemd
 /// 与看门狗；中止轮恰恰可能刚重启过内核，再叠一次重启只会更乱）。
 ///
-/// 文案**不许**包含 `crate::serve::RECONCILE_FAILED_LOG`：run.rs 把 `result` 写回 b-ui 自己的
-/// journald（`"哨兵事件：{}"`），哨兵再读到它就会自己认领自己，无限触发（同 `on_xray_grpc`
-/// 对 `users::USER_SYNC_FAILED_LOG` 那条约定）。
+/// 文案**不许**包含 `crate::serve::RECONCILE_FAILED_LOG`（同 `on_xray_grpc` 对
+/// `users::USER_SYNC_FAILED_LOG` 那条约定）：run.rs 把 `result` 写回 b-ui 自己的 journald
+/// （`"哨兵事件：{}"`），而哨兵盯着 b-ui，文案带匹配词就是**拿自己的回响给自己的门槛凑数**
+/// ——在 `threshold≥2` 的签名上会把它凑满。
+///
+/// 注：`threshold = 1 / window = 60s` 时这条回响**不会**变成死循环（去抖 60 秒、命中窗口也是
+/// 60 秒且过期即弹出，链条自灭）。但那条论证只对当前取值成立，**别把它当作可以放宽文案的理由**：
+/// 真理由是上面那条成文不变量，且 `threshold` 一旦被调大，回响就真的会开始凑数。
 pub fn on_reconcile_failed() -> Outcome {
     Outcome {
         subject: RECONCILE_SUBJECT.to_string(),

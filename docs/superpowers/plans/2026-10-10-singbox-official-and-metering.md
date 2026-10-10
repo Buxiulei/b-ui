@@ -1,9 +1,10 @@
-# 官方 sing-box 发行物 + 独立计量模块：实施计划（草稿）
+# 官方 sing-box 发行物 + 独立计量模块：实施计划
 
 记录日期：2026-10-10。主理人本轮裁决：**不再自建 sing-box，改用官方发行物；住宅按用户计量由独立模块承担**；
 并追加要求 **「支持一直更新最新版的 sing-box 核心」**。
 
-> 状态：**本文件为草稿**。第 2、3 节等待 G0 实测结论回填。其余已可执行。
+> 状态：**第 2、3 节已由 G0 实测回填**（`e9b6133`）。第 4 节第 1/4/5/6/7/9/11/14/15/16 步已落地；
+> 第 3 步见 §4.3。**发布前的未决项见 §8.1 与 §7.3**（真机兜底、发布纪律、UDP 计费口径）。
 
 ---
 
@@ -92,7 +93,7 @@
    （整段由 `table inet bui` REDIRECT 进来），用户靠**凭据门**区分、多用户共享一个槽/IP，
    **不存在每用户端口、也不存在每用户 cgroup**。「每用户一条本地端口 + nft 计数器」与冻结架构相反。
 
-### 2.4 ✅ 缺口形状已钉死（决定性实验结论）
+### 2.4 ✅ 缺口形状已钉死（决定性实验结论；重启截断与阈值口径亦已钉死，仅 UDP/IPv6 **计费**口径仍挂账，见 §5.3/§7.3）
 
 三处矛盾已由常开流的逐字节对账裁定（642 条连接 / 3 个会话 / 逐连接 1:1 配对）：
 
@@ -247,20 +248,20 @@ hysteria 客户端自带的 `api.hy2.io:443` 版本探针**真实过代理并归
 |---|---|---|
 | 1 | 发布侧换官方：`kernels.lock` 两行改官方 1.14.3 tar.gz + 官方 sha；`kernel-versions.env` 轨道改 1.14.3、`SINGBOX_TAGS` 删；`build-singbox.sh` 与 `test-build-singbox.sh` 删；CI job 名与三处 skip-grep 自建支改 | ✅ **完成**（`51024f5`） |
 | 2 | **裁决计量替代来源与迁移期语义**（fail-open 少计 / fail-closed 拒连），据此拍板 `query_user_deltas`、`10086`、`HY2_RESI_V2RAY_API`、`proto-v2ray` 的去留 | ✅ **裁决已定**（§2/§3/§5，全部实测支撑）；**实现待第 7 步** |
-| 3 | 可见性：**整轮对账中止**要可见（**当前核实仍缺**——迁移期任何失败都是「机器不报错但状态是错的」）。⚠️ 见 §4.3 的**设计修订**：不新增 `last_reconcile_error` 字段，改为「包装 `reconcile_from_ctx` + 复用 `last_reconcile`」**加**哨兵 `Sig::ReconcileFailed` | ⬜ 施工图已就绪 |
+| 3 | 可见性：**整轮对账中止**要可见（迁移期任何失败都是「机器不报错但状态是错的」）。做法见 §4.3：薄包装 + 哨兵 `Sig::ReconcileFailed`（**不新增字段**，复用 `last_reconcile`） | ✅ **完成**（`e90ad21`；对抗复审做了两次反向实验证明测试非永绿） |
 | 4 | **原子核心**：删 `render/hy2_singbox.rs` 的 `experimental.v2ray_api` 键，换成官方顶层 `services:[{"type":"api",…}]`（`clash_api` 保留；常量改名 `HY2_RESI_API`，端口单一真源） | ✅ **完成**（切换批；门 `EXIT 3 → 0`） |
 | 5 | 断言同步（同提交）：`hy2_singbox.rs`（反向守卫 + `services[0]` 正断言）、`core_files.rs`、`hysteria.rs` 端口表标签、常量全部消费点（`lib.rs`/`panel/mod.rs`/`hy2resi.rs`/`selfcheck.rs`/`install.rs`/`stock_gate_fixture.rs`） | ✅ **完成**（切换批） |
 | 6 | **测试改真跑**：`kernel_hy2_singbox.rs` 删 skip 门 —— 冷/热两套均 `2 passed / 0 skipped`，并用 PATH shim 证明真调用官方 `/usr/bin/sing-box` | ✅ **完成**（切换批，blocker 解除） |
 | 7 | 计量路径收口：`hy2resi.rs` 重写（Clash HTTP + daemon gRPC 双面）、`traffic.rs` Err 分支落双标记 warn、`query_user_deltas` 签名冻结、lossy 贯通 `users.rs`/`gates.rs`/`api_admin.rs`/`auth_http.rs` | ✅ **完成**（`9f9b1fb`） |
 | 8 | ~~自检改写：拆成「计量面／门位·在线面」两条判据~~ → **降级为可选（Fable 2026-10-10 裁决）**：本步的两条动机**已随第 4 步消失**——「白等 120s 与必然 FAIL」的成因是官方内核不认 `v2ray_api` ⇒ 10086 永不监听；切换后 10086 由新 `services.api` **真绑**（本机实测），`wait_ready` 天然满足。且对手复审确认 `selfcheck.rs:1557` 的「等待有界 ≤120s」假时钟断言**仍在验一条真性质**，不必重写。剩下的只是「把一行拆成两行以改善诊断」，属外观改进 | ⏸ **可选，不阻塞发布** |
 | 9 | **版本钉子改能力/sha 绑定**（§1.4 的核心）：`serve.rs`（否则整轮对账中止）、`upgrade.rs`（否则升级双通道自锁）、`install.rs`（否则新装中止）、`gates.rs`（否则门停 deny 住全体住宅用户）；rollback 守卫从版本白名单改为 `RESIDENTIAL_LAYOUT_SINCE` + sha | ✅ **完成**（`fd55363`） |
-| 10 | 夹具与守卫：`relay_generation_kernel.rs`/`generation.py`/`policy.py` 版本串 ✅；`install/upgrade/serve` 夹具 1.14.2 字面量（自洽、不卡 bot）✅；stock sha 已换官方 `299f9f60…` ✅；`stock_gate_fixture.rs:436` 与 `tests/test-residential-stock-gates.sh:30` 的 `1.14.3` 硬字面量**留作升轨维护点**（opt-in 手动夹具） | 🔶 残部见 §8 |
+| 10 | 夹具与守卫：`relay_generation_kernel.rs`/`generation.py`/`policy.py` 版本串 ✅；`install/upgrade/serve` 夹具 1.14.2 字面量（自洽、不卡 bot）✅；stock sha 已换官方 `299f9f60…` ✅；`stock_gate_fixture.rs:449` 与 `tests/test-residential-stock-gates.sh:30` 的 `1.14.3` 硬字面量**留作升轨维护点**（opt-in 手动夹具） | 🔶 残部见 §8 |
 | 11 | 清扫：`serve.rs` 的 `bin/.prepared-<uuid>` 失败与成功路径统一清理（否则每 tick 残留 ~81MB 且不被体检暴露） | ✅ **完成**（`fd55363`） |
 | 12 | 真机兜底：官方 1.14.3 + 生产形状配置实测 `auth_user=<name> => gate` 路由串（含多用户 `[a b]` → None 分支）；演练 `/api/health` 对计量失败的 degraded 表现 | ⬜ |
 | 13 | **发布纪律**：2–12 同一 release，不许拆包 | ⬜ |
 | 14 | **原子性自检（机制化闸门）**：内核来源与渲染器是否产出 `experimental.v2ray_api` 必须自洽 | ✅ **完成**（`51024f5`；`check-kernel-consistency.sh`，ci.yml 只告警 / release.yml 硬闸门。**真实 CI 里验证过会发告警**） |
 | 15 | **lock 检查的 fail-open 修复**：`pin-kernels.sh` 新增 `--warn`——只降级「漂移」，`lock 少行`／`核实不了` 仍旧退 1（原 `\|\| echo ::warning::` 把三类一起吞掉） | ✅ **完成**（`fd55363`；安全审查与对抗复审各自独立指出） |
-| 16 | **测试层的版本守卫要读 lock，不能写死**（🔴 **不做则「一直更新最新版」在实践上失效**，见 §4.2） | ✅ **完成**（`ddd928c`）。四个文件改完；**换版证伪实验**（私有 mount namespace bind 换入版本列=1.14.99 的锁，真文件零改动）四守卫全部改口变红；坏锁四类（缺失/空/无行/缺列）全硬失败，无一处降级为 skip。遗留：`relay_generation.rs:527`（在 `src/`、自洽故不卡 bot）与 stock 那族（opt-in 手动夹具）并入第 4/5 批 |
+| 16 | **测试层的版本守卫要读 lock，不能写死**（🔴 **不做则「一直更新最新版」在实践上失效**，见 §4.2） | ✅ **完成**（`ddd928c`）。四个文件改完；**换版证伪实验**（私有 mount namespace bind 换入版本列=1.14.99 的锁，真文件零改动）四守卫全部改口变红；坏锁四类（缺失/空/无行/缺列）全硬失败，无一处降级为 skip。遗留**已消解**：`relay_generation.rs` 的 `1.14.3` 字面量已在切换批（`79753b2`）改为 `include_str!` 编译期读 `kernels.lock`。stock 那族见 §8 #7 |
 
 ### 4.2 为什么第 16 步是「一直更新最新版」的最后一道坎
 
@@ -458,10 +459,33 @@ scripts/tests/test-residential-stock-gates.sh:19          sing-box version 1.14.
 **亚 tick 连接不属于「未知」**——实测其终值完整（40/40 sub-ms、60/60 ~1–2ms）。
 只有「用 Σδ 当账」这种**实现错误**才会 100% 漏计，**那是修 bug，不是 fail-open/closed 的取舍**。
 
-### 5.3 仍未裁决的产品口径
+### 5.3 UDP 计费口径（Fable 2026-10-10 裁决：**按账本口径**）
 
-**UDP 按哪个口径计费**：账本记的是**净负载**，与客户端封装口径差**恒定 10 B/报文/方向（v4）/
-22 B（v6）**，按包数线性放大。混用即系统性偏差 ⇒ **产品决策，不是测量问题**，发版前必须定死一个。
+原为「仍未裁决」的产品口径。现裁定：**计费一律以服务端账本的数为准**（即应用真实净负载，
+账本记的那个数），不再换算成任何「客户端封装口径」。
+
+**理由（按分量排序，第 1 条是决定性的）：**
+
+1. **「客户端口径」在本拓扑里甚至不是良定义的。** 那 10 B/报文（v4）/ 22 B（v6）是 **SOCKS5 UDP
+   请求头**（RSV+FRAG 3 + ATYP 1 + 地址 4|16 + 端口 2）的长度，来自 Xray 那条路。而住宅 HY2 的
+   UDP 走的是 hysteria2 over QUIC——客户端的封装是 QUIC datagram/stream，**没有**一个「加 10 字节」
+   的对应量。想按客户端口径计费，就得凭空重构一个对不同客户端都不成立的定义。
+2. **账本是唯一可验证的真相源。** 它是服务端逐连接、字节精确的（G0 实测 642 条连接逐连接差额 0），
+   而客户端自报既不可得也不可信。计费锚定在一个别人无法复核的数上，是更糟的选择。
+3. **混用才是真危险。** 偏差按**报文数**线性放大，一旦同一个用户的不同流量走了不同口径，
+   就是系统性错账，且随包大小反向放大（小包影响最大）。**单一口径**本身就是最重要的性质。
+4. **方向上是安全的**：账本口径**小于** Xray 那条路会记的（少掉每报文的头），所以相对旧口径
+   是**少收**而不是多收；用户不会因为这次裁决被多算。
+
+**必须配套做的（否则口径只是纸面上的）：**
+
+- **订阅/面板文案要写明计费单位**是「服务端观测到的净负载」。用户拿客户端流量统计对不上时
+  （尤其是小包密集的 UDP：每报文差 10/22 B，按包数放大），先看得到这句话，而不是来问。
+- **不要在任何地方再引入第二种口径**——包括将来加 TCP 以外的协议、加新的订阅渲染路径时。
+  这条写在这里就是给那时的自己看的。
+- ⚠️ 这是**产品语义裁决**，主理人可一票否决。若否决，需要同时决定「换算公式 + 在哪个环节换算 +
+  怎么对不同客户端成立」，那是另一件工作，不是本计划的一步。
+
 
 ---
 
@@ -538,10 +562,9 @@ scripts/tests/test-residential-stock-gates.sh:19          sing-box version 1.14.
 3. **记第二条后续**：评估把有损**归因**做细（例如按用户维度统计「哪些用户的 UPDATE 落在 gap 里」）。
    当前账本只知「全局丢了 N 字节」而不知「丢的是谁的」，这正是它无法按用户降级的原因。
 
-### 7.3 顺带：仍未裁决的产品口径（§5.3 遗留）
+### 7.3 UDP 计费口径
 
-**UDP 计费口径**：账本记**净负载**，与客户端封装口径差恒定 10 B/报文/方向（v4）/ 22 B（v6）。混用即系统性偏差。
-本次不阻塞切换，但**发版前必须定死一个**（建议：以账本口径为准并在订阅页说明，因为账本是唯一可验证的真相源）。
+**已裁决：按账本口径（应用净负载）**，理由与配套要求见 §5.3。本条不再是发布阻塞项。
 
 ---
 
@@ -558,7 +581,7 @@ scripts/tests/test-residential-stock-gates.sh:19          sing-box version 1.14.
 | 4 | `crates/bui-schema/tests/kernel_hy2_singbox.rs` 的 openssl 早退 | **真（静默面）**：PATH 缺 sing-box 或 openssl 不可用时 `eprintln` + `return` **静默通过**；而 CI 的 skip 黑名单只匹配 `<kernel> not found` 与 caddy，**不匹配 `skipped: openssl not usable`** | 纳入 CI skip 黑名单，或让 CI 里缺内核即硬失败（照 `relay_generation_kernel.rs:143-146` 的 `assert!(CI.is_none())` 范式） |
 | 5 | `crates/bui/src/modules/panel/traffic.rs` 测试串 `fail_next("v2ray_api 不可达")`（`:787`/`:1193`）与「住宅的 QueryStats」注释 | **真（文案说谎）** | 同下一批改 |
 | 6 | `CHANGELOG.md:20`（未发布的 4.1.9 段）仍写「sing-box 1.14.2」 | **真**：锁自 `51024f5` 起是官方 1.14.3，且 `install.rs:356` 的 `client_sing_box` 与 `sing_box` 同源 ⇒ 服务端与 bui-c 一并到 1.14.3，该句对两个角色都失真 | **随第 13 步的发布准备改**（现在改是写未发生的记录） |
-| 7 | `stock_gate_fixture.rs:436` 与 `tests/test-residential-stock-gates.sh:30` 的 `1.14.3` 硬字面量 | **维护点**：opt-in 手动夹具，升轨时须同步 | 记在此，升轨时一并 |
+| 7 | `stock_gate_fixture.rs:449` 与 `tests/test-residential-stock-gates.sh:30` 的 `1.14.3` 硬字面量 | **维护点**：opt-in 手动夹具，升轨时须同步 | 记在此，升轨时一并 |
 | 8 | `docs/superpowers/plans/2026-09-15-v41-hy2-singbox.md:802/:907` 旧口径 | **可选**：历史计划，不改史实 | 不动 |
 | 9 | `run-all.sh` 以退出码判过、不解析 TAP；两个手动 runner 跳过仍计入「all script tests passed」 | **可选**：跳行有输出可见，只是汇总不区分「跑过」与「跳过」 | 记此，需要时再改 |
 | 10 | 计划状态表滞后 | — | ✅ 已回填（第 4/5/6/7 步） |
