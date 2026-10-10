@@ -6,8 +6,8 @@
 //! 1. **2026-09-18 tizi sidecar 自建 1.14.1 真机**（`with_v2ray_api`，生产形状配置：整段
 //!    跳跃 + 每凭据一个 `gate-<id>` selector 门 + `auth_user` 路由到门）。落这里的是
 //!    RESULT-up.md「八条夹具」一节（T3 阶段 0），**色码已剥**（journald 那一步剥，
-//!    `sys::parse_journal_json`）。隔离端口改回生产值（`40100→40000`、`9192→9092`、
-//!    `10186→10086`），公网源地址 / 测试目标域名换成 `203.0.113.10` / `www.example.com`，
+//!    `sys::parse_journal_json`）。隔离端口改回生产值（`40100→40000`、`9192→9092`），
+//!    公网源地址 / 测试目标域名换成 `203.0.113.10` / `www.example.com`，
 //!    用户名保留两条**合成**名做解析考察（中文 `测试用户`、含空格 + U+00B7 中点的
 //!    `低 空·飞行`，都是本次测试造的合成名、不是真实用户），其余用 `alice` / `r000`；
 //!    其余**逐字原文**（时间戳保留真机的 `+0000 2026-09-18`）。
@@ -17,6 +17,9 @@
 //!    判据**两种形态都认**——生产不会再打这种形态。`BIND_IN_USE` 也来自这一版（1.14.1 的
 //!    dup 单元复现了同类 FATAL，见 RESULT-up.md 步骤 6，但没采到整行）。UDP 的 selector
 //!    形态真机未采到，按 1.14.0 实录 + selector 替换推断（见 `RELAY_DIAL_FAIL_UDP` 注）。
+//!    **⑧ `API_LISTEN` 由 2026-10-10 本机官方 1.14.3 复采**（隔离端口 `10187→10086`；
+//!    同机 `experimental.v2ray_api` 负例被官方内核 FATAL 拒掉 ⇒ 确实不是自建），
+//!    取代自建内核的 `v2ray-api: grpc server started` 那条。
 //! 3. **systemd 文案**：与 4.0 同源（`signature.rs` 既有用例里的真机原文），4.1 只换单元名。
 //!
 //! **生产形态的关键点**：一旦成员出站拨号失败，refused 的 ERROR 行挂在最外层 **selector 门**
@@ -129,11 +132,13 @@ pub const DENY_NOISE_SOCKS_FORM: &str = "+0800 2026-09-17 03:48:11 ERROR [271732
 pub const CLASH_API_LISTEN: &str =
     "+0000 2026-09-18 02:48:21 INFO clash-api: restful api listening at 127.0.0.1:9092";
 
-/// ⑧ v2ray_api 起监听（2026-09-18 tizi sidecar 自建 `with_v2ray_api` 真机，端口 10186→10086）。
-/// 4.1 起随发布分发的 sing-box 自带 `with_v2ray_api`（住宅 HY2 的按用户计量靠它），这条终于
-/// 能在真机上采到，替换掉先前的源码推断版
-pub const V2RAY_API_LISTEN: &str =
-    "+0000 2026-09-18 02:48:21 INFO v2ray-api: grpc server started at 127.0.0.1:10086";
+/// ⑧ 官方内核内置 api 服务起监听（2026-10-10 本机**官方** 1.14.3 实跑：同一台机器上
+/// `experimental.v2ray_api` 的负例被官方内核 FATAL 拒掉，证明不是自建；端口 10187→10086，
+/// 色码按 journald 那一步剥）。取代 4.x 自建内核的 `v2ray-api: grpc server started` ——
+/// 官方发行物永不含 `with_v2ray_api`，计量改走 `daemon.StartedService` 的 gRPC，
+/// 这条对判据同样必须判 `None`
+pub const API_LISTEN: &str =
+    "+0800 2026-10-10 16:07:36 INFO service/api[0]: tcp server started at 127.0.0.1:10086";
 
 /// ⑨a 证书热加载的中间态 ERROR（2026-09-18 本机自建 1.14.1 换证实测，item09/logs/sidecar.log，
 /// `+0800` 是那次本机运行的真时区、逐字原文；行里无端口 / 路径 / 用户名，无需归一）。

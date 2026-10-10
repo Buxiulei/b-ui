@@ -1153,10 +1153,15 @@ mod tests {
              住宅 HY2 侧不渲染 sniff（见 `render::hy2_singbox` 模块文档）"
         );
         assert_eq!(
-            v["experimental"]["v2ray_api"]["stats"]["users"],
-            serde_json::json!([])
+            v["services"][0]["type"], "api",
+            "计量面 = 官方内核内置 api 服务（`daemon.StartedService` 的 gRPC），空池也不许少"
         );
-        // 真实内核校验那一格在 `bui-schema` 的 `tests/kernel_hy2_singbox.rs`
-        // （那里有自签证书与 with_v2ray_api 的 skip 逻辑）。
+        assert!(
+            v.get("experimental")
+                .and_then(|e| e.get("v2ray_api"))
+                .is_none(),
+            "官方内核不认 v2ray_api，产物里一旦出现就是启动 FATAL"
+        );
+        // 真实内核校验那一格在 `bui-schema` 的 `tests/kernel_hy2_singbox.rs`（那里有自签证书）。
     }
 }

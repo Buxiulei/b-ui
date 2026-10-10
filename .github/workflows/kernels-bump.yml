@@ -1,8 +1,8 @@
 name: kernels-bump
 
 # 内核版本轨道的周更 bot：按 kernel-versions.env 的轨道重解析 → 重写 kernels.lock →
-# 锁正文真的变了才继续 → 按新锁复算四个内核的 sha（amd64 + arm64）→
-# 用新内核跑全量测试 → 开 PR 交给人看。
+# 锁正文真的变了才继续 → 核对 vendored proto 与锁（联网）→ 按新锁复算四个内核的 sha
+# （amd64 + arm64）→ 用新内核跑全量测试 → 开 PR 交给人看。
 # 任何一步失败 ⇒ 工作流红、**锁不动**、**不开 PR**（pin-kernels.sh --write 是先写临时文件
 # 最后才 mv，失败时磁盘上的锁没被碰过）。release.yml 永远只用锁里的版本，所以上游怎么改
 # 都不会阻塞发版，发布保持上一版（spec §5.4 第 8 条）。
@@ -70,6 +70,9 @@ jobs:
             printf 'changed=1\n' >> "$GITHUB_OUTPUT"
           fi
           { printf 'old=%s\n' "$old"; printf 'new=%s\n' "$new"; } >> "$GITHUB_OUTPUT"
+      - name: 核对 vendored proto 与锁（sing-box 升了 patch 时必须先重核）
+        if: steps.bump.outputs.changed == '1'
+        run: bash scripts/release/check-vendored-proto.sh
       - name: 按新锁准备内核 amd64（复算 sha 与锁一致）
         if: steps.bump.outputs.changed == '1'
         uses: ./.github/actions/setup-kernels

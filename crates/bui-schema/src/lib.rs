@@ -105,7 +105,7 @@
 //!   一起退役）。
 //! - [`render::hy2_singbox::config`]：**住宅** HY2 的 `hy2-residential.json`（一个 sing-box
 //!   hysteria2 入站 + 凭据池 + 每凭据一个 `gate-<id>` selector），端点常量
-//!   [`render::hy2_singbox::HY2_RESI_CLASH_API`] / [`render::hy2_singbox::HY2_RESI_V2RAY_API`]
+//!   [`render::hy2_singbox::HY2_RESI_CLASH_API`] / [`render::hy2_singbox::HY2_RESI_API`]
 //!   与标签 [`render::hy2_singbox::INBOUND_TAG`] / [`render::hy2_singbox::DENY_TAG`] /
 //!   [`render::hy2_singbox::gate_tag`] / [`render::hy2_singbox::slot_out_tag`] 都只有这一处来源。
 //! - [`render::nft::ruleset`]：住宅 HY2 端口跳跃那张 `table inet bui`

@@ -110,6 +110,9 @@ jobs:
           bash scripts/release/pin-kernels.sh --check --warn
 
   test:
+    # 注意：这个 `name` 是 GitHub 分支保护里 **required status check 的匹配串**：一个字都不能改，
+    # 改了会让 PR 等一个永远不出现的检查而卡死。内核版本升轨时这个名字**保持原样**（实际版本
+    # 由 kernels.lock 决定，括号里的字样只是个标签）；确实要改名，先同步分支保护设置再改这里。
     name: test (sing-box 1.14.3)
     runs-on: ubuntu-24.04
     steps:

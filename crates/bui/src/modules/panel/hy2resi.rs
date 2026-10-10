@@ -1,7 +1,7 @@
 //! 住宅 HY2（官方 sing-box）的两个控制面客户端（spec §2.3、§5.1、§5.2）。
 //!
 //! 住宅入站从 apernet hysteria 换成 sing-box 之后，「计量」与「在线 / 踢人」分别落在
-//! 两个只监听回环、都不设 secret 的面上（[`super::HY2_RESI_V2RAY_API`] /
+//! 两个只监听回环、都不设 secret 的面上（[`super::HY2_RESI_API`] /
 //! [`super::HY2_RESI_CLASH_API`]）：
 //!
 //! - **计量**走官方内核自带的 `daemon.StartedService`：[`Hy2ResiClient::started_at`]（实例
@@ -24,12 +24,10 @@
 //! 内核重启会清空计量计数器：账本按 `GetStartedAt` 的代际封账（`meter` 规则 9），本模块
 //! 只把 `started_at` 原样交给它，**不做**降级或补偿。
 //!
-//! ⚠️ **过渡态（原子切换批次收口）**：渲染器此刻仍往 `hy2-residential.json` 写
-//! `experimental.v2ray_api` 段（官方内核不认它，启动即 exit=1），而本模块已经在说
-//! `daemon.StartedService`。切换那一次提交要做三件事：渲染器把那段换成
-//! `services: [{ type: "api", … }]`、`panel` 侧的常量从 `HY2_RESI_V2RAY_API` 改名成
-//! `HY2_RESI_API`、`hysteria.rs` 的端口表登记新口。**常量改名只许与渲染器同一次提交**：
-//! 分叉 = 客户端打没人听的端口而测试全绿，属静默生产故障。
+//! 计量面的地址是 [`super::HY2_RESI_API`]（渲染器产的顶层 `services` 里的 api 服务，
+//! 官方内核 `daemon.StartedService` 的 gRPC）；4.x 那个 `experimental.v2ray_api` 段已随
+//! 自建二进制一起退役。**常量只许与渲染器同一次提交改**：分叉 = 客户端打没人听的端口而
+//! 测试全绿，属静默生产故障。
 
 // 生成代码归 prost/tonic 管，clippy 的意见对它没有意义；理由同 `panel::xray::pb`。
 #[allow(clippy::all, dead_code)]
@@ -331,7 +329,7 @@ pub struct Hy2ResiClient {
 
 impl Hy2ResiClient {
     pub fn new() -> Self {
-        Self::with_endpoints(super::HY2_RESI_CLASH_API, super::HY2_RESI_V2RAY_API)
+        Self::with_endpoints(super::HY2_RESI_CLASH_API, super::HY2_RESI_API)
     }
 
     pub fn with_endpoints(clash_api: impl Into<String>, grpc_api: impl Into<String>) -> Self {
@@ -663,10 +661,8 @@ mod tests {
     ///
     /// 断言比的是「`panel` 侧的常量 == `bui_schema` 侧的常量」而不是字面量 ——
     /// 比字面量的话，`panel` 这边另定一份值、与渲染器分叉，测试照样全绿，而生产上
-    /// 计量（`daemon.StartedService` 的 gRPC 口）与门位（Clash API）会双双打到没人听的
-    /// 端口上（静默故障）。⚠️ 过渡态：第二个常量此刻仍叫 `HY2_RESI_V2RAY_API`
-    /// （渲染器也还在写 `experimental.v2ray_api` 段），原子切换那次提交把两边一起改名成
-    /// `HY2_RESI_API` 并换成 `services: [{ type: "api", … }]`。
+    /// 计量（api 服务的 gRPC 口）与门位（Clash API）会双双打到没人听的
+    /// 端口上（静默故障）。
     #[test]
     fn the_endpoints_come_from_the_renderer() {
         use bui_schema::render::hy2_singbox as renderer;
@@ -676,8 +672,8 @@ mod tests {
             "panel 侧的 Clash API 必须就是渲染器写进配置的那一个"
         );
         assert_eq!(
-            super::super::HY2_RESI_V2RAY_API,
-            renderer::HY2_RESI_V2RAY_API,
+            super::super::HY2_RESI_API,
+            renderer::HY2_RESI_API,
             "panel 侧的 gRPC API 必须就是渲染器写进配置的那一个"
         );
         // 客户端不许自己拼地址：默认构造的两个端点就是上面那两个常量
@@ -685,17 +681,14 @@ mod tests {
             Hy2ResiClient::new().clash_api(),
             renderer::HY2_RESI_CLASH_API
         );
-        assert_eq!(
-            Hy2ResiClient::new().grpc_api(),
-            renderer::HY2_RESI_V2RAY_API
-        );
+        assert_eq!(Hy2ResiClient::new().grpc_api(), renderer::HY2_RESI_API);
         assert_eq!(
             Hy2ResiClient::new().clash_url("/connections"),
             format!("http://{}/connections", renderer::HY2_RESI_CLASH_API)
         );
         assert_eq!(
             Hy2ResiClient::new().grpc_endpoint_url(),
-            format!("http://{}", renderer::HY2_RESI_V2RAY_API)
+            format!("http://{}", renderer::HY2_RESI_API)
         );
     }
 

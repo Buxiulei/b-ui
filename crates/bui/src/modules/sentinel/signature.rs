@@ -1004,7 +1004,7 @@ mod tests {
             fx_hy2::CONN_TO_USER_UDP,
             fx_hy2::SLOT_OUT_CONN,
             fx_hy2::CLASH_API_LISTEN,
-            fx_hy2::V2RAY_API_LISTEN,
+            fx_hy2::API_LISTEN,
         ] {
             assert_eq!(sig_of("hysteria-residential", l), None, "误报：{l}");
         }

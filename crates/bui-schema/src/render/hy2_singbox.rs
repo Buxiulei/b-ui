@@ -18,13 +18,17 @@
 //! - selector 的 `outbounds` 必填、`default` 缺省取第一个、`interrupt_exist_connections` =
 //!   "Interrupt existing connections when the selected outbound has changed" ——
 //!   <https://sing-box.sagernet.org/configuration/outbound/selector/> 。
-//! - `v2ray_api.stats.users` = "User list to count traffic"，且 "V2Ray API is not included
-//!   by default"（所以这份配置只在自建二进制上跑）——
-//!   <https://sing-box.sagernet.org/configuration/experimental/v2ray-api/> 。
+//! - 控制面 = 顶层 `services` 的 `api` 服务（`daemon.StartedService` 的 gRPC）。
+//!   **不许再写 `experimental.v2ray_api`**：官方发行物永不含 `with_v2ray_api` 编译标签
+//!   （2026-10-10 抽样 17 个 tag、0 次命中），那个段会让内核
+//!   `FATAL create v2ray-server: v2ray api is not included in this build, rebuild with
+//!   -tags with_v2ray_api` 起不来（不是降级）。`type` 的字符串必须是 `"api"`——写 proto
+//!   包名 `daemon` 会 FATAL `unknown inbound type: daemon`（本机官方 1.14.3 实测）——
+//!   <https://sing-box.sagernet.org/configuration/service/api/> 。
 //!
 //! 与今天 apernet 配置（[`crate::render::hysteria`] 的 `common_doc`）的结构性差异：
 //! `sniGuard` / `resolver` / `trafficStats` / `auth` / `acl` / `quic` 在 sing-box 的入站
-//! schema 里根本不存在 —— `trafficStats` 的位置由 `experimental.v2ray_api` 接，`auth` 由
+//! schema 里根本不存在 —— `trafficStats` 的位置由顶层 `services` 的 api 服务接，`auth` 由
 //! `users[]` 接，**`sniff` 这一项没有对应物（见下）**，目标域名仍不在本机解析（**不要
 //! `dns` 段**），原样经 socks 交给 relay。
 //!
@@ -77,8 +81,24 @@ use serde_json::{json, Value};
 
 /// 住宅 HY2 实例的 Clash API（relay 是 9091）。**只监听回环、不设 secret**。
 pub const HY2_RESI_CLASH_API: &str = "127.0.0.1:9092";
-/// 住宅 HY2 实例的 v2ray_api（Xray 的 api 是 10085）。**只监听回环、不设 secret**。
-pub const HY2_RESI_V2RAY_API: &str = "127.0.0.1:10086";
+/// 住宅 HY2 实例的官方内核内置 api 服务（`services: [{ "type": "api", … }]` 的监听地址；
+/// Xray 的 api 是 10085）。**只监听回环、不设 secret** —— 计量（`daemon.StartedService`
+/// 的 gRPC）打这个面。
+///
+/// 取代 4.x 的 `experimental.v2ray_api`：官方发行物永不含 `with_v2ray_api`，那个段会让
+/// 内核启动 FATAL。端口值 10086 原地保留，只改常量名与语义（端口表 / 自检 / 夹具因此
+/// 少动一处值）。
+pub const HY2_RESI_API: &str = "127.0.0.1:10086";
+
+/// [`HY2_RESI_API`] → (`listen`, `listen_port`)：`services[]` 里这两个键是分开的，而端口
+/// 常量按 `host:port` 写（`hysteria.rs` 的端口表、自检的 `api_port` 也按同一形态取）。
+/// 拆法只此一处，别在各处 `rsplit`。
+fn api_listen() -> (&'static str, u16) {
+    let (host, port) = HY2_RESI_API
+        .rsplit_once(':')
+        .expect("HY2_RESI_API 是 host:port 形态");
+    (host, port.parse().expect("HY2_RESI_API 的端口段是数字"))
+}
 /// 唯一的 hysteria2 入站 tag。
 pub const INBOUND_TAG: &str = "hy2-resi";
 /// 拒绝出站的 tag：门的 `default`、`route.final` 都指它。
@@ -170,6 +190,7 @@ pub fn config(node: &NodeParams, paths: &Paths, pool: &Hy2Pool) -> Value {
             .map(|c| json!({ "auth_user": [&c.name], "outbound": gate_tag(&c.id) })),
     );
 
+    let (listen, listen_port) = api_listen();
     json!({
         // level 不降到 warn：spec §6 那条带用户名的 inbound connection 行是排查线索
         "log": { "level": "info", "timestamp": true },
@@ -180,15 +201,13 @@ pub fn config(node: &NodeParams, paths: &Paths, pool: &Hy2Pool) -> Value {
             // 理论上不可达：auth 串不命中时 hysteria2 入站走 masquerade，不进路由
             "final": DENY_TAG
         },
+        // 官方内核内置的管理面（计量 = `daemon.StartedService` 的 gRPC）。**不是**
+        // `experimental.v2ray_api`：官方发行物不含 `with_v2ray_api`，那个段会让内核启动 FATAL。
+        "services": [
+            { "type": "api", "listen": listen, "listen_port": listen_port }
+        ],
         "experimental": {
-            "clash_api": { "external_controller": HY2_RESI_CLASH_API },
-            "v2ray_api": {
-                "listen": HY2_RESI_V2RAY_API,
-                "stats": {
-                    "enabled": true,
-                    "users": pool.creds.iter().map(|c| &c.name).collect::<Vec<&String>>()
-                }
-            }
+            "clash_api": { "external_controller": HY2_RESI_CLASH_API }
         }
     })
 }
@@ -359,12 +378,23 @@ mod tests {
             v["experimental"]["clash_api"]["external_controller"],
             HY2_RESI_CLASH_API
         );
-        assert_eq!(v["experimental"]["v2ray_api"]["listen"], HY2_RESI_V2RAY_API);
-        assert_eq!(v["experimental"]["v2ray_api"]["stats"]["enabled"], true);
+        // 反向守卫：官方发行物不含 `with_v2ray_api`，产物里一旦出现这个段就是启动 FATAL
+        assert!(
+            v.get("experimental")
+                .and_then(|e| e.get("v2ray_api"))
+                .is_none(),
+            "官方内核不认 v2ray_api，产物里一旦出现就是启动 FATAL"
+        );
+        // 计量面 = 官方内置 api 服务（`daemon.StartedService` 的 gRPC）。
+        // `type` 写 proto 包名 `daemon` 会 FATAL unknown inbound type: daemon（实测）。
+        let (host, port) = api_listen();
+        assert_eq!(v["services"][0]["type"], "api");
+        assert_eq!(v["services"][0]["listen"], host);
+        assert_eq!(v["services"][0]["listen_port"], port);
         assert_eq!(
-            v["experimental"]["v2ray_api"]["stats"]["users"],
-            serde_json::json!(["alice", "r001"]),
-            "白名单 = 全部凭据的 name；不在表里的用户不计"
+            v["services"].as_array().unwrap().len(),
+            1,
+            "只此一个服务；Clash API 仍走 experimental.clash_api"
         );
         assert!(
             v["experimental"].get("cache_file").is_none(),

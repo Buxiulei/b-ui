@@ -47,19 +47,20 @@ use uuid::Uuid;
 
 pub const MODULE_NAME: &str = "panel";
 /// **直连**那一个 hysteria 的 trafficStats 监听端口（由 `bui_schema::render::hysteria`
-/// 写死）。4.1 起这就是全部：住宅是一个 sing-box 入站，计量走 v2ray_api、在线与踢人走
+/// 写死）。4.1 起这就是全部：住宅是一个 sing-box 入站，计量走官方内核内置的 api 服务
+/// （`services: [{ "type": "api", … }]`，`daemon.StartedService` 的 gRPC）、在线与踢人走
 /// Clash API（[`traffic::stats_ports`] 因此只剩这一个端口），4.0.x 的
 /// `HY2_STATS_PORT_RESI` / `slots::HY2_STATS_RESI_BASE`（`9998 - 槽序号`）已随 T15 删除。
 pub const HY2_STATS_PORT_DIRECT: u16 = 9999;
 /// 住宅 HY2（sing-box）的两个回环控制面（spec §2.3）：`HY2_RESI_CLASH_API` 上跑在线数、
-/// 踢连接与门位（selector），`HY2_RESI_V2RAY_API` 上跑 `StatsService.QueryStats` 的计量。
+/// 踢连接与门位（selector），`HY2_RESI_API` 上跑 `daemon.StartedService` 的计量账本。
 /// 两个面都**只监听回环、不设 secret** ⇒ 这条路从不发 Authorization 头。
 ///
 /// **端口只有一处来源：写出 `hy2-residential.json` 的那个渲染器。** 这里必须是 `pub use`
-/// 而不是另定字面量——一旦两边分叉，客户端会去打没人听的端口，而计量（v2ray_api）与
+/// 而不是另定字面量——一旦两边分叉，客户端会去打没人听的端口，而计量（api 服务）与
 /// 门位（Clash API）双双打空、测试却全绿，属静默生产故障。守门断言见
 /// `panel::hy2resi::tests::the_endpoints_come_from_the_renderer`。
-pub use bui_schema::render::hy2_singbox::{HY2_RESI_CLASH_API, HY2_RESI_V2RAY_API};
+pub use bui_schema::render::hy2_singbox::{HY2_RESI_API, HY2_RESI_CLASH_API};
 /// `bui_schema::render::hysteria` 渲染的 `trafficStats.secret` 是空串 ⇒ 不发 Authorization 头。
 /// 若将来改成非空，`hy2::Hy2Client` 按调研 H13 发 `Authorization: <secret>`（**无** `Bearer ` 前缀）。
 pub const HY2_STATS_SECRET: &str = "";
@@ -553,7 +554,7 @@ mod tests {
     }
 
     /// **漏注入也不许碰真实系统**：测试构型下 `Shared::new` 的默认住宅控制面客户端是
-    /// fake，不是只连 `127.0.0.1:9092` / `:10086` 的生产客户端（`new` 的八个调用点里
+    /// fake，不是只连住宅那两个回环面（`127.0.0.1:9092` / `:10086`）的生产客户端（`new` 的八个调用点里
     /// 七个是测试专用，所以这件事必须由构型兜住，不能靠「每个人记得 `with_hy2resi`」）。
     ///
     /// 判据就是「不出网也能成」：fake 立刻回 `ready = true` 且 `Ok(空表)`；换成生产客户端，

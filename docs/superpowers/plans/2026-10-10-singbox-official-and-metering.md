@@ -248,13 +248,13 @@ hysteria 客户端自带的 `api.hy2.io:443` 版本探针**真实过代理并归
 | 1 | 发布侧换官方：`kernels.lock` 两行改官方 1.14.3 tar.gz + 官方 sha；`kernel-versions.env` 轨道改 1.14.3、`SINGBOX_TAGS` 删；`build-singbox.sh` 与 `test-build-singbox.sh` 删；CI job 名与三处 skip-grep 自建支改 | ✅ **完成**（`51024f5`） |
 | 2 | **裁决计量替代来源与迁移期语义**（fail-open 少计 / fail-closed 拒连），据此拍板 `query_user_deltas`、`10086`、`HY2_RESI_V2RAY_API`、`proto-v2ray` 的去留 | ✅ **裁决已定**（§2/§3/§5，全部实测支撑）；**实现待第 7 步** |
 | 3 | 可见性：**整轮对账中止**要可见（**当前核实仍缺**——迁移期任何失败都是「机器不报错但状态是错的」）。⚠️ 见 §4.3 的**设计修订**：不新增 `last_reconcile_error` 字段，改为「包装 `reconcile_from_ctx` + 复用 `last_reconcile`」**加**哨兵 `Sig::ReconcileFailed` | ⬜ 施工图已就绪 |
-| 4 | **原子核心**：删 `render/hy2_singbox.rs:185-191` 整个 `experimental.v2ray_api` 键（保留 `clash_api`；**必须删键，只删 stats 子对象无效**） | ⬜ 与内核换装同一发布 |
-| 5 | 断言同步（同提交）：`hy2_singbox.rs:362-368` 删三条+补反向守卫；`core_files.rs:1156-1160` 同步；`hysteria.rs:283-286` 端口表登记新口。**端口号裁决：保留 `10086`**，只改常量名（`HY2_RESI_V2RAY_API` → `HY2_RESI_API`）与全部标签（不留「v2ray_api」幽灵）。理由：回环内部 API，号无对外语义，保留号让端口表/夹具/测试只改文案不改值；说谎的责任落在名字上。**常量改名只许与渲染器同一次提交**（`hy2resi.rs:26-31` 已把这条写死） | ⬜ |
-| 6 | **测试改真跑**：`kernel_hy2_singbox.rs` 删 skip 门，让两用例对不含 `v2ray_api` 的产物跑官方 `sing-box check`（**CI 抓 skip 的 grep 已删，此用例现在是静默——整个切换期住宅配置形状无人验**） | ⬜ blocker |
-| 7 | 计量路径收口：`panel/hy2resi.rs:275,357` 删除或改接；`traffic.rs:240-248` Err 分支必须可见或整体删除；面板/文档承诺同步 | ⬜ 等 §3 |
-| 8 | 自检改写：`selfcheck.rs` 拆成「计量面／门位·在线面」两条判据，去掉 10086 白等 120s 与必然 FAIL | ⬜ |
+| 4 | **原子核心**：删 `render/hy2_singbox.rs` 的 `experimental.v2ray_api` 键，换成官方顶层 `services:[{"type":"api",…}]`（`clash_api` 保留；常量改名 `HY2_RESI_API`，端口单一真源） | ✅ **完成**（切换批；门 `EXIT 3 → 0`） |
+| 5 | 断言同步（同提交）：`hy2_singbox.rs`（反向守卫 + `services[0]` 正断言）、`core_files.rs`、`hysteria.rs` 端口表标签、常量全部消费点（`lib.rs`/`panel/mod.rs`/`hy2resi.rs`/`selfcheck.rs`/`install.rs`/`stock_gate_fixture.rs`） | ✅ **完成**（切换批） |
+| 6 | **测试改真跑**：`kernel_hy2_singbox.rs` 删 skip 门 —— 冷/热两套均 `2 passed / 0 skipped`，并用 PATH shim 证明真调用官方 `/usr/bin/sing-box` | ✅ **完成**（切换批，blocker 解除） |
+| 7 | 计量路径收口：`hy2resi.rs` 重写（Clash HTTP + daemon gRPC 双面）、`traffic.rs` Err 分支落双标记 warn、`query_user_deltas` 签名冻结、lossy 贯通 `users.rs`/`gates.rs`/`api_admin.rs`/`auth_http.rs` | ✅ **完成**（`9f9b1fb`） |
+| 8 | ~~自检改写：拆成「计量面／门位·在线面」两条判据~~ → **降级为可选（Fable 2026-10-10 裁决）**：本步的两条动机**已随第 4 步消失**——「白等 120s 与必然 FAIL」的成因是官方内核不认 `v2ray_api` ⇒ 10086 永不监听；切换后 10086 由新 `services.api` **真绑**（本机实测），`wait_ready` 天然满足。且对手复审确认 `selfcheck.rs:1557` 的「等待有界 ≤120s」假时钟断言**仍在验一条真性质**，不必重写。剩下的只是「把一行拆成两行以改善诊断」，属外观改进 | ⏸ **可选，不阻塞发布** |
 | 9 | **版本钉子改能力/sha 绑定**（§1.4 的核心）：`serve.rs`（否则整轮对账中止）、`upgrade.rs`（否则升级双通道自锁）、`install.rs`（否则新装中止）、`gates.rs`（否则门停 deny 住全体住宅用户）；rollback 守卫从版本白名单改为 `RESIDENTIAL_LAYOUT_SINCE` + sha | ✅ **完成**（`fd55363`） |
-| 10 | 夹具与守卫：`relay_generation_kernel.rs`/`generation.py`/`policy.py` 版本串；`install/upgrade/serve` 夹具 1.14.2 字面量；stock 三处换官方真实 sha；`fakes.rs` 补守卫测试 | 🔶 部分（stock sha 已换 `299f9f60…`） |
+| 10 | 夹具与守卫：`relay_generation_kernel.rs`/`generation.py`/`policy.py` 版本串 ✅；`install/upgrade/serve` 夹具 1.14.2 字面量（自洽、不卡 bot）✅；stock sha 已换官方 `299f9f60…` ✅；`stock_gate_fixture.rs:436` 与 `tests/test-residential-stock-gates.sh:30` 的 `1.14.3` 硬字面量**留作升轨维护点**（opt-in 手动夹具） | 🔶 残部见 §8 |
 | 11 | 清扫：`serve.rs` 的 `bin/.prepared-<uuid>` 失败与成功路径统一清理（否则每 tick 残留 ~81MB 且不被体检暴露） | ✅ **完成**（`fd55363`） |
 | 12 | 真机兜底：官方 1.14.3 + 生产形状配置实测 `auth_user=<name> => gate` 路由串（含多用户 `[a b]` → None 分支）；演练 `/api/health` 对计量失败的 degraded 表现 | ⬜ |
 | 13 | **发布纪律**：2–12 同一 release，不许拆包 | ⬜ |
@@ -327,24 +327,72 @@ scripts/tests/test-residential-stock-gates.sh:19          sing-box version 1.14.
    ⇒ `last_reconcile` 停在**上一次成功的、几小时前的、干净的报告**上，`/api/health` 照报 `ok`。
    （apply 内部的 `out.errors`/`verify_failures` 本来就进报告也参与 degraded，**不是盲区**。）
 
+> 🔁 **本节 2026-10-10 晚被三轮独立对抗验证 + 一次综合裁决推翻过一次，下面是修正后的版本。**
+> 初版有三处错：① 说 `reconcile_from_ctx` 有「5 条 Err 出口」——实为 **≥7 条**（`residential_lifecycle.rs` 另有 2）；
+> ② 说那两行 `tracing::error` 「本来就在 journald 里，只差签名」——对**启动轮**只在同秒竞态下成立、对 **Ok-带错误类**完全不成立；
+> ③ 把自触发描述成「死循环、永不停止」——**机制上不成立**（见硬约束 2，必做的理由不是这个）。
+> 照初版实现仍会得到一个**永不命中**的 matcher 与一个**被饿死的计量告警**。
+
 **修订后的做法（两件，缺一不可）：**
 
 | 件 | 落点 | 为什么 |
 |---|---|---|
-| **① 包装 `reconcile_from_ctx`** | `serve.rs:203-393`（原函数体整体下移成私有 `reconcile_inner`，外层只留 wrapper） | 一处覆盖**全部 5 条出口**与全部 4 个生产调用点（`serve.rs:745`/`:775`/`:902`、`install.rs:1224`）。**不新增字段**：Err（`!dry_run`）时把一份只填 `at` + `errors` 的合成 `ReconcileReport` 写进 `last_reconcile`——`api/health.rs:66-69` 的 degraded 第三项**自动点亮**，`status.rs:388-393` 同源判据同步点亮，`format_status:92-105` 自动打出错误行，`HealthResponse` 形状（`status.rs:18-19`/`:290`、`api/mod.rs:331` 三处注释锁死的回归面）**一字不改** |
-| **② 哨兵 `Sig::ReconcileFailed`** | `signature.rs`（`Sig` + `ALL_SIGS` + `id()` + `action()`=`Alert` + `rule()` + 匹配器）、`run.rs` 分派、`system.rs` 处理 | 让它在**有人看的地方**主动出现：`bui incidents` + **面板系统状态卡**（`web/app.js:1485` 已在拉 `/incidents?limit=20`，`web/index.html:154` 有刷新按钮）。那两行 `tracing::error!("[启动]对账失败：{e}")`（`serve.rs:755`/`:777`）**本来就在 b-ui 自己的 journald 里**，哨兵也本来就盯着 `b-ui`（`sentinel/run.rs:21-25`），**只差签名**。冷却/去重/恢复语义全是现成的 `Rule` |
+| **① 包装 `reconcile_from_ctx`** | `serve.rs:203`。**实现方式是「原函数原地改名 `reconcile_from_ctx_inner` + 在它上方加 ~12 行薄包装」**，不是把 190 行整体缩进重排（那是最容易在这个文件上制造 review 噪声与冲突的做法，零收益；文档注释留在新的 pub 包装上） | 一处覆盖**全部 ≥7 条** Err 出口与全部 4 个生产调用点（`serve.rs:745` 启动轮、`:775` 唯一 mpsc consumer、`:902` `reconcile_offline`（`bui reconcile` / 菜单 / `upgrade.rs:455`）、`install.rs:1224` 装机）。**不新增字段**：Err（`!dry_run`）时把一份只填 `at` + `errors` + 一条 `notes` 的合成 `ReconcileReport`（`..Default::default()`）写进 `last_reconcile`——`api/health.rs:64-69` 的 degraded 第三项**自动点亮**，`status.rs:388-393` 同源判据同步点亮，`format_status:92-105` 自动打出错误行，`HealthResponse` 形状（三处注释锁死的回归面）**一字不改** |
+| **② 哨兵 `Sig::ReconcileFailed`** | `signature.rs`（`Sig` 枚举+文档、`ALL_SIGS` 13→14〔`[Sig; 13]` 是编译期约束〕、`id()`、`action()`=`Alert`、`rule()`、`classify` 的 `b-ui` 分支 `:249` 追加 `.or_else(reconcile_failed)`）、`run.rs:342-370` dispatch 加一条（穷尽 match，编译器兜底）、`system.rs` 纯处理函数 | 让**整轮中止**主动出现在有人看的地方：`bui incidents` + 面板系统状态卡（`web/app.js:1485` 拉 `/incidents?limit=20`）。`classify` 用源码子串 **`对账失败`**（同时覆盖 `:755` 与 `:777`）+ `unit == "b-ui"` |
 
-**两条硬约束（侦察点名、必须遵守）：**
+**硬约束（对抗验证逐条给出，实现前必须落死）：**
 
-- **只许写自己那一项。** `:387` 一次写 `restart_keys` / `drift` / `last_reconcile` 三个字段；失败路径
-  若照抄整行会把真实漂移与重启键擦成空（而漂移非空**本身也是 degraded 判据**，`api/health.rs:65`）。
-- **必须「下一轮成功即清空」。** `:387` 在成功轮无条件覆盖 `last_reconcile` ⇒ 清空是自然的；但**不许**
-  另加一个只在失败时写的字段（那就要自己发明「什么时候算恢复」）。教训见 `reconcile/drift.rs:466`、`modules/system.rs:524`。
+1. **matcher 与 producer 共用同一个常量**，常量**取自 `serve.rs:755`/`:777` 的源码原文**——`"启动对账失败：{e}"` 与 `"对账失败：{e}"`，**没有方括号**。
+   ⚠️ 计划初版写成 `"[启动]对账失败：{e}"`，**逐字照抄 = matcher 永不命中，而照抄写的测试会一起绿**。形状照 `users::USER_SYNC_FAILED_LOG`（`users.rs:26-29`）。
+2. **handler 的 result 文案禁止包含该常量**，并**补一条同款断言测试**。理由要说准（初版说成「死循环、永不停止」，**综合裁决复核后判定机制上不成立**）：
+   `run.rs:320/323` 会把事件文案以 `"哨兵事件：{result}"` 写回 b-ui 自己的 journald，而哨兵读的 `units()` 含 `b-ui`。但回响行在事件落盘后 ~2 秒就被读走，
+   而同签名去抖 60 秒（`sentinel/mod.rs:23`，`engine.rs` 的 observe 在 `now-fired<60` 时丢弃）、命中窗口也是 60 秒且过期即 `pop_front`，冷却又把事件率钉死在 ≤1/10 分钟
+   ⇒ **链条会自灭，不会无限循环**。**必做的真实理由是**：(a) 它**违反成文不变量**——`system.rs:87`（xray 文案不许含 `USER_SYNC_FAILED_LOG`）、
+   `system.rs:161-163` + 测试 `system.rs:411-416`（计量文案不许同带双标记）；(b) 在 `threshold≥2` 的签名上它是**拿自己的回响给自己的门槛凑数**。
+   另注：`sys/mod.rs:293-297` 会把 tracing 的 `error=` 字段追加进 MESSAGE，**所以带错误原文的那条行也在匹配面内**——这正是「不把错误原文塞回 result」的原因。
+   可选加固：`classify`（或 tick 匹配处）跳过 MESSAGE 以 `哨兵事件：` 开头的记录（`run.rs:320/323` 是唯一写者）。
+3. **用独立 subject（建议 `reconcile`），不要用 `b-ui`**——`engine.rs:59-61` 的 `action_key = "<action.id()>|<subject>"` **不含签名**，
+   而 `alert|b-ui` 已被 `Hy2ResiMeteringLost` 占用（`signature.rs:124-127` → `Alert`，`system.rs:181` subject `"b-ui"`）。
+   两者在 600 秒内相遇时**后者连事件都不记**（`run.rs:258-262` 只留一行 debug），能把计量告警饿死——而它文档里明写「必须有人看见，不许静默」。
+4. **`Rule { threshold: 1, window_secs: 60 }`**——tick 节律是 `DRIFT_INTERVAL_SECS=600`，抄 relay 那族的 `2/60` **永不达标**（60 秒外的命中会被逐条弹出）。
+   同族先例见 `signature.rs:152-160`（`KernelBindInUse`/`CaddyCertFailed`）。**window 也不许 >150**：`longest_window_secs` 从 `ALL_SIGS` 推导（`run.rs:27-33`，现为 150），抬高它会改变 `drop_stale_start`（`run.rs:37-58`）的游标丢弃阈值。
+   ⚠️ 攻击者曾提议用 `threshold≥2 / window_secs≥1500` 来压事件量，**综合裁决否掉**：1500 会让 `longest_window_secs` 从 150 跳到 1500，把**所有**签名的回放窗口一起放大；而它要解决的「事件量」本来就由 600 秒动作冷却兜着（见下面的「事件节律」条）。
+5. **wrapper 必须把 Err 原样重抛**（不包装、不吞）。下游全依赖 Err 传播：`serve.rs:755`/`:777` 两个 `tracing::error!`、`reconcile_offline` 的 `?`（`:902` 后打印返回值）、`install.rs:1223-1236` 的 `?` + 依 `report.errors` bail，
+   以及两条硬断言 `serve.rs:1730`（`expect_err`）与 `:2321`（`unwrap_err`）——**吞掉 Err 会让它们 panic**。落笔时别只写「写报告」，要写「写完 `return result`」。
+6. **只写 `last_reconcile` 一项。** `serve.rs:387` 一次写 `restart_keys` / `drift` / `last_reconcile` 三个字段；失败路径若照抄整行会把真实漂移与重启键擦成空
+   （而漂移非空**本身也是独立 degraded 判据**，`api/health.rs:60-66` 与 `status.rs:388-393` 都读顶层 `rt.drift`，不读 `report.drift`）。
+7. **`errors` 落盘前必须脱敏。** `logging.rs` 只是 subscriber 初始化，**没有脱敏层**，脱敏全靠调用点。同一函数里正反例并存：`:363` 对 relay 确认错误用了 `redact::url_credentials`，`:379` 的 `residential activation: {error}` 是裸写。
+   合成报告建议统一走 `crate::redact::line(&format!("{e:#}"))`（带错误链更可诊断），**顺手把 `:379` 那处也统一到同一口径**。否则错误链里的 `scheme://user:pass@…` 会经 `runtime.json`（0600）、`/api/health`、`bui status`、`POST /api/reconcile` 回包与 incident 回读。
+8. **合成报告加一条 `notes`**，例如「本轮在中止前可能已应用部分改动，changed/restarted 清单不可信」——
+   `:371`/`:375` 两条出口发生在 `reconcile_once` 已经落盘并重启过单元**之后**，报告里 `changed`/`restarted`/`notes` 都是真实值却被 `?` 整份丢弃；
+   不写这条，`status.rs:91-97` 会打出「变更 **0** 项」而事实相反（**不是误判**——errors 行照常打印、degraded 照常点亮——但会让人低估已发生的改动）。
+9. **`!dry_run` 守卫**：`reconcile_offline --dry-run`（`serve.rs:859-869`）与各测试都传 `dry_run=true`；dry-run 成败都不写 runtime。
+   守护进程永远传 `false`（`api/system.rs:25` 忽略请求里的 dry_run），所以这个守卫只影响离线 CLI。
+10. **`residential_lifecycle.rs:367` 的关闭场景**：`ensure!(!jobs.closing, "residential owner is shutting down")` 会让 wrapper 在守护进程 drain 时写一份合成失败报告。噪声可接受，但**文案要能看懂**（别让它读起来像生产事故）。
 
-**已核过的兼容性**：`last_reconcile` 的活消费者只有 4 处，合成报告在每处都**更真**——`api/health.rs:67`（degraded ✅ 想要它亮）、
-`api/health.rs:80` / `status.rs:411`（响应体 ✅）、`api/system.rs:28`（`POST /api/reconcile` 回最近一份报告 ✅）、
-`status.rs:391`（degraded ✅）。其余是测试（`serve.rs:2364`、`api/mod.rs:331/335/383`、`runtime.rs:437/439`）。
-`is_clean()` 的 7 个使用点**全在测试里**，不受影响。
+**覆盖边界（写文档时不许含糊）：**
+
+- ① 覆盖 **≥7 条** Err 出口：`serve.rs:319`（`??`，内含 `:220`/`:230`/`:285`/`:291` 等内层出口）、`:329`（候选 sing-box 存在时的 `Facts::probe`）、`:338`（发布被拒）、`:351`（`reconcile_once` 失败）、`:371`（证书待定回执缺失）、`:374`（`maintenance`）、`:375`（维护回执缺失）；`residential_lifecycle.rs` 另有 2 条（`:367` 关闭中、`:381-382` owner 无结果）。最现实的一类是 `:220`/`:230`/`:285` 的 preflight——**GitHub 或镜像不可达时每 10 分钟必失败**。
+  另注：`:371` 只在回执**整体缺失**时才 Err（`residential_lifecycle.rs:749-752` 会先 persist `awaiting_certificate`）⇒ 正常首装等证书是 **Ok + notes**，不会被 ① 误记成错误。
+- **启动那一轮（`serve.rs:755`）只是同秒竞态，不是「一定看不到」**（初版说反了）：哨兵模块 `:762` 才 spawn，晚于启动对账（`:745-757`）；哨兵首 tick 用 `--since @unix秒`（`sys/mod.rs:179-197`）⇒ **与启动错误行落在同一秒才读得到，常态同秒即可见，跨秒才漏**；后续轮与 10 分钟巡检走游标，可靠。
+  所以口径写成「启动轮**可能**漏首发，后续轮会补」，**不写成保证、也不为此加通道**。
+- **不许宣称「再无静默对账失败」。** 以下都不在 ① ② 覆盖内：
+  - **Ok-带错误类（apply 逐项失败）本次不做成事件**（综合裁决：另开一条，别搭车）。它今天在 `bui status` 与 `/api/health` 上**可见**（`reconcile_once` 把 `ApplyOutcome.errors`/`verify_failures` 拷进报告后返回 **Ok**，`serve.rs:142-163`），
+    只是**面板不读 `/api/health`** ⇒ 真正的缺口在「面板不消费 health」这个 UI 问题上，**要覆盖得先改 UI 口径，而不是在这里加第二个发射点**。
+  - `apply.rs:517-543`：`let _ = host.run("ufw"/"firewall-cmd", …)` 之后**无条件** `out.changed.push(describe(c))` 与 `out.keys.insert("firewall", k)`
+    ⇒ **端口放行失败被记账成成功**，diff 里 firewall key 已提交、不再重发 `OpenPorts`，**永不重试、不进 errors/verify_failures**。**独立缺陷，单独提。**
+  - `apply.rs:473-505`、`:633` 的 `let _ = host.systemd(…)` / `let _ = host.systemd_daemon_reload()` 静默。
+  - `drift::scan` 是不可失败的 `Vec`（host 查询错误 `unwrap_or_default` 吞掉），也不报。
+- **事件节律是有意为之、要写进注释**：`DRIFT_INTERVAL_SECS=600` 与 `ACTION_COOLDOWN_SECS=600` 相等 ⇒ 稳定态的持续故障约 **20 分钟一条**同签名 Alert（约 72 条/天），
+  而 `INCIDENTS_MAX=200` ⇒ 单一故障约 **2.8 天占满事件环**；面板卡读 `limit=20` 只覆盖约 6.7 小时。这与既有 Alert 级签名（`Hy2AuthHttpFailed`/`CaddyCertFailed`）**行为一致**，是平台语义不是新缺陷——
+  但要在 `signature.rs` 的注释里写明「持续故障每冷却周期提醒一次」是**选择**。
+
+**已核过的兼容性**：`last_reconcile` 的活消费者确为 4 类（`api/health.rs:67` degraded ✅、`api/health.rs:80` / `status.rs:411` 响应体 ✅、`api/system.rs:28` `POST /api/reconcile` 回包 ✅、`status.rs:391` degraded ✅），
+`web/*`、`.github/*`、`modules/panel/*`（含 `residential::state::health_summary`）**零读取**；`is_clean()` 只在测试里。
+合成报告在每处都**更真**（`api/system.rs:28` 现在会回一份失败报告，比今天的陈旧成功报告准确）。
+⚠️ 补一处初版漏掉的消费方：**`scripts/m1-acceptance.sh:30-50`** 读 `bui status --json` 的 `.reconcile.errors`/`.verify_failures`——
+合成报告让它从「停留在几小时前的干净报告 ⇒ 假通过」变成「真失败」，**方向正确，验收时不要当回归**（其 stub 形状 `:866-869` 与新形状逐字段一致）。
+另：`:387` 与 `:393` 之间若发生 panic（如 `c.bus.send(Event::RelayRestarted)`），wrapper 会用合成报告覆盖本轮刚落的真实报告——**影响面小（本轮确实失败且仍 degraded），接受并在注释里写明这是有意的**。
 
 **顺带纠正第 16 步的遗留条目**：`relay_generation.rs:527` 的 `"1.14.3"` 字面量**不在活的生产路径上**——
 `relay_generation` 只被 `render/relay/generation.rs` 引用，而后者自己在文件头写明「当前生产 renderer 尚未调用本模块」。
@@ -424,3 +472,100 @@ scripts/tests/test-residential-stock-gates.sh:19          sing-box version 1.14.
   `next-actual-entrypoint-map.md`。**注意**：当前持锁同步 `systemctl` 的旧路径与 locking hooks
   存在死锁（job 等 hook、hook 等锁），**不得先装部分 hooks**。
 - 客户端完整受管配置交付（平台逐项验收）。
+
+---
+
+## 7. 安全审查的未决发现（Fable 2026-10-10 裁决）
+
+后台提交安全审查（`~/.claude/security/security_warnings_state_<session>.json`）在 `9f9b1fb` 上留下 3 条未决。
+其中**两条此前已修**（记录在 `previous_findings` 里，此处只作存档）：`api/system.rs` 的 `format!("{result:?}")`
+已换成只回错误消息 + `redact::url_credentials`；`ci.yml` / `release.yml` 的
+`pin-kernels.sh --check || echo "::warning::…"` 已改成 `--check --warn`（`||` 会把硬失败一起吞掉，注释里点名了这次审查）。
+
+**未决三条的裁决：**
+
+| # | 位置 | 审查类别 | 裁决 |
+|---|---|---|---|
+| A | `crates/bui/src/modules/panel/hy2resi.rs` | 部署期可用性（客户端与渲染器分叉） | **正在修**（第 4/5/6 步的原子切换批）。客户端已改说官方 `daemon.StartedService`，而渲染器仍写 `experimental.v2ray_api` ⇒ 官方内核拒绝启动。**这就是本计划存在的理由**，切换批落地即消解 |
+| B | `crates/bui/src/modules/panel/meter.rs` `g.open` | 无上界内存（远端连接 churn 喂养） | **真缺陷，单独排期修**。见下 |
+| C | `crates/bui/src/modules/panel/users.rs` `blocked_set(.., lossy)` | fail-open 授权（攻击者可影响的状态关闭强制） | **接受的已记录风险**，但计划必须把它写成**安全控制**而非运维提示。见下 |
+
+### 7.1 B：`g.open` 无上界（真泄漏，非理论）
+
+`meter.rs` 里 `alerts` 有 `ALERTS_KEPT`、`dedup` 有 `DEDUP_CAP` + `DEDUP_TTL_MS`，**唯独 `g.open` 没有任何上界**：
+`:492` `g.open.insert(ev.id, Open { known: total })`（NEW 事件）、`:500` `g.open.entry(ev.id).or_default()`（UPDATE，**连没见过的 id 也建条目**）、
+`:705` `self.open.remove(id)`（只在收到 CLOSED 时删）。
+
+**泄漏路径已核实**：判损时 `:557` 会 `resubscribe = true`（测试 `:1082` 守着），但 `note_session_start` **只在实例代际变化时 `g.open.clear()`**（`:599`）——
+重订阅同一实例代际不变 ⇒ **gap 期间关闭的连接，其条目永久留下**。而 G0 已实测流会在 ~128 KiB 流控边界被截断（丢 4%~100%）
+⇒ 反复 gap 会持续累积。
+
+**影响面（如实界定，不夸大）**：`Open.known` **不参与入账**——入账用的是 CLOSED 事件的终值 `c.total`（规则 1）。
+所以它不污染账本，只泄内存 + 扰动指标 A 的 ΔS 项（`R = ΔG − ΔB − ΔS`）。稳定态尺寸 ≈ 并发连接数，只在反复截断时累积 —— **不是紧急缺陷，但是确定的缺陷。**
+**修法方向**（不要与本次切换搭车）：给 `open` 一个上界（超限时按「最可疑」策略淘汰并在指标里记一次事件），
+或让重订阅也换代际/清一次在册 —— 后者要小心别把仍在开的连接算漏。
+
+### 7.2 C：lossy 的 fail-open 是**安全控制**，不是运维提示
+
+`users.rs` 的 `blocked_set(state, pending, now, lossy)` 在有损窗口里把该用户的 `pending` 视为 0
+⇒ **有损期间新增的字节不参与封禁判定**。§5.1 的裁定（用户层 fail-open / 系统层 fail-closed）成立于
+「诚实故障」的框架下，**但没有考虑「攻击者自己诱发」**。
+
+⚠️ **已核实：`lossy` 是账本上的单个全局布尔，不是按用户的**（`MeterView` 只有 `lossy` / `lossy_since` / `lossy_until` 三个标量字段，
+`Inner` 侧是 `lossy_since_ms` / `lossy_until_ms` 一对 `i64`；全账本共用）。所以它不是「一个用户逃配额」，而是**全局性**的：
+
+> **单个用户**制造**持续**的计量 gap（判据是连接 churn 撑爆 gRPC 流控，G0 已实测会在 ~128 KiB 边界截断）
+> ⇒ 全局 `lossy` 为真 ⇒ **所有用户**的未落盘 pending 都不参与判定 ⇒ 同期落盘循环也拿不到增量（`query_user_deltas` 返回 Err）。
+
+**但严重度是有界的（三个参数把口子收窄了，这部分我起初也写过头，改回来）：**
+
+| 收窄项 | 实测值 | 效果 |
+|---|---|---|
+| `LOSSY_MAX_MS` | **6 小时**（`until = min(now + LOSSY_HOLD_MS, since + LOSSY_MAX_MS)`） | 有损状态**硬封顶**在「自首次判损起 6 小时」，到点 `expire_lossy` 复位、`since` 清空 ⇒ **不能永久逃避**，每次诱发最多换 6 小时 |
+| `LOSSY_HOLD_MS` | 30 分钟 | 单次判损的保底窗口 |
+| 已有 usage | `blocked_set` 只把 **pending** 视为 0，**已落盘的 `usage` 照常判定** | 能逃的只有**未落盘的那一段**，历史超量仍会封 |
+
+⇒ 定性：**有界、自限、每次窗口起止各留一条 incident 的已记录风险**，不是「一个人永久关掉强制」。
+
+**这不改变 §5.1 的取舍**（反向做会在任何计量打嗝时封住全体无辜用户，更糟），但要补三件事：
+
+1. **把它写成安全控制**：计划与代码注释里，「incidents 事件 + 人工核账」是**这一风险的唯一缓解**，
+   不是「顺带提醒运维」。`Sig::Hy2ResiMeteringLost` 因此在功能上**不是可选项**（已有实现，`9f9b1fb`）。
+   **并且要把 6 小时这个上限写进注释**——它是这条风险「有界」的依据，将来谁改动 `LOSSY_MAX_MS` 就要重估这条。
+2. **记一条后续**：评估「有损持续接近 6 小时上限 ⇒ 升级动作」的策略。
+   ⚠️ 因为 `lossy` 是全局的，任何升级动作**必须是全局性的**——按用户动作会误伤（攻击者诱发 lossy，被处理的是所有人）。
+   这本身也是 DoS 面：升级策略既是缓解也是武器，取舍要单独论证。
+3. **记第二条后续**：评估把有损**归因**做细（例如按用户维度统计「哪些用户的 UPDATE 落在 gap 里」）。
+   当前账本只知「全局丢了 N 字节」而不知「丢的是谁的」，这正是它无法按用户降级的原因。
+
+### 7.3 顺带：仍未裁决的产品口径（§5.3 遗留）
+
+**UDP 计费口径**：账本记**净负载**，与客户端封装口径差恒定 10 B/报文/方向（v4）/ 22 B（v6）。混用即系统性偏差。
+本次不阻塞切换，但**发版前必须定死一个**（建议：以账本口径为准并在订阅页说明，因为账本是唯一可验证的真相源）。
+
+---
+
+## 8. 切换批验证者留下的残部（Fable 2026-10-10 收口）
+
+原子切换批的两个验证者（对抗复审 + 契约核验）都判**通过、无阻塞缺陷**，但留下下列残部。
+**判据分级**：「真」= 事实错误或安全面；「维护点」= 现在不错但升轨会错；「可选」= 外观。
+
+| # | 位置 | 性质 | 处置 |
+|---|---|---|---|
+| 1 | `docs/superpowers/plans/2026-09-11-v4-master.md:66` | **真**：C1 契约清单仍列 `HY2_RESI_V2RAY_API`，而该符号已不存在（本文件本次已被 diff 改过 `:229/:342`，唯独漏了这处契约行） | 同下一批改 |
+| 2 | `docs/superpowers/specs/2026-09-15-hy2-singbox-residential-design.md:146/:156/:542/:548/:676` | **真**：`v2ray_api` 残留未全部加订正注（该文件已有 `:18/:66/:71/:129/:135/:354/:408` 的 2026-10-10 订正，口径不齐） | 同下一批补齐 |
+| 3 | `crates/bui/src/modules/panel/stock_gate_fixture.rs` 的新守卫 | **真（不可达但守卫不严）**：只校验 `services` 是长度 1 的数组；若 `services[0]` 是非对象（如数字），随后的 `["listen"]` 赋值会 panic。当前渲染器恒产对象故不可达 | 加严成 `.as_object()` |
+| 4 | `crates/bui-schema/tests/kernel_hy2_singbox.rs` 的 openssl 早退 | **真（静默面）**：PATH 缺 sing-box 或 openssl 不可用时 `eprintln` + `return` **静默通过**；而 CI 的 skip 黑名单只匹配 `<kernel> not found` 与 caddy，**不匹配 `skipped: openssl not usable`** | 纳入 CI skip 黑名单，或让 CI 里缺内核即硬失败（照 `relay_generation_kernel.rs:143-146` 的 `assert!(CI.is_none())` 范式） |
+| 5 | `crates/bui/src/modules/panel/traffic.rs` 测试串 `fail_next("v2ray_api 不可达")`（`:787`/`:1193`）与「住宅的 QueryStats」注释 | **真（文案说谎）** | 同下一批改 |
+| 6 | `CHANGELOG.md:20`（未发布的 4.1.9 段）仍写「sing-box 1.14.2」 | **真**：锁自 `51024f5` 起是官方 1.14.3，且 `install.rs:356` 的 `client_sing_box` 与 `sing_box` 同源 ⇒ 服务端与 bui-c 一并到 1.14.3，该句对两个角色都失真 | **随第 13 步的发布准备改**（现在改是写未发生的记录） |
+| 7 | `stock_gate_fixture.rs:436` 与 `tests/test-residential-stock-gates.sh:30` 的 `1.14.3` 硬字面量 | **维护点**：opt-in 手动夹具，升轨时须同步 | 记在此，升轨时一并 |
+| 8 | `docs/superpowers/plans/2026-09-15-v41-hy2-singbox.md:802/:907` 旧口径 | **可选**：历史计划，不改史实 | 不动 |
+| 9 | `run-all.sh` 以退出码判过、不解析 TAP；两个手动 runner 跳过仍计入「all script tests passed」 | **可选**：跳行有输出可见，只是汇总不区分「跑过」与「跳过」 | 记此，需要时再改 |
+| 10 | 计划状态表滞后 | — | ✅ 已回填（第 4/5/6/7 步） |
+
+### 8.1 发布前必须人工做的（不属代码改动）
+
+- **私有渲染器快照需重采**：`offline_renderer_snapshot.rs:680` 已写明；本机无 docker 夹具故 `test-renderer-snapshot.sh` 跳过。切上线后用新渲染产物重采。
+- **stock 门位夹具容器需用官方裸二进制重建**：sha `299f9f60…`（arm64）。旧自建 1.14.2 的 PASS **不继承**。
+- **第 12 步真机兜底**：官方 1.14.3 + 生产形状配置实测 `auth_user=<name> => gate` 路由串（含多用户 `[a b]` → None 分支）；`/api/health` 对计量失败的 degraded 演练。**未见执行记录。**
+- **存量安装换核依赖真实发布 + 真机升级**。

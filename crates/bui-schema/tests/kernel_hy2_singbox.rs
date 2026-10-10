@@ -1,21 +1,13 @@
-//! `hy2-residential.json` 过**自建** sing-box（≥ 1.14，带 with_v2ray_api）的 check。
-//! 官方二进制不含 with_v2ray_api，`experimental.v2ray_api` 段在它上面必然 FATAL ⇒ 那种情况 skip
-//! 而不是失败（spec §2.3「哪些还没验」+ §5.4 第 9 条）。
+//! `hy2-residential.json` 过**官方** sing-box（= `scripts/release/kernels.lock` 里
+//! `sing-box target` 那一版，2026-10-10 起是官方发行归档）的 check。
 //!
-//! 本机 1.14.0（官方二进制）实测，逐字：
-//! `FATAL create v2ray-server: v2ray api is not included in this build, rebuild with -tags with_v2ray_api`
-//! ——把 `experimental.v2ray_api` 摘掉后同一份配置 `check` 退 0，所以除那一段之外的形状
-//! （凭据池 / deny socks / 8 个槽出站 / 门 / `auth_user` 规则 /
-//! `route.final` / `clash_api` / salamander / masquerade proxy）已在真实 1.14 上验过。
+//! 4.x 这里按「自建 `with_v2ray_api` 二进制」判 skip：官方发行物不含那个编译标签，而渲染器
+//! 当时还产 `experimental.v2ray_api`，对官方内核必然
+//! `FATAL create v2ray-server: v2ray api is not included in this build, rebuild with
+//! -tags with_v2ray_api`。渲染器已把那段换成官方内置的 `services: [{ "type": "api", … }]`
+//! （见 `render::hy2_singbox` 模块文档），所以这两格对官方产物**必须真跑**——再退回
+//! 「自建不可用 ⇒ 静默 skip」会让「住宅内核起不来」正好发生在绿 CI 底下。
 mod common;
-
-fn singbox_has_v2ray_api() -> bool {
-    std::process::Command::new("sing-box")
-        .arg("version")
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).contains("with_v2ray_api"))
-        .unwrap_or(false)
-}
 
 /// 自签一张证书：`check` 会真读 `tls.certificate_path`（缺文件即
 /// `FATAL initialize inbound[0]: read certificate: open …: no such file or directory`），
@@ -37,11 +29,7 @@ fn self_signed(dir: &std::path::Path) -> Option<()> {
 }
 
 #[test]
-fn residential_inbound_config_passes_check_on_the_self_built_singbox() {
-    if !singbox_has_v2ray_api() {
-        eprintln!("skipped: 自建 sing-box（with_v2ray_api）不可用");
-        return;
-    }
+fn residential_inbound_config_passes_check_on_the_stock_singbox() {
     let dir = tempfile::tempdir().unwrap();
     if self_signed(dir.path()).is_none() {
         eprintln!("skipped: openssl not usable");
@@ -67,10 +55,6 @@ fn residential_inbound_config_passes_check_on_the_self_built_singbox() {
 /// 空 `users` 或空 `rules` 数组被 sing-box 判非法的话，首装当轮住宅内核就起不来。
 #[test]
 fn an_empty_credential_pool_also_passes_check() {
-    if !singbox_has_v2ray_api() {
-        eprintln!("skipped: 自建 sing-box（with_v2ray_api）不可用");
-        return;
-    }
     let dir = tempfile::tempdir().unwrap();
     if self_signed(dir.path()).is_none() {
         eprintln!("skipped: openssl not usable");

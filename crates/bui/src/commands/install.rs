@@ -1532,8 +1532,8 @@ mod tests {
             ));
             i.listening.insert(
                 crate::sys::Proto::Tcp,
-                // 9092 / 10086 是住宅 sing-box 的两个回环面（Clash API + v2ray_api，
-                // 自检的「住宅管理面端口」那一行查它们）
+                // 9092 / 10086 是住宅 sing-box 的两个回环面（Clash API + 官方内核
+                // 内置的 api 服务，自检的「住宅管理面端口」那一行查它们）
                 std::collections::BTreeSet::from([443, 10001, 10002, 8080, 9092, 10086]),
             );
             i.listening.insert(

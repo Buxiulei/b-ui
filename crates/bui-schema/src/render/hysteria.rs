@@ -281,8 +281,8 @@ mod tests {
             ),
             (10085, "Xray api"),
             (
-                port_of(crate::render::hy2_singbox::HY2_RESI_V2RAY_API),
-                "住宅 HY2 v2ray_api",
+                port_of(crate::render::hy2_singbox::HY2_RESI_API),
+                "住宅 HY2 官方内核 api 服务（计量面）",
             ),
             (10000, "hy2 直连"),
             (10001, "reality 直连"),

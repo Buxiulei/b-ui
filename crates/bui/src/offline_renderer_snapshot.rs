@@ -672,6 +672,15 @@ fn exercise_snapshot(input: PathBuf, output: PathBuf) -> Result<()> {
     Ok(())
 }
 
+/// 私有快照回归 runner：对 `BUI_RENDER_INPUT_DIR` 里那份**私下采集**的真实渲染产物跑全量校验
+/// （入口是 `scripts/tests/test-renderer-snapshot.sh`）。其中一个断言拿快照里的
+/// `hy2-residential.json` 与**当前渲染器的新输出**逐字节比对。
+///
+/// **（2026-10-10 注记）**：快照记录的是采集那一刻渲染器的产物，与渲染器逐字节绑定。官方
+/// sing-box 切换（顶层 `services` 的 `api` 服务取代 `experimental.v2ray_api`）随本候选发布
+/// 上线后，必须用**切换后新渲染的产物**重新采集这份私有快照，否则上面那条逐字节断言会直接
+/// 失败——那是预期信号（快照过期），不是渲染器回归。重采口径见
+/// `docs/superpowers/plans/2026-10-10-singbox-official-and-metering.md`。
 #[test]
 #[ignore = "requires explicit private snapshot paths; use scripts/tests/test-renderer-snapshot.sh"]
 fn offline_renderer_snapshot() {

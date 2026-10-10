@@ -828,7 +828,7 @@ pub fn kernel_build_differs(
 
 /// 边下边 hash 边写临时文件 → sha256 校验 → `commit`（0755 rename 到 `dest`）。
 ///
-/// **不许改回 `get_bytes` + `write_file`**：内核二进制单笔约 81 MB（sing-box，自建更大），
+/// **不许改回 `get_bytes` + `write_file`**：内核二进制单笔约 81 MB（sing-box），
 /// 而 `b-ui.service` 的 `MemoryMax=200M` 是硬上限 ⇒ 一次性读入就是升级期的 OOM 面
 /// （systemd 把守护进程杀在下载半路）。详见 [`Fetcher::download_to`] 与
 /// [`crate::sys::StagedWrite`]。
@@ -1223,7 +1223,7 @@ mod tests {
     /// 钉住「内核身份不再把二进制整文件读进内存」。
     ///
     /// 这个判断在**每轮稳态对账**里对四个内核各跑一次：实测四个 stripped 内核合计 190 MB、
-    /// 单笔最大约 81 MB（sing-box，自建更大），等价进程峰值 RSS 132 MB；而 `b-ui.service`
+    /// 单笔最大约 81 MB（sing-box），等价进程峰值 RSS 132 MB；而 `b-ui.service`
     /// 的 `MemoryMax=200M` 是**硬上限**、对账 600 秒一轮 —— 用 `read_file` 算 sha 就是每
     /// 10 分钟复现一次的 OOM/重启循环面。判据不变，只把「读 190 MB」换成「流 190 MB」，
     /// 所以这里断言的是**用了哪条接口**：`Host::file_sha256`（流式，峰值几 KiB）被查过。

@@ -6,7 +6,7 @@
 //!
 //! 4.1 的住宅 HY2（sing-box 单入站 + nft 端口跳跃）另加五行：`table inet bui` 在位且规则等价、
 //! **端口 1 没人监听**（`deny` 出站指向 `127.0.0.1:1`，前提没了就等于放行被封用户）、
-//! 凭据池的已用 / 空闲 / 代数、两个回环控制面（Clash API + v2ray_api）在听，以及一条
+//! 凭据池的已用 / 空闲 / 代数、两个回环控制面（Clash API 与 api 服务的 gRPC）在听，以及一条
 //! **带整段跳跃**的住宅回环鉴权 —— 最后那条是 `inet bui` 的 `output` 链唯一的验证路径。
 //!
 //! 任一 FAIL 让 `bui install` 退 2，但**不回滚**：配置已经落盘、v3 已经卸掉，回滚只会把机器
@@ -180,8 +180,9 @@ fn wait_ready(
                     Proto::Tcp => tcp.contains(&port),
                     Proto::Udp => udp.contains(&port),
                 })
-                // 住宅 sing-box 的两个回环控制面：inbound 先绑 `:40000`、experimental 的
-                // 这两个面稍后才起，采样落进那个窗口会把一台健康机器判红（那一行是 FAIL
+                // 住宅 sing-box 的两个回环控制面：inbound 先绑 `:40000`，`services` 的 api
+                // 面与 `experimental.clash_api` 面稍后才起，采样落进那个窗口会把一台健康机器
+                // 判红（那一行是 FAIL
                 // 级 ⇒ `bui install` 退 2）。只进**等待条件**，不进 `listen_ports`
                 // ——那会改「关键端口」那一行的语义与它的 PASS 文案。
                 && resi_api_ports().iter().all(|p| tcp.contains(p))
@@ -212,13 +213,13 @@ pub fn listen_ports(state: &State) -> Vec<(Proto, u16)> {
     ]
 }
 
-/// 住宅 sing-box 的两个回环控制面端口（Clash API 与 v2ray_api）。端口只有一处来源——
-/// 写出 `hy2-residential.json` 的那个渲染器；这里只把它们解析成数字。
+/// 住宅 sing-box 的两个回环控制面端口（Clash API 与官方内核内置的 api 服务）。端口只有一处
+/// 来源——写出 `hy2-residential.json` 的那个渲染器；这里只把它们解析成数字。
 /// **不在** [`listen_ports`] 里（那一行的语义是「关键端口」），只进有界等待的就绪条件与
 /// 「住宅管理面端口」那一行。
 fn resi_api_ports() -> Vec<u16> {
-    use bui_schema::render::hy2_singbox::{HY2_RESI_CLASH_API, HY2_RESI_V2RAY_API};
-    [HY2_RESI_CLASH_API, HY2_RESI_V2RAY_API]
+    use bui_schema::render::hy2_singbox::{HY2_RESI_API, HY2_RESI_CLASH_API};
+    [HY2_RESI_CLASH_API, HY2_RESI_API]
         .iter()
         .filter_map(|a| api_port(a))
         .collect()
@@ -557,18 +558,19 @@ fn hy2_pool_row(state: &State) -> Check {
     pass(name, detail)
 }
 
-/// 住宅 sing-box 的两个回环控制面：Clash API（在线数 / 踢连接 / 门位）与
-/// v2ray_api（计量）。端口只有一处来源——写出 `hy2-residential.json` 的那个渲染器。
+/// 住宅 sing-box 的两个回环控制面：Clash API（在线数 / 踢连接 / 门位）与官方内核内置的
+/// api 服务（计量，`daemon.StartedService` 的 gRPC）。端口只有一处来源——写出
+/// `hy2-residential.json` 的那个渲染器。
 /// 证书未到时住宅内核根本没起来 ⇒ SKIP（与 HY2 的 UDP 口同一口径）。
 fn hy2_resi_api_row(tcp: &std::collections::BTreeSet<u16>, cert_ready: bool) -> Check {
-    use bui_schema::render::hy2_singbox::{HY2_RESI_CLASH_API, HY2_RESI_V2RAY_API};
+    use bui_schema::render::hy2_singbox::{HY2_RESI_API, HY2_RESI_CLASH_API};
     let name = "住宅管理面端口";
     // 时序保护在 [`wait_ready`]：这两个端口进就绪条件，所以走到这里时要么已经绑上、
     // 要么预算等满了（真有问题）。
     if !cert_ready {
         return skip(name, CERT_PENDING);
     }
-    let missing: Vec<String> = [HY2_RESI_CLASH_API, HY2_RESI_V2RAY_API]
+    let missing: Vec<String> = [HY2_RESI_CLASH_API, HY2_RESI_API]
         .iter()
         .filter(|addr| !api_port(addr).is_some_and(|p| tcp.contains(&p)))
         .map(|addr| (*addr).to_string())
@@ -577,14 +579,14 @@ fn hy2_resi_api_row(tcp: &std::collections::BTreeSet<u16>, cert_ready: bool) -> 
         return fail(
             name,
             format!(
-                "{} 没在监听：住宅的计量（v2ray_api）与门位 / 在线数（Clash API）会双双打空",
+                "{} 没在监听：住宅的计量面（api 服务）与门位 / 在线面（Clash API）会双双打空",
                 missing.join("、")
             ),
         );
     }
     pass(
         name,
-        format!("Clash API {HY2_RESI_CLASH_API} 与 v2ray_api {HY2_RESI_V2RAY_API} 在监听"),
+        format!("Clash API {HY2_RESI_CLASH_API} 与 api 服务 {HY2_RESI_API} 在监听"),
     )
 }
 
@@ -831,10 +833,10 @@ mod tests {
                     Proto::Udp => udp.insert(port),
                 };
             }
-            // 住宅 sing-box 的两个回环面（Clash API + v2ray_api）
+            // 住宅 sing-box 的两个回环面（Clash API + api 服务）
             for addr in [
                 bui_schema::render::hy2_singbox::HY2_RESI_CLASH_API,
-                bui_schema::render::hy2_singbox::HY2_RESI_V2RAY_API,
+                bui_schema::render::hy2_singbox::HY2_RESI_API,
             ] {
                 tcp.insert(api_port(addr).unwrap());
             }
@@ -1408,7 +1410,7 @@ mod tests {
         }
     }
 
-    /// 住宅那两个回环面（Clash API 9092 / v2ray_api 10086）没在听 ⇒ FAIL：计量与门位
+    /// 住宅那两个回环面（Clash API 9092 / api 服务 10086）没在听 ⇒ FAIL：计量与门位
     /// 会双双打空，而单元本身照样 active，只有这一行看得出来。
     #[test]
     fn the_residential_control_plane_ports_must_be_listening() {
@@ -1417,7 +1419,7 @@ mod tests {
         let state = crate::testutil::sample_state();
         for gone in [
             bui_schema::render::hy2_singbox::HY2_RESI_CLASH_API,
-            bui_schema::render::hy2_singbox::HY2_RESI_V2RAY_API,
+            bui_schema::render::hy2_singbox::HY2_RESI_API,
         ] {
             let h = healthy(&p, &state);
             h.with(|i| {
@@ -1437,7 +1439,7 @@ mod tests {
             Some(9092)
         );
         assert_eq!(
-            api_port(bui_schema::render::hy2_singbox::HY2_RESI_V2RAY_API),
+            api_port(bui_schema::render::hy2_singbox::HY2_RESI_API),
             Some(10086)
         );
     }

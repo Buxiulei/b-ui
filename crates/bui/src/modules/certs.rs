@@ -8,7 +8,7 @@
 //!
 //! 两个实例读证书的方式不同（T3 §12 第 9 项，2026-09-18 实测）：
 //! - `hysteria-server` 是 apernet hysteria，只在启动时读证书（`CanReload=no`），换证必须重启；
-//! - `hysteria-residential` 是自建 sing-box（1.14），hysteria2 入站会 watch 证书文件热加载，
+//! - `hysteria-residential` 是 sing-box（官方发行物），hysteria2 入站会 watch 证书文件热加载，
 //!   写完亚秒级打出 `inbound/hysteria2[hy2-resi]: reloaded TLS certificate`，既有连接不受影响。
 //!   所以住宅实例改成「确认热加载、超时才回退重启」（[`confirm_reload`]），不再无条件重启。
 
@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 /// 就回退重启（spec §3.4 原本是「两个 hysteria 错峰重启」的 10 秒间隔；4.1 住宅改热加载后，
 /// 只剩直连一个实例要重启、错峰无意义，这个常量转用作住宅实例的热加载确认时限）。
 pub const RESTART_GAP_SECS: u64 = 10;
-/// 住宅实例（自建 sing-box）hysteria2 入站热加载证书成功时逐字打出的日志片段。
+/// 住宅实例（sing-box，官方发行物）hysteria2 入站热加载证书成功时逐字打出的日志片段。
 const RELOAD_MARK: &str = "reloaded TLS certificate";
 /// 已经有证书之后的兜底轮询间隔（inotify 漏事件时的保险）。
 pub const FALLBACK_POLL_SECS: u64 = 21600; // 6h
@@ -239,7 +239,7 @@ async fn restart(ctx: &DaemonCtx, unit: &'static str) -> anyhow::Result<bool> {
     .await?)
 }
 
-/// 写完证书后确认住宅实例（自建 sing-box）已热加载：在 [`RESTART_GAP_SECS`] 秒内反复读它的
+/// 写完证书后确认住宅实例（sing-box，官方发行物）已热加载：在 [`RESTART_GAP_SECS`] 秒内反复读它的
 /// journald（复用哨兵那条 [`Host::journal_read`]，从写证书前一刻 [`JournalFrom::Since`] 读起、
 /// 只看新行），看到 [`RELOAD_MARK`] 即确认返回 `true`。
 ///

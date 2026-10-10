@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-B-UI is a Hysteria2 + Xray (VLESS-REALITY) proxy server with a built-in Web admin panel, plus a Linux client. Since v4.0.0 the control plane and the client are **Rust single binaries** (`bui` / `bui-c`); the protocol kernels (Xray / hysteria / sing-box / Caddy) are upstream builds — unchanged except sing-box, which since 4.1 is built by our own CI from the upstream tag with the `with_v2ray_api` tag added (the official release binary lacks it). It targets Ubuntu/Debian/CentOS/RHEL VPS hosts, amd64 or arm64, systemd. Users are in mainland China; Windows users consume subscriptions with v2rayN, Linux users run `bui-c`. The project, its UI and its commit messages are in Chinese.
+B-UI is a Hysteria2 + Xray (VLESS-REALITY) proxy server with a built-in Web admin panel, plus a Linux client. Since v4.0.0 the control plane and the client are **Rust single binaries** (`bui` / `bui-c`); the protocol kernels (Xray / hysteria / sing-box / Caddy) are all upstream builds — sing-box included: since 2026-10-10 it ships as the official v1.14.3 release archive (the CI self-build with the `with_v2ray_api` tag that 4.1.x used is retired), and residential HY2 per-user metering now runs on the official built-in service (top-level `services` `api` → `daemon.StartedService` connection events) plus a local ledger in `modules/panel/meter.rs`. It targets Ubuntu/Debian/CentOS/RHEL VPS hosts, amd64 or arm64, systemd. Users are in mainland China; Windows users consume subscriptions with v2rayN, Linux users run `bui-c`. The project, its UI and its commit messages are in Chinese.
 
 v4.0.0 删掉了 v3 的 shell / Node 实现（`server/` 下的五个脚本、Node 面板、根目录那两个 v3 安装与客户端脚本、旧的版本清单 JSON）。它们还在 git 历史里，`crates/` 里那些「移植参照 …:<行号>」注释指的就是历史里的那份代码；要看原文用 `git log --diff-filter=D -1 -- <路径>` 找到删除提交，再 `git show <sha>^:<路径>`。
 
@@ -27,7 +27,7 @@ Cargo workspace，三个 crate + 保留的前端三文件：
 | Path | Listener | Egress |
 |---|---|---|
 | `hysteria-server` (`config.yaml`) | `:PORT` (+ built-in port hopping range in the same `listen:` line) | built-in direct, `mode: 4` (IPv4-only) |
-| `hysteria-residential` (`hy2-residential.json`，**sing-box**，自建带 `with_v2ray_api`) | `:40000` 单端口；整段 `41000-50000`（+ 兼容段 `40001-40007`）由 `table inet bui` REDIRECT 进来 | 每凭据一个 `gate-<id>` selector → `slot-<i>-out` = `socks 127.0.0.1:(2080+i)`，或 `deny`（到期/封禁） |
+| `hysteria-residential` (`hy2-residential.json`，**sing-box**，官方发行物、无 `with_v2ray_api`) | `:40000` 单端口；整段 `41000-50000`（+ 兼容段 `40001-40007`）由 `table inet bui` REDIRECT 进来 | 每凭据一个 `gate-<id>` selector → `slot-<i>-out` = `socks 127.0.0.1:(2080+i)`，或 `deny`（到期/封禁） |
 | xray `vless-direct` (`xray-config.json`) | `:10001` REALITY | `freedom` with `domainStrategy: ForceIPv4` |
 | xray `vless-residential` | `:10002` REALITY | `socks 127.0.0.1:(2080+i)`，按用户 email 路由到槽（每人一条 `ruleTag` 规则，增删走 `RoutingService` gRPC，不重启 xray） |
 
@@ -82,7 +82,7 @@ bash scripts/tests/run-all.sh
 bash scripts/release/pin-kernels.sh --check          # 内核 lock 是否还贴着版本轨道
 bash scripts/release/check-version.sh v4.0.0         # tag / workspace version / CHANGELOG 一致
 
-# 用真实内核校验渲染结果（本机 1.14.0；CI 跑 1.12/1.13/1.14）
+# 用真实内核校验渲染结果（本机 1.14.0；CI 只跑发布锁里那一版，当前 sing-box 官方 1.14.3）
 sing-box check -c <渲染出的 json>
 xray run -test -c <渲染出的 json>
 ```
@@ -90,7 +90,7 @@ xray run -test -c <渲染出的 json>
 ## Important Conventions
 
 - 版本号唯一来源是根 `Cargo.toml` 的 `[workspace.package] version`；发布 tag = `v<version>`（预发布 `v<version>-rcN`），同时在 `CHANGELOG.md` 加一段，`scripts/release/check-version.sh` 在 CI 卡一致性。commit 前缀：`fix(scope):` / `feat(scope):` / `chore(scope):` / `docs(scope):` / `test(scope):`。
-- 内核版本由 `scripts/release/kernel-versions.env`（轨道）+ `kernels.lock`（精确版本与 sha256）决定；`manifest.json`（总纲 C4：`kernels` 版本表 + 扁平 `artifacts`，每项是裸二进制的 `url` + `sha256`）把它们带给安装与升级，上游归档由 Actions 解包后以裸二进制资产重传。**`kernels.lock` 已不全是上游归档的 sha**：`sing-box target` 那两行的 URL 列是 `build:` URI、sha256 是**自建产物**的 sha（4.1 起随发布分发的 sing-box 由 CI 按上游 tag 自己编，编译标签带 `with_v2ray_api`，官方 release 二进制不含它 —— 住宅 HY2 的按用户计量靠它），其余各行仍是上游归档的 sha。Xray 的 `/releases/latest` 不可用（全部 tag 标 prerelease），轨道解析走 `git ls-remote --tags`。
+- 内核版本由 `scripts/release/kernel-versions.env`（轨道）+ `kernels.lock`（精确版本与 sha256）决定；`manifest.json`（总纲 C4：`kernels` 版本表 + 扁平 `artifacts`，每项是裸二进制的 `url` + `sha256`）把它们带给安装与升级，上游归档由 Actions 解包后以裸二进制资产重传。**`kernels.lock` 的每一行都是上游归档的 sha**（sing-box 那两行 2026-10-10 起回到官方发布归档 v1.14.3、不含 `with_v2ray_api`；4.1.x 时期的 `build:` URI 自建链已退役 —— 住宅 HY2 的按用户计量改走官方内核内置 `services` 的 `api` 服务、`daemon.StartedService` 连接事件流 + `modules/panel/meter.rs` 本地账本，不再依赖编译标签）。Xray 的 `/releases/latest` 不可用（全部 tag 标 prerelease），轨道解析走 `git ls-remote --tags`。
 - 客户端配置模板改动后无需版本常量：`bui-c` 每次 apply 都重渲染 `config.json` 并按内容比对（`engine::write_if_changed`）决定是否重写 + 重启，不再有 `TUN_SCHEMA_VERSION`。
 - Rust 输出与错误：面板/CLI 的用户可见文字是中文；`bui` 的日志经 `logging.rs`，凭据一律经 `redact.rs` 脱敏后才落日志。Shell 脚本的输出 helper 是 `print_info`/`print_success`/`print_warning`/`print_error`；`scripts/` 下的脚本都带 `#!/usr/bin/env bash` + `LC_ALL=C`，采样/压测循环用 `set -uo pipefail`（不用 `set -e`），其余用 `set -euo pipefail`。
 - 服务器上的文件：`state.json`（期望态，600）、`runtime.json` / `auth-snapshot.json`（运行期，600）、`manifest.json`（升级缓存）、渲染产物 `config.yaml` / `hy2-residential.json`（600）/ `xray-config.json` / `singbox-relay.json` / `Caddyfile`，二进制在 `bin/`，备份在 `state.backups/`；CLI ↔ 守护进程走 `/run/b-ui.sock`。4.0 的 `config-residential.yaml` / `config-residential-<i>.yaml` 已退役（对账产 `Absent`）。Systemd 单元见 `reconcile::MANAGED_UNITS`，防火墙之外还有一张 b-ui 自管的 `table inet bui`。

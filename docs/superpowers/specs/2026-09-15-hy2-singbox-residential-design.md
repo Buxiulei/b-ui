@@ -15,6 +15,8 @@
 
 **主理人 2026-09-15 裁决**：住宅 HY2 从「每住宅 IP 一个 apernet hysteria 进程」改为「**一个 sing-box hysteria2 入站 + `auth_user` 路由到各槽出站**」；已接受三个代价——① 自建 sing-box（`with_v2ray_api`）进发布链；② 到期 / 封禁用户「握手成功但全部流被拒」；③ 住宅 HY2 收成单进程。**直连 HY2 仍用 apernet，不动**。staging 方式已定为 tizi sidecar（不另开 VPS、不等低峰）。追问「自建以后每次 sing-box 更新是不是还要重建」——答案在 §5.4：轨道 → 锁 → CI 构建，**不需要人工重建**；构建或校验失败则锁不动、发布保持上一版并告警。
 
+> **（2026-10-10 订正）**：代价 ① 已不存在 —— 自建链退役，随发布分发回到**官方发布归档原件**（官方 v1.14.3；`kernels.lock` 不再是 `build:` URI）。住宅计量改走官方内核内置 `services` `api` 服务的 `daemon.StartedService` 连接事件流 + 守护进程内本地账本（`crates/bui/src/modules/panel/meter.rs`；见 `docs/superpowers/plans/2026-10-10-singbox-official-and-metering.md` §2–§3），不再依赖 `with_v2ray_api` —— §5.4 那套「自建怎么重建」的问答随自建链一并作废。代价 ②③ 不变。
+
 ---
 
 ## 1. 背景、目标与非目标
@@ -65,6 +67,8 @@ v4.0.0 的 IP 池（spec §5.6 落地细节 D3/D4）把住宅跳跃段 `41000-50
 | 端口跳跃的所有权 | apernet 自己建（`portjump.rs` 按 `HYSTERIA-PR-*` 链清理孤儿） | b-ui 自管 nft 表 `inet bui`，三处幂等重放（§2.4） |
 | 受管单元数 | 6 + (槽数 − 1) | **固定 6** |
 | 内存 | apernet 每实例 **28.1 MB**（tizi 实测；生产 4 个合计 108.4 MB，`v41-hw-facts.md`） | 单进程 **61.8 → 65.2 MB**（tizi 实测，括号内为传输中）；本机 128 凭据 + 128 门 + 128 规则仍 ≈ 57 MB、`check` 0.04 s（`sb128.json`）⇒ **3 槽起更省**（65 vs 84 MB） |
+
+> **（2026-10-10 订正）**：本表「计量 / 在线 / 踢人」一行住宅那半（v2ray_api gRPC `StatsService`）已换成官方内核内置 `api` 服务的 `daemon.StartedService` 连接事件流 + 本地账本（`crates/bui/src/modules/panel/meter.rs`）；同一行的 Clash API `/connections` 那半不变。其余各行不受影响。
 
 直连 `hysteria-server`、`xray`、`b-ui-relay`、`caddy`、`b-ui` 五个单元的拓扑不变。硬件不是判据：两台都是 2 vCPU / 1020 MB，各内核 CPU < 1%，B 净省 ≤ 60 MB（`v41-hw-facts.md`）。
 
@@ -127,6 +131,8 @@ selector gate-r000 { outbounds: ["deny","slot-0-out"…"slot-7-out"], default: "
   }
 }
 ```
+
+> **（2026-10-10 订正）**：上面 JSON 里的 `experimental.v2ray_api` 块已换成**顶层** `"services": [ { "type": "api", "listen": "127.0.0.1", "listen_port": 10086 } ]`（官方发行物内置的 api 服务；`type` 的字符串必须是 `"api"` —— 写 proto 包名 `daemon` 会 FATAL `unknown inbound type: daemon`，本机官方 1.14.3 实测）。其余形状（入站、凭据池、门 selector、`auth_user` 规则、`clash_api`）不变；计量消费方见 §5.1 订正、采集实现在 `crates/bui/src/modules/panel/meter.rs`。
 
 **哪些已在 1.14.0 真机上过 `check`**（tizi PoC，逐条）：hysteria2 入站 + `users[{name,password:"r000:<pw>"}]` + salamander `obfs` + `masquerade proxy{url,rewrite_host}` + 复用生产证书 + `ignore_client_bandwidth` + 三个 selector 门 + 两条 `auth_user` 规则 + `clash_api`；**route 规则用传统 `"outbound"` 字段即可（无需 action 语法）**——所以渲染器就产出这个已验证的写法。
 
@@ -345,6 +351,8 @@ Clash API 客户端复用 `modules/residential/clash.rs` 的 `Clash` trait（`re
 
 ### 5.1 按用户流量：v2ray_api `StatsService.QueryStats(reset=true)`
 
+> **（2026-10-10 订正）**：本节前提已反转 —— 自建链退役、随发布分发回到官方发行物，「必须自建」不再成立；住宅计量的采集面从 v2ray_api `StatsService.QueryStats(reset=true)` 轮询改为官方内核内置 `api` 服务的 `daemon.StartedService/SubscribeConnections` 事件流 + 守护进程内本地账本（`crates/bui/src/modules/panel/meter.rs`）：入账只用 `CLOSED` 事件的 `connection.uplinkTotal/downlinkTotal`，绝不用 `Σdelta`（UPDATE 不带 user / 总量），按 `(实例代际, 连接 id)` 去重。见 `docs/superpowers/plans/2026-10-10-singbox-official-and-metering.md` §2–§3。本节以下内容（含 §5.3、§5.4 的「自建」各表与构建链）作为 2026-09-15 的设计记录保留，不再描述现状；§5.2 的 Clash API 那半仍然有效。
+
 为什么必须自建：官方二进制不含 `with_v2ray_api`（评估 `sb.facts[4-官方release二进制默认不带v2ray_api]`），而 Clash API 的 `/connections` 只给**未关闭**的连接、`closedConnections` 只被 libbox/daemon 消费、不经 HTTP 暴露（评估 `ev.key_facts[9]`）⇒ 轮询会漏掉两次采样之间开闭的短连接、限额执行偏松。主理人已接受自建，所以计量走 gRPC：
 
 - 配置 `experimental.v2ray_api.stats.users` = **全部凭据的 `name`**（这是白名单，不在表里的用户不计——评估 `sb.facts[4-v2ray_api用户计量覆盖hysteria2]`）；池静态 ⇒ 这张表也静态，不因用户变更改文件（与 §3.5 一致）。
@@ -397,6 +405,7 @@ Clash API 客户端复用 `modules/residential/clash.rs` 的 `Clash` trait（`re
   - **实现口径回写（2026-09-17，与上面这一行的逐字表述有两处偏离）**：
     - ③ 的「`/connections` 里该用户条数归零」只能经 `GET /api/online` 观察（面板把直连 `/online` 与住宅 `/connections` 归一成「这个人在线」、值恒为 1、不在线的人不进表，`panel/traffic.rs`），所以脚本判的是「该用户从 `/api/online` 消失且连续三轮确认」；而且**必须先收掉他的直连通路再量**——合并表里只要直连会话还挂着就一直非零，与住宅门位切没切干净无关。
     - ④ 的门位**不读** `bui residential slots --json`：`SlotRow`（`modules/residential/api.rs`）没有 per-user 门位字段，per-user 门位只在 `GET /api/users` 的 `hy2ResiGate`。但它与脚本的期望值同源（都是 `panel::gates::expected`）⇒ 这一项在真机上几乎恒真，抓不到本节要盯的「Clash API 的 select 重放失败」。因此判据④ 另加两件**活体**证据：`bui incidents --json` 里删上游之后没有 `hy2_resi_gate_sync_failed` / `hy2_resi_gate_replay_failed`（§5.7 的签名），且一个**未封**住宅 HY2 用户用池凭据真连一次 `ports.hy2_resi` 仍出得网。要直接读「内核里当前的门位」需要一个透出中继 Clash `/proxies` 的管理端点，今天没有。
+  - **（2026-10-10 订正）**：② 的「住宅经 v2ray_api」已作废 —— 住宅计数改走官方内核内置 `api` 服务的 `daemon.StartedService` 连接事件流 + 本地账本（`crates/bui/src/modules/panel/meter.rs`），`reset=true` 那套清零点随自建链退役不复存在；脚本「只读 `GET /api/users` 的 `usage`」这一口径不变，容差以 `scripts/m3-acceptance.sh` 现值为准（其注释同批订正）。
 
 ---
 

@@ -127,6 +127,8 @@ Cargo workspace：
 
 四个内核都是静态二进制（sha256 校验），放 `/opt/b-ui/bin/`；不再调用 `get.hy2.sh` / Xray-install / 发行版包，不再装 Node.js。sing-box 上限 1.14（v2rayN 7.25 封顶）。**4.1 起 sing-box 改为自建**：随发布分发的那一个由 CI 按上游 tag 编译、带上 `with_v2ray_api`（官方 release 二进制不含它，而住宅 HY2 的按用户计量必须走 v2ray_api），`kernels.lock` 里它那两行的 URL 列是 `build:` URI、sha256 是构建产物的 sha；其余三个仍是上游归档。
 
+> **（2026-10-10 订正）**：上一句已反转 —— 自建链退役，随发布分发的 sing-box 回到**官方发布归档原件**（`kernels.lock` 两行 = 官方 v1.14.3 的 tar.gz URL + 官方 sha，`build:` URI 不复存在）。控制面改用官方内核内置的顶层 `services` `api` 服务（`daemon.StartedService` 的 `SubscribeConnections` 流），住宅计量不再依赖 `with_v2ray_api`。实测、设计与实施口径见 `docs/superpowers/plans/2026-10-10-singbox-official-and-metering.md` §2–§3 与 `crates/bui/src/modules/panel/meter.rs`；本文其余处「自建 / v2ray_api」的现状陈述同此订正（§4.2 与 §9 另有就地订正）。
+
 ### 3.2 Hysteria2 鉴权（**4.1 起仅直连**）：默认 `auth.type: http`，`command` 为退路开关
 
 > **4.1 作用域**：本节只管**直连**那一个 apernet 实例。住宅 HY2 换成 sing-box 之后是静态凭据池
@@ -191,6 +193,7 @@ tonic 客户端，proto 从 Xray-core `v26.3.27` vendor 进仓（以仓库根为
 ### 4.2 流量采样与限额
 
 - 守护进程内 10 秒任务（**4.1 口径**）：hysteria 直连 `GET /traffic?clear=1`（9999，`clear` 在同一把锁内序列化并清零，原子，H10；trafficStats 若设 `secret`，请求头 `Authorization: <secret>`，无 `Bearer` 前缀，H13）+ **住宅 sing-box 的 v2ray_api `StatsService.QueryStats(reset=true)`（`127.0.0.1:10086`）** + Xray `QueryStats(reset=true)`（`127.0.0.1:10085`），三路增量相加；累加到内存中的 `usage`，最多每 30 秒合并落盘一次。4.0.x 那条「住宅 trafficStats `9998 - 槽序号`」已退役，`9991..9998` 全部释放；在线与踢人走住宅的 Clash API（`127.0.0.1:9092` 的 `/connections`）。
+  > **（2026-10-10 订正）**：住宅那一路不再是 v2ray_api 的 `QueryStats(reset=true)` —— 采集面改成官方内核内置 `api` 服务（仍是 `127.0.0.1:10086`）的 `daemon.StartedService/SubscribeConnections` 事件流，入账由守护进程内的本地账本完成（`crates/bui/src/modules/panel/meter.rs`，计划 §3）：只用 `CLOSED` 事件的 `connection.uplinkTotal/downlinkTotal` 入账，绝不用 `Σdelta`（UPDATE 不带 user / 总量）。直连 `/traffic?clear=1`、Xray `QueryStats`、在线的 Clash API 三条不变。
 - 在线：hysteria 两个 `/online` 的并集（值是该用户当前 QUIC 连接数，`>0` 即在线，H11）∪ 最近 30 秒有 Xray 增量的用户。
 - 月度重置：服务器本地时间每月 1 日 00:00，`month_key` 变化时清零 `monthly_bytes`。
 - 执行：到期 / 超限 / 禁用 → 快照标记拒绝（主保障：新连接一律被钩子拒绝）+ 对两个 hysteria `POST /kick`（请求体 `["<user_id>"]`；kick 只是标记，要等该用户下次有流量才断连，空闲连接可能长期不断，被踢后客户端会重连并再次过钩子，H12）+ Xray `RemoveUser`（只阻新握手，见 §3.3）；恢复条件满足时反向操作（快照放行 + Xray `AddUser`）。限额判断每次采样后执行。
@@ -436,7 +439,7 @@ tonic 客户端，proto 从 Xray-core `v26.3.27` vendor 进仓（以仓库根为
 |---|---|---|
 | M1 控制面闭环（2 周） | `bui install --import-v3`、对账器、四内核渲染、面板（旧前端）、三种订阅、`/api/nodes` | 每个现有用户三种订阅与 v3 逐项相同；sing-box JSON 过 1.12/1.13/1.14 `check`；v2rayN 四节点可连；二次 `install` 零变更；体检无漂移 |
 | M2 住宅模块（1.5 周） | 池导入、健康切换、黑名单、体检、面板体检卡 | relay 重启后选中不变；24h 内学到 Decodo 的 `ports_allowed` 与支付域名；relay 日拒绝数较 v3 基线降 ≥ 90%；pin 立即生效 |
-| M3 用户与流量（1 周） | 采样合并、限额执行、`auth-hook`、gRPC 增删、用户域 API 桩 | 加用户时 `NRestarts` 不变且在线会话不断；每节点 100MB 已知流量计数误差 ±5%；到期用户被拒并被踢；重启守护进程计数不重复。**4.1 的「被拒」分两种形态**（判据随之改，见 4.1 spec §6）：直连在**建连时**被拒；住宅 HY2 的门切到 `deny` ⇒ **握手照旧成功、客户端仍显示已连接，但每个请求都被拒**（判据改成「回环经该用户凭据发请求必失败」，不是「连不上」）。住宅侧计量改走 v2ray_api（`127.0.0.1:10086`），在线与踢人走 Clash API（`127.0.0.1:9092`） |
+| M3 用户与流量（1 周） | 采样合并、限额执行、`auth-hook`、gRPC 增删、用户域 API 桩 | 加用户时 `NRestarts` 不变且在线会话不断；每节点 100MB 已知流量计数误差 ±5%；到期用户被拒并被踢；重启守护进程计数不重复。**4.1 的「被拒」分两种形态**（判据随之改，见 4.1 spec §6）：直连在**建连时**被拒；住宅 HY2 的门切到 `deny` ⇒ **握手照旧成功、客户端仍显示已连接，但每个请求都被拒**（判据改成「回环经该用户凭据发请求必失败」，不是「连不上」）。住宅侧计量改走官方内核内置 `api` 服务的 `daemon.StartedService`（`127.0.0.1:10086`）+ 本地账本（**2026-10-10 订正**：原「v2ray_api」表述随自建链退役作废，见 2026-10-10 计划 §2–§3 与 `crates/bui/src/modules/panel/meter.rs`；容差与判据以 `scripts/m3-acceptance.sh` 为准，其注释同批订正），在线与踢人走 Clash API（`127.0.0.1:9092`） |
 | M4 客户端（2 周） | `bui-c` 全功能 | baiyi 上四节点 SOCKS/TUN 均通；裸 IPv6 回落符合 spec；杀 sing-box 一分钟内自愈；从 v3 客户端原地升级不丢节点 |
 | M5 硬化与发布（1 周） | soak、压测、升级回滚演练、CHANGELOG、v4.0.0 | 72h soak Xray RSS 无单调增长、`bui` RSS < 50MB；`auth-hook` 200 建连/秒 p99 < 20ms；`upgrade` 与 `--rollback` 各演练成功 |
 

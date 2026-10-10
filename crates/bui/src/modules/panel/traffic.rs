@@ -70,14 +70,15 @@ pub struct Sample {
 
 /// 要采样 / kick 的 hysteria trafficStats 端口：**只有直连实例那一个**。
 ///
-/// 4.1 起住宅是一个 sing-box 入站（计量走 v2ray_api、踢人走 Clash API），apernet 的
+/// 4.1 起住宅是一个 sing-box 入站（计量走官方内核内置 api 服务的
+/// `daemon.StartedService`、踢人走 Clash API），apernet 的
 /// `trafficStats` 端口连带槽位换算一起消失；签名保留 `&State` 是为了让调用点不动。
 pub fn stats_ports(_s: &State) -> Vec<u16> {
     vec![HY2_STATS_PORT_DIRECT]
 }
 
-/// 凭据 `name` → `user_id`：住宅两条控制面（`QueryStats` 的计数器名、`/connections` 的
-/// `auth_user=`）都以凭据 name 为键，采样与在线共用这张表换键。
+/// 凭据 `name` → `user_id`：住宅两条控制面（api 服务流事件的 `connection.user`、
+/// `/connections` 的 `auth_user=`）都以凭据 name 为键，采样与在线共用这张表换键。
 ///
 /// 空闲凭据与已删用户的凭据不在表里 ⇒ 它们的增量与连接一律丢弃（口径同
 /// [`to_uuid_map`]：认不出的键不入账，绝不猜）。
@@ -714,7 +715,8 @@ mod tests {
     }
 
     /// 直连**一个字不变**（仍是 `/traffic?clear=1` + `/online`，只剩 `:9999` 一个端口）；
-    /// 住宅改走自建 sing-box 的两个回环面：计量 v2ray_api 的 `QueryStats`、在线
+    /// 住宅改走官方 sing-box 的两个回环面：计量读 api 服务 `daemon.StartedService` 的流
+    /// 事件（`panel::meter` 的账本）、在线走
     /// Clash API 的 `/connections`。住宅那两条的返回键是**凭据 name**，必须经凭据池
     /// 换成 `user_id` 才能入账（spec §5.1、§5.2）。
     #[tokio::test]

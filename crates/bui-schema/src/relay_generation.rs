@@ -397,6 +397,29 @@ impl<'de> Deserialize<'de> for GenerationLedger {
     }
 }
 
+/// 生成协议期望的 sing-box 版本：唯一来源是 `scripts/release/kernels.lock` 的
+/// `sing-box target` 行（解析与 `pin-kernels.sh` 的 awk、`tests/kernel_relay_policy.rs` /
+/// `tests/relay_generation_kernel.rs` 的 `pinned_version()` 逐字一致）。
+///
+/// **编译期嵌入**而不是运行期读路径：driver 上线后跑在服务端，那里没有源码树；
+/// 锁一改（`kernels-bump`）就会重编，期望值不会滞后。锁里没有这一行 = 构建事故，
+/// 响亮 panic（不降级、不静默放过）。
+fn pinned_singbox_version() -> &'static str {
+    let lock = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../scripts/release/kernels.lock"
+    ));
+    for line in lock.lines() {
+        let mut fields = line.split_whitespace();
+        if fields.next() == Some("sing-box") && fields.next() == Some("target") {
+            return fields
+                .next()
+                .expect("kernels.lock 的 `sing-box target` 行缺版本号");
+        }
+    }
+    panic!("kernels.lock 里没有 `sing-box target` 行");
+}
+
 impl GenerationLedger {
     pub fn new(layout: GenerationLayout) -> Result<Self, ProtocolError> {
         Self::validate_layout(&layout)?;
@@ -524,7 +547,7 @@ impl GenerationLedger {
                 .copied()
                 .collect::<BTreeSet<_>>();
             if evidence.binding != lease.binding
-                || evidence.kernel_version != "1.14.3"
+                || evidence.kernel_version != pinned_singbox_version()
                 || !evidence.checked
                 || evidence.api_upstreams != expected
                 || evidence.probed_upstreams != expected
@@ -1050,7 +1073,7 @@ mod tests {
     fn ready_evidence(binding: &GenerationBinding) -> PreparedEvidence {
         PreparedEvidence {
             binding: binding.clone(),
-            kernel_version: "1.14.3".into(),
+            kernel_version: pinned_singbox_version().into(),
             checked: true,
             api_upstreams: ids().into_iter().collect(),
             probed_upstreams: ids().into_iter().collect(),
@@ -1244,7 +1267,8 @@ mod tests {
         let mut wrong_config = valid.clone();
         wrong_config.binding.config_sha256 = sha('d');
         let mut wrong_version = valid.clone();
-        wrong_version.kernel_version = "1.14.1".into();
+        // 与锁值**必然不同**：拼接后缀，锁升到哪一版都能钉住「版本必须精确匹配」这条判据
+        wrong_version.kernel_version = format!("{}-not-the-pin", pinned_singbox_version());
         let mut unchecked = valid.clone();
         unchecked.checked = false;
         let mut missing_probe = valid.clone();

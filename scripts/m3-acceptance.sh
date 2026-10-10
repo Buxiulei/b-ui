@@ -3,7 +3,8 @@
 #   ① 加用户时三个内核单元的 NRestarts / MainPID 不变、`hy2-residential.json` 字节不变，
 #      且在线会话不断
 #   ② 已知字节数（下载源实报的 Content-Length）的住宅计数误差 ±5%（住宅那一路的 usage
-#      由服务端经 v2ray_api 采上来，脚本只读 `GET /api/users`）
+#      由服务端经官方内核内置 api 服务的 `daemon.StartedService` 连接事件流 + 本地账本采上
+#      来，2026-10-10 起；此前经 v2ray_api。脚本只读 `GET /api/users`，与采集机制无关）
 #   ③ 到期语义（4.1 变了）：**住宅握手仍成功、请求全被拒**，`/api/online` 里该用户归零、
 #      同槽邻居的会话不断；直连仍是握手即拒，`auth-hook.log` 记 expired / blocked
 #   ④ 删一个上游后：任一用户三种订阅的 sha 不变、每个人的门位与期望一致、
@@ -916,9 +917,11 @@ usage_dev() {
 }
 
 # $1=实测增量 $2=已知流量 $3=容差% → 问题描述（空串 = 在容差内）。
-# 4.1 的住宅那一路由服务端经 v2ray_api 的 `QueryStats(patterns=["user>>>"], reset=true)`
-# 采上来（`traffic::tick`），脚本只读 `GET /api/users` 的 `usage` —— 一个住宅进程、
-# 一个计数器名空间，不再有「按槽分别核对」这回事。
+# 4.1 的住宅那一路由服务端采上来（2026-10-10 起 = 官方内核内置 api 服务的
+# `daemon.StartedService` 连接事件流 + 本地账本 `panel/meter.rs`，按 CLOSED 事件的
+# `connection.uplinkTotal/downlinkTotal` 入账；此前 = v2ray_api 的
+# `QueryStats(patterns=["user>>>"], reset=true)`），脚本只读 `GET /api/users` 的 `usage`
+# —— 一个住宅进程、一个计数名空间，不再有「按槽分别核对」这回事。
 judge_usage() {
   local dev
   dev=$(usage_dev "$1" "$2")
@@ -932,8 +935,9 @@ judge_usage() {
 }
 
 # $1=重启前 usage.total $2=重启后 → 问题描述（空串 = 不减也不重复）。
-# 容差 = max(5%, 1MB)：`clear=1` / `reset=true` 让每轮拿到的就是增量，重启不该把累计值
-# 再算一遍（翻倍）；反方向的已知降级是 pending 只在内存里，最多丢 30 秒计数。
+# 容差 = max(5%, 1MB)：直连那一路 `clear=1`、住宅那一路（4.1 起走本地账本）也只在 CLOSED 时
+# 一次性入账（按 (实例代际, 连接 id) 去重），每轮拿到的就是增量，重启不该把累计值再算一遍
+# （翻倍）；反方向的已知降级是 pending 只在内存里，最多丢 30 秒计数。
 judge_restart_total() {
   awk -v a="$1" -v b="$2" 'BEGIN {
     if (a == "" || b == "") { printf "读不到 usage.total（%s → %s）", a, b; exit }
@@ -1149,13 +1153,15 @@ load_resi_creds() {
   [ -n "$RESI_NAME" ] && [ -n "$RESI_SECRET" ] && [ -n "$RESI_PORT" ]
 }
 
-# 判据 ②：已知字节数的流量计数误差 ±5%，走**住宅**那一路（4.1 起它的计数换成了
-# v2ray_api 的 `QueryStats`，直连那一路一个字没改 ⇒ 要测的是住宅）。已知字节数来自
+# 判据 ②：已知字节数的流量计数误差 ±5%，走**住宅**那一路（4.1 起它的计数换成了内核
+# 控制面 —— 2026-10-10 起 = 官方 `daemon.StartedService` 连接事件流 + 本地账本，此前 =
+# v2ray_api 的 `QueryStats`；直连那一路一个字没改 ⇒ 要测的是住宅）。已知字节数来自
 # 下载源 HEAD 探活实报的 Content-Length（不写死 104857600 —— 候选源换了、或换成小一号的
 # 文件都不该让判据失真）。
 # 口径（以代码为准）：面板 `usage.total` = 上下行之和 —— `TxRx::total()` 是 `tx + rx`
-# （crates/bui/src/modules/panel/mod.rs:59），住宅那一路的 uplink / downlink 来自
-# `user>>>{name}>>>traffic>>>uplink|downlink` 两个计数器，所以一次纯下载 ≈ 100MB(下行)
+# （crates/bui/src/modules/panel/mod.rs:59），住宅那一路的 uplink / downlink 来自账本入账的
+# `connection.uplinkTotal` / `downlinkTotal`（2026-10-10 前是
+# `user>>>{name}>>>traffic>>>uplink|downlink` 两个计数器），所以一次纯下载 ≈ 100MB(下行)
 # + 请求头/TLS 记录开销(上行)，正偏差很小；判定用 curl 自己数的 `size_download` 当
 # 「已知流量」。
 # 门槛：spec §10 写的是 ≤1%，脚本现值是 ±5%（TOL_PCT）——**按脚本现值判、把实测偏差一并

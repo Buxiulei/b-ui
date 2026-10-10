@@ -331,7 +331,17 @@ async fn exercise() -> Result<()> {
     config["inbounds"][0]["listen_port"] = json!(hy2_port);
     config["experimental"]["clash_api"]["external_controller"] =
         json!(format!("127.0.0.1:{clash}"));
-    config["experimental"]["v2ray_api"]["listen"] = json!(format!("127.0.0.1:{v2ray}"));
+    // 计量面 = 渲染器产的顶层 `services[0]`（官方内核内置 api 服务，`daemon.StartedService`
+    // 的 gRPC）。先确认真有一个服务再按下标写：4.x 的 `experimental.v2ray_api` 官方发行物
+    // 不认（启动即 FATAL），谁把渲染器改回去，这里要挡在指纹对不上之前。
+    ensure!(
+        config["services"]
+            .as_array()
+            .is_some_and(|services| services.len() == 1),
+        "renderer must emit exactly one service (the api service)"
+    );
+    config["services"][0]["listen"] = json!("127.0.0.1");
+    config["services"][0]["listen_port"] = json!(v2ray);
     for outbound in config["outbounds"].as_array_mut().unwrap() {
         match outbound["tag"].as_str() {
             Some("slot-0-out") => outbound["server_port"] = json!(a.port),
