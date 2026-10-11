@@ -151,6 +151,10 @@ fn node_uri(node: &Node, username: &str) -> String {
 }
 
 /// base64 的 URI 列表订阅（`/api/sub/<token>`，末段是 [`crate::sub`] 的随机订阅 token）。
+///
+/// **本产物无法承载面向用户的说明**：载荷是 base64 的 URI 行，插一行注释会被客户端当成
+/// 坏节点。计费口径写在 [`clash`] 的注释头与面板里 —— 那两处才是用户看得到的说明位，
+/// 别为了「三种产物对称」往这里补。
 pub fn uri_list(nodes: &[Node], username: &str) -> String {
     let lines: Vec<String> = nodes.iter().map(|n| node_uri(n, username)).collect();
     STANDARD.encode(lines.join("\n"))
@@ -249,6 +253,9 @@ fn urltest(tag: &str, outbounds: &[&str]) -> Value {
 /// `route.final` 指向它 —— 那样该用户的 `/api/subscription/<token>` **整份不可用**，
 /// 而不只是少一个节点。零节点一律退成全部走 `direct`：配置仍然加载得起来，客户端起得来、
 /// 只是没有代理出口，下一轮收敛补上凭据后重新拉一次订阅即可。
+///
+/// **本产物无法承载面向用户的说明**：JSON 没有注释语法，而 sing-box 见到未知顶层键直接
+/// FATAL（2026-10-10 实测 `services_typo`）。计费口径写在 [`clash`] 的注释头与面板里。
 pub fn singbox(nodes: &[Node], split: &SplitRules, dial_ip: &str) -> Value {
     let host = nodes.first().map(|n| n.host.as_str()).unwrap_or("");
     let dial = dial_host(host, dial_ip);
@@ -466,6 +473,13 @@ fn clash_group(name: &str, members: &[String]) -> Yaml {
     ])
 }
 
+/// 计费口径（2026-07-10 裁决，计划 §5.3）：服务端账本记的是应用真实净负载、不含客户端的
+/// 封装开销，所以小包密集的 UDP（每报文差 10/22 B，按包数放大）与客户端自带统计差得最多。
+/// **只进 [`clash`] 的注释头** —— 另两种产物没有合法的注释位（见 [`uri_list`] / [`singbox`]），
+/// 面板那两份文案（订阅弹窗与编辑用户的用量处）与这里同口径。
+const BILLING_NOTE: &str =
+    "计费：按服务端观测到的净负载计算（不含客户端封装开销）。UDP 小包密集时，与客户端自带的流量统计差异最明显。";
+
 /// mihomo（Clash Meta / Clash Verge Rev）订阅 YAML（`/api/clash/<token>`）。
 ///
 /// 不含 `mixed-port`（由客户端自身管理）。v3 的首部注释带生成时间，这里去掉：
@@ -474,6 +488,9 @@ fn clash_group(name: &str, members: &[String]) -> Yaml {
 /// v4 在 v3 输出之上新增 IPv6 接管（2026-09-12 裁决，golden 同步补齐）：顶层 `ipv6: true`、
 /// `dns.ipv6: false`、`tun` 接管参数、三条 `IP-CIDR6` 规则，与 sing-box 订阅同构，
 /// 依据 spec 2026-09-10-ipv6-takeover-design。其余字段与 v3 逐项相同。
+///
+/// 注释头第三行是 [`BILLING_NOTE`]（2026-07-10 裁决，计划 §5.3）：三种订阅产物里只有 YAML
+/// 能合法承载注释，[`uri_list`] / [`singbox`] 为什么不能写在那里见各自文档。
 pub fn clash(nodes: &[Node], username: &str, split: &SplitRules) -> String {
     let host = nodes.first().map(|n| n.host.as_str()).unwrap_or("");
 
@@ -611,7 +628,7 @@ pub fn clash(nodes: &[Node], username: &str, split: &SplitRules) -> String {
     ]);
 
     format!(
-        "# B-UI Clash Meta 订阅配置\n# 用户: {username}\n\n{}",
+        "# B-UI Clash Meta 订阅配置\n# 用户: {username}\n# {BILLING_NOTE}\n\n{}",
         serde_yaml::to_string(&doc).expect("clash 配置序列化")
     )
 }
@@ -648,5 +665,61 @@ mod tests {
         assert_eq!(dial_host("example.com", "203.0.113.10"), "203.0.113.10");
         assert_eq!(dial_host("example.com", ""), "example.com");
         assert_eq!(dial_host("203.0.113.10", "198.51.100.1"), "203.0.113.10");
+    }
+
+    /// 计费口径（2026-07-10 裁决，计划 §5.3）只进 Clash 注释头，且注释头仍是三行注释 + 空行
+    /// 的结构：URI 列表插注释会被客户端当成坏节点，sing-box 的 JSON 里多一个键直接 FATAL，
+    /// 所以「三种产物要对齐」的直觉在这里必须停住 —— 另两种产物一个字节都不该变。
+    #[test]
+    fn billing_note_rides_in_the_clash_header_only() {
+        let split = SplitRules {
+            enabled: false,
+            global: false,
+            keywords: vec![],
+        };
+        let yaml = clash(&[], "alice", &split);
+        let head: Vec<&str> = yaml.lines().take(4).collect();
+        assert_eq!(head[0], "# B-UI Clash Meta 订阅配置");
+        assert_eq!(head[1], "# 用户: alice");
+        assert_eq!(head[2], format!("# {BILLING_NOTE}"));
+        assert_eq!(head[3], "", "注释头与正文之间要留一个空行");
+        assert!(
+            BILLING_NOTE.contains("服务端观测到的净负载"),
+            "{BILLING_NOTE}"
+        );
+
+        // 另两种产物一个字节都不该变：URI 列表里插一行会被客户端当成坏节点（解码后应当
+        // 只有节点那几行），sing-box 的 JSON 多一个键直接 FATAL。用一条真节点把「URI 列表
+        // 没被塞进任何多余内容」钉死；sing-box 侧则不许出现文案字眼。
+        let node = Node {
+            kind: NodeKind::Hy2Direct,
+            label: "HY2直连".into(),
+            host: "example.com".into(),
+            port: 443,
+            hop: None,
+            transport: Transport::Hysteria2 {
+                username: "alice".into(),
+                password: "0123456789abcdef".into(),
+                sni: "example.com".into(),
+                obfs_password: None,
+            },
+        };
+        let uris = {
+            // 本地显式导入：`Engine as _` 是匿名 trait 导入，不指望 `use super::*` 把它带进来
+            use base64::Engine as _;
+            String::from_utf8(STANDARD.decode(uri_list(&[node], "alice")).unwrap()).unwrap()
+        };
+        assert!(
+            uris.starts_with("hysteria2://"),
+            "URI 列表解出来不是节点行：{uris}"
+        );
+        assert_eq!(uris.lines().count(), 1, "URI 列表里混进了注释/空行：{uris}");
+        assert!(!uris.contains("计费"), "计费口径泄进了 URI 列表：{uris}");
+
+        let sb = serde_json::to_string(&singbox(&[], &split, "")).unwrap();
+        assert!(
+            !sb.contains("计费"),
+            "计费口径泄进了 sing-box 的 JSON：{sb}"
+        );
     }
 }

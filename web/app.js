@@ -117,6 +117,14 @@ const _DENY_SEMANTICS =
     "已停用 / 已到期：住宅 HY2 客户端仍会显示已连接，但所有请求会被拒绝（门位 deny，握手照旧成功）；" +
     "直连节点在连接时即被拒。";
 
+// 计费口径（2026-07-10 裁决，计划 §5.3），**一处文案**：订阅弹窗与编辑用户的「当前使用量」
+// 都用它。服务端账本记的是应用真实净负载、不含客户端封装开销，所以小包密集的 UDP
+// （每报文差 10/22 B，按包数放大）与客户端自带统计差得最多 —— 用户拿客户端统计对不上时
+// 先看到这句话，而不是来问。同口径也写在 Clash 订阅的注释头里
+//（bui-schema 的 `render::subscription::BILLING_NOTE`），三处不许分叉。
+const _BILLING_UNIT =
+    "计费按服务端观测到的净负载计算（不含客户端封装开销），与客户端流量统计会有差异，UDP 小包密集时最明显";
+
 // 「重置订阅链接与凭据」（rotate）的后果，**一处文案**：二次确认与成功提示都用它
 // （spec §7.4 第 3 条，2026-09-17 裁决）。rotate 把住宅凭据连名字一起换掉
 // （迁移用户的用户名 → 池里的 rNNN），所以对按账号匹配的 bui-c 等于换了账号：
@@ -324,6 +332,9 @@ function editUser(uname) {
     const monthly = x.usage?.monthly?.[m] || 0;
     const total = x.usage?.total || 0;
     $("#edit-usage-info").innerHTML = "本月: " + sz(monthly) + " | 总计: " + sz(total);
+    // 这个数是服务端账本的数（应用净负载），与客户端自带统计天然有差 —— 与管理员设定的
+    // GB 限额同一块界面上把口径说出来（文案同订阅弹窗，见 _BILLING_UNIT）
+    $("#edit-usage-note").textContent = _BILLING_UNIT;
 
     openM("m-edit");
 }
@@ -462,7 +473,7 @@ function showU(uname) {
     // 融合订阅用户显示订阅链接
     if (x.protocol === "fusion") {
         $("#cfg-title").innerText = "融合订阅配置";
-        $("#cfg-desc").innerHTML = "Hysteria2 + VLESS 自动故障切换<br><small>可导入 v2rayN / v2rayNG / Shadowrocket / bui-c 客户端</small>";
+        $("#cfg-desc").innerHTML = "Hysteria2 + VLESS 自动故障切换<br><small>可导入 v2rayN / v2rayNG / Shadowrocket / bui-c 客户端</small><br><small>" + _BILLING_UNIT + "</small>";
 
         // 显示二维码（本地生成，节点链接不外发）
         renderQR(uri);
@@ -482,7 +493,7 @@ function showU(uname) {
                 x.protocol === "vless-ws-tls" ? "VLESS-WS" : x.protocol;
 
         $("#cfg-title").innerText = protoName + " 配置";
-        $("#cfg-desc").innerText = "单协议客户端配置";
+        $("#cfg-desc").innerHTML = "单协议客户端配置<br><small>" + _BILLING_UNIT + "</small>";
 
         // 显示二维码（本地生成，节点链接不外发）
         renderQR(uri);

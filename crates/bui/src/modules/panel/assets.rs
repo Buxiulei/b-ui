@@ -556,4 +556,67 @@ mod tests {
             "成功提示不再点名「切换」：{body}"
         );
     }
+
+    /// 计费口径（2026-07-10 裁决，计划 §5.3）：服务端账本记的是应用真实净负载、不含客户端
+    /// 封装开销 —— 与客户端自带流量统计对不上时，用户/运维先看到这句话而不是来问。
+    ///
+    /// 面板侧**一处文案、两处落点**：`_BILLING_UNIT` 同时进订阅弹窗的两个分支（融合 /
+    /// 单协议）和编辑用户的「当前使用量」（落进 index.html 的 `#edit-usage-note`，由
+    /// editUser 填）。第三处同源文案是 Clash 订阅注释头的
+    /// `render::subscription::BILLING_NOTE`，在 bui-schema 侧钉住；三处口径不许分叉。
+    ///
+    /// 断言切在**函数体**里，不是整份文件：同样的字眼也写在常量旁边的注释里，按整份文件
+    /// 断言时把 `_BILLING_UNIT` 从某个落点摘掉仍然全绿（与上面 rotate 那条同一条教训）。
+    #[test]
+    fn the_billing_unit_note_is_one_constant_and_covers_both_panel_spots() {
+        let js = String::from_utf8(web_file("app.js").unwrap()).unwrap();
+        let decl = js
+            .split_once("const _BILLING_UNIT =")
+            .expect("计费口径的文案常量没了")
+            .1;
+        let value = decl.split_once(";\n").expect("_BILLING_UNIT 没收尾").0;
+        for must in ["服务端观测到的净负载", "不含客户端封装开销", "UDP 小包密集"]
+        {
+            assert!(value.contains(must), "计费口径的文案缺「{must}」：{value}");
+        }
+
+        let body = js
+            .split_once("function showU(")
+            .expect("showU 没了")
+            .1
+            .split_once("\n}")
+            .expect("showU 没收尾")
+            .0;
+        let (fusion, single) = body.split_once("} else {").expect("showU 的单协议分支没了");
+        assert!(
+            fusion.contains("_BILLING_UNIT"),
+            "订阅弹窗的融合分支不再带计费口径：{fusion}"
+        );
+        assert!(
+            single.contains("_BILLING_UNIT"),
+            "订阅弹窗的单协议分支不再带计费口径：{single}"
+        );
+
+        let edit = js
+            .split_once("function editUser(")
+            .expect("editUser 没了")
+            .1
+            .split_once("\n}")
+            .expect("editUser 没收尾")
+            .0;
+        assert!(
+            edit.contains("_BILLING_UNIT"),
+            "「当前使用量」不再带计费口径：{edit}"
+        );
+        assert!(
+            edit.contains("edit-usage-note"),
+            "计费口径要写进 #edit-usage-note，别塞回使用量那一行：{edit}"
+        );
+
+        let html = String::from_utf8(web_file("index.html").unwrap()).unwrap();
+        assert!(
+            html.contains("id=\"edit-usage-note\""),
+            "index.html 里没给计费口径留元素（app.js 写的 #edit-usage-note 会落空）"
+        );
+    }
 }

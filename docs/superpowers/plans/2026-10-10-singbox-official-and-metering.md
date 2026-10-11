@@ -482,7 +482,16 @@ scripts/tests/test-residential-stock-gates.sh:19          sing-box version 1.14.
 
 **必须配套做的（否则口径只是纸面上的）：**
 
-- **订阅/面板文案要写明计费单位**是「服务端观测到的净负载」。用户拿客户端流量统计对不上时
+- ✅ **已完成**（2026-10-11；本批 diff 经契约核验，五条开发命令冷/热两套全绿 ——
+  `test` 19 个结果行 2206 passed / 0 failed / 5 ignored，`run-all` 19 runner 679 ok / 0 not-ok，
+  2 条注记式 skip）：**订阅/面板文案写明计费单位**是「服务端观测到的净负载」，落在三处——
+  ① Clash 订阅注释头（`crates/bui-schema/src/render/subscription.rs` 的 `BILLING_NOTE`，
+  `/api/clash/<token>` 首部第三行）；② 面板订阅弹窗两个分支（`web/app.js` `showU` 写 `#cfg-desc`，
+  常量 `_BILLING_UNIT`）；③ 面板编辑用户「当前使用量」旁（`web/index.html` `#edit-usage-note`，
+  `editUser` 填充）。**两处故意不带**：`/api/sub`（base64 URI 列表）与 `/api/subscription`
+  （sing-box JSON）——URI 列表插注释行会被客户端当成坏节点，JSON 塞未知键直接 FATAL；
+  只吃 URI 列表的客户端（v2rayN 等）看不到这句，属产物形态所限（`billing_note_rides_in_the_clash_header_only`
+  把两处边界钉在一个用例里）。用户拿客户端流量统计对不上时
   （尤其是小包密集的 UDP：每报文差 10/22 B，按包数放大），先看得到这句话，而不是来问。
 - **不要在任何地方再引入第二种口径**——包括将来加 TCP 以外的协议、加新的订阅渲染路径时。
   这条写在这里就是给那时的自己看的。
@@ -609,7 +618,7 @@ scripts/tests/test-residential-stock-gates.sh:19          sing-box version 1.14.
 | 3 | `crates/bui/src/modules/panel/stock_gate_fixture.rs` 的新守卫 | **真（不可达但守卫不严）**：只校验 `services` 是长度 1 的数组；若 `services[0]` 是非对象（如数字），随后的 `["listen"]` 赋值会 panic。当前渲染器恒产对象故不可达 | ✅ **已完成**（`e90ad21`；并普查同文件同类「先索引后写」：`inbounds[0]`/`clash_api`/`outbounds` 的 `.unwrap()` 一并收口） |
 | 4 | `crates/bui-schema/tests/kernel_hy2_singbox.rs` 的 openssl 早退 | **真（静默面）**：PATH 缺 sing-box 或 openssl 不可用时 `eprintln` + `return` **静默通过**；而 CI 的 skip 黑名单只匹配 `<kernel> not found` 与 caddy，**不匹配 `skipped: openssl not usable`** | ✅ **已完成**（`e90ad21` 取**后一种**：CI 里硬失败。理由——黑名单是外部 workflow 里的转写匹配器，注定会生产侧漂移而测试全绿。并已推广到 `common/mod.rs` 的 `have()`、`kernel_hysteria.rs` 的 `self_signed()`、`kernel_relay_policy.rs`） |
 | 5 | `crates/bui/src/modules/panel/traffic.rs` 测试串 `fail_next("v2ray_api 不可达")`（`:787`/`:1193`）与「住宅的 QueryStats」注释 | **真（文案说谎）** | ✅ **已完成**（`e90ad21`，6 处） |
-| 6 | `CHANGELOG.md:20`（未发布的 4.1.9 段）仍写「sing-box 1.14.2」 | **真**：锁自 `51024f5` 起是官方 1.14.3，且 `install.rs:356` 的 `client_sing_box` 与 `sing_box` 同源 ⇒ 服务端与 bui-c 一并到 1.14.3，该句对两个角色都失真 | **随第 13 步的发布准备改**（现在改是写未发生的记录） |
+| 6 | `CHANGELOG.md:20`（未发布的 4.1.9 段）仍写「sing-box 1.14.2」 | **真**：锁自 `51024f5` 起是官方 1.14.3，且 `install.rs:356` 的 `client_sing_box` 与 `sing_box` 同源 ⇒ 服务端与 bui-c 一并到 1.14.3，该句对两个角色都失真 | ✅ **已完成**（`6609e70`；4.1.9 段现写官方 1.14.3 + 轨道 minor:1.14） |
 | 7 | `stock_gate_fixture.rs:449` 与 `tests/test-residential-stock-gates.sh:30` 的 `1.14.3` 硬字面量 | **维护点**：opt-in 手动夹具，升轨时须同步 | 记在此，升轨时一并 |
 | 8 | `docs/superpowers/plans/2026-09-15-v41-hy2-singbox.md:802/:907` 旧口径 | **可选**：历史计划，不改史实 | 不动 |
 | 9 | `run-all.sh` 以退出码判过、不解析 TAP；两个手动 runner 跳过仍计入「all script tests passed」 | **可选**：跳行有输出可见，只是汇总不区分「跑过」与「跳过」 | 记此，需要时再改 |

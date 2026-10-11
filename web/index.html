@@ -505,6 +505,11 @@
                 <span id="edit-usage-info"
                     style="font-size:13px; font-family:'JetBrains Mono', monospace; color:var(--primary); font-weight:600"></span>
             </div>
+            <!-- 计费口径（2026-07-10 裁决，计划 §5.3）：这句是给看到数字的人的，落在这里紧贴
+                 「当前使用量」。文案由 app.js 的 _BILLING_UNIT 填（订阅弹窗与 Clash 注释头同源，
+                 三处不许分叉），所以这里留空元素。 -->
+            <div id="edit-usage-note"
+                style="font-size:11px;color:var(--text-dim);margin-top:6px;line-height:1.5"></div>
 
             <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:20px">
                 <button class="btn btn-secondary" onclick="closeM()">取消</button>
