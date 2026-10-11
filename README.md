@@ -98,7 +98,7 @@ Rust 编写的多协议代理控制与管理工具，提供服务端部署、Web
 - 🩺 **故障**：bwg-tizi 实例排查到一条遗留管道 `bash -x b-ui-cli.sh </dev/null | grep -B2 'unknown' | head -20` —— SSH 断开后被 init 收养，grep 从未匹配 'unknown'、head 永远等不到 20 行，bash -x 持续吐 trace 死锁。3 天 15 小时累积把 1 vCPU VPS 拖到 sys 50% / idle 14%，hysteria QUIC 来不及发 keepalive，客户端 sing-box 看到 `outbound/hysteria2[proxy]: timeout: no recent network activity`
 - 🔧 **update.sh `cleanup_orphan_cli_processes`**：停服阶段按 PGID SIGTERM→KILL 清掉 PPID==1 且 cmdline 含 b-ui CLI 的孤儿；主动跳过当前 update.sh 所在 PGID（防自杀）和其他活跃 sudo b-ui session
 - 🔧 **b-ui-cli.sh TTY 守卫**：交互菜单 `while true` 前加 `[[ -t 0 ]]` 检查，无 TTY 直接 exit 1 不进死循环 read；`b-ui <子命令>` 非交互入口不受影响（cron 正常）
-- 📜 **v3.4.11 ~ v3.4.40 共 31 个版本**详见 git 历史里的 changelog（`git log --diff-filter=D -1 -- version.json` 找到删除提交，再 `git show <sha>^:version.json`）：DNS UDP→DoH (v3.4.40)、紧急 hotfix（cmd_harden_ssh / first_run_setup / cgroup 限额）、Web 安全验证（POST/PUT users 白名单）、bui-c smoke test、住宅 IP ip-api 分流、test_proxy DNS 假阳性等
+- 📜 **v3.4.11 ~ v3.4.40 共 30 个版本**详见 git 历史里的 changelog（`git log --diff-filter=D -1 -- version.json` 找到删除提交，再 `git show <sha>^:version.json`）：DNS UDP→DoH (v3.4.40)、紧急 hotfix（cmd_harden_ssh / first_run_setup / cgroup 限额）、Web 安全验证（POST/PUT users 白名单）、bui-c smoke test、住宅 IP ip-api 分流、test_proxy DNS 假阳性等
 
 ### v3.4.10 — UI 简化 + 自愈强化
 - 🎯 **CLI 菜单回到数字直选**：实测下来 gum 箭头选择体验比直接敲数字慢，重新设计两栏紧凑布局，纯 bash + ANSI 渲染零依赖
@@ -207,15 +207,15 @@ curl -fsSL https://raw.githubusercontent.com/Buxiulei/b-ui/v4/install.sh \
 没有终端可问（CI、`/dev/tty` 也开不了）时同样全用默认值；不问的这几种情形下域名仍然缺不得——没给就打印用法并以非 0 退出，**不会装一半**。域名之外的事——架构、发行版与包管理器、公网 IP、SELinux、时间同步、关键端口占用、域名解析核对、IPv6 出口、v3 迁移、防火墙——全部自动探测处理，装完打印一张「环境」表、一张自检 PASS/FAIL 表，以及面板地址、一次性管理员密码、第一个用户名与他那三条订阅地址（`/api/sub`、`/api/subscription`、`/api/clash`，末段是他的随机订阅 token，见[订阅链接与 token](#订阅链接与-token)）。
 
 全新服务器上首张证书要等 Caddy 签到，自检会先有界等待（最多 2 分钟）；到点还没签下来时，
-「两个 hysteria 单元 / HY2 的 UDP 端口 / HY2 回环鉴权」这三行报 `SKIP 待证书` 而**不算失败**
+「单元 hysteria-server、单元 hysteria-residential、关键端口（10000/udp、40000/udp）、HY2 回环鉴权、HY2 住宅回环鉴权、住宅管理面端口」这几行报 `SKIP 待证书` 而**不算失败**
 （证书到位后 systemd 会自动把它们拉起，`bui status` 复检即可）。
 
-三个环境变量（等价写法 / 覆盖项）：
+环境变量（等价写法 / 覆盖项）：
 
 | 变量 | 作用 |
 |---|---|
 | `BUI_DOMAIN` | 等价于 `--domain`，域名不想进命令行时用它 |
-| `BUI_VERSION` | 指定版本，如 `v4.0.0-rc1`；默认 `latest`，仓库只有预发布时自动回退到最新的 `v4*` 标签 |
+| `BUI_VERSION` | 指定版本，如 `v4.0.0-rc1`；默认 `latest`，仓库只有预发布时自动回退到版本号最大的 rc 预发布（形如 `v4.0.0-rc2`，按 `(x,y,z,N)` 数值取最大，不看列表顺序） |
 | `BUI_MANIFEST_URL` | 直接指定 manifest 地址（离线源 / 演练用），覆盖 `BUI_VERSION` |
 | `BUI_MIRRORS` | 覆盖 GitHub 镜像前缀（按序回退，拼在完整 URL 前）；设成空串就只走直连 |
 
@@ -234,7 +234,7 @@ v3 机器上原地切 v4：检测到 `/opt/b-ui/users.json` 会自动补 `--impo
 升级与回滚：
 
 ```bash
-sudo bui upgrade              # 升 bui 与四个内核，失败自动回退
+sudo bui upgrade              # 升 bui 与四个内核（候选先校验 sha256 再换装，校验失败不动现装版本；出问题用 sudo bui upgrade --rollback 手动回）
 sudo bui upgrade --rollback   # 回到上一版二进制、内核与最近一份 state
 ```
 
@@ -253,8 +253,7 @@ Linux 客户端 `bui-c` 的安装命令从服务端面板取（面板「客户�
 形如：
 
 ```bash
-curl -fsSL --noproxy '*' 'https://panel.example.com/packages/bui-c-install.sh' \
-  | sudo BUI_C_SOURCE='https://panel.example.com/packages' bash
+curl -fsSL --noproxy '*' 'https://panel.example.com/packages/bui-c-install.sh' | sudo bash
 ```
 
 脚本按架构从面板 `/packages/` 取 `bui-c` 裸二进制、校验 `manifest.json` 里的 sha256 后装进
@@ -313,7 +312,7 @@ Reality 认 uuid）。同一账号的端口变了（住宅槽位换了）或 HY2
 - **重置过凭据后的 Reality 节点**：uuid 换了，算另一个账号，新节点与旧节点同名时命名为 `<原名>-2`
   （屏幕上提示「节点名 … 已被另一个账号占用」）。旧节点已经连不上，要清理。
 - **粘贴的链接（或订阅）碰上面板导入的节点、或碰上当前节点，而参数不是全等**：例如粘的是凭据轮换之前留下
-  的旧链接。这时不覆盖它们，按新节点导入并打一行说明出路（同一账号下已经有别的、不受保护的副本时不另起，只更新那一条，菜单会改问「切换到那一条？」）——面板那条「要更新它请从面板重新导入」，当前节点
+  的旧链接。这时不覆盖它们，按新节点导入并打一行说明出路（同一账号下已经有别的、不受保护的副本时不另起，只更新那一条，菜单会改问「切换到 <那条副本的名字>？」）——面板那条「要更新它请从面板重新导入」，当前节点
   那条「确认新节点能用后可以切换过去」。另外，手里的链接是直连还是住宅只能从备注认（含「直连」或「住宅」
   才算数），备注被改过的链接只认同端口的那一条，端口不同不算同一账号。
 
@@ -356,7 +355,7 @@ Reality 认 uuid）。同一账号的端口变了（住宅槽位换了）或 HY2
 `bui-c` 无参数运行即进数字菜单（Rust 渲染，零外部依赖）：
 
 ```
-  ── B-UI 客户端 v4.1.0 ──
+  ── B-UI 客户端 v4.1.9 ──
 
    节点   ●  运行中  alice-reality-direct
           Reality直连  reality-direct  panel.example.com:10001
@@ -384,7 +383,8 @@ Reality 认 uuid）。同一账号的端口变了（住宅槽位换了）或 HY2
 ```
 服务端：sudo bui upgrade            # 按 manifest 换 bui 与四个内核，失败可 bui upgrade --rollback
 客户端：bui-c update                # 每日 timer 自动，菜单 [7] 更新与维护 → [2] 可关
-下载顺序：服务端面板 /packages/ → GitHub Releases → BUI_MIRRORS 里的镜像前缀
+下载顺序（bui-c 更新）：面板 /packages/ → manifest 里的 GitHub 资产 url → manifest.mirrors 镜像前缀（manifest 目前不带 mirrors，实际只有前两个源）
+引导脚本 install.sh：先直连 GitHub，失败再按 BUI_MIRRORS 的镜像前缀回退（默认 ghfast.top / gh-proxy.com）
 ```
 
 不再有 v3 的 `version.json`、不再有 cron 行、不再从发行版包或 `get.hy2.sh` 装内核。
@@ -405,8 +405,8 @@ Reality 认 uuid）。同一账号的端口变了（住宅槽位换了）或 HY2
 
 - 默认分流关键词 67 条，权威副本在 `crates/bui-schema/src/keywords.rs` 的 `DEFAULT_KEYWORDS`；`sudo bui residential domains` 打印当前生效的一份
 - 状态：`/opt/b-ui/state.json` 的 `residential`（600），上游凭据随它一起落盘；不再有 `residential-proxy.json`
-- 控制命令：`sudo bui residential {status|add|remove|enable|disable|global|domains|restore-default|check|select|health}`（`add -` 从 stdin 读，凭据不进 argv）
-- 入口：`sudo b-ui` 菜单第 8 项 / Web 看板🏠 / 上面这套子命令；上游体检与自动黑名单由守护进程按日跑
+- 控制命令：`sudo bui residential {status|add|remove|enable|disable|global|domains|restore-default|check|select|health|slots|slot-pin|rebalance|assign|pool|blacklist}`（`add -` 从 stdin 读，凭据不进 argv）
+- 入口：`sudo b-ui` 菜单第 8 项 / Web 看板🏠 / 上面这套子命令；上游体检每 2 分钟一轮，自动黑名单由守护进程常驻学习（journald 增量轮询）+ 每日 04:00 批量生效
 - 选购与配置：[docs/residential-proxy-guide.md](docs/residential-proxy-guide.md) —— 供应商粘性参数（不加就静默换 IP）、目标端口白名单、"不限量"与转售条款、池子来源风险披露、体检读数判读
 
 ---
@@ -469,7 +469,7 @@ Reality 认 uuid）。同一账号的端口变了（住宅槽位换了）或 HY2
 - `/opt/b-ui/bin/`: `bui` 与四个内核（hysteria / xray / sing-box / caddy）的静态二进制，sha256 由 `manifest.json` 钉住
 - `/opt/b-ui/state.json`: 期望态（600），`state.backups/` 保留最近 10 份
 - `/opt/b-ui/runtime.json` / `auth-snapshot.json`: 运行期计数与鉴权快照（600）
-- `/opt/b-ui/{config.yaml,config-residential.yaml,xray-config.json,singbox-relay.json,Caddyfile}`: 由对账器渲染，勿手改
+- `/opt/b-ui/{config.yaml,hy2-residential.json,xray-config.json,singbox-relay.json,Caddyfile}`: 由对账器渲染，勿手改（4.0 的 `config-residential*.yaml` 已退役，对账即删）
 - `/opt/b-ui/certs/`: 证书（Caddy 签发后由守护进程同步）
 - `/opt/b-ui/packages/`: 给客户端下载的二进制与 `manifest.json`
 - `/run/b-ui.sock`: CLI ↔ 守护进程（600，root）
