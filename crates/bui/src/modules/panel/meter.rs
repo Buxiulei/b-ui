@@ -62,8 +62,10 @@
 //! —— 初版 `ΔG − Σ(区间内 CLOSED 终值)` 漏掉 ΔS，会把「区间内仍在传输的连接」整体算成
 //! 缺口，健康区间也报巨额缺口。
 //!
-//! 阈值：`R > 64 KiB` 记观察；**`R ≥ 1 MiB` 或 `R ≥ 区间字节（ΔG）的 5%`（先触发者）**
+//! 阈值：`R > 64 KiB` 记观察；**`R ≥ 1 MiB` 或（`R ≥ 64 KiB` 且 `R ≥ 区间字节（ΔG）的 5%`）**
 //! 判「后缀丢失」⇒ 告警 + 该区间**标损** + 暂停该窗口的自动裁决（见下）+ 请求重订阅一次。
+//! 百分比那一支的 64 KiB 绝对下限 [`ALERT_PCT_FLOOR_BYTES`] 挡的是跨流采样滞后
+//! （ΔG 只有几百字节时这个滞后就是 100%），不是真实丢失 —— 见该常数的注释。
 //!
 //! **B（世代边界）**：流终止（非 OK gRPC 码 / 流结束）与代际变化都封账，并把
 //! `[最后一 tick, 流终止]` 标「可疑损失」（预期 **≤384 B @1s tick**：250ms tick 丢 0 B）。
@@ -129,8 +131,31 @@ pub const DEDUP_CAP: usize = 32_768;
 pub const OBSERVE_BYTES: i64 = 64 * 1024;
 /// 指标 A 的告警门槛（绝对量）
 pub const ALERT_BYTES: i64 = 1024 * 1024;
-/// 指标 A 的告警门槛（区间字节占比，%）。两个门槛**先触发者**生效。
+/// 指标 A 的告警门槛（区间字节占比，%）。三个门槛**先触发者**生效，
+/// 但百分比这一支还要先过 [`ALERT_PCT_FLOOR_BYTES`]。
 pub const ALERT_PCT: i64 = 5;
+/// 百分比告警的**绝对下限**：缺口不到这么大就只记观察，占比再高也不判「后缀丢失」。
+///
+/// **为什么必须有这条**：指标 A 的 `R = ΔG − ΔB − ΔS` 是三条**独立流**的差分
+/// （全局量 `SubscribeStatus` 与逐连接 `SubscribeConnections` 是两个订阅、各自
+/// tick），所以 R 除了「真的丢了尾巴」，还含一个跨流采样滞后的常数项（实测几十到几百
+/// 字节，见 [`SUB_TICK_MS`] 与指标 A 的滞后解释）。在 ΔG 只有几百字节的区间里，
+/// 这个常数项就是 100% —— 旧口径（只看占比）于是把一次正常的采样错位报成
+/// 「后缀丢失 + 标损」，**并且顺手触发一次重订阅**：重订阅本身又按中断封账，
+/// 于是自激成一阵告警风暴（实测爆发期约每分钟一次中断）。
+///
+/// 生产证据（2026-10-13 bwg-rick，12 小时）：74 次「计量流中断」**全部**是
+/// `按账本请求重订阅一次（指标 A 越线）`、中断时在册 0 条连接；4 个有损窗口
+/// 全是 127 B / 217 B、占比 100%、ΔG 也各只有 127 / 217 B。而真实丢失的下限
+/// 是 273,920 B（实测 84–92% 那一档），再小的丢失在观测上根本不存在。
+///
+/// 64 KiB 的取法：取值**等于** [`OBSERVE_BYTES`]（观察线只提示「继续盯」、不标损、
+/// 不重订阅）—— 但两者是**各自独立**的字面量，不是别名：调观察线时不该顺带挪动
+/// 告警地板。它比真实丢失下限低 4 倍多，比跨流滞后高两个数量级，三个量级被同时
+/// 分开。**只卡百分比这一支**：绝对量那一支（`gap ≥ ALERT_BYTES`）不设下限，
+/// 1 MiB 的单次真实丢失即便占比不到 5% 也照旧判损（那是 [指标 A 的实测故障档]，
+/// 不是滞后）。
+pub const ALERT_PCT_FLOOR_BYTES: i64 = 64 * 1024;
 /// `lossy` 单次触发后的抑制时长（每次再触发就再延长）。**绝对上限见 [`LOSSY_MAX_MS`]**
 /// —— 那条常数承载了「有损窗口有界」这条性质，动它之前先读它的注释。
 pub const LOSSY_HOLD_MS: i64 = 30 * 60 * 1000;
@@ -596,14 +621,17 @@ impl Ledger {
                             ),
                         });
                     }
-                    if gap >= ALERT_BYTES || (dg > 0 && pct >= ALERT_PCT) {
+                    if gap >= ALERT_BYTES
+                        || (gap >= ALERT_PCT_FLOOR_BYTES && dg > 0 && pct >= ALERT_PCT)
+                    {
                         g.stat.lossy_intervals += 1;
                         // 重订阅一次：快照给**在册**（见过 NEW、CLOSED 丢了）的连接补终值
                         // （结构性幂等：不在册的一律跳过，重播多少次都不重计；见 `Inner::close`）
                         g.resubscribe = true;
                         let text = format!(
-                            "后缀丢失：本区间 {gap} B 未确证（全局 {dg} B 的 {pct}%，阈值 {ALERT_BYTES} B 或 {ALERT_PCT}%），\
-                             已标损且不折算到人；本窗口自动封禁/计费裁决只用确证字节，并重订阅一次兜底"
+                            "后缀丢失：本区间 {gap} B 未确证（全局 {dg} B 的 {pct}%，阈值 {ALERT_BYTES} B 或 {ALERT_PCT}%\
+                             且 ≥ {ALERT_PCT_FLOOR_BYTES} B），已标损且不折算到人；本窗口自动封禁/计费裁决只用确证字节，\
+                             并重订阅一次兜底"
                         );
                         // 真的新触发的有损必须经 `publish_alerts` 出境（§5「不得静默」）
                         if let Some(a) = g.enter_lossy(now_ms, text) {
@@ -1226,6 +1254,50 @@ mod tests {
             "观察行不带「有损」标记，否则哨兵会把良性观察也报成事件"
         );
         assert!(l.recent_alerts().iter().any(|a| a.text.contains("观察线")));
+    }
+
+    /// 占比条款的绝对地板（2026-10-13 生产回归）。三条独立流的先后差会造出「全局涨了 N、
+    /// 账本还没入账」的 N 字节缺口（实测 127 B / 217 B），占比却是 100%。微小缺口不是
+    /// 「满丢后缀」，绝不许把整台机器拖进 30 分钟有损窗口、更不许自伤式重订阅（实测 12
+    /// 小时里 74 次「计量流中断」全是它触发的）—— 但**过了地板的**同形缺口照样要判。
+    #[test]
+    fn the_percentage_clause_needs_an_absolute_floor() {
+        // 地板以下：217 B 的 100% 缺口 ⇒ 既不标损也不重订阅，连观察线都不过
+        let tiny = Ledger::new();
+        tiny.note_session_start(1, 0);
+        tiny.apply(status(0, 0), 1);
+        tiny.drain(1);
+        tiny.apply(status(217, 0), 1_000);
+        tiny.drain(1_000);
+        let st = tiny.view(1_000).stat;
+        assert_eq!(st.last_gap, 217);
+        assert_eq!(
+            st.last_gap_pct, 100,
+            "占比是 100%，但绝对量在地板以下：{st:?}"
+        );
+        assert_eq!(
+            (st.observed_intervals, st.lossy_intervals),
+            (0, 0),
+            "{st:?}"
+        );
+        assert!(!tiny.lossy_at(1_000), "地板以下的缺口不许标损");
+        assert!(!tiny.take_resubscribe(), "更不许为它重订阅（那是自伤）");
+
+        // 刚过地板：70,000 B 的 35% 缺口（> 64 KiB 地板）⇒ 照旧标损 + 重订阅
+        let over = Ledger::new();
+        over.note_session_start(1, 0);
+        over.apply(status(0, 0), 1);
+        over.drain(1);
+        over.apply(ev("c1", new(txrx(0, 0))), 100);
+        over.apply(ev("c1", closed("alice", txrx(130_000, 0), 100, 500)), 500);
+        over.apply(status(200_000, 0), 1_000);
+        over.drain(1_000);
+        let st = over.view(1_000).stat;
+        assert_eq!(st.last_gap, 70_000, "{st:?}");
+        assert_eq!(st.last_gap_pct, 35, "{st:?}");
+        assert_eq!(st.lossy_intervals, 1, "过了地板就照旧判：{st:?}");
+        assert!(over.lossy_at(1_000));
+        assert!(over.take_resubscribe());
     }
 
     /// 钉住告警的单一出口（[`Ledger::publish_alerts`]）：每条告警**只入环一次**，
