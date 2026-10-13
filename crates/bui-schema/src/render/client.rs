@@ -83,8 +83,9 @@ impl std::fmt::Debug for ProbeTarget<'_> {
 ///   同名节点都不会撞 tag，也碰不到 `direct-out`。
 /// - `route.auto_detect_interface = true` 必需：不设的话出站连接会被本机正在跑的 TUN 截走。
 /// - DNS 只有 `local-dns`（udp 223.5.5.5），出站的 `domain_resolver` 写死引用它；
-///   `default_domain_resolver` 与 `strategy: ipv4_only` 同主配置（服务端没有 IPv6 出口，
-///   测速也必须只查 A 记录，否则整轮全判不通）。
+///   `default_domain_resolver` 与 `strategy: ipv4_only` 同主配置：主配置把隧道内解析钉在 A 记录，
+///   测速也钉同一口径。回退成默认策略会改查 AAAA，实测现象是整轮全判不通——这是
+///   「客户端到服务器怎么走」的问题，与服务端有没有 v6 **出站**（4.1.8 起可双栈）无关。
 /// - 没有 tun、hijack-dns、sniff、rule_set、download_detour、cache_file；
 ///   `log.level = error`（sing-box 的日志可能带出服务器地址，调用方也不读）。
 /// - `targets` 为空时产出没有入站的配置，调用方不要这样调。
@@ -384,7 +385,8 @@ fn route_rules(node: &Node, opts: &ClientOpts, tun: bool) -> Vec<Value> {
     rules.push(json!({ "port": [22, 2222], "outbound": "direct-out" }));
     rules.push(json!({ "source_port": [22, 2222], "outbound": "direct-out" }));
     rules.push(json!({ "ip_is_private": true, "outbound": "direct-out" }));
-    // 服务端无 IPv6 出口：裸 v6 目标就地 reject，应用立刻回退 IPv4
+    // 只命中**裸 v6 目标**（域名由服务端按 `node.direct_ip_policy` 取舍 A/AAAA，不在这里拦）：
+    // 就地 reject 让应用立刻回退 IPv4，不必在隧道里等一次超时
     rules.push(json!({ "ip_version": 6, "action": "reject" }));
     // 住宅节点 + split 模式：关键字域名必须走住宅出口，优先于国内域名直连
     let residential = matches!(
@@ -523,8 +525,9 @@ mod tests {
         }
     }
 
-    /// IPv6 接管是项目级不变量（服务端没有 IPv6 出口）：测速配置一旦回退成默认 DNS 策略，
+    /// IPv6 接管是项目级不变量：测速配置一旦回退成默认 DNS 策略，
     /// 现象是测速走 AAAA、所有节点被判不通，而主配置照常可用——静默错测，最难查。
+    /// （钉的是客户端到服务器的路径，不是「服务端没有 v6 出口」；4.1.8 起服务端可双栈。）
     #[test]
     fn probe_config_pins_ipv4_only_dns() {
         let nodes = [hy2_node(), reality_node()];

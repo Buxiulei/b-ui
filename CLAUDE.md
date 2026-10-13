@@ -26,9 +26,9 @@ Cargo workspace，三个 crate + 保留的前端三文件：
 
 | Path | Listener | Egress |
 |---|---|---|
-| `hysteria-server` (`config.yaml`) | `:PORT` (+ built-in port hopping range in the same `listen:` line) | built-in direct, `mode: 4` (IPv4-only) |
+| `hysteria-server` (`config.yaml`) | `:PORT` (+ built-in port hopping range in the same `listen:` line) | built-in direct, `mode: auto` (dual-stack；`mode: 4` 仅当 `node.direct_ip_policy = ipv4-only`) |
 | `hysteria-residential` (`hy2-residential.json`，**sing-box**，官方发行物、无 `with_v2ray_api`) | `:40000` 单端口；整段 `41000-50000`（+ 兼容段 `40001-40007`）由 `table inet bui` REDIRECT 进来 | 每凭据一个 `gate-<id>` selector → `slot-<i>-out` = `socks 127.0.0.1:(2080+i)`，或 `deny`（到期/封禁） |
-| xray `vless-direct` (`xray-config.json`) | `:10001` REALITY | `freedom` with `domainStrategy: ForceIPv4` |
+| xray `vless-direct` (`xray-config.json`) | `:10001` REALITY | `freedom` with `domainStrategy: ForceIPv4v6`（dual-stack；`ipv4-only` 时为 `ForceIPv4`） |
 | xray `vless-residential` | `:10002` REALITY | `socks 127.0.0.1:(2080+i)`，按用户 email 路由到槽（每人一条 `ruleTag` 规则，增删走 `RoutingService` gRPC，不重启 xray） |
 
 `127.0.0.1:2080` 是常驻的本地 sing-box 中继（`b-ui-relay.service`，配置 `/opt/b-ui/singbox-relay.json`，由 `render::relay::config` 渲染）：住宅上游池非空时把 AI 域名关键字（global 模式则全部）送进 `resi-pool`，池空则全部直连（fail-open）。目标域名不在本机解析，原样交给上游。上游可以是 `socks5` 或 `http`（`model::UpstreamKind`，粘贴 `socks5://u:p@h:port`、`http://…`、`h:port:u:p`、`u:p@h:port` 四种写法都由 `parse::upstream_url` 归一）；Bright Data 用 HTTP 端口（44445），它的 SOCKS5 端口拒绝明文 HTTP 目标（2026-09-10 实测）。池状态、凭据、黑名单与选中的上游都在 `state.json` 的 `residential` 里（600），没有独立的 `residential-proxy.json`；体检与自动黑名单是守护进程里的任务，切换上游经中继的 Clash API 而不重启内核。
@@ -41,7 +41,7 @@ Cargo workspace，三个 crate + 保留的前端三文件：
 
 受管单元 = `reconcile::MANAGED_UNITS` 那六个固定名字（`b-ui`、`hysteria-server`、`hysteria-residential`、`xray`、`b-ui-relay`、`caddy`），**就是全部**（4.1 起住宅只有一个实例）；枚举一律经 `reconcile::managed_units(&state)`，词法判定用 `reconcile::is_managed_unit`（带后缀的 `hysteria-residential-<i>` 一律 false）。`reconcile::LEGACY_UNITS` 是 16 项：v3 的九个遗留单元与定时器 + 4.0 的 `hysteria-residential-1..7.service`，对账器只负责把它们停掉、删掉；它们留下的端口跳跃 NAT 孤儿由 `portjump::cleanup_legacy_residential` 在落 `inet bui` 之前清（那条路径的下线判据写在它的文档注释里，与那七个名字同生共死）。`Artifact::NftTable` 是第 10 个期望项，`bui nft apply|status|delete` 是它的运维入口。
 
-VPS 没有 IPv6 出口：服务端每条出口都钉在 IPv4，客户端配置接管 IPv6 并拒绝裸 IPv6 目标，让应用回落 IPv4（spec：`docs/superpowers/specs/2026-09-10-ipv6-takeover-design.md`）。
+直连出口的地址族由 `node.direct_ip_policy` 决定，**默认 `ipv4-only`**（hysteria `direct.mode: 4`、xray `ForceIPv4`/`UseIPv4`）；显式 `bui set direct-ip-policy dual-stack` 才切成 `mode: auto` 与 `ForceIPv4v6`/`UseIP`（两台生产机都已切双栈，靠宿主机 `ipv6net` SIT 隧道出口）。**这一位只动服务端直连出口，与客户端无关**：订阅/客户端配置仍接管 IPv6 并拒绝裸 IPv6 目标（`subscription.rs` 的 `ip_version 6 ⇒ reject` + DNS `ipv4_only`、`bui-c` 的 `host_has_ipv6`），让应用回落 IPv4。双栈出站的裁决与验收口径在 v4.1.8 的 CHANGELOG 段（commit `ccc70ba`）；`docs/superpowers/specs/2026-09-10-ipv6-takeover-design.md` 是客户端接管那一半的设计，其中「服务器（VPS）没有 IPv6 出口」的前提已被双栈取代。
 
 ### Subscriptions (`crates/bui-schema/src/render/subscription.rs`)
 

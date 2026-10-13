@@ -272,8 +272,11 @@ pub fn singbox(nodes: &[Node], split: &SplitRules, dial_ip: &str) -> Value {
         }
     }
 
-    // 顺序：sniff → DNS 劫持 → 私网直连 → IPv6 reject（服务端无 v6 出口，RST 让应用回退 v4）
+    // 顺序：sniff → DNS 劫持 → 私网直连 → IPv6 reject（只命中**裸 v6 目标**，RST 让应用回退 v4）
     //       → 住宅关键字 → cn 直连
+    // 域名不经客户端预解析：出站没写 `domain_strategy`，域名原样交服务端，由 `node.direct_ip_policy`
+    // 决定 A/AAAA 取舍（双栈时 AAAA-only 域名走宿主机 v6 出口）。这条 reject 与 `strategy: ipv4_only`
+    // 只管字面 v6 目标——不是「服务端没有 v6 出口」（4.1.8 起可双栈），而是让字面 v6 快速回落、不在隧道里慢死。
     let mut rules = vec![
         json!({ "action": "sniff" }),
         json!({ "protocol": "dns", "action": "hijack-dns" }),
