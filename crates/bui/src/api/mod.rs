@@ -36,6 +36,10 @@ pub fn router(state: AppState, modules: &[Arc<dyn Module>]) -> axum::Router {
         )
         .route("/api/system/obfs", axum::routing::post(system::set_obfs))
         .route(
+            "/api/system/residential-health-interval",
+            axum::routing::post(system::set_residential_health_interval),
+        )
+        .route(
             "/api/system/direct-ip-policy",
             axum::routing::post(system::set_direct_ip_policy),
         )

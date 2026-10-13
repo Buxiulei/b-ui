@@ -257,6 +257,15 @@ async fn dispatch(command: Command) -> Result<()> {
                 )
                 .await
             }
+            cli::SetCmd::ResidentialHealthInterval { interval_secs } => {
+                commands::config::run_residential_health_interval_with(
+                    &interval_secs,
+                    bui_schema::paths::Paths::default_server(),
+                    std::sync::Arc::new(sys::real::RealHost::new()),
+                    PathBuf::from(paths::SOCKET_PATH),
+                )
+                .await
+            }
         },
         Command::Menu => {
             commands::menu::run(

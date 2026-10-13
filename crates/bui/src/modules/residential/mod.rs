@@ -41,8 +41,9 @@ pub const PROBE_CONCURRENCY: usize = 4;
 /// Clash API 地址与超时（地址与 P1 Task 10 的 relay 渲染同值，不另立常量）
 pub const CLASH_API: &str = crate::modules::core_files::RELAY_CLASH_API;
 pub const CLASH_TIMEOUT_SECS: u64 = 2;
-/// 健康巡检：每 2 分钟一轮、每成员 2 次探测、任一成功即本轮健康（spec §5.3）
-pub const HEALTH_INTERVAL_SECS: u64 = 120;
+// 健康巡检：周期已可配置，真值在 `state.system.residential_health_interval_secs`
+//（缺省 120 秒 = 原「每 2 分钟一轮」，见 `bui_schema::model::SystemSettings`，
+// 缺省不落盘）；每成员 2 次探测、任一成功即本轮健康（spec §5.3）
 pub const HEALTH_PROBE_URL: &str = "https://www.gstatic.com/generate_204";
 /// [`HEALTH_PROBE_URL`] 的主机名。`get` 失败后要经上游自写一次 CONNECT 才能把
 /// 「凭据失效（407）」从「不可达」里分出来（T3 `confirm_auth_failure` 的注释讲了原因），
@@ -425,7 +426,7 @@ mod tests {
         assert_eq!(GROUP_DEFAULT, "default");
         assert_eq!(POOL, "resi-pool");
         assert_eq!(CLASH_API, "127.0.0.1:9091");
-        assert_eq!((HEALTH_INTERVAL_SECS, HEALTH_TRIES), (120, 2));
+        assert_eq!(HEALTH_TRIES, 2);
         assert_eq!((FAIL_TO_UNHEALTHY, OK_TO_HEALTHY), (2, 2));
         assert_eq!(
             (SWITCH_MIN_INTERVAL_SECS, MANUAL_ROUND_MIN_GAP_SECS),

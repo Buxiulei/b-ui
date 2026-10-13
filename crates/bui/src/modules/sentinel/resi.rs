@@ -146,7 +146,7 @@ pub async fn on_upstream_error(
         //    请求是 `timed_get`，超时 `LATENCY_PROBE_TIMEOUT_SECS` = 8 秒 > 预算 4 秒，隧道不
         //    应答就必然先吃光预算。而触发本预案的签名恰恰是 relay 的 `i/o timeout` /
         //    `deadline exceeded` —— 就是「隧道挂死」本身。当它不动作，哨兵在**主打的故障形态**
-        //    上就是永久空操作，只能等巡检（`HEALTH_INTERVAL_SECS` 120 秒 × `FAIL_TO_UNHEALTHY`
+        //    上就是永久空操作，只能等巡检（巡检缺省周期 120 秒 × `FAIL_TO_UNHEALTHY`
         //    2 轮迟滞，且挂死时每轮 `probe_member` 自己要 ~40 秒）≈4–5 分钟才挪槽；
         // ③ 判错的代价不对称：误判死 = 多借一次兄弟 IP（吵闹；`mark_unhealthy` 之后巡检要先连续
         //    `OK_TO_HEALTHY` = 2 轮探通重新判健康、再攒满 `SLOT_BACK_ROUNDS` = 3 轮，恢复后第 4 轮

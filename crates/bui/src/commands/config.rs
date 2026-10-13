@@ -172,6 +172,55 @@ pub async fn run_legacy_sub_with(
     .await
 }
 
+/// `bui set residential-health-interval <秒数>`
+pub async fn run_residential_health_interval_with(
+    value: &str,
+    paths: Paths,
+    _host: Arc<dyn Host>,
+    socket: PathBuf,
+) -> Result<()> {
+    let secs: u64 = value
+        .parse()
+        .map_err(|_| anyhow::anyhow!("取值必须是正整数（秒），收到「{value}」"))?;
+    anyhow::ensure!(
+        secs >= 60,
+        "周期不能小于 60 秒（防止烧住宅流量），收到 {secs}"
+    );
+    anyhow::ensure!(
+        secs <= 86400,
+        "周期不能超过 86400 秒（24 小时），收到 {secs}"
+    );
+
+    let client = crate::ipc::Client::new(&socket);
+    if client.available().await {
+        let (status, body) = client
+            .request(
+                "POST",
+                "/api/system/residential-health-interval",
+                Some(serde_json::json!({"interval_secs": secs})),
+            )
+            .await?;
+        if !(200..300).contains(&status) {
+            anyhow::bail!("守护进程拒绝了这次修改（HTTP {status}）：{body}");
+        }
+        println!("住宅体检周期已设为 {secs} 秒；守护进程会在下一次重启时生效（systemctl restart b-ui）。");
+        return Ok(());
+    }
+    let owned_paths = paths.clone();
+    crate::residential_lifecycle::offline(&paths, async move {
+        let paths = owned_paths;
+        let store = Store::open(crate::paths::state_file(&paths)).await?;
+        if store.read().await.system.residential_health_interval_secs == secs {
+            println!("体检周期已经是 {secs} 秒，无需改动。");
+            return Ok(());
+        }
+        store.update(|s| s.system.residential_health_interval_secs = secs).await?;
+        println!("住宅体检周期已设为 {secs} 秒；守护进程会在下一次重启时生效（systemctl restart b-ui）。");
+        Ok(())
+    })
+    .await
+}
+
 /// obfs 密码的十六进制位数：16 字节随机，与订阅 token（`bui_schema::sub`）同量级。
 pub const OBFS_PASSWORD_HEX_LEN: usize = 32;
 

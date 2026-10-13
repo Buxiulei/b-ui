@@ -623,10 +623,29 @@ pub struct SystemSettings {
     /// SAMPLE**），单槽机器升级后 `state.json` 也一个字节不变。
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub hy2_resi_compat_ports: bool,
+    /// 住宅上游健康巡检的周期（秒）。**缺省 120**（2 分钟一轮）。设太短会烧住宅流量
+    /// （每轮每成员 2 次探测，每次约 1KB），设太长则上游 IP 挂掉时切换不及时。
+    /// 每次体检都会打 Google 搜索与 www.gstatic.com，所以这个周期也是「连接被 relay 关闭」
+    /// 在客户端日志里出现的最短间隔（切 IP 时旧连接会被关）。
+    ///
+    /// `skip_serializing_if = "is_default_health_interval"`：缺省不落盘，同 `hy2_resi_compat_ports` 口径。
+    #[serde(
+        default = "default_health_interval_secs",
+        skip_serializing_if = "is_default_health_interval"
+    )]
+    pub residential_health_interval_secs: u64,
 }
 
 fn default_auto() -> String {
     "auto".into()
+}
+
+fn default_health_interval_secs() -> u64 {
+    120
+}
+
+fn is_default_health_interval(v: &u64) -> bool {
+    *v == default_health_interval_secs()
 }
 
 impl Default for SystemSettings {
@@ -639,6 +658,7 @@ impl Default for SystemSettings {
             hy2_auth: Hy2Auth::Http,
             legacy_sub_until: None,
             hy2_resi_compat_ports: true,
+            residential_health_interval_secs: 120,
         }
     }
 }
@@ -745,6 +765,10 @@ mod tests {
         assert!(s.residential.groups.contains_key("default"));
         assert_eq!(s.residential.groups["default"].mode, ResiMode::Split);
         assert!(s.system.static_dns);
+        assert_eq!(
+            s.system.residential_health_interval_secs, 120,
+            "旧 state.json 没有这个字段 ⇒ 缺省 120 秒"
+        );
     }
 
     /// 2026-09-13 裁决：Hysteria2 鉴权默认 `http`。旧 `state.json`（含只写了另外四个
@@ -765,6 +789,27 @@ mod tests {
         assert_eq!("command".parse::<Hy2Auth>().unwrap(), Hy2Auth::Command);
         assert!("userpass".parse::<Hy2Auth>().is_err());
         assert_eq!(Hy2Auth::Http.to_string(), "http");
+    }
+
+    /// 新字段的落盘口径：缺省值不落盘，非缺省往返不丢。
+    #[test]
+    fn residential_health_interval_round_trips_and_skips_the_default() {
+        let d = SystemSettings::default();
+        assert_eq!(d.residential_health_interval_secs, 120);
+        let v = serde_json::to_value(&d).unwrap();
+        assert!(
+            v.get("residential_health_interval_secs").is_none(),
+            "缺省不落盘：{v}"
+        );
+
+        let changed = SystemSettings {
+            residential_health_interval_secs: 300,
+            ..SystemSettings::default()
+        };
+        let v = serde_json::to_value(&changed).unwrap();
+        assert_eq!(v["residential_health_interval_secs"], 300);
+        let back: SystemSettings = serde_json::from_value(v).unwrap();
+        assert_eq!(back.residential_health_interval_secs, 300);
     }
 
     /// 2026-09-14 裁决（每用户随机订阅 token）：三个新字段缺省一律不落盘。

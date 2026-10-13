@@ -482,3 +482,49 @@ pub async fn harden_ssh(
             .into_response(),
     }
 }
+
+#[derive(Debug, Deserialize)]
+pub struct ResidentialHealthIntervalRequest {
+    pub interval_secs: u64,
+}
+
+/// `POST /api/system/residential-health-interval`：改住宅体检周期
+/// （`bui set residential-health-interval` 的落点）。
+///
+/// 守护进程写 state.json，但**不会立即生效**——需要重启守护进程（体检循环在启动时读配置）。
+pub async fn set_residential_health_interval(
+    State(app): State<AppState>,
+    Json(req): Json<ResidentialHealthIntervalRequest>,
+) -> Response {
+    let secs = req.interval_secs;
+    if secs < 60 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "周期不能小于 60 秒（防止烧住宅流量）"})),
+        )
+            .into_response();
+    }
+    if secs > 86400 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "周期不能超过 86400 秒（24 小时）"})),
+        )
+            .into_response();
+    }
+    match app
+        .store
+        .update(|s| s.system.residential_health_interval_secs = secs)
+        .await
+    {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"ok": true, "interval_secs": secs, "note": "需重启守护进程生效"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}

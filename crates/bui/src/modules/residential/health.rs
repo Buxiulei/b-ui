@@ -9,8 +9,8 @@
 //! `clash::tag_of` 现算，绝不当运行时主键。
 
 use super::{
-    clash, proxy, state, HEALTH_INTERVAL_SECS, HEALTH_PROBE_HOST, HEALTH_PROBE_URL, HEALTH_TRIES,
-    POOL, SWITCH_IMPROVE_ROUNDS, SWITCH_LATENCY_GAIN, SWITCH_MIN_INTERVAL_SECS, SWITCH_SPEED_GAIN,
+    clash, proxy, state, HEALTH_PROBE_HOST, HEALTH_PROBE_URL, HEALTH_TRIES, POOL,
+    SWITCH_IMPROVE_ROUNDS, SWITCH_LATENCY_GAIN, SWITCH_MIN_INTERVAL_SECS, SWITCH_SPEED_GAIN,
 };
 use crate::api::Event;
 use crate::reconcile::DaemonCtx;
@@ -958,9 +958,15 @@ async fn persist_alerts(ctx: &DaemonCtx, alerts: &[String]) {
     .await;
 }
 
-/// 每 2 分钟一轮
+/// 每 N 秒一轮（N 由 state.system.residential_health_interval_secs 控制，默认 120）
 pub async fn health_loop(ctx: DaemonCtx, p: Arc<dyn Prober>, c: Arc<dyn Clash>) {
-    let mut tick = tokio::time::interval(std::time::Duration::from_secs(HEALTH_INTERVAL_SECS));
+    let interval_secs = ctx
+        .store
+        .read()
+        .await
+        .system
+        .residential_health_interval_secs;
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
     loop {
         tick.tick().await;
         if let Err(e) = check_once(&ctx, p.clone(), c.clone()).await {
@@ -2813,6 +2819,8 @@ mod tests {
     async fn the_health_loop_runs_a_round_every_two_minutes() {
         let d = tempfile::tempdir().unwrap();
         let (c, _h) = ctx(&d, &[10, 20]).await;
+        // 间隔已可配置（默认 120）：断言吃期望态里的真实取值，别再引用死常量
+        let interval = c.store.read().await.system.residential_health_interval_secs;
         let clash = Arc::new(FakeClash::new(Some("resi-1")));
         let task = tokio::spawn(health_loop(c.clone(), by_host(&[], &[]), clash.clone()));
         // 用「等到出现」而不是精确计时：一轮里有 spawn_blocking，与假时钟没有确定的先后。
@@ -2831,17 +2839,14 @@ mod tests {
             "interval 第一 tick 立即完成 ⇒ 起来就跑一轮"
         );
         let first = clash.calls().len();
-        tokio::time::advance(std::time::Duration::from_secs(HEALTH_INTERVAL_SECS + 1)).await;
+        tokio::time::advance(std::time::Duration::from_secs(interval + 1)).await;
         for _ in 0..500 {
             if clash.calls().len() > first {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
-        assert!(
-            clash.calls().len() > first,
-            "每 {HEALTH_INTERVAL_SECS} 秒再跑一轮"
-        );
+        assert!(clash.calls().len() > first, "每 {interval} 秒再跑一轮");
         task.abort();
     }
 

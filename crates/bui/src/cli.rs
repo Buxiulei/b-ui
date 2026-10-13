@@ -194,6 +194,13 @@ pub enum SetCmd {
         #[arg(long)]
         force: bool,
     },
+    /// 住宅上游健康巡检的周期（秒）。默认 120（2 分钟一轮）。
+    /// 设太短会烧住宅流量（每轮每成员 2 次探测），设太长则上游 IP 挂掉时切换不及时。
+    /// **需重启守护进程生效**（`systemctl restart b-ui`）。
+    ResidentialHealthInterval {
+        /// 周期秒数，取值范围 60-86400。
+        interval_secs: String,
+    },
 }
 
 /// `/usr/local/bin/b-ui` 这个符号链接裸跑时进菜单（spec §1、§2.4）。
