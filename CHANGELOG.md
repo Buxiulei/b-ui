@@ -8,7 +8,7 @@
 `version` 的唯一来源是根 `Cargo.toml` 的 `[workspace.package] version`；改版本必须同时在本文件加一段，`scripts/release/check-version.sh` 会在 CI 里卡住不一致（它只认 `## [<version>]` 这个标题，日期不参与校验）。
 未发布的版本日期写「未发布」，由主理人打 tag 发版时替换成当天日期（UTC）。
 
-## [4.1.11] - 2026-10-27（未发布）
+## [4.1.11] - 2026-10-27
 
 ### 服务端出站强制 IPv4 / 封死主机 IPv6 出站
 
