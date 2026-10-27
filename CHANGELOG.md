@@ -8,6 +8,38 @@
 `version` 的唯一来源是根 `Cargo.toml` 的 `[workspace.package] version`；改版本必须同时在本文件加一段，`scripts/release/check-version.sh` 会在 CI 里卡住不一致（它只认 `## [<version>]` 这个标题，日期不参与校验）。
 未发布的版本日期写「未发布」，由主理人打 tag 发版时替换成当天日期（UTC）。
 
+## [4.1.11] - 2026-10-27（未发布）
+
+### 服务端出站强制 IPv4 / 封死主机 IPv6 出站
+
+- **服务端四条代理出站恒 IPv4，删除双栈开关**：HY2 直连 `direct.mode: 4`；Xray 直连
+  `ForceIPv4` / `UseIPv4`，路由显式 `domainStrategy: AsIs`，首条 `::/0 → block` blackhole；
+  relay 路由首条用 logical + invert 只拒绝**全局** IPv6 字面量（`::1` / `fc00::/7` /
+  `fe80::/10` 仍走私网直连）；住宅上游沿用 relay。`node.direct_ip_policy` 只为旧
+  `state.json` 反序列化保留，渲染不再读它；`bui set direct-ip-policy` 与控制 API 只接受
+  `ipv4-only`，`dual-stack` 当场拒绝（旧 state 可用它写回默认）。
+- **`table inet bui` 新增 filter/output `ipv6_egress` 链**：放行本机地址、链路本地/组播、
+  `ct state established,related` 回包与入站连接需要的 ICMPv6 错误，其余新建 IPv6 出站
+  立即 reject。`rule_count` 语义不变（仍只数 REDIRECT）；watchdog、`bui install` 自检与
+  `bui nft status` 单独校验封禁链，缺失/不符即整表重放。`b-ui.service` 加
+  `ExecStartPre=-{bin}/bui nft apply`，五个数据面单元加 `After=b-ui.service`，保证开机时
+  封禁链先于内核起来（无依赖环）。
+- **管理面与安装期只走 IPv4**：`probe_public_ip` 与 `install.sh` / `bui-c-install.sh` 的
+  curl/wget 加 `-4`；`bui` 的 `HttpFetcher` 与 `bui-c` 的 `ReqwestNet` 各带一个只返回 A
+  记录的 `reqwest::dns::Resolve`；住宅探针 `dial` / `direct_tcp` / `gateway_tcp_within`
+  过滤 `to_socket_addrs` 为 IPv4；`env_probe` 的「IPv6 出站」行改为反映封堵策略，不再用
+  默认 v6 路由冒充可出站。
+- **客户端拒绝全局 IPv6 字面量**：主配置与测速配置首条加
+  `logical(ip_version 6 AND NOT ip_is_private) ⇒ reject`，删掉会把私网 v6 一起拒掉的裸
+  `ip_version 6` reject；mihomo 订阅的四条 `IP-CIDR6`（含新增 `::1/128`）整体提到
+  `GEOIP`/`GEOSITE` 之前。sing-box 侧不写 legacy `domain_strategy`，也不用
+  `ip_is_private: false`（1.14.3 是 no-op）。`bui-c` 的 IPv6 观测改经当前 profile 的代理
+  路径（SOCKS 经本地代理、TUN 受捕获），`check` 新增 IPv6 默认路由观察
+  `TunNoDefaultRouteV6`（只报告，不自动改路由）。
+- **已知边界**：IPv6-only 目标从此不可达；SOCKS 模式下不走本地代理的应用流量不在保证内；
+  住宅供应商自身的出口地址族不在本机控制内。设计见
+  `docs/superpowers/specs/2026-10-27-ipv4-only-egress-design.md`。
+
 ## [4.1.10] - 2026-10-13
 
 ### 住宅计量：占比告警加绝对下限，止住自伤式中断

@@ -114,6 +114,9 @@ pub struct NftRound {
     /// 恰好是期望条数时，故障就不是「表被删了」而是回显解析对不上
     /// ——那会每 60 秒重放一次，得让 `bui incidents` 一眼看出来。
     pub seen_rules: usize,
+    /// 回显里数出来的 IPv6 出站封禁规则条数（表或链不在 ⇒ 0）。与 `seen_rules` 分开报，
+    /// 才能区分「跳跃段没了」与「只是封禁链缺了」。
+    pub seen_egress: usize,
 }
 
 /// `nft list table` 的回显（或渲染器的规则集）里每条 redirect 的 `(链, dport, 目标端口, 目标必须属于本机)`。
@@ -212,6 +215,7 @@ pub fn check_nft(host: &dyn Host, s: &State) -> NftRound {
             compat_live: None,
             error: None,
             seen_rules: 0,
+            seen_egress: 0,
         };
     }
     let want = nft::ruleset(&s.node.ports, s.system.hy2_resi_compat_ports);
@@ -228,6 +232,7 @@ pub fn check_nft(host: &dyn Host, s: &State) -> NftRound {
                 compat_live: None,
                 error: Some(first_line(&o)),
                 seen_rules: 0,
+                seen_egress: 0,
             }
         }
         Err(e) => {
@@ -236,6 +241,7 @@ pub fn check_nft(host: &dyn Host, s: &State) -> NftRound {
                 compat_live: None,
                 error: Some(e.to_string()),
                 seen_rules: 0,
+                seen_egress: 0,
             }
         }
     };
@@ -245,13 +251,21 @@ pub fn check_nft(host: &dyn Host, s: &State) -> NftRound {
         .and_then(|t| compat_counter(t, &s.node.ports));
     let got = listed.as_deref().map(redirect_rules).unwrap_or_default();
     let seen_rules = got.len();
-    // `want` 恒有 2 或 4 条 redirect，所以「表不在」（`got` 为空）永远落不进这一支
-    if got == redirect_rules(&want) {
+    // IPv6 出站封禁链单独比：缺链（旧表 / 被人删掉）时 redirect 可能全对，
+    // 只比 redirect 会让这条链永远沉默。
+    let got_egress = listed
+        .as_deref()
+        .map(nft::egress_signature)
+        .unwrap_or_default();
+    let seen_egress = got_egress.len();
+    // `want` 恒有 2 或 4 条 redirect + 6 条封禁规则，所以「表不在」（两者都为空）永远落不进这一支
+    if got == redirect_rules(&want) && got_egress == nft::egress_signature(&want) {
         return NftRound {
             verdict: NftVerdict::Ok,
             compat_live,
             error: None,
             seen_rules,
+            seen_egress,
         };
     }
     let (verdict, error) = match host.run_stdin("nft", &["-f", "-"], &want) {
@@ -264,6 +278,7 @@ pub fn check_nft(host: &dyn Host, s: &State) -> NftRound {
         compat_live,
         error,
         seen_rules,
+        seen_egress,
     }
 }
 
@@ -363,9 +378,12 @@ pub fn nft_event(
             NFT_REPLAY_ACTION,
             Level::Warn,
             format!(
-                "table {table} 不在或规则不符（期望 {want_rules} 条 redirect，实到 {}），\
-                 已整表重放（{hop_a}-{hop_b} → :{}）",
-                round.seen_rules, p.hy2_resi
+                "table {table} 不在或规则不符（期望 {want_rules} 条 redirect / {} 条 IPv6 出站封禁，\
+                 实到 {} / {}），已整表重放（{hop_a}-{hop_b} → :{}）",
+                bui_schema::render::nft::EGRESS_RULES,
+                round.seen_rules,
+                round.seen_egress,
+                p.hy2_resi
             ),
         ),
         NftVerdict::Missing => (
@@ -374,9 +392,10 @@ pub fn nft_event(
             Level::Error,
             format!(
                 "table {table} 重放失败：{} —— 住宅 HY2 跳跃段不通（{hop_a}-{hop_b} 没人接，\
-                 盘上实到 {} 条 redirect）",
+                 盘上实到 {} 条 redirect、{} 条 IPv6 出站封禁）",
                 round.error.as_deref().unwrap_or("（没有输出）"),
-                round.seen_rules
+                round.seen_rules,
+                round.seen_egress
             ),
         ),
         NftVerdict::Unreadable => (
@@ -760,6 +779,7 @@ pub async fn check_once(ctx: &DaemonCtx) -> anyhow::Result<Vec<(String, Decision
                 compat_live: None,
                 error: Some(error.to_string()),
                 seen_rules: 0,
+                seen_egress: 0,
             },
             false,
         ),
@@ -1946,6 +1966,15 @@ table inet bui {
 \t\tudp dport 41000-50000 fib daddr type local counter packets 0 bytes 0 redirect to :40000 comment \"hy2 residential hop (local)\"
 \t\tudp dport 40001-40007 fib daddr type local counter packets 1 bytes 40 redirect to :40000 comment \"hy2 residential 4.0 compat (local)\"
 \t}
+\tchain ipv6_egress {
+\t\ttype filter hook output priority filter; policy accept;
+\t\tmeta nfproto ipv6 fib daddr type local counter packets 0 bytes 0 accept
+\t\tip6 daddr { fe80::/10, ff00::/8 } counter packets 0 bytes 0 accept
+\t\tmeta nfproto ipv6 ct state established,related counter packets 6 bytes 720 accept
+\t\ticmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem } counter packets 0 bytes 0 accept
+\t\tmeta nfproto ipv6 meta l4proto tcp counter packets 2 bytes 120 reject with tcp reset
+\t\tmeta nfproto ipv6 counter packets 3 bytes 180 reject with icmpx admin-prohibited
+\t}
 }
 ";
 
@@ -1966,7 +1995,7 @@ table inet bui {
         assert_eq!(r.compat_live, Some(4), "修复前仍采集旧规则计数");
         assert_eq!(r.seen_rules, 4, "条数相同也必须识别旧规则");
         assert!(h.stdins().iter().any(|(cmd, input)| {
-            cmd == "nft -f -" && input.matches("fib daddr type local").count() == 4
+            cmd == "nft -f -" && input.matches("fib daddr type local").count() == 5
         }));
         assert!(!h.ops().iter().any(|o| o.starts_with("systemd:")));
         assert_eq!(
@@ -1974,6 +2003,46 @@ table inet bui {
             redirect_rules(&LISTED.replace("type local", "type == local")),
             "nft 显式输出等号时不应反复重放"
         );
+    }
+
+    /// 2026-10-27：redirect 规则全对、但 IPv6 出站封禁链缺了/被改了，也必须整表重放。
+    /// 只比 redirect 的旧判据会让这条链永远沉默。
+    #[test]
+    fn a_missing_or_tampered_ipv6_egress_chain_is_replayed() {
+        let s = sample_state();
+        let want = bui_schema::render::nft::ruleset(&s.node.ports, true);
+        let without = format!(
+            "{}}}",
+            LISTED
+                .split_once("\tchain ipv6_egress")
+                .expect("fixture 带封禁链")
+                .0
+        );
+        for (live, seen_egress) in [
+            (without, 0),
+            (
+                LISTED.replace("reject with icmpx admin-prohibited", "accept"),
+                bui_schema::render::nft::EGRESS_RULES,
+            ),
+        ] {
+            let h = FakeHost::new();
+            h.with(|i| {
+                i.which.insert("nft".into());
+                i.scripted.push((
+                    "nft list table inet bui".into(),
+                    crate::sys::CmdOut::success(&live),
+                ));
+            });
+            let r = check_nft(&h, &s);
+            assert_eq!(r.verdict, NftVerdict::Replayed, "{live}");
+            assert_eq!(r.seen_rules, 4, "redirect 本身是好的");
+            assert_eq!(r.seen_egress, seen_egress, "{live}");
+            assert_eq!(
+                h.stdins(),
+                vec![("nft -f -".to_string(), want.clone())],
+                "重放的是完整规则集（含封禁链）"
+            );
+        }
     }
 
     /// 表被人删掉 ⇒ 整表重放；`nft` 不存在 ⇒ 只告警、一条命令都不发；规则一致 ⇒ 什么都不做。
@@ -2048,6 +2117,7 @@ table inet bui {
             compat_live: None,
             error: None,
             seen_rules: 0,
+            seen_egress: 0,
         };
         let none = std::collections::BTreeMap::new();
         let (bucket, rec, inc) = nft_event(&round, &s, &none, t0()).unwrap();
@@ -2075,12 +2145,14 @@ table inet bui {
             compat_live: None,
             error: None,
             seen_rules: 2,
+            seen_egress: 0,
         };
         let (_, _, inc) = nft_event(&replayed, &s, &none, t0()).unwrap();
         assert_eq!(inc.signature, NFT_TABLE_MISSING_SIG);
         assert_eq!(inc.level, crate::modules::sentinel::incidents::Level::Warn);
         assert!(
-            inc.result.contains("期望 4 条 redirect，实到 2"),
+            inc.result
+                .contains("期望 4 条 redirect / 6 条 IPv6 出站封禁，实到 2 / 0"),
             "条数进正文：判成不符却恰好是期望条数时，故障是回显解析对不上而不是表被删了：{}",
             inc.result
         );
@@ -2089,6 +2161,7 @@ table inet bui {
             compat_live: None,
             error: Some("Error: Chain of type \"nat\" is not supported".into()),
             seen_rules: 0,
+            seen_egress: 0,
         };
         let (_, _, inc) = nft_event(&failed, &s, &none, t0()).unwrap();
         assert_eq!(inc.level, crate::modules::sentinel::incidents::Level::Error);
@@ -2100,6 +2173,7 @@ table inet bui {
                 compat_live: Some(0),
                 error: None,
                 seen_rules: 4,
+                seen_egress: bui_schema::render::nft::EGRESS_RULES,
             },
             &s,
             &none,
@@ -2119,6 +2193,7 @@ table inet bui {
             compat_live: Some(0),
             error: None,
             seen_rules: 0,
+            seen_egress: 0,
         };
         let (bucket, rec, inc) = nft_event(&replayed, &s, &Default::default(), t0()).unwrap();
         assert_eq!(bucket, "replayed");
@@ -2132,6 +2207,7 @@ table inet bui {
             compat_live: Some(0),
             error: Some("Error: Chain of type \"nat\" is not supported".into()),
             seen_rules: 0,
+            seen_egress: 0,
         };
         let (bucket2, rec2, inc2) =
             nft_event(&failed, &s, &heals, t0() + time::Duration::minutes(1)).unwrap();
@@ -2252,7 +2328,8 @@ table inet bui {
         // 事件正文报的是「期望 2 条」，不是恒 4 条
         let (_, _, inc) = nft_event(&r, &s, &Default::default(), t0()).unwrap();
         assert!(
-            inc.result.contains("期望 2 条 redirect，实到 4"),
+            inc.result
+                .contains("期望 2 条 redirect / 6 条 IPv6 出站封禁，实到 4 / 6"),
             "{}",
             inc.result
         );
@@ -2388,7 +2465,9 @@ table inet bui {
         assert_eq!(incs.len(), 1);
         assert_eq!(incs[0].signature, NFT_TABLE_MISSING_SIG);
         assert!(
-            incs[0].result.contains("期望 4 条 redirect，实到 2"),
+            incs[0]
+                .result
+                .contains("期望 4 条 redirect / 6 条 IPv6 出站封禁，实到 2 / 0"),
             "盘上到底有几条要如实报（夹具那张表只剩 prerouting 的两条）：{}",
             incs[0].result
         );

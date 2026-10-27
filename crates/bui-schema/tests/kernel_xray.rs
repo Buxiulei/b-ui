@@ -43,8 +43,17 @@ fn xray_config_has_two_reality_inbounds_and_passes_xray_test() {
             .unwrap(),
         "www.bing.com:443"
     );
-    // 住宅兜底是**最后一条**（前面每个住宅用户各有自己的 `resi-u-<user_id>` 规则）
+    // 首条是字面 IPv6 的 blackhole（服务端出站一律 IPv4，2026-10-27）
     let rs = cfg["routing"]["rules"].as_array().unwrap();
+    assert_eq!(rs[0]["ip"], serde_json::json!(["::/0"]));
+    assert_eq!(rs[0]["outboundTag"], "block");
+    assert_eq!(cfg["routing"]["domainStrategy"], "AsIs");
+    assert!(cfg["outbounds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|o| o["tag"] == "block" && o["protocol"] == "blackhole"));
+    // 住宅兜底是**最后一条**（前面每个住宅用户各有自己的 `resi-u-<user_id>` 规则）
     let last = rs.last().unwrap();
     assert_eq!(last["ruleTag"].as_str().unwrap(), "resi-fallback");
     assert_eq!(last["outboundTag"].as_str().unwrap(), "relay-slot-0");
@@ -116,7 +125,7 @@ fn a_three_slot_routing_table_passes_xray_test() {
     // 把每个住宅用户按创建顺序轮流落槽，制造出「每槽都有 user 规则」的形态
     bui_schema::slots::migrate_unassigned(&mut s);
     let cfg = xray::config(&s.node, &s.users, &s.residential, &Paths::default_server());
-    assert_eq!(cfg["outbounds"].as_array().unwrap().len(), 4);
+    assert_eq!(cfg["outbounds"].as_array().unwrap().len(), 5);
     let rs = cfg["routing"]["rules"].as_array().unwrap();
     assert!(rs.iter().any(|r| r.get("user").is_some()));
     assert!(rs

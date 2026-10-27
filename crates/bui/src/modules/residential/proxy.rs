@@ -9,6 +9,30 @@
 
 use bui_schema::model::{Upstream, UpstreamKind};
 
+/// 住宅探针的解析结果只保留 IPv4（2026-10-27：服务端绝不新建 IPv6 出站）。
+///
+/// 探针是管理面路径，不走代理内核的 nft/路由策略，所以这里显式过滤；没有 A 记录时
+/// 调用方按「解析为空」处理（上游不可达），绝不回落 AAAA。
+fn ipv4_only(addrs: impl IntoIterator<Item = std::net::SocketAddr>) -> Vec<std::net::SocketAddr> {
+    addrs.into_iter().filter(|a| a.is_ipv4()).collect()
+}
+
+/// `proxied_client` 的解析器：reqwest 自己拨**上游代理服务器**时也不许走 IPv6。
+/// `dial` 那三条路径（CONNECT / SOCKS5 / UDP ASSOCIATE 的控制连接）已被 [`ipv4_only`]
+/// 挡住；`get` / `google_search` / `timed_get` 走 reqwest，必须在 builder 上再钉一次。
+struct Ipv4OnlyDns;
+
+impl reqwest::dns::Resolve for Ipv4OnlyDns {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        use std::net::ToSocketAddrs;
+        let result = (name.as_str(), 0).to_socket_addrs().map(ipv4_only);
+        Box::pin(std::future::ready(match result {
+            Ok(addrs) => Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs),
+            Err(e) => Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
+        }))
+    }
+}
+
 /// 一次「经该上游对某个 host:port 开隧道」的结果。这四个变体是黑名单判定与体检的全部依据。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectVerdict {
@@ -342,8 +366,8 @@ impl ReqwestProber {
 
     fn dial(&self, up: &Upstream) -> std::io::Result<std::net::TcpStream> {
         use std::net::ToSocketAddrs;
-        let mut last = std::io::Error::other("上游地址解析为空");
-        for a in (up.host.as_str(), up.port).to_socket_addrs()? {
+        let mut last = std::io::Error::other("上游地址没有 A 记录（服务端出站一律 IPv4）");
+        for a in ipv4_only((up.host.as_str(), up.port).to_socket_addrs()?) {
             match std::net::TcpStream::connect_timeout(&a, self.timeout) {
                 Ok(s) => {
                     s.set_read_timeout(Some(self.timeout))?;
@@ -401,6 +425,7 @@ impl ReqwestProber {
             .map_err(|e| ProbeError::Unreachable(e.to_string()))?
             .basic_auth(&up.username, &up.password);
         reqwest::blocking::Client::builder()
+            .dns_resolver(std::sync::Arc::new(Ipv4OnlyDns))
             .proxy(proxy)
             .timeout(timeout)
             .redirect(reqwest::redirect::Policy::none())
@@ -622,7 +647,7 @@ impl Prober for ReqwestProber {
         let Ok(addrs) = (host, port).to_socket_addrs() else {
             return false;
         };
-        addrs
+        ipv4_only(addrs)
             .into_iter()
             .any(|a| std::net::TcpStream::connect_timeout(&a, self.timeout).is_ok())
     }
@@ -646,7 +671,7 @@ impl Prober for ReqwestProber {
             let Ok(addrs) = target.to_socket_addrs() else {
                 return;
             };
-            for a in addrs {
+            for a in ipv4_only(addrs) {
                 let tx = tx.clone();
                 std::thread::spawn(move || {
                     if std::net::TcpStream::connect_timeout(&a, within).is_ok() {
@@ -1137,6 +1162,22 @@ mod tests {
             "实际 {req:?}"
         );
         assert!(req.ends_with("\r\n\r\n"));
+    }
+
+    /// 2026-10-27：住宅探针只拨 IPv4；字面 IPv6 目标一个都不尝试（不新建 IPv6 出站）。
+    #[test]
+    fn residential_probes_drop_every_ipv6_address() {
+        use std::net::SocketAddr;
+        let addrs: Vec<SocketAddr> = ["127.0.0.1:1", "[::1]:1", "[2001:db8::1]:1"]
+            .iter()
+            .map(|s| s.parse().unwrap())
+            .collect();
+        assert_eq!(ipv4_only(addrs.clone()), vec![addrs[0]]);
+        assert!(ipv4_only(addrs[1..].to_vec()).is_empty());
+        // `direct_tcp` 对字面 v6 直接返回 false，不会去连 ::1
+        let p = ReqwestProber::with_timeout(1);
+        assert!(!p.direct_tcp("::1", 1));
+        assert!(!p.direct_tcp("2001:db8::1", 443));
     }
 
     #[test]

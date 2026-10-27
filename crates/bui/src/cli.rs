@@ -154,7 +154,8 @@ pub enum NftCmd {
 /// `bui set` 的子命令。
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum SetCmd {
-    /// 直连出口地址族：ipv4-only（默认）或 dual-stack（需宿主机 IPv6 出口可用）。
+    /// 直连出口地址族：只接受 ipv4-only。`dual-stack` 已停用（2026-10-27：服务端出站
+    /// 一律 IPv4）；保留这个子命令是为了把旧 state 里的双栈值写回默认。
     /// 通过 root UDS 的唯一控制 owner 设置；离线必须取得机器 lease。
     DirectIpPolicy {
         policy: bui_schema::model::DirectIpPolicy,
@@ -476,10 +477,9 @@ mod tests {
 
     #[test]
     fn parses_direct_ip_policy_through_the_model_validator() {
-        for value in ["dual-stack", "ipv4-only"] {
-            assert!(Cli::try_parse_from(["bui", "set", "direct-ip-policy", value]).is_ok());
-        }
-        for value in ["auto", "dual_stack", "ipv6-only", ""] {
+        assert!(Cli::try_parse_from(["bui", "set", "direct-ip-policy", "ipv4-only"]).is_ok());
+        // dual-stack 已停用（2026-10-27）：CLI 必须当场拒绝，而不是落盘后再被渲染忽略
+        for value in ["dual-stack", "auto", "dual_stack", "ipv6-only", ""] {
             assert!(Cli::try_parse_from(["bui", "set", "direct-ip-policy", value]).is_err());
         }
     }

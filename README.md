@@ -6,7 +6,7 @@
 
 Rust 编写的多协议代理控制与管理工具，提供服务端部署、Web 管理面板、住宅出口管理和 Linux 客户端。网络转发由 Hysteria2、Xray、sing-box 等独立内核承担。
 
-**版本状态（2026-10-10 核对）**：GitHub 最新正式 Release 为 [v4.1.3](https://github.com/Buxiulei/b-ui/releases/tag/v4.1.3)；本工作分支的源码候选为 **v4.1.9，尚未发布、未部署**。版本号唯一来源是根 [Cargo.toml](Cargo.toml) 的 `[workspace.package] version`，候选进展不能当作已发布能力。
+**版本状态（2026-10-27 核对）**：GitHub 最新正式 Release 为 [v4.1.3](https://github.com/Buxiulei/b-ui/releases/tag/v4.1.3)；本工作分支的源码候选为 **v4.1.11，尚未发布、未部署**。版本号唯一来源是根 [Cargo.toml](Cargo.toml) 的 `[workspace.package] version`，候选进展不能当作已发布能力。
 
 **内核来源**：目标坚持使用上游原版内核，不维护协议源码补丁。当前[发布锁](scripts/release/kernels.lock)中的 sing-box 已是上游官方发布归档原件（**官方 v1.14.3**，2026-10-10 切换；4.1.x 那段时间曾随发布分发 CI 自建、带 `with_v2ray_api` 编译标签的产物，该自建链已退役）。官方原件不含 `with_v2ray_api`，住宅 HY2 的按用户计量改走官方内核内置的控制面（顶层 `services` 的 `api` 服务，`daemon.StartedService` 的连接事件流）加守护进程内的本地账本，不再依赖源码补丁。切换的实测、设计与实施口径见[官方 sing-box 与独立计量计划](docs/superpowers/plans/2026-10-10-singbox-official-and-metering.md)；随本候选发布后生效，存量安装由 `bui upgrade` 换内核。
 
@@ -14,7 +14,7 @@ Rust 编写的多协议代理控制与管理工具，提供服务端部署、Web
 
 当前主线是：**控制面只依据当前实例的本地故障决定是否中断；数据面在启动、运行、退出和恢复期间，始终受管转发或明确阻断 IPv4、IPv6 与 DNS。** Rust 管理授权、期望配置和服务生命周期；本轮候选固定 sing-box **1.14.3**（官方发行物），不通过修改客户端规则或降低日志级别替代架构修复。
 
-截至 2026-10-10，当前实例恢复决策已有公开代码；独立出口保护、统一生命周期 owner 和隔离验收工具的后续实现仍有未完成接线。**完整 hooks、所有配置写者、冷启动双栈、强杀/重启/回滚及严格 Clippy 尚未全部通过，不能宣称已经实现完整防泄漏。**
+2026-10-27 起服务端**四条代理出站恒 IPv4，没有双栈开关**；主机新 IPv6 出站由 `table inet bui` 的 `ipv6_egress` 链封死，只保留 IPv6 入站（回包走 conntrack established）。管理面（升级下载、公网 IP 探测、住宅探针、客户端抓取）也只解析/连接 IPv4。客户端接管 IPv6 并拒绝**全局** IPv6 字面量，私网 v6（`::1` / `fc00::/7` / `fe80::/10`）仍直连。边界要说清：**IPv6-only 目标从此不可达**；SOCKS 模式下不走本地代理的应用流量不在保证内；住宅供应商自己的出口地址族不在本机控制内；客户端完整捕获、强杀/重启与回滚的既有验收台账仍见下方工作记录，不因本次服务端封堵而继承为「完整防泄漏」结论。
 
 - [全部工作成果与交接索引](docs/work-records/2026-10-10/README.md)：调查经过、设计决策、实现边界、证据和下一步。
 - [架构、模块与剩余实施顺序](docs/work-records/2026-10-10/architecture-and-handover.md)：统一 owner、短锁、状态记录和生命周期接线。
@@ -155,11 +155,11 @@ Rust 编写的多协议代理控制与管理工具，提供服务端部署、Web
 
 ### 客户端 (Client)
 - **统一导入**: 粘贴链接即可，自动识别 Hysteria2/VLESS 链接、订阅地址、批量
-- **单引擎双模式**: sing-box 跑 SOCKS/HTTP 混合入口或 TUN；本工作分支固定 1.14.3（官方发行物）。独立双栈保护及完整生命周期的交付状态见上方工作记录
+- **单引擎双模式**: sing-box 跑 SOCKS/HTTP 混合入口或 TUN；本工作分支固定 1.14.3（官方发行物）。客户端拒绝全局 IPv6 字面量、DNS 只取 A；完整生命周期与物理捕获的交付状态见上方工作记录
 - **巡检与恢复**: `bui-c.timer` 周期执行 `bui-c check`；4.1.9 候选将外部可达性异常与当前本地故障分开，外部探测失败不单独授权重启
 - **更新来源**: 面板 `/packages/` → GitHub Releases → 镜像前缀，解决 GitHub 不可达问题
 - **服务控制**: 实时状态显示，一键启停/重启/查看日志
-- **IPv4 / IPv6**：客户端捕获、代理传输与服务端出站分别验收；[完整配置设计](docs/work-records/2026-10-10/managed-client-design.md)说明当前目标。[早期 v2rayN 部署说明](docs/v2rayn-tun-ipv6.md)保留作历史参考，不代表完整双栈接管已完成
+- **IPv4 / IPv6**：服务端出站恒 IPv4、主机新 IPv6 出站已封；客户端接管 IPv6 并拒绝全局 v6 字面量。客户端捕获、代理传输与服务端出站分别验收；[完整配置设计](docs/work-records/2026-10-10/managed-client-design.md)与[2026-10-27 封堵设计](docs/superpowers/specs/2026-10-27-ipv4-only-egress-design.md)说明边界。[早期 v2rayN 部署说明](docs/v2rayn-tun-ipv6.md)保留作操作参考；SOCKS 模式非代理流量与住宅供应商出口不在保证内
 
 ---
 
@@ -204,7 +204,7 @@ curl -fsSL https://raw.githubusercontent.com/Buxiulei/b-ui/v4/install.sh \
   | bash -s -- --domain panel.example.com --yes --admin-password-stdin < /root/panel-password.txt
 ```
 
-没有终端可问（CI、`/dev/tty` 也开不了）时同样全用默认值；不问的这几种情形下域名仍然缺不得——没给就打印用法并以非 0 退出，**不会装一半**。域名之外的事——架构、发行版与包管理器、公网 IP、SELinux、时间同步、关键端口占用、域名解析核对、IPv6 出口、v3 迁移、防火墙——全部自动探测处理，装完打印一张「环境」表、一张自检 PASS/FAIL 表，以及面板地址、一次性管理员密码、第一个用户名与他那三条订阅地址（`/api/sub`、`/api/subscription`、`/api/clash`，末段是他的随机订阅 token，见[订阅链接与 token](#订阅链接与-token)）。
+没有终端可问（CI、`/dev/tty` 也开不了）时同样全用默认值；不问的这几种情形下域名仍然缺不得——没给就打印用法并以非 0 退出，**不会装一半**。域名之外的事——架构、发行版与包管理器、公网 IP、SELinux、时间同步、关键端口占用、域名解析核对、IPv6 出站策略、v3 迁移、防火墙——全部自动探测处理，装完打印一张「环境」表、一张自检 PASS/FAIL 表，以及面板地址、一次性管理员密码、第一个用户名与他那三条订阅地址（`/api/sub`、`/api/subscription`、`/api/clash`，末段是他的随机订阅 token，见[订阅链接与 token](#订阅链接与-token)）。
 
 全新服务器上首张证书要等 Caddy 签到，自检会先有界等待（最多 2 分钟）；到点还没签下来时，
 「单元 hysteria-server、单元 hysteria-residential、关键端口（10000/udp、40000/udp）、HY2 回环鉴权、HY2 住宅回环鉴权、住宅管理面端口」这几行报 `SKIP 待证书` 而**不算失败**

@@ -42,6 +42,12 @@
 //! 双 hook 是硬要求：只挂 `prerouting` 时，**本机发往自身公网 IP 的包不过 prerouting**，
 //! 跳跃对本机自测直接失效（spec §2.4，tizi PoC 实测；apernet 的规则同样是
 //! PREROUTING + OUTPUT 两条）。
+//!
+//! 2026-10-27 起这张表里还有一条主机级封禁链 [`EGRESS_CHAIN`]（filter / output）：
+//! 新建的 IPv6 出站一律 reject，只放行本机地址、链路本地/组播、已建立连接的回包与
+//! 入站连接需要的 ICMPv6 错误。目的是让升级下载、ACME、住宅探针、伪装反代与内核自身
+//! 都不再新建 IPv6 出站，同时保留 IPv6 **入站**。它随整表 `flush` + 重放，watchdog
+//! 每 60 秒用 [`egress_signature`] 校验（[`rule_count`] 仍只数 REDIRECT）。
 use crate::model::Ports;
 use crate::slots::MAX_SLOTS;
 
@@ -62,13 +68,88 @@ pub fn compat_range(p: &Ports) -> (u16, u16) {
     (p.hy2_resi + 1, p.hy2_resi + MAX_SLOTS - 1)
 }
 
-/// 表里应有的规则条数（自检与 watchdog 的判据与渲染同源）。
+/// 表里应有的 **REDIRECT** 规则条数（自检与 watchdog 的判据与渲染同源）。
+///
+/// 语义**不是**整表规则数：watchdog 拿它比跳转/兼容段（2 或 4），
+/// IPv6 出站封禁那六条由 [`EGRESS_RULES`] + [`egress_signature`] 单独校验。
 pub fn rule_count(compat: bool) -> usize {
     if compat {
         4
     } else {
         2
     }
+}
+
+/// 主机级 IPv6 出站封禁链（filter / output）的链名。
+pub const EGRESS_CHAIN: &str = "ipv6_egress";
+
+/// [`EGRESS_CHAIN`] 里的规则条数（自检与 watchdog 的判据与渲染同源）。
+pub const EGRESS_RULES: usize = 6;
+
+/// 规范化 [`EGRESS_CHAIN`] 的规则，用于比较「盘上那一份」与「期望的那一份」。
+///
+/// 不逐字比 `nft list` 的回显。真实回显（2026-10-27 netns 实测）会：
+/// - 把 `priority 0` 打成 `priority filter`；
+/// - 给每条规则插 `counter packets N bytes N`；
+/// - 在能由 `ip6` / `icmpv6` 隐含地址族时**省略** `meta nfproto ipv6` 前缀；
+/// - 把 `reject with icmpx type admin-prohibited` 打成 `reject with icmpx admin-prohibited`；
+/// - 某些版本把 `fib daddr type local` 打成 `fib daddr type == local`。
+///
+/// 这里按原顺序收集链内每条规则（跳过链头的 `type … hook …` 行），去掉上述可逆差异后返回；
+/// 链缺失、条数不符或任何语义差异都会让结果与期望不等，watchdog 据此重放。
+pub fn egress_signature(text: &str) -> Vec<String> {
+    let mut in_chain = false;
+    let mut out = Vec::new();
+    for line in text.lines().map(str::trim) {
+        if let Some(rest) = line.strip_prefix("chain ") {
+            in_chain = rest.trim_end_matches('{').trim() == EGRESS_CHAIN;
+            continue;
+        }
+        if !in_chain {
+            continue;
+        }
+        // 本链结束：后面的表级 `}` 或别的链不再属于这里
+        if line == "}" {
+            in_chain = false;
+            continue;
+        }
+        if line.is_empty() || line.starts_with("type ") {
+            continue;
+        }
+        let mut words = Vec::new();
+        let mut it = line.split_whitespace();
+        while let Some(w) = it.next() {
+            match w {
+                "counter" => {}
+                "packets" | "bytes" => {
+                    // `counter packets N bytes N`：数字是瞬时量，不参与比较
+                    let _ = it.next();
+                }
+                _ => words.push(w),
+            }
+        }
+        // 回显里可省略、期望里显式写着的地址族限定：去掉后两边同形
+        if words.starts_with(&["meta", "nfproto", "ipv6"]) {
+            words.drain(0..3);
+        }
+        // `fib daddr type == local` 与 `fib daddr type local` 同义
+        let mut i = 0;
+        while i + 1 < words.len() {
+            if words[i] == "type" && words[i + 1] == "==" {
+                words.remove(i + 1);
+            } else {
+                i += 1;
+            }
+        }
+        // `icmpx type admin-prohibited` 的回显不带 `type`
+        if let Some(i) = words.iter().position(|w| *w == "icmpx") {
+            if words.get(i + 1) == Some(&"type") {
+                words.remove(i + 1);
+            }
+        }
+        out.push(words.join(" "));
+    }
+    out
 }
 
 /// 整份规则集，可直接 `nft -f -`。
@@ -98,6 +179,22 @@ pub fn ruleset(p: &Ports, compat: bool) -> String {
         }
         out.push_str("  }\n");
     }
+    // 主机级 IPv6 出站封禁（2026-10-27）：新建的 IPv6 出站一律立即 reject（不是 drop），
+    // 让 Go / reqwest / Caddy 快速回落 IPv4。保住的四类：
+    // 本机地址（自连）、链路本地与组播（NDP / MLD）、已建立连接的回包（IPv6 入站仍可用）、
+    // 入站连接需要的 ICMPv6 错误。IPv4 完全不经这条链。
+    out.push_str(&format!("  chain {EGRESS_CHAIN} {{\n"));
+    out.push_str("    type filter hook output priority 0; policy accept;\n");
+    out.push_str("    meta nfproto ipv6 fib daddr type local counter accept\n");
+    out.push_str("    meta nfproto ipv6 ip6 daddr { fe80::/10, ff00::/8 } counter accept\n");
+    out.push_str("    meta nfproto ipv6 ct state established,related counter accept\n");
+    out.push_str(
+        "    meta nfproto ipv6 icmpv6 type { destination-unreachable, packet-too-big, \
+         time-exceeded, parameter-problem } counter accept\n",
+    );
+    out.push_str("    meta nfproto ipv6 meta l4proto tcp counter reject with tcp reset\n");
+    out.push_str("    meta nfproto ipv6 counter reject with icmpx type admin-prohibited\n");
+    out.push_str("  }\n");
     out.push_str("}\n");
     out
 }
@@ -132,6 +229,15 @@ table inet bui {
     udp dport 41000-50000 fib daddr type local counter redirect to :40000 comment \"hy2 residential hop (local)\"
     udp dport 40001-40007 fib daddr type local counter redirect to :40000 comment \"hy2 residential 4.0 compat (local)\"
   }
+  chain ipv6_egress {
+    type filter hook output priority 0; policy accept;
+    meta nfproto ipv6 fib daddr type local counter accept
+    meta nfproto ipv6 ip6 daddr { fe80::/10, ff00::/8 } counter accept
+    meta nfproto ipv6 ct state established,related counter accept
+    meta nfproto ipv6 icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem } counter accept
+    meta nfproto ipv6 meta l4proto tcp counter reject with tcp reset
+    meta nfproto ipv6 counter reject with icmpx type admin-prohibited
+  }
 }
 ";
         let got = ruleset(&ports(), true);
@@ -153,6 +259,96 @@ table inet bui {
         assert_eq!(got.matches("counter redirect").count(), 2);
         assert_eq!(rule_count(false), 2);
         assert_eq!(compat_range(&ports()), (40001, 40007));
+    }
+
+    /// 2026-10-27 sudo netns 实测的真实 `nft list table inet bui`（完整规则集落地后）。
+    ///
+    /// 与期望渲染值的差异全部必须被 [`egress_signature`] 吸收：priority 被打成 filter、
+    /// 每条规则带 counter 计数、`ip6`/`icmpv6` 规则省略 `meta nfproto ipv6` 前缀、
+    /// `icmpx type` 回显成 `icmpx`。
+    const REAL_LISTING: &str = "\
+table inet bui {
+\tchain prerouting {
+\t\ttype nat hook prerouting priority dstnat; policy accept;
+\t\tudp dport 41000-50000 fib daddr type local counter packets 2 bytes 86 redirect to :40000 comment \"hy2 residential hop\"
+\t\tudp dport 40001-40007 fib daddr type local counter packets 0 bytes 0 redirect to :40000 comment \"hy2 residential 4.0 compat\"
+\t}
+\tchain output {
+\t\ttype nat hook output priority dstnat; policy accept;
+\t\tudp dport 41000-50000 fib daddr type local counter packets 4 bytes 172 redirect to :40000 comment \"hy2 residential hop (local)\"
+\t\tudp dport 40001-40007 fib daddr type local counter packets 0 bytes 0 redirect to :40000 comment \"hy2 residential 4.0 compat (local)\"
+\t}
+\tchain ipv6_egress {
+\t\ttype filter hook output priority filter; policy accept;
+\t\tmeta nfproto ipv6 fib daddr type local counter packets 6 bytes 414 accept
+\t\tip6 daddr { fe80::/10, ff00::/8 } counter packets 0 bytes 0 accept
+\t\tmeta nfproto ipv6 ct state established,related counter packets 1 bytes 53 accept
+\t\ticmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem } counter packets 0 bytes 0 accept
+\t\tmeta nfproto ipv6 meta l4proto tcp counter packets 0 bytes 0 reject with tcp reset
+\t\tmeta nfproto ipv6 counter packets 2 bytes 106 reject with icmpx admin-prohibited
+\t}
+}
+";
+
+    /// 主理人 2026-10-27 在 root netns 里贴回的同一条链（零计数形态，逐字）。
+    const REAL_LISTING_ZERO: &str = "\
+table inet bui {
+\tchain ipv6_egress {
+\t\ttype filter hook output priority filter; policy accept;
+\t\tmeta nfproto ipv6 fib daddr type local counter packets 0 bytes 0 accept
+\t\tip6 daddr { fe80::/10, ff00::/8 } counter packets 0 bytes 0 accept
+\t\tmeta nfproto ipv6 ct state established,related counter packets 0 bytes 0 accept
+\t\ticmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem } counter packets 0 bytes 0 accept
+\t\tmeta nfproto ipv6 meta l4proto tcp counter packets 0 bytes 0 reject with tcp reset
+\t\tmeta nfproto ipv6 counter packets 0 bytes 0 reject with icmpx admin-prohibited
+\t}
+}
+";
+
+    /// IPv6 出站封禁链必须随整表落地，且 watchdog/selfcheck 能用规范化签名比较
+    /// 「盘上」与「期望」。基线上面的 `REAL_LISTING` 是 2026-10-27 sudo netns 实测原文。
+    #[test]
+    fn the_ipv6_egress_chain_matches_the_real_nft_list_output() {
+        let want = ruleset(&ports(), true);
+        let sig = egress_signature(&want);
+        assert_eq!(sig.len(), EGRESS_RULES);
+        assert_eq!(
+            egress_signature(REAL_LISTING),
+            sig,
+            "真实回显与期望必须同签名，否则 watchdog 每 60 秒误重放"
+        );
+        assert_eq!(
+            egress_signature(REAL_LISTING_ZERO),
+            sig,
+            "主理人贴回的零计数回显必须同签名"
+        );
+        assert_eq!(sig[0], "fib daddr type local accept");
+        assert_eq!(sig[1], "ip6 daddr { fe80::/10, ff00::/8 } accept");
+        assert_eq!(sig[2], "ct state established,related accept");
+        assert_eq!(
+            sig[3],
+            "icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem } accept"
+        );
+        assert_eq!(sig[4], "meta l4proto tcp reject with tcp reset");
+        assert_eq!(sig[5], "reject with icmpx admin-prohibited");
+        // 某些 nft 版本会显式打印 `==`；不能因此判成规则不符。
+        assert_eq!(
+            egress_signature(
+                &REAL_LISTING.replace("fib daddr type local", "fib daddr type == local")
+            ),
+            sig
+        );
+        // 改一条 reject 为 accept ⇒ 签名必须不等，watchdog 会重放
+        let tampered = REAL_LISTING_ZERO.replace("reject with icmpx admin-prohibited", "accept");
+        let tampered_sig = egress_signature(&tampered);
+        assert_eq!(tampered_sig.len(), EGRESS_RULES, "条数仍对，内容已变");
+        assert_ne!(tampered_sig, sig, "改一条 reject 必须让签名不等");
+        // 链缺失（旧表 / 被人删掉）⇒ 空签名 ⇒ watchdog 必须重放
+        assert!(
+            egress_signature(&ruleset(&ports(), false).replace(EGRESS_CHAIN, "renamed")).is_empty()
+        );
+        assert!(egress_signature(&REAL_LISTING_ZERO.replace(EGRESS_CHAIN, "renamed")).is_empty());
+        assert_eq!(rule_count(true), 4, "rule_count 仍只数 REDIRECT");
     }
 
     /// 端口改过的机器：规则跟着期望态走，函数里不许有第二份端口口径

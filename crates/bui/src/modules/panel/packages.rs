@@ -79,7 +79,7 @@ pub fn safe_host(h: &str) -> bool {
     {
         return false;
     }
-    // IPv6 字面量（`[::1]:443`）也一并拒掉：面板走域名，VPS 没有 IPv6 出口
+    // IPv6 字面量（`[::1]:443`）也一并拒掉：面板走域名，服务端出站一律 IPv4
     match port {
         None => true,
         Some(p) => {

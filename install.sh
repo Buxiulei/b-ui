@@ -129,8 +129,9 @@ fetch() {
     # shellcheck disable=SC2086
     for prefix in "" $MIRRORS; do
         print_info "下载 ${1##*/}${prefix:+（镜像 $prefix）}"
-        if [[ "$(pick_dl)" == "curl" ]] && curl -fsSL --connect-timeout 10 --max-time 600 --retry 2 -o "$2" "${prefix}$1"; then return 0; fi
-        if [[ "$(pick_dl)" == "wget" ]] && wget -q -T 10 --tries 3 -O "$2" "${prefix}$1"; then return 0; fi
+        # `-4`：服务端不新建 IPv6 出站（2026-10-27），装机下载也一样
+        if [[ "$(pick_dl)" == "curl" ]] && curl -4 -fsSL --connect-timeout 10 --max-time 600 --retry 2 -o "$2" "${prefix}$1"; then return 0; fi
+        if [[ "$(pick_dl)" == "wget" ]] && wget -4 -q -T 10 --tries 3 -O "$2" "${prefix}$1"; then return 0; fi
     done
     [[ "${3:-}" == "quiet" ]] || print_error "${1##*/} 下载失败：直连与全部镜像均不可达"
     return 1

@@ -889,31 +889,32 @@ mod tests {
     #[tokio::test]
     async fn direct_ip_policy_offline_requires_the_control_lease_and_persists_idempotently() {
         let (dir, paths) = scratch().await;
+        // 旧 state 里的双栈值：仍能反序列化，`ipv4-only` 是把它写回默认的唯一手段
+        let file = crate::paths::state_file(&paths);
+        let mut stored: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        stored["node"]["direct_ip_policy"] = serde_json::json!("dual_stack");
+        std::fs::write(&file, serde_json::to_vec(&stored).unwrap()).unwrap();
         let sock = dir.path().join("absent.sock");
         let before = disk_snapshot(&paths);
         let lease = crate::residential_lifecycle::ControlLease::acquire(&paths).unwrap();
         assert!(
-            run_direct_ip_policy_with("dual-stack", paths.clone(), sock.clone())
+            run_direct_ip_policy_with("ipv4-only", paths.clone(), sock.clone())
                 .await
                 .is_err()
         );
         assert_eq!(disk_snapshot(&paths), before);
         drop(lease);
-        run_direct_ip_policy_with("dual-stack", paths.clone(), sock.clone())
+        run_direct_ip_policy_with("ipv4-only", paths.clone(), sock.clone())
             .await
             .unwrap();
         let next = disk_snapshot(&paths);
-        let stored: serde_json::Value = serde_json::from_slice(&next.0).unwrap();
-        assert_eq!(stored["node"]["direct_ip_policy"], "dual_stack");
-        run_direct_ip_policy_with("dual-stack", paths.clone(), sock.clone())
-            .await
-            .unwrap();
-        assert_eq!(disk_snapshot(&paths), next, "重复设置不写盘、不备份");
+        let restored: serde_json::Value = serde_json::from_slice(&next.0).unwrap();
+        assert!(restored["node"].get("direct_ip_policy").is_none());
         run_direct_ip_policy_with("ipv4-only", paths.clone(), sock)
             .await
             .unwrap();
-        let restored: serde_json::Value = serde_json::from_slice(&disk_snapshot(&paths).0).unwrap();
-        assert!(restored["node"].get("direct_ip_policy").is_none());
+        assert_eq!(disk_snapshot(&paths), next, "重复设置不写盘、不备份");
     }
 
     #[tokio::test]
@@ -922,11 +923,14 @@ mod tests {
         let before = disk_snapshot(&paths);
         let lease = paths.base_dir.join(".residential-control.lock");
         assert!(!lease.exists());
-        assert!(
-            run_direct_ip_policy_with("auto", paths.clone(), dir.path().join("absent.sock"))
-                .await
-                .is_err()
-        );
+        for bad in ["auto", "dual-stack"] {
+            assert!(
+                run_direct_ip_policy_with(bad, paths.clone(), dir.path().join("absent.sock"))
+                    .await
+                    .is_err(),
+                "{bad}"
+            );
+        }
         assert_eq!(disk_snapshot(&paths), before);
         assert!(!lease.exists(), "校验必须在取lease之前");
     }
@@ -964,12 +968,12 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         assert!(client.available().await);
-        let result = run_direct_ip_policy_with("dual-stack", paths.clone(), sock).await;
+        let result = run_direct_ip_policy_with("ipv4-only", paths.clone(), sock).await;
         server.abort();
         result.unwrap();
         assert_eq!(
             *calls.lock().await,
-            vec![serde_json::json!({"value":"dual-stack"})]
+            vec![serde_json::json!({"value":"ipv4-only"})]
         );
         assert!(!paths.base_dir.exists());
     }

@@ -150,29 +150,35 @@ fn clash_declares_ipv6_takeover() {
                 "{ctx}"
             );
 
-            // 三条 IPv6 规则紧贴最终 MATCH 之前、既有直连/分流规则之后
+            // 四条 IPv6 接管规则必须在 GEOIP/GEOSITE 之前：`GEOIP,cn,DIRECT` 会先把
+            // 全局 IPv6 字面量判成直连，物理网卡就带着 v6 出去了。
             let rules: Vec<&str> = doc["rules"]
                 .as_sequence()
                 .unwrap()
                 .iter()
                 .map(|v| v.as_str().unwrap())
                 .collect();
-            let tail = &rules[rules.len() - 4..];
             assert_eq!(
-                tail[..3],
+                &rules[..4],
                 [
+                    "IP-CIDR6,::1/128,DIRECT,no-resolve",
                     "IP-CIDR6,fc00::/7,DIRECT,no-resolve",
                     "IP-CIDR6,fe80::/10,DIRECT,no-resolve",
                     "IP-CIDR6,::/0,REJECT,no-resolve",
                 ],
                 "{ctx}"
             );
-            assert!(tail[3].starts_with("MATCH,"), "{ctx} tail={tail:?}");
             assert!(
-                rules[..rules.len() - 4]
+                rules[..rules.len() - 1]
                     .iter()
-                    .all(|r| !r.starts_with("IP-CIDR6") && !r.starts_with("MATCH")),
+                    .skip(4)
+                    .all(|r| !r.starts_with("IP-CIDR6")),
                 "{ctx}"
+            );
+            assert!(rules.last().unwrap().starts_with("MATCH,"), "{ctx}");
+            assert_eq!(
+                rules[4], "GEOIP,private,DIRECT,no-resolve",
+                "{ctx}: IPv6 规则之后才是 GEOIP/GEOSITE"
             );
         }
     }

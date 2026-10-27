@@ -2611,15 +2611,15 @@ mod tests {
         host.with(|i| {
             // 前两个源不灵（真机形态：ipify 回空串），第三个才给出答案
             i.scripted.push((
-                format!("curl -sS --max-time 5 {}", crate::sys::IP_PROBE_URLS[0]),
+                format!("curl -sS -4 --max-time 5 {}", crate::sys::IP_PROBE_URLS[0]),
                 CmdOut::success(""),
             ));
             i.scripted.push((
-                format!("curl -sS --max-time 5 {}", crate::sys::IP_PROBE_URLS[1]),
+                format!("curl -sS -4 --max-time 5 {}", crate::sys::IP_PROBE_URLS[1]),
                 CmdOut::failure(7, "couldn't connect"),
             ));
             i.scripted.push((
-                format!("curl -sS --max-time 5 {}", crate::sys::IP_PROBE_URLS[2]),
+                format!("curl -sS -4 --max-time 5 {}", crate::sys::IP_PROBE_URLS[2]),
                 CmdOut::success("198.51.100.7\n"),
             ));
         });

@@ -85,7 +85,7 @@ impl std::fmt::Debug for ProbeTarget<'_> {
 /// - DNS 只有 `local-dns`（udp 223.5.5.5），出站的 `domain_resolver` 写死引用它；
 ///   `default_domain_resolver` 与 `strategy: ipv4_only` 同主配置：主配置把隧道内解析钉在 A 记录，
 ///   测速也钉同一口径。回退成默认策略会改查 AAAA，实测现象是整轮全判不通——这是
-///   「客户端到服务器怎么走」的问题，与服务端有没有 v6 **出站**（4.1.8 起可双栈）无关。
+///   「客户端到服务器怎么走」的问题。路由首条另外拒绝全局 IPv6 字面量（2026-10-27）。
 /// - 没有 tun、hijack-dns、sniff、rule_set、download_detour、cache_file；
 ///   `log.level = error`（sing-box 的日志可能带出服务器地址，调用方也不读）。
 /// - `targets` 为空时产出没有入站的配置，调用方不要这样调。
@@ -99,7 +99,9 @@ impl std::fmt::Debug for ProbeTarget<'_> {
 pub fn probe_config(targets: &[ProbeTarget<'_>]) -> Value {
     let mut inbounds = Vec::with_capacity(targets.len());
     let mut outbounds = Vec::with_capacity(targets.len() + 1);
-    let mut rules = Vec::with_capacity(targets.len());
+    // 首条与服务端出站策略同口径：全局 IPv6 字面量 reject，测速也不会物理直连 v6
+    let mut rules = Vec::with_capacity(targets.len() + 1);
+    rules.push(global_v6_reject());
     for (i, t) in targets.iter().enumerate() {
         let in_tag = format!("probe-in-{i}");
         let out_tag = format!("probe-{i}");
@@ -371,9 +373,28 @@ fn outbound(node: &Node, tag: &str) -> Value {
     }
 }
 
+/// 只拒绝**全局** IPv6 字面量，私网 v6（`::1` / `fc00::/7` / `fe80::/10`）继续落到
+/// 后面的 `ip_is_private → direct-out`。**不要写 `ip_is_private: false`**：
+/// sing-box 1.14.3 只在它为 true 时添加匹配项，false 等于没写，规则会退化成拒绝全部 v6。
+fn global_v6_reject() -> Value {
+    json!({
+        "type": "logical",
+        "mode": "and",
+        "rules": [
+            { "ip_version": 6 },
+            { "ip_is_private": true, "invert": true },
+        ],
+        "action": "reject",
+    })
+}
+
 /// 路由规则：顺序即优先级（移植 v3 TUN schema 8）。
+///
+/// 2026-10-27 起第一条是全局 IPv6 字面量 reject：直连例外（cloudflared / 7844 / 22 / 2222）
+/// 排在它后面，命中字面 v6 时不会被物理直连。
 fn route_rules(node: &Node, opts: &ClientOpts, tun: bool) -> Vec<Value> {
     let mut rules = vec![
+        global_v6_reject(),
         // cloudflared 的 QUIC tunnel 被 sniff 误判成 DNS，进程与端口两道例外
         json!({ "process_name": ["cloudflared"], "outbound": "direct-out" }),
         json!({ "network": "udp", "port": [7844], "outbound": "direct-out" }),
@@ -385,9 +406,8 @@ fn route_rules(node: &Node, opts: &ClientOpts, tun: bool) -> Vec<Value> {
     rules.push(json!({ "port": [22, 2222], "outbound": "direct-out" }));
     rules.push(json!({ "source_port": [22, 2222], "outbound": "direct-out" }));
     rules.push(json!({ "ip_is_private": true, "outbound": "direct-out" }));
-    // 只命中**裸 v6 目标**（域名由服务端按 `node.direct_ip_policy` 取舍 A/AAAA，不在这里拦）：
-    // 就地 reject 让应用立刻回退 IPv4，不必在隧道里等一次超时
-    rules.push(json!({ "ip_version": 6, "action": "reject" }));
+    // 全局 v6 已在首条 reject；这里不能再放一条裸 `ip_version: 6`（会把私网 v6 也拒掉）。
+    // 域名由服务端按 IPv4-only 取舍 A/AAAA，不在客户端预解析。
     // 住宅节点 + split 模式：关键字域名必须走住宅出口，优先于国内域名直连
     let residential = matches!(
         node.kind,

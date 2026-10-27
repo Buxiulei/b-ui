@@ -753,34 +753,43 @@ mod tests {
         });
         let cfg = front_config(&g, &slots(&g), &front(Bank::A)).unwrap();
         let r = cfg["route"]["rules"].as_array().unwrap();
+        // 2026-10-27：首条是全局 IPv6 字面量 reject
         assert_eq!(
             r[0],
+            json!({
+                "type":"logical","mode":"and",
+                "rules":[{"ip_version":6},{"ip_is_private":true,"invert":true}],
+                "action":"reject"
+            })
+        );
+        assert_eq!(
+            r[1],
             json!({"inbound":["slot-0","slot-1"],"action":"sniff"})
         );
-        assert_eq!(r[1]["domain_suffix"], json!(["public.example.test"]));
-        assert_eq!(r[2]["port"], json!([8443]));
+        assert_eq!(r[2]["domain_suffix"], json!(["public.example.test"]));
+        assert_eq!(r[3]["port"], json!([8443]));
         assert_eq!(
-            r[3],
+            r[4],
             json!({"inbound":["slot-0","slot-1"],"network":"udp","port":53,"outbound":"direct"})
         );
         assert_eq!(
-            r[4],
+            r[5],
             json!({"inbound":["slot-0","slot-1"],"network":"udp","port":443,"action":"reject"})
         );
         assert_eq!(
-            r[5],
+            r[6],
             json!({"inbound":["slot-0","slot-1"],"network":"udp","outbound":"direct"})
         );
-        assert!(r[6]["ip_cidr"]
+        assert!(r[7]["ip_cidr"]
             .as_array()
             .unwrap()
             .contains(&json!("127.0.0.0/8")));
         assert_eq!(
-            r[7],
+            r[8],
             json!({"inbound":["slot-0"],"domain_keyword":["example"],"outbound":"slot-0-pool"})
         );
         assert_eq!(
-            r[8],
+            r[9],
             json!({"inbound":["slot-1"],"domain_keyword":["example"],"outbound":"slot-1-pool"})
         );
         assert_eq!(cfg["route"]["final"], "direct");

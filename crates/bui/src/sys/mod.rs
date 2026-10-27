@@ -343,7 +343,9 @@ pub const IP_PROBE_URLS: [&str; 3] = [
 /// CLI 路径里调用。
 pub fn probe_public_ip(host: &dyn Host) -> String {
     for url in IP_PROBE_URLS {
-        let Ok(out) = host.run("curl", &["-sS", "--max-time", "5", url]) else {
+        // `-4`：服务端不再新建 IPv6 出站（2026-10-27），探测也一样；否则有 AAAA 的
+        // 探测源会让 curl 走 v6，和最终要写进 state 的 IPv4 地址不是同一条路径。
+        let Ok(out) = host.run("curl", &["-sS", "-4", "--max-time", "5", url]) else {
             continue;
         };
         if !out.ok() {
@@ -401,15 +403,15 @@ mod tests {
         h.with(|i| {
             // ① 连不上 ② 200 但回了个空串（真机形态）③ 才是真答案
             i.scripted.push((
-                format!("curl -sS --max-time 5 {}", IP_PROBE_URLS[0]),
+                format!("curl -sS -4 --max-time 5 {}", IP_PROBE_URLS[0]),
                 CmdOut::failure(7, "couldn't connect"),
             ));
             i.scripted.push((
-                format!("curl -sS --max-time 5 {}", IP_PROBE_URLS[1]),
+                format!("curl -sS -4 --max-time 5 {}", IP_PROBE_URLS[1]),
                 CmdOut::success("\n"),
             ));
             i.scripted.push((
-                format!("curl -sS --max-time 5 {}", IP_PROBE_URLS[2]),
+                format!("curl -sS -4 --max-time 5 {}", IP_PROBE_URLS[2]),
                 CmdOut::success("203.0.113.10\n"),
             ));
         });
@@ -418,7 +420,7 @@ mod tests {
             h.ops(),
             IP_PROBE_URLS
                 .iter()
-                .map(|u| format!("run:curl -sS --max-time 5 {u}"))
+                .map(|u| format!("run:curl -sS -4 --max-time 5 {u}"))
                 .collect::<Vec<_>>(),
             "三个源按顺序试"
         );
@@ -430,15 +432,15 @@ mod tests {
         h.with(|i| {
             // 运营商的劫持页 / IPv6 都不算 IPv4
             i.scripted.push((
-                format!("curl -sS --max-time 5 {}", IP_PROBE_URLS[0]),
+                format!("curl -sS -4 --max-time 5 {}", IP_PROBE_URLS[0]),
                 CmdOut::success("<html>error</html>"),
             ));
             i.scripted.push((
-                format!("curl -sS --max-time 5 {}", IP_PROBE_URLS[1]),
+                format!("curl -sS -4 --max-time 5 {}", IP_PROBE_URLS[1]),
                 CmdOut::success("2001:db8::1"),
             ));
             i.scripted.push((
-                format!("curl -sS --max-time 5 {}", IP_PROBE_URLS[2]),
+                format!("curl -sS -4 --max-time 5 {}", IP_PROBE_URLS[2]),
                 CmdOut::success("198.51.100.7"),
             ));
         });

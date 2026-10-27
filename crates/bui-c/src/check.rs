@@ -101,6 +101,9 @@ pub enum Failure {
     },
     TunMissing,
     TunNoDefaultRoute,
+    // 2026-10-27：主机仍有 IPv6 默认路由、且没有一条指向 bui-tun ⇒ IPv6 没被捕获。
+    // 只观察、只报告：不自动改路由，单独出现时也不授权重启（见 [`decide`]）。
+    TunNoDefaultRouteV6,
     /// 观察失败不能当成已确认的本地故障。
     LocalUnknown {
         component: &'static str,
@@ -118,6 +121,9 @@ impl std::fmt::Display for Failure {
             Failure::Probe { got: None } => write!(f, "探测 {target} 超时或连不上"),
             Failure::TunMissing => write!(f, "{TUN_IFACE} 接口不存在"),
             Failure::TunNoDefaultRoute => write!(f, "默认路由没有指向 {TUN_IFACE}"),
+            Failure::TunNoDefaultRouteV6 => {
+                write!(f, "IPv6 默认路由没有指向 {TUN_IFACE}")
+            }
             Failure::LocalUnknown { component } => write!(f, "{component} 状态未确认"),
         }
     }
@@ -239,6 +245,24 @@ pub fn capture_failures<S: Sys>(sys: &S, prof: &Profiles) -> Vec<Failure> {
                 component: "IPv4 路由",
             }),
         }
+        // IPv6 默认路由：存在就必须有一条指向 TUN（auto_route 装 `::/0` 的形态）。
+        // 只观察：查询失败不报（不是已确认的故障），也不自动改路由。
+        if let Ok(o) = sys.run("ip", &["-6", "route", "show", "table", "all"]) {
+            if o.ok() {
+                let is_default = |line: &str| {
+                    let words: Vec<_> = line.split_ascii_whitespace().collect();
+                    words.first() == Some(&"default")
+                };
+                let any_default = o.stdout.lines().any(is_default);
+                let captured = o.stdout.lines().filter(|l| is_default(l)).any(|line| {
+                    let words: Vec<_> = line.split_ascii_whitespace().collect();
+                    words.windows(2).any(|pair| pair == ["dev", TUN_IFACE])
+                });
+                if any_default && !captured {
+                    out.push(Failure::TunNoDefaultRouteV6);
+                }
+            }
+        }
     }
     out
 }
@@ -311,7 +335,8 @@ pub enum Decision {
     },
 }
 
-/// 纯函数：仅外部探针失败不授权重启；有本地故障时才按运行时记账检查退避窗口。
+/// 纯函数：仅外部探针失败不授权重启；仅 IPv6 默认路由观察也不授权重启；
+/// 有其它本地故障时才按运行时记账检查退避窗口。
 pub fn decide(rt: &Runtime, now: i64, failures: Vec<Failure>) -> Decision {
     if failures.is_empty() {
         return Decision::Healthy;
@@ -324,6 +349,15 @@ pub fn decide(rt: &Runtime, now: i64, failures: Vec<Failure>) -> Decision {
     }
     if failures.iter().all(|f| matches!(f, Failure::Probe { .. })) {
         return Decision::ExternalDegraded { failures };
+    }
+    // IPv6 默认路由没进 TUN 只是观察：重启通常修不好（`host_has_ipv6 = false` 时 TUN
+    // 根本没装 v6 地址），单独出现时不能变成退避重启循环。与其它本地故障同时出现
+    // （UnitDown / TunMissing / TunNoDefaultRoute / Probe 等）仍走下面的现有判定。
+    if failures
+        .iter()
+        .all(|f| matches!(f, Failure::TunNoDefaultRouteV6))
+    {
+        return Decision::Uncertain { failures };
     }
     if let Some(last) = rt.last_restart_at {
         let (elapsed, wait_s) = (now - last, wait_seconds(rt.fail_streak));
@@ -571,6 +605,46 @@ mod tests {
             Failure::TunNoDefaultRoute.to_string(),
             "默认路由没有指向 bui-tun"
         );
+        assert_eq!(
+            Failure::TunNoDefaultRouteV6.to_string(),
+            "IPv6 默认路由没有指向 bui-tun"
+        );
+    }
+
+    /// 2026-10-27：存在 IPv6 默认路由却没有一条指向 bui-tun ⇒ 报 TunNoDefaultRouteV6；
+    /// 已指向 bui-tun 或根本没有 v6 默认路由 ⇒ 不报。只观察，不发任何修复命令。
+    #[test]
+    fn a_leaking_ipv6_default_route_is_observed_but_never_repaired() {
+        let setup = |v6: &str| {
+            let s = FakeSys::new();
+            s.reply("ip -j link show", 0, "[{\"ifname\":\"bui-tun\"}]");
+            s.reply(
+                "ip -4 route show table all",
+                0,
+                "default dev bui-tun table 2022\n",
+            );
+            s.reply("ip -6 route show table all", 0, v6);
+            s
+        };
+        let leaking = setup("default via fe80::1 dev eth0 metric 1024\n");
+        assert_eq!(
+            capture_failures(&leaking, &profiles_tun()),
+            vec![Failure::TunNoDefaultRouteV6]
+        );
+        assert!(
+            !leaking
+                .calls()
+                .iter()
+                .any(|c| c.contains("route add") || c.contains("route del")),
+            "只观察，不改路由：{:?}",
+            leaking.calls()
+        );
+        for captured in ["default dev bui-tun table 2022\n", "local fe80::1 dev lo\n"] {
+            assert!(
+                capture_failures(&setup(captured), &profiles_tun()).is_empty(),
+                "{captured:?}"
+            );
+        }
     }
 
     #[test]
@@ -1004,6 +1078,47 @@ mod tests {
             decide(&Runtime::default(), 0, f()),
             Decision::Restart { failures: f() },
             "从没重启过：第一次失败立刻重启"
+        );
+    }
+
+    /// 2026-10-27：IPv6 默认路由没进 TUN 只观察。单独出现时不能触发重启
+    /// （`host_has_ipv6 = false` 时重启也装不上 v6 地址，会变成退避重启循环）；
+    /// 与其它本地故障或外部探针失败同时出现时，维持原有判定。
+    #[test]
+    fn a_lone_ipv6_route_observation_never_restarts() {
+        let lone = vec![Failure::TunNoDefaultRouteV6];
+        assert_eq!(
+            decide(&Runtime::default(), 0, lone.clone()),
+            Decision::Uncertain { failures: lone },
+            "只有 IPv6 路由观察 ⇒ 不重启"
+        );
+
+        // 与 UnitDown 一起：仍按退避判定（窗口内 Wait、窗口外 Restart）
+        let rt = Runtime {
+            fail_streak: 1,
+            last_restart_at: Some(1_000),
+            ..Runtime::default()
+        };
+        let both = vec![Failure::TunNoDefaultRouteV6, Failure::UnitDown];
+        assert_eq!(
+            decide(&rt, 1_030, both.clone()),
+            Decision::Wait {
+                failures: both.clone(),
+                remaining_s: 30
+            }
+        );
+        assert_eq!(
+            decide(&rt, 1_060, both.clone()),
+            Decision::Restart { failures: both }
+        );
+
+        // 与外部探针失败一起：也维持现有逻辑（不是全 Probe ⇒ 属本地恢复路径）
+        let with_probe = vec![Failure::TunNoDefaultRouteV6, Failure::Probe { got: None }];
+        assert_eq!(
+            decide(&Runtime::default(), 0, with_probe.clone()),
+            Decision::Restart {
+                failures: with_probe
+            }
         );
     }
 

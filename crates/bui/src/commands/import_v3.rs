@@ -1384,12 +1384,12 @@ blog.example.com {
         let host = std::sync::Arc::new(FakeHost::new());
         host.with(|i| {
             i.scripted.push((
-                format!("curl -sS --max-time 5 {}", crate::sys::IP_PROBE_URLS[0]),
+                format!("curl -sS -4 --max-time 5 {}", crate::sys::IP_PROBE_URLS[0]),
                 // 真机形态：HTTP 200 但回了个空串
                 CmdOut::success("\n"),
             ));
             i.scripted.push((
-                format!("curl -sS --max-time 5 {}", crate::sys::IP_PROBE_URLS[1]),
+                format!("curl -sS -4 --max-time 5 {}", crate::sys::IP_PROBE_URLS[1]),
                 CmdOut::success("198.51.100.7\n"),
             ));
         });

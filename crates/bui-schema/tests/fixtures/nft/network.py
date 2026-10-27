@@ -68,7 +68,9 @@ def request(peer, *args):
 
 
 def main():
-    rules = sys.stdin.read()
+    payload = json.loads(sys.stdin.read())
+    nat_rules = payload["nat"]
+    rules = payload["full"]
     peers = []
     run("ip", "link", "set", "lo", "up")
     try:
@@ -112,7 +114,7 @@ def main():
         for host in ("198.51.100.2", "2001:db8:2::2"):
             assert request(peers[0], "probe", host, 45000) == "peer2", ("baseline forwarded", host)
         # Reproduce the shipped bug first: external UDP is delivered to our HY2 listener.
-        old = rules.replace("fib daddr type local ", "")
+        old = nat_rules.replace("fib daddr type local ", "")
         run("nft", "-f", "-", input=old)
         for host in ("192.0.2.2", "2001:db8:1::2"):
             try:
@@ -121,8 +123,9 @@ def main():
                 got = "timeout"
             assert got == "local", ("old rule did not intercept", host, got)
 
-        run("nft", "-c", "-f", "-", input=rules)
-        run("nft", "-f", "-", input=rules)
+        # 基线只落 NAT 链：完整规则集里的 IPv6 出站封禁会拒掉这些探测。
+        run("nft", "-c", "-f", "-", input=nat_rules)
+        run("nft", "-f", "-", input=nat_rules)
         for port in (45000, 40001):
             for host in ("192.0.2.2", "2001:db8:1::2"):
                 assert probe(host, port) == "peer1", ("external", host, port)
@@ -132,7 +135,35 @@ def main():
                 assert request(peers[0], "probe", host, port) == "local", ("incoming", host, port)
             for host in ("198.51.100.2", "2001:db8:2::2"):
                 assert request(peers[0], "probe", host, port) == "peer2", ("forwarded", host, port)
-        print("PASS: reproduced old UDP interception; fixed IPv4/IPv6 external, forwarded, loopback, incoming hop and compat traffic")
+
+        # 完整规则集：IPv4 完全不受影响，新建 IPv6 出站被 reject，
+        # 但本机地址与 IPv6 入站连接的回包（ct established）仍放行。
+        run("nft", "-c", "-f", "-", input=rules)
+        run("nft", "-f", "-", input=rules)
+        for host in ("192.0.2.2", "127.0.0.1", "192.0.2.1"):
+            assert probe(host, 45000) == ("peer1" if host == "192.0.2.2" else "local"), (
+            "ipv4 unaffected", host)
+        assert request(peers[0], "probe", "192.0.2.1", 45000) == "local", "ipv4 incoming"
+        assert request(peers[0], "probe", "198.51.100.2", 45000) == "peer2", "ipv4 forwarded"
+        # 本机 IPv6 地址与回环仍可自连（fib daddr type local）
+        assert probe("::1", 45000) == "local", "ipv6 loopback"
+        assert probe("2001:db8:1::1", 45000) == "local", "ipv6 local address"
+        # IPv6 入站连接的回包：peer1 打本机 :45000，被 REDIRECT 到 :40000，回包是 established
+        assert request(peers[0], "probe", "2001:db8:1::1", 45000) == "local", "ipv6 inbound reply"
+        # 新建 IPv6 出站（打 peer1 自己的监听）：一律 reject，不会得到回包。
+        # reject with icmpx 会让本地 UDP 的 sendto 直接回 EPERM；有些内核形态是
+        # ConnectionRefused，另一些把包丢掉表现为 TimeoutError —— 三者都算 rejected。
+        for host in ("2001:db8:1::2", "2001:db8:2::2"):
+            try:
+                got = probe(host, 45000)
+            except OSError as e:
+                got = f"rejected:{type(e).__name__}"
+            assert got.startswith("rejected:"), (
+                "new ipv6 egress must be rejected", host, got)
+        if os.environ.get("BUI_NFT_DUMP"):
+            print("=== nft list table inet bui (full rules) ===")
+            print(run("nft", "list", "table", "inet", "bui").stdout, end="")
+        print("PASS: reproduced old UDP interception; fixed IPv4/IPv6 external, forwarded, loopback, incoming hop and compat traffic; full rules keep IPv4, reject new IPv6 egress, allow IPv6 inbound replies")
     finally:
         for peer in peers:
             peer.terminate()

@@ -2,11 +2,14 @@
 //!
 //! 字段逐条对齐 v3 `server/core.sh` 的 `xray-config.json` 模板。
 
-use crate::model::{DirectIpPolicy, NodeParams, Protocol, Residential, User};
+use crate::model::{NodeParams, Protocol, Residential, User};
 use crate::paths::Paths;
 use crate::slots;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+
+/// 字面 IPv6 的 blackhole 出站 tag。路由首条把 `::/0` 送到它，服务端绝不新建 IPv6 出站。
+pub const BLOCK_TAG: &str = "block";
 
 /// 住宅槽路由规则的 `ruleTag` 前缀：gRPC 侧按它认「这条规则是槽位模块的」。
 /// 改它等于把线上已经装载的旧规则变成认不出来的孤儿（收敛会把它们当多余项删掉，
@@ -56,15 +59,14 @@ const RESI_INBOUND_TAG: &str = "vless-residential";
 pub fn config(node: &NodeParams, users: &[User], resi: &Residential, _paths: &Paths) -> Value {
     let clients = clients(users);
 
-    // ForceIPv4v6 先解析 IPv4，无 A 时再用 IPv6；不是拨号失败回退或连接竞速。
+    // 服务端出站一律 IPv4（2026-10-27 裁决）：
+    // - `ForceIPv4` / `UseIPv4` 只管域名解析，字面 `[::1]` 仍会被 freedom 拨出去；
+    // - 所以路由首条把字面 IPv6（`::/0`）丢进 blackhole，`domainStrategy: AsIs`
+    //   保证路由阶段不解析域名（域名交给 freedom 按 ForceIPv4 取 A，AAAA-only 域名失败）。
     // 住宅仍把目标交给原 SOCKS relay，不改变供应商路径与出口身份。
-    let (domain_strategy, query_strategy) = match node.direct_ip_policy {
-        DirectIpPolicy::DualStack => ("ForceIPv4v6", "UseIP"),
-        DirectIpPolicy::Ipv4Only => ("ForceIPv4", "UseIPv4"),
-    };
-
     let mut outbounds = vec![
-        json!({"tag": "direct", "protocol": "freedom", "settings": {"domainStrategy": domain_strategy}}),
+        json!({"tag": "direct", "protocol": "freedom", "settings": {"domainStrategy": "ForceIPv4"}}),
+        json!({"tag": BLOCK_TAG, "protocol": "blackhole", "settings": {}}),
     ];
     for i in slots::indices(resi) {
         let res = slots::resources(i);
@@ -76,6 +78,9 @@ pub fn config(node: &NodeParams, users: &[User], resi: &Residential, _paths: &Pa
     }
 
     let mut rules = vec![
+        // 字面 IPv6 一律 blackhole（见上面 outbounds 的注释）。必须在所有入站规则之前：
+        // 不论流量来自直连还是住宅入站，都不允许从本机新建 IPv6 出站。
+        json!({"type": "field", "ip": ["::/0"], "outboundTag": BLOCK_TAG}),
         json!({"type": "field", "inboundTag": ["api"], "outboundTag": "api"}),
         json!({"type": "field", "inboundTag": ["vless-direct"], "outboundTag": "direct"}),
     ];
@@ -95,7 +100,7 @@ pub fn config(node: &NodeParams, users: &[User], resi: &Residential, _paths: &Pa
         },
         "dns": {
             "servers": ["https+local://1.1.1.1/dns-query", "8.8.8.8"],
-            "queryStrategy": query_strategy
+            "queryStrategy": "UseIPv4"
         },
         "inbounds": [
             {
@@ -109,7 +114,7 @@ pub fn config(node: &NodeParams, users: &[User], resi: &Residential, _paths: &Pa
             vless_inbound("vless-residential", node.ports.reality_resi, node, &clients),
         ],
         "outbounds": outbounds,
-        "routing": {"rules": rules}
+        "routing": {"domainStrategy": "AsIs", "rules": rules}
     })
 }
 
@@ -371,6 +376,23 @@ mod tests {
         );
     }
 
+    /// 服务端出站一律 IPv4（2026-10-27）：字面 `::/0` 在路由首条进 blackhole，
+    /// 且必须显式 `AsIs`（默认 `AsIs` 也好，但写死才不会被上游默认值带着走）。
+    #[test]
+    fn literal_ipv6_is_blackholed_before_every_other_route() {
+        let cfg = config(&node(), &[], &resi(1), &Paths::default_server());
+        assert_eq!(cfg["routing"]["domainStrategy"], "AsIs");
+        assert_eq!(
+            rules(&cfg)[0],
+            serde_json::json!({"type": "field", "ip": ["::/0"], "outboundTag": "block"})
+        );
+        assert!(cfg["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o["tag"] == "block" && o["protocol"] == "blackhole"));
+    }
+
     #[test]
     fn a_single_slot_routes_its_one_user_to_slot_zero() {
         let u = user(1, None);
@@ -386,10 +408,14 @@ mod tests {
             .iter()
             .map(|o| o["tag"].as_str().unwrap().to_string())
             .collect();
-        assert_eq!(tags, vec!["direct", "relay-slot-0"]);
-        assert_eq!(cfg["outbounds"][1]["settings"]["servers"][0]["port"], 2080);
+        assert_eq!(tags, vec!["direct", "block", "relay-slot-0"]);
+        assert_eq!(cfg["outbounds"][2]["settings"]["servers"][0]["port"], 2080);
         let r = rules(&cfg);
-        assert_eq!(r.len(), 4, "api / 直连 / 这个用户一条 / 住宅兜底");
+        assert_eq!(
+            r.len(),
+            5,
+            "IPv6 block / api / 直连 / 这个用户一条 / 住宅兜底"
+        );
         // 未分配的用户也有自己的一条规则，指向兜底槽（D7：一人一条，追加顺序才无所谓）
         assert_eq!(
             user_rules(&cfg),
@@ -429,6 +455,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 ("direct".to_string(), None),
+                ("block".to_string(), None),
                 ("relay-slot-0".to_string(), Some(2080)),
                 ("relay-slot-1".to_string(), Some(2081)),
                 ("relay-slot-2".to_string(), Some(2082)),
@@ -500,7 +527,7 @@ mod tests {
             &resi(2),
             &Paths::default_server(),
         );
-        assert_eq!(cfg["outbounds"].as_array().unwrap().len(), 3);
+        assert_eq!(cfg["outbounds"].as_array().unwrap().len(), 4);
         assert!(
             !rules(&cfg)
                 .iter()
@@ -526,7 +553,7 @@ mod tests {
             &Paths::default_server(),
         );
         assert!(user_rules(&cfg).is_empty());
-        assert_eq!(rules(&cfg).len(), 3, "只剩 api / 直连 / 兜底");
+        assert_eq!(rules(&cfg).len(), 4, "只剩 IPv6 block / api / 直连 / 兜底");
     }
 
     /// D7：加减用户、改用户槽位都**不**改结构哈希（否则 xray 每次加用户都重启，

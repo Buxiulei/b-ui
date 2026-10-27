@@ -4473,7 +4473,13 @@ mod tests {
             ],
             "{t}"
         );
-        for debug in ["UnitDown", "Probe", "TunMissing", "TunNoDefaultRoute"] {
+        for debug in [
+            "UnitDown",
+            "Probe",
+            "TunMissing",
+            "TunNoDefaultRoute",
+            "TunNoDefaultRouteV6",
+        ] {
             assert!(!t.contains(debug), "不打 Rust Debug 名 {debug}：{t}");
         }
     }
@@ -9867,7 +9873,7 @@ mod tests {
             "  下载       ✓ 1 MB 用时 0.9 秒，约 1.1 MB/s（良好）",
             "  IPv4 出口  ✓ 203.0.113.7",
             "             IDC 机房  风险分 22（ippure）",
-            "  IPv6       ○ IPv6 状态未确认（未获得有效地址）",
+            "  IPv6       ○ IPv6 出站已封禁或未确认",
             "  通过 6 项，跳过 1 项，用时 0 秒",
             "  上次：连接检查：运行状态未确认",
         ] {

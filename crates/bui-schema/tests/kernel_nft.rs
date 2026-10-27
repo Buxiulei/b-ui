@@ -12,7 +12,14 @@ fn port_hopping_preserves_external_udp_and_accepts_local_ipv4_and_ipv6() {
         "hy2_resi_hop":[41000,50000],"reality_direct":10001,"reality_resi":10002,"admin":8080}"#,
     )
     .unwrap();
-    let rules = bui_schema::render::nft::ruleset(&ports, true);
+    let full = bui_schema::render::nft::ruleset(&ports, true);
+    // 基线（重定向）必须先只落 NAT 部分：完整规则集里的 IPv6 出站封禁会把基线探测拒掉。
+    let nat = format!(
+        "{}}}",
+        full.split_once("  chain ipv6_egress {")
+            .expect("完整规则集必须带 IPv6 出站封禁链")
+            .0
+    );
     let script = format!(
         "{}/tests/fixtures/nft/network.py",
         env!("CARGO_MANIFEST_DIR")
@@ -24,11 +31,12 @@ fn port_hopping_preserves_external_udp_and_accepts_local_ipv4_and_ipv6() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("start isolated nft regression");
+    let payload = serde_json::json!({"nat": nat, "full": full}).to_string();
     child
         .stdin
         .take()
         .unwrap()
-        .write_all(rules.as_bytes())
+        .write_all(payload.as_bytes())
         .unwrap();
     let out = child.wait_with_output().unwrap();
     assert!(

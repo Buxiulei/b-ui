@@ -62,6 +62,33 @@ pub trait Net: Sync {
     fn download_via(&self, url: &str, via: Via, max_bytes: u64, cap: Duration) -> Result<Download>;
 }
 
+/// 只解析 A 记录的 `reqwest::dns::Resolve`（2026-10-27）：客户端自更新、订阅抓取与
+/// 直连探测都不物理新建 IPv6 出站。nft / TUN 策略只在服务端或 TUN 模式下生效，
+/// SOCKS 模式下 bui-c 自己的 HTTP 请求不受它们约束，所以必须在解析器这一层钉住。
+///
+/// 不引入新依赖、不起后台线程：客户端本身是 blocking，`ToSocketAddrs` 同步解析即可。
+struct Ipv4OnlyResolver;
+
+/// 同步解析 + 过滤 IPv6；没有 A 记录时返回空列表（reqwest 报没有可用地址），
+/// 绝不回落 AAAA。
+fn ipv4_addrs(host: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+    use std::net::ToSocketAddrs;
+    Ok((host, 0)
+        .to_socket_addrs()?
+        .filter(|a| a.is_ipv4())
+        .collect())
+}
+
+impl reqwest::dns::Resolve for Ipv4OnlyResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let result = ipv4_addrs(name.as_str());
+        Box::pin(std::future::ready(match result {
+            Ok(addrs) => Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs),
+            Err(e) => Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
+        }))
+    }
+}
+
 /// 生产实现。
 pub struct ReqwestNet;
 
@@ -71,7 +98,8 @@ impl ReqwestNet {
     fn builder(&self, via: Via, timeout: Duration) -> Result<reqwest::blocking::ClientBuilder> {
         let mut b = reqwest::blocking::Client::builder()
             .timeout(timeout)
-            .no_proxy();
+            .no_proxy()
+            .dns_resolver(std::sync::Arc::new(Ipv4OnlyResolver));
         if let Via::Socks5 { port } = via {
             let p = reqwest::Proxy::all(format!("socks5h://127.0.0.1:{port}")).map_err(|e| {
                 Error::Net {
@@ -310,6 +338,18 @@ fn connect_failure(chain: &str) -> ProbeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 2026-10-27：客户端抓取只解析 A 记录。`localhost` 通常同时有 127.0.0.1 与 ::1，
+    /// 过滤后必须只剩 IPv4。
+    #[test]
+    fn the_download_resolver_only_returns_a_records() {
+        let got = ipv4_addrs("localhost").unwrap();
+        assert!(
+            got.iter().any(|a| a.ip() == std::net::Ipv4Addr::LOCALHOST),
+            "{got:?}"
+        );
+        assert!(got.iter().all(|a| a.is_ipv4()), "{got:?}");
+    }
 
     #[test]
     fn request_errors_never_carry_the_full_url() {

@@ -59,9 +59,9 @@ fi
 # （2026-09-13 baiyi 真机：releases/latest 必然 404，每次都先蹦一行 `curl: (22) … 404`）。
 fetch_manifest() {
     if [ "${2:-}" = quiet ]; then
-        curl -fsL --max-time 30 "$1/manifest.json" -o "$MANIFEST"
+        curl -4 -fsL --max-time 30 "$1/manifest.json" -o "$MANIFEST"
     else
-        curl -fsSL --max-time 30 "$1/manifest.json" -o "$MANIFEST"
+        curl -4 -fsSL --max-time 30 "$1/manifest.json" -o "$MANIFEST"
     fi
 }
 
@@ -88,7 +88,7 @@ fi
 # ③ releases 列表里版本号最大的预发布（与服务端 install.sh 的 latest_v4_tag、bui-c 的 latest_rc_tag 同口径）
 if [ -z "$GOT" ]; then
     TAG=""
-    if curl -fsSL --max-time 30 "$RELEASES_API" -o "$TMP/releases.json"; then
+    if curl -4 -fsSL --max-time 30 "$RELEASES_API" -o "$TMP/releases.json"; then
         # prerelease=true 且形如 vX.Y.Z-rcN 的里按 (x, y, z, N) 数值取最大，任一段超出 u32
         # （4294967295）的跳过。**不看列表顺序**：这个列表不按创建时间倒序（2026-09-13 实测返回
         # rc9 → rc8 → rc7 → rc10 → rc6，最新的 rc10 排第 4，取第一个会装成 rc9）。
@@ -130,7 +130,7 @@ SHA="$(printf '%s' "$OBJ" | sed -n 's/.*"sha256":"\([0-9a-f]\{64\}\)".*/\1/p')"
 [ -n "$SHA" ] || { print_error "manifest 里没有 $ART 的 sha256"; exit 1; }
 
 print_info "下载 $ART（v$VERSION）"
-curl -fsSL --max-time 300 "$SOURCE/$ART" -o "$TMP/$ART" \
+curl -4 -fsSL --max-time 300 "$SOURCE/$ART" -o "$TMP/$ART" \
     || { print_error "$ART 下载失败"; exit 1; }
 
 GOT_SHA="$(sha256sum "$TMP/$ART" | cut -d' ' -f1)"

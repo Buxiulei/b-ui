@@ -37,15 +37,21 @@ pub struct NodeParams {
     pub reality: Reality,
     #[serde(default)]
     pub obfs: Obfs,
-    /// VPS 直连出站的地址族；显式启用双栈不授予客户端捕获或住宅出口能力。
+    /// VPS 直连出站的地址族策略。2026-10-27 起**只剩 IPv4**：这个字段保留只为旧
+    /// `state.json` 能原样读写，渲染器不再读它（见 [`DirectIpPolicy`]）。
     #[serde(default, skip_serializing_if = "DirectIpPolicy::is_ipv4_only")]
     pub direct_ip_policy: DirectIpPolicy,
 }
 
-/// 直连出口地址族策略。旧状态保留 IPv4，双栈需受管设置显式启用。
+/// 直连出口地址族策略。
+///
+/// 2026-10-27 裁决：IPv6 出站会泄露节点信息，服务端所有代理出站一律 IPv4。
+/// [`DirectIpPolicy::DualStack`] 只为旧 `state.json` 还能反序列化/序列化而保留，
+/// 渲染器不再读它；CLI 与控制 API 的 [`FromStr`](std::str::FromStr) 拒绝 `dual-stack`。
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DirectIpPolicy {
+    /// 旧状态里的双栈值：可读写，但渲染一律 IPv4，CLI/API 不再接受。
     DualStack,
     #[default]
     Ipv4Only,
@@ -70,9 +76,9 @@ impl std::str::FromStr for DirectIpPolicy {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
-            "dual-stack" => Ok(Self::DualStack),
+            "dual-stack" => Err("dual-stack 已停用：服务端出站一律 IPv4".into()),
             "ipv4-only" => Ok(Self::Ipv4Only),
-            _ => Err("直连出口策略只能是 dual-stack 或 ipv4-only".into()),
+            _ => Err("直连出口策略只能是 ipv4-only".into()),
         }
     }
 }

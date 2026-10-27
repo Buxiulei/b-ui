@@ -33,11 +33,13 @@ STUB
 # 其余 URL 回一份假 manifest。
 cat > "$WORK/bin/curl" <<'STUB'
 #!/usr/bin/env bash
+args="$*"
 out=""; url=""
 while [[ $# -gt 0 ]]; do
   case "$1" in -o) out="$2"; shift 2 ;; http*) url="$1"; shift ;; *) shift ;; esac
 done
 printf 'curl %s\n' "$url" >> "$DL_LOG"
+printf '%s\n' "$args" >> "$ARG_LOG"
 case "$url" in
   *releases/latest/download/*) exit 22 ;;
   *api.github.com/repos/*/releases*) cat "$FAKE_RELEASES" > "$out" ;;
@@ -47,11 +49,13 @@ STUB
 # wget stub：同样的分派，参数形状换成 -O
 cat > "$WORK/bin/wget" <<'STUB'
 #!/usr/bin/env bash
+args="$*"
 out=""; url=""
 while [[ $# -gt 0 ]]; do
   case "$1" in -O) out="$2"; shift 2 ;; http*) url="$1"; shift ;; *) shift ;; esac
 done
 printf 'wget %s\n' "$url" >> "$DL_LOG"
+printf '%s\n' "$args" >> "$ARG_LOG"
 case "$url" in
   *releases/latest/download/*) exit 8 ;;
   *) printf 'MANIFEST %s' "$url" > "$out" ;;
@@ -60,6 +64,7 @@ STUB
 chmod +x "$WORK/bin/uname" "$WORK/bin/curl" "$WORK/bin/wget"
 export PATH="$WORK/bin:$PATH"
 export DL_LOG="$WORK/dl.log"
+export ARG_LOG="$WORK/dl-args.log"
 export FAKE_RELEASES="$WORK/fixtures/releases.json"
 
 BUI_BOOTSTRAP_SOURCED=1
@@ -83,6 +88,8 @@ assert_eq "curl https://github.com/Buxiulei/b-ui/releases/latest/download/manife
 assert_eq "curl https://api.github.com/repos/Buxiulei/b-ui/releases?per_page=100" \
     "$(sed -n 2p "$DL_LOG")" "404 后才去问 releases 列表"
 assert_contains "回退到预发布 v4.0.0-rc2" "$(cat "$WORK/out.txt")" "回退有中文提示"
+# 2026-10-27：服务端不新建 IPv6 出站，下载器必须钉 -4
+assert_contains "-4" "$(cat "$ARG_LOG")" "curl 下载带 -4"
 # 404 不是「源不可达」：第一次尝试静默，别先甩一句误导性的「直连与全部镜像均不可达」
 assert_not_contains "直连与全部镜像均不可达" "$(cat "$WORK/out.txt")" \
     "releases/latest 404 时不报「均不可达」（源没坏，只是还没正式版）"
@@ -179,11 +186,13 @@ cp "$WORK/bin/wget" "$WORK/wgetonly/wget"
 assert_eq "wget" "$(PATH="$WORK/wgetonly" pick_dl)" "没有 curl 时选 wget"
 assert_eq "" "$(PATH="$WORK/fresh" pick_dl)" "两个都没有时输出空串（main 据此报错退出）"
 : > "$DL_LOG"
+: > "$ARG_LOG"
 (
     pick_dl() { printf 'wget\n'; }
     fetch "https://github.com/Buxiulei/b-ui/releases/download/v4.0.0-rc2/manifest.json" "$WORK/w.json"
 ) > /dev/null 2>&1
 assert_eq "0" "$?" "只有 wget 时下载照样成功"
+assert_contains "-4" "$(cat "$ARG_LOG")" "wget 下载带 -4"
 assert_eq "wget https://github.com/Buxiulei/b-ui/releases/download/v4.0.0-rc2/manifest.json" \
     "$(cat "$DL_LOG")" "走的是 wget 那条路径（curl 一次都没调）"
 assert_contains "MANIFEST" "$(cat "$WORK/w.json")" "wget 也把内容落地了"

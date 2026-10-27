@@ -497,10 +497,25 @@ fn nft_table_row(host: &dyn Host, state: &State) -> Check {
             ),
         );
     }
+    // 2026-10-27：IPv6 出站封禁链单独校验。redirect 全对但这条链缺了/被改了，
+    // 主机就会重新新建 IPv6 出站——只比 redirect 会让它静默消失。
+    let got_egress = nft::egress_signature(&listed);
+    if got_egress != nft::egress_signature(&want) {
+        return fail(
+            name,
+            format!(
+                "IPv6 出站封禁链 {} 缺失或规则不符（期望 {} 条，实到 {} 条）：执行 \
+                 `bui nft apply` 重放，`bui nft status` 看现状",
+                nft::EGRESS_CHAIN,
+                nft::EGRESS_RULES,
+                got_egress.len()
+            ),
+        );
+    }
     pass(
         name,
         format!(
-            "{} 条规则在位：{hop_a}-{hop_b}{} → :{}",
+            "{} 条规则在位：{hop_a}-{hop_b}{} → :{}；IPv6 出站封禁 {} 条在位",
             nft::rule_count(compat),
             if compat {
                 let (a, b) = nft::compat_range(&state.node.ports);
@@ -508,7 +523,8 @@ fn nft_table_row(host: &dyn Host, state: &State) -> Check {
             } else {
                 String::new()
             },
-            state.node.ports.hy2_resi
+            state.node.ports.hy2_resi,
+            got_egress.len()
         ),
     )
 }
@@ -1408,6 +1424,37 @@ mod tests {
                 r.detail
             );
         }
+    }
+
+    /// redirect 全对、只少了 IPv6 出站封禁链 ⇒ 也必须 FAIL（2026-10-27）：否则这台
+    /// 机器上的升级下载 / ACME / 住宅探针会重新从 IPv6 出网。
+    #[test]
+    fn a_missing_ipv6_egress_chain_fails_the_nft_row() {
+        let d = tempfile::tempdir().unwrap();
+        let p = paths(&d);
+        let state = crate::testutil::sample_state();
+        let listing = format!(
+            "{}}}",
+            nft_listing(&state)
+                .split_once("chain ipv6_egress")
+                .expect("nft_listing 来自完整规则集")
+                .0
+        );
+        let h = healthy(&p, &state);
+        h.with(|i| {
+            i.scripted.insert(
+                0,
+                ("nft list table inet bui".into(), CmdOut::success(&listing)),
+            );
+        });
+        let rows = no_wait(&h, &p, &state, &[]);
+        let r = rows.iter().find(|r| r.name == "nft 表 inet bui").unwrap();
+        assert_eq!(r.verdict, Verdict::Fail, "{}", r.detail);
+        assert!(
+            r.detail.contains("IPv6 出站封禁链") && r.detail.contains("实到 0 条"),
+            "{}",
+            r.detail
+        );
     }
 
     /// 住宅那两个回环面（Clash API 9092 / api 服务 10086）没在听 ⇒ FAIL：计量与门位

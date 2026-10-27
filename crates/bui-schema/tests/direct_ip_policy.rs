@@ -155,37 +155,49 @@ fn invalid_direct_ip_policy_is_rejected_in_state_and_standalone_node_json() {
     }
 }
 
+/// 2026-10-27：旧 state 里的 `dual_stack` 仍能读，但渲染器不再读它 —— HY2 恒 `mode: 4`。
 #[test]
-fn dual_stack_hysteria_changes_only_direct_mode_to_the_auto_string() {
+fn dual_stack_state_still_renders_hy2_ipv4_only() {
     let legacy = legacy_state_json();
     let ipv4 = state_with_policy(&legacy, "ipv4_only");
     let dual = state_with_policy(&legacy, "dual_stack");
     for auth in [Hy2Auth::Http, Hy2Auth::Command] {
-        let mut expected = direct_hy2(&ipv4.node, auth);
+        let expected = direct_hy2(&ipv4.node, auth);
         assert_eq!(
             expected["outbounds"][0]["direct"]["mode"],
             serde_yaml::Value::Number(4.into())
         );
-        expected["outbounds"][0]["direct"]["mode"] = serde_yaml::Value::String("auto".into());
         assert_eq!(
             direct_hy2(&dual.node, auth),
             expected,
-            "双栈只能把 HY2 direct.mode 从数字 4 改为字符串 auto"
+            "旧双栈 state 也只渲染 IPv4"
         );
     }
 }
 
+/// 旧 `dual_stack` state 的 Xray 与 `ipv4_only` 逐字节相同：出站恒 `ForceIPv4` / `UseIPv4`，
+/// 字面 IPv6 由首条 blackhole 规则挡住。
 #[test]
-fn dual_stack_xray_changes_only_direct_domain_strategy_and_dns_query_strategy() {
+fn dual_stack_state_renders_the_same_ipv4_xray_config() {
     let legacy = legacy_state_json();
     let ipv4 = state_with_policy(&legacy, "ipv4_only");
     let dual = state_with_policy(&legacy, "dual_stack");
-    let mut expected = xray_config(&ipv4);
+    let expected = xray_config(&ipv4);
     assert_eq!(
         direct_xray(&expected)["settings"]["domainStrategy"],
         "ForceIPv4"
     );
     assert_eq!(expected["dns"]["queryStrategy"], "UseIPv4");
+    assert_eq!(expected["routing"]["domainStrategy"], "AsIs");
+    assert_eq!(
+        expected["routing"]["rules"][0],
+        json!({"type": "field", "ip": ["::/0"], "outboundTag": "block"})
+    );
+    assert!(expected["outbounds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|o| o["tag"] == "block" && o["protocol"] == "blackhole"));
     assert!(
         expected["inbounds"]
             .as_array()
@@ -210,17 +222,27 @@ fn dual_stack_xray_changes_only_direct_domain_strategy_and_dns_query_strategy() 
                     .as_str()
                     .is_some_and(|tag| tag.starts_with("resi-u-"))
         }));
-    for outbound in expected["outbounds"].as_array_mut().unwrap() {
-        if outbound["tag"] == "direct" {
-            outbound["settings"]["domainStrategy"] = json!("ForceIPv4v6");
-        }
-    }
-    expected["dns"]["queryStrategy"] = json!("UseIP");
     assert_eq!(
         xray_config(&dual),
         expected,
-        "账户、住宅 SOCKS、路由、REALITY 与其他 Xray 字段必须完全不变"
+        "旧双栈 state 的账户、住宅 SOCKS、路由、REALITY 与其他 Xray 字段必须完全不变"
     );
+}
+
+/// CLI 与控制 API 共用的解析器：`dual-stack` 明确拒绝，`ipv4-only` 仍可写回默认。
+#[test]
+fn from_str_rejects_dual_stack_but_still_accepts_ipv4_only() {
+    use bui_schema::model::DirectIpPolicy;
+    use std::str::FromStr;
+    assert_eq!(
+        DirectIpPolicy::from_str("ipv4-only").unwrap(),
+        DirectIpPolicy::Ipv4Only
+    );
+    let err = DirectIpPolicy::from_str("dual-stack").unwrap_err();
+    assert!(err.contains("dual-stack 已停用"), "{err}");
+    assert!(err.contains("IPv4"), "{err}");
+    // 落盘名称仍是 snake_case；`as_str` 只服务 API 回显
+    assert_eq!(DirectIpPolicy::DualStack.as_str(), "dual-stack");
 }
 
 fn relay_config(state: &State) -> Value {

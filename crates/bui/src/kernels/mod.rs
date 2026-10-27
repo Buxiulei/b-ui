@@ -251,6 +251,34 @@ fn body_error(url: &str, e: std::io::Error) -> anyhow::Error {
     ))
 }
 
+/// 只解析 A 记录的 `reqwest::dns::Resolve`：安装/升级下载也不新建 IPv6 出站
+/// （2026-10-27）。nft 的 `ipv6_egress` 链在 install 期间可能还没落地，而
+/// curl `-4` / `wget -4` 只管 `install.sh`，`bui` 自己的 reqwest 下载必须自己钉住。
+///
+/// 不引入新依赖、不起后台线程：`reqwest::blocking` 的解析器假定 `resolve` 立即可用，
+/// 这里的 `ToSocketAddrs` 是同步阻塞调用（调用方本来就在 `spawn_blocking` / 同步 CLI）。
+struct Ipv4OnlyResolver;
+
+/// 同步解析 + 过滤 IPv6。没有 A 记录时返回空列表，由 reqwest 报「没有可用地址」，
+/// 绝不回落 AAAA。
+fn ipv4_addrs(host: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+    use std::net::ToSocketAddrs;
+    Ok((host, 0)
+        .to_socket_addrs()?
+        .filter(|a| a.is_ipv4())
+        .collect())
+}
+
+impl reqwest::dns::Resolve for Ipv4OnlyResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let result = ipv4_addrs(name.as_str());
+        Box::pin(std::future::ready(match result {
+            Ok(addrs) => Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs),
+            Err(e) => Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
+        }))
+    }
+}
+
 pub struct HttpFetcher {
     client: std::sync::OnceLock<reqwest::blocking::Client>,
     /// 整个响应体的总预算与字节上限，默认 [`DOWNLOAD_BUDGET`] / [`DOWNLOAD_MAX_BYTES`]；
@@ -301,6 +329,7 @@ impl HttpFetcher {
             reqwest::blocking::Client::builder()
                 .timeout(std::time::Duration::from_secs(300))
                 .user_agent(concat!("b-ui/", env!("CARGO_PKG_VERSION")))
+                .dns_resolver(std::sync::Arc::new(Ipv4OnlyResolver))
                 .build()
                 .expect("rustls 客户端构建失败")
         });
@@ -871,6 +900,18 @@ mod tests {
     const XRAY: &str = "Xray 26.3.27 (Xray, Penetrates Everything.) d2758a0 (go1.26.1 linux/amd64)\nA unified platform for anti-censorship.\n";
     const HYSTERIA: &str = "\n░█░█\n\na powerful, lightning fast and censorship resistant proxy\n\nVersion:\tv2.12.2\nBuildDate:\t2026-08-23T00:39:00Z\nBuildType:\trelease\n";
     const CADDY: &str = "v2.10.2 h1:g/gTYjGMD0dec+UgMw8SnfmJ3I9+M2TdvoRL/Ovu6U8=\n";
+
+    /// 2026-10-27：安装/升级下载的解析器只返回 A 记录。`localhost` 通常同时有
+    /// 127.0.0.1 与 ::1，过滤后必须只剩 IPv4。
+    #[test]
+    fn the_download_resolver_only_returns_a_records() {
+        let got = ipv4_addrs("localhost").unwrap();
+        assert!(
+            got.iter().any(|a| a.ip() == std::net::Ipv4Addr::LOCALHOST),
+            "{got:?}"
+        );
+        assert!(got.iter().all(|a| a.is_ipv4()), "{got:?}");
+    }
 
     #[test]
     fn parses_all_four_real_version_outputs() {

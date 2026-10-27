@@ -1,5 +1,5 @@
-//! `bui nft apply|status|delete`：住宅 HY2 端口跳跃那张 `inet bui` 表的三个运维入口
-//! （4.1，spec §2.4）。
+//! `bui nft apply|status|delete`：住宅 HY2 端口跳跃与主机 IPv6 出站封禁共用的
+//! `inet bui` 表的三个运维入口（4.1 / 4.1.11）。
 //!
 //! 规则集只有 [`bui_schema::render::nft::ruleset`] 一处实现，这里只负责把它喂给 `nft`。
 //!
@@ -57,9 +57,10 @@ pub fn apply(host: &dyn Host, paths: &Paths) -> Result<String> {
         String::new()
     };
     Ok(format!(
-        "已落地 table {}（{} 条规则）：{hop_a}-{hop_b}{compat} → :{}",
+        "已落地 table {}（{} 条规则；IPv6 出站封禁 {} 条在位）：{hop_a}-{hop_b}{compat} → :{}",
         nft::TABLE,
         nft::rule_count(s.system.hy2_resi_compat_ports),
+        nft::EGRESS_RULES,
         s.node.ports.hy2_resi
     ))
 }
@@ -85,7 +86,8 @@ pub fn status(host: &dyn Host, paths: &Paths) -> Result<String> {
         .context("nft list table 无法执行")?;
     if !out.ok() {
         return Ok(format!(
-            "table {} 不存在（住宅 HY2 的端口跳跃整段不通）：执行 `bui nft apply` 或等下一轮对账重放",
+            "table {} 不存在（住宅 HY2 的端口跳跃整段不通，IPv6 出站封禁链也不在）：\
+             执行 `bui nft apply` 或等下一轮对账重放",
             nft::TABLE
         ));
     }
@@ -99,6 +101,22 @@ pub fn status(host: &dyn Host, paths: &Paths) -> Result<String> {
             lines.push(format!("  {line}"));
         }
     }
+    let want = nft::ruleset(&s.node.ports, s.system.hy2_resi_compat_ports);
+    let live_egress = nft::egress_signature(&out.stdout);
+    lines.push(if live_egress == nft::egress_signature(&want) {
+        format!(
+            "IPv6 出站封禁链 {} 在位（{} 条规则）",
+            nft::EGRESS_CHAIN,
+            live_egress.len()
+        )
+    } else {
+        format!(
+            "IPv6 出站封禁链 {} 缺失或规则不符（期望 {} 条，实到 {}）：执行 `bui nft apply` 重放",
+            nft::EGRESS_CHAIN,
+            nft::EGRESS_RULES,
+            live_egress.len()
+        )
+    });
     lines.push(
         "（counter 是瞬时流计数：每次重放都从 0 开始，兼容段的下线判据看 `bui status` 里的累计值）"
             .into(),
@@ -221,6 +239,7 @@ mod tests {
         assert!(msg.contains("41000-50000"), "{msg}");
         assert!(msg.contains("40001-40007"), "{msg}");
         assert!(msg.contains("4 条规则"), "{msg}");
+        assert!(msg.contains("IPv6 出站封禁 6 条在位"), "{msg}");
     }
 
     /// 预检不过就**显式失败**，一次 `nft -f` 都不发；错误里要有内核下限与可操作的下一步。
@@ -304,7 +323,7 @@ mod tests {
             i.scripted.push((
                 "nft list table inet bui".into(),
                 CmdOut::success(
-                    "table inet bui {\n\tchain prerouting {\n\t\ttype nat hook prerouting priority dstnat; policy accept;\n\t\tudp dport 41000-50000 counter packets 12 bytes 480 redirect to :40000 comment \"hy2 residential hop\"\n\t\tudp dport 40001-40007 counter packets 0 bytes 0 redirect to :40000 comment \"hy2 residential 4.0 compat\"\n\t}\n}\n",
+                    "table inet bui {\n\tchain prerouting {\n\t\ttype nat hook prerouting priority dstnat; policy accept;\n\t\tudp dport 41000-50000 counter packets 12 bytes 480 redirect to :40000 comment \"hy2 residential hop\"\n\t\tudp dport 40001-40007 counter packets 0 bytes 0 redirect to :40000 comment \"hy2 residential 4.0 compat\"\n\t}\n\tchain ipv6_egress {\n\t\ttype filter hook output priority filter; policy accept;\n\t\tmeta nfproto ipv6 fib daddr type local counter packets 0 bytes 0 accept\n\t\tmeta nfproto ipv6 ip6 daddr { fe80::/10, ff00::/8 } counter packets 0 bytes 0 accept\n\t\tmeta nfproto ipv6 ct state established,related counter packets 12 bytes 960 accept\n\t\tmeta nfproto ipv6 icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem } counter packets 0 bytes 0 accept\n\t\tmeta nfproto ipv6 meta l4proto tcp counter packets 2 bytes 120 reject with tcp reset\n\t\tmeta nfproto ipv6 counter packets 3 bytes 180 reject with icmpx type admin-prohibited\n\t}\n}\n",
                 ),
             ));
         });
@@ -315,6 +334,25 @@ mod tests {
             msg.contains("瞬时流计数"),
             "counter 不是兼容段的下线判据，必须说清：{msg}"
         );
+        assert!(msg.contains("IPv6 出站封禁链 ipv6_egress 在位"), "{msg}");
+    }
+
+    /// 盘上还是旧表（只有 NAT 链）⇒ status 必须报出封禁链缺失。
+    #[test]
+    fn status_reports_a_missing_ipv6_egress_chain() {
+        let (_d, paths, h) = seeded();
+        h.with(|i| {
+            i.scripted.push((
+                "nft list table inet bui".into(),
+                CmdOut::success(
+                    "table inet bui {\n\tchain prerouting {\n\t\ttype nat hook prerouting priority dstnat; policy accept;\n\t\tudp dport 41000-50000 fib daddr type local counter packets 12 bytes 480 redirect to :40000 comment \"hy2 residential hop\"\n\t}\n}\n",
+                ),
+            ));
+        });
+        let msg = status(&h, &paths).unwrap();
+        assert!(msg.contains("IPv6 出站封禁链"), "{msg}");
+        assert!(msg.contains("缺失或规则不符"), "{msg}");
+        assert!(msg.contains("实到 0"), "{msg}");
     }
 
     /// 回滚路径要用它：表不存在只记一行，不算失败（spec §9.1）。

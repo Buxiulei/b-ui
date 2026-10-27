@@ -1,7 +1,7 @@
 //! 装机前的环境探测（2026-09-12 裁决「安装：一行命令与零手工配置」）。
 //!
 //! 主理人的要求是「安装我需要能自动检测环境，完成所有的配置安装」：除面板域名外一个问题都不问，
-//! 所以凡是过去靠人肉确认的事实（发行版、SELinux、时间同步、端口占用、域名解析、IPv6 出口）
+//! 所以凡是过去靠人肉确认的事实（发行版、SELinux、时间同步、端口占用、域名解析、IPv6 出站策略）
 //! 都要在这里自己探出来，打成一张表给运维看。
 //!
 //! 全部经 [`Host`] 原语，于是 [`crate::sys::fake::FakeHost`] 里可编程、单元测试既不 `systemctl`
@@ -130,7 +130,6 @@ pub struct EnvReport {
     pub selinux: String,
     /// `已同步` / `未同步` / `未知`。
     pub time_sync: String,
-    pub ipv6_egress: bool,
     /// `getent ahosts <域名>` 解析出的地址（去重，保序）。
     pub domain_ips: Vec<String>,
     /// 被非本栈进程占着的关键端口。
@@ -366,11 +365,8 @@ pub fn probe(
         "未知".into()
     };
 
-    // IPv6 出口：没有也没关系（服务端出站一律钉死 IPv4），但客户端 IPv6 接管的判据要记一笔
-    r.ipv6_egress = host
-        .run("ip", &["-6", "route", "show", "default"])
-        .map(|o| o.ok() && !o.stdout.trim().is_empty())
-        .unwrap_or(false);
+    // IPv6 出站不探测：2026-10-27 起服务端出站一律 IPv4，`table inet bui` 的
+    // `ipv6_egress` 链封死主机新 IPv6 出站。有默认 v6 路由不等于能出站，不能拿它冒充。
 
     // 域名解析核对：不一致只警告（DNS 还没生效、或走 Cloudflare 代理都属正常）
     if !domain.is_empty() {
@@ -465,12 +461,8 @@ pub fn table(r: &EnvReport, ports: &Ports) -> String {
     ));
     out.push(row("时间同步", &r.time_sync));
     out.push(row(
-        "IPv6 出口",
-        if r.ipv6_egress {
-            "有"
-        } else {
-            "无（服务端出站一律钉死 IPv4）"
-        },
+        "IPv6 出站",
+        "已封禁（b-ui nft 策略：服务端出站一律 IPv4，IPv6-only 目标不可达）",
     ));
     out.push(row(
         "域名解析",
@@ -891,10 +883,6 @@ nonsense
                 CmdOut::success("NTPSynchronized=yes\n"),
             ));
             i.scripted.push((
-                "ip -6 route show default".into(),
-                CmdOut::success("default via 2001:db8::1 dev eth0\n"),
-            ));
-            i.scripted.push((
                 "getent ahosts panel.example.com".into(),
                 CmdOut::success("203.0.113.10 STREAM panel.example.com\n"),
             ));
@@ -907,7 +895,7 @@ nonsense
             Path::new("/opt/b-ui/bin"),
             false,
         );
-        assert!(r.systemd && r.ipv6_egress);
+        assert!(r.systemd);
         let t = table(&r, &ports());
         for want in [
             "环境",
@@ -916,6 +904,8 @@ nonsense
             "在位",
             "未启用",
             "已同步",
+            "IPv6 出站",
+            "已封禁",
             "203.0.113.10",
             "80/443/10001/10002/10000/40000 均空闲",
         ] {

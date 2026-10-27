@@ -175,7 +175,22 @@ pub fn config(g: &ResidentialGroup, slots: &[Slot], opts: &RelayOpts) -> Value {
     } else {
         view.iter().map(|s| inbound_tag(s.index)).collect()
     };
-    let mut route_rules = vec![json!({ "inbound": slot_inbounds, "action": "sniff" })];
+    // 服务端出站一律 IPv4（2026-10-27）：全局 IPv6 字面量在嗅探前就 reject。
+    // 用 logical + invert 而不是裸 `ip_version: 6`，让 `::1` / `fc00::/7` / `fe80::/10`
+    // 继续落到下面的私网直连规则（保持原行为）。**不要写 `ip_is_private: false`**：
+    // sing-box 1.14.3 只在它为 true 时添加匹配项，false 等于没写，会退化成拒绝全部 v6。
+    // 域名不在路由阶段解析：出站没写 `domain_strategy`，由 `dns.strategy: ipv4_only` +
+    // `default_domain_resolver: dns_direct` 让直连出站的域名只取 A。
+    let mut route_rules = vec![json!({
+        "type": "logical",
+        "mode": "and",
+        "rules": [
+            { "ip_version": 6 },
+            { "ip_is_private": true, "invert": true }
+        ],
+        "action": "reject"
+    })];
+    route_rules.push(json!({ "inbound": slot_inbounds, "action": "sniff" }));
     if let Some(mut r) = bl.domain_rule("outbound", "direct") {
         r["inbound"] = json!(slot_inbounds);
         route_rules.push(r);
@@ -583,7 +598,7 @@ mod tests {
             ("/outbounds/0/server_port", json!(2280)),
             ("/outbounds/2/password", json!("rotated-placeholder")),
             ("/inbounds/0/listen_port", json!(2088)),
-            ("/route/rules/0/action", json!("reject")),
+            ("/route/rules/0/mode", json!("or")),
             ("/dns/servers/0/server", json!("9.9.9.9")),
             ("/dns/servers/0/detour", json!("direct")),
         ] {
@@ -757,6 +772,18 @@ mod tests {
         assert_eq!(
             cfg["route"]["rules"][0],
             json!({
+                "type": "logical", "mode": "and",
+                "rules": [
+                    { "ip_version": 6 },
+                    { "ip_is_private": true, "invert": true },
+                ],
+                "action": "reject"
+            }),
+            "首条是全局 IPv6 字面量 reject"
+        );
+        assert_eq!(
+            cfg["route"]["rules"][1],
+            json!({
                 "action": "sniff", "inbound": ["slot-0", "slot-1", "slot-2"]
             })
         );
@@ -764,7 +791,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .skip(1)
+            .skip(2)
             .filter(|r| r["action"] == "sniff")
             .collect();
         assert_eq!(inner.len(), 1, "只有带域名 auto 的出口需要第二次嗅探");

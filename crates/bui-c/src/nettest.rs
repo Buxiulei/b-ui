@@ -814,9 +814,11 @@ impl<S: Sys, N: Net> Runner<'_, '_, S, N> {
         self.begin(Item::V6.name());
         let mut addr = None;
         let mut failures = Vec::new();
+        // 2026-10-27：不再用 `Via::Direct` 物理直连。SOCKS 模式经本地代理、TUN 模式受
+        // 路由捕获；观测到地址只说明「当前代理路径的出口能到 IPv6」，不证明本地泄漏。
         for url in [IPIFY6_URL, ICANHAZIP6_URL] {
             let source = url.trim_start_matches("https://");
-            match self.net.text_via(url, Via::Direct, V6_TIMEOUT) {
+            match self.net.text_via(url, self.via, V6_TIMEOUT) {
                 Ok(body) if valid_v6(body.trim()) => {
                     addr = Some(body.trim().to_string());
                     break;
@@ -835,7 +837,7 @@ impl<S: Sys, N: Net> Runner<'_, '_, S, N> {
             .as_deref()
             .and_then(|a| {
                 self.net
-                    .text_via(&ipapi_url_for(a), Via::Direct, IPAPI_TIMEOUT)
+                    .text_via(&ipapi_url_for(a), self.via, IPAPI_TIMEOUT)
                     .ok()
             })
             .and_then(|b| parse_ipapi(&b))
@@ -844,8 +846,8 @@ impl<S: Sys, N: Net> Runner<'_, '_, S, N> {
         self.line(
             Mark::Info,
             match addr {
-                Some(a) => format!("观测到 IPv6 出口 {a}，路径未确认"),
-                None => "IPv6 状态未确认（未获得有效地址）".into(),
+                Some(a) => format!("观测到 IPv6 出口 {a}：经当前代理路径，未确认"),
+                None => "IPv6 出站已封禁或未确认".into(),
             },
         );
         self.score(Item::V6, None);
@@ -1680,7 +1682,7 @@ mod tests {
                 "✓ 32ms",
                 "✓ 1 MB 用时 0.9 秒，约 1.1 MB/s（良好）",
                 "✓ 203.0.113.7",
-                "○ IPv6 状态未确认（未获得有效地址）",
+                "○ IPv6 出站已封禁或未确认",
             ],
             "11 行，每行一个结果"
         );
@@ -1740,13 +1742,13 @@ mod tests {
         );
         let lines = rec.lines();
         assert_eq!(lines[6], "✓ 本机解析正常 12ms");
-        assert_eq!(lines[10], "○ IPv6 状态未确认（未获得有效地址）");
+        assert_eq!(lines[10], "○ IPv6 出站已封禁或未确认");
         assert_eq!(
             (sum.passed, sum.failed),
             (5, 0),
             "SOCKS 计 5 项，IPv6 只作提示"
         );
-        // 走哪条腿：代理项经本地入站（socks5h），百度与 IPv6 永远直连
+        // 走哪条腿：代理项经本地入站（socks5h），百度和 IPv6 检测站也经代理（2026-10-27 起 IPv6 观测不再物理直连）
         let log = n.log();
         for url in [
             PROBE_URL,
@@ -1761,9 +1763,14 @@ mod tests {
                 "{url}: {log:?}"
             );
         }
-        for url in [BAIDU_URL, IPIFY6_URL, ICANHAZIP6_URL] {
+        assert!(
+            log.contains(&format!("GET {BAIDU_URL} via Direct")),
+            "百度直连不经代理：{log:?}"
+        );
+        // 2026-10-27：IPv6 观测不再用 Via::Direct 物理直连，SOCKS 模式经本地代理
+        for url in [IPIFY6_URL, ICANHAZIP6_URL] {
             assert!(
-                log.contains(&format!("GET {url} via Direct")),
+                log.contains(&format!("GET {url} via socks5:1080")),
                 "{url}: {log:?}"
             );
         }
@@ -1905,10 +1912,7 @@ mod tests {
         sample::healthy(&s, &n, Mode::Tun);
         let mut rec = Recorder::default();
         let sum = check(&s, &n, &profiles_tun(), &mut rec);
-        assert_eq!(
-            rec.lines().last().unwrap(),
-            "○ IPv6 状态未确认（未获得有效地址）"
-        );
+        assert_eq!(rec.lines().last().unwrap(), "○ IPv6 出站已封禁或未确认");
         assert_eq!(sum.failed, 0);
 
         // 拿到地址也不证明捕获路径；归属仅作为出口观测的补充信息。
@@ -1918,7 +1922,7 @@ mod tests {
         let sum = check(&s, &n, &profiles_tun(), &mut rec);
         assert_eq!(
             rec.lines().last().unwrap(),
-            "○ 观测到 IPv6 出口 2001:db8::1，路径未确认"
+            "○ 观测到 IPv6 出口 2001:db8::1：经当前代理路径，未确认"
         );
         assert_eq!(
             rec.conts().last().unwrap(),
@@ -1947,7 +1951,7 @@ mod tests {
         check(&s, &n, &profiles_tun(), &mut rec);
         assert_eq!(
             rec.lines().last().unwrap(),
-            "○ 观测到 IPv6 出口 2001:db8::2，路径未确认"
+            "○ 观测到 IPv6 出口 2001:db8::2：经当前代理路径，未确认"
         );
         let too_long = "1:".repeat(20);
         n.route(ICANHAZIP6_URL, FakeReply::Timeout);
@@ -1964,7 +1968,7 @@ mod tests {
             check(&s, &n, &profiles_tun(), &mut rec);
             assert_eq!(
                 rec.lines().last().unwrap(),
-                "○ IPv6 状态未确认（未获得有效地址）",
+                "○ IPv6 出站已封禁或未确认",
                 "{bad:?}"
             );
         }
@@ -1977,10 +1981,18 @@ mod tests {
         let sum = check(&s, &n, &profiles_socks(), &mut rec);
         assert_eq!(
             rec.lines().last().unwrap(),
-            "○ 观测到 IPv6 出口 2001:db8::1，路径未确认"
+            "○ 观测到 IPv6 出口 2001:db8::1：经当前代理路径，未确认"
         );
         assert_eq!((sum.passed, sum.failed, sum.skipped), (5, 0, 1));
         assert!(sum.info_failed.is_empty(), "出口路径未确认不是泄漏证据");
+        // 2026-10-27：SOCKS 模式必须经本地代理探测，不再物理直连
+        let socks = profiles_socks().socks_port;
+        assert!(
+            n.log()
+                .contains(&format!("GET {IPIFY6_URL} via socks5:{socks}")),
+            "IPv6 探测绕过了本地代理：{:?}",
+            n.log()
+        );
     }
 
     fn failed_ipv6_probe_is_unconfirmed(reply: FakeReply, detail: &str) {
@@ -2437,7 +2449,7 @@ mod tests {
                 "✓ 本机解析正常 12ms",
                 "✓ 32ms",
                 "- 跳过（隧道不通）",
-                "○ IPv6 状态未确认（未获得有效地址）",
+                "○ IPv6 出站已封禁或未确认",
             ]
         );
         assert_eq!(
@@ -2977,10 +2989,13 @@ mod tests {
         assert!(!p.saw_info());
         let observed = p.paint(&Event::Line(
             Mark::Info,
-            "观测到 IPv6 出口 2001:db8:ffff:ffff:ffff:ffff:ffff:ffff，路径未确认".into(),
+            "观测到 IPv6 出口 2001:db8:ffff:ffff:ffff:ffff:ffff:ffff：经当前代理路径，未确认"
+                .into(),
         ));
         assert!(
-            observed.starts_with("○ ") && observed.contains("路径未确认"),
+            observed.starts_with("○ ")
+                && observed.contains("经当前代理路径")
+                && observed.contains("未确认"),
             "{observed}"
         );
         for (i, l) in observed.lines().enumerate() {

@@ -272,11 +272,11 @@ pub fn singbox(nodes: &[Node], split: &SplitRules, dial_ip: &str) -> Value {
         }
     }
 
-    // 顺序：sniff → DNS 劫持 → 私网直连 → IPv6 reject（只命中**裸 v6 目标**，RST 让应用回退 v4）
+    // 顺序：sniff → DNS 劫持 → 私网直连 → 全局 IPv6 字面量 reject（RST 让应用回退 v4）
     //       → 住宅关键字 → cn 直连
-    // 域名不经客户端预解析：出站没写 `domain_strategy`，域名原样交服务端，由 `node.direct_ip_policy`
-    // 决定 A/AAAA 取舍（双栈时 AAAA-only 域名走宿主机 v6 出口）。这条 reject 与 `strategy: ipv4_only`
-    // 只管字面 v6 目标——不是「服务端没有 v6 出口」（4.1.8 起可双栈），而是让字面 v6 快速回落、不在隧道里慢死。
+    // 域名不经客户端预解析：出站没写 `domain_strategy`，域名原样交服务端；服务端四条代理
+    // 出站一律 IPv4（2026-10-27 裁决），AAAA-only 域名因此不可达。这条 reject 与
+    // `strategy: ipv4_only` 只管字面 v6 目标：私网 v6 已在前一条走 direct。
     let mut rules = vec![
         json!({ "action": "sniff" }),
         json!({ "protocol": "dns", "action": "hijack-dns" }),
@@ -489,8 +489,9 @@ const BILLING_NOTE: &str =
 /// 期望态渲染必须可重复，带时间戳会让每次比对都判"变了"。
 ///
 /// v4 在 v3 输出之上新增 IPv6 接管（2026-09-12 裁决，golden 同步补齐）：顶层 `ipv6: true`、
-/// `dns.ipv6: false`、`tun` 接管参数、三条 `IP-CIDR6` 规则，与 sing-box 订阅同构，
-/// 依据 spec 2026-09-10-ipv6-takeover-design。其余字段与 v3 逐项相同。
+/// `dns.ipv6: false`、`tun` 接管参数、四条 `IP-CIDR6` 规则（回环 / ULA / link-local 直连，
+/// 全局 v6 拒绝；2026-10-27 起整体排在 `GEOIP`/`GEOSITE` **之前**，否则
+/// `GEOIP,cn,DIRECT` 会先放行全局 IPv6 字面量）。其余字段与 v3 逐项相同。
 ///
 /// 注释头第三行是 [`BILLING_NOTE`]（2026-07-10 裁决，计划 §5.3）：三种订阅产物里只有 YAML
 /// 能合法承载注释，[`uri_list`] / [`singbox`] 为什么不能写在那里见各自文档。
@@ -549,7 +550,15 @@ pub fn clash(nodes: &[Node], username: &str, split: &SplitRules) -> String {
         "DIRECT" // 零节点：两个自动组都不存在，MATCH 只能指内置出站
     };
 
+    // IPv6 接管规则必须在 GEOIP/GEOSITE 之前：`GEOIP,cn,DIRECT` 会先把全局 IPv6 字面量
+    // 判成直连，物理网卡就带着 v6 出去了。mihomo 没有 `ip_version` 匹配器，用 IP-CIDR6
+    // 等价表达 sing-box 的 `ip_is_private ⇒ direct` + 全局 v6 reject；`no-resolve` 防触发
+    // DNS 解析。`::1/128` 是最具体的回环，必须排在 `::/0` 拒绝之前。
     let mut rules = vec![
+        "IP-CIDR6,::1/128,DIRECT,no-resolve".to_string(),
+        "IP-CIDR6,fc00::/7,DIRECT,no-resolve".to_string(),
+        "IP-CIDR6,fe80::/10,DIRECT,no-resolve".to_string(),
+        "IP-CIDR6,::/0,REJECT,no-resolve".to_string(),
         "GEOIP,private,DIRECT,no-resolve".to_string(),
         "GEOSITE,cn,DIRECT".to_string(),
         "GEOIP,cn,DIRECT,no-resolve".to_string(),
@@ -561,12 +570,6 @@ pub fn clash(nodes: &[Node], username: &str, split: &SplitRules) -> String {
                 .map(|k| format!("DOMAIN-KEYWORD,{k},住宅自动")),
         );
     }
-    // IPv6 接管，对应 sing-box 订阅的 `ip_is_private ⇒ direct` 与 `ip_version 6 ⇒ reject`：
-    // mihomo 没有 `ip_version` 匹配器，用 IP-CIDR6 等价表达（`no-resolve` 防触发 DNS 解析）。
-    // 顺序：ULA / link-local 先直连，剩下的 v6 一律 REJECT。
-    rules.push("IP-CIDR6,fc00::/7,DIRECT,no-resolve".to_string());
-    rules.push("IP-CIDR6,fe80::/10,DIRECT,no-resolve".to_string());
-    rules.push("IP-CIDR6,::/0,REJECT,no-resolve".to_string());
     rules.push(format!("MATCH,{match_target}"));
 
     let dns = ymap(vec![

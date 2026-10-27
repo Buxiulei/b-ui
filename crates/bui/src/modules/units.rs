@@ -13,6 +13,11 @@
 //! `b-ui.service` 自身 `MemoryMax=200M`（4.1.3 起守护进程读日志的 `journalctl` 经
 //! `Host::run_journalctl` 放进临时单元 `bui-journal-*.service` 运行，它冷读 journal 的页缓存
 //! 不再记到本单元头上，200M 现在只量守护进程自身）；不生成任何 timer。
+//!
+//! 4.1.11 起开机顺序还负责 IPv6 封堵（2026-10-27）：`b-ui.service` 带
+//! `ExecStartPre=-{bin}/bui nft apply`，五个数据面单元 `After=b-ui.service`，保证
+//! `table inet bui`（含 `ipv6_egress` 链）先于任何代理内核落地；`b-ui` 自己只
+//! `After=network-online.target`，没有依赖环。
 
 use crate::paths::{caddy_xdg, CLI_LINKS};
 use crate::reconcile::{Artifact, Module, RenderCtx, Unit, LEGACY_UNITS, MANAGED_UNITS};
@@ -152,6 +157,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+ExecStartPre=-{bin}/bui nft apply
 ExecStart={bin}/bui serve
 Restart=always
 RestartSec=3
@@ -167,7 +173,7 @@ WantedBy=multi-user.target
             "[Unit]
 Description=Hysteria Server (Direct)
 Documentation=https://v2.hysteria.network/
-After=network-online.target
+After=network-online.target b-ui.service
 Wants=network-online.target
 
 [Service]
@@ -195,7 +201,7 @@ WantedBy=multi-user.target
             "[Unit]
 Description=Xray Service (VLESS-REALITY)
 Documentation=https://xtls.github.io/
-After=network-online.target
+After=network-online.target b-ui.service
 Wants=network-online.target
 
 [Service]
@@ -216,7 +222,7 @@ WantedBy=multi-user.target
         "b-ui-relay" => format!(
             "[Unit]
 Description=B-UI Outbound Relay (sing-box)
-After=network-online.target
+After=network-online.target b-ui.service
 Wants=network-online.target
 
 [Service]
@@ -245,7 +251,7 @@ WantedBy=multi-user.target
                 "[Unit]
 Description=Caddy (B-UI managed)
 Documentation=https://caddyserver.com/docs/
-After=network-online.target
+After=network-online.target b-ui.service
 Wants=network-online.target
 
 [Service]
@@ -292,7 +298,7 @@ pub fn resi_unit_text(ctx: &RenderCtx) -> String {
         "[Unit]
 Description=B-UI Residential Hysteria2 (sing-box)
 Documentation=https://sing-box.sagernet.org/
-After=network-online.target b-ui-relay.service
+After=network-online.target b-ui.service b-ui-relay.service
 Wants=network-online.target
 
 [Service]
@@ -455,7 +461,7 @@ mod tests {
             resi.contains("ExecStartPre=-/opt/b-ui/bin/bui nft apply\n"),
             "{resi}"
         );
-        assert!(resi.contains("After=network-online.target b-ui-relay.service"));
+        assert!(resi.contains("After=network-online.target b-ui.service b-ui-relay.service"));
         assert!(resi.contains("Restart=always") && resi.contains("RestartSec=3"));
         assert!(resi.contains("LimitNOFILE=1048576") && resi.contains("Nice=-5"));
         assert!(
@@ -567,8 +573,8 @@ mod tests {
         let resi = unit_of(&arts, "hysteria-residential");
         assert_eq!(resi.matches("ExecStartPre").count(), 1, "{resi}");
         assert!(!resi.contains("hy2-prestart"), "{resi}");
-        // 另外四个单元不该有任何启动前钩子
-        for name in ["b-ui", "xray", "b-ui-relay", "caddy"] {
+        // 另外三个数据面单元不该有任何启动前钩子；`b-ui` 的那条是 IPv6 出站封禁（见下）
+        for name in ["xray", "b-ui-relay", "caddy"] {
             assert!(
                 !unit_of(&arts, name).contains("ExecStartPre"),
                 "{name} 不需要启动前钩子"
@@ -602,6 +608,38 @@ mod tests {
         assert!(t.contains("ExecStart=/opt/b-ui/bin/bui serve"));
         assert!(t.contains("MemoryMax=200M"));
         assert!(t.contains("Environment=RUST_LOG=info"));
+        assert!(
+            t.contains("ExecStartPre=-/opt/b-ui/bin/bui nft apply\n"),
+            "开机时封禁链必须先于数据面起来：{t}"
+        );
+    }
+
+    /// 2026-10-27：开机顺序保证 `table inet bui`（含 IPv6 出站封禁）先于五个数据面单元。
+    /// `b-ui.service` 自己带 `ExecStartPre=-… bui nft apply`，数据面加 `After=b-ui.service`。
+    #[test]
+    fn the_ipv6_egress_table_is_installed_before_every_data_plane_unit() {
+        let arts = UnitsModule.render(&sample_state(), &ctx());
+        for name in [
+            "hysteria-server",
+            "hysteria-residential",
+            "xray",
+            "b-ui-relay",
+            "caddy",
+        ] {
+            let t = unit_of(&arts, name);
+            let after = t
+                .lines()
+                .find(|l| l.starts_with("After="))
+                .unwrap_or_else(|| panic!("{name} 没有 After="));
+            assert!(
+                after.split_whitespace().any(|w| w == "b-ui.service"),
+                "{name} 必须 After=b-ui.service（否则开机先于封禁链起来）：{after}"
+            );
+        }
+        // 无依赖环：b-ui 自己只等 network-online
+        let b = unit_of(&arts, "b-ui");
+        let after = b.lines().find(|l| l.starts_with("After=")).unwrap();
+        assert_eq!(after, "After=network-online.target");
     }
 
     #[test]

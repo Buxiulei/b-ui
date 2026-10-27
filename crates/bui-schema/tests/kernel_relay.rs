@@ -5,6 +5,20 @@ use bui_schema::model::{Pin, Rule, UpstreamKind};
 use bui_schema::relay_policy;
 use bui_schema::render::relay::{self, RelayOpts};
 
+/// 服务端出站一律 IPv4（2026-10-27）：全局 IPv6 字面量的 reject 必须是路由第一条，
+/// 且必须用 logical + invert —— 裸 `ip_version: 6` 会把私网 v6 也拒掉。
+fn v6_reject() -> serde_json::Value {
+    serde_json::json!({
+        "type": "logical",
+        "mode": "and",
+        "rules": [
+            { "ip_version": 6 },
+            { "ip_is_private": true, "invert": true },
+        ],
+        "action": "reject",
+    })
+}
+
 fn opts() -> RelayOpts {
     RelayOpts {
         listen_port: 2080,
@@ -67,9 +81,10 @@ fn relay_global_with_blacklist_and_ports_allowed() {
     assert_eq!(cfg["route"]["final"], "resi-pool");
 
     let rules = cfg["route"]["rules"].as_array().unwrap();
-    assert_eq!(rules[0]["action"], "sniff");
-    assert_eq!(rules[1]["domain_suffix"][0], "pay.google.com");
-    assert_eq!(rules[1]["outbound"], "direct");
+    assert_eq!(rules[0], v6_reject(), "IPv6 字面量 reject 必须是第一条");
+    assert_eq!(rules[1]["action"], "sniff");
+    assert_eq!(rules[2]["domain_suffix"][0], "pay.google.com");
+    assert_eq!(rules[2]["outbound"], "direct");
     let ports = rules
         .iter()
         .find(|r| r.get("port_range").is_some())
@@ -101,6 +116,29 @@ fn relay_global_with_blacklist_and_ports_allowed() {
     common::check_singbox(&cfg);
 }
 
+/// 2026-10-27：全局 IPv6 字面量在 sniff 之前 reject；私网 v6 继续由既有
+/// `ip_cidr → direct` 规则直连（logical + invert 的意义就在这里）。
+#[test]
+fn global_ipv6_literals_are_rejected_but_private_v6_still_goes_direct() {
+    for mode in ["global", "split"] {
+        let s = common::state(mode);
+        let g = s.residential.default_group().unwrap().clone();
+        let cfg = relay::config(&g, &[], &opts());
+        let rules = cfg["route"]["rules"].as_array().unwrap();
+        assert_eq!(rules[0], v6_reject(), "mode={mode}");
+        let private = rules
+            .iter()
+            .find(|r| r.get("ip_cidr").is_some())
+            .expect("私网直连规则");
+        let cidrs = private["ip_cidr"].as_array().unwrap();
+        for want in ["::1/128", "fc00::/7", "fe80::/10"] {
+            assert!(cidrs.iter().any(|c| c == want), "mode={mode} 缺 {want}");
+        }
+        assert_eq!(private["outbound"], "direct", "mode={mode}");
+        common::check_singbox(&cfg);
+    }
+}
+
 #[test]
 fn relay_split_uses_keywords_and_direct_final() {
     let s = common::state("split");
@@ -108,12 +146,13 @@ fn relay_split_uses_keywords_and_direct_final() {
     let cfg = relay::config(&g, &[], &opts());
     let rules = cfg["route"]["rules"].as_array().unwrap();
     // split 分流的生命线：hy2 侧 `{"action":"sniff"}` 不改写目标，客户端本地解析后 relay 只
-    // 收到 IP；唯有 rules[0] 这条无过滤 sniff 再嗅一次、让下面各槽的 domain_keyword 匹配到
+    // 收到 IP；唯有 rules[1] 这条无过滤 sniff 再嗅一次、让下面各槽的 domain_keyword 匹配到
     // metadata.Domain，关键字流量才进得了住宅出口。T3 2026-09-18 对照实验摘掉它 ⇒ 静默直连
-    // （与 global 用例的 rules[0] 断言同一口径，实现见 relay.rs:126）。
+    // （与 global 用例的 rules[1] 断言同一口径）。
+    assert_eq!(rules[0], v6_reject(), "IPv6 字面量 reject 必须是第一条");
     assert_eq!(
-        rules[0]["action"], "sniff",
-        "rules[0] 必须是 sniff（split 分流前提）"
+        rules[1]["action"], "sniff",
+        "规则第二条必须是 sniff（split 分流前提）"
     );
     assert_eq!(cfg["route"]["final"], "direct");
     let last = rules.last().unwrap();
@@ -161,10 +200,10 @@ fn relay_blacklist_keeps_pins_global_and_auto_with_each_actual_upstream() {
 
     let cfg = relay::config(&g, &[], &opts());
     let rules = cfg["route"]["rules"].as_array().unwrap();
-    assert_eq!(rules[1]["domain"], serde_json::json!(["www.paypal.com"]));
-    assert!(rules[1].get("domain_suffix").is_none());
+    assert_eq!(rules[2]["domain"], serde_json::json!(["www.paypal.com"]));
+    assert!(rules[2].get("domain_suffix").is_none());
     assert_eq!(
-        rules[1]["inbound"],
+        rules[2]["inbound"],
         serde_json::json!(["slot-0"]),
         "人工 pins 对用户入口生效"
     );

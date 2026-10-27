@@ -829,16 +829,20 @@ mod tests {
                 StatusCode::FORBIDDEN
             );
         }
-        let mut req = post(
-            "/api/system/direct-ip-policy",
-            serde_json::json!({"value":"auto"}),
-        );
-        req.extensions_mut()
-            .insert(crate::api::auth::UdsPeer { uid: 0 });
-        assert_eq!(
-            app.oneshot(req).await.unwrap().status(),
-            StatusCode::BAD_REQUEST
-        );
+        // `dual-stack` 已停用（2026-10-27）：root UDS 也不能再写；`auto` 仍是非法值
+        for bad in ["dual-stack", "auto"] {
+            let mut req = post(
+                "/api/system/direct-ip-policy",
+                serde_json::json!({"value": bad}),
+            );
+            req.extensions_mut()
+                .insert(crate::api::auth::UdsPeer { uid: 0 });
+            assert_eq!(
+                app.clone().oneshot(req).await.unwrap().status(),
+                StatusCode::BAD_REQUEST,
+                "{bad}"
+            );
+        }
         assert_eq!(
             std::fs::read(dir.path().join("state.json")).unwrap(),
             before
@@ -849,12 +853,15 @@ mod tests {
 
     #[tokio::test]
     async fn direct_ip_policy_root_uds_persists_once_and_sends_one_event() {
-        let (app, dir, _host, _runtime, bus) = app_with_bus().await;
+        // 旧 state 的双栈值：`ipv4-only` 把它写回默认（字段从盘上消失）
+        let mut state = crate::testutil::sample_state();
+        state.node.direct_ip_policy = bui_schema::model::DirectIpPolicy::DualStack;
+        let (app, dir, _host, _runtime, bus) = app_with_state(state).await;
         let mut events = bus.subscribe();
         for changed in [true, false] {
             let mut req = post(
                 "/api/system/direct-ip-policy",
-                serde_json::json!({"value":"dual-stack"}),
+                serde_json::json!({"value":"ipv4-only"}),
             );
             req.extensions_mut()
                 .insert(crate::api::auth::UdsPeer { uid: 0 });
@@ -862,10 +869,10 @@ mod tests {
             assert_eq!(res.status(), StatusCode::OK);
             let body = json(res).await;
             assert_eq!(body["changed"], changed);
-            assert_eq!(body["direct_ip_policy"], "dual-stack");
+            assert_eq!(body["direct_ip_policy"], "ipv4-only");
             let bytes = std::fs::read(dir.path().join("state.json")).unwrap();
             let persisted: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(persisted["node"]["direct_ip_policy"], "dual_stack");
+            assert!(persisted["node"].get("direct_ip_policy").is_none());
             if changed {
                 assert_eq!(
                     events.try_recv().unwrap(),
@@ -885,7 +892,9 @@ mod tests {
 
     #[tokio::test]
     async fn direct_ip_policy_waits_for_the_control_owner_before_writing() {
-        let (app, dir, _host, _runtime, bus) = app_with_bus().await;
+        let mut state = crate::testutil::sample_state();
+        state.node.direct_ip_policy = bui_schema::model::DirectIpPolicy::DualStack;
+        let (app, dir, _host, _runtime, bus) = app_with_state(state).await;
         let before = std::fs::read(dir.path().join("state.json")).unwrap();
         let mut events = bus.subscribe();
         let owner = bus.residential();
@@ -904,7 +913,7 @@ mod tests {
         seen.await.unwrap();
         let mut req = post(
             "/api/system/direct-ip-policy",
-            serde_json::json!({"value":"dual-stack"}),
+            serde_json::json!({"value":"ipv4-only"}),
         );
         req.extensions_mut()
             .insert(crate::api::auth::UdsPeer { uid: 0 });
