@@ -9,6 +9,15 @@
 //! 回到钩子 `bin/bui-auth-hook`。**两种形态都只作用于直连**（住宅侧是 sing-box 的静态
 //! `users` 列表 + 门，配置里没有 `auth` 段）。`masquerade.proxy.url` 由 REALITY 伪装域推导；
 //! `obfs` 段只在启用时输出。
+//!
+//! 4.2.2 的两个 HY2 修复：
+//! - `tls.sniGuard: dns-san`（原 `disable`）：证书 SAN 必须匹配客户端 SNI。订阅里的 HY2
+//!   `sni` 自 4.2.0 起是 `node.domain`（`State::normalize` 后的 REALITY SNI），所以新订阅
+//!   与证书同源。**仍拿着 4.2.0 之前旧订阅（`sni=www.bing.com`）的 HY2 客户端会连不上，
+//!   必须刷新订阅**。住宅 sing-box 入站没有 sniGuard 字段（平台限制），不在本修复范围。
+//! - `trafficStats.secret`：由 [`NodeParams`] 之外传入（`state.system.hy2_stats_secret`，
+//!   `State::normalize` 生成的 32 位 hex）。面板客户端发 `Authorization: <secret>`（无
+//!   `Bearer ` 前缀）；secret 绝不进日志。
 use crate::model::{Hy2Auth, NodeParams};
 use crate::paths::Paths;
 use serde_yaml::{Mapping, Value};
@@ -24,12 +33,16 @@ pub fn auth_http_url() -> String {
 }
 
 /// 直连实例 `config.yaml`。
-pub fn direct_yaml(node: &NodeParams, paths: &Paths, auth: Hy2Auth) -> String {
+///
+/// `stats_secret` 是 `state.system.hy2_stats_secret`（4.2.2）：写进 `trafficStats.secret`，
+/// 面板的 `/traffic`、`/online`、`/kick` 用同一个值发 `Authorization`。空串只可能出现在
+/// 未经 `State::normalize` 的旧状态上（那时两边同为「不发头」，行为与 4.2.0 一致）。
+pub fn direct_yaml(node: &NodeParams, paths: &Paths, auth: Hy2Auth, stats_secret: &str) -> String {
     let listen = match node.ports.hy2_hop {
         Some((start, end)) => format!(":{},{}-{}", node.ports.hy2, start, end),
         None => format!(":{}", node.ports.hy2),
     };
-    let mut doc = common_doc(node, paths, &listen, 9999, auth);
+    let mut doc = common_doc(node, paths, &listen, 9999, auth, stats_secret);
     doc.insert(
         key("outbounds"),
         Value::Sequence(vec![Value::Mapping(direct_outbound())]),
@@ -45,6 +58,7 @@ fn common_doc(
     listen: &str,
     traffic_port: u16,
     auth: Hy2Auth,
+    stats_secret: &str,
 ) -> Mapping {
     let certs = paths.certs_dir.display();
     let mut doc = Mapping::new();
@@ -52,7 +66,9 @@ fn common_doc(
     doc.insert(
         key("tls"),
         map(vec![
-            ("sniGuard", str_val("disable")),
+            // 4.2.2：证书 SAN 必须匹配客户端 SNI（订阅里的 HY2 sni = node.domain）。
+            // 旧订阅（SNI=www.bing.com）会在这里被拒，用户必须刷新订阅。
+            ("sniGuard", str_val("dns-san")),
             ("cert", str_val(&format!("{certs}/fullchain.pem"))),
             ("key", str_val(&format!("{certs}/privkey.pem"))),
         ]),
@@ -77,7 +93,7 @@ fn common_doc(
         key("trafficStats"),
         map(vec![
             ("listen", str_val(&format!("127.0.0.1:{traffic_port}"))),
-            ("secret", str_val("")),
+            ("secret", str_val(stats_secret)),
         ]),
     );
     doc.insert(
@@ -182,6 +198,9 @@ fn to_yaml(doc: Mapping) -> String {
 mod tests {
     use super::*;
 
+    /// 测试用的合成 secret（32 位小写 hex，与 `State::normalize` 生成同形）。
+    const STATS_SECRET: &str = "0123456789abcdef0123456789abcdef";
+
     fn node() -> NodeParams {
         serde_json::from_str(
             r#"{"id":"8d5a1a1e-3b2c-4d1e-9f00-000000000001","name":"node-a","domain":"example.com","public_ip":"203.0.113.10",
@@ -202,7 +221,7 @@ mod tests {
             enabled: true,
             password: "obfs-pw".into(),
         };
-        let t = direct_yaml(&n, &p, Hy2Auth::Http);
+        let t = direct_yaml(&n, &p, Hy2Auth::Http, STATS_SECRET);
         let y: Value = serde_yaml::from_str(&t).unwrap();
         assert_eq!(y["obfs"]["type"].as_str(), Some("salamander"), "{t}");
         assert_eq!(
@@ -211,9 +230,29 @@ mod tests {
             "{t}"
         );
         n.obfs.enabled = false;
-        let t = direct_yaml(&n, &p, Hy2Auth::Http);
+        let t = direct_yaml(&n, &p, Hy2Auth::Http, STATS_SECRET);
         let y: Value = serde_yaml::from_str(&t).unwrap();
         assert!(y.get("obfs").is_none(), "{t}");
+    }
+
+    /// 4.2.2 的两个 HY2 must-fix：`sniGuard: dns-san`（旧 `disable` 接受任意 SNI，配合旧
+    /// 订阅的 `www.bing.com` 等于没校验）与 `trafficStats.secret`（写 state 里的随机值，
+    /// 面板客户端发同一个值作裸 `Authorization`）。
+    #[test]
+    fn the_hy2_security_fixes_are_rendered() {
+        let (n, p) = (node(), Paths::default_server());
+        let y: Value =
+            serde_yaml::from_str(&direct_yaml(&n, &p, Hy2Auth::Http, STATS_SECRET)).unwrap();
+        assert_eq!(
+            y["tls"]["sniGuard"].as_str(),
+            Some("dns-san"),
+            "证书 SAN 必须匹配客户端 SNI（订阅里的 sni = node.domain）"
+        );
+        assert_eq!(y["trafficStats"]["secret"].as_str(), Some(STATS_SECRET));
+        assert_eq!(y["trafficStats"]["listen"].as_str(), Some("127.0.0.1:9999"));
+        // 空 secret 只可能来自未经 normalize 的旧 state：原样写空串（客户端也不发头）
+        let empty: Value = serde_yaml::from_str(&direct_yaml(&n, &p, Hy2Auth::Http, "")).unwrap();
+        assert_eq!(empty["trafficStats"]["secret"].as_str(), Some(""));
     }
 
     /// 两种鉴权模式各自的 `auth` 段（2026-09-13 裁决）。http 是默认，command 是退路：
@@ -221,7 +260,8 @@ mod tests {
     #[test]
     fn the_auth_section_is_the_only_difference_between_the_two_modes() {
         let (n, p) = (node(), Paths::default_server());
-        let y: Value = serde_yaml::from_str(&direct_yaml(&n, &p, Hy2Auth::Http)).unwrap();
+        let y: Value =
+            serde_yaml::from_str(&direct_yaml(&n, &p, Hy2Auth::Http, STATS_SECRET)).unwrap();
         assert_eq!(y["auth"]["type"].as_str(), Some("http"));
         assert_eq!(
             y["auth"]["http"]["url"].as_str(),
@@ -230,7 +270,8 @@ mod tests {
         assert_eq!(y["auth"]["http"]["insecure"].as_bool(), Some(false));
         assert!(y["auth"].get("command").is_none());
 
-        let y: Value = serde_yaml::from_str(&direct_yaml(&n, &p, Hy2Auth::Command)).unwrap();
+        let y: Value =
+            serde_yaml::from_str(&direct_yaml(&n, &p, Hy2Auth::Command, STATS_SECRET)).unwrap();
         assert_eq!(y["auth"]["type"].as_str(), Some("command"));
         assert_eq!(
             y["auth"]["command"].as_str(),
@@ -238,8 +279,10 @@ mod tests {
         );
         assert!(y["auth"].get("http").is_none());
         // 除 auth 之外逐键相等
-        let mut a: Mapping = serde_yaml::from_str(&direct_yaml(&n, &p, Hy2Auth::Http)).unwrap();
-        let mut b: Mapping = serde_yaml::from_str(&direct_yaml(&n, &p, Hy2Auth::Command)).unwrap();
+        let mut a: Mapping =
+            serde_yaml::from_str(&direct_yaml(&n, &p, Hy2Auth::Http, STATS_SECRET)).unwrap();
+        let mut b: Mapping =
+            serde_yaml::from_str(&direct_yaml(&n, &p, Hy2Auth::Command, STATS_SECRET)).unwrap();
         a.remove(key("auth"));
         b.remove(key("auth"));
         assert_eq!(a, b);

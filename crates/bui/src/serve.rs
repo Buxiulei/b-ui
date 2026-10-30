@@ -42,10 +42,19 @@ pub struct Registry {
     pub panel: Arc<crate::modules::panel::Shared>,
 }
 
+/// 测试与「没有 state」的调用点用的注册表：面板客户端用空 `trafficStats.secret`
+/// （不发 `Authorization`）。生产走 [`modules_with_secret`]。
 pub fn modules(manifest: Option<Manifest>) -> Registry {
+    modules_with_secret(manifest, String::new())
+}
+
+/// 同 [`modules`]，但把直连 hysteria 的 `trafficStats.secret`
+/// （`state.system.hy2_stats_secret`）交给面板客户端 —— 4.2.2 起两者必须是同一个值，
+/// 否则 `/traffic`、`/online`、`/kick` 会被内核 401。
+pub fn modules_with_secret(manifest: Option<Manifest>, hy2_stats_secret: String) -> Registry {
     let core = CoreFilesModule::new(manifest);
     let handle = core.manifest_handle();
-    let panel = crate::modules::panel::PanelModule::new();
+    let panel = crate::modules::panel::PanelModule::new_with_secret(hy2_stats_secret);
     let shared = panel.shared();
     Registry {
         modules: vec![
@@ -753,7 +762,9 @@ pub async fn run(paths: Paths, host: Arc<dyn Host>) -> anyhow::Result<()> {
         let p = paths.clone();
         tokio::task::spawn_blocking(move || load_cached_manifest(h.as_ref(), &p)).await?
     };
-    let reg = modules(cached);
+    // 4.2.2：面板客户端与直连 hysteria 配置必须用同一个 trafficStats.secret。
+    let hy2_stats_secret = store.read().await.system.hy2_stats_secret.clone();
+    let reg = modules_with_secret(cached, hy2_stats_secret);
     let mods = reg.modules.clone();
     let panel = reg.panel.clone();
     bus.bind_residential(panel.clone());
@@ -955,6 +966,8 @@ pub async fn reconcile_offline(
     lease: crate::residential_lifecycle::ControlLease,
 ) -> anyhow::Result<()> {
     let store = Store::open(crate::paths::state_file(&paths)).await?;
+    // 4.2.2：面板客户端与直连 hysteria 配置必须用同一个 trafficStats.secret。
+    let hy2_stats_secret = store.read().await.system.hy2_stats_secret.clone();
     let runtime = Runtime::load(crate::paths::runtime_file(&paths));
     let ctx = DaemonCtx {
         store,
@@ -968,7 +981,7 @@ pub async fn reconcile_offline(
         let p = paths.clone();
         tokio::task::spawn_blocking(move || load_cached_manifest(h.as_ref(), &p)).await?
     };
-    let reg = modules(cached);
+    let reg = modules_with_secret(cached, hy2_stats_secret);
     ctx.bus.bind_residential(reg.panel.clone());
     let fetcher: Arc<dyn Fetcher> = Arc::new(HttpFetcher::new());
     let report = reconcile_from_ctx(&ctx, &reg.modules, fetcher, force, dry_run).await?;

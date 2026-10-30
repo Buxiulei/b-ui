@@ -230,9 +230,28 @@ chain input {
 - `modules/panel/mod.rs::XRAY_INBOUND_TAGS = ["vless"]`；`users.rs` 的同步对单 tag 工作（逻辑不变，少一个 tag）。
 - `modules/panel/xray.rs::add_rule_request`：`RoutingRule.vless_route_list = Some(PortList { range: vec![PortRange { from: 1, to: 1 }] })`（仅当 `SlotRule.vless_route` 有值）。
 
+### 4.6 HY2 两个 must-fix（4.2.2）
+
+- **`tls.sniGuard: disable` → `dns-san`**（直连 hysteria，`render::hysteria`）：证书 SAN 必须
+  匹配客户端 SNI。4.2.0 起订阅里的 HY2 `sni` 已是 `node.domain`（REALITY 的
+  `serverNames` 同源），所以新订阅与证书一致。**仍拿着 4.2.0 之前旧订阅的 HY2 客户端
+  （`sni=www.bing.com`）升级后连不上，必须刷新订阅**；`bui-c` 拉一次订阅即换新。
+  住宅 sing-box 入站的 `masquerade` 平台没有 sniGuard 字段，不在本修复范围（它的客户端
+  SNI 同样是域名，只是没有服务端强制校验）。
+- **`trafficStats.secret` 从空串改为随机 secret**：`state.system.hy2_stats_secret`
+  （`State::normalize` 生成 32 位小写 hex，绝不进日志），渲染进 `config.yaml` 的
+  `trafficStats.secret`；面板 `/traffic`、`/online`、`/kick` 的 `Authorization` 头值
+  **精确等于**它（无 `Bearer ` 前缀）。两处只有一处来源（state），对账重写配置 + 重启
+  hysteria 之后自愈；面板客户端由 `serve::modules_with_secret` 注入。
+- 实测（本地 hysteria v2.13.0，官方归档、sha256 与 `kernels.lock` 一致）：
+  - SNI = 证书 SAN（`example.com`）→ `connected to server`；SNI = `www.bing.com` →
+    `CRYPTO_ERROR 0x150 (remote): tls: internal error`（旧订阅的断联形态）；
+  - trafficStats：无 secret → 401；裸 secret → 200；`Bearer <secret>` → 401。
+
 ## 5. 兼容与迁移语义
 
 - 旧订阅（10001/10002）在部署后不可用；客户端刷新订阅即拿到新节点（同域名、443、两个不同 UUID）。`bui-c` 的节点集合会替换，tombstone 逻辑照常。
+- **HY2 旧订阅（4.2.0 之前，SNI=`www.bing.com`）在外层 `public`/`l4` 切换之外还要再刷一次**：4.2.2 起直连 hysteria 用 `sniGuard: dns-san`，SNI 与证书 SAN 不匹配会被拒；`trafficStats.secret` 的变更只影响面板采样，对账重写 `config.yaml` 并重启 `hysteria-server` 后生效。
 - 旧 state 的 `reality.dest=www.bing.com:443`、`server_names=[www.bing.com]` 由 `normalize()` 覆盖；面板/订阅/ HY2 masquerade 全部改用 `node.domain`。
 - `v3 import` 读出的 dest/server_names 同样被归一；import 测试的期望值改为 self-steal。
 - `ports.reality_direct/reality_resi` 写回 443；v3 导入仍能解析旧 JSON。

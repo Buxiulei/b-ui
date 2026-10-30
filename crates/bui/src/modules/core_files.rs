@@ -238,7 +238,12 @@ impl Module for CoreFilesModule {
         out.push(
             Artifact::file(
                 p.base_dir.join("config.yaml"),
-                bui_schema::render::hysteria::direct_yaml(&s.node, p, s.system.hy2_auth),
+                bui_schema::render::hysteria::direct_yaml(
+                    &s.node,
+                    p,
+                    s.system.hy2_auth,
+                    &s.system.hy2_stats_secret,
+                ),
             )
             .restart(Unit::restart("hysteria-server")),
         );
@@ -452,6 +457,7 @@ mod tests {
             &s.node,
             &Paths::default_server(),
             s.system.hy2_auth,
+            &s.system.hy2_stats_secret,
         );
         match find_file(&arts, "/opt/b-ui/config.yaml") {
             Artifact::File {

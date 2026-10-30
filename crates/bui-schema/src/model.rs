@@ -42,6 +42,10 @@ impl State {
     ///
     /// 返回是否改动了任何一项。调用点：`Store::open`（读盘即归一，CLI 与守护进程同口径）
     /// 与 v3 导入。`node.domain` 为空（还没装机）时不动 `server_names`，否则会写出一个空 SNI。
+    ///
+    /// 4.2.2 起还负责补齐直连 hysteria 的 `trafficStats.secret`
+    /// （[`SystemSettings::hy2_stats_secret`]）：为空时生成 32 位小写 hex。**随机值只在
+    /// 这里生成一处**，渲染与面板客户端都读 state；secret 绝不进日志。
     pub fn normalize(&mut self) -> bool {
         let mut changed = false;
         let dest = format!("127.0.0.1:{CADDY_LOCAL_PORT}");
@@ -64,6 +68,11 @@ impl State {
                 *port = REALITY_PORT;
                 changed = true;
             }
+        }
+        // 直连 hysteria 的 trafficStats.secret（4.2.2）：只在这里生成，32 位小写 hex。
+        if self.system.hy2_stats_secret.is_empty() {
+            self.system.hy2_stats_secret = Uuid::new_v4().simple().to_string();
+            changed = true;
         }
         changed
     }
@@ -756,6 +765,17 @@ pub struct SystemSettings {
         skip_serializing_if = "is_default_health_interval"
     )]
     pub residential_health_interval_secs: u64,
+    /// 直连 hysteria `trafficStats.secret`（4.2.2 安全修复）：空 = 尚未生成，由
+    /// [`State::normalize`] 填 32 位小写 hex；面板的 `/traffic`、`/online`、`/kick` 用
+    /// 同一个值发 `Authorization`（头值**精确等于** secret，没有 `Bearer ` 前缀）。
+    ///
+    /// **绝不进日志**；`state.json` 已是 0600。渲染进 `config.yaml` 与面板客户端同源，
+    /// 两处不一致时采样会 401（对账重写配置并重启 hysteria 后自愈）。
+    ///
+    /// `skip_serializing_if`（D10）：空串不落盘，`state_round_trips` 的
+    /// `to_value(&s) == SAMPLE` 继续成立（**不许改 SAMPLE**）；归一后非空才写盘。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub hy2_stats_secret: String,
 }
 
 fn default_auto() -> String {
@@ -781,6 +801,7 @@ impl Default for SystemSettings {
             legacy_sub_until: None,
             hy2_resi_compat_ports: true,
             residential_health_interval_secs: 120,
+            hy2_stats_secret: String::new(),
         }
     }
 }
@@ -1058,15 +1079,36 @@ mod tests {
 
     /// 2026-10-30（REALITY 443 + self-steal）：`State::normalize` 把旧 state 的三项
     /// （dest / serverNames / 两个 reality 端口）拉齐；幂等、不碰别的字段。
+    ///
+    /// 4.2.2 追加：`hy2_stats_secret` 为空时生成 32 位小写 hex（直连 hysteria 的
+    /// `trafficStats.secret`），非空时原样保留。
     #[test]
     fn normalize_moves_reality_to_self_steal_and_is_idempotent() {
         let mut s: State = serde_json::from_str(SAMPLE).unwrap();
+        assert!(s.system.hy2_stats_secret.is_empty(), "SAMPLE 里没有 secret");
+        assert!(
+            serde_json::to_value(&s).unwrap()["system"]
+                .get("hy2_stats_secret")
+                .is_none(),
+            "空 secret 不落盘（D10 口径）"
+        );
         assert!(s.normalize(), "旧 state 必然要改");
         assert_eq!(s.node.reality.dest, "127.0.0.1:9443");
         assert_eq!(s.node.reality.server_names, vec!["example.com".to_string()]);
         assert_eq!(s.node.ports.reality_direct, REALITY_PORT);
         assert_eq!(s.node.ports.reality_resi, REALITY_PORT);
+        assert_eq!(s.system.hy2_stats_secret.len(), 32, "32 位 hex");
+        assert!(
+            s.system
+                .hy2_stats_secret
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "必须是小写 hex：{}",
+            s.system.hy2_stats_secret
+        );
+        let generated = s.system.hy2_stats_secret.clone();
         assert!(!s.normalize(), "第二遍无事可做");
+        assert_eq!(s.system.hy2_stats_secret, generated, "已有 secret 不重生成");
         // 空域名（还没装机）时不许写出空 SNI：这一项保持原样
         let mut empty: State = serde_json::from_str(SAMPLE).unwrap();
         empty.node.domain = String::new();

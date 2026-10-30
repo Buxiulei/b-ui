@@ -4,7 +4,9 @@
 //! - `GET /online`：值是该 id 当前的 QUIC 连接数，`>0` 即在线（H11）。
 //! - `POST /kick`：体是 JSON 字符串数组；只是**标记**，要等该用户下次有流量才断连（H12）。
 //! - `trafficStats.secret` 非空时，`Authorization` 头的值**精确等于** secret，**没有** `Bearer ` 前缀（H13）。
-//!   `bui_schema::render::hysteria` 目前渲染空串，所以默认不发这个头。
+//!   4.2.2 起直连配置渲染的是 `state.system.hy2_stats_secret`，生产由
+//!   [`PanelModule::new_with_secret`](super::PanelModule::new_with_secret) 注入同一个值；
+//!   [`Hy2Client::new`] 的空 secret 只给测试 / 默认构造用（那时不发头）。
 
 use super::{Hy2Api, TxRx};
 use std::collections::BTreeMap;
@@ -26,7 +28,8 @@ impl Hy2Client {
     pub fn with_base(base: impl Into<String>) -> Self {
         Self {
             base: base.into(),
-            secret: super::HY2_STATS_SECRET.to_string(),
+            // 空 = 不发 Authorization；生产由 PanelModule::new_with_secret 注入 state 里的值。
+            secret: String::new(),
             http: reqwest::Client::builder()
                 .timeout(REQ_TIMEOUT)
                 .build()
@@ -106,6 +109,10 @@ pub fn kick_body(ids: &[String]) -> Vec<u8> {
 
 #[async_trait::async_trait]
 impl Hy2Api for Hy2Client {
+    fn secret(&self) -> &str {
+        &self.secret
+    }
+
     async fn traffic_clear(&self, port: u16) -> anyhow::Result<BTreeMap<String, TxRx>> {
         let url = self.url(port, "/traffic?clear=1");
         let resp = self
@@ -193,7 +200,7 @@ mod tests {
             auth_header("s3cr3t"),
             Some(("authorization", "s3cr3t".to_string()))
         );
-        assert_eq!(super::super::HY2_STATS_SECRET, "");
+        assert_eq!(Hy2Client::new().secret(), "", "默认构造不带 secret");
     }
 
     /// 起一个**进程内的回环** HTTP 服务（`127.0.0.1:0`，随机端口）当假 hysteria。
@@ -267,12 +274,31 @@ mod tests {
         );
     }
 
+    /// 4.2.2：`trafficStats.secret` 非空时 `/traffic` 也必须带裸 `Authorization`
+    /// （这是采样任务的主路径，漏了就是每轮 401 + 流量账停摆）。
+    #[tokio::test]
+    async fn traffic_clear_with_a_secret_sends_the_bare_authorization_header() {
+        let (port, mut rx) = fake_hysteria("{}").await;
+        let c = Hy2Client::new().with_secret("s3cr3t");
+        c.traffic_clear(port).await.unwrap();
+        let req = rx.recv().await.unwrap();
+        assert!(
+            req.starts_with("GET /traffic?clear=1 HTTP/1.1"),
+            "请求行不对：{req}"
+        );
+        assert!(
+            req.contains("authorization: s3cr3t"),
+            "头值必须是裸 secret：{req}"
+        );
+        assert!(!req.contains("Bearer"), "绝不能带 Bearer 前缀：{req}");
+    }
+
     #[tokio::test]
     async fn online_and_kick_use_the_documented_shapes_and_a_bare_secret_header() {
         let (port, mut rx) = fake_hysteria(r#"{"u-1":3}"#).await;
         let c = Hy2Client::new().with_secret("s3cr3t");
         assert_eq!(c.secret(), "s3cr3t", "with_secret 必须真的换掉默认空串");
-        assert_eq!(Hy2Client::new().secret(), super::super::HY2_STATS_SECRET);
+        assert_eq!(Hy2Client::new().secret(), "", "默认构造不带 secret");
         assert_eq!(c.online(port).await.unwrap()["u-1"], 3);
         let req = rx.recv().await.unwrap();
         assert!(req.starts_with("GET /online HTTP/1.1"), "{req}");

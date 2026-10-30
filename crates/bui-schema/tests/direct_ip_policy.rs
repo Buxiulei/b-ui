@@ -41,8 +41,17 @@ fn state_with_policy(legacy: &Value, policy: &str) -> State {
     serde_json::from_value(value).unwrap()
 }
 
+/// 测试用的合成 secret（与 `State::normalize` 生成的 32 位 hex 同形）。
+const STATS_SECRET: &str = "0123456789abcdef0123456789abcdef";
+
 fn direct_hy2(node: &NodeParams, auth: Hy2Auth) -> serde_yaml::Value {
-    serde_yaml::from_str(&hysteria::direct_yaml(node, &Paths::default_server(), auth)).unwrap()
+    serde_yaml::from_str(&hysteria::direct_yaml(
+        node,
+        &Paths::default_server(),
+        auth,
+        STATS_SECRET,
+    ))
+    .unwrap()
 }
 
 fn xray_config(state: &State) -> Value {

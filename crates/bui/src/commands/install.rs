@@ -1234,7 +1234,9 @@ async fn install_owned(
     // 9：一次完整对账。守护进程已经在跑（活机器上重跑 install）就交给它，别在本进程里并发再跑
     // 一轮——两边会同时 restart 同一个单元、`.verify/<file>` 候选文件互相覆盖、
     // `runtime.json` 交叉写（与 `serve::reconcile_cli` 同一条口径）。
-    let reg = crate::serve::modules(manifest);
+    // 4.2.2：面板客户端与 config.yaml 的 trafficStats.secret 同源（state 里那一处）。
+    let hy2_stats_secret = ctx.store.read().await.system.hy2_stats_secret.clone();
+    let reg = crate::serve::modules_with_secret(manifest, hy2_stats_secret);
     ctx.bus.bind_residential(reg.panel.clone());
     let report =
         crate::serve::reconcile_from_ctx(&ctx, &reg.modules, fetcher, false, false).await?;

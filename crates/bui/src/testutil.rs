@@ -25,7 +25,8 @@ const SAMPLE: &str = r#"{
                "billing": { "currency": "CNY", "balance_minor": 0, "orders": [] } } ],
   "residential": { "groups": { "default": { "enabled": false, "mode": "split", "keywords": null, "upstreams": [],
                     "selected_upstream_id": null, "blacklist": { "pins": [], "auto": [] } } } },
-  "system": { "ssh_hardening": true, "static_dns": true, "sysctl_profile": "auto", "firewall": "auto" },
+  "system": { "ssh_hardening": true, "static_dns": true, "sysctl_profile": "auto", "firewall": "auto",
+              "hy2_stats_secret": "0123456789abcdef0123456789abcdef" },
   "versions": { "bui": "4.0.0", "hysteria": "2.12.2", "xray": "26.3.27", "sing_box": "1.13.19", "caddy": "2.10.2", "client_sing_box": "1.13.19" },
   "catalog": []
 }"#;

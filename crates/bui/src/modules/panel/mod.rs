@@ -61,9 +61,6 @@ pub const HY2_STATS_PORT_DIRECT: u16 = 9999;
 /// 门位（Clash API）双双打空、测试却全绿，属静默生产故障。守门断言见
 /// `panel::hy2resi::tests::the_endpoints_come_from_the_renderer`。
 pub use bui_schema::render::hy2_singbox::{HY2_RESI_API, HY2_RESI_CLASH_API};
-/// `bui_schema::render::hysteria` 渲染的 `trafficStats.secret` 是空串 ⇒ 不发 Authorization 头。
-/// 若将来改成非空，`hy2::Hy2Client` 按调研 H13 发 `Authorization: <secret>`（**无** `Bearer ` 前缀）。
-pub const HY2_STATS_SECRET: &str = "";
 /// Xray 的 api inbound（`bui_schema::render::xray` 的 `API_PORT` = 10085）。
 pub const XRAY_API_ADDR: &str = "127.0.0.1:10085";
 /// 唯一 REALITY inbound 的 tag（`bui_schema::render::xray::INBOUND_TAG`）。
@@ -153,6 +150,11 @@ pub trait Hy2Api: Send + Sync {
     async fn online(&self, port: u16) -> anyhow::Result<BTreeMap<String, u32>>;
     /// `POST /kick`，体是 JSON 字符串数组（H12）
     async fn kick(&self, port: u16, ids: &[String]) -> anyhow::Result<()>;
+    /// 客户端持有的 `trafficStats.secret`（4.2.2）。生产实现返回 state 里那个值；测试 fake
+    /// 与「未配置」默认空串。只用于把「面板拿到的 secret」与渲染出的配置对齐的守门测试。
+    fn secret(&self) -> &str {
+        ""
+    }
 }
 
 /// 住宅 HY2（sing-box）的控制面：计量走 `daemon.StartedService` 的 gRPC 流
@@ -332,10 +334,19 @@ pub struct PanelModule {
 }
 
 impl PanelModule {
+    /// 客户端用**空** secret（不发 `Authorization`）。生产不用它：`serve` 读
+    /// `state.system.hy2_stats_secret` 后走 [`PanelModule::new_with_secret`]。
     pub fn new() -> Self {
+        Self::new_with_secret(String::new())
+    }
+
+    /// 4.2.2：直连 hysteria 的 `trafficStats.secret` 非空，`/traffic`、`/online`、`/kick`
+    /// 必须带 `Authorization: <secret>`（值精确等于 secret，无 `Bearer ` 前缀，调研 H13）。
+    /// secret 只有一处来源：`state.system.hy2_stats_secret`（`State::normalize` 生成）。
+    pub fn new_with_secret(secret: String) -> Self {
         Self::with_shared(Arc::new(Shared::new(
             Box::new(xray::XrayClient::new()),
-            Box::new(hy2::Hy2Client::new()),
+            Box::new(hy2::Hy2Client::new().with_secret(secret)),
         )))
     }
 
@@ -573,6 +584,25 @@ mod tests {
         assert_eq!(
             s.hy2resi().query_user_deltas().await.unwrap(),
             BTreeMap::new()
+        );
+    }
+
+    /// 4.2.2：直连 hysteria 的 `trafficStats.secret` 非空，面板客户端必须拿到**同一个**
+    /// 值（`/traffic`、`/online`、`/kick` 的 `Authorization` 头 = 裸 secret）。
+    /// `PanelModule::new()` 只给测试/未配置用，保持空串（不发头）。
+    #[test]
+    fn the_panel_client_takes_the_rendered_traffic_stats_secret() {
+        assert_eq!(
+            PanelModule::new().shared().hy2().secret(),
+            "",
+            "默认构造（测试 / 未配置）不发 Authorization"
+        );
+        let secret = "0123456789abcdef0123456789abcdef";
+        let m = PanelModule::new_with_secret(secret.to_string());
+        assert_eq!(
+            m.shared().hy2().secret(),
+            secret,
+            "生产路径必须把 state 里的 secret 交给面板客户端"
         );
     }
 

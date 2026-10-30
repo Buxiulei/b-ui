@@ -32,6 +32,13 @@ fn imports_node_params() {
         vec!["0123456789abcdef".to_string()]
     );
     assert!(!s.node.obfs.enabled);
+    // 4.2.2：直连 hysteria 的 trafficStats.secret 由 normalize 生成（32 位小写 hex）
+    assert_eq!(s.system.hy2_stats_secret.len(), 32);
+    assert!(s
+        .system
+        .hy2_stats_secret
+        .chars()
+        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
 }
 
 #[test]

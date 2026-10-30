@@ -799,10 +799,12 @@ mod tests {
             target: "bui".into(),
         }));
         // 渲染进配置的那条路径与这条链接必须是同一个（否则内核指向一个不存在的文件）
+        let state = sample_state();
         let yaml = bui_schema::render::hysteria::direct_yaml(
-            &sample_state().node,
+            &state.node,
             &p,
             bui_schema::model::Hy2Auth::Command,
+            &state.system.hy2_stats_secret,
         );
         assert!(
             yaml.contains(&format!("command: {}\n", p.auth_hook_bin().display())),

@@ -1,6 +1,6 @@
 listen: :10000,20000-30000
 tls:
-  sniGuard: disable
+  sniGuard: dns-san
   cert: /opt/b-ui/certs/fullchain.pem
   key: /opt/b-ui/certs/privkey.pem
 quic:
@@ -16,7 +16,7 @@ auth:
   command: /opt/b-ui/bin/bui-auth-hook
 trafficStats:
   listen: 127.0.0.1:9999
-  secret: ''
+  secret: 0123456789abcdef0123456789abcdef
 masquerade:
   type: proxy
   proxy:

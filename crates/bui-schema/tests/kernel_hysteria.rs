@@ -47,6 +47,9 @@ fn self_signed(dir: &std::path::Path) -> Option<()> {
 }
 
 /// golden：`tests/fixtures/hysteria/<模式>/<文件名>`，两种鉴权模式各一份。
+/// 测试用的合成 secret（与 `State::normalize` 生成同形）；golden 里逐字写着它。
+const STATS_SECRET: &str = "0123456789abcdef0123456789abcdef";
+
 fn golden(mode: &str, file: &str) -> String {
     let path = std::path::Path::new(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -64,10 +67,18 @@ fn hysteria_direct_shape() {
         &s.node,
         &Paths::default_server(),
         Hy2Auth::Command,
+        STATS_SECRET,
     ))
     .unwrap();
     assert_eq!(y["listen"].as_str().unwrap(), ":10000,20000-30000");
     assert_eq!(y["auth"]["type"].as_str().unwrap(), "command");
+    // 4.2.1：sniGuard 必须是 dns-san（旧 disable 接受任意 SNI）；trafficStats.secret 来自 state
+    assert_eq!(y["tls"]["sniGuard"].as_str().unwrap(), "dns-san");
+    assert_eq!(
+        y["trafficStats"]["secret"].as_str().unwrap(),
+        STATS_SECRET,
+        "trafficStats.secret 必须写进配置（面板客户端用同一个值发 Authorization）"
+    );
     assert_eq!(
         y["auth"]["command"].as_str().unwrap(),
         "/opt/b-ui/bin/bui-auth-hook"
@@ -101,6 +112,7 @@ fn hysteria_direct_without_obfs_or_hop() {
         &s.node,
         &Paths::default_server(),
         Hy2Auth::Http,
+        STATS_SECRET,
     ))
     .unwrap();
     assert_eq!(y["listen"].as_str().unwrap(), ":10000");
@@ -122,7 +134,7 @@ fn hysteria_auth_command_is_a_single_executable_path_without_arguments() {
     let s = common::state("obfs");
     let p = Paths::default_server();
     let which = "config.yaml";
-    let yaml = hysteria::direct_yaml(&s.node, &p, Hy2Auth::Command);
+    let yaml = hysteria::direct_yaml(&s.node, &p, Hy2Auth::Command, STATS_SECRET);
     let y: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
     let cmd = y["auth"]["command"].as_str().unwrap();
     assert_eq!(y["auth"]["type"].as_str().unwrap(), "command", "{which}");
@@ -168,7 +180,10 @@ fn both_auth_modes_load_in_the_real_hysteria_kernel() {
         bin_dir: dir.path().join("bin"),
     };
     for (mode, auth) in [("http", Hy2Auth::Http), ("command", Hy2Auth::Command)] {
-        for (which, text) in [("direct", hysteria::direct_yaml(&s.node, &paths, auth))] {
+        for (which, text) in [(
+            "direct",
+            hysteria::direct_yaml(&s.node, &paths, auth, STATS_SECRET),
+        )] {
             let mode = format!("{mode}-{which}");
             assert!(text.contains("salamander"), "{mode} 应带 obfs：{text}");
             let cfg = dir.path().join(format!("{mode}.yaml"));
@@ -270,7 +285,7 @@ fn obfs_server_admits_a_matching_client_and_refuses_one_without_obfs() {
     let obfs_pw = s.node.obfs.password.clone();
     for (which, rendered) in [(
         "direct",
-        hysteria::direct_yaml(&s.node, &paths, Hy2Auth::Http),
+        hysteria::direct_yaml(&s.node, &paths, Hy2Auth::Http, STATS_SECRET),
     )] {
         let port = free_udp_port();
         let mut text = with_listen(&rendered, &format!("127.0.0.1:{port}"));
@@ -412,7 +427,7 @@ fn both_auth_modes_match_their_golden_config() {
     let p = Paths::default_server();
     for (mode, auth) in [("http", Hy2Auth::Http), ("command", Hy2Auth::Command)] {
         assert_eq!(
-            hysteria::direct_yaml(&s.node, &p, auth),
+            hysteria::direct_yaml(&s.node, &p, auth, STATS_SECRET),
             golden(mode, "config.yaml"),
             "{mode} 模式的 config.yaml 与 golden 不符"
         );

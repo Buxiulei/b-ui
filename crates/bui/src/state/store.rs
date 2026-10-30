@@ -361,6 +361,8 @@ mod tests {
 
     /// 2026-10-30（REALITY 443 + self-steal）：读盘即归一 —— 旧 state 的 dest /
     /// serverNames / 10001/10002 在**内存与磁盘**上都被拉齐（CLI 与守护进程同口径）。
+    ///
+    /// 4.2.2 追加：`hy2_stats_secret` 为空时在这里生成 32 位小写 hex 并写回（文件已 0600）。
     #[tokio::test]
     async fn opening_an_old_state_normalizes_reality_and_writes_it_back() {
         let d = dir();
@@ -370,15 +372,24 @@ mod tests {
         old.node.reality.server_names = vec!["www.bing.com".into()];
         old.node.ports.reality_direct = 10001;
         old.node.ports.reality_resi = 10002;
+        old.system.hy2_stats_secret = String::new(); // 旧 state 没有这一项
         Store::create(&p, old).await.unwrap();
 
         let store = Store::open(&p).await.unwrap();
+        let generated;
         {
             let s = store.read().await;
             assert_eq!(s.node.reality.dest, "127.0.0.1:9443");
             assert_eq!(s.node.reality.server_names, vec!["example.com".to_string()]);
             assert_eq!(s.node.ports.reality_direct, 443);
             assert_eq!(s.node.ports.reality_resi, 443);
+            assert_eq!(s.system.hy2_stats_secret.len(), 32);
+            assert!(s
+                .system
+                .hy2_stats_secret
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+            generated = s.system.hy2_stats_secret.clone();
         }
         let disk: State = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
         assert_eq!(
@@ -386,6 +397,10 @@ mod tests {
             "归一结果要写回盘上"
         );
         assert_eq!(disk.node.ports.reality_direct, 443);
+        assert_eq!(
+            disk.system.hy2_stats_secret, generated,
+            "secret 要持久化，第二次打开才不会再生成"
+        );
         // 已经是新形态的 state：再开一次零改动、零备份
         Store::open(&p).await.unwrap();
         assert_eq!(

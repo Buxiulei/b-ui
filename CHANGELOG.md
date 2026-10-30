@@ -8,6 +8,23 @@
 `version` 的唯一来源是根 `Cargo.toml` 的 `[workspace.package] version`；改版本必须同时在本文件加一段，`scripts/release/check-version.sh` 会在 CI 里卡住不一致（它只认 `## [<version>]` 这个标题，日期不参与校验）。
 未发布的版本日期写「未发布」，由主理人打 tag 发版时替换成当天日期（UTC）。
 
+## [4.2.2] - 2026-10-30
+
+### HY2 两个 must-fix：sniGuard dns-san / trafficStats secret
+
+- **直连 hysteria 的 `tls.sniGuard` 从 `disable` 改为 `dns-san`**：证书 SAN 必须匹配客户端
+  SNI。4.2.0 起订阅里的 HY2 `sni` 已统一为面板域名（`node.domain`），所以新订阅不受影响；
+  **仍拿着 4.2.0 之前旧订阅（`sni=www.bing.com`）的 HY2 客户端升级后会连不上，必须刷新
+  订阅**。住宅 sing-box 入站没有 sniGuard 字段（平台限制），不在本修复范围。
+- **直连 hysteria 的 `trafficStats.secret` 从空串改为随机 secret**：新增
+  `state.system.hy2_stats_secret`（`State::normalize` 生成 32 位小写 hex，绝不进日志），
+  渲染进 `config.yaml`；面板的 `/traffic`、`/online`、`/kick` 用同一个值发
+  `Authorization: <secret>`（无 `Bearer ` 前缀）。只有一处来源（state），对账重写配置并
+  重启 `hysteria-server` 后生效；两处不一致时采样会 401 而不是静默失效。
+- 本地 hysteria **2.13.0**（官方归档，sha256 与 `kernels.lock` 一致）实测：SNI=证书 SAN
+  连接成功、SNI=`www.bing.com` 被拒（`CRYPTO_ERROR 0x150`）；trafficStats 无 secret 401 /
+  裸 secret 200 / `Bearer` 前缀 401。
+
 ## [4.2.1] - 2026-10-30
 
 ### 修复：非住宅 Reality 用户不能借 route 1 走住宅出口
