@@ -75,16 +75,21 @@ fn xray_config_has_one_self_steal_reality_inbound_and_passes_xray_test() {
         .unwrap()
         .iter()
         .any(|o| o["tag"] == "block" && o["protocol"] == "blackhole"));
-    // 表尾：resi-route（route 1 → 兜底槽）→ resi-fallback（→ direct）
+    // 表尾：resi-route（route 1 → block，4.2.1）→ resi-fallback（→ direct）
     let route = &rs[rs.len() - 2];
     assert_eq!(route["ruleTag"].as_str().unwrap(), "resi-route");
     assert_eq!(route["vlessRoute"], "1");
-    assert_eq!(route["outboundTag"].as_str().unwrap(), "relay-slot-0");
+    assert_eq!(
+        route["outboundTag"].as_str().unwrap(),
+        "block",
+        "通用 route 1 必须拒绝：非住宅用户不能借 route 1 走住宅出口"
+    );
     let last = rs.last().unwrap();
     assert_eq!(last["ruleTag"].as_str().unwrap(), "resi-fallback");
     assert_eq!(last["outboundTag"].as_str().unwrap(), "direct");
     assert!(last.get("vlessRoute").is_none());
-    // 每个住宅用户一条 user + vlessRoute 1
+    // 每个未停用、有 Reality 权益的用户一条 user + vlessRoute 1：
+    // 有住宅权益 → relay-slot-N，没有住宅权益（fixture 的 dave）→ block。
     assert!(rs.iter().filter(|r| r.get("user").is_some()).all(|r| {
         r["vlessRoute"] == "1"
             && r["inboundTag"] == serde_json::json!(["vless"])
@@ -92,6 +97,32 @@ fn xray_config_has_one_self_steal_reality_inbound_and_passes_xray_test() {
                 .as_str()
                 .is_some_and(|t| t.starts_with("resi-u-"))
     }));
+    let rule_of = |username: &str| {
+        let uid = s
+            .users
+            .iter()
+            .find(|u| u.username == username)
+            .unwrap()
+            .user_id
+            .to_string();
+        rs.iter()
+            .find(|r| r["user"] == serde_json::json!([uid]))
+            .unwrap_or_else(|| panic!("{username} 没有 per-user 规则"))
+    };
+    assert_eq!(
+        rule_of("dave")["outboundTag"].as_str().unwrap(),
+        "block",
+        "非住宅 Reality 用户的 route 1 必须被拒"
+    );
+    for resi_user in ["alice", "carol"] {
+        assert!(
+            rule_of(resi_user)["outboundTag"]
+                .as_str()
+                .unwrap()
+                .starts_with("relay-slot-"),
+            "{resi_user} 有住宅权益，route 1 应落到槽"
+        );
+    }
     if !common::have("xray") {
         eprintln!("skipped: xray not found");
         return;
@@ -171,7 +202,8 @@ fn structural_hash_ignores_clients() {
     );
 }
 
-/// 加用户 / 改槽只动带 `user` 的规则（gRPC 收敛，不重启）；兜底槽变化才动结构哈希。
+/// 加用户 / 改槽 / 权益变化只动带 `user` 的规则（gRPC 收敛，不重启）；槽位表或入站等
+/// 结构变化才动结构哈希（4.2.1 起两条通用规则都是常量）。
 #[test]
 fn user_churn_does_not_change_the_structural_hash() {
     let mut s = common::state("global");

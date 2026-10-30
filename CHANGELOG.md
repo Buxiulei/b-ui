@@ -8,6 +8,20 @@
 `version` 的唯一来源是根 `Cargo.toml` 的 `[workspace.package] version`；改版本必须同时在本文件加一段，`scripts/release/check-version.sh` 会在 CI 里卡住不一致（它只认 `## [<version>]` 这个标题，日期不参与校验）。
 未发布的版本日期写「未发布」，由主理人打 tag 发版时替换成当天日期（UTC）。
 
+## [Unreleased]
+
+### 修复：非住宅 Reality 用户不能借 route 1 走住宅出口
+
+- **每个 Reality 用户都有 per-user 的 route-1 规则，非住宅用户落到 `block`**：4.2.0 的
+  通用 `resi-route` 指向兜底住宅槽，没有住宅权益的用户只要把自己 UUID 第 6/7 字节改成
+  `0001` 就能借到住宅出口（4.1.x 双 inbound 共用 `clients` 时已有同类暴露面）。
+  现在未停用、有 Reality 权益的用户一律生成 `resi-u-<user_id>`：有住宅权益 →
+  `vlessRoute: 1 → relay-slot-N`；没有住宅权益 → `vlessRoute: 1 → block`。
+- **通用 `resi-route` 改为 `vlessRoute: 1 → block`**：新用户（或权益刚变更）的 per-user
+  规则尚未经 gRPC 落地时，route 1 被拒 —— 既不漏到直连，也不借住宅出口；住宅用户的
+  fail-closed 语义因此从「落到兜底槽」收紧为「拒绝」。`resi-fallback`（无 route →
+  `direct`）不变，直连节点（route 0）不受影响。
+
 ## [4.2.0] - 2026-10-30
 
 ### REALITY 443 + self-steal

@@ -74,7 +74,8 @@ pub async fn update_group_slots_as(
 
 /// 新建用户时分槽（spec §5.6 规则 1）**并给他一条住宅 HY2 凭据**（spec §3.1）。
 /// **在 `Store::update` 的闭包里调**，与 `users.push(...)` 同一次写盘 —— 否则会出现
-/// 「用户已存在但没有槽位」的中间态，那一瞬间他的 Reality 住宅会落到兜底槽；
+/// 「用户已存在但没有槽位」的中间态，那一瞬间他的 Reality 住宅会被通用 route 1 拒绝
+/// （4.2.1 起落到 `block`，不会借兜底槽）；
 /// 凭据同理：没有凭据 ⇒ `nodes_for` 压根不发住宅 HY2 节点，他刷出来的订阅里少一个节点。
 ///
 /// 返回值仍只报**分槽**结果（调用方据此判要不要重算 Xray 槽规则）；凭据分没分到由调用方
@@ -560,8 +561,9 @@ fn is_connect_error(e: &anyhow::Error) -> bool {
 /// 返回发出的增删条数（0 = 本来就一致）。任一调用失败立刻返回 `Err`，**不回滚** ——
 /// 下一轮 `ListRule` 会看到真实状态再补差分（幂等）。
 ///
-/// 差分要**连表序一起比**：Xray 按表序首条匹配，兜底规则（没有 `user` 条件，吃掉
-/// 整个住宅入站）一旦排在某条用户规则之前，那个用户就会被路由到兜底槽而不是自己的槽。
+/// 差分要**连表序一起比**：Xray 按表序首条匹配，通用 route-1 规则（没有 `user` 条件，
+/// 吃掉整个入站的 route 1）一旦排在某条用户规则之前，那个用户的 route 1 会直接落到
+/// `block`，而不是自己的槽。
 /// 所以「内容一致但兜底不在表尾」也算差异 —— 否则上一轮把兜底挪回表尾那步失败之后，
 /// 下一轮会误判为一致、记哈希清脏，把错序永久固化下来。
 async fn apply_slot_rules(xray: &dyn XrayApi, want: &[SlotRule]) -> anyhow::Result<usize> {
@@ -582,11 +584,12 @@ async fn apply_slot_rules(xray: &dyn XrayApi, want: &[SlotRule]) -> anyhow::Resu
         .collect();
     let wanted: BTreeSet<&str> = want.iter().map(|r| r.rule_tag.as_str()).collect();
     let mut calls = 0usize;
-    // 表尾两条通用规则：`resi-route`（route 1 → 兜底槽）必须在全部用户规则**之后**，
-    // `resi-fallback`（→ direct）永远最后（spec §3.3）。
+    // 表尾两条通用规则：`resi-route`（route 1 → block，4.2.1 安全修订）必须在全部用户
+    // 规则**之后**，`resi-fallback`（→ direct）永远最后（spec §3.3）。
     let (body, tails): (Vec<&SlotRule>, Vec<&SlotRule>) =
         want.iter().partition(|r| !r.emails.is_empty());
-    // ① 多出来的（用户删了 / 没了住宅权益 / 换了 tag 写法）
+    // ① 多出来的（用户删了 / 换了 tag 写法）。住宅权益变化不在此列：4.2.1 起用户仍有
+    //    per-user 规则，只是 outbound 从槽变成 block，走 ② 的先删再加。
     for (tag, _) in &live {
         if !wanted.contains(tag.as_str()) {
             xray.remove_rule(tag).await?;
@@ -612,7 +615,7 @@ async fn apply_slot_rules(xray: &dyn XrayApi, want: &[SlotRule]) -> anyhow::Resu
     //    用户规则之后。①删掉的那些不算数：判位置只看留下来的（`wanted` 里的）那些规则。
     //
     //    顺序错了为什么必须修：`resi-route` 不带 `user`，一旦排在某个用户规则之前，那个
-    //    用户的 route 1 流量会被它先匹配走（落到兜底槽而不是自己的槽）。
+    //    用户的 route 1 流量会被它先匹配走（直接 block，而不是落到自己的槽）。
     let last_kept: Vec<&str> = live
         .iter()
         .rev()
@@ -2079,7 +2082,7 @@ mod tests {
                 format!("add-rule:resi-u-{moved}:relay-slot-1"),
                 "remove-rule:resi-route".to_string(),
                 "remove-rule:resi-fallback".to_string(),
-                "add-rule:resi-route:relay-slot-0".to_string(),
+                "add-rule:resi-route:block".to_string(),
                 "add-rule:resi-fallback:direct".to_string(),
             ],
             "先删再加（重名会让整条 AddRule 报错），最后把两条通用规则按序挪回表尾"
@@ -2094,8 +2097,9 @@ mod tests {
     }
 
     /// 上一轮「把兜底挪回表尾」那步失败留下的错序（兜底排在用户规则中间）：
-    /// 内容一模一样，但 Xray 首条匹配会把后面那些用户吃到兜底槽。差分必须看见这个差异，
-    /// 把兜底挪回表尾，而且**不重启** xray。
+    /// 内容一模一样，但 Xray 首条匹配会让后面那些用户的 route 1 直接落到 block
+    /// （4.2.1 起通用 route 1 就是拒绝）。差分必须看见这个差异，把表尾两条挪回去，
+    /// 而且**不重启** xray。
     #[tokio::test]
     async fn a_fallback_stuck_in_the_middle_is_moved_back_to_the_tail() {
         let d = tempfile::tempdir().unwrap();
@@ -2120,7 +2124,7 @@ mod tests {
                 "list-rules".to_string(),
                 "remove-rule:resi-route".to_string(),
                 "remove-rule:resi-fallback".to_string(),
-                "add-rule:resi-route:relay-slot-0".to_string(),
+                "add-rule:resi-route:block".to_string(),
                 "add-rule:resi-fallback:direct".to_string(),
             ],
             "只挪表尾两条通用规则，用户规则一条都不碰"

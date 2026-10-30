@@ -99,7 +99,7 @@ client --TCP 443--> Xray REALITY (front=public，新装机)
 | 节点 | UUID | 服务端 `vlessRoute` | 路由 |
 |---|---|---|---|
 | Reality直连 | `base` 的第 7/8 字节 = `0000` | 0 | 规则不匹配 → 兜底 `direct` |
-| Reality住宅 | `base` 的第 7/8 字节 = `0001` | 1 | 先匹配「本用户 + route 1」→ 自己的槽；没规则时落到通用 route 1 → 兜底槽 |
+| Reality住宅 | `base` 的第 7/8 字节 = `0001` | 1 | 先匹配「本用户 + route 1」→ 自己的槽；规则尚未收敛时落到通用 route 1 → **block**（4.2.1） |
 
 - `base` 是 `User.credentials.vless_uuid`（state 里的原值）。Xray 的 `ProcessUUID` 清零第 7/8 字节后查用户，所以两个 UUID 映射到同一个 email。
 - 新增 `bui_schema::sub::routed_uuid(base, route)`（或 `nodes::routed_uuid`）：解析失败时原样返回，不 panic；路由常量 `DIRECT_ROUTE = 0`、`RESIDENTIAL_ROUTE = 1`。
@@ -108,24 +108,35 @@ client --TCP 443--> Xray REALITY (front=public，新装机)
 
 ### 3.3 路由规则（顺序即语义）
 
+> **4.2.1 安全修订**：4.2.0 的通用 `resi-route` 指向兜底住宅槽，非住宅 Reality 用户只要
+> 自己把 UUID 第 6/7 字节改成 `0001` 就能借到住宅出口（4.1.x 双 inbound 共用 clients 时
+> 已有的同类暴露面）。4.2.1 起每个 Reality 用户都有 per-user 规则（住宅 → 自己的槽，
+> 非住宅 → `block`），通用 route 1 也改成 `block`；未收敛窗口从「落到兜底槽」收紧为
+> 「拒绝」，既不漏直连也不借住宅。
+
 ```
 1. {"type":"field","ip":["::/0"],"outboundTag":"block"}                       # 服务端 IPv4-only，保留
 2. {"type":"field","inboundTag":["api"],"outboundTag":"api"}
-3. 每个住宅用户一条：
+3. 每个未停用、有 Reality 权益的用户一条（按 user_id 升序）：
+   有住宅权益：
    {"type":"field","ruleTag":"resi-u-<user_id>","inboundTag":["vless"],
     "user":["<user_id>"],"vlessRoute":"1","outboundTag":"relay-slot-N"}
-4. 通用住宅兜底：
+   没有住宅权益：
+   {"type":"field","ruleTag":"resi-u-<user_id>","inboundTag":["vless"],
+    "user":["<user_id>"],"vlessRoute":"1","outboundTag":"block"}
+4. 通用 route 1 兜底（4.2.1 起拒绝）：
    {"type":"field","ruleTag":"resi-route","inboundTag":["vless"],
-    "vlessRoute":"1","outboundTag":"relay-slot-<fallback>"}
+    "vlessRoute":"1","outboundTag":"block"}
 5. 最终兜底：
    {"type":"field","ruleTag":"resi-fallback","inboundTag":["vless"],"outboundTag":"direct"}
 ```
 
-- 新住宅用户规则还没经 gRPC 落地的窗口里，route 1 会落到兜底槽（仍是住宅出口，fail-closed），不会走直连。
+- 任何 Reality 用户的 per-user 规则还没经 gRPC 落地的窗口里，route 1 落到通用 `resi-route` → `block`（fail-closed：不走直连、不借住宅）；住宅用户刷不出住宅出口，但也不会被错误放行。
+- 非住宅 Reality 用户即使自己构造 route 1 UUID，也会被自己的 `resi-u-<user_id> → block` 拦住。
 - 直连节点 route 0 不匹配 3/4，落到 5 → `direct`。
 - `SlotRule` 增加 `vless_route: Option<u16>`；`rule_json` 写 `"vlessRoute": "<n>"`；`add_rule_request` 填 `vless_route_list`（proto 字段 20）。
 - 通用规则 tag 用常量 `RESI_ROUTE_RULE_TAG = "resi-route"`，不能以 `USER_RULE_PREFIX` 开头（否则收敛会把线上规则当孤儿删掉）。
-- `structural_hash` 仍剥离带 `user` 的规则；`resi-route` / `resi-fallback` 留在结构哈希里（兜底槽变化 = 重启）。
+- `structural_hash` 仍剥离带 `user` 的规则；两条通用规则自 4.2.1 起都是常量（`resi-route → block`、`resi-fallback → direct`），用户增删/改槽/权益变化（relay ↔ block）只改 per-user 规则、走 gRPC 收敛；槽位表本身增删仍改出站表，必须重启。
 
 ## 4. 配置渲染
 
@@ -234,8 +245,8 @@ chain input {
 
 - `routed_uuid`：route 0/1、第三组 hex 正确、非法 UUID 原样返回、base 的 6/7 字节被替换。
 - `nodes_for`：双权益用户得到两个节点、host/port 相同、UUID 第三组 `0000`/`0001`；只有直连/只有住宅的用户各得一个；住宅凭据逻辑不变。
-- `xray::config`：单 inbound tag `vless`；`public` port 443 / `l4` listen 127.0.0.1:10443；dest/serverNames/xver；`sniffing.routeOnly`；规则顺序与 `vlessRoute`；`structural_hash`/`slot_rules_hash` 在加用户/改槽时不重启、兜底槽变化时重启。
-- `slot_rules`：per-user + `resi-route` + `resi-fallback`；`rule_json` 的 `vlessRoute` 字符串；`add_rule_request` 的 `vless_route_list`。
+- `xray::config`：单 inbound tag `vless`；`public` port 443 / `l4` listen 127.0.0.1:10443；dest/serverNames/xver；`sniffing.routeOnly`；规则顺序与 `vlessRoute`（住宅用户 → 槽，非住宅用户 → block，通用 route 1 → block）；`structural_hash`/`slot_rules_hash` 在加用户/改槽/权益变化时不重启（走 gRPC 收敛），槽位表/入站等结构变化才重启。
+- `slot_rules`：每个 Reality 用户一条 per-user 规则 + `resi-route`（→ block）+ `resi-fallback`（→ direct）；`rule_json` 的 `vlessRoute` 字符串；`add_rule_request` 的 `vless_route_list`。
 - Caddyfile：`https://{domain}:9443`、`servers :9443`、`proxy_protocol` 在 `tls` 前、`:80` 跳转、无 site 级 `bind`、`auto_https disable_redirects`。
 - nft：input 链两条 drop；`input_signature` 稳定；`nft status`/selfcheck 用例。
 - 面板：`XRAY_INBOUND_TAGS` 单 tag；sync 测试的 tag 字符串更新；`api_admin` 的端口/SNI。
@@ -249,7 +260,7 @@ chain input {
 - `openssl s_client -connect <域名>:443 -servername <域名>` 未认证回落拿到面板 200（self-steal）。
 - `curl -4 https://<域名>/` 200；面板登录；订阅四个端点 200。
 - v2rayN / `bui-c` 各拉一次订阅：两个 Reality 节点同 host/port，UUID 不同；直连节点出口 = VPS IPv4，住宅节点出口 = 槽 IP。
-- 住宅用户在**通用规则尚未收敛**的窗口内（新建用户立即连）走兜底槽，不走直连（可人工制造规则缺失验证）。
+- 住宅用户在 **per-user 规则尚未收敛**的窗口内（新建用户立即连）被通用 `resi-route` 拒绝（不走直连、不借兜底槽）；非住宅用户构造 route 1 UUID 同样被自己的 `→ block` 规则拒绝（可人工制造规则缺失验证）。
 - `ss -ltnp`：公网只有 443（或 haproxy 的 443）与 80；9443 只被 loopback 访问；`nft list table inet bui` 有 input 链。
 - 证书：Caddy 日志无 ACME 错误；强制续期一次（Caddy admin `/certificates/.../renew`，以实际 API 为准）确认 HTTP-01/TLS-ALPN 至少一条成功。
 - **反代线（不可回归项）**：带 SNI `www.nbdpsy.com` / `database.nbdpsy.com` 的 TLS 请求仍到国内源站；源站看到的客户端 IP 仍来自 `send-proxy-v2`（不是 VPS 的 127.0.0.1）；tizi 的 80 端口 HTTP 分流仍把 NBDpsy 域名送到源站、其余送到本地面板；rick 的 `table ip nbdpsy_l4` 仍在。至少从境外视角（或用户侧现网）实测一次。

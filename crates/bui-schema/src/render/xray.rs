@@ -3,8 +3,12 @@
 //!
 //! 2026-10-30 裁决（REALITY 443 + self-steal）：`vless-direct` / `vless-residential` 两个
 //! inbound 合并成一个，未认证连接回落到本机 Caddy（`dest = 127.0.0.1:9443`）；住宅用户
-//! 的路由按 `user` + `vlessRoute: 1` 落到自己的槽，其余 route 1 落到兜底槽，route 0
-//! 落到最终兜底 `direct`。
+//! 的路由按 `user` + `vlessRoute: 1` 落到自己的槽，route 0 落到最终兜底 `direct`。
+//!
+//! 4.2.1 安全修订：**没有住宅权益的 Reality 用户也会有一条 `user + vlessRoute: 1 → block`
+//! 的 per-user 规则**，通用 `resi-route` 也从「兜底槽」改成 `block` —— 非住宅用户自己把
+//! UUID 第 6/7 字节改成 `0001` 只会被拒，不会借到住宅出口；新住宅用户的规则尚未经 gRPC
+//! 落地时同样被拒（fail-closed 从「落到兜底槽」收紧为「block」）。
 
 use crate::model::{NodeParams, Protocol, RealityFront, Residential, User, CADDY_LOCAL_PORT};
 use crate::nodes::RESIDENTIAL_ROUTE;
@@ -14,6 +18,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 /// 字面 IPv6 的 blackhole 出站 tag。路由首条把 `::/0` 送到它，服务端绝不新建 IPv6 出站。
+/// 4.2.1 起它同时是「route 1 未授权」的落点（非住宅用户与通用兜底都指它）。
 pub const BLOCK_TAG: &str = "block";
 
 /// 唯一 REALITY inbound 的 tag（`XRAY_INBOUND_TAGS` 与用户同步共用同一个字面量）。
@@ -23,10 +28,11 @@ pub const INBOUND_TAG: &str = "vless";
 /// 改它等于把线上已经装载的旧规则变成认不出来的孤儿（收敛会把它们当多余项删掉，
 /// 一轮之内自愈，但别没事乱改）。
 pub const USER_RULE_PREFIX: &str = "resi-u-";
-/// 通用住宅兜底规则的 `ruleTag`：没有 `user` 条件、只匹配 `vlessRoute: 1`，排在全部
-/// 用户规则之后、最终兜底之前。新用户的 gRPC 规则还没落地的窗口里，route 1 落到这一条
-/// （仍是住宅出口，fail-closed）。**不能**以 [`USER_RULE_PREFIX`] 开头（否则收敛会把
-/// 线上规则当孤儿删掉）。
+/// 通用 route-1 规则（4.2.1 起**拒绝**）：没有 `user` 条件、只匹配 `vlessRoute: 1`，
+/// 排在全部用户规则之后、最终兜底之前。每个 Reality 用户都有 per-user 规则（住宅 → 自己的
+/// 槽，非住宅 → `block`），所以这一条只兜「规则尚未经 gRPC 落地」的窗口——落点是
+/// [`BLOCK_TAG`]，既不漏到直连、也不借住宅出口。**不能**以 [`USER_RULE_PREFIX`] 开头
+/// （否则收敛会把线上规则当孤儿删掉）。
 pub const RESI_ROUTE_RULE_TAG: &str = "resi-route";
 /// 最终兜底规则的 `ruleTag`：无 `user`、无 `vlessRoute`，永远排在表尾（`direct`）。
 pub const FALLBACK_RULE_TAG: &str = "resi-fallback";
@@ -59,8 +65,10 @@ const API_PORT: u16 = 10085;
 /// `127.0.0.1:(2080+i)`）。路由表（顺序即语义，spec §3.3）：
 /// 1. 字面 IPv6 → blackhole；
 /// 2. api inbound → api；
-/// 3. 每个住宅用户一条 `user + vlessRoute: 1 → relay-slot-<自己的槽>`；
-/// 4. `resi-route`：无 `user`，`vlessRoute: 1 → relay-slot-<兜底槽>`；
+/// 3. 每个未停用、有 Reality 权益的用户一条：
+///    有住宅权益 → `user + vlessRoute: 1 → relay-slot-<自己的槽>`；
+///    没有住宅权益 → `user + vlessRoute: 1 → block`（4.2.1 安全修订）；
+/// 4. `resi-route`：无 `user`，`vlessRoute: 1 → block`（规则尚未收敛的窗口，拒绝）；
 /// 5. `resi-fallback`：无 `user`、无 route → `direct`（直连节点走这一条）。
 ///
 /// `email` 就是 `user_id`（spec §3.3，gRPC 侧唯一键）。
@@ -133,11 +141,14 @@ pub fn config(node: &NodeParams, users: &[User], resi: &Residential, _paths: &Pa
     })
 }
 
-/// 期望态的住宅槽规则表：每个住宅用户一条（按 `user_id` 升序），**末尾两条通用规则**
-/// （`resi-route` → 兜底槽，`resi-fallback` → direct）。
+/// 期望态的槽规则表：**每个未停用、有 Reality 权益的用户一条**（按 `user_id` 升序），
+/// **末尾两条通用规则**（`resi-route` → `block`，`resi-fallback` → `direct`）。
 ///
 /// 渲染（写文件）与 gRPC 收敛（`residential::slots::converge_xray`）共用这一个函数，
 /// 两边不可能各算出一份不同的表（D7）。
+///
+/// 有住宅权益 → 自己的槽；没有住宅权益 → `block`（4.2.1 安全修订：不再靠「没有规则」
+/// 让它落到通用规则上，通用规则本身也改成 `block`）。
 ///
 /// 被封（超限/到期）的用户**留着**他的规则：他的凭据已经被 `sync_users` 从 `clients`
 /// 里摘掉了，规则匹配不到任何连接，留着能让「渲染 = runtime」这条不变量保持简单。
@@ -149,17 +160,21 @@ pub fn slot_rules(users: &[User], resi: &Residential) -> Vec<SlotRule> {
             inbound_tag: INBOUND_TAG.to_string(),
             emails: vec![u.user_id.to_string()],
             vless_route: Some(RESIDENTIAL_ROUTE),
-            outbound_tag: relay_tag(slots::index_of_user(u, resi)),
+            outbound_tag: if u.entitlements.residential.is_some() {
+                relay_tag(slots::index_of_user(u, resi))
+            } else {
+                BLOCK_TAG.to_string()
+            },
         })
         .collect();
-    // 通用住宅兜底：新用户的 per-user 规则还没经 gRPC 落地的窗口里，route 1 落到这里
-    // （仍是住宅出口，fail-closed —— 不会漏到直连）。
+    // 通用 route-1 兜底（4.2.1）：落点从「兜底槽」改成 `block`。per-user 规则尚未经
+    // gRPC 落地的窗口里 route 1 会被拒 —— 既不漏到直连，也不借住宅出口。
     out.push(SlotRule {
         rule_tag: RESI_ROUTE_RULE_TAG.to_string(),
         inbound_tag: INBOUND_TAG.to_string(),
         emails: vec![],
         vless_route: Some(RESIDENTIAL_ROUTE),
-        outbound_tag: relay_tag(slots::fallback_index(resi)),
+        outbound_tag: BLOCK_TAG.to_string(),
     });
     // 最终兜底：直连节点（route 0）落到 direct。
     out.push(SlotRule {
@@ -196,17 +211,15 @@ fn relay_tag(i: u16) -> String {
     format!("relay-slot-{i}")
 }
 
-/// 会出现在槽规则里的用户：未停用、有 Reality 权益、**且有住宅权益**（其余人没有住宅
-/// 节点，列进 `user` 只会匹配一个用不到的 email）。按 `user_id` 升序 —— 渲染必须确定性，
-/// 顺序抖动会让文件与两个哈希无谓地变。
+/// 会出现在槽规则里的用户：**未停用、有 Reality 权益**（不论有没有住宅权益）。
+///
+/// 4.2.1 安全修订：没有住宅权益的用户也必须有一条 `→ block` 的 route-1 规则，否则他可以
+/// 自己把 UUID 第 6/7 字节改成 `0001`，直接落进通用 `resi-route`（旧语义是兜底住宅槽）。
+/// 按 `user_id` 升序 —— 渲染必须确定性，顺序抖动会让文件与两个哈希无谓地变。
 fn slot_users(users: &[User]) -> Vec<&User> {
     let mut v: Vec<&User> = users
         .iter()
-        .filter(|u| {
-            !u.disabled
-                && u.entitlements.protocols.contains(&Protocol::Reality)
-                && u.entitlements.residential.is_some()
-        })
+        .filter(|u| !u.disabled && u.entitlements.protocols.contains(&Protocol::Reality))
         .collect();
     v.sort_unstable_by_key(|u| u.user_id);
     v
@@ -215,9 +228,12 @@ fn slot_users(users: &[User]) -> Vec<&User> {
 /// 配置的结构哈希：去掉每个 inbound 的 `settings.clients`、**以及 `routing.rules` 里
 /// 带 `user` 字段的规则**后取 sha256。
 ///
-/// 用户增删走 gRPC、用户改槽位只改这些 `user` 规则（也走 gRPC），两者都不该触发
-/// xray 重启（D7 / spec §3.3；重启会掐断全部 REALITY 连接）。兜底规则没有 `user`，
-/// 留在哈希里 —— 它只在兜底槽序号变化时变，那一刻本来就该重启。
+/// 用户增删、用户改槽位、用户权益变化（住宅 ↔ 非住宅，per-user 规则在 relay 与 block
+/// 之间切换）都只改这些 `user` 规则（走 gRPC 收敛），不该触发 xray 重启
+/// （D7 / spec §3.3；重启会掐断全部 REALITY 连接）。
+///
+/// 4.2.1 起两条通用规则都是常量（`resi-route → block`、`resi-fallback → direct`），
+/// 它们与槽位表无关；结构调整只剩「槽位表本身 + front/入站/出站」在哈希里。
 pub fn structural_hash(cfg: &Value) -> String {
     let mut stripped = cfg.clone();
     if let Some(inbounds) = stripped.get_mut("inbounds").and_then(Value::as_array_mut) {
@@ -475,13 +491,13 @@ mod tests {
                 u.user_id.to_string()
             )]
         );
-        // 通用住宅兜底（route 1 → 兜底槽）排在用户规则之后、最终兜底之前：
-        // 新用户的 per-user 规则还没经 gRPC 落地时，route 1 落到这里（仍是住宅出口）
+        // 通用 route-1 兜底（4.2.1 起 → block）排在用户规则之后、最终兜底之前：
+        // 新用户的 per-user 规则还没经 gRPC 落地时，route 1 被拒（不漏直连、不借住宅）
         let route = &r[3];
         assert_eq!(route["ruleTag"], "resi-route");
-        assert_eq!(route["outboundTag"], "relay-slot-0");
+        assert_eq!(route["outboundTag"], "block");
         assert_eq!(route["vlessRoute"], "1");
-        assert!(route.get("user").is_none(), "通用住宅兜底不带 user");
+        assert!(route.get("user").is_none(), "通用 route-1 兜底不带 user");
         let last = r.last().unwrap();
         assert_eq!(last["ruleTag"], "resi-fallback");
         assert_eq!(
@@ -599,24 +615,76 @@ mod tests {
         );
     }
 
-    /// 停用 / 没有 Reality 权益 / 没有住宅权益的用户都不进槽规则 —— 前两种在 `clients`
-    /// 里也不存在，第三种根本没有住宅节点，列进 `user` 只会匹配一个用不到的 email。
+    /// 停用 / 没有 Reality 权益的用户不进槽规则（前两种在 `clients` 里也不存在）；
+    /// **没有住宅权益的 Reality 用户仍要有一条 `→ block` 的 per-user 规则**（4.2.1）。
     #[test]
-    fn disabled_non_reality_and_direct_only_users_are_left_out_of_the_slot_rules() {
+    fn disabled_and_non_reality_users_get_no_rule_but_direct_only_users_are_blocked() {
         let mut disabled = user(2, Some(Uuid::from_u128(2)));
         disabled.disabled = true;
         let mut hy2_only = user(3, Some(Uuid::from_u128(2)));
         hy2_only.entitlements.protocols = vec![Protocol::Hysteria2];
         let mut direct_only = user(4, None);
         direct_only.entitlements.residential = None;
+        let direct_id = direct_only.user_id;
         let cfg = config(
             &node(),
             &[disabled, hy2_only, direct_only],
             &resi(2),
             &Paths::default_server(),
         );
-        assert!(user_rules(&cfg).is_empty());
-        assert_eq!(rules(&cfg).len(), 4, "只剩 IPv6 block / api / 直连 / 兜底");
+        assert_eq!(
+            user_rules(&cfg),
+            vec![(
+                user_rule_tag(direct_id),
+                "block".to_string(),
+                direct_id.to_string()
+            )],
+            "非住宅 Reality 用户的 route 1 必须被拒"
+        );
+        assert_eq!(
+            rules(&cfg).len(),
+            5,
+            "IPv6 block / api / 非住宅用户 → block / resi-route → block / resi-fallback → direct"
+        );
+    }
+
+    /// 4.2.1 安全修订的核心：非住宅 Reality 用户自己把 UUID 第 6/7 字节改成 `0001`，
+    /// 也只会被自己的 per-user 规则 `→ block` 拦住；通用 `resi-route` 同样是 block。
+    /// 权益从「无住宅」变「有住宅」只改他的 user 规则（relay vs block）⇒ gRPC 收敛，
+    /// 不改结构哈希。
+    #[test]
+    fn a_direct_only_reality_user_is_blocked_on_route_1() {
+        let p = Paths::default_server();
+        let r = resi(1);
+        let mut direct_only = user(1, None);
+        direct_only.entitlements.residential = None;
+        let blocked = config(&node(), std::slice::from_ref(&direct_only), &r, &p);
+        assert_eq!(
+            user_rules(&blocked),
+            vec![(
+                user_rule_tag(direct_only.user_id),
+                "block".to_string(),
+                direct_only.user_id.to_string()
+            )]
+        );
+        let tail = &rules(&blocked)[rules(&blocked).len() - 2];
+        assert_eq!(tail["ruleTag"], RESI_ROUTE_RULE_TAG);
+        assert_eq!(tail["outboundTag"], "block");
+
+        let entitled = user(1, None); // 同一个 user_id，带住宅权益
+        assert_eq!(entitled.user_id, direct_only.user_id);
+        let with_relay = config(&node(), std::slice::from_ref(&entitled), &r, &p);
+        assert_eq!(user_rules(&with_relay)[0].1, "relay-slot-0");
+        assert_eq!(
+            structural_hash(&blocked),
+            structural_hash(&with_relay),
+            "权益变化只改 user 规则，不重启 xray"
+        );
+        assert_ne!(
+            slot_rules_hash(&blocked),
+            slot_rules_hash(&with_relay),
+            "权益变化必须触发 gRPC 收敛"
+        );
     }
 
     /// D7：加减用户、改用户槽位都**不**改结构哈希（否则 xray 每次加用户都重启，
@@ -657,21 +725,38 @@ mod tests {
         assert_ne!(structural_hash(&a), structural_hash(&b));
     }
 
-    /// 两条通用规则都没有 `user` ⇒ **留在**结构哈希里：`resi-route` 指向兜底槽，
-    /// 兜底槽序号变化时它变，那一刻本来就该重启（D7）；`resi-fallback` 恒为 `direct`。
+    /// 4.2.1：两条通用规则都是常量（`resi-route → block`、`resi-fallback → direct`），
+    /// **不再随兜底槽序号变化**；它们留在结构哈希里也无害。用户增删 / 分槽变化只改被剥离
+    /// 的 `user` 规则 ⇒ 结构哈希不变（gRPC 收敛）。槽位表本身增删仍会改出站表 ⇒ 仍要重启，
+    /// 那是出站表的变化，不是这两条规则。
     #[test]
-    fn the_generic_tail_rules_stay_inside_the_structural_hash() {
+    fn the_generic_tail_rules_are_constant_across_slot_and_user_changes() {
         let p = Paths::default_server();
-        let mut r = resi(2);
-        let a = config(&node(), &[], &r, &p);
-        // 删掉序号 0 那个槽 ⇒ 兜底槽变成槽 1
-        r.slots.retain(|s| s.index != 0);
-        let b = config(&node(), &[], &r, &p);
-        let tail = &rules(&b)[rules(&b).len() - 2];
-        assert_eq!(tail["ruleTag"], RESI_ROUTE_RULE_TAG);
-        assert_eq!(tail["outboundTag"], "relay-slot-1");
-        assert_eq!(rules(&b).last().unwrap()["outboundTag"], "direct");
-        assert_ne!(structural_hash(&a), structural_hash(&b));
+        let r = resi(2);
+        let empty = config(&node(), &[], &r, &p);
+        let tail = rules(&empty)[rules(&empty).len() - 2..].to_vec();
+        assert_eq!(tail[0]["ruleTag"], RESI_ROUTE_RULE_TAG);
+        assert_eq!(tail[0]["outboundTag"], "block");
+        assert_eq!(tail[0]["vlessRoute"], "1");
+        assert_eq!(tail[1]["ruleTag"], FALLBACK_RULE_TAG);
+        assert_eq!(tail[1]["outboundTag"], "direct");
+        assert!(tail[1].get("vlessRoute").is_none());
+
+        // 加用户 / 改分槽：表尾一字不差，结构哈希不变
+        let with_user = config(&node(), &[user(1, Some(Uuid::from_u128(2)))], &r, &p);
+        assert_eq!(&rules(&with_user)[rules(&with_user).len() - 2..], &tail[..]);
+        assert_eq!(structural_hash(&empty), structural_hash(&with_user));
+
+        // 槽位表本身变化：出站表变了 ⇒ 仍要重启（不是因为表尾规则）
+        let mut shrunk = r.clone();
+        shrunk.slots.retain(|s| s.index != 0);
+        let one_slot = config(&node(), &[], &shrunk, &p);
+        assert_eq!(
+            &rules(&one_slot)[rules(&one_slot).len() - 2..],
+            &tail[..],
+            "表尾仍不引用任何槽"
+        );
+        assert_ne!(structural_hash(&empty), structural_hash(&one_slot));
     }
 
     #[test]
