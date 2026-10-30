@@ -8,6 +8,25 @@
 `version` 的唯一来源是根 `Cargo.toml` 的 `[workspace.package] version`；改版本必须同时在本文件加一段，`scripts/release/check-version.sh` 会在 CI 里卡住不一致（它只认 `## [<version>]` 这个标题，日期不参与校验）。
 未发布的版本日期写「未发布」，由主理人打 tag 发版时替换成当天日期（UTC）。
 
+## [4.3.0] - 2026-10-30
+
+### bui-c：订阅来源管理与代理暂停/恢复
+
+- **`bui-c subscription` / `bui-c subscription remove`**：显示面板订阅来源（`base_url` +
+  打码后的 username 与面板来源节点数）；`remove` 确认（`-y` 跳过）后只清 `profiles.panel`，
+  节点、墓碑、active、模式与端口全部保留。清除后不再从面板自动刷新节点，每日自更新的
+  manifest/二进制优先来源回落到 GitHub。
+- **`bui-c stop` / `bui-c start`**：暂停落标记 `/opt/bui-c/paused`（0600，一行 RFC3339 + 来源），
+  `stop` 写标记 → `systemctl disable` → `systemctl stop`（timer 不动）；`start` 清标记 →
+  与导入同一条 apply 路径 → `systemctl enable` → timer 不 active 时 start 之。
+  `bui-c check` 看到标记返回 `Verdict::Paused`：不探测、不重启、不自更新，只记一行日志；
+  `bui-c update` 在暂停时直接拒绝（`--auto on|off` 不受影响）；`switch` / `mode` /
+  `import --activate` 先清标记。**暂停期间除这些显式激活外的 apply 一律跳过**（只保存配置，
+  不装内核、不动 UFW、不重启）；菜单连接检查、服务控制重启与 `[7]` 的安装段同样只提示/拒绝。
+- **菜单**：`[7] 更新与维护` 新增 `[4] 订阅来源`（显示 + `[1] 清除`）；`[4] 服务控制` 新增
+  `[3] 停止代理 / 恢复代理`；状态行在暂停时显示「已停止（直连）」，`status --json` 多一个
+  `paused` 字段。
+
 ## [4.2.2] - 2026-10-30
 
 ### HY2 两个 must-fix：sniGuard dns-san / trafficStats secret

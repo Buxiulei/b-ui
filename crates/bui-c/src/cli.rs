@@ -11,6 +11,7 @@ use crate::menu::{self, Action, MaintAction, MaintStatus, NextStep, Prompt, Stat
 use crate::net::Net;
 use crate::nettest::{self, Event, Hooks, Painter};
 use crate::paths::{Paths, UNIT_MAIN, UNIT_TIMER};
+use crate::pause;
 use crate::profiles::{
     best_source, https_base, kind_slug, profile_name, rfc3339, same_endpoint, Blocked, Mode, Panel,
     Profile, Profiles, Source, Upsert,
@@ -80,6 +81,15 @@ pub enum Cmd {
     },
     /// 巡检（bui-c.timer 每分钟调用）
     Check,
+    /// 停止代理、恢复直连：写暂停标记并停掉 bui-c.service（timer 留着）
+    Stop,
+    /// 恢复代理：清暂停标记、重新 apply 并 enable bui-c.service
+    Start,
+    /// 显示订阅来源；remove 子命令清除它（只清 panel，节点与 active 都保留）
+    Subscription {
+        #[command(subcommand)]
+        cmd: Option<SubscriptionCmd>,
+    },
     /// 按 manifest 升级自身与 sing-box；`--auto on|off` 只开关每日自动更新
     Update {
         #[arg(long)]
@@ -109,6 +119,13 @@ pub enum Cmd {
     },
     /// 进数字菜单（无参数时的默认行为）
     Menu,
+}
+
+/// `bui-c subscription remove`（4.3.0）。
+#[derive(Subcommand, Debug, PartialEq, Eq)]
+pub enum SubscriptionCmd {
+    /// 清除订阅来源：只清 profiles.panel，节点、墓碑、active 与模式都保留
+    Remove,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -362,6 +379,7 @@ fn engine_status<S: Sys, N: Net, P: Prompt>(ctx: &Ctx<'_, S, N, P>, prof: &Profi
         mode: prof.mode,
         service_running: systemd::is_active(ctx.sys, UNIT_MAIN),
         tun_up: Engine::new(ctx.sys, ctx.paths).tun_up(),
+        paused: pause::is_paused(ctx.sys, ctx.paths),
         socks_port: prof.socks_port,
         http_port: prof.http_port,
         // 上一次检查更新的结论，不为渲染一屏菜单去联网（写在 `update` / 巡检自更新里）
@@ -427,11 +445,25 @@ const TUN_NOT_READY: &str =
 
 /// 唯一的「改机器」路径：装内核 → 同步 UFW → apply。持锁才能调用：`LockGuard` 由顶层入口
 /// 拿（[`take_lock`]），这里只是收下凭证，自己绝不拿锁（spec §0.2 R11）。
+///
+/// 暂停守卫（4.3.0）：标记在就只打一行「配置未应用」并返回 no-op，不装内核、不动 UFW、
+/// 不 apply。显式激活类动作（`start` / `switch` / `mode` / `import --activate`）都先清标记，
+/// 不受影响；其余路径（无激活的导入刷新活动节点、v3 导入、删除后切节点）可以保存配置，
+/// 但不会把服务拉起来。
 fn apply_with_ufw<S: Sys, N: Net, P: Prompt>(
     ctx: &mut Ctx<'_, S, N, P>,
     prof: &Profiles,
     _: &LockGuard,
 ) -> Result<Applied> {
+    if pause::is_paused(ctx.sys, ctx.paths) {
+        ctx.say(pause::APPLY_SKIPPED);
+        return Ok(Applied {
+            config_changed: false,
+            units_changed: false,
+            restarted: false,
+            tun_ready: None,
+        });
+    }
     if update::ensure_kernel(
         ctx.sys,
         ctx.net,
@@ -901,6 +933,8 @@ fn apply_import<S: Sys, N: Net, P: Prompt>(
 ) -> Result<()> {
     let prof = &imported.prof;
     if imported.activated {
+        // 显式激活（4.3.0）：`import --activate` 或首次导入就是要跑，先清暂停标记
+        crate::pause::clear(ctx.sys, ctx.paths)?;
         apply_with_ufw(ctx, prof, g)?;
         let active = prof.active.clone().unwrap_or_default();
         ctx.say_aside(format!(
@@ -963,6 +997,7 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
                     "active": st.node, "label": st.label,
                     "mode": match prof.mode { Mode::Tun => "tun", Mode::Socks => "socks" },
                     "service": if st.service_running { "running" } else { "stopped" },
+                    "paused": st.paused,
                     "timer": if systemd::is_active(ctx.sys, UNIT_TIMER) { "active" } else { "inactive" },
                     "tun": if st.tun_up { "up" } else { "down" },
                     "socks_port": st.socks_port, "http_port": st.http_port,
@@ -1013,6 +1048,8 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
                     "节点 {shown} 不存在，用 `bui-c list` 看可用节点"
                 )));
             }
+            // 显式激活（4.3.0）：人选了节点就是要跑，先清暂停标记
+            pause::clear(ctx.sys, ctx.paths)?;
             if prof.active.as_deref() == Some(name.as_str()) {
                 // 兜底 apply 一次：配置丢了、单元没建时这是唯一不绕路的补救；配置没变就不重启
                 apply_with_ufw(ctx, &prof, &g)?;
@@ -1031,6 +1068,8 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
             let want: Mode = (*mode).into();
             prof.mode = want;
             prof.save(ctx.sys, ctx.paths)?;
+            // 显式激活（4.3.0）：切模式就是要跑，先清暂停标记
+            pause::clear(ctx.sys, ctx.paths)?;
             let label = match want {
                 Mode::Tun => "TUN",
                 Mode::Socks => "SOCKS",
@@ -1209,6 +1248,14 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
             Ok(())
         }
         Cmd::Check => run_check(ctx),
+        // 暂停 / 恢复（4.3.0）：用户意图，不是期望配置——只动 `/opt/bui-c/paused` 与
+        // bui-c.service 的 enable/start 状态，profiles.json 一个字节都不动
+        Cmd::Stop => stop_cmd(ctx, pause::SOURCE_CLI),
+        Cmd::Start => start_cmd(ctx),
+        Cmd::Subscription { cmd } => match cmd {
+            None => show_subscription(ctx),
+            Some(SubscriptionCmd::Remove) => remove_subscription(ctx),
+        },
         Cmd::Update { check_only, auto } => {
             // --auto 只翻开关、不联网：spec §6「每日 timer 自动，可关」的 CLI 入口。写 profiles.json，
             // 拿锁之后再读
@@ -1222,6 +1269,11 @@ pub fn dispatch<S: Sys, N: Net, P: Prompt>(cli: &Cli, ctx: &mut Ctx<'_, S, N, P>
                     if prof.auto_update { "开" } else { "关" }
                 ));
                 return Ok(());
+            }
+            // 暂停期间拒绝更新：装内核会重启主单元，等于把用户刚停掉的代理又拉起来（4.3.0）。
+            // 巡检里的自动更新由 `Verdict::Paused` 跳过，`--auto` 已在上面放行
+            if pause::is_paused(ctx.sys, ctx.paths) {
+                return Err(Error::msg(pause::UPDATE_REFUSED));
             }
             // 锁外读的这份只用来找面板（manifest 与产物的来源）
             let prof = Profiles::load(ctx.sys, ctx.paths)?;
@@ -1401,6 +1453,13 @@ fn import_v3_cmd<S: Sys, N: Net, P: Prompt>(
 /// 菜单 `[5]` 不走这里，走 [`check_menu`]：人点的是「连接检查」，不该顺带把二进制换掉
 /// （spec §6.7）。每日自更新只留在这条路径上。
 fn run_check<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()> {
+    // 暂停标记排在最前面（4.3.0）：连中断收敛都不做——收敛会 apply，等于把用户停掉的代理
+    // 拉回来。这一行是 timer 每分钟唯一的日志（journald 可见），`check::run` 里还有同一道
+    // 判据，给直接调用它的路径兜底
+    if pause::is_paused(ctx.sys, ctx.paths) {
+        ctx.say(pause::CHECK_SKIPPED);
+        return Ok(());
+    }
     // 中断收敛（spec §5.5、§0.2 R10 / R12）：锁外判一次，要收敛才**只试一次**锁，拿到后在锁里
     // 重判。收拾过（不论成败）这一轮就到此为止：刚 apply 起来的服务不该紧接着被探测、再按
     // 「探测失败」重启一次；自更新也等下一分钟。拿不到锁与 `Verdict::Busy` 同一个说法，不写
@@ -1427,6 +1486,11 @@ fn run_check<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()
     let v = check::run(ctx.sys, ctx.net, ctx.paths)?;
     match &v {
         Verdict::NoProfile => ctx.say("没有激活的节点，巡检跳过"),
+        // 上面已经先判过一遍；这里兜的是「判完之后、跑巡检之前」才被 `bui-c stop` 的窗口
+        Verdict::Paused => {
+            ctx.say(pause::CHECK_SKIPPED);
+            return Ok(());
+        }
         Verdict::Ok => ctx.say("正常：单元在跑、204 探测通过"),
         Verdict::Uncertain { failures } => {
             ctx.say("本地运行状态未确认，保留当前实例，本轮不执行恢复");
@@ -1556,6 +1620,91 @@ fn daily_self_update<S: Sys, N: Net, P: Prompt>(
         Err(e) => tracing::warn!(error = %e, "自更新失败，下轮再试"),
     }
     Ok(())
+}
+
+/// `bui-c stop` 与菜单 `[4]` → `[3] 停止代理`（4.3.0）：写标记 → disable → stop，timer 不动。
+///
+/// 「本机没有安装代理」= 没有单元文件、也没有节点：报错且**不写标记**，免得在一台干净的
+/// 机器上留下一个会让巡检永久跳过、`bui-c update` 永久拒绝的文件。
+/// `profiles.json` 读不出来也算「有节点」：坏文件不该让 `stop` 停不掉一台装着代理的机器。
+fn stop_cmd<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>, source: &str) -> Result<()> {
+    let g = take_lock(ctx)?;
+    let has_unit = ctx.sys.exists(&ctx.paths.unit(UNIT_MAIN));
+    let has_nodes = Profiles::load(ctx.sys, ctx.paths)
+        .map(|p| !p.profiles.is_empty())
+        .unwrap_or(true);
+    let stopped = pause::stop(ctx.sys, ctx.paths, has_unit || has_nodes, source)?;
+    drop(g);
+    if !stopped {
+        return Err(Error::msg(pause::NO_PROXY));
+    }
+    ctx.say(pause::STOPPED);
+    Ok(())
+}
+
+/// `bui-c start` 与菜单 `[4]` → `[3] 恢复代理`（4.3.0）：清标记 → 与导入同一条
+/// `apply_with_ufw`（装内核 → UFW → `Engine::apply`）→ `systemctl enable bui-c.service`
+/// → timer 不 active 时 start 它。没有活动节点时报错、**不清标记**；已经在跑且没有标记时
+/// 只提示，不重启。
+fn start_cmd<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()> {
+    let g = take_lock(ctx)?;
+    let prof = Profiles::load(ctx.sys, ctx.paths)?;
+    if !pause::begin_start(ctx.sys, ctx.paths, &prof)? {
+        ctx.say(pause::ALREADY_RUNNING);
+        return Ok(());
+    }
+    apply_with_ufw(ctx, &prof, &g)?;
+    systemd::enable(ctx.sys, UNIT_MAIN)?;
+    if !systemd::is_active(ctx.sys, UNIT_TIMER) {
+        systemd::start(ctx.sys, UNIT_TIMER)?;
+    }
+    ctx.say(pause::RESUMED);
+    Ok(())
+}
+
+/// `bui-c subscription`（4.3.0）：订阅来源的本地事实。`username` 是订阅路径的最后一段
+/// （等价凭据），经 [`menu::mask_username`] 打码后才打印。
+fn show_subscription<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()> {
+    let prof = Profiles::load(ctx.sys, ctx.paths)?;
+    let view = menu::subscription_view(&prof);
+    for line in menu::subscription_report(view.as_ref()) {
+        ctx.say(line);
+    }
+    Ok(())
+}
+
+/// `bui-c subscription remove`（4.3.0）：确认（`-y` 跳过）后只清 `profiles.panel`。
+/// 节点、墓碑、active、模式与端口一律保留；确认在拿锁之前问（持锁绝不提问）。
+fn remove_subscription<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<()> {
+    let prof = Profiles::load(ctx.sys, ctx.paths)?;
+    let Some(panel) = prof.panel.as_ref() else {
+        ctx.say(menu::SUB_NONE);
+        return Ok(());
+    };
+    if !ctx.yes && !ctx.prompt.confirm(&menu::sub_clear_ask(&panel.base_url))? {
+        ctx.say("已取消");
+        return Ok(());
+    }
+    let _g = take_lock(ctx)?;
+    if !clear_subscription(ctx)? {
+        // 确认的这几秒里别处已经清过：结论一样，不报错
+        ctx.say(menu::SUB_NONE);
+        return Ok(());
+    }
+    ctx.say(menu::SUB_CLEARED);
+    ctx.say(menu::SUB_CLEAR_EFFECT);
+    Ok(())
+}
+
+/// 只清 `profiles.panel`（4.3.0）。持锁调用；返回 `false` 表示本来就没有来源、什么都没写。
+fn clear_subscription<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<bool> {
+    let mut prof = Profiles::load(ctx.sys, ctx.paths)?;
+    if prof.panel.is_none() {
+        return Ok(false);
+    }
+    prof.panel = None;
+    prof.save(ctx.sys, ctx.paths)?;
+    Ok(true)
 }
 
 /// 决策 10 / spec §6「import-v3：首次运行从 /opt/hysteria-client/ 导入」的接线点：
@@ -1822,12 +1971,18 @@ fn pending_failed<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>, e: Erro
 
 /// Switch 失败之后的回滚（spec §0.2 R10）：一律 `Engine::apply(&old)`，**不**经 `ensure_kernel`
 /// 与 UFW 前置——失败发生在写 `config.json` 之前时，这一次逐字节比对下来什么都不改、也不重启。
+/// 暂停标记在时除外（4.3.0）：不 apply、不换回旧配置，只打一行让 `bui-c start` 之后收敛。
 /// 返回失败页里跟在原因后面的那一两行，以及旧配置换没换回去（没换回去才把 `pending.json`
 /// 留给收敛，spec §0.2 R2）。
 fn roll_back<S: Sys, N: Net, P: Prompt>(
     ctx: &mut Ctx<'_, S, N, P>,
     old: &Profiles,
 ) -> (Vec<String>, bool) {
+    // 暂停守卫（4.3.0）：不 apply（那会把服务拉起来），旧配置也不换回；`false` 让
+    // `pending.json` 留着，`bui-c start` 之后的下一次巡检 / 进菜单按节点列表收敛。
+    if pause::is_paused(ctx.sys, ctx.paths) {
+        return (vec![pause::ROLLBACK_SKIPPED.to_string()], false);
+    }
     match Engine::new(ctx.sys, ctx.paths).apply(old) {
         // 旧配置写回去了、接口还是没起来：R10 对 apply 的判据（Err 或 `tun_ready == Some(false)`
         // 都算失败）在回滚方向一样算数。不能在断网状态下报「节点都还在」了事，出路也要给。
@@ -2013,12 +2168,17 @@ fn out_of_step<S: Sys>(sys: &S, paths: &Paths, prof: &Profiles) -> bool {
 /// 判据，R10）；`profiles` 为空 → [`teardown_all`]，成功后 [`release_after_teardown`]（R2）。
 /// **无论成败**都删掉 `pending.json`（只试一次），结果写进 `runtime.last_converge`；失败再记
 /// [`converge_key`]。节点还列着却没有活动节点时 R2 两条都不成立：只删 `pending.json`，数据面
-/// 不动、不报，返回 `None`。
+/// 不动、不报，返回 `None`。暂停标记在时是唯一的例外：什么都不动、`pending.json` 留着。
 fn converge<S: Sys, N: Net, P: Prompt>(
     ctx: &mut Ctx<'_, S, N, P>,
     g: &LockGuard,
 ) -> Result<Option<LastConverge>> {
     let prof = Profiles::load(ctx.sys, ctx.paths)?;
+    // 暂停守卫（4.3.0）：不 apply、不 teardown，也**不删** `pending.json`——留到
+    // `bui-c start` 之后的下一次巡检 / 进菜单再收（start 已经按当前 profiles 渲染过）。
+    if pause::is_paused(ctx.sys, ctx.paths) {
+        return Ok(None);
+    }
     if !needs_converge(
         ctx.sys,
         ctx.paths,
@@ -2131,7 +2291,9 @@ fn converge_at_menu_start<S: Sys, N: Net, P: Prompt>(
 ) -> Result<Option<Outcome>> {
     let prof = Profiles::load(ctx.sys, ctx.paths)?;
     let rt = Runtime::load(ctx.sys, ctx.paths);
-    let need = needs_converge(ctx.sys, ctx.paths, &prof, &rt);
+    // 暂停期间不收敛（4.3.0）：别白等锁；`last_converge` 的读取/清除照旧走下面
+    let need =
+        !pause::is_paused(ctx.sys, ctx.paths) && needs_converge(ctx.sys, ctx.paths, &prof, &rt);
     if !need && rt.last_converge.is_none() {
         return Ok(None);
     }
@@ -2705,7 +2867,7 @@ fn maint_menu<S: Sys, N: Net, P: Prompt>(
     ctx.show(page.trim_end());
     let action = loop {
         ctx.flush();
-        let pick = ctx.prompt.line("选择 [0-3]")?;
+        let pick = ctx.prompt.line("选择 [0-4]")?;
         match menu::parse_maint_choice(&pick) {
             Some(a) => break a,
             None => ctx.say(menu::invalid_maint_choice(&pick, ctx.width())),
@@ -2747,7 +2909,55 @@ fn maint_menu<S: Sys, N: Net, P: Prompt>(
             )
         }
         MaintAction::ImportV3 => menu_import_v3(ctx)?,
+        MaintAction::Subscription => subscription_menu(ctx, prof)?,
     })
+}
+
+/// 菜单 `[7]` → `[4] 订阅来源`（4.3.0）：显示面板地址、打码用户名与面板节点数；
+/// 有来源时 `[1] 清除订阅来源`（确认后只清 `profiles.panel`，清完回主菜单）。
+/// 没有来源时这一页只显示「未设置」与 `[0] 返回`。
+fn subscription_menu<S: Sys, N: Net, P: Prompt>(
+    ctx: &mut Ctx<'_, S, N, P>,
+    prof: &Profiles,
+) -> Result<Outcome> {
+    ctx.clear_screen();
+    let view = menu::subscription_view(prof);
+    let has_source = view.is_some();
+    ctx.show(menu::render_subscription(view.as_ref(), ctx.width()).trim_end());
+    loop {
+        ctx.flush();
+        let pick = ctx.prompt.line(if has_source {
+            "选择 [0-1]"
+        } else {
+            "选择 [0]"
+        })?;
+        match menu::parse_sub_choice(&pick, has_source) {
+            Some(menu::SubAction::Back) => return Ok(Outcome::Nothing),
+            Some(menu::SubAction::Clear) => {
+                let Some(base) = view.as_ref().map(|v| v.base_url.clone()) else {
+                    // `parse_sub_choice` 只在有来源时给 Clear；防御一下，不拿空地址提问
+                    return Ok(Outcome::Nothing);
+                };
+                if !ctx.prompt.confirm(&menu::sub_clear_ask(&base))? {
+                    return Ok(note(ctx, "已取消"));
+                }
+                let cleared = with_lock(ctx, |ctx, _| clear_subscription(ctx));
+                return match cleared {
+                    Ok(_) => {
+                        ctx.say(menu::SUB_CLEARED);
+                        ctx.say(menu::SUB_CLEAR_EFFECT);
+                        Ok(Outcome::Note(menu::SUB_CLEARED.to_string()))
+                    }
+                    Err(e) => {
+                        let line = format!("失败：{e}");
+                        tell(ctx, &line);
+                        Ok(Outcome::Pause(line))
+                    }
+                };
+            }
+            None => ctx.say(menu::invalid_sub_choice(&pick, has_source, ctx.width())),
+        }
+    }
 }
 
 /// `[7]` → `[1]` 检查更新（spec §8.1）：打「正在检查更新…」→ 只读地查一次（不拿锁）→ 结论落盘
@@ -2859,6 +3069,11 @@ fn maint_install_update<S: Sys, N: Net, P: Prompt>(
     ctx: &mut Ctx<'_, S, N, P>,
     shown: &menu::UpdateOffer,
 ) -> Result<Installed> {
+    // 暂停守卫（4.3.0）：装内核后可能重启主单元，等于把用户停掉的代理拉起来。连下载都不做。
+    // 只查不装的 `maint_check_update` 不在这里，照常可用
+    if pause::is_paused(ctx.sys, ctx.paths) {
+        return Err(Error::msg(pause::UPDATE_REFUSED));
+    }
     let prof = Profiles::load(ctx.sys, ctx.paths)?;
     let fetched = update::fetch(
         ctx.sys,
@@ -2937,6 +3152,11 @@ fn maint_status<S: Sys, N: Net, P: Prompt>(ctx: &Ctx<'_, S, N, P>, prof: &Profil
 /// 需要时再给固定编号的「下一步」小菜单（§6.5、§0.2 R3）。不受 timer 的退避约束，也**不**顺带
 /// 每日自更新（§6.7）。没有节点时不进报告页，一行 Note 回主菜单。
 fn check_menu<S: Sys, N: Net, P: Prompt>(ctx: &mut Ctx<'_, S, N, P>) -> Result<Outcome> {
+    // 暂停守卫（4.3.0）：连接检查会探测、必要时还会重启主单元——暂停期间一律不做，
+    // 只指到服务控制里的恢复入口
+    if pause::is_paused(ctx.sys, ctx.paths) {
+        return Ok(note(ctx, pause::CHECK_MENU_SKIPPED));
+    }
     let prof = Profiles::load(ctx.sys, ctx.paths)?;
     if prof.active_profile().is_none() {
         return Ok(note(ctx, "没有节点可检查：先用 [3] 导入节点"));
@@ -3440,23 +3660,27 @@ fn without_urls(detail: &str) -> String {
         .join(" ")
 }
 
-/// `[4] 服务控制` 的二级菜单：重启 / 看日志 / 返回（v3 的服务子菜单大半是死代码，
-/// 这里只留两个真实动作）。进页清屏；输错只提示、原地重问；空行、`0`、EOF 与做完一个动作
+/// `[4] 服务控制` 的二级菜单：重启 / 看日志 / 停止或恢复代理 / 返回（v3 的服务子菜单大半是
+/// 死代码，这里只留真实动作）。进页清屏；输错只提示、原地重问；空行、`0`、EOF 与做完一个动作
 /// 都回主菜单。重启的结果照 [`outcome_since`] 定停不停（TUN 没起来会带出日志，要停）。
 fn service_menu<S: Sys, N: Net, P: Prompt>(
     ctx: &mut Ctx<'_, S, N, P>,
     mode: Mode,
 ) -> Result<Outcome> {
     ctx.clear_screen();
-    ctx.show(menu::render_service_options().trim_end());
+    ctx.show(menu::render_service_options(pause::is_paused(ctx.sys, ctx.paths)).trim_end());
     loop {
         ctx.flush();
-        let pick = ctx.prompt.line("选择 [0-2]")?;
+        let pick = ctx.prompt.line("选择 [0-3]")?;
         match menu::parse_service_choice(&pick) {
             Some(menu::ServiceAction::Back) => return Ok(Outcome::Nothing),
             // 回显先净化再截到行宽：方向键是 `ESC [ A`，误贴的整条链接也只占一行
             None => ctx.say(menu::invalid_service_choice(&pick, ctx.width())),
             Some(menu::ServiceAction::Restart) => {
+                // 暂停守卫（4.3.0）：不 restart、也不静默清标记，指到 [3] 恢复代理
+                if pause::is_paused(ctx.sys, ctx.paths) {
+                    return Ok(note(ctx, pause::RESTART_SKIPPED));
+                }
                 let start = ctx.transcript.len();
                 restart_service(ctx, mode);
                 return Ok(outcome_since(ctx, start));
@@ -3468,6 +3692,20 @@ fn service_menu<S: Sys, N: Net, P: Prompt>(
                 ctx.flush();
                 ctx.prompt.pause("回车返回菜单")?;
                 return Ok(Outcome::Nothing);
+            }
+            // [3] 与 `bui-c stop` / `bui-c start` 同一条路（4.3.0）；按**当下**的标记决定方向，
+            // 不按进页时渲染的那一份——中间可能被另一个会话停过 / 恢复过
+            Some(menu::ServiceAction::TogglePause) => {
+                let start = ctx.transcript.len();
+                let r = if pause::is_paused(ctx.sys, ctx.paths) {
+                    start_cmd(ctx)
+                } else {
+                    stop_cmd(ctx, pause::SOURCE_MENU)
+                };
+                if let Err(e) = r {
+                    ctx.say(format!("失败：{e}"));
+                }
+                return Ok(outcome_since(ctx, start));
             }
         }
     }
@@ -3547,7 +3785,9 @@ mod tests {
     use crate::fake::{FakeNet, FakeReply, FakeSys};
     use crate::menu::Scripted;
     use crate::profiles::{Mode, Profiles};
-    use crate::testutil::{hy2_direct_node, profiles_socks, reality_direct_node, split_keywords};
+    use crate::testutil::{
+        hy2_account_node, hy2_direct_node, profiles_socks, reality_direct_node, split_keywords,
+    };
     use base64::Engine as _;
     use pretty_assertions::assert_eq;
 
@@ -3648,6 +3888,25 @@ mod tests {
             })
         );
         assert_eq!(parse(&["check"]).cmd, Some(Cmd::Check));
+        // 4.3.0：暂停 / 恢复与订阅来源
+        assert_eq!(parse(&["stop"]).cmd, Some(Cmd::Stop));
+        assert_eq!(parse(&["start"]).cmd, Some(Cmd::Start));
+        assert_eq!(
+            parse(&["subscription"]).cmd,
+            Some(Cmd::Subscription { cmd: None })
+        );
+        assert_eq!(
+            parse(&["subscription", "remove"]).cmd,
+            Some(Cmd::Subscription {
+                cmd: Some(SubscriptionCmd::Remove)
+            })
+        );
+        assert_eq!(
+            parse(&["subscription", "remove", "-y"]).cmd,
+            Some(Cmd::Subscription {
+                cmd: Some(SubscriptionCmd::Remove)
+            })
+        );
         assert_eq!(
             parse(&["delete", "HY2"]).cmd,
             Some(Cmd::Delete {
@@ -5115,7 +5374,7 @@ mod tests {
         let r = run_menu(&s, &n, &pp, &["7", "1", "0"], true);
         assert_eq!(
             r.asked,
-            vec!["选择 [0-9]", "选择 [0-3]", "选择 [0-9]"],
+            vec!["选择 [0-9]", "选择 [0-4]", "选择 [0-9]"],
             "{}",
             r.t
         );
@@ -5165,7 +5424,7 @@ mod tests {
         let r = run_menu(&s, &n, &pp, &["7", "1", "", "0"], true);
         assert_eq!(
             r.asked,
-            vec!["选择 [0-9]", "选择 [0-3]", "回车返回菜单", "选择 [0-9]"],
+            vec!["选择 [0-9]", "选择 [0-4]", "回车返回菜单", "选择 [0-9]"],
             "{}",
             r.t
         );
@@ -5667,7 +5926,7 @@ mod tests {
         let r = run_menu(&s, &n, &pp, &["7", "1", "", "0"], true);
         assert_eq!(
             r.asked,
-            vec!["选择 [0-9]", "选择 [0-3]", "回车返回菜单", "选择 [0-9]"],
+            vec!["选择 [0-9]", "选择 [0-4]", "回车返回菜单", "选择 [0-9]"],
             "停一下、回主菜单、0 照样被读到：{}",
             r.t
         );
@@ -6327,7 +6586,7 @@ mod tests {
         );
         assert_eq!(
             p.asked,
-            vec!["选择 [0-9]", "选择 [0-3]", "回车返回菜单", "选择 [0-9]"],
+            vec!["选择 [0-9]", "选择 [0-4]", "回车返回菜单", "选择 [0-9]"],
             "失败先停，看完回车再清屏回主菜单，0 由主菜单读走：\n{t}"
         );
     }
@@ -7209,12 +7468,12 @@ mod tests {
             r.asked,
             vec![
                 "选择 [0-9]",
-                "选择 [0-3]",
-                "选择 [0-3]",
+                "选择 [0-4]",
+                "选择 [0-4]",
                 "选择 [0-9]",
-                "选择 [0-3]",
+                "选择 [0-4]",
                 "选择 [0-9]",
-                "选择 [0-3]",
+                "选择 [0-4]",
                 "选择 [0-9]"
             ],
             "{}",
@@ -8448,12 +8707,13 @@ mod tests {
             .position(|l| *l == "  服务控制")
             .unwrap_or_else(|| panic!("缺标题：\n{t}"));
         assert_eq!(
-            lines[at - 1..at + 4],
+            lines[at - 1..at + 5],
             [
                 "",
                 "  服务控制",
                 "     [1] 重启 bui-c.service",
                 "     [2] 最近 50 行日志",
+                "     [3] 停止代理",
                 "     [0] 返回",
             ],
             "样式与主菜单一致：\n{t}"
@@ -8511,7 +8771,7 @@ mod tests {
             "1 是子菜单里的重启：\n{t}"
         );
         assert_eq!(
-            p.asked.iter().filter(|q| *q == "选择 [0-2]").count(),
+            p.asked.iter().filter(|q| *q == "选择 [0-3]").count(),
             2,
             "{:?}",
             p.asked
@@ -8619,7 +8879,7 @@ mod tests {
         );
         assert_eq!(
             p.asked,
-            vec!["选择 [0-9]", "选择 [0-2]", "回车返回菜单", "选择 [0-9]"],
+            vec!["选择 [0-9]", "选择 [0-3]", "回车返回菜单", "选择 [0-9]"],
             "接口没起来、还带出了日志：先停，看完回车再清屏回主菜单"
         );
         assert!(
@@ -8671,7 +8931,7 @@ mod tests {
         assert!(!t.contains('\u{1b}'), "菜单约定无 ANSI：{t:?}");
         assert_eq!(
             p.asked,
-            vec!["选择 [0-9]", "选择 [0-2]", "回车返回菜单", "选择 [0-9]"],
+            vec!["选择 [0-9]", "选择 [0-3]", "回车返回菜单", "选择 [0-9]"],
             "打完日志停下来等回车，0 由主菜单读走"
         );
         assert_eq!(t.matches("B-UI 客户端").count(), 2, "{t}");
@@ -16648,6 +16908,655 @@ mod tests {
             pauses(&r.asked),
             0,
             "最后一问答完之后一行都没打：提问本身就是停顿，不再停一次（与三问的顺序无关）：{:?}",
+            r.asked
+        );
+    }
+
+    // ───────────── 4.3.0：订阅来源管理 + 代理暂停/恢复 ─────────────
+
+    fn panel_source() -> crate::profiles::Panel {
+        crate::profiles::Panel {
+            base_url: "https://panel.example.com".into(),
+            username: "0123456789abcdef0123456789abcdef".into(),
+        }
+    }
+
+    #[test]
+    fn stop_writes_the_marker_disables_and_stops_and_leaves_the_timer_alone() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        with_unit(&s);
+        profiles_socks().save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["stop"]), &mut ctx).unwrap();
+        assert!(ctx.out.contains("已停止代理"), "{}", ctx.out);
+        assert!(
+            ctx.out.contains("bui-c start 恢复"),
+            "要说清怎么恢复：{}",
+            ctx.out
+        );
+        let calls = s.calls();
+        let at = |c: &str| {
+            calls
+                .iter()
+                .position(|x| x == c)
+                .unwrap_or_else(|| panic!("没调用 {c}：{calls:?}"))
+        };
+        assert!(
+            at("systemctl disable bui-c.service") < at("systemctl stop bui-c.service"),
+            "disable 在 stop 之前：{calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("bui-c.timer")),
+            "timer 保持 enabled/running：{calls:?}"
+        );
+        assert_eq!(
+            s.get("/opt/bui-c/paused").unwrap(),
+            "2026-09-11T00:00:00Z cli\n",
+            "标记：一行 RFC3339 + 来源"
+        );
+        assert_eq!(s.mode("/opt/bui-c/paused"), Some(0o600));
+        // profiles.json 一个字节都不动：暂停不是期望配置
+        assert_eq!(
+            Profiles::load(&s, &pp).unwrap(),
+            profiles_socks(),
+            "暂停不该改写节点设置"
+        );
+
+        // 幂等：再跑一次照样成功，标记不变
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["stop"]), &mut ctx).unwrap();
+        assert_eq!(
+            s.get("/opt/bui-c/paused").unwrap(),
+            "2026-09-11T00:00:00Z cli\n"
+        );
+    }
+
+    #[test]
+    fn stop_without_a_unit_or_a_node_errors_and_writes_no_marker() {
+        let pp = paths();
+        let s = FakeSys::new();
+        let n = FakeNet::new();
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        let e = dispatch(&parse(&["stop"]), &mut ctx).unwrap_err();
+        assert!(e.to_string().contains("本机没有安装代理"), "{e}");
+        assert!(!s.exists(&pp.paused()), "不写标记");
+        assert!(
+            !s.calls().iter().any(|c| c.starts_with("systemctl")),
+            "{:?}",
+            s.calls()
+        );
+    }
+
+    #[test]
+    fn start_clears_the_marker_applies_enables_and_starts_the_timer() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        with_unit(&s);
+        profiles_socks().save(&s, &pp).unwrap();
+        pause::mark(&s, &pp, pause::SOURCE_CLI).unwrap();
+        // 暂停后的样子：主单元停着、被 disable；timer 不 active
+        s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        s.reply("systemctl is-enabled --quiet bui-c.service", 1, "");
+        s.reply("systemctl is-active --quiet bui-c.timer", 3, "");
+        s.reply("systemctl is-enabled --quiet bui-c.timer", 1, "");
+        let n = FakeNet::new();
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["start"]), &mut ctx).unwrap();
+        assert!(!s.exists(&pp.paused()), "标记要清掉");
+        assert!(ctx.out.contains("已恢复代理"), "{}", ctx.out);
+        assert!(
+            s.called("systemctl enable --now bui-c.service"),
+            "没在跑时 apply 用 enable --now 拉起：{:?}",
+            s.calls()
+        );
+        assert!(
+            s.called("systemctl enable bui-c.service"),
+            "apply 之后按 spec 再 enable 一次（幂等）"
+        );
+        assert!(
+            s.called("systemctl start bui-c.timer"),
+            "timer 不 active 时要 start：{:?}",
+            s.calls()
+        );
+        assert_ne!(
+            s.get("/opt/bui-c/config.json").as_deref(),
+            Some("{}"),
+            "走的是与导入同一条 apply_with_ufw"
+        );
+    }
+
+    #[test]
+    fn start_without_an_active_node_errors_and_keeps_the_marker() {
+        let pp = paths();
+        let s = FakeSys::new();
+        let n = FakeNet::new();
+        Profiles::new_default().save(&s, &pp).unwrap();
+        pause::mark(&s, &pp, pause::SOURCE_CLI).unwrap();
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        let e = dispatch(&parse(&["start"]), &mut ctx).unwrap_err();
+        assert!(e.to_string().contains("没有可用的节点"), "{e}");
+        assert!(s.exists(&pp.paused()), "报错不清标记");
+        assert!(
+            !s.calls().iter().any(|c| c.starts_with("systemctl")),
+            "{:?}",
+            s.calls()
+        );
+    }
+
+    #[test]
+    fn start_on_a_running_machine_only_says_so() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        with_unit(&s);
+        profiles_socks().save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["start"]), &mut ctx).unwrap();
+        assert!(ctx.out.contains("代理已在运行"), "{}", ctx.out);
+        assert_eq!(s.writes("/opt/bui-c/config.json"), 0, "不 apply");
+        assert!(!s.called("systemctl restart bui-c.service"));
+        assert!(!s.exists(&pp.paused()), "没有标记还去建一个");
+    }
+
+    /// 暂停期间 `bui-c check` 是纯粹的 no-op：timer 每分钟跑它，这是「停止后不被拉回来」的
+    /// 唯一判据。连每日自更新都不能发生。
+    #[test]
+    fn check_dispatch_is_a_no_op_while_paused() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        with_unit(&s);
+        let mut prof = profiles_socks();
+        prof.panel = Some(panel_source());
+        prof.auto_update = true; // 正常情况下这一轮就该自更新了
+        prof.save(&s, &pp).unwrap();
+        pause::mark(&s, &pp, pause::SOURCE_CLI).unwrap();
+        let n = FakeNet::new();
+        n.route(crate::check::PROBE_URL, FakeReply::Status(204));
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["check"]), &mut ctx).unwrap();
+        assert!(ctx.out.contains("巡检跳过"), "{}", ctx.out);
+        assert!(n.log().is_empty(), "不探测、不自更新：{:?}", n.log());
+        assert!(
+            !s.called("systemctl restart bui-c.service"),
+            "不重启：{:?}",
+            s.calls()
+        );
+        assert_eq!(s.writes("/opt/bui-c/runtime.json"), 0);
+    }
+
+    /// 4.3.0：暂停期间任何非显式激活的 apply 都是 no-op——不装内核、不动 UFW、不 apply、
+    /// 不重启，只打一行「配置未应用」。`start` / `switch` / `mode` / `import --activate`
+    /// 先清标记，不受影响。
+    #[test]
+    fn apply_with_ufw_is_a_no_op_while_paused() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        with_unit(&s);
+        let prof = profiles_socks();
+        prof.save(&s, &pp).unwrap();
+        pause::mark(&s, &pp, pause::SOURCE_CLI).unwrap();
+        let n = FakeNet::new();
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        let g = take_lock(&mut ctx).unwrap();
+        let applied = apply_with_ufw(&mut ctx, &prof, &g).unwrap();
+        drop(g);
+        assert_eq!(applied, Applied::default(), "no-op 的 Applied 必须全假");
+        assert!(ctx.out.contains(pause::APPLY_SKIPPED), "{}", ctx.out);
+        assert!(
+            !s.calls().iter().any(|c| c.starts_with("systemctl")
+                || c.contains("sing-box")
+                || c.starts_with("ufw")
+                || c.starts_with("sysctl")
+                || c.starts_with("ip ")),
+            "不装内核、不动 UFW、不 apply：{:?}",
+            s.calls()
+        );
+        assert_eq!(s.writes("/opt/bui-c/config.json"), 0);
+        assert_eq!(s.writes("/opt/bui-c/runtime.json"), 0);
+        assert!(n.log().is_empty(), "不联网：{:?}", n.log());
+        assert!(s.exists(&pp.paused()), "守卫不消费标记");
+    }
+
+    /// 无激活的导入（刷新活动节点）在暂停期间只落 `profiles.json`：配置不应用、服务不重启，
+    /// 下一次 `bui-c start` 才生效。
+    #[test]
+    fn an_import_refresh_while_paused_saves_but_does_not_apply() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        with_unit(&s);
+        profiles_socks().save(&s, &pp).unwrap();
+        pause::mark(&s, &pp, pause::SOURCE_CLI).unwrap();
+        let t = import_from_panel(&s, &pp, "alice", vec![hy2_account_node("alice")]);
+        assert!(t.contains("更新节点 alice-hy2-direct"), "{t}");
+        assert!(t.contains(pause::APPLY_SKIPPED), "{t}");
+        assert_eq!(
+            s.get("/opt/bui-c/config.json").as_deref(),
+            Some("{}"),
+            "配置没被重写：{:?}",
+            s.calls()
+        );
+        assert!(
+            !s.calls().iter().any(|c| c.contains("sing-box check")),
+            "没走 apply：{:?}",
+            s.calls()
+        );
+        assert!(!s.called("systemctl restart bui-c.service"));
+        assert!(s.exists(&pp.paused()));
+        // 节点本身已经存下（活动节点的密码换了），只是还没生效——`start` 时按新 profiles 渲染
+        let saved = Profiles::load(&s, &pp).unwrap();
+        assert_eq!(hy2_credentials(&saved.profiles[0]).1, "alice-pw");
+    }
+
+    /// 4.3.0：暂停期间菜单 `[5] 连接检查` 不探测、不修复，只提示去哪里恢复。
+    #[test]
+    fn menu_connection_check_is_a_no_op_while_paused() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        with_unit(&s);
+        profiles_socks().save(&s, &pp).unwrap();
+        pause::mark(&s, &pp, pause::SOURCE_CLI).unwrap();
+        let n = FakeNet::new();
+        let r = run_menu(&s, &n, &pp, &["5", "0"], true);
+        assert!(r.t.contains(pause::CHECK_MENU_SKIPPED), "{}", r.t);
+        assert!(
+            n.log().is_empty(),
+            "不跑连接检查（一次请求都不发）：{:?}",
+            n.log()
+        );
+        assert!(
+            !s.calls()
+                .iter()
+                .any(|c| c == "systemctl restart bui-c.service"),
+            "不修复、不重启：{:?}",
+            s.calls()
+        );
+        assert_eq!(
+            last_line(&r.t),
+            format!("  上次：{}", pause::CHECK_MENU_SKIPPED)
+        );
+    }
+
+    /// 4.3.0：暂停期间菜单 `[4] 服务控制` → `[1] 重启` 不重启、也不清标记。
+    #[test]
+    fn menu_service_restart_is_refused_while_paused() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        with_unit(&s);
+        profiles_socks().save(&s, &pp).unwrap();
+        pause::mark(&s, &pp, pause::SOURCE_CLI).unwrap();
+        let n = FakeNet::new();
+        let r = run_menu(&s, &n, &pp, &["4", "1", "0"], true);
+        assert!(r.t.contains(pause::RESTART_SKIPPED), "{}", r.t);
+        assert!(r.t.contains("[3] 恢复代理"), "子页要给出恢复入口：{}", r.t);
+        assert!(!s.called("systemctl restart bui-c.service"));
+        assert!(s.exists(&pp.paused()), "不静默清标记");
+    }
+
+    /// 4.3.0：`[7] → [1]` 只查不装照常可用；答 y 的安装段在暂停时直接拒绝，
+    /// 且**连下载都不做**（下载内核是这一段的第一个动作）。
+    #[test]
+    fn menu_update_install_is_refused_while_paused() {
+        let pp = paths();
+        let (s, n) = update_machine("9.9.9", Some("bui-c-newer"), Some("1.13.19"));
+        pause::mark(&s, &pp, pause::SOURCE_CLI).unwrap();
+        let r = run_menu(&s, &n, &pp, &["7", "1", "y", "", "0"], true);
+        assert!(r.t.contains("最新 9.9.9"), "只查不装照常：{}", r.t);
+        assert!(
+            r.t.contains(&format!("失败：{}", pause::UPDATE_REFUSED)),
+            "{}",
+            r.t
+        );
+        assert_eq!(
+            last_line(&r.t),
+            format!("  上次：失败：{}", pause::UPDATE_REFUSED)
+        );
+        assert!(
+            !n.log().iter().any(|l| l.contains("sing-box-linux")),
+            "安装段在下载之前就拒绝了：{:?}",
+            n.log()
+        );
+        assert!(!s.called("systemctl restart bui-c.service"));
+        assert_eq!(
+            s.get(crate::paths::SELF_BIN).as_deref(),
+            Some(INSTALLED),
+            "自身二进制没被换"
+        );
+        assert!(s.exists(&pp.paused()));
+    }
+
+    /// 4.3.0：暂停期间进菜单不做中断收敛——`pending.json` 留着、不 apply、不启动服务，
+    /// 也不为收敛那把锁白等（`last_converge` 的读取/清除不受影响）。
+    #[test]
+    fn menu_converge_is_skipped_while_paused() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        // 主单元与 config.json 都不在 → 有活动节点时 tidy = Apply、与节点列表对不上
+        profiles_socks().save(&s, &pp).unwrap();
+        s.put("/opt/bui-c/pending.json", "{}");
+        pause::mark(&s, &pp, pause::SOURCE_CLI).unwrap();
+        let n = FakeNet::new();
+        let r = run_menu(&s, &n, &pp, &["0"], true);
+        assert!(
+            s.exists(&pp.pending()),
+            "pending 留给 start 之后的下一次收敛"
+        );
+        assert_eq!(s.get("/opt/bui-c/config.json"), None, "不 apply");
+        assert!(
+            !s.called("systemctl start bui-c.service"),
+            "{:?}",
+            s.calls()
+        );
+        assert!(
+            !s.called("systemctl enable --now bui-c.service"),
+            "{:?}",
+            s.calls()
+        );
+        assert!(
+            !s.calls().iter().any(|c| c == "lock"),
+            "暂停时不为收敛白等锁：{:?}",
+            s.calls()
+        );
+        assert!(!r.t.contains("收拾"), "{}", r.t);
+    }
+
+    /// 4.3.0：暂停期间删除切节点写 `profiles.json` 失败时，回滚不 apply（不启动服务）、
+    /// 也不换回旧配置，`pending.json` 留给 `bui-c start` 之后收敛。
+    #[test]
+    fn roll_back_does_not_apply_while_paused() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        with_unit(&s);
+        two_nodes(&s, &pp);
+        pause::mark(&s, &pp, pause::SOURCE_CLI).unwrap();
+        s.fail_write("/opt/bui-c/profiles.json");
+        let n = FakeNet::new();
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, true); // -y
+        let e = dispatch(
+            &parse(&[
+                "delete",
+                "alice-hy2-direct",
+                "--switch-to",
+                "alice-reality-direct",
+                "-y",
+            ]),
+            &mut ctx,
+        )
+        .unwrap_err();
+        assert_eq!(e.to_string(), crate::delete::SAVE_FAILED);
+        assert!(
+            ctx.transcript.contains(pause::ROLLBACK_SKIPPED),
+            "{}",
+            ctx.transcript
+        );
+        assert_eq!(
+            s.writes("/opt/bui-c/config.json"),
+            0,
+            "回滚没有 apply：{:?}",
+            s.calls()
+        );
+        assert!(!s.called("systemctl restart bui-c.service"));
+        assert!(!s.called("systemctl start bui-c.service"));
+        assert!(
+            s.exists(&pp.pending()),
+            "没换回旧配置，pending 不能删（留给 start 之后收敛）"
+        );
+        assert_eq!(
+            Profiles::load(&s, &pp).unwrap().profiles.len(),
+            2,
+            "节点一个都没少"
+        );
+    }
+
+    #[test]
+    fn subscription_shows_the_panel_and_masks_the_username() {
+        let pp = paths();
+        let s = FakeSys::new();
+        let mut prof = profiles_socks();
+        prof.panel = Some(panel_source());
+        prof.save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["subscription"]), &mut ctx).unwrap();
+        assert!(ctx.out.contains("https://panel.example.com"), "{}", ctx.out);
+        assert!(ctx.out.contains("0123…cdef"), "{}", ctx.out);
+        assert!(ctx.out.contains("面板节点：1 个"), "{}", ctx.out);
+        assert!(
+            !ctx.out.contains("0123456789abcdef0123456789abcdef"),
+            "完整 username 是等价凭据，不能打出来：{}",
+            ctx.out
+        );
+
+        // 没有面板来源：一行「未设置订阅来源」
+        let s = FakeSys::new();
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["subscription"]), &mut ctx).unwrap();
+        assert_eq!(ctx.out.trim(), "未设置订阅来源");
+    }
+
+    #[test]
+    fn subscription_remove_only_clears_the_panel() {
+        let pp = paths();
+        let s = FakeSys::new();
+        let mut prof = profiles_socks();
+        prof.panel = Some(panel_source());
+        prof.auto_update = false;
+        prof.deleted.push(crate::profiles::Tombstone {
+            key: "tombstone-key".into(),
+            name: "删过的节点".into(),
+            at: 1,
+            extra: Default::default(),
+        });
+        prof.extra
+            .insert("future".into(), serde_json::Value::Bool(true));
+        prof.save(&s, &pp).unwrap();
+        let before = Profiles::load(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, true); // -y
+        dispatch(&parse(&["subscription", "remove", "-y"]), &mut ctx).unwrap();
+        let after = Profiles::load(&s, &pp).unwrap();
+        assert!(after.panel.is_none(), "只清 panel");
+        assert_eq!(after.active, before.active);
+        assert_eq!(after.profiles, before.profiles, "节点一个都不动");
+        assert_eq!(after.deleted, before.deleted, "墓碑保留");
+        assert_eq!(after.mode, before.mode);
+        assert_eq!(
+            (after.socks_port, after.http_port, after.auto_update),
+            (before.socks_port, before.http_port, before.auto_update)
+        );
+        assert_eq!(after.extra, before.extra);
+        assert!(ctx.out.contains("已清除订阅来源"), "{}", ctx.out);
+        assert!(ctx.out.contains("回落到 GitHub"), "要说清后果：{}", ctx.out);
+        assert_eq!(s.mode("/opt/bui-c/profiles.json"), Some(0o600));
+
+        // 不带 -y 且没人回答：算取消，panel 原样
+        let mut prof = after;
+        prof.panel = Some(panel_source());
+        prof.save(&s, &pp).unwrap();
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["subscription", "remove"]), &mut ctx).unwrap();
+        assert!(ctx.out.contains("已取消"), "{}", ctx.out);
+        assert!(Profiles::load(&s, &pp).unwrap().panel.is_some());
+    }
+
+    #[test]
+    fn update_refuses_while_paused_but_the_auto_toggle_still_works() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        with_unit(&s);
+        let mut prof = profiles_socks();
+        prof.panel = Some(panel_source());
+        prof.save(&s, &pp).unwrap();
+        pause::mark(&s, &pp, pause::SOURCE_CLI).unwrap();
+        let n = FakeNet::new();
+        let mut p = Scripted::from([]);
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        let e = dispatch(&parse(&["update"]), &mut ctx).unwrap_err();
+        assert_eq!(e.to_string(), pause::UPDATE_REFUSED);
+        assert!(n.log().is_empty(), "拒绝在原地，不联网：{:?}", n.log());
+
+        // --auto 只翻开关，不受暂停影响
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["update", "--auto", "off"]), &mut ctx).unwrap();
+        assert!(!Profiles::load(&s, &pp).unwrap().auto_update);
+        assert!(s.exists(&pp.paused()), "--auto 不动暂停标记");
+    }
+
+    /// 4.3.0：显式激活类动作（`switch`、`mode`、`import --activate`）先清暂停标记——
+    /// 人选了节点就是要跑；`status` / `list` / `subscription` 只读，不动标记。
+    #[test]
+    fn explicit_activation_clears_the_pause_marker_and_read_only_commands_do_not() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        with_unit(&s);
+        profiles_socks().save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+
+        // 只读的三条不碰标记
+        pause::mark(&s, &pp, pause::SOURCE_CLI).unwrap();
+        let mut p = Scripted::from([]);
+        for args in [vec!["status"], vec!["list"], vec!["subscription"]] {
+            let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+            dispatch(&parse(&args), &mut ctx).unwrap();
+            assert!(s.exists(&pp.paused()), "{args:?} 不该动暂停标记");
+        }
+
+        // switch
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["switch", "alice-hy2-direct"]), &mut ctx).unwrap();
+        assert!(!s.exists(&pp.paused()), "switch 是显式激活");
+
+        // mode
+        pause::mark(&s, &pp, pause::SOURCE_CLI).unwrap();
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(&parse(&["mode", "tun"]), &mut ctx).unwrap();
+        assert!(!s.exists(&pp.paused()), "mode 是显式激活");
+
+        // import --activate：本地粘一条新节点，不联网
+        pause::mark(&s, &pp, pause::SOURCE_CLI).unwrap();
+        let mut ctx = Ctx::new(&s, &n, &pp, &mut p, false, false);
+        dispatch(
+            &parse(&[
+                "import",
+                "hysteria2://u1:pw1@panel.example.com:10000/?sni=panel.example.com&mport=20000-30000#u1-HY2",
+                "--activate",
+            ]),
+            &mut ctx,
+        )
+        .unwrap();
+        assert!(!s.exists(&pp.paused()), "import --activate 是显式激活");
+        assert_eq!(
+            Profiles::load(&s, &pp).unwrap().active.as_deref(),
+            Some("panel.example.com-hy2-direct"),
+            "{}",
+            ctx.out
+        );
+    }
+
+    /// 菜单 `[4]` → `[3]`：与命令行同一条路，标记里记来源 `menu`；暂停后主菜单状态行说
+    /// 「已停止（直连）」；再进子页文案变成「恢复代理」。
+    #[test]
+    fn menu_service_page_stops_and_resumes_the_proxy() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        with_unit(&s);
+        profiles_socks().save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        let r = run_menu(&s, &n, &pp, &["4", "3", "0"], true);
+        assert!(r.t.contains("[3] 停止代理"), "{}", r.t);
+        assert!(r.t.contains("已停止代理"), "{}", r.t);
+        assert_eq!(
+            s.get("/opt/bui-c/paused").unwrap(),
+            "2026-09-11T00:00:00Z menu\n",
+            "菜单里停的，来源记 menu"
+        );
+        assert!(r.t.contains("已停止（直连）"), "主菜单状态行：{}", r.t);
+        assert!(last_line(&r.t).contains("已停止代理"), "{}", r.t);
+
+        // 再进去：主单元已经停了，[3] 改说「恢复代理」
+        s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        let r = run_menu(&s, &n, &pp, &["4", "3", "0"], true);
+        assert!(r.t.contains("[3] 恢复代理"), "{}", r.t);
+        assert!(r.t.contains("已恢复代理"), "{}", r.t);
+        assert!(!s.exists(&pp.paused()), "恢复后标记清掉");
+    }
+
+    #[test]
+    fn menu_maint_subscription_page_shows_the_source_and_clears_it() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        with_unit(&s);
+        let mut prof = profiles_socks();
+        prof.panel = Some(panel_source());
+        prof.save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        let r = run_menu(&s, &n, &pp, &["7", "4", "1", "y", "0"], true);
+        assert!(r.t.contains("[4] 订阅来源"), "{}", r.t);
+        assert!(r.t.contains("https://panel.example.com"), "{}", r.t);
+        assert!(r.t.contains("0123…cdef"), "{}", r.t);
+        assert!(
+            !r.t.contains("0123456789abcdef0123456789abcdef"),
+            "完整 username 不能出现在屏幕上：{}",
+            r.t
+        );
+        assert!(
+            r.asked.iter().any(|q| q.contains("清除订阅来源")),
+            "{:?}",
+            r.asked
+        );
+        assert!(
+            Profiles::load(&s, &pp).unwrap().panel.is_none(),
+            "答 y 之后 panel 清掉"
+        );
+        assert!(r.t.contains("已清除订阅来源"), "{}", r.t);
+        assert!(r.t.contains("回落到 GitHub"), "{}", r.t);
+        assert_eq!(last_line(&r.t), "  上次：已清除订阅来源", "{}", r.t);
+    }
+
+    #[test]
+    fn menu_subscription_page_without_a_source_only_says_unset() {
+        let pp = paths();
+        let s = FakeSys::new();
+        ready(&s);
+        with_unit(&s);
+        profiles_socks().save(&s, &pp).unwrap();
+        let n = FakeNet::new();
+        let r = run_menu(&s, &n, &pp, &["7", "4", "0", "0"], true);
+        assert!(r.t.contains("未设置订阅来源"), "{}", r.t);
+        assert!(
+            !r.t.contains("[1] 清除订阅来源"),
+            "没有来源时不出 [1]：{}",
+            r.t
+        );
+        assert!(
+            r.asked.iter().any(|q| q == "选择 [0]"),
+            "没有 [1] 时提示符只到 [0]：{:?}",
             r.asked
         );
     }

@@ -33,6 +33,9 @@ pub fn run<S: Sys>(sys: &S, paths: &Paths, purge_bin: bool) -> Result<Report> {
         }
     }
     systemd::daemon_reload(sys)?;
+    // 暂停标记（4.3.0）：常规路径随 `base` 一起删掉，这里显式清一次——`remove_dir_all` 失败时
+    // 也不留下一个会被下一次巡检读到的「已暂停」。
+    sys.remove_file(&paths.paused())?;
     // 单元停了 TUN 接口通常自己就没了；留下的残骸删掉，没有也不算错
     let _ = sys.run("ip", &["link", "delete", TUN_IFACE]);
     r.ufw_revoked = ufw::revoke_tun(sys)?;
@@ -72,6 +75,8 @@ mod tests {
     fn removes_units_dir_and_interface() {
         let s = FakeSys::new();
         installed(&s);
+        // 4.3.0：暂停标记随卸载一起清掉
+        s.put("/opt/bui-c/paused", "2026-09-11T00:00:00Z cli\n");
         s.reply("ufw status", 0, "Status: active\n");
         let r = run(&s, &paths(), false).unwrap();
         assert_eq!(
@@ -83,6 +88,7 @@ mod tests {
             ]
         );
         assert!(r.purged_base && !r.purged_bin && r.ufw_revoked);
+        assert!(!s.exists(std::path::Path::new("/opt/bui-c/paused")));
         // timer 先停再停主单元，避免刚停完 sing-box 又被巡检拉起来
         let calls = s.calls();
         let i_timer = calls

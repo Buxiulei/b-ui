@@ -133,6 +133,9 @@ impl std::fmt::Display for Failure {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
     NoProfile,
+    /// 用户 `bui-c stop` 过（`/opt/bui-c/paused` 在）：不探测、不重启、不自更新，
+    /// 只记一行日志。这是「停止后不被 timer 拉回来」的唯一判据（4.3.0）。
+    Paused,
     Ok,
     Uncertain {
         failures: Vec<Failure>,
@@ -378,6 +381,11 @@ pub fn decide(rt: &Runtime, now: i64, failures: Vec<Failure>) -> Decision {
 /// 不能拿旧实例的探测结果打断新实例。锁内重新确认本地故障、读取最新退避记账，
 /// 恢复与等 TUN 就绪都在同一把锁里；单元动作成功不代表全链路或防泄漏已验证。
 pub fn run<S: Sys, N: Net>(sys: &S, net: &N, paths: &Paths) -> Result<Verdict> {
+    // 暂停标记先于一切：探测、UFW 重放、重启、自更新都不做（4.3.0）。
+    if crate::pause::is_paused(sys, paths) {
+        tracing::info!("{}", crate::pause::CHECK_SKIPPED);
+        return Ok(Verdict::Paused);
+    }
     let prof = Profiles::load(sys, paths)?;
     if prof.active_profile().is_none() {
         return Ok(Verdict::NoProfile);
@@ -664,6 +672,25 @@ mod tests {
             !s.called("systemctl restart bui-c.service"),
             "没配置节点时不该重启单元"
         );
+    }
+
+    /// 4.3.0：暂停标记在就不探测、不乱动服务、不写 runtime.json——timer 每分钟跑一次
+    /// `bui-c check`，这是「停止后不被拉回来」的唯一判据。
+    #[test]
+    fn a_paused_machine_is_not_probed_restarted_or_recorded() {
+        let s = FakeSys::new();
+        let n = FakeNet::new();
+        profiles_socks().save(&s, &paths()).unwrap();
+        crate::pause::mark(&s, &paths(), crate::pause::SOURCE_CLI).unwrap();
+        s.reply("systemctl is-active --quiet bui-c.service", 3, "");
+        crate::testutil::stopped_service(&s);
+        n.route(PROBE_URL, FakeReply::Fail("no route".into()));
+        let before = s.writes("/opt/bui-c/runtime.json");
+        assert_eq!(run(&s, &n, &paths()).unwrap(), Verdict::Paused);
+        assert!(n.log().is_empty(), "不探测：{:?}", n.log());
+        assert!(s.calls().is_empty(), "不碰 systemd / ip：{:?}", s.calls());
+        assert_eq!(s.writes("/opt/bui-c/runtime.json"), before);
+        assert!(s.sleeps().is_empty());
     }
 
     #[test]

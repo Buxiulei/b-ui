@@ -59,6 +59,11 @@ impl Paths {
     pub fn pending(&self) -> PathBuf {
         self.base.join("pending.json")
     }
+    /// 暂停标记 `/opt/bui-c/paused`（0600，4.3.0）：用户意图「现在不要代理」，
+    /// 不是期望配置，所以不进 `profiles.json`（旧版本读到它仍逐字节兼容）。
+    pub fn paused(&self) -> PathBuf {
+        self.base.join("paused")
+    }
     pub fn bin_dir(&self) -> PathBuf {
         self.base.join("bin")
     }
@@ -84,6 +89,7 @@ mod tests {
         assert_eq!(p.config(), PathBuf::from("/opt/bui-c/config.json"));
         assert_eq!(p.runtime(), PathBuf::from("/opt/bui-c/runtime.json"));
         assert_eq!(p.pending(), PathBuf::from("/opt/bui-c/pending.json"));
+        assert_eq!(p.paused(), PathBuf::from("/opt/bui-c/paused"));
         assert_eq!(p.singbox(), PathBuf::from("/opt/bui-c/bin/sing-box"));
         assert_eq!(
             p.unit(UNIT_TIMER),

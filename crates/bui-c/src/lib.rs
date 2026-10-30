@@ -16,6 +16,7 @@ pub mod menu;
 pub mod net;
 pub mod nettest;
 pub mod paths;
+pub mod pause;
 pub mod profiles;
 pub mod service;
 pub mod source;

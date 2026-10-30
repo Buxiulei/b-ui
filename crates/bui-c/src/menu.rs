@@ -2,7 +2,7 @@
 //!
 //! 渲染输出不含 ANSI 颜色：颜色会让快照测试变脆，可读性靠对齐与 `●`/`○`/`★` 够用。
 
-use crate::profiles::{kind_slug, Blocked, Mode, Profiles};
+use crate::profiles::{kind_slug, Blocked, Mode, Profiles, Source};
 use crate::update::{Report, SelfReason};
 use crate::{Error, Result};
 use std::borrow::Cow;
@@ -240,6 +240,9 @@ pub struct Status {
     pub mode: Mode,
     pub service_running: bool,
     pub tun_up: bool,
+    /// 用户 `bui-c stop` 过（`/opt/bui-c/paused` 在）：状态区显示「已停止（直连）」，
+    /// 服务控制子页的 [3] 按它切换「停止代理 / 恢复代理」（4.3.0）。
+    pub paused: bool,
     pub socks_port: u16,
     pub http_port: u16,
     /// 上一次检查更新的结论：有新版时主菜单在 `[7] 更新与维护` 后面挂 ★（spec §0.2 R6）。
@@ -254,6 +257,8 @@ pub enum MaintAction {
     CheckUpdate,
     ToggleAuto,
     ImportV3,
+    /// `[4] 订阅来源`（4.3.0）：显示面板订阅来源，可在子页里清除。
+    Subscription,
     Back,
 }
 
@@ -302,9 +307,9 @@ pub fn ago(secs: i64) -> String {
 }
 
 /// `[7] 更新与维护` 子页（spec §3e-60-5、§8.4）：样式与 [4] 服务控制一致——前空一行、两列缩进的
-/// 标题、5 列缩进的内容。顶部三行是本地事实，下面三个动作与返回；「上次检查」那一行放不下就尾截
+/// 标题、5 列缩进的内容。顶部三行是本地事实，下面四个动作与返回；「上次检查」那一行放不下就尾截
 /// （有新版时带 manifest 的版本号，rc 预发布的可以很长），编号与动作名都是固定短文案，40 列放得下。
-/// 提示符 `选择 [0-3]` 由调用方问。
+/// 提示符 `选择 [0-4]` 由调用方问。
 pub fn render_maint(m: &MaintStatus, width: usize) -> String {
     const FACT: &str = "     ";
     let fact = |head: &str, value: &str| {
@@ -322,12 +327,12 @@ pub fn render_maint(m: &MaintStatus, width: usize) -> String {
     out.push_str(&fact("上次检查", &m.update_line));
     out.push_str(&fact("自动更新", auto));
     out.push_str(&format!(
-        "     [1] 检查更新\n     [2] {toggle}\n     [3] 从 v3 导入\n     [0] 返回\n"
+        "     [1] 检查更新\n     [2] {toggle}\n     [3] 从 v3 导入\n     [4] 订阅来源\n     [0] 返回\n"
     ));
     out
 }
 
-/// `[7]` 子页：空行与 `0` 返回，`1`–`3` 是动作（全角数字折半角），别的一律 `None`（调用方打一行
+/// `[7]` 子页：空行与 `0` 返回，`1`–`4` 是动作（全角数字折半角），别的一律 `None`（调用方打一行
 /// 错误、原地重问）。
 pub fn parse_maint_choice(input: &str) -> Option<MaintAction> {
     match normalize_digits(input).as_str() {
@@ -335,13 +340,138 @@ pub fn parse_maint_choice(input: &str) -> Option<MaintAction> {
         "1" => Some(MaintAction::CheckUpdate),
         "2" => Some(MaintAction::ToggleAuto),
         "3" => Some(MaintAction::ImportV3),
+        "4" => Some(MaintAction::Subscription),
         _ => None,
     }
 }
 
-/// `[7]` 子页输错：`无效选项：{x}（请输入 0-3 的数字）`，回显先净化再截到行宽。
+/// `[7]` 子页输错：`无效选项：{x}（请输入 0-4 的数字）`，回显先净化再截到行宽。
 pub fn invalid_maint_choice(input: &str, width: usize) -> String {
-    bad_input_line("无效选项：", input, "（请输入 0-3 的数字）", width)
+    bad_input_line("无效选项：", input, "（请输入 0-4 的数字）", width)
+}
+
+// ───────────── [7] → [4] 订阅来源（4.3.0） ─────────────
+
+/// 「订阅来源」页要显示的事实：`profiles.panel`（面板地址与等价凭据 username）与
+/// `source = api_nodes` 的节点数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubscriptionView {
+    pub base_url: String,
+    /// 已经过 [`mask_username`]，可以直接打印。
+    pub username: String,
+    pub nodes: usize,
+}
+
+/// 从 `profiles.json` 组装：没有 `panel` 就是「未设置」。
+pub fn subscription_view(prof: &Profiles) -> Option<SubscriptionView> {
+    let p = prof.panel.as_ref()?;
+    Some(SubscriptionView {
+        base_url: p.base_url.clone(),
+        username: mask_username(&p.username),
+        nodes: prof
+            .profiles
+            .iter()
+            .filter(|x| x.source == Source::ApiNodes)
+            .count(),
+    })
+}
+
+/// username 是订阅路径的最后一段（等价凭据），显示时打码：留首尾各 4 个字符
+/// （`0123…cdef`）；短名字只留第一个字符（`a…`）——9–12 个字符的名字按短的算，
+/// 免得露出大半个凭据。
+pub fn mask_username(user: &str) -> String {
+    let n = user.chars().count();
+    if n == 0 {
+        return String::new();
+    }
+    if n <= 12 {
+        return format!("{}…", user.chars().next().unwrap_or('?'));
+    }
+    let head: String = user.chars().take(4).collect();
+    let tail: String = user.chars().skip(n - 4).collect();
+    format!("{head}…{tail}")
+}
+
+/// `[7]` → `[4] 订阅来源` 子页（4.3.0）：面板地址、打码后的用户名与面板节点数；
+/// 有来源时多一行 `[1] 清除订阅来源`。没有来源时只显示「未设置」。
+pub fn render_subscription(v: Option<&SubscriptionView>, width: usize) -> String {
+    const FACT: &str = "     ";
+    let fact = |head: &str, value: &str| {
+        let lead = format!("{FACT}{head}   ");
+        let room = line_limit(width).saturating_sub(budget_width(&lead));
+        format!("{lead}{}\n", truncate_end(&sanitize(value), room))
+    };
+    let mut out = String::from("\n  订阅来源\n");
+    match v {
+        None => out.push_str(&format!("     {SUB_NONE}\n")),
+        Some(v) => {
+            out.push_str(&fact("面板地址", &v.base_url));
+            out.push_str(&fact("面板用户", &v.username));
+            out.push_str(&fact("面板节点", &format!("{} 个", v.nodes)));
+        }
+    }
+    if v.is_some() {
+        out.push_str("     [1] 清除订阅来源\n");
+    }
+    out.push_str("     [0] 返回\n");
+    out
+}
+
+/// `bui-c subscription` 的几行（没有来源时一行）。username 已打码，`base_url` 不是凭据。
+pub fn subscription_report(v: Option<&SubscriptionView>) -> Vec<String> {
+    match v {
+        None => vec![SUB_NONE.to_string()],
+        Some(v) => vec![
+            format!("订阅来源：{}", v.base_url),
+            format!("面板用户：{}", v.username),
+            format!("面板节点：{} 个", v.nodes),
+        ],
+    }
+}
+
+/// 没有订阅来源时的说法（子页、`bui-c subscription`、清除时别人已经清过——同一句）。
+pub const SUB_NONE: &str = "未设置订阅来源";
+
+/// 清除订阅来源的确认问句（`[y/N]` 由提示自己补）。
+pub fn sub_clear_ask(base_url: &str) -> String {
+    format!("清除订阅来源 {}？", sanitize(base_url))
+}
+
+/// 清除成功的那一行（命令行与菜单同一句，「上次：」行也用它）。
+pub const SUB_CLEARED: &str = "已清除订阅来源";
+/// 清除之后的两句后果（spec 2026-10-30 §1）。
+pub const SUB_CLEAR_EFFECT: &str =
+    "不再从面板自动刷新节点；每日自更新的 manifest 与二进制优先来源回落到 GitHub";
+
+/// 「订阅来源」子页里的一次选择。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubAction {
+    /// `[1] 清除订阅来源`（只有设置了来源时才有这一项）。
+    Clear,
+    Back,
+}
+
+/// 子页：空行与 `0` 返回；`1` 只在有来源时是「清除」，别的一律 `None`。
+pub fn parse_sub_choice(input: &str, has_source: bool) -> Option<SubAction> {
+    match normalize_digits(input).as_str() {
+        "" | "0" => Some(SubAction::Back),
+        "1" if has_source => Some(SubAction::Clear),
+        _ => None,
+    }
+}
+
+/// 子页输错：有来源时 `（请输入 0-1 的数字）`，没有时 `（请输入 0 返回）`。
+pub fn invalid_sub_choice(input: &str, has_source: bool, width: usize) -> String {
+    bad_input_line(
+        "无效选项：",
+        input,
+        if has_source {
+            "（请输入 0-1 的数字）"
+        } else {
+            "（请输入 0 返回）"
+        },
+        width,
+    )
 }
 
 // ───────────── [7] → [1] 检查更新：先显示版本，再确认（spec §8.1、§0.2 R4） ─────────────
@@ -1057,9 +1187,12 @@ pub fn render_status(st: &Status, width: usize) -> String {
         "\n{}\n\n",
         title_bar(&format!("B-UI 客户端 v{}", crate::VERSION))
     );
-    // 没有节点时服务就算在跑也没东西可用：不亮绿灯，也不报「已停止」这种无关的状态
+    // 没有节点时服务就算在跑也没东西可用：不亮绿灯，也不报「已停止」这种无关的状态。
+    // 暂停是用户意图（4.3.0）：说「已停止（直连）」，不跟故障的「已停止」混为一谈
     let (dot, word) = if st.node.is_empty() {
         ("○", "(未设置)")
+    } else if st.paused {
+        ("○", crate::pause::PAUSED_WORD)
     } else if st.service_running {
         ("●", "运行中")
     } else {
@@ -1333,6 +1466,9 @@ pub fn render_node_picker(prof: &Profiles, width: usize) -> String {
 pub enum ServiceAction {
     Restart,
     Logs,
+    /// `[3] 停止代理` / `[3] 恢复代理`（4.3.0）：按暂停标记切换文案，行为与
+    /// `bui-c stop` / `bui-c start` 相同。
+    TogglePause,
     Back,
 }
 
@@ -1340,10 +1476,15 @@ pub enum ServiceAction {
 pub const SERVICE_LOG_LINES: u32 = 50;
 
 /// `[4] 服务控制` 的二级数字菜单：样式与主菜单一致——前空一行、两列缩进的标题、
-/// 选项 5 列缩进。以前两列缩进直接接在主菜单下面，看着像主菜单多出来的几行。
-pub fn render_service_options() -> String {
+/// 选项 5 列缩进。`paused` 只换 [3] 的文案（停止代理 / 恢复代理）。
+pub fn render_service_options(paused: bool) -> String {
+    let toggle = if paused {
+        "恢复代理"
+    } else {
+        "停止代理"
+    };
     format!(
-        "\n  服务控制\n     [1] 重启 bui-c.service\n     [2] 最近 {SERVICE_LOG_LINES} 行日志\n     [0] 返回\n"
+        "\n  服务控制\n     [1] 重启 bui-c.service\n     [2] 最近 {SERVICE_LOG_LINES} 行日志\n     [3] {toggle}\n     [0] 返回\n"
     )
 }
 
@@ -1353,6 +1494,7 @@ pub fn parse_service_choice(input: &str) -> Option<ServiceAction> {
         "" | "0" => Some(ServiceAction::Back),
         "1" => Some(ServiceAction::Restart),
         "2" => Some(ServiceAction::Logs),
+        "3" => Some(ServiceAction::TogglePause),
         _ => None,
     }
 }
@@ -2235,6 +2377,7 @@ mod tests {
             mode: Mode::Tun,
             service_running: true,
             tun_up: true,
+            paused: false,
             socks_port: 1080,
             http_port: 8080,
             update_available: false,
@@ -2645,7 +2788,7 @@ mod tests {
         };
         assert_eq!(
             render_maint(&on, 60),
-            "\n  更新与维护\n     当前版本   4.0.0\n     上次检查   有新版（2 小时前）\n     自动更新   开，每天一次\n     [1] 检查更新\n     [2] 关闭自动更新\n     [3] 从 v3 导入\n     [0] 返回\n"
+            "\n  更新与维护\n     当前版本   4.0.0\n     上次检查   有新版（2 小时前）\n     自动更新   开，每天一次\n     [1] 检查更新\n     [2] 关闭自动更新\n     [3] 从 v3 导入\n     [4] 订阅来源\n     [0] 返回\n"
         );
         let off = MaintStatus {
             auto_update: false,
@@ -2667,6 +2810,7 @@ mod tests {
             "[1] 检查更新",
             "[2] 关闭自动更新",
             "[3] 从 v3 导入",
+            "[4] 订阅来源",
             "[0] 返回",
         ] {
             assert!(out.contains(key), "{key}\n{out}");
@@ -2678,12 +2822,105 @@ mod tests {
         assert_eq!(parse_maint_choice("1"), Some(MaintAction::CheckUpdate));
         assert_eq!(parse_maint_choice(" ２ "), Some(MaintAction::ToggleAuto));
         assert_eq!(parse_maint_choice("3"), Some(MaintAction::ImportV3));
+        assert_eq!(parse_maint_choice("4"), Some(MaintAction::Subscription));
         assert_eq!(parse_maint_choice("0"), Some(MaintAction::Back));
         assert_eq!(parse_maint_choice(""), Some(MaintAction::Back));
-        assert_eq!(parse_maint_choice("4"), None);
+        assert_eq!(parse_maint_choice("5"), None);
         assert_eq!(parse_maint_choice("x"), None);
         let bad = invalid_maint_choice("x", 80);
-        assert!(bad.contains("0-3"), "{bad}");
+        assert!(bad.contains("0-4"), "{bad}");
+    }
+
+    /// 4.3.0：`[7]` → `[4] 订阅来源`。username 是订阅路径的最后一段（等价凭据），显示前打码；
+    /// 面板节点数只数 `source = api_nodes` 的条目。
+    #[test]
+    fn subscription_page_masks_the_username_and_counts_panel_nodes() {
+        assert_eq!(
+            mask_username("0123456789abcdef0123456789abcdef"),
+            "0123…cdef"
+        );
+        assert_eq!(mask_username("alice"), "a…", "短名字只留第一个字符");
+        assert_eq!(mask_username("alice1234567"), "a…", "12 个字符仍按短的算");
+        assert_eq!(mask_username("alice12345678"), "alic…5678");
+        assert_eq!(mask_username(""), "");
+
+        let mut prof = Profiles::new_default();
+        assert_eq!(subscription_view(&prof), None, "没有 panel 就是未设置");
+        assert_eq!(subscription_report(None), vec![SUB_NONE.to_string()]);
+        prof.panel = Some(crate::profiles::Panel {
+            base_url: "https://panel.example.com".into(),
+            username: "0123456789abcdef0123456789abcdef".into(),
+        });
+        // 面板来源两条、订阅一条：只数面板的
+        prof.profiles
+            .push(named("alice-hy2-direct", hy2_direct_node()));
+        prof.profiles
+            .push(named("alice-hy2-resi", hy2_direct_node()));
+        let mut pasted = named("pasted", hy2_direct_node());
+        pasted.source = Source::Subscription;
+        prof.profiles.push(pasted);
+        let view = subscription_view(&prof).unwrap();
+        assert_eq!(
+            view,
+            SubscriptionView {
+                base_url: "https://panel.example.com".into(),
+                username: "0123…cdef".into(),
+                nodes: 2,
+            }
+        );
+        assert_eq!(
+            render_subscription(None, 60),
+            "\n  订阅来源\n     未设置订阅来源\n     [0] 返回\n",
+            "没有来源时这一页只显示「未设置」"
+        );
+        assert_eq!(
+            render_subscription(Some(&view), 60),
+            "\n  订阅来源\n     面板地址   https://panel.example.com\n     面板用户   0123…cdef\n     面板节点   2 个\n     [1] 清除订阅来源\n     [0] 返回\n"
+        );
+        // 40 列：面板地址尾截，编号与动作名一个不少
+        let out = render_subscription(Some(&view), 40);
+        for l in out.lines() {
+            assert!(budget_width(l) <= line_limit(40), "{l:?}\n{out}");
+        }
+        assert!(out.contains("[1] 清除订阅来源"), "{out}");
+        assert_eq!(
+            subscription_report(Some(&view)),
+            vec![
+                "订阅来源：https://panel.example.com".to_string(),
+                "面板用户：0123…cdef".to_string(),
+                "面板节点：2 个".to_string(),
+            ]
+        );
+
+        assert_eq!(parse_sub_choice("1", true), Some(SubAction::Clear));
+        assert_eq!(parse_sub_choice("1", false), None, "没有来源时没有 [1]");
+        assert_eq!(parse_sub_choice("０", true), Some(SubAction::Back));
+        assert_eq!(parse_sub_choice("", false), Some(SubAction::Back));
+        assert_eq!(parse_sub_choice("2", true), None);
+        assert!(invalid_sub_choice("x", true, 80).contains("0-1"));
+        assert!(invalid_sub_choice("x", false, 80).contains("0 返回"));
+    }
+
+    /// 4.3.0：暂停是用户意图，状态区说「已停止（直连）」，与故障的「已停止」区分开；
+    /// 手动把单元拉起来过也一样（标记才是判据）。
+    #[test]
+    fn a_paused_machine_says_stopped_direct() {
+        let paused = Status {
+            paused: true,
+            service_running: false,
+            tun_up: false,
+            ..st()
+        };
+        let out = render_status(&paused, 80);
+        assert!(out.contains("○  已停止（直连）"), "{out}");
+        let manually_started = Status {
+            service_running: true,
+            ..paused
+        };
+        assert!(
+            render_status(&manually_started, 80).contains("已停止（直连）"),
+            "标记在就按暂停说"
+        );
     }
 
     /// 检查更新的一份结论：来源与版本取最长的 rc 预发布写法；内核要换时本机是 1.13.19。
@@ -3032,7 +3269,8 @@ mod tests {
         }
         out.push(("nodes", render_nodes(&prof, true, width)));
         out.push(("picker", render_node_picker(&prof, width)));
-        out.push(("service", render_service_options()));
+        out.push(("service", render_service_options(false)));
+        out.push(("service-paused", render_service_options(true)));
         // 下面是另补的形态：状态区带上各节点真实的 kind 与服务器:端口（上面只换了名字与 label，
         // 服务器:端口一直是 st() 的 23 列）、每个节点轮流当活动节点时的菜单列表与一次性 list、
         // 没有节点、SOCKS 模式服务停了且端口是 5 位数。T9 起还有「有新版」形态：★ 挂在左栏
@@ -3095,6 +3333,29 @@ mod tests {
                 Some(V3_SKIPPED),
             ),
         ));
+        // 4.3.0：暂停（状态区说「已停止（直连）」）与 [7] → [4] 订阅来源子页的两种形态。
+        // 面板地址取真机同量级的长度，打码用户名取 32 位 token 的首尾
+        out.push((
+            "paused",
+            render(
+                &Status {
+                    paused: true,
+                    service_running: false,
+                    tun_up: false,
+                    ..st()
+                },
+                width,
+                Some(crate::pause::STOPPED),
+            ),
+        ));
+        out.push(("sub-none", render_subscription(None, width)));
+        let sub = SubscriptionView {
+            base_url: "https://panel.example.com".into(),
+            username: mask_username("0123456789abcdef0123456789abcdef"),
+            nodes: 9,
+        };
+        out.push(("sub", render_subscription(Some(&sub), width)));
+        out.push(("sub-last", render(&st(), width, Some(SUB_CLEAR_EFFECT))));
         // T9：[7] 更新与维护子页（开关两种、上次检查的几种说法，含带版本号的长句）、
         // 子页输错、旧键过渡提示、只活在「上次：」行里的几句挪了位置的引导
         for auto_update in [true, false] {
@@ -4646,15 +4907,21 @@ mod tests {
     #[test]
     fn service_submenu_is_numbered_and_parses_back_on_blank_or_zero() {
         assert_eq!(
-            render_service_options(),
-            "\n  服务控制\n     [1] 重启 bui-c.service\n     [2] 最近 50 行日志\n     [0] 返回\n",
+            render_service_options(false),
+            "\n  服务控制\n     [1] 重启 bui-c.service\n     [2] 最近 50 行日志\n     [3] 停止代理\n     [0] 返回\n",
             "与主菜单一致：前空一行、标题、选项 5 列缩进"
+        );
+        // 4.3.0：暂停中 [3] 换文案，动作与 `bui-c start` 相同
+        assert_eq!(
+            render_service_options(true),
+            "\n  服务控制\n     [1] 重启 bui-c.service\n     [2] 最近 50 行日志\n     [3] 恢复代理\n     [0] 返回\n"
         );
         assert_eq!(parse_service_choice("1"), Some(ServiceAction::Restart));
         assert_eq!(parse_service_choice(" ２ "), Some(ServiceAction::Logs));
+        assert_eq!(parse_service_choice("3"), Some(ServiceAction::TogglePause));
         assert_eq!(parse_service_choice("0"), Some(ServiceAction::Back));
         assert_eq!(parse_service_choice(""), Some(ServiceAction::Back));
-        assert_eq!(parse_service_choice("3"), None);
+        assert_eq!(parse_service_choice("4"), None);
         assert_eq!(parse_service_choice("x"), None);
     }
 

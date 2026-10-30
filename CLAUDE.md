@@ -14,7 +14,7 @@ Cargo workspace，三个 crate + 保留的前端三文件：
 
 1. **`crates/bui-schema`** — 唯一知道端口、标签、规则与格式的地方：期望态模型（`State`）、权益 → 节点集合（`nodes::nodes_for`）、四种内核配置渲染（hysteria ×2 / xray / sing-box relay）、三种订阅渲染、客户端配置渲染、上游 URL 与节点 URI 解析、v3 状态导入。改端口/标签/参数只改这里。公共 API 是总纲 C1 契约，`src/lib.rs` 的模块文档是它的清单。
 2. **`crates/bui`** — 服务端单二进制：`install / upgrade / serve / reconcile / status / incidents / import-v3 / set / auth-hook / residential / menu / harden-ssh`。期望态存 `/opt/b-ui/state.json`，对账器把文件/单元/sysctl/防火墙/二进制拉到期望态（非受管项只报不改）；面板 API + 内嵌前端 + 住宅巡检 + 黑名单 + 证书监听 + watchdog + 日志哨兵（spec §5.7，`modules/sentinel`：5 秒增量读受管单元的 journald，按签名表探测 → 按槽借用 / 重试用户同步 / 告警，事件落 `runtime.json` 的 `incidents`，`bui incidents` 查看）+ 升级都在这一个进程里，**没有 cron、没有独立 timer、没有改配置的 shell 脚本**。
-3. **`crates/bui-c`** — Linux 客户端：单引擎（sing-box ≤ 1.14）的 SOCKS/TUN，`bui-c.service` + `bui-c.timer`（每分钟 `bui-c check`）。
+3. **`crates/bui-c`** — Linux 客户端：单引擎（sing-box ≤ 1.14）的 SOCKS/TUN，`bui-c.service` + `bui-c.timer`（每分钟 `bui-c check`）。`bui-c stop|start` 用标记 `/opt/bui-c/paused`（0600）暂停/恢复：巡检见到标记直接跳过、不回拉服务，暂停期间除 switch/mode/import --activate 外的 apply 一律只存配置；`bui-c subscription` 查看/清除面板订阅来源（只清 `profiles.panel`，节点保留）。
 4. **`web/{index.html,app.js,style.css}`** — 保留的 vanilla SPA，由 `bui` 以 `rust-embed` 内嵌（`modules/panel/assets.rs`）。
 
 引导：`install.sh`（有效代码 ≤150 行，`scripts/tests/test-install.sh` 守门）识别架构 → 从 GitHub Releases（失败则 `BUI_MIRRORS` 的镜像前缀）下载 `manifest.json` 与 `bui` → 校验 sha256 → `exec bui install [--import-v3]`。
