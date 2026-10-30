@@ -46,6 +46,10 @@ pub fn router(state: AppState, modules: &[Arc<dyn Module>]) -> axum::Router {
         .route(
             "/api/system/hy2-resi-compat",
             axum::routing::post(system::set_hy2_resi_compat),
+        )
+        .route(
+            "/api/system/reality-front",
+            axum::routing::post(system::set_reality_front),
         );
     let protected = modules
         .iter()
@@ -804,6 +808,72 @@ mod tests {
             .contains("PasswordAuthentication no"));
         assert!(host.ops().contains(&"systemd:reload:sshd".into()));
         owner.drain().await;
+    }
+
+    #[tokio::test]
+    async fn reality_front_requires_root_uds_and_persists_once() {
+        let (app, dir, _host, _runtime, bus) = app_with_bus().await;
+        let token = login(&app).await;
+        let before = std::fs::read(dir.path().join("state.json")).unwrap();
+        let mut events = bus.subscribe();
+        for uid in [None, Some(1000)] {
+            let mut req = with_token(
+                post(
+                    "/api/system/reality-front",
+                    serde_json::json!({"value":"l4"}),
+                ),
+                &token,
+            );
+            if let Some(uid) = uid {
+                req.extensions_mut()
+                    .insert(crate::api::auth::UdsPeer { uid });
+            }
+            assert_eq!(
+                app.clone().oneshot(req).await.unwrap().status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        let mut req = post(
+            "/api/system/reality-front",
+            serde_json::json!({"value":"proxy"}),
+        );
+        req.extensions_mut()
+            .insert(crate::api::auth::UdsPeer { uid: 0 });
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("state.json")).unwrap(),
+            before,
+            "未授权的请求一个字节都不许写"
+        );
+        assert!(events.try_recv().is_err());
+
+        for changed in [true, false] {
+            let mut req = post(
+                "/api/system/reality-front",
+                serde_json::json!({"value":"l4"}),
+            );
+            req.extensions_mut()
+                .insert(crate::api::auth::UdsPeer { uid: 0 });
+            let res = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            let body = json(res).await;
+            assert_eq!(body["changed"], changed);
+            assert_eq!(body["reality_front"], "l4");
+            let bytes = std::fs::read(dir.path().join("state.json")).unwrap();
+            let persisted: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(persisted["node"]["reality"]["front"], "l4");
+            if changed {
+                assert_eq!(
+                    events.try_recv().unwrap(),
+                    Event::StateChanged("reality-front")
+                );
+            } else {
+                assert!(events.try_recv().is_err());
+            }
+        }
     }
 
     #[tokio::test]

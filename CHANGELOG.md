@@ -8,6 +8,30 @@
 `version` 的唯一来源是根 `Cargo.toml` 的 `[workspace.package] version`；改版本必须同时在本文件加一段，`scripts/release/check-version.sh` 会在 CI 里卡住不一致（它只认 `## [<version>]` 这个标题，日期不参与校验）。
 未发布的版本日期写「未发布」，由主理人打 tag 发版时替换成当天日期（UTC）。
 
+## [Unreleased]
+
+### REALITY 443 + self-steal
+
+- **REALITY 收敛到 443，伪装目标换成本机 Caddy**：`vless-direct` / `vless-residential`
+  两个 inbound 合并成一个 `tag: "vless"`。`front = public`（新装机默认）直接监听
+  `0.0.0.0:443`；`front = l4` 监听 `127.0.0.1:10443`，由前置 L4 把公网 443 转进来
+  （`bui set reality-front public|l4`）。`realitySettings.dest` 固定为
+  `127.0.0.1:9443`、`serverNames = [node.domain]`、`xver: 1`，`sniffing` 加
+  `routeOnly: true`；Caddy 退到本地 `:9443`（只服务 REALITY 回落，外部由 `inet bui`
+  的 `input` 链封堵），公网 `:80` 只做 ACME 与跳转。
+- **两个 Reality 节点改用 VLESS `vlessRoute` 区分**：直连节点 UUID 第 6/7 字节 =
+  `0000`、住宅节点 = `0001`（Xray 的 `ProcessUUID` 清零这两字节后查用户，客户端无需
+  任何新字段）。服务端每个住宅用户一条 `user + vlessRoute: 1` 规则，通用
+  `resi-route`（route 1 → 兜底槽）与最终兜底 `resi-fallback`（→ `direct`）把新用户
+  尚未收敛的窗口挡在住宅出口上。
+- **旧 state 读盘即归一**：`State::normalize` 把 `reality.dest` / `server_names` /
+  `ports.reality_*`（旧 10001/10002）拉齐为 self-steal 形态并写回；v3 导入同样归一。
+  面板 `/api/masquerade` 的写入口径退役（GET 只回显域名，POST 显式拒绝）。防火墙只
+  放行 443（去重），自检 / watchdog / 装机端口检查按 `front` 检查实际监听。
+- **升级注意**：旧订阅里的 `:10001` / `:10002` 节点在部署后不可用，客户端刷新订阅即
+  拿到同域名、同端口（443）、两个不同 UUID 的节点；两台生产机按 `front = l4` 迁移，
+  NBDpsy 的静态 xray-client 需同步改端口与 route 0 UUID。
+
 ## [4.1.11] - 2026-10-27
 
 ### 服务端出站强制 IPv4 / 封死主机 IPv6 出站

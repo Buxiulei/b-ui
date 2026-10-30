@@ -571,7 +571,9 @@ async fn apply_slot_rules(xray: &dyn XrayApi, want: &[SlotRule]) -> anyhow::Resu
         .await?
         .into_iter()
         .filter(|(tag, _)| {
-            tag.starts_with(xray_render::USER_RULE_PREFIX) || tag == xray_render::FALLBACK_RULE_TAG
+            tag.starts_with(xray_render::USER_RULE_PREFIX)
+                || tag == xray_render::RESI_ROUTE_RULE_TAG
+                || tag == xray_render::FALLBACK_RULE_TAG
         })
         .collect();
     let by_tag: BTreeMap<&str, &str> = live
@@ -580,6 +582,10 @@ async fn apply_slot_rules(xray: &dyn XrayApi, want: &[SlotRule]) -> anyhow::Resu
         .collect();
     let wanted: BTreeSet<&str> = want.iter().map(|r| r.rule_tag.as_str()).collect();
     let mut calls = 0usize;
+    // 表尾两条通用规则：`resi-route`（route 1 → 兜底槽）必须在全部用户规则**之后**，
+    // `resi-fallback`（→ direct）永远最后（spec §3.3）。
+    let (body, tails): (Vec<&SlotRule>, Vec<&SlotRule>) =
+        want.iter().partition(|r| !r.emails.is_empty());
     // ① 多出来的（用户删了 / 没了住宅权益 / 换了 tag 写法）
     for (tag, _) in &live {
         if !wanted.contains(tag.as_str()) {
@@ -588,9 +594,8 @@ async fn apply_slot_rules(xray: &dyn XrayApi, want: &[SlotRule]) -> anyhow::Resu
         }
     }
     // ② 缺的或指错槽的：**先删再加** —— 重名 ruleTag 会让整条 AddRule 报错（D7 事实①）
-    let fallback = want.last().expect("slot_rules 末尾一定是兜底规则").clone();
     let mut appended = false;
-    for r in want.iter().filter(|r| r.rule_tag != fallback.rule_tag) {
+    for r in body {
         if by_tag.get(r.rule_tag.as_str()).copied() == Some(r.outbound_tag.as_str()) {
             continue;
         }
@@ -602,25 +607,34 @@ async fn apply_slot_rules(xray: &dyn XrayApi, want: &[SlotRule]) -> anyhow::Resu
         calls += 1;
         appended = true;
     }
-    // ③ `AddRule` 只能追加到表尾 ⇒ 这一轮追加过、或兜底本身缺了 / 指错了 / 排在别的
-    //    槽规则前面，就把兜底删掉再追加一次，让它回到全部用户规则之后。两次调用之间
-    //    有个亚毫秒窗口，期间「一条规则都没有的 email」落到首个出站 direct（D7 已接受）。
-    //    ①删掉的那些不算数：判位置只看留下来的（`wanted` 里的）那些规则的相对次序。
-    let last_kept = live
+    // ③ `AddRule` 只能追加到表尾 ⇒ 这一轮追加过、或表尾两条通用规则缺失 / 指错 / 顺序不对，
+    //    就把它们删掉再按 `resi-route` → `resi-fallback` 的顺序追加一次，让它们回到全部
+    //    用户规则之后。①删掉的那些不算数：判位置只看留下来的（`wanted` 里的）那些规则。
+    //
+    //    顺序错了为什么必须修：`resi-route` 不带 `user`，一旦排在某个用户规则之前，那个
+    //    用户的 route 1 流量会被它先匹配走（落到兜底槽而不是自己的槽）。
+    let last_kept: Vec<&str> = live
         .iter()
         .rev()
-        .find(|(tag, _)| wanted.contains(tag.as_str()))
-        .map(|(tag, _)| tag.as_str());
-    let fallback_ok = by_tag.get(fallback.rule_tag.as_str()).copied()
-        == Some(fallback.outbound_tag.as_str())
-        && last_kept == Some(fallback.rule_tag.as_str());
-    if appended || !fallback_ok {
-        if by_tag.contains_key(fallback.rule_tag.as_str()) {
-            xray.remove_rule(&fallback.rule_tag).await?;
+        .filter(|(tag, _)| wanted.contains(tag.as_str()))
+        .map(|(tag, _)| tag.as_str())
+        .take(tails.len())
+        .collect();
+    let tails_ok = last_kept.len() == tails.len()
+        && last_kept.iter().rev().zip(&tails).all(|(tag, r)| {
+            *tag == r.rule_tag && by_tag.get(tag).copied() == Some(r.outbound_tag.as_str())
+        });
+    if appended || !tails_ok {
+        for r in &tails {
+            if by_tag.contains_key(r.rule_tag.as_str()) {
+                xray.remove_rule(&r.rule_tag).await?;
+                calls += 1;
+            }
+        }
+        for r in &tails {
+            xray.add_rule(r).await?;
             calls += 1;
         }
-        xray.add_rule(&fallback).await?;
-        calls += 1;
     }
     Ok(calls)
 }
@@ -2063,10 +2077,12 @@ mod tests {
                 "list-rules".to_string(),
                 format!("remove-rule:resi-u-{moved}"),
                 format!("add-rule:resi-u-{moved}:relay-slot-1"),
+                "remove-rule:resi-route".to_string(),
                 "remove-rule:resi-fallback".to_string(),
-                "add-rule:resi-fallback:relay-slot-0".to_string(),
+                "add-rule:resi-route:relay-slot-0".to_string(),
+                "add-rule:resi-fallback:direct".to_string(),
             ],
-            "先删再加（重名会让整条 AddRule 报错），最后把兜底挪回表尾"
+            "先删再加（重名会让整条 AddRule 报错），最后把两条通用规则按序挪回表尾"
         );
         assert!(
             !x.calls().iter().any(|c| c.contains(&other.to_string())),
@@ -2102,10 +2118,12 @@ mod tests {
             x.calls(),
             vec![
                 "list-rules".to_string(),
+                "remove-rule:resi-route".to_string(),
                 "remove-rule:resi-fallback".to_string(),
-                "add-rule:resi-fallback:relay-slot-0".to_string(),
+                "add-rule:resi-route:relay-slot-0".to_string(),
+                "add-rule:resi-fallback:direct".to_string(),
             ],
-            "只挪兜底，用户规则一条都不碰"
+            "只挪表尾两条通用规则，用户规则一条都不碰"
         );
         assert_same_rules(&x.rules(), &want);
         assert_eq!(restarts_of_xray(&host), 0, "{:?}", host.ops());

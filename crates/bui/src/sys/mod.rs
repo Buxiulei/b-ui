@@ -489,7 +489,7 @@ mod tests {
         .to_string();
         let l3 = serde_json::json!({"__CURSOR": "s=a;i=3", "__REALTIME_TIMESTAMP": us(3),
             "_SYSTEMD_UNIT": "b-ui.service", "MESSAGE": "用户同步有失败项，下一轮安全网会重试",
-            "F_ERROR": "AddUser vless-direct 失败：code: 'The service is currently unavailable'"})
+            "F_ERROR": "AddUser vless 失败：code: 'The service is currently unavailable'"})
         .to_string();
         // 不在单元集合里 / 非 JSON / 缺 __CURSOR：一律丢掉
         let l4 = serde_json::json!({"__CURSOR": "s=a;i=4", "__REALTIME_TIMESTAMP": us(4),
@@ -515,7 +515,7 @@ mod tests {
         assert_eq!(out[1].unit, "xray", "systemd 自己的消息按 UNIT 归属");
         assert_eq!(
             out[2].message,
-            "用户同步有失败项，下一轮安全网会重试 error=AddUser vless-direct 失败：\
+            "用户同步有失败项，下一轮安全网会重试 error=AddUser vless 失败：\
              code: 'The service is currently unavailable'"
         );
     }

@@ -10,7 +10,7 @@
 //!
 //! [`State`] 是聚合根（对应 `/opt/b-ui/state.json`），其下：
 //! [`NodeParams`](model::NodeParams)、[`Ports`](model::Ports)、[`Reality`](model::Reality)、
-//! [`Obfs`](model::Obfs)、[`Admin`](model::Admin)、[`User`](model::User)、
+//! [`RealityFront`](model::RealityFront)、[`Obfs`](model::Obfs)、[`Admin`](model::Admin)、[`User`](model::User)、
 //! [`Credentials`](model::Credentials)、[`Protocol`](model::Protocol)、
 //! [`Entitlements`](model::Entitlements)、[`ResidentialEntitlement`](model::ResidentialEntitlement)、
 //! [`TrafficLimit`](model::TrafficLimit)、[`Usage`](model::Usage)、[`PortalAuth`](model::PortalAuth)、
@@ -110,8 +110,11 @@
 //!   [`render::hy2_singbox::gate_tag`] / [`render::hy2_singbox::slot_out_tag`] 都只有这一处来源。
 //! - [`render::nft::ruleset`]：住宅 HY2 端口跳跃那张 `table inet bui`
 //!   （[`render::nft::TABLE`]，整段 + 可选的 4.0 兼容段 REDIRECT 到单一监听端口）。
-//! - [`render::xray::config`]：含 `vless-direct` / `vless-residential` 两个 REALITY 入站的
-//!   `xray-config.json`；[`render::xray::structural_hash`] 忽略 `clients` 后取哈希，
+//! - [`render::xray::config`]：**单个** REALITY 入站 `vless` 的 `xray-config.json`
+//!   （客户端端口恒 [`REALITY_PORT`](model::REALITY_PORT) = 443，self-steal 回落到本机
+//!   Caddy [`CADDY_LOCAL_PORT`](model::CADDY_LOCAL_PORT) = 9443；直连 / 住宅用
+//!   [`nodes::routed_uuid`] 的 VLESS `vlessRoute` 区分）；
+//!   [`render::xray::structural_hash`] 忽略 `clients` 与带 `user` 的槽规则后取哈希，
 //!   用于判断是否只是加减用户（可热更新而不必重启）。
 //! - [`render::relay::config`]：本地 sing-box 中继 `singbox-relay.json`（池空时 fail-open 直连）。
 //!

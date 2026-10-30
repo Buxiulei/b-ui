@@ -259,7 +259,10 @@ function addUser() {
     const m = $("#nm").value || 0;
     const s = $("#ns").value || 100;  // 默认 100Mbps 上下行带宽
     const proto = $("#nproto").value;
-    const customSni = $("#nsni-custom")?.value || $("#nsni")?.value || "";
+    // SNI 下拉只服务 v3 遗留的 vless-ws-tls；vless-reality 的 SNI 恒为面板域名。
+    const customSni = proto === "vless-ws-tls"
+        ? ($("#nsni-custom")?.value || $("#nsni")?.value || "")
+        : "";
     const residential = $("#nresi")?.checked !== false; // 默认 true
 
     // v4：创建用户改为 JWT 保护的 POST /api/users（spec §4.3 改动 1）。
@@ -387,6 +390,16 @@ function subPath(x, kind) {
     return x && x.subToken ? "/api/" + kind + "/" + encodeURIComponent(x.subToken) : null;
 }
 
+// 2026-10-30（REALITY 443 + self-steal）：UUID 第 6/7 字节承载 VLESS `vlessRoute`
+// （第三组 = 0000 直连 / 0001 住宅），与服务端 `bui_schema::nodes::routed_uuid` 同一算法。
+// 非法 UUID 原样返回，不抛错。
+function routedUuid(uuid, route) {
+    const parts = String(uuid || "").split("-");
+    if (parts.length !== 5) return uuid;
+    parts[2] = (route & 0xffff).toString(16).padStart(4, "0");
+    return parts.join("-");
+}
+
 // Generate URI - 根据协议类型生成不同的链接
 function genUri(x) {
     // 融合订阅用户: 返回 v2rayN 原生订阅 URL (带备注)
@@ -400,17 +413,15 @@ function genUri(x) {
     // 判定与 server.js /api/sub 的 includeResi 完全一致（未设 residential 视为开）
     const includeResi = x.residential !== false;
     if (x.protocol === "vless-reality") {
-        // sni 以服务端实时 reality 配置(cfg.sni)为准，user.sni 是建用户时的旧拷贝。
-        // 改伪装后只动 xray-config、不回写老用户 sni；若优先 user.sni 会下发旧 sni →
-        // 与服务端 serverNames 不匹配 → REALITY received real certificate → 连不上。
-        // (与 server.js v3.5.13 订阅修复保持一致，避免"复制链接"路径重蹈覆辙)
-        const userSni = cfg.sni || x.sni || "www.bing.com";
+        // self-steal（2026-10-30）：两个现实节点都连 443，用 UUID 的 vlessRoute 区分；
+        // SNI 恒为服务端 serverNames（= 面板域名），不回退旧伪装站域名。
+        const userSni = cfg.sni || cfg.domain;
         // 参数顺序与 /api/sub 的 buildVlessUrl 逐字节一致，方便与订阅比对
         const vlessParams = "security=reality&encryption=none&pbk=" + cfg.pubKey +
             "&headerType=&fp=chrome&spx=%2F&type=tcp&flow=xtls-rprx-vision&sni=" + userSni +
             "&sid=" + cfg.shortId;
-        return "vless://" + x.uuid + "@" + cfg.domain + ":" +
-            (includeResi ? 10002 : (cfg.xrayPort || 10001)) + "?" + vlessParams + "#" +
+        return "vless://" + routedUuid(x.uuid, includeResi ? 1 : 0) + "@" + cfg.domain +
+            ":443?" + vlessParams + "#" +
             encodeURIComponent(x.username + "-" + (includeResi ? "Reality住宅" : "Reality直连"));
     }
     if (x.protocol === "vless-ws-tls") {
@@ -617,25 +628,13 @@ function changePwd() {
     });
 }
 
-// Masquerade settings
+// Masquerade (2026-10-30): REALITY 改为 self-steal 后，回落目标固定为本机 Caddy
+// （127.0.0.1:9443）、SNI 恒为面板域名，面板只做只读展示；服务端 POST /api/masquerade
+// 已显式拒绝，别再在这里发写请求。
 function openMasq() {
     api("/masquerade").then(r => {
-        $("#masqurl").value = r.masqueradeUrl || "https://www.bing.com/";
+        $("#masqurl").value = r.masqueradeUrl || ("https://" + cfg.domain + "/");
         openM("m-masq");
-    });
-}
-
-function saveMasq() {
-    const url = $("#masqurl").value;
-    if (!url) return toast("请输入URL", 1);
-    api("/masquerade", { method: "POST", body: JSON.stringify({ url }) }).then(r => {
-        if (r.success) {
-            closeM();
-            toast("伪装网站已更新: " + r.domain);
-            setTimeout(() => location.reload(), 2000);
-        } else {
-            toast(r.error || "操作失败", 1);
-        }
     });
 }
 
@@ -705,11 +704,10 @@ function savePortHopping() {
 function toggleSniSelect() {
     const proto = $("#nproto").value;
     const sniGroup = $("#sni-group");
-    if (proto === "vless-reality" || proto === "vless-ws-tls") {
-        sniGroup.style.display = "block";
-    } else {
-        sniGroup.style.display = "none";
-    }
+    // 2026-10-30（REALITY 443 + self-steal）：vless-reality 的 SNI 恒为面板域名
+    // （服务端 `serverNames = [domain]`，per-user sni 被忽略），只有 v3 遗留的
+    // vless-ws-tls 还需要选 SNI。
+    sniGroup.style.display = proto === "vless-ws-tls" ? "block" : "none";
     // v3.5.6: 住宅 checkbox 语义随 protocol 变
     const wrap = $("#nresi-wrap");
     const title = $("#nresi-title");
@@ -726,7 +724,7 @@ function toggleSniSelect() {
     } else if (proto === "vless-reality") {
         wrap.style.display = "flex";
         title.textContent = "使用住宅版 (Reality)";
-        hint.textContent = "勾选 → 节点指 :10002 vless-residential 经住宅 IP；不勾 → :10001 直连";
+        hint.textContent = "勾选 → 住宅出口（443，UUID route 1）；不勾 → 直连（443，route 0）";
     } else {
         wrap.style.display = "none";  // ws-tls 无住宅版
     }

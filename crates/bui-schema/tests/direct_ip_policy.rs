@@ -204,7 +204,7 @@ fn dual_stack_state_renders_the_same_ipv4_xray_config() {
             .unwrap()
             .iter()
             .any(|inbound| {
-                inbound["tag"] == "vless-residential"
+                inbound["tag"] == bui_schema::render::xray::INBOUND_TAG
                     && !inbound["settings"]["clients"]
                         .as_array()
                         .unwrap()

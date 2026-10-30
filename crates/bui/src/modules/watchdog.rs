@@ -117,6 +117,8 @@ pub struct NftRound {
     /// 回显里数出来的 IPv6 出站封禁规则条数（表或链不在 ⇒ 0）。与 `seen_rules` 分开报，
     /// 才能区分「跳跃段没了」与「只是封禁链缺了」。
     pub seen_egress: usize,
+    /// 回显里数出来的 Caddy `:9443` input 封堵规则条数（表或链不在 ⇒ 0）。
+    pub seen_input: usize,
 }
 
 /// `nft list table` 的回显（或渲染器的规则集）里每条 redirect 的 `(链, dport, 目标端口, 目标必须属于本机)`。
@@ -216,6 +218,7 @@ pub fn check_nft(host: &dyn Host, s: &State) -> NftRound {
             error: None,
             seen_rules: 0,
             seen_egress: 0,
+            seen_input: 0,
         };
     }
     let want = nft::ruleset(&s.node.ports, s.system.hy2_resi_compat_ports);
@@ -233,6 +236,7 @@ pub fn check_nft(host: &dyn Host, s: &State) -> NftRound {
                 error: Some(first_line(&o)),
                 seen_rules: 0,
                 seen_egress: 0,
+                seen_input: 0,
             }
         }
         Err(e) => {
@@ -242,6 +246,7 @@ pub fn check_nft(host: &dyn Host, s: &State) -> NftRound {
                 error: Some(e.to_string()),
                 seen_rules: 0,
                 seen_egress: 0,
+                seen_input: 0,
             }
         }
     };
@@ -258,14 +263,26 @@ pub fn check_nft(host: &dyn Host, s: &State) -> NftRound {
         .map(nft::egress_signature)
         .unwrap_or_default();
     let seen_egress = got_egress.len();
-    // `want` 恒有 2 或 4 条 redirect + 6 条封禁规则，所以「表不在」（两者都为空）永远落不进这一支
-    if got == redirect_rules(&want) && got_egress == nft::egress_signature(&want) {
+    // Caddy `:9443` 的 input 封堵链同样单独比：缺链时 redirect 与 egress 可能全对，
+    // 只比那两项会让 9443 从「只服务本机」悄悄变成公网可达（2026-10-30 裁决）。
+    let got_input = listed
+        .as_deref()
+        .map(nft::input_signature)
+        .unwrap_or_default();
+    let seen_input = got_input.len();
+    // `want` 恒有 2 或 4 条 redirect + 6 条封禁 + 2 条 input 规则，所以「表不在」
+    // （三者都为空）永远落不进这一支
+    if got == redirect_rules(&want)
+        && got_egress == nft::egress_signature(&want)
+        && got_input == nft::input_signature(&want)
+    {
         return NftRound {
             verdict: NftVerdict::Ok,
             compat_live,
             error: None,
             seen_rules,
             seen_egress,
+            seen_input,
         };
     }
     let (verdict, error) = match host.run_stdin("nft", &["-f", "-"], &want) {
@@ -279,6 +296,7 @@ pub fn check_nft(host: &dyn Host, s: &State) -> NftRound {
         error,
         seen_rules,
         seen_egress,
+        seen_input,
     }
 }
 
@@ -378,11 +396,13 @@ pub fn nft_event(
             NFT_REPLAY_ACTION,
             Level::Warn,
             format!(
-                "table {table} 不在或规则不符（期望 {want_rules} 条 redirect / {} 条 IPv6 出站封禁，\
-                 实到 {} / {}），已整表重放（{hop_a}-{hop_b} → :{}）",
+                "table {table} 不在或规则不符（期望 {want_rules} 条 redirect / {} 条 IPv6 出站封禁 / \
+                 {} 条 9443 input 封堵，实到 {} / {} / {}），已整表重放（{hop_a}-{hop_b} → :{}）",
                 bui_schema::render::nft::EGRESS_RULES,
+                bui_schema::render::nft::INPUT_RULES,
                 round.seen_rules,
                 round.seen_egress,
+                round.seen_input,
                 p.hy2_resi
             ),
         ),
@@ -392,10 +412,11 @@ pub fn nft_event(
             Level::Error,
             format!(
                 "table {table} 重放失败：{} —— 住宅 HY2 跳跃段不通（{hop_a}-{hop_b} 没人接，\
-                 盘上实到 {} 条 redirect、{} 条 IPv6 出站封禁）",
+                 盘上实到 {} 条 redirect、{} 条 IPv6 出站封禁、{} 条 9443 input 封堵）",
                 round.error.as_deref().unwrap_or("（没有输出）"),
                 round.seen_rules,
-                round.seen_egress
+                round.seen_egress,
+                round.seen_input
             ),
         ),
         NftVerdict::Unreadable => (
@@ -682,7 +703,9 @@ pub fn targets(state: &State) -> Vec<Target> {
     v.push(Target {
         unit: "xray".into(),
         proto: Proto::Tcp,
-        port: state.node.ports.reality_direct,
+        // self-steal（2026-10-30）：public ⇒ 443；l4 ⇒ 127.0.0.1:10443（前置 L4 转进来）。
+        // 判据是**实际监听端口**：l4 机器上 443 由 haproxy 占着，查 443 会让 xray 死了也显示健康。
+        port: state.node.reality_listen_port(),
     });
     v.push(Target {
         unit: "b-ui-relay".into(),
@@ -780,6 +803,7 @@ pub async fn check_once(ctx: &DaemonCtx) -> anyhow::Result<Vec<(String, Decision
                 error: Some(error.to_string()),
                 seen_rules: 0,
                 seen_egress: 0,
+                seen_input: 0,
             },
             false,
         ),
@@ -1027,7 +1051,7 @@ mod tests {
                 Target {
                     unit: "xray".into(),
                     proto: Proto::Tcp,
-                    port: 10001
+                    port: 443,
                 },
                 Target {
                     unit: "b-ui-relay".into(),
@@ -1240,7 +1264,7 @@ mod tests {
             i.listening
                 .insert(Proto::Udp, [40000].into_iter().collect()); // 10000 失活
             i.listening
-                .insert(Proto::Tcp, [10001, 2080].into_iter().collect());
+                .insert(Proto::Tcp, [443, 2080].into_iter().collect());
         });
         let (c, _d) = ctx(host.clone()).await;
         let first = check_once(&c).await.unwrap();
@@ -1288,7 +1312,7 @@ mod tests {
             i.listening
                 .insert(Proto::Udp, [10000].into_iter().collect());
             i.listening
-                .insert(Proto::Tcp, [10001, 2080].into_iter().collect());
+                .insert(Proto::Tcp, [443, 2080].into_iter().collect());
         });
         let (c, _d) = ctx(host.clone()).await;
         c.store
@@ -1355,8 +1379,7 @@ mod tests {
             }
             i.listening
                 .insert(Proto::Udp, [10000, 40000].into_iter().collect());
-            i.listening
-                .insert(Proto::Tcp, [10001].into_iter().collect());
+            i.listening.insert(Proto::Tcp, [443].into_iter().collect());
             i.advance_on_systemd = restart_secs;
         });
         host
@@ -1584,7 +1607,7 @@ mod tests {
             i.listening
                 .insert(Proto::Udp, [40000].into_iter().collect()); // 10000 失活
             i.listening
-                .insert(Proto::Tcp, [10001, 2080].into_iter().collect());
+                .insert(Proto::Tcp, [443, 2080].into_iter().collect());
         });
         let (c, _d) = ctx(host.clone()).await;
         let mut rx = c.bus.subscribe();
@@ -1664,7 +1687,7 @@ mod tests {
             i.listening
                 .insert(Proto::Udp, [40000].into_iter().collect());
             i.listening
-                .insert(Proto::Tcp, [10001, 2080].into_iter().collect());
+                .insert(Proto::Tcp, [443, 2080].into_iter().collect());
         });
         host
     }
@@ -1876,7 +1899,7 @@ mod tests {
             vec![
                 ("hysteria-server".to_string(), 10000),
                 ("hysteria-residential".to_string(), 40000),
-                ("xray".to_string(), 10001),
+                ("xray".to_string(), 443),
                 ("b-ui-relay".to_string(), 2080),
             ]
         );
@@ -1974,6 +1997,11 @@ table inet bui {
 \t\ticmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem } counter packets 0 bytes 0 accept
 \t\tmeta nfproto ipv6 meta l4proto tcp counter packets 2 bytes 120 reject with tcp reset
 \t\tmeta nfproto ipv6 counter packets 3 bytes 180 reject with icmpx admin-prohibited
+\t}
+\tchain input {
+\t\ttype filter hook input priority filter; policy accept;
+\t\tiifname != \"lo\" tcp dport 9443 counter packets 5 bytes 300 drop
+\t\tiifname != \"lo\" udp dport 9443 counter packets 0 bytes 0 drop
 \t}
 }
 ";
@@ -2118,6 +2146,7 @@ table inet bui {
             error: None,
             seen_rules: 0,
             seen_egress: 0,
+            seen_input: 0,
         };
         let none = std::collections::BTreeMap::new();
         let (bucket, rec, inc) = nft_event(&round, &s, &none, t0()).unwrap();
@@ -2146,13 +2175,15 @@ table inet bui {
             error: None,
             seen_rules: 2,
             seen_egress: 0,
+            seen_input: 0,
         };
         let (_, _, inc) = nft_event(&replayed, &s, &none, t0()).unwrap();
         assert_eq!(inc.signature, NFT_TABLE_MISSING_SIG);
         assert_eq!(inc.level, crate::modules::sentinel::incidents::Level::Warn);
         assert!(
-            inc.result
-                .contains("期望 4 条 redirect / 6 条 IPv6 出站封禁，实到 2 / 0"),
+            inc.result.contains(
+                "期望 4 条 redirect / 6 条 IPv6 出站封禁 / 2 条 9443 input 封堵，实到 2 / 0 / 0"
+            ),
             "条数进正文：判成不符却恰好是期望条数时，故障是回显解析对不上而不是表被删了：{}",
             inc.result
         );
@@ -2162,6 +2193,7 @@ table inet bui {
             error: Some("Error: Chain of type \"nat\" is not supported".into()),
             seen_rules: 0,
             seen_egress: 0,
+            seen_input: 0,
         };
         let (_, _, inc) = nft_event(&failed, &s, &none, t0()).unwrap();
         assert_eq!(inc.level, crate::modules::sentinel::incidents::Level::Error);
@@ -2174,6 +2206,7 @@ table inet bui {
                 error: None,
                 seen_rules: 4,
                 seen_egress: bui_schema::render::nft::EGRESS_RULES,
+                seen_input: 0,
             },
             &s,
             &none,
@@ -2194,6 +2227,7 @@ table inet bui {
             error: None,
             seen_rules: 0,
             seen_egress: 0,
+            seen_input: 0,
         };
         let (bucket, rec, inc) = nft_event(&replayed, &s, &Default::default(), t0()).unwrap();
         assert_eq!(bucket, "replayed");
@@ -2208,6 +2242,7 @@ table inet bui {
             error: Some("Error: Chain of type \"nat\" is not supported".into()),
             seen_rules: 0,
             seen_egress: 0,
+            seen_input: 0,
         };
         let (bucket2, rec2, inc2) =
             nft_event(&failed, &s, &heals, t0() + time::Duration::minutes(1)).unwrap();
@@ -2328,8 +2363,9 @@ table inet bui {
         // 事件正文报的是「期望 2 条」，不是恒 4 条
         let (_, _, inc) = nft_event(&r, &s, &Default::default(), t0()).unwrap();
         assert!(
-            inc.result
-                .contains("期望 2 条 redirect / 6 条 IPv6 出站封禁，实到 4 / 6"),
+            inc.result.contains(
+                "期望 2 条 redirect / 6 条 IPv6 出站封禁 / 2 条 9443 input 封堵，实到 4 / 6 / 2"
+            ),
             "{}",
             inc.result
         );
@@ -2465,9 +2501,9 @@ table inet bui {
         assert_eq!(incs.len(), 1);
         assert_eq!(incs[0].signature, NFT_TABLE_MISSING_SIG);
         assert!(
-            incs[0]
-                .result
-                .contains("期望 4 条 redirect / 6 条 IPv6 出站封禁，实到 2 / 0"),
+            incs[0].result.contains(
+                "期望 4 条 redirect / 6 条 IPv6 出站封禁 / 2 条 9443 input 封堵，实到 2 / 0 / 0"
+            ),
             "盘上到底有几条要如实报（夹具那张表只剩 prerouting 的两条）：{}",
             incs[0].result
         );
@@ -2578,7 +2614,7 @@ hysteria[1]: outbound error {\"error\": \"dial tcp 198.51.100.7:10007: connect: 
             i.listening
                 .insert(Proto::Udp, [10000, 40000].into_iter().collect());
             i.listening
-                .insert(Proto::Tcp, [10001, 2080].into_iter().collect());
+                .insert(Proto::Tcp, [443, 2080].into_iter().collect());
         });
         let (c, _d) = ctx(host.clone()).await;
         check_once(&c).await.unwrap();

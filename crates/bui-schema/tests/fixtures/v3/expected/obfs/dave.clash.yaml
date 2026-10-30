@@ -51,12 +51,12 @@ proxies:
   - name: "dave-Reality直连"
     type: vless
     server: example.com
-    port: 10001
-    uuid: 44444444-4444-4444-8444-444444444444
+    port: 443
+    uuid: 44444444-4444-0000-8444-444444444444
     flow: xtls-rprx-vision
     tls: true
     udp: true
-    servername: www.bing.com
+    servername: example.com
     client-fingerprint: chrome
     reality-opts:
       public-key: xpkTHqtLnYuBcHoV5_MgPY0MEjbMCHjkyKruMhDfbjY

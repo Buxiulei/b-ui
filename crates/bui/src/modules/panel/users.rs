@@ -917,8 +917,8 @@ mod tests {
         assert_eq!(v["password"], "pw-alice-01");
         assert_eq!(v["uuid"], "11111111-1111-4111-8111-111111111111");
         assert_eq!(
-            v["sni"], "www.bing.com",
-            "全局 REALITY 伪装域，不是建户时的旧拷贝"
+            v["sni"], "example.com",
+            "全局 REALITY 伪装域（self-steal 后 = 面板域名），不是建户时的旧拷贝"
         );
         assert_eq!(v["residential"], true);
         assert_eq!(v["disabled"], false);
@@ -1749,13 +1749,7 @@ mod tests {
         assert_eq!(out.added, vec![id]);
         assert!(out.removed.is_empty());
         assert!(out.errors.is_empty(), "{:?}", out.errors);
-        assert_eq!(
-            h.xray.calls(),
-            vec![
-                format!("add:vless-direct:{id}:{vid}"),
-                format!("add:vless-residential:{id}:{vid}")
-            ]
-        );
+        assert_eq!(h.xray.calls(), vec![format!("add:vless:{id}:{vid}"),]);
         let snap = crate::modules::panel::snapshot::read(&h.shared.snapshot_path());
         assert_eq!(snap.users["alice"].blocked, false);
     }
@@ -1783,13 +1777,7 @@ mod tests {
         assert_eq!(out.removed, vec![id]);
         assert_eq!(out.newly_blocked, vec![id], "供采样任务去 kick");
         assert!(out.snapshot_written);
-        assert_eq!(
-            h.xray.calls(),
-            vec![
-                format!("remove:vless-direct:{id}"),
-                format!("remove:vless-residential:{id}")
-            ]
-        );
+        assert_eq!(h.xray.calls(), vec![format!("remove:vless:{id}"),]);
         assert!(
             crate::modules::panel::snapshot::read(&h.shared.snapshot_path()).users["alice"].blocked
         );
@@ -1811,13 +1799,7 @@ mod tests {
         assert_eq!(out.removed, vec![id], "没 AddUser 过也要删（spec §4.2）");
         assert!(out.added.is_empty());
         assert!(out.errors.is_empty(), "{:?}", out.errors);
-        assert_eq!(
-            h.xray.calls(),
-            vec![
-                format!("remove:vless-direct:{id}"),
-                format!("remove:vless-residential:{id}")
-            ]
-        );
+        assert_eq!(h.xray.calls(), vec![format!("remove:vless:{id}"),]);
         // `applied.xray_removed` 去重：第二轮零 gRPC
         h.xray.clear_calls();
         let again = sync_users(&ctx, &h.shared, &BTreeSet::from([id])).await;
@@ -1854,13 +1836,13 @@ mod tests {
             i.which.insert("xray".into());
         });
         h.xray.with(|i| {
-            i.fail_on.insert(format!("remove:vless-direct:{id}"));
+            i.fail_on.insert(format!("remove:vless:{id}"));
         });
         let out = sync_users(&ctx, &h.shared, &BTreeSet::from([id])).await;
         assert_eq!(out.removed, vec![id], "退路成功就算删掉了");
         assert!(
             h.host.ops().contains(&format!(
-                "run:xray api rmu --server=127.0.0.1:10085 -tag=vless-direct {id}"
+                "run:xray api rmu --server=127.0.0.1:10085 -tag=vless {id}"
             )),
             "没走 CLI 退路：{:?}",
             h.host.ops()
@@ -1908,9 +1890,9 @@ mod tests {
         let vid = h.store.read().await.users[0].credentials.vless_uuid;
         // 读不到内核状态（xray 掉线 / 老内核没这个 RPC）⇒ 退回错误串那一路；
         // 而 xray 侧其实已有同 email（`applied` 只活在进程内）
-        let key = format!("add:vless-direct:{id}:{vid}");
+        let key = format!("add:vless:{id}:{vid}");
         h.xray.with(|i| {
-            i.fail_on.insert(format!("get:vless-direct:{id}"));
+            i.fail_on.insert(format!("get:vless:{id}"));
             i.fail_once.insert(key.clone());
             i.error_text
                 .insert(key, format!("User {id} already exists."));
@@ -1925,10 +1907,9 @@ mod tests {
         assert_eq!(
             h.xray.calls(),
             vec![
-                format!("add:vless-direct:{id}:{vid}"),
-                format!("remove:vless-direct:{id}"),
-                format!("add:vless-direct:{id}:{vid}"),
-                format!("add:vless-residential:{id}:{vid}"),
+                format!("add:vless:{id}:{vid}"),
+                format!("remove:vless:{id}"),
+                format!("add:vless:{id}:{vid}"),
             ],
             "只有报「已存在」的那个 inbound 需要摘掉再加"
         );
@@ -1968,12 +1949,10 @@ mod tests {
         assert_eq!(
             h.xray.calls(),
             vec![
-                format!("remove:vless-direct:{id}"),
-                format!("add:vless-direct:{id}:{new}"),
-                format!("remove:vless-residential:{id}"),
-                format!("add:vless-residential:{id}:{new}"),
+                format!("remove:vless:{id}"),
+                format!("add:vless:{id}:{new}"),
             ],
-            "两个 inbound 都要把旧 uuid 摘掉再挂新的"
+            "单个 REALITY inbound：先把旧 uuid 摘掉再挂新的"
         );
         // 新进程的记账指向新 uuid ⇒ 下一轮零请求（不会每 60 秒 remove+add 抖一次）
         h.xray.clear_calls();
@@ -1998,7 +1977,7 @@ mod tests {
             i.which.insert("xray".into());
         });
         h.xray.with(|i| {
-            i.fail_on.insert(format!("remove:vless-direct:{id}"));
+            i.fail_on.insert(format!("remove:vless:{id}"));
         });
         h.xray.clear_calls();
 
@@ -2011,15 +1990,13 @@ mod tests {
         assert_eq!(out.added, vec![id]);
         assert!(
             h.host.ops().contains(&format!(
-                "run:xray api rmu --server=127.0.0.1:10085 -tag=vless-direct {id}"
+                "run:xray api rmu --server=127.0.0.1:10085 -tag=vless {id}"
             )),
             "没走 CLI 退路：{:?}",
             h.host.ops()
         );
         assert!(
-            h.xray
-                .calls()
-                .contains(&format!("add:vless-direct:{id}:{new}")),
+            h.xray.calls().contains(&format!("add:vless:{id}:{new}")),
             "位置腾出来了就要把新 uuid 挂上去：{:?}",
             h.xray.calls()
         );
@@ -2052,12 +2029,10 @@ mod tests {
         assert_eq!(
             h.xray.calls(),
             vec![
-                format!("remove:vless-direct:{id}"),
-                format!("add:vless-direct:{id}:{new}"),
-                format!("remove:vless-residential:{id}"),
-                format!("add:vless-residential:{id}:{new}"),
+                format!("remove:vless:{id}"),
+                format!("add:vless:{id}:{new}"),
             ],
-            "每个 inbound 都要先 remove 再 add"
+            "先 remove 再 add（同一个 inbound）"
         );
 
         // 记账已经指向新 uuid ⇒ 再同步一轮零请求
@@ -2069,7 +2044,7 @@ mod tests {
     /// 位置腾过了、AddUser 还是报「已存在」（摘掉再加也没成）= 目标根本没达成：
     /// 必须记成失败交给 60 秒安全网重试，**绝不**记账。
     ///
-    /// 审查意见②的另一半：这一刻这个用户已经被摘出 `vless-direct`、还没加回去，
+    /// 审查意见②的另一半：这一刻这个用户已经被摘出 `vless`、还没加回去，
     /// 60 秒内他在这个 inbound 上握不了新手 —— 错误串要把这件事说出来，
     /// 否则运维只看到「加不上」，不知道人已经掉了。
     #[tokio::test]
@@ -2081,7 +2056,7 @@ mod tests {
         h.store.update(|s| rotate(&mut s.users[0])).await.unwrap();
         let new = h.store.read().await.users[0].credentials.vless_uuid;
 
-        let add_key = format!("add:vless-direct:{id}:{new}");
+        let add_key = format!("add:vless:{id}:{new}");
         h.xray.with(|i| {
             i.fail_on.insert(add_key.clone());
             i.error_text
@@ -2091,7 +2066,7 @@ mod tests {
         assert!(
             out.errors
                 .iter()
-                .any(|e| e.contains("AddUser vless-direct") && e.contains("已被摘出 vless-direct")),
+                .any(|e| e.contains("AddUser vless") && e.contains("已被摘出 vless")),
             "错误串要点明用户已被摘出内核、等下一轮补回：{:?}",
             out.errors
         );
@@ -2109,7 +2084,7 @@ mod tests {
         h.store.update(|s| rotate(&mut s.users[0])).await.unwrap();
         let new = h.store.read().await.users[0].credentials.vless_uuid;
         h.xray.with(|i| {
-            i.fail_on.insert(format!("remove:vless-direct:{id}"));
+            i.fail_on.insert(format!("remove:vless:{id}"));
         });
         h.xray.clear_calls();
 
@@ -2117,23 +2092,14 @@ mod tests {
         assert!(
             out.errors
                 .iter()
-                .any(|e| e.contains("换 uuid 前 RemoveUser vless-direct")),
+                .any(|e| e.contains("换 uuid 前 RemoveUser vless")),
             "{:?}",
             out.errors
         );
         assert!(out.added.is_empty(), "没换成就不许记账");
         assert!(
-            !h.xray
-                .calls()
-                .contains(&format!("add:vless-direct:{id}:{new}")),
-            "{:?}",
-            h.xray.calls()
-        );
-        assert!(
-            h.xray
-                .calls()
-                .contains(&format!("add:vless-residential:{id}:{new}")),
-            "另一个 inbound 照旧推进：{:?}",
+            !h.xray.calls().contains(&format!("add:vless:{id}:{new}")),
+            "位置没腾出来就不许 add（只会再撞一次「已存在」）：{:?}",
             h.xray.calls()
         );
     }
@@ -2165,7 +2131,7 @@ mod tests {
         // （真应答），于是走「摘掉再加」，而重加那次同样失败（inbound 正在重载）——
         // 旧实现就是在这里把一个本来好着的用户摘出内核的。先读后写根本不发这次 AddUser，
         // 所以这个陷阱必须一次都踩不到。
-        let add_key = format!("add:vless-direct:{id}:{vid}");
+        let add_key = format!("add:vless:{id}:{vid}");
         h.xray.with(|i| {
             i.fail_on.insert(add_key.clone());
             i.error_text
@@ -2182,17 +2148,14 @@ mod tests {
         );
         assert_eq!(
             h.xray.gets(),
-            vec![
-                format!("get:vless-direct:{id}"),
-                format!("get:vless-residential:{id}"),
-            ],
+            vec![format!("get:vless:{id}"),],
             "只读，每个 inbound 各一次"
         );
         // 最要紧的一条断言：这个健康用户此刻还挂在内核上。旧实现走到这里时他已经被
         // RemoveUser 摘出去、重加又失败，要等 60 秒安全网才补回来。
         let mut mounted = None;
         h.xray
-            .with(|i| mounted = i.users.get(&("vless-direct".to_string(), id)).copied());
+            .with(|i| mounted = i.users.get(&("vless".to_string(), id)).copied());
         assert_eq!(mounted, Some(vid), "uuid 没变的健康用户绝不许被摘出内核");
     }
 
@@ -2242,11 +2205,11 @@ mod tests {
         let vid = h.store.read().await.users[0].credentials.vless_uuid;
         // 默认错误串（不含 already / not found）：真失败
         h.xray.with(|i| {
-            i.fail_on.insert(format!("add:vless-direct:{id}:{vid}"));
+            i.fail_on.insert(format!("add:vless:{id}:{vid}"));
         });
         let out = sync_users(&ctx, &h.shared, &BTreeSet::new()).await;
         assert!(
-            out.errors.iter().any(|e| e.contains("vless-direct")),
+            out.errors.iter().any(|e| e.contains("vless")),
             "真失败要记 error：{:?}",
             out.errors
         );
@@ -2277,7 +2240,7 @@ mod tests {
         });
         let out = sync_users(&ctx, &h.shared, &BTreeSet::new()).await;
         assert_eq!(out.added.len(), 1, "重启后必须重放一遍");
-        assert_eq!(h.xray.gets().len(), 2, "两个 inbound 各读一次");
+        assert_eq!(h.xray.gets().len(), 1, "唯一的 REALITY inbound 读一次");
         assert!(
             h.xray.calls().is_empty(),
             "配置里的 uuid 已经是对的 ⇒ 不许摘挂一遍：{:?}",
@@ -2286,8 +2249,7 @@ mod tests {
 
         // 配置落后（`xray-config.json` 还是轮换前那份）⇒ 重放时把旧 uuid 换掉
         h.xray.with(|i| {
-            i.users
-                .insert(("vless-direct".into(), id), Uuid::from_u128(1));
+            i.users.insert(("vless".into(), id), Uuid::from_u128(1));
         });
         h.host.with(|i| {
             i.unit_props
@@ -2299,8 +2261,8 @@ mod tests {
         assert_eq!(
             h.xray.calls(),
             vec![
-                format!("remove:vless-direct:{id}"),
-                format!("add:vless-direct:{id}:{vid}"),
+                format!("remove:vless:{id}"),
+                format!("add:vless:{id}:{vid}"),
             ],
             "只有落后的那个 inbound 要动"
         );
@@ -2328,13 +2290,7 @@ mod tests {
             vec![id],
             "重启后 RemoveUser 也要重放，不只是 AddUser"
         );
-        assert_eq!(
-            h.xray.calls(),
-            vec![
-                format!("remove:vless-direct:{id}"),
-                format!("remove:vless-residential:{id}")
-            ]
-        );
+        assert_eq!(h.xray.calls(), vec![format!("remove:vless:{id}"),]);
     }
 
     #[tokio::test]

@@ -253,14 +253,14 @@ pub fn parse_ss(text: &str) -> Vec<(Proto, u16, String)> {
     out
 }
 
-/// 必须空着的关键端口：Caddy 的 80/443、HY2 直连与住宅、REALITY 两个入站。
-/// 端口跳跃区间不查（它是一整段，v3 机器上本来就在 nft 的 redirect 里）。
+/// 必须空着的关键端口：面板/Caddy 的 80、REALITY 的 443（self-steal 后客户端只连它）、
+/// HY2 直连与住宅。端口跳跃区间不查（它是一整段，v3 机器上本来就在 nft 的 redirect 里）。
+///
+/// 2026-10-30：10001/10002 不再是公网端口；443 与 REALITY 同号，去重后只查一次。
 pub fn key_ports(ports: &Ports) -> Vec<(Proto, u16)> {
     vec![
         (Proto::Tcp, 80),
-        (Proto::Tcp, 443),
-        (Proto::Tcp, ports.reality_direct),
-        (Proto::Tcp, ports.reality_resi),
+        (Proto::Tcp, bui_schema::model::REALITY_PORT),
         (Proto::Udp, ports.hy2),
         (Proto::Udp, ports.hy2_resi),
     ]
@@ -562,9 +562,13 @@ nonsense
     }
 
     #[test]
-    fn key_ports_cover_the_six_that_must_be_free() {
+    fn key_ports_cover_the_four_that_must_be_free() {
         let ps: Vec<u16> = key_ports(&ports()).iter().map(|(_, p)| *p).collect();
-        assert_eq!(ps, vec![80, 443, 10001, 10002, 10000, 40000]);
+        assert_eq!(
+            ps,
+            vec![80, 443, 10000, 40000],
+            "REALITY 只剩 443（与面板同号，去重）；10001/10002 已退役"
+        );
     }
 
     /// 装机前的闸门：nginx 占着 443 就必须中止（装下去 caddy 起不来、证书签不下来），
@@ -907,7 +911,7 @@ nonsense
             "IPv6 出站",
             "已封禁",
             "203.0.113.10",
-            "80/443/10001/10002/10000/40000 均空闲",
+            "80/443/10000/40000 均空闲",
         ] {
             assert!(t.contains(want), "表里缺「{want}」：\n{t}");
         }

@@ -97,9 +97,12 @@ fn tun_outbound_follows_node_transport() {
     assert_eq!(o["type"], "vless");
     assert_eq!(o["tag"], "proxy-out");
     assert_eq!(o["server"], "example.com");
-    assert_eq!(o["server_port"], 10001);
+    assert_eq!(o["server_port"], 443, "REALITY 客户端端口恒 443");
     assert_eq!(o["flow"], "xtls-rprx-vision");
-    assert_eq!(o["tls"]["server_name"], "www.bing.com");
+    assert_eq!(
+        o["tls"]["server_name"], "example.com",
+        "self-steal：SNI = 域名"
+    );
     assert_eq!(o["tls"]["utls"]["fingerprint"], "chrome");
     assert_eq!(o["tls"]["reality"]["short_id"], "0123456789abcdef");
     assert_eq!(o["domain_resolver"], "local-dns");

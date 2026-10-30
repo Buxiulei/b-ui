@@ -36,13 +36,16 @@ pub struct Answers {
     pub node_name: String,
     pub public_ip: String,
     pub ports: Ports,
+    /// **已废弃**（2026-10-30：REALITY 改为 self-steal，`dest` 固定为本机 Caddy、
+    /// `serverNames` 固定为域名）。保留字段只为旧 `--answers` JSON 还能反序列化；
+    /// [`build_state`] 一个字节都不读它，显式给了只会打一条「已废弃」告警。
     pub masquerade: String,
     /// 全新装机要建的第一个用户名（空串 = 不建；`--import-v3` 路径不看这一项，用户从 v3 来）
     pub first_user: String,
 }
 
 impl Answers {
-    /// 端口布局与 v3 一致（`server/core.sh`），伪装域用合成值 `www.bing.com:443`。
+    /// 端口布局与 v3 一致（`server/core.sh`），REALITY 端口恒 443（self-steal）。
     /// `admin_password` 是**空串**：密码只由 `--admin-password-stdin` 或随机生成填。
     pub fn defaults(hostname: &str, public_ip: &str) -> Answers {
         Answers {
@@ -56,11 +59,11 @@ impl Answers {
                 hy2_hop: Some((20000, 30000)),
                 hy2_resi: 40000,
                 hy2_resi_hop: (41000, 50000),
-                reality_direct: 10001,
-                reality_resi: 10002,
+                reality_direct: bui_schema::model::REALITY_PORT,
+                reality_resi: bui_schema::model::REALITY_PORT,
                 admin: 8080,
             },
-            masquerade: "www.bing.com:443".into(),
+            masquerade: String::new(),
         }
     }
 }
@@ -71,11 +74,12 @@ impl Answers {
 ///
 /// ```jsonc
 /// { "domain": "example.com", "node_name": "node-a", "public_ip": "203.0.113.10",
-///   "masquerade": "www.bing.com:443",
 ///   "ports": { "hy2": 10000, "hy2_hop": [20000, 30000], "hy2_resi": 40000,
-///              "hy2_resi_hop": [41000, 50000], "reality_direct": 10001,
-///              "reality_resi": 10002, "admin": 8080 } }
+///              "hy2_resi_hop": [41000, 50000], "reality_direct": 443,
+///              "reality_resi": 443, "admin": 8080 } }
 /// ```
+///
+/// `masquerade` 键已废弃（2026-10-30 self-steal）：还能读、但不生效，给了只打一条告警。
 ///
 /// `ports` 给了就必须**给全**（`bui_schema::model::Ports` 除 `hy2_hop` 外没有 serde 默认值）。
 /// **文件里没有管理员密码**：它会留在磁盘上、还会进 P5 脚本的 git 历史，所以密码只能经
@@ -230,12 +234,9 @@ pub fn build_state(
     reality: Reality,
     versions: Versions,
 ) -> anyhow::Result<State> {
-    let mut reality = reality;
-    // dest 与 serverNames 必须同源：用户在交互里改了伪装域名而 server_names 还写死 www.bing.com 时，
-    // xray 的 REALITY 握手直接失败。`Reality::sni()` 就是「dest 去掉端口」的语义。
-    reality.dest = answers.masquerade.clone();
-    reality.server_names = vec![reality.sni().to_string()];
-    Ok(State {
+    // 2026-10-30 裁决（REALITY 443 + self-steal）：`dest` 固定指向本机 Caddy，
+    // `serverNames` 恒为 `[domain]`。`answers.masquerade` 已废弃，一个字都不读。
+    let mut state = State {
         schema_version: SCHEMA_VERSION,
         node: NodeParams {
             id: uuid::Uuid::new_v4(),
@@ -243,7 +244,11 @@ pub fn build_state(
             domain: answers.domain.clone(),
             public_ip: answers.public_ip.clone(),
             ports: answers.ports.clone(),
-            reality,
+            reality: Reality {
+                dest: String::new(),
+                server_names: Vec::new(),
+                ..reality.clone()
+            },
             obfs: Obfs::default(),
             direct_ip_policy: Default::default(),
         },
@@ -256,7 +261,11 @@ pub fn build_state(
         system: SystemSettings::default(),
         versions,
         catalog: Vec::new(),
-    })
+    };
+    // 归一只有一处口径（`State::normalize`）：dest = 127.0.0.1:9443、serverNames = [domain]、
+    // REALITY 端口 = 443。这里先清空两项再调它，避免 generate_reality 的占位值蒙混过关。
+    state.normalize();
+    Ok(state)
 }
 
 /// hysteria 鉴权钩子读的快照（spec §3.2）。形状**逐字照总纲 C5**：
@@ -311,8 +320,8 @@ fn x25519_parse_hint(text: &str) -> String {
     format!("共 {} 行，首行前 40 字符：{head}", text.lines().count())
 }
 
-/// 生成 REALITY 密钥；`dest` 与 `server_names` 留空占位，由 [`build_state`] 按
-/// `answers.masquerade` 一起填。
+/// 生成 REALITY 密钥；`dest` 与 `server_names` 留空占位，由 [`build_state`] 调
+/// [`State::normalize`](bui_schema::model::State::normalize) 一起填成 self-steal 形态。
 fn generate_reality(host: &dyn Host, paths: &Paths) -> anyhow::Result<Reality> {
     let Some(prog) = xray_program(host, paths) else {
         anyhow::bail!(
@@ -340,6 +349,7 @@ fn generate_reality(host: &dyn Host, paths: &Paths) -> anyhow::Result<Reality> {
         short_ids: vec![random_short_id()],
         dest: String::new(),
         server_names: Vec::new(),
+        front: Default::default(),
     })
 }
 
@@ -758,8 +768,9 @@ fn asks_nothing(opts: &InstallOpts, env_domain: Option<&str>) -> bool {
 ///
 /// `prompt` = 问答的输入源（`None` = 没有终端可问 ⇒ 一个都不问，全用默认值）。主理人
 /// 2026-09-12「一行命令输入后，能询问关键信息，输入域名后，面板的密码（默认随机密码），
-/// 别的选项默认敲回车就可以快速配置完」：按 **域名 → 面板密码 → HY2 端口 → REALITY 伪装站
-/// → 第一个用户名 → 节点名 → 公网 IP** 的顺序问，除域名外每题回车即默认。
+/// 别的选项默认敲回车就可以快速配置完」：按 **域名 → 面板密码 → HY2 端口 → 第一个用户名
+/// → 节点名 → 公网 IP** 的顺序问，除域名外每题回车即默认。
+/// （「REALITY 伪装站」那一问随 2026-10-30 的 self-steal 改造删除。）
 ///
 /// **全程一个问题都不问**的三种情形（裁决 2026-09-12）：`--yes` / `--non-interactive`、
 /// `$BUI_DOMAIN` 非空（环境变量那条写法的语义就是「无人值守」，`install.sh` 的 `tty_source`
@@ -850,12 +861,17 @@ async fn collect_answers(
     // ③～⑦ 其余各问：每题回车即默认（`--import-v3` 沿用 v3 的值，一概不问）。
     // `--answers` 文件里显式给了的键跳过对应那一问（裁决「有则不问对应项」）：`given.ports`
     // 一真就连 HY2 端口也不问——文件里的 `ports` 必须给全，再问一遍只会让人以为能只改一个。
+    //
+    // 「REALITY 伪装站」那一问已删除（2026-10-30 self-steal）：`dest` 固定为本机 Caddy、
+    // SNI 恒为域名。旧 `--answers` 文件里的 `masquerade` 仍然收下并打一条告警，不报错。
+    if given.masquerade {
+        tracing::warn!(
+            "answers 文件里的 masquerade 已废弃：REALITY 使用 self-steal，伪装目标固定为本机 Caddy"
+        );
+    }
     if let (false, Some(p)) = (import, prompt) {
         if opts.port.is_none() && !given.ports {
             answers.ports.hy2 = ask_port(p, "Hysteria2 直连端口", answers.ports.hy2);
-        }
-        if !given.masquerade {
-            answers.masquerade = ask_or(p, "REALITY 伪装站", &answers.masquerade);
         }
         answers.first_user = ask_username(p, "第一个用户名", &answers.first_user);
         if !given.node_name {
@@ -1357,10 +1373,10 @@ mod tests {
         assert_eq!(a.ports.hy2_hop, Some((20000, 30000)));
         assert_eq!(a.ports.hy2_resi, 40000);
         assert_eq!(a.ports.hy2_resi_hop, (41000, 50000));
-        assert_eq!(a.ports.reality_direct, 10001);
-        assert_eq!(a.ports.reality_resi, 10002);
+        assert_eq!(a.ports.reality_direct, 443, "self-steal：客户端端口恒 443");
+        assert_eq!(a.ports.reality_resi, 443, "两个 REALITY 节点同端口");
         assert_eq!(a.ports.admin, 8080);
-        assert_eq!(a.masquerade, "www.bing.com:443");
+        assert_eq!(a.masquerade, "", "伪装站已废弃：默认空串");
         assert_eq!(a.node_name, "node-a");
         assert_eq!(
             a.first_user, "user1",
@@ -1379,9 +1395,10 @@ mod tests {
             private_key: "priv".into(),
             public_key: "pub".into(),
             short_ids: vec![random_short_id()],
-            // generate_reality 给的就是空占位，两项都由 build_state 按 answers.masquerade 填
+            // generate_reality 给的就是空占位，两项都由 build_state 调 normalize 填成 self-steal
             dest: String::new(),
             server_names: Vec::new(),
+            front: Default::default(),
         };
         let versions = bui_schema::model::Versions {
             bui: "4.0.0".into(),
@@ -1392,12 +1409,17 @@ mod tests {
         assert_eq!(s.node.domain, "example.com");
         assert_eq!(s.node.name, "node-a");
         assert_eq!(s.node.public_ip, "203.0.113.10");
-        assert_eq!(s.node.reality.dest, "www.bing.com:443");
+        assert_eq!(
+            s.node.reality.dest, "127.0.0.1:9443",
+            "self-steal：未认证连接回落到本机 Caddy"
+        );
         assert_eq!(
             s.node.reality.server_names,
-            vec!["www.bing.com".to_string()],
-            "serverNames 必须与 dest 同源，否则用户改了伪装域名 REALITY 握手就失败"
+            vec!["example.com".to_string()],
+            "serverNames = [domain]，与订阅里的 SNI 同源"
         );
+        assert_eq!(s.node.ports.reality_direct, 443);
+        assert_eq!(s.node.ports.reality_resi, 443);
         assert_eq!(s.node.reality.short_ids[0].len(), 16);
         assert!(s.admin.password_hash.starts_with("$argon2id$"));
         assert!(crate::api::auth::verify_password(
@@ -1533,8 +1555,9 @@ mod tests {
             i.listening.insert(
                 crate::sys::Proto::Tcp,
                 // 9092 / 10086 是住宅 sing-box 的两个回环面（Clash API + 官方内核
-                // 内置的 api 服务，自检的「住宅管理面端口」那一行查它们）
-                std::collections::BTreeSet::from([443, 10001, 10002, 8080, 9092, 10086]),
+                // 内置的 api 服务，自检的「住宅管理面端口」那一行查它们）；9443 是
+                // 本机 Caddy（REALITY 的 self-steal 回落目标，面板/订阅全靠它）。
+                std::collections::BTreeSet::from([443, 8080, 9092, 9443, 10086]),
             );
             i.listening.insert(
                 crate::sys::Proto::Udp,
@@ -1742,7 +1765,10 @@ mod tests {
         assert_eq!(a.node_name, "node-a");
         assert_eq!(a.domain, "example.com");
         assert_eq!(a.ports.hy2, 10000);
-        assert_eq!(a.masquerade, "www.bing.com:443");
+        assert_eq!(
+            a.masquerade, "127.0.0.1:9443",
+            "已装机：字段已废弃，回显 state 里的 self-steal dest"
+        );
         // IP 探测是 Host 上的一次 curl（Fetcher 不参与装机探测）：一条流水都不该有
         assert_eq!(host.ops(), Vec::<String>::new(), "{:?}", host.ops());
         // 全新装机（没有 state.json）那一支照旧探 IP、生成并打印密码
@@ -1769,7 +1795,7 @@ mod tests {
         std::fs::write(
             &f,
             r#"{"domain":"example.com","ports":{"hy2":10500,"hy2_hop":[20000,30000],"hy2_resi":40000,
-                "hy2_resi_hop":[41000,50000],"reality_direct":10001,"reality_resi":10002,"admin":8080}}"#,
+                "hy2_resi_hop":[41000,50000],"reality_direct":443,"reality_resi":443,"admin":8080}}"#,
         )
         .unwrap();
         let (a, given) = load_answers(&f, Answers::defaults("node-a", "203.0.113.10")).unwrap();
@@ -1777,7 +1803,7 @@ mod tests {
         assert_eq!(a.ports.hy2, 10500);
         assert_eq!(a.node_name, "node-a", "文件里没写的项沿用默认");
         assert_eq!(a.public_ip, "203.0.113.10");
-        assert_eq!(a.masquerade, "www.bing.com:443");
+        assert_eq!(a.masquerade, "", "伪装站已废弃：默认空串");
         assert_eq!(
             a.first_user, DEFAULT_FIRST_USER,
             "文件里没有这一项，沿用默认"
@@ -2587,7 +2613,7 @@ mod tests {
         assert_eq!(a.domain, "example.com");
         assert_eq!(a.node_name, "node-a", "节点名用 hostname");
         assert_eq!(a.public_ip, "203.0.113.10", "公网 IP 用探测值");
-        assert_eq!(a.masquerade, "www.bing.com:443", "伪装目标用默认值");
+        assert_eq!(a.masquerade, "", "伪装站已废弃，默认空串");
         assert_eq!(a.ports.hy2, 10000, "端口用默认值");
         assert_eq!(a.first_user, DEFAULT_FIRST_USER, "首用户用默认名");
     }
@@ -3016,9 +3042,10 @@ mod tests {
     }
 
     /// 主理人 2026-09-12「一行命令输入后，能询问关键信息……别的选项默认敲回车就可以快速配置完」：
-    /// 七问的顺序与默认值定死，除面板域名外每题回车即默认。
+    /// 六问的顺序与默认值定死，除面板域名外每题回车即默认。
+    /// （「REALITY 伪装站」那一问随 2026-10-30 的 self-steal 改造删除。）
     #[tokio::test]
-    async fn the_interview_asks_seven_things_in_order_and_takes_enter_for_defaults() {
+    async fn the_interview_asks_six_things_in_order_and_takes_enter_for_defaults() {
         let d = tempfile::tempdir().unwrap();
         let paths = scratch(&d);
         let host = host_for_install(&paths);
@@ -3040,16 +3067,14 @@ mod tests {
                 "面板域名（必填，例如",
                 "面板管理员密码",
                 "Hysteria2",
-                "REALITY",
                 "第一个用户名",
                 "节点名",
                 "公网",
             ],
-            "问答顺序：域名 → 面板密码 → HY2 端口 → 伪装站 → 首用户 → 节点名 → 公网 IP"
+            "问答顺序：域名 → 面板密码 → HY2 端口 → 首用户 → 节点名 → 公网 IP"
         );
         assert_eq!(a.domain, "panel.example.com");
         assert_eq!(a.ports.hy2, 10000, "回车用默认端口");
-        assert_eq!(a.masquerade, "www.bing.com:443", "回车用默认伪装站");
         assert_eq!(a.first_user, DEFAULT_FIRST_USER, "回车用默认首用户名");
         assert_eq!(a.first_user, "user1");
         assert_eq!(a.node_name, "node-a", "回车用主机名");
@@ -3067,10 +3092,6 @@ mod tests {
         assert!(line.contains(&a.admin_password), "{line}");
         // 有默认值的每一问都要把默认值写在提示里
         assert_eq!(p.shown_default("Hysteria2").as_deref(), Some("10000"));
-        assert_eq!(
-            p.shown_default("REALITY").as_deref(),
-            Some("www.bing.com:443")
-        );
         assert_eq!(p.shown_default("第一个用户名").as_deref(), Some("user1"));
         assert_eq!(p.shown_default("节点名").as_deref(), Some("node-a"));
         assert_eq!(p.shown_default("公网").as_deref(), Some("203.0.113.10"));
@@ -3093,7 +3114,6 @@ mod tests {
             "panel.example.com",
             "hunter2",
             "20443",
-            "www.apple.com:443",
             "张三",
             "hk-01",
             "198.51.100.7",
@@ -3105,7 +3125,7 @@ mod tests {
         assert_eq!(a.admin_password, "hunter2");
         assert_eq!(notice, None, "自己输的密码不该被当成随机密码打印");
         assert_eq!(a.ports.hy2, 20443);
-        assert_eq!(a.masquerade, "www.apple.com:443");
+        assert_eq!(a.masquerade, "", "伪装站已废弃：不再接受输入");
         assert_eq!(a.first_user, "张三");
         assert_eq!(a.node_name, "hk-01");
         assert_eq!(a.public_ip, "198.51.100.7");
@@ -3120,11 +3140,11 @@ mod tests {
         let paths = scratch(&d);
         let host = host_for_install(&paths);
         let mut o = opts(&d);
-        // 域名由 opts() 给成 example.com、端口由 --port 给定 ⇒ 提问只剩密码/伪装站/首用户/节点名/公网 IP
+        // 域名由 opts() 给成 example.com、端口由 --port 给定 ⇒ 提问只剩密码/首用户/节点名/公网 IP
         (o.yes, o.non_interactive) = (false, false);
         o.port = Some(30000);
-        // 密码、伪装站回车，首用户连填三个坏名字（空格 / 斜杠 / @ 都不合面板规则）
-        let mut p = ScriptedPrompt::new(&["", "", "张 三", "a/b", "bob@example.com"]);
+        // 密码回车，首用户连填三个坏名字（空格 / 斜杠 / @ 都不合面板规则）
+        let mut p = ScriptedPrompt::new(&["", "张 三", "a/b", "bob@example.com"]);
         let (a, _) = collect_answers(&o, None, host.clone(), Some(&mut p))
             .await
             .unwrap();
@@ -3146,7 +3166,7 @@ mod tests {
             );
         }
         // 坏名字之后填对了就收下，并继续往后问
-        let mut p = ScriptedPrompt::new(&["", "", "a b", "张三_a-b.c", "hk-01", "198.51.100.7"]);
+        let mut p = ScriptedPrompt::new(&["", "a b", "张三_a-b.c", "hk-01", "198.51.100.7"]);
         let (a, _) = collect_answers(&o, None, host.clone(), Some(&mut p))
             .await
             .unwrap();
@@ -3176,7 +3196,7 @@ mod tests {
             .await
             .unwrap();
         let joined = p.asked.join("|");
-        for pinned in ["节点名", "公网", "REALITY"] {
+        for pinned in ["节点名", "公网"] {
             assert!(
                 !joined.contains(pinned),
                 "文件里给了「{pinned}」，不该再问：{joined}"
@@ -3184,7 +3204,10 @@ mod tests {
         }
         assert_eq!(a.node_name, "hk-01");
         assert_eq!(a.public_ip, "198.51.100.7");
-        assert_eq!(a.masquerade, "www.apple.com:443");
+        assert_eq!(
+            a.masquerade, "www.apple.com:443",
+            "旧 answers 文件里的 masquerade 仍能读进来（字段保留兼容），只是 build_state 不读"
+        );
         // 文件里没给的项照问
         assert!(joined.contains("面板管理员密码"), "{joined}");
         assert!(joined.contains("Hysteria2"), "{joined}");
@@ -3197,7 +3220,7 @@ mod tests {
         std::fs::write(
             &f,
             r#"{"domain":"panel.example.com","ports":{"hy2":20443,"hy2_resi":40000,
-               "hy2_resi_hop":[41000,50000],"reality_direct":10001,"reality_resi":10002,
+               "hy2_resi_hop":[41000,50000],"reality_direct":443,"reality_resi":443,
                "admin":8080}}"#,
         )
         .unwrap();
@@ -3219,8 +3242,8 @@ mod tests {
             !joined.contains("面板域名"),
             "文件里给了 domain，不该再问域名：{joined}"
         );
-        // 文件里没给的项照问（节点名/公网 IP/伪装站这次都没给）
-        for asked in ["节点名", "公网", "REALITY", "第一个用户名"] {
+        // 文件里没给的项照问（节点名/公网 IP 这次都没给）
+        for asked in ["节点名", "公网", "第一个用户名"] {
             assert!(joined.contains(asked), "「{asked}」该问：{joined}");
         }
     }
@@ -3453,9 +3476,15 @@ mod tests {
             uris.contains(&u.credentials.hy2_password),
             "HY2 URI 里没带这个用户的密码：{uris}"
         );
+        let direct_uuid = bui_schema::nodes::routed_uuid_of(u.credentials.vless_uuid, 0);
+        let resi_uuid = bui_schema::nodes::routed_uuid_of(u.credentials.vless_uuid, 1);
         assert!(
-            uris.contains(&u.credentials.vless_uuid.to_string()),
-            "VLESS URI 里没带这个用户的 UUID：{uris}"
+            uris.contains(&format!("vless://{direct_uuid}@")),
+            "直连节点的 VLESS URI 里没带 route 0 UUID：{uris}"
+        );
+        assert!(
+            uris.contains(&format!("vless://{resi_uuid}@")),
+            "住宅节点的 VLESS URI 里没带 route 1 UUID：{uris}"
         );
         // /api/subscription：sing-box 配置，能序列化成 JSON 且四个节点各有一个出站
         // （sing-box 的出站 tag 是固定的四个，不带用户名——用户名只出现在 HY2 的 password 里）
@@ -3477,7 +3506,7 @@ mod tests {
         }
         assert!(
             sb_text.contains(&u.credentials.hy2_password)
-                && sb_text.contains(&u.credentials.vless_uuid.to_string()),
+                && sb_text.contains(&direct_uuid.to_string()),
             "sing-box 配置里没带这个用户的凭据：{sb_text}"
         );
         // /api/clash：mihomo YAML 非空且解析得开

@@ -57,10 +57,11 @@ pub fn apply(host: &dyn Host, paths: &Paths) -> Result<String> {
         String::new()
     };
     Ok(format!(
-        "已落地 table {}（{} 条规则；IPv6 出站封禁 {} 条在位）：{hop_a}-{hop_b}{compat} → :{}",
+        "已落地 table {}（{} 条规则；IPv6 出站封禁 {} 条、9443 input 封堵 {} 条在位）：{hop_a}-{hop_b}{compat} → :{}",
         nft::TABLE,
         nft::rule_count(s.system.hy2_resi_compat_ports),
         nft::EGRESS_RULES,
+        nft::INPUT_RULES,
         s.node.ports.hy2_resi
     ))
 }
@@ -115,6 +116,24 @@ pub fn status(host: &dyn Host, paths: &Paths) -> Result<String> {
             nft::EGRESS_CHAIN,
             nft::EGRESS_RULES,
             live_egress.len()
+        )
+    });
+    let live_input = nft::input_signature(&out.stdout);
+    lines.push(if live_input == nft::input_signature(&want) {
+        format!(
+            "input 封堵链 {} 在位（{} 条规则，Caddy 的 {} 只服务本机）",
+            nft::INPUT_CHAIN,
+            live_input.len(),
+            bui_schema::model::CADDY_LOCAL_PORT
+        )
+    } else {
+        format!(
+            "input 封堵链 {} 缺失或规则不符（期望 {} 条，实到 {}）：Caddy 的 {} 端口会暴露公网，\
+             执行 `bui nft apply` 重放",
+            nft::INPUT_CHAIN,
+            nft::INPUT_RULES,
+            live_input.len(),
+            bui_schema::model::CADDY_LOCAL_PORT
         )
     });
     lines.push(
@@ -239,7 +258,10 @@ mod tests {
         assert!(msg.contains("41000-50000"), "{msg}");
         assert!(msg.contains("40001-40007"), "{msg}");
         assert!(msg.contains("4 条规则"), "{msg}");
-        assert!(msg.contains("IPv6 出站封禁 6 条在位"), "{msg}");
+        assert!(
+            msg.contains("IPv6 出站封禁 6 条、9443 input 封堵 2 条在位"),
+            "{msg}"
+        );
     }
 
     /// 预检不过就**显式失败**，一次 `nft -f` 都不发；错误里要有内核下限与可操作的下一步。

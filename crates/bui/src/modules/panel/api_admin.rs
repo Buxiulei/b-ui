@@ -135,7 +135,8 @@ pub fn config_payload(s: &BuiState) -> serde_json::Value {
         "domain": s.node.domain,
         // v3 的 `port` 来自正则捕获，是**字符串**；前端直接拼进 URL，这里保持同型
         "port": s.node.ports.hy2.to_string(),
-        "xrayPort": s.node.ports.reality_direct,
+        // 2026-10-30：REALITY 客户端端口恒为 443（self-steal），与 `front` 无关。
+        "xrayPort": bui_schema::model::REALITY_PORT,
         "pubKey": s.node.reality.public_key,
         "shortId": s.node.reality.short_id(),
         "sni": s.node.reality.sni(),
@@ -152,15 +153,6 @@ pub fn config_payload(s: &BuiState) -> serde_json::Value {
 pub fn masquerade_payload(s: &BuiState) -> serde_json::Value {
     let d = s.node.reality.sni();
     json!({"masqueradeUrl": format!("https://{d}/"), "masqueradeDomain": d})
-}
-
-/// 移植 v3 的 `b.url.replace(/https?:\/\/([^/:]+).*/, "$1")`（`web/server.js:2588`）。
-pub fn host_of(url: &str) -> String {
-    let rest = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .unwrap_or(url);
-    rest.split(['/', ':']).next().unwrap_or("").to_string()
 }
 
 /// `runtime` → v3 `/api/hy2/watchdog/status` 的形状（兼容 shim，见契约表 #21）。
@@ -632,35 +624,17 @@ async fn get_masquerade(State(app): State<AppState>) -> Response {
     ok_json(masquerade_payload(&s))
 }
 
-async fn set_masquerade(State(app): State<AppState>, body: Bytes) -> Response {
-    let Some(v) = parse_json::<serde_json::Value>(&body) else {
-        return bad_json();
-    };
-    let Some(url) = v.get("url").and_then(|x| x.as_str()) else {
-        return fail(StatusCode::BAD_REQUEST, "URL required");
-    };
-    let domain = host_of(url);
-    if domain.is_empty() || !domain.contains('.') {
-        return fail(StatusCode::BAD_REQUEST, "URL required");
-    }
-    let d = domain.clone();
-    if let Err(e) = app
-        .store
-        .update(|s| {
-            s.node.reality.dest = format!("{d}:443");
-            s.node.reality.server_names = vec![d];
-        })
-        .await
-    {
-        return fail(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Save failed: {e}"),
-        );
-    }
-    // 对账会重写 xray-config.json（结构哈希变 ⇒ 重启 xray）与两份 hysteria 配置
-    // （`masquerade.proxy.url` 由 `reality.sni()` 推导 ⇒ 重启两个 hysteria）
-    app.bus.send(Event::StateChanged("masquerade"));
-    ok_json(json!({"success": true, "domain": domain}))
+/// 2026-10-30（REALITY 443 + self-steal）：REALITY 的 `dest` 固定指向本机 Caddy
+/// `127.0.0.1:9443`、`serverNames` 固定为 `[node.domain]`，由 `State::normalize` 维护。
+/// 面板再改「伪装站」会同时打破 self-steal 与订阅 SNI，所以这里显式拒绝，
+/// 不静默忽略（v3 的 `/api/masquerade` 写入口径到此退役）。
+async fn set_masquerade(State(_app): State<AppState>, body: Bytes) -> Response {
+    let _ = body;
+    fail(
+        StatusCode::BAD_REQUEST,
+        "自 4.2 起 REALITY 使用 self-steal：回落目标固定为本机 Caddy（127.0.0.1:9443），\
+         伪装站不可再修改。面板域名即 REALITY 的 SNI",
+    )
 }
 
 async fn get_bandwidth() -> Response {
@@ -797,15 +771,6 @@ mod tests {
             .unwrap();
     }
 
-    #[test]
-    fn host_of_strips_scheme_port_and_path() {
-        assert_eq!(host_of("https://www.bing.com/"), "www.bing.com");
-        assert_eq!(host_of("http://www.bing.com"), "www.bing.com");
-        assert_eq!(host_of("https://a.example.com:8443/x?y=1"), "a.example.com");
-        assert_eq!(host_of("www.bing.com"), "www.bing.com");
-        assert_eq!(host_of(""), "");
-    }
-
     #[tokio::test]
     async fn config_matches_the_v3_shape() {
         let h = harness().await;
@@ -814,10 +779,10 @@ mod tests {
         assert_eq!(s, axum::http::StatusCode::OK);
         assert_eq!(v["domain"], "example.com");
         assert_eq!(v["port"], "10000", "v3 的 port 是字符串");
-        assert_eq!(v["xrayPort"], 10001);
+        assert_eq!(v["xrayPort"], 443, "REALITY 客户端端口恒 443");
         assert_eq!(v["pubKey"], "cTpW46LZoWSn3XlHahzkRh3CMpu-pEQUOk7-seT7W1c");
         assert_eq!(v["shortId"], "0123456789abcdef");
-        assert_eq!(v["sni"], "www.bing.com");
+        assert_eq!(v["sni"], "example.com", "self-steal：SNI = 面板域名");
         assert_eq!(
             v["portHopping"],
             serde_json::json!({"enabled": true, "start": 20000, "end": 30000})
@@ -862,7 +827,7 @@ mod tests {
         assert_eq!(v["user"], "bob");
         assert_eq!(v["password"].as_str().unwrap().len(), 16);
         assert_eq!(
-            v["sni"], "www.bing.com",
+            v["sni"], "example.com",
             "回显真正生效的 SNI，不是请求里那个（决策 D13）"
         );
         assert!(v["uuid"].as_str().is_some());
@@ -1685,16 +1650,17 @@ mod tests {
         );
     }
 
+    /// 2026-10-30：REALITY 改为 self-steal，`dest`/`serverNames` 由 `State::normalize`
+    /// 固定住；面板写入口径退役，GET 只回显域名，POST 显式拒绝（不静默忽略）。
     #[tokio::test]
-    async fn masquerade_reads_and_writes_the_reality_dest() {
+    async fn masquerade_is_read_only_after_the_self_steal_change() {
         let h = harness().await;
         let (r, t) = app(&h).await;
         let (_, v) = send(&r, "GET", "/api/masquerade", Some(&t), None).await;
         assert_eq!(
             v,
-            serde_json::json!({"masqueradeUrl": "https://www.bing.com/", "masqueradeDomain": "www.bing.com"})
+            serde_json::json!({"masqueradeUrl": "https://example.com/", "masqueradeDomain": "example.com"})
         );
-        let mut rx = h.app.bus.subscribe();
         let (s, out) = send(
             &r,
             "POST",
@@ -1703,30 +1669,17 @@ mod tests {
             Some(serde_json::json!({"url": "https://www.apple.com/"})),
         )
         .await;
-        assert_eq!(s, axum::http::StatusCode::OK);
-        assert_eq!(
-            out,
-            serde_json::json!({"success": true, "domain": "www.apple.com"})
+        assert_eq!(s, axum::http::StatusCode::BAD_REQUEST);
+        assert!(
+            out["error"].as_str().unwrap_or("").contains("self-steal"),
+            "{out}"
         );
         let st = h.store.read().await;
-        assert_eq!(st.node.reality.dest, "www.apple.com:443");
+        assert_eq!(st.node.reality.dest, "127.0.0.1:9443");
         assert_eq!(
             st.node.reality.server_names,
-            vec!["www.apple.com".to_string()]
+            vec!["example.com".to_string()]
         );
-        assert_eq!(
-            rx.try_recv().unwrap(),
-            crate::api::Event::StateChanged("masquerade")
-        );
-        let (bad, _) = send(
-            &r,
-            "POST",
-            "/api/masquerade",
-            Some(&t),
-            Some(serde_json::json!({})),
-        )
-        .await;
-        assert_eq!(bad, axum::http::StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

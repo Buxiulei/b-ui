@@ -51,12 +51,12 @@ proxies:
   - name: "carol-Reality住宅"
     type: vless
     server: example.com
-    port: 10002
-    uuid: 33333333-3333-4333-8333-333333333333
+    port: 443
+    uuid: 33333333-3333-0001-8333-333333333333
     flow: xtls-rprx-vision
     tls: true
     udp: true
-    servername: www.bing.com
+    servername: example.com
     client-fingerprint: chrome
     reality-opts:
       public-key: xpkTHqtLnYuBcHoV5_MgPY0MEjbMCHjkyKruMhDfbjY

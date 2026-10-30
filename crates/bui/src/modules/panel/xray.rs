@@ -1,7 +1,9 @@
 //! Xray gRPC 客户端（spec §3.3、调研 X1–X11）。
 //!
 //! - 增删用户：`HandlerService.AlterInbound{tag, operation}`，`operation` 是**两层** `TypedMessage`
-//!   （外层 `AddUserOperation` 包 `User`，`User.account` 再包 `vless.Account`）；对两个 inbound 各调一次。
+//!   （外层 `AddUserOperation` 包 `User`，`User.account` 再包 `vless.Account`）；对每个
+//!   REALITY inbound 各调一次（2026-10-30 起只有一个 `vless`，`XRAY_INBOUND_TAGS` 仍按
+//!   「每个 tag」遍历，测试里的多 tag 夹具继续覆盖按 tag 分派的那半边逻辑）。
 //! - `email` 是 gRPC 侧唯一键，取 `user_id`（`bui_schema::render::xray::clients` 里也是它）。
 //! - 读回用户：`HandlerService.GetInboundUsers{tag, email}` 会把这个 email 挂的 `vless.Account`
 //!   一起回来，所以「内核里现在挂的是哪个 uuid」是**读得到**的（26.3.27 / 26.9.9 实测，
@@ -45,6 +47,7 @@ use pb::xray::app::router::{routing_rule::TargetTag, Config as RouterConfig, Rou
 use pb::xray::app::stats::command::{
     stats_service_client::StatsServiceClient, QueryStatsRequest, Stat,
 };
+use pb::xray::common::net::{PortList, PortRange};
 use pb::xray::common::protocol::User as PbUser;
 use pb::xray::common::serial::TypedMessage;
 use pb::xray::proxy::vless::Account;
@@ -135,6 +138,14 @@ pub fn add_rule_request(rule: &SlotRule) -> AddRuleRequest {
         rule_tag: rule.rule_tag.clone(),
         inbound_tag: vec![rule.inbound_tag.clone()],
         user_email: rule.emails.clone(),
+        // VLESS `vlessRoute`（UUID 第 6/7 字节）：proto 里是 `PortList`，单个 route 写成
+        // `{from: n, to: n}`。`None` = 不按 route 过滤（最终兜底 `direct`）。
+        vless_route_list: rule.vless_route.map(|route| PortList {
+            range: vec![PortRange {
+                from: u32::from(route),
+                to: u32::from(route),
+            }],
+        }),
         target_tag: Some(TargetTag::Tag(rule.outbound_tag.clone())),
         ..Default::default()
     };
@@ -339,8 +350,9 @@ mod tests {
     fn user_rule() -> SlotRule {
         SlotRule {
             rule_tag: "resi-u-8d5a1a1e-3b2c-4d1e-9f00-0000000000aa".into(),
-            inbound_tag: "vless-residential".into(),
+            inbound_tag: bui_schema::render::xray::INBOUND_TAG.into(),
             emails: vec!["8d5a1a1e-3b2c-4d1e-9f00-0000000000aa".into()],
+            vless_route: Some(bui_schema::nodes::RESIDENTIAL_ROUTE),
             outbound_tag: "relay-slot-1".into(),
         }
     }
@@ -348,9 +360,10 @@ mod tests {
     fn fallback_rule() -> SlotRule {
         SlotRule {
             rule_tag: "resi-fallback".into(),
-            inbound_tag: "vless-residential".into(),
+            inbound_tag: bui_schema::render::xray::INBOUND_TAG.into(),
             emails: vec![],
-            outbound_tag: "relay-slot-0".into(),
+            vless_route: None,
+            outbound_tag: "direct".into(),
         }
     }
 
@@ -368,8 +381,15 @@ mod tests {
         assert_eq!(cfg.rule.len(), 1, "一条请求只带一条规则");
         let r = &cfg.rule[0];
         assert_eq!(r.rule_tag, user_rule().rule_tag);
-        assert_eq!(r.inbound_tag, vec!["vless-residential".to_string()]);
+        assert_eq!(r.inbound_tag, vec!["vless".to_string()]);
         assert_eq!(r.user_email, vec![user_rule().emails[0].clone()]);
+        assert_eq!(
+            r.vless_route_list,
+            Some(PortList {
+                range: vec![PortRange { from: 1, to: 1 }]
+            }),
+            "住宅规则必须带 vlessRoute 1（proto 的 vless_route_list）"
+        );
         assert_eq!(
             r.target_tag,
             Some(pb::xray::app::router::routing_rule::TargetTag::Tag(
@@ -389,6 +409,10 @@ mod tests {
             "兜底规则不按 user 过滤：它要兜住「一条规则都没有的 email」"
         );
         assert_eq!(cfg.rule[0].rule_tag, "resi-fallback");
+        assert_eq!(
+            cfg.rule[0].vless_route_list, None,
+            "最终兜底不按 route 过滤：route 0 的直连流量落到它"
+        );
     }
 
     #[test]
@@ -658,7 +682,7 @@ mod tests {
             "routing": {"rules": [
                 {"type": "field", "inboundTag": ["api"], "outboundTag": "api"},
                 {"type": "field", "ruleTag": "resi-fallback",
-                 "inboundTag": ["vless-residential"], "outboundTag": "relay-slot-0"}
+                 "inboundTag": ["vless"], "outboundTag": "direct"}
             ]}
         });
         std::fs::write(&cfg_path, serde_json::to_vec_pretty(&cfg).unwrap()).unwrap();
@@ -675,7 +699,7 @@ mod tests {
         }
         assert!(ready, "xray 没在 5 秒内接受 gRPC");
 
-        let fb = ("resi-fallback".to_string(), "relay-slot-0".to_string());
+        let fb = ("resi-fallback".to_string(), "direct".to_string());
         assert_eq!(
             c.list_rules().await.unwrap(),
             vec![fb.clone()],
@@ -684,8 +708,9 @@ mod tests {
 
         let u = SlotRule {
             rule_tag: "resi-u-a".into(),
-            inbound_tag: "vless-residential".into(),
+            inbound_tag: bui_schema::render::xray::INBOUND_TAG.into(),
             emails: vec!["a".into()],
+            vless_route: Some(bui_schema::nodes::RESIDENTIAL_ROUTE),
             outbound_tag: "relay-slot-1".into(),
         };
         c.add_rule(&u).await.unwrap();
@@ -706,9 +731,10 @@ mod tests {
         c.remove_rule(FALLBACK_RULE_TAG).await.unwrap();
         c.add_rule(&SlotRule {
             rule_tag: FALLBACK_RULE_TAG.into(),
-            inbound_tag: "vless-residential".into(),
+            inbound_tag: bui_schema::render::xray::INBOUND_TAG.into(),
             emails: vec![],
-            outbound_tag: "relay-slot-0".into(),
+            vless_route: None,
+            outbound_tag: "direct".into(),
         })
         .await
         .unwrap();

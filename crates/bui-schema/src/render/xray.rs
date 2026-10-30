@@ -1,8 +1,13 @@
-//! Xray 配置渲染：双 REALITY inbound（`vless-direct` 直连 / `vless-residential` 走本地 relay）。
+//! Xray 配置渲染：**单个** REALITY inbound（`tag: "vless"`，客户端端口恒 443），
+//! 直连 / 住宅用 VLESS `vlessRoute`（UUID 第 6/7 字节）区分。
 //!
-//! 字段逐条对齐 v3 `server/core.sh` 的 `xray-config.json` 模板。
+//! 2026-10-30 裁决（REALITY 443 + self-steal）：`vless-direct` / `vless-residential` 两个
+//! inbound 合并成一个，未认证连接回落到本机 Caddy（`dest = 127.0.0.1:9443`）；住宅用户
+//! 的路由按 `user` + `vlessRoute: 1` 落到自己的槽，其余 route 1 落到兜底槽，route 0
+//! 落到最终兜底 `direct`。
 
-use crate::model::{NodeParams, Protocol, Residential, User};
+use crate::model::{NodeParams, Protocol, RealityFront, Residential, User, CADDY_LOCAL_PORT};
+use crate::nodes::RESIDENTIAL_ROUTE;
 use crate::paths::Paths;
 use crate::slots;
 use serde_json::{json, Value};
@@ -11,11 +16,19 @@ use sha2::{Digest, Sha256};
 /// 字面 IPv6 的 blackhole 出站 tag。路由首条把 `::/0` 送到它，服务端绝不新建 IPv6 出站。
 pub const BLOCK_TAG: &str = "block";
 
+/// 唯一 REALITY inbound 的 tag（`XRAY_INBOUND_TAGS` 与用户同步共用同一个字面量）。
+pub const INBOUND_TAG: &str = "vless";
+
 /// 住宅槽路由规则的 `ruleTag` 前缀：gRPC 侧按它认「这条规则是槽位模块的」。
 /// 改它等于把线上已经装载的旧规则变成认不出来的孤儿（收敛会把它们当多余项删掉，
 /// 一轮之内自愈，但别没事乱改）。
 pub const USER_RULE_PREFIX: &str = "resi-u-";
-/// 兜底规则的 `ruleTag`：永远排在表尾，兜住「一条规则都没有的 email」。
+/// 通用住宅兜底规则的 `ruleTag`：没有 `user` 条件、只匹配 `vlessRoute: 1`，排在全部
+/// 用户规则之后、最终兜底之前。新用户的 gRPC 规则还没落地的窗口里，route 1 落到这一条
+/// （仍是住宅出口，fail-closed）。**不能**以 [`USER_RULE_PREFIX`] 开头（否则收敛会把
+/// 线上规则当孤儿删掉）。
+pub const RESI_ROUTE_RULE_TAG: &str = "resi-route";
+/// 最终兜底规则的 `ruleTag`：无 `user`、无 `vlessRoute`，永远排在表尾（`direct`）。
 pub const FALLBACK_RULE_TAG: &str = "resi-fallback";
 
 /// 用户 `user_id`（= xray 侧的 email）对应的规则 tag。
@@ -24,28 +37,32 @@ pub fn user_rule_tag(user_id: uuid::Uuid) -> String {
 }
 
 /// 一条住宅槽路由规则 —— **渲染（写 `xray-config.json`）与 gRPC 增删共用同一个形状**，
-/// 两边不可能各算一份（D7）。`emails` 为空 = 兜底规则（不带 `user`，匹配该 inbound 的全部流量）。
+/// 两边不可能各算一份（D7）。`emails` 为空 = 不带 `user` 条件；`vless_route` 有值 =
+/// 只匹配该 `vlessRoute`（proto 的 `vless_route_list`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlotRule {
     pub rule_tag: String,
     pub inbound_tag: String,
     pub emails: Vec<String>,
+    pub vless_route: Option<u16>,
     pub outbound_tag: String,
 }
 
 /// API inbound 的本地端口（v3 固定值）。
 const API_PORT: u16 = 10085;
 
-/// 住宅入站的 tag（规则与 `XRAY_INBOUND_TAGS[1]` 同一个字面量）。
-const RESI_INBOUND_TAG: &str = "vless-residential";
-
 /// 渲染整份 `xray-config.json`。
 ///
-/// `users` 里只有开通了 [`Protocol::Reality`] 且未停用的用户进 `clients`，两个 inbound 共用同一份。
+/// `users` 里只有开通了 [`Protocol::Reality`] 且未停用的用户进 `clients`。
 ///
 /// `resi` 提供槽位表（spec §5.6）：每槽一个 `relay-slot-<i>` 出站（socks →
-/// `127.0.0.1:(2080+i)`），住宅入站**每个用户一条规则**分到自己的槽（`ruleTag`
-/// = `resi-u-<user_id>`），末尾一条 `resi-fallback` 兜住还没有规则的 email。
+/// `127.0.0.1:(2080+i)`）。路由表（顺序即语义，spec §3.3）：
+/// 1. 字面 IPv6 → blackhole；
+/// 2. api inbound → api；
+/// 3. 每个住宅用户一条 `user + vlessRoute: 1 → relay-slot-<自己的槽>`；
+/// 4. `resi-route`：无 `user`，`vlessRoute: 1 → relay-slot-<兜底槽>`；
+/// 5. `resi-fallback`：无 `user`、无 route → `direct`（直连节点走这一条）。
+///
 /// `email` 就是 `user_id`（spec §3.3，gRPC 侧唯一键）。
 ///
 /// 这份文件只在 xray **启动**时被读；运行中的增删由
@@ -79,13 +96,12 @@ pub fn config(node: &NodeParams, users: &[User], resi: &Residential, _paths: &Pa
 
     let mut rules = vec![
         // 字面 IPv6 一律 blackhole（见上面 outbounds 的注释）。必须在所有入站规则之前：
-        // 不论流量来自直连还是住宅入站，都不允许从本机新建 IPv6 出站。
+        // 不论流量来自哪条路由，都不允许从本机新建 IPv6 出站。
         json!({"type": "field", "ip": ["::/0"], "outboundTag": BLOCK_TAG}),
         json!({"type": "field", "inboundTag": ["api"], "outboundTag": "api"}),
-        json!({"type": "field", "inboundTag": ["vless-direct"], "outboundTag": "direct"}),
     ];
-    // 每个住宅用户一条、末尾兜底一条（顺序即 `slot_rules` 的顺序）。带 `user` 的那些
-    // **不进结构哈希**（[`structural_hash`]，D7），所以加用户不重启 xray。
+    // 用户规则 + `resi-route` + `resi-fallback`（顺序即 `slot_rules` 的顺序）。带 `user`
+    // 的那些**不进结构哈希**（[`structural_hash`]，D7），所以加用户不重启 xray。
     rules.extend(slot_rules(users, resi).iter().map(rule_json));
 
     json!({
@@ -110,15 +126,15 @@ pub fn config(node: &NodeParams, users: &[User], resi: &Residential, _paths: &Pa
                 "protocol": "dokodemo-door",
                 "settings": {"address": "127.0.0.1"}
             },
-            vless_inbound("vless-direct", node.ports.reality_direct, node, &clients),
-            vless_inbound("vless-residential", node.ports.reality_resi, node, &clients),
+            vless_inbound(node, &clients),
         ],
         "outbounds": outbounds,
         "routing": {"domainStrategy": "AsIs", "rules": rules}
     })
 }
 
-/// 期望态的住宅槽规则表：每个住宅用户一条（按 `user_id` 升序），**末尾一条兜底**。
+/// 期望态的住宅槽规则表：每个住宅用户一条（按 `user_id` 升序），**末尾两条通用规则**
+/// （`resi-route` → 兜底槽，`resi-fallback` → direct）。
 ///
 /// 渲染（写文件）与 gRPC 收敛（`residential::slots::converge_xray`）共用这一个函数，
 /// 两边不可能各算出一份不同的表（D7）。
@@ -130,22 +146,35 @@ pub fn slot_rules(users: &[User], resi: &Residential) -> Vec<SlotRule> {
         .into_iter()
         .map(|u| SlotRule {
             rule_tag: user_rule_tag(u.user_id),
-            inbound_tag: RESI_INBOUND_TAG.to_string(),
+            inbound_tag: INBOUND_TAG.to_string(),
             emails: vec![u.user_id.to_string()],
+            vless_route: Some(RESIDENTIAL_ROUTE),
             outbound_tag: relay_tag(slots::index_of_user(u, resi)),
         })
         .collect();
+    // 通用住宅兜底：新用户的 per-user 规则还没经 gRPC 落地的窗口里，route 1 落到这里
+    // （仍是住宅出口，fail-closed —— 不会漏到直连）。
+    out.push(SlotRule {
+        rule_tag: RESI_ROUTE_RULE_TAG.to_string(),
+        inbound_tag: INBOUND_TAG.to_string(),
+        emails: vec![],
+        vless_route: Some(RESIDENTIAL_ROUTE),
+        outbound_tag: relay_tag(slots::fallback_index(resi)),
+    });
+    // 最终兜底：直连节点（route 0）落到 direct。
     out.push(SlotRule {
         rule_tag: FALLBACK_RULE_TAG.to_string(),
-        inbound_tag: RESI_INBOUND_TAG.to_string(),
+        inbound_tag: INBOUND_TAG.to_string(),
         emails: vec![],
-        outbound_tag: relay_tag(slots::fallback_index(resi)),
+        vless_route: None,
+        outbound_tag: "direct".to_string(),
     });
     out
 }
 
 /// 一条 [`SlotRule`] 的 JSON 形态（`emails` 为空就不写 `user` 字段 —— 写成 `[]`
-/// 会变成「匹配空用户列表」，内核语义与「不过滤」不同）。
+/// 会变成「匹配空用户列表」，内核语义与「不过滤」不同）。`vless_route` 有值时写字符串
+/// `"vlessRoute": "<n>"`（与 proto 的 `vless_route_list` 同语义）。
 fn rule_json(r: &SlotRule) -> Value {
     let mut v = json!({
         "type": "field",
@@ -155,6 +184,9 @@ fn rule_json(r: &SlotRule) -> Value {
     });
     if !r.emails.is_empty() {
         v["user"] = json!(r.emails);
+    }
+    if let Some(route) = r.vless_route {
+        v["vlessRoute"] = json!(route.to_string());
     }
     v
 }
@@ -239,10 +271,22 @@ fn clients(users: &[User]) -> Vec<Value> {
         .collect()
 }
 
-/// 一个 REALITY inbound（两条通路只差 tag 与端口）。
-fn vless_inbound(tag: &str, port: u16, node: &NodeParams, clients: &[Value]) -> Value {
+/// 唯一的 REALITY inbound（self-steal）：未认证连接回落到本机 Caddy。
+///
+/// - `front = public`：监听 `0.0.0.0:443`；`front = l4`：监听 `127.0.0.1:10443`
+///   （前置 L4 把公网 443 转进来）。
+/// - `dest` 恒为 [`CADDY_LOCAL_PORT`]；`serverNames` = `[node.domain]`（订阅里客户端
+///   用的 SNI 与它同源）；`xver: 1` 让 Xray 给 Caddy 发 PROXY protocol（Caddy 的
+///   `listener_wrappers { proxy_protocol tls }` 接住，客户端真实 IP 不丢）。
+/// - `sniffing.routeOnly: true`：只把嗅探结果用于路由，不重写目标的域名（spec §2.1 第 4 条）。
+fn vless_inbound(node: &NodeParams, clients: &[Value]) -> Value {
+    let (listen, port) = match node.reality.front {
+        RealityFront::Public => ("0.0.0.0", crate::model::REALITY_PORT),
+        RealityFront::L4 => ("127.0.0.1", crate::model::L4_XRAY_PORT),
+    };
     json!({
-        "tag": tag,
+        "tag": INBOUND_TAG,
+        "listen": listen,
         "port": port,
         "protocol": "vless",
         "settings": {"clients": clients, "decryption": "none"},
@@ -250,13 +294,14 @@ fn vless_inbound(tag: &str, port: u16, node: &NodeParams, clients: &[Value]) -> 
             "network": "tcp",
             "security": "reality",
             "realitySettings": {
-                "dest": node.reality.dest,
-                "serverNames": node.reality.server_names,
+                "dest": format!("127.0.0.1:{CADDY_LOCAL_PORT}"),
+                "serverNames": [node.domain],
                 "privateKey": node.reality.private_key,
-                "shortIds": node.reality.short_ids
+                "shortIds": node.reality.short_ids,
+                "xver": 1
             }
         },
-        "sniffing": {"enabled": true, "destOverride": ["http", "tls"]}
+        "sniffing": {"enabled": true, "destOverride": ["http", "tls"], "routeOnly": true}
     })
 }
 
@@ -279,6 +324,11 @@ mod tests {
             "gRPC 侧按前缀认「这条规则是我们的」，改前缀等于把旧规则变成孤儿"
         );
         assert!(user_rule_tag(id).starts_with(USER_RULE_PREFIX));
+        assert_eq!(RESI_ROUTE_RULE_TAG, "resi-route");
+        assert!(
+            !RESI_ROUTE_RULE_TAG.starts_with(USER_RULE_PREFIX),
+            "通用住宅兜底也不能以用户前缀开头（否则收敛会把它当孤儿删掉）"
+        );
         assert_eq!(FALLBACK_RULE_TAG, "resi-fallback");
         assert!(
             !FALLBACK_RULE_TAG.starts_with(USER_RULE_PREFIX),
@@ -414,7 +464,7 @@ mod tests {
         assert_eq!(
             r.len(),
             5,
-            "IPv6 block / api / 直连 / 这个用户一条 / 住宅兜底"
+            "IPv6 block / api / 这个用户一条 / 通用住宅兜底 / 最终兜底"
         );
         // 未分配的用户也有自己的一条规则，指向兜底槽（D7：一人一条，追加顺序才无所谓）
         assert_eq!(
@@ -425,11 +475,22 @@ mod tests {
                 u.user_id.to_string()
             )]
         );
+        // 通用住宅兜底（route 1 → 兜底槽）排在用户规则之后、最终兜底之前：
+        // 新用户的 per-user 规则还没经 gRPC 落地时，route 1 落到这里（仍是住宅出口）
+        let route = &r[3];
+        assert_eq!(route["ruleTag"], "resi-route");
+        assert_eq!(route["outboundTag"], "relay-slot-0");
+        assert_eq!(route["vlessRoute"], "1");
+        assert!(route.get("user").is_none(), "通用住宅兜底不带 user");
         let last = r.last().unwrap();
         assert_eq!(last["ruleTag"], "resi-fallback");
-        assert_eq!(last["outboundTag"], "relay-slot-0");
-        assert_eq!(last["inboundTag"], serde_json::json!(["vless-residential"]));
-        assert!(last.get("user").is_none(), "兜底规则不带 user");
+        assert_eq!(
+            last["outboundTag"], "direct",
+            "route 0（直连节点）落到 direct"
+        );
+        assert_eq!(last["inboundTag"], serde_json::json!(["vless"]));
+        assert!(last.get("user").is_none(), "最终兜底不带 user");
+        assert!(last.get("vlessRoute").is_none(), "最终兜底不按 route 过滤");
     }
 
     #[test]
@@ -498,9 +559,11 @@ mod tests {
         let users = vec![user(1, Some(Uuid::from_u128(2))), user(2, None)];
         let cfg = config(&node(), &users, &r, &Paths::default_server());
         let want = slot_rules(&users, &r);
-        assert_eq!(want.len(), 3, "两个用户各一条 + 兜底一条");
+        assert_eq!(want.len(), 4, "两个用户各一条 + resi-route + 最终兜底");
+        assert_eq!(want[want.len() - 2].rule_tag, RESI_ROUTE_RULE_TAG);
         assert_eq!(want.last().unwrap().rule_tag, FALLBACK_RULE_TAG);
         assert!(want.last().unwrap().emails.is_empty());
+        assert_eq!(want.last().unwrap().vless_route, None);
         let rendered: Vec<(String, String)> = rules(&cfg)
             .iter()
             .filter(|x| x.get("ruleTag").is_some())
@@ -594,17 +657,20 @@ mod tests {
         assert_ne!(structural_hash(&a), structural_hash(&b));
     }
 
-    /// 兜底规则没有 `user` ⇒ **留在**结构哈希里：它只在兜底槽序号变化时变，
-    /// 那一刻本来就该重启（D7）。
+    /// 两条通用规则都没有 `user` ⇒ **留在**结构哈希里：`resi-route` 指向兜底槽，
+    /// 兜底槽序号变化时它变，那一刻本来就该重启（D7）；`resi-fallback` 恒为 `direct`。
     #[test]
-    fn the_fallback_rule_stays_inside_the_structural_hash() {
+    fn the_generic_tail_rules_stay_inside_the_structural_hash() {
         let p = Paths::default_server();
         let mut r = resi(2);
         let a = config(&node(), &[], &r, &p);
         // 删掉序号 0 那个槽 ⇒ 兜底槽变成槽 1
         r.slots.retain(|s| s.index != 0);
         let b = config(&node(), &[], &r, &p);
-        assert_eq!(rules(&b).last().unwrap()["outboundTag"], "relay-slot-1");
+        let tail = &rules(&b)[rules(&b).len() - 2];
+        assert_eq!(tail["ruleTag"], RESI_ROUTE_RULE_TAG);
+        assert_eq!(tail["outboundTag"], "relay-slot-1");
+        assert_eq!(rules(&b).last().unwrap()["outboundTag"], "direct");
         assert_ne!(structural_hash(&a), structural_hash(&b));
     }
 

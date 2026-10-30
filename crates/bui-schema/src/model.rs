@@ -7,6 +7,12 @@ use uuid::Uuid;
 pub const SCHEMA_VERSION: u32 = 1;
 /// 默认住宅分组名。
 pub const DEFAULT_GROUP: &str = "default";
+/// REALITY 的对外端口：客户端连接的端口恒为 443（2026-10-30 裁决，spec §2.1/§4.1）。
+pub const REALITY_PORT: u16 = 443;
+/// 本机 Caddy 的面板/订阅端口：REALITY 的回落目标（self-steal），只服务本机。
+pub const CADDY_LOCAL_PORT: u16 = 9443;
+/// `front = l4` 时 Xray 的 REALITY 监听端口：前置 L4 把公网 443 转进来。
+pub const L4_XRAY_PORT: u16 = 10443;
 
 /// 期望态根对象（`/opt/b-ui/state.json`）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -26,6 +32,43 @@ pub struct State {
     pub catalog: Vec<CatalogItem>,
 }
 
+impl State {
+    /// 把旧 `state.json` 的 REALITY 参数归一为 self-steal 形态（2026-10-30 裁决，spec §4.4）：
+    ///
+    /// - `reality.dest` = 本机 Caddy 的回落地址 `127.0.0.1:9443`（`dest` 不再是公网伪装站）；
+    /// - `reality.server_names` = `[node.domain]`（客户端 SNI 与服务端 serverNames 同源）；
+    /// - `ports.reality_direct` / `ports.reality_resi` = [`REALITY_PORT`]（两个字段只为 v3
+    ///   反序列化保留，语义已废弃，恒 443）。
+    ///
+    /// 返回是否改动了任何一项。调用点：`Store::open`（读盘即归一，CLI 与守护进程同口径）
+    /// 与 v3 导入。`node.domain` 为空（还没装机）时不动 `server_names`，否则会写出一个空 SNI。
+    pub fn normalize(&mut self) -> bool {
+        let mut changed = false;
+        let dest = format!("127.0.0.1:{CADDY_LOCAL_PORT}");
+        if self.node.reality.dest != dest {
+            self.node.reality.dest = dest;
+            changed = true;
+        }
+        if !self.node.domain.is_empty() {
+            let names = vec![self.node.domain.clone()];
+            if self.node.reality.server_names != names {
+                self.node.reality.server_names = names;
+                changed = true;
+            }
+        }
+        for port in [
+            &mut self.node.ports.reality_direct,
+            &mut self.node.ports.reality_resi,
+        ] {
+            if *port != REALITY_PORT {
+                *port = REALITY_PORT;
+                changed = true;
+            }
+        }
+        changed
+    }
+}
+
 /// 本节点的身份与监听参数。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NodeParams {
@@ -41,6 +84,19 @@ pub struct NodeParams {
     /// `state.json` 能原样读写，渲染器不再读它（见 [`DirectIpPolicy`]）。
     #[serde(default, skip_serializing_if = "DirectIpPolicy::is_ipv4_only")]
     pub direct_ip_policy: DirectIpPolicy,
+}
+
+impl NodeParams {
+    /// Xray REALITY 实际监听的端口（`front = public` ⇒ 443，`front = l4` ⇒ 10443）。
+    ///
+    /// 自检 / watchdog / 装机端口检查用它判「进程真的在听」；客户端订阅里的端口恒为
+    /// [`REALITY_PORT`]，与此无关。
+    pub fn reality_listen_port(&self) -> u16 {
+        match self.reality.front {
+            RealityFront::Public => REALITY_PORT,
+            RealityFront::L4 => L4_XRAY_PORT,
+        }
+    }
 }
 
 /// 直连出口地址族策略。
@@ -84,6 +140,10 @@ impl std::str::FromStr for DirectIpPolicy {
 }
 
 /// 四条通路的端口与端口跳跃区间。
+///
+/// `reality_direct` / `reality_resi` **已废弃**（2026-10-30：REALITY 客户端端口恒为
+/// [`REALITY_PORT`] = 443，由 [`State::normalize`] 覆盖）；只为旧 `state.json`（v3 的
+/// 10001/10002）还能反序列化而保留。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Ports {
     pub hy2: u16,
@@ -102,15 +162,71 @@ pub struct Reality {
     pub private_key: String,
     pub public_key: String,
     pub short_ids: Vec<String>,
-    /// 形如 `www.bing.com:443`
+    /// self-steal（2026-10-30 裁决）后**恒为** `127.0.0.1:9443`：未认证的 REALITY 连接
+    /// 回落到本机 Caddy。由 [`State::normalize`] 覆盖旧值，渲染器不再把它当公网伪装站。
     pub dest: String,
+    /// 客户端该用的 SNI（= `node.domain`，由 [`State::normalize`] 覆盖）。
     pub server_names: Vec<String>,
+    /// REALITY 的前置形态（spec §4.4）：`public` = Xray 直接监听 443（新装机默认）；
+    /// `l4` = Xray 监听 `127.0.0.1:10443`，由前置 L4 把公网 443 转进来。
+    ///
+    /// `skip_serializing_if`：缺省值不落盘，旧 `state.json` 往返一个字节都不变。
+    #[serde(default, skip_serializing_if = "RealityFront::is_public")]
+    pub front: RealityFront,
+}
+
+/// REALITY 的前置形态。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RealityFront {
+    /// 新装机默认：Xray 直接监听 `0.0.0.0:443`。
+    #[default]
+    Public,
+    /// 公网 443 被前置 L4（haproxy 等）占着：Xray 监听 `127.0.0.1:10443`。
+    L4,
+}
+
+impl RealityFront {
+    pub const fn is_public(&self) -> bool {
+        matches!(self, Self::Public)
+    }
+
+    /// CLI 与控制 API 共用的外部名称；落盘名称由 serde 明确使用小写。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::L4 => "l4",
+        }
+    }
+}
+
+impl std::str::FromStr for RealityFront {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "public" => Ok(Self::Public),
+            "l4" => Ok(Self::L4),
+            _ => Err("REALITY 前置形态只能是 public 或 l4".into()),
+        }
+    }
+}
+
+impl std::fmt::Display for RealityFront {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 impl Reality {
-    /// SNI = dest 去掉端口（v3 `getConfig` 语义）
+    /// 客户端该用的 SNI：`server_names[0]`（self-steal 后 = `node.domain`）；缺失或空串时
+    /// 回退 `dest` 去端口（与旧口径兼容）。
     pub fn sni(&self) -> &str {
-        self.dest.split(':').next().unwrap_or(&self.dest)
+        self.server_names
+            .first()
+            .map(String::as_str)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| self.dest.split(':').next().unwrap_or(&self.dest))
     }
 
     /// 订阅里用的第一个 shortId，缺失时为空串。
@@ -938,5 +1054,64 @@ mod tests {
         );
         let back: State = serde_json::from_value(json).unwrap();
         assert_eq!(back, s2);
+    }
+
+    /// 2026-10-30（REALITY 443 + self-steal）：`State::normalize` 把旧 state 的三项
+    /// （dest / serverNames / 两个 reality 端口）拉齐；幂等、不碰别的字段。
+    #[test]
+    fn normalize_moves_reality_to_self_steal_and_is_idempotent() {
+        let mut s: State = serde_json::from_str(SAMPLE).unwrap();
+        assert!(s.normalize(), "旧 state 必然要改");
+        assert_eq!(s.node.reality.dest, "127.0.0.1:9443");
+        assert_eq!(s.node.reality.server_names, vec!["example.com".to_string()]);
+        assert_eq!(s.node.ports.reality_direct, REALITY_PORT);
+        assert_eq!(s.node.ports.reality_resi, REALITY_PORT);
+        assert!(!s.normalize(), "第二遍无事可做");
+        // 空域名（还没装机）时不许写出空 SNI：这一项保持原样
+        let mut empty: State = serde_json::from_str(SAMPLE).unwrap();
+        empty.node.domain = String::new();
+        empty.normalize();
+        assert_eq!(
+            empty.node.reality.server_names,
+            vec!["www.bing.com".to_string()],
+            "空域名不覆盖 serverNames"
+        );
+    }
+
+    /// `front` 缺省省略、往返不丢；`sni()` 优先 `server_names[0]`，缺失回退 dest 去端口。
+    #[test]
+    fn reality_front_defaults_and_sni_prefers_server_names() {
+        let mut s: State = serde_json::from_str(SAMPLE).unwrap();
+        assert_eq!(s.node.reality.front, RealityFront::Public);
+        assert!(
+            serde_json::to_value(&s).unwrap()["node"]["reality"]
+                .get("front")
+                .is_none(),
+            "缺省值不落盘"
+        );
+        s.node.reality.front = RealityFront::L4;
+        let json = serde_json::to_value(&s).unwrap();
+        assert_eq!(json["node"]["reality"]["front"], "l4");
+        let back: State = serde_json::from_value(json).unwrap();
+        assert_eq!(back.node.reality.front, RealityFront::L4);
+        assert_eq!(back.node.reality_listen_port(), crate::model::L4_XRAY_PORT);
+
+        let mut r: Reality = serde_json::from_str(
+            r#"{"private_key":"a","public_key":"b","short_ids":["c"],
+               "dest":"www.bing.com:443","server_names":["panel.example.com"]}"#,
+        )
+        .unwrap();
+        assert_eq!(r.sni(), "panel.example.com");
+        r.server_names.clear();
+        assert_eq!(r.sni(), "www.bing.com", "缺失时回退 dest 去端口");
+        r.server_names = vec![String::new()];
+        assert_eq!(r.sni(), "www.bing.com");
+        assert_eq!(
+            "public".parse::<RealityFront>().unwrap(),
+            RealityFront::Public
+        );
+        assert_eq!("l4".parse::<RealityFront>().unwrap(), RealityFront::L4);
+        assert!("proxy".parse::<RealityFront>().is_err());
+        assert_eq!(RealityFront::L4.to_string(), "l4");
     }
 }

@@ -185,6 +185,9 @@ pub fn import(dir: &Path) -> Result<ImportReport, ImportError> {
     // v3 → 4.1 直装也要拿到住宅 HY2 凭据（spec §4.3）：迁移用户的凭据是
     // `{ name: 用户名, secret: 当时的 hy2_password }`，所以三种订阅逐字不变。
     crate::hy2pool::migrate(&mut state, now);
+    // 2026-10-30 裁决：v3 的 `dest`（www.bing.com:443）与 `ports.reality_*`（10001/10002）
+    // 一律归一为 self-steal 形态（dest = 本机 Caddy、serverNames = 域名、端口恒 443）。
+    state.normalize();
 
     Ok(ImportReport { state, warnings })
 }
@@ -500,6 +503,8 @@ fn reality_from_xray(
         short_ids,
         dest,
         server_names,
+        // 前置形态由 `State::normalize` / 安装默认值决定（v3 没有这个概念）
+        front: Default::default(),
     })
 }
 

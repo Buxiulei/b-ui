@@ -1054,9 +1054,8 @@ mod tests {
                 "{line}"
             );
         }
-        let xray = sync_failed_message(
-            "AddUser vless-direct 失败：code: 'The service is currently unavailable'",
-        );
+        let xray =
+            sync_failed_message("AddUser vless 失败：code: 'The service is currently unavailable'");
         assert_eq!(
             sig_of("b-ui", &xray),
             Some((Sig::XrayGrpcUnavailable, "xray".into()))
@@ -1176,14 +1175,14 @@ mod tests {
     fn a_failed_user_sync_with_unavailable_is_the_xray_grpc_signature() {
         use crate::modules::panel::users::USER_SYNC_FAILED_LOG;
         let hit = format!(
-            "{USER_SYNC_FAILED_LOG} error=AddUser vless-direct 失败：code: 'The service is \
+            "{USER_SYNC_FAILED_LOG} error=AddUser vless 失败：code: 'The service is \
              currently unavailable', message: \"tcp connect error\""
         );
         assert_eq!(
             sig_of("b-ui", &hit),
             Some((Sig::XrayGrpcUnavailable, "xray".into()))
         );
-        let other = format!("{USER_SYNC_FAILED_LOG} error=AddUser vless-direct 失败：fake");
+        let other = format!("{USER_SYNC_FAILED_LOG} error=AddUser vless 失败：fake");
         assert_eq!(
             sig_of("b-ui", &other),
             None,

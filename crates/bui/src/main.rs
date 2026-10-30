@@ -248,6 +248,14 @@ async fn dispatch(command: Command) -> Result<()> {
                 )
                 .await
             }
+            cli::SetCmd::RealityFront { front } => {
+                commands::config::run_reality_front(
+                    front,
+                    bui_schema::paths::Paths::default_server(),
+                    PathBuf::from(paths::SOCKET_PATH),
+                )
+                .await
+            }
             cli::SetCmd::Hy2ResiCompat { value, force } => {
                 commands::config::run_hy2_resi_compat(
                     &value,

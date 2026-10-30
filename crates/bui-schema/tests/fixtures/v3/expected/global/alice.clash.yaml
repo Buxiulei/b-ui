@@ -51,12 +51,12 @@ proxies:
   - name: "alice-Reality直连"
     type: vless
     server: example.com
-    port: 10001
-    uuid: 11111111-1111-4111-8111-111111111111
+    port: 443
+    uuid: 11111111-1111-0000-8111-111111111111
     flow: xtls-rprx-vision
     tls: true
     udp: true
-    servername: www.bing.com
+    servername: example.com
     client-fingerprint: chrome
     reality-opts:
       public-key: xpkTHqtLnYuBcHoV5_MgPY0MEjbMCHjkyKruMhDfbjY
@@ -65,12 +65,12 @@ proxies:
   - name: "alice-Reality住宅"
     type: vless
     server: example.com
-    port: 10002
-    uuid: 11111111-1111-4111-8111-111111111111
+    port: 443
+    uuid: 11111111-1111-0001-8111-111111111111
     flow: xtls-rprx-vision
     tls: true
     udp: true
-    servername: www.bing.com
+    servername: example.com
     client-fingerprint: chrome
     reality-opts:
       public-key: xpkTHqtLnYuBcHoV5_MgPY0MEjbMCHjkyKruMhDfbjY

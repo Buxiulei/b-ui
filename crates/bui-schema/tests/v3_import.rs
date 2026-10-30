@@ -20,7 +20,13 @@ fn imports_node_params() {
     assert_eq!(s.node.ports.hy2_hop, Some((20000, 30000)));
     assert_eq!(s.node.ports.hy2_resi, 40000);
     assert_eq!(s.node.ports.hy2_resi_hop, (41000, 50000));
-    assert_eq!(s.node.reality.dest, "www.bing.com:443");
+    assert_eq!(
+        s.node.reality.dest, "127.0.0.1:9443",
+        "v3 的伪装站被归一为 self-steal（本机 Caddy）"
+    );
+    assert_eq!(s.node.reality.server_names, vec!["example.com".to_string()]);
+    assert_eq!(s.node.ports.reality_direct, 443);
+    assert_eq!(s.node.ports.reality_resi, 443);
     assert_eq!(
         s.node.reality.short_ids,
         vec!["0123456789abcdef".to_string()]
@@ -233,8 +239,15 @@ fn reality_user_without_uuid_gets_generated_uuid_and_refresh_warning() {
         ]
     );
     let heidi_sub = decoded_uri_list(s, "heidi");
+    // 订阅里是 routed UUID（route 0 直连 / route 1 住宅），第 6/7 字节来自 base
+    let direct = bui_schema::nodes::routed_uuid_of(heidi.credentials.vless_uuid, 0);
+    let resi = bui_schema::nodes::routed_uuid_of(heidi.credentials.vless_uuid, 1);
     assert!(
-        heidi_sub.contains(&format!("vless://{}@", heidi.credentials.vless_uuid)),
+        heidi_sub.contains(&format!("vless://{direct}@example.com:443?")),
+        "{heidi_sub}"
+    );
+    assert!(
+        heidi_sub.contains(&format!("vless://{resi}@example.com:443?")),
         "{heidi_sub}"
     );
 

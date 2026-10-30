@@ -66,8 +66,12 @@ pub use bui_schema::render::hy2_singbox::{HY2_RESI_API, HY2_RESI_CLASH_API};
 pub const HY2_STATS_SECRET: &str = "";
 /// Xray 的 api inbound（`bui_schema::render::xray` 的 `API_PORT` = 10085）。
 pub const XRAY_API_ADDR: &str = "127.0.0.1:10085";
-/// 两个 REALITY inbound 的 tag（`bui_schema::render::xray` 的 `vless_inbound` 调用处）。
-pub const XRAY_INBOUND_TAGS: [&str; 2] = ["vless-direct", "vless-residential"];
+/// 唯一 REALITY inbound 的 tag（`bui_schema::render::xray::INBOUND_TAG`）。
+///
+/// 2026-10-30（REALITY 443 + self-steal）：`vless-direct` / `vless-residential` 两个
+/// inbound 合并成一个 `vless`，直连与住宅用 VLESS `vlessRoute` 区分；用户同步仍对
+/// 「每个 tag」各发一次，只是这份表现在只有一个元素。
+pub const XRAY_INBOUND_TAGS: [&str; 1] = [bui_schema::render::xray::INBOUND_TAG];
 /// VLESS `Account.flow`（`bui_schema::render::xray::clients` 里同值）。
 pub const VLESS_FLOW: &str = "xtls-rprx-vision";
 

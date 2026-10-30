@@ -265,6 +265,51 @@ mod tests {
         );
     }
 
+    /// 2026-10-30（REALITY 443 + self-steal）：面板「复制链接」必须与服务端 `/api/sub`
+    /// 同口径 —— 两个 Reality 节点都连 443、UUID 按 `vlessRoute` 改写（第 6/7 字节
+    /// `0000` 直连 / `0001` 住宅）、SNI = 面板域名；伪装弹窗只剩只读说明。
+    #[test]
+    fn the_copied_reality_uri_matches_the_443_self_steal_contract() {
+        let js = String::from_utf8(web_file("app.js").unwrap()).unwrap();
+        assert!(
+            js.contains("function routedUuid(uuid, route)"),
+            "缺 routedUuid（UUID 第三组改写）"
+        );
+        let body = js
+            .split("if (x.protocol === \"vless-reality\")")
+            .nth(1)
+            .expect("genUri 缺 vless-reality 分支")
+            .split("if (x.protocol === \"vless-ws-tls\")")
+            .next()
+            .unwrap();
+        assert!(
+            body.contains("routedUuid(x.uuid, includeResi ? 1 : 0)"),
+            "Reality 节点必须发 route 0/1 UUID：{body}"
+        );
+        assert!(body.contains(":443?"), "两个节点都连 443：{body}");
+        assert!(
+            body.contains("cfg.sni || cfg.domain"),
+            "SNI 必须回退面板域名：{body}"
+        );
+        for banned in ["10001", "10002", "www.bing.com"] {
+            assert!(!body.contains(banned), "旧口径「{banned}」还在：{body}");
+        }
+
+        assert!(
+            js.contains(
+                "sniGroup.style.display = proto === \"vless-ws-tls\" ? \"block\" : \"none\";"
+            ),
+            "SNI 下拉只留给 vless-ws-tls（vless-reality 的 SNI 恒为域名）"
+        );
+
+        let html = String::from_utf8(web_file("index.html").unwrap()).unwrap();
+        assert!(
+            html.contains("id=\"masqurl\" readonly"),
+            "伪装弹窗必须只读（服务端 POST /api/masquerade 已拒绝）"
+        );
+        assert!(!html.contains("saveMasq"), "伪装弹窗不许再保存");
+    }
+
     /// 2026-09-14 裁决的回归锁：四个免鉴权订阅端点的路径末段是**每用户的随机订阅 token**，
     /// 面板不许再拿用户名拼 —— 公开仓库的 git 历史里有真实域名与用户名，旧口径下
     /// 「域名 + 用户名」就等于订阅凭据（响应体里有 hy2 明文密码与 vless uuid）。

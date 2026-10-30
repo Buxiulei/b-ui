@@ -173,6 +173,12 @@ pub enum SetCmd {
         /// `off` 或 RFC3339 时刻；取值合法性由 `commands::config::parse_legacy_sub` 判。
         value: String,
     },
+    /// REALITY 的前置形态（2026-10-30 self-steal）：`public` = Xray 直接监听 443（新装机
+    /// 默认）；`l4` = Xray 监听 127.0.0.1:10443，由前置 L4（haproxy 等）把公网 443 转进来。
+    /// 改完由对账重写 `xray-config.json`（结构哈希变 ⇒ 重启 xray）与防火墙端口。
+    RealityFront {
+        front: bui_schema::model::RealityFront,
+    },
     /// HY2 混淆（salamander）开关：`on` / `off`，覆盖直连与全部住宅 HY2 实例。
     /// 开启或关闭后，所有用户的 HY2 节点要更新一次订阅才能连上；Reality 节点不受影响。
     Obfs {
@@ -482,6 +488,30 @@ mod tests {
         for value in ["dual-stack", "auto", "dual_stack", "ipv6-only", ""] {
             assert!(Cli::try_parse_from(["bui", "set", "direct-ip-policy", value]).is_err());
         }
+    }
+
+    /// `bui set reality-front public|l4`（2026-10-30 self-steal，spec §4.4）。取值由模型
+    /// 的 `FromStr` 一处判，clap 只管**必须收到一个值**。
+    #[test]
+    fn parses_reality_front_through_the_model_validator() {
+        use bui_schema::model::RealityFront;
+        for (value, want) in [("public", RealityFront::Public), ("l4", RealityFront::L4)] {
+            assert_eq!(
+                Cli::try_parse_from(["bui", "set", "reality-front", value])
+                    .unwrap()
+                    .command,
+                Some(Command::Set {
+                    cmd: SetCmd::RealityFront { front: want }
+                })
+            );
+        }
+        for bad in ["PUBLIC", "l4-", "proxy", ""] {
+            assert!(
+                Cli::try_parse_from(["bui", "set", "reality-front", bad]).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(Cli::try_parse_from(["bui", "set", "reality-front"]).is_err());
     }
 
     /// `bui set legacy-sub off|<RFC3339>`（2026-09-14 裁决的收口开关）。取值形状不由 clap 管

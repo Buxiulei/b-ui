@@ -35,7 +35,7 @@
                 <span class="ver-tag">v${VERSION}</span>
             </div>
             <div class="nav-actions">
-                <button class="ibtn" onclick="openMasq()" title="伪装网站设置">
+                <button class="ibtn" onclick="openMasq()" title="REALITY 伪装（self-steal，只读）">
                     <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
                 </button>
                 <button class="ibtn" onclick="openResi()" title="住宅 IP 出站">
@@ -366,17 +366,17 @@
         </div>
     </div>
 
-    <!-- Masquerade Settings Modal -->
+    <!-- Masquerade Settings Modal（2026-10-30：self-steal 后只读） -->
     <div id="m-masq" class="modal">
         <div class="modal-card">
-            <h3>伪装网站设置</h3>
+            <h3>REALITY 伪装（self-steal）</h3>
             <div class="info-box" style="margin-bottom:20px; font-size:13px; color:var(--text-dim)">
-                此设置将同时应用于 Hysteria2 和 VLESS-Reality 协议，作为流量伪装目标。
+                REALITY 的未认证连接固定回落到本机 Caddy（127.0.0.1:9443），SNI 恒为面板域名。
+                该目标由对账器维护，不可在面板修改；Hysteria2 的伪装域与它同源。
             </div>
-            <input type="text" id="masqurl" placeholder="例如: https://www.bing.com/">
-            <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:8px">
-                <button class="btn btn-secondary" onclick="closeM()">取消</button>
-                <button class="btn" onclick="saveMasq()">保存设置</button>
+            <input type="text" id="masqurl" readonly>
+            <div style="display:grid; grid-template-columns:1fr; gap:16px; margin-top:8px">
+                <button class="btn btn-secondary" onclick="closeM()">关闭</button>
             </div>
         </div>
     </div>

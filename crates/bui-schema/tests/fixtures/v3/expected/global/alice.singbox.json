@@ -113,13 +113,13 @@
             "type": "vless",
             "tag": "vless-direct",
             "server": "203.0.113.10",
-            "server_port": 10001,
+            "server_port": 443,
             "connect_timeout": "2s",
-            "uuid": "11111111-1111-4111-8111-111111111111",
+            "uuid": "11111111-1111-0000-8111-111111111111",
             "flow": "xtls-rprx-vision",
             "tls": {
                 "enabled": true,
-                "server_name": "www.bing.com",
+                "server_name": "example.com",
                 "utls": {
                     "enabled": true,
                     "fingerprint": "chrome"
@@ -135,13 +135,13 @@
             "type": "vless",
             "tag": "vless-residential",
             "server": "203.0.113.10",
-            "server_port": 10002,
+            "server_port": 443,
             "connect_timeout": "2s",
-            "uuid": "11111111-1111-4111-8111-111111111111",
+            "uuid": "11111111-1111-0001-8111-111111111111",
             "flow": "xtls-rprx-vision",
             "tls": {
                 "enabled": true,
-                "server_name": "www.bing.com",
+                "server_name": "example.com",
                 "utls": {
                     "enabled": true,
                     "fingerprint": "chrome"

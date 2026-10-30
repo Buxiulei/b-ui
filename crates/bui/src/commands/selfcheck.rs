@@ -198,15 +198,20 @@ fn wait_ready(
     }
 }
 
-/// 关键端口：面板与证书的 443、REALITY 两个入站、HY2 直连与住宅、面板自己的 admin 口。
+/// 关键端口：REALITY 的实际监听口（`public` ⇒ 443，`l4` ⇒ 10443，见
+/// [`NodeParams::reality_listen_port`](bui_schema::model::NodeParams::reality_listen_port)）、
+/// 本机 Caddy 的 [`CADDY_LOCAL_PORT`](bui_schema::model::CADDY_LOCAL_PORT)（REALITY 的
+/// self-steal 回落目标，面板与四个订阅端点全靠它）、面板自己的 admin 口、HY2 直连与住宅。
 /// 两段跳跃与 4.0 兼容段都不查：那些端口上**没有任何进程监听**，包是由 `inet bui` 表
 /// REDIRECT 到 `hy2_resi` 的（表本身由「nft 表 inet bui」那一行查）。
 pub fn listen_ports(state: &State) -> Vec<(Proto, u16)> {
     let p = &state.node.ports;
     vec![
-        (Proto::Tcp, 443),
-        (Proto::Tcp, p.reality_direct),
-        (Proto::Tcp, p.reality_resi),
+        // 2026-10-30：REALITY 只剩一个 inbound；`public` 直接听 443，`l4` 听 127.0.0.1:10443
+        // （443 在前置 L4 手里，不归 xray）。
+        (Proto::Tcp, state.node.reality_listen_port()),
+        // Caddy 退到本机 9443 后，面板/订阅的可用性判据从「443 上的 Caddy」变成这一口。
+        (Proto::Tcp, bui_schema::model::CADDY_LOCAL_PORT),
         (Proto::Tcp, p.admin),
         (Proto::Udp, p.hy2),
         (Proto::Udp, p.hy2_resi),
@@ -512,10 +517,25 @@ fn nft_table_row(host: &dyn Host, state: &State) -> Check {
             ),
         );
     }
+    // 2026-10-30：Caddy 的 9443 只服务本机 Xray 回落，input 链缺失 ⇒ 面板端口直接暴露公网。
+    let got_input = nft::input_signature(&listed);
+    if got_input != nft::input_signature(&want) {
+        return fail(
+            name,
+            format!(
+                "input 封堵链 {} 缺失或规则不符（期望 {} 条，实到 {} 条）：Caddy 的 {} 端口 \
+                 会暴露公网。执行 `bui nft apply` 重放",
+                nft::INPUT_CHAIN,
+                nft::INPUT_RULES,
+                got_input.len(),
+                bui_schema::model::CADDY_LOCAL_PORT
+            ),
+        );
+    }
     pass(
         name,
         format!(
-            "{} 条规则在位：{hop_a}-{hop_b}{} → :{}；IPv6 出站封禁 {} 条在位",
+            "{} 条规则在位：{hop_a}-{hop_b}{} → :{}；IPv6 出站封禁 {} 条、9443 input 封堵 {} 条在位",
             nft::rule_count(compat),
             if compat {
                 let (a, b) = nft::compat_range(&state.node.ports);
@@ -524,7 +544,8 @@ fn nft_table_row(host: &dyn Host, state: &State) -> Check {
                 String::new()
             },
             state.node.ports.hy2_resi,
-            got_egress.len()
+            got_egress.len(),
+            got_input.len()
         ),
     )
 }
@@ -740,7 +761,7 @@ pub fn run_with_clock(
     } else if !pending.is_empty() {
         skip("关键端口", format!("{} {CERT_PENDING}", pending.join("、")))
     } else {
-        pass("关键端口", "443/REALITY/HY2/面板 全部在监听")
+        pass("关键端口", "REALITY/Caddy 9443/HY2/面板 全部在监听")
     });
     // 住宅 HY2 那一套（4.1）：跳跃靠 nft 表、封禁靠 deny 出站、门位与计量靠两个回环面
     rows.push(nft_table_row(host, state));
@@ -1455,6 +1476,25 @@ mod tests {
             "{}",
             r.detail
         );
+    }
+
+    /// 2026-10-30（REALITY 443 + self-steal）：关键端口必须包含本机 Caddy 的 9443
+    /// （面板与四个订阅端点的唯一入口），且 REALITY 口随 `front` 在 443 / 10443 之间切换。
+    #[test]
+    fn the_key_ports_include_the_local_caddy_listener() {
+        let state = crate::testutil::sample_state();
+        let ports = listen_ports(&state);
+        assert!(
+            ports.contains(&(Proto::Tcp, bui_schema::model::CADDY_LOCAL_PORT)),
+            "9443 上的 Caddy 没人查：面板/订阅失联也判绿：{ports:?}"
+        );
+        assert!(ports.contains(&(Proto::Tcp, state.node.reality_listen_port())));
+        let mut l4 = state.clone();
+        l4.node.reality.front = bui_schema::model::RealityFront::L4;
+        let ports = listen_ports(&l4);
+        assert!(ports.contains(&(Proto::Tcp, bui_schema::model::L4_XRAY_PORT)));
+        assert!(ports.contains(&(Proto::Tcp, bui_schema::model::CADDY_LOCAL_PORT)));
+        assert!(!ports.contains(&(Proto::Tcp, bui_schema::model::REALITY_PORT)));
     }
 
     /// 住宅那两个回环面（Clash API 9092 / api 服务 10086）没在听 ⇒ FAIL：计量与门位

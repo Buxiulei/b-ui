@@ -113,13 +113,13 @@
             "type": "vless",
             "tag": "vless-residential",
             "server": "203.0.113.10",
-            "server_port": 10002,
+            "server_port": 443,
             "connect_timeout": "2s",
-            "uuid": "33333333-3333-4333-8333-333333333333",
+            "uuid": "33333333-3333-0001-8333-333333333333",
             "flow": "xtls-rprx-vision",
             "tls": {
                 "enabled": true,
-                "server_name": "www.bing.com",
+                "server_name": "example.com",
                 "utls": {
                     "enabled": true,
                     "fingerprint": "chrome"

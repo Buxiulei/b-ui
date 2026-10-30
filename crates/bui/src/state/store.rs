@@ -55,13 +55,34 @@ impl Store {
         self.0.path.parent().expect("state file has a parent")
     }
     /// 读现成的 `state.json`；文件缺失或内容不合 schema 一律报错（装机前的判据）。
+    ///
+    /// 读盘即调用 [`State::normalize`]（2026-10-30 裁决）：旧 `state.json` 的 REALITY
+    /// `dest` / `server_names` / 端口一律归一为 self-steal 形态，**内存与磁盘同口径**——
+    /// `bui status` 之类的 CLI 与守护进程看到的是同一份值。归一改动了内容就尽力写回；
+    /// 写回失败只告警、不阻断启动（只读文件系统上仍然能跑）。
     pub async fn open(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
         let bytes =
             std::fs::read(&path).with_context(|| format!("读取 {} 失败", path.display()))?;
-        let state: State = serde_json::from_slice(&bytes)
+        let mut state: State = serde_json::from_slice(&bytes)
             .with_context(|| format!("解析 {} 失败", path.display()))?;
         validate_residential_groups(&state)?;
+        if state.normalize() {
+            match serde_json::to_vec_pretty(&state) {
+                Ok(written) => {
+                    if let Err(error) = write_atomic(&path, &written) {
+                        tracing::warn!(error = %error, "REALITY 归一结果写回 state.json 失败");
+                    } else {
+                        tracing::info!(
+                            "REALITY 已归一为 self-steal（dest/端口按 2026-10-30 裁决）"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "REALITY 归一结果序列化失败，未写回 state.json")
+                }
+            }
+        }
         Ok(Self::wrap(path, state))
     }
 
@@ -336,6 +357,44 @@ mod tests {
         assert_eq!(store.read().await.node.ports.hy2, 10000);
         let reopened = Store::open(&p).await.unwrap();
         assert_eq!(reopened.read().await.users[0].username, "alice");
+    }
+
+    /// 2026-10-30（REALITY 443 + self-steal）：读盘即归一 —— 旧 state 的 dest /
+    /// serverNames / 10001/10002 在**内存与磁盘**上都被拉齐（CLI 与守护进程同口径）。
+    #[tokio::test]
+    async fn opening_an_old_state_normalizes_reality_and_writes_it_back() {
+        let d = dir();
+        let p = d.path().join("state.json");
+        let mut old = sample_state();
+        old.node.reality.dest = "www.bing.com:443".into();
+        old.node.reality.server_names = vec!["www.bing.com".into()];
+        old.node.ports.reality_direct = 10001;
+        old.node.ports.reality_resi = 10002;
+        Store::create(&p, old).await.unwrap();
+
+        let store = Store::open(&p).await.unwrap();
+        {
+            let s = store.read().await;
+            assert_eq!(s.node.reality.dest, "127.0.0.1:9443");
+            assert_eq!(s.node.reality.server_names, vec!["example.com".to_string()]);
+            assert_eq!(s.node.ports.reality_direct, 443);
+            assert_eq!(s.node.ports.reality_resi, 443);
+        }
+        let disk: State = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        assert_eq!(
+            disk.node.reality.dest, "127.0.0.1:9443",
+            "归一结果要写回盘上"
+        );
+        assert_eq!(disk.node.ports.reality_direct, 443);
+        // 已经是新形态的 state：再开一次零改动、零备份
+        Store::open(&p).await.unwrap();
+        assert_eq!(
+            std::fs::read_dir(d.path().join("state.backups"))
+                .map(|it| it.count())
+                .unwrap_or(0),
+            0,
+            "第二次打开不该再写盘"
+        );
     }
 
     #[tokio::test]

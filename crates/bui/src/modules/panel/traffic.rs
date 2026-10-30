@@ -1181,7 +1181,7 @@ mod tests {
             h.xray
                 .calls()
                 .iter()
-                .any(|c| c.starts_with(&format!("add:vless-direct:{id}"))),
+                .any(|c| c.starts_with(&format!("add:vless:{id}"))),
             "恢复要反向做一次 AddUser：{:?}",
             h.xray.calls()
         );

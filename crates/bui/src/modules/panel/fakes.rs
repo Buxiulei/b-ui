@@ -649,8 +649,9 @@ mod tests {
         use bui_schema::render::xray::SlotRule;
         let rule = |tag: &str, out: &str| SlotRule {
             rule_tag: tag.to_string(),
-            inbound_tag: "vless-residential".into(),
+            inbound_tag: bui_schema::render::xray::INBOUND_TAG.into(),
             emails: vec![],
+            vless_route: None,
             outbound_tag: out.to_string(),
         };
         let x = FakeXray::new();

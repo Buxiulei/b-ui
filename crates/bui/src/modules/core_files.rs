@@ -85,12 +85,16 @@ pub const SITES_README: &str = "\
 #
 # 一个文件可以放任意多个顶层站点块，写法与 /etc/caddy/Caddyfile 里一样，例如：
 #
-#   blog.example.com {
+#   blog.example.com:9443 {
 #       root * /srv/blog
 #       file_server
 #   }
 #
 # 注意：
+# - **站点地址必须写 :9443**（2026-10-30 起 Caddy 只监听本地 9443，443 归 Xray 的
+#   REALITY）。不写端口会去绑 443、与 xray 抢端口，整份配置校验失败；
+# - 这个 9443 监听带 `proxy_protocol` 包装器，外部流量只能经 REALITY 的未认证回落
+#   进来（那时 Xray 会带上 PROXY 头）；本机直接 curl 不带 PROXY 头会握手失败；
 # - 不要在这里写 Caddy 的全局选项块（开头那个没有站点地址的 `{ ... }`）——
 #   被 import 的文件里不允许出现它，caddy validate 会直接报错；
 # - 改完用 `bui reconcile` 或 `systemctl reload caddy` 生效；语法错会让整份配置
@@ -125,7 +129,16 @@ const SUB_PATHS_MATCHER: &str = "/api/sub/* /api/subscription/* /api/clash/* /ap
 /// Caddy 的 `path` 匹配器不分大小写，`/API/SUB/<token>` 也照样被服务到。
 const SUB_SEG_REGEXP: &str = "\"(?i)(/api/(?:sub|subscription|clash|nodes)/)[^/?]+\" \"${1}***\"";
 
-/// Caddyfile：只反代面板端口，日志进 stderr（journald 收），不再写 `/var/log/caddy`。
+/// Caddyfile：面板/订阅只监听本机 `:9443`（REALITY 的 self-steal 回落目标，2026-10-30
+/// 裁决，spec §4.2）；公网 `:80` 只做 ACME HTTP-01 与跳转到 `https://<域名>`。
+///
+/// - 站点地址是 `https://{domain}:9443`，**不写 site 级 `bind`**：`bind 127.0.0.1` 会把
+///   ACME 的 `bind_host` 也锁到 loopback，公网 80 的 HTTP-01 挑战失败。9443 的对外封堵
+///   由 `inet bui` 的 `input` 链负责（[`bui_schema::render::nft::INPUT_CHAIN`]）。
+/// - 全局 `servers :9443 { listener_wrappers { proxy_protocol tls } }`：Xray 的 REALITY
+///   回落带 `xver: 1`（PROXY protocol），顺序必须是 `proxy_protocol` 再 `tls`（反了会把
+///   TLS 连接包在代理层里；Caddy 2.11.7 实测）。
+/// - `auto_https disable_redirects` + 显式 `:80` 站点：跳转目标是 443，不是 9443。
 ///
 /// 面板块的访问日志会把完整 URI 写进 journald，而四个免鉴权订阅端点的路径末段本身就是
 /// 凭据 ⇒ 给它们加一条 `log_skip`（[`SUB_PATHS_MATCHER`]，2026-09-14 裁决），其余请求
@@ -141,10 +154,14 @@ const SUB_SEG_REGEXP: &str = "\"(?i)(/api/(?:sub|subscription|clash|nodes)/)[^/?
 /// **必须排在面板站点块之后**：写进块里就变成站点内指令了。glob 一个文件都没匹配到时
 /// caddy 不报错（2.10 实测），所以目录空着也照样 `Valid configuration`。
 pub fn caddyfile_text(domain: &str, admin_port: u16, sites_glob: &str) -> String {
+    let local_port = bui_schema::model::CADDY_LOCAL_PORT;
     format!(
         "\
 # B-UI v4 —— 由 bui 对账器生成，手改会被覆盖
 {{
+\t# 面板/订阅只在本地 {local_port} 提供服务（REALITY 的 self-steal 回落目标）；
+\t# 公网跳转由下面的 :80 站点负责，关掉自动 HTTP→HTTPS 重定向
+\tauto_https disable_redirects
 \t# caddy 自己的日志（含 reverse_proxy 的错误日志与 :80 跳转）里也有订阅链接的末段；
 \t# wrap 必须留 json，哨兵按 JSON 解证书失败行
 \tlog default {{
@@ -157,9 +174,20 @@ pub fn caddyfile_text(domain: &str, admin_port: u16, sites_glob: &str) -> String
 \t\t\t}}
 \t\t}}
 \t}}
+\t# Xray 回落带 PROXY protocol（xver: 1）；顺序必须是 proxy_protocol 再 tls
+\tservers :{local_port} {{
+\t\tlistener_wrappers {{
+\t\t\tproxy_protocol
+\t\t\ttls
+\t\t}}
+\t}}
 }}
 
-{domain} {{
+{domain}:80 {{
+\tredir https://{domain}{{uri}} permanent
+}}
+
+https://{domain}:{local_port} {{
 \t# 订阅链接的末段就是凭据，不进访问日志
 \t@sub path {SUB_PATHS_MATCHER}
 \tlog_skip @sub
@@ -739,8 +767,35 @@ mod tests {
                 ..
             } => {
                 let text = String::from_utf8(content).unwrap();
-                assert!(text.contains("example.com {"));
+                assert!(
+                    text.contains("https://example.com:9443 {"),
+                    "面板站点只在本地 9443 监听（REALITY 的 self-steal 回落目标）：\n{text}"
+                );
+                assert!(
+                    text.contains("example.com:80 {"),
+                    "公网 80 只做 ACME HTTP-01 与跳转：\n{text}"
+                );
                 assert!(text.contains("reverse_proxy 127.0.0.1:8080"));
+                // 2026-10-30 self-steal：9443 只给本机 Xray 回落；公网 80 跳 443
+                assert!(text.contains("\tauto_https disable_redirects\n"), "{text}");
+                assert!(text.contains("\tservers :9443 {\n"), "{text}");
+                let wrappers = text
+                    .find("listener_wrappers {")
+                    .map(|at| &text[at..])
+                    .expect("servers :9443 的 listener_wrappers");
+                assert!(
+                    wrappers.find("proxy_protocol").unwrap()
+                        < wrappers.find("tls").unwrap(),
+                    "listener_wrappers 顺序必须是 proxy_protocol 再 tls（反了会把 TLS 包在代理层里）：\n{text}"
+                );
+                assert!(
+                    text.contains("\tredir https://example.com{uri} permanent\n"),
+                    "公网 80 跳到 443，不是 9443：\n{text}"
+                );
+                assert!(
+                    !text.lines().any(|l| l.trim_start().starts_with("bind ")),
+                    "不许写 site 级 bind（会把 ACME 的 bind_host 锁到 loopback）：\n{text}"
+                );
                 assert!(
                     text.contains("output stderr"),
                     "日志进 journald，不再写 /var/log/caddy"
@@ -773,7 +828,9 @@ mod tests {
         assert!(text.contains("\tlog_skip @sub\n"), "\n{text}");
         // 必须在面板站点块**里面**（块外的 log_skip 不是合法的顶层指令）。
         // 顶格的 `\n}\n` 现在第一处是全局选项块的，所以从站点块开头往后找
-        let block_start = text.find("\nexample.com {\n").expect("面板站点块的开头");
+        let block_start = text
+            .find("\nhttps://example.com:9443 {\n")
+            .expect("面板站点块的开头");
         let block_end = block_start
             + 1
             + text[block_start + 1..]
@@ -808,7 +865,9 @@ mod tests {
         );
         // 全局选项块（default logger）在最前，站点块在后
         let global = text.find("\n{\n").expect("全局选项块");
-        let site = text.find("\nexample.com {\n").expect("面板站点块");
+        let site = text
+            .find("\nhttps://example.com:9443 {\n")
+            .expect("面板站点块");
         assert!(global < site, "全局选项块必须是第一个块：\n{text}");
         assert!(
             text[global..site].contains("\t\t\twrap json\n"),
@@ -917,7 +976,7 @@ mod tests {
         std::fs::write(crate::paths::caddy_sites_readme(&p), SITES_README).unwrap();
         std::fs::write(
             crate::paths::caddy_sites(&p).join("blog.caddy"),
-            "blog.example.com {\n\trespond \"hi\"\n}\n",
+            "blog.example.com:9443 {\n\trespond \"hi\"\n}\n",
         )
         .unwrap();
         let f = d.path().join("Caddyfile");
@@ -1118,13 +1177,12 @@ mod tests {
         let mut ports = base.clone();
         ports.node.ports.hy2_resi = 45000;
         assert_ne!(bytes(&ports), want, "改端口要改它");
-        // 第 5 件（spec §3.5 第 5 条）：伪装域变更（面板 `POST /api/masquerade` 改
-        // `reality.dest`）。`masquerade.url` 由 `node.reality.sni()` 推导 ⇒ 这一处推导被
-        // 写死成常量域名的话，改伪装域就不再重写这份配置、也不再重启住宅实例，
-        // 而住宅 HY2 的伪装域会永远停在旧值上（与直连实例不再同源）。
+        // 第 5 件（spec §3.5 第 5 条）：伪装域变更。self-steal 后 `dest` 固定为本机
+        // Caddy，`masquerade.url` 由 `node.reality.sni()`（= `server_names[0]`）推导；
+        // 这一处推导被写死成常量的话，改域名就不再重写这份配置、也不再重启住宅实例。
         let mut masq = base.clone();
-        masq.node.reality.dest = "www.example.com:443".into();
-        assert_ne!(bytes(&masq), want, "改伪装域（reality.dest）要改它");
+        masq.node.reality.server_names = vec!["www.example.com".into()];
+        assert_ne!(bytes(&masq), want, "改伪装域（server_names）要改它");
     }
 
     /// 全新装机（`hy2pool::migrate` 之前）池是空的：此时也必须渲染出合法配置

@@ -48,7 +48,11 @@
 //! 入站连接需要的 ICMPv6 错误。目的是让升级下载、ACME、住宅探针、伪装反代与内核自身
 //! 都不再新建 IPv6 出站，同时保留 IPv6 **入站**。它随整表 `flush` + 重放，watchdog
 //! 每 60 秒用 [`egress_signature`] 校验（[`rule_count`] 仍只数 REDIRECT）。
-use crate::model::Ports;
+//!
+//! 2026-10-30 起再加一条 [`INPUT_CHAIN`]（filter / input）：Caddy 退到本地
+//! `127.0.0.1:{CADDY_LOCAL_PORT}` 当 REALITY 的 self-steal 回落目标，非回环接口访问该端口
+//! 一律 drop。watchdog / 自检 / `bui nft status` 用 [`input_signature`] 单独校验它。
+use crate::model::{Ports, CADDY_LOCAL_PORT};
 use crate::slots::MAX_SLOTS;
 
 /// 族，`nft` 命令行里表标识符的前半段。
@@ -86,6 +90,15 @@ pub const EGRESS_CHAIN: &str = "ipv6_egress";
 /// [`EGRESS_CHAIN`] 里的规则条数（自检与 watchdog 的判据与渲染同源）。
 pub const EGRESS_RULES: usize = 6;
 
+/// 本机 Caddy（面板/订阅，REALITY 的回落目标）的 input 封堵链。
+///
+/// `front = public` 时 Caddy 只该被本机 Xray 回落访问；`front = l4` 时同理。
+/// 9443 不对外，两条 drop 规则随整表 `flush` + 重放。
+pub const INPUT_CHAIN: &str = "input";
+
+/// [`INPUT_CHAIN`] 里的规则条数。
+pub const INPUT_RULES: usize = 2;
+
 /// 规范化 [`EGRESS_CHAIN`] 的规则，用于比较「盘上那一份」与「期望的那一份」。
 ///
 /// 不逐字比 `nft list` 的回显。真实回显（2026-10-27 netns 实测）会：
@@ -98,11 +111,21 @@ pub const EGRESS_RULES: usize = 6;
 /// 这里按原顺序收集链内每条规则（跳过链头的 `type … hook …` 行），去掉上述可逆差异后返回；
 /// 链缺失、条数不符或任何语义差异都会让结果与期望不等，watchdog 据此重放。
 pub fn egress_signature(text: &str) -> Vec<String> {
+    chain_signature(text, EGRESS_CHAIN)
+}
+
+/// [`INPUT_CHAIN`] 的规范化规则（口径同 [`egress_signature`]）：两条 drop 规则在位。
+pub fn input_signature(text: &str) -> Vec<String> {
+    chain_signature(text, INPUT_CHAIN)
+}
+
+/// 一条 filter 链的规范化规则（原顺序）。`chain` 是链名；链缺失 ⇒ 空表。
+fn chain_signature(text: &str, chain: &str) -> Vec<String> {
     let mut in_chain = false;
     let mut out = Vec::new();
     for line in text.lines().map(str::trim) {
         if let Some(rest) = line.strip_prefix("chain ") {
-            in_chain = rest.trim_end_matches('{').trim() == EGRESS_CHAIN;
+            in_chain = rest.trim_end_matches('{').trim() == chain;
             continue;
         }
         if !in_chain {
@@ -195,6 +218,18 @@ pub fn ruleset(p: &Ports, compat: bool) -> String {
     out.push_str("    meta nfproto ipv6 meta l4proto tcp counter reject with tcp reset\n");
     out.push_str("    meta nfproto ipv6 counter reject with icmpx type admin-prohibited\n");
     out.push_str("  }\n");
+    // 本机 Caddy 的 9443 不对外（2026-10-30 裁决）：只服务 Xray 的 REALITY 回落。
+    // `iifname != "lo"` 让回环（Xray → Caddy）照常通；Caddy 必须监听所有地址而不是只
+    // `bind 127.0.0.1`——后者会把 ACME 的 bind_host 也锁到 loopback，公网 80 的 HTTP-01 挂掉。
+    out.push_str(&format!("  chain {INPUT_CHAIN} {{\n"));
+    out.push_str("    type filter hook input priority filter; policy accept;\n");
+    out.push_str(&format!(
+        "    iifname != \"lo\" tcp dport {CADDY_LOCAL_PORT} counter drop\n"
+    ));
+    out.push_str(&format!(
+        "    iifname != \"lo\" udp dport {CADDY_LOCAL_PORT} counter drop\n"
+    ));
+    out.push_str("  }\n");
     out.push_str("}\n");
     out
 }
@@ -238,6 +273,11 @@ table inet bui {
     meta nfproto ipv6 meta l4proto tcp counter reject with tcp reset
     meta nfproto ipv6 counter reject with icmpx type admin-prohibited
   }
+  chain input {
+    type filter hook input priority filter; policy accept;
+    iifname != \"lo\" tcp dport 9443 counter drop
+    iifname != \"lo\" udp dport 9443 counter drop
+  }
 }
 ";
         let got = ruleset(&ports(), true);
@@ -246,6 +286,37 @@ table inet bui {
         // 落地的却是一张零规则空表——住宅跳跃与兼容段静默失效，正是要防的那起回归。
         assert_eq!(got, format!("table inet bui\nflush table inet bui\n{want}"));
         assert_eq!(rule_count(true), 4);
+    }
+
+    /// 9443 的 input 封堵链（2026-10-30 self-steal）：两条 drop 随整表落地，
+    /// watchdog 用 [`input_signature`] 与 `nft list` 回显比对。
+    #[test]
+    fn the_input_chain_blocks_9443_from_non_loopback_interfaces() {
+        let want = ruleset(&ports(), true);
+        let sig = input_signature(&want);
+        assert_eq!(sig.len(), INPUT_RULES);
+        assert_eq!(
+            sig,
+            vec![
+                "iifname != \"lo\" tcp dport 9443 drop".to_string(),
+                "iifname != \"lo\" udp dport 9443 drop".to_string(),
+            ],
+            "回环必须放行（Xray → Caddy），外部访问一律 drop"
+        );
+        // 真机 `nft list` 的回显：带 counter 计数，语义不变
+        let listed = want.replace(
+            "tcp dport 9443 counter drop",
+            "tcp dport 9443 counter packets 7 bytes 420 drop",
+        );
+        assert_eq!(input_signature(&listed), sig);
+        // 被人改成 accept ⇒ 签名不等 ⇒ watchdog 整表重放
+        let tampered = want.replace(
+            "udp dport 9443 counter drop",
+            "udp dport 9443 counter accept",
+        );
+        assert_ne!(input_signature(&tampered), sig);
+        // 链整条缺失（旧表）⇒ 空签名
+        assert!(input_signature(&want.replace(INPUT_CHAIN, "renamed")).is_empty());
     }
 
     /// 兼容段关掉之后只剩两条（`bui set hy2-resi-compat off` 之后的形态）

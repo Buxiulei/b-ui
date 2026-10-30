@@ -63,6 +63,64 @@ pub(crate) async fn update_direct_ip_policy(store: &Store, policy: DirectIpPolic
     Ok(changed)
 }
 
+/// `bui set reality-front public|l4`（2026-10-30 self-steal，spec §4.4）：写
+/// `node.reality.front`，由对账重渲染 `xray-config.json`（监听地址/端口变了，结构哈希变
+/// ⇒ 重启 xray），防火墙端口与 watchdog 的监听判据也跟着走。
+pub async fn run_reality_front(
+    front: bui_schema::model::RealityFront,
+    paths: Paths,
+    socket: PathBuf,
+) -> Result<()> {
+    let client = crate::ipc::Client::new(&socket);
+    let changed = if client.available().await {
+        let (status, body) = client
+            .request(
+                "POST",
+                "/api/system/reality-front",
+                Some(serde_json::json!({"value": front.as_str()})),
+            )
+            .await?;
+        anyhow::ensure!(
+            (200..300).contains(&status),
+            "守护进程拒绝 REALITY 前置形态（HTTP {status}）：{body}"
+        );
+        body["changed"]
+            .as_bool()
+            .ok_or_else(|| anyhow::anyhow!("守护进程未返回 REALITY 前置形态修改结果"))?
+    } else {
+        let lease_paths = paths.clone();
+        crate::residential_lifecycle::offline(&lease_paths, async move {
+            let store = Store::open(crate::paths::state_file(&paths)).await?;
+            update_reality_front(&store, front).await
+        })
+        .await?
+    };
+    if changed {
+        println!(
+            "REALITY 前置形态已设为 {}；对账会按它重写 xray-config.json 并重启 xray。",
+            front.as_str()
+        );
+    } else {
+        println!("REALITY 前置形态已经是 {}，无需改动。", front.as_str());
+    }
+    Ok(())
+}
+
+/// 调用方必须持有 daemon 控制 owner 或离线 ControlLease；变化判定在 Store 写锁中完成。
+pub(crate) async fn update_reality_front(
+    store: &Store,
+    front: bui_schema::model::RealityFront,
+) -> Result<bool> {
+    let mut changed = false;
+    store
+        .update(|state| {
+            changed = state.node.reality.front != front;
+            state.node.reality.front = front;
+        })
+        .await?;
+    Ok(changed)
+}
+
 pub async fn run_hy2_auth(mode: &str, paths: Paths, host: Arc<dyn Host>) -> Result<()> {
     run_hy2_auth_with(mode, paths, host, PathBuf::from(crate::paths::SOCKET_PATH)).await
 }

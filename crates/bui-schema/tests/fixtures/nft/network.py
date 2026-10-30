@@ -54,6 +54,11 @@ def worker():
         if req[0] == "listen":
             listen(req[1], req[2])
             value = "ready"
+        elif req[0] == "probe_timeout":
+            try:
+                value = probe(req[1], req[2])
+            except TimeoutError:
+                value = "timeout"
         else:
             value = probe(req[1], req[2])
         print(json.dumps(value), flush=True)
@@ -160,10 +165,20 @@ def main():
                 got = f"rejected:{type(e).__name__}"
             assert got.startswith("rejected:"), (
                 "new ipv6 egress must be rejected", host, got)
+        # Caddy 的 9443 只服务本机（2026-10-30 self-steal）：完整规则集里的 input 链
+        # 放行 lo、drop 其余接口。本机回环探测照常拿到回包，外部（含转发路径的邻居）
+        # 一律静默丢弃。
+        listen(9443, "caddy-local")
+        assert probe("127.0.0.1", 9443) == "caddy-local", "9443 loopback must work"
+        assert probe("::1", 9443) == "caddy-local", "9443 loopback v6 must work"
+        assert request(peers[0], "probe_timeout", "192.0.2.1", 9443) == "timeout", (
+            "9443 must be dropped from non-loopback")
+        assert request(peers[0], "probe_timeout", "2001:db8:1::1", 9443) == "timeout", (
+            "9443 must be dropped from non-loopback (v6)")
         if os.environ.get("BUI_NFT_DUMP"):
             print("=== nft list table inet bui (full rules) ===")
             print(run("nft", "list", "table", "inet", "bui").stdout, end="")
-        print("PASS: reproduced old UDP interception; fixed IPv4/IPv6 external, forwarded, loopback, incoming hop and compat traffic; full rules keep IPv4, reject new IPv6 egress, allow IPv6 inbound replies")
+        print("PASS: reproduced old UDP interception; fixed IPv4/IPv6 external, forwarded, loopback, incoming hop and compat traffic; full rules keep IPv4, reject new IPv6 egress, allow IPv6 inbound replies, keep 9443 loopback-only")
     finally:
         for peer in peers:
             peer.terminate()

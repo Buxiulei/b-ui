@@ -20,7 +20,7 @@ trafficStats:
 masquerade:
   type: proxy
   proxy:
-    url: https://www.bing.com
+    url: https://example.com
     rewriteHost: true
 sniff:
   enable: true

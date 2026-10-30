@@ -1,6 +1,6 @@
-//! CLI 通过 unix socket 调的六个系统端点（spec §2.4）：触发一轮对账、动一个受管单元、
+//! CLI 通过 unix socket 调的七个系统端点（spec §2.4）：触发一轮对账、动一个受管单元、
 //! 切 Hysteria2 的鉴权方式、改旧订阅链接的宽限期、开关 HY2 混淆、开关住宅 HY2 的 4.0
-//! 兼容段（4.1 新增，带 30 天下线门禁）。
+//! 兼容段（4.1 新增，带 30 天下线门禁）、REALITY 前置形态（2026-10-30 self-steal）。
 //!
 //! 这两个端点是「菜单与 CLI 不自己动手」的唯一出口：`sudo b-ui` 的重启/停止都经过这里，
 //! 于是三条对账路径（启动、去抖、10 分钟巡检）仍只有守护进程里那一个 consumer 在跑（S6）。
@@ -91,6 +91,61 @@ pub async fn set_direct_ip_policy(
         )
             .into_response(),
     }
+}
+
+/// `POST /api/system/reality-front`（`bui set reality-front` 的落点，2026-10-30）。
+///
+/// 与直连出口策略同一个口径：这是宿主机监听面，只接受 root UDS。改完发一次
+/// `StateChanged`，重写 `xray-config.json` / 防火墙 / watchdog 判据都由那一轮对账做。
+pub async fn set_reality_front(
+    State(app): State<AppState>,
+    peer: Option<axum::Extension<crate::api::auth::UdsPeer>>,
+    Json(req): Json<RealityFrontRequest>,
+) -> Response {
+    if peer.is_none_or(|peer| peer.0.uid != 0) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error":"REALITY 前置形态设置需要 root UDS"})),
+        )
+            .into_response();
+    }
+    let front = match req.value.parse::<bui_schema::model::RealityFront>() {
+        Ok(front) => front,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error":error})),
+            )
+                .into_response()
+        }
+    };
+    let owner = app.bus.residential();
+    match owner
+        .execute(move |_tx| async move {
+            let changed = crate::commands::config::update_reality_front(&app.store, front).await?;
+            if changed {
+                app.bus.send(Event::StateChanged("reality-front"));
+            }
+            Ok(changed)
+        })
+        .await
+    {
+        Ok(changed) => {
+            Json(serde_json::json!({"ok":true,"changed":changed,"reality_front":front.as_str()}))
+                .into_response()
+        }
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error":error.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RealityFrontRequest {
+    pub value: String,
 }
 
 /// `POST /api/system/hy2-auth`：切 Hysteria2 的鉴权方式（`bui set hy2-auth` 的落点）。

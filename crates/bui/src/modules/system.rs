@@ -35,16 +35,14 @@ pub fn conntrack_max(mem_mb: u64) -> u32 {
 }
 
 /// `ip_local_reserved_ports` 的值（v3 core.sh:1485 的硬编码在 v4 从 state 推导）：
-/// 监听端口里连续的合成段（10000-10002）+ 直连跳跃段 + 住宅单端口 + （`compat` 为真时）
+/// 监听端口里连续的合成段（10000 + REALITY）+ 直连跳跃段 + 住宅单端口 + （`compat` 为真时）
 /// 4.0 兼容段 + 住宅跳跃整段。
 ///
-/// 4.1 起住宅 HY2 只有**一个**监听端口（`hy2_resi`），跳跃与兼容段都由 nft 表 REDIRECT
-/// 过来，所以第二个参数从「槽位空间宽度」换成 `compat`（= `system.hy2_resi_compat_ports`）。
-/// 兼容段仍要排除出临时端口池：出向连接抢了 `40001-40007` 里的端口，4.0 的旧订阅就会
-/// 有一片端口被本机自己占着（spec §2.4）。
+/// 2026-10-30 起 REALITY 的对外端口恒为 443（self-steal），`ports.reality_direct` /
+/// `reality_resi` 两个字段被归一成同一个值，排序去重后只贡献一个 `443`。
 pub fn reserved_ports(p: &Ports, compat: bool) -> String {
     let mut parts: Vec<String> = Vec::new();
-    let mut singles = vec![p.hy2, p.reality_direct, p.reality_resi];
+    let mut singles = vec![bui_schema::model::REALITY_PORT, p.hy2];
     singles.sort_unstable();
     singles.dedup();
     let mut i = 0;
@@ -82,13 +80,14 @@ pub fn reserved_ports(p: &Ports, compat: bool) -> String {
 /// 4.1：住宅 HY2 只有一个监听端口，跳跃段与 4.0 兼容段都靠 nft 表 REDIRECT 到它 ——
 /// 但**放行仍要按客户端实际发往的端口算**（包先过 filter 再过我们的 nat 链，
 /// 只放行 `:40000` 会让整段跳跃在 ufw 机器上被丢掉）。`compat` = `system.hy2_resi_compat_ports`。
+///
+/// 2026-10-30：REALITY 的对外端口恒为 443（self-steal），客户端不再连 10001/10002；
+/// 443 与面板/证书同号，只放行一次（去重）。
 pub fn firewall_ports(p: &Ports, compat: bool) -> Vec<PortSpec> {
     let mut v = vec![
         PortSpec::one(Proto::Tcp, 22),
         PortSpec::one(Proto::Tcp, 80),
-        PortSpec::one(Proto::Tcp, 443),
-        PortSpec::one(Proto::Tcp, p.reality_direct),
-        PortSpec::one(Proto::Tcp, p.reality_resi),
+        PortSpec::one(Proto::Tcp, bui_schema::model::REALITY_PORT),
         PortSpec::one(Proto::Udp, p.hy2),
     ];
     if let Some((a, b)) = p.hy2_hop {
@@ -343,14 +342,13 @@ mod tests {
                 "22/tcp",
                 "80/tcp",
                 "443/tcp",
-                "10001/tcp",
-                "10002/tcp",
                 "10000/udp",
                 "20000:30000/udp",
                 "40000/udp",
                 "40001:40007/udp",
                 "41000:50000/udp",
-            ]
+            ],
+            "REALITY 只放行 443（与面板/证书同号，去重一次）"
         );
         let off: Vec<String> = firewall_ports(&p, false)
             .iter()
@@ -364,18 +362,18 @@ mod tests {
             .any(|x| x == "40001-40007/udp"));
         assert_eq!(
             reserved_ports(&p, true),
-            "10000-10002,20000-30000,40000,40001-40007,41000-50000"
+            "443,10000,20000-30000,40000,40001-40007,41000-50000"
         );
         assert_eq!(
             reserved_ports(&p, false),
-            "10000-10002,20000-30000,40000,41000-50000"
+            "443,10000,20000-30000,40000,41000-50000"
         );
         // 直连跳跃段缺失时其余各段照旧
         let mut q = p.clone();
         q.hy2_hop = None;
         assert_eq!(
             reserved_ports(&q, true),
-            "10000-10002,40000,40001-40007,41000-50000"
+            "443,10000,40000,40001-40007,41000-50000"
         );
     }
 
@@ -477,7 +475,7 @@ mod tests {
         assert!(net.contains("net.ipv4.tcp_congestion_control=bbr"));
         assert!(net.contains("net.core.default_qdisc=fq"));
         assert!(net.contains(
-            "net.ipv4.ip_local_reserved_ports=10000-10002,20000-30000,40000,40001-40007,41000-50000"
+            "net.ipv4.ip_local_reserved_ports=443,10000,20000-30000,40000,40001-40007,41000-50000"
         ));
         assert!(net.contains("net.core.rmem_max=16777216"));
         assert!(net.contains("net.ipv4.tcp_retries2=8"));
@@ -675,7 +673,7 @@ mod tests {
             "没有活防火墙时不许产出 FirewallPorts"
         );
         // 但端口集本身照样可算——提示文案要用它
-        assert_eq!(firewall_ports(&s.node.ports, true).len(), 10);
+        assert_eq!(firewall_ports(&s.node.ports, true).len(), 8);
     }
 
     #[test]

@@ -1,8 +1,37 @@
 //! 权益 → 节点集合：把一个用户的 [`Entitlements`](crate::model::Entitlements) 展开成他订阅里该出现的节点。
 
-use crate::model::{NodeParams, Protocol, Residential, User};
+use crate::model::{NodeParams, Protocol, Residential, User, REALITY_PORT};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+/// 直连节点的 VLESS `vlessRoute`（UUID 第 6/7 字节 = `0000`）。
+pub const DIRECT_ROUTE: u16 = 0;
+/// 住宅节点的 VLESS `vlessRoute`（UUID 第 6/7 字节 = `0001`）。
+pub const RESIDENTIAL_ROUTE: u16 = 1;
+
+/// 把 `base` UUID 的第 6/7 字节换成 `route`，得到订阅里该发的那条 UUID。
+///
+/// Xray 的 VLESS 入站用 `ProcessUUID` 把这两个字节清零后查用户，所以同一用户的
+/// `route = 0` 与 `route = 1` 两个 UUID 映射到同一个 email；`inbound.VlessRoute`
+/// 取客户端发来的这两个字节，路由规则据此区分直连 / 住宅（spec §3.2）。
+/// 客户端（v2rayN / sing-box / mihomo）只需发送这个普通 UUID 字符串，无需任何新字段。
+///
+/// 解析失败原样返回（不 panic）—— 只有历史脏数据才可能走到这一支。
+pub fn routed_uuid(base: &str, route: u16) -> String {
+    match Uuid::parse_str(base) {
+        Ok(uuid) => {
+            let mut bytes = *uuid.as_bytes();
+            bytes[6..8].copy_from_slice(&route.to_be_bytes());
+            Uuid::from_bytes(bytes).to_string()
+        }
+        Err(_) => base.to_string(),
+    }
+}
+
+/// [`routed_uuid`] 的 `Uuid` 便利版：输入本来就合法，解析不可能失败。
+pub fn routed_uuid_of(base: Uuid, route: u16) -> Uuid {
+    Uuid::parse_str(&routed_uuid(&base.to_string(), route)).unwrap_or(base)
+}
 
 /// 四条通路之一。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,17 +105,19 @@ pub fn nodes_for(user: &User, node: &NodeParams, resi: &Residential) -> Vec<Node
     } else {
         None
     };
-    let reality = |port: u16, kind: NodeKind, label: &str| Node {
+    let reality = |kind: NodeKind, label: &str, route: u16| Node {
         kind,
         label: label.into(),
         host: node.domain.clone(),
-        port,
+        // 客户端连的 REALITY 端口恒为 443，与 `front`（服务端怎么接）无关（spec §2.1）。
+        port: REALITY_PORT,
         hop: None,
         transport: Transport::Reality {
-            uuid: user.credentials.vless_uuid,
+            uuid: routed_uuid_of(user.credentials.vless_uuid, route),
             public_key: node.reality.public_key.clone(),
             short_id: node.reality.short_id().to_string(),
-            server_name: node.reality.sni().to_string(),
+            // 服务端 `serverNames` = [node.domain]（self-steal），客户端 SNI 必须与它同源。
+            server_name: node.domain.clone(),
             fingerprint: "chrome".into(),
             flow: "xtls-rprx-vision".into(),
         },
@@ -115,16 +146,16 @@ pub fn nodes_for(user: &User, node: &NodeParams, resi: &Residential) -> Vec<Node
     if has(Protocol::Reality) {
         if e.direct {
             out.push(reality(
-                node.ports.reality_direct,
                 NodeKind::RealityDirect,
                 "Reality直连",
+                DIRECT_ROUTE,
             ));
         }
         if resi_ok {
             out.push(reality(
-                node.ports.reality_resi,
                 NodeKind::RealityResidential,
                 "Reality住宅",
+                RESIDENTIAL_ROUTE,
             ));
         }
     }
@@ -238,7 +269,7 @@ mod tests {
                 flow,
                 ..
             } => {
-                assert_eq!(server_name, "www.bing.com");
+                assert_eq!(server_name, "example.com", "self-steal：SNI 恒为域名");
                 assert_eq!(short_id, "0123456789abcdef");
                 assert_eq!(fingerprint, "chrome");
                 assert_eq!(flow, "xtls-rprx-vision");
@@ -490,8 +521,15 @@ mod tests {
         let (u, resi) = minted(u, resi_with_slots(3));
         let ns = nodes_for(&u, &node(), &resi);
         let by = |k: NodeKind| ns.iter().find(|n| n.kind == k).unwrap().clone();
-        assert_eq!(by(NodeKind::RealityDirect).port, 10001);
-        assert_eq!(by(NodeKind::RealityResidential).port, 10002);
+        assert_eq!(
+            by(NodeKind::RealityDirect).port,
+            crate::model::REALITY_PORT,
+            "REALITY 客户端端口恒 443"
+        );
+        assert_eq!(
+            by(NodeKind::RealityResidential).port,
+            crate::model::REALITY_PORT
+        );
         assert_eq!(by(NodeKind::RealityResidential).hop, None);
         assert_eq!(by(NodeKind::Hy2Direct).port, 10000);
         assert_eq!(by(NodeKind::Hy2Direct).hop, Some((20000, 30000)));
@@ -517,6 +555,60 @@ mod tests {
             Transport::Hysteria2 { obfs_password, .. } => assert_eq!(obfs_password, &None),
             _ => panic!(),
         }
+    }
+
+    /// vlessRoute 的线上表达（spec §3.2）：改 UUID 第 6/7 字节（第三组），route 0 / 1
+    /// 分别得到 `0000` / `0001`；解析失败原样返回，不 panic。
+    #[test]
+    fn routed_uuid_rewrites_the_third_group() {
+        let base = "11111111-1111-4111-8111-111111111111";
+        assert_eq!(
+            routed_uuid(base, DIRECT_ROUTE),
+            "11111111-1111-0000-8111-111111111111"
+        );
+        assert_eq!(
+            routed_uuid(base, RESIDENTIAL_ROUTE),
+            "11111111-1111-0001-8111-111111111111"
+        );
+        assert_eq!(
+            base, "11111111-1111-4111-8111-111111111111",
+            "base 不被修改"
+        );
+        assert_eq!(routed_uuid("not-a-uuid", 1), "not-a-uuid");
+        assert_eq!(
+            routed_uuid_of(Uuid::parse_str(base).unwrap(), RESIDENTIAL_ROUTE).to_string(),
+            routed_uuid(base, RESIDENTIAL_ROUTE)
+        );
+    }
+
+    /// 两个 REALITY 节点：同 host / 同 port，UUID 只差第 6/7 字节（客户端无感知）。
+    #[test]
+    fn the_two_reality_nodes_differ_only_in_the_routed_uuid() {
+        let (u, r) = minted(user(vec![Protocol::Reality], true), Residential::default());
+        let ns = nodes_for(&u, &node(), &r);
+        let reality: Vec<_> = ns
+            .iter()
+            .filter(|n| n.kind != NodeKind::Hy2Direct && n.kind != NodeKind::Hy2Residential)
+            .collect();
+        assert_eq!(reality.len(), 2);
+        assert_eq!(reality[0].host, "example.com");
+        assert_eq!(reality[1].host, "example.com");
+        let (Transport::Reality { uuid: direct, .. }, Transport::Reality { uuid: resi, .. }) =
+            (&reality[0].transport, &reality[1].transport)
+        else {
+            panic!("两个节点都必须是 REALITY")
+        };
+        assert_eq!(
+            direct.to_string(),
+            routed_uuid(&u.credentials.vless_uuid.to_string(), DIRECT_ROUTE)
+        );
+        assert_eq!(
+            resi.to_string(),
+            routed_uuid(&u.credentials.vless_uuid.to_string(), RESIDENTIAL_ROUTE)
+        );
+        assert_ne!(direct, resi);
+        assert_eq!(direct.as_bytes()[..6], resi.as_bytes()[..6]);
+        assert_eq!(direct.as_bytes()[8..], resi.as_bytes()[8..]);
     }
 }
 
